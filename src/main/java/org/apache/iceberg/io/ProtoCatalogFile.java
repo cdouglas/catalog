@@ -303,7 +303,28 @@ public class ProtoCatalogFile extends CatalogFile {
     public Builder addNamespace(int id, int parentId, String name, int version) {
       NsEntry entry = new NsEntry(parentId, name, version);
       namespaceById.put(id, entry);
-      namespaceLookup.put(buildNamespace(id), id);
+      // Defer lookup building if parent doesn't exist yet (checkpoint decoding)
+      if (parentId == 0 || namespaceById.containsKey(parentId)) {
+        namespaceLookup.put(buildNamespace(id), id);
+      }
+      // Otherwise, lookup will be built by rebuildLookups() after all entries are loaded
+      return this;
+    }
+
+    /**
+     * Rebuilds namespace and table lookups after bulk loading from checkpoint.
+     * Call this after decoding a checkpoint to ensure all lookups are populated.
+     */
+    public Builder rebuildLookups() {
+      namespaceLookup.clear();
+      for (Integer id : namespaceById.keySet()) {
+        namespaceLookup.put(buildNamespace(id), id);
+      }
+      tableLookup.clear();
+      for (Map.Entry<Integer, TblEntry> entry : tableById.entrySet()) {
+        Namespace ns = buildNamespace(entry.getValue().namespaceId);
+        tableLookup.put(TableIdentifier.of(ns, entry.getValue().name), entry.getKey());
+      }
       return this;
     }
 
@@ -417,6 +438,8 @@ public class ProtoCatalogFile extends CatalogFile {
     }
 
     public ProtoCatalogFile build() {
+      // Ensure all lookups are complete before building immutable file
+      rebuildLookups();
       return new ProtoCatalogFile(this);
     }
   }

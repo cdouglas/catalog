@@ -229,42 +229,46 @@ public class ProtoCatalogFormat
       // Map namespace to assigned ID (for late-binding)
       Map<Namespace, Integer> nsIdMap = new java.util.HashMap<>();
 
-      // Process namespace creates (true = create)
-      for (Map.Entry<Namespace, Boolean> entry : namespaces.entrySet()) {
-        Namespace ns = entry.getKey();
-        if (entry.getValue()) {
-          // Create namespace
-          Namespace parent = CatalogFile.Mut.parentOf(ns);
-          String name = CatalogFile.Mut.nameOf(ns);
+      // Sort namespaces by depth (parents before children) to ensure correct ID assignment
+      List<Namespace> sortedNamespaces = namespaces.entrySet().stream()
+          .filter(Map.Entry::getValue)  // only creates
+          .map(Map.Entry::getKey)
+          .sorted(java.util.Comparator.comparingInt(Namespace::length))
+          .collect(java.util.stream.Collectors.toList());
 
-          int parentId = 0;
-          int parentVersion = -1;
-          if (!parent.isEmpty()) {
-            Integer existingParentId = original.namespaceId(parent);
-            if (existingParentId != null) {
-              parentId = existingParentId;
-              parentVersion = original.namespaceVersion(existingParentId);
-            } else {
-              // Parent created in same transaction
-              Integer lateBoundParentId = nsIdMap.get(parent);
-              if (lateBoundParentId != null) {
-                parentId = lateBoundParentId;
-                parentVersion = -1; // late-bound
-              }
+      // Process namespace creates in topological order
+      for (Namespace ns : sortedNamespaces) {
+        // Create namespace
+        Namespace parent = CatalogFile.Mut.parentOf(ns);
+        String name = CatalogFile.Mut.nameOf(ns);
+
+        int parentId = 0;
+        int parentVersion = -1;
+        if (!parent.isEmpty()) {
+          Integer existingParentId = original.namespaceId(parent);
+          if (existingParentId != null) {
+            parentId = existingParentId;
+            parentVersion = original.namespaceVersion(existingParentId);
+          } else {
+            // Parent created in same transaction
+            Integer lateBoundParentId = nsIdMap.get(parent);
+            if (lateBoundParentId != null) {
+              parentId = lateBoundParentId;
+              parentVersion = -1; // late-bound
             }
           }
+        }
 
-          int nsId = idManager.allocateNsid();
-          nsIdMap.put(ns, nsId);
-          actions.add(new ProtoCodec.CreateNamespaceAction(nsId, 1, parentId, parentVersion, name));
+        int nsId = idManager.allocateNsid();
+        nsIdMap.put(ns, nsId);
+        actions.add(new ProtoCodec.CreateNamespaceAction(nsId, 1, parentId, parentVersion, name));
 
-          // Add properties for this namespace
-          Map<String, String> props = namespaceProperties.get(ns);
-          if (props != null) {
-            for (Map.Entry<String, String> prop : props.entrySet()) {
-              actions.add(new ProtoCodec.SetNamespacePropertyAction(
-                  nsId, -1, prop.getKey(), prop.getValue()));
-            }
+        // Add properties for this namespace
+        Map<String, String> props = namespaceProperties.get(ns);
+        if (props != null) {
+          for (Map.Entry<String, String> prop : props.entrySet()) {
+            actions.add(new ProtoCodec.SetNamespacePropertyAction(
+                nsId, -1, prop.getKey(), prop.getValue()));
           }
         }
       }

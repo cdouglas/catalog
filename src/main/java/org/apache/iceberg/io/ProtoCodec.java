@@ -229,6 +229,8 @@ public class ProtoCodec {
             skipField(in, wireType);
         }
       }
+      // Rebuild lookups after all entries are loaded (handles out-of-order decoding)
+      builder.rebuildLookups();
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
