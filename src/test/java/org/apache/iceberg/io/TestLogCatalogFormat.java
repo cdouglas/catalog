@@ -39,6 +39,7 @@ import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -49,7 +50,7 @@ import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
-import org.apache.iceberg.io.LogCatalogFormat.LogCatalogFile;
+import org.apache.iceberg.io.LogCatalogFile;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInfo;
@@ -90,20 +91,21 @@ public class TestLogCatalogFormat {
     transaction.write(dos);
     byte[] data = baos.toByteArray();
 
-    // Read the transaction from the byte array using LogStream
+    // Read the transaction from the byte array using LogSerializer iterator
     ByteArrayInputStream bais = new ByteArrayInputStream(data);
     DataInputStream dis = new DataInputStream(bais);
-    LogCatalogFormat.LogAction.LogStream logStream = new LogCatalogFormat.LogAction.LogStream(dis);
+    Iterator<LogCatalogFormat.LogAction.Transaction> logIterator =
+        LogSerializer.logIterable(dis).iterator();
 
-    // Verify that the LogStream correctly reads the transaction
-    assertTrue(logStream.hasNext());
-    LogCatalogFormat.LogAction.Transaction readTransaction = logStream.next();
+    // Verify that the iterator correctly reads the transaction
+    assertTrue(logIterator.hasNext());
+    LogCatalogFormat.LogAction.Transaction readTransaction = logIterator.next();
     assertEquals(txnId, readTransaction.txnId);
     assertTrue(readTransaction.isSealed());
     assertEquals(1, readTransaction.actions.size());
     assertInstanceOf(
         LogCatalogFormat.LogAction.CreateNamespace.class, readTransaction.actions.get(0));
-    assertFalse(logStream.hasNext());
+    assertFalse(logIterator.hasNext());
   }
 
   @Test

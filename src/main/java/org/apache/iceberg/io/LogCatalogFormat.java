@@ -26,11 +26,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.UncheckedIOException;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -50,8 +48,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 
 @SuppressWarnings("checkstyle:VisibilityModifier")
-public class LogCatalogFormat
-    implements CatalogFormat<LogCatalogFormat.LogCatalogFile, LogCatalogFormat.Mut> {
+public class LogCatalogFormat implements CatalogFormat<LogCatalogFile, LogCatalogFormat.Mut> {
   // UUID generation
   private static final Random random = new Random();
 
@@ -94,18 +91,19 @@ public class LogCatalogFormat
   @VisibleForTesting
   static LogCatalogFile readInternal(Mut catalog, InputStream in, int catalogLen)
       throws IOException {
+    LogMutator mutator = new LogMutator(catalog);
     try (DataInputStream din = new DataInputStream(in)) {
       if (din.readByte() != LogAction.Type.CHECKPOINT.opcode) {
         throw new IllegalStateException("Invalid magic bits");
       }
       LogAction.Checkpoint chk = LogAction.Checkpoint.read(din);
-      chk.apply(catalog);
+      mutator.apply(chk);
       byte[] chkBytes = new byte[(int) chk.chkLen];
       IOUtil.readFully(in, chkBytes, 0, chkBytes.length);
       InputStream chkStream = new DataInputStream(new ByteArrayInputStream(chkBytes));
       for (LogAction action : LogAction.chkIterator(new DataInputStream(chkStream))) {
         // no validation necessary in this interval
-        action.apply(catalog);
+        mutator.apply(action);
       }
       if (chk.tblEmbedEnd != 0) {
         // TODO embed table region
@@ -126,9 +124,7 @@ public class LogCatalogFormat
         logStream = new ByteArrayInputStream(logBytes);
       }
       for (LogAction.Transaction txn : LogAction.logIterator(new DataInputStream(logStream))) {
-        if (txn.verify(catalog)) {
-          txn.apply(catalog);
-        }
+        mutator.verifyAndApply(txn);
         if (txn.sealed) {
           catalog.setSealed();
           break;
@@ -153,9 +149,6 @@ public class LogCatalogFormat
       ADD_NAMESPACE_PROPERTY(7), // <nsid> <version> <key> <value>
       DROP_NAMESPACE_PROPERTY(8), // <nsid> <version> <key>
       TRANSACTION(9); // <txid> <sealed> <n_actions> <action>*
-
-      // TODO YOU FUCKING IDIOT
-      // TODO include READ_TABLE operations as constraints on serializable transactions
 
       final int opcode;
 
@@ -219,28 +212,11 @@ public class LogCatalogFormat
 
       @Override
       void write(DataOutputStream dos) throws IOException {
-        dos.writeByte(Type.CHECKPOINT.opcode);
-        // TODO write additional, magic bits + version
-        dos.writeLong(catalogUUID.getMostSignificantBits());
-        dos.writeLong(catalogUUID.getLeastSignificantBits());
-        dos.writeInt(nextNsid);
-        dos.writeInt(nextTblid);
-        dos.writeInt(chkLen);
-        dos.writeInt(tblEmbedEnd);
-        dos.writeInt(committedTxnLen);
+        LogSerializer.writeCheckpoint(this, dos);
       }
 
       static Checkpoint read(DataInputStream dis) throws IOException {
-        long msb = dis.readLong();
-        long lsb = dis.readLong();
-        UUID catalogUUID = new UUID(msb, lsb);
-        int nextNsid = dis.readInt();
-        int nextTblid = dis.readInt();
-        int chkLen = dis.readInt();
-        int tblEmbedEnd = dis.readInt();
-        int committedTxnLen = dis.readInt();
-        return new Checkpoint(
-            catalogUUID, nextNsid, nextTblid, chkLen, tblEmbedEnd, committedTxnLen);
+        return LogSerializer.readCheckpoint(dis);
       }
     }
 
@@ -291,7 +267,7 @@ public class LogCatalogFormat
         if (logNsid < 0) {
           // assign late-bound NSID, record remap
           nsid = catalog.remap(logNsid);
-          parentId = logParentId < 0 ? catalog.nsRemap.get(logParentId) : logParentId;
+          parentId = logParentId < 0 ? catalog.idManager.getRemapped(logParentId) : logParentId;
           version = 1;
           catalog.nsVersion.compute(
               parentId,
@@ -313,21 +289,11 @@ public class LogCatalogFormat
 
       @Override
       void write(DataOutputStream dos) throws IOException {
-        dos.writeByte(Type.CREATE_NAMESPACE.opcode);
-        dos.writeUTF(name);
-        dos.writeInt(logNsid);
-        dos.writeInt(logVersion);
-        dos.writeInt(logParentId);
-        dos.writeInt(logParentVersion);
+        LogSerializer.writeCreateNamespace(this, dos);
       }
 
       static CreateNamespace read(DataInputStream dis) throws IOException {
-        String name = dis.readUTF();
-        int nsid = dis.readInt();
-        int version = dis.readInt();
-        int parentId = dis.readInt();
-        int parentVersion = dis.readInt();
-        return new CreateNamespace(name, nsid, version, parentId, parentVersion);
+        return LogSerializer.readCreateNamespace(dis);
       }
     }
 
@@ -353,15 +319,11 @@ public class LogCatalogFormat
 
       @Override
       void write(DataOutputStream dos) throws IOException {
-        dos.writeByte(Type.DROP_NAMESPACE.opcode);
-        dos.writeInt(nsid);
-        dos.writeInt(version);
+        LogSerializer.writeDropNamespace(this, dos);
       }
 
       static DropNamespace read(DataInputStream dis) throws IOException {
-        int nsid = dis.readInt();
-        int version = dis.readInt();
-        return new DropNamespace(nsid, version);
+        return LogSerializer.readDropNamespace(dis);
       }
     }
 
@@ -399,7 +361,7 @@ public class LogCatalogFormat
         final int nsid;
         if (logNsid < 0) {
           // created with namespace; don't increment the namespace version
-          nsid = catalog.nsRemap.get(logNsid);
+          nsid = catalog.idManager.getRemapped(logNsid);
         } else {
           nsid = logNsid;
           if (logVersion >= 0) {
@@ -412,19 +374,11 @@ public class LogCatalogFormat
 
       @Override
       void write(DataOutputStream dos) throws IOException {
-        dos.writeByte(Type.ADD_NAMESPACE_PROPERTY.opcode);
-        dos.writeInt(logNsid);
-        dos.writeInt(logVersion);
-        dos.writeUTF(key);
-        dos.writeUTF(value);
+        LogSerializer.writeAddNamespaceProperty(this, dos);
       }
 
       static AddNamespaceProperty read(DataInputStream dis) throws IOException {
-        int nsid = dis.readInt();
-        int version = dis.readInt();
-        String key = dis.readUTF();
-        String value = dis.readUTF();
-        return new AddNamespaceProperty(nsid, version, key, value);
+        return LogSerializer.readAddNamespaceProperty(dis);
       }
     }
 
@@ -453,17 +407,11 @@ public class LogCatalogFormat
 
       @Override
       void write(DataOutputStream dos) throws IOException {
-        dos.writeByte(Type.DROP_NAMESPACE_PROPERTY.opcode);
-        dos.writeInt(nsid);
-        dos.writeInt(version);
-        dos.writeUTF(key);
+        LogSerializer.writeDropNamespaceProperty(this, dos);
       }
 
       static DropNamespaceProperty read(DataInputStream dis) throws IOException {
-        int nsid = dis.readInt();
-        int version = dis.readInt();
-        String key = dis.readUTF();
-        return new DropNamespaceProperty(nsid, version, key);
+        return LogSerializer.readDropNamespaceProperty(dis);
       }
     }
 
@@ -515,35 +463,21 @@ public class LogCatalogFormat
 
       @Override
       void apply(Mut catalog) {
-        // restore NSID, version from log (checkpoint)
-        // TODO ID remapping needs an abstraction
         // TODO reaching into internal maps is grotesque, clean this up
         // TODO XXX create table should also increment the namespace version, so concurrent creates
         // fail validation
-        final int nsid = logNsVersion < 0 ? catalog.nsRemap.get(logNsid) : logNsid;
-        final int tblId = this.logTblId == LATE_BIND ? catalog.nextTblid++ : this.logTblId;
+        final int nsid = logNsVersion < 0 ? catalog.idManager.getRemapped(logNsid) : logNsid;
+        final int tblId = this.logTblId == LATE_BIND ? catalog.idManager.allocateTblid() : this.logTblId;
         catalog.addTableInternal(tblId, nsid, logTblVersion, name, location);
       }
 
       @Override
       void write(DataOutputStream dos) throws IOException {
-        dos.writeByte(Type.CREATE_TABLE.opcode);
-        dos.writeUTF(name);
-        dos.writeInt(logTblId);
-        dos.writeInt(logTblVersion);
-        dos.writeInt(logNsid);
-        dos.writeInt(logNsVersion);
-        dos.writeUTF(location);
+        LogSerializer.writeCreateTable(this, dos);
       }
 
       static CreateTable read(DataInputStream dis) throws IOException {
-        String name = dis.readUTF();
-        int tblId = dis.readInt();
-        int tblVersion = dis.readInt();
-        int nsid = dis.readInt();
-        int nsVersion = dis.readInt();
-        String location = dis.readUTF();
-        return new CreateTable(name, tblId, tblVersion, nsid, nsVersion, location);
+        return LogSerializer.readCreateTable(dis);
       }
     }
 
@@ -569,15 +503,11 @@ public class LogCatalogFormat
 
       @Override
       void write(DataOutputStream dos) throws IOException {
-        dos.writeByte(Type.DROP_TABLE.opcode);
-        dos.writeInt(tblId);
-        dos.writeInt(version);
+        LogSerializer.writeDropTable(this, dos);
       }
 
       static DropTable read(DataInputStream dis) throws IOException {
-        int tblId = dis.readInt();
-        int version = dis.readInt();
-        return new DropTable(tblId, version);
+        return LogSerializer.readDropTable(dis);
       }
     }
 
@@ -603,15 +533,11 @@ public class LogCatalogFormat
 
       @Override
       void write(DataOutputStream dos) throws IOException {
-        dos.writeByte(Type.READ_TABLE.opcode);
-        dos.writeInt(tblId);
-        dos.writeInt(version);
+        LogSerializer.writeReadTable(this, dos);
       }
 
       static ReadTable read(DataInputStream dis) throws IOException {
-        int tblId = dis.readInt();
-        int version = dis.readInt();
-        return new ReadTable(tblId, version);
+        return LogSerializer.readReadTable(dis);
       }
     }
 
@@ -639,17 +565,11 @@ public class LogCatalogFormat
 
       @Override
       void write(DataOutputStream dos) throws IOException {
-        dos.writeByte(Type.UPDATE_TABLE.opcode);
-        dos.writeInt(tblId);
-        dos.writeInt(version);
-        dos.writeUTF(location);
+        LogSerializer.writeUpdateTable(this, dos);
       }
 
       static UpdateTable read(DataInputStream dis) throws IOException {
-        int tblId = dis.readInt();
-        int version = dis.readInt();
-        String location = dis.readUTF();
-        return new UpdateTable(tblId, version, location);
+        return LogSerializer.readUpdateTable(dis);
       }
     }
 
@@ -689,165 +609,44 @@ public class LogCatalogFormat
 
       @Override
       void write(DataOutputStream dos) throws IOException {
-        if (actions.isEmpty()) {
-          return;
-        }
-        dos.writeByte(Type.TRANSACTION.opcode);
-        dos.writeLong(txnId.getMostSignificantBits());
-        dos.writeLong(txnId.getLeastSignificantBits());
-        dos.writeBoolean(sealed);
-        dos.writeInt(actions.size());
-        for (LogAction action : actions) {
-          action.write(dos);
-        }
+        LogSerializer.writeTransaction(this, dos);
       }
 
       static void seal(byte[] serTxn) {
-        serTxn[17] = 1;
+        LogSerializer.sealTransaction(serTxn);
       }
 
       static void unseal(byte[] serTxn) {
-        serTxn[17] = 0;
+        LogSerializer.unsealTransaction(serTxn);
       }
 
       static Transaction read(DataInputStream dis) throws IOException {
-        long msb = dis.readLong();
-        long lsb = dis.readLong();
-        final UUID uuid = new UUID(msb, lsb);
-        boolean sealed = dis.readBoolean();
-        final int nActions = dis.readInt();
-        List<LogAction> actions = new ArrayList<>(nActions);
-        for (int i = 0; i < nActions; ++i) {
-          Type type = Type.from(dis.readByte());
-          switch (type) {
-            case CREATE_TABLE:
-              actions.add(CreateTable.read(dis));
-              break;
-            case UPDATE_TABLE:
-              actions.add(UpdateTable.read(dis));
-              break;
-            case READ_TABLE:
-              actions.add(ReadTable.read(dis));
-              break;
-            case DROP_TABLE:
-              actions.add(DropTable.read(dis));
-              break;
-            case CREATE_NAMESPACE:
-              actions.add(CreateNamespace.read(dis));
-              break;
-            case ADD_NAMESPACE_PROPERTY:
-              actions.add(AddNamespaceProperty.read(dis));
-              break;
-            case DROP_NAMESPACE_PROPERTY:
-              actions.add(DropNamespaceProperty.read(dis));
-              break;
-            case DROP_NAMESPACE:
-              actions.add(DropNamespace.read(dis));
-              break;
-            case TRANSACTION:
-              throw new IllegalStateException("Nested transactions are not supported");
-          }
-        }
-        return new Transaction(uuid, actions, sealed);
+        return LogSerializer.readTransaction(dis);
       }
     }
 
-    static Iterable<LogAction> chkIterator(final DataInputStream dis) throws IOException {
-      return () -> new ChkStream(dis);
+    static Iterable<LogAction> chkIterator(final DataInputStream dis) {
+      return LogSerializer.checkpointIterable(dis);
     }
 
-    static Iterable<Transaction> logIterator(final DataInputStream dis) throws IOException {
-      return () -> new LogStream(dis);
-    }
-
-    static class ChkStream implements Iterator<LogAction> {
-      private final DataInputStream dis;
-
-      ChkStream(DataInputStream dis) {
-        this.dis = dis;
-      }
-
-      @Override
-      public boolean hasNext() {
-        try {
-          return dis.available() > 0;
-        } catch (IOException e) {
-          throw new UncheckedIOException(e);
-        }
-      }
-
-      @Override
-      public LogAction next() {
-        try {
-          Type type = Type.from(dis.readByte());
-          switch (type) {
-            case CHECKPOINT:
-              return Checkpoint.read(dis);
-            case CREATE_NAMESPACE:
-              return CreateNamespace.read(dis);
-            case ADD_NAMESPACE_PROPERTY:
-              return AddNamespaceProperty.read(dis);
-            case CREATE_TABLE:
-              return CreateTable.read(dis);
-            default:
-              throw new IllegalArgumentException("Unknown action type: " + type);
-          }
-        } catch (IOException e) {
-          throw new UncheckedIOException(e);
-        }
-      }
-    }
-
-    static class LogStream implements Iterator<Transaction> {
-      private final DataInputStream dis;
-
-      LogStream(DataInputStream dis) {
-        this.dis = dis;
-      }
-
-      @Override
-      public boolean hasNext() {
-        try {
-          return dis.available() > 0;
-        } catch (IOException e) {
-          throw new UncheckedIOException(e);
-        }
-      }
-
-      @Override
-      public Transaction next() {
-        try {
-          Type type = Type.from(dis.readByte());
-          switch (type) {
-            case TRANSACTION:
-              return Transaction.read(dis);
-            case CHECKPOINT:
-            case CREATE_TABLE:
-            case UPDATE_TABLE:
-            case READ_TABLE:
-            case DROP_TABLE:
-            case CREATE_NAMESPACE:
-            case ADD_NAMESPACE_PROPERTY:
-            case DROP_NAMESPACE_PROPERTY:
-            case DROP_NAMESPACE:
-              throw new IllegalStateException("Action not in transaction");
-            default:
-              throw new IllegalArgumentException("Unknown action type: " + type);
-          }
-        } catch (IOException e) {
-          throw new UncheckedIOException(e);
-        }
-      }
+    static Iterable<Transaction> logIterator(final DataInputStream dis) {
+      return LogSerializer.logIterable(dis);
     }
   }
 
-  // TODO move this to LogCatalogFile
+  /**
+   * Mutable builder for LogCatalogFile that accumulates changes and commits atomically.
+   *
+   * <p>TODO (Future refactoring): The format-specific state fields below (nsids, nsVersion,
+   * nsLookup, nsProperties, tblIds, tblVersion, tblLocations, committedTxn) could be moved to a
+   * separate LogMutState class to further separate "what user requested" (base class fields) from
+   * "how format implements it" (format-specific state). This was deferred as a higher-risk change.
+   */
   public static class Mut extends CatalogFile.Mut<LogCatalogFile, Mut> {
     // namespace IDs are internal to the catalog format
 
     private UUID uuid = null;
-    private int nextNsid = 1;
-    private int nextTblid = 1;
+    private final LogIdManager idManager = new LogIdManager();
     private boolean sealed = false;
     private final Set<UUID> committedTxn = Sets.newHashSet();
 
@@ -861,7 +660,6 @@ public class LogCatalogFormat
     // );
     private final Map<Namespace, Integer> nsids = Maps.newHashMap();
     private final Map<Integer, Integer> nsVersion = Maps.newHashMap();
-    private final Map<Integer, Integer> nsRemap = Maps.newHashMap();
     private final Map<Integer, Namespace> nsLookup = Maps.newHashMap();
 
     // CREATE TABLE ns_prop (
@@ -893,8 +691,7 @@ public class LogCatalogFormat
     Mut(InputFile input, UUID uuid, int nextNsid, int nextTblid) {
       this(new LogCatalogFile(input));
       this.uuid = uuid;
-      this.nextNsid = nextNsid;
-      this.nextTblid = nextTblid;
+      this.idManager.setGlobals(nextNsid, nextTblid);
     }
 
     // changes to be applied to this catalog
@@ -907,17 +704,13 @@ public class LogCatalogFormat
     }
 
     int remap(int nsid) {
-      Preconditions.checkArgument(nsid < 0, "Attempting to remap non-virtual namespace: %d", nsid);
-      final int assignedNsid = nextNsid++;
-      nsRemap.put(nsid, assignedNsid);
-      return assignedNsid;
+      return idManager.remap(nsid);
     }
 
     void setGlobals(UUID uuid, int nextNsid, int nextTblid) {
       Preconditions.checkArgument(this.uuid == null, "UUID already set");
       this.uuid = uuid;
-      this.nextNsid = nextNsid;
-      this.nextTblid = nextTblid;
+      idManager.setGlobals(nextNsid, nextTblid);
       // TODO add compaction parameters so clients use the same criteria?
     }
 
@@ -937,7 +730,7 @@ public class LogCatalogFormat
       } else {
         Namespace parent = nsLookup.get(parentId);
         if (null == parent) {
-          parent = original.nsLookup.get(parentId);
+          parent = original.getNsLookup().get(parentId);
           if (null == parent) {
             throw new IllegalStateException("Invalid parent namespace: " + parentId);
           }
@@ -1009,15 +802,15 @@ public class LogCatalogFormat
 
     // store the serialized bytes for committted transactions (lazily resolve)
     void committedTransactionBytes(byte[] committedTxnBytes) {
-      LogCatalogFile.readCommittedTxn(committedTxn, committedTxnBytes);
+      LogSerializer.readCommittedTransactions(committedTxn, committedTxnBytes);
     }
 
     LogCatalogFile merge() {
       return new LogCatalogFile(
           original.location(),
           uuid,
-          nextNsid,
-          nextTblid,
+          idManager.getNextNsid(),
+          idManager.getNextTblid(),
           sealed,
           Maps.newHashMap(nsids),
           Maps.newHashMap(nsVersion),
@@ -1191,13 +984,7 @@ public class LogCatalogFormat
     }
 
     static byte[] toBytes(LogCatalogFormat.LogAction.Transaction diffActions) {
-      try (ByteArrayOutputStream bos = new ByteArrayOutputStream();
-          DataOutputStream dos = new DataOutputStream(bos)) {
-        diffActions.write(dos);
-        return bos.toByteArray();
-      } catch (IOException e) {
-        throw new UncheckedIOException("Failed to write/read diff", e);
-      }
+      return LogSerializer.transactionToBytes(diffActions);
     }
 
     @Override
@@ -1283,283 +1070,4 @@ public class LogCatalogFormat
     return new UUID(msb, lsb);
   }
 
-  public static class LogCatalogFile extends CatalogFile {
-    final int nextNsid;
-    final int nextTblid;
-    final boolean sealed;
-
-    private final Set<UUID> committedTxn;
-
-    private final Map<Namespace, Integer> nsids;
-    private final Map<Integer, Integer> nsVersion;
-    private final Map<Integer, Namespace> nsLookup;
-
-    private final Map<Integer, Map<String, String>> nsProperties;
-
-    private final Map<TableIdentifier, Integer> tblIds;
-    private final Map<Integer, Integer> tblVersion;
-    private final Map<Integer, String> tblLocations;
-
-    // empty LogCatalogFile
-    LogCatalogFile(InputFile location) {
-      super(location);
-      this.nextNsid = 1;
-      this.nextTblid = 1;
-      this.sealed = false;
-      this.nsids = Maps.newHashMap();
-      this.nsVersion = Maps.newHashMap();
-      this.nsProperties = Maps.newHashMap();
-      this.tblIds = Maps.newHashMap();
-      this.tblVersion = Maps.newHashMap();
-      this.tblLocations = Maps.newHashMap();
-      this.nsLookup = Maps.newHashMap();
-      this.committedTxn = Sets.newHashSet();
-      this.nsids.put(Namespace.empty(), 0);
-      this.nsVersion.put(0, 1);
-      this.nsLookup.put(0, Namespace.empty());
-    }
-
-    LogCatalogFile(
-        InputFile location,
-        UUID catalogUUID,
-        int nextNsid,
-        int nextTblid,
-        boolean sealed,
-        Map<Namespace, Integer> nsids,
-        Map<Integer, Integer> nsVersion,
-        Map<Integer, Map<String, String>> nsProperties,
-        Map<TableIdentifier, Integer> tblIds,
-        Map<Integer, Integer> tblVersion,
-        Map<Integer, String> tblLocations,
-        Set<UUID> committedTxn) {
-      super(catalogUUID, location);
-      this.sealed = sealed;
-      this.nextNsid = nextNsid;
-      this.nextTblid = nextTblid;
-      this.nsids = nsids;
-      this.nsVersion = nsVersion;
-      this.nsProperties = nsProperties;
-      this.tblIds = tblIds;
-      this.tblVersion = tblVersion;
-      this.tblLocations = tblLocations;
-      this.committedTxn = committedTxn;
-      this.nsLookup =
-          nsids.entrySet().stream()
-              .collect(Collectors.toMap(Map.Entry::getValue, Map.Entry::getKey));
-      if (!nsids.containsKey(Namespace.empty())) {
-        throw new IllegalStateException("Missing root/empty namespace");
-      }
-    }
-
-    // TODO move this to format (why does this here?)
-    @Override
-    public boolean createsHierarchicalNamespaces() {
-      return true;
-    }
-
-    public boolean containsTransaction(UUID txnId) {
-      return committedTxn.contains(txnId);
-    }
-
-    @Override
-    public String location(TableIdentifier table) {
-      final Integer tblId = tblIds.get(table);
-      if (tblId == null) {
-        return null;
-      }
-      return tblLocations.get(tblId);
-    }
-
-    @Override
-    public Set<Namespace> namespaces() {
-      return Collections.unmodifiableSet(nsids.keySet());
-    }
-
-    @Override
-    public boolean containsNamespace(Namespace namespace) {
-      return nsids.containsKey(namespace);
-    }
-
-    @Override
-    public Map<String, String> namespaceProperties(Namespace namespace) {
-      final Integer nsid = nsids.get(namespace);
-      if (nsid == null) {
-        return null;
-      }
-      return Collections.unmodifiableMap(nsProperties.getOrDefault(nsid, Collections.emptyMap()));
-    }
-
-    @Override
-    public List<TableIdentifier> tables() {
-      return Lists.newArrayList(tblIds.keySet().iterator());
-    }
-
-    @Override
-    Map<Namespace, Map<String, String>> namespaceProperties() {
-      return nsids.entrySet().stream()
-          .collect(
-              Collectors.toMap(
-                  Map.Entry::getKey,
-                  e -> nsProperties.getOrDefault(e.getValue(), Collections.emptyMap())));
-    }
-
-    @Override
-    Map<TableIdentifier, String> locations() {
-      return tblIds.entrySet().stream()
-          .collect(Collectors.toMap(Map.Entry::getKey, e -> tblLocations.get(e.getValue())));
-    }
-
-    // emit stream of actions that recreate this catalog, NOT including Checkpoint action
-    List<LogAction> checkpointStream() {
-      List<LogAction> actions = Lists.newArrayList();
-      // TODO regions
-      // TODO ensure properties of deleted namespaces are removed
-      // sort by nsid; sufficient for parentId, since namespaces never move, are created in order
-      for (Map.Entry<Namespace, Integer> e :
-          nsids.entrySet().stream()
-              .sorted(Comparator.comparingInt(Map.Entry::getValue))
-              .collect(Collectors.toList())) {
-        final Namespace ns = e.getKey();
-        final int nsid = e.getValue();
-        final int version = nsVersion.get(nsid);
-        final int levels = ns.length();
-        final Namespace parent =
-            levels > 1
-                ? Namespace.of(Arrays.copyOfRange(ns.levels(), 0, levels - 1))
-                : Namespace.empty();
-        final int parentId = nsids.get(parent);
-        actions.add(
-            new LogAction.CreateNamespace(
-                0 == levels ? "" : ns.level(levels - 1),
-                nsid,
-                version,
-                parentId,
-                nsVersion.get(parentId)));
-      }
-      for (Map.Entry<Integer, Map<String, String>> e : nsProperties.entrySet()) {
-        final int nsid = e.getKey();
-        for (Map.Entry<String, String> prop : e.getValue().entrySet()) {
-          actions.add(new LogAction.AddNamespaceProperty(nsid, prop.getKey(), prop.getValue()));
-        }
-      }
-      for (Map.Entry<TableIdentifier, Integer> e : tblIds.entrySet()) {
-        final TableIdentifier ti = e.getKey();
-        final int tblId = e.getValue();
-        final int version = tblVersion.get(tblId);
-        final int nsid = nsids.get(ti.namespace());
-        actions.add(
-            new LogAction.CreateTable(
-                ti.name(), tblId, version, nsid, nsVersion.get(nsid), tblLocations.get(tblId)));
-      }
-      return actions;
-    }
-
-    // absolutely disgusting
-    static void readCommittedTxn(Set<UUID> committedTxn, byte[] txnBytes) {
-      try (ByteArrayInputStream bais = new ByteArrayInputStream(txnBytes);
-          DataInputStream txndis = new DataInputStream(bais)) {
-        int nTxn = txndis.readInt();
-        for (int i = 0; i < nTxn; ++i) {
-          long msb = txndis.readLong();
-          long lsb = txndis.readLong();
-          committedTxn.add(new UUID(msb, lsb));
-        }
-      } catch (IOException e) {
-        throw new UncheckedIOException(e); // not possible
-      }
-    }
-
-    void writeCommittedTxn(DataOutputStream txndos) throws IOException {
-      txndos.writeInt(committedTxn.size());
-      for (UUID u : committedTxn.stream().sorted().collect(Collectors.toList())) {
-        txndos.writeLong(u.getMostSignificantBits());
-        txndos.writeLong(u.getLeastSignificantBits());
-      }
-    }
-
-    void writeCheckpoint(OutputStream out) throws IOException {
-      try (ByteArrayOutputStream bos = new ByteArrayOutputStream();
-          DataOutputStream chk = new DataOutputStream(out)) {
-        final byte[] chkData;
-        try (DataOutputStream chkdos = new DataOutputStream(bos)) {
-          for (LogAction action : checkpointStream()) {
-            action.write(chkdos);
-          }
-          chkData = bos.toByteArray(); // SIGH. You suck.
-        }
-
-        bos.reset();
-
-        final byte[] txnData;
-        try (DataOutputStream txndos = new DataOutputStream(bos)) {
-          writeCommittedTxn(txndos);
-          txnData = bos.toByteArray();
-        }
-        final LogAction.Checkpoint chkAction =
-            new LogAction.Checkpoint(
-                uuid(), nextNsid, nextTblid, chkData.length, 0, txnData.length);
-        chkAction.write(chk);
-        out.write(chkData);
-        out.write(txnData);
-      }
-    }
-
-    @Override
-    public boolean equals(Object o) {
-      if (this == o) {
-        return true;
-      }
-      if (o == null || getClass() != o.getClass()) {
-        return false;
-      }
-      LogCatalogFile that = (LogCatalogFile) o;
-      return nextNsid == that.nextNsid
-          && nextTblid == that.nextTblid
-          && Objects.equals(uuid(), that.uuid())
-          && Objects.equals(nsids, that.nsids)
-          && Objects.equals(nsVersion, that.nsVersion)
-          && Objects.equals(nsProperties, that.nsProperties)
-          && Objects.equals(tblIds, that.tblIds)
-          && Objects.equals(tblVersion, that.tblVersion)
-          && Objects.equals(tblLocations, that.tblLocations);
-    }
-
-    @Override
-    public int hashCode() {
-      return Objects.hash(
-          uuid(),
-          nextNsid,
-          nextTblid,
-          nsids,
-          nsVersion,
-          nsProperties,
-          tblIds,
-          tblVersion,
-          tblLocations);
-    }
-
-    @Override
-    public String toString() {
-      return "LogCatalogFile{"
-          + "catalogUUID="
-          + uuid()
-          + ", nextNsid="
-          + nextNsid
-          + ", nextTblid="
-          + nextTblid
-          + ", nsids="
-          + nsids
-          + ", nsVersion="
-          + nsVersion
-          + ", nsProperties="
-          + nsProperties
-          + ", tblIds="
-          + tblIds
-          + ", tblVersion="
-          + tblVersion
-          + ", tblLocations="
-          + tblLocations
-          + '}';
-    }
-  }
 }
