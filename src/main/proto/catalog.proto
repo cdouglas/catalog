@@ -1,0 +1,142 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+syntax = "proto3";
+package iceberg.catalog;
+
+option java_package = "org.apache.iceberg.catalog.proto";
+option java_outer_classname = "CatalogProto";
+
+// ============================================================
+// Checkpoint - written on compaction (CAS)
+// ============================================================
+
+message Checkpoint {
+  // Catalog identity
+  bytes catalog_uuid = 1;           // 16 bytes, UUIDv7
+
+  // ID allocation state
+  int32 next_namespace_id = 2;
+  int32 next_table_id = 3;
+
+  // Catalog contents
+  repeated Namespace namespaces = 10;
+  repeated Table tables = 11;
+  repeated NamespaceProperty namespace_properties = 12;
+
+  // Committed transaction tracking (for deduplication)
+  repeated bytes committed_transaction_ids = 20;  // UUIDv7s, 16 bytes each
+}
+
+message Namespace {
+  int32 id = 1;
+  int32 version = 2;
+  int32 parent_id = 3;      // 0 = root
+  string name = 4;          // single level name, not full path
+}
+
+message Table {
+  int32 id = 1;
+  int32 version = 2;
+  int32 namespace_id = 3;
+  string name = 4;
+  string metadata_location = 5;
+}
+
+message NamespaceProperty {
+  int32 namespace_id = 1;
+  string key = 2;
+  string value = 3;
+}
+
+// ============================================================
+// Transaction Log - appended atomically
+// ============================================================
+
+message Transaction {
+  bytes transaction_id = 1;         // UUIDv7, 16 bytes
+  bool sealed = 2;                  // signals compaction needed
+  repeated Action actions = 3;
+}
+
+message Action {
+  oneof action {
+    CreateNamespace create_namespace = 1;
+    DropNamespace drop_namespace = 2;
+    SetNamespaceProperty set_namespace_property = 3;
+    RemoveNamespaceProperty remove_namespace_property = 4;
+    CreateTable create_table = 5;
+    DropTable drop_table = 6;
+    UpdateTableLocation update_table_location = 7;
+    ReadTable read_table = 8;       // for read-your-writes validation
+  }
+}
+
+// ============================================================
+// Action types - version fields enable conflict detection
+// ============================================================
+
+message CreateNamespace {
+  int32 id = 1;                     // assigned ID, or negative for late-bind
+  int32 version = 2;                // -1 for late-bind
+  int32 parent_id = 3;
+  int32 parent_version = 4;         // for conflict detection, -1 if parent is late-bound
+  string name = 5;
+}
+
+message DropNamespace {
+  int32 id = 1;
+  int32 version = 2;                // must match for commit
+}
+
+message SetNamespaceProperty {
+  int32 namespace_id = 1;
+  int32 namespace_version = 2;      // -1 if namespace created in same txn
+  string key = 3;
+  string value = 4;
+}
+
+message RemoveNamespaceProperty {
+  int32 namespace_id = 1;
+  int32 namespace_version = 2;
+  string key = 3;
+}
+
+message CreateTable {
+  int32 id = 1;                     // -1 for late-bind
+  int32 version = 2;
+  int32 namespace_id = 3;
+  int32 namespace_version = 4;      // -1 if namespace is late-bound
+  string name = 5;
+  string metadata_location = 6;
+}
+
+message DropTable {
+  int32 id = 1;
+  int32 version = 2;
+}
+
+message UpdateTableLocation {
+  int32 id = 1;
+  int32 version = 2;                // must match current
+  string metadata_location = 3;
+}
+
+message ReadTable {
+  int32 id = 1;
+  int32 version = 2;                // version that was read
+}
