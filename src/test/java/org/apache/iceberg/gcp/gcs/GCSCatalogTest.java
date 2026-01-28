@@ -40,7 +40,6 @@ import org.apache.iceberg.io.CASCatalogFormat;
 import org.apache.iceberg.io.FileIOCatalog;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
-import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.TestInfo;
@@ -56,7 +55,6 @@ public class GCSCatalogTest extends CatalogTests<FileIOCatalog> {
   private static final Logger LOG = LoggerFactory.getLogger(GCSCatalogTest.class);
 
   private static Storage storage;
-  private static boolean usingRealGCS = false;
   private FileIOCatalog catalog;
   private static String warehouseLocation;
   private static String uniqTestRun;
@@ -88,7 +86,6 @@ public class GCSCatalogTest extends CatalogTests<FileIOCatalog> {
     if (credFile.exists()) {
       try (FileInputStream creds = new FileInputStream(credFile)) {
         storage = RemoteStorageHelper.create("lst-consistency", creds).getOptions().getService();
-        usingRealGCS = true;
         LOG.info("Using remote storage");
       }
     } else {
@@ -113,10 +110,6 @@ public class GCSCatalogTest extends CatalogTests<FileIOCatalog> {
 
   @BeforeEach
   public void before(TestInfo info) {
-    // BlobWriteSession API is not supported by LocalStorageHelper, so skip tests when not using real GCS
-    Assumptions.assumeTrue(
-        usingRealGCS, "GCS integration tests require real GCS (BlobWriteSession not supported by mock)");
-
     // XXX don't call io.initialize(), as it will overwrite this config
     GCSFileIO io = new GCSFileIO(() -> storage, new GCPProperties());
 
