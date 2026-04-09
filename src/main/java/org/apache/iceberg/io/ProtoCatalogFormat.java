@@ -340,6 +340,37 @@ public class ProtoCatalogFormat
           actions.add(new ProtoCodec.ReadTableAction(tblId, version));
         }
       }
+
+      // Process inline table creates
+      for (Map.Entry<TableIdentifier, byte[]> entry : inlineTables.entrySet()) {
+        TableIdentifier ident = entry.getKey();
+        byte[] metadata = entry.getValue();
+        Namespace ns = ident.namespace();
+
+        Integer nsId = original.namespaceId(ns);
+        int nsVersion = -1;
+        if (nsId == null) {
+          nsId = nsIdMap.get(ns);
+        } else {
+          nsVersion = original.namespaceVersion(nsId);
+        }
+
+        int tblId = idManager.allocateTblid();
+        actions.add(new ProtoCodec.CreateTableInlineAction(
+            tblId, 1, nsId, nsVersion, ident.name(), metadata));
+      }
+
+      // Process inline table updates (full mode)
+      for (Map.Entry<TableIdentifier, byte[]> entry : inlineTableUpdates.entrySet()) {
+        TableIdentifier ident = entry.getKey();
+        byte[] metadata = entry.getValue();
+        Integer tblId = original.tableId(ident);
+        if (tblId != null) {
+          int version = original.tableVersion(tblId);
+          actions.add(new ProtoCodec.UpdateTableInlineAction(
+              tblId, version, metadata, null));
+        }
+      }
     }
 
     @Override

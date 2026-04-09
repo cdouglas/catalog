@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.io;
 
+import java.nio.charset.StandardCharsets;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -30,6 +31,7 @@ import org.apache.iceberg.BaseMetastoreTableOperations;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.CatalogUtil;
 import org.apache.iceberg.TableMetadata;
+import org.apache.iceberg.TableMetadataParser;
 import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.catalog.BaseCatalogTransaction;
 import org.apache.iceberg.catalog.CatalogTransaction;
@@ -54,6 +56,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
   // TODO buildTable overridden in BaseMetastoreCatalog?
 
   private static final String FILE_FORMAT = "fileio.catalog.format";
+  private static final String INLINE_ENABLED = "fileio.catalog.inline";
 
   private Configuration conf; // TODO: delete
   private String catalogName = "fileio";
@@ -175,11 +178,17 @@ public class FileIOCatalog extends BaseMetastoreCatalog
 
   @Override
   protected TableOperations newTableOps(TableIdentifier tableIdentifier) {
-    return new FileIOTableOperations(tableIdentifier, catalogLocation, format, fileIO);
+    boolean inline = Boolean.parseBoolean(
+        catalogProperties.getOrDefault(INLINE_ENABLED, "false"));
+    return new FileIOTableOperations(
+        tableIdentifier, catalogLocation, format, fileIO, inline);
   }
 
   FileIOTableOperations newTableOps(TableIdentifier tableIdentifier, CatalogFile catalogFile) {
-    return new FileIOTableOperations(tableIdentifier, catalogLocation, format, fileIO, catalogFile);
+    boolean inline = Boolean.parseBoolean(
+        catalogProperties.getOrDefault(INLINE_ENABLED, "false"));
+    return new FileIOTableOperations(
+        tableIdentifier, catalogLocation, format, fileIO, inline, catalogFile);
   }
 
   @Override
@@ -267,14 +276,16 @@ public class FileIOCatalog extends BaseMetastoreCatalog
     private final TableIdentifier tableId;
     private final CatalogFormat format;
     private final SupportsAtomicOperations fileIO;
+    private final boolean inlineEnabled;
     private volatile CatalogFile lastCatalogFile = null;
 
     FileIOTableOperations(
         TableIdentifier tableId,
         String catalogLocation,
         CatalogFormat format,
-        SupportsAtomicOperations fileIO) {
-      this(tableId, catalogLocation, format, fileIO, null);
+        SupportsAtomicOperations fileIO,
+        boolean inlineEnabled) {
+      this(tableId, catalogLocation, format, fileIO, inlineEnabled, null);
     }
 
     FileIOTableOperations(
@@ -282,14 +293,16 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         String catalogLocation,
         CatalogFormat format,
         SupportsAtomicOperations fileIO,
+        boolean inlineEnabled,
         CatalogFile catalogFile) {
       this.fileIO = fileIO;
       this.format = format;
       this.tableId = tableId;
       this.catalogLocation = catalogLocation;
+      this.inlineEnabled = inlineEnabled;
       this.lastCatalogFile = catalogFile;
       if (catalogFile != null) {
-        updateVersionAndMetadata(catalogFile.location(tableId));
+        loadFromCatalogFile(catalogFile);
         disableRefresh();
       }
     }
@@ -299,21 +312,29 @@ public class FileIOCatalog extends BaseMetastoreCatalog
       return fileIO;
     }
 
-    // version 0 reserved for empty catalog; tables created in subsequent commits TODO replace w/
-    // metadata embed
-    private synchronized void updateVersionAndMetadata(String metadataFile) {
-      // update if table exists and version lags newVersion
-      if (null == metadataFile) {
-        if (currentMetadataLocation() != null) {
-          // table used to exist, but not found in CatalogFile
-          throw new NoSuchTableException("Table %s was deleted", tableId);
-        } else {
-          disableRefresh(); // table does not exist, yet; no need to refresh
-          return;
-        }
+    /**
+     * Loads table metadata from a CatalogFile, handling both pointer and inline tables.
+     */
+    private synchronized void loadFromCatalogFile(CatalogFile catalogFile) {
+      String metadataFile = catalogFile.location(tableId);
+      if (metadataFile != null) {
+        // Pointer table: load metadata from external file
+        refreshFromMetadataLocation(metadataFile);
+      } else if (catalogFile.isInlineTable(tableId)) {
+        // Inline table: load metadata from catalog bytes
+        byte[] inlineMeta = catalogFile.inlineMetadata(tableId);
+        String json = new String(inlineMeta, StandardCharsets.UTF_8);
+        // Use synthetic location for change detection; custom loader skips file I/O
+        String syntheticLoc = "inline://" + tableId + "#v" + System.nanoTime();
+        refreshFromMetadataLocation(syntheticLoc, null, 0,
+            loc -> TableMetadataParser.fromJson(loc, json));
+      } else if (currentMetadataLocation() != null) {
+        // Table used to exist but is now missing
+        throw new NoSuchTableException("Table %s was deleted", tableId);
+      } else {
+        // Table does not exist yet
+        disableRefresh();
       }
-      // checks for UUID match
-      refreshFromMetadataLocation(metadataFile);
     }
 
     @Override
@@ -325,8 +346,8 @@ public class FileIOCatalog extends BaseMetastoreCatalog
     protected void doRefresh() {
       final CatalogFile updatedCatalogFile =
           format.read(fileIO, io().newInputFile(catalogLocation));
-      updateVersionAndMetadata(updatedCatalogFile.location(tableId));
       lastCatalogFile = updatedCatalogFile;
+      loadFromCatalogFile(updatedCatalogFile);
     }
 
     // visible from commitTransaction
@@ -334,15 +355,37 @@ public class FileIOCatalog extends BaseMetastoreCatalog
       return writeNewMetadataIfRequired(isCreate, metadata);
     }
 
+    private boolean shouldInline() {
+      return inlineEnabled;
+    }
+
     @Override
     public void doCommit(TableMetadata base, TableMetadata metadata) {
       final boolean isCreate = null == base;
-      final String newMetadataLocation = writeUpdateMetadata(isCreate, metadata);
       try {
-        if (null == base) {
-          format.from(lastCatalogFile).createTable(tableId, newMetadataLocation).commit(io());
+        if (shouldInline()) {
+          String json = TableMetadataParser.toJson(metadata);
+          byte[] metadataBytes = json.getBytes(StandardCharsets.UTF_8);
+          if (isCreate) {
+            format.from(lastCatalogFile)
+                .createTableInline(tableId, metadataBytes)
+                .commit(io());
+          } else {
+            format.from(lastCatalogFile)
+                .updateTableInline(tableId, metadataBytes)
+                .commit(io());
+          }
         } else {
-          format.from(lastCatalogFile).updateTable(tableId, newMetadataLocation).commit(io());
+          final String newMetadataLocation = writeUpdateMetadata(isCreate, metadata);
+          if (isCreate) {
+            format.from(lastCatalogFile)
+                .createTable(tableId, newMetadataLocation)
+                .commit(io());
+          } else {
+            format.from(lastCatalogFile)
+                .updateTable(tableId, newMetadataLocation)
+                .commit(io());
+          }
         }
       } catch (SupportsAtomicOperations.CASException e) {
         throw new CommitFailedException(e, "Failed to commit metadata for table %s", tableId);
@@ -378,9 +421,16 @@ public class FileIOCatalog extends BaseMetastoreCatalog
       if (newMetadata.changes().isEmpty()) {
         continue;
       }
-      // !#! HERE; inline metadata
-      final String newLocation = ops.writeUpdateMetadata(false, newMetadata);
-      newCatalog.updateTable(tableId, newLocation);
+      boolean inline = Boolean.parseBoolean(
+          catalogProperties.getOrDefault(INLINE_ENABLED, "false"));
+      if (inline) {
+        String json = TableMetadataParser.toJson(newMetadata);
+        byte[] metadataBytes = json.getBytes(StandardCharsets.UTF_8);
+        newCatalog.updateTableInline(tableId, metadataBytes);
+      } else {
+        final String newLocation = ops.writeUpdateMetadata(false, newMetadata);
+        newCatalog.updateTable(tableId, newLocation);
+      }
     }
     try {
       newCatalog.commit(fileIO);

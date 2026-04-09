@@ -1280,6 +1280,103 @@ public class TestProtoActions {
       assertThat(result.manifestListPrefix(result.tableId(t2)))
           .isEqualTo("s3://b/db2/t2/metadata/snap-");
     }
+
+    // --- Mut-level inline API tests (Stage 4) ---
+
+    @Test
+    void mutCreateTableInlineProducesCorrectAction() throws IOException {
+      ProtoCatalogFile orig = ProtoCatalogFile.builder(LOCATION)
+          .addNamespace(0, 0, "", 1)
+          .addNamespace(1, 0, "db", 1)
+          .setNextNamespaceId(2)
+          .setNextTableId(1)
+          .build();
+      byte[] origBytes = toFileBytes(orig);
+      ProtoCatalogFile fresh = ProtoCatalogFormat.readInternal(
+          LOCATION, new java.io.ByteArrayInputStream(origBytes), origBytes.length);
+
+      ProtoCatalogFormat.Mut mut = new ProtoCatalogFormat.Mut(fresh);
+      mut.createTableInline(
+          TableIdentifier.of(Namespace.of("db"), "events"), SAMPLE_INLINE_METADATA);
+      ProtoCodec.Transaction txn = mut.buildTransaction();
+
+      // Should produce a CreateTableInlineAction
+      assertThat(txn.actions()).hasSize(1);
+      assertThat(txn.actions().get(0))
+          .isInstanceOf(ProtoCodec.CreateTableInlineAction.class);
+
+      // Apply and verify
+      ProtoCatalogFile result = apply(origBytes, txn);
+      TableIdentifier events = TableIdentifier.of(Namespace.of("db"), "events");
+      assertThat(result.isInlineTable(events)).isTrue();
+      assertThat(result.inlineMetadata(events)).isEqualTo(SAMPLE_INLINE_METADATA);
+    }
+
+    @Test
+    void mutUpdateTableInlineProducesCorrectAction() throws IOException {
+      ProtoCatalogFile orig = ProtoCatalogFile.builder(LOCATION)
+          .addNamespace(0, 0, "", 1)
+          .addNamespace(1, 0, "db", 1)
+          .setNextNamespaceId(2)
+          .setNextTableId(2)
+          .build();
+      // Add inline table directly
+      orig.builder(LOCATION)
+          .addNamespace(0, 0, "", 1)
+          .addNamespace(1, 0, "db", 1)
+          .addInlineTable(1, 1, "events", 1, SAMPLE_INLINE_METADATA, SAMPLE_MANIFEST_PREFIX)
+          .setNextNamespaceId(2)
+          .setNextTableId(2)
+          .build();
+
+      // Build from checkpoint with inline table
+      byte[] origBytes = catalog()
+          .ns(1, 0, "db", 1)
+          .inlineTbl(1, 1, "events", 1, SAMPLE_INLINE_METADATA, SAMPLE_MANIFEST_PREFIX)
+          .build();
+      ProtoCatalogFile fresh = ProtoCatalogFormat.readInternal(
+          LOCATION, new java.io.ByteArrayInputStream(origBytes), origBytes.length);
+
+      byte[] newMeta = "{\"updated\":true}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+      ProtoCatalogFormat.Mut mut = new ProtoCatalogFormat.Mut(fresh);
+      mut.updateTableInline(
+          TableIdentifier.of(Namespace.of("db"), "events"), newMeta);
+      ProtoCodec.Transaction txn = mut.buildTransaction();
+
+      // Should produce an UpdateTableInlineAction
+      assertThat(txn.actions()).hasSize(1);
+      assertThat(txn.actions().get(0))
+          .isInstanceOf(ProtoCodec.UpdateTableInlineAction.class);
+
+      // Apply and verify
+      ProtoCatalogFile result = apply(origBytes, txn);
+      TableIdentifier events = TableIdentifier.of(Namespace.of("db"), "events");
+      assertThat(result.isInlineTable(events)).isTrue();
+      assertThat(result.inlineMetadata(events)).isEqualTo(newMeta);
+      assertThat(result.tableVersion(result.tableId(events))).isEqualTo(2);
+    }
+
+    @Test
+    void mutMixedInlineAndPointerInSameTransaction() throws IOException {
+      byte[] origBytes = catalog().ns(1, 0, "db", 1).build();
+      ProtoCatalogFile fresh = ProtoCatalogFormat.readInternal(
+          LOCATION, new java.io.ByteArrayInputStream(origBytes), origBytes.length);
+
+      ProtoCatalogFormat.Mut mut = new ProtoCatalogFormat.Mut(fresh);
+      mut.createTable(
+          TableIdentifier.of(Namespace.of("db"), "pointer_tbl"), "s3://bucket/pointer/v1");
+      mut.createTableInline(
+          TableIdentifier.of(Namespace.of("db"), "inline_tbl"), SAMPLE_INLINE_METADATA);
+      ProtoCodec.Transaction txn = mut.buildTransaction();
+
+      assertThat(txn.actions()).hasSize(2);
+
+      ProtoCatalogFile result = apply(origBytes, txn);
+      TableIdentifier pointer = TableIdentifier.of(Namespace.of("db"), "pointer_tbl");
+      TableIdentifier inline = TableIdentifier.of(Namespace.of("db"), "inline_tbl");
+      assertThat(result.location(pointer)).isEqualTo("s3://bucket/pointer/v1");
+      assertThat(result.isInlineTable(inline)).isTrue();
+    }
   }
 
   // ============================================================

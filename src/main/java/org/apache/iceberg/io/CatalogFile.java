@@ -72,6 +72,21 @@ public abstract class CatalogFile {
 
   public abstract List<TableIdentifier> tables();
 
+  /** Returns true if the table exists in the catalog (pointer or inline). */
+  public boolean containsTable(TableIdentifier table) {
+    return location(table) != null;
+  }
+
+  /** Returns true if the table is stored inline (metadata in catalog). Default: false. */
+  public boolean isInlineTable(TableIdentifier table) {
+    return false;
+  }
+
+  /** Returns inline metadata bytes for the table, or null if not inline. */
+  public byte[] inlineMetadata(TableIdentifier table) {
+    return null;
+  }
+
   abstract Map<Namespace, Map<String, String>> namespaceProperties();
 
   abstract Map<TableIdentifier, String> locations();
@@ -81,9 +96,12 @@ public abstract class CatalogFile {
     protected final C original;
     protected final Set<TableIdentifier> readTables;
     protected final Map<TableIdentifier, String> tables;
-    protected final Map<TableIdentifier, String> tableUpdates; // TODO extend this to metadata
+    protected final Map<TableIdentifier, String> tableUpdates;
     protected final Map<Namespace, Boolean> namespaces;
     protected final Map<Namespace, Map<String, String>> namespaceProperties;
+    // Inline table mutations (metadata stored in catalog, not external file)
+    protected final Map<TableIdentifier, byte[]> inlineTables;
+    protected final Map<TableIdentifier, byte[]> inlineTableUpdates;
 
     protected Mut(C original) {
       this.original = original;
@@ -92,6 +110,8 @@ public abstract class CatalogFile {
       this.tableUpdates = Maps.newHashMap();
       this.namespaces = Maps.newHashMap();
       this.namespaceProperties = Maps.newHashMap();
+      this.inlineTables = Maps.newHashMap();
+      this.inlineTableUpdates = Maps.newHashMap();
     }
 
     @SuppressWarnings("unchecked")
@@ -201,7 +221,8 @@ public abstract class CatalogFile {
       if (checkNamespaceExists(table.namespace())) {
         throw new NoSuchNamespaceException("Namespace does not exist: %s", table.namespace());
       }
-      if (original.location(table) != null || tables.get(table) != null) {
+      if (original.containsTable(table) || tables.get(table) != null
+          || inlineTables.get(table) != null) {
         throw new AlreadyExistsException("Table already exists: %s", table);
       }
       tables.put(table, location);
@@ -220,7 +241,7 @@ public abstract class CatalogFile {
     }
 
     public T updateTable(TableIdentifier table, String location) {
-      if (null == original.location(table)) {
+      if (!original.containsTable(table)) {
         throw new NoSuchNamespaceException("Table does not exist: %s", table);
       }
       final String newloc = tables.get(table);
@@ -237,10 +258,32 @@ public abstract class CatalogFile {
     }
 
     public T dropTable(TableIdentifier tableId) {
-      if (null == original.location(tableId)) {
+      if (!original.containsTable(tableId)) {
         throw new NoSuchTableException("Table does not exist: %s", tableId);
       }
       tables.put(tableId, null);
+      return self();
+    }
+
+    /** Creates a table with its metadata stored inline in the catalog. */
+    public T createTableInline(TableIdentifier table, byte[] metadata) {
+      if (checkNamespaceExists(table.namespace())) {
+        throw new NoSuchNamespaceException("Namespace does not exist: %s", table.namespace());
+      }
+      if (original.containsTable(table) || tables.get(table) != null
+          || inlineTables.get(table) != null) {
+        throw new AlreadyExistsException("Table already exists: %s", table);
+      }
+      inlineTables.put(table, metadata);
+      return self();
+    }
+
+    /** Updates an inline table's metadata (full replacement). */
+    public T updateTableInline(TableIdentifier table, byte[] metadata) {
+      if (!original.containsTable(table)) {
+        throw new NoSuchTableException("Table does not exist: %s", table);
+      }
+      inlineTableUpdates.put(table, metadata);
       return self();
     }
 

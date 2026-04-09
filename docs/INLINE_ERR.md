@@ -22,6 +22,19 @@ any future code that reads + re-writes must be aware.
 (b) compute max(existing IDs) + 1 at `build()` time. Deferred since the
 real commit path is correct.
 
+### E2a: addNamespace eager lookup was racy during checkpoint decode
+
+`Builder.addNamespace()` eagerly called `buildNamespace(id)` when the direct
+parent was in `namespaceById`, but `buildNamespace` walks the *entire* ancestor
+chain. During checkpoint decoding, HashMap iteration order is non-deterministic,
+so grandparents might not be decoded yet.
+
+**Fix:** Removed eager lookup from `addNamespace`. All lookups are now deferred
+to `rebuildLookups()` which is called after all entries are loaded. This also
+fixes a pre-existing flaky test failure in the randomized tests.
+
+**Status:** Fixed.
+
 ### E2: Root namespace (id=0) must exist for Mut.createNamespace()
 
 `CatalogFile.Mut.createNamespace()` auto-creates ancestor namespaces when

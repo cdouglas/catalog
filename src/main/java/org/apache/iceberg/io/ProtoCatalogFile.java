@@ -141,6 +141,23 @@ public class ProtoCatalogFile extends CatalogFile {
   }
 
   @Override
+  public boolean containsTable(TableIdentifier table) {
+    return tableLookup.containsKey(table);
+  }
+
+  @Override
+  public boolean isInlineTable(TableIdentifier table) {
+    Integer id = tableLookup.get(table);
+    return id != null && tblInlineMetadata.containsKey(id);
+  }
+
+  @Override
+  public byte[] inlineMetadata(TableIdentifier table) {
+    Integer id = tableLookup.get(table);
+    return id != null ? tblInlineMetadata.get(id) : null;
+  }
+
+  @Override
   Map<Namespace, Map<String, String>> namespaceProperties() {
     ImmutableMap.Builder<Namespace, Map<String, String>> builder = ImmutableMap.builder();
     for (Map.Entry<Integer, Map<String, String>> entry : nsProperties.entrySet()) {
@@ -336,11 +353,9 @@ public class ProtoCatalogFile extends CatalogFile {
     public Builder addNamespace(int id, int parentId, String name, int version) {
       NsEntry entry = new NsEntry(parentId, name, version);
       namespaceById.put(id, entry);
-      // Defer lookup building if parent doesn't exist yet (checkpoint decoding)
-      if (parentId == 0 || namespaceById.containsKey(parentId)) {
-        namespaceLookup.put(buildNamespace(id), id);
-      }
-      // Otherwise, lookup will be built by rebuildLookups() after all entries are loaded
+      // Lookup is built by rebuildLookups() after all entries are loaded.
+      // During checkpoint decoding, namespaces may arrive in arbitrary order
+      // (HashMap iteration), so the full ancestor chain may not be available yet.
       return this;
     }
 
