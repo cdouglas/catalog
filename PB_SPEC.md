@@ -447,12 +447,50 @@ Identical to LCF. Each action's `verify()` checks version-based preconditions:
 | CreateTableInline        | namespace version matches (skip if late-bound)            |
 | UpdateTableInline        | table version matches                                     |
 
+## Inline Table Metadata
+
+The PB format supports **inline table metadata** -- storing `TableMetadata` (as JSON
+bytes) directly in the catalog rather than in external metadata.json files. This
+eliminates the second write per table update and reduces per-commit payload from
+2-700 KB (full metadata rewrite) to the size of the metadata JSON.
+
+### Storage Model
+
+A table is either **pointer** (external metadata file) or **inline** (metadata in
+catalog). The `Checkpoint` message stores pointer tables in `tables` (field 11) and
+inline tables in `inline_tables` (field 13). A table ID appears in exactly one.
+
+### Configuration
+
+Set `fileio.catalog.inline=true` in catalog properties to enable inline mode. When
+enabled, `FileIOTableOperations.doCommit()` serializes `TableMetadata` to JSON bytes
+and emits `CreateTableInline` / `UpdateTableInline` actions instead of writing external
+metadata files. Currently uses Full mode only (complete metadata replacement per
+commit); delta mode is planned for future stages.
+
+### Table Loading
+
+`FileIOTableOperations.loadFromCatalogFile()` detects inline tables via
+`CatalogFile.isInlineTable()` and uses `BaseMetastoreTableOperations
+.refreshFromMetadataLocation(syntheticLoc, null, 0, customLoader)` with a custom
+loader that parses from the inline bytes. No changes to `BaseMetastoreCatalog` or
+`BaseMetastoreTableOperations` in the iceberg/ fork are needed.
+
+### Implementation Status
+
+Stages 1-4 are complete:
+1. `InlineTable` checkpoint message and state model
+2. `CreateTableInline` action (verify, apply, encode/decode)
+3. `UpdateTableInline` action (Full + Pointer modes)
+4. `CatalogFile.Mut` inline API + `FileIOCatalog` integration
+
+Remaining (delta optimization): structured metadata deltas (`AddSnapshot`,
+`SetSnapshotRef`, schema/spec/order changes) for efficient per-commit encoding.
+See [INLINE_INTENTION.md](INLINE_INTENTION.md) for the full design and
+[docs/INLINE_IMPL.md](docs/INLINE_IMPL.md) for implementation tracking.
+
 ## Current Status
 
-- **Implemented and tested** (`TestProtoCatalogFormat`, 684 lines).
-- **Not yet wired into FileIOCatalog** -- the format selection logic in `FileIOCatalog`
-  currently supports `"append"` (LogCatalogFormat) and `"cas"` (CASCatalogFormat) but
-  does not yet offer a `"proto"` option.
 - **Hand-rolled codec** -- `ProtoCodec` implements protobuf wire format manually. This
   validates correctness against the `.proto` schema before committing to generated classes
   as a dependency.
