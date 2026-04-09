@@ -38,6 +38,9 @@ message Checkpoint {
   repeated Table tables = 11;
   repeated NamespaceProperty namespace_properties = 12;
 
+  // Inline table metadata (tables with metadata stored in the catalog)
+  repeated InlineTable inline_tables = 13;
+
   // Committed transaction tracking (for deduplication)
   repeated bytes committed_transaction_ids = 20;  // UUIDv7s, 16 bytes each
 }
@@ -61,6 +64,15 @@ message NamespaceProperty {
   int32 namespace_id = 1;
   string key = 2;
   string value = 3;
+}
+
+message InlineTable {
+  int32  id                   = 1;
+  int32  version              = 2;
+  int32  namespace_id         = 3;
+  string name                 = 4;
+  bytes  metadata             = 5;  // TableMetadata as JSON bytes
+  string manifest_list_prefix = 6;  // per-table dictionary: shared manifest path prefix
 }
 
 // ============================================================

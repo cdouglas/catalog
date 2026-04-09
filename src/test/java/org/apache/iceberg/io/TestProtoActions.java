@@ -92,6 +92,14 @@ public class TestProtoActions {
       return this;
     }
 
+    /** Adds an inline table (metadata stored in catalog). Tracks max IDs automatically. */
+    CatalogBuilder inlineTbl(
+        int id, int nsId, String name, int version, byte[] metadata, String manifestPrefix) {
+      inner.addInlineTable(id, nsId, name, version, metadata, manifestPrefix);
+      maxTblId = Math.max(maxTblId, id);
+      return this;
+    }
+
     /** Sets a namespace property. */
     CatalogBuilder prop(int nsId, String key, String value) {
       inner.setNamespaceProperty(nsId, key, value);
@@ -993,6 +1001,129 @@ public class TestProtoActions {
   }
 
   // ============================================================
+  // Inline table checkpoint tests
+  // ============================================================
+
+  private static final byte[] SAMPLE_INLINE_METADATA =
+      "{\"format-version\":2,\"table-uuid\":\"abc\"}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+  private static final String SAMPLE_MANIFEST_PREFIX = "s3://bucket/db/tbl/metadata/snap-";
+
+  @Nested
+  class InlineTableTests {
+
+    @Test
+    void checkpointRoundtripWithInlineTable() {
+      byte[] file = catalog()
+          .ns(1, 0, "db", 1)
+          .inlineTbl(1, 1, "events", 1, SAMPLE_INLINE_METADATA, SAMPLE_MANIFEST_PREFIX)
+          .build();
+      ProtoCatalogFile result = apply(file);
+
+      // Table exists and is accessible
+      TableIdentifier events = TableIdentifier.of(Namespace.of("db"), "events");
+      assertThat(result.tables()).contains(events);
+      Integer tblId = result.tableId(events);
+      assertThat(tblId).isNotNull();
+
+      // It's inline (no pointer location, has inline metadata)
+      assertThat(result.location(events)).isNull();
+      assertThat(result.isInlineTable(tblId)).isTrue();
+      assertThat(result.inlineMetadata(tblId)).isEqualTo(SAMPLE_INLINE_METADATA);
+      assertThat(result.manifestListPrefix(tblId)).isEqualTo(SAMPLE_MANIFEST_PREFIX);
+    }
+
+    @Test
+    void mixedInlineAndPointerTables() {
+      byte[] file = catalog()
+          .ns(1, 0, "db", 1)
+          .tbl(1, 1, "pointer_tbl", 1, "s3://bucket/pointer/v1")
+          .inlineTbl(2, 1, "inline_tbl", 1, SAMPLE_INLINE_METADATA, SAMPLE_MANIFEST_PREFIX)
+          .build();
+      ProtoCatalogFile result = apply(file);
+
+      TableIdentifier pointer = TableIdentifier.of(Namespace.of("db"), "pointer_tbl");
+      TableIdentifier inline = TableIdentifier.of(Namespace.of("db"), "inline_tbl");
+
+      // Both tables visible
+      assertThat(result.tables()).containsExactlyInAnyOrder(pointer, inline);
+
+      // Pointer table has location, not inline
+      assertThat(result.location(pointer)).isEqualTo("s3://bucket/pointer/v1");
+      assertThat(result.isInlineTable(result.tableId(pointer))).isFalse();
+
+      // Inline table has metadata, no location
+      assertThat(result.location(inline)).isNull();
+      assertThat(result.isInlineTable(result.tableId(inline))).isTrue();
+      assertThat(result.inlineMetadata(result.tableId(inline))).isEqualTo(SAMPLE_INLINE_METADATA);
+    }
+
+    @Test
+    void inlineTableVersionTracking() {
+      byte[] file = catalog()
+          .ns(1, 0, "db", 1)
+          .inlineTbl(1, 1, "tbl", 3, SAMPLE_INLINE_METADATA, SAMPLE_MANIFEST_PREFIX)
+          .build();
+      ProtoCatalogFile result = apply(file);
+
+      Integer tblId = result.tableId(TableIdentifier.of(Namespace.of("db"), "tbl"));
+      assertThat(result.tableVersion(tblId)).isEqualTo(3);
+    }
+
+    @Test
+    void inlineTableNotAPointer() {
+      byte[] file = catalog()
+          .ns(1, 0, "db", 1)
+          .inlineTbl(1, 1, "tbl", 1, SAMPLE_INLINE_METADATA, SAMPLE_MANIFEST_PREFIX)
+          .build();
+      ProtoCatalogFile result = apply(file);
+
+      // location() returns null for inline tables -- they don't have an external file
+      TableIdentifier tbl = TableIdentifier.of(Namespace.of("db"), "tbl");
+      assertThat(result.location(tbl)).isNull();
+      assertThat(result.isInlineTable(result.tableId(tbl))).isTrue();
+
+      // A pointer table would return a location string
+      assertThat(result.inlineMetadata(result.tableId(tbl))).isNotNull();
+    }
+
+    @Test
+    void emptyMetadataBytes() {
+      byte[] emptyMeta = "{}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+      byte[] file = catalog()
+          .ns(1, 0, "db", 1)
+          .inlineTbl(1, 1, "tbl", 1, emptyMeta, "")
+          .build();
+      ProtoCatalogFile result = apply(file);
+
+      Integer tblId = result.tableId(TableIdentifier.of(Namespace.of("db"), "tbl"));
+      assertThat(result.inlineMetadata(tblId)).isEqualTo(emptyMeta);
+      assertThat(result.manifestListPrefix(tblId)).isEmpty();
+    }
+
+    @Test
+    void multipleInlineTablesInDifferentNamespaces() {
+      byte[] meta1 = "{\"id\":1}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+      byte[] meta2 = "{\"id\":2}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+      byte[] file = catalog()
+          .ns(1, 0, "db1", 1)
+          .ns(2, 0, "db2", 1)
+          .inlineTbl(1, 1, "t1", 1, meta1, "s3://b/db1/t1/metadata/snap-")
+          .inlineTbl(2, 2, "t2", 1, meta2, "s3://b/db2/t2/metadata/snap-")
+          .build();
+      ProtoCatalogFile result = apply(file);
+
+      TableIdentifier t1 = TableIdentifier.of(Namespace.of("db1"), "t1");
+      TableIdentifier t2 = TableIdentifier.of(Namespace.of("db2"), "t2");
+      assertThat(result.inlineMetadata(result.tableId(t1))).isEqualTo(meta1);
+      assertThat(result.inlineMetadata(result.tableId(t2))).isEqualTo(meta2);
+      assertThat(result.manifestListPrefix(result.tableId(t1)))
+          .isEqualTo("s3://b/db1/t1/metadata/snap-");
+      assertThat(result.manifestListPrefix(result.tableId(t2)))
+          .isEqualTo("s3://b/db2/t2/metadata/snap-");
+    }
+  }
+
+  // ============================================================
   // Randomized tests (ported from TestLogCatalogFormat)
   // ============================================================
 
@@ -1042,7 +1173,14 @@ public class TestProtoActions {
       if (!nsIds.isEmpty()) {
         for (int tblid = 1; tblid < nextTblid; tblid += rand.nextInt(10) + 1) {
           int nsid = nsIds.get(rand.nextInt(nsIds.size()));
-          builder.addTable(tblid, nsid, "tbl" + tblid, rand.nextInt(5) + 1, "s3://t" + tblid);
+          if (rand.nextInt(4) == 0) {
+            // ~25% chance of inline table
+            byte[] meta = ("{\"tbl\":" + tblid + "}").getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            String prefix = "s3://t" + tblid + "/metadata/snap-";
+            builder.addInlineTable(tblid, nsid, "tbl" + tblid, rand.nextInt(5) + 1, meta, prefix);
+          } else {
+            builder.addTable(tblid, nsid, "tbl" + tblid, rand.nextInt(5) + 1, "s3://t" + tblid);
+          }
         }
       }
 
@@ -1092,6 +1230,17 @@ public class TestProtoActions {
         assertThat(actual.tableVersion(aid))
             .as("table version for %s", tbl)
             .isEqualTo(expected.tableVersion(eid));
+        assertThat(actual.isInlineTable(aid))
+            .as("inline status for %s", tbl)
+            .isEqualTo(expected.isInlineTable(eid));
+        if (expected.isInlineTable(eid)) {
+          assertThat(actual.inlineMetadata(aid))
+              .as("inline metadata for %s", tbl)
+              .isEqualTo(expected.inlineMetadata(eid));
+          assertThat(actual.manifestListPrefix(aid))
+              .as("manifest prefix for %s", tbl)
+              .isEqualTo(expected.manifestListPrefix(eid));
+        }
       }
     }
 

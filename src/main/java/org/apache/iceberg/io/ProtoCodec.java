@@ -61,6 +61,7 @@ public class ProtoCodec {
   private static final int CHECKPOINT_NAMESPACES = 10;
   private static final int CHECKPOINT_TABLES = 11;
   private static final int CHECKPOINT_NAMESPACE_PROPERTIES = 12;
+  private static final int CHECKPOINT_INLINE_TABLES = 13;
   private static final int CHECKPOINT_COMMITTED_TXNS = 20;
 
   // Namespace field numbers
@@ -80,6 +81,14 @@ public class ProtoCodec {
   private static final int NSPROP_NAMESPACE_ID = 1;
   private static final int NSPROP_KEY = 2;
   private static final int NSPROP_VALUE = 3;
+
+  // InlineTable field numbers
+  private static final int INLINE_TBL_ID = 1;
+  private static final int INLINE_TBL_VERSION = 2;
+  private static final int INLINE_TBL_NAMESPACE_ID = 3;
+  private static final int INLINE_TBL_NAME = 4;
+  private static final int INLINE_TBL_METADATA = 5;
+  private static final int INLINE_TBL_MANIFEST_PREFIX = 6;
 
   // Transaction field numbers
   private static final int TXN_ID = 1;
@@ -166,10 +175,12 @@ public class ProtoCodec {
         writeLengthDelimited(out, CHECKPOINT_NAMESPACES, nsBytes);
       }
 
-      // Tables
+      // Tables (pointer-mode only; inline tables encoded separately)
       for (Map.Entry<Integer, ProtoCatalogFile.TblEntry> entry : original.tableById().entrySet()) {
-        byte[] tblBytes = encodeTable(entry.getKey(), entry.getValue());
-        writeLengthDelimited(out, CHECKPOINT_TABLES, tblBytes);
+        if (!original.isInlineTable(entry.getKey())) {
+          byte[] tblBytes = encodeTable(entry.getKey(), entry.getValue());
+          writeLengthDelimited(out, CHECKPOINT_TABLES, tblBytes);
+        }
       }
 
       // Namespace properties
@@ -178,6 +189,17 @@ public class ProtoCodec {
         for (Map.Entry<String, String> prop : nsProps.getValue().entrySet()) {
           byte[] propBytes = encodeNamespaceProperty(nsId, prop.getKey(), prop.getValue());
           writeLengthDelimited(out, CHECKPOINT_NAMESPACE_PROPERTIES, propBytes);
+        }
+      }
+
+      // Inline tables
+      for (Map.Entry<Integer, byte[]> inlineEntry : original.allInlineMetadata().entrySet()) {
+        int tblId = inlineEntry.getKey();
+        ProtoCatalogFile.TblEntry tblEntry = original.tableById().get(tblId);
+        if (tblEntry != null) {
+          String prefix = original.allManifestPrefixes().getOrDefault(tblId, "");
+          byte[] inlineBytes = encodeInlineTable(tblId, tblEntry, inlineEntry.getValue(), prefix);
+          writeLengthDelimited(out, CHECKPOINT_INLINE_TABLES, inlineBytes);
         }
       }
 
@@ -221,6 +243,9 @@ public class ProtoCodec {
             break;
           case CHECKPOINT_NAMESPACE_PROPERTIES:
             decodeNamespaceProperty(readLengthDelimitedBytes(in), builder);
+            break;
+          case CHECKPOINT_INLINE_TABLES:
+            decodeInlineTable(readLengthDelimitedBytes(in), builder);
             break;
           case CHECKPOINT_COMMITTED_TXNS:
             builder.addCommittedTransaction(bytesToUuid(readLengthDelimitedBytes(in)));
@@ -345,6 +370,55 @@ public class ProtoCodec {
       }
     }
     builder.setNamespaceProperty(nsId, key, value);
+  }
+
+  private static byte[] encodeInlineTable(
+      int id, ProtoCatalogFile.TblEntry entry, byte[] metadata, String manifestPrefix)
+      throws IOException {
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    writeVarint(out, INLINE_TBL_ID, id);
+    writeVarint(out, INLINE_TBL_VERSION, entry.version);
+    writeVarint(out, INLINE_TBL_NAMESPACE_ID, entry.namespaceId);
+    writeString(out, INLINE_TBL_NAME, entry.name);
+    writeBytes(out, INLINE_TBL_METADATA, metadata);
+    writeString(out, INLINE_TBL_MANIFEST_PREFIX, manifestPrefix);
+    return out.toByteArray();
+  }
+
+  private static void decodeInlineTable(byte[] bytes, ProtoCatalogFile.Builder builder)
+      throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    int id = 0, version = 0, nsId = 0;
+    String name = "", manifestPrefix = "";
+    byte[] metadata = new byte[0];
+
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      int fieldNumber = tag >>> 3;
+      switch (fieldNumber) {
+        case INLINE_TBL_ID:
+          id = readVarint(in);
+          break;
+        case INLINE_TBL_VERSION:
+          version = readVarint(in);
+          break;
+        case INLINE_TBL_NAMESPACE_ID:
+          nsId = readVarint(in);
+          break;
+        case INLINE_TBL_NAME:
+          name = readString(in);
+          break;
+        case INLINE_TBL_METADATA:
+          metadata = readLengthDelimitedBytes(in);
+          break;
+        case INLINE_TBL_MANIFEST_PREFIX:
+          manifestPrefix = readString(in);
+          break;
+        default:
+          skipField(in, tag & 0x7);
+      }
+    }
+    builder.addInlineTable(id, nsId, name, version, metadata, manifestPrefix);
   }
 
   // ============================================================

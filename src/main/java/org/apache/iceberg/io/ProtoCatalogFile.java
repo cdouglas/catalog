@@ -55,6 +55,12 @@ public class ProtoCatalogFile extends CatalogFile {
   // Namespace properties: nsId -> (key -> value)
   private final Map<Integer, Map<String, String>> nsProperties;
 
+  // Inline table metadata: tblId -> opaque JSON bytes (TableMetadata)
+  // A table ID appears in either tableById (pointer) or tblInlineMetadata (inline), not both.
+  // Inline tables also appear in tableById with metadataLocation = null for lookup purposes.
+  private final Map<Integer, byte[]> tblInlineMetadata;
+  private final Map<Integer, String> tblManifestPrefix;
+
   // Committed transactions for deduplication
   private final Set<UUID> committedTransactions;
 
@@ -68,6 +74,8 @@ public class ProtoCatalogFile extends CatalogFile {
     this.tableById = ImmutableMap.copyOf(builder.tableById);
     this.tableLookup = ImmutableMap.copyOf(builder.tableLookup);
     this.nsProperties = deepCopyProperties(builder.nsProperties);
+    this.tblInlineMetadata = ImmutableMap.copyOf(builder.tblInlineMetadata);
+    this.tblManifestPrefix = ImmutableMap.copyOf(builder.tblManifestPrefix);
     this.committedTransactions = ImmutableSet.copyOf(builder.committedTransactions);
   }
 
@@ -227,6 +235,29 @@ public class ProtoCatalogFile extends CatalogFile {
     return nsProperties;
   }
 
+  /** Returns inline metadata bytes for the given table ID, or null if not inline. */
+  public byte[] inlineMetadata(int tblId) {
+    return tblInlineMetadata.get(tblId);
+  }
+
+  /** Returns the manifest list prefix for the given inline table, or null. */
+  public String manifestListPrefix(int tblId) {
+    return tblManifestPrefix.get(tblId);
+  }
+
+  /** Returns true if the table is stored inline (metadata in catalog, not external file). */
+  public boolean isInlineTable(int tblId) {
+    return tblInlineMetadata.containsKey(tblId);
+  }
+
+  Map<Integer, byte[]> allInlineMetadata() {
+    return tblInlineMetadata;
+  }
+
+  Map<Integer, String> allManifestPrefixes() {
+    return tblManifestPrefix;
+  }
+
   // ============================================================
   // Entry types
   // ============================================================
@@ -273,6 +304,8 @@ public class ProtoCatalogFile extends CatalogFile {
     private final Map<Integer, TblEntry> tableById = new HashMap<>();
     private final Map<TableIdentifier, Integer> tableLookup = new HashMap<>();
     private final Map<Integer, Map<String, String>> nsProperties = new HashMap<>();
+    private final Map<Integer, byte[]> tblInlineMetadata = new HashMap<>();
+    private final Map<Integer, String> tblManifestPrefix = new HashMap<>();
     private final Set<UUID> committedTransactions = new HashSet<>();
 
     Builder(InputFile location) {
@@ -372,6 +405,43 @@ public class ProtoCatalogFile extends CatalogFile {
         tableById.put(id, new TblEntry(old.namespaceId, old.name, newVersion, metadataLocation));
       }
       return this;
+    }
+
+    /**
+     * Adds an inline table (metadata stored in catalog, not external file).
+     * The table is also added to tableById with null metadataLocation for lookup.
+     */
+    public Builder addInlineTable(
+        int id, int namespaceId, String name, int version,
+        byte[] metadata, String manifestListPrefix) {
+      // Add to tableById for lookup (null location marks it as inline)
+      TblEntry entry = new TblEntry(namespaceId, name, version, null);
+      tableById.put(id, entry);
+      Namespace ns = buildNamespace(namespaceId);
+      tableLookup.put(TableIdentifier.of(ns, name), id);
+      // Store inline-specific data
+      tblInlineMetadata.put(id, metadata);
+      tblManifestPrefix.put(id, manifestListPrefix);
+      return this;
+    }
+
+    /** Removes inline metadata for a table (e.g., when transitioning to pointer mode). */
+    public Builder removeInlineMetadata(int id) {
+      tblInlineMetadata.remove(id);
+      tblManifestPrefix.remove(id);
+      return this;
+    }
+
+    public boolean isInlineTable(int id) {
+      return tblInlineMetadata.containsKey(id);
+    }
+
+    public byte[] inlineMetadata(int id) {
+      return tblInlineMetadata.get(id);
+    }
+
+    public String manifestListPrefix(int id) {
+      return tblManifestPrefix.get(id);
     }
 
     public Builder setNamespaceProperty(int namespaceId, String key, String value) {
