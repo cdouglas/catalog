@@ -69,8 +69,9 @@ message Checkpoint {
   int32  next_namespace_id         = 2;
   int32  next_table_id             = 3;
   repeated Namespace              namespaces              = 10;
-  repeated Table                  tables                  = 11;
+  repeated Table                  tables                  = 11;   // pointer-mode tables only
   repeated NamespaceProperty      namespace_properties    = 12;
+  repeated InlineTable            inline_tables           = 13;   // inline-mode tables
   repeated bytes                  committed_transaction_ids = 20;  // 16-byte UUIDs
 }
 ```
@@ -98,7 +99,21 @@ message NamespaceProperty {
   string key          = 2;
   string value        = 3;
 }
+
+message InlineTable {
+  int32  id                   = 1;
+  int32  version              = 2;
+  int32  namespace_id         = 3;
+  string name                 = 4;
+  bytes  metadata             = 5;  // TableMetadata as JSON bytes
+  string manifest_list_prefix = 6;  // per-table dictionary: shared manifest path prefix
+}
 ```
+
+A table ID appears in either `tables` (pointer mode) or `inline_tables` (inline mode),
+never both. Inline tables store the full `TableMetadata` as opaque JSON bytes in the
+checkpoint and carry a `manifest_list_prefix` for efficient snapshot delta encoding.
+Pointer-mode tables store only an external metadata file location.
 
 ### Transaction
 
@@ -121,6 +136,8 @@ message Action {
     DropTable              drop_table               = 6;
     UpdateTableLocation    update_table_location    = 7;
     ReadTable              read_table               = 8;
+    UpdateTableInline      update_table_inline      = 9;   // inline table update
+    CreateTableInline      create_table_inline      = 10;  // inline table create
   }
 }
 ```
@@ -181,6 +198,47 @@ message ReadTable {
   int32 version = 2;            // version that was read
 }
 ```
+
+### Inline Table Action Messages
+
+These actions operate on tables whose metadata is stored directly in the catalog
+rather than in an external metadata.json file. See
+[INLINE_INTENTION.md](INLINE_INTENTION.md) for the full design.
+
+```protobuf
+message CreateTableInline {
+  int32  id                = 1;   // -1 for late-bind
+  int32  version           = 2;
+  int32  namespace_id      = 3;
+  int32  namespace_version = 4;   // -1 if late-bound
+  string name              = 5;
+  bytes  metadata          = 6;   // full TableMetadata as JSON bytes
+}
+
+message UpdateTableInline {
+  int32 id      = 1;
+  int32 version = 2;              // must match current
+
+  oneof payload {
+    bytes  full_metadata     = 4;   // full TableMetadata JSON (re-inline)
+    string metadata_location = 5;   // pointer fallback (eviction)
+    // TableMetadataDelta delta = 3;  // reserved for future delta mode
+  }
+}
+```
+
+**CreateTableInline** creates a table with its full `TableMetadata` inlined. The
+verification rule is the same as `CreateTable` (namespace version check, late-bind
+support).
+
+**UpdateTableInline** updates an inline table in one of two modes:
+- **Full** (`full_metadata`): replaces the entire inline metadata. Used for
+  re-inlining or full metadata refresh.
+- **Pointer** (`metadata_location`): evicts the table from inline to pointer mode.
+  The inline metadata is removed and replaced with an external file location.
+
+Version verification is the same as `UpdateTableLocation`. A future delta mode
+(field 3) will carry structured metadata changes for efficient data commits.
 
 ## Wire Format Details
 
@@ -363,8 +421,14 @@ The catalog state is held in `ProtoCatalogFile` (immutable snapshot), mirroring 
 | `namespaceProps`   | `Map<Integer, Map<Str, Str>>`   | Namespace ID -> properties           |
 | `tableIds`         | `Map<TableIdentifier, Integer>` | Table -> internal ID                 |
 | `tableVersions`    | `Map<Integer, Integer>`         | Table ID -> version counter          |
-| `tableLocations`   | `Map<Integer, String>`          | Table ID -> metadata file location   |
+| `tableLocations`   | `Map<Integer, String>`          | Table ID -> metadata file location (pointer tables only) |
+| `tblInlineMetadata`| `Map<Integer, byte[]>`          | Table ID -> TableMetadata JSON bytes (inline tables only) |
+| `tblManifestPrefix`| `Map<Integer, String>`          | Table ID -> manifest list path prefix (inline tables only) |
 | `committedTxns`    | `Set<UUID>`                     | Applied transaction IDs              |
+
+A table ID appears in either `tableLocations` (pointer mode) or `tblInlineMetadata`
+(inline mode), never both. Every inline table also has a `tblManifestPrefix` entry.
+Both pointer and inline tables share the same `tableIds` and `tableVersions` maps.
 
 ## Action Verification Rules
 
@@ -380,6 +444,8 @@ Identical to LCF. Each action's `verify()` checks version-based preconditions:
 | DropTable                | table version matches                                     |
 | UpdateTableLocation      | table version matches                                     |
 | ReadTable                | table version matches                                     |
+| CreateTableInline        | namespace version matches (skip if late-bound)            |
+| UpdateTableInline        | table version matches                                     |
 
 ## Current Status
 
@@ -399,7 +465,8 @@ Identical to LCF. Each action's `verify()` checks version-based preconditions:
 | `src/main/java/.../ProtoCatalogFormat.java` | Format implementation (read, commit, CAS/append) |
 | `src/main/java/.../ProtoCatalogFile.java` | Immutable catalog snapshot + builder |
 | `src/main/java/.../ProtoCodec.java` | Protobuf wire encoding/decoding, action types |
-| `src/test/java/.../TestProtoCatalogFormat.java` | Test suite |
+| `src/test/java/.../TestProtoCatalogFormat.java` | Codec and format tests |
+| `src/test/java/.../TestProtoActions.java` | Systematic action tests (positive/negative/randomized) |
 
 ---
 
