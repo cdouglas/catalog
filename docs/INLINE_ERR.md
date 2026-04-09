@@ -90,6 +90,31 @@ Edge cases: tables with no snapshots yet (prefix is empty or derived from
 location), tables whose manifest list paths don't share a common prefix
 (fall back to empty prefix, suffixes carry full paths).
 
+### E8: Integration path -- no base class changes needed
+
+`BaseMetastoreTableOperations` exposes a 4-argument overload:
+
+```java
+protected void refreshFromMetadataLocation(
+    String newLocation,
+    Predicate<Exception> shouldRetry,
+    int numRetries,
+    Function<String, TableMetadata> metadataLoader)
+```
+
+For inline tables, `FileIOTableOperations.updateVersionAndMetadata()` can call
+this with a custom `metadataLoader` that deserializes from the inline bytes
+instead of reading from storage. A synthetic location string (e.g.,
+`inline://<tblId>#v<version>`) satisfies the location-change detection.
+
+Similarly, `doCommit()` can serialize new metadata to bytes and produce
+`CreateTableInline` / `UpdateTableInline` actions instead of writing an
+external file and producing pointer actions.
+
+**No modifications to `BaseMetastoreCatalog` or `BaseMetastoreTableOperations`
+in the iceberg/ fork are required.** All interception happens in
+`FileIOTableOperations` (our inner class) and `CatalogFile.Mut` (our code).
+
 ### E7: StringDictionary (checkpoint field 14)
 
 The catalog-wide string dictionary is marked optional in the spec. It adds
