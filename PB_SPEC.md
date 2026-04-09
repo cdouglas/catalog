@@ -476,18 +476,38 @@ commit); delta mode is planned for future stages.
 loader that parses from the inline bytes. No changes to `BaseMetastoreCatalog` or
 `BaseMetastoreTableOperations` in the iceberg/ fork are needed.
 
+### Delta Mode
+
+For table updates, the format supports structured metadata deltas that encode
+only what changed, reducing per-commit payload from full metadata JSON (~KB) to
+compact binary deltas (~100 bytes for a typical data commit).
+
+`InlineDeltaCodec` implements encode/decode/apply for all 11 update types from
+[INLINE_INTENTION.md](INLINE_INTENTION.md): `AddSnapshot` (with `CompactSummary`
+and dictionary-derived fields), `SetSnapshotRef`, `RemoveSnapshots`, `AddSchema`,
+`SetCurrentSchema`, `AddPartitionSpec`, `SetDefaultPartitionSpec`, `AddSortOrder`,
+`SetDefaultSortOrder`, `SetTableProperties`, `SetTableLocation`.
+
+`computeDelta(oldMeta, newMeta, manifestListPrefix)` diffs two `TableMetadata`
+instances. `selectMode(delta, newMeta, txnSize)` picks delivery mode based on
+encoded size vs the 4 MiB Azure append limit.
+
+`FileIOTableOperations.doCommit()` uses the delta/full/pointer pipeline
+automatically when `fileio.catalog.inline=true`.
+
 ### Implementation Status
 
-Stages 1-4 are complete:
+All 8 stages complete:
 1. `InlineTable` checkpoint message and state model
 2. `CreateTableInline` action (verify, apply, encode/decode)
 3. `UpdateTableInline` action (Full + Pointer modes)
 4. `CatalogFile.Mut` inline API + `FileIOCatalog` integration
+5. Delta infrastructure + all simple delta types
+6. Snapshot deltas with `CompactSummary` and dictionary encoding
+7. `computeDelta` + mode selection (4 MiB Azure limit)
+8. Delta integration into `FileIOCatalog` commit path
 
-Remaining (delta optimization): structured metadata deltas (`AddSnapshot`,
-`SetSnapshotRef`, schema/spec/order changes) for efficient per-commit encoding.
-See [INLINE_INTENTION.md](INLINE_INTENTION.md) for the full design and
-[docs/INLINE_IMPL.md](docs/INLINE_IMPL.md) for implementation tracking.
+See [docs/INLINE_IMPL.md](docs/INLINE_IMPL.md) for detailed implementation log.
 
 ## Current Status
 
