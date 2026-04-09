@@ -46,7 +46,7 @@ No transaction-log actions yet -- just checkpoint-level persistence.
 - **Tests (integration):** create inline + create pointer in same transaction,
   checkpoint roundtrip after applying CreateTableInline.
 
-**Status:** Not started
+**Status:** Complete
 
 ---
 
@@ -168,3 +168,4 @@ the FileIOCatalog commit path.
 | Date | Stage | Notes |
 |------|-------|-------|
 | 2026-04-08 | Stage 1 | InlineTable proto, state model, checkpoint encode/decode, 6 tests |
+| 2026-04-08 | Stage 2 | CreateTableInline action + encode/decode, 5 action tests |

@@ -95,6 +95,7 @@ message Action {
     DropTable drop_table = 6;
     UpdateTableLocation update_table_location = 7;
     ReadTable read_table = 8;       // for read-your-writes validation
+    CreateTableInline create_table_inline = 10;
   }
 }
 
@@ -151,4 +152,17 @@ message UpdateTableLocation {
 message ReadTable {
   int32 id = 1;
   int32 version = 2;                // version that was read
+}
+
+// ============================================================
+// Inline table metadata actions
+// ============================================================
+
+message CreateTableInline {
+  int32  id                = 1;   // -1 for late-bind
+  int32  version           = 2;
+  int32  namespace_id      = 3;
+  int32  namespace_version = 4;   // -1 if late-bound
+  string name              = 5;
+  bytes  metadata          = 6;   // full TableMetadata as JSON bytes
 }

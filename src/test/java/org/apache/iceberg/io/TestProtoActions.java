@@ -179,6 +179,11 @@ public class TestProtoActions {
     return new ProtoCodec.ReadTableAction(id, version);
   }
 
+  static ProtoCodec.CreateTableInlineAction createTblInline(
+      int id, int nsId, String name, int version, int nsVersion, byte[] metadata) {
+    return new ProtoCodec.CreateTableInlineAction(id, version, nsId, nsVersion, name, metadata);
+  }
+
   // ============================================================
   // File construction / replay helpers
   // ============================================================
@@ -1098,6 +1103,78 @@ public class TestProtoActions {
       Integer tblId = result.tableId(TableIdentifier.of(Namespace.of("db"), "tbl"));
       assertThat(result.inlineMetadata(tblId)).isEqualTo(emptyMeta);
       assertThat(result.manifestListPrefix(tblId)).isEmpty();
+    }
+
+    // --- CreateTableInline action tests ---
+
+    @Test
+    void createTableInlineApplies() {
+      byte[] file = catalog().ns(1, 0, "db", 1).build();
+      ProtoCatalogFile result = apply(file,
+          txn(createTblInline(1, 1, "events", 1, 1, SAMPLE_INLINE_METADATA)));
+
+      TableIdentifier events = TableIdentifier.of(Namespace.of("db"), "events");
+      assertThat(result.tables()).contains(events);
+      assertThat(result.isInlineTable(result.tableId(events))).isTrue();
+      assertThat(result.inlineMetadata(result.tableId(events))).isEqualTo(SAMPLE_INLINE_METADATA);
+      assertThat(result.location(events)).isNull();
+    }
+
+    @Test
+    void createTableInlineRejectsNamespaceVersionMismatch() {
+      byte[] file = catalog().ns(1, 0, "db", 3).build();
+      ProtoCodec.Transaction t = txn(
+          createTblInline(1, 1, "events", 1, 1, SAMPLE_INLINE_METADATA));
+      ProtoCatalogFile result = apply(file, t);
+
+      assertThat(result.containsTransaction(t.id())).isFalse();
+      assertThat(result.tables()).isEmpty();
+    }
+
+    @Test
+    void createTableInlineWithLateBoundNamespace() {
+      byte[] file = catalog().build();
+      ProtoCatalogFile result = apply(file, txn(
+          createNs(1, 0, "db", 1, -1),
+          createTblInline(1, 1, "events", 1, -1, SAMPLE_INLINE_METADATA)));
+
+      assertThat(result.containsNamespace(Namespace.of("db"))).isTrue();
+      TableIdentifier events = TableIdentifier.of(Namespace.of("db"), "events");
+      assertThat(result.isInlineTable(result.tableId(events))).isTrue();
+    }
+
+    @Test
+    void mixedInlineAndPointerCreatesInSameTransaction() {
+      byte[] file = catalog().ns(1, 0, "db", 1).build();
+      ProtoCatalogFile result = apply(file, txn(
+          createTbl(1, 1, "pointer", 1, 1, "s3://bucket/pointer/v1"),
+          createTblInline(2, 1, "inline", 1, 1, SAMPLE_INLINE_METADATA)));
+
+      TableIdentifier pointer = TableIdentifier.of(Namespace.of("db"), "pointer");
+      TableIdentifier inline = TableIdentifier.of(Namespace.of("db"), "inline");
+
+      assertThat(result.location(pointer)).isEqualTo("s3://bucket/pointer/v1");
+      assertThat(result.isInlineTable(result.tableId(pointer))).isFalse();
+      assertThat(result.isInlineTable(result.tableId(inline))).isTrue();
+    }
+
+    @Test
+    void createTableInlineEncodeDecode() {
+      // Verify the action survives encode/decode roundtrip
+      ProtoCodec.CreateTableInlineAction action =
+          createTblInline(1, 1, "tbl", 1, 1, SAMPLE_INLINE_METADATA);
+      ProtoCodec.Transaction txn = new ProtoCodec.Transaction(
+          UUID.randomUUID(), false, List.of(action));
+
+      byte[] encoded = ProtoCodec.encodeTransaction(txn);
+      ProtoCodec.Transaction decoded = ProtoCodec.decodeTransaction(encoded);
+
+      assertThat(decoded.actions()).hasSize(1);
+      assertThat(decoded.actions().get(0)).isInstanceOf(ProtoCodec.CreateTableInlineAction.class);
+      ProtoCodec.CreateTableInlineAction decodedAction =
+          (ProtoCodec.CreateTableInlineAction) decoded.actions().get(0);
+      assertThat(decodedAction.name).isEqualTo("tbl");
+      assertThat(decodedAction.metadata).isEqualTo(SAMPLE_INLINE_METADATA);
     }
 
     @Test

@@ -104,6 +104,7 @@ public class ProtoCodec {
   private static final int ACTION_DROP_TABLE = 6;
   private static final int ACTION_UPDATE_TABLE_LOCATION = 7;
   private static final int ACTION_READ_TABLE = 8;
+  private static final int ACTION_CREATE_TABLE_INLINE = 10;
 
   // CreateNamespace field numbers
   private static final int CREATE_NS_ID = 1;
@@ -147,6 +148,14 @@ public class ProtoCodec {
   // ReadTable field numbers
   private static final int READ_TBL_ID = 1;
   private static final int READ_TBL_VERSION = 2;
+
+  // CreateTableInline field numbers
+  private static final int CREATE_INLINE_TBL_ID = 1;
+  private static final int CREATE_INLINE_TBL_VERSION = 2;
+  private static final int CREATE_INLINE_TBL_NS_ID = 3;
+  private static final int CREATE_INLINE_TBL_NS_VERSION = 4;
+  private static final int CREATE_INLINE_TBL_NAME = 5;
+  private static final int CREATE_INLINE_TBL_METADATA = 6;
 
   // ============================================================
   // Checkpoint encoding/decoding
@@ -597,6 +606,16 @@ public class ProtoCodec {
       writeVarint(inner, READ_TBL_ID, a.id);
       writeVarint(inner, READ_TBL_VERSION, a.version);
       writeLengthDelimited(out, ACTION_READ_TABLE, inner.toByteArray());
+    } else if (action instanceof CreateTableInlineAction) {
+      CreateTableInlineAction a = (CreateTableInlineAction) action;
+      ByteArrayOutputStream inner = new ByteArrayOutputStream();
+      writeVarint(inner, CREATE_INLINE_TBL_ID, a.id);
+      writeVarint(inner, CREATE_INLINE_TBL_VERSION, a.version);
+      writeVarint(inner, CREATE_INLINE_TBL_NS_ID, a.namespaceId);
+      writeVarint(inner, CREATE_INLINE_TBL_NS_VERSION, a.namespaceVersion);
+      writeString(inner, CREATE_INLINE_TBL_NAME, a.name);
+      writeBytes(inner, CREATE_INLINE_TBL_METADATA, a.metadata);
+      writeLengthDelimited(out, ACTION_CREATE_TABLE_INLINE, inner.toByteArray());
     }
     return out.toByteArray();
   }
@@ -624,6 +643,8 @@ public class ProtoCodec {
         return decodeUpdateTableLocation(actionBytes);
       case ACTION_READ_TABLE:
         return decodeReadTable(actionBytes);
+      case ACTION_CREATE_TABLE_INLINE:
+        return decodeCreateTableInline(actionBytes);
       default:
         return new UnknownAction(actionType, actionBytes);
     }
@@ -833,6 +854,41 @@ public class ProtoCodec {
       }
     }
     return new ReadTableAction(id, version);
+  }
+
+  private static CreateTableInlineAction decodeCreateTableInline(byte[] bytes) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    int id = 0, version = 0, nsId = 0, nsVersion = 0;
+    String name = "";
+    byte[] metadata = new byte[0];
+
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      int fieldNumber = tag >>> 3;
+      switch (fieldNumber) {
+        case CREATE_INLINE_TBL_ID:
+          id = readVarint(in);
+          break;
+        case CREATE_INLINE_TBL_VERSION:
+          version = readVarint(in);
+          break;
+        case CREATE_INLINE_TBL_NS_ID:
+          nsId = readVarint(in);
+          break;
+        case CREATE_INLINE_TBL_NS_VERSION:
+          nsVersion = readVarint(in);
+          break;
+        case CREATE_INLINE_TBL_NAME:
+          name = readString(in);
+          break;
+        case CREATE_INLINE_TBL_METADATA:
+          metadata = readLengthDelimitedBytes(in);
+          break;
+        default:
+          skipField(in, tag & 0x7);
+      }
+    }
+    return new CreateTableInlineAction(id, version, nsId, nsVersion, name, metadata);
   }
 
   // ============================================================
@@ -1219,6 +1275,48 @@ public class ProtoCodec {
     @Override
     public void apply(ProtoCatalogFile.Builder builder) {
       // Read actions don't modify state
+    }
+  }
+
+  /**
+   * Creates an inline table (metadata stored in catalog, not external file).
+   * Verification: namespace version must match (same as CreateTable).
+   */
+  public static class CreateTableInlineAction implements Action {
+    final int id;
+    final int version;
+    final int namespaceId;
+    final int namespaceVersion;
+    final String name;
+    final byte[] metadata;
+
+    public CreateTableInlineAction(
+        int id, int version, int namespaceId, int namespaceVersion,
+        String name, byte[] metadata) {
+      this.id = id;
+      this.version = version;
+      this.namespaceId = namespaceId;
+      this.namespaceVersion = namespaceVersion;
+      this.name = name;
+      this.metadata = metadata;
+    }
+
+    @Override
+    public boolean verify(ProtoCatalogFile.Builder builder) {
+      if (namespaceVersion >= 0) {
+        int currentNsVersion = builder.namespaceVersion(namespaceId);
+        if (currentNsVersion != namespaceVersion) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    @Override
+    public void apply(ProtoCatalogFile.Builder builder) {
+      // manifest list prefix is derived from metadata at checkpoint time;
+      // for newly created tables, we default to empty (set later on first snapshot)
+      builder.addInlineTable(id, namespaceId, name, version, metadata, "");
     }
   }
 
