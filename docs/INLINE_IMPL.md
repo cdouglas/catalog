@@ -82,7 +82,7 @@ the FileIOCatalog commit path. Uses Full mode only (no deltas needed).
 - `UpdateTableInlineAction`: DELTA mode support.
 - **Tests:** set/remove properties via delta, change location via delta.
 
-**Status:** Not started
+**Status:** Complete (merged with Stage 6)
 
 ---
 
@@ -98,7 +98,7 @@ path (AddSnapshot + SetSnapshotRef).
 - AddSnapshot with dictionary-derived fields.
 - **Tests:** per-type positive/negative, typical data commit roundtrip.
 
-**Status:** Not started
+**Status:** Complete (merged with Stage 5)
 
 ---
 
@@ -137,3 +137,4 @@ delta. Mode selection picks delta/full/pointer based on size.
 | 2026-04-08 | Stage 2 | CreateTableInline action + encode/decode, 5 action tests |
 | 2026-04-08 | Stage 3 | UpdateTableInline (Full + Pointer), 4 tests (update, evict, mismatch, concurrent) |
 | 2026-04-09 | Stage 4 | Mut-level inline API, FileIOCatalog integration, fix addNamespace flake. 3 Mut tests |
+| 2026-04-09 | Stage 5+6 | InlineDeltaCodec: all 11 delta types, CompactSummary, DELTA mode in UpdateTableInlineAction. 14 tests |

@@ -173,8 +173,114 @@ message UpdateTableInline {
   int32 version = 2;              // must match current
 
   oneof payload {
+    TableMetadataDelta delta = 3;   // structured metadata changes
     bytes  full_metadata     = 4;   // full TableMetadata JSON (re-inline)
     string metadata_location = 5;   // pointer fallback (eviction)
-    // TableMetadataDelta delta = 3;  // reserved for Stage 4
   }
+}
+
+// ============================================================
+// Table metadata delta types
+// ============================================================
+
+message TableMetadataDelta {
+  repeated TableMetadataUpdate updates = 1;
+}
+
+message TableMetadataUpdate {
+  oneof update {
+    AddSnapshot             add_snapshot              = 1;
+    SetSnapshotRef          set_snapshot_ref          = 2;
+    RemoveSnapshots         remove_snapshots          = 3;
+    AddSchema               add_schema                = 4;
+    SetCurrentSchema        set_current_schema        = 5;
+    AddPartitionSpec        add_partition_spec         = 6;
+    SetDefaultPartitionSpec set_default_partition_spec = 7;
+    AddSortOrder            add_sort_order             = 8;
+    SetDefaultSortOrder     set_default_sort_order     = 9;
+    SetTableProperties      set_properties            = 10;
+    SetTableLocation        set_table_location        = 11;
+  }
+}
+
+message AddSnapshot {
+  fixed64        snapshot_id            = 1;
+  string         manifest_list_suffix   = 2;
+  CompactSummary summary                = 3;
+  sint64         timestamp_delta_ms     = 4;
+  int32          schema_id              = 5;
+  int64          added_rows             = 6;
+}
+
+enum OperationType {
+  APPEND    = 0;
+  OVERWRITE = 1;
+  DELETE    = 2;
+  REPLACE   = 3;
+}
+
+message CompactSummary {
+  OperationType      operation              = 1;
+  int64              added_data_files       = 2;
+  int64              added_records          = 3;
+  int64              added_files_size       = 4;
+  int64              total_data_files       = 5;
+  int64              total_records          = 6;
+  int64              total_files_size       = 7;
+  int64              added_delete_files     = 8;
+  int64              total_delete_files     = 9;
+  int64              total_equality_deletes = 10;
+  int64              total_position_deletes = 11;
+  map<string,string> extra                  = 15;
+}
+
+message SetSnapshotRef {
+  string ref_name               = 1;
+  int64  snapshot_id            = 2;
+  string ref_type               = 3;
+  int32  min_snapshots_to_keep  = 4;
+  int64  max_snapshot_age_ms    = 5;
+  int64  max_ref_age_ms         = 6;
+}
+
+message RemoveSnapshots {
+  repeated int64 snapshot_ids = 1;
+}
+
+message AddSchema {
+  int32 schema_id      = 1;
+  int32 last_column_id = 2;
+  bytes schema_json    = 3;
+}
+
+message SetCurrentSchema {
+  int32 schema_id = 1;
+}
+
+message AddPartitionSpec {
+  int32 spec_id           = 1;
+  int32 last_partition_id = 2;
+  bytes spec_json         = 3;
+}
+
+message SetDefaultPartitionSpec {
+  int32 spec_id = 1;
+}
+
+message AddSortOrder {
+  int32 order_id   = 1;
+  bytes order_json  = 2;
+}
+
+message SetDefaultSortOrder {
+  int32 order_id = 1;
+}
+
+message SetTableProperties {
+  map<string,string> updated = 1;
+  repeated string    removed = 2;
+}
+
+message SetTableLocation {
+  string location = 1;
 }

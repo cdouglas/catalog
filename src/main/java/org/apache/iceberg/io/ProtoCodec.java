@@ -154,6 +154,7 @@ public class ProtoCodec {
   private static final int UPDATE_INLINE_TBL_ID = 1;
   private static final int UPDATE_INLINE_TBL_VERSION = 2;
   // oneof payload field numbers:
+  private static final int UPDATE_INLINE_DELTA = 3;
   private static final int UPDATE_INLINE_FULL_METADATA = 4;
   private static final int UPDATE_INLINE_METADATA_LOCATION = 5;
 
@@ -619,7 +620,9 @@ public class ProtoCodec {
       ByteArrayOutputStream inner = new ByteArrayOutputStream();
       writeVarint(inner, UPDATE_INLINE_TBL_ID, a.id);
       writeVarint(inner, UPDATE_INLINE_TBL_VERSION, a.version);
-      if (a.fullMetadata != null) {
+      if (a.deltaBytes != null) {
+        writeBytes(inner, UPDATE_INLINE_DELTA, a.deltaBytes);
+      } else if (a.fullMetadata != null) {
         writeBytes(inner, UPDATE_INLINE_FULL_METADATA, a.fullMetadata);
       } else if (a.metadataLocation != null) {
         writeString(inner, UPDATE_INLINE_METADATA_LOCATION, a.metadataLocation);
@@ -915,6 +918,7 @@ public class ProtoCodec {
   private static UpdateTableInlineAction decodeUpdateTableInline(byte[] bytes) throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
     int id = 0, version = 0;
+    byte[] deltaBytes = null;
     byte[] fullMetadata = null;
     String metadataLocation = null;
 
@@ -928,6 +932,9 @@ public class ProtoCodec {
         case UPDATE_INLINE_TBL_VERSION:
           version = readVarint(in);
           break;
+        case UPDATE_INLINE_DELTA:
+          deltaBytes = readLengthDelimitedBytes(in);
+          break;
         case UPDATE_INLINE_FULL_METADATA:
           fullMetadata = readLengthDelimitedBytes(in);
           break;
@@ -938,7 +945,7 @@ public class ProtoCodec {
           skipField(in, tag & 0x7);
       }
     }
-    return new UpdateTableInlineAction(id, version, fullMetadata, metadataLocation);
+    return new UpdateTableInlineAction(id, version, deltaBytes, fullMetadata, metadataLocation);
   }
 
   // ============================================================
@@ -1329,23 +1336,36 @@ public class ProtoCodec {
   }
 
   /**
-   * Updates an inline table's metadata. Supports two modes:
+   * Updates an inline table's metadata. Supports three modes:
+   * - Delta: applies structured changes (deltaBytes != null)
    * - Full: replaces entire metadata (fullMetadata != null)
    * - Pointer: evicts to external file (metadataLocation != null)
-   * Exactly one of fullMetadata or metadataLocation should be non-null.
+   * Exactly one of deltaBytes, fullMetadata, or metadataLocation should be non-null.
    */
   public static class UpdateTableInlineAction implements Action {
     final int id;
     final int version;
+    final byte[] deltaBytes;         // non-null for DELTA mode
     final byte[] fullMetadata;       // non-null for FULL mode
     final String metadataLocation;   // non-null for POINTER mode
 
     public UpdateTableInlineAction(
         int id, int version, byte[] fullMetadata, String metadataLocation) {
+      this(id, version, null, fullMetadata, metadataLocation);
+    }
+
+    public UpdateTableInlineAction(
+        int id, int version, byte[] deltaBytes, byte[] fullMetadata, String metadataLocation) {
       this.id = id;
       this.version = version;
+      this.deltaBytes = deltaBytes;
       this.fullMetadata = fullMetadata;
       this.metadataLocation = metadataLocation;
+    }
+
+    /** Creates an UpdateTableInlineAction in DELTA mode. */
+    public static UpdateTableInlineAction delta(int id, int version, byte[] deltaBytes) {
+      return new UpdateTableInlineAction(id, version, deltaBytes, null, null);
     }
 
     @Override
@@ -1356,7 +1376,21 @@ public class ProtoCodec {
 
     @Override
     public void apply(ProtoCatalogFile.Builder builder) {
-      if (fullMetadata != null) {
+      if (deltaBytes != null) {
+        // DELTA mode: apply structured changes to current inline metadata
+        byte[] currentMeta = builder.inlineMetadata(id);
+        if (currentMeta != null) {
+          byte[] updatedMeta = InlineDeltaCodec.applyDelta(currentMeta, deltaBytes);
+          builder.removeInlineMetadata(id);
+          ProtoCatalogFile.TblEntry old = builder.tableEntry(id);
+          if (old != null) {
+            String prefix = builder.manifestListPrefix(id) != null
+                ? builder.manifestListPrefix(id) : "";
+            builder.addInlineTable(
+                id, old.namespaceId, old.name, version + 1, updatedMeta, prefix);
+          }
+        }
+      } else if (fullMetadata != null) {
         // FULL mode: replace inline metadata, keep as inline table
         builder.removeInlineMetadata(id);
         ProtoCatalogFile.TblEntry old = builder.tableEntry(id);
