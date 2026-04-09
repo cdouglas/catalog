@@ -224,8 +224,37 @@
         <version>3.2.2</version>
         <configuration>
           <useModulePath>false</useModulePath>
+          <excludes>
+            <exclude>**/aws/**</exclude>
+            <exclude>**/gcp/**</exclude>
+            <exclude>**/azure/**</exclude>
+          </excludes>
         </configuration>
+      </plugin>
+      <!-- Integration tests (S3, GCS, ADLS): mvn verify -Pintegration -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-failsafe-plugin</artifactId>
+        <version>3.2.2</version>
+        <configuration>
+          <useModulePath>false</useModulePath>
+          <includes>
+            <include>**/aws/**</include>
+            <include>**/gcp/**</include>
+            <include>**/azure/**</include>
+          </includes>
+        </configuration>
+        <executions>
+          <execution>
+            <id>integration-test</id>
+            <goals>
+              <goal>integration-test</goal>
+              <goal>verify</goal>
+            </goals>
+          </execution>
+        </executions>
       </plugin>
     </plugins>
   </build>
+
 </project>
