@@ -196,6 +196,184 @@ public class InlineDeltaCodec {
     }
   }
 
+  /** Maximum transaction record size (Azure AppendBlock limit minus safety margin). */
+  public static final int APPEND_LIMIT = 4 * 1024 * 1024 - 4096; // ~4 MiB
+
+  // ============================================================
+  // computeDelta: diff two TableMetadata instances
+  // ============================================================
+
+  /**
+   * Computes a minimal delta between old and new TableMetadata.
+   *
+   * @param oldMeta base metadata (from the inline table's current state)
+   * @param newMeta target metadata (after applying the table operation)
+   * @param manifestListPrefix shared prefix for manifest list paths
+   * @return list of delta updates, or null if metadata is identical
+   */
+  public static List<DeltaUpdate> computeDelta(
+      TableMetadata oldMeta, TableMetadata newMeta, String manifestListPrefix) {
+    List<DeltaUpdate> updates = new ArrayList<>();
+
+    // New snapshots (most common path: data commits)
+    Set<Long> oldSnapIds = new HashSet<>();
+    for (org.apache.iceberg.Snapshot s : oldMeta.snapshots()) {
+      oldSnapIds.add(s.snapshotId());
+    }
+    for (org.apache.iceberg.Snapshot snap : newMeta.snapshots()) {
+      if (!oldSnapIds.contains(snap.snapshotId())) {
+        String manifestList = snap.manifestListLocation();
+        String suffix = manifestList;
+        if (manifestListPrefix != null && !manifestListPrefix.isEmpty()
+            && manifestList.startsWith(manifestListPrefix)) {
+          suffix = manifestList.substring(manifestListPrefix.length());
+        }
+        long timestampDelta = snap.timestampMillis() - oldMeta.lastUpdatedMillis();
+        int schemaId = snap.schemaId() != null
+            && snap.schemaId() != oldMeta.currentSchemaId()
+            ? snap.schemaId() : 0;
+        updates.add(new AddSnapshotUpdate(
+            snap.snapshotId(), suffix,
+            snap.summary() != null ? snap.summary() : Map.of(),
+            timestampDelta, schemaId, 0));
+      }
+    }
+
+    // Removed snapshots
+    Set<Long> newSnapIds = new HashSet<>();
+    for (org.apache.iceberg.Snapshot s : newMeta.snapshots()) {
+      newSnapIds.add(s.snapshotId());
+    }
+    List<Long> removedSnaps = new ArrayList<>();
+    for (long id : oldSnapIds) {
+      if (!newSnapIds.contains(id)) {
+        removedSnaps.add(id);
+      }
+    }
+    if (!removedSnaps.isEmpty()) {
+      updates.add(new RemoveSnapshotsUpdate(removedSnaps));
+    }
+
+    // Ref changes
+    Map<String, org.apache.iceberg.SnapshotRef> oldRefs = oldMeta.refs();
+    for (Map.Entry<String, org.apache.iceberg.SnapshotRef> entry : newMeta.refs().entrySet()) {
+      org.apache.iceberg.SnapshotRef oldRef = oldRefs.get(entry.getKey());
+      org.apache.iceberg.SnapshotRef newRef = entry.getValue();
+      if (oldRef == null || !refsEqual(oldRef, newRef)) {
+        updates.add(new SetSnapshotRefUpdate(
+            entry.getKey(), newRef.snapshotId(),
+            newRef.isBranch() ? "branch" : "tag",
+            newRef.minSnapshotsToKeep() != null ? newRef.minSnapshotsToKeep() : 0,
+            newRef.maxSnapshotAgeMs() != null ? newRef.maxSnapshotAgeMs() : 0,
+            newRef.maxRefAgeMs() != null ? newRef.maxRefAgeMs() : 0));
+      }
+    }
+
+    // Schema changes
+    Set<Integer> oldSchemaIds = new HashSet<>();
+    for (org.apache.iceberg.Schema s : oldMeta.schemas()) {
+      oldSchemaIds.add(s.schemaId());
+    }
+    for (org.apache.iceberg.Schema schema : newMeta.schemas()) {
+      if (!oldSchemaIds.contains(schema.schemaId())) {
+        String json = org.apache.iceberg.SchemaParser.toJson(schema);
+        updates.add(new AddSchemaUpdate(
+            schema.schemaId(), newMeta.lastColumnId(),
+            json.getBytes(StandardCharsets.UTF_8)));
+      }
+    }
+    if (newMeta.currentSchemaId() != oldMeta.currentSchemaId()) {
+      updates.add(new SetCurrentSchemaUpdate(newMeta.currentSchemaId()));
+    }
+
+    // Partition spec changes
+    Set<Integer> oldSpecIds = new HashSet<>();
+    for (org.apache.iceberg.PartitionSpec s : oldMeta.specs()) {
+      oldSpecIds.add(s.specId());
+    }
+    for (org.apache.iceberg.PartitionSpec spec : newMeta.specs()) {
+      if (!oldSpecIds.contains(spec.specId())) {
+        String json = org.apache.iceberg.PartitionSpecParser.toJson(spec);
+        updates.add(new AddPartitionSpecUpdate(
+            spec.specId(), newMeta.lastAssignedPartitionId(),
+            json.getBytes(StandardCharsets.UTF_8)));
+      }
+    }
+    if (newMeta.defaultSpecId() != oldMeta.defaultSpecId()) {
+      updates.add(new SetDefaultSpecUpdate(newMeta.defaultSpecId()));
+    }
+
+    // Sort order changes
+    Set<Integer> oldOrderIds = new HashSet<>();
+    for (org.apache.iceberg.SortOrder o : oldMeta.sortOrders()) {
+      oldOrderIds.add(o.orderId());
+    }
+    for (org.apache.iceberg.SortOrder order : newMeta.sortOrders()) {
+      if (!oldOrderIds.contains(order.orderId())) {
+        String json = org.apache.iceberg.SortOrderParser.toJson(order);
+        updates.add(new AddSortOrderUpdate(
+            order.orderId(), json.getBytes(StandardCharsets.UTF_8)));
+      }
+    }
+    if (newMeta.defaultSortOrderId() != oldMeta.defaultSortOrderId()) {
+      updates.add(new SetDefaultSortOrderUpdate(newMeta.defaultSortOrderId()));
+    }
+
+    // Property changes
+    Map<String, String> addedOrChanged = new HashMap<>();
+    Set<String> removed = new HashSet<>();
+    for (Map.Entry<String, String> e : newMeta.properties().entrySet()) {
+      String oldVal = oldMeta.properties().get(e.getKey());
+      if (!e.getValue().equals(oldVal)) {
+        addedOrChanged.put(e.getKey(), e.getValue());
+      }
+    }
+    for (String key : oldMeta.properties().keySet()) {
+      if (!newMeta.properties().containsKey(key)) {
+        removed.add(key);
+      }
+    }
+    if (!addedOrChanged.isEmpty() || !removed.isEmpty()) {
+      updates.add(new SetPropertiesUpdate(addedOrChanged, removed));
+    }
+
+    // Location change
+    if (!newMeta.location().equals(oldMeta.location())) {
+      updates.add(new SetLocationUpdate(newMeta.location()));
+    }
+
+    return updates.isEmpty() ? null : updates;
+  }
+
+  private static boolean refsEqual(
+      org.apache.iceberg.SnapshotRef a, org.apache.iceberg.SnapshotRef b) {
+    return a.snapshotId() == b.snapshotId()
+        && a.isBranch() == b.isBranch()
+        && java.util.Objects.equals(a.minSnapshotsToKeep(), b.minSnapshotsToKeep())
+        && java.util.Objects.equals(a.maxSnapshotAgeMs(), b.maxSnapshotAgeMs())
+        && java.util.Objects.equals(a.maxRefAgeMs(), b.maxRefAgeMs());
+  }
+
+  /**
+   * Selects the delivery mode for an inline table update.
+   *
+   * @return "delta" if delta fits, "full" if full metadata fits, "pointer" otherwise
+   */
+  public static String selectMode(
+      List<DeltaUpdate> delta, TableMetadata newMeta, int currentTxnSize) {
+    if (delta != null) {
+      byte[] deltaBytes = encodeDelta(delta);
+      if (currentTxnSize + deltaBytes.length <= APPEND_LIMIT) {
+        return "delta";
+      }
+    }
+    String fullJson = TableMetadataParser.toJson(newMeta);
+    if (currentTxnSize + fullJson.length() <= APPEND_LIMIT) {
+      return "full";
+    }
+    return "pointer";
+  }
+
   // ============================================================
   // DeltaUpdate interface and implementations
   // ============================================================

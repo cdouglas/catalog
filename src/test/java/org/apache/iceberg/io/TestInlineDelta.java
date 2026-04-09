@@ -21,7 +21,6 @@ package org.apache.iceberg.io;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.nio.charset.StandardCharsets;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -360,6 +359,139 @@ public class TestInlineDelta {
           ProtoCodec.UpdateTableInlineAction.delta(1, 1, deltaBytes));
       ProtoCatalogFile result = TestProtoActions.apply(file, txn);
       assertThat(result.containsTransaction(txn.id())).isFalse();
+    }
+  }
+
+  // ============================================================
+  // computeDelta
+  // ============================================================
+
+  @Nested
+  class ComputeDeltaTests {
+
+    @Test
+    void identicalMetadataReturnsNull() {
+      TableMetadata meta = baseMetadata();
+      assertThat(InlineDeltaCodec.computeDelta(meta, meta, "")).isNull();
+    }
+
+    @Test
+    void propertyChangeProducesDelta() {
+      TableMetadata oldMeta = baseMetadata();
+      TableMetadata newMeta = TableMetadata.buildFrom(oldMeta)
+          .setProperties(Map.of("engine", "spark"))
+          .discardChanges().build();
+
+      List<InlineDeltaCodec.DeltaUpdate> delta =
+          InlineDeltaCodec.computeDelta(oldMeta, newMeta, "");
+      assertThat(delta).isNotNull();
+      assertThat(delta).hasSize(1);
+      assertThat(delta.get(0)).isInstanceOf(InlineDeltaCodec.SetPropertiesUpdate.class);
+      InlineDeltaCodec.SetPropertiesUpdate u =
+          (InlineDeltaCodec.SetPropertiesUpdate) delta.get(0);
+      assertThat(u.updated).containsEntry("engine", "spark");
+    }
+
+    @Test
+    void propertyRemovalProducesDelta() {
+      TableMetadata oldMeta = TableMetadata.buildFrom(baseMetadata())
+          .setProperties(Map.of("key", "val"))
+          .discardChanges().build();
+      TableMetadata newMeta = TableMetadata.buildFrom(oldMeta)
+          .removeProperties(Set.of("key"))
+          .discardChanges().build();
+
+      List<InlineDeltaCodec.DeltaUpdate> delta =
+          InlineDeltaCodec.computeDelta(oldMeta, newMeta, "");
+      assertThat(delta).isNotNull();
+      InlineDeltaCodec.SetPropertiesUpdate u =
+          (InlineDeltaCodec.SetPropertiesUpdate) delta.get(0);
+      assertThat(u.removed).contains("key");
+    }
+
+    @Test
+    void locationChangeProducesDelta() {
+      TableMetadata oldMeta = baseMetadata();
+      TableMetadata newMeta = TableMetadata.buildFrom(oldMeta)
+          .setLocation("s3://new-bucket/table")
+          .discardChanges().build();
+
+      List<InlineDeltaCodec.DeltaUpdate> delta =
+          InlineDeltaCodec.computeDelta(oldMeta, newMeta, "");
+      assertThat(delta).isNotNull();
+      assertThat(delta.stream()
+          .filter(d -> d instanceof InlineDeltaCodec.SetLocationUpdate)
+          .count()).isEqualTo(1);
+    }
+
+    @Test
+    void schemaEvolutionProducesDelta() {
+      TableMetadata oldMeta = baseMetadata();
+      Schema newSchema = new Schema(
+          Types.NestedField.required(1, "id", Types.LongType.get()),
+          Types.NestedField.optional(2, "data", Types.StringType.get()),
+          Types.NestedField.optional(3, "ts", Types.TimestampType.withoutZone()));
+      TableMetadata newMeta = TableMetadata.buildFrom(oldMeta)
+          .setCurrentSchema(newSchema, 3)
+          .discardChanges().build();
+
+      List<InlineDeltaCodec.DeltaUpdate> delta =
+          InlineDeltaCodec.computeDelta(oldMeta, newMeta, "");
+      assertThat(delta).isNotNull();
+      // Should have AddSchema + SetCurrentSchema
+      assertThat(delta.stream()
+          .filter(d -> d instanceof InlineDeltaCodec.AddSchemaUpdate).count())
+          .isGreaterThanOrEqualTo(1);
+      assertThat(delta.stream()
+          .filter(d -> d instanceof InlineDeltaCodec.SetCurrentSchemaUpdate).count())
+          .isEqualTo(1);
+    }
+
+    @Test
+    void deltaRoundtripPreservesProperties() {
+      TableMetadata oldMeta = baseMetadata();
+      TableMetadata newMeta = TableMetadata.buildFrom(oldMeta)
+          .setProperties(Map.of("a", "1", "b", "2"))
+          .setLocation("s3://moved")
+          .discardChanges().build();
+
+      List<InlineDeltaCodec.DeltaUpdate> delta =
+          InlineDeltaCodec.computeDelta(oldMeta, newMeta, "");
+      byte[] encoded = InlineDeltaCodec.encodeDelta(delta);
+      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(encoded);
+      TableMetadata applied = InlineDeltaCodec.applyUpdates(oldMeta, decoded);
+
+      assertThat(applied.properties()).containsEntry("a", "1");
+      assertThat(applied.properties()).containsEntry("b", "2");
+      assertThat(applied.location()).isEqualTo("s3://moved");
+    }
+  }
+
+  // ============================================================
+  // selectMode
+  // ============================================================
+
+  @Nested
+  class SelectModeTests {
+
+    @Test
+    void smallDeltaSelectsDelta() {
+      List<InlineDeltaCodec.DeltaUpdate> delta = List.of(
+          new InlineDeltaCodec.SetPropertiesUpdate(Map.of("k", "v"), Set.of()));
+      assertThat(InlineDeltaCodec.selectMode(delta, baseMetadata(), 0)).isEqualTo("delta");
+    }
+
+    @Test
+    void nullDeltaSelectsFull() {
+      assertThat(InlineDeltaCodec.selectMode(null, baseMetadata(), 0)).isEqualTo("full");
+    }
+
+    @Test
+    void oversizedSelectsPointer() {
+      // txn already near the limit
+      int nearLimit = InlineDeltaCodec.APPEND_LIMIT - 10;
+      assertThat(InlineDeltaCodec.selectMode(null, baseMetadata(), nearLimit))
+          .isEqualTo("pointer");
     }
   }
 }

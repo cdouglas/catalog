@@ -112,7 +112,7 @@ delta. Mode selection picks delta/full/pointer based on size.
 - `InlineMetadataDelta.selectMode(table, delta, txnSize)` with 4 MiB limit.
 - **Tests:** data commit diff, schema evolution diff, mode selection fallback.
 
-**Status:** Not started
+**Status:** Complete
 
 ---
 
@@ -138,3 +138,4 @@ delta. Mode selection picks delta/full/pointer based on size.
 | 2026-04-08 | Stage 3 | UpdateTableInline (Full + Pointer), 4 tests (update, evict, mismatch, concurrent) |
 | 2026-04-09 | Stage 4 | Mut-level inline API, FileIOCatalog integration, fix addNamespace flake. 3 Mut tests |
 | 2026-04-09 | Stage 5+6 | InlineDeltaCodec: all 11 delta types, CompactSummary, DELTA mode in UpdateTableInlineAction. 14 tests |
+| 2026-04-09 | Stage 7 | computeDelta + selectMode. 8 tests (property/location/schema diff, roundtrip, mode selection) |
