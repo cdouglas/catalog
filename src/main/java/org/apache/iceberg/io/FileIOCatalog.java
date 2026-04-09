@@ -364,31 +364,69 @@ public class FileIOCatalog extends BaseMetastoreCatalog
       final boolean isCreate = null == base;
       try {
         if (shouldInline()) {
-          String json = TableMetadataParser.toJson(metadata);
-          byte[] metadataBytes = json.getBytes(StandardCharsets.UTF_8);
-          if (isCreate) {
-            format.from(lastCatalogFile)
-                .createTableInline(tableId, metadataBytes)
-                .commit(io());
-          } else {
-            format.from(lastCatalogFile)
-                .updateTableInline(tableId, metadataBytes)
-                .commit(io());
-          }
+          commitInline(base, metadata, isCreate);
         } else {
-          final String newMetadataLocation = writeUpdateMetadata(isCreate, metadata);
-          if (isCreate) {
-            format.from(lastCatalogFile)
-                .createTable(tableId, newMetadataLocation)
-                .commit(io());
-          } else {
-            format.from(lastCatalogFile)
-                .updateTable(tableId, newMetadataLocation)
-                .commit(io());
-          }
+          commitPointer(base, metadata, isCreate);
         }
       } catch (SupportsAtomicOperations.CASException e) {
         throw new CommitFailedException(e, "Failed to commit metadata for table %s", tableId);
+      }
+    }
+
+    private void commitInline(TableMetadata base, TableMetadata metadata, boolean isCreate) {
+      if (isCreate) {
+        String json = TableMetadataParser.toJson(metadata);
+        byte[] metadataBytes = json.getBytes(StandardCharsets.UTF_8);
+        format.from(lastCatalogFile)
+            .createTableInline(tableId, metadataBytes)
+            .commit(io());
+      } else {
+        // Try delta mode first, fall back to full or pointer
+        String manifestPrefix = "";
+        if (lastCatalogFile.isInlineTable(tableId)) {
+          Integer tblId = null;
+          if (lastCatalogFile instanceof ProtoCatalogFile) {
+            tblId = ((ProtoCatalogFile) lastCatalogFile).tableId(tableId);
+            if (tblId != null) {
+              String p = ((ProtoCatalogFile) lastCatalogFile).manifestListPrefix(tblId);
+              if (p != null) { manifestPrefix = p; }
+            }
+          }
+        }
+
+        java.util.List<InlineDeltaCodec.DeltaUpdate> delta =
+            InlineDeltaCodec.computeDelta(base, metadata, manifestPrefix);
+        String mode = InlineDeltaCodec.selectMode(delta, metadata, 0);
+
+        CatalogFile.Mut<?, ?> mut = format.from(lastCatalogFile);
+        switch (mode) {
+          case "delta":
+            byte[] deltaBytes = InlineDeltaCodec.encodeDelta(delta);
+            mut.updateTableInlineDelta(tableId, deltaBytes);
+            break;
+          case "full":
+            String json = TableMetadataParser.toJson(metadata);
+            mut.updateTableInline(tableId, json.getBytes(StandardCharsets.UTF_8));
+            break;
+          case "pointer":
+            String loc = writeUpdateMetadata(false, metadata);
+            mut.updateTable(tableId, loc);
+            break;
+        }
+        mut.commit(io());
+      }
+    }
+
+    private void commitPointer(TableMetadata base, TableMetadata metadata, boolean isCreate) {
+      final String newMetadataLocation = writeUpdateMetadata(isCreate, metadata);
+      if (isCreate) {
+        format.from(lastCatalogFile)
+            .createTable(tableId, newMetadataLocation)
+            .commit(io());
+      } else {
+        format.from(lastCatalogFile)
+            .updateTable(tableId, newMetadataLocation)
+            .commit(io());
       }
     }
   }
@@ -424,9 +462,31 @@ public class FileIOCatalog extends BaseMetastoreCatalog
       boolean inline = Boolean.parseBoolean(
           catalogProperties.getOrDefault(INLINE_ENABLED, "false"));
       if (inline) {
-        String json = TableMetadataParser.toJson(newMetadata);
-        byte[] metadataBytes = json.getBytes(StandardCharsets.UTF_8);
-        newCatalog.updateTableInline(tableId, metadataBytes);
+        // Compute delta from current to new metadata
+        String manifestPrefix = "";
+        if (current instanceof ProtoCatalogFile) {
+          ProtoCatalogFile proto = (ProtoCatalogFile) current;
+          Integer tblIdNum = proto.tableId(tableId);
+          if (tblIdNum != null) {
+            String p = proto.manifestListPrefix(tblIdNum);
+            if (p != null) { manifestPrefix = p; }
+          }
+        }
+        java.util.List<InlineDeltaCodec.DeltaUpdate> delta =
+            InlineDeltaCodec.computeDelta(currentMetadata, newMetadata, manifestPrefix);
+        String mode = InlineDeltaCodec.selectMode(delta, newMetadata, 0);
+        switch (mode) {
+          case "delta":
+            newCatalog.updateTableInlineDelta(tableId, InlineDeltaCodec.encodeDelta(delta));
+            break;
+          case "full":
+            String json = TableMetadataParser.toJson(newMetadata);
+            newCatalog.updateTableInline(tableId, json.getBytes(StandardCharsets.UTF_8));
+            break;
+          default:
+            String loc = ops.writeUpdateMetadata(false, newMetadata);
+            newCatalog.updateTable(tableId, loc);
+        }
       } else {
         final String newLocation = ops.writeUpdateMetadata(false, newMetadata);
         newCatalog.updateTable(tableId, newLocation);

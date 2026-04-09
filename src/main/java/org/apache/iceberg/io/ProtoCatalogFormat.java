@@ -371,6 +371,17 @@ public class ProtoCatalogFormat
               tblId, version, metadata, null));
         }
       }
+
+      // Process inline table delta updates
+      for (Map.Entry<TableIdentifier, byte[]> entry : inlineTableDeltaUpdates.entrySet()) {
+        TableIdentifier ident = entry.getKey();
+        byte[] deltaBytes = entry.getValue();
+        Integer tblId = original.tableId(ident);
+        if (tblId != null) {
+          int version = original.tableVersion(tblId);
+          actions.add(ProtoCodec.UpdateTableInlineAction.delta(tblId, version, deltaBytes));
+        }
+      }
     }
 
     @Override

@@ -102,6 +102,7 @@ public abstract class CatalogFile {
     // Inline table mutations (metadata stored in catalog, not external file)
     protected final Map<TableIdentifier, byte[]> inlineTables;
     protected final Map<TableIdentifier, byte[]> inlineTableUpdates;
+    protected final Map<TableIdentifier, byte[]> inlineTableDeltaUpdates;
 
     protected Mut(C original) {
       this.original = original;
@@ -112,6 +113,7 @@ public abstract class CatalogFile {
       this.namespaceProperties = Maps.newHashMap();
       this.inlineTables = Maps.newHashMap();
       this.inlineTableUpdates = Maps.newHashMap();
+      this.inlineTableDeltaUpdates = Maps.newHashMap();
     }
 
     @SuppressWarnings("unchecked")
@@ -284,6 +286,16 @@ public abstract class CatalogFile {
         throw new NoSuchTableException("Table does not exist: %s", table);
       }
       inlineTableUpdates.put(table, metadata);
+      return self();
+    }
+
+    /** Updates an inline table via structured delta (encoded delta bytes). */
+    public T updateTableInlineDelta(TableIdentifier table, byte[] deltaBytes) {
+      if (!original.containsTable(table)) {
+        throw new NoSuchTableException("Table does not exist: %s", table);
+      }
+      // Store with a marker prefix to distinguish from full mode in buildActions
+      inlineTableDeltaUpdates.put(table, deltaBytes);
       return self();
     }
 
