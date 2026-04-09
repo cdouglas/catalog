@@ -95,7 +95,8 @@ message Action {
     DropTable drop_table = 6;
     UpdateTableLocation update_table_location = 7;
     ReadTable read_table = 8;       // for read-your-writes validation
-    CreateTableInline create_table_inline = 10;
+    UpdateTableInline  update_table_inline  = 9;
+    CreateTableInline  create_table_inline  = 10;
   }
 }
 
@@ -165,4 +166,15 @@ message CreateTableInline {
   int32  namespace_version = 4;   // -1 if late-bound
   string name              = 5;
   bytes  metadata          = 6;   // full TableMetadata as JSON bytes
+}
+
+message UpdateTableInline {
+  int32 id      = 1;
+  int32 version = 2;              // must match current
+
+  oneof payload {
+    bytes  full_metadata     = 4;   // full TableMetadata JSON (re-inline)
+    string metadata_location = 5;   // pointer fallback (eviction)
+    // TableMetadataDelta delta = 3;  // reserved for Stage 4
+  }
 }

@@ -67,7 +67,7 @@ to pointer mode. Delta mode is NOT yet implemented.
 - **Tests (transition):** inline->pointer transition verified in state model,
   pointer table has location but no inline metadata.
 
-**Status:** Not started
+**Status:** Complete
 
 ---
 
@@ -169,3 +169,4 @@ the FileIOCatalog commit path.
 |------|-------|-------|
 | 2026-04-08 | Stage 1 | InlineTable proto, state model, checkpoint encode/decode, 6 tests |
 | 2026-04-08 | Stage 2 | CreateTableInline action + encode/decode, 5 action tests |
+| 2026-04-08 | Stage 3 | UpdateTableInline (Full + Pointer), 4 tests (update, evict, mismatch, concurrent) |

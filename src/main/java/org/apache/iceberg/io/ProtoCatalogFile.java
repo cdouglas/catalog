@@ -484,6 +484,10 @@ public class ProtoCatalogFile extends CatalogFile {
       return entry != null ? entry.version : -1;
     }
 
+    public TblEntry tableEntry(int tblId) {
+      return tableById.get(tblId);
+    }
+
     public boolean namespaceExists(Namespace ns) {
       return namespaceLookup.containsKey(ns);
     }

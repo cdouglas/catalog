@@ -104,6 +104,7 @@ public class ProtoCodec {
   private static final int ACTION_DROP_TABLE = 6;
   private static final int ACTION_UPDATE_TABLE_LOCATION = 7;
   private static final int ACTION_READ_TABLE = 8;
+  private static final int ACTION_UPDATE_TABLE_INLINE = 9;
   private static final int ACTION_CREATE_TABLE_INLINE = 10;
 
   // CreateNamespace field numbers
@@ -148,6 +149,13 @@ public class ProtoCodec {
   // ReadTable field numbers
   private static final int READ_TBL_ID = 1;
   private static final int READ_TBL_VERSION = 2;
+
+  // UpdateTableInline field numbers
+  private static final int UPDATE_INLINE_TBL_ID = 1;
+  private static final int UPDATE_INLINE_TBL_VERSION = 2;
+  // oneof payload field numbers:
+  private static final int UPDATE_INLINE_FULL_METADATA = 4;
+  private static final int UPDATE_INLINE_METADATA_LOCATION = 5;
 
   // CreateTableInline field numbers
   private static final int CREATE_INLINE_TBL_ID = 1;
@@ -606,6 +614,17 @@ public class ProtoCodec {
       writeVarint(inner, READ_TBL_ID, a.id);
       writeVarint(inner, READ_TBL_VERSION, a.version);
       writeLengthDelimited(out, ACTION_READ_TABLE, inner.toByteArray());
+    } else if (action instanceof UpdateTableInlineAction) {
+      UpdateTableInlineAction a = (UpdateTableInlineAction) action;
+      ByteArrayOutputStream inner = new ByteArrayOutputStream();
+      writeVarint(inner, UPDATE_INLINE_TBL_ID, a.id);
+      writeVarint(inner, UPDATE_INLINE_TBL_VERSION, a.version);
+      if (a.fullMetadata != null) {
+        writeBytes(inner, UPDATE_INLINE_FULL_METADATA, a.fullMetadata);
+      } else if (a.metadataLocation != null) {
+        writeString(inner, UPDATE_INLINE_METADATA_LOCATION, a.metadataLocation);
+      }
+      writeLengthDelimited(out, ACTION_UPDATE_TABLE_INLINE, inner.toByteArray());
     } else if (action instanceof CreateTableInlineAction) {
       CreateTableInlineAction a = (CreateTableInlineAction) action;
       ByteArrayOutputStream inner = new ByteArrayOutputStream();
@@ -643,6 +662,8 @@ public class ProtoCodec {
         return decodeUpdateTableLocation(actionBytes);
       case ACTION_READ_TABLE:
         return decodeReadTable(actionBytes);
+      case ACTION_UPDATE_TABLE_INLINE:
+        return decodeUpdateTableInline(actionBytes);
       case ACTION_CREATE_TABLE_INLINE:
         return decodeCreateTableInline(actionBytes);
       default:
@@ -889,6 +910,35 @@ public class ProtoCodec {
       }
     }
     return new CreateTableInlineAction(id, version, nsId, nsVersion, name, metadata);
+  }
+
+  private static UpdateTableInlineAction decodeUpdateTableInline(byte[] bytes) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    int id = 0, version = 0;
+    byte[] fullMetadata = null;
+    String metadataLocation = null;
+
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      int fieldNumber = tag >>> 3;
+      switch (fieldNumber) {
+        case UPDATE_INLINE_TBL_ID:
+          id = readVarint(in);
+          break;
+        case UPDATE_INLINE_TBL_VERSION:
+          version = readVarint(in);
+          break;
+        case UPDATE_INLINE_FULL_METADATA:
+          fullMetadata = readLengthDelimitedBytes(in);
+          break;
+        case UPDATE_INLINE_METADATA_LOCATION:
+          metadataLocation = readString(in);
+          break;
+        default:
+          skipField(in, tag & 0x7);
+      }
+    }
+    return new UpdateTableInlineAction(id, version, fullMetadata, metadataLocation);
   }
 
   // ============================================================
@@ -1275,6 +1325,51 @@ public class ProtoCodec {
     @Override
     public void apply(ProtoCatalogFile.Builder builder) {
       // Read actions don't modify state
+    }
+  }
+
+  /**
+   * Updates an inline table's metadata. Supports two modes:
+   * - Full: replaces entire metadata (fullMetadata != null)
+   * - Pointer: evicts to external file (metadataLocation != null)
+   * Exactly one of fullMetadata or metadataLocation should be non-null.
+   */
+  public static class UpdateTableInlineAction implements Action {
+    final int id;
+    final int version;
+    final byte[] fullMetadata;       // non-null for FULL mode
+    final String metadataLocation;   // non-null for POINTER mode
+
+    public UpdateTableInlineAction(
+        int id, int version, byte[] fullMetadata, String metadataLocation) {
+      this.id = id;
+      this.version = version;
+      this.fullMetadata = fullMetadata;
+      this.metadataLocation = metadataLocation;
+    }
+
+    @Override
+    public boolean verify(ProtoCatalogFile.Builder builder) {
+      int currentVersion = builder.tableVersion(id);
+      return currentVersion == version;
+    }
+
+    @Override
+    public void apply(ProtoCatalogFile.Builder builder) {
+      if (fullMetadata != null) {
+        // FULL mode: replace inline metadata, keep as inline table
+        builder.removeInlineMetadata(id);
+        ProtoCatalogFile.TblEntry old = builder.tableEntry(id);
+        if (old != null) {
+          builder.addInlineTable(
+              id, old.namespaceId, old.name, version + 1, fullMetadata,
+              builder.manifestListPrefix(id) != null ? builder.manifestListPrefix(id) : "");
+        }
+      } else if (metadataLocation != null) {
+        // POINTER mode: evict from inline to pointer
+        builder.removeInlineMetadata(id);
+        builder.updateTableLocation(id, version + 1, metadataLocation);
+      }
     }
   }
 

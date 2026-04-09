@@ -184,6 +184,18 @@ public class TestProtoActions {
     return new ProtoCodec.CreateTableInlineAction(id, version, nsId, nsVersion, name, metadata);
   }
 
+  /** UpdateTableInline in FULL mode (replace inline metadata). */
+  static ProtoCodec.UpdateTableInlineAction updateTblInlineFull(
+      int id, int version, byte[] fullMetadata) {
+    return new ProtoCodec.UpdateTableInlineAction(id, version, fullMetadata, null);
+  }
+
+  /** UpdateTableInline in POINTER mode (evict to external file). */
+  static ProtoCodec.UpdateTableInlineAction updateTblInlinePointer(
+      int id, int version, String metadataLocation) {
+    return new ProtoCodec.UpdateTableInlineAction(id, version, null, metadataLocation);
+  }
+
   // ============================================================
   // File construction / replay helpers
   // ============================================================
@@ -1175,6 +1187,76 @@ public class TestProtoActions {
           (ProtoCodec.CreateTableInlineAction) decoded.actions().get(0);
       assertThat(decodedAction.name).isEqualTo("tbl");
       assertThat(decodedAction.metadata).isEqualTo(SAMPLE_INLINE_METADATA);
+    }
+
+    // --- UpdateTableInline action tests ---
+
+    @Test
+    void updateInlineTableFullMode() {
+      byte[] file = catalog()
+          .ns(1, 0, "db", 1)
+          .inlineTbl(1, 1, "tbl", 1, SAMPLE_INLINE_METADATA, SAMPLE_MANIFEST_PREFIX)
+          .build();
+      byte[] newMeta = "{\"format-version\":2,\"updated\":true}".getBytes(
+          java.nio.charset.StandardCharsets.UTF_8);
+      ProtoCatalogFile result = apply(file, txn(updateTblInlineFull(1, 1, newMeta)));
+
+      TableIdentifier tbl = TableIdentifier.of(Namespace.of("db"), "tbl");
+      assertThat(result.isInlineTable(result.tableId(tbl))).isTrue();
+      assertThat(result.inlineMetadata(result.tableId(tbl))).isEqualTo(newMeta);
+      assertThat(result.tableVersion(result.tableId(tbl))).isEqualTo(2);
+    }
+
+    @Test
+    void updateInlineTablePointerModeEvicts() {
+      byte[] file = catalog()
+          .ns(1, 0, "db", 1)
+          .inlineTbl(1, 1, "tbl", 1, SAMPLE_INLINE_METADATA, SAMPLE_MANIFEST_PREFIX)
+          .build();
+      ProtoCatalogFile result = apply(file,
+          txn(updateTblInlinePointer(1, 1, "s3://bucket/evicted/v1.metadata.json")));
+
+      TableIdentifier tbl = TableIdentifier.of(Namespace.of("db"), "tbl");
+      // Table is now a pointer, no longer inline
+      assertThat(result.isInlineTable(result.tableId(tbl))).isFalse();
+      assertThat(result.location(tbl)).isEqualTo("s3://bucket/evicted/v1.metadata.json");
+      assertThat(result.inlineMetadata(result.tableId(tbl))).isNull();
+      assertThat(result.tableVersion(result.tableId(tbl))).isEqualTo(2);
+    }
+
+    @Test
+    void updateInlineTableRejectsVersionMismatch() {
+      byte[] file = catalog()
+          .ns(1, 0, "db", 1)
+          .inlineTbl(1, 1, "tbl", 3, SAMPLE_INLINE_METADATA, SAMPLE_MANIFEST_PREFIX)
+          .build();
+      byte[] newMeta = "{}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+      ProtoCodec.Transaction t = txn(updateTblInlineFull(1, 1, newMeta));
+      ProtoCatalogFile result = apply(file, t);
+
+      // Version 1 doesn't match actual 3
+      assertThat(result.containsTransaction(t.id())).isFalse();
+      assertThat(result.inlineMetadata(result.tableId(
+          TableIdentifier.of(Namespace.of("db"), "tbl")))).isEqualTo(SAMPLE_INLINE_METADATA);
+    }
+
+    @Test
+    void concurrentInlineUpdatesSecondRejected() {
+      byte[] file = catalog()
+          .ns(1, 0, "db", 1)
+          .inlineTbl(1, 1, "tbl", 1, SAMPLE_INLINE_METADATA, SAMPLE_MANIFEST_PREFIX)
+          .build();
+      byte[] meta1 = "{\"writer\":\"a\"}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+      byte[] meta2 = "{\"writer\":\"b\"}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+
+      ProtoCodec.Transaction t1 = txn(updateTblInlineFull(1, 1, meta1));
+      ProtoCodec.Transaction t2 = txn(updateTblInlineFull(1, 1, meta2));
+      ProtoCatalogFile result = apply(file, t1, t2);
+
+      assertThat(result.containsTransaction(t1.id())).isTrue();
+      assertThat(result.containsTransaction(t2.id())).isFalse();
+      assertThat(result.inlineMetadata(result.tableId(
+          TableIdentifier.of(Namespace.of("db"), "tbl")))).isEqualTo(meta1);
     }
 
     @Test
