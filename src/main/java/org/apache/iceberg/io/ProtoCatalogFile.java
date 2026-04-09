@@ -329,9 +329,12 @@ public class ProtoCatalogFile extends CatalogFile {
     }
 
     public Builder removeNamespace(int id) {
+      // Build the Namespace key before removing from namespaceById,
+      // since buildNamespace needs the entry to reconstruct the path.
+      Namespace ns = namespaceById.containsKey(id) ? buildNamespace(id) : null;
       NsEntry entry = namespaceById.remove(id);
       if (entry != null) {
-        namespaceLookup.remove(buildNamespace(id));
+        namespaceLookup.remove(ns);
         nsProperties.remove(id);
       }
       return this;
