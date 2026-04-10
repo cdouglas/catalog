@@ -58,13 +58,69 @@ public class ProtoCatalogFormat
   public static final int FORMAT_VERSION = 1;
   public static final int HEADER_SIZE = 8; // magic (4) + version (4)
 
-  public ProtoCatalogFormat() {}
+  /**
+   * Maximum number of transaction records in the log portion before a new commit
+   * must CAS (compact) instead of append. Default: 10000. Set to 0 to force CAS on
+   * every commit (for storage providers that don't support conditional append).
+   *
+   * <p>Provider hard limits: S3 Express ~10000, Azure AppendBlob 50000.
+   */
+  public static final String MAX_APPEND_COUNT = "fileio.catalog.max.append.count";
+  public static final int DEFAULT_MAX_APPEND_COUNT = 10_000;
 
-  public ProtoCatalogFormat(Map<String, String> properties) {}
+  /**
+   * Maximum size in bytes of the catalog file before a new commit must CAS (compact)
+   * instead of append. This is a performance target; larger catalogs take longer to
+   * read. Default: 16 MB.
+   */
+  public static final String MAX_APPEND_SIZE = "fileio.catalog.max.append.size";
+  public static final long DEFAULT_MAX_APPEND_SIZE = 16L * 1024 * 1024;
+
+  private final int maxAppendCount;
+  private final long maxAppendSize;
+
+  public ProtoCatalogFormat() {
+    this(DEFAULT_MAX_APPEND_COUNT, DEFAULT_MAX_APPEND_SIZE);
+  }
+
+  public ProtoCatalogFormat(Map<String, String> properties) {
+    this(
+        parseIntProperty(properties, MAX_APPEND_COUNT, DEFAULT_MAX_APPEND_COUNT),
+        parseLongProperty(properties, MAX_APPEND_SIZE, DEFAULT_MAX_APPEND_SIZE));
+  }
+
+  public ProtoCatalogFormat(int maxAppendCount, long maxAppendSize) {
+    Preconditions.checkArgument(maxAppendCount >= 0,
+        "maxAppendCount must be >= 0, got %s", maxAppendCount);
+    Preconditions.checkArgument(maxAppendSize >= 0,
+        "maxAppendSize must be >= 0, got %s", maxAppendSize);
+    this.maxAppendCount = maxAppendCount;
+    this.maxAppendSize = maxAppendSize;
+  }
+
+  public int maxAppendCount() {
+    return maxAppendCount;
+  }
+
+  public long maxAppendSize() {
+    return maxAppendSize;
+  }
+
+  private static int parseIntProperty(Map<String, String> properties, String key, int dflt) {
+    if (properties == null) return dflt;
+    String val = properties.get(key);
+    return val != null ? Integer.parseInt(val) : dflt;
+  }
+
+  private static long parseLongProperty(Map<String, String> properties, String key, long dflt) {
+    if (properties == null) return dflt;
+    String val = properties.get(key);
+    return val != null ? Long.parseLong(val) : dflt;
+  }
 
   @Override
   public CatalogFile.Mut<ProtoCatalogFile, Mut> empty(InputFile input) {
-    return new Mut(input);
+    return new Mut(input, maxAppendCount, maxAppendSize);
   }
 
   @Override
@@ -72,7 +128,7 @@ public class ProtoCatalogFormat
     if (!(other instanceof ProtoCatalogFile)) {
       throw new IllegalArgumentException("Cannot convert to ProtoCatalogFile: " + other);
     }
-    return new Mut((ProtoCatalogFile) other);
+    return new Mut((ProtoCatalogFile) other, maxAppendCount, maxAppendSize);
   }
 
   @Override
@@ -107,6 +163,7 @@ public class ProtoCatalogFormat
     // Read and apply transaction log
     int logStart = HEADER_SIZE + varintSize(checkpointLen) + checkpointLen;
     int remaining = fileLength - logStart;
+    int appendCount = 0;
     if (remaining > 0) {
       byte[] logBytes = new byte[remaining];
       IOUtil.readFully(in, logBytes, 0, remaining);
@@ -116,6 +173,7 @@ public class ProtoCatalogFormat
         int txnLen = readVarint(logStream);
         byte[] txnBytes = new byte[txnLen];
         IOUtil.readFully(logStream, txnBytes, 0, txnLen);
+        appendCount++;
 
         ProtoCodec.Transaction txn = ProtoCodec.decodeTransaction(txnBytes);
         if (builder.containsTransaction(txn.id())) {
@@ -132,6 +190,7 @@ public class ProtoCatalogFormat
         }
       }
     }
+    builder.setAppendCount(appendCount);
 
     return builder.build();
   }
@@ -200,6 +259,8 @@ public class ProtoCatalogFormat
   public static class Mut extends CatalogFile.Mut<ProtoCatalogFile, Mut> {
 
     private final ProtoIdManager idManager = new ProtoIdManager();
+    private final int maxAppendCount;
+    private final long maxAppendSize;
     private ProtoCodec.Transaction pendingTransaction;
 
     Mut(InputFile input) {
@@ -207,7 +268,17 @@ public class ProtoCatalogFormat
     }
 
     Mut(ProtoCatalogFile other) {
+      this(other, DEFAULT_MAX_APPEND_COUNT, DEFAULT_MAX_APPEND_SIZE);
+    }
+
+    Mut(InputFile input, int maxAppendCount, long maxAppendSize) {
+      this(ProtoCatalogFile.empty(input), maxAppendCount, maxAppendSize);
+    }
+
+    Mut(ProtoCatalogFile other, int maxAppendCount, long maxAppendSize) {
       super(other);
+      this.maxAppendCount = maxAppendCount;
+      this.maxAppendSize = maxAppendSize;
     }
 
     /**
@@ -386,7 +457,6 @@ public class ProtoCatalogFormat
 
     @Override
     public ProtoCatalogFile commit(SupportsAtomicOperations fileIO) {
-      final long MAX_CATALOG_SIZE = 16L * 1024 * 1024;
       final int MAX_ATTEMPTS = 10;
 
       ProtoCatalogFile baseCatalog = original;
@@ -401,16 +471,25 @@ public class ProtoCatalogFormat
       }
 
       for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-        // Case 1: Catalog is sealed - must compact via CAS
-        if (baseCatalog.isSealed()) {
+        // Decide whether to CAS (compact) or append.
+        // MUST CAS if: already sealed by a previous writer, or append count at/beyond the
+        // hard limit. Setting maxAppendCount=0 forces CAS on every commit.
+        boolean mustCAS = baseCatalog.isSealed()
+            || baseCatalog.appendCount() >= maxAppendCount;
+
+        if (mustCAS) {
           ProtoCodec.unsealTransaction(txnBytes);
           Optional<ProtoCatalogFile> result = tryCAS(current, txn, txnBytes, fileIO);
           if (result.isPresent()) {
             return validateCommit(result.get(), txn);
           }
         } else {
-          // Case 2: Normal append
-          if (current.getLength() + txnBytes.length > MAX_CATALOG_SIZE) {
+          // Append path. Seal this transaction if it will push us to/past either limit,
+          // signalling the next writer to compact via CAS.
+          boolean willHitLimit =
+              baseCatalog.appendCount() + 1 >= maxAppendCount
+              || current.getLength() + txnBytes.length > maxAppendSize;
+          if (willHitLimit) {
             ProtoCodec.sealTransaction(txnBytes);
           }
           Optional<ProtoCatalogFile> result = tryAppend(current, txn, txnBytes, fileIO);

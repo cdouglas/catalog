@@ -64,6 +64,10 @@ public class ProtoCatalogFile extends CatalogFile {
   // Committed transactions for deduplication
   private final Set<UUID> committedTransactions;
 
+  // Number of transaction records in the log portion of the catalog file.
+  // Computed during readInternal; used by commit() to enforce max-append-count.
+  private final int appendCount;
+
   private ProtoCatalogFile(Builder builder) {
     super(builder.catalogUuid, builder.location);
     this.sealed = builder.sealed;
@@ -77,6 +81,7 @@ public class ProtoCatalogFile extends CatalogFile {
     this.tblInlineMetadata = ImmutableMap.copyOf(builder.tblInlineMetadata);
     this.tblManifestPrefix = ImmutableMap.copyOf(builder.tblManifestPrefix);
     this.committedTransactions = ImmutableSet.copyOf(builder.committedTransactions);
+    this.appendCount = builder.appendCount;
   }
 
   private static Map<Integer, Map<String, String>> deepCopyProperties(
@@ -267,6 +272,11 @@ public class ProtoCatalogFile extends CatalogFile {
     return tblInlineMetadata.containsKey(tblId);
   }
 
+  /** Returns the number of transaction records in the log portion of the catalog file. */
+  public int appendCount() {
+    return appendCount;
+  }
+
   Map<Integer, byte[]> allInlineMetadata() {
     return tblInlineMetadata;
   }
@@ -324,6 +334,7 @@ public class ProtoCatalogFile extends CatalogFile {
     private final Map<Integer, byte[]> tblInlineMetadata = new HashMap<>();
     private final Map<Integer, String> tblManifestPrefix = new HashMap<>();
     private final Set<UUID> committedTransactions = new HashSet<>();
+    private int appendCount = 0;
 
     Builder(InputFile location) {
       this.location = location;
@@ -479,6 +490,11 @@ public class ProtoCatalogFile extends CatalogFile {
 
     public boolean containsTransaction(UUID txnId) {
       return committedTransactions.contains(txnId);
+    }
+
+    public Builder setAppendCount(int count) {
+      this.appendCount = count;
+      return this;
     }
 
     public Integer namespaceId(Namespace ns) {

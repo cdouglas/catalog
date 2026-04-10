@@ -450,9 +450,10 @@ public class ProtoCodec {
     try {
       ByteArrayOutputStream out = new ByteArrayOutputStream();
       writeBytes(out, TXN_ID, uuidToBytes(txn.id()));
-      if (txn.isSealed()) {
-        writeVarint(out, TXN_SEALED, 1);
-      }
+      // Always encode the sealed field so sealTransaction/unsealTransaction can
+      // mutate it in place (otherwise proto3 default-suppression would omit it
+      // when false, breaking in-place seal toggling).
+      writeVarint(out, TXN_SEALED, txn.isSealed() ? 1 : 0);
       for (Action action : txn.actions()) {
         byte[] actionBytes = encodeAction(action);
         writeLengthDelimited(out, TXN_ACTIONS, actionBytes);
