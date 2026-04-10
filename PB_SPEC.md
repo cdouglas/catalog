@@ -220,9 +220,9 @@ message UpdateTableInline {
   int32 version = 2;              // must match current
 
   oneof payload {
-    bytes  full_metadata     = 4;   // full TableMetadata JSON (re-inline)
-    string metadata_location = 5;   // pointer fallback (eviction)
-    // TableMetadataDelta delta = 3;  // reserved for future delta mode
+    TableMetadataDelta delta             = 3;  // structured metadata changes
+    bytes              full_metadata     = 4;  // full TableMetadata JSON
+    string             metadata_location = 5;  // pointer fallback (eviction)
   }
 }
 ```
@@ -231,14 +231,94 @@ message UpdateTableInline {
 verification rule is the same as `CreateTable` (namespace version check, late-bind
 support).
 
-**UpdateTableInline** updates an inline table in one of two modes:
-- **Full** (`full_metadata`): replaces the entire inline metadata. Used for
-  re-inlining or full metadata refresh.
+**UpdateTableInline** updates an inline table in one of three modes:
+- **Delta** (`delta`): applies structured metadata changes. The typical path for
+  data commits -- encodes only what changed (~100 bytes for an AddSnapshot).
+- **Full** (`full_metadata`): replaces the entire inline metadata. Used on
+  initial creation, re-inlining, or when the delta exceeds the size budget.
 - **Pointer** (`metadata_location`): evicts the table from inline to pointer mode.
   The inline metadata is removed and replaced with an external file location.
 
-Version verification is the same as `UpdateTableLocation`. A future delta mode
-(field 3) will carry structured metadata changes for efficient data commits.
+Version verification is the same as `UpdateTableLocation`.
+
+### Table Metadata Delta Messages
+
+The delta payload is a sequence of typed metadata updates, each representing
+one logical change to the table's `TableMetadata`. See
+[INLINE_INTENTION.md](INLINE_INTENTION.md) for the full dictionary design.
+
+```protobuf
+message TableMetadataDelta {
+  repeated TableMetadataUpdate updates = 1;
+}
+
+message TableMetadataUpdate {
+  oneof update {
+    AddSnapshot             add_snapshot               = 1;
+    SetSnapshotRef          set_snapshot_ref           = 2;
+    RemoveSnapshots         remove_snapshots           = 3;
+    AddSchema               add_schema                 = 4;
+    SetCurrentSchema        set_current_schema         = 5;
+    AddPartitionSpec        add_partition_spec         = 6;
+    SetDefaultPartitionSpec set_default_partition_spec = 7;
+    AddSortOrder            add_sort_order             = 8;
+    SetDefaultSortOrder     set_default_sort_order     = 9;
+    SetTableProperties      set_properties             = 10;
+    SetTableLocation        set_table_location         = 11;
+  }
+}
+
+message AddSnapshot {
+  fixed64        snapshot_id          = 1;
+  string         manifest_list_suffix = 2;   // appended to per-table prefix
+  CompactSummary summary              = 3;   // typed summary (replaces map)
+  sint64         timestamp_delta_ms   = 4;   // signed delta from lastUpdatedMs
+  int32          schema_id            = 5;   // only if changed from current
+  int64          added_rows           = 6;   // v3+
+}
+
+enum OperationType { APPEND = 0; OVERWRITE = 1; DELETE = 2; REPLACE = 3; }
+
+message CompactSummary {
+  OperationType      operation              = 1;
+  int64              added_data_files       = 2;
+  int64              added_records          = 3;
+  int64              added_files_size       = 4;
+  int64              total_data_files       = 5;
+  int64              total_records          = 6;
+  int64              total_files_size       = 7;
+  int64              added_delete_files     = 8;
+  int64              total_delete_files     = 9;
+  int64              total_equality_deletes = 10;
+  int64              total_position_deletes = 11;
+  map<string,string> extra                  = 15;
+}
+
+message SetSnapshotRef {
+  string ref_name              = 1;
+  int64  snapshot_id           = 2;
+  string ref_type              = 3;   // "branch" or "tag"
+  int32  min_snapshots_to_keep = 4;
+  int64  max_snapshot_age_ms   = 5;
+  int64  max_ref_age_ms        = 6;
+}
+
+message RemoveSnapshots          { repeated int64 snapshot_ids = 1; }
+message AddSchema                { int32 schema_id = 1; int32 last_column_id = 2; bytes schema_json = 3; }
+message SetCurrentSchema         { int32 schema_id = 1; }
+message AddPartitionSpec         { int32 spec_id = 1; int32 last_partition_id = 2; bytes spec_json = 3; }
+message SetDefaultPartitionSpec  { int32 spec_id = 1; }
+message AddSortOrder             { int32 order_id = 1; bytes order_json = 2; }
+message SetDefaultSortOrder      { int32 order_id = 1; }
+message SetTableProperties       { map<string,string> updated = 1; repeated string removed = 2; }
+message SetTableLocation         { string location = 1; }
+```
+
+`AddSnapshot` uses dictionary-derived fields: the per-table `manifest_list_prefix`
+is prepended to `manifest_list_suffix`, the timestamp is reconstructed from
+`state.lastUpdatedMs + timestamp_delta_ms`, the sequence number is
+`state.lastSequenceNumber + 1`, and the parent snapshot is `state.currentSnapshotId`.
+A typical data commit delta is ~80-115 bytes.
 
 ## Wire Format Details
 
@@ -449,82 +529,123 @@ Identical to LCF. Each action's `verify()` checks version-based preconditions:
 
 ## Inline Table Metadata
 
-The PB format supports **inline table metadata** -- storing `TableMetadata` (as JSON
-bytes) directly in the catalog rather than in external metadata.json files. This
-eliminates the second write per table update and reduces per-commit payload from
-2-700 KB (full metadata rewrite) to the size of the metadata JSON.
+The PB format supports **inline table metadata** -- storing `TableMetadata` directly
+in the catalog rather than in external `metadata.json` files. This eliminates the
+second write per table update and reduces per-commit payload from 2-700 KB (full
+metadata rewrite) to ~80-170 bytes (delta mode for a typical data commit).
 
 ### Storage Model
 
 A table is either **pointer** (external metadata file) or **inline** (metadata in
-catalog). The `Checkpoint` message stores pointer tables in `tables` (field 11) and
-inline tables in `inline_tables` (field 13). A table ID appears in exactly one.
+catalog). The `Checkpoint` message stores pointer tables in `tables` (field 11)
+and inline tables in `inline_tables` (field 13). A table ID appears in exactly one.
+Pointer and inline tables can coexist in the same catalog; individual tables can
+transition between modes.
+
+### Delivery Modes
+
+When committing an update to an inline table, `FileIOTableOperations.doCommit()`
+picks one of three modes based on the resulting transaction size:
+
+- **Delta**: applies structured changes via `InlineDeltaCodec`. This is the common
+  path for data commits -- an `AddSnapshot` + `SetSnapshotRef` typically encodes
+  to ~80-115 bytes.
+- **Full**: serializes the complete `TableMetadata` JSON. Used on initial creation
+  or when the delta would exceed the append size budget.
+- **Pointer**: writes `TableMetadata` to an external file and records only its
+  location. Used as a fallback when even the full metadata exceeds the 4 MiB Azure
+  `AppendBlock` limit.
+
+`InlineDeltaCodec.selectMode(delta, newMeta, currentTxnSize)` picks the mode given
+the current transaction size and a 4 MiB budget (`APPEND_LIMIT`).
+
+### Delta Application
+
+`InlineDeltaCodec.computeDelta(oldMeta, newMeta, manifestListPrefix)` diffs two
+`TableMetadata` instances and produces a minimal list of `DeltaUpdate` objects
+covering all 11 update types (new snapshots, removed snapshots, ref changes,
+schema additions, partition specs, sort orders, property changes, location
+changes).
+
+On replay, `InlineDeltaCodec.applyDelta(baseMetadataJson, deltaBytes)` parses the
+base metadata, applies each update via `TableMetadata.Builder`, and re-serializes.
+`AddSnapshot` reconstructs derived fields (sequence number, parent snapshot,
+timestamp) from the base state's corresponding values.
 
 ### Configuration
 
-Set `fileio.catalog.inline=true` in catalog properties to enable inline mode. When
-enabled, `FileIOTableOperations.doCommit()` serializes `TableMetadata` to JSON bytes
-and emits `CreateTableInline` / `UpdateTableInline` actions instead of writing external
-metadata files. Currently uses Full mode only (complete metadata replacement per
-commit); delta mode is planned for future stages.
+Set `fileio.catalog.inline=true` in catalog properties to enable inline mode.
+When disabled (default), the catalog uses the traditional pointer path.
 
-### Table Loading
+### Table Loading (No Base Class Changes)
 
 `FileIOTableOperations.loadFromCatalogFile()` detects inline tables via
-`CatalogFile.isInlineTable()` and uses `BaseMetastoreTableOperations
-.refreshFromMetadataLocation(syntheticLoc, null, 0, customLoader)` with a custom
-loader that parses from the inline bytes. No changes to `BaseMetastoreCatalog` or
-`BaseMetastoreTableOperations` in the iceberg/ fork are needed.
+`CatalogFile.isInlineTable()` and calls
+`BaseMetastoreTableOperations.refreshFromMetadataLocation(syntheticLoc, null, 0,
+customLoader)` with a custom `Function<String, TableMetadata>` that parses from
+the catalog's inline bytes. **No changes to `BaseMetastoreCatalog` or
+`BaseMetastoreTableOperations` in the iceberg/ fork are required** -- the
+existing protected API supports this integration cleanly.
 
-### Delta Mode
+### Commit Protocol (Inline Mode)
 
-For table updates, the format supports structured metadata deltas that encode
-only what changed, reducing per-commit payload from full metadata JSON (~KB) to
-compact binary deltas (~100 bytes for a typical data commit).
+```
+function doCommit(base, newMetadata):
+    if isCreate:
+        bytes = TableMetadataParser.toJson(newMetadata).getBytes(UTF_8)
+        format.from(lastCatalogFile)
+            .createTableInline(tableId, bytes)
+            .commit(io)
+        return
 
-`InlineDeltaCodec` implements encode/decode/apply for all 11 update types from
-[INLINE_INTENTION.md](INLINE_INTENTION.md): `AddSnapshot` (with `CompactSummary`
-and dictionary-derived fields), `SetSnapshotRef`, `RemoveSnapshots`, `AddSchema`,
-`SetCurrentSchema`, `AddPartitionSpec`, `SetDefaultPartitionSpec`, `AddSortOrder`,
-`SetDefaultSortOrder`, `SetTableProperties`, `SetTableLocation`.
+    # Compute delta using the per-table manifest list prefix
+    prefix = lastCatalogFile.manifestListPrefix(tableId)
+    delta  = InlineDeltaCodec.computeDelta(base, newMetadata, prefix)
+    mode   = InlineDeltaCodec.selectMode(delta, newMetadata, 0)
 
-`computeDelta(oldMeta, newMeta, manifestListPrefix)` diffs two `TableMetadata`
-instances. `selectMode(delta, newMeta, txnSize)` picks delivery mode based on
-encoded size vs the 4 MiB Azure append limit.
+    mut = format.from(lastCatalogFile)
+    switch mode:
+        case "delta":
+            mut.updateTableInlineDelta(tableId, InlineDeltaCodec.encodeDelta(delta))
+        case "full":
+            mut.updateTableInline(tableId, newMetadata.toJson().getBytes(UTF_8))
+        case "pointer":
+            loc = writeMetadataFile(newMetadata)
+            mut.updateTable(tableId, loc)
+    mut.commit(io)
+```
 
-`FileIOTableOperations.doCommit()` uses the delta/full/pointer pipeline
-automatically when `fileio.catalog.inline=true`.
-
-### Implementation Status
-
-All 8 stages complete:
-1. `InlineTable` checkpoint message and state model
-2. `CreateTableInline` action (verify, apply, encode/decode)
-3. `UpdateTableInline` action (Full + Pointer modes)
-4. `CatalogFile.Mut` inline API + `FileIOCatalog` integration
-5. Delta infrastructure + all simple delta types
-6. Snapshot deltas with `CompactSummary` and dictionary encoding
-7. `computeDelta` + mode selection (4 MiB Azure limit)
-8. Delta integration into `FileIOCatalog` commit path
-
-See [docs/INLINE_IMPL.md](docs/INLINE_IMPL.md) for detailed implementation log.
+`commitTransaction()` (multi-table commits) uses the same delta/full/pointer
+selection per table.
 
 ## Current Status
 
-- **Hand-rolled codec** -- `ProtoCodec` implements protobuf wire format manually. This
-  validates correctness against the `.proto` schema before committing to generated classes
-  as a dependency.
+All 8 implementation stages are complete. See
+[docs/INLINE_IMPL.md](docs/INLINE_IMPL.md) for the progress log.
+
+- **Hand-rolled codec** -- `ProtoCodec` and `InlineDeltaCodec` implement protobuf
+  wire format manually. This validates correctness against the `.proto` schema
+  before committing to generated classes as a dependency.
+- **Inline metadata** -- full integration with `FileIOCatalog`, using delta mode
+  for data commits and falling back to full/pointer for oversized transactions.
+- **Test coverage** -- 134 unit tests passing (`mvn test`). Cloud provider
+  integration tests are separated via `maven-failsafe-plugin` and run with
+  `mvn verify`.
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `src/main/proto/catalog.proto` | Protobuf schema definition |
+| `src/main/proto/catalog.proto` | Protobuf schema definition (catalog + inline delta messages) |
 | `src/main/java/.../ProtoCatalogFormat.java` | Format implementation (read, commit, CAS/append) |
-| `src/main/java/.../ProtoCatalogFile.java` | Immutable catalog snapshot + builder |
-| `src/main/java/.../ProtoCodec.java` | Protobuf wire encoding/decoding, action types |
+| `src/main/java/.../ProtoCatalogFile.java` | Immutable catalog snapshot + builder (pointer + inline tables) |
+| `src/main/java/.../ProtoCodec.java` | Protobuf wire encoding/decoding, catalog-level action types |
+| `src/main/java/.../InlineDeltaCodec.java` | Delta encode/decode/apply, `computeDelta`, `selectMode` |
+| `src/main/java/.../FileIOCatalog.java` | Catalog + `FileIOTableOperations` with inline integration |
+| `src/main/java/.../CatalogFile.java` | Abstract base with inline-aware `Mut` API |
 | `src/test/java/.../TestProtoCatalogFormat.java` | Codec and format tests |
-| `src/test/java/.../TestProtoActions.java` | Systematic action tests (positive/negative/randomized) |
+| `src/test/java/.../TestProtoActions.java` | Systematic action tests (positive/negative/randomized/inline) |
+| `src/test/java/.../TestInlineDelta.java` | Delta encode/decode/apply, `computeDelta`, `selectMode` tests |
 
 ---
 
@@ -539,7 +660,7 @@ differences are in encoding, file structure, and extensibility.
 | Aspect | LCF | PB |
 |--------|-----|-----|
 | **Record format** | Custom opcode-based (`DataOutputStream`) | Protobuf wire format (field tags + varints) |
-| **Opcodes** | 1-byte prefix per record (0x00--0x09) | Protobuf `oneof` field numbers (1--8) in `Action` |
+| **Opcodes** | 1-byte prefix per record (0x00--0x09) | Protobuf `oneof` field numbers (1--10) in `Action` |
 | **Integer encoding** | Fixed 4-byte big-endian | Protobuf varint (1--5 bytes for positive values) |
 | **String encoding** | Java modified UTF-8 (2-byte length prefix) | Protobuf length-delimited (varint prefix + UTF-8) |
 | **UUID encoding** | Raw 16 bytes (MSB long + LSB long) | Protobuf `bytes` field (varint tag + varint length + 16 bytes) |
@@ -582,7 +703,8 @@ and backward compatibility.
 |--------|-----|-----|
 | **Failed verification on read** | Treated as corruption (error) | Silently skipped (conflict from concurrent writer) |
 | **Seal/unseal** | Toggle byte at fixed offset 17 in transaction record | Locate protobuf field tag for field 2 and toggle varint |
-| **Codec** | Inline in `LogCatalogFormat` (~1500 lines) | Separated into `ProtoCodec` (~1176 lines) |
+| **Codec** | Inline in `LogCatalogFormat` (~1500 lines) | Separated: `ProtoCodec` (catalog) + `InlineDeltaCodec` (deltas) |
+| **Inline metadata** | Not supported (pointer only) | Supported (delta/full/pointer mode selection) |
 | **Generated code** | None | None yet (hand-rolled codec validates against `.proto`) |
 
 ### What Is Identical
@@ -591,7 +713,7 @@ and backward compatibility.
 - Compaction threshold (16 MB)
 - Late-binding with negative virtual IDs
 - Version-based optimistic concurrency (same verification rules)
-- Action semantics (same 8 action types)
-- State model (same fields in snapshot)
+- The 8 base action semantics (namespace/table CRUD) -- PB adds 2 inline actions
+- State model for namespaces, pointer tables, and committed transactions
 - Namespace hierarchy (parent pointers, root = ID 0)
 - Idempotency via committed-transaction-ID tracking
