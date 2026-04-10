@@ -55,7 +55,6 @@ public class FileIOCatalog extends BaseMetastoreCatalog
   // TODO audit loadTable in BaseMetastoreCatalog
   // TODO buildTable overridden in BaseMetastoreCatalog?
 
-  private static final String FILE_FORMAT = "fileio.catalog.format";
   private static final String INLINE_ENABLED = "fileio.catalog.inline";
 
   private Configuration conf; // TODO: delete
@@ -115,15 +114,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
       catalogLocation = LocationUtil.stripTrailingSlash(warehouseLocation) + "/catalog";
     }
     if (null == format) {
-      // TODO configuration
-      String formatStr = properties.getOrDefault(FILE_FORMAT, "append");
-      if ("cas".equals(formatStr)) {
-        format = new CASCatalogFormat();
-      } else if ("append".equals(formatStr)) {
-        format = new LogCatalogFormat();
-      } else {
-        throw new IllegalArgumentException("Unknown catalog format: " + formatStr);
-      }
+      format = new ProtoCatalogFormat(properties);
     }
     if (null == fileIO) {
       // TODO check warehouseLocation schema?

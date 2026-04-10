@@ -1,8 +1,8 @@
 # ProtoCatalogFormat (PB) Specification
 
-This document specifies the protobuf-based catalog format implemented by `ProtoCatalogFormat`.
-It uses the same checkpoint + append log architecture as `LogCatalogFormat` but encodes all
-records using protobuf-compatible wire format.
+This document specifies the protobuf-based catalog format implemented by `ProtoCatalogFormat`,
+the only catalog format used by `FileIOCatalog`. It uses a checkpoint + append log
+architecture encoded via protobuf-compatible wire format.
 
 ## Overview
 
@@ -377,7 +377,16 @@ ignore them.
 
 ## Commit Protocol
 
-The commit protocol is structurally identical to LCF:
+Two configurable thresholds control when a commit takes the append path versus the
+CAS (compaction) path:
+
+| Property | Default | Purpose |
+|----------|---------|---------|
+| `fileio.catalog.max.append.count` | 10000 | Hard limit on log records. Must CAS when exceeded. Matches provider limits (S3 Express ~10k, Azure AppendBlob 50k). **Setting to 0 forces CAS on every commit**, for providers without conditional append (S3 standard, GCS). |
+| `fileio.catalog.max.append.size`  | 16 MB  | Soft performance target for total file size. Larger catalogs take longer to read. |
+
+`ProtoCatalogFile` tracks `appendCount` (the number of transaction records in the log
+portion), computed during `readInternal`.
 
 ```
 function COMMIT(fileIO, original, mutations):
@@ -387,21 +396,24 @@ function COMMIT(fileIO, original, mutations):
 
     # Case 0: catalog does not exist yet
     if not current.exists():
-        return tryCAS(current, txnBytes, fileIO)
-            .orElseThrow(CommitFailed)
+        return tryCAS(current, txnBytes, fileIO).orElseThrow(CommitFailed)
 
     for attempt in 0..9:
+        # Must CAS if already sealed, or append count at/beyond the hard limit.
+        # (maxAppendCount=0 makes this always true, forcing CAS on every commit.)
+        mustCAS = original.sealed
+            or original.appendCount >= maxAppendCount
 
-        # Case 1: sealed - must compact via CAS
-        if original.sealed:
+        if mustCAS:
             unseal(txnBytes)
             result = tryCAS(current, txnBytes, fileIO)
             if result.present:
                 return validateCommit(result, txn)
-
-        # Case 2: normal append
         else:
-            if current.length + len(txnBytes) > 16 MB:
+            # Append path. Seal if adding this transaction will push us at or
+            # past either limit, so the next writer compacts via CAS.
+            if original.appendCount + 1 >= maxAppendCount
+               or current.length + len(txnBytes) > maxAppendSize:
                 seal(txnBytes)
             result = tryAppend(current, txnBytes, fileIO)
             if result.present:
@@ -416,6 +428,14 @@ function COMMIT(fileIO, original, mutations):
 
     throw CommitFailed("exceeded retry limit")
 ```
+
+### CAS-only Mode
+
+Setting `fileio.catalog.max.append.count=0` makes every commit go through `tryCAS`.
+This is required for storage providers that support conditional full-object
+replacement but not conditional append (S3 standard via if-match ETag, GCS via
+generation number). The commit loop never enters the append branch because
+`appendCount >= 0` is always true.
 
 ### tryCAS (compare-and-swap)
 
@@ -463,12 +483,18 @@ bytes in place by locating the field tag for field 2 and toggling the varint val
 
 ## Compaction
 
-Same trigger and mechanics as LCF:
+Compaction is triggered when either the append count or the append size threshold
+would be exceeded:
 
-1. Writer detects `file_size + txn_size > 16 MB` and sets `sealed = true`.
-2. Next writer sees `sealed = true` and performs a full CAS.
-3. CAS builds a fresh checkpoint from the fully-replayed state.
-4. New file: header + checkpoint + transaction (minimal log).
+1. A writer detects that committing this transaction would push the log past
+   `maxAppendCount` records or `maxAppendSize` bytes. It **seals** the transaction
+   (flipping the `sealed` bit in the encoded bytes) so the next writer knows to compact.
+2. Next writer reads the file, sees `sealed = true` (or `appendCount >= maxAppendCount`),
+   and enters the CAS branch.
+3. The CAS builds a fresh checkpoint from the fully-replayed state and writes
+   `[header][checkpoint][new-txn]`, replacing the entire file.
+4. After CAS, the file has a single record in the log portion (the committing
+   transaction), and `appendCount = 1`.
 
 The committed-transaction-ID set is carried forward in the checkpoint for idempotency.
 
@@ -487,8 +513,7 @@ virtual IDs:
 
 ## State Model
 
-The catalog state is held in `ProtoCatalogFile` (immutable snapshot), mirroring LCF's
-`LogCatalogFile`:
+The catalog state is held in `ProtoCatalogFile` (immutable snapshot):
 
 | Field              | Type                            | Description                          |
 |--------------------|---------------------------------|--------------------------------------|
@@ -496,6 +521,7 @@ The catalog state is held in `ProtoCatalogFile` (immutable snapshot), mirroring 
 | `nextNamespaceId`  | `int`                           | Next namespace ID to allocate        |
 | `nextTableId`      | `int`                           | Next table ID to allocate            |
 | `sealed`           | `boolean`                       | Whether a sealed txn was encountered |
+| `appendCount`      | `int`                           | Number of transaction records in the log portion (used for compaction threshold) |
 | `namespaceIds`     | `Map<Namespace, Integer>`       | Namespace -> internal ID             |
 | `namespaceVersions`| `Map<Integer, Integer>`         | Namespace ID -> version counter      |
 | `namespaceProps`   | `Map<Integer, Map<Str, Str>>`   | Namespace ID -> properties           |
@@ -512,7 +538,7 @@ Both pointer and inline tables share the same `tableIds` and `tableVersions` map
 
 ## Action Verification Rules
 
-Identical to LCF. Each action's `verify()` checks version-based preconditions:
+Each action's `verify()` checks version-based preconditions:
 
 | Action                   | Precondition                                              |
 |--------------------------|-----------------------------------------------------------|
@@ -628,7 +654,7 @@ All 8 implementation stages are complete. See
   before committing to generated classes as a dependency.
 - **Inline metadata** -- full integration with `FileIOCatalog`, using delta mode
   for data commits and falling back to full/pointer for oversized transactions.
-- **Test coverage** -- 134 unit tests passing (`mvn test`). Cloud provider
+- **Test coverage** -- 128 unit tests passing (`mvn test`). Cloud provider
   integration tests are separated via `maven-failsafe-plugin` and run with
   `mvn verify`.
 
@@ -645,75 +671,39 @@ All 8 implementation stages are complete. See
 | `src/main/java/.../CatalogFile.java` | Abstract base with inline-aware `Mut` API |
 | `src/test/java/.../TestProtoCatalogFormat.java` | Codec and format tests |
 | `src/test/java/.../TestProtoActions.java` | Systematic action tests (positive/negative/randomized/inline) |
+| `src/test/java/.../TestProtoCommitKnobs.java` | max_appends / max_size commit-knob tests |
 | `src/test/java/.../TestInlineDelta.java` | Delta encode/decode/apply, `computeDelta`, `selectMode` tests |
 
 ---
 
-## Comparison with LogCatalogFormat (LCF)
+## Design Notes
 
-The two formats share the same high-level architecture (checkpoint + append log, CAS/append
-commit strategies, 16 MB compaction threshold, version-based optimistic concurrency). The
-differences are in encoding, file structure, and extensibility.
+### Hand-Rolled Wire Format
 
-### Encoding
+`ProtoCodec` and `InlineDeltaCodec` implement the protobuf wire format manually
+rather than using generated classes. This choice lets the codebase validate
+correctness against `catalog.proto` before committing to generated-code
+dependencies; the wire format is still standard protobuf (field tags, varints,
+length-delimited messages), so any protobuf tool can decode the output given
+the `.proto` file.
 
-| Aspect | LCF | PB |
-|--------|-----|-----|
-| **Record format** | Custom opcode-based (`DataOutputStream`) | Protobuf wire format (field tags + varints) |
-| **Opcodes** | 1-byte prefix per record (0x00--0x09) | Protobuf `oneof` field numbers (1--10) in `Action` |
-| **Integer encoding** | Fixed 4-byte big-endian | Protobuf varint (1--5 bytes for positive values) |
-| **String encoding** | Java modified UTF-8 (2-byte length prefix) | Protobuf length-delimited (varint prefix + UTF-8) |
-| **UUID encoding** | Raw 16 bytes (MSB long + LSB long) | Protobuf `bytes` field (varint tag + varint length + 16 bytes) |
-| **Boolean encoding** | 1 byte unsigned (0/1) | Protobuf varint (0 omitted per proto3 default) |
-| **Negative ints** | 4-byte big-endian (compact) | Protobuf varint (10 bytes -- zigzag not used) |
+The codec is split across two classes:
+- `ProtoCodec` handles the catalog-level messages: `Checkpoint`, `Transaction`,
+  `Action` oneof, and all catalog/namespace/table actions.
+- `InlineDeltaCodec` handles the inline table delta messages: `TableMetadataDelta`,
+  all 11 `TableMetadataUpdate` types, and `CompactSummary`.
 
-PB is slightly more verbose for negative values (late-bind sentinels), but more compact for
-small positive integers (common case for IDs and versions).
+### Schema Evolution
 
-### File Structure
+Protobuf's forward and backward compatibility applies: new field numbers can
+be added without breaking old readers, and removed fields leave their numbers
+reserved. Unknown fields are silently skipped during decode (see `ProtoCodec.skipField`).
 
-| Aspect | LCF | PB |
-|--------|-----|-----|
-| **Header** | 37-byte checkpoint header with embedded counters | 8-byte magic + version; counters inside checkpoint message |
-| **Checkpoint** | Opcode stream (CREATE_NAMESPACE, ADD_NAMESPACE_PROPERTY, CREATE_TABLE) in deterministic order | Single protobuf `Checkpoint` message with repeated fields |
-| **Committed txn IDs** | Separate block between checkpoint data and transaction log (4-byte count + 16-byte UUIDs) | Inside `Checkpoint` message as `repeated bytes` field |
-| **Table embed region** | Reserved region (currently unused, 0 bytes) | Not present |
-| **Transaction log** | TRANSACTION opcode records | Varint-prefixed protobuf `Transaction` messages |
-| **Length prefixes** | Fixed 4-byte in header (`chkLen`, `committedTxnLen`) | Varint throughout |
+### Seal/Unseal
 
-PB has a simpler file structure: no reserved regions, no separate committed-txn block.
-Everything is either header or varint-prefixed protobuf message.
-
-### Schema Evolution and Forward Compatibility
-
-| Aspect | LCF | PB |
-|--------|-----|-----|
-| **Unknown fields** | Must add explicit skip logic for new opcodes | Protobuf preserves unknown fields by default |
-| **Adding fields** | Requires format version bump and custom parsing | Add new field number; old readers ignore it |
-| **Removing fields** | Risky without versioned skip tables | Safe (field number reserved, old data still parseable) |
-| **Tooling** | Custom -- no external tools can parse | Any protobuf tool can decode if given the `.proto` schema |
-
-This is the primary motivation for the migration. LCF has no schema evolution story; every
-change requires hand-written compatibility code. PB inherits protobuf's field-level forward
-and backward compatibility.
-
-### Behavioral Differences
-
-| Aspect | LCF | PB |
-|--------|-----|-----|
-| **Failed verification on read** | Treated as corruption (error) | Silently skipped (conflict from concurrent writer) |
-| **Seal/unseal** | Toggle byte at fixed offset 17 in transaction record | Locate protobuf field tag for field 2 and toggle varint |
-| **Codec** | Inline in `LogCatalogFormat` (~1500 lines) | Separated: `ProtoCodec` (catalog) + `InlineDeltaCodec` (deltas) |
-| **Inline metadata** | Not supported (pointer only) | Supported (delta/full/pointer mode selection) |
-| **Generated code** | None | None yet (hand-rolled codec validates against `.proto`) |
-
-### What Is Identical
-
-- Commit protocol (CAS + append, 10-attempt retry)
-- Compaction threshold (16 MB)
-- Late-binding with negative virtual IDs
-- Version-based optimistic concurrency (same verification rules)
-- The 8 base action semantics (namespace/table CRUD) -- PB adds 2 inline actions
-- State model for namespaces, pointer tables, and committed transactions
-- Namespace hierarchy (parent pointers, root = ID 0)
-- Idempotency via committed-transaction-ID tracking
+The `sealed` flag is a `bool` field (field number 2) in the `Transaction` message.
+`ProtoCodec.sealTransaction()` and `unsealTransaction()` locate the field tag in
+the serialized bytes and toggle the varint value in place. To make this possible,
+`encodeTransaction()` always writes the sealed field (even when false), overriding
+proto3's default-value suppression -- otherwise in-place mutation would need to
+insert bytes into the middle of the encoded message.

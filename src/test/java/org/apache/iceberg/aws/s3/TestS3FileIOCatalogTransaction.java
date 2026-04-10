@@ -22,9 +22,9 @@ import java.util.Map;
 import java.util.UUID;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.catalog.CatalogTransactionTests;
-import org.apache.iceberg.io.CASCatalogFormat;
 import org.apache.iceberg.io.CatalogFormat;
 import org.apache.iceberg.io.FileIOCatalog;
+import org.apache.iceberg.io.ProtoCatalogFormat;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
@@ -73,7 +73,7 @@ public class TestS3FileIOCatalogTransaction extends CatalogTransactionTests<File
     final S3FileIO io = new S3FileIO(); // () -> s3);
     io.initialize(Maps.newHashMap());
     final String location = warehouseLocation + "/catalog";
-    final CatalogFormat<?, ?> format = new CASCatalogFormat(); // new LogCatalogFormat();
+    final CatalogFormat<?, ?> format = new ProtoCatalogFormat();
     catalog = new FileIOCatalog("test", location, null, format, io, Maps.newHashMap());
 
     final Map<String, String> properties = Maps.newHashMap();

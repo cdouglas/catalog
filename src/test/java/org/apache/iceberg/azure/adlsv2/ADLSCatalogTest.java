@@ -34,7 +34,7 @@ import org.apache.iceberg.catalog.CatalogTests;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.io.CatalogFormat;
 import org.apache.iceberg.io.FileIOCatalog;
-import org.apache.iceberg.io.LogCatalogFormat;
+import org.apache.iceberg.io.ProtoCatalogFormat;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -145,9 +145,7 @@ public class ADLSCatalogTest extends CatalogTests<FileIOCatalog> {
     final Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
     final String location = warehouseLocation + "/catalog";
-    // TODO current status, LogCatalogFormat should throw CommitFailed exception instead of
-    // IllegalStateException
-    CatalogFormat<?, ?> format = new LogCatalogFormat();
+    CatalogFormat<?, ?> format = new ProtoCatalogFormat();
     catalog = new FileIOCatalog("test", location, null, format, io, Maps.newHashMap());
     catalog.initialize(testName, properties);
   }
@@ -164,7 +162,6 @@ public class ADLSCatalogTest extends CatalogTests<FileIOCatalog> {
 
   @Override
   protected boolean supportsConcurrentCreate() {
-    // TODO LogCatalogFormat supports concurrent create in different namespaces
     return false;
   }
 

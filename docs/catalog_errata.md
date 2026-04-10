@@ -61,18 +61,13 @@ The abstract test classes `CatalogTests` and `CatalogTransactionTests` are dupli
 2. Use Git submodule or subtree for shared test code
 3. Publish iceberg test-jar and depend on it (current approach, but fragile)
 
-## Pending: LogCatalogFormat Serialization
+## Resolved: LogCatalogFormat and CASCatalogFormat Removed
 
-The current binary serialization in LogCatalogFormat has known issues:
-- Naive `DataOutputStream`/`DataInputStream` serialization
-- No schema evolution support
-- No compression
-- No checksumming of individual records
-
-**Recommended approach:**
-- Migrate to Protobuf (partially done with ProtoCatalogFormat)
-- Use Avro for columnar checkpoint regions
-- Add CRC32C per-record checksums
+LogCatalogFormat and CASCatalogFormat (including `LogCatalogFile`, `LogSerializer`,
+`LogMutator`, `LogIdManager`) have been removed. ProtoCatalogFormat is now the only
+catalog format. The known LCF serialization issues (naive DataOutputStream encoding,
+no schema evolution, no per-record checksums) are addressed by protobuf's wire
+format and the separated `ProtoCodec` / `InlineDeltaCodec` classes.
 
 ## Pending: Cloud Provider Integration Tests
 

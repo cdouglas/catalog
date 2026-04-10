@@ -31,8 +31,8 @@ import java.util.UUID;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.azure.AzureProperties;
 import org.apache.iceberg.catalog.CatalogTransactionTests;
-import org.apache.iceberg.io.CASCatalogFormat;
 import org.apache.iceberg.io.FileIOCatalog;
+import org.apache.iceberg.io.ProtoCatalogFormat;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -111,7 +111,7 @@ public class ADLSFileIOCatalogTransactionTests extends CatalogTransactionTests<F
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
     final String location = warehouseLocation + "/catalog";
     catalog =
-        new FileIOCatalog("test", location, null, new CASCatalogFormat(), io, Maps.newHashMap());
+        new FileIOCatalog("test", location, null, new ProtoCatalogFormat(), io, Maps.newHashMap());
     catalog.initialize(testName, properties);
   }
 

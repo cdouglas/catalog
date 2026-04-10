@@ -24,7 +24,7 @@ import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.catalog.CatalogTests;
 import org.apache.iceberg.io.CatalogFormat;
 import org.apache.iceberg.io.FileIOCatalog;
-import org.apache.iceberg.io.LogCatalogFormat;
+import org.apache.iceberg.io.ProtoCatalogFormat;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
@@ -75,15 +75,13 @@ public class TestS3Catalog extends CatalogTests<FileIOCatalog> {
     final S3FileIO io = new S3FileIO();
     io.initialize(Maps.newHashMap());
     final String location = warehouseLocation + "/catalog";
-    // TODO current status, LogCatalogFormat should throw CommitFailed exception instead of
-    // IllegalStateException
     // Note from:
     // https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-express-tutorial-Upload.html
     // "If you're uploading a single object that's less than 16 MB in size, you can also specify a
     // pre-calculated checksum value. When you provide a pre-calculated value, Amazon S3 compares it
     // with the value that it calculates by using the selected checksum function. If the values
     // don't match, the upload won't start."
-    final CatalogFormat<?, ?> format = new LogCatalogFormat();
+    final CatalogFormat<?, ?> format = new ProtoCatalogFormat();
     catalog = new FileIOCatalog("test", location, null, format, io, Maps.newHashMap());
 
     final Map<String, String> properties = Maps.newHashMap();
