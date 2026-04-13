@@ -7,8 +7,8 @@ architecture encoded via protobuf-compatible wire format.
 ## Overview
 
 A catalog file is a single object stored in cloud storage. It encodes the full state of the
-catalog -- namespaces, tables, and their properties -- using protobuf messages. Like LCF, it
-supports two mutation strategies:
+catalog -- namespaces, tables, and their properties -- using protobuf messages. It supports
+two mutation strategies:
 
 - **Append**: append a length-prefixed transaction record (offset-validated)
 - **CAS (compare-and-swap)**: atomically replace the entire file (ETag-validated)
@@ -515,26 +515,37 @@ virtual IDs:
 
 The catalog state is held in `ProtoCatalogFile` (immutable snapshot):
 
-| Field              | Type                            | Description                          |
-|--------------------|---------------------------------|--------------------------------------|
-| `uuid`             | `UUID`                          | Catalog identity (UUIDv7)            |
-| `nextNamespaceId`  | `int`                           | Next namespace ID to allocate        |
-| `nextTableId`      | `int`                           | Next table ID to allocate            |
-| `sealed`           | `boolean`                       | Whether a sealed txn was encountered |
-| `appendCount`      | `int`                           | Number of transaction records in the log portion (used for compaction threshold) |
-| `namespaceIds`     | `Map<Namespace, Integer>`       | Namespace -> internal ID             |
-| `namespaceVersions`| `Map<Integer, Integer>`         | Namespace ID -> version counter      |
-| `namespaceProps`   | `Map<Integer, Map<Str, Str>>`   | Namespace ID -> properties           |
-| `tableIds`         | `Map<TableIdentifier, Integer>` | Table -> internal ID                 |
-| `tableVersions`    | `Map<Integer, Integer>`         | Table ID -> version counter          |
-| `tableLocations`   | `Map<Integer, String>`          | Table ID -> metadata file location (pointer tables only) |
-| `tblInlineMetadata`| `Map<Integer, byte[]>`          | Table ID -> TableMetadata JSON bytes (inline tables only) |
-| `tblManifestPrefix`| `Map<Integer, String>`          | Table ID -> manifest list path prefix (inline tables only) |
-| `committedTxns`    | `Set<UUID>`                     | Applied transaction IDs              |
+| Field                | Type                             | Description                          |
+|----------------------|----------------------------------|--------------------------------------|
+| `uuid`               | `UUID`                           | Catalog identity (UUIDv7)            |
+| `nextNamespaceId`    | `int`                            | Next namespace ID to allocate        |
+| `nextTableId`        | `int`                            | Next table ID to allocate            |
+| `sealed`             | `boolean`                        | Whether a sealed txn was encountered |
+| `appendCount`        | `int`                            | Transaction records in the log portion (for compaction threshold) |
+| `namespaceById`      | `Map<Integer, NsEntry>`          | Namespace ID -> entry (parentId, name, version)   |
+| `namespaceLookup`    | `Map<Namespace, Integer>`        | Namespace path -> ID (derived from namespaceById) |
+| `nsProperties`       | `Map<Integer, Map<Str, Str>>`    | Namespace ID -> properties           |
+| `tableById`          | `Map<Integer, TblEntry>`         | Table ID -> entry (nsId, name, version, metadataLocation) |
+| `tableLookup`        | `Map<TableIdentifier, Integer>`  | Table name -> ID (derived from tableById) |
+| `tblInlineMetadata`  | `Map<Integer, byte[]>`           | Table ID -> TableMetadata JSON bytes (inline tables only) |
+| `tblManifestPrefix`  | `Map<Integer, String>`           | Table ID -> manifest list path prefix (inline tables only) |
+| `committedTxns`      | `Set<UUID>`                      | Applied transaction IDs              |
 
-A table ID appears in either `tableLocations` (pointer mode) or `tblInlineMetadata`
-(inline mode), never both. Every inline table also has a `tblManifestPrefix` entry.
-Both pointer and inline tables share the same `tableIds` and `tableVersions` maps.
+**Entry classes:**
+
+- `NsEntry(int parentId, String name, int version)` -- namespace metadata. The
+  `namespaceLookup` map is rebuilt from `namespaceById` by walking parent chains.
+- `TblEntry(int namespaceId, String name, int version, String metadataLocation)` --
+  table metadata. For inline tables, `metadataLocation` is null; the actual metadata
+  is in `tblInlineMetadata`.
+
+A table ID appears in either `tableById` with a non-null `metadataLocation` (pointer
+mode) or in `tblInlineMetadata` (inline mode), never both. Inline tables appear in
+`tableById` with `metadataLocation = null` for unified lookup via `tableLookup`.
+
+**Location behavior:** `CatalogFile.location(table)` returns the `metadataLocation`
+string from `TblEntry` -- this is null for inline tables. Callers use
+`isInlineTable(table)` and `inlineMetadata(table)` to access inline metadata.
 
 ## Action Verification Rules
 
@@ -583,7 +594,8 @@ picks one of three modes based on the resulting transaction size:
   `AppendBlock` limit.
 
 `InlineDeltaCodec.selectMode(delta, newMeta, currentTxnSize)` picks the mode given
-the current transaction size and a 4 MiB budget (`APPEND_LIMIT`).
+the current transaction size and a ~4 MiB budget (`APPEND_LIMIT = 4 MiB - 4096`,
+leaving a safety margin for framing overhead).
 
 ### Delta Application
 
@@ -600,8 +612,13 @@ timestamp) from the base state's corresponding values.
 
 ### Configuration
 
-Set `fileio.catalog.inline=true` in catalog properties to enable inline mode.
-When disabled (default), the catalog uses the traditional pointer path.
+All properties are set in the catalog properties map passed to `FileIOCatalog.initialize()`.
+
+| Property | Default | Description |
+|----------|---------|-------------|
+| `fileio.catalog.inline` | `false` | Enable inline table metadata. When true, `doCommit()` uses delta/full/pointer mode selection instead of writing external metadata files. |
+| `fileio.catalog.max.append.count` | `10000` | Hard limit on log records before CAS compaction (0 = CAS-only). |
+| `fileio.catalog.max.append.size` | `16777216` (16 MB) | Soft file-size target before CAS compaction. |
 
 ### Table Loading (No Base Class Changes)
 
@@ -668,6 +685,7 @@ All 8 implementation stages are complete. See
 | `src/main/java/.../ProtoCodec.java` | Protobuf wire encoding/decoding, catalog-level action types |
 | `src/main/java/.../InlineDeltaCodec.java` | Delta encode/decode/apply, `computeDelta`, `selectMode` |
 | `src/main/java/.../FileIOCatalog.java` | Catalog + `FileIOTableOperations` with inline integration |
+| `src/main/java/.../CatalogFormat.java` | Format strategy interface (`empty`, `read`, `from`) |
 | `src/main/java/.../CatalogFile.java` | Abstract base with inline-aware `Mut` API |
 | `src/test/java/.../TestProtoCatalogFormat.java` | Codec and format tests |
 | `src/test/java/.../TestProtoActions.java` | Systematic action tests (positive/negative/randomized/inline) |
