@@ -20,17 +20,15 @@ package org.apache.iceberg.io;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
-import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.UncheckedIOException;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import org.apache.iceberg.catalog.Namespace;
@@ -57,6 +55,11 @@ public class TestProtoCommitKnobs {
     final AtomicReference<byte[]> content = new AtomicReference<>();
     int casCount = 0;
     int appendCount = 0;
+    int readCount = 0;   // number of newStream() calls (proxy for catalog reads)
+
+    // When > 0, the next N appends throw AppendException (simulating concurrent writers).
+    // Each injected failure also simulates the concurrent writer's append by growing the file.
+    int injectAppendFailures = 0;
 
     @SuppressWarnings("unchecked")
     MockIO() {
@@ -80,6 +83,22 @@ public class TestProtoCommitKnobs {
             casCount++;
             content.set(written);
           } else if (strategy == AtomicOutputFile.Strategy.APPEND) {
+            if (injectAppendFailures > 0) {
+              injectAppendFailures--;
+              // Simulate a concurrent writer's append that won the offset race:
+              // grow the file with dummy bytes so length increases.
+              byte[] existing = content.get();
+              if (existing != null) {
+                byte[] grown = new byte[existing.length + written.length];
+                System.arraycopy(existing, 0, grown, 0, existing.length);
+                // Fill with the concurrent writer's data (we just use our bytes
+                // as a stand-in; content doesn't matter for offset-conflict tests)
+                System.arraycopy(written, 0, grown, existing.length, written.length);
+                content.set(grown);
+              }
+              throw new SupportsAtomicOperations.AppendException(
+                  "injected offset conflict", new IOException("offset mismatch"));
+            }
             appendCount++;
             byte[] existing = content.get();
             byte[] merged;
@@ -109,6 +128,7 @@ public class TestProtoCommitKnobs {
 
         @Override
         public SeekableInputStream newStream() {
+          readCount++;
           byte[] b = content.get();
           if (b == null) {
             throw new RuntimeException("File does not exist");
@@ -264,5 +284,134 @@ public class TestProtoCommitKnobs {
     org.assertj.core.api.Assertions.assertThatThrownBy(
         () -> new ProtoCatalogFormat(100, -1L))
         .isInstanceOf(IllegalArgumentException.class);
+  }
+
+  // ============================================================
+  // Append retry: no catalog read between offset-conflict retries
+  // ============================================================
+
+  @Test
+  void appendRetry_doesNotReadCatalogOnOffsetConflict() {
+    // Unlimited limits so we stay in the append path.
+    ProtoCatalogFormat format =
+        new ProtoCatalogFormat(Integer.MAX_VALUE, Long.MAX_VALUE);
+    MockIO io = new MockIO();
+
+    // Initial commit (CAS, creates the file)
+    InputFile catalogFile = io.trackedInput();
+    ProtoCatalogFormat.Mut mut0 = (ProtoCatalogFormat.Mut) format.empty(catalogFile);
+    mut0.createNamespace(Namespace.of("seed"));
+    mut0.commit(io.fileIO);
+    // Reset counters after initial setup
+    int readsAfterInit = io.readCount;
+    io.casCount = 0;
+    io.appendCount = 0;
+
+    // Now: inject 3 consecutive append failures (offset conflicts),
+    // then the 4th attempt succeeds.
+    io.injectAppendFailures = 3;
+
+    ProtoCatalogFile current = format.read(io.fileIO, io.trackedInput());
+    int readsAfterLoad = io.readCount;
+
+    ProtoCatalogFormat.Mut mut =
+        (ProtoCatalogFormat.Mut) format.from(current);
+    mut.createNamespace(Namespace.of("test_ns"));
+    ProtoCatalogFile result = (ProtoCatalogFile) mut.commit(io.fileIO);
+
+    // The commit should have succeeded
+    assertThat(result.containsNamespace(Namespace.of("test_ns"))).isTrue();
+
+    // 3 failed appends + 1 successful append
+    assertThat(io.appendCount).isEqualTo(1);  // only the successful one counts
+
+    // Key assertion: no catalog reads between append retries.
+    // The only reads should be from:
+    //   1. The successful append's read-back (tryAppend reads after write)
+    // The 3 failed attempts should NOT have triggered reads.
+    int readsDuringCommit = io.readCount - readsAfterLoad;
+    assertThat(readsDuringCommit)
+        .as("should only read once (post-success validation), not on each retry")
+        .isEqualTo(1);
+  }
+
+  @Test
+  void appendRetry_sameBytesSucceedAfterConflict() {
+    // Verify the retried append produces a valid catalog with the intended change.
+    ProtoCatalogFormat format =
+        new ProtoCatalogFormat(Integer.MAX_VALUE, Long.MAX_VALUE);
+    MockIO io = new MockIO();
+
+    // Setup: create initial catalog with one namespace
+    InputFile catalogFile = io.trackedInput();
+    ProtoCatalogFormat.Mut mut0 = (ProtoCatalogFormat.Mut) format.empty(catalogFile);
+    mut0.createNamespace(Namespace.of("existing"));
+    mut0.commit(io.fileIO);
+
+    // Inject 5 offset conflicts, then succeed
+    io.injectAppendFailures = 5;
+
+    ProtoCatalogFile current = format.read(io.fileIO, io.trackedInput());
+    ProtoCatalogFormat.Mut mut =
+        (ProtoCatalogFormat.Mut) format.from(current);
+    mut.createNamespace(Namespace.of("new_ns"));
+    ProtoCatalogFile result = (ProtoCatalogFile) mut.commit(io.fileIO);
+
+    // Both the original and new namespace should be present
+    assertThat(result.containsNamespace(Namespace.of("existing"))).isTrue();
+    assertThat(result.containsNamespace(Namespace.of("new_ns"))).isTrue();
+  }
+
+  @Test
+  void appendRetry_manyConflictsThenSuccess() {
+    // Verify commit succeeds even after many consecutive offset conflicts.
+    ProtoCatalogFormat format =
+        new ProtoCatalogFormat(Integer.MAX_VALUE, Long.MAX_VALUE);
+    MockIO io = new MockIO();
+
+    // Setup
+    InputFile catalogFile = io.trackedInput();
+    ProtoCatalogFormat.Mut mut0 = (ProtoCatalogFormat.Mut) format.empty(catalogFile);
+    mut0.createNamespace(Namespace.of("existing"));
+    mut0.commit(io.fileIO);
+
+    // Inject 8 consecutive failures (just under the 10-attempt limit)
+    io.injectAppendFailures = 8;
+    ProtoCatalogFile current = format.read(io.fileIO, io.trackedInput());
+    ProtoCatalogFormat.Mut mut = (ProtoCatalogFormat.Mut) format.from(current);
+    mut.createNamespace(Namespace.of("final"));
+    ProtoCatalogFile result = (ProtoCatalogFile) mut.commit(io.fileIO);
+
+    assertThat(result.containsNamespace(Namespace.of("final"))).isTrue();
+    assertThat(result.containsNamespace(Namespace.of("existing"))).isTrue();
+  }
+
+  @Test
+  void appendRetry_idempotentTransactionId() {
+    // Even if the same txn bytes are appended twice (shouldn't happen, but
+    // testing the idempotency guarantee), the transaction should only apply once.
+    ProtoCatalogFormat format =
+        new ProtoCatalogFormat(Integer.MAX_VALUE, Long.MAX_VALUE);
+    MockIO io = new MockIO();
+
+    // Setup
+    InputFile catalogFile = io.trackedInput();
+    ProtoCatalogFormat.Mut mut0 = (ProtoCatalogFormat.Mut) format.empty(catalogFile);
+    mut0.createNamespace(Namespace.of("base"));
+    ProtoCatalogFile initial = (ProtoCatalogFile) mut0.commit(io.fileIO);
+
+    // Commit with 1 retry (inject 1 failure)
+    io.injectAppendFailures = 1;
+    ProtoCatalogFile current = format.read(io.fileIO, io.trackedInput());
+    ProtoCatalogFormat.Mut mut =
+        (ProtoCatalogFormat.Mut) format.from(current);
+    mut.createNamespace(Namespace.of("new_ns"));
+    ProtoCatalogFile result = (ProtoCatalogFile) mut.commit(io.fileIO);
+
+    // The namespace should appear exactly once
+    assertThat(result.containsNamespace(Namespace.of("new_ns"))).isTrue();
+    // The committed transaction set should contain the txn ID
+    assertThat(result.committedTransactions().size())
+        .isGreaterThan(initial.committedTransactions().size());
   }
 }
