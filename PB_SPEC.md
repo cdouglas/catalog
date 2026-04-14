@@ -409,9 +409,11 @@ function COMMIT(fileIO, original, mutations):
             result = tryCAS(current, txnBytes, fileIO)
             if result.present:
                 return validateCommit(result, txn)
+            # CAS failed: must re-read to rebuild checkpoint
+            current = fileIO.newInputFile(current.location)
+            original = READ(fileIO, current)
+
         else:
-            # Append path. Seal if adding this transaction will push us at or
-            # past either limit, so the next writer compacts via CAS.
             if original.appendCount + 1 >= maxAppendCount
                or current.length + len(txnBytes) > maxAppendSize:
                 seal(txnBytes)
@@ -419,12 +421,16 @@ function COMMIT(fileIO, original, mutations):
             if result.present:
                 return validateCommit(result, txn)
 
-        # Refresh for retry
-        oldLength = current.length
-        current = fileIO.newInputFile(current.location)
-        if current.length < oldLength:
-            unseal(txnBytes)                 # file was compacted
-        original = READ(fileIO, current)
+            # Append failed (offset mismatch from concurrent writer).
+            # The transaction bytes are identical and idempotent (UUID-
+            # deduplicated), so retry at the new offset without re-reading.
+            oldLength = current.length
+            current = fileIO.newInputFile(current.location)
+            if current.length < oldLength:
+                # File shrank (compacted). Must re-read to check sealed/count.
+                unseal(txnBytes)
+                original = READ(fileIO, current)
+            # else: file grew (concurrent append). Retry same bytes.
 
     throw CommitFailed("exceeded retry limit")
 ```

@@ -483,6 +483,14 @@ public class ProtoCatalogFormat
           if (result.isPresent()) {
             return validateCommit(result.get(), txn);
           }
+          // CAS failed: another writer CAS'd concurrently. Must re-read to get the
+          // new state and rebuild the checkpoint for the next CAS attempt.
+          current = fileIO.newInputFile(current.location());
+          try (SeekableInputStream in = current.newStream()) {
+            baseCatalog = readInternal(current, in, (int) current.getLength());
+          } catch (IOException e) {
+            throw new UncheckedIOException(e);
+          }
         } else {
           // Append path. Seal this transaction if it will push us to/past either limit,
           // signalling the next writer to compact via CAS.
@@ -496,19 +504,24 @@ public class ProtoCatalogFormat
           if (result.isPresent()) {
             return validateCommit(result.get(), txn);
           }
-        }
-
-        // Refresh and retry
-        long oldLength = current.getLength();
-        current = fileIO.newInputFile(current.location());
-        if (current.getLength() < oldLength) {
-          // File was compacted by another writer
-          ProtoCodec.unsealTransaction(txnBytes);
-        }
-        try (SeekableInputStream in = current.newStream()) {
-          baseCatalog = readInternal(current, in, (int) current.getLength());
-        } catch (IOException e) {
-          throw new UncheckedIOException(e);
+          // Append failed: another writer appended first (offset mismatch).
+          // The transaction bytes are identical and idempotent (UUID-deduplicated),
+          // so we can retry the append at the new offset without re-reading the
+          // catalog. Only need to refresh the InputFile to get the current length.
+          long oldLength = current.getLength();
+          current = fileIO.newInputFile(current.location());
+          if (current.getLength() < oldLength) {
+            // File shrank -- another writer compacted. Must re-read to check
+            // whether we need to switch to CAS (sealed, or count reset).
+            ProtoCodec.unsealTransaction(txnBytes);
+            try (SeekableInputStream in = current.newStream()) {
+              baseCatalog = readInternal(current, in, (int) current.getLength());
+            } catch (IOException e) {
+              throw new UncheckedIOException(e);
+            }
+          }
+          // Otherwise: file grew (normal concurrent append). Retry with same
+          // bytes at the new offset. No read needed.
         }
       }
 
