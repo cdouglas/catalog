@@ -370,10 +370,10 @@ function READ(fileIO, location):
     return freeze(state)
 ```
 
-Note: unlike LCF, a transaction that fails verification during read is silently skipped
-rather than treated as corruption. This is because the protobuf format expects that
-concurrent writers may append transactions that conflict, and the correct behavior is to
-ignore them.
+A transaction that fails verification during read is silently skipped (not applied, no
+error). This is correct behavior: concurrent writers may append transactions that
+conflict with each other, and during log replay the losing transaction simply has no
+effect.
 
 ## Commit Protocol
 
@@ -666,9 +666,10 @@ selection per table.
 All 8 implementation stages are complete. See
 [docs/INLINE_IMPL.md](docs/INLINE_IMPL.md) for the progress log.
 
-- **Hand-rolled codec** -- `ProtoCodec` and `InlineDeltaCodec` implement protobuf
-  wire format manually. This validates correctness against the `.proto` schema
-  before committing to generated classes as a dependency.
+- **Hand-rolled protobuf codec** -- `ProtoCodec` (catalog messages) and
+  `InlineDeltaCodec` (delta messages) both produce standard protobuf wire
+  format without using `protoc`-generated classes. The output is
+  wire-compatible with `catalog.proto` and decodable by any protobuf tool.
 - **Inline metadata** -- full integration with `FileIOCatalog`, using delta mode
   for data commits and falling back to full/pointer for oversized transactions.
 - **Test coverage** -- 128 unit tests passing (`mvn test`). Cloud provider
