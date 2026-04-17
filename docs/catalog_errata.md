@@ -164,3 +164,42 @@ use pointer mode exclusively. The `loadFromCatalogFile` inline path and
 `commitInline` path have no end-to-end test coverage through the catalog API.
 
 This is a pre-existing gap. The parameterized test strategy addresses it.
+
+## INLINE_ML Implementation Review Fixes (2026-04-17)
+
+Defects identified by ML_INLINE_IMPL_REVIEW.md and resolved:
+
+### §3.1/§3.2 Resolved: computeDelta NPE on InlineSnapshot
+
+`computeDelta` now handles null `manifestListLocation` (InlineSnapshot)
+by using empty string as the suffix. Defensive null check added to
+`writeString`. `AddSnapshotUpdate` uses `"inline://<snapshotId>"` as a
+sentinel manifest-list location in the JSON, ensuring SnapshotParser
+takes the v2 path rather than the v1 embedded-manifests branch.
+
+### §3.3/§2.4 Resolved: Delta replay for ML updates
+
+New `applyDeltaWithManifests()` routes `AddManifestUpdate`/
+`RemoveManifestUpdate` to `ProtoCatalogFile.Builder` manifest pool, and
+`AddSnapshotUpdate` through its prefix-accepting overload. Manifest
+carry-forward copies parent snapshot's refs for new snapshots.
+`updateInlineMetadata()` preserves pool during metadata rotation.
+
+### §2.1 Resolved: InlineSnapshot equals/hashCode
+
+`InlineSnapshot` now overrides `equals()` and `hashCode()` matching on
+snapshotId, parentId, sequenceNumber, timestampMillis, schemaId.
+`BaseSnapshot.equals()` loosened to accept any `Snapshot` (not just
+`BaseSnapshot`).
+
+### §2.2 Resolved: Full-mode guard for inline snapshots
+
+When ML deltas are attached, `commitInline` forces delta mode. The
+full/pointer modes lose ML payload because `SnapshotParser.toJson`
+serializes InlineSnapshot via the v1 embedded-manifests branch.
+
+### §2.6 Resolved: SnapshotProducer cleanup null-safety
+
+Reversed comparison to `manifestList.equals(committedSnapshot.
+manifestListLocation())` — the loop variable is never null, making the
+comparison null-safe when the committed snapshot is an InlineSnapshot.

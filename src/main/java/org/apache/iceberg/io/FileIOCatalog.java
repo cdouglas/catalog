@@ -418,6 +418,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
             InlineDeltaCodec.computeDelta(base, metadata, manifestPrefix);
 
         // Attach manifest list deltas if this ops implements ManifestListSink
+        boolean hasMLDeltas = false;
         if (this instanceof InlineManifestTableOperations) {
           Map<Long, ManifestListDelta> mlDeltas =
               ((InlineManifestTableOperations) this).drainStagedDeltas();
@@ -434,12 +435,19 @@ public class FileIOCatalog extends BaseMetastoreCatalog
                 InlineDeltaCodec.attachManifestDelta(
                     delta, snap.snapshotId(),
                     mlDelta.added(), mlDelta.removedPaths(), manifestPrefix);
+                hasMLDeltas = true;
               }
             }
           }
         }
 
         String mode = InlineDeltaCodec.selectMode(delta, metadata, 0);
+        // When ML deltas are attached, force delta mode: full/pointer modes lose
+        // the ML payload because they serialize TableMetadata directly (InlineSnapshot
+        // with null manifestListLocation falls into SnapshotParser's v1 branch).
+        if (hasMLDeltas && !"delta".equals(mode)) {
+          mode = "delta";
+        }
 
         CatalogFile.Mut<?, ?> mut = format.from(lastCatalogFile);
         switch (mode) {

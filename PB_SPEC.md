@@ -321,7 +321,7 @@ message RemoveManifestDelta {
 
 message AddSnapshot {
   fixed64        snapshot_id          = 1;
-  string         manifest_list_suffix = 2;   // appended to per-table prefix
+  string         manifest_list_suffix = 2;   // appended to per-table prefix; empty for inline-ML snapshots
   CompactSummary summary              = 3;   // typed summary (replaces map)
   sint64         timestamp_delta_ms   = 4;   // signed delta from lastUpdatedMs
   int32          schema_id            = 5;   // only if changed from current
