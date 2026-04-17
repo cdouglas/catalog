@@ -245,13 +245,16 @@ public class ProtoCodec {
         }
       }
 
-      // Inline tables
+      // Inline tables (with optional manifest pool + snapshot refs)
       for (Map.Entry<Integer, byte[]> inlineEntry : original.allInlineMetadata().entrySet()) {
         int tblId = inlineEntry.getKey();
         ProtoCatalogFile.TblEntry tblEntry = original.tableById().get(tblId);
         if (tblEntry != null) {
           String prefix = original.allManifestPrefixes().getOrDefault(tblId, "");
-          byte[] inlineBytes = encodeInlineTable(tblId, tblEntry, inlineEntry.getValue(), prefix);
+          Map<String, ManifestFile> pool = original.manifestPool(tblId);
+          Map<Long, List<String>> snapRefs = original.snapshotManifests(tblId);
+          byte[] inlineBytes = encodeInlineTable(
+              tblId, tblEntry, inlineEntry.getValue(), prefix, pool, snapRefs);
           writeLengthDelimited(out, CHECKPOINT_INLINE_TABLES, inlineBytes);
         }
       }
@@ -426,7 +429,8 @@ public class ProtoCodec {
   }
 
   private static byte[] encodeInlineTable(
-      int id, ProtoCatalogFile.TblEntry entry, byte[] metadata, String manifestPrefix)
+      int id, ProtoCatalogFile.TblEntry entry, byte[] metadata, String manifestPrefix,
+      Map<String, ManifestFile> pool, Map<Long, List<String>> snapRefs)
       throws IOException {
     ByteArrayOutputStream out = new ByteArrayOutputStream();
     writeVarint(out, INLINE_TBL_ID, id);
@@ -435,6 +439,43 @@ public class ProtoCodec {
     writeString(out, INLINE_TBL_NAME, entry.name);
     writeBytes(out, INLINE_TBL_METADATA, metadata);
     writeString(out, INLINE_TBL_MANIFEST_PREFIX, manifestPrefix);
+
+    // Manifest pool (field 7): encode each unique ManifestFile entry
+    if (pool != null && !pool.isEmpty()) {
+      // Build positional index for snapshot refs
+      List<String> poolOrder = new ArrayList<>(pool.keySet());
+      Map<String, Integer> pathToIndex = new java.util.HashMap<>();
+      for (int i = 0; i < poolOrder.size(); i++) {
+        pathToIndex.put(poolOrder.get(i), i);
+        ManifestFile mf = pool.get(poolOrder.get(i));
+        byte[] mfBytes = encodeManifestFileEntry(mf, manifestPrefix);
+        writeLengthDelimited(out, INLINE_TBL_MANIFEST_POOL, mfBytes);
+      }
+
+      // Snapshot refs (field 8): per-snapshot index arrays
+      if (snapRefs != null) {
+        for (Map.Entry<Long, List<String>> snapEntry : snapRefs.entrySet()) {
+          byte[] refBytes = encodeSnapshotManifestRefs(
+              snapEntry.getKey(), snapEntry.getValue(), pathToIndex);
+          writeLengthDelimited(out, INLINE_TBL_SNAPSHOT_REFS, refBytes);
+        }
+      }
+    }
+
+    return out.toByteArray();
+  }
+
+  private static byte[] encodeSnapshotManifestRefs(
+      long snapshotId, List<String> paths, Map<String, Integer> pathToIndex)
+      throws IOException {
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    writeFixed64(out, SMR_SNAPSHOT_ID, snapshotId);
+    for (String path : paths) {
+      Integer idx = pathToIndex.get(path);
+      if (idx != null) {
+        writeVarint(out, SMR_POOL_INDICES, idx);
+      }
+    }
     return out.toByteArray();
   }
 
@@ -444,6 +485,8 @@ public class ProtoCodec {
     int id = 0, version = 0, nsId = 0;
     String name = "", manifestPrefix = "";
     byte[] metadata = new byte[0];
+    List<byte[]> poolEntryBytes = new ArrayList<>();
+    List<byte[]> snapRefBytes = new ArrayList<>();
 
     while (in.available() > 0) {
       int tag = readVarint(in);
@@ -467,11 +510,65 @@ public class ProtoCodec {
         case INLINE_TBL_MANIFEST_PREFIX:
           manifestPrefix = readString(in);
           break;
+        case INLINE_TBL_MANIFEST_POOL:
+          poolEntryBytes.add(readLengthDelimitedBytes(in));
+          break;
+        case INLINE_TBL_SNAPSHOT_REFS:
+          snapRefBytes.add(readLengthDelimitedBytes(in));
+          break;
         default:
           skipField(in, tag & 0x7);
       }
     }
     builder.addInlineTable(id, nsId, name, version, metadata, manifestPrefix);
+
+    // Decode manifest pool (positional array) -> path-keyed map
+    if (!poolEntryBytes.isEmpty()) {
+      List<ManifestFile> poolList = new ArrayList<>(poolEntryBytes.size());
+      for (byte[] entryBytes : poolEntryBytes) {
+        poolList.add(decodeManifestFileEntry(entryBytes, manifestPrefix));
+      }
+      for (ManifestFile mf : poolList) {
+        builder.addManifestToPool(id, mf);
+      }
+
+      // Decode snapshot refs (index arrays) -> path lists
+      for (byte[] refBytes : snapRefBytes) {
+        decodeSnapshotManifestRefs(refBytes, id, poolList, builder);
+      }
+    }
+  }
+
+  private static void decodeSnapshotManifestRefs(
+      byte[] bytes, int tblId, List<ManifestFile> poolList,
+      ProtoCatalogFile.Builder builder) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    long snapshotId = 0;
+    List<Integer> indices = new ArrayList<>();
+
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      int fieldNumber = tag >>> 3;
+      int wireType = tag & 0x7;
+      switch (fieldNumber) {
+        case SMR_SNAPSHOT_ID:
+          snapshotId = readFixed64(in);
+          break;
+        case SMR_POOL_INDICES:
+          indices.add(readVarint(in));
+          break;
+        default:
+          skipField(in, wireType);
+      }
+    }
+
+    List<String> paths = new ArrayList<>(indices.size());
+    for (int idx : indices) {
+      if (idx >= 0 && idx < poolList.size()) {
+        paths.add(poolList.get(idx).path());
+      }
+    }
+    builder.setSnapshotManifests(tblId, snapshotId, paths);
   }
 
   // ============================================================

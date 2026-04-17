@@ -21,12 +21,15 @@ package org.apache.iceberg.io;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 
@@ -61,6 +64,13 @@ public class ProtoCatalogFile extends CatalogFile {
   private final Map<Integer, byte[]> tblInlineMetadata;
   private final Map<Integer, String> tblManifestPrefix;
 
+  // Inline manifest list state: per-table pool of unique ManifestFile entries keyed by path,
+  // and per-snapshot references into the pool. Present only when inline.manifests is enabled.
+  // tblId -> (manifest path -> ManifestFile)
+  private final Map<Integer, Map<String, ManifestFile>> manifestPool;
+  // tblId -> (snapshotId -> list of manifest paths in the pool)
+  private final Map<Integer, Map<Long, List<String>>> snapshotManifests;
+
   // Committed transactions for deduplication
   private final Set<UUID> committedTransactions;
 
@@ -80,6 +90,8 @@ public class ProtoCatalogFile extends CatalogFile {
     this.nsProperties = deepCopyProperties(builder.nsProperties);
     this.tblInlineMetadata = ImmutableMap.copyOf(builder.tblInlineMetadata);
     this.tblManifestPrefix = ImmutableMap.copyOf(builder.tblManifestPrefix);
+    this.manifestPool = deepCopyManifestPool(builder.manifestPool);
+    this.snapshotManifests = deepCopySnapshotManifests(builder.snapshotManifests);
     this.committedTransactions = ImmutableSet.copyOf(builder.committedTransactions);
     this.appendCount = builder.appendCount;
   }
@@ -91,6 +103,28 @@ public class ProtoCatalogFile extends CatalogFile {
       builder.put(entry.getKey(), ImmutableMap.copyOf(entry.getValue()));
     }
     return builder.build();
+  }
+
+  private static Map<Integer, Map<String, ManifestFile>> deepCopyManifestPool(
+      Map<Integer, Map<String, ManifestFile>> pool) {
+    ImmutableMap.Builder<Integer, Map<String, ManifestFile>> builder = ImmutableMap.builder();
+    for (Map.Entry<Integer, Map<String, ManifestFile>> entry : pool.entrySet()) {
+      builder.put(entry.getKey(), ImmutableMap.copyOf(entry.getValue()));
+    }
+    return builder.build();
+  }
+
+  private static Map<Integer, Map<Long, List<String>>> deepCopySnapshotManifests(
+      Map<Integer, Map<Long, List<String>>> refs) {
+    ImmutableMap.Builder<Integer, Map<Long, List<String>>> outer = ImmutableMap.builder();
+    for (Map.Entry<Integer, Map<Long, List<String>>> entry : refs.entrySet()) {
+      ImmutableMap.Builder<Long, List<String>> inner = ImmutableMap.builder();
+      for (Map.Entry<Long, List<String>> snap : entry.getValue().entrySet()) {
+        inner.put(snap.getKey(), ImmutableList.copyOf(snap.getValue()));
+      }
+      outer.put(entry.getKey(), inner.build());
+    }
+    return outer.build();
   }
 
   public static ProtoCatalogFile empty(InputFile location) {
@@ -285,6 +319,58 @@ public class ProtoCatalogFile extends CatalogFile {
     return tblManifestPrefix;
   }
 
+  /** Returns true if the table has inline manifest list data for the given snapshot. */
+  public boolean hasInlineManifests(int tblId, long snapshotId) {
+    Map<Long, List<String>> refs = snapshotManifests.get(tblId);
+    return refs != null && refs.containsKey(snapshotId);
+  }
+
+  /** Returns the inline manifest list for the given table and snapshot, resolving from the pool. */
+  public List<ManifestFile> inlineManifests(int tblId, long snapshotId) {
+    Map<Long, List<String>> refs = snapshotManifests.get(tblId);
+    if (refs == null) {
+      return null;
+    }
+    List<String> paths = refs.get(snapshotId);
+    if (paths == null) {
+      return null;
+    }
+    Map<String, ManifestFile> pool = manifestPool.get(tblId);
+    if (pool == null) {
+      return ImmutableList.of();
+    }
+    ImmutableList.Builder<ManifestFile> result = ImmutableList.builder();
+    for (String path : paths) {
+      ManifestFile mf = pool.get(path);
+      if (mf != null) {
+        result.add(mf);
+      }
+    }
+    return result.build();
+  }
+
+  /** Returns the manifest pool for the given table, or empty map. */
+  Map<String, ManifestFile> manifestPool(int tblId) {
+    Map<String, ManifestFile> pool = manifestPool.get(tblId);
+    return pool != null ? pool : ImmutableMap.of();
+  }
+
+  /** Returns the snapshot manifest refs for the given table, or empty map. */
+  Map<Long, List<String>> snapshotManifests(int tblId) {
+    Map<Long, List<String>> refs = snapshotManifests.get(tblId);
+    return refs != null ? refs : ImmutableMap.of();
+  }
+
+  /** Returns the full manifest pool map for checkpoint encoding. */
+  Map<Integer, Map<String, ManifestFile>> allManifestPools() {
+    return manifestPool;
+  }
+
+  /** Returns the full snapshot manifest refs map for checkpoint encoding. */
+  Map<Integer, Map<Long, List<String>>> allSnapshotManifests() {
+    return snapshotManifests;
+  }
+
   // ============================================================
   // Entry types
   // ============================================================
@@ -333,6 +419,8 @@ public class ProtoCatalogFile extends CatalogFile {
     private final Map<Integer, Map<String, String>> nsProperties = new HashMap<>();
     private final Map<Integer, byte[]> tblInlineMetadata = new HashMap<>();
     private final Map<Integer, String> tblManifestPrefix = new HashMap<>();
+    private final Map<Integer, Map<String, ManifestFile>> manifestPool = new HashMap<>();
+    private final Map<Integer, Map<Long, List<String>>> snapshotManifests = new HashMap<>();
     private final Set<UUID> committedTransactions = new HashSet<>();
     private int appendCount = 0;
 
@@ -455,7 +543,29 @@ public class ProtoCatalogFile extends CatalogFile {
     public Builder removeInlineMetadata(int id) {
       tblInlineMetadata.remove(id);
       tblManifestPrefix.remove(id);
+      manifestPool.remove(id);
+      snapshotManifests.remove(id);
       return this;
+    }
+
+    /** Adds a ManifestFile to the table's pool. */
+    public Builder addManifestToPool(int tblId, ManifestFile manifest) {
+      manifestPool.computeIfAbsent(tblId, k -> new LinkedHashMap<>())
+          .put(manifest.path(), manifest);
+      return this;
+    }
+
+    /** Sets the manifest list for a snapshot (list of manifest paths in the pool). */
+    public Builder setSnapshotManifests(int tblId, long snapshotId, List<String> paths) {
+      snapshotManifests.computeIfAbsent(tblId, k -> new HashMap<>())
+          .put(snapshotId, new ArrayList<>(paths));
+      return this;
+    }
+
+    /** Returns true if the table has any manifest pool entries. */
+    public boolean hasManifestPool(int tblId) {
+      Map<String, ManifestFile> pool = manifestPool.get(tblId);
+      return pool != null && !pool.isEmpty();
     }
 
     public boolean isInlineTable(int id) {

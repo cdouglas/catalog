@@ -1380,6 +1380,144 @@ public class TestProtoActions {
   }
 
   // ============================================================
+  // Inline manifest list checkpoint tests
+  // ============================================================
+
+  @Nested
+  class InlineManifestListTests {
+
+    private static final String MANIFEST_PREFIX = "s3://bucket/db/tbl/metadata/";
+
+    @Test
+    void checkpointRoundtripWithManifestPool() {
+      // Build a catalog with an inline table that has manifest pool + snapshot refs
+      ProtoCatalogFile.Builder b = ProtoCatalogFile.builder(LOCATION);
+      b.addNamespace(0, 0, "", 1);
+      b.addNamespace(1, 0, "db", 1);
+      b.setNextNamespaceId(2);
+      b.setNextTableId(2);
+      b.addInlineTable(1, 1, "tbl", 1, SAMPLE_INLINE_METADATA, MANIFEST_PREFIX);
+
+      // Add 3 manifests to the pool
+      org.apache.iceberg.ManifestFile m1 = new TestManifestFile(
+          MANIFEST_PREFIX + "aaa-m0.avro", 1024, 0,
+          org.apache.iceberg.ManifestContent.DATA, 1, 1, 100L,
+          5, 0, 0, 50L, 0L, 0L, null, null, null);
+      org.apache.iceberg.ManifestFile m2 = new TestManifestFile(
+          MANIFEST_PREFIX + "bbb-m0.avro", 2048, 0,
+          org.apache.iceberg.ManifestContent.DATA, 2, 2, 200L,
+          10, 0, 0, 100L, 0L, 0L, null, null, null);
+      org.apache.iceberg.ManifestFile m3 = new TestManifestFile(
+          MANIFEST_PREFIX + "ccc-m0.avro", 4096, 0,
+          org.apache.iceberg.ManifestContent.DATA, 3, 3, 300L,
+          8, 5, 0, 80L, 50L, 0L, null, null, null);
+      b.addManifestToPool(1, m1);
+      b.addManifestToPool(1, m2);
+      b.addManifestToPool(1, m3);
+
+      // Snapshot 100 has manifests m1 only; snapshot 200 has m1+m2; snapshot 300 has m1+m2+m3
+      b.setSnapshotManifests(1, 100L, List.of(m1.path()));
+      b.setSnapshotManifests(1, 200L, List.of(m2.path(), m1.path()));
+      b.setSnapshotManifests(1, 300L, List.of(m3.path(), m2.path(), m1.path()));
+
+      ProtoCatalogFile original = b.build();
+
+      // Serialize to file bytes and re-read
+      byte[] fileBytes = toFileBytes(original);
+      ProtoCatalogFile result = apply(fileBytes);
+
+      // Verify table exists and is inline
+      TableIdentifier tbl = TableIdentifier.of(Namespace.of("db"), "tbl");
+      Integer tblId = result.tableId(tbl);
+      assertThat(tblId).isNotNull();
+      assertThat(result.isInlineTable(tblId)).isTrue();
+
+      // Verify manifest pool round-tripped
+      assertThat(result.hasInlineManifests(tblId, 100L)).isTrue();
+      assertThat(result.hasInlineManifests(tblId, 200L)).isTrue();
+      assertThat(result.hasInlineManifests(tblId, 300L)).isTrue();
+      assertThat(result.hasInlineManifests(tblId, 999L)).isFalse();
+
+      // Snapshot 100: just m1
+      List<org.apache.iceberg.ManifestFile> snap100 = result.inlineManifests(tblId, 100L);
+      assertThat(snap100).hasSize(1);
+      assertThat(snap100.get(0).path()).isEqualTo(m1.path());
+      assertThat(snap100.get(0).length()).isEqualTo(1024);
+      assertThat(snap100.get(0).snapshotId()).isEqualTo(100L);
+      assertThat(snap100.get(0).addedFilesCount()).isEqualTo(5);
+
+      // Snapshot 200: m2, m1
+      List<org.apache.iceberg.ManifestFile> snap200 = result.inlineManifests(tblId, 200L);
+      assertThat(snap200).hasSize(2);
+      assertThat(snap200.get(0).path()).isEqualTo(m2.path());
+      assertThat(snap200.get(1).path()).isEqualTo(m1.path());
+
+      // Snapshot 300: m3, m2, m1 -- pool sharing verified (m1 + m2 stored once)
+      List<org.apache.iceberg.ManifestFile> snap300 = result.inlineManifests(tblId, 300L);
+      assertThat(snap300).hasSize(3);
+      assertThat(snap300.get(0).path()).isEqualTo(m3.path());
+      assertThat(snap300.get(0).existingFilesCount()).isEqualTo(5);
+      assertThat(snap300.get(0).existingRowsCount()).isEqualTo(50L);
+    }
+
+    @Test
+    void emptyManifestPoolRoundtrip() {
+      // Inline table with no manifest pool data (backward compat)
+      byte[] file = catalog()
+          .ns(1, 0, "db", 1)
+          .inlineTbl(1, 1, "tbl", 1, SAMPLE_INLINE_METADATA, MANIFEST_PREFIX)
+          .build();
+      ProtoCatalogFile result = apply(file);
+
+      Integer tblId = result.tableId(TableIdentifier.of(Namespace.of("db"), "tbl"));
+      assertThat(result.hasInlineManifests(tblId, 1L)).isFalse();
+      assertThat(result.inlineManifests(tblId, 1L)).isNull();
+    }
+
+    @Test
+    void multipleTablesWithIndependentPools() {
+      ProtoCatalogFile.Builder b = ProtoCatalogFile.builder(LOCATION);
+      b.addNamespace(0, 0, "", 1);
+      b.addNamespace(1, 0, "db", 1);
+      b.setNextNamespaceId(2);
+      b.setNextTableId(3);
+
+      String prefix1 = "s3://bucket/db/t1/metadata/";
+      String prefix2 = "s3://bucket/db/t2/metadata/";
+      b.addInlineTable(1, 1, "t1", 1, SAMPLE_INLINE_METADATA, prefix1);
+      b.addInlineTable(2, 1, "t2", 1, SAMPLE_INLINE_METADATA, prefix2);
+
+      org.apache.iceberg.ManifestFile m1 = new TestManifestFile(
+          prefix1 + "aaa-m0.avro", 1024, 0,
+          org.apache.iceberg.ManifestContent.DATA, 1, 1, 10L,
+          1, 0, 0, 10L, 0L, 0L, null, null, null);
+      org.apache.iceberg.ManifestFile m2 = new TestManifestFile(
+          prefix2 + "bbb-m0.avro", 2048, 0,
+          org.apache.iceberg.ManifestContent.DATA, 1, 1, 20L,
+          2, 0, 0, 20L, 0L, 0L, null, null, null);
+
+      b.addManifestToPool(1, m1);
+      b.setSnapshotManifests(1, 10L, List.of(m1.path()));
+      b.addManifestToPool(2, m2);
+      b.setSnapshotManifests(2, 20L, List.of(m2.path()));
+
+      byte[] fileBytes = toFileBytes(b.build());
+      ProtoCatalogFile result = apply(fileBytes);
+
+      Integer t1Id = result.tableId(TableIdentifier.of(Namespace.of("db"), "t1"));
+      Integer t2Id = result.tableId(TableIdentifier.of(Namespace.of("db"), "t2"));
+
+      assertThat(result.hasInlineManifests(t1Id, 10L)).isTrue();
+      assertThat(result.hasInlineManifests(t2Id, 20L)).isTrue();
+      assertThat(result.hasInlineManifests(t1Id, 20L)).isFalse();
+      assertThat(result.hasInlineManifests(t2Id, 10L)).isFalse();
+
+      assertThat(result.inlineManifests(t1Id, 10L).get(0).path()).isEqualTo(m1.path());
+      assertThat(result.inlineManifests(t2Id, 20L).get(0).path()).isEqualTo(m2.path());
+    }
+  }
+
+  // ============================================================
   // ManifestFileEntry codec tests
   // ============================================================
 
