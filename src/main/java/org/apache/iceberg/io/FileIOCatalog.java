@@ -412,6 +412,29 @@ public class FileIOCatalog extends BaseMetastoreCatalog
 
         java.util.List<InlineDeltaCodec.DeltaUpdate> delta =
             InlineDeltaCodec.computeDelta(base, metadata, manifestPrefix);
+
+        // Attach manifest list deltas if this ops implements ManifestListSink
+        if (this instanceof InlineManifestTableOperations) {
+          Map<Long, ManifestListDelta> mlDeltas =
+              ((InlineManifestTableOperations) this).drainStagedDeltas();
+          java.util.Set<Long> oldSnapIds = new java.util.HashSet<>();
+          if (base != null) {
+            for (org.apache.iceberg.Snapshot s : base.snapshots()) {
+              oldSnapIds.add(s.snapshotId());
+            }
+          }
+          for (org.apache.iceberg.Snapshot snap : metadata.snapshots()) {
+            if (!oldSnapIds.contains(snap.snapshotId())) {
+              ManifestListDelta mlDelta = mlDeltas.get(snap.snapshotId());
+              if (mlDelta != null && delta != null) {
+                InlineDeltaCodec.attachManifestDelta(
+                    delta, snap.snapshotId(),
+                    mlDelta.added(), mlDelta.removedPaths(), manifestPrefix);
+              }
+            }
+          }
+        }
+
         String mode = InlineDeltaCodec.selectMode(delta, metadata, 0);
 
         CatalogFile.Mut<?, ?> mut = format.from(lastCatalogFile);
