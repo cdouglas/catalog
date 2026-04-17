@@ -30,7 +30,11 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import org.apache.iceberg.CatalogProperties;
+import org.apache.iceberg.DataFile;
+import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.ManifestFile;
+import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.Schema;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.Namespace;
@@ -253,6 +257,26 @@ public class TestInlineManifestEndToEnd {
   // Tests per config
   // ============================================================
 
+  static final Schema TEST_SCHEMA = new Schema(
+      Types.NestedField.required(1, "id", Types.IntegerType.get()),
+      Types.NestedField.required(2, "data", Types.StringType.get()));
+  static final PartitionSpec TEST_SPEC = PartitionSpec.builderFor(TEST_SCHEMA)
+      .bucket("data", 16).build();
+  static final DataFile FILE_A = DataFiles.builder(TEST_SPEC)
+      .withPath("/path/to/data-a.parquet")
+      .withFileSizeInBytes(10)
+      .withPartitionPath("data_bucket=0")
+      .withRecordCount(1)
+      .build();
+  static final DataFile FILE_B = DataFiles.builder(TEST_SPEC)
+      .withPath("/path/to/data-b.parquet")
+      .withFileSizeInBytes(10)
+      .withPartitionPath("data_bucket=1")
+      .withRecordCount(1)
+      .build();
+
+  static final TableIdentifier TBL = TableIdentifier.of("db", "tbl");
+
   abstract static class ConfiguredTests {
     MemoryFileIO io;
     FileIOCatalog catalog;
@@ -270,11 +294,17 @@ public class TestInlineManifestEndToEnd {
 
     void createNamespaceAndTable() {
       catalog.createNamespace(Namespace.of("db"));
-      catalog.buildTable(
-              TableIdentifier.of("db", "tbl"),
-              new org.apache.iceberg.Schema(
-                  Types.NestedField.required(1, "id", Types.LongType.get())))
-          .create();
+      catalog.buildTable(TBL, TEST_SCHEMA).create();
+    }
+
+    /** Construct a fresh catalog over the same MemoryFileIO (forces checkpoint+log replay). */
+    FileIOCatalog reloadCatalog() {
+      String wh = "mem:///warehouse";
+      Map<String, String> props = config().catalogProperties(wh);
+      FileIOCatalog fresh = new FileIOCatalog(
+          "test2", wh + "/catalog", null, new ProtoCatalogFormat(), io, props);
+      fresh.initialize("test2", props);
+      return fresh;
     }
   }
 
@@ -331,9 +361,70 @@ public class TestInlineManifestEndToEnd {
     @Test
     void tableOperationsIsManifestListSink() {
       createNamespaceAndTable();
-      var ops = catalog.newTableOps(
-          TableIdentifier.of("db", "tbl"));
+      var ops = catalog.newTableOps(TBL);
       assertThat(ops).isInstanceOf(org.apache.iceberg.ManifestListSink.class);
+    }
+
+    /** §3.1/§3.2: FastAppend must not crash with NPE on null manifestListLocation. */
+    @Test
+    void fastAppendCommitsWithoutCrash() {
+      createNamespaceAndTable();
+      Table tbl = catalog.loadTable(TBL);
+      tbl.newFastAppend().appendFile(FILE_A).commit();
+      assertThat(tbl.currentSnapshot()).isNotNull();
+    }
+
+    /** §3.3/§2.4: After FastAppend + catalog reload, manifest list must survive replay. */
+    @Test
+    void fastAppendReloadManifests() {
+      createNamespaceAndTable();
+      Table tbl = catalog.loadTable(TBL);
+      tbl.newFastAppend().appendFile(FILE_A).commit();
+
+      // Reload from a fresh catalog (forces checkpoint + log replay)
+      FileIOCatalog fresh = reloadCatalog();
+      Table reloaded = fresh.loadTable(TBL);
+      Snapshot snap = reloaded.currentSnapshot();
+      assertThat(snap).isNotNull();
+      List<ManifestFile> manifests = snap.allManifests(io);
+      assertThat(manifests).hasSize(1);
+      assertThat(manifests.get(0).addedFilesCount()).isEqualTo(1);
+    }
+
+    /** Pool carryover: two FastAppends, reload, verify both snapshots' manifest lists. */
+    @Test
+    void twoFastAppendsReloadManifests() {
+      createNamespaceAndTable();
+      Table tbl = catalog.loadTable(TBL);
+      tbl.newFastAppend().appendFile(FILE_A).commit();
+      long firstSnapId = tbl.currentSnapshot().snapshotId();
+      tbl.newFastAppend().appendFile(FILE_B).commit();
+      long secondSnapId = tbl.currentSnapshot().snapshotId();
+
+      FileIOCatalog fresh = reloadCatalog();
+      Table reloaded = fresh.loadTable(TBL);
+
+      // Current snapshot has 2 manifests (one per append)
+      Snapshot current = reloaded.currentSnapshot();
+      assertThat(current.snapshotId()).isEqualTo(secondSnapId);
+      assertThat(current.allManifests(io)).hasSize(2);
+
+      // First snapshot has 1 manifest
+      Snapshot first = reloaded.snapshot(firstSnapId);
+      assertThat(first).isNotNull();
+      assertThat(first.allManifests(io)).hasSize(1);
+    }
+
+    /** Sink path: no snap-*.avro files should be written when inline.manifests=true. */
+    @Test
+    void noSnapAvroFilesWritten() {
+      createNamespaceAndTable();
+      Table tbl = catalog.loadTable(TBL);
+      tbl.newFastAppend().appendFile(FILE_A).commit();
+      tbl.newFastAppend().appendFile(FILE_B).commit();
+
+      List<String> snapFiles = io.filesMatching("snap-");
+      assertThat(snapFiles).isEmpty();
     }
   }
 }

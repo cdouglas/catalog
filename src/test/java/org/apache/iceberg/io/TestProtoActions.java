@@ -1518,6 +1518,46 @@ public class TestProtoActions {
   }
 
   // ============================================================
+  // InlineSnapshot equals/hashCode tests (§2.1)
+  // ============================================================
+
+  @Nested
+  class InlineSnapshotEqualityTests {
+
+    @Test
+    void inlineSnapshotEqualsItself() {
+      org.apache.iceberg.InlineSnapshot snap = new org.apache.iceberg.InlineSnapshot(
+          1L, 100L, null, 1000L, "append",
+          Map.of("operation", "append"), 0, null, null, null, List.of());
+      assertThat(snap).isEqualTo(snap);
+    }
+
+    @Test
+    void twoInlineSnapshotsWithSameFieldsAreEqual() {
+      org.apache.iceberg.InlineSnapshot a = new org.apache.iceberg.InlineSnapshot(
+          5L, 200L, 100L, 2000L, "append",
+          Map.of("operation", "append"), 1, null, null, null, List.of());
+      org.apache.iceberg.InlineSnapshot b = new org.apache.iceberg.InlineSnapshot(
+          5L, 200L, 100L, 2000L, "overwrite",
+          Map.of("operation", "overwrite"), 1, null, null, null, List.of());
+      // equals compares snapshotId, parentId, sequenceNumber, timestampMillis, schemaId
+      assertThat(a).isEqualTo(b);
+      assertThat(a.hashCode()).isEqualTo(b.hashCode());
+    }
+
+    @Test
+    void inlineSnapshotNotEqualDifferentId() {
+      org.apache.iceberg.InlineSnapshot a = new org.apache.iceberg.InlineSnapshot(
+          1L, 100L, null, 1000L, "append",
+          Map.of("operation", "append"), 0, null, null, null, List.of());
+      org.apache.iceberg.InlineSnapshot b = new org.apache.iceberg.InlineSnapshot(
+          1L, 999L, null, 1000L, "append",
+          Map.of("operation", "append"), 0, null, null, null, List.of());
+      assertThat(a).isNotEqualTo(b);
+    }
+  }
+
+  // ============================================================
   // ManifestFileEntry codec tests
   // ============================================================
 

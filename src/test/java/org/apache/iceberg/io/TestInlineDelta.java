@@ -554,6 +554,19 @@ public class TestInlineDelta {
   }
 
   // ============================================================
+  // Delta replay with ML updates tests
+  // ============================================================
+
+  @Nested
+  class DeltaReplayTests {
+    private static final String PATH_PREFIX = "s3://bucket/db/tbl/metadata/";
+
+    // Test 6 (applyDeltaWithAddSnapshotAndManifests) is added in Step 2
+    // when the applyDeltaWithManifests method and snapshotManifestPaths
+    // accessor are implemented. It cannot compile until then.
+  }
+
+  // ============================================================
   // Manifest list delta tests
   // ============================================================
 
@@ -651,6 +664,37 @@ public class TestInlineDelta {
       InlineDeltaCodec.RemoveManifestUpdate rm =
           (InlineDeltaCodec.RemoveManifestUpdate) delta.get(1);
       assertThat(rm.manifestPathSuffix).isEqualTo("original-m0.avro");
+    }
+
+    /** §3.1: computeDelta must handle null manifestListLocation (InlineSnapshot). */
+    @Test
+    void computeDeltaHandlesNullManifestListLocation() {
+      TableMetadata base = baseMetadata();
+
+      // Construct metadata with an InlineSnapshot (manifestListLocation == null)
+      org.apache.iceberg.ManifestFile mf = new TestProtoActions.TestManifestFile(
+          "s3://bucket/m0.avro", 1024, 0, org.apache.iceberg.ManifestContent.DATA,
+          1, 1, 99L, 5, 0, 0, 50L, 0L, 0L, null, null, null);
+      org.apache.iceberg.Snapshot inlineSnap = new org.apache.iceberg.InlineSnapshot(
+          1L, 99L, null, System.currentTimeMillis(), "append",
+          Map.of("operation", "append"), base.currentSchemaId(), null, null, null,
+          List.of(mf));
+      TableMetadata newMeta = TableMetadata.buildFrom(base)
+          .addSnapshot(inlineSnap)
+          .discardChanges()
+          .build();
+
+      // computeDelta must not throw NPE
+      List<InlineDeltaCodec.DeltaUpdate> delta =
+          InlineDeltaCodec.computeDelta(base, newMeta, "s3://bucket/");
+      assertThat(delta).isNotEmpty();
+      // The AddSnapshotUpdate should have an empty-string suffix (no Avro file)
+      InlineDeltaCodec.AddSnapshotUpdate addSnap = delta.stream()
+          .filter(u -> u instanceof InlineDeltaCodec.AddSnapshotUpdate)
+          .map(u -> (InlineDeltaCodec.AddSnapshotUpdate) u)
+          .findFirst()
+          .orElseThrow();
+      assertThat(addSnap.manifestListSuffix).isEqualTo("");
     }
 
     @Test
