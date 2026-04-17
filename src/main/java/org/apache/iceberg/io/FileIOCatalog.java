@@ -345,10 +345,9 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         String json = new String(inlineMeta, StandardCharsets.UTF_8);
         // Use synthetic location for change detection; custom loader skips file I/O
         String syntheticLoc = "inline://" + tableId + "#v" + System.nanoTime();
-        refreshFromMetadataLocation(syntheticLoc, null, 0, loc -> {
-          TableMetadata parsed = TableMetadataParser.fromJson(loc, json);
-          return wrapInlineManifests(parsed, catalogFile);
-        });
+        refreshFromMetadataLocation(syntheticLoc, null, 0,
+            loc -> wrapInlineManifests(
+                TableMetadataParser.fromJson(loc, json), catalogFile));
       } else if (currentMetadataLocation() != null) {
         // Table used to exist but is now missing
         throw new NoSuchTableException("Table %s was deleted", tableId);
@@ -487,16 +486,12 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         return parsed;
       }
 
-      // Replace snapshots that have inline ML data with InlineSnapshot
-      TableMetadata.Builder builder = TableMetadata.buildFrom(parsed);
-      java.util.List<Long> toRemove = new java.util.ArrayList<>();
-      java.util.List<Snapshot> toAdd = new java.util.ArrayList<>();
-
+      // Build a snapshot replacement map (id -> InlineSnapshot)
+      Map<Long, Snapshot> replacements = new java.util.HashMap<>();
       for (Snapshot s : parsed.snapshots()) {
         if (proto.hasInlineManifests(tblId, s.snapshotId())) {
           List<ManifestFile> manifests = proto.inlineManifests(tblId, s.snapshotId());
-          toRemove.add(s.snapshotId());
-          toAdd.add(new InlineSnapshot(
+          replacements.put(s.snapshotId(), new InlineSnapshot(
               s.sequenceNumber(), s.snapshotId(), s.parentId(),
               s.timestampMillis(), s.operation(), s.summary(),
               s.schemaId(), s.firstRowId(), s.addedRows(), s.keyId(),
@@ -504,10 +499,10 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         }
       }
 
-      builder.removeSnapshots(toRemove);
-      for (Snapshot wrapped : toAdd) {
-        builder.addSnapshot(wrapped);
-      }
+      // Replace snapshots in-place without using removeSnapshots (which clears refs
+      // and doesn't reset lastSequenceNumber, causing validation failures on re-add).
+      TableMetadata.Builder builder = TableMetadata.buildFrom(parsed);
+      builder.replaceSnapshots(replacements);
       return builder.discardChanges().build();
     }
 

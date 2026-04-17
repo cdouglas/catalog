@@ -32,6 +32,7 @@ import java.util.function.Supplier;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
+import org.apache.iceberg.InlineSnapshot;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
@@ -371,7 +372,12 @@ public class TestInlineManifestEndToEnd {
       createNamespaceAndTable();
       Table tbl = catalog.loadTable(TBL);
       tbl.newFastAppend().appendFile(FILE_A).commit();
-      assertThat(tbl.currentSnapshot()).isNotNull();
+
+      // Verify via fresh catalog (forces full re-read from storage)
+      FileIOCatalog fresh = reloadCatalog();
+      Table reloaded = fresh.loadTable(TBL);
+      assertThat(reloaded.snapshots()).as("table should have snapshots after FastAppend").isNotEmpty();
+      assertThat(reloaded.currentSnapshot()).as("table should have a current snapshot").isNotNull();
     }
 
     /** §3.3/§2.4: After FastAppend + catalog reload, manifest list must survive replay. */
@@ -380,7 +386,6 @@ public class TestInlineManifestEndToEnd {
       createNamespaceAndTable();
       Table tbl = catalog.loadTable(TBL);
       tbl.newFastAppend().appendFile(FILE_A).commit();
-
       // Reload from a fresh catalog (forces checkpoint + log replay)
       FileIOCatalog fresh = reloadCatalog();
       Table reloaded = fresh.loadTable(TBL);

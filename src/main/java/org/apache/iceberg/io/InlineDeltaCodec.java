@@ -162,6 +162,73 @@ public class InlineDeltaCodec {
     return TableMetadataParser.toJson(result).getBytes(StandardCharsets.UTF_8);
   }
 
+  /**
+   * Applies a delta (encoded bytes) to base metadata, routing ML updates to the
+   * ProtoCatalogFile.Builder and TM updates (including AddSnapshot) to TableMetadata.
+   * This is the ML-aware replacement for {@link #applyDelta(byte[], byte[])}.
+   */
+  public static byte[] applyDeltaWithManifests(
+      byte[] baseMetadataJson, byte[] deltaBytes,
+      ProtoCatalogFile.Builder catalogBuilder, int tableId) {
+    TableMetadata base = TableMetadataParser.fromJson(
+        new String(baseMetadataJson, StandardCharsets.UTF_8));
+    List<DeltaUpdate> updates = decodeDelta(deltaBytes);
+    String prefix = catalogBuilder.manifestListPrefix(tableId);
+    if (prefix == null) {
+      prefix = "";
+    }
+
+    // Apply updates type-by-type: TM updates to TableMetadata, ML updates to catalog builder
+    TableMetadata current = base;
+    for (DeltaUpdate update : updates) {
+      if (update instanceof AddSnapshotUpdate) {
+        // Route through the prefix-accepting overload (avoids the throw in applyTo(Builder))
+        current = ((AddSnapshotUpdate) update).applyTo(current, prefix);
+      } else if (update instanceof AddManifestUpdate) {
+        AddManifestUpdate add = (AddManifestUpdate) update;
+        // The manifest decoded from the wire has a suffix-only path; resolve full path
+        String fullPath = add.manifest.path();
+        if (!prefix.isEmpty() && !fullPath.startsWith(prefix)) {
+          fullPath = prefix + fullPath;
+        }
+        ManifestFile resolved = new ProtoCodec.DecodedManifestFile(
+            fullPath, add.manifest.length(), add.manifest.partitionSpecId(),
+            add.manifest.content().id(),
+            add.manifest.sequenceNumber(), add.manifest.minSequenceNumber(),
+            add.manifest.snapshotId(),
+            add.manifest.addedFilesCount() != null ? add.manifest.addedFilesCount() : 0,
+            add.manifest.existingFilesCount() != null ? add.manifest.existingFilesCount() : 0,
+            add.manifest.deletedFilesCount() != null ? add.manifest.deletedFilesCount() : 0,
+            add.manifest.addedRowsCount() != null ? add.manifest.addedRowsCount() : 0,
+            add.manifest.existingRowsCount() != null ? add.manifest.existingRowsCount() : 0,
+            add.manifest.deletedRowsCount() != null ? add.manifest.deletedRowsCount() : 0,
+            add.manifest.partitions(),
+            add.manifest.keyMetadata() != null
+                ? java.nio.ByteBuffer.allocate(add.manifest.keyMetadata().remaining())
+                    .put(add.manifest.keyMetadata().duplicate()).array()
+                : null,
+            add.manifest.firstRowId());
+        catalogBuilder.addManifestToPool(tableId, resolved);
+        List<String> refs = new ArrayList<>(
+            catalogBuilder.snapshotManifestPaths(tableId, add.snapshotId));
+        refs.add(resolved.path());
+        catalogBuilder.setSnapshotManifests(tableId, add.snapshotId, refs);
+      } else if (update instanceof RemoveManifestUpdate) {
+        RemoveManifestUpdate rm = (RemoveManifestUpdate) update;
+        List<String> refs = new ArrayList<>(
+            catalogBuilder.snapshotManifestPaths(tableId, rm.snapshotId));
+        refs.removeIf(p -> p.endsWith(rm.manifestPathSuffix));
+        catalogBuilder.setSnapshotManifests(tableId, rm.snapshotId, refs);
+      } else {
+        // Schema, properties, sort order, refs, etc. — apply to TableMetadata.Builder
+        TableMetadata.Builder tmBuilder = TableMetadata.buildFrom(current);
+        update.applyTo(tmBuilder);
+        current = tmBuilder.discardChanges().build();
+      }
+    }
+    return TableMetadataParser.toJson(current).getBytes(StandardCharsets.UTF_8);
+  }
+
   /** Applies a list of decoded updates to a base metadata. */
   public static TableMetadata applyUpdates(TableMetadata base, List<DeltaUpdate> updates) {
     TableMetadata.Builder builder = TableMetadata.buildFrom(base);
@@ -612,7 +679,11 @@ public class InlineDeltaCodec {
           ? base.currentSnapshot().snapshotId() : -1;
       long timestamp = base.lastUpdatedMillis() + timestampDeltaMs;
       int resolvedSchemaId = schemaId > 0 ? schemaId : base.currentSchemaId();
-      String manifestList = manifestListPrefix + manifestListSuffix;
+      // For inline snapshots (empty suffix), use a sentinel that SnapshotParser.toJson
+      // will write as a manifest-list location (not the v1 embedded path)
+      String manifestList = manifestListSuffix.isEmpty()
+          ? "inline://" + snapshotId
+          : manifestListPrefix + manifestListSuffix;
 
       // Build snapshot via JSON + SnapshotParser (BaseSnapshot is package-private)
       StringBuilder json = new StringBuilder("{");

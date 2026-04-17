@@ -1862,17 +1862,22 @@ public class ProtoCodec {
     @Override
     public void apply(ProtoCatalogFile.Builder builder) {
       if (deltaBytes != null) {
-        // DELTA mode: apply structured changes to current inline metadata
+        // DELTA mode: apply structured changes to current inline metadata.
+        // Uses applyDeltaWithManifests to route ML updates (AddManifestUpdate,
+        // RemoveManifestUpdate) to the catalog builder's manifest pool, and
+        // AddSnapshotUpdate through the prefix-accepting overload.
         byte[] currentMeta = builder.inlineMetadata(id);
         if (currentMeta != null) {
-          byte[] updatedMeta = InlineDeltaCodec.applyDelta(currentMeta, deltaBytes);
-          builder.removeInlineMetadata(id);
+          // Save prefix before removeInlineMetadata clears it
+          String prefix = builder.manifestListPrefix(id) != null
+              ? builder.manifestListPrefix(id) : "";
+          // Apply delta — routes ML updates to builder's manifest pool
+          byte[] updatedMeta = InlineDeltaCodec.applyDeltaWithManifests(
+              currentMeta, deltaBytes, builder, id);
+          // Rotate the inline metadata without clearing manifest pool/refs.
           ProtoCatalogFile.TblEntry old = builder.tableEntry(id);
           if (old != null) {
-            String prefix = builder.manifestListPrefix(id) != null
-                ? builder.manifestListPrefix(id) : "";
-            builder.addInlineTable(
-                id, old.namespaceId, old.name, version + 1, updatedMeta, prefix);
+            builder.updateInlineMetadata(id, version + 1, updatedMeta);
           }
         }
       } else if (fullMetadata != null) {

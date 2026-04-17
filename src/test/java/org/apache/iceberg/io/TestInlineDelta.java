@@ -561,9 +561,101 @@ public class TestInlineDelta {
   class DeltaReplayTests {
     private static final String PATH_PREFIX = "s3://bucket/db/tbl/metadata/";
 
-    // Test 6 (applyDeltaWithAddSnapshotAndManifests) is added in Step 2
-    // when the applyDeltaWithManifests method and snapshotManifestPaths
-    // accessor are implemented. It cannot compile until then.
+    /**
+     * §3.3/§2.4: A delta containing AddSnapshotUpdate + AddManifestUpdate must
+     * survive encode → decode → apply. The manifest must appear in the catalog
+     * builder's manifest pool after application.
+     */
+    @Test
+    void applyDeltaWithAddSnapshotAndManifests() {
+      org.apache.iceberg.ManifestFile mf = new TestProtoActions.TestManifestFile(
+          PATH_PREFIX + "aaa-m0.avro", 2048L, 0,
+          org.apache.iceberg.ManifestContent.DATA,
+          1L, 1L, 500L,
+          10, 0, 0, 100L, 0L, 0L,
+          null, null, null);
+
+      // Build a delta with AddSnapshot + AddManifest
+      List<InlineDeltaCodec.DeltaUpdate> delta = new java.util.ArrayList<>();
+      delta.add(new InlineDeltaCodec.AddSnapshotUpdate(
+          500L, "", Map.of("operation", "append"),
+          1000L, 0, 100L));
+      InlineDeltaCodec.attachManifestDelta(
+          delta, 500L, List.of(mf), List.of(), PATH_PREFIX);
+
+      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(delta);
+
+      // Set up a catalog builder with an inline table
+      byte[] baseMeta = TableMetadataParser.toJson(baseMetadata())
+          .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+      InputFile loc = new InputFile() {
+        @Override public long getLength() { return 0; }
+        @Override public SeekableInputStream newStream() { return null; }
+        @Override public String location() { return "test://catalog"; }
+        @Override public boolean exists() { return true; }
+      };
+      ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(loc);
+      builder.addNamespace(0, 0, "", 1);
+      builder.addNamespace(1, 0, "db", 1);
+      builder.setNextNamespaceId(2);
+      builder.setNextTableId(2);
+      builder.addInlineTable(1, 1, "tbl", 1, baseMeta, PATH_PREFIX);
+
+      // Apply the delta — routes ML updates to the catalog builder
+      byte[] updatedMeta = InlineDeltaCodec.applyDeltaWithManifests(
+          baseMeta, deltaBytes, builder, 1);
+
+      // The manifest pool should have the manifest
+      assertThat(builder.hasManifestPool(1)).isTrue();
+      // The snapshot refs should have the manifest path
+      List<String> refs = builder.snapshotManifestPaths(1, 500L);
+      assertThat(refs).hasSize(1);
+      assertThat(refs.get(0)).isEqualTo(mf.path());
+
+      // The updated metadata should parse and contain the new snapshot
+      assertThat(updatedMeta).isNotNull();
+      org.apache.iceberg.TableMetadata updated = TableMetadataParser.fromJson(
+          new String(updatedMeta, java.nio.charset.StandardCharsets.UTF_8));
+      assertThat(updated.snapshots()).hasSize(1);
+      assertThat(updated.snapshots().get(0).snapshotId()).isEqualTo(500L);
+    }
+
+    /** Verify AddSnapshot + SetSnapshotRef results in a table with currentSnapshot set. */
+    @Test
+    void applyDeltaWithSnapshotRefSetsCurrentSnapshot() {
+      List<InlineDeltaCodec.DeltaUpdate> delta = new java.util.ArrayList<>();
+      delta.add(new InlineDeltaCodec.AddSnapshotUpdate(
+          500L, "", Map.of("operation", "append"),
+          1000L, 0, 100L));
+      delta.add(new InlineDeltaCodec.SetSnapshotRefUpdate(
+          "main", 500L, "branch", 0, 0L, 0L));
+
+      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(delta);
+
+      byte[] baseMeta = TableMetadataParser.toJson(baseMetadata())
+          .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+      InputFile loc = new InputFile() {
+        @Override public long getLength() { return 0; }
+        @Override public SeekableInputStream newStream() { return null; }
+        @Override public String location() { return "test://catalog"; }
+        @Override public boolean exists() { return true; }
+      };
+      ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(loc);
+      builder.addNamespace(0, 0, "", 1);
+      builder.addNamespace(1, 0, "db", 1);
+      builder.setNextNamespaceId(2);
+      builder.setNextTableId(2);
+      builder.addInlineTable(1, 1, "tbl", 1, baseMeta, "");
+
+      byte[] updatedMeta = InlineDeltaCodec.applyDeltaWithManifests(
+          baseMeta, deltaBytes, builder, 1);
+
+      org.apache.iceberg.TableMetadata updated = TableMetadataParser.fromJson(
+          new String(updatedMeta, java.nio.charset.StandardCharsets.UTF_8));
+      assertThat(updated.snapshots()).as("should have 1 snapshot").hasSize(1);
+      assertThat(updated.currentSnapshot()).as("currentSnapshot should be set").isNotNull();
+      assertThat(updated.currentSnapshot().snapshotId()).isEqualTo(500L);
+    }
   }
 
   // ============================================================

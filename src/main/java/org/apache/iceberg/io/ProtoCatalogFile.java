@@ -539,6 +539,16 @@ public class ProtoCatalogFile extends CatalogFile {
       return this;
     }
 
+    /** Updates inline metadata and version without clearing the manifest pool. */
+    public Builder updateInlineMetadata(int id, int newVersion, byte[] metadata) {
+      tblInlineMetadata.put(id, metadata);
+      TblEntry old = tableById.get(id);
+      if (old != null) {
+        tableById.put(id, new TblEntry(old.namespaceId, old.name, newVersion, null));
+      }
+      return this;
+    }
+
     /** Removes inline metadata for a table (e.g., when transitioning to pointer mode). */
     public Builder removeInlineMetadata(int id) {
       tblInlineMetadata.remove(id);
@@ -566,6 +576,16 @@ public class ProtoCatalogFile extends CatalogFile {
     public boolean hasManifestPool(int tblId) {
       Map<String, ManifestFile> pool = manifestPool.get(tblId);
       return pool != null && !pool.isEmpty();
+    }
+
+    /** Returns the manifest paths for a snapshot, or empty list. */
+    public List<String> snapshotManifestPaths(int tblId, long snapshotId) {
+      Map<Long, List<String>> refs = snapshotManifests.get(tblId);
+      if (refs == null) {
+        return List.of();
+      }
+      List<String> paths = refs.get(snapshotId);
+      return paths != null ? paths : List.of();
     }
 
     public boolean isInlineTable(int id) {
