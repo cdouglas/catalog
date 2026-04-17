@@ -32,6 +32,9 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.BaseMetastoreCatalog;
 import org.apache.iceberg.BaseMetastoreTableOperations;
 import org.apache.iceberg.CatalogProperties;
+import org.apache.iceberg.InlineSnapshot;
+import org.apache.iceberg.ManifestFile;
+import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.CatalogUtil;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableMetadataParser;
@@ -342,8 +345,10 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         String json = new String(inlineMeta, StandardCharsets.UTF_8);
         // Use synthetic location for change detection; custom loader skips file I/O
         String syntheticLoc = "inline://" + tableId + "#v" + System.nanoTime();
-        refreshFromMetadataLocation(syntheticLoc, null, 0,
-            loc -> TableMetadataParser.fromJson(loc, json));
+        refreshFromMetadataLocation(syntheticLoc, null, 0, loc -> {
+          TableMetadata parsed = TableMetadataParser.fromJson(loc, json);
+          return wrapInlineManifests(parsed, catalogFile);
+        });
       } else if (currentMetadataLocation() != null) {
         // Table used to exist but is now missing
         throw new NoSuchTableException("Table %s was deleted", tableId);
@@ -454,6 +459,56 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         }
         mut.commit(io());
       }
+    }
+
+    /**
+     * Replaces snapshots with InlineSnapshot when the catalog has inline manifest list data.
+     * Snapshots without inline ML data keep their original manifestListLocation (Avro pointer).
+     */
+    private TableMetadata wrapInlineManifests(TableMetadata parsed, CatalogFile catalogFile) {
+      if (!(catalogFile instanceof ProtoCatalogFile)) {
+        return parsed;
+      }
+      ProtoCatalogFile proto = (ProtoCatalogFile) catalogFile;
+      Integer tblId = proto.tableId(tableId);
+      if (tblId == null) {
+        return parsed;
+      }
+
+      // Check if any snapshot has inline manifests
+      boolean hasAny = false;
+      for (Snapshot s : parsed.snapshots()) {
+        if (proto.hasInlineManifests(tblId, s.snapshotId())) {
+          hasAny = true;
+          break;
+        }
+      }
+      if (!hasAny) {
+        return parsed;
+      }
+
+      // Replace snapshots that have inline ML data with InlineSnapshot
+      TableMetadata.Builder builder = TableMetadata.buildFrom(parsed);
+      java.util.List<Long> toRemove = new java.util.ArrayList<>();
+      java.util.List<Snapshot> toAdd = new java.util.ArrayList<>();
+
+      for (Snapshot s : parsed.snapshots()) {
+        if (proto.hasInlineManifests(tblId, s.snapshotId())) {
+          List<ManifestFile> manifests = proto.inlineManifests(tblId, s.snapshotId());
+          toRemove.add(s.snapshotId());
+          toAdd.add(new InlineSnapshot(
+              s.sequenceNumber(), s.snapshotId(), s.parentId(),
+              s.timestampMillis(), s.operation(), s.summary(),
+              s.schemaId(), s.firstRowId(), s.addedRows(), s.keyId(),
+              manifests));
+        }
+      }
+
+      builder.removeSnapshots(toRemove);
+      for (Snapshot wrapped : toAdd) {
+        builder.addSnapshot(wrapped);
+      }
+      return builder.discardChanges().build();
     }
 
     private void commitPointer(TableMetadata base, TableMetadata metadata, boolean isCreate) {
