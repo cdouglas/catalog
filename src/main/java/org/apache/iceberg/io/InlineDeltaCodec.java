@@ -211,12 +211,26 @@ public class InlineDeltaCodec {
         catalogBuilder.addManifestToPool(tableId, resolved);
         List<String> refs = new ArrayList<>(
             catalogBuilder.snapshotManifestPaths(tableId, add.snapshotId));
+        // For a new snapshot, initialize refs from the parent snapshot's manifest list
+        // (carry-forward: manifests not in the delta are inherited from the parent)
+        if (refs.isEmpty()) {
+          Snapshot snap = current.snapshot(add.snapshotId);
+          if (snap != null && snap.parentId() != null) {
+            refs.addAll(catalogBuilder.snapshotManifestPaths(tableId, snap.parentId()));
+          }
+        }
         refs.add(resolved.path());
         catalogBuilder.setSnapshotManifests(tableId, add.snapshotId, refs);
       } else if (update instanceof RemoveManifestUpdate) {
         RemoveManifestUpdate rm = (RemoveManifestUpdate) update;
         List<String> refs = new ArrayList<>(
             catalogBuilder.snapshotManifestPaths(tableId, rm.snapshotId));
+        if (refs.isEmpty()) {
+          Snapshot snap = current.snapshot(rm.snapshotId);
+          if (snap != null && snap.parentId() != null) {
+            refs.addAll(catalogBuilder.snapshotManifestPaths(tableId, snap.parentId()));
+          }
+        }
         refs.removeIf(p -> p.endsWith(rm.manifestPathSuffix));
         catalogBuilder.setSnapshotManifests(tableId, rm.snapshotId, refs);
       } else {
