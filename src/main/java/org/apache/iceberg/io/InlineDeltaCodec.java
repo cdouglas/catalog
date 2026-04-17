@@ -231,11 +231,16 @@ public class InlineDeltaCodec {
     }
     for (org.apache.iceberg.Snapshot snap : newMeta.snapshots()) {
       if (!oldSnapIds.contains(snap.snapshotId())) {
+        // InlineSnapshot has null manifestListLocation (no Avro file written);
+        // use empty suffix — the actual ML data is in AddManifestUpdate entries.
         String manifestList = snap.manifestListLocation();
-        String suffix = manifestList;
-        if (manifestListPrefix != null && !manifestListPrefix.isEmpty()
-            && manifestList.startsWith(manifestListPrefix)) {
-          suffix = manifestList.substring(manifestListPrefix.length());
+        String suffix = "";
+        if (manifestList != null) {
+          suffix = manifestList;
+          if (manifestListPrefix != null && !manifestListPrefix.isEmpty()
+              && manifestList.startsWith(manifestListPrefix)) {
+            suffix = manifestList.substring(manifestListPrefix.length());
+          }
         }
         long timestampDelta = snap.timestampMillis() - oldMeta.lastUpdatedMillis();
         int schemaId = snap.schemaId() != null
@@ -1260,6 +1265,9 @@ public class InlineDeltaCodec {
 
   private static void writeString(OutputStream out, int fieldNumber, String value)
       throws IOException {
+    if (value == null) {
+      value = "";
+    }
     byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
     writeLengthDelimited(out, fieldNumber, bytes);
   }
