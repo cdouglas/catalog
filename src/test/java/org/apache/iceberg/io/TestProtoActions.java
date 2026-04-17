@@ -1380,6 +1380,270 @@ public class TestProtoActions {
   }
 
   // ============================================================
+  // ManifestFileEntry codec tests
+  // ============================================================
+
+  @Nested
+  class ManifestFileEntryCodecTests {
+
+    private static final String MANIFEST_PREFIX = "s3://bucket/db/tbl/metadata/";
+
+    @Test
+    void roundtripAllFields() throws Exception {
+      java.nio.ByteBuffer lb = java.nio.ByteBuffer.wrap(new byte[]{1, 2, 3, 4});
+      java.nio.ByteBuffer ub = java.nio.ByteBuffer.wrap(new byte[]{5, 6, 7, 8});
+      java.nio.ByteBuffer km = java.nio.ByteBuffer.wrap(new byte[]{10, 20, 30});
+
+      org.apache.iceberg.ManifestFile original = new TestManifestFile(
+          MANIFEST_PREFIX + "abc-m0.avro", 4096L, 1,
+          org.apache.iceberg.ManifestContent.DATA,
+          7L, 5L, 12345L,
+          10, 90, 3, 100L, 900L, 30L,
+          List.of(new TestPartitionFieldSummary(true, false, lb, ub)),
+          km, 42L);
+
+      byte[] encoded = ProtoCodec.encodeManifestFileEntry(original, MANIFEST_PREFIX);
+      org.apache.iceberg.ManifestFile decoded =
+          ProtoCodec.decodeManifestFileEntry(encoded, MANIFEST_PREFIX);
+
+      assertThat(decoded.path()).isEqualTo(original.path());
+      assertThat(decoded.length()).isEqualTo(original.length());
+      assertThat(decoded.partitionSpecId()).isEqualTo(original.partitionSpecId());
+      assertThat(decoded.content()).isEqualTo(original.content());
+      assertThat(decoded.sequenceNumber()).isEqualTo(original.sequenceNumber());
+      assertThat(decoded.minSequenceNumber()).isEqualTo(original.minSequenceNumber());
+      assertThat(decoded.snapshotId()).isEqualTo(original.snapshotId());
+      assertThat(decoded.addedFilesCount()).isEqualTo(original.addedFilesCount());
+      assertThat(decoded.existingFilesCount()).isEqualTo(original.existingFilesCount());
+      assertThat(decoded.deletedFilesCount()).isEqualTo(original.deletedFilesCount());
+      assertThat(decoded.addedRowsCount()).isEqualTo(original.addedRowsCount());
+      assertThat(decoded.existingRowsCount()).isEqualTo(original.existingRowsCount());
+      assertThat(decoded.deletedRowsCount()).isEqualTo(original.deletedRowsCount());
+      assertThat(decoded.firstRowId()).isEqualTo(original.firstRowId());
+
+      // Partition summaries
+      assertThat(decoded.partitions()).hasSize(1);
+      var pfs = decoded.partitions().get(0);
+      assertThat(pfs.containsNull()).isTrue();
+      assertThat(pfs.containsNaN()).isFalse();
+      assertThat(pfs.lowerBound()).isEqualTo(lb.duplicate());
+      assertThat(pfs.upperBound()).isEqualTo(ub.duplicate());
+
+      // Key metadata
+      assertThat(decoded.keyMetadata()).isEqualTo(km.duplicate());
+    }
+
+    @Test
+    void roundtripMinimalManifest() throws Exception {
+      // Brand-new manifest from FastAppend: many fields are zero/null/default
+      org.apache.iceberg.ManifestFile original = new TestManifestFile(
+          MANIFEST_PREFIX + "def-m0.avro", 1024L, 0,
+          org.apache.iceberg.ManifestContent.DATA,
+          1L, 1L, 99L,
+          5, 0, 0, 50L, 0L, 0L,
+          null, null, null);
+
+      byte[] encoded = ProtoCodec.encodeManifestFileEntry(original, MANIFEST_PREFIX);
+      org.apache.iceberg.ManifestFile decoded =
+          ProtoCodec.decodeManifestFileEntry(encoded, MANIFEST_PREFIX);
+
+      assertThat(decoded.path()).isEqualTo(original.path());
+      assertThat(decoded.length()).isEqualTo(1024L);
+      assertThat(decoded.partitionSpecId()).isEqualTo(0);
+      assertThat(decoded.content()).isEqualTo(org.apache.iceberg.ManifestContent.DATA);
+      assertThat(decoded.sequenceNumber()).isEqualTo(1L);
+      assertThat(decoded.snapshotId()).isEqualTo(99L);
+      assertThat(decoded.addedFilesCount()).isEqualTo(5);
+      assertThat(decoded.existingFilesCount()).isEqualTo(0);
+      assertThat(decoded.deletedFilesCount()).isEqualTo(0);
+      assertThat(decoded.addedRowsCount()).isEqualTo(50L);
+      assertThat(decoded.existingRowsCount()).isEqualTo(0L);
+      assertThat(decoded.deletedRowsCount()).isEqualTo(0L);
+      assertThat(decoded.partitions()).isNull();
+      assertThat(decoded.keyMetadata()).isNull();
+      assertThat(decoded.firstRowId()).isNull();
+    }
+
+    @Test
+    void roundtripDeleteManifest() throws Exception {
+      org.apache.iceberg.ManifestFile original = new TestManifestFile(
+          MANIFEST_PREFIX + "ghi-m0.avro", 2048L, 2,
+          org.apache.iceberg.ManifestContent.DELETES,
+          10L, 8L, 200L,
+          3, 0, 0, 15L, 0L, 0L,
+          null, null, null);
+
+      byte[] encoded = ProtoCodec.encodeManifestFileEntry(original, MANIFEST_PREFIX);
+      org.apache.iceberg.ManifestFile decoded =
+          ProtoCodec.decodeManifestFileEntry(encoded, MANIFEST_PREFIX);
+
+      assertThat(decoded.content()).isEqualTo(org.apache.iceberg.ManifestContent.DELETES);
+      assertThat(decoded.partitionSpecId()).isEqualTo(2);
+    }
+
+    @Test
+    void roundtripMultiplePartitionSummaries() throws Exception {
+      java.nio.ByteBuffer lb1 = java.nio.ByteBuffer.wrap(new byte[]{0});
+      java.nio.ByteBuffer ub1 = java.nio.ByteBuffer.wrap(new byte[]{100});
+      java.nio.ByteBuffer lb2 = java.nio.ByteBuffer.wrap("aaa".getBytes());
+      java.nio.ByteBuffer ub2 = java.nio.ByteBuffer.wrap("zzz".getBytes());
+
+      org.apache.iceberg.ManifestFile original = new TestManifestFile(
+          MANIFEST_PREFIX + "multi-m0.avro", 8192L, 3,
+          org.apache.iceberg.ManifestContent.DATA,
+          5L, 5L, 300L,
+          20, 0, 0, 200L, 0L, 0L,
+          List.of(
+              new TestPartitionFieldSummary(false, true, lb1, ub1),
+              new TestPartitionFieldSummary(true, false, lb2, ub2)),
+          null, null);
+
+      byte[] encoded = ProtoCodec.encodeManifestFileEntry(original, MANIFEST_PREFIX);
+      org.apache.iceberg.ManifestFile decoded =
+          ProtoCodec.decodeManifestFileEntry(encoded, MANIFEST_PREFIX);
+
+      assertThat(decoded.partitions()).hasSize(2);
+      assertThat(decoded.partitions().get(0).containsNull()).isFalse();
+      assertThat(decoded.partitions().get(0).containsNaN()).isTrue();
+      assertThat(decoded.partitions().get(0).lowerBound()).isEqualTo(lb1.duplicate());
+      assertThat(decoded.partitions().get(1).containsNull()).isTrue();
+      assertThat(decoded.partitions().get(1).containsNaN()).isFalse();
+      assertThat(decoded.partitions().get(1).lowerBound()).isEqualTo(lb2.duplicate());
+      assertThat(decoded.partitions().get(1).upperBound()).isEqualTo(ub2.duplicate());
+    }
+
+    @Test
+    void pathPrefixStrippingAndRestore() throws Exception {
+      String prefix = "gs://my-bucket/warehouse/db/tbl/metadata/";
+      String fullPath = prefix + "a1b2c3-m0.avro";
+
+      org.apache.iceberg.ManifestFile original = new TestManifestFile(
+          fullPath, 512L, 0,
+          org.apache.iceberg.ManifestContent.DATA,
+          1L, 1L, 1L,
+          1, 0, 0, 10L, 0L, 0L,
+          null, null, null);
+
+      byte[] encoded = ProtoCodec.encodeManifestFileEntry(original, prefix);
+      org.apache.iceberg.ManifestFile decoded =
+          ProtoCodec.decodeManifestFileEntry(encoded, prefix);
+
+      assertThat(decoded.path()).isEqualTo(fullPath);
+
+      // Verify the suffix was actually stripped (encoded bytes should be smaller)
+      org.apache.iceberg.ManifestFile decodedNoPrefix =
+          ProtoCodec.decodeManifestFileEntry(encoded, "");
+      assertThat(decodedNoPrefix.path()).isEqualTo("a1b2c3-m0.avro");
+    }
+
+    @Test
+    void emptyPrefix() throws Exception {
+      org.apache.iceberg.ManifestFile original = new TestManifestFile(
+          "s3://bucket/path/m0.avro", 100L, 0,
+          org.apache.iceberg.ManifestContent.DATA,
+          1L, 1L, 1L,
+          1, 0, 0, 1L, 0L, 0L,
+          null, null, null);
+
+      byte[] encoded = ProtoCodec.encodeManifestFileEntry(original, "");
+      org.apache.iceberg.ManifestFile decoded =
+          ProtoCodec.decodeManifestFileEntry(encoded, "");
+
+      assertThat(decoded.path()).isEqualTo("s3://bucket/path/m0.avro");
+    }
+  }
+
+  // ============================================================
+  // Test ManifestFile / PartitionFieldSummary implementations
+  // ============================================================
+
+  /** Minimal ManifestFile for test construction. */
+  static class TestManifestFile implements org.apache.iceberg.ManifestFile {
+    private final String path;
+    private final long length;
+    private final int specId;
+    private final org.apache.iceberg.ManifestContent content;
+    private final long sequenceNumber;
+    private final long minSequenceNumber;
+    private final Long snapshotId;
+    private final Integer addedFilesCount;
+    private final Integer existingFilesCount;
+    private final Integer deletedFilesCount;
+    private final Long addedRowsCount;
+    private final Long existingRowsCount;
+    private final Long deletedRowsCount;
+    private final List<org.apache.iceberg.ManifestFile.PartitionFieldSummary> partitions;
+    private final java.nio.ByteBuffer keyMetadata;
+    private final Long firstRowId;
+
+    TestManifestFile(
+        String path, long length, int specId,
+        org.apache.iceberg.ManifestContent content,
+        long sequenceNumber, long minSequenceNumber, Long snapshotId,
+        int addedFilesCount, int existingFilesCount, int deletedFilesCount,
+        long addedRowsCount, long existingRowsCount, long deletedRowsCount,
+        List<org.apache.iceberg.ManifestFile.PartitionFieldSummary> partitions,
+        java.nio.ByteBuffer keyMetadata, Long firstRowId) {
+      this.path = path;
+      this.length = length;
+      this.specId = specId;
+      this.content = content;
+      this.sequenceNumber = sequenceNumber;
+      this.minSequenceNumber = minSequenceNumber;
+      this.snapshotId = snapshotId;
+      this.addedFilesCount = addedFilesCount;
+      this.existingFilesCount = existingFilesCount;
+      this.deletedFilesCount = deletedFilesCount;
+      this.addedRowsCount = addedRowsCount;
+      this.existingRowsCount = existingRowsCount;
+      this.deletedRowsCount = deletedRowsCount;
+      this.partitions = partitions;
+      this.keyMetadata = keyMetadata;
+      this.firstRowId = firstRowId;
+    }
+
+    @Override public String path() { return path; }
+    @Override public long length() { return length; }
+    @Override public int partitionSpecId() { return specId; }
+    @Override public org.apache.iceberg.ManifestContent content() { return content; }
+    @Override public long sequenceNumber() { return sequenceNumber; }
+    @Override public long minSequenceNumber() { return minSequenceNumber; }
+    @Override public Long snapshotId() { return snapshotId; }
+    @Override public Integer addedFilesCount() { return addedFilesCount; }
+    @Override public Integer existingFilesCount() { return existingFilesCount; }
+    @Override public Integer deletedFilesCount() { return deletedFilesCount; }
+    @Override public Long addedRowsCount() { return addedRowsCount; }
+    @Override public Long existingRowsCount() { return existingRowsCount; }
+    @Override public Long deletedRowsCount() { return deletedRowsCount; }
+    @Override public List<org.apache.iceberg.ManifestFile.PartitionFieldSummary> partitions() { return partitions; }
+    @Override public java.nio.ByteBuffer keyMetadata() { return keyMetadata; }
+    @Override public Long firstRowId() { return firstRowId; }
+    @Override public org.apache.iceberg.ManifestFile copy() { return this; }
+  }
+
+  /** Minimal PartitionFieldSummary for test construction. */
+  static class TestPartitionFieldSummary implements org.apache.iceberg.ManifestFile.PartitionFieldSummary {
+    private final boolean containsNull;
+    private final Boolean containsNaN;
+    private final java.nio.ByteBuffer lowerBound;
+    private final java.nio.ByteBuffer upperBound;
+
+    TestPartitionFieldSummary(boolean containsNull, boolean containsNaN,
+        java.nio.ByteBuffer lowerBound, java.nio.ByteBuffer upperBound) {
+      this.containsNull = containsNull;
+      this.containsNaN = containsNaN;
+      this.lowerBound = lowerBound;
+      this.upperBound = upperBound;
+    }
+
+    @Override public boolean containsNull() { return containsNull; }
+    @Override public Boolean containsNaN() { return containsNaN; }
+    @Override public java.nio.ByteBuffer lowerBound() { return lowerBound; }
+    @Override public java.nio.ByteBuffer upperBound() { return upperBound; }
+    @Override public org.apache.iceberg.ManifestFile.PartitionFieldSummary copy() { return this; }
+  }
+
+  // ============================================================
   // Randomized tests (ported from TestLogCatalogFormat)
   // ============================================================
 

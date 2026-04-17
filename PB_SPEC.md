@@ -106,7 +106,40 @@ message InlineTable {
   int32  namespace_id         = 3;
   string name                 = 4;
   bytes  metadata             = 5;  // TableMetadata as JSON bytes
-  string manifest_list_prefix = 6;  // per-table dictionary: shared manifest path prefix
+  string manifest_list_prefix = 6;  // per-table dictionary: shared manifest file path prefix
+  repeated ManifestFileEntry     manifest_pool  = 7;  // unique manifests for this table
+  repeated SnapshotManifestRefs  snapshot_refs  = 8;  // per-snapshot index lists into pool
+}
+
+message ManifestFileEntry {
+  string manifest_path_suffix   = 1;   // relative to manifest_list_prefix
+  int64  manifest_length        = 2;
+  int32  partition_spec_id      = 3;
+  int32  content                = 4;   // 0=data, 1=deletes
+  int64  sequence_number        = 5;
+  int64  min_sequence_number    = 6;
+  int64  added_snapshot_id      = 7;   // fixed64 encoding
+  int32  added_files_count      = 8;
+  int32  existing_files_count   = 9;
+  int32  deleted_files_count    = 10;
+  int64  added_rows_count       = 11;
+  int64  existing_rows_count    = 12;
+  int64  deleted_rows_count     = 13;
+  repeated PartitionFieldSummaryEntry partitions = 14;
+  bytes  key_metadata           = 15;
+  int64  first_row_id           = 16;
+}
+
+message PartitionFieldSummaryEntry {
+  bool  contains_null = 1;
+  bool  contains_nan  = 2;
+  bytes lower_bound   = 3;
+  bytes upper_bound   = 4;
+}
+
+message SnapshotManifestRefs {
+  int64          snapshot_id  = 1;
+  repeated int32 pool_indices = 2;  // positions in manifest_pool
 }
 ```
 
@@ -114,6 +147,12 @@ A table ID appears in either `tables` (pointer mode) or `inline_tables` (inline 
 never both. Inline tables store the full `TableMetadata` as opaque JSON bytes in the
 checkpoint and carry a `manifest_list_prefix` for efficient snapshot delta encoding.
 Pointer-mode tables store only an external metadata file location.
+
+When inline manifest lists are enabled (`fileio.catalog.inline.manifests=true`), the
+checkpoint also carries a pool of unique `ManifestFileEntry` records per table (field 7)
+and per-snapshot index arrays (field 8) referencing pool positions. Each unique manifest
+file is stored once in the pool; consecutive snapshots share most entries. Manifest file
+paths are stored as suffixes relative to `manifest_list_prefix` (field 6).
 
 ### Transaction
 

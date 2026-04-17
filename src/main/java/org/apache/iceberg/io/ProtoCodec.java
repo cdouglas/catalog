@@ -30,9 +30,13 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import org.apache.iceberg.ManifestContent;
+import org.apache.iceberg.ManifestFile;
+import org.apache.iceberg.ManifestFile.PartitionFieldSummary;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 
 /**
  * Protobuf encoding/decoding for catalog state.
@@ -52,6 +56,7 @@ public class ProtoCodec {
 
   // Wire types
   private static final int WIRE_VARINT = 0;
+  private static final int WIRE_64BIT = 1;
   private static final int WIRE_LENGTH_DELIMITED = 2;
 
   // Checkpoint field numbers (from catalog.proto)
@@ -89,6 +94,36 @@ public class ProtoCodec {
   private static final int INLINE_TBL_NAME = 4;
   private static final int INLINE_TBL_METADATA = 5;
   private static final int INLINE_TBL_MANIFEST_PREFIX = 6;
+  private static final int INLINE_TBL_MANIFEST_POOL = 7;
+  private static final int INLINE_TBL_SNAPSHOT_REFS = 8;
+
+  // ManifestFileEntry field numbers
+  private static final int MF_PATH_SUFFIX = 1;
+  private static final int MF_LENGTH = 2;
+  private static final int MF_SPEC_ID = 3;
+  private static final int MF_CONTENT = 4;
+  private static final int MF_SEQ_NUM = 5;
+  private static final int MF_MIN_SEQ_NUM = 6;
+  private static final int MF_SNAPSHOT_ID = 7;
+  private static final int MF_ADDED_FILES = 8;
+  private static final int MF_EXISTING_FILES = 9;
+  private static final int MF_DELETED_FILES = 10;
+  private static final int MF_ADDED_ROWS = 11;
+  private static final int MF_EXISTING_ROWS = 12;
+  private static final int MF_DELETED_ROWS = 13;
+  private static final int MF_PARTITIONS = 14;
+  private static final int MF_KEY_METADATA = 15;
+  private static final int MF_FIRST_ROW_ID = 16;
+
+  // PartitionFieldSummaryEntry field numbers
+  private static final int PFS_CONTAINS_NULL = 1;
+  private static final int PFS_CONTAINS_NAN = 2;
+  private static final int PFS_LOWER_BOUND = 3;
+  private static final int PFS_UPPER_BOUND = 4;
+
+  // SnapshotManifestRefs field numbers
+  private static final int SMR_SNAPSHOT_ID = 1;
+  private static final int SMR_POOL_INDICES = 2;
 
   // Transaction field numbers
   private static final int TXN_ID = 1;
@@ -975,12 +1010,33 @@ public class ProtoCodec {
     out.write(value);
   }
 
+  private static void writeVarint64(OutputStream out, int fieldNumber, long value) throws IOException {
+    writeRawVarint(out, (fieldNumber << 3) | WIRE_VARINT);
+    writeRawVarint64(out, value);
+  }
+
+  private static void writeFixed64(OutputStream out, int fieldNumber, long value) throws IOException {
+    writeRawVarint(out, (fieldNumber << 3) | WIRE_64BIT);
+    for (int i = 0; i < 8; i++) {
+      out.write((int) (value & 0xFF));
+      value >>>= 8;
+    }
+  }
+
   private static void writeRawVarint(OutputStream out, int value) throws IOException {
     while ((value & ~0x7F) != 0) {
       out.write((value & 0x7F) | 0x80);
       value >>>= 7;
     }
     out.write(value);
+  }
+
+  private static void writeRawVarint64(OutputStream out, long value) throws IOException {
+    while ((value & ~0x7FL) != 0) {
+      out.write((int) (value & 0x7F) | 0x80);
+      value >>>= 7;
+    }
+    out.write((int) value);
   }
 
   private static int readVarint(InputStream in) throws IOException {
@@ -1017,17 +1073,43 @@ public class ProtoCodec {
     return bytes;
   }
 
+  private static long readVarint64(InputStream in) throws IOException {
+    long result = 0;
+    int shift = 0, b;
+    do {
+      b = in.read();
+      if (b < 0) {
+        throw new IOException("Unexpected end of stream");
+      }
+      result |= (long) (b & 0x7F) << shift;
+      shift += 7;
+    } while ((b & 0x80) != 0);
+    return result;
+  }
+
+  private static long readFixed64(InputStream in) throws IOException {
+    long result = 0;
+    for (int i = 0; i < 8; i++) {
+      int b = in.read();
+      if (b < 0) {
+        throw new IOException("Unexpected end of stream");
+      }
+      result |= (long) (b & 0xFF) << (i * 8);
+    }
+    return result;
+  }
+
   private static void skipField(InputStream in, int wireType) throws IOException {
     switch (wireType) {
       case WIRE_VARINT:
-        readVarint(in);
+        readVarint64(in);
+        break;
+      case WIRE_64BIT:
+        in.skip(8);
         break;
       case WIRE_LENGTH_DELIMITED:
         int length = readVarint(in);
         in.skip(length);
-        break;
-      case 1: // 64-bit
-        in.skip(8);
         break;
       case 5: // 32-bit
         in.skip(4);
@@ -1049,6 +1131,311 @@ public class ProtoCodec {
     long msb = buffer.getLong();
     long lsb = buffer.getLong();
     return new UUID(msb, lsb);
+  }
+
+  // ============================================================
+  // ManifestFile encode/decode
+  // ============================================================
+
+  /**
+   * Encodes a ManifestFile into protobuf-compatible bytes matching ManifestFileEntry.
+   * The manifest path is stored as a suffix by stripping the given prefix.
+   */
+  public static byte[] encodeManifestFileEntry(ManifestFile manifest, String pathPrefix)
+      throws IOException {
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+    String suffix = manifest.path();
+    if (pathPrefix != null && !pathPrefix.isEmpty() && suffix.startsWith(pathPrefix)) {
+      suffix = suffix.substring(pathPrefix.length());
+    }
+    writeString(out, MF_PATH_SUFFIX, suffix);
+    writeVarint64(out, MF_LENGTH, manifest.length());
+    if (manifest.partitionSpecId() != 0) {
+      writeVarint(out, MF_SPEC_ID, manifest.partitionSpecId());
+    }
+    if (manifest.content() != ManifestContent.DATA) {
+      writeVarint(out, MF_CONTENT, manifest.content().id());
+    }
+    if (manifest.sequenceNumber() != 0) {
+      writeVarint64(out, MF_SEQ_NUM, manifest.sequenceNumber());
+    }
+    if (manifest.minSequenceNumber() != 0) {
+      writeVarint64(out, MF_MIN_SEQ_NUM, manifest.minSequenceNumber());
+    }
+    if (manifest.snapshotId() != null) {
+      writeFixed64(out, MF_SNAPSHOT_ID, manifest.snapshotId());
+    }
+    if (manifest.addedFilesCount() != null && manifest.addedFilesCount() != 0) {
+      writeVarint(out, MF_ADDED_FILES, manifest.addedFilesCount());
+    }
+    if (manifest.existingFilesCount() != null && manifest.existingFilesCount() != 0) {
+      writeVarint(out, MF_EXISTING_FILES, manifest.existingFilesCount());
+    }
+    if (manifest.deletedFilesCount() != null && manifest.deletedFilesCount() != 0) {
+      writeVarint(out, MF_DELETED_FILES, manifest.deletedFilesCount());
+    }
+    if (manifest.addedRowsCount() != null && manifest.addedRowsCount() != 0) {
+      writeVarint64(out, MF_ADDED_ROWS, manifest.addedRowsCount());
+    }
+    if (manifest.existingRowsCount() != null && manifest.existingRowsCount() != 0) {
+      writeVarint64(out, MF_EXISTING_ROWS, manifest.existingRowsCount());
+    }
+    if (manifest.deletedRowsCount() != null && manifest.deletedRowsCount() != 0) {
+      writeVarint64(out, MF_DELETED_ROWS, manifest.deletedRowsCount());
+    }
+    if (manifest.partitions() != null) {
+      for (PartitionFieldSummary pfs : manifest.partitions()) {
+        byte[] pfsBytes = encodePartitionFieldSummary(pfs);
+        writeLengthDelimited(out, MF_PARTITIONS, pfsBytes);
+      }
+    }
+    if (manifest.keyMetadata() != null) {
+      byte[] km = new byte[manifest.keyMetadata().remaining()];
+      manifest.keyMetadata().duplicate().get(km);
+      writeBytes(out, MF_KEY_METADATA, km);
+    }
+    if (manifest.firstRowId() != null && manifest.firstRowId() != 0) {
+      writeVarint64(out, MF_FIRST_ROW_ID, manifest.firstRowId());
+    }
+
+    return out.toByteArray();
+  }
+
+  /**
+   * Decodes a ManifestFileEntry from protobuf bytes, prepending the path prefix.
+   */
+  public static ManifestFile decodeManifestFileEntry(byte[] bytes, String pathPrefix)
+      throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    String pathSuffix = "";
+    long length = 0;
+    int specId = 0;
+    int content = 0;
+    long seqNum = 0;
+    long minSeqNum = 0;
+    Long snapshotId = null;
+    int addedFiles = 0;
+    int existingFiles = 0;
+    int deletedFiles = 0;
+    long addedRows = 0;
+    long existingRows = 0;
+    long deletedRows = 0;
+    List<PartitionFieldSummary> partitions = new ArrayList<>();
+    byte[] keyMetadata = null;
+    Long firstRowId = null;
+
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      int fieldNumber = tag >>> 3;
+      int wireType = tag & 0x7;
+      switch (fieldNumber) {
+        case MF_PATH_SUFFIX:
+          pathSuffix = readString(in);
+          break;
+        case MF_LENGTH:
+          length = readVarint64(in);
+          break;
+        case MF_SPEC_ID:
+          specId = readVarint(in);
+          break;
+        case MF_CONTENT:
+          content = readVarint(in);
+          break;
+        case MF_SEQ_NUM:
+          seqNum = readVarint64(in);
+          break;
+        case MF_MIN_SEQ_NUM:
+          minSeqNum = readVarint64(in);
+          break;
+        case MF_SNAPSHOT_ID:
+          snapshotId = readFixed64(in);
+          break;
+        case MF_ADDED_FILES:
+          addedFiles = readVarint(in);
+          break;
+        case MF_EXISTING_FILES:
+          existingFiles = readVarint(in);
+          break;
+        case MF_DELETED_FILES:
+          deletedFiles = readVarint(in);
+          break;
+        case MF_ADDED_ROWS:
+          addedRows = readVarint64(in);
+          break;
+        case MF_EXISTING_ROWS:
+          existingRows = readVarint64(in);
+          break;
+        case MF_DELETED_ROWS:
+          deletedRows = readVarint64(in);
+          break;
+        case MF_PARTITIONS:
+          partitions.add(decodePartitionFieldSummary(readLengthDelimitedBytes(in)));
+          break;
+        case MF_KEY_METADATA:
+          keyMetadata = readLengthDelimitedBytes(in);
+          break;
+        case MF_FIRST_ROW_ID:
+          firstRowId = readVarint64(in);
+          break;
+        default:
+          skipField(in, wireType);
+      }
+    }
+
+    String fullPath = (pathPrefix != null ? pathPrefix : "") + pathSuffix;
+    return new DecodedManifestFile(
+        fullPath, length, specId, content, seqNum, minSeqNum, snapshotId,
+        addedFiles, existingFiles, deletedFiles, addedRows, existingRows, deletedRows,
+        partitions.isEmpty() ? null : ImmutableList.copyOf(partitions),
+        keyMetadata, firstRowId);
+  }
+
+  private static byte[] encodePartitionFieldSummary(PartitionFieldSummary pfs) throws IOException {
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    if (pfs.containsNull()) {
+      writeVarint(out, PFS_CONTAINS_NULL, 1);
+    }
+    if (pfs.containsNaN() != null && pfs.containsNaN()) {
+      writeVarint(out, PFS_CONTAINS_NAN, 1);
+    }
+    if (pfs.lowerBound() != null) {
+      byte[] lb = new byte[pfs.lowerBound().remaining()];
+      pfs.lowerBound().duplicate().get(lb);
+      writeBytes(out, PFS_LOWER_BOUND, lb);
+    }
+    if (pfs.upperBound() != null) {
+      byte[] ub = new byte[pfs.upperBound().remaining()];
+      pfs.upperBound().duplicate().get(ub);
+      writeBytes(out, PFS_UPPER_BOUND, ub);
+    }
+    return out.toByteArray();
+  }
+
+  private static PartitionFieldSummary decodePartitionFieldSummary(byte[] bytes) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    boolean containsNull = false;
+    boolean containsNaN = false;
+    byte[] lowerBound = null;
+    byte[] upperBound = null;
+
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      int fieldNumber = tag >>> 3;
+      int wireType = tag & 0x7;
+      switch (fieldNumber) {
+        case PFS_CONTAINS_NULL:
+          containsNull = readVarint(in) != 0;
+          break;
+        case PFS_CONTAINS_NAN:
+          containsNaN = readVarint(in) != 0;
+          break;
+        case PFS_LOWER_BOUND:
+          lowerBound = readLengthDelimitedBytes(in);
+          break;
+        case PFS_UPPER_BOUND:
+          upperBound = readLengthDelimitedBytes(in);
+          break;
+        default:
+          skipField(in, wireType);
+      }
+    }
+    return new DecodedPartitionFieldSummary(
+        containsNull, containsNaN,
+        lowerBound != null ? ByteBuffer.wrap(lowerBound) : null,
+        upperBound != null ? ByteBuffer.wrap(upperBound) : null);
+  }
+
+  // ============================================================
+  // Decoded ManifestFile / PartitionFieldSummary implementations
+  // ============================================================
+
+  /**
+   * Lightweight ManifestFile for data decoded from protobuf. Holds all fields
+   * in memory; no Avro dependency.
+   */
+  public static class DecodedManifestFile implements ManifestFile {
+    private final String path;
+    private final long length;
+    private final int specId;
+    private final ManifestContent content;
+    private final long sequenceNumber;
+    private final long minSequenceNumber;
+    private final Long snapshotId;
+    private final Integer addedFilesCount;
+    private final Integer existingFilesCount;
+    private final Integer deletedFilesCount;
+    private final Long addedRowsCount;
+    private final Long existingRowsCount;
+    private final Long deletedRowsCount;
+    private final List<PartitionFieldSummary> partitions;
+    private final ByteBuffer keyMetadata;
+    private final Long firstRowId;
+
+    DecodedManifestFile(
+        String path, long length, int specId, int content,
+        long sequenceNumber, long minSequenceNumber, Long snapshotId,
+        int addedFilesCount, int existingFilesCount, int deletedFilesCount,
+        long addedRowsCount, long existingRowsCount, long deletedRowsCount,
+        List<PartitionFieldSummary> partitions, byte[] keyMetadata, Long firstRowId) {
+      this.path = path;
+      this.length = length;
+      this.specId = specId;
+      this.content = ManifestContent.values()[content];
+      this.sequenceNumber = sequenceNumber;
+      this.minSequenceNumber = minSequenceNumber;
+      this.snapshotId = snapshotId;
+      this.addedFilesCount = addedFilesCount;
+      this.existingFilesCount = existingFilesCount;
+      this.deletedFilesCount = deletedFilesCount;
+      this.addedRowsCount = addedRowsCount;
+      this.existingRowsCount = existingRowsCount;
+      this.deletedRowsCount = deletedRowsCount;
+      this.partitions = partitions;
+      this.keyMetadata = keyMetadata != null ? ByteBuffer.wrap(keyMetadata) : null;
+      this.firstRowId = firstRowId;
+    }
+
+    @Override public String path() { return path; }
+    @Override public long length() { return length; }
+    @Override public int partitionSpecId() { return specId; }
+    @Override public ManifestContent content() { return content; }
+    @Override public long sequenceNumber() { return sequenceNumber; }
+    @Override public long minSequenceNumber() { return minSequenceNumber; }
+    @Override public Long snapshotId() { return snapshotId; }
+    @Override public Integer addedFilesCount() { return addedFilesCount; }
+    @Override public Integer existingFilesCount() { return existingFilesCount; }
+    @Override public Integer deletedFilesCount() { return deletedFilesCount; }
+    @Override public Long addedRowsCount() { return addedRowsCount; }
+    @Override public Long existingRowsCount() { return existingRowsCount; }
+    @Override public Long deletedRowsCount() { return deletedRowsCount; }
+    @Override public List<PartitionFieldSummary> partitions() { return partitions; }
+    @Override public ByteBuffer keyMetadata() { return keyMetadata; }
+    @Override public Long firstRowId() { return firstRowId; }
+    @Override public ManifestFile copy() { return this; }
+  }
+
+  /** Lightweight PartitionFieldSummary decoded from protobuf. */
+  public static class DecodedPartitionFieldSummary implements PartitionFieldSummary {
+    private final boolean containsNull;
+    private final Boolean containsNaN;
+    private final ByteBuffer lowerBound;
+    private final ByteBuffer upperBound;
+
+    DecodedPartitionFieldSummary(
+        boolean containsNull, boolean containsNaN,
+        ByteBuffer lowerBound, ByteBuffer upperBound) {
+      this.containsNull = containsNull;
+      this.containsNaN = containsNaN;
+      this.lowerBound = lowerBound;
+      this.upperBound = upperBound;
+    }
+
+    @Override public boolean containsNull() { return containsNull; }
+    @Override public Boolean containsNaN() { return containsNaN; }
+    @Override public ByteBuffer lowerBound() { return lowerBound; }
+    @Override public ByteBuffer upperBound() { return upperBound; }
+    @Override public PartitionFieldSummary copy() { return this; }
   }
 
   // ============================================================
