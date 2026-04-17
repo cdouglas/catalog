@@ -20,10 +20,13 @@ package org.apache.iceberg.io;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
+import org.apache.iceberg.ManifestListSink;
+import org.apache.iceberg.ManifestListSink.ManifestListDelta;
 import org.apache.hadoop.conf.Configurable;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.BaseMetastoreCatalog;
@@ -56,6 +59,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
   // TODO buildTable overridden in BaseMetastoreCatalog?
 
   private static final String INLINE_ENABLED = "fileio.catalog.inline";
+  private static final String INLINE_MANIFESTS = "fileio.catalog.inline.manifests";
 
   private Configuration conf; // TODO: delete
   private String catalogName = "fileio";
@@ -105,6 +109,15 @@ public class FileIOCatalog extends BaseMetastoreCatalog
     if (name != null) {
       catalogName = name;
     }
+
+    // Validate config: inline.manifests requires inline
+    boolean inlineEnabled = Boolean.parseBoolean(
+        properties.getOrDefault(INLINE_ENABLED, "false"));
+    boolean inlineManifests = Boolean.parseBoolean(
+        properties.getOrDefault(INLINE_MANIFESTS, "false"));
+    Preconditions.checkArgument(
+        !inlineManifests || inlineEnabled,
+        "fileio.catalog.inline.manifests=true requires fileio.catalog.inline=true");
 
     warehouseLocation = properties.get(CatalogProperties.WAREHOUSE_LOCATION);
     if (null == catalogLocation) {
@@ -171,6 +184,12 @@ public class FileIOCatalog extends BaseMetastoreCatalog
   protected TableOperations newTableOps(TableIdentifier tableIdentifier) {
     boolean inline = Boolean.parseBoolean(
         catalogProperties.getOrDefault(INLINE_ENABLED, "false"));
+    boolean inlineManifests = Boolean.parseBoolean(
+        catalogProperties.getOrDefault(INLINE_MANIFESTS, "false"));
+    if (inlineManifests) {
+      return new InlineManifestTableOperations(
+          tableIdentifier, catalogLocation, format, fileIO, inline);
+    }
     return new FileIOTableOperations(
         tableIdentifier, catalogLocation, format, fileIO, inline);
   }
@@ -178,6 +197,12 @@ public class FileIOCatalog extends BaseMetastoreCatalog
   FileIOTableOperations newTableOps(TableIdentifier tableIdentifier, CatalogFile catalogFile) {
     boolean inline = Boolean.parseBoolean(
         catalogProperties.getOrDefault(INLINE_ENABLED, "false"));
+    boolean inlineManifests = Boolean.parseBoolean(
+        catalogProperties.getOrDefault(INLINE_MANIFESTS, "false"));
+    if (inlineManifests) {
+      return new InlineManifestTableOperations(
+          tableIdentifier, catalogLocation, format, fileIO, inline, catalogFile);
+    }
     return new FileIOTableOperations(
         tableIdentifier, catalogLocation, format, fileIO, inline, catalogFile);
   }
@@ -419,6 +444,44 @@ public class FileIOCatalog extends BaseMetastoreCatalog
             .updateTable(tableId, newMetadataLocation)
             .commit(io());
       }
+    }
+  }
+
+  /**
+   * Extension of FileIOTableOperations that also implements ManifestListSink,
+   * enabling SnapshotProducer to hand off manifest list deltas instead of writing
+   * snap-*.avro files. Activated when fileio.catalog.inline.manifests=true.
+   */
+  static class InlineManifestTableOperations extends FileIOTableOperations
+      implements ManifestListSink {
+
+    private final Map<Long, ManifestListDelta> stagedDeltas = new LinkedHashMap<>();
+
+    InlineManifestTableOperations(
+        TableIdentifier tableId, String catalogLocation,
+        CatalogFormat format, SupportsAtomicOperations fileIO, boolean inlineEnabled) {
+      super(tableId, catalogLocation, format, fileIO, inlineEnabled);
+    }
+
+    InlineManifestTableOperations(
+        TableIdentifier tableId, String catalogLocation,
+        CatalogFormat format, SupportsAtomicOperations fileIO,
+        boolean inlineEnabled, CatalogFile catalogFile) {
+      super(tableId, catalogLocation, format, fileIO, inlineEnabled, catalogFile);
+    }
+
+    @Override
+    public void stageManifestListDelta(
+        long sequenceNumber, long snapshotId, Long parentSnapshotId,
+        Long nextRowId, ManifestListDelta delta, Long nextRowIdAfter) {
+      stagedDeltas.put(snapshotId, delta);
+    }
+
+    /** Returns and clears all staged manifest list deltas. */
+    Map<Long, ManifestListDelta> drainStagedDeltas() {
+      Map<Long, ManifestListDelta> result = new LinkedHashMap<>(stagedDeltas);
+      stagedDeltas.clear();
+      return result;
     }
   }
 

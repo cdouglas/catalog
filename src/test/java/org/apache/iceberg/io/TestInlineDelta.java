@@ -496,6 +496,64 @@ public class TestInlineDelta {
   }
 
   // ============================================================
+  // InlineManifestTableOperations tests
+  // ============================================================
+
+  @Nested
+  class InlineManifestTableOpsTests {
+
+    @Test
+    void sinkStagesAndDrains() {
+      var ops = new FileIOCatalog.InlineManifestTableOperations(
+          org.apache.iceberg.catalog.TableIdentifier.of("db", "tbl"),
+          "mem:///catalog", new ProtoCatalogFormat(), null, true);
+
+      org.apache.iceberg.ManifestFile m1 = new TestProtoActions.TestManifestFile(
+          "s3://b/m1.avro", 1024, 0, org.apache.iceberg.ManifestContent.DATA,
+          1, 1, 100L, 5, 0, 0, 50L, 0L, 0L, null, null, null);
+
+      ops.stageManifestListDelta(1L, 100L, null, null,
+          new org.apache.iceberg.ManifestListSink.ManifestListDelta(
+              List.of(m1), List.of()),
+          null);
+      ops.stageManifestListDelta(2L, 200L, 100L, null,
+          new org.apache.iceberg.ManifestListSink.ManifestListDelta(
+              List.of(m1), List.of("s3://b/old.avro")),
+          null);
+
+      var drained = ops.drainStagedDeltas();
+      assertThat(drained).hasSize(2);
+      assertThat(drained.get(100L).added()).hasSize(1);
+      assertThat(drained.get(100L).removedPaths()).isEmpty();
+      assertThat(drained.get(200L).removedPaths()).containsExactly("s3://b/old.avro");
+
+      // drain clears
+      assertThat(ops.drainStagedDeltas()).isEmpty();
+    }
+
+    @Test
+    void isInstanceOfManifestListSink() {
+      var ops = new FileIOCatalog.InlineManifestTableOperations(
+          org.apache.iceberg.catalog.TableIdentifier.of("db", "tbl"),
+          "mem:///catalog", new ProtoCatalogFormat(), null, true);
+      assertThat(ops).isInstanceOf(org.apache.iceberg.ManifestListSink.class);
+    }
+
+    @Test
+    void configValidationRejectsManifestsWithoutInline() {
+      org.assertj.core.api.Assertions.assertThatThrownBy(() -> {
+        FileIOCatalog catalog = new FileIOCatalog();
+        Map<String, String> props = new java.util.HashMap<>();
+        props.put("fileio.catalog.inline", "false");
+        props.put("fileio.catalog.inline.manifests", "true");
+        props.put(org.apache.iceberg.CatalogProperties.WAREHOUSE_LOCATION, "mem:///wh");
+        catalog.initialize("test", props);
+      }).isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("fileio.catalog.inline.manifests=true requires");
+    }
+  }
+
+  // ============================================================
   // Manifest list delta tests
   // ============================================================
 
