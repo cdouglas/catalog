@@ -143,7 +143,7 @@ handles mixed snapshots: `InlineSnapshot` for those with inline data,
 - **Tests:** round-trip a `GenericManifestFile` through encode/decode;
   verify all 16 fields survive including partition summaries.
 
-**Status:** Pending
+**Status:** Complete
 
 ---
 
@@ -173,7 +173,7 @@ per-snapshot manifest references. Checkpoint read/write includes ML data.
   - Empty manifest pool round-trip (backward compat)
   - Multiple tables with independent pools
 
-**Status:** Pending
+**Status:** Complete
 
 ---
 
@@ -235,7 +235,7 @@ Encode/decode round-trips. Apply updates to `ProtoCatalogFile` state.
   - Encode/decode round-trip for both types
   - Apply: pool grows on add, snapshot refs update on remove
 
-**Status:** Pending
+**Status:** Complete
 
 ---
 
@@ -271,7 +271,7 @@ and stages manifest list deltas. The catalog property gates its activation.
 - **Tests:** Unit test that `ManifestListSink.stageManifestListDelta` stashes
   deltas correctly; drain returns and clears.
 
-**Status:** Pending
+**Status:** Complete
 
 ---
 
@@ -291,7 +291,7 @@ to the intention record alongside the TM delta.
 - **Tests:** mock the sink, verify that a FastAppend commit through the
   inline path produces a delta with both TM and ML updates.
 
-**Status:** Pending
+**Status:** Complete
 
 ---
 
@@ -315,7 +315,7 @@ wrap each such snapshot with `InlineSnapshot`.
   verify `snapshot.allManifests(io)` returns correct list without reading
   any `snap-*.avro` file.
 
-**Status:** Pending
+**Status:** Complete
 
 ---
 
@@ -326,7 +326,7 @@ all catalog operations produce identical results regardless of inline mode.
 
 See "Parameterized Test Strategy" section below for details.
 
-**Status:** Pending
+**Status:** Complete
 
 ---
 
@@ -537,4 +537,10 @@ Key metrics per experiment:
 
 | Date | Stage | Notes |
 |------|-------|-------|
-| -- | -- | -- |
+| 2026-04-16 | Stage 1 | ManifestFileEntry/PartitionFieldSummaryEntry/SnapshotManifestRefs protos, ProtoCodec encode/decode, DecodedManifestFile. 6 tests |
+| 2026-04-16 | Stage 2 | ProtoCatalogFile manifest pool + snapshot refs. Checkpoint encode/decode. 3 tests |
+| 2026-04-17 | Stage 3 | AddManifestUpdate/RemoveManifestUpdate DeltaUpdate types, attachManifestDelta helper. 5 tests |
+| 2026-04-17 | Stage 4 | InlineManifestTableOperations + ManifestListSink, feature flag wiring, config validation. 3 tests |
+| 2026-04-17 | Stage 5 | commitInline drains staged ML deltas, attaches to intention record |
+| 2026-04-17 | Stage 6 | loadFromCatalogFile wraps snapshots with InlineSnapshot via wrapInlineManifests() |
+| 2026-04-17 | Stage 7 | MemoryFileIO, InlineConfig enum, end-to-end tests per config (BASELINE/TM_ONLY/TM_ML). 4 tests |
