@@ -31,6 +31,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.SchemaParser;
 import org.apache.iceberg.SortOrder;
@@ -72,6 +73,14 @@ public class InlineDeltaCodec {
   private static final int UPDATE_SET_DEFAULT_SORT_ORDER = 9;
   private static final int UPDATE_SET_PROPERTIES = 10;
   private static final int UPDATE_SET_TABLE_LOCATION = 11;
+
+  // AddManifestDelta / RemoveManifestDelta field numbers
+  private static final int UPDATE_ADD_MANIFEST = 12;
+  private static final int UPDATE_REMOVE_MANIFEST = 13;
+  private static final int ADD_MF_SNAPSHOT_ID = 1;
+  private static final int ADD_MF_MANIFEST = 2;
+  private static final int REMOVE_MF_SNAPSHOT_ID = 1;
+  private static final int REMOVE_MF_PATH_SUFFIX = 2;
 
   // SetTableProperties field numbers
   private static final int SET_PROPS_UPDATED = 1;
@@ -642,6 +651,72 @@ public class InlineDeltaCodec {
     }
   }
 
+  /**
+   * Adds a ManifestFile to a snapshot's inline manifest list. During log replay, this
+   * adds the manifest to the table's pool and appends it to the snapshot's reference list.
+   */
+  public static class AddManifestUpdate implements DeltaUpdate {
+    public final long snapshotId;
+    public final ManifestFile manifest;
+    public final String pathPrefix;
+
+    public AddManifestUpdate(long snapshotId, ManifestFile manifest, String pathPrefix) {
+      this.snapshotId = snapshotId;
+      this.manifest = manifest;
+      this.pathPrefix = pathPrefix;
+    }
+
+    @Override
+    public void applyTo(TableMetadata.Builder builder) {
+      // ML deltas are applied to ProtoCatalogFile.Builder, not TableMetadata.Builder.
+      // This is a no-op here; handled by applyManifestDelta.
+    }
+  }
+
+  /**
+   * Removes a ManifestFile from a snapshot's inline manifest list by path suffix.
+   */
+  public static class RemoveManifestUpdate implements DeltaUpdate {
+    public final long snapshotId;
+    public final String manifestPathSuffix;
+
+    public RemoveManifestUpdate(long snapshotId, String manifestPathSuffix) {
+      this.snapshotId = snapshotId;
+      this.manifestPathSuffix = manifestPathSuffix;
+    }
+
+    @Override
+    public void applyTo(TableMetadata.Builder builder) {
+      // ML deltas are applied to ProtoCatalogFile.Builder, not TableMetadata.Builder.
+      // This is a no-op here; handled by applyManifestDelta.
+    }
+  }
+
+  /**
+   * Appends AddManifestUpdate/RemoveManifestUpdate entries to a delta for all manifests
+   * in a ManifestListDelta from SnapshotProducer.
+   *
+   * @param delta existing list of delta updates to extend
+   * @param snapshotId snapshot these manifests belong to
+   * @param added manifests to add (finalized by SnapshotProducer)
+   * @param removedPaths paths of manifests to remove
+   * @param pathPrefix shared manifest path prefix for efficient encoding
+   */
+  public static void attachManifestDelta(
+      List<DeltaUpdate> delta, long snapshotId,
+      List<ManifestFile> added, List<String> removedPaths, String pathPrefix) {
+    for (ManifestFile mf : added) {
+      delta.add(new AddManifestUpdate(snapshotId, mf, pathPrefix));
+    }
+    for (String path : removedPaths) {
+      String suffix = path;
+      if (pathPrefix != null && !pathPrefix.isEmpty() && path.startsWith(pathPrefix)) {
+        suffix = path.substring(pathPrefix.length());
+      }
+      delta.add(new RemoveManifestUpdate(snapshotId, suffix));
+    }
+  }
+
   // ============================================================
   // Encoding
   // ============================================================
@@ -747,6 +822,21 @@ public class InlineDeltaCodec {
         writeVarint64(inner, SNAP_ADDED_ROWS, u.addedRows);
       }
       writeLengthDelimited(out, UPDATE_ADD_SNAPSHOT, inner.toByteArray());
+
+    } else if (update instanceof AddManifestUpdate) {
+      AddManifestUpdate u = (AddManifestUpdate) update;
+      ByteArrayOutputStream inner = new ByteArrayOutputStream();
+      writeFixed64(inner, ADD_MF_SNAPSHOT_ID, u.snapshotId);
+      byte[] mfBytes = ProtoCodec.encodeManifestFileEntry(u.manifest, u.pathPrefix);
+      writeLengthDelimited(inner, ADD_MF_MANIFEST, mfBytes);
+      writeLengthDelimited(out, UPDATE_ADD_MANIFEST, inner.toByteArray());
+
+    } else if (update instanceof RemoveManifestUpdate) {
+      RemoveManifestUpdate u = (RemoveManifestUpdate) update;
+      ByteArrayOutputStream inner = new ByteArrayOutputStream();
+      writeFixed64(inner, REMOVE_MF_SNAPSHOT_ID, u.snapshotId);
+      writeString(inner, REMOVE_MF_PATH_SUFFIX, u.manifestPathSuffix);
+      writeLengthDelimited(out, UPDATE_REMOVE_MANIFEST, inner.toByteArray());
     }
 
     return out.toByteArray();
@@ -785,10 +875,59 @@ public class InlineDeltaCodec {
         return decodeRemoveSnapshots(updateBytes);
       case UPDATE_ADD_SNAPSHOT:
         return decodeAddSnapshot(updateBytes);
+      case UPDATE_ADD_MANIFEST:
+        return decodeAddManifest(updateBytes);
+      case UPDATE_REMOVE_MANIFEST:
+        return decodeRemoveManifest(updateBytes);
       default:
         // Forward compatibility: skip unknown update types
         return builder -> {};
     }
+  }
+
+  private static AddManifestUpdate decodeAddManifest(byte[] bytes) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    long snapshotId = 0;
+    ManifestFile manifest = null;
+
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      int fn = tag >>> 3;
+      switch (fn) {
+        case ADD_MF_SNAPSHOT_ID:
+          snapshotId = readFixed64(in);
+          break;
+        case ADD_MF_MANIFEST:
+          // Decode with empty prefix; full path will be resolved by the caller
+          manifest = ProtoCodec.decodeManifestFileEntry(readLengthDelimitedBytes(in), "");
+          break;
+        default:
+          skipField(in, tag & 0x7);
+      }
+    }
+    return new AddManifestUpdate(snapshotId, manifest, "");
+  }
+
+  private static RemoveManifestUpdate decodeRemoveManifest(byte[] bytes) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    long snapshotId = 0;
+    String pathSuffix = "";
+
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      int fn = tag >>> 3;
+      switch (fn) {
+        case REMOVE_MF_SNAPSHOT_ID:
+          snapshotId = readFixed64(in);
+          break;
+        case REMOVE_MF_PATH_SUFFIX:
+          pathSuffix = readString(in);
+          break;
+        default:
+          skipField(in, tag & 0x7);
+      }
+    }
+    return new RemoveManifestUpdate(snapshotId, pathSuffix);
   }
 
   private static SetPropertiesUpdate decodeSetProperties(byte[] bytes) throws IOException {

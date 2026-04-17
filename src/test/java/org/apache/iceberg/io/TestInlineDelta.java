@@ -494,4 +494,135 @@ public class TestInlineDelta {
           .isEqualTo("pointer");
     }
   }
+
+  // ============================================================
+  // Manifest list delta tests
+  // ============================================================
+
+  @Nested
+  class ManifestDeltaTests {
+
+    private static final String PATH_PREFIX = "s3://bucket/db/tbl/metadata/";
+
+    @Test
+    void addManifestRoundtrip() {
+      org.apache.iceberg.ManifestFile mf = new TestProtoActions.TestManifestFile(
+          PATH_PREFIX + "aaa-m0.avro", 2048L, 0,
+          org.apache.iceberg.ManifestContent.DATA,
+          5L, 5L, 100L,
+          10, 0, 0, 100L, 0L, 0L,
+          null, null, null);
+
+      List<InlineDeltaCodec.DeltaUpdate> updates = List.of(
+          new InlineDeltaCodec.AddManifestUpdate(100L, mf, PATH_PREFIX));
+
+      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(updates);
+      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(deltaBytes);
+
+      assertThat(decoded).hasSize(1);
+      assertThat(decoded.get(0)).isInstanceOf(InlineDeltaCodec.AddManifestUpdate.class);
+      InlineDeltaCodec.AddManifestUpdate add =
+          (InlineDeltaCodec.AddManifestUpdate) decoded.get(0);
+      assertThat(add.snapshotId).isEqualTo(100L);
+      assertThat(add.manifest.length()).isEqualTo(2048L);
+      assertThat(add.manifest.addedFilesCount()).isEqualTo(10);
+      assertThat(add.manifest.addedRowsCount()).isEqualTo(100L);
+    }
+
+    @Test
+    void removeManifestRoundtrip() {
+      List<InlineDeltaCodec.DeltaUpdate> updates = List.of(
+          new InlineDeltaCodec.RemoveManifestUpdate(200L, "bbb-m0.avro"));
+
+      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(updates);
+      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(deltaBytes);
+
+      assertThat(decoded).hasSize(1);
+      assertThat(decoded.get(0)).isInstanceOf(InlineDeltaCodec.RemoveManifestUpdate.class);
+      InlineDeltaCodec.RemoveManifestUpdate rm =
+          (InlineDeltaCodec.RemoveManifestUpdate) decoded.get(0);
+      assertThat(rm.snapshotId).isEqualTo(200L);
+      assertThat(rm.manifestPathSuffix).isEqualTo("bbb-m0.avro");
+    }
+
+    @Test
+    void fastAppendDelta() {
+      // FastAppend: 1 add, 0 removes
+      org.apache.iceberg.ManifestFile newManifest = new TestProtoActions.TestManifestFile(
+          PATH_PREFIX + "new-m0.avro", 1024L, 0,
+          org.apache.iceberg.ManifestContent.DATA,
+          3L, 3L, 300L,
+          5, 0, 0, 50L, 0L, 0L,
+          null, null, null);
+
+      List<InlineDeltaCodec.DeltaUpdate> delta = new java.util.ArrayList<>();
+      InlineDeltaCodec.attachManifestDelta(
+          delta, 300L,
+          List.of(newManifest), List.of(), PATH_PREFIX);
+
+      assertThat(delta).hasSize(1);
+      assertThat(delta.get(0)).isInstanceOf(InlineDeltaCodec.AddManifestUpdate.class);
+
+      // Round-trip
+      byte[] encoded = InlineDeltaCodec.encodeDelta(delta);
+      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(encoded);
+      assertThat(decoded).hasSize(1);
+    }
+
+    @Test
+    void deleteDelta() {
+      // Delete: 1 add (rewritten manifest) + 1 remove (original)
+      org.apache.iceberg.ManifestFile rewritten = new TestProtoActions.TestManifestFile(
+          PATH_PREFIX + "rewritten-m0.avro", 2048L, 0,
+          org.apache.iceberg.ManifestContent.DATA,
+          4L, 1L, 400L,
+          5, 85, 10, 50L, 850L, 100L,
+          null, null, null);
+
+      List<InlineDeltaCodec.DeltaUpdate> delta = new java.util.ArrayList<>();
+      InlineDeltaCodec.attachManifestDelta(
+          delta, 400L,
+          List.of(rewritten),
+          List.of(PATH_PREFIX + "original-m0.avro"),
+          PATH_PREFIX);
+
+      assertThat(delta).hasSize(2);
+      assertThat(delta.get(0)).isInstanceOf(InlineDeltaCodec.AddManifestUpdate.class);
+      assertThat(delta.get(1)).isInstanceOf(InlineDeltaCodec.RemoveManifestUpdate.class);
+
+      InlineDeltaCodec.RemoveManifestUpdate rm =
+          (InlineDeltaCodec.RemoveManifestUpdate) delta.get(1);
+      assertThat(rm.manifestPathSuffix).isEqualTo("original-m0.avro");
+    }
+
+    @Test
+    void mixedTmAndMlDelta() {
+      // A typical data commit delta: AddSnapshot + SetSnapshotRef + AddManifest
+      org.apache.iceberg.ManifestFile mf = new TestProtoActions.TestManifestFile(
+          PATH_PREFIX + "xyz-m0.avro", 4096L, 0,
+          org.apache.iceberg.ManifestContent.DATA,
+          1L, 1L, 500L,
+          20, 0, 0, 200L, 0L, 0L,
+          null, null, null);
+
+      List<InlineDeltaCodec.DeltaUpdate> delta = new java.util.ArrayList<>();
+      delta.add(new InlineDeltaCodec.AddSnapshotUpdate(
+          500L, "snap-500.avro", Map.of("operation", "append"),
+          1000L, 0, 200L));
+      delta.add(new InlineDeltaCodec.SetSnapshotRefUpdate(
+          "main", 500L, "branch", 0, 0L, 0L));
+      InlineDeltaCodec.attachManifestDelta(
+          delta, 500L, List.of(mf), List.of(), PATH_PREFIX);
+
+      assertThat(delta).hasSize(3);
+
+      // Round-trip all together
+      byte[] encoded = InlineDeltaCodec.encodeDelta(delta);
+      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(encoded);
+      assertThat(decoded).hasSize(3);
+      assertThat(decoded.get(0)).isInstanceOf(InlineDeltaCodec.AddSnapshotUpdate.class);
+      assertThat(decoded.get(1)).isInstanceOf(InlineDeltaCodec.SetSnapshotRefUpdate.class);
+      assertThat(decoded.get(2)).isInstanceOf(InlineDeltaCodec.AddManifestUpdate.class);
+    }
+  }
 }

@@ -304,7 +304,19 @@ message TableMetadataUpdate {
     SetDefaultSortOrder     set_default_sort_order     = 9;
     SetTableProperties      set_properties             = 10;
     SetTableLocation        set_table_location         = 11;
+    AddManifestDelta        add_manifest               = 12;
+    RemoveManifestDelta     remove_manifest            = 13;
   }
+}
+
+message AddManifestDelta {
+  int64              snapshot_id = 1;   // which snapshot this manifest belongs to
+  ManifestFileEntry  manifest    = 2;   // full manifest entry (see ManifestFileEntry)
+}
+
+message RemoveManifestDelta {
+  int64  snapshot_id           = 1;
+  string manifest_path_suffix  = 2;   // identifies manifest to remove (relative to prefix)
 }
 
 message AddSnapshot {
