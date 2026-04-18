@@ -617,5 +617,101 @@ public class TestInlineManifestEndToEnd {
           .as("property update applied")
           .containsEntry("read.split.target-size", "134217728");
     }
+
+    // ============================================================
+    // Per-operation coverage (§4.1)
+    //
+    // Each test commits one operation, then reloads via a fresh catalog
+    // and asserts the manifest list is correct. Covers SnapshotProducer
+    // subclasses beyond FastAppend.
+    // ============================================================
+
+    /** MergeAppend (newAppend): merges small manifests on commit. */
+    @Test
+    void mergeAppendCommitAndReload() {
+      createNamespaceAndTable();
+      Table tbl = catalog.loadTable(TBL);
+      tbl.newAppend().appendFile(FILE_A).commit();
+
+      FileIOCatalog fresh = reloadCatalog();
+      Table reloaded = fresh.loadTable(TBL);
+      assertThat(reloaded.currentSnapshot()).isNotNull();
+      assertThat(reloaded.currentSnapshot().allManifests(io)).hasSize(1);
+      assertThat(reloaded.currentSnapshot().operation()).isEqualTo("append");
+    }
+
+    /** BaseOverwriteFiles (newOverwrite): overwrite semantics with add + remove. */
+    @Test
+    void overwriteCommitAndReload() {
+      createNamespaceAndTable();
+      Table tbl = catalog.loadTable(TBL);
+      // Seed with a snapshot so overwrite has something to overwrite
+      tbl.newFastAppend().appendFile(FILE_A).commit();
+      // Overwrite: add B, the overwrite operation marks FILE_A as deleted
+      tbl.newOverwrite().addFile(FILE_B).deleteFile(FILE_A).commit();
+
+      FileIOCatalog fresh = reloadCatalog();
+      Table reloaded = fresh.loadTable(TBL);
+      Snapshot current = reloaded.currentSnapshot();
+      assertThat(current).isNotNull();
+      assertThat(current.operation()).isEqualTo("overwrite");
+      // Overwrite produces a new manifest with B + rewrite of A's manifest
+      assertThat(current.allManifests(io)).as("overwrite manifest list").hasSizeGreaterThanOrEqualTo(1);
+    }
+
+    /** BaseReplacePartitions (newReplacePartitions): partition-level replace. */
+    @Test
+    void replacePartitionsCommitAndReload() {
+      createNamespaceAndTable();
+      Table tbl = catalog.loadTable(TBL);
+      tbl.newFastAppend().appendFile(FILE_A).commit();
+      tbl.newReplacePartitions().addFile(FILE_B).commit();
+
+      FileIOCatalog fresh = reloadCatalog();
+      Table reloaded = fresh.loadTable(TBL);
+      Snapshot current = reloaded.currentSnapshot();
+      assertThat(current).isNotNull();
+      assertThat(current.operation()).isIn("overwrite", "replace");
+      assertThat(current.allManifests(io)).isNotEmpty();
+    }
+
+    /** newDelete (StreamingDelete): file-based delete. */
+    @Test
+    void deleteCommitAndReload() {
+      createNamespaceAndTable();
+      Table tbl = catalog.loadTable(TBL);
+      tbl.newFastAppend().appendFile(FILE_A).appendFile(FILE_B).commit();
+      tbl.newDelete().deleteFile(FILE_A).commit();
+
+      FileIOCatalog fresh = reloadCatalog();
+      Table reloaded = fresh.loadTable(TBL);
+      Snapshot current = reloaded.currentSnapshot();
+      assertThat(current).isNotNull();
+      assertThat(current.operation()).isIn("delete", "overwrite");
+    }
+
+    /** BaseRewriteManifests (rewriteManifests): manifest-level rewrite. */
+    @Test
+    void rewriteManifestsCommitAndReload() {
+      createNamespaceAndTable();
+      Table tbl = catalog.loadTable(TBL);
+      // Create multiple manifests by doing separate fast appends
+      tbl.newFastAppend().appendFile(FILE_A).commit();
+      tbl.newFastAppend().appendFile(FILE_B).commit();
+      long preRewriteSnapId = tbl.currentSnapshot().snapshotId();
+      int beforeCount = tbl.currentSnapshot().allManifests(io).size();
+      assertThat(beforeCount).as("pre-rewrite manifest count").isGreaterThanOrEqualTo(2);
+
+      // Rewrite manifests — creates new manifest(s) superseding the originals
+      tbl.rewriteManifests().clusterBy(f -> "all").commit();
+
+      FileIOCatalog fresh = reloadCatalog();
+      Table reloaded = fresh.loadTable(TBL);
+      Snapshot current = reloaded.currentSnapshot();
+      assertThat(current).isNotNull();
+      assertThat(current.snapshotId()).isNotEqualTo(preRewriteSnapId);
+      // rewriteManifests typically compacts to fewer manifests
+      assertThat(current.allManifests(io)).isNotEmpty();
+    }
   }
 }

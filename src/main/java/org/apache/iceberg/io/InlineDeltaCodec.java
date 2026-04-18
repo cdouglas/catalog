@@ -374,9 +374,17 @@ public class InlineDeltaCodec {
         Long firstRowId = snap.firstRowId();
         String keyId = snap.keyId();
         long addedRowsValue = snap.addedRows() != null ? snap.addedRows() : 0L;
+        // Ensure the operation name is carried in the summary. snap.operation()
+        // is the authoritative source; snap.summary() may or may not include
+        // the "operation" key depending on the producer, and encoding relies on
+        // the summary map's entry.
+        Map<String, String> summary = snap.summary() != null
+            ? new HashMap<>(snap.summary()) : new HashMap<>();
+        if (snap.operation() != null && !summary.containsKey("operation")) {
+          summary.put("operation", snap.operation());
+        }
         updates.add(new AddSnapshotUpdate(
-            snap.snapshotId(), suffix,
-            snap.summary() != null ? snap.summary() : Map.of(),
+            snap.snapshotId(), suffix, summary,
             timestampDelta, schemaId, addedRowsValue,
             parentId, firstRowId, keyId));
       }
