@@ -324,6 +324,7 @@ public class TestInlineManifestEndToEnd {
       List<String> metadataFiles = io.filesMatching("metadata.json");
       assertThat(metadataFiles).isNotEmpty();
     }
+
   }
 
   @Nested
@@ -342,6 +343,7 @@ public class TestInlineManifestEndToEnd {
       List<String> metadataFiles = io.filesMatching("metadata.json");
       assertThat(metadataFiles).isEmpty();
     }
+
   }
 
   @Nested
@@ -433,6 +435,48 @@ public class TestInlineManifestEndToEnd {
     }
 
     /**
+     * §1.2: A catalog transaction FastAppend must preserve ML data across
+     * commitTransaction. Without the commitTransaction ML integration, the
+     * committed snapshot would have an empty manifest list on reload.
+     *
+     * <p>Caveat: commitTransaction uses BaseTransaction's TransactionTableOperations
+     * wrapper, which does not forward the ManifestListSink interface. The
+     * SnapshotProducer therefore takes the Avro path and writes a snap-*.avro
+     * file. Our commitTransaction path extracts the ML delta from the resulting
+     * snapshot's allManifests(io) list (reading the Avro file back) and stores
+     * it in the catalog pool — so the end state on reload is correct, but a
+     * transient snap-*.avro file is written. Eliminating that file requires
+     * forwarding the sink through TransactionTableOperations (iceberg core).
+     *
+     * <p>Note: multi-table transactions not tested here due to a pre-existing
+     * bug where consecutive buildTable().create() calls overwrite each other
+     * (unrelated to ML); tracked separately.
+     */
+    @Test
+    void commitTransactionWithML() {
+      createNamespaceAndTable();
+
+      org.apache.iceberg.catalog.CatalogTransaction txn =
+          catalog.createTransaction(
+              org.apache.iceberg.catalog.CatalogTransaction.IsolationLevel.SNAPSHOT);
+      org.apache.iceberg.catalog.Catalog txCatalog = txn.asCatalog();
+      txCatalog.loadTable(TBL).newFastAppend().appendFile(FILE_A).commit();
+      txn.commitTransaction();
+
+      // Reload via fresh catalog; manifest list must survive
+      FileIOCatalog fresh = reloadCatalog();
+      Table reloaded = fresh.loadTable(TBL);
+      assertThat(reloaded.currentSnapshot())
+          .as("snapshot should survive commitTransaction")
+          .isNotNull();
+      assertThat(reloaded.currentSnapshot().allManifests(io))
+          .as("manifest list survives commitTransaction")
+          .hasSize(1);
+      // Note: snap-*.avro IS written because the transaction wrapper bypasses
+      // the sink; the ML delta is still captured correctly via allManifests.
+    }
+
+/**
      * §2.6: Expiring a snapshot must cascade to the catalog pool — remove the
      * snapshot's ref list and GC pool entries no longer referenced. Without
      * the cascade, the pool grows indefinitely with expired-snapshot count.

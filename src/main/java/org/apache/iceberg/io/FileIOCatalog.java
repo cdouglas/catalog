@@ -628,12 +628,16 @@ public class FileIOCatalog extends BaseMetastoreCatalog
       }
       boolean inline = Boolean.parseBoolean(
           catalogProperties.getOrDefault(INLINE_ENABLED, "false"));
+      boolean inlineManifests = Boolean.parseBoolean(
+          catalogProperties.getOrDefault(INLINE_MANIFESTS, "false"));
       if (inline) {
         // Compute delta from current to new metadata
         String manifestPrefix = "";
+        ProtoCatalogFile proto = null;
+        Integer tblIdNum = null;
         if (current instanceof ProtoCatalogFile) {
-          ProtoCatalogFile proto = (ProtoCatalogFile) current;
-          Integer tblIdNum = proto.tableId(tableId);
+          proto = (ProtoCatalogFile) current;
+          tblIdNum = proto.tableId(tableId);
           if (tblIdNum != null) {
             String p = proto.manifestListPrefix(tblIdNum);
             if (p != null) { manifestPrefix = p; }
@@ -641,7 +645,65 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         }
         java.util.List<InlineDeltaCodec.DeltaUpdate> delta =
             InlineDeltaCodec.computeDelta(currentMetadata, newMetadata, manifestPrefix);
+
+        // ML-mode integration: extract per-snapshot manifest delta from staged
+        // snapshots in newMetadata. Cannot reuse the sink drain path because
+        // commitTransaction buffers commits through BaseTransaction's
+        // TransactionTableOperations wrapper, which does not forward
+        // ManifestListSink — so SnapshotProducer writes snap-*.avro and the
+        // snapshot is a BaseSnapshot (not InlineSnapshot). We still want ML
+        // deltas recorded in the catalog; extract via snap.allManifests(io)
+        // which reads the external Avro for pointer-mode or returns the
+        // in-memory list for InlineSnapshot. See ML_INLINE_REVIEW2.md §1.2.
+        // Proper fix requires TransactionTableOperations to forward the sink,
+        // an iceberg-core architectural change tracked as follow-up.
+        boolean hasMLPool = proto != null && tblIdNum != null
+            && !proto.manifestPool(tblIdNum).isEmpty();
+        boolean hasMLDeltas = false;
+        if (inlineManifests) {
+          java.util.Set<Long> oldSnapIds = new java.util.HashSet<>();
+          for (org.apache.iceberg.Snapshot s : currentMetadata.snapshots()) {
+            oldSnapIds.add(s.snapshotId());
+          }
+          for (org.apache.iceberg.Snapshot snap : newMetadata.snapshots()) {
+            if (oldSnapIds.contains(snap.snapshotId())) continue;
+            java.util.List<org.apache.iceberg.ManifestFile> currentMfs =
+                snap.allManifests(ops.io());
+            java.util.List<org.apache.iceberg.ManifestFile> parentMfs =
+                txnParentManifests(snap.parentId(), currentMetadata, newMetadata,
+                    proto, tblIdNum, ops.io());
+            java.util.List<org.apache.iceberg.ManifestFile> added =
+                new java.util.ArrayList<>();
+            java.util.List<String> removedPaths = new java.util.ArrayList<>();
+            java.util.Set<String> parentPaths = new java.util.HashSet<>();
+            for (org.apache.iceberg.ManifestFile pmf : parentMfs) {
+              parentPaths.add(pmf.path());
+            }
+            java.util.Set<String> currentPaths = new java.util.HashSet<>();
+            for (org.apache.iceberg.ManifestFile cmf : currentMfs) {
+              currentPaths.add(cmf.path());
+              if (!parentPaths.contains(cmf.path())) {
+                added.add(cmf);
+              }
+            }
+            for (String pp : parentPaths) {
+              if (!currentPaths.contains(pp)) {
+                removedPaths.add(pp);
+              }
+            }
+            if (!added.isEmpty() || !removedPaths.isEmpty()) {
+              InlineDeltaCodec.attachManifestDelta(
+                  delta, snap.snapshotId(), added, removedPaths, manifestPrefix);
+              hasMLDeltas = true;
+            }
+          }
+        }
+
         String mode = InlineDeltaCodec.selectMode(delta, newMetadata, 0);
+        if ((hasMLDeltas || hasMLPool) && !"delta".equals(mode)) {
+          // See commitInline — same reasoning for full-mode avoidance
+          mode = "delta";
+        }
         switch (mode) {
           case "delta":
             newCatalog.updateTableInlineDelta(tableId, InlineDeltaCodec.encodeDelta(delta));
@@ -669,5 +731,49 @@ public class FileIOCatalog extends BaseMetastoreCatalog
   @Override
   public CatalogTransaction createTransaction(CatalogTransaction.IsolationLevel isolationLevel) {
     return new BaseCatalogTransaction(this, isolationLevel);
+  }
+
+  /**
+   * Reconstructs the parent snapshot's manifest list for ML delta computation
+   * in commitTransaction. Preference order:
+   * 1. If parent is an in-transaction InlineSnapshot in newMetadata (second
+   *    commit in a multi-op transaction), use its in-memory manifest list.
+   * 2. If parent is in currentMetadata as an InlineSnapshot (loaded from
+   *    catalog pool via wrapInlineManifests), use its in-memory list.
+   * 3. Otherwise look up in the catalog's pool (parent is a prior inline
+   *    snapshot not yet in newMetadata).
+   * 4. Fall back to empty list (first commit on branch, or mixed-mode
+   *    pointer-mode parent — treat all current manifests as added).
+   */
+  private static java.util.List<org.apache.iceberg.ManifestFile> txnParentManifests(
+      Long parentId,
+      TableMetadata currentMetadata,
+      TableMetadata newMetadata,
+      ProtoCatalogFile proto,
+      Integer tblIdNum,
+      org.apache.iceberg.io.FileIO io) {
+    if (parentId == null) {
+      return java.util.List.of();
+    }
+    // Case 1: parent in newMetadata (same-txn sibling) and is InlineSnapshot
+    org.apache.iceberg.Snapshot parentInNew = newMetadata.snapshot(parentId);
+    if (parentInNew instanceof org.apache.iceberg.InlineSnapshot) {
+      return parentInNew.allManifests(io);
+    }
+    // Case 2: parent in currentMetadata and is InlineSnapshot
+    org.apache.iceberg.Snapshot parentInCurrent = currentMetadata.snapshot(parentId);
+    if (parentInCurrent instanceof org.apache.iceberg.InlineSnapshot) {
+      return parentInCurrent.allManifests(io);
+    }
+    // Case 3: look up in catalog's pool
+    if (proto != null && tblIdNum != null) {
+      java.util.List<org.apache.iceberg.ManifestFile> pooled =
+          proto.inlineManifests(tblIdNum, parentId);
+      if (pooled != null) {
+        return pooled;
+      }
+    }
+    // Case 4: no inline data for parent (first commit / mixed-mode / new branch)
+    return java.util.List.of();
   }
 }
