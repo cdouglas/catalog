@@ -721,6 +721,50 @@ public class TestInlineDelta {
 
       assertThat(withSecond.snapshot(200L).parentId()).isEqualTo(100L);
     }
+
+    /**
+     * §2.1: applyDeltaWithManifests must detect mis-ordered deltas (AddManifest
+     * before AddSnapshot for the same snapshot id) and fail loudly. Manifest
+     * carry-forward can't work when the snapshot isn't yet in the current
+     * metadata.
+     */
+    @Test
+    void misorderedDeltaFailsLoudly() {
+      String prefix = "s3://bucket/db/tbl/metadata/";
+      org.apache.iceberg.ManifestFile mf = new TestProtoActions.TestManifestFile(
+          prefix + "x-m0.avro", 1024L, 0,
+          org.apache.iceberg.ManifestContent.DATA,
+          1L, 1L, 500L, 1, 0, 0, 1L, 0L, 0L, null, null, null);
+
+      // Manually construct mis-ordered delta: AddManifest BEFORE AddSnapshot
+      List<InlineDeltaCodec.DeltaUpdate> delta = new java.util.ArrayList<>();
+      InlineDeltaCodec.attachManifestDelta(
+          delta, 500L, List.of(mf), List.of(), prefix);
+      delta.add(new InlineDeltaCodec.AddSnapshotUpdate(
+          500L, "", Map.of("operation", "append"),
+          1000L, 0, 100L));
+
+      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(delta);
+      byte[] baseMeta = TableMetadataParser.toJson(baseMetadata())
+          .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+      InputFile loc = new InputFile() {
+        @Override public long getLength() { return 0; }
+        @Override public SeekableInputStream newStream() { return null; }
+        @Override public String location() { return "test://catalog"; }
+        @Override public boolean exists() { return true; }
+      };
+      ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(loc);
+      builder.addNamespace(0, 0, "", 1);
+      builder.addNamespace(1, 0, "db", 1);
+      builder.setNextNamespaceId(2);
+      builder.setNextTableId(2);
+      builder.addInlineTable(1, 1, "tbl", 1, baseMeta, prefix);
+
+      org.assertj.core.api.Assertions.assertThatThrownBy(() ->
+          InlineDeltaCodec.applyDeltaWithManifests(baseMeta, deltaBytes, builder, 1))
+          .isInstanceOf(IllegalStateException.class)
+          .hasMessageContaining("violates delta ordering invariant");
+    }
   }
 
   // ============================================================

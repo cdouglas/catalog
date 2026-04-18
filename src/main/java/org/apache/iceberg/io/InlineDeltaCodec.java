@@ -169,6 +169,16 @@ public class InlineDeltaCodec {
    * Applies a delta (encoded bytes) to base metadata, routing ML updates to the
    * ProtoCatalogFile.Builder and TM updates (including AddSnapshot) to TableMetadata.
    * This is the ML-aware replacement for {@link #applyDelta(byte[], byte[])}.
+   *
+   * <p><b>Ordering invariant:</b> {@code AddSnapshotUpdate} entries for a given
+   * snapshot must appear in the delta list <em>before</em> any
+   * {@code AddManifestUpdate} / {@code RemoveManifestUpdate} entries that
+   * reference that snapshot. Manifest carry-forward (inheriting parent's refs
+   * when a new snapshot's ref list is empty) reads
+   * {@code current.snapshot(add.snapshotId).parentId()}, which only works if
+   * the snapshot has already been added to {@code current}.
+   * {@link #computeDelta} and {@link #attachManifestDelta} always emit updates
+   * in this order; custom callers must maintain it.
    */
   public static byte[] applyDeltaWithManifests(
       byte[] baseMetadataJson, byte[] deltaBytes,
@@ -181,14 +191,27 @@ public class InlineDeltaCodec {
       prefix = "";
     }
 
-    // Apply updates type-by-type: TM updates to TableMetadata, ML updates to catalog builder
+    // Apply updates type-by-type: TM updates to TableMetadata, ML updates to catalog builder.
+    // Ordering: AddSnapshot must precede AddManifest/RemoveManifest for the same snapshotId
+    // (see javadoc). Track added snapshot ids to assert invariant.
+    java.util.Set<Long> addedInThisDelta = new java.util.HashSet<>();
     TableMetadata current = base;
     for (DeltaUpdate update : updates) {
       if (update instanceof AddSnapshotUpdate) {
         // Route through the prefix-accepting overload (avoids the throw in applyTo(Builder))
-        current = ((AddSnapshotUpdate) update).applyTo(current, prefix);
+        AddSnapshotUpdate addSnap = (AddSnapshotUpdate) update;
+        current = addSnap.applyTo(current, prefix);
+        addedInThisDelta.add(addSnap.snapshotId);
       } else if (update instanceof AddManifestUpdate) {
         AddManifestUpdate add = (AddManifestUpdate) update;
+        // Assert ordering: if we're adding a manifest for a snapshot not yet in
+        // current, carry-forward lookup will fail to find the parent. Flag it.
+        if (current.snapshot(add.snapshotId) == null
+            && !addedInThisDelta.contains(add.snapshotId)) {
+          throw new IllegalStateException(
+              "AddManifestUpdate for snapshot " + add.snapshotId
+                  + " before its AddSnapshotUpdate — violates delta ordering invariant");
+        }
         // The manifest decoded from the wire has a suffix-only path; resolve full path
         String fullPath = add.manifest.path();
         if (!prefix.isEmpty() && !fullPath.startsWith(prefix)) {

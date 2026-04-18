@@ -64,6 +64,9 @@ public class FileIOCatalog extends BaseMetastoreCatalog
   private static final String INLINE_ENABLED = "fileio.catalog.inline";
   private static final String INLINE_MANIFESTS = "fileio.catalog.inline.manifests";
 
+  private static final org.slf4j.Logger LOG =
+      org.slf4j.LoggerFactory.getLogger(FileIOCatalog.class);
+
   private Configuration conf; // TODO: delete
   private String catalogName = "fileio";
   private String catalogLocation;
@@ -497,13 +500,46 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         return parsed;
       }
 
-      // Check if any snapshot has inline manifests
+      // §2.3: Any snapshot with an inline:// sentinel manifest-list location
+      // MUST have a pool entry — the sentinel is only written when the sink
+      // path is active, and the pool and sentinel must be committed atomically.
+      // A sentinel without a pool entry means the pool was clobbered (§1.1 bug
+      // or similar), and loading the BaseSnapshot as-is would result in
+      // FileNotFound when allManifests() tries to read `inline://<id>`. Fail
+      // loudly instead of silently corrupting the read.
+      for (Snapshot s : parsed.snapshots()) {
+        String loc = s.manifestListLocation();
+        if (loc != null && loc.startsWith("inline://")
+            && !proto.hasInlineManifests(tblId, s.snapshotId())) {
+          throw new IllegalStateException(
+              "Inline snapshot " + s.snapshotId() + " has sentinel manifest-list "
+                  + "location '" + loc + "' but no pool entry — catalog state corrupt");
+        }
+      }
+
+      // Check if any snapshot has inline manifests, and detect mixed mode
+      // (some inline, some pointer-mode in the same table).
       boolean hasAny = false;
+      boolean hasInline = false;
+      boolean hasPointer = false;
       for (Snapshot s : parsed.snapshots()) {
         if (proto.hasInlineManifests(tblId, s.snapshotId())) {
           hasAny = true;
-          break;
+          hasInline = true;
+        } else if (s.manifestListLocation() != null
+            && !s.manifestListLocation().startsWith("inline://")) {
+          hasPointer = true;
         }
+      }
+      if (hasInline && hasPointer) {
+        // §2.7: mixed-mode table. Log once; proceed. Rejection would break
+        // tables mid-migration from pointer to inline. Strict rejection is
+        // reserved for a future follow-up that wires the catalog-level property
+        // through to this static context.
+        LOG.warn(
+            "Table {} is in mixed mode: has both inline and pointer-mode snapshots. "
+                + "Reload is supported but migration utilities may misbehave.",
+            tableId);
       }
       if (!hasAny) {
         return parsed;

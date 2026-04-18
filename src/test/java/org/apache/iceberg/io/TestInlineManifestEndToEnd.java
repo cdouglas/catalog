@@ -477,6 +477,75 @@ public class TestInlineManifestEndToEnd {
     }
 
 /**
+     * §2.3: wrapInlineManifests must reject catalog state where a snapshot
+     * has an inline:// sentinel location but the pool has no entry for it.
+     * This is the signature of a §1.1-class bug (pool cleared by a non-ML
+     * commit) — silent delegation to FileIO would yield a confusing
+     * File not found. Direct check: construct a poisoned catalog file and
+     * verify loadTable throws IllegalStateException.
+     */
+    @Test
+    void sentinelWithoutPoolFailsLoudly() throws Exception {
+      createNamespaceAndTable();
+      Table tbl = catalog.loadTable(TBL);
+      tbl.newFastAppend().appendFile(FILE_A).commit();
+
+      // Surgically clobber the manifest pool: reconstruct the catalog file
+      // with inline metadata intact but empty pool/snapshotRefs
+      ProtoCatalogFormat fmt = new ProtoCatalogFormat();
+      ProtoCatalogFile original = (ProtoCatalogFile) fmt.read(
+          io, io.newInputFile("mem:///warehouse/catalog"));
+      Integer tblId = original.tableId(TBL);
+      byte[] inlineMeta = original.inlineMetadata(tblId);
+      String prefix = original.manifestListPrefix(tblId);
+      var tblEntry = original.tableById().get(tblId);
+
+      // Build a catalog file with ALL original state except the pool
+      ProtoCatalogFile.Builder b = ProtoCatalogFile.builder(
+          io.newInputFile("mem:///warehouse/catalog"));
+      b.setCatalogUuid(original.uuid());
+      for (var e : original.namespaceById().entrySet()) {
+        b.addNamespace(e.getKey(), e.getValue().parentId,
+            e.getValue().name, e.getValue().version);
+      }
+      // Keep inline metadata (with inline:// sentinel) but NO pool
+      b.addInlineTable(tblId, tblEntry.namespaceId, tblEntry.name,
+          tblEntry.version, inlineMeta, prefix);
+      b.setNextNamespaceId(original.nextNamespaceId());
+      b.setNextTableId(original.nextTableId());
+      ProtoCatalogFile poisoned = b.build();
+
+      // Serialize the poisoned file back to io, overwriting the catalog
+      ProtoCatalogFormat.Mut mut = new ProtoCatalogFormat.Mut(poisoned);
+      byte[] header = new byte[8];
+      System.arraycopy(ProtoCatalogFormat.MAGIC, 0, header, 0,
+          ProtoCatalogFormat.MAGIC.length);
+      header[4] = 0; header[5] = 0; header[6] = 0;
+      header[7] = (byte) ProtoCatalogFormat.FORMAT_VERSION;
+      ProtoCatalogFormat.ProtoIdManager idmgr = new ProtoCatalogFormat.ProtoIdManager();
+      idmgr.setGlobals(poisoned.nextNamespaceId(), poisoned.nextTableId());
+      byte[] checkpoint = ProtoCodec.encodeCheckpoint(poisoned, mut, idmgr);
+
+      java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+      out.write(header);
+      // varint-encode checkpoint length
+      int len = checkpoint.length;
+      while ((len & ~0x7F) != 0) {
+        out.write((len & 0x7F) | 0x80);
+        len >>>= 7;
+      }
+      out.write(len);
+      out.write(checkpoint);
+      io.files.put("mem:///warehouse/catalog", out.toByteArray());
+
+      // Attempt to load via a fresh catalog — should throw
+      FileIOCatalog fresh = reloadCatalog();
+      org.assertj.core.api.Assertions.assertThatThrownBy(() -> fresh.loadTable(TBL))
+          .isInstanceOfAny(IllegalStateException.class, RuntimeException.class)
+          .hasMessageContaining("sentinel manifest-list");
+    }
+
+    /**
      * §2.6: Expiring a snapshot must cascade to the catalog pool — remove the
      * snapshot's ref list and GC pool entries no longer referenced. Without
      * the cascade, the pool grows indefinitely with expired-snapshot count.
