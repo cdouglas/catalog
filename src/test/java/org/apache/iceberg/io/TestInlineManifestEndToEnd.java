@@ -431,5 +431,36 @@ public class TestInlineManifestEndToEnd {
       List<String> snapFiles = io.filesMatching("snap-");
       assertThat(snapFiles).isEmpty();
     }
+
+    /**
+     * §1.1: After a FastAppend populates the pool, a non-ML commit (e.g.
+     * property change) that would naturally go through full mode must NOT
+     * clobber the pool. Validates both the commit-time guard (forces delta
+     * mode on ML-populated tables) and the replay-time fix (updateInlineMetadata
+     * preserves the pool) together.
+     */
+    @Test
+    void fullModePreservesPool() {
+      createNamespaceAndTable();
+      Table tbl = catalog.loadTable(TBL);
+      tbl.newFastAppend().appendFile(FILE_A).commit();
+      long snapId = tbl.currentSnapshot().snapshotId();
+
+      // A property-only commit would naturally take full mode if the delta
+      // were too small to justify delta encoding — but our commit-time guard
+      // should force delta mode when the pool is populated.
+      tbl.updateProperties().set("read.split.target-size", "134217728").commit();
+
+      // Reload via fresh catalog; the pool must still have an entry
+      FileIOCatalog fresh = reloadCatalog();
+      Table reloaded = fresh.loadTable(TBL);
+      Snapshot snap = reloaded.snapshot(snapId);
+      assertThat(snap).as("snapshot should still exist").isNotNull();
+      List<ManifestFile> manifests = snap.allManifests(io);
+      assertThat(manifests).as("manifest pool preserved across non-ML commit").hasSize(1);
+      assertThat(reloaded.properties())
+          .as("property update applied")
+          .containsEntry("read.split.target-size", "134217728");
+    }
   }
 }

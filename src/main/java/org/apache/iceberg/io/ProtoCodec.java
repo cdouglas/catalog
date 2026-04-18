@@ -1881,13 +1881,15 @@ public class ProtoCodec {
           }
         }
       } else if (fullMetadata != null) {
-        // FULL mode: replace inline metadata, keep as inline table
-        builder.removeInlineMetadata(id);
+        // FULL mode: replace inline metadata bytes in place, preserving the
+        // manifest pool and snapshot refs. `removeInlineMetadata` (used by
+        // the POINTER branch below) also clears the pool — that's the correct
+        // behavior for pointer-mode eviction, but would silently corrupt an
+        // ML-populated table on a non-ML commit (schema evolution, etc.).
+        // See ML_INLINE_REVIEW2.md §1.1.
         ProtoCatalogFile.TblEntry old = builder.tableEntry(id);
         if (old != null) {
-          builder.addInlineTable(
-              id, old.namespaceId, old.name, version + 1, fullMetadata,
-              builder.manifestListPrefix(id) != null ? builder.manifestListPrefix(id) : "");
+          builder.updateInlineMetadata(id, version + 1, fullMetadata);
         }
       } else if (metadataLocation != null) {
         // POINTER mode: evict from inline to pointer

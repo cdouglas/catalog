@@ -443,10 +443,24 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         }
 
         String mode = InlineDeltaCodec.selectMode(delta, metadata, 0);
-        // When ML deltas are attached, force delta mode: full/pointer modes lose
-        // the ML payload because they serialize TableMetadata directly (InlineSnapshot
-        // with null manifestListLocation falls into SnapshotParser's v1 branch).
-        if (hasMLDeltas && !"delta".equals(mode)) {
+        // Force delta mode in two cases:
+        // 1. hasMLDeltas: the current commit staged new ML deltas; full/pointer
+        //    lose them because they serialize TableMetadata (InlineSnapshot ->
+        //    v1 embedded-manifests branch in SnapshotParser.toJson).
+        // 2. hasMLPool: the table already has an ML pool from a prior commit; a
+        //    full-mode write rewrites the TM JSON with `inline://` sentinel
+        //    manifest-list locations, and even though the replay-side full-mode
+        //    fix (§1.1) preserves the pool, we still avoid writing bloated full
+        //    TM blobs on ML-populated tables. See ML_INLINE_REVIEW2.md §1.1.
+        boolean hasMLPool = false;
+        if (lastCatalogFile instanceof ProtoCatalogFile) {
+          ProtoCatalogFile proto = (ProtoCatalogFile) lastCatalogFile;
+          Integer tblIdNum = proto.tableId(tableId);
+          if (tblIdNum != null) {
+            hasMLPool = !proto.manifestPool(tblIdNum).isEmpty();
+          }
+        }
+        if ((hasMLDeltas || hasMLPool) && !"delta".equals(mode)) {
           mode = "delta";
         }
 
