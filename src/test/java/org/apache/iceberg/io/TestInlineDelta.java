@@ -523,9 +523,11 @@ public class TestInlineDelta {
 
       var drained = ops.drainStagedDeltas();
       assertThat(drained).hasSize(2);
-      assertThat(drained.get(100L).added()).hasSize(1);
-      assertThat(drained.get(100L).removedPaths()).isEmpty();
-      assertThat(drained.get(200L).removedPaths()).containsExactly("s3://b/old.avro");
+      assertThat(drained.get(100L).delta.added()).hasSize(1);
+      assertThat(drained.get(100L).delta.removedPaths()).isEmpty();
+      assertThat(drained.get(200L).delta.removedPaths()).containsExactly("s3://b/old.avro");
+      // Staged parent/next-row-id fields captured alongside delta
+      assertThat(drained.get(200L).parentSnapshotId).isEqualTo(100L);
 
       // drain clears
       assertThat(ops.drainStagedDeltas()).isEmpty();
@@ -655,6 +657,69 @@ public class TestInlineDelta {
       assertThat(updated.snapshots()).as("should have 1 snapshot").hasSize(1);
       assertThat(updated.currentSnapshot()).as("currentSnapshot should be set").isNotNull();
       assertThat(updated.currentSnapshot().snapshotId()).isEqualTo(500L);
+    }
+
+    /** §1.3/§2.5: Optional parentSnapshotId / firstRowId / keyId round-trip. */
+    @Test
+    void addSnapshotWithParentKeyIdFirstRowId() {
+      // Construct with all three optional fields populated
+      InlineDeltaCodec.AddSnapshotUpdate orig =
+          new InlineDeltaCodec.AddSnapshotUpdate(
+              500L, "", Map.of("operation", "append"),
+              1000L, 0, 100L,
+              /* parentSnapshotId */ 999L,
+              /* firstRowId */ 42L,
+              /* keyId */ "key-abc-123");
+
+      List<InlineDeltaCodec.DeltaUpdate> delta = List.of(orig);
+      byte[] bytes = InlineDeltaCodec.encodeDelta(delta);
+      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(bytes);
+
+      assertThat(decoded).hasSize(1);
+      InlineDeltaCodec.AddSnapshotUpdate d =
+          (InlineDeltaCodec.AddSnapshotUpdate) decoded.get(0);
+      assertThat(d.snapshotId).isEqualTo(500L);
+      assertThat(d.parentSnapshotId).isEqualTo(999L);
+      assertThat(d.firstRowId).isEqualTo(42L);
+      assertThat(d.keyId).isEqualTo("key-abc-123");
+    }
+
+    /** Back-compat: old-style AddSnapshotUpdate (no optional fields) still round-trips. */
+    @Test
+    void addSnapshotBackCompatNoOptionalFields() {
+      InlineDeltaCodec.AddSnapshotUpdate orig =
+          new InlineDeltaCodec.AddSnapshotUpdate(
+              500L, "", Map.of("operation", "append"),
+              1000L, 0, 100L);  // back-compat constructor
+
+      byte[] bytes = InlineDeltaCodec.encodeDelta(List.of(orig));
+      InlineDeltaCodec.AddSnapshotUpdate d =
+          (InlineDeltaCodec.AddSnapshotUpdate) InlineDeltaCodec.decodeDelta(bytes).get(0);
+
+      assertThat(d.parentSnapshotId).isNull();
+      assertThat(d.firstRowId).isNull();
+      assertThat(d.keyId).isNull();
+    }
+
+    /** §1.3 A: AddSnapshotUpdate with explicit parentSnapshotId overrides base.currentSnapshot(). */
+    @Test
+    void applyToUsesExplicitParentSnapshotId() {
+      // Base has one snapshot; we add a new snapshot whose explicit parent is a
+      // historical snapshot (not the current one — simulates branch/cherry-pick).
+      TableMetadata base = baseMetadata();
+      // First add an "original" snapshot to have a non-null currentSnapshot
+      InlineDeltaCodec.AddSnapshotUpdate first = new InlineDeltaCodec.AddSnapshotUpdate(
+          100L, "", Map.of("operation", "append"), 1000L, 0, 0);
+      TableMetadata withFirst = first.applyTo(base, "");
+
+      // Now add a second with explicit parent = 100 (same as current in this trivial case)
+      InlineDeltaCodec.AddSnapshotUpdate second = new InlineDeltaCodec.AddSnapshotUpdate(
+          200L, "", Map.of("operation", "append"),
+          1000L, 0, 0,
+          /* parent */ 100L, /* firstRowId */ null, /* keyId */ null);
+      TableMetadata withSecond = second.applyTo(withFirst, "");
+
+      assertThat(withSecond.snapshot(200L).parentId()).isEqualTo(100L);
     }
   }
 

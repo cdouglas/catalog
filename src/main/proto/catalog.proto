@@ -224,6 +224,15 @@ message AddSnapshot {
   sint64         timestamp_delta_ms     = 4;
   int32          schema_id              = 5;
   int64          added_rows             = 6;
+  // Optional: explicit parent snapshot ID (for stage-only, branch, cherry-pick).
+  // When omitted, replay defaults to base.currentSnapshot().snapshotId().
+  // 0 sentinel = absent; use has_parent_snapshot_id flag to distinguish null parent (-1)
+  // from omission. A parent ID of 0 is not legal in Iceberg so the sentinel is safe.
+  fixed64        parent_snapshot_id     = 7;
+  // Optional: v3+ row lineage starting row ID for this snapshot.
+  int64          first_row_id           = 8;
+  // Optional: encryption key ID carried on the snapshot.
+  string         key_id                 = 9;
 }
 
 enum OperationType {

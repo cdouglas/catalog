@@ -322,6 +322,14 @@ message RemoveManifestDelta {
 message AddSnapshot {
   fixed64        snapshot_id          = 1;
   string         manifest_list_suffix = 2;   // appended to per-table prefix; empty for inline-ML snapshots
+  // Optional fields (presence-encoded). Required for:
+  //   parent_snapshot_id: stage-only snapshots, branch commits, cherry-picks
+  //   first_row_id:       v3+ row-lineage tables
+  //   key_id:             encrypted tables
+  // When absent, replay falls back to base.currentSnapshot() for parent (legacy).
+  fixed64        parent_snapshot_id   = 7;   // absent => fall back to current snapshot
+  int64          first_row_id         = 8;   // v3+ row lineage, absent => null
+  string         key_id               = 9;   // encryption key, absent => null
   CompactSummary summary              = 3;   // typed summary (replaces map)
   sint64         timestamp_delta_ms   = 4;   // signed delta from lastUpdatedMs
   int32          schema_id            = 5;   // only if changed from current

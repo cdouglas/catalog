@@ -134,6 +134,9 @@ public class InlineDeltaCodec {
   private static final int SNAP_TIMESTAMP_DELTA = 4;
   private static final int SNAP_SCHEMA_ID = 5;
   private static final int SNAP_ADDED_ROWS = 6;
+  private static final int SNAP_PARENT_ID = 7;    // optional; fixed64
+  private static final int SNAP_FIRST_ROW_ID = 8; // optional; varint64
+  private static final int SNAP_KEY_ID = 9;       // optional; string
 
   // CompactSummary field numbers
   private static final int CS_OPERATION = 1;
@@ -327,10 +330,18 @@ public class InlineDeltaCodec {
         int schemaId = snap.schemaId() != null
             && snap.schemaId() != oldMeta.currentSchemaId()
             ? snap.schemaId() : 0;
+        // Always carry parent snapshot ID explicitly. This is required for
+        // stage-only, branch, cherry-pick; reconstructing from base.currentSnapshot
+        // on replay is wrong in those cases.
+        Long parentId = snap.parentId();
+        Long firstRowId = snap.firstRowId();
+        String keyId = snap.keyId();
+        long addedRowsValue = snap.addedRows() != null ? snap.addedRows() : 0L;
         updates.add(new AddSnapshotUpdate(
             snap.snapshotId(), suffix,
             snap.summary() != null ? snap.summary() : Map.of(),
-            timestampDelta, schemaId, 0));
+            timestampDelta, schemaId, addedRowsValue,
+            parentId, firstRowId, keyId));
       }
     }
 
@@ -671,16 +682,36 @@ public class InlineDeltaCodec {
     public final long timestampDeltaMs;
     public final int schemaId;
     public final long addedRows;
+    // Optional fields. Absent values:
+    //   parentSnapshotId == null  -> fall back to base.currentSnapshot()
+    //   firstRowId == null        -> no row lineage
+    //   keyId == null             -> no encryption key
+    public final Long parentSnapshotId;
+    public final Long firstRowId;
+    public final String keyId;
 
+    /** Back-compat constructor: no explicit parent/firstRowId/keyId. */
     public AddSnapshotUpdate(
         long snapshotId, String manifestListSuffix, Map<String, String> summary,
         long timestampDeltaMs, int schemaId, long addedRows) {
+      this(snapshotId, manifestListSuffix, summary, timestampDeltaMs, schemaId,
+          addedRows, null, null, null);
+    }
+
+    /** Full constructor with optional parent snapshot id, first row id, key id. */
+    public AddSnapshotUpdate(
+        long snapshotId, String manifestListSuffix, Map<String, String> summary,
+        long timestampDeltaMs, int schemaId, long addedRows,
+        Long parentSnapshotId, Long firstRowId, String keyId) {
       this.snapshotId = snapshotId;
       this.manifestListSuffix = manifestListSuffix;
       this.summary = summary;
       this.timestampDeltaMs = timestampDeltaMs;
       this.schemaId = schemaId;
       this.addedRows = addedRows;
+      this.parentSnapshotId = parentSnapshotId;
+      this.firstRowId = firstRowId;
+      this.keyId = keyId;
     }
 
     /**
@@ -689,8 +720,16 @@ public class InlineDeltaCodec {
      */
     public TableMetadata applyTo(TableMetadata base, String manifestListPrefix) {
       long seqNum = base.lastSequenceNumber() + 1;
-      long parentSnapshotId = base.currentSnapshot() != null
-          ? base.currentSnapshot().snapshotId() : -1;
+      // Prefer explicit parentSnapshotId (correct for stage-only, branch, cherry-pick).
+      // Fall back to base.currentSnapshot() for older-format deltas (backward compat).
+      long resolvedParentId;
+      if (parentSnapshotId != null) {
+        resolvedParentId = parentSnapshotId;
+      } else if (base.currentSnapshot() != null) {
+        resolvedParentId = base.currentSnapshot().snapshotId();
+      } else {
+        resolvedParentId = -1;
+      }
       long timestamp = base.lastUpdatedMillis() + timestampDeltaMs;
       int resolvedSchemaId = schemaId > 0 ? schemaId : base.currentSchemaId();
       // For inline snapshots (empty suffix), use a sentinel that SnapshotParser.toJson
@@ -702,8 +741,8 @@ public class InlineDeltaCodec {
       // Build snapshot via JSON + SnapshotParser (BaseSnapshot is package-private)
       StringBuilder json = new StringBuilder("{");
       json.append("\"snapshot-id\":").append(snapshotId);
-      if (parentSnapshotId >= 0) {
-        json.append(",\"parent-snapshot-id\":").append(parentSnapshotId);
+      if (resolvedParentId >= 0) {
+        json.append(",\"parent-snapshot-id\":").append(resolvedParentId);
       }
       json.append(",\"sequence-number\":").append(seqNum);
       json.append(",\"timestamp-ms\":").append(timestamp);
@@ -719,6 +758,19 @@ public class InlineDeltaCodec {
         }
       }
       json.append("}}");
+      if (firstRowId != null) {
+        // Insert first-row-id before the closing brace
+        json.setLength(json.length() - 1);
+        json.append(",\"first-row-id\":").append(firstRowId).append("}");
+      }
+      if (addedRows > 0) {
+        // Insert added-rows (already tracked, but SnapshotParser may expect explicit field)
+        // Note: SnapshotParser.toJson emits added_rows only if present; we preserve symmetry.
+      }
+      if (keyId != null && !keyId.isEmpty()) {
+        json.setLength(json.length() - 1);
+        json.append(",\"key-id\":\"").append(escapeJson(keyId)).append("\"}");
+      }
       Snapshot snapshot = SnapshotParser.fromJson(json.toString());
 
       return TableMetadata.buildFrom(base)
@@ -910,6 +962,16 @@ public class InlineDeltaCodec {
       }
       if (u.addedRows > 0) {
         writeVarint64(inner, SNAP_ADDED_ROWS, u.addedRows);
+      }
+      // Optional fields for stage-only/branch/cherry-pick/v3+/encrypted tables
+      if (u.parentSnapshotId != null) {
+        writeFixed64(inner, SNAP_PARENT_ID, u.parentSnapshotId);
+      }
+      if (u.firstRowId != null) {
+        writeVarint64(inner, SNAP_FIRST_ROW_ID, u.firstRowId);
+      }
+      if (u.keyId != null && !u.keyId.isEmpty()) {
+        writeString(inner, SNAP_KEY_ID, u.keyId);
       }
       writeLengthDelimited(out, UPDATE_ADD_SNAPSHOT, inner.toByteArray());
 
@@ -1180,6 +1242,9 @@ public class InlineDeltaCodec {
     String manifestSuffix = "";
     Map<String, String> summary = new HashMap<>();
     int schemaId = 0;
+    Long parentId = null;
+    Long firstRowId = null;
+    String keyId = null;
 
     while (in.available() > 0) {
       int tag = readVarint(in);
@@ -1193,11 +1258,14 @@ public class InlineDeltaCodec {
         case SNAP_TIMESTAMP_DELTA: timestampDelta = readSVarint64(in); break;
         case SNAP_SCHEMA_ID: schemaId = readVarint(in); break;
         case SNAP_ADDED_ROWS: addedRows = readVarint64(in); break;
+        case SNAP_PARENT_ID: parentId = readFixed64(in); break;
+        case SNAP_FIRST_ROW_ID: firstRowId = readVarint64(in); break;
+        case SNAP_KEY_ID: keyId = readString(in); break;
         default: skipField(in, tag & 0x7);
       }
     }
     return new AddSnapshotUpdate(snapId, manifestSuffix, summary, timestampDelta,
-        schemaId, addedRows);
+        schemaId, addedRows, parentId, firstRowId, keyId);
   }
 
   // ============================================================

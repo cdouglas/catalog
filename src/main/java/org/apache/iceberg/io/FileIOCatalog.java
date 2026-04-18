@@ -420,7 +420,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         // Attach manifest list deltas if this ops implements ManifestListSink
         boolean hasMLDeltas = false;
         if (this instanceof InlineManifestTableOperations) {
-          Map<Long, ManifestListDelta> mlDeltas =
+          Map<Long, InlineManifestTableOperations.StagedSnapshotData> mlDeltas =
               ((InlineManifestTableOperations) this).drainStagedDeltas();
           java.util.Set<Long> oldSnapIds = new java.util.HashSet<>();
           if (base != null) {
@@ -430,11 +430,12 @@ public class FileIOCatalog extends BaseMetastoreCatalog
           }
           for (org.apache.iceberg.Snapshot snap : metadata.snapshots()) {
             if (!oldSnapIds.contains(snap.snapshotId())) {
-              ManifestListDelta mlDelta = mlDeltas.get(snap.snapshotId());
-              if (mlDelta != null && delta != null) {
+              InlineManifestTableOperations.StagedSnapshotData staged =
+                  mlDeltas.get(snap.snapshotId());
+              if (staged != null && delta != null) {
                 InlineDeltaCodec.attachManifestDelta(
                     delta, snap.snapshotId(),
-                    mlDelta.added(), mlDelta.removedPaths(), manifestPrefix);
+                    staged.delta.added(), staged.delta.removedPaths(), manifestPrefix);
                 hasMLDeltas = true;
               }
             }
@@ -536,7 +537,23 @@ public class FileIOCatalog extends BaseMetastoreCatalog
   static class InlineManifestTableOperations extends FileIOTableOperations
       implements ManifestListSink {
 
-    private final Map<Long, ManifestListDelta> stagedDeltas = new LinkedHashMap<>();
+    /** Staged per-snapshot sink data, keyed by snapshot id. */
+    static final class StagedSnapshotData {
+      final ManifestListDelta delta;
+      final Long parentSnapshotId;
+      final Long nextRowId;
+      final Long nextRowIdAfter;
+
+      StagedSnapshotData(ManifestListDelta delta, Long parentSnapshotId,
+          Long nextRowId, Long nextRowIdAfter) {
+        this.delta = delta;
+        this.parentSnapshotId = parentSnapshotId;
+        this.nextRowId = nextRowId;
+        this.nextRowIdAfter = nextRowIdAfter;
+      }
+    }
+
+    private final Map<Long, StagedSnapshotData> stagedDeltas = new LinkedHashMap<>();
 
     InlineManifestTableOperations(
         TableIdentifier tableId, String catalogLocation,
@@ -555,12 +572,13 @@ public class FileIOCatalog extends BaseMetastoreCatalog
     public void stageManifestListDelta(
         long sequenceNumber, long snapshotId, Long parentSnapshotId,
         Long nextRowId, ManifestListDelta delta, Long nextRowIdAfter) {
-      stagedDeltas.put(snapshotId, delta);
+      stagedDeltas.put(snapshotId,
+          new StagedSnapshotData(delta, parentSnapshotId, nextRowId, nextRowIdAfter));
     }
 
-    /** Returns and clears all staged manifest list deltas. */
-    Map<Long, ManifestListDelta> drainStagedDeltas() {
-      Map<Long, ManifestListDelta> result = new LinkedHashMap<>(stagedDeltas);
+    /** Returns and clears all staged sink data (keyed by snapshot id). */
+    Map<Long, StagedSnapshotData> drainStagedDeltas() {
+      Map<Long, StagedSnapshotData> result = new LinkedHashMap<>(stagedDeltas);
       stagedDeltas.clear();
       return result;
     }
