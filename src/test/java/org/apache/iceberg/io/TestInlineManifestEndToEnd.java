@@ -433,6 +433,48 @@ public class TestInlineManifestEndToEnd {
     }
 
     /**
+     * §2.6: Expiring a snapshot must cascade to the catalog pool — remove the
+     * snapshot's ref list and GC pool entries no longer referenced. Without
+     * the cascade, the pool grows indefinitely with expired-snapshot count.
+     */
+    @Test
+    void expireSnapshotsGcsPool() {
+      createNamespaceAndTable();
+      Table tbl = catalog.loadTable(TBL);
+      tbl.newFastAppend().appendFile(FILE_A).commit();
+      long firstSnapId = tbl.currentSnapshot().snapshotId();
+      tbl.newFastAppend().appendFile(FILE_B).commit();
+      long secondSnapId = tbl.currentSnapshot().snapshotId();
+
+      // Expire the first snapshot; second is current (retained)
+      tbl.expireSnapshots().expireSnapshotId(firstSnapId).commit();
+
+      // Reload via fresh catalog and inspect the pool
+      FileIOCatalog fresh = reloadCatalog();
+      Table reloaded = fresh.loadTable(TBL);
+      assertThat(reloaded.snapshot(firstSnapId))
+          .as("expired snapshot should be gone from metadata")
+          .isNull();
+      assertThat(reloaded.currentSnapshot().snapshotId())
+          .as("second snapshot retained")
+          .isEqualTo(secondSnapId);
+      // Current snapshot still has its 2 manifests (carry-forward M_A + new M_B)
+      assertThat(reloaded.currentSnapshot().allManifests(io)).hasSize(2);
+
+      // Inspect pool directly: should not have entries for the expired snapshot
+      ProtoCatalogFormat fmt = new ProtoCatalogFormat();
+      ProtoCatalogFile proto = (ProtoCatalogFile) fmt.read(
+          io, io.newInputFile("mem:///warehouse/catalog"));
+      Integer tblId = proto.tableId(TBL);
+      // The expired snapshot's ref list must be gone
+      assertThat(proto.hasInlineManifests(tblId, firstSnapId))
+          .as("expired snapshot's ref list should be GC'd")
+          .isFalse();
+      // The retained snapshot still has refs
+      assertThat(proto.hasInlineManifests(tblId, secondSnapId)).isTrue();
+    }
+
+    /**
      * §1.1: After a FastAppend populates the pool, a non-ML commit (e.g.
      * property change) that would naturally go through full mode must NOT
      * clobber the pool. Validates both the commit-time guard (forces delta

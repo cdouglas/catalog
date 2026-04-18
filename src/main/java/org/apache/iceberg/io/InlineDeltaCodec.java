@@ -236,6 +236,20 @@ public class InlineDeltaCodec {
         }
         refs.removeIf(p -> p.endsWith(rm.manifestPathSuffix));
         catalogBuilder.setSnapshotManifests(tableId, rm.snapshotId, refs);
+      } else if (update instanceof RemoveSnapshotsUpdate) {
+        // Cascade snapshot removal to the catalog pool: drop the snapshot's ref
+        // list and GC any pool entries no longer referenced. Without this, the
+        // pool grows unboundedly as snapshots are expired.
+        // See ML_INLINE_REVIEW2.md §2.6 / ML_INLINE_DESIGN_NOTES.md Gap 1.
+        RemoveSnapshotsUpdate rs = (RemoveSnapshotsUpdate) update;
+        for (long snapId : rs.snapshotIds) {
+          catalogBuilder.removeSnapshotManifests(tableId, snapId);
+        }
+        // Also remove from TableMetadata (Builder.removeSnapshots handles the
+        // dangling-refs cleanup for the TM side).
+        TableMetadata.Builder tmBuilder = TableMetadata.buildFrom(current);
+        update.applyTo(tmBuilder);
+        current = tmBuilder.discardChanges().build();
       } else {
         // Schema, properties, sort order, refs, etc. — apply to TableMetadata.Builder
         TableMetadata.Builder tmBuilder = TableMetadata.buildFrom(current);

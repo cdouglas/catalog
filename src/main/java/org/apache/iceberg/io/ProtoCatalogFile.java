@@ -588,6 +588,36 @@ public class ProtoCatalogFile extends CatalogFile {
       return paths != null ? paths : List.of();
     }
 
+    /**
+     * Drops a snapshot's manifest ref list and GCs any pool entries no longer
+     * referenced. Called from RemoveSnapshotsUpdate replay to prevent unbounded
+     * pool growth after snapshot expiration. See ML_INLINE_DESIGN_NOTES.md Gap 1.
+     */
+    public Builder removeSnapshotManifests(int tblId, long snapshotId) {
+      Map<Long, List<String>> refs = snapshotManifests.get(tblId);
+      if (refs == null) {
+        return this;
+      }
+      List<String> dropped = refs.remove(snapshotId);
+      if (dropped == null || dropped.isEmpty()) {
+        return this;
+      }
+      // Collect paths still referenced by any remaining snapshot
+      Set<String> stillReferenced = new HashSet<>();
+      for (List<String> snapRefs : refs.values()) {
+        stillReferenced.addAll(snapRefs);
+      }
+      Map<String, ManifestFile> pool = manifestPool.get(tblId);
+      if (pool != null) {
+        for (String path : dropped) {
+          if (!stillReferenced.contains(path)) {
+            pool.remove(path);
+          }
+        }
+      }
+      return this;
+    }
+
     public boolean isInlineTable(int id) {
       return tblInlineMetadata.containsKey(id);
     }
