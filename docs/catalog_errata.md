@@ -203,3 +203,95 @@ serializes InlineSnapshot via the v1 embedded-manifests branch.
 Reversed comparison to `manifestList.equals(committedSnapshot.
 manifestListLocation())` — the loop variable is never null, making the
 comparison null-safe when the committed snapshot is an InlineSnapshot.
+
+## ML_INLINE_REVIEW2.md Remediation (2026-04-17 → 2026-04-18)
+
+### §1.3/§2.5 Resolved: AddSnapshotUpdate wire format extended
+
+Added three optional wire fields to `AddSnapshot` (proto fields 7, 8, 9):
+- `parent_snapshot_id` (fixed64): required for stage-only, branch
+  commits, cherry-pick. Replaces the buggy `base.currentSnapshot()`
+  fallback.
+- `first_row_id` (int64): required for v3+ row-lineage tables.
+- `key_id` (string): required for encrypted tables.
+
+All optional for backward compatibility. `computeDelta` populates from
+`Snapshot.parentId()`, `Snapshot.firstRowId()`, `Snapshot.keyId()`.
+Sink now captures `nextRowId`/`nextRowIdAfter` into a
+`StagedSnapshotData` record.
+
+### §1.1 Resolved: Full-mode pool preservation
+
+Two-layer defense:
+1. Replay-side (ProtoCodec UpdateTableInlineAction full-mode branch):
+   uses `updateInlineMetadata` instead of `removeInlineMetadata +
+   addInlineTable`. `removeInlineMetadata` reserved for POINTER-mode
+   eviction.
+2. Commit-side (FileIOCatalog.commitInline): force delta mode when the
+   catalog has an existing ML pool, regardless of whether the current
+   commit stages new ML deltas. Prevents oversized full TM writes.
+
+### §2.6 Resolved: RemoveSnapshotsUpdate cascade to pool
+
+`ProtoCatalogFile.Builder.removeSnapshotManifests(tblId, snapshotId)`
+drops the snapshot's ref list and GCs any pool entries no longer
+referenced. `applyDeltaWithManifests` routes `RemoveSnapshotsUpdate`
+through this helper. Prevents unbounded pool growth after snapshot
+expiration.
+
+### §1.2 Partial: commitTransaction ML integration
+
+Per-snapshot ML delta is now extracted from staged snapshots in
+`newMetadata` and attached to the `UpdateTableInlineDelta`. Works for
+single-table transactions. **Caveat**: `BaseTransaction`'s
+`TransactionTableOperations` wrapper doesn't forward `ManifestListSink`,
+so `SnapshotProducer` writes a transient `snap-*.avro` during transaction
+staging. The ML delta is still captured via `allManifests(io)` but the
+Avro file is written. Eliminating that requires forwarding the sink
+through the wrapper (iceberg core change; tracked as follow-up).
+
+### §2.1 Resolved: Delta ordering invariant
+
+`applyDeltaWithManifests` now documents and enforces: `AddSnapshotUpdate`
+must precede `AddManifestUpdate` / `RemoveManifestUpdate` for the same
+snapshot id. Fails with `IllegalStateException` on violation.
+
+### §2.3 Resolved: inline:// sentinel leak check
+
+`wrapInlineManifests` scans for `inline://` sentinel locations without
+corresponding pool entries and throws `IllegalStateException`. Prevents
+silent `File not found` errors when the pool is corrupted.
+
+### §2.4 Resolved (docs): InlineSnapshot.equals semantics
+
+Class javadoc now documents that `equals` compares only scalar identity
+fields, NOT manifest list contents. Callers needing manifest-pool
+divergence detection must compare `allManifests()` directly.
+
+### §2.7 Partial: Mixed-mode detection
+
+`wrapInlineManifests` logs a warning when a table has both inline and
+pointer-mode snapshots. Strict-mode rejection deferred (requires
+threading the catalog property through to the static inner class).
+
+### §4.1 Resolved (partial): Per-operation test coverage
+
+Added 5 new tests to `TmMlTests` covering MergeAppend, Overwrite,
+ReplacePartitions, Delete, RewriteManifests. CherryPickOperation and
+BaseRowDelta still untested (deferred — require more complex setup).
+Writing the Overwrite test discovered a latent bug: `computeDelta` did
+not ensure the "operation" key was present in the summary map, so
+non-append operations round-tripped as "append" on reload. Fixed.
+
+### Open follow-ups (tracked, not closed)
+
+- **§2.2 core fork**: `TableMetadata.Builder.replaceSnapshots` change
+  in iceberg-core is still load-bearing. Replacing `wrapInlineManifests`
+  with a parser-level wrap strategy would remove the fork.
+- **TransactionTableOperations sink forwarding**: required for
+  commitTransaction to avoid writing transient `snap-*.avro` files.
+- **Multi-table buildTable().create() bug**: consecutive creates in
+  a single catalog session overwrite each other. Pre-existing,
+  unrelated to ML.
+- **CherryPickOperation / BaseRowDelta end-to-end tests**: deferred.
+- **Strict mixed-mode rejection**: deferred.
