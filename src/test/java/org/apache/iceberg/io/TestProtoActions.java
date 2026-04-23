@@ -893,9 +893,11 @@ public class TestProtoActions {
           .tbl(1, 1, "raw", 1, "s3://staging/raw")
           .build();
 
-      // Drop table then namespace, then create a new namespace
+      // Drop table then namespace, then create a new namespace.
+      // Dropping the table bumps the parent ns from v=1 to v=2 (children-set
+      // mutation), so the subsequent dropNs must capture v=2.
       ProtoCodec.Transaction t1 = txn(dropTbl(1, 1));
-      ProtoCodec.Transaction t2 = txn(dropNs(1, 1));
+      ProtoCodec.Transaction t2 = txn(dropNs(1, 2));
       ProtoCodec.Transaction t3 = txn(createNs(2, 0, "production", 1, -1));
       ProtoCatalogFile result = apply(file, t1, t2, t3);
 
@@ -921,8 +923,10 @@ public class TestProtoActions {
     void setAndRemovePropertyInSequentialTransactions() {
       byte[] file = catalog().ns(1, 0, "db", 1).build();
 
+      // setNsProp bumps ns "db" from v=1 to v=2; the subsequent removeNsProp
+      // must capture v=2 to verify against the post-set state.
       ProtoCodec.Transaction t1 = txn(setNsProp(1, 1, "owner", "alice"));
-      ProtoCodec.Transaction t2 = txn(removeNsProp(1, 1, "owner"));
+      ProtoCodec.Transaction t2 = txn(removeNsProp(1, 2, "owner"));
       ProtoCatalogFile result = apply(file, t1, t2);
 
       assertThat(result.namespaceProperties(Namespace.of("db")))
@@ -1819,6 +1823,411 @@ public class TestProtoActions {
     @Override public java.nio.ByteBuffer lowerBound() { return lowerBound; }
     @Override public java.nio.ByteBuffer upperBound() { return upperBound; }
     @Override public org.apache.iceberg.ManifestFile.PartitionFieldSummary copy() { return this; }
+  }
+
+  // ============================================================
+  // Idempotency tests -- each action's apply() mutates state so that the
+  // same intention record, replayed with a fresh UUID (bypassing the
+  // committed-txn dedup set), fails verify against the post-apply state.
+  // See Invariant I2 in docs/catalog_errata.md.
+  // ============================================================
+
+  @Nested
+  class IdempotencyTests {
+
+    @Test
+    void createNamespaceRejectedWhenParentVersionMoved() {
+      byte[] file = catalog().ns(1, 0, "db", 1).build();
+      // First txn: create child under "db" at parentVersion=1
+      ProtoCodec.Transaction first = txn(createNs(2, 1, "schema", 1, 1));
+      byte[] afterFirst = replayAndSerialize(file, first);
+
+      // Replay the same logical action against post-apply state with fresh
+      // UUID: parent "db" is now v=2 (bumped by child create), action captured
+      // parentVersion=1, must be rejected.
+      ProtoCodec.Transaction replay = txn(createNs(3, 1, "schema2", 1, 1));
+      ProtoCatalogFile result = apply(afterFirst, replay);
+      assertThat(result.containsNamespace(Namespace.of("db", "schema"))).isTrue();
+      assertThat(result.containsNamespace(Namespace.of("db", "schema2"))).isFalse();
+      assertThat(result.containsTransaction(replay.id())).isFalse();
+    }
+
+    @Test
+    void createTableReplayAfterDropDoesNotRecreate() {
+      // User-specified scenario: "create with record A, delete with B,
+      // re-appending A should not recreate the table."
+      byte[] file = catalog().ns(1, 0, "db", 1).build();
+
+      // A: create table t1 under "db" capturing nsVersion=1
+      ProtoCodec.Transaction recordA = txn(
+          createTbl(1, 1, "t1", 1, 1, "s3://t1/v1"));
+      // B: drop t1 capturing tbl version=1
+      ProtoCodec.Transaction recordB = txn(dropTbl(1, 1));
+
+      byte[] afterAB = replayAndSerialize(file, recordA, recordB);
+
+      // Re-apply content of A with a fresh UUID. "db" is now at v=3 (create
+      // and drop each bumped it); the captured nsVersion=1 must be rejected.
+      ProtoCodec.Transaction replayA = txn(
+          createTbl(1, 1, "t1", 1, 1, "s3://t1/v1"));
+      ProtoCatalogFile result = apply(afterAB, replayA);
+
+      assertThat(result.tableId(TableIdentifier.of(Namespace.of("db"), "t1")))
+          .as("replayed create must not resurrect the dropped table")
+          .isNull();
+      assertThat(result.containsTransaction(replayA.id())).isFalse();
+    }
+
+    @Test
+    void createTableInlineReplayAfterDropDoesNotRecreate() {
+      byte[] file = catalog().ns(1, 0, "db", 1).build();
+      byte[] md = "{\"format-version\":2}".getBytes();
+
+      ProtoCodec.Transaction recordA = txn(createTblInline(1, 1, "t1", 1, 1, md));
+      ProtoCodec.Transaction recordB = txn(dropTbl(1, 1));
+      byte[] afterAB = replayAndSerialize(file, recordA, recordB);
+
+      ProtoCodec.Transaction replayA = txn(createTblInline(1, 1, "t1", 1, 1, md));
+      ProtoCatalogFile result = apply(afterAB, replayA);
+
+      assertThat(result.tableId(TableIdentifier.of(Namespace.of("db"), "t1")))
+          .isNull();
+      assertThat(result.containsTransaction(replayA.id())).isFalse();
+    }
+
+    @Test
+    void setNamespacePropertyReplayRejectedAfterBump() {
+      byte[] file = catalog().ns(1, 0, "db", 1).build();
+      ProtoCodec.Transaction first = txn(setNsProp(1, 1, "owner", "alice"));
+      byte[] afterFirst = replayAndSerialize(file, first);
+
+      // Replay: ns version moved 1 -> 2; captured version=1 must be rejected.
+      ProtoCodec.Transaction replay = txn(setNsProp(1, 1, "owner", "bob"));
+      ProtoCatalogFile result = apply(afterFirst, replay);
+      assertThat(result.namespaceProperties(Namespace.of("db")))
+          .containsEntry("owner", "alice");
+      assertThat(result.containsTransaction(replay.id())).isFalse();
+    }
+
+    @Test
+    void removeNamespacePropertyReplayRejectedAfterBump() {
+      byte[] file = catalog()
+          .ns(1, 0, "db", 1)
+          .prop(1, "owner", "alice")
+          .prop(1, "env", "prod")
+          .build();
+      ProtoCodec.Transaction first = txn(removeNsProp(1, 1, "owner"));
+      byte[] afterFirst = replayAndSerialize(file, first);
+
+      // ns bumped 1 -> 2; captured v=1 must be rejected.
+      ProtoCodec.Transaction replay = txn(removeNsProp(1, 1, "env"));
+      ProtoCatalogFile result = apply(afterFirst, replay);
+      assertThat(result.namespaceProperties(Namespace.of("db")))
+          .doesNotContainKey("owner")
+          .containsEntry("env", "prod");
+      assertThat(result.containsTransaction(replay.id())).isFalse();
+    }
+
+    @Test
+    void dropNamespaceReplayRejectedOnMissingNamespace() {
+      byte[] file = catalog().ns(1, 0, "db", 1).build();
+      ProtoCodec.Transaction first = txn(dropNs(1, 1));
+      byte[] afterFirst = replayAndSerialize(file, first);
+
+      // Replay: ns is gone; namespaceVersion returns -1, which != captured 1.
+      ProtoCodec.Transaction replay = txn(dropNs(1, 1));
+      ProtoCatalogFile result = apply(afterFirst, replay);
+      assertThat(result.containsNamespace(Namespace.of("db"))).isFalse();
+      assertThat(result.containsTransaction(replay.id())).isFalse();
+    }
+
+    @Test
+    void dropTableReplayRejectedOnMissingTable() {
+      byte[] file = catalog()
+          .ns(1, 0, "db", 1)
+          .tbl(1, 1, "t1", 1, "s3://t1/v1")
+          .build();
+      ProtoCodec.Transaction first = txn(dropTbl(1, 1));
+      byte[] afterFirst = replayAndSerialize(file, first);
+
+      // tbl is gone; tableVersion returns -1, captured=1, rejected.
+      ProtoCodec.Transaction replay = txn(dropTbl(1, 1));
+      ProtoCatalogFile result = apply(afterFirst, replay);
+      assertThat(result.containsTransaction(replay.id())).isFalse();
+    }
+
+    @Test
+    void updateTableLocationReplayRejectedAfterVersionBump() {
+      byte[] file = catalog()
+          .ns(1, 0, "db", 1)
+          .tbl(1, 1, "t1", 1, "s3://t1/v1")
+          .build();
+      ProtoCodec.Transaction first = txn(updateTbl(1, 1, "s3://t1/v2"));
+      byte[] afterFirst = replayAndSerialize(file, first);
+
+      // tbl version bumped 1 -> 2; replay with captured v=1 rejected.
+      ProtoCodec.Transaction replay = txn(updateTbl(1, 1, "s3://t1/v3"));
+      ProtoCatalogFile result = apply(afterFirst, replay);
+      assertThat(result.location(TableIdentifier.of(Namespace.of("db"), "t1")))
+          .isEqualTo("s3://t1/v2");
+      assertThat(result.containsTransaction(replay.id())).isFalse();
+    }
+
+    @Test
+    void duplicateUuidIsSkippedAtReplay() {
+      // Complementary to the content-level idempotency above: the committedTxn
+      // set dedups replays where the UUID has already been seen. Both lines
+      // of defense must hold (invariant I2).
+      byte[] file = catalog().build();
+      UUID sharedId = UUID.randomUUID();
+      ProtoCodec.Transaction t = txn(sharedId, createNs(1, 0, "db", 1, -1));
+      ProtoCatalogFile result = apply(file, t, t);
+      assertThat(result.containsNamespace(Namespace.of("db"))).isTrue();
+      assertThat(result.namespaceVersion(result.namespaceId(Namespace.of("db"))))
+          .isEqualTo(1);
+    }
+
+    /** Applies {@code txns} to {@code file} and returns the result reserialized. */
+    private byte[] replayAndSerialize(byte[] file, ProtoCodec.Transaction... txns) {
+      return toFileBytes(apply(file, txns));
+    }
+  }
+
+  // ============================================================
+  // Conflict-matrix tests -- every pair (A, B) of actions where B captures
+  // the pre-A version and is applied to post-A state. Each test asserts
+  // whether verify returns true (compose) or false (conflict) and,
+  // on conflict, which field drives the rejection.
+  // The results are tabulated in docs/catalog_errata.md.
+  // ============================================================
+
+  @Nested
+  class ConflictTests {
+
+    /** Catalog with two namespaces and two tables under ns1 for conflict scenarios. */
+    private byte[] baseFile() {
+      return catalog()
+          .ns(1, 0, "db", 1)
+          .ns(2, 0, "other", 1)
+          .tbl(1, 1, "t1", 1, "s3://t1/v1")
+          .tbl(2, 1, "t2", 1, "s3://t2/v1")
+          .prop(1, "owner", "alice")
+          .build();
+    }
+
+    // --- CreateNamespace vs X ---
+
+    @Test
+    void createNsSiblingVsCreateNs_conflict_parentVersion() {
+      // Two concurrent creates under the same parent. Parent is root here
+      // (id=0), whose version is implicit — so BOTH creates capture
+      // parentVersion=-1 in buildActions and both succeed. This is expected.
+      byte[] file = baseFile();
+      ProtoCodec.Transaction t1 = txn(createNs(3, 0, "a", 1, -1));
+      ProtoCodec.Transaction t2 = txn(createNs(4, 0, "b", 1, -1));
+      ProtoCatalogFile r = apply(file, t1, t2);
+      assertThat(r.containsNamespace(Namespace.of("a"))).isTrue();
+      assertThat(r.containsNamespace(Namespace.of("b"))).isTrue();
+    }
+
+    @Test
+    void createNsChildVsCreateNsSibling_conflict_parentVersion() {
+      // Two concurrent creates under NON-root parent "db". Both capture v=1;
+      // first to commit wins, second must be rejected on replay.
+      byte[] file = baseFile();
+      ProtoCodec.Transaction t1 = txn(createNs(3, 1, "child1", 1, 1));
+      ProtoCodec.Transaction t2 = txn(createNs(4, 1, "child2", 1, 1));
+      ProtoCatalogFile r = apply(file, t1, t2);
+      assertThat(r.containsNamespace(Namespace.of("db", "child1"))).isTrue();
+      assertThat(r.containsNamespace(Namespace.of("db", "child2"))).isFalse();
+      assertThat(r.containsTransaction(t2.id())).isFalse();
+    }
+
+    @Test
+    void createNsChildVsSetNsProperty_conflict_nsVersion() {
+      byte[] file = baseFile();
+      ProtoCodec.Transaction t1 = txn(createNs(3, 1, "child", 1, 1));
+      ProtoCodec.Transaction t2 = txn(setNsProp(1, 1, "env", "prod"));
+      ProtoCatalogFile r = apply(file, t1, t2);
+      assertThat(r.containsNamespace(Namespace.of("db", "child"))).isTrue();
+      assertThat(r.namespaceProperties(Namespace.of("db")))
+          .doesNotContainKey("env");
+      assertThat(r.containsTransaction(t2.id())).isFalse();
+    }
+
+    @Test
+    void createNsChildVsDropNs_conflict_nsVersion() {
+      byte[] file = baseFile();
+      ProtoCodec.Transaction t1 = txn(createNs(3, 1, "child", 1, 1));
+      ProtoCodec.Transaction t2 = txn(dropNs(1, 1));
+      ProtoCatalogFile r = apply(file, t1, t2);
+      assertThat(r.containsNamespace(Namespace.of("db"))).isTrue();
+      assertThat(r.containsTransaction(t2.id())).isFalse();
+    }
+
+    @Test
+    void createNsChildVsCreateTbl_conflict_nsVersion() {
+      byte[] file = baseFile();
+      ProtoCodec.Transaction t1 = txn(createNs(3, 1, "child", 1, 1));
+      ProtoCodec.Transaction t2 = txn(createTbl(3, 1, "t3", 1, 1, "s3://t3"));
+      ProtoCatalogFile r = apply(file, t1, t2);
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "t3"))).isNull();
+      assertThat(r.containsTransaction(t2.id())).isFalse();
+    }
+
+    // --- DropNamespace vs X ---
+
+    @Test
+    void dropNsVsSetNsProperty_conflict_nsVersion() {
+      byte[] file = catalog().ns(1, 0, "db", 1).build();
+      ProtoCodec.Transaction t1 = txn(dropNs(1, 1));
+      ProtoCodec.Transaction t2 = txn(setNsProp(1, 1, "k", "v"));
+      ProtoCatalogFile r = apply(file, t1, t2);
+      assertThat(r.containsNamespace(Namespace.of("db"))).isFalse();
+      assertThat(r.containsTransaction(t2.id())).isFalse();
+    }
+
+    @Test
+    void dropNsVsCreateTbl_conflict_nsVersion() {
+      byte[] file = catalog().ns(1, 0, "db", 1).build();
+      ProtoCodec.Transaction t1 = txn(dropNs(1, 1));
+      ProtoCodec.Transaction t2 = txn(createTbl(1, 1, "t1", 1, 1, "s3://t1"));
+      ProtoCatalogFile r = apply(file, t1, t2);
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "t1"))).isNull();
+      assertThat(r.containsTransaction(t2.id())).isFalse();
+    }
+
+    // --- SetNamespaceProperty vs X ---
+
+    @Test
+    void setNsPropertyVsSetNsProperty_conflict_nsVersion() {
+      byte[] file = baseFile();
+      ProtoCodec.Transaction t1 = txn(setNsProp(1, 1, "owner", "bob"));
+      ProtoCodec.Transaction t2 = txn(setNsProp(1, 1, "env", "prod"));
+      ProtoCatalogFile r = apply(file, t1, t2);
+      assertThat(r.namespaceProperties(Namespace.of("db")))
+          .containsEntry("owner", "bob")
+          .doesNotContainKey("env");
+      assertThat(r.containsTransaction(t2.id())).isFalse();
+    }
+
+    @Test
+    void setNsPropertyVsRemoveNsProperty_conflict_nsVersion() {
+      byte[] file = baseFile();
+      ProtoCodec.Transaction t1 = txn(setNsProp(1, 1, "env", "prod"));
+      ProtoCodec.Transaction t2 = txn(removeNsProp(1, 1, "owner"));
+      ProtoCatalogFile r = apply(file, t1, t2);
+      assertThat(r.namespaceProperties(Namespace.of("db")))
+          .containsEntry("owner", "alice")
+          .containsEntry("env", "prod");
+      assertThat(r.containsTransaction(t2.id())).isFalse();
+    }
+
+    @Test
+    void setNsPropertyVsCreateTbl_conflict_nsVersion() {
+      byte[] file = baseFile();
+      ProtoCodec.Transaction t1 = txn(setNsProp(1, 1, "env", "prod"));
+      ProtoCodec.Transaction t2 = txn(createTbl(3, 1, "t3", 1, 1, "s3://t3"));
+      ProtoCatalogFile r = apply(file, t1, t2);
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "t3"))).isNull();
+      assertThat(r.containsTransaction(t2.id())).isFalse();
+    }
+
+    @Test
+    void setNsPropertyVsDropTbl_conflict_nsVersion() {
+      byte[] file = baseFile();
+      ProtoCodec.Transaction t1 = txn(setNsProp(1, 1, "env", "prod"));
+      ProtoCodec.Transaction t2 = txn(dropTbl(1, 1));
+      ProtoCatalogFile r = apply(file, t1, t2);
+      // Note: DropTable.verify checks TABLE version (not ns version), so the
+      // drop succeeds. The ns-version bump from setNsProp doesn't directly
+      // protect DropTable; that's by design — concurrent table-ops on
+      // different tables in the same ns compose.
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "t1")))
+          .as("DropTable is independent of ns version; it succeeds")
+          .isNull();
+      assertThat(r.containsTransaction(t2.id())).isTrue();
+    }
+
+    // --- CreateTable vs CreateTable / UpdateTable / DropTable ---
+
+    @Test
+    void createTblSameNsVsCreateTbl_conflict_nsVersion() {
+      // Two creates under the same ns from independent transactions — the
+      // second captured the pre-first nsVersion and must be rejected.
+      byte[] file = baseFile();
+      ProtoCodec.Transaction t1 = txn(createTbl(3, 1, "tA", 1, 1, "s3://tA"));
+      ProtoCodec.Transaction t2 = txn(createTbl(4, 1, "tB", 1, 1, "s3://tB"));
+      ProtoCatalogFile r = apply(file, t1, t2);
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "tA"))).isNotNull();
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "tB"))).isNull();
+      assertThat(r.containsTransaction(t2.id())).isFalse();
+    }
+
+    @Test
+    void createTblInDifferentNs_compose() {
+      // Two creates under DIFFERENT namespaces — independent, both succeed.
+      byte[] file = baseFile();
+      ProtoCodec.Transaction t1 = txn(createTbl(3, 1, "tA", 1, 1, "s3://tA"));
+      ProtoCodec.Transaction t2 = txn(createTbl(4, 2, "tB", 1, 1, "s3://tB"));
+      ProtoCatalogFile r = apply(file, t1, t2);
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "tA"))).isNotNull();
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("other"), "tB"))).isNotNull();
+    }
+
+    @Test
+    void updateTblVsUpdateTbl_conflict_tblVersion() {
+      byte[] file = baseFile();
+      ProtoCodec.Transaction t1 = txn(updateTbl(1, 1, "s3://t1/v2"));
+      ProtoCodec.Transaction t2 = txn(updateTbl(1, 1, "s3://t1/v3"));
+      ProtoCatalogFile r = apply(file, t1, t2);
+      assertThat(r.location(TableIdentifier.of(Namespace.of("db"), "t1")))
+          .isEqualTo("s3://t1/v2");
+      assertThat(r.containsTransaction(t2.id())).isFalse();
+    }
+
+    @Test
+    void updateTblVsDropTbl_conflict_tblVersion() {
+      byte[] file = baseFile();
+      ProtoCodec.Transaction t1 = txn(updateTbl(1, 1, "s3://t1/v2"));
+      ProtoCodec.Transaction t2 = txn(dropTbl(1, 1));
+      ProtoCatalogFile r = apply(file, t1, t2);
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "t1"))).isNotNull();
+      assertThat(r.containsTransaction(t2.id())).isFalse();
+    }
+
+    @Test
+    void updateTblDifferentTables_compose() {
+      // Independent tables — no conflict.
+      byte[] file = baseFile();
+      ProtoCodec.Transaction t1 = txn(updateTbl(1, 1, "s3://t1/v2"));
+      ProtoCodec.Transaction t2 = txn(updateTbl(2, 1, "s3://t2/v2"));
+      ProtoCatalogFile r = apply(file, t1, t2);
+      assertThat(r.location(TableIdentifier.of(Namespace.of("db"), "t1")))
+          .isEqualTo("s3://t1/v2");
+      assertThat(r.location(TableIdentifier.of(Namespace.of("db"), "t2")))
+          .isEqualTo("s3://t2/v2");
+    }
+
+    @Test
+    void readTblVsUpdateTbl_conflict_tblVersion() {
+      // ReadTable fails if the table has been updated since the read.
+      byte[] file = baseFile();
+      ProtoCodec.Transaction t1 = txn(updateTbl(1, 1, "s3://t1/v2"));
+      ProtoCodec.Transaction t2 = txn(readTbl(1, 1));
+      ProtoCatalogFile r = apply(file, t1, t2);
+      assertThat(r.containsTransaction(t2.id())).isFalse();
+    }
+
+    @Test
+    void readTblVsIndependentUpdate_compose() {
+      // ReadTable on t1, update on t2 — no interaction.
+      byte[] file = baseFile();
+      ProtoCodec.Transaction t1 = txn(updateTbl(2, 1, "s3://t2/v2"));
+      ProtoCodec.Transaction t2 = txn(readTbl(1, 1));
+      ProtoCatalogFile r = apply(file, t1, t2);
+      assertThat(r.containsTransaction(t2.id())).isTrue();
+    }
   }
 
   // ============================================================

@@ -1641,6 +1641,10 @@ public class ProtoCodec {
     @Override
     public void apply(ProtoCatalogFile.Builder builder) {
       builder.addNamespace(id, parentId, name, version);
+      // Creating a child namespace mutates the parent's children set; bump so
+      // concurrent mutations of the parent (create sibling, drop parent, set
+      // property) fail verify if they captured the pre-bump version.
+      builder.bumpNamespaceVersion(parentId);
     }
   }
 
@@ -1661,7 +1665,12 @@ public class ProtoCodec {
 
     @Override
     public void apply(ProtoCatalogFile.Builder builder) {
+      // Capture parent before removing so we can bump the parent's version
+      // (dropping a child mutates the parent's children set).
+      ProtoCatalogFile.NsEntry entry = builder.namespaceEntry(id);
+      int parentId = entry != null ? entry.parentId : 0;
       builder.removeNamespace(id);
+      builder.bumpNamespaceVersion(parentId);
     }
   }
 
@@ -1690,6 +1699,7 @@ public class ProtoCodec {
     @Override
     public void apply(ProtoCatalogFile.Builder builder) {
       builder.setNamespaceProperty(namespaceId, key, value);
+      builder.bumpNamespaceVersion(namespaceId);
     }
   }
 
@@ -1716,6 +1726,7 @@ public class ProtoCodec {
     @Override
     public void apply(ProtoCatalogFile.Builder builder) {
       builder.removeNamespaceProperty(namespaceId, key);
+      builder.bumpNamespaceVersion(namespaceId);
     }
   }
 
@@ -1751,6 +1762,9 @@ public class ProtoCodec {
     @Override
     public void apply(ProtoCatalogFile.Builder builder) {
       builder.addTable(id, namespaceId, name, version, metadataLocation);
+      // Adding a table mutates the parent's children set; bump so concurrent
+      // ns mutations (drop, set-property, create sibling table) fail verify.
+      builder.bumpNamespaceVersion(namespaceId);
     }
   }
 
@@ -1771,7 +1785,12 @@ public class ProtoCodec {
 
     @Override
     public void apply(ProtoCatalogFile.Builder builder) {
+      // Capture parent before removing so we can bump the parent's version
+      // (dropping a table mutates the parent's children set).
+      ProtoCatalogFile.TblEntry entry = builder.tableEntry(id);
+      int parentNsId = entry != null ? entry.namespaceId : 0;
       builder.removeTable(id);
+      builder.bumpNamespaceVersion(parentNsId);
     }
   }
 
@@ -1938,6 +1957,9 @@ public class ProtoCodec {
       // manifest list prefix is derived from metadata at checkpoint time;
       // for newly created tables, we default to empty (set later on first snapshot)
       builder.addInlineTable(id, namespaceId, name, version, metadata, "");
+      // Adding a table mutates the parent's children set; bump so concurrent
+      // ns mutations fail verify. Same rule as CreateTableAction.
+      builder.bumpNamespaceVersion(namespaceId);
     }
   }
 

@@ -495,6 +495,23 @@ public class ProtoCatalogFile extends CatalogFile {
       return this;
     }
 
+    /**
+     * Increments a namespace's version by one. Called from action applies that mutate
+     * the namespace (children set, properties) so that concurrent / replayed actions
+     * whose preconditions captured the pre-bump version fail {@code verify}. No-op on
+     * the root namespace (id 0), which has no explicit entry.
+     */
+    public Builder bumpNamespaceVersion(int id) {
+      if (id == 0) {
+        return this;
+      }
+      NsEntry old = namespaceById.get(id);
+      if (old != null) {
+        namespaceById.put(id, new NsEntry(old.parentId, old.name, old.version + 1));
+      }
+      return this;
+    }
+
     public Builder addTable(int id, int namespaceId, String name, int version, String metadataLocation) {
       TblEntry entry = new TblEntry(namespaceId, name, version, metadataLocation);
       tableById.put(id, entry);
@@ -664,6 +681,10 @@ public class ProtoCatalogFile extends CatalogFile {
     public int namespaceVersion(int nsId) {
       NsEntry entry = namespaceById.get(nsId);
       return entry != null ? entry.version : -1;
+    }
+
+    public NsEntry namespaceEntry(int nsId) {
+      return namespaceById.get(nsId);
     }
 
     public Integer tableId(TableIdentifier ident) {
