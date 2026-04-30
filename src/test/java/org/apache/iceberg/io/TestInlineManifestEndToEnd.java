@@ -32,8 +32,11 @@ import java.util.function.Supplier;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
+import org.apache.iceberg.DeleteFile;
+import org.apache.iceberg.FileMetadata;
 import org.apache.iceberg.GenericStatisticsFile;
 import org.apache.iceberg.InlineSnapshot;
+import org.apache.iceberg.ManifestContent;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
@@ -276,6 +279,13 @@ public class TestInlineManifestEndToEnd {
       .withPath("/path/to/data-b.parquet")
       .withFileSizeInBytes(10)
       .withPartitionPath("data_bucket=1")
+      .withRecordCount(1)
+      .build();
+  static final DeleteFile FILE_A_POS_DELETES = FileMetadata.deleteFileBuilder(TEST_SPEC)
+      .ofPositionDeletes()
+      .withPath("/path/to/data-a-pos-deletes.parquet")
+      .withFileSizeInBytes(10)
+      .withPartitionPath("data_bucket=0")
       .withRecordCount(1)
       .build();
 
@@ -750,6 +760,76 @@ public class TestInlineManifestEndToEnd {
       // Existing snapshot's manifest list must still round-trip.
       assertThat(reloaded.currentSnapshot()).isNotNull();
       assertThat(reloaded.currentSnapshot().allManifests(io)).hasSize(1);
+    }
+
+    /**
+     * CherryPickOperation: stage an append off-current via stageOnly, then
+     * cherry-pick it back to the main branch. The cherry-pick produces a new
+     * snapshot whose manifest list (= staged snapshot's data) must round-trip
+     * through the inline-ML pool. Errata T1.
+     */
+    @Test
+    void cherryPickCommitAndReload() {
+      createNamespaceAndTable();
+      Table tbl = catalog.loadTable(TBL);
+      tbl.newFastAppend().appendFile(FILE_A).commit();
+      long mainBeforeCherryPick = tbl.currentSnapshot().snapshotId();
+
+      // Stage an append off-current. After stageOnly, the staged snapshot
+      // exists in metadata.snapshots() but the main branch still points at
+      // FILE_A's snapshot.
+      tbl.newAppend().appendFile(FILE_B).stageOnly().commit();
+      tbl.refresh();
+      assertThat(tbl.currentSnapshot().snapshotId()).isEqualTo(mainBeforeCherryPick);
+      Snapshot staged = null;
+      for (Snapshot s : tbl.snapshots()) {
+        if (s.snapshotId() != mainBeforeCherryPick) {
+          staged = s;
+          break;
+        }
+      }
+      assertThat(staged).as("staged snapshot must exist").isNotNull();
+
+      tbl.manageSnapshots().cherrypick(staged.snapshotId()).commit();
+
+      FileIOCatalog fresh = reloadCatalog();
+      Table reloaded = fresh.loadTable(TBL);
+      Snapshot current = reloaded.currentSnapshot();
+      assertThat(current).isNotNull();
+      assertThat(current.snapshotId()).isNotEqualTo(mainBeforeCherryPick);
+      assertThat(current.parentId()).isEqualTo(mainBeforeCherryPick);
+      // Cherry-pick fast-forwards by reusing the staged snapshot's manifest list,
+      // so the cherry-picked snapshot must expose FILE_B's manifest after reload.
+      List<ManifestFile> manifests = current.allManifests(io);
+      assertThat(manifests).as("cherry-picked snapshot manifest list").isNotEmpty();
+      assertThat(manifests).allMatch(mf -> mf.content() == ManifestContent.DATA);
+    }
+
+    /**
+     * BaseRowDelta (newRowDelta): adding a position-delete file produces a
+     * delete manifest that must round-trip alongside the data manifest in the
+     * inline pool. Errata T1.
+     */
+    @Test
+    void rowDeltaCommitAndReload() {
+      createNamespaceAndTable();
+      Table tbl = catalog.loadTable(TBL);
+      tbl.newFastAppend().appendFile(FILE_A).commit();
+      long appendSnapId = tbl.currentSnapshot().snapshotId();
+
+      tbl.newRowDelta().addDeletes(FILE_A_POS_DELETES).commit();
+
+      FileIOCatalog fresh = reloadCatalog();
+      Table reloaded = fresh.loadTable(TBL);
+      Snapshot current = reloaded.currentSnapshot();
+      assertThat(current).isNotNull();
+      assertThat(current.snapshotId()).isNotEqualTo(appendSnapId);
+      assertThat(current.parentId()).isEqualTo(appendSnapId);
+      // Must reload both the inherited data manifest and the new delete manifest.
+      assertThat(current.dataManifests(io)).as("data manifests").isNotEmpty();
+      assertThat(current.deleteManifests(io))
+          .as("delete manifest from row delta must survive reload")
+          .hasSize(1);
     }
 
     /** BaseRewriteManifests (rewriteManifests): manifest-level rewrite. */

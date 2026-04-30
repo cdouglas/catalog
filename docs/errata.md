@@ -95,19 +95,6 @@ who hit it mid-migration can recognize it.
 
 ## Test Coverage Gaps
 
-### T1. `CherryPickOperation` and `BaseRowDelta` are not exercised end-to-end
-
-`TestInlineManifestEndToEnd.TmMlTests` covers `FastAppend`,
-`MergeAppend`, `BaseOverwriteFiles`, `BaseReplacePartitions`,
-`StreamingDelete`, `BaseRewriteManifests`, and `expireSnapshots`. The
-remaining `SnapshotProducer` subclasses — `CherryPickOperation` and
-`BaseRowDelta` — are exercised at the codec level only, not through a
-real `SnapshotProducer.commit()`.
-
-**Fix path:** add cherry-pick (stage append on side branch, cherry-pick
-to main, reload, assert ML round-trips) and rowDelta (data + position
-delete, reload, assert delete-manifest round-trips through the pool).
-
 ### T2. Cloud integration tests don't run in inline-ML mode
 
 `TestS3Catalog`, `GCSCatalogTest`, and `ADLSCatalogTest` set neither
