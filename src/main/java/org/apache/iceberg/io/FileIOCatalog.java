@@ -671,16 +671,15 @@ public class FileIOCatalog extends BaseMetastoreCatalog
             InlineDeltaCodec.computeDelta(currentMetadata, newMetadata, manifestPrefix);
 
         // ML-mode integration: extract per-snapshot manifest delta from staged
-        // snapshots in newMetadata. Cannot reuse the sink drain path because
-        // commitTransaction buffers commits through BaseTransaction's
-        // TransactionTableOperations wrapper, which does not forward
-        // ManifestListSink — so SnapshotProducer writes snap-*.avro and the
-        // snapshot is a BaseSnapshot (not InlineSnapshot). We still want ML
-        // deltas recorded in the catalog; extract via snap.allManifests(io)
-        // which reads the external Avro for pointer-mode or returns the
-        // in-memory list for InlineSnapshot. See ML_INLINE_REVIEW2.md §1.2.
-        // Proper fix requires TransactionTableOperations to forward the sink,
-        // an iceberg-core architectural change tracked as follow-up.
+        // snapshots in newMetadata. After iceberg-core R2 (sink forwarding through
+        // BaseTransaction.TransactionTableOperationsWithSink), SnapshotProducer
+        // takes the inline path inside a transaction too, so each new snapshot is
+        // an InlineSnapshot and snap.allManifests(io) returns its in-memory list
+        // with no FileIO read. The reconstruction below therefore no longer reads
+        // any snap-*.avro file (and none is written). The same code path remains
+        // correct for the rare pointer-mode parent (BaseSnapshot) — allManifests
+        // there still does a real Avro read, used only for parent reconciliation.
+        // See iceberg_refine.md R2 / errata.md S2.
         boolean hasMLPool = proto != null && tblIdNum != null
             && !proto.manifestPool(tblIdNum).isEmpty();
         boolean hasMLDeltas = false;
