@@ -121,7 +121,7 @@ public class GCSCatalogTest extends CatalogTests<FileIOCatalog> {
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
     final String location = warehouseLocation + "/catalog";
     catalog =
-        new FileIOCatalog("test", location, null, new ProtoCatalogFormat(), io, Maps.newHashMap());
+        new FileIOCatalog("test", location, new ProtoCatalogFormat(), io, Maps.newHashMap());
     catalog.initialize(testName, properties);
   }
 

@@ -146,7 +146,7 @@ public class ADLSCatalogTest extends CatalogTests<FileIOCatalog> {
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
     final String location = warehouseLocation + "/catalog";
     CatalogFormat<?, ?> format = new ProtoCatalogFormat();
-    catalog = new FileIOCatalog("test", location, null, format, io, Maps.newHashMap());
+    catalog = new FileIOCatalog("test", location, format, io, Maps.newHashMap());
     catalog.initialize(testName, properties);
   }
 

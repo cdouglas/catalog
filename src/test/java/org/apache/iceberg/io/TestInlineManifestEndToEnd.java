@@ -302,7 +302,7 @@ public class TestInlineManifestEndToEnd {
       String wh = "mem:///warehouse";
       Map<String, String> props = config().catalogProperties(wh);
       catalog = new FileIOCatalog(
-          "test", wh + "/catalog", null, new ProtoCatalogFormat(), io, props);
+          "test", wh + "/catalog", new ProtoCatalogFormat(), io, props);
       catalog.initialize("test", props);
     }
 
@@ -316,10 +316,23 @@ public class TestInlineManifestEndToEnd {
       String wh = "mem:///warehouse";
       Map<String, String> props = config().catalogProperties(wh);
       FileIOCatalog fresh = new FileIOCatalog(
-          "test2", wh + "/catalog", null, new ProtoCatalogFormat(), io, props);
+          "test2", wh + "/catalog", new ProtoCatalogFormat(), io, props);
       fresh.initialize("test2", props);
       return fresh;
     }
+  }
+
+  /**
+   * Errata S3: FileIOCatalog must not implement Hadoop's Configurable.
+   * Reintroducing the dependency drags Hadoop back into the public catalog
+   * surface; loaders that pass a Configuration via CatalogUtil's
+   * configureHadoopConf would silently re-acquire it and the catalog would
+   * once again carry the dead {@code conf} field.
+   */
+  @Test
+  void catalogIsNotHadoopConfigurable() {
+    assertThat(new FileIOCatalog())
+        .isNotInstanceOf(org.apache.hadoop.conf.Configurable.class);
   }
 
   @Nested

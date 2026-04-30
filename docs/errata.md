@@ -53,13 +53,6 @@ simplify `FileIOCatalog.commitTransaction` to drain the sink directly.
 Extend `TestInlineManifestEndToEnd#commitTransactionWithML` to assert no
 `snap-*.avro` is written.
 
-### S3. The `Configurable` Hadoop interface lives on `FileIOCatalog`
-
-`FileIOCatalog` implements Hadoop's `Configurable` (`Configuration conf`)
-because some Iceberg client paths still call it. The field is marked
-`// TODO: delete` in the source. It is dead weight today; remove once
-the call sites are gone.
-
 ## Deferred Functionality
 
 ### D2. Strict mixed-mode rejection

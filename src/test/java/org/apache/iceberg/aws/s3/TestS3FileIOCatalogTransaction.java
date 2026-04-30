@@ -74,7 +74,7 @@ public class TestS3FileIOCatalogTransaction extends CatalogTransactionTests<File
     io.initialize(Maps.newHashMap());
     final String location = warehouseLocation + "/catalog";
     final CatalogFormat<?, ?> format = new ProtoCatalogFormat();
-    catalog = new FileIOCatalog("test", location, null, format, io, Maps.newHashMap());
+    catalog = new FileIOCatalog("test", location, format, io, Maps.newHashMap());
 
     final Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);

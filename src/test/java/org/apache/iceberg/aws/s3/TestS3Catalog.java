@@ -82,7 +82,7 @@ public class TestS3Catalog extends CatalogTests<FileIOCatalog> {
     // with the value that it calculates by using the selected checksum function. If the values
     // don't match, the upload won't start."
     final CatalogFormat<?, ?> format = new ProtoCatalogFormat();
-    catalog = new FileIOCatalog("test", location, null, format, io, Maps.newHashMap());
+    catalog = new FileIOCatalog("test", location, format, io, Maps.newHashMap());
 
     final Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);

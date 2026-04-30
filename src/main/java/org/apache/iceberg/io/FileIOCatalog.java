@@ -27,8 +27,6 @@ import java.util.Set;
 import java.util.stream.Collectors;
 import org.apache.iceberg.ManifestListSink;
 import org.apache.iceberg.ManifestListSink.ManifestListDelta;
-import org.apache.hadoop.conf.Configurable;
-import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.BaseMetastoreCatalog;
 import org.apache.iceberg.BaseMetastoreTableOperations;
 import org.apache.iceberg.CatalogProperties;
@@ -57,7 +55,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.util.LocationUtil;
 
 public class FileIOCatalog extends BaseMetastoreCatalog
-    implements Configurable, SupportsNamespaces, SupportsCatalogTransactions {
+    implements SupportsNamespaces, SupportsCatalogTransactions {
   // TODO audit loadTable in BaseMetastoreCatalog
   // TODO buildTable overridden in BaseMetastoreCatalog?
 
@@ -67,7 +65,6 @@ public class FileIOCatalog extends BaseMetastoreCatalog
   private static final org.slf4j.Logger LOG =
       org.slf4j.LoggerFactory.getLogger(FileIOCatalog.class);
 
-  private Configuration conf; // TODO: delete
   private String catalogName = "fileio";
   private String catalogLocation;
   private String warehouseLocation;
@@ -84,26 +81,14 @@ public class FileIOCatalog extends BaseMetastoreCatalog
   public FileIOCatalog(
       String catalogName,
       String catalogLocation,
-      Configuration conf,
       CatalogFormat<?, ?> format,
       SupportsAtomicOperations fileIO,
       Map<String, String> catalogProperties) {
     this.catalogName = catalogName;
     this.catalogLocation = catalogLocation;
-    this.conf = conf;
     this.format = format;
     this.fileIO = fileIO;
     this.catalogProperties = catalogProperties;
-  }
-
-  @Override
-  public void setConf(Configuration conf) {
-    this.conf = conf;
-  }
-
-  @Override
-  public Configuration getConf() {
-    return conf;
   }
 
   @Override
@@ -143,7 +128,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
 
       // TODO handle this more gracefully; use listings/HadoopCatalog?
       // TODO remove generics
-      fileIO = (SupportsAtomicOperations) CatalogUtil.loadFileIO(fileIOImpl, properties, getConf());
+      fileIO = (SupportsAtomicOperations) CatalogUtil.loadFileIO(fileIOImpl, properties, null);
     }
     final InputFile catalogFile = fileIO.newInputFile(catalogLocation);
     if (!catalogFile.exists()) {
