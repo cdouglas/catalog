@@ -463,7 +463,10 @@ public class FileIOCatalog extends BaseMetastoreCatalog
             hasMLPool = !proto.manifestPool(tblIdNum).isEmpty();
           }
         }
-        if ((hasMLDeltas || hasMLPool) && !"delta".equals(mode)) {
+        // Don't force delta when computeDelta returned null (e.g. a stats-only
+        // change with no representable delta updates) — encodeDelta(null) NPEs
+        // and full mode is the correct fallback. See errata D1.
+        if ((hasMLDeltas || hasMLPool) && !"delta".equals(mode) && delta != null) {
           mode = "delta";
         }
 
@@ -736,8 +739,9 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         }
 
         String mode = InlineDeltaCodec.selectMode(delta, newMetadata, 0);
-        if ((hasMLDeltas || hasMLPool) && !"delta".equals(mode)) {
-          // See commitInline — same reasoning for full-mode avoidance
+        // See commitInline — full-mode avoidance, but never with null delta
+        // (encodeDelta would NPE; full is the correct fallback). See errata D1.
+        if ((hasMLDeltas || hasMLPool) && !"delta".equals(mode) && delta != null) {
           mode = "delta";
         }
         switch (mode) {

@@ -493,7 +493,23 @@ public class InlineDeltaCodec {
       updates.add(new SetLocationUpdate(newMeta.location()));
     }
 
+    // Statistics-file changes have no DeltaUpdate type yet. If they differ,
+    // fall back to "full" mode by returning null; full-mode serializes the
+    // entire TableMetadata (including stats), so the change survives.
+    // Mixed commits (stats + a delta-representable change) lose the size
+    // benefit of delta mode but never lose the stats themselves.
+    if (statisticsChanged(oldMeta, newMeta)) {
+      return null;
+    }
+
     return updates.isEmpty() ? null : updates;
+  }
+
+  private static boolean statisticsChanged(TableMetadata oldMeta, TableMetadata newMeta) {
+    return !new java.util.HashSet<>(oldMeta.statisticsFiles())
+            .equals(new java.util.HashSet<>(newMeta.statisticsFiles()))
+        || !new java.util.HashSet<>(oldMeta.partitionStatisticsFiles())
+            .equals(new java.util.HashSet<>(newMeta.partitionStatisticsFiles()));
   }
 
   private static boolean refsEqual(

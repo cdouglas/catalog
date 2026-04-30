@@ -32,12 +32,15 @@ import java.util.function.Supplier;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
+import org.apache.iceberg.GenericStatisticsFile;
 import org.apache.iceberg.InlineSnapshot;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Snapshot;
+import org.apache.iceberg.StatisticsFile;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.Transaction;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.inmemory.InMemoryInputFile;
@@ -344,6 +347,37 @@ public class TestInlineManifestEndToEnd {
       assertThat(metadataFiles).isEmpty();
     }
 
+    /**
+     * Errata D1: a transaction that mixes a delta-representable update
+     * (setProperties) with statistics — currently not representable as a
+     * delta — must not silently drop the statistics. The bug was: the
+     * presence of a non-stats change made computeDelta return a non-empty
+     * list, selectMode picked "delta", and stats were never encoded.
+     */
+    @Test
+    void transactionWithStatisticsAndPropertiesSurvivesReload() {
+      createNamespaceAndTable();
+      Table tbl = catalog.loadTable(TBL);
+      // Need a snapshot to attach stats to.
+      tbl.newFastAppend().appendFile(FILE_A).commit();
+      long snapId = tbl.currentSnapshot().snapshotId();
+
+      StatisticsFile stat = new GenericStatisticsFile(
+          snapId, "/path/to/stats.puffin", 100, 90, List.of());
+
+      Transaction tx = tbl.newTransaction();
+      tx.updateProperties().set("k", "v").commit();
+      tx.updateStatistics().setStatistics(stat).commit();
+      tx.commitTransaction();
+
+      FileIOCatalog fresh = reloadCatalog();
+      Table reloaded = fresh.loadTable(TBL);
+      assertThat(reloaded.properties()).containsEntry("k", "v");
+      assertThat(reloaded.statisticsFiles())
+          .as("stats must survive reload alongside property update")
+          .extracting(StatisticsFile::snapshotId)
+          .containsExactly(snapId);
+    }
   }
 
   @Nested
@@ -688,6 +722,34 @@ public class TestInlineManifestEndToEnd {
       Snapshot current = reloaded.currentSnapshot();
       assertThat(current).isNotNull();
       assertThat(current.operation()).isIn("delete", "overwrite");
+    }
+
+    /**
+     * Errata D1: a stats-only commit on a table with an existing manifest
+     * pool must not crash. The bug was: computeDelta returned null
+     * (no recognized change), the ML "force delta on populated pool"
+     * branch flipped mode to "delta" anyway, and encodeDelta(null) NPE'd.
+     */
+    @Test
+    void setStatisticsAfterAppendSurvivesReload() {
+      createNamespaceAndTable();
+      Table tbl = catalog.loadTable(TBL);
+      tbl.newFastAppend().appendFile(FILE_A).commit();
+      long snapId = tbl.currentSnapshot().snapshotId();
+
+      StatisticsFile stat = new GenericStatisticsFile(
+          snapId, "/path/to/stats.puffin", 100, 90, List.of());
+      tbl.updateStatistics().setStatistics(stat).commit();
+
+      FileIOCatalog fresh = reloadCatalog();
+      Table reloaded = fresh.loadTable(TBL);
+      assertThat(reloaded.statisticsFiles())
+          .as("stats must survive reload on ML-populated table")
+          .extracting(StatisticsFile::snapshotId)
+          .containsExactly(snapId);
+      // Existing snapshot's manifest list must still round-trip.
+      assertThat(reloaded.currentSnapshot()).isNotNull();
+      assertThat(reloaded.currentSnapshot().allManifests(io)).hasSize(1);
     }
 
     /** BaseRewriteManifests (rewriteManifests): manifest-level rewrite. */

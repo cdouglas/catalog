@@ -62,22 +62,6 @@ the call sites are gone.
 
 ## Deferred Functionality
 
-### D1. Statistics-file metadata updates have no delta type
-
-Iceberg's `MetadataUpdate` hierarchy includes `SetStatistics`,
-`RemoveStatistics`, `SetPartitionStatistics`, and
-`RemovePartitionStatistics`. `InlineDeltaCodec.computeDelta` does not
-emit any of them. `selectMode` will see an "empty" delta for a pure
-`ANALYZE TABLE` commit and pick `"delta"`, but the delta captures no
-actual change. On reload, the statistics are gone.
-
-This is not ML-specific — it pre-exists the ML work and affects TM delta
-mode too.
-
-**Fix path:** four new `DeltaUpdate` subclasses, or a fallback to
-`"full"` mode when `computeDelta` sees an unhandled `MetadataUpdate`
-type.
-
 ### D2. Strict mixed-mode rejection
 
 `wrapInlineManifests` currently logs a warning when a table has both
@@ -230,35 +214,3 @@ manifest-list equality.
 
 **Trigger:** any retention or cleanup bug report that involves an
 inline-ML table.
-
-## Resolved (kept for reference)
-
-The following appeared in earlier review documents and are now closed.
-They are listed here so a reader cross-referencing old commit messages
-can find their resolution.
-
-- **`Action.apply` did not bump namespace versions** — closed by
-  c2054cf (P0.1). All ns-mutating actions now bump `ns v`; idempotency
-  and conflict-matrix tests added.
-- **`computeDelta` NPE on `InlineSnapshot`** — closed by bf55b46.
-- **`AddSnapshotUpdate.applyTo` threw `UnsupportedOperationException`
-  on replay** — closed by 2ab8067; routed through the prefix-accepting
-  overload via `applyDeltaWithManifests`.
-- **`AddManifestUpdate` / `RemoveManifestUpdate` were no-ops referring
-  to a non-existent method** — closed by 2ab8067.
-- **Full-mode commit on an ML-populated table dropped the pool** —
-  closed by da9b5fd (A2). Full mode now preserves manifestPool and
-  snapshotManifests across the metadata rotation.
-- **Multi-table `commitTransaction` had no ML integration** — closed by
-  6ef3035 (A4). The multi-table path now drains staged deltas and
-  attaches them to each table's `UpdateTableInline`.
-- **`AddSnapshotUpdate` discarded `parentSnapshotId`, `firstRowId`,
-  `keyId`** — closed by 8ca2d7f (A1). Wire format extended; sink
-  populates them; `applyTo` reconstructs from the delta when present.
-- **`RemoveSnapshotsUpdate.applyTo` did not cascade to the pool** —
-  closed by 2da44fa (A3). Expiration now drops snapshot ref lists and
-  GCs orphan pool entries.
-- **`InlineSnapshot` lacked `equals` / `hashCode`** — closed in iceberg
-  fork; loosened `BaseSnapshot.equals` to interoperate.
-- **`computeDelta` did not handle inline snapshots' null
-  `manifestListLocation`** — closed by bf55b46.
