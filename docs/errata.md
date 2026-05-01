@@ -109,19 +109,6 @@ We rely on developer-run emulators; CI coverage is best-effort.
 Gate container startup behind a profile flag so `mvn test` stays fast
 and offline.
 
-### T4. `CatalogTests` and `CatalogTransactionTests` are duplicated
-
-The abstract suites are duplicated between
-`iceberg/core/src/test/` and `fileio-catalog/src/test/`. The copies have
-already diverged (verified 2026-04-22: this project's `CatalogTests`
-lacks imports and assertions added upstream).
-
-**Fix path (pick one):**
-1. Publish iceberg's test-jar and consume it (current intended approach
-   — needs the publish step wired into the Gradle task).
-2. Extract `catalog-tests` into a standalone published module.
-3. Add a CI check that diffs the two files and fails on drift.
-
 ## Known Unknowns
 
 These are pending measurement or validation. None block current work;
