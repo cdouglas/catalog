@@ -22,6 +22,7 @@ import java.util.Map;
 import java.util.UUID;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.catalog.CatalogTests;
+import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.io.CatalogFormat;
 import org.apache.iceberg.io.FileIOCatalog;
 import org.apache.iceberg.io.ProtoCatalogFormat;
@@ -95,8 +96,8 @@ public class TestS3Catalog extends CatalogTests<FileIOCatalog> {
   }
 
   @Override
-  protected String cannedTableLocation() {
-    return warehouseLocation + "/tmp/ns/table";
+  protected String baseTableLocation(TableIdentifier identifier) {
+    return warehouseLocation + "/" + identifier.namespace() + "/" + identifier.name();
   }
 
   @Override
@@ -105,12 +106,21 @@ public class TestS3Catalog extends CatalogTests<FileIOCatalog> {
   }
 
   @Override
-  protected boolean supportsConcurrentCreate() {
-    return false;
+  protected FileIOCatalog catalog() {
+    return catalog;
   }
 
   @Override
-  protected FileIOCatalog catalog() {
-    return catalog;
+  protected FileIOCatalog initCatalog(String catalogName, Map<String, String> additionalProperties) {
+    final S3FileIO io = new S3FileIO();
+    io.initialize(Maps.newHashMap());
+    final String location = warehouseLocation + "/catalog-" + catalogName;
+    final CatalogFormat<?, ?> format = new ProtoCatalogFormat();
+    FileIOCatalog c = new FileIOCatalog(catalogName, location, format, io, Maps.newHashMap());
+    final Map<String, String> properties = Maps.newHashMap();
+    properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
+    properties.putAll(additionalProperties);
+    c.initialize(catalogName, properties);
+    return c;
   }
 }

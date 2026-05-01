@@ -32,6 +32,7 @@ import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.azure.AzureProperties;
 import org.apache.iceberg.catalog.CatalogTests;
 import org.apache.iceberg.catalog.Namespace;
+import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.io.CatalogFormat;
 import org.apache.iceberg.io.FileIOCatalog;
 import org.apache.iceberg.io.ProtoCatalogFormat;
@@ -151,8 +152,8 @@ public class ADLSCatalogTest extends CatalogTests<FileIOCatalog> {
   }
 
   @Override
-  protected String cannedTableLocation() {
-    return warehouseLocation + "/tmp/ns/table";
+  protected String baseTableLocation(TableIdentifier identifier) {
+    return warehouseLocation + "/" + identifier.namespace() + "/" + identifier.name();
   }
 
   @Override
@@ -161,12 +162,35 @@ public class ADLSCatalogTest extends CatalogTests<FileIOCatalog> {
   }
 
   @Override
-  protected boolean supportsConcurrentCreate() {
-    return false;
+  protected FileIOCatalog catalog() {
+    return catalog;
   }
 
   @Override
-  protected FileIOCatalog catalog() {
-    return catalog;
+  protected FileIOCatalog initCatalog(String catalogName, Map<String, String> additionalProperties) {
+    final ADLSFileIO io;
+    if (null == azureProperties) {
+      final AzureProperties azureProps = spy(new AzureProperties());
+      doAnswer(
+              invoke -> {
+                DataLakeFileSystemClientBuilder clientBuilder = invoke.getArgument(1);
+                clientBuilder.endpoint(azuriteContainer.endpoint());
+                clientBuilder.credential(azuriteContainer.credential());
+                return null;
+              })
+          .when(azureProps)
+          .applyClientConfiguration(any(), any());
+      io = new ADLSFileIO(azureProps);
+    } else {
+      io = new ADLSFileIO(azureProperties);
+    }
+    final Map<String, String> properties = Maps.newHashMap();
+    properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
+    properties.putAll(additionalProperties);
+    final String location = warehouseLocation + "/catalog-" + catalogName;
+    FileIOCatalog c =
+        new FileIOCatalog(catalogName, location, new ProtoCatalogFormat(), io, Maps.newHashMap());
+    c.initialize(catalogName, properties);
+    return c;
   }
 }
