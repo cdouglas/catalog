@@ -452,6 +452,13 @@ public class ProtoCatalogFile extends CatalogFile {
     public Builder addNamespace(int id, int parentId, String name, int version) {
       NsEntry entry = new NsEntry(parentId, name, version);
       namespaceById.put(id, entry);
+      // Keep nextNamespaceId monotone: a transaction-replayed CreateNamespaceAction
+      // adds an id that wasn't reflected in the (older) checkpoint header, so the
+      // checkpoint-derived nextNamespaceId would otherwise hand the same id out
+      // again on the next commit and overwrite this entry.
+      if (id >= nextNamespaceId) {
+        nextNamespaceId = id + 1;
+      }
       // Lookup is built by rebuildLookups() after all entries are loaded.
       // During checkpoint decoding, namespaces may arrive in arbitrary order
       // (HashMap iteration), so the full ancestor chain may not be available yet.
@@ -518,6 +525,11 @@ public class ProtoCatalogFile extends CatalogFile {
 
       Namespace ns = buildNamespace(namespaceId);
       tableLookup.put(TableIdentifier.of(ns, name), id);
+      // Same monotonicity argument as addNamespace: keep nextTableId ahead of
+      // any id that arrived via transaction replay.
+      if (id >= nextTableId) {
+        nextTableId = id + 1;
+      }
       return this;
     }
 

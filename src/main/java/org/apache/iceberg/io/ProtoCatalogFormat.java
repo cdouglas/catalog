@@ -572,7 +572,23 @@ public class ProtoCatalogFormat
 
     private ProtoCatalogFile validateCommit(ProtoCatalogFile result, ProtoCodec.Transaction txn) {
       if (!result.containsTransaction(txn.id())) {
-        throw new CommitFailedException("Conflicting concurrent transaction");
+        // Our append landed but at least one action's verify rejected it
+        // (e.g., a concurrent writer bumped the table version). Surface the
+        // most informative error: AlreadyExistsException if a pending create
+        // collides with a now-existing table (matches Iceberg's create-race
+        // semantic), CommitFailedException otherwise.
+        for (Map.Entry<TableIdentifier, String> e : tables.entrySet()) {
+          if (e.getValue() != null && result.containsTable(e.getKey())) {
+            throw new AlreadyExistsException("Table already exists: %s", e.getKey());
+          }
+        }
+        for (Map.Entry<TableIdentifier, byte[]> e : inlineTables.entrySet()) {
+          if (result.containsTable(e.getKey())) {
+            throw new AlreadyExistsException("Table already exists: %s", e.getKey());
+          }
+        }
+        throw new CommitFailedException(
+            "Cannot commit: concurrent transaction invalidated this update");
       }
       return result;
     }

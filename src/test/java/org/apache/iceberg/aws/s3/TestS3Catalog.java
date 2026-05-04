@@ -79,7 +79,8 @@ public class TestS3Catalog extends CatalogTests<FileIOCatalog> {
 
     final Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
-    properties.put("fileio.catalog.max.append.count", "0");
+    // Append path: large limit so individual tests stay on the append branch.
+    properties.put("fileio.catalog.max.append.count", "10000");
     // CatalogTests.testDefault*Properties / testOverride*Properties expect
     // catalog() to come configured with table-default.* / table-override.*
     properties.put(CatalogProperties.TABLE_DEFAULT_PREFIX + "default-key1", "catalog-default-key1");
@@ -119,7 +120,8 @@ public class TestS3Catalog extends CatalogTests<FileIOCatalog> {
     final String location = warehouseLocation + "/catalog-" + catalogName;
     final Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
-    properties.put("fileio.catalog.max.append.count", "0");
+    // Append path: large limit so individual tests stay on the append branch.
+    properties.put("fileio.catalog.max.append.count", "10000");
     properties.putAll(additionalProperties);
     final CatalogFormat<?, ?> format = new ProtoCatalogFormat(properties);
     FileIOCatalog c = new FileIOCatalog(catalogName, location, format, io, Maps.newHashMap());

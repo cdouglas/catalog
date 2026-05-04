@@ -76,7 +76,8 @@ public class TestS3FileIOCatalogTransaction extends CatalogTransactionTests<File
 
     final Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
-    properties.put("fileio.catalog.max.append.count", "0");
+    // Append path: large limit so individual tests stay on the append branch.
+    properties.put("fileio.catalog.max.append.count", "10000");
     final CatalogFormat<?, ?> format = new ProtoCatalogFormat(properties);
     catalog = new FileIOCatalog("test", location, format, io, Maps.newHashMap());
     catalog.initialize(testName, properties);
