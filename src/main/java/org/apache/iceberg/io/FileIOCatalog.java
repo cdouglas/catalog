@@ -20,11 +20,14 @@ package org.apache.iceberg.io;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
+import org.apache.iceberg.HasTableOperations;
 import org.apache.iceberg.ManifestListSink;
 import org.apache.iceberg.ManifestListSink.ManifestListDelta;
 import org.apache.iceberg.BaseMetastoreCatalog;
@@ -34,6 +37,7 @@ import org.apache.iceberg.InlineSnapshot;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.CatalogUtil;
+import org.apache.iceberg.Table;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableMetadataParser;
 import org.apache.iceberg.TableOperations;
@@ -71,6 +75,14 @@ public class FileIOCatalog extends BaseMetastoreCatalog
   private CatalogFormat<?, ?> format;
   private SupportsAtomicOperations fileIO;
   private final Map<String, String> catalogProperties;
+
+  // Per-thread map of tables loaded via loadTable() to the ops instance that
+  // received their staged ManifestListSink deltas. Populated lazily on
+  // loadTable, drained by commitTransaction (multi-table catalog commit), then
+  // cleared. The single-table commitInline path drains the sink directly off
+  // `this` and does not consult this map. See iceberg_refine.md R2.
+  private final ThreadLocal<Map<TableIdentifier, InlineManifestTableOperations>>
+      txnSinkOps = ThreadLocal.withInitial(HashMap::new);
 
   @SuppressWarnings("unused") // reflection cstr
   FileIOCatalog() {
@@ -169,6 +181,23 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         .dropTable(from)
         .createTable(to, catalogFile.location(from))
         .commit(fileIO);
+  }
+
+  @Override
+  public Table loadTable(TableIdentifier identifier) {
+    Table tbl = super.loadTable(identifier);
+    // Track InlineManifestTableOperations instances so commitTransaction can
+    // drain the staged ManifestListSink deltas directly, mirroring the
+    // single-table commitInline path. The check is intentionally permissive:
+    // if the loaded table doesn't expose ops, or the ops isn't a sink, we
+    // simply don't track it; commitTransaction tolerates a missing entry.
+    if (tbl instanceof HasTableOperations) {
+      TableOperations ops = ((HasTableOperations) tbl).operations();
+      if (ops instanceof InlineManifestTableOperations) {
+        txnSinkOps.get().put(identifier, (InlineManifestTableOperations) ops);
+      }
+    }
+    return tbl;
   }
 
   @Override
@@ -631,173 +660,122 @@ public class FileIOCatalog extends BaseMetastoreCatalog
     //      XXX tired of tinkering with this fucking codebase.
     // TableCommit validations check the table UUID and snapshot ref for each table
     // if all validations pass for the current CatalogFile, then attempt atomic replace
-    final CatalogFile current = getCatalogFile();
-    final CatalogFile.Mut<?, ?> newCatalog = format.from(current);
-    for (TableIdentifier readTable : readTables) {
-      final FileIOTableOperations ops = newTableOps(readTable, current);
-      newCatalog.readTable(readTable);
-    }
-    for (TableCommit commit : commits) {
-      final TableIdentifier tableId = commit.identifier();
-      // use fixed catalog snapshot for validation
-      FileIOTableOperations ops = newTableOps(tableId, current);
-      final TableMetadata currentMetadata = ops.current();
-      commit.requirements().forEach(req -> req.validate(currentMetadata));
-
-      TableMetadata.Builder newMetadataBuilder = TableMetadata.buildFrom(currentMetadata);
-      commit.updates().forEach(update -> update.applyTo(newMetadataBuilder));
-      final TableMetadata newMetadata = newMetadataBuilder.build();
-      if (newMetadata.changes().isEmpty()) {
-        continue;
-      }
-      boolean inline = Boolean.parseBoolean(
-          catalogProperties.getOrDefault(INLINE_ENABLED, "false"));
-      boolean inlineManifests = Boolean.parseBoolean(
-          catalogProperties.getOrDefault(INLINE_MANIFESTS, "false"));
-      if (inline) {
-        // Compute delta from current to new metadata
-        String manifestPrefix = "";
-        ProtoCatalogFile proto = null;
-        Integer tblIdNum = null;
-        if (current instanceof ProtoCatalogFile) {
-          proto = (ProtoCatalogFile) current;
-          tblIdNum = proto.tableId(tableId);
-          if (tblIdNum != null) {
-            String p = proto.manifestListPrefix(tblIdNum);
-            if (p != null) { manifestPrefix = p; }
-          }
-        }
-        java.util.List<InlineDeltaCodec.DeltaUpdate> delta =
-            InlineDeltaCodec.computeDelta(currentMetadata, newMetadata, manifestPrefix);
-
-        // ML-mode integration: extract per-snapshot manifest delta from staged
-        // snapshots in newMetadata. After iceberg-core R2 (sink forwarding through
-        // BaseTransaction.TransactionTableOperationsWithSink), SnapshotProducer
-        // takes the inline path inside a transaction too, so each new snapshot is
-        // an InlineSnapshot and snap.allManifests(io) returns its in-memory list
-        // with no FileIO read. The reconstruction below therefore no longer reads
-        // any snap-*.avro file (and none is written). The same code path remains
-        // correct for the rare pointer-mode parent (BaseSnapshot) — allManifests
-        // there still does a real Avro read, used only for parent reconciliation.
-        // See iceberg_refine.md R2 / errata.md S2.
-        boolean hasMLPool = proto != null && tblIdNum != null
-            && !proto.manifestPool(tblIdNum).isEmpty();
-        boolean hasMLDeltas = false;
-        if (inlineManifests) {
-          java.util.Set<Long> oldSnapIds = new java.util.HashSet<>();
-          for (org.apache.iceberg.Snapshot s : currentMetadata.snapshots()) {
-            oldSnapIds.add(s.snapshotId());
-          }
-          for (org.apache.iceberg.Snapshot snap : newMetadata.snapshots()) {
-            if (oldSnapIds.contains(snap.snapshotId())) continue;
-            java.util.List<org.apache.iceberg.ManifestFile> currentMfs =
-                snap.allManifests(ops.io());
-            java.util.List<org.apache.iceberg.ManifestFile> parentMfs =
-                txnParentManifests(snap.parentId(), currentMetadata, newMetadata,
-                    proto, tblIdNum, ops.io());
-            java.util.List<org.apache.iceberg.ManifestFile> added =
-                new java.util.ArrayList<>();
-            java.util.List<String> removedPaths = new java.util.ArrayList<>();
-            java.util.Set<String> parentPaths = new java.util.HashSet<>();
-            for (org.apache.iceberg.ManifestFile pmf : parentMfs) {
-              parentPaths.add(pmf.path());
-            }
-            java.util.Set<String> currentPaths = new java.util.HashSet<>();
-            for (org.apache.iceberg.ManifestFile cmf : currentMfs) {
-              currentPaths.add(cmf.path());
-              if (!parentPaths.contains(cmf.path())) {
-                added.add(cmf);
-              }
-            }
-            for (String pp : parentPaths) {
-              if (!currentPaths.contains(pp)) {
-                removedPaths.add(pp);
-              }
-            }
-            if (!added.isEmpty() || !removedPaths.isEmpty()) {
-              InlineDeltaCodec.attachManifestDelta(
-                  delta, snap.snapshotId(), added, removedPaths, manifestPrefix);
-              hasMLDeltas = true;
-            }
-          }
-        }
-
-        String mode = InlineDeltaCodec.selectMode(delta, newMetadata, 0);
-        // See commitInline — full-mode avoidance, but never with null delta
-        // (encodeDelta would NPE; full is the correct fallback). See errata D1.
-        if ((hasMLDeltas || hasMLPool) && !"delta".equals(mode) && delta != null) {
-          mode = "delta";
-        }
-        switch (mode) {
-          case "delta":
-            newCatalog.updateTableInlineDelta(tableId, InlineDeltaCodec.encodeDelta(delta));
-            break;
-          case "full":
-            String json = TableMetadataParser.toJson(newMetadata);
-            newCatalog.updateTableInline(tableId, json.getBytes(StandardCharsets.UTF_8));
-            break;
-          default:
-            String loc = ops.writeUpdateMetadata(false, newMetadata);
-            newCatalog.updateTable(tableId, loc);
-        }
-      } else {
-        final String newLocation = ops.writeUpdateMetadata(false, newMetadata);
-        newCatalog.updateTable(tableId, newLocation);
-      }
-    }
+    final Map<TableIdentifier, InlineManifestTableOperations> sinkOpsByTable =
+        txnSinkOps.get();
     try {
-      newCatalog.commit(fileIO);
-    } catch (SupportsAtomicOperations.CASException e) {
-      throw new CommitFailedException(e, "Failed to commit metadata for multi-table commit");
+      final CatalogFile current = getCatalogFile();
+      final CatalogFile.Mut<?, ?> newCatalog = format.from(current);
+      for (TableIdentifier readTable : readTables) {
+        final FileIOTableOperations ops = newTableOps(readTable, current);
+        newCatalog.readTable(readTable);
+      }
+      for (TableCommit commit : commits) {
+        final TableIdentifier tableId = commit.identifier();
+        // use fixed catalog snapshot for validation
+        FileIOTableOperations ops = newTableOps(tableId, current);
+        final TableMetadata currentMetadata = ops.current();
+        commit.requirements().forEach(req -> req.validate(currentMetadata));
+
+        TableMetadata.Builder newMetadataBuilder = TableMetadata.buildFrom(currentMetadata);
+        commit.updates().forEach(update -> update.applyTo(newMetadataBuilder));
+        final TableMetadata newMetadata = newMetadataBuilder.build();
+        if (newMetadata.changes().isEmpty()) {
+          continue;
+        }
+        boolean inline = Boolean.parseBoolean(
+            catalogProperties.getOrDefault(INLINE_ENABLED, "false"));
+        boolean inlineManifests = Boolean.parseBoolean(
+            catalogProperties.getOrDefault(INLINE_MANIFESTS, "false"));
+        if (inline) {
+          // Compute delta from current to new metadata
+          String manifestPrefix = "";
+          ProtoCatalogFile proto = null;
+          Integer tblIdNum = null;
+          if (current instanceof ProtoCatalogFile) {
+            proto = (ProtoCatalogFile) current;
+            tblIdNum = proto.tableId(tableId);
+            if (tblIdNum != null) {
+              String p = proto.manifestListPrefix(tblIdNum);
+              if (p != null) { manifestPrefix = p; }
+            }
+          }
+          java.util.List<InlineDeltaCodec.DeltaUpdate> delta =
+              InlineDeltaCodec.computeDelta(currentMetadata, newMetadata, manifestPrefix);
+
+          // Drain the per-snapshot ManifestListSink deltas staged on the
+          // user-loaded ops during the transaction. iceberg-core R2 forwards
+          // SnapshotProducer's stageManifestListDelta calls through
+          // BaseTransaction.TransactionTableOperationsWithSink to the
+          // underlying InlineManifestTableOperations — which is the same
+          // instance loadTable() recorded in txnSinkOps. The added/removed
+          // sets are the exact ones SnapshotProducer would have written into
+          // a snap-*.avro; we attach them directly without rereading them.
+          // Single-table commitInline does the same drain off `this`. See
+          // iceberg_refine.md R2.
+          boolean hasMLPool = proto != null && tblIdNum != null
+              && !proto.manifestPool(tblIdNum).isEmpty();
+          boolean hasMLDeltas = false;
+          if (inlineManifests) {
+            InlineManifestTableOperations sinkOps = sinkOpsByTable.get(tableId);
+            if (sinkOps != null) {
+              Map<Long, InlineManifestTableOperations.StagedSnapshotData> staged =
+                  sinkOps.drainStagedDeltas();
+              Set<Long> oldSnapIds = new HashSet<>();
+              for (Snapshot s : currentMetadata.snapshots()) {
+                oldSnapIds.add(s.snapshotId());
+              }
+              for (Snapshot snap : newMetadata.snapshots()) {
+                if (oldSnapIds.contains(snap.snapshotId())) continue;
+                InlineManifestTableOperations.StagedSnapshotData data =
+                    staged.get(snap.snapshotId());
+                if (data != null && delta != null) {
+                  InlineDeltaCodec.attachManifestDelta(
+                      delta, snap.snapshotId(),
+                      data.delta.added(), data.delta.removedPaths(), manifestPrefix);
+                  hasMLDeltas = true;
+                }
+              }
+            }
+          }
+
+          String mode = InlineDeltaCodec.selectMode(delta, newMetadata, 0);
+          // See commitInline — full-mode avoidance, but never with null delta
+          // (encodeDelta would NPE; full is the correct fallback). See errata D1.
+          if ((hasMLDeltas || hasMLPool) && !"delta".equals(mode) && delta != null) {
+            mode = "delta";
+          }
+          switch (mode) {
+            case "delta":
+              newCatalog.updateTableInlineDelta(tableId, InlineDeltaCodec.encodeDelta(delta));
+              break;
+            case "full":
+              String json = TableMetadataParser.toJson(newMetadata);
+              newCatalog.updateTableInline(tableId, json.getBytes(StandardCharsets.UTF_8));
+              break;
+            default:
+              String loc = ops.writeUpdateMetadata(false, newMetadata);
+              newCatalog.updateTable(tableId, loc);
+          }
+        } else {
+          final String newLocation = ops.writeUpdateMetadata(false, newMetadata);
+          newCatalog.updateTable(tableId, newLocation);
+        }
+      }
+      try {
+        newCatalog.commit(fileIO);
+      } catch (SupportsAtomicOperations.CASException e) {
+        throw new CommitFailedException(e, "Failed to commit metadata for multi-table commit");
+      }
+    } finally {
+      // Clear the per-thread map. Subsequent loadTable calls will repopulate
+      // it. This keeps the map bounded and prevents stale ops references
+      // outliving their useful window.
+      txnSinkOps.remove();
     }
   }
 
   @Override
   public CatalogTransaction createTransaction(CatalogTransaction.IsolationLevel isolationLevel) {
     return new BaseCatalogTransaction(this, isolationLevel);
-  }
-
-  /**
-   * Reconstructs the parent snapshot's manifest list for ML delta computation
-   * in commitTransaction. Preference order:
-   * 1. If parent is an in-transaction InlineSnapshot in newMetadata (second
-   *    commit in a multi-op transaction), use its in-memory manifest list.
-   * 2. If parent is in currentMetadata as an InlineSnapshot (loaded from
-   *    catalog pool via wrapInlineManifests), use its in-memory list.
-   * 3. Otherwise look up in the catalog's pool (parent is a prior inline
-   *    snapshot not yet in newMetadata).
-   * 4. Fall back to empty list (first commit on branch, or mixed-mode
-   *    pointer-mode parent — treat all current manifests as added).
-   */
-  private static java.util.List<org.apache.iceberg.ManifestFile> txnParentManifests(
-      Long parentId,
-      TableMetadata currentMetadata,
-      TableMetadata newMetadata,
-      ProtoCatalogFile proto,
-      Integer tblIdNum,
-      org.apache.iceberg.io.FileIO io) {
-    if (parentId == null) {
-      return java.util.List.of();
-    }
-    // Case 1: parent in newMetadata (same-txn sibling) and is InlineSnapshot
-    org.apache.iceberg.Snapshot parentInNew = newMetadata.snapshot(parentId);
-    if (parentInNew instanceof org.apache.iceberg.InlineSnapshot) {
-      return parentInNew.allManifests(io);
-    }
-    // Case 2: parent in currentMetadata and is InlineSnapshot
-    org.apache.iceberg.Snapshot parentInCurrent = currentMetadata.snapshot(parentId);
-    if (parentInCurrent instanceof org.apache.iceberg.InlineSnapshot) {
-      return parentInCurrent.allManifests(io);
-    }
-    // Case 3: look up in catalog's pool
-    if (proto != null && tblIdNum != null) {
-      java.util.List<org.apache.iceberg.ManifestFile> pooled =
-          proto.inlineManifests(tblIdNum, parentId);
-      if (pooled != null) {
-        return pooled;
-      }
-    }
-    // Case 4: no inline data for parent (first commit / mixed-mode / new branch)
-    return java.util.List.of();
   }
 }

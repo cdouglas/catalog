@@ -499,9 +499,9 @@ public class TestInlineManifestEndToEnd {
      * <p>After iceberg-core R2 (sink forwarding through
      * BaseTransaction.TransactionTableOperationsWithSink), SnapshotProducer
      * takes the inline path inside a transaction too — no transient
-     * snap-*.avro is written, closing the orphan-file window described in
-     * errata S2 / iceberg_refine.md R2. This test asserts both end-state
-     * correctness on reload and absence of the transient Avro file.
+     * snap-*.avro is written, closing the orphan-file window. This test
+     * asserts both end-state correctness on reload and absence of the
+     * transient Avro file. See iceberg_refine.md R2.
      *
      * <p>Note: multi-table transactions not tested here due to a pre-existing
      * bug where consecutive buildTable().create() calls overwrite each other

@@ -26,33 +26,6 @@ Iceberg. The cleaner alternative is a parser-level hook: detect the
 pool entries, and construct `InlineSnapshot` directly. **Trigger to
 revisit:** any plan to drop the iceberg fork or upstream the changes.
 
-### S2. `BaseTransaction.TransactionTableOperations` does not forward `ManifestListSink`
-
-For multi-table catalog transactions, `BaseTransaction` wraps the
-underlying `TableOperations` in `TransactionTableOperations`. That
-wrapper does not implement (or forward) `ManifestListSink`, so
-`SnapshotProducer.apply()` falls back to writing a transient
-`snap-*.avro` *before* the catalog commit. The catalog then reads that
-file back via `allManifests(io)` in `commitTransaction` to reconstruct
-the ML delta into the single atomic intention record.
-
-The end state on reload is correct (the intention record itself is
-atomic), but:
-
-- a crash between the Avro write and the catalog commit orphans the
-  Avro file;
-- a checkpoint that lands in that window captures no record of the
-  Avro, making cleanup harder;
-- it violates the spirit of I1 even though the intention record is a
-  single atomic write.
-
-**Fix path:** add sink-capability forwarding in
-`BaseTransaction.TransactionTableOperations` (iceberg-core change), have
-`SnapshotProducer`'s sink-detection walk through the wrapper, and
-simplify `FileIOCatalog.commitTransaction` to drain the sink directly.
-Extend `TestInlineManifestEndToEnd#commitTransactionWithML` to assert no
-`snap-*.avro` is written.
-
 ## Deferred Functionality
 
 ### D2. Strict mixed-mode rejection
