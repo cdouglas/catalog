@@ -23,6 +23,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -603,6 +604,78 @@ public class TestInlineManifestEndToEnd {
       org.assertj.core.api.Assertions.assertThatThrownBy(() -> fresh.loadTable(TBL))
           .isInstanceOfAny(IllegalStateException.class, RuntimeException.class)
           .hasMessageContaining("sentinel manifest-list");
+    }
+
+    /**
+     * Mixed-mode rejection. A table with both inline-ML and pointer-mode
+     * snapshots is allowed by default (warn-only) so that mid-migration tables
+     * remain loadable, but {@code fileio.catalog.inline.strict=true} flips this
+     * to a hard reject via {@link org.apache.iceberg.exceptions.ValidationException}.
+     *
+     * <p>Construction: do a real inline-ML append (creates snapshot S1 with an
+     * {@code inline://} location and a pool entry), then surgically inject a
+     * second snapshot S2 with a non-inline manifest-list location into the
+     * inline TableMetadata via {@code Mut.updateTableInline}. Pool entries for
+     * S1 are preserved; S2 is recognized as pointer-mode by
+     * {@code wrapInlineManifests} because no pool entry covers its id.
+     */
+    @Test
+    void mixedModeRejectionStrict() {
+      createNamespaceAndTable();
+      Table tbl = catalog.loadTable(TBL);
+      tbl.newFastAppend().appendFile(FILE_A).commit();
+
+      // Read the inline TableMetadata that the catalog wrote for S1.
+      ProtoCatalogFormat fmt = new ProtoCatalogFormat();
+      ProtoCatalogFile original = (ProtoCatalogFile) fmt.read(
+          io, io.newInputFile("mem:///warehouse/catalog"));
+      Integer tblIdNum = original.tableId(TBL);
+      byte[] inlineMeta = original.inlineMetadata(tblIdNum);
+      org.apache.iceberg.TableMetadata parsed = org.apache.iceberg.TableMetadataParser
+          .fromJson(new String(inlineMeta, StandardCharsets.UTF_8));
+      org.apache.iceberg.Snapshot s1 = parsed.currentSnapshot();
+
+      // Hand-build a pointer-mode S2 (manifest-list points at a fake Avro path
+      // — it doesn't need to exist; wrapInlineManifests only inspects the
+      // location string and pool membership).
+      String s2Json = String.format(
+          "{\"snapshot-id\": 9999, \"parent-snapshot-id\": %d, "
+              + "\"sequence-number\": %d, \"timestamp-ms\": %d, "
+              + "\"summary\": {\"operation\": \"append\"}, "
+              + "\"schema-id\": 0, "
+              + "\"manifest-list\": \"mem:///warehouse/db/tbl/metadata/snap-9999-fake.avro\"}",
+          s1.snapshotId(),
+          s1.sequenceNumber() + 1,
+          s1.timestampMillis() + 1);
+      org.apache.iceberg.Snapshot s2 =
+          org.apache.iceberg.SnapshotParser.fromJson(s2Json);
+
+      org.apache.iceberg.TableMetadata mixed =
+          org.apache.iceberg.TableMetadata.buildFrom(parsed)
+              .setBranchSnapshot(s2, "main")
+              .build();
+      byte[] mixedJson = org.apache.iceberg.TableMetadataParser.toJson(mixed)
+          .getBytes(StandardCharsets.UTF_8);
+
+      // Replace the inline TM bytes via the standard catalog mutation path
+      // (preserves pool entries for S1).
+      fmt.from(original).updateTableInline(TBL, mixedJson).commit(io);
+
+      // Default (lenient) reload: warn but succeed.
+      FileIOCatalog lenient = reloadCatalog();
+      assertThat(lenient.loadTable(TBL)).isNotNull();
+
+      // Strict reload: fileio.catalog.inline.strict=true rejects mixed mode.
+      Map<String, String> strictProps = new HashMap<>(config()
+          .catalogProperties("mem:///warehouse"));
+      strictProps.put("fileio.catalog.inline.strict", "true");
+      FileIOCatalog strict = new FileIOCatalog(
+          "test-strict", "mem:///warehouse/catalog",
+          new ProtoCatalogFormat(), io, strictProps);
+      strict.initialize("test-strict", strictProps);
+      org.assertj.core.api.Assertions.assertThatThrownBy(() -> strict.loadTable(TBL))
+          .isInstanceOf(org.apache.iceberg.exceptions.ValidationException.class)
+          .hasMessageContaining("mixed mode");
     }
 
     /**

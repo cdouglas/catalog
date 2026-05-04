@@ -28,18 +28,6 @@ revisit:** any plan to drop the iceberg fork or upstream the changes.
 
 ## Deferred Functionality
 
-### D2. Strict mixed-mode rejection
-
-`wrapInlineManifests` currently logs a warning when a table has both
-inline and pointer-mode snapshots. Production deployments should be
-able to opt into hard rejection.
-
-**Fix path:** thread the existing `fileio.catalog.inline` property (or
-add `fileio.catalog.inline.strict`) through `FileIOCatalog` to the
-loader; on strict mode throw `ValidationException` rather than logging.
-Add a test with a hand-constructed mixed-mode `CatalogFile` covering
-both behaviours.
-
 ### D3. Pointer-mode eviction of an inline-ML table does not materialize Avro manifest lists
 
 If an inline TM falls back to pointer mode (size eviction), any snapshot

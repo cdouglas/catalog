@@ -52,6 +52,7 @@ import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
+import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.base.Strings;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -65,6 +66,10 @@ public class FileIOCatalog extends BaseMetastoreCatalog
 
   private static final String INLINE_ENABLED = "fileio.catalog.inline";
   private static final String INLINE_MANIFESTS = "fileio.catalog.inline.manifests";
+  // When true, loadTable rejects a TableMetadata that has both inline-ML and
+  // pointer-mode snapshots instead of warning. Default is the lenient warn path
+  // because rejection breaks tables mid-migration.
+  private static final String INLINE_STRICT = "fileio.catalog.inline.strict";
 
   private static final org.slf4j.Logger LOG =
       org.slf4j.LoggerFactory.getLogger(FileIOCatalog.class);
@@ -206,12 +211,14 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         catalogProperties.getOrDefault(INLINE_ENABLED, "false"));
     boolean inlineManifests = Boolean.parseBoolean(
         catalogProperties.getOrDefault(INLINE_MANIFESTS, "false"));
+    boolean inlineStrict = Boolean.parseBoolean(
+        catalogProperties.getOrDefault(INLINE_STRICT, "false"));
     if (inlineManifests) {
       return new InlineManifestTableOperations(
-          tableIdentifier, catalogLocation, format, fileIO, inline);
+          tableIdentifier, catalogLocation, format, fileIO, inline, inlineStrict);
     }
     return new FileIOTableOperations(
-        tableIdentifier, catalogLocation, format, fileIO, inline);
+        tableIdentifier, catalogLocation, format, fileIO, inline, inlineStrict);
   }
 
   FileIOTableOperations newTableOps(TableIdentifier tableIdentifier, CatalogFile catalogFile) {
@@ -219,12 +226,14 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         catalogProperties.getOrDefault(INLINE_ENABLED, "false"));
     boolean inlineManifests = Boolean.parseBoolean(
         catalogProperties.getOrDefault(INLINE_MANIFESTS, "false"));
+    boolean inlineStrict = Boolean.parseBoolean(
+        catalogProperties.getOrDefault(INLINE_STRICT, "false"));
     if (inlineManifests) {
       return new InlineManifestTableOperations(
-          tableIdentifier, catalogLocation, format, fileIO, inline, catalogFile);
+          tableIdentifier, catalogLocation, format, fileIO, inline, inlineStrict, catalogFile);
     }
     return new FileIOTableOperations(
-        tableIdentifier, catalogLocation, format, fileIO, inline, catalogFile);
+        tableIdentifier, catalogLocation, format, fileIO, inline, inlineStrict, catalogFile);
   }
 
   @Override
@@ -313,6 +322,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
     private final CatalogFormat format;
     private final SupportsAtomicOperations fileIO;
     private final boolean inlineEnabled;
+    private final boolean inlineStrict;
     private volatile CatalogFile lastCatalogFile = null;
 
     FileIOTableOperations(
@@ -320,8 +330,9 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         String catalogLocation,
         CatalogFormat format,
         SupportsAtomicOperations fileIO,
-        boolean inlineEnabled) {
-      this(tableId, catalogLocation, format, fileIO, inlineEnabled, null);
+        boolean inlineEnabled,
+        boolean inlineStrict) {
+      this(tableId, catalogLocation, format, fileIO, inlineEnabled, inlineStrict, null);
     }
 
     FileIOTableOperations(
@@ -330,12 +341,14 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         CatalogFormat format,
         SupportsAtomicOperations fileIO,
         boolean inlineEnabled,
+        boolean inlineStrict,
         CatalogFile catalogFile) {
       this.fileIO = fileIO;
       this.format = format;
       this.tableId = tableId;
       this.catalogLocation = catalogLocation;
       this.inlineEnabled = inlineEnabled;
+      this.inlineStrict = inlineStrict;
       this.lastCatalogFile = catalogFile;
       if (catalogFile != null) {
         loadFromCatalogFile(catalogFile);
@@ -549,10 +562,17 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         }
       }
       if (hasInline && hasPointer) {
-        // §2.7: mixed-mode table. Log once; proceed. Rejection would break
-        // tables mid-migration from pointer to inline. Strict rejection is
-        // reserved for a future follow-up that wires the catalog-level property
-        // through to this static context.
+        // §2.7: mixed-mode table. Default behavior is warn-and-proceed because
+        // rejection would break tables mid-migration. Production deployments
+        // can opt into hard rejection via fileio.catalog.inline.strict=true,
+        // which throws ValidationException here.
+        if (inlineStrict) {
+          throw new ValidationException(
+              "Table %s is in mixed mode: has both inline and pointer-mode "
+                  + "snapshots. Strict mode (fileio.catalog.inline.strict=true) "
+                  + "rejects mixed-mode loads.",
+              tableId);
+        }
         LOG.warn(
             "Table {} is in mixed mode: has both inline and pointer-mode snapshots. "
                 + "Reload is supported but migration utilities may misbehave.",
@@ -624,15 +644,16 @@ public class FileIOCatalog extends BaseMetastoreCatalog
 
     InlineManifestTableOperations(
         TableIdentifier tableId, String catalogLocation,
-        CatalogFormat format, SupportsAtomicOperations fileIO, boolean inlineEnabled) {
-      super(tableId, catalogLocation, format, fileIO, inlineEnabled);
+        CatalogFormat format, SupportsAtomicOperations fileIO,
+        boolean inlineEnabled, boolean inlineStrict) {
+      super(tableId, catalogLocation, format, fileIO, inlineEnabled, inlineStrict);
     }
 
     InlineManifestTableOperations(
         TableIdentifier tableId, String catalogLocation,
         CatalogFormat format, SupportsAtomicOperations fileIO,
-        boolean inlineEnabled, CatalogFile catalogFile) {
-      super(tableId, catalogLocation, format, fileIO, inlineEnabled, catalogFile);
+        boolean inlineEnabled, boolean inlineStrict, CatalogFile catalogFile) {
+      super(tableId, catalogLocation, format, fileIO, inlineEnabled, inlineStrict, catalogFile);
     }
 
     @Override

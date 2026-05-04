@@ -506,7 +506,7 @@ public class TestInlineDelta {
     void sinkStagesAndDrains() {
       var ops = new FileIOCatalog.InlineManifestTableOperations(
           org.apache.iceberg.catalog.TableIdentifier.of("db", "tbl"),
-          "mem:///catalog", new ProtoCatalogFormat(), null, true);
+          "mem:///catalog", new ProtoCatalogFormat(), null, true, false);
 
       org.apache.iceberg.ManifestFile m1 = new TestProtoActions.TestManifestFile(
           "s3://b/m1.avro", 1024, 0, org.apache.iceberg.ManifestContent.DATA,
@@ -537,7 +537,7 @@ public class TestInlineDelta {
     void isInstanceOfManifestListSink() {
       var ops = new FileIOCatalog.InlineManifestTableOperations(
           org.apache.iceberg.catalog.TableIdentifier.of("db", "tbl"),
-          "mem:///catalog", new ProtoCatalogFormat(), null, true);
+          "mem:///catalog", new ProtoCatalogFormat(), null, true, false);
       assertThat(ops).isInstanceOf(org.apache.iceberg.ManifestListSink.class);
     }
 
