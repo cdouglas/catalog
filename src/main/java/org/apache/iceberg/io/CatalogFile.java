@@ -27,6 +27,7 @@ import java.util.UUID;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
+import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -136,7 +137,7 @@ public abstract class CatalogFile {
             "Cannot create namespace %s. Namespace already exists", namespace);
       }
       for (Namespace ancestor = parentOf(namespace);
-          !original.containsNamespace(ancestor);
+          !ancestor.isEmpty() && !original.containsNamespace(ancestor);
           ancestor = parentOf(ancestor)) {
         if (namespaces.containsKey(ancestor)) {
           if (!namespaces.get(ancestor)) {
@@ -211,7 +212,7 @@ public abstract class CatalogFile {
                   .map(e -> e.getKey().namespace())
                   .noneMatch(ns -> ns.equals(namespace));
       if (!noNsChild || !noTblChild) {
-        throw new IllegalArgumentException("Cannot drop non-empty namespace: " + namespace);
+        throw new NamespaceNotEmptyException("Namespace %s is not empty", namespace);
       }
       namespaces.put(namespace, false);
       namespaceProperties.remove(namespace);

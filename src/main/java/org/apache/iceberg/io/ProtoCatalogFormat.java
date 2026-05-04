@@ -33,6 +33,7 @@ import java.util.Optional;
 import java.util.UUID;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.exceptions.AlreadyExistsException;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 
@@ -334,10 +335,15 @@ public class ProtoCatalogFormat
         nsIdMap.put(ns, nsId);
         actions.add(new ProtoCodec.CreateNamespaceAction(nsId, 1, parentId, parentVersion, name));
 
-        // Add properties for this namespace
+        // Add properties for this namespace. Null values are remove markers
+        // from a subsequent updateProperties call; skip them since there is
+        // nothing to remove on a freshly-created namespace.
         Map<String, String> props = namespaceProperties.get(ns);
         if (props != null) {
           for (Map.Entry<String, String> prop : props.entrySet()) {
+            if (prop.getValue() == null) {
+              continue;
+            }
             actions.add(new ProtoCodec.SetNamespacePropertyAction(
                 nsId, -1, prop.getKey(), prop.getValue()));
           }
@@ -356,7 +362,9 @@ public class ProtoCatalogFormat
         }
       }
 
-      // Process namespace property updates (for existing namespaces)
+      // Process namespace property updates (for existing namespaces).
+      // CatalogFile.Mut.updateProperties merges into the same map for both
+      // sets and removes; a null value is the remove marker.
       for (Map.Entry<Namespace, Map<String, String>> entry : namespaceProperties.entrySet()) {
         Namespace ns = entry.getKey();
         if (!namespaces.containsKey(ns)) {
@@ -365,19 +373,35 @@ public class ProtoCatalogFormat
           if (nsId != null) {
             int version = original.namespaceVersion(nsId);
             for (Map.Entry<String, String> prop : entry.getValue().entrySet()) {
-              actions.add(new ProtoCodec.SetNamespacePropertyAction(
-                  nsId, version, prop.getKey(), prop.getValue()));
+              if (prop.getValue() == null) {
+                actions.add(new ProtoCodec.RemoveNamespacePropertyAction(
+                    nsId, version, prop.getKey()));
+              } else {
+                actions.add(new ProtoCodec.SetNamespacePropertyAction(
+                    nsId, version, prop.getKey(), prop.getValue()));
+              }
             }
           }
         }
       }
 
-      // Process table creates
+      // Process table creates and drops. CatalogFile.Mut uses the `tables` map
+      // for both: a non-null value is a create-with-location, a null value is
+      // a drop marker. Inline-table creates use a separate inlineTables map.
       for (Map.Entry<TableIdentifier, String> entry : tables.entrySet()) {
         TableIdentifier ident = entry.getKey();
         String metadataLocation = entry.getValue();
-        Namespace ns = ident.namespace();
 
+        if (metadataLocation == null) {
+          Integer tblId = original.tableId(ident);
+          if (tblId != null) {
+            int version = original.tableVersion(tblId);
+            actions.add(new ProtoCodec.DropTableAction(tblId, version));
+          }
+          continue;
+        }
+
+        Namespace ns = ident.namespace();
         Integer nsId = original.namespaceId(ns);
         int nsVersion = -1;
         if (nsId == null) {
@@ -483,14 +507,32 @@ public class ProtoCatalogFormat
           if (result.isPresent()) {
             return validateCommit(result.get(), txn);
           }
-          // CAS failed: another writer CAS'd concurrently. Must re-read to get the
-          // new state and rebuild the checkpoint for the next CAS attempt.
-          current = fileIO.newInputFile(current.location());
-          try (SeekableInputStream in = current.newStream()) {
-            baseCatalog = readInternal(current, in, (int) current.getLength());
+          // CAS failed: another writer changed the catalog file between our read
+          // and our write. Re-read to surface the most informative error:
+          // - if our pending creates target a table/namespace that now exists,
+          //   throw AlreadyExistsException (matches Iceberg semantic for
+          //   create-races);
+          // - otherwise, throw CommitFailedException so the caller can refresh
+          //   and re-apply at the PendingUpdate level.
+          InputFile fresh = fileIO.newInputFile(current.location());
+          ProtoCatalogFile newState;
+          try (SeekableInputStream in = fresh.newStream()) {
+            newState = readInternal(fresh, in, (int) fresh.getLength());
           } catch (IOException e) {
             throw new UncheckedIOException(e);
           }
+          for (Map.Entry<TableIdentifier, String> e : tables.entrySet()) {
+            if (e.getValue() != null && newState.containsTable(e.getKey())) {
+              throw new AlreadyExistsException("Table already exists: %s", e.getKey());
+            }
+          }
+          for (Map.Entry<TableIdentifier, byte[]> e : inlineTables.entrySet()) {
+            if (newState.containsTable(e.getKey())) {
+              throw new AlreadyExistsException("Table already exists: %s", e.getKey());
+            }
+          }
+          throw new CommitFailedException(
+              "Cannot commit: catalog file changed concurrently at %s", current.location());
         } else {
           // Append path. Seal this transaction if it will push us to/past either limit,
           // signalling the next writer to compact via CAS.

@@ -154,6 +154,11 @@ public class FileIOCatalog extends BaseMetastoreCatalog
   }
 
   @Override
+  protected Map<String, String> properties() {
+    return catalogProperties;
+  }
+
+  @Override
   public List<TableIdentifier> listTables(Namespace namespace) {
     if (!namespaceExists(namespace) && !namespace.isEmpty()) {
       throw new NoSuchNamespaceException(
@@ -267,7 +272,24 @@ public class FileIOCatalog extends BaseMetastoreCatalog
 
   @Override
   public List<Namespace> listNamespaces(Namespace namespace) throws NoSuchNamespaceException {
-    return Lists.newArrayList(getCatalogFile().namespaces().iterator());
+    CatalogFile catalogFile = getCatalogFile();
+    if (!namespace.isEmpty() && !catalogFile.namespaces().contains(namespace)) {
+      throw new NoSuchNamespaceException("Namespace does not exist: %s", namespace);
+    }
+    return catalogFile.namespaces().stream()
+        .filter(ns -> !ns.isEmpty())
+        .filter(ns -> ns.length() == namespace.length() + 1)
+        .filter(ns -> {
+          // Direct child: prefix matches `namespace` and has exactly one extra level
+          for (int i = 0; i < namespace.length(); i++) {
+            if (!ns.level(i).equals(namespace.level(i))) {
+              return false;
+            }
+          }
+          return true;
+        })
+        .sorted(Comparator.comparing(Namespace::toString))
+        .collect(Collectors.toList());
   }
 
   @Override

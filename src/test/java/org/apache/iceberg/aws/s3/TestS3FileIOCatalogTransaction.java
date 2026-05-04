@@ -73,11 +73,12 @@ public class TestS3FileIOCatalogTransaction extends CatalogTransactionTests<File
     final S3FileIO io = new S3FileIO(); // () -> s3);
     io.initialize(Maps.newHashMap());
     final String location = warehouseLocation + "/catalog";
-    final CatalogFormat<?, ?> format = new ProtoCatalogFormat();
-    catalog = new FileIOCatalog("test", location, format, io, Maps.newHashMap());
 
     final Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
+    properties.put("fileio.catalog.max.append.count", "0");
+    final CatalogFormat<?, ?> format = new ProtoCatalogFormat(properties);
+    catalog = new FileIOCatalog("test", location, format, io, Maps.newHashMap());
     catalog.initialize(testName, properties);
   }
 
