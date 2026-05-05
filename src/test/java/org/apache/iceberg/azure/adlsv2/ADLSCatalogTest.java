@@ -51,9 +51,8 @@ import org.slf4j.LoggerFactory;
 
 @ExtendWith(ADLSCatalogTest.SuccessCleanupExtension.class)
 public class ADLSCatalogTest extends CatalogTests<FileIOCatalog> {
-  // static final String SAS_FILE = "/home/chris/work/.cloud/azure/lstnsgymx-20250801.json";
   static final String SAS_FILE =
-      "/home/chris/src/YCSB/catalog-bench/azure/infra/tokens/client1_20250527.json";
+      "/home/chris/work/.cloud/azure/lstnsgymx3serug-20260803.json";
   private static final String TEST_BUCKET = "lst-consistency/TEST_BUCKET";
   private static final Logger LOG = LoggerFactory.getLogger(ADLSCatalogTest.class);
   protected static AzuriteContainer azuriteContainer = null;
