@@ -162,6 +162,11 @@ public class ADLSCatalogTest extends CatalogTests<FileIOCatalog> {
   }
 
   @Override
+  protected boolean supportsNestedNamespaces() {
+    return true;
+  }
+
+  @Override
   protected FileIOCatalog catalog() {
     return catalog;
   }
