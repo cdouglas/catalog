@@ -494,12 +494,23 @@ public class ProtoCatalogFormat
             .orElseThrow(() -> new CommitFailedException("Catalog creation failed"));
       }
 
+      // Backends without an append primitive (e.g. GCS) coerce every commit to CAS,
+      // regardless of how the format was configured. Without this guard, a catalog
+      // pointed at GCS with a non-zero max.append.count would silently overwrite the
+      // catalog file in tryAppend (writeAtomic with Strategy.APPEND replaces the
+      // object on GCS) -- and now GCSOutputFile.prepare() rejects APPEND outright,
+      // so an unguarded append commit would surface as IllegalArgumentException.
+      final boolean appendSupported = fileIO.supportsAppend();
+
       for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
         // Decide whether to CAS (compact) or append.
-        // MUST CAS if: already sealed by a previous writer, or append count at/beyond the
-        // hard limit. Setting maxAppendCount=0 forces CAS on every commit.
-        boolean mustCAS = baseCatalog.isSealed()
-            || baseCatalog.appendCount() >= maxAppendCount;
+        // MUST CAS if: backend doesn't support append, already sealed by a previous
+        // writer, or append count at/beyond the hard limit. Setting maxAppendCount=0
+        // forces CAS on every commit.
+        boolean mustCAS =
+            !appendSupported
+                || baseCatalog.isSealed()
+                || baseCatalog.appendCount() >= maxAppendCount;
 
         if (mustCAS) {
           ProtoCodec.unsealTransaction(txnBytes);
@@ -598,25 +609,58 @@ public class ProtoCatalogFormat
         ProtoCodec.Transaction txn,
         byte[] txnBytes,
         SupportsAtomicOperations fileIO) {
+      // Build the wire bytes once; retries reuse the same payload.
+      final byte[] fullFile;
       try {
-        AtomicOutputFile outputFile = fileIO.newOutputFile(current);
-        byte[] fullFile = buildFullFile(txnBytes);
-
-        try (ByteArrayInputStream serBytes = new ByteArrayInputStream(fullFile)) {
-          serBytes.mark(fullFile.length);
-          CAS token = outputFile.prepare(() -> serBytes, AtomicOutputFile.Strategy.CAS);
-          serBytes.reset();
-          InputFile newCatalog = outputFile.writeAtomic(token, () -> serBytes);
-
-          try (SeekableInputStream in = newCatalog.newStream()) {
-            return Optional.of(readInternal(newCatalog, in, (int) newCatalog.getLength()));
-          }
-        }
-      } catch (SupportsAtomicOperations.CASException e) {
-        return Optional.empty();
+        fullFile = buildFullFile(txnBytes);
       } catch (IOException e) {
         throw new CommitFailedException(e, "CAS commit failed: %s", e.getMessage());
       }
+
+      // Retry budget for transient backpressure (StorageThrottleException: 429s,
+      // 5xx, GCS per-object update rate). The underlying invariants still hold,
+      // so the same write should succeed after a backoff. A real CAS conflict
+      // (StorageInvariantException) returns Optional.empty so the outer commit
+      // loop can re-read state.
+      final int maxThrottleAttempts = 8;
+      long backoffMs = 200L;
+      SupportsAtomicOperations.StorageThrottleException lastThrottle = null;
+      for (int attempt = 0; attempt < maxThrottleAttempts; attempt++) {
+        try {
+          AtomicOutputFile outputFile = fileIO.newOutputFile(current);
+          try (ByteArrayInputStream serBytes = new ByteArrayInputStream(fullFile)) {
+            serBytes.mark(fullFile.length);
+            CAS token = outputFile.prepare(() -> serBytes, AtomicOutputFile.Strategy.CAS);
+            serBytes.reset();
+            InputFile newCatalog = outputFile.writeAtomic(token, () -> serBytes);
+
+            try (SeekableInputStream in = newCatalog.newStream()) {
+              return Optional.of(readInternal(newCatalog, in, (int) newCatalog.getLength()));
+            }
+          }
+        } catch (SupportsAtomicOperations.StorageThrottleException e) {
+          lastThrottle = e;
+          long sleepMs =
+              backoffMs + java.util.concurrent.ThreadLocalRandom.current().nextLong(backoffMs / 2 + 1);
+          try {
+            Thread.sleep(sleepMs);
+          } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new CommitFailedException(ie, "Interrupted retrying CAS commit");
+          }
+          backoffMs = Math.min(backoffMs * 2, 5_000L);
+        } catch (SupportsAtomicOperations.CASException e) {
+          // Real CAS conflict (e.g. ETag mismatch, GCS generationMatch failure).
+          return Optional.empty();
+        } catch (IOException e) {
+          throw new CommitFailedException(e, "CAS commit failed: %s", e.getMessage());
+        }
+      }
+      throw new CommitFailedException(
+          lastThrottle,
+          "CAS commit failed: storage throttled %d attempts at %s",
+          maxThrottleAttempts,
+          current.location());
     }
 
     private Optional<ProtoCatalogFile> tryAppend(

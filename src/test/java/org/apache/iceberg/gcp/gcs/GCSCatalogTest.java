@@ -120,8 +120,8 @@ public class GCSCatalogTest extends CatalogTests<FileIOCatalog> {
 
     final Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
-    // GCS has no native append; force CAS on every commit.
-    properties.put("fileio.catalog.max.append.count", "0");
+    // GCSFileIO.supportsAppend() returns false, so the format auto-coerces every
+    // commit to CAS regardless of fileio.catalog.max.append.count.
     // CatalogTests.testDefault*Properties / testOverride*Properties expect
     // catalog() to come configured with table-default.* / table-override.*
     properties.put(CatalogProperties.TABLE_DEFAULT_PREFIX + "default-key1", "catalog-default-key1");
@@ -161,8 +161,6 @@ public class GCSCatalogTest extends CatalogTests<FileIOCatalog> {
     GCSFileIO io = new GCSFileIO(() -> storage, new GCPProperties());
     final Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
-    // GCS has no native append; force CAS on every commit.
-    properties.put("fileio.catalog.max.append.count", "0");
     properties.putAll(additionalProperties);
     final String location = warehouseLocation + "/catalog-" + catalogName;
     FileIOCatalog c =

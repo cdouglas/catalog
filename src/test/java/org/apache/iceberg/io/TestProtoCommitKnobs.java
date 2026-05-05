@@ -64,6 +64,11 @@ public class TestProtoCommitKnobs {
     @SuppressWarnings("unchecked")
     MockIO() {
       fileIO = mock(SupportsAtomicOperations.class);
+      // Mockito returns false for unstubbed boolean methods, but the format
+      // interprets false as "no append primitive" and forces CAS-only. These
+      // knob tests exercise the append branch, so opt back into the interface
+      // default.
+      when(fileIO.supportsAppend()).thenReturn(true);
       when(fileIO.newInputFile(any(String.class))).thenAnswer(inv -> trackedInput());
       when(fileIO.newOutputFile(any(InputFile.class))).thenAnswer(inv -> {
         AtomicOutputFile out = mock(AtomicOutputFile.class);
