@@ -45,6 +45,15 @@ public class TestS3Catalog extends CatalogTests<FileIOCatalog> {
 
   private FileIOCatalog catalog;
 
+  /**
+   * Catalog format's max.append.count for this suite. Subclasses override to flip the
+   * commit policy: 10000 (default) exercises the append branch on S3 Express One Zone;
+   * 0 forces CAS on every commit.
+   */
+  protected int maxAppendCount() {
+    return 10_000;
+  }
+
   // Don't keep artifacts from successful tests
   static class SuccessCleanupExtension implements TestWatcher {
     @Override
@@ -79,8 +88,7 @@ public class TestS3Catalog extends CatalogTests<FileIOCatalog> {
 
     final Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
-    // Append path: large limit so individual tests stay on the append branch.
-    properties.put("fileio.catalog.max.append.count", "10000");
+    properties.put("fileio.catalog.max.append.count", String.valueOf(maxAppendCount()));
     // CatalogTests.testDefault*Properties / testOverride*Properties expect
     // catalog() to come configured with table-default.* / table-override.*
     properties.put(CatalogProperties.TABLE_DEFAULT_PREFIX + "default-key1", "catalog-default-key1");
@@ -125,8 +133,7 @@ public class TestS3Catalog extends CatalogTests<FileIOCatalog> {
     final String location = warehouseLocation + "/catalog-" + catalogName;
     final Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
-    // Append path: large limit so individual tests stay on the append branch.
-    properties.put("fileio.catalog.max.append.count", "10000");
+    properties.put("fileio.catalog.max.append.count", String.valueOf(maxAppendCount()));
     properties.putAll(additionalProperties);
     final CatalogFormat<?, ?> format = new ProtoCatalogFormat(properties);
     FileIOCatalog c = new FileIOCatalog(catalogName, location, format, io, Maps.newHashMap());
