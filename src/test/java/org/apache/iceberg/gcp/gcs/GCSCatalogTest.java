@@ -120,9 +120,19 @@ public class GCSCatalogTest extends CatalogTests<FileIOCatalog> {
 
     final Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
+    // GCS has no native append; force CAS on every commit.
+    properties.put("fileio.catalog.max.append.count", "0");
+    // CatalogTests.testDefault*Properties / testOverride*Properties expect
+    // catalog() to come configured with table-default.* / table-override.*
+    properties.put(CatalogProperties.TABLE_DEFAULT_PREFIX + "default-key1", "catalog-default-key1");
+    properties.put(CatalogProperties.TABLE_DEFAULT_PREFIX + "default-key2", "catalog-default-key2");
+    properties.put(CatalogProperties.TABLE_DEFAULT_PREFIX + "override-key3", "catalog-default-key3");
+    properties.put(CatalogProperties.TABLE_OVERRIDE_PREFIX + "override-key3", "catalog-override-key3");
+    properties.put(CatalogProperties.TABLE_OVERRIDE_PREFIX + "override-key4", "catalog-override-key4");
     final String location = warehouseLocation + "/catalog";
     catalog =
-        new FileIOCatalog("test", location, new ProtoCatalogFormat(), io, Maps.newHashMap());
+        new FileIOCatalog(
+            "test", location, new ProtoCatalogFormat(properties), io, Maps.newHashMap());
     catalog.initialize(testName, properties);
   }
 
@@ -151,10 +161,13 @@ public class GCSCatalogTest extends CatalogTests<FileIOCatalog> {
     GCSFileIO io = new GCSFileIO(() -> storage, new GCPProperties());
     final Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
+    // GCS has no native append; force CAS on every commit.
+    properties.put("fileio.catalog.max.append.count", "0");
     properties.putAll(additionalProperties);
     final String location = warehouseLocation + "/catalog-" + catalogName;
     FileIOCatalog c =
-        new FileIOCatalog(catalogName, location, new ProtoCatalogFormat(), io, Maps.newHashMap());
+        new FileIOCatalog(
+            catalogName, location, new ProtoCatalogFormat(properties), io, Maps.newHashMap());
     c.initialize(catalogName, properties);
     return c;
   }

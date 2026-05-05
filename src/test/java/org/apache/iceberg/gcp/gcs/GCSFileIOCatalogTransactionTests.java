@@ -115,9 +115,12 @@ public class GCSFileIOCatalogTransactionTests extends CatalogTransactionTests<Fi
     cleanupWarehouseLocation();
     final Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
+    // GCS has no native append; force CAS on every commit.
+    properties.put("fileio.catalog.max.append.count", "0");
     final String location = warehouseLocation + "/catalog";
     catalog =
-        new FileIOCatalog("test", location, new ProtoCatalogFormat(), io, Maps.newHashMap());
+        new FileIOCatalog(
+            "test", location, new ProtoCatalogFormat(properties), io, Maps.newHashMap());
     catalog.initialize(testName, properties);
   }
 
