@@ -83,6 +83,14 @@ public class InlineDeltaCodec {
   private static final int REMOVE_MF_SNAPSHOT_ID = 1;
   private static final int REMOVE_MF_PATH_SUFFIX = 2;
 
+  // Remove-schema / remove-spec field numbers (Iceberg metadata maintenance:
+  // expireSnapshots().cleanExpiredMetadata(true) prunes unreachable schemas
+  // and partition specs after snapshot expiration).
+  private static final int UPDATE_REMOVE_SCHEMAS = 14;
+  private static final int UPDATE_REMOVE_PARTITION_SPECS = 15;
+  private static final int REMOVE_SCHEMA_IDS = 1;
+  private static final int REMOVE_SPEC_IDS = 1;
+
   // SetTableProperties field numbers
   private static final int SET_PROPS_UPDATED = 1;
   private static final int SET_PROPS_REMOVED = 2;
@@ -460,12 +468,17 @@ public class InlineDeltaCodec {
       }
     }
 
-    // Schema changes
+    // Schema changes. Order matters: Add -> SetCurrent -> Remove. RemoveSchemas
+    // (and the Builder.removeSchemas it routes to) rejects removing the current
+    // schema id; if a replace transaction makes a new schema current and drops
+    // the old one, we have to advance currentSchemaId before pruning.
     Set<Integer> oldSchemaIds = new HashSet<>();
     for (org.apache.iceberg.Schema s : oldMeta.schemas()) {
       oldSchemaIds.add(s.schemaId());
     }
+    Set<Integer> newSchemaIds = new HashSet<>();
     for (org.apache.iceberg.Schema schema : newMeta.schemas()) {
+      newSchemaIds.add(schema.schemaId());
       if (!oldSchemaIds.contains(schema.schemaId())) {
         String json = org.apache.iceberg.SchemaParser.toJson(schema);
         updates.add(new AddSchemaUpdate(
@@ -476,13 +489,28 @@ public class InlineDeltaCodec {
     if (newMeta.currentSchemaId() != oldMeta.currentSchemaId()) {
       updates.add(new SetCurrentSchemaUpdate(newMeta.currentSchemaId()));
     }
+    // Removed schemas (cleanExpiredMetadata=true after expireSnapshots prunes
+    // schemas that no retained snapshot references; replace transactions also
+    // drop the prior current schema). Without an explicit RemoveSchemasUpdate
+    // the replay would re-introduce them via the carried base.schemas() list.
+    List<Integer> removedSchemas = new ArrayList<>();
+    for (int id : oldSchemaIds) {
+      if (!newSchemaIds.contains(id)) {
+        removedSchemas.add(id);
+      }
+    }
+    if (!removedSchemas.isEmpty()) {
+      updates.add(new RemoveSchemasUpdate(removedSchemas));
+    }
 
-    // Partition spec changes
+    // Partition spec changes (same ordering rationale as schema changes above).
     Set<Integer> oldSpecIds = new HashSet<>();
     for (org.apache.iceberg.PartitionSpec s : oldMeta.specs()) {
       oldSpecIds.add(s.specId());
     }
+    Set<Integer> newSpecIds = new HashSet<>();
     for (org.apache.iceberg.PartitionSpec spec : newMeta.specs()) {
+      newSpecIds.add(spec.specId());
       if (!oldSpecIds.contains(spec.specId())) {
         String json = org.apache.iceberg.PartitionSpecParser.toJson(spec);
         updates.add(new AddPartitionSpecUpdate(
@@ -492,6 +520,16 @@ public class InlineDeltaCodec {
     }
     if (newMeta.defaultSpecId() != oldMeta.defaultSpecId()) {
       updates.add(new SetDefaultSpecUpdate(newMeta.defaultSpecId()));
+    }
+    // Removed specs (companion to removed schemas above).
+    List<Integer> removedSpecs = new ArrayList<>();
+    for (int id : oldSpecIds) {
+      if (!newSpecIds.contains(id)) {
+        removedSpecs.add(id);
+      }
+    }
+    if (!removedSpecs.isEmpty()) {
+      updates.add(new RemovePartitionSpecsUpdate(removedSpecs));
     }
 
     // Sort order changes
@@ -776,6 +814,50 @@ public class InlineDeltaCodec {
     }
   }
 
+  /**
+   * Drops schemas no longer referenced by any retained snapshot. Emitted by
+   * {@code computeDelta} when {@code expireSnapshots().cleanExpiredMetadata(true)}
+   * prunes the schemas-by-id map.
+   *
+   * <p>Routes through {@link org.apache.iceberg.MetadataUpdate.RemoveSchemas}
+   * because {@code TableMetadata.Builder.removeSchemas} is package-private.
+   */
+  public static class RemoveSchemasUpdate implements DeltaUpdate {
+    public final List<Integer> schemaIds;
+
+    public RemoveSchemasUpdate(List<Integer> schemaIds) {
+      this.schemaIds = schemaIds;
+    }
+
+    @Override
+    public void applyTo(TableMetadata.Builder builder) {
+      new org.apache.iceberg.MetadataUpdate.RemoveSchemas(new HashSet<>(schemaIds))
+          .applyTo(builder);
+    }
+  }
+
+  /**
+   * Drops partition specs no longer referenced by any retained snapshot.
+   * Companion to {@link RemoveSchemasUpdate} for the
+   * {@code cleanExpiredMetadata=true} path.
+   *
+   * <p>Routes through {@link org.apache.iceberg.MetadataUpdate.RemovePartitionSpecs}
+   * because {@code TableMetadata.Builder.removeSpecs} is package-private.
+   */
+  public static class RemovePartitionSpecsUpdate implements DeltaUpdate {
+    public final List<Integer> specIds;
+
+    public RemovePartitionSpecsUpdate(List<Integer> specIds) {
+      this.specIds = specIds;
+    }
+
+    @Override
+    public void applyTo(TableMetadata.Builder builder) {
+      new org.apache.iceberg.MetadataUpdate.RemovePartitionSpecs(new HashSet<>(specIds))
+          .applyTo(builder);
+    }
+  }
+
   public static class AddSnapshotUpdate implements DeltaUpdate {
     public final long snapshotId;
     public final String manifestListSuffix;
@@ -1050,6 +1132,22 @@ public class InlineDeltaCodec {
       }
       writeLengthDelimited(out, UPDATE_REMOVE_SNAPSHOTS, inner.toByteArray());
 
+    } else if (update instanceof RemoveSchemasUpdate) {
+      RemoveSchemasUpdate u = (RemoveSchemasUpdate) update;
+      ByteArrayOutputStream inner = new ByteArrayOutputStream();
+      for (int id : u.schemaIds) {
+        writeVarint(inner, REMOVE_SCHEMA_IDS, id);
+      }
+      writeLengthDelimited(out, UPDATE_REMOVE_SCHEMAS, inner.toByteArray());
+
+    } else if (update instanceof RemovePartitionSpecsUpdate) {
+      RemovePartitionSpecsUpdate u = (RemovePartitionSpecsUpdate) update;
+      ByteArrayOutputStream inner = new ByteArrayOutputStream();
+      for (int id : u.specIds) {
+        writeVarint(inner, REMOVE_SPEC_IDS, id);
+      }
+      writeLengthDelimited(out, UPDATE_REMOVE_PARTITION_SPECS, inner.toByteArray());
+
     } else if (update instanceof AddSnapshotUpdate) {
       AddSnapshotUpdate u = (AddSnapshotUpdate) update;
       ByteArrayOutputStream inner = new ByteArrayOutputStream();
@@ -1126,6 +1224,10 @@ public class InlineDeltaCodec {
         return decodeSetSnapshotRef(updateBytes);
       case UPDATE_REMOVE_SNAPSHOTS:
         return decodeRemoveSnapshots(updateBytes);
+      case UPDATE_REMOVE_SCHEMAS:
+        return decodeRemoveSchemas(updateBytes);
+      case UPDATE_REMOVE_PARTITION_SPECS:
+        return decodeRemovePartitionSpecs(updateBytes);
       case UPDATE_ADD_SNAPSHOT:
         return decodeAddSnapshot(updateBytes);
       case UPDATE_ADD_MANIFEST:
@@ -1335,6 +1437,29 @@ public class InlineDeltaCodec {
       else { skipField(in, tag & 0x7); }
     }
     return new RemoveSnapshotsUpdate(ids);
+  }
+
+  private static RemoveSchemasUpdate decodeRemoveSchemas(byte[] bytes) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    List<Integer> ids = new ArrayList<>();
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      if ((tag >>> 3) == REMOVE_SCHEMA_IDS) { ids.add(readVarint(in)); }
+      else { skipField(in, tag & 0x7); }
+    }
+    return new RemoveSchemasUpdate(ids);
+  }
+
+  private static RemovePartitionSpecsUpdate decodeRemovePartitionSpecs(byte[] bytes)
+      throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    List<Integer> ids = new ArrayList<>();
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      if ((tag >>> 3) == REMOVE_SPEC_IDS) { ids.add(readVarint(in)); }
+      else { skipField(in, tag & 0x7); }
+    }
+    return new RemovePartitionSpecsUpdate(ids);
   }
 
   private static AddSnapshotUpdate decodeAddSnapshot(byte[] bytes) throws IOException {
