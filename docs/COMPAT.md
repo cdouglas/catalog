@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-05-05
+last-verified: 2026-05-05 (matrix re-verification)
 ---
 
 # Cloud-store compatibility matrix
@@ -39,9 +39,9 @@ Cell legend:
 
 | Store | CAS · file | CAS · TM | CAS · TM+ML | append · file | append · TM | append · TM+ML |
 |-------|------------|----------|-------------|---------------|-------------|----------------|
-| GCS   | OK         | WIP      | WIP         | NA            | NA          | NA             |
-| S3    | OK         | WIP      | WIP         | OK            | --          | --             |
-| ADLS  | OK         | --       | --          | OK            | --          | --             |
+| GCS   | OK         | OK       | WIP         | NA            | NA          | NA             |
+| S3    | OK         | OK       | WIP         | OK            | OK          | --             |
+| ADLS  | OK         | OK       | --          | OK            | OK          | --             |
 
 ## Notes
 
@@ -53,34 +53,37 @@ Cell legend:
   detects this at init and coerces `max.append.count=0` (commits
   `e15051d`, `a4cff40`).
 - **CAS · file (OK)** — `GCSCatalogTest`,
-  `GCSFileIOCatalogTransactionTests`. Part of the green non-inlined
-  matrix noted in `INLINE_STABILIZATION.md`.
-- **CAS · TM / CAS · TM+ML (WIP)** — `GCSCatalogTestInlineTM`,
-  `GCSCatalogTestInlineML`, `GCSFileIOCatalogTransactionTestsInlineTM`,
-  `GCSFileIOCatalogTransactionTestsInlineML`. Tracks the same 8 inline
-  bugs as the S3 CAS-inline cells; see `INLINE_STABILIZATION.md` for the
-  per-bug plan (Steps 1–6).
+  `GCSFileIOCatalogTransactionTests`.
+- **CAS · TM (OK)** — `GCSCatalogTestInlineTM`,
+  `GCSFileIOCatalogTransactionTestsInlineTM`. Verified 2026-05-05 after
+  the inline-replay determinism fixes (commits `804465b`, `45c88c5`,
+  `b616131`, `baac33b`) and the v1 sequence-number gate (`ec220c2`).
+- **CAS · TM+ML (WIP)** — `GCSCatalogTestInlineML`,
+  `GCSFileIOCatalogTransactionTestsInlineML`. Not exercised in the
+  current matrix run; revisit after we extend verification to the ML
+  cells.
 
 ### S3
 
 - **CAS · file (OK)** — `TestS3CatalogCAS`,
-  `TestS3FileIOCatalogTransactionCAS`. Greened in `42c23f9` and
-  `6fab0b7`.
+  `TestS3FileIOCatalogTransactionCAS`.
 - **append · file (OK)** — `TestS3Catalog`,
   `TestS3FileIOCatalogTransaction`. Runs against an S3 Express One Zone
   bucket (the only S3 surface that natively supports
-  `WriteOffsetBytes`). Greened in `621b1cb`. Together with CAS · file
-  this is the "260 + 130 = 390/390" non-inlined baseline.
-- **CAS · TM / CAS · TM+ML (WIP)** — `TestS3CatalogCASInlineTM`,
-  `TestS3CatalogCASInlineML`, `TestS3FileIOCatalogTransactionCASInlineTM`,
-  `TestS3FileIOCatalogTransactionCASInlineML`. After scaffolding
-  (`69649a3`) and the first two determinism fixes,
-  `TestS3CatalogCASInlineTM` reports 8 failures (file-counting
-  incompatibility + 5 real bugs). `INLINE_STABILIZATION.md` is the
-  working plan; the inline-ML subclasses inherit the same overrides.
-- **append · TM / append · TM+ML (--)** — no suites yet. The plan is to
-  add them after the CAS-inline cells go green, since the append code
-  path shares `commitInline` and the manifest pool with CAS.
+  `WriteOffsetBytes`).
+- **CAS · TM (OK)** — `TestS3CatalogCASInlineTM`,
+  `TestS3FileIOCatalogTransactionCASInlineTM`. 102/102 + 28/28 verified
+  2026-05-05.
+- **CAS · TM+ML (WIP)** — `TestS3CatalogCASInlineML`,
+  `TestS3FileIOCatalogTransactionCASInlineML`. Not exercised in the
+  current matrix run.
+- **append · TM (OK)** — `TestS3CatalogInlineTM`,
+  `TestS3FileIOCatalogTransactionInlineTM` (added 2026-05-05).
+  Uncovered the `addInlineTable` nextTableId-monotonicity bug
+  (commit `85bd9ac`); now 102/102 + 28/28.
+- **append · TM+ML (--)** — no suite yet; trivial to add as a one-line
+  override on `TestS3CatalogInlineTM` once the CAS · TM+ML cell goes
+  green.
 
 ### ADLS
 
@@ -88,17 +91,17 @@ Cell legend:
   `ADLSFileIOCatalogTransactionTests`. The default `ProtoCatalogFormat`
   configuration leaves `max.append.count` at 10 000, and `ADLSFileIO`
   honours `Strategy.APPEND` via lease-protected appends in
-  `ADLSOutputFile`. Verified 2026-05-05: `CatalogTests` 103/103 (10
-  skipped, pre-existing) and `CatalogTransactionTests` 28/28 against a
-  remote ADLS Gen2 account.
+  `ADLSOutputFile`.
 - **CAS · file (OK)** — `ADLSCatalogTestCAS`,
   `ADLSFileIOCatalogTransactionTestsCAS`. One-line subclasses that flip
-  `maxAppendCount()` to 0, mirroring the S3 CAS suites. Verified
-  2026-05-05: same counts as the append-mode runs.
-- **TM / TM+ML for both atomic modes (--)** — no suites yet. Will be
-  added once the S3/GCS inline-CAS cells go green via
-  `INLINE_STABILIZATION.md` Steps B–F; ADLS inline cells should then be
-  cheap subclasses analogous to `*InlineTM` / `*InlineML`.
+  `maxAppendCount()` to 0, mirroring the S3 CAS suites.
+- **CAS · TM (OK)** — `ADLSCatalogTestCASInlineTM`,
+  `ADLSFileIOCatalogTransactionTestsCASInlineTM` (added 2026-05-05).
+- **append · TM (OK)** — `ADLSCatalogTestInlineTM`,
+  `ADLSFileIOCatalogTransactionTestsInlineTM` (added 2026-05-05).
+- **TM+ML for both atomic modes (--)** — no suites yet. The TM cells'
+  health on both atomic modes makes adding them mechanical when we get
+  to inline-ML matrix verification.
 
 ## How to update this doc
 
