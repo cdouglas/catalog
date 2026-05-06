@@ -187,11 +187,27 @@ public class FileIOCatalog extends BaseMetastoreCatalog
   public void renameTable(TableIdentifier from, TableIdentifier to) {
     final InputFile catalog = fileIO.newInputFile(catalogLocation);
     final CatalogFile catalogFile = format.read(fileIO, catalog);
-    format
-        .from(catalogFile)
-        .dropTable(from)
-        .createTable(to, catalogFile.location(from))
-        .commit(fileIO);
+    if (catalogFile.isInlineTable(from)) {
+      // Inline path: dropTable+createTable would leave the inline bytes (and any
+      // manifest pool / per-snapshot manifest refs) keyed under the dropped id;
+      // copy the inline metadata across atomically instead. Pointer-mode rename
+      // works because both names point to the same metadata.json on disk;
+      // inline tables have no such file, so we have to carry the bytes ourselves.
+      // TODO(inline-ML): when this catalog grows ML-rename support, also migrate
+      // tblManifestPrefix / manifestPool / snapshotManifests across the id swap.
+      final byte[] inlineMeta = catalogFile.inlineMetadata(from);
+      format
+          .from(catalogFile)
+          .dropTable(from)
+          .createTableInline(to, inlineMeta)
+          .commit(fileIO);
+    } else {
+      format
+          .from(catalogFile)
+          .dropTable(from)
+          .createTable(to, catalogFile.location(from))
+          .commit(fileIO);
+    }
   }
 
   @Override
