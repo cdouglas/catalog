@@ -287,20 +287,23 @@ public class InlineDeltaCodec {
         // Also remove from TableMetadata (Builder.removeSnapshots handles the
         // dangling-refs cleanup for the TM side).
         TableMetadata.Builder tmBuilder = TableMetadata.buildFrom(current);
-        update.applyTo(tmBuilder);
-        // Pin lastUpdatedMillis: Builder.build() defaults to System.currentTimeMillis() when
-        // unset, which makes replay of the same delta on the same base produce different bytes
-        // and trips BaseTransaction's "Table metadata refresh is required" check. Carry the
-        // current TM's value forward; it equals base.lastUpdatedMillis() until an
-        // AddSnapshotUpdate bumps it to the snapshot's timestamp.
+        // Pin lastUpdatedMillis BEFORE applyTo. Builder.lastUpdatedMillis starts
+        // null; the setRef path inside several updates (e.g. SetSnapshotRefUpdate
+        // for the main branch) consults the field synchronously to stamp a new
+        // SnapshotLogEntry, and a null reads as System.currentTimeMillis(). That
+        // produces a non-deterministic snapshot-log timestamp during replay
+        // (testReplaceTableKeepsSnapshotLog) and also flips the bytes hash that
+        // backs the synthetic metadataFileLocation, tripping
+        // BaseTransaction's reference-equality refresh check.
         tmBuilder.setLastUpdatedMillis(current.lastUpdatedMillis());
+        update.applyTo(tmBuilder);
         current = tmBuilder.discardChanges().build();
       } else {
-        // Schema, properties, sort order, refs, etc. — apply to TableMetadata.Builder
+        // Schema, properties, sort order, refs, etc. — apply to TableMetadata.Builder.
+        // Pin lastUpdatedMillis BEFORE applyTo (see RemoveSnapshotsUpdate above).
         TableMetadata.Builder tmBuilder = TableMetadata.buildFrom(current);
-        update.applyTo(tmBuilder);
-        // Pin lastUpdatedMillis: see RemoveSnapshotsUpdate branch above.
         tmBuilder.setLastUpdatedMillis(current.lastUpdatedMillis());
+        update.applyTo(tmBuilder);
         current = tmBuilder.discardChanges().build();
       }
     }
