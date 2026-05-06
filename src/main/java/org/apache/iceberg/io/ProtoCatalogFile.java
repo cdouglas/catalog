@@ -565,6 +565,16 @@ public class ProtoCatalogFile extends CatalogFile {
       // Store inline-specific data
       tblInlineMetadata.put(id, metadata);
       tblManifestPrefix.put(id, manifestListPrefix);
+      // Same monotonicity argument as addTable: keep nextTableId ahead of any id
+      // that arrived via transaction replay. Without this, a fresh checkpoint
+      // (post-CAS) carries nextTableId from before the inline table was created;
+      // the next Mut allocates the same id again and the second
+      // createTableInline overwrites the first in tableById / tblInlineMetadata.
+      // testListTables, testRenameTableDestinationTableAlreadyExists, and the
+      // append+TM transaction tests' NoSuchTable errors all trace back to this.
+      if (id >= nextTableId) {
+        nextTableId = id + 1;
+      }
       return this;
     }
 
