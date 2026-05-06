@@ -38,31 +38,24 @@ public class GCSCatalogTestInlineTM extends GCSCatalogTest {
     return true;
   }
 
-  @Override
-  @Test
-  @Disabled("inline TM has no metadata.json files on disk; assertPreviousMetadataFileCount N/A")
-  public void testReplaceTransaction() {}
+  // assertPreviousMetadataFileCount inspects ops.current().previousFiles() -- a
+  // TableMetadata field, not a filesystem check. Inline TM populates this with
+  // synthetic "inline://#<hash>" entries (one per prior catalog version), so the
+  // four testReplaceTransaction-family cases run cleanly here as long as
+  // InlineDeltaCodec's replay produces a non-null base.metadataFileLocation --
+  // see commit 804465b. Re-enabled.
 
-  @Override
-  @Test
-  @Disabled("inline TM has no metadata.json files on disk; assertPreviousMetadataFileCount N/A")
-  public void testCompleteReplaceTransaction() {}
-
-  @Override
-  @Test
-  @Disabled("inline TM has no metadata.json files on disk; assertPreviousMetadataFileCount N/A")
-  public void testCompleteCreateOrReplaceTransactionReplace() {}
-
-  @Override
-  @Test
-  @Disabled("inline TM has no metadata.json files on disk; assertPreviousMetadataFileCount N/A")
-  public void testCreateOrReplaceReplaceTransactionReplace() {}
-
+  // testMetadataFileLocationsRemovalAfterCommit calls
+  // ReachableFileUtil.metadataFileLocations and exercises bounded retention.
+  // For inline tables there are no on-disk metadata.json files; the equivalent
+  // semantic (METADATA_PREVIOUS_VERSIONS_MAX bounding previousFiles) is upstream
+  // logic. Reachability resolution against synthetic inline:// URIs is the only
+  // mismatch; defer until the InlineCompat fork swaps the assertion's accessor.
   @Override
   @Test
   @Disabled(
-      "inline TM has no metadata.json files on disk; "
-          + "testMetadataFileLocationsRemovalAfterCommit counts file deletions")
+      "ReachableFileUtil.metadataFileLocations resolves inline:// URIs as files; "
+          + "needs InlineCompat fork to assert against TableMetadata.previousFiles() instead")
   public void testMetadataFileLocationsRemovalAfterCommit() {}
 
   @Override

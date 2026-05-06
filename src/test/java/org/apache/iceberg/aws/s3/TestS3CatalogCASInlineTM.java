@@ -38,36 +38,26 @@ public class TestS3CatalogCASInlineTM extends TestS3CatalogCAS {
     return true;
   }
 
-  // ============================================================
-  // Disabled: assertPreviousMetadataFileCount counts metadata.json files on disk.
-  // Inline TM stores metadata in the catalog blob -- nothing to count.
-  // ============================================================
+  // assertPreviousMetadataFileCount inspects ops.current().previousFiles() -- a
+  // TableMetadata field, not a filesystem check. Inline TM populates this list
+  // with synthetic "inline://#<hash>" entries (one per prior catalog version),
+  // so the four testReplaceTransaction-family cases that only count previousFiles
+  // run cleanly here as long as InlineDeltaCodec's replay produces a non-null
+  // base.metadataFileLocation -- see commit 804465b. Re-enabled.
 
-  @Override
-  @Test
-  @Disabled("inline TM has no metadata.json files on disk; assertPreviousMetadataFileCount N/A")
-  public void testReplaceTransaction() {}
-
-  @Override
-  @Test
-  @Disabled("inline TM has no metadata.json files on disk; assertPreviousMetadataFileCount N/A")
-  public void testCompleteReplaceTransaction() {}
-
-  @Override
-  @Test
-  @Disabled("inline TM has no metadata.json files on disk; assertPreviousMetadataFileCount N/A")
-  public void testCompleteCreateOrReplaceTransactionReplace() {}
-
-  @Override
-  @Test
-  @Disabled("inline TM has no metadata.json files on disk; assertPreviousMetadataFileCount N/A")
-  public void testCreateOrReplaceReplaceTransactionReplace() {}
-
+  // testMetadataFileLocationsRemovalAfterCommit calls
+  // ReachableFileUtil.metadataFileLocations and exercises
+  // METADATA_DELETE_AFTER_COMMIT_ENABLED bounded retention. For inline tables
+  // there are no on-disk metadata.json files to delete; the equivalent semantic
+  // -- bounding previousFiles by METADATA_PREVIOUS_VERSIONS_MAX -- is pure
+  // TableMetadata logic and already in upstream. Reachability resolution against
+  // synthetic inline:// URIs is the only mismatch; defer until we have an
+  // InlineCompat fork that swaps the assertion's accessor.
   @Override
   @Test
   @Disabled(
-      "inline TM has no metadata.json files on disk; "
-          + "testMetadataFileLocationsRemovalAfterCommit counts file deletions")
+      "ReachableFileUtil.metadataFileLocations resolves inline:// URIs as files; "
+          + "needs InlineCompat fork to assert against TableMetadata.previousFiles() instead")
   public void testMetadataFileLocationsRemovalAfterCommit() {}
 
   // ============================================================
