@@ -125,6 +125,8 @@ message TableMetadataUpdate {
     SetTableLocation        set_table_location         = 11;
     AddManifestDelta        add_manifest               = 12;  // SPEC_ML
     RemoveManifestDelta     remove_manifest            = 13;  // SPEC_ML
+    RemoveSchemas           remove_schemas             = 14;
+    RemovePartitionSpecs    remove_partition_specs     = 15;
   }
 }
 ```
@@ -215,12 +217,30 @@ message AddSortOrder            { int32 order_id = 1; bytes order_json = 2; }
 message SetDefaultSortOrder     { int32 order_id = 1; }
 message SetTableProperties      { map<string,string> updated = 1; repeated string removed = 2; }
 message SetTableLocation        { string location = 1; }
+message RemoveSchemas           { repeated int32 schema_ids = 1; }
+message RemovePartitionSpecs    { repeated int32 spec_ids   = 1; }
 ```
 
 Schemas, partition specs, and sort orders are serialized as length-prefixed
 JSON via Iceberg's existing parsers (`SchemaParser`, `PartitionSpecParser`,
 `SortOrderParser`). These updates are rare, so the JSON overhead is
 acceptable.
+
+`RemoveSchemas` / `RemovePartitionSpecs` are emitted by `computeDelta`
+when `expireSnapshots().cleanExpiredMetadata(true)` (or a replace
+transaction) prunes ids that no retained snapshot references. Without
+explicit removes, the replay would carry every old schema/spec id forward
+through `Builder.buildFrom(base)` and the loaded table would still expose
+them. The `applyTo` for both routes through
+`MetadataUpdate.RemoveSchemas` / `MetadataUpdate.RemovePartitionSpecs`
+because `TableMetadata.Builder.removeSchemas` / `removeSpecs` are
+package-private.
+
+**Update ordering inside a delta:** `Add → SetCurrent / SetDefault → Remove`
+for both schemas and partition specs. The Builder rejects removing the
+current schema id or default spec id, so a replace transaction that
+swaps schemas or specs has to advance the `current` / `default` pointer
+before pruning the prior one.
 
 ## Delta Application
 
@@ -232,9 +252,53 @@ from the base state.
 
 `InlineDeltaCodec.computeDelta(oldMeta, newMeta, manifestListPrefix)` diffs
 two `TableMetadata` instances and produces a minimal list of `DeltaUpdate`
-objects covering all 11 update types (new snapshots, removed snapshots,
-ref changes, schema additions, partition specs, sort orders, property
-changes, location changes).
+objects covering 13 update types (new snapshots, removed snapshots, ref
+changes, schema add/remove, partition spec add/remove, sort orders,
+property changes, location changes).
+
+### Replay determinism
+
+The replay path (`applyDelta` / `applyDeltaWithManifests`) must produce
+**byte-stable** output for repeated replays of the same inputs. Two
+properties make this work:
+
+1. **Synthetic base location.** `TableMetadataParser.fromJson(json)` (the
+   no-location overload) leaves `metadataFileLocation = null`, which makes
+   `Builder.buildFrom(base).discardChanges().build()` skip
+   `addPreviousFile` and drop the would-be metadata-log entry for the
+   prior version. Both replay entry points pass a deterministic synthetic
+   location of the form `inline://#<hash-of-base-bytes>` so the new TM's
+   `previousFiles()` history accumulates correctly. The exact format isn't
+   load-bearing — metadata-log entries are opaque strings, never resolved
+   as filesystem paths in inline mode — only determinism is.
+
+2. **`lastUpdatedMillis` pin BEFORE `applyTo`.** `Builder.lastUpdatedMillis`
+   starts null and `Builder.build()` defaults to
+   `System.currentTimeMillis()` when unset. Several updates (notably
+   `SetSnapshotRefUpdate` for the `main` branch, which calls
+   `Builder.setRef`) read the field synchronously to stamp a new
+   `SnapshotLogEntry`, so a null reads as wall-clock time. Both replay
+   loops set `tmBuilder.setLastUpdatedMillis(current.lastUpdatedMillis())`
+   before calling `update.applyTo(tmBuilder)`. `AddSnapshotUpdate` is
+   exempt: its `applyTo` calls `addSnapshot(snapshot)` which itself pins
+   `lastUpdatedMillis` to the snapshot's deterministic timestamp.
+
+Without these two properties, replay produces different bytes on each
+read, the synthetic `metadataFileLocation` (Arrays.hashCode of the bytes)
+flips, and BaseTransaction's reference-equality refresh check
+(`base != underlyingOps.refresh()`) trips on every `commitTransaction`.
+
+### Concurrent-replace id collisions
+
+Schema, partition-spec, and sort-order ids are usually unique per
+content, but two racing replace transactions starting from the same base
+can independently assign the same id (e.g. `sortOrderId=1`) to different
+content. Delta encoding can't express an in-place id swap — Builder's
+`addSortOrderInternal` short-circuits on existing ids, and there's no
+public `removeSortOrders` / `replaceSortOrder`. `computeDelta` detects
+this at the top of the diff and returns `null`, which `selectMode`
+routes to **full mode**. Full mode serializes the new TM verbatim, so
+the collision resolves naturally on the next read.
 
 ## Configuration
 
@@ -278,10 +342,42 @@ function doCommit(base, newMetadata):
 `CatalogFile.isInlineTable()` and calls
 `BaseMetastoreTableOperations.refreshFromMetadataLocation(syntheticLoc, null, 0, customLoader)`
 with a `Function<String, TableMetadata>` that parses from the catalog's
-inline bytes. The synthetic location (`inline://<tblId>#v<nanos>`) never
+inline bytes.
+
+The synthetic location is `inline://<tableIdentifier>#<hash-of-bytes>`,
+where the hash is `Integer.toHexString(Arrays.hashCode(inlineMeta))`.
+The hash form is required for the
+`BaseMetastoreTableOperations.refreshFromMetadataLocation` cache check:
+when the inline bytes haven't changed, the synthetic location matches
+`currentMetadataLocation`, refresh short-circuits, and the cached
+`TableMetadata` instance survives. A wall-clock-based suffix would force
+a reload on every refresh and break BaseTransaction's reference-equality
+check (`base != underlyingOps.refresh()`). The synthetic location never
 reaches `FileIO`. **No changes to `BaseMetastoreCatalog` or
-`BaseMetastoreTableOperations` are required** — the existing protected API
-supports this integration cleanly.
+`BaseMetastoreTableOperations` are required** — the existing protected
+API supports this integration cleanly.
+
+## Rename
+
+`Catalog.renameTable(from, to)` for inline tables migrates the inline
+bytes across, not just the namespace/name pointer. The pointer-mode
+shape (`dropTable(from) + createTable(to, oldLocation)`) works for
+external metadata.json because both names point at the same on-disk
+file, but inline tables have no such file: a literal port of that shape
+would create a destination entry pointing at nothing while the inline
+metadata stayed keyed under the just-dropped id.
+
+Implementation: `FileIOCatalog.renameTable` checks
+`catalogFile.isInlineTable(from)`. For inline tables it does
+`format.from(catalogFile).dropTable(from).createTableInline(to, inlineBytes).commit(io)`
+inside a single `Mut`, so the migration is observed atomically by
+readers. Pointer tables continue to use the original shape.
+
+**TM+ML caveat (TODO).** The current implementation copies only the
+`tblInlineMetadata` bytes. When inline-ML grows rename support, the
+migration also needs to carry `tblManifestPrefix`, `manifestPool`, and
+`snapshotManifests` across the id swap. Tracked at the
+`renameTable` callsite in `FileIOCatalog`.
 
 ## Inline ↔ Pointer Transitions
 

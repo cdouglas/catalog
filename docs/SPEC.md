@@ -266,6 +266,14 @@ applied, no error). This is correct behaviour: concurrent writers may append
 transactions that conflict with each other, and during log replay the losing
 transaction has no effect.
 
+Inline-mode `UpdateTableInline` actions in delta mode fold their delta
+into the in-memory checkpoint via
+`InlineDeltaCodec.applyDeltaWithManifests` during this read-time apply
+step. The replay must be byte-stable so the resulting `tblInlineMetadata`
+hash (used as the synthetic `metadataFileLocation`) is the same across
+two reads of the same catalog state — see [SPEC_TM.md](SPEC_TM.md)
+§"Replay determinism" for the two pinning rules.
+
 ## Commit Protocol
 
 Two thresholds control whether a commit takes the append path or the CAS

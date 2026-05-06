@@ -1,5 +1,43 @@
 # Inline TM/ML stabilization plan
 
+## Status (2026-05-05) — all 8 inline-TM bugs fixed
+
+`TestS3CatalogCASInlineTM` is **102/102 passing** (13 skipped, all
+pre-existing). The plan below was executed; the per-step landings are
+summarized here so the rest of this doc reads as historical context.
+
+| Step | Bug                                                | Resolution                                     | Commit    |
+|------|----------------------------------------------------|------------------------------------------------|-----------|
+| A    | `testUpdateTransaction` — `previousFiles().size() == 0` | Synthetic `inline://#<hash>` base location in `applyDelta`/`applyDeltaWithManifests` so `Builder.previousFileLocation` is non-null and `addPreviousFile` runs | `804465b` |
+| B    | `testRemoveUnusedSpec/Schemas[1]` — refresh required   | `setLastUpdatedMillis(current.lastUpdatedMillis())` BEFORE `update.applyTo` (was after) so `setRef` sees a deterministic stamp | `45c88c5` |
+| C    | `testRemoveUnusedSpec/Schemas[2]` — specs/schemas not removed | New `RemoveSchemasUpdate` / `RemovePartitionSpecsUpdate` delta types (wire fields 14/15); `computeDelta` emits them with `Add → SetCurrent/SetDefault → Remove` ordering | `b616131` |
+| D    | `testRenameTable` — destination empty for inline tables | Inline-aware `renameTable`: `dropTable + createTableInline(to, oldInlineMeta)` in a single `Mut`. TM+ML rename still TODO. | `067df2c` |
+| E    | `testReplaceTableKeepsSnapshotLog` — wall-clock timestamp | Same Step B fix (the `setRef`-before-pin bug also corrupted the snapshot log entry's timestamp on inherited snapshots) | `45c88c5` |
+| F    | `testConcurrentReplaceTransactionSortOrderConflict` | `idCollidesWithDifferentContent` check in `computeDelta`: if any schema/spec/sort-order id appears in both old and new with different content, return null → full-mode write | `baac33b` |
+
+The four `testReplaceTransaction`-family `@Disabled` overrides (Group A
+in the original plan) were re-enabled in commit `d8e19e8`; Step A was
+sufficient to fix them. Two remain disabled in
+`TestS3CatalogCASInlineTM`:
+
+* `testMetadataFileLocationsRemovalAfterCommit` — `ReachableFileUtil`
+  resolves `inline://` URIs as filesystem paths.
+* `testRegisterTable` / `testRegisterExistingTable` — the API
+  round-trips a metadata-location string back through
+  `catalog.registerTable`, which has no inline equivalent yet.
+
+Both need the `InlineCompatCatalogTests` fork that the user's original
+directive describes; tracked under errata T4.
+
+The full atomic-mode × inline-mode matrix status (which cells are green,
+WIP, or open) lives in [docs/COMPAT.md](docs/COMPAT.md). Replay-side
+determinism is documented in [docs/SPEC_TM.md](docs/SPEC_TM.md)
+§"Replay determinism" and as invariant I4 in
+[docs/design.md](docs/design.md). Original plan and analysis below
+preserved for context.
+
+---
+
 ## Context
 
 Extending the cloud test matrix from "non-inlined" to also cover `fileio.catalog.inline=true` (TM-only) and `fileio.catalog.inline=true + fileio.catalog.inline.manifests=true` (TM+ML), starting with CAS-only mode on S3 and GCS. The non-inlined matrix is green (S3-Express-append, S3-CAS, GCS-CAS, both `CatalogTests` and `CatalogTransactionTests`, 260 + 130 = 390/390 across six suites).

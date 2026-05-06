@@ -123,6 +123,40 @@ eviction is explicitly to pointer mode. `updateInlineMetadata` preserves
 the pool; `removeInlineMetadata` clears it. Callers pick by intent, not
 convenience.
 
+### I4. Inline replay is byte-stable
+
+Two reads of the same catalog state must produce identical inline-table
+bytes for every table. The synthetic `metadataFileLocation` is the
+hex-hash of those bytes (see [SPEC_TM.md](SPEC_TM.md) §"Table Loading"),
+and `BaseMetastoreTableOperations.refreshFromMetadataLocation` short-
+circuits a refresh exactly when that location matches the cached one.
+Without byte-stability the cache misses on every refresh,
+`BaseTransaction.applyUpdates`'s reference-equality check
+(`base != underlyingOps.refresh()`) trips, and any `commitTransaction`
+that doesn't swap to a fresh base throws "Table metadata refresh is
+required".
+
+Two operational rules in `InlineDeltaCodec` keep the bytes stable:
+
+1. The base parsed inside `applyDelta` / `applyDeltaWithManifests` is
+   given a deterministic synthetic `metadataFileLocation`
+   (`inline://#<hash-of-base-bytes>`), not null. Without it,
+   `Builder.buildFrom(base).discardChanges().build()` skips
+   `addPreviousFile` and the new TM's metadata-log loses the entry for
+   the prior version.
+2. `tmBuilder.setLastUpdatedMillis(current.lastUpdatedMillis())` runs
+   **before** `update.applyTo(tmBuilder)` in every Builder rebuild loop.
+   `Builder.lastUpdatedMillis` starts null; `Builder.setRef` (invoked by
+   `SetSnapshotRefUpdate` for `main`) reads it synchronously to stamp a
+   `SnapshotLogEntry`, and a null reads as `System.currentTimeMillis()`
+   inside `Builder.build`'s fallback. Pinning before `applyTo` makes the
+   stamp deterministic and the bytes stable.
+
+`AddSnapshotUpdate.applyTo` is exempt from rule 2 because
+`Builder.addSnapshot` itself pins `lastUpdatedMillis` to
+`snapshot.timestampMillis()`, which is reconstructed deterministically
+from `base.lastUpdatedMillis() + timestampDeltaMs`.
+
 ## Operation × Operation Conflict Matrix
 
 The matrix below falls out of I2 (action versions are bumped on apply)
@@ -224,9 +258,18 @@ field 2 even when false (overriding proto3's default-value suppression).
    overload (for changes that reference inline state like manifest pools).
 3. Update `computeDelta` to emit the new update when relevant; the diff
    should be minimal (only emit when the field differs).
-4. Add unit tests in `TestInlineDelta`: encode/decode round-trip,
-   apply against a fresh `TableMetadata`, idempotency on replay.
-5. If the new update type interacts with manifest-pool state, also extend
+4. **Update ordering** matters when a Builder method rejects the
+   operation against the current state (e.g. `removeSchemas` rejects
+   removing the current schema id). Emit `Add → SetCurrent / SetDefault →
+   Remove` so the pointer advances before the prune.
+5. **Determinism check.** If the update's `applyTo` reads
+   `Builder.lastUpdatedMillis` to stamp a derived field (snapshot-log
+   entry, etc.), make sure the rebuild loop in `applyDeltaWithManifests`
+   pins that value before `applyTo` runs. See I4.
+6. Add unit tests in `TestInlineDelta`: encode/decode round-trip,
+   apply against a fresh `TableMetadata`, idempotency on replay,
+   byte-stability across repeated replays of the same delta.
+7. If the new update type interacts with manifest-pool state, also extend
    the routing in `applyDeltaWithManifests` (see SPEC_TM.md and SPEC_ML.md).
 
 ### Choosing append vs CAS
@@ -273,8 +316,9 @@ classes handle this for you; manual codecs require it as a discipline.
 | `TestProtoCommitKnobs` | `max.append.count` / `max.append.size` thresholds; `MockIO` |
 | `TestInlineDelta` | Inline TM delta encode/decode/apply, `computeDelta`, `selectMode`, ML delta types |
 | `TestInlineManifestEndToEnd` | End-to-end commit→reload across BASELINE / TM_ONLY / TM_ML configs; per-`SnapshotProducer` operation coverage |
-| `CatalogTests`, `CatalogTransactionTests` | Abstract suites copied from Iceberg core, run by cloud-provider subclasses |
-| `GCSCatalogTest`, `TestS3Catalog`, `ADLSCatalogTest` | Cloud integration tests (require credentials/emulators; pointer mode only today) |
+| `CatalogTests`, `CatalogTransactionTests` | Abstract suites consumed from `iceberg-core-tests.jar` (R4 / commit `35076d6`) and run by cloud-provider subclasses |
+| `GCSCatalogTest`, `TestS3Catalog`, `ADLSCatalogTest` | Cloud integration tests, append-mode + pointer (require credentials/emulators) |
+| `*CAS`, `*InlineTM`, `*InlineML` subclasses | Cloud matrix subclasses overriding `maxAppendCount()` / `inlineTM()` / `inlineML()` -- see [COMPAT.md](COMPAT.md) for status |
 
 The end-to-end suite uses an in-memory `MemoryFileIO` so commit→reload
 cycles run without storage. Cloud tests verify that the actual provider

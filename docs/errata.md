@@ -39,6 +39,21 @@ on demand, which is not implemented today.
 **Trigger to revisit:** if a real workload hits the path. Until then,
 inline ML implies the table stays inline.
 
+### D5. `renameTable` for inline-ML tables doesn't migrate the manifest pool
+
+`FileIOCatalog.renameTable` correctly migrates `tblInlineMetadata`
+across the id swap for inline-TM tables (see [SPEC_TM.md](SPEC_TM.md)
+§"Rename"), but doesn't yet migrate the inline-ML side -- the
+`tblManifestPrefix`, `manifestPool`, and `snapshotManifests` maps stay
+keyed under the dropped old id. Inline-TM tables (no ML) work fine;
+inline-ML tables would lose their manifest data on rename.
+
+**Trigger to revisit:** when adding a cloud `*InlineMLRenameTable` test,
+or the first time an inline-ML tenant exercises rename. The fix is to
+extend the `Mut.dropTable` / `Mut.createTableInline` pair into a single
+atomic `renameInlineTable(from, to)` action that copies all four maps
+across. Tracked at the call site in `FileIOCatalog.renameTable`.
+
 ### D4. `RewriteTablePathUtil` does not handle inline-ML tables
 
 `core/.../RewriteTablePathUtil.java:252,280` calls `ManifestLists.write()`
@@ -49,16 +64,57 @@ who hit it mid-migration can recognize it.
 
 ## Test Coverage Gaps
 
-### T2. Cloud integration tests don't run in inline-ML mode
+### T2. Cloud integration tests don't run in inline-ML mode (mostly resolved)
 
-`TestS3Catalog`, `GCSCatalogTest`, and `ADLSCatalogTest` set neither
-`fileio.catalog.inline=true` nor `fileio.catalog.inline.manifests=true`.
-The cloud suite runs in pointer mode only. Provider-specific
-conditional-write quirks could interact with inline-ML semantics in
-ways not covered today.
+S3 and GCS now run an `inline=true` matrix:
+`TestS3CatalogCASInlineTM` / `TestS3CatalogCASInlineML` and the GCS
+counterparts; the same shape exists for the transaction suites. Each is
+a one-line subclass that overrides `inlineTM()` / `inlineML()` and
+flips `maxAppendCount()` to 0. The full atomic-mode × inline-mode grid
+status lives in [COMPAT.md](COMPAT.md). The non-inlined and CAS-inline-
+TM cells are green on S3 and GCS; the inline-TM cells require the
+`InlineDeltaCodec` determinism + RemoveSchemas/RemovePartitionSpecs
+fixes from this session.
 
-**Fix path:** parameterize each cloud test by `InlineConfig` (BASELINE /
-TM_ONLY / TM_ML), as already done for the in-memory end-to-end tests.
+**Still open for ADLS:** `ADLSCatalogTest` and
+`ADLSFileIOCatalogTransactionTests` now share the same hooks
+(`maxAppendCount`, `inlineTM`, `inlineML`) as their S3/GCS counterparts
+and have CAS-mode subclasses (`ADLSCatalogTestCAS`,
+`ADLSFileIOCatalogTransactionTestsCAS`) but no `*InlineTM` /
+`*InlineML` variants yet. Adding them is mechanical once the inline-CAS
+matrix on S3/GCS proves the underlying behavior, which it now does.
+
+### T4. Inline-CatalogTests reachability tests need an InlineCompat fork
+
+`testMetadataFileLocationsRemovalAfterCommit` calls
+`ReachableFileUtil.metadataFileLocations(table, false)` and asserts the
+result's size after `METADATA_DELETE_AFTER_COMMIT_ENABLED` retention
+kicks in. For inline tables there are no on-disk metadata.json files;
+the equivalent semantic (bounding `previousFiles()` by
+`METADATA_PREVIOUS_VERSIONS_MAX`) is already wired through
+`Builder.build()`'s `addPreviousFile`, but the assertion uses
+`ReachableFileUtil` which resolves the URIs as filesystem paths and
+treats synthetic `inline://` entries as missing files.
+
+The user direction was: do not `@Disabled` such tests permanently —
+fork them into an intermediate abstract suite that asserts the
+inline-equivalent (e.g. `previousFiles().size()`) without ever cheating
+about data accessibility (snapshots and data files must remain reachable
+through the catalog file).
+
+**State today:** disabled in `TestS3CatalogCASInlineTM` and
+`GCSCatalogTestInlineTM` with a narrowed message pointing at the
+InlineCompat fork. Same for `testRegisterTable` /
+`testRegisterExistingTable`, which round-trip a metadata-location
+string back through `catalog.registerTable()`; the inline equivalent
+needs a register-from-bytes API, not a string.
+
+**Fix path:** add an `InlineCompatCatalogTests` abstract subclass of
+`CatalogTests` in this project that overrides the affected test bodies
+to inspect catalog state instead of file URIs, and have the
+`*InlineTM` / `*InlineML` cloud subclasses extend it. Already in the
+session task list; deferred behind the inline determinism fixes that
+needed cloud-test feedback first.
 
 ### T3. Cloud integration tests require manual emulator setup
 
