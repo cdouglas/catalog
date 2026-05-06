@@ -956,7 +956,12 @@ public class InlineDeltaCodec {
      * Requires the manifest list prefix from the inline table's checkpoint entry.
      */
     public TableMetadata applyTo(TableMetadata base, String manifestListPrefix) {
-      long seqNum = base.lastSequenceNumber() + 1;
+      // v1 tables don't carry sequence numbers; TableMetadata's constructor rejects
+      // any non-zero value. Synthesize seqNum only for v2+; otherwise leave it 0 and
+      // omit the field from the snapshot JSON (SnapshotParser interprets a missing
+      // sequence-number as 0).
+      boolean hasSeqNum = base.formatVersion() >= 2;
+      long seqNum = hasSeqNum ? base.lastSequenceNumber() + 1 : 0;
       // Prefer explicit parentSnapshotId (correct for stage-only, branch, cherry-pick).
       // Fall back to base.currentSnapshot() for older-format deltas (backward compat).
       long resolvedParentId;
@@ -981,7 +986,9 @@ public class InlineDeltaCodec {
       if (resolvedParentId >= 0) {
         json.append(",\"parent-snapshot-id\":").append(resolvedParentId);
       }
-      json.append(",\"sequence-number\":").append(seqNum);
+      if (hasSeqNum) {
+        json.append(",\"sequence-number\":").append(seqNum);
+      }
       json.append(",\"timestamp-ms\":").append(timestamp);
       json.append(",\"schema-id\":").append(resolvedSchemaId);
       json.append(",\"manifest-list\":\"").append(escapeJson(manifestList)).append("\"");
