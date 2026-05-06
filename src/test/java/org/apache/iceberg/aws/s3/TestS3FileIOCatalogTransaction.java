@@ -53,6 +53,19 @@ public class TestS3FileIOCatalogTransaction extends CatalogTransactionTests<File
     return 10_000;
   }
 
+  /** Whether the catalog inlines TableMetadata. Default off; subclasses opt in. */
+  protected boolean inlineTM() {
+    return false;
+  }
+
+  /**
+   * Whether the catalog inlines manifest lists. Requires {@link #inlineTM()} to be true; the
+   * format rejects {@code inline.manifests=true} without {@code inline=true}.
+   */
+  protected boolean inlineML() {
+    return false;
+  }
+
   // Don't keep artifacts from successful tests
   static class SuccessCleanupExtension implements TestWatcher {
     @Override
@@ -86,6 +99,8 @@ public class TestS3FileIOCatalogTransaction extends CatalogTransactionTests<File
     final Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
     properties.put("fileio.catalog.max.append.count", String.valueOf(maxAppendCount()));
+    properties.put("fileio.catalog.inline", String.valueOf(inlineTM()));
+    properties.put("fileio.catalog.inline.manifests", String.valueOf(inlineML()));
     final CatalogFormat<?, ?> format = new ProtoCatalogFormat(properties);
     catalog = new FileIOCatalog("test", location, format, io, Maps.newHashMap());
     catalog.initialize(testName, properties);

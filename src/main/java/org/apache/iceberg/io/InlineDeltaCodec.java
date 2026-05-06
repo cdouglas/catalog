@@ -283,12 +283,25 @@ public class InlineDeltaCodec {
     return TableMetadataParser.toJson(current).getBytes(StandardCharsets.UTF_8);
   }
 
-  /** Applies a list of decoded updates to a base metadata. */
+  /**
+   * Applies a list of decoded updates to a base metadata. Reconstruction must be byte-stable:
+   * a logically-identical replay (e.g. the same delta on the same base across catalog reads)
+   * must produce identical TableMetadata bytes, otherwise BaseMetastoreTableOperations'
+   * metadata-location cache check sees every refresh as a new version and returns a fresh
+   * TableMetadata instance, which surfaces inside BaseTransaction as
+   * "Table metadata refresh is required" because the staged PendingUpdates' captured base no
+   * longer reference-equals the rebuilt current. {@link TableMetadata.Builder#build()} defaults
+   * {@code lastUpdatedMillis} to {@code System.currentTimeMillis()} when null, so we pin it
+   * here: the table-level timestamp on a delta replay isn't meaningful (the delta is the new
+   * snapshot's wall clock), and carrying the base's timestamp keeps reconstruction
+   * deterministic.
+   */
   public static TableMetadata applyUpdates(TableMetadata base, List<DeltaUpdate> updates) {
     TableMetadata.Builder builder = TableMetadata.buildFrom(base);
     for (DeltaUpdate update : updates) {
       update.applyTo(builder);
     }
+    builder.setLastUpdatedMillis(base.lastUpdatedMillis());
     return builder.discardChanges().build();
   }
 

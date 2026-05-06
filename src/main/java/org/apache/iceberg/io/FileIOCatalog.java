@@ -19,6 +19,7 @@
 package org.apache.iceberg.io;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -392,11 +393,22 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         // Pointer table: load metadata from external file
         refreshFromMetadataLocation(metadataFile);
       } else if (catalogFile.isInlineTable(tableId)) {
-        // Inline table: load metadata from catalog bytes
+        // Inline table: load metadata from catalog bytes.
+        // The synthetic location must be deterministic in the inline content: a unique
+        // value per refresh (e.g. nanoTime) defeats the
+        // BaseMetastoreTableOperations.refreshFromMetadataLocation cache check, so a
+        // logically-identical re-read returns a *new* TableMetadata instance. Inside a
+        // BaseTransaction, that triggers applyUpdates' "underlying changed" branch on a
+        // refresh-with-no-actual-change, which then surfaces as
+        // "Table metadata refresh is required" because the staged PendingUpdates'
+        // captured base no longer reference-equals the rebuilt current. Hashing the
+        // inline bytes gives the same string for the same content.
+        // Companion fix lives in InlineDeltaCodec.applyUpdates, which pins
+        // last-updated-ms on delta replay so the bytes themselves are stable.
         byte[] inlineMeta = catalogFile.inlineMetadata(tableId);
         String json = new String(inlineMeta, StandardCharsets.UTF_8);
-        // Use synthetic location for change detection; custom loader skips file I/O
-        String syntheticLoc = "inline://" + tableId + "#v" + System.nanoTime();
+        String syntheticLoc =
+            "inline://" + tableId + "#" + Integer.toHexString(Arrays.hashCode(inlineMeta));
         refreshFromMetadataLocation(syntheticLoc, null, 0,
             loc -> wrapInlineManifests(
                 TableMetadataParser.fromJson(loc, json), catalogFile));

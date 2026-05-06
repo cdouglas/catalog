@@ -60,6 +60,19 @@ public class GCSCatalogTest extends CatalogTests<FileIOCatalog> {
   private static String warehouseLocation;
   private static String uniqTestRun;
 
+  /** Whether the catalog inlines TableMetadata. Default off; subclasses opt in. */
+  protected boolean inlineTM() {
+    return false;
+  }
+
+  /**
+   * Whether the catalog inlines manifest lists. Requires {@link #inlineTM()} to be true; the
+   * format rejects {@code inline.manifests=true} without {@code inline=true}.
+   */
+  protected boolean inlineML() {
+    return false;
+  }
+
   // Don't keep artifacts from successful tests
   static class SuccessCleanupExtension implements TestWatcher {
     @Override
@@ -122,6 +135,8 @@ public class GCSCatalogTest extends CatalogTests<FileIOCatalog> {
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
     // GCSFileIO.supportsAppend() returns false, so the format auto-coerces every
     // commit to CAS regardless of fileio.catalog.max.append.count.
+    properties.put("fileio.catalog.inline", String.valueOf(inlineTM()));
+    properties.put("fileio.catalog.inline.manifests", String.valueOf(inlineML()));
     // CatalogTests.testDefault*Properties / testOverride*Properties expect
     // catalog() to come configured with table-default.* / table-override.*
     properties.put(CatalogProperties.TABLE_DEFAULT_PREFIX + "default-key1", "catalog-default-key1");
@@ -161,6 +176,8 @@ public class GCSCatalogTest extends CatalogTests<FileIOCatalog> {
     GCSFileIO io = new GCSFileIO(() -> storage, new GCPProperties());
     final Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
+    properties.put("fileio.catalog.inline", String.valueOf(inlineTM()));
+    properties.put("fileio.catalog.inline.manifests", String.valueOf(inlineML()));
     properties.putAll(additionalProperties);
     final String location = warehouseLocation + "/catalog-" + catalogName;
     FileIOCatalog c =

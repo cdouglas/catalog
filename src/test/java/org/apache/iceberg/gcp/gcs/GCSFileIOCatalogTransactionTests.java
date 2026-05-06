@@ -58,6 +58,19 @@ public class GCSFileIOCatalogTransactionTests extends CatalogTransactionTests<Fi
   private static String warehouseLocation;
   private static String uniqTestRun;
 
+  /** Whether the catalog inlines TableMetadata. Default off; subclasses opt in. */
+  protected boolean inlineTM() {
+    return false;
+  }
+
+  /**
+   * Whether the catalog inlines manifest lists. Requires {@link #inlineTM()} to be true; the
+   * format rejects {@code inline.manifests=true} without {@code inline=true}.
+   */
+  protected boolean inlineML() {
+    return false;
+  }
+
   // Don't keep artifacts from successful tests
   static class SuccessCleanupExtension implements TestWatcher {
     @Override
@@ -117,6 +130,8 @@ public class GCSFileIOCatalogTransactionTests extends CatalogTransactionTests<Fi
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
     // GCSFileIO.supportsAppend() returns false, so the format auto-coerces every
     // commit to CAS regardless of fileio.catalog.max.append.count.
+    properties.put("fileio.catalog.inline", String.valueOf(inlineTM()));
+    properties.put("fileio.catalog.inline.manifests", String.valueOf(inlineML()));
     final String location = warehouseLocation + "/catalog";
     catalog =
         new FileIOCatalog(

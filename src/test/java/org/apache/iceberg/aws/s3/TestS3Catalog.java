@@ -54,6 +54,19 @@ public class TestS3Catalog extends CatalogTests<FileIOCatalog> {
     return 10_000;
   }
 
+  /** Whether the catalog inlines TableMetadata. Default off; subclasses opt in. */
+  protected boolean inlineTM() {
+    return false;
+  }
+
+  /**
+   * Whether the catalog inlines manifest lists. Requires {@link #inlineTM()} to be true; the
+   * format rejects {@code inline.manifests=true} without {@code inline=true}.
+   */
+  protected boolean inlineML() {
+    return false;
+  }
+
   // Don't keep artifacts from successful tests
   static class SuccessCleanupExtension implements TestWatcher {
     @Override
@@ -89,6 +102,8 @@ public class TestS3Catalog extends CatalogTests<FileIOCatalog> {
     final Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
     properties.put("fileio.catalog.max.append.count", String.valueOf(maxAppendCount()));
+    properties.put("fileio.catalog.inline", String.valueOf(inlineTM()));
+    properties.put("fileio.catalog.inline.manifests", String.valueOf(inlineML()));
     // CatalogTests.testDefault*Properties / testOverride*Properties expect
     // catalog() to come configured with table-default.* / table-override.*
     properties.put(CatalogProperties.TABLE_DEFAULT_PREFIX + "default-key1", "catalog-default-key1");
@@ -134,6 +149,8 @@ public class TestS3Catalog extends CatalogTests<FileIOCatalog> {
     final Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
     properties.put("fileio.catalog.max.append.count", String.valueOf(maxAppendCount()));
+    properties.put("fileio.catalog.inline", String.valueOf(inlineTM()));
+    properties.put("fileio.catalog.inline.manifests", String.valueOf(inlineML()));
     properties.putAll(additionalProperties);
     final CatalogFormat<?, ?> format = new ProtoCatalogFormat(properties);
     FileIOCatalog c = new FileIOCatalog(catalogName, location, format, io, Maps.newHashMap());
