@@ -26,6 +26,7 @@ import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -158,8 +159,15 @@ public class InlineDeltaCodec {
 
   /** Applies a delta (encoded bytes) to base metadata, returns updated metadata bytes. */
   public static byte[] applyDelta(byte[] baseMetadataJson, byte[] deltaBytes) {
+    // Synthesize a deterministic metadata-file location for the parsed base. Without this,
+    // TableMetadataParser.fromJson(json) leaves base.metadataFileLocation null, which makes
+    // Builder.buildFrom(base) carry previousFileLocation=null, and the subsequent
+    // discardChanges().build() drops the would-be metadata-log entry for the prior version --
+    // breaking previousFiles() history (CatalogTests.assertPreviousMetadataFileCount).
+    String syntheticLoc =
+        "inline://#" + Integer.toHexString(Arrays.hashCode(baseMetadataJson));
     TableMetadata base = TableMetadataParser.fromJson(
-        new String(baseMetadataJson, StandardCharsets.UTF_8));
+        syntheticLoc, new String(baseMetadataJson, StandardCharsets.UTF_8));
     List<DeltaUpdate> updates = decodeDelta(deltaBytes);
     TableMetadata result = applyUpdates(base, updates);
     return TableMetadataParser.toJson(result).getBytes(StandardCharsets.UTF_8);
@@ -183,8 +191,16 @@ public class InlineDeltaCodec {
   public static byte[] applyDeltaWithManifests(
       byte[] baseMetadataJson, byte[] deltaBytes,
       ProtoCatalogFile.Builder catalogBuilder, int tableId) {
+    // Synthesize a deterministic metadata-file location for the parsed base. Without this,
+    // TableMetadataParser.fromJson leaves metadataFileLocation null, so each Builder.buildFrom(base)
+    // carries previousFileLocation=null and addPreviousFile becomes a no-op -- the new TM's
+    // metadata-log loses the entry for the prior version (CatalogTests.testUpdateTransaction et al.
+    // see previousFiles().size() == 0). The exact format isn't load-bearing, only determinism is:
+    // a hash of the base bytes is stable across repeated replays of the same catalog state.
+    String syntheticLoc =
+        "inline://#" + Integer.toHexString(Arrays.hashCode(baseMetadataJson));
     TableMetadata base = TableMetadataParser.fromJson(
-        new String(baseMetadataJson, StandardCharsets.UTF_8));
+        syntheticLoc, new String(baseMetadataJson, StandardCharsets.UTF_8));
     List<DeltaUpdate> updates = decodeDelta(deltaBytes);
     String prefix = catalogBuilder.manifestListPrefix(tableId);
     if (prefix == null) {
@@ -272,11 +288,19 @@ public class InlineDeltaCodec {
         // dangling-refs cleanup for the TM side).
         TableMetadata.Builder tmBuilder = TableMetadata.buildFrom(current);
         update.applyTo(tmBuilder);
+        // Pin lastUpdatedMillis: Builder.build() defaults to System.currentTimeMillis() when
+        // unset, which makes replay of the same delta on the same base produce different bytes
+        // and trips BaseTransaction's "Table metadata refresh is required" check. Carry the
+        // current TM's value forward; it equals base.lastUpdatedMillis() until an
+        // AddSnapshotUpdate bumps it to the snapshot's timestamp.
+        tmBuilder.setLastUpdatedMillis(current.lastUpdatedMillis());
         current = tmBuilder.discardChanges().build();
       } else {
         // Schema, properties, sort order, refs, etc. — apply to TableMetadata.Builder
         TableMetadata.Builder tmBuilder = TableMetadata.buildFrom(current);
         update.applyTo(tmBuilder);
+        // Pin lastUpdatedMillis: see RemoveSnapshotsUpdate branch above.
+        tmBuilder.setLastUpdatedMillis(current.lastUpdatedMillis());
         current = tmBuilder.discardChanges().build();
       }
     }
