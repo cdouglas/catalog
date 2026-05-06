@@ -373,11 +373,12 @@ Implementation: `FileIOCatalog.renameTable` checks
 inside a single `Mut`, so the migration is observed atomically by
 readers. Pointer tables continue to use the original shape.
 
-**TM+ML caveat (TODO).** The current implementation copies only the
-`tblInlineMetadata` bytes. When inline-ML grows rename support, the
-migration also needs to carry `tblManifestPrefix`, `manifestPool`, and
-`snapshotManifests` across the id swap. Tracked at the
-`renameTable` callsite in `FileIOCatalog`.
+This is a workaround inside the existing `dropTable + createTable`
+layering, not the right shape long-term. Rename should be a single
+in-place update of the `TblEntry`'s namespace/name fields, keeping the
+id stable so every id-keyed map (including the entire inline-ML side)
+follows for free. See [errata.md](errata.md) §D5 for the proper fix and
+the inline-ML migration gap that this workaround leaves open.
 
 ## Inline ↔ Pointer Transitions
 

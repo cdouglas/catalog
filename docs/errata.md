@@ -39,20 +39,47 @@ on demand, which is not implemented today.
 **Trigger to revisit:** if a real workload hits the path. Until then,
 inline ML implies the table stays inline.
 
-### D5. `renameTable` for inline-ML tables doesn't migrate the manifest pool
+### D5. `renameTable` is layered as drop+create, not as an in-place update
 
-`FileIOCatalog.renameTable` correctly migrates `tblInlineMetadata`
-across the id swap for inline-TM tables (see [SPEC_TM.md](SPEC_TM.md)
-§"Rename"), but doesn't yet migrate the inline-ML side -- the
-`tblManifestPrefix`, `manifestPool`, and `snapshotManifests` maps stay
-keyed under the dropped old id. Inline-TM tables (no ML) work fine;
-inline-ML tables would lose their manifest data on rename.
+The catalog state is keyed by `int` table id throughout: `tableById`,
+`tblInlineMetadata`, `tblManifestPrefix`, `manifestPool`,
+`snapshotManifests`. The `(namespace, name)` pair lives on `TblEntry` and
+in the derived `tableLookup` -- it's metadata associated with the id.
+A correct `renameTable` mutates the `TblEntry`'s `namespaceId` / `name`
+fields in place, bumps the entry's version, and updates `tableLookup`.
+The id stays put, so every id-keyed map (including the entire inline-ML
+side) follows for free.
 
-**Trigger to revisit:** when adding a cloud `*InlineMLRenameTable` test,
-or the first time an inline-ML tenant exercises rename. The fix is to
-extend the `Mut.dropTable` / `Mut.createTableInline` pair into a single
-atomic `renameInlineTable(from, to)` action that copies all four maps
-across. Tracked at the call site in `FileIOCatalog.renameTable`.
+What's actually implemented is `dropTable(from) + createTable(to, ...)`,
+which allocates a *new* id. For pointer-mode tables that's harmless --
+the on-disk `metadata.json` is the load-bearing state and both ids
+briefly point at the same file. For inline tables the id-keyed maps
+*are* the load-bearing state, so the new id starts empty and the
+just-dropped old id takes everything with it.
+
+**Workaround in this branch.** `FileIOCatalog.renameTable` detects
+inline tables via `catalogFile.isInlineTable(from)` and emits
+`format.from(catalogFile).dropTable(from).createTableInline(to, oldInlineMeta).commit(io)`
+inside one `Mut`. The old id is still dropped and a new one is still
+allocated, but `oldInlineMeta` is copied across so the destination at
+least has the inline TM bytes. This is enough for inline-TM (no ML);
+it's not enough for inline-ML, where `tblManifestPrefix`,
+`manifestPool`, and `snapshotManifests` would also need to be carried.
+That gap is the symptom that originally prompted this entry.
+
+**Proper fix.** Add a single `RenameTable(id, newNamespaceId, newName)`
+action with its own wire type and `Mut.renameTable(from, to)` API.
+`apply(builder)` mutates `TblEntry` in place and bumps its version;
+`verify(builder)` checks the same version preconditions as `DropTable`
+/ `UpdateTableInline` (matching `tbl_v`). Conflict semantics fall out
+of the existing version-bumping rules in the design.md
+operation × operation matrix without new cells. Inline state is never
+copied and never stranded -- the id is stable and every id-keyed map
+follows by construction. This also retires the inline-ML migration
+TODO at the rename callsite.
+
+**Trigger to revisit:** before exercising rename on inline-ML tables in
+a cloud test, or before the first inline-ML tenant uses rename.
 
 ### D4. `RewriteTablePathUtil` does not handle inline-ML tables
 
