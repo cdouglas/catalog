@@ -63,6 +63,28 @@ public class ADLSCatalogTest extends CatalogTests<FileIOCatalog> {
   private static String uniqTestRun;
   private static LocationResolver az;
 
+  /**
+   * Catalog format's max.append.count for this suite. Subclasses override to flip the
+   * commit policy: 10000 (default) exercises the append branch via {@code ADLSFileIO}'s
+   * lease-protected appends; 0 forces CAS on every commit.
+   */
+  protected int maxAppendCount() {
+    return 10_000;
+  }
+
+  /** Whether the catalog inlines TableMetadata. Default off; subclasses opt in. */
+  protected boolean inlineTM() {
+    return false;
+  }
+
+  /**
+   * Whether the catalog inlines manifest lists. Requires {@link #inlineTM()} to be true; the
+   * format rejects {@code inline.manifests=true} without {@code inline=true}.
+   */
+  protected boolean inlineML() {
+    return false;
+  }
+
   // copied from BaseAzuriteTest (needs to extend CatalogTests)
   @BeforeAll
   public static void initStorage() {
@@ -144,8 +166,18 @@ public class ADLSCatalogTest extends CatalogTests<FileIOCatalog> {
 
     final Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
+    properties.put("fileio.catalog.max.append.count", String.valueOf(maxAppendCount()));
+    properties.put("fileio.catalog.inline", String.valueOf(inlineTM()));
+    properties.put("fileio.catalog.inline.manifests", String.valueOf(inlineML()));
+    // CatalogTests.testDefault*Properties / testOverride*Properties expect
+    // catalog() to come configured with table-default.* / table-override.*
+    properties.put(CatalogProperties.TABLE_DEFAULT_PREFIX + "default-key1", "catalog-default-key1");
+    properties.put(CatalogProperties.TABLE_DEFAULT_PREFIX + "default-key2", "catalog-default-key2");
+    properties.put(CatalogProperties.TABLE_DEFAULT_PREFIX + "override-key3", "catalog-default-key3");
+    properties.put(CatalogProperties.TABLE_OVERRIDE_PREFIX + "override-key3", "catalog-override-key3");
+    properties.put(CatalogProperties.TABLE_OVERRIDE_PREFIX + "override-key4", "catalog-override-key4");
     final String location = warehouseLocation + "/catalog";
-    CatalogFormat<?, ?> format = new ProtoCatalogFormat();
+    CatalogFormat<?, ?> format = new ProtoCatalogFormat(properties);
     catalog = new FileIOCatalog("test", location, format, io, Maps.newHashMap());
     catalog.initialize(testName, properties);
   }
@@ -190,10 +222,13 @@ public class ADLSCatalogTest extends CatalogTests<FileIOCatalog> {
     }
     final Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
+    properties.put("fileio.catalog.max.append.count", String.valueOf(maxAppendCount()));
+    properties.put("fileio.catalog.inline", String.valueOf(inlineTM()));
+    properties.put("fileio.catalog.inline.manifests", String.valueOf(inlineML()));
     properties.putAll(additionalProperties);
     final String location = warehouseLocation + "/catalog-" + catalogName;
-    FileIOCatalog c =
-        new FileIOCatalog(catalogName, location, new ProtoCatalogFormat(), io, Maps.newHashMap());
+    final CatalogFormat<?, ?> format = new ProtoCatalogFormat(properties);
+    FileIOCatalog c = new FileIOCatalog(catalogName, location, format, io, Maps.newHashMap());
     c.initialize(catalogName, properties);
     return c;
   }

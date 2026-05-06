@@ -31,6 +31,7 @@ import java.util.UUID;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.azure.AzureProperties;
 import org.apache.iceberg.catalog.CatalogTransactionTests;
+import org.apache.iceberg.io.CatalogFormat;
 import org.apache.iceberg.io.FileIOCatalog;
 import org.apache.iceberg.io.ProtoCatalogFormat;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
@@ -58,6 +59,28 @@ public class ADLSFileIOCatalogTransactionTests extends CatalogTransactionTests<F
   private static String warehouseLocation;
   private static String uniqTestRun;
   private static LocationResolver az;
+
+  /**
+   * Catalog format's max.append.count for this suite. Subclasses override to flip the
+   * commit policy: 10000 (default) exercises the append branch via {@code ADLSFileIO}'s
+   * lease-protected appends; 0 forces CAS on every commit.
+   */
+  protected int maxAppendCount() {
+    return 10_000;
+  }
+
+  /** Whether the catalog inlines TableMetadata. Default off; subclasses opt in. */
+  protected boolean inlineTM() {
+    return false;
+  }
+
+  /**
+   * Whether the catalog inlines manifest lists. Requires {@link #inlineTM()} to be true; the
+   * format rejects {@code inline.manifests=true} without {@code inline=true}.
+   */
+  protected boolean inlineML() {
+    return false;
+  }
 
   @BeforeAll
   public static void initStorage() throws IOException {
@@ -108,9 +131,12 @@ public class ADLSFileIOCatalogTransactionTests extends CatalogTransactionTests<F
 
     final Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
+    properties.put("fileio.catalog.max.append.count", String.valueOf(maxAppendCount()));
+    properties.put("fileio.catalog.inline", String.valueOf(inlineTM()));
+    properties.put("fileio.catalog.inline.manifests", String.valueOf(inlineML()));
     final String location = warehouseLocation + "/catalog";
-    catalog =
-        new FileIOCatalog("test", location, new ProtoCatalogFormat(), io, Maps.newHashMap());
+    final CatalogFormat<?, ?> format = new ProtoCatalogFormat(properties);
+    catalog = new FileIOCatalog("test", location, format, io, Maps.newHashMap());
     catalog.initialize(testName, properties);
   }
 
