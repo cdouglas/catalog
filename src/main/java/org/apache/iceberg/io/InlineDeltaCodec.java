@@ -391,6 +391,18 @@ public class InlineDeltaCodec {
    */
   public static List<DeltaUpdate> computeDelta(
       TableMetadata oldMeta, TableMetadata newMeta, String manifestListPrefix) {
+    // Concurrent-replace collision: if a schema, partition spec, or sort order
+    // appears in both old and new metadata under the same id but with different
+    // content, delta encoding can't express the in-place swap (Builder rejects
+    // re-adding an existing id, and there's no public RemoveSortOrder /
+    // ReplaceSortOrder). Force full mode -- the new TM JSON carries the right
+    // shape and the replay never has to dispatch on ids.
+    // testConcurrentReplaceTransactionSortOrderConflict triggers this: both
+    // racing replace transactions independently assign sortOrderId=1 to
+    // different SortOrder fields.
+    if (idCollidesWithDifferentContent(oldMeta, newMeta)) {
+      return null;
+    }
     List<DeltaUpdate> updates = new ArrayList<>();
 
     // New snapshots (most common path: data commits)
@@ -581,6 +593,48 @@ public class InlineDeltaCodec {
     }
 
     return updates.isEmpty() ? null : updates;
+  }
+
+  /**
+   * Detects whether a schema, partition spec, or sort order id exists in both
+   * old and new metadata with different content. Returns true if any such
+   * collision is found -- the caller should fall back to full-mode write,
+   * because delta encoding can't express an in-place id swap. See the
+   * computeDelta header for the concurrent-replace scenario this guards.
+   */
+  private static boolean idCollidesWithDifferentContent(
+      TableMetadata oldMeta, TableMetadata newMeta) {
+    Map<Integer, org.apache.iceberg.Schema> oldSchemasById = new HashMap<>();
+    for (org.apache.iceberg.Schema s : oldMeta.schemas()) {
+      oldSchemasById.put(s.schemaId(), s);
+    }
+    for (org.apache.iceberg.Schema s : newMeta.schemas()) {
+      org.apache.iceberg.Schema oldSchema = oldSchemasById.get(s.schemaId());
+      if (oldSchema != null && !oldSchema.sameSchema(s)) {
+        return true;
+      }
+    }
+    Map<Integer, org.apache.iceberg.PartitionSpec> oldSpecsById = new HashMap<>();
+    for (org.apache.iceberg.PartitionSpec s : oldMeta.specs()) {
+      oldSpecsById.put(s.specId(), s);
+    }
+    for (org.apache.iceberg.PartitionSpec s : newMeta.specs()) {
+      org.apache.iceberg.PartitionSpec oldSpec = oldSpecsById.get(s.specId());
+      if (oldSpec != null && !oldSpec.compatibleWith(s)) {
+        return true;
+      }
+    }
+    Map<Integer, org.apache.iceberg.SortOrder> oldOrdersById = new HashMap<>();
+    for (org.apache.iceberg.SortOrder o : oldMeta.sortOrders()) {
+      oldOrdersById.put(o.orderId(), o);
+    }
+    for (org.apache.iceberg.SortOrder o : newMeta.sortOrders()) {
+      org.apache.iceberg.SortOrder oldOrder = oldOrdersById.get(o.orderId());
+      if (oldOrder != null && !oldOrder.sameOrder(o)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private static boolean statisticsChanged(TableMetadata oldMeta, TableMetadata newMeta) {
