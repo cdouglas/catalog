@@ -200,7 +200,18 @@ public class FileIOCatalog extends BaseMetastoreCatalog
     if (tbl instanceof HasTableOperations) {
       TableOperations ops = ((HasTableOperations) tbl).operations();
       if (ops instanceof InlineManifestTableOperations) {
-        txnSinkOps.get().put(identifier, (InlineManifestTableOperations) ops);
+        // Peek-not-clobber: BaseCatalogTransaction.validateSerializableIsolation
+        // calls origin.loadTable() during its own commitTransaction(), creating a
+        // fresh InlineManifestTableOperations whose stagedDeltas is empty. If we
+        // overwrite the user-loaded ops (which holds the actual staged deltas)
+        // here, FileIOCatalog#commitTransaction would later drain the empty
+        // validation ops, drop all AddManifestUpdate entries, and write a
+        // sentinel-without-pool snapshot. Skip the overwrite when the existing
+        // entry has unflushed staged deltas.
+        InlineManifestTableOperations existing = txnSinkOps.get().get(identifier);
+        if (existing == null || !existing.hasStagedDeltas()) {
+          txnSinkOps.get().put(identifier, (InlineManifestTableOperations) ops);
+        }
       }
     }
     return tbl;
@@ -693,8 +704,12 @@ public class FileIOCatalog extends BaseMetastoreCatalog
 
       // Replace snapshots in-place without using removeSnapshots (which clears refs
       // and doesn't reset lastSequenceNumber, causing validation failures on re-add).
+      // withMetadataLocation preserves parsed.metadataFileLocation() across the
+      // rebuild — without it, BaseCatalogTransaction.validateSerializableIsolation
+      // NPEs on .equals() against a null metadataFileLocation.
       TableMetadata.Builder builder = TableMetadata.buildFrom(parsed);
       builder.replaceSnapshots(replacements);
+      builder.withMetadataLocation(parsed.metadataFileLocation());
       return builder.discardChanges().build();
     }
 
@@ -758,6 +773,11 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         Long nextRowId, ManifestListDelta delta, Long nextRowIdAfter) {
       stagedDeltas.put(snapshotId,
           new StagedSnapshotData(delta, parentSnapshotId, nextRowId, nextRowIdAfter));
+    }
+
+    /** Returns true if there are unflushed staged sink deltas. */
+    boolean hasStagedDeltas() {
+      return !stagedDeltas.isEmpty();
     }
 
     /** Returns and clears all staged sink data (keyed by snapshot id). */

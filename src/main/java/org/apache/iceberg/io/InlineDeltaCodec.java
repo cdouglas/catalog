@@ -236,6 +236,17 @@ public class InlineDeltaCodec {
         AddSnapshotUpdate addSnap = (AddSnapshotUpdate) update;
         current = addSnap.applyTo(current, prefix);
         addedInThisDelta.add(addSnap.snapshotId);
+        // Inline-ML snapshots (empty suffix → `inline://<snapId>` sentinel) must
+        // have a pool entry, otherwise wrapInlineManifests treats the sentinel as
+        // catalog state corruption. A delete-only snapshot on an empty table
+        // produces no AddManifestUpdate entries, so without this pre-register
+        // step the snapshot would land with sentinel + missing pool entry.
+        // Subsequent AddManifestUpdate calls observe an empty refs list and the
+        // existing carry-forward branch fills in the parent's manifests.
+        if (addSnap.manifestListSuffix.isEmpty()) {
+          catalogBuilder.setSnapshotManifests(
+              tableId, addSnap.snapshotId, java.util.Collections.emptyList());
+        }
       } else if (update instanceof AddManifestUpdate) {
         AddManifestUpdate add = (AddManifestUpdate) update;
         // Assert ordering: if we're adding a manifest for a snapshot not yet in

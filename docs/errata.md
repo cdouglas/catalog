@@ -162,6 +162,57 @@ If we ever do this work, the natural cuts are:
 Until any of those triggers, the JSON-as-bytes path is correct and the
 encoder cost outweighs the benefit.
 
+### D9. Inline-ML create-transaction loses per-manifest `partitionSpecId`
+
+Reproduced by `testCompleteCreateTransactionMultipleSchemas` on the
+`*InlineML` matrix only (the inline-TM-only matrix passes the same
+test). A `createTransaction()` that appends FILE_A under spec 0,
+evolves the spec to 1, then appends `anotherFile` under spec 1
+correctly stages two `InlineSnapshot`s — but the file read back at
+spec 1 surfaces with `specId() == 0`.
+
+Root cause: `FileIOTableOperations#commitInline` `isCreate=true`
+serializes the full `TableMetadata` via `TableMetadataParser.toJson`.
+For each `InlineSnapshot` (whose `manifestListLocation()` is null),
+`SnapshotParser.toJson` falls into the v1-embedded-manifests branch and
+writes only the manifest paths as a string array — losing the
+per-manifest `partitionSpecId` that lived on the `ManifestFile`. On
+read, `SnapshotParser.fromJson` reconstructs each entry through
+`new GenericManifestFile(InputFile, /* specId= */ 0, snapshotId)`
+(`GenericManifestFile.java:78`) — `specId` is hardcoded to `0`.
+`ManifestFiles.read` then uses `manifest.partitionSpecId()` for the
+spec lookup, so files in the spec-1 manifest are decoded against
+spec 0.
+
+`commitInline` `isCreate=false` (the update path) does not have this
+problem because it uses delta encoding: the `inline://<snapId>`
+sentinel is written into the TM JSON, the catalog's manifest pool
+holds the actual `ManifestFile` entries, and `wrapInlineManifests`
+swaps `BaseSnapshot+sentinel` for `InlineSnapshot+pool` on read,
+preserving `partitionSpecId`.
+
+**Fix path:** route inline-ML create through the same
+sentinel + pool encoding as the update path. Concretely, in
+`commitInline` `isCreate=true`:
+
+1. Drain `stagedDeltas` from the InlineManifestTableOperations.
+2. Replace each `InlineSnapshot` in `metadata` with a `BaseSnapshot`
+   whose `manifestListLocation` is `inline://<snapId>`, using
+   `TableMetadata.Builder.replaceSnapshots` (the same hook
+   `wrapInlineManifests` uses on the read side).
+3. Serialize the rewritten metadata; the JSON now carries sentinel
+   manifest-list locations, not embedded paths.
+4. Atomically `createTableInline` the bytes AND populate the manifest
+   pool from the drained deltas. The Mut interface doesn't currently
+   expose pool-during-create — adding a `createTableInlineWithManifests`
+   method (or extending `CreateTableInlineAction` with manifest-pool
+   fields, mirroring `UpdateTableInlineAction`'s delta path) closes
+   the gap.
+
+Until this lands, inline-ML create-transactions are limited to
+single-spec tables. The doc references this as the M1 outlier in
+`INLINE_STABILIZATION.md`.
+
 ### D4. `RewriteTablePathUtil` does not handle inline-ML tables
 
 `core/.../RewriteTablePathUtil.java:252,280` calls `ManifestLists.write()`
@@ -172,15 +223,13 @@ who hit it mid-migration can recognize it.
 
 ## Test Coverage Gaps
 
-### T2. ADLS inline matrix is partial
+### T2. ADLS inline matrix complete (2026-05-07)
 
-S3 and GCS run the full `inline=true` matrix
-(`*InlineTM` and `*InlineML` × `*Catalog` and `*FileIOCatalogTransaction`).
-ADLS has CAS-mode and append-mode inline-TM subclasses
-(`ADLSCatalogTest{,CAS}InlineTM`,
-`ADLSFileIOCatalogTransactionTests{,CAS}InlineTM`), but no `*InlineML`
-variants. Adding them is mechanical — one-line subclasses — once the
-inline-ML cells go green on S3/GCS (see `INLINE_STABILIZATION.md` M1).
+ADLS now runs the full `inline=true` matrix matching S3/GCS:
+`ADLSCatalogTest{,CAS}Inline{TM,ML}` and
+`ADLSFileIOCatalogTransactionTests{,CAS}Inline{TM,ML}`. All cells
+green except for the deferred D9 outlier
+(`testCompleteCreateTransactionMultipleSchemas`).
 
 ### T3. Cloud integration tests require manual emulator setup
 

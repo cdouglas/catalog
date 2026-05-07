@@ -15,126 +15,107 @@ deferred functionality live in [docs/errata.md](docs/errata.md).
 
 ## Open
 
-### M1. Inline-ML matrix triage (GCS run 2026-05-07)
+### M2. Statistics-file changes force full mode (perf, not correctness)
 
-GCS inline-ML run: `GCSCatalogTestInlineML` 102 tests / 5 failures /
-0 errors / 11 skipped; `GCSFileIOCatalogTransactionTestsInlineML`
-28 tests / 2 failures / 6 errors. Total **13 failures across 3
-distinct modes** plus one outlier. Inline-TM shielded us from these
-because either `wrapInlineManifests` was a no-op (no pool) or the
-ML-specific code paths weren't exercised.
+`InlineDeltaCodec.computeDelta` returns `null` whenever a stats file
+changed (line 774–776). Any commit that runs `setStatistics` in addition
+to a real change pays full-mode bytes, defeating the delta-mode benefit
+on tables that maintain stats. Adding `AddStatistics` /
+`RemoveStatistics` delta types is straightforward; the JSON parsers are
+already in upstream Iceberg.
 
-Reproduce:
-```
-mvn test -Dtest='GCSCatalogTestInlineML,GCSFileIOCatalogTransactionTestsInlineML'
-```
+## Closed
 
-#### Mode A — Replace transaction adds an extra `metadata-log` entry (4 tests)
+### M1. Inline-ML matrix triage (GCS run 2026-05-07) — RESOLVED 2026-05-07
 
-- `testReplaceTransaction`
-- `testCompleteReplaceTransaction`
-- `testCreateOrReplaceReplaceTransactionReplace`
-- `testCompleteCreateOrReplaceTransactionReplace`
+GCS inline-ML run was 13 failures across 3 modes plus one outlier;
+matrix is now green except for the deferred outlier (errata D9).
 
-Assertion: `previousFiles().size() == 1`, observed 2. The two entries
-have *different* synthetic-location forms:
+#### Mode A — Replace transaction adds an extra `metadata-log` entry — fixed
 
-```
-[MetadataLogEntry{file=inline://#9d55ea46},
- MetadataLogEntry{file=inline://newdb.newtable#2}]
-```
+Symptom (4 tests): `previousFiles().size() == 1`, observed 2.
+`InlineDeltaCodec.applyDelta` and `wrapInlineManifests` each rebuilt
+the `TableMetadata` and each contributed one entry to `previousFiles`.
 
-Two layers each generate a synthetic location: `InlineDeltaCodec.applyDelta`
-emits `inline://#<hash-of-base-bytes>` as the parsed-base
-`metadataFileLocation` (used by `Builder.buildFrom` to populate
-`previousFiles`); `FileIOCatalog.loadFromCatalogFile` separately uses
-`inline://<id>#<version>` as the BaseMetastoreTableOperations cache
-key. Both forms end up in the rebuilt TM's `previousFiles()` —
-metadata-log accumulates one entry per layer instead of one per
-logical predecessor.
+Fix: in `wrapInlineManifests`, call
+`builder.withMetadataLocation(parsed.metadataFileLocation())` before
+`build()`. The fork's `withMetadataLocation` carries
+`lastUpdatedMillis` from base and nulls `previousFileLocation` —
+exactly the right semantics for an in-memory `BaseSnapshot` →
+`InlineSnapshot` swap (no logical change, no new metadata-log entry).
+Side effect: also fixes Mode C below by preserving
+`metadataFileLocation` across the rebuild.
 
-Inline-TM has the same architecture but doesn't trip the assertion
-because `wrapInlineManifests` is a no-op there (no pool); only
-inline-ML reconstructs the TM through `Builder.buildFrom` →
-`replaceSnapshots` → `build`, which is where the second metadata-log
-entry leaks in. **Fix path:** unify the two synthetic-location
-generators on `inline://<id>#<version>`. Pass `(tableId, baseVersion)`
-through to `applyDelta` / `applyDeltaWithManifests` (or precompute the
-location at the FileIOCatalog layer and thread it down). Eliminates
-the double-entry by construction.
+#### Mode B — Sentinel-without-pool corruption — fixed
 
-#### Mode B — Sentinel-without-pool corruption (6 transaction tests)
+Symptom (6 tests, multi-table / cross-branch transaction paths):
+`Inline snapshot <id> has sentinel manifest-list location
+'inline://<id>' but no pool entry — catalog state corrupt`.
 
-- `catalogTxWithSingleOp`, `concurrentTx`, `concurrentTxOnBranch`
-- `txAgainstDifferentBranchesWithSerializable`
-- `txAgainstMultipleTables` (×2 isolation levels)
+Two distinct bugs surfaced through diagnostic instrumentation:
 
-All hit the corruption check in `FileIOCatalog.wrapInlineManifests`:
+1. **Validation-pass clobber** (`txnSinkOps`).
+   `BaseCatalogTransaction.validateSerializableIsolation` calls
+   `origin.loadTable()` for every read table during its own
+   `commitTransaction()`. Each call constructed a fresh
+   `InlineManifestTableOperations` with empty `stagedDeltas` and
+   overwrote the user-staged ops in `txnSinkOps`. By the time
+   `FileIOCatalog#commitTransaction` drained the registered ops, the
+   real staged deltas were gone, no `AddManifestUpdate` made it into
+   the delta, and the AddSnapshot replay wrote the
+   `inline://<snapId>` sentinel without a corresponding pool entry.
 
-```
-IllegalStateException: Inline snapshot <id> has sentinel manifest-list
-location 'inline://<id>' but no pool entry — catalog state corrupt
-```
+   Fix: peek-not-clobber in `FileIOCatalog#loadTable`. Skip the
+   overwrite when the existing `txnSinkOps` entry has unflushed
+   staged deltas (new `hasStagedDeltas()` peek method on
+   `InlineManifestTableOperations`).
 
-This is real catalog state corruption: `AddSnapshotUpdate` fired
-(sentinel written) but no matching `AddManifestUpdate` reached the
-pool. The trigger appears specific to the multi-table / cross-branch
-transaction paths — single-table, single-branch inline-ML commits
-work (the `*Catalog* ` suite has no Mode B failures). Likely
-correlated with **errata D7** (ML deltas on *existing* snapshots
-silently dropped by `commitInline`'s "new snapshots only" loop), but
-the transaction layer may also be staging deltas that don't reach
-`commitInline` at all when a transaction spans multiple tables or
-branches. Needs targeted reproduction: add a unit test that mirrors
-`txAgainstMultipleTables` against `TestInlineManifestEndToEnd`'s
-fixtures, instrument `commitInline`'s `mlDeltas.entrySet()` vs
-`metadata.snapshots()`, see what's missing.
+2. **Empty inline-ML snapshot** (delete-only on empty table).
+   `InlineDeltaCodec.applyDeltaWithManifests`'s `AddSnapshotUpdate`
+   branch wrote the `inline://<snap>` sentinel but only registered
+   pool entries through the `AddManifestUpdate` path. A delete-only
+   snapshot on an empty table has zero added manifests, so
+   `attachManifestDelta` emitted no `AddManifestUpdate`s, and the
+   pool ended up without an entry for the snapshot. `wrapInlineManifests`
+   then flagged the sentinel as catalog-state corruption.
 
-#### Mode C — NPE on `metadataFileLocation` (2 transaction tests)
+   Fix: in `applyDeltaWithManifests`, when an inline-ML
+   `AddSnapshotUpdate` (empty `manifestListSuffix`) is applied,
+   pre-register an empty `setSnapshotManifests(tblId, snapId, [])`
+   so `hasInlineManifests` returns true even for snapshots with no
+   manifests. The carry-forward inheritance in subsequent
+   `AddManifestUpdate` calls is unaffected (it checks
+   `refs.isEmpty()`).
 
-- `readTableAfterLoadTableInsideTx`
-- `txAgainstMultipleTablesLastOneFails`
+#### Mode C — NPE on `metadataFileLocation` — fixed
 
-Stack:
-```
-java.lang.NullPointerException: Cannot invoke "String.equals(Object)"
-  because the return value of "TableMetadata.metadataFileLocation()" is null
-  at BaseCatalogTransaction.validateSerializableIsolation(BaseCatalogTransaction.java:171)
-```
+Symptom (2 tests): `BaseCatalogTransaction.validateSerializableIsolation`
+NPE'd on `currentTableMetadata.metadataFileLocation().equals(...)` because
+the rebuilt TM in `wrapInlineManifests` had `metadataLocation == null`
+(`Builder.buildFrom` carries it as `previousFileLocation`, not
+`metadataLocation`).
 
-Root cause: `wrapInlineManifests` rebuilds the parsed `TableMetadata`
-through `Builder.buildFrom(parsed) → replaceSnapshots → discardChanges →
-build`. `Builder.buildFrom` carries `previousFileLocation` from base but
-leaves the new TM's `metadataLocation` null (it's the *new* version's
-location, normally set by the caller). Caller doesn't set it for
-inline tables, so the rebuilt TM has `metadataFileLocation() == null`.
-Then `BaseCatalogTransaction.validateSerializableIsolation` calls
-`.equals(...)` on the null and NPEs. The test expected a
-`ValidationException` (which uses the same string-compare path).
-Inline-ML-specific because the `Builder.buildFrom → build` only runs
-in `wrapInlineManifests`, which is a no-op without a manifest pool.
+Fix: same `withMetadataLocation` call as Mode A — preserves the
+metadata file location across the in-memory rebuild.
 
-**Fix path:** preserve `metadataFileLocation` across the rebuild.
-Cleanest is `builder.withMetadataLocation(parsed.metadataFileLocation())`
-— the side effects (`lastUpdatedMillis = base.lastUpdatedMillis()`,
-`previousFileLocation = null`) are correct for our case (no logical
-change, just an in-memory swap of `BaseSnapshot` for `InlineSnapshot`).
-Verify it doesn't conflict with the fork's `replaceSnapshots`/
-`snapshotsReplaced` flag.
+#### Outlier — `testCompleteCreateTransactionMultipleSchemas` — deferred
 
-#### Outlier — `testCompleteCreateTransactionMultipleSchemas`
+Symptom: `[Spec ID should match] expected: 1 but was: 0`. An inline-ML
+create-transaction that evolves the spec mid-flight loses per-manifest
+`partitionSpecId` on read.
 
-Failure: `[Spec ID should match] expected: 1 but was: 0`. Different
-shape from Modes A–C; involves multi-schema/spec replay. Not yet
-diagnosed. Defer until A/B/C are landed; may be downstream of one of
-them.
+Root cause and fix path documented in [docs/errata.md](docs/errata.md)
+D9. The inline-ML create path uses `TableMetadataParser.toJson`, which
+serializes `InlineSnapshot`s through the v1-embedded-manifests branch
+of `SnapshotParser.toJson` (no `manifestListLocation`). On read,
+`GenericManifestFile`'s `InputFile` constructor hardcodes `specId=0`,
+so files in non-zero spec manifests decode against the wrong spec.
 
-#### Sequencing
-
-A and C are localized fixes (~10-30 lines each). B is the structural
-one — likely needs a reproducer and may surface design questions in
-how the transaction layer stages ML deltas for cross-table commits.
-Land A and C first; they may also collapse the outlier.
+Fix requires routing inline-ML create through the sentinel + pool
+encoding (as the update path does), which means an extension to the
+catalog Mut/codec to populate the manifest pool atomically with
+`createTableInline`. Until then, inline-ML create-transactions are
+limited to single-spec tables.
 
 #### After GCS goes green
 
@@ -145,13 +126,3 @@ Land A and C first; they may also collapse the outlier.
    subclasses once the underlying CAS · TM+ML cells are green.
 3. Add the `append · TM+ML` cell on S3 (one-line subclass on
    `TestS3CatalogInlineTM`).
-
-### M2. Statistics-file changes force full mode (perf, not correctness)
-
-`InlineDeltaCodec.computeDelta` returns `null` whenever a stats file
-changed (line 774–776). Any commit that runs `setStatistics` in addition
-to a real change pays full-mode bytes, defeating the delta-mode benefit
-on tables that maintain stats. Adding `AddStatistics` /
-`RemoveStatistics` delta types is straightforward; the JSON parsers are
-already in upstream Iceberg. Defer until inline-ML matrix is green.
-

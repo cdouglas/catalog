@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-05-06 (post-RenameTable action — errata D5)
+last-verified: 2026-05-07 (M1 closeout — inline-ML matrix green except errata D9)
 ---
 
 # Cloud-store compatibility matrix
@@ -30,6 +30,7 @@ Cell legend:
 | Code  | Meaning                                                      |
 |-------|--------------------------------------------------------------|
 | `OK`  | green — full `CatalogTests` + `CatalogTransactionTests` pass |
+| `OK*` | green except for the deferred D9 outlier (multi-spec inline-ML create-transaction); see `errata.md` |
 | `WIP` | partial — known failures tracked in `INLINE_STABILIZATION.md`|
 | `BAD` | broken                                                       |
 | `--`  | no suite for this cell yet                                   |
@@ -39,9 +40,9 @@ Cell legend:
 
 | Store | CAS · file | CAS · TM | CAS · TM+ML | append · file | append · TM | append · TM+ML |
 |-------|------------|----------|-------------|---------------|-------------|----------------|
-| GCS   | OK         | OK       | WIP         | NA            | NA          | NA             |
-| S3    | OK         | OK       | WIP         | OK            | OK          | --             |
-| ADLS  | OK         | OK       | --          | OK            | OK          | --             |
+| GCS   | OK         | OK       | OK*         | NA            | NA          | NA             |
+| S3    | OK         | OK       | OK*         | OK            | OK          | OK*            |
+| ADLS  | OK         | OK       | OK*         | OK            | OK          | OK*            |
 
 ## Notes
 
@@ -58,10 +59,12 @@ Cell legend:
   `GCSFileIOCatalogTransactionTestsInlineTM`. Verified 2026-05-05 after
   the inline-replay determinism fixes (commits `804465b`, `45c88c5`,
   `b616131`, `baac33b`) and the v1 sequence-number gate (`ec220c2`).
-- **CAS · TM+ML (WIP)** — `GCSCatalogTestInlineML`,
-  `GCSFileIOCatalogTransactionTestsInlineML`. Not exercised in the
-  current matrix run; revisit after we extend verification to the ML
-  cells.
+- **CAS · TM+ML (OK\*)** — `GCSCatalogTestInlineML`,
+  `GCSFileIOCatalogTransactionTestsInlineML`. 130/1/0 (1 deferred D9
+  outlier) + 28/0/0 verified 2026-05-07 after the M1 fixes
+  (`wrapInlineManifests` `withMetadataLocation` bridge,
+  peek-not-clobber `txnSinkOps` registration, empty inline-ML pool
+  pre-register).
 
 ### S3
 
@@ -74,16 +77,17 @@ Cell legend:
 - **CAS · TM (OK)** — `TestS3CatalogCASInlineTM`,
   `TestS3FileIOCatalogTransactionCASInlineTM`. 102/102 + 28/28 verified
   2026-05-05.
-- **CAS · TM+ML (WIP)** — `TestS3CatalogCASInlineML`,
-  `TestS3FileIOCatalogTransactionCASInlineML`. Not exercised in the
-  current matrix run.
+- **CAS · TM+ML (OK\*)** — `TestS3CatalogCASInlineML`,
+  `TestS3FileIOCatalogTransactionCASInlineML`. 130/1/0 (D9 outlier) +
+  28/0/0 verified 2026-05-07.
 - **append · TM (OK)** — `TestS3CatalogInlineTM`,
   `TestS3FileIOCatalogTransactionInlineTM` (added 2026-05-05).
   Uncovered the `addInlineTable` nextTableId-monotonicity bug
   (commit `85bd9ac`); now 102/102 + 28/28.
-- **append · TM+ML (--)** — no suite yet; trivial to add as a one-line
-  override on `TestS3CatalogInlineTM` once the CAS · TM+ML cell goes
-  green.
+- **append · TM+ML (OK\*)** — `TestS3CatalogInlineML`,
+  `TestS3FileIOCatalogTransactionInlineML` (added 2026-05-07,
+  one-line subclasses on the `*InlineTM` variants). 130/1/0 (D9
+  outlier) + 28/0/0.
 
 ### ADLS
 
@@ -99,9 +103,12 @@ Cell legend:
   `ADLSFileIOCatalogTransactionTestsCASInlineTM` (added 2026-05-05).
 - **append · TM (OK)** — `ADLSCatalogTestInlineTM`,
   `ADLSFileIOCatalogTransactionTestsInlineTM` (added 2026-05-05).
-- **TM+ML for both atomic modes (--)** — no suites yet. The TM cells'
-  health on both atomic modes makes adding them mechanical when we get
-  to inline-ML matrix verification.
+- **CAS · TM+ML (OK\*)** — `ADLSCatalogTestCASInlineML`,
+  `ADLSFileIOCatalogTransactionTestsCASInlineML` (added 2026-05-07).
+  103/1/0 (D9 outlier) + 28/0/0.
+- **append · TM+ML (OK\*)** — `ADLSCatalogTestInlineML`,
+  `ADLSFileIOCatalogTransactionTestsInlineML` (added 2026-05-07).
+  103/1/0 (D9 outlier) + 28/0/0.
 
 ## How to update this doc
 
@@ -112,7 +119,7 @@ cd /home/chris/work/catalog/iceberg && \
   ./gradlew :iceberg-core:publishToMavenLocal -x test -x integrationTest -x generateGitProperties
 
 cd /home/chris/work/catalog/fileio-catalog && \
-  mvn test -Dtest='TestS3Catalog,TestS3CatalogCAS,TestS3CatalogCASInlineTM,TestS3CatalogCASInlineML,TestS3FileIOCatalogTransaction,TestS3FileIOCatalogTransactionCAS,TestS3FileIOCatalogTransactionCASInlineTM,TestS3FileIOCatalogTransactionCASInlineML,GCSCatalogTest,GCSCatalogTestInlineTM,GCSCatalogTestInlineML,GCSFileIOCatalogTransactionTests,GCSFileIOCatalogTransactionTestsInlineTM,GCSFileIOCatalogTransactionTestsInlineML,ADLSCatalogTest,ADLSFileIOCatalogTransactionTests'
+  mvn test -Dtest='TestS3Catalog,TestS3CatalogCAS,TestS3CatalogInlineTM,TestS3CatalogCASInlineTM,TestS3CatalogInlineML,TestS3CatalogCASInlineML,TestS3FileIOCatalogTransaction,TestS3FileIOCatalogTransactionCAS,TestS3FileIOCatalogTransactionInlineTM,TestS3FileIOCatalogTransactionCASInlineTM,TestS3FileIOCatalogTransactionInlineML,TestS3FileIOCatalogTransactionCASInlineML,GCSCatalogTest,GCSCatalogTestInlineTM,GCSCatalogTestInlineML,GCSFileIOCatalogTransactionTests,GCSFileIOCatalogTransactionTestsInlineTM,GCSFileIOCatalogTransactionTestsInlineML,ADLSCatalogTest,ADLSCatalogTestCAS,ADLSCatalogTestInlineTM,ADLSCatalogTestCASInlineTM,ADLSCatalogTestInlineML,ADLSCatalogTestCASInlineML,ADLSFileIOCatalogTransactionTests,ADLSFileIOCatalogTransactionTestsCAS,ADLSFileIOCatalogTransactionTestsInlineTM,ADLSFileIOCatalogTransactionTestsCASInlineTM,ADLSFileIOCatalogTransactionTestsInlineML,ADLSFileIOCatalogTransactionTestsCASInlineML'
 ```
 
 Update the cell codes and bump `last-verified` in the frontmatter to
