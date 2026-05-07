@@ -530,7 +530,8 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         CatalogFile.Mut<?, ?> mut = format.from(lastCatalogFile);
         switch (mode) {
           case "delta":
-            byte[] deltaBytes = InlineDeltaCodec.encodeDelta(delta);
+            byte[] deltaBytes =
+                InlineDeltaCodec.encodeDelta(delta, metadata.lastUpdatedMillis());
             mut.updateTableInlineDelta(tableId, deltaBytes);
             break;
           case "full":
@@ -797,7 +798,9 @@ public class FileIOCatalog extends BaseMetastoreCatalog
           }
           switch (mode) {
             case "delta":
-              newCatalog.updateTableInlineDelta(tableId, InlineDeltaCodec.encodeDelta(delta));
+              newCatalog.updateTableInlineDelta(
+                  tableId,
+                  InlineDeltaCodec.encodeDelta(delta, newMetadata.lastUpdatedMillis()));
               break;
             case "full":
               String json = TableMetadataParser.toJson(newMetadata);

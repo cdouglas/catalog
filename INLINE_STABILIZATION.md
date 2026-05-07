@@ -17,17 +17,27 @@ summarized here so the rest of this doc reads as historical context.
 
 The four `testReplaceTransaction`-family `@Disabled` overrides (Group A
 in the original plan) were re-enabled in commit `d8e19e8`; Step A was
-sufficient to fix them. Two remain disabled in
-`TestS3CatalogCASInlineTM`:
+sufficient to fix them. **Updated 2026-05-06:** of the three remaining
+disabled cases, two are now re-enabled and one keeps a narrowed
+disable:
 
-* `testMetadataFileLocationsRemovalAfterCommit` — `ReachableFileUtil`
-  resolves `inline://` URIs as filesystem paths.
-* `testRegisterTable` / `testRegisterExistingTable` — the API
-  round-trips a metadata-location string back through
-  `catalog.registerTable`, which has no inline equivalent yet.
-
-Both need the `InlineCompatCatalogTests` fork that the user's original
-directive describes; tracked under errata T4.
+* `testMetadataFileLocationsRemovalAfterCommit` — re-enabled in both
+  `TestS3CatalogCASInlineTM` and `GCSCatalogTestInlineTM` with an
+  inline-equivalent body that asserts on `metadata.previousFiles().size()`
+  directly (one less than the upstream `Set<String>` assertion, which
+  also includes `metadataFileLocation()`). The upstream
+  `CatalogUtil.deleteRemovedMetadataFiles` was forwarding `inline://`
+  pseudo-URIs to `FileIO.deleteFiles` and surfacing
+  `BulkDeletionFailure`; `FileIOTableOperations.commit` now overrides
+  `BaseMetastoreTableOperations.commit` and routes the cleanup
+  through a local helper that filters those entries.
+* `testRegisterExistingTable` — re-enabled. The existence check in
+  `BaseMetastoreCatalog.registerTable` fires before any I/O on the
+  metadata-file URI, so the inline:// pseudo-URI never gets resolved
+  and the test passes as-is.
+* `testRegisterTable` — still `@Disabled`. The drop + register
+  round-trip needs a register-from-bytes API on `FileIOCatalog` (no
+  equivalent today). Disable message updated to point at errata T4.
 
 The full atomic-mode × inline-mode matrix status (which cells are green,
 WIP, or open) lives in [docs/COMPAT.md](docs/COMPAT.md). Replay-side
@@ -51,18 +61,23 @@ Pointing the upstream `CatalogTests` at `TestS3CatalogCASInlineTM` initially pro
 - **Determinism fix #1 — synthetic location.** `FileIOCatalog.loadFromCatalogFile` now uses `inline://<table>#<Arrays.hashCode(inlineMeta)>` instead of `System.nanoTime()`, so `BaseMetastoreTableOperations.refreshFromMetadataLocation` short-circuits when the catalog content is unchanged.
 - **Determinism fix #2 — `last-updated-ms` on delta replay.** `InlineDeltaCodec.applyUpdates` pins `lastUpdatedMillis` via `Builder.setLastUpdatedMillis(base.lastUpdatedMillis())` before `discardChanges().build()`. The companion setter was added in iceberg `ad714e683`.
 
-## Open design question (raised by user, deferred)
+## Open design question (resolved 2026-05-06 — encoded in intention record)
 
-The current fix relies on a new public setter (`Builder.setLastUpdatedMillis`) on the upstream `TableMetadata.Builder`. Reviewer challenge: the catalog format already speaks delta and the only requirement is that the timestamp be **consistent** across reads — not that we be able to mutate `Builder.lastUpdatedMillis` from outside the package.
+The original concern: the inline-TM determinism fix relied on a determinism *hack* — pinning `Builder.lastUpdatedMillis` to `base.lastUpdatedMillis()` so the rebuilt JSON was byte-stable across replays. The base's timestamp is the wrong source of truth (the delta is a logically-new commit, not the same one), and the only reason it "worked" was that consistency was the only requirement. Two alternatives were on the table:
 
-Two alternatives that don't touch iceberg core:
+1. **Encode the writer's `last-updated-ms` in the delta bytes**, post-process JSON on read.
+2. **Compute a deterministic synthetic value** from inputs.
 
-1. **Encode the writer's `last-updated-ms` in the delta bytes** (or as a per-table side-channel in the catalog protobuf). On read, `applyDelta`'s post-processing pins the field by string-replacing `"last-updated-ms":<auto>` in the JSON output before returning bytes. Costs: one regex pass over the JSON per replay.
-2. **Compute a deterministic `last-updated-ms` from inputs** — `max(base.lastUpdatedMillis, max(snapshot.timestampMillis()))` — and again post-process the JSON. The writer's actual wall-clock value is lost (we synthesize a coherent monotonic value instead), but no extra storage is needed.
+**Resolution: option (1).** The wire format gained field 2 (`last_updated_ms`, varint64) on `TableMetadataDelta`, **required** on every encoded delta. `FileIOCatalog.commitInline` and the transaction-side equivalent pass `metadata.lastUpdatedMillis()` to `InlineDeltaCodec.encodeDelta(List, long)`; `applyDelta` / `applyDeltaWithManifests` decode it via `decodeDelta` (which returns `DecodedDelta`) and use it during JSON post-processing.
 
-If we prefer no upstream change, option (2) is the cleaner first step — it keeps the storage format unchanged and adds a single deterministic post-processing step in `InlineDeltaCodec.applyDelta` / `applyDeltaWithManifests`. The current `Builder.setLastUpdatedMillis` and its caller can both be reverted.
+The writer's actual wall-clock value is the source of truth — every replay reproduces the writer's `last-updated-ms` exactly, including any new `snapshot-log` entries. No fallback / legacy path: a delta missing field 2 is malformed and `decodeDelta` raises. (This research prototype has never been deployed, so wire-level back-compat isn't a constraint.)
 
-**Recommendation:** keep the current setter for now; revisit when we land Step B below — at that point we'll be touching `applyDeltaWithManifests` anyway and can decide whether to switch to JSON post-processing across both replay paths.
+**Upstream setter dropped.** `InlineDeltaCodec.pinTimestamps(json, baseSnapshotLogSize, writerLastUpdatedMs)` substitutes the writer's value into the serialized JSON in two places:
+
+1. Top-level `"last-updated-ms":N` (single occurrence, matched with `replaceFirst`).
+2. Trailing `snapshot-log` entries beyond `baseSnapshotLogSize` — those are the entries `setRef` stamped during this builder pass; their `timestamp-ms` fields get rewritten to `writerLastUpdatedMs`.
+
+The single-timestamp substitution covers both spots because, within any one builder pass, every new `snapshot-log` entry's `timestamp-ms` equals the final `metadata.lastUpdatedMillis()` (`setRef` reads `builder.lastUpdatedMillis` at stamp time; the only writes between stamps are `addSnapshot` (snapshot's own timestamp) or the wall-clock fallback; the last write before `build()` wins for the top-level field, and any earlier `setRef` saw the same value or a precursor that got overwritten). Implementation: regex on the JSON string with bracket-tracking to scope the snapshot-log scan; no JSON re-parse. The `Builder.setLastUpdatedMillis` we had added to `iceberg/core` has been reverted — the catalog rides a stock Iceberg `TableMetadata.Builder` again.
 
 ## Remaining failures (`TestS3CatalogCASInlineTM`, 8 errors)
 

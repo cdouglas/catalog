@@ -61,6 +61,10 @@ public class InlineDeltaCodec {
 
   // TableMetadataDelta field numbers
   private static final int DELTA_UPDATES = 1;
+  // Writer's last-updated-ms, threaded through the wire so reconstruction is
+  // byte-stable across replays. Required (this prototype has no deployed
+  // history; a delta missing this field is malformed and decode raises).
+  private static final int DELTA_LAST_UPDATED_MS = 2;
 
   // TableMetadataUpdate oneof field numbers
   private static final int UPDATE_ADD_SNAPSHOT = 1;
@@ -176,9 +180,11 @@ public class InlineDeltaCodec {
         "inline://#" + Integer.toHexString(Arrays.hashCode(baseMetadataJson));
     TableMetadata base = TableMetadataParser.fromJson(
         syntheticLoc, new String(baseMetadataJson, StandardCharsets.UTF_8));
-    List<DeltaUpdate> updates = decodeDelta(deltaBytes);
-    TableMetadata result = applyUpdates(base, updates);
-    return TableMetadataParser.toJson(result).getBytes(StandardCharsets.UTF_8);
+    DecodedDelta decoded = decodeDelta(deltaBytes);
+    TableMetadata result = applyUpdates(base, decoded.updates);
+    String json = TableMetadataParser.toJson(result);
+    return pinTimestamps(json, base.snapshotLog().size(), decoded.lastUpdatedMillis)
+        .getBytes(StandardCharsets.UTF_8);
   }
 
   /**
@@ -209,7 +215,15 @@ public class InlineDeltaCodec {
         "inline://#" + Integer.toHexString(Arrays.hashCode(baseMetadataJson));
     TableMetadata base = TableMetadataParser.fromJson(
         syntheticLoc, new String(baseMetadataJson, StandardCharsets.UTF_8));
-    List<DeltaUpdate> updates = decodeDelta(deltaBytes);
+    DecodedDelta decoded = decodeDelta(deltaBytes);
+    List<DeltaUpdate> updates = decoded.updates;
+    // Determinism source: writer's last-updated-ms threaded via the intention
+    // record. We let the builder do its normal thing (setRef may stamp wall-
+    // clock into snapshot-log entries; build() may default lastUpdatedMillis
+    // to wall-clock); after serialization we substitute the writer's value
+    // into the JSON for both the top-level field and any new snapshot-log
+    // entries. See pinTimestamps() for the rationale.
+    int baseSnapshotLogSize = base.snapshotLog().size();
     String prefix = catalogBuilder.manifestListPrefix(tableId);
     if (prefix == null) {
       prefix = "";
@@ -295,55 +309,213 @@ public class InlineDeltaCodec {
         // Also remove from TableMetadata (Builder.removeSnapshots handles the
         // dangling-refs cleanup for the TM side).
         TableMetadata.Builder tmBuilder = TableMetadata.buildFrom(current);
-        // Pin lastUpdatedMillis BEFORE applyTo. Builder.lastUpdatedMillis starts
-        // null; the setRef path inside several updates (e.g. SetSnapshotRefUpdate
-        // for the main branch) consults the field synchronously to stamp a new
-        // SnapshotLogEntry, and a null reads as System.currentTimeMillis(). That
-        // produces a non-deterministic snapshot-log timestamp during replay
-        // (testReplaceTableKeepsSnapshotLog) and also flips the bytes hash that
-        // backs the synthetic metadataFileLocation, tripping
-        // BaseTransaction's reference-equality refresh check.
-        tmBuilder.setLastUpdatedMillis(current.lastUpdatedMillis());
         update.applyTo(tmBuilder);
         current = tmBuilder.discardChanges().build();
       } else {
         // Schema, properties, sort order, refs, etc. — apply to TableMetadata.Builder.
-        // Pin lastUpdatedMillis BEFORE applyTo (see RemoveSnapshotsUpdate above).
         TableMetadata.Builder tmBuilder = TableMetadata.buildFrom(current);
-        tmBuilder.setLastUpdatedMillis(current.lastUpdatedMillis());
         update.applyTo(tmBuilder);
         current = tmBuilder.discardChanges().build();
       }
     }
-    return TableMetadataParser.toJson(current).getBytes(StandardCharsets.UTF_8);
+    String json = TableMetadataParser.toJson(current);
+    return pinTimestamps(json, baseSnapshotLogSize, decoded.lastUpdatedMillis)
+        .getBytes(StandardCharsets.UTF_8);
   }
 
   /**
-   * Applies a list of decoded updates to a base metadata. Reconstruction must be byte-stable:
-   * a logically-identical replay (e.g. the same delta on the same base across catalog reads)
-   * must produce identical TableMetadata bytes, otherwise BaseMetastoreTableOperations'
-   * metadata-location cache check sees every refresh as a new version and returns a fresh
+   * Applies a list of decoded updates to a base metadata. Reconstruction must
+   * be byte-stable: a logically-identical replay (e.g. the same delta on the
+   * same base across catalog reads) must produce identical TableMetadata
+   * bytes, otherwise BaseMetastoreTableOperations' metadata-location cache
+   * check sees every refresh as a new version and returns a fresh
    * TableMetadata instance, which surfaces inside BaseTransaction as
-   * "Table metadata refresh is required" because the staged PendingUpdates' captured base no
-   * longer reference-equals the rebuilt current. {@link TableMetadata.Builder#build()} defaults
-   * {@code lastUpdatedMillis} to {@code System.currentTimeMillis()} when null, so we pin it
-   * here: the table-level timestamp on a delta replay isn't meaningful (the delta is the new
-   * snapshot's wall clock), and carrying the base's timestamp keeps reconstruction
-   * deterministic.
+   * "Table metadata refresh is required" because the staged PendingUpdates'
+   * captured base no longer reference-equals the rebuilt current.
+   *
+   * <p>This method does not pin {@code last-updated-ms}; the pinning happens
+   * during JSON serialization via {@link #pinTimestamps}, which substitutes
+   * the writer's value (encoded in the delta intention record) for both the
+   * top-level field and any new snapshot-log entries. Callers that need byte-
+   * stable bytes must use the {@link #applyDelta} / {@link #applyDeltaWithManifests}
+   * entry points, which combine the apply step with the pin step.
    */
   public static TableMetadata applyUpdates(TableMetadata base, List<DeltaUpdate> updates) {
     TableMetadata.Builder builder = TableMetadata.buildFrom(base);
     for (DeltaUpdate update : updates) {
       update.applyTo(builder);
     }
-    builder.setLastUpdatedMillis(base.lastUpdatedMillis());
     return builder.discardChanges().build();
   }
 
-  /** Encodes a list of delta updates to wire bytes. */
-  public static byte[] encodeDelta(List<DeltaUpdate> updates) {
+  /**
+   * Substitutes the writer's {@code last-updated-ms} (threaded through the
+   * delta's intention record) into the JSON serialization of a replay
+   * result. Two rewrites:
+   *
+   * <ul>
+   *   <li><b>Top-level {@code "last-updated-ms"}</b> — replace whatever
+   *       {@code TableMetadata.Builder.build()} stamped (likely
+   *       {@code System.currentTimeMillis()} when no {@code addSnapshot}
+   *       reset it) with the writer's value.
+   *   <li><b>Trailing snapshot-log entries</b> — any entry beyond
+   *       {@code baseSnapshotLogSize} was added during this builder pass.
+   *       {@code setRef} on {@code MAIN_BRANCH} stamps each new entry's
+   *       {@code timestamp-ms} from {@code builder.lastUpdatedMillis} at the
+   *       moment the ref is set. We rewrite all such entries to the writer's
+   *       value (see invariant below).
+   * </ul>
+   *
+   * <p><b>Why one timestamp covers both:</b> within a single builder pass,
+   * every new {@code snapshot-log} entry's {@code timestamp-ms} equals the
+   * final {@code metadata.lastUpdatedMillis()}. {@code setRef} reads
+   * {@code builder.lastUpdatedMillis} at stamp time; the only writes between
+   * stamps are {@code addSnapshot} (which sets it to the snapshot's own
+   * timestamp) or the wall-clock fallback. The last write before
+   * {@code build()} wins for the top-level field, and any earlier setRef saw
+   * either that same value or a precursor that got overwritten. The writer
+   * captures the post-build value as {@code metadata.lastUpdatedMillis()}
+   * and encodes it in the delta; replaying with a JSON substitution at that
+   * single value reproduces the writer's bytes exactly.
+   *
+   * <p>Implementation: numeric value rewriting via regex on a JSON string.
+   * Bounded scope: top-level {@code "last-updated-ms":N} appears once;
+   * {@code snapshot-log} entries appear inside a single named array and we
+   * rewrite the trailing N. Avoids JSON re-parsing.
+   */
+  static String pinTimestamps(String json, int baseSnapshotLogSize, long writerLastUpdatedMs) {
+    // 1. Top-level last-updated-ms.
+    String pinned = json.replaceFirst(
+        "\"last-updated-ms\"\\s*:\\s*-?\\d+",
+        "\"last-updated-ms\":" + writerLastUpdatedMs);
+
+    // 2. Trailing snapshot-log entries.
+    // Find the snapshot-log array by name; rewrite the timestamp-ms in any
+    // entry at index >= baseSnapshotLogSize. We avoid full JSON parsing by
+    // scanning for the array bounds and matching object literals inside.
+    int arrIdx = pinned.indexOf("\"snapshot-log\"");
+    if (arrIdx < 0) {
+      return pinned;
+    }
+    int openBracket = pinned.indexOf('[', arrIdx);
+    if (openBracket < 0) {
+      return pinned;
+    }
+    int closeBracket = matchingClose(pinned, openBracket, '[', ']');
+    if (closeBracket < 0) {
+      return pinned;
+    }
+    String arrayBody = pinned.substring(openBracket + 1, closeBracket);
+    java.util.List<int[]> entrySpans = new java.util.ArrayList<>();
+    int i = 0;
+    while (i < arrayBody.length()) {
+      // Skip whitespace, commas
+      while (i < arrayBody.length()
+          && (Character.isWhitespace(arrayBody.charAt(i)) || arrayBody.charAt(i) == ',')) {
+        i++;
+      }
+      if (i >= arrayBody.length()) {
+        break;
+      }
+      if (arrayBody.charAt(i) == '{') {
+        int end = matchingClose(arrayBody, i, '{', '}');
+        if (end < 0) {
+          break;
+        }
+        entrySpans.add(new int[] {i, end});
+        i = end + 1;
+      } else {
+        i++;
+      }
+    }
+    if (entrySpans.size() <= baseSnapshotLogSize) {
+      return pinned;
+    }
+    StringBuilder rebuiltArray = new StringBuilder();
+    int cursor = 0;
+    for (int idx = 0; idx < entrySpans.size(); idx++) {
+      int[] span = entrySpans.get(idx);
+      // Append everything between previous cursor and this entry's start verbatim
+      // (commas, whitespace).
+      rebuiltArray.append(arrayBody, cursor, span[0]);
+      String entry = arrayBody.substring(span[0], span[1] + 1);
+      if (idx >= baseSnapshotLogSize) {
+        entry = entry.replaceFirst(
+            "\"timestamp-ms\"\\s*:\\s*-?\\d+",
+            "\"timestamp-ms\":" + writerLastUpdatedMs);
+      }
+      rebuiltArray.append(entry);
+      cursor = span[1] + 1;
+    }
+    rebuiltArray.append(arrayBody, cursor, arrayBody.length());
+    return pinned.substring(0, openBracket + 1) + rebuiltArray + pinned.substring(closeBracket);
+  }
+
+  private static int matchingClose(String s, int openIdx, char open, char close) {
+    int depth = 0;
+    boolean inString = false;
+    boolean escape = false;
+    for (int i = openIdx; i < s.length(); i++) {
+      char c = s.charAt(i);
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (c == '\\') {
+        escape = true;
+        continue;
+      }
+      if (c == '"') {
+        inString = !inString;
+        continue;
+      }
+      if (inString) {
+        continue;
+      }
+      if (c == open) {
+        depth++;
+      } else if (c == close) {
+        depth--;
+        if (depth == 0) {
+          return i;
+        }
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * Decoded delta record. Carries the structured {@link DeltaUpdate} list plus
+   * the writer's {@code last-updated-ms} (encoded as wire field 2). On replay,
+   * the timestamp is used to pin {@code TableMetadata.Builder.lastUpdatedMillis}
+   * before applying updates so {@code setRef}-style stamping of new snapshot-log
+   * entries is byte-stable across reads.
+   */
+  public static final class DecodedDelta {
+    public final List<DeltaUpdate> updates;
+    public final long lastUpdatedMillis;
+
+    DecodedDelta(List<DeltaUpdate> updates, long lastUpdatedMillis) {
+      this.updates = updates;
+      this.lastUpdatedMillis = lastUpdatedMillis;
+    }
+  }
+
+  /**
+   * Encodes a list of delta updates plus the writer's {@code last-updated-ms}
+   * to wire bytes. The timestamp is written as wire field 2 (varint64) and is
+   * required: it threads the writer's actual value through the intention
+   * record so every replay reproduces it exactly (top-level
+   * {@code last-updated-ms} field plus any new {@code snapshot-log} entries
+   * stamped by {@code setRef}).
+   *
+   * <p>Production callers (e.g. {@code FileIOCatalog.commitInline}) pass the
+   * just-built {@code metadata.lastUpdatedMillis()}.
+   */
+  public static byte[] encodeDelta(List<DeltaUpdate> updates, long lastUpdatedMillis) {
     try {
       ByteArrayOutputStream out = new ByteArrayOutputStream();
+      writeVarint64(out, DELTA_LAST_UPDATED_MS, lastUpdatedMillis);
       for (DeltaUpdate update : updates) {
         byte[] updateBytes = encodeUpdate(update);
         writeLengthDelimited(out, DELTA_UPDATES, updateBytes);
@@ -354,21 +526,32 @@ public class InlineDeltaCodec {
     }
   }
 
-  /** Decodes delta bytes into a list of updates. */
-  public static List<DeltaUpdate> decodeDelta(byte[] bytes) {
+  /**
+   * Decodes delta bytes, returning the update list and the writer's
+   * {@code last-updated-ms}. Field 2 is required; absence raises.
+   */
+  public static DecodedDelta decodeDelta(byte[] bytes) {
     try {
       ByteArrayInputStream in = new ByteArrayInputStream(bytes);
       List<DeltaUpdate> updates = new ArrayList<>();
+      Long lastUpdatedMillis = null;
       while (in.available() > 0) {
         int tag = readVarint(in);
         int fieldNumber = tag >>> 3;
+        int wireType = tag & 0x7;
         if (fieldNumber == DELTA_UPDATES) {
           updates.add(decodeUpdate(readLengthDelimitedBytes(in)));
+        } else if (fieldNumber == DELTA_LAST_UPDATED_MS) {
+          lastUpdatedMillis = readVarint64(in);
         } else {
-          skipField(in, tag & 0x7);
+          skipField(in, wireType);
         }
       }
-      return updates;
+      if (lastUpdatedMillis == null) {
+        throw new IllegalStateException(
+            "Malformed TableMetadataDelta: required field 2 (last_updated_ms) missing");
+      }
+      return new DecodedDelta(updates, lastUpdatedMillis);
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
@@ -661,7 +844,7 @@ public class InlineDeltaCodec {
   public static String selectMode(
       List<DeltaUpdate> delta, TableMetadata newMeta, int currentTxnSize) {
     if (delta != null) {
-      byte[] deltaBytes = encodeDelta(delta);
+      byte[] deltaBytes = encodeDelta(delta, newMeta.lastUpdatedMillis());
       if (currentTxnSize + deltaBytes.length <= APPEND_LIMIT) {
         return "delta";
       }

@@ -39,6 +39,15 @@ import org.junit.jupiter.api.Test;
  */
 public class TestInlineDelta {
 
+  /**
+   * Stable test timestamp passed into {@link InlineDeltaCodec#encodeDelta(List, long)}.
+   * The wire format requires {@code last_updated_ms} (field 2); these tests don't care
+   * about its exact value, only that it round-trips. Picked far enough in the future
+   * (~year 2096) that it's always {@code >= base.lastUpdatedMillis()} — TableMetadata.Builder
+   * rejects updates with an earlier timestamp than the latest metadata-log entry.
+   */
+  static final long TEST_TS = 4_000_000_000_000L;
+
   /** Creates a minimal valid TableMetadata for testing. */
   static TableMetadata baseMetadata() {
     Schema schema = new Schema(
@@ -71,8 +80,8 @@ public class TestInlineDelta {
           new InlineDeltaCodec.SetPropertiesUpdate(
               Map.of("write.format.default", "parquet"), Set.of()));
 
-      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(updates);
-      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(deltaBytes);
+      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(updates, TestInlineDelta.TEST_TS);
+      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(deltaBytes).updates;
       assertThat(decoded).hasSize(1);
       assertThat(decoded.get(0)).isInstanceOf(InlineDeltaCodec.SetPropertiesUpdate.class);
 
@@ -120,7 +129,7 @@ public class TestInlineDelta {
       List<InlineDeltaCodec.DeltaUpdate> updates = List.of(
           new InlineDeltaCodec.SetPropertiesUpdate(
               Map.of("engine", "spark"), Set.of()));
-      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(updates);
+      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(updates, TestInlineDelta.TEST_TS);
 
       // Build catalog with inline table, apply delta action
       byte[] file = TestProtoActions.catalog()
@@ -159,8 +168,8 @@ public class TestInlineDelta {
       List<InlineDeltaCodec.DeltaUpdate> updates = List.of(
           new InlineDeltaCodec.SetLocationUpdate("s3://new-bucket/table"));
 
-      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(updates);
-      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(deltaBytes);
+      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(updates, TestInlineDelta.TEST_TS);
+      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(deltaBytes).updates;
       assertThat(decoded).hasSize(1);
 
       TableMetadata result = InlineDeltaCodec.applyUpdates(baseMetadata(), decoded);
@@ -187,8 +196,8 @@ public class TestInlineDelta {
           new InlineDeltaCodec.AddSchemaUpdate(1, 3, schemaJson.getBytes(StandardCharsets.UTF_8)),
           new InlineDeltaCodec.SetCurrentSchemaUpdate(1));
 
-      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(updates);
-      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(deltaBytes);
+      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(updates, TestInlineDelta.TEST_TS);
+      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(deltaBytes).updates;
       assertThat(decoded).hasSize(2);
 
       TableMetadata result = InlineDeltaCodec.applyUpdates(baseMetadata(), decoded);
@@ -200,8 +209,8 @@ public class TestInlineDelta {
     void encodeDecodeRoundtrip() {
       InlineDeltaCodec.SetCurrentSchemaUpdate update =
           new InlineDeltaCodec.SetCurrentSchemaUpdate(42);
-      byte[] bytes = InlineDeltaCodec.encodeDelta(List.of(update));
-      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(bytes);
+      byte[] bytes = InlineDeltaCodec.encodeDelta(List.of(update), TestInlineDelta.TEST_TS);
+      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(bytes).updates;
       assertThat(decoded).hasSize(1);
       assertThat(decoded.get(0)).isInstanceOf(InlineDeltaCodec.SetCurrentSchemaUpdate.class);
       assertThat(((InlineDeltaCodec.SetCurrentSchemaUpdate) decoded.get(0)).schemaId).isEqualTo(42);
@@ -219,8 +228,8 @@ public class TestInlineDelta {
     void setDefaultSortOrderRoundtrip() {
       InlineDeltaCodec.SetDefaultSortOrderUpdate update =
           new InlineDeltaCodec.SetDefaultSortOrderUpdate(5);
-      byte[] bytes = InlineDeltaCodec.encodeDelta(List.of(update));
-      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(bytes);
+      byte[] bytes = InlineDeltaCodec.encodeDelta(List.of(update), TestInlineDelta.TEST_TS);
+      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(bytes).updates;
       assertThat(decoded).hasSize(1);
       assertThat(((InlineDeltaCodec.SetDefaultSortOrderUpdate) decoded.get(0)).orderId)
           .isEqualTo(5);
@@ -230,8 +239,8 @@ public class TestInlineDelta {
     void setDefaultSpecRoundtrip() {
       InlineDeltaCodec.SetDefaultSpecUpdate update =
           new InlineDeltaCodec.SetDefaultSpecUpdate(3);
-      byte[] bytes = InlineDeltaCodec.encodeDelta(List.of(update));
-      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(bytes);
+      byte[] bytes = InlineDeltaCodec.encodeDelta(List.of(update), TestInlineDelta.TEST_TS);
+      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(bytes).updates;
       assertThat(decoded).hasSize(1);
       assertThat(((InlineDeltaCodec.SetDefaultSpecUpdate) decoded.get(0)).specId).isEqualTo(3);
     }
@@ -250,8 +259,8 @@ public class TestInlineDelta {
           new InlineDeltaCodec.SetSnapshotRefUpdate(
               "main", 12345L, "branch", 10, 86400000L, 0);
 
-      byte[] bytes = InlineDeltaCodec.encodeDelta(List.of(update));
-      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(bytes);
+      byte[] bytes = InlineDeltaCodec.encodeDelta(List.of(update), TestInlineDelta.TEST_TS);
+      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(bytes).updates;
       assertThat(decoded).hasSize(1);
       InlineDeltaCodec.SetSnapshotRefUpdate d =
           (InlineDeltaCodec.SetSnapshotRefUpdate) decoded.get(0);
@@ -283,8 +292,8 @@ public class TestInlineDelta {
           new InlineDeltaCodec.AddSnapshotUpdate(
               99887766L, "123-uuid.avro", summary, 5000L, 0, 0);
 
-      byte[] bytes = InlineDeltaCodec.encodeDelta(List.of(update));
-      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(bytes);
+      byte[] bytes = InlineDeltaCodec.encodeDelta(List.of(update), TestInlineDelta.TEST_TS);
+      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(bytes).updates;
       assertThat(decoded).hasSize(1);
       InlineDeltaCodec.AddSnapshotUpdate d =
           (InlineDeltaCodec.AddSnapshotUpdate) decoded.get(0);
@@ -306,9 +315,9 @@ public class TestInlineDelta {
       InlineDeltaCodec.AddSnapshotUpdate update =
           new InlineDeltaCodec.AddSnapshotUpdate(1L, "snap.avro", summary, 0, 0, 0);
 
-      byte[] bytes = InlineDeltaCodec.encodeDelta(List.of(update));
+      byte[] bytes = InlineDeltaCodec.encodeDelta(List.of(update), TestInlineDelta.TEST_TS);
       InlineDeltaCodec.AddSnapshotUpdate d =
-          (InlineDeltaCodec.AddSnapshotUpdate) InlineDeltaCodec.decodeDelta(bytes).get(0);
+          (InlineDeltaCodec.AddSnapshotUpdate) InlineDeltaCodec.decodeDelta(bytes).updates.get(0);
       assertThat(d.summary).containsEntry("operation", "overwrite");
       assertThat(d.summary).containsEntry("custom-engine-field", "spark-3.5");
     }
@@ -330,8 +339,8 @@ public class TestInlineDelta {
           new InlineDeltaCodec.SetPropertiesUpdate(
               Map.of("k2", "v2"), Set.of()));
 
-      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(updates);
-      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(deltaBytes);
+      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(updates, TestInlineDelta.TEST_TS);
+      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(deltaBytes).updates;
       assertThat(decoded).hasSize(3);
 
       TableMetadata result = InlineDeltaCodec.applyUpdates(baseMetadata(), decoded);
@@ -347,7 +356,7 @@ public class TestInlineDelta {
 
       List<InlineDeltaCodec.DeltaUpdate> updates = List.of(
           new InlineDeltaCodec.SetPropertiesUpdate(Map.of("k", "v"), Set.of()));
-      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(updates);
+      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(updates, TestInlineDelta.TEST_TS);
 
       byte[] file = TestProtoActions.catalog()
           .ns(1, 0, "db", 1)
@@ -457,8 +466,8 @@ public class TestInlineDelta {
 
       List<InlineDeltaCodec.DeltaUpdate> delta =
           InlineDeltaCodec.computeDelta(oldMeta, newMeta, "");
-      byte[] encoded = InlineDeltaCodec.encodeDelta(delta);
-      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(encoded);
+      byte[] encoded = InlineDeltaCodec.encodeDelta(delta, TestInlineDelta.TEST_TS);
+      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(encoded).updates;
       TableMetadata applied = InlineDeltaCodec.applyUpdates(oldMeta, decoded);
 
       assertThat(applied.properties()).containsEntry("a", "1");
@@ -585,7 +594,7 @@ public class TestInlineDelta {
       InlineDeltaCodec.attachManifestDelta(
           delta, 500L, List.of(mf), List.of(), PATH_PREFIX);
 
-      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(delta);
+      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(delta, TestInlineDelta.TEST_TS);
 
       // Set up a catalog builder with an inline table
       byte[] baseMeta = TableMetadataParser.toJson(baseMetadata())
@@ -632,7 +641,7 @@ public class TestInlineDelta {
       delta.add(new InlineDeltaCodec.SetSnapshotRefUpdate(
           "main", 500L, "branch", 0, 0L, 0L));
 
-      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(delta);
+      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(delta, TestInlineDelta.TEST_TS);
 
       byte[] baseMeta = TableMetadataParser.toJson(baseMetadata())
           .getBytes(java.nio.charset.StandardCharsets.UTF_8);
@@ -672,8 +681,8 @@ public class TestInlineDelta {
               /* keyId */ "key-abc-123");
 
       List<InlineDeltaCodec.DeltaUpdate> delta = List.of(orig);
-      byte[] bytes = InlineDeltaCodec.encodeDelta(delta);
-      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(bytes);
+      byte[] bytes = InlineDeltaCodec.encodeDelta(delta, TestInlineDelta.TEST_TS);
+      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(bytes).updates;
 
       assertThat(decoded).hasSize(1);
       InlineDeltaCodec.AddSnapshotUpdate d =
@@ -692,9 +701,9 @@ public class TestInlineDelta {
               500L, "", Map.of("operation", "append"),
               1000L, 0, 100L);  // back-compat constructor
 
-      byte[] bytes = InlineDeltaCodec.encodeDelta(List.of(orig));
+      byte[] bytes = InlineDeltaCodec.encodeDelta(List.of(orig), TestInlineDelta.TEST_TS);
       InlineDeltaCodec.AddSnapshotUpdate d =
-          (InlineDeltaCodec.AddSnapshotUpdate) InlineDeltaCodec.decodeDelta(bytes).get(0);
+          (InlineDeltaCodec.AddSnapshotUpdate) InlineDeltaCodec.decodeDelta(bytes).updates.get(0);
 
       assertThat(d.parentSnapshotId).isNull();
       assertThat(d.firstRowId).isNull();
@@ -744,7 +753,7 @@ public class TestInlineDelta {
           500L, "", Map.of("operation", "append"),
           1000L, 0, 100L));
 
-      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(delta);
+      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(delta, TestInlineDelta.TEST_TS);
       byte[] baseMeta = TableMetadataParser.toJson(baseMetadata())
           .getBytes(java.nio.charset.StandardCharsets.UTF_8);
       InputFile loc = new InputFile() {
@@ -788,8 +797,8 @@ public class TestInlineDelta {
       List<InlineDeltaCodec.DeltaUpdate> updates = List.of(
           new InlineDeltaCodec.AddManifestUpdate(100L, mf, PATH_PREFIX));
 
-      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(updates);
-      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(deltaBytes);
+      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(updates, TestInlineDelta.TEST_TS);
+      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(deltaBytes).updates;
 
       assertThat(decoded).hasSize(1);
       assertThat(decoded.get(0)).isInstanceOf(InlineDeltaCodec.AddManifestUpdate.class);
@@ -806,8 +815,8 @@ public class TestInlineDelta {
       List<InlineDeltaCodec.DeltaUpdate> updates = List.of(
           new InlineDeltaCodec.RemoveManifestUpdate(200L, "bbb-m0.avro"));
 
-      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(updates);
-      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(deltaBytes);
+      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(updates, TestInlineDelta.TEST_TS);
+      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(deltaBytes).updates;
 
       assertThat(decoded).hasSize(1);
       assertThat(decoded.get(0)).isInstanceOf(InlineDeltaCodec.RemoveManifestUpdate.class);
@@ -836,8 +845,8 @@ public class TestInlineDelta {
       assertThat(delta.get(0)).isInstanceOf(InlineDeltaCodec.AddManifestUpdate.class);
 
       // Round-trip
-      byte[] encoded = InlineDeltaCodec.encodeDelta(delta);
-      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(encoded);
+      byte[] encoded = InlineDeltaCodec.encodeDelta(delta, TestInlineDelta.TEST_TS);
+      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(encoded).updates;
       assertThat(decoded).hasSize(1);
     }
 
@@ -920,12 +929,87 @@ public class TestInlineDelta {
       assertThat(delta).hasSize(3);
 
       // Round-trip all together
-      byte[] encoded = InlineDeltaCodec.encodeDelta(delta);
-      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(encoded);
+      byte[] encoded = InlineDeltaCodec.encodeDelta(delta, TestInlineDelta.TEST_TS);
+      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(encoded).updates;
       assertThat(decoded).hasSize(3);
       assertThat(decoded.get(0)).isInstanceOf(InlineDeltaCodec.AddSnapshotUpdate.class);
       assertThat(decoded.get(1)).isInstanceOf(InlineDeltaCodec.SetSnapshotRefUpdate.class);
       assertThat(decoded.get(2)).isInstanceOf(InlineDeltaCodec.AddManifestUpdate.class);
+    }
+  }
+
+  /**
+   * The whole point of threading {@code last_updated_ms} through the wire and
+   * post-processing the JSON is determinism: replaying the same delta against
+   * the same base must produce byte-identical output, otherwise
+   * {@code BaseMetastoreTableOperations}' metadata-location cache check sees
+   * every refresh as a new version and {@code BaseTransaction} hits "Table
+   * metadata refresh is required". These tests assert that property directly.
+   */
+  @Nested
+  class ReplayDeterminismTests {
+
+    @Test
+    void propertyOnlyDeltaIsByteStable() {
+      // No AddSnapshot, no setRef("main") — exercises the
+      // "build() defaults lastUpdatedMillis to wall-clock" path. Without the
+      // post-processing pin, two replays would differ in the top-level
+      // last-updated-ms field by tens of nanoseconds.
+      List<InlineDeltaCodec.DeltaUpdate> updates = List.of(
+          new InlineDeltaCodec.SetPropertiesUpdate(
+              Map.of("write.format.default", "parquet"), Set.of()));
+      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(updates, TestInlineDelta.TEST_TS);
+      byte[] baseBytes = metadataBytes(baseMetadata());
+
+      byte[] r1 = InlineDeltaCodec.applyDelta(baseBytes, deltaBytes);
+      byte[] r2 = InlineDeltaCodec.applyDelta(baseBytes, deltaBytes);
+      assertThat(r1).isEqualTo(r2);
+
+      TableMetadata reparsed = TableMetadataParser.fromJson(
+          new String(r1, StandardCharsets.UTF_8));
+      assertThat(reparsed.lastUpdatedMillis())
+          .as("top-level last-updated-ms must equal the writer's value")
+          .isEqualTo(TestInlineDelta.TEST_TS);
+    }
+
+    @Test
+    void pinTimestampsLeavesUnrelatedFieldsUntouched() {
+      // The post-processing must not touch timestamp-ms in metadata-log
+      // entries (a sibling array right after snapshot-log) or in snapshot
+      // summary objects elsewhere in the JSON.
+      String json =
+          "{\"format-version\":2,"
+              + "\"last-updated-ms\":111,"
+              + "\"snapshots\":[{\"snapshot-id\":1,\"timestamp-ms\":222}],"
+              + "\"snapshot-log\":[{\"timestamp-ms\":333,\"snapshot-id\":1}],"
+              + "\"metadata-log\":[{\"timestamp-ms\":444,\"metadata-file\":\"x\"}]}";
+      String pinned = InlineDeltaCodec.pinTimestamps(json, /*baseSnapshotLogSize*/ 0, 999L);
+      assertThat(pinned).contains("\"last-updated-ms\":999");
+      // snapshot-log entry rewritten
+      assertThat(pinned).contains("\"snapshot-log\":[{\"timestamp-ms\":999,\"snapshot-id\":1}]");
+      // snapshots[].timestamp-ms preserved
+      assertThat(pinned).contains("\"snapshots\":[{\"snapshot-id\":1,\"timestamp-ms\":222}]");
+      // metadata-log entry preserved
+      assertThat(pinned).contains("\"metadata-log\":[{\"timestamp-ms\":444,\"metadata-file\":\"x\"}]");
+    }
+
+    @Test
+    void pinTimestampsOnlyRewritesNewSnapshotLogEntries() {
+      // baseSnapshotLogSize=2 means the first two entries were carried over
+      // and must keep their timestamps; only the third was added in this
+      // builder pass.
+      String json =
+          "{\"last-updated-ms\":555,"
+              + "\"snapshot-log\":["
+              + "{\"timestamp-ms\":100,\"snapshot-id\":1},"
+              + "{\"timestamp-ms\":200,\"snapshot-id\":2},"
+              + "{\"timestamp-ms\":999999,\"snapshot-id\":3}"
+              + "]}";
+      String pinned = InlineDeltaCodec.pinTimestamps(json, 2, 777L);
+      assertThat(pinned).contains("\"last-updated-ms\":777");
+      assertThat(pinned).contains("{\"timestamp-ms\":100,\"snapshot-id\":1}");
+      assertThat(pinned).contains("{\"timestamp-ms\":200,\"snapshot-id\":2}");
+      assertThat(pinned).contains("{\"timestamp-ms\":777,\"snapshot-id\":3}");
     }
   }
 }
