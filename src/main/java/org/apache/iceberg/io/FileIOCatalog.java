@@ -19,7 +19,6 @@
 package org.apache.iceberg.io;
 
 import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -390,21 +389,24 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         refreshFromMetadataLocation(metadataFile);
       } else if (catalogFile.isInlineTable(tableId)) {
         // Inline table: load metadata from catalog bytes.
-        // The synthetic location must be deterministic in the inline content: a unique
-        // value per refresh (e.g. nanoTime) defeats the
-        // BaseMetastoreTableOperations.refreshFromMetadataLocation cache check, so a
-        // logically-identical re-read returns a *new* TableMetadata instance. Inside a
-        // BaseTransaction, that triggers applyUpdates' "underlying changed" branch on a
-        // refresh-with-no-actual-change, which then surfaces as
-        // "Table metadata refresh is required" because the staged PendingUpdates'
-        // captured base no longer reference-equals the rebuilt current. Hashing the
-        // inline bytes gives the same string for the same content.
-        // Companion fix lives in InlineDeltaCodec.applyUpdates, which pins
-        // last-updated-ms on delta replay so the bytes themselves are stable.
+        // The synthetic location is the cache key for
+        // BaseMetastoreTableOperations.refreshFromMetadataLocation: it must be
+        // identical across reads of the same logical state and distinct after
+        // any commit. The catalog already tracks both — TblEntry.version bumps
+        // on every commit and is the authoritative monotonic counter — so we
+        // derive the location from (tableId, version) directly. No content
+        // hashing, no collision worry.
         byte[] inlineMeta = catalogFile.inlineMetadata(tableId);
         String json = new String(inlineMeta, StandardCharsets.UTF_8);
-        String syntheticLoc =
-            "inline://" + tableId + "#" + Integer.toHexString(Arrays.hashCode(inlineMeta));
+        int version = -1;
+        if (catalogFile instanceof ProtoCatalogFile) {
+          ProtoCatalogFile proto = (ProtoCatalogFile) catalogFile;
+          Integer numId = proto.tableId(tableId);
+          if (numId != null) {
+            version = proto.tableVersion(numId);
+          }
+        }
+        String syntheticLoc = "inline://" + tableId + "#" + version;
         refreshFromMetadataLocation(syntheticLoc, null, 0,
             loc -> wrapInlineManifests(
                 TableMetadataParser.fromJson(loc, json), catalogFile));

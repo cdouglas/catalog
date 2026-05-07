@@ -28,6 +28,47 @@ revisit:** any plan to drop the iceberg fork or upstream the changes.
 
 ## Deferred Functionality
 
+### D6. Concurrent-replace id collision on an inline-ML table can lose the new ML data
+
+`commitInline` forces `mode = "delta"` whenever `(hasMLDeltas || hasMLPool)
+&& delta != null`. The `delta != null` guard is correct in isolation —
+`encodeDelta(null, ...)` would NPE — but it has a hole: if the new
+commit added inline-ML data (`hasMLDeltas == true`) AND
+`computeDelta` returned null because of an `idCollidesWithDifferentContent`
+check (concurrent-replace race assigning the same schema/spec/sort-order
+id to different content), `selectMode` falls back to "full" or "pointer".
+Both paths drop the staged ML deltas: full mode serializes
+`TableMetadata` only and never visits the per-snapshot manifest pool;
+pointer mode evicts and `removeInlineMetadata` clears the pool.
+
+The collision case is exactly when concurrent replace transactions need
+the new manifests preserved most. Triggered by the same
+`testConcurrentReplaceTransactionSortOrderConflict` shape that
+`computeDelta` already detects, but on an inline-ML table.
+
+**Fix path:** when forced into full/pointer mode with non-empty
+`hasMLDeltas`, either retry the commit after refresh (preferred — the
+collision will resolve naturally on the rebased delta) or persist the
+staged ML data via the catalog builder before serializing. The retry
+path leaves the writer responsible for re-running their staged manifest
+producer, which matches the error semantics of every other
+`CommitFailedException`.
+
+### D7. ML deltas on existing snapshots are silently dropped
+
+`commitInline` only attaches staged manifest deltas for snapshots
+present in `metadata.snapshots()` but absent from `oldSnapIds` — the
+new-snapshots set. Manifest rewrites against an *existing* snapshot
+(compaction, RewriteManifests, anything that mutates a snapshot's
+manifest list without producing a new snapshot id) drain from
+`mlDeltas` but never reach `attachManifestDelta`. The pool keeps the
+stale entries; the snapshot's ref list is never updated.
+
+**Fix path:** iterate `mlDeltas.entrySet()` directly (covers both new
+and existing snapshot ids) and route each entry through
+`attachManifestDelta` regardless of whether the snapshot id was added
+in this commit.
+
 ### D3. Pointer-mode eviction of an inline-ML table does not materialize Avro manifest lists
 
 If an inline TM falls back to pointer mode (size eviction), any snapshot
@@ -39,20 +80,6 @@ on demand, which is not implemented today.
 **Trigger to revisit:** if a real workload hits the path. Until then,
 inline ML implies the table stays inline.
 
-### D5. `renameTable` is layered as drop+create, not as an in-place update (resolved)
-
-`renameTable` is now a first-class action: `RenameTable(id, version,
-new_namespace_id, new_namespace_version, new_name)`, wire type 11. The
-action mutates `TblEntry` in place — the `int` table id stays put, so
-all id-keyed maps (`tblInlineMetadata`, `tblManifestPrefix`,
-`manifestPool`, `snapshotManifests`) follow by construction. Inline-TM
-and inline-ML rename are correct and atomic. Conflict semantics fall
-out of the existing version-bumping rules in the
-design.md operation × operation matrix (entry RT'). See
-[SPEC.md](SPEC.md), [SPEC_TM.md](SPEC_TM.md) §"Rename", and
-`TestProtoActions$RenameTableTests` /
-`TestProtoActions$ConflictTests` for coverage.
-
 ### D4. `RewriteTablePathUtil` does not handle inline-ML tables
 
 `core/.../RewriteTablePathUtil.java:252,280` calls `ManifestLists.write()`
@@ -63,76 +90,15 @@ who hit it mid-migration can recognize it.
 
 ## Test Coverage Gaps
 
-### T2. Cloud integration tests don't run in inline-ML mode (mostly resolved)
+### T2. ADLS inline matrix is partial
 
-S3 and GCS now run an `inline=true` matrix:
-`TestS3CatalogCASInlineTM` / `TestS3CatalogCASInlineML` and the GCS
-counterparts; the same shape exists for the transaction suites. Each is
-a one-line subclass that overrides `inlineTM()` / `inlineML()` and
-flips `maxAppendCount()` to 0. The full atomic-mode × inline-mode grid
-status lives in [COMPAT.md](COMPAT.md). The non-inlined and CAS-inline-
-TM cells are green on S3 and GCS; the inline-TM cells require the
-`InlineDeltaCodec` determinism + RemoveSchemas/RemovePartitionSpecs
-fixes from this session.
-
-**Still open for ADLS:** `ADLSCatalogTest` and
-`ADLSFileIOCatalogTransactionTests` now share the same hooks
-(`maxAppendCount`, `inlineTM`, `inlineML`) as their S3/GCS counterparts
-and have CAS-mode subclasses (`ADLSCatalogTestCAS`,
-`ADLSFileIOCatalogTransactionTestsCAS`) but no `*InlineTM` /
-`*InlineML` variants yet. Adding them is mechanical once the inline-CAS
-matrix on S3/GCS proves the underlying behavior, which it now does.
-
-### T4. Inline-CatalogTests reachability tests (mostly resolved)
-
-Three upstream `CatalogTests` cases were originally `@Disabled` on the
-inline-TM matrix because they assert through accessors that don't
-translate cleanly to inline metadata:
-
-* `testMetadataFileLocationsRemovalAfterCommit` calls
-  `ReachableFileUtil.metadataFileLocations(table, false)`, which adds
-  the URIs to a `Set<String>` and (with `recursive=false`) doesn't
-  actually resolve them as files. The non-test problem was upstream
-  `CatalogUtil.deleteRemovedMetadataFiles`, which forwards
-  `inline://` URIs to `FileIO.deleteFiles` after retention bounds
-  kick in — S3 / GCS / ADLS treat them as missing keys and surface a
-  `BulkDeletionFailure`.
-* `testRegisterTable` round-trips a metadata-location string through
-  `catalog.dropTable` then `catalog.registerTable`. After drop, the
-  inline metadata bytes are gone; without a register-from-bytes API,
-  the round-trip is fundamentally inexpressible.
-* `testRegisterExistingTable` round-trips the same metadata location
-  but expects an `AlreadyExistsException`. Upstream
-  `BaseMetastoreCatalog.registerTable` runs the `tableExists` check
-  *before* any I/O on the URI, so the test passes against the
-  inline:// pseudo-URI as-is.
-
-**Resolved 2026-05-06:**
-
-* `FileIOTableOperations.commit` overrides the upstream
-  `BaseMetastoreTableOperations.commit` to call a local
-  `deleteRemovedRealMetadataFiles` that filters `inline://` entries
-  out of the previousFiles diff before invoking
-  `FileIO.deleteFile(s)`. Real metadata files (pointer-mode
-  predecessors) still get cleaned up; inline pseudo-URIs are
-  no-ops. `BulkDeletionFailure` no longer fires.
-* `TestS3CatalogCASInlineTM` / `GCSCatalogTestInlineTM` carry an
-  inline-equivalent `testMetadataFileLocationsRemovalAfterCommit`
-  that asserts on `metadata.previousFiles().size()` directly (one
-  fewer than the upstream count, since the upstream assertion adds
-  `metadataFileLocation()` to the set). The semantic — bounded
-  history under `METADATA_PREVIOUS_VERSIONS_MAX` after enabling
-  `METADATA_DELETE_AFTER_COMMIT_ENABLED` — is preserved verbatim;
-  only the accessor changed. Confirmed passing on S3.
-* `testRegisterExistingTable` re-enabled (the `@Disabled` override
-  removed). The existence check fires before URI resolution, so the
-  inline:// path never gets touched.
-
-**Still disabled:** `testRegisterTable` only. The drop +
-registerTable round-trip requires a register-from-bytes API on
-`FileIOCatalog` — no equivalent exists today. Disabled with the gap
-documented inline; revisit if a real workload needs catalog
-re-registration of a previously-dropped inline table.
+S3 and GCS run the full `inline=true` matrix
+(`*InlineTM` and `*InlineML` × `*Catalog` and `*FileIOCatalogTransaction`).
+ADLS has CAS-mode and append-mode inline-TM subclasses
+(`ADLSCatalogTest{,CAS}InlineTM`,
+`ADLSFileIOCatalogTransactionTests{,CAS}InlineTM`), but no `*InlineML`
+variants. Adding them is mechanical — one-line subclasses — once the
+inline-ML cells go green on S3/GCS (see `INLINE_STABILIZATION.md` M1).
 
 ### T3. Cloud integration tests require manual emulator setup
 
@@ -143,6 +109,38 @@ We rely on developer-run emulators; CI coverage is best-effort.
 (ADLS), and fake-gcs-server (GCS) under the `verify` Maven profile.
 Gate container startup behind a profile flag so `mvn test` stays fast
 and offline.
+
+### T4. `testRegisterTable` (inline) needs a register-from-bytes API
+
+`TestS3CatalogCASInlineTM` and `GCSCatalogTestInlineTM` keep a
+single `@Disabled` override on `testRegisterTable`. The upstream test
+calls `catalog.dropTable(t)` then `catalog.registerTable(t, oldLoc)`
+with the previously-loaded metadata location string. After drop, the
+inline metadata bytes are gone, and there is no `registerTable(name,
+bytes)` API on `FileIOCatalog` to re-inline them. Two options:
+
+1. Add a `registerInlineTable(TableIdentifier, byte[])` overload
+   surfaced through `FileIOCatalog`. The upstream `Catalog` interface
+   only exposes the location-string variant, so callers would need to
+   downcast — acceptable for inline-aware tools.
+2. Stash a side copy of the dropped inline bytes in `FileIOCatalog`
+   keyed by metadata location, so the register-by-location path can
+   look them up. Smells like a leak waiting to happen; (1) is cleaner.
+
+**Trigger to revisit:** when a real workload needs catalog
+re-registration of a previously-dropped inline table.
+
+### T5. `TestInlineDelta` covers encode/decode round-trip but not reconstruction round-trip for `addSnapshot`
+
+`addSnapshotWithParentKeyIdFirstRowId` and friends assert that an
+`AddSnapshotUpdate` survives `encodeDelta` → `decodeDelta` with all
+fields intact. They don't assert that the resulting Snapshot object
+produced by `applyTo(base, prefix)` carries those fields back through
+JSON parsing. The hand-rolled JSON in `applyTo` has at least one known
+gap (`addedRows` — see `INLINE_STABILIZATION.md` M4); other v3+ fields
+may have similar issues. **Fix path:** reuse the existing fixtures but
+extend the assertions through `applyTo`, comparing the rebuilt
+`Snapshot` field-by-field against an expected `BaseSnapshot`.
 
 ## Known Unknowns
 

@@ -949,12 +949,13 @@ public class TestInlineDelta {
   @Nested
   class ReplayDeterminismTests {
 
+    /**
+     * Property-only delta: no AddSnapshot, no setRef. Exercises
+     * {@code Builder.build()}'s wall-clock fallback path (TableMetadata.java line
+     * 1568) — the writer's {@code last-updated-ms} from the delta must override it.
+     */
     @Test
-    void propertyOnlyDeltaIsByteStable() {
-      // No AddSnapshot, no setRef("main") — exercises the
-      // "build() defaults lastUpdatedMillis to wall-clock" path. Without the
-      // post-processing pin, two replays would differ in the top-level
-      // last-updated-ms field by tens of nanoseconds.
+    void propertyOnlyDeltaCarriesWriterTimestamp() {
       List<InlineDeltaCodec.DeltaUpdate> updates = List.of(
           new InlineDeltaCodec.SetPropertiesUpdate(
               Map.of("write.format.default", "parquet"), Set.of()));
@@ -962,54 +963,47 @@ public class TestInlineDelta {
       byte[] baseBytes = metadataBytes(baseMetadata());
 
       byte[] r1 = InlineDeltaCodec.applyDelta(baseBytes, deltaBytes);
-      byte[] r2 = InlineDeltaCodec.applyDelta(baseBytes, deltaBytes);
-      assertThat(r1).isEqualTo(r2);
-
-      TableMetadata reparsed = TableMetadataParser.fromJson(
-          new String(r1, StandardCharsets.UTF_8));
-      assertThat(reparsed.lastUpdatedMillis())
+      TableMetadata m1 = TableMetadataParser.fromJson(new String(r1, StandardCharsets.UTF_8));
+      assertThat(m1.lastUpdatedMillis())
           .as("top-level last-updated-ms must equal the writer's value")
           .isEqualTo(TestInlineDelta.TEST_TS);
+      assertThat(m1.properties()).containsEntry("write.format.default", "parquet");
     }
 
+    /**
+     * Replay determinism: the same delta against the same base must produce a
+     * {@link TableMetadata} with the same field values across reads.
+     * {@code Builder.setLastUpdatedMillis} pinned from delta field 2 makes
+     * snapshot-log timestamps and the top-level field deterministic, even when
+     * the delta has no AddSnapshot to side-effect the builder.
+     */
     @Test
-    void pinTimestampsLeavesUnrelatedFieldsUntouched() {
-      // The post-processing must not touch timestamp-ms in metadata-log
-      // entries (a sibling array right after snapshot-log) or in snapshot
-      // summary objects elsewhere in the JSON.
-      String json =
-          "{\"format-version\":2,"
-              + "\"last-updated-ms\":111,"
-              + "\"snapshots\":[{\"snapshot-id\":1,\"timestamp-ms\":222}],"
-              + "\"snapshot-log\":[{\"timestamp-ms\":333,\"snapshot-id\":1}],"
-              + "\"metadata-log\":[{\"timestamp-ms\":444,\"metadata-file\":\"x\"}]}";
-      String pinned = InlineDeltaCodec.pinTimestamps(json, /*baseSnapshotLogSize*/ 0, 999L);
-      assertThat(pinned).contains("\"last-updated-ms\":999");
-      // snapshot-log entry rewritten
-      assertThat(pinned).contains("\"snapshot-log\":[{\"timestamp-ms\":999,\"snapshot-id\":1}]");
-      // snapshots[].timestamp-ms preserved
-      assertThat(pinned).contains("\"snapshots\":[{\"snapshot-id\":1,\"timestamp-ms\":222}]");
-      // metadata-log entry preserved
-      assertThat(pinned).contains("\"metadata-log\":[{\"timestamp-ms\":444,\"metadata-file\":\"x\"}]");
-    }
+    void deltaWithSetRefIsDeterministicAcrossReplays() {
+      // Build a base that already has a snapshot, so SetSnapshotRef on MAIN_BRANCH
+      // hits the setRef→snapshotLog.add path (TableMetadata.java line 1327)
+      // without an AddSnapshot in the same delta.
+      InlineDeltaCodec.AddSnapshotUpdate addSnap = new InlineDeltaCodec.AddSnapshotUpdate(
+          100L, "", Map.of("operation", "append"), 0L, 0, 0);
+      TableMetadata base = addSnap.applyTo(baseMetadata(), "");
 
-    @Test
-    void pinTimestampsOnlyRewritesNewSnapshotLogEntries() {
-      // baseSnapshotLogSize=2 means the first two entries were carried over
-      // and must keep their timestamps; only the third was added in this
-      // builder pass.
-      String json =
-          "{\"last-updated-ms\":555,"
-              + "\"snapshot-log\":["
-              + "{\"timestamp-ms\":100,\"snapshot-id\":1},"
-              + "{\"timestamp-ms\":200,\"snapshot-id\":2},"
-              + "{\"timestamp-ms\":999999,\"snapshot-id\":3}"
-              + "]}";
-      String pinned = InlineDeltaCodec.pinTimestamps(json, 2, 777L);
-      assertThat(pinned).contains("\"last-updated-ms\":777");
-      assertThat(pinned).contains("{\"timestamp-ms\":100,\"snapshot-id\":1}");
-      assertThat(pinned).contains("{\"timestamp-ms\":200,\"snapshot-id\":2}");
-      assertThat(pinned).contains("{\"timestamp-ms\":777,\"snapshot-id\":3}");
+      // Delta: just move main to snapshot 100. No AddSnapshot in this delta.
+      List<InlineDeltaCodec.DeltaUpdate> updates = List.of(
+          new InlineDeltaCodec.SetSnapshotRefUpdate("main", 100L, "branch", 0, 0, 0));
+      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(updates, TestInlineDelta.TEST_TS);
+      byte[] baseBytes = metadataBytes(base);
+
+      byte[] r1 = InlineDeltaCodec.applyDelta(baseBytes, deltaBytes);
+      byte[] r2 = InlineDeltaCodec.applyDelta(baseBytes, deltaBytes);
+      TableMetadata m1 = TableMetadataParser.fromJson(new String(r1, StandardCharsets.UTF_8));
+      TableMetadata m2 = TableMetadataParser.fromJson(new String(r2, StandardCharsets.UTF_8));
+
+      assertThat(m1.lastUpdatedMillis()).isEqualTo(TestInlineDelta.TEST_TS);
+      assertThat(m2.lastUpdatedMillis()).isEqualTo(TestInlineDelta.TEST_TS);
+      assertThat(m1.snapshotLog()).hasSize(m2.snapshotLog().size());
+      for (int i = 0; i < m1.snapshotLog().size(); i++) {
+        assertThat(m1.snapshotLog().get(i).timestampMillis())
+            .isEqualTo(m2.snapshotLog().get(i).timestampMillis());
+      }
     }
   }
 }
