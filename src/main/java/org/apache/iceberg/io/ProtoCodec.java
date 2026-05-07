@@ -141,6 +141,7 @@ public class ProtoCodec {
   private static final int ACTION_READ_TABLE = 8;
   private static final int ACTION_UPDATE_TABLE_INLINE = 9;
   private static final int ACTION_CREATE_TABLE_INLINE = 10;
+  private static final int ACTION_RENAME_TABLE = 11;
 
   // CreateNamespace field numbers
   private static final int CREATE_NS_ID = 1;
@@ -200,6 +201,13 @@ public class ProtoCodec {
   private static final int CREATE_INLINE_TBL_NS_VERSION = 4;
   private static final int CREATE_INLINE_TBL_NAME = 5;
   private static final int CREATE_INLINE_TBL_METADATA = 6;
+
+  // RenameTable field numbers
+  private static final int RENAME_TBL_ID = 1;
+  private static final int RENAME_TBL_VERSION = 2;
+  private static final int RENAME_TBL_NEW_NS_ID = 3;
+  private static final int RENAME_TBL_NEW_NS_VERSION = 4;
+  private static final int RENAME_TBL_NEW_NAME = 5;
 
   // ============================================================
   // Checkpoint encoding/decoding
@@ -771,6 +779,15 @@ public class ProtoCodec {
       writeString(inner, CREATE_INLINE_TBL_NAME, a.name);
       writeBytes(inner, CREATE_INLINE_TBL_METADATA, a.metadata);
       writeLengthDelimited(out, ACTION_CREATE_TABLE_INLINE, inner.toByteArray());
+    } else if (action instanceof RenameTableAction) {
+      RenameTableAction a = (RenameTableAction) action;
+      ByteArrayOutputStream inner = new ByteArrayOutputStream();
+      writeVarint(inner, RENAME_TBL_ID, a.id);
+      writeVarint(inner, RENAME_TBL_VERSION, a.version);
+      writeVarint(inner, RENAME_TBL_NEW_NS_ID, a.newNamespaceId);
+      writeVarint(inner, RENAME_TBL_NEW_NS_VERSION, a.newNamespaceVersion);
+      writeString(inner, RENAME_TBL_NEW_NAME, a.newName);
+      writeLengthDelimited(out, ACTION_RENAME_TABLE, inner.toByteArray());
     }
     return out.toByteArray();
   }
@@ -802,6 +819,8 @@ public class ProtoCodec {
         return decodeUpdateTableInline(actionBytes);
       case ACTION_CREATE_TABLE_INLINE:
         return decodeCreateTableInline(actionBytes);
+      case ACTION_RENAME_TABLE:
+        return decodeRenameTable(actionBytes);
       default:
         return new UnknownAction(actionType, actionBytes);
     }
@@ -1079,6 +1098,37 @@ public class ProtoCodec {
       }
     }
     return new UpdateTableInlineAction(id, version, deltaBytes, fullMetadata, metadataLocation);
+  }
+
+  private static RenameTableAction decodeRenameTable(byte[] bytes) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    int id = 0, version = 0, newNsId = 0, newNsVersion = 0;
+    String newName = "";
+
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      int fieldNumber = tag >>> 3;
+      switch (fieldNumber) {
+        case RENAME_TBL_ID:
+          id = readVarint(in);
+          break;
+        case RENAME_TBL_VERSION:
+          version = readVarint(in);
+          break;
+        case RENAME_TBL_NEW_NS_ID:
+          newNsId = readVarint(in);
+          break;
+        case RENAME_TBL_NEW_NS_VERSION:
+          newNsVersion = readVarint(in);
+          break;
+        case RENAME_TBL_NEW_NAME:
+          newName = readString(in);
+          break;
+        default:
+          skipField(in, tag & 0x7);
+      }
+    }
+    return new RenameTableAction(id, version, newNsId, newNsVersion, newName);
   }
 
   // ============================================================
@@ -1960,6 +2010,72 @@ public class ProtoCodec {
       // Adding a table mutates the parent's children set; bump so concurrent
       // ns mutations fail verify. Same rule as CreateTableAction.
       builder.bumpNamespaceVersion(namespaceId);
+    }
+  }
+
+  /**
+   * Renames a table in place: the table id stays put, only the
+   * {@code (namespace, name)} pair changes. Inline state (manifest pool, snapshot
+   * manifest refs, inline TM bytes) is id-keyed and follows by construction.
+   *
+   * <p>Verification: source {@code tbl_v} must match (catches concurrent drop /
+   * update / rename of the same id). When {@code newNamespaceVersion >= 0}, the
+   * destination namespace's version must match — caller passes {@code -1} to
+   * skip the check when the destination ns was created in this same transaction
+   * (late-bind), mirroring {@link CreateTableAction}.
+   *
+   * <p>Apply bumps the source and destination namespaces' children-set version,
+   * matching the rule for {@link CreateTableAction} / {@link DropTableAction}.
+   * See errata.md §D5 and design.md "Operation × Operation Conflict Matrix".
+   */
+  public static class RenameTableAction implements Action {
+    final int id;
+    final int version;
+    final int newNamespaceId;
+    final int newNamespaceVersion;
+    final String newName;
+
+    public RenameTableAction(
+        int id, int version, int newNamespaceId, int newNamespaceVersion, String newName) {
+      this.id = id;
+      this.version = version;
+      this.newNamespaceId = newNamespaceId;
+      this.newNamespaceVersion = newNamespaceVersion;
+      this.newName = newName;
+    }
+
+    @Override
+    public boolean verify(ProtoCatalogFile.Builder builder) {
+      // Source tbl_v must match. Catches concurrent drop / update / rename of
+      // the same id.
+      int currentVersion = builder.tableVersion(id);
+      if (currentVersion != version) {
+        return false;
+      }
+      // Destination ns_v must match (when not late-bound). Catches a concurrent
+      // CreateTable / DropTable / RenameTable into the same destination ns —
+      // any of those bumps the parent ns's children-set version.
+      if (newNamespaceVersion >= 0) {
+        int currentNsVersion = builder.namespaceVersion(newNamespaceId);
+        if (currentNsVersion != newNamespaceVersion) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    @Override
+    public void apply(ProtoCatalogFile.Builder builder) {
+      ProtoCatalogFile.TblEntry old = builder.tableEntry(id);
+      int oldNsId = old != null ? old.namespaceId : 0;
+      builder.renameTable(id, newNamespaceId, newName, version + 1);
+      // Renaming mutates the source ns's children set (table left) and the
+      // destination ns's children set (table arrived). Bump both, exactly like
+      // DropTable + CreateTable would have.
+      builder.bumpNamespaceVersion(oldNsId);
+      if (newNamespaceId != oldNsId) {
+        builder.bumpNamespaceVersion(newNamespaceId);
+      }
     }
   }
 

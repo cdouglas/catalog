@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-05-05 (matrix re-verification)
+last-verified: 2026-05-06 (post-RenameTable action — errata D5)
 ---
 
 # Cloud-store compatibility matrix

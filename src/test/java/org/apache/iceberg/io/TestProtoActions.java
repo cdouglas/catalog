@@ -196,6 +196,11 @@ public class TestProtoActions {
     return new ProtoCodec.UpdateTableInlineAction(id, version, null, metadataLocation);
   }
 
+  static ProtoCodec.RenameTableAction renameTbl(
+      int id, int version, int newNsId, int newNsVersion, String newName) {
+    return new ProtoCodec.RenameTableAction(id, version, newNsId, newNsVersion, newName);
+  }
+
   // ============================================================
   // File construction / replay helpers
   // ============================================================
@@ -763,6 +768,122 @@ public class TestProtoActions {
       TableIdentifier users = TableIdentifier.of(Namespace.of("db"), "users");
       assertThat(result.tableVersion(result.tableId(users))).isEqualTo(1);
       assertThat(result.location(users)).isEqualTo("s3://v1");
+    }
+  }
+
+  // ============================================================
+  // RenameTable
+  // ============================================================
+
+  @Nested
+  class RenameTableTests {
+
+    @Test
+    void renamesPointerTableInPlace() {
+      byte[] file = catalog()
+          .ns(1, 0, "db", 1)
+          .tbl(1, 1, "users", 1, "s3://users/v1")
+          .build();
+      ProtoCatalogFile r = apply(file, txn(renameTbl(1, 1, 1, 1, "people")));
+
+      Namespace db = Namespace.of("db");
+      // Old name gone, new name resolves to the SAME id, location preserved.
+      assertThat(r.tableId(TableIdentifier.of(db, "users"))).isNull();
+      assertThat(r.tableId(TableIdentifier.of(db, "people"))).isEqualTo(1);
+      assertThat(r.location(TableIdentifier.of(db, "people"))).isEqualTo("s3://users/v1");
+      assertThat(r.tableVersion(1)).isEqualTo(2);
+    }
+
+    @Test
+    void renamesAcrossNamespaces() {
+      byte[] file = catalog()
+          .ns(1, 0, "db", 1)
+          .ns(2, 0, "archive", 1)
+          .tbl(1, 1, "users", 1, "s3://users/v1")
+          .build();
+      ProtoCatalogFile r = apply(file, txn(renameTbl(1, 1, 2, 1, "users")));
+
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "users"))).isNull();
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("archive"), "users"))).isEqualTo(1);
+      assertThat(r.location(TableIdentifier.of(Namespace.of("archive"), "users")))
+          .isEqualTo("s3://users/v1");
+      // Both source and destination ns versions bumped (children-set rule).
+      assertThat(r.namespaceVersion(1)).isEqualTo(2);
+      assertThat(r.namespaceVersion(2)).isEqualTo(2);
+    }
+
+    @Test
+    void renameInlineTablePreservesInlineState() throws IOException {
+      byte[] meta = "{\"format-version\":2}".getBytes();
+      ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(LOCATION);
+      builder.addNamespace(1, 0, "db", 1);
+      builder.addInlineTable(1, 1, "users", 1, meta, "s3://users/metadata/snap-");
+      // Synthetic manifest pool entry + snapshot ref so we can prove they survive.
+      builder.addManifestToPool(1, new ProtoCodec.DecodedManifestFile(
+          "s3://users/metadata/snap-m0.avro", 1234, 0, 0, 1, 1, 100L,
+          1, 0, 0, 10L, 0, 0, null, null, null));
+      builder.setSnapshotManifests(1, 100L, java.util.Collections.singletonList(
+          "s3://users/metadata/snap-m0.avro"));
+      byte[] file = toFileBytes(builder.build());
+
+      ProtoCatalogFile r = apply(file, txn(renameTbl(1, 1, 1, 1, "people")));
+
+      // Id is stable, so the inline maps follow for free.
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "people"))).isEqualTo(1);
+      assertThat(r.isInlineTable(1)).isTrue();
+      assertThat(r.inlineMetadata(1)).isEqualTo(meta);
+      assertThat(r.manifestListPrefix(1)).isEqualTo("s3://users/metadata/snap-");
+      assertThat(r.hasInlineManifests(1, 100L)).isTrue();
+      assertThat(r.inlineManifests(1, 100L)).hasSize(1);
+    }
+
+    @Test
+    void rejectsOnTableVersionMismatch() {
+      byte[] file = catalog()
+          .ns(1, 0, "db", 1)
+          .tbl(1, 1, "users", 3, "s3://users/v3")
+          .build();
+      // Action captured tbl_v=1 but real version is 3.
+      ProtoCodec.Transaction t = txn(renameTbl(1, 1, 1, 1, "people"));
+      ProtoCatalogFile r = apply(file, t);
+
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "users"))).isEqualTo(1);
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "people"))).isNull();
+      assertThat(r.containsTransaction(t.id())).isFalse();
+    }
+
+    @Test
+    void rejectsOnDestNamespaceVersionMismatch() {
+      byte[] file = catalog()
+          .ns(1, 0, "db", 1)
+          .ns(2, 0, "archive", 5)
+          .tbl(1, 1, "users", 1, "s3://users/v1")
+          .build();
+      // Action captured archive ns_v=1 but it's actually 5.
+      ProtoCodec.Transaction t = txn(renameTbl(1, 1, 2, 1, "users"));
+      ProtoCatalogFile r = apply(file, t);
+
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "users"))).isEqualTo(1);
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("archive"), "users"))).isNull();
+      assertThat(r.containsTransaction(t.id())).isFalse();
+    }
+
+    @Test
+    void lateBindDestNamespaceSkipsVersionCheck() {
+      // Action carries newNamespaceVersion=-1 (dest ns created in same txn),
+      // so apply doesn't gate on ns_v.
+      byte[] file = catalog()
+          .ns(1, 0, "db", 1)
+          .tbl(1, 1, "users", 1, "s3://users/v1")
+          .build();
+      ProtoCodec.Transaction t = txn(
+          createNs(2, 0, "archive", 1, -1),
+          renameTbl(1, 1, 2, -1, "users"));
+      ProtoCatalogFile r = apply(file, t);
+
+      assertThat(r.containsNamespace(Namespace.of("archive"))).isTrue();
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("archive"), "users"))).isEqualTo(1);
+      assertThat(r.containsTransaction(t.id())).isTrue();
     }
   }
 
@@ -1974,6 +2095,24 @@ public class TestProtoActions {
     }
 
     @Test
+    void renameTableReplayRejectedAfterVersionBump() {
+      byte[] file = catalog()
+          .ns(1, 0, "db", 1)
+          .tbl(1, 1, "users", 1, "s3://users/v1")
+          .build();
+      ProtoCodec.Transaction first = txn(renameTbl(1, 1, 1, 1, "people"));
+      byte[] afterFirst = replayAndSerialize(file, first);
+
+      // tbl version bumped 1 -> 2; replay capturing tbl_v=1 must be rejected.
+      ProtoCodec.Transaction replay = txn(renameTbl(1, 1, 1, 2, "humans"));
+      ProtoCatalogFile result = apply(afterFirst, replay);
+      Namespace db = Namespace.of("db");
+      assertThat(result.tableId(TableIdentifier.of(db, "people"))).isEqualTo(1);
+      assertThat(result.tableId(TableIdentifier.of(db, "humans"))).isNull();
+      assertThat(result.containsTransaction(replay.id())).isFalse();
+    }
+
+    @Test
     void duplicateUuidIsSkippedAtReplay() {
       // Complementary to the content-level idempotency above: the committedTxn
       // set dedups replays where the UUID has already been seen. Both lines
@@ -2227,6 +2366,93 @@ public class TestProtoActions {
       ProtoCodec.Transaction t2 = txn(readTbl(1, 1));
       ProtoCatalogFile r = apply(file, t1, t2);
       assertThat(r.containsTransaction(t2.id())).isTrue();
+    }
+
+    // --- RenameTable vs X ---
+
+    @Test
+    void renameTblVsRenameTbl_sameId_conflict_tblVersion() {
+      // Two concurrent renames of the same table — second's tbl_v=1 fails.
+      byte[] file = baseFile();
+      ProtoCodec.Transaction t1 = txn(renameTbl(1, 1, 1, 1, "renamed_a"));
+      ProtoCodec.Transaction t2 = txn(renameTbl(1, 1, 1, 1, "renamed_b"));
+      ProtoCatalogFile r = apply(file, t1, t2);
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "renamed_a"))).isEqualTo(1);
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "renamed_b"))).isNull();
+      assertThat(r.containsTransaction(t2.id())).isFalse();
+    }
+
+    @Test
+    void renameTblVsDropTbl_sameId_conflict_tblVersion() {
+      byte[] file = baseFile();
+      ProtoCodec.Transaction t1 = txn(dropTbl(1, 1));
+      ProtoCodec.Transaction t2 = txn(renameTbl(1, 1, 1, 1, "renamed"));
+      ProtoCatalogFile r = apply(file, t1, t2);
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "t1"))).isNull();
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "renamed"))).isNull();
+      assertThat(r.containsTransaction(t2.id())).isFalse();
+    }
+
+    @Test
+    void renameTblVsUpdateTbl_sameId_conflict_tblVersion() {
+      byte[] file = baseFile();
+      ProtoCodec.Transaction t1 = txn(updateTbl(1, 1, "s3://t1/v2"));
+      ProtoCodec.Transaction t2 = txn(renameTbl(1, 1, 1, 1, "renamed"));
+      ProtoCatalogFile r = apply(file, t1, t2);
+      assertThat(r.location(TableIdentifier.of(Namespace.of("db"), "t1"))).isEqualTo("s3://t1/v2");
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "renamed"))).isNull();
+      assertThat(r.containsTransaction(t2.id())).isFalse();
+    }
+
+    @Test
+    void renameTblVsReadTbl_sameId_conflict_tblVersion() {
+      byte[] file = baseFile();
+      ProtoCodec.Transaction t1 = txn(renameTbl(1, 1, 1, 1, "renamed"));
+      ProtoCodec.Transaction t2 = txn(readTbl(1, 1));
+      ProtoCatalogFile r = apply(file, t1, t2);
+      assertThat(r.containsTransaction(t1.id())).isTrue();
+      assertThat(r.containsTransaction(t2.id())).isFalse();
+    }
+
+    @Test
+    void renameTblDifferentTables_compose() {
+      byte[] file = baseFile();
+      ProtoCodec.Transaction t1 = txn(renameTbl(1, 1, 1, 1, "renamed1"));
+      ProtoCodec.Transaction t2 = txn(renameTbl(2, 1, 1, 2, "renamed2"));
+      ProtoCatalogFile r = apply(file, t1, t2);
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "renamed1"))).isEqualTo(1);
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "renamed2"))).isEqualTo(2);
+    }
+
+    @Test
+    void renameTblVsCreateTblInDestNs_conflict_nsVersion() {
+      // Concurrent CreateTable in the destination ns bumps that ns's version;
+      // the rename's captured ns_v fails.
+      byte[] file = baseFile();
+      // ns1 ("db") starts at v=1. CreateTable bumps it to v=2. Rename
+      // captured newNamespaceVersion=1, so verify fails.
+      ProtoCodec.Transaction t1 = txn(createTbl(3, 1, "newcomer", 1, 1, "s3://newcomer/v1"));
+      ProtoCodec.Transaction t2 = txn(renameTbl(1, 1, 1, 1, "renamed"));
+      ProtoCatalogFile r = apply(file, t1, t2);
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "newcomer"))).isEqualTo(3);
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "renamed"))).isNull();
+      assertThat(r.containsTransaction(t2.id())).isFalse();
+    }
+
+    @Test
+    void renameTblBumpsSourceAndDestNs() {
+      // After a cross-namespace rename, both source and destination ns
+      // versions bump (children-set rule). A concurrent set-property on
+      // either ns at the captured version is rejected.
+      byte[] file = baseFile();
+      ProtoCodec.Transaction t1 = txn(renameTbl(1, 1, 2, 1, "t1"));
+      ProtoCodec.Transaction t2 = txn(setNsProp(1, 1, "owner", "carol"));  // src ns
+      ProtoCodec.Transaction t3 = txn(setNsProp(2, 1, "team", "data"));    // dest ns
+      ProtoCatalogFile r = apply(file, t1, t2, t3);
+      assertThat(r.tableId(TableIdentifier.of(Namespace.of("other"), "t1"))).isEqualTo(1);
+      assertThat(r.containsTransaction(t1.id())).isTrue();
+      assertThat(r.containsTransaction(t2.id())).isFalse();
+      assertThat(r.containsTransaction(t3.id())).isFalse();
     }
   }
 

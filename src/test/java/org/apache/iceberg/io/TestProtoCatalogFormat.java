@@ -128,6 +128,26 @@ public class TestProtoCatalogFormat {
   }
 
   @Test
+  public void testRenameTableActionEncodeDecode() {
+    UUID txnId = UUID.randomUUID();
+    ProtoCodec.Transaction txn = new ProtoCodec.Transaction(
+        txnId, false, List.of(
+            new ProtoCodec.RenameTableAction(7, 3, 4, 9, "renamed_tbl")));
+
+    byte[] bytes = ProtoCodec.encodeTransaction(txn);
+    ProtoCodec.Transaction decoded = ProtoCodec.decodeTransaction(bytes);
+
+    assertThat(decoded.id()).isEqualTo(txnId);
+    assertThat(decoded.actions()).hasSize(1);
+    ProtoCodec.RenameTableAction rt = (ProtoCodec.RenameTableAction) decoded.actions().get(0);
+    assertThat(rt.id).isEqualTo(7);
+    assertThat(rt.version).isEqualTo(3);
+    assertThat(rt.newNamespaceId).isEqualTo(4);
+    assertThat(rt.newNamespaceVersion).isEqualTo(9);
+    assertThat(rt.newName).isEqualTo("renamed_tbl");
+  }
+
+  @Test
   public void testTransactionVerifyAndApply() {
     InputFile location = new TestInputFile("test://catalog");
     ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(location);

@@ -140,6 +140,7 @@ message Action {
     ReadTable               read_table                = 8;
     UpdateTableInline       update_table_inline       = 9;   // see SPEC_TM
     CreateTableInline       create_table_inline       = 10;  // see SPEC_TM
+    RenameTable             rename_table              = 11;
   }
 }
 ```
@@ -198,6 +199,19 @@ message UpdateTableLocation {
 message ReadTable {
   int32 id      = 1;
   int32 version = 2;            // version that was read
+}
+
+// Renames a table in place — the int32 table id is stable, only
+// (namespace, name) on TblEntry changes. Applies to both pointer-mode and
+// inline tables (the id-keyed manifest pool / snapshot refs follow by
+// construction). See SPEC_TM.md "Rename" and design.md "Operation × Operation
+// Conflict Matrix" entry RT'.
+message RenameTable {
+  int32  id                    = 1;
+  int32  version               = 2; // source tbl_v; must match current
+  int32  new_namespace_id      = 3;
+  int32  new_namespace_version = 4; // -1 if dest ns is created in same txn
+  string new_name              = 5;
 }
 ```
 

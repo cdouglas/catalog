@@ -96,16 +96,19 @@ return tmBuilder.discardChanges().build();
 
 Add a focused unit test under `src/test/java/org/apache/iceberg/io/TestInlineDelta.java` that calls `applyDeltaWithManifests` twice with the same inputs and asserts byte-equality of the result.
 
-### Step 3 — Inline-aware rename (D)
+### Step 3 — Inline-aware rename (D) — resolved
 
-`FileIOCatalog.renameTable` and the underlying `CatalogFile.Mut` rename action only know how to migrate a metadata-file pointer. Inline tables have no pointer; the inline bytes, manifest pool, and per-snapshot manifest refs need to migrate to the new table id atomically.
-
-Approach:
-1. Add a `renameTable(TableIdentifier, TableIdentifier)` action to `ProtoCodec` that, on `apply`, copies `tblInlineMetadata`, `manifestPool`, and `snapshotManifests` entries from the old id to the new id (or the new id to a new entry, dropping the old) inside `ProtoCatalogFile.Builder`.
-2. Add `Mut.renameInlineTable(from, to)` (or fold it into the existing rename helper) and route `FileIOCatalog.renameTable` through it when `catalogFile.isInlineTable(from)`. Pointer-mode tables keep going through `dropTable + createTable`.
-3. Add a unit test in `TestProtoCatalogFormat` that round-trips an inline-table rename (commit, read back, verify bytes + pool + refs).
-
-Files: `src/main/java/org/apache/iceberg/io/{FileIOCatalog,CatalogFile,ProtoCatalogFile,ProtoCodec}.java`; new test in `TestProtoCatalogFormat`.
+Resolved by promoting `renameTable` to a first-class action
+(`RenameTable`, wire type 11). The catalog state is keyed by `int` table
+id throughout; the action mutates `TblEntry` in place, leaving all
+id-keyed maps (`tblInlineMetadata`, `tblManifestPrefix`, `manifestPool`,
+`snapshotManifests`) untouched. Inline-TM, inline-ML, and pointer-mode
+rename all take the same path. See [docs/SPEC.md](docs/SPEC.md) and
+[docs/SPEC_TM.md](docs/SPEC_TM.md) §"Rename"; coverage in
+`TestProtoActions$RenameTableTests`,
+`TestProtoActions$ConflictTests` (RT' row/column),
+`TestProtoActions$IdempotencyTests`,
+`TestProtoCatalogFormat#testRenameTableActionEncodeDecode`.
 
 ### Step 4 — Replace preserves snapshot log (E)
 
@@ -158,7 +161,7 @@ Goal: zero failures across the 14 suites, with `*InlineTM/ML` reporting ~18 skip
 
 - `iceberg/core/src/main/java/org/apache/iceberg/TableMetadata.java` — `Builder.setLastUpdatedMillis` (committed `ad714e683`); revisit if we adopt the JSON-post-processing alternative.
 - `src/main/java/org/apache/iceberg/io/InlineDeltaCodec.java` — Step 2 (and Step 5 if delta encoding gains `RemoveSpec`/`RemoveSchema`).
-- `src/main/java/org/apache/iceberg/io/FileIOCatalog.java` — Step 3 routes inline rename; Step 4 may touch `commitInline`'s replace branch.
-- `src/main/java/org/apache/iceberg/io/{CatalogFile,ProtoCatalogFile,ProtoCodec}.java` — Step 3.
+- `src/main/java/org/apache/iceberg/io/FileIOCatalog.java` — Step 4 may touch `commitInline`'s replace branch. (Step 3 landed: `renameTable` is a first-class action — see §Step 3.)
+- `src/main/java/org/apache/iceberg/io/{CatalogFile,ProtoCatalogFile,ProtoCodec}.java` — Step 3 (resolved).
 - `src/test/java/org/apache/iceberg/aws/s3/TestS3CatalogCASInlineTM.java`, `gcp/gcs/GCSCatalogTestInlineTM.java` — Step 1.
 - New focused unit tests in `src/test/java/org/apache/iceberg/io/{TestInlineDelta,TestProtoCatalogFormat,TestInlineManifestEndToEnd}.java` so each cloud bug has a non-cloud regression.

@@ -551,6 +551,26 @@ public class ProtoCatalogFile extends CatalogFile {
     }
 
     /**
+     * Renames a table in place: keeps the id, swaps namespaceId/name/version, and
+     * preserves the existing metadataLocation (inline tables carry null here).
+     * Inline state (tblInlineMetadata, tblManifestPrefix, manifestPool,
+     * snapshotManifests) is id-keyed and intentionally untouched. See errata.md
+     * §D5.
+     */
+    public Builder renameTable(int id, int newNamespaceId, String newName, int newVersion) {
+      TblEntry old = tableById.get(id);
+      if (old == null) {
+        return this;
+      }
+      Namespace oldNs = buildNamespace(old.namespaceId);
+      tableLookup.remove(TableIdentifier.of(oldNs, old.name));
+      tableById.put(id, new TblEntry(newNamespaceId, newName, newVersion, old.metadataLocation));
+      Namespace newNs = buildNamespace(newNamespaceId);
+      tableLookup.put(TableIdentifier.of(newNs, newName), id);
+      return this;
+    }
+
+    /**
      * Adds an inline table (metadata stored in catalog, not external file).
      * The table is also added to tableById with null metadataLocation for lookup.
      */

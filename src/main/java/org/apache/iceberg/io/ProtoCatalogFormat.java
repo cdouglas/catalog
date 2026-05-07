@@ -477,6 +477,29 @@ public class ProtoCatalogFormat
           actions.add(ProtoCodec.UpdateTableInlineAction.delta(tblId, version, deltaBytes));
         }
       }
+
+      // Process table renames (in-place, id-stable). See errata.md §D5.
+      for (Map.Entry<TableIdentifier, TableIdentifier> entry : tableRenames.entrySet()) {
+        TableIdentifier from = entry.getKey();
+        TableIdentifier to = entry.getValue();
+        Integer tblId = original.tableId(from);
+        if (tblId == null) {
+          continue;
+        }
+        int version = original.tableVersion(tblId);
+        Namespace newNs = to.namespace();
+        Integer newNsId = original.namespaceId(newNs);
+        int newNsVersion;
+        if (newNsId == null) {
+          // Destination namespace was created in this same transaction.
+          newNsId = nsIdMap.get(newNs);
+          newNsVersion = -1;
+        } else {
+          newNsVersion = original.namespaceVersion(newNsId);
+        }
+        actions.add(new ProtoCodec.RenameTableAction(
+            tblId, version, newNsId, newNsVersion, to.name()));
+      }
     }
 
     @Override
@@ -542,6 +565,11 @@ public class ProtoCatalogFormat
               throw new AlreadyExistsException("Table already exists: %s", e.getKey());
             }
           }
+          for (TableIdentifier dest : tableRenames.values()) {
+            if (newState.containsTable(dest)) {
+              throw new AlreadyExistsException("Table already exists: %s", dest);
+            }
+          }
           throw new CommitFailedException(
               "Cannot commit: catalog file changed concurrently at %s", current.location());
         } else {
@@ -596,6 +624,11 @@ public class ProtoCatalogFormat
         for (Map.Entry<TableIdentifier, byte[]> e : inlineTables.entrySet()) {
           if (result.containsTable(e.getKey())) {
             throw new AlreadyExistsException("Table already exists: %s", e.getKey());
+          }
+        }
+        for (TableIdentifier dest : tableRenames.values()) {
+          if (result.containsTable(dest)) {
+            throw new AlreadyExistsException("Table already exists: %s", dest);
           }
         }
         throw new CommitFailedException(

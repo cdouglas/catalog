@@ -175,24 +175,26 @@ Assumptions: same namespace or same table unless otherwise noted. Ops on
 *different* namespaces/tables always compose. `CN↓` = create child under
 the same parent.
 
-|         | CN↓  | DN   | SP   | RP   | CT   | CTI  | DT    | UT    | RT    |
-|---------|------|------|------|------|------|------|-------|-------|-------|
-| **CN↓** | ns v | ns v | ns v | ns v | ns v | ns v | ✓     | ✓     | ✓     |
-| **DN**  | —    | ns v | ns v | ns v | ns v | ns v | —     | —     | —     |
-| **SP**  | ns v | ns v | ns v | ns v | ns v | ns v | ✓     | ✓     | ✓     |
-| **RP**  | ns v | ns v | ns v | ns v | ns v | ns v | ✓     | ✓     | ✓     |
-| **CT**  | ns v | ns v | ns v | ns v | ns v | ns v | ✓     | ✓     | ✓     |
-| **CTI** | ns v | ns v | ns v | ns v | ns v | ns v | ✓     | ✓     | ✓     |
-| **DT**  | ✓    | —    | ✓    | ✓    | ✓    | ✓    | —     | tbl v | tbl v |
-| **UT**  | ✓    | —    | ✓    | ✓    | ✓    | ✓    | tbl v | tbl v | tbl v |
-| **RT**  | ✓    | ✓    | ✓    | ✓    | ✓    | ✓    | tbl v | tbl v | ✓     |
+|          | CN↓  | DN   | SP   | RP   | CT   | CTI  | DT    | UT    | RT'   | RT    |
+|----------|------|------|------|------|------|------|-------|-------|-------|-------|
+| **CN↓**  | ns v | ns v | ns v | ns v | ns v | ns v | ✓     | ✓     | ns v  | ✓     |
+| **DN**   | —    | ns v | ns v | ns v | ns v | ns v | —     | —     | —     | —     |
+| **SP**   | ns v | ns v | ns v | ns v | ns v | ns v | ✓     | ✓     | ns v  | ✓     |
+| **RP**   | ns v | ns v | ns v | ns v | ns v | ns v | ✓     | ✓     | ns v  | ✓     |
+| **CT**   | ns v | ns v | ns v | ns v | ns v | ns v | ✓     | ✓     | ns v  | ✓     |
+| **CTI**  | ns v | ns v | ns v | ns v | ns v | ns v | ✓     | ✓     | ns v  | ✓     |
+| **DT**   | ✓    | —    | ✓    | ✓    | ✓    | ✓    | —     | tbl v | tbl v | tbl v |
+| **UT**   | ✓    | —    | ✓    | ✓    | ✓    | ✓    | tbl v | tbl v | tbl v | tbl v |
+| **RT'**  | ns v | —    | ns v | ns v | ns v | ns v | tbl v | tbl v | tbl v | tbl v |
+| **RT**   | ✓    | ✓    | ✓    | ✓    | ✓    | ✓    | tbl v | tbl v | tbl v | ✓     |
 
 Legend: **CN↓** `CreateNamespace` (child), **DN** `DropNamespace`,
 **SP** `SetNamespaceProperty`, **RP** `RemoveNamespaceProperty`,
 **CT** `CreateTable`, **CTI** `CreateTableInline`, **DT** `DropTable`,
-**UT** `UpdateTableLocation` / `UpdateTableInline`, **RT** `ReadTable`.
-"ns v" = parent namespace's version conflicts; "tbl v" = table version
-conflicts.
+**UT** `UpdateTableLocation` / `UpdateTableInline`,
+**RT'** `RenameTable` (in-place; bumps both source and destination ns),
+**RT** `ReadTable`. "ns v" = parent namespace's version conflicts;
+"tbl v" = table version conflicts.
 
 What the matrix says:
 

@@ -104,6 +104,9 @@ public abstract class CatalogFile {
     protected final Map<TableIdentifier, byte[]> inlineTables;
     protected final Map<TableIdentifier, byte[]> inlineTableUpdates;
     protected final Map<TableIdentifier, byte[]> inlineTableDeltaUpdates;
+    // Pending renames: from-identifier -> to-identifier. The id stays put; only
+    // the (namespace, name) pair on TblEntry changes. See errata.md §D5.
+    protected final Map<TableIdentifier, TableIdentifier> tableRenames;
 
     protected Mut(C original) {
       this.original = original;
@@ -115,6 +118,7 @@ public abstract class CatalogFile {
       this.inlineTables = Maps.newHashMap();
       this.inlineTableUpdates = Maps.newHashMap();
       this.inlineTableDeltaUpdates = Maps.newHashMap();
+      this.tableRenames = Maps.newHashMap();
     }
 
     @SuppressWarnings("unchecked")
@@ -254,9 +258,38 @@ public abstract class CatalogFile {
       if (newloc != null) {
         tables.put(table, location);
       } else {
-        // TODO implement w.r.t. tableID to follow table renames (currently implemented as drop/add)
         tableUpdates.put(table, location);
       }
+      return self();
+    }
+
+    /**
+     * Renames a table in place: the table id stays put, only the
+     * {@code (namespace, name)} pair on {@code TblEntry} changes. Inline state
+     * keyed by id (manifest pool, snapshot manifest refs, inline TM bytes)
+     * follows by construction. See errata.md §D5.
+     */
+    public T renameTable(TableIdentifier from, TableIdentifier to) {
+      Preconditions.checkNotNull(from, "Source table cannot be null");
+      Preconditions.checkNotNull(to, "Destination table cannot be null");
+      Preconditions.checkArgument(!from.equals(to), "Source and destination identifiers are equal");
+      // Source must exist and not already be marked for delete in this Mut.
+      if (!original.containsTable(from) || (tables.containsKey(from) && tables.get(from) == null)) {
+        throw new NoSuchTableException("Table does not exist: %s", from);
+      }
+      // Destination namespace must exist (in original or pending creates).
+      if (checkNamespaceExists(to.namespace())) {
+        throw new NoSuchNamespaceException("Namespace does not exist: %s", to.namespace());
+      }
+      // Destination must not already exist (in original or pending creates).
+      boolean destPendingCreate =
+          (tables.containsKey(to) && tables.get(to) != null)
+              || inlineTables.containsKey(to)
+              || tableRenames.containsValue(to);
+      if (original.containsTable(to) || destPendingCreate) {
+        throw new AlreadyExistsException("Table already exists: %s", to);
+      }
+      tableRenames.put(from, to);
       return self();
     }
 

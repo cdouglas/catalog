@@ -359,26 +359,20 @@ API supports this integration cleanly.
 
 ## Rename
 
-`Catalog.renameTable(from, to)` for inline tables migrates the inline
-bytes across, not just the namespace/name pointer. The pointer-mode
-shape (`dropTable(from) + createTable(to, oldLocation)`) works for
-external metadata.json because both names point at the same on-disk
-file, but inline tables have no such file: a literal port of that shape
-would create a destination entry pointing at nothing while the inline
-metadata stayed keyed under the just-dropped id.
+`Catalog.renameTable(from, to)` is a single in-place update of the
+`TblEntry`'s `(namespaceId, name)` fields. The `int` table id stays put,
+so every id-keyed map (`tblInlineMetadata`, `tblManifestPrefix`,
+`manifestPool`, `snapshotManifests`) follows by construction — no inline
+state is copied across, and no migration can leak it.
 
-Implementation: `FileIOCatalog.renameTable` checks
-`catalogFile.isInlineTable(from)`. For inline tables it does
-`format.from(catalogFile).dropTable(from).createTableInline(to, inlineBytes).commit(io)`
-inside a single `Mut`, so the migration is observed atomically by
-readers. Pointer tables continue to use the original shape.
-
-This is a workaround inside the existing `dropTable + createTable`
-layering, not the right shape long-term. Rename should be a single
-in-place update of the `TblEntry`'s namespace/name fields, keeping the
-id stable so every id-keyed map (including the entire inline-ML side)
-follows for free. See [errata.md](errata.md) §D5 for the proper fix and
-the inline-ML migration gap that this workaround leaves open.
+Implementation: `FileIOCatalog.renameTable` calls
+`format.from(catalogFile).renameTable(from, to).commit(io)`. Pointer-mode
+and inline (TM, TM+ML) tables all take the same path. The wire action is
+`RenameTable(id, version, new_namespace_id, new_namespace_version, new_name)`;
+on apply it bumps the source and destination namespaces' children-set
+versions, exactly like `DropTable` + `CreateTable` would have. Conflict
+semantics fall out of the design.md operation × operation matrix without
+new fields — see entry **RT'** there.
 
 ## Inline ↔ Pointer Transitions
 
