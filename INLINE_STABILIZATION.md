@@ -43,16 +43,3 @@ on tables that maintain stats. Adding `AddStatistics` /
 `RemoveStatistics` delta types is straightforward; the JSON parsers are
 already in upstream Iceberg. Defer until inline-ML matrix is green.
 
-### M3. `AddSnapshotUpdate` does not reconstruct `added-rows` JSON field
-
-The encode side carries `addedRows` (`SNAP_ADDED_ROWS`, line 1406). The
-decode side stores it on the decoded update. But
-`AddSnapshotUpdate.applyTo(TableMetadata, prefix)` builds snapshot JSON
-by hand and never emits `"added-rows":N` — see the empty `if (addedRows
-> 0) { ... }` block at line 1193. A v3+ row-lineage commit that sets
-`addedRows=100` round-trips through the wire correctly but reconstructs
-to a `Snapshot` with `addedRows=null`. No test catches this because
-`TestInlineDelta` only verifies encode/decode round-trip, not
-reconstruction round-trip; integration suites don't exercise v3+ row
-lineage yet. Surface either when a v3 test lands or before publishing
-inline-ML as production-ready.

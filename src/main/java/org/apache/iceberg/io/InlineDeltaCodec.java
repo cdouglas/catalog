@@ -40,8 +40,8 @@ import org.apache.iceberg.SortOrderParser;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableMetadataParser;
 import org.apache.iceberg.PartitionSpecParser;
+import org.apache.iceberg.InlineDeltaSnapshots;
 import org.apache.iceberg.Snapshot;
-import org.apache.iceberg.SnapshotParser;
 import org.apache.iceberg.UnboundPartitionSpec;
 import org.apache.iceberg.UnboundSortOrder;
 
@@ -804,15 +804,10 @@ public class InlineDeltaCodec {
 
     @Override
     public void applyTo(TableMetadata.Builder builder) {
-      try {
-        com.fasterxml.jackson.databind.JsonNode node =
-            com.fasterxml.jackson.databind.ObjectMapper.class.newInstance()
-                .readTree(new String(specJson, StandardCharsets.UTF_8));
-        UnboundPartitionSpec spec = PartitionSpecParser.fromJson(node);
-        builder.addPartitionSpec(spec);
-      } catch (Exception e) {
-        throw new RuntimeException("Failed to parse partition spec JSON", e);
-      }
+      UnboundPartitionSpec spec = org.apache.iceberg.util.JsonUtil.parse(
+          new String(specJson, StandardCharsets.UTF_8),
+          PartitionSpecParser::fromJson);
+      builder.addPartitionSpec(spec);
     }
   }
 
@@ -1002,74 +997,43 @@ public class InlineDeltaCodec {
      */
     public TableMetadata applyTo(TableMetadata base, String manifestListPrefix) {
       // v1 tables don't carry sequence numbers; TableMetadata's constructor rejects
-      // any non-zero value. Synthesize seqNum only for v2+; otherwise leave it 0 and
-      // omit the field from the snapshot JSON (SnapshotParser interprets a missing
-      // sequence-number as 0).
-      boolean hasSeqNum = base.formatVersion() >= 2;
-      long seqNum = hasSeqNum ? base.lastSequenceNumber() + 1 : 0;
+      // any non-zero value. Synthesize seqNum only for v2+.
+      long seqNum = base.formatVersion() >= 2 ? base.lastSequenceNumber() + 1 : 0;
       // Prefer explicit parentSnapshotId (correct for stage-only, branch, cherry-pick).
       // Fall back to base.currentSnapshot() for older-format deltas (backward compat).
-      long resolvedParentId;
+      Long resolvedParentId;
       if (parentSnapshotId != null) {
         resolvedParentId = parentSnapshotId;
       } else if (base.currentSnapshot() != null) {
         resolvedParentId = base.currentSnapshot().snapshotId();
       } else {
-        resolvedParentId = -1;
+        resolvedParentId = null;
       }
       long timestamp = base.lastUpdatedMillis() + timestampDeltaMs;
-      int resolvedSchemaId = schemaId > 0 ? schemaId : base.currentSchemaId();
-      // For inline snapshots (empty suffix), use a sentinel that SnapshotParser.toJson
-      // will write as a manifest-list location (not the v1 embedded path)
+      Integer resolvedSchemaId = schemaId > 0 ? schemaId : base.currentSchemaId();
+      // For inline-ML snapshots (empty suffix), the manifest-list location is a
+      // sentinel; the inline-ML read path swaps the BaseSnapshot for an
+      // InlineSnapshot in wrapInlineManifests before any FileIO call resolves it.
       String manifestList = manifestListSuffix.isEmpty()
           ? "inline://" + snapshotId
           : manifestListPrefix + manifestListSuffix;
 
-      // Build snapshot via JSON + SnapshotParser (BaseSnapshot is package-private)
-      StringBuilder json = new StringBuilder("{");
-      json.append("\"snapshot-id\":").append(snapshotId);
-      if (resolvedParentId >= 0) {
-        json.append(",\"parent-snapshot-id\":").append(resolvedParentId);
-      }
-      if (hasSeqNum) {
-        json.append(",\"sequence-number\":").append(seqNum);
-      }
-      json.append(",\"timestamp-ms\":").append(timestamp);
-      json.append(",\"schema-id\":").append(resolvedSchemaId);
-      json.append(",\"manifest-list\":\"").append(escapeJson(manifestList)).append("\"");
-      json.append(",\"summary\":{\"operation\":\"")
-          .append(escapeJson(summary.getOrDefault("operation", "append")))
-          .append("\"");
-      for (Map.Entry<String, String> e : summary.entrySet()) {
-        if (!"operation".equals(e.getKey())) {
-          json.append(",\"").append(escapeJson(e.getKey()))
-              .append("\":\"").append(escapeJson(e.getValue())).append("\"");
-        }
-      }
-      json.append("}}");
-      if (firstRowId != null) {
-        // Insert first-row-id before the closing brace
-        json.setLength(json.length() - 1);
-        json.append(",\"first-row-id\":").append(firstRowId).append("}");
-      }
-      if (addedRows > 0) {
-        // Insert added-rows (already tracked, but SnapshotParser may expect explicit field)
-        // Note: SnapshotParser.toJson emits added_rows only if present; we preserve symmetry.
-      }
-      if (keyId != null && !keyId.isEmpty()) {
-        json.setLength(json.length() - 1);
-        json.append(",\"key-id\":\"").append(escapeJson(keyId)).append("\"}");
-      }
-      Snapshot snapshot = SnapshotParser.fromJson(json.toString());
+      Snapshot snapshot = InlineDeltaSnapshots.create(
+          seqNum,
+          snapshotId,
+          resolvedParentId,
+          timestamp,
+          summary,
+          resolvedSchemaId,
+          manifestList,
+          firstRowId,
+          addedRows > 0 ? addedRows : null,
+          keyId == null || keyId.isEmpty() ? null : keyId);
 
       return TableMetadata.buildFrom(base)
           .addSnapshot(snapshot)
           .discardChanges()
           .build();
-    }
-
-    private static String escapeJson(String s) {
-      return s.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 
     @Override

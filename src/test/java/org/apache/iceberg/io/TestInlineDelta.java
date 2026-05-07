@@ -710,6 +710,41 @@ public class TestInlineDelta {
       assertThat(d.keyId).isNull();
     }
 
+    /**
+     * Reconstruction round-trip: optional snapshot fields ({@code addedRows},
+     * {@code firstRowId}, {@code keyId}) survive the full
+     * {@code encodeDelta} → {@code decodeDelta} → {@code applyTo} chain, not
+     * just the wire codec. The hand-rolled JSON in {@link
+     * InlineDeltaCodec.AddSnapshotUpdate#applyTo(TableMetadata, String)} has
+     * been the historical gap — earlier versions silently dropped
+     * {@code addedRows} on replay because the JSON-emit branch was empty.
+     */
+    @Test
+    void addSnapshotOptionalFieldsReconstructThroughApplyTo() {
+      InlineDeltaCodec.AddSnapshotUpdate orig =
+          new InlineDeltaCodec.AddSnapshotUpdate(
+              500L, "", Map.of("operation", "append"),
+              0L, 0, /* addedRows */ 12345L,
+              /* parentSnapshotId */ null,
+              /* firstRowId */ 42L,
+              /* keyId */ "key-abc-123");
+
+      byte[] bytes = InlineDeltaCodec.encodeDelta(List.of(orig), TestInlineDelta.TEST_TS);
+      InlineDeltaCodec.AddSnapshotUpdate decoded =
+          (InlineDeltaCodec.AddSnapshotUpdate)
+              InlineDeltaCodec.decodeDelta(bytes).updates.get(0);
+
+      // Apply through to a real Snapshot via TableMetadata
+      TableMetadata applied = decoded.applyTo(baseMetadata(), "");
+      org.apache.iceberg.Snapshot snap = applied.snapshot(500L);
+      assertThat(snap).isNotNull();
+      assertThat(snap.addedRows())
+          .as("added-rows must survive reconstruction (was the addedRows-dropped bug)")
+          .isEqualTo(12345L);
+      assertThat(snap.firstRowId()).isEqualTo(42L);
+      assertThat(snap.keyId()).isEqualTo("key-abc-123");
+    }
+
     /** §1.3 A: AddSnapshotUpdate with explicit parentSnapshotId overrides base.currentSnapshot(). */
     @Test
     void applyToUsesExplicitParentSnapshotId() {

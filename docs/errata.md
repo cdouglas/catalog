@@ -130,18 +130,6 @@ bytes)` API on `FileIOCatalog` to re-inline them. Two options:
 **Trigger to revisit:** when a real workload needs catalog
 re-registration of a previously-dropped inline table.
 
-### T5. `TestInlineDelta` covers encode/decode round-trip but not reconstruction round-trip for `addSnapshot`
-
-`addSnapshotWithParentKeyIdFirstRowId` and friends assert that an
-`AddSnapshotUpdate` survives `encodeDelta` → `decodeDelta` with all
-fields intact. They don't assert that the resulting Snapshot object
-produced by `applyTo(base, prefix)` carries those fields back through
-JSON parsing. The hand-rolled JSON in `applyTo` has at least one known
-gap (`addedRows` — see `INLINE_STABILIZATION.md` M4); other v3+ fields
-may have similar issues. **Fix path:** reuse the existing fixtures but
-extend the assertions through `applyTo`, comparing the rebuilt
-`Snapshot` field-by-field against an expected `BaseSnapshot`.
-
 ## Known Unknowns
 
 These are pending measurement or validation. None block current work;
