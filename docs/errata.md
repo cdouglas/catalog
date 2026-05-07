@@ -80,6 +80,88 @@ on demand, which is not implemented today.
 **Trigger to revisit:** if a real workload hits the path. Until then,
 inline ML implies the table stays inline.
 
+### D8. Typed-protobuf encoding for Iceberg structural types (skip JSON serde)
+
+The `bytes` fields in our wire format that carry upstream Iceberg objects
+— full `TableMetadata`, `Schema`, `PartitionSpec`, `SortOrder` — are
+JSON today because Iceberg's only public serialization for those types
+is JSON. The catalog file is otherwise protobuf, with structured
+encodings for snapshots (`AddSnapshotUpdate` / `CompactSummary`) that we
+own.
+
+Replacing JSON with typed protobuf would (a) skip JSON parsing on the
+read path and (b) shrink the bytes we store. For a research prototype
+where deployments handle reader-version compatibility, the upstream-
+slow-evolution constraint is less binding than for a stock Iceberg
+catalog. Constructor visibility audit:
+
+| Type | Visibility | How we'd build one |
+|---|---|---|
+| `TableMetadata` | package-private | factory in our `org.apache.iceberg` package (same trick as `InlineDeltaSnapshots`) |
+| `BaseSnapshot`, `SnapshotLogEntry`, `MetadataLogEntry` | package-private | same |
+| `Schema` | public | direct `new Schema(...)` |
+| `PartitionSpec` | **`private`** | public `Builder` API |
+| `SortOrder` | **`private`** | public `Builder` API |
+
+No additional Iceberg fork needed beyond the package-peer factory.
+The hard part isn't constructors — it's the recursive `Type` system
+(`StructType` of `ListType` of `MapType` of …, plus parameterized
+primitives like `DecimalType(precision, scale)`). A protobuf grammar
+mirroring `org.apache.iceberg.types.Types` is ~300-500 lines of
+encoder + decoder.
+
+#### Per-type cost / benefit
+
+For each candidate, the benefit depends on **frequency** (how often the
+encoded bytes get written) and the **JSON-vs-binary ratio**:
+
+| Type | Where it lives | Write frequency | JSON size | Binary est. | Savings worth the encoder? |
+|---|---|---|---|---|---|
+| Snapshot list (inside TM) | every `inline_tables.metadata` | every CAS commit; long tail accumulates | ~500 B/snapshot × N | ~80-100 B/snapshot × N | **Yes.** Dominant term for active tables (1000 snapshots ≈ 500 KB JSON → 100 KB protobuf). Largely overlaps the `AddSnapshotUpdate` codec we already have — we'd be reusing it for the in-checkpoint storage. |
+| `TableMetadata` wrapper (scalars + lists + refs + properties) | every `inline_tables.metadata` | every CAS commit | ~1-3 KB structural + history | ~500 B - 1.5 KB | **Yes.** Cuts checkpoint bytes ~50%; eliminates JSON parse on every `loadTable`. |
+| `Schema` (with `Type` system) | inside TM JSON; `AddSchemaUpdate` deltas | every CAS commit (unchanged across most commits, but rewritten as part of TM) | ~400-800 B narrow / 8-15 KB wide | ~50-70% smaller | **Yes for wide tables, marginal for narrow.** The recursive `Type` encoder is the bulk of the work. |
+| `PartitionSpec` | inside TM JSON; `AddPartitionSpecUpdate` deltas | every CAS commit (typically 1-2 specs/table) | ~100-300 B each | ~40-60% smaller | **Marginal.** Once Type system exists, encoder is small (~50 lines), but per-table savings are modest. |
+| `SortOrder` | inside TM JSON; `AddSortOrderUpdate` deltas | every CAS commit (typically 1 order/table) | ~100-300 B | ~40-60% smaller | **Marginal.** Same shape as PartitionSpec. |
+
+The user's intuition — "if a schema is written once per catalog file
+it may not be worth it" — is accurate **for the delta-update path**:
+`AddSchemaUpdate` / `AddPartitionSpecUpdate` / `AddSortOrderUpdate`
+fire only when those types change, which is rare. Compressing the
+delta JSON saves bytes on rare commits.
+
+It is **not** accurate for the inline-TM storage path: the full
+`TableMetadata` JSON in `inline_tables.metadata` includes the schema /
+specs / sort-orders array unchanged from the previous version, and
+that JSON is rewritten on every CAS commit (per `INLINE_TBL_UPDATE.md`
+the structural overhead is 90%+ redundant after 10 commits). Compression
+helps every commit, even though the schema itself didn't change.
+
+#### Recommended slicing
+
+If we ever do this work, the natural cuts are:
+
+1. **TableMetadata wrapper + snapshot list** — biggest payoff per line of
+   code. Reuses `AddSnapshotUpdate` encoding for snapshots in
+   checkpoint storage. Schemas / specs / sort-orders stay JSON-as-bytes
+   in this slice. Cuts the dominant cost; ~300 lines.
+2. **`Type` system + `Schema`** — recursive, careful, but bounded. ~400
+   lines. Only worth doing if step (1) lands and wide-table workloads
+   matter.
+3. **`PartitionSpec` / `SortOrder`** — fall out cheaply once (2) exists
+   (~100 lines). Skip if (2) is skipped.
+
+#### When to revisit
+
+- Profiling shows `TableMetadataParser.fromJson` cost is non-negligible
+  on `loadTable`-heavy workloads.
+- Catalog-file size becomes a write-amplification concern (high-rate
+  CAS catalogs, especially on GCS where every commit is a CAS replace).
+- Inline-ML matrix is green and we're chasing the next compressibility
+  bound from `docs/INLINE_TBL_UPDATE.md`.
+
+Until any of those triggers, the JSON-as-bytes path is correct and the
+encoder cost outweighs the benefit.
+
 ### D4. `RewriteTablePathUtil` does not handle inline-ML tables
 
 `core/.../RewriteTablePathUtil.java:252,280` calls `ManifestLists.write()`
