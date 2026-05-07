@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.aws.s3;
 
+import org.apache.iceberg.io.InlineCompatAssertions;
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -26,10 +27,9 @@ import org.junit.jupiter.api.extension.ExtendWith;
  * S3 + CAS-only commit policy + inline TableMetadata (manifest lists still written as separate
  * snap-*.avro files). Companion to {@link TestS3CatalogCAS}, which is non-inlined.
  *
- * <p>Several upstream {@code CatalogTests} cases are skipped here because they assert on artefacts
- * that inline-TM intentionally doesn't write (metadata.json files on disk) or pass an
- * {@code inline://} URI through APIs that only accept disk metadata files. These will be
- * revisited; for now we keep the rest of the suite green so the inline path stays exercised.
+ * <p>The upstream {@code CatalogTests} cases that resolve {@code inline://} URIs as filesystem
+ * paths get inline-equivalent overrides delegating to {@link InlineCompatAssertions}; the
+ * register-from-disk round-trip stays disabled (errata T4).
  */
 @ExtendWith(TestS3Catalog.SuccessCleanupExtension.class)
 public class TestS3CatalogCASInlineTM extends TestS3CatalogCAS {
@@ -38,43 +38,17 @@ public class TestS3CatalogCASInlineTM extends TestS3CatalogCAS {
     return true;
   }
 
-  // assertPreviousMetadataFileCount inspects ops.current().previousFiles() -- a
-  // TableMetadata field, not a filesystem check. Inline TM populates this list
-  // with synthetic "inline://#<hash>" entries (one per prior catalog version),
-  // so the four testReplaceTransaction-family cases that only count previousFiles
-  // run cleanly here as long as InlineDeltaCodec's replay produces a non-null
-  // base.metadataFileLocation -- see commit 804465b. Re-enabled.
+  @Override
+  @Test
+  public void testMetadataFileLocationsRemovalAfterCommit() {
+    InlineCompatAssertions.runMetadataFileLocationsRemovalAfterCommit(
+        catalog(), TABLE, NS, SCHEMA, requiresNamespaceCreate());
+  }
 
-  // testMetadataFileLocationsRemovalAfterCommit calls
-  // ReachableFileUtil.metadataFileLocations and exercises
-  // METADATA_DELETE_AFTER_COMMIT_ENABLED bounded retention. For inline tables
-  // there are no on-disk metadata.json files to delete; the equivalent semantic
-  // -- bounding previousFiles by METADATA_PREVIOUS_VERSIONS_MAX -- is pure
-  // TableMetadata logic and already in upstream. Reachability resolution against
-  // synthetic inline:// URIs is the only mismatch; defer until we have an
-  // InlineCompat fork that swaps the assertion's accessor.
   @Override
   @Test
   @Disabled(
-      "ReachableFileUtil.metadataFileLocations resolves inline:// URIs as files; "
-          + "needs InlineCompat fork to assert against TableMetadata.previousFiles() instead")
-  public void testMetadataFileLocationsRemovalAfterCommit() {}
-
-  // ============================================================
-  // Disabled: testRegisterTable feeds a metadata location string back into
-  // catalog.registerTable(). Inline TM uses an inline:// pseudo-URI that
-  // BaseMetastoreCatalog.registerTable rejects with IllegalArgumentException
-  // ("not a valid metadata file"). Register-from-disk is incompatible with
-  // an inline-only catalog.
-  // ============================================================
-
-  @Override
-  @Test
-  @Disabled("registerTable expects an on-disk metadata.json; inline TM exposes inline:// only")
+      "drop+registerTable requires register-from-bytes API for inline TM; "
+          + "no equivalent on-disk metadata.json exists after drop. See errata T4.")
   public void testRegisterTable() {}
-
-  @Override
-  @Test
-  @Disabled("registerTable expects an on-disk metadata.json; inline TM exposes inline:// only")
-  public void testRegisterExistingTable() {}
 }

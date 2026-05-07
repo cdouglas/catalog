@@ -18,20 +18,15 @@
  */
 package org.apache.iceberg.aws.s3;
 
+import org.apache.iceberg.io.InlineCompatAssertions;
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 
 /**
  * S3 Express + append-mode commit policy + inline TableMetadata. Companion to
- * {@link TestS3CatalogCASInlineTM} (CAS-only commit policy), exercising the
- * native {@code WriteOffsetBytes} append path with inline-TM bytes.
- *
- * <p>Same {@code @Disabled} list as {@link TestS3CatalogCASInlineTM}: the
- * upstream {@code CatalogTests} cases that resolve {@code inline://} URIs as
- * filesystem paths or round-trip a metadata-location string back through
- * {@code catalog.registerTable} cannot pass against an inline catalog without
- * the {@code InlineCompatCatalogTests} fork (errata T4).
+ * {@link TestS3CatalogCASInlineTM} (CAS-only commit policy), exercising the native
+ * {@code WriteOffsetBytes} append path with inline-TM bytes.
  */
 @ExtendWith(TestS3Catalog.SuccessCleanupExtension.class)
 public class TestS3CatalogInlineTM extends TestS3Catalog {
@@ -42,18 +37,15 @@ public class TestS3CatalogInlineTM extends TestS3Catalog {
 
   @Override
   @Test
+  public void testMetadataFileLocationsRemovalAfterCommit() {
+    InlineCompatAssertions.runMetadataFileLocationsRemovalAfterCommit(
+        catalog(), TABLE, NS, SCHEMA, requiresNamespaceCreate());
+  }
+
+  @Override
+  @Test
   @Disabled(
-      "ReachableFileUtil.metadataFileLocations resolves inline:// URIs as files; "
-          + "needs InlineCompat fork to assert against TableMetadata.previousFiles() instead")
-  public void testMetadataFileLocationsRemovalAfterCommit() {}
-
-  @Override
-  @Test
-  @Disabled("registerTable expects an on-disk metadata.json; inline TM exposes inline:// only")
+      "drop+registerTable requires register-from-bytes API for inline TM; "
+          + "no equivalent on-disk metadata.json exists after drop. See errata T4.")
   public void testRegisterTable() {}
-
-  @Override
-  @Test
-  @Disabled("registerTable expects an on-disk metadata.json; inline TM exposes inline:// only")
-  public void testRegisterExistingTable() {}
 }

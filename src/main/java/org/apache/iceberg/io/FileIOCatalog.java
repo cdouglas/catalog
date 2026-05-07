@@ -439,6 +439,69 @@ public class FileIOCatalog extends BaseMetastoreCatalog
       return inlineEnabled;
     }
 
+    /**
+     * Wraps {@link BaseMetastoreTableOperations#commit} so the post-commit
+     * metadata-file cleanup step (driven by
+     * {@code TableProperties.METADATA_DELETE_AFTER_COMMIT_ENABLED}) skips
+     * {@code inline://} pseudo-URIs. Those entries appear in
+     * {@link TableMetadata#previousFiles} for inline TM tables but don't
+     * correspond to real storage objects; handing them to
+     * {@code FileIO.deleteFiles} surfaces as a {@code BulkDeletionFailure} on
+     * S3 / GCS / ADLS. We re-implement the upstream commit logic instead of
+     * post-filtering inside {@link CatalogUtil#deleteRemovedMetadataFiles}
+     * because the upstream method consumes {@link TableMetadata} directly.
+     */
+    @Override
+    public void commit(TableMetadata base, TableMetadata metadata) {
+      if (base != current()) {
+        if (base != null) {
+          throw new CommitFailedException("Cannot commit: stale table metadata");
+        } else {
+          throw new org.apache.iceberg.exceptions.AlreadyExistsException(
+              "Table already exists: %s", tableName());
+        }
+      }
+      if (base == metadata) {
+        return;
+      }
+      doCommit(base, metadata);
+      deleteRemovedRealMetadataFiles(base, metadata);
+      requestRefresh();
+    }
+
+    private void deleteRemovedRealMetadataFiles(TableMetadata base, TableMetadata metadata) {
+      if (base == null) {
+        return;
+      }
+      boolean deleteAfterCommit =
+          metadata.propertyAsBoolean(
+              org.apache.iceberg.TableProperties.METADATA_DELETE_AFTER_COMMIT_ENABLED,
+              org.apache.iceberg.TableProperties.METADATA_DELETE_AFTER_COMMIT_ENABLED_DEFAULT);
+      if (!deleteAfterCommit) {
+        return;
+      }
+      Set<TableMetadata.MetadataLogEntry> removed = new HashSet<>(base.previousFiles());
+      removed.removeAll(metadata.previousFiles());
+      // Drop inline:// pseudo-URIs -- they don't correspond to real files.
+      removed.removeIf(entry -> entry.file() != null && entry.file().startsWith("inline://"));
+      if (removed.isEmpty()) {
+        return;
+      }
+      Iterable<String> paths =
+          removed.stream().map(TableMetadata.MetadataLogEntry::file)::iterator;
+      if (io() instanceof org.apache.iceberg.io.SupportsBulkOperations) {
+        ((org.apache.iceberg.io.SupportsBulkOperations) io()).deleteFiles(paths);
+      } else {
+        for (String path : paths) {
+          try {
+            io().deleteFile(path);
+          } catch (RuntimeException e) {
+            LOG.warn("Delete failed for previous metadata file: {}", path, e);
+          }
+        }
+      }
+    }
+
     @Override
     public void doCommit(TableMetadata base, TableMetadata metadata) {
       final boolean isCreate = null == base;

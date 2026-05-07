@@ -83,37 +83,56 @@ and have CAS-mode subclasses (`ADLSCatalogTestCAS`,
 `*InlineML` variants yet. Adding them is mechanical once the inline-CAS
 matrix on S3/GCS proves the underlying behavior, which it now does.
 
-### T4. Inline-CatalogTests reachability tests need an InlineCompat fork
+### T4. Inline-CatalogTests reachability tests (mostly resolved)
 
-`testMetadataFileLocationsRemovalAfterCommit` calls
-`ReachableFileUtil.metadataFileLocations(table, false)` and asserts the
-result's size after `METADATA_DELETE_AFTER_COMMIT_ENABLED` retention
-kicks in. For inline tables there are no on-disk metadata.json files;
-the equivalent semantic (bounding `previousFiles()` by
-`METADATA_PREVIOUS_VERSIONS_MAX`) is already wired through
-`Builder.build()`'s `addPreviousFile`, but the assertion uses
-`ReachableFileUtil` which resolves the URIs as filesystem paths and
-treats synthetic `inline://` entries as missing files.
+Three upstream `CatalogTests` cases were originally `@Disabled` on the
+inline-TM matrix because they assert through accessors that don't
+translate cleanly to inline metadata:
 
-The user direction was: do not `@Disabled` such tests permanently —
-fork them into an intermediate abstract suite that asserts the
-inline-equivalent (e.g. `previousFiles().size()`) without ever cheating
-about data accessibility (snapshots and data files must remain reachable
-through the catalog file).
+* `testMetadataFileLocationsRemovalAfterCommit` calls
+  `ReachableFileUtil.metadataFileLocations(table, false)`, which adds
+  the URIs to a `Set<String>` and (with `recursive=false`) doesn't
+  actually resolve them as files. The non-test problem was upstream
+  `CatalogUtil.deleteRemovedMetadataFiles`, which forwards
+  `inline://` URIs to `FileIO.deleteFiles` after retention bounds
+  kick in — S3 / GCS / ADLS treat them as missing keys and surface a
+  `BulkDeletionFailure`.
+* `testRegisterTable` round-trips a metadata-location string through
+  `catalog.dropTable` then `catalog.registerTable`. After drop, the
+  inline metadata bytes are gone; without a register-from-bytes API,
+  the round-trip is fundamentally inexpressible.
+* `testRegisterExistingTable` round-trips the same metadata location
+  but expects an `AlreadyExistsException`. Upstream
+  `BaseMetastoreCatalog.registerTable` runs the `tableExists` check
+  *before* any I/O on the URI, so the test passes against the
+  inline:// pseudo-URI as-is.
 
-**State today:** disabled in `TestS3CatalogCASInlineTM` and
-`GCSCatalogTestInlineTM` with a narrowed message pointing at the
-InlineCompat fork. Same for `testRegisterTable` /
-`testRegisterExistingTable`, which round-trip a metadata-location
-string back through `catalog.registerTable()`; the inline equivalent
-needs a register-from-bytes API, not a string.
+**Resolved 2026-05-06:**
 
-**Fix path:** add an `InlineCompatCatalogTests` abstract subclass of
-`CatalogTests` in this project that overrides the affected test bodies
-to inspect catalog state instead of file URIs, and have the
-`*InlineTM` / `*InlineML` cloud subclasses extend it. Already in the
-session task list; deferred behind the inline determinism fixes that
-needed cloud-test feedback first.
+* `FileIOTableOperations.commit` overrides the upstream
+  `BaseMetastoreTableOperations.commit` to call a local
+  `deleteRemovedRealMetadataFiles` that filters `inline://` entries
+  out of the previousFiles diff before invoking
+  `FileIO.deleteFile(s)`. Real metadata files (pointer-mode
+  predecessors) still get cleaned up; inline pseudo-URIs are
+  no-ops. `BulkDeletionFailure` no longer fires.
+* `TestS3CatalogCASInlineTM` / `GCSCatalogTestInlineTM` carry an
+  inline-equivalent `testMetadataFileLocationsRemovalAfterCommit`
+  that asserts on `metadata.previousFiles().size()` directly (one
+  fewer than the upstream count, since the upstream assertion adds
+  `metadataFileLocation()` to the set). The semantic — bounded
+  history under `METADATA_PREVIOUS_VERSIONS_MAX` after enabling
+  `METADATA_DELETE_AFTER_COMMIT_ENABLED` — is preserved verbatim;
+  only the accessor changed. Confirmed passing on S3.
+* `testRegisterExistingTable` re-enabled (the `@Disabled` override
+  removed). The existence check fires before URI resolution, so the
+  inline:// path never gets touched.
+
+**Still disabled:** `testRegisterTable` only. The drop +
+registerTable round-trip requires a register-from-bytes API on
+`FileIOCatalog` — no equivalent exists today. Disabled with the gap
+documented inline; revisit if a real workload needs catalog
+re-registration of a previously-dropped inline table.
 
 ### T3. Cloud integration tests require manual emulator setup
 

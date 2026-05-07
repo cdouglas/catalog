@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.gcp.gcs;
 
+import org.apache.iceberg.io.InlineCompatAssertions;
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -25,11 +26,6 @@ import org.junit.jupiter.api.extension.ExtendWith;
 /**
  * GCS + CAS (forced by {@code GCSFileIO.supportsAppend()=false}) + inline TableMetadata. Manifest
  * lists still written as separate snap-*.avro files.
- *
- * <p>Same disable-list as {@link
- * org.apache.iceberg.aws.s3.TestS3CatalogCASInlineTM}: the upstream {@code CatalogTests} cases
- * that count metadata.json files on disk or feed metadata locations through register APIs cannot
- * pass against an inline catalog.
  */
 @ExtendWith(GCSCatalogTest.SuccessCleanupExtension.class)
 public class GCSCatalogTestInlineTM extends GCSCatalogTest {
@@ -38,33 +34,17 @@ public class GCSCatalogTestInlineTM extends GCSCatalogTest {
     return true;
   }
 
-  // assertPreviousMetadataFileCount inspects ops.current().previousFiles() -- a
-  // TableMetadata field, not a filesystem check. Inline TM populates this with
-  // synthetic "inline://#<hash>" entries (one per prior catalog version), so the
-  // four testReplaceTransaction-family cases run cleanly here as long as
-  // InlineDeltaCodec's replay produces a non-null base.metadataFileLocation --
-  // see commit 804465b. Re-enabled.
+  @Override
+  @Test
+  public void testMetadataFileLocationsRemovalAfterCommit() {
+    InlineCompatAssertions.runMetadataFileLocationsRemovalAfterCommit(
+        catalog(), TABLE, NS, SCHEMA, requiresNamespaceCreate());
+  }
 
-  // testMetadataFileLocationsRemovalAfterCommit calls
-  // ReachableFileUtil.metadataFileLocations and exercises bounded retention.
-  // For inline tables there are no on-disk metadata.json files; the equivalent
-  // semantic (METADATA_PREVIOUS_VERSIONS_MAX bounding previousFiles) is upstream
-  // logic. Reachability resolution against synthetic inline:// URIs is the only
-  // mismatch; defer until the InlineCompat fork swaps the assertion's accessor.
   @Override
   @Test
   @Disabled(
-      "ReachableFileUtil.metadataFileLocations resolves inline:// URIs as files; "
-          + "needs InlineCompat fork to assert against TableMetadata.previousFiles() instead")
-  public void testMetadataFileLocationsRemovalAfterCommit() {}
-
-  @Override
-  @Test
-  @Disabled("registerTable expects an on-disk metadata.json; inline TM exposes inline:// only")
+      "drop+registerTable requires register-from-bytes API for inline TM; "
+          + "no equivalent on-disk metadata.json exists after drop. See errata T4.")
   public void testRegisterTable() {}
-
-  @Override
-  @Test
-  @Disabled("registerTable expects an on-disk metadata.json; inline TM exposes inline:// only")
-  public void testRegisterExistingTable() {}
 }

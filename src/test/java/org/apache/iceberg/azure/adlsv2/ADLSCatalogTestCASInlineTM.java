@@ -18,13 +18,14 @@
  */
 package org.apache.iceberg.azure.adlsv2;
 
+import org.apache.iceberg.io.InlineCompatAssertions;
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 
 /**
- * ADLS + CAS-only commit policy + inline TableMetadata. Companion to
- * {@link ADLSCatalogTestCAS}, with {@code inlineTM=true}.
+ * ADLS + CAS-only commit policy + inline TableMetadata. Companion to {@link ADLSCatalogTestCAS},
+ * with {@code inlineTM=true}.
  */
 @ExtendWith(ADLSCatalogTest.SuccessCleanupExtension.class)
 public class ADLSCatalogTestCASInlineTM extends ADLSCatalogTestCAS {
@@ -35,18 +36,15 @@ public class ADLSCatalogTestCASInlineTM extends ADLSCatalogTestCAS {
 
   @Override
   @Test
+  public void testMetadataFileLocationsRemovalAfterCommit() {
+    InlineCompatAssertions.runMetadataFileLocationsRemovalAfterCommit(
+        catalog(), TABLE, NS, SCHEMA, requiresNamespaceCreate());
+  }
+
+  @Override
+  @Test
   @Disabled(
-      "ReachableFileUtil.metadataFileLocations resolves inline:// URIs as files; "
-          + "needs InlineCompat fork to assert against TableMetadata.previousFiles() instead")
-  public void testMetadataFileLocationsRemovalAfterCommit() {}
-
-  @Override
-  @Test
-  @Disabled("registerTable expects an on-disk metadata.json; inline TM exposes inline:// only")
+      "drop+registerTable requires register-from-bytes API for inline TM; "
+          + "no equivalent on-disk metadata.json exists after drop. See errata T4.")
   public void testRegisterTable() {}
-
-  @Override
-  @Test
-  @Disabled("registerTable expects an on-disk metadata.json; inline TM exposes inline:// only")
-  public void testRegisterExistingTable() {}
 }
