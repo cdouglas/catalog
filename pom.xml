@@ -102,6 +102,21 @@
       <version>${mockito.version}</version>
       <scope>test</scope>
     </dependency>
+
+    <!-- JMH for committed-transaction-set encoding benchmarks (see
+         src/test/java/org/apache/iceberg/io/bench/CommittedTxnsBench.java). -->
+    <dependency>
+      <groupId>org.openjdk.jmh</groupId>
+      <artifactId>jmh-core</artifactId>
+      <version>1.37</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.openjdk.jmh</groupId>
+      <artifactId>jmh-generator-annprocess</artifactId>
+      <version>1.37</version>
+      <scope>test</scope>
+    </dependency>
     <dependency>
       <groupId>org.apache.iceberg</groupId>
       <artifactId>iceberg-core</artifactId>
@@ -238,6 +253,14 @@
           </excludes>
         </configuration>
       </plugin>
+      <!-- exec:java target for the JMH benchmark runner. Invoke:
+           mvn test-compile exec:java -Dexec.mainClass=org.apache.iceberg.io.bench.CommittedTxnsBench -Dexec.classpathScope=test -->
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.1.1</version>
+      </plugin>
+
       <!-- Integration tests (S3, GCS, ADLS): mvn verify -Pintegration -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
