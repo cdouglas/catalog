@@ -131,7 +131,7 @@ public class TestProtoActions {
   // ============================================================
 
   static ProtoCodec.Transaction txn(ProtoCodec.Action... actions) {
-    return new ProtoCodec.Transaction(UUID.randomUUID(), List.of(actions));
+    return new ProtoCodec.Transaction(UuidV7.newUuidV7(), List.of(actions));
   }
 
   static ProtoCodec.Transaction txn(UUID id, ProtoCodec.Action... actions) {
@@ -934,7 +934,7 @@ public class TestProtoActions {
     @Test
     void duplicateTransactionIdIsIdempotent() {
       byte[] file = catalog().build();
-      UUID sharedId = UUID.randomUUID();
+      UUID sharedId = UuidV7.newUuidV7();
 
       ProtoCodec.Transaction t = txn(sharedId, createNs(1, 0, "db", 1, -1));
       // Same ID appended twice
@@ -946,7 +946,7 @@ public class TestProtoActions {
 
     @Test
     void committedTransactionInCheckpointIsSkipped() {
-      UUID priorTxnId = UUID.randomUUID();
+      UUID priorTxnId = UuidV7.newUuidV7();
       byte[] file = catalog()
           .ns(1, 0, "db", 1)
           .committed(priorTxnId)
@@ -1110,7 +1110,7 @@ public class TestProtoActions {
     @Test
     void emptyTransactionApplies() {
       byte[] file = catalog().ns(1, 0, "db", 1).build();
-      ProtoCodec.Transaction t = new ProtoCodec.Transaction(UUID.randomUUID(), List.of());
+      ProtoCodec.Transaction t = new ProtoCodec.Transaction(UuidV7.newUuidV7(), List.of());
       ProtoCatalogFile result = apply(file, t);
 
       // No-op transaction should still be recorded
@@ -1278,7 +1278,7 @@ public class TestProtoActions {
       ProtoCodec.CreateTableInlineAction action =
           createTblInline(1, 1, "tbl", 1, 1, SAMPLE_INLINE_METADATA);
       ProtoCodec.Transaction txn = new ProtoCodec.Transaction(
-          UUID.randomUUID(), List.of(action));
+          UuidV7.newUuidV7(), List.of(action));
 
       byte[] encoded = ProtoCodec.encodeTransaction(txn);
       ProtoCodec.Transaction decoded = ProtoCodec.decodeTransaction(encoded);
@@ -2095,7 +2095,7 @@ public class TestProtoActions {
       // set dedups replays where the UUID has already been seen. Both lines
       // of defense must hold (invariant I2).
       byte[] file = catalog().build();
-      UUID sharedId = UUID.randomUUID();
+      UUID sharedId = UuidV7.newUuidV7();
       ProtoCodec.Transaction t = txn(sharedId, createNs(1, 0, "db", 1, -1));
       ProtoCatalogFile result = apply(file, t, t);
       assertThat(result.containsNamespace(Namespace.of("db"))).isTrue();
@@ -2447,7 +2447,7 @@ public class TestProtoActions {
     ProtoCatalogFile generateRandom(long seed) {
       Random rand = new Random(seed);
       ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(LOCATION);
-      builder.setCatalogUuid(new UUID(rand.nextLong(), rand.nextLong()));
+      builder.setCatalogUuid(UuidV7.newUuidV7(rand.nextLong() & 0xFFFFFFFFFFFFL, rand));
 
       int nextNsid = rand.nextInt(20) + 10;
       int nextTblid = rand.nextInt(100) + 10;
@@ -2495,7 +2495,7 @@ public class TestProtoActions {
       }
 
       Set<UUID> txns = IntStream.range(0, rand.nextInt(20) + 5)
-          .mapToObj(i -> new UUID(rand.nextLong(), rand.nextLong()))
+          .mapToObj(i -> UuidV7.newUuidV7(rand.nextLong() & 0xFFFFFFFFFFFFL, rand))
           .collect(Collectors.toSet());
       for (UUID txnId : txns) {
         builder.addCommittedTransaction(txnId);

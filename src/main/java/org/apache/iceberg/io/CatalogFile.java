@@ -40,10 +40,9 @@ public abstract class CatalogFile {
   private final UUID uuid;
   private final InputFile location;
 
-  /** Constructor for empty CatalogFile instances. Assigns a random UUID. */
+  /** Constructor for empty CatalogFile instances. Assigns a fresh UUIDv7. */
   CatalogFile(InputFile location) {
-    // consistent iteration order; UUIDv7
-    this(UUID.randomUUID(), location);
+    this(UuidV7.newUuidV7(), location);
   }
 
   /** Construct a CatalogFile instance from an existing Catalog. */

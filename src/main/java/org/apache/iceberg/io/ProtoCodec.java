@@ -1543,7 +1543,7 @@ public class ProtoCodec {
     public static Transaction from(
         CatalogFile.Mut<ProtoCatalogFile, ?> mut,
         ProtoCatalogFormat.ProtoIdManager idManager) {
-      UUID txnId = UUID.randomUUID();
+      UUID txnId = UuidV7.newUuidV7();
       List<Action> actions = new ArrayList<>();
 
       // Build actions from mutations accumulated in mut
@@ -1564,9 +1564,17 @@ public class ProtoCodec {
     }
 
     /**
-     * Verifies that all actions in this transaction can be applied.
+     * Verifies that all actions in this transaction can be applied. A
+     * non-UUIDv7 transaction id fails verification: the dedup set only
+     * tolerates v7 ids (the encoder partitions on this), so accepting a
+     * non-v7 record from the log would put a value in the committed-set
+     * that the next checkpoint can't represent. Skip silently — same
+     * read-time behavior as any other rejected transaction.
      */
     public boolean verify(ProtoCatalogFile.Builder builder) {
+      if (!UuidV7.isV7(id)) {
+        return false;
+      }
       for (Action action : actions) {
         if (!action.verify(builder)) {
           return false;

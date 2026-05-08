@@ -29,6 +29,7 @@ import java.util.UUID;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
@@ -418,7 +419,7 @@ public class ProtoCatalogFile extends CatalogFile {
 
     Builder(InputFile location) {
       this.location = location;
-      this.catalogUuid = UUID.randomUUID();
+      this.catalogUuid = UuidV7.newUuidV7();
     }
 
     public Builder setCatalogUuid(UUID uuid) {
@@ -690,6 +691,8 @@ public class ProtoCatalogFile extends CatalogFile {
     }
 
     public Builder addCommittedTransaction(UUID txnId) {
+      Preconditions.checkArgument(UuidV7.isV7(txnId),
+          "Committed transaction IDs must be UUIDv7; got %s", txnId);
       committedTransactions.add(txnId);
       return this;
     }

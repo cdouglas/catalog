@@ -73,7 +73,7 @@ public class TestProtoCatalogFormat {
     builder.addNamespace(2, 1, "schema", 1);
     builder.addTable(1, 2, "test_table", 1, "s3://bucket/table/metadata.json");
     builder.setNamespaceProperty(1, "owner", "alice");
-    builder.addCommittedTransaction(UUID.randomUUID());
+    builder.addCommittedTransaction(UuidV7.newUuidV7());
 
     ProtoCatalogFile original = builder.build();
 
@@ -111,7 +111,7 @@ public class TestProtoCatalogFormat {
         new ProtoCodec.CreateTableAction(1, 1, 1, -1, "mytable", "s3://bucket/metadata.json")
     );
 
-    UUID txnId = UUID.randomUUID();
+    UUID txnId = UuidV7.newUuidV7();
     ProtoCodec.Transaction txn = new ProtoCodec.Transaction(txnId, actions);
 
     // Encode
@@ -128,7 +128,7 @@ public class TestProtoCatalogFormat {
 
   @Test
   public void testRenameTableActionEncodeDecode() {
-    UUID txnId = UUID.randomUUID();
+    UUID txnId = UuidV7.newUuidV7();
     ProtoCodec.Transaction txn = new ProtoCodec.Transaction(
         txnId, List.of(
             new ProtoCodec.RenameTableAction(7, 3, 4, 9, "renamed_tbl")));
@@ -157,7 +157,7 @@ public class TestProtoCatalogFormat {
         new ProtoCodec.CreateTableAction(1, 1, 1, -1, "mytable", "s3://bucket/metadata.json")
     );
 
-    ProtoCodec.Transaction txn = new ProtoCodec.Transaction(UUID.randomUUID(), actions);
+    ProtoCodec.Transaction txn = new ProtoCodec.Transaction(UuidV7.newUuidV7(), actions);
 
     // Verify should pass on empty catalog
     assertThat(txn.verify(builder)).isTrue();
@@ -208,7 +208,7 @@ public class TestProtoCatalogFormat {
     List<ProtoCodec.Action> actions = List.of(
         new ProtoCodec.CreateNamespaceAction(1, 1, 0, -1, "testns")
     );
-    ProtoCodec.Transaction txn = new ProtoCodec.Transaction(UUID.randomUUID(), actions);
+    ProtoCodec.Transaction txn = new ProtoCodec.Transaction(UuidV7.newUuidV7(), actions);
     byte[] txnBytes = ProtoCodec.encodeTransaction(txn);
     writeVarint(out, txnBytes.length);
     out.write(txnBytes);
@@ -270,7 +270,7 @@ public class TestProtoCatalogFormat {
         new ProtoCodec.CreateNamespaceAction(2, 1, 1, -1, "yaks"),
         new ProtoCodec.CreateTableAction(1, 1, 2, -1, "tblY", "yak://chinchilla/tblY")
     );
-    ProtoCodec.Transaction txnA = new ProtoCodec.Transaction(UUID.randomUUID(), actionsA);
+    ProtoCodec.Transaction txnA = new ProtoCodec.Transaction(UuidV7.newUuidV7(), actionsA);
     byte[] txnABytes = toTransactionRecord(txnA);
 
     // Append transaction to the file
@@ -305,13 +305,13 @@ public class TestProtoCatalogFormat {
     List<ProtoCodec.Action> actionsA = List.of(
         new ProtoCodec.UpdateTableLocationAction(1, 1, "yak://chinchilla/tblY2")
     );
-    ProtoCodec.Transaction txnA = new ProtoCodec.Transaction(UUID.randomUUID(), actionsA);
+    ProtoCodec.Transaction txnA = new ProtoCodec.Transaction(UuidV7.newUuidV7(), actionsA);
 
     // txnB: create tblD in dingos - should succeed
     List<ProtoCodec.Action> actionsB = List.of(
         new ProtoCodec.CreateTableAction(2, 1, 1, 1, "tblD", "yak://chinchilla/tblD")
     );
-    ProtoCodec.Transaction txnB = new ProtoCodec.Transaction(UUID.randomUUID(), actionsB);
+    ProtoCodec.Transaction txnB = new ProtoCodec.Transaction(UuidV7.newUuidV7(), actionsB);
 
     // txnC: also tries to update tblY from version 1 - should FAIL
     // because txnA already updated it to version 2
@@ -319,7 +319,7 @@ public class TestProtoCatalogFormat {
         new ProtoCodec.CreateNamespaceAction(3, 1, 0, -1, "yaks"),
         new ProtoCodec.UpdateTableLocationAction(1, 1, "yak://chinchilla/tblY3")
     );
-    ProtoCodec.Transaction txnC = new ProtoCodec.Transaction(UUID.randomUUID(), actionsC);
+    ProtoCodec.Transaction txnC = new ProtoCodec.Transaction(UuidV7.newUuidV7(), actionsC);
 
     // Combine all transactions
     byte[] allTxns = appendBytes(
@@ -356,7 +356,7 @@ public class TestProtoCatalogFormat {
     List<ProtoCodec.Action> actionsA = List.of(
         new ProtoCodec.CreateNamespaceAction(1, 1, 0, -1, "dingos")
     );
-    ProtoCodec.Transaction txnA = new ProtoCodec.Transaction(UUID.randomUUID(), actionsA);
+    ProtoCodec.Transaction txnA = new ProtoCodec.Transaction(UuidV7.newUuidV7(), actionsA);
     byte[] txnARecord = toTransactionRecord(txnA);
 
     // Duplicate the same transaction (simulating retry)
@@ -393,13 +393,13 @@ public class TestProtoCatalogFormat {
     List<ProtoCodec.Action> actionsA = List.of(
         new ProtoCodec.UpdateTableLocationAction(1, 1, "yak://updated1")
     );
-    ProtoCodec.Transaction txnA = new ProtoCodec.Transaction(UUID.randomUUID(), actionsA);
+    ProtoCodec.Transaction txnA = new ProtoCodec.Transaction(UuidV7.newUuidV7(), actionsA);
 
     // txnB: also tries to update from version 1 - should fail
     List<ProtoCodec.Action> actionsB = List.of(
         new ProtoCodec.UpdateTableLocationAction(1, 1, "yak://updated2")
     );
-    ProtoCodec.Transaction txnB = new ProtoCodec.Transaction(UUID.randomUUID(), actionsB);
+    ProtoCodec.Transaction txnB = new ProtoCodec.Transaction(UuidV7.newUuidV7(), actionsB);
 
     byte[] combined = appendBytes(origBytes,
         toTransactionRecord(txnA),
@@ -433,14 +433,14 @@ public class TestProtoCatalogFormat {
     List<ProtoCodec.Action> actionsA = List.of(
         new ProtoCodec.UpdateTableLocationAction(1, 1, "s3://updated")
     );
-    ProtoCodec.Transaction txnA = new ProtoCodec.Transaction(UUID.randomUUID(), actionsA);
+    ProtoCodec.Transaction txnA = new ProtoCodec.Transaction(UuidV7.newUuidV7(), actionsA);
 
     // txnB: read table at version 1 - should fail because txnA updated it
     List<ProtoCodec.Action> actionsB = List.of(
         new ProtoCodec.ReadTableAction(1, 1),
         new ProtoCodec.CreateNamespaceAction(2, 1, 0, -1, "newns")
     );
-    ProtoCodec.Transaction txnB = new ProtoCodec.Transaction(UUID.randomUUID(), actionsB);
+    ProtoCodec.Transaction txnB = new ProtoCodec.Transaction(UuidV7.newUuidV7(), actionsB);
 
     byte[] combined = appendBytes(origBytes,
         toTransactionRecord(txnA),
@@ -473,8 +473,8 @@ public class TestProtoCatalogFormat {
     builder.addTable(2, 4, "table2", 2, "s3://bucket/t2");
     builder.setNamespaceProperty(1, "owner", "alice");
     builder.setNamespaceProperty(2, "comment", "test schema");
-    builder.addCommittedTransaction(UUID.randomUUID());
-    builder.addCommittedTransaction(UUID.randomUUID());
+    builder.addCommittedTransaction(UuidV7.newUuidV7());
+    builder.addCommittedTransaction(UuidV7.newUuidV7());
 
     ProtoCatalogFile original = builder.build();
 
@@ -548,9 +548,10 @@ public class TestProtoCatalogFormat {
       }
     }
 
-    // Random committed transactions
+    // Random committed transactions (must be UUIDv7 — Builder.addCommittedTransaction
+    // asserts version+variant bits).
     Set<UUID> committedTxns = IntStream.range(0, rand.nextInt(20) + 5)
-        .mapToObj(i -> new UUID(rand.nextLong(), rand.nextLong()))
+        .mapToObj(i -> UuidV7.newUuidV7(rand.nextLong() & 0xFFFFFFFFFFFFL, rand))
         .collect(Collectors.toSet());
     for (UUID txnId : committedTxns) {
       builder.addCommittedTransaction(txnId);
