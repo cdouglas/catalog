@@ -123,6 +123,135 @@ skipped at read-time replay (`Transaction.verify` returns false). See
 [UUID_V7_BENCH_RESULTS.md](UUID_V7_BENCH_RESULTS.md) for the encoding
 study that informed this choice.
 
+#### Committed-set retention (GC)
+
+> **Status:** designed; implementation tracked in errata D11.
+
+The dedup set in `Checkpoint.committed_transactions` grows monotonically
+across compactions. Without a retention policy, even with v7 compression
+the section's size scales linearly with the catalog's total commit
+history. The retention policy below trims old entries at compaction
+time while preserving the dedup guarantee inside a configurable window.
+
+**Premise: UUIDv7 timestamps approximate commit time.** Transaction IDs
+are minted in `ProtoCodec.Transaction.from()` (called from `Mut.commit`)
+using `UuidV7.newUuidV7()`, which embeds `System.currentTimeMillis()`
+in the high 48 bits. Because the mint happens at commit-submission
+time — not at transaction-begin time — a long-running transaction
+does not get a stale timestamp; a transaction that ran for a week and
+then commits has a UUID timestamp from the moment of commit, not from
+a week prior. Retention can therefore be expressed in wall-clock terms
+without disadvantaging slow workloads.
+
+**Wire format addition.** The `CommittedTransactions` message gains a
+new field:
+
+```protobuf
+message CommittedTransactions {
+  fixed64 max_timestamp_ms              = 1;
+  bytes   packed_entries                = 2;
+  // Highest UUIDv7 timestamp that was dropped during the most recent
+  // compaction. Implicitly 0 (no GC has occurred yet) when absent.
+  // Monotonically non-decreasing across compactions.
+  fixed64 highest_dropped_timestamp_ms  = 3;
+}
+```
+
+**GC algorithm at compaction.** At every compaction (any CAS-mode
+commit, including the always-CAS path when `maxAppendCount=0`):
+
+```
+function compactCheckpoint(oldCheckpoint, logTxns, retentionMs):
+    nowMs        = System.currentTimeMillis()
+    watermarkMs  = nowMs - retentionMs
+
+    // 1. Inherited committed-set: keep only entries above the watermark.
+    keptInherited = []
+    droppedHighest = oldCheckpoint.highest_dropped_timestamp_ms
+    for entry in decode(oldCheckpoint.packed_entries):
+        if uuidv7_timestamp(entry) > watermarkMs:
+            keptInherited.append(entry)
+        else:
+            droppedHighest = max(droppedHighest, uuidv7_timestamp(entry))
+
+    // 2. Log transactions are NEVER dropped — they all become part of
+    //    the new compacted checkpoint, regardless of timestamp. A log
+    //    entry whose UUIDv7 timestamp is older than the watermark
+    //    (clock skew, late retry, etc.) survives this compaction; it
+    //    only becomes eligible for GC at the *next* compaction.
+    newCommitted = mergeSortDescending(keptInherited, logTxns.map(txn => txn.id))
+
+    return CommittedTransactions(
+        max_timestamp_ms             = newCommitted[0].timestamp or 0,
+        packed_entries               = encode(newCommitted),
+        highest_dropped_timestamp_ms = droppedHighest)
+```
+
+The merge step preserves the streaming-friendly property: both
+`keptInherited` and `logTxns` are already sorted descending by
+UUID, so a single linear merge produces the new packed_entries body
+without random-access materialization. (See errata D10 for the
+single-pass rewrite that fuses decode + filter + merge into one walk.)
+
+**Edge case: highest dropped can exceed max retained.** It is possible
+(though rare) for `highest_dropped_timestamp_ms` to be *more recent*
+than `max_timestamp_ms` of the same checkpoint. This happens when the
+inherited committed-set had its newest entries below the watermark
+(all dropped) and the log contributed only entries whose timestamps
+are even older — typically a clock-skewed writer or a heavily-retried
+old commit. The two timestamps must be tracked independently.
+
+**Query semantics: tri-state.** With GC in place, `containsTransaction`
+is no longer a clean boolean. A query for UUID `q` against
+`CommittedTransactions(packed_entries=P, highest_dropped=H)` resolves
+to one of:
+
+| Outcome | Condition | Meaning |
+|---|---|---|
+| `COMMITTED` | `q ∈ P` | the transaction landed |
+| `ABSENT` | `q ∉ P` and `timestamp(q) > H` | the transaction was never committed |
+| `UNKNOWN` | `q ∉ P` and `timestamp(q) <= H` | may have been GC'd; cannot distinguish from never-committed |
+
+For the dedup-replay path (`readInternal`'s idempotency check), the
+querying transaction was just appended within the current append
+window, so its timestamp is always above any reasonable watermark and
+the result is always definitive. The tri-state distinction matters for
+the writer-confirmation use case: a writer that comes back to confirm
+its own commit after the retention window must be prepared to receive
+`UNKNOWN` and decide its own policy (assume committed, retry, escalate).
+
+The recommended public API:
+
+- `boolean containsTransaction(UUID)` — `true` iff `COMMITTED`. Existing
+  callers (replay) continue to use this.
+- `TxnDedupStatus dedupStatus(UUID)` — returns `COMMITTED` / `ABSENT`
+  / `UNKNOWN`. New API for writers that care about the GC ambiguity.
+- `long highestDroppedTimestampMs()` — exposed for callers building
+  bespoke logic.
+
+**Configuration knob.**
+
+| Property | Default | Purpose |
+|---|---|---|
+| `fileio.catalog.committed.retention.ms` | `21_600_000` (6h) | Minimum age before a committed-txn UUID becomes eligible for GC. Should comfortably exceed the longest plausible retry window for a writer learning its outcome. Setting to `Long.MAX_VALUE` disables GC. Setting to `0` would GC aggressively but is not recommended — would routinely produce `UNKNOWN` for any post-CAS query. |
+
+A 6-hour default is pessimistic by design: it bounds the `CommittedTransactions`
+section size to `retention × commit-rate` even for CAS-only catalogs
+that compact on every commit, while leaving a generous window for
+writers to confirm. For a 1-commit/sec workload with 6h retention the
+section caps at ~21,600 entries (~250 KB compressed); for 100/sec it
+caps at ~2.16M entries (~25 MB compressed) — still bounded, predictable,
+and recoverable from the writer side via the `UNKNOWN` signal.
+
+**Clock-skew note.** Watermark comparisons use the compactor's local
+clock against UUIDv7 timestamps minted by other writers. Wall-clock
+skew between writers translates directly into GC-window jitter: a
+writer with a clock 10 minutes behind has its UUID timestamps appear
+10 minutes "older," shrinking its effective retention by 10 minutes.
+Keep writer clocks NTP-synced. This is a deployment requirement, not a
+correctness invariant — a wildly skewed clock can cause spurious
+`UNKNOWN` results but cannot violate idempotency for in-window writers.
+
 ### Catalog Entities
 
 ```protobuf
