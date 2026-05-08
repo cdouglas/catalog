@@ -10,6 +10,9 @@ For inline-table extensions, see:
 - [SPEC_ML.md](SPEC_ML.md) — inline manifest lists (fields 7–8 of
   `InlineTable`, `AddManifestDelta` / `RemoveManifestDelta` updates).
 
+For an interactive byte-level walkthrough of these structures, open
+[format-explorer/index.html](format-explorer/index.html) in a browser.
+
 ## Overview
 
 A catalog file is a single object stored in cloud storage. It encodes the full

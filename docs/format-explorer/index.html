@@ -1,0 +1,1794 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>ProtoCatalogFormat Explorer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    /* ============================================================
+       Color palette: Okabe-Ito (colorblind-safe) used as background
+       tints so the hex glyphs and tree text stay readable.
+       ============================================================ */
+    :root {
+      --c-magic:    #E69F00;
+      --c-version:  #F2BE5C;
+      --c-frame:    #56B4E9;
+      --c-tag:      #0072B2;
+      --c-len:      #009E73;
+      --c-scalar:   #F0E442;
+      --c-string:   #FFEFA8;
+      --c-bytes:    #FFD27A;
+      --c-msg-1:    #f4f4f6;
+      --c-msg-2:    #e9eaef;
+      --c-msg-3:    #dee0e8;
+      --c-msg-4:    #d3d6e1;
+      --c-oneof:    #CC79A7;
+      --c-quirk:    #d62728;
+      --c-bg:       #fafbfc;
+      --c-fg:       #1c1f26;
+      --c-muted:    #5b6271;
+      --c-border:   #d0d4dc;
+      --c-select:   #fffbd6;
+      --c-select-edge: #c39600;
+      --c-hover:    #fff7e1;
+      --c-code-bg:  #ffffff;
+    }
+    html, body {
+      height: 100%;
+      margin: 0;
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      color: var(--c-fg);
+      background: var(--c-bg);
+    }
+    header {
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--c-border);
+      display: flex;
+      gap: 16px;
+      align-items: center;
+      background: #fff;
+    }
+    header h1 {
+      font-size: 15px;
+      font-weight: 600;
+      margin: 0;
+      letter-spacing: 0.2px;
+    }
+    header .scenario-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex: 1;
+    }
+    header select { font: inherit; padding: 4px 8px; }
+    header .actions { display: flex; gap: 6px; }
+    header button {
+      font: inherit;
+      padding: 4px 10px;
+      border: 1px solid var(--c-border);
+      background: #fff;
+      cursor: pointer;
+      border-radius: 3px;
+    }
+    header button:hover { background: var(--c-hover); }
+    header button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .scenario-desc {
+      padding: 8px 16px;
+      background: #f4f7fb;
+      border-bottom: 1px solid var(--c-border);
+      color: var(--c-muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    main {
+      display: grid;
+      grid-template-columns: minmax(380px, 1fr) minmax(420px, 1fr) minmax(360px, 1fr);
+      gap: 0;
+      height: calc(100vh - 90px);
+      min-height: 0;
+    }
+    main > section {
+      overflow: auto;
+      border-right: 1px solid var(--c-border);
+      padding: 12px 14px;
+      min-width: 0;
+    }
+    main > section:last-child { border-right: none; }
+    section h2 {
+      margin: 0 0 8px;
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--c-muted);
+    }
+
+    /* ============================================================
+       Hex pane
+       ============================================================ */
+    #hex {
+      font: 12.5px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      white-space: pre;
+      background: var(--c-code-bg);
+      border: 1px solid var(--c-border);
+      padding: 10px 12px;
+      border-radius: 4px;
+    }
+    #hex .row { display: block; }
+    #hex .row .off {
+      color: var(--c-muted);
+      margin-right: 12px;
+      user-select: none;
+    }
+    #hex .b {
+      padding: 1px 1.5px;
+      cursor: pointer;
+      border-radius: 2px;
+      transition: background-color 0.05s ease;
+    }
+    #hex .b:hover { outline: 1px solid var(--c-select-edge); }
+    #hex .ascii {
+      color: #5b6271;
+      margin-left: 12px;
+      letter-spacing: 0;
+    }
+    /* Layer tinting via the byte's `data-kind` */
+    #hex .b[data-kind="magic"]      { background: var(--c-magic);   }
+    #hex .b[data-kind="version"]    { background: var(--c-version); }
+    #hex .b[data-kind="frame"]      { background: var(--c-frame);   }
+    #hex .b[data-kind="tag"]        { background: var(--c-tag); color: #fff; }
+    #hex .b[data-kind="len"]        { background: var(--c-len);     }
+    #hex .b[data-kind="varint"]     { background: var(--c-scalar);  }
+    #hex .b[data-kind="fixed64"]    { background: var(--c-scalar);  }
+    #hex .b[data-kind="fixed32"]    { background: var(--c-scalar);  }
+    #hex .b[data-kind="bool"]       { background: var(--c-scalar);  }
+    #hex .b[data-kind="string"]     { background: var(--c-string);  }
+    #hex .b[data-kind="bytes"]      { background: var(--c-bytes);   }
+    #hex .b[data-kind="zero-pad"]   { background: #fafafa;          }
+    #hex .b[data-quirk="1"]        { text-decoration: underline dashed var(--c-quirk); text-underline-offset: 2px; }
+    #hex .b.sel { outline: 2px solid var(--c-select-edge); background: var(--c-select) !important; }
+    #hex .b.ancestor { box-shadow: inset 0 -2px 0 var(--c-select-edge); }
+    /* Hover preview from the tree pane: dashed outline, no fill change. */
+    #hex .b.hover-preview { outline: 1px dashed #1f6db5; }
+
+    /* ============================================================
+       Tree pane
+       ============================================================ */
+    #tree { font-size: 13px; }
+    #tree details { margin: 0; }
+    #tree details > summary {
+      cursor: pointer;
+      padding: 2px 6px;
+      border-radius: 3px;
+      list-style-position: inside;
+      user-select: none;
+    }
+    #tree details > summary:hover { background: var(--c-hover); }
+    #tree details > summary.sel,
+    #tree .leaf > summary.sel { background: var(--c-select); outline: 1px solid var(--c-select-edge); }
+    /* Ancestor: the path from root to the selected node, faintly tinted. */
+    #tree details > summary.ancestor,
+    #tree .leaf > summary.ancestor { box-shadow: inset 2px 0 0 var(--c-select-edge); }
+    /* Hover preview from the hex pane: dashed outline. */
+    #tree details > summary.hover-preview,
+    #tree .leaf > summary.hover-preview { outline: 1px dashed #1f6db5; }
+    #tree .pill {
+      display: inline-block;
+      font-size: 10.5px;
+      font-weight: 600;
+      letter-spacing: 0.4px;
+      text-transform: uppercase;
+      padding: 1px 5px;
+      border-radius: 3px;
+      margin-right: 6px;
+      vertical-align: 1px;
+    }
+    #tree .pill.t-magic    { background: var(--c-magic); }
+    #tree .pill.t-version  { background: var(--c-version); }
+    #tree .pill.t-frame    { background: var(--c-frame); }
+    #tree .pill.t-msg      { background: #cfd2da; }
+    #tree .pill.t-tag      { background: var(--c-tag); color: #fff; }
+    #tree .pill.t-scalar   { background: var(--c-scalar); }
+    #tree .pill.t-string   { background: var(--c-string); }
+    #tree .pill.t-bytes    { background: var(--c-bytes); }
+    #tree .pill.t-len      { background: var(--c-len); }
+    #tree .pill.t-quirk    { background: var(--c-quirk); color: #fff; }
+    #tree .pill.t-oneof    { background: var(--c-oneof); color: #fff; }
+    #tree .name { font-weight: 600; }
+    #tree .preview {
+      color: var(--c-muted);
+      font: 12px ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      margin-left: 6px;
+    }
+    #tree .range {
+      color: var(--c-muted);
+      font: 11px ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      margin-left: 6px;
+      opacity: 0.7;
+    }
+    #tree .nested { margin-left: 14px; padding-left: 8px; border-left: 1px dotted var(--c-border); }
+    #tree details[data-depth="0"] > summary { background: var(--c-msg-1); }
+    #tree details[data-depth="1"] > summary { background: var(--c-msg-2); }
+    #tree details[data-depth="2"] > summary { background: var(--c-msg-3); }
+    #tree details[data-depth="3"] > summary { background: var(--c-msg-4); }
+    #tree details[data-oneof] > summary { box-shadow: inset 2px 0 0 var(--c-oneof); }
+    #tree .note-marker {
+      display: inline-block;
+      font-size: 11px;
+      color: #6b3a00;
+      background: #ffe8a8;
+      border: 1px solid #d9a93a;
+      padding: 0 5px;
+      margin-left: 6px;
+      border-radius: 8px;
+      font-weight: 500;
+    }
+    #hex .b.noted { box-shadow: inset 0 -2px 0 #d9a93a; }
+
+    /* ============================================================
+       Detail pane
+       ============================================================ */
+    #detail dl {
+      margin: 0 0 14px;
+      display: grid;
+      grid-template-columns: max-content 1fr;
+      gap: 4px 12px;
+      font-size: 13px;
+    }
+    #detail dt {
+      font-weight: 600;
+      color: var(--c-muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      align-self: start;
+      padding-top: 1px;
+    }
+    #detail dd { margin: 0; word-break: break-word; }
+    #detail dd code {
+      background: #eef0f4;
+      padding: 1px 4px;
+      border-radius: 2px;
+      font-size: 12.5px;
+    }
+    #detail .quirk-block {
+      border-left: 3px solid var(--c-quirk);
+      padding: 8px 12px;
+      background: #fff5f4;
+      margin: 12px 0;
+      font-size: 12.5px;
+      color: #5d2222;
+    }
+    #detail .note-block {
+      border-left: 3px solid #d9a93a;
+      padding: 8px 12px;
+      background: #fffaeb;
+      margin: 12px 0;
+      font-size: 12.5px;
+      color: #4a3500;
+    }
+    #detail .breadcrumb {
+      font: 12.5px ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      color: var(--c-muted);
+      margin-bottom: 10px;
+      padding: 6px 8px;
+      background: #f4f7fb;
+      border-radius: 3px;
+      word-break: break-all;
+    }
+    #detail .breadcrumb .crumb {
+      cursor: pointer;
+      padding: 1px 3px;
+      border-radius: 2px;
+    }
+    #detail .breadcrumb .crumb:hover { background: var(--c-hover); }
+    #detail .breadcrumb .crumb.tail { color: var(--c-fg); font-weight: 600; }
+    #detail .breadcrumb .sep { color: #aab; padding: 0 4px; }
+    #detail .schema-block {
+      background: #fff;
+      border: 1px solid var(--c-border);
+      padding: 8px 10px;
+      border-radius: 3px;
+      font: 12.5px ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    #detail details {
+      margin: 10px 0;
+      border: 1px solid var(--c-border);
+      border-radius: 3px;
+      background: #fff;
+    }
+    #detail details > summary {
+      padding: 6px 10px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 12.5px;
+    }
+    #detail details > pre {
+      margin: 0;
+      padding: 8px 10px;
+      max-height: 360px;
+      overflow: auto;
+      font: 12px ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #fafbfc;
+      border-top: 1px solid var(--c-border);
+    }
+
+    /* ============================================================
+       Legend (footer)
+       ============================================================ */
+    .legend {
+      padding: 6px 14px;
+      font-size: 11.5px;
+      color: var(--c-muted);
+      border-top: 1px solid var(--c-border);
+      background: #fff;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 14px;
+      align-items: center;
+    }
+    .legend .swatch {
+      display: inline-block;
+      width: 13px;
+      height: 13px;
+      border-radius: 2px;
+      vertical-align: -2px;
+      margin-right: 4px;
+      border: 1px solid rgba(0,0,0,0.1);
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>ProtoCatalogFormat Explorer</h1>
+    <div class="scenario-row">
+      <label for="scenario">Scenario:</label>
+      <select id="scenario"></select>
+    </div>
+    <div class="actions">
+      <button id="toggle-sealed" title="Flip the sealed byte in the last appended transaction" disabled>Toggle sealed bit</button>
+      <button id="reset" title="Reset the current scenario to its original bytes">Reset</button>
+    </div>
+  </header>
+  <div id="scenario-desc" class="scenario-desc"></div>
+
+  <main>
+    <section id="hex-pane">
+      <h2>Hex bytes</h2>
+      <div id="hex"></div>
+    </section>
+    <section id="tree-pane">
+      <h2>Decoded tree</h2>
+      <div id="tree"></div>
+    </section>
+    <section id="detail-pane">
+      <h2>Field detail</h2>
+      <div id="detail"><p style="color:var(--c-muted);">Click any byte or tree node to see its decoded value, proto field number, wire type, schema text, and any non-obvious encoding quirks.</p></div>
+    </section>
+  </main>
+
+  <div class="legend">
+    <span><span class="swatch" style="background:var(--c-magic)"></span>magic</span>
+    <span><span class="swatch" style="background:var(--c-version)"></span>version</span>
+    <span><span class="swatch" style="background:var(--c-frame)"></span>length frame</span>
+    <span><span class="swatch" style="background:var(--c-tag)"></span>field tag</span>
+    <span><span class="swatch" style="background:var(--c-len)"></span>length prefix</span>
+    <span><span class="swatch" style="background:var(--c-scalar)"></span>scalar (varint / fixed)</span>
+    <span><span class="swatch" style="background:var(--c-string)"></span>string</span>
+    <span><span class="swatch" style="background:var(--c-bytes)"></span>bytes</span>
+    <span><span class="swatch" style="background:var(--c-oneof)"></span>oneof variant</span>
+    <span><span class="swatch" style="background:var(--c-quirk)"></span>quirk (see detail panel)</span>
+  </div>
+
+  <!-- fixtures:start
+       Regenerate via:
+         mvn test -Dtest=FormatExplorerFixtures -Dexplorer.regenerate=true
+         python3 docs/format-explorer/splice-fixtures.py
+  -->
+  <script id="fixtures-data" type="application/json">{
+  "schema": {
+    "messages": {
+      "Checkpoint": {
+        "fields": [
+          {"number": 1, "name": "catalog_uuid", "type": "bytes", "repeated": false, "oneof": null, "comment": "Catalog identity 16 bytes, UUIDv7"},
+          {"number": 2, "name": "next_namespace_id", "type": "int32", "repeated": false, "oneof": null, "comment": "ID allocation state"},
+          {"number": 3, "name": "next_table_id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 10, "name": "namespaces", "type": "Namespace", "repeated": true, "oneof": null, "comment": "Catalog contents"},
+          {"number": 11, "name": "tables", "type": "Table", "repeated": true, "oneof": null, "comment": ""},
+          {"number": 12, "name": "namespace_properties", "type": "NamespaceProperty", "repeated": true, "oneof": null, "comment": ""},
+          {"number": 13, "name": "inline_tables", "type": "InlineTable", "repeated": true, "oneof": null, "comment": "Inline table metadata (tables with metadata stored in the catalog)"},
+          {"number": 20, "name": "committed_transaction_ids", "type": "bytes", "repeated": true, "oneof": null, "comment": "Committed transaction tracking (for deduplication) UUIDv7s, 16 bytes each"}
+        ]
+      },
+      "Namespace": {
+        "fields": [
+          {"number": 1, "name": "id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "version", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 3, "name": "parent_id", "type": "int32", "repeated": false, "oneof": null, "comment": "0 = root"},
+          {"number": 4, "name": "name", "type": "string", "repeated": false, "oneof": null, "comment": "single level name, not full path"}
+        ]
+      },
+      "Table": {
+        "fields": [
+          {"number": 1, "name": "id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "version", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 3, "name": "namespace_id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 4, "name": "name", "type": "string", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 5, "name": "metadata_location", "type": "string", "repeated": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "NamespaceProperty": {
+        "fields": [
+          {"number": 1, "name": "namespace_id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "key", "type": "string", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 3, "name": "value", "type": "string", "repeated": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "InlineTable": {
+        "fields": [
+          {"number": 1, "name": "id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "version", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 3, "name": "namespace_id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 4, "name": "name", "type": "string", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 5, "name": "metadata", "type": "bytes", "repeated": false, "oneof": null, "comment": "TableMetadata as JSON bytes"},
+          {"number": 6, "name": "manifest_list_prefix", "type": "string", "repeated": false, "oneof": null, "comment": "per-table dictionary: shared manifest file path prefix"},
+          {"number": 7, "name": "manifest_pool", "type": "ManifestFileEntry", "repeated": true, "oneof": null, "comment": "unique manifests for this table"},
+          {"number": 8, "name": "snapshot_refs", "type": "SnapshotManifestRefs", "repeated": true, "oneof": null, "comment": "per-snapshot index lists into pool"}
+        ]
+      },
+      "Transaction": {
+        "fields": [
+          {"number": 1, "name": "transaction_id", "type": "bytes", "repeated": false, "oneof": null, "comment": "UUIDv7, 16 bytes"},
+          {"number": 2, "name": "sealed", "type": "bool", "repeated": false, "oneof": null, "comment": "signals compaction needed"},
+          {"number": 3, "name": "actions", "type": "Action", "repeated": true, "oneof": null, "comment": ""}
+        ]
+      },
+      "Action": {
+        "fields": [
+          {"number": 1, "name": "create_namespace", "type": "CreateNamespace", "repeated": false, "oneof": "action", "comment": ""},
+          {"number": 2, "name": "drop_namespace", "type": "DropNamespace", "repeated": false, "oneof": "action", "comment": ""},
+          {"number": 3, "name": "set_namespace_property", "type": "SetNamespaceProperty", "repeated": false, "oneof": "action", "comment": ""},
+          {"number": 4, "name": "remove_namespace_property", "type": "RemoveNamespaceProperty", "repeated": false, "oneof": "action", "comment": ""},
+          {"number": 5, "name": "create_table", "type": "CreateTable", "repeated": false, "oneof": "action", "comment": ""},
+          {"number": 6, "name": "drop_table", "type": "DropTable", "repeated": false, "oneof": "action", "comment": ""},
+          {"number": 7, "name": "update_table_location", "type": "UpdateTableLocation", "repeated": false, "oneof": "action", "comment": ""},
+          {"number": 8, "name": "read_table", "type": "ReadTable", "repeated": false, "oneof": "action", "comment": "for read-your-writes validation"},
+          {"number": 9, "name": "update_table_inline", "type": "UpdateTableInline", "repeated": false, "oneof": "action", "comment": ""},
+          {"number": 10, "name": "create_table_inline", "type": "CreateTableInline", "repeated": false, "oneof": "action", "comment": ""}
+        ]
+      },
+      "CreateNamespace": {
+        "fields": [
+          {"number": 1, "name": "id", "type": "int32", "repeated": false, "oneof": null, "comment": "assigned ID, or negative for late-bind"},
+          {"number": 2, "name": "version", "type": "int32", "repeated": false, "oneof": null, "comment": "-1 for late-bind"},
+          {"number": 3, "name": "parent_id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 4, "name": "parent_version", "type": "int32", "repeated": false, "oneof": null, "comment": "for conflict detection, -1 if parent is late-bound"},
+          {"number": 5, "name": "name", "type": "string", "repeated": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "DropNamespace": {
+        "fields": [
+          {"number": 1, "name": "id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "version", "type": "int32", "repeated": false, "oneof": null, "comment": "must match for commit"}
+        ]
+      },
+      "SetNamespaceProperty": {
+        "fields": [
+          {"number": 1, "name": "namespace_id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "namespace_version", "type": "int32", "repeated": false, "oneof": null, "comment": "-1 if namespace created in same txn"},
+          {"number": 3, "name": "key", "type": "string", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 4, "name": "value", "type": "string", "repeated": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "RemoveNamespaceProperty": {
+        "fields": [
+          {"number": 1, "name": "namespace_id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "namespace_version", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 3, "name": "key", "type": "string", "repeated": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "CreateTable": {
+        "fields": [
+          {"number": 1, "name": "id", "type": "int32", "repeated": false, "oneof": null, "comment": "-1 for late-bind"},
+          {"number": 2, "name": "version", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 3, "name": "namespace_id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 4, "name": "namespace_version", "type": "int32", "repeated": false, "oneof": null, "comment": "-1 if namespace is late-bound"},
+          {"number": 5, "name": "name", "type": "string", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 6, "name": "metadata_location", "type": "string", "repeated": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "DropTable": {
+        "fields": [
+          {"number": 1, "name": "id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "version", "type": "int32", "repeated": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "UpdateTableLocation": {
+        "fields": [
+          {"number": 1, "name": "id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "version", "type": "int32", "repeated": false, "oneof": null, "comment": "must match current"},
+          {"number": 3, "name": "metadata_location", "type": "string", "repeated": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "ReadTable": {
+        "fields": [
+          {"number": 1, "name": "id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "version", "type": "int32", "repeated": false, "oneof": null, "comment": "version that was read"}
+        ]
+      },
+      "CreateTableInline": {
+        "fields": [
+          {"number": 1, "name": "id", "type": "int32", "repeated": false, "oneof": null, "comment": "-1 for late-bind"},
+          {"number": 2, "name": "version", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 3, "name": "namespace_id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 4, "name": "namespace_version", "type": "int32", "repeated": false, "oneof": null, "comment": "-1 if late-bound"},
+          {"number": 5, "name": "name", "type": "string", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 6, "name": "metadata", "type": "bytes", "repeated": false, "oneof": null, "comment": "full TableMetadata as JSON bytes"}
+        ]
+      },
+      "UpdateTableInline": {
+        "fields": [
+          {"number": 1, "name": "id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "version", "type": "int32", "repeated": false, "oneof": null, "comment": "must match current"},
+          {"number": 3, "name": "delta", "type": "TableMetadataDelta", "repeated": false, "oneof": "payload", "comment": "structured metadata changes"},
+          {"number": 4, "name": "full_metadata", "type": "bytes", "repeated": false, "oneof": "payload", "comment": "full TableMetadata JSON (re-inline)"},
+          {"number": 5, "name": "metadata_location", "type": "string", "repeated": false, "oneof": "payload", "comment": "pointer fallback (eviction)"}
+        ]
+      },
+      "TableMetadataDelta": {
+        "fields": [
+          {"number": 1, "name": "updates", "type": "TableMetadataUpdate", "repeated": true, "oneof": null, "comment": ""}
+        ]
+      },
+      "TableMetadataUpdate": {
+        "fields": [
+          {"number": 1, "name": "add_snapshot", "type": "AddSnapshot", "repeated": false, "oneof": "update", "comment": ""},
+          {"number": 2, "name": "set_snapshot_ref", "type": "SetSnapshotRef", "repeated": false, "oneof": "update", "comment": ""},
+          {"number": 3, "name": "remove_snapshots", "type": "RemoveSnapshots", "repeated": false, "oneof": "update", "comment": ""},
+          {"number": 4, "name": "add_schema", "type": "AddSchema", "repeated": false, "oneof": "update", "comment": ""},
+          {"number": 5, "name": "set_current_schema", "type": "SetCurrentSchema", "repeated": false, "oneof": "update", "comment": ""},
+          {"number": 6, "name": "add_partition_spec", "type": "AddPartitionSpec", "repeated": false, "oneof": "update", "comment": ""},
+          {"number": 7, "name": "set_default_partition_spec", "type": "SetDefaultPartitionSpec", "repeated": false, "oneof": "update", "comment": ""},
+          {"number": 8, "name": "add_sort_order", "type": "AddSortOrder", "repeated": false, "oneof": "update", "comment": ""},
+          {"number": 9, "name": "set_default_sort_order", "type": "SetDefaultSortOrder", "repeated": false, "oneof": "update", "comment": ""},
+          {"number": 10, "name": "set_properties", "type": "SetTableProperties", "repeated": false, "oneof": "update", "comment": ""},
+          {"number": 11, "name": "set_table_location", "type": "SetTableLocation", "repeated": false, "oneof": "update", "comment": ""},
+          {"number": 12, "name": "add_manifest", "type": "AddManifestDelta", "repeated": false, "oneof": "update", "comment": ""},
+          {"number": 13, "name": "remove_manifest", "type": "RemoveManifestDelta", "repeated": false, "oneof": "update", "comment": ""}
+        ]
+      },
+      "AddManifestDelta": {
+        "fields": [
+          {"number": 1, "name": "snapshot_id", "type": "int64", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "manifest", "type": "ManifestFileEntry", "repeated": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "RemoveManifestDelta": {
+        "fields": [
+          {"number": 1, "name": "snapshot_id", "type": "int64", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "manifest_path_suffix", "type": "string", "repeated": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "AddSnapshot": {
+        "fields": [
+          {"number": 1, "name": "snapshot_id", "type": "fixed64", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "manifest_list_suffix", "type": "string", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 3, "name": "summary", "type": "CompactSummary", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 4, "name": "timestamp_delta_ms", "type": "sint64", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 5, "name": "schema_id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 6, "name": "added_rows", "type": "int64", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 7, "name": "parent_snapshot_id", "type": "fixed64", "repeated": false, "oneof": null, "comment": "Optional: explicit parent snapshot ID (for stage-only, branch, cherry-pick). When omitted, replay defaults to base.currentSnapshot().snapshotId(). 0 sentinel = absent; use has_parent_snapshot_id flag to distinguish null parent (-1) from omission. A parent ID of 0 is not legal in Iceberg so the sentinel is safe."},
+          {"number": 8, "name": "first_row_id", "type": "int64", "repeated": false, "oneof": null, "comment": "Optional: v3+ row lineage starting row ID for this snapshot."},
+          {"number": 9, "name": "key_id", "type": "string", "repeated": false, "oneof": null, "comment": "Optional: encryption key ID carried on the snapshot."}
+        ]
+      },
+      "CompactSummary": {
+        "fields": [
+          {"number": 1, "name": "operation", "type": "OperationType", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "added_data_files", "type": "int64", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 3, "name": "added_records", "type": "int64", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 4, "name": "added_files_size", "type": "int64", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 5, "name": "total_data_files", "type": "int64", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 6, "name": "total_records", "type": "int64", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 7, "name": "total_files_size", "type": "int64", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 8, "name": "added_delete_files", "type": "int64", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 9, "name": "total_delete_files", "type": "int64", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 10, "name": "total_equality_deletes", "type": "int64", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 11, "name": "total_position_deletes", "type": "int64", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 15, "name": "extra", "type": "map<string,string>", "repeated": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "SetSnapshotRef": {
+        "fields": [
+          {"number": 1, "name": "ref_name", "type": "string", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "snapshot_id", "type": "int64", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 3, "name": "ref_type", "type": "string", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 4, "name": "min_snapshots_to_keep", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 5, "name": "max_snapshot_age_ms", "type": "int64", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 6, "name": "max_ref_age_ms", "type": "int64", "repeated": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "RemoveSnapshots": {
+        "fields": [
+          {"number": 1, "name": "snapshot_ids", "type": "int64", "repeated": true, "oneof": null, "comment": ""}
+        ]
+      },
+      "AddSchema": {
+        "fields": [
+          {"number": 1, "name": "schema_id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "last_column_id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 3, "name": "schema_json", "type": "bytes", "repeated": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "SetCurrentSchema": {
+        "fields": [
+          {"number": 1, "name": "schema_id", "type": "int32", "repeated": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "AddPartitionSpec": {
+        "fields": [
+          {"number": 1, "name": "spec_id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "last_partition_id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 3, "name": "spec_json", "type": "bytes", "repeated": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "SetDefaultPartitionSpec": {
+        "fields": [
+          {"number": 1, "name": "spec_id", "type": "int32", "repeated": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "AddSortOrder": {
+        "fields": [
+          {"number": 1, "name": "order_id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "order_json", "type": "bytes", "repeated": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "SetDefaultSortOrder": {
+        "fields": [
+          {"number": 1, "name": "order_id", "type": "int32", "repeated": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "SetTableProperties": {
+        "fields": [
+          {"number": 1, "name": "updated", "type": "map<string,string>", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "removed", "type": "string", "repeated": true, "oneof": null, "comment": ""}
+        ]
+      },
+      "SetTableLocation": {
+        "fields": [
+          {"number": 1, "name": "location", "type": "string", "repeated": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "ManifestFileEntry": {
+        "fields": [
+          {"number": 1, "name": "manifest_path_suffix", "type": "string", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "manifest_length", "type": "int64", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 3, "name": "partition_spec_id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 4, "name": "content", "type": "int32", "repeated": false, "oneof": null, "comment": "0=data, 1=deletes"},
+          {"number": 5, "name": "sequence_number", "type": "int64", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 6, "name": "min_sequence_number", "type": "int64", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 7, "name": "added_snapshot_id", "type": "int64", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 8, "name": "added_files_count", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 9, "name": "existing_files_count", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 10, "name": "deleted_files_count", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 11, "name": "added_rows_count", "type": "int64", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 12, "name": "existing_rows_count", "type": "int64", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 13, "name": "deleted_rows_count", "type": "int64", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 14, "name": "partitions", "type": "PartitionFieldSummaryEntry", "repeated": true, "oneof": null, "comment": ""},
+          {"number": 15, "name": "key_metadata", "type": "bytes", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 16, "name": "first_row_id", "type": "int64", "repeated": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "PartitionFieldSummaryEntry": {
+        "fields": [
+          {"number": 1, "name": "contains_null", "type": "bool", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "contains_nan", "type": "bool", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 3, "name": "lower_bound", "type": "bytes", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 4, "name": "upper_bound", "type": "bytes", "repeated": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "SnapshotManifestRefs": {
+        "fields": [
+          {"number": 1, "name": "snapshot_id", "type": "int64", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "pool_indices", "type": "int32", "repeated": true, "oneof": null, "comment": ""}
+        ]
+      }
+    },
+    "enums": {
+      "OperationType": [
+        {"name": "APPEND", "number": 0},
+        {"name": "OVERWRITE", "number": 1},
+        {"name": "DELETE", "number": 2},
+        {"name": "REPLACE", "number": 3}
+      ]
+    }
+  },
+  "scenarios": [
+    {
+      "name": "empty-bootstrap",
+      "description": "Smallest realistic catalog: 8-byte header, a checkpoint that is essentially just a UUID + ID counters, and a single transaction with a single CreateNamespace action. Walk every byte to learn how length framing and oneof discriminators work.",
+      "hex": "4c43415400000001160a1001900000000070008000000000000001100118012f0a100190000000007000800000000000001010001a190a1708011001180020ffffffff0f2a09616e616c7974696373",
+      "notes": [
+        {"start": 0, "end": 4, "label": "Magic bytes \"LCAT\""},
+        {"start": 4, "end": 8, "label": "Format version (big-endian int32 = 1)"}
+      ]
+    },
+    {
+      "name": "namespaces-and-pointer-tables",
+      "description": "A compacted (CAS-only) catalog with two namespaces, one nested under the other, a pointer-mode table referenced by S3 URL, and one namespace property. Demonstrates repeated message fields and parent_id chaining inside the Checkpoint message.",
+      "hex": "4c4341540000000197010a1001900000000070008000000000000001100318025211080110021800220977617265686f757365520e080210011801220662726f6e7a655a4208011003180222066576656e74732a3273333a2f2f6c616b652f77617265686f7573652f62726f6e7a652f6576656e74732f76332e6d657461646174612e6a736f6e6218080112056f776e65721a0d646174612d706c6174666f726d",
+      "notes": [
+      ]
+    },
+    {
+      "name": "txn-multi-action-with-late-bind",
+      "description": "Two actions in one transaction: CreateNamespace and CreateTable. The CreateTable references the new namespace via namespace_version = -1 (late-bind sentinel). Look for the 5-byte negative-int varint -- a quirk of the manual encoder.",
+      "hex": "4c43415400000001160a100190000000007000800000000000000110011801780a100190000000007000800000000000002010001a170a1508011001180020ffffffff0f2a0773746167696e671a492a4708011001180120ffffffff0f2a0a7261775f6576656e7473322d73333a2f2f6c616b652f73746167696e672f7261775f6576656e74732f76312e6d657461646174612e6a736f6e",
+      "notes": [
+        {"start": -1, "end": -1, "label": "QUIRK: parent_version = -1 (late-bind sentinel) encodes as a 5-byte varint, not the 10-byte sign-extended form proto3 specifies. See ProtoCodec.writeRawVarint(int) -- the unsigned >>>= 7 on a 32-bit int terminates after 5 iterations."}
+      ]
+    },
+    {
+      "name": "create-table-inline-with-real-metadata",
+      "description": "CreateTableInline action carrying a complete Iceberg TableMetadata JSON in its metadata bytes field. The JSON is opaque to the catalog format -- protobuf treats it as a length-delimited byte string. The detail panel offers a JSON pretty-print.",
+      "hex": "4c43415400000001290a1001900000000070008000000000000001100218015211080110011800220977617265686f757365ed040a100190000000007000800000000000003010001ad60452d30408011001180120012a066f726465727332c0047b22666f726d61742d76657273696f6e223a322c227461626c652d75756964223a2230313930303030302d303030302d373030302d383030302d303030303030303030306161222c226c6f636174696f6e223a2273333a2f2f6c616b652f77617265686f7573652f6f7264657273222c226c6173742d73657175656e63652d6e756d626572223a302c226c6173742d757064617465642d6d73223a313734363531383430303030302c2263757272656e742d736368656d612d6964223a302c22736368656d6173223a5b7b2274797065223a22737472756374222c22736368656d612d6964223a302c226669656c6473223a5b7b226964223a312c226e616d65223a226964222c227265717569726564223a747275652c2274797065223a226c6f6e67227d2c7b226964223a322c226e616d65223a22717479222c227265717569726564223a66616c73652c2274797065223a22696e74227d5d7d5d2c2264656661756c742d737065632d6964223a302c22706172746974696f6e2d7370656373223a5b7b22737065632d6964223a302c226669656c6473223a5b5d7d5d2c2264656661756c742d736f72742d6f726465722d6964223a302c22736f72742d6f7264657273223a5b7b226f726465722d6964223a302c226669656c6473223a5b5d7d5d2c2270726f70657274696573223a7b7d2c2263757272656e742d736e617073686f742d6964223a2d312c22736e617073686f7473223a5b5d2c22736e617073686f742d6c6f67223a5b5d2c226d657461646174612d6c6f67223a5b5d7d",
+      "notes": [
+      ]
+    },
+    {
+      "name": "update-table-inline-delta",
+      "description": "An UpdateTableInline action whose payload is a structured TableMetadataDelta. The delta carries an AddSnapshot (with a nested CompactSummary), a SetSnapshotRef pointing 'main' at the new snapshot, and an AddManifestDelta with one ManifestFileEntry. Look for fixed64 (snapshot_id), sint64 (timestamp_delta_ms), and the deepest message nesting in the format.",
+      "hex": "4c43415400000001c2040a1001900000000070008000000000000001100218025211080110011800220977617265686f7573656a960408011001180122066576656e74732ada037b22666f726d61742d76657273696f6e223a322c227461626c652d75756964223a2230313930303030302d303030302d373030302d383030302d303030303030303030306262222c226c6f636174696f6e223a2273333a2f2f6c616b652f77617265686f7573652f6576656e7473222c226c6173742d73657175656e63652d6e756d626572223a302c226c6173742d757064617465642d6d73223a313734363531383430303030302c2263757272656e742d736368656d612d6964223a302c22736368656d6173223a5b7b2274797065223a22737472756374222c22736368656d612d6964223a302c226669656c6473223a5b5d7d5d2c2264656661756c742d737065632d6964223a302c22706172746974696f6e2d7370656373223a5b7b22737065632d6964223a302c226669656c6473223a5b5d7d5d2c2264656661756c742d736f72742d6f726465722d6964223a302c22736f72742d6f7264657273223a5b7b226f726465722d6964223a302c226669656c6473223a5b5d7d5d2c2270726f70657274696573223a7b7d2c2263757272656e742d736e617073686f742d6964223a2d312c22736e617073686f7473223a5b5d2c22736e617073686f742d6c6f67223a5b5d2c226d657461646174612d6c6f67223a5b5d7d322973333a2f2f6c616b652f77617265686f7573652f6576656e74732f6d657461646174612f736e61702d8a010a100190000000007000800000000000004010001a744a72080110011a6c10e08cf3a4ea320a1b0a1909cdab34128e4a6c4f12001a05100118800820c0a9073080080a1912170a046d61696e11cdab34128e4a6c4f1a066272616e63680a2b622909cdab34128e4a6c4f121e0a076d302e6176726f1080202801300139cdab34128e4a6c4f4001588008",
+      "notes": [
+      ]
+    },
+    {
+      "name": "sealed-toggle",
+      "description": "Same actions as the late-bind scenario, but with sealed=true on the transaction. Find the single byte that distinguishes a sealed transaction from an unsealed one. The toggle button demonstrates the in-place mutation that compaction relies on.",
+      "hex": "4c43415400000001160a100190000000007000800000000000000110011801780a100190000000007000800000000000005010011a170a1508011001180020ffffffff0f2a0773746167696e671a492a4708011001180120ffffffff0f2a0a7261775f6576656e7473322d73333a2f2f6c616b652f73746167696e672f7261775f6576656e74732f76312e6d657461646174612e6a736f6e",
+      "notes": [
+        {"start": -1, "end": -1, "label": "QUIRK: Transaction.sealed (proto field 2, bool) is always written even when its proto3 default-value (false) would otherwise omit it. This guarantees the byte stays at a predictable offset so ProtoCodec.sealTransaction() / unsealTransaction() can flip it in place without re-encoding the whole transaction."}
+      ]
+    },
+    {
+      "name": "pointer-multi-table-conflict-retry",
+      "description": "Two pointer-mode tables A and B in one namespace. Three appended transactions show how version-based conflict detection and atomic multi-table commits interact: T1 succeeds, T2 (multi-table) is rejected because A's captured version is stale, then T3 (the retry) applies both actions. T2's bytes remain in the log — read replay skips them silently.",
+      "hex": "4c434154000000018f010a1001900000000070008000000000000001100218035211080110011800220977617265686f7573655a310801100118012201412a2673333a2f2f6c616b652f77617265686f7573652f412f76312e6d657461646174612e6a736f6e5a310802100118012201422a2673333a2f2f6c616b652f77617265686f7573652f422f76312e6d657461646174612e6a736f6e440a100190000000007000800000000000007110001a2e3a2c080110011a2673333a2f2f6c616b652f77617265686f7573652f412f76322e6d657461646174612e6a736f6e740a100190000000007000800000000000007210001a2e3a2c080110011a2673333a2f2f6c616b652f77617265686f7573652f412f76332e6d657461646174612e6a736f6e1a2e3a2c080210011a2673333a2f2f6c616b652f77617265686f7573652f422f76322e6d657461646174612e6a736f6e740a100190000000007000800000000000007310001a2e3a2c080110021a2673333a2f2f6c616b652f77617265686f7573652f412f76332e6d657461646174612e6a736f6e1a2e3a2c080210011a2673333a2f2f6c616b652f77617265686f7573652f422f76322e6d657461646174612e6a736f6e",
+      "notes": [
+        {"start": 153, "end": 222, "label": "T1: UpdateTableLocation(A, v=1) — APPLIES. A advances to v=2."},
+        {"start": 222, "end": 339, "label": "T2: UpdateTableLocation(A, v=1) + UpdateTableLocation(B, v=1) — REJECTED. A's captured version (1) no longer matches current (2) after T1, so the entire transaction fails verify(); B is also not updated (all-or-nothing). The bytes still sit in the log on disk; replay silently skips them."},
+        {"start": 339, "end": 456, "label": "T3: UpdateTableLocation(A, v=2) + UpdateTableLocation(B, v=1) — APPLIES. Same intent as T2, retried with A's correct current version."}
+      ]
+    },
+    {
+      "name": "inline-multi-table-conflict-retry",
+      "description": "Same conflict-retry story as the pointer scenario, but with inline-mode tables. The wire format is structurally identical except UpdateTableInline (Action field 9) replaces UpdateTableLocation (Action field 7) and the new metadata travels as a length-delimited bytes field inside each action, instead of a string URL.",
+      "hex": "4c43415400000001b3010a1001900000000070008000000000000001100218035211080110011800220977617265686f7573656a430801100118012201412a197b227461626c65223a2241222c2276657273696f6e223a317d321d73333a2f2f6c616b652f77617265686f7573652f412f6d2f736e61702d6a430802100118012201422a197b227461626c65223a2242222c2276657273696f6e223a317d321d73333a2f2f6c616b652f77617265686f7573652f422f6d2f736e61702d370a100190000000007000800000000000008110001a214a1f0801100122197b227461626c65223a2241222c2276657273696f6e223a327d7c0a100190000000007000800000000000008210001a324a3008011001222a7b227461626c65223a2241222c2276657273696f6e223a332c22777269746572223a227374616c65227d1a324a3008021001222a7b227461626c65223a2242222c2276657273696f6e223a322c22777269746572223a227374616c65227d5a0a100190000000007000800000000000008310001a214a1f0801100222197b227461626c65223a2241222c2276657273696f6e223a337d1a214a1f0802100122197b227461626c65223a2242222c2276657273696f6e223a327d",
+      "notes": [
+        {"start": 189, "end": 245, "label": "T1: UpdateTableInline(A, v=1, full) — APPLIES. A advances to v=2 with new metadata bytes."},
+        {"start": 245, "end": 370, "label": "T2: UpdateTableInline(A, v=1) + UpdateTableInline(B, v=1) — REJECTED. Same multi-table all-or-nothing behavior as the pointer scenario: A's captured v=1 no longer matches current v=2, so verify() fails and B is also untouched. The entire transaction record (including B's full metadata bytes) is wasted log space — exactly the situation the seal+CAS compaction path eventually reclaims."},
+        {"start": 370, "end": 461, "label": "T3: UpdateTableInline(A, v=2) + UpdateTableInline(B, v=1) — APPLIES. Both tables get their new inline metadata atomically."}
+      ]
+    }
+  ]
+}</script>
+  <!-- fixtures:end -->
+
+  <script>
+  (function () {
+    'use strict';
+    // ============================================================
+    // Constants
+    // ============================================================
+    var WIRE_VARINT = 0, WIRE_FIXED64 = 1, WIRE_LEN_DELIM = 2, WIRE_FIXED32 = 5;
+    var MAGIC_BYTES = [0x4C, 0x43, 0x41, 0x54]; // "LCAT"
+
+    var SCALAR_TYPES = {
+      'int32': 'varint', 'int64': 'varint', 'uint32': 'varint', 'uint64': 'varint',
+      'sint32': 'varint-zigzag', 'sint64': 'varint-zigzag',
+      'bool': 'varint', 'fixed64': 'fixed64', 'sfixed64': 'fixed64',
+      'fixed32': 'fixed32', 'sfixed32': 'fixed32',
+      'string': 'len-delim-string', 'bytes': 'len-delim-bytes'
+    };
+
+    // Bytes fields known to carry JSON
+    var JSON_BYTES_FIELDS = {
+      'InlineTable.metadata': true,
+      'CreateTableInline.metadata': true,
+      'UpdateTableInline.full_metadata': true,
+      'AddSchema.schema_json': true,
+      'AddPartitionSpec.spec_json': true,
+      'AddSortOrder.order_json': true
+    };
+
+    // Bytes fields that are nested protobuf messages (decoded recursively)
+    var NESTED_PROTO_BYTES = {
+      'UpdateTableInline.delta': 'TableMetadataDelta'
+    };
+
+    // Bytes fields that are 16-byte UUIDs
+    var UUID_BYTES_FIELDS = {
+      'Checkpoint.catalog_uuid': true,
+      'Checkpoint.committed_transaction_ids': true,
+      'Transaction.transaction_id': true
+    };
+
+    // ============================================================
+    // State
+    // ============================================================
+    var state = {
+      schema: null,
+      scenarios: [],
+      scenarioIndex: 0,
+      bytes: null,           // Uint8Array of currently-displayed scenario
+      origBytes: null,       // pristine copy for reset
+      tree: null,
+      nodes: [],             // flat list keyed by id
+      offsetToNodes: [],     // offsetToNodes[i] = list of node ids covering byte i, deepest last
+      selectedId: null,
+      sealedNodeIds: []      // node ids of sealed-byte values for the toggle
+    };
+
+    function loadFixtures() {
+      var blob = document.getElementById('fixtures-data').textContent;
+      var data = JSON.parse(blob);
+      state.schema = data.schema;
+      state.scenarios = data.scenarios || [];
+    }
+
+    // ============================================================
+    // Decoder
+    // ============================================================
+    function findField(messageDef, fieldNumber) {
+      if (!messageDef) return null;
+      for (var i = 0; i < messageDef.fields.length; i++) {
+        if (messageDef.fields[i].number === fieldNumber) return messageDef.fields[i];
+      }
+      return null;
+    }
+
+    function readVarint(bytes, off) {
+      var result = 0n;
+      var shift = 0n;
+      var start = off;
+      while (true) {
+        if (off >= bytes.length) throw new Error('Truncated varint at ' + start);
+        var b = bytes[off++];
+        result |= BigInt(b & 0x7F) << shift;
+        if ((b & 0x80) === 0) break;
+        shift += 7n;
+        if (shift >= 70n) throw new Error('Varint too long at ' + start);
+      }
+      return { value: result, end: off, byteLen: off - start };
+    }
+
+    function readFixed64(bytes, off) {
+      if (off + 8 > bytes.length) throw new Error('Truncated fixed64 at ' + off);
+      var lo = BigInt(bytes[off] | (bytes[off+1] << 8) | (bytes[off+2] << 16) | (bytes[off+3] << 24)) & 0xFFFFFFFFn;
+      var hi = BigInt(bytes[off+4] | (bytes[off+5] << 8) | (bytes[off+6] << 16) | (bytes[off+7] << 24)) & 0xFFFFFFFFn;
+      return (hi << 32n) | lo;
+    }
+    function readFixed32(bytes, off) {
+      if (off + 4 > bytes.length) throw new Error('Truncated fixed32 at ' + off);
+      return bytes[off] | (bytes[off+1] << 8) | (bytes[off+2] << 16) | (bytes[off+3] << 24);
+    }
+    function utf8Decode(bytes, start, end) {
+      try { return new TextDecoder('utf-8', { fatal: false }).decode(bytes.slice(start, end)); }
+      catch (e) { return '<binary>'; }
+    }
+    function asInt32(big) {
+      // Truncate big to 32 bits, interpret as signed
+      var v = Number(big & 0xFFFFFFFFn);
+      return (v | 0);
+    }
+    function isCanonicalVarintSize(value, byteLen) {
+      // Smallest varint encoding of an unsigned long.
+      var bits = (value === 0n) ? 1 : value.toString(2).length;
+      var minLen = Math.max(1, Math.ceil(bits / 7));
+      return byteLen === minLen;
+    }
+
+    var nodeIdSeq = 0;
+    function newNode(props) { props.id = nodeIdSeq++; state.nodes.push(props); return props; }
+
+    function decodeFile(bytes) {
+      nodeIdSeq = 0;
+      state.nodes = [];
+      state.sealedNodeIds = [];
+      var root = newNode({
+        kind: 'file', label: 'File', byteStart: 0, byteEnd: bytes.length, children: []
+      });
+      // Header
+      var magicNode = newNode({
+        kind: 'magic', label: 'magic', byteStart: 0, byteEnd: 4,
+        decodedValue: '"LCAT"',
+        detail: 'ASCII "LCAT" (0x4C 0x43 0x41 0x54). Identifies the file as a ProtoCatalogFormat catalog.',
+        children: []
+      });
+      root.children.push(magicNode);
+      // Validate magic
+      for (var i = 0; i < 4; i++) {
+        if (bytes[i] !== MAGIC_BYTES[i]) {
+          magicNode.detail = 'Bad magic: expected "LCAT".';
+          break;
+        }
+      }
+      var version = (bytes[4] << 24) | (bytes[5] << 16) | (bytes[6] << 8) | bytes[7];
+      var versionNode = newNode({
+        kind: 'version', label: 'version', byteStart: 4, byteEnd: 8,
+        decodedValue: String(version >>> 0),
+        detail: 'Big-endian int32. Currently 1; readers reject anything else.',
+        children: []
+      });
+      root.children.push(versionNode);
+
+      // Checkpoint record (length-prefix + Checkpoint message)
+      var off = 8;
+      var chkRecordStart = off;
+      var chkLenInfo = readVarint(bytes, off);
+      var chkLenNode = newNode({
+        kind: 'frame', label: 'checkpoint_length',
+        byteStart: off, byteEnd: chkLenInfo.end,
+        decodedValue: chkLenInfo.value.toString(),
+        detail: 'Varint length-prefix for the Checkpoint message that follows.',
+        children: []
+      });
+      off = chkLenInfo.end;
+      var chkEnd = off + Number(chkLenInfo.value);
+      var chkNode = decodeMessageRegion(bytes, off, chkEnd, 'Checkpoint', 'Checkpoint');
+      var chkRecord = newNode({
+        kind: 'record', label: 'Checkpoint record',
+        recordKind: 'checkpoint',
+        byteStart: chkRecordStart, byteEnd: chkEnd,
+        children: [chkLenNode, chkNode]
+      });
+      root.children.push(chkRecord);
+      off = chkEnd;
+
+      // Repeated transaction records (each is length-prefix + Transaction)
+      var txnIndex = 0;
+      while (off < bytes.length) {
+        var recordStart = off;
+        var tlInfo = readVarint(bytes, off);
+        var tlNode = newNode({
+          kind: 'frame', label: 'txn_length[' + txnIndex + ']',
+          byteStart: off, byteEnd: tlInfo.end,
+          decodedValue: tlInfo.value.toString(),
+          detail: 'Varint length-prefix for the next Transaction record.',
+          children: []
+        });
+        off = tlInfo.end;
+        var tEnd = off + Number(tlInfo.value);
+        var tNode = decodeMessageRegion(bytes, off, tEnd, 'Transaction', 'Transaction[' + txnIndex + ']');
+        var rec = newNode({
+          kind: 'record', label: 'Transaction record [' + txnIndex + ']',
+          recordKind: 'transaction',
+          recordIndex: txnIndex,
+          byteStart: recordStart, byteEnd: tEnd,
+          children: [tlNode, tNode]
+        });
+        root.children.push(rec);
+        off = tEnd;
+        txnIndex++;
+      }
+      return root;
+    }
+
+    // ============================================================
+    // Note attachment: tag any node whose [byteStart, byteEnd) exactly
+    // matches a scenario note. The fixture generator typically emits one
+    // note per transaction record, matching the wrapper record node.
+    // ============================================================
+    function attachNotes(root, notes) {
+      if (!notes || notes.length === 0) return;
+      function walk(node) {
+        for (var i = 0; i < notes.length; i++) {
+          var n = notes[i];
+          if (n.start === node.byteStart && n.end === node.byteEnd) {
+            node.note = n.label;
+            break;
+          }
+        }
+        if (node.children) for (var j = 0; j < node.children.length; j++) walk(node.children[j]);
+      }
+      walk(root);
+    }
+
+    function findNoteIdsCovering(offset) {
+      // Returns true if offset falls within any noted node's range.
+      // Used by the hex pane to apply a subtle bottom border.
+      var ids = state.offsetToNodes[offset] || [];
+      for (var i = 0; i < ids.length; i++) {
+        if (state.nodes[ids[i]].note) return true;
+      }
+      return false;
+    }
+
+    function decodeMessageRegion(bytes, start, end, messageType, label) {
+      var def = state.schema.messages[messageType];
+      var node = newNode({
+        kind: 'msg', messageType: messageType,
+        label: label, byteStart: start, byteEnd: end,
+        children: []
+      });
+      var off = start;
+      while (off < end) {
+        var tagInfo = readVarint(bytes, off);
+        var fieldNumber = Number(tagInfo.value >> 3n);
+        var wireType = Number(tagInfo.value & 7n);
+        var fieldDef = findField(def, fieldNumber);
+        var fieldName = fieldDef ? fieldDef.name : ('<unknown #' + fieldNumber + '>');
+        var fieldType = fieldDef ? fieldDef.type : null;
+        var oneofGroup = fieldDef ? fieldDef.oneof : null;
+        var schemaPath = messageType + '.' + fieldName;
+
+        // Field tag
+        var tagNode = newNode({
+          kind: 'tag', label: 'tag #' + fieldNumber + ' (wire ' + wireType + ')',
+          fieldNumber: fieldNumber, wireType: wireType, fieldName: fieldName,
+          fieldType: fieldType, parentMessage: messageType, schemaPath: schemaPath,
+          oneofGroup: oneofGroup,
+          fieldComment: fieldDef ? fieldDef.comment : null,
+          byteStart: off, byteEnd: tagInfo.end,
+          decodedValue: '(' + fieldNumber + ' << 3) | ' + wireType,
+          children: []
+        });
+        node.children.push(tagNode);
+        off = tagInfo.end;
+
+        if (wireType === WIRE_VARINT) {
+          var vInfo = readVarint(bytes, off);
+          var quirk = false;
+          var quirkNote = null;
+          // Detect 5-byte non-canonical negative int32: byteLen=5, value would
+          // truncate to a negative int32, AND the canonical (smallest) form
+          // would be shorter. Only for fields declared int32/sint32/bool.
+          if ((fieldType === 'int32' || fieldType === 'sint32' || fieldType === 'bool')
+              && vInfo.byteLen === 5 && asInt32(vInfo.value) < 0) {
+            quirk = true;
+            quirkNote = 'QUIRK: 5-byte varint encoding a negative int32. The '
+              + 'manual encoder ProtoCodec.writeRawVarint(int) uses unsigned '
+              + 'right-shift on a 32-bit int, terminating after 5 iterations '
+              + 'instead of the 10-byte sign-extended form proto3 specifies. '
+              + 'A protoc-generated reader (treating the field as int32) '
+              + 'would still accept this — but other proto3 toolchains '
+              + 'sometimes reject it.';
+          }
+          var decoded;
+          if (fieldType === 'bool') {
+            decoded = (vInfo.value === 0n) ? 'false' : 'true';
+          } else if (fieldType === 'sint32' || fieldType === 'sint64') {
+            // Zigzag: (n >> 1) XOR -(n AND 1)
+            var z = vInfo.value;
+            var dec = (z >> 1n) ^ (-(z & 1n));
+            decoded = dec.toString() + ' (zigzag)';
+          } else if (fieldType === 'int32' || fieldType === 'sint32' || fieldType === 'bool') {
+            decoded = String(asInt32(vInfo.value));
+          } else {
+            decoded = vInfo.value.toString();
+          }
+          // Special case: Transaction.sealed is the in-place toggle byte
+          var isSealed = (messageType === 'Transaction' && fieldName === 'sealed');
+          var valueKind = isSealed ? 'bool' : 'varint';
+          var valueNode = newNode({
+            kind: valueKind, label: fieldName, byteStart: off, byteEnd: vInfo.end,
+            decodedValue: decoded, fieldType: fieldType, schemaPath: schemaPath,
+            parentMessage: messageType,
+            fieldComment: fieldDef ? fieldDef.comment : null,
+            oneofGroup: oneofGroup,
+            quirk: quirk, quirkNote: quirkNote, sealed: isSealed,
+            children: []
+          });
+          if (isSealed) {
+            valueNode.kind = 'sealed';
+            valueNode.label = 'sealed (always-written)';
+            valueNode.detail = 'QUIRK: Transaction.sealed (proto field 2, bool) '
+              + 'is always written even when its proto3 default value (false) '
+              + 'would otherwise omit it. The byte is at a fixed offset within '
+              + 'the encoded transaction so ProtoCodec.sealTransaction() / '
+              + 'unsealTransaction() can flip it without re-encoding the '
+              + 'whole record.';
+            state.sealedNodeIds.push(valueNode.id);
+          }
+          node.children.push(valueNode);
+          off = vInfo.end;
+        } else if (wireType === WIRE_FIXED64) {
+          var f64 = readFixed64(bytes, off);
+          node.children.push(newNode({
+            kind: 'fixed64', label: fieldName, byteStart: off, byteEnd: off + 8,
+            decodedValue: f64.toString() + ' (0x' + f64.toString(16) + ')',
+            fieldType: fieldType, schemaPath: schemaPath,
+            parentMessage: messageType,
+            fieldComment: fieldDef ? fieldDef.comment : null,
+            oneofGroup: oneofGroup, children: []
+          }));
+          off += 8;
+        } else if (wireType === WIRE_FIXED32) {
+          var f32 = readFixed32(bytes, off);
+          node.children.push(newNode({
+            kind: 'fixed32', label: fieldName, byteStart: off, byteEnd: off + 4,
+            decodedValue: String(f32 >>> 0),
+            fieldType: fieldType, schemaPath: schemaPath,
+            parentMessage: messageType,
+            fieldComment: fieldDef ? fieldDef.comment : null,
+            oneofGroup: oneofGroup, children: []
+          }));
+          off += 4;
+        } else if (wireType === WIRE_LEN_DELIM) {
+          var lenInfo = readVarint(bytes, off);
+          var payloadStart = lenInfo.end;
+          var payloadEnd = payloadStart + Number(lenInfo.value);
+          // Length prefix node
+          var lenNode = newNode({
+            kind: 'len', label: fieldName + '.len', byteStart: off, byteEnd: lenInfo.end,
+            decodedValue: lenInfo.value.toString(),
+            fieldType: fieldType,
+            schemaPath: schemaPath,
+            parentMessage: messageType,
+            children: []
+          });
+          node.children.push(lenNode);
+          off = lenInfo.end;
+          // Payload: nested message, string, bytes, or repeated bytes
+          if (fieldType && state.schema.messages[fieldType]) {
+            var sub = decodeMessageRegion(bytes, payloadStart, payloadEnd, fieldType, fieldName);
+            sub.fieldName = fieldName;
+            sub.parentMessage = messageType;
+            sub.schemaPath = schemaPath;
+            sub.fieldComment = fieldDef ? fieldDef.comment : null;
+            sub.oneofGroup = oneofGroup;
+            node.children.push(sub);
+          } else if (fieldType === 'string') {
+            var str = utf8Decode(bytes, payloadStart, payloadEnd);
+            node.children.push(newNode({
+              kind: 'string', label: fieldName,
+              byteStart: payloadStart, byteEnd: payloadEnd,
+              decodedValue: JSON.stringify(str), fieldType: fieldType,
+              schemaPath: schemaPath, parentMessage: messageType,
+              fieldComment: fieldDef ? fieldDef.comment : null,
+              oneofGroup: oneofGroup, children: []
+            }));
+          } else if (NESTED_PROTO_BYTES[schemaPath]) {
+            var nestedType = NESTED_PROTO_BYTES[schemaPath];
+            var inner = decodeMessageRegion(bytes, payloadStart, payloadEnd, nestedType, fieldName + ' (' + nestedType + ')');
+            inner.fieldName = fieldName;
+            inner.parentMessage = messageType;
+            inner.schemaPath = schemaPath;
+            inner.fieldComment = fieldDef ? fieldDef.comment : null;
+            inner.oneofGroup = oneofGroup;
+            inner.detail = 'Bytes field carrying a nested ' + nestedType + ' message. Decoded recursively.';
+            node.children.push(inner);
+          } else {
+            var isJson = !!JSON_BYTES_FIELDS[schemaPath];
+            var isUuid = !!UUID_BYTES_FIELDS[schemaPath]
+              && (payloadEnd - payloadStart) === 16;
+            var bytesNode = newNode({
+              kind: 'bytes', label: fieldName,
+              byteStart: payloadStart, byteEnd: payloadEnd,
+              fieldType: fieldType, schemaPath: schemaPath,
+              parentMessage: messageType,
+              fieldComment: fieldDef ? fieldDef.comment : null,
+              oneofGroup: oneofGroup, isJson: isJson, isUuid: isUuid,
+              children: []
+            });
+            if (isUuid) {
+              bytesNode.decodedValue = formatUuid(bytes, payloadStart);
+            } else if (isJson) {
+              bytesNode.decodedValue = '<' + (payloadEnd - payloadStart) + ' bytes JSON; expand below>';
+              bytesNode.jsonText = utf8Decode(bytes, payloadStart, payloadEnd);
+            } else {
+              bytesNode.decodedValue = '<' + (payloadEnd - payloadStart) + ' bytes>';
+            }
+            node.children.push(bytesNode);
+          }
+          off = payloadEnd;
+        } else {
+          // Unknown wire type — bail to avoid runaway parsing
+          throw new Error('Unknown wire type ' + wireType + ' at offset ' + (off - tagInfo.byteLen));
+        }
+      }
+      return node;
+    }
+
+    function formatUuid(bytes, off) {
+      function hh(i) { return (bytes[i] < 16 ? '0' : '') + bytes[i].toString(16); }
+      return [
+        hh(off) + hh(off+1) + hh(off+2) + hh(off+3),
+        hh(off+4) + hh(off+5),
+        hh(off+6) + hh(off+7),
+        hh(off+8) + hh(off+9),
+        hh(off+10) + hh(off+11) + hh(off+12) + hh(off+13) + hh(off+14) + hh(off+15)
+      ].join('-');
+    }
+
+    // ============================================================
+    // Build offset -> node map
+    // ============================================================
+    function buildOffsetMap() {
+      state.offsetToNodes = new Array(state.bytes.length);
+      for (var i = 0; i < state.bytes.length; i++) state.offsetToNodes[i] = [];
+      // Walk all leaf-or-near-leaf nodes; each byte maps to the deepest covering node.
+      // Strategy: do a DFS, push the node id onto each covered offset; the deepest
+      // (last-pushed) wins for "deepest-containing" lookups.
+      function walk(node) {
+        for (var off = node.byteStart; off < node.byteEnd; off++) {
+          state.offsetToNodes[off].push(node.id);
+        }
+        if (node.children) for (var i = 0; i < node.children.length; i++) walk(node.children[i]);
+      }
+      walk(state.tree);
+    }
+
+    function deepestNodeAt(offset) {
+      var ids = state.offsetToNodes[offset];
+      if (!ids || ids.length === 0) return null;
+      return state.nodes[ids[ids.length - 1]];
+    }
+
+    function ancestorIds(nodeId) {
+      // Walk parent chain by scanning offsetToNodes at byteStart (parents always
+      // cover at least the same range).
+      var node = state.nodes[nodeId];
+      if (!node) return [];
+      var stack = state.offsetToNodes[node.byteStart] || [];
+      var out = [];
+      for (var i = 0; i < stack.length; i++) {
+        if (stack[i] === nodeId) break;
+        out.push(stack[i]);
+      }
+      return out;
+    }
+
+    // ============================================================
+    // Hex pane rendering
+    // ============================================================
+    function renderHex() {
+      var bytes = state.bytes;
+      var lines = [];
+      for (var off = 0; off < bytes.length; off += 16) {
+        var pieces = ['<span class="row">'];
+        pieces.push('<span class="off">' + off.toString(16).padStart(8, '0') + '</span>');
+        var lineEnd = Math.min(off + 16, bytes.length);
+        var ascii = '';
+        for (var j = off; j < lineEnd; j++) {
+          var node = deepestNodeAt(j);
+          var kind = nodeKindForByte(node);
+          var quirk = node && (node.quirk || node.sealed) ? '1' : '';
+          var nodeId = node ? node.id : '';
+          var hex = bytes[j].toString(16).padStart(2, '0');
+          var notedCls = findNoteIdsCovering(j) ? ' noted' : '';
+          pieces.push('<span class="b' + notedCls + '" data-off="' + j + '" data-node="' + nodeId
+              + '" data-kind="' + kind + '" data-quirk="' + quirk + '">' + hex + '</span>');
+          if (j < lineEnd - 1) pieces.push(' ');
+          ascii += (bytes[j] >= 0x20 && bytes[j] < 0x7F)
+            ? String.fromCharCode(bytes[j]) : '.';
+        }
+        // Padding so ASCII column lines up
+        for (var k = lineEnd; k < off + 16; k++) {
+          pieces.push('<span class="b" data-kind="zero-pad">  </span>');
+          if (k < off + 15) pieces.push(' ');
+          ascii += ' ';
+        }
+        pieces.push('<span class="ascii">' + escapeHtml(ascii) + '</span>');
+        pieces.push('</span>');
+        lines.push(pieces.join(''));
+      }
+      document.getElementById('hex').innerHTML = lines.join('\n');
+    }
+
+    function nodeKindForByte(node) {
+      if (!node) return '';
+      switch (node.kind) {
+        case 'magic': return 'magic';
+        case 'version': return 'version';
+        case 'frame': return 'frame';
+        case 'tag': return 'tag';
+        case 'len': return 'len';
+        case 'varint': return 'varint';
+        case 'bool': return 'varint';
+        case 'sealed': return 'varint';
+        case 'fixed64': return 'fixed64';
+        case 'fixed32': return 'fixed32';
+        case 'string': return 'string';
+        case 'bytes': return 'bytes';
+        default: return '';
+      }
+    }
+
+    function escapeHtml(s) {
+      return s.replace(/[&<>"']/g, function (c) {
+        return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c];
+      });
+    }
+
+    // ============================================================
+    // Tree pane rendering
+    // ============================================================
+    function renderTree() {
+      var root = state.tree;
+      var html = treeHtml(root, 0);
+      document.getElementById('tree').innerHTML = html;
+      // Open the top-level <details> by default for visibility.
+      var allDetails = document.querySelectorAll('#tree details');
+      for (var i = 0; i < allDetails.length; i++) {
+        if (parseInt(allDetails[i].getAttribute('data-depth'), 10) <= 1) {
+          allDetails[i].open = true;
+        }
+      }
+    }
+
+    function treeHtml(node, depth) {
+      var hasChildren = node.children && node.children.length > 0;
+      var pill = pillFor(node);
+      var preview = previewFor(node);
+      var size = node.byteEnd - node.byteStart;
+      var range = '<span class="range">[' + node.byteStart + '..' + node.byteEnd + ') (' + size + ')</span>';
+      var oneofAttr = node.oneofGroup ? (' data-oneof="' + node.oneofGroup + '"') : '';
+      var depthAttr = ' data-depth="' + depth + '"';
+      var noteMarker = node.note
+        ? '<span class="note-marker" title="' + escapeHtml(node.note) + '">📝 ' + escapeHtml(notePreview(node.note)) + '</span>'
+        : '';
+      if (hasChildren) {
+        var childHtml = '<div class="nested">';
+        for (var i = 0; i < node.children.length; i++) {
+          childHtml += treeHtml(node.children[i], depth + 1);
+        }
+        childHtml += '</div>';
+        return '<details data-node="' + node.id + '"' + depthAttr + oneofAttr + '>'
+          + '<summary data-node="' + node.id + '">' + pill
+          + '<span class="name">' + escapeHtml(node.label) + '</span>'
+          + (preview ? '<span class="preview">' + escapeHtml(preview) + '</span>' : '')
+          + range + noteMarker + '</summary>' + childHtml + '</details>';
+      }
+      return '<div data-node="' + node.id + '" class="leaf"'
+        + depthAttr + oneofAttr + '>'
+        + '<summary data-node="' + node.id + '" style="display:inline-block;list-style:none;">'
+        + pill + '<span class="name">' + escapeHtml(node.label) + '</span>'
+        + (preview ? '<span class="preview">' + escapeHtml(preview) + '</span>' : '')
+        + range + noteMarker + '</summary></div>';
+    }
+
+    function notePreview(text) {
+      // Show the leading "T1: ..." style label up to the em-dash, or the
+      // first 50 chars otherwise.
+      var em = text.indexOf('—');
+      if (em > 0 && em < 80) return text.slice(0, em).trim();
+      return text.length > 60 ? text.slice(0, 57) + '...' : text;
+    }
+
+    function pillFor(node) {
+      var cls, label;
+      switch (node.kind) {
+        case 'magic':   cls = 't-magic';   label = 'MAGIC'; break;
+        case 'version': cls = 't-version'; label = 'VERSION'; break;
+        case 'frame':   cls = 't-frame';   label = 'FRAME'; break;
+        case 'record':  cls = 't-frame';   label = (node.recordKind || 'RECORD').toUpperCase(); break;
+        case 'msg':     cls = 't-msg';     label = node.messageType || 'MSG'; break;
+        case 'tag':     cls = 't-tag';     label = 'TAG #' + node.fieldNumber + ' w' + node.wireType; break;
+        case 'len':     cls = 't-len';     label = 'LEN'; break;
+        case 'varint':  cls = 't-scalar';  label = (node.fieldType || 'varint').toUpperCase(); break;
+        case 'bool':    cls = 't-scalar';  label = 'BOOL'; break;
+        case 'sealed':  cls = 't-quirk';   label = 'QUIRK'; break;
+        case 'fixed64': cls = 't-scalar';  label = (node.fieldType || 'FIXED64').toUpperCase(); break;
+        case 'fixed32': cls = 't-scalar';  label = (node.fieldType || 'FIXED32').toUpperCase(); break;
+        case 'string':  cls = 't-string';  label = 'STRING'; break;
+        case 'bytes':   cls = 't-bytes';   label = node.isJson ? 'JSON' : (node.isUuid ? 'UUID' : 'BYTES'); break;
+        default:        cls = 't-msg';     label = (node.kind || 'NODE').toUpperCase();
+      }
+      if (node.quirk) {
+        cls += ' t-quirk-overlay';
+        label += ' ⚠';
+      }
+      return '<span class="pill ' + cls + '">' + escapeHtml(label) + '</span>';
+    }
+
+    function previewFor(node) {
+      if (node.decodedValue !== undefined) {
+        var s = String(node.decodedValue);
+        if (s.length > 60) s = s.slice(0, 57) + '...';
+        return '= ' + s;
+      }
+      return '';
+    }
+
+    // ============================================================
+    // Detail pane rendering
+    // ============================================================
+    function renderDetail() {
+      var d = document.getElementById('detail');
+      if (state.selectedId == null) {
+        d.innerHTML = '<p style="color:var(--c-muted);">Click any byte or tree node to see its decoded value, proto field number, wire type, schema text, and any non-obvious encoding quirks.</p>';
+        return;
+      }
+      var node = state.nodes[state.selectedId];
+      var rows = [];
+      rows.push(['Label', escapeHtml(node.label)]);
+      rows.push(['Kind', '<code>' + node.kind + '</code>']);
+      rows.push(['Byte range', '<code>[' + node.byteStart + '..' + node.byteEnd + ') = '
+        + (node.byteEnd - node.byteStart) + ' B</code>']);
+      if (node.fieldNumber != null) rows.push(['Proto field #', '<code>' + node.fieldNumber + '</code>']);
+      if (node.wireType != null) {
+        var wn = ['varint', 'fixed64', 'length-delimited', 'group-start', 'group-end', 'fixed32'][node.wireType] || '?';
+        rows.push(['Wire type', '<code>' + node.wireType + ' (' + wn + ')</code>']);
+      }
+      if (node.fieldType) rows.push(['Proto type', '<code>' + escapeHtml(node.fieldType) + '</code>']);
+      if (node.parentMessage) rows.push(['Parent message', '<code>' + escapeHtml(node.parentMessage) + '</code>']);
+      if (node.messageType) rows.push(['Message type', '<code>' + escapeHtml(node.messageType) + '</code>']);
+      if (node.oneofGroup) rows.push(['Oneof group', '<code>' + escapeHtml(node.oneofGroup) + '</code>']);
+      if (node.decodedValue !== undefined) rows.push(['Decoded value', '<code>' + escapeHtml(String(node.decodedValue)) + '</code>']);
+      if (node.detail) rows.push(['Notes', escapeHtml(node.detail).replace(/\n/g, '<br>')]);
+      if (node.fieldComment) rows.push(['.proto comment', '<em>' + escapeHtml(node.fieldComment) + '</em>']);
+      if (node.schemaPath) {
+        var sd = schemaDeclFor(node);
+        if (sd) rows.push(['Schema declaration', '<div class="schema-block">' + escapeHtml(sd) + '</div>']);
+      }
+      var html = '';
+      // Lineage breadcrumb (clickable + hoverable)
+      var anc = ancestorIds(state.selectedId).slice();  // root...parent
+      var trail = anc.concat([state.selectedId]);
+      if (trail.length > 1) {
+        var parts = [];
+        for (var bi = 0; bi < trail.length; bi++) {
+          var n = state.nodes[trail[bi]];
+          if (!n) continue;
+          var isTail = bi === trail.length - 1;
+          parts.push('<span class="crumb' + (isTail ? ' tail' : '')
+            + '" data-node="' + n.id + '">' + escapeHtml(crumbLabel(n)) + '</span>');
+        }
+        html += '<div class="breadcrumb">' + parts.join('<span class="sep">›</span>') + '</div>';
+      }
+      // Note callout
+      if (node.note) {
+        html += '<div class="note-block">' + escapeHtml(node.note) + '</div>';
+      }
+      html += '<dl>';
+      for (var i = 0; i < rows.length; i++) {
+        html += '<dt>' + rows[i][0] + '</dt><dd>' + rows[i][1] + '</dd>';
+      }
+      html += '</dl>';
+
+      // Quirk callout
+      if (node.quirk && node.quirkNote) {
+        html += '<div class="quirk-block"><b>QUIRK:</b> ' + escapeHtml(node.quirkNote) + '</div>';
+      } else if (node.kind === 'sealed' && node.detail) {
+        html += '<div class="quirk-block"><b>QUIRK:</b> ' + escapeHtml(node.detail) + '</div>';
+      }
+
+      // JSON expander
+      if (node.isJson && node.jsonText) {
+        var pretty = node.jsonText;
+        try { pretty = JSON.stringify(JSON.parse(node.jsonText), null, 2); } catch (e) {}
+        html += '<details><summary>Show JSON ('
+          + (node.byteEnd - node.byteStart) + ' bytes)</summary>'
+          + '<pre>' + escapeHtml(pretty) + '</pre></details>';
+      }
+
+      d.innerHTML = html;
+    }
+
+    function crumbLabel(node) {
+      // Compact label suitable for a breadcrumb crumb.
+      switch (node.kind) {
+        case 'file':    return 'File';
+        case 'magic':   return 'magic';
+        case 'version': return 'version';
+        case 'frame':   return node.label || 'frame';
+        case 'record':  return node.label || 'record';
+        case 'msg':     return node.label || node.messageType || 'msg';
+        case 'tag':     return 'tag #' + node.fieldNumber;
+        case 'len':     return 'len';
+        case 'string':
+        case 'bytes':
+        case 'varint':
+        case 'bool':
+        case 'sealed':
+        case 'fixed64':
+        case 'fixed32': return node.fieldName || node.label || node.kind;
+        default:        return node.label || node.kind;
+      }
+    }
+
+    function schemaDeclFor(node) {
+      if (!node.parentMessage || !node.fieldName) return null;
+      var def = state.schema.messages[node.parentMessage];
+      if (!def) return null;
+      var f;
+      for (var i = 0; i < def.fields.length; i++) {
+        if (def.fields[i].name === node.fieldName) { f = def.fields[i]; break; }
+      }
+      if (!f) return null;
+      var prefix = '';
+      if (f.oneof) prefix = '// inside oneof ' + f.oneof + '\n';
+      if (f.repeated) prefix += 'repeated ';
+      return 'message ' + node.parentMessage + ' { ' + prefix
+        + (f.repeated ? '' : '') + f.type + ' ' + f.name + ' = ' + f.number + '; }';
+    }
+
+    // ============================================================
+    // Selection / highlighting
+    // ============================================================
+    function select(nodeId, opts) {
+      // opts.skipOwnExpand: when the user click is happening on the clicked
+      // node's own <summary>, don't force its <details> open — the browser's
+      // native click-to-toggle is responsible for that. Otherwise we'd race
+      // it: we set open=true, native toggle flips to closed, the click ends
+      // up closing instead of opening.
+      var skipOwnExpand = opts && opts.skipOwnExpand;
+      state.selectedId = nodeId;
+      var node = state.nodes[nodeId];
+      if (!node) return;
+      var hex = document.getElementById('hex');
+      var tree = document.getElementById('tree');
+
+      // 1. Hex pane: clear prior, mark selected + every ancestor.
+      var prevHex = hex.querySelectorAll('.b.sel, .b.ancestor');
+      for (var i = 0; i < prevHex.length; i++) {
+        prevHex[i].classList.remove('sel');
+        prevHex[i].classList.remove('ancestor');
+      }
+      var anc = ancestorIds(nodeId);
+      // Ancestor underlines first; .sel paints over.
+      for (var a = 0; a < anc.length; a++) {
+        var aN = state.nodes[anc[a]];
+        for (var off = aN.byteStart; off < aN.byteEnd; off++) {
+          var elt = hex.querySelector('.b[data-off="' + off + '"]');
+          if (elt) elt.classList.add('ancestor');
+        }
+      }
+      for (var off2 = node.byteStart; off2 < node.byteEnd; off2++) {
+        var b = hex.querySelector('.b[data-off="' + off2 + '"]');
+        if (b) b.classList.add('sel');
+      }
+
+      // 2. Tree pane: clear prior, mark selected + every ancestor, expand chain.
+      var prevTree = tree.querySelectorAll('summary.sel, summary.ancestor');
+      for (var k = 0; k < prevTree.length; k++) {
+        prevTree[k].classList.remove('sel');
+        prevTree[k].classList.remove('ancestor');
+      }
+      for (var aa = 0; aa < anc.length; aa++) {
+        var aSum = tree.querySelector('summary[data-node="' + anc[aa] + '"]');
+        if (aSum) aSum.classList.add('ancestor');
+      }
+      var summary = tree.querySelector('summary[data-node="' + nodeId + '"]');
+      if (summary) {
+        summary.classList.add('sel');
+        var p = summary.parentElement;
+        // If the click is on this summary, leave its own <details> alone so
+        // the browser's native toggle wins. Walk to strict ancestors only.
+        if (skipOwnExpand && p && p.tagName === 'DETAILS') {
+          p = p.parentElement;
+        }
+        while (p && p.id !== 'tree') {
+          if (p.tagName === 'DETAILS') p.open = true;
+          p = p.parentElement;
+        }
+        var rect = summary.getBoundingClientRect();
+        var pr = document.getElementById('tree-pane').getBoundingClientRect();
+        if (rect.top < pr.top || rect.bottom > pr.bottom) {
+          summary.scrollIntoView({ block: 'center' });
+        }
+      }
+
+      // 3. Scroll hex pane to selection if off-screen.
+      var firstByte = hex.querySelector('.b[data-off="' + node.byteStart + '"]');
+      if (firstByte) {
+        var br = firstByte.getBoundingClientRect();
+        var hp = document.getElementById('hex-pane').getBoundingClientRect();
+        if (br.top < hp.top || br.bottom > hp.bottom) {
+          firstByte.scrollIntoView({ block: 'center' });
+        }
+      }
+      renderDetail();
+    }
+
+    // ============================================================
+    // Hover sync: dashed-outline preview without disturbing the
+    // committed click-selection.
+    // ============================================================
+    function clearHover() {
+      var hex = document.getElementById('hex');
+      var tree = document.getElementById('tree');
+      var hxs = hex.querySelectorAll('.b.hover-preview');
+      for (var i = 0; i < hxs.length; i++) hxs[i].classList.remove('hover-preview');
+      var trs = tree.querySelectorAll('summary.hover-preview');
+      for (var j = 0; j < trs.length; j++) trs[j].classList.remove('hover-preview');
+    }
+
+    function hoverNode(nodeId) {
+      clearHover();
+      var node = state.nodes[nodeId];
+      if (!node) return;
+      var hex = document.getElementById('hex');
+      var tree = document.getElementById('tree');
+      for (var off = node.byteStart; off < node.byteEnd; off++) {
+        var b = hex.querySelector('.b[data-off="' + off + '"]');
+        if (b) b.classList.add('hover-preview');
+      }
+      var summary = tree.querySelector('summary[data-node="' + nodeId + '"]');
+      if (summary) summary.classList.add('hover-preview');
+    }
+
+    // ============================================================
+    // Wiring
+    // ============================================================
+    function setupScenarioPicker() {
+      var sel = document.getElementById('scenario');
+      sel.innerHTML = '';
+      for (var i = 0; i < state.scenarios.length; i++) {
+        var opt = document.createElement('option');
+        opt.value = String(i);
+        opt.textContent = (i + 1) + '. ' + state.scenarios[i].name;
+        sel.appendChild(opt);
+      }
+      sel.addEventListener('change', function () {
+        loadScenario(parseInt(sel.value, 10));
+      });
+    }
+
+    function loadScenario(index) {
+      state.scenarioIndex = index;
+      var s = state.scenarios[index];
+      state.origBytes = hexToBytes(s.hex);
+      state.bytes = new Uint8Array(state.origBytes);
+      state.notes = (s.notes || []).filter(function (n) { return n.start >= 0 && n.end >= 0; });
+      state.scenarioLevelNotes = (s.notes || []).filter(function (n) { return n.start < 0 || n.end < 0; });
+      state.selectedId = null;
+      var desc = document.getElementById('scenario-desc');
+      desc.innerHTML = '';
+      var p = document.createElement('p');
+      p.style.margin = '0 0 4px';
+      p.textContent = s.description;
+      desc.appendChild(p);
+      for (var k = 0; k < state.scenarioLevelNotes.length; k++) {
+        var np = document.createElement('p');
+        np.style.margin = '4px 0 0';
+        np.style.color = '#7a5300';
+        np.style.fontSize = '12.5px';
+        np.textContent = state.scenarioLevelNotes[k].label;
+        desc.appendChild(np);
+      }
+      decodeAndRender();
+      var btn = document.getElementById('toggle-sealed');
+      btn.disabled = state.sealedNodeIds.length === 0;
+      btn.textContent = state.sealedNodeIds.length > 0
+        ? 'Toggle sealed bit (' + state.sealedNodeIds.length + ')'
+        : 'Toggle sealed bit';
+    }
+
+    function decodeAndRender() {
+      try {
+        state.tree = decodeFile(state.bytes);
+        attachNotes(state.tree, state.notes);
+        buildOffsetMap();
+        renderHex();
+        renderTree();
+        renderDetail();
+      } catch (e) {
+        document.getElementById('detail').innerHTML =
+          '<div class="quirk-block">Decode error: ' + escapeHtml(String(e.message || e)) + '</div>';
+      }
+    }
+
+    function attachClickHandlers() {
+      var hex = document.getElementById('hex');
+      var tree = document.getElementById('tree');
+
+      // ---- Click selection ----
+      hex.addEventListener('click', function (ev) {
+        var b = ev.target.closest('.b');
+        if (!b) return;
+        var off = parseInt(b.getAttribute('data-off'), 10);
+        if (isNaN(off)) return;
+        var node = deepestNodeAt(off);
+        if (node) select(node.id);
+      });
+      tree.addEventListener('click', function (ev) {
+        var summary = ev.target.closest('summary, .leaf');
+        if (!summary) return;
+        var idStr = summary.getAttribute('data-node')
+          || (summary.querySelector('summary') && summary.querySelector('summary').getAttribute('data-node'));
+        if (idStr == null) return;
+        var id = parseInt(idStr, 10);
+        // skipOwnExpand: the native <details> click-to-toggle handles the
+        // clicked element's open/closed state.
+        if (!isNaN(id)) select(id, { skipOwnExpand: true });
+      });
+
+      // ---- Hover preview (dashed outline, doesn't disturb selection) ----
+      hex.addEventListener('mouseover', function (ev) {
+        var b = ev.target.closest('.b');
+        if (!b) return;
+        var off = parseInt(b.getAttribute('data-off'), 10);
+        if (isNaN(off)) return;
+        var node = deepestNodeAt(off);
+        if (node) hoverNode(node.id);
+      });
+      hex.addEventListener('mouseleave', clearHover);
+      tree.addEventListener('mouseover', function (ev) {
+        var sum = ev.target.closest('summary');
+        if (!sum) return;
+        var idStr = sum.getAttribute('data-node');
+        if (idStr == null) return;
+        var id = parseInt(idStr, 10);
+        if (!isNaN(id)) hoverNode(id);
+      });
+      tree.addEventListener('mouseleave', clearHover);
+
+      // ---- Detail-pane breadcrumb is interactive too ----
+      document.getElementById('detail').addEventListener('click', function (ev) {
+        var crumb = ev.target.closest('.crumb');
+        if (!crumb) return;
+        var idStr = crumb.getAttribute('data-node');
+        if (idStr == null) return;
+        var id = parseInt(idStr, 10);
+        if (!isNaN(id)) select(id);
+      });
+      document.getElementById('detail').addEventListener('mouseover', function (ev) {
+        var crumb = ev.target.closest('.crumb');
+        if (!crumb) return;
+        var idStr = crumb.getAttribute('data-node');
+        if (idStr == null) return;
+        var id = parseInt(idStr, 10);
+        if (!isNaN(id)) hoverNode(id);
+      });
+      document.getElementById('detail').addEventListener('mouseleave', clearHover);
+    }
+
+    function hexToBytes(hex) {
+      var out = new Uint8Array(hex.length / 2);
+      for (var i = 0; i < hex.length; i += 2) {
+        out[i / 2] = parseInt(hex.substr(i, 2), 16);
+      }
+      return out;
+    }
+
+    function setupActions() {
+      document.getElementById('toggle-sealed').addEventListener('click', function () {
+        if (state.sealedNodeIds.length === 0) return;
+        // Toggle the LAST sealed-byte node (the most recently appended txn)
+        var lastId = state.sealedNodeIds[state.sealedNodeIds.length - 1];
+        var node = state.nodes[lastId];
+        var off = node.byteStart;
+        state.bytes[off] = state.bytes[off] === 0 ? 1 : 0;
+        var keepSelected = state.selectedId;
+        decodeAndRender();
+        if (keepSelected != null && state.nodes[keepSelected]) {
+          select(keepSelected);
+        }
+      });
+      document.getElementById('reset').addEventListener('click', function () {
+        if (!state.origBytes) return;
+        state.bytes = new Uint8Array(state.origBytes);
+        decodeAndRender();
+      });
+    }
+
+    // ============================================================
+    // Bootstrap
+    // ============================================================
+    document.addEventListener('DOMContentLoaded', function () {
+      loadFixtures();
+      if (state.scenarios.length === 0) {
+        document.getElementById('detail').innerHTML =
+          '<div class="quirk-block">No fixtures embedded. Run '
+          + '<code>mvn test -Dtest=FormatExplorerFixtures '
+          + '-Dexplorer.regenerate=true</code> then '
+          + '<code>python3 docs/format-explorer/splice-fixtures.py</code>.</div>';
+        return;
+      }
+      setupScenarioPicker();
+      setupActions();
+      attachClickHandlers();   // attach once; survives re-renders.
+      loadScenario(0);
+    });
+  })();
+  </script>
+</body>
+</html>
