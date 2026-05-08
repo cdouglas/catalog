@@ -34,6 +34,12 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.Schema;
+import org.apache.iceberg.SortOrder;
+import org.apache.iceberg.TableMetadata;
+import org.apache.iceberg.TableMetadataParser;
+import org.apache.iceberg.types.Types;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 
@@ -214,11 +220,13 @@ public class FormatExplorerFixtures {
         org.apache.iceberg.catalog.TableIdentifier.of(warehouse, "B"));
     String aMeta = new String(result.inlineMetadata(aId), StandardCharsets.UTF_8);
     String bMeta = new String(result.inlineMetadata(bId), StandardCharsets.UTF_8);
-    if (!"{\"table\":\"A\",\"version\":3}".equals(aMeta)) {
-      throw new AssertionError(s.name + ": A inline metadata = " + aMeta);
+    // After T3, both tables should carry the "last-touched-by":"T3" property
+    // on their inline metadata -- never "T2-stale" (T2 was rejected).
+    if (!aMeta.contains("\"last-touched-by\":\"T3\"") || aMeta.contains("T2-stale")) {
+      throw new AssertionError(s.name + ": A inline metadata didn't end at T3: " + aMeta);
     }
-    if (!"{\"table\":\"B\",\"version\":2}".equals(bMeta)) {
-      throw new AssertionError(s.name + ": B inline metadata = " + bMeta);
+    if (!bMeta.contains("\"last-touched-by\":\"T3\"") || bMeta.contains("T2-stale")) {
+      throw new AssertionError(s.name + ": B inline metadata didn't end at T3: " + bMeta);
     }
   }
 
@@ -347,33 +355,27 @@ public class FormatExplorerFixtures {
         .build();
     byte[] file = encodeFile(catalog);
 
-    String metadataJson = "{\"format-version\":2,"
-        + "\"table-uuid\":\"01900000-0000-7000-8000-0000000000aa\","
-        + "\"location\":\"s3://lake/warehouse/orders\","
-        + "\"last-sequence-number\":0,\"last-updated-ms\":1746518400000,"
-        + "\"current-schema-id\":0,"
-        + "\"schemas\":[{\"type\":\"struct\",\"schema-id\":0,\"fields\":["
-        + "{\"id\":1,\"name\":\"id\",\"required\":true,\"type\":\"long\"},"
-        + "{\"id\":2,\"name\":\"qty\",\"required\":false,\"type\":\"int\"}]}],"
-        + "\"default-spec-id\":0,\"partition-specs\":[{\"spec-id\":0,\"fields\":[]}],"
-        + "\"default-sort-order-id\":0,"
-        + "\"sort-orders\":[{\"order-id\":0,\"fields\":[]}],"
-        + "\"properties\":{},\"current-snapshot-id\":-1,"
-        + "\"snapshots\":[],\"snapshot-log\":[],\"metadata-log\":[]}";
+    byte[] metadataJson = realTableMetadata(
+        "019000aa-0000-7000-8000-000000000001",
+        "s3://lake/warehouse/orders",
+        Map.of("table-name", "orders", "owner", "commerce-team"),
+        PINNED_TS);
 
     UUID txnId = UUID.fromString("01900000-0000-7000-8000-000000000030");
     ProtoCodec.Transaction txn = new ProtoCodec.Transaction(
         txnId, false,
         List.of(new ProtoCodec.CreateTableInlineAction(
-            1, 1, 1, 1, "orders", metadataJson.getBytes(StandardCharsets.UTF_8))));
+            1, 1, 1, 1, "orders", metadataJson)));
     file = appendTxn(file, txn);
 
     return new Scenario(
         "create-table-inline-with-real-metadata",
-        "CreateTableInline action carrying a complete Iceberg TableMetadata "
-            + "JSON in its metadata bytes field. The JSON is opaque to the "
+        "CreateTableInline action carrying a real Iceberg TableMetadata "
+            + "(format-version 2, schema with 6 fields, day-partitioned on "
+            + "ts, four table properties). The JSON is opaque to the "
             + "catalog format -- protobuf treats it as a length-delimited "
-            + "byte string. The detail panel offers a JSON pretty-print.",
+            + "byte string -- but the detail panel pretty-prints it so you "
+            + "can see what fresh-table metadata looks like in practice.",
         file, List.of());
   }
 
@@ -384,17 +386,11 @@ public class FormatExplorerFixtures {
    * the deepest message nesting in the format.
    */
   private Scenario scenarioUpdateTableInlineDelta() {
-    String baseMetadataJson = "{\"format-version\":2,"
-        + "\"table-uuid\":\"01900000-0000-7000-8000-0000000000bb\","
-        + "\"location\":\"s3://lake/warehouse/events\","
-        + "\"last-sequence-number\":0,\"last-updated-ms\":1746518400000,"
-        + "\"current-schema-id\":0,\"schemas\":[{\"type\":\"struct\","
-        + "\"schema-id\":0,\"fields\":[]}],\"default-spec-id\":0,"
-        + "\"partition-specs\":[{\"spec-id\":0,\"fields\":[]}],"
-        + "\"default-sort-order-id\":0,\"sort-orders\":[{\"order-id\":0,"
-        + "\"fields\":[]}],\"properties\":{},\"current-snapshot-id\":-1,"
-        + "\"snapshots\":[],\"snapshot-log\":[],\"metadata-log\":[]}";
-    byte[] baseMetadata = baseMetadataJson.getBytes(StandardCharsets.UTF_8);
+    byte[] baseMetadata = realTableMetadata(
+        "019000bb-0000-7000-8000-000000000001",
+        "s3://lake/warehouse/events",
+        Map.of("table-name", "events", "owner", "telemetry-team"),
+        PINNED_TS);
 
     ProtoCatalogFile catalog = ProtoCatalogFile.builder(LOCATION)
         .setCatalogUuid(FIXED_CATALOG_UUID)
@@ -577,15 +573,30 @@ public class FormatExplorerFixtures {
    * fails verify after T1, T3 retries with A.v=2.
    */
   private Scenario scenarioInlineMultiTableConflictRetry() {
-    byte[] aV1 = ("{\"table\":\"A\",\"version\":1}").getBytes(StandardCharsets.UTF_8);
-    byte[] bV1 = ("{\"table\":\"B\",\"version\":1}").getBytes(StandardCharsets.UTF_8);
-    byte[] aV2 = ("{\"table\":\"A\",\"version\":2}").getBytes(StandardCharsets.UTF_8);
-    byte[] aV3Stale = ("{\"table\":\"A\",\"version\":3,\"writer\":\"stale\"}")
-        .getBytes(StandardCharsets.UTF_8);
-    byte[] bV2Stale = ("{\"table\":\"B\",\"version\":2,\"writer\":\"stale\"}")
-        .getBytes(StandardCharsets.UTF_8);
-    byte[] aV3 = ("{\"table\":\"A\",\"version\":3}").getBytes(StandardCharsets.UTF_8);
-    byte[] bV2 = ("{\"table\":\"B\",\"version\":2}").getBytes(StandardCharsets.UTF_8);
+    // Each table starts at a distinct UUID; subsequent versions are
+    // evolveTableMetadata() chains, so what differs between versions is a
+    // single "last-touched-by" property -- realistic for this kind of
+    // metadata commit, and demonstrates how a small logical change still
+    // re-serializes the entire TableMetadata document on the wire.
+    byte[] aV1 = realTableMetadata(
+        "019000a1-0000-7000-8000-000000000001",
+        "s3://lake/warehouse/A",
+        Map.of("table-name", "A"),
+        PINNED_TS);
+    byte[] bV1 = realTableMetadata(
+        "019000b1-0000-7000-8000-000000000001",
+        "s3://lake/warehouse/B",
+        Map.of("table-name", "B"),
+        PINNED_TS);
+    byte[] aV2 = evolveTableMetadata(aV1, "T1", PINNED_TS_AFTER_T1);
+    // T2 (the loser) targets A as a fresh evolution off aV1, NOT off aV2,
+    // because that's exactly the writer's stale view of the world: it never
+    // saw T1's commit.
+    byte[] aV3Stale = evolveTableMetadata(aV1, "T2-stale", PINNED_TS_AFTER_T2);
+    byte[] bV2Stale = evolveTableMetadata(bV1, "T2-stale", PINNED_TS_AFTER_T2);
+    // T3 (the retry) is built off the now-current aV2.
+    byte[] aV3 = evolveTableMetadata(aV2, "T3", PINNED_TS_AFTER_T3);
+    byte[] bV2 = evolveTableMetadata(bV1, "T3", PINNED_TS_AFTER_T3);
 
     ProtoCatalogFile catalog = ProtoCatalogFile.builder(LOCATION)
         .setCatalogUuid(FIXED_CATALOG_UUID)
@@ -639,6 +650,80 @@ public class FormatExplorerFixtures {
             + "UpdateTableLocation (Action field 7) and the new metadata travels as a length-delimited "
             + "bytes field inside each action, instead of a string URL.",
         file, notes);
+  }
+
+  // ============================================================
+  // Real Iceberg TableMetadata helpers
+  //
+  // The catalog format treats inline table metadata as opaque length-
+  // delimited bytes -- it never parses the JSON. Most catalog tests
+  // therefore use minimal "{}"-style placeholders. The format-explorer
+  // visualizer is different: developers open it precisely to see what
+  // realistic payloads look like on the wire. So we build genuine Iceberg
+  // TableMetadata via TableMetadata.buildFromEmpty(), serialize via
+  // TableMetadataParser.toJson, and pin both the UUID and last-updated-ms
+  // so fixture regenerations produce stable bytes.
+  // ============================================================
+
+  private static final long PINNED_TS = 1_746_518_400_000L;     // 2025-05-06 12:00:00Z
+  private static final long PINNED_TS_AFTER_T1 = PINNED_TS + 60_000L;
+  private static final long PINNED_TS_AFTER_T2 = PINNED_TS + 120_000L;
+  private static final long PINNED_TS_AFTER_T3 = PINNED_TS + 180_000L;
+
+  private static Schema demoSchema() {
+    return new Schema(
+        Types.NestedField.required(1, "id", Types.LongType.get()),
+        Types.NestedField.required(2, "ts", Types.TimestampType.withZone()),
+        Types.NestedField.optional(3, "category", Types.StringType.get()),
+        Types.NestedField.optional(4, "amount", Types.DecimalType.of(12, 2)),
+        Types.NestedField.optional(5, "tags",
+            Types.ListType.ofOptional(7, Types.StringType.get())),
+        Types.NestedField.optional(6, "payload", Types.StringType.get()));
+  }
+
+  /** Real Iceberg TableMetadata for a fresh table; deterministic JSON bytes. */
+  private static byte[] realTableMetadata(
+      String tableUuid, String location, Map<String, String> extraProps, long timestamp) {
+    Schema schema = demoSchema();
+    PartitionSpec spec = PartitionSpec.builderFor(schema).day("ts").build();
+    Map<String, String> props = new LinkedHashMap<>();
+    props.put("write.format.default", "parquet");
+    props.put("write.parquet.compression-codec", "zstd");
+    props.put("write.target-file-size-bytes", "536870912");
+    props.put("owner", "data-platform");
+    if (extraProps != null) {
+      props.putAll(extraProps);
+    }
+    TableMetadata meta = TableMetadata.buildFromEmpty()
+        .setLocation(location)
+        .setCurrentSchema(schema, /* lastColumnId */ 7)
+        .addPartitionSpec(spec)
+        .addSortOrder(SortOrder.unsorted())
+        .setProperties(props)
+        .assignUUID(tableUuid)
+        .setLastUpdatedMillis(timestamp)
+        .discardChanges()
+        .build();
+    return TableMetadataParser.toJson(meta).getBytes(StandardCharsets.UTF_8);
+  }
+
+  /**
+   * Builds the next realistic TableMetadata: same schema/spec/UUID as
+   * {@code base}, with one extra property added to record which writer
+   * committed it. Use this for the post-T1 / post-T3 commits.
+   */
+  private static byte[] evolveTableMetadata(
+      byte[] baseJson, String label, long timestamp) {
+    TableMetadata base = TableMetadataParser.fromJson(
+        new String(baseJson, StandardCharsets.UTF_8));
+    Map<String, String> updated = new LinkedHashMap<>(base.properties());
+    updated.put("last-touched-by", label);
+    TableMetadata next = TableMetadata.buildFrom(base)
+        .setProperties(updated)
+        .setLastUpdatedMillis(timestamp)
+        .discardChanges()
+        .build();
+    return TableMetadataParser.toJson(next).getBytes(StandardCharsets.UTF_8);
   }
 
   // ============================================================
