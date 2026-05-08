@@ -336,6 +336,58 @@ public class TestInlineManifestEndToEnd {
         .isNotInstanceOf(org.apache.hadoop.conf.Configurable.class);
   }
 
+  /**
+   * Reads the last appended transaction record from the catalog file and
+   * returns its {@link ProtoCodec.UpdateTableInlineAction}. Fails fast if
+   * the last action isn't an UpdateTableInline.
+   */
+  static ProtoCodec.UpdateTableInlineAction lastInlineUpdateAction(MemoryFileIO io)
+      throws IOException {
+    byte[] bytes = io.files.get("mem:///warehouse/catalog");
+    if (bytes == null) {
+      throw new IllegalStateException("catalog file not present");
+    }
+    java.io.ByteArrayInputStream in = new java.io.ByteArrayInputStream(bytes);
+    in.skip(8); // magic + version
+    int chkLen = readVarintFromStream(in);
+    in.skip(chkLen);
+
+    ProtoCodec.Transaction last = null;
+    while (in.available() > 0) {
+      int txnLen = readVarintFromStream(in);
+      byte[] txnBytes = in.readNBytes(txnLen);
+      last = ProtoCodec.decodeTransaction(txnBytes);
+    }
+    if (last == null) {
+      throw new IllegalStateException("no appended transaction in catalog file");
+    }
+    java.util.List<ProtoCodec.Action> actions = last.actions();
+    if (actions.isEmpty()) {
+      throw new IllegalStateException("last transaction has no actions");
+    }
+    ProtoCodec.Action a = actions.get(actions.size() - 1);
+    if (!(a instanceof ProtoCodec.UpdateTableInlineAction)) {
+      throw new IllegalStateException(
+          "expected UpdateTableInlineAction, got " + a.getClass().getSimpleName());
+    }
+    return (ProtoCodec.UpdateTableInlineAction) a;
+  }
+
+  private static int readVarintFromStream(java.io.InputStream in) throws IOException {
+    int result = 0;
+    int shift = 0;
+    int b;
+    do {
+      b = in.read();
+      if (b < 0) {
+        throw new IOException("EOF reading varint");
+      }
+      result |= (b & 0x7F) << shift;
+      shift += 7;
+    } while ((b & 0x80) != 0);
+    return result;
+  }
+
   @Nested
   class BaselineTests extends ConfiguredTests {
     @Override InlineConfig config() { return InlineConfig.BASELINE; }
@@ -401,6 +453,95 @@ public class TestInlineManifestEndToEnd {
           .as("stats must survive reload alongside property update")
           .extracting(StatisticsFile::snapshotId)
           .containsExactly(snapId);
+    }
+
+    /**
+     * commitInline full-mode trigger A: a stats-only commit produces no
+     * delta-representable updates (computeDelta returns null), so
+     * {@code selectMode} picks {@code "full"} and the wire action carries
+     * full_metadata. Sharper than {@link
+     * #transactionWithStatisticsAndPropertiesSurvivesReload} (which only
+     * checks the round-trip outcome): this test cracks open the appended
+     * transaction and asserts on the action's payload variant.
+     */
+    @Test
+    void statsOnlyCommitEmitsFullModeAction() throws IOException {
+      createNamespaceAndTable();
+      Table tbl = catalog.loadTable(TBL);
+      tbl.newFastAppend().appendFile(FILE_A).commit();
+      long snapId = tbl.currentSnapshot().snapshotId();
+
+      StatisticsFile stat = new GenericStatisticsFile(
+          snapId, "/path/to/stats.puffin", 100, 90, List.of());
+      tbl.updateStatistics().setStatistics(stat).commit();
+
+      ProtoCodec.UpdateTableInlineAction action = lastInlineUpdateAction(io);
+      assertThat(action.fullMetadata)
+          .as("stats-only commit (no representable delta) must emit full_metadata")
+          .isNotNull();
+      assertThat(action.deltaBytes).isNull();
+      assertThat(action.metadataLocation).isNull();
+    }
+
+    /**
+     * commitInline full-mode trigger C (re-inline from pointer): a table
+     * created in pointer mode and then updated under inline-enabled
+     * configuration. The catalog has no prior inline metadata for the
+     * table, so a delta-mode apply would silently no-op
+     * ({@code UpdateTableInlineAction.apply} bails when {@code currentMeta}
+     * is null). {@code commitInline} compensates by forcing full mode
+     * whenever {@code selectMode} picked delta but
+     * {@code lastCatalogFile.isInlineTable(tableId)} is false. The wire
+     * action must carry full_metadata, the catalog entry must transition
+     * to inline, and the property update must survive reload.
+     */
+    @Test
+    void pointerTableUpdatedUnderInlineConfigForcesFullMode() throws IOException {
+      // Phase 1: create + populate the table under pointer-mode config so
+      // a real metadata.json exists and the catalog entry is pointer.
+      Map<String, String> pointerProps = new HashMap<>(InlineConfig.BASELINE
+          .catalogProperties("mem:///warehouse"));
+      FileIOCatalog pointerCat = new FileIOCatalog(
+          "pointer", "mem:///warehouse/catalog", new ProtoCatalogFormat(), io, pointerProps);
+      pointerCat.initialize("pointer", pointerProps);
+      pointerCat.createNamespace(Namespace.of("db"));
+      pointerCat.buildTable(TBL, TEST_SCHEMA).create();
+
+      ProtoCatalogFormat fmt = new ProtoCatalogFormat();
+      ProtoCatalogFile beforeUpdate = (ProtoCatalogFile) fmt.read(
+          io, io.newInputFile("mem:///warehouse/catalog"));
+      Integer tblId = beforeUpdate.tableId(TBL);
+      assertThat(beforeUpdate.isInlineTable(tblId))
+          .as("table must start as pointer-mode under BASELINE config")
+          .isFalse();
+
+      // Phase 2: switch to inline-enabled config and update the table.
+      // setUp() already configured `catalog` with TM_ONLY props.
+      Table tbl = catalog.loadTable(TBL);
+      tbl.updateProperties().set("foo", "bar").commit();
+
+      // Wire-format check: action must be full_metadata, not delta.
+      ProtoCodec.UpdateTableInlineAction action = lastInlineUpdateAction(io);
+      assertThat(action.fullMetadata)
+          .as("pointer→inline transition must emit full_metadata so the catalog "
+              + "receives the bytes that seed future deltas")
+          .isNotNull();
+      assertThat(action.deltaBytes).isNull();
+      assertThat(action.metadataLocation).isNull();
+
+      // Catalog state: table is now inline.
+      ProtoCatalogFile afterUpdate = (ProtoCatalogFile) fmt.read(
+          io, io.newInputFile("mem:///warehouse/catalog"));
+      assertThat(afterUpdate.isInlineTable(tblId))
+          .as("table must be inline after the update")
+          .isTrue();
+
+      // Reload: property update is observable.
+      FileIOCatalog fresh = reloadCatalog();
+      Table reloaded = fresh.loadTable(TBL);
+      assertThat(reloaded.properties())
+          .as("property update must survive reload")
+          .containsEntry("foo", "bar");
     }
   }
 

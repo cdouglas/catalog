@@ -603,6 +603,15 @@ public class FileIOCatalog extends BaseMetastoreCatalog
           mode = "delta";
         }
 
+        // Pointer → inline transition: when the catalog has the table as
+        // pointer (no inline metadata yet) but selectMode picked delta, the
+        // delta would silently no-op on apply — UpdateTableInlineAction.apply
+        // bails when currentMeta is null. Force full mode so the catalog
+        // actually receives the inline bytes that seed future deltas.
+        if ("delta".equals(mode) && !lastCatalogFile.isInlineTable(tableId)) {
+          mode = "full";
+        }
+
         CatalogFile.Mut<?, ?> mut = format.from(lastCatalogFile);
         switch (mode) {
           case "delta":
@@ -880,6 +889,11 @@ public class FileIOCatalog extends BaseMetastoreCatalog
           // (encodeDelta would NPE; full is the correct fallback). See errata D1.
           if ((hasMLDeltas || hasMLPool) && !"delta".equals(mode) && delta != null) {
             mode = "delta";
+          }
+          // Pointer → inline transition: same reason as commitInline.
+          // Without this, a delta lands but applies to nothing.
+          if ("delta".equals(mode) && !current.isInlineTable(tableId)) {
+            mode = "full";
           }
           switch (mode) {
             case "delta":
