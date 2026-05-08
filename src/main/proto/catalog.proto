@@ -41,8 +41,37 @@ message Checkpoint {
   // Inline table metadata (tables with metadata stored in the catalog)
   repeated InlineTable inline_tables = 13;
 
-  // Committed transaction tracking (for deduplication)
-  repeated bytes committed_transaction_ids = 20;  // UUIDv7s, 16 bytes each
+  // Committed transaction tracking (for deduplication). UUIDv7s, compressed
+  // by sorting descending and delta-encoding the timestamp half. See
+  // CommittedTransactions and docs/UUID_V7_BENCH_RESULTS.md.
+  CommittedTransactions committed_transactions = 20;
+}
+
+// Compressed UUIDv7 set. The encoder sorts entries descending by UUID
+// (= descending by timestamp, since v7's high bits are timestamp), records
+// the largest timestamp as `max_timestamp_ms`, and emits per-entry the gap
+// from the previous timestamp plus 10 bytes of random material (rand_a +
+// rand_b, with the fixed version and variant bits dropped). The decoder
+// reconstructs each UUID by reapplying the version (=0x7) and variant
+// (=0b10) bits.
+//
+// Per-entry wire cost: 1 (delta tag) + 1-3 (delta varint) + 10 (random)
+// ≈ 12 bytes for clustered timestamps, 14 bytes for sparse year-spanning
+// sets, vs 18 bytes (16 + tag + length) for the prior `repeated bytes`
+// encoding. ~30% reduction at typical sizes; see docs/UUID_V7_BENCH_RESULTS.md.
+message CommittedTransactions {
+  // Largest (most recent) timestamp in ms. Implicit when the set is empty.
+  fixed64 max_timestamp_ms = 1;
+
+  // Per entry, descending timestamp order: gap from previous entry.
+  // The first delta is 0 (max_timestamp_ms - max_timestamp_ms). Same logical
+  // length as random_packed / 10.
+  repeated uint64 timestamp_deltas = 2;
+
+  // 10 bytes per entry, in the same order as timestamp_deltas. Each chunk:
+  // 12 bits rand_a + 62 bits rand_b + 6 bits zero pad. Decoder invariant:
+  // random_packed.length == 10 * len(timestamp_deltas).
+  bytes random_packed = 3;
 }
 
 message Namespace {

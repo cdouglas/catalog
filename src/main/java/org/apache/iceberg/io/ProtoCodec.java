@@ -69,6 +69,11 @@ public class ProtoCodec {
   private static final int CHECKPOINT_INLINE_TABLES = 13;
   private static final int CHECKPOINT_COMMITTED_TXNS = 20;
 
+  // CommittedTransactions field numbers (compressed UUIDv7 set)
+  private static final int COMMITTED_TXNS_MAX_TIMESTAMP_MS = 1;
+  private static final int COMMITTED_TXNS_TIMESTAMP_DELTAS = 2;
+  private static final int COMMITTED_TXNS_RANDOM_PACKED = 3;
+
   // Namespace field numbers
   private static final int NS_ID = 1;
   private static final int NS_VERSION = 2;
@@ -266,9 +271,14 @@ public class ProtoCodec {
         }
       }
 
-      // Committed transactions
-      for (UUID txnId : original.committedTransactions()) {
-        writeBytes(out, CHECKPOINT_COMMITTED_TXNS, uuidToBytes(txnId));
+      // Committed transactions (compressed UUIDv7 set, see CommittedTransactions
+      // proto). Empty set is omitted for wire-byte parity with the prior encoding.
+      // TODO: the dedup set is unbounded — a retention policy is the right fix
+      // for long-lived catalogs; this compression ~30% per entry but doesn't
+      // change the linear-growth shape.
+      if (!original.committedTransactions().isEmpty()) {
+        byte[] inner = encodeCommittedTransactions(original.committedTransactions());
+        writeLengthDelimited(out, CHECKPOINT_COMMITTED_TXNS, inner);
       }
 
       return out.toByteArray();
@@ -311,7 +321,7 @@ public class ProtoCodec {
             decodeInlineTable(readLengthDelimitedBytes(in), builder);
             break;
           case CHECKPOINT_COMMITTED_TXNS:
-            builder.addCommittedTransaction(bytesToUuid(readLengthDelimitedBytes(in)));
+            decodeCommittedTransactions(readLengthDelimitedBytes(in), builder);
             break;
           default:
             skipField(in, wireType);
@@ -321,6 +331,76 @@ public class ProtoCodec {
       builder.rebuildLookups();
     } catch (IOException e) {
       throw new UncheckedIOException(e);
+    }
+  }
+
+  /**
+   * Encodes the committed-transaction UUIDv7 set as a {@code CommittedTransactions}
+   * sub-message body. Sorts entries descending by UUID (= descending by timestamp
+   * for v7), emits the largest timestamp as {@code max_timestamp_ms}, then for
+   * each entry emits the gap from the previous timestamp (varint) and 10 bytes
+   * of random material (rand_a + rand_b, version/variant bits dropped).
+   *
+   * <p>Caller is responsible for omitting the outer field when the set is empty.
+   */
+  static byte[] encodeCommittedTransactions(java.util.Collection<UUID> txns)
+      throws IOException {
+    UUID[] sorted = txns.toArray(new UUID[0]);
+    java.util.Arrays.sort(sorted, (a, b) -> b.compareTo(a));
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    long maxTs = sorted.length == 0 ? 0L : UuidV7.timestampMs(sorted[0]);
+    writeFixed64(out, COMMITTED_TXNS_MAX_TIMESTAMP_MS, maxTs);
+    ByteArrayOutputStream randomBuf = new ByteArrayOutputStream(10 * sorted.length);
+    long prev = maxTs;
+    for (UUID u : sorted) {
+      long ts = UuidV7.timestampMs(u);
+      writeVarint64(out, COMMITTED_TXNS_TIMESTAMP_DELTAS, prev - ts);
+      prev = ts;
+      randomBuf.write(UuidV7.packRandomBits(u));
+    }
+    writeBytes(out, COMMITTED_TXNS_RANDOM_PACKED, randomBuf.toByteArray());
+    return out.toByteArray();
+  }
+
+  /**
+   * Decodes a {@code CommittedTransactions} sub-message body and adds each
+   * reconstructed v7 UUID to the builder. Throws if the random_packed length
+   * doesn't match the delta count (length invariant).
+   */
+  static void decodeCommittedTransactions(byte[] body, ProtoCatalogFile.Builder builder)
+      throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(body);
+    long maxTs = 0L;
+    java.util.List<Long> deltas = new ArrayList<>();
+    byte[] randomPacked = new byte[0];
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      int fieldNumber = tag >>> 3;
+      int wireType = tag & 0x7;
+      switch (fieldNumber) {
+        case COMMITTED_TXNS_MAX_TIMESTAMP_MS:
+          maxTs = readFixed64(in);
+          break;
+        case COMMITTED_TXNS_TIMESTAMP_DELTAS:
+          deltas.add(readVarint64(in));
+          break;
+        case COMMITTED_TXNS_RANDOM_PACKED:
+          randomPacked = readLengthDelimitedBytes(in);
+          break;
+        default:
+          skipField(in, wireType);
+      }
+    }
+    if (randomPacked.length != 10 * deltas.size()) {
+      throw new IOException(
+          "Malformed CommittedTransactions: random_packed has "
+              + randomPacked.length + " bytes but " + deltas.size() + " deltas");
+    }
+    long ts = maxTs;
+    for (int i = 0; i < deltas.size(); i++) {
+      ts -= deltas.get(i);
+      builder.addCommittedTransaction(
+          UuidV7.fromTimestampAndRandom(ts, randomPacked, i * 10));
     }
   }
 

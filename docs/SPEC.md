@@ -82,16 +82,36 @@ message Checkpoint {
   bytes  catalog_uuid              = 1;   // 16 bytes, UUIDv7
   int32  next_namespace_id         = 2;
   int32  next_table_id             = 3;
-  repeated Namespace          namespaces                = 10;
-  repeated Table              tables                    = 11;  // pointer-mode tables
-  repeated NamespaceProperty  namespace_properties      = 12;
-  repeated InlineTable        inline_tables             = 13;  // inline-mode tables
-  repeated bytes              committed_transaction_ids = 20;  // 16-byte UUIDs
+  repeated Namespace          namespaces             = 10;
+  repeated Table              tables                 = 11;  // pointer-mode tables
+  repeated NamespaceProperty  namespace_properties   = 12;
+  repeated InlineTable        inline_tables          = 13;  // inline-mode tables
+  CommittedTransactions       committed_transactions = 20;  // compressed UUIDv7 set
+}
+
+message CommittedTransactions {
+  fixed64 max_timestamp_ms          = 1;  // largest timestamp in the set
+  repeated uint64 timestamp_deltas  = 2;  // descending; gap from previous entry
+  bytes random_packed               = 3;  // 10 bytes/entry: rand_a + rand_b + 6-bit pad
 }
 ```
 
 A table ID appears in either `tables` (pointer mode) or `inline_tables`
 (inline mode), never both.
+
+The `committed_transactions` sub-message exploits the structure of UUIDv7
+to compress the dedup set. Entries are sorted descending by UUID (= by
+timestamp), the largest timestamp is stored once as `max_timestamp_ms`,
+and each entry contributes a varint gap-from-previous plus 10 bytes of
+random material (the 12-bit `rand_a` plus 62-bit `rand_b`, with the
+fixed 4-bit version and 2-bit variant nibbles dropped on encode and
+reconstructed on decode). For typical clustered commit traffic this
+saves ~30% per entry vs the older `repeated bytes` form. All entries
+must be UUIDv7; non-v7 IDs are rejected at the dedup-set entry point
+(`ProtoCatalogFile.Builder.addCommittedTransaction`) and skipped at
+read-time replay (`Transaction.verify` returns false). See
+[UUID_V7_BENCH_RESULTS.md](UUID_V7_BENCH_RESULTS.md) for the encoding
+study that informed this choice.
 
 ### Catalog Entities
 

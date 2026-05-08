@@ -402,7 +402,14 @@
           {"number": 11, "name": "tables", "type": "Table", "repeated": true, "oneof": null, "comment": ""},
           {"number": 12, "name": "namespace_properties", "type": "NamespaceProperty", "repeated": true, "oneof": null, "comment": ""},
           {"number": 13, "name": "inline_tables", "type": "InlineTable", "repeated": true, "oneof": null, "comment": "Inline table metadata (tables with metadata stored in the catalog)"},
-          {"number": 20, "name": "committed_transaction_ids", "type": "bytes", "repeated": true, "oneof": null, "comment": "Committed transaction tracking (for deduplication) UUIDv7s, 16 bytes each"}
+          {"number": 20, "name": "committed_transactions", "type": "CommittedTransactions", "repeated": false, "oneof": null, "comment": "Committed transaction tracking (for deduplication). UUIDv7s, compressed by sorting descending and delta-encoding the timestamp half. See CommittedTransactions and docs/UUID_V7_BENCH_RESULTS.md."}
+        ]
+      },
+      "CommittedTransactions": {
+        "fields": [
+          {"number": 1, "name": "max_timestamp_ms", "type": "fixed64", "repeated": false, "oneof": null, "comment": "Largest (most recent) timestamp in ms. Implicit when the set is empty."},
+          {"number": 2, "name": "timestamp_deltas", "type": "uint64", "repeated": true, "oneof": null, "comment": "Per entry, descending timestamp order: gap from previous entry. The first delta is 0 (max_timestamp_ms - max_timestamp_ms). Same logical length as random_packed / 10."},
+          {"number": 3, "name": "random_packed", "type": "bytes", "repeated": false, "oneof": null, "comment": "10 bytes per entry, in the same order as timestamp_deltas. Each chunk: 12 bits rand_a + 62 bits rand_b + 6 bits zero pad. Decoder invariant: random_packed.length == 10 * len(timestamp_deltas)."}
         ]
       },
       "Namespace": {
@@ -719,8 +726,8 @@
     },
     {
       "name": "namespaces-and-pointer-tables",
-      "description": "A compacted (CAS-only) catalog with two namespaces, one nested under the other, a pointer-mode table referenced by S3 URL, and one namespace property. Demonstrates repeated message fields and parent_id chaining inside the Checkpoint message.",
-      "hex": "4c4341540000000197010a1001900000000070008000000000000001100318025211080110021800220977617265686f757365520e080210011801220662726f6e7a655a4208011003180222066576656e74732a3273333a2f2f6c616b652f77617265686f7573652f62726f6e7a652f6576656e74732f76332e6d657461646174612e6a736f6e6218080112056f776e65721a0d646174612d706c6174666f726d",
+      "description": "A compacted (CAS-only) catalog with two namespaces, one nested under the other, a pointer-mode table referenced by S3 URL, one namespace property, and five committed transactions in the dedup set. Demonstrates repeated message fields, parent_id chaining, and the CommittedTransactions sub-message (field 20): UUIDv7s sorted descending, with the 48-bit timestamp half delta-coded as varints and the 74 random bits packed into 10 bytes per entry (version+variant bits implicit). Click the random_packed bytes node to see the reconstructed UUIDs.",
+      "hex": "4c43415400000001e1010a1001900000000070008000000000000001100318025211080110021800220977617265686f757365520e080210011801220662726f6e7a655a4208011003180222066576656e74732a3273333a2f2f6c616b652f77617265686f7573652f62726f6e7a652f6576656e74732f76332e6d657461646174612e6a736f6e6218080112056f776e65721a0d646174612d706c6174666f726da20147090719eca890010000100010031002100110011a320000000000000000c1400000000000000000c1000000000000000000c0c00000000000000000c0800000000000000000c040",
       "notes": [
       ]
     },
@@ -802,10 +809,11 @@
       'UpdateTableInline.delta': 'TableMetadataDelta'
     };
 
-    // Bytes fields that are 16-byte UUIDs
+    // Bytes fields that are 16-byte UUIDs. The committed_transactions set
+    // is no longer a bytes field; it's a CommittedTransactions sub-message
+    // that the post-decode hook below reconstructs into UUID strings.
     var UUID_BYTES_FIELDS = {
       'Checkpoint.catalog_uuid': true,
-      'Checkpoint.committed_transaction_ids': true,
       'Transaction.transaction_id': true
     };
 
@@ -1117,6 +1125,12 @@
             sub.schemaPath = schemaPath;
             sub.fieldComment = fieldDef ? fieldDef.comment : null;
             sub.oneofGroup = oneofGroup;
+            // Reconstruct UUIDs from the compressed CommittedTransactions
+            // sub-message and surface them on the detail node so the user
+            // sees real UUID strings, not just deltas + opaque bytes.
+            if (fieldType === 'CommittedTransactions') {
+              decorateCommittedTransactions(sub, bytes, payloadStart, payloadEnd);
+            }
             node.children.push(sub);
           } else if (fieldType === 'string') {
             var str = utf8Decode(bytes, payloadStart, payloadEnd);
@@ -1179,6 +1193,115 @@
         hh(off+8) + hh(off+9),
         hh(off+10) + hh(off+11) + hh(off+12) + hh(off+13) + hh(off+14) + hh(off+15)
       ].join('-');
+    }
+
+    /**
+     * Reconstructs the v7 UUID set from a CommittedTransactions sub-message
+     * and decorates the node's `decodedValue` with a comma-separated list of
+     * canonical UUID strings, plus per-entry timestamps for clarity. This
+     * makes the explorer's detail panel show "this is UUID 01900000-…" for
+     * each compressed entry instead of just the raw deltas + bytes blob.
+     */
+    function decorateCommittedTransactions(node, bytes, start, end) {
+      var off = start;
+      var maxTs = 0;
+      var deltas = [];
+      var randomPacked = null;
+      while (off < end) {
+        var tagInfo = readVarint(bytes, off);
+        off = tagInfo.end;
+        var fieldNumber = Number(tagInfo.value) >>> 3;
+        var wireType = Number(tagInfo.value) & 0x7;
+        if (fieldNumber === 1 && wireType === 1) {
+          // fixed64 max_timestamp_ms
+          var lo = bytes[off] | (bytes[off+1] << 8) | (bytes[off+2] << 16) | (bytes[off+3] << 24);
+          var hi = bytes[off+4] | (bytes[off+5] << 8) | (bytes[off+6] << 16) | (bytes[off+7] << 24);
+          maxTs = (BigInt(hi >>> 0) << 32n) | BigInt(lo >>> 0);
+          off += 8;
+        } else if (fieldNumber === 2 && wireType === 0) {
+          // varint timestamp delta
+          var v = readVarint(bytes, off);
+          deltas.push(v.value);
+          off = v.end;
+        } else if (fieldNumber === 3 && wireType === 2) {
+          // bytes random_packed
+          var len = readVarint(bytes, off);
+          off = len.end;
+          randomPacked = bytes.slice(off, off + Number(len.value));
+          off += Number(len.value);
+        } else {
+          // Unknown field — skip best-effort.
+          break;
+        }
+      }
+      if (!randomPacked || randomPacked.length !== 10 * deltas.length) {
+        node.decodedValue = '<malformed CommittedTransactions: '
+          + (randomPacked ? randomPacked.length : 0) + ' random bytes vs '
+          + deltas.length + ' deltas>';
+        return;
+      }
+      var uuids = [];
+      var ts = maxTs;
+      for (var i = 0; i < deltas.length; i++) {
+        ts -= deltas[i];
+        uuids.push(reconstructV7Uuid(ts, randomPacked, i * 10));
+      }
+      node.decodedValue = uuids.length + ' UUIDv7 entries (descending by timestamp)';
+      node.uuids = uuids;
+    }
+
+    /**
+     * Reconstructs a canonical UUIDv7 string from a 48-bit timestamp and the
+     * 10-byte packed random sequence. Mirrors UuidV7.fromTimestampAndRandom in
+     * Java but produces the hex representation directly.
+     */
+    function reconstructV7Uuid(tsBig, packed, offset) {
+      // Build the 16 canonical bytes:
+      //   bytes 0..5  = timestamp big-endian (top 48 bits)
+      //   byte 6 high nibble = version (0x7)
+      //   byte 6 low nibble + byte 7 = 12 bits rand_a (high 8 from packed[0],
+      //                                                low 4 in packed[1] high)
+      //   byte 8 top 2 bits = variant (0b10)
+      //   byte 8 low 6 bits + bytes 9..15 = 62 bits rand_b
+      // Random_packed layout (80 bits, big-endian):
+      //   bits 0..11  = rand_a
+      //   bits 12..73 = rand_b
+      //   bits 74..79 = padding
+      var b = new Array(16);
+      // Timestamp bytes (bytes 0..5).
+      for (var i = 5; i >= 0; i--) {
+        b[i] = Number(tsBig & 0xFFn);
+        tsBig >>= 8n;
+      }
+      // packed[0] = top 8 bits of rand_a.
+      // packed[1] high nibble = bottom 4 bits of rand_a.
+      // packed[1] low nibble = top 4 bits of rand_b.
+      var randA_hi = packed[offset];
+      var randA_lo4 = (packed[offset + 1] >>> 4) & 0xF;
+      b[6] = (0x7 << 4) | (randA_hi >>> 4);
+      b[7] = ((randA_hi & 0xF) << 4) | randA_lo4;
+      // rand_b: 62 bits. byte 8 has variant in top 2 bits + 6 bits of rand_b.
+      // Reconstruction: extract bits 12..73 (62 bits) from packed.
+      // Easiest: reassemble the 80-bit packed view as a BigInt, mask, then
+      // emit byte 8 .. byte 15 in the canonical UUID layout.
+      var v = 0n;
+      for (var k = 0; k < 10; k++) {
+        v = (v << 8n) | BigInt(packed[offset + k] & 0xFF);
+      }
+      // v has bits 79..0 (MSB-first when shifted in). rand_a occupies bits
+      // 79..68; rand_b occupies bits 67..6; bits 5..0 are pad.
+      var randB = (v >> 6n) & ((1n << 62n) - 1n);  // 62-bit value
+      // byte 8: variant (0b10) in top 2 bits + top 6 bits of rand_b.
+      var randB_top6 = Number((randB >> 56n) & 0x3Fn);
+      b[8] = (0x2 << 6) | randB_top6;
+      // bytes 9..15: next 56 bits of rand_b (big-endian).
+      var rest = randB & ((1n << 56n) - 1n);
+      for (var j = 15; j >= 9; j--) {
+        b[j] = Number(rest & 0xFFn);
+        rest >>= 8n;
+      }
+      function hh(i) { return (b[i] < 16 ? '0' : '') + b[i].toString(16); }
+      return hh(0)+hh(1)+hh(2)+hh(3)+'-'+hh(4)+hh(5)+'-'+hh(6)+hh(7)+'-'+hh(8)+hh(9)+'-'+hh(10)+hh(11)+hh(12)+hh(13)+hh(14)+hh(15);
     }
 
     // ============================================================
@@ -1446,6 +1569,13 @@
         html += '<details><summary>Show JSON ('
           + (node.byteEnd - node.byteStart) + ' bytes)</summary>'
           + '<pre>' + escapeHtml(pretty) + '</pre></details>';
+      }
+
+      // Reconstructed UUID list for CommittedTransactions sub-message.
+      if (node.uuids && node.uuids.length > 0) {
+        html += '<details open><summary>Reconstructed UUIDs ('
+          + node.uuids.length + ' entries, descending by timestamp)</summary>'
+          + '<pre>' + escapeHtml(node.uuids.join('\n')) + '</pre></details>';
       }
 
       d.innerHTML = html;

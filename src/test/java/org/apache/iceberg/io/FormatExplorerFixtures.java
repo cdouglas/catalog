@@ -296,23 +296,38 @@ public class FormatExplorerFixtures {
    * compaction commit looks like.
    */
   private Scenario scenarioPostCasMultiNamespace() {
-    ProtoCatalogFile catalog = ProtoCatalogFile.builder(LOCATION)
+    ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(LOCATION)
         .setCatalogUuid(FIXED_CATALOG_UUID)
         .addNamespace(1, 0, "warehouse", 2)
         .addNamespace(2, 1, "bronze", 1)
         .addTable(1, 2, "events", 3, "s3://lake/warehouse/bronze/events/v3.metadata.json")
         .setNamespaceProperty(1, "owner", "data-platform")
         .setNextNamespaceId(3)
-        .setNextTableId(2)
-        .rebuildLookups()
-        .build();
+        .setNextTableId(2);
+    // Five recent committed transaction IDs, demonstrating the
+    // CommittedTransactions sub-message: descending timestamp sort,
+    // per-entry timestamp delta + 10 packed random bytes. UUIDs are
+    // hand-crafted v7 with successive 1-ms-spaced timestamps in the
+    // version nibble = 7 / variant nibble = 8 layout.
+    builder.addCommittedTransaction(UUID.fromString("0190a8ec-1900-7000-8000-000000000301"));
+    builder.addCommittedTransaction(UUID.fromString("0190a8ec-1901-7000-8000-000000000302"));
+    builder.addCommittedTransaction(UUID.fromString("0190a8ec-1902-7000-8000-000000000303"));
+    builder.addCommittedTransaction(UUID.fromString("0190a8ec-1904-7000-8000-000000000304"));
+    builder.addCommittedTransaction(UUID.fromString("0190a8ec-1907-7000-8000-000000000305"));
+    ProtoCatalogFile catalog = builder.rebuildLookups().build();
     byte[] file = encodeFile(catalog);
     return new Scenario(
         "namespaces-and-pointer-tables",
         "A compacted (CAS-only) catalog with two namespaces, one nested "
             + "under the other, a pointer-mode table referenced by S3 URL, "
-            + "and one namespace property. Demonstrates repeated message "
-            + "fields and parent_id chaining inside the Checkpoint message.",
+            + "one namespace property, and five committed transactions in "
+            + "the dedup set. Demonstrates repeated message fields, "
+            + "parent_id chaining, and the CommittedTransactions sub-message "
+            + "(field 20): UUIDv7s sorted descending, with the 48-bit "
+            + "timestamp half delta-coded as varints and the 74 random bits "
+            + "packed into 10 bytes per entry (version+variant bits "
+            + "implicit). Click the random_packed bytes node to see the "
+            + "reconstructed UUIDs.",
         file, List.of());
   }
 
@@ -990,6 +1005,7 @@ public class FormatExplorerFixtures {
   private static Map<String, Map<String, Integer>> expectedConstants(SchemaDescriptor schema) {
     Map<String, String> messageToPrefix = new LinkedHashMap<>();
     messageToPrefix.put("Checkpoint", "CHECKPOINT");
+    messageToPrefix.put("CommittedTransactions", "COMMITTED_TXNS");
     messageToPrefix.put("Namespace", "NS");
     messageToPrefix.put("Table", "TBL");
     messageToPrefix.put("NamespaceProperty", "NSPROP");
