@@ -221,40 +221,28 @@ no null check. Running the path-rewrite migration utility on an
 inline-ML table NPEs. Pre-existing in upstream; flagged here so users
 who hit it mid-migration can recognize it.
 
-### D10. Single-pass rewrite of `committedTransactionsBytes`
+### D10. Single-pass rewrite of `committedTransactionsBytes` — RESOLVED
 
-`ProtoCatalogFile.Builder.materializeCommittedBytes` merges additions by
-decoding the inherited compressed bytes into a `LinkedHashSet<UUID>`,
-adding the new UUIDs, and re-encoding from scratch. Two full passes
-plus an intermediate `LinkedHashSet`. The work can be done in a single
-pass by streaming the inherited `packed_entries` once and merging in
-the additions in sorted order; the same loop will absorb the
-watermark-based GC drop (D11) when that lands. Trigger to fix: when
-the GC policy is implemented, or when profiling shows merge cost
-dominating re-checkpoint time on large committed sets.
+Resolved by `ProtoCodec.rewriteCommittedBytes`, called from
+`ProtoCatalogFile.Builder.materializeCommittedBytes(long)` and from
+`ProtoCodec.encodeCheckpoint` on the CAS / compaction path. The merge
+streams the inherited `packed_entries` once, two-pointer-merging the
+sorted additions and emitting a merged descending stream — the same
+loop applies the D11 GC drop. See `docs/GC.md` Phase B.
 
-The new entrypoint signature should be roughly
-`rewriteCommittedBytes(byte[] inheritedBytes, Set<UUID> addUnconditionally,
-long dropBeforeTimestampMs) -> byte[]` — additions are applied always;
-inherited entries with `timestamp_ms <= dropBeforeTimestampMs` are
-suppressed. Streaming order: the inherited bytes are already sorted
-descending, so we walk them in stride with the additions sorted
-descending and emit a merged stream.
+### D11. Committed-set GC (watermark-based retention) — RESOLVED
 
-### D11. Committed-set GC (watermark-based retention)
-
-The dedup set in `Checkpoint.committed_transactions` grows monotonically
-across compactions. Without a retention policy it accumulates linearly
-in the lifetime of the catalog file, dominating size for long-lived
-catalogs even with the v7 compression already in place. SPEC.md
-"Committed-set retention" specifies the policy: at each compaction the
-committer drops inherited entries whose UUIDv7 timestamp is older than
-a configurable cutoff (default 6 hours), and persists the highest
-timestamp dropped in a new `CommittedTransactions.highest_dropped_timestamp_ms`
-field so readers can distinguish "definitively absent" from "GC'd, status
-unknown." Trigger to implement: when long-lived catalogs are exercised
-in tests or deployment, or when checkpoint size becomes a measured
-concern.
+Implemented per `docs/GC.md`. The format property
+`fileio.catalog.committed.retention.ms` (default 6 hours) sets the
+window; on each CAS / compaction commit the writer GCs inherited entries
+whose UUIDv7 timestamp is at or below `now - retentionMs` and persists
+the largest dropped timestamp in
+`CommittedTransactions.highest_dropped_timestamp_ms`.
+`ProtoCatalogFile.containsTransaction` is now tri-state: `true`,
+`false` (presumed abort, ts above horizon), or
+`DedupHorizonExceededException` (UNKNOWN, ts at or below horizon).
+`Long.MAX_VALUE` retention disables GC; `0` retention drops everything
+older than the current commit.
 
 ## Test Coverage Gaps
 

@@ -73,6 +73,13 @@ message CommittedTransactions {
   //   10 bytes         -- 12 bits rand_a + 62 bits rand_b + 6 bits zero pad
   // The number of entries is recovered by walking the buffer.
   bytes packed_entries = 2;
+
+  // GC horizon: the largest timestamp_ms of any UUIDv7 that has been dropped
+  // from this set by a retention pass. 0 (absent) means no GC has happened yet.
+  // Queries for UUIDs whose timestamp_ms <= this value are UNKNOWN — the entry
+  // may have been committed and aged out, or it may never have been committed.
+  // See docs/SPEC.md "Committed-set retention (GC)" and docs/GC.md.
+  fixed64 highest_dropped_timestamp_ms = 3;
 }
 
 message Namespace {

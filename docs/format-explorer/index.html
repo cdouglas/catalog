@@ -408,7 +408,8 @@
       "CommittedTransactions": {
         "fields": [
           {"number": 1, "name": "max_timestamp_ms", "type": "fixed64", "repeated": false, "oneof": null, "comment": "Largest (most recent) timestamp in ms. Implicit when the set is empty."},
-          {"number": 2, "name": "packed_entries", "type": "bytes", "repeated": false, "oneof": null, "comment": "Per entry, in descending timestamp order, back-to-back: varint delta_ms  -- gap from previous entry (first delta is 0) 10 bytes         -- 12 bits rand_a + 62 bits rand_b + 6 bits zero pad The number of entries is recovered by walking the buffer."}
+          {"number": 2, "name": "packed_entries", "type": "bytes", "repeated": false, "oneof": null, "comment": "Per entry, in descending timestamp order, back-to-back: varint delta_ms  -- gap from previous entry (first delta is 0) 10 bytes         -- 12 bits rand_a + 62 bits rand_b + 6 bits zero pad The number of entries is recovered by walking the buffer."},
+          {"number": 3, "name": "highest_dropped_timestamp_ms", "type": "fixed64", "repeated": false, "oneof": null, "comment": "GC horizon: the largest timestamp_ms of any UUIDv7 that has been dropped from this set by a retention pass. 0 (absent) means no GC has happened yet. Queries for UUIDs whose timestamp_ms <= this value are UNKNOWN — the entry may have been committed and aged out, or it may never have been committed. See docs/SPEC.md \"Committed-set retention (GC)\" and docs/GC.md."}
         ]
       },
       "Namespace": {

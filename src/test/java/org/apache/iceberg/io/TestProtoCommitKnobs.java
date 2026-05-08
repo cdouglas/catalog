@@ -362,6 +362,122 @@ public class TestProtoCommitKnobs {
     org.assertj.core.api.Assertions.assertThatThrownBy(
         () -> new ProtoCatalogFormat(100, -1L))
         .isInstanceOf(IllegalArgumentException.class);
+    org.assertj.core.api.Assertions.assertThatThrownBy(
+        () -> new ProtoCatalogFormat(100, 1024L, -1L))
+        .isInstanceOf(IllegalArgumentException.class);
+  }
+
+  @Test
+  void committedRetentionConfigFromProperties() {
+    Map<String, String> props = new HashMap<>();
+    props.put(ProtoCatalogFormat.COMMITTED_RETENTION_MS, "300000");
+    ProtoCatalogFormat format = new ProtoCatalogFormat(props);
+    assertThat(format.committedRetentionMs()).isEqualTo(300_000L);
+  }
+
+  @Test
+  void defaultCommittedRetentionIsSixHours() {
+    ProtoCatalogFormat format = new ProtoCatalogFormat();
+    assertThat(format.committedRetentionMs())
+        .isEqualTo(ProtoCatalogFormat.DEFAULT_COMMITTED_RETENTION_MS)
+        .isEqualTo(6L * 60 * 60 * 1000);
+  }
+
+  /**
+   * Aggressive-retention end-to-end: with {@code committedRetentionMs = 0}
+   * every CAS rewrite GCs all prior dedup entries. After Writer A commits
+   * txn_X and Writer B follows with another CAS, the fresh read's
+   * {@code containsTransaction(txn_X)} throws
+   * {@link DedupHorizonExceededException} because txn_X's timestamp is at or
+   * below the now-advanced horizon. The exception's {@code queryId} and
+   * {@code horizonMs} are checked for diagnostic correctness.
+   *
+   * <p>Negative case: a freshly-minted UUID whose timestamp is above the
+   * horizon and never committed returns {@code false} (presumed abort) — no
+   * exception.
+   */
+  @Test
+  void retentionZeroGcsDedupSetOnEachCompaction() throws InterruptedException {
+    // CAS-only mode (so every commit is a rewrite) + retention=0 (so every
+    // rewrite drops everything older than now).
+    ProtoCatalogFormat format = new ProtoCatalogFormat(0, Long.MAX_VALUE, 0L);
+    MockIO io = new MockIO();
+
+    // Writer A: initial commit, mints txn_X.
+    InputFile catalogFile = io.trackedInput();
+    ProtoCatalogFormat.Mut mutA = (ProtoCatalogFormat.Mut) format.empty(catalogFile);
+    mutA.createNamespace(Namespace.of("warehouse"));
+    ProtoCatalogFile afterA = (ProtoCatalogFile) mutA.commit(io.fileIO);
+    assertThat(afterA.committedTransactions()).hasSize(1);
+    UUID txnX = afterA.committedTransactions().iterator().next();
+    long txnXTs = UuidV7.timestampMs(txnX);
+
+    // Bump the wall clock so Writer B's watermark moves past txn_X.
+    Thread.sleep(5);
+
+    // Writer B: CAS commit, which rewrites the checkpoint with watermark =
+    // now > txnXTs → drops txn_X from the dedup set, sets horizon ≈ txnXTs.
+    ProtoCatalogFormat.Mut mutB = (ProtoCatalogFormat.Mut) format.from(afterA);
+    mutB.createNamespace(Namespace.of("bronze"));
+    mutB.commit(io.fileIO);
+
+    // Fresh read.
+    ProtoCatalogFile fresh = format.read(io.fileIO, io.trackedInput());
+
+    // Horizon now covers txn_X.
+    assertThat(fresh.highestDroppedTimestampMs())
+        .as("horizon after retention=0 compaction must overtake txn_X")
+        .isGreaterThanOrEqualTo(txnXTs);
+
+    // Querying for txn_X is UNKNOWN — throws.
+    org.assertj.core.api.Assertions.assertThatThrownBy(() -> fresh.containsTransaction(txnX))
+        .isInstanceOf(DedupHorizonExceededException.class)
+        .satisfies(e -> {
+          DedupHorizonExceededException ex = (DedupHorizonExceededException) e;
+          assertThat(ex.queryId()).isEqualTo(txnX);
+          assertThat(ex.horizonMs()).isEqualTo(fresh.highestDroppedTimestampMs());
+        });
+
+    // Negative case: a UUID minted *after* the horizon that was never
+    // committed returns false (presumed abort), no throw.
+    UUID neverCommitted = UuidV7.newUuidV7();
+    assertThat(UuidV7.timestampMs(neverCommitted))
+        .isGreaterThan(fresh.highestDroppedTimestampMs());
+    assertThat(fresh.containsTransaction(neverCommitted)).isFalse();
+  }
+
+  /**
+   * Default-retention end-to-end: with the 6-hour default, txn_X stays
+   * findable across many compactions. Differs from
+   * {@link #writerLearnsCommitOutcomeAfterCompaction} only in that this test
+   * explicitly verifies {@code highestDroppedTimestampMs == 0} (no GC fired
+   * because the watermark is hours back, before the test's commits).
+   */
+  @Test
+  void defaultRetentionPreservesRecentCommits() {
+    ProtoCatalogFormat format = new ProtoCatalogFormat(0, Long.MAX_VALUE); // CAS-only, default retention
+    MockIO io = new MockIO();
+
+    InputFile catalogFile = io.trackedInput();
+    ProtoCatalogFormat.Mut mut = (ProtoCatalogFormat.Mut) format.empty(catalogFile);
+    mut.createNamespace(Namespace.of("warehouse"));
+    ProtoCatalogFile afterCommit = (ProtoCatalogFile) mut.commit(io.fileIO);
+    UUID txnId = afterCommit.committedTransactions().iterator().next();
+
+    // Several more CAS rewrites — none of them GC anything because the
+    // watermark = now - 6h is well before the test's start.
+    for (int i = 0; i < 3; i++) {
+      ProtoCatalogFile current = format.read(io.fileIO, io.trackedInput());
+      ProtoCatalogFormat.Mut m = (ProtoCatalogFormat.Mut) format.from(current);
+      m.createNamespace(Namespace.of("ns" + i));
+      m.commit(io.fileIO);
+    }
+
+    ProtoCatalogFile fresh = format.read(io.fileIO, io.trackedInput());
+    assertThat(fresh.containsTransaction(txnId)).isTrue();
+    assertThat(fresh.highestDroppedTimestampMs())
+        .as("default retention is far enough back that no GC pass should fire on test-time commits")
+        .isZero();
   }
 
   // ============================================================

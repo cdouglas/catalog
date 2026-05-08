@@ -75,6 +75,7 @@ public class ProtoCodec {
   // the wire bytes in one linear pass without allocating intermediates.
   private static final int COMMITTED_TXNS_MAX_TIMESTAMP_MS = 1;
   private static final int COMMITTED_TXNS_PACKED_ENTRIES = 2;
+  private static final int COMMITTED_TXNS_HIGHEST_DROPPED_TIMESTAMP_MS = 3;
 
   // Namespace field numbers
   private static final int NS_ID = 1;
@@ -220,12 +221,29 @@ public class ProtoCodec {
   // ============================================================
 
   /**
-   * Encodes a checkpoint from the original catalog state plus pending mutations.
+   * Encodes a checkpoint from the original catalog state plus pending mutations,
+   * using {@code dropBeforeTimestampMs = 0} (no committed-set GC).
    */
   public static byte[] encodeCheckpoint(
       ProtoCatalogFile original,
       CatalogFile.Mut<ProtoCatalogFile, ?> mut,
       ProtoCatalogFormat.ProtoIdManager idManager) {
+    return encodeCheckpoint(original, mut, idManager, 0L);
+  }
+
+  /**
+   * Encodes a checkpoint, optionally GC-ing the inherited committed-transaction
+   * set: any UUIDv7 with {@code timestamp_ms <= dropBeforeTimestampMs} is
+   * dropped from the encoded body and contributes to
+   * {@code highest_dropped_timestamp_ms}. Called from the CAS / compaction path
+   * in {@link ProtoCatalogFormat.Mut} where {@code dropBeforeTimestampMs} is
+   * computed as {@code now - committedRetentionMs}.
+   */
+  public static byte[] encodeCheckpoint(
+      ProtoCatalogFile original,
+      CatalogFile.Mut<ProtoCatalogFile, ?> mut,
+      ProtoCatalogFormat.ProtoIdManager idManager,
+      long dropBeforeTimestampMs) {
     try {
       ByteArrayOutputStream out = new ByteArrayOutputStream();
 
@@ -274,14 +292,17 @@ public class ProtoCodec {
       }
 
       // Committed transactions (compressed UUIDv7 set, see CommittedTransactions
-      // proto). The catalog file stores the inner-message bytes directly, so
-      // re-encoding from a freshly-read ProtoCatalogFile is a byte copy with
-      // no decompress/recompress cycle. Empty set is omitted for wire-byte
-      // parity with the prior encoding.
-      // TODO: the dedup set is unbounded — a retention policy is the right fix
-      // for long-lived catalogs; this compression ~30% per entry but doesn't
-      // change the linear-growth shape.
-      byte[] committedBytes = original.committedTransactionsBytes();
+      // proto). The catalog file stores the inner-message bytes directly. When
+      // dropBeforeTimestampMs > 0, this is also the GC site: rewriteCommittedBytes
+      // drops inherited entries whose v7 timestamp is below the watermark and
+      // updates highest_dropped_timestamp_ms accordingly. Empty set with no
+      // horizon is omitted for wire-byte parity with the prior encoding.
+      byte[] inheritedBytes = original.committedTransactionsBytes();
+      byte[] committedBytes =
+          dropBeforeTimestampMs > 0L
+              ? rewriteCommittedBytes(
+                  inheritedBytes, java.util.Collections.emptyList(), dropBeforeTimestampMs)
+              : inheritedBytes;
       if (committedBytes.length > 0) {
         writeLengthDelimited(out, CHECKPOINT_COMMITTED_TXNS, committedBytes);
       }
@@ -340,14 +361,28 @@ public class ProtoCodec {
   }
 
   /**
+   * Encodes a UUIDv7 set as a {@code CommittedTransactions} sub-message body
+   * with no GC horizon. See {@link #encodeCommittedTransactions(java.util.Collection, long)}
+   * for the GC-aware variant.
+   */
+  static byte[] encodeCommittedTransactions(java.util.Collection<UUID> txns)
+      throws IOException {
+    return encodeCommittedTransactions(txns, 0L);
+  }
+
+  /**
    * Encodes a UUIDv7 set as a {@code CommittedTransactions} sub-message body.
    * Sorts entries descending by UUID (= descending by timestamp for v7),
    * emits {@code max_timestamp_ms}, then a single packed bytes field whose
-   * payload is the interleaved (varint delta + 10 random bytes) per entry.
+   * payload is the interleaved (varint delta + 10 random bytes) per entry,
+   * and optionally a {@code highest_dropped_timestamp_ms} field when the
+   * caller has performed a GC pass.
    *
-   * <p>Caller is responsible for omitting the outer field when the set is empty.
+   * <p>Caller is responsible for omitting the outer field when the set is empty
+   * AND the horizon is zero (i.e., no observable state to record).
    */
-  static byte[] encodeCommittedTransactions(java.util.Collection<UUID> txns)
+  static byte[] encodeCommittedTransactions(java.util.Collection<UUID> txns,
+                                             long highestDroppedTimestampMs)
       throws IOException {
     UUID[] sorted = txns.toArray(new UUID[0]);
     java.util.Arrays.sort(sorted, (a, b) -> b.compareTo(a));
@@ -364,7 +399,225 @@ public class ProtoCodec {
       packed.write(UuidV7.packRandomBits(u));
     }
     writeBytes(out, COMMITTED_TXNS_PACKED_ENTRIES, packed.toByteArray());
+    if (highestDroppedTimestampMs != 0L) {
+      writeFixed64(out, COMMITTED_TXNS_HIGHEST_DROPPED_TIMESTAMP_MS, highestDroppedTimestampMs);
+    }
     return out.toByteArray();
+  }
+
+  /**
+   * Single-pass rewrite of an inherited {@code CommittedTransactions} body.
+   * Streams the inherited entries in descending order, drops any whose
+   * {@code timestamp_ms <= dropBeforeTimestampMs} (updating
+   * {@code highest_dropped_timestamp_ms}), and merges in the supplied
+   * additions in descending order. Additions are emitted unconditionally —
+   * the caller's invariant is that they correspond to just-applied log
+   * transactions which must remain queryable regardless of the watermark.
+   *
+   * <p>An exact-duplicate addition (same UUID as an inherited entry) is
+   * deduped: the merged output emits a single copy.
+   *
+   * <p>Returns an empty byte array iff there are no entries to emit AND the
+   * resulting {@code highest_dropped_timestamp_ms} is zero (no observable
+   * state). Otherwise returns the encoded body — including a horizon-only
+   * body when every entry was dropped but the horizon is non-zero, so that
+   * monotonicity is preserved across subsequent compactions.
+   */
+  static byte[] rewriteCommittedBytes(
+      byte[] inheritedBytes,
+      java.util.Collection<UUID> addUnconditionally,
+      long dropBeforeTimestampMs) {
+    UUID[] adds = addUnconditionally.toArray(new UUID[0]);
+    long[] addTs = new long[adds.length];
+    byte[][] addRand = new byte[adds.length][];
+    for (int i = 0; i < adds.length; i++) {
+      Preconditions.checkArgument(UuidV7.isV7(adds[i]),
+          "Committed transaction IDs must be UUIDv7; got %s", adds[i]);
+      addTs[i] = UuidV7.timestampMs(adds[i]);
+      addRand[i] = UuidV7.packRandomBits(adds[i]);
+    }
+    // Sort additions descending: by ts desc, then by packed-random desc
+    // (lexicographic unsigned matches UUID.compareTo for v7 — see UuidV7).
+    Integer[] addIdx = new Integer[adds.length];
+    for (int i = 0; i < adds.length; i++) {
+      addIdx[i] = i;
+    }
+    java.util.Arrays.sort(addIdx, (a, b) -> {
+      int c = Long.compare(addTs[b], addTs[a]);
+      if (c != 0) return c;
+      for (int k = 0; k < 10; k++) {
+        int d = (addRand[b][k] & 0xFF) - (addRand[a][k] & 0xFF);
+        if (d != 0) return d;
+      }
+      return 0;
+    });
+    long[] sortedAddTs = new long[adds.length];
+    byte[][] sortedAddRand = new byte[adds.length][];
+    for (int i = 0; i < adds.length; i++) {
+      sortedAddTs[i] = addTs[addIdx[i]];
+      sortedAddRand[i] = addRand[addIdx[i]];
+    }
+
+    // Parse the inherited body's top-level fields.
+    long prevMaxTs = 0L;
+    int packedStart = -1;
+    int packedEnd = -1;
+    long prevHorizon = 0L;
+    if (inheritedBytes.length > 0) {
+      try {
+        ByteArrayInputStream in = new ByteArrayInputStream(inheritedBytes);
+        while (in.available() > 0) {
+          int tag = readVarint(in);
+          int fieldNumber = tag >>> 3;
+          int wireType = tag & 0x7;
+          switch (fieldNumber) {
+            case COMMITTED_TXNS_MAX_TIMESTAMP_MS:
+              prevMaxTs = readFixed64(in);
+              break;
+            case COMMITTED_TXNS_PACKED_ENTRIES:
+              int len = readVarint(in);
+              packedStart = inheritedBytes.length - in.available();
+              packedEnd = packedStart + len;
+              long skipped = in.skip(len);
+              if (skipped != len) {
+                throw new IOException(
+                    "Truncated CommittedTransactions: expected " + len
+                        + " packed bytes, got " + skipped);
+              }
+              break;
+            case COMMITTED_TXNS_HIGHEST_DROPPED_TIMESTAMP_MS:
+              prevHorizon = readFixed64(in);
+              break;
+            default:
+              skipField(in, wireType);
+          }
+        }
+      } catch (IOException e) {
+        throw new UncheckedIOException(e);
+      }
+    }
+
+    // Two-pointer merge of inherited entries (in descending order) against
+    // the sorted additions. Output is buffered in (ts, rand) parallel arrays
+    // because we don't know max_timestamp_ms until we've seen the first
+    // emitted entry.
+    int inheritedUpper = packedStart < 0 ? 0 : ((packedEnd - packedStart) / 11) + 1;
+    int capacity = inheritedUpper + adds.length;
+    long[] outTs = new long[capacity];
+    byte[][] outRand = new byte[capacity][];
+    int outCount = 0;
+    long newHorizon = prevHorizon;
+
+    long ts = prevMaxTs;
+    int off = packedStart < 0 ? 0 : packedStart;
+    int end = packedStart < 0 ? 0 : packedEnd;
+    int aPtr = 0;
+
+    while (off < end) {
+      // Decode next inherited entry: varint delta + 10 random bytes.
+      long delta = 0L;
+      int shift = 0;
+      while (true) {
+        if (off >= end) {
+          throw new UncheckedIOException(new IOException(
+              "Malformed CommittedTransactions: truncated varint"));
+        }
+        int b = inheritedBytes[off++] & 0xFF;
+        delta |= ((long) (b & 0x7F)) << shift;
+        if ((b & 0x80) == 0) break;
+        shift += 7;
+      }
+      ts -= delta;
+      if (off + 10 > end) {
+        throw new UncheckedIOException(new IOException(
+            "Malformed CommittedTransactions: truncated random bytes"));
+      }
+      int randOff = off;
+      off += 10;
+
+      // Emit any additions strictly greater than the inherited entry first.
+      while (aPtr < sortedAddTs.length
+          && compareTsRand(sortedAddTs[aPtr], sortedAddRand[aPtr],
+              ts, inheritedBytes, randOff) > 0) {
+        outTs[outCount] = sortedAddTs[aPtr];
+        outRand[outCount] = sortedAddRand[aPtr];
+        outCount++;
+        aPtr++;
+      }
+
+      if (ts <= dropBeforeTimestampMs) {
+        // Drop this inherited entry; the addition (if any) at the same key
+        // still stands and will be emitted from the addition stream.
+        if (ts > newHorizon) {
+          newHorizon = ts;
+        }
+      } else {
+        // Dedup: an addition equal to this inherited entry collapses to one.
+        if (aPtr < sortedAddTs.length
+            && compareTsRand(sortedAddTs[aPtr], sortedAddRand[aPtr],
+                ts, inheritedBytes, randOff) == 0) {
+          aPtr++;
+        }
+        outTs[outCount] = ts;
+        byte[] copy = new byte[10];
+        System.arraycopy(inheritedBytes, randOff, copy, 0, 10);
+        outRand[outCount] = copy;
+        outCount++;
+      }
+    }
+
+    // Drain remaining additions (older than the smallest inherited entry, or
+    // older-than-watermark inherited that got dropped left holes in the
+    // descending stream — additions still survive unconditionally).
+    while (aPtr < sortedAddTs.length) {
+      outTs[outCount] = sortedAddTs[aPtr];
+      outRand[outCount] = sortedAddRand[aPtr];
+      outCount++;
+      aPtr++;
+    }
+
+    if (outCount == 0 && newHorizon == 0L) {
+      return new byte[0];
+    }
+
+    try {
+      ByteArrayOutputStream out = new ByteArrayOutputStream();
+      long maxTs = outCount > 0 ? outTs[0] : 0L;
+      writeFixed64(out, COMMITTED_TXNS_MAX_TIMESTAMP_MS, maxTs);
+
+      ByteArrayOutputStream packed = new ByteArrayOutputStream(13 * outCount);
+      long prev = maxTs;
+      for (int i = 0; i < outCount; i++) {
+        long entryTs = outTs[i];
+        writeRawVarint64(packed, prev - entryTs);
+        prev = entryTs;
+        packed.write(outRand[i]);
+      }
+      writeBytes(out, COMMITTED_TXNS_PACKED_ENTRIES, packed.toByteArray());
+
+      if (newHorizon != 0L) {
+        writeFixed64(out, COMMITTED_TXNS_HIGHEST_DROPPED_TIMESTAMP_MS, newHorizon);
+      }
+      return out.toByteArray();
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
+  /**
+   * Compares an addition entry {@code (aTs, aRand)} against an inherited entry
+   * stored in {@code body[bOff..bOff+10)} with timestamp {@code bTs}. Negative
+   * iff a < b, zero iff equal, positive iff a > b.
+   */
+  private static int compareTsRand(long aTs, byte[] aRand, long bTs, byte[] body, int bOff) {
+    if (aTs != bTs) {
+      return Long.compare(aTs, bTs);
+    }
+    for (int i = 0; i < 10; i++) {
+      int cmp = (aRand[i] & 0xFF) - (body[bOff + i] & 0xFF);
+      if (cmp != 0) return cmp;
+    }
+    return 0;
   }
 
   /**
@@ -402,6 +655,10 @@ public class ProtoCodec {
             packedEnd = packedStart + len;
             in.skip(len);
             break;
+          // COMMITTED_TXNS_HIGHEST_DROPPED_TIMESTAMP_MS: ignored here; the
+          // membership predicate doesn't consult the horizon. The horizon-aware
+          // tri-state result lives in ProtoCatalogFile.containsTransaction,
+          // which calls committedSetHorizon on a miss.
           default:
             skipField(in, wireType);
         }
@@ -439,6 +696,35 @@ public class ProtoCodec {
     }
   }
 
+  /**
+   * Reads the {@code highest_dropped_timestamp_ms} field from a committed-set
+   * body. Returns 0 when the body is empty, the field is absent, or no GC has
+   * ever fired on this set. Walks only the top-level fields and skips the
+   * (potentially large) {@code packed_entries} payload, so this is cheap.
+   */
+  static long committedSetHorizon(byte[] body) {
+    if (body.length == 0) {
+      return 0L;
+    }
+    try {
+      ByteArrayInputStream in = new ByteArrayInputStream(body);
+      long horizon = 0L;
+      while (in.available() > 0) {
+        int tag = readVarint(in);
+        int fieldNumber = tag >>> 3;
+        int wireType = tag & 0x7;
+        if (fieldNumber == COMMITTED_TXNS_HIGHEST_DROPPED_TIMESTAMP_MS) {
+          horizon = readFixed64(in);
+        } else {
+          skipField(in, wireType);
+        }
+      }
+      return horizon;
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
   private static boolean randomMatches(byte[] body, int off, byte[] query) {
     for (int i = 0; i < 10; i++) {
       if (body[off + i] != query[i]) return false;
@@ -471,6 +757,10 @@ public class ProtoCodec {
         case COMMITTED_TXNS_PACKED_ENTRIES:
           packed = readLengthDelimitedBytes(in);
           break;
+        // COMMITTED_TXNS_HIGHEST_DROPPED_TIMESTAMP_MS: skipped — this bulk
+        // entrypoint surfaces only the entries, not the GC horizon. Callers
+        // that need the horizon use committedSetHorizon (cheap) or peek at
+        // it during a single-pass merge in rewriteCommittedBytes.
         default:
           skipField(in, wireType);
       }

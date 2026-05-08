@@ -77,26 +77,51 @@ public class ProtoCatalogFormat
   public static final String MAX_APPEND_SIZE = "fileio.catalog.max.append.size";
   public static final long DEFAULT_MAX_APPEND_SIZE = 16L * 1024 * 1024;
 
+  /**
+   * Retention window for the committed-transaction dedup set, in milliseconds.
+   * On every CAS / compaction commit the writer drops any UUIDv7 from
+   * {@code CommittedTransactions} whose timestamp is older than
+   * {@code now - committedRetentionMs}. Aged-out entries become
+   * {@code highest_dropped_timestamp_ms}, after which a query for a UUID below
+   * the horizon throws {@link DedupHorizonExceededException}. Default: 6 hours
+   * — long enough to cover normal CAS-conflict retry windows, short enough to
+   * bound dedup-set size on long-lived catalogs. {@code Long.MAX_VALUE}
+   * disables GC; {@code 0} means "drop everything older than now"
+   * (degenerate but legal). See {@code docs/GC.md}.
+   */
+  public static final String COMMITTED_RETENTION_MS = "fileio.catalog.committed.retention.ms";
+  public static final long DEFAULT_COMMITTED_RETENTION_MS = 6L * 60 * 60 * 1000;
+
   private final int maxAppendCount;
   private final long maxAppendSize;
+  private final long committedRetentionMs;
 
   public ProtoCatalogFormat() {
-    this(DEFAULT_MAX_APPEND_COUNT, DEFAULT_MAX_APPEND_SIZE);
+    this(DEFAULT_MAX_APPEND_COUNT, DEFAULT_MAX_APPEND_SIZE, DEFAULT_COMMITTED_RETENTION_MS);
   }
 
   public ProtoCatalogFormat(Map<String, String> properties) {
     this(
         parseIntProperty(properties, MAX_APPEND_COUNT, DEFAULT_MAX_APPEND_COUNT),
-        parseLongProperty(properties, MAX_APPEND_SIZE, DEFAULT_MAX_APPEND_SIZE));
+        parseLongProperty(properties, MAX_APPEND_SIZE, DEFAULT_MAX_APPEND_SIZE),
+        parseLongProperty(
+            properties, COMMITTED_RETENTION_MS, DEFAULT_COMMITTED_RETENTION_MS));
   }
 
   public ProtoCatalogFormat(int maxAppendCount, long maxAppendSize) {
+    this(maxAppendCount, maxAppendSize, DEFAULT_COMMITTED_RETENTION_MS);
+  }
+
+  public ProtoCatalogFormat(int maxAppendCount, long maxAppendSize, long committedRetentionMs) {
     Preconditions.checkArgument(maxAppendCount >= 0,
         "maxAppendCount must be >= 0, got %s", maxAppendCount);
     Preconditions.checkArgument(maxAppendSize >= 0,
         "maxAppendSize must be >= 0, got %s", maxAppendSize);
+    Preconditions.checkArgument(committedRetentionMs >= 0,
+        "committedRetentionMs must be >= 0, got %s", committedRetentionMs);
     this.maxAppendCount = maxAppendCount;
     this.maxAppendSize = maxAppendSize;
+    this.committedRetentionMs = committedRetentionMs;
   }
 
   public int maxAppendCount() {
@@ -105,6 +130,10 @@ public class ProtoCatalogFormat
 
   public long maxAppendSize() {
     return maxAppendSize;
+  }
+
+  public long committedRetentionMs() {
+    return committedRetentionMs;
   }
 
   private static int parseIntProperty(Map<String, String> properties, String key, int dflt) {
@@ -121,7 +150,7 @@ public class ProtoCatalogFormat
 
   @Override
   public CatalogFile.Mut<ProtoCatalogFile, Mut> empty(InputFile input) {
-    return new Mut(input, maxAppendCount, maxAppendSize);
+    return new Mut(input, maxAppendCount, maxAppendSize, committedRetentionMs);
   }
 
   @Override
@@ -129,7 +158,7 @@ public class ProtoCatalogFormat
     if (!(other instanceof ProtoCatalogFile)) {
       throw new IllegalArgumentException("Cannot convert to ProtoCatalogFile: " + other);
     }
-    return new Mut((ProtoCatalogFile) other, maxAppendCount, maxAppendSize);
+    return new Mut((ProtoCatalogFile) other, maxAppendCount, maxAppendSize, committedRetentionMs);
   }
 
   @Override
@@ -258,6 +287,7 @@ public class ProtoCatalogFormat
     private final ProtoIdManager idManager = new ProtoIdManager();
     private final int maxAppendCount;
     private final long maxAppendSize;
+    private final long committedRetentionMs;
     private ProtoCodec.Transaction pendingTransaction;
 
     Mut(InputFile input) {
@@ -265,17 +295,19 @@ public class ProtoCatalogFormat
     }
 
     Mut(ProtoCatalogFile other) {
-      this(other, DEFAULT_MAX_APPEND_COUNT, DEFAULT_MAX_APPEND_SIZE);
+      this(other, DEFAULT_MAX_APPEND_COUNT, DEFAULT_MAX_APPEND_SIZE, DEFAULT_COMMITTED_RETENTION_MS);
     }
 
-    Mut(InputFile input, int maxAppendCount, long maxAppendSize) {
-      this(ProtoCatalogFile.empty(input), maxAppendCount, maxAppendSize);
+    Mut(InputFile input, int maxAppendCount, long maxAppendSize, long committedRetentionMs) {
+      this(ProtoCatalogFile.empty(input), maxAppendCount, maxAppendSize, committedRetentionMs);
     }
 
-    Mut(ProtoCatalogFile other, int maxAppendCount, long maxAppendSize) {
+    Mut(ProtoCatalogFile other, int maxAppendCount, long maxAppendSize,
+        long committedRetentionMs) {
       super(other);
       this.maxAppendCount = maxAppendCount;
       this.maxAppendSize = maxAppendSize;
+      this.committedRetentionMs = committedRetentionMs;
     }
 
     /**
@@ -715,8 +747,15 @@ public class ProtoCatalogFormat
       out.write(MAGIC);
       writeInt(out, FORMAT_VERSION);
 
-      // Checkpoint (from current state + pending changes merged)
-      byte[] checkpointBytes = ProtoCodec.encodeCheckpoint(original, this, idManager);
+      // Checkpoint (from current state + pending changes merged). CAS / compaction
+      // is the only place the committed-set is rewritten, so this is also the GC
+      // site: any inherited UUIDv7 with timestamp_ms <= watermark is dropped.
+      // watermark = now - committedRetentionMs, clamped to 0 (never negative);
+      // Long.MAX_VALUE retention disables GC.
+      long now = System.currentTimeMillis();
+      long watermark = committedRetentionMs >= now ? 0L : now - committedRetentionMs;
+      byte[] checkpointBytes =
+          ProtoCodec.encodeCheckpoint(original, this, idManager, watermark);
       writeVarint(out, checkpointBytes.length);
       out.write(checkpointBytes);
 

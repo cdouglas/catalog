@@ -125,7 +125,9 @@ study that informed this choice.
 
 #### Committed-set retention (GC)
 
-> **Status:** designed; implementation tracked in errata D11.
+> **Status:** implemented (see `docs/GC.md`). Configured via
+> `fileio.catalog.committed.retention.ms` (default 6 hours).
+> Errata D10 + D11 — resolved.
 
 The dedup set in `Checkpoint.committed_transactions` grows monotonically
 across compactions. Without a retention policy, even with v7 compression
@@ -190,8 +192,9 @@ function compactCheckpoint(oldCheckpoint, logTxns, retentionMs):
 The merge step preserves the streaming-friendly property: both
 `keptInherited` and `logTxns` are already sorted descending by
 UUID, so a single linear merge produces the new packed_entries body
-without random-access materialization. (See errata D10 for the
-single-pass rewrite that fuses decode + filter + merge into one walk.)
+without random-access materialization. The single-pass rewrite that
+fuses decode + filter + merge into one walk is implemented in
+`ProtoCodec.rewriteCommittedBytes`.
 
 **Edge case: highest dropped can exceed max retained.** It is possible
 (though rare) for `highest_dropped_timestamp_ms` to be *more recent*

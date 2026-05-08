@@ -94,7 +94,7 @@ public class ProtoCatalogFile extends CatalogFile {
     this.tblManifestPrefix = ImmutableMap.copyOf(builder.tblManifestPrefix);
     this.manifestPool = deepCopyManifestPool(builder.manifestPool);
     this.snapshotManifests = deepCopySnapshotManifests(builder.snapshotManifests);
-    this.committedTransactionsBytes = builder.materializeCommittedBytes();
+    this.committedTransactionsBytes = builder.materializeCommittedBytes(builder.dropBeforeTimestampMs);
     this.appendCount = builder.appendCount;
   }
 
@@ -243,8 +243,48 @@ public class ProtoCatalogFile extends CatalogFile {
     return nextTableId;
   }
 
+  /**
+   * Returns whether {@code txnId} is in the committed-transaction dedup set.
+   *
+   * <p>Tri-state semantic, with the third state surfaced as an exception:
+   * <ul>
+   *   <li>{@code true} — UUID found in the set; definitively committed.</li>
+   *   <li>{@code false} — UUID not found AND its v7 timestamp is greater than
+   *       {@link #highestDroppedTimestampMs()}. Definitively not committed
+   *       (presumed abort): no record exists, and we know we would still have
+   *       it if it had committed (newer than the GC horizon).</li>
+   *   <li><em>throws {@link DedupHorizonExceededException}</em> — UUID not
+   *       found AND its v7 timestamp is at or below the GC horizon. The
+   *       catalog can no longer distinguish "committed and aged out" from
+   *       "never committed." Callers should fall back to the snapshot-oracle
+   *       pattern (see {@code docs/GC.md} §"Two oracles") or treat as a
+   *       hard error.</li>
+   * </ul>
+   *
+   * <p>For non-v7 UUIDs (the dedup set only stores v7), returns {@code false}
+   * without consulting the horizon.
+   */
   public boolean containsTransaction(UUID txnId) {
-    return ProtoCodec.committedSetContains(committedTransactionsBytes, txnId);
+    if (ProtoCodec.committedSetContains(committedTransactionsBytes, txnId)) {
+      return true;
+    }
+    if (UuidV7.isV7(txnId)) {
+      long horizon = ProtoCodec.committedSetHorizon(committedTransactionsBytes);
+      if (horizon > 0L && UuidV7.timestampMs(txnId) <= horizon) {
+        throw new DedupHorizonExceededException(txnId, horizon);
+      }
+    }
+    return false;
+  }
+
+  /**
+   * The {@code highest_dropped_timestamp_ms} from the committed-transaction
+   * set: the largest v7 timestamp ever GC'd from this catalog. Queries for
+   * UUIDs at or below this watermark are UNKNOWN. Returns 0 when no GC pass
+   * has fired yet.
+   */
+  public long highestDroppedTimestampMs() {
+    return ProtoCodec.committedSetHorizon(committedTransactionsBytes);
   }
 
   /** Raw inner-message bytes of the committed-txn set. Empty array iff the set is empty. */
@@ -445,6 +485,9 @@ public class ProtoCatalogFile extends CatalogFile {
     private byte[] originalCommittedBytes = new byte[0];
     private final Set<UUID> addedCommittedTransactions = new HashSet<>();
     private int appendCount = 0;
+    // GC watermark passed via build(long); 0 means "no GC pass on this build".
+    // Set by Mut prior to invoking build during a CAS / compaction commit.
+    private long dropBeforeTimestampMs = 0L;
 
     Builder(InputFile location) {
       this.location = location;
@@ -737,31 +780,49 @@ public class ProtoCatalogFile extends CatalogFile {
       return this;
     }
 
+    /**
+     * Tri-state membership check, mirroring
+     * {@link ProtoCatalogFile#containsTransaction}: returns {@code true} if
+     * found among in-flight additions or in the inherited bytes; returns
+     * {@code false} for a v7 UUID whose timestamp is above the GC horizon;
+     * throws {@link DedupHorizonExceededException} when the UUID is missing
+     * and at or below the horizon.
+     *
+     * <p>Replay-path note: the just-appended txn UUID is minted at append
+     * time (minutes ago at most) while the watermark is hours back, so the
+     * throw branch is unreachable in normal operation. If a malformed /
+     * skewed writer manages to append a UUID below the watermark, the
+     * exception surfaces the bug rather than silently mis-deduping.
+     */
     public boolean containsTransaction(UUID txnId) {
       if (addedCommittedTransactions.contains(txnId)) {
         return true;
       }
-      return ProtoCodec.committedSetContains(originalCommittedBytes, txnId);
+      if (ProtoCodec.committedSetContains(originalCommittedBytes, txnId)) {
+        return true;
+      }
+      if (UuidV7.isV7(txnId)) {
+        long horizon = ProtoCodec.committedSetHorizon(originalCommittedBytes);
+        if (horizon > 0L && UuidV7.timestampMs(txnId) <= horizon) {
+          throw new DedupHorizonExceededException(txnId, horizon);
+        }
+      }
+      return false;
     }
 
     /**
      * Produces the final inner CommittedTransactions wire bytes for the
-     * resulting ProtoCatalogFile. Pass-through when no additions; merge
-     * (decode original + add new + re-encode) otherwise.
+     * resulting ProtoCatalogFile. Single-pass merge of inherited entries +
+     * additions, with optional GC drop of inherited entries whose v7 timestamp
+     * is &lt;= {@code dropBeforeTimestampMs}. {@code 0} disables the GC pass
+     * (pass-through when there are no additions).
      */
-    byte[] materializeCommittedBytes() {
-      if (addedCommittedTransactions.isEmpty()) {
+    byte[] materializeCommittedBytes(long dropBeforeTimestampMs) {
+      if (addedCommittedTransactions.isEmpty() && dropBeforeTimestampMs == 0L) {
         return originalCommittedBytes;
       }
-      try {
-        java.util.LinkedHashSet<UUID> merged = originalCommittedBytes.length == 0
-            ? new java.util.LinkedHashSet<>()
-            : ProtoCodec.decodeCommittedTransactions(originalCommittedBytes);
-        merged.addAll(addedCommittedTransactions);
-        return ProtoCodec.encodeCommittedTransactions(merged);
-      } catch (IOException e) {
-        throw new java.io.UncheckedIOException(e);
-      }
+      return ProtoCodec.rewriteCommittedBytes(
+          originalCommittedBytes, addedCommittedTransactions, dropBeforeTimestampMs);
     }
 
     public Builder setAppendCount(int count) {
@@ -822,6 +883,26 @@ public class ProtoCatalogFile extends CatalogFile {
     }
 
     public ProtoCatalogFile build() {
+      return build(0L);
+    }
+
+    /**
+     * Builds a ProtoCatalogFile, performing a GC pass on the inherited
+     * committed-set when {@code dropBeforeTimestampMs > 0}: any inherited
+     * UUIDv7 with {@code timestamp_ms <= dropBeforeTimestampMs} is dropped
+     * and contributes to {@code highest_dropped_timestamp_ms}. Additions
+     * via {@link #addCommittedTransaction} are kept unconditionally.
+     *
+     * <p>Callers (notably the CAS / compaction path in
+     * {@link ProtoCatalogFormat.Mut}) compute {@code dropBeforeTimestampMs}
+     * as {@code now - committedRetentionMs}. The no-arg {@link #build()}
+     * variant disables the GC pass and is used for read-only rebuilds (decode
+     * round-trips, tests).
+     */
+    public ProtoCatalogFile build(long dropBeforeTimestampMs) {
+      Preconditions.checkArgument(dropBeforeTimestampMs >= 0L,
+          "dropBeforeTimestampMs must be >= 0, got %s", dropBeforeTimestampMs);
+      this.dropBeforeTimestampMs = dropBeforeTimestampMs;
       // Ensure all lookups are complete before building immutable file
       rebuildLookups();
       return new ProtoCatalogFile(this);
