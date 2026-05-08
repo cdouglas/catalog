@@ -224,15 +224,19 @@ negative integers as virtual IDs:
 - On replay, `resolve(id)` maps negative IDs to their allocated
   counterparts.
 
-## Sealing
+## Compaction Trigger
 
-The transaction `sealed` flag is a `bool` (field 2 in `Transaction`). A
-writer about to push the log past `maxAppendCount` or `maxAppendSize`
-seals its transaction so the next writer knows to compact rather than
-append. Sealing is bytewise in-place: `ProtoCodec.sealTransaction()` /
-`unsealTransaction()` toggle the varint at the field-2 offset without
-re-encoding. To make this work, `encodeTransaction()` always writes
-field 2 even when false (overriding proto3's default-value suppression).
+Compaction happens at write time when the file's observable state
+crosses either threshold:
+
+- `appendCount >= maxAppendCount`, or
+- `current.length + len(txnBytes) > maxAppendSize`.
+
+No on-disk hint is needed. Atomic append + atomic CAS at the storage
+layer are sufficient to linearize commits, and either writer in a race
+will independently decide to compact based on the live file's
+length / appendCount. Field 2 in `Transaction` (formerly a `sealed` bool
+flag) is reserved.
 
 ## Best Practices
 

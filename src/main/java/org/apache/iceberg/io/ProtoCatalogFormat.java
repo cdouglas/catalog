@@ -185,10 +185,6 @@ public class ProtoCatalogFormat
           txn.apply(builder);
           builder.addCommittedTransaction(txn.id());
         }
-        if (txn.isSealed()) {
-          builder.setSealed(true);
-          break;
-        }
       }
     }
     builder.setAppendCount(appendCount);
@@ -526,17 +522,16 @@ public class ProtoCatalogFormat
       final boolean appendSupported = fileIO.supportsAppend();
 
       for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-        // Decide whether to CAS (compact) or append.
-        // MUST CAS if: backend doesn't support append, already sealed by a previous
-        // writer, or append count at/beyond the hard limit. Setting maxAppendCount=0
-        // forces CAS on every commit.
+        // Decide whether to CAS (compact) or append based on observable state
+        // of the live file: backend support, append count, and current size.
+        // Either limit (count or size) being met forces CAS on the next commit.
+        // Setting maxAppendCount=0 forces CAS on every commit.
         boolean mustCAS =
             !appendSupported
-                || baseCatalog.isSealed()
-                || baseCatalog.appendCount() >= maxAppendCount;
+                || baseCatalog.appendCount() >= maxAppendCount
+                || current.getLength() + txnBytes.length > maxAppendSize;
 
         if (mustCAS) {
-          ProtoCodec.unsealTransaction(txnBytes);
           Optional<ProtoCatalogFile> result = tryCAS(current, txn, txnBytes, fileIO);
           if (result.isPresent()) {
             return validateCommit(result.get(), txn);
@@ -573,14 +568,6 @@ public class ProtoCatalogFormat
           throw new CommitFailedException(
               "Cannot commit: catalog file changed concurrently at %s", current.location());
         } else {
-          // Append path. Seal this transaction if it will push us to/past either limit,
-          // signalling the next writer to compact via CAS.
-          boolean willHitLimit =
-              baseCatalog.appendCount() + 1 >= maxAppendCount
-              || current.getLength() + txnBytes.length > maxAppendSize;
-          if (willHitLimit) {
-            ProtoCodec.sealTransaction(txnBytes);
-          }
           Optional<ProtoCatalogFile> result = tryAppend(current, txn, txnBytes, fileIO);
           if (result.isPresent()) {
             return validateCommit(result.get(), txn);
@@ -592,9 +579,8 @@ public class ProtoCatalogFormat
           long oldLength = current.getLength();
           current = fileIO.newInputFile(current.location());
           if (current.getLength() < oldLength) {
-            // File shrank -- another writer compacted. Must re-read to check
-            // whether we need to switch to CAS (sealed, or count reset).
-            ProtoCodec.unsealTransaction(txnBytes);
+            // File shrank -- another writer compacted. Re-read to refresh
+            // appendCount so the next mustCAS decision is accurate.
             try (SeekableInputStream in = current.newStream()) {
               baseCatalog = readInternal(current, in, (int) current.getLength());
             } catch (IOException e) {

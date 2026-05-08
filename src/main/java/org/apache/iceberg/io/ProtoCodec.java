@@ -125,9 +125,13 @@ public class ProtoCodec {
   private static final int SMR_SNAPSHOT_ID = 1;
   private static final int SMR_POOL_INDICES = 2;
 
+  // Uuid message field numbers (msb/lsb halves of a 128-bit UUID).
+  // Used for catalog_uuid, transaction_id, and committed_transaction_ids.
+  private static final int UUID_MSB = 1;
+  private static final int UUID_LSB = 2;
+
   // Transaction field numbers
-  private static final int TXN_ID = 1;
-  private static final int TXN_SEALED = 2;
+  private static final int TXN_ID = 1;            // length-delimited Uuid message
   private static final int TXN_ACTIONS = 3;
 
   // Action type field numbers (oneof)
@@ -224,7 +228,7 @@ public class ProtoCodec {
       ByteArrayOutputStream out = new ByteArrayOutputStream();
 
       // Catalog UUID
-      writeBytes(out, CHECKPOINT_CATALOG_UUID, uuidToBytes(original.uuid()));
+      writeUuid(out, CHECKPOINT_CATALOG_UUID, original.uuid());
 
       // Next IDs (from idManager which tracks allocations)
       writeVarint(out, CHECKPOINT_NEXT_NAMESPACE_ID, idManager.getNextNsid());
@@ -269,7 +273,7 @@ public class ProtoCodec {
 
       // Committed transactions
       for (UUID txnId : original.committedTransactions()) {
-        writeBytes(out, CHECKPOINT_COMMITTED_TXNS, uuidToBytes(txnId));
+        writeUuid(out, CHECKPOINT_COMMITTED_TXNS, txnId);
       }
 
       return out.toByteArray();
@@ -291,7 +295,7 @@ public class ProtoCodec {
 
         switch (fieldNumber) {
           case CHECKPOINT_CATALOG_UUID:
-            builder.setCatalogUuid(bytesToUuid(readLengthDelimitedBytes(in)));
+            builder.setCatalogUuid(decodeUuid(readLengthDelimitedBytes(in)));
             break;
           case CHECKPOINT_NEXT_NAMESPACE_ID:
             builder.setNextNamespaceId(readVarint(in));
@@ -312,7 +316,7 @@ public class ProtoCodec {
             decodeInlineTable(readLengthDelimitedBytes(in), builder);
             break;
           case CHECKPOINT_COMMITTED_TXNS:
-            builder.addCommittedTransaction(bytesToUuid(readLengthDelimitedBytes(in)));
+            builder.addCommittedTransaction(decodeUuid(readLengthDelimitedBytes(in)));
             break;
           default:
             skipField(in, wireType);
@@ -589,11 +593,7 @@ public class ProtoCodec {
   public static byte[] encodeTransaction(Transaction txn) {
     try {
       ByteArrayOutputStream out = new ByteArrayOutputStream();
-      writeBytes(out, TXN_ID, uuidToBytes(txn.id()));
-      // Always encode the sealed field so sealTransaction/unsealTransaction can
-      // mutate it in place (otherwise proto3 default-suppression would omit it
-      // when false, breaking in-place seal toggling).
-      writeVarint(out, TXN_SEALED, txn.isSealed() ? 1 : 0);
+      writeUuid(out, TXN_ID, txn.id());
       for (Action action : txn.actions()) {
         byte[] actionBytes = encodeAction(action);
         writeLengthDelimited(out, TXN_ACTIONS, actionBytes);
@@ -611,7 +611,6 @@ public class ProtoCodec {
     try {
       ByteArrayInputStream in = new ByteArrayInputStream(bytes);
       UUID txnId = null;
-      boolean sealed = false;
       List<Action> actions = new ArrayList<>();
 
       while (in.available() > 0) {
@@ -619,10 +618,7 @@ public class ProtoCodec {
         int fieldNumber = tag >>> 3;
         switch (fieldNumber) {
           case TXN_ID:
-            txnId = bytesToUuid(readLengthDelimitedBytes(in));
-            break;
-          case TXN_SEALED:
-            sealed = readVarint(in) != 0;
+            txnId = decodeUuid(readLengthDelimitedBytes(in));
             break;
           case TXN_ACTIONS:
             actions.add(decodeAction(readLengthDelimitedBytes(in)));
@@ -633,59 +629,7 @@ public class ProtoCodec {
       }
 
       Preconditions.checkNotNull(txnId, "Transaction ID is required");
-      return new Transaction(txnId, sealed, actions);
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
-    }
-  }
-
-  /**
-   * Modifies transaction bytes to set the sealed flag.
-   */
-  public static void sealTransaction(byte[] bytes) {
-    // The sealed field is at a known position after the UUID:
-    // tag(1 byte) + uuid_length(1 byte) + uuid(16 bytes) = 18 bytes
-    // Then comes the sealed field tag
-    setSealed(bytes, true);
-  }
-
-  /**
-   * Modifies transaction bytes to clear the sealed flag.
-   */
-  public static void unsealTransaction(byte[] bytes) {
-    setSealed(bytes, false);
-  }
-
-  private static void setSealed(byte[] bytes, boolean sealed) {
-    // Find and modify the sealed field in place
-    // This is a simplified implementation - in practice we'd need to handle
-    // the case where sealed field doesn't exist yet
-    try {
-      ByteArrayInputStream in = new ByteArrayInputStream(bytes);
-      int pos = 0;
-
-      while (in.available() > 0) {
-        int startPos = bytes.length - in.available();
-        int tag = readVarint(in);
-        int fieldNumber = tag >>> 3;
-        int wireType = tag & 0x7;
-
-        if (fieldNumber == TXN_SEALED && wireType == WIRE_VARINT) {
-          // Found the sealed field - modify in place
-          int valuePos = bytes.length - in.available();
-          bytes[valuePos] = (byte) (sealed ? 1 : 0);
-          readVarint(in); // consume existing value
-          return;
-        } else if (fieldNumber == TXN_ID) {
-          // Skip UUID
-          readLengthDelimitedBytes(in);
-        } else {
-          skipField(in, wireType);
-        }
-      }
-
-      // Sealed field not found - this shouldn't happen in well-formed transactions
-      throw new IllegalStateException("Sealed field not found in transaction");
+      return new Transaction(txnId, actions);
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
@@ -1266,17 +1210,44 @@ public class ProtoCodec {
     }
   }
 
-  private static byte[] uuidToBytes(UUID uuid) {
-    ByteBuffer buffer = ByteBuffer.allocate(16);
-    buffer.putLong(uuid.getMostSignificantBits());
-    buffer.putLong(uuid.getLeastSignificantBits());
-    return buffer.array();
+  /**
+   * Encodes a UUID as a length-delimited {@code Uuid} sub-message under
+   * the given outer field number. Inner layout is fixed64 msb (field 1),
+   * fixed64 lsb (field 2). Each Uuid is 20 bytes on the wire (1 outer
+   * tag + 1 length + 18 inner bytes).
+   */
+  private static void writeUuid(OutputStream out, int fieldNumber, UUID uuid) throws IOException {
+    ByteArrayOutputStream inner = new ByteArrayOutputStream(18);
+    writeFixed64(inner, UUID_MSB, uuid.getMostSignificantBits());
+    writeFixed64(inner, UUID_LSB, uuid.getLeastSignificantBits());
+    writeLengthDelimited(out, fieldNumber, inner.toByteArray());
   }
 
-  private static UUID bytesToUuid(byte[] bytes) {
-    ByteBuffer buffer = ByteBuffer.wrap(bytes);
-    long msb = buffer.getLong();
-    long lsb = buffer.getLong();
+  /**
+   * Decodes a {@code Uuid} sub-message body (already length-delimited
+   * stripped) into a {@link UUID}.
+   */
+  private static UUID decodeUuid(byte[] bytes) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    Long msb = null;
+    Long lsb = null;
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      int fieldNumber = tag >>> 3;
+      int wireType = tag & 0x7;
+      switch (fieldNumber) {
+        case UUID_MSB:
+          msb = readFixed64(in);
+          break;
+        case UUID_LSB:
+          lsb = readFixed64(in);
+          break;
+        default:
+          skipField(in, wireType);
+      }
+    }
+    Preconditions.checkNotNull(msb, "Uuid msb is required");
+    Preconditions.checkNotNull(lsb, "Uuid lsb is required");
     return new UUID(msb, lsb);
   }
 
@@ -1594,12 +1565,10 @@ public class ProtoCodec {
    */
   public static class Transaction {
     private final UUID id;
-    private boolean sealed;
     private final List<Action> actions;
 
-    public Transaction(UUID id, boolean sealed, List<Action> actions) {
+    public Transaction(UUID id, List<Action> actions) {
       this.id = id;
-      this.sealed = sealed;
       this.actions = actions;
     }
 
@@ -1615,15 +1584,11 @@ public class ProtoCodec {
         ((ProtoCatalogFormat.Mut) mut).buildActions(actions, idManager);
       }
 
-      return new Transaction(txnId, false, actions);
+      return new Transaction(txnId, actions);
     }
 
     public UUID id() {
       return id;
-    }
-
-    public boolean isSealed() {
-      return sealed;
     }
 
     public List<Action> actions() {

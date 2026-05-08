@@ -131,15 +131,11 @@ public class TestProtoActions {
   // ============================================================
 
   static ProtoCodec.Transaction txn(ProtoCodec.Action... actions) {
-    return new ProtoCodec.Transaction(UUID.randomUUID(), false, List.of(actions));
+    return new ProtoCodec.Transaction(UUID.randomUUID(), List.of(actions));
   }
 
   static ProtoCodec.Transaction txn(UUID id, ProtoCodec.Action... actions) {
-    return new ProtoCodec.Transaction(id, false, List.of(actions));
-  }
-
-  static ProtoCodec.Transaction sealedTxn(ProtoCodec.Action... actions) {
-    return new ProtoCodec.Transaction(UUID.randomUUID(), true, List.of(actions));
+    return new ProtoCodec.Transaction(id, List.of(actions));
   }
 
   static ProtoCodec.CreateNamespaceAction createNs(
@@ -963,25 +959,6 @@ public class TestProtoActions {
       assertThat(result.containsNamespace(Namespace.of("should_not_appear"))).isFalse();
     }
 
-    @Test
-    void sealedTransactionStopsLogReplay() {
-      byte[] file = catalog().ns(1, 0, "db", 1).build();
-
-      ProtoCodec.Transaction sealed = sealedTxn(
-          createTbl(1, 1, "sealed_tbl", 1, 1, "s3://sealed"));
-      ProtoCodec.Transaction after = txn(
-          createNs(2, 0, "ignored", 1, -1));
-      ProtoCatalogFile result = apply(file, sealed, after);
-
-      // Sealed transaction applied
-      assertThat(result.location(TableIdentifier.of(Namespace.of("db"), "sealed_tbl")))
-          .isEqualTo("s3://sealed");
-      assertThat(result.isSealed()).isTrue();
-
-      // Transaction after seal not applied
-      assertThat(result.containsNamespace(Namespace.of("ignored"))).isFalse();
-      assertThat(result.containsTransaction(after.id())).isFalse();
-    }
   }
 
   // ============================================================
@@ -1133,7 +1110,7 @@ public class TestProtoActions {
     @Test
     void emptyTransactionApplies() {
       byte[] file = catalog().ns(1, 0, "db", 1).build();
-      ProtoCodec.Transaction t = new ProtoCodec.Transaction(UUID.randomUUID(), false, List.of());
+      ProtoCodec.Transaction t = new ProtoCodec.Transaction(UUID.randomUUID(), List.of());
       ProtoCatalogFile result = apply(file, t);
 
       // No-op transaction should still be recorded
@@ -1301,7 +1278,7 @@ public class TestProtoActions {
       ProtoCodec.CreateTableInlineAction action =
           createTblInline(1, 1, "tbl", 1, 1, SAMPLE_INLINE_METADATA);
       ProtoCodec.Transaction txn = new ProtoCodec.Transaction(
-          UUID.randomUUID(), false, List.of(action));
+          UUID.randomUUID(), List.of(action));
 
       byte[] encoded = ProtoCodec.encodeTransaction(txn);
       ProtoCodec.Transaction decoded = ProtoCodec.decodeTransaction(encoded);
@@ -2535,7 +2512,6 @@ public class TestProtoActions {
      */
     void assertCatalogEquals(ProtoCatalogFile expected, ProtoCatalogFile actual) {
       assertThat(actual.uuid()).isEqualTo(expected.uuid());
-      assertThat(actual.isSealed()).isEqualTo(expected.isSealed());
       assertThat(actual.namespaces()).containsExactlyInAnyOrderElementsOf(expected.namespaces());
       assertThat(actual.tables()).containsExactlyInAnyOrderElementsOf(expected.tables());
       assertThat(actual.committedTransactions())
@@ -2663,65 +2639,6 @@ public class TestProtoActions {
 
       // txnD failed: stale table version
       assertThat(afterAll.containsTransaction(txnD.id())).isFalse();
-    }
-
-    /**
-     * Sealed transaction on random state: build from Mut, seal, verify later
-     * transactions are not applied. Ported from LCF testSealTransaction.
-     */
-    @RepeatedTest(5)
-    void sealedMutTransactionOnRandomState() throws IOException {
-      ProtoCatalogFile orig = generateRandom(System.nanoTime());
-      byte[] origBytes = toFileBytes(orig);
-
-      Namespace dingos = Namespace.of("dingos");
-      Namespace dingos_yaks = Namespace.of("dingos", "yaks");
-      Namespace yaks = Namespace.of("yaks");
-      TableIdentifier tblY = TableIdentifier.of(dingos_yaks, "tblY");
-      TableIdentifier tblD = TableIdentifier.of(dingos, "tblD");
-
-      // txnA: create structure
-      ProtoCatalogFormat.Mut mutA = new ProtoCatalogFormat.Mut(orig);
-      mutA.createNamespace(dingos);
-      mutA.createNamespace(dingos_yaks);
-      mutA.createTable(tblY, "yak://chinchilla/tblY");
-      ProtoCodec.Transaction txnA = mutA.buildTransaction();
-
-      ProtoCatalogFile afterA = apply(origBytes, txnA);
-      byte[] afterABytes = toFileBytes(afterA);
-      ProtoCatalogFile afterAFresh = ProtoCatalogFormat.readInternal(
-          LOCATION, new ByteArrayInputStream(afterABytes), afterABytes.length);
-
-      // txnB: update tblY, SEALED
-      ProtoCatalogFormat.Mut mutB = new ProtoCatalogFormat.Mut(afterAFresh);
-      mutB.updateTable(tblY, "yak://chinchilla/tblY2");
-      ProtoCodec.Transaction txnBRaw = mutB.buildTransaction();
-      // Make it sealed
-      ProtoCodec.Transaction txnB = new ProtoCodec.Transaction(
-          txnBRaw.id(), true, txnBRaw.actions());
-
-      // txnC: would create yaks (valid, but after seal)
-      ProtoCatalogFormat.Mut mutC = new ProtoCatalogFormat.Mut(afterAFresh);
-      mutC.createNamespace(yaks);
-      ProtoCodec.Transaction txnC = mutC.buildTransaction();
-
-      // txnD: would create tblD (valid, but after seal)
-      ProtoCatalogFormat.Mut mutD = new ProtoCatalogFormat.Mut(afterAFresh);
-      mutD.createTable(tblD, "yak://chinchilla/tblD");
-      ProtoCodec.Transaction txnD = mutD.buildTransaction();
-
-      ProtoCatalogFile result = apply(afterABytes, txnB, txnC, txnD);
-
-      // txnB applied, catalog is sealed
-      assertThat(result.location(tblY)).isEqualTo("yak://chinchilla/tblY2");
-      assertThat(result.containsTransaction(txnB.id())).isTrue();
-      assertThat(result.isSealed()).isTrue();
-
-      // txnC, txnD not applied (after seal)
-      assertThat(result.containsNamespace(yaks)).isFalse();
-      assertThat(result.location(tblD)).isNull();
-      assertThat(result.containsTransaction(txnC.id())).isFalse();
-      assertThat(result.containsTransaction(txnD.id())).isFalse();
     }
 
     /**

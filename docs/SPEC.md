@@ -73,20 +73,36 @@ Offset  Size   Field             Description
 
 Defined in `src/main/proto/catalog.proto`, package `iceberg.catalog`.
 
+### Uuid
+
+128-bit identifier encoded as two `fixed64` halves. Used for catalog
+identity, transaction IDs, and committed-transaction dedup. Each `fixed64`
+is 8 raw bytes (no length prefix), so a `Uuid` sub-message is 20 bytes
+on the wire (1 outer tag + 1 length + 18 inner bytes), versus 18 bytes
+for an opaque `bytes`-encoded UUID. The structured shape composes
+cleanly inside `repeated` fields.
+
+```protobuf
+message Uuid {
+  fixed64 msb = 1;
+  fixed64 lsb = 2;
+}
+```
+
 ### Checkpoint
 
 Written on compaction (CAS). Contains the full materialized catalog state.
 
 ```protobuf
 message Checkpoint {
-  bytes  catalog_uuid              = 1;   // 16 bytes, UUIDv7
-  int32  next_namespace_id         = 2;
-  int32  next_table_id             = 3;
-  repeated Namespace          namespaces                = 10;
-  repeated Table              tables                    = 11;  // pointer-mode tables
-  repeated NamespaceProperty  namespace_properties      = 12;
-  repeated InlineTable        inline_tables             = 13;  // inline-mode tables
-  repeated bytes              committed_transaction_ids = 20;  // 16-byte UUIDs
+  Uuid                       catalog_uuid              = 1;   // UUIDv7
+  int32                      next_namespace_id         = 2;
+  int32                      next_table_id             = 3;
+  repeated Namespace         namespaces                = 10;
+  repeated Table             tables                    = 11;  // pointer-mode
+  repeated NamespaceProperty namespace_properties      = 12;
+  repeated InlineTable       inline_tables             = 13;  // inline-mode
+  repeated Uuid              committed_transaction_ids = 20;  // UUIDv7s
 }
 ```
 
@@ -126,9 +142,8 @@ Appended atomically to the log region.
 
 ```protobuf
 message Transaction {
-  bytes          transaction_id = 1;    // UUIDv7, 16 bytes
-  bool           sealed         = 2;    // signals compaction needed
-  repeated Action actions       = 3;
+  Uuid            transaction_id = 1;       // UUIDv7
+  repeated Action actions        = 3;
 }
 
 message Action {
@@ -237,9 +252,7 @@ so negative values (used for late-binding sentinels) occupy 10 bytes on the
 wire.
 
 Default-valued fields (zero for ints, false for bools, empty for
-strings/bytes) are omitted per proto3 conventions, with one exception: the
-`sealed` flag on `Transaction` is always written so it can be toggled
-in-place (see Seal / Unseal).
+strings/bytes) are omitted per proto3 conventions.
 
 ## Read Protocol
 
@@ -271,9 +284,6 @@ function READ(fileIO, location):
         if txn.verify(state):
             txn.apply(state)
             state.committedTxn.add(txn.id)
-        if txn.sealed:
-            state.sealed = true
-            break                            # stop after sealed txn
 
     return freeze(state)
 ```
@@ -315,13 +325,13 @@ function COMMIT(fileIO, original, mutations):
         return tryCAS(current, txnBytes, fileIO).orElseThrow(CommitFailed)
 
     for attempt in 0..9:
-        # Must CAS if already sealed, or append count at/beyond the hard
-        # limit. (maxAppendCount=0 forces CAS on every commit.)
-        mustCAS = original.sealed
-            or original.appendCount >= maxAppendCount
+        # Must CAS when either limit is at/beyond threshold based on the
+        # observable file state. (maxAppendCount=0 forces CAS on every
+        # commit — useful for backends without conditional append.)
+        mustCAS = original.appendCount >= maxAppendCount
+            or current.length + len(txnBytes) > maxAppendSize
 
         if mustCAS:
-            unseal(txnBytes)
             result = tryCAS(current, txnBytes, fileIO)
             if result.present:
                 return validateCommit(result, txn)
@@ -329,9 +339,6 @@ function COMMIT(fileIO, original, mutations):
             original = READ(fileIO, current)
 
         else:
-            if original.appendCount + 1 >= maxAppendCount
-               or current.length + len(txnBytes) > maxAppendSize:
-                seal(txnBytes)
             result = tryAppend(current, txnBytes, fileIO)
             if result.present:
                 return validateCommit(result, txn)
@@ -342,8 +349,8 @@ function COMMIT(fileIO, original, mutations):
             oldLength = current.length
             current   = fileIO.newInputFile(current.location)
             if current.length < oldLength:
-                # File shrank (compacted). Must re-read to check sealed/count.
-                unseal(txnBytes)
+                # File shrank (compacted). Re-read so the next mustCAS
+                # decision sees the current appendCount.
                 original = READ(fileIO, current)
             # else: file grew (concurrent append). Retry same bytes.
 
@@ -397,34 +404,26 @@ function tryAppend(current, txnBytes, fileIO):
         return None
 ```
 
-### Seal / Unseal
-
-The `sealed` flag is a `bool` field (field 2) in `Transaction`.
-`ProtoCodec.sealTransaction()` and `unsealTransaction()` locate the field
-tag in the serialized bytes and toggle the varint value in place. To make
-this possible, `encodeTransaction()` always writes the sealed field (even
-when false), overriding proto3's default-value suppression — otherwise
-in-place mutation would need to insert bytes into the middle of the encoded
-message.
-
 ## Compaction
 
-Compaction is triggered when either the append count or the append size
-threshold would be exceeded:
+Compaction is triggered by observable file state — no per-transaction
+hint flag is required, because correctness rests on atomic append + atomic
+CAS at the storage layer:
 
-1. A writer detects that committing this transaction would push the log past
-   `maxAppendCount` records or `maxAppendSize` bytes. It **seals** the
-   transaction (flipping the `sealed` bit in the encoded bytes) so the next
-   writer knows to compact.
-2. Next writer reads the file, sees `sealed = true` (or `appendCount >=
-   maxAppendCount`), and enters the CAS branch.
-3. The CAS builds a fresh checkpoint from the fully-replayed state and
+1. The next writer reads the file. If `appendCount >= maxAppendCount` or
+   `current.length + len(txnBytes) > maxAppendSize`, it enters the CAS
+   branch.
+2. The CAS builds a fresh checkpoint from the fully-replayed state and
    writes `[header][checkpoint][new-txn]`, replacing the entire file.
-4. After CAS, the file has a single record in the log portion (the
+3. After CAS, the file has a single record in the log portion (the
    committing transaction), and `appendCount = 1`.
 
-The committed-transaction-ID set is carried forward in the checkpoint for
-idempotency.
+Two writers with mismatched `maxAppendCount` / `maxAppendSize` config can
+disagree on when to compact, but they cannot corrupt the catalog: the
+worst case is one writer continues appending past another writer's
+preferred threshold. Both atomic primitives still enforce linearizable
+ordering. The committed-transaction-ID set is carried forward in the
+checkpoint for idempotency.
 
 ## Late-Binding
 
@@ -449,7 +448,6 @@ The catalog state is held in `ProtoCatalogFile` (immutable snapshot):
 | `uuid`               | `UUID`                           | Catalog identity (UUIDv7)            |
 | `nextNamespaceId`    | `int`                            | Next namespace ID to allocate        |
 | `nextTableId`        | `int`                            | Next table ID to allocate            |
-| `sealed`             | `boolean`                        | Whether a sealed txn was encountered |
 | `appendCount`        | `int`                            | Transaction records in the log       |
 | `namespaceById`      | `Map<Integer, NsEntry>`          | Namespace ID → entry                 |
 | `namespaceLookup`    | `Map<Namespace, Integer>`        | Namespace path → ID (derived)        |

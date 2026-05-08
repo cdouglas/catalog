@@ -41,8 +41,6 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
  */
 public class ProtoCatalogFile extends CatalogFile {
 
-  private final boolean sealed;
-
   // ID tracking
   private final int nextNamespaceId;
   private final int nextTableId;
@@ -80,7 +78,6 @@ public class ProtoCatalogFile extends CatalogFile {
 
   private ProtoCatalogFile(Builder builder) {
     super(builder.catalogUuid, builder.location);
-    this.sealed = builder.sealed;
     this.nextNamespaceId = builder.nextNamespaceId;
     this.nextTableId = builder.nextTableId;
     this.namespaceById = ImmutableMap.copyOf(builder.namespaceById);
@@ -232,10 +229,6 @@ public class ProtoCatalogFile extends CatalogFile {
   // ============================================================
   // Proto-specific accessors
   // ============================================================
-
-  public boolean isSealed() {
-    return sealed;
-  }
 
   public int nextNamespaceId() {
     return nextNamespaceId;
@@ -408,7 +401,6 @@ public class ProtoCatalogFile extends CatalogFile {
   public static class Builder {
     private final InputFile location;
     private UUID catalogUuid;
-    private boolean sealed = false;
     private int nextNamespaceId = 1;
     private int nextTableId = 1;
 
@@ -431,11 +423,6 @@ public class ProtoCatalogFile extends CatalogFile {
 
     public Builder setCatalogUuid(UUID uuid) {
       this.catalogUuid = uuid;
-      return this;
-    }
-
-    public Builder setSealed(boolean sealed) {
-      this.sealed = sealed;
       return this;
     }
 

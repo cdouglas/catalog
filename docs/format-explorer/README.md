@@ -20,7 +20,8 @@ No server needed; everything (fixtures, schema, decoder, UI) is embedded.
 | 3 | `txn-multi-action-with-late-bind` | 5-byte negative-int varint quirk, `parent_version=-1` |
 | 4 | `create-table-inline-with-real-metadata` | oneof bytes variant, JSON-in-protobuf nesting |
 | 5 | `update-table-inline-delta` | deepest message nesting, fixed64, sint64, manifest entry |
-| 6 | `sealed-toggle` | the always-written `sealed` byte and in-place mutation |
+| 6 | `pointer-multi-table-conflict-retry` | atomic multi-table commits, version-based conflict detection |
+| 7 | `inline-multi-table-conflict-retry` | inline-mode delta commits, conflict-retry on inline tables |
 
 Click any byte in the hex pane or any node in the tree pane to populate the
 detail panel with the field's name, proto field number, wire type, scalar
@@ -57,7 +58,7 @@ silently skipped during the regular `mvn test` run.
 
 ## Notes on the wire format
 
-The visualizer surfaces two encoding quirks that are worth knowing about:
+The visualizer surfaces one encoding quirk worth knowing about:
 
 - **5-byte negative-int varints.** `ProtoCodec.writeRawVarint(int)` operates
   on a 32-bit Java `int` and uses unsigned right-shift (`>>>= 7`). A
@@ -65,9 +66,4 @@ The visualizer surfaces two encoding quirks that are worth knowing about:
   bytes. Canonical proto3 sign-extends a negative `int32` to 64 bits and
   writes 10 bytes. Most `protoc`-generated readers (treating the field as
   `int32`) accept the 5-byte form, but the encoded bytes are not strictly
-  conformant. Scenarios 3 and 6 highlight this as a quirk callout.
-- **Always-written `Transaction.sealed` byte.** The `sealed` bool field is
-  written even when its proto3 default value would normally omit it.
-  This guarantees a fixed byte offset for `ProtoCodec.sealTransaction()` /
-  `unsealTransaction()` to flip in place. Click the "Toggle sealed bit"
-  button on scenario 3 or 6 to see exactly which byte changes.
+  conformant. Scenario 3 highlights this as a quirk callout.

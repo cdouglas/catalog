@@ -230,14 +230,14 @@ public class TestProtoCommitKnobs {
   }
 
   @Test
-  void appendCountLimitTriggersSealAndCAS() {
+  void appendCountLimitTriggersCAS() {
     // maxAppendCount=3 means we allow up to 3 log records before CAS.
     // Commit 1: initial CAS -> file has 1 txn. count=1.
-    // Commit 2: count(1) < 3, append. (seal check: 1+1=2 < 3, no seal.) count=2.
-    // Commit 3: count(2) < 3, append. (seal check: 2+1=3 >= 3, seal.) count=3.
-    // Commit 4: sealed -> CAS. count=1.
+    // Commit 2: count(1) < 3, append. count=2.
+    // Commit 3: count(2) < 3, append. count=3.
+    // Commit 4: count(3) >= 3, CAS. count=1.
     // Commit 5: count(1) < 3, append. count=2.
-    // Commit 6: count(2) < 3, append with seal. count=3.
+    // Commit 6: count(2) < 3, append. count=3.
     ProtoCatalogFormat format = new ProtoCatalogFormat(3, Long.MAX_VALUE);
     MockIO io = new MockIO();
 
@@ -249,7 +249,7 @@ public class TestProtoCommitKnobs {
   }
 
   @Test
-  void appendSizeLimitTriggersSealAndCAS() {
+  void appendSizeLimitTriggersCAS() {
     // Small size budget -> compaction kicks in after a few appends
     ProtoCatalogFormat format = new ProtoCatalogFormat(Integer.MAX_VALUE, 200L);
     MockIO io = new MockIO();
@@ -278,7 +278,6 @@ public class TestProtoCommitKnobs {
     // With limit=3, the 4th commit CASes. After CAS, count=1 (just the new txn).
     ProtoCatalogFile cat = commitN(format, io, 4);
     assertThat(cat.appendCount()).isEqualTo(1);
-    assertThat(cat.isSealed()).isFalse();
   }
 
   @Test

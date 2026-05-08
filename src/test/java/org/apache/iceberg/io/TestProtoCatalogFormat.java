@@ -112,7 +112,7 @@ public class TestProtoCatalogFormat {
     );
 
     UUID txnId = UUID.randomUUID();
-    ProtoCodec.Transaction txn = new ProtoCodec.Transaction(txnId, false, actions);
+    ProtoCodec.Transaction txn = new ProtoCodec.Transaction(txnId, actions);
 
     // Encode
     byte[] bytes = ProtoCodec.encodeTransaction(txn);
@@ -121,7 +121,6 @@ public class TestProtoCatalogFormat {
     ProtoCodec.Transaction decoded = ProtoCodec.decodeTransaction(bytes);
 
     assertThat(decoded.id()).isEqualTo(txnId);
-    assertThat(decoded.isSealed()).isFalse();
     assertThat(decoded.actions()).hasSize(2);
     assertThat(decoded.actions().get(0)).isInstanceOf(ProtoCodec.CreateNamespaceAction.class);
     assertThat(decoded.actions().get(1)).isInstanceOf(ProtoCodec.CreateTableAction.class);
@@ -131,7 +130,7 @@ public class TestProtoCatalogFormat {
   public void testRenameTableActionEncodeDecode() {
     UUID txnId = UUID.randomUUID();
     ProtoCodec.Transaction txn = new ProtoCodec.Transaction(
-        txnId, false, List.of(
+        txnId, List.of(
             new ProtoCodec.RenameTableAction(7, 3, 4, 9, "renamed_tbl")));
 
     byte[] bytes = ProtoCodec.encodeTransaction(txn);
@@ -158,7 +157,7 @@ public class TestProtoCatalogFormat {
         new ProtoCodec.CreateTableAction(1, 1, 1, -1, "mytable", "s3://bucket/metadata.json")
     );
 
-    ProtoCodec.Transaction txn = new ProtoCodec.Transaction(UUID.randomUUID(), false, actions);
+    ProtoCodec.Transaction txn = new ProtoCodec.Transaction(UUID.randomUUID(), actions);
 
     // Verify should pass on empty catalog
     assertThat(txn.verify(builder)).isTrue();
@@ -209,7 +208,7 @@ public class TestProtoCatalogFormat {
     List<ProtoCodec.Action> actions = List.of(
         new ProtoCodec.CreateNamespaceAction(1, 1, 0, -1, "testns")
     );
-    ProtoCodec.Transaction txn = new ProtoCodec.Transaction(UUID.randomUUID(), false, actions);
+    ProtoCodec.Transaction txn = new ProtoCodec.Transaction(UUID.randomUUID(), actions);
     byte[] txnBytes = ProtoCodec.encodeTransaction(txn);
     writeVarint(out, txnBytes.length);
     out.write(txnBytes);
@@ -271,7 +270,7 @@ public class TestProtoCatalogFormat {
         new ProtoCodec.CreateNamespaceAction(2, 1, 1, -1, "yaks"),
         new ProtoCodec.CreateTableAction(1, 1, 2, -1, "tblY", "yak://chinchilla/tblY")
     );
-    ProtoCodec.Transaction txnA = new ProtoCodec.Transaction(UUID.randomUUID(), false, actionsA);
+    ProtoCodec.Transaction txnA = new ProtoCodec.Transaction(UUID.randomUUID(), actionsA);
     byte[] txnABytes = toTransactionRecord(txnA);
 
     // Append transaction to the file
@@ -306,13 +305,13 @@ public class TestProtoCatalogFormat {
     List<ProtoCodec.Action> actionsA = List.of(
         new ProtoCodec.UpdateTableLocationAction(1, 1, "yak://chinchilla/tblY2")
     );
-    ProtoCodec.Transaction txnA = new ProtoCodec.Transaction(UUID.randomUUID(), false, actionsA);
+    ProtoCodec.Transaction txnA = new ProtoCodec.Transaction(UUID.randomUUID(), actionsA);
 
     // txnB: create tblD in dingos - should succeed
     List<ProtoCodec.Action> actionsB = List.of(
         new ProtoCodec.CreateTableAction(2, 1, 1, 1, "tblD", "yak://chinchilla/tblD")
     );
-    ProtoCodec.Transaction txnB = new ProtoCodec.Transaction(UUID.randomUUID(), false, actionsB);
+    ProtoCodec.Transaction txnB = new ProtoCodec.Transaction(UUID.randomUUID(), actionsB);
 
     // txnC: also tries to update tblY from version 1 - should FAIL
     // because txnA already updated it to version 2
@@ -320,7 +319,7 @@ public class TestProtoCatalogFormat {
         new ProtoCodec.CreateNamespaceAction(3, 1, 0, -1, "yaks"),
         new ProtoCodec.UpdateTableLocationAction(1, 1, "yak://chinchilla/tblY3")
     );
-    ProtoCodec.Transaction txnC = new ProtoCodec.Transaction(UUID.randomUUID(), false, actionsC);
+    ProtoCodec.Transaction txnC = new ProtoCodec.Transaction(UUID.randomUUID(), actionsC);
 
     // Combine all transactions
     byte[] allTxns = appendBytes(
@@ -348,63 +347,6 @@ public class TestProtoCatalogFormat {
   }
 
   @Test
-  public void testSealedTransactionStopsProcessing() throws IOException {
-    InputFile location = new TestInputFile("test://catalog");
-
-    // Start with a catalog that has dingos.yaks namespace and tblY
-    ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(location);
-    builder.setNextNamespaceId(3);
-    builder.setNextTableId(2);
-    builder.addNamespace(1, 0, "dingos", 1);
-    builder.addNamespace(2, 1, "yaks", 1);
-    builder.addTable(1, 2, "tblY", 1, "yak://chinchilla/tblY");
-    ProtoCatalogFile orig = builder.build();
-    byte[] origBytes = toFullFileBytes(orig);
-
-    // txnA: update tblY - this transaction is SEALED
-    List<ProtoCodec.Action> actionsA = List.of(
-        new ProtoCodec.UpdateTableLocationAction(1, 1, "yak://chinchilla/tblY2")
-    );
-    // Create as sealed directly
-    ProtoCodec.Transaction txnA = new ProtoCodec.Transaction(UUID.randomUUID(), true, actionsA);
-    byte[] txnARecord = toTransactionRecord(txnA);
-
-    // txnB: create yaks namespace (valid transaction, but comes after sealed)
-    List<ProtoCodec.Action> actionsB = List.of(
-        new ProtoCodec.CreateNamespaceAction(3, 1, 0, -1, "yaks_root")
-    );
-    ProtoCodec.Transaction txnB = new ProtoCodec.Transaction(UUID.randomUUID(), false, actionsB);
-
-    // txnC: create tblD (valid transaction, but comes after sealed)
-    List<ProtoCodec.Action> actionsC = List.of(
-        new ProtoCodec.CreateTableAction(2, 1, 1, 1, "tblD", "yak://chinchilla/tblD")
-    );
-    ProtoCodec.Transaction txnC = new ProtoCodec.Transaction(UUID.randomUUID(), false, actionsC);
-
-    // Combine all transactions
-    byte[] allTxns = appendBytes(
-        origBytes,
-        txnARecord,
-        toTransactionRecord(txnB),
-        toTransactionRecord(txnC)
-    );
-
-    ProtoCatalogFile result = ProtoCatalogFormat.readInternal(
-        location, new ByteArrayInputStream(allTxns), allTxns.length);
-
-    // Verify txnA was applied and catalog is sealed
-    assertThat(result.location(tblY)).isEqualTo("yak://chinchilla/tblY2");
-    assertThat(result.containsTransaction(txnA.id())).isTrue();
-    assertThat(result.isSealed()).isTrue();
-
-    // Verify txnB and txnC were NOT applied (after sealed transaction)
-    assertThat(result.containsNamespace(Namespace.of("yaks_root"))).isFalse();
-    assertThat(result.location(tblD)).isNull();
-    assertThat(result.containsTransaction(txnB.id())).isFalse();
-    assertThat(result.containsTransaction(txnC.id())).isFalse();
-  }
-
-  @Test
   public void testDuplicateTransactionIdIgnored() throws IOException {
     InputFile location = new TestInputFile("test://catalog");
     ProtoCatalogFile orig = ProtoCatalogFile.empty(location);
@@ -414,7 +356,7 @@ public class TestProtoCatalogFormat {
     List<ProtoCodec.Action> actionsA = List.of(
         new ProtoCodec.CreateNamespaceAction(1, 1, 0, -1, "dingos")
     );
-    ProtoCodec.Transaction txnA = new ProtoCodec.Transaction(UUID.randomUUID(), false, actionsA);
+    ProtoCodec.Transaction txnA = new ProtoCodec.Transaction(UUID.randomUUID(), actionsA);
     byte[] txnARecord = toTransactionRecord(txnA);
 
     // Duplicate the same transaction (simulating retry)
@@ -451,13 +393,13 @@ public class TestProtoCatalogFormat {
     List<ProtoCodec.Action> actionsA = List.of(
         new ProtoCodec.UpdateTableLocationAction(1, 1, "yak://updated1")
     );
-    ProtoCodec.Transaction txnA = new ProtoCodec.Transaction(UUID.randomUUID(), false, actionsA);
+    ProtoCodec.Transaction txnA = new ProtoCodec.Transaction(UUID.randomUUID(), actionsA);
 
     // txnB: also tries to update from version 1 - should fail
     List<ProtoCodec.Action> actionsB = List.of(
         new ProtoCodec.UpdateTableLocationAction(1, 1, "yak://updated2")
     );
-    ProtoCodec.Transaction txnB = new ProtoCodec.Transaction(UUID.randomUUID(), false, actionsB);
+    ProtoCodec.Transaction txnB = new ProtoCodec.Transaction(UUID.randomUUID(), actionsB);
 
     byte[] combined = appendBytes(origBytes,
         toTransactionRecord(txnA),
@@ -491,14 +433,14 @@ public class TestProtoCatalogFormat {
     List<ProtoCodec.Action> actionsA = List.of(
         new ProtoCodec.UpdateTableLocationAction(1, 1, "s3://updated")
     );
-    ProtoCodec.Transaction txnA = new ProtoCodec.Transaction(UUID.randomUUID(), false, actionsA);
+    ProtoCodec.Transaction txnA = new ProtoCodec.Transaction(UUID.randomUUID(), actionsA);
 
     // txnB: read table at version 1 - should fail because txnA updated it
     List<ProtoCodec.Action> actionsB = List.of(
         new ProtoCodec.ReadTableAction(1, 1),
         new ProtoCodec.CreateNamespaceAction(2, 1, 0, -1, "newns")
     );
-    ProtoCodec.Transaction txnB = new ProtoCodec.Transaction(UUID.randomUUID(), false, actionsB);
+    ProtoCodec.Transaction txnB = new ProtoCodec.Transaction(UUID.randomUUID(), actionsB);
 
     byte[] combined = appendBytes(origBytes,
         toTransactionRecord(txnA),

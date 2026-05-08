@@ -93,7 +93,6 @@ public class FormatExplorerFixtures {
     scenarios.add(scenarioLateBindMultiAction());
     scenarios.add(scenarioCreateTableInline());
     scenarios.add(scenarioUpdateTableInlineDelta());
-    scenarios.add(scenarioSealedToggle());
     scenarios.add(scenarioPointerMultiTableConflictRetry());
     scenarios.add(scenarioInlineMultiTableConflictRetry());
 
@@ -104,9 +103,9 @@ public class FormatExplorerFixtures {
     // read path (verify + apply). Their wire bytes must round-trip through
     // ProtoCatalogFormat.readInternal with the documented outcomes.
     verifyConflictRetryReplay(
-        scenarios.get(6), /* aSucceeds */ true, /* bAtV2 */ "s3://lake/warehouse/B/v2.metadata.json",
+        scenarios.get(5), /* aSucceeds */ true, /* bAtV2 */ "s3://lake/warehouse/B/v2.metadata.json",
         "s3://lake/warehouse/A/v3.metadata.json");
-    verifyInlineConflictRetryReplay(scenarios.get(7));
+    verifyInlineConflictRetryReplay(scenarios.get(6));
 
     Files.createDirectories(OUTPUT.getParent());
     Files.writeString(OUTPUT, emitJson(schema, scenarios));
@@ -218,15 +217,27 @@ public class FormatExplorerFixtures {
         org.apache.iceberg.catalog.TableIdentifier.of(warehouse, "A"));
     Integer bId = result.tableId(
         org.apache.iceberg.catalog.TableIdentifier.of(warehouse, "B"));
-    String aMeta = new String(result.inlineMetadata(aId), StandardCharsets.UTF_8);
-    String bMeta = new String(result.inlineMetadata(bId), StandardCharsets.UTF_8);
-    // After T3, both tables should carry the "last-touched-by":"T3" property
-    // on their inline metadata -- never "T2-stale" (T2 was rejected).
-    if (!aMeta.contains("\"last-touched-by\":\"T3\"") || aMeta.contains("T2-stale")) {
-      throw new AssertionError(s.name + ": A inline metadata didn't end at T3: " + aMeta);
+    TableMetadata aMeta = TableMetadataParser.fromJson(
+        new String(result.inlineMetadata(aId), StandardCharsets.UTF_8));
+    TableMetadata bMeta = TableMetadataParser.fromJson(
+        new String(result.inlineMetadata(bId), StandardCharsets.UTF_8));
+    // After T3 commits, A holds {S1A, S3A} with main->S3A; B holds {S3B} with
+    // main->S3B. Neither carries the snapshots from the rejected T2.
+    long aT3Snap = 0x3333333333333333L;
+    long bT3Snap = 0x3333333333333334L;
+    long aT2StaleSnap = 0x2222222222222222L;
+    long bT2StaleSnap = 0x2222222222222223L;
+    if (aMeta.currentSnapshot() == null || aMeta.currentSnapshot().snapshotId() != aT3Snap) {
+      throw new AssertionError(s.name + ": A.currentSnapshot != S3A; got " + aMeta.currentSnapshot());
     }
-    if (!bMeta.contains("\"last-touched-by\":\"T3\"") || bMeta.contains("T2-stale")) {
-      throw new AssertionError(s.name + ": B inline metadata didn't end at T3: " + bMeta);
+    if (bMeta.currentSnapshot() == null || bMeta.currentSnapshot().snapshotId() != bT3Snap) {
+      throw new AssertionError(s.name + ": B.currentSnapshot != S3B; got " + bMeta.currentSnapshot());
+    }
+    if (aMeta.snapshot(aT2StaleSnap) != null) {
+      throw new AssertionError(s.name + ": A retained the rejected T2 snapshot");
+    }
+    if (bMeta.snapshot(bT2StaleSnap) != null) {
+      throw new AssertionError(s.name + ": B retained the rejected T2 snapshot");
     }
   }
 
@@ -263,7 +274,7 @@ public class FormatExplorerFixtures {
     byte[] file = encodeFile(catalog);
     UUID txnId = UUID.fromString("01900000-0000-7000-8000-000000000010");
     ProtoCodec.Transaction txn = new ProtoCodec.Transaction(
-        txnId, false,
+        txnId,
         List.of(new ProtoCodec.CreateNamespaceAction(1, 1, 0, -1, "analytics")));
     file = appendTxn(file, txn);
 
@@ -319,7 +330,7 @@ public class FormatExplorerFixtures {
     byte[] file = encodeFile(catalog);
     UUID txnId = UUID.fromString("01900000-0000-7000-8000-000000000020");
     ProtoCodec.Transaction txn = new ProtoCodec.Transaction(
-        txnId, false,
+        txnId,
         List.of(
             new ProtoCodec.CreateNamespaceAction(1, 1, 0, -1, "staging"),
             new ProtoCodec.CreateTableAction(
@@ -363,7 +374,7 @@ public class FormatExplorerFixtures {
 
     UUID txnId = UUID.fromString("01900000-0000-7000-8000-000000000030");
     ProtoCodec.Transaction txn = new ProtoCodec.Transaction(
-        txnId, false,
+        txnId,
         List.of(new ProtoCodec.CreateTableInlineAction(
             1, 1, 1, 1, "orders", metadataJson)));
     file = appendTxn(file, txn);
@@ -441,7 +452,7 @@ public class FormatExplorerFixtures {
 
     UUID txnId = UUID.fromString("01900000-0000-7000-8000-000000000040");
     ProtoCodec.Transaction txn = new ProtoCodec.Transaction(
-        txnId, false,
+        txnId,
         List.of(ProtoCodec.UpdateTableInlineAction.delta(1, 1, deltaBytes)));
     file = appendTxn(file, txn);
 
@@ -455,43 +466,6 @@ public class FormatExplorerFixtures {
             + "(timestamp_delta_ms), and the deepest message nesting in the "
             + "format.",
         file, List.of());
-  }
-
-  /**
-   * Same byte content as the late-bind scenario but with {@code sealed=true}
-   * on the appended transaction. The detail panel highlights the single
-   * byte position and offers an interactive toggle.
-   */
-  private Scenario scenarioSealedToggle() {
-    ProtoCatalogFile catalog = ProtoCatalogFile.builder(LOCATION)
-        .setCatalogUuid(FIXED_CATALOG_UUID)
-        .setNextNamespaceId(1)
-        .setNextTableId(1)
-        .build();
-    byte[] file = encodeFile(catalog);
-    UUID txnId = UUID.fromString("01900000-0000-7000-8000-000000000050");
-    ProtoCodec.Transaction txn = new ProtoCodec.Transaction(
-        txnId, true,
-        List.of(
-            new ProtoCodec.CreateNamespaceAction(1, 1, 0, -1, "staging"),
-            new ProtoCodec.CreateTableAction(
-                1, 1, 1, -1, "raw_events", "s3://lake/staging/raw_events/v1.metadata.json")));
-    file = appendTxn(file, txn);
-
-    List<Note> notes = List.of(
-        new Note(-1, -1, "QUIRK: Transaction.sealed (proto field 2, bool) is "
-            + "always written even when its proto3 default-value (false) "
-            + "would otherwise omit it. This guarantees the byte stays at a "
-            + "predictable offset so ProtoCodec.sealTransaction() / "
-            + "unsealTransaction() can flip it in place without re-encoding "
-            + "the whole transaction."));
-    return new Scenario(
-        "sealed-toggle",
-        "Same actions as the late-bind scenario, but with sealed=true on "
-            + "the transaction. Find the single byte that distinguishes a "
-            + "sealed transaction from an unsealed one. The toggle button "
-            + "demonstrates the in-place mutation that compaction relies on.",
-        file, notes);
   }
 
   /**
@@ -524,18 +498,18 @@ public class FormatExplorerFixtures {
     UUID t3Id = UUID.fromString("01900000-0000-7000-8000-000000000073");
 
     ProtoCodec.Transaction t1 = new ProtoCodec.Transaction(
-        t1Id, false,
+        t1Id,
         List.of(new ProtoCodec.UpdateTableLocationAction(
             1, 1, "s3://lake/warehouse/A/v2.metadata.json")));
     ProtoCodec.Transaction t2 = new ProtoCodec.Transaction(
-        t2Id, false,
+        t2Id,
         List.of(
             new ProtoCodec.UpdateTableLocationAction(
                 1, 1, "s3://lake/warehouse/A/v3.metadata.json"),  // STALE: captured v=1
             new ProtoCodec.UpdateTableLocationAction(
                 2, 1, "s3://lake/warehouse/B/v2.metadata.json")));
     ProtoCodec.Transaction t3 = new ProtoCodec.Transaction(
-        t3Id, false,
+        t3Id,
         List.of(
             new ProtoCodec.UpdateTableLocationAction(
                 1, 2, "s3://lake/warehouse/A/v3.metadata.json"),  // RETRY: captured v=2
@@ -567,17 +541,17 @@ public class FormatExplorerFixtures {
   }
 
   /**
-   * Same A/B two-table scenario but for inline tables. T1, T2, T3 use
-   * {@code UpdateTableInline} in FULL mode (replace the inline metadata
-   * bytes wholesale). Conflict detection is identical: T2 captures A.v=1,
-   * fails verify after T1, T3 retries with A.v=2.
+   * Same A/B two-table scenario but for inline tables. Each
+   * {@code UpdateTableInline} carries a real-shape data-commit delta:
+   * an {@code AddSnapshot} plus a {@code SetSnapshotRef} pointing the
+   * {@code main} branch at the new snapshot. Conflict detection is
+   * identical to the pointer variant: T2 captures A.v=1, fails verify
+   * after T1, T3 retries with A.v=2.
    */
   private Scenario scenarioInlineMultiTableConflictRetry() {
-    // Each table starts at a distinct UUID; subsequent versions are
-    // evolveTableMetadata() chains, so what differs between versions is a
-    // single "last-touched-by" property -- realistic for this kind of
-    // metadata commit, and demonstrates how a small logical change still
-    // re-serializes the entire TableMetadata document on the wire.
+    // Seed each table at a distinct UUID; deltas only carry the
+    // AddSnapshot/SetSnapshotRef pair, mirroring the production
+    // (checkpoint + delta) replay model.
     byte[] aV1 = realTableMetadata(
         "019000a1-0000-7000-8000-000000000001",
         "s3://lake/warehouse/A",
@@ -588,15 +562,24 @@ public class FormatExplorerFixtures {
         "s3://lake/warehouse/B",
         Map.of("table-name", "B"),
         PINNED_TS);
-    byte[] aV2 = evolveTableMetadata(aV1, "T1", PINNED_TS_AFTER_T1);
-    // T2 (the loser) targets A as a fresh evolution off aV1, NOT off aV2,
-    // because that's exactly the writer's stale view of the world: it never
-    // saw T1's commit.
-    byte[] aV3Stale = evolveTableMetadata(aV1, "T2-stale", PINNED_TS_AFTER_T2);
-    byte[] bV2Stale = evolveTableMetadata(bV1, "T2-stale", PINNED_TS_AFTER_T2);
-    // T3 (the retry) is built off the now-current aV2.
-    byte[] aV3 = evolveTableMetadata(aV2, "T3", PINNED_TS_AFTER_T3);
-    byte[] bV2 = evolveTableMetadata(bV1, "T3", PINNED_TS_AFTER_T3);
+
+    long aT1Snap = 0x1111111111111111L;
+    long aT2StaleSnap = 0x2222222222222222L;
+    long bT2StaleSnap = 0x2222222222222223L;
+    long aT3Snap = 0x3333333333333333L;
+    long bT3Snap = 0x3333333333333334L;
+
+    byte[] aT1Delta = encodeAppendSnapshotDelta(
+        aT1Snap, "T1.avro", PINNED_TS, PINNED_TS_AFTER_T1, /* parentSnapshotId */ null);
+    byte[] aT2StaleDelta = encodeAppendSnapshotDelta(
+        aT2StaleSnap, "T2-stale.avro", PINNED_TS, PINNED_TS_AFTER_T2, null);
+    byte[] bT2StaleDelta = encodeAppendSnapshotDelta(
+        bT2StaleSnap, "T2-stale.avro", PINNED_TS, PINNED_TS_AFTER_T2, null);
+    byte[] aT3Delta = encodeAppendSnapshotDelta(
+        aT3Snap, "T3.avro", PINNED_TS_AFTER_T1, PINNED_TS_AFTER_T3,
+        /* parentSnapshotId */ aT1Snap);
+    byte[] bT3Delta = encodeAppendSnapshotDelta(
+        bT3Snap, "T3.avro", PINNED_TS, PINNED_TS_AFTER_T3, null);
 
     ProtoCatalogFile catalog = ProtoCatalogFile.builder(LOCATION)
         .setCatalogUuid(FIXED_CATALOG_UUID)
@@ -614,18 +597,18 @@ public class FormatExplorerFixtures {
     UUID t3Id = UUID.fromString("01900000-0000-7000-8000-000000000083");
 
     ProtoCodec.Transaction t1 = new ProtoCodec.Transaction(
-        t1Id, false,
-        List.of(new ProtoCodec.UpdateTableInlineAction(1, 1, aV2, null)));
+        t1Id,
+        List.of(ProtoCodec.UpdateTableInlineAction.delta(1, 1, aT1Delta)));
     ProtoCodec.Transaction t2 = new ProtoCodec.Transaction(
-        t2Id, false,
+        t2Id,
         List.of(
-            new ProtoCodec.UpdateTableInlineAction(1, 1, aV3Stale, null),  // STALE
-            new ProtoCodec.UpdateTableInlineAction(2, 1, bV2Stale, null)));
+            ProtoCodec.UpdateTableInlineAction.delta(1, 1, aT2StaleDelta),  // STALE
+            ProtoCodec.UpdateTableInlineAction.delta(2, 1, bT2StaleDelta)));
     ProtoCodec.Transaction t3 = new ProtoCodec.Transaction(
-        t3Id, false,
+        t3Id,
         List.of(
-            new ProtoCodec.UpdateTableInlineAction(1, 2, aV3, null),  // RETRY
-            new ProtoCodec.UpdateTableInlineAction(2, 1, bV2, null)));
+            ProtoCodec.UpdateTableInlineAction.delta(1, 2, aT3Delta),  // RETRY
+            ProtoCodec.UpdateTableInlineAction.delta(2, 1, bT3Delta)));
 
     int[] r1 = new int[2];
     int[] r2 = new int[2];
@@ -635,21 +618,54 @@ public class FormatExplorerFixtures {
     file = appendTxnTrack(file, t3, r3);
 
     List<Note> notes = List.of(
-        new Note(r1[0], r1[1], "T1: UpdateTableInline(A, v=1, full) — APPLIES. A advances to v=2 with new metadata bytes."),
+        new Note(r1[0], r1[1], "T1: UpdateTableInline(A, v=1, delta) — APPLIES. "
+            + "Delta carries an AddSnapshot + SetSnapshotRef('main', S1A). A advances to v=2."),
         new Note(r2[0], r2[1], "T2: UpdateTableInline(A, v=1) + UpdateTableInline(B, v=1) — REJECTED. "
-            + "Same multi-table all-or-nothing behavior as the pointer scenario: A's captured v=1 no "
-            + "longer matches current v=2, so verify() fails and B is also untouched. The entire "
-            + "transaction record (including B's full metadata bytes) is wasted log space — exactly "
-            + "the situation the seal+CAS compaction path eventually reclaims."),
+            + "Multi-table all-or-nothing: A's captured v=1 no longer matches current v=2 after T1, "
+            + "so the entire transaction fails verify(). B's delta (a perfectly valid AddSnapshot) "
+            + "never lands. The record stays in the log until the next CAS-mode commit reclaims the space."),
         new Note(r3[0], r3[1], "T3: UpdateTableInline(A, v=2) + UpdateTableInline(B, v=1) — APPLIES. "
-            + "Both tables get their new inline metadata atomically."));
+            + "Each table's AddSnapshot delta lands atomically; A's main now points at S3A "
+            + "(parent=S1A), B's at S3B."));
     return new Scenario(
         "inline-multi-table-conflict-retry",
-        "Same conflict-retry story as the pointer scenario, but with inline-mode tables. The wire "
-            + "format is structurally identical except UpdateTableInline (Action field 9) replaces "
-            + "UpdateTableLocation (Action field 7) and the new metadata travels as a length-delimited "
-            + "bytes field inside each action, instead of a string URL.",
+        "Inline-mode counterpart of pointer-multi-table-conflict-retry. Each transaction is a "
+            + "real-shape data commit: a TableMetadataDelta with an AddSnapshot + SetSnapshotRef "
+            + "pinning the new snapshot to main. The structural shape is identical to the pointer "
+            + "scenario except UpdateTableInline (Action field 9) replaces UpdateTableLocation "
+            + "(Action field 7), and the payload is a length-delimited delta message instead of a "
+            + "metadata-location string. Compare T2's wasted bytes between the two scenarios: in "
+            + "pointer mode T2 references already-written metadata.json files; in inline mode T2's "
+            + "delta is the only place its rejected snapshots appeared on the wire.",
         file, notes);
+  }
+
+  /**
+   * Builds a {@code TableMetadataDelta} bytes payload representing a typical
+   * data commit on an inline table: an {@code AddSnapshot} plus a
+   * {@code SetSnapshotRef} pointing the {@code main} branch at the new
+   * snapshot. The {@code manifest_list_suffix} is appended to the table's
+   * stored {@code manifest_list_prefix} on replay; passing a real path
+   * suffix (e.g., {@code "T1.avro"}) produces a regular external
+   * manifest-list location, not an inline-ML sentinel.
+   */
+  private static byte[] encodeAppendSnapshotDelta(
+      long snapshotId, String manifestListSuffix,
+      long baseLastUpdatedMs, long deltaLastUpdatedMs, Long parentSnapshotId) {
+    Map<String, String> summary = new LinkedHashMap<>();
+    summary.put("operation", "append");
+    summary.put("added-data-files", "1");
+    summary.put("added-records", "1024");
+    long timestampDeltaMs = deltaLastUpdatedMs - baseLastUpdatedMs;
+    InlineDeltaCodec.AddSnapshotUpdate addSnap =
+        new InlineDeltaCodec.AddSnapshotUpdate(
+            snapshotId, manifestListSuffix, summary,
+            timestampDeltaMs, /* schemaId */ 0, /* addedRows */ 1024L,
+            parentSnapshotId, /* firstRowId */ null, /* keyId */ null);
+    InlineDeltaCodec.SetSnapshotRefUpdate setRef =
+        new InlineDeltaCodec.SetSnapshotRefUpdate(
+            "main", snapshotId, "branch", 0, 0L, 0L);
+    return InlineDeltaCodec.encodeDelta(List.of(addSnap, setRef), deltaLastUpdatedMs);
   }
 
   // ============================================================
@@ -705,25 +721,6 @@ public class FormatExplorerFixtures {
         .discardChanges()
         .build();
     return TableMetadataParser.toJson(meta).getBytes(StandardCharsets.UTF_8);
-  }
-
-  /**
-   * Builds the next realistic TableMetadata: same schema/spec/UUID as
-   * {@code base}, with one extra property added to record which writer
-   * committed it. Use this for the post-T1 / post-T3 commits.
-   */
-  private static byte[] evolveTableMetadata(
-      byte[] baseJson, String label, long timestamp) {
-    TableMetadata base = TableMetadataParser.fromJson(
-        new String(baseJson, StandardCharsets.UTF_8));
-    Map<String, String> updated = new LinkedHashMap<>(base.properties());
-    updated.put("last-touched-by", label);
-    TableMetadata next = TableMetadata.buildFrom(base)
-        .setProperties(updated)
-        .setLastUpdatedMillis(timestamp)
-        .discardChanges()
-        .build();
-    return TableMetadataParser.toJson(next).getBytes(StandardCharsets.UTF_8);
   }
 
   // ============================================================
