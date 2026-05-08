@@ -408,8 +408,7 @@
       "CommittedTransactions": {
         "fields": [
           {"number": 1, "name": "max_timestamp_ms", "type": "fixed64", "repeated": false, "oneof": null, "comment": "Largest (most recent) timestamp in ms. Implicit when the set is empty."},
-          {"number": 2, "name": "timestamp_deltas", "type": "uint64", "repeated": true, "oneof": null, "comment": "Per entry, descending timestamp order: gap from previous entry. The first delta is 0 (max_timestamp_ms - max_timestamp_ms). Same logical length as random_packed / 10."},
-          {"number": 3, "name": "random_packed", "type": "bytes", "repeated": false, "oneof": null, "comment": "10 bytes per entry, in the same order as timestamp_deltas. Each chunk: 12 bits rand_a + 62 bits rand_b + 6 bits zero pad. Decoder invariant: random_packed.length == 10 * len(timestamp_deltas)."}
+          {"number": 2, "name": "packed_entries", "type": "bytes", "repeated": false, "oneof": null, "comment": "Per entry, in descending timestamp order, back-to-back: varint delta_ms  -- gap from previous entry (first delta is 0) 10 bytes         -- 12 bits rand_a + 62 bits rand_b + 6 bits zero pad The number of entries is recovered by walking the buffer."}
         ]
       },
       "Namespace": {
@@ -726,8 +725,8 @@
     },
     {
       "name": "namespaces-and-pointer-tables",
-      "description": "A compacted (CAS-only) catalog with two namespaces, one nested under the other, a pointer-mode table referenced by S3 URL, one namespace property, and five committed transactions in the dedup set. Demonstrates repeated message fields, parent_id chaining, and the CommittedTransactions sub-message (field 20): UUIDv7s sorted descending, with the 48-bit timestamp half delta-coded as varints and the 74 random bits packed into 10 bytes per entry (version+variant bits implicit). Click the random_packed bytes node to see the reconstructed UUIDs.",
-      "hex": "4c43415400000001e1010a1001900000000070008000000000000001100318025211080110021800220977617265686f757365520e080210011801220662726f6e7a655a4208011003180222066576656e74732a3273333a2f2f6c616b652f77617265686f7573652f62726f6e7a652f6576656e74732f76332e6d657461646174612e6a736f6e6218080112056f776e65721a0d646174612d706c6174666f726da20147090719eca890010000100010031002100110011a320000000000000000c1400000000000000000c1000000000000000000c0c00000000000000000c0800000000000000000c040",
+      "description": "A compacted (CAS-only) catalog with two namespaces, one nested under the other, a pointer-mode table referenced by S3 URL, one namespace property, and five committed transactions in the dedup set. Demonstrates repeated message fields, parent_id chaining, and the CommittedTransactions sub-message (field 20): UUIDv7s sorted descending, with each entry interleaving a varint timestamp delta (gap from the previous entry) and 10 packed random bytes (rand_a + rand_b, version+variant bits implicit) into a single packed_entries blob. The catalog scans this blob in one linear pass with no per-call heap allocation. Click the packed_entries node to see the reconstructed UUIDs.",
+      "hex": "4c43415400000001dc010a1001900000000070008000000000000001100318025211080110021800220977617265686f757365520e080210011801220662726f6e7a655a4208011003180222066576656e74732a3273333a2f2f6c616b652f77617265686f7573652f62726f6e7a652f6576656e74732f76332e6d657461646174612e6a736f6e6218080112056f776e65721a0d646174612d706c6174666f726da20142090719eca8900100001237000000000000000000c140030000000000000000c100020000000000000000c0c0010000000000000000c080010000000000000000c040",
       "notes": [
       ]
     },
@@ -1204,9 +1203,9 @@
      */
     function decorateCommittedTransactions(node, bytes, start, end) {
       var off = start;
-      var maxTs = 0;
-      var deltas = [];
-      var randomPacked = null;
+      var maxTs = 0n;
+      var packedStart = -1;
+      var packedEnd = -1;
       while (off < end) {
         var tagInfo = readVarint(bytes, off);
         off = tagInfo.end;
@@ -1218,33 +1217,37 @@
           var hi = bytes[off+4] | (bytes[off+5] << 8) | (bytes[off+6] << 16) | (bytes[off+7] << 24);
           maxTs = (BigInt(hi >>> 0) << 32n) | BigInt(lo >>> 0);
           off += 8;
-        } else if (fieldNumber === 2 && wireType === 0) {
-          // varint timestamp delta
-          var v = readVarint(bytes, off);
-          deltas.push(v.value);
-          off = v.end;
-        } else if (fieldNumber === 3 && wireType === 2) {
-          // bytes random_packed
+        } else if (fieldNumber === 2 && wireType === 2) {
+          // bytes packed_entries: interleaved (varint delta + 10 random bytes) per entry
           var len = readVarint(bytes, off);
           off = len.end;
-          randomPacked = bytes.slice(off, off + Number(len.value));
-          off += Number(len.value);
+          packedStart = off;
+          packedEnd = off + Number(len.value);
+          off = packedEnd;
         } else {
           // Unknown field — skip best-effort.
           break;
         }
       }
-      if (!randomPacked || randomPacked.length !== 10 * deltas.length) {
-        node.decodedValue = '<malformed CommittedTransactions: '
-          + (randomPacked ? randomPacked.length : 0) + ' random bytes vs '
-          + deltas.length + ' deltas>';
+      if (packedStart < 0) {
+        node.decodedValue = '<malformed CommittedTransactions: missing packed_entries>';
         return;
       }
       var uuids = [];
       var ts = maxTs;
-      for (var i = 0; i < deltas.length; i++) {
-        ts -= deltas[i];
-        uuids.push(reconstructV7Uuid(ts, randomPacked, i * 10));
+      var p = packedStart;
+      while (p < packedEnd) {
+        var dv = readVarint(bytes, p);
+        var delta = dv.value;
+        p = dv.end;
+        ts -= delta;
+        if (p + 10 > packedEnd) {
+          node.decodedValue = '<malformed CommittedTransactions: truncated entry at offset '
+            + p + '>';
+          return;
+        }
+        uuids.push(reconstructV7Uuid(ts, bytes, p));
+        p += 10;
       }
       node.decodedValue = uuids.length + ' UUIDv7 entries (descending by timestamp)';
       node.uuids = uuids;

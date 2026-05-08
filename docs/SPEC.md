@@ -90,9 +90,11 @@ message Checkpoint {
 }
 
 message CommittedTransactions {
-  fixed64 max_timestamp_ms          = 1;  // largest timestamp in the set
-  repeated uint64 timestamp_deltas  = 2;  // descending; gap from previous entry
-  bytes random_packed               = 3;  // 10 bytes/entry: rand_a + rand_b + 6-bit pad
+  fixed64 max_timestamp_ms = 1;   // largest timestamp in the set
+  // Per entry, descending order, back-to-back inside one packed bytes
+  // field: varint delta_ms (gap from previous) || 10 random bytes
+  // (rand_a + rand_b + 6-bit pad).
+  bytes   packed_entries   = 2;
 }
 ```
 
@@ -102,14 +104,22 @@ A table ID appears in either `tables` (pointer mode) or `inline_tables`
 The `committed_transactions` sub-message exploits the structure of UUIDv7
 to compress the dedup set. Entries are sorted descending by UUID (= by
 timestamp), the largest timestamp is stored once as `max_timestamp_ms`,
-and each entry contributes a varint gap-from-previous plus 10 bytes of
-random material (the 12-bit `rand_a` plus 62-bit `rand_b`, with the
-fixed 4-bit version and 2-bit variant nibbles dropped on encode and
-reconstructed on decode). For typical clustered commit traffic this
-saves ~30% per entry vs the older `repeated bytes` form. All entries
-must be UUIDv7; non-v7 IDs are rejected at the dedup-set entry point
-(`ProtoCatalogFile.Builder.addCommittedTransaction`) and skipped at
-read-time replay (`Transaction.verify` returns false). See
+and each entry's varint gap-from-previous and 10 bytes of random
+material (the 12-bit `rand_a` plus 62-bit `rand_b`, with the fixed
+4-bit version and 2-bit variant nibbles dropped on encode and
+reconstructed on decode) are interleaved back-to-back inside a single
+`packed_entries` bytes blob. For typical clustered commit traffic this
+saves ~30% per entry vs the older `repeated bytes` form.
+
+The interleaved layout lets `ProtoCatalogFile.containsTransaction` walk
+the wire bytes in a single linear pass with no per-call heap
+allocation: the catalog file holds the inner-message bytes directly
+(no materialized `HashSet<UUID>`), and re-encoding to a fresh checkpoint
+is a byte copy when no commits have been added since decode.
+
+All entries must be UUIDv7; non-v7 IDs are rejected at the dedup-set
+entry point (`ProtoCatalogFile.Builder.addCommittedTransaction`) and
+skipped at read-time replay (`Transaction.verify` returns false). See
 [UUID_V7_BENCH_RESULTS.md](UUID_V7_BENCH_RESULTS.md) for the encoding
 study that informed this choice.
 

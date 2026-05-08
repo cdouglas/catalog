@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.io;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -70,8 +71,11 @@ public class ProtoCatalogFile extends CatalogFile {
   // tblId -> (snapshotId -> list of manifest paths in the pool)
   private final Map<Integer, Map<Long, List<String>>> snapshotManifests;
 
-  // Committed transactions for deduplication
-  private final Set<UUID> committedTransactions;
+  // Committed transactions for deduplication. Stored as the raw inner
+  // CommittedTransactions wire bytes (compressed UUIDv7 set). Queries scan
+  // the bytes directly via ProtoCodec.committedSetContains; the canonical
+  // Set<UUID> is materialized only on demand.
+  private final byte[] committedTransactionsBytes;
 
   // Number of transaction records in the log portion of the catalog file.
   // Computed during readInternal; used by commit() to enforce max-append-count.
@@ -90,7 +94,7 @@ public class ProtoCatalogFile extends CatalogFile {
     this.tblManifestPrefix = ImmutableMap.copyOf(builder.tblManifestPrefix);
     this.manifestPool = deepCopyManifestPool(builder.manifestPool);
     this.snapshotManifests = deepCopySnapshotManifests(builder.snapshotManifests);
-    this.committedTransactions = ImmutableSet.copyOf(builder.committedTransactions);
+    this.committedTransactionsBytes = builder.materializeCommittedBytes();
     this.appendCount = builder.appendCount;
   }
 
@@ -240,11 +244,30 @@ public class ProtoCatalogFile extends CatalogFile {
   }
 
   public boolean containsTransaction(UUID txnId) {
-    return committedTransactions.contains(txnId);
+    return ProtoCodec.committedSetContains(committedTransactionsBytes, txnId);
   }
 
+  /** Raw inner-message bytes of the committed-txn set. Empty array iff the set is empty. */
+  public byte[] committedTransactionsBytes() {
+    return committedTransactionsBytes;
+  }
+
+  /**
+   * Materializes the committed-txn set on demand. Allocates a fresh
+   * {@code Set<UUID>} each call by decoding the compressed bytes; intended
+   * for tests and tooling, not query-hot paths. Use {@link #containsTransaction}
+   * for membership checks.
+   */
   public Set<UUID> committedTransactions() {
-    return committedTransactions;
+    if (committedTransactionsBytes.length == 0) {
+      return ImmutableSet.of();
+    }
+    try {
+      return ImmutableSet.copyOf(
+          ProtoCodec.decodeCommittedTransactions(committedTransactionsBytes));
+    } catch (IOException e) {
+      throw new java.io.UncheckedIOException(e);
+    }
   }
 
   public Integer namespaceId(Namespace ns) {
@@ -414,7 +437,13 @@ public class ProtoCatalogFile extends CatalogFile {
     private final Map<Integer, String> tblManifestPrefix = new HashMap<>();
     private final Map<Integer, Map<String, ManifestFile>> manifestPool = new HashMap<>();
     private final Map<Integer, Map<Long, List<String>>> snapshotManifests = new HashMap<>();
-    private final Set<UUID> committedTransactions = new HashSet<>();
+    // Committed-txn dedup state. originalCommittedBytes is the inner
+    // CommittedTransactions message body inherited from a decoded checkpoint
+    // (empty if built from scratch). addedCommittedTransactions accumulates
+    // UUIDs added via addCommittedTransaction during the lifetime of this
+    // builder. build() merges them.
+    private byte[] originalCommittedBytes = new byte[0];
+    private final Set<UUID> addedCommittedTransactions = new HashSet<>();
     private int appendCount = 0;
 
     Builder(InputFile location) {
@@ -693,12 +722,46 @@ public class ProtoCatalogFile extends CatalogFile {
     public Builder addCommittedTransaction(UUID txnId) {
       Preconditions.checkArgument(UuidV7.isV7(txnId),
           "Committed transaction IDs must be UUIDv7; got %s", txnId);
-      committedTransactions.add(txnId);
+      addedCommittedTransactions.add(txnId);
+      return this;
+    }
+
+    /**
+     * Bulk-load entrypoint: install the inner CommittedTransactions message
+     * body inherited from a decoded checkpoint, without materializing the
+     * canonical Set. Subsequent {@link #addCommittedTransaction} calls layer
+     * additions on top; build-time merge happens in {@link #materializeCommittedBytes}.
+     */
+    public Builder setCommittedTransactionsBytes(byte[] bytes) {
+      this.originalCommittedBytes = bytes != null ? bytes : new byte[0];
       return this;
     }
 
     public boolean containsTransaction(UUID txnId) {
-      return committedTransactions.contains(txnId);
+      if (addedCommittedTransactions.contains(txnId)) {
+        return true;
+      }
+      return ProtoCodec.committedSetContains(originalCommittedBytes, txnId);
+    }
+
+    /**
+     * Produces the final inner CommittedTransactions wire bytes for the
+     * resulting ProtoCatalogFile. Pass-through when no additions; merge
+     * (decode original + add new + re-encode) otherwise.
+     */
+    byte[] materializeCommittedBytes() {
+      if (addedCommittedTransactions.isEmpty()) {
+        return originalCommittedBytes;
+      }
+      try {
+        java.util.LinkedHashSet<UUID> merged = originalCommittedBytes.length == 0
+            ? new java.util.LinkedHashSet<>()
+            : ProtoCodec.decodeCommittedTransactions(originalCommittedBytes);
+        merged.addAll(addedCommittedTransactions);
+        return ProtoCodec.encodeCommittedTransactions(merged);
+      } catch (IOException e) {
+        throw new java.io.UncheckedIOException(e);
+      }
     }
 
     public Builder setAppendCount(int count) {

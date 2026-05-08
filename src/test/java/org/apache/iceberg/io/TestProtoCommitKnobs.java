@@ -28,6 +28,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
@@ -278,6 +279,79 @@ public class TestProtoCommitKnobs {
     // With limit=3, the 4th commit CASes. After CAS, count=1 (just the new txn).
     ProtoCatalogFile cat = commitN(format, io, 4);
     assertThat(cat.appendCount()).isEqualTo(1);
+  }
+
+  /**
+   * The committed-txn dedup set's load-bearing use case: a writer that
+   * committed transaction X reads a later checkpoint and confirms via
+   * {@code containsTransaction(X)} that its commit landed (i.e., made it
+   * across a CAS-mode rewrite by another writer). Negative case for an
+   * uncommitted UUID confirms the scan returns false rather than spuriously
+   * matching.
+   *
+   * <p>Exercises the full pipeline: the test writer commits → the new
+   * checkpoint persists the txn UUID inside the {@code CommittedTransactions}
+   * sub-message → a fresh {@link ProtoCatalogFile} parses that sub-message
+   * lazily and {@link ProtoCatalogFile#containsTransaction} scans the wire
+   * bytes directly without HashSet materialization.
+   */
+  @Test
+  void writerLearnsCommitOutcomeAfterCompaction() {
+    // CAS-only mode: every commit is a full file rewrite. Equivalent to
+    // "compaction happens on every commit" — strongest version of the
+    // after-compaction question.
+    ProtoCatalogFormat format = new ProtoCatalogFormat(0, Long.MAX_VALUE);
+    MockIO io = new MockIO();
+
+    // Initial commit creates the catalog and adds a namespace. The Transaction
+    // mints a v7 UUID inside Mut.commit; we recover it by inspecting the
+    // returned ProtoCatalogFile's committed-set (size == 1 here).
+    InputFile catalogFile = io.trackedInput();
+    ProtoCatalogFormat.Mut mut = (ProtoCatalogFormat.Mut) format.empty(catalogFile);
+    mut.createNamespace(Namespace.of("warehouse"));
+    ProtoCatalogFile afterCommit = (ProtoCatalogFile) mut.commit(io.fileIO);
+
+    assertThat(afterCommit.committedTransactions())
+        .as("CAS-mode commit must record exactly the one new txn UUID")
+        .hasSize(1);
+    UUID txnId = afterCommit.committedTransactions().iterator().next();
+    assertThat(UuidV7.isV7(txnId)).isTrue();
+    // Sanity check: the in-memory ProtoCatalogFile post-commit should also
+    // confirm via the scan-on-bytes path.
+    assertThat(afterCommit.containsTransaction(txnId)).isTrue();
+
+    // Fresh read: simulate a different writer (or the same writer at a later
+    // time) loading the catalog file and querying for the original txn.
+    ProtoCatalogFile fresh = format.read(io.fileIO, io.trackedInput());
+
+    // Confirms the commit landed in the post-CAS checkpoint and is still
+    // visible via the lazy scan.
+    assertThat(fresh.containsTransaction(txnId))
+        .as("a committed txn UUID must be findable in the post-compaction checkpoint")
+        .isTrue();
+
+    // Negative: an unrelated v7 UUID was never committed; scan must return false.
+    UUID never = UuidV7.newUuidV7();
+    assertThat(fresh.containsTransaction(never))
+        .as("an uncommitted UUID must not match")
+        .isFalse();
+
+    // After two more commits (each a CAS rewrite — i.e., two more compactions),
+    // the original txn must STILL be findable: the dedup set is monotonic
+    // across compactions.
+    ProtoCatalogFormat.Mut mut2 = (ProtoCatalogFormat.Mut) format.from(fresh);
+    mut2.createNamespace(Namespace.of("bronze"));
+    ProtoCatalogFile afterSecond = (ProtoCatalogFile) mut2.commit(io.fileIO);
+
+    ProtoCatalogFormat.Mut mut3 = (ProtoCatalogFormat.Mut) format.from(afterSecond);
+    mut3.createNamespace(Namespace.of("silver"));
+    mut3.commit(io.fileIO);
+
+    ProtoCatalogFile afterMore = format.read(io.fileIO, io.trackedInput());
+    assertThat(afterMore.containsTransaction(txnId))
+        .as("the original txn must survive subsequent compactions")
+        .isTrue();
+    assertThat(afterMore.committedTransactions()).hasSize(3);
   }
 
   @Test

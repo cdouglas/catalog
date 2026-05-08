@@ -69,10 +69,12 @@ public class ProtoCodec {
   private static final int CHECKPOINT_INLINE_TABLES = 13;
   private static final int CHECKPOINT_COMMITTED_TXNS = 20;
 
-  // CommittedTransactions field numbers (compressed UUIDv7 set)
+  // CommittedTransactions field numbers (compressed UUIDv7 set).
+  // Entries are interleaved (varint delta + 10 random bytes per entry,
+  // back-to-back) into a single packed_entries blob so the scanner can walk
+  // the wire bytes in one linear pass without allocating intermediates.
   private static final int COMMITTED_TXNS_MAX_TIMESTAMP_MS = 1;
-  private static final int COMMITTED_TXNS_TIMESTAMP_DELTAS = 2;
-  private static final int COMMITTED_TXNS_RANDOM_PACKED = 3;
+  private static final int COMMITTED_TXNS_PACKED_ENTRIES = 2;
 
   // Namespace field numbers
   private static final int NS_ID = 1;
@@ -272,13 +274,16 @@ public class ProtoCodec {
       }
 
       // Committed transactions (compressed UUIDv7 set, see CommittedTransactions
-      // proto). Empty set is omitted for wire-byte parity with the prior encoding.
+      // proto). The catalog file stores the inner-message bytes directly, so
+      // re-encoding from a freshly-read ProtoCatalogFile is a byte copy with
+      // no decompress/recompress cycle. Empty set is omitted for wire-byte
+      // parity with the prior encoding.
       // TODO: the dedup set is unbounded — a retention policy is the right fix
       // for long-lived catalogs; this compression ~30% per entry but doesn't
       // change the linear-growth shape.
-      if (!original.committedTransactions().isEmpty()) {
-        byte[] inner = encodeCommittedTransactions(original.committedTransactions());
-        writeLengthDelimited(out, CHECKPOINT_COMMITTED_TXNS, inner);
+      byte[] committedBytes = original.committedTransactionsBytes();
+      if (committedBytes.length > 0) {
+        writeLengthDelimited(out, CHECKPOINT_COMMITTED_TXNS, committedBytes);
       }
 
       return out.toByteArray();
@@ -321,7 +326,7 @@ public class ProtoCodec {
             decodeInlineTable(readLengthDelimitedBytes(in), builder);
             break;
           case CHECKPOINT_COMMITTED_TXNS:
-            decodeCommittedTransactions(readLengthDelimitedBytes(in), builder);
+            builder.setCommittedTransactionsBytes(readLengthDelimitedBytes(in));
             break;
           default:
             skipField(in, wireType);
@@ -335,11 +340,10 @@ public class ProtoCodec {
   }
 
   /**
-   * Encodes the committed-transaction UUIDv7 set as a {@code CommittedTransactions}
-   * sub-message body. Sorts entries descending by UUID (= descending by timestamp
-   * for v7), emits the largest timestamp as {@code max_timestamp_ms}, then for
-   * each entry emits the gap from the previous timestamp (varint) and 10 bytes
-   * of random material (rand_a + rand_b, version/variant bits dropped).
+   * Encodes a UUIDv7 set as a {@code CommittedTransactions} sub-message body.
+   * Sorts entries descending by UUID (= descending by timestamp for v7),
+   * emits {@code max_timestamp_ms}, then a single packed bytes field whose
+   * payload is the interleaved (varint delta + 10 random bytes) per entry.
    *
    * <p>Caller is responsible for omitting the outer field when the set is empty.
    */
@@ -350,29 +354,112 @@ public class ProtoCodec {
     ByteArrayOutputStream out = new ByteArrayOutputStream();
     long maxTs = sorted.length == 0 ? 0L : UuidV7.timestampMs(sorted[0]);
     writeFixed64(out, COMMITTED_TXNS_MAX_TIMESTAMP_MS, maxTs);
-    ByteArrayOutputStream randomBuf = new ByteArrayOutputStream(10 * sorted.length);
+
+    ByteArrayOutputStream packed = new ByteArrayOutputStream(13 * sorted.length);
     long prev = maxTs;
     for (UUID u : sorted) {
       long ts = UuidV7.timestampMs(u);
-      writeVarint64(out, COMMITTED_TXNS_TIMESTAMP_DELTAS, prev - ts);
+      writeRawVarint64(packed, prev - ts);
       prev = ts;
-      randomBuf.write(UuidV7.packRandomBits(u));
+      packed.write(UuidV7.packRandomBits(u));
     }
-    writeBytes(out, COMMITTED_TXNS_RANDOM_PACKED, randomBuf.toByteArray());
+    writeBytes(out, COMMITTED_TXNS_PACKED_ENTRIES, packed.toByteArray());
     return out.toByteArray();
   }
 
   /**
-   * Decodes a {@code CommittedTransactions} sub-message body and adds each
-   * reconstructed v7 UUID to the builder. Throws if the random_packed length
-   * doesn't match the delta count (length invariant).
+   * Scans the inner {@code CommittedTransactions} body for a v7 UUID. Returns
+   * true iff the set contains the query. Walks the wire bytes linearly with
+   * no per-call allocation: tracks the running timestamp by summing varint
+   * deltas, compares the random-bits region of each entry against the
+   * query's packed bits in place, and exits early when the running timestamp
+   * passes the query's timestamp (descending order).
+   *
+   * <p>Returns false for non-v7 queries (the dedup set only stores v7 IDs).
    */
-  static void decodeCommittedTransactions(byte[] body, ProtoCatalogFile.Builder builder)
+  static boolean committedSetContains(byte[] body, UUID query) {
+    if (body.length == 0 || !UuidV7.isV7(query)) {
+      return false;
+    }
+    long queryTs = UuidV7.timestampMs(query);
+    byte[] queryRand = UuidV7.packRandomBits(query);
+    try {
+      ByteArrayInputStream in = new ByteArrayInputStream(body);
+      long maxTs = 0L;
+      int packedStart = -1;
+      int packedEnd = -1;
+      while (in.available() > 0) {
+        int tag = readVarint(in);
+        int fieldNumber = tag >>> 3;
+        int wireType = tag & 0x7;
+        switch (fieldNumber) {
+          case COMMITTED_TXNS_MAX_TIMESTAMP_MS:
+            maxTs = readFixed64(in);
+            break;
+          case COMMITTED_TXNS_PACKED_ENTRIES:
+            int len = readVarint(in);
+            packedStart = body.length - in.available();
+            packedEnd = packedStart + len;
+            in.skip(len);
+            break;
+          default:
+            skipField(in, wireType);
+        }
+      }
+      if (packedStart < 0 || queryTs > maxTs) {
+        return false;
+      }
+      long ts = maxTs;
+      int off = packedStart;
+      while (off < packedEnd) {
+        // Inline varint read to avoid wrapping with InputStream.
+        long delta = 0;
+        int shift = 0;
+        while (true) {
+          int b = body[off++] & 0xFF;
+          delta |= ((long) (b & 0x7F)) << shift;
+          if ((b & 0x80) == 0) break;
+          shift += 7;
+        }
+        ts -= delta;
+        if (off + 10 > packedEnd) {
+          return false; // malformed; treat as not-contained
+        }
+        if (ts == queryTs && randomMatches(body, off, queryRand)) {
+          return true;
+        }
+        if (ts < queryTs) {
+          return false; // descending order: any further entries are older
+        }
+        off += 10;
+      }
+      return false;
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
+  private static boolean randomMatches(byte[] body, int off, byte[] query) {
+    for (int i = 0; i < 10; i++) {
+      if (body[off + i] != query[i]) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Decodes a {@code CommittedTransactions} body into the canonical {@code Set<UUID>}.
+   * Used by the {@code committedTransactions()} bulk-getter and during merge in
+   * {@code Builder.build()}; not on the query hot path.
+   */
+  static java.util.LinkedHashSet<UUID> decodeCommittedTransactions(byte[] body)
       throws IOException {
+    java.util.LinkedHashSet<UUID> out = new java.util.LinkedHashSet<>();
+    if (body.length == 0) {
+      return out;
+    }
     ByteArrayInputStream in = new ByteArrayInputStream(body);
     long maxTs = 0L;
-    java.util.List<Long> deltas = new ArrayList<>();
-    byte[] randomPacked = new byte[0];
+    byte[] packed = new byte[0];
     while (in.available() > 0) {
       int tag = readVarint(in);
       int fieldNumber = tag >>> 3;
@@ -381,27 +468,38 @@ public class ProtoCodec {
         case COMMITTED_TXNS_MAX_TIMESTAMP_MS:
           maxTs = readFixed64(in);
           break;
-        case COMMITTED_TXNS_TIMESTAMP_DELTAS:
-          deltas.add(readVarint64(in));
-          break;
-        case COMMITTED_TXNS_RANDOM_PACKED:
-          randomPacked = readLengthDelimitedBytes(in);
+        case COMMITTED_TXNS_PACKED_ENTRIES:
+          packed = readLengthDelimitedBytes(in);
           break;
         default:
           skipField(in, wireType);
       }
     }
-    if (randomPacked.length != 10 * deltas.size()) {
-      throw new IOException(
-          "Malformed CommittedTransactions: random_packed has "
-              + randomPacked.length + " bytes but " + deltas.size() + " deltas");
-    }
     long ts = maxTs;
-    for (int i = 0; i < deltas.size(); i++) {
-      ts -= deltas.get(i);
-      builder.addCommittedTransaction(
-          UuidV7.fromTimestampAndRandom(ts, randomPacked, i * 10));
+    int off = 0;
+    while (off < packed.length) {
+      int start = off;
+      long delta = 0;
+      int shift = 0;
+      while (true) {
+        if (off >= packed.length) {
+          throw new IOException("Malformed CommittedTransactions: truncated varint at " + start);
+        }
+        int b = packed[off++] & 0xFF;
+        delta |= ((long) (b & 0x7F)) << shift;
+        if ((b & 0x80) == 0) break;
+        shift += 7;
+      }
+      ts -= delta;
+      if (off + 10 > packed.length) {
+        throw new IOException(
+            "Malformed CommittedTransactions: entry at offset " + start
+                + " missing 10 random bytes (have " + (packed.length - off) + ")");
+      }
+      out.add(UuidV7.fromTimestampAndRandom(ts, packed, off));
+      off += 10;
     }
+    return out;
   }
 
   private static byte[] encodeNamespace(int id, ProtoCatalogFile.NsEntry entry) throws IOException {

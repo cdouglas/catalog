@@ -51,9 +51,10 @@ class TestCommittedTransactions {
   @Test
   void emptySetRoundTrips() throws IOException {
     byte[] body = ProtoCodec.encodeCommittedTransactions(java.util.Collections.emptyList());
-    ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(LOC);
-    ProtoCodec.decodeCommittedTransactions(body, builder);
-    assertThat(builder.build().committedTransactions()).isEmpty();
+    ProtoCatalogFile cat = ProtoCatalogFile.builder(LOC)
+        .setCommittedTransactionsBytes(body)
+        .build();
+    assertThat(cat.committedTransactions()).isEmpty();
   }
 
   @Test
@@ -120,30 +121,25 @@ class TestCommittedTransactions {
   }
 
   @Test
-  void mismatchedLengthInvariantThrows() {
-    // Hand-craft a payload with 2 deltas but only 10 bytes of random
-    // (should be 20). Field tags constructed manually:
+  void truncatedPackedEntryThrows() throws IOException {
+    // Hand-craft a payload whose packed_entries blob declares a delta but
+    // doesn't include the expected 10 random bytes after it. Field tags:
     //   field 1, fixed64 (wire 1):     tag 0x09
-    //   field 2, varint (wire 0):      tag 0x10
-    //   field 3, length-delim (wire 2): tag 0x1a
+    //   field 2, length-delim (wire 2): tag 0x12
     java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
-    // max_timestamp_ms: 0x09 + 8 bytes
     out.write(0x09);
     for (int i = 0; i < 8; i++) out.write(0);
-    // delta 1: 0x10 + varint(0)
-    out.write(0x10);
+    out.write(0x12);
+    // packed_entries length = 4: one delta varint (0x00 = 0), then only 3
+    // random bytes — should be 10. Decode must reject.
+    out.write(4);
     out.write(0);
-    // delta 2: 0x10 + varint(1)
-    out.write(0x10);
-    out.write(1);
-    // random_packed: 0x1a + length(10) + 10 bytes (only enough for ONE entry)
-    out.write(0x1a);
-    out.write(10);
-    for (int i = 0; i < 10; i++) out.write(0);
+    out.write(0);
+    out.write(0);
+    out.write(0);
     byte[] body = out.toByteArray();
 
-    ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(LOC);
-    assertThatThrownBy(() -> ProtoCodec.decodeCommittedTransactions(body, builder))
+    assertThatThrownBy(() -> ProtoCodec.decodeCommittedTransactions(body))
         .isInstanceOf(IOException.class)
         .hasMessageContaining("CommittedTransactions");
   }
@@ -196,10 +192,17 @@ class TestCommittedTransactions {
   // Helpers
   // ============================================================
 
+  /**
+   * Round-trip via the bulk-load Builder path used by readInternal: encode
+   * the input set, install the bytes on a fresh Builder via
+   * setCommittedTransactionsBytes, and recover the canonical Set through
+   * the resulting ProtoCatalogFile's lazy committedTransactions() getter.
+   */
   private static Set<UUID> roundTripImpl(java.util.Collection<UUID> input) throws IOException {
     byte[] body = ProtoCodec.encodeCommittedTransactions(input);
-    ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(LOC);
-    ProtoCodec.decodeCommittedTransactions(body, builder);
-    return new HashSet<>(builder.build().committedTransactions());
+    ProtoCatalogFile cat = ProtoCatalogFile.builder(LOC)
+        .setCommittedTransactionsBytes(body)
+        .build();
+    return new HashSet<>(cat.committedTransactions());
   }
 }

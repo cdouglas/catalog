@@ -55,23 +55,24 @@ message Checkpoint {
 // reconstructs each UUID by reapplying the version (=0x7) and variant
 // (=0b10) bits.
 //
-// Per-entry wire cost: 1 (delta tag) + 1-3 (delta varint) + 10 (random)
-// ≈ 12 bytes for clustered timestamps, 14 bytes for sparse year-spanning
-// sets, vs 18 bytes (16 + tag + length) for the prior `repeated bytes`
-// encoding. ~30% reduction at typical sizes; see docs/UUID_V7_BENCH_RESULTS.md.
+// Entries are interleaved into a single packed bytes field so the codec
+// can walk them in one linear pass without allocating intermediate
+// arrays — `ProtoCatalogFile.containsTransaction` runs directly against
+// the wire bytes with zero per-call heap.
+//
+// Per-entry wire cost: 1-3 (delta varint) + 10 (random) ≈ 11-13 bytes,
+// vs 18 bytes (16 + tag + length) for the prior `repeated bytes`
+// encoding. ~30% reduction at typical sizes;
+// see docs/UUID_V7_BENCH_RESULTS.md.
 message CommittedTransactions {
   // Largest (most recent) timestamp in ms. Implicit when the set is empty.
   fixed64 max_timestamp_ms = 1;
 
-  // Per entry, descending timestamp order: gap from previous entry.
-  // The first delta is 0 (max_timestamp_ms - max_timestamp_ms). Same logical
-  // length as random_packed / 10.
-  repeated uint64 timestamp_deltas = 2;
-
-  // 10 bytes per entry, in the same order as timestamp_deltas. Each chunk:
-  // 12 bits rand_a + 62 bits rand_b + 6 bits zero pad. Decoder invariant:
-  // random_packed.length == 10 * len(timestamp_deltas).
-  bytes random_packed = 3;
+  // Per entry, in descending timestamp order, back-to-back:
+  //   varint delta_ms  -- gap from previous entry (first delta is 0)
+  //   10 bytes         -- 12 bits rand_a + 62 bits rand_b + 6 bits zero pad
+  // The number of entries is recovered by walking the buffer.
+  bytes packed_entries = 2;
 }
 
 message Namespace {

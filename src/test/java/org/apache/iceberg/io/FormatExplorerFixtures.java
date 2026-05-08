@@ -323,11 +323,13 @@ public class FormatExplorerFixtures {
             + "one namespace property, and five committed transactions in "
             + "the dedup set. Demonstrates repeated message fields, "
             + "parent_id chaining, and the CommittedTransactions sub-message "
-            + "(field 20): UUIDv7s sorted descending, with the 48-bit "
-            + "timestamp half delta-coded as varints and the 74 random bits "
-            + "packed into 10 bytes per entry (version+variant bits "
-            + "implicit). Click the random_packed bytes node to see the "
-            + "reconstructed UUIDs.",
+            + "(field 20): UUIDv7s sorted descending, with each entry "
+            + "interleaving a varint timestamp delta (gap from the previous "
+            + "entry) and 10 packed random bytes (rand_a + rand_b, "
+            + "version+variant bits implicit) into a single packed_entries "
+            + "blob. The catalog scans this blob in one linear pass with no "
+            + "per-call heap allocation. Click the packed_entries node to "
+            + "see the reconstructed UUIDs.",
         file, List.of());
   }
 
