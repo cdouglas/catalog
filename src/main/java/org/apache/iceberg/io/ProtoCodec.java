@@ -125,13 +125,8 @@ public class ProtoCodec {
   private static final int SMR_SNAPSHOT_ID = 1;
   private static final int SMR_POOL_INDICES = 2;
 
-  // Uuid message field numbers (msb/lsb halves of a 128-bit UUID).
-  // Used for catalog_uuid, transaction_id, and committed_transaction_ids.
-  private static final int UUID_MSB = 1;
-  private static final int UUID_LSB = 2;
-
   // Transaction field numbers
-  private static final int TXN_ID = 1;            // length-delimited Uuid message
+  private static final int TXN_ID = 1;
   private static final int TXN_ACTIONS = 3;
 
   // Action type field numbers (oneof)
@@ -228,7 +223,7 @@ public class ProtoCodec {
       ByteArrayOutputStream out = new ByteArrayOutputStream();
 
       // Catalog UUID
-      writeUuid(out, CHECKPOINT_CATALOG_UUID, original.uuid());
+      writeBytes(out, CHECKPOINT_CATALOG_UUID, uuidToBytes(original.uuid()));
 
       // Next IDs (from idManager which tracks allocations)
       writeVarint(out, CHECKPOINT_NEXT_NAMESPACE_ID, idManager.getNextNsid());
@@ -273,7 +268,7 @@ public class ProtoCodec {
 
       // Committed transactions
       for (UUID txnId : original.committedTransactions()) {
-        writeUuid(out, CHECKPOINT_COMMITTED_TXNS, txnId);
+        writeBytes(out, CHECKPOINT_COMMITTED_TXNS, uuidToBytes(txnId));
       }
 
       return out.toByteArray();
@@ -295,7 +290,7 @@ public class ProtoCodec {
 
         switch (fieldNumber) {
           case CHECKPOINT_CATALOG_UUID:
-            builder.setCatalogUuid(decodeUuid(readLengthDelimitedBytes(in)));
+            builder.setCatalogUuid(bytesToUuid(readLengthDelimitedBytes(in)));
             break;
           case CHECKPOINT_NEXT_NAMESPACE_ID:
             builder.setNextNamespaceId(readVarint(in));
@@ -316,7 +311,7 @@ public class ProtoCodec {
             decodeInlineTable(readLengthDelimitedBytes(in), builder);
             break;
           case CHECKPOINT_COMMITTED_TXNS:
-            builder.addCommittedTransaction(decodeUuid(readLengthDelimitedBytes(in)));
+            builder.addCommittedTransaction(bytesToUuid(readLengthDelimitedBytes(in)));
             break;
           default:
             skipField(in, wireType);
@@ -593,7 +588,7 @@ public class ProtoCodec {
   public static byte[] encodeTransaction(Transaction txn) {
     try {
       ByteArrayOutputStream out = new ByteArrayOutputStream();
-      writeUuid(out, TXN_ID, txn.id());
+      writeBytes(out, TXN_ID, uuidToBytes(txn.id()));
       for (Action action : txn.actions()) {
         byte[] actionBytes = encodeAction(action);
         writeLengthDelimited(out, TXN_ACTIONS, actionBytes);
@@ -618,7 +613,7 @@ public class ProtoCodec {
         int fieldNumber = tag >>> 3;
         switch (fieldNumber) {
           case TXN_ID:
-            txnId = decodeUuid(readLengthDelimitedBytes(in));
+            txnId = bytesToUuid(readLengthDelimitedBytes(in));
             break;
           case TXN_ACTIONS:
             actions.add(decodeAction(readLengthDelimitedBytes(in)));
@@ -1210,44 +1205,17 @@ public class ProtoCodec {
     }
   }
 
-  /**
-   * Encodes a UUID as a length-delimited {@code Uuid} sub-message under
-   * the given outer field number. Inner layout is fixed64 msb (field 1),
-   * fixed64 lsb (field 2). Each Uuid is 20 bytes on the wire (1 outer
-   * tag + 1 length + 18 inner bytes).
-   */
-  private static void writeUuid(OutputStream out, int fieldNumber, UUID uuid) throws IOException {
-    ByteArrayOutputStream inner = new ByteArrayOutputStream(18);
-    writeFixed64(inner, UUID_MSB, uuid.getMostSignificantBits());
-    writeFixed64(inner, UUID_LSB, uuid.getLeastSignificantBits());
-    writeLengthDelimited(out, fieldNumber, inner.toByteArray());
+  private static byte[] uuidToBytes(UUID uuid) {
+    ByteBuffer buffer = ByteBuffer.allocate(16);
+    buffer.putLong(uuid.getMostSignificantBits());
+    buffer.putLong(uuid.getLeastSignificantBits());
+    return buffer.array();
   }
 
-  /**
-   * Decodes a {@code Uuid} sub-message body (already length-delimited
-   * stripped) into a {@link UUID}.
-   */
-  private static UUID decodeUuid(byte[] bytes) throws IOException {
-    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
-    Long msb = null;
-    Long lsb = null;
-    while (in.available() > 0) {
-      int tag = readVarint(in);
-      int fieldNumber = tag >>> 3;
-      int wireType = tag & 0x7;
-      switch (fieldNumber) {
-        case UUID_MSB:
-          msb = readFixed64(in);
-          break;
-        case UUID_LSB:
-          lsb = readFixed64(in);
-          break;
-        default:
-          skipField(in, wireType);
-      }
-    }
-    Preconditions.checkNotNull(msb, "Uuid msb is required");
-    Preconditions.checkNotNull(lsb, "Uuid lsb is required");
+  private static UUID bytesToUuid(byte[] bytes) {
+    ByteBuffer buffer = ByteBuffer.wrap(bytes);
+    long msb = buffer.getLong();
+    long lsb = buffer.getLong();
     return new UUID(msb, lsb);
   }
 

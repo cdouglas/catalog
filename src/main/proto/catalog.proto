@@ -22,26 +22,12 @@ option java_package = "org.apache.iceberg.catalog.proto";
 option java_outer_classname = "CatalogProto";
 
 // ============================================================
-// Common types
-// ============================================================
-
-// 128-bit UUID encoded as two fixed64 halves. This is the conventional
-// protobuf representation for UUIDs: each half is 8 raw bytes on the wire
-// (no length prefix), and the structured shape composes cleanly inside
-// `repeated` fields. Used for catalog identity, transaction IDs, and
-// committed-transaction dedup.
-message Uuid {
-  fixed64 msb = 1;
-  fixed64 lsb = 2;
-}
-
-// ============================================================
 // Checkpoint - written on compaction (CAS)
 // ============================================================
 
 message Checkpoint {
-  // Catalog identity (UUIDv7)
-  Uuid catalog_uuid = 1;
+  // Catalog identity
+  bytes catalog_uuid = 1;           // 16 bytes, UUIDv7
 
   // ID allocation state
   int32 next_namespace_id = 2;
@@ -56,7 +42,7 @@ message Checkpoint {
   repeated InlineTable inline_tables = 13;
 
   // Committed transaction tracking (for deduplication)
-  repeated Uuid committed_transaction_ids = 20;
+  repeated bytes committed_transaction_ids = 20;  // UUIDv7s, 16 bytes each
 }
 
 message Namespace {
@@ -96,7 +82,7 @@ message InlineTable {
 // ============================================================
 
 message Transaction {
-  Uuid transaction_id = 1;          // UUIDv7
+  bytes transaction_id = 1;         // UUIDv7, 16 bytes
   repeated Action actions = 3;
 }
 

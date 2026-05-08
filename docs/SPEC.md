@@ -73,36 +73,20 @@ Offset  Size   Field             Description
 
 Defined in `src/main/proto/catalog.proto`, package `iceberg.catalog`.
 
-### Uuid
-
-128-bit identifier encoded as two `fixed64` halves. Used for catalog
-identity, transaction IDs, and committed-transaction dedup. Each `fixed64`
-is 8 raw bytes (no length prefix), so a `Uuid` sub-message is 20 bytes
-on the wire (1 outer tag + 1 length + 18 inner bytes), versus 18 bytes
-for an opaque `bytes`-encoded UUID. The structured shape composes
-cleanly inside `repeated` fields.
-
-```protobuf
-message Uuid {
-  fixed64 msb = 1;
-  fixed64 lsb = 2;
-}
-```
-
 ### Checkpoint
 
 Written on compaction (CAS). Contains the full materialized catalog state.
 
 ```protobuf
 message Checkpoint {
-  Uuid                       catalog_uuid              = 1;   // UUIDv7
-  int32                      next_namespace_id         = 2;
-  int32                      next_table_id             = 3;
-  repeated Namespace         namespaces                = 10;
-  repeated Table             tables                    = 11;  // pointer-mode
-  repeated NamespaceProperty namespace_properties      = 12;
-  repeated InlineTable       inline_tables             = 13;  // inline-mode
-  repeated Uuid              committed_transaction_ids = 20;  // UUIDv7s
+  bytes  catalog_uuid              = 1;   // 16 bytes, UUIDv7
+  int32  next_namespace_id         = 2;
+  int32  next_table_id             = 3;
+  repeated Namespace          namespaces                = 10;
+  repeated Table              tables                    = 11;  // pointer-mode tables
+  repeated NamespaceProperty  namespace_properties      = 12;
+  repeated InlineTable        inline_tables             = 13;  // inline-mode tables
+  repeated bytes              committed_transaction_ids = 20;  // 16-byte UUIDs
 }
 ```
 
@@ -142,7 +126,7 @@ Appended atomically to the log region.
 
 ```protobuf
 message Transaction {
-  Uuid            transaction_id = 1;       // UUIDv7
+  bytes           transaction_id = 1;    // UUIDv7, 16 bytes
   repeated Action actions        = 3;
 }
 
