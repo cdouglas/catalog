@@ -1251,6 +1251,7 @@
     function renderHex() {
       var bytes = state.bytes;
       var lines = [];
+      state.byteEls = new Array(bytes.length);
       for (var off = 0; off < bytes.length; off += 16) {
         var pieces = ['<span class="row">'];
         pieces.push('<span class="off">' + off.toString(16).padStart(8, '0') + '</span>');
@@ -1279,7 +1280,15 @@
         pieces.push('</span>');
         lines.push(pieces.join(''));
       }
-      document.getElementById('hex').innerHTML = lines.join('\n');
+      var hexEl = document.getElementById('hex');
+      hexEl.innerHTML = lines.join('\n');
+      // Cache .b spans by offset so select()/hoverNode() can avoid the
+      // O(bytes × ancestors) querySelector storm on multi-KB scenarios.
+      var spans = hexEl.querySelectorAll('.b[data-off]');
+      for (var s = 0; s < spans.length; s++) {
+        var sOff = parseInt(spans[s].getAttribute('data-off'), 10);
+        if (!isNaN(sOff)) state.byteEls[sOff] = spans[s];
+      }
     }
 
     function nodeKindForByte(node) {
@@ -1534,15 +1543,17 @@
       }
       var anc = ancestorIds(nodeId);
       // Ancestor underlines first; .sel paints over.
+      // Use the byte-element cache (state.byteEls) instead of querySelector
+      // per offset — large scenarios would otherwise freeze the browser.
       for (var a = 0; a < anc.length; a++) {
         var aN = state.nodes[anc[a]];
         for (var off = aN.byteStart; off < aN.byteEnd; off++) {
-          var elt = hex.querySelector('.b[data-off="' + off + '"]');
+          var elt = state.byteEls[off];
           if (elt) elt.classList.add('ancestor');
         }
       }
       for (var off2 = node.byteStart; off2 < node.byteEnd; off2++) {
-        var b = hex.querySelector('.b[data-off="' + off2 + '"]');
+        var b = state.byteEls[off2];
         if (b) b.classList.add('sel');
       }
 
@@ -1577,7 +1588,7 @@
       }
 
       // 3. Scroll hex pane to selection if off-screen.
-      var firstByte = hex.querySelector('.b[data-off="' + node.byteStart + '"]');
+      var firstByte = state.byteEls[node.byteStart];
       if (firstByte) {
         var br = firstByte.getBoundingClientRect();
         var hp = document.getElementById('hex-pane').getBoundingClientRect();
@@ -1605,13 +1616,12 @@
       clearHover();
       var node = state.nodes[nodeId];
       if (!node) return;
-      var hex = document.getElementById('hex');
-      var tree = document.getElementById('tree');
       for (var off = node.byteStart; off < node.byteEnd; off++) {
-        var b = hex.querySelector('.b[data-off="' + off + '"]');
+        var b = state.byteEls[off];
         if (b) b.classList.add('hover-preview');
       }
-      var summary = tree.querySelector('summary[data-node="' + nodeId + '"]');
+      var summary = document.getElementById('tree')
+        .querySelector('summary[data-node="' + nodeId + '"]');
       if (summary) summary.classList.add('hover-preview');
     }
 
