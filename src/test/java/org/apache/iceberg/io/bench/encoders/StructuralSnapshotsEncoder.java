@@ -34,6 +34,7 @@ import java.util.Set;
 import org.apache.iceberg.InlineDeltaSnapshots;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.TableMetadata;
+import org.apache.iceberg.TableMetadata.MetadataLogEntry;
 import org.apache.iceberg.TableMetadataParser;
 import org.apache.iceberg.io.bench.MetadataDecoder;
 
@@ -53,13 +54,20 @@ import org.apache.iceberg.io.bench.MetadataDecoder;
  *   <li><b>schema-id RLE</b> — usually one run.
  * </ul>
  *
+ * <p>The same idea is applied to the {@code metadata-log} array — entries
+ * follow the {@code .../v{N}-{uuid}.metadata.json} pattern, so the path is
+ * stored as prefix+suffix template plus per-entry {N, UUID}, and
+ * {@code timestamp-ms} as deltas-from-base.
+ *
  * <p>Wire format (gzip-wrapped):
  *
  * <pre>{@code
  *   varint  json_len
- *   bytes   json (TableMetadata minus snapshots)
+ *   bytes   json (TableMetadata minus "snapshots" and "metadata-log")
  *   varint  snap_block_len
  *   bytes   snap_block
+ *   varint  mdlog_block_len
+ *   bytes   mdlog_block
  * }</pre>
  *
  * <p>{@code snap_block}:
@@ -118,6 +126,7 @@ public final class StructuralSnapshotsEncoder implements MetadataDecoder {
       throw new RuntimeException("re-parse of TableMetadata JSON failed", e);
     }
     root.remove("snapshots");
+    root.remove("metadata-log");
     byte[] strippedJson;
     try {
       strippedJson = MAPPER.writeValueAsBytes(root);
@@ -126,12 +135,16 @@ public final class StructuralSnapshotsEncoder implements MetadataDecoder {
     }
 
     byte[] snapBlock = encodeSnapshotsBlock(meta.snapshots());
+    byte[] mdlogBlock = encodeMetadataLogBlock(meta.previousFiles());
 
-    ByteArrayOutputStream wrapper = new ByteArrayOutputStream(strippedJson.length + snapBlock.length + 16);
+    ByteArrayOutputStream wrapper = new ByteArrayOutputStream(
+        strippedJson.length + snapBlock.length + mdlogBlock.length + 32);
     writeVarint(wrapper, strippedJson.length);
     writeBytes(wrapper, strippedJson);
     writeVarint(wrapper, snapBlock.length);
     writeBytes(wrapper, snapBlock);
+    writeVarint(wrapper, mdlogBlock.length);
+    writeBytes(wrapper, mdlogBlock);
     return EncoderUtil.gzip(wrapper.toByteArray());
   }
 
@@ -282,6 +295,76 @@ public final class StructuralSnapshotsEncoder implements MetadataDecoder {
       writeString(out, s.operation() == null ? "" : s.operation());
     }
 
+    return out.toByteArray();
+  }
+
+  // ---------------------------------------------------------------------------
+  // metadata-log block (timestamp-deltas + path template)
+  // ---------------------------------------------------------------------------
+
+  static byte[] encodeMetadataLogBlock(List<MetadataLogEntry> entries) {
+    ByteArrayOutputStream out = new ByteArrayOutputStream(entries.size() * 32 + 64);
+    int n = entries.size();
+    writeVarint(out, n);
+    if (n == 0) {
+      return out.toByteArray();
+    }
+
+    String[] paths = new String[n];
+    for (int i = 0; i < n; i++) {
+      paths[i] = entries.get(i).file();
+    }
+    String prefix = longestCommonPrefix(paths);
+    String suffix = longestCommonSuffix(paths, prefix.length());
+
+    // Try "<int>-<uuid>" template.
+    long[] versions = new long[n];
+    byte[][] uuids = new byte[n][];
+    boolean templated = true;
+    for (int i = 0; i < n; i++) {
+      String mid = paths[i].substring(prefix.length(), paths[i].length() - suffix.length());
+      int dash = mid.indexOf('-');
+      if (dash < 0) {
+        templated = false;
+        break;
+      }
+      try {
+        versions[i] = Long.parseLong(mid.substring(0, dash));
+      } catch (NumberFormatException e) {
+        templated = false;
+        break;
+      }
+      byte[] uuidBytes = parseUuidBytes(mid.substring(dash + 1));
+      if (uuidBytes == null) {
+        templated = false;
+        break;
+      }
+      uuids[i] = uuidBytes;
+    }
+
+    out.write(templated ? 0 : 1);
+    writeString(out, prefix);
+    writeString(out, suffix);
+    if (templated) {
+      for (int i = 0; i < n; i++) {
+        writeVarint(out, versions[i]);
+        writeBytes(out, uuids[i]);
+      }
+    } else {
+      for (int i = 0; i < n; i++) {
+        String mid = paths[i].substring(prefix.length(), paths[i].length() - suffix.length());
+        writeString(out, mid);
+      }
+    }
+
+    long tsBase = entries.get(0).timestampMillis();
+    writeFixed64(out, tsBase);
+    long prev = tsBase;
+    for (int i = 0; i < n; i++) {
+      long ts = entries.get(i).timestampMillis();
+      writeSignedVarint(out, ts - prev);
+      prev = ts;
+    }
     return out.toByteArray();
   }
 
@@ -536,12 +619,32 @@ public final class StructuralSnapshotsEncoder implements MetadataDecoder {
     } catch (IOException e) {
       throw new RuntimeException("decodeFull: parse stripped JSON failed", e);
     }
-    ArrayNode arr = MAPPER.createArrayNode();
+    ArrayNode snapsArr = MAPPER.createArrayNode();
     for (int i = 0; i < d.snapshotCount; i++) {
-      arr.add(buildSnapshotJson(d, i));
+      snapsArr.add(buildSnapshotJson(d, i));
     }
-    root.set("snapshots", arr);
+    root.set("snapshots", snapsArr);
+
+    if (d.mdlogCount > 0) {
+      ArrayNode mdArr = MAPPER.createArrayNode();
+      for (int i = 0; i < d.mdlogCount; i++) {
+        ObjectNode entry = MAPPER.createObjectNode();
+        entry.put("timestamp-ms", d.mdlogTimestamps[i]);
+        entry.put("metadata-file", reconstructMdlogPath(d, i));
+        mdArr.add(entry);
+      }
+      root.set("metadata-log", mdArr);
+    }
+
     return TableMetadataParser.fromJson(root.toString());
+  }
+
+  private static String reconstructMdlogPath(Decoded d, int i) {
+    if (d.mdlogPathMode == 0) {
+      return d.mdlogPrefix + d.mdlogVersions[i] + "-" + formatUuid(d.mdlogUuids[i]) + d.mdlogSuffix;
+    } else {
+      return d.mdlogPrefix + d.mdlogMiddles[i] + d.mdlogSuffix;
+    }
   }
 
   @Override
@@ -617,6 +720,16 @@ public final class StructuralSnapshotsEncoder implements MetadataDecoder {
     Long[] addedRowsArr;
     String[] keyIds;
     String[] operations;
+
+    // metadata-log block (lazy-decoded only when decodeFull is called)
+    int mdlogCount;
+    int mdlogPathMode;
+    String mdlogPrefix;
+    String mdlogSuffix;
+    long[] mdlogVersions;
+    byte[][] mdlogUuids;
+    String[] mdlogMiddles;
+    long[] mdlogTimestamps;
   }
 
   private Decoded decode(byte[] encoded, boolean lazyOnly) {
@@ -758,6 +871,41 @@ public final class StructuralSnapshotsEncoder implements MetadataDecoder {
     d.operations = new String[d.snapshotCount];
     for (int i = 0; i < d.snapshotCount; i++) {
       d.operations[i] = c.readString();
+    }
+
+    // metadata-log block follows. For lazy paths, just skip past it.
+    int mdlogBlockLen = c.readVarint32();
+    int mdlogEnd = c.pos + mdlogBlockLen;
+    if (lazyOnly) {
+      c.pos = mdlogEnd;
+      return d;
+    }
+    d.mdlogCount = c.readVarint32();
+    if (d.mdlogCount > 0) {
+      d.mdlogPathMode = c.buf[c.pos++] & 0xFF;
+      d.mdlogPrefix = c.readString();
+      d.mdlogSuffix = c.readString();
+      if (d.mdlogPathMode == 0) {
+        d.mdlogVersions = new long[d.mdlogCount];
+        d.mdlogUuids = new byte[d.mdlogCount][];
+        for (int i = 0; i < d.mdlogCount; i++) {
+          d.mdlogVersions[i] = c.readVarint64();
+          d.mdlogUuids[i] = c.readBytes(UUID_BYTES);
+        }
+      } else {
+        d.mdlogMiddles = new String[d.mdlogCount];
+        for (int i = 0; i < d.mdlogCount; i++) {
+          d.mdlogMiddles[i] = c.readString();
+        }
+      }
+      long base = c.readFixed64();
+      d.mdlogTimestamps = new long[d.mdlogCount];
+      long mprev = base;
+      for (int i = 0; i < d.mdlogCount; i++) {
+        long delta = c.readSignedVarint();
+        mprev += delta;
+        d.mdlogTimestamps[i] = mprev;
+      }
     }
 
     return d;
