@@ -11,6 +11,32 @@ always exactly what the implementation produces.
 Double-click `index.html` or open it in any modern browser via `file://`.
 No server needed; everything (fixtures, schema, decoder, UI) is embedded.
 
+## Loading an arbitrary catalog file
+
+Click the **"📂 Load catalog file…"** chip next to the scenario dropdown,
+or drag-and-drop a file anywhere on the page. The proto walk, hex pane,
+and tree pane all run on the loaded bytes the same as on a bundled
+scenario — useful for triaging a corrupted or unfamiliar catalog file.
+
+For inline-TM bytes fields (`InlineTable.metadata`,
+`CreateTableInline.metadata`, `UpdateTableInline.full_metadata`), the page
+decodes the codec-encoded payload **in the browser** using
+`DecompressionStream('gzip')` (no external dependency):
+
+- **`CODEC_JSON_GZIP`** — gunzip + UTF-8 decode + pretty-print as
+  TableMetadata JSON.
+- **`CODEC_STRUCTURAL`** — gunzip + walk the wrapper one level deep
+  (`format_version`, `stripped_json`, `snap_block_len`/`snap_block`,
+  `mdlog_block_len`/`mdlog_block`). The recovered JSON shows everything
+  *except* snapshots and metadata-log; their columnar bytes are surfaced
+  in the "Show compact form" table for inspection. Snapshot reconstruction
+  isn't ported to JS — for full snapshot decode use the Java codec
+  (`StructuralInlineMetadataCodec.decodeFull`).
+
+The dynamic decode is asynchronous: clicking on an inline-TM bytes node
+during the brief window before it completes shows a placeholder; click
+another node and back to retry, or just wait for the auto-rerender.
+
 ## Bundled scenarios
 
 | # | Name | Teaches |
@@ -18,15 +44,23 @@ No server needed; everything (fixtures, schema, decoder, UI) is embedded.
 | 1 | `empty-bootstrap` | header, length framing, oneof discriminator |
 | 2 | `namespaces-and-pointer-tables` | repeated fields, parent_id chaining, post-CAS state |
 | 3 | `txn-multi-action-with-late-bind` | 5-byte negative-int varint quirk, `parent_version=-1` |
-| 4 | `create-table-inline-with-real-metadata` | oneof bytes variant, JSON-in-protobuf nesting |
-| 5 | `update-table-inline-delta` | deepest message nesting, fixed64, sint64, manifest entry |
-| 6 | `pointer-multi-table-conflict-retry` | atomic multi-table commits, version-based conflict detection |
-| 7 | `inline-multi-table-conflict-retry` | inline-mode delta commits, conflict-retry on inline tables |
+| 4 | `create-table-inline-gzip` | inline-TM `metadata_codec=CODEC_JSON_GZIP`; gzip-wrapped JSON |
+| 5 | `create-table-inline-structural` | inline-TM `metadata_codec=CODEC_STRUCTURAL`; columnar layout (varint format_version, stripped JSON, snap_block, mdlog_block) |
+| 6 | `update-table-inline-delta` | deepest message nesting, fixed64, sint64, manifest entry |
+| 7 | `pointer-multi-table-conflict-retry` | atomic multi-table commits, version-based conflict detection |
+| 8 | `inline-multi-table-conflict-retry` | inline-mode delta commits, conflict-retry on inline tables |
 
 Click any byte in the hex pane or any node in the tree pane to populate the
 detail panel with the field's name, proto field number, wire type, scalar
 type, schema declaration, and the decoded value. Inline `bytes` fields that
-carry JSON (`metadata`, `schema_json`, etc.) get a "Show JSON" expander.
+carry JSON (`schema_json`, `spec_json`, `order_json`) get a "Show JSON"
+expander. Inline-TM `metadata` / `full_metadata` fields (codec-encoded) get
+two expanders driven by Java-side pre-decoding:
+
+- **Show recovered JSON** — the decoded `TableMetadata` JSON, pretty-printed.
+- **Show compact form** — a labelled table walking the (decompressed) wire
+  layout: `format_version`, `stripped_json`, `snap_block`, `mdlog_block`,
+  etc., each with its byte count and a hex preview.
 
 ## Regenerating the fixtures
 

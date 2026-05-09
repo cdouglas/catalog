@@ -103,6 +103,11 @@ public abstract class CatalogFile {
     protected final Map<TableIdentifier, byte[]> inlineTables;
     protected final Map<TableIdentifier, byte[]> inlineTableUpdates;
     protected final Map<TableIdentifier, byte[]> inlineTableDeltaUpdates;
+    // Codec tags parallel to inlineTables / inlineTableUpdates. Entries default
+    // to InlineMetadataCodecs.TAG_JSON_GZIP when missing (see the no-codec
+    // overloads of createTableInline / updateTableInline below).
+    protected final Map<TableIdentifier, Byte> inlineTableCodecs;
+    protected final Map<TableIdentifier, Byte> inlineTableUpdateCodecs;
     // Pending renames: from-identifier -> to-identifier. The id stays put; only
     // the (namespace, name) pair on TblEntry changes. See errata.md §D5.
     protected final Map<TableIdentifier, TableIdentifier> tableRenames;
@@ -117,6 +122,8 @@ public abstract class CatalogFile {
       this.inlineTables = Maps.newHashMap();
       this.inlineTableUpdates = Maps.newHashMap();
       this.inlineTableDeltaUpdates = Maps.newHashMap();
+      this.inlineTableCodecs = Maps.newHashMap();
+      this.inlineTableUpdateCodecs = Maps.newHashMap();
       this.tableRenames = Maps.newHashMap();
     }
 
@@ -300,8 +307,20 @@ public abstract class CatalogFile {
       return self();
     }
 
-    /** Creates a table with its metadata stored inline in the catalog. */
+    /**
+     * Creates a table with its metadata stored inline in the catalog. Defaults
+     * the codec to {@link InlineMetadataCodecs#TAG_JSON_GZIP}; use the
+     * codec-aware overload to record a different codec.
+     */
     public T createTableInline(TableIdentifier table, byte[] metadata) {
+      return createTableInline(table, metadata, InlineMetadataCodecs.TAG_JSON_GZIP);
+    }
+
+    /**
+     * Creates a table with metadata stored inline; {@code codecTag} identifies
+     * the codec used to encode {@code metadata}.
+     */
+    public T createTableInline(TableIdentifier table, byte[] metadata, byte codecTag) {
       if (checkNamespaceExists(table.namespace())) {
         throw new NoSuchNamespaceException("Namespace does not exist: %s", table.namespace());
       }
@@ -310,15 +329,24 @@ public abstract class CatalogFile {
         throw new AlreadyExistsException("Table already exists: %s", table);
       }
       inlineTables.put(table, metadata);
+      inlineTableCodecs.put(table, codecTag);
       return self();
     }
 
     /** Updates an inline table's metadata (full replacement). */
     public T updateTableInline(TableIdentifier table, byte[] metadata) {
+      return updateTableInline(table, metadata, InlineMetadataCodecs.TAG_JSON_GZIP);
+    }
+
+    /**
+     * Updates an inline table's metadata (full replacement) with the given codec.
+     */
+    public T updateTableInline(TableIdentifier table, byte[] metadata, byte codecTag) {
       if (!original.containsTable(table)) {
         throw new NoSuchTableException("Table does not exist: %s", table);
       }
       inlineTableUpdates.put(table, metadata);
+      inlineTableUpdateCodecs.put(table, codecTag);
       return self();
     }
 

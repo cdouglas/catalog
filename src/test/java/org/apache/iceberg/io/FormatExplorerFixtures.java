@@ -91,7 +91,8 @@ public class FormatExplorerFixtures {
     scenarios.add(scenarioEmptyBootstrap());
     scenarios.add(scenarioPostCasMultiNamespace());
     scenarios.add(scenarioLateBindMultiAction());
-    scenarios.add(scenarioCreateTableInline());
+    scenarios.add(scenarioCreateTableInlineGzip());
+    scenarios.add(scenarioCreateTableInlineStructural());
     scenarios.add(scenarioUpdateTableInlineDelta());
     scenarios.add(scenarioPointerMultiTableConflictRetry());
     scenarios.add(scenarioInlineMultiTableConflictRetry());
@@ -103,9 +104,9 @@ public class FormatExplorerFixtures {
     // read path (verify + apply). Their wire bytes must round-trip through
     // ProtoCatalogFormat.readInternal with the documented outcomes.
     verifyConflictRetryReplay(
-        scenarios.get(5), /* aSucceeds */ true, /* bAtV2 */ "s3://lake/warehouse/B/v2.metadata.json",
+        scenarios.get(6), /* aSucceeds */ true, /* bAtV2 */ "s3://lake/warehouse/B/v2.metadata.json",
         "s3://lake/warehouse/A/v3.metadata.json");
-    verifyInlineConflictRetryReplay(scenarios.get(6));
+    verifyInlineConflictRetryReplay(scenarios.get(7));
 
     Files.createDirectories(OUTPUT.getParent());
     Files.writeString(OUTPUT, emitJson(schema, scenarios));
@@ -217,10 +218,10 @@ public class FormatExplorerFixtures {
         org.apache.iceberg.catalog.TableIdentifier.of(warehouse, "A"));
     Integer bId = result.tableId(
         org.apache.iceberg.catalog.TableIdentifier.of(warehouse, "B"));
-    TableMetadata aMeta = TableMetadataParser.fromJson(
-        new String(result.inlineMetadata(aId), StandardCharsets.UTF_8));
-    TableMetadata bMeta = TableMetadataParser.fromJson(
-        new String(result.inlineMetadata(bId), StandardCharsets.UTF_8));
+    InlineMetadataCodec aCodec = InlineMetadataCodecs.byTag(result.inlineMetadataCodec(aId));
+    InlineMetadataCodec bCodec = InlineMetadataCodecs.byTag(result.inlineMetadataCodec(bId));
+    TableMetadata aMeta = aCodec.decodeFull(result.inlineMetadata(aId), null);
+    TableMetadata bMeta = bCodec.decodeFull(result.inlineMetadata(bId), null);
     // After T3 commits, A holds {S1A, S3A} with main->S3A; B holds {S3B} with
     // main->S3B. Neither carries the snapshots from the rejected T2.
     long aT3Snap = 0x3333333333333333L;
@@ -369,11 +370,12 @@ public class FormatExplorerFixtures {
   }
 
   /**
-   * Inline table mode: CreateTableInline carries a real (small) Iceberg
-   * TableMetadata JSON in the {@code metadata} bytes field. Shows oneof's
-   * length-delimited variant and JSON-in-protobuf nesting.
+   * Inline table mode (gzip codec): CreateTableInline carries a gzip-encoded
+   * Iceberg TableMetadata in the {@code metadata} bytes field, with the
+   * {@code metadata_codec} enum field set to {@code CODEC_JSON_GZIP}. Shows
+   * the codec discriminator on the wire alongside the gzip-wrapped JSON.
    */
-  private Scenario scenarioCreateTableInline() {
+  private Scenario scenarioCreateTableInlineGzip() {
     ProtoCatalogFile catalog = ProtoCatalogFile.builder(LOCATION)
         .setCatalogUuid(FIXED_CATALOG_UUID)
         .addNamespace(1, 0, "warehouse", 1)
@@ -383,28 +385,89 @@ public class FormatExplorerFixtures {
         .build();
     byte[] file = encodeFile(catalog);
 
-    byte[] metadataJson = realTableMetadata(
+    TableMetadata meta = realTableMetadataObject(
         "019000aa-0000-7000-8000-000000000001",
         "s3://lake/warehouse/orders",
         Map.of("table-name", "orders", "owner", "commerce-team"),
         PINNED_TS);
+    byte[] metadataBytes = InlineMetadataCodecs.JSON_GZIP.encode(meta);
 
     UUID txnId = UUID.fromString("01900000-0000-7000-8000-000000000030");
     ProtoCodec.Transaction txn = new ProtoCodec.Transaction(
         txnId,
         List.of(new ProtoCodec.CreateTableInlineAction(
-            1, 1, 1, 1, "orders", metadataJson)));
+            1, 1, 1, 1, "orders", metadataBytes,
+            InlineMetadataCodecs.TAG_JSON_GZIP)));
     file = appendTxn(file, txn);
 
+    StructuralView view = gzipStructuralView(metadataBytes, meta);
+
     return new Scenario(
-        "create-table-inline-with-real-metadata",
-        "CreateTableInline action carrying a real Iceberg TableMetadata "
-            + "(format-version 2, schema with 6 fields, day-partitioned on "
-            + "ts, four table properties). The JSON is opaque to the "
-            + "catalog format -- protobuf treats it as a length-delimited "
-            + "byte string -- but the detail panel pretty-prints it so you "
-            + "can see what fresh-table metadata looks like in practice.",
-        file, List.of());
+        "create-table-inline-gzip",
+        "CreateTableInline action carrying a gzip-encoded Iceberg "
+            + "TableMetadata (format-version 2, schema with 6 fields, "
+            + "day-partitioned on ts, four table properties). The "
+            + "metadata_codec enum field on the action is CODEC_JSON_GZIP "
+            + "(0). On the wire, proto3 omits the field at the default "
+            + "value, so a gzip-coded record matches what older builds "
+            + "wrote when no codec was specified. Expand 'Show recovered "
+            + "JSON' to see the decompressed TableMetadata.",
+        file, List.of(), List.of(view));
+  }
+
+  /**
+   * Inline table mode (structural codec): CreateTableInline carries a
+   * structurally-encoded Iceberg TableMetadata. The {@code metadata_codec}
+   * enum field is {@code CODEC_STRUCTURAL = 1}, and the bytes are a gzip
+   * wrapper around the columnar layout described in
+   * {@link StructuralInlineMetadataCodec}.
+   */
+  private Scenario scenarioCreateTableInlineStructural() {
+    ProtoCatalogFile catalog = ProtoCatalogFile.builder(LOCATION)
+        .setCatalogUuid(FIXED_CATALOG_UUID)
+        .addNamespace(1, 0, "warehouse", 1)
+        .setNextNamespaceId(2)
+        .setNextTableId(1)
+        .rebuildLookups()
+        .build();
+    byte[] file = encodeFile(catalog);
+
+    TableMetadata meta = realTableMetadataObject(
+        "019000cc-0000-7000-8000-000000000001",
+        "s3://lake/warehouse/products",
+        Map.of("table-name", "products", "owner", "catalog-team"),
+        PINNED_TS);
+    byte[] metadataBytes = InlineMetadataCodecs.STRUCTURAL.encode(meta);
+
+    UUID txnId = UUID.fromString("01900000-0000-7000-8000-000000000031");
+    ProtoCodec.Transaction txn = new ProtoCodec.Transaction(
+        txnId,
+        List.of(new ProtoCodec.CreateTableInlineAction(
+            1, 1, 1, 1, "products", metadataBytes,
+            InlineMetadataCodecs.TAG_STRUCTURAL)));
+    file = appendTxn(file, txn);
+
+    // The catalog under test has no snapshots in this fresh-create scenario,
+    // so the structural payload's snap_block / mdlog_block are both empty
+    // (N=0). We still walk the wrapper so the explorer can show what each
+    // segment contains.
+    StructuralView view = structuralStructuralView(metadataBytes, meta);
+
+    return new Scenario(
+        "create-table-inline-structural",
+        "CreateTableInline action carrying a structurally-encoded "
+            + "TableMetadata. The metadata_codec enum field is "
+            + "CODEC_STRUCTURAL (1) and the bytes are a gzip wrapper around "
+            + "the columnar layout described in "
+            + "StructuralInlineMetadataCodec: a varint format_version, then "
+            + "a stripped JSON document (TableMetadata minus snapshots and "
+            + "metadata-log), then snap_block and mdlog_block columnar "
+            + "segments. The 'Show compact form' expander lists each segment "
+            + "so you can see how the bytes are laid out — at the corpus "
+            + "median this layout is 40% smaller than gzip(JSON) and 4-7x "
+            + "faster on lazy-decode workloads (see "
+            + "docs/TM_ENCODING_BENCH_RESULTS.md).",
+        file, List.of(), List.of(view));
   }
 
   /**
@@ -414,11 +477,14 @@ public class FormatExplorerFixtures {
    * the deepest message nesting in the format.
    */
   private Scenario scenarioUpdateTableInlineDelta() {
-    byte[] baseMetadata = realTableMetadata(
+    TableMetadata baseMeta = realTableMetadataObject(
         "019000bb-0000-7000-8000-000000000001",
         "s3://lake/warehouse/events",
         Map.of("table-name", "events", "owner", "telemetry-team"),
         PINNED_TS);
+    // gzip-encode so the on-disk bytes match the codec field (default = gzip)
+    // and the visualizer can recover the JSON via the per-record codec.
+    byte[] baseMetadata = InlineMetadataCodecs.JSON_GZIP.encode(baseMeta);
 
     ProtoCatalogFile catalog = ProtoCatalogFile.builder(LOCATION)
         .setCatalogUuid(FIXED_CATALOG_UUID)
@@ -481,8 +547,11 @@ public class FormatExplorerFixtures {
             + "the new snapshot, and an AddManifestDelta with one "
             + "ManifestFileEntry. Look for fixed64 (snapshot_id), sint64 "
             + "(timestamp_delta_ms), and the deepest message nesting in the "
-            + "format.",
-        file, List.of());
+            + "format. The InlineTable.metadata field in the checkpoint "
+            + "carries the pre-delta base TableMetadata (gzip-encoded); "
+            + "click it to see the recovered JSON.",
+        file, List.of(),
+        List.of(gzipStructuralView(baseMetadata, baseMeta)));
   }
 
   /**
@@ -568,17 +637,21 @@ public class FormatExplorerFixtures {
   private Scenario scenarioInlineMultiTableConflictRetry() {
     // Seed each table at a distinct UUID; deltas only carry the
     // AddSnapshot/SetSnapshotRef pair, mirroring the production
-    // (checkpoint + delta) replay model.
-    byte[] aV1 = realTableMetadata(
+    // (checkpoint + delta) replay model. Inline base bytes are encoded with
+    // the gzip codec (matches the default codec recorded by the catalog when
+    // the explicit codec field is absent).
+    TableMetadata aMeta = realTableMetadataObject(
         "019000a1-0000-7000-8000-000000000001",
         "s3://lake/warehouse/A",
         Map.of("table-name", "A"),
         PINNED_TS);
-    byte[] bV1 = realTableMetadata(
+    TableMetadata bMeta = realTableMetadataObject(
         "019000b1-0000-7000-8000-000000000001",
         "s3://lake/warehouse/B",
         Map.of("table-name", "B"),
         PINNED_TS);
+    byte[] aV1 = InlineMetadataCodecs.JSON_GZIP.encode(aMeta);
+    byte[] bV1 = InlineMetadataCodecs.JSON_GZIP.encode(bMeta);
 
     long aT1Snap = 0x1111111111111111L;
     long aT2StaleSnap = 0x2222222222222222L;
@@ -653,8 +726,13 @@ public class FormatExplorerFixtures {
             + "(Action field 7), and the payload is a length-delimited delta message instead of a "
             + "metadata-location string. Compare T2's wasted bytes between the two scenarios: in "
             + "pointer mode T2 references already-written metadata.json files; in inline mode T2's "
-            + "delta is the only place its rejected snapshots appeared on the wire.",
-        file, notes);
+            + "delta is the only place its rejected snapshots appeared on the wire. The "
+            + "InlineTable.metadata fields for both A and B in the checkpoint are gzip-encoded; "
+            + "click either to see the recovered JSON.",
+        file, notes,
+        List.of(
+            gzipStructuralView(aV1, aMeta),
+            gzipStructuralView(bV1, bMeta)));
   }
 
   /**
@@ -717,6 +795,14 @@ public class FormatExplorerFixtures {
   /** Real Iceberg TableMetadata for a fresh table; deterministic JSON bytes. */
   private static byte[] realTableMetadata(
       String tableUuid, String location, Map<String, String> extraProps, long timestamp) {
+    return TableMetadataParser
+        .toJson(realTableMetadataObject(tableUuid, location, extraProps, timestamp))
+        .getBytes(StandardCharsets.UTF_8);
+  }
+
+  /** Same shape as {@link #realTableMetadata} but returns the TableMetadata object. */
+  private static TableMetadata realTableMetadataObject(
+      String tableUuid, String location, Map<String, String> extraProps, long timestamp) {
     Schema schema = demoSchema();
     PartitionSpec spec = PartitionSpec.builderFor(schema).day("ts").build();
     Map<String, String> props = new LinkedHashMap<>();
@@ -727,7 +813,7 @@ public class FormatExplorerFixtures {
     if (extraProps != null) {
       props.putAll(extraProps);
     }
-    TableMetadata meta = TableMetadata.buildFromEmpty()
+    return TableMetadata.buildFromEmpty()
         .setLocation(location)
         .setCurrentSchema(schema, /* lastColumnId */ 7)
         .addPartitionSpec(spec)
@@ -737,7 +823,165 @@ public class FormatExplorerFixtures {
         .setLastUpdatedMillis(timestamp)
         .discardChanges()
         .build();
-    return TableMetadataParser.toJson(meta).getBytes(StandardCharsets.UTF_8);
+  }
+
+  /**
+   * Builds a {@link StructuralView} for a gzip-encoded inline-TM record:
+   * recovered JSON plus a single segment summarising the wrapped payload
+   * (gzip is one logical segment, so the compact-form table is one row).
+   */
+  private static StructuralView gzipStructuralView(byte[] gzipBytes, TableMetadata meta) {
+    String recoveredJson = TableMetadataParser.toJson(meta);
+    String label = "gzip-wrapped JSON (decompresses to " + recoveredJson.length()
+        + " bytes of TableMetadata)";
+    return new StructuralView(
+        gzipBytes,
+        prettyJson(recoveredJson),
+        List.of(new StructuralSegment(label, gzipBytes)));
+  }
+
+  /**
+   * Builds a {@link StructuralView} for a structural-encoded inline-TM
+   * record: recovered JSON plus a labelled segment per top-level field of
+   * the columnar wire layout.
+   */
+  private static StructuralView structuralStructuralView(byte[] structBytes, TableMetadata meta) {
+    return new StructuralView(
+        structBytes,
+        prettyJson(TableMetadataParser.toJson(meta)),
+        walkStructuralPayload(structBytes));
+  }
+
+  /**
+   * Pretty-prints a JSON document for the explorer's "Show recovered JSON"
+   * pane. Falls back to the raw input if the parse fails (defensive — the
+   * scenarios produce valid JSON).
+   */
+  private static String prettyJson(String json) {
+    try {
+      com.fasterxml.jackson.databind.ObjectMapper mapper =
+          new com.fasterxml.jackson.databind.ObjectMapper();
+      return mapper.writerWithDefaultPrettyPrinter()
+          .writeValueAsString(mapper.readTree(json));
+    } catch (IOException e) {
+      return json;
+    }
+  }
+
+  /**
+   * Walks the (gzip-decompressed) structural payload and emits a sequence of
+   * labelled segments matching {@link StructuralInlineMetadataCodec}'s wire
+   * layout. The decompressed buffer starts with:
+   *
+   * <pre>{@code
+   *   varint format_version
+   *   varint json_len
+   *   bytes  stripped_json
+   *   varint snap_block_len
+   *   bytes  snap_block
+   *   varint mdlog_block_len
+   *   bytes  mdlog_block
+   * }</pre>
+   *
+   * <p>For the bench-targeted purpose of teaching the format, this walker
+   * goes one level deep into the wrapper (segments per top-level field) and
+   * does not crack open snap_block or mdlog_block beyond reporting their
+   * sizes. That's enough to show readers what structural saves bytes on.
+   */
+  private static List<StructuralSegment> walkStructuralPayload(byte[] gzipped) {
+    byte[] inner = gunzip(gzipped);
+    List<StructuralSegment> out = new ArrayList<>();
+    int pos = 0;
+
+    int formatVerStart = pos;
+    long formatVer = readVarint64(inner, pos);
+    pos += varintSize(formatVer);
+    out.add(new StructuralSegment(
+        "format_version (varint = " + formatVer + ")",
+        Arrays.copyOfRange(inner, formatVerStart, pos)));
+
+    int jsonLenStart = pos;
+    long jsonLen = readVarint64(inner, pos);
+    pos += varintSize(jsonLen);
+    out.add(new StructuralSegment(
+        "json_len (varint = " + jsonLen + ")",
+        Arrays.copyOfRange(inner, jsonLenStart, pos)));
+
+    int jsonStart = pos;
+    pos += (int) jsonLen;
+    out.add(new StructuralSegment(
+        "stripped_json (TableMetadata minus snapshots and metadata-log)",
+        Arrays.copyOfRange(inner, jsonStart, pos)));
+
+    int snapLenStart = pos;
+    long snapLen = readVarint64(inner, pos);
+    pos += varintSize(snapLen);
+    out.add(new StructuralSegment(
+        "snap_block_len (varint = " + snapLen + ")",
+        Arrays.copyOfRange(inner, snapLenStart, pos)));
+
+    int snapStart = pos;
+    pos += (int) snapLen;
+    out.add(new StructuralSegment(
+        snapLen == 1
+            ? "snap_block (empty: N=0)"
+            : "snap_block (columnar: snapshot_ids, parent_offsets, summaries, "
+                + "timestamp/sequence deltas, schema-id RLE, manifest-list "
+                + "template paths)",
+        Arrays.copyOfRange(inner, snapStart, pos)));
+
+    int mdlogLenStart = pos;
+    long mdlogLen = readVarint64(inner, pos);
+    pos += varintSize(mdlogLen);
+    out.add(new StructuralSegment(
+        "mdlog_block_len (varint = " + mdlogLen + ")",
+        Arrays.copyOfRange(inner, mdlogLenStart, pos)));
+
+    int mdlogStart = pos;
+    pos += (int) mdlogLen;
+    out.add(new StructuralSegment(
+        mdlogLen == 1
+            ? "mdlog_block (empty: N=0)"
+            : "mdlog_block (columnar: timestamp deltas + path templates for "
+                + "previous-metadata-log entries)",
+        Arrays.copyOfRange(inner, mdlogStart, pos)));
+
+    return out;
+  }
+
+  private static long readVarint64(byte[] buf, int pos) {
+    long result = 0;
+    int shift = 0;
+    while (true) {
+      byte b = buf[pos++];
+      result |= ((long) (b & 0x7F)) << shift;
+      if ((b & 0x80) == 0) return result;
+      shift += 7;
+    }
+  }
+
+  private static int varintSize(long v) {
+    int size = 1;
+    while ((v & ~0x7FL) != 0L) {
+      size++;
+      v >>>= 7;
+    }
+    return size;
+  }
+
+  private static byte[] gunzip(byte[] in) {
+    try (java.util.zip.GZIPInputStream gz =
+            new java.util.zip.GZIPInputStream(new java.io.ByteArrayInputStream(in));
+        ByteArrayOutputStream out = new ByteArrayOutputStream(in.length * 4)) {
+      byte[] buf = new byte[8192];
+      int n;
+      while ((n = gz.read(buf)) > 0) {
+        out.write(buf, 0, n);
+      }
+      return out.toByteArray();
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
   }
 
   // ============================================================
@@ -1072,8 +1316,36 @@ public class FormatExplorerFixtures {
         }
         sb.append('\n');
       }
-      sb.append("      ]\n");
-      sb.append("    }");
+      sb.append("      ]");
+      if (!s.structuralViews.isEmpty()) {
+        sb.append(",\n      \"structuralViews\": [\n");
+        for (int v = 0; v < s.structuralViews.size(); v++) {
+          StructuralView view = s.structuralViews.get(v);
+          sb.append("        {\n");
+          sb.append("          \"bytesHex\": ").append(jsonString(view.bytesHex)).append(",\n");
+          sb.append("          \"recoveredJson\": ")
+              .append(jsonString(view.recoveredJson)).append(",\n");
+          sb.append("          \"compactSegments\": [\n");
+          for (int j = 0; j < view.compactSegments.size(); j++) {
+            StructuralSegment seg = view.compactSegments.get(j);
+            sb.append("            {\"label\": ").append(jsonString(seg.label))
+                .append(", \"hex\": ").append(jsonString(seg.hex))
+                .append(", \"byteCount\": ").append(seg.byteCount).append("}");
+            if (j < view.compactSegments.size() - 1) {
+              sb.append(',');
+            }
+            sb.append('\n');
+          }
+          sb.append("          ]\n");
+          sb.append("        }");
+          if (v < s.structuralViews.size() - 1) {
+            sb.append(',');
+          }
+          sb.append('\n');
+        }
+        sb.append("      ]");
+      }
+      sb.append("\n    }");
       if (i < scenarios.size() - 1) {
         sb.append(',');
       }
@@ -1207,12 +1479,60 @@ public class FormatExplorerFixtures {
     final String description;
     final byte[] bytes;
     final List<Note> notes;
+    /**
+     * One {@link StructuralView} per inline-TM bytes field carried in this
+     * scenario. The visualizer matches a clicked bytes node to its view by
+     * comparing hex of {@code state.bytes[node.byteStart..node.byteEnd]}
+     * against {@link StructuralView#bytesHex}; mismatched / unknown bytes
+     * fall back to the standard "<N bytes>" display.
+     */
+    final List<StructuralView> structuralViews;
 
     Scenario(String name, String description, byte[] bytes, List<Note> notes) {
+      this(name, description, bytes, notes, Collections.emptyList());
+    }
+
+    Scenario(String name, String description, byte[] bytes, List<Note> notes,
+        List<StructuralView> structuralViews) {
       this.name = name;
       this.description = description;
       this.bytes = bytes;
       this.notes = notes;
+      this.structuralViews = structuralViews;
+    }
+  }
+
+  /**
+   * Decoded preview of an inline-TM bytes record: the recovered canonical
+   * JSON plus a list of labelled segments that walk the (gzip-decompressed)
+   * wire layout. Embedded into {@code fixtures.json} keyed by
+   * {@link #bytesHex} so the HTML visualizer can match it to the right
+   * bytes node when the user clicks. Avoids needing a JS port of the
+   * structural decoder.
+   */
+  static final class StructuralView {
+    /** Hex of the on-wire bytes this view describes. Used as the match key. */
+    final String bytesHex;
+    final String recoveredJson;
+    final List<StructuralSegment> compactSegments;
+
+    StructuralView(byte[] bytes, String recoveredJson,
+        List<StructuralSegment> compactSegments) {
+      this.bytesHex = toHex(bytes);
+      this.recoveredJson = recoveredJson;
+      this.compactSegments = compactSegments;
+    }
+  }
+
+  static final class StructuralSegment {
+    final String label;
+    final String hex;       // hex bytes of this segment (decompressed wire)
+    final int byteCount;
+
+    StructuralSegment(String label, byte[] bytes) {
+      this.label = label;
+      this.hex = toHex(bytes);
+      this.byteCount = bytes.length;
     }
   }
 

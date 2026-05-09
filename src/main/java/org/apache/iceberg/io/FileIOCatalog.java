@@ -18,7 +18,6 @@
  */
 package org.apache.iceberg.io;
 
-import java.nio.charset.StandardCharsets;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -39,7 +38,6 @@ import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.CatalogUtil;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableMetadata;
-import org.apache.iceberg.TableMetadataParser;
 import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.catalog.BaseCatalogTransaction;
 import org.apache.iceberg.catalog.CatalogTransaction;
@@ -70,6 +68,18 @@ public class FileIOCatalog extends BaseMetastoreCatalog
   // pointer-mode snapshots instead of warning. Default is the lenient warn path
   // because rejection breaks tables mid-migration.
   private static final String INLINE_STRICT = "fileio.catalog.inline.strict";
+
+  /**
+   * Selects the codec used to encode full inline {@link TableMetadata} bytes
+   * (CreateTableInline / UpdateTableInline.full / checkpoint InlineTable).
+   * Valid values are "structural" (default — see
+   * {@link StructuralInlineMetadataCodec}) and "gzip" (Iceberg-style
+   * gzip(JSON), see {@link GzipInlineMetadataCodec}). Decode is always driven
+   * by the per-record codec discriminator on the wire, regardless of this
+   * setting.
+   */
+  static final String INLINE_TM_CODEC = "fileio.catalog.inline.tm.codec";
+  static final String DEFAULT_INLINE_TM_CODEC = "structural";
 
   private static final org.slf4j.Logger LOG =
       org.slf4j.LoggerFactory.getLogger(FileIOCatalog.class);
@@ -225,12 +235,13 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         catalogProperties.getOrDefault(INLINE_MANIFESTS, "false"));
     boolean inlineStrict = Boolean.parseBoolean(
         catalogProperties.getOrDefault(INLINE_STRICT, "false"));
+    InlineMetadataCodec codec = configuredInlineCodec();
     if (inlineManifests) {
       return new InlineManifestTableOperations(
-          tableIdentifier, catalogLocation, format, fileIO, inline, inlineStrict);
+          tableIdentifier, catalogLocation, format, fileIO, inline, inlineStrict, codec);
     }
     return new FileIOTableOperations(
-        tableIdentifier, catalogLocation, format, fileIO, inline, inlineStrict);
+        tableIdentifier, catalogLocation, format, fileIO, inline, inlineStrict, codec);
   }
 
   FileIOTableOperations newTableOps(TableIdentifier tableIdentifier, CatalogFile catalogFile) {
@@ -240,12 +251,15 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         catalogProperties.getOrDefault(INLINE_MANIFESTS, "false"));
     boolean inlineStrict = Boolean.parseBoolean(
         catalogProperties.getOrDefault(INLINE_STRICT, "false"));
+    InlineMetadataCodec codec = configuredInlineCodec();
     if (inlineManifests) {
       return new InlineManifestTableOperations(
-          tableIdentifier, catalogLocation, format, fileIO, inline, inlineStrict, catalogFile);
+          tableIdentifier, catalogLocation, format, fileIO,
+          inline, inlineStrict, codec, catalogFile);
     }
     return new FileIOTableOperations(
-        tableIdentifier, catalogLocation, format, fileIO, inline, inlineStrict, catalogFile);
+        tableIdentifier, catalogLocation, format, fileIO,
+        inline, inlineStrict, codec, catalogFile);
   }
 
   @Override
@@ -264,6 +278,33 @@ public class FileIOCatalog extends BaseMetastoreCatalog
   private CatalogFile getCatalogFile() {
     final InputFile catalog = fileIO.newInputFile(catalogLocation);
     return format.read(fileIO, catalog);
+  }
+
+  /**
+   * Resolves the codec used for new full inline-TM writes from the catalog
+   * properties (defaults to {@link #DEFAULT_INLINE_TM_CODEC}). Decode is
+   * always driven by the per-record codec discriminator on the wire — this
+   * setting only affects encode paths.
+   */
+  private InlineMetadataCodec configuredInlineCodec() {
+    String shortName = catalogProperties.getOrDefault(INLINE_TM_CODEC, DEFAULT_INLINE_TM_CODEC);
+    return InlineMetadataCodecs.byShortName(shortName);
+  }
+
+  /**
+   * Returns the codec tag recorded for the given inline table. Falls back to
+   * {@link InlineMetadataCodecs#TAG_JSON_GZIP} when the catalog file doesn't
+   * expose per-table codec metadata (only ProtoCatalogFile does today).
+   */
+  private static byte inlineCodecTag(CatalogFile catalogFile, TableIdentifier table) {
+    if (catalogFile instanceof ProtoCatalogFile) {
+      ProtoCatalogFile proto = (ProtoCatalogFile) catalogFile;
+      Integer numId = proto.tableId(table);
+      if (numId != null) {
+        return proto.inlineMetadataCodec(numId);
+      }
+    }
+    return InlineMetadataCodecs.TAG_JSON_GZIP;
   }
 
   //
@@ -352,6 +393,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
     private final SupportsAtomicOperations fileIO;
     private final boolean inlineEnabled;
     private final boolean inlineStrict;
+    private final InlineMetadataCodec inlineCodec;
     private volatile CatalogFile lastCatalogFile = null;
 
     FileIOTableOperations(
@@ -360,8 +402,10 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         CatalogFormat format,
         SupportsAtomicOperations fileIO,
         boolean inlineEnabled,
-        boolean inlineStrict) {
-      this(tableId, catalogLocation, format, fileIO, inlineEnabled, inlineStrict, null);
+        boolean inlineStrict,
+        InlineMetadataCodec inlineCodec) {
+      this(tableId, catalogLocation, format, fileIO,
+          inlineEnabled, inlineStrict, inlineCodec, null);
     }
 
     FileIOTableOperations(
@@ -371,6 +415,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         SupportsAtomicOperations fileIO,
         boolean inlineEnabled,
         boolean inlineStrict,
+        InlineMetadataCodec inlineCodec,
         CatalogFile catalogFile) {
       this.fileIO = fileIO;
       this.format = format;
@@ -378,6 +423,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
       this.catalogLocation = catalogLocation;
       this.inlineEnabled = inlineEnabled;
       this.inlineStrict = inlineStrict;
+      this.inlineCodec = inlineCodec;
       this.lastCatalogFile = catalogFile;
       if (catalogFile != null) {
         loadFromCatalogFile(catalogFile);
@@ -408,7 +454,8 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         // derive the location from (tableId, version) directly. No content
         // hashing, no collision worry.
         byte[] inlineMeta = catalogFile.inlineMetadata(tableId);
-        String json = new String(inlineMeta, StandardCharsets.UTF_8);
+        byte codecTag = inlineCodecTag(catalogFile, tableId);
+        InlineMetadataCodec codec = InlineMetadataCodecs.byTag(codecTag);
         int version = -1;
         if (catalogFile instanceof ProtoCatalogFile) {
           ProtoCatalogFile proto = (ProtoCatalogFile) catalogFile;
@@ -419,8 +466,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         }
         String syntheticLoc = "inline://" + tableId + "#" + version;
         refreshFromMetadataLocation(syntheticLoc, null, 0,
-            loc -> wrapInlineManifests(
-                TableMetadataParser.fromJson(loc, json), catalogFile));
+            loc -> wrapInlineManifests(codec.decodeFull(inlineMeta, loc), catalogFile));
       } else if (currentMetadataLocation() != null) {
         // Table used to exist but is now missing
         throw new NoSuchTableException("Table %s was deleted", tableId);
@@ -530,11 +576,11 @@ public class FileIOCatalog extends BaseMetastoreCatalog
     }
 
     private void commitInline(TableMetadata base, TableMetadata metadata, boolean isCreate) {
+      InlineMetadataCodec codec = inlineCodec;
       if (isCreate) {
-        String json = TableMetadataParser.toJson(metadata);
-        byte[] metadataBytes = json.getBytes(StandardCharsets.UTF_8);
+        byte[] metadataBytes = codec.encode(metadata);
         format.from(lastCatalogFile)
-            .createTableInline(tableId, metadataBytes)
+            .createTableInline(tableId, metadataBytes, codec.tag())
             .commit(io());
       } else {
         // Try delta mode first, fall back to full or pointer
@@ -578,7 +624,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
           }
         }
 
-        String mode = InlineDeltaCodec.selectMode(delta, metadata, 0);
+        String mode = InlineDeltaCodec.selectMode(delta, metadata, 0, codec);
         // Force delta mode in two cases:
         // 1. hasMLDeltas: the current commit staged new ML deltas; full/pointer
         //    lose them because they serialize TableMetadata (InlineSnapshot ->
@@ -620,8 +666,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
             mut.updateTableInlineDelta(tableId, deltaBytes);
             break;
           case "full":
-            String json = TableMetadataParser.toJson(metadata);
-            mut.updateTableInline(tableId, json.getBytes(StandardCharsets.UTF_8));
+            mut.updateTableInline(tableId, codec.encode(metadata), codec.tag());
             break;
           case "pointer":
             String loc = writeUpdateMetadata(false, metadata);
@@ -765,15 +810,18 @@ public class FileIOCatalog extends BaseMetastoreCatalog
     InlineManifestTableOperations(
         TableIdentifier tableId, String catalogLocation,
         CatalogFormat format, SupportsAtomicOperations fileIO,
-        boolean inlineEnabled, boolean inlineStrict) {
-      super(tableId, catalogLocation, format, fileIO, inlineEnabled, inlineStrict);
+        boolean inlineEnabled, boolean inlineStrict, InlineMetadataCodec inlineCodec) {
+      super(tableId, catalogLocation, format, fileIO,
+          inlineEnabled, inlineStrict, inlineCodec);
     }
 
     InlineManifestTableOperations(
         TableIdentifier tableId, String catalogLocation,
         CatalogFormat format, SupportsAtomicOperations fileIO,
-        boolean inlineEnabled, boolean inlineStrict, CatalogFile catalogFile) {
-      super(tableId, catalogLocation, format, fileIO, inlineEnabled, inlineStrict, catalogFile);
+        boolean inlineEnabled, boolean inlineStrict, InlineMetadataCodec inlineCodec,
+        CatalogFile catalogFile) {
+      super(tableId, catalogLocation, format, fileIO,
+          inlineEnabled, inlineStrict, inlineCodec, catalogFile);
     }
 
     @Override
@@ -884,7 +932,8 @@ public class FileIOCatalog extends BaseMetastoreCatalog
             }
           }
 
-          String mode = InlineDeltaCodec.selectMode(delta, newMetadata, 0);
+          InlineMetadataCodec codec = configuredInlineCodec();
+          String mode = InlineDeltaCodec.selectMode(delta, newMetadata, 0, codec);
           // See commitInline — full-mode avoidance, but never with null delta
           // (encodeDelta would NPE; full is the correct fallback). See errata D1.
           if ((hasMLDeltas || hasMLPool) && !"delta".equals(mode) && delta != null) {
@@ -902,8 +951,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
                   InlineDeltaCodec.encodeDelta(delta, newMetadata.lastUpdatedMillis()));
               break;
             case "full":
-              String json = TableMetadataParser.toJson(newMetadata);
-              newCatalog.updateTableInline(tableId, json.getBytes(StandardCharsets.UTF_8));
+              newCatalog.updateTableInline(tableId, codec.encode(newMetadata), codec.tag());
               break;
             default:
               String loc = ops.writeUpdateMetadata(false, newMetadata);

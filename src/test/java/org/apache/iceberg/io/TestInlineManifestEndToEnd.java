@@ -253,10 +253,23 @@ public class TestInlineManifestEndToEnd {
     }
 
     Map<String, String> catalogProperties(String warehouseLocation) {
+      // Defaults to the catalog's configured inline-TM codec (structural).
+      return catalogProperties(warehouseLocation, null);
+    }
+
+    /**
+     * Catalog properties optionally pinned to a specific inline-TM codec
+     * ({@code "gzip"} or {@code "structural"}). Pass {@code null} to use the
+     * production default.
+     */
+    Map<String, String> catalogProperties(String warehouseLocation, String codec) {
       Map<String, String> props = new HashMap<>();
       props.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
       props.put("fileio.catalog.inline", String.valueOf(inlineTM));
       props.put("fileio.catalog.inline.manifests", String.valueOf(inlineML));
+      if (codec != null) {
+        props.put("fileio.catalog.inline.tm.codec", codec);
+      }
       return props;
     }
   }
@@ -710,9 +723,10 @@ public class TestInlineManifestEndToEnd {
         b.addNamespace(e.getKey(), e.getValue().parentId,
             e.getValue().name, e.getValue().version);
       }
-      // Keep inline metadata (with inline:// sentinel) but NO pool
+      // Keep inline metadata (with inline:// sentinel) but NO pool. Preserve
+      // the original codec so the bytes round-trip through encode + decode.
       b.addInlineTable(tblId, tblEntry.namespaceId, tblEntry.name,
-          tblEntry.version, inlineMeta, prefix);
+          tblEntry.version, inlineMeta, original.inlineMetadataCodec(tblId), prefix);
       b.setNextNamespaceId(original.nextNamespaceId());
       b.setNextTableId(original.nextTableId());
       ProtoCatalogFile poisoned = b.build();
@@ -766,14 +780,16 @@ public class TestInlineManifestEndToEnd {
       Table tbl = catalog.loadTable(TBL);
       tbl.newFastAppend().appendFile(FILE_A).commit();
 
-      // Read the inline TableMetadata that the catalog wrote for S1.
+      // Read the inline TableMetadata that the catalog wrote for S1, using
+      // the codec recorded on the proto record to decode the bytes.
       ProtoCatalogFormat fmt = new ProtoCatalogFormat();
       ProtoCatalogFile original = (ProtoCatalogFile) fmt.read(
           io, io.newInputFile("mem:///warehouse/catalog"));
       Integer tblIdNum = original.tableId(TBL);
       byte[] inlineMeta = original.inlineMetadata(tblIdNum);
-      org.apache.iceberg.TableMetadata parsed = org.apache.iceberg.TableMetadataParser
-          .fromJson(new String(inlineMeta, StandardCharsets.UTF_8));
+      InlineMetadataCodec inlineCodec =
+          InlineMetadataCodecs.byTag(original.inlineMetadataCodec(tblIdNum));
+      org.apache.iceberg.TableMetadata parsed = inlineCodec.decodeFull(inlineMeta, null);
       org.apache.iceberg.Snapshot s1 = parsed.currentSnapshot();
 
       // Hand-build a pointer-mode S2 (manifest-list points at a fake Avro path
@@ -795,12 +811,12 @@ public class TestInlineManifestEndToEnd {
           org.apache.iceberg.TableMetadata.buildFrom(parsed)
               .setBranchSnapshot(s2, "main")
               .build();
-      byte[] mixedJson = org.apache.iceberg.TableMetadataParser.toJson(mixed)
-          .getBytes(StandardCharsets.UTF_8);
+      byte[] mixedBytes = inlineCodec.encode(mixed);
 
       // Replace the inline TM bytes via the standard catalog mutation path
-      // (preserves pool entries for S1).
-      fmt.from(original).updateTableInline(TBL, mixedJson).commit(io);
+      // (preserves pool entries for S1). Use the same codec the table was
+      // already encoded with.
+      fmt.from(original).updateTableInline(TBL, mixedBytes, inlineCodec.tag()).commit(io);
 
       // Default (lenient) reload: warn but succeed.
       FileIOCatalog lenient = reloadCatalog();
@@ -1084,6 +1100,108 @@ public class TestInlineManifestEndToEnd {
       assertThat(current.snapshotId()).isNotEqualTo(preRewriteSnapId);
       // rewriteManifests typically compacts to fewer manifests
       assertThat(current.allManifests(io)).isNotEmpty();
+    }
+  }
+
+  // ============================================================
+  // Codec axis: end-to-end create → append → reload under each
+  // configured inline-TM codec. The default-codec path (= structural)
+  // is already covered in TmOnlyTests / TmMlTests above; this nested
+  // block adds explicit gzip and structural runs so we know both wire
+  // formats round-trip through the live catalog.
+  // ============================================================
+
+  @Nested
+  class CodecAxisTests {
+
+    @org.junit.jupiter.params.ParameterizedTest(name = "tm_only / codec={0}")
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"gzip", "structural"})
+    void tmOnlyCreateAndAppendRoundTrips(String codecName) {
+      runCreateAndAppendRoundTrip(InlineConfig.TM_ONLY, codecName);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest(name = "tm_ml / codec={0}")
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"gzip", "structural"})
+    void tmMlCreateAndAppendRoundTrips(String codecName) {
+      runCreateAndAppendRoundTrip(InlineConfig.TM_ML, codecName);
+    }
+
+    /**
+     * Schema/spec evolution must round-trip through inline-TM encode + decode
+     * for both codecs. Catches structural-codec regressions on schema-id RLE
+     * and partition-spec churn paths.
+     */
+    @org.junit.jupiter.params.ParameterizedTest(name = "tm_only / codec={0}")
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"gzip", "structural"})
+    void schemaEvolutionRoundTrips(String codecName) {
+      MemoryFileIO io = new MemoryFileIO();
+      String wh = "mem:///warehouse-codec-evol-" + codecName;
+      Map<String, String> props = InlineConfig.TM_ONLY.catalogProperties(wh, codecName);
+      FileIOCatalog catalog = new FileIOCatalog(
+          "test", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      catalog.initialize("test", props);
+
+      catalog.createNamespace(Namespace.of("db"));
+      catalog.buildTable(TBL, TEST_SCHEMA).create();
+
+      Table tbl = catalog.loadTable(TBL);
+      tbl.newFastAppend().appendFile(FILE_A).commit();
+      // Schema evolution: add a new column.
+      tbl.updateSchema().addColumn("ts",
+          org.apache.iceberg.types.Types.TimestampType.withoutZone()).commit();
+
+      FileIOCatalog fresh = new FileIOCatalog(
+          "test2", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      fresh.initialize("test2", props);
+      Table reloaded = fresh.loadTable(TBL);
+      assertThat(reloaded.schema().findField("ts"))
+          .as("evolved schema must survive reload under codec=%s", codecName)
+          .isNotNull();
+      assertThat(reloaded.currentSnapshot()).isNotNull();
+      assertThat(reloaded.snapshots()).hasSize(1);
+
+      // Verify the inlined record on disk records the codec we asked for.
+      ProtoCatalogFile decoded = (ProtoCatalogFile) new ProtoCatalogFormat()
+          .read(io, io.newInputFile(wh + "/catalog"));
+      Integer tblId = decoded.tableId(TBL);
+      byte expectedTag = InlineMetadataCodecs.byShortName(codecName).tag();
+      assertThat(decoded.inlineMetadataCodec(tblId))
+          .as("on-disk codec tag must match configured codec=%s", codecName)
+          .isEqualTo(expectedTag);
+    }
+
+    private void runCreateAndAppendRoundTrip(InlineConfig config, String codecName) {
+      MemoryFileIO io = new MemoryFileIO();
+      String wh = "mem:///warehouse-codec-" + config.name() + "-" + codecName;
+      Map<String, String> props = config.catalogProperties(wh, codecName);
+      FileIOCatalog catalog = new FileIOCatalog(
+          "test", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      catalog.initialize("test", props);
+
+      catalog.createNamespace(Namespace.of("db"));
+      catalog.buildTable(TBL, TEST_SCHEMA).create();
+      Table tbl = catalog.loadTable(TBL);
+      tbl.newFastAppend().appendFile(FILE_A).commit();
+      tbl.newFastAppend().appendFile(FILE_B).commit();
+
+      // Reload through a fresh catalog (forces checkpoint+log replay).
+      FileIOCatalog fresh = new FileIOCatalog(
+          "test2", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      fresh.initialize("test2", props);
+      Table reloaded = fresh.loadTable(TBL);
+      assertThat(reloaded.snapshots()).hasSize(2);
+      assertThat(reloaded.currentSnapshot()).isNotNull();
+      assertThat(reloaded.currentSnapshot().allManifests(io)).isNotEmpty();
+
+      // Verify the on-wire codec discriminator matches what we configured.
+      ProtoCatalogFile decoded = (ProtoCatalogFile) new ProtoCatalogFormat()
+          .read(io, io.newInputFile(wh + "/catalog"));
+      Integer tblId = decoded.tableId(TBL);
+      byte expectedTag = InlineMetadataCodecs.byShortName(codecName).tag();
+      assertThat(decoded.inlineMetadataCodec(tblId))
+          .as("on-disk codec tag must match configured codec=%s on %s",
+              codecName, config)
+          .isEqualTo(expectedTag);
     }
   }
 }

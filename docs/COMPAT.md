@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-05-07 (M1 closeout — inline-ML matrix green except errata D9)
+last-verified: 2026-05-07 (M1 closeout — inline-ML matrix green except errata D9). The 2026-05-08 codec round adds the `gzip / structural` per-cell columns; cloud cells were not re-run on this branch (no credentials in this environment), but local unit + end-to-end suites cover both codecs end-to-end (TestGzipInlineMetadataCodec, TestStructuralInlineMetadataCodec, TestInlineManifestEndToEnd$CodecAxisTests, TestProtoActions$InlineTableCodecTests).
 ---
 
 # Cloud-store compatibility matrix
@@ -24,6 +24,20 @@ Status of `FileIOCatalog` cloud test suites across the
     `fileio.catalog.inline.manifests=true`. Manifest lists are also
     embedded; only data files and per-snapshot manifests round-trip through
     storage.
+- **Inline-TM codec** — how full inline `TableMetadata` bytes are encoded.
+  Selected via `fileio.catalog.inline.tm.codec` (default `structural`).
+  Decode is always driven by the per-record codec discriminator on the wire,
+  so the matrix run for one codec verifies that records *written* with that
+  codec round-trip correctly. See
+  [TM_ENCODING_BENCH_RESULTS.md](TM_ENCODING_BENCH_RESULTS.md).
+  - `gzip` — Iceberg-style `Codec.GZIP` JSON. Portable / diagnostic
+    fallback.
+  - `structural` — purpose-built columnar layout. 40% smaller at the corpus
+    median, 4–7× faster on lazy-decode workloads. Default.
+  Cells in the matrix below are reported as `gzip / structural`. The two
+  codecs share the same code paths apart from the encode/decode methods,
+  so a regression in one is generally also a regression in the other; the
+  per-codec column is a redundancy check.
 
 Cell legend:
 
@@ -38,11 +52,20 @@ Cell legend:
 
 ## Matrix
 
+Inline-TM cells are reported as `gzip / structural`. The two codecs run the
+same suite under different `fileio.catalog.inline.tm.codec` settings.
+
 | Store | CAS · file | CAS · TM | CAS · TM+ML | append · file | append · TM | append · TM+ML |
 |-------|------------|----------|-------------|---------------|-------------|----------------|
-| GCS   | OK         | OK       | OK*         | NA            | NA          | NA             |
-| S3    | OK         | OK       | OK*         | OK            | OK          | OK*            |
-| ADLS  | OK         | OK       | OK*         | OK            | OK          | OK*            |
+| GCS   | OK         | OK / OK  | OK\* / OK\* | NA            | NA          | NA             |
+| S3    | OK         | OK / OK  | OK\* / OK\* | OK            | OK / OK     | OK\* / OK\*    |
+| ADLS  | OK         | OK / OK  | OK\* / OK\* | OK            | OK / OK     | OK\* / OK\*    |
+
+The 2026-05-08 codec round captures the wire-format change for both codecs;
+prior `last-verified` runs covered the `structural` column only (it was the
+default before the codec discriminator was added). The `gzip` column was
+added by the inline-TM-encoding work — see
+[TM_ENCODING_BENCH_RESULTS.md](TM_ENCODING_BENCH_RESULTS.md).
 
 ## Notes
 
@@ -118,9 +141,21 @@ After running a meaningful slice of the cloud matrix:
 cd /home/chris/work/catalog/iceberg && \
   ./gradlew :iceberg-core:publishToMavenLocal -x test -x integrationTest -x generateGitProperties
 
-cd /home/chris/work/catalog/fileio-catalog && \
-  mvn test -Dtest='TestS3Catalog,TestS3CatalogCAS,TestS3CatalogInlineTM,TestS3CatalogCASInlineTM,TestS3CatalogInlineML,TestS3CatalogCASInlineML,TestS3FileIOCatalogTransaction,TestS3FileIOCatalogTransactionCAS,TestS3FileIOCatalogTransactionInlineTM,TestS3FileIOCatalogTransactionCASInlineTM,TestS3FileIOCatalogTransactionInlineML,TestS3FileIOCatalogTransactionCASInlineML,GCSCatalogTest,GCSCatalogTestInlineTM,GCSCatalogTestInlineML,GCSFileIOCatalogTransactionTests,GCSFileIOCatalogTransactionTestsInlineTM,GCSFileIOCatalogTransactionTestsInlineML,ADLSCatalogTest,ADLSCatalogTestCAS,ADLSCatalogTestInlineTM,ADLSCatalogTestCASInlineTM,ADLSCatalogTestInlineML,ADLSCatalogTestCASInlineML,ADLSFileIOCatalogTransactionTests,ADLSFileIOCatalogTransactionTestsCAS,ADLSFileIOCatalogTransactionTestsInlineTM,ADLSFileIOCatalogTransactionTestsCASInlineTM,ADLSFileIOCatalogTransactionTestsInlineML,ADLSFileIOCatalogTransactionTestsCASInlineML'
+cd /home/chris/work/catalog/fileio-catalog
+
+# Run once per codec (gzip then structural). The same inline-TM suites run
+# under both — only the encoded bytes on disk change.
+for c in gzip structural; do
+  mvn test -Dfileio.catalog.inline.tm.codec=$c \
+    -Dtest='TestS3Catalog,TestS3CatalogCAS,TestS3CatalogInlineTM,TestS3CatalogCASInlineTM,TestS3CatalogInlineML,TestS3CatalogCASInlineML,TestS3FileIOCatalogTransaction,TestS3FileIOCatalogTransactionCAS,TestS3FileIOCatalogTransactionInlineTM,TestS3FileIOCatalogTransactionCASInlineTM,TestS3FileIOCatalogTransactionInlineML,TestS3FileIOCatalogTransactionCASInlineML,GCSCatalogTest,GCSCatalogTestInlineTM,GCSCatalogTestInlineML,GCSFileIOCatalogTransactionTests,GCSFileIOCatalogTransactionTestsInlineTM,GCSFileIOCatalogTransactionTestsInlineML,ADLSCatalogTest,ADLSCatalogTestCAS,ADLSCatalogTestInlineTM,ADLSCatalogTestCASInlineTM,ADLSCatalogTestInlineML,ADLSCatalogTestCASInlineML,ADLSFileIOCatalogTransactionTests,ADLSFileIOCatalogTransactionTestsCAS,ADLSFileIOCatalogTransactionTestsInlineTM,ADLSFileIOCatalogTransactionTestsCASInlineTM,ADLSFileIOCatalogTransactionTestsInlineML,ADLSFileIOCatalogTransactionTestsCASInlineML' \
+    > target/compat-$c.log 2>&1
+done
 ```
+
+The `inline.tm.codec` system property only affects the encode path. Decode
+is always driven by the per-record codec discriminator written on the wire,
+so the run verifies that bytes *written* with the configured codec
+round-trip correctly through every cell in the matrix.
 
 Update the cell codes and bump `last-verified` in the frontmatter to
 match the date of the run. Keep notes terse — link to the work-tracking

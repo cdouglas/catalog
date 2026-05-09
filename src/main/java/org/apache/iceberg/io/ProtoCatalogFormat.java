@@ -468,6 +468,8 @@ public class ProtoCatalogFormat
       for (Map.Entry<TableIdentifier, byte[]> entry : inlineTables.entrySet()) {
         TableIdentifier ident = entry.getKey();
         byte[] metadata = entry.getValue();
+        Byte codecTag = inlineTableCodecs.get(ident);
+        byte codec = codecTag != null ? codecTag : InlineMetadataCodecs.TAG_JSON_GZIP;
         Namespace ns = ident.namespace();
 
         Integer nsId = original.namespaceId(ns);
@@ -480,18 +482,20 @@ public class ProtoCatalogFormat
 
         int tblId = idManager.allocateTblid();
         actions.add(new ProtoCodec.CreateTableInlineAction(
-            tblId, 1, nsId, nsVersion, ident.name(), metadata));
+            tblId, 1, nsId, nsVersion, ident.name(), metadata, codec));
       }
 
       // Process inline table updates (full mode)
       for (Map.Entry<TableIdentifier, byte[]> entry : inlineTableUpdates.entrySet()) {
         TableIdentifier ident = entry.getKey();
         byte[] metadata = entry.getValue();
+        Byte codecTag = inlineTableUpdateCodecs.get(ident);
+        byte codec = codecTag != null ? codecTag : InlineMetadataCodecs.TAG_JSON_GZIP;
         Integer tblId = original.tableId(ident);
         if (tblId != null) {
           int version = original.tableVersion(tblId);
-          actions.add(new ProtoCodec.UpdateTableInlineAction(
-              tblId, version, metadata, null));
+          actions.add(ProtoCodec.UpdateTableInlineAction.full(
+              tblId, version, metadata, codec));
         }
       }
 

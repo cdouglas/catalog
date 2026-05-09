@@ -38,7 +38,6 @@ import org.apache.iceberg.SchemaParser;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.SortOrderParser;
 import org.apache.iceberg.TableMetadata;
-import org.apache.iceberg.TableMetadataParser;
 import org.apache.iceberg.PartitionSpecParser;
 import org.apache.iceberg.InlineDeltaSnapshots;
 import org.apache.iceberg.Snapshot;
@@ -169,8 +168,15 @@ public class InlineDeltaCodec {
   // Public API
   // ============================================================
 
-  /** Applies a delta (encoded bytes) to base metadata, returns updated metadata bytes. */
-  public static byte[] applyDelta(byte[] baseMetadataJson, byte[] deltaBytes) {
+  /**
+   * Applies a delta (encoded bytes) to a codec-encoded base TableMetadata blob,
+   * returning the updated bytes encoded with the same codec.
+   *
+   * <p>Delta mode preserves the on-disk codec — codec changes only happen via
+   * full re-inline (CreateTableInline / UpdateTableInline.full_metadata).
+   */
+  public static byte[] applyDelta(
+      byte[] baseMetadataBytes, InlineMetadataCodec baseCodec, byte[] deltaBytes) {
     // Synthesize a deterministic metadata-file location for the parsed base so the
     // rebuilt TM's `previousFiles()` history accumulates an entry for the prior
     // version. The exact format isn't load-bearing — `inline://` URIs are opaque
@@ -179,12 +185,11 @@ public class InlineDeltaCodec {
     // metadata-log entries, which `MetadataLogEntry` deduplicates by file+timestamp
     // anyway).
     String syntheticLoc =
-        "inline://#" + Integer.toHexString(Arrays.hashCode(baseMetadataJson));
-    TableMetadata base = TableMetadataParser.fromJson(
-        syntheticLoc, new String(baseMetadataJson, StandardCharsets.UTF_8));
+        "inline://#" + Integer.toHexString(Arrays.hashCode(baseMetadataBytes));
+    TableMetadata base = baseCodec.decodeFull(baseMetadataBytes, syntheticLoc);
     DecodedDelta decoded = decodeDelta(deltaBytes);
     TableMetadata result = applyUpdates(base, decoded.updates, decoded.lastUpdatedMillis);
-    return TableMetadataParser.toJson(result).getBytes(StandardCharsets.UTF_8);
+    return baseCodec.encode(result);
   }
 
   /**
@@ -203,15 +208,14 @@ public class InlineDeltaCodec {
    * in this order; custom callers must maintain it.
    */
   public static byte[] applyDeltaWithManifests(
-      byte[] baseMetadataJson, byte[] deltaBytes,
+      byte[] baseMetadataBytes, InlineMetadataCodec baseCodec, byte[] deltaBytes,
       ProtoCatalogFile.Builder catalogBuilder, int tableId) {
     // Synthetic metadata-file location for the parsed base — see applyDelta()
     // for the rationale. The string is opaque to FileIO; it only flows into
     // `previousFiles()` as a metadata-log entry.
     String syntheticLoc =
-        "inline://#" + Integer.toHexString(Arrays.hashCode(baseMetadataJson));
-    TableMetadata base = TableMetadataParser.fromJson(
-        syntheticLoc, new String(baseMetadataJson, StandardCharsets.UTF_8));
+        "inline://#" + Integer.toHexString(Arrays.hashCode(baseMetadataBytes));
+    TableMetadata base = baseCodec.decodeFull(baseMetadataBytes, syntheticLoc);
     DecodedDelta decoded = decodeDelta(deltaBytes);
     List<DeltaUpdate> updates = decoded.updates;
     // Pin the writer's last-updated-ms on every Builder pass before applyTo,
@@ -327,7 +331,7 @@ public class InlineDeltaCodec {
         current = tmBuilder.discardChanges().build();
       }
     }
-    return TableMetadataParser.toJson(current).getBytes(StandardCharsets.UTF_8);
+    return baseCodec.encode(current);
   }
 
   /**
@@ -710,20 +714,23 @@ public class InlineDeltaCodec {
   }
 
   /**
-   * Selects the delivery mode for an inline table update.
+   * Selects the delivery mode for an inline table update. {@code fullCodec} is
+   * the codec the caller will use for FULL mode; we encode through it to get
+   * an accurate fits-or-not check against {@link #APPEND_LIMIT}.
    *
    * @return "delta" if delta fits, "full" if full metadata fits, "pointer" otherwise
    */
   public static String selectMode(
-      List<DeltaUpdate> delta, TableMetadata newMeta, int currentTxnSize) {
+      List<DeltaUpdate> delta, TableMetadata newMeta, int currentTxnSize,
+      InlineMetadataCodec fullCodec) {
     if (delta != null) {
       byte[] deltaBytes = encodeDelta(delta, newMeta.lastUpdatedMillis());
       if (currentTxnSize + deltaBytes.length <= APPEND_LIMIT) {
         return "delta";
       }
     }
-    String fullJson = TableMetadataParser.toJson(newMeta);
-    if (currentTxnSize + fullJson.length() <= APPEND_LIMIT) {
+    int fullSize = fullCodec.encode(newMeta).length;
+    if (currentTxnSize + fullSize <= APPEND_LIMIT) {
       return "full";
     }
     return "pointer";

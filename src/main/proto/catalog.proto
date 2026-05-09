@@ -103,15 +103,29 @@ message NamespaceProperty {
   string value = 3;
 }
 
+// Codec used to encode the bytes of a full TableMetadata when it is stored
+// inline in the catalog file (CreateTableInline.metadata, the
+// UpdateTableInline.full_metadata oneof case, and InlineTable.metadata in the
+// checkpoint). The default value (CODEC_JSON_GZIP, 0) is the portable
+// fallback: Iceberg's TableMetadataParser.Codec.GZIP. CODEC_STRUCTURAL is the
+// structural columnar layout described in
+// docs/TM_ENCODING_BENCH_RESULTS.md; its byte stream begins with a varint
+// format-version so the layout itself can evolve without proto churn.
+enum InlineMetadataCodec {
+  CODEC_JSON_GZIP   = 0;
+  CODEC_STRUCTURAL  = 1;
+}
+
 message InlineTable {
   int32  id                   = 1;
   int32  version              = 2;
   int32  namespace_id         = 3;
   string name                 = 4;
-  bytes  metadata             = 5;  // TableMetadata as JSON bytes
+  bytes  metadata             = 5;  // encoded TableMetadata bytes; see metadata_codec
   string manifest_list_prefix = 6;  // per-table dictionary: shared manifest file path prefix
   repeated ManifestFileEntry manifest_pool       = 7;  // unique manifests for this table
   repeated SnapshotManifestRefs snapshot_refs    = 8;  // per-snapshot index lists into pool
+  InlineMetadataCodec metadata_codec             = 9;  // codec for `metadata`
 }
 
 // ============================================================
@@ -203,7 +217,8 @@ message CreateTableInline {
   int32  namespace_id      = 3;
   int32  namespace_version = 4;   // -1 if late-bound
   string name              = 5;
-  bytes  metadata          = 6;   // full TableMetadata as JSON bytes
+  bytes  metadata          = 6;   // encoded TableMetadata bytes; see metadata_codec
+  InlineMetadataCodec metadata_codec = 7;  // codec for `metadata`
 }
 
 message UpdateTableInline {
@@ -212,9 +227,12 @@ message UpdateTableInline {
 
   oneof payload {
     TableMetadataDelta delta = 3;   // structured metadata changes
-    bytes  full_metadata     = 4;   // full TableMetadata JSON (re-inline)
+    bytes  full_metadata     = 4;   // encoded TableMetadata; see full_metadata_codec
     string metadata_location = 5;   // pointer fallback (eviction)
   }
+  // Codec for `full_metadata`. Only meaningful when the oneof is set to
+  // full_metadata; ignored otherwise.
+  InlineMetadataCodec full_metadata_codec = 6;
 }
 
 // ============================================================

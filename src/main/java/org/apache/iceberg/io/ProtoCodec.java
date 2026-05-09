@@ -104,6 +104,7 @@ public class ProtoCodec {
   private static final int INLINE_TBL_MANIFEST_PREFIX = 6;
   private static final int INLINE_TBL_MANIFEST_POOL = 7;
   private static final int INLINE_TBL_SNAPSHOT_REFS = 8;
+  private static final int INLINE_TBL_METADATA_CODEC = 9;
 
   // ManifestFileEntry field numbers
   private static final int MF_PATH_SUFFIX = 1;
@@ -200,6 +201,8 @@ public class ProtoCodec {
   private static final int UPDATE_INLINE_DELTA = 3;
   private static final int UPDATE_INLINE_FULL_METADATA = 4;
   private static final int UPDATE_INLINE_METADATA_LOCATION = 5;
+  // Codec for full_metadata bytes; ignored in delta / pointer modes.
+  private static final int UPDATE_INLINE_FULL_METADATA_CODEC = 6;
 
   // CreateTableInline field numbers
   private static final int CREATE_INLINE_TBL_ID = 1;
@@ -208,6 +211,7 @@ public class ProtoCodec {
   private static final int CREATE_INLINE_TBL_NS_VERSION = 4;
   private static final int CREATE_INLINE_TBL_NAME = 5;
   private static final int CREATE_INLINE_TBL_METADATA = 6;
+  private static final int CREATE_INLINE_TBL_METADATA_CODEC = 7;
 
   // RenameTable field numbers
   private static final int RENAME_TBL_ID = 1;
@@ -285,8 +289,9 @@ public class ProtoCodec {
           String prefix = original.allManifestPrefixes().getOrDefault(tblId, "");
           Map<String, ManifestFile> pool = original.manifestPool(tblId);
           Map<Long, List<String>> snapRefs = original.snapshotManifests(tblId);
+          byte codecTag = original.inlineMetadataCodec(tblId);
           byte[] inlineBytes = encodeInlineTable(
-              tblId, tblEntry, inlineEntry.getValue(), prefix, pool, snapRefs);
+              tblId, tblEntry, inlineEntry.getValue(), codecTag, prefix, pool, snapRefs);
           writeLengthDelimited(out, CHECKPOINT_INLINE_TABLES, inlineBytes);
         }
       }
@@ -904,7 +909,8 @@ public class ProtoCodec {
   }
 
   private static byte[] encodeInlineTable(
-      int id, ProtoCatalogFile.TblEntry entry, byte[] metadata, String manifestPrefix,
+      int id, ProtoCatalogFile.TblEntry entry, byte[] metadata, byte metadataCodec,
+      String manifestPrefix,
       Map<String, ManifestFile> pool, Map<Long, List<String>> snapRefs)
       throws IOException {
     ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -914,6 +920,11 @@ public class ProtoCodec {
     writeString(out, INLINE_TBL_NAME, entry.name);
     writeBytes(out, INLINE_TBL_METADATA, metadata);
     writeString(out, INLINE_TBL_MANIFEST_PREFIX, manifestPrefix);
+    // Omit the field on the default value (CODEC_JSON_GZIP = 0) to keep wire
+    // bytes tight; decoders default unset to TAG_JSON_GZIP.
+    if (metadataCodec != InlineMetadataCodecs.TAG_JSON_GZIP) {
+      writeVarint(out, INLINE_TBL_METADATA_CODEC, metadataCodec & 0xFF);
+    }
 
     // Manifest pool (field 7): encode each unique ManifestFile entry
     if (pool != null && !pool.isEmpty()) {
@@ -960,6 +971,7 @@ public class ProtoCodec {
     int id = 0, version = 0, nsId = 0;
     String name = "", manifestPrefix = "";
     byte[] metadata = new byte[0];
+    byte metadataCodec = InlineMetadataCodecs.TAG_JSON_GZIP;
     List<byte[]> poolEntryBytes = new ArrayList<>();
     List<byte[]> snapRefBytes = new ArrayList<>();
 
@@ -991,11 +1003,14 @@ public class ProtoCodec {
         case INLINE_TBL_SNAPSHOT_REFS:
           snapRefBytes.add(readLengthDelimitedBytes(in));
           break;
+        case INLINE_TBL_METADATA_CODEC:
+          metadataCodec = (byte) readVarint(in);
+          break;
         default:
           skipField(in, tag & 0x7);
       }
     }
-    builder.addInlineTable(id, nsId, name, version, metadata, manifestPrefix);
+    builder.addInlineTable(id, nsId, name, version, metadata, metadataCodec, manifestPrefix);
 
     // Decode manifest pool (positional array) -> path-keyed map
     if (!poolEntryBytes.isEmpty()) {
@@ -1172,6 +1187,10 @@ public class ProtoCodec {
         writeBytes(inner, UPDATE_INLINE_DELTA, a.deltaBytes);
       } else if (a.fullMetadata != null) {
         writeBytes(inner, UPDATE_INLINE_FULL_METADATA, a.fullMetadata);
+        // Codec only meaningful when full_metadata is set; omit on default.
+        if (a.fullMetadataCodec != InlineMetadataCodecs.TAG_JSON_GZIP) {
+          writeVarint(inner, UPDATE_INLINE_FULL_METADATA_CODEC, a.fullMetadataCodec & 0xFF);
+        }
       } else if (a.metadataLocation != null) {
         writeString(inner, UPDATE_INLINE_METADATA_LOCATION, a.metadataLocation);
       }
@@ -1185,6 +1204,9 @@ public class ProtoCodec {
       writeVarint(inner, CREATE_INLINE_TBL_NS_VERSION, a.namespaceVersion);
       writeString(inner, CREATE_INLINE_TBL_NAME, a.name);
       writeBytes(inner, CREATE_INLINE_TBL_METADATA, a.metadata);
+      if (a.metadataCodec != InlineMetadataCodecs.TAG_JSON_GZIP) {
+        writeVarint(inner, CREATE_INLINE_TBL_METADATA_CODEC, a.metadataCodec & 0xFF);
+      }
       writeLengthDelimited(out, ACTION_CREATE_TABLE_INLINE, inner.toByteArray());
     } else if (action instanceof RenameTableAction) {
       RenameTableAction a = (RenameTableAction) action;
@@ -1444,6 +1466,7 @@ public class ProtoCodec {
     int id = 0, version = 0, nsId = 0, nsVersion = 0;
     String name = "";
     byte[] metadata = new byte[0];
+    byte metadataCodec = InlineMetadataCodecs.TAG_JSON_GZIP;
 
     while (in.available() > 0) {
       int tag = readVarint(in);
@@ -1467,11 +1490,15 @@ public class ProtoCodec {
         case CREATE_INLINE_TBL_METADATA:
           metadata = readLengthDelimitedBytes(in);
           break;
+        case CREATE_INLINE_TBL_METADATA_CODEC:
+          metadataCodec = (byte) readVarint(in);
+          break;
         default:
           skipField(in, tag & 0x7);
       }
     }
-    return new CreateTableInlineAction(id, version, nsId, nsVersion, name, metadata);
+    return new CreateTableInlineAction(
+        id, version, nsId, nsVersion, name, metadata, metadataCodec);
   }
 
   private static UpdateTableInlineAction decodeUpdateTableInline(byte[] bytes) throws IOException {
@@ -1480,6 +1507,7 @@ public class ProtoCodec {
     byte[] deltaBytes = null;
     byte[] fullMetadata = null;
     String metadataLocation = null;
+    byte fullMetadataCodec = InlineMetadataCodecs.TAG_JSON_GZIP;
 
     while (in.available() > 0) {
       int tag = readVarint(in);
@@ -1500,11 +1528,15 @@ public class ProtoCodec {
         case UPDATE_INLINE_METADATA_LOCATION:
           metadataLocation = readString(in);
           break;
+        case UPDATE_INLINE_FULL_METADATA_CODEC:
+          fullMetadataCodec = (byte) readVarint(in);
+          break;
         default:
           skipField(in, tag & 0x7);
       }
     }
-    return new UpdateTableInlineAction(id, version, deltaBytes, fullMetadata, metadataLocation);
+    return new UpdateTableInlineAction(
+        id, version, deltaBytes, fullMetadata, fullMetadataCodec, metadataLocation);
   }
 
   private static RenameTableAction decodeRenameTable(byte[] bytes) throws IOException {
@@ -2310,25 +2342,57 @@ public class ProtoCodec {
     final int version;
     final byte[] deltaBytes;         // non-null for DELTA mode
     final byte[] fullMetadata;       // non-null for FULL mode
+    /** Codec for {@link #fullMetadata}. Ignored for DELTA / POINTER modes. */
+    final byte fullMetadataCodec;
     final String metadataLocation;   // non-null for POINTER mode
 
     public UpdateTableInlineAction(
+        int id, int version, byte[] fullMetadata, byte fullMetadataCodec,
+        String metadataLocation) {
+      this(id, version, null, fullMetadata, fullMetadataCodec, metadataLocation);
+    }
+
+    /** Back-compat 4-arg constructor: defaults full-metadata codec to gzip. */
+    public UpdateTableInlineAction(
         int id, int version, byte[] fullMetadata, String metadataLocation) {
-      this(id, version, null, fullMetadata, metadataLocation);
+      this(id, version, null, fullMetadata,
+          InlineMetadataCodecs.TAG_JSON_GZIP, metadataLocation);
+    }
+
+    /**
+     * Convenience constructor that defaults the full-metadata codec to
+     * {@link InlineMetadataCodecs#TAG_JSON_GZIP}. Used by tests and decode
+     * paths that haven't observed a codec field yet.
+     */
+    public UpdateTableInlineAction(
+        int id, int version, byte[] deltaBytes, byte[] fullMetadata, String metadataLocation) {
+      this(id, version, deltaBytes, fullMetadata,
+          InlineMetadataCodecs.TAG_JSON_GZIP, metadataLocation);
     }
 
     public UpdateTableInlineAction(
-        int id, int version, byte[] deltaBytes, byte[] fullMetadata, String metadataLocation) {
+        int id, int version, byte[] deltaBytes, byte[] fullMetadata,
+        byte fullMetadataCodec, String metadataLocation) {
       this.id = id;
       this.version = version;
       this.deltaBytes = deltaBytes;
       this.fullMetadata = fullMetadata;
+      this.fullMetadataCodec = fullMetadataCodec;
       this.metadataLocation = metadataLocation;
     }
 
     /** Creates an UpdateTableInlineAction in DELTA mode. */
     public static UpdateTableInlineAction delta(int id, int version, byte[] deltaBytes) {
-      return new UpdateTableInlineAction(id, version, deltaBytes, null, null);
+      return new UpdateTableInlineAction(
+          id, version, deltaBytes, null,
+          InlineMetadataCodecs.TAG_JSON_GZIP, null);
+    }
+
+    /** Creates an UpdateTableInlineAction in FULL mode with an explicit codec. */
+    public static UpdateTableInlineAction full(
+        int id, int version, byte[] fullMetadata, byte fullMetadataCodec) {
+      return new UpdateTableInlineAction(
+          id, version, null, fullMetadata, fullMetadataCodec, null);
     }
 
     @Override
@@ -2341,21 +2405,20 @@ public class ProtoCodec {
     public void apply(ProtoCatalogFile.Builder builder) {
       if (deltaBytes != null) {
         // DELTA mode: apply structured changes to current inline metadata.
-        // Uses applyDeltaWithManifests to route ML updates (AddManifestUpdate,
-        // RemoveManifestUpdate) to the catalog builder's manifest pool, and
-        // AddSnapshotUpdate through the prefix-accepting overload.
+        // Decode base, apply delta, re-encode with the SAME codec the base
+        // used (delta mode preserves the on-disk codec — codec changes only
+        // happen via FULL re-inline).
         byte[] currentMeta = builder.inlineMetadata(id);
         if (currentMeta != null) {
-          // Save prefix before removeInlineMetadata clears it
-          String prefix = builder.manifestListPrefix(id) != null
-              ? builder.manifestListPrefix(id) : "";
+          byte baseCodecTag = builder.inlineMetadataCodec(id);
+          InlineMetadataCodec baseCodec = InlineMetadataCodecs.byTag(baseCodecTag);
           // Apply delta — routes ML updates to builder's manifest pool
           byte[] updatedMeta = InlineDeltaCodec.applyDeltaWithManifests(
-              currentMeta, deltaBytes, builder, id);
+              currentMeta, baseCodec, deltaBytes, builder, id);
           // Rotate the inline metadata without clearing manifest pool/refs.
           ProtoCatalogFile.TblEntry old = builder.tableEntry(id);
           if (old != null) {
-            builder.updateInlineMetadata(id, version + 1, updatedMeta);
+            builder.updateInlineMetadata(id, version + 1, updatedMeta, baseCodecTag);
           }
         }
       } else if (fullMetadata != null) {
@@ -2367,7 +2430,7 @@ public class ProtoCodec {
         // See ML_INLINE_REVIEW2.md §1.1.
         ProtoCatalogFile.TblEntry old = builder.tableEntry(id);
         if (old != null) {
-          builder.updateInlineMetadata(id, version + 1, fullMetadata);
+          builder.updateInlineMetadata(id, version + 1, fullMetadata, fullMetadataCodec);
         }
       } else if (metadataLocation != null) {
         // POINTER mode: evict from inline to pointer
@@ -2388,16 +2451,26 @@ public class ProtoCodec {
     final int namespaceVersion;
     final String name;
     final byte[] metadata;
+    /** Codec used to encode {@link #metadata}. */
+    final byte metadataCodec;
 
     public CreateTableInlineAction(
         int id, int version, int namespaceId, int namespaceVersion,
         String name, byte[] metadata) {
+      this(id, version, namespaceId, namespaceVersion, name, metadata,
+          InlineMetadataCodecs.TAG_JSON_GZIP);
+    }
+
+    public CreateTableInlineAction(
+        int id, int version, int namespaceId, int namespaceVersion,
+        String name, byte[] metadata, byte metadataCodec) {
       this.id = id;
       this.version = version;
       this.namespaceId = namespaceId;
       this.namespaceVersion = namespaceVersion;
       this.name = name;
       this.metadata = metadata;
+      this.metadataCodec = metadataCodec;
     }
 
     @Override
@@ -2415,7 +2488,7 @@ public class ProtoCodec {
     public void apply(ProtoCatalogFile.Builder builder) {
       // manifest list prefix is derived from metadata at checkpoint time;
       // for newly created tables, we default to empty (set later on first snapshot)
-      builder.addInlineTable(id, namespaceId, name, version, metadata, "");
+      builder.addInlineTable(id, namespaceId, name, version, metadata, metadataCodec, "");
       // Adding a table mutates the parent's children set; bump so concurrent
       // ns mutations fail verify. Same rule as CreateTableAction.
       builder.bumpNamespaceVersion(namespaceId);

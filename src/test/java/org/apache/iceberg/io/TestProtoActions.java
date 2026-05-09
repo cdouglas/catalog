@@ -95,7 +95,15 @@ public class TestProtoActions {
     /** Adds an inline table (metadata stored in catalog). Tracks max IDs automatically. */
     CatalogBuilder inlineTbl(
         int id, int nsId, String name, int version, byte[] metadata, String manifestPrefix) {
-      inner.addInlineTable(id, nsId, name, version, metadata, manifestPrefix);
+      return inlineTbl(id, nsId, name, version, metadata,
+          InlineMetadataCodecs.TAG_JSON_GZIP, manifestPrefix);
+    }
+
+    /** Adds an inline table with an explicit codec for the encoded metadata bytes. */
+    CatalogBuilder inlineTbl(
+        int id, int nsId, String name, int version, byte[] metadata, byte codec,
+        String manifestPrefix) {
+      inner.addInlineTable(id, nsId, name, version, metadata, codec, manifestPrefix);
       maxTblId = Math.max(maxTblId, id);
       return this;
     }
@@ -180,10 +188,23 @@ public class TestProtoActions {
     return new ProtoCodec.CreateTableInlineAction(id, version, nsId, nsVersion, name, metadata);
   }
 
+  /** CreateTableInline action with an explicit codec tag. */
+  static ProtoCodec.CreateTableInlineAction createTblInline(
+      int id, int nsId, String name, int version, int nsVersion, byte[] metadata, byte codec) {
+    return new ProtoCodec.CreateTableInlineAction(
+        id, version, nsId, nsVersion, name, metadata, codec);
+  }
+
   /** UpdateTableInline in FULL mode (replace inline metadata). */
   static ProtoCodec.UpdateTableInlineAction updateTblInlineFull(
       int id, int version, byte[] fullMetadata) {
     return new ProtoCodec.UpdateTableInlineAction(id, version, fullMetadata, null);
+  }
+
+  /** UpdateTableInline in FULL mode with an explicit codec tag. */
+  static ProtoCodec.UpdateTableInlineAction updateTblInlineFull(
+      int id, int version, byte[] fullMetadata, byte codec) {
+    return ProtoCodec.UpdateTableInlineAction.full(id, version, fullMetadata, codec);
   }
 
   /** UpdateTableInline in POINTER mode (evict to external file). */
@@ -1478,6 +1499,122 @@ public class TestProtoActions {
       TableIdentifier inline = TableIdentifier.of(Namespace.of("db"), "inline_tbl");
       assertThat(result.location(pointer)).isEqualTo("s3://bucket/pointer/v1");
       assertThat(result.isInlineTable(inline)).isTrue();
+    }
+  }
+
+  // ============================================================
+  // Inline-TM codec round-trip tests
+  // ============================================================
+
+  /**
+   * Codec discriminator must round-trip through encode → wire → decode for
+   * each of the three sites that carry full inline TableMetadata bytes:
+   * CreateTableInlineAction, UpdateTableInlineAction (full mode), and the
+   * checkpoint InlineTable record. Mixed-codec catalogs (table A with one
+   * codec, table B with another) must also round-trip.
+   */
+  @Nested
+  class InlineTableCodecTests {
+
+    @Test
+    void createInlineActionPreservesCodec() {
+      byte[] file = catalog().ns(1, 0, "db", 1).build();
+      byte[] meta = new byte[] {1, 2, 3, 4, 5};
+
+      ProtoCodec.Transaction txn = txn(
+          createTblInline(-1, 1, "tbl", 1, 1, meta, InlineMetadataCodecs.TAG_STRUCTURAL));
+      ProtoCatalogFile result = apply(file, txn);
+
+      Integer id = result.tableId(TableIdentifier.of(Namespace.of("db"), "tbl"));
+      assertThat(id).isNotNull();
+      assertThat(result.inlineMetadata(id)).isEqualTo(meta);
+      assertThat(result.inlineMetadataCodec(id))
+          .isEqualTo(InlineMetadataCodecs.TAG_STRUCTURAL);
+    }
+
+    @Test
+    void updateInlineFullActionPreservesCodec() {
+      byte[] meta0 = new byte[] {0x10, 0x20};
+      byte[] file = catalog()
+          .ns(1, 0, "db", 1)
+          .inlineTbl(1, 1, "tbl", 1, meta0, InlineMetadataCodecs.TAG_JSON_GZIP, "")
+          .build();
+
+      byte[] meta1 = new byte[] {0x30, 0x40, 0x50};
+      ProtoCodec.Transaction txn = txn(
+          updateTblInlineFull(1, 1, meta1, InlineMetadataCodecs.TAG_STRUCTURAL));
+      ProtoCatalogFile result = apply(file, txn);
+
+      Integer id = result.tableId(TableIdentifier.of(Namespace.of("db"), "tbl"));
+      assertThat(result.inlineMetadata(id)).isEqualTo(meta1);
+      assertThat(result.inlineMetadataCodec(id))
+          .as("full-mode update must record the codec on the new inline bytes")
+          .isEqualTo(InlineMetadataCodecs.TAG_STRUCTURAL);
+    }
+
+    @Test
+    void checkpointInlineTablePreservesCodec() {
+      byte[] meta = new byte[] {(byte) 0xAA, (byte) 0xBB};
+      byte[] file = catalog()
+          .ns(1, 0, "db", 1)
+          .inlineTbl(1, 1, "tbl", 1, meta, InlineMetadataCodecs.TAG_STRUCTURAL, "prefix/")
+          .build();
+
+      // Reading the file back exercises the checkpoint encode + decode path.
+      ProtoCatalogFile decoded = decodeFile(file);
+      Integer id = decoded.tableId(TableIdentifier.of(Namespace.of("db"), "tbl"));
+      assertThat(decoded.inlineMetadata(id)).isEqualTo(meta);
+      assertThat(decoded.inlineMetadataCodec(id))
+          .isEqualTo(InlineMetadataCodecs.TAG_STRUCTURAL);
+    }
+
+    @Test
+    void mixedCodecsRoundTrip() {
+      byte[] gzipMeta = new byte[] {1, 2, 3};
+      byte[] structMeta = new byte[] {7, 8, 9, 10};
+      byte[] file = catalog()
+          .ns(1, 0, "db", 1)
+          .inlineTbl(1, 1, "a", 1, gzipMeta, InlineMetadataCodecs.TAG_JSON_GZIP, "")
+          .inlineTbl(2, 1, "b", 1, structMeta, InlineMetadataCodecs.TAG_STRUCTURAL, "")
+          .build();
+
+      ProtoCatalogFile decoded = decodeFile(file);
+      Integer aId = decoded.tableId(TableIdentifier.of(Namespace.of("db"), "a"));
+      Integer bId = decoded.tableId(TableIdentifier.of(Namespace.of("db"), "b"));
+
+      assertThat(decoded.inlineMetadata(aId)).isEqualTo(gzipMeta);
+      assertThat(decoded.inlineMetadataCodec(aId))
+          .isEqualTo(InlineMetadataCodecs.TAG_JSON_GZIP);
+      assertThat(decoded.inlineMetadata(bId)).isEqualTo(structMeta);
+      assertThat(decoded.inlineMetadataCodec(bId))
+          .isEqualTo(InlineMetadataCodecs.TAG_STRUCTURAL);
+    }
+
+    @Test
+    void unsetCodecDecodesAsGzip() {
+      // Default proto3 enum value is 0 = CODEC_JSON_GZIP. The encoder omits
+      // the field when the value matches the default, so a record with no
+      // codec field on the wire must decode as gzip.
+      byte[] meta = new byte[] {0x42};
+      byte[] file = catalog()
+          .ns(1, 0, "db", 1)
+          .inlineTbl(1, 1, "tbl", 1, meta, "")  // no-codec overload → defaults to gzip
+          .build();
+
+      ProtoCatalogFile decoded = decodeFile(file);
+      Integer id = decoded.tableId(TableIdentifier.of(Namespace.of("db"), "tbl"));
+      assertThat(decoded.inlineMetadataCodec(id))
+          .as("missing codec field on the wire must decode as the proto3 default")
+          .isEqualTo(InlineMetadataCodecs.TAG_JSON_GZIP);
+    }
+  }
+
+  /** Decodes a serialized catalog file back to a ProtoCatalogFile. */
+  private static ProtoCatalogFile decodeFile(byte[] file) {
+    try (java.io.ByteArrayInputStream in = new java.io.ByteArrayInputStream(file)) {
+      return ProtoCatalogFormat.readInternal(LOCATION, in, file.length);
+    } catch (java.io.IOException e) {
+      throw new java.io.UncheckedIOException(e);
     }
   }
 

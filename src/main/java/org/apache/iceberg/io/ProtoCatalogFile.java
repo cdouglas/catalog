@@ -58,10 +58,14 @@ public class ProtoCatalogFile extends CatalogFile {
   // Namespace properties: nsId -> (key -> value)
   private final Map<Integer, Map<String, String>> nsProperties;
 
-  // Inline table metadata: tblId -> opaque JSON bytes (TableMetadata)
+  // Inline table metadata: tblId -> opaque encoded bytes (TableMetadata)
   // A table ID appears in either tableById (pointer) or tblInlineMetadata (inline), not both.
   // Inline tables also appear in tableById with metadataLocation = null for lookup purposes.
+  // tblInlineMetadataCodec is parallel to tblInlineMetadata: the codec used to
+  // encode the bytes. Entries default to InlineMetadataCodecs.TAG_JSON_GZIP (0)
+  // when missing.
   private final Map<Integer, byte[]> tblInlineMetadata;
+  private final Map<Integer, Byte> tblInlineMetadataCodec;
   private final Map<Integer, String> tblManifestPrefix;
 
   // Inline manifest list state: per-table pool of unique ManifestFile entries keyed by path,
@@ -91,6 +95,7 @@ public class ProtoCatalogFile extends CatalogFile {
     this.tableLookup = ImmutableMap.copyOf(builder.tableLookup);
     this.nsProperties = deepCopyProperties(builder.nsProperties);
     this.tblInlineMetadata = ImmutableMap.copyOf(builder.tblInlineMetadata);
+    this.tblInlineMetadataCodec = ImmutableMap.copyOf(builder.tblInlineMetadataCodec);
     this.tblManifestPrefix = ImmutableMap.copyOf(builder.tblManifestPrefix);
     this.manifestPool = deepCopyManifestPool(builder.manifestPool);
     this.snapshotManifests = deepCopySnapshotManifests(builder.snapshotManifests);
@@ -353,6 +358,17 @@ public class ProtoCatalogFile extends CatalogFile {
     return tblInlineMetadata.get(tblId);
   }
 
+  /**
+   * Returns the codec used to encode the bytes of {@link #inlineMetadata(int)}.
+   * Defaults to {@link InlineMetadataCodecs#TAG_JSON_GZIP} when no codec was
+   * recorded for the table (e.g., the inline entry came from a checkpoint
+   * written by an old build that didn't carry the field).
+   */
+  public byte inlineMetadataCodec(int tblId) {
+    Byte tag = tblInlineMetadataCodec.get(tblId);
+    return tag != null ? tag : InlineMetadataCodecs.TAG_JSON_GZIP;
+  }
+
   /** Returns the manifest list prefix for the given inline table, or null. */
   public String manifestListPrefix(int tblId) {
     return tblManifestPrefix.get(tblId);
@@ -370,6 +386,10 @@ public class ProtoCatalogFile extends CatalogFile {
 
   Map<Integer, byte[]> allInlineMetadata() {
     return tblInlineMetadata;
+  }
+
+  Map<Integer, Byte> allInlineMetadataCodecs() {
+    return tblInlineMetadataCodec;
   }
 
   Map<Integer, String> allManifestPrefixes() {
@@ -474,6 +494,7 @@ public class ProtoCatalogFile extends CatalogFile {
     private final Map<TableIdentifier, Integer> tableLookup = new HashMap<>();
     private final Map<Integer, Map<String, String>> nsProperties = new HashMap<>();
     private final Map<Integer, byte[]> tblInlineMetadata = new HashMap<>();
+    private final Map<Integer, Byte> tblInlineMetadataCodec = new HashMap<>();
     private final Map<Integer, String> tblManifestPrefix = new HashMap<>();
     private final Map<Integer, Map<String, ManifestFile>> manifestPool = new HashMap<>();
     private final Map<Integer, Map<Long, List<String>>> snapshotManifests = new HashMap<>();
@@ -637,6 +658,18 @@ public class ProtoCatalogFile extends CatalogFile {
     public Builder addInlineTable(
         int id, int namespaceId, String name, int version,
         byte[] metadata, String manifestListPrefix) {
+      return addInlineTable(
+          id, namespaceId, name, version, metadata,
+          InlineMetadataCodecs.TAG_JSON_GZIP, manifestListPrefix);
+    }
+
+    /**
+     * Adds an inline table with an explicit codec tag for the encoded metadata
+     * bytes.
+     */
+    public Builder addInlineTable(
+        int id, int namespaceId, String name, int version,
+        byte[] metadata, byte metadataCodec, String manifestListPrefix) {
       // Add to tableById for lookup (null location marks it as inline)
       TblEntry entry = new TblEntry(namespaceId, name, version, null);
       tableById.put(id, entry);
@@ -644,6 +677,7 @@ public class ProtoCatalogFile extends CatalogFile {
       tableLookup.put(TableIdentifier.of(ns, name), id);
       // Store inline-specific data
       tblInlineMetadata.put(id, metadata);
+      tblInlineMetadataCodec.put(id, metadataCodec);
       tblManifestPrefix.put(id, manifestListPrefix);
       // Same monotonicity argument as addTable: keep nextTableId ahead of any id
       // that arrived via transaction replay. Without this, a fresh checkpoint
@@ -658,9 +692,24 @@ public class ProtoCatalogFile extends CatalogFile {
       return this;
     }
 
-    /** Updates inline metadata and version without clearing the manifest pool. */
+    /**
+     * Updates inline metadata and version without clearing the manifest pool.
+     * Preserves the existing codec tag for the table; use the codec-aware
+     * overload when re-inlining with a different codec.
+     */
     public Builder updateInlineMetadata(int id, int newVersion, byte[] metadata) {
+      Byte existing = tblInlineMetadataCodec.get(id);
+      byte codec = existing != null ? existing : InlineMetadataCodecs.TAG_JSON_GZIP;
+      return updateInlineMetadata(id, newVersion, metadata, codec);
+    }
+
+    /**
+     * Updates inline metadata and version, recording the codec used to encode
+     * {@code metadata}. Preserves the manifest pool.
+     */
+    public Builder updateInlineMetadata(int id, int newVersion, byte[] metadata, byte codec) {
       tblInlineMetadata.put(id, metadata);
+      tblInlineMetadataCodec.put(id, codec);
       TblEntry old = tableById.get(id);
       if (old != null) {
         tableById.put(id, new TblEntry(old.namespaceId, old.name, newVersion, null));
@@ -671,6 +720,7 @@ public class ProtoCatalogFile extends CatalogFile {
     /** Removes inline metadata for a table (e.g., when transitioning to pointer mode). */
     public Builder removeInlineMetadata(int id) {
       tblInlineMetadata.remove(id);
+      tblInlineMetadataCodec.remove(id);
       tblManifestPrefix.remove(id);
       manifestPool.remove(id);
       snapshotManifests.remove(id);
@@ -743,6 +793,12 @@ public class ProtoCatalogFile extends CatalogFile {
 
     public byte[] inlineMetadata(int id) {
       return tblInlineMetadata.get(id);
+    }
+
+    /** Codec tag for the bytes returned by {@link #inlineMetadata(int)}. */
+    public byte inlineMetadataCodec(int id) {
+      Byte tag = tblInlineMetadataCodec.get(id);
+      return tag != null ? tag : InlineMetadataCodecs.TAG_JSON_GZIP;
     }
 
     public String manifestListPrefix(int id) {

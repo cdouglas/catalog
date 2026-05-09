@@ -63,8 +63,18 @@ public class TestInlineDelta {
         .build();
   }
 
+  /**
+   * Encodes a TableMetadata using the gzip(JSON) inline codec — the test
+   * default for inline-TM bytes. Pair with {@link #parseMetadataBytes} to
+   * round-trip.
+   */
   static byte[] metadataBytes(TableMetadata meta) {
-    return TableMetadataParser.toJson(meta).getBytes(StandardCharsets.UTF_8);
+    return InlineMetadataCodecs.JSON_GZIP.encode(meta);
+  }
+
+  /** Decodes inline-TM bytes that were produced by {@link #metadataBytes}. */
+  static TableMetadata parseMetadataBytes(byte[] bytes) {
+    return InlineMetadataCodecs.JSON_GZIP.decodeFull(bytes, null);
   }
 
   // ============================================================
@@ -150,8 +160,7 @@ public class TestInlineDelta {
 
       // Verify the updated metadata
       byte[] updatedMeta = result.inlineMetadata(result.tableId(tbl));
-      TableMetadata updated = TableMetadataParser.fromJson(
-          new String(updatedMeta, StandardCharsets.UTF_8));
+      TableMetadata updated = parseMetadataBytes(updatedMeta);
       assertThat(updated.properties()).containsEntry("engine", "spark");
     }
   }
@@ -487,19 +496,27 @@ public class TestInlineDelta {
     void smallDeltaSelectsDelta() {
       List<InlineDeltaCodec.DeltaUpdate> delta = List.of(
           new InlineDeltaCodec.SetPropertiesUpdate(Map.of("k", "v"), Set.of()));
-      assertThat(InlineDeltaCodec.selectMode(delta, baseMetadata(), 0)).isEqualTo("delta");
+      assertThat(
+              InlineDeltaCodec.selectMode(
+                  delta, baseMetadata(), 0, InlineMetadataCodecs.JSON_GZIP))
+          .isEqualTo("delta");
     }
 
     @Test
     void nullDeltaSelectsFull() {
-      assertThat(InlineDeltaCodec.selectMode(null, baseMetadata(), 0)).isEqualTo("full");
+      assertThat(
+              InlineDeltaCodec.selectMode(
+                  null, baseMetadata(), 0, InlineMetadataCodecs.JSON_GZIP))
+          .isEqualTo("full");
     }
 
     @Test
     void oversizedSelectsPointer() {
       // txn already near the limit
       int nearLimit = InlineDeltaCodec.APPEND_LIMIT - 10;
-      assertThat(InlineDeltaCodec.selectMode(null, baseMetadata(), nearLimit))
+      assertThat(
+              InlineDeltaCodec.selectMode(
+                  null, baseMetadata(), nearLimit, InlineMetadataCodecs.JSON_GZIP))
           .isEqualTo("pointer");
     }
 
@@ -528,7 +545,9 @@ public class TestInlineDelta {
           delta, baseMetadata().lastUpdatedMillis());
       assertThat(deltaBytes.length).isGreaterThan(InlineDeltaCodec.APPEND_LIMIT);
 
-      assertThat(InlineDeltaCodec.selectMode(delta, baseMetadata(), 0))
+      assertThat(
+              InlineDeltaCodec.selectMode(
+                  delta, baseMetadata(), 0, InlineMetadataCodecs.JSON_GZIP))
           .as("oversized delta with small full TM must fall through to full mode")
           .isEqualTo("full");
     }
@@ -545,7 +564,8 @@ public class TestInlineDelta {
     void sinkStagesAndDrains() {
       var ops = new FileIOCatalog.InlineManifestTableOperations(
           org.apache.iceberg.catalog.TableIdentifier.of("db", "tbl"),
-          "mem:///catalog", new ProtoCatalogFormat(), null, true, false);
+          "mem:///catalog", new ProtoCatalogFormat(), null, true, false,
+          InlineMetadataCodecs.JSON_GZIP);
 
       org.apache.iceberg.ManifestFile m1 = new TestProtoActions.TestManifestFile(
           "s3://b/m1.avro", 1024, 0, org.apache.iceberg.ManifestContent.DATA,
@@ -576,7 +596,8 @@ public class TestInlineDelta {
     void isInstanceOfManifestListSink() {
       var ops = new FileIOCatalog.InlineManifestTableOperations(
           org.apache.iceberg.catalog.TableIdentifier.of("db", "tbl"),
-          "mem:///catalog", new ProtoCatalogFormat(), null, true, false);
+          "mem:///catalog", new ProtoCatalogFormat(), null, true, false,
+          InlineMetadataCodecs.JSON_GZIP);
       assertThat(ops).isInstanceOf(org.apache.iceberg.ManifestListSink.class);
     }
 
@@ -626,9 +647,8 @@ public class TestInlineDelta {
 
       byte[] deltaBytes = InlineDeltaCodec.encodeDelta(delta, TestInlineDelta.TEST_TS);
 
-      // Set up a catalog builder with an inline table
-      byte[] baseMeta = TableMetadataParser.toJson(baseMetadata())
-          .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+      // Set up a catalog builder with an inline table (gzip-encoded base bytes)
+      byte[] baseMeta = metadataBytes(baseMetadata());
       InputFile loc = new InputFile() {
         @Override public long getLength() { return 0; }
         @Override public SeekableInputStream newStream() { return null; }
@@ -640,11 +660,12 @@ public class TestInlineDelta {
       builder.addNamespace(1, 0, "db", 1);
       builder.setNextNamespaceId(2);
       builder.setNextTableId(2);
-      builder.addInlineTable(1, 1, "tbl", 1, baseMeta, PATH_PREFIX);
+      builder.addInlineTable(1, 1, "tbl", 1, baseMeta,
+          InlineMetadataCodecs.TAG_JSON_GZIP, PATH_PREFIX);
 
       // Apply the delta — routes ML updates to the catalog builder
       byte[] updatedMeta = InlineDeltaCodec.applyDeltaWithManifests(
-          baseMeta, deltaBytes, builder, 1);
+          baseMeta, InlineMetadataCodecs.JSON_GZIP, deltaBytes, builder, 1);
 
       // The manifest pool should have the manifest
       assertThat(builder.hasManifestPool(1)).isTrue();
@@ -655,8 +676,7 @@ public class TestInlineDelta {
 
       // The updated metadata should parse and contain the new snapshot
       assertThat(updatedMeta).isNotNull();
-      org.apache.iceberg.TableMetadata updated = TableMetadataParser.fromJson(
-          new String(updatedMeta, java.nio.charset.StandardCharsets.UTF_8));
+      org.apache.iceberg.TableMetadata updated = parseMetadataBytes(updatedMeta);
       assertThat(updated.snapshots()).hasSize(1);
       assertThat(updated.snapshots().get(0).snapshotId()).isEqualTo(500L);
     }
@@ -673,8 +693,7 @@ public class TestInlineDelta {
 
       byte[] deltaBytes = InlineDeltaCodec.encodeDelta(delta, TestInlineDelta.TEST_TS);
 
-      byte[] baseMeta = TableMetadataParser.toJson(baseMetadata())
-          .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+      byte[] baseMeta = metadataBytes(baseMetadata());
       InputFile loc = new InputFile() {
         @Override public long getLength() { return 0; }
         @Override public SeekableInputStream newStream() { return null; }
@@ -686,13 +705,13 @@ public class TestInlineDelta {
       builder.addNamespace(1, 0, "db", 1);
       builder.setNextNamespaceId(2);
       builder.setNextTableId(2);
-      builder.addInlineTable(1, 1, "tbl", 1, baseMeta, "");
+      builder.addInlineTable(1, 1, "tbl", 1, baseMeta,
+          InlineMetadataCodecs.TAG_JSON_GZIP, "");
 
       byte[] updatedMeta = InlineDeltaCodec.applyDeltaWithManifests(
-          baseMeta, deltaBytes, builder, 1);
+          baseMeta, InlineMetadataCodecs.JSON_GZIP, deltaBytes, builder, 1);
 
-      org.apache.iceberg.TableMetadata updated = TableMetadataParser.fromJson(
-          new String(updatedMeta, java.nio.charset.StandardCharsets.UTF_8));
+      org.apache.iceberg.TableMetadata updated = parseMetadataBytes(updatedMeta);
       assertThat(updated.snapshots()).as("should have 1 snapshot").hasSize(1);
       assertThat(updated.currentSnapshot()).as("currentSnapshot should be set").isNotNull();
       assertThat(updated.currentSnapshot().snapshotId()).isEqualTo(500L);
@@ -819,8 +838,7 @@ public class TestInlineDelta {
           1000L, 0, 100L));
 
       byte[] deltaBytes = InlineDeltaCodec.encodeDelta(delta, TestInlineDelta.TEST_TS);
-      byte[] baseMeta = TableMetadataParser.toJson(baseMetadata())
-          .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+      byte[] baseMeta = metadataBytes(baseMetadata());
       InputFile loc = new InputFile() {
         @Override public long getLength() { return 0; }
         @Override public SeekableInputStream newStream() { return null; }
@@ -832,10 +850,12 @@ public class TestInlineDelta {
       builder.addNamespace(1, 0, "db", 1);
       builder.setNextNamespaceId(2);
       builder.setNextTableId(2);
-      builder.addInlineTable(1, 1, "tbl", 1, baseMeta, prefix);
+      builder.addInlineTable(1, 1, "tbl", 1, baseMeta,
+          InlineMetadataCodecs.TAG_JSON_GZIP, prefix);
 
       org.assertj.core.api.Assertions.assertThatThrownBy(() ->
-          InlineDeltaCodec.applyDeltaWithManifests(baseMeta, deltaBytes, builder, 1))
+          InlineDeltaCodec.applyDeltaWithManifests(
+              baseMeta, InlineMetadataCodecs.JSON_GZIP, deltaBytes, builder, 1))
           .isInstanceOf(IllegalStateException.class)
           .hasMessageContaining("violates delta ordering invariant");
     }
@@ -1027,8 +1047,9 @@ public class TestInlineDelta {
       byte[] deltaBytes = InlineDeltaCodec.encodeDelta(updates, TestInlineDelta.TEST_TS);
       byte[] baseBytes = metadataBytes(baseMetadata());
 
-      byte[] r1 = InlineDeltaCodec.applyDelta(baseBytes, deltaBytes);
-      TableMetadata m1 = TableMetadataParser.fromJson(new String(r1, StandardCharsets.UTF_8));
+      byte[] r1 = InlineDeltaCodec.applyDelta(
+          baseBytes, InlineMetadataCodecs.JSON_GZIP, deltaBytes);
+      TableMetadata m1 = parseMetadataBytes(r1);
       assertThat(m1.lastUpdatedMillis())
           .as("top-level last-updated-ms must equal the writer's value")
           .isEqualTo(TestInlineDelta.TEST_TS);
@@ -1057,10 +1078,12 @@ public class TestInlineDelta {
       byte[] deltaBytes = InlineDeltaCodec.encodeDelta(updates, TestInlineDelta.TEST_TS);
       byte[] baseBytes = metadataBytes(base);
 
-      byte[] r1 = InlineDeltaCodec.applyDelta(baseBytes, deltaBytes);
-      byte[] r2 = InlineDeltaCodec.applyDelta(baseBytes, deltaBytes);
-      TableMetadata m1 = TableMetadataParser.fromJson(new String(r1, StandardCharsets.UTF_8));
-      TableMetadata m2 = TableMetadataParser.fromJson(new String(r2, StandardCharsets.UTF_8));
+      byte[] r1 = InlineDeltaCodec.applyDelta(
+          baseBytes, InlineMetadataCodecs.JSON_GZIP, deltaBytes);
+      byte[] r2 = InlineDeltaCodec.applyDelta(
+          baseBytes, InlineMetadataCodecs.JSON_GZIP, deltaBytes);
+      TableMetadata m1 = parseMetadataBytes(r1);
+      TableMetadata m2 = parseMetadataBytes(r2);
 
       assertThat(m1.lastUpdatedMillis()).isEqualTo(TestInlineDelta.TEST_TS);
       assertThat(m2.lastUpdatedMillis()).isEqualTo(TestInlineDelta.TEST_TS);
