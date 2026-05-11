@@ -19,27 +19,29 @@
 package org.apache.iceberg.gcp.gcs;
 
 import static org.assertj.core.api.Assertions.setMaxStackTraceElementsDisplayed;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.spy;
 
-import com.google.cloud.storage.BlobId;
+import com.google.cloud.NoCredentials;
+import com.google.cloud.storage.BucketInfo;
 import com.google.cloud.storage.Storage;
-import com.google.cloud.storage.contrib.nio.testing.LocalStorageHelper;
+import com.google.cloud.storage.StorageException;
+import com.google.cloud.storage.StorageOptions;
 import com.google.cloud.storage.testing.RemoteStorageHelper;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
-import java.util.List;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.Map;
 import java.util.Random;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.catalog.CatalogTransactionTests;
 import org.apache.iceberg.gcp.GCPProperties;
+import org.apache.iceberg.io.CloudMode;
 import org.apache.iceberg.io.FileIOCatalog;
 import org.apache.iceberg.io.ProtoCatalogFormat;
-import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.TestInfo;
@@ -47,13 +49,19 @@ import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.TestWatcher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.utility.DockerImageName;
 
 public class GCSFileIOCatalogTransactionTests extends CatalogTransactionTests<FileIOCatalog> {
   private static final String TEST_BUCKET = "lst-consistency/TEST_BUCKET";
+  private static final String GCS_BUCKET = "lst-consistency";
   private static final Logger LOG = LoggerFactory.getLogger(GCSCatalogTest.class);
+  private static final String FAKE_GCS_IMAGE = "fsouza/fake-gcs-server:1.49.2";
+  private static final int FAKE_GCS_PORT = 4443;
 
-  // private final Storage storage =
+  protected static CloudMode mode;
   private static Storage storage;
+  private static GenericContainer<?> fakeGcsContainer;
   private FileIOCatalog catalog;
   private static String warehouseLocation;
   private static String uniqTestRun;
@@ -91,31 +99,71 @@ public class GCSFileIOCatalogTransactionTests extends CatalogTransactionTests<Fi
   public static void initStorage() throws IOException {
     uniqTestRun = randomAlphabetic(8);
     LOG.info("TEST RUN: " + uniqTestRun);
-    // TODO get from env
-    final File credFile = new File("/home/chris/work/.cloud/gcp/lst-consistency-8dd2dfbea73a.json");
-    if (credFile.exists()) {
+    String credsPath = System.getenv("GOOGLE_APPLICATION_CREDENTIALS");
+    File credFile = credsPath != null ? new File(credsPath) : null;
+    if (credFile != null && credFile.exists()) {
+      mode = CloudMode.REAL_GCS;
       try (FileInputStream creds = new FileInputStream(credFile)) {
-        storage = RemoteStorageHelper.create("lst-consistency", creds).getOptions().getService();
-        LOG.info("Using remote storage");
+        storage = RemoteStorageHelper.create(GCS_BUCKET, creds).getOptions().getService();
+        LOG.info("Using remote GCS (creds from {})", credsPath);
       }
     } else {
-      storage = spy(LocalStorageHelper.getOptions().getService());
-      doAnswer(
-              invoke -> {
-                Iterable<BlobId> iter = invoke.getArgument(0);
-                List<Boolean> answer = Lists.newArrayList();
-                iter.forEach(
-                    blobId -> {
-                      answer.add(storage.delete(blobId));
-                    });
-                return answer;
-              })
-          .when(storage)
-          .delete(any(Iterable.class));
-      LOG.info("Using local storage");
+      mode = CloudMode.FAKE_GCS;
+      fakeGcsContainer =
+          new GenericContainer<>(DockerImageName.parse(FAKE_GCS_IMAGE))
+              .withExposedPorts(FAKE_GCS_PORT)
+              .withCommand(
+                  "-scheme", "http",
+                  "-port", String.valueOf(FAKE_GCS_PORT));
+      fakeGcsContainer.start();
+      String endpoint =
+          "http://"
+              + fakeGcsContainer.getHost()
+              + ":"
+              + fakeGcsContainer.getMappedPort(FAKE_GCS_PORT);
+      updateFakeGcsExternalUrl(endpoint);
+      storage =
+          StorageOptions.newBuilder()
+              .setHost(endpoint)
+              .setProjectId("test-project")
+              .setCredentials(NoCredentials.getInstance())
+              .build()
+              .getService();
+      try {
+        storage.create(BucketInfo.of(GCS_BUCKET));
+      } catch (StorageException e) {
+        if (e.getCode() != 409) { // already exists
+          throw e;
+        }
+      }
+      LOG.info("Using fake-gcs-server Testcontainers emulator at {}", endpoint);
     }
     // show ridiculous stack traces
     setMaxStackTraceElementsDisplayed(Integer.MAX_VALUE);
+  }
+
+  @AfterAll
+  public static void tearDownStorage() {
+    if (fakeGcsContainer != null) {
+      fakeGcsContainer.stop();
+      fakeGcsContainer = null;
+    }
+  }
+
+  private static void updateFakeGcsExternalUrl(String externalUrl) throws IOException {
+    URL url = new URL(externalUrl + "/_internal/config");
+    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+    conn.setRequestMethod("PUT");
+    conn.setRequestProperty("Content-Type", "application/json");
+    conn.setDoOutput(true);
+    byte[] body = ("{\"externalUrl\":\"" + externalUrl + "\"}").getBytes();
+    try (OutputStream out = conn.getOutputStream()) {
+      out.write(body);
+    }
+    int code = conn.getResponseCode();
+    if (code / 100 != 2) {
+      throw new IOException("fake-gcs-server /_internal/config returned HTTP " + code);
+    }
   }
 
   @BeforeEach

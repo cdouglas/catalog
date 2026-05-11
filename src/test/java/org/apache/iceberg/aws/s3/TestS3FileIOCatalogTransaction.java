@@ -21,11 +21,14 @@ package org.apache.iceberg.aws.s3;
 import java.util.Map;
 import java.util.UUID;
 import org.apache.iceberg.CatalogProperties;
+import org.apache.iceberg.aws.AwsClientFactories;
 import org.apache.iceberg.catalog.CatalogTransactionTests;
 import org.apache.iceberg.io.CatalogFormat;
+import org.apache.iceberg.io.CloudMode;
 import org.apache.iceberg.io.FileIOCatalog;
 import org.apache.iceberg.io.ProtoCatalogFormat;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -33,12 +36,17 @@ import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.TestWatcher;
+import org.testcontainers.containers.MinIOContainer;
+import software.amazon.awssdk.services.s3.S3Client;
 
 @ExtendWith(TestS3Catalog.SuccessCleanupExtension.class)
 public class TestS3FileIOCatalogTransaction extends CatalogTransactionTests<FileIOCatalog> {
-  private static final String TEST_BUCKET = "casalog";
   private static final String EXPR_BUCKET = "lst-pbafvfgrapl--usw2-az3--x-s3";
 
+  protected static CloudMode mode;
+  private static MinIOContainer minioContainer;
+  private static S3Client s3Client;
+  private static String testBucket;
   private static String uniqTestRun;
   private static String warehouseLocation;
 
@@ -81,18 +89,48 @@ public class TestS3FileIOCatalogTransaction extends CatalogTransactionTests<File
   @BeforeAll
   public static void initStorage() {
     uniqTestRun = UUID.randomUUID().toString();
-    // LOG.info("TEST RUN: {}", uniqTestRun);
     System.err.println("TEST RUN: " + uniqTestRun); // (logging disabled in tests)
+    String accessKey = System.getenv("AWS_ACCESS_KEY_ID");
+    if (accessKey != null && !accessKey.isBlank()) {
+      mode = CloudMode.REAL_S3;
+      s3Client = AwsClientFactories.defaultFactory().s3();
+      testBucket = System.getenv().getOrDefault("S3_TEST_BUCKET", EXPR_BUCKET);
+      System.err.println("Using real S3, bucket=" + testBucket);
+    } else {
+      mode = CloudMode.MINIO;
+      minioContainer = MinioUtil.createContainer();
+      minioContainer.start();
+      s3Client = MinioUtil.createS3Client(minioContainer);
+      testBucket = "casalog-" + UUID.randomUUID().toString().substring(0, 8);
+      s3Client.createBucket(b -> b.bucket(testBucket));
+      System.err.println("Using MinIO Testcontainers emulator, bucket=" + testBucket);
+    }
+  }
+
+  @AfterAll
+  public static void tearDownStorage() {
+    if (s3Client != null) {
+      s3Client.close();
+      s3Client = null;
+    }
+    if (minioContainer != null) {
+      minioContainer.stop();
+      minioContainer = null;
+    }
   }
 
   @BeforeEach
   public void before(TestInfo info) {
+    if (mode == CloudMode.MINIO && maxAppendCount() > 0) {
+      mode.assumeRealCloud("S3 Express writeOffsetBytes (APPEND-mode commits)");
+    }
     final String testName = info.getTestMethod().orElseThrow(RuntimeException::new).getName();
     warehouseLocation =
-        "s3://" + EXPR_BUCKET + "/" + uniqTestRun + "/" + testName + "_" + info.getDisplayName();
+        "s3://" + testBucket + "/" + uniqTestRun + "/" + testName + "_" + info.getDisplayName();
     cleanupWarehouseLocation();
 
-    final S3FileIO io = new S3FileIO(); // () -> s3);
+    final S3Client client = s3Client;
+    final S3FileIO io = new S3FileIO(() -> client);
     io.initialize(Maps.newHashMap());
     final String location = warehouseLocation + "/catalog";
 

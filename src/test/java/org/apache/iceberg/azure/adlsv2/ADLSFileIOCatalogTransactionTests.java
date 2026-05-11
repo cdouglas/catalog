@@ -32,6 +32,7 @@ import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.azure.AzureProperties;
 import org.apache.iceberg.catalog.CatalogTransactionTests;
 import org.apache.iceberg.io.CatalogFormat;
+import org.apache.iceberg.io.CloudMode;
 import org.apache.iceberg.io.FileIOCatalog;
 import org.apache.iceberg.io.ProtoCatalogFormat;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
@@ -48,12 +49,11 @@ import org.slf4j.LoggerFactory;
 
 @ExtendWith(ADLSCatalogTest.SuccessCleanupExtension.class)
 public class ADLSFileIOCatalogTransactionTests extends CatalogTransactionTests<FileIOCatalog> {
-  static final String SAS_FILE =
-      "/home/chris/work/.cloud/azure/lstnsgymx3serug-20260803.json";
   private static final String TEST_BUCKET = "lst-consistency/TEST_BUCKET";
   private static final Logger LOG = LoggerFactory.getLogger(ADLSCatalogTest.class);
   protected static AzuriteContainer azuriteContainer = null;
 
+  protected static CloudMode mode;
   private static Map<String, String> azureProperties;
   private FileIOCatalog catalog;
   private static String warehouseLocation;
@@ -86,19 +86,22 @@ public class ADLSFileIOCatalogTransactionTests extends CatalogTransactionTests<F
   public static void initStorage() throws IOException {
     uniqTestRun = UUID.randomUUID().toString();
     LOG.info("TEST RUN: {}", uniqTestRun);
-    AzureSAS creds = AzureSAS.readCreds(new File(SAS_FILE));
+    String credsPath = System.getenv("AZURE_SAS_CREDENTIALS_FILE");
+    AzureSAS creds = credsPath != null ? AzureSAS.readCreds(new File(credsPath)) : null;
     if (creds != null) {
+      mode = CloudMode.REAL_ADLS;
       azureProperties = Maps.newHashMap();
       azureProperties.put(
           AzureProperties.ADLS_SAS_TOKEN_PREFIX + creds.account + ".dfs.core.windows.net",
           creds.sasToken);
       az = new AzureSAS.SasResolver(creds);
-      LOG.info("Using remote storage");
+      LOG.info("Using remote ADLS via SAS from {}", credsPath);
     } else {
+      mode = CloudMode.AZURITE;
       azuriteContainer = new AzuriteContainer();
       azuriteContainer.start();
       az = azuriteContainer;
-      LOG.info("Using local storage");
+      LOG.info("Using Azurite Testcontainers emulator");
     }
     // show ridiculous stack traces
     setMaxStackTraceElementsDisplayed(Integer.MAX_VALUE);
@@ -106,6 +109,11 @@ public class ADLSFileIOCatalogTransactionTests extends CatalogTransactionTests<F
 
   @BeforeEach
   public void before(TestInfo info) {
+    if (mode == CloudMode.AZURITE) {
+      mode.assumeRealCloud(
+          "DataLake uploadWithResponse to a non-existent path "
+              + "(real ADLS auto-creates; Azurite returns HTTP 400)");
+    }
     final ADLSFileIO io;
     if (null == azureProperties) {
       azuriteContainer.createStorageContainer();
@@ -150,7 +158,11 @@ public class ADLSFileIOCatalogTransactionTests extends CatalogTransactionTests<F
   @AfterEach
   public void baseAfter() {
     if (azuriteContainer != null) {
-      azuriteContainer.deleteStorageContainer();
+      try {
+        azuriteContainer.deleteStorageContainer();
+      } catch (RuntimeException ignored) {
+        // best-effort: the container may not have been created (test skipped in @BeforeEach)
+      }
     }
   }
 

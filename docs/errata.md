@@ -90,15 +90,37 @@ rare-update path is non-negligible.
 
 ## Test Coverage Gaps
 
-### T3. Cloud integration tests require manual emulator setup
+### T3. Cloud integration tests rely on emulators for some behaviour
 
-S3, ADLS, and GCS integration tests are skipped without credentials.
-We rely on developer-run emulators; CI coverage is best-effort.
+`mvn verify` runs the S3, ADLS, and GCS integration tests against
+Testcontainers emulators by default (MinIO, Azurite, fake-gcs-server),
+falling back to live cloud when `AWS_ACCESS_KEY_ID`,
+`AZURE_SAS_CREDENTIALS_FILE`, or `GOOGLE_APPLICATION_CREDENTIALS` is
+present. `CloudMode#assumeRealCloud` skips individual tests when the
+configured emulator does not implement the feature being exercised, and
+each skip is paired with a canary in `*EmulatorCanaries` that asserts
+the gap is still present. When an emulator image bump closes a gap, the
+matching canary fails and the upgrader knows to delete the workaround.
 
-**Fix path:** add Testcontainers lifecycle for LocalStack (S3), Azurite
-(ADLS), and fake-gcs-server (GCS) under the `verify` Maven profile.
-Gate container startup behind a profile flag so `mvn test` stays fast
-and offline.
+**Residual gaps guarded by canaries:**
+
+- **MinIO**: no S3 directory-bucket semantics. APPEND-mode commits
+  (`maxAppendCount > 0`) skip on MinIO; `MinIOEmulatorCanaries` asserts
+  `writeOffsetBytes` is still rejected and that `If-Match` preconditions
+  are still honoured (catches silent-ignore regressions).
+- **Azurite**: `DataLakeFileClient.uploadWithResponse` returns HTTP 400
+  on a non-existent path; real ADLS auto-creates the file. Every test in
+  `ADLSCatalogTest` / `ADLSFileIOCatalogTransactionTests` writes the
+  initial catalog file via that path, so on Azurite the whole class
+  skips. `AzuriteEmulatorCanaries#azuriteRejectsUploadToNonExistentPath`
+  asserts the gap; the positive
+  `AzuriteEmulatorCanaries#azuriteEnforcesIfMatchPrecondition` guards
+  against silent `If-Match` regressions.
+- **fake-gcs-server**: standard-bucket CAS path works.
+  `FakeGcsEmulatorCanaries` carries a positive canary for
+  `ifGenerationMatch` enforcement. The GCS Rapid stage-and-move path
+  (`blobAppendableUpload` + `moveBlob` with dual generations) is not
+  exercised by `GCSCatalogTest`, so no negative canary is needed today.
 
 ### T4. `testRegisterTable` (inline) needs a register-from-bytes API
 
