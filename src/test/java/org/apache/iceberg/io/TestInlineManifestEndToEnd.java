@@ -1172,6 +1172,130 @@ public class TestInlineManifestEndToEnd {
     }
 
     /**
+     * Errata D6: when computeDelta returns null because of an
+     * idCollidesWithDifferentContent (concurrent-replace race assigning the
+     * same schema/spec/sort-order id to different content) AND we have ML
+     * data staged on a live snapshot, commitInline must surface
+     * CommitFailedException instead of silently falling back to full or
+     * pointer mode (both of which drop the staged ML data).
+     */
+    @Test
+    void concurrentReplaceCollisionWithStagedMLThrowsCommitFailed() {
+      createNamespaceAndTable();
+      org.apache.iceberg.Table tbl = catalog.loadTable(TBL);
+
+      FileIOCatalog.InlineManifestTableOperations ops =
+          (FileIOCatalog.InlineManifestTableOperations)
+              ((org.apache.iceberg.BaseTable) tbl).operations();
+      org.apache.iceberg.TableMetadata current = ops.current();
+
+      // Build two TableMetadata variants that share the same sort-order id (1)
+      // with different content. setDefaultSortOrder via Builder assigns the
+      // next available id — starting from the same current state, both Builders
+      // independently pick id 1, exactly as concurrent replaceTransaction
+      // commits would.
+      org.apache.iceberg.SortOrder orderA =
+          org.apache.iceberg.SortOrder.builderFor(TEST_SCHEMA).asc("id").build();
+      org.apache.iceberg.SortOrder orderB =
+          org.apache.iceberg.SortOrder.builderFor(TEST_SCHEMA).desc("id").build();
+      org.apache.iceberg.TableMetadata baseWithA = org.apache.iceberg.TableMetadata
+          .buildFrom(current).setDefaultSortOrder(orderA).build();
+      org.apache.iceberg.TableMetadata newWithB = org.apache.iceberg.TableMetadata
+          .buildFrom(current).setDefaultSortOrder(orderB).build();
+
+      // Precondition: this pair must trigger idCollidesWithDifferentContent.
+      assertThat(InlineDeltaCodec.computeDelta(baseWithA, newWithB, ""))
+          .as("collision pair must yield null delta")
+          .isNull();
+
+      // Add a snapshot to the new metadata so we can stage an ML delta on it.
+      long snapId = 0xD6D6D6L;
+      org.apache.iceberg.Snapshot newSnap = org.apache.iceberg.InlineDeltaSnapshots.create(
+          1L, snapId, null, System.currentTimeMillis(),
+          java.util.Map.of("operation", "append"),
+          newWithB.currentSchemaId(),
+          "inline://" + snapId,
+          null, 0L, null);
+      org.apache.iceberg.TableMetadata newWithBPlusSnap =
+          org.apache.iceberg.TableMetadata.buildFrom(newWithB).addSnapshot(newSnap).build();
+
+      // Stage ML data for the new snapshot.
+      org.apache.iceberg.ManifestFile mf = new TestProtoActions.TestManifestFile(
+          "mem:///warehouse/db/tbl/metadata/d6-m0.avro", 1024L, 0,
+          org.apache.iceberg.ManifestContent.DATA,
+          1L, 1L, snapId, 1, 0, 0, 1L, 0L, 0L, null, null, null);
+      ops.stageManifestListDelta(
+          1L, snapId, null, null,
+          new org.apache.iceberg.ManifestListSink.ManifestListDelta(
+              java.util.List.of(mf), java.util.List.of()),
+          null);
+
+      org.assertj.core.api.Assertions.assertThatThrownBy(() ->
+          ops.doCommit(baseWithA, newWithBPlusSnap))
+          .as("staged ML data + null delta must throw CommitFailedException, not silently drop ML")
+          .isInstanceOf(org.apache.iceberg.exceptions.CommitFailedException.class)
+          .hasMessageContaining("concurrent-replace");
+    }
+
+    /**
+     * Errata D6 companion: an empty staged-delta entry (the producer staged a
+     * delta with no added/removed manifests, e.g. a metadata-only operation
+     * that still goes through the sink) must NOT trigger the D6 retry path.
+     * Empty staging is benign — there's no ML data to preserve.
+     */
+    @Test
+    void concurrentReplaceCollisionWithEmptyStagedMLFallsThrough() {
+      createNamespaceAndTable();
+      org.apache.iceberg.Table tbl = catalog.loadTable(TBL);
+
+      FileIOCatalog.InlineManifestTableOperations ops =
+          (FileIOCatalog.InlineManifestTableOperations)
+              ((org.apache.iceberg.BaseTable) tbl).operations();
+      org.apache.iceberg.TableMetadata current = ops.current();
+
+      org.apache.iceberg.SortOrder orderA =
+          org.apache.iceberg.SortOrder.builderFor(TEST_SCHEMA).asc("id").build();
+      org.apache.iceberg.SortOrder orderB =
+          org.apache.iceberg.SortOrder.builderFor(TEST_SCHEMA).desc("id").build();
+      org.apache.iceberg.TableMetadata baseWithA = org.apache.iceberg.TableMetadata
+          .buildFrom(current).setDefaultSortOrder(orderA).build();
+      org.apache.iceberg.TableMetadata newWithB = org.apache.iceberg.TableMetadata
+          .buildFrom(current).setDefaultSortOrder(orderB).build();
+
+      long snapId = 0xD6E000L;
+      org.apache.iceberg.Snapshot newSnap = org.apache.iceberg.InlineDeltaSnapshots.create(
+          1L, snapId, null, System.currentTimeMillis(),
+          java.util.Map.of("operation", "append"),
+          newWithB.currentSchemaId(),
+          "inline://" + snapId,
+          null, 0L, null);
+      org.apache.iceberg.TableMetadata newWithBPlusSnap =
+          org.apache.iceberg.TableMetadata.buildFrom(newWithB).addSnapshot(newSnap).build();
+
+      // Empty staged delta — no added, no removed.
+      ops.stageManifestListDelta(
+          1L, snapId, null, null,
+          new org.apache.iceberg.ManifestListSink.ManifestListDelta(
+              java.util.List.of(), java.util.List.of()),
+          null);
+
+      // Should NOT throw the D6 CFE. The full-mode fallback runs; the empty
+      // staged delta carries no data so nothing is lost. (The commit itself
+      // may succeed or fail for unrelated reasons; we only assert the absence
+      // of the D6-specific error message.)
+      try {
+        ops.doCommit(baseWithA, newWithBPlusSnap);
+      } catch (org.apache.iceberg.exceptions.CommitFailedException e) {
+        assertThat(e.getMessage())
+            .as("empty staged delta must not trigger D6 path")
+            .doesNotContain("concurrent-replace");
+      } catch (Exception ignored) {
+        // Other exceptions from full-mode are acceptable; the only thing
+        // under test is "no D6 false positive".
+      }
+    }
+
+    /**
      * Errata D7 companion: a staged delta whose snapshot id is NOT in
      * metadata.snapshots() (orphan stage, e.g. a producer that was rolled
      * back before its snapshot landed in TableMetadata) must be dropped,

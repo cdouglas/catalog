@@ -28,31 +28,22 @@ revisit:** any plan to drop the iceberg fork or upstream the changes.
 
 ## Deferred Functionality
 
-### D6. Concurrent-replace id collision on an inline-ML table can lose the new ML data
+### D6. Concurrent-replace id collision on an inline-ML table can lose the new ML data — RESOLVED
 
-`commitInline` forces `mode = "delta"` whenever `(hasMLDeltas || hasMLPool)
-&& delta != null`. The `delta != null` guard is correct in isolation —
-`encodeDelta(null, ...)` would NPE — but it has a hole: if the new
-commit added inline-ML data (`hasMLDeltas == true`) AND
-`computeDelta` returned null because of an `idCollidesWithDifferentContent`
-check (concurrent-replace race assigning the same schema/spec/sort-order
-id to different content), `selectMode` falls back to "full" or "pointer".
-Both paths drop the staged ML deltas: full mode serializes
-`TableMetadata` only and never visits the per-snapshot manifest pool;
-pointer mode evicts and `removeInlineMetadata` clears the pool.
+Resolved 2026-05-10. When `computeDelta` returns null (idCollidesWith-
+DifferentContent: concurrent-replace race assigning the same schema /
+spec / sort-order id to different content) AND staged ML data is
+non-empty for a live snapshot, `commitInline` and `commitTransaction`
+now throw `CommitFailedException` instead of silently falling back to
+full / pointer mode (both of which dropped the staged ML data). The
+producer's retry loop refreshes the base and re-stages on top of the
+rebased state, where the colliding id has been reassigned naturally.
 
-The collision case is exactly when concurrent replace transactions need
-the new manifests preserved most. Triggered by the same
-`testConcurrentReplaceTransactionSortOrderConflict` shape that
-`computeDelta` already detects, but on an inline-ML table.
-
-**Fix path:** when forced into full/pointer mode with non-empty
-`hasMLDeltas`, either retry the commit after refresh (preferred — the
-collision will resolve naturally on the rebased delta) or persist the
-staged ML data via the catalog builder before serializing. The retry
-path leaves the writer responsible for re-running their staged manifest
-producer, which matches the error semantics of every other
-`CommitFailedException`.
+Regression test: `TestInlineManifestEndToEnd$TmMlTests
+.concurrentReplaceCollisionWithStagedMLThrowsCommitFailed` (verified to
+fail without the fix). A companion test
+(`concurrentReplaceCollisionWithEmptyStagedMLFallsThrough`) guards
+against a D6 false positive on empty staging.
 
 ### D7. ML deltas on existing snapshots are silently dropped — RESOLVED
 

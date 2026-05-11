@@ -606,6 +606,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         // drop deltas for snapshot ids that aren't present in the target
         // metadata (orphaned stages from a rolled-back producer). Errata D7.
         boolean hasMLDeltas = false;
+        boolean stagedMLPendingApply = false;
         if (this instanceof InlineManifestTableOperations) {
           Map<Long, InlineManifestTableOperations.StagedSnapshotData> mlDeltas =
               ((InlineManifestTableOperations) this).drainStagedDeltas();
@@ -619,14 +620,36 @@ public class FileIOCatalog extends BaseMetastoreCatalog
             if (!liveSnapIds.contains(snapId)) {
               continue;
             }
+            InlineManifestTableOperations.StagedSnapshotData staged = entry.getValue();
+            boolean stagedHasContent = !staged.delta.added().isEmpty()
+                || !staged.delta.removedPaths().isEmpty();
             if (delta != null) {
-              InlineManifestTableOperations.StagedSnapshotData staged = entry.getValue();
               InlineDeltaCodec.attachManifestDelta(
                   delta, snapId,
                   staged.delta.added(), staged.delta.removedPaths(), manifestPrefix);
               hasMLDeltas = true;
+            } else if (stagedHasContent) {
+              stagedMLPendingApply = true;
             }
           }
+        }
+
+        // Errata D6: computeDelta returned null (idCollidesWithDifferentContent
+        // — concurrent-replace race assigning the same schema/spec/sort-order id
+        // to different content), but we have ML data staged on live snapshots.
+        // Full-mode and pointer-mode fall-backs both drop the staged ML data:
+        // full mode serializes TableMetadata only and never visits the per-
+        // snapshot manifest pool, and pointer mode evicts and removeInlineMetadata
+        // clears the pool. Surface CommitFailedException so the producer's
+        // retry loop re-applies on top of the rebased base — the collision
+        // resolves naturally on the next attempt because Builder.addSortOrder
+        // assigns a fresh id when the old one is occupied.
+        if (stagedMLPendingApply) {
+          throw new CommitFailedException(
+              "Cannot encode inline-ML delta for %s: concurrent-replace id "
+                  + "collision (schema/spec/sort-order) blocks delta encoding; "
+                  + "retry will rebase",
+              tableId);
         }
 
         String mode = InlineDeltaCodec.selectMode(delta, metadata, 0, codec);
@@ -914,6 +937,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
           boolean hasMLPool = proto != null && tblIdNum != null
               && !proto.manifestPool(tblIdNum).isEmpty();
           boolean hasMLDeltas = false;
+          boolean stagedMLPendingApply = false;
           if (inlineManifests) {
             InlineManifestTableOperations sinkOps = sinkOpsByTable.get(tableId);
             if (sinkOps != null) {
@@ -932,15 +956,27 @@ public class FileIOCatalog extends BaseMetastoreCatalog
                 if (!liveSnapIds.contains(snapId)) {
                   continue;
                 }
+                InlineManifestTableOperations.StagedSnapshotData data = entry.getValue();
+                boolean stagedHasContent = !data.delta.added().isEmpty()
+                    || !data.delta.removedPaths().isEmpty();
                 if (delta != null) {
-                  InlineManifestTableOperations.StagedSnapshotData data = entry.getValue();
                   InlineDeltaCodec.attachManifestDelta(
                       delta, snapId,
                       data.delta.added(), data.delta.removedPaths(), manifestPrefix);
                   hasMLDeltas = true;
+                } else if (stagedHasContent) {
+                  stagedMLPendingApply = true;
                 }
               }
             }
+          }
+          // Errata D6: see commitInline for the rationale. CommitFailedException
+          // forces the producer to refresh + re-stage on top of the rebased base.
+          if (stagedMLPendingApply) {
+            throw new CommitFailedException(
+                "Cannot encode inline-ML delta for %s: concurrent-replace id "
+                    + "collision blocks delta encoding; retry will rebase",
+                tableId);
           }
 
           InlineMetadataCodec codec = configuredInlineCodec();
