@@ -62,8 +62,7 @@ public class ProtoCatalogFile extends CatalogFile {
   // A table ID appears in either tableById (pointer) or tblInlineMetadata (inline), not both.
   // Inline tables also appear in tableById with metadataLocation = null for lookup purposes.
   // tblInlineMetadataCodec is parallel to tblInlineMetadata: the codec used to
-  // encode the bytes. Entries default to InlineMetadataCodecs.TAG_JSON_GZIP (0)
-  // when missing.
+  // encode the bytes.
   private final Map<Integer, byte[]> tblInlineMetadata;
   private final Map<Integer, Byte> tblInlineMetadataCodec;
   private final Map<Integer, String> tblManifestPrefix;
@@ -360,13 +359,14 @@ public class ProtoCatalogFile extends CatalogFile {
 
   /**
    * Returns the codec used to encode the bytes of {@link #inlineMetadata(int)}.
-   * Defaults to {@link InlineMetadataCodecs#TAG_JSON_GZIP} when no codec was
-   * recorded for the table (e.g., the inline entry came from a checkpoint
-   * written by an old build that didn't carry the field).
+   * Only valid for inline tables; the wire format requires the codec tag to
+   * be present alongside the inline metadata bytes.
    */
   public byte inlineMetadataCodec(int tblId) {
     Byte tag = tblInlineMetadataCodec.get(tblId);
-    return tag != null ? tag : InlineMetadataCodecs.TAG_JSON_GZIP;
+    Preconditions.checkState(
+        tag != null, "Not an inline table or missing codec tag: %s", tblId);
+    return tag;
   }
 
   /** Returns the manifest list prefix for the given inline table, or null. */
@@ -693,17 +693,6 @@ public class ProtoCatalogFile extends CatalogFile {
     }
 
     /**
-     * Updates inline metadata and version without clearing the manifest pool.
-     * Preserves the existing codec tag for the table; use the codec-aware
-     * overload when re-inlining with a different codec.
-     */
-    public Builder updateInlineMetadata(int id, int newVersion, byte[] metadata) {
-      Byte existing = tblInlineMetadataCodec.get(id);
-      byte codec = existing != null ? existing : InlineMetadataCodecs.TAG_JSON_GZIP;
-      return updateInlineMetadata(id, newVersion, metadata, codec);
-    }
-
-    /**
      * Updates inline metadata and version, recording the codec used to encode
      * {@code metadata}. Preserves the manifest pool.
      */
@@ -812,7 +801,9 @@ public class ProtoCatalogFile extends CatalogFile {
     /** Codec tag for the bytes returned by {@link #inlineMetadata(int)}. */
     public byte inlineMetadataCodec(int id) {
       Byte tag = tblInlineMetadataCodec.get(id);
-      return tag != null ? tag : InlineMetadataCodecs.TAG_JSON_GZIP;
+      Preconditions.checkState(
+          tag != null, "Not an inline table or missing codec tag: %s", id);
+      return tag;
     }
 
     public String manifestListPrefix(int id) {

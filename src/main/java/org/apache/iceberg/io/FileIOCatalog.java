@@ -292,19 +292,13 @@ public class FileIOCatalog extends BaseMetastoreCatalog
   }
 
   /**
-   * Returns the codec tag recorded for the given inline table. Falls back to
-   * {@link InlineMetadataCodecs#TAG_JSON_GZIP} when the catalog file doesn't
-   * expose per-table codec metadata (only ProtoCatalogFile does today).
+   * Returns the codec tag recorded for the given inline table. Callers must
+   * have already verified the table is inline via
+   * {@link CatalogFile#isInlineTable(TableIdentifier)}.
    */
   private static byte inlineCodecTag(CatalogFile catalogFile, TableIdentifier table) {
-    if (catalogFile instanceof ProtoCatalogFile) {
-      ProtoCatalogFile proto = (ProtoCatalogFile) catalogFile;
-      Integer numId = proto.tableId(table);
-      if (numId != null) {
-        return proto.inlineMetadataCodec(numId);
-      }
-    }
-    return InlineMetadataCodecs.TAG_JSON_GZIP;
+    ProtoCatalogFile proto = (ProtoCatalogFile) catalogFile;
+    return proto.inlineMetadataCodec(proto.tableId(table));
   }
 
   //

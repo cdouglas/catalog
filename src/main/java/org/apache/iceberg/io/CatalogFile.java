@@ -109,9 +109,7 @@ public abstract class CatalogFile {
     // immediately after the table create. {@code null} / absent for non-ML
     // creates and for inline-ML creates with no snapshots. Errata D9.
     protected final Map<TableIdentifier, byte[]> inlineTableCreateDeltas;
-    // Codec tags parallel to inlineTables / inlineTableUpdates. Entries default
-    // to InlineMetadataCodecs.TAG_JSON_GZIP when missing (see the no-codec
-    // overloads of createTableInline / updateTableInline below).
+    // Codec tags parallel to inlineTables / inlineTableUpdates.
     protected final Map<TableIdentifier, Byte> inlineTableCodecs;
     protected final Map<TableIdentifier, Byte> inlineTableUpdateCodecs;
     // Pending renames: from-identifier -> to-identifier. The id stays put; only
@@ -315,15 +313,6 @@ public abstract class CatalogFile {
     }
 
     /**
-     * Creates a table with its metadata stored inline in the catalog. Defaults
-     * the codec to {@link InlineMetadataCodecs#TAG_JSON_GZIP}; use the
-     * codec-aware overload to record a different codec.
-     */
-    public T createTableInline(TableIdentifier table, byte[] metadata) {
-      return createTableInline(table, metadata, InlineMetadataCodecs.TAG_JSON_GZIP);
-    }
-
-    /**
      * Creates a table with metadata stored inline; {@code codecTag} identifies
      * the codec used to encode {@code metadata}.
      */
@@ -352,11 +341,6 @@ public abstract class CatalogFile {
       createTableInline(table, metadata, codecTag);
       inlineTableCreateDeltas.put(table, deltaBytes);
       return self();
-    }
-
-    /** Updates an inline table's metadata (full replacement). */
-    public T updateTableInline(TableIdentifier table, byte[] metadata) {
-      return updateTableInline(table, metadata, InlineMetadataCodecs.TAG_JSON_GZIP);
     }
 
     /**

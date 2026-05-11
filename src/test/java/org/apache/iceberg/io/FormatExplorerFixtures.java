@@ -408,10 +408,8 @@ public class FormatExplorerFixtures {
             + "TableMetadata (format-version 2, schema with 6 fields, "
             + "day-partitioned on ts, four table properties). The "
             + "metadata_codec enum field on the action is CODEC_JSON_GZIP "
-            + "(0). On the wire, proto3 omits the field at the default "
-            + "value, so a gzip-coded record matches what older builds "
-            + "wrote when no codec was specified. Expand 'Show recovered "
-            + "JSON' to see the decompressed TableMetadata.",
+            + "(0). Expand 'Show recovered JSON' to see the decompressed "
+            + "TableMetadata.",
         file, List.of(), List.of(view));
   }
 

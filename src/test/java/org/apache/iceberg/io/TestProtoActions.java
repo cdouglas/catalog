@@ -185,7 +185,8 @@ public class TestProtoActions {
 
   static ProtoCodec.CreateTableInlineAction createTblInline(
       int id, int nsId, String name, int version, int nsVersion, byte[] metadata) {
-    return new ProtoCodec.CreateTableInlineAction(id, version, nsId, nsVersion, name, metadata);
+    return new ProtoCodec.CreateTableInlineAction(
+        id, version, nsId, nsVersion, name, metadata, InlineMetadataCodecs.TAG_JSON_GZIP);
   }
 
   /** CreateTableInline action with an explicit codec tag. */
@@ -198,7 +199,8 @@ public class TestProtoActions {
   /** UpdateTableInline in FULL mode (replace inline metadata). */
   static ProtoCodec.UpdateTableInlineAction updateTblInlineFull(
       int id, int version, byte[] fullMetadata) {
-    return new ProtoCodec.UpdateTableInlineAction(id, version, fullMetadata, null);
+    return ProtoCodec.UpdateTableInlineAction.full(
+        id, version, fullMetadata, InlineMetadataCodecs.TAG_JSON_GZIP);
   }
 
   /** UpdateTableInline in FULL mode with an explicit codec tag. */
@@ -210,7 +212,7 @@ public class TestProtoActions {
   /** UpdateTableInline in POINTER mode (evict to external file). */
   static ProtoCodec.UpdateTableInlineAction updateTblInlinePointer(
       int id, int version, String metadataLocation) {
-    return new ProtoCodec.UpdateTableInlineAction(id, version, null, metadataLocation);
+    return ProtoCodec.UpdateTableInlineAction.pointer(id, version, metadataLocation);
   }
 
   static ProtoCodec.RenameTableAction renameTbl(
@@ -1420,7 +1422,8 @@ public class TestProtoActions {
 
       ProtoCatalogFormat.Mut mut = new ProtoCatalogFormat.Mut(fresh);
       mut.createTableInline(
-          TableIdentifier.of(Namespace.of("db"), "events"), SAMPLE_INLINE_METADATA);
+          TableIdentifier.of(Namespace.of("db"), "events"),
+          SAMPLE_INLINE_METADATA, InlineMetadataCodecs.TAG_JSON_GZIP);
       ProtoCodec.Transaction txn = mut.buildTransaction();
 
       // Should produce a CreateTableInlineAction
@@ -1463,7 +1466,8 @@ public class TestProtoActions {
       byte[] newMeta = "{\"updated\":true}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
       ProtoCatalogFormat.Mut mut = new ProtoCatalogFormat.Mut(fresh);
       mut.updateTableInline(
-          TableIdentifier.of(Namespace.of("db"), "events"), newMeta);
+          TableIdentifier.of(Namespace.of("db"), "events"),
+          newMeta, InlineMetadataCodecs.TAG_JSON_GZIP);
       ProtoCodec.Transaction txn = mut.buildTransaction();
 
       // Should produce an UpdateTableInlineAction
@@ -1489,7 +1493,8 @@ public class TestProtoActions {
       mut.createTable(
           TableIdentifier.of(Namespace.of("db"), "pointer_tbl"), "s3://bucket/pointer/v1");
       mut.createTableInline(
-          TableIdentifier.of(Namespace.of("db"), "inline_tbl"), SAMPLE_INLINE_METADATA);
+          TableIdentifier.of(Namespace.of("db"), "inline_tbl"),
+          SAMPLE_INLINE_METADATA, InlineMetadataCodecs.TAG_JSON_GZIP);
       ProtoCodec.Transaction txn = mut.buildTransaction();
 
       assertThat(txn.actions()).hasSize(2);
