@@ -38,19 +38,52 @@ message InlineTable {
   int32  version              = 2;
   int32  namespace_id         = 3;
   string name                 = 4;
-  bytes  metadata             = 5;  // TableMetadata as JSON bytes
+  bytes  metadata             = 5;  // codec-encoded TableMetadata; codec
+                                    //   identified by `metadata_codec`
   string manifest_list_prefix = 6;  // shared manifest-list path prefix
   repeated ManifestFileEntry     manifest_pool  = 7;  // see SPEC_ML.md
   repeated SnapshotManifestRefs  snapshot_refs  = 8;  // see SPEC_ML.md
+  int32  metadata_codec       = 9;  // codec tag (see "Inline-TM codecs")
 }
 ```
 
-`metadata` is the opaque JSON output of `TableMetadataParser.toJson()`.
-Storing JSON keeps the codec decoupled from `TableMetadataParser`. Fields
-7–8 belong to the manifest-list extension (see SPEC_ML.md). Field 6,
-`manifest_list_prefix`, is the per-table dictionary entry that lets
-`AddSnapshot` deltas carry only the variable suffix of each snapshot's
-manifest-list path.
+`metadata` is opaque bytes produced by an `InlineMetadataCodec`
+(`structural` by default, `gzip` for diagnostic / portable use; see
+"Inline-TM codecs" below). The codec is identified on the wire by
+`metadata_codec`, so different `InlineTable` records and different
+`UpdateTableInline` actions can carry different codecs within the same
+catalog file. Storing the bytes opaque keeps the catalog codec decoupled
+from `TableMetadataParser`.
+
+Fields 7–8 belong to the manifest-list extension (see SPEC_ML.md).
+Field 6, `manifest_list_prefix`, is the per-table dictionary entry that
+lets `AddSnapshot` deltas carry only the variable suffix of each
+snapshot's manifest-list path.
+
+### Inline-TM codecs
+
+Inline `TableMetadata` bytes pass through one of two codecs. Decode is
+always driven by the per-record codec tag on the wire — the writer's
+configured codec only affects newly-written records.
+
+| Codec | Tag | When used |
+|-------|-----|-----------|
+| `structural` | `0x02` | Default. Strips the snapshots and metadata-log arrays out of the canonical JSON envelope and re-encodes them as a binary-structural columnar block (RLE schema ids, templated manifest-list paths, per-snapshot dictionary summaries). 40% smaller than gzip-JSON at the corpus median; 4–7× faster on lazy-decode workloads. |
+| `gzip`       | `0x01` | Iceberg-style `Codec.GZIP` JSON. Diagnostic / portable fallback. Compatible with any tool that knows how to read `metadata.json.gz`. |
+
+The codec selection is recorded in `InlineTable.metadata_codec` and in
+the codec field of each `CreateTableInline` / `UpdateTableInline` action.
+Both codecs preserve the same `TableMetadata` semantics; the on-disk
+shape differs only in how the snapshots and metadata-log are serialized.
+
+**Sentinel handling for inline manifest lists.** Both codecs serialize a
+snapshot's `manifest_list` path as written — if the snapshot's
+`manifestListLocation()` is the catalog sentinel
+`inline://<snapshotId>`, that string is what lands on the wire.
+`InlineSnapshot` (whose `manifestListLocation()` returns `null`) must be
+rewritten to a `BaseSnapshot` carrying the sentinel before encode —
+see "Commit Protocol" below. This keeps both codecs codec-uniform on
+the wire and matches what `wrapInlineManifests` expects on read.
 
 ## Delivery Modes
 
@@ -80,16 +113,22 @@ message CreateTableInline {
   int32  namespace_id      = 3;
   int32  namespace_version = 4;   // -1 if late-bound
   string name              = 5;
-  bytes  metadata          = 6;   // full TableMetadata as JSON bytes
+  bytes  metadata          = 6;   // codec-encoded full TableMetadata
+  int32  metadata_codec    = 7;   // codec tag (omitted when 0x01 / gzip)
+  bytes  delta             = 8;   // OPTIONAL: AddManifestDelta entries
+                                  //   for inline-ML create-with-snapshots
+                                  //   (see SPEC_ML.md)
 }
 
 message UpdateTableInline {
-  int32 id      = 1;
-  int32 version = 2;              // must match current
+  int32 id                  = 1;
+  int32 version             = 2;  // must match current
+  int32 full_metadata_codec = 6;  // codec tag for `full_metadata` payload
+                                  //   (omitted when 0x01 / gzip)
 
   oneof payload {
     TableMetadataDelta delta             = 3;  // structured changes
-    bytes              full_metadata     = 4;  // full JSON
+    bytes              full_metadata     = 4;  // codec-encoded TableMetadata
     string             metadata_location = 5;  // pointer fallback
   }
 }
@@ -98,6 +137,16 @@ message UpdateTableInline {
 `CreateTableInline` verifies the same way as `CreateTable` (namespace
 version check, late-bind support). `UpdateTableInline` verifies on the
 table version, like `UpdateTableLocation`.
+
+`CreateTableInline.delta` carries an encoded `TableMetadataDelta` whose
+updates are exclusively `AddManifestDelta` (one entry per manifest in
+each freshly-created snapshot's manifest list). It is set when the
+create transaction is inline-ML *and* at least one snapshot lands as
+part of the create (e.g. `createTransaction().newFastAppend()`); when
+set, the action's `apply` populates the manifest pool and per-snapshot
+ref list atomically with `addInlineTable`, using the same
+`InlineDeltaCodec.applyDeltaWithManifests` hook the update path uses.
+Absent for plain creates and for inline-TM-without-ML.
 
 ## Delta Structure
 
@@ -300,11 +349,24 @@ this at the top of the diff and returns `null`, which `selectMode`
 routes to **full mode**. Full mode serializes the new TM verbatim, so
 the collision resolves naturally on the next read.
 
+For an **inline-ML** table this routing has one extra constraint: if
+the producer staged a non-empty manifest-list delta against a live
+snapshot in the same commit (so the new ML data must be preserved),
+`commitInline` / `commitTransaction` instead surface
+`CommitFailedException`. Full mode would serialize `TableMetadata`
+without visiting the per-snapshot manifest pool, and pointer-mode
+eviction would clear it; both silently drop the staged ML data. The
+exception triggers the producer's retry loop, which refreshes the
+base and re-stages on top of the rebased state — the colliding id is
+reassigned naturally on the next attempt (Builder picks the next
+free id).
+
 ## Configuration
 
-| Property                | Default | Description |
-|-------------------------|---------|-------------|
-| `fileio.catalog.inline` | `false` | Enable inline TM. When true, `doCommit()` uses delta/full/pointer mode selection instead of writing external metadata files. |
+| Property                          | Default       | Description |
+|-----------------------------------|---------------|-------------|
+| `fileio.catalog.inline`           | `false`       | Enable inline TM. When true, `doCommit()` uses delta/full/pointer mode selection instead of writing external metadata files. |
+| `fileio.catalog.inline.tm.codec`  | `structural`  | Codec for newly-written inline `TableMetadata` bytes. `structural` (binary, columnar) or `gzip` (gzipped JSON). Decode is always driven by the on-wire codec tag, so changing this setting affects only new writes. |
 
 `fileio.catalog.max.append.count` and `fileio.catalog.max.append.size`
 (see [SPEC.md](SPEC.md)) still apply.
@@ -313,28 +375,53 @@ the collision resolves naturally on the next read.
 
 ```
 function doCommit(base, newMetadata):
+    codec = configuredInlineCodec()                    // structural or gzip
     if isCreate:
-        bytes = TableMetadataParser.toJson(newMetadata).getBytes(UTF_8)
+        # Inline-ML create-with-snapshots: rewrite InlineSnapshots to
+        # BaseSnapshot+sentinel and bundle the manifest pool with the
+        # create action.
+        delta = null
+        toEncode = newMetadata
+        if isInlineML() and hasStagedDeltas():
+            staged   = drainStagedDeltas()
+            delta    = encodeDelta(buildAddManifestUpdates(staged))
+            toEncode = rewriteInlineSnapshotsToSentinels(newMetadata)
+        bytes = codec.encode(toEncode)
         format.from(lastCatalogFile)
-            .createTableInline(tableId, bytes)
+            .createTableInlineWithManifests(tableId, bytes, codec.tag(), delta)
             .commit(io)
         return
 
     prefix = lastCatalogFile.manifestListPrefix(tableId)
     delta  = InlineDeltaCodec.computeDelta(base, newMetadata, prefix)
-    mode   = InlineDeltaCodec.selectMode(delta, newMetadata, 0)
+    attachStagedManifestDeltas(delta, newMetadata.snapshots())   // SPEC_ML
+    mode   = InlineDeltaCodec.selectMode(delta, newMetadata, 0, codec)
 
     mut = format.from(lastCatalogFile)
     switch mode:
         case "delta":
             mut.updateTableInlineDelta(tableId, encodeDelta(delta))
         case "full":
-            mut.updateTableInline(tableId, newMetadata.toJson().getBytes(UTF_8))
+            mut.updateTableInline(tableId, codec.encode(newMetadata), codec.tag())
         case "pointer":
             loc = writeMetadataFile(newMetadata)
             mut.updateTable(tableId, loc)
     mut.commit(io)
 ```
+
+The `delta` payload on `createTableInlineWithManifests` is `null` for
+plain (non-ML) creates; the format reverts to the single-action
+`createTableInline` shape (the `delta` field is simply omitted from the
+encoded action — see "Action Messages" above). The
+`rewriteInlineSnapshotsToSentinels` step uses
+`TableMetadata.Builder.replaceSnapshots` — the same hook
+`wrapInlineManifests` uses on the read side — to swap each
+`InlineSnapshot` (whose `manifestListLocation()` is null) for a
+`BaseSnapshot` carrying `inline://<snapshotId>`. This makes the encoded
+TM uniform across both codecs: both the `gzip` and `structural` write
+paths see a snapshot with a non-null sentinel `manifest-list` and emit
+it verbatim, rather than falling into Iceberg's v1-embedded-manifests
+branch (which would lose per-manifest `partitionSpecId` on decode).
 
 ## Table Loading
 

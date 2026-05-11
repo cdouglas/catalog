@@ -58,17 +58,27 @@ The format alternates between them based on log-size thresholds. See
 
 ### Codec Layout
 
-The codec is split across two classes:
+Three codecs cooperate at write/read time:
 
 - `ProtoCodec` handles catalog-level messages: `Checkpoint`, `Transaction`,
   `Action` oneof, all catalog/namespace/table actions.
 - `InlineDeltaCodec` handles inline TM delta messages:
   `TableMetadataDelta`, all 13 `TableMetadataUpdate` types,
   `CompactSummary`, `ManifestFileEntry`.
+- `InlineMetadataCodec` (with two implementations,
+  `StructuralInlineMetadataCodec` and `GzipInlineMetadataCodec`)
+  encodes full `TableMetadata` bytes inside `InlineTable`,
+  `CreateTableInline`, and `UpdateTableInline.full_metadata`. The codec
+  used is identified by a per-record tag on the wire (`structural` /
+  `gzip`); see [SPEC_TM.md](SPEC_TM.md) §"Inline-TM codecs". The
+  writer's `fileio.catalog.inline.tm.codec` property selects the codec
+  for new writes; decode always follows the wire tag, so codecs can
+  mix freely within a single catalog file.
 
-Both implement protobuf wire format manually; neither depends on
+All three implement protobuf wire format manually; none depends on
 `protoc`-generated classes. The output is wire-compatible with
-`catalog.proto` so any protobuf tool can decode it given the schema.
+`catalog.proto` so any protobuf tool can decode the catalog-level
+framing given the schema.
 
 ### Component Separation
 
@@ -91,11 +101,17 @@ configuration is subject to this rule:
 
 - **pointer**: one `UpdateTableLocation` / `CreateTable` action referencing
   a pre-written `v<N>.metadata.json`.
-- **TM inline**: one `UpdateTableInline` action carrying delta or full
-  metadata.
-- **TM+ML inline**: one `UpdateTableInline` action whose delta carries the
-  TM updates *and* the per-snapshot `AddManifestDelta` /
+- **TM inline**: one `UpdateTableInline` / `CreateTableInline` action
+  carrying delta or full metadata (codec-encoded).
+- **TM+ML inline (update)**: one `UpdateTableInline` action whose delta
+  carries the TM updates *and* the per-snapshot `AddManifestDelta` /
   `RemoveManifestDelta` entries in the same blob.
+- **TM+ML inline (create-with-snapshots)**: one `CreateTableInline`
+  action whose `metadata` carries the codec-encoded TM (with sentinel
+  manifest-list locations for every freshly-created snapshot) and
+  whose optional `delta` field carries the matching `AddManifestDelta`
+  entries that populate the pool. Apply runs the create and the
+  manifest-pool fill in the same `Action.apply()` call.
 
 A compaction or crash mid-flight must not be able to observe a half-applied
 commit. ML actions are never written separately from the TM action that
@@ -156,6 +172,32 @@ Two operational rules in `InlineDeltaCodec` keep the bytes stable:
 `Builder.addSnapshot` itself pins `lastUpdatedMillis` to
 `snapshot.timestampMillis()`, which is reconstructed deterministically
 from `base.lastUpdatedMillis() + timestampDeltaMs`.
+
+### I5. Inline-ML snapshots encode as sentinels, never as embedded paths
+
+Every `Snapshot` written into inline-mode `TableMetadata` bytes carries
+a non-null `manifestListLocation()`. For snapshots whose manifest list
+lives in the catalog's manifest pool (inline-ML), that location is the
+sentinel `inline://<snapshotId>`. The `InlineSnapshot` type (which
+returns `null` from `manifestListLocation()`) is a runtime in-memory
+representation only — before any codec encode of `TableMetadata`
+that contains `InlineSnapshot` instances, the snapshots must be
+rewritten to `BaseSnapshot` with the sentinel set, using
+`TableMetadata.Builder.replaceSnapshots`. The rewrite is the only path
+that keeps both codecs (`gzip` and `structural`) producing the same
+on-wire shape: a `manifest-list` field with the sentinel, no embedded
+`manifests` array, no v1-style path list.
+
+On the read side, `wrapInlineManifests` (FileIOCatalog) reverses the
+transformation by swapping each sentinel-bearing `BaseSnapshot` for an
+`InlineSnapshot` whose `manifests` come from the pool. Loading rejects
+a sentinel without a matching pool entry (§2.3 check) — catalog state
+must always satisfy "sentinel ⇒ pool entry".
+
+The delta-update path emits sentinels through `AddSnapshotUpdate`
+(which encodes the manifest-list suffix; for inline-ML the suffix is
+empty and the consumer reconstructs `inline://<snapshotId>`). The
+full-mode and pointer-mode write paths rely on the I5 rewrite.
 
 ## Operation × Operation Conflict Matrix
 
@@ -299,6 +341,21 @@ for write-heavy.
   Iceberg fork** for `ManifestListSink` and `InlineSnapshot`. See the
   [README](../README.md) for fork dependencies.
 
+### Choosing the inline-TM codec
+
+`fileio.catalog.inline.tm.codec` selects between two encoders for
+inline `TableMetadata` bytes; decode always follows the on-wire tag, so
+catalogs can carry a mix produced by different writers.
+
+- `structural` (default) — purpose-built binary-columnar encoder. 40%
+  smaller at the corpus median, 4–7× faster on lazy-decode workloads
+  (current-snapshot lookups, snapshot-history scans). Recommended for
+  production.
+- `gzip` — Iceberg-style `Codec.GZIP` JSON. Useful when an external
+  tool needs to read inline TM bytes by gunzipping them as
+  `metadata.json.gz`, or as a diagnostic fallback. Larger and slower
+  than `structural`; otherwise functionally equivalent.
+
 ## Hand-Rolled Wire Format
 
 `ProtoCodec` and `InlineDeltaCodec` implement protobuf wire format
@@ -321,7 +378,7 @@ classes handle this for you; manual codecs require it as a discipline.
 | `TestProtoActions` | Per-action positive/negative tests, conflict matrix, idempotency, randomized tests, inline tables, manifest-pool round-trip |
 | `TestProtoCommitKnobs` | `max.append.count` / `max.append.size` thresholds; `MockIO` |
 | `TestInlineDelta` | Inline TM delta encode/decode/apply, `computeDelta`, `selectMode`, ML delta types |
-| `TestInlineManifestEndToEnd` | End-to-end commit→reload across BASELINE / TM_ONLY / TM_ML configs; per-`SnapshotProducer` operation coverage |
+| `TestInlineManifestEndToEnd` | End-to-end commit→reload across BASELINE / TM_ONLY / TM_ML configs; per-`SnapshotProducer` operation coverage; codec-axis subclass parameterized over `gzip` / `structural` |
 | `CatalogTests`, `CatalogTransactionTests` | Abstract suites consumed from `iceberg-core-tests.jar` (R4 / commit `35076d6`) and run by cloud-provider subclasses |
 | `GCSCatalogTest`, `TestS3Catalog`, `ADLSCatalogTest` | Cloud integration tests, append-mode + pointer (require credentials/emulators) |
 | `*CAS`, `*InlineTM`, `*InlineML` subclasses | Cloud matrix subclasses overriding `maxAppendCount()` / `inlineTM()` / `inlineML()` -- see [COMPAT.md](COMPAT.md) for status |

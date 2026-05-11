@@ -80,13 +80,15 @@ emulators (LocalStack, fake-gcs-server, Azurite).
 
 ## Configuration
 
-| Property                          | Default     | Effect |
-|-----------------------------------|-------------|--------|
-| `fileio.catalog.inline`           | `false`     | Inline table metadata (no `metadata.json`) |
-| `fileio.catalog.inline.manifests` | `false`     | Inline manifest lists (no `snap-*.avro`); requires `inline=true` |
-| `fileio.catalog.max.append.count` | `10000`     | Hard limit on log records before CAS compaction. `0` forces CAS-only mode (S3 standard, GCS) |
-| `fileio.catalog.max.append.size`  | `16777216`  | Soft target for catalog-file size before compaction |
+| Property                          | Default       | Effect |
+|-----------------------------------|---------------|--------|
+| `fileio.catalog.inline`           | `false`       | Inline table metadata (no `metadata.json`) |
+| `fileio.catalog.inline.manifests` | `false`       | Inline manifest lists (no `snap-*.avro`); requires `inline=true` |
+| `fileio.catalog.inline.tm.codec`  | `structural`  | Codec for newly-written inline `TableMetadata` bytes: `structural` (binary, columnar; default) or `gzip` (Iceberg-style gzipped JSON). Decode follows the on-wire codec tag, so writers can change this setting freely |
+| `fileio.catalog.max.append.count` | `10000`       | Hard limit on log records before CAS compaction. `0` forces CAS-only mode (S3 standard, GCS) |
+| `fileio.catalog.max.append.size`  | `16777216`    | Soft target for catalog-file size before compaction |
+| `fileio.catalog.committed.retention.ms` | `21600000` (6h) | Minimum age before a committed-txn UUID becomes eligible for GC at compaction. `Long.MAX_VALUE` disables; `0` GCs aggressively (not recommended) |
 
 See [docs/SPEC.md](docs/SPEC.md) for the commit protocol and
 [docs/design.md](docs/design.md) for guidance on choosing append vs CAS
-and which inline mode to enable.
+and which inline mode and codec to enable.

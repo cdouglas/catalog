@@ -198,23 +198,69 @@ sink path when the catalog is prepared to store ML deltas.
 
 `stageManifestListDelta` stashes the delta on an instance field keyed by
 snapshot id. After `SnapshotProducer.commit()` returns, `commitInline`
-drains those staged deltas and attaches them to the same intention record
-that carries the TM delta:
+drains those staged deltas and attaches them to the same intention
+record that carries the TM delta:
 
 ```java
 List<DeltaUpdate> delta = InlineDeltaCodec.computeDelta(base, metadata, prefix);
-for (Snapshot newSnap : metadata.snapshots()) {
-  if (base.snapshot(newSnap.snapshotId()) != null) continue;
-  ManifestListDelta mlDelta = stagedDeltas.remove(newSnap.snapshotId());
-  if (mlDelta != null) {
-    InlineDeltaCodec.attachManifestDelta(
-        delta, newSnap.snapshotId(), mlDelta.added(), mlDelta.removedPaths());
+Map<Long, StagedSnapshotData> mlDeltas = ops.drainStagedDeltas();
+
+// Filter staged entries to snapshot ids actually present in the target
+// metadata. Iteration is over the staged map (not metadata.snapshots())
+// so manifest rewrites against an existing snapshot id — compaction /
+// future RewriteManifests / etc. — also reach attachManifestDelta.
+// Orphan stages (snapshot ids no longer in the metadata, e.g. a
+// rolled-back producer run) are dropped here.
+Set<Long> liveSnapIds = metadata.snapshots().stream()
+    .map(Snapshot::snapshotId).collect(toSet());
+for (var entry : mlDeltas.entrySet()) {
+  long snapId = entry.getKey();
+  if (!liveSnapIds.contains(snapId)) continue;        // drop orphan
+  if (delta == null) {                                // see "ID collision"
+    if (entry.getValue().delta.added().isEmpty()
+        && entry.getValue().delta.removedPaths().isEmpty()) continue;
+    throw new CommitFailedException(...);             // force retry
   }
+  InlineDeltaCodec.attachManifestDelta(
+      delta, snapId,
+      entry.getValue().delta.added(),
+      entry.getValue().delta.removedPaths(),
+      prefix);
 }
 ```
 
 A multi-table `commitTransaction` follows the same pattern: deltas are
 drained per table and attached to each table's `UpdateTableInline`.
+
+### Create-with-snapshots
+
+A `createTransaction()` that runs one or more `newFastAppend` calls
+before `commitTransaction()` lands as a single inline create with
+embedded snapshots. The `CreateTableInline` action carries an optional
+`delta` field (`AddManifestDelta` entries only) that
+`InlineDeltaCodec.applyDeltaWithManifests` consumes on apply, exactly
+the way it does for the update path. The TM bytes inside the same
+action carry sentinel manifest-list locations
+(`inline://<snapshotId>`) for every freshly-created snapshot — see
+[SPEC_TM.md](SPEC_TM.md) §"Commit Protocol" for the `InlineSnapshot →
+BaseSnapshot+sentinel` rewrite that produces them. Without the rewrite,
+the `gzip` codec falls into Iceberg's v1-embedded-manifests serialization
+branch and decodes manifests with `partitionSpecId` hardcoded to 0;
+multi-spec create transactions surface the wrong spec on read.
+
+### ID collision under inline-ML
+
+`InlineDeltaCodec.computeDelta` returns `null` when two racing replace
+transactions have independently assigned the same schema / spec /
+sort-order id to different content (see [SPEC_TM.md](SPEC_TM.md)
+§"Concurrent-replace id collisions"). For an inline-ML table with
+non-empty staged ML data on a live snapshot, `commitInline` /
+`commitTransaction` raise `CommitFailedException` rather than
+silently falling back to full or pointer mode — both of those drop
+the staged ML data (full mode serializes `TableMetadata` only; pointer
+mode evicts and clears the pool). The producer's retry loop refreshes
+the base and re-stages on top of the rebased state, where the
+colliding id has been reassigned naturally.
 
 ### Loading
 

@@ -125,15 +125,12 @@ study that informed this choice.
 
 #### Committed-set retention (GC)
 
-> **Status:** implemented (see `docs/GC.md`). Configured via
-> `fileio.catalog.committed.retention.ms` (default 6 hours).
-> Errata D10 + D11 — resolved.
-
 The dedup set in `Checkpoint.committed_transactions` grows monotonically
 across compactions. Without a retention policy, even with v7 compression
 the section's size scales linearly with the catalog's total commit
 history. The retention policy below trims old entries at compaction
 time while preserving the dedup guarantee inside a configurable window.
+See [GC.md](GC.md) for the implementation rationale.
 
 **Premise: UUIDv7 timestamps approximate commit time.** Transaction IDs
 are minted in `ProtoCodec.Transaction.from()` (called from `Mut.commit`)
