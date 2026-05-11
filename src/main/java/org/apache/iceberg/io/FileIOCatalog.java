@@ -781,7 +781,10 @@ public class FileIOCatalog extends BaseMetastoreCatalog
             mut.updateTableInlineDelta(tableId, deltaBytes);
             break;
           case "full":
-            mut.updateTableInline(tableId, codec.encode(metadata), codec.tag());
+            mut.updateTableInline(
+                tableId,
+                codec.encode(rewriteInlineSnapshotsForFullEncode(metadata)),
+                codec.tag());
             break;
           case "pointer":
             String loc = writeUpdateMetadata(false, metadata);
@@ -960,6 +963,57 @@ public class FileIOCatalog extends BaseMetastoreCatalog
     }
   }
 
+  /**
+   * Rewrites any {@link InlineSnapshot} (i.e. snapshots whose
+   * {@link Snapshot#manifestListLocation()} is {@code null}) to a
+   * {@link org.apache.iceberg.BaseSnapshot} carrying the
+   * {@code inline://<snapshotId>} sentinel, then returns a rebuilt
+   * {@link TableMetadata}. Called immediately before
+   * {@code InlineMetadataCodec.encode} on the full-mode commit paths
+   * ({@code commitInline} update branch and {@code commitTransaction}'s
+   * inner full-mode arm) so the on-disk bytes are codec-agnostic.
+   *
+   * <p>Without this rewrite the gzip codec's {@code SnapshotParser.toJson}
+   * falls into the v1-embedded-manifests branch (no {@code manifest-list}
+   * field, an explicit {@code "manifests": [...]} array), and any reader
+   * that decodes those bytes without the catalog's {@code wrapInlineManifests}
+   * rewrap reconstructs {@code GenericManifestFile(specId=0, ...)} — multi-spec
+   * tables silently lose {@code partitionSpecId}. The structural codec
+   * already writes the sentinel via {@code planPaths}; this aligns the gzip
+   * encoding with the structural codec and matches the create-path rewrite
+   * (errata D9).
+   */
+  private static TableMetadata rewriteInlineSnapshotsForFullEncode(TableMetadata metadata) {
+    Map<Long, Snapshot> sentinelReplacements = null;
+    for (Snapshot s : metadata.snapshots()) {
+      if (s.manifestListLocation() != null) {
+        continue;
+      }
+      if (sentinelReplacements == null) {
+        sentinelReplacements = new HashMap<>();
+      }
+      Map<String, String> summary = s.summary() != null
+          ? new HashMap<>(s.summary())
+          : new HashMap<>();
+      if (s.operation() != null && !summary.containsKey("operation")) {
+        summary.put("operation", s.operation());
+      }
+      Snapshot replacement = org.apache.iceberg.InlineDeltaSnapshots.create(
+          s.sequenceNumber(), s.snapshotId(), s.parentId(),
+          s.timestampMillis(), summary, s.schemaId(),
+          "inline://" + s.snapshotId(),
+          s.firstRowId(), s.addedRows(), s.keyId());
+      sentinelReplacements.put(s.snapshotId(), replacement);
+    }
+    if (sentinelReplacements == null) {
+      return metadata;
+    }
+    TableMetadata.Builder b = TableMetadata.buildFrom(metadata);
+    b.replaceSnapshots(sentinelReplacements);
+    b.withMetadataLocation(metadata.metadataFileLocation());
+    return b.discardChanges().build();
+  }
+
   // SupportsCatalogTransaction
 
   @Override
@@ -1085,7 +1139,10 @@ public class FileIOCatalog extends BaseMetastoreCatalog
                   InlineDeltaCodec.encodeDelta(delta, newMetadata.lastUpdatedMillis()));
               break;
             case "full":
-              newCatalog.updateTableInline(tableId, codec.encode(newMetadata), codec.tag());
+              newCatalog.updateTableInline(
+                  tableId,
+                  codec.encode(rewriteInlineSnapshotsForFullEncode(newMetadata)),
+                  codec.tag());
               break;
             default:
               String loc = ops.writeUpdateMetadata(false, newMetadata);

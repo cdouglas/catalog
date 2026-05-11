@@ -1522,6 +1522,277 @@ public class TestInlineManifestEndToEnd {
           .isEqualTo(1);
     }
 
+    /**
+     * Latent full-mode bug (same root cause as D9, different codepath): a
+     * stats-only commit on a multi-spec inline-ML table goes through
+     * {@code commitInline}'s update branch with
+     * {@code computeDelta} returning {@code null} (statisticsChanged → null)
+     * and {@code hasMLPool == true} but no new ML deltas. The
+     * "force delta on populated pool" guard requires {@code delta != null},
+     * so full mode wins. {@code codec.encode(metadata)} then serializes the
+     * in-memory {@link InlineSnapshot}s, whose
+     * {@code manifestListLocation() == null} triggers the v1
+     * embedded-{@code manifests} branch in
+     * {@code SnapshotParser}. The gzip codec decodes those embedded paths
+     * into {@code GenericManifestFile(specId=0, ...)} on reload — single-spec
+     * accidentally works, multi-spec silently surfaces wrong specs.
+     *
+     * <p>Structural codec is unaffected: its {@code planPaths} already writes
+     * the {@code inline://} sentinel even for null
+     * {@code manifestListLocation}, which {@code wrapInlineManifests} then
+     * swaps for the real {@code InlineSnapshot}.
+     */
+    @org.junit.jupiter.params.ParameterizedTest(name = "tm_ml stats-only multi-spec / codec={0}")
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"gzip", "structural"})
+    void tmMlStatsOnlyMultiSpecFullModeRoundTrip(String codecName) throws IOException {
+      MemoryFileIO io = new MemoryFileIO();
+      String wh = "mem:///warehouse-fullmode-multi-" + codecName;
+      Map<String, String> props = InlineConfig.TM_ML.catalogProperties(wh, codecName);
+      FileIOCatalog catalog = new FileIOCatalog(
+          "test", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      catalog.initialize("test", props);
+
+      catalog.createNamespace(Namespace.of("db"));
+      catalog.buildTable(TBL, TEST_SCHEMA).withPartitionSpec(TEST_SPEC).create();
+      Table tbl = catalog.loadTable(TBL);
+      tbl.newFastAppend().appendFile(FILE_A).commit();
+      long firstSnap = tbl.currentSnapshot().snapshotId();
+
+      // Evolve to specId=1 and append under the new spec.
+      tbl.updateSpec().addField("id").commit();
+      tbl.refresh();
+      org.apache.iceberg.PartitionSpec newSpec = tbl.spec();
+      org.apache.iceberg.DataFile multispecFile =
+          org.apache.iceberg.DataFiles.builder(newSpec)
+              .withPath("/path/to/data-multispec.parquet")
+              .withFileSizeInBytes(10)
+              .withPartitionPath("data_bucket=0/id=0")
+              .withRecordCount(1)
+              .build();
+      tbl.newFastAppend().appendFile(multispecFile).commit();
+      tbl.refresh();
+      long secondSnap = tbl.currentSnapshot().snapshotId();
+
+      // Stats-only commit. statisticsChanged() → computeDelta returns null →
+      // selectMode picks "full" → case "full" encodes metadata without
+      // rewriting InlineSnapshots to inline:// sentinels.
+      StatisticsFile stat = new GenericStatisticsFile(
+          secondSnap, "/path/to/stats.puffin", 100, 90, List.of());
+      tbl.updateStatistics().setStatistics(stat).commit();
+
+      // On-disk assertion: the gzip codec must emit inline://<id> sentinels
+      // for InlineSnapshots. Without the rewrite, SnapshotParser's v1
+      // embedded-manifests branch (no manifest-list field) wins, and any
+      // consumer that decodes the bytes without the catalog's
+      // wrapInlineManifests rescue reconstructs GenericManifestFile(specId=0).
+      // Structural codec already writes the sentinel via planPaths.
+      if ("gzip".equals(codecName)) {
+        ProtoCatalogFile decoded = (ProtoCatalogFile) new ProtoCatalogFormat()
+            .read(io, io.newInputFile(wh + "/catalog"));
+        Integer probeTblId = decoded.tableId(TBL);
+        byte[] storedInline = decoded.inlineMetadata(probeTblId);
+        java.util.zip.GZIPInputStream gz =
+            new java.util.zip.GZIPInputStream(new java.io.ByteArrayInputStream(storedInline));
+        String jsonOnDisk = new String(gz.readAllBytes(), StandardCharsets.UTF_8);
+        assertThat(jsonOnDisk)
+            .as("on-disk inline TM (codec=%s) must carry inline:// sentinel "
+                + "for InlineSnapshots so multi-spec is preserved", codecName)
+            .contains("\"manifest-list\":\"inline://" + firstSnap + "\"")
+            .contains("\"manifest-list\":\"inline://" + secondSnap + "\"");
+      }
+
+      // Reload via fresh catalog (forces checkpoint+log replay).
+      FileIOCatalog fresh = new FileIOCatalog(
+          "test2", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      fresh.initialize("test2", props);
+      Table reloaded = fresh.loadTable(TBL);
+      Snapshot reloadedFirst = reloaded.snapshot(firstSnap);
+      Snapshot reloadedSecond = reloaded.snapshot(secondSnap);
+      assertThat(reloadedFirst).isNotNull();
+      assertThat(reloadedSecond).isNotNull();
+
+      List<ManifestFile> firstManifests = reloadedFirst.allManifests(io);
+      List<ManifestFile> secondManifests = reloadedSecond.allManifests(io);
+      assertThat(firstManifests)
+          .as("first snapshot manifests under codec=%s", codecName)
+          .hasSize(1);
+      assertThat(secondManifests)
+          .as("second snapshot manifests under codec=%s", codecName)
+          .hasSize(2);
+
+      assertThat(firstManifests.get(0).partitionSpecId())
+          .as("first snapshot manifest must round-trip under spec 0 (codec=%s)",
+              codecName)
+          .isEqualTo(0);
+      ManifestFile newManifest = secondManifests.stream()
+          .filter(m -> java.util.Objects.equals(m.snapshotId(), reloadedSecond.snapshotId()))
+          .findFirst()
+          .orElseThrow(() -> new AssertionError(
+              "no manifest belongs to second snapshot under codec=" + codecName));
+      assertThat(newManifest.partitionSpecId())
+          .as("new-spec manifest must round-trip under spec 1 after stats-only "
+              + "full-mode commit (codec=%s)", codecName)
+          .isEqualTo(1);
+      assertThat(reloaded.statisticsFiles())
+          .as("stats must survive reload (codec=%s)", codecName)
+          .extracting(StatisticsFile::snapshotId)
+          .containsExactly(secondSnap);
+    }
+
+    /**
+     * Companion of {@link #tmMlStatsOnlyMultiSpecFullModeRoundTrip} for the
+     * multi-table {@code commitTransaction} path. A multi-table catalog
+     * transaction performs the same full-mode encode at
+     * {@code FileIOCatalog#commitTransaction} when its inner update on an
+     * inline-ML multi-spec table happens to fall into full mode (here, by
+     * setting a property in the transaction that flips computeDelta to null
+     * via a sort-order collision is brittle; instead we use the same
+     * stats-only trigger inside the transaction).
+     */
+    @org.junit.jupiter.params.ParameterizedTest(
+        name = "tm_ml stats-only multi-spec / commitTransaction / codec={0}")
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"gzip", "structural"})
+    void tmMlStatsOnlyMultiSpecCommitTransactionRoundTrip(String codecName) throws IOException {
+      MemoryFileIO io = new MemoryFileIO();
+      String wh = "mem:///warehouse-fullmode-multi-txn-" + codecName;
+      Map<String, String> props = InlineConfig.TM_ML.catalogProperties(wh, codecName);
+      FileIOCatalog catalog = new FileIOCatalog(
+          "test", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      catalog.initialize("test", props);
+
+      catalog.createNamespace(Namespace.of("db"));
+      catalog.buildTable(TBL, TEST_SCHEMA).withPartitionSpec(TEST_SPEC).create();
+      Table tbl = catalog.loadTable(TBL);
+      tbl.newFastAppend().appendFile(FILE_A).commit();
+      long firstSnap = tbl.currentSnapshot().snapshotId();
+
+      tbl.updateSpec().addField("id").commit();
+      tbl.refresh();
+      org.apache.iceberg.PartitionSpec newSpec = tbl.spec();
+      org.apache.iceberg.DataFile multispecFile =
+          org.apache.iceberg.DataFiles.builder(newSpec)
+              .withPath("/path/to/data-multispec-txn.parquet")
+              .withFileSizeInBytes(10)
+              .withPartitionPath("data_bucket=0/id=0")
+              .withRecordCount(1)
+              .build();
+      tbl.newFastAppend().appendFile(multispecFile).commit();
+      tbl.refresh();
+      long secondSnap = tbl.currentSnapshot().snapshotId();
+
+      // Stats-only commit inside a catalog transaction — exercises the
+      // matching case "full" arm in FileIOCatalog#commitTransaction.
+      org.apache.iceberg.catalog.CatalogTransaction txn =
+          catalog.createTransaction(
+              org.apache.iceberg.catalog.CatalogTransaction.IsolationLevel.SNAPSHOT);
+      StatisticsFile stat = new GenericStatisticsFile(
+          secondSnap, "/path/to/stats.puffin", 100, 90, List.of());
+      txn.asCatalog().loadTable(TBL)
+          .updateStatistics().setStatistics(stat).commit();
+      txn.commitTransaction();
+
+      // On-disk assertion: full-mode encode in commitTransaction must also
+      // rewrite InlineSnapshots to inline:// sentinels (see companion test).
+      if ("gzip".equals(codecName)) {
+        ProtoCatalogFile probeCatalog = (ProtoCatalogFile) new ProtoCatalogFormat()
+            .read(io, io.newInputFile(wh + "/catalog"));
+        Integer probeTblId = probeCatalog.tableId(TBL);
+        byte[] storedInline = probeCatalog.inlineMetadata(probeTblId);
+        java.util.zip.GZIPInputStream gz =
+            new java.util.zip.GZIPInputStream(new java.io.ByteArrayInputStream(storedInline));
+        String jsonOnDisk = new String(gz.readAllBytes(), StandardCharsets.UTF_8);
+        assertThat(jsonOnDisk)
+            .as("on-disk inline TM in commitTransaction (codec=%s) must carry "
+                + "inline:// sentinel for InlineSnapshots", codecName)
+            .contains("\"manifest-list\":\"inline://" + firstSnap + "\"")
+            .contains("\"manifest-list\":\"inline://" + secondSnap + "\"");
+      }
+
+      FileIOCatalog fresh = new FileIOCatalog(
+          "test2", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      fresh.initialize("test2", props);
+      Table reloaded = fresh.loadTable(TBL);
+      Snapshot reloadedFirst = reloaded.snapshot(firstSnap);
+      Snapshot reloadedSecond = reloaded.snapshot(secondSnap);
+      assertThat(reloadedFirst).isNotNull();
+      assertThat(reloadedSecond).isNotNull();
+
+      List<ManifestFile> firstManifests = reloadedFirst.allManifests(io);
+      List<ManifestFile> secondManifests = reloadedSecond.allManifests(io);
+      assertThat(firstManifests).hasSize(1);
+      assertThat(secondManifests).hasSize(2);
+      assertThat(firstManifests.get(0).partitionSpecId())
+          .as("first snapshot manifest must round-trip under spec 0 (codec=%s)",
+              codecName)
+          .isEqualTo(0);
+      ManifestFile newManifest = secondManifests.stream()
+          .filter(m -> java.util.Objects.equals(m.snapshotId(), reloadedSecond.snapshotId()))
+          .findFirst()
+          .orElseThrow(() -> new AssertionError(
+              "no manifest belongs to second snapshot under codec=" + codecName));
+      assertThat(newManifest.partitionSpecId())
+          .as("new-spec manifest must round-trip under spec 1 after stats-only "
+              + "commitTransaction full-mode commit (codec=%s)", codecName)
+          .isEqualTo(1);
+    }
+
+    /**
+     * Row-lineage round-trip on an inline-ML table. Asserts that V3
+     * row-lineage fields ({@code firstRowId}, {@code addedRows}) survive a
+     * fresh-catalog reload under both codecs. These fields are stored in
+     * the inline TM bytes, not in the manifest pool, so
+     * {@code wrapInlineManifests} can't restore them — anything the encoder
+     * loses is lost user-visibly. Sharpens the "we recover all state from
+     * the catalog" contract beyond manifests/specIds.
+     */
+    @org.junit.jupiter.params.ParameterizedTest(name = "tm_ml row-lineage / codec={0}")
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"gzip", "structural"})
+    void tmMlRowLineageRoundTrips(String codecName) {
+      MemoryFileIO io = new MemoryFileIO();
+      String wh = "mem:///warehouse-rowlineage-" + codecName;
+      Map<String, String> props = InlineConfig.TM_ML.catalogProperties(wh, codecName);
+      FileIOCatalog catalog = new FileIOCatalog(
+          "test", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      catalog.initialize("test", props);
+
+      catalog.createNamespace(Namespace.of("db"));
+      // V3 forces SnapshotProducer to populate firstRowId/addedRows.
+      Map<String, String> tableProps = new HashMap<>();
+      tableProps.put(org.apache.iceberg.TableProperties.FORMAT_VERSION, "3");
+      catalog.buildTable(TBL, TEST_SCHEMA)
+          .withPartitionSpec(TEST_SPEC)
+          .withProperties(tableProps)
+          .create();
+      Table tbl = catalog.loadTable(TBL);
+      tbl.newFastAppend().appendFile(FILE_A).commit();
+      tbl.newFastAppend().appendFile(FILE_B).commit();
+
+      // Pre-reload baseline: the in-memory snapshot must carry the fields.
+      Snapshot beforeReload = tbl.currentSnapshot();
+      assertThat(beforeReload.firstRowId())
+          .as("V3 FastAppend must populate firstRowId (codec=%s)", codecName)
+          .isNotNull();
+      assertThat(beforeReload.addedRows())
+          .as("V3 FastAppend must populate addedRows (codec=%s)", codecName)
+          .isNotNull();
+      Long expectedFirstRowId = beforeReload.firstRowId();
+      Long expectedAddedRows = beforeReload.addedRows();
+
+      // Reload via fresh catalog — exercises the full storage round-trip.
+      FileIOCatalog fresh = new FileIOCatalog(
+          "test2", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      fresh.initialize("test2", props);
+      Table reloaded = fresh.loadTable(TBL);
+      Snapshot reloadedSnap = reloaded.currentSnapshot();
+      assertThat(reloadedSnap).isNotNull();
+      assertThat(reloadedSnap.firstRowId())
+          .as("firstRowId must survive reload (codec=%s)", codecName)
+          .isEqualTo(expectedFirstRowId);
+      assertThat(reloadedSnap.addedRows())
+          .as("addedRows must survive reload (codec=%s)", codecName)
+          .isEqualTo(expectedAddedRows);
+    }
+
     private void runCreateAndAppendRoundTrip(InlineConfig config, String codecName) {
       MemoryFileIO io = new MemoryFileIO();
       String wh = "mem:///warehouse-codec-" + config.name() + "-" + codecName;
