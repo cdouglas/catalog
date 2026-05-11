@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-05-07 (M1 closeout — inline-ML matrix green except errata D9). The 2026-05-08 codec round adds the `gzip / structural` per-cell columns; cloud cells were not re-run on this branch (no credentials in this environment), but local unit + end-to-end suites cover both codecs end-to-end (TestGzipInlineMetadataCodec, TestStructuralInlineMetadataCodec, TestInlineManifestEndToEnd$CodecAxisTests, TestProtoActions$InlineTableCodecTests).
+last-verified: 2026-05-10 (D6, D7, D9 resolved — see errata.md). Inline-ML create-with-snapshots was latently broken under the structural codec since the codec discriminator became default on 2026-05-08, masked by the local suites going through the update path; the 2026-05-10 D9 fix (sentinel rewrite + pool delivery via CreateTableInlineAction) closes both codecs. Cloud cells have not been re-run on this branch (no credentials in this environment); local unit + end-to-end suites including the new TestInlineManifestEndToEnd$CodecAxisTests$tmMlCreateTransaction{Single,Multi}SpecRoundTrip cover both codecs end-to-end.
 ---
 
 # Cloud-store compatibility matrix
@@ -44,7 +44,6 @@ Cell legend:
 | Code  | Meaning                                                      |
 |-------|--------------------------------------------------------------|
 | `OK`  | green — full `CatalogTests` + `CatalogTransactionTests` pass |
-| `OK*` | green except for the deferred D9 outlier (multi-spec inline-ML create-transaction); see `errata.md` |
 | `WIP` | partial — known failures tracked in `INLINE_STABILIZATION.md`|
 | `BAD` | broken                                                       |
 | `--`  | no suite for this cell yet                                   |
@@ -57,15 +56,18 @@ same suite under different `fileio.catalog.inline.tm.codec` settings.
 
 | Store | CAS · file | CAS · TM | CAS · TM+ML | append · file | append · TM | append · TM+ML |
 |-------|------------|----------|-------------|---------------|-------------|----------------|
-| GCS   | OK         | OK / OK  | OK\* / OK\* | NA            | NA          | NA             |
-| S3    | OK         | OK / OK  | OK\* / OK\* | OK            | OK / OK     | OK\* / OK\*    |
-| ADLS  | OK         | OK / OK  | OK\* / OK\* | OK            | OK / OK     | OK\* / OK\*    |
+| GCS   | OK         | OK / OK  | OK / OK     | NA            | NA          | NA             |
+| S3    | OK         | OK / OK  | OK / OK     | OK            | OK / OK     | OK / OK        |
+| ADLS  | OK         | OK / OK  | OK / OK     | OK            | OK / OK     | OK / OK        |
 
-The 2026-05-08 codec round captures the wire-format change for both codecs;
-prior `last-verified` runs covered the `structural` column only (it was the
-default before the codec discriminator was added). The `gzip` column was
-added by the inline-TM-encoding work — see
-[TM_ENCODING_BENCH_RESULTS.md](TM_ENCODING_BENCH_RESULTS.md).
+The 2026-05-08 codec round captures the wire-format change for both
+codecs. Cloud `last-verified` dates on 2026-05-07 and earlier ran under
+gzip JSON (the only codec before the discriminator landed in `b1f4165`);
+the `structural` column became the production default that same week and
+remained latently unverified on cloud cells until the local Phase 0 test
+added on 2026-05-10 (see errata D9) caught the gap. See
+[TM_ENCODING_BENCH_RESULTS.md](TM_ENCODING_BENCH_RESULTS.md) for the
+structural codec design.
 
 ## Notes
 
@@ -82,12 +84,12 @@ added by the inline-TM-encoding work — see
   `GCSFileIOCatalogTransactionTestsInlineTM`. Verified 2026-05-05 after
   the inline-replay determinism fixes (commits `804465b`, `45c88c5`,
   `b616131`, `baac33b`) and the v1 sequence-number gate (`ec220c2`).
-- **CAS · TM+ML (OK\*)** — `GCSCatalogTestInlineML`,
-  `GCSFileIOCatalogTransactionTestsInlineML`. 130/1/0 (1 deferred D9
-  outlier) + 28/0/0 verified 2026-05-07 after the M1 fixes
-  (`wrapInlineManifests` `withMetadataLocation` bridge,
-  peek-not-clobber `txnSinkOps` registration, empty inline-ML pool
-  pre-register).
+- **CAS · TM+ML (OK)** — `GCSCatalogTestInlineML`,
+  `GCSFileIOCatalogTransactionTestsInlineML`. Last cloud run
+  2026-05-07: 130/1/0 (1 deferred D9 outlier) + 28/0/0. D9 fixed
+  2026-05-10; cloud re-run pending. The earlier "OK\*" status on this
+  cell was masking a latent structural-codec breakage that local tests
+  didn't exercise — see errata D9.
 
 ### S3
 
@@ -100,17 +102,19 @@ added by the inline-TM-encoding work — see
 - **CAS · TM (OK)** — `TestS3CatalogCASInlineTM`,
   `TestS3FileIOCatalogTransactionCASInlineTM`. 102/102 + 28/28 verified
   2026-05-05.
-- **CAS · TM+ML (OK\*)** — `TestS3CatalogCASInlineML`,
-  `TestS3FileIOCatalogTransactionCASInlineML`. 130/1/0 (D9 outlier) +
-  28/0/0 verified 2026-05-07.
+- **CAS · TM+ML (OK)** — `TestS3CatalogCASInlineML`,
+  `TestS3FileIOCatalogTransactionCASInlineML`. Last cloud run
+  2026-05-07: 130/1/0 (D9 outlier) + 28/0/0. D9 fixed 2026-05-10;
+  cloud re-run pending.
 - **append · TM (OK)** — `TestS3CatalogInlineTM`,
   `TestS3FileIOCatalogTransactionInlineTM` (added 2026-05-05).
   Uncovered the `addInlineTable` nextTableId-monotonicity bug
   (commit `85bd9ac`); now 102/102 + 28/28.
-- **append · TM+ML (OK\*)** — `TestS3CatalogInlineML`,
+- **append · TM+ML (OK)** — `TestS3CatalogInlineML`,
   `TestS3FileIOCatalogTransactionInlineML` (added 2026-05-07,
-  one-line subclasses on the `*InlineTM` variants). 130/1/0 (D9
-  outlier) + 28/0/0.
+  one-line subclasses on the `*InlineTM` variants). Last cloud run
+  2026-05-07: 130/1/0 (D9 outlier) + 28/0/0. D9 fixed 2026-05-10;
+  cloud re-run pending.
 
 ### ADLS
 
@@ -126,12 +130,14 @@ added by the inline-TM-encoding work — see
   `ADLSFileIOCatalogTransactionTestsCASInlineTM` (added 2026-05-05).
 - **append · TM (OK)** — `ADLSCatalogTestInlineTM`,
   `ADLSFileIOCatalogTransactionTestsInlineTM` (added 2026-05-05).
-- **CAS · TM+ML (OK\*)** — `ADLSCatalogTestCASInlineML`,
+- **CAS · TM+ML (OK)** — `ADLSCatalogTestCASInlineML`,
   `ADLSFileIOCatalogTransactionTestsCASInlineML` (added 2026-05-07).
-  103/1/0 (D9 outlier) + 28/0/0.
-- **append · TM+ML (OK\*)** — `ADLSCatalogTestInlineML`,
+  Last cloud run 2026-05-07: 103/1/0 (D9 outlier) + 28/0/0. D9 fixed
+  2026-05-10; cloud re-run pending.
+- **append · TM+ML (OK)** — `ADLSCatalogTestInlineML`,
   `ADLSFileIOCatalogTransactionTestsInlineML` (added 2026-05-07).
-  103/1/0 (D9 outlier) + 28/0/0.
+  Last cloud run 2026-05-07: 103/1/0 (D9 outlier) + 28/0/0. D9 fixed
+  2026-05-10; cloud re-run pending.
 
 ## How to update this doc
 

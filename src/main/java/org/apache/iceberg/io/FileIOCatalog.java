@@ -578,10 +578,97 @@ public class FileIOCatalog extends BaseMetastoreCatalog
     private void commitInline(TableMetadata base, TableMetadata metadata, boolean isCreate) {
       InlineMetadataCodec codec = inlineCodec;
       if (isCreate) {
-        byte[] metadataBytes = codec.encode(metadata);
-        format.from(lastCatalogFile)
-            .createTableInline(tableId, metadataBytes, codec.tag())
-            .commit(io());
+        // Errata D9: an inline-ML createTransaction with one or more
+        // newFastAppend calls puts InlineSnapshots into `metadata`. Two things
+        // must happen for those snapshots to round-trip on reload:
+        //   1. The encoded TableMetadata must carry a sentinel manifest-list
+        //      location (inline://<snapId>) — not v1-embedded `manifests`
+        //      paths — so wrapInlineManifests can swap in the pool's
+        //      InlineSnapshot. The structural codec already emits this shape
+        //      for null manifestListLocation; the gzip codec falls into the
+        //      v1-embedded branch and loses partitionSpecId. Rewriting
+        //      InlineSnapshot → BaseSnapshot(+sentinel) before encode makes
+        //      both codecs uniform.
+        //   2. The catalog's manifest pool and per-snapshot ref list must be
+        //      populated atomically with the create. We achieve this by
+        //      bundling AddManifestUpdate entries (built from the producer's
+        //      staged ManifestListDelta) into a delta payload that
+        //      CreateTableInlineAction.apply feeds through
+        //      InlineDeltaCodec.applyDeltaWithManifests — the same hook the
+        //      update path uses.
+        byte[] createDeltaBytes = null;
+        TableMetadata metadataToEncode = metadata;
+        if (this instanceof InlineManifestTableOperations
+            && ((InlineManifestTableOperations) this).hasStagedDeltas()) {
+          InlineManifestTableOperations sinkOps = (InlineManifestTableOperations) this;
+          Map<Long, InlineManifestTableOperations.StagedSnapshotData> drained =
+              sinkOps.drainStagedDeltas();
+
+          // Filter to staged entries whose snapshot id is actually in the
+          // metadata being committed (drop orphan stages, same rule as D7).
+          java.util.Set<Long> liveSnapIds = new java.util.HashSet<>();
+          for (org.apache.iceberg.Snapshot snap : metadata.snapshots()) {
+            liveSnapIds.add(snap.snapshotId());
+          }
+
+          // Build the AddManifestUpdate stream for the pool.
+          String manifestPrefix = "";
+          java.util.List<InlineDeltaCodec.DeltaUpdate> deltaUpdates =
+              new java.util.ArrayList<>();
+          for (Map.Entry<Long, InlineManifestTableOperations.StagedSnapshotData> entry
+              : drained.entrySet()) {
+            long snapId = entry.getKey();
+            if (!liveSnapIds.contains(snapId)) {
+              continue;
+            }
+            InlineManifestTableOperations.StagedSnapshotData staged = entry.getValue();
+            InlineDeltaCodec.attachManifestDelta(
+                deltaUpdates, snapId,
+                staged.delta.added(), staged.delta.removedPaths(), manifestPrefix);
+          }
+
+          if (!deltaUpdates.isEmpty()) {
+            createDeltaBytes =
+                InlineDeltaCodec.encodeDelta(deltaUpdates, metadata.lastUpdatedMillis());
+
+            // Rewrite InlineSnapshots → BaseSnapshot with the inline://<id>
+            // sentinel so the on-wire TM is codec-agnostic and matches what
+            // wrapInlineManifests expects.
+            Map<Long, Snapshot> sentinelReplacements = new java.util.HashMap<>();
+            for (Snapshot s : metadata.snapshots()) {
+              if (s.manifestListLocation() == null) {
+                Map<String, String> summary = s.summary() != null
+                    ? new java.util.HashMap<>(s.summary())
+                    : new java.util.HashMap<>();
+                if (s.operation() != null && !summary.containsKey("operation")) {
+                  summary.put("operation", s.operation());
+                }
+                Snapshot replacement = org.apache.iceberg.InlineDeltaSnapshots.create(
+                    s.sequenceNumber(), s.snapshotId(), s.parentId(),
+                    s.timestampMillis(), summary, s.schemaId(),
+                    "inline://" + s.snapshotId(),
+                    s.firstRowId(), s.addedRows(), s.keyId());
+                sentinelReplacements.put(s.snapshotId(), replacement);
+              }
+            }
+            if (!sentinelReplacements.isEmpty()) {
+              TableMetadata.Builder b = TableMetadata.buildFrom(metadata);
+              b.replaceSnapshots(sentinelReplacements);
+              b.withMetadataLocation(metadata.metadataFileLocation());
+              metadataToEncode = b.discardChanges().build();
+            }
+          }
+        }
+
+        byte[] metadataBytes = codec.encode(metadataToEncode);
+        CatalogFile.Mut<?, ?> mut = format.from(lastCatalogFile);
+        if (createDeltaBytes != null) {
+          mut.createTableInlineWithManifests(
+              tableId, metadataBytes, codec.tag(), createDeltaBytes);
+        } else {
+          mut.createTableInline(tableId, metadataBytes, codec.tag());
+        }
+        mut.commit(io());
       } else {
         // Try delta mode first, fall back to full or pointer
         String manifestPrefix = "";

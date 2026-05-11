@@ -1408,6 +1408,120 @@ public class TestInlineManifestEndToEnd {
           .isEqualTo(expectedTag);
     }
 
+    /**
+     * Errata D9 (phase 0 — paradox check): a single {@code createTransaction}
+     * that runs {@code newFastAppend} BEFORE {@code commitTransaction} fires
+     * the inline-ML create-with-snapshots path. This is the path COMPAT.md
+     * claims is OK* but no local test today exercises (the existing
+     * tmMlCreateAndAppendRoundTrips uses a separate create() then
+     * fastAppend(), which goes through the update path).
+     *
+     * <p>The test mirrors {@code testCompleteCreateTransaction} (single-spec)
+     * to first confirm whether create-with-snapshots even round-trips today
+     * under each codec. The follow-up multi-spec test below is the actual
+     * D9 trigger.
+     */
+    @org.junit.jupiter.params.ParameterizedTest(name = "tm_ml createTxn / codec={0}")
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"gzip", "structural"})
+    void tmMlCreateTransactionSingleSpecRoundTrip(String codecName) {
+      MemoryFileIO io = new MemoryFileIO();
+      String wh = "mem:///warehouse-d9-single-" + codecName;
+      Map<String, String> props = InlineConfig.TM_ML.catalogProperties(wh, codecName);
+      FileIOCatalog catalog = new FileIOCatalog(
+          "test", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      catalog.initialize("test", props);
+
+      catalog.createNamespace(Namespace.of("db"));
+      org.apache.iceberg.Transaction txn = catalog.buildTable(TBL, TEST_SCHEMA)
+          .withPartitionSpec(TEST_SPEC)
+          .createTransaction();
+      txn.newFastAppend().appendFile(FILE_A).commit();
+      txn.commitTransaction();
+
+      FileIOCatalog fresh = new FileIOCatalog(
+          "test2", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      fresh.initialize("test2", props);
+      Table reloaded = fresh.loadTable(TBL);
+      assertThat(reloaded.currentSnapshot())
+          .as("snapshot must survive create-transaction reload under codec=%s", codecName)
+          .isNotNull();
+      List<ManifestFile> manifests = reloaded.currentSnapshot().allManifests(io);
+      assertThat(manifests)
+          .as("manifest list must round-trip under codec=%s", codecName)
+          .hasSize(1);
+      assertThat(manifests.get(0).partitionSpecId())
+          .as("manifest must round-trip under correct spec id under codec=%s", codecName)
+          .isEqualTo(0);
+    }
+
+    /**
+     * Errata D9 (phase 0): the actual D9 trigger — multi-spec createTransaction.
+     * Mirrors {@code testCompleteCreateTransactionMultipleSchemas} but pinned
+     * to a specific codec.
+     */
+    @org.junit.jupiter.params.ParameterizedTest(name = "tm_ml createTxn multi-spec / codec={0}")
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"gzip", "structural"})
+    void tmMlCreateTransactionMultiSpecRoundTrip(String codecName) {
+      MemoryFileIO io = new MemoryFileIO();
+      String wh = "mem:///warehouse-d9-multi-" + codecName;
+      Map<String, String> props = InlineConfig.TM_ML.catalogProperties(wh, codecName);
+      FileIOCatalog catalog = new FileIOCatalog(
+          "test", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      catalog.initialize("test", props);
+
+      catalog.createNamespace(Namespace.of("db"));
+      org.apache.iceberg.Transaction txn = catalog.buildTable(TBL, TEST_SCHEMA)
+          .withPartitionSpec(TEST_SPEC)
+          .createTransaction();
+      txn.newFastAppend().appendFile(FILE_A).commit();
+      // Evolve the spec by adding a new partition field.
+      txn.updateSpec().addField("id").commit();
+      org.apache.iceberg.PartitionSpec newSpec = txn.table().spec();
+      org.apache.iceberg.DataFile anotherFile =
+          org.apache.iceberg.DataFiles.builder(newSpec)
+              .withPath("/path/to/data-multispec.parquet")
+              .withFileSizeInBytes(10)
+              .withPartitionPath("data_bucket=0/id=0")
+              .withRecordCount(1)
+              .build();
+      txn.newFastAppend().appendFile(anotherFile).commit();
+      txn.commitTransaction();
+
+      FileIOCatalog fresh = new FileIOCatalog(
+          "test2", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      fresh.initialize("test2", props);
+      Table reloaded = fresh.loadTable(TBL);
+      assertThat(reloaded.snapshots())
+          .as("two snapshots must survive reload under codec=%s", codecName)
+          .hasSize(2);
+
+      // Find manifests per snapshot and confirm partitionSpecId is preserved
+      // (this is the D9 assertion).
+      java.util.List<org.apache.iceberg.Snapshot> snaps =
+          new java.util.ArrayList<org.apache.iceberg.Snapshot>();
+      reloaded.snapshots().forEach(snaps::add);
+      org.apache.iceberg.Snapshot first = snaps.get(0);
+      org.apache.iceberg.Snapshot second = snaps.get(1);
+      List<ManifestFile> firstManifests = first.allManifests(io);
+      List<ManifestFile> secondManifests = second.allManifests(io);
+      assertThat(firstManifests).hasSize(1);
+      assertThat(secondManifests).hasSize(2);
+      assertThat(firstManifests.get(0).partitionSpecId())
+          .as("first snapshot manifest must be under spec 0 under codec=%s", codecName)
+          .isEqualTo(0);
+      // The second snapshot has two manifests: the inherited one (spec 0) and
+      // the new one written under spec 1. The new manifest is the one whose
+      // snapshotId matches `second`.
+      ManifestFile newManifest = secondManifests.stream()
+          .filter(m -> java.util.Objects.equals(m.snapshotId(), second.snapshotId()))
+          .findFirst()
+          .orElseThrow(() -> new AssertionError(
+              "no manifest belongs to second snapshot under codec=" + codecName));
+      assertThat(newManifest.partitionSpecId())
+          .as("D9: new-spec manifest must round-trip under correct spec id (codec=%s)", codecName)
+          .isEqualTo(1);
+    }
+
     private void runCreateAndAppendRoundTrip(InlineConfig config, String codecName) {
       MemoryFileIO io = new MemoryFileIO();
       String wh = "mem:///warehouse-codec-" + config.name() + "-" + codecName;

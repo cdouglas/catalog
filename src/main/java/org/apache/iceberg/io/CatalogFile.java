@@ -103,6 +103,12 @@ public abstract class CatalogFile {
     protected final Map<TableIdentifier, byte[]> inlineTables;
     protected final Map<TableIdentifier, byte[]> inlineTableUpdates;
     protected final Map<TableIdentifier, byte[]> inlineTableDeltaUpdates;
+    // Initial manifest-pool delta for inline-ML create-with-snapshots. Parallel
+    // to {@link #inlineTables}: an entry here carries the AddManifestUpdate
+    // payload that {@link ProtoCodec.CreateTableInlineAction#apply} applies
+    // immediately after the table create. {@code null} / absent for non-ML
+    // creates and for inline-ML creates with no snapshots. Errata D9.
+    protected final Map<TableIdentifier, byte[]> inlineTableCreateDeltas;
     // Codec tags parallel to inlineTables / inlineTableUpdates. Entries default
     // to InlineMetadataCodecs.TAG_JSON_GZIP when missing (see the no-codec
     // overloads of createTableInline / updateTableInline below).
@@ -122,6 +128,7 @@ public abstract class CatalogFile {
       this.inlineTables = Maps.newHashMap();
       this.inlineTableUpdates = Maps.newHashMap();
       this.inlineTableDeltaUpdates = Maps.newHashMap();
+      this.inlineTableCreateDeltas = Maps.newHashMap();
       this.inlineTableCodecs = Maps.newHashMap();
       this.inlineTableUpdateCodecs = Maps.newHashMap();
       this.tableRenames = Maps.newHashMap();
@@ -330,6 +337,20 @@ public abstract class CatalogFile {
       }
       inlineTables.put(table, metadata);
       inlineTableCodecs.put(table, codecTag);
+      return self();
+    }
+
+    /**
+     * Creates an inline-ML table whose initial commit contains one or more
+     * staged snapshots. {@code deltaBytes} carries the AddManifestUpdate entries
+     * that populate the per-table manifest pool atomically with the table
+     * create — required so the on-disk encoded TableMetadata's
+     * {@code inline://&lt;snapId&gt;} sentinels resolve on reload. Errata D9.
+     */
+    public T createTableInlineWithManifests(
+        TableIdentifier table, byte[] metadata, byte codecTag, byte[] deltaBytes) {
+      createTableInline(table, metadata, codecTag);
+      inlineTableCreateDeltas.put(table, deltaBytes);
       return self();
     }
 

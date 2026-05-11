@@ -155,56 +155,53 @@ If we ever do this work, the natural cuts are:
 Until any of those triggers, the JSON-as-bytes path is correct and the
 encoder cost outweighs the benefit.
 
-### D9. Inline-ML create-transaction loses per-manifest `partitionSpecId`
+### D9. Inline-ML create-transaction loses per-manifest `partitionSpecId` — RESOLVED
 
-Reproduced by `testCompleteCreateTransactionMultipleSchemas` on the
-`*InlineML` matrix only (the inline-TM-only matrix passes the same
-test). A `createTransaction()` that appends FILE_A under spec 0,
-evolves the spec to 1, then appends `anotherFile` under spec 1
-correctly stages two `InlineSnapshot`s — but the file read back at
-spec 1 surfaces with `specId() == 0`.
+Resolved 2026-05-10. The scope was larger than originally described:
+pre-fix, inline-ML create-with-snapshots was broken under **both**
+codecs.
 
-Root cause: `FileIOTableOperations#commitInline` `isCreate=true`
-serializes the full `TableMetadata` via `TableMetadataParser.toJson`.
-For each `InlineSnapshot` (whose `manifestListLocation()` is null),
-`SnapshotParser.toJson` falls into the v1-embedded-manifests branch and
-writes only the manifest paths as a string array — losing the
-per-manifest `partitionSpecId` that lived on the `ManifestFile`. On
-read, `SnapshotParser.fromJson` reconstructs each entry through
-`new GenericManifestFile(InputFile, /* specId= */ 0, snapshotId)`
-(`GenericManifestFile.java:78`) — `specId` is hardcoded to `0`.
-`ManifestFiles.read` then uses `manifest.partitionSpecId()` for the
-spec lookup, so files in the spec-1 manifest are decoded against
-spec 0.
+- **gzip**: `TableMetadataParser.toJson(meta)` on an `InlineSnapshot`
+  fell into the v1-embedded-manifests branch and wrote only the
+  manifest paths as strings; on decode `GenericManifestFile(InputFile,
+  /*specId=*/0, snapshotId)` hardcoded spec 0. Single-spec
+  accidentally worked; multi-spec produced the originally-tracked
+  `specId() == 0` symptom.
+- **structural**: `planPaths` emits an `inline://<snapId>` sentinel for
+  any snapshot with null `manifestListLocation`, but
+  `CreateTableInlineAction.apply` never populated the manifest pool, so
+  `wrapInlineManifests` §2.3 threw "catalog state corrupt" on every
+  inline-ML create-with-snapshots reload. This breakage was latent in
+  COMPAT.md's `OK*` cells for the structural column — the inheriting
+  cloud test suites hadn't been re-run since the codec discriminator
+  became default on 2026-05-08, and the local suites' inline-ML
+  tests use a separate `create()` then `fastAppend()` (which goes
+  through the update path, not create-with-snapshots).
 
-`commitInline` `isCreate=false` (the update path) does not have this
-problem because it uses delta encoding: the `inline://<snapId>`
-sentinel is written into the TM JSON, the catalog's manifest pool
-holds the actual `ManifestFile` entries, and `wrapInlineManifests`
-swaps `BaseSnapshot+sentinel` for `InlineSnapshot+pool` on read,
-preserving `partitionSpecId`.
+Fix implemented:
 
-**Fix path:** route inline-ML create through the same
-sentinel + pool encoding as the update path. Concretely, in
-`commitInline` `isCreate=true`:
+1. `FileIOCatalog.commitInline isCreate=true` (FileIOCatalog.java:580)
+   drains `InlineManifestTableOperations.stagedDeltas`, builds a
+   delta of `AddManifestUpdate` entries via
+   `InlineDeltaCodec.attachManifestDelta`, and rewrites InlineSnapshots
+   → `BaseSnapshot` with `inline://<snapId>` sentinel via
+   `TableMetadata.Builder.replaceSnapshots`. The encoded TM is now
+   codec-agnostic — both codecs emit sentinel-shaped snapshots.
+2. `CreateTableInlineAction` (ProtoCodec.java:2447) gained an optional
+   `deltaBytes` payload (wire field 8). On apply, after
+   `addInlineTable`, the action calls
+   `InlineDeltaCodec.applyDeltaWithManifests` — the same hook the
+   update path uses — to populate the per-table manifest pool and
+   per-snapshot ref list atomically with the create.
+3. New `Mut.createTableInlineWithManifests(table, bytes, codec, delta)`
+   (CatalogFile.java) wires the staged delta from `FileIOCatalog`
+   through `ProtoCatalogFormat.Mut.buildActions` to the action.
 
-1. Drain `stagedDeltas` from the InlineManifestTableOperations.
-2. Replace each `InlineSnapshot` in `metadata` with a `BaseSnapshot`
-   whose `manifestListLocation` is `inline://<snapId>`, using
-   `TableMetadata.Builder.replaceSnapshots` (the same hook
-   `wrapInlineManifests` uses on the read side).
-3. Serialize the rewritten metadata; the JSON now carries sentinel
-   manifest-list locations, not embedded paths.
-4. Atomically `createTableInline` the bytes AND populate the manifest
-   pool from the drained deltas. The Mut interface doesn't currently
-   expose pool-during-create — adding a `createTableInlineWithManifests`
-   method (or extending `CreateTableInlineAction` with manifest-pool
-   fields, mirroring `UpdateTableInlineAction`'s delta path) closes
-   the gap.
-
-Until this lands, inline-ML create-transactions are limited to
-single-spec tables. The doc references this as the M1 outlier in
-`INLINE_STABILIZATION.md`.
+Regression tests:
+`TestInlineManifestEndToEnd$CodecAxisTests.tmMlCreateTransactionSingleSpecRoundTrip`
+and `.tmMlCreateTransactionMultiSpecRoundTrip` — each parameterized
+across `gzip` and `structural`. All four cases verified to fail
+without the fix.
 
 ### D4. `RewriteTablePathUtil` does not handle inline-ML tables
 

@@ -481,8 +481,9 @@ public class ProtoCatalogFormat
         }
 
         int tblId = idManager.allocateTblid();
+        byte[] createDelta = inlineTableCreateDeltas.get(ident);
         actions.add(new ProtoCodec.CreateTableInlineAction(
-            tblId, 1, nsId, nsVersion, ident.name(), metadata, codec));
+            tblId, 1, nsId, nsVersion, ident.name(), metadata, codec, createDelta));
       }
 
       // Process inline table updates (full mode)

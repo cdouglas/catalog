@@ -212,6 +212,9 @@ public class ProtoCodec {
   private static final int CREATE_INLINE_TBL_NAME = 5;
   private static final int CREATE_INLINE_TBL_METADATA = 6;
   private static final int CREATE_INLINE_TBL_METADATA_CODEC = 7;
+  // Optional delta bytes carrying initial manifest-pool entries for an
+  // inline-ML create-with-snapshots commit. See errata D9.
+  private static final int CREATE_INLINE_TBL_DELTA = 8;
 
   // RenameTable field numbers
   private static final int RENAME_TBL_ID = 1;
@@ -1207,6 +1210,9 @@ public class ProtoCodec {
       if (a.metadataCodec != InlineMetadataCodecs.TAG_JSON_GZIP) {
         writeVarint(inner, CREATE_INLINE_TBL_METADATA_CODEC, a.metadataCodec & 0xFF);
       }
+      if (a.deltaBytes != null) {
+        writeBytes(inner, CREATE_INLINE_TBL_DELTA, a.deltaBytes);
+      }
       writeLengthDelimited(out, ACTION_CREATE_TABLE_INLINE, inner.toByteArray());
     } else if (action instanceof RenameTableAction) {
       RenameTableAction a = (RenameTableAction) action;
@@ -1467,6 +1473,7 @@ public class ProtoCodec {
     String name = "";
     byte[] metadata = new byte[0];
     byte metadataCodec = InlineMetadataCodecs.TAG_JSON_GZIP;
+    byte[] deltaBytes = null;
 
     while (in.available() > 0) {
       int tag = readVarint(in);
@@ -1493,12 +1500,15 @@ public class ProtoCodec {
         case CREATE_INLINE_TBL_METADATA_CODEC:
           metadataCodec = (byte) readVarint(in);
           break;
+        case CREATE_INLINE_TBL_DELTA:
+          deltaBytes = readLengthDelimitedBytes(in);
+          break;
         default:
           skipField(in, tag & 0x7);
       }
     }
     return new CreateTableInlineAction(
-        id, version, nsId, nsVersion, name, metadata, metadataCodec);
+        id, version, nsId, nsVersion, name, metadata, metadataCodec, deltaBytes);
   }
 
   private static UpdateTableInlineAction decodeUpdateTableInline(byte[] bytes) throws IOException {
@@ -2453,17 +2463,33 @@ public class ProtoCodec {
     final byte[] metadata;
     /** Codec used to encode {@link #metadata}. */
     final byte metadataCodec;
+    /**
+     * Optional initial manifest-pool delta. Set when an inline-ML
+     * create-transaction commits with one or more staged snapshots — apply()
+     * routes these entries through {@link InlineDeltaCodec#applyDeltaWithManifests}
+     * so the per-table manifest pool and per-snapshot ref list are populated
+     * atomically with the table create. {@code null} for non-inline-ML
+     * creates and for inline-ML creates with no snapshots. See errata D9.
+     */
+    final byte[] deltaBytes;
 
     public CreateTableInlineAction(
         int id, int version, int namespaceId, int namespaceVersion,
         String name, byte[] metadata) {
       this(id, version, namespaceId, namespaceVersion, name, metadata,
-          InlineMetadataCodecs.TAG_JSON_GZIP);
+          InlineMetadataCodecs.TAG_JSON_GZIP, null);
     }
 
     public CreateTableInlineAction(
         int id, int version, int namespaceId, int namespaceVersion,
         String name, byte[] metadata, byte metadataCodec) {
+      this(id, version, namespaceId, namespaceVersion, name, metadata,
+          metadataCodec, null);
+    }
+
+    public CreateTableInlineAction(
+        int id, int version, int namespaceId, int namespaceVersion,
+        String name, byte[] metadata, byte metadataCodec, byte[] deltaBytes) {
       this.id = id;
       this.version = version;
       this.namespaceId = namespaceId;
@@ -2471,6 +2497,7 @@ public class ProtoCodec {
       this.name = name;
       this.metadata = metadata;
       this.metadataCodec = metadataCodec;
+      this.deltaBytes = deltaBytes;
     }
 
     @Override
@@ -2489,6 +2516,14 @@ public class ProtoCodec {
       // manifest list prefix is derived from metadata at checkpoint time;
       // for newly created tables, we default to empty (set later on first snapshot)
       builder.addInlineTable(id, namespaceId, name, version, metadata, metadataCodec, "");
+      if (deltaBytes != null) {
+        // Inline-ML create: feed the initial manifest-pool delta through the
+        // same machinery the update path uses. Decodes against the just-stored
+        // metadata bytes so the per-snapshot ref list can carry forward from
+        // each snapshot's parent within the same create transaction.
+        InlineDeltaCodec.applyDeltaWithManifests(
+            metadata, InlineMetadataCodecs.byTag(metadataCodec), deltaBytes, builder, id);
+      }
       // Adding a table mutates the parent's children set; bump so concurrent
       // ns mutations fail verify. Same rule as CreateTableAction.
       builder.bumpNamespaceVersion(namespaceId);
