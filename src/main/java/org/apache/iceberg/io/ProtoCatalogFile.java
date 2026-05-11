@@ -758,6 +758,20 @@ public class ProtoCatalogFile extends CatalogFile {
     }
 
     /**
+     * Returns the set of snapshot ids for which this table has manifest ref
+     * lists in the pool. Used by full-mode replay to reconcile pool refs
+     * against the new {@code TableMetadata} (drop refs for snapshots that
+     * are no longer present).
+     */
+    public Set<Long> snapshotManifestKeys(int tblId) {
+      Map<Long, List<String>> refs = snapshotManifests.get(tblId);
+      if (refs == null) {
+        return java.util.Collections.emptySet();
+      }
+      return new HashSet<>(refs.keySet());
+    }
+
+    /**
      * Drops a snapshot's manifest ref list and GCs any pool entries no longer
      * referenced. Called from RemoveSnapshotsUpdate replay to prevent unbounded
      * pool growth after snapshot expiration. See ML_INLINE_DESIGN_NOTES.md Gap 1.

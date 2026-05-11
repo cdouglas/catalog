@@ -27,11 +27,15 @@ import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import org.apache.iceberg.ManifestContent;
 import org.apache.iceberg.ManifestFile;
+import org.apache.iceberg.Snapshot;
+import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.ManifestFile.PartitionFieldSummary;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
@@ -2433,14 +2437,41 @@ public class ProtoCodec {
         }
       } else if (fullMetadata != null) {
         // FULL mode: replace inline metadata bytes in place, preserving the
-        // manifest pool and snapshot refs. `removeInlineMetadata` (used by
-        // the POINTER branch below) also clears the pool — that's the correct
-        // behavior for pointer-mode eviction, but would silently corrupt an
-        // ML-populated table on a non-ML commit (schema evolution, etc.).
-        // See ML_INLINE_REVIEW2.md §1.1.
+        // manifest pool. `removeInlineMetadata` (used by the POINTER branch
+        // below) also clears the pool — that's the correct behavior for
+        // pointer-mode eviction, but would silently corrupt an ML-populated
+        // table on a non-ML commit (schema evolution, etc.). See
+        // ML_INLINE_REVIEW2.md §1.1.
         ProtoCatalogFile.TblEntry old = builder.tableEntry(id);
         if (old != null) {
           builder.updateInlineMetadata(id, version + 1, fullMetadata, fullMetadataCodec);
+          // Reconcile snapshot manifest refs (and orphan'd pool entries)
+          // against the snapshots present in the new TM. Delta-mode replay
+          // handles this via RemoveSnapshotsUpdate (InlineDeltaCodec
+          // line 317); full-mode replay swaps the entire TM bytes in one
+          // shot, so we re-derive the live snapshot set from the new bytes
+          // and prune anything that's no longer referenced. Without this,
+          // a full-mode commit that drops a snapshot (e.g. expireSnapshots
+          // co-committed with a statistics change that flips computeDelta
+          // to null) leaves orphan refs that bloat the catalog file and
+          // reference storage paths storage GC may later delete.
+          //
+          // Only ML-populated tables have refs to reconcile; skip the decode
+          // for TM-only inline tables (no pool entries to prune anyway).
+          Set<Long> existingRefs = builder.snapshotManifestKeys(id);
+          if (!existingRefs.isEmpty()) {
+            InlineMetadataCodec codec = InlineMetadataCodecs.byTag(fullMetadataCodec);
+            TableMetadata newMeta = codec.decodeFull(fullMetadata, "inline://reconcile");
+            Set<Long> liveSnapIds = new HashSet<>();
+            for (Snapshot s : newMeta.snapshots()) {
+              liveSnapIds.add(s.snapshotId());
+            }
+            for (Long staleId : existingRefs) {
+              if (!liveSnapIds.contains(staleId)) {
+                builder.removeSnapshotManifests(id, staleId);
+              }
+            }
+          }
         }
       } else if (metadataLocation != null) {
         // POINTER mode: evict from inline to pointer

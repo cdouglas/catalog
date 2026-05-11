@@ -1793,6 +1793,120 @@ public class TestInlineManifestEndToEnd {
           .isEqualTo(expectedAddedRows);
     }
 
+    /**
+     * Pool-orphan check: a full-mode commit that drops a snapshot must
+     * reconcile the catalog's per-snapshot manifest refs and shared pool
+     * against the new {@code TableMetadata}. The full-mode replay
+     * ({@code UpdateTableInlineAction.apply} → {@code updateInlineMetadata})
+     * preserves the pool wholesale; delta-mode replay reconciles via
+     * {@code RemoveSnapshotsUpdate}. Combine snapshot expiration with a
+     * statistics change to force {@code computeDelta} to return null
+     * (statistics changes flip selectMode to "full") and verify the
+     * dropped snapshot's pool refs are pruned.
+     */
+    @Test
+    void fullModeSnapshotRemovalReconcilesPool() {
+      MemoryFileIO io = new MemoryFileIO();
+      String wh = "mem:///warehouse-poolorphan";
+      Map<String, String> props = InlineConfig.TM_ML.catalogProperties(wh);
+      FileIOCatalog catalog = new FileIOCatalog(
+          "test", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      catalog.initialize("test", props);
+
+      catalog.createNamespace(Namespace.of("db"));
+      catalog.buildTable(TBL, TEST_SCHEMA).withPartitionSpec(TEST_SPEC).create();
+      Table tbl = catalog.loadTable(TBL);
+      tbl.newFastAppend().appendFile(FILE_A).commit();
+      long firstSnap = tbl.currentSnapshot().snapshotId();
+      // Roll the main branch forward off firstSnap so it's expirable.
+      tbl.newFastAppend().appendFile(FILE_B).commit();
+      long secondSnap = tbl.currentSnapshot().snapshotId();
+
+      // Sanity: pool has refs for both snapshots before the full-mode commit.
+      ProtoCatalogFile before = (ProtoCatalogFile) new ProtoCatalogFormat()
+          .read(io, io.newInputFile(wh + "/catalog"));
+      Integer tblId = before.tableId(TBL);
+      assertThat(before.snapshotManifests(tblId).keySet())
+          .as("baseline: both snapshots have pool refs")
+          .containsExactlyInAnyOrder(firstSnap, secondSnap);
+
+      // Single transaction: drop firstSnap AND change statistics. The stats
+      // change makes computeDelta return null, forcing full-mode replay.
+      org.apache.iceberg.Transaction txn = tbl.newTransaction();
+      txn.expireSnapshots().expireSnapshotId(firstSnap).commit();
+      StatisticsFile stat = new GenericStatisticsFile(
+          secondSnap, "/path/to/stats.puffin", 100, 90, List.of());
+      txn.updateStatistics().setStatistics(stat).commit();
+      txn.commitTransaction();
+
+      // After commit: the catalog must have dropped firstSnap from the
+      // per-snapshot ref list AND from the shared pool. Today the
+      // full-mode apply path preserves the pool wholesale, so this test
+      // fails — exposing the orphan-leak invariant gap.
+      ProtoCatalogFile after = (ProtoCatalogFile) new ProtoCatalogFormat()
+          .read(io, io.newInputFile(wh + "/catalog"));
+      Integer tblIdAfter = after.tableId(TBL);
+      assertThat(after.snapshotManifests(tblIdAfter).keySet())
+          .as("snapshotManifests must not retain a ref list for an expired snapshot")
+          .containsExactly(secondSnap);
+      // Pool: firstSnap's manifest must be gone (it isn't shared with secondSnap;
+      // FILE_A and FILE_B live in distinct manifests).
+      java.util.Set<String> remainingPaths = after.manifestPool(tblIdAfter).keySet();
+      java.util.Set<String> stillReferenced = new java.util.HashSet<>(
+          after.snapshotManifests(tblIdAfter).getOrDefault(secondSnap, List.of()));
+      assertThat(remainingPaths)
+          .as("manifest pool must contain only paths still referenced by live snapshots")
+          .isEqualTo(stillReferenced);
+    }
+
+    /**
+     * Pool/metadata keyset invariant: after any committed sequence on an
+     * inline-ML table, every snapshot id in {@code snapshotManifests} must
+     * also be in {@code TableMetadata.snapshots()}. Orphan refs in
+     * {@code snapshotManifests} (a snapshot id with no matching live
+     * snapshot) signal a reconciliation bug. Runs a representative
+     * sequence — create, multi-append, expire — under both codecs.
+     */
+    @org.junit.jupiter.params.ParameterizedTest(name = "tm_ml keyset invariant / codec={0}")
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"gzip", "structural"})
+    void tmMlSnapshotManifestKeysetSubsetOfLiveSnapshots(String codecName) {
+      MemoryFileIO io = new MemoryFileIO();
+      String wh = "mem:///warehouse-keyset-" + codecName;
+      Map<String, String> props = InlineConfig.TM_ML.catalogProperties(wh, codecName);
+      FileIOCatalog catalog = new FileIOCatalog(
+          "test", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      catalog.initialize("test", props);
+
+      catalog.createNamespace(Namespace.of("db"));
+      catalog.buildTable(TBL, TEST_SCHEMA).withPartitionSpec(TEST_SPEC).create();
+      Table tbl = catalog.loadTable(TBL);
+      tbl.newFastAppend().appendFile(FILE_A).commit();
+      long firstSnap = tbl.currentSnapshot().snapshotId();
+      tbl.newFastAppend().appendFile(FILE_B).commit();
+      // Expire the first snapshot via a normal expire (delta-path).
+      tbl.expireSnapshots().expireSnapshotId(firstSnap).commit();
+
+      ProtoCatalogFile cat = (ProtoCatalogFile) new ProtoCatalogFormat()
+          .read(io, io.newInputFile(wh + "/catalog"));
+      Integer tblId = cat.tableId(TBL);
+
+      // Recover the live snapshot ids from the catalog (via the catalog's
+      // own load path, since that's the authoritative reload contract).
+      FileIOCatalog fresh = new FileIOCatalog(
+          "test2", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      fresh.initialize("test2", props);
+      Table reloaded = fresh.loadTable(TBL);
+      java.util.Set<Long> liveSnapIds = new java.util.HashSet<>();
+      for (Snapshot s : reloaded.snapshots()) {
+        liveSnapIds.add(s.snapshotId());
+      }
+
+      assertThat(cat.snapshotManifests(tblId).keySet())
+          .as("snapshotManifests keys must be a subset of live snapshot ids "
+              + "(codec=%s)", codecName)
+          .isSubsetOf(liveSnapIds);
+    }
+
     private void runCreateAndAppendRoundTrip(InlineConfig config, String codecName) {
       MemoryFileIO io = new MemoryFileIO();
       String wh = "mem:///warehouse-codec-" + config.name() + "-" + codecName;
