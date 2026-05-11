@@ -325,7 +325,7 @@ from external storage.
 ## Iceberg-Core Hooks
 
 The fork in `../iceberg/` adds these extension points (all on the
-`vldb-1.10.1-ml` branch):
+`atomicio` branch, alongside the atomic-operations hooks):
 
 | Hook | File | Notes |
 |------|------|-------|

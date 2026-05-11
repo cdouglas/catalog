@@ -38,9 +38,9 @@ docs/errata.md                               current shortcuts, gaps, known unkn
 
 This project does not run against stock Iceberg. It consumes the fork at
 [github.com/cdouglas/iceberg](https://github.com/cdouglas/iceberg) (locally
-at `../iceberg`, branch `vldb-1.10.1` for the base catalog or
-`vldb-1.10.1-ml` for inline manifest lists) as a Maven `1.11.0-SNAPSHOT`
-artifact.
+at `../iceberg`, branch `atomicio`) as a Maven `1.11.0-SNAPSHOT` artifact.
+That branch carries both the atomic-operations hooks used by the base
+catalog and the manifest-list-inlining hooks used by `inline.manifests`.
 
 The fork adds these extension points; everything else is stock Iceberg.
 
