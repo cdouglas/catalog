@@ -1101,6 +1101,120 @@ public class TestInlineManifestEndToEnd {
       // rewriteManifests typically compacts to fewer manifests
       assertThat(current.allManifests(io)).isNotEmpty();
     }
+
+    /**
+     * Errata D7: an ML delta staged against a snapshot id that is already
+     * present in base.snapshots() (the "existing snapshot" path) must reach
+     * attachManifestDelta. The previous filter dropped these silently because
+     * it iterated metadata.snapshots() and skipped ids present in oldSnapIds.
+     *
+     * <p>No upstream Iceberg producer currently stages on an existing snapshot
+     * id (SnapshotProducer always mints a fresh id), so this test drives the
+     * sink interface directly, mirroring the future cases the errata calls
+     * out (compaction / RewriteManifests / etc. that mutate a snapshot's
+     * manifest list in place).
+     */
+    @Test
+    void stagedDeltaOnExistingSnapshotIdSurvivesCommit() {
+      createNamespaceAndTable();
+      Table tbl = catalog.loadTable(TBL);
+      tbl.newFastAppend().appendFile(FILE_A).commit();
+      long s1Id = tbl.currentSnapshot().snapshotId();
+      List<ManifestFile> before = tbl.currentSnapshot().allManifests(io);
+      assertThat(before).hasSize(1);
+      String originalManifestPath = before.get(0).path();
+
+      // Reload to get a clean ops instance (no leftover staged deltas from
+      // the producer that ran during newFastAppend).
+      Table reloaded = catalog.loadTable(TBL);
+      FileIOCatalog.InlineManifestTableOperations ops =
+          (FileIOCatalog.InlineManifestTableOperations)
+              ((org.apache.iceberg.BaseTable) reloaded).operations();
+
+      // Synthesize a "compacted" replacement manifest for s1. Path is under
+      // the catalog's manifest-list prefix so attachManifestDelta encodes it
+      // as a short suffix on the wire.
+      String replacementPath = "mem:///warehouse/db/tbl/metadata/d7-compacted-m0.avro";
+      org.apache.iceberg.ManifestFile replacement =
+          new TestProtoActions.TestManifestFile(
+              replacementPath, 4096L, 0,
+              org.apache.iceberg.ManifestContent.DATA,
+              1L, 1L, s1Id,
+              1, 0, 0, 1L, 0L, 0L,
+              null, null, null);
+
+      // Stage: replace M1 with `replacement` against the existing snapshot id.
+      ops.stageManifestListDelta(
+          reloaded.currentSnapshot().sequenceNumber(),
+          s1Id,
+          reloaded.currentSnapshot().parentId(),
+          null,
+          new org.apache.iceberg.ManifestListSink.ManifestListDelta(
+              List.of(replacement), List.of(originalManifestPath)),
+          null);
+
+      // Trigger commitInline via a property update. computeDelta(base, new)
+      // emits a SetPropertiesUpdate; the staged delta must ride that commit.
+      reloaded.updateProperties().set("d7.test", "tripped").commit();
+
+      // Fresh catalog reload exercises the full replay path.
+      FileIOCatalog fresh = reloadCatalog();
+      Table out = fresh.loadTable(TBL);
+      Snapshot s1 = out.snapshot(s1Id);
+      assertThat(s1).isNotNull();
+      List<ManifestFile> after = s1.allManifests(io);
+      assertThat(after)
+          .as("staged delta on existing snapshot id must replace the manifest list")
+          .hasSize(1);
+      assertThat(after.get(0).path())
+          .as("manifest list for s1 must reflect the staged replacement")
+          .isEqualTo(replacementPath);
+    }
+
+    /**
+     * Errata D7 companion: a staged delta whose snapshot id is NOT in
+     * metadata.snapshots() (orphan stage, e.g. a producer that was rolled
+     * back before its snapshot landed in TableMetadata) must be dropped,
+     * not applied. Without the filter, an orphan AddManifest would attach a
+     * pool entry against a snapshot id that has no referent.
+     */
+    @Test
+    void stagedDeltaForOrphanSnapshotIdIsDropped() {
+      createNamespaceAndTable();
+      Table tbl = catalog.loadTable(TBL);
+      tbl.newFastAppend().appendFile(FILE_A).commit();
+      long currentSnapId = tbl.currentSnapshot().snapshotId();
+
+      Table reloaded = catalog.loadTable(TBL);
+      FileIOCatalog.InlineManifestTableOperations ops =
+          (FileIOCatalog.InlineManifestTableOperations)
+              ((org.apache.iceberg.BaseTable) reloaded).operations();
+
+      long orphanId = currentSnapId + 0xD7D7D7L;
+      org.apache.iceberg.ManifestFile orphanManifest =
+          new TestProtoActions.TestManifestFile(
+              "mem:///warehouse/db/tbl/metadata/orphan-m0.avro", 1024L, 0,
+              org.apache.iceberg.ManifestContent.DATA,
+              1L, 1L, orphanId,
+              1, 0, 0, 1L, 0L, 0L,
+              null, null, null);
+
+      ops.stageManifestListDelta(
+          1L, orphanId, null, null,
+          new org.apache.iceberg.ManifestListSink.ManifestListDelta(
+              List.of(orphanManifest), List.of()),
+          null);
+
+      reloaded.updateProperties().set("d7.orphan", "dropped").commit();
+
+      FileIOCatalog fresh = reloadCatalog();
+      Table out = fresh.loadTable(TBL);
+      assertThat(out.snapshot(orphanId))
+          .as("orphan snapshot id must not be conjured into the table")
+          .isNull();
+      // The real snapshot's manifest list must be untouched by the orphan stage.
+      assertThat(out.snapshot(currentSnapId).allManifests(io)).hasSize(1);
+    }
   }
 
   // ============================================================

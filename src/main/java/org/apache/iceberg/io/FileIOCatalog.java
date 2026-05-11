@@ -599,27 +599,32 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         java.util.List<InlineDeltaCodec.DeltaUpdate> delta =
             InlineDeltaCodec.computeDelta(base, metadata, manifestPrefix);
 
-        // Attach manifest list deltas if this ops implements ManifestListSink
+        // Attach manifest list deltas if this ops implements ManifestListSink.
+        // Iterate the staged map directly so deltas on snapshot ids already
+        // present in base.snapshots() (manifest rewrites against an existing
+        // snapshot) also reach attachManifestDelta. Filter by liveSnapIds to
+        // drop deltas for snapshot ids that aren't present in the target
+        // metadata (orphaned stages from a rolled-back producer). Errata D7.
         boolean hasMLDeltas = false;
         if (this instanceof InlineManifestTableOperations) {
           Map<Long, InlineManifestTableOperations.StagedSnapshotData> mlDeltas =
               ((InlineManifestTableOperations) this).drainStagedDeltas();
-          java.util.Set<Long> oldSnapIds = new java.util.HashSet<>();
-          if (base != null) {
-            for (org.apache.iceberg.Snapshot s : base.snapshots()) {
-              oldSnapIds.add(s.snapshotId());
-            }
-          }
+          java.util.Set<Long> liveSnapIds = new java.util.HashSet<>();
           for (org.apache.iceberg.Snapshot snap : metadata.snapshots()) {
-            if (!oldSnapIds.contains(snap.snapshotId())) {
-              InlineManifestTableOperations.StagedSnapshotData staged =
-                  mlDeltas.get(snap.snapshotId());
-              if (staged != null && delta != null) {
-                InlineDeltaCodec.attachManifestDelta(
-                    delta, snap.snapshotId(),
-                    staged.delta.added(), staged.delta.removedPaths(), manifestPrefix);
-                hasMLDeltas = true;
-              }
+            liveSnapIds.add(snap.snapshotId());
+          }
+          for (Map.Entry<Long, InlineManifestTableOperations.StagedSnapshotData> entry
+              : mlDeltas.entrySet()) {
+            long snapId = entry.getKey();
+            if (!liveSnapIds.contains(snapId)) {
+              continue;
+            }
+            if (delta != null) {
+              InlineManifestTableOperations.StagedSnapshotData staged = entry.getValue();
+              InlineDeltaCodec.attachManifestDelta(
+                  delta, snapId,
+                  staged.delta.added(), staged.delta.removedPaths(), manifestPrefix);
+              hasMLDeltas = true;
             }
           }
         }
@@ -914,17 +919,23 @@ public class FileIOCatalog extends BaseMetastoreCatalog
             if (sinkOps != null) {
               Map<Long, InlineManifestTableOperations.StagedSnapshotData> staged =
                   sinkOps.drainStagedDeltas();
-              Set<Long> oldSnapIds = new HashSet<>();
-              for (Snapshot s : currentMetadata.snapshots()) {
-                oldSnapIds.add(s.snapshotId());
-              }
+              // Iterate staged entries directly (see commitInline / errata D7).
+              // Drop entries whose snapshot id is not in newMetadata.snapshots()
+              // — those are orphaned stages.
+              Set<Long> liveSnapIds = new HashSet<>();
               for (Snapshot snap : newMetadata.snapshots()) {
-                if (oldSnapIds.contains(snap.snapshotId())) continue;
-                InlineManifestTableOperations.StagedSnapshotData data =
-                    staged.get(snap.snapshotId());
-                if (data != null && delta != null) {
+                liveSnapIds.add(snap.snapshotId());
+              }
+              for (Map.Entry<Long, InlineManifestTableOperations.StagedSnapshotData> entry
+                  : staged.entrySet()) {
+                long snapId = entry.getKey();
+                if (!liveSnapIds.contains(snapId)) {
+                  continue;
+                }
+                if (delta != null) {
+                  InlineManifestTableOperations.StagedSnapshotData data = entry.getValue();
                   InlineDeltaCodec.attachManifestDelta(
-                      delta, snap.snapshotId(),
+                      delta, snapId,
                       data.delta.added(), data.delta.removedPaths(), manifestPrefix);
                   hasMLDeltas = true;
                 }

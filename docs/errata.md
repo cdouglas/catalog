@@ -54,20 +54,22 @@ path leaves the writer responsible for re-running their staged manifest
 producer, which matches the error semantics of every other
 `CommitFailedException`.
 
-### D7. ML deltas on existing snapshots are silently dropped
+### D7. ML deltas on existing snapshots are silently dropped — RESOLVED
 
-`commitInline` only attaches staged manifest deltas for snapshots
-present in `metadata.snapshots()` but absent from `oldSnapIds` — the
-new-snapshots set. Manifest rewrites against an *existing* snapshot
-(compaction, RewriteManifests, anything that mutates a snapshot's
-manifest list without producing a new snapshot id) drain from
-`mlDeltas` but never reach `attachManifestDelta`. The pool keeps the
-stale entries; the snapshot's ref list is never updated.
+Resolved 2026-05-10. `commitInline` and `commitTransaction` now iterate
+`mlDeltas.entrySet()` directly, attaching every staged delta whose
+snapshot id is present in `metadata.snapshots()`. The old code filtered
+to snapshot ids absent from `base.snapshots()` (the "new snapshots"
+set), silently dropping manifest rewrites against existing snapshot
+ids. The new filter also drops orphan stages (snapshot ids not present
+in the target metadata, e.g. rolled-back producer runs) instead of
+attaching pool entries with no referent.
 
-**Fix path:** iterate `mlDeltas.entrySet()` directly (covers both new
-and existing snapshot ids) and route each entry through
-`attachManifestDelta` regardless of whether the snapshot id was added
-in this commit.
+Regression tests: `TestInlineManifestEndToEnd$TmMlTests
+.stagedDeltaOnExistingSnapshotIdSurvivesCommit` (verified to fail
+without the fix; the manifest list still pointed at the original
+manifest path) and `.stagedDeltaForOrphanSnapshotIdIsDropped` (guards
+against over-applying orphan stages).
 
 ### D3. Pointer-mode eviction of an inline-ML table does not materialize Avro manifest lists
 
