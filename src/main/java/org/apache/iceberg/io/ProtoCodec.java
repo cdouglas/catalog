@@ -58,6 +58,17 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
  */
 public class ProtoCodec {
 
+  /**
+   * The reader-format version this build supports. The encoder stamps this
+   * value on every checkpoint via {@code CHECKPOINT_MIN_READER_VERSION}; the
+   * decoder refuses to load a checkpoint whose stamp exceeds this value. Bump
+   * only when introducing a wire-format change a prior reader cannot skip
+   * safely (new action types it must interpret, repurposed field numbers,
+   * altered semantics on an existing field). New tags an old reader can
+   * skip via {@code default → skipField} do not require a bump.
+   */
+  public static final int SUPPORTED_READER_VERSION = 1;
+
   // Wire types
   private static final int WIRE_VARINT = 0;
   private static final int WIRE_64BIT = 1;
@@ -67,6 +78,16 @@ public class ProtoCodec {
   private static final int CHECKPOINT_CATALOG_UUID = 1;
   private static final int CHECKPOINT_NEXT_NAMESPACE_ID = 2;
   private static final int CHECKPOINT_NEXT_TABLE_ID = 3;
+  /**
+   * Minimum reader version required to interpret this checkpoint. The writer
+   * stamps {@link #SUPPORTED_READER_VERSION} on every encode; the reader
+   * refuses to load a checkpoint whose value exceeds its own
+   * {@link #SUPPORTED_READER_VERSION}. Bumped only on wire-format changes a
+   * v1 reader cannot interpret correctly (new actions, repurposed field
+   * numbers). Forward-compatible additions (new tag the decoder can skip
+   * safely) do not bump the version.
+   */
+  private static final int CHECKPOINT_MIN_READER_VERSION = 4;
   private static final int CHECKPOINT_NAMESPACES = 10;
   private static final int CHECKPOINT_TABLES = 11;
   private static final int CHECKPOINT_NAMESPACE_PROPERTIES = 12;
@@ -258,6 +279,10 @@ public class ProtoCodec {
     try {
       ByteArrayOutputStream out = new ByteArrayOutputStream();
 
+      // Stamp first so the reader fails fast on a version mismatch before
+      // chewing through the rest of the payload.
+      writeVarint(out, CHECKPOINT_MIN_READER_VERSION, SUPPORTED_READER_VERSION);
+
       // Catalog UUID
       writeBytes(out, CHECKPOINT_CATALOG_UUID, uuidToBytes(original.uuid()));
 
@@ -331,12 +356,25 @@ public class ProtoCodec {
   public static void decodeCheckpoint(byte[] bytes, ProtoCatalogFile.Builder builder) {
     try {
       ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+      boolean sawMinReaderVersion = false;
       while (in.available() > 0) {
         int tag = readVarint(in);
         int fieldNumber = tag >>> 3;
         int wireType = tag & 0x7;
 
         switch (fieldNumber) {
+          case CHECKPOINT_MIN_READER_VERSION:
+            int minReaderVersion = readVarint(in);
+            if (minReaderVersion > SUPPORTED_READER_VERSION) {
+              throw new IllegalStateException(
+                  "Checkpoint requires reader version "
+                      + minReaderVersion
+                      + " but this build supports up to "
+                      + SUPPORTED_READER_VERSION
+                      + "; the file was written by a newer build");
+            }
+            sawMinReaderVersion = true;
+            break;
           case CHECKPOINT_CATALOG_UUID:
             builder.setCatalogUuid(bytesToUuid(readLengthDelimitedBytes(in)));
             break;
@@ -365,6 +403,9 @@ public class ProtoCodec {
             skipField(in, wireType);
         }
       }
+      Preconditions.checkState(
+          sawMinReaderVersion,
+          "Checkpoint missing required min_reader_version field");
       // Rebuild lookups after all entries are loaded (handles out-of-order decoding)
       builder.rebuildLookups();
     } catch (IOException e) {

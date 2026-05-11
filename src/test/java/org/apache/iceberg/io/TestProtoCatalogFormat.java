@@ -19,6 +19,7 @@
 package org.apache.iceberg.io;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -101,6 +102,53 @@ public class TestProtoCatalogFormat {
 
     Namespace db = Namespace.of("db");
     assertThat(decoded.namespaceProperties(db)).isEqualTo(original.namespaceProperties(db));
+  }
+
+  /**
+   * Reader-version gate: a checkpoint stamped with a min_reader_version
+   * greater than the build's {@link ProtoCodec#SUPPORTED_READER_VERSION}
+   * must be rejected loudly rather than silently misinterpreted. Protects
+   * against reader/writer skew during rolling deploys when a new writer
+   * lands a wire-format change a v1 reader can't follow.
+   */
+  @Test
+  public void testCheckpointRejectsFutureReaderVersion() {
+    // Hand-rolled minimal checkpoint payload: just the min_reader_version
+    // field stamped at SUPPORTED + 1. Tag = (field 4 << 3) | wire-type 0.
+    int tagByte = (4 << 3) | 0;
+    int futureVersion = ProtoCodec.SUPPORTED_READER_VERSION + 1;
+    byte[] checkpoint = new byte[]{(byte) tagByte, (byte) futureVersion};
+
+    InputFile location = new TestInputFile("test://catalog");
+    ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(location);
+    assertThatThrownBy(() -> ProtoCodec.decodeCheckpoint(checkpoint, builder))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("requires reader version " + futureVersion)
+        .hasMessageContaining("supports up to " + ProtoCodec.SUPPORTED_READER_VERSION);
+  }
+
+  /**
+   * The min_reader_version field is required; a checkpoint that omits it
+   * is corrupt (or written by a build that predates the gate, which per
+   * the no-back-compat policy is also corrupt). decodeCheckpoint must
+   * surface this loudly rather than guessing a default.
+   */
+  @Test
+  public void testCheckpointRejectsMissingReaderVersion() {
+    // Hand-rolled checkpoint with only a catalog-uuid field (16-byte UUID,
+    // length-delimited). No min_reader_version → rejected.
+    int uuidTag = (1 << 3) | 2; // CHECKPOINT_CATALOG_UUID, wire-type length-delimited
+    byte[] checkpoint = new byte[2 + 16];
+    checkpoint[0] = (byte) uuidTag;
+    checkpoint[1] = 16; // varint length
+    // Remaining 16 bytes are zero — content irrelevant; the gate fires
+    // because no min_reader_version was seen.
+
+    InputFile location = new TestInputFile("test://catalog");
+    ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(location);
+    assertThatThrownBy(() -> ProtoCodec.decodeCheckpoint(checkpoint, builder))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("missing required min_reader_version");
   }
 
   @Test
