@@ -94,13 +94,18 @@ rare-update path is non-negligible.
 
 `mvn verify` runs the S3, ADLS, and GCS integration tests against
 Testcontainers emulators by default (MinIO, Azurite, fake-gcs-server),
-falling back to live cloud when `AWS_ACCESS_KEY_ID`,
-`AZURE_SAS_CREDENTIALS_FILE`, or `GOOGLE_APPLICATION_CREDENTIALS` is
-present. `CloudMode#assumeRealCloud` skips individual tests when the
-configured emulator does not implement the feature being exercised, and
-each skip is paired with a canary in `*EmulatorCanaries` that asserts
-the gap is still present. When an emulator image bump closes a gap, the
-matching canary fails and the upgrader knows to delete the workaround.
+falling back to live cloud when the provider's env vars are set.
+`mvn verify -Preal-cloud` requires live cloud and fails fast if any
+required env var is missing. See [INTEGRATION_TESTING.md](INTEGRATION_TESTING.md)
+for the env-var contract and the
+[`IntegTestEnv`](../src/test/java/org/apache/iceberg/io/IntegTestEnv.java)
+util for the constants.
+
+`CloudMode#assumeRealCloud` skips individual tests when the configured
+emulator does not implement the feature being exercised, and each skip
+is paired with a canary in `*EmulatorCanaries` that asserts the gap is
+still present. When an emulator image bump closes a gap, the matching
+canary fails and the upgrader knows to delete the workaround.
 
 **Residual gaps guarded by canaries:**
 

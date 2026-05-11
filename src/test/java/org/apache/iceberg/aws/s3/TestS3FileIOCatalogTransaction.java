@@ -26,6 +26,7 @@ import org.apache.iceberg.catalog.CatalogTransactionTests;
 import org.apache.iceberg.io.CatalogFormat;
 import org.apache.iceberg.io.CloudMode;
 import org.apache.iceberg.io.FileIOCatalog;
+import org.apache.iceberg.io.IntegTestEnv;
 import org.apache.iceberg.io.ProtoCatalogFormat;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.junit.jupiter.api.AfterAll;
@@ -41,7 +42,6 @@ import software.amazon.awssdk.services.s3.S3Client;
 
 @ExtendWith(TestS3Catalog.SuccessCleanupExtension.class)
 public class TestS3FileIOCatalogTransaction extends CatalogTransactionTests<FileIOCatalog> {
-  private static final String EXPR_BUCKET = "lst-pbafvfgrapl--usw2-az3--x-s3";
 
   protected static CloudMode mode;
   private static MinIOContainer minioContainer;
@@ -90,12 +90,18 @@ public class TestS3FileIOCatalogTransaction extends CatalogTransactionTests<File
   public static void initStorage() {
     uniqTestRun = UUID.randomUUID().toString();
     System.err.println("TEST RUN: " + uniqTestRun); // (logging disabled in tests)
-    String accessKey = System.getenv("AWS_ACCESS_KEY_ID");
-    if (accessKey != null && !accessKey.isBlank()) {
+    if (IntegTestEnv.isSet(IntegTestEnv.AWS_ACCESS_KEY_ID)) {
       mode = CloudMode.REAL_S3;
       s3Client = AwsClientFactories.defaultFactory().s3();
-      testBucket = System.getenv().getOrDefault("S3_TEST_BUCKET", EXPR_BUCKET);
+      testBucket = IntegTestEnv.require(IntegTestEnv.AWS_TEST_BUCKET);
       System.err.println("Using real S3, bucket=" + testBucket);
+    } else if (IntegTestEnv.requireRealCloud()) {
+      throw new IllegalStateException(
+          "-Preal-cloud requires "
+              + IntegTestEnv.AWS_ACCESS_KEY_ID
+              + " and "
+              + IntegTestEnv.AWS_TEST_BUCKET
+              + ". See docs/INTEGRATION_TESTING.md.");
     } else {
       mode = CloudMode.MINIO;
       minioContainer = MinioUtil.createContainer();

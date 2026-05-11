@@ -302,4 +302,28 @@
     </plugins>
   </build>
 
+  <profiles>
+    <!-- Real-cloud integration tests. Activate with: mvn verify -Preal-cloud
+         Requires the env vars documented in docs/INTEGRATION_TESTING.md.
+         Under this profile, CloudMode#assumeRealCloud throws instead of skipping,
+         and each provider's @BeforeAll fails fast if its real-cloud env vars are
+         missing. -->
+    <profile>
+      <id>real-cloud</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <configuration>
+              <systemPropertyVariables combine.children="append">
+                <require.real.cloud>true</require.real.cloud>
+              </systemPropertyVariables>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+
 </project>

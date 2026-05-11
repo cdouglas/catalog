@@ -52,8 +52,20 @@ public enum CloudMode {
    * Skip the calling test if this mode is an emulator, with a message naming the feature
    * the emulator does not implement. The message points future readers at the canary
    * class that asserts the gap.
+   *
+   * <p>Under {@code -Preal-cloud} ({@link IntegTestEnv#requireRealCloud()}), this throws
+   * instead of skipping — emulator fallback is forbidden in that mode, and any skip
+   * indicates the test was misrouted.
    */
   public void assumeRealCloud(String featureName) {
+    if (isEmulator() && IntegTestEnv.requireRealCloud()) {
+      throw new IllegalStateException(
+          String.format(
+              "-Preal-cloud is active but the test fell back to %s (emulator does not "
+                  + "implement %s). Set the real-cloud env vars for this provider; see "
+                  + "docs/INTEGRATION_TESTING.md.",
+              this, featureName));
+    }
     Assumptions.assumeTrue(
         isRealCloud(),
         () ->

@@ -24,7 +24,6 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.spy;
 
 import com.azure.storage.file.datalake.DataLakeFileSystemClientBuilder;
-import java.io.File;
 import java.io.IOException;
 import java.util.Map;
 import java.util.UUID;
@@ -34,6 +33,7 @@ import org.apache.iceberg.catalog.CatalogTransactionTests;
 import org.apache.iceberg.io.CatalogFormat;
 import org.apache.iceberg.io.CloudMode;
 import org.apache.iceberg.io.FileIOCatalog;
+import org.apache.iceberg.io.IntegTestEnv;
 import org.apache.iceberg.io.ProtoCatalogFormat;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.junit.jupiter.api.AfterAll;
@@ -49,7 +49,7 @@ import org.slf4j.LoggerFactory;
 
 @ExtendWith(ADLSCatalogTest.SuccessCleanupExtension.class)
 public class ADLSFileIOCatalogTransactionTests extends CatalogTransactionTests<FileIOCatalog> {
-  private static final String TEST_BUCKET = "lst-consistency/TEST_BUCKET";
+  private static final String TEST_PREFIX = "TEST_BUCKET";
   private static final Logger LOG = LoggerFactory.getLogger(ADLSCatalogTest.class);
   protected static AzuriteContainer azuriteContainer = null;
 
@@ -86,16 +86,28 @@ public class ADLSFileIOCatalogTransactionTests extends CatalogTransactionTests<F
   public static void initStorage() throws IOException {
     uniqTestRun = UUID.randomUUID().toString();
     LOG.info("TEST RUN: {}", uniqTestRun);
-    String credsPath = System.getenv("AZURE_SAS_CREDENTIALS_FILE");
-    AzureSAS creds = credsPath != null ? AzureSAS.readCreds(new File(credsPath)) : null;
-    if (creds != null) {
+    if (IntegTestEnv.isSet(IntegTestEnv.AZURE_STORAGE_ACCOUNT)) {
       mode = CloudMode.REAL_ADLS;
+      AzureSAS creds = new AzureSAS();
+      creds.account = IntegTestEnv.require(IntegTestEnv.AZURE_STORAGE_ACCOUNT);
+      creds.sasToken = IntegTestEnv.require(IntegTestEnv.AZURE_STORAGE_SAS_TOKEN);
+      creds.container = IntegTestEnv.require(IntegTestEnv.AZURE_TEST_CONTAINER);
+      creds.endpoint = "https://" + creds.account + ".dfs.core.windows.net";
       azureProperties = Maps.newHashMap();
       azureProperties.put(
           AzureProperties.ADLS_SAS_TOKEN_PREFIX + creds.account + ".dfs.core.windows.net",
           creds.sasToken);
       az = new AzureSAS.SasResolver(creds);
-      LOG.info("Using remote ADLS via SAS from {}", credsPath);
+      LOG.info("Using real ADLS via SAS, account={} container={}", creds.account, creds.container);
+    } else if (IntegTestEnv.requireRealCloud()) {
+      throw new IllegalStateException(
+          "-Preal-cloud requires "
+              + IntegTestEnv.AZURE_STORAGE_ACCOUNT
+              + ", "
+              + IntegTestEnv.AZURE_STORAGE_SAS_TOKEN
+              + ", and "
+              + IntegTestEnv.AZURE_TEST_CONTAINER
+              + ". See docs/INTEGRATION_TESTING.md.");
     } else {
       mode = CloudMode.AZURITE;
       azuriteContainer = new AzuriteContainer();
@@ -134,7 +146,7 @@ public class ADLSFileIOCatalogTransactionTests extends CatalogTransactionTests<F
 
     final String testName = info.getTestMethod().orElseThrow(RuntimeException::new).getName();
     warehouseLocation =
-        az.location(TEST_BUCKET + "/" + uniqTestRun + "/" + testName + "_" + info.getDisplayName());
+        az.location(TEST_PREFIX + "/" + uniqTestRun + "/" + testName + "_" + info.getDisplayName());
     cleanupWarehouseLocation();
 
     final Map<String, String> properties = Maps.newHashMap();

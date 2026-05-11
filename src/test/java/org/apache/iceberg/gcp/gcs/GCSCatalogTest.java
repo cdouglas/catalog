@@ -40,6 +40,7 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.gcp.GCPProperties;
 import org.apache.iceberg.io.CloudMode;
 import org.apache.iceberg.io.FileIOCatalog;
+import org.apache.iceberg.io.IntegTestEnv;
 import org.apache.iceberg.io.ProtoCatalogFormat;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.junit.jupiter.api.AfterAll;
@@ -56,15 +57,17 @@ import org.testcontainers.utility.DockerImageName;
 
 @ExtendWith(GCSCatalogTest.SuccessCleanupExtension.class)
 public class GCSCatalogTest extends CatalogTests<FileIOCatalog> {
-  private static final String TEST_BUCKET = "lst-consistency/TEST_BUCKET";
-  private static final String GCS_BUCKET = "lst-consistency";
   private static final Logger LOG = LoggerFactory.getLogger(GCSCatalogTest.class);
   private static final String FAKE_GCS_IMAGE = "fsouza/fake-gcs-server:1.49.2";
   private static final int FAKE_GCS_PORT = 4443;
+  // Path prefix inside the bucket; the bucket itself comes from the env or is created
+  // on the fake-gcs-server emulator.
+  private static final String TEST_PREFIX = "TEST_BUCKET";
 
   protected static CloudMode mode;
   private static Storage storage;
   private static GenericContainer<?> fakeGcsContainer;
+  private static String testBucket;
   private FileIOCatalog catalog;
   private static String warehouseLocation;
   private static String uniqTestRun;
@@ -102,16 +105,25 @@ public class GCSCatalogTest extends CatalogTests<FileIOCatalog> {
   public static void initStorage() throws IOException {
     uniqTestRun = UUID.randomUUID().toString();
     LOG.info("TEST RUN: " + uniqTestRun);
-    String credsPath = System.getenv("GOOGLE_APPLICATION_CREDENTIALS");
+    String credsPath = System.getenv(IntegTestEnv.GOOGLE_APPLICATION_CREDENTIALS);
     File credFile = credsPath != null ? new File(credsPath) : null;
     if (credFile != null && credFile.exists()) {
       mode = CloudMode.REAL_GCS;
+      testBucket = IntegTestEnv.require(IntegTestEnv.GCS_TEST_BUCKET);
       try (FileInputStream creds = new FileInputStream(credFile)) {
-        storage = RemoteStorageHelper.create(GCS_BUCKET, creds).getOptions().getService();
-        LOG.info("Using remote GCS (creds from {})", credsPath);
+        storage = RemoteStorageHelper.create(testBucket, creds).getOptions().getService();
+        LOG.info("Using remote GCS (creds from {}), bucket={}", credsPath, testBucket);
       }
+    } else if (IntegTestEnv.requireRealCloud()) {
+      throw new IllegalStateException(
+          "-Preal-cloud requires "
+              + IntegTestEnv.GOOGLE_APPLICATION_CREDENTIALS
+              + " and "
+              + IntegTestEnv.GCS_TEST_BUCKET
+              + ". See docs/INTEGRATION_TESTING.md.");
     } else {
       mode = CloudMode.FAKE_GCS;
+      testBucket = "casalog-" + UUID.randomUUID().toString().substring(0, 8);
       fakeGcsContainer =
           new GenericContainer<>(DockerImageName.parse(FAKE_GCS_IMAGE))
               .withExposedPorts(FAKE_GCS_PORT)
@@ -135,13 +147,13 @@ public class GCSCatalogTest extends CatalogTests<FileIOCatalog> {
               .build()
               .getService();
       try {
-        storage.create(BucketInfo.of(GCS_BUCKET));
+        storage.create(BucketInfo.of(testBucket));
       } catch (StorageException e) {
         if (e.getCode() != 409) { // already exists
           throw e;
         }
       }
-      LOG.info("Using fake-gcs-server Testcontainers emulator at {}", endpoint);
+      LOG.info("Using fake-gcs-server Testcontainers emulator at {}, bucket={}", endpoint, testBucket);
     }
     // show ridiculous stack traces
     setMaxStackTraceElementsDisplayed(Integer.MAX_VALUE);
@@ -177,7 +189,8 @@ public class GCSCatalogTest extends CatalogTests<FileIOCatalog> {
     GCSFileIO io = new GCSFileIO(() -> storage, new GCPProperties());
 
     final String testName = info.getTestMethod().orElseThrow(RuntimeException::new).getName();
-    warehouseLocation = "gs://" + TEST_BUCKET + "/" + uniqTestRun + "/" + testName;
+    warehouseLocation =
+        "gs://" + testBucket + "/" + TEST_PREFIX + "/" + uniqTestRun + "/" + testName;
     cleanupWarehouseLocation();
 
     final Map<String, String> properties = Maps.newHashMap();
