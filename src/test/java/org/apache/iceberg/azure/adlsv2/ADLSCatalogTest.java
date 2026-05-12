@@ -60,10 +60,11 @@ public class ADLSCatalogTest extends CatalogTests<FileIOCatalog> {
 
   protected static CloudMode mode;
   private static Map<String, String> azureProperties;
+  private static String account;
+  private static String container;
   private FileIOCatalog catalog;
   private static String warehouseLocation;
   private static String uniqTestRun;
-  private static LocationResolver az;
 
   /**
    * Catalog format's max.append.count for this suite. Subclasses override to flip the
@@ -94,17 +95,13 @@ public class ADLSCatalogTest extends CatalogTests<FileIOCatalog> {
     LOG.info("TEST RUN: {}", uniqTestRun);
     if (IntegTestEnv.isSet(IntegTestEnv.AZURE_STORAGE_ACCOUNT)) {
       mode = CloudMode.REAL_ADLS;
-      AzureSAS creds = new AzureSAS();
-      creds.account = IntegTestEnv.require(IntegTestEnv.AZURE_STORAGE_ACCOUNT);
-      creds.sasToken = IntegTestEnv.require(IntegTestEnv.AZURE_STORAGE_SAS_TOKEN);
-      creds.container = IntegTestEnv.require(IntegTestEnv.AZURE_TEST_CONTAINER);
-      creds.endpoint = "https://" + creds.account + ".dfs.core.windows.net";
+      account = IntegTestEnv.require(IntegTestEnv.AZURE_STORAGE_ACCOUNT);
+      container = IntegTestEnv.require(IntegTestEnv.AZURE_TEST_CONTAINER);
+      String sasToken = IntegTestEnv.require(IntegTestEnv.AZURE_STORAGE_SAS_TOKEN);
       azureProperties = Maps.newHashMap();
       azureProperties.put(
-          AzureProperties.ADLS_SAS_TOKEN_PREFIX + creds.account + ".dfs.core.windows.net",
-          creds.sasToken);
-      az = new AzureSAS.SasResolver(creds);
-      LOG.info("Using real ADLS via SAS, account={} container={}", creds.account, creds.container);
+          AzureProperties.ADLS_SAS_TOKEN_PREFIX + account + ".dfs.core.windows.net", sasToken);
+      LOG.info("Using real ADLS via SAS, account={} container={}", account, container);
     } else if (IntegTestEnv.requireRealCloud()) {
       throw new IllegalStateException(
           "-Preal-cloud requires "
@@ -118,7 +115,8 @@ public class ADLSCatalogTest extends CatalogTests<FileIOCatalog> {
       mode = CloudMode.AZURITE;
       azuriteContainer = new AzuriteContainer();
       azuriteContainer.start();
-      az = azuriteContainer;
+      account = AzuriteContainer.ACCOUNT;
+      container = AzuriteContainer.STORAGE_CONTAINER;
       LOG.info("Using Azurite Testcontainers emulator");
     }
     // show ridiculous stack traces
@@ -155,6 +153,10 @@ public class ADLSCatalogTest extends CatalogTests<FileIOCatalog> {
     // TODO: remove test data if test passed
   }
 
+  private static String warehouseUrl(String path) {
+    return String.format("abfs://%s@%s.dfs.core.windows.net/%s", container, account, path);
+  }
+
   @Test
   public void catalogFileTest() throws IOException {
     catalog.createNamespace(Namespace.of("dingos"), Maps.newHashMap());
@@ -187,7 +189,8 @@ public class ADLSCatalogTest extends CatalogTests<FileIOCatalog> {
 
     final String testName = info.getTestMethod().orElseThrow(RuntimeException::new).getName();
     warehouseLocation =
-        az.location(TEST_PREFIX + "/" + uniqTestRun + "/" + testName + "_" + info.getDisplayName());
+        warehouseUrl(
+            TEST_PREFIX + "/" + uniqTestRun + "/" + testName + "_" + info.getDisplayName());
     cleanupWarehouseLocation();
 
     final Map<String, String> properties = Maps.newHashMap();
