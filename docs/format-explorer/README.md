@@ -52,15 +52,34 @@ another node and back to retry, or just wait for the auto-rerender.
 
 Click any byte in the hex pane or any node in the tree pane to populate the
 detail panel with the field's name, proto field number, wire type, scalar
-type, schema declaration, and the decoded value. Inline `bytes` fields that
-carry JSON (`schema_json`, `spec_json`, `order_json`) get a "Show JSON"
-expander. Inline-TM `metadata` / `full_metadata` fields (codec-encoded) get
-two expanders driven by Java-side pre-decoding:
+type, schema declaration, and the decoded value.
+
+`bytes` fields that carry gzip-wrapped JSON (`AddSchema.schema_json`,
+`AddPartitionSpec.spec_json`) get the same two-expander treatment as
+inline-TM bytes:
+
+- **Show recovered JSON** — gunzipped + pretty-printed.
+- **Show compact form** — a single labelled segment for the gzip envelope
+  (`gzip-wrapped JSON (decompresses to N bytes of Schema JSON)`), with
+  byte count and hex preview. Bundled scenarios don't currently include
+  AddSchema / AddPartitionSpec deltas, so the decode fires only on loaded
+  files; the async decode pass runs the same `DecompressionStream('gzip')`
+  path as inline-TM.
+
+Inline-TM `metadata` / `full_metadata` fields (codec-encoded) get the
+multi-segment compact form driven by Java-side pre-decoding:
 
 - **Show recovered JSON** — the decoded `TableMetadata` JSON, pretty-printed.
 - **Show compact form** — a labelled table walking the (decompressed) wire
   layout: `format_version`, `stripped_json`, `snap_block`, `mdlog_block`,
   etc., each with its byte count and a hex preview.
+
+`AddSortOrder` no longer carries an `order_json` bytes field — it now
+encodes a `repeated SortField fields = 2` (see catalog.proto). Each
+`SortField` is a regular nested submessage; click into the tree to see
+`source_id`, `kind` (TransformKind enum), `transform_param`, `direction`
+(SortDirection enum), and `null_order` (NullOrderKind enum) with their
+named enum values.
 
 ## Regenerating the fixtures
 

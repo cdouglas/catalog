@@ -685,7 +685,16 @@
       "AddSortOrder": {
         "fields": [
           {"number": 1, "name": "order_id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
-          {"number": 2, "name": "order_json", "type": "bytes", "repeated": false, "oneof": null, "comment": ""}
+          {"number": 2, "name": "fields", "type": "SortField", "repeated": true, "oneof": null, "comment": ""}
+        ]
+      },
+      "SortField": {
+        "fields": [
+          {"number": 1, "name": "source_id", "type": "int32", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "kind", "type": "TransformKind", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 3, "name": "transform_param", "type": "int32", "repeated": false, "oneof": null, "comment": "bucket N or truncate N; absent for non-parameterized"},
+          {"number": 4, "name": "direction", "type": "SortDirection", "repeated": false, "oneof": null, "comment": ""},
+          {"number": 5, "name": "null_order", "type": "NullOrderKind", "repeated": false, "oneof": null, "comment": ""}
         ]
       },
       "SetDefaultSortOrder": {
@@ -749,6 +758,27 @@
         {"name": "OVERWRITE", "number": 1},
         {"name": "DELETE", "number": 2},
         {"name": "REPLACE", "number": 3}
+      ],
+      "TransformKind": [
+        {"name": "TRANSFORM_KIND_UNSPECIFIED", "number": 0},
+        {"name": "IDENTITY", "number": 1},
+        {"name": "YEAR", "number": 2},
+        {"name": "MONTH", "number": 3},
+        {"name": "DAY", "number": 4},
+        {"name": "HOUR", "number": 5},
+        {"name": "BUCKET", "number": 6},
+        {"name": "TRUNCATE", "number": 7},
+        {"name": "VOID", "number": 8}
+      ],
+      "SortDirection": [
+        {"name": "SORT_DIRECTION_UNSPECIFIED", "number": 0},
+        {"name": "ASC", "number": 1},
+        {"name": "DESC", "number": 2}
+      ],
+      "NullOrderKind": [
+        {"name": "NULL_ORDER_UNSPECIFIED", "number": 0},
+        {"name": "NULLS_FIRST", "number": 1},
+        {"name": "NULLS_LAST", "number": 2}
       ]
     }
   },
@@ -756,7 +786,7 @@
     {
       "name": "empty-bootstrap",
       "description": "Smallest realistic catalog: 8-byte header, a checkpoint that is essentially just a UUID + ID counters, and a single transaction with a single CreateNamespace action. Walk every byte to learn how length framing and oneof discriminators work.",
-      "hex": "4c43415400000001160a1001900000000070008000000000000001100118012d0a10019000000000700080000000000000101a190a1708011001180020ffffffff0f2a09616e616c7974696373",
+      "hex": "4c434154000000011820010a1001900000000070008000000000000001100118012d0a10019000000000700080000000000000101a190a1708011001180020ffffffff0f2a09616e616c7974696373",
       "notes": [
         {"start": 0, "end": 4, "label": "Magic bytes \"LCAT\""},
         {"start": 4, "end": 8, "label": "Format version (big-endian int32 = 1)"}
@@ -765,22 +795,22 @@
     {
       "name": "namespaces-and-pointer-tables",
       "description": "A compacted (CAS-only) catalog with two namespaces, one nested under the other, a pointer-mode table referenced by S3 URL, one namespace property, and five committed transactions in the dedup set. Demonstrates repeated message fields, parent_id chaining, and the CommittedTransactions sub-message (field 20): UUIDv7s sorted descending, with each entry interleaving a varint timestamp delta (gap from the previous entry) and 10 packed random bytes (rand_a + rand_b, version+variant bits implicit) into a single packed_entries blob. The catalog scans this blob in one linear pass with no per-call heap allocation. Click the packed_entries node to see the reconstructed UUIDs.",
-      "hex": "4c43415400000001dc010a1001900000000070008000000000000001100318025211080110021800220977617265686f757365520e080210011801220662726f6e7a655a4208011003180222066576656e74732a3273333a2f2f6c616b652f77617265686f7573652f62726f6e7a652f6576656e74732f76332e6d657461646174612e6a736f6e6218080112056f776e65721a0d646174612d706c6174666f726da20142090719eca8900100001237000000000000000000c140030000000000000000c100020000000000000000c0c0010000000000000000c080010000000000000000c040",
+      "hex": "4c43415400000001de0120010a1001900000000070008000000000000001100318025211080110021800220977617265686f757365520e080210011801220662726f6e7a655a4208011003180222066576656e74732a3273333a2f2f6c616b652f77617265686f7573652f62726f6e7a652f6576656e74732f76332e6d657461646174612e6a736f6e6218080112056f776e65721a0d646174612d706c6174666f726da20142090719eca8900100001237000000000000000000c140030000000000000000c100020000000000000000c0c0010000000000000000c080010000000000000000c040",
       "notes": [
       ]
     },
     {
       "name": "txn-multi-action-with-late-bind",
       "description": "Two actions in one transaction: CreateNamespace and CreateTable. The CreateTable references the new namespace via namespace_version = -1 (late-bind sentinel). Look for the 5-byte negative-int varint -- a quirk of the manual encoder.",
-      "hex": "4c43415400000001160a100190000000007000800000000000000110011801760a10019000000000700080000000000000201a170a1508011001180020ffffffff0f2a0773746167696e671a492a4708011001180120ffffffff0f2a0a7261775f6576656e7473322d73333a2f2f6c616b652f73746167696e672f7261775f6576656e74732f76312e6d657461646174612e6a736f6e",
+      "hex": "4c434154000000011820010a100190000000007000800000000000000110011801760a10019000000000700080000000000000201a170a1508011001180020ffffffff0f2a0773746167696e671a492a4708011001180120ffffffff0f2a0a7261775f6576656e7473322d73333a2f2f6c616b652f73746167696e672f7261775f6576656e74732f76312e6d657461646174612e6a736f6e",
       "notes": [
         {"start": -1, "end": -1, "label": "QUIRK: parent_version = -1 (late-bind sentinel) encodes as a 5-byte varint, not the 10-byte sign-extended form proto3 specifies. See ProtoCodec.writeRawVarint(int) -- the unsigned >>>= 7 on a 32-bit int terminates after 5 iterations."}
       ]
     },
     {
       "name": "create-table-inline-gzip",
-      "description": "CreateTableInline action carrying a gzip-encoded Iceberg TableMetadata (format-version 2, schema with 6 fields, day-partitioned on ts, four table properties). The metadata_codec enum field on the action is CODEC_JSON_GZIP (0). On the wire, proto3 omits the field at the default value, so a gzip-coded record matches what older builds wrote when no codec was specified. Expand 'Show recovered JSON' to see the decompressed TableMetadata.",
-      "hex": "4c43415400000001290a1001900000000070008000000000000001100218015211080110011800220977617265686f757365c5040a10019000000000700080000000000000301ab00452ad0408011001180120012a066f7264657273329a041f8b08000000000000ff8d54db6edb300cfd95414f1b602576eecdaf0cc5c0d8742254b23c895a9014f9f751b22da7053acc0f06783b3cbce95db4d61920f9079d57b613c75521084e1a6508aa114751562f65590248fe97721f7f87f82be7af1285d0b6064a00c2af8fcba586375c5ec1e1c5068f4beb1a4e10fdc093f4f83b6057a3ec8239a113c7723484be01c2461a2f8ed57eb3db56874d4a31da6bab83e96424b62f441d9cc38ee1ea0b1a485a761c2406f8f92ee8d66364442ed42426dbe4d92ad4cde0183555213a30d19fa5423826a91cb281a3b198b0b4edcee2510c21ab1c42feeb1052063d81e9e99e23d73992fb8667eb6e1fe25bd07e0660feea29eb26c782b1a1a37f4436582b03fa7bb52abead7e6484edcc1bcefeebf8dc41ad7c4c831a4decf83880519c19ce1e9f001f53e65dcedcc34d5b68fea3ecd7c76bc195b410340fbbc77a1a600f8e54dcbaa41d26f96c7f1a701ed3af0662abc941e7e3eec726258db7c1f14a8e634da149a878fd060a6905e79c93f1899b7524d3aae765cc9a81c60763a697d07b677b646cf4b1eff6dac5c310b53506232f423062bacdb19a7c5557a7081704ee8c245bc51e5edd519e6e14d1c476bd3beccb976a955d87ab5f8cc4d3341cdf246587515e70fedea18f6f035f1faf13fbde3d35bc4af3fd75d0fb8b1dd6425671a06d2c825d2653aa9245e247c293aa47f969809f2c1953dbf3a03148c0af034c9ac75f4201ded1bc040000",
+      "description": "CreateTableInline action carrying a gzip-encoded Iceberg TableMetadata (format-version 2, schema with 6 fields, day-partitioned on ts, four table properties). The metadata_codec enum field on the action is CODEC_JSON_GZIP (0). Expand 'Show recovered JSON' to see the decompressed TableMetadata.",
+      "hex": "4c434154000000012b20010a1001900000000070008000000000000001100218015211080110011800220977617265686f757365c7040a10019000000000700080000000000000301ab20452af0408011001180120012a066f7264657273329a041f8b08000000000000ff8d54db6edb300cfd95414f1b602576eecdaf0cc5c0d8742254b23c895a9014f9f751b22da7053acc0f06783b3cbce95db4d61920f9079d57b613c75521084e1a6508aa114751562f65590248fe97721f7f87f82be7af1285d0b6064a00c2af8fcba586375c5ec1e1c5068f4beb1a4e10fdc093f4f83b6057a3ec8239a113c7723484be01c2461a2f8ed57eb3db56874d4a31da6bab83e96424b62f441d9cc38ee1ea0b1a485a761c2406f8f92ee8d66364442ed42426dbe4d92ad4cde0183555213a30d19fa5423826a91cb281a3b198b0b4edcee2510c21ab1c42feeb1052063d81e9e99e23d73992fb8667eb6e1fe25bd07e0660feea29eb26c782b1a1a37f4436582b03fa7bb52abead7e6484edcc1bcefeebf8dc41ad7c4c831a4decf83880519c19ce1e9f001f53e65dcedcc34d5b68fea3ecd7c76bc195b410340fbbc77a1a600f8e54dcbaa41d26f96c7f1a701ed3af0662abc941e7e3eec726258db7c1f14a8e634da149a878fd060a6905e79c93f1899b7524d3aae765cc9a81c60763a697d07b677b646cf4b1eff6dac5c310b53506232f423062bacdb19a7c5557a7081704ee8c245bc51e5edd519e6e14d1c476bd3beccb976a955d87ab5f8cc4d3341cdf246587515e70fedea18f6f035f1faf13fbde3d35bc4af3fd75d0fb8b1dd6425671a06d2c825d2653aa9245e247c293aa47f969809f2c1953dbf3a03148c0af034c9ac75f4201ded1bc0400003800",
       "notes": [
       ],
       "structuralViews": [
@@ -796,7 +826,7 @@
     {
       "name": "create-table-inline-structural",
       "description": "CreateTableInline action carrying a structurally-encoded TableMetadata. The metadata_codec enum field is CODEC_STRUCTURAL (1) and the bytes are a gzip wrapper around the columnar layout described in StructuralInlineMetadataCodec: a varint format_version, then a stripped JSON document (TableMetadata minus snapshots and metadata-log), then snap_block and mdlog_block columnar segments. The 'Show compact form' expander lists each segment so you can see how the bytes are laid out — at the corpus median this layout is 40% smaller than gzip(JSON) and 4-7x faster on lazy-decode workloads (see docs/TM_ENCODING_BENCH_RESULTS.md).",
-      "hex": "4c43415400000001290a1001900000000070008000000000000001100218015211080110011800220977617265686f757365d0040a10019000000000700080000000000000311abb0452b80408011001180120012a0870726f647563747332a1041f8b08000000000000ff8d545b8edb300cdc7cf61685be5ac04aecbc3757298282b16947a864b97a344816b94acf5a4ab6e564815d341f06240e87146798d9df2f6facd64681e37fd058a15b765866ccc14922f75e54ecc0f2e235cff3b2e4f4cdf92e7cf6e1934fbf82654cea125c24607675582c24fcc2c5050c9eb5b7b8e88cae7ce96c408275dce26f8f6d89bcf5ea84861df221e0bb0a1c565c59762876ebeda6d8af6391215e6ae955cb436bbb8c95de186c89ae3ca382784bc0fe44043fde98bb76187a7286cab33136226b81b2ea81e1a6c8580b2ae0e99431434d0a8314a06ccc462ea9db86ddb33e659952e2e33e487142a175a03a774b99ab944993c3469beb537e0dd24e04d4bf78a8ba4eb9a0b46fdd279915964281fc562cb3afcbef896133f50d8dfd383f4d500a1bcaa04415263e08301ca70e27c43bc2fb58799b2a7770951aaaff78f6f17ecce8253578496277588e0276609c08be8bb7bd928ff10781934c3f2b08a376065a1bdc1f86146facf6862c39c81a53e3a120fbf52d440b4e35c7e0436fda38ae4d85269931ddf46d3c05537b919d96a443e2461be6ae2f6d588ce00e90bae10e41b17139c7094e6b7531c2e1dc8169d0f15a10c68a1bf2d3d5053ab6596df7bbfcb5582668bff8f3a1f32887a1a57409309ce7a5569d411bfe1e68fdc84f84bd59579197a6056ca1b367ddfb821741d13abc8220e47b47de11519de39364ef2289849e1b67327b99bdfc03a2ca0c1ba50400003801",
+      "hex": "4c434154000000012b20010a1001900000000070008000000000000001100218015211080110011800220977617265686f757365d0040a10019000000000700080000000000000311abb0452b80408011001180120012a0870726f647563747332a1041f8b08000000000000ff8d545b8edb300cdc7cf61685be5ac04aecbc3757298282b16947a864b97a344816b94acf5a4ab6e564815d341f06240e87146798d9df2f6facd64681e37fd058a15b765866ccc14922f75e54ecc0f2e235cff3b2e4f4cdf92e7cf6e1934fbf82654cea125c24607675582c24fcc2c5050c9eb5b7b8e88cae7ce96c408275dce26f8f6d89bcf5ea84861df221e0bb0a1c565c59762876ebeda6d8af6391215e6ae955cb436bbb8c95de186c89ae3ca382784bc0fe44043fde98bb76187a7286cab33136226b81b2ea81e1a6c8580b2ae0e99431434d0a8314a06ccc462ea9db86ddb33e659952e2e33e487142a175a03a774b99ab944993c3469beb537e0dd24e04d4bf78a8ba4eb9a0b46fdd279915964281fc562cb3afcbef896133f50d8dfd383f4d500a1bcaa04415263e08301ca70e27c43bc2fb58799b2a7770951aaaff78f6f17ecce8253578496277588e0276609c08be8bb7bd928ff10781934c3f2b08a376065a1bdc1f86146facf6862c39c81a53e3a120fbf52d440b4e35c7e0436fda38ae4d85269931ddf46d3c05537b919d96a443e2461be6ae2f6d588ce00e90bae10e41b17139c7094e6b7531c2e1dc8169d0f15a10c68a1bf2d3d5053ab6596df7bbfcb5582668bff8f3a1f32887a1a57409309ce7a5569d411bfe1e68fdc84f84bd59579197a6056ca1b367ddfb821741d13abc8220e47b47de11519de39364ef2289849e1b67327b99bdfc03a2ca0c1ba50400003801",
       "notes": [
       ],
       "structuralViews": [
@@ -818,7 +848,7 @@
     {
       "name": "update-table-inline-delta",
       "description": "An UpdateTableInline action whose payload is a structured TableMetadataDelta. The delta carries an AddSnapshot (with a nested CompactSummary), a SetSnapshotRef pointing 'main' at the new snapshot, and an AddManifestDelta with one ManifestFileEntry. Look for fixed64 (snapshot_id), sint64 (timestamp_delta_ms), and the deepest message nesting in the format. The InlineTable.metadata field in the checkpoint carries the pre-delta base TableMetadata (gzip-encoded); click it to see the recovered JSON.",
-      "hex": "4c4341540000000186050a1001900000000070008000000000000001100218025211080110011800220977617265686f7573656ada0408011001180122066576656e74732a9e041f8b08000000000000ff8d54db6edb300cfd95414f1b602576eecdaf0cc5c0d874224cb23c896a9014f9f751b22da7053acc0f06481e1edef52e5aeb0c907c43e795edc471550882934619826ac45194d54b5996a793e47f29f7f17788bf72fe2a51086d6ba04420fcfab85c6af88dcb2b38bcd8e071896fd8918f38f0243dfe09d8d528bb604ee8c4b11c0da16f80b091c68b63b5dfecb6d56193428cf6daea603a1913db17a20ece31adf4f5050d242d030789097ebe0bbaf5183322176a12936d42b60a753300a3a62a440726e2592a84e324954336b037161397b6dd593c8ac165955d52715fb89032e8094c4ff7ecb9ce9edc373c5b77fbe0df82f63301e7af9ea26eb22f181b3afa876783b532a0bf57abe2dbea4766d8ce79c3d97fed9f3ba8958f6150a3891d1f07308a738633e213e1638abccb917bb8690bcd7f94fdfa782db8921682e661f7584f03ecc1918a5b97b4c3249fed4f03ce63fad5406c3539e87cdcfdd8a4a4f136385ec971acc9350915afdf90425ac139e6647ccacd3a92d635e8f23266cd90c607634e2fb1f7cef6c8dce863dfedb58b8721283594dc4d128211d3718ee5e4b3ba3a45b820706724d92a4678754779ba51a413dbf5eeb02f5faa55860e67bf18334fe3707c949401a3bca8ade91dfaf838f0f9f13e31f6eea9e15d9a0fb083de5fecb017b28a136d63150c994ca94c16895f094faa1ee5a7097eb2644e6dcf8386db00fc3cc0a479fc05c3795d97bd040000322973333a2f2f6c616b652f77617265686f7573652f6576656e74732f6d657461646174612f736e61702d88010a10019000000000700080000000000000401a744a72080110011a6c10e08cf3a4ea320a1b0a1909cdab34128e4a6c4f12001a05100118800820c0a9073080080a1912170a046d61696e11cdab34128e4a6c4f1a066272616e63680a2b622909cdab34128e4a6c4f121e0a076d302e6176726f1080202801300139cdab34128e4a6c4f4001588008",
+      "hex": "4c434154000000018a0520010a1001900000000070008000000000000001100218025211080110011800220977617265686f7573656adc0408011001180122066576656e74732a9e041f8b08000000000000ff8d54db6edb300cfd95414f1b602576eecdaf0cc5c0d874224cb23c896a9014f9f751b22da7053acc0f06481e1edef52e5aeb0c907c43e795edc471550882934619826ac45194d54b5996a793e47f29f7f17788bf72fe2a51086d6ba04420fcfab85c6af88dcb2b38bcd8e071896fd8918f38f0243dfe09d8d528bb604ee8c4b11c0da16f80b091c68b63b5dfecb6d56193428cf6daea603a1913db17a20ece31adf4f5050d242d030789097ebe0bbaf5183322176a12936d42b60a753300a3a62a440726e2592a84e324954336b037161397b6dd593c8ac165955d52715fb89032e8094c4ff7ecb9ce9edc373c5b77fbe0df82f63301e7af9ea26eb22f181b3afa876783b532a0bf57abe2dbea4766d8ce79c3d97fed9f3ba8958f6150a3891d1f07308a738633e213e1638abccb917bb8690bcd7f94fdfa782db8921682e661f7584f03ecc1918a5b97b4c3249fed4f03ce63fad5406c3539e87cdcfdd8a4a4f136385ec971acc9350915afdf90425ac139e6647ccacd3a92d635e8f23266cd90c607634e2fb1f7cef6c8dce863dfedb58b8721283594dc4d128211d3718ee5e4b3ba3a45b820706724d92a4678754779ba51a413dbf5eeb02f5faa55860e67bf18334fe3707c949401a3bca8ade91dfaf838f0f9f13e31f6eea9e15d9a0fb083de5fecb017b28a136d63150c994ca94c16895f094faa1ee5a7097eb2644e6dcf8386db00fc3cc0a479fc05c3795d97bd040000322973333a2f2f6c616b652f77617265686f7573652f6576656e74732f6d657461646174612f736e61702d480088010a10019000000000700080000000000000401a744a72080110011a6c10e08cf3a4ea320a1b0a1909cdab34128e4a6c4f12001a05100118800820c0a9073080080a1912170a046d61696e11cdab34128e4a6c4f1a066272616e63680a2b622909cdab34128e4a6c4f121e0a076d302e6176726f1080202801300139cdab34128e4a6c4f4001588008",
       "notes": [
       ],
       "structuralViews": [
@@ -834,21 +864,21 @@
     {
       "name": "pointer-multi-table-conflict-retry",
       "description": "Two pointer-mode tables A and B in one namespace. Three appended transactions show how version-based conflict detection and atomic multi-table commits interact: T1 succeeds, T2 (multi-table) is rejected because A's captured version is stale, then T3 (the retry) applies both actions. T2's bytes remain in the log — read replay skips them silently.",
-      "hex": "4c434154000000018f010a1001900000000070008000000000000001100218035211080110011800220977617265686f7573655a310801100118012201412a2673333a2f2f6c616b652f77617265686f7573652f412f76312e6d657461646174612e6a736f6e5a310802100118012201422a2673333a2f2f6c616b652f77617265686f7573652f422f76312e6d657461646174612e6a736f6e420a10019000000000700080000000000000711a2e3a2c080110011a2673333a2f2f6c616b652f77617265686f7573652f412f76322e6d657461646174612e6a736f6e720a10019000000000700080000000000000721a2e3a2c080110011a2673333a2f2f6c616b652f77617265686f7573652f412f76332e6d657461646174612e6a736f6e1a2e3a2c080210011a2673333a2f2f6c616b652f77617265686f7573652f422f76322e6d657461646174612e6a736f6e720a10019000000000700080000000000000731a2e3a2c080110021a2673333a2f2f6c616b652f77617265686f7573652f412f76332e6d657461646174612e6a736f6e1a2e3a2c080210011a2673333a2f2f6c616b652f77617265686f7573652f422f76322e6d657461646174612e6a736f6e",
+      "hex": "4c43415400000001910120010a1001900000000070008000000000000001100218035211080110011800220977617265686f7573655a310801100118012201412a2673333a2f2f6c616b652f77617265686f7573652f412f76312e6d657461646174612e6a736f6e5a310802100118012201422a2673333a2f2f6c616b652f77617265686f7573652f422f76312e6d657461646174612e6a736f6e420a10019000000000700080000000000000711a2e3a2c080110011a2673333a2f2f6c616b652f77617265686f7573652f412f76322e6d657461646174612e6a736f6e720a10019000000000700080000000000000721a2e3a2c080110011a2673333a2f2f6c616b652f77617265686f7573652f412f76332e6d657461646174612e6a736f6e1a2e3a2c080210011a2673333a2f2f6c616b652f77617265686f7573652f422f76322e6d657461646174612e6a736f6e720a10019000000000700080000000000000731a2e3a2c080110021a2673333a2f2f6c616b652f77617265686f7573652f412f76332e6d657461646174612e6a736f6e1a2e3a2c080210011a2673333a2f2f6c616b652f77617265686f7573652f422f76322e6d657461646174612e6a736f6e",
       "notes": [
-        {"start": 153, "end": 220, "label": "T1: UpdateTableLocation(A, v=1) — APPLIES. A advances to v=2."},
-        {"start": 220, "end": 335, "label": "T2: UpdateTableLocation(A, v=1) + UpdateTableLocation(B, v=1) — REJECTED. A's captured version (1) no longer matches current (2) after T1, so the entire transaction fails verify(); B is also not updated (all-or-nothing). The bytes still sit in the log on disk; replay silently skips them."},
-        {"start": 335, "end": 450, "label": "T3: UpdateTableLocation(A, v=2) + UpdateTableLocation(B, v=1) — APPLIES. Same intent as T2, retried with A's correct current version."}
+        {"start": 155, "end": 222, "label": "T1: UpdateTableLocation(A, v=1) — APPLIES. A advances to v=2."},
+        {"start": 222, "end": 337, "label": "T2: UpdateTableLocation(A, v=1) + UpdateTableLocation(B, v=1) — REJECTED. A's captured version (1) no longer matches current (2) after T1, so the entire transaction fails verify(); B is also not updated (all-or-nothing). The bytes still sit in the log on disk; replay silently skips them."},
+        {"start": 337, "end": 452, "label": "T3: UpdateTableLocation(A, v=2) + UpdateTableLocation(B, v=1) — APPLIES. Same intent as T2, retried with A's correct current version."}
       ]
     },
     {
       "name": "inline-multi-table-conflict-retry",
       "description": "Inline-mode counterpart of pointer-multi-table-conflict-retry. Each transaction is a real-shape data commit: a TableMetadataDelta with an AddSnapshot + SetSnapshotRef pinning the new snapshot to main. The structural shape is identical to the pointer scenario except UpdateTableInline (Action field 9) replaces UpdateTableLocation (Action field 7), and the payload is a length-delimited delta message instead of a metadata-location string. Compare T2's wasted bytes between the two scenarios: in pointer mode T2 references already-written metadata.json files; in inline mode T2's delta is the only place its rejected snapshots appeared on the wire. The InlineTable.metadata fields for both A and B in the checkpoint are gzip-encoded; click either to see the recovered JSON.",
-      "hex": "4c43415400000001b8090a1001900000000070008000000000000001100218035211080110011800220977617265686f7573656ac4040801100118012201412a99041f8b08000000000000ff8d54db8edb2010fd958aa75632899dfbe6addf51adaa893d4e50c1b830344a56f9f70ed8c6d995b6aa1f90e6720e87b9f84db4d61920f9079d57b613c75521084e1a6508aa114751562f65594225f92ce53e1e877894f3578942685b032502e1d7c7e552c32f5c5ec1e1c5068fcbef31053c498fbf037635ca2e98133a712cc740e81b206ca4f1e258ed37bb6d75d824f6315e5b1d4c27a3a67d21eae01c764c575fd040f272e26031c18f3741b71ea31872a12631c5a6cc56a16e86c4e8a90ad18189f96c15c2b148e590038cc662e2d2b63b8b473140561942fe730829839ec0f474cfc8754672c9f06cdded1dbe05ed6702d6af9e6edd642c181b3afa07b2c15a19d05fab55f165f52d336c67dd70f69fe37305b5f2f11ad46862c5c7068ce6ac70cef840f8986edee59b7bb8690bcd7f3cfbf5f15af04b5a089a9bdd633d35b007472a0e5cf20e9d7c8e3f3538b7e96703b1d4e4a0f371ec639192c7dbe07824c7b62668322a1ebf41421ac1f9ce29f8a4cd3a92d635e8f23066cf20e35d30cb4becbdb33d3237fa58777bede262b03602d96ba0a4755acbf13571a1ae4e112e08dc1949b68a835edd519e6e1489c476bd3beccb976a9553875d5f8c9a53231caf23e584d15ed4d6f40e7dfc23f0e2f12471eedd53c35334af5e07bdbfd8612264157bd946fd9c3285d203d924fe357852f5683ff5ee4324736a7b1e3c0609522146cfe32f3e230758b2040000321d73333a2f2f6c616b652f77617265686f7573652f412f6d2f736e61702d6ac5040802100118012201422a9a041f8b08000000000000ff8d54db8edb2010fd958aa75632899dfbe6b1bf51adaa893d4e50c1b830344a56f9f70ed8c6d995b6aa1f90e6720e87b9f84db4d61920f9079d57b613c75521084e1a6508aa114751562f65599e2ac96729f7f138c4a39cbf4a1442db1a281108bf3e2e971a7ee1f20a0e2f36785c7e8f29e0497afc1db0ab5176c19cd08963390642df0061238d17c76abfd96dabc326b18ff1daea603a1935ed0b5107e7b063bafa8206929713078b097ebc09baf518c5900b3589293665b60a753324464f55880e4ccc67ab108e452a871c6034161397b6dd593c8a01b2ca10f29f434819f404a6a77b46ae33924b8667eb6eeff02d683f13b07ef574eb2663c1d8d0d13f900dd6ca80fe5aad8a2fab6f99613beb86b3ff1c9f2ba8958fd7a046132b3e366034678573c607c2c774f32edfdcc34d5b68fee3d9af8fd7825fd242d0dcec1eeba9813d385271e09277e8e473fca9c1b94d3f1b88a526079d8f631f8b943cde06c72339b635419351f1f80d12d208ce774ec1276dd691b4ae419787317b0619ef82595e62ef9ded91b9d1c7badb6b171783b511c85e0325add35a8eaf890b75758a7041e0ce48b2551cf4ea8ef274a34824b6ebdd615fbe54ab9c3aecfa62d49c1ae1781d29278cf6a2b6a677e8e31f81178f278973ef9e1a9ea279f53ae8fdc50e1321abd8cb36eae79429941ec826f1afc193aa47fba9771f229953dbf3e03148900a317a1e7f012fef0317b2040000321d73333a2f2f6c616b652f77617265686f7573652f422f6d2f736e61702d620a10019000000000700080000000000000811a4e4a4c080110011a4610e08cf3a4ea320a220a20091111111111111111120754312e6176726f1a05100118800820c0a9073080080a1912170a046d61696e1111111111111111111a066272616e6368be010a10019000000000700080000000000000821a544a52080110011a4c10c0e1f6a4ea320a280a26092222222222222222120d54322d7374616c652e6176726f1a0510011880082080d30e3080080a1912170a046d61696e1122222222222222221a066272616e63681a544a52080210011a4c10c0e1f6a4ea320a280a26092322222222222222120d54322d7374616c652e6176726f1a0510011880082080d30e3080080a1912170a046d61696e1123222222222222221a066272616e6368bb010a10019000000000700080000000000000831a574a55080110021a4f10a0b6faa4ea320a2b0a29093333333333333333120754332e6176726f1a0510011880082080d30e3080083911111111111111110a1912170a046d61696e1133333333333333331a066272616e63681a4e4a4c080210011a4610a0b6faa4ea320a220a20093433333333333333120754332e6176726f1a05100118800820c0fc153080080a1912170a046d61696e1134333333333333331a066272616e6368",
+      "hex": "4c43415400000001be0920010a1001900000000070008000000000000001100218035211080110011800220977617265686f7573656ac6040801100118012201412a99041f8b08000000000000ff8d54db8edb2010fd958aa75632899dfbe6addf51adaa893d4e50c1b830344a56f9f70ed8c6d995b6aa1f90e6720e87b9f84db4d61920f9079d57b613c75521084e1a6508aa114751562f65594225f92ce53e1e877894f3578942685b032502e1d7c7e552c32f5c5ec1e1c5068fcbef31053c498fbf037635ca2e98133a712cc740e81b206ca4f1e258ed37bb6d75d824f6315e5b1d4c27a3a67d21eae01c764c575fd040f272e26031c18f3741b71ea31872a12631c5a6cc56a16e86c4e8a90ad18189f96c15c2b148e590038cc662e2d2b63b8b473140561942fe730829839ec0f474cfc8754672c9f06cdded1dbe05ed6702d6af9e6edd642c181b3afa07b2c15a19d05fab55f165f52d336c67dd70f69fe37305b5f2f11ad46862c5c7068ce6ac70cef840f8986edee59b7bb8690bcd7f3cfbf5f15af04b5a089a9bdd633d35b007472a0e5cf20e9d7c8e3f3538b7e96703b1d4e4a0f371ec639192c7dbe07824c7b62668322a1ebf41421ac1f9ce29f8a4cd3a92d635e8f23066cf20e35d30cb4becbdb33d3237fa58777bede262b03602d96ba0a4755acbf13571a1ae4e112e08dc1949b68a835edd519e6e1489c476bd3beccb976a9553875d5f8c9a53231caf23e584d15ed4d6f40e7dfc23f0e2f12471eedd53c35334af5e07bdbfd8612264157bd946fd9c3285d203d924fe357852f5683ff5ee4324736a7b1e3c0609522146cfe32f3e230758b2040000321d73333a2f2f6c616b652f77617265686f7573652f412f6d2f736e61702d48006ac7040802100118012201422a9a041f8b08000000000000ff8d54db8edb2010fd958aa75632899dfbe6b1bf51adaa893d4e50c1b830344a56f9f70ed8c6d995b6aa1f90e6720e87b9f84db4d61920f9079d57b613c75521084e1a6508aa114751562f65599e2ac96729f7f138c4a39cbf4a1442db1a281108bf3e2e971a7ee1f20a0e2f36785c7e8f29e0497afc1db0ab5176c19cd08963390642df0061238d17c76abfd96dabc326b18ff1daea603a1935ed0b5107e7b063bafa8206929713078b097ebc09baf518c5900b3589293665b60a753324464f55880e4ccc67ab108e452a871c6034161397b6dd593c8a01b2ca10f29f434819f404a6a77b46ae33924b8667eb6eeff02d683f13b07ef574eb2663c1d8d0d13f900dd6ca80fe5aad8a2fab6f99613beb86b3ff1c9f2ba8958fd7a046132b3e366034678573c607c2c774f32edfdcc34d5b68fee3d9af8fd7825fd242d0dcec1eeba9813d385271e09277e8e473fca9c1b94d3f1b88a526079d8f631f8b943cde06c72339b635419351f1f80d12d208ce774ec1276dd691b4ae419787317b0619ef82595e62ef9ded91b9d1c7badb6b171783b511c85e0325add35a8eaf890b75758a7041e0ce48b2551cf4ea8ef274a34824b6ebdd615fbe54ab9c3aecfa62d49c1ae1781d29278cf6a2b6a677e8e31f81178f278973ef9e1a9ea279f53ae8fdc50e1321abd8cb36eae79429941ec826f1afc193aa47fba9771f229953dbf3e03148900a317a1e7f012fef0317b2040000321d73333a2f2f6c616b652f77617265686f7573652f422f6d2f736e61702d4800620a10019000000000700080000000000000811a4e4a4c080110011a4610e08cf3a4ea320a220a20091111111111111111120754312e6176726f1a05100118800820c0a9073080080a1912170a046d61696e1111111111111111111a066272616e6368be010a10019000000000700080000000000000821a544a52080110011a4c10c0e1f6a4ea320a280a26092222222222222222120d54322d7374616c652e6176726f1a0510011880082080d30e3080080a1912170a046d61696e1122222222222222221a066272616e63681a544a52080210011a4c10c0e1f6a4ea320a280a26092322222222222222120d54322d7374616c652e6176726f1a0510011880082080d30e3080080a1912170a046d61696e1123222222222222221a066272616e6368bb010a10019000000000700080000000000000831a574a55080110021a4f10a0b6faa4ea320a2b0a29093333333333333333120754332e6176726f1a0510011880082080d30e3080083911111111111111110a1912170a046d61696e1133333333333333331a066272616e63681a4e4a4c080210011a4610a0b6faa4ea320a220a20093433333333333333120754332e6176726f1a05100118800820c0fc153080080a1912170a046d61696e1134333333333333331a066272616e6368",
       "notes": [
-        {"start": 1218, "end": 1317, "label": "T1: UpdateTableInline(A, v=1, delta) — APPLIES. Delta carries an AddSnapshot + SetSnapshotRef('main', S1A). A advances to v=2."},
-        {"start": 1317, "end": 1509, "label": "T2: UpdateTableInline(A, v=1) + UpdateTableInline(B, v=1) — REJECTED. Multi-table all-or-nothing: A's captured v=1 no longer matches current v=2 after T1, so the entire transaction fails verify(). B's delta (a perfectly valid AddSnapshot) never lands. The record stays in the log until the next CAS-mode commit reclaims the space."},
-        {"start": 1509, "end": 1698, "label": "T3: UpdateTableInline(A, v=2) + UpdateTableInline(B, v=1) — APPLIES. Each table's AddSnapshot delta lands atomically; A's main now points at S3A (parent=S1A), B's at S3B."}
+        {"start": 1224, "end": 1323, "label": "T1: UpdateTableInline(A, v=1, delta) — APPLIES. Delta carries an AddSnapshot + SetSnapshotRef('main', S1A). A advances to v=2."},
+        {"start": 1323, "end": 1515, "label": "T2: UpdateTableInline(A, v=1) + UpdateTableInline(B, v=1) — REJECTED. Multi-table all-or-nothing: A's captured v=1 no longer matches current v=2 after T1, so the entire transaction fails verify(). B's delta (a perfectly valid AddSnapshot) never lands. The record stays in the log until the next CAS-mode commit reclaims the space."},
+        {"start": 1515, "end": 1704, "label": "T3: UpdateTableInline(A, v=2) + UpdateTableInline(B, v=1) — APPLIES. Each table's AddSnapshot delta lands atomically; A's main now points at S3A (parent=S1A), B's at S3B."}
       ],
       "structuralViews": [
         {
@@ -888,14 +918,27 @@
       'string': 'len-delim-string', 'bytes': 'len-delim-bytes'
     };
 
-    // Bytes fields known to carry JSON
+    // Bytes fields known to carry JSON-derived payloads, used for tree/hex
+    // label coloring ("JSON" vs "BYTES"). Decode behavior is determined
+    // separately by GZIP_JSON_BYTES_FIELDS and INLINE_TM_BYTES_FIELDS below.
     var JSON_BYTES_FIELDS = {
       'InlineTable.metadata': true,
       'CreateTableInline.metadata': true,
       'UpdateTableInline.full_metadata': true,
       'AddSchema.schema_json': true,
-      'AddPartitionSpec.spec_json': true,
-      'AddSortOrder.order_json': true
+      'AddPartitionSpec.spec_json': true
+    };
+
+    // Bytes fields whose payload is gzip-wrapped JSON (no codec discriminator).
+    // The renderer routes these through the structural-view lookup so the user
+    // sees a "Show recovered JSON" + "Show compact form" expander pair, the
+    // same treatment as gzip-codec inline-TM bytes — the alternative would be
+    // a "Show JSON" expander rendering mojibake from utf8-decoded gzip stream.
+    // Value is the human-readable type label used in the compact-form segment
+    // ("decompresses to N bytes of <label>").
+    var GZIP_JSON_BYTES_FIELDS = {
+      'AddSchema.schema_json':       'Schema JSON',
+      'AddPartitionSpec.spec_json':  'PartitionSpec JSON'
     };
 
     // Bytes fields that are nested protobuf messages (decoded recursively)
@@ -1261,6 +1304,7 @@
             node.children.push(inner);
           } else {
             var isJson = !!JSON_BYTES_FIELDS[schemaPath];
+            var isGzipJson = !!GZIP_JSON_BYTES_FIELDS[schemaPath];
             var isUuid = !!UUID_BYTES_FIELDS[schemaPath]
               && (payloadEnd - payloadStart) === 16;
             var bytesNode = newNode({
@@ -1269,11 +1313,18 @@
               fieldType: fieldType, schemaPath: schemaPath,
               parentMessage: messageType,
               fieldComment: fieldDef ? fieldDef.comment : null,
-              oneofGroup: oneofGroup, isJson: isJson, isUuid: isUuid,
-              children: []
+              oneofGroup: oneofGroup, isJson: isJson, isGzipJson: isGzipJson,
+              isUuid: isUuid, children: []
             });
             if (isUuid) {
               bytesNode.decodedValue = formatUuid(bytes, payloadStart);
+            } else if (isGzipJson) {
+              // Don't utf8-decode gzip bytes — utf8 of a gzip stream is
+              // mojibake. The renderer routes this through the structural-view
+              // lookup which decompresses asynchronously and surfaces both the
+              // recovered JSON and the gzip envelope as a compact-form segment.
+              bytesNode.decodedValue = '<' + (payloadEnd - payloadStart)
+                + ' bytes gzip(JSON); expand below>';
             } else if (isJson) {
               bytesNode.decodedValue = '<' + (payloadEnd - payloadStart) + ' bytes JSON; expand below>';
               bytesNode.jsonText = utf8Decode(bytes, payloadStart, payloadEnd);
@@ -1673,18 +1724,19 @@
         html += '<div class="quirk-block"><b>QUIRK:</b> ' + escapeHtml(node.quirkNote) + '</div>';
       }
 
-      // Codec-encoded inline-TM bytes: prefer the scenario's pre-decoded
-      // StructuralView (recovered JSON + labelled compact-form segments)
-      // over JSON-decoding the on-disk bytes, which would fail for
-      // gzip/structural-coded payloads. Lookup is by hex of the clicked
-      // bytes slice — this generalises to scenarios with multiple inline
-      // TM records (e.g. multi-table commits that touch A and B).
+      // Codec-encoded inline-TM bytes and gzip-wrapped JSON delta bytes both
+      // prefer a pre-decoded StructuralView (recovered JSON + labelled
+      // compact-form segments) over JSON-decoding the on-disk bytes, which
+      // would fail for any gzip-wrapped payload. Lookup is by hex of the
+      // clicked bytes slice — this generalises to scenarios with multiple
+      // inline TM records (e.g. multi-table commits that touch A and B).
       var isInlineTmBytes = node.schemaPath === 'InlineTable.metadata'
           || node.schemaPath === 'CreateTableInline.metadata'
           || node.schemaPath === 'UpdateTableInline.full_metadata';
+      var usesStructuralView = isInlineTmBytes || node.isGzipJson;
 
       var sv = null;
-      if (isInlineTmBytes) {
+      if (usesStructuralView) {
         var nodeHex = bytesToHex(state.bytes, node.byteStart, node.byteEnd);
         sv = findStructuralView(nodeHex);
       }
@@ -1737,24 +1789,25 @@
           }
           html += '</tbody></table></details>';
         }
-      } else if (isInlineTmBytes) {
-        // Inline-TM bytes with no fixture / dynamic view available:
-        // either the in-browser decode pass is still running, or the bytes
-        // aren't gzip-magic-prefixed (legacy raw JSON / unsupported codec).
-        // Suppress the legacy "Show JSON" expander — JSON.parse on codec
-        // bytes renders mojibake. Show a brief placeholder so the field
-        // detail isn't silent.
+      } else if (usesStructuralView) {
+        // Gzip-wrapped bytes (inline-TM, AddSchema.schema_json,
+        // AddPartitionSpec.spec_json) with no fixture / dynamic view
+        // available: either the in-browser decode pass is still running,
+        // or the bytes aren't gzip-magic-prefixed. Show a brief placeholder
+        // so the detail panel isn't silent.
+        var kindLabel = isInlineTmBytes
+            ? 'Inline-TM bytes'
+            : 'Gzip-wrapped JSON bytes';
         html += '<details><summary>'
           + (state.loadedFileName
-              ? 'Inline-TM bytes — recovery decode pending or unrecognised codec'
-              : 'Inline-TM bytes — no decode preview available')
+              ? kindLabel + ' — recovery decode pending or unrecognised payload'
+              : kindLabel + ' — no decode preview available')
           + '</summary><pre>'
-          + 'codec-encoded bytes ('
+          + 'gzip-wrapped bytes ('
           + (node.byteEnd - node.byteStart) + ' bytes). '
           + 'If you just loaded a file, the in-browser decode runs '
           + 'asynchronously — click another node and back to retry. '
-          + 'Bytes that aren\'t gzip-magic-prefixed are not decoded; '
-          + 'their codec_field on the parent message identifies the writer.'
+          + 'Bytes that aren\'t gzip-magic-prefixed are not decoded.'
           + '</pre></details>';
       } else if (node.isJson && node.jsonText) {
         // Plain JSON bytes (schema/spec/order JSON in delta records, etc.).
@@ -2026,32 +2079,86 @@
 
     function computeDynamicStructuralViews(token) {
       if (!state.tree) return;
-      var targets = [];
-      collectInlineTmTargets(state.tree, targets);
-      if (targets.length === 0) return;
+      var inlineTmTargets = [];
+      collectInlineTmTargets(state.tree, inlineTmTargets);
+      var gzipJsonTargets = [];
+      collectGzipJsonTargets(state.tree, gzipJsonTargets);
+      if (inlineTmTargets.length === 0 && gzipJsonTargets.length === 0) return;
 
       // Decompress + decode each target in parallel; each is independent.
-      var promises = targets.map(function (t) {
+      var promises = inlineTmTargets.map(function (t) {
         return decodeInlineTmBytes(t).then(function (view) {
-          // Race guard: if the user switched scenarios mid-flight, drop the
-          // result on the floor.
           if (token !== state.decodeToken) return null;
           if (view) state.dynamicStructuralViews.push(view);
           return view;
         }, function (err) {
-          // Don't crash the page on a malformed inline-TM record; leave
-          // the bytes node showing the standard "<N bytes>" preview.
           if (window.console && console.warn) {
             console.warn('inline-TM decode failed:', err);
           }
           return null;
         });
-      });
+      }).concat(gzipJsonTargets.map(function (t) {
+        return decodeGzipJsonBytes(t).then(function (view) {
+          if (token !== state.decodeToken) return null;
+          if (view) state.dynamicStructuralViews.push(view);
+          return view;
+        }, function (err) {
+          if (window.console && console.warn) {
+            console.warn('gzip-JSON decode failed:', err);
+          }
+          return null;
+        });
+      }));
       Promise.all(promises).then(function () {
         if (token !== state.decodeToken) return;
         // Re-render the detail panel — the currently-selected node may
         // now have a recovered JSON / compact form to show.
         renderDetail();
+      });
+    }
+
+    function collectGzipJsonTargets(node, out) {
+      if (!node) return;
+      if (node.kind === 'bytes' && node.isGzipJson && node.schemaPath) {
+        out.push({
+          bytesNode: node,
+          typeLabel: GZIP_JSON_BYTES_FIELDS[node.schemaPath] || 'JSON'
+        });
+      }
+      var children = node.children || [];
+      for (var k = 0; k < children.length; k++) {
+        collectGzipJsonTargets(children[k], out);
+      }
+    }
+
+    function decodeGzipJsonBytes(target) {
+      var b = target.bytesNode;
+      var slice = state.bytes.slice(b.byteStart, b.byteEnd);
+      var hex = bytesToHex(state.bytes, b.byteStart, b.byteEnd);
+      // Skip if a fixture already provides a view for these bytes.
+      for (var i = 0; i < state.structuralViews.length; i++) {
+        if (state.structuralViews[i].bytesHex === hex) {
+          return Promise.resolve(null);
+        }
+      }
+      // Sniff the gzip magic before handing to DecompressionStream; otherwise
+      // a non-gzip payload (e.g., a partially-written file) would produce a
+      // noisy console error during the async pass.
+      if (slice.length < 2 || slice[0] !== 0x1f || slice[1] !== 0x8b) {
+        return Promise.resolve(null);
+      }
+      return gunzipBytes(slice).then(function (inner) {
+        var json = utf8DecodeArray(inner);
+        return {
+          bytesHex: hex,
+          recoveredJson: tryPretty(json),
+          compactSegments: [{
+            label: 'gzip-wrapped JSON (decompresses to ' + inner.length
+              + ' bytes of ' + target.typeLabel + ')',
+            hex: bytesToHex(slice),
+            byteCount: slice.length
+          }]
+        };
       });
     }
 
