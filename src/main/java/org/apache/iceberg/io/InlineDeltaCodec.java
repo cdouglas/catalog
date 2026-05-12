@@ -30,11 +30,15 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import org.apache.iceberg.ManifestFile;
+import org.apache.iceberg.NullOrder;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.SchemaParser;
+import org.apache.iceberg.SortDirection;
+import org.apache.iceberg.SortField;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.SortOrderParser;
 import org.apache.iceberg.TableMetadata;
@@ -43,6 +47,7 @@ import org.apache.iceberg.InlineDeltaSnapshots;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.UnboundPartitionSpec;
 import org.apache.iceberg.UnboundSortOrder;
+import org.apache.iceberg.util.JsonUtil;
 
 /**
  * Encodes, decodes, and applies inline table metadata deltas.
@@ -121,9 +126,44 @@ public class InlineDeltaCodec {
   // SetDefaultPartitionSpec field numbers
   private static final int SET_SPEC_ID = 1;
 
-  // AddSortOrder field numbers
+  // AddSortOrder field numbers. The repeated SortField list (field 2) carries
+  // a typed binary grammar — see SortFieldEntry. Schemas and partition specs
+  // still embed gzip(JSON) because their Type system / transform vocabulary
+  // is too large to mirror; sort order is small and closed enough to encode
+  // structurally. See SPEC_TM.md for the format and errata.md §D8 for the
+  // residual scope (PartitionSpec, Schema).
   private static final int ADD_ORDER_ID = 1;
-  private static final int ADD_ORDER_JSON = 2;
+  private static final int ADD_ORDER_FIELDS = 2;
+
+  // SortField (inner submessage of AddSortOrder) field numbers. transform_kind
+  // is 1-based so a missing kind is distinguishable from a recognized value;
+  // ditto direction and null_order. transform_param is present only for the
+  // parameterized transforms (BUCKET, TRUNCATE).
+  private static final int SF_SOURCE_ID = 1;
+  private static final int SF_TRANSFORM_KIND = 2;
+  private static final int SF_TRANSFORM_PARAM = 3;
+  private static final int SF_DIRECTION = 4;
+  private static final int SF_NULL_ORDER = 5;
+
+  // TransformKind wire values. Closed set; the encoder throws on an
+  // unrecognized Transform.toString() (e.g., UnknownTransform or a future
+  // Iceberg-added kind) so silent data loss on grammar evolution is
+  // impossible.
+  static final int TK_IDENTITY = 1;
+  static final int TK_YEAR = 2;
+  static final int TK_MONTH = 3;
+  static final int TK_DAY = 4;
+  static final int TK_HOUR = 5;
+  static final int TK_BUCKET = 6;
+  static final int TK_TRUNCATE = 7;
+  static final int TK_VOID = 8;
+
+  // Direction / NullOrder wire values (1-based; see comment on SortField field
+  // numbers above for the rationale).
+  private static final int DIR_ASC = 1;
+  private static final int DIR_DESC = 2;
+  private static final int NO_NULLS_FIRST = 1;
+  private static final int NO_NULLS_LAST = 2;
 
   // SetDefaultSortOrder field numbers
   private static final int SET_ORDER_ID = 1;
@@ -611,9 +651,7 @@ public class InlineDeltaCodec {
     }
     for (org.apache.iceberg.SortOrder order : newMeta.sortOrders()) {
       if (!oldOrderIds.contains(order.orderId())) {
-        String json = org.apache.iceberg.SortOrderParser.toJson(order);
-        updates.add(new AddSortOrderUpdate(
-            order.orderId(), json.getBytes(StandardCharsets.UTF_8)));
+        updates.add(AddSortOrderUpdate.fromSortOrder(order));
       }
     }
     if (newMeta.defaultSortOrderId() != oldMeta.defaultSortOrderId()) {
@@ -842,19 +880,128 @@ public class InlineDeltaCodec {
     }
   }
 
+  /**
+   * Sort field entry in the binary wire grammar. Mirrors the four accessors on
+   * {@link SortField} that Iceberg's JSON serialization writes:
+   * source-id, transform, direction, null-order. The transform is split into a
+   * closed {@code TK_*} kind plus an optional int parameter (bucket N /
+   * truncate N); on encode an unrecognized {@link Transform#toString()} fails
+   * loudly rather than being silently encoded as an opaque string.
+   */
+  public static class SortFieldEntry {
+    public final int sourceId;
+    public final int transformKind;   // TK_* constants
+    public final int transformParam;  // 0 unless BUCKET or TRUNCATE
+    public final SortDirection direction;
+    public final NullOrder nullOrder;
+
+    public SortFieldEntry(
+        int sourceId,
+        int transformKind,
+        int transformParam,
+        SortDirection direction,
+        NullOrder nullOrder) {
+      this.sourceId = sourceId;
+      this.transformKind = transformKind;
+      this.transformParam = transformParam;
+      this.direction = direction;
+      this.nullOrder = nullOrder;
+    }
+
+    /** Builds an entry from an Iceberg {@link SortField}, validating the transform vocabulary. */
+    public static SortFieldEntry fromSortField(SortField f) {
+      String t = f.transform().toString();
+      int kind;
+      int param = 0;
+      switch (t) {
+        case "identity": kind = TK_IDENTITY; break;
+        case "year":     kind = TK_YEAR; break;
+        case "month":    kind = TK_MONTH; break;
+        case "day":      kind = TK_DAY; break;
+        case "hour":     kind = TK_HOUR; break;
+        case "void":     kind = TK_VOID; break;
+        default:
+          if (t.startsWith("bucket[") && t.endsWith("]")) {
+            kind = TK_BUCKET;
+            param = Integer.parseInt(t.substring("bucket[".length(), t.length() - 1));
+          } else if (t.startsWith("truncate[") && t.endsWith("]")) {
+            kind = TK_TRUNCATE;
+            param = Integer.parseInt(t.substring("truncate[".length(), t.length() - 1));
+          } else {
+            throw new IllegalArgumentException(
+                "Cannot encode sort field with unrecognized transform: " + t
+                    + " (catalog grammar covers identity, year, month, day, hour,"
+                    + " bucket[N], truncate[N], void)");
+          }
+      }
+      return new SortFieldEntry(f.sourceId(), kind, param, f.direction(), f.nullOrder());
+    }
+
+    /** Canonical Iceberg {@code Transform.toString()} form for this entry. */
+    public String transformAsString() {
+      switch (transformKind) {
+        case TK_IDENTITY: return "identity";
+        case TK_YEAR:     return "year";
+        case TK_MONTH:    return "month";
+        case TK_DAY:      return "day";
+        case TK_HOUR:     return "hour";
+        case TK_BUCKET:   return "bucket[" + transformParam + "]";
+        case TK_TRUNCATE: return "truncate[" + transformParam + "]";
+        case TK_VOID:     return "void";
+        default:
+          throw new IllegalStateException("Unknown sort transform kind: " + transformKind);
+      }
+    }
+  }
+
   public static class AddSortOrderUpdate implements DeltaUpdate {
     public final int orderId;
-    public final byte[] orderJson;
+    public final List<SortFieldEntry> fields;
 
-    public AddSortOrderUpdate(int orderId, byte[] orderJson) {
+    public AddSortOrderUpdate(int orderId, List<SortFieldEntry> fields) {
       this.orderId = orderId;
-      this.orderJson = orderJson;
+      this.fields = fields;
+    }
+
+    /** Builds an update from an Iceberg {@link SortOrder}, validating each field's transform. */
+    public static AddSortOrderUpdate fromSortOrder(SortOrder order) {
+      List<SortFieldEntry> entries = new ArrayList<>(order.fields().size());
+      for (SortField f : order.fields()) {
+        entries.add(SortFieldEntry.fromSortField(f));
+      }
+      return new AddSortOrderUpdate(order.orderId(), entries);
+    }
+
+    /**
+     * Synthesizes the JSON form Iceberg's {@code SortOrderParser} expects.
+     * Kept symmetric with {@link SortOrderParser#toJson(SortOrder)} so a
+     * round-trip ({@code encode → decode → SortOrderParser.toJson}) is
+     * byte-stable against the original input — a property test exercises that
+     * to catch upstream Iceberg adding new sort-field fields.
+     */
+    String toJson() {
+      return JsonUtil.generate(gen -> {
+        gen.writeStartObject();
+        gen.writeNumberField("order-id", orderId);
+        gen.writeFieldName("fields");
+        gen.writeStartArray();
+        for (SortFieldEntry f : fields) {
+          gen.writeStartObject();
+          gen.writeStringField("transform", f.transformAsString());
+          gen.writeNumberField("source-id", f.sourceId);
+          gen.writeStringField("direction", f.direction.toString().toLowerCase(Locale.ENGLISH));
+          gen.writeStringField(
+              "null-order", f.nullOrder == NullOrder.NULLS_FIRST ? "nulls-first" : "nulls-last");
+          gen.writeEndObject();
+        }
+        gen.writeEndArray();
+        gen.writeEndObject();
+      }, false);
     }
 
     @Override
     public void applyTo(TableMetadata.Builder builder) {
-      UnboundSortOrder order = SortOrderParser.fromJson(
-          new String(orderJson, StandardCharsets.UTF_8));
+      UnboundSortOrder order = SortOrderParser.fromJson(toJson());
       builder.addSortOrder(order);
     }
 
@@ -1159,7 +1306,7 @@ public class InlineDeltaCodec {
       ByteArrayOutputStream inner = new ByteArrayOutputStream();
       writeVarint(inner, ADD_SCHEMA_ID, u.schemaId);
       writeVarint(inner, ADD_SCHEMA_LAST_COL_ID, u.lastColumnId);
-      writeBytes(inner, ADD_SCHEMA_JSON, u.schemaJson);
+      writeBytes(inner, ADD_SCHEMA_JSON, InlineMetadataIO.gzip(u.schemaJson));
       writeLengthDelimited(out, UPDATE_ADD_SCHEMA, inner.toByteArray());
 
     } else if (update instanceof SetCurrentSchemaUpdate) {
@@ -1173,7 +1320,7 @@ public class InlineDeltaCodec {
       ByteArrayOutputStream inner = new ByteArrayOutputStream();
       writeVarint(inner, ADD_SPEC_ID, u.specId);
       writeVarint(inner, ADD_SPEC_LAST_PART_ID, u.lastPartitionId);
-      writeBytes(inner, ADD_SPEC_JSON, u.specJson);
+      writeBytes(inner, ADD_SPEC_JSON, InlineMetadataIO.gzip(u.specJson));
       writeLengthDelimited(out, UPDATE_ADD_PARTITION_SPEC, inner.toByteArray());
 
     } else if (update instanceof SetDefaultSpecUpdate) {
@@ -1186,7 +1333,9 @@ public class InlineDeltaCodec {
       AddSortOrderUpdate u = (AddSortOrderUpdate) update;
       ByteArrayOutputStream inner = new ByteArrayOutputStream();
       writeVarint(inner, ADD_ORDER_ID, u.orderId);
-      writeBytes(inner, ADD_ORDER_JSON, u.orderJson);
+      for (SortFieldEntry f : u.fields) {
+        writeLengthDelimited(inner, ADD_ORDER_FIELDS, encodeSortField(f));
+      }
       writeLengthDelimited(out, UPDATE_ADD_SORT_ORDER, inner.toByteArray());
 
     } else if (update instanceof SetDefaultSortOrderUpdate) {
@@ -1420,7 +1569,7 @@ public class InlineDeltaCodec {
       switch (fn) {
         case ADD_SCHEMA_ID: schemaId = readVarint(in); break;
         case ADD_SCHEMA_LAST_COL_ID: lastColId = readVarint(in); break;
-        case ADD_SCHEMA_JSON: json = readLengthDelimitedBytes(in); break;
+        case ADD_SCHEMA_JSON: json = InlineMetadataIO.gunzip(readLengthDelimitedBytes(in)); break;
         default: skipField(in, tag & 0x7);
       }
     }
@@ -1448,7 +1597,7 @@ public class InlineDeltaCodec {
       switch (fn) {
         case ADD_SPEC_ID: specId = readVarint(in); break;
         case ADD_SPEC_LAST_PART_ID: lastPartId = readVarint(in); break;
-        case ADD_SPEC_JSON: json = readLengthDelimitedBytes(in); break;
+        case ADD_SPEC_JSON: json = InlineMetadataIO.gunzip(readLengthDelimitedBytes(in)); break;
         default: skipField(in, tag & 0x7);
       }
     }
@@ -1469,17 +1618,69 @@ public class InlineDeltaCodec {
   private static AddSortOrderUpdate decodeAddSortOrder(byte[] bytes) throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
     int orderId = 0;
-    byte[] json = new byte[0];
+    List<SortFieldEntry> entries = new ArrayList<>();
     while (in.available() > 0) {
       int tag = readVarint(in);
       int fn = tag >>> 3;
       switch (fn) {
         case ADD_ORDER_ID: orderId = readVarint(in); break;
-        case ADD_ORDER_JSON: json = readLengthDelimitedBytes(in); break;
+        case ADD_ORDER_FIELDS: entries.add(decodeSortField(readLengthDelimitedBytes(in))); break;
         default: skipField(in, tag & 0x7);
       }
     }
-    return new AddSortOrderUpdate(orderId, json);
+    return new AddSortOrderUpdate(orderId, entries);
+  }
+
+  private static byte[] encodeSortField(SortFieldEntry f) throws IOException {
+    ByteArrayOutputStream inner = new ByteArrayOutputStream();
+    writeVarint(inner, SF_SOURCE_ID, f.sourceId);
+    writeVarint(inner, SF_TRANSFORM_KIND, f.transformKind);
+    if (f.transformKind == TK_BUCKET || f.transformKind == TK_TRUNCATE) {
+      writeVarint(inner, SF_TRANSFORM_PARAM, f.transformParam);
+    }
+    writeVarint(inner, SF_DIRECTION, f.direction == SortDirection.ASC ? DIR_ASC : DIR_DESC);
+    writeVarint(
+        inner, SF_NULL_ORDER, f.nullOrder == NullOrder.NULLS_FIRST ? NO_NULLS_FIRST : NO_NULLS_LAST);
+    return inner.toByteArray();
+  }
+
+  private static SortFieldEntry decodeSortField(byte[] bytes) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    int sourceId = 0;
+    int kind = 0;
+    int param = 0;
+    int dir = 0;
+    int nullOrd = 0;
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      int fn = tag >>> 3;
+      switch (fn) {
+        case SF_SOURCE_ID:       sourceId = readVarint(in); break;
+        case SF_TRANSFORM_KIND:  kind = readVarint(in); break;
+        case SF_TRANSFORM_PARAM: param = readVarint(in); break;
+        case SF_DIRECTION:       dir = readVarint(in); break;
+        case SF_NULL_ORDER:      nullOrd = readVarint(in); break;
+        default: skipField(in, tag & 0x7);
+      }
+    }
+    SortDirection direction;
+    switch (dir) {
+      case DIR_ASC:  direction = SortDirection.ASC; break;
+      case DIR_DESC: direction = SortDirection.DESC; break;
+      default:
+        throw new IllegalStateException("Sort field missing or invalid direction: " + dir);
+    }
+    NullOrder nullOrder;
+    switch (nullOrd) {
+      case NO_NULLS_FIRST: nullOrder = NullOrder.NULLS_FIRST; break;
+      case NO_NULLS_LAST:  nullOrder = NullOrder.NULLS_LAST; break;
+      default:
+        throw new IllegalStateException("Sort field missing or invalid null order: " + nullOrd);
+    }
+    if (kind < TK_IDENTITY || kind > TK_VOID) {
+      throw new IllegalStateException("Sort field missing or invalid transform kind: " + kind);
+    }
+    return new SortFieldEntry(sourceId, kind, param, direction, nullOrder);
   }
 
   private static SetDefaultSortOrderUpdate decodeSetDefaultSortOrder(byte[] bytes)

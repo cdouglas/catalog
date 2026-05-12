@@ -262,7 +262,17 @@ message AddSchema               { int32 schema_id = 1; int32 last_column_id = 2;
 message SetCurrentSchema        { int32 schema_id = 1; }
 message AddPartitionSpec        { int32 spec_id = 1; int32 last_partition_id = 2; bytes spec_json = 3; }
 message SetDefaultPartitionSpec { int32 spec_id = 1; }
-message AddSortOrder            { int32 order_id = 1; bytes order_json = 2; }
+message AddSortOrder            { int32 order_id = 1; repeated SortField fields = 2; }
+message SortField {
+  int32 source_id            = 1;
+  TransformKind kind         = 2;   // IDENTITY | YEAR | MONTH | DAY | HOUR | BUCKET | TRUNCATE | VOID
+  int32 transform_param      = 3;   // bucket N or truncate N; omitted for non-parameterized
+  SortDirection direction    = 4;   // ASC | DESC
+  NullOrderKind null_order   = 5;   // NULLS_FIRST | NULLS_LAST
+}
+// Each enum carries an explicit *_UNSPECIFIED = 0 sentinel so the decoder
+// can distinguish "missing on wire" from "valid value". See catalog.proto
+// for the full enum definitions.
 message SetDefaultSortOrder     { int32 order_id = 1; }
 message SetTableProperties      { map<string,string> updated = 1; repeated string removed = 2; }
 message SetTableLocation        { string location = 1; }
@@ -270,10 +280,30 @@ message RemoveSchemas           { repeated int32 schema_ids = 1; }
 message RemovePartitionSpecs    { repeated int32 spec_ids   = 1; }
 ```
 
-Schemas, partition specs, and sort orders are serialized as length-prefixed
-JSON via Iceberg's existing parsers (`SchemaParser`, `PartitionSpecParser`,
-`SortOrderParser`). These updates are rare, so the JSON overhead is
-acceptable.
+Schemas and partition specs are serialized as gzip-wrapped JSON via
+Iceberg's existing parsers (`SchemaParser`, `PartitionSpecParser`). The
+`schema_json` and `spec_json` byte fields hold the gzip stream directly;
+the decoder gunzips before handing the bytes to the parser. Gzip is
+applied unconditionally — for some payloads it is roughly a wash, but
+always compressing puts a ceiling on the worst case (a wide nested
+schema) which would otherwise risk pushing the append log past
+`max.append.size` and triggering compaction earlier than snapshot
+volume alone warrants. Future revisits to a typed-protobuf encoding
+for `Schema` and `PartitionSpec` are tracked in [errata.md §D8](errata.md).
+
+Sort orders are encoded structurally. The `SortField` grammar is closed
+(8 transform kinds: identity, year, month, day, hour, bucket[N],
+truncate[N], void; two directions; two null orders); the encoder fails
+loudly if a `SortField`'s `transform.toString()` doesn't match the
+grammar, so silent data loss on grammar evolution is impossible. The
+1-based wire values for `kind` / `direction` / `null_order` (rather
+than proto3 zero-defaults) let the decoder distinguish "missing" from
+"valid value" and reject incomplete messages. The apply path
+synthesizes the canonical Iceberg JSON form and hands it to
+`SortOrderParser` — equivalent to the legacy gzip(JSON) path, but
+without an intermediate JSON blob on disk. A round-trip property test
+exercises every transform kind to catch upstream Iceberg adding new
+fields to `SortField`.
 
 `RemoveSchemas` / `RemovePartitionSpecs` are emitted by `computeDelta`
 when `expireSnapshots().cleanExpiredMetadata(true)` (or a replace

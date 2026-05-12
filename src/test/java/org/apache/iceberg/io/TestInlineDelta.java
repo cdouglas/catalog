@@ -24,9 +24,11 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import org.apache.iceberg.NullOrder;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.SortOrder;
+import org.apache.iceberg.SortOrderParser;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableMetadataParser;
 import org.apache.iceberg.types.Types;
@@ -252,6 +254,93 @@ public class TestInlineDelta {
       List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(bytes).updates;
       assertThat(decoded).hasSize(1);
       assertThat(((InlineDeltaCodec.SetDefaultSpecUpdate) decoded.get(0)).specId).isEqualTo(3);
+    }
+  }
+
+  // ============================================================
+  // AddSortOrder — typed binary grammar (no JSON on the wire)
+  // ============================================================
+
+  @Nested
+  class SortOrderTests {
+
+    /** Schema with one field per Iceberg primitive that admits every transform we encode. */
+    private Schema schemaForTransforms() {
+      return new Schema(
+          Types.NestedField.required(1, "id", Types.LongType.get()),
+          Types.NestedField.required(2, "ts", Types.TimestampType.withoutZone()),
+          Types.NestedField.required(3, "name", Types.StringType.get()));
+    }
+
+    /** Round-trips every transform vocabulary entry through encode → decode → apply. */
+    @Test
+    void coversEveryTransformKind() {
+      Schema schema = schemaForTransforms();
+      SortOrder order = SortOrder.builderFor(schema).withOrderId(7)
+          .asc("id", NullOrder.NULLS_FIRST)
+          .desc(org.apache.iceberg.expressions.Expressions.bucket("name", 16), NullOrder.NULLS_LAST)
+          .asc(org.apache.iceberg.expressions.Expressions.truncate("name", 4), NullOrder.NULLS_FIRST)
+          .asc(org.apache.iceberg.expressions.Expressions.year("ts"), NullOrder.NULLS_FIRST)
+          .asc(org.apache.iceberg.expressions.Expressions.month("ts"), NullOrder.NULLS_FIRST)
+          .asc(org.apache.iceberg.expressions.Expressions.day("ts"), NullOrder.NULLS_FIRST)
+          .asc(org.apache.iceberg.expressions.Expressions.hour("ts"), NullOrder.NULLS_FIRST)
+          .build();
+
+      InlineDeltaCodec.AddSortOrderUpdate update =
+          InlineDeltaCodec.AddSortOrderUpdate.fromSortOrder(order);
+
+      byte[] bytes = InlineDeltaCodec.encodeDelta(List.of(update), TestInlineDelta.TEST_TS);
+      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(bytes).updates;
+      assertThat(decoded).hasSize(1);
+      InlineDeltaCodec.AddSortOrderUpdate d =
+          (InlineDeltaCodec.AddSortOrderUpdate) decoded.get(0);
+      assertThat(d.orderId).isEqualTo(7);
+      assertThat(d.fields).hasSize(7);
+
+      // Property: re-rendering the decoded update's JSON matches the original
+      // SortOrderParser.toJson(order). Catches upstream Iceberg adding new
+      // sort-field fields — our binary grammar would drop them, the synthesized
+      // JSON would diverge, this test would fail.
+      assertThat(d.toJson()).isEqualTo(SortOrderParser.toJson(order));
+    }
+
+    /**
+     * Apply-path sanity check: a decoded AddSortOrder applied to a TableMetadata
+     * yields a SortOrder with the same fields, in the same order, with the same
+     * transform/direction/null-order. The order id is incidental — Iceberg's
+     * Builder reassigns ids via {@code reuseOrCreateNewSortOrderId}, so we
+     * compare against the last-added order rather than asserting a specific id.
+     */
+    @Test
+    void decodedAddSortOrderAppliesCorrectly() {
+      Schema schema = schemaForTransforms();
+      SortOrder order = SortOrder.builderFor(schema).withOrderId(3)
+          .desc("id", NullOrder.NULLS_LAST)
+          .asc(org.apache.iceberg.expressions.Expressions.bucket("name", 8), NullOrder.NULLS_FIRST)
+          .build();
+
+      InlineDeltaCodec.AddSortOrderUpdate update =
+          InlineDeltaCodec.AddSortOrderUpdate.fromSortOrder(order);
+      byte[] bytes = InlineDeltaCodec.encodeDelta(List.of(update), TestInlineDelta.TEST_TS);
+      List<InlineDeltaCodec.DeltaUpdate> decoded = InlineDeltaCodec.decodeDelta(bytes).updates;
+
+      TableMetadata base = TableMetadata.buildFromEmpty()
+          .setLocation("s3://bucket/warehouse/db/tbl")
+          .setCurrentSchema(schema, 3)
+          .addPartitionSpec(PartitionSpec.unpartitioned())
+          .addSortOrder(SortOrder.unsorted())
+          .assignUUID()
+          .discardChanges()
+          .build();
+      TableMetadata result = InlineDeltaCodec.applyUpdates(base, decoded);
+      SortOrder applied = result.sortOrders().get(result.sortOrders().size() - 1);
+      assertThat(applied.fields()).hasSize(order.fields().size());
+      for (int i = 0; i < order.fields().size(); i++) {
+        assertThat(applied.fields().get(i).transform().toString())
+            .isEqualTo(order.fields().get(i).transform().toString());
+        assertThat(applied.fields().get(i).direction()).isEqualTo(order.fields().get(i).direction());
+        assertThat(applied.fields().get(i).nullOrder()).isEqualTo(order.fields().get(i).nullOrder());
+      }
     }
   }
 

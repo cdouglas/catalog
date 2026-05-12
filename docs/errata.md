@@ -49,19 +49,17 @@ who hit it mid-migration can recognize it.
 
 ### D8. Typed-protobuf encoding for Iceberg structural types (skip JSON serde)
 
-The `bytes` fields in our wire format that carry upstream Iceberg objects
-— full `TableMetadata` (in `gzip` codec mode), `Schema`, `PartitionSpec`,
-`SortOrder` — are JSON today because Iceberg's only public serialization
-for those types is JSON. The catalog file is otherwise protobuf, with
-structured encodings for snapshots (`AddSnapshotUpdate` / `CompactSummary`)
-that we own, plus a binary-structural codec for `TableMetadata` itself
-(see [SPEC_TM.md](SPEC_TM.md) §"Inline-TM codecs"). The remaining JSON
-payloads live in the rare-update path: `AddSchemaUpdate`,
-`AddPartitionSpecUpdate`, `AddSortOrderUpdate`.
+`AddSortOrderUpdate` is encoded structurally (see SPEC_TM.md §"Other
+Updates"); the apply path synthesizes JSON only as the boundary into
+`SortOrderParser`. `AddSchemaUpdate` and `AddPartitionSpecUpdate` remain
+gzip-wrapped JSON. The split is driven by the size of the grammar each
+type carries — sort fields are a closed 8-kind transform vocabulary and
+a pair of two-value enums; schemas drag the full recursive `Type` system.
 
-Replacing JSON with typed protobuf in those updates would (a) skip JSON
-parsing on the read path and (b) shrink the bytes we store. Constructor
-visibility audit:
+A typed encoder for the remaining two would (a) skip the JSON parse +
+gunzip on the read path and (b) shrink the bytes further for small
+payloads where gzip has little to compress. Constructor visibility
+audit:
 
 | Type | Visibility | How we'd build one |
 |---|---|---|
@@ -69,24 +67,28 @@ visibility audit:
 | `BaseSnapshot`, `SnapshotLogEntry`, `MetadataLogEntry` | package-private | same |
 | `Schema` | public | direct `new Schema(...)` |
 | `PartitionSpec` | **`private`** | public `Builder` API |
-| `SortOrder` | **`private`** | public `Builder` API |
 
-No additional Iceberg fork needed beyond the package-peer factory. The
-hard part isn't constructors — it's the recursive `Type` system
+The hard part isn't constructors — it's the recursive `Type` system
 (`StructType` of `ListType` of `MapType` of …, plus parameterized
 primitives like `DecimalType(precision, scale)`). A protobuf grammar
 mirroring `org.apache.iceberg.types.Types` is ~300-500 lines of
-encoder + decoder.
+encoder + decoder, plus the ongoing burden of mirroring every new
+upstream type (v3 row-lineage, future variant / geometry, etc.).
+`PartitionSpec` is in the middle tier: its transform vocabulary
+matches the one already implemented for sort order, so a typed encoder
+is mostly mechanical — but it carries a `field_id` per partition field
+and a `last_assigned_partition_id` that need careful handling.
 
-For the delta-update path the benefit is marginal — `AddSchemaUpdate` /
-`AddPartitionSpecUpdate` / `AddSortOrderUpdate` fire only when those
-types change, which is rare. The dominant cost (full `TableMetadata`
-JSON in `inline_tables.metadata`) is already addressed by the
-`structural` codec.
+For the delta-update path the marginal benefit over gzip(JSON) is small
+— these updates fire only when those types change, which is rare. The
+dominant cost (full `TableMetadata` JSON in `inline_tables.metadata`)
+is already addressed by the `structural` codec.
 
-**Trigger to revisit:** wide-table workloads where individual
-schema/spec change records dominate; profiling shows JSON parse on the
-rare-update path is non-negligible.
+**Trigger to revisit:** when we decide to upstream / drop the iceberg
+fork — at that point the package-peer factory becomes load-bearing
+elsewhere and a typed encoder removes it from the wire format
+altogether. PartitionSpec is the cheaper of the two to lift next if a
+workload motivates it independently.
 
 ## Test Coverage Gaps
 
@@ -178,19 +180,6 @@ cost.
 **Trigger:** measure pool size at 100 / 1000 / 10000 retained snapshots
 on a representative table; decide whether to add a per-table
 "checkpoint-too-big → evict to pointer" threshold.
-
-### U3. Reader / writer skew during a rolling deploy
-
-Protobuf forward-compatibility means an old reader silently skips new
-fields, so an old reader looking at a catalog written with inline ML
-would see *no* manifest list for inline snapshots — leading to a
-different (worse) failure than a clear version mismatch. The
-documentation says "upgrade readers before writers" but we have no
-version negotiation, no minimum-reader-version field, and no test that
-proves what an old reader does.
-
-**Trigger:** before a multi-process deployment, decide whether to add a
-`min_reader_version` field to `Checkpoint` and gate it.
 
 ### U4. Behaviour under storage provider edge cases
 
