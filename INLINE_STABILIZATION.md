@@ -1,10 +1,8 @@
 # Inline TM/ML stabilization — open items
 
 Inline-TM and inline-ML are green across the cloud matrix — see
-[docs/COMPAT.md](docs/COMPAT.md). One inline-ML create-transaction
-shape (multi-spec) is deferred and tracked as
-[errata D9](docs/errata.md). Resolved shortcuts and deferred
-functionality otherwise live in [docs/errata.md](docs/errata.md).
+[docs/COMPAT.md](docs/COMPAT.md). Deferred functionality lives in
+[docs/errata.md](docs/errata.md).
 
 This file tracks inline TM/ML work still ahead.
 

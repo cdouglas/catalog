@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-05-10 (D6, D7, D9 resolved — see errata.md). Inline-ML create-with-snapshots was latently broken under the structural codec since the codec discriminator became default on 2026-05-08, masked by the local suites going through the update path; the 2026-05-10 D9 fix (sentinel rewrite + pool delivery via CreateTableInlineAction) closes both codecs. Cloud cells have not been re-run on this branch (no credentials in this environment); local unit + end-to-end suites including the new TestInlineManifestEndToEnd$CodecAxisTests$tmMlCreateTransaction{Single,Multi}SpecRoundTrip cover both codecs end-to-end.
+last-verified: 2026-05-12 — full real-cloud matrix run under both gzip and structural inline-TM codecs (1961 tests, 0 failures, 163 skipped per codec).
 ---
 
 # Cloud-store compatibility matrix
@@ -51,23 +51,11 @@ Cell legend:
 
 ## Matrix
 
-Inline-TM cells are reported as `gzip / structural`. The two codecs run the
-same suite under different `fileio.catalog.inline.tm.codec` settings.
-
 | Store | CAS · file | CAS · TM | CAS · TM+ML | append · file | append · TM | append · TM+ML |
 |-------|------------|----------|-------------|---------------|-------------|----------------|
 | GCS   | OK         | OK / OK  | OK / OK     | NA            | NA          | NA             |
 | S3    | OK         | OK / OK  | OK / OK     | OK            | OK / OK     | OK / OK        |
 | ADLS  | OK         | OK / OK  | OK / OK     | OK            | OK / OK     | OK / OK        |
-
-The 2026-05-08 codec round captures the wire-format change for both
-codecs. Cloud `last-verified` dates on 2026-05-07 and earlier ran under
-gzip JSON (the only codec before the discriminator landed in `b1f4165`);
-the `structural` column became the production default that same week and
-remained latently unverified on cloud cells until the local Phase 0 test
-added on 2026-05-10 (see errata D9) caught the gap. See
-[TM_ENCODING_BENCH_RESULTS.md](TM_ENCODING_BENCH_RESULTS.md) for the
-structural codec design.
 
 ## Notes
 
@@ -76,20 +64,13 @@ structural codec design.
 - **Append is unsupported.** `GCSOutputFile.prepare` rejects
   `Strategy.APPEND` with a `Preconditions` check; the only honest
   implementation would already be a CAS replace. `ProtoCatalogFormat`
-  detects this at init and coerces `max.append.count=0` (commits
-  `e15051d`, `a4cff40`).
+  detects this at init and coerces `max.append.count=0`.
 - **CAS · file (OK)** — `GCSCatalogTest`,
   `GCSFileIOCatalogTransactionTests`.
 - **CAS · TM (OK)** — `GCSCatalogTestInlineTM`,
-  `GCSFileIOCatalogTransactionTestsInlineTM`. Verified 2026-05-05 after
-  the inline-replay determinism fixes (commits `804465b`, `45c88c5`,
-  `b616131`, `baac33b`) and the v1 sequence-number gate (`ec220c2`).
+  `GCSFileIOCatalogTransactionTestsInlineTM`.
 - **CAS · TM+ML (OK)** — `GCSCatalogTestInlineML`,
-  `GCSFileIOCatalogTransactionTestsInlineML`. Last cloud run
-  2026-05-07: 130/1/0 (1 deferred D9 outlier) + 28/0/0. D9 fixed
-  2026-05-10; cloud re-run pending. The earlier "OK\*" status on this
-  cell was masking a latent structural-codec breakage that local tests
-  didn't exercise — see errata D9.
+  `GCSFileIOCatalogTransactionTestsInlineML`.
 
 ### S3
 
@@ -100,21 +81,13 @@ structural codec design.
   bucket (the only S3 surface that natively supports
   `WriteOffsetBytes`).
 - **CAS · TM (OK)** — `TestS3CatalogCASInlineTM`,
-  `TestS3FileIOCatalogTransactionCASInlineTM`. 102/102 + 28/28 verified
-  2026-05-05.
+  `TestS3FileIOCatalogTransactionCASInlineTM`.
 - **CAS · TM+ML (OK)** — `TestS3CatalogCASInlineML`,
-  `TestS3FileIOCatalogTransactionCASInlineML`. Last cloud run
-  2026-05-07: 130/1/0 (D9 outlier) + 28/0/0. D9 fixed 2026-05-10;
-  cloud re-run pending.
+  `TestS3FileIOCatalogTransactionCASInlineML`.
 - **append · TM (OK)** — `TestS3CatalogInlineTM`,
-  `TestS3FileIOCatalogTransactionInlineTM` (added 2026-05-05).
-  Uncovered the `addInlineTable` nextTableId-monotonicity bug
-  (commit `85bd9ac`); now 102/102 + 28/28.
+  `TestS3FileIOCatalogTransactionInlineTM`.
 - **append · TM+ML (OK)** — `TestS3CatalogInlineML`,
-  `TestS3FileIOCatalogTransactionInlineML` (added 2026-05-07,
-  one-line subclasses on the `*InlineTM` variants). Last cloud run
-  2026-05-07: 130/1/0 (D9 outlier) + 28/0/0. D9 fixed 2026-05-10;
-  cloud re-run pending.
+  `TestS3FileIOCatalogTransactionInlineML`.
 
 ### ADLS
 
@@ -127,17 +100,13 @@ structural codec design.
   `ADLSFileIOCatalogTransactionTestsCAS`. One-line subclasses that flip
   `maxAppendCount()` to 0, mirroring the S3 CAS suites.
 - **CAS · TM (OK)** — `ADLSCatalogTestCASInlineTM`,
-  `ADLSFileIOCatalogTransactionTestsCASInlineTM` (added 2026-05-05).
+  `ADLSFileIOCatalogTransactionTestsCASInlineTM`.
 - **append · TM (OK)** — `ADLSCatalogTestInlineTM`,
-  `ADLSFileIOCatalogTransactionTestsInlineTM` (added 2026-05-05).
+  `ADLSFileIOCatalogTransactionTestsInlineTM`.
 - **CAS · TM+ML (OK)** — `ADLSCatalogTestCASInlineML`,
-  `ADLSFileIOCatalogTransactionTestsCASInlineML` (added 2026-05-07).
-  Last cloud run 2026-05-07: 103/1/0 (D9 outlier) + 28/0/0. D9 fixed
-  2026-05-10; cloud re-run pending.
+  `ADLSFileIOCatalogTransactionTestsCASInlineML`.
 - **append · TM+ML (OK)** — `ADLSCatalogTestInlineML`,
-  `ADLSFileIOCatalogTransactionTestsInlineML` (added 2026-05-07).
-  Last cloud run 2026-05-07: 103/1/0 (D9 outlier) + 28/0/0. D9 fixed
-  2026-05-10; cloud re-run pending.
+  `ADLSFileIOCatalogTransactionTestsInlineML`.
 
 ## How to update this doc
 
@@ -145,15 +114,15 @@ After running a meaningful slice of the cloud matrix:
 
 ```bash
 cd /home/chris/work/catalog/iceberg && \
-  ./gradlew :iceberg-core:publishToMavenLocal -x test -x integrationTest -x generateGitProperties
+  ./gradlew publishToMavenLocal -x test -x integrationTest -x generateGitProperties
 
 cd /home/chris/work/catalog/fileio-catalog
 
 # Run once per codec (gzip then structural). The same inline-TM suites run
-# under both — only the encoded bytes on disk change.
+# under both — only the encoded bytes on disk change. The -Preal-cloud profile
+# fails fast if any provider's env vars are missing.
 for c in gzip structural; do
-  mvn test -Dfileio.catalog.inline.tm.codec=$c \
-    -Dtest='TestS3Catalog,TestS3CatalogCAS,TestS3CatalogInlineTM,TestS3CatalogCASInlineTM,TestS3CatalogInlineML,TestS3CatalogCASInlineML,TestS3FileIOCatalogTransaction,TestS3FileIOCatalogTransactionCAS,TestS3FileIOCatalogTransactionInlineTM,TestS3FileIOCatalogTransactionCASInlineTM,TestS3FileIOCatalogTransactionInlineML,TestS3FileIOCatalogTransactionCASInlineML,GCSCatalogTest,GCSCatalogTestInlineTM,GCSCatalogTestInlineML,GCSFileIOCatalogTransactionTests,GCSFileIOCatalogTransactionTestsInlineTM,GCSFileIOCatalogTransactionTestsInlineML,ADLSCatalogTest,ADLSCatalogTestCAS,ADLSCatalogTestInlineTM,ADLSCatalogTestCASInlineTM,ADLSCatalogTestInlineML,ADLSCatalogTestCASInlineML,ADLSFileIOCatalogTransactionTests,ADLSFileIOCatalogTransactionTestsCAS,ADLSFileIOCatalogTransactionTestsInlineTM,ADLSFileIOCatalogTransactionTestsCASInlineTM,ADLSFileIOCatalogTransactionTestsInlineML,ADLSFileIOCatalogTransactionTestsCASInlineML' \
+  mvn verify -Preal-cloud -Dfileio.catalog.inline.tm.codec=$c \
     > target/compat-$c.log 2>&1
 done
 ```
