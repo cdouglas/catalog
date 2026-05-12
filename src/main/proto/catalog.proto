@@ -22,6 +22,45 @@ option java_package = "org.apache.iceberg.catalog.proto";
 option java_outer_classname = "CatalogProto";
 
 // ============================================================
+// READ FIRST: THIS FILE IS NOT COMPILED.
+// ============================================================
+//
+// `catalog.proto` is a **schema-of-record** for the on-disk wire format.
+// It is written in protobuf IDL so it reviews unambiguously and tools
+// can read it, but the build does NOT run `protoc` on it and there are
+// no generated `CatalogProto` classes. The `option java_package` and
+// `option java_outer_classname` lines above are aspirational; they only
+// matter to a hypothetical future `protoc` invocation.
+//
+// All encoding/decoding lives in two hand-rolled Java files:
+//
+//   * `ProtoCodec.java`         — Checkpoint and its sub-messages
+//   * `InlineDeltaCodec.java`   — TableMetadataDelta and per-update messages
+//
+// Both construct tags by hand (`(fieldNumber << 3) | wireType`) and
+// emit byte-for-byte what `protoc`-generated code would produce.
+// Consistency between this .proto file and the Java codecs is
+// maintained by review, not automation; there is currently no test
+// that fails if the two drift apart. The codec-vs-schema drift surface
+// is tracked in errata.md (§T5: "Hand-rolled proto codec lacks
+// drift-detection oracle"); add a test-scope `protobuf-java` validator
+// there if you need stronger guarantees.
+//
+// Why hand-roll: we have wire-byte determinism across `protobuf-java`
+// version bumps, latitude for non-proto patterns (lazy scanning,
+// required fields enforced at decode), no runtime `protobuf-java`
+// dependency, and no build-time `protoc` toolchain. The trade is the
+// drift risk above.
+//
+// When editing this file:
+//   1. Update the corresponding `*_FIELD_NUMBER` constants and
+//      encode/decode logic in `ProtoCodec.java` / `InlineDeltaCodec.java`.
+//   2. Update `SPEC.md`, `SPEC_TM.md`, or `SPEC_ML.md` as appropriate.
+//   3. Run the relevant tests; verify wire bytes round-trip.
+//   4. Consider whether `FormatExplorerFixtures` needs regeneration
+//      (`mvn test -Dtest=FormatExplorerFixtures -Dexplorer.regenerate=true`).
+//
+// ============================================================
 // Checkpoint - written on compaction (CAS)
 // ============================================================
 

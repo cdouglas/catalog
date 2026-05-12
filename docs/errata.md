@@ -149,6 +149,31 @@ bytes)` API on `FileIOCatalog` to re-inline them. Two options:
 **Trigger to revisit:** when a real workload needs catalog
 re-registration of a previously-dropped inline table.
 
+### T5. `catalog.proto` is a schema-of-record with no drift-detection oracle
+
+`src/main/proto/catalog.proto` documents the on-disk wire format in
+protobuf IDL, but the build does not compile it. All encode/decode is
+hand-rolled in `ProtoCodec.java` and `InlineDeltaCodec.java` and stays
+byte-compatible with what `protoc`-generated code would produce by
+convention only. Field numbers, wire types, oneof membership, and
+message structure must agree between the `.proto` and the Java
+constants; today nothing fails the build if they diverge. The header
+comment in `catalog.proto` calls this out, but the comment is not a
+test.
+
+A proportionate fix is a test-scope dependency on `protobuf-java`
+plus a CI-time validation oracle: feed a corpus of catalog files
+through both encoders, assert they produce identical bytes, and have
+the test framework parse `catalog.proto` so a missing field surfaces
+at test time. Estimate: ~30 minutes to wire up, ~50 MB of
+test-only dependency weight, no impact on runtime artifacts. The
+runtime stays lean; only CI carries the toolchain.
+
+**Trigger to revisit:** the first time we ship a wire-format change
+that compiled-tool consumers (rather than the hand-rolled codec) need
+to read, or the first time review misses a drift between `.proto` and
+Java field numbers.
+
 ## Known Unknowns
 
 These are pending measurement or validation. None block current work;
