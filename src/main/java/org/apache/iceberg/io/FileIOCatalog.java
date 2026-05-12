@@ -686,11 +686,20 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         // snapshot) also reach attachManifestDelta. Filter by liveSnapIds to
         // drop deltas for snapshot ids that aren't present in the target
         // metadata (orphaned stages from a rolled-back producer). Errata D7.
+        //
+        // Peek (don't drain) here so the staged data survives a
+        // CommitFailedException throw below. Iceberg's transaction layer
+        // retries the commit by re-running the producer chain, but if we drain
+        // before throwing, the retry's underlyingOps.commit sees an empty sink
+        // and writes a sentinel manifest-list location with no pool entry —
+        // catalog state corruption surfaced on the next load. Drain only on
+        // the success path, just before encode.
         boolean hasMLDeltas = false;
         boolean stagedMLPendingApply = false;
+        Map<Long, InlineManifestTableOperations.StagedSnapshotData> mlDeltas =
+            java.util.Collections.emptyMap();
         if (this instanceof InlineManifestTableOperations) {
-          Map<Long, InlineManifestTableOperations.StagedSnapshotData> mlDeltas =
-              ((InlineManifestTableOperations) this).drainStagedDeltas();
+          mlDeltas = ((InlineManifestTableOperations) this).peekStagedDeltas();
           java.util.Set<Long> liveSnapIds = new java.util.HashSet<>();
           for (org.apache.iceberg.Snapshot snap : metadata.snapshots()) {
             liveSnapIds.add(snap.snapshotId());
@@ -718,19 +727,39 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         // Errata D6: computeDelta returned null (idCollidesWithDifferentContent
         // — concurrent-replace race assigning the same schema/spec/sort-order id
         // to different content), but we have ML data staged on live snapshots.
-        // Full-mode and pointer-mode fall-backs both drop the staged ML data:
-        // full mode serializes TableMetadata only and never visits the per-
-        // snapshot manifest pool, and pointer mode evicts and removeInlineMetadata
-        // clears the pool. Surface CommitFailedException so the producer's
-        // retry loop re-applies on top of the rebased base — the collision
-        // resolves naturally on the next attempt because Builder.addSortOrder
-        // assigns a fresh id when the old one is occupied.
+        // The retry strategy doesn't help: Iceberg's replace-transaction retry
+        // refreshes `base` but reuses the producer's `current`, so the colliding
+        // id keeps recurring on every attempt. Build a focused ML delta payload
+        // and bundle it with the FULL-mode TM update so the new snapshot's pool
+        // entries land atomically with the TM replacement (mirror of
+        // CreateTableInlineWithManifests for the update path).
+        byte[] collisionMlDeltaBytes = null;
         if (stagedMLPendingApply) {
-          throw new CommitFailedException(
-              "Cannot encode inline-ML delta for %s: concurrent-replace id "
-                  + "collision (schema/spec/sort-order) blocks delta encoding; "
-                  + "retry will rebase",
-              tableId);
+          java.util.List<InlineDeltaCodec.DeltaUpdate> fixupDelta =
+              new java.util.ArrayList<>();
+          java.util.Set<Long> liveSnapIds = new java.util.HashSet<>();
+          for (org.apache.iceberg.Snapshot snap : metadata.snapshots()) {
+            liveSnapIds.add(snap.snapshotId());
+          }
+          for (Map.Entry<Long, InlineManifestTableOperations.StagedSnapshotData> entry
+              : mlDeltas.entrySet()) {
+            long snapId = entry.getKey();
+            if (!liveSnapIds.contains(snapId)) {
+              continue;
+            }
+            InlineManifestTableOperations.StagedSnapshotData staged = entry.getValue();
+            InlineDeltaCodec.attachManifestDelta(
+                fixupDelta, snapId,
+                staged.delta.added(), staged.delta.removedPaths(), manifestPrefix);
+          }
+          collisionMlDeltaBytes = InlineDeltaCodec.encodeDelta(
+              fixupDelta, metadata.lastUpdatedMillis());
+        }
+
+        // Past the staged-ML inspection — safe to drain so the next commit on
+        // this ops instance doesn't re-attach stale data.
+        if (this instanceof InlineManifestTableOperations) {
+          ((InlineManifestTableOperations) this).clearStagedDeltas();
         }
 
         String mode = InlineDeltaCodec.selectMode(delta, metadata, 0, codec);
@@ -775,10 +804,17 @@ public class FileIOCatalog extends BaseMetastoreCatalog
             mut.updateTableInlineDelta(tableId, deltaBytes);
             break;
           case "full":
-            mut.updateTableInline(
-                tableId,
-                codec.encode(rewriteInlineSnapshotsForFullEncode(metadata)),
-                codec.tag());
+            byte[] fullBytes =
+                codec.encode(rewriteInlineSnapshotsForFullEncode(metadata));
+            if (collisionMlDeltaBytes != null) {
+              // Concurrent-replace fixup: bundle the staged ML pool deltas so the
+              // new snapshot's manifest pool entries are populated atomically
+              // with the TM replacement.
+              mut.updateTableInlineWithManifests(
+                  tableId, fullBytes, codec.tag(), collisionMlDeltaBytes);
+            } else {
+              mut.updateTableInline(tableId, fullBytes, codec.tag());
+            }
             break;
           case "pointer":
             String loc = writeUpdateMetadata(false, metadata);
@@ -947,6 +983,21 @@ public class FileIOCatalog extends BaseMetastoreCatalog
     /** Returns true if there are unflushed staged sink deltas. */
     boolean hasStagedDeltas() {
       return !stagedDeltas.isEmpty();
+    }
+
+    /**
+     * Returns a snapshot of the staged sink data without clearing it. Use this
+     * when the caller might decide not to commit (e.g. throws CommitFailedException
+     * to trigger a producer-level retry); pair with {@link #clearStagedDeltas()}
+     * once the write is committed.
+     */
+    Map<Long, StagedSnapshotData> peekStagedDeltas() {
+      return new LinkedHashMap<>(stagedDeltas);
+    }
+
+    /** Clears all staged sink data after a successful encode. */
+    void clearStagedDeltas() {
+      stagedDeltas.clear();
     }
 
     /** Returns and clears all staged sink data (keyed by snapshot id). */

@@ -1172,15 +1172,18 @@ public class TestInlineManifestEndToEnd {
     }
 
     /**
-     * Errata D6: when computeDelta returns null because of an
-     * idCollidesWithDifferentContent (concurrent-replace race assigning the
-     * same schema/spec/sort-order id to different content) AND we have ML
-     * data staged on a live snapshot, commitInline must surface
-     * CommitFailedException instead of silently falling back to full or
-     * pointer mode (both of which drop the staged ML data).
+     * When computeDelta returns null because of idCollidesWithDifferentContent
+     * (concurrent-replace race assigning the same schema/spec/sort-order id to
+     * different content) AND we have ML data staged on a live snapshot,
+     * commitInline must take the FULL+ML-bundle path: replace the TM bytes and
+     * land the new snapshot's manifest pool entry atomically. Throwing
+     * CommitFailedException would loop indefinitely because Iceberg's
+     * replace-transaction retry refreshes {@code base} but reuses {@code current},
+     * so the same colliding id keeps recurring; the silent full/pointer fall-
+     * backs corrupt by dropping pool entries.
      */
     @Test
-    void concurrentReplaceCollisionWithStagedMLThrowsCommitFailed() {
+    void concurrentReplaceCollisionWithStagedMLLandsViaFullPlusMlBundle() {
       createNamespaceAndTable();
       org.apache.iceberg.Table tbl = catalog.loadTable(TBL);
 
@@ -1230,11 +1233,17 @@ public class TestInlineManifestEndToEnd {
               java.util.List.of(mf), java.util.List.of()),
           null);
 
-      org.assertj.core.api.Assertions.assertThatThrownBy(() ->
-          ops.doCommit(baseWithA, newWithBPlusSnap))
-          .as("staged ML data + null delta must throw CommitFailedException, not silently drop ML")
-          .isInstanceOf(org.apache.iceberg.exceptions.CommitFailedException.class)
-          .hasMessageContaining("concurrent-replace");
+      // Commit must succeed. The FULL+ML-bundle path replaces the TM and
+      // populates the new snapshot's pool entry; loading the table afterwards
+      // must NOT trip wrapInlineManifests's "sentinel without pool entry"
+      // corruption check.
+      ops.doCommit(baseWithA, newWithBPlusSnap);
+      org.apache.iceberg.Table reloaded = catalog.loadTable(TBL);
+      assertThat(reloaded.snapshot(snapId)).as("new snapshot must be reachable").isNotNull();
+      assertThat(reloaded.snapshot(snapId).allManifests(io))
+          .as("new snapshot's manifest pool entry must round-trip")
+          .extracting(ManifestFile::path)
+          .containsExactly(mf.path());
     }
 
     /**

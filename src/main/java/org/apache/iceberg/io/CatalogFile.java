@@ -109,6 +109,12 @@ public abstract class CatalogFile {
     // immediately after the table create. {@code null} / absent for non-ML
     // creates and for inline-ML creates with no snapshots. Errata D9.
     protected final Map<TableIdentifier, byte[]> inlineTableCreateDeltas;
+    // Companion to {@link #inlineTableUpdates}: optional ML-pool delta carried
+    // alongside a FULL-mode update. Set when delta-mode TM encoding wasn't
+    // possible (e.g. concurrent-replace id collision) but the commit still has
+    // staged manifest-list updates that must land atomically with the TM
+    // replacement.
+    protected final Map<TableIdentifier, byte[]> inlineTableUpdateMlDeltas;
     // Codec tags parallel to inlineTables / inlineTableUpdates.
     protected final Map<TableIdentifier, Byte> inlineTableCodecs;
     protected final Map<TableIdentifier, Byte> inlineTableUpdateCodecs;
@@ -127,6 +133,7 @@ public abstract class CatalogFile {
       this.inlineTableUpdates = Maps.newHashMap();
       this.inlineTableDeltaUpdates = Maps.newHashMap();
       this.inlineTableCreateDeltas = Maps.newHashMap();
+      this.inlineTableUpdateMlDeltas = Maps.newHashMap();
       this.inlineTableCodecs = Maps.newHashMap();
       this.inlineTableUpdateCodecs = Maps.newHashMap();
       this.tableRenames = Maps.newHashMap();
@@ -352,6 +359,19 @@ public abstract class CatalogFile {
       }
       inlineTableUpdates.put(table, metadata);
       inlineTableUpdateCodecs.put(table, codecTag);
+      return self();
+    }
+
+    /**
+     * Full-mode inline update bundled with an ML pool delta. Used when delta-
+     * mode TM encoding can't represent the diff (e.g. concurrent-replace id
+     * collision) but the commit still has staged manifest-list updates that
+     * must land in the per-table pool atomically with the TM replacement.
+     */
+    public T updateTableInlineWithManifests(
+        TableIdentifier table, byte[] metadata, byte codecTag, byte[] mlDeltaBytes) {
+      updateTableInline(table, metadata, codecTag);
+      inlineTableUpdateMlDeltas.put(table, mlDeltaBytes);
       return self();
     }
 

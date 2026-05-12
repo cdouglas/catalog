@@ -486,17 +486,23 @@ public class ProtoCatalogFormat
             tblId, 1, nsId, nsVersion, ident.name(), metadata, codec, createDelta));
       }
 
-      // Process inline table updates (full mode)
+      // Process inline table updates (full mode, optionally with bundled ML delta)
       for (Map.Entry<TableIdentifier, byte[]> entry : inlineTableUpdates.entrySet()) {
         TableIdentifier ident = entry.getKey();
         byte[] metadata = entry.getValue();
         Byte codecTag = inlineTableUpdateCodecs.get(ident);
         byte codec = codecTag != null ? codecTag : InlineMetadataCodecs.TAG_JSON_GZIP;
+        byte[] mlDelta = inlineTableUpdateMlDeltas.get(ident);
         Integer tblId = original.tableId(ident);
         if (tblId != null) {
           int version = original.tableVersion(tblId);
-          actions.add(ProtoCodec.UpdateTableInlineAction.full(
-              tblId, version, metadata, codec));
+          if (mlDelta != null) {
+            actions.add(ProtoCodec.UpdateTableInlineAction.full(
+                tblId, version, metadata, codec, mlDelta));
+          } else {
+            actions.add(ProtoCodec.UpdateTableInlineAction.full(
+                tblId, version, metadata, codec));
+          }
         }
       }
 

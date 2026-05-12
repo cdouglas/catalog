@@ -228,6 +228,12 @@ public class ProtoCodec {
   private static final int UPDATE_INLINE_METADATA_LOCATION = 5;
   // Codec for full_metadata bytes; ignored in delta / pointer modes.
   private static final int UPDATE_INLINE_FULL_METADATA_CODEC = 6;
+  // Optional ML pool delta bytes carried alongside FULL mode. Used when delta
+  // encoding can't represent a TM diff (e.g. concurrent-replace id collision)
+  // but the commit still has staged manifest-list updates that must land in
+  // the pool atomically with the TM replacement. Same wire shape as
+  // {@link #CREATE_INLINE_TBL_DELTA}.
+  private static final int UPDATE_INLINE_ML_DELTA = 7;
 
   // CreateTableInline field numbers
   private static final int CREATE_INLINE_TBL_ID = 1;
@@ -1235,6 +1241,9 @@ public class ProtoCodec {
       } else if (a.fullMetadata != null) {
         writeBytes(inner, UPDATE_INLINE_FULL_METADATA, a.fullMetadata);
         writeVarint(inner, UPDATE_INLINE_FULL_METADATA_CODEC, a.fullMetadataCodec & 0xFF);
+        if (a.mlDeltaBytes != null) {
+          writeBytes(inner, UPDATE_INLINE_ML_DELTA, a.mlDeltaBytes);
+        }
       } else if (a.metadataLocation != null) {
         writeString(inner, UPDATE_INLINE_METADATA_LOCATION, a.metadataLocation);
       }
@@ -1560,6 +1569,7 @@ public class ProtoCodec {
     byte[] fullMetadata = null;
     String metadataLocation = null;
     Byte fullMetadataCodec = null;
+    byte[] mlDeltaBytes = null;
 
     while (in.available() > 0) {
       int tag = readVarint(in);
@@ -1583,6 +1593,9 @@ public class ProtoCodec {
         case UPDATE_INLINE_FULL_METADATA_CODEC:
           fullMetadataCodec = (byte) readVarint(in);
           break;
+        case UPDATE_INLINE_ML_DELTA:
+          mlDeltaBytes = readLengthDelimitedBytes(in);
+          break;
         default:
           skipField(in, tag & 0x7);
       }
@@ -1594,7 +1607,7 @@ public class ProtoCodec {
     return new UpdateTableInlineAction(
         id, version, deltaBytes, fullMetadata,
         fullMetadataCodec != null ? fullMetadataCodec : InlineMetadataCodecs.TAG_JSON_GZIP,
-        metadataLocation);
+        metadataLocation, mlDeltaBytes);
   }
 
   private static RenameTableAction decodeRenameTable(byte[] bytes) throws IOException {
@@ -2403,16 +2416,30 @@ public class ProtoCodec {
     /** Codec for {@link #fullMetadata}. Ignored for DELTA / POINTER modes. */
     final byte fullMetadataCodec;
     final String metadataLocation;   // non-null for POINTER mode
+    /**
+     * Optional ML pool delta bundled with FULL mode. Non-null only when
+     * {@link #fullMetadata} is non-null and the commit had staged manifest-list
+     * updates that need to land atomically with the TM replacement. See
+     * {@link #full(int, int, byte[], byte, byte[])}.
+     */
+    final byte[] mlDeltaBytes;
 
     public UpdateTableInlineAction(
         int id, int version, byte[] deltaBytes, byte[] fullMetadata,
         byte fullMetadataCodec, String metadataLocation) {
+      this(id, version, deltaBytes, fullMetadata, fullMetadataCodec, metadataLocation, null);
+    }
+
+    public UpdateTableInlineAction(
+        int id, int version, byte[] deltaBytes, byte[] fullMetadata,
+        byte fullMetadataCodec, String metadataLocation, byte[] mlDeltaBytes) {
       this.id = id;
       this.version = version;
       this.deltaBytes = deltaBytes;
       this.fullMetadata = fullMetadata;
       this.fullMetadataCodec = fullMetadataCodec;
       this.metadataLocation = metadataLocation;
+      this.mlDeltaBytes = mlDeltaBytes;
     }
 
     /** Creates an UpdateTableInlineAction in DELTA mode (codec inherited from base). */
@@ -2425,6 +2452,18 @@ public class ProtoCodec {
         int id, int version, byte[] fullMetadata, byte fullMetadataCodec) {
       return new UpdateTableInlineAction(
           id, version, null, fullMetadata, fullMetadataCodec, null);
+    }
+
+    /**
+     * Creates an UpdateTableInlineAction in FULL mode that also carries an ML
+     * pool delta. Used when delta-mode TM encoding is infeasible (e.g. concurrent-
+     * replace id collision) but the commit still has staged manifest-list updates
+     * that must land in the per-table pool atomically with the TM replacement.
+     */
+    public static UpdateTableInlineAction full(
+        int id, int version, byte[] fullMetadata, byte fullMetadataCodec, byte[] mlDeltaBytes) {
+      return new UpdateTableInlineAction(
+          id, version, null, fullMetadata, fullMetadataCodec, null, mlDeltaBytes);
     }
 
     /** Creates an UpdateTableInlineAction in POINTER mode (codec field unused). */
@@ -2468,6 +2507,19 @@ public class ProtoCodec {
         ProtoCatalogFile.TblEntry old = builder.tableEntry(id);
         if (old != null) {
           builder.updateInlineMetadata(id, version + 1, fullMetadata, fullMetadataCodec);
+          // Apply bundled ML pool delta first (if any), so any AddManifest
+          // entries for new snapshots populate the pool before we reconcile
+          // refs against the new TM. Used when delta-mode TM encoding wasn't
+          // possible (e.g. concurrent-replace id collision) but the commit
+          // still has staged manifest-list updates that must land atomically
+          // with the TM replacement. The ML delta is decoded against the new
+          // TM bytes — applyDeltaWithManifests's snapshot-add steps are
+          // idempotent against the just-stored TM since the snapshots already
+          // present are skipped at the addSnapshot apply level.
+          if (mlDeltaBytes != null) {
+            InlineMetadataCodec codec = InlineMetadataCodecs.byTag(fullMetadataCodec);
+            InlineDeltaCodec.applyManifestsOnly(mlDeltaBytes, builder, id, codec, fullMetadata);
+          }
           // Reconcile snapshot manifest refs (and orphan'd pool entries)
           // against the snapshots present in the new TM. Delta-mode replay
           // handles this via RemoveSnapshotsUpdate (InlineDeltaCodec

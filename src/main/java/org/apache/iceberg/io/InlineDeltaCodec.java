@@ -375,6 +375,101 @@ public class InlineDeltaCodec {
   }
 
   /**
+   * Applies only the ML-pool side of a delta payload to {@code catalogBuilder}'s
+   * per-table state, leaving the inline TM bytes untouched. Used in FULL-mode
+   * UpdateTableInline to land staged manifest-list updates atomically with the
+   * TM replacement when delta-mode TM encoding wasn't possible (e.g. concurrent-
+   * replace id collision).
+   *
+   * <p>{@code newMetadataBytes} are decoded once to provide context for the
+   * carry-forward heuristic in AddManifestUpdate (parent's manifest list is
+   * inherited when the new snapshot's ref list starts empty).
+   * AddSnapshotUpdate / SetSnapshotRefUpdate / schema / spec / sort-order /
+   * properties / location / RemoveSchemas / RemovePartitionSpecs updates in the
+   * payload are ignored — the TM replacement already carries those. We honour
+   * AddManifestUpdate, RemoveManifestUpdate, and RemoveSnapshotsUpdate (cascading
+   * pool removal for snapshots dropped from the new TM).
+   */
+  public static void applyManifestsOnly(
+      byte[] deltaBytes, ProtoCatalogFile.Builder catalogBuilder, int tableId,
+      InlineMetadataCodec newMetadataCodec, byte[] newMetadataBytes) {
+    String prefix = catalogBuilder.manifestListPrefix(tableId);
+    if (prefix == null) {
+      prefix = "";
+    }
+    DecodedDelta decoded = decodeDelta(deltaBytes);
+    TableMetadata current =
+        newMetadataCodec.decodeFull(newMetadataBytes, "inline://manifests-only");
+    java.util.Set<Long> addedInThisDelta = new java.util.HashSet<>();
+    for (DeltaUpdate update : decoded.updates) {
+      if (update instanceof AddSnapshotUpdate) {
+        AddSnapshotUpdate addSnap = (AddSnapshotUpdate) update;
+        addedInThisDelta.add(addSnap.snapshotId);
+        // Pre-register sentinel snapshots so applyDeltaWithManifests's invariant
+        // (sentinel ⇒ pool entry) holds even for delete-only commits with no
+        // AddManifestUpdate entries.
+        if (addSnap.manifestListSuffix.isEmpty()) {
+          catalogBuilder.setSnapshotManifests(
+              tableId, addSnap.snapshotId, java.util.Collections.emptyList());
+        }
+      } else if (update instanceof AddManifestUpdate) {
+        AddManifestUpdate add = (AddManifestUpdate) update;
+        String fullPath = add.manifest.path();
+        if (!prefix.isEmpty() && !fullPath.startsWith(prefix)) {
+          fullPath = prefix + fullPath;
+        }
+        ManifestFile resolved = new ProtoCodec.DecodedManifestFile(
+            fullPath, add.manifest.length(), add.manifest.partitionSpecId(),
+            add.manifest.content().id(),
+            add.manifest.sequenceNumber(), add.manifest.minSequenceNumber(),
+            add.manifest.snapshotId(),
+            add.manifest.addedFilesCount() != null ? add.manifest.addedFilesCount() : 0,
+            add.manifest.existingFilesCount() != null ? add.manifest.existingFilesCount() : 0,
+            add.manifest.deletedFilesCount() != null ? add.manifest.deletedFilesCount() : 0,
+            add.manifest.addedRowsCount() != null ? add.manifest.addedRowsCount() : 0,
+            add.manifest.existingRowsCount() != null ? add.manifest.existingRowsCount() : 0,
+            add.manifest.deletedRowsCount() != null ? add.manifest.deletedRowsCount() : 0,
+            add.manifest.partitions(),
+            add.manifest.keyMetadata() != null
+                ? java.nio.ByteBuffer.allocate(add.manifest.keyMetadata().remaining())
+                    .put(add.manifest.keyMetadata().duplicate()).array()
+                : null,
+            add.manifest.firstRowId());
+        catalogBuilder.addManifestToPool(tableId, resolved);
+        List<String> refs = new ArrayList<>(
+            catalogBuilder.snapshotManifestPaths(tableId, add.snapshotId));
+        if (refs.isEmpty()) {
+          Snapshot snap = current.snapshot(add.snapshotId);
+          if (snap != null && snap.parentId() != null) {
+            refs.addAll(catalogBuilder.snapshotManifestPaths(tableId, snap.parentId()));
+          }
+        }
+        refs.add(resolved.path());
+        catalogBuilder.setSnapshotManifests(tableId, add.snapshotId, refs);
+      } else if (update instanceof RemoveManifestUpdate) {
+        RemoveManifestUpdate rm = (RemoveManifestUpdate) update;
+        List<String> refs = new ArrayList<>(
+            catalogBuilder.snapshotManifestPaths(tableId, rm.snapshotId));
+        if (refs.isEmpty()) {
+          Snapshot snap = current.snapshot(rm.snapshotId);
+          if (snap != null && snap.parentId() != null) {
+            refs.addAll(catalogBuilder.snapshotManifestPaths(tableId, snap.parentId()));
+          }
+        }
+        refs.removeIf(p -> p.endsWith(rm.manifestPathSuffix));
+        catalogBuilder.setSnapshotManifests(tableId, rm.snapshotId, refs);
+      } else if (update instanceof RemoveSnapshotsUpdate) {
+        RemoveSnapshotsUpdate rs = (RemoveSnapshotsUpdate) update;
+        for (long snapId : rs.snapshotIds) {
+          catalogBuilder.removeSnapshotManifests(tableId, snapId);
+        }
+      }
+      // All other update types are TM concerns and are already reflected in
+      // newMetadataBytes — skip.
+    }
+  }
+
+  /**
    * Applies a list of decoded updates to a base metadata, pinning the
    * writer's {@code last-updated-ms} on the builder so {@code setRef(MAIN_BRANCH, ...)}
    * stamps snapshot-log entries with the writer's value instead of the wall-clock
