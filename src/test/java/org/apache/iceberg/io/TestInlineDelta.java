@@ -419,6 +419,46 @@ public class TestInlineDelta {
       assertThat(d.summary).containsEntry("operation", "overwrite");
       assertThat(d.summary).containsEntry("custom-engine-field", "spark-3.5");
     }
+
+    /**
+     * Regression: when an AddSnapshotUpdate is decoded with a null
+     * parentSnapshotId (the wire shape produced by computeDelta when
+     * {@code snap.parentId() == null} — the replace-transaction case where the
+     * new snapshot is intentionally rooted), {@code applyTo} must NOT fall back
+     * to {@code base.currentSnapshot()}. The old fallback re-parented the
+     * replacement snapshot onto the prior incarnation; the manifest carry-
+     * forward in {@code applyDeltaWithManifests} then inherited the prior
+     * snapshot's manifest list into the replacement, leaving every concurrent-
+     * replace test with one extra data file in scope.
+     */
+    @Test
+    void addSnapshotApplyToHonorsNullParentEvenWhenBaseHasCurrentSnapshot() {
+      // Build a base TableMetadata that already has a current snapshot — the
+      // condition under which the old fallback was triggered.
+      Map<String, String> originSummary = new java.util.HashMap<>();
+      originSummary.put("operation", "append");
+      InlineDeltaCodec.AddSnapshotUpdate origin = new InlineDeltaCodec.AddSnapshotUpdate(
+          11L, "origin.avro", originSummary, 0L, 0, 0,
+          /* parentSnapshotId */ null, /* firstRowId */ null, /* keyId */ null);
+      TableMetadata baseWithCurrent = origin.applyTo(baseMetadata(), "");
+      baseWithCurrent = TableMetadata.buildFrom(baseWithCurrent)
+          .setBranchSnapshot(11L, org.apache.iceberg.SnapshotRef.MAIN_BRANCH)
+          .build();
+      assertThat(baseWithCurrent.currentSnapshot()).isNotNull();
+
+      // Apply a second AddSnapshot whose parentSnapshotId is explicitly null
+      // (replace-transaction shape).
+      Map<String, String> replacementSummary = new java.util.HashMap<>();
+      replacementSummary.put("operation", "append");
+      InlineDeltaCodec.AddSnapshotUpdate replacement = new InlineDeltaCodec.AddSnapshotUpdate(
+          22L, "replacement.avro", replacementSummary, 0L, 0, 0,
+          /* parentSnapshotId */ null, /* firstRowId */ null, /* keyId */ null);
+      TableMetadata afterReplacement = replacement.applyTo(baseWithCurrent, "");
+
+      assertThat(afterReplacement.snapshot(22L).parentId())
+          .as("explicit null parent must not fall back to base.currentSnapshot()")
+          .isNull();
+    }
   }
 
   // ============================================================

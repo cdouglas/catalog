@@ -1164,16 +1164,15 @@ public class InlineDeltaCodec {
       // v1 tables don't carry sequence numbers; TableMetadata's constructor rejects
       // any non-zero value. Synthesize seqNum only for v2+.
       long seqNum = base.formatVersion() >= 2 ? base.lastSequenceNumber() + 1 : 0;
-      // Prefer explicit parentSnapshotId (correct for stage-only, branch, cherry-pick).
-      // Fall back to base.currentSnapshot() for older-format deltas (backward compat).
-      Long resolvedParentId;
-      if (parentSnapshotId != null) {
-        resolvedParentId = parentSnapshotId;
-      } else if (base.currentSnapshot() != null) {
-        resolvedParentId = base.currentSnapshot().snapshotId();
-      } else {
-        resolvedParentId = null;
-      }
+      // parentSnapshotId is authoritative. The encoder (computeDelta line 533)
+      // captures snap.parentId() verbatim and the wire treats field absence as
+      // explicit null. Falling back to base.currentSnapshot() is wrong for
+      // replace transactions, where the new snapshot is intentionally rooted
+      // (parent=null) but base still carries the prior incarnation's snapshot
+      // — the fallback re-parented the replacement onto it, which then made
+      // the manifest carry-forward in applyDeltaWithManifests inherit the
+      // prior snapshot's manifest list into the replacement.
+      Long resolvedParentId = parentSnapshotId;
       long timestamp = base.lastUpdatedMillis() + timestampDeltaMs;
       Integer resolvedSchemaId = schemaId > 0 ? schemaId : base.currentSchemaId();
       // For inline-ML snapshots (empty suffix), the manifest-list location is a
