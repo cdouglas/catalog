@@ -206,7 +206,7 @@ cost.
 on a representative table; decide whether to add a per-table
 "checkpoint-too-big → evict to pointer" threshold.
 
-### U4. Behaviour under storage provider edge cases
+### U4. Behavior under storage provider edge cases
 
 We exercise S3, GCS, and ADLS conditional writes in integration tests,
 but only for the conditions we know to test (basic CAS, append). We
