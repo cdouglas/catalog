@@ -47,6 +47,18 @@ no null check. Running the path-rewrite migration utility on an
 inline-ML table NPEs. Pre-existing in upstream; flagged here so users
 who hit it mid-migration can recognize it.
 
+### D9. Statistics-file changes force full mode (perf, not correctness)
+
+`InlineDeltaCodec.computeDelta` returns `null` whenever a stats file
+changed (the `statisticsChanged` check around line 784). Any commit that
+runs `setStatistics` in addition to a real change pays full-mode bytes,
+defeating the delta-mode benefit on tables that maintain stats. Adding
+`AddStatistics` / `RemoveStatistics` delta types is straightforward; the
+JSON parsers are already in upstream Iceberg.
+
+**Trigger to revisit:** when a stats-maintaining workload shows up where
+the full-mode size penalty matters.
+
 ### D8. Typed-protobuf encoding for Iceberg structural types (skip JSON serde)
 
 `AddSortOrderUpdate` is encoded structurally (see SPEC_TM.md §"Other

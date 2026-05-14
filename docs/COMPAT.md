@@ -44,7 +44,7 @@ Cell legend:
 | Code  | Meaning                                                      |
 |-------|--------------------------------------------------------------|
 | `OK`  | green — full `CatalogTests` + `CatalogTransactionTests` pass |
-| `WIP` | partial — known failures tracked in `INLINE_STABILIZATION.md`|
+| `WIP` | partial — known failures tracked in `errata.md`              |
 | `BAD` | broken                                                       |
 | `--`  | no suite for this cell yet                                   |
 | `NA`  | unsupported by the store                                     |
@@ -133,6 +133,5 @@ so the run verifies that bytes *written* with the configured codec
 round-trip correctly through every cell in the matrix.
 
 Update the cell codes and bump `last-verified` in the frontmatter to
-match the date of the run. Keep notes terse — link to the work-tracking
-doc (`INLINE_STABILIZATION.md`, `R4.md`, `errata.md`) for details rather
-than duplicating them here.
+match the date of the run. Keep notes terse — link to `errata.md` for
+details rather than duplicating them here.
