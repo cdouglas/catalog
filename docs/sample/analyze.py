@@ -39,6 +39,20 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
+from matplotlib.ticker import FuncFormatter, NullFormatter  # noqa: E402
+
+
+def _kib_fmt(v, _pos):
+    """Plain (non-scientific) KiB tick label with just enough precision."""
+    if v <= 0:
+        return "0"
+    if v >= 100:
+        return f"{v:.0f}"
+    if v >= 10:
+        return f"{v:.1f}".rstrip("0").rstrip(".")
+    if v >= 1:
+        return f"{v:.2f}".rstrip("0").rstrip(".")
+    return f"{v:.3f}".rstrip("0").rstrip(".")
 
 MODES = ["orig", "orig-gz", "tm", "tmml"]
 MODE_LABEL = {
@@ -278,39 +292,48 @@ def fig_per_commit(data, cfg, out_path, title):
     # per version, the inline modes a log record per *appended* commit (the
     # checkpoint phase was compacted away, so their deltas start after it).
     n_ckpt = cfg.get("checkpointTxns", 0)
-    fig, ax = plt.subplots(figsize=(7.5, 4.4))
-    drew = False
-    for m, color, label in [
-        ("orig", CAT_COLOR["table-metadata-json"], "orig: metadata.json per commit"),
-        ("orig-gz", "#8c564b", "orig-gz: gzip metadata.json per commit"),
-    ]:
-        if single_table and m in data:
-            vs = metadata_versions(data[m])  # (version, bytes), version == commit no.
-            if len(vs) > 2:
-                ax.plot([v for v, _ in vs], [b for _, b in vs],
-                        label=label, color=color, lw=1.6)
-                drew = True
+
+    # Collect series (x, bytes, label, color) first, so we can pick a scale.
+    series = []
+    if single_table:
+        for m, color, label in [
+            ("orig", CAT_COLOR["table-metadata-json"], "orig: metadata.json per commit"),
+            ("orig-gz", "#8c564b", "orig-gz: gzip metadata.json per commit"),
+        ]:
+            if m in data:
+                vs = metadata_versions(data[m])  # (version, bytes), version == commit no.
+                if len(vs) > 2:
+                    series.append(([v for v, _ in vs], [b for _, b in vs], label, color))
     for m, color in [("tm", "#4c72b0"), ("tmml", "#c44e52")]:
         if m in data:
-            sizes = data[m].get("logRecordSizes", [])
             # Drop the leading carry-over record; the remaining N map to the
             # appended commits (n_ckpt+1 .. n_ckpt+N) on the shared commit axis.
-            body = sizes[1:]
+            body = data[m].get("logRecordSizes", [])[1:]
             if len(body) > 2:
                 xs = [n_ckpt + 1 + i for i in range(len(body))]
-                ax.plot(xs, body, label=f"{m}: append-log record per commit",
-                        color=color, lw=1.6)
-                drew = True
-    if not drew:
-        plt.close(fig)
+                series.append((xs, body, f"{m}: append-log record per commit", color))
+    if not series:
         return False
+
+    all_y = [y for _, ys, _, _ in series for y in ys]
+    # Log only when the range is wide (>~1.3 decades); otherwise a linear KiB
+    # axis keeps a narrow delta band readable instead of a sci-notation sliver.
+    use_log = max(all_y) > 20 * max(min(all_y), 1)
+
+    fig, ax = plt.subplots(figsize=(7.5, 4.4))
+    for xs, ys, label, color in series:
+        ax.plot(xs, [y / 1024.0 for y in ys], label=label, color=color, lw=1.6)
     if n_ckpt > 0:
         ax.axvline(n_ckpt + 0.5, color="gray", ls="--", lw=1, alpha=0.6)
-        ax.text(n_ckpt + 0.5, ax.get_ylim()[1], " checkpoint │ appended log",
-                ha="left", va="top", fontsize=7, color="gray")
-    ax.set_yscale("log")
+        ax.text(n_ckpt + 0.5, 1.0, " checkpoint │ appended log",
+                transform=ax.get_xaxis_transform(), ha="left", va="top",
+                fontsize=7, color="gray")
+    if use_log:
+        ax.set_yscale("log")
+        ax.yaxis.set_minor_formatter(NullFormatter())
+    ax.yaxis.set_major_formatter(FuncFormatter(_kib_fmt))
     ax.set_xlabel("commit number (table-metadata version)")
-    ax.set_ylabel("catalog-layer bytes written (log scale)")
+    ax.set_ylabel("catalog-layer bytes written (KiB" + (", log scale)" if use_log else ")"))
     ax.set_title(title)
     ax.legend(fontsize=8)
     ax.grid(True, which="both", ls=":", alpha=0.4)
