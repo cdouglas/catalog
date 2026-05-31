@@ -71,6 +71,13 @@ public final class SampleGenerator {
 
   private static final long PHASE_B_MAX_APPEND_COUNT = 1_000_000L;
 
+  // Fixed across every mode (and every example) so the only difference between
+  // runs is the encoding. Each run uses its own fresh SampleFileIO, so a shared
+  // warehouse string never collides. Note: the gzip metadata-file extension
+  // (".gz.metadata.json" under orig-gz) is part of the encoding and legitimately
+  // makes those pointer strings 3 bytes longer than orig's.
+  private static final String WAREHOUSE = "mem:///warehouse";
+
   private SampleGenerator() {}
 
   public static void main(String[] args) throws IOException {
@@ -123,7 +130,7 @@ public final class SampleGenerator {
       SampleConfig config, SampleConfig.Mode mode, WorkloadPlan plan, Path modeDir)
       throws IOException {
     SampleFileIO io = new SampleFileIO();
-    String warehouse = "mem:///wh-" + config.name + "-" + mode.dir;
+    String warehouse = WAREHOUSE;
     String catalogLoc = warehouse + "/catalog";
     Map<String, String> props = mode.catalogProperties(warehouse, config.tmCodec);
     props.put(CatalogProperties.WAREHOUSE_LOCATION, warehouse);
