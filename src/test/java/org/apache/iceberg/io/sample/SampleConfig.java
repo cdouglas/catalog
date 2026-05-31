@@ -213,7 +213,7 @@ public final class SampleConfig {
         .build();
   }
 
-  /** Catalog scale: many small tables. Footprint is dominated by the checkpoint. */
+  /** Catalog scale (static): many small tables compacted into the checkpoint. */
   public static SampleConfig manyTables(long seed) {
     return new Builder("many-tables")
         .description(
@@ -225,6 +225,24 @@ public final class SampleConfig {
         .atomicGroups(false)
         .checkpointTxns(256) // one append per table
         .logTxns(0)
+        .opWeights(100, 0, 0)
+        .build();
+  }
+
+  /** Catalog scale (dynamic): many tables under a sustained append workload. */
+  public static SampleConfig manyTablesAppend(long seed) {
+    return new Builder("many-tables-append")
+        .description(
+            "256 tables created into the checkpoint, then 1024 append "
+                + "transactions distributed uniformly at random across them "
+                + "(~4 per table) in the append log. A dynamic catalog-scale "
+                + "workload: the steady-state per-commit cost across a wide "
+                + "catalog, not just the static per-table checkpoint state.")
+        .seed(seed)
+        .tables(256)
+        .atomicGroups(false)
+        .checkpointTxns(0) // tables are only created; all appends go to the log
+        .logTxns(1024) // uniform random over the 256 tables (see WorkloadPlan)
         .opWeights(100, 0, 0)
         .build();
   }
@@ -251,7 +269,8 @@ public final class SampleConfig {
         oneTable50x50(derive(masterSeed, 0)),
         multiTableAtomic(derive(masterSeed, 1)),
         manyTables(derive(masterSeed, 2)),
-        mlCarryForward(derive(masterSeed, 3)));
+        mlCarryForward(derive(masterSeed, 3)),
+        manyTablesAppend(derive(masterSeed, 4)));
   }
 
   public static List<SampleConfig> all() {

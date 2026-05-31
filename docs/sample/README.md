@@ -36,11 +36,12 @@ vary modestly with the seed; the report has the exact figures for your run.
 
 ## The examples
 
-Four scenarios, described in detail below:
+Five scenarios, described in detail below:
 
 - **1tbl-50x50** — headline. One table, a 50-snapshot checkpoint + 50 appended updates.
 - **multi-table-atomic** — four tables updated in one atomic commit.
-- **many-tables** — 256 tables, catalog-scale per-table overhead.
+- **many-tables** — 256 tables compacted into the checkpoint; static per-table scale.
+- **many-tables-append** — the same 256 tables under 1024 uniform appends; dynamic scale.
 - **ml-carry-forward** — a long append chain isolating manifest-pool dedup.
 
 `1tbl-50x50` is a clean controlled experiment, but on its own it understates two
@@ -142,7 +143,7 @@ flowchart LR
 The atomic-commit capability is the qualitative win here; the byte footprint (in
 the report) is the quantitative one.
 
-## many-tables — catalog scale
+## many-tables — catalog scale (static checkpoint)
 
 256 tables, one append each, all compacted into the checkpoint (no append log).
 This isolates how **per-table state** scales the catalog, independent of
@@ -159,10 +160,28 @@ external files each mode keeps.
 - **`tmml`** additionally inlines the manifest lists, dropping the 256
   `snap-*.avro` files. The whole catalog is one file.
 
-This example is the counterpoint to `ml-carry-forward`: there the win is per-commit
-history; here it is the per-table multiplier across a wide catalog. Per-table
-metadata is small, so `tm`'s win over `orig` is more modest than in the
+Per-table metadata is small, so `tm`'s win over `orig` is more modest than in the
 single-table histories — the decisive drop is `tmml` shedding the manifest lists.
+
+## many-tables-append — catalog scale (sustained appends)
+
+The dynamic counterpart: the same 256 tables are created into the checkpoint, then
+**1024 append transactions** are distributed uniformly at random across them
+(~4 per table) into the append log. This exercises the append log at scale rather
+than only the compacted checkpoint.
+
+- **`orig`** writes a fresh full `metadata.json` for the target table on every one
+  of the 1024 appends (plus the 256 create-time versions) and a `snap-*.avro` per
+  append. The catalog file stays small — it only swaps pointers — but the external
+  sidecars dominate.
+- **`tm`** inlines table metadata: each append is one small delta record in the
+  log instead of a `metadata.json` rewrite. The manifest lists stay external, so
+  the 1024 `snap-*.avro` files remain.
+- **`tmml`** inlines both. Each of the 1024 appends is a single delta record; no
+  external catalog-layer files at all. The whole catalog is one file.
+
+Together the two many-tables runs separate per-table *state* cost (static) from
+per-commit *write* cost at scale (dynamic).
 
 ## ml-carry-forward — the quadratic manifest-list rewrite
 
@@ -207,7 +226,7 @@ the catalog-layer footprint collapses from megabytes to tens of kilobytes.
 
 ## Regenerating
 
-One seed drives all four examples. Pass it to the generator script:
+One seed drives all five examples. Pass it to the generator script:
 
 ```bash
 docs/sample/gen.sh 0xC0FFEE        # decimal or 0x-hex
