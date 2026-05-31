@@ -34,30 +34,48 @@ can decode the output.
 
 ## File Layout
 
+A fixed 8-byte header, a length-prefixed checkpoint, then a series of
+length-prefixed transaction records appended on top of it:
+
+<!-- RFC frame generated with luismartingarcia/protocol:
+protocol "Magic = LCAT:32,Format Version = 1:32,Checkpoint Length (varint):16,Checkpoint (protobuf - variable):48,Record Length (varint):16,Transaction (protobuf - variable):48" -->
 ```
-+------------------------------------------------------------------+
-|                     Catalog File                                 |
-+==================================================================+
-| Magic              (4 bytes, "LCAT")                             |
-| Format Version     (4 bytes, big-endian int32, currently 1)      |
-+------------------------------------------------------------------+
-| Checkpoint Length   (varint)                                     |
-| Checkpoint          (protobuf Checkpoint message)                |
-+------------------------------------------------------------------+
-| Transaction 1 Length (varint)                                    |
-| Transaction 1       (protobuf Transaction message)               |
-+------------------------------------------------------------------+
-| Transaction 2 Length (varint)                                    |
-| Transaction 2       (protobuf Transaction message)               |
-+------------------------------------------------------------------+
-| ...                                                              |
-+------------------------------------------------------------------+
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                          Magic = LCAT                         |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                       Format Version = 1                      |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|   Checkpoint Length (varint)  |                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
+|                Checkpoint (protobuf - variable)               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|     Record Length (varint)    |                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
+|               Transaction (protobuf - variable)               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+As a grammar (`framed` = a varint byte-length followed by the bytes of that
+protobuf message):
+
+```abnf
+catalog-file = header checkpoint *record
+header       = magic version
+magic        = %x4C.43.41.54        ; "LCAT"
+version      = u32                  ; big-endian, currently 1
+checkpoint   = framed               ; protobuf Checkpoint
+record       = framed               ; protobuf Transaction
+framed       = varint *OCTET        ; varint length L, then L octets
 ```
 
 The header is 8 bytes fixed. Everything after the header is variable-length,
 using varint length prefixes for each record. There is no separate
 committed-transaction-ID block; the checkpoint message carries that set
-internally.
+internally. The bit-grid widths for the varint and protobuf regions above are
+schematic: a varint is 1+ bytes, and the protobuf bodies are tag-keyed with no
+fixed offsets (the same caveat applies to the worked-example frames below).
 
 ### Header
 
@@ -379,6 +397,110 @@ message RenameTable {
 Inline action messages (`CreateTableInline`, `UpdateTableInline`) and the
 delta hierarchy under `TableMetadataDelta` live in [SPEC_TM.md](SPEC_TM.md);
 manifest-list delta updates live in [SPEC_ML.md](SPEC_ML.md).
+
+## Worked examples
+
+Two end-to-end layouts showing a checkpoint plus appended records. The RFC frames
+are schematic (see the caveat under [File Layout](#file-layout)); a protobuf
+body's internal fields are listed in the grammar rather than placed at fixed
+offsets.
+
+### Create a namespace and a table
+
+`createNamespace("db")` then `createTable("db.t")`, shown *before* compaction so
+the two appended records are visible:
+
+```abnf
+file       = header checkpoint record-1 record-2
+checkpoint = framed<Checkpoint{ next_namespace_id=1, next_table_id=1 }>   ; empty
+record-1   = framed<Transaction{ CreateNamespace(id=1, version=1,
+                                                  parent_id=0, name="db") }>
+record-2   = framed<Transaction{ CreateTable(id=1, version=1,
+                                  namespace_id=1, namespace_version=1,
+                                  name="t", metadata_location="…/meta-A.json") }>
+```
+
+<!-- protocol "Magic = LCAT:32,Format Version = 1:32,CP Length (varint):16,Checkpoint - empty (next_ns_id=1 next_tbl_id=1):48,Rec1 Length (varint):16,Record 1 - CreateNamespace (id=1 v=1 db):48,Rec2 Length (varint):16,Record 2 - CreateTable (id=1 v=1 ns=1 name=t):48" -->
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                          Magic = LCAT                         |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                       Format Version = 1                      |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|       CP Length (varint)      |                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
+|        Checkpoint - empty (next_ns_id=1 next_tbl_id=1)        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|      Rec1 Length (varint)     |                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
+|            Record 1 - CreateNamespace (id=1 v=1 db)           |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|      Rec2 Length (varint)     |                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
+|         Record 2 - CreateTable (id=1 v=1 ns=1 name=t)         |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+After a CAS compaction the two records fold into the checkpoint, leaving one
+carry-over record (the compacting commit's own transaction id, kept for dedup):
+
+```
+checkpoint: next_ns_id=2  next_tbl_id=2
+            Namespace{ id=1  v=1  "db" }
+            Table{ id=1  v=1  ns=1  "t" -> …/meta-A.json }
+record 1  : carry-over (last txn id; dedup only)
+```
+
+### Multi-table transaction
+
+Four tables already in the checkpoint; one atomic `CatalogTransaction` appends a
+single record whose four `UpdateTableLocation` actions each match the table's
+current version and advance it by one:
+
+```abnf
+file       = header checkpoint record-1
+checkpoint = framed<Checkpoint{ next_table_id=5,
+               Table{id=1,version=3,name="a"}, Table{id=2,version=5,name="b"},
+               Table{id=3,version=2,name="c"}, Table{id=4,version=7,name="d"} }>
+record-1   = framed<Transaction{
+               UpdateTableLocation(id=1, version=3, metadata_location="…/a-4.json"),
+               UpdateTableLocation(id=2, version=5, metadata_location="…/b-6.json"),
+               UpdateTableLocation(id=3, version=2, metadata_location="…/c-3.json"),
+               UpdateTableLocation(id=4, version=7, metadata_location="…/d-8.json") }>
+```
+
+<!-- protocol "Magic = LCAT:32,Format Version = 1:32,CP Length (varint):16,Checkpoint - Tables a(v3) b(v5) c(v2) d(v7):48,Record Length (varint):16,Record - 4x UpdateTableLocation bumps a-d:48" -->
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                          Magic = LCAT                         |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                       Format Version = 1                      |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|       CP Length (varint)      |                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
+|          Checkpoint - Tables a(v3) b(v5) c(v2) d(v7)          |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|     Record Length (varint)    |                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
+|           Record - 4x UpdateTableLocation bumps a-d           |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+Applying the record advances all four versions together (optimistic concurrency —
+each action's `version` must match the current table version, else the commit is
+rejected):
+
+```
+              before        after
+  table a       v3    ->      v4
+  table b       v5    ->      v6
+  table c       v2    ->      v3
+  table d       v7    ->      v8
+```
 
 ## Wire Format Details
 
