@@ -108,8 +108,9 @@ def catalog_layer_files(manifest):
     return sum(cat_count(manifest, c) for c in CATALOG_LAYER)
 
 
-def metadata_sizes_by_version(manifest):
-    """orig: metadata.json sizes ordered by their NNNNN- version prefix."""
+def metadata_versions(manifest):
+    """orig: (version, bytes) pairs for each metadata.json, ordered by the
+    NNNNN- version prefix. The version doubles as the commit number."""
     out = []
     for f in manifest.get("files", []):
         if f["category"] != "table-metadata-json":
@@ -119,7 +120,7 @@ def metadata_sizes_by_version(manifest):
         if m:
             out.append((int(m.group(1)), f["bytes"]))
     out.sort()
-    return [b for _, b in out]
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -273,29 +274,42 @@ def fig_per_commit(data, cfg, out_path, title):
     histories (orig's metadata.json is one growing file per commit) or for logs
     with more than a carry-over record. Returns whether a figure was drawn."""
     single_table = cfg.get("tables", 1) == 1
-    fig, ax = plt.subplots(figsize=(7, 4.2))
+    # Snapshot commits run 1..(checkpointTxns+logTxns); orig writes a metadata.json
+    # per version, the inline modes a log record per *appended* commit (the
+    # checkpoint phase was compacted away, so their deltas start after it).
+    n_ckpt = cfg.get("checkpointTxns", 0)
+    fig, ax = plt.subplots(figsize=(7.5, 4.4))
     drew = False
     for m, color, label in [
         ("orig", CAT_COLOR["table-metadata-json"], "orig: metadata.json per commit"),
         ("orig-gz", "#8c564b", "orig-gz: gzip metadata.json per commit"),
     ]:
         if single_table and m in data:
-            sizes = metadata_sizes_by_version(data[m])
-            if len(sizes) > 2:
-                ax.plot(range(len(sizes)), sizes, label=label, color=color, lw=1.6)
+            vs = metadata_versions(data[m])  # (version, bytes), version == commit no.
+            if len(vs) > 2:
+                ax.plot([v for v, _ in vs], [b for _, b in vs],
+                        label=label, color=color, lw=1.6)
                 drew = True
     for m, color in [("tm", "#4c72b0"), ("tmml", "#c44e52")]:
         if m in data:
             sizes = data[m].get("logRecordSizes", [])
-            if len(sizes) > 2:
-                ax.plot(range(len(sizes)), sizes, label=f"{m}: append-log record per commit",
+            # Drop the leading carry-over record; the remaining N map to the
+            # appended commits (n_ckpt+1 .. n_ckpt+N) on the shared commit axis.
+            body = sizes[1:]
+            if len(body) > 2:
+                xs = [n_ckpt + 1 + i for i in range(len(body))]
+                ax.plot(xs, body, label=f"{m}: append-log record per commit",
                         color=color, lw=1.6)
                 drew = True
     if not drew:
         plt.close(fig)
         return False
+    if n_ckpt > 0:
+        ax.axvline(n_ckpt + 0.5, color="gray", ls="--", lw=1, alpha=0.6)
+        ax.text(n_ckpt + 0.5, ax.get_ylim()[1], " checkpoint │ appended log",
+                ha="left", va="top", fontsize=7, color="gray")
     ax.set_yscale("log")
-    ax.set_xlabel("commit index")
+    ax.set_xlabel("commit number (table-metadata version)")
     ax.set_ylabel("catalog-layer bytes written (log scale)")
     ax.set_title(title)
     ax.legend(fontsize=8)
