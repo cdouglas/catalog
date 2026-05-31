@@ -1,0 +1,3 @@
+# Generated samples are not checked in -- regenerate with: docs/sample/gen.sh <seed>
+# Everything per-seed (byte-exact artifacts, figures, REPORT.md) lands here.
+figures/
