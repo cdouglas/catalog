@@ -129,6 +129,31 @@ public final class SampleGenerator {
   private static Map<String, Long> runMode(
       SampleConfig config, SampleConfig.Mode mode, WorkloadPlan plan, Path modeDir)
       throws IOException {
+    Replay replay = replay(config, mode, plan);
+    return dump(replay.io, replay.catalogLoc, modeDir, mode);
+  }
+
+  /** A workload replayed under one mode: the live catalog and the backing in-memory IO. */
+  static final class Replay {
+    final FileIOCatalog catalog;
+    final SampleFileIO io;
+    final String catalogLoc;
+
+    Replay(FileIOCatalog catalog, SampleFileIO io, String catalogLoc) {
+      this.catalog = catalog;
+      this.io = io;
+      this.catalogLoc = catalogLoc;
+    }
+  }
+
+  /**
+   * Replays {@code plan} under {@code mode} over a fresh {@link SampleFileIO},
+   * returning the final live catalog. This is the exact path the figure
+   * generation uses (see {@link #runMode}); the losslessness verification
+   * ({@code TestSampleLosslessness}) reloads the returned catalog to confirm the
+   * inline modes reconstruct the same snapshots and manifest lists as {@code orig}.
+   */
+  static Replay replay(SampleConfig config, SampleConfig.Mode mode, WorkloadPlan plan) {
     SampleFileIO io = new SampleFileIO();
     String warehouse = WAREHOUSE;
     String catalogLoc = warehouse + "/catalog";
@@ -163,7 +188,7 @@ public final class SampleGenerator {
     catalog = newCatalog(catalogLoc, props, io, PHASE_B_MAX_APPEND_COUNT);
     applyTxns(catalog, plan.logTxns, config, live, fileSeq);
 
-    return dump(io, catalogLoc, modeDir, mode);
+    return new Replay(catalog, io, catalogLoc);
   }
 
   private static FileIOCatalog newCatalog(
