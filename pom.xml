@@ -146,6 +146,15 @@
       <scope>test</scope>
     </dependency>
 
+    <!-- jqwik: property-based testing for V1b protocol-correctness suite. See
+         docs/superpowers/specs/2026-10-10-v1-protocol-correctness-design.md -->
+    <dependency>
+      <groupId>net.jqwik</groupId>
+      <artifactId>jqwik</artifactId>
+      <version>1.9.1</version>
+      <scope>test</scope>
+    </dependency>
+
     <!-- GCP dependencies for integration tests -->
     <dependency>
       <groupId>org.apache.iceberg</groupId>
