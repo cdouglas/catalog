@@ -10,3 +10,15 @@ target/
 
 # OS files
 .DS_Store
+
+# jqwik failure-sample cache
+.jqwik-database
+
+# TLC tools (downloaded, not vendored)
+spec/tla/tools/
+
+# TLC run artifacts
+spec/tla/states/
+
+spec/tla/FileIOCatalog.cfg
+spec/tla/FileIOCatalog.old
