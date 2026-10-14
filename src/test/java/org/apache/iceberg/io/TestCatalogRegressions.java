@@ -26,6 +26,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
@@ -39,6 +40,7 @@ import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.inmemory.InMemoryInputFile;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.types.Types;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -597,7 +599,8 @@ public class TestCatalogRegressions {
   }
 
   /** Commits {@code namespaces} and returns the snapshot both racing writers start from. */
-  private static ProtoCatalogFile seed(CasFileIO io, ProtoCatalogFormat fmt, String... namespaces) {
+  private static ProtoCatalogFile seed(
+      SupportsAtomicOperations io, ProtoCatalogFormat fmt, String... namespaces) {
     ProtoCatalogFormat.Mut mut = (ProtoCatalogFormat.Mut) fmt.empty(io.newInputFile(RACE_LOC));
     for (String ns : namespaces) {
       mut.createNamespace(Namespace.of(ns));
@@ -606,7 +609,7 @@ public class TestCatalogRegressions {
     return reread(io, fmt);
   }
 
-  private static ProtoCatalogFile reread(CasFileIO io, ProtoCatalogFormat fmt) {
+  private static ProtoCatalogFile reread(SupportsAtomicOperations io, ProtoCatalogFormat fmt) {
     return fmt.read(io, io.newInputFile(RACE_LOC));
   }
 
@@ -825,6 +828,80 @@ public class TestCatalogRegressions {
 
       assertThatThrownBy(() -> cat.setProperties(Namespace.empty(), Map.of("k", "v")))
           .isInstanceOf(NoSuchNamespaceException.class);
+    }
+  }
+  // ============================================================
+  // Bug 12: when an append lost a race, the commit loop refreshed `current`
+  // to the newer file and kept going without re-reading it. If the next
+  // attempt then had to CAS (the refreshed length crossed max.append.size, or
+  // a compaction had shrunk the file and the re-read count reached
+  // max.append.count), tryCAS wrote a checkpoint of the writer's original
+  // snapshot conditioned on the refreshed version: the CAS succeeded and
+  // erased every record committed in between.
+  // ============================================================
+
+  @Nested
+  class AppendRetry {
+
+    @Test
+    void compactionAfterLostAppendRaceKeepsTheWinner() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      ProtoCatalogFile snap = seed(io, format(APPEND), "a", "b");
+      // A small transaction fits under the size limit; the winner's large one
+      // does not, so the loser's retry sees a file that must be compacted.
+      ProtoCatalogFormat fmt =
+          new ProtoCatalogFormat(APPEND, snap.location().getLength() + 1_000);
+      TableIdentifier winner = TableIdentifier.of("a", "t1");
+      TableIdentifier loser = TableIdentifier.of("b", "t2");
+      String winnerLocation = "mem:///a/t1/" + "x".repeat(4_000) + ".metadata.json";
+
+      fmt.from(snap).createTable(winner, winnerLocation).commit(io);
+      try {
+        fmt.from(snap).createTable(loser, "mem:///b/t2/v1.metadata.json").commit(io);
+      } catch (CommitFailedException e) {
+        // Rejecting the loser is fine; dropping the winner is not.
+      }
+
+      assertThat(reread(io, fmt).location(winner)).isEqualTo(winnerLocation);
+    }
+
+    @Test
+    void compactionAfterRaceWithCompactionKeepsTheLog() {
+      // The loser's snapshot holds a large namespace that is then dropped and
+      // compacted away, so the loser's retry finds a shorter file: it re-reads
+      // the record count, which forces a CAS.
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      ProtoCatalogFormat fmt = format(3);
+      seed(io, fmt, "a", "b");
+      fmt.from(reread(io, fmt))
+          .createNamespace(Namespace.of("big"), Map.of("k", "x".repeat(4_000)))
+          .commit(io);
+      ProtoCatalogFile snap = reread(io, fmt);
+
+      fmt.from(reread(io, fmt)).dropNamespace(Namespace.of("big")).commit(io);
+      for (String ns : new String[] {"y", "z", "v"}) {
+        fmt.from(reread(io, fmt)).createNamespace(Namespace.of("a", ns)).commit(io);
+      }
+      assertThat(io.conditionalWrites().get(RACE_LOC))
+          .as("the drop is compacted away and two appends follow")
+          .endsWith(
+              AtomicOutputFile.Strategy.CAS,
+              AtomicOutputFile.Strategy.APPEND,
+              AtomicOutputFile.Strategy.APPEND);
+
+      List<Namespace> expected =
+          Lists.newArrayList(
+              Namespace.of("a"), Namespace.of("b"),
+              Namespace.of("a", "y"), Namespace.of("a", "z"), Namespace.of("a", "v"));
+      try {
+        fmt.from(snap).createNamespace(Namespace.of("b", "w")).commit(io);
+        expected.add(Namespace.of("b", "w"));
+      } catch (CommitFailedException e) {
+        // Rejecting the loser is fine; resurrecting "big" or dropping the
+        // namespaces committed since its snapshot is not.
+      }
+
+      assertThat(reread(io, fmt).namespaces()).containsExactlyInAnyOrderElementsOf(expected);
     }
   }
 }

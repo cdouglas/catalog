@@ -323,8 +323,8 @@ public class ProtoCatalogFormat
      * <p>Called by ProtoCodec.Transaction.from() to extract pending changes.
      */
     void buildActions(List<ProtoCodec.Action> actions, ProtoIdManager idManager) {
-      // The checkpoint written on the CAS path carries the original state's
-      // next ids; replay allocates the ids this transaction creates.
+      // A checkpoint of original carries these next ids (the CAS path reads
+      // them from its base); replay allocates the ids this transaction creates.
       idManager.setGlobals(original.nextNamespaceId(), original.nextTableId());
 
       // New namespaces and tables get late-bound (negative) ids, which replay
@@ -553,14 +553,17 @@ public class ProtoCatalogFormat
     public ProtoCatalogFile commit(SupportsAtomicOperations fileIO) {
       final int MAX_ATTEMPTS = 10;
 
+      // baseCatalog is the parsed state of current unless baseIsCurrent is false:
+      // after a lost append race, current is refreshed without reading it.
       ProtoCatalogFile baseCatalog = original;
       InputFile current = original.location();
+      boolean baseIsCurrent = true;
       ProtoCodec.Transaction txn = buildTransaction();
       byte[] txnBytes = ProtoCodec.encodeTransaction(txn);
 
       // Case 0: Initial commit (file doesn't exist)
       if (!current.exists()) {
-        return tryCAS(current, txn, txnBytes, fileIO)
+        return tryCAS(original, current, txnBytes, fileIO)
             .orElseThrow(() -> new CommitFailedException("Catalog creation failed"));
       }
 
@@ -583,7 +586,15 @@ public class ProtoCatalogFormat
                 || current.getLength() + txnBytes.length > maxAppendSize;
 
         if (mustCAS) {
-          Optional<ProtoCatalogFile> result = tryCAS(current, txn, txnBytes, fileIO);
+          if (!baseIsCurrent) {
+            // The CAS replaces current, so its checkpoint must hold the state
+            // current names: a checkpoint of original would erase every record
+            // committed since. Our transaction record follows the checkpoint and
+            // replay verifies it against that state, as it would an append.
+            baseCatalog = read(current);
+            baseIsCurrent = true;
+          }
+          Optional<ProtoCatalogFile> result = tryCAS(baseCatalog, current, txnBytes, fileIO);
           if (result.isPresent()) {
             return validateCommit(result.get(), txn);
           }
@@ -632,14 +643,14 @@ public class ProtoCatalogFormat
           if (current.getLength() < oldLength) {
             // File shrank -- another writer compacted. Re-read to refresh
             // appendCount so the next mustCAS decision is accurate.
-            try (SeekableInputStream in = current.newStream()) {
-              baseCatalog = readInternal(current, in, (int) current.getLength());
-            } catch (IOException e) {
-              throw new UncheckedIOException(e);
-            }
+            baseCatalog = read(current);
+            baseIsCurrent = true;
+          } else {
+            // File grew (normal concurrent append). Retry with same bytes at the
+            // new offset; the append count is now a lower bound, which is fine
+            // for a soft limit. No read needed unless the next attempt CASes.
+            baseIsCurrent = false;
           }
-          // Otherwise: file grew (normal concurrent append). Retry with same
-          // bytes at the new offset. No read needed.
         }
       }
 
@@ -674,15 +685,24 @@ public class ProtoCatalogFormat
       return result;
     }
 
+    private ProtoCatalogFile read(InputFile file) {
+      try (SeekableInputStream in = file.newStream()) {
+        return readInternal(file, in, (int) file.getLength());
+      } catch (IOException e) {
+        throw new UncheckedIOException(e);
+      }
+    }
+
+    /** Replaces {@code current}, whose parsed state is {@code base}, with base + txnBytes. */
     private Optional<ProtoCatalogFile> tryCAS(
+        ProtoCatalogFile base,
         InputFile current,
-        ProtoCodec.Transaction txn,
         byte[] txnBytes,
         SupportsAtomicOperations fileIO) {
       // Build the wire bytes once; retries reuse the same payload.
       final byte[] fullFile;
       try {
-        fullFile = buildFullFile(txnBytes);
+        fullFile = buildFullFile(base, txnBytes);
       } catch (IOException e) {
         throw new CommitFailedException(e, "CAS commit failed: %s", e.getMessage());
       }
@@ -759,27 +779,28 @@ public class ProtoCatalogFormat
       }
     }
 
-    private byte[] buildFullFile(byte[] txnBytes) throws IOException {
+    private byte[] buildFullFile(ProtoCatalogFile base, byte[] txnBytes) throws IOException {
       ByteArrayOutputStream out = new ByteArrayOutputStream();
 
       // Header
       out.write(MAGIC);
       writeInt(out, FORMAT_VERSION);
 
-      // Checkpoint (from current state + pending changes merged). CAS / compaction
+      // Checkpoint of the base state; pending changes go in the record below. CAS / compaction
       // is the only place the committed-set is rewritten, so this is also the GC
       // site: any inherited UUIDv7 with timestamp_ms <= watermark is dropped.
       // watermark = now - committedRetentionMs, clamped to 0 (never negative);
       // Long.MAX_VALUE retention disables GC.
       long now = System.currentTimeMillis();
       long watermark = committedRetentionMs >= now ? 0L : now - committedRetentionMs;
-      byte[] checkpointBytes =
-          ProtoCodec.encodeCheckpoint(original, this, idManager, watermark);
+      ProtoIdManager baseIds = new ProtoIdManager();
+      baseIds.setGlobals(base.nextNamespaceId(), base.nextTableId());
+      byte[] checkpointBytes = ProtoCodec.encodeCheckpoint(base, this, baseIds, watermark);
       writeVarint(out, checkpointBytes.length);
       out.write(checkpointBytes);
 
-      // Transaction: the checkpoint holds the original state only; replay
-      // applies this record on top of it (binding any late-bound ids).
+      // Transaction: the checkpoint holds the base state only; replay verifies
+      // and applies this record on top of it (binding any late-bound ids).
       writeVarint(out, txnBytes.length);
       out.write(txnBytes);
 

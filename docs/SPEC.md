@@ -573,7 +573,7 @@ Two thresholds control whether a commit takes the append path or the CAS
 
 | Property                          | Default     | Purpose |
 |-----------------------------------|-------------|---------|
-| `fileio.catalog.max.append.count` | 10000       | Hard limit on log records. Must CAS when exceeded. Matches provider limits (S3 Express ~10k, Azure AppendBlob 50k). **Setting to 0 forces CAS on every commit**, for providers without conditional append (S3 standard, GCS). |
+| `fileio.catalog.max.append.count` | 10000       | Soft limit on log records: a writer that reads at least this many CASes instead of appending. Writers retrying a lost append race do not re-read the count, so the log can run a few records past it. Sized to provider limits (S3 Express 10k parts, Azure AppendBlob 50k blocks). **Setting to 0 forces CAS on every commit**, for providers without conditional append (S3 standard, GCS). |
 | `fileio.catalog.max.append.size`  | 16777216    | Soft performance target for total file size. Larger catalogs take longer to read. |
 
 `ProtoCatalogFile` tracks `appendCount` (the number of transaction records in
@@ -584,24 +584,34 @@ function COMMIT(fileIO, original, mutations):
     txn      = buildTransaction(original, mutations)
     txnBytes = encodeTransaction(txn)
     current  = original.location
+    base     = original          # parsed state of current, unless stale
+    stale    = false
 
     # Case 0: catalog does not exist yet
     if not current.exists():
-        return tryCAS(current, txnBytes, fileIO).orElseThrow(CommitFailed)
+        return tryCAS(original, current, txnBytes, fileIO).orElseThrow(CommitFailed)
 
     for attempt in 0..9:
         # Must CAS when either limit is at/beyond threshold based on the
         # observable file state. (maxAppendCount=0 forces CAS on every
         # commit — useful for backends without conditional append.)
-        mustCAS = original.appendCount >= maxAppendCount
+        mustCAS = not fileIO.supportsAppend()
+            or base.appendCount >= maxAppendCount
             or current.length + len(txnBytes) > maxAppendSize
 
         if mustCAS:
-            result = tryCAS(current, txnBytes, fileIO)
+            # The CAS replaces current, so it must checkpoint the state current
+            # names. Checkpointing a stale base would erase every record
+            # committed since it was read.
+            if stale:
+                base  = READ(fileIO, current)
+                stale = false
+            result = tryCAS(base, current, txnBytes, fileIO)
             if result.present:
                 return validateCommit(result, txn)
-            current  = fileIO.newInputFile(current.location)
-            original = READ(fileIO, current)
+            # CAS conflict: re-read and throw AlreadyExists if a pending create
+            # now collides, CommitFailed otherwise. The client retries.
+            throw ...
 
         else:
             result = tryAppend(current, txnBytes, fileIO)
@@ -616,8 +626,11 @@ function COMMIT(fileIO, original, mutations):
             if current.length < oldLength:
                 # File shrank (compacted). Re-read so the next mustCAS
                 # decision sees the current appendCount.
-                original = READ(fileIO, current)
-            # else: file grew (concurrent append). Retry same bytes.
+                base = READ(fileIO, current)
+            else:
+                # File grew (concurrent append). Retry same bytes; base's
+                # appendCount is now a lower bound.
+                stale = true
 
     throw CommitFailed("exceeded retry limit")
 ```
@@ -636,9 +649,9 @@ Builds a full file (header + checkpoint + transaction) and writes it
 atomically, conditioned on the ETag / generation number of the existing file.
 
 ```
-function tryCAS(current, txnBytes, fileIO):
+function tryCAS(base, current, txnBytes, fileIO):
     outputFile = fileIO.newAtomicOutputFile(current)
-    fullFile   = buildFullFile(original, txnBytes)
+    fullFile   = buildFullFile(base, txnBytes)
     token      = outputFile.prepare(fullFile, Strategy.CAS)
     try:
         written = outputFile.writeAtomic(token, fullFile)
@@ -649,8 +662,12 @@ function tryCAS(current, txnBytes, fileIO):
 
 `buildFullFile` creates:
 `[MAGIC][VERSION][varint(chkLen)][checkpoint][varint(txnLen)][txn]`. The
-checkpoint is encoded from the merged state (original + pending mutations),
-so the resulting file is fully compacted.
+checkpoint is encoded from `base` alone, the replayed state of the file being
+replaced; the pending mutations are only in the transaction record, which
+replay verifies against `base` and applies, exactly as for an append. `base`
+is usually the writer's `original`. After a lost append race it is the state
+the writer re-read, and a transaction whose preconditions no longer hold is
+rejected at replay (`validateCommit` throws).
 
 ### tryAppend
 
