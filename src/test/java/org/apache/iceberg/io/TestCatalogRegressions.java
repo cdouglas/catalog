@@ -1118,4 +1118,30 @@ public class TestCatalogRegressions {
       assertThat(builder.build().tables()).isEmpty();
     }
   }
+
+  // ============================================================
+  // Bug 16: a transaction could create a namespace and drop it again. The
+  // Mut cancelled the two, so the record carried no action and no
+  // precondition that the namespace was absent, and it committed even after
+  // a concurrent create of the same namespace -- although, run serially after
+  // that create, its createNamespace fails. Append mode always accepted the
+  // empty record; the CAS rebase made CAS mode accept it too. dropTable
+  // already rejected tables the transaction created. Found by
+  // TestMultiWriterProperties.
+  // ============================================================
+
+  @Nested
+  class CreateThenDropNamespace {
+
+    @Test
+    void namespaceCreatedInTheTransactionCannotBeDropped() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      ProtoCatalogFormat fmt = format(APPEND);
+      CatalogFile.Mut<ProtoCatalogFile, ?> txn = fmt.from(seed(io, fmt, "a"));
+      txn.createNamespace(Namespace.of("a", "x"));
+      assertThatThrownBy(() -> txn.dropNamespace(Namespace.of("a", "x")))
+          .isInstanceOf(IllegalArgumentException.class)
+          .hasMessageContaining("created in this transaction");
+    }
+  }
 }

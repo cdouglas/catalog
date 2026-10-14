@@ -219,6 +219,14 @@ public abstract class CatalogFile {
       if (checkNamespaceExists(namespace)) {
         throw new NoSuchNamespaceException("Namespace does not exist: %s", namespace);
       }
+      // As for tables, only a namespace in the snapshot can be dropped. Dropping
+      // one this transaction creates would cancel the create and, with it, the
+      // create's precondition that the namespace was absent: the empty record
+      // would commit even after a concurrent create of the same namespace.
+      Preconditions.checkArgument(
+          original.containsNamespace(namespace),
+          "Cannot drop namespace %s created in this transaction",
+          namespace);
       final boolean noNsChild =
           original.namespaces().stream()
                   .filter(
