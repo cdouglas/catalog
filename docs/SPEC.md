@@ -609,9 +609,18 @@ function COMMIT(fileIO, original, mutations):
             result = tryCAS(base, current, txnBytes, fileIO)
             if result.present:
                 return validateCommit(result, txn)
-            # CAS conflict: re-read and throw AlreadyExists if a pending create
+            # CAS conflict: rebase. Replay checks txn's preconditions against
+            # the state its record lands on, so if they hold on the new state,
+            # retry on top of it (append or CAS, as that state calls for): the
+            # commit is accepted exactly when a serial commit would be.
+            # Otherwise fail without writing: AlreadyExists if a pending create
             # now collides, CommitFailed otherwise. The client retries.
-            throw ...
+            current = fileIO.newInputFile(current.location)
+            base    = READ(fileIO, current)
+            if txn.id in base.committed:
+                return base                  # an earlier attempt landed
+            if not txn.verify(base):
+                throw conflict(base)
 
         else:
             result = tryAppend(current, txnBytes, fileIO)
@@ -638,7 +647,8 @@ function COMMIT(fileIO, original, mutations):
 ### CAS-only Mode
 
 Setting `fileio.catalog.max.append.count=0` makes every commit go through
-`tryCAS`. This is required for storage providers that support conditional
+`tryCAS`. A CAS that loses a race rebases as above, so concurrent commits whose
+preconditions do not overlap all succeed, as they would on the append path. This is required for storage providers that support conditional
 full-object replacement but not conditional append (S3 standard via if-match
 ETag, GCS via generation number). The commit loop never enters the append
 branch because `appendCount >= 0` is always true.

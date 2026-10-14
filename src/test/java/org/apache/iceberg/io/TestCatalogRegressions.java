@@ -1144,4 +1144,65 @@ public class TestCatalogRegressions {
           .hasMessageContaining("created in this transaction");
     }
   }
+
+  // ============================================================
+  // CAS rebase: a CAS that loses a race re-reads the file and retries on top
+  // of the new state when the transaction's preconditions still hold there,
+  // instead of failing every concurrent CAS-mode commit. A transaction that
+  // no longer holds fails without writing.
+  // ============================================================
+
+  @Nested
+  class CasRebase {
+
+    @Test
+    void casConflictRebasesWhenTheTransactionStillHolds() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      ProtoCatalogFormat fmt = format(0);
+      ProtoCatalogFile snap = seed(io, fmt, "a", "b");
+      TableIdentifier t1 = TableIdentifier.of("a", "t1");
+      TableIdentifier t2 = TableIdentifier.of("b", "t2");
+
+      fmt.from(snap).createTable(t1, "mem:///a/t1/v1.metadata.json").commit(io);
+      fmt.from(snap).createTable(t2, "mem:///b/t2/v1.metadata.json").commit(io);
+
+      assertThat(io.rejected(AtomicOutputFile.Strategy.CAS)).isEqualTo(1);
+      ProtoCatalogFile result = reread(io, fmt);
+      assertThat(result.location(t1)).isEqualTo("mem:///a/t1/v1.metadata.json");
+      assertThat(result.location(t2)).isEqualTo("mem:///b/t2/v1.metadata.json");
+    }
+
+    @Test
+    void casConflictThatNoLongerHoldsFailsWithoutWriting() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      ProtoCatalogFormat fmt = format(0);
+      ProtoCatalogFile snap = seed(io, fmt, "a", "b");
+
+      fmt.from(snap).updateProperties(Namespace.of("a"), new HashMap<>(Map.of("k", "1"))).commit(io);
+      int writes = io.history().size();
+      assertThatThrownBy(
+              () ->
+                  fmt.from(snap)
+                      .updateProperties(Namespace.of("a"), new HashMap<>(Map.of("k", "2")))
+                      .commit(io))
+          .isInstanceOf(CommitFailedException.class);
+
+      assertThat(io.history()).hasSize(writes);
+      assertThat(reread(io, fmt).namespaceProperties(Namespace.of("a"))).containsEntry("k", "1");
+    }
+
+    @Test
+    void casCreateRaceIsAlreadyExists() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      ProtoCatalogFormat fmt = format(0);
+      ProtoCatalogFile snap = seed(io, fmt, "a");
+      TableIdentifier t = TableIdentifier.of("a", "t");
+
+      fmt.from(snap).createTable(t, "mem:///a/t/v1.metadata.json").commit(io);
+      assertThatThrownBy(() -> fmt.from(snap).createTable(t, "mem:///a/t/v2.metadata.json").commit(io))
+          .isInstanceOf(AlreadyExistsException.class);
+
+      assertThat(reread(io, fmt).location(t)).isEqualTo("mem:///a/t/v1.metadata.json");
+    }
+  }
 }

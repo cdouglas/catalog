@@ -173,6 +173,12 @@ public class ProtoCatalogFormat
 
   static ProtoCatalogFile readInternal(InputFile location, InputStream in, int fileLength)
       throws IOException {
+    return replay(location, in, fileLength).build();
+  }
+
+  /** Decodes the checkpoint and replays the log, returning the builder before {@code build()}. */
+  static ProtoCatalogFile.Builder replay(InputFile location, InputStream in, int fileLength)
+      throws IOException {
     // Read and validate header
     byte[] header = new byte[HEADER_SIZE];
     IOUtil.readFully(in, header, 0, HEADER_SIZE);
@@ -218,7 +224,7 @@ public class ProtoCatalogFormat
     }
     builder.setAppendCount(appendCount);
 
-    return builder.build();
+    return builder;
   }
 
   private static void validateMagic(byte[] header) {
@@ -598,37 +604,25 @@ public class ProtoCatalogFormat
           if (result.isPresent()) {
             return validateCommit(result.get(), txn);
           }
-          // CAS failed: another writer changed the catalog file between our read
-          // and our write. Re-read to surface the most informative error:
-          // - if our pending creates target a table/namespace that now exists,
-          //   throw AlreadyExistsException (matches Iceberg semantic for
-          //   create-races);
-          // - otherwise, throw CommitFailedException so the caller can refresh
-          //   and re-apply at the PendingUpdate level.
-          InputFile fresh = fileIO.newInputFile(current.location());
-          ProtoCatalogFile newState;
-          try (SeekableInputStream in = fresh.newStream()) {
-            newState = readInternal(fresh, in, (int) fresh.getLength());
-          } catch (IOException e) {
-            throw new UncheckedIOException(e);
+          // CAS conflict: another writer changed the file since we read it.
+          // Rebase onto the new state. Replay checks this transaction's
+          // preconditions against the state its record lands on, so if they
+          // hold on the new state, retry on top of it -- by append or CAS, as
+          // that state calls for -- and the commit is accepted exactly when a
+          // serial commit would be. If not, fail without writing; the client
+          // refreshes and re-applies.
+          current = fileIO.newInputFile(current.location());
+          ProtoCatalogFile.Builder fresh = replay(current);
+          if (fresh.containsTransaction(txn.id())) {
+            return fresh.build(); // an earlier attempt landed
           }
-          for (Map.Entry<TableIdentifier, String> e : tables.entrySet()) {
-            if (e.getValue() != null && newState.containsTable(e.getKey())) {
-              throw new AlreadyExistsException("Table already exists: %s", e.getKey());
-            }
+          boolean holds = txn.verify(fresh);
+          baseCatalog = fresh.build();
+          baseIsCurrent = true;
+          if (!holds) {
+            throw conflict(
+                baseCatalog, "Cannot commit: catalog file changed concurrently at " + current.location());
           }
-          for (Map.Entry<TableIdentifier, byte[]> e : inlineTables.entrySet()) {
-            if (newState.containsTable(e.getKey())) {
-              throw new AlreadyExistsException("Table already exists: %s", e.getKey());
-            }
-          }
-          for (TableIdentifier dest : tableRenames.values()) {
-            if (newState.containsTable(dest)) {
-              throw new AlreadyExistsException("Table already exists: %s", dest);
-            }
-          }
-          throw new CommitFailedException(
-              "Cannot commit: catalog file changed concurrently at %s", current.location());
         } else {
           Optional<ProtoCatalogFile> result = tryAppend(current, txn, txnBytes, fileIO);
           if (result.isPresent()) {
@@ -659,35 +653,45 @@ public class ProtoCatalogFormat
 
     private ProtoCatalogFile validateCommit(ProtoCatalogFile result, ProtoCodec.Transaction txn) {
       if (!result.containsTransaction(txn.id())) {
-        // Our append landed but at least one action's verify rejected it
-        // (e.g., a concurrent writer bumped the table version). Surface the
-        // most informative error: AlreadyExistsException if a pending create
-        // collides with a now-existing table (matches Iceberg's create-race
-        // semantic), CommitFailedException otherwise.
-        for (Map.Entry<TableIdentifier, String> e : tables.entrySet()) {
-          if (e.getValue() != null && result.containsTable(e.getKey())) {
-            throw new AlreadyExistsException("Table already exists: %s", e.getKey());
-          }
-        }
-        for (Map.Entry<TableIdentifier, byte[]> e : inlineTables.entrySet()) {
-          if (result.containsTable(e.getKey())) {
-            throw new AlreadyExistsException("Table already exists: %s", e.getKey());
-          }
-        }
-        for (TableIdentifier dest : tableRenames.values()) {
-          if (result.containsTable(dest)) {
-            throw new AlreadyExistsException("Table already exists: %s", dest);
-          }
-        }
-        throw new CommitFailedException(
-            "Cannot commit: concurrent transaction invalidated this update");
+        // Our record landed but at least one action's verify rejected it
+        // (e.g., a concurrent writer bumped the table version).
+        throw conflict(result, "Cannot commit: concurrent transaction invalidated this update");
       }
       return result;
     }
 
+    /**
+     * The most informative error for a transaction that does not hold on {@code state}:
+     * AlreadyExistsException if a pending create or rename destination now exists (Iceberg's
+     * create-race semantic), CommitFailedException otherwise, so the caller can refresh and
+     * re-apply.
+     */
+    private RuntimeException conflict(ProtoCatalogFile state, String message) {
+      for (Map.Entry<TableIdentifier, String> e : tables.entrySet()) {
+        if (e.getValue() != null && state.containsTable(e.getKey())) {
+          return new AlreadyExistsException("Table already exists: %s", e.getKey());
+        }
+      }
+      for (Map.Entry<TableIdentifier, byte[]> e : inlineTables.entrySet()) {
+        if (state.containsTable(e.getKey())) {
+          return new AlreadyExistsException("Table already exists: %s", e.getKey());
+        }
+      }
+      for (TableIdentifier dest : tableRenames.values()) {
+        if (state.containsTable(dest)) {
+          return new AlreadyExistsException("Table already exists: %s", dest);
+        }
+      }
+      return new CommitFailedException("%s", message);
+    }
+
     private ProtoCatalogFile read(InputFile file) {
+      return replay(file).build();
+    }
+
+    private ProtoCatalogFile.Builder replay(InputFile file) {
       try (SeekableInputStream in = file.newStream()) {
-        return readInternal(file, in, (int) file.getLength());
+        return ProtoCatalogFormat.replay(file, in, (int) file.getLength());
       } catch (IOException e) {
         throw new UncheckedIOException(e);
       }

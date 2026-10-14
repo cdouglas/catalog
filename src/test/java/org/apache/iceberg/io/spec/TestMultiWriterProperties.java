@@ -537,6 +537,7 @@ class TestMultiWriterProperties {
       byte[] liveBefore = liveBytes();
       int mark = io.history().size();
       int lostAppends = io.rejected(AtomicOutputFile.Strategy.APPEND);
+      int lostCas = io.rejected(AtomicOutputFile.Strategy.CAS);
       Outcome outcome;
       String reason = "";
       try {
@@ -549,7 +550,10 @@ class TestMultiWriterProperties {
       List<InMemoryAtomicFileIO.Write> writes = io.history().subList(mark, io.history().size());
       InMemoryAtomicFileIO.Write write = writes.isEmpty() ? null : writes.get(0);
       String path =
-          (io.rejected(AtomicOutputFile.Strategy.APPEND) > lostAppends ? "lost append race, " : "")
+          (io.rejected(AtomicOutputFile.Strategy.CAS) > lostCas ? "lost CAS race, " : "")
+              + (io.rejected(AtomicOutputFile.Strategy.APPEND) > lostAppends
+                  ? "lost append race, "
+                  : "")
               + (write == null ? "no write" : write.strategy() + rebased(w, write));
       trace.append(String.format("w%d commit -> %s%s via %s%n", w.id, outcome, reason, path));
       Statistics.label("commit path").collect(path);
