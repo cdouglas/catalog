@@ -22,3 +22,4 @@ spec/tla/states/
 
 spec/tla/FileIOCatalog.cfg
 spec/tla/FileIOCatalog.old
+spec/tla/FileIOCatalog_TTrace_*
