@@ -250,21 +250,34 @@ What the matrix says:
    that are more precise.
 4. `ReadTable` is the read side of optimistic concurrency — it conflicts
    with any update to the same table, nothing else.
+5. The root is a parent like any other: an ordinary namespace row with
+   id 0, so top-level creates and drops serialize on its version. It
+   cannot be named, created, or dropped (SPEC.md §State Model).
 
 ## Late-Binding
 
-When a transaction creates a namespace or table and references it in the
-same transaction, the entity ID is not yet allocated. The format uses
-negative integers as virtual IDs:
+Writers never allocate entity IDs. A create action carries a negative
+late-bound ID, and replay binds it to a real ID:
 
-- `ProtoIdManager` maintains allocation counters and a remap table
-  (`virtualId -> realId`).
 - `buildActions()` sorts new namespaces by depth (parents before
-  children) and assigns real IDs.
+  children) and numbers new namespaces and tables `-1, -2, ...`
+  (separate sequences). Actions later in the same transaction reference
+  a new entity by its late-bound ID.
 - Version fields are set to `-1` when the referenced entity was created
   in the same txn.
-- On replay, `resolve(id)` maps negative IDs to their allocated
-  counterparts.
+- On replay, `Transaction.apply` binds each late-bound ID, at its
+  defining create, to the replaying state's next namespace / table ID
+  (`ProtoCodec.IdBinding`), and resolves later references to it. Every
+  reader replays the log in the same order, so every reader assigns the
+  same IDs.
+- `Transaction.verify` rejects a record that references a late-bound ID
+  before (or without) the create that defines it.
+
+Binding at replay is what keeps concurrent creates apart. When writers
+allocated IDs from their own snapshot, two writers that read the same
+snapshot and created unrelated entities -- e.g. tables in different
+namespaces -- wrote records with the same ID. Both records verified, and replay let the second overwrite the
+first.
 
 ## Compaction Trigger
 

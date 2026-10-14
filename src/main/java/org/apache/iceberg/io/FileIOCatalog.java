@@ -168,6 +168,12 @@ public class FileIOCatalog extends BaseMetastoreCatalog
     return catalogProperties;
   }
 
+  /** Tables live in a namespace; the empty namespace is not supported. */
+  @Override
+  protected boolean isValidIdentifier(TableIdentifier tableIdentifier) {
+    return !tableIdentifier.namespace().isEmpty();
+  }
+
   @Override
   public List<TableIdentifier> listTables(Namespace namespace) {
     if (!namespaceExists(namespace) && !namespace.isEmpty()) {
@@ -175,7 +181,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
           "Cannot list tables for namespace. Namespace does not exist: %s", namespace);
     }
     return getCatalogFile().tables().stream()
-        .filter(t -> t.namespace().isEmpty() || t.namespace().equals(namespace))
+        .filter(t -> t.namespace().equals(namespace))
         .sorted(Comparator.comparing(TableIdentifier::toString))
         .collect(Collectors.toList());
   }

@@ -42,6 +42,8 @@ import org.apache.iceberg.inmemory.InMemoryInputFile;
 import org.apache.iceberg.types.Types;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * Focused regression tests for catalog-side bugs surfaced when running the
@@ -576,6 +578,253 @@ public class TestCatalogRegressions {
       assertThatThrownBy(
               () -> b.buildTable(TableIdentifier.of("db", "t"), SCHEMA).create())
           .isInstanceOfAny(AlreadyExistsException.class, CommitFailedException.class);
+    }
+  }
+
+  // ============================================================
+  // Race helpers for Bug 10 / Bug 11. FileIOCatalog re-reads the catalog for
+  // every namespace op, so these tests drive ProtoCatalogFormat directly: both
+  // writers mutate the same snapshot, then commit in sequence, as two
+  // concurrent processes would.
+  // ============================================================
+
+  private static final String RACE_LOC = "mem:///wh/catalog";
+  private static final int APPEND = 10_000;
+
+  private static ProtoCatalogFormat format(int maxAppendCount) {
+    return new ProtoCatalogFormat(
+        Map.of(ProtoCatalogFormat.MAX_APPEND_COUNT, String.valueOf(maxAppendCount)));
+  }
+
+  /** Commits {@code namespaces} and returns the snapshot both racing writers start from. */
+  private static ProtoCatalogFile seed(CasFileIO io, ProtoCatalogFormat fmt, String... namespaces) {
+    ProtoCatalogFormat.Mut mut = (ProtoCatalogFormat.Mut) fmt.empty(io.newInputFile(RACE_LOC));
+    for (String ns : namespaces) {
+      mut.createNamespace(Namespace.of(ns));
+    }
+    mut.commit(io);
+    return reread(io, fmt);
+  }
+
+  private static ProtoCatalogFile reread(CasFileIO io, ProtoCatalogFormat fmt) {
+    return fmt.read(io, io.newInputFile(RACE_LOC));
+  }
+
+  // ============================================================
+  // Bug 10: buildActions bound new namespace / table ids eagerly from the
+  // writer's snapshot (nextNamespaceId / nextTableId). Two writers that read
+  // the same snapshot and created unrelated entities wrote records carrying
+  // the same id. On the append path both records verified -- their parents
+  // differed, or the parent was the then-unversioned root (Bug 11) -- and
+  // replay let the second overwrite the first. Both writers were told they
+  // committed.
+  // ============================================================
+
+  @Nested
+  class ConcurrentCreateIds {
+
+    @Test
+    void appendCreatesInDifferentNamespacesBothSurvive() {
+      CasFileIO io = new CasFileIO();
+      ProtoCatalogFormat fmt = format(APPEND);
+      ProtoCatalogFile snap = seed(io, fmt, "a", "b");
+      TableIdentifier t1 = TableIdentifier.of("a", "t1");
+      TableIdentifier t2 = TableIdentifier.of("b", "t2");
+
+      fmt.from(snap).createTable(t1, "mem:///a/t1/v1.metadata.json").commit(io);
+      fmt.from(snap).createTable(t2, "mem:///b/t2/v1.metadata.json").commit(io);
+
+      ProtoCatalogFile result = reread(io, fmt);
+      assertThat(result.tables()).containsExactlyInAnyOrder(t1, t2);
+      assertThat(result.location(t1)).isEqualTo("mem:///a/t1/v1.metadata.json");
+      assertThat(result.location(t2)).isEqualTo("mem:///b/t2/v1.metadata.json");
+      assertThat(result.tableId(t1)).isNotEqualTo(result.tableId(t2));
+    }
+
+    @Test
+    void appendCreatesWithNestedReferencesBindToTheirOwnParents() {
+      // Each writer creates a namespace, a child namespace, and a table in the
+      // child, all in one transaction: the child and the table reference ids
+      // allocated in the same transaction.
+      CasFileIO io = new CasFileIO();
+      ProtoCatalogFormat fmt = format(APPEND);
+      ProtoCatalogFile snap = seed(io, fmt, "a", "b");
+      TableIdentifier at = TableIdentifier.of("a", "p", "c", "t");
+      TableIdentifier bt = TableIdentifier.of("b", "q", "c", "t");
+
+      fmt.from(snap)
+          .createNamespace(Namespace.of("a", "p"))
+          .createNamespace(Namespace.of("a", "p", "c"))
+          .createTable(at, "mem:///a/p/c/t/v1.metadata.json")
+          .commit(io);
+      fmt.from(snap)
+          .createNamespace(Namespace.of("b", "q"))
+          .createNamespace(Namespace.of("b", "q", "c"))
+          .createTable(bt, "mem:///b/q/c/t/v1.metadata.json")
+          .commit(io);
+
+      ProtoCatalogFile result = reread(io, fmt);
+      assertThat(result.namespaces())
+          .containsExactlyInAnyOrder(
+              Namespace.of("a"), Namespace.of("a", "p"), Namespace.of("a", "p", "c"),
+              Namespace.of("b"), Namespace.of("b", "q"), Namespace.of("b", "q", "c"));
+      assertThat(result.tables()).containsExactlyInAnyOrder(at, bt);
+      assertThat(result.location(at)).isEqualTo("mem:///a/p/c/t/v1.metadata.json");
+      assertThat(result.location(bt)).isEqualTo("mem:///b/q/c/t/v1.metadata.json");
+    }
+
+    @ParameterizedTest(name = "maxAppendCount={0}")
+    @ValueSource(ints = {0, APPEND})
+    void acknowledgedCreatesAreNeverLost(int maxAppendCount) {
+      // The invariant behind the tests above, for both commit paths: a writer
+      // whose commit returned normally must find its create in the catalog.
+      // The CAS path may reject the second writer; it must not drop the first.
+      CasFileIO io = new CasFileIO();
+      ProtoCatalogFormat fmt = format(maxAppendCount);
+      ProtoCatalogFile snap = seed(io, fmt, "a", "b");
+      Map<TableIdentifier, String> acknowledged = new HashMap<>();
+      Map<TableIdentifier, String> creates =
+          Map.of(
+              TableIdentifier.of("a", "t1"), "mem:///a/t1/v1.metadata.json",
+              TableIdentifier.of("b", "t2"), "mem:///b/t2/v1.metadata.json");
+
+      for (Map.Entry<TableIdentifier, String> create : creates.entrySet()) {
+        try {
+          fmt.from(snap).createTable(create.getKey(), create.getValue()).commit(io);
+          acknowledged.put(create.getKey(), create.getValue());
+        } catch (CommitFailedException e) {
+          // Rejected, not acknowledged: nothing to check for this writer.
+        }
+      }
+
+      ProtoCatalogFile result = reread(io, fmt);
+      assertThat(acknowledged).isNotEmpty();
+      acknowledged.forEach(
+          (ident, location) -> assertThat(result.location(ident)).as("%s", ident).isEqualTo(location));
+    }
+  }
+
+  // ============================================================
+  // Bug 11: the root namespace (id 0) had no row and so no version.
+  // bumpNamespaceVersion(0) was a no-op and CreateNamespaceAction.verify
+  // skipped the parent check for the root, so top-level creates never
+  // conflicted -- not even two creates of the same name. The root is now an
+  // ordinary namespace row that cannot be named, created, or dropped.
+  // Separately, CatalogFile.Mut treated the empty namespace as existing, so a
+  // table in the root passed validation and then hit an NPE in buildActions.
+  // ============================================================
+
+  @Nested
+  class RootNamespace {
+
+    @Test
+    void appendCreatesUnderRootConflictOnRootVersion() {
+      // Top-level creates serialize on the root's version, as sibling creates
+      // under any other parent do.
+      CasFileIO io = new CasFileIO();
+      ProtoCatalogFormat fmt = format(APPEND);
+      ProtoCatalogFile snap = seed(io, fmt, "seed");
+
+      fmt.from(snap).createNamespace(Namespace.of("x")).commit(io);
+      assertThatThrownBy(() -> fmt.from(snap).createNamespace(Namespace.of("y")).commit(io))
+          .isInstanceOf(CommitFailedException.class);
+
+      assertThat(reread(io, fmt).namespaces())
+          .containsExactlyInAnyOrder(Namespace.of("seed"), Namespace.of("x"));
+    }
+
+    @Test
+    void appendCreatesOfSameRootNamespaceConflict() {
+      CasFileIO io = new CasFileIO();
+      ProtoCatalogFormat fmt = format(APPEND);
+      ProtoCatalogFile snap = seed(io, fmt, "seed");
+
+      fmt.from(snap).createNamespace(Namespace.of("x")).commit(io);
+      assertThatThrownBy(() -> fmt.from(snap).createNamespace(Namespace.of("x")).commit(io))
+          .isInstanceOfAny(AlreadyExistsException.class, CommitFailedException.class);
+
+      ProtoCatalogFile result = reread(io, fmt);
+      assertThat(result.namespaceById().values().stream().filter(e -> e.name.equals("x")))
+          .hasSize(1);
+    }
+
+    @Test
+    void droppingTopLevelNamespaceConflictsWithTopLevelCreate() {
+      CasFileIO io = new CasFileIO();
+      ProtoCatalogFormat fmt = format(APPEND);
+      ProtoCatalogFile snap = seed(io, fmt, "a");
+
+      fmt.from(snap).dropNamespace(Namespace.of("a")).commit(io);
+      assertThatThrownBy(() -> fmt.from(snap).createNamespace(Namespace.of("b")).commit(io))
+          .isInstanceOf(CommitFailedException.class);
+    }
+
+    @Test
+    void rootVersionSurvivesCompaction() {
+      // CAS-only: every commit writes a fresh checkpoint, so the root version
+      // must round-trip through the checkpoint encoding.
+      CasFileIO io = new CasFileIO();
+      ProtoCatalogFormat fmt = format(0);
+      seed(io, fmt, "a");
+      fmt.from(reread(io, fmt)).createNamespace(Namespace.of("b")).commit(io);
+      fmt.from(reread(io, fmt)).createNamespace(Namespace.of("c")).commit(io);
+
+      assertThat(reread(io, fmt).namespaceVersion(ProtoCatalogFile.ROOT_ID)).isEqualTo(3);
+    }
+
+    @Test
+    void rootIsNotAddressableByName() {
+      CasFileIO io = new CasFileIO();
+      FileIOCatalog cat = catalog(io);
+      cat.createNamespace(Namespace.of("a"));
+
+      ProtoCatalogFile file = reread(io, format(0));
+      assertThat(file.namespaceEntry(ProtoCatalogFile.ROOT_ID)).isNotNull();
+      assertThat(file.namespaces()).containsExactly(Namespace.of("a"));
+      assertThat(cat.namespaceExists(Namespace.empty())).isFalse();
+      assertThat(cat.listNamespaces()).containsExactly(Namespace.of("a"));
+    }
+
+    @Test
+    void replayNeverDropsOrReplacesTheRoot() {
+      ProtoCatalogFile.Builder builder =
+          ProtoCatalogFile.builder(new InMemoryInputFile(new byte[0]));
+      int rootVersion = builder.namespaceVersion(ProtoCatalogFile.ROOT_ID);
+
+      assertThat(new ProtoCodec.DropNamespaceAction(ProtoCatalogFile.ROOT_ID, rootVersion)
+              .verify(builder))
+          .isFalse();
+      assertThat(new ProtoCodec.CreateNamespaceAction(ProtoCatalogFile.ROOT_ID, 1, 0, -1, "x")
+              .verify(builder))
+          .isFalse();
+      assertThatThrownBy(() -> builder.removeNamespace(ProtoCatalogFile.ROOT_ID))
+          .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void tableInRootIsRejected() {
+      CasFileIO io = new CasFileIO();
+      ProtoCatalogFormat fmt = format(APPEND);
+      ProtoCatalogFile snap = seed(io, fmt, "a");
+
+      assertThatThrownBy(
+              () -> fmt.from(snap).createTable(TableIdentifier.of("t"), "mem:///t/v1.metadata.json"))
+          .isInstanceOf(NoSuchNamespaceException.class);
+
+      FileIOCatalog cat = catalog(io);
+      assertThatThrownBy(() -> cat.buildTable(TableIdentifier.of("t"), SCHEMA))
+          .isInstanceOf(IllegalArgumentException.class)
+          .hasMessageContaining("Invalid table identifier");
+    }
+
+    @Test
+    void propertiesOnRootAreRejected() {
+      CasFileIO io = new CasFileIO();
+      FileIOCatalog cat = catalog(io);
+      cat.createNamespace(Namespace.of("a"));
+
+      assertThatThrownBy(() -> cat.setProperties(Namespace.empty(), Map.of("k", "v")))
+          .isInstanceOf(NoSuchNamespaceException.class);
     }
   }
 }

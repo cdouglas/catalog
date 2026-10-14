@@ -2277,15 +2277,16 @@ public class TestProtoActions {
 
     @Test
     void createNsSiblingVsCreateNs_conflict_parentVersion() {
-      // Two concurrent creates under the same parent. Parent is root here
-      // (id=0), whose version is implicit — so BOTH creates capture
-      // parentVersion=-1 in buildActions and both succeed. This is expected.
+      // Two concurrent creates under the same parent. Parent is the root here
+      // (id=0), which is versioned like any other parent: both capture v=0;
+      // first to commit wins, second must be rejected on replay.
       byte[] file = baseFile();
-      ProtoCodec.Transaction t1 = txn(createNs(3, 0, "a", 1, -1));
-      ProtoCodec.Transaction t2 = txn(createNs(4, 0, "b", 1, -1));
+      ProtoCodec.Transaction t1 = txn(createNs(3, 0, "a", 1, 0));
+      ProtoCodec.Transaction t2 = txn(createNs(4, 0, "b", 1, 0));
       ProtoCatalogFile r = apply(file, t1, t2);
       assertThat(r.containsNamespace(Namespace.of("a"))).isTrue();
-      assertThat(r.containsNamespace(Namespace.of("b"))).isTrue();
+      assertThat(r.containsNamespace(Namespace.of("b"))).isFalse();
+      assertThat(r.containsTransaction(t2.id())).isFalse();
     }
 
     @Test
@@ -2599,11 +2600,7 @@ public class TestProtoActions {
       Map<Integer, String> nsNames = new HashMap<>();
       nsNames.put(0, ""); // root
 
-      // Root namespace must be present for Mut.createNamespace() to work
-      // correctly -- without it, auto-created root serializes as name=""
-      // which becomes Namespace.of("") on replay instead of Namespace.empty().
-      int rootVersion = rand.nextInt(3) + 1;
-      builder.addNamespace(0, 0, "", rootVersion);
+      builder.addNamespace(ProtoCatalogFile.ROOT_ID, 0, "", rand.nextInt(3) + 1);
 
       for (int nsid = 1; nsid < nextNsid; nsid += rand.nextInt(5) + 1) {
         int parentId = rand.nextInt(nsid);

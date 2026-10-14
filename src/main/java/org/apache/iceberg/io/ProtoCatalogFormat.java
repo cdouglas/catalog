@@ -323,10 +323,18 @@ public class ProtoCatalogFormat
      * <p>Called by ProtoCodec.Transaction.from() to extract pending changes.
      */
     void buildActions(List<ProtoCodec.Action> actions, ProtoIdManager idManager) {
-      // Initialize ID manager from original catalog state
+      // The checkpoint written on the CAS path carries the original state's
+      // next ids; replay allocates the ids this transaction creates.
       idManager.setGlobals(original.nextNamespaceId(), original.nextTableId());
 
-      // Map namespace to assigned ID (for late-binding)
+      // New namespaces and tables get late-bound (negative) ids, which replay
+      // binds to real ids in log order (ProtoCodec.IdBinding). Allocating real
+      // ids here, from this writer's snapshot, let two concurrent writers claim
+      // the same id for unrelated creates.
+      int nextLateNsid = -1;
+      int nextLateTblid = -1;
+
+      // Map namespace created in this transaction to its late-bound ID
       Map<Namespace, Integer> nsIdMap = new java.util.HashMap<>();
 
       // Sort namespaces by depth (parents before children) to ensure correct ID assignment
@@ -343,7 +351,7 @@ public class ProtoCatalogFormat
         String name = CatalogFile.Mut.nameOf(ns);
 
         int parentId = 0;
-        int parentVersion = -1;
+        int parentVersion = original.namespaceVersion(0);
         if (!parent.isEmpty()) {
           Integer existingParentId = original.namespaceId(parent);
           if (existingParentId != null) {
@@ -359,7 +367,7 @@ public class ProtoCatalogFormat
           }
         }
 
-        int nsId = idManager.allocateNsid();
+        int nsId = nextLateNsid--;
         nsIdMap.put(ns, nsId);
         actions.add(new ProtoCodec.CreateNamespaceAction(nsId, 1, parentId, parentVersion, name));
 
@@ -439,7 +447,7 @@ public class ProtoCatalogFormat
           nsVersion = original.namespaceVersion(nsId);
         }
 
-        int tblId = idManager.allocateTblid();
+        int tblId = nextLateTblid--;
         actions.add(new ProtoCodec.CreateTableAction(
             tblId, 1, nsId, nsVersion, ident.name(), metadataLocation));
       }
@@ -480,7 +488,7 @@ public class ProtoCatalogFormat
           nsVersion = original.namespaceVersion(nsId);
         }
 
-        int tblId = idManager.allocateTblid();
+        int tblId = nextLateTblid--;
         byte[] createDelta = inlineTableCreateDeltas.get(ident);
         actions.add(new ProtoCodec.CreateTableInlineAction(
             tblId, 1, nsId, nsVersion, ident.name(), metadata, codec, createDelta));
@@ -770,8 +778,8 @@ public class ProtoCatalogFormat
       writeVarint(out, checkpointBytes.length);
       out.write(checkpointBytes);
 
-      // Transaction (empty actions since checkpoint includes the changes)
-      // But we still write it for the transaction ID tracking
+      // Transaction: the checkpoint holds the original state only; replay
+      // applies this record on top of it (binding any late-bound ids).
       writeVarint(out, txnBytes.length);
       out.write(txnBytes);
 
@@ -787,14 +795,17 @@ public class ProtoCatalogFormat
   }
 
   // ============================================================
-  // ID Manager for late-binding
+  // Next-id counters for the checkpoint header
   // ============================================================
 
+  /**
+   * Carries the next namespace / table ids written to a checkpoint header.
+   * Writers do not allocate ids: creates carry late-bound ids that replay
+   * binds (see {@link ProtoCodec.IdBinding}).
+   */
   static class ProtoIdManager {
     private int nextNsid = 1;
     private int nextTblid = 1;
-    private final java.util.Map<Integer, Integer> nsRemap =
-        new java.util.HashMap<>();
 
     public int getNextNsid() {
       return nextNsid;
@@ -802,30 +813,6 @@ public class ProtoCatalogFormat
 
     public int getNextTblid() {
       return nextTblid;
-    }
-
-    public int allocateNsid() {
-      return nextNsid++;
-    }
-
-    public int allocateTblid() {
-      return nextTblid++;
-    }
-
-    public int remap(int virtualId) {
-      Preconditions.checkArgument(virtualId < 0, "Not a virtual ID: %d", virtualId);
-      int realId = allocateNsid();
-      nsRemap.put(virtualId, realId);
-      return realId;
-    }
-
-    public int resolve(int id) {
-      if (id < 0) {
-        Integer remapped = nsRemap.get(id);
-        Preconditions.checkNotNull(remapped, "Virtual ID not remapped: %d", id);
-        return remapped;
-      }
-      return id;
     }
 
     public void setGlobals(int nextNsid, int nextTblid) {

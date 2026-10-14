@@ -385,9 +385,10 @@ public abstract class CatalogFile {
       return self();
     }
 
+    // True when the namespace does NOT exist. The empty namespace never exists:
+    // the format cannot hold tables or properties on the root.
     private boolean checkNamespaceExists(Namespace namespace) {
-      return !Namespace.empty().equals(namespace)
-          && !original.containsNamespace(namespace)
+      return !original.containsNamespace(namespace)
           && !namespaces.getOrDefault(namespace, false);
     }
 

@@ -43,6 +43,9 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
  */
 public class ProtoCatalogFile extends CatalogFile {
 
+  /** Id of the root namespace's row. Every catalog has one; it is never dropped. */
+  static final int ROOT_ID = 0;
+
   // ID tracking
   private final int nextNamespaceId;
   private final int nextTableId;
@@ -513,6 +516,11 @@ public class ProtoCatalogFile extends CatalogFile {
     Builder(InputFile location) {
       this.location = location;
       this.catalogUuid = UuidV7.newUuidV7();
+      // The root namespace is an ordinary row with id 0, so it is versioned
+      // like any other parent: creating or dropping a top-level namespace bumps
+      // it. It cannot be created or dropped, and it is not addressable by name
+      // (see rebuildLookups). A decoded checkpoint replaces this default row.
+      namespaceById.put(ROOT_ID, new NsEntry(ROOT_ID, "", 0));
     }
 
     public Builder setCatalogUuid(UUID uuid) {
@@ -553,7 +561,9 @@ public class ProtoCatalogFile extends CatalogFile {
     public Builder rebuildLookups() {
       namespaceLookup.clear();
       for (Integer id : namespaceById.keySet()) {
-        namespaceLookup.put(buildNamespace(id), id);
+        if (id != ROOT_ID) {  // the root is not a namespace callers can name
+          namespaceLookup.put(buildNamespace(id), id);
+        }
       }
       tableLookup.clear();
       for (Map.Entry<Integer, TblEntry> entry : tableById.entrySet()) {
@@ -564,6 +574,7 @@ public class ProtoCatalogFile extends CatalogFile {
     }
 
     public Builder removeNamespace(int id) {
+      Preconditions.checkArgument(id != ROOT_ID, "Cannot remove the root namespace");
       // Build the Namespace key before removing from namespaceById,
       // since buildNamespace needs the entry to reconstruct the path.
       Namespace ns = namespaceById.containsKey(id) ? buildNamespace(id) : null;
@@ -586,13 +597,9 @@ public class ProtoCatalogFile extends CatalogFile {
     /**
      * Increments a namespace's version by one. Called from action applies that mutate
      * the namespace (children set, properties) so that concurrent / replayed actions
-     * whose preconditions captured the pre-bump version fail {@code verify}. No-op on
-     * the root namespace (id 0), which has no explicit entry.
+     * whose preconditions captured the pre-bump version fail {@code verify}.
      */
     public Builder bumpNamespaceVersion(int id) {
-      if (id == 0) {
-        return this;
-      }
       NsEntry old = namespaceById.get(id);
       if (old != null) {
         namespaceById.put(id, new NsEntry(old.parentId, old.name, old.version + 1));
@@ -902,6 +909,14 @@ public class ProtoCatalogFile extends CatalogFile {
 
     public NsEntry namespaceEntry(int nsId) {
       return namespaceById.get(nsId);
+    }
+
+    public int nextNamespaceId() {
+      return nextNamespaceId;
+    }
+
+    public int nextTableId() {
+      return nextTableId;
     }
 
     public Integer tableId(TableIdentifier ident) {

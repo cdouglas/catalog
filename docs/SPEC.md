@@ -512,9 +512,9 @@ The codec uses standard protobuf encoding:
 - **Wire type 1/5** (fixed64/fixed32): used for snapshot IDs
 
 Varints use the standard protobuf unsigned encoding (7 bits per byte, MSB
-continuation). Signed integers use protobuf's default zigzag-less encoding,
-so negative values (used for late-binding sentinels) occupy 10 bytes on the
-wire.
+continuation). Signed integers are not zigzag-encoded: a negative `int32`
+(a late-bound ID) is written as the 5-byte varint of its 32-bit two's
+complement.
 
 Default-valued fields (zero for ints, false for bools, empty for
 strings/bytes) are omitted per proto3 conventions.
@@ -692,17 +692,28 @@ checkpoint for idempotency.
 
 ## Late-Binding
 
-When a transaction creates a namespace or table and references it within the
-same transaction, the entity ID is not yet allocated. The format uses
-negative integers as virtual IDs:
+Writers never allocate entity IDs. A create action carries a negative
+late-bound ID, and replay binds it to a real ID:
 
-- `ProtoIdManager` maintains allocation counters (`nextNsid`, `nextTblid`)
-  and a remap table (`virtualId -> realId`).
-- During `buildActions()`, new namespaces are sorted by depth (parents
-  before children) and assigned IDs from `idManager.allocateNsid()`.
-- Version fields are set to `-1` when the referenced entity was created in
-  the same txn.
-- On replay, `resolve(id)` maps negative IDs to their allocated counterparts.
+- `buildActions()` sorts new namespaces by depth (parents before
+  children) and numbers new namespaces and tables `-1, -2, ...`
+  (separate sequences). Actions later in the same transaction reference
+  a new entity by its late-bound ID.
+- Version fields are set to `-1` when the referenced entity was created
+  in the same txn.
+- On replay, `Transaction.apply` binds each late-bound ID, at its
+  defining create, to the replaying state's next namespace / table ID
+  (`ProtoCodec.IdBinding`), and resolves later references to it. Every
+  reader replays the log in the same order, so every reader assigns the
+  same IDs.
+- `Transaction.verify` rejects a record that references a late-bound ID
+  before (or without) the create that defines it.
+
+Binding at replay is what keeps concurrent creates apart. When writers
+allocated IDs from their own snapshot, two writers that read the same
+snapshot and created unrelated entities -- e.g. tables in different
+namespaces -- wrote records with the same ID. Both records verified, and replay let the second overwrite the
+first.
 
 ## State Model
 
@@ -729,6 +740,22 @@ Inline-only fields (`tblInlineMetadata`, `tblManifestPrefix`, `manifestPool`,
 `snapshotManifests`) are described in [SPEC_TM.md](SPEC_TM.md) and
 [SPEC_ML.md](SPEC_ML.md).
 
+**The root namespace** is an ordinary `NsEntry` row with id 0
+(`parentId = 0`, `name = ""`), present in every catalog and written to
+the checkpoint with the other namespaces. `parentId = 0` means "child of
+the root". Because it is a row, the root is versioned like any other
+parent: creating or dropping a top-level namespace bumps its version, so
+top-level creates serialize as sibling creates do under any other
+parent. The root is otherwise reserved:
+
+- it is not addressable by name: `namespaceLookup` omits it, so
+  `Namespace.empty()` does not exist as far as callers are concerned;
+- no action may create or drop it (`CreateNamespace` / `DropNamespace`
+  with id 0 fail verification);
+- tables and namespace properties cannot live on it: `FileIOCatalog`
+  rejects table identifiers with an empty namespace
+  (`supportsEmptyNamespace() = false` in the Iceberg catalog contract).
+
 **Entry classes:**
 
 - `NsEntry(int parentId, String name, int version)` — namespace metadata.
@@ -749,8 +776,8 @@ Each action's `verify()` checks version-based preconditions:
 
 | Action                   | Precondition                                              |
 |--------------------------|-----------------------------------------------------------|
-| CreateNamespace          | parent version matches (skip if late-bound)               |
-| DropNamespace            | namespace version matches                                 |
+| CreateNamespace          | not the root (id 0); parent version matches (skip if late-bound) |
+| DropNamespace            | not the root (id 0); namespace version matches            |
 | SetNamespaceProperty     | namespace version matches (skip if late-bound)            |
 | RemoveNamespaceProperty  | namespace version matches (skip if late-bound)            |
 | CreateTable              | namespace version matches (skip if late-bound)            |

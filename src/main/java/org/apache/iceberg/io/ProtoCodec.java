@@ -27,6 +27,7 @@ import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -292,7 +293,8 @@ public class ProtoCodec {
       // Catalog UUID
       writeBytes(out, CHECKPOINT_CATALOG_UUID, uuidToBytes(original.uuid()));
 
-      // Next IDs (from idManager which tracks allocations)
+      // Next IDs: the original state's. Replay allocates the ids of the
+      // transaction record that follows this checkpoint.
       writeVarint(out, CHECKPOINT_NEXT_NAMESPACE_ID, idManager.getNextNsid());
       writeVarint(out, CHECKPOINT_NEXT_TABLE_ID, idManager.getNextTblid());
 
@@ -2146,6 +2148,16 @@ public class ProtoCodec {
       if (!UuidV7.isV7(id)) {
         return false;
       }
+      // Every late-bound reference must follow the create that defines it;
+      // otherwise apply could not bind it. Reject the record, don't fail the read.
+      IdBinding ids = new IdBinding(builder);
+      try {
+        for (Action action : actions) {
+          action.bind(ids);
+        }
+      } catch (IllegalStateException e) {
+        return false;
+      }
       for (Action action : actions) {
         if (!action.verify(builder)) {
           return false;
@@ -2155,12 +2167,80 @@ public class ProtoCodec {
     }
 
     /**
-     * Applies all actions in this transaction to the builder.
+     * Applies all actions in this transaction to the builder, binding late-bound
+     * ids to real ids as their creates are applied.
      */
     public void apply(ProtoCatalogFile.Builder builder) {
+      IdBinding ids = new IdBinding(builder);
       for (Action action : actions) {
-        action.apply(builder);
+        action.bind(ids).apply(builder);
       }
+    }
+  }
+
+  /**
+   * Binds one transaction's late-bound (negative) namespace and table ids to
+   * real ids at replay time. A create action defines a late-bound id; later
+   * actions in the same transaction reference it.
+   *
+   * <p>Real ids come from the replaying builder's counters, so every reader of
+   * the log assigns the same ids, and two writers that read the same snapshot
+   * cannot claim the same id. Writers that bound ids from their own snapshot
+   * did exactly that: two unrelated creates carried one id, and replay let the
+   * second overwrite the first.
+   */
+  static final class IdBinding {
+    private final ProtoCatalogFile.Builder builder;
+    private final Map<Integer, Integer> namespaces = new HashMap<>();
+    private final Map<Integer, Integer> tables = new HashMap<>();
+    private int nextNamespaceId;
+    private int nextTableId;
+
+    IdBinding(ProtoCatalogFile.Builder builder) {
+      this.builder = builder;
+      this.nextNamespaceId = builder.nextNamespaceId();
+      this.nextTableId = builder.nextTableId();
+    }
+
+    /** Binds a namespace id at its defining create. Concrete ids pass through. */
+    int defineNamespace(int id) {
+      if (id >= 0) {
+        return id;
+      }
+      int real = Math.max(nextNamespaceId, builder.nextNamespaceId());
+      nextNamespaceId = real + 1;
+      bind(namespaces, id, real);
+      return real;
+    }
+
+    /** Resolves a namespace reference. Concrete ids (including the root, 0) pass through. */
+    int namespace(int id) {
+      return id >= 0 ? id : resolve(namespaces, id, "namespace");
+    }
+
+    /** Binds a table id at its defining create. Concrete ids pass through. */
+    int defineTable(int id) {
+      if (id >= 0) {
+        return id;
+      }
+      int real = Math.max(nextTableId, builder.nextTableId());
+      nextTableId = real + 1;
+      bind(tables, id, real);
+      return real;
+    }
+
+    private static void bind(Map<Integer, Integer> bound, int lateId, int real) {
+      if (bound.putIfAbsent(lateId, real) != null) {
+        throw new IllegalStateException("Late-bound id defined twice: " + lateId);
+      }
+    }
+
+    private static int resolve(Map<Integer, Integer> bound, int lateId, String kind) {
+      Integer real = bound.get(lateId);
+      if (real == null) {
+        throw new IllegalStateException("Unbound late-bound " + kind + " id: " + lateId);
+      }
+      return real;
     }
   }
 
@@ -2171,6 +2251,14 @@ public class ProtoCodec {
   public interface Action {
     boolean verify(ProtoCatalogFile.Builder builder);
     void apply(ProtoCatalogFile.Builder builder);
+
+    /**
+     * Returns this action with its late-bound ids bound to real ids. Actions
+     * that only ever carry concrete ids return themselves.
+     */
+    default Action bind(IdBinding ids) {
+      return this;
+    }
   }
 
   public static class CreateNamespaceAction implements Action {
@@ -2190,14 +2278,24 @@ public class ProtoCodec {
 
     @Override
     public boolean verify(ProtoCatalogFile.Builder builder) {
-      // Parent must exist (unless root) and version must match
-      if (parentId != 0) {
-        int currentParentVersion = builder.namespaceVersion(parentId);
-        if (parentVersion >= 0 && currentParentVersion != parentVersion) {
-          return false;
-        }
+      if (id == ProtoCatalogFile.ROOT_ID) {
+        return false;  // the root row exists in every catalog; never replace it
+      }
+      // Parent version must match (skipped when the parent is late-bound).
+      // The root is versioned like any other parent.
+      int currentParentVersion = builder.namespaceVersion(parentId);
+      if (parentVersion >= 0 && currentParentVersion != parentVersion) {
+        return false;
       }
       return true;
+    }
+
+    @Override
+    public Action bind(IdBinding ids) {
+      // Resolve the parent first so a record naming itself as parent is unbound.
+      int boundParentId = ids.namespace(parentId);
+      return new CreateNamespaceAction(
+          ids.defineNamespace(id), version, boundParentId, parentVersion, name);
     }
 
     @Override
@@ -2221,6 +2319,9 @@ public class ProtoCodec {
 
     @Override
     public boolean verify(ProtoCatalogFile.Builder builder) {
+      if (id == ProtoCatalogFile.ROOT_ID) {
+        return false;  // the root is never dropped
+      }
       int currentVersion = builder.namespaceVersion(id);
       return currentVersion == version;
     }
@@ -2259,6 +2360,11 @@ public class ProtoCodec {
     }
 
     @Override
+    public Action bind(IdBinding ids) {
+      return new SetNamespacePropertyAction(ids.namespace(namespaceId), namespaceVersion, key, value);
+    }
+
+    @Override
     public void apply(ProtoCatalogFile.Builder builder) {
       builder.setNamespaceProperty(namespaceId, key, value);
       builder.bumpNamespaceVersion(namespaceId);
@@ -2283,6 +2389,11 @@ public class ProtoCodec {
         return currentVersion == namespaceVersion;
       }
       return true;
+    }
+
+    @Override
+    public Action bind(IdBinding ids) {
+      return new RemoveNamespacePropertyAction(ids.namespace(namespaceId), namespaceVersion, key);
     }
 
     @Override
@@ -2319,6 +2430,13 @@ public class ProtoCodec {
         }
       }
       return true;
+    }
+
+    @Override
+    public Action bind(IdBinding ids) {
+      int boundNamespaceId = ids.namespace(namespaceId);
+      return new CreateTableAction(
+          ids.defineTable(id), version, boundNamespaceId, namespaceVersion, name, metadataLocation);
     }
 
     @Override
@@ -2611,6 +2729,14 @@ public class ProtoCodec {
     }
 
     @Override
+    public Action bind(IdBinding ids) {
+      int boundNamespaceId = ids.namespace(namespaceId);
+      return new CreateTableInlineAction(
+          ids.defineTable(id), version, boundNamespaceId, namespaceVersion, name, metadata,
+          metadataCodec, deltaBytes);
+    }
+
+    @Override
     public void apply(ProtoCatalogFile.Builder builder) {
       // manifest list prefix is derived from metadata at checkpoint time;
       // for newly created tables, we default to empty (set later on first snapshot)
@@ -2678,6 +2804,12 @@ public class ProtoCodec {
         }
       }
       return true;
+    }
+
+    @Override
+    public Action bind(IdBinding ids) {
+      return new RenameTableAction(
+          id, version, ids.namespace(newNamespaceId), newNamespaceVersion, newName);
     }
 
     @Override
