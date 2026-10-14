@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Usage: spec/tla/run-tlc.sh <config.cfg>
 #
-# NOTE: -deadlock (which enables deadlock *checking*) is intentionally omitted
-# in this bootstrap because the trivial Next == UNCHANGED storage action would
-# otherwise be reported as a deadlock. Task 10 introduces real transitions, at
-# which point deadlock checking will be re-enabled.
+# TLC checks for deadlock by default; the -deadlock flag would turn that check
+# off, so it is not passed. Terminated runs are not reported as deadlocks
+# because the PlusCal translation's `Terminating` disjunct lets a finished
+# system stutter.
 set -euo pipefail
 
 CFG="${1:-MC_small.cfg}"

@@ -15,7 +15,8 @@ variables
   terminalResult = [w \in Writers |-> "unknown"];
 
 define
-  \* MustCAS condition from SPEC.md:596-597.
+  \* MustCAS condition (SPEC.md §Commit Protocol), count limit only: the
+  \* size limit and backend capability are not modelled (newBytes is unused).
   MustCAS(view, newBytes) ==
     Len(view.log) >= MaxLog
   \* Compaction result: committed set grows by the new UUID, log is reset to the new txn.
@@ -200,63 +201,44 @@ TypeOK ==
   /\ nextUuid \in Nat
   /\ terminalResult \in [Writers -> {"unknown", "committed", "exhausted"}]
 
-\* S1: every log entry is a UUID that was previously assigned and is in `committed`.
-S1_LinearizableOrder ==
+\* S1: every log entry is a UUID that is in `committed`. Every append adds to
+\* both, so this holds by construction; it is not a linearizability check.
+S1_LogEntriesCommitted ==
   \A i \in 1..Len(storage.log):
     storage.log[i] \in storage.committed
 
-\* S2: committed set is monotone — once a UUID appears, it never disappears
-\* within a window where any writer could retry with it. (GC trimming is
-\* separately bounded in V1b P7.) Within the model's horizon, we check strict
-\* monotonicity.
+\* S2: the committed set is monotone — once a UUID appears, it never
+\* disappears. GC of the committed set is not modelled. This is the property
+\* that catches a CAS without the etag check; it does not catch an append
+\* without the offset check (see README, Known gaps).
 S2_NoLostCommit == [][storage.committed \subseteq storage'.committed]_<<storage>>
 
-\* S3: each UUID appears at most once in `log`.
+\* S3: each UUID appears at most once in `log`. Vacuous as modelled: no writer
+\* retries after its write lands (lost replies are not modelled), so the
+\* "already committed" branches of DoCAS / DoAppend are never taken.
 S3_IdempotentReplay ==
   \A i, j \in 1..Len(storage.log):
     (storage.log[i] = storage.log[j]) => (i = j)
 
-\* S4: compaction never shrinks the committed set. Enforced here by the
-\* `Compact` operator's definition — this invariant is a sanity check that
-\* no future edit silently drops that property. The plan's quantifier uses
-\* `Nat` which is infinite for TLC. Adaptation: `Compact` only reads
-\* `view.committed` (etag/length/log are overwritten unconditionally), so
-\* it suffices to quantify over the finite domain of possible committed
-\* sets. We fix dummy values for the unread fields to keep `view` a valid
-\* record of the expected shape.
-S4_CompactionPreservesCommit ==
-  \A c \in SUBSET (0..MaxLog+1):
-    \A u \in 0..MaxLog+1:
-      LET view == [etag |-> 0, length |-> 0, log |-> << >>, committed |-> c] IN
-      LET post == Compact(view, u) IN
-        view.committed \cup {u} \subseteq post.committed
-
 \* Weak fairness on each writer: once a writer step is enabled, it is
-\* eventually taken. Adaptation from plan: the plan writes
-\* `WF_<<storage, nextUuid>>(Writer(w))`, but the standard pcal.trans idiom
-\* is to use the full `vars` tuple (defined at the top of the translation).
-\* Per-process WF on `Writer(self)` is the intended "each writer makes
-\* progress" fairness.
+\* eventually taken. Per-process WF on `Writer(self)` over the full `vars`
+\* tuple is the standard idiom for PlusCal translations.
 FairSpec == Spec /\ \A w \in Writers: WF_vars(Writer(w))
 
-\* L1: every writer eventually reaches the terminal state. The translator
-\* sets `pc[self] := "Done"` once a process falls off the end of its
-\* procedure (after the `Finish` label's `skip`). So the terminal pc value
-\* is `"Done"`, matching the auto-generated `Termination` operator above.
-L1_EventualCommit ==
+\* L1: every writer eventually terminates, committed or exhausted (pc = "Done",
+\* matching the generated `Termination` operator). Follows from the bounded
+\* retry loop.
+L1_Termination ==
   \A w \in Writers: <>(pc[w] = "Done")
 
-\* L2: every writer eventually commits or exhausts retries.
+\* L2: every writer eventually commits or exhausts retries. `Exhaust` is
+\* unreachable in the shipped configs, so in practice every writer commits.
 L2_NoStarvation ==
   \A w \in Writers: <>(terminalResult[w] \in {"committed", "exhausted"})
 
 \* L3: bounded retries — every writer's `attempt` counter stays within
-\* MaxRetries at all reachable states. The pcal.trans translation emits
-\* `attempt` as a per-process function `[Writers -> Nat]`, so we
-\* quantify over Writers. This is a safety-shaped invariant: the loop
-\* guard `while attempt < MaxRetries` ensures `attempt` is only
-\* incremented when strictly less than MaxRetries, so the counter
-\* reaches MaxRetries at most once (triggering Exhaust).
+\* MaxRetries. This is an invariant (safety), implied by the loop guard
+\* `while attempt < MaxRetries`.
 L3_BoundedRetries ==
   \A w \in Writers: attempt[w] <= MaxRetries
 
