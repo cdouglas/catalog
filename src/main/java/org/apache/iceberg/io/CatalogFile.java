@@ -232,6 +232,9 @@ public abstract class CatalogFile {
               && tables.entrySet().stream()
                   .filter(e -> e.getValue() != null) // only table creations
                   .map(e -> e.getKey().namespace())
+                  .noneMatch(ns -> ns.equals(namespace))
+              && tableRenames.values().stream()
+                  .map(TableIdentifier::namespace)
                   .noneMatch(ns -> ns.equals(namespace));
       if (!noNsChild || !noTblChild) {
         throw new NamespaceNotEmptyException("Namespace %s is not empty", namespace);
@@ -247,7 +250,7 @@ public abstract class CatalogFile {
         throw new NoSuchNamespaceException("Namespace does not exist: %s", table.namespace());
       }
       if (original.containsTable(table) || tables.get(table) != null
-          || inlineTables.get(table) != null) {
+          || inlineTables.get(table) != null || tableRenames.containsValue(table)) {
         throw new AlreadyExistsException("Table already exists: %s", table);
       }
       tables.put(table, location);
@@ -269,6 +272,7 @@ public abstract class CatalogFile {
       if (!original.containsTable(table)) {
         throw new NoSuchNamespaceException("Table does not exist: %s", table);
       }
+      checkNotRenamed(table);
       final String newloc = tables.get(table);
       if (original.location(table) != null && tables.containsKey(table) && newloc == null) {
         throw new IllegalArgumentException("Cannot update table marked for deletion: " + table);
@@ -295,6 +299,7 @@ public abstract class CatalogFile {
       if (!original.containsTable(from) || (tables.containsKey(from) && tables.get(from) == null)) {
         throw new NoSuchTableException("Table does not exist: %s", from);
       }
+      checkNotRenamed(from);
       // Destination namespace must exist (in original or pending creates).
       if (checkNamespaceExists(to.namespace())) {
         throw new NoSuchNamespaceException("Namespace does not exist: %s", to.namespace());
@@ -315,6 +320,7 @@ public abstract class CatalogFile {
       if (!original.containsTable(tableId)) {
         throw new NoSuchTableException("Table does not exist: %s", tableId);
       }
+      checkNotRenamed(tableId);
       tables.put(tableId, null);
       return self();
     }
@@ -328,7 +334,7 @@ public abstract class CatalogFile {
         throw new NoSuchNamespaceException("Namespace does not exist: %s", table.namespace());
       }
       if (original.containsTable(table) || tables.get(table) != null
-          || inlineTables.get(table) != null) {
+          || inlineTables.get(table) != null || tableRenames.containsValue(table)) {
         throw new AlreadyExistsException("Table already exists: %s", table);
       }
       inlineTables.put(table, metadata);
@@ -357,6 +363,7 @@ public abstract class CatalogFile {
       if (!original.containsTable(table)) {
         throw new NoSuchTableException("Table does not exist: %s", table);
       }
+      checkNotRenamed(table);
       inlineTableUpdates.put(table, metadata);
       inlineTableUpdateCodecs.put(table, codecTag);
       return self();
@@ -380,16 +387,27 @@ public abstract class CatalogFile {
       if (!original.containsTable(table)) {
         throw new NoSuchTableException("Table does not exist: %s", table);
       }
+      checkNotRenamed(table);
       // Store with a marker prefix to distinguish from full mode in buildActions
       inlineTableDeltaUpdates.put(table, deltaBytes);
       return self();
     }
 
-    // True when the namespace does NOT exist. The empty namespace never exists:
-    // the format cannot hold tables or properties on the root.
+    // True when the namespace does NOT exist once this transaction's pending
+    // creates and drops apply. The empty namespace never exists: the format
+    // cannot hold tables or properties on the root.
     private boolean checkNamespaceExists(Namespace namespace) {
-      return !original.containsNamespace(namespace)
-          && !namespaces.getOrDefault(namespace, false);
+      Boolean pending = namespaces.get(namespace);
+      return pending != null ? !pending : !original.containsNamespace(namespace);
+    }
+
+    // A table renamed earlier in this transaction no longer exists under its old name.
+    private void checkNotRenamed(TableIdentifier table) {
+      if (tableRenames.containsKey(table)) {
+        throw new NoSuchTableException(
+            "Table does not exist: %s (renamed to %s in this transaction)",
+            table, tableRenames.get(table));
+      }
     }
 
     public abstract C commit(SupportsAtomicOperations fileIO);

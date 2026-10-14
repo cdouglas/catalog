@@ -39,6 +39,7 @@ import org.apache.iceberg.exceptions.AlreadyExistsException;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
+import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.inmemory.InMemoryInputFile;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.types.Types;
@@ -902,6 +903,93 @@ public class TestCatalogRegressions {
       }
 
       assertThat(reread(io, fmt).namespaces()).containsExactlyInAnyOrderElementsOf(expected);
+    }
+  }
+
+  // ============================================================
+  // Bug 13: CatalogFile.Mut validated each staged operation against the
+  // writer's snapshot, ignoring the transaction's own pending renames and
+  // namespace drops. A transaction could rename a table and then drop, update
+  // or rename it again under its old name, create a second table at the
+  // rename destination, drop the namespace a table was renamed into, or
+  // create, rename into, or set properties on a namespace it had dropped.
+  // The commit was acknowledged with some of those changes silently lost or
+  // with a table left without its namespace. Found by
+  // TestMultiWriterProperties.
+  // ============================================================
+
+  @Nested
+  class CompoundTransactionValidation {
+
+    private final TableIdentifier at = TableIdentifier.of("a", "t");
+    private final TableIdentifier bt = TableIdentifier.of("b", "t");
+
+    private CatalogFile.Mut<ProtoCatalogFile, ?> txn() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      ProtoCatalogFormat fmt = format(APPEND);
+      CatalogFile.Mut<ProtoCatalogFile, ?> seed = fmt.empty(io.newInputFile(RACE_LOC));
+      seed.createNamespace(Namespace.of("a"));
+      seed.createNamespace(Namespace.of("b"));
+      seed.createTable(at, "mem:///a/t/v1.metadata.json");
+      seed.commit(io);
+      return fmt.from(reread(io, fmt));
+    }
+
+    @Test
+    void renamedTableCannotBeDroppedUnderItsOldName() {
+      CatalogFile.Mut<ProtoCatalogFile, ?> txn = txn();
+      txn.renameTable(at, bt);
+      assertThatThrownBy(() -> txn.dropTable(at)).isInstanceOf(NoSuchTableException.class);
+    }
+
+    @Test
+    void renamedTableCannotBeRenamedAgainUnderItsOldName() {
+      CatalogFile.Mut<ProtoCatalogFile, ?> txn = txn();
+      txn.renameTable(at, bt);
+      assertThatThrownBy(() -> txn.renameTable(at, TableIdentifier.of("b", "u")))
+          .isInstanceOf(NoSuchTableException.class);
+    }
+
+    @Test
+    void renamedTableCannotBeUpdatedUnderItsOldName() {
+      CatalogFile.Mut<ProtoCatalogFile, ?> txn = txn();
+      txn.renameTable(at, bt);
+      assertThatThrownBy(() -> txn.updateTable(at, "mem:///a/t/v2.metadata.json"))
+          .isInstanceOf(NoSuchTableException.class);
+    }
+
+    @Test
+    void renameDestinationCannotBeCreated() {
+      CatalogFile.Mut<ProtoCatalogFile, ?> txn = txn();
+      txn.renameTable(at, bt);
+      assertThatThrownBy(() -> txn.createTable(bt, "mem:///b/t/v1.metadata.json"))
+          .isInstanceOf(AlreadyExistsException.class);
+    }
+
+    @Test
+    void namespaceWithRenamedInTableCannotBeDropped() {
+      CatalogFile.Mut<ProtoCatalogFile, ?> txn = txn();
+      txn.renameTable(at, bt);
+      assertThatThrownBy(() -> txn.dropNamespace(Namespace.of("b")))
+          .isInstanceOf(NamespaceNotEmptyException.class);
+    }
+
+    @Test
+    void droppedNamespaceCannotReceiveTables() {
+      CatalogFile.Mut<ProtoCatalogFile, ?> txn = txn();
+      txn.dropNamespace(Namespace.of("b"));
+      assertThatThrownBy(() -> txn.createTable(bt, "mem:///b/t/v1.metadata.json"))
+          .isInstanceOf(NoSuchNamespaceException.class);
+      assertThatThrownBy(() -> txn.renameTable(at, bt))
+          .isInstanceOf(NoSuchNamespaceException.class);
+    }
+
+    @Test
+    void droppedNamespaceCannotTakeProperties() {
+      CatalogFile.Mut<ProtoCatalogFile, ?> txn = txn();
+      txn.dropNamespace(Namespace.of("b"));
+      assertThatThrownBy(() -> txn.updateProperties(Namespace.of("b"), Map.of("k", "v")))
+          .isInstanceOf(NoSuchNamespaceException.class);
     }
   }
 }
