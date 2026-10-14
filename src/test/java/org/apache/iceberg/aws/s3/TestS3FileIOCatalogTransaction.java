@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.aws.s3;
 
+import java.net.URI;
 import java.util.Map;
 import java.util.UUID;
 import org.apache.iceberg.CatalogProperties;
@@ -29,6 +30,7 @@ import org.apache.iceberg.io.FileIOCatalog;
 import org.apache.iceberg.io.IntegTestEnv;
 import org.apache.iceberg.io.ProtoCatalogFormat;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.util.SerializableSupplier;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
@@ -37,15 +39,18 @@ import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.TestWatcher;
-import org.testcontainers.containers.MinIOContainer;
 import software.amazon.awssdk.services.s3.S3Client;
 
 @ExtendWith(TestS3Catalog.SuccessCleanupExtension.class)
 public class TestS3FileIOCatalogTransaction extends CatalogTransactionTests<FileIOCatalog> {
 
   protected static CloudMode mode;
-  private static MinIOContainer minioContainer;
+  private static VersityGwContainer s3Emulator;
+  // Admin client for bucket setup. Each FileIO gets its own client from newClient:
+  // S3FileIO closes the client it is given, so sharing one closed it for the rest of
+  // the class ("Connection pool shut down").
   private static S3Client s3Client;
+  private static SerializableSupplier<S3Client> newClient;
   private static String testBucket;
   private static String uniqTestRun;
   private static String warehouseLocation;
@@ -92,7 +97,8 @@ public class TestS3FileIOCatalogTransaction extends CatalogTransactionTests<File
     System.err.println("TEST RUN: " + uniqTestRun); // (logging disabled in tests)
     if (IntegTestEnv.isSet(IntegTestEnv.AWS_ACCESS_KEY_ID)) {
       mode = CloudMode.REAL_S3;
-      s3Client = AwsClientFactories.defaultFactory().s3();
+      newClient = () -> AwsClientFactories.defaultFactory().s3();
+      s3Client = newClient.get();
       testBucket = IntegTestEnv.require(IntegTestEnv.AWS_TEST_BUCKET);
       System.err.println("Using real S3, bucket=" + testBucket);
     } else if (IntegTestEnv.requireRealCloud()) {
@@ -103,13 +109,15 @@ public class TestS3FileIOCatalogTransaction extends CatalogTransactionTests<File
               + IntegTestEnv.AWS_TEST_BUCKET
               + ". See docs/INTEGRATION_TESTING.md.");
     } else {
-      mode = CloudMode.MINIO;
-      minioContainer = MinioUtil.createContainer();
-      minioContainer.start();
-      s3Client = MinioUtil.createS3Client(minioContainer);
+      mode = CloudMode.VERSITYGW;
+      s3Emulator = new VersityGwContainer();
+      s3Emulator.start();
+      final URI endpoint = s3Emulator.endpoint();
+      newClient = () -> VersityGwContainer.createS3Client(endpoint);
+      s3Client = newClient.get();
       testBucket = "casalog-" + UUID.randomUUID().toString().substring(0, 8);
       s3Client.createBucket(b -> b.bucket(testBucket));
-      System.err.println("Using MinIO Testcontainers emulator, bucket=" + testBucket);
+      System.err.println("Using versitygw Testcontainers emulator, bucket=" + testBucket);
     }
   }
 
@@ -119,15 +127,15 @@ public class TestS3FileIOCatalogTransaction extends CatalogTransactionTests<File
       s3Client.close();
       s3Client = null;
     }
-    if (minioContainer != null) {
-      minioContainer.stop();
-      minioContainer = null;
+    if (s3Emulator != null) {
+      s3Emulator.stop();
+      s3Emulator = null;
     }
   }
 
   @BeforeEach
   public void before(TestInfo info) {
-    if (mode == CloudMode.MINIO && maxAppendCount() > 0) {
+    if (mode == CloudMode.VERSITYGW && maxAppendCount() > 0) {
       mode.assumeRealCloud("S3 Express writeOffsetBytes (APPEND-mode commits)");
     }
     final String testName = info.getTestMethod().orElseThrow(RuntimeException::new).getName();
@@ -135,8 +143,7 @@ public class TestS3FileIOCatalogTransaction extends CatalogTransactionTests<File
         "s3://" + testBucket + "/" + uniqTestRun + "/" + testName + "_" + info.getDisplayName();
     cleanupWarehouseLocation();
 
-    final S3Client client = s3Client;
-    final S3FileIO io = new S3FileIO(() -> client);
+    final S3FileIO io = new S3FileIO(newClient);
     io.initialize(Maps.newHashMap());
     final String location = warehouseLocation + "/catalog";
 

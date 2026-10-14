@@ -113,7 +113,7 @@ public class ADLSCatalogTest extends CatalogTests<FileIOCatalog> {
               + ". See docs/INTEGRATION_TESTING.md.");
     } else {
       mode = CloudMode.AZURITE;
-      azuriteContainer = new AzuriteContainer();
+      azuriteContainer = new AzuriteContainer(AzuriteEmulatorCanaries.AZURITE_IMAGE);
       azuriteContainer.start();
       account = AzuriteContainer.ACCOUNT;
       container = AzuriteContainer.STORAGE_CONTAINER;

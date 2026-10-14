@@ -34,14 +34,14 @@ import org.junit.jupiter.api.Assumptions;
  */
 public enum CloudMode {
   REAL_S3,
-  MINIO,
+  VERSITYGW,
   REAL_ADLS,
   AZURITE,
   REAL_GCS,
   FAKE_GCS;
 
   public boolean isEmulator() {
-    return this == MINIO || this == AZURITE || this == FAKE_GCS;
+    return this == VERSITYGW || this == AZURITE || this == FAKE_GCS;
   }
 
   public boolean isRealCloud() {

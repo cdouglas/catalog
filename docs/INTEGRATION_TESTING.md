@@ -2,7 +2,7 @@
 
 The `aws/`, `gcp/`, and `azure/` test packages run as JUnit integration tests
 via Maven Failsafe (`mvn verify`). By default each provider falls back to a
-local Testcontainers emulator (MinIO / fake-gcs-server / Azurite); set the
+local Testcontainers emulator (versitygw / fake-gcs-server / Azurite); set the
 provider's env vars to run against the real service instead.
 
 ## Modes

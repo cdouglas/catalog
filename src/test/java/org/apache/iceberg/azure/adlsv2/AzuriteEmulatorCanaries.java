@@ -51,14 +51,20 @@ import org.junit.jupiter.api.condition.DisabledIfEnvironmentVariable;
  * to the test suite — for example, if AppendBlob flush-position validation turns out
  * to be unimplemented and we end up skipping the append-mode tests on Azurite.
  */
-@DisabledIfEnvironmentVariable(named = "AZURE_SAS_CREDENTIALS_FILE", matches = ".+")
+@DisabledIfEnvironmentVariable(named = "AZURE_STORAGE_ACCOUNT", matches = ".+")
 public class AzuriteEmulatorCanaries {
+
+  // Pinned here rather than taking iceberg-azure's AzuriteContainer default (3.30.0): Azurite
+  // rejects any x-ms-version newer than it knows, and the azure-sdk-bom this module imports
+  // sends 2025-07-05. 3.37.0 accepts up to 2026-06-06. Bumping this tag (or the BOM) is the
+  // trigger to re-check these canaries.
+  public static final String AZURITE_IMAGE = "mcr.microsoft.com/azure-storage/azurite:3.37.0";
 
   private static AzuriteContainer container;
 
   @BeforeAll
   static void setUp() {
-    container = new AzuriteContainer();
+    container = new AzuriteContainer(AZURITE_IMAGE);
     container.start();
     container.createStorageContainer();
   }

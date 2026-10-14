@@ -39,7 +39,50 @@
     <junit.version>5.10.1</junit.version>
     <assertj.version>3.24.2</assertj.version>
     <mockito.version>4.11.0</mockito.version>
+    <!-- Cloud SDK and Jackson BOMs: keep in step with iceberg/gradle/libs.versions.toml
+         (awssdk-bom, azuresdk-bom, google-libraries-bom, jackson-bom), so the tests run
+         iceberg's cloud FileIOs against the SDK versions they were compiled against. -->
+    <awssdk.bom.version>2.33.0</awssdk.bom.version>
+    <azuresdk.bom.version>1.2.37</azuresdk.bom.version>
+    <google.libraries.bom.version>26.80.0</google.libraries.bom.version>
+    <jackson.bom.version>2.19.2</jackson.bom.version>
+    <testcontainers.version>1.21.4</testcontainers.version>
   </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <!-- First import wins on overlap: Jackson first so azure-core's
+           jackson-dataformat-xml matches jackson-databind. -->
+      <dependency>
+        <groupId>com.fasterxml.jackson</groupId>
+        <artifactId>jackson-bom</artifactId>
+        <version>${jackson.bom.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>software.amazon.awssdk</groupId>
+        <artifactId>bom</artifactId>
+        <version>${awssdk.bom.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>com.azure</groupId>
+        <artifactId>azure-sdk-bom</artifactId>
+        <version>${azuresdk.bom.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>com.google.cloud</groupId>
+        <artifactId>libraries-bom</artifactId>
+        <version>${google.libraries.bom.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
 
   <dependencies>
     <!-- Iceberg dependencies -->
@@ -164,13 +207,6 @@
     <dependency>
       <groupId>com.google.cloud</groupId>
       <artifactId>google-cloud-storage</artifactId>
-      <version>2.50.0</version>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>com.google.cloud</groupId>
-      <artifactId>google-cloud-nio</artifactId>
-      <version>0.127.29</version>
       <scope>test</scope>
     </dependency>
 
@@ -178,13 +214,7 @@
     <dependency>
       <groupId>org.testcontainers</groupId>
       <artifactId>testcontainers</artifactId>
-      <version>1.21.3</version>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>org.testcontainers</groupId>
-      <artifactId>minio</artifactId>
-      <version>1.21.3</version>
+      <version>${testcontainers.version}</version>
       <scope>test</scope>
     </dependency>
 
@@ -198,20 +228,17 @@
     <dependency>
       <groupId>software.amazon.awssdk</groupId>
       <artifactId>s3</artifactId>
-      <version>2.33.0</version>
       <scope>test</scope>
     </dependency>
     <dependency>
       <groupId>software.amazon.awssdk</groupId>
       <artifactId>sts</artifactId>
-      <version>2.33.0</version>
       <scope>test</scope>
     </dependency>
     <dependency>
       <!-- iceberg-aws's AwsClientFactories static init references KMS model classes -->
       <groupId>software.amazon.awssdk</groupId>
       <artifactId>kms</artifactId>
-      <version>2.33.0</version>
       <scope>test</scope>
     </dependency>
 
@@ -232,13 +259,11 @@
     <dependency>
       <groupId>com.azure</groupId>
       <artifactId>azure-storage-file-datalake</artifactId>
-      <version>12.18.1</version>
       <scope>test</scope>
     </dependency>
     <dependency>
       <groupId>com.azure</groupId>
       <artifactId>azure-identity</artifactId>
-      <version>1.11.1</version>
       <scope>test</scope>
     </dependency>
   </dependencies>
@@ -277,20 +302,14 @@
 
       <!-- Integration tests (S3, GCS, ADLS): mvn verify (Docker required for the
            emulator fallbacks; use -DskipITs to skip). With AWS_ACCESS_KEY_ID,
-           AZURE_SAS_CREDENTIALS_FILE, or GOOGLE_APPLICATION_CREDENTIALS set, the
-           corresponding suite hits the real service instead of its emulator.
-           api.version pins the docker-java client API to a version recent Docker
-           daemons still accept; without it Docker Engine 25+ rejects the default
-           probe with HTTP 400. -->
+           AZURE_STORAGE_ACCOUNT, or GOOGLE_APPLICATION_CREDENTIALS set, the
+           corresponding suite hits the real service instead of its emulator. -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-failsafe-plugin</artifactId>
         <version>3.2.2</version>
         <configuration>
           <useModulePath>false</useModulePath>
-          <systemPropertyVariables>
-            <api.version>1.44</api.version>
-          </systemPropertyVariables>
           <includes>
             <include>**/aws/**</include>
             <include>**/gcp/**</include>

@@ -107,7 +107,7 @@ workload motivates it independently.
 ### T3. Cloud integration tests rely on emulators for some behaviour
 
 `mvn verify` runs the S3, ADLS, and GCS integration tests against
-Testcontainers emulators by default (MinIO, Azurite, fake-gcs-server),
+Testcontainers emulators by default (versitygw, Azurite, fake-gcs-server),
 falling back to live cloud when the provider's env vars are set.
 `mvn verify -Preal-cloud` requires live cloud and fails fast if any
 required env var is missing. See [INTEGRATION_TESTING.md](INTEGRATION_TESTING.md)
@@ -123,10 +123,15 @@ canary fails and the upgrader knows to delete the workaround.
 
 **Residual gaps guarded by canaries:**
 
-- **MinIO**: no S3 directory-bucket semantics. APPEND-mode commits
-  (`maxAppendCount > 0`) skip on MinIO; `MinIOEmulatorCanaries` asserts
-  `writeOffsetBytes` is still rejected and that `If-Match` preconditions
-  are still honoured (catches silent-ignore regressions).
+- **versitygw** (replaced MinIO, whose images stopped being published and
+  were removed from Docker Hub in 2026-09): no S3 directory-bucket
+  semantics; `writeOffsetBytes` is accepted and ignored (the object is
+  overwritten). APPEND-mode commits (`maxAppendCount > 0`) skip on
+  versitygw; `VersityGwEmulatorCanaries` asserts the gap, and positive
+  canaries check that `If-Match` / `If-None-Match: *` are enforced and that
+  concurrent conditional PUTs have exactly one winner. No S3 emulator
+  implements S3 Express append (checked 2026-10: versitygw, SeaweedFS and
+  LocalStack ignore or lack it; RustFS rejects it with 501).
 - **Azurite**: `DataLakeFileClient.uploadWithResponse` returns HTTP 400
   on a non-existent path; real ADLS auto-creates the file. Every test in
   `ADLSCatalogTest` / `ADLSFileIOCatalogTransactionTests` writes the
