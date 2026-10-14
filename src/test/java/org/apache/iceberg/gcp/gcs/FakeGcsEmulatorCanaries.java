@@ -24,6 +24,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import com.google.cloud.NoCredentials;
 import com.google.cloud.storage.Blob;
 import com.google.cloud.storage.BlobInfo;
+import com.google.cloud.storage.BlobWriteSession;
 import com.google.cloud.storage.BucketInfo;
 import com.google.cloud.storage.Storage;
 import com.google.cloud.storage.StorageException;
@@ -32,7 +33,10 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.nio.ByteBuffer;
+import java.nio.channels.WritableByteChannel;
 import java.util.UUID;
+import java.util.concurrent.ExecutionException;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -41,23 +45,25 @@ import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.utility.DockerImageName;
 
 /**
- * Canaries for fake-gcs-server's <em>current</em> behaviour. The catalog itself uses
- * standard-bucket CAS via {@code BlobWriteSession} with {@code generationMatch}; on the
- * happy path fake-gcs-server emulates this and the {@link GCSCatalogTest} suite needs
- * no skips. The single positive canary below guards against silent regressions where
- * a future image accepts our writes but ignores the generation precondition — which
- * would turn the CAS suite into uniform false-green.
+ * Canaries for fake-gcs-server's <em>current</em> behaviour. The catalog's standard-bucket
+ * CAS pins each write with {@code generationMatch}. fake-gcs-server enforces that on
+ * multipart uploads ({@code storage.create}) and, since 1.55.0, on resumable uploads
+ * ({@code BlobWriteSession}, {@code WriteChannel}); 1.49.2 silently ignored it on the
+ * resumable path, so every conflict test in {@link GCSCatalogTest} failed on the emulator.
+ * Both canaries below are positive: they guard against a future image that accepts our
+ * writes but ignores the precondition, which would turn the CAS suite into uniform
+ * false-green (or, as with 1.49.2, uniform false-red).
  *
- * <p>When this canary fires after a fake-gcs-server image bump in
- * {@link GCSCatalogTest}, treat the run as untrusted until the cause is understood:
- * either the emulator regressed, or our generation tracking changed shape.
+ * <p>When a canary fires after a fake-gcs-server image bump in {@link GCSCatalogTest},
+ * treat the run as untrusted until the cause is understood: either the emulator
+ * regressed, or our generation tracking changed shape.
  */
 @DisabledIfEnvironmentVariable(named = "GOOGLE_APPLICATION_CREDENTIALS", matches = ".+")
 public class FakeGcsEmulatorCanaries {
 
   // Pin a specific fake-gcs-server image tag so canary results are reproducible.
   // Bumping this tag triggers the canary — when it fires, fake-gcs-server changed.
-  private static final String FAKE_GCS_IMAGE = "fsouza/fake-gcs-server:1.49.2";
+  private static final String FAKE_GCS_IMAGE = "fsouza/fake-gcs-server:1.56.1";
   private static final int FAKE_GCS_PORT = 4443;
   private static final String BUCKET = "canary-bucket";
 
@@ -137,5 +143,39 @@ public class FakeGcsEmulatorCanaries {
                 + "as unreliable until the emulator is fixed or replaced.")
         .isInstanceOf(StorageException.class)
         .satisfies(ex -> assertThat(((StorageException) ex).getCode()).isEqualTo(412));
+  }
+
+  /**
+   * CANARY (positive): fake-gcs-server must enforce {@code ifGenerationMatch} on resumable
+   * uploads too. The precondition travels on the upload's initiate request and is applied
+   * at finalize; fake-gcs-server before 1.55.0 dropped it there and overwrote the stale
+   * generation. Same shape as {@link #fakeGcsEnforcesGenerationMatch}, through {@code
+   * BlobWriteSession}.
+   */
+  @Test
+  void fakeGcsEnforcesGenerationMatchOnResumableUpload() throws IOException {
+    String name = "canary/gen-match-resumable/" + UUID.randomUUID();
+    BlobInfo info = BlobInfo.newBuilder(BUCKET, name).build();
+    Blob v1 = storage.create(info, "v1".getBytes());
+    long staleGen = v1.getGeneration();
+    storage.create(info, "v2".getBytes()); // overwrites, advances generation
+    BlobWriteSession session =
+        storage.blobWriteSession(info, Storage.BlobWriteOption.generationMatch(staleGen));
+    try (WritableByteChannel channel = session.open()) {
+      channel.write(ByteBuffer.wrap("v3".getBytes()));
+    } catch (StorageException e) {
+      // Some SDK versions surface the finalize failure from close(); getResult() below
+      // carries the same failure either way.
+    }
+    assertThatThrownBy(() -> session.getResult().get())
+        .as(
+            "fake-gcs-server accepted a resumable upload pinned to a stale generation. "
+                + "GCSFileIO's CAS writes go through BlobWriteSession. Treat the run as "
+                + "unreliable until the emulator is fixed or replaced.")
+        .isInstanceOf(ExecutionException.class)
+        .cause()
+        .isInstanceOf(StorageException.class)
+        .satisfies(ex -> assertThat(((StorageException) ex).getCode()).isEqualTo(412));
+    assertThat(new String(storage.readAllBytes(info.getBlobId()))).isEqualTo("v2");
   }
 }

@@ -135,11 +135,15 @@ canary fails and the upgrader knows to delete the workaround.
   asserts the gap; the positive
   `AzuriteEmulatorCanaries#azuriteEnforcesIfMatchPrecondition` guards
   against silent `If-Match` regressions.
-- **fake-gcs-server**: standard-bucket CAS path works.
-  `FakeGcsEmulatorCanaries` carries a positive canary for
-  `ifGenerationMatch` enforcement. The GCS Rapid stage-and-move path
-  (`blobAppendableUpload` + `moveBlob` with dual generations) is not
-  exercised by `GCSCatalogTest`, so no negative canary is needed today.
+- **fake-gcs-server** (1.56.1): standard-bucket CAS path works.
+  Before 1.55.0 it ignored `ifGenerationMatch` on resumable uploads
+  (`BlobWriteSession`, `WriteChannel`), the path `GCSFileIO` uses, so the
+  six conflict tests in each `GCSCatalogTest*` class failed on the
+  emulator. `FakeGcsEmulatorCanaries` carries positive canaries for
+  `ifGenerationMatch` on both multipart (`storage.create`) and resumable
+  uploads. The GCS Rapid stage-and-move path (`blobAppendableUpload` +
+  `moveBlob` with dual generations) is not exercised by `GCSCatalogTest`:
+  fake-gcs-server has no appendable objects, gRPC v2 or `moveObject`.
 
 ### T4. `testRegisterTable` (inline) needs a register-from-bytes API
 

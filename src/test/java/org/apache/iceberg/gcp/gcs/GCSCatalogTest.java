@@ -58,7 +58,7 @@ import org.testcontainers.utility.DockerImageName;
 @ExtendWith(GCSCatalogTest.SuccessCleanupExtension.class)
 public class GCSCatalogTest extends CatalogTests<FileIOCatalog> {
   private static final Logger LOG = LoggerFactory.getLogger(GCSCatalogTest.class);
-  private static final String FAKE_GCS_IMAGE = "fsouza/fake-gcs-server:1.49.2";
+  private static final String FAKE_GCS_IMAGE = "fsouza/fake-gcs-server:1.56.1";
   private static final int FAKE_GCS_PORT = 4443;
   // Path prefix inside the bucket; the bucket itself comes from the env or is created
   // on the fake-gcs-server emulator.
