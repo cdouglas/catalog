@@ -67,35 +67,6 @@ public final class ProtoCatalogFormatTestSupport {
   }
 
   /**
-   * Encodes a {@link ProtoCatalogFile} to full LCAT wire bytes, with the
-   * supplied {@code inlineCodecTag} recorded for documentation purposes.
-   *
-   * <p>For pointer-mode catalogs (all tables are pointer-mode, no inline
-   * metadata), the {@code inlineCodecTag} has no observable effect on the
-   * produced bytes: the codec field only appears inside an inline-table
-   * record, and pointer-mode states have none.  The overload exists so that
-   * {@code P3_crossCodecEquivalence} in {@link org.apache.iceberg.io.spec.CodecProperties}
-   * can route through two nominally distinct code paths
-   * ({@link InlineMetadataCodecs#TAG_JSON_GZIP} vs
-   * {@link InlineMetadataCodecs#TAG_STRUCTURAL}) and assert that both produce
-   * logically equivalent decoded states.  Once inline-table generators are
-   * added in a later task, the two tags will produce genuinely different wire
-   * bytes, making P3 non-trivially meaningful.
-   *
-   * @param catalog      the catalog state to encode
-   * @param inlineCodecTag one of {@link InlineMetadataCodecs#TAG_JSON_GZIP} or
-   *                       {@link InlineMetadataCodecs#TAG_STRUCTURAL}
-   */
-  public static byte[] encodeFullFile(ProtoCatalogFile catalog, byte inlineCodecTag) {
-    // Validate the tag so callers learn about unknown values immediately.
-    InlineMetadataCodecs.byTag(inlineCodecTag & 0xFF);
-    // For pointer-mode states the codec tag has no effect; the encoding is
-    // identical to the single-argument overload.  Future inline-mode support
-    // will route the tag into Mut.createTableInline() calls.
-    return encodeFullFile(catalog);
-  }
-
-  /**
    * Decodes a full LCAT file (as produced by {@link #encodeFullFile}) back to a
    * {@link ProtoCatalogFile}, replaying any appended transaction records.
    *

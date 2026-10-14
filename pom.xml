@@ -146,8 +146,7 @@
       <scope>test</scope>
     </dependency>
 
-    <!-- jqwik: property-based testing for V1b protocol-correctness suite. See
-         docs/superpowers/specs/2026-10-10-v1-protocol-correctness-design.md -->
+    <!-- jqwik: property-based tests in org.apache.iceberg.io.spec -->
     <dependency>
       <groupId>net.jqwik</groupId>
       <artifactId>jqwik</artifactId>
