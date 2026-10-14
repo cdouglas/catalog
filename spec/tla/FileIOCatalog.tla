@@ -1,7 +1,12 @@
 ---- MODULE FileIOCatalog ----
 EXTENDS Integers, Sequences, FiniteSets, TLC
 
-CONSTANTS Writers, Tables, MaxLog, MaxRetries
+CONSTANTS Writers, Tables, MaxLog, MaxRetries,
+          \* TRUE: entity ids are bound at replay (the protocol since 808bca7).
+          \* FALSE: writers bind them from their snapshot (the pre-808bca7 bug).
+          LateBinding
+
+ASSUME LateBinding \in BOOLEAN
 
 (* --algorithm FileIOCatalog
 
@@ -23,12 +28,22 @@ define
   \* Union of all entity ids allocated by committed transactions in `view`.
   AllocatedIds(view) ==
     UNION { t.created : t \in view.committed }
-  \* Writer-local id allocation from a snapshot: pick max(allocated)+1, or 1
-  \* if nothing has committed yet. This mirrors the pre-808bca7 buggy path
-  \* where two writers reading the same snapshot collide on the same id.
+  \* Next entity id in `view`: max(allocated)+1, or 1 if nothing has
+  \* committed yet. Applied to a writer's snapshot it is the pre-808bca7 eager
+  \* allocation, where two writers reading the same snapshot collide; applied
+  \* at replay it is late binding (see Bind).
   NextIdFrom(view) ==
     IF AllocatedIds(view) = {} THEN 1
     ELSE (CHOOSE n \in AllocatedIds(view): \A m \in AllocatedIds(view): m <= n) + 1
+  \* Binds a record's entity ids against `state`, the catalog the record is
+  \* replayed on top of. With LateBinding the writer's record carries no
+  \* concrete ids (production writes negative placeholders) and replay binds
+  \* them in log order. Replay is a deterministic fold over the file, so
+  \* binding when the record lands -- against the checkpoint plus the log
+  \* prefix before it -- gives the ids every reader assigns. Without
+  \* LateBinding the writer already bound them when it read.
+  Bind(txn, state) ==
+    IF LateBinding THEN [txn EXCEPT !.created = {NextIdFrom(state)}] ELSE txn
   \* UUIDs projected from a set of transaction records.
   UuidsOf(S) == { t.uuid : t \in S }
   \* Compaction result: committed set grows by the new txn record, log is
@@ -55,8 +70,10 @@ begin
           myUuid := nextUuid;
           nextUuid := nextUuid + 1;
         end if;
-        \* Eager snapshot-local id allocation (the buggy behaviour).
-        myTxn := [uuid |-> myUuid, created |-> {NextIdFrom(myView)}];
+        \* With LateBinding the record carries no concrete ids until replay
+        \* binds them; otherwise the writer allocates from its snapshot.
+        myTxn := [uuid |-> myUuid,
+                  created |-> IF LateBinding THEN {} ELSE {NextIdFrom(myView)}];
       Decide:
         if MustCAS(myView) then
           goto DoCAS;
@@ -68,7 +85,9 @@ begin
           terminalResult[self] := "committed";
           goto Finish;  \* Already committed by a previous attempt.
         elsif storage.etag = myView.etag then
-          storage := Compact(myView, myTxn);
+          \* The new checkpoint is the writer's view; replay binds the record
+          \* written after it against that checkpoint.
+          storage := Compact(myView, Bind(myTxn, myView));
           terminalResult[self] := "committed";
           goto Finish;
         else
@@ -82,12 +101,12 @@ begin
         else
           \* Append always lands: content-addressed storage returns the
           \* actual landing offset, so a stale view does not fail the write.
-          \* Replay/verify is what rejects conflicting records (not modelled
-          \* here; see MC_ids_bug for the id-collision bug this exposes).
+          \* Replay binds the record's ids against the log before it (Bind);
+          \* replay's verify of action preconditions is not modelled.
           storage := [storage EXCEPT
                       !.length = @ + 1,
-                      !.log = Append(@, myTxn),
-                      !.committed = @ \cup {myTxn}];
+                      !.log = Append(@, Bind(myTxn, storage)),
+                      !.committed = @ \cup {Bind(myTxn, storage)}];
           terminalResult[self] := "committed";
           goto Finish;
         end if;
@@ -99,7 +118,7 @@ begin
 end process;
 
 end algorithm; *)
-\* BEGIN TRANSLATION (chksum(pcal) = "c4360955" /\ chksum(tla) = "c85d0e82")
+\* BEGIN TRANSLATION (chksum(pcal) = "8bba3a9a" /\ chksum(tla) = "fa031284")
 VARIABLES pc, storage, nextUuid, terminalResult
 
 (* define statement *)
@@ -111,9 +130,19 @@ AllocatedIds(view) ==
 
 
 
+
 NextIdFrom(view) ==
   IF AllocatedIds(view) = {} THEN 1
   ELSE (CHOOSE n \in AllocatedIds(view): \A m \in AllocatedIds(view): m <= n) + 1
+
+
+
+
+
+
+
+Bind(txn, state) ==
+  IF LateBinding THEN [txn EXCEPT !.created = {NextIdFrom(state)}] ELSE txn
 
 UuidsOf(S) == { t.uuid : t \in S }
 
@@ -156,7 +185,8 @@ Read(self) == /\ pc[self] = "Read"
                          /\ nextUuid' = nextUuid + 1
                     ELSE /\ TRUE
                          /\ UNCHANGED << nextUuid, myUuid >>
-              /\ myTxn' = [myTxn EXCEPT ![self] = [uuid |-> myUuid'[self], created |-> {NextIdFrom(myView'[self])}]]
+              /\ myTxn' = [myTxn EXCEPT ![self] = [uuid |-> myUuid'[self],
+                                                   created |-> IF LateBinding THEN {} ELSE {NextIdFrom(myView'[self])}]]
               /\ pc' = [pc EXCEPT ![self] = "Decide"]
               /\ UNCHANGED << storage, terminalResult, attempt >>
 
@@ -173,7 +203,7 @@ DoCAS(self) == /\ pc[self] = "DoCAS"
                           /\ pc' = [pc EXCEPT ![self] = "Finish"]
                           /\ UNCHANGED << storage, attempt >>
                      ELSE /\ IF storage.etag = myView[self].etag
-                                THEN /\ storage' = Compact(myView[self], myTxn[self])
+                                THEN /\ storage' = Compact(myView[self], Bind(myTxn[self], myView[self]))
                                      /\ terminalResult' = [terminalResult EXCEPT ![self] = "committed"]
                                      /\ pc' = [pc EXCEPT ![self] = "Finish"]
                                      /\ UNCHANGED attempt
@@ -189,8 +219,8 @@ DoAppend(self) == /\ pc[self] = "DoAppend"
                              /\ UNCHANGED storage
                         ELSE /\ storage' = [storage EXCEPT
                                             !.length = @ + 1,
-                                            !.log = Append(@, myTxn[self]),
-                                            !.committed = @ \cup {myTxn[self]}]
+                                            !.log = Append(@, Bind(myTxn[self], storage)),
+                                            !.committed = @ \cup {Bind(myTxn[self], storage)}]
                              /\ terminalResult' = [terminalResult EXCEPT ![self] = "committed"]
                              /\ pc' = [pc EXCEPT ![self] = "Finish"]
                   /\ UNCHANGED << nextUuid, attempt, myView, myUuid, myTxn >>
@@ -252,9 +282,8 @@ S3_IdempotentReplay ==
     (storage.log[i].uuid = storage.log[j].uuid) => (i = j)
 
 \* S4: no entity id is allocated by two distinct committed transactions.
-\* Expected to FAIL under eager snapshot-local id allocation: two writers
-\* that read the same snapshot pick the same `nextId` and both append.
-\* Fixed in production code 808bca7 by late binding at replay.
+\* Holds with LateBinding. Without it (MC_ids_bug) two writers that read the
+\* same snapshot pick the same id and both append: the bug fixed in 808bca7.
 S4_UniqueEntityIds ==
   \A t1, t2 \in storage.committed:
     (t1.uuid # t2.uuid) => (t1.created \cap t2.created = {})
