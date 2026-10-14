@@ -31,6 +31,7 @@ import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 
@@ -158,20 +159,25 @@ public abstract class CatalogFile {
         throw new AlreadyExistsException(
             "Cannot create namespace %s. Namespace already exists", namespace);
       }
+      // Missing ancestors are created with the namespace. An ancestor that this
+      // transaction drops cannot gain a child, whether or not the snapshot has it.
+      List<Namespace> missing = Lists.newArrayList();
       for (Namespace ancestor = parentOf(namespace);
-          !ancestor.isEmpty() && !original.containsNamespace(ancestor);
+          !ancestor.isEmpty();
           ancestor = parentOf(ancestor)) {
-        if (namespaces.containsKey(ancestor)) {
-          if (!namespaces.get(ancestor)) {
-            throw new IllegalStateException(
-                String.format(
-                    "Cannot create namespace %s. Parent namespace %s is marked for deletion",
-                    namespace, ancestor));
-          }
+        Boolean pending = namespaces.get(ancestor);
+        if (Boolean.FALSE.equals(pending)) {
+          throw new IllegalStateException(
+              String.format(
+                  "Cannot create namespace %s. Parent namespace %s is marked for deletion",
+                  namespace, ancestor));
+        }
+        if (pending != null || original.containsNamespace(ancestor)) {
           break;
         }
-        namespaces.put(ancestor, true);
+        missing.add(ancestor);
       }
+      missing.forEach(ancestor -> namespaces.put(ancestor, true));
       namespaces.put(namespace, true);
       namespaceProperties.put(namespace, properties);
       return self();

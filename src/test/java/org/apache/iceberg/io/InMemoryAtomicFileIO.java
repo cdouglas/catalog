@@ -108,6 +108,11 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
     return objects.size();
   }
 
+  /** Stores {@code bytes} at {@code location} unconditionally, as a new generation. */
+  public void seed(String location, byte[] bytes) {
+    put(location, bytes.clone());
+  }
+
   /** The strategy of every successful conditional write, per location, in commit order. */
   public synchronized Map<String, List<AtomicOutputFile.Strategy>> conditionalWrites() {
     ImmutableMap.Builder<String, List<AtomicOutputFile.Strategy>> copy = ImmutableMap.builder();

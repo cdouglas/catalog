@@ -2151,15 +2151,79 @@ public class ProtoCodec {
       // Every late-bound reference must follow the create that defines it;
       // otherwise apply could not bind it. Reject the record, don't fail the read.
       IdBinding ids = new IdBinding(builder);
+      List<Action> bound = new ArrayList<>(actions.size());
       try {
         for (Action action : actions) {
-          action.bind(ids);
+          bound.add(action.bind(ids));
         }
       } catch (IllegalStateException e) {
         return false;
       }
+      if (!selfConsistent(bound)) {
+        return false;
+      }
       for (Action action : actions) {
         if (!action.verify(builder)) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    /**
+     * Whether no action references a namespace or table that another action of
+     * this transaction drops. Every action verifies against the state before
+     * the transaction, so such a record would pass verify and then apply to an
+     * inconsistent state (a namespace or table whose parent is gone) that no
+     * read could build. Reject the record, don't fail the read.
+     */
+    private static boolean selfConsistent(List<Action> actions) {
+      Set<Integer> droppedNamespaces = new HashSet<>();
+      Set<Integer> droppedTables = new HashSet<>();
+      for (Action action : actions) {
+        if (action instanceof DropNamespaceAction) {
+          droppedNamespaces.add(((DropNamespaceAction) action).id);
+        } else if (action instanceof DropTableAction) {
+          droppedTables.add(((DropTableAction) action).id);
+        }
+      }
+      if (droppedNamespaces.isEmpty() && droppedTables.isEmpty()) {
+        return true;
+      }
+      for (Action action : actions) {
+        final int namespace;
+        final int table;
+        if (action instanceof CreateNamespaceAction) {
+          namespace = ((CreateNamespaceAction) action).parentId;
+          table = -1;
+        } else if (action instanceof SetNamespacePropertyAction) {
+          namespace = ((SetNamespacePropertyAction) action).namespaceId;
+          table = -1;
+        } else if (action instanceof RemoveNamespacePropertyAction) {
+          namespace = ((RemoveNamespacePropertyAction) action).namespaceId;
+          table = -1;
+        } else if (action instanceof CreateTableAction) {
+          namespace = ((CreateTableAction) action).namespaceId;
+          table = -1;
+        } else if (action instanceof CreateTableInlineAction) {
+          namespace = ((CreateTableInlineAction) action).namespaceId;
+          table = -1;
+        } else if (action instanceof RenameTableAction) {
+          namespace = ((RenameTableAction) action).newNamespaceId;
+          table = ((RenameTableAction) action).id;
+        } else if (action instanceof UpdateTableLocationAction) {
+          namespace = -1;
+          table = ((UpdateTableLocationAction) action).id;
+        } else if (action instanceof UpdateTableInlineAction) {
+          namespace = -1;
+          table = ((UpdateTableInlineAction) action).id;
+        } else if (action instanceof ReadTableAction) {
+          namespace = -1;
+          table = ((ReadTableAction) action).id;
+        } else {
+          continue;
+        }
+        if (droppedNamespaces.contains(namespace) || droppedTables.contains(table)) {
           return false;
         }
       }

@@ -992,4 +992,63 @@ public class TestCatalogRegressions {
           .isInstanceOf(NoSuchNamespaceException.class);
     }
   }
+
+  // ============================================================
+  // Bug 14: a transaction could drop a namespace and create a child of it.
+  // CatalogFile.Mut checked only ancestors missing from the snapshot for a
+  // pending drop, and replay verifies every action against the state before
+  // the transaction, so both actions verified. The child landed with no
+  // parent; building the state threw, so the commit failed after its write
+  // landed and every later read of the catalog failed. Found by
+  // TestMultiWriterProperties.
+  // ============================================================
+
+  @Nested
+  class DropAndReferenceInOneTransaction {
+
+    @Test
+    void droppedNamespaceCannotGainAChild() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      ProtoCatalogFormat fmt = format(APPEND);
+      CatalogFile.Mut<ProtoCatalogFile, ?> txn = fmt.from(seed(io, fmt, "a", "b"));
+      txn.dropNamespace(Namespace.of("b"));
+      assertThatThrownBy(() -> txn.createNamespace(Namespace.of("b", "x")))
+          .isInstanceOf(IllegalStateException.class)
+          .hasMessageContaining("marked for deletion");
+    }
+
+    @Test
+    void replayRejectsARecordThatDropsWhatItReferences() throws IOException {
+      // Bypass the Mut: append the record it used to write.
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      ProtoCatalogFormat fmt = format(APPEND);
+      ProtoCatalogFile snap = seed(io, fmt, "a", "b");
+      int b = snap.namespaceId(Namespace.of("b"));
+      int version = snap.namespaceVersion(b);
+      ProtoCodec.Transaction txn =
+          new ProtoCodec.Transaction(
+              UuidV7.newUuidV7(),
+              List.of(
+                  new ProtoCodec.DropNamespaceAction(b, version),
+                  new ProtoCodec.CreateNamespaceAction(-1, 1, b, version, "x")));
+      byte[] record = ProtoCodec.encodeTransaction(txn);
+      ByteArrayOutputStream file = new ByteArrayOutputStream();
+      try (InputStream in = io.newInputFile(RACE_LOC).newStream()) {
+        file.write(in.readAllBytes());
+      }
+      for (int v = record.length; ; v >>>= 7) {
+        if ((v & ~0x7F) == 0) {
+          file.write(v);
+          break;
+        }
+        file.write((v & 0x7F) | 0x80);
+      }
+      file.write(record);
+      io.seed(RACE_LOC, file.toByteArray());
+
+      ProtoCatalogFile result = reread(io, fmt);
+      assertThat(result.containsTransaction(txn.id())).isFalse();
+      assertThat(result.namespaces()).containsExactlyInAnyOrder(Namespace.of("a"), Namespace.of("b"));
+    }
+  }
 }
