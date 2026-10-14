@@ -1051,4 +1051,71 @@ public class TestCatalogRegressions {
       assertThat(result.namespaces()).containsExactlyInAnyOrder(Namespace.of("a"), Namespace.of("b"));
     }
   }
+
+  // ============================================================
+  // Bug 15: a transaction may drop a namespace and its child; CatalogFile.Mut
+  // allows it and buildActions emits the drops in HashMap order. Replay
+  // removed each namespace's lookup entry by rebuilding its path, so a drop of
+  // the child after its parent threw: the commit failed after its write
+  // landed and every later read of the catalog failed. Removing a table whose
+  // namespace was already gone failed the same way. Found by
+  // TestMultiWriterProperties.
+  // ============================================================
+
+  @Nested
+  class DropNamespaceAndChild {
+
+    @Test
+    void transactionDropsNamespaceAndChild() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      ProtoCatalogFormat fmt = format(APPEND);
+      seed(io, fmt, "a", "b");
+      fmt.from(reread(io, fmt)).createNamespace(Namespace.of("a", "x")).commit(io);
+
+      CatalogFile.Mut<ProtoCatalogFile, ?> txn = fmt.from(reread(io, fmt));
+      txn.dropNamespace(Namespace.of("a", "x"));
+      txn.dropNamespace(Namespace.of("a"));
+      txn.commit(io);
+
+      assertThat(reread(io, fmt).namespaces()).containsExactly(Namespace.of("b"));
+    }
+
+    @ParameterizedTest(name = "parentFirst={0}")
+    @ValueSource(booleans = {true, false})
+    void replayAppliesTheDropsInEitherOrder(boolean parentFirst) {
+      ProtoCatalogFile.Builder builder =
+          ProtoCatalogFile.builder(new InMemoryInputFile(new byte[0]));
+      builder.addNamespace(1, ProtoCatalogFile.ROOT_ID, "a", 1);
+      builder.addNamespace(2, 1, "x", 1);
+      builder.addTable(1, 2, "t", 1, "mem:///a/x/t/v1.metadata.json");
+      builder.rebuildLookups();
+
+      builder.removeTable(1);
+      if (parentFirst) {
+        builder.removeNamespace(1);
+        builder.removeNamespace(2);
+      } else {
+        builder.removeNamespace(2);
+        builder.removeNamespace(1);
+      }
+
+      ProtoCatalogFile result = builder.build();
+      assertThat(result.namespaces()).isEmpty();
+      assertThat(result.tables()).isEmpty();
+    }
+
+    @Test
+    void tableRemovedAfterItsNamespace() {
+      ProtoCatalogFile.Builder builder =
+          ProtoCatalogFile.builder(new InMemoryInputFile(new byte[0]));
+      builder.addNamespace(1, ProtoCatalogFile.ROOT_ID, "a", 1);
+      builder.addTable(1, 1, "t", 1, "mem:///a/t/v1.metadata.json");
+      builder.rebuildLookups();
+
+      builder.removeNamespace(1);
+      builder.removeTable(1);
+
+      assertThat(builder.build().tables()).isEmpty();
+    }
+  }
 }

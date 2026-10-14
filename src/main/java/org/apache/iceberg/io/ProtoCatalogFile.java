@@ -20,6 +20,7 @@ package org.apache.iceberg.io;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -575,15 +576,46 @@ public class ProtoCatalogFile extends CatalogFile {
 
     public Builder removeNamespace(int id) {
       Preconditions.checkArgument(id != ROOT_ID, "Cannot remove the root namespace");
-      // Build the Namespace key before removing from namespaceById,
-      // since buildNamespace needs the entry to reconstruct the path.
-      Namespace ns = namespaceById.containsKey(id) ? buildNamespace(id) : null;
-      NsEntry entry = namespaceById.remove(id);
-      if (entry != null) {
-        namespaceLookup.remove(ns);
+      // Find the lookup key before removing from namespaceById, since the path
+      // needs the entry.
+      if (namespaceById.containsKey(id)) {
+        removeLookup(namespaceLookup, pathOrNull(id), id);
+        namespaceById.remove(id);
         nsProperties.remove(id);
       }
       return this;
+    }
+
+    /**
+     * The path of namespace {@code id}, or null if it or an ancestor is gone. A
+     * transaction that drops a namespace and its child may apply the drops in
+     * either order, so a removal cannot rely on the parent chain.
+     */
+    private Namespace pathOrNull(int id) {
+      List<String> levels = new ArrayList<>();
+      for (int cur = id; cur != ROOT_ID; ) {
+        NsEntry entry = namespaceById.get(cur);
+        if (entry == null) {
+          return null;
+        }
+        levels.add(entry.name);
+        cur = entry.parentId;
+      }
+      Collections.reverse(levels);
+      return levels.isEmpty() ? Namespace.empty() : Namespace.of(levels.toArray(new String[0]));
+    }
+
+    private static <K> void removeLookup(Map<K, Integer> lookup, K key, int id) {
+      if (key != null) {
+        lookup.remove(key);
+      } else {
+        lookup.values().remove(id);
+      }
+    }
+
+    private TableIdentifier tableKeyOrNull(TblEntry entry) {
+      Namespace ns = pathOrNull(entry.namespaceId);
+      return ns == null ? null : TableIdentifier.of(ns, entry.name);
     }
 
     public Builder updateNamespaceVersion(int id, int newVersion) {
@@ -624,8 +656,7 @@ public class ProtoCatalogFile extends CatalogFile {
     public Builder removeTable(int id) {
       TblEntry entry = tableById.remove(id);
       if (entry != null) {
-        Namespace ns = buildNamespace(entry.namespaceId);
-        tableLookup.remove(TableIdentifier.of(ns, entry.name));
+        removeLookup(tableLookup, tableKeyOrNull(entry), id);
       }
       return this;
     }
@@ -650,8 +681,7 @@ public class ProtoCatalogFile extends CatalogFile {
       if (old == null) {
         return this;
       }
-      Namespace oldNs = buildNamespace(old.namespaceId);
-      tableLookup.remove(TableIdentifier.of(oldNs, old.name));
+      removeLookup(tableLookup, tableKeyOrNull(old), id);
       tableById.put(id, new TblEntry(newNamespaceId, newName, newVersion, old.metadataLocation));
       Namespace newNs = buildNamespace(newNamespaceId);
       tableLookup.put(TableIdentifier.of(newNs, newName), id);
