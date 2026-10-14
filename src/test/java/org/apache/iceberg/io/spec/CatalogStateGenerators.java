@@ -32,13 +32,12 @@ import org.apache.iceberg.io.ProtoCatalogFile;
 import org.apache.iceberg.io.SeekableInputStream;
 
 /**
- * jqwik generators for V1b. Each generator supports shrinking. Keep generators
- * expansive (not just empty states) — see docs/superpowers/specs/
- * 2026-10-10-v1-protocol-correctness-design.md §9 "jqwik generator realism".
+ * jqwik generators for catalog states and actions.
  *
- * <p>This file starts with a minimal catalogStates() that returns an
- * empty-but-well-formed catalog. Downstream tasks (Task 4+) add richer
- * generation of namespaces, tables, inline metadata, and actions.
+ * <p>Generators are built on {@link Arbitraries#randomValue}, so they produce no
+ * edge cases and do not shrink: a failure reports the drawn value as is.
+ * States are flat (root-level namespaces only) with pointer-mode tables at
+ * version 1, no namespace properties, and no inline tables.
  */
 final class CatalogStateGenerators {
 
@@ -91,7 +90,7 @@ final class CatalogStateGenerators {
         generatedNsNames.add(nsName);
 
         int nsId = nextNsId++;
-        // parentId = 0 (root-level namespace, keeps the tree flat for Task 4).
+        // parentId = 0: root-level namespace, keeping the tree flat.
         builder.addNamespace(nsId, 0, nsName, 1);
 
         int tblCount = rng.nextInt(4); // 0, 1, 2, or 3 tables per namespace
@@ -162,12 +161,9 @@ final class CatalogStateGenerators {
    * handles the minority of races where the generator draws from an empty
    * set or produces a version mismatch.
    *
-   * <p>Adaptation: the plan spec uses {@code action.verify(CatalogFile)} and
-   * {@code action.apply(CatalogFile)}, but the real API is
-   * {@code Action.verify(ProtoCatalogFile.Builder)} /
-   * {@code Action.apply(ProtoCatalogFile.Builder)}.  The property class builds
-   * a fresh Builder from the ProtoCatalogFile snapshot to mirror what the
-   * production replay path does.
+   * <p>{@code Action.verify} / {@code Action.apply} take a
+   * {@link ProtoCatalogFile.Builder}; property classes build one from the
+   * snapshot with {@link SpecUtils#stateToBuilder}.
    *
    * <p>This generator uses only public accessors on {@code ProtoCatalogFile}:
    * {@code namespaces()}, {@code namespaceId(Namespace)},
@@ -255,37 +251,5 @@ final class CatalogStateGenerators {
     String name = randomLowercaseName(rng, 1, 8, java.util.Collections.emptyList());
     if (name == null) name = "ns" + newNsId;
     return new ProtoCodec.CreateNamespaceAction(newNsId, 1, 0, 0, name);
-  }
-
-  /**
-   * Transaction generator for P5 (virtual-ID resolution).
-   *
-   * <p>Adaptation / SKIPPED note: The plan's P5 spec calls
-   * {@code ProtoIdManager.allocate(txn)} / {@code ProtoIdManager.resolve(allocated)}
-   * as a symmetric pair. The real {@link org.apache.iceberg.io.ProtoCatalogFormat.ProtoIdManager}
-   * does not support this interface — it is a stateful sequential allocator that
-   * remaps negative virtual IDs to real IDs during {@code buildActions()}; there
-   * is no inverse {@code resolve(Transaction)} that maps real IDs back to virtuals.
-   *
-   * <p>Consequently, P5 is implemented as a compile-time placeholder that
-   * returns a trivial no-op arbitray and is tagged SKIPPED_PENDING_CLARIFICATION
-   * in the property class.  The generator is still provided here for forward
-   * compatibility when/if the production API gains a symmetric round-trip.
-   *
-   * <p>Returns 1–4 {@link ProtoCodec.Transaction} instances built from
-   * {@link ProtoCodec.CreateNamespaceAction}s with real (positive) IDs.
-   */
-  static Arbitrary<ProtoCodec.Transaction> transactions() {
-    return Arbitraries.randomValue(rng -> {
-      int count = 1 + rng.nextInt(4);
-      List<ProtoCodec.Action> actions = new ArrayList<>();
-      for (int i = 0; i < count; i++) {
-        int nsId = i + 1;
-        String name = randomLowercaseName(rng, 1, 8, java.util.Collections.emptyList());
-        if (name == null) name = "ns" + nsId;
-        actions.add(new ProtoCodec.CreateNamespaceAction(nsId, 1, 0, 0, name));
-      }
-      return new ProtoCodec.Transaction(UUID.randomUUID(), actions);
-    });
   }
 }

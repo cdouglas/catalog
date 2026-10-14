@@ -24,8 +24,8 @@ import org.apache.iceberg.io.CatalogFile;
 import org.apache.iceberg.io.ProtoCatalogFile;
 
 /**
- * Structural well-formedness check for V1b P4. Encodes the invariants from
- * docs/design.md §Invariants that hold on a single state:
+ * Structural well-formedness check for P4 ({@link TestInvariantProperties}).
+ * Encodes invariants that hold on a single state:
  *
  * <ul>
  *   <li>I5: every inline-ML sentinel has a matching pool entry (not checked
@@ -39,7 +39,7 @@ import org.apache.iceberg.io.ProtoCatalogFile;
  *   <li>Table lookup consistency: every table in {@code tables()} appears
  *       exactly once, and {@code location()} or {@code isInlineTable()} is
  *       consistent for each.</li>
- *   <li>Inline/pointer disjointness (SPEC.md:741-744): a table's metadata
+ *   <li>Inline/pointer disjointness (SPEC.md §State Model): a table's metadata
  *       lives in {@code tblInlineMetadata} OR has non-null
  *       {@code metadataLocation}, never both.</li>
  * </ul>
@@ -56,8 +56,12 @@ import org.apache.iceberg.io.ProtoCatalogFile;
  * {@code inlineMetadata(TableIdentifier)} which confirm that the inline byte
  * blob is non-empty for each inline table — a necessary (though not
  * sufficient) proxy for "the pool entry exists". The full sentinel-pool
- * consistency check would require exposing manifest-pool internals; that
- * extension is deferred to a future task.
+ * consistency check would require exposing manifest-pool internals, so it is
+ * not checked here.
+ *
+ * <p>Not checked: referential integrity (every table's namespace and every
+ * namespace's parent exist), ids below the next-id counters, and name
+ * uniqueness within a parent.
  */
 final class WellFormed {
 
@@ -79,7 +83,7 @@ final class WellFormed {
    * the manifest pool, both of which are package-private. The public API
    * only guarantees that {@code inlineMetadata(table)} returns the bytes. We
    * check the necessary proxy: if the table is inline, the bytes must be
-   * non-null and non-empty. The deep sentinel check is deferred.
+   * non-null and non-empty. The deep sentinel check is not implemented.
    */
   private static boolean sentinelImpliesPoolEntry(CatalogFile state) {
     for (TableIdentifier tbl : state.tables()) {
@@ -124,7 +128,7 @@ final class WellFormed {
   }
 
   /**
-   * Inline/pointer disjointness (SPEC.md:741-744): a table's metadata lives
+   * Inline/pointer disjointness (SPEC.md §State Model): a table's metadata lives
    * in {@code tblInlineMetadata} OR has a non-null {@code metadataLocation},
    * never both.
    *

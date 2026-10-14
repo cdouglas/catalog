@@ -57,6 +57,10 @@ final class SpecUtils {
             .setNextNamespaceId(pcf.nextNamespaceId())
             .setNextTableId(pcf.nextTableId());
 
+    // The root namespace row (id 0) is not listed by namespaces(); carry its
+    // version so top-level creates verify against the right value.
+    builder.addNamespace(0, 0, "", pcf.namespaceVersion(0));
+
     // Namespaces
     for (Namespace ns : pcf.namespaces()) {
       Integer nsId = pcf.namespaceId(ns);
