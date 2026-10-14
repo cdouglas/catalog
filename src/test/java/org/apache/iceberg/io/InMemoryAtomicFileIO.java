@@ -59,10 +59,43 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
     }
   }
 
+  /** A successful conditional write: the version it replaced and the one it wrote. */
+  public static final class Write {
+    private final String location;
+    private final AtomicOutputFile.Strategy strategy;
+    private final byte[] before;
+    private final byte[] after;
+
+    Write(String location, AtomicOutputFile.Strategy strategy, byte[] before, byte[] after) {
+      this.location = location;
+      this.strategy = strategy;
+      this.before = before;
+      this.after = after;
+    }
+
+    public String location() {
+      return location;
+    }
+
+    public AtomicOutputFile.Strategy strategy() {
+      return strategy;
+    }
+
+    /** Bytes of the replaced version, or null if the write created the object. */
+    public byte[] before() {
+      return before;
+    }
+
+    public byte[] after() {
+      return after;
+    }
+  }
+
   private final Map<String, Version> objects = new ConcurrentHashMap<>();
-  // Successful conditional writes per location, in the order they took effect.
-  private final Map<String, List<AtomicOutputFile.Strategy>> conditionalWrites =
-      Maps.newHashMap();
+  // Successful conditional writes, in the order they took effect.
+  private final List<Write> history = Lists.newArrayList();
+  private int rejectedAppends = 0;
+  private int rejectedCas = 0;
   private final AtomicLong generations = new AtomicLong(0);
   private final boolean supportsAppend;
 
@@ -92,7 +125,7 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
 
   @Override
   public AtomicOutputFile newOutputFile(InputFile replace) {
-    if (!(replace instanceof BoundInputFile)) {
+    if (!(replace instanceof BoundInputFile) || ((BoundInputFile) replace).owner() != this) {
       throw new IllegalArgumentException("Not an input file of this FileIO: " + replace);
     }
     return new ConditionalOutputFile((BoundInputFile) replace);
@@ -113,11 +146,23 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
     put(location, bytes.clone());
   }
 
+  /** Number of conditional writes rejected because the object changed, by strategy. */
+  public synchronized int rejected(AtomicOutputFile.Strategy strategy) {
+    return strategy == AtomicOutputFile.Strategy.APPEND ? rejectedAppends : rejectedCas;
+  }
+
+  /** Every successful conditional write, in the order they took effect. */
+  public synchronized List<Write> history() {
+    return ImmutableList.copyOf(history);
+  }
+
   /** The strategy of every successful conditional write, per location, in commit order. */
   public synchronized Map<String, List<AtomicOutputFile.Strategy>> conditionalWrites() {
-    ImmutableMap.Builder<String, List<AtomicOutputFile.Strategy>> copy = ImmutableMap.builder();
-    conditionalWrites.forEach((location, writes) -> copy.put(location, ImmutableList.copyOf(writes)));
-    return copy.build();
+    Map<String, List<AtomicOutputFile.Strategy>> writes = Maps.newLinkedHashMap();
+    for (Write w : history) {
+      writes.computeIfAbsent(w.location, k -> Lists.newArrayList()).add(w.strategy);
+    }
+    return ImmutableMap.copyOf(writes);
   }
 
   private synchronized Version put(String location, byte[] bytes) {
@@ -139,6 +184,10 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
       this.location = location;
       this.bound = true;
       this.version = version;
+    }
+
+    InMemoryAtomicFileIO owner() {
+      return InMemoryAtomicFileIO.this;
     }
 
     synchronized Version version() {
@@ -261,8 +310,10 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
                   "%s precondition failed at %s: expected generation %d, live %d",
                   strategy, location, expectedGen, liveGen);
           if (strategy == Strategy.APPEND) {
+            rejectedAppends += 1;
             throw new AppendException(msg, new IOException(msg));
           }
+          rejectedCas += 1;
           throw new StorageInvariantException(msg, new IOException(msg));
         }
         final byte[] next;
@@ -273,7 +324,7 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
         } else {
           next = data;
         }
-        conditionalWrites.computeIfAbsent(location, k -> Lists.newArrayList()).add(strategy);
+        history.add(new Write(location, strategy, live == null ? null : live.bytes, next));
         return new BoundInputFile(location, put(location, next));
       }
     }
