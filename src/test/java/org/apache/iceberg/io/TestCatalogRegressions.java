@@ -1355,6 +1355,122 @@ public class TestCatalogRegressions {
   }
 
   // ============================================================
+  // Bug 20: replay built an inline-ML snapshot's manifest list from its
+  // AddManifest / RemoveManifest updates, copying the parent's list only when
+  // the first such update arrived. SnapshotProducer stages the list as a delta
+  // against the parent, so a snapshot that changes no manifests (a delete
+  // that matched nothing) got an empty list, and the table lost every data
+  // file. Racing writers hit it without such a delete: a delete on an empty
+  // table, retried after a concurrent append, rebases onto the append and
+  // changes none of its manifests. Found by TestCatalogFaultProperties.
+  // ============================================================
+
+  @Nested
+  class UnchangedInlineManifestList {
+
+    private final Schema schema =
+        new Schema(Types.NestedField.required(1, "id", Types.IntegerType.get()));
+    private final TableIdentifier id = TableIdentifier.of("ns", "t");
+
+    private org.apache.iceberg.DataFile file(String name) {
+      return org.apache.iceberg.DataFiles.builder(org.apache.iceberg.PartitionSpec.unpartitioned())
+          .withPath("mem:///data/" + name + ".parquet")
+          .withFileSizeInBytes(10)
+          .withRecordCount(1)
+          .build();
+    }
+
+    private long liveFiles(Table table) throws IOException {
+      try (CloseableIterable<org.apache.iceberg.FileScanTask> tasks = table.newScan().planFiles()) {
+        return org.apache.iceberg.relocated.com.google.common.collect.Iterables.size(tasks);
+      }
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class,
+        names = {"APPEND_ML", "CAS_ML", "COMPACT_ML"})
+    void deleteThatMatchesNothingKeepsTheParentsManifests(LocalCatalogMode mode)
+        throws IOException {
+      FileIOCatalog catalog = mode.catalog(new InMemoryAtomicFileIO(), "mem:///w", "c", Map.of());
+      catalog.createNamespace(Namespace.of("ns"));
+      Table table = catalog.createTable(id, schema);
+      table.newFastAppend().appendFile(file("a")).commit();
+
+      table.newDelete().deleteFile("mem:///data/missing.parquet").commit();
+
+      assertThat(liveFiles(catalog.loadTable(id))).isEqualTo(1);
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class,
+        names = {"APPEND_ML", "CAS_ML", "COMPACT_ML"})
+    void deleteRebasedOntoARacingAppendKeepsIt(LocalCatalogMode mode) throws IOException {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog first = mode.catalog(io, "mem:///w", "c", Map.of());
+      FileIOCatalog second = mode.catalog(io, "mem:///w", "c", Map.of());
+      first.createNamespace(Namespace.of("ns"));
+      first.createTable(id, schema);
+      Table table = first.loadTable(id);
+
+      // The append lands just before the delete's first write, which then loses the race.
+      boolean[] raced = {false};
+      io.injectFaults(
+          (location, strategy) -> {
+            if (!raced[0]) {
+              raced[0] = true;
+              second.loadTable(id).newFastAppend().appendFile(file("a")).commit();
+            }
+            return Fault.NONE;
+          });
+      table.newDelete().deleteFile("mem:///data/missing.parquet").commit();
+      io.injectFaults((location, strategy) -> Fault.NONE);
+
+      assertThat(liveFiles(first.loadTable(id))).isEqualTo(1);
+    }
+
+    // One commit can add a snapshot and its child; the child builds on the parent's final list.
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class,
+        names = {"APPEND_ML", "CAS_ML", "COMPACT_ML"})
+    void twoAppendsInOneCatalogTransactionKeepBoth(LocalCatalogMode mode) throws IOException {
+      FileIOCatalog catalog = mode.catalog(new InMemoryAtomicFileIO(), "mem:///w", "c", Map.of());
+      catalog.createNamespace(Namespace.of("ns"));
+      catalog.createTable(id, schema).newFastAppend().appendFile(file("a")).commit();
+
+      org.apache.iceberg.catalog.CatalogTransaction txn =
+          catalog.createTransaction(
+              org.apache.iceberg.catalog.CatalogTransaction.IsolationLevel.SNAPSHOT);
+      txn.asCatalog().loadTable(id).newFastAppend().appendFile(file("b")).commit();
+      txn.asCatalog().loadTable(id).newFastAppend().appendFile(file("c")).commit();
+      txn.commitTransaction();
+
+      assertThat(liveFiles(catalog.loadTable(id))).isEqualTo(3);
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class,
+        names = {"APPEND_ML", "CAS_ML", "COMPACT_ML"})
+    void appendAfterADeleteThatMatchesNothingInOneTransaction(LocalCatalogMode mode)
+        throws IOException {
+      FileIOCatalog catalog = mode.catalog(new InMemoryAtomicFileIO(), "mem:///w", "c", Map.of());
+      catalog.createNamespace(Namespace.of("ns"));
+      Table table = catalog.createTable(id, schema);
+      table.newFastAppend().appendFile(file("a")).commit();
+
+      org.apache.iceberg.Transaction txn = table.newTransaction();
+      txn.newDelete().deleteFile("mem:///data/missing.parquet").commit();
+      txn.newFastAppend().appendFile(file("b")).commit();
+      txn.commitTransaction();
+
+      assertThat(liveFiles(catalog.loadTable(id))).isEqualTo(2);
+    }
+  }
+
+  // ============================================================
   // CAS rebase: a CAS that loses a race re-reads the file and retries on top
   // of the new state when the transaction's preconditions still hold there,
   // instead of failing every concurrent CAS-mode commit. A transaction that
