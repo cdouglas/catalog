@@ -26,6 +26,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -37,12 +38,14 @@ import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
 import org.apache.iceberg.exceptions.CommitFailedException;
+import org.apache.iceberg.exceptions.CommitStateUnknownException;
 import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.inmemory.InMemoryInputFile;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.types.Types;
+import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -1142,6 +1145,95 @@ public class TestCatalogRegressions {
       assertThatThrownBy(() -> txn.dropNamespace(Namespace.of("a", "x")))
           .isInstanceOf(IllegalArgumentException.class)
           .hasMessageContaining("created in this transaction");
+    }
+  }
+
+  // ============================================================
+  // Bug 17: a conditional write whose outcome the commit could not know -- it
+  // landed but the reply was lost, or reading back what it wrote failed --
+  // was reported as a definite failure: CommitFailedException from the CAS
+  // path, a raw UncheckedIOException from the append path. Iceberg deletes a
+  // commit's new files on either, so a commit that had landed lost the
+  // files its snapshot references. The commit loop now re-reads after such a
+  // failure: the record carries the transaction's id, so the commit returns
+  // as committed if it landed and retries if not, and throws
+  // CommitStateUnknownException when it cannot tell. Found by
+  // TestMultiWriterProperties with fault injection.
+  // ============================================================
+
+  @Nested
+  class AmbiguousWrites {
+
+    private void failNext(InMemoryAtomicFileIO io, Fault... faults) {
+      Iterator<Fault> plan = List.of(faults).iterator();
+      io.injectFaults((location, strategy) -> plan.hasNext() ? plan.next() : Fault.NONE);
+    }
+
+    @Test
+    void casWhoseReplyWasLostIsCommitted() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      ProtoCatalogFormat fmt = format(0);
+      ProtoCatalogFile snap = seed(io, fmt, "a");
+      int writes = io.history().size();
+
+      failNext(io, Fault.LOST_REPLY);
+      ProtoCatalogFormat.Mut mut = (ProtoCatalogFormat.Mut) fmt.from(snap);
+      mut.createNamespace(Namespace.of("c"));
+      mut.commit(io);
+
+      assertThat(io.history()).hasSize(writes + 1); // landed once, not written again
+      assertThat(reread(io, fmt).namespaces()).contains(Namespace.of("c"));
+    }
+
+    @Test
+    void appendWhoseReplyWasLostIsCommitted() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      ProtoCatalogFormat fmt = format(10_000);
+      ProtoCatalogFile snap = seed(io, fmt, "a");
+      int writes = io.history().size();
+
+      failNext(io, Fault.LOST_REPLY_RUNTIME);
+      ProtoCatalogFormat.Mut mut = (ProtoCatalogFormat.Mut) fmt.from(snap);
+      mut.createNamespace(Namespace.of("c"));
+      mut.commit(io);
+
+      assertThat(io.history()).hasSize(writes + 1);
+      assertThat(io.history().get(writes).strategy()).isEqualTo(AtomicOutputFile.Strategy.APPEND);
+      assertThat(reread(io, fmt).namespaces()).contains(Namespace.of("c"));
+    }
+
+    @Test
+    void writeThatFailedBeforeLandingIsRetried() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      ProtoCatalogFormat fmt = format(10_000);
+      ProtoCatalogFile snap = seed(io, fmt, "a");
+      int writes = io.history().size();
+
+      failNext(io, Fault.FAIL_BEFORE, Fault.FAIL_BEFORE);
+      ProtoCatalogFormat.Mut mut = (ProtoCatalogFormat.Mut) fmt.from(snap);
+      mut.createNamespace(Namespace.of("c"));
+      mut.commit(io);
+
+      assertThat(io.history()).hasSize(writes + 1);
+      assertThat(reread(io, fmt).namespaces()).contains(Namespace.of("c"));
+    }
+
+    @Test
+    void outcomeThatNeverResolvesIsCommitStateUnknown() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      ProtoCatalogFormat fmt = format(0);
+      ProtoCatalogFile snap = seed(io, fmt, "a");
+      int writes = io.history().size();
+
+      io.injectFaults((location, strategy) -> Fault.FAIL_BEFORE);
+      ProtoCatalogFormat.Mut mut = (ProtoCatalogFormat.Mut) fmt.from(snap);
+      mut.createNamespace(Namespace.of("c"));
+      // Nothing landed, but the commit cannot know that: every write might yet.
+      assertThatThrownBy(() -> mut.commit(io)).isInstanceOf(CommitStateUnknownException.class);
+
+      io.injectFaults((location, strategy) -> Fault.NONE);
+      assertThat(io.history()).hasSize(writes);
+      assertThat(reread(io, fmt).namespaces()).doesNotContain(Namespace.of("c"));
     }
   }
 

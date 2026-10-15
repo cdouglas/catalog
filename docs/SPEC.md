@@ -589,9 +589,16 @@ function COMMIT(fileIO, original, mutations):
 
     # Case 0: catalog does not exist yet
     if not current.exists():
-        return tryCAS(original, current, txnBytes, fileIO).orElseThrow(CommitFailed)
+        try:
+            return tryCAS(original, current, txnBytes, fileIO).orElseThrow(CommitFailed)
+        catch Ambiguous:
+            if txn.id in READ(fileIO, current.location).committed:
+                return it                    # the creation landed
+            throw CommitStateUnknown
 
+    ambiguous = false
     for attempt in 0..9:
+      try:
         # Must CAS when either limit is at/beyond threshold based on the
         # observable file state. (maxAppendCount=0 forces CAS on every
         # commit — useful for backends without conditional append.)
@@ -641,8 +648,39 @@ function COMMIT(fileIO, original, mutations):
                 # appendCount is now a lower bound.
                 stale = true
 
-    throw CommitFailed("exceeded retry limit")
+      catch Ambiguous:
+        # The write may have landed: its reply was lost, or reading back what
+        # it wrote failed. Its record carries txn.id, so a fresh read decides.
+        # If it has not landed, retry: a write still in flight carries the same
+        # transaction and a precondition on the version it saw, so at most one
+        # of the two lands, and replay applies txn once. A rejection stays
+        # definite: replay verifies a record against the state it lands on, so
+        # a late landing of a transaction that does not hold changes nothing.
+        ambiguous = true
+        current = fileIO.newInputFile(current.location)
+        base    = READ(fileIO, current)  # failure here: throw CommitStateUnknown
+        stale   = false
+        if txn.id in base.committed:
+            return base                  # the write landed
+        if not txn.verify(base):
+            throw conflict(base)
+
+    # After an ambiguous write, running out of attempts is not a failure: a
+    # write might yet have landed.
+    throw ambiguous ? CommitStateUnknown : CommitFailed("exceeded retry limit")
 ```
+
+A commit reports one of three outcomes, and a caller can rely on each:
+**returned** (the transaction took effect, once), **CommitFailed /
+AlreadyExists** (it did not and will not), **CommitStateUnknown** (either).
+Iceberg deletes a commit's new files on `CommitFailedException` (a
+`CleanableFailure`) and on any failure other than
+`CommitStateUnknownException`, so reporting a landed commit any other way
+loses the files its snapshot references. A write fails ambiguously when
+`writeAtomic` throws anything but the protocol's conflict and throttling
+signals (`CASException`, `AppendException`, `StorageThrottleException`), or
+when reading back what it wrote fails; `tryCAS` and `tryAppend` raise
+`Ambiguous` then.
 
 ### CAS-only Mode
 
@@ -665,9 +703,11 @@ function tryCAS(base, current, txnBytes, fileIO):
     token      = outputFile.prepare(fullFile, Strategy.CAS)
     try:
         written = outputFile.writeAtomic(token, fullFile)
-        return Some(READ(written))
     catch CASException:
         return None
+    catch other:
+        throw Ambiguous(other)          # may have landed
+    return Some(READ(written))          # a failure here: Ambiguous too
 ```
 
 `buildFullFile` creates:
@@ -691,9 +731,11 @@ function tryAppend(current, txnBytes, fileIO):
     token      = outputFile.prepare(record, Strategy.APPEND)
     try:
         written = outputFile.writeAtomic(token, record)
-        return Some(READ(written))
     catch AppendException:
         return None
+    catch other:
+        throw Ambiguous(other)          # may have landed
+    return Some(READ(written))          # a failure here: Ambiguous too
 ```
 
 ## Compaction

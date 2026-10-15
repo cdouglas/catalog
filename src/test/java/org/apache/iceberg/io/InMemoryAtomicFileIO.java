@@ -21,6 +21,7 @@ package org.apache.iceberg.io;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UncheckedIOException;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -45,8 +46,32 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
  * condition, as S3 Express does with {@code ifMatch} plus {@code writeOffsetBytes}.
  *
  * <p>Plain {@link OutputFile} writes are unconditional, as for table metadata and data files.
+ *
+ * <p>{@link #injectFaults} makes conditional writes fail the way remote storage can: before the
+ * write lands, or after it lands with the reply lost (an {@link IOException} or a runtime error, as
+ * SDKs surface either) or reported as a precondition failure (a transport retry that ran into its
+ * own write). A lost reply leaves the caller unable to tell whether the write took effect.
  */
 public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
+
+  /** How a conditional write fails, if it does. */
+  public enum Fault {
+    NONE,
+    /** Throws {@link IOException}; nothing lands. */
+    FAIL_BEFORE,
+    /** Lands, then throws {@link IOException}. */
+    LOST_REPLY,
+    /** Lands, then throws {@link UncheckedIOException}. */
+    LOST_REPLY_RUNTIME,
+    /** Lands, then throws the strategy's precondition failure, as a retry of it would. */
+    LANDED_AS_CONFLICT
+  }
+
+  /** Chooses the fault for each conditional write, in order. */
+  @FunctionalInterface
+  public interface Faults {
+    Fault next(String location, AtomicOutputFile.Strategy strategy);
+  }
 
   /** One version of an object; a new instance per write. */
   private static final class Version {
@@ -98,6 +123,8 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
   private int rejectedCas = 0;
   private final AtomicLong generations = new AtomicLong(0);
   private final boolean supportsAppend;
+  private Faults faults = (location, strategy) -> Fault.NONE;
+  private final Map<Fault, Integer> injected = Maps.newEnumMap(Fault.class);
 
   public InMemoryAtomicFileIO() {
     this(true);
@@ -134,6 +161,16 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
   @Override
   public synchronized void deleteFile(String location) {
     objects.remove(location);
+  }
+
+  /** Fails conditional writes as {@code plan} chooses; {@link Fault#NONE} for all by default. */
+  public synchronized void injectFaults(Faults plan) {
+    this.faults = plan;
+  }
+
+  /** Number of faults injected so far, by kind (excluding {@link Fault#NONE}). */
+  public synchronized int injected(Fault fault) {
+    return injected.getOrDefault(fault, 0);
   }
 
   /** Number of objects currently stored. */
@@ -301,6 +338,13 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
       Version expected = replace.version();
       String location = location();
       synchronized (InMemoryAtomicFileIO.this) {
+        Fault fault = faults.next(location, strategy);
+        if (fault != Fault.NONE) {
+          injected.merge(fault, 1, Integer::sum);
+        }
+        if (fault == Fault.FAIL_BEFORE) {
+          throw new IOException("injected: " + strategy + " at " + location + " failed before landing");
+        }
         Version live = objects.get(location);
         long expectedGen = expected == null ? 0 : expected.generation;
         long liveGen = live == null ? 0 : live.generation;
@@ -325,7 +369,22 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
           next = data;
         }
         history.add(new Write(location, strategy, live == null ? null : live.bytes, next));
-        return new BoundInputFile(location, put(location, next));
+        BoundInputFile written = new BoundInputFile(location, put(location, next));
+        String landed = "injected: " + strategy + " at " + location + " landed, but ";
+        switch (fault) {
+          case LOST_REPLY:
+            throw new IOException(landed + "the reply was lost");
+          case LOST_REPLY_RUNTIME:
+            throw new UncheckedIOException(new IOException(landed + "the reply was lost"));
+          case LANDED_AS_CONFLICT:
+            String msg = landed + "a retry of it failed its precondition";
+            if (strategy == Strategy.APPEND) {
+              throw new AppendException(msg, new IOException(msg));
+            }
+            throw new StorageInvariantException(msg, new IOException(msg));
+          default:
+            return written;
+        }
       }
     }
   }

@@ -44,12 +44,14 @@ import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
 import org.apache.iceberg.exceptions.CommitFailedException;
+import org.apache.iceberg.exceptions.CommitStateUnknownException;
 import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.io.AtomicOutputFile;
 import org.apache.iceberg.io.CatalogFile;
 import org.apache.iceberg.io.InMemoryAtomicFileIO;
+import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
 import org.apache.iceberg.io.ProtoCatalogFile;
 import org.apache.iceberg.io.ProtoCatalogFormat;
 
@@ -77,6 +79,15 @@ import org.apache.iceberg.io.ProtoCatalogFormat;
  *
  * <p>Conflicts are not asserted: rejecting a commit is always safe. The outcome statistics report
  * how often a rejected transaction would have re-executed cleanly (a spurious conflict).
+ *
+ * <p>{@link #faultyStorageNeverMisreportsACommit} runs the same schedules on storage that fails
+ * (see {@link InMemoryAtomicFileIO.Fault}): a write may not land, or land with its reply lost, or
+ * land and report a precondition failure. A writer must be able to trust a definite answer.
+ * Iceberg deletes a commit's new files on {@link CommitFailedException} (a {@code
+ * CleanableFailure}) and on any failure but {@link CommitStateUnknownException}, so a transaction
+ * reported any other way as failed must not have taken effect, and an acknowledged one took effect
+ * once. A commit may now retry, so it may write more than once; at most one of its writes changes
+ * the state, and that one is checked as above.
  */
 class TestMultiWriterProperties {
 
@@ -104,6 +115,30 @@ class TestMultiWriterProperties {
       @ForAll("schedules") List<Cmd> schedule) {
     new Run(writers, maxAppendCount, appendHeadroom).execute(schedule);
   }
+
+  @Property(tries = 300)
+  void faultyStorageNeverMisreportsACommit(
+      @ForAll @IntRange(min = 2, max = 4) int writers,
+      @ForAll("maxAppendCounts") int maxAppendCount,
+      @ForAll("appendHeadrooms") long appendHeadroom,
+      @ForAll("schedules") List<Cmd> schedule) {
+    new Run(writers, maxAppendCount, appendHeadroom, true).execute(schedule);
+  }
+
+  // A commit step's operands pick the faults for its first two conditional writes; later writes
+  // succeed. The first fails two times in three, the second one time in three.
+  private static final List<Fault> FIRST_WRITE_FAULTS =
+      List.of(
+          Fault.NONE, Fault.NONE, Fault.NONE, Fault.NONE,
+          Fault.FAIL_BEFORE, Fault.FAIL_BEFORE,
+          Fault.LOST_REPLY, Fault.LOST_REPLY,
+          Fault.LOST_REPLY_RUNTIME, Fault.LOST_REPLY_RUNTIME,
+          Fault.LANDED_AS_CONFLICT, Fault.LANDED_AS_CONFLICT);
+  private static final List<Fault> SECOND_WRITE_FAULTS =
+      List.of(
+          Fault.NONE, Fault.NONE, Fault.NONE, Fault.NONE,
+          Fault.NONE, Fault.NONE, Fault.NONE, Fault.NONE,
+          Fault.FAIL_BEFORE, Fault.LOST_REPLY, Fault.LOST_REPLY_RUNTIME, Fault.LANDED_AS_CONFLICT);
 
   @Provide
   Arbitrary<Integer> maxAppendCounts() {
@@ -418,17 +453,28 @@ class TestMultiWriterProperties {
 
   enum Outcome {
     ACKNOWLEDGED,
-    REJECTED
+    /** CommitFailedException or AlreadyExistsException: a definite no. */
+    REJECTED,
+    /** CommitStateUnknownException: the commit may or may not have taken effect. */
+    UNKNOWN,
+    /** Any other exception, after an injected fault. */
+    FAILED
   }
 
   private static final class Run {
     private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
     private final ProtoCatalogFormat format;
+    private final boolean faults;
     private final Writer[] writers;
     private final StringBuilder trace = new StringBuilder();
     private int nextValue = 0;
 
     Run(int writers, int maxAppendCount, long appendHeadroom) {
+      this(writers, maxAppendCount, appendHeadroom, false);
+    }
+
+    Run(int writers, int maxAppendCount, long appendHeadroom, boolean faults) {
+      this.faults = faults;
       CatalogFile.Mut<ProtoCatalogFile, ?> seed =
           new ProtoCatalogFormat().empty(io.newInputFile(CATALOG));
       seed.createNamespace(Namespace.of("a"));
@@ -478,7 +524,8 @@ class TestMultiWriterProperties {
             break;
           case COMMIT:
             if (w.snapshot != null) {
-              commit(w);
+              commit(w, faults ? List.of(FIRST_WRITE_FAULTS.get(cmd.a % 12),
+                  SECOND_WRITE_FAULTS.get(cmd.b % 12)) : List.of());
             }
             break;
           default:
@@ -487,7 +534,7 @@ class TestMultiWriterProperties {
       }
       for (Writer w : writers) {
         if (w.snapshot != null) {
-          commit(w);
+          commit(w, List.of());
         }
       }
     }
@@ -532,12 +579,19 @@ class TestMultiWriterProperties {
       }
     }
 
-    private void commit(Writer w) {
+    private void commit(Writer w, List<Fault> plan) {
       List<Op> ops = w.ops;
       byte[] liveBefore = liveBytes();
       int mark = io.history().size();
       int lostAppends = io.rejected(AtomicOutputFile.Strategy.APPEND);
       int lostCas = io.rejected(AtomicOutputFile.Strategy.CAS);
+      List<Fault> fired = new ArrayList<>();
+      io.injectFaults(
+          (location, strategy) -> {
+            Fault fault = fired.size() < plan.size() ? plan.get(fired.size()) : Fault.NONE;
+            fired.add(fault);
+            return fault;
+          });
       Outcome outcome;
       String reason = "";
       try {
@@ -546,53 +600,96 @@ class TestMultiWriterProperties {
       } catch (CommitFailedException | AlreadyExistsException e) {
         outcome = Outcome.REJECTED;
         reason = " (" + e.getClass().getSimpleName() + ")";
+      } catch (CommitStateUnknownException e) {
+        outcome = Outcome.UNKNOWN;
+        reason = " (" + e.getMessage() + ")";
+      } catch (RuntimeException e) {
+        if (fired.stream().allMatch(f -> f == Fault.NONE)) {
+          throw e; // not a storage fault: a bug
+        }
+        outcome = Outcome.FAILED;
+        reason = " (" + e.getClass().getSimpleName() + ": " + e.getMessage() + ")";
+      } finally {
+        io.injectFaults((location, strategy) -> Fault.NONE);
       }
       List<InMemoryAtomicFileIO.Write> writes = io.history().subList(mark, io.history().size());
-      InMemoryAtomicFileIO.Write write = writes.isEmpty() ? null : writes.get(0);
+      List<InMemoryAtomicFileIO.Write> effective = new ArrayList<>();
+      for (InMemoryAtomicFileIO.Write wr : writes) {
+        View after = View.of(parse(wr.after()));
+        check(after.equals(View.of(parse(wr.before()))) || effective.isEmpty(),
+            "one commit changed the state twice");
+        if (!after.equals(View.of(parse(wr.before())))) {
+          effective.add(wr);
+        }
+        checkIntegrity(after);
+      }
+      // The write the transaction's effects are checked on: the one that changed the state, else
+      // (for a transaction without effects) the first.
+      InMemoryAtomicFileIO.Write write =
+          !effective.isEmpty() ? effective.get(0) : writes.isEmpty() ? null : writes.get(0);
+      String faultsFired =
+          fired.stream().anyMatch(f -> f != Fault.NONE) ? " after faults " + fired : "";
       String path =
           (io.rejected(AtomicOutputFile.Strategy.CAS) > lostCas ? "lost CAS race, " : "")
               + (io.rejected(AtomicOutputFile.Strategy.APPEND) > lostAppends
                   ? "lost append race, "
                   : "")
               + (write == null ? "no write" : write.strategy() + rebased(w, write));
-      trace.append(String.format("w%d commit -> %s%s via %s%n", w.id, outcome, reason, path));
+      trace.append(String.format("w%d commit -> %s%s via %s%s%n",
+          w.id, outcome, reason, path, faultsFired));
       Statistics.label("commit path").collect(path);
       Statistics.label("operations per transaction").collect(Math.min(ops.size(), 5));
-      check(writes.size() <= 1, "one commit made %d conditional writes", writes.size());
+      if (!faults) {
+        check(writes.size() <= 1, "one commit made %d conditional writes", writes.size());
+      }
+      if (!faultsFired.isEmpty()) {
+        Statistics.label("outcome after a fault").collect(outcome);
+      }
 
-      if (outcome == Outcome.ACKNOWLEDGED) {
+      if (outcome == Outcome.ACKNOWLEDGED
+          || (outcome == Outcome.UNKNOWN && !effective.isEmpty())) {
         check(write != null, "acknowledged commit changed nothing");
-        ProtoCatalogFile pre = parse(write.before());
-        View post = View.of(parse(write.after()));
-        String invalid = reexecutionViolation(pre, ops);
-        check(invalid == null, "acknowledged transaction is invalid on the state it replaced: %s",
-            invalid);
-        InMemoryAtomicFileIO alone = scratch(write.before());
-        ProtoCatalogFile fresh = format.read(alone, alone.newInputFile(CATALOG));
-        View serial = View.of(mut(fresh, ops).commit(alone));
-        check(serial.equals(post), "serial re-execution differs:%n  serial: %s%n  actual: %s",
-            serial, post);
-        View expected = View.of(pre).copy();
-        ops.forEach(op -> op.applyTo(expected));
-        check(expected.equals(post), "effects differ:%n  expected: %s%n  actual:   %s",
-            expected, post);
-        checkIntegrity(post);
-        Statistics.label("outcome").collect("acknowledged");
+        checkTransition(write, ops);
+        Statistics.label("outcome").collect(outcome.name().toLowerCase());
+      } else if (outcome == Outcome.UNKNOWN) {
+        Statistics.label("outcome").collect("unknown, did not take effect");
       } else {
-        if (write != null) {
-          View post = View.of(parse(write.after()));
-          check(post.equals(View.of(parse(write.before()))),
-              "rejected transaction changed the state to %s", post);
-          checkIntegrity(post);
-        }
+        check(effective.isEmpty(),
+            "commit reported %s%s but took effect: %s -> %s",
+            outcome, reason,
+            effective.isEmpty() ? null : View.of(parse(effective.get(0).before())),
+            effective.isEmpty() ? null : View.of(parse(effective.get(0).after())));
         boolean spurious = reexecutionViolation(parse(liveBefore), ops) == null;
         Statistics.label("outcome").collect(
-            (write == null ? "rejected by CAS conflict" : "rejected at replay")
+            (outcome == Outcome.FAILED ? "failed"
+                : write == null ? "rejected by CAS conflict" : "rejected at replay")
                 + (spurious ? ", spurious" : ""));
       }
       w.snapshot = null;
       w.snapshotBytes = null;
       w.ops = null;
+    }
+
+    /**
+     * {@code write} took {@code ops} from the state it replaced to the state it wrote: the
+     * transaction is valid on the former, re-executes serially to the latter, and changed exactly
+     * its own effects.
+     */
+    private void checkTransition(InMemoryAtomicFileIO.Write write, List<Op> ops) {
+      ProtoCatalogFile pre = parse(write.before());
+      View post = View.of(parse(write.after()));
+      String invalid = reexecutionViolation(pre, ops);
+      check(invalid == null, "acknowledged transaction is invalid on the state it replaced: %s",
+          invalid);
+      InMemoryAtomicFileIO alone = scratch(write.before());
+      ProtoCatalogFile fresh = format.read(alone, alone.newInputFile(CATALOG));
+      View serial = View.of(mut(fresh, ops).commit(alone));
+      check(serial.equals(post), "serial re-execution differs:%n  serial: %s%n  actual: %s",
+          serial, post);
+      View expected = View.of(pre).copy();
+      ops.forEach(op -> op.applyTo(expected));
+      check(expected.equals(post), "effects differ:%n  expected: %s%n  actual:   %s",
+          expected, post);
     }
 
     /** Why {@code ops} cannot be re-executed serially on {@code state}, or null if they can. */
