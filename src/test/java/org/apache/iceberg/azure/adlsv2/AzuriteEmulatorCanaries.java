@@ -21,14 +21,15 @@ package org.apache.iceberg.azure.adlsv2;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.azure.core.util.Context;
+import com.azure.storage.blob.models.AppendBlobRequestConditions;
+import com.azure.storage.blob.models.BlobStorageException;
+import com.azure.storage.blob.specialized.AppendBlobClient;
+import com.azure.storage.blob.specialized.SpecializedBlobClientBuilder;
 import com.azure.storage.file.datalake.DataLakeFileClient;
 import com.azure.storage.file.datalake.models.DataLakeRequestConditions;
 import com.azure.storage.file.datalake.models.DataLakeStorageException;
-import com.azure.storage.file.datalake.options.DataLakeFileOutputStreamOptions;
-import com.azure.storage.file.datalake.options.FileParallelUploadOptions;
 import java.io.ByteArrayInputStream;
-import java.io.IOException;
-import java.io.OutputStream;
 import java.util.UUID;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -36,20 +37,18 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.DisabledIfEnvironmentVariable;
 
 /**
- * Canaries for Azurite's <em>current</em> behaviour. The {@link ADLSCatalogTest} suite
- * runs unmodified against Azurite today — no skips, no workarounds — so this class
- * holds only positive canaries that guard against silent regressions in the
- * preconditions the catalog's CAS path depends on.
+ * Canaries for Azurite's <em>current</em> behaviour, as it bears on {@code ADLSFileIO}'s atomic
+ * writes: the catalog file is an Append Blob, appended with a conditional {@code AppendBlock} and
+ * replaced (CAS) by renaming a staged temp onto it through the Data Lake API.
  *
- * <p>If a future Azurite image breaks {@code If-Match} enforcement, the catalog's CAS
- * tests would pass for the wrong reason. The canary below writes v1, overwrites to v2
- * without preconditions, then attempts a v3 write pinned to v1's stale ETag and
- * asserts it is rejected. A failure here after an image bump means the run cannot
- * be trusted.
- *
- * <p>New negative canaries belong here when a workaround for an Azurite gap is added
- * to the test suite — for example, if AppendBlob flush-position validation turns out
- * to be unimplemented and we end up skipping the append-mode tests on Azurite.
+ * <ul>
+ *   <li>Gap canary: Azurite has no Data Lake endpoint, so the rename fails. Every catalog write
+ *       starts with a CAS (creating the catalog file), so {@link ADLSCatalogTest} and {@link
+ *       ADLSFileIOCatalogTransactionTests} skip on Azurite.
+ *   <li>Positive canary: Azurite enforces the {@code AppendBlock} conditions the APPEND path
+ *       relies on. If it stopped, append tests would pass for the wrong reason once the gap
+ *       closes.
+ * </ul>
  */
 @DisabledIfEnvironmentVariable(named = "AZURE_STORAGE_ACCOUNT", matches = ".+")
 public class AzuriteEmulatorCanaries {
@@ -83,72 +82,80 @@ public class AzuriteEmulatorCanaries {
   }
 
   /**
-   * CANARY (positive): Azurite must enforce {@code If-Match} preconditions on
-   * {@code DataLakeFileClient} writes. The catalog's CAS path pins each write to the
-   * file's current ETag; if Azurite silently ignores the precondition, every CAS test
-   * in {@link ADLSCatalogTest} passes for the wrong reason. This canary asserts the
-   * precondition is rejected with HTTP 412 on a stale ETag.
-   */
-  /**
-   * CANARY: Azurite returns HTTP 400 (empty body) for {@code uploadWithResponse} on a
-   * path that does not yet exist. Real ADLS atomically creates the file as part of the
-   * upload. This is the gap that forces {@link ADLSCatalogTest#before} (and the
-   * transaction-test mirror) to skip every test under {@link CloudMode#AZURITE}: the
-   * catalog's very first commit writes a non-existent catalog file via
-   * {@code ADLSOutputFile.replaceDestObj}, which delegates to
-   * {@code uploadWithResponse}.
+   * CANARY: Azurite rejects a Data Lake rename (HTTP 400) and leaves the source in place. Real
+   * ADLS renames atomically, honouring the destination's {@code If-Match} / {@code If-None-Match}.
    *
-   * <p>If this canary fails, Azurite started accepting the upload (or returning a more
-   * specific status). Verify that {@code uploadWithResponse} now creates the file
-   * atomically (write content, flush, read back), drop the {@code AZURITE} skips in
-   * {@link ADLSCatalogTest#before} and the transaction-test mirror, and delete this
+   * <p>When this fails, Azurite gained a Data Lake endpoint: check that the rename is atomic and
+   * enforces destination conditions, then drop the {@code assumeRealCloud(...)} skips in {@link
+   * ADLSCatalogTest#before} and {@link ADLSFileIOCatalogTransactionTests#before} and delete this
    * canary.
    */
   @Test
-  void azuriteRejectsUploadToNonExistentPath() {
-    String name = "canary/no-create-then-upload/" + UUID.randomUUID();
-    DataLakeFileClient file = container.fileClient(name);
-    byte[] data = "v1".getBytes();
+  void azuriteRejectsDataLakeRename() {
+    DataLakeFileClient temp = container.fileClient("canary/rename/" + UUID.randomUUID() + ".tmp");
+    AppendBlobClient blob = appendBlob(temp);
+    blob.create();
+    String etag = append(blob, "v1", 0, null);
     assertThatThrownBy(
             () ->
-                file.uploadWithResponse(
-                    new FileParallelUploadOptions(new ByteArrayInputStream(data), data.length),
+                temp.renameWithResponse(
                     null,
-                    null))
+                    "canary/rename/" + UUID.randomUUID(),
+                    new DataLakeRequestConditions().setIfMatch(etag),
+                    new DataLakeRequestConditions().setIfNoneMatch("*"),
+                    null,
+                    Context.NONE))
         .as(
-            "Azurite accepted uploadWithResponse on a non-existent path. Real ADLS does "
-                + "this too — verify the file exists with the expected content, then drop "
-                + "the assumeRealCloud(AZURITE, \"DataLake uploadWithResponse...\") skips "
-                + "in ADLSCatalogTest#before and ADLSFileIOCatalogTransactionTests#before "
-                + "and delete this canary.")
+            "Azurite accepted a Data Lake rename. Verify it is atomic and honours destination "
+                + "conditions, then drop the assumeRealCloud(AZURITE, \"DataLake rename...\") "
+                + "skips and delete this canary.")
         .isInstanceOf(DataLakeStorageException.class)
         .satisfies(
             ex -> assertThat(((DataLakeStorageException) ex).getStatusCode()).isEqualTo(400));
+    assertThat(temp.exists()).isTrue();
   }
 
+  /**
+   * CANARY (positive): Azurite must enforce the {@code AppendBlock} conditions: a stale {@code
+   * If-Match} ETag and a wrong append position are each rejected with 412, and neither block lands.
+   */
   @Test
-  void azuriteEnforcesIfMatchPrecondition() {
-    String name = "canary/if-match/" + UUID.randomUUID();
-    container.createFile(name, "v1".getBytes());
-    DataLakeFileClient file = container.fileClient(name);
-    String staleEtag = file.getProperties().getETag();
-    container.createFile(name, "v2".getBytes()); // overwrites, ETag advances
-    DataLakeFileOutputStreamOptions options =
-        new DataLakeFileOutputStreamOptions()
-            .setRequestConditions(new DataLakeRequestConditions().setIfMatch(staleEtag));
-    assertThatThrownBy(
-            () -> {
-              try (OutputStream out = file.getOutputStream(options)) {
-                out.write("v3".getBytes());
-              }
-            })
-        .as(
-            "Azurite accepted a write with a stale If-Match ETag. CAS semantics in "
-                + "ADLSCatalogTest rely on this precondition. Treat the run as "
-                + "unreliable until Azurite is fixed or replaced.")
-        // The DataLake OutputStream wraps a blob-level BlobStorageException in IOException;
-        // match by HTTP status code in the message to stay decoupled from the wrapping shape.
-        .isInstanceOf(IOException.class)
-        .satisfies(ex -> assertThat(ex).hasMessageContaining("412"));
+  void azuriteEnforcesAppendBlockConditions() {
+    AppendBlobClient blob = appendBlob(container.fileClient("canary/append/" + UUID.randomUUID()));
+    blob.create();
+    String e1 = append(blob, "ckpt|", 0, null);
+    append(blob, "r1|", 5, e1);
+    assertThatThrownBy(() -> append(blob, "stale|", 8, e1))
+        .as("Azurite accepted an AppendBlock with a stale If-Match ETag")
+        .isInstanceOf(BlobStorageException.class)
+        .satisfies(ex -> assertThat(((BlobStorageException) ex).getStatusCode()).isEqualTo(412));
+    String e2 = blob.getProperties().getETag();
+    assertThatThrownBy(() -> append(blob, "wrong-pos|", 5, e2))
+        .as("Azurite accepted an AppendBlock at the wrong append position")
+        .isInstanceOf(BlobStorageException.class)
+        .satisfies(ex -> assertThat(((BlobStorageException) ex).getStatusCode()).isEqualTo(412));
+    assertThat(blob.downloadContent().toString()).isEqualTo("ckpt|r1|");
+  }
+
+  private static AppendBlobClient appendBlob(DataLakeFileClient file) {
+    // Same construction as ADLSOutputFile: the Data Lake client's pipeline, Blob API client.
+    // Azurite serves one endpoint, so the URL needs no dfs -> blob rewrite.
+    return new SpecializedBlobClientBuilder()
+        .pipeline(file.getHttpPipeline())
+        .endpoint(file.getFileUrl())
+        .buildAppendBlobClient();
+  }
+
+  private static String append(AppendBlobClient blob, String data, long position, String etag) {
+    byte[] bytes = data.getBytes();
+    return blob.appendBlockWithResponse(
+            new ByteArrayInputStream(bytes),
+            bytes.length,
+            null,
+            new AppendBlobRequestConditions().setAppendPosition(position).setIfMatch(etag),
+            null,
+            Context.NONE)
+        .getValue()
+        .getETag();
   }
 }

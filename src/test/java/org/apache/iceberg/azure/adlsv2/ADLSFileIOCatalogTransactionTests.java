@@ -121,8 +121,8 @@ public class ADLSFileIOCatalogTransactionTests extends CatalogTransactionTests<F
   public void before(TestInfo info) {
     if (mode == CloudMode.AZURITE) {
       mode.assumeRealCloud(
-          "DataLake uploadWithResponse to a non-existent path "
-              + "(real ADLS auto-creates; Azurite returns HTTP 400)");
+          "DataLake rename (ADLSFileIO's CAS renames a staged Append Blob onto the catalog "
+              + "file; Azurite has no Data Lake endpoint and returns HTTP 400)");
     }
     final ADLSFileIO io;
     if (null == azureProperties) {

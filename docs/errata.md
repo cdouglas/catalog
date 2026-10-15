@@ -59,6 +59,20 @@ JSON parsers are already in upstream Iceberg.
 **Trigger to revisit:** when a stats-maintaining workload shows up where
 the full-mode size penalty matters.
 
+### D10. ADLS CAS does not work with vended SAS credentials
+
+ADLS CAS renames a staged temp onto the catalog file, and under SAS
+auth the rename must carry the SAS in `x-ms-rename-source`. The Azure
+SDK adds it only for clients built with a SAS token (`adls.sas-token.*`
+in `AzureProperties`); SAS added by `VendedAzureSasCredentialPolicy`
+(REST-catalog credential vending) reaches the request URL but not the
+rename source, so the rename fails with 403. Shared key and OAuth are
+unaffected. Building the rename source from the vended token would fix
+it.
+
+**Trigger:** the first deployment that serves a `FileIOCatalog` on ADLS
+through vended credentials.
+
 ### D8. Typed-protobuf encoding for Iceberg structural types (skip JSON serde)
 
 `AddSortOrderUpdate` is encoded structurally (see SPEC_TM.md §"Other
@@ -132,23 +146,29 @@ canary fails and the upgrader knows to delete the workaround.
   concurrent conditional PUTs have exactly one winner. No S3 emulator
   implements S3 Express append (checked 2026-10: versitygw, SeaweedFS and
   LocalStack ignore or lack it; RustFS rejects it with 501).
-- **Azurite**: `DataLakeFileClient.uploadWithResponse` returns HTTP 400
-  on a non-existent path; real ADLS auto-creates the file. Every test in
-  `ADLSCatalogTest` / `ADLSFileIOCatalogTransactionTests` writes the
-  initial catalog file via that path, so on Azurite the whole class
-  skips. `AzuriteEmulatorCanaries#azuriteRejectsUploadToNonExistentPath`
-  asserts the gap; the positive
-  `AzuriteEmulatorCanaries#azuriteEnforcesIfMatchPrecondition` guards
-  against silent `If-Match` regressions.
+- **Azurite** (3.37.0): no Data Lake endpoint. `ADLSFileIO` keeps the
+  catalog file as an Append Blob: APPEND is one conditional
+  `AppendBlock`, and CAS stages a temp Append Blob and renames it onto
+  the catalog file through the Data Lake API, which Azurite answers with
+  HTTP 400. Every test in `ADLSCatalogTest` /
+  `ADLSFileIOCatalogTransactionTests` starts with a CAS (creating the
+  catalog file), so on Azurite the whole class skips.
+  `AzuriteEmulatorCanaries#azuriteRejectsDataLakeRename` asserts the gap;
+  the positive `azuriteEnforcesAppendBlockConditions` checks that a stale
+  `If-Match` and a wrong append position are rejected, the conditions the
+  APPEND path relies on. The ADLS suites run against real ADLS only
+  (`AZURE_STORAGE_ACCOUNT` etc., see INTEGRATION_TESTING.md).
 - **fake-gcs-server** (1.56.1): standard-bucket CAS path works.
+  `GCSFileIO` writes each CAS as one multipart upload (`storage.create`
+  with `ifGenerationMatch`), which fake-gcs-server has always enforced.
   Before 1.55.0 it ignored `ifGenerationMatch` on resumable uploads
-  (`BlobWriteSession`, `WriteChannel`), the path `GCSFileIO` uses, so the
-  six conflict tests in each `GCSCatalogTest*` class failed on the
-  emulator. `FakeGcsEmulatorCanaries` carries positive canaries for
-  `ifGenerationMatch` on both multipart (`storage.create`) and resumable
-  uploads. The GCS Rapid stage-and-move path (`blobAppendableUpload` +
-  `moveBlob` with dual generations) is not exercised by `GCSCatalogTest`:
-  fake-gcs-server has no appendable objects, gRPC v2 or `moveObject`.
+  (`BlobWriteSession`, `WriteChannel`), the path `GCSFileIO` used until
+  iceberg `e0bc582f7`, so the six conflict tests in each `GCSCatalogTest*`
+  class failed on the emulator. `FakeGcsEmulatorCanaries` checks
+  `ifGenerationMatch` on both kinds of upload. Zonal (Rapid) buckets take
+  a single XML API PUT instead; fake-gcs-server has no zonal semantics,
+  so that path is covered by iceberg's `GcsRapidCanaries` and
+  `GcsFileIOAtomicRapidTest` against a real Rapid bucket (`RAPID_BUCKET`).
 
 ### T4. `testRegisterTable` (inline) needs a register-from-bytes API
 
@@ -234,11 +254,17 @@ but only for the conditions we know to test (basic CAS, append). We
 have not exercised:
 
 - ETag changes that aren't object replacements (provider-side metadata
-  rewrites — does Azure's HNS rename change ETag?);
+  rewrites). Answered for Azure's HNS rename, which ADLS CAS relies on:
+  the renamed file keeps the source's ETag, and the rename response
+  carries it (checked 2026-10-14), so a CAS learns the new ETag without
+  a HEAD that could see a later writer;
 - region-failover redirects mid-write;
 - conditional appends that succeed at the storage layer but return a
   partial offset (does any provider do this?);
-- AppendBlob block boundary effects on the 50k-block hard limit.
+- AppendBlob block boundary effects on the 50k-block hard limit
+  (`BlockCountExceedsLimit`; see iceberg `TOO_MANY_PARTS.md`). Every
+  ADLS APPEND is one block, so a catalog file takes at most 50,000
+  appends between compactions.
 
 **Trigger:** the first time a real workload sees an unexpected commit
 failure on a specific provider.
