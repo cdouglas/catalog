@@ -694,7 +694,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         //      InlineDeltaCodec.applyDeltaWithManifests — the same hook the
         //      update path uses.
         List<InlineDeltaCodec.DeltaUpdate> manifests =
-            manifestUpdates(metadata, staged, "");
+            manifestUpdates(null, metadata, staged, "");
         byte[] manifestBytes =
             manifests.isEmpty()
                 ? null
@@ -735,7 +735,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
             ? proto.manifestListPrefix(tblId)
             : "";
         List<InlineDeltaCodec.DeltaUpdate> manifests =
-            manifestUpdates(metadata, staged, prefix);
+            manifestUpdates(isInline ? proto : null, metadata, staged, prefix);
         if (isInline) {
           // Null if delta encoding cannot express the change (errata D1, D6): full mode then.
           List<InlineDeltaCodec.DeltaUpdate> delta =
@@ -772,23 +772,40 @@ public class FileIOCatalog extends BaseMetastoreCatalog
 
     /**
      * The manifest list updates for the inline-ML snapshots {@code metadata} adds, from the lists
-     * their producers staged, each a delta against its parent's. Stages for snapshots not in
+     * their producers staged. A producer stages a list as a delta against its parent's, and the
+     * catalog builds the list on its parent's inline list ({@code
+     * InlineDeltaCodec.NewSnapshotManifests}). So a snapshot whose parent has no inline list in
+     * {@code proto} (the table's state the update applies to, null if the table is not inline) or
+     * among the new snapshots carries its whole list: its parent's list is a file, written by a
+     * writer that does not inline manifest lists or by an eviction. Stages for snapshots not in
      * {@code metadata} are dropped: a producer staged them and then rolled back (errata D7).
      */
     private List<InlineDeltaCodec.DeltaUpdate> manifestUpdates(
+        ProtoCatalogFile proto,
         TableMetadata metadata,
         Map<Long, InlineManifestTableOperations.StagedSnapshotData> staged,
         String prefix) {
       List<InlineDeltaCodec.DeltaUpdate> updates = new java.util.ArrayList<>();
+      Integer tblId = proto != null ? proto.tableId(tableId) : null;
       for (Map.Entry<Long, InlineManifestTableOperations.StagedSnapshotData> entry
           : staged.entrySet()) {
         Snapshot snapshot = metadata.snapshot(entry.getKey());
         if (snapshot == null) {
           continue;
         }
+        Long parentId = snapshot.parentId();
+        boolean parentInline =
+            parentId == null
+                || (staged.containsKey(parentId) && metadata.snapshot(parentId) != null)
+                || (tblId != null && proto.hasInlineManifests(tblId, parentId));
         ManifestListDelta delta = entry.getValue().delta;
-        InlineDeltaCodec.attachManifestDelta(
-            updates, snapshot.snapshotId(), delta.added(), delta.removedPaths(), prefix);
+        if (parentInline) {
+          InlineDeltaCodec.attachManifestDelta(
+              updates, snapshot.snapshotId(), delta.added(), delta.removedPaths(), prefix);
+        } else {
+          InlineDeltaCodec.attachManifestDelta(
+              updates, snapshot.snapshotId(), snapshot.allManifests(io()), List.of(), prefix);
+        }
       }
       return updates;
     }

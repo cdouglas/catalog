@@ -207,16 +207,29 @@ List<DeltaUpdate> manifests = new ArrayList<>();
 for (var entry : staged.entrySet()) {
   Snapshot snap = metadata.snapshot(entry.getKey());
   if (snap == null) continue;                         // orphan stage (errata D7)
-  attachManifestDelta(manifests, snap.snapshotId(),
-      entry.getValue().delta.added(), entry.getValue().delta.removedPaths(), prefix);
+  Long parent = snap.parentId();
+  boolean parentInline = parent == null
+      || staged.containsKey(parent)                   // new in this commit
+      || base.hasInlineManifests(tblId, parent);      // inline in the table's state
+  if (parentInline) {
+    attachManifestDelta(manifests, snap.snapshotId(),
+        entry.getValue().delta.added(), entry.getValue().delta.removedPaths(), prefix);
+  } else {                                            // parent's list is a file
+    attachManifestDelta(manifests, snap.snapshotId(),
+        snap.allManifests(io), List.of(), prefix);
+  }
 }
 ```
 
 Iteration is over the staged map (not `metadata.snapshots()`) so
 manifest rewrites against an existing snapshot id also reach
 `attachManifestDelta`. A staged list is a delta against the parent's
-list, and the replay builds it on the parent's inline list
-(`NewSnapshotManifests`).
+list, and the replay builds it on the parent's *inline* list
+(`NewSnapshotManifests`). A parent whose list is an Avro file has no
+inline list, so a snapshot on such a parent carries its whole list
+(the `InlineSnapshot` the producer returned holds it). Such parents
+come from writers that do not inline manifest lists and from eviction
+(see "Writers in Different Modes" below).
 
 The manifest updates ride in whichever form the table update takes
 (see [SPEC_TM.md](SPEC_TM.md) §"Delivery Modes"): appended to the TM
@@ -278,9 +291,10 @@ metadata file location) clears the table's inline state, pool included.
 - An **inline-TM writer** committing a snapshot to an inline-ML table
   writes an Avro manifest list for it; the table stays inline, in mixed
   mode.
-- An **inline-ML writer** committing to a pointer table brings the
-  table back inline if the full metadata, with the manifest updates,
-  fits; the older snapshots keep their files.
+- An **inline-ML writer** committing on a parent whose list is a file
+  sends the new snapshot's whole list (above). Committing to a pointer
+  table, it brings the table back inline if the full metadata, with the
+  manifest updates, fits; the older snapshots keep their files.
 
 ### Loading
 

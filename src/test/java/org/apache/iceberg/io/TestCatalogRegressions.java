@@ -2007,6 +2007,43 @@ public class TestCatalogRegressions {
     }
 
     @Test
+    void evictionWritesTheManifestListsAndTheTableReturns() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog ml = small(io, LocalCatalogMode.APPEND_ML);
+      FileIOCatalog compacting = small(io, LocalCatalogMode.CAS_ML);
+      ml.createNamespace(mixedNs);
+      ml.createTable(mixed, intSchema).newFastAppend().appendFile(dataFile("a")).commit();
+      Map<Long, List<String>> lists = manifestLists(io, ml.loadTable(mixed));
+
+      // Too big for a delta or in full: the table leaves inline storage.
+      ml.loadTable(mixed).updateProperties().set("big", bigValue(6000)).commit();
+      assertThat(catalogFile(io).isInlineTable(mixed)).as("evicted").isFalse();
+      assertThat(manifestLists(io, ml.loadTable(mixed))).isEqualTo(lists);
+
+      // Full metadata still does not fit, so a new snapshot gets a manifest list file.
+      ml.loadTable(mixed).newFastAppend().appendFile(dataFile("b")).commit();
+      assertThat(catalogFile(io).isInlineTable(mixed)).isFalse();
+      lists = manifestLists(io, ml.loadTable(mixed));
+      compacting.createNamespace(Namespace.of("other"));
+      assertThat(manifestLists(io, ml.loadTable(mixed))).isEqualTo(lists);
+
+      // Once it fits in full, the next commit brings the table back, with an inline list for its
+      // new snapshot.
+      ml.loadTable(mixed).updateProperties().remove("big").commit();
+      assertThat(catalogFile(io).isInlineTable(mixed)).as("re-inlined").isTrue();
+      ml.loadTable(mixed).newAppend().appendFile(dataFile("c")).commit();
+      compacting.createNamespace(Namespace.of("another"));
+
+      Table table = ml.loadTable(mixed);
+      Map<Long, List<String>> after = manifestLists(io, table);
+      assertThat(after).containsAllEntriesOf(lists);
+      assertThat(table.currentSnapshot()).isInstanceOf(org.apache.iceberg.InlineSnapshot.class);
+      assertThat(dataFiles(table))
+          .containsExactly(
+              "mem:///data/a.parquet", "mem:///data/b.parquet", "mem:///data/c.parquet");
+    }
+
+    @Test
     void tableTooBigToCreateInlineGetsAMetadataFile() {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       FileIOCatalog ml = small(io, LocalCatalogMode.APPEND_ML);
@@ -2066,6 +2103,53 @@ public class TestCatalogRegressions {
       Table table = pointer.loadTable(mixed);
       assertThat(table.currentSnapshot()).isInstanceOf(org.apache.iceberg.InlineSnapshot.class);
       assertThat(dataFiles(table)).containsExactly("mem:///data/a.parquet");
+    }
+  }
+
+  // ============================================================
+  // Bug 29: an inline-ML snapshot's list is staged, and replayed, as a
+  // delta against its parent's inline list. When the parent's list was a
+  // file -- the snapshot of an inline-TM writer, which writes manifest list
+  // files, or of a pointer writer, as when an inline-ML writer brings a
+  // pointer table back inline -- the replay found no parent list and the
+  // new snapshot lost every manifest it carried over. Such a snapshot now
+  // carries its whole list.
+  // ============================================================
+
+  @Nested
+  class InlineSnapshotOnAManifestListFile {
+
+    @Test
+    void appendThatReinlinesKeepsItsManifestList() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog pointer = catalog(io, LocalCatalogMode.APPEND);
+      FileIOCatalog ml = catalog(io, LocalCatalogMode.APPEND_ML);
+      pointer.createNamespace(mixedNs);
+      pointer.createTable(mixed, intSchema).newFastAppend().appendFile(dataFile("a")).commit();
+
+      ml.loadTable(mixed).newFastAppend().appendFile(dataFile("b")).commit();
+
+      assertThat(catalogFile(io).isInlineTable(mixed)).isTrue();
+      assertThat(dataFiles(pointer.loadTable(mixed)))
+          .containsExactly("mem:///data/a.parquet", "mem:///data/b.parquet");
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND", "APPEND_TM"})
+    void inlineSnapshotKeepsItsParentsManifests(LocalCatalogMode other) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog ml = catalog(io, LocalCatalogMode.APPEND_ML);
+      FileIOCatalog writer = catalog(io, other);
+      ml.createNamespace(mixedNs);
+      ml.createTable(mixed, intSchema).newFastAppend().appendFile(dataFile("a")).commit();
+      writer.loadTable(mixed).newFastAppend().appendFile(dataFile("b")).commit();
+
+      ml.loadTable(mixed).newAppend().appendFile(dataFile("c")).commit();
+
+      assertThat(dataFiles(writer.loadTable(mixed)))
+          .containsExactly(
+              "mem:///data/a.parquet", "mem:///data/b.parquet", "mem:///data/c.parquet");
     }
   }
 }
