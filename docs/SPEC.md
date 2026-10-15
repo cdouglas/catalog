@@ -590,13 +590,20 @@ function COMMIT(fileIO, original, mutations):
     # Case 0: catalog does not exist yet
     if not current.exists():
         try:
-            return tryCAS(original, current, txnBytes, fileIO).orElseThrow(CommitFailed)
-        catch Ambiguous:
-            if txn.id in READ(fileIO, current.location).committed:
-                return it                    # the creation landed
+            return tryCAS(original, current, txnBytes, fileIO)
+        catch Ambiguous or Conflict as e:
+            # The creation may have landed: its reply was lost, reading it back
+            # failed, or it failed its precondition, as a transport retry of a
+            # creation that landed does.
+            fresh = READ(fileIO, current.location)   # failure: throw CommitStateUnknown
+            if txn.id in fresh.committed:
+                return fresh                 # the creation landed
+            if e is Conflict:
+                throw CommitFailed           # another writer created the catalog
             throw CommitStateUnknown
 
-    ambiguous = false
+    ambiguous  = false   # a write's outcome is unknown; it may still be in flight
+    unresolved = false   # a write failed its precondition; no read has ruled it out
     for attempt in 0..9:
       try:
         # Must CAS when either limit is at/beyond threshold based on the
@@ -613,9 +620,13 @@ function COMMIT(fileIO, original, mutations):
             if stale:
                 base  = READ(fileIO, current)
                 stale = false
-            result = tryCAS(base, current, txnBytes, fileIO)
-            if result.present:
-                return validateCommit(result, txn)
+                if txn.id in base.committed:
+                    return base              # an append reported as a lost race landed
+                unresolved = false
+            try:
+                return validateCommit(tryCAS(base, current, txnBytes, fileIO), txn)
+            catch Conflict:
+                unresolved = true
             # CAS conflict: rebase. Replay checks txn's preconditions against
             # the state its record lands on, so if they hold on the new state,
             # retry on top of it (append or CAS, as that state calls for): the
@@ -626,13 +637,15 @@ function COMMIT(fileIO, original, mutations):
             base    = READ(fileIO, current)
             if txn.id in base.committed:
                 return base                  # an earlier attempt landed
+            unresolved = false
             if not txn.verify(base):
                 throw conflict(base)
 
         else:
-            result = tryAppend(current, txnBytes, fileIO)
-            if result.present:
-                return validateCommit(result, txn)
+            try:
+                return validateCommit(tryAppend(current, txnBytes, fileIO), txn)
+            catch Conflict:
+                unresolved = true
 
             # Append failed (offset mismatch from concurrent writer). The
             # transaction bytes are identical and idempotent (UUID-deduped),
@@ -643,6 +656,9 @@ function COMMIT(fileIO, original, mutations):
                 # File shrank (compacted). Re-read so the next mustCAS
                 # decision sees the current appendCount.
                 base = READ(fileIO, current)
+                if txn.id in base.committed:
+                    return base              # an append reported as a lost race landed
+                unresolved = false
             else:
                 # File grew (concurrent append). Retry same bytes; base's
                 # appendCount is now a lower bound.
@@ -662,25 +678,42 @@ function COMMIT(fileIO, original, mutations):
         stale   = false
         if txn.id in base.committed:
             return base                  # the write landed
+        unresolved = false
         if not txn.verify(base):
             throw conflict(base)
 
+      catch ReadFailed as e:
+        # Reading the catalog failed. The commit failed too, unless one of its
+        # writes may have landed.
+        throw (ambiguous or unresolved) ? CommitStateUnknown : e
+
     # After an ambiguous write, running out of attempts is not a failure: a
     # write might yet have landed.
-    throw ambiguous ? CommitStateUnknown : CommitFailed("exceeded retry limit")
+    if ambiguous:
+        throw CommitStateUnknown
+    if unresolved:
+        # The last append lost a race, which its own landing also reports.
+        base = READ(fileIO, current.location)  # failure here: throw CommitStateUnknown
+        if txn.id in base.committed:
+            return base
+    throw CommitFailed("exceeded retry limit")
 ```
 
 A commit reports one of three outcomes, and a caller can rely on each:
 **returned** (the transaction took effect, once), **CommitFailed /
-AlreadyExists** (it did not and will not), **CommitStateUnknown** (either).
-Iceberg deletes a commit's new files on `CommitFailedException` (a
-`CleanableFailure`) and on any failure other than
-`CommitStateUnknownException`, so reporting a landed commit any other way
+AlreadyExists** or any other failure (it did not and will not),
+**CommitStateUnknown** (either). Iceberg deletes a commit's new files on a
+`CleanableFailure` such as `CommitFailedException` (and, for table operations
+that do not require strict cleanup, on any failure but
+`CommitStateUnknownException`), so reporting a landed commit any other way
 loses the files its snapshot references. A write fails ambiguously when
 `writeAtomic` throws anything but the protocol's conflict and throttling
 signals (`CASException`, `AppendException`, `StorageThrottleException`), or
 when reading back what it wrote fails; `tryCAS` and `tryAppend` raise
-`Ambiguous` then.
+`Ambiguous` then. A write that fails its precondition (`Conflict`) may have
+landed too: a transport retry of a write that landed fails it. But that write
+landed before the reply, so a read of the catalog that does not show it rules
+it out; until one does, a failed read is `CommitStateUnknown`.
 
 ### CAS-only Mode
 

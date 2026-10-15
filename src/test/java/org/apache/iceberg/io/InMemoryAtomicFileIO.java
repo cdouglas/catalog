@@ -51,6 +51,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
  * write lands, or after it lands with the reply lost (an {@link IOException} or a runtime error, as
  * SDKs surface either) or reported as a precondition failure (a transport retry that ran into its
  * own write). A lost reply leaves the caller unable to tell whether the write took effect.
+ * {@link #injectReadFaults} makes reads fail: a request for an object's metadata or content throws,
+ * or its content stream breaks part way through.
  */
 public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
 
@@ -67,10 +69,36 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
     LANDED_AS_CONFLICT
   }
 
-  /** Chooses the fault for each conditional write, in order. */
+  /**
+   * Chooses the fault for each conditional write, in order. It is called as the write is issued,
+   * before the write reads its precondition, and holds no lock: it may run other writers first.
+   */
   @FunctionalInterface
   public interface Faults {
     Fault next(String location, AtomicOutputFile.Strategy strategy);
+  }
+
+  /** How a read request fails, if it does. */
+  public enum ReadFault {
+    NONE,
+    /** The request throws {@link UncheckedIOException}; the input file stays unbound. */
+    FAIL,
+    /**
+     * A content request throws {@link IOException} from its stream halfway through the object. A
+     * metadata request fails as {@link #FAIL} does.
+     */
+    FAIL_MID_STREAM
+  }
+
+  /**
+   * Chooses the fault for each read request, in order. A request is what reaches storage: binding
+   * an input file ({@code exists} or {@code getLength} of an unbound file) and every {@code
+   * newStream}. It is called as the request is issued and holds no lock: it may run other writers
+   * first.
+   */
+  @FunctionalInterface
+  public interface ReadFaults {
+    ReadFault next(String location);
   }
 
   /** One version of an object; a new instance per write. */
@@ -123,8 +151,10 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
   private int rejectedCas = 0;
   private final AtomicLong generations = new AtomicLong(0);
   private final boolean supportsAppend;
-  private Faults faults = (location, strategy) -> Fault.NONE;
+  private volatile Faults faults = (location, strategy) -> Fault.NONE;
   private final Map<Fault, Integer> injected = Maps.newEnumMap(Fault.class);
+  private volatile ReadFaults readFaults = location -> ReadFault.NONE;
+  private final Map<ReadFault, Integer> injectedReads = Maps.newEnumMap(ReadFault.class);
 
   public InMemoryAtomicFileIO() {
     this(true);
@@ -164,13 +194,38 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
   }
 
   /** Fails conditional writes as {@code plan} chooses; {@link Fault#NONE} for all by default. */
-  public synchronized void injectFaults(Faults plan) {
+  public void injectFaults(Faults plan) {
     this.faults = plan;
   }
 
   /** Number of faults injected so far, by kind (excluding {@link Fault#NONE}). */
   public synchronized int injected(Fault fault) {
     return injected.getOrDefault(fault, 0);
+  }
+
+  /** Fails read requests as {@code plan} chooses; {@link ReadFault#NONE} for all by default. */
+  public void injectReadFaults(ReadFaults plan) {
+    this.readFaults = plan;
+  }
+
+  /** Number of read faults injected so far, by kind (excluding {@link ReadFault#NONE}). */
+  public synchronized int injected(ReadFault fault) {
+    return injectedReads.getOrDefault(fault, 0);
+  }
+
+  /** The fault for the next read request of {@code location}, recorded if it is one. */
+  private ReadFault readFault(String location) {
+    ReadFault fault = readFaults.next(location);
+    if (fault != ReadFault.NONE) {
+      synchronized (this) {
+        injectedReads.merge(fault, 1, Integer::sum);
+      }
+    }
+    return fault;
+  }
+
+  private static UncheckedIOException readFailure(String location) {
+    return new UncheckedIOException(new IOException("injected: read of " + location + " failed"));
   }
 
   /** Number of objects currently stored. */
@@ -227,12 +282,27 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
       return InMemoryAtomicFileIO.this;
     }
 
-    synchronized Version version() {
-      if (!bound) {
-        version = objects.get(location);
-        bound = true;
+    /** The bound version, binding it first if need be. Binding is a read request. */
+    Version version() {
+      synchronized (this) {
+        if (bound) {
+          return version;
+        }
       }
-      return version;
+      if (readFault(location) != ReadFault.NONE) {
+        throw readFailure(location);
+      }
+      synchronized (this) {
+        if (!bound) {
+          bind();
+        }
+        return version;
+      }
+    }
+
+    private void bind() {
+      version = objects.get(location);
+      bound = true;
     }
 
     @Override
@@ -246,11 +316,24 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
 
     @Override
     public SeekableInputStream newStream() {
-      Version v = version();
+      ReadFault fault = readFault(location);
+      if (fault == ReadFault.FAIL) {
+        throw readFailure(location);
+      }
+      Version v;
+      synchronized (this) {
+        if (!bound) {
+          bind();
+        }
+        v = version;
+      }
       if (v == null) {
         throw new NotFoundException("File does not exist: %s", location);
       }
-      return new InMemoryInputFile(location, v.bytes).newStream();
+      SeekableInputStream stream = new InMemoryInputFile(location, v.bytes).newStream();
+      return fault == ReadFault.FAIL_MID_STREAM
+          ? new BreakingInputStream(stream, location, v.bytes.length / 2)
+          : stream;
     }
 
     @Override
@@ -334,11 +417,11 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
       if (strategy == null) {
         throw new IllegalStateException("prepare() was not called");
       }
+      String location = location();
+      Fault fault = faults.next(location, strategy);
       byte[] data = readAll(source.get());
       Version expected = replace.version();
-      String location = location();
       synchronized (InMemoryAtomicFileIO.this) {
-        Fault fault = faults.next(location, strategy);
         if (fault != Fault.NONE) {
           injected.merge(fault, 1, Integer::sum);
         }
@@ -386,6 +469,53 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
             return written;
         }
       }
+    }
+  }
+
+  /** Throws {@link IOException} once a read reaches {@code breakAt}. */
+  private static class BreakingInputStream extends SeekableInputStream {
+    private final SeekableInputStream in;
+    private final String location;
+    private final long breakAt;
+
+    BreakingInputStream(SeekableInputStream in, String location, long breakAt) {
+      this.in = in;
+      this.location = location;
+      this.breakAt = breakAt;
+    }
+
+    private void check(long pos) throws IOException {
+      if (pos >= breakAt) {
+        throw new IOException("injected: stream of " + location + " broke at byte " + breakAt);
+      }
+    }
+
+    @Override
+    public long getPos() throws IOException {
+      return in.getPos();
+    }
+
+    @Override
+    public void seek(long newPos) throws IOException {
+      in.seek(newPos);
+    }
+
+    @Override
+    public int read() throws IOException {
+      check(in.getPos());
+      return in.read();
+    }
+
+    @Override
+    public int read(byte[] b, int off, int len) throws IOException {
+      long pos = in.getPos();
+      check(pos);
+      return in.read(b, off, (int) Math.min(len, breakAt - pos));
+    }
+
+    @Override
+    public void close() throws IOException {
+      in.close();
     }
   }
 

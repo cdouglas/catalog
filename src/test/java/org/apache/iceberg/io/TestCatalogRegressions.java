@@ -46,6 +46,7 @@ import org.apache.iceberg.inmemory.InMemoryInputFile;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
+import org.apache.iceberg.io.InMemoryAtomicFileIO.ReadFault;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -1234,6 +1235,81 @@ public class TestCatalogRegressions {
       io.injectFaults((location, strategy) -> Fault.NONE);
       assertThat(io.history()).hasSize(writes);
       assertThat(reread(io, fmt).namespaces()).doesNotContain(Namespace.of("c"));
+    }
+  }
+
+  // ============================================================
+  // Bug 18: a conditional write that failed its precondition was taken as
+  // proof that it had not landed. A transport retry of a write that landed
+  // fails its precondition too, so when the read that followed failed, a
+  // commit that had landed was reported as a raw failure; and creating the
+  // catalog file reported CommitFailedException. The commit loop now keeps
+  // such a write unresolved until a read of the catalog rules it out, and a
+  // failed read while one is unresolved is CommitStateUnknownException. Found
+  // by TestMultiWriterProperties with read faults.
+  // ============================================================
+
+  @Nested
+  class ConflictsThatLanded {
+
+    /** Lands the first conditional write as a conflict; then fails reads if {@code failReads}. */
+    private void landFirstAsConflict(InMemoryAtomicFileIO io, boolean failReads) {
+      boolean[] landed = {false};
+      io.injectFaults(
+          (location, strategy) -> {
+            if (landed[0]) {
+              return Fault.NONE;
+            }
+            landed[0] = true;
+            return Fault.LANDED_AS_CONFLICT;
+          });
+      io.injectReadFaults(location -> failReads && landed[0] ? ReadFault.FAIL : ReadFault.NONE);
+    }
+
+    private void healed(InMemoryAtomicFileIO io) {
+      io.injectFaults((location, strategy) -> Fault.NONE);
+      io.injectReadFaults(location -> ReadFault.NONE);
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 10_000})
+    void writeReportedAsConflictThatLandedIsCommitted(int maxAppendCount) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      ProtoCatalogFormat fmt = format(maxAppendCount);
+      ProtoCatalogFile snap = seed(io, fmt, "a");
+
+      landFirstAsConflict(io, false);
+      fmt.from(snap).createNamespace(Namespace.of("c")).commit(io);
+
+      healed(io);
+      assertThat(reread(io, fmt).namespaces()).contains(Namespace.of("c"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 10_000})
+    void unreadableCatalogAfterAConflictThatLandedIsCommitStateUnknown(int maxAppendCount) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      ProtoCatalogFormat fmt = format(maxAppendCount);
+      ProtoCatalogFile snap = seed(io, fmt, "a");
+
+      landFirstAsConflict(io, true);
+      assertThatThrownBy(() -> fmt.from(snap).createNamespace(Namespace.of("c")).commit(io))
+          .isInstanceOf(CommitStateUnknownException.class);
+
+      healed(io);
+      assertThat(reread(io, fmt).namespaces()).contains(Namespace.of("c"));
+    }
+
+    @Test
+    void catalogCreationReportedAsConflictThatLandedIsCommitted() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      ProtoCatalogFormat fmt = format(0);
+
+      landFirstAsConflict(io, false);
+      fmt.empty(io.newInputFile(RACE_LOC)).createNamespace(Namespace.of("a")).commit(io);
+
+      healed(io);
+      assertThat(reread(io, fmt).namespaces()).contains(Namespace.of("a"));
     }
   }
 

@@ -29,7 +29,6 @@ import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.UUID;
 import java.util.function.Supplier;
 import org.apache.iceberg.catalog.Namespace;
@@ -572,14 +571,19 @@ public class ProtoCatalogFormat
       // Case 0: Initial commit (file doesn't exist)
       if (!current.exists()) {
         try {
-          return tryCAS(original, current, txnBytes, fileIO)
-              .orElseThrow(() -> new CommitFailedException("Catalog creation failed"));
-        } catch (AmbiguousWrite e) {
-          ProtoCatalogFile.Builder fresh = resolve(e, fileIO.newInputFile(current.location()));
+          return tryCAS(original, current, txnBytes, fileIO);
+        } catch (AmbiguousWrite | SupportsAtomicOperations.CASException e) {
+          // The creation may have landed: its reply was lost, reading it back failed, or it
+          // failed its precondition, as a transport retry of a creation that landed does.
+          Throwable failure = e instanceof AmbiguousWrite ? e.getCause() : e;
+          ProtoCatalogFile.Builder fresh = resolve(failure, fileIO.newInputFile(current.location()));
           if (fresh != null && fresh.containsTransaction(txn.id())) {
             return fresh.build(); // the creation landed
           }
-          throw new CommitStateUnknownException(e.getCause());
+          if (fresh != null && !(e instanceof AmbiguousWrite)) {
+            throw new CommitFailedException(e, "Catalog creation failed: %s exists", current.location());
+          }
+          throw new CommitStateUnknownException(failure);
         }
       }
 
@@ -591,9 +595,14 @@ public class ProtoCatalogFormat
       // so an unguarded append commit would surface as IllegalArgumentException.
       final boolean appendSupported = fileIO.supportsAppend();
 
-      // The last write whose outcome is unknown, if any. Once one has happened, running out of
+      // The last write whose outcome is unknown, if any: its reply was lost, or reading back what
+      // it wrote failed. It may still be in flight, so once one has happened, running out of
       // attempts no longer means the commit failed.
       AmbiguousWrite ambiguous = null;
+      // The last write that failed its precondition, until a read of the catalog rules out that it
+      // landed. A transport retry of a write that landed fails its precondition, so the failure is
+      // no proof; but the write landed before the reply, so a read without it settles it.
+      SupportsAtomicOperations.AtomicOperationException unresolved = null;
 
       for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
         try {
@@ -604,7 +613,7 @@ public class ProtoCatalogFormat
           boolean mustCAS =
               !appendSupported
                   || baseCatalog.appendCount() >= maxAppendCount
-                  || current.getLength() + txnBytes.length > maxAppendSize;
+                  || length(current) + txnBytes.length > maxAppendSize;
 
           if (mustCAS) {
             if (!baseIsCurrent) {
@@ -612,12 +621,18 @@ public class ProtoCatalogFormat
               // current names: a checkpoint of original would erase every record
               // committed since. Our transaction record follows the checkpoint and
               // replay verifies it against that state, as it would an append.
-              baseCatalog = read(current);
+              ProtoCatalogFile.Builder fresh = replay(current);
+              if (fresh.containsTransaction(txn.id())) {
+                return fresh.build(); // an append reported as a lost race landed
+              }
+              unresolved = null;
+              baseCatalog = fresh.build();
               baseIsCurrent = true;
             }
-            Optional<ProtoCatalogFile> result = tryCAS(baseCatalog, current, txnBytes, fileIO);
-            if (result.isPresent()) {
-              return validateCommit(result.get(), txn);
+            try {
+              return validateCommit(tryCAS(baseCatalog, current, txnBytes, fileIO), txn);
+            } catch (SupportsAtomicOperations.CASException e) {
+              unresolved = e;
             }
             // CAS conflict: another writer changed the file since we read it.
             // Rebase onto the new state. Replay checks this transaction's
@@ -631,6 +646,7 @@ public class ProtoCatalogFormat
             if (fresh.containsTransaction(txn.id())) {
               return fresh.build(); // an earlier attempt landed
             }
+            unresolved = null;
             boolean holds = txn.verify(fresh);
             baseCatalog = fresh.build();
             baseIsCurrent = true;
@@ -639,20 +655,26 @@ public class ProtoCatalogFormat
                   baseCatalog, "Cannot commit: catalog file changed concurrently at " + current.location());
             }
           } else {
-            Optional<ProtoCatalogFile> result = tryAppend(current, txn, txnBytes, fileIO);
-            if (result.isPresent()) {
-              return validateCommit(result.get(), txn);
+            try {
+              return validateCommit(tryAppend(current, txnBytes, fileIO), txn);
+            } catch (SupportsAtomicOperations.AppendException e) {
+              unresolved = e;
             }
             // Append failed: another writer appended first (offset mismatch).
             // The transaction bytes are identical and idempotent (UUID-deduplicated),
             // so we can retry the append at the new offset without re-reading the
             // catalog. Only need to refresh the InputFile to get the current length.
-            long oldLength = current.getLength();
+            long oldLength = length(current);
             current = fileIO.newInputFile(current.location());
-            if (current.getLength() < oldLength) {
+            if (length(current) < oldLength) {
               // File shrank -- another writer compacted. Re-read to refresh
               // appendCount so the next mustCAS decision is accurate.
-              baseCatalog = read(current);
+              ProtoCatalogFile.Builder fresh = replay(current);
+              if (fresh.containsTransaction(txn.id())) {
+                return fresh.build(); // an append reported as a lost race landed
+              }
+              unresolved = null;
+              baseCatalog = fresh.build();
               baseIsCurrent = true;
             } else {
               // File grew (normal concurrent append). Retry with same bytes at the
@@ -671,13 +693,14 @@ public class ProtoCatalogFormat
           // that does not hold changes nothing.
           ambiguous = e;
           current = fileIO.newInputFile(current.location());
-          ProtoCatalogFile.Builder fresh = resolve(e, current);
+          ProtoCatalogFile.Builder fresh = resolve(e.getCause(), current);
           if (fresh == null) {
             throw new CommitStateUnknownException(e.getCause());
           }
           if (fresh.containsTransaction(txn.id())) {
             return fresh.build(); // the write landed
           }
+          unresolved = null;
           boolean holds = txn.verify(fresh);
           baseCatalog = fresh.build();
           baseIsCurrent = true;
@@ -685,24 +708,42 @@ public class ProtoCatalogFormat
             throw conflict(
                 baseCatalog, "Cannot commit: catalog file changed concurrently at " + current.location());
           }
+        } catch (UnreadableCatalog e) {
+          // A read failed. The commit failed too, unless one of its writes may have landed.
+          Throwable write = ambiguous != null ? ambiguous.getCause() : unresolved;
+          if (write == null) {
+            throw e.failure();
+          }
+          write.addSuppressed(e.failure());
+          throw new CommitStateUnknownException(write);
         }
       }
 
       if (ambiguous != null) {
         throw new CommitStateUnknownException(ambiguous.getCause());
       }
+      if (unresolved != null) {
+        // The last attempt lost an append race, which its own landing would also report.
+        ProtoCatalogFile.Builder fresh = resolve(unresolved, fileIO.newInputFile(current.location()));
+        if (fresh == null) {
+          throw new CommitStateUnknownException(unresolved);
+        }
+        if (fresh.containsTransaction(txn.id())) {
+          return fresh.build();
+        }
+      }
       throw new CommitFailedException("Exceeded maximum commit attempts");
     }
 
     /**
-     * Re-reads the catalog after an ambiguous write, or returns null if that fails too (the
-     * failure is attached to {@code e}).
+     * Re-reads the catalog after a write that may have landed, or returns null if that fails too
+     * (the read failure is attached to {@code writeFailure}).
      */
-    private ProtoCatalogFile.Builder resolve(AmbiguousWrite e, InputFile file) {
+    private ProtoCatalogFile.Builder resolve(Throwable writeFailure, InputFile file) {
       try {
         return replay(file);
-      } catch (RuntimeException readFailure) {
-        e.getCause().addSuppressed(readFailure);
+      } catch (UnreadableCatalog readFailure) {
+        writeFailure.addSuppressed(readFailure.failure());
         return null;
       }
     }
@@ -741,20 +782,31 @@ public class ProtoCatalogFormat
       return new CommitFailedException("%s", message);
     }
 
-    private ProtoCatalogFile read(InputFile file) {
-      return replay(file).build();
-    }
-
+    /** Reads and parses {@code file}; any failure becomes {@link UnreadableCatalog}. */
     private ProtoCatalogFile.Builder replay(InputFile file) {
       try (SeekableInputStream in = file.newStream()) {
         return ProtoCatalogFormat.replay(file, in, (int) file.getLength());
       } catch (IOException e) {
-        throw new UncheckedIOException(e);
+        throw new UnreadableCatalog(new UncheckedIOException(e));
+      } catch (RuntimeException e) {
+        throw new UnreadableCatalog(e);
       }
     }
 
-    /** Replaces {@code current}, whose parsed state is {@code base}, with base + txnBytes. */
-    private Optional<ProtoCatalogFile> tryCAS(
+    /** The length of {@code file}; a failure to read it becomes {@link UnreadableCatalog}. */
+    private static long length(InputFile file) {
+      try {
+        return file.getLength();
+      } catch (RuntimeException e) {
+        throw new UnreadableCatalog(e);
+      }
+    }
+
+    /**
+     * Replaces {@code current}, whose parsed state is {@code base}, with base + txnBytes. Throws
+     * {@link SupportsAtomicOperations.CASException} if {@code current} is no longer live.
+     */
+    private ProtoCatalogFile tryCAS(
         ProtoCatalogFile base,
         InputFile current,
         byte[] txnBytes,
@@ -770,8 +822,8 @@ public class ProtoCatalogFormat
       // Retry budget for transient backpressure (StorageThrottleException: 429s,
       // 5xx, GCS per-object update rate). The underlying invariants still hold,
       // so the same write should succeed after a backoff. A real CAS conflict
-      // (StorageInvariantException) returns Optional.empty so the outer commit
-      // loop can re-read state.
+      // (StorageInvariantException) propagates so the outer commit loop can
+      // re-read state.
       final int maxThrottleAttempts = 8;
       long backoffMs = 200L;
       SupportsAtomicOperations.StorageThrottleException lastThrottle = null;
@@ -782,7 +834,7 @@ public class ProtoCatalogFormat
             serBytes.mark(fullFile.length);
             CAS token = outputFile.prepare(() -> serBytes, AtomicOutputFile.Strategy.CAS);
             serBytes.reset();
-            return Optional.of(writeAndRead(outputFile, token, () -> serBytes));
+            return writeAndRead(outputFile, token, () -> serBytes);
           }
         } catch (SupportsAtomicOperations.StorageThrottleException e) {
           lastThrottle = e;
@@ -795,9 +847,6 @@ public class ProtoCatalogFormat
             throw new CommitFailedException(ie, "Interrupted retrying CAS commit");
           }
           backoffMs = Math.min(backoffMs * 2, 5_000L);
-        } catch (SupportsAtomicOperations.CASException e) {
-          // Real CAS conflict (e.g. ETag mismatch, GCS generationMatch failure).
-          return Optional.empty();
         } catch (IOException e) {
           throw new CommitFailedException(e, "CAS commit failed: %s", e.getMessage());
         }
@@ -809,11 +858,12 @@ public class ProtoCatalogFormat
           current.location());
     }
 
-    private Optional<ProtoCatalogFile> tryAppend(
-        InputFile current,
-        ProtoCodec.Transaction txn,
-        byte[] txnBytes,
-        SupportsAtomicOperations fileIO) {
+    /**
+     * Appends txnBytes to {@code current}. Throws {@link SupportsAtomicOperations.AppendException}
+     * if {@code current} is no longer live.
+     */
+    private ProtoCatalogFile tryAppend(
+        InputFile current, byte[] txnBytes, SupportsAtomicOperations fileIO) {
       try {
         AtomicOutputFile outputFile = fileIO.newOutputFile(current);
         byte[] record = buildTransactionRecord(txnBytes);
@@ -822,10 +872,8 @@ public class ProtoCatalogFormat
           serBytes.mark(record.length);
           CAS token = outputFile.prepare(() -> serBytes, AtomicOutputFile.Strategy.APPEND);
           serBytes.reset();
-          return Optional.of(writeAndRead(outputFile, token, () -> serBytes));
+          return writeAndRead(outputFile, token, () -> serBytes);
         }
-      } catch (SupportsAtomicOperations.AppendException e) {
-        return Optional.empty();
       } catch (IOException e) {
         throw new UncheckedIOException("Append commit failed: " + e.getMessage(), e);
       }
@@ -920,6 +968,17 @@ public class ProtoCatalogFormat
   private static class AmbiguousWrite extends RuntimeException {
     AmbiguousWrite(Exception cause) {
       super(cause);
+    }
+  }
+
+  /** A failed read of the catalog during a commit. */
+  private static class UnreadableCatalog extends RuntimeException {
+    UnreadableCatalog(RuntimeException cause) {
+      super(cause);
+    }
+
+    RuntimeException failure() {
+      return (RuntimeException) getCause();
     }
   }
 }

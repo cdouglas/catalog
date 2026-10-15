@@ -52,6 +52,7 @@ import org.apache.iceberg.io.AtomicOutputFile;
 import org.apache.iceberg.io.CatalogFile;
 import org.apache.iceberg.io.InMemoryAtomicFileIO;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
+import org.apache.iceberg.io.InMemoryAtomicFileIO.ReadFault;
 import org.apache.iceberg.io.ProtoCatalogFile;
 import org.apache.iceberg.io.ProtoCatalogFormat;
 
@@ -82,7 +83,8 @@ import org.apache.iceberg.io.ProtoCatalogFormat;
  *
  * <p>{@link #faultyStorageNeverMisreportsACommit} runs the same schedules on storage that fails
  * (see {@link InMemoryAtomicFileIO.Fault}): a write may not land, or land with its reply lost, or
- * land and report a precondition failure. A writer must be able to trust a definite answer.
+ * land and report a precondition failure; and a read of the catalog during the commit may fail
+ * (see {@link InMemoryAtomicFileIO.ReadFault}). A writer must be able to trust a definite answer.
  * Iceberg deletes a commit's new files on {@link CommitFailedException} (a {@code
  * CleanableFailure}) and on any failure but {@link CommitStateUnknownException}, so a transaction
  * reported any other way as failed must not have taken effect, and an acknowledged one took effect
@@ -140,6 +142,19 @@ class TestMultiWriterProperties {
           Fault.NONE, Fault.NONE, Fault.NONE, Fault.NONE,
           Fault.FAIL_BEFORE, Fault.LOST_REPLY, Fault.LOST_REPLY_RUNTIME, Fault.LANDED_AS_CONFLICT);
 
+  /**
+   * A commit step's third operand picks a read of the catalog during the commit to fail, two times
+   * in three: one of its first four read requests, which fails outright or breaks mid-stream.
+   * Later reads succeed. Returns the index of the failing read, or -1.
+   */
+  private static int failingRead(int c) {
+    return c < 4 ? -1 : (c - 4) / 2;
+  }
+
+  private static ReadFault readFault(int c) {
+    return c % 2 == 0 ? ReadFault.FAIL : ReadFault.FAIL_MID_STREAM;
+  }
+
   @Provide
   Arbitrary<Integer> maxAppendCounts() {
     return Arbitraries.of(0, 1, 2, 3, 10_000);
@@ -164,6 +179,7 @@ class TestMultiWriterProperties {
             steps,
             Arbitraries.integers().between(0, 3),
             Arbitraries.of(OpKind.values()),
+            small,
             small,
             small)
         .as(Cmd::new)
@@ -201,7 +217,8 @@ class TestMultiWriterProperties {
    * cleanly. An operation on an existing entity picks from the snapshot when {@code a < 8} and from
    * the whole universe otherwise, which reaches entities created earlier in the same transaction
    * and ones that do not exist. Commands that do not apply (a commit by an idle writer, an
-   * operation the transaction rejects while staging) are skipped.
+   * operation the transaction rejects while staging) are skipped. On faulty storage, a commit's
+   * {@code a} and {@code b} pick its write faults and {@code c} its read fault.
    */
   static final class Cmd {
     final Step step;
@@ -209,13 +226,15 @@ class TestMultiWriterProperties {
     final OpKind op;
     final int a;
     final int b;
+    final int c;
 
-    Cmd(Step step, int writer, OpKind op, int a, int b) {
+    Cmd(Step step, int writer, OpKind op, int a, int b, int c) {
       this.step = step;
       this.writer = writer;
       this.op = op;
       this.a = a;
       this.b = b;
+      this.c = c;
     }
 
     @Override
@@ -524,8 +543,12 @@ class TestMultiWriterProperties {
             break;
           case COMMIT:
             if (w.snapshot != null) {
-              commit(w, faults ? List.of(FIRST_WRITE_FAULTS.get(cmd.a % 12),
-                  SECOND_WRITE_FAULTS.get(cmd.b % 12)) : List.of());
+              if (faults) {
+                commit(w, List.of(FIRST_WRITE_FAULTS.get(cmd.a % 12),
+                    SECOND_WRITE_FAULTS.get(cmd.b % 12)), failingRead(cmd.c), readFault(cmd.c));
+              } else {
+                commit(w, List.of(), -1, ReadFault.NONE);
+              }
             }
             break;
           default:
@@ -534,7 +557,7 @@ class TestMultiWriterProperties {
       }
       for (Writer w : writers) {
         if (w.snapshot != null) {
-          commit(w, List.of());
+          commit(w, List.of(), -1, ReadFault.NONE);
         }
       }
     }
@@ -579,7 +602,12 @@ class TestMultiWriterProperties {
       }
     }
 
-    private void commit(Writer w, List<Fault> plan) {
+    /**
+     * Commits {@code w}'s transaction. The first writes fail as {@code plan} says, and read request
+     * number {@code failingRead} of the catalog (counting from 0; -1 for none) fails as {@code
+     * readFault} says.
+     */
+    private void commit(Writer w, List<Fault> plan, int failingRead, ReadFault readFault) {
       List<Op> ops = w.ops;
       byte[] liveBefore = liveBytes();
       int mark = io.history().size();
@@ -591,6 +619,16 @@ class TestMultiWriterProperties {
             Fault fault = fired.size() < plan.size() ? plan.get(fired.size()) : Fault.NONE;
             fired.add(fault);
             return fault;
+          });
+      int[] reads = {0};
+      List<String> readsFailed = new ArrayList<>();
+      io.injectReadFaults(
+          location -> {
+            if (reads[0]++ != failingRead) {
+              return ReadFault.NONE;
+            }
+            readsFailed.add("read #" + failingRead + " " + readFault);
+            return readFault;
           });
       Outcome outcome;
       String reason = "";
@@ -604,13 +642,14 @@ class TestMultiWriterProperties {
         outcome = Outcome.UNKNOWN;
         reason = " (" + e.getMessage() + ")";
       } catch (RuntimeException e) {
-        if (fired.stream().allMatch(f -> f == Fault.NONE)) {
+        if (fired.stream().allMatch(f -> f == Fault.NONE) && readsFailed.isEmpty()) {
           throw e; // not a storage fault: a bug
         }
         outcome = Outcome.FAILED;
         reason = " (" + e.getClass().getSimpleName() + ": " + e.getMessage() + ")";
       } finally {
         io.injectFaults((location, strategy) -> Fault.NONE);
+        io.injectReadFaults(location -> ReadFault.NONE);
       }
       List<InMemoryAtomicFileIO.Write> writes = io.history().subList(mark, io.history().size());
       List<InMemoryAtomicFileIO.Write> effective = new ArrayList<>();
@@ -628,7 +667,8 @@ class TestMultiWriterProperties {
       InMemoryAtomicFileIO.Write write =
           !effective.isEmpty() ? effective.get(0) : writes.isEmpty() ? null : writes.get(0);
       String faultsFired =
-          fired.stream().anyMatch(f -> f != Fault.NONE) ? " after faults " + fired : "";
+          (fired.stream().anyMatch(f -> f != Fault.NONE) ? " after faults " + fired : "")
+              + (readsFailed.isEmpty() ? "" : " after " + readsFailed.get(0));
       String path =
           (io.rejected(AtomicOutputFile.Strategy.CAS) > lostCas ? "lost CAS race, " : "")
               + (io.rejected(AtomicOutputFile.Strategy.APPEND) > lostAppends
