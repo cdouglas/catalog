@@ -59,20 +59,6 @@ JSON parsers are already in upstream Iceberg.
 **Trigger to revisit:** when a stats-maintaining workload shows up where
 the full-mode size penalty matters.
 
-### D10. ADLS CAS does not work with vended SAS credentials
-
-ADLS CAS renames a staged temp onto the catalog file, and under SAS
-auth the rename must carry the SAS in `x-ms-rename-source`. The Azure
-SDK adds it only for clients built with a SAS token (`adls.sas-token.*`
-in `AzureProperties`); SAS added by `VendedAzureSasCredentialPolicy`
-(REST-catalog credential vending) reaches the request URL but not the
-rename source, so the rename fails with 403. Shared key and OAuth are
-unaffected. Building the rename source from the vended token would fix
-it.
-
-**Trigger:** the first deployment that serves a `FileIOCatalog` on ADLS
-through vended credentials.
-
 ### D8. Typed-protobuf encoding for Iceberg structural types (skip JSON serde)
 
 `AddSortOrderUpdate` is encoded structurally (see SPEC_TM.md §"Other
