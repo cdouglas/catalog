@@ -83,7 +83,8 @@ import org.apache.iceberg.io.ProtoCatalogFormat;
  *
  * <p>{@link #faultyStorageNeverMisreportsACommit} runs the same schedules on storage that fails
  * (see {@link InMemoryAtomicFileIO.Fault}): a write may not land, or land with its reply lost, or
- * land and report a precondition failure; and a read of the catalog during the commit may fail
+ * land and report a precondition failure, or be throttled before or after it lands; and a read of
+ * the catalog during the commit may fail
  * (see {@link InMemoryAtomicFileIO.ReadFault}). A writer must be able to trust a definite answer.
  * Iceberg deletes a commit's new files on {@link CommitFailedException} (a {@code
  * CleanableFailure}) and on any failure but {@link CommitStateUnknownException}, so a transaction
@@ -132,15 +133,17 @@ class TestMultiWriterProperties {
   private static final List<Fault> FIRST_WRITE_FAULTS =
       List.of(
           Fault.NONE, Fault.NONE, Fault.NONE, Fault.NONE,
-          Fault.FAIL_BEFORE, Fault.FAIL_BEFORE,
+          Fault.FAIL_BEFORE,
           Fault.LOST_REPLY, Fault.LOST_REPLY,
-          Fault.LOST_REPLY_RUNTIME, Fault.LOST_REPLY_RUNTIME,
-          Fault.LANDED_AS_CONFLICT, Fault.LANDED_AS_CONFLICT);
+          Fault.LOST_REPLY_RUNTIME,
+          Fault.LANDED_AS_CONFLICT, Fault.LANDED_AS_CONFLICT,
+          Fault.THROTTLED, Fault.LANDED_THROTTLED);
   private static final List<Fault> SECOND_WRITE_FAULTS =
       List.of(
           Fault.NONE, Fault.NONE, Fault.NONE, Fault.NONE,
-          Fault.NONE, Fault.NONE, Fault.NONE, Fault.NONE,
-          Fault.FAIL_BEFORE, Fault.LOST_REPLY, Fault.LOST_REPLY_RUNTIME, Fault.LANDED_AS_CONFLICT);
+          Fault.NONE, Fault.NONE, Fault.NONE,
+          Fault.FAIL_BEFORE, Fault.LOST_REPLY, Fault.LOST_REPLY_RUNTIME, Fault.LANDED_AS_CONFLICT,
+          Fault.LANDED_THROTTLED);
 
   /**
    * A commit step's third operand picks a read of the catalog during the commit to fail, two times
@@ -506,7 +509,9 @@ class TestMultiWriterProperties {
               maxAppendCount,
               appendHeadroom < 0
                   ? ProtoCatalogFormat.DEFAULT_MAX_APPEND_SIZE
-                  : seedLength + appendHeadroom);
+                  : seedLength + appendHeadroom,
+              ProtoCatalogFormat.DEFAULT_COMMITTED_RETENTION_MS,
+              0); // retry throttled writes without sleeping
       this.writers = new Writer[writers];
       for (int i = 0; i < writers; i++) {
         this.writers[i] = new Writer(i);

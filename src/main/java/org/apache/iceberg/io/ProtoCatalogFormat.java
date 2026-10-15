@@ -93,9 +93,16 @@ public class ProtoCatalogFormat
   public static final String COMMITTED_RETENTION_MS = "fileio.catalog.committed.retention.ms";
   public static final long DEFAULT_COMMITTED_RETENTION_MS = 6L * 60 * 60 * 1000;
 
+  /**
+   * First wait before retrying a write that storage throttled; each later wait doubles, up to 5 s.
+   */
+  public static final String THROTTLE_MIN_WAIT_MS = "fileio.catalog.throttle.retry.min-wait-ms";
+  public static final long DEFAULT_THROTTLE_MIN_WAIT_MS = 200L;
+
   private final int maxAppendCount;
   private final long maxAppendSize;
   private final long committedRetentionMs;
+  private final long throttleMinWaitMs;
 
   public ProtoCatalogFormat() {
     this(DEFAULT_MAX_APPEND_COUNT, DEFAULT_MAX_APPEND_SIZE, DEFAULT_COMMITTED_RETENTION_MS);
@@ -106,7 +113,8 @@ public class ProtoCatalogFormat
         parseIntProperty(properties, MAX_APPEND_COUNT, DEFAULT_MAX_APPEND_COUNT),
         parseLongProperty(properties, MAX_APPEND_SIZE, DEFAULT_MAX_APPEND_SIZE),
         parseLongProperty(
-            properties, COMMITTED_RETENTION_MS, DEFAULT_COMMITTED_RETENTION_MS));
+            properties, COMMITTED_RETENTION_MS, DEFAULT_COMMITTED_RETENTION_MS),
+        parseLongProperty(properties, THROTTLE_MIN_WAIT_MS, DEFAULT_THROTTLE_MIN_WAIT_MS));
   }
 
   public ProtoCatalogFormat(int maxAppendCount, long maxAppendSize) {
@@ -114,15 +122,23 @@ public class ProtoCatalogFormat
   }
 
   public ProtoCatalogFormat(int maxAppendCount, long maxAppendSize, long committedRetentionMs) {
+    this(maxAppendCount, maxAppendSize, committedRetentionMs, DEFAULT_THROTTLE_MIN_WAIT_MS);
+  }
+
+  public ProtoCatalogFormat(
+      int maxAppendCount, long maxAppendSize, long committedRetentionMs, long throttleMinWaitMs) {
     Preconditions.checkArgument(maxAppendCount >= 0,
         "maxAppendCount must be >= 0, got %s", maxAppendCount);
     Preconditions.checkArgument(maxAppendSize >= 0,
         "maxAppendSize must be >= 0, got %s", maxAppendSize);
     Preconditions.checkArgument(committedRetentionMs >= 0,
         "committedRetentionMs must be >= 0, got %s", committedRetentionMs);
+    Preconditions.checkArgument(throttleMinWaitMs >= 0,
+        "throttleMinWaitMs must be >= 0, got %s", throttleMinWaitMs);
     this.maxAppendCount = maxAppendCount;
     this.maxAppendSize = maxAppendSize;
     this.committedRetentionMs = committedRetentionMs;
+    this.throttleMinWaitMs = throttleMinWaitMs;
   }
 
   public int maxAppendCount() {
@@ -135,6 +151,10 @@ public class ProtoCatalogFormat
 
   public long committedRetentionMs() {
     return committedRetentionMs;
+  }
+
+  public long throttleMinWaitMs() {
+    return throttleMinWaitMs;
   }
 
   private static int parseIntProperty(Map<String, String> properties, String key, int dflt) {
@@ -151,7 +171,7 @@ public class ProtoCatalogFormat
 
   @Override
   public CatalogFile.Mut<ProtoCatalogFile, Mut> empty(InputFile input) {
-    return new Mut(input, maxAppendCount, maxAppendSize, committedRetentionMs);
+    return new Mut(input, maxAppendCount, maxAppendSize, committedRetentionMs, throttleMinWaitMs);
   }
 
   @Override
@@ -159,7 +179,12 @@ public class ProtoCatalogFormat
     if (!(other instanceof ProtoCatalogFile)) {
       throw new IllegalArgumentException("Cannot convert to ProtoCatalogFile: " + other);
     }
-    return new Mut((ProtoCatalogFile) other, maxAppendCount, maxAppendSize, committedRetentionMs);
+    return new Mut(
+        (ProtoCatalogFile) other,
+        maxAppendCount,
+        maxAppendSize,
+        committedRetentionMs,
+        throttleMinWaitMs);
   }
 
   @Override
@@ -295,6 +320,7 @@ public class ProtoCatalogFormat
     private final int maxAppendCount;
     private final long maxAppendSize;
     private final long committedRetentionMs;
+    private final long throttleMinWaitMs;
     private ProtoCodec.Transaction pendingTransaction;
 
     Mut(InputFile input) {
@@ -302,19 +328,23 @@ public class ProtoCatalogFormat
     }
 
     Mut(ProtoCatalogFile other) {
-      this(other, DEFAULT_MAX_APPEND_COUNT, DEFAULT_MAX_APPEND_SIZE, DEFAULT_COMMITTED_RETENTION_MS);
+      this(other, DEFAULT_MAX_APPEND_COUNT, DEFAULT_MAX_APPEND_SIZE,
+          DEFAULT_COMMITTED_RETENTION_MS, DEFAULT_THROTTLE_MIN_WAIT_MS);
     }
 
-    Mut(InputFile input, int maxAppendCount, long maxAppendSize, long committedRetentionMs) {
-      this(ProtoCatalogFile.empty(input), maxAppendCount, maxAppendSize, committedRetentionMs);
+    Mut(InputFile input, int maxAppendCount, long maxAppendSize, long committedRetentionMs,
+        long throttleMinWaitMs) {
+      this(ProtoCatalogFile.empty(input), maxAppendCount, maxAppendSize, committedRetentionMs,
+          throttleMinWaitMs);
     }
 
     Mut(ProtoCatalogFile other, int maxAppendCount, long maxAppendSize,
-        long committedRetentionMs) {
+        long committedRetentionMs, long throttleMinWaitMs) {
       super(other);
       this.maxAppendCount = maxAppendCount;
       this.maxAppendSize = maxAppendSize;
       this.committedRetentionMs = committedRetentionMs;
+      this.throttleMinWaitMs = throttleMinWaitMs;
     }
 
     /**
@@ -819,43 +849,19 @@ public class ProtoCatalogFormat
         throw new CommitFailedException(e, "CAS commit failed: %s", e.getMessage());
       }
 
-      // Retry budget for transient backpressure (StorageThrottleException: 429s,
-      // 5xx, GCS per-object update rate). The underlying invariants still hold,
-      // so the same write should succeed after a backoff. A real CAS conflict
-      // (StorageInvariantException) propagates so the outer commit loop can
-      // re-read state.
-      final int maxThrottleAttempts = 8;
-      long backoffMs = 200L;
-      SupportsAtomicOperations.StorageThrottleException lastThrottle = null;
-      for (int attempt = 0; attempt < maxThrottleAttempts; attempt++) {
-        try {
-          AtomicOutputFile outputFile = fileIO.newOutputFile(current);
-          try (ByteArrayInputStream serBytes = new ByteArrayInputStream(fullFile)) {
-            serBytes.mark(fullFile.length);
-            CAS token = outputFile.prepare(() -> serBytes, AtomicOutputFile.Strategy.CAS);
-            serBytes.reset();
-            return writeAndRead(outputFile, token, () -> serBytes);
-          }
-        } catch (SupportsAtomicOperations.StorageThrottleException e) {
-          lastThrottle = e;
-          long sleepMs =
-              backoffMs + java.util.concurrent.ThreadLocalRandom.current().nextLong(backoffMs / 2 + 1);
-          try {
-            Thread.sleep(sleepMs);
-          } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            throw new CommitFailedException(ie, "Interrupted retrying CAS commit");
-          }
-          backoffMs = Math.min(backoffMs * 2, 5_000L);
-        } catch (IOException e) {
-          throw new CommitFailedException(e, "CAS commit failed: %s", e.getMessage());
-        }
-      }
-      throw new CommitFailedException(
-          lastThrottle,
-          "CAS commit failed: storage throttled %d attempts at %s",
-          maxThrottleAttempts,
-          current.location());
+      return retryThrottled(
+          current.location(),
+          () -> {
+            AtomicOutputFile outputFile = fileIO.newOutputFile(current);
+            try (ByteArrayInputStream serBytes = new ByteArrayInputStream(fullFile)) {
+              serBytes.mark(fullFile.length);
+              CAS token = outputFile.prepare(() -> serBytes, AtomicOutputFile.Strategy.CAS);
+              serBytes.reset();
+              return writeAndRead(outputFile, token, () -> serBytes);
+            } catch (IOException e) {
+              throw new CommitFailedException(e, "CAS commit failed: %s", e.getMessage());
+            }
+          });
     }
 
     /**
@@ -864,19 +870,70 @@ public class ProtoCatalogFormat
      */
     private ProtoCatalogFile tryAppend(
         InputFile current, byte[] txnBytes, SupportsAtomicOperations fileIO) {
+      final byte[] record;
       try {
-        AtomicOutputFile outputFile = fileIO.newOutputFile(current);
-        byte[] record = buildTransactionRecord(txnBytes);
-
-        try (ByteArrayInputStream serBytes = new ByteArrayInputStream(record)) {
-          serBytes.mark(record.length);
-          CAS token = outputFile.prepare(() -> serBytes, AtomicOutputFile.Strategy.APPEND);
-          serBytes.reset();
-          return writeAndRead(outputFile, token, () -> serBytes);
-        }
+        record = buildTransactionRecord(txnBytes);
       } catch (IOException e) {
         throw new UncheckedIOException("Append commit failed: " + e.getMessage(), e);
       }
+      return retryThrottled(
+          current.location(),
+          () -> {
+            AtomicOutputFile outputFile = fileIO.newOutputFile(current);
+            try (ByteArrayInputStream serBytes = new ByteArrayInputStream(record)) {
+              serBytes.mark(record.length);
+              CAS token = outputFile.prepare(() -> serBytes, AtomicOutputFile.Strategy.APPEND);
+              serBytes.reset();
+              return writeAndRead(outputFile, token, () -> serBytes);
+            } catch (IOException e) {
+              throw new UncheckedIOException("Append commit failed: " + e.getMessage(), e);
+            }
+          });
+    }
+
+    /**
+     * Performs {@code write}, retrying it after a backoff while storage applies backpressure
+     * (StorageThrottleException: a 429, a 5xx, the GCS per-object update rate). Each retry carries
+     * the same precondition, so at most one attempt lands. A throttled write may have landed even
+     * so: a 5xx can follow a write the service applied, and an SDK's own retries report only the
+     * last attempt. A retry of a write that landed fails its precondition, which the commit loop
+     * resolves by reading the catalog; running out of retries leaves the outcome unknown in the
+     * same way, so it is an {@link AmbiguousWrite}. An interrupt during the backoff stops the
+     * commit with its outcome unknown.
+     */
+    private ProtoCatalogFile retryThrottled(String location, Supplier<ProtoCatalogFile> write) {
+      final int maxThrottleAttempts = 8;
+      long backoffMs = throttleMinWaitMs;
+      SupportsAtomicOperations.StorageThrottleException lastThrottle = null;
+      for (int attempt = 0; attempt < maxThrottleAttempts; attempt++) {
+        try {
+          return write.get();
+        } catch (SupportsAtomicOperations.StorageThrottleException e) {
+          lastThrottle = e;
+          long sleepMs =
+              backoffMs + java.util.concurrent.ThreadLocalRandom.current().nextLong(backoffMs / 2 + 1);
+          try {
+            Thread.sleep(sleepMs);
+          } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            e.addSuppressed(ie);
+            throw new CommitStateUnknownException(e);
+          }
+          backoffMs = Math.min(backoffMs * 2, Math.max(5_000L, throttleMinWaitMs));
+        } catch (CommitFailedException | UncheckedIOException e) {
+          // This attempt failed before writing; an earlier, throttled one may have landed.
+          if (lastThrottle == null) {
+            throw e;
+          }
+          e.addSuppressed(lastThrottle);
+          throw new AmbiguousWrite(e);
+        }
+      }
+      throw new AmbiguousWrite(
+          new IOException(
+              String.format(
+                  "Storage throttled %d attempts at %s", maxThrottleAttempts, location),
+              lastThrottle));
     }
 
     /**

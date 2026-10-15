@@ -117,10 +117,11 @@ class TestCatalogFaultProperties {
   private static final String CATALOG_NAME = "fuzz";
   private static final String CATALOG_LOCATION = WAREHOUSE + "/catalog-" + CATALOG_NAME;
 
-  // Retry commits without sleeping; merge manifests early, so merge appends read them; keep two
-  // previous metadata files, so pointer-mode commits delete older ones.
-  private static final Map<String, String> TABLE_DEFAULTS =
+  // Retry commits and throttled writes without sleeping; merge manifests early, so merge appends
+  // read them; keep two previous metadata files, so pointer-mode commits delete older ones.
+  private static final Map<String, String> PROPERTIES =
       Map.of(
+          ProtoCatalogFormat.THROTTLE_MIN_WAIT_MS, "0",
           CatalogProperties.TABLE_DEFAULT_PREFIX + TableProperties.COMMIT_MIN_RETRY_WAIT_MS, "1",
           CatalogProperties.TABLE_DEFAULT_PREFIX + TableProperties.COMMIT_MAX_RETRY_WAIT_MS, "1",
           CatalogProperties.TABLE_DEFAULT_PREFIX + TableProperties.MANIFEST_MIN_MERGE_COUNT, "2",
@@ -135,14 +136,16 @@ class TestCatalogFaultProperties {
   private static final List<Fault> FIRST_WRITE_FAULTS =
       List.of(
           Fault.NONE, Fault.NONE, Fault.NONE, Fault.NONE, Fault.NONE, Fault.NONE,
-          Fault.FAIL_BEFORE, Fault.FAIL_BEFORE,
+          Fault.FAIL_BEFORE,
           Fault.LOST_REPLY, Fault.LOST_REPLY_RUNTIME,
-          Fault.LANDED_AS_CONFLICT, Fault.LANDED_AS_CONFLICT);
+          Fault.LANDED_AS_CONFLICT,
+          Fault.THROTTLED, Fault.LANDED_THROTTLED);
   private static final List<Fault> SECOND_WRITE_FAULTS =
       List.of(
           Fault.NONE, Fault.NONE, Fault.NONE, Fault.NONE,
-          Fault.NONE, Fault.NONE, Fault.NONE, Fault.NONE,
-          Fault.FAIL_BEFORE, Fault.LOST_REPLY, Fault.LOST_REPLY_RUNTIME, Fault.LANDED_AS_CONFLICT);
+          Fault.NONE, Fault.NONE, Fault.NONE,
+          Fault.FAIL_BEFORE, Fault.LOST_REPLY, Fault.LOST_REPLY_RUNTIME, Fault.LANDED_AS_CONFLICT,
+          Fault.LANDED_THROTTLED);
 
   @Property(tries = 100)
   void catalogMatchesModel(
@@ -471,9 +474,9 @@ class TestCatalogFaultProperties {
       this.writers = new Writer[writers];
       for (int i = 0; i < writers; i++) {
         this.writers[i] =
-            new Writer(i, mode.catalog(io, WAREHOUSE, CATALOG_NAME, TABLE_DEFAULTS));
+            new Writer(i, mode.catalog(io, WAREHOUSE, CATALOG_NAME, PROPERTIES));
       }
-      this.checker = mode.catalog(io, WAREHOUSE, CATALOG_NAME, TABLE_DEFAULTS);
+      this.checker = mode.catalog(io, WAREHOUSE, CATALOG_NAME, PROPERTIES);
       FileIOCatalog seed = this.writers[0].catalog;
       seed.createNamespace(NS);
       seed.createTable(TABLES.get(0), SCHEMA);

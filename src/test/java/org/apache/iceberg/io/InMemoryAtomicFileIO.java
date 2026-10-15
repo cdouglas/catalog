@@ -50,7 +50,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
  * <p>{@link #injectFaults} makes conditional writes fail the way remote storage can: before the
  * write lands, or after it lands with the reply lost (an {@link IOException} or a runtime error, as
  * SDKs surface either) or reported as a precondition failure (a transport retry that ran into its
- * own write). A lost reply leaves the caller unable to tell whether the write took effect.
+ * own write); or throttled, before or after landing. A lost reply leaves the caller unable to tell
+ * whether the write took effect.
  * {@link #injectReadFaults} makes reads fail: a request for an object's metadata or content throws,
  * or its content stream breaks part way through.
  */
@@ -66,7 +67,14 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
     /** Lands, then throws {@link UncheckedIOException}. */
     LOST_REPLY_RUNTIME,
     /** Lands, then throws the strategy's precondition failure, as a retry of it would. */
-    LANDED_AS_CONFLICT
+    LANDED_AS_CONFLICT,
+    /** Throws {@link StorageThrottleException} (a 429) before the precondition check; nothing lands. */
+    THROTTLED,
+    /**
+     * Lands, then throws {@link StorageThrottleException}: a 5xx after the service applied the
+     * write, or a 429 that ended an SDK's retries of a write that landed.
+     */
+    LANDED_THROTTLED
   }
 
   /**
@@ -428,6 +436,10 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
         if (fault == Fault.FAIL_BEFORE) {
           throw new IOException("injected: " + strategy + " at " + location + " failed before landing");
         }
+        if (fault == Fault.THROTTLED) {
+          String msg = "injected: " + strategy + " at " + location + " throttled";
+          throw new StorageThrottleException(msg, new IOException(msg));
+        }
         Version live = objects.get(location);
         long expectedGen = expected == null ? 0 : expected.generation;
         long liveGen = live == null ? 0 : live.generation;
@@ -459,6 +471,9 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
             throw new IOException(landed + "the reply was lost");
           case LOST_REPLY_RUNTIME:
             throw new UncheckedIOException(new IOException(landed + "the reply was lost"));
+          case LANDED_THROTTLED:
+            String throttled = landed + "the service replied that it was throttled";
+            throw new StorageThrottleException(throttled, new IOException(throttled));
           case LANDED_AS_CONFLICT:
             String msg = landed + "a retry of it failed its precondition";
             if (strategy == Strategy.APPEND) {

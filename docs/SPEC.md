@@ -575,6 +575,7 @@ Two thresholds control whether a commit takes the append path or the CAS
 |-----------------------------------|-------------|---------|
 | `fileio.catalog.max.append.count` | 10000       | Soft limit on log records: a writer that reads at least this many CASes instead of appending. Writers retrying a lost append race do not re-read the count, so the log can run a few records past it. Sized to provider limits (S3 Express 10k parts, Azure AppendBlob 50k blocks). **Setting to 0 forces CAS on every commit**, for providers without conditional append (S3 standard, GCS). |
 | `fileio.catalog.max.append.size`  | 16777216    | Soft performance target for total file size. Larger catalogs take longer to read. |
+| `fileio.catalog.throttle.retry.min-wait-ms` | 200 | First wait before retrying a write that storage throttled; later waits double, up to 5 s, for 8 attempts in all. |
 
 `ProtoCatalogFile` tracks `appendCount` (the number of transaction records in
 the log portion), computed during `readInternal`.
@@ -708,8 +709,10 @@ that do not require strict cleanup, on any failure but
 `CommitStateUnknownException`), so reporting a landed commit any other way
 loses the files its snapshot references. A write fails ambiguously when
 `writeAtomic` throws anything but the protocol's conflict and throttling
-signals (`CASException`, `AppendException`, `StorageThrottleException`), or
-when reading back what it wrote fails; `tryCAS` and `tryAppend` raise
+signals (`CASException`, `AppendException`, `StorageThrottleException`), when
+reading back what it wrote fails, or when storage throttles it until the
+retries run out (a 5xx can follow a write the service applied, and an SDK's
+own retries report only the last attempt); `tryCAS` and `tryAppend` raise
 `Ambiguous` then. A write that fails its precondition (`Conflict`) may have
 landed too: a transport retry of a write that landed fails it. But that write
 landed before the reply, so a read of the catalog that does not show it rules
@@ -731,16 +734,7 @@ atomically, conditioned on the ETag / generation number of the existing file.
 
 ```
 function tryCAS(base, current, txnBytes, fileIO):
-    outputFile = fileIO.newAtomicOutputFile(current)
-    fullFile   = buildFullFile(base, txnBytes)
-    token      = outputFile.prepare(fullFile, Strategy.CAS)
-    try:
-        written = outputFile.writeAtomic(token, fullFile)
-    catch CASException:
-        return None
-    catch other:
-        throw Ambiguous(other)          # may have landed
-    return Some(READ(written))          # a failure here: Ambiguous too
+    return WRITE(current, buildFullFile(base, txnBytes), Strategy.CAS, fileIO)
 ```
 
 `buildFullFile` creates:
@@ -759,16 +753,32 @@ the file.
 
 ```
 function tryAppend(current, txnBytes, fileIO):
-    outputFile = fileIO.newAtomicOutputFile(current)
-    record     = [varint(len(txnBytes))] + txnBytes
-    token      = outputFile.prepare(record, Strategy.APPEND)
-    try:
-        written = outputFile.writeAtomic(token, record)
-    catch AppendException:
-        return None
-    catch other:
-        throw Ambiguous(other)          # may have landed
-    return Some(READ(written))          # a failure here: Ambiguous too
+    return WRITE(current, [varint(len(txnBytes))] + txnBytes, Strategy.APPEND, fileIO)
+```
+
+Both write through `WRITE`, which retries a write that storage throttles
+(`StorageThrottleException`: a 429, a 5xx, the GCS per-object update rate)
+after a backoff that starts at `fileio.catalog.throttle.retry.min-wait-ms` and
+doubles up to 5 s. Every attempt carries the same precondition, so at most one
+lands; a retry of one that landed fails its precondition, which `COMMIT`
+resolves by reading.
+
+```
+function WRITE(current, bytes, strategy, fileIO):
+    for attempt in 0..7:
+        outputFile = fileIO.newAtomicOutputFile(current)
+        token      = outputFile.prepare(bytes, strategy)
+        try:
+            written = outputFile.writeAtomic(token, bytes)
+        catch StorageThrottleException:
+            backoff()                   # interrupted: throw CommitStateUnknown
+            continue
+        catch CASException or AppendException:
+            throw Conflict              # may have landed: see COMMIT
+        catch other:
+            throw Ambiguous(other)      # may have landed
+        return READ(written)            # a failure here: Ambiguous too
+    throw Ambiguous                     # a throttled attempt may have landed
 ```
 
 ## Compaction

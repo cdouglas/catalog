@@ -1616,6 +1616,106 @@ public class TestCatalogRegressions {
   }
 
   // ============================================================
+  // Bug 25: a CAS that storage throttled until the retries ran out was
+  // reported as CommitFailedException, and a throttled append escaped as a
+  // raw failure. GCS reports a 429 or a 5xx as throttling, and the write
+  // may have landed regardless: a 5xx can follow a write the service
+  // applied, and the SDK's own retries report only the last attempt.
+  // Iceberg deletes a commit's files on CommitFailedException, so a commit
+  // that landed lost them. Running out of throttle retries is now an
+  // ambiguous write, which the commit loop resolves by reading the catalog.
+  // ============================================================
+
+  @Nested
+  class ThrottledWrites {
+
+    private ProtoCatalogFormat format(int maxAppendCount, long throttleMinWaitMs) {
+      return new ProtoCatalogFormat(
+          maxAppendCount,
+          ProtoCatalogFormat.DEFAULT_MAX_APPEND_SIZE,
+          ProtoCatalogFormat.DEFAULT_COMMITTED_RETENTION_MS,
+          throttleMinWaitMs);
+    }
+
+    /** Fails conditional writes as {@code faults} says, in order; later writes succeed. */
+    private void plan(InMemoryAtomicFileIO io, List<Fault> faults) {
+      Iterator<Fault> next = faults.iterator();
+      io.injectFaults((location, strategy) -> next.hasNext() ? next.next() : Fault.NONE);
+    }
+
+    private List<Fault> throttled(Fault first, int times) {
+      List<Fault> faults = Lists.newArrayList(first);
+      for (int i = 1; i < times; i++) {
+        faults.add(Fault.THROTTLED);
+      }
+      return faults;
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 10_000})
+    void writeThatLandedBeforeThrottlingRanOutIsCommitted(int maxAppendCount) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      ProtoCatalogFormat fmt = format(maxAppendCount, 0);
+      ProtoCatalogFile snap = seed(io, fmt, "a");
+      int writes = io.history().size();
+
+      plan(io, throttled(Fault.LANDED_THROTTLED, 8)); // every retry throttled
+      fmt.from(snap).createNamespace(Namespace.of("c")).commit(io);
+
+      assertThat(io.history()).hasSize(writes + 1);
+      assertThat(reread(io, fmt).namespaces()).contains(Namespace.of("c"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 10_000})
+    void writeThrottledUntilTheRetriesRanOutIsRetried(int maxAppendCount) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      ProtoCatalogFormat fmt = format(maxAppendCount, 0);
+      ProtoCatalogFile snap = seed(io, fmt, "a");
+      int writes = io.history().size();
+
+      plan(io, throttled(Fault.THROTTLED, 8));
+      fmt.from(snap).createNamespace(Namespace.of("c")).commit(io);
+
+      assertThat(io.history()).hasSize(writes + 1);
+      assertThat(reread(io, fmt).namespaces()).contains(Namespace.of("c"));
+    }
+
+    @Test
+    void throttlingThatNeverEndsIsCommitStateUnknown() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      ProtoCatalogFormat fmt = format(0, 0);
+      ProtoCatalogFile snap = seed(io, fmt, "a");
+      int writes = io.history().size();
+
+      io.injectFaults((location, strategy) -> Fault.THROTTLED);
+      // Nothing landed, but every throttled write might have.
+      assertThatThrownBy(() -> fmt.from(snap).createNamespace(Namespace.of("c")).commit(io))
+          .isInstanceOf(CommitStateUnknownException.class);
+
+      io.injectFaults((location, strategy) -> Fault.NONE);
+      assertThat(io.history()).hasSize(writes);
+    }
+
+    @Test
+    void interruptedBackoffIsCommitStateUnknown() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      ProtoCatalogFormat fmt = format(0, 1);
+      ProtoCatalogFile snap = seed(io, fmt, "a");
+
+      plan(io, List.of(Fault.LANDED_THROTTLED));
+      Thread.currentThread().interrupt(); // the backoff's sleep throws at once
+      try {
+        assertThatThrownBy(() -> fmt.from(snap).createNamespace(Namespace.of("c")).commit(io))
+            .isInstanceOf(CommitStateUnknownException.class);
+      } finally {
+        Thread.interrupted();
+      }
+      assertThat(reread(io, fmt).namespaces()).contains(Namespace.of("c"));
+    }
+  }
+
+  // ============================================================
   // CAS rebase: a CAS that loses a race re-reads the file and retries on top
   // of the new state when the transaction's preconditions still hold there,
   // instead of failing every concurrent CAS-mode commit. A transaction that
