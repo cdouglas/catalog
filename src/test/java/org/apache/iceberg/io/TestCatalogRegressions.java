@@ -2152,4 +2152,49 @@ public class TestCatalogRegressions {
               "mem:///data/a.parquet", "mem:///data/b.parquet", "mem:///data/c.parquet");
     }
   }
+
+  // ============================================================
+  // Bug 30: a commit that writes full metadata -- a create, or a pointer
+  // table coming back inline -- sent the manifest updates of its new inline
+  // snapshots only if there were any. A snapshot that changes no manifests
+  // (a delete that matched nothing) has none, so the replay registered no
+  // list for it and the table no longer loaded ("sentinel manifest-list
+  // location ... but no pool entry"). Found by TestCatalogFaultProperties.
+  // Such a commit now sends the updates whenever it adds an inline
+  // snapshot, and the replay registers every new inline snapshot's list.
+  // ============================================================
+
+  @Nested
+  class InlineSnapshotWithNoManifestChanges {
+
+    @Test
+    void deleteThatMatchesNothingReinlines() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog pointer = catalog(io, LocalCatalogMode.APPEND);
+      FileIOCatalog ml = catalog(io, LocalCatalogMode.APPEND_ML);
+      pointer.createNamespace(mixedNs);
+      pointer.createTable(mixed, intSchema);
+
+      ml.loadTable(mixed).newDelete().deleteFile("mem:///data/missing.parquet").commit();
+
+      Table table = pointer.loadTable(mixed);
+      assertThat(table.currentSnapshot()).isNotNull();
+      assertThat(manifestLists(io, table).get(table.currentSnapshot().snapshotId())).isEmpty();
+    }
+
+    @Test
+    void createTransactionWithASnapshotThatChangesNothing() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog ml = catalog(io, LocalCatalogMode.APPEND_ML);
+      ml.createNamespace(mixedNs);
+
+      org.apache.iceberg.Transaction create = ml.newCreateTableTransaction(mixed, intSchema);
+      create.newDelete().deleteFile("mem:///data/missing.parquet").commit();
+      create.commitTransaction();
+
+      Table table = ml.loadTable(mixed);
+      assertThat(table.currentSnapshot()).isNotNull();
+      assertThat(manifestLists(io, table).get(table.currentSnapshot().snapshotId())).isEmpty();
+    }
+  }
 }

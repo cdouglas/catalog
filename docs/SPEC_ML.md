@@ -203,10 +203,11 @@ same intention record that carries the table update
 (`FileIOTableOperations.manifestUpdates`):
 
 ```java
-List<DeltaUpdate> manifests = new ArrayList<>();
+List<DeltaUpdate> manifests = null;                   // null: no new inline snapshot
 for (var entry : staged.entrySet()) {
   Snapshot snap = metadata.snapshot(entry.getKey());
   if (snap == null) continue;                         // orphan stage (errata D7)
+  if (manifests == null) manifests = new ArrayList<>();
   Long parent = snap.parentId();
   boolean parentInline = parent == null
       || staged.containsKey(parent)                   // new in this commit
@@ -234,7 +235,10 @@ come from writers that do not inline manifest lists and from eviction
 The manifest updates ride in whichever form the table update takes
 (see [SPEC_TM.md](SPEC_TM.md) §"Delivery Modes"): appended to the TM
 delta, or bundled with full metadata as the `UpdateTableInline.ml_delta`
-payload. A
+payload. A full update or a create sends the payload whenever the commit
+adds an inline snapshot, even with no updates in it (a delete that
+matched nothing changes no manifests); the replay registers every new
+inline snapshot's list, so the invariant *sentinel ⇒ list* holds. A
 metadata-file update (eviction) writes each inline snapshot's list to
 an Avro file instead.
 
@@ -248,8 +252,8 @@ A `createTransaction()` that runs one or more `newFastAppend` calls
 before `commitTransaction()` lands as a single inline create with
 embedded snapshots. The `CreateTableInline` action carries an optional
 `delta` field (`AddManifestDelta` entries only) that
-`InlineDeltaCodec.applyDeltaWithManifests` consumes on apply, exactly
-the way it does for the update path. The TM bytes inside the same
+`InlineDeltaCodec.applyManifestsOnly` consumes on apply, the way a
+full-mode update does. The TM bytes inside the same
 action carry sentinel manifest-list locations
 (`inline://<snapshotId>`) for every freshly-created snapshot — see
 [SPEC_TM.md](SPEC_TM.md) §"Commit Protocol" for the `InlineSnapshot →

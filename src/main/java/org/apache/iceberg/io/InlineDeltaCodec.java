@@ -447,10 +447,10 @@ public class InlineDeltaCodec {
   /**
    * Applies only the ML-pool side of a delta payload to {@code catalogBuilder}'s
    * per-table state, leaving the inline TM bytes untouched. Used by a FULL-mode
-   * UpdateTableInline to land the new snapshots' manifest lists atomically
-   * with the TM: whenever the commit writes full metadata (a pointer table
-   * coming back inline, a delta too big for the update limit, or a change
-   * delta encoding cannot express).
+   * UpdateTableInline and by CreateTableInline to land the new snapshots'
+   * manifest lists atomically with the TM: whenever the commit writes full
+   * metadata (a create, a pointer table coming back inline, a delta too big
+   * for the update limit, or a change delta encoding cannot express).
    *
    * <p>{@code newMetadataBytes} are decoded once to find each new snapshot's
    * parent, whose manifest list it builds on (see {@link NewSnapshotManifests}).
@@ -471,6 +471,17 @@ public class InlineDeltaCodec {
     TableMetadata current =
         newMetadataCodec.decodeFull(newMetadataBytes, "inline://manifests-only");
     NewSnapshotManifests newSnapshots = new NewSnapshotManifests(catalogBuilder, tableId);
+    // Register the new TM's inline snapshots that have no list yet (the ones this update adds),
+    // parents first, so the invariant sentinel => pool entry holds even for a snapshot that changes
+    // no manifests and so has no updates here.
+    Set<Long> listed = catalogBuilder.snapshotManifestKeys(tableId);
+    for (Snapshot snap : current.snapshots()) {
+      String location = snap.manifestListLocation();
+      if (location != null && location.startsWith("inline://")
+          && !listed.contains(snap.snapshotId())) {
+        newSnapshots.add(current, snap.snapshotId());
+      }
+    }
     for (DeltaUpdate update : decoded.updates) {
       if (update instanceof AddSnapshotUpdate) {
         AddSnapshotUpdate addSnap = (AddSnapshotUpdate) update;

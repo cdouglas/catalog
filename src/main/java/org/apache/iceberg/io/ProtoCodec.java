@@ -2811,12 +2811,12 @@ public class ProtoCodec {
       // for newly created tables, we default to empty (set later on first snapshot)
       builder.addInlineTable(id, namespaceId, name, version, metadata, metadataCodec, "");
       if (deltaBytes != null) {
-        // Inline-ML create: feed the initial manifest-pool delta through the
-        // same machinery the update path uses. Decodes against the just-stored
-        // metadata bytes so the per-snapshot ref list can carry forward from
-        // each snapshot's parent within the same create transaction.
-        InlineDeltaCodec.applyDeltaWithManifests(
-            metadata, InlineMetadataCodecs.byTag(metadataCodec), deltaBytes, builder, id);
+        // Inline-ML create: land the manifest lists of the create transaction's snapshots,
+        // the way a full-mode update does. Decodes the just-stored metadata so each snapshot's
+        // list builds on its parent's, and registers every inline snapshot, including one
+        // with no manifest updates of its own.
+        InlineDeltaCodec.applyManifestsOnly(
+            deltaBytes, builder, id, InlineMetadataCodecs.byTag(metadataCodec), metadata);
       }
       // Adding a table mutates the parent's children set; bump so concurrent
       // ns mutations fail verify. Same rule as CreateTableAction.

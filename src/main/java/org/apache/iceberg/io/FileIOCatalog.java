@@ -691,12 +691,12 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         //      bundling AddManifestUpdate entries (built from the producer's
         //      staged ManifestListDelta) into a delta payload that
         //      CreateTableInlineAction.apply feeds through
-        //      InlineDeltaCodec.applyDeltaWithManifests — the same hook the
-        //      update path uses.
+        //      InlineDeltaCodec.applyManifestsOnly — the same hook a full-mode
+        //      update uses.
         List<InlineDeltaCodec.DeltaUpdate> manifests =
             manifestUpdates(null, metadata, staged, "");
         byte[] manifestBytes =
-            manifests.isEmpty()
+            manifests == null
                 ? null
                 : InlineDeltaCodec.encodeDelta(manifests, metadata.lastUpdatedMillis());
         byte[] metadataBytes = inline.codec.encode(rewriteInlineSnapshotsForFullEncode(metadata));
@@ -741,7 +741,9 @@ public class FileIOCatalog extends BaseMetastoreCatalog
           List<InlineDeltaCodec.DeltaUpdate> delta =
               InlineDeltaCodec.computeDelta(base, metadata, prefix);
           if (delta != null) {
-            delta.addAll(manifests);
+            if (manifests != null) {
+              delta.addAll(manifests);
+            }
             byte[] deltaBytes = InlineDeltaCodec.encodeDelta(delta, metadata.lastUpdatedMillis());
             if (deltaBytes.length <= inline.maxUpdateSize) {
               mut.updateTableInlineDelta(tableId, deltaBytes);
@@ -750,10 +752,11 @@ public class FileIOCatalog extends BaseMetastoreCatalog
           }
         }
         // Full mode keeps the manifest pool (I3) and lands the new snapshots' lists with the
-        // metadata: the replay builds each new inline snapshot's list on its parent's.
+        // metadata: the replay registers each new inline snapshot on its parent's list, even one
+        // with no updates of its own.
         byte[] fullBytes = inline.codec.encode(rewriteInlineSnapshotsForFullEncode(metadata));
         byte[] manifestBytes =
-            manifests.isEmpty()
+            manifests == null
                 ? null
                 : InlineDeltaCodec.encodeDelta(manifests, metadata.lastUpdatedMillis());
         if (fullBytes.length + (manifestBytes != null ? manifestBytes.length : 0)
@@ -779,19 +782,25 @@ public class FileIOCatalog extends BaseMetastoreCatalog
      * among the new snapshots carries its whole list: its parent's list is a file, written by a
      * writer that does not inline manifest lists or by an eviction. Stages for snapshots not in
      * {@code metadata} are dropped: a producer staged them and then rolled back (errata D7).
+     * Returns null if no staged snapshot is in {@code metadata}; else the updates, which are none
+     * if the new snapshots change no manifests (a delete that matched nothing) but must still be
+     * sent, so that the catalog registers their lists.
      */
     private List<InlineDeltaCodec.DeltaUpdate> manifestUpdates(
         ProtoCatalogFile proto,
         TableMetadata metadata,
         Map<Long, InlineManifestTableOperations.StagedSnapshotData> staged,
         String prefix) {
-      List<InlineDeltaCodec.DeltaUpdate> updates = new java.util.ArrayList<>();
+      List<InlineDeltaCodec.DeltaUpdate> updates = null;
       Integer tblId = proto != null ? proto.tableId(tableId) : null;
       for (Map.Entry<Long, InlineManifestTableOperations.StagedSnapshotData> entry
           : staged.entrySet()) {
         Snapshot snapshot = metadata.snapshot(entry.getKey());
         if (snapshot == null) {
           continue;
+        }
+        if (updates == null) {
+          updates = new java.util.ArrayList<>();
         }
         Long parentId = snapshot.parentId();
         boolean parentInline =
