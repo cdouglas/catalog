@@ -281,6 +281,30 @@ public class FileIOCatalog extends BaseMetastoreCatalog
     return warehouseLocation + "/" + String.join("/", namespace.levels());
   }
 
+  /**
+   * The location {@code table}'s metadata loads from in {@code catalogFile}, or null if it has no
+   * table of that name. It names the table's version: a pointer table gets a new metadata file on
+   * every commit, and an inline table's location is {@code inline://<table>#<id>.<version>}. The
+   * table id tells apart tables that held the name in turn, whose versions each count from 1:
+   * BaseMetastoreTableOperations reloads only when the location changes, so a handle to a table
+   * that was dropped or renamed away must not see the same location for its successor.
+   */
+  static String metadataLocation(CatalogFile catalogFile, TableIdentifier table) {
+    String location = catalogFile.location(table);
+    if (location != null || !catalogFile.isInlineTable(table)) {
+      return location;
+    }
+    String version = "-1";
+    if (catalogFile instanceof ProtoCatalogFile) {
+      ProtoCatalogFile proto = (ProtoCatalogFile) catalogFile;
+      Integer numId = proto.tableId(table);
+      if (numId != null) {
+        version = numId + "." + proto.tableVersion(numId);
+      }
+    }
+    return "inline://" + table + "#" + version;
+  }
+
   private CatalogFile getCatalogFile() {
     final InputFile catalog = fileIO.newInputFile(catalogLocation);
     return format.read(fileIO, catalog);
@@ -449,22 +473,15 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         // The synthetic location is the cache key for
         // BaseMetastoreTableOperations.refreshFromMetadataLocation: it must be
         // identical across reads of the same logical state and distinct after
-        // any commit. The catalog already tracks both — TblEntry.version bumps
-        // on every commit and is the authoritative monotonic counter — so we
-        // derive the location from (tableId, version) directly. No content
-        // hashing, no collision worry.
+        // any commit, and distinct for another table that later holds the
+        // name. The catalog already tracks all three — TblEntry.version bumps
+        // on every commit, and each table has its own id — so we derive the
+        // location from (name, id, version) directly; see metadataLocation.
+        // No content hashing, no collision worry.
         byte[] inlineMeta = catalogFile.inlineMetadata(tableId);
         byte codecTag = inlineCodecTag(catalogFile, tableId);
         InlineMetadataCodec codec = InlineMetadataCodecs.byTag(codecTag);
-        int version = -1;
-        if (catalogFile instanceof ProtoCatalogFile) {
-          ProtoCatalogFile proto = (ProtoCatalogFile) catalogFile;
-          Integer numId = proto.tableId(tableId);
-          if (numId != null) {
-            version = proto.tableVersion(numId);
-          }
-        }
-        String syntheticLoc = "inline://" + tableId + "#" + version;
+        String syntheticLoc = metadataLocation(catalogFile, tableId);
         refreshFromMetadataLocation(syntheticLoc, null, 0,
             loc -> wrapInlineManifests(codec.decodeFull(inlineMeta, loc), catalogFile));
       } else if (currentMetadataLocation() != null) {

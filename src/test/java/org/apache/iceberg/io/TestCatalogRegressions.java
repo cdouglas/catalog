@@ -618,6 +618,15 @@ public class TestCatalogRegressions {
     return fmt.read(io, io.newInputFile(RACE_LOC));
   }
 
+  /** An unpartitioned data file at mem:///data/{name}.parquet. */
+  private static org.apache.iceberg.DataFile file(String name) {
+    return org.apache.iceberg.DataFiles.builder(org.apache.iceberg.PartitionSpec.unpartitioned())
+        .withPath("mem:///data/" + name + ".parquet")
+        .withFileSizeInBytes(10)
+        .withRecordCount(1)
+        .build();
+  }
+
   // ============================================================
   // Bug 10: buildActions bound new namespace / table ids eagerly from the
   // writer's snapshot (nextNamespaceId / nextTableId). Two writers that read
@@ -1532,6 +1541,49 @@ public class TestCatalogRegressions {
       io.injectReadFaults(location -> ReadFault.NONE);
 
       assertThat(first.loadTable(written).currentSnapshot()).isNull();
+    }
+  }
+
+  // ============================================================
+  // Bug 22: an inline table's synthetic metadata location was
+  // inline://<name>#<version>, and versions count from 1 for each table, so
+  // a table created or renamed under a dropped table's name could reach the
+  // location a handle to the dropped table had cached. BaseMetastoreTable-
+  // Operations reloads only when the location changes, so the stale handle
+  // kept the dropped table's metadata, skipped the UUID check, and committed
+  // a delta built on it to the new table, which lost its snapshot. The
+  // location now carries the table's id. Found by TestCatalogFaultProperties.
+  // ============================================================
+
+  @Nested
+  class StaleInlineHandle {
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class,
+        names = {"APPEND_TM", "CAS_TM", "COMPACT_TM", "APPEND_ML", "CAS_ML", "COMPACT_ML"})
+    void handleToADroppedTableCannotCommitToItsSuccessor(LocalCatalogMode mode)
+        throws IOException {
+      FileIOCatalog catalog = mode.catalog(new InMemoryAtomicFileIO(), "mem:///w", "c", Map.of());
+      catalog.createNamespace(Namespace.of("ns"));
+      TableIdentifier id = TableIdentifier.of("ns", "t");
+      Schema schema = new Schema(Types.NestedField.required(1, "id", Types.IntegerType.get()));
+      catalog.createTable(id, schema);
+      Table stale = catalog.loadTable(id);
+      stale.updateProperties().set("k", "v").commit();
+      stale.refresh(); // caches the dropped table's version 2
+
+      catalog.dropTable(id, false);
+      catalog.createTable(id, schema);
+      catalog.loadTable(id).newFastAppend().appendFile(file("a")).commit(); // also version 2
+
+      assertThatThrownBy(() -> stale.newFastAppend().appendFile(file("b")).commit())
+          .isInstanceOfAny(IllegalStateException.class, CommitFailedException.class);
+      try (CloseableIterable<org.apache.iceberg.FileScanTask> tasks =
+          catalog.loadTable(id).newScan().planFiles()) {
+        assertThat(tasks).extracting(t -> t.file().location())
+            .containsExactly("mem:///data/a.parquet");
+      }
     }
   }
 
