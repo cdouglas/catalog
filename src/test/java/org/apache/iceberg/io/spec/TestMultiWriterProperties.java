@@ -21,10 +21,12 @@ package org.apache.iceberg.io.spec;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -81,15 +83,24 @@ import org.apache.iceberg.io.ProtoCatalogFormat;
  * <p>Conflicts are not asserted: rejecting a commit is always safe. The outcome statistics report
  * how often a rejected transaction would have re-executed cleanly (a spurious conflict).
  *
+ * <p>A commit may also be preempted: another writer with a transaction open commits it to
+ * completion just before one of the first commit's storage requests (its conditional writes and
+ * reads of the catalog), so it lands inside the first commit's loop: before or after the first
+ * commit's write, between a lost reply and the read that resolves it, between a conflict and the
+ * rebase. Each commit is checked on its own writes. Storage may also be strict about
+ * versions, as it is in practice: a read pinned to a version that has since been replaced fails
+ * (a GCS read by generation, an S3 or ADLS read with If-Match), where the lenient model returns
+ * the replaced bytes. With neither faults nor preemption, nothing in a commit fails.
+ *
  * <p>{@link #faultyStorageNeverMisreportsACommit} runs the same schedules on storage that fails
  * (see {@link InMemoryAtomicFileIO.Fault}): a write may not land, or land with its reply lost, or
  * land and report a precondition failure, or be throttled before or after it lands; and a read of
  * the catalog during the commit may fail
  * (see {@link InMemoryAtomicFileIO.ReadFault}). A writer must be able to trust a definite answer.
  * Iceberg deletes a commit's new files on {@link CommitFailedException} (a {@code
- * CleanableFailure}) and on any failure but {@link CommitStateUnknownException}, so a transaction
- * reported any other way as failed must not have taken effect, and an acknowledged one took effect
- * once. A commit may now retry, so it may write more than once; at most one of its writes changes
+ * CleanableFailure}) and, without strict cleanup, on any failure but {@link
+ * CommitStateUnknownException}, so a transaction reported any other way as failed must not have
+ * taken effect, and an acknowledged one took effect once. A commit may now retry, so it may write more than once; at most one of its writes changes
  * the state, and that one is checked as above.
  */
 class TestMultiWriterProperties {
@@ -115,8 +126,9 @@ class TestMultiWriterProperties {
       @ForAll @IntRange(min = 2, max = 4) int writers,
       @ForAll("maxAppendCounts") int maxAppendCount,
       @ForAll("appendHeadrooms") long appendHeadroom,
+      @ForAll boolean strictVersions,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(writers, maxAppendCount, appendHeadroom).execute(schedule);
+    new Run(writers, maxAppendCount, appendHeadroom, false, strictVersions).execute(schedule);
   }
 
   @Property(tries = 300)
@@ -124,8 +136,9 @@ class TestMultiWriterProperties {
       @ForAll @IntRange(min = 2, max = 4) int writers,
       @ForAll("maxAppendCounts") int maxAppendCount,
       @ForAll("appendHeadrooms") long appendHeadroom,
+      @ForAll boolean strictVersions,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(writers, maxAppendCount, appendHeadroom, true).execute(schedule);
+    new Run(writers, maxAppendCount, appendHeadroom, true, strictVersions).execute(schedule);
   }
 
   // A commit step's operands pick the faults for its first two conditional writes; later writes
@@ -158,6 +171,14 @@ class TestMultiWriterProperties {
     return c % 2 == 0 ? ReadFault.FAIL : ReadFault.FAIL_MID_STREAM;
   }
 
+  /**
+   * A commit step's fourth operand picks, half the time, the storage request of the commit (0 to 3)
+   * at which another writer's open transaction commits. Returns -1 for none.
+   */
+  private static int preemptAt(int d) {
+    return d < 6 ? -1 : (d - 6) % 4;
+  }
+
   @Provide
   Arbitrary<Integer> maxAppendCounts() {
     return Arbitraries.of(0, 1, 2, 3, 10_000);
@@ -182,6 +203,7 @@ class TestMultiWriterProperties {
             steps,
             Arbitraries.integers().between(0, 3),
             Arbitraries.of(OpKind.values()),
+            small,
             small,
             small,
             small)
@@ -221,7 +243,8 @@ class TestMultiWriterProperties {
    * the whole universe otherwise, which reaches entities created earlier in the same transaction
    * and ones that do not exist. Commands that do not apply (a commit by an idle writer, an
    * operation the transaction rejects while staging) are skipped. On faulty storage, a commit's
-   * {@code a} and {@code b} pick its write faults and {@code c} its read fault.
+   * {@code a} and {@code b} pick its write faults and {@code c} its read fault; {@code d} picks
+   * where another writer's commit may preempt it.
    */
   static final class Cmd {
     final Step step;
@@ -230,20 +253,25 @@ class TestMultiWriterProperties {
     final int a;
     final int b;
     final int c;
+    final int d;
 
-    Cmd(Step step, int writer, OpKind op, int a, int b, int c) {
+    Cmd(Step step, int writer, OpKind op, int a, int b, int c, int d) {
       this.step = step;
       this.writer = writer;
       this.op = op;
       this.a = a;
       this.b = b;
       this.c = c;
+      this.d = d;
     }
 
     @Override
     public String toString() {
-      return step == Step.OP
-          ? String.format("w%d:%s(%d,%d)", writer, op, a, b)
+      if (step == Step.OP) {
+        return String.format("w%d:%s(%d,%d)", writer, op, a, b);
+      }
+      return step == Step.COMMIT
+          ? String.format("w%d:COMMIT(%d,%d,%d,%d)", writer, a, b, c, d)
           : String.format("w%d:%s", writer, step);
     }
   }
@@ -483,19 +511,53 @@ class TestMultiWriterProperties {
     FAILED
   }
 
+  /**
+   * A commit in progress: its storage plan, the commit that may preempt it, and the history ranges
+   * that preempting commits wrote. Faults and preemption apply only while it is active, that is,
+   * while its own commit runs, not its checks or a preempting commit.
+   */
+  private static final class Context {
+    final List<Fault> plan;
+    final List<Fault> fired = new ArrayList<>();
+    final int failingRead;
+    final ReadFault readFault;
+    final List<String> readsFailed = new ArrayList<>();
+    final List<int[]> nested = new ArrayList<>();
+    Writer pending;
+    final int preemptAt;
+    int preemptedAt = -1;
+    int reads = 0;
+    int requests = 0;
+    boolean active = false;
+
+    Context(List<Fault> plan, int failingRead, ReadFault readFault, Writer pending, int preemptAt) {
+      this.plan = plan;
+      this.failingRead = failingRead;
+      this.readFault = readFault;
+      this.pending = pending;
+      this.preemptAt = preemptAt;
+    }
+
+    boolean faulted() {
+      return fired.stream().anyMatch(f -> f != Fault.NONE) || !readsFailed.isEmpty();
+    }
+  }
+
   private static final class Run {
     private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
     private final ProtoCatalogFormat format;
     private final boolean faults;
     private final Writer[] writers;
     private final StringBuilder trace = new StringBuilder();
+    private final Deque<Context> commits = new ArrayDeque<>();
     private int nextValue = 0;
 
     Run(int writers, int maxAppendCount, long appendHeadroom) {
-      this(writers, maxAppendCount, appendHeadroom, false);
+      this(writers, maxAppendCount, appendHeadroom, false, false);
     }
 
-    Run(int writers, int maxAppendCount, long appendHeadroom, boolean faults) {
+    Run(int writers, int maxAppendCount, long appendHeadroom, boolean faults,
+        boolean strictVersions) {
       this.faults = faults;
       CatalogFile.Mut<ProtoCatalogFile, ?> seed =
           new ProtoCatalogFormat().empty(io.newInputFile(CATALOG));
@@ -516,15 +578,65 @@ class TestMultiWriterProperties {
       for (int i = 0; i < writers; i++) {
         this.writers[i] = new Writer(i);
       }
-      trace.append(String.format("format: maxAppendCount=%d maxAppendSize=%d (seed %d bytes)%n",
-          format.maxAppendCount(), format.maxAppendSize(), seedLength));
+      trace.append(String.format(
+          "format: maxAppendCount=%d maxAppendSize=%d (seed %d bytes)%s%n",
+          format.maxAppendCount(), format.maxAppendSize(), seedLength,
+          strictVersions ? ", strict versions" : ""));
       trace.append("seed: ").append(View.of(read())).append('\n');
+      io.failSupersededReads(strictVersions);
+      io.injectFaults(this::onWrite);
+      io.injectReadFaults(this::onRead);
+    }
+
+    private Fault onWrite(String location, AtomicOutputFile.Strategy strategy) {
+      Context c = commits.peek();
+      if (c == null || !c.active) {
+        return Fault.NONE;
+      }
+      request(c);
+      Fault fault = c.fired.size() < c.plan.size() ? c.plan.get(c.fired.size()) : Fault.NONE;
+      c.fired.add(fault);
+      return fault;
+    }
+
+    private ReadFault onRead(String location) {
+      Context c = commits.peek();
+      if (c == null || !c.active) {
+        return ReadFault.NONE;
+      }
+      request(c);
+      if (c.reads++ != c.failingRead) {
+        return ReadFault.NONE;
+      }
+      c.readsFailed.add("read #" + c.failingRead + " " + c.readFault);
+      return c.readFault;
+    }
+
+    /** Counts a storage request of {@code c}'s commit; runs the preempting commit before it. */
+    private void request(Context c) {
+      int request = c.requests++;
+      if (c.pending == null || request != c.preemptAt) {
+        return;
+      }
+      Writer other = c.pending;
+      c.pending = null;
+      c.preemptedAt = request;
+      c.active = false;
+      int start = io.history().size();
+      trace.append(String.format("  preempted at request #%d by%n", request));
+      commit(other, List.of(), -1, ReadFault.NONE, null, -1);
+      c.nested.add(new int[] {start, io.history().size()});
+      c.active = true;
+    }
+
+    private Writer writer(Cmd cmd) {
+      return writers[cmd.writer % writers.length];
     }
 
     void execute(List<Cmd> schedule) {
 
       for (Cmd cmd : schedule) {
-        Writer w = writers[cmd.writer % writers.length];
+        Writer w = writer(cmd);
         switch (cmd.step) {
           case BEGIN:
             if (w.snapshot == null) {
@@ -548,12 +660,13 @@ class TestMultiWriterProperties {
             break;
           case COMMIT:
             if (w.snapshot != null) {
-              if (faults) {
-                commit(w, List.of(FIRST_WRITE_FAULTS.get(cmd.a % 12),
-                    SECOND_WRITE_FAULTS.get(cmd.b % 12)), failingRead(cmd.c), readFault(cmd.c));
-              } else {
-                commit(w, List.of(), -1, ReadFault.NONE);
+              // The next writer with a transaction open may commit it inside this commit.
+              Writer other = null;
+              for (int k = 1; preemptAt(cmd.d) >= 0 && other == null && k < writers.length; k++) {
+                Writer candidate = writers[(w.id + k) % writers.length];
+                other = candidate.snapshot != null ? candidate : null;
               }
+              commit(w, cmd, other);
             }
             break;
           default:
@@ -562,8 +675,18 @@ class TestMultiWriterProperties {
       }
       for (Writer w : writers) {
         if (w.snapshot != null) {
-          commit(w, List.of(), -1, ReadFault.NONE);
+          commit(w, List.of(), -1, ReadFault.NONE, null, -1);
         }
+      }
+    }
+
+    /** Commits {@code w}'s transaction with the faults {@code cmd} picks, if storage is faulty. */
+    private void commit(Writer w, Cmd cmd, Writer preempting) {
+      if (faults) {
+        commit(w, List.of(FIRST_WRITE_FAULTS.get(cmd.a % 12), SECOND_WRITE_FAULTS.get(cmd.b % 12)),
+            failingRead(cmd.c), readFault(cmd.c), preempting, preemptAt(cmd.d));
+      } else {
+        commit(w, List.of(), -1, ReadFault.NONE, preempting, preemptAt(cmd.d));
       }
     }
 
@@ -610,34 +733,24 @@ class TestMultiWriterProperties {
     /**
      * Commits {@code w}'s transaction. The first writes fail as {@code plan} says, and read request
      * number {@code failingRead} of the catalog (counting from 0; -1 for none) fails as {@code
-     * readFault} says.
+     * readFault} says. If {@code preempting} is not null, that writer commits just before storage
+     * request number {@code preemptAt} of this commit.
      */
-    private void commit(Writer w, List<Fault> plan, int failingRead, ReadFault readFault) {
+    private void commit(Writer w, List<Fault> plan, int failingRead, ReadFault readFault,
+        Writer preempting, int preemptAt) {
       List<Op> ops = w.ops;
       byte[] liveBefore = liveBytes();
       int mark = io.history().size();
       int lostAppends = io.rejected(AtomicOutputFile.Strategy.APPEND);
       int lostCas = io.rejected(AtomicOutputFile.Strategy.CAS);
-      List<Fault> fired = new ArrayList<>();
-      io.injectFaults(
-          (location, strategy) -> {
-            Fault fault = fired.size() < plan.size() ? plan.get(fired.size()) : Fault.NONE;
-            fired.add(fault);
-            return fault;
-          });
-      int[] reads = {0};
-      List<String> readsFailed = new ArrayList<>();
-      io.injectReadFaults(
-          location -> {
-            if (reads[0]++ != failingRead) {
-              return ReadFault.NONE;
-            }
-            readsFailed.add("read #" + failingRead + " " + readFault);
-            return readFault;
-          });
+      Context ctx = new Context(plan, failingRead, readFault, preempting, preemptAt);
+      List<Fault> fired = ctx.fired;
+      List<String> readsFailed = ctx.readsFailed;
+      commits.push(ctx);
       Outcome outcome;
       String reason = "";
       try {
+        ctx.active = true;
         mut(w.snapshot, ops).commit(io);
         outcome = Outcome.ACKNOWLEDGED;
       } catch (CommitFailedException | AlreadyExistsException e) {
@@ -647,16 +760,25 @@ class TestMultiWriterProperties {
         outcome = Outcome.UNKNOWN;
         reason = " (" + e.getMessage() + ")";
       } catch (RuntimeException e) {
-        if (fired.stream().allMatch(f -> f == Fault.NONE) && readsFailed.isEmpty()) {
-          throw e; // not a storage fault: a bug
+        if (!ctx.faulted()) {
+          throw new AssertionError(
+              "commit failed without an injected fault\ntrace:\n" + trace, e); // a bug
         }
         outcome = Outcome.FAILED;
         reason = " (" + e.getClass().getSimpleName() + ": " + e.getMessage() + ")";
       } finally {
-        io.injectFaults((location, strategy) -> Fault.NONE);
-        io.injectReadFaults(location -> ReadFault.NONE);
+        ctx.active = false;
+        commits.pop();
       }
-      List<InMemoryAtomicFileIO.Write> writes = io.history().subList(mark, io.history().size());
+      // This commit's writes: those since it started, less those of the commit that preempted it.
+      List<InMemoryAtomicFileIO.Write> writes = new ArrayList<>();
+      List<InMemoryAtomicFileIO.Write> history = io.history();
+      for (int i = mark; i < history.size(); i++) {
+        final int at = i;
+        if (ctx.nested.stream().noneMatch(r -> at >= r[0] && at < r[1])) {
+          writes.add(history.get(i));
+        }
+      }
       List<InMemoryAtomicFileIO.Write> effective = new ArrayList<>();
       for (InMemoryAtomicFileIO.Write wr : writes) {
         View after = View.of(parse(wr.after()));
@@ -682,6 +804,15 @@ class TestMultiWriterProperties {
               + (write == null ? "no write" : write.strategy() + rebased(w, write));
       trace.append(String.format("w%d commit -> %s%s via %s%s%n",
           w.id, outcome, reason, path, faultsFired));
+      if (ctx.preemptedAt >= 0) {
+        Statistics.label("preemption").collect("at request #" + ctx.preemptedAt);
+        Statistics.label("outcome when preempted").collect(outcome);
+      } else if (preempting != null) {
+        Statistics.label("preemption").collect("commit ended first");
+      }
+      // Storage that does not fail leaves no outcome unknown, races and replaced versions included.
+      check(outcome != Outcome.UNKNOWN || ctx.faulted(),
+          "commit outcome unknown without an injected fault%s", reason);
       Statistics.label("commit path").collect(path);
       Statistics.label("operations per transaction").collect(Math.min(ops.size(), 5));
       if (!faults) {

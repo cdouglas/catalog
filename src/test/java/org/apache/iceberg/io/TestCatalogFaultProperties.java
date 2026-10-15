@@ -87,7 +87,9 @@ import org.apache.iceberg.types.Types;
  * command says: its first two conditional writes (see {@link InMemoryAtomicFileIO.Fault}) and one
  * of its reads (see {@link InMemoryAtomicFileIO.ReadFault}). Reads of {@code metadata.json} do not
  * fail, as Iceberg retries them after 100 ms; nor do reads on Iceberg's worker threads, which
- * would make the schedule nondeterministic. A preempting operation runs without faults.
+ * would make the schedule nondeterministic. A preempting operation runs without faults. Storage may
+ * also be strict about versions, as it is in practice: a read pinned to a replaced version fails
+ * (see {@link InMemoryAtomicFileIO#failSupersededReads}).
  *
  * <p>A model holds each table's UUID, live data files, properties and added columns. After every
  * operation the catalog, read back without faults, must match it:
@@ -151,16 +153,18 @@ class TestCatalogFaultProperties {
   void catalogMatchesModel(
       @ForAll LocalCatalogMode mode,
       @ForAll @IntRange(min = 2, max = 3) int writers,
+      @ForAll boolean strictVersions,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(mode, writers, false).execute(schedule);
+    new Run(mode, writers, false, strictVersions).execute(schedule);
   }
 
   @Property(tries = 100)
   void faultyStorageNeverMisreportsACommit(
       @ForAll LocalCatalogMode mode,
       @ForAll @IntRange(min = 2, max = 3) int writers,
+      @ForAll boolean strictVersions,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(mode, writers, true).execute(schedule);
+    new Run(mode, writers, true, strictVersions).execute(schedule);
   }
 
   @Provide
@@ -468,9 +472,10 @@ class TestCatalogFaultProperties {
     private int reads;
     private final List<String> fired = new ArrayList<>();
 
-    Run(LocalCatalogMode mode, int writers, boolean faults) {
+    Run(LocalCatalogMode mode, int writers, boolean faults, boolean strictVersions) {
       this.mode = mode;
       this.faults = faults;
+      io.failSupersededReads(strictVersions);
       this.writers = new Writer[writers];
       for (int i = 0; i < writers; i++) {
         this.writers[i] =
@@ -482,7 +487,8 @@ class TestCatalogFaultProperties {
       seed.createTable(TABLES.get(0), SCHEMA);
       seed.createTable(TABLES.get(1), SCHEMA).newFastAppend().appendFile(newFile()).commit();
       this.model = actual();
-      trace.append(String.format("mode %s, %d writers%nseed: %s%n", mode, writers, model));
+      trace.append(String.format("mode %s, %d writers%s%nseed: %s%n", mode, writers,
+          strictVersions ? ", strict versions" : "", model));
       io.injectFaults(this::onWrite);
       io.injectReadFaults(this::onRead);
     }
