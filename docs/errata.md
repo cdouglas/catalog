@@ -26,6 +26,39 @@ Iceberg. The cleaner alternative is a parser-level hook: detect the
 pool entries, and construct `InlineSnapshot` directly. **Trigger to
 revisit:** any plan to drop the iceberg fork or upstream the changes.
 
+### S2. Catalog transactions use a forked `SupportsCatalogTransactions`
+
+`FileIOCatalog` commits multi-table transactions through the fork's
+`SupportsCatalogTransactions` and `BaseCatalogTransaction`, a prototype
+of a catalog-transaction API that Apache Iceberg does not have, and the
+fork has since changed both:
+
+- `commitTransaction(Map<BaseCatalogTransaction.TableRef, TableMetadata>
+  reads, List<TableCommit> commits)` takes, for serializable isolation,
+  the metadata of every branch the transaction read, as it read it. The
+  catalog checks them again on the state its commit builds on
+  (`BaseCatalogTransaction.unchangedSinceRead`) and pins those tables in
+  the commit's record. It used to take only the table names, so a change
+  that landed between `BaseCatalogTransaction`'s own check and the
+  catalog's read went unseen (Bug 21). `TableRef` is public for this.
+- `BaseCatalogTransaction` stages a table's updates on the version the
+  transaction read, not a refresh of it, so a write to a table that
+  changed after the transaction read it fails the commit's requirements
+  at either isolation level (Bug 23).
+
+So this catalog is not a drop-in replacement in an existing Iceberg
+deployment: anything that implements or calls `commitTransaction` must
+use the new signature, and a catalog transaction run against a stock
+`BaseCatalogTransaction` keeps both bugs. `RESTCatalog` accepts the read
+set but does not send it, so a REST server sees only the table commits'
+requirements and keeps the race Bug 21 closes here.
+
+**Trigger to revisit:** any plan to drop the iceberg fork or upstream
+the changes. The read set could travel as requirement-only
+`TableCommit`s, which the REST protocol already carries, at the cost of
+checking a read branch's snapshot (`AssertRefSnapshotId`) rather than
+the whole table.
+
 ## Deferred Functionality
 
 ### D3. Pointer-mode eviction of an inline-ML table does not materialize Avro manifest lists

@@ -1471,6 +1471,71 @@ public class TestCatalogRegressions {
   }
 
   // ============================================================
+  // Bug 21: a serializable catalog transaction pinned the tables it read at
+  // the versions FileIOCatalog.commitTransaction read, not the versions the
+  // transaction read. BaseCatalogTransaction validates the read tables just
+  // before calling it, so a change landing between that check and the
+  // commit's own read went unseen, and the transaction committed on a table
+  // that had changed under it (write skew). The transaction now passes the
+  // metadata of each branch it read; the commit checks them, by the rule
+  // BaseCatalogTransaction uses, on the state it builds on, and pins those
+  // tables. Found by TestCatalogFaultProperties.
+  // ============================================================
+
+  @Nested
+  class SerializableReadSkew {
+
+    private org.apache.iceberg.DataFile file(String name) {
+      return org.apache.iceberg.DataFiles.builder(org.apache.iceberg.PartitionSpec.unpartitioned())
+          .withPath("mem:///data/" + name + ".parquet")
+          .withFileSizeInBytes(10)
+          .withRecordCount(1)
+          .build();
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(LocalCatalogMode.class)
+    void changeToAReadTableAfterValidationFailsTheCommit(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog first = mode.catalog(io, "mem:///w", "c", Map.of());
+      FileIOCatalog second = mode.catalog(io, "mem:///w", "c", Map.of());
+      Namespace ns = Namespace.of("ns");
+      first.createNamespace(ns);
+      Schema schema = new Schema(Types.NestedField.required(1, "id", Types.IntegerType.get()));
+      TableIdentifier read = TableIdentifier.of(ns, "read");
+      TableIdentifier written = TableIdentifier.of(ns, "written");
+      first.createTable(read, schema).newFastAppend().appendFile(file("r0")).commit();
+      first.createTable(written, schema);
+
+      org.apache.iceberg.catalog.CatalogTransaction txn =
+          first.createTransaction(
+              org.apache.iceberg.catalog.CatalogTransaction.IsolationLevel.SERIALIZABLE);
+      org.apache.iceberg.catalog.Catalog txc = txn.asCatalog();
+      txc.loadTable(read);
+      txc.loadTable(written).newFastAppend().appendFile(file("w1")).commit();
+
+      // The commit reads the catalog once per table to validate, then once to commit. Another
+      // writer changes the read table just before that last read.
+      int[] reads = {0};
+      Thread committer = Thread.currentThread();
+      io.injectReadFaults(
+          location -> {
+            if (location.equals("mem:///w/catalog-c")
+                && Thread.currentThread() == committer
+                && reads[0]++ == 2) {
+              second.loadTable(read).newFastAppend().appendFile(file("r1")).commit();
+            }
+            return ReadFault.NONE;
+          });
+      assertThatThrownBy(txn::commitTransaction)
+          .isInstanceOf(org.apache.iceberg.exceptions.ValidationException.class);
+      io.injectReadFaults(location -> ReadFault.NONE);
+
+      assertThat(first.loadTable(written).currentSnapshot()).isNull();
+    }
+  }
+
+  // ============================================================
   // CAS rebase: a CAS that loses a race re-reads the file and retries on top
   // of the new state when the transaction's preconditions still hold there,
   // instead of failing every concurrent CAS-mode commit. A transaction that

@@ -1068,10 +1068,8 @@ public class FileIOCatalog extends BaseMetastoreCatalog
   // SupportsCatalogTransaction
 
   @Override
-  public void commitTransaction(List<TableIdentifier> readTables, List<TableCommit> commits) {
-    // TODO XXX This is wrong. The read version needs to be extracted from the spaghetti
-    //      XXX in BaseCatalogTransaction and resolved against table identifiers, but I'm
-    //      XXX tired of tinkering with this fucking codebase.
+  public void commitTransaction(
+      Map<BaseCatalogTransaction.TableRef, TableMetadata> reads, List<TableCommit> commits) {
     // TableCommit validations check the table UUID and snapshot ref for each table
     // if all validations pass for the current CatalogFile, then attempt atomic replace
     final Map<TableIdentifier, InlineManifestTableOperations> sinkOpsByTable =
@@ -1079,8 +1077,19 @@ public class FileIOCatalog extends BaseMetastoreCatalog
     try {
       final CatalogFile current = getCatalogFile();
       final CatalogFile.Mut<?, ?> newCatalog = format.from(current);
-      for (TableIdentifier readTable : readTables) {
-        final FileIOTableOperations ops = newTableOps(readTable, current);
+      // Each branch the transaction read must be as it read it, from then until the commit
+      // lands. BaseCatalogTransaction checked that before calling, but a commit may have landed
+      // since; check again on the state this commit builds on, and readTable makes the commit
+      // fail if the table changes before it lands.
+      for (Map.Entry<BaseCatalogTransaction.TableRef, TableMetadata> read : reads.entrySet()) {
+        TableIdentifier readTable = read.getKey().identifier();
+        String ref = read.getKey().ref();
+        TableMetadata now = newTableOps(readTable, current).current();
+        if (!BaseCatalogTransaction.unchangedSinceRead(ref, read.getValue(), now)) {
+          throw new ValidationException(
+              "SERIALIZABLE isolation violation: Found table metadata updates to table '%s' after it was read on branch '%s'",
+              readTable, ref);
+        }
         newCatalog.readTable(readTable);
       }
       for (TableCommit commit : commits) {
