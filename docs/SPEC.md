@@ -372,7 +372,7 @@ message DropTable {
 message UpdateTableLocation {
   int32  id                = 1;
   int32  version           = 2; // must match current
-  string metadata_location = 3;
+  string metadata_location = 3; // on apply, clears any inline state (SPEC_TM)
 }
 
 message ReadTable {
@@ -884,7 +884,11 @@ parent. The root is otherwise reserved:
 A table ID appears in either `tableById` with a non-null `metadataLocation`
 (pointer mode) or in `tblInlineMetadata` (inline mode), never both. Inline
 tables also appear in `tableById` with `metadataLocation = null` so
-`tableLookup` resolves them uniformly.
+`tableLookup` resolves them uniformly. Applying `UpdateTableLocation`
+clears the table's inline state (metadata, manifest pool, snapshot refs);
+applying a full `UpdateTableInline` clears the location. A checkpoint
+encodes an inline table without a location, so a table holding both
+would lose its metadata file there.
 
 ## Action Verification Rules
 

@@ -1829,4 +1829,75 @@ public class TestCatalogRegressions {
       assertThat(reread(io, fmt).location(t)).isEqualTo("mem:///a/t/v1.metadata.json");
     }
   }
+
+  // ============================================================
+  // Writers that store table metadata differently, on one catalog -- a
+  // pointer writer (metadata files), an inline-TM writer and an inline-ML
+  // writer -- and tables that leave inline storage and come back. Found by
+  // reading the commit paths for errata D3, and by TestCatalogFaultProperties
+  // with a storage mode per writer.
+  // ============================================================
+
+  private static final String WAREHOUSE = "mem:///w";
+  private static final String CATALOG = WAREHOUSE + "/catalog-c";
+
+  private static FileIOCatalog catalog(InMemoryAtomicFileIO io, LocalCatalogMode mode) {
+    return mode.catalog(io, WAREHOUSE, "c", Map.of());
+  }
+
+  private static ProtoCatalogFile catalogFile(InMemoryAtomicFileIO io) {
+    return new ProtoCatalogFormat().read(io, io.newInputFile(CATALOG));
+  }
+
+  private final Namespace mixedNs = Namespace.of("ns");
+  private final TableIdentifier mixed = TableIdentifier.of(mixedNs, "t");
+  private final Schema intSchema =
+      new Schema(Types.NestedField.required(1, "id", Types.IntegerType.get()));
+
+  // ============================================================
+  // Bug 27: a commit that gave an inline table a metadata file -- a pointer
+  // writer's, or an inline writer's eviction -- set the location but kept
+  // the inline metadata. Readers took the metadata file, but the next
+  // checkpoint encoded the table as inline without its location, losing the
+  // commit and every one after it; and an inline writer, seeing the table
+  // still inline, applied its delta to the stale inline copy, losing the
+  // same commits. A metadata-file commit now clears the inline state: a
+  // table is a pointer table or an inline table, never both (SPEC.md).
+  // ============================================================
+
+  @Nested
+  class MetadataFileCommitToAnInlineTable {
+
+    @Test
+    void pointerCommitSurvivesCompaction() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog inline = catalog(io, LocalCatalogMode.APPEND_TM);
+      FileIOCatalog pointer = catalog(io, LocalCatalogMode.APPEND);
+      FileIOCatalog compacting = catalog(io, LocalCatalogMode.CAS);
+      inline.createNamespace(mixedNs);
+      inline.createTable(mixed, intSchema).updateProperties().set("k", "1").commit();
+      pointer.loadTable(mixed).updateProperties().set("k", "2").commit();
+
+      compacting.createNamespace(Namespace.of("other"));
+
+      assertThat(compacting.loadTable(mixed).properties()).containsEntry("k", "2");
+      assertThat(catalogFile(io).isInlineTable(mixed)).isFalse();
+    }
+
+    @Test
+    void inlineCommitBuildsOnAPointerCommit() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog inline = catalog(io, LocalCatalogMode.APPEND_TM);
+      FileIOCatalog pointer = catalog(io, LocalCatalogMode.APPEND);
+      inline.createNamespace(mixedNs);
+      inline.createTable(mixed, intSchema).updateProperties().set("k", "1").commit();
+      pointer.loadTable(mixed).updateProperties().set("k", "2").commit();
+
+      inline.loadTable(mixed).updateProperties().set("j", "1").commit();
+
+      assertThat(pointer.loadTable(mixed).properties())
+          .containsEntry("k", "2")
+          .containsEntry("j", "1");
+    }
+  }
 }

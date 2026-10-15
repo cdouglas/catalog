@@ -2557,6 +2557,11 @@ public class ProtoCodec {
 
     @Override
     public void apply(ProtoCatalogFile.Builder builder) {
+      // A table is a pointer table or an inline table, never both: the metadata file is now the
+      // table's whole state. Inline state left behind would be read again, by an inline writer's
+      // delta and by the next checkpoint, which encodes an inline table without its location,
+      // losing this commit.
+      builder.removeInlineMetadata(id);
       builder.updateTableLocation(id, version + 1, metadataLocation);
     }
   }
