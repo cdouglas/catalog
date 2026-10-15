@@ -1114,6 +1114,9 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         // use fixed catalog snapshot for validation
         FileIOTableOperations ops = newTableOps(tableId, current);
         final TableMetadata currentMetadata = ops.current();
+        if (currentMetadata == null) {
+          throw new NoSuchTableException("Table does not exist: %s", tableId);
+        }
         commit.requirements().forEach(req -> req.validate(currentMetadata));
 
         TableMetadata.Builder newMetadataBuilder = TableMetadata.buildFrom(currentMetadata);

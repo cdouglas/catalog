@@ -1588,6 +1588,34 @@ public class TestCatalogRegressions {
   }
 
   // ============================================================
+  // Bug 24: committing a catalog transaction after another writer dropped a
+  // table it updates threw NullPointerException from the requirement checks.
+  // It now throws NoSuchTableException. Found by TestCatalogFaultProperties.
+  // ============================================================
+
+  @Nested
+  class TransactionOnADroppedTable {
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(LocalCatalogMode.class)
+    void commitAfterTheTableWasDroppedIsNoSuchTable(LocalCatalogMode mode) {
+      FileIOCatalog catalog = mode.catalog(new InMemoryAtomicFileIO(), "mem:///w", "c", Map.of());
+      catalog.createNamespace(Namespace.of("ns"));
+      TableIdentifier id = TableIdentifier.of("ns", "t");
+      catalog.createTable(id, new Schema(Types.NestedField.required(1, "id", Types.IntegerType.get())));
+
+      org.apache.iceberg.catalog.CatalogTransaction txn =
+          catalog.createTransaction(
+              org.apache.iceberg.catalog.CatalogTransaction.IsolationLevel.SNAPSHOT);
+      txn.asCatalog().loadTable(id).newFastAppend().appendFile(file("a")).commit();
+      catalog.dropTable(id, false);
+
+      assertThatThrownBy(txn::commitTransaction).isInstanceOf(NoSuchTableException.class);
+      assertThat(catalog.tableExists(id)).isFalse();
+    }
+  }
+
+  // ============================================================
   // CAS rebase: a CAS that loses a race re-reads the file and retries on top
   // of the new state when the transaction's preconditions still hold there,
   // instead of failing every concurrent CAS-mode commit. A transaction that
