@@ -651,6 +651,10 @@ public class ProtoCatalogFormat
               // current names: a checkpoint of original would erase every record
               // committed since. Our transaction record follows the checkpoint and
               // replay verifies it against that state, as it would an append.
+              // Read the live version afresh rather than the one current was bound
+              // to: storage fails a read pinned to a version another writer has since
+              // replaced (a GCS read by generation, an S3 or ADLS read with If-Match).
+              current = fileIO.newInputFile(current.location());
               ProtoCatalogFile.Builder fresh = replay(current);
               if (fresh.containsTransaction(txn.id())) {
                 return fresh.build(); // an append reported as a lost race landed
@@ -698,7 +702,9 @@ public class ProtoCatalogFormat
             current = fileIO.newInputFile(current.location());
             if (length(current) < oldLength) {
               // File shrank -- another writer compacted. Re-read to refresh
-              // appendCount so the next mustCAS decision is accurate.
+              // appendCount so the next mustCAS decision is accurate; afresh, as
+              // above, since current's version may be replaced by now.
+              current = fileIO.newInputFile(current.location());
               ProtoCatalogFile.Builder fresh = replay(current);
               if (fresh.containsTransaction(txn.id())) {
                 return fresh.build(); // an append reported as a lost race landed

@@ -619,8 +619,11 @@ function COMMIT(fileIO, original, mutations):
             # names. Checkpointing a stale base would erase every record
             # committed since it was read.
             if stale:
-                base  = READ(fileIO, current)
-                stale = false
+                # Afresh: a read pinned to a version another writer has replaced
+                # since current was bound fails on real storage.
+                current = fileIO.newInputFile(current.location)
+                base    = READ(fileIO, current)
+                stale   = false
                 if txn.id in base.committed:
                     return base              # an append reported as a lost race landed
                 unresolved = false
@@ -655,8 +658,9 @@ function COMMIT(fileIO, original, mutations):
             current   = fileIO.newInputFile(current.location)
             if current.length < oldLength:
                 # File shrank (compacted). Re-read so the next mustCAS
-                # decision sees the current appendCount.
-                base = READ(fileIO, current)
+                # decision sees the current appendCount; afresh, as above.
+                current = fileIO.newInputFile(current.location)
+                base    = READ(fileIO, current)
                 if txn.id in base.committed:
                     return base              # an append reported as a lost race landed
                 unresolved = false

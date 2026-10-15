@@ -1716,6 +1716,60 @@ public class TestCatalogRegressions {
   }
 
   // ============================================================
+  // Bug 26: after an append lost its race, the commit bound the catalog's
+  // new version with a metadata request (getLength), and if the retry had to
+  // CAS (by size or count) it then read that version's content. Real storage
+  // fails a read pinned to a version another writer has replaced in between
+  // (a GCS read by generation, an S3 or ADLS read with If-Match), and with
+  // the lost append still unresolved the commit reported its outcome
+  // unknown: a concurrent compaction alone left a commit unknown. The commit
+  // now reads the live version afresh. Found by TestMultiWriterProperties
+  // with preemption and strict versions.
+  // ============================================================
+
+  @Nested
+  class ReplacedVersionRead {
+
+    @Test
+    void compactionBetweenBindingAndReadingTheCatalogIsNotAmbiguous() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      io.failSupersededReads(true);
+      ProtoCatalogFormat appending = format(10_000);
+      ProtoCatalogFile stale = seed(io, appending, "a");
+
+      // Another writer appends a large record.
+      ProtoCatalogFormat.Mut big = (ProtoCatalogFormat.Mut) appending.from(stale);
+      for (String ns : List.of("x1", "x2", "x3", "x4")) {
+        big.createNamespace(Namespace.of(ns));
+      }
+      big.commit(io);
+      ProtoCatalogFile afterBig = reread(io, appending);
+      long length = io.newInputFile(RACE_LOC).getLength();
+
+      // The stale writer's small append fits its view but loses the race; at the new length it
+      // must CAS. Just before it reads the version it bound, a third writer compacts.
+      ProtoCatalogFormat tight =
+          new ProtoCatalogFormat(
+              10_000, length, ProtoCatalogFormat.DEFAULT_COMMITTED_RETENTION_MS, 0);
+      int[] reads = {0};
+      io.injectReadFaults(
+          location -> {
+            if (reads[0]++ == 1) {
+              format(0).from(afterBig).createNamespace(Namespace.of("z")).commit(io);
+            }
+            return ReadFault.NONE;
+          });
+      tight.from(stale).updateProperties(Namespace.of("a"), new HashMap<>(Map.of("k", "v")))
+          .commit(io);
+      io.injectReadFaults(location -> ReadFault.NONE);
+
+      ProtoCatalogFile result = reread(io, appending);
+      assertThat(result.namespaces()).contains(Namespace.of("x1"), Namespace.of("z"));
+      assertThat(result.namespaceProperties(Namespace.of("a"))).containsEntry("k", "v");
+    }
+  }
+
+  // ============================================================
   // CAS rebase: a CAS that loses a race re-reads the file and retries on top
   // of the new state when the transaction's preconditions still hold there,
   // instead of failing every concurrent CAS-mode commit. A transaction that

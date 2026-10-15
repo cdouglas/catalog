@@ -43,7 +43,9 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
  * version its precondition names. {@link AtomicOutputFile.Strategy#CAS} replaces the object only if
  * the live generation is the bound one (or, for an unbound absent file, the object still does not
  * exist). {@link AtomicOutputFile.Strategy#APPEND} adds the bytes at the end under the same
- * condition, as S3 Express does with {@code ifMatch} plus {@code writeOffsetBytes}.
+ * condition, as S3 Express does with {@code ifMatch} plus {@code writeOffsetBytes}. With {@link
+ * #failSupersededReads}, reading a bound generation that a later write replaced fails instead of
+ * returning its bytes, as on real storage: GCS reads by generation, and S3 and ADLS with If-Match.
  *
  * <p>Plain {@link OutputFile} writes are unconditional, as for table metadata and data files.
  *
@@ -162,6 +164,7 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
   private volatile Faults faults = (location, strategy) -> Fault.NONE;
   private final Map<Fault, Integer> injected = Maps.newEnumMap(Fault.class);
   private volatile ReadFaults readFaults = location -> ReadFault.NONE;
+  private volatile boolean failSupersededReads = false;
   private final Map<ReadFault, Integer> injectedReads = Maps.newEnumMap(ReadFault.class);
 
   public InMemoryAtomicFileIO() {
@@ -209,6 +212,14 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
   /** Number of faults injected so far, by kind (excluding {@link Fault#NONE}). */
   public synchronized int injected(Fault fault) {
     return injected.getOrDefault(fault, 0);
+  }
+
+  /**
+   * Whether reading a bound generation that a later write replaced fails ({@link
+   * NotFoundException}), as on real storage, instead of returning the replaced bytes.
+   */
+  public void failSupersededReads(boolean fail) {
+    this.failSupersededReads = fail;
   }
 
   /** Fails read requests as {@code plan} chooses; {@link ReadFault#NONE} for all by default. */
@@ -329,7 +340,9 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
         throw readFailure(location);
       }
       Version v;
+      boolean wasBound;
       synchronized (this) {
+        wasBound = bound;
         if (!bound) {
           bind();
         }
@@ -337,6 +350,9 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
       }
       if (v == null) {
         throw new NotFoundException("File does not exist: %s", location);
+      }
+      if (wasBound && failSupersededReads && objects.get(location) != v) {
+        throw new NotFoundException("Generation %d of %s was replaced", v.generation, location);
       }
       SeekableInputStream stream = new InMemoryInputFile(location, v.bytes).newStream();
       return fault == ReadFault.FAIL_MID_STREAM
