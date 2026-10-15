@@ -1314,6 +1314,47 @@ public class TestCatalogRegressions {
   }
 
   // ============================================================
+  // Bug 19: an inline-ML snapshot without manifests (a delete that matched
+  // nothing) lost its manifest-list entry when a CAS rewrote the checkpoint,
+  // if the table's manifest pool was empty: the checkpoint wrote and read
+  // snapshot refs only alongside pool entries. The table then failed to
+  // load ("sentinel manifest-list location but no pool entry"). Found by
+  // TestCatalogFaultProperties.
+  // ============================================================
+
+  @Nested
+  class EmptyInlineManifestList {
+
+    @Test
+    void snapshotWithoutManifestsSurvivesCompaction() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog =
+          LocalCatalogMode.COMPACT_ML.catalog(io, "mem:///warehouse", "c", Map.of());
+      Namespace ns = Namespace.of("ns");
+      catalog.createNamespace(ns);
+      TableIdentifier id = TableIdentifier.of(ns, "t");
+      Table table =
+          catalog.createTable(id, new Schema(Types.NestedField.required(1, "id", Types.IntegerType.get())));
+      table.newDelete().deleteFile("mem:///missing.parquet").commit();
+      long snapshotId = catalog.loadTable(id).currentSnapshot().snapshotId();
+
+      int compactions = compactions(io);
+      while (compactions(io) == compactions) {
+        catalog.setProperties(ns, Map.of("k", "v" + io.history().size()));
+      }
+
+      Table reloaded = catalog.loadTable(id);
+      assertThat(reloaded.currentSnapshot().snapshotId()).isEqualTo(snapshotId);
+      assertThat(reloaded.currentSnapshot().allManifests(io)).isEmpty();
+    }
+
+    private int compactions(InMemoryAtomicFileIO io) {
+      return (int)
+          io.history().stream().filter(w -> w.strategy() == AtomicOutputFile.Strategy.CAS).count();
+    }
+  }
+
+  // ============================================================
   // CAS rebase: a CAS that loses a race re-reads the file and retries on top
   // of the new state when the transaction's preconditions still hold there,
   // instead of failing every concurrent CAS-mode commit. A transaction that

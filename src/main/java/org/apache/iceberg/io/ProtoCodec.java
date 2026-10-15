@@ -978,25 +978,27 @@ public class ProtoCodec {
     writeString(out, INLINE_TBL_MANIFEST_PREFIX, manifestPrefix);
     writeVarint(out, INLINE_TBL_METADATA_CODEC, metadataCodec & 0xFF);
 
-    // Manifest pool (field 7): encode each unique ManifestFile entry
-    if (pool != null && !pool.isEmpty()) {
-      // Build positional index for snapshot refs
+    // Manifest pool (field 7): encode each unique ManifestFile entry, and build the
+    // positional index for snapshot refs
+    Map<String, Integer> pathToIndex = new java.util.HashMap<>();
+    if (pool != null) {
       List<String> poolOrder = new ArrayList<>(pool.keySet());
-      Map<String, Integer> pathToIndex = new java.util.HashMap<>();
       for (int i = 0; i < poolOrder.size(); i++) {
         pathToIndex.put(poolOrder.get(i), i);
         ManifestFile mf = pool.get(poolOrder.get(i));
         byte[] mfBytes = encodeManifestFileEntry(mf, manifestPrefix);
         writeLengthDelimited(out, INLINE_TBL_MANIFEST_POOL, mfBytes);
       }
+    }
 
-      // Snapshot refs (field 8): per-snapshot index arrays
-      if (snapRefs != null) {
-        for (Map.Entry<Long, List<String>> snapEntry : snapRefs.entrySet()) {
-          byte[] refBytes = encodeSnapshotManifestRefs(
-              snapEntry.getKey(), snapEntry.getValue(), pathToIndex);
-          writeLengthDelimited(out, INLINE_TBL_SNAPSHOT_REFS, refBytes);
-        }
+    // Snapshot refs (field 8): per-snapshot index arrays. A snapshot without manifests (a delete
+    // that matched nothing) has an empty array but still needs its entry, even when the pool is
+    // empty: its inline:// manifest-list location resolves through it.
+    if (snapRefs != null) {
+      for (Map.Entry<Long, List<String>> snapEntry : snapRefs.entrySet()) {
+        byte[] refBytes = encodeSnapshotManifestRefs(
+            snapEntry.getKey(), snapEntry.getValue(), pathToIndex);
+        writeLengthDelimited(out, INLINE_TBL_SNAPSHOT_REFS, refBytes);
       }
     }
 
@@ -1068,19 +1070,17 @@ public class ProtoCodec {
     builder.addInlineTable(id, nsId, name, version, metadata, metadataCodec, manifestPrefix);
 
     // Decode manifest pool (positional array) -> path-keyed map
-    if (!poolEntryBytes.isEmpty()) {
-      List<ManifestFile> poolList = new ArrayList<>(poolEntryBytes.size());
-      for (byte[] entryBytes : poolEntryBytes) {
-        poolList.add(decodeManifestFileEntry(entryBytes, manifestPrefix));
-      }
-      for (ManifestFile mf : poolList) {
-        builder.addManifestToPool(id, mf);
-      }
+    List<ManifestFile> poolList = new ArrayList<>(poolEntryBytes.size());
+    for (byte[] entryBytes : poolEntryBytes) {
+      poolList.add(decodeManifestFileEntry(entryBytes, manifestPrefix));
+    }
+    for (ManifestFile mf : poolList) {
+      builder.addManifestToPool(id, mf);
+    }
 
-      // Decode snapshot refs (index arrays) -> path lists
-      for (byte[] refBytes : snapRefBytes) {
-        decodeSnapshotManifestRefs(refBytes, id, poolList, builder);
-      }
+    // Decode snapshot refs (index arrays) -> path lists; a ref may be empty (see encode)
+    for (byte[] refBytes : snapRefBytes) {
+      decodeSnapshotManifestRefs(refBytes, id, poolList, builder);
     }
   }
 
