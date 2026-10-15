@@ -446,10 +446,11 @@ public class InlineDeltaCodec {
 
   /**
    * Applies only the ML-pool side of a delta payload to {@code catalogBuilder}'s
-   * per-table state, leaving the inline TM bytes untouched. Used in FULL-mode
-   * UpdateTableInline to land staged manifest-list updates atomically with the
-   * TM replacement when delta-mode TM encoding wasn't possible (e.g. concurrent-
-   * replace id collision).
+   * per-table state, leaving the inline TM bytes untouched. Used by a FULL-mode
+   * UpdateTableInline to land the new snapshots' manifest lists atomically
+   * with the TM: whenever the commit writes full metadata (a pointer table
+   * coming back inline, a delta too big for the update limit, or a change
+   * delta encoding cannot express).
    *
    * <p>{@code newMetadataBytes} are decoded once to find each new snapshot's
    * parent, whose manifest list it builds on (see {@link NewSnapshotManifests}).
@@ -570,7 +571,7 @@ public class InlineDeltaCodec {
    * {@code last-updated-ms} field plus any new {@code snapshot-log} entries
    * stamped by {@code setRef}).
    *
-   * <p>Production callers (e.g. {@code FileIOCatalog.commitInline}) pass the
+   * <p>Production callers (e.g. {@code FileIOTableOperations.stageUpdate}) pass the
    * just-built {@code metadata.lastUpdatedMillis()}.
    */
   public static byte[] encodeDelta(List<DeltaUpdate> updates, long lastUpdatedMillis) {
@@ -893,29 +894,6 @@ public class InlineDeltaCodec {
         && java.util.Objects.equals(a.minSnapshotsToKeep(), b.minSnapshotsToKeep())
         && java.util.Objects.equals(a.maxSnapshotAgeMs(), b.maxSnapshotAgeMs())
         && java.util.Objects.equals(a.maxRefAgeMs(), b.maxRefAgeMs());
-  }
-
-  /**
-   * Selects the delivery mode for an inline table update. {@code fullCodec} is
-   * the codec the caller will use for FULL mode; we encode through it to get
-   * an accurate fits-or-not check against {@link #APPEND_LIMIT}.
-   *
-   * @return "delta" if delta fits, "full" if full metadata fits, "pointer" otherwise
-   */
-  public static String selectMode(
-      List<DeltaUpdate> delta, TableMetadata newMeta, int currentTxnSize,
-      InlineMetadataCodec fullCodec) {
-    if (delta != null) {
-      byte[] deltaBytes = encodeDelta(delta, newMeta.lastUpdatedMillis());
-      if (currentTxnSize + deltaBytes.length <= APPEND_LIMIT) {
-        return "delta";
-      }
-    }
-    int fullSize = fullCodec.encode(newMeta).length;
-    if (currentTxnSize + fullSize <= APPEND_LIMIT) {
-      return "full";
-    }
-    return "pointer";
   }
 
   // ============================================================

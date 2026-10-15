@@ -87,22 +87,24 @@ the wire and matches what `wrapInlineManifests` expects on read.
 
 ## Delivery Modes
 
-When committing an update to an inline table,
-`FileIOTableOperations.doCommit()` picks one of three modes based on the
-resulting transaction size:
+When an inline catalog commits a table update,
+`FileIOTableOperations.stageUpdate()` takes the first of three modes
+whose payload fits in `fileio.catalog.inline.max.update.size` (default
+`InlineDeltaCodec.APPEND_LIMIT` = 4 MiB - 4096, leaving a safety margin
+for framing):
 
 | Mode        | Payload                            | When used                                   |
 |-------------|------------------------------------|---------------------------------------------|
-| **Delta**   | Structured `TableMetadataDelta`    | Common path for data commits and DDL        |
-| **Full**    | Complete `TableMetadata` JSON      | Initial creation, re-inlining from pointer  |
-| **Pointer** | Metadata file location string      | Fallback when inline exceeds size limits    |
+| **Delta**   | Structured `TableMetadataDelta`    | The table is inline (common path for data commits and DDL) |
+| **Full**    | Complete encoded `TableMetadata`   | No delta: the table is a pointer table (re-inlining), the delta does not fit, or `computeDelta` cannot express the change |
+| **Pointer** | Metadata file location (`UpdateTableLocation`) | Neither fits: the table leaves inline storage (eviction) |
 
-A single transaction may contain actions in different modes for different
-tables.
-
-`InlineDeltaCodec.selectMode(delta, newMeta, currentTxnSize)` picks the
-mode given the current transaction size and a ~4 MiB budget
-(`APPEND_LIMIT = 4 MiB - 4096`, leaving a safety margin for framing).
+Manifest updates of new inline-ML snapshots count toward the payload
+(see [SPEC_ML.md](SPEC_ML.md)). A create is full mode or pointer mode by
+the same rule. A single transaction may contain actions in different
+modes for different tables. A delta that fits keeps a table inline
+however large its full metadata grows; only the update's size is
+bounded.
 
 ### Action Messages
 
@@ -129,8 +131,12 @@ message UpdateTableInline {
   oneof payload {
     TableMetadataDelta delta             = 3;  // structured changes
     bytes              full_metadata     = 4;  // codec-encoded TableMetadata
-    string             metadata_location = 5;  // pointer fallback
+    string             metadata_location = 5;  // pointer fallback (writers
+                                                   //   evict with UpdateTableLocation)
   }
+  bytes ml_delta            = 7;  // OPTIONAL with full_metadata: manifest
+                                  //   updates of new inline-ML snapshots
+                                  //   (see SPEC_ML.md)
 }
 ```
 
@@ -375,21 +381,14 @@ can independently assign the same id (e.g. `sortOrderId=1`) to different
 content. Delta encoding can't express an in-place id swap — Builder's
 `addSortOrderInternal` short-circuits on existing ids, and there's no
 public `removeSortOrders` / `replaceSortOrder`. `computeDelta` detects
-this at the top of the diff and returns `null`, which `selectMode`
+this at the top of the diff and returns `null`, which the commit
 routes to **full mode**. Full mode serializes the new TM verbatim, so
 the collision resolves naturally on the next read.
 
-For an **inline-ML** table this routing has one extra constraint: if
-the producer staged a non-empty manifest-list delta against a live
-snapshot in the same commit (so the new ML data must be preserved),
-`commitInline` / `commitTransaction` instead surface
-`CommitFailedException`. Full mode would serialize `TableMetadata`
-without visiting the per-snapshot manifest pool, and pointer-mode
-eviction would clear it; both silently drop the staged ML data. The
-exception triggers the producer's retry loop, which refreshes the
-base and re-stages on top of the rebased state — the colliding id is
-reassigned naturally on the next attempt (Builder picks the next
-free id).
+For an **inline-ML** table, full mode carries the staged manifest-list
+updates in its `ml_delta` payload, so the new snapshots' lists land
+atomically with the TM replacement; pointer mode writes them to Avro
+files (see [SPEC_ML.md](SPEC_ML.md) §"Writers in Different Modes").
 
 ## Configuration
 
@@ -397,6 +396,7 @@ free id).
 |-----------------------------------|---------------|-------------|
 | `fileio.catalog.inline`           | `false`       | Enable inline TM. When true, `doCommit()` uses delta/full/pointer mode selection instead of writing external metadata files. |
 | `fileio.catalog.inline.tm.codec`  | `structural`  | Codec for newly-written inline `TableMetadata` bytes. `structural` (binary, columnar) or `gzip` (gzipped JSON). Decode is always driven by the on-wire codec tag, so changing this setting affects only new writes. |
+| `fileio.catalog.inline.max.update.size` | 4,190,208 | Largest inline table update in bytes (a delta, or full metadata with its manifest updates). A larger update writes a metadata file. See "Delivery Modes". |
 
 `fileio.catalog.max.append.count` and `fileio.catalog.max.append.size`
 (see [SPEC.md](SPEC.md)) still apply.
@@ -404,40 +404,38 @@ free id).
 ## Commit Protocol
 
 ```
-function doCommit(base, newMetadata):
-    codec = configuredInlineCodec()                    // structural or gzip
-    if isCreate:
-        # Inline-ML create-with-snapshots: rewrite InlineSnapshots to
-        # BaseSnapshot+sentinel and bundle the manifest pool with the
-        # create action.
-        delta = null
-        toEncode = newMetadata
-        if isInlineML() and hasStagedDeltas():
-            staged   = drainStagedDeltas()
-            delta    = encodeDelta(buildAddManifestUpdates(staged))
-            toEncode = rewriteInlineSnapshotsToSentinels(newMetadata)
-        bytes = codec.encode(toEncode)
-        format.from(lastCatalogFile)
-            .createTableInlineWithManifests(tableId, bytes, codec.tag(), delta)
-            .commit(io)
-        return
+function stageCreate(mut, metadata):                   # base == null
+    manifests = manifestUpdates(staged, metadata)       # null: no inline-ML snapshot
+    bytes = codec.encode(rewriteInlineSnapshotsToSentinels(metadata))
+    if inline and size(bytes, manifests) <= maxUpdateSize:
+        mut.createTableInlineWithManifests(tableId, bytes, codec.tag(), manifests)
+    else:
+        mut.createTable(tableId, writeUpdateMetadata(metadata))
 
-    prefix = lastCatalogFile.manifestListPrefix(tableId)
-    delta  = InlineDeltaCodec.computeDelta(base, newMetadata, prefix)
-    attachStagedManifestDeltas(delta, newMetadata.snapshots())   // SPEC_ML
-    mode   = InlineDeltaCodec.selectMode(delta, newMetadata, 0, codec)
+function stageUpdate(mut, base, metadata):
+    if inline:
+        manifests = manifestUpdates(staged, metadata)   # SPEC_ML
+        if lastCatalogFile.isInlineTable(tableId):
+            delta = computeDelta(base, metadata, prefix)   # null: inexpressible
+            if delta != null and size(delta + manifests) <= maxUpdateSize:
+                mut.updateTableInlineDelta(tableId, encodeDelta(delta + manifests))
+                return
+        full = codec.encode(rewriteInlineSnapshotsToSentinels(metadata))
+        if size(full, manifests) <= maxUpdateSize:
+            mut.updateTableInline(tableId, full, codec.tag(), manifests)
+            return
+    # evict, or a writer that does not inline
+    mut.updateTable(tableId, writeUpdateMetadata(metadata))
 
-    mut = format.from(lastCatalogFile)
-    switch mode:
-        case "delta":
-            mut.updateTableInlineDelta(tableId, encodeDelta(delta))
-        case "full":
-            mut.updateTableInline(tableId, codec.encode(newMetadata), codec.tag())
-        case "pointer":
-            loc = writeMetadataFile(newMetadata)
-            mut.updateTable(tableId, loc)
-    mut.commit(io)
+function writeUpdateMetadata(metadata):
+    # A metadata file names manifest list files only (SPEC_ML)
+    for each InlineSnapshot s in metadata:
+        replace s with a BaseSnapshot naming writeManifestList(s.allManifests)
+    return writeNewMetadataFile(metadata)
 ```
+
+`doCommit` and the multi-table `commitTransaction` both stage through
+these, then commit the catalog file once.
 
 The `delta` payload on `createTableInlineWithManifests` is `null` for
 plain (non-ML) creates; the format reverts to the single-action
@@ -461,13 +459,13 @@ branch (which would lose per-manifest `partitionSpecId` on decode).
 with a `Function<String, TableMetadata>` that parses from the catalog's
 inline bytes.
 
-The synthetic location is `inline://<tableIdentifier>#<hash-of-bytes>`,
-where the hash is `Integer.toHexString(Arrays.hashCode(inlineMeta))`.
-The hash form is required for the
-`BaseMetastoreTableOperations.refreshFromMetadataLocation` cache check:
-when the inline bytes haven't changed, the synthetic location matches
-`currentMetadataLocation`, refresh short-circuits, and the cached
-`TableMetadata` instance survives. A wall-clock-based suffix would force
+The synthetic location is `inline://<tableIdentifier>#<tableId>.<version>`
+(`FileIOCatalog.metadataLocation`): the table version bumps on every
+commit, and the table id tells apart tables that held the name in turn.
+The `BaseMetastoreTableOperations.refreshFromMetadataLocation` cache
+check relies on it: when the table hasn't changed, the synthetic
+location matches `currentMetadataLocation`, refresh short-circuits, and
+the cached `TableMetadata` instance survives. A wall-clock-based suffix would force
 a reload on every refresh and break BaseTransaction's reference-equality
 check (`base != underlyingOps.refresh()`). The synthetic location never
 reaches `FileIO`. **No changes to `BaseMetastoreCatalog` or
@@ -495,22 +493,28 @@ new fields — see entry **RT'** there.
 
 ### Inline → Pointer (Eviction)
 
-Triggered when an update would push the transaction past `APPEND_LIMIT`,
-or when compaction would push the checkpoint past
-`fileio.catalog.max.append.size`. On eviction:
+Triggered when an update fits in `fileio.catalog.inline.max.update.size`
+neither as a delta nor in full. On eviction:
 
-1. Serialize current `TableMetadata` to a `v<N>.metadata.json` in the
+1. Write each inline-ML snapshot's manifest list to an Avro file
+   (`snap-<snapshotId>-<uuid>.avro`) and point the snapshot at it.
+2. Serialize the resulting `TableMetadata` to a metadata file in the
    table's metadata directory.
-2. Record the file location in an `UpdateTableInline` with the `metadata_location`
-   payload.
-3. On apply, the table moves out of `inline_tables` and back into `tables`.
+3. Record the file location in an `UpdateTableLocation` action. On
+   apply, the table's inline state (metadata, manifest pool, snapshot
+   refs) is cleared: the table is a pointer table.
+
+A pointer writer's commit to an inline table is the same record and
+has the same effect. The table version check makes the step atomic
+with the commit it carries.
 
 ### Pointer → Inline (Re-inlining)
 
-- During compaction: the compactor reads external metadata.json files and
-  inlines them in the new checkpoint.
-- On the next table update: the writer can choose to inline the new
-  metadata via full mode.
+An inline writer's next update to a pointer table is full mode if the
+full metadata (with any manifest updates) fits; otherwise the table
+stays a pointer table and the update writes another metadata file. The
+snapshots that have manifest list files keep them. Compaction does not
+re-inline tables.
 
 ### Mixed-Mode Catalogs
 
@@ -529,7 +533,7 @@ larger (5 GB), so Azure is the binding constraint.
 Azure append limit:                     4,194,304 bytes
 Safety margin (framing, varint, etc.):     -4,096 bytes
                                        ──────────────────
-APPEND_LIMIT (per transaction):         4,190,208 bytes (~4.0 MiB)
+APPEND_LIMIT (per table update):        4,190,208 bytes (~4.0 MiB)
 ```
 
 Approximate sizes per update:

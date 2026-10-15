@@ -441,7 +441,7 @@ public class TestInlineManifestEndToEnd {
      * (setProperties) with statistics — currently not representable as a
      * delta — must not silently drop the statistics. The bug was: the
      * presence of a non-stats change made computeDelta return a non-empty
-     * list, selectMode picked "delta", and stats were never encoded.
+     * list, the commit picked delta mode, and stats were never encoded.
      */
     @Test
     void transactionWithStatisticsAndPropertiesSurvivesReload() {
@@ -469,9 +469,9 @@ public class TestInlineManifestEndToEnd {
     }
 
     /**
-     * commitInline full-mode trigger A: a stats-only commit produces no
+     * Full-mode trigger A: a stats-only commit produces no
      * delta-representable updates (computeDelta returns null), so
-     * {@code selectMode} picks {@code "full"} and the wire action carries
+     * {@code stageUpdate} writes full mode and the wire action carries
      * full_metadata. Sharper than {@link
      * #transactionWithStatisticsAndPropertiesSurvivesReload} (which only
      * checks the round-trip outcome): this test cracks open the appended
@@ -502,8 +502,7 @@ public class TestInlineManifestEndToEnd {
      * configuration. The catalog has no prior inline metadata for the
      * table, so a delta-mode apply would silently no-op
      * ({@code UpdateTableInlineAction.apply} bails when {@code currentMeta}
-     * is null). {@code commitInline} compensates by forcing full mode
-     * whenever {@code selectMode} picked delta but
+     * is null). {@code stageUpdate} therefore never writes a delta when
      * {@code lastCatalogFile.isInlineTable(tableId)} is false. The wire
      * action must carry full_metadata, the catalog entry must transition
      * to inline, and the property update must survive reload.
@@ -1583,7 +1582,7 @@ public class TestInlineManifestEndToEnd {
       long secondSnap = tbl.currentSnapshot().snapshotId();
 
       // Stats-only commit. statisticsChanged() → computeDelta returns null →
-      // selectMode picks "full" → case "full" encodes metadata without
+      // stageUpdate writes full mode, which once encoded metadata without
       // rewriting InlineSnapshots to inline:// sentinels.
       StatisticsFile stat = new GenericStatisticsFile(
           secondSnap, "/path/to/stats.puffin", 100, 90, List.of());
@@ -1810,7 +1809,7 @@ public class TestInlineManifestEndToEnd {
      * preserves the pool wholesale; delta-mode replay reconciles via
      * {@code RemoveSnapshotsUpdate}. Combine snapshot expiration with a
      * statistics change to force {@code computeDelta} to return null
-     * (statistics changes flip selectMode to "full") and verify the
+     * (statistics changes force full mode) and verify the
      * dropped snapshot's pool refs are pruned.
      */
     @Test

@@ -137,7 +137,10 @@ Replaying an inline TM update (delta, full, or pointer-eviction) must
 never silently drop the catalog's per-table manifest pool unless the
 eviction is explicitly to pointer mode. `updateInlineMetadata` preserves
 the pool; `removeInlineMetadata` clears it. Callers pick by intent, not
-convenience.
+convenience. Every `UpdateTableLocation` is such an eviction: a table is
+inline or a pointer table, never both, and the metadata file it names
+carries a manifest list file for every snapshot (its writer wrote the
+inline ones out first).
 
 ### I4. Inline replay is byte-stable
 
@@ -390,7 +393,7 @@ classes handle this for you; manual codecs require it as a discipline.
 | `TestProtoCatalogFormat` | PB codec, format read/write, header validation |
 | `TestProtoActions` | Per-action positive/negative tests, conflict matrix, idempotency, randomized tests, inline tables, manifest-pool round-trip |
 | `TestProtoCommitKnobs` | `max.append.count` / `max.append.size` thresholds; `MockIO` |
-| `TestInlineDelta` | Inline TM delta encode/decode/apply, `computeDelta`, `selectMode`, ML delta types |
+| `TestInlineDelta` | Inline TM delta encode/decode/apply, `computeDelta`, ML delta types |
 | `TestInlineManifestEndToEnd` | End-to-end commit→reload across BASELINE / TM_ONLY / TM_ML configs; per-`SnapshotProducer` operation coverage; codec-axis subclass parameterized over `gzip` / `structural` |
 | `CatalogTests`, `CatalogTransactionTests` | Abstract suites consumed from `iceberg-core-tests.jar` (R4 / commit `35076d6`) and run by cloud-provider subclasses |
 | `GCSCatalogTest`, `TestS3Catalog`, `ADLSCatalogTest` | Cloud integration tests, append-mode + pointer (require credentials/emulators) |

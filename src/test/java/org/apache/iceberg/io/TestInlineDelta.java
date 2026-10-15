@@ -615,74 +615,6 @@ public class TestInlineDelta {
   }
 
   // ============================================================
-  // selectMode
-  // ============================================================
-
-  @Nested
-  class SelectModeTests {
-
-    @Test
-    void smallDeltaSelectsDelta() {
-      List<InlineDeltaCodec.DeltaUpdate> delta = List.of(
-          new InlineDeltaCodec.SetPropertiesUpdate(Map.of("k", "v"), Set.of()));
-      assertThat(
-              InlineDeltaCodec.selectMode(
-                  delta, baseMetadata(), 0, InlineMetadataCodecs.JSON_GZIP))
-          .isEqualTo("delta");
-    }
-
-    @Test
-    void nullDeltaSelectsFull() {
-      assertThat(
-              InlineDeltaCodec.selectMode(
-                  null, baseMetadata(), 0, InlineMetadataCodecs.JSON_GZIP))
-          .isEqualTo("full");
-    }
-
-    @Test
-    void oversizedSelectsPointer() {
-      // txn already near the limit
-      int nearLimit = InlineDeltaCodec.APPEND_LIMIT - 10;
-      assertThat(
-              InlineDeltaCodec.selectMode(
-                  null, baseMetadata(), nearLimit, InlineMetadataCodecs.JSON_GZIP))
-          .isEqualTo("pointer");
-    }
-
-    /**
-     * commitInline full-mode trigger B: a non-null delta that encodes
-     * larger than {@code APPEND_LIMIT} but the full TableMetadata still
-     * fits. selectMode must skip "delta" and pick "full".
-     *
-     * <p>Synthesized via SetPropertiesUpdate carrying one large value
-     * just over the budget — the delta byte size is dominated by that
-     * payload. The base metadata stays small, so the full TM JSON is
-     * well under APPEND_LIMIT and "full" is the correct fall-through.
-     */
-    @Test
-    void deltaTooLargeFullFitsSelectsFull() {
-      // One key, one value — the value is sized so the full encoded
-      // delta exceeds APPEND_LIMIT (the SetPropertiesUpdate framing
-      // adds a few bytes around the value, which is fine).
-      String oversizedValue = "x".repeat(InlineDeltaCodec.APPEND_LIMIT);
-      List<InlineDeltaCodec.DeltaUpdate> delta = List.of(
-          new InlineDeltaCodec.SetPropertiesUpdate(
-              Map.of("k", oversizedValue), Set.of()));
-
-      // Sanity-check the synthesized delta is actually oversized.
-      byte[] deltaBytes = InlineDeltaCodec.encodeDelta(
-          delta, baseMetadata().lastUpdatedMillis());
-      assertThat(deltaBytes.length).isGreaterThan(InlineDeltaCodec.APPEND_LIMIT);
-
-      assertThat(
-              InlineDeltaCodec.selectMode(
-                  delta, baseMetadata(), 0, InlineMetadataCodecs.JSON_GZIP))
-          .as("oversized delta with small full TM must fall through to full mode")
-          .isEqualTo("full");
-    }
-  }
-
-  // ============================================================
   // InlineManifestTableOperations tests
   // ============================================================
 
@@ -693,8 +625,9 @@ public class TestInlineDelta {
     void sinkStagesAndDrains() {
       var ops = new FileIOCatalog.InlineManifestTableOperations(
           org.apache.iceberg.catalog.TableIdentifier.of("db", "tbl"),
-          "mem:///catalog", new ProtoCatalogFormat(), null, true, false,
-          InlineMetadataCodecs.JSON_GZIP);
+          "mem:///catalog", new ProtoCatalogFormat(), null,
+          new FileIOCatalog.InlineSettings(
+              true, true, false, InlineMetadataCodecs.JSON_GZIP, InlineDeltaCodec.APPEND_LIMIT));
 
       org.apache.iceberg.ManifestFile m1 = new TestProtoActions.TestManifestFile(
           "s3://b/m1.avro", 1024, 0, org.apache.iceberg.ManifestContent.DATA,
@@ -725,8 +658,9 @@ public class TestInlineDelta {
     void isInstanceOfManifestListSink() {
       var ops = new FileIOCatalog.InlineManifestTableOperations(
           org.apache.iceberg.catalog.TableIdentifier.of("db", "tbl"),
-          "mem:///catalog", new ProtoCatalogFormat(), null, true, false,
-          InlineMetadataCodecs.JSON_GZIP);
+          "mem:///catalog", new ProtoCatalogFormat(), null,
+          new FileIOCatalog.InlineSettings(
+              true, true, false, InlineMetadataCodecs.JSON_GZIP, InlineDeltaCodec.APPEND_LIMIT));
       assertThat(ops).isInstanceOf(org.apache.iceberg.ManifestListSink.class);
     }
 

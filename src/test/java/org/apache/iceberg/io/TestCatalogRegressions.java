@@ -1845,6 +1845,61 @@ public class TestCatalogRegressions {
     return mode.catalog(io, WAREHOUSE, "c", Map.of());
   }
 
+  /** A catalog whose inline updates must fit in 2 KiB. */
+  private static FileIOCatalog small(InMemoryAtomicFileIO io, LocalCatalogMode mode) {
+    return mode.catalog(io, WAREHOUSE, "c", Map.of(FileIOCatalog.INLINE_MAX_UPDATE_SIZE, "2048"));
+  }
+
+  /** A value of {@code size} random characters, which compresses little. */
+  private static String bigValue(int size) {
+    java.util.Random random = new java.util.Random(size);
+    StringBuilder value = new StringBuilder(size);
+    for (int i = 0; i < size; i++) {
+      value.append((char) ('!' + random.nextInt(90)));
+    }
+    return value.toString();
+  }
+
+  private static org.apache.iceberg.DataFile dataFile(String name) {
+    return org.apache.iceberg.DataFiles.builder(org.apache.iceberg.PartitionSpec.unpartitioned())
+        .withPath("mem:///data/" + name + ".parquet")
+        .withFileSizeInBytes(10)
+        .withRecordCount(1)
+        .build();
+  }
+
+  private static List<String> dataFiles(Table table) {
+    List<String> files = Lists.newArrayList();
+    try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.FileScanTask> tasks =
+        table.newScan().planFiles()) {
+      tasks.forEach(task -> files.add(task.file().location()));
+    } catch (IOException e) {
+      throw new java.io.UncheckedIOException(e);
+    }
+    files.sort(String::compareTo);
+    return files;
+  }
+
+  /** Each snapshot's manifest list, with what a reader takes from each manifest's entry. */
+  private static Map<Long, List<String>> manifestLists(InMemoryAtomicFileIO io, Table table) {
+    Map<Long, List<String>> lists = new HashMap<>();
+    for (org.apache.iceberg.Snapshot snapshot : table.snapshots()) {
+      String list = snapshot.manifestListLocation();
+      assertThat(list == null ? snapshot instanceof org.apache.iceberg.InlineSnapshot
+              : io.newInputFile(list).exists())
+          .as("snapshot %d has its manifest list (%s)", snapshot.snapshotId(), list)
+          .isTrue();
+      List<String> manifests = Lists.newArrayList();
+      for (org.apache.iceberg.ManifestFile m : snapshot.allManifests(io)) {
+        manifests.add(String.format("%s spec=%d seq=%d/%d snap=%d files=%d/%d/%d",
+            m.path(), m.partitionSpecId(), m.sequenceNumber(), m.minSequenceNumber(),
+            m.snapshotId(), m.addedFilesCount(), m.existingFilesCount(), m.deletedFilesCount()));
+      }
+      lists.put(snapshot.snapshotId(), manifests);
+    }
+    return lists;
+  }
+
   private static ProtoCatalogFile catalogFile(InMemoryAtomicFileIO io) {
     return new ProtoCatalogFormat().read(io, io.newInputFile(CATALOG));
   }
@@ -1898,6 +1953,119 @@ public class TestCatalogRegressions {
       assertThat(pointer.loadTable(mixed).properties())
           .containsEntry("k", "2")
           .containsEntry("j", "1");
+    }
+
+    @Test
+    void evictionSurvivesCompaction() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog inline = small(io, LocalCatalogMode.APPEND_TM);
+      FileIOCatalog compacting = small(io, LocalCatalogMode.CAS_TM);
+      inline.createNamespace(mixedNs);
+      inline.createTable(mixed, intSchema);
+      String big = bigValue(6000);
+      inline.loadTable(mixed).updateProperties().set("big", big).commit();
+      assertThat(catalogFile(io).isInlineTable(mixed)).as("evicted").isFalse();
+
+      compacting.createNamespace(Namespace.of("other"));
+
+      assertThat(compacting.loadTable(mixed).properties()).containsEntry("big", big);
+    }
+  }
+
+  // ============================================================
+  // Bug 28 (errata D3): a metadata file written for a table with inline
+  // manifest lists -- by a writer that does not inline them, or by an
+  // eviction -- named no manifest list file for the inline snapshots.
+  // Iceberg wrote their manifests as a v1 embedded list of paths, which
+  // reads back with sequence number 0, spec 0 and the snapshot's own id for
+  // every manifest. The writer now writes each inline snapshot's list to an
+  // Avro file first, and an inline-ML table can leave inline storage (it
+  // used to be kept inline past the size limit instead).
+  // ============================================================
+
+  @Nested
+  class MetadataFileForInlineManifestLists {
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND", "CAS"})
+    void pointerWriterKeepsTheManifestLists(LocalCatalogMode pointerMode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog ml = catalog(io, LocalCatalogMode.APPEND_ML);
+      FileIOCatalog pointer = catalog(io, pointerMode);
+      ml.createNamespace(mixedNs);
+      ml.createTable(mixed, intSchema).newFastAppend().appendFile(dataFile("a")).commit();
+      ml.loadTable(mixed).newAppend().appendFile(dataFile("b")).commit();
+      Map<Long, List<String>> before = manifestLists(io, ml.loadTable(mixed));
+
+      pointer.loadTable(mixed).updateProperties().set("k", "v").commit();
+
+      Table table = ml.loadTable(mixed);
+      assertThat(manifestLists(io, table)).isEqualTo(before);
+      assertThat(dataFiles(table))
+          .containsExactly("mem:///data/a.parquet", "mem:///data/b.parquet");
+    }
+
+    @Test
+    void tableTooBigToCreateInlineGetsAMetadataFile() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog ml = small(io, LocalCatalogMode.APPEND_ML);
+      ml.createNamespace(mixedNs);
+      String big = bigValue(6000);
+
+      ml.buildTable(mixed, intSchema).withProperty("big", big).create();
+
+      assertThat(catalogFile(io).isInlineTable(mixed)).isFalse();
+      assertThat(ml.loadTable(mixed).properties()).containsEntry("big", big);
+    }
+
+    @Test
+    void createTransactionTooBigToInlineWritesItsManifestLists() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog ml = small(io, LocalCatalogMode.APPEND_ML);
+      ml.createNamespace(mixedNs);
+
+      org.apache.iceberg.Transaction create =
+          ml.buildTable(mixed, intSchema).withProperty("big", bigValue(6000))
+              .createTransaction();
+      create.newFastAppend().appendFile(dataFile("a")).commit();
+      create.newFastAppend().appendFile(dataFile("b")).commit();
+      create.commitTransaction();
+
+      assertThat(catalogFile(io).isInlineTable(mixed)).isFalse();
+      Table table = ml.loadTable(mixed);
+      assertThat(manifestLists(io, table)).hasSize(2);
+      assertThat(dataFiles(table))
+          .containsExactly("mem:///data/a.parquet", "mem:///data/b.parquet");
+    }
+  }
+
+  // ============================================================
+  // An inline-ML writer's commit to a pointer table brings the table back
+  // inline in full mode. The old commit path chose full mode for it but
+  // sent the full metadata without the new snapshot's manifest list, so the
+  // table no longer loaded ("sentinel manifest-list location ... but no
+  // pool entry"). Full mode now carries the manifest updates. Fixed with
+  // Bug 28 by the single commit path.
+  // ============================================================
+
+  @Nested
+  class InlineManifestListsIntoAPointerTable {
+
+    @Test
+    void firstAppendBringsThePointerTableInline() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog pointer = catalog(io, LocalCatalogMode.APPEND);
+      FileIOCatalog ml = catalog(io, LocalCatalogMode.APPEND_ML);
+      pointer.createNamespace(mixedNs);
+      pointer.createTable(mixed, intSchema);
+
+      ml.loadTable(mixed).newFastAppend().appendFile(dataFile("a")).commit();
+
+      assertThat(catalogFile(io).isInlineTable(mixed)).isTrue();
+      Table table = pointer.loadTable(mixed);
+      assertThat(table.currentSnapshot()).isInstanceOf(org.apache.iceberg.InlineSnapshot.class);
+      assertThat(dataFiles(table)).containsExactly("mem:///data/a.parquet");
     }
   }
 }

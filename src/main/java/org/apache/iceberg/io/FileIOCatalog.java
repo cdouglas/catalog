@@ -81,6 +81,14 @@ public class FileIOCatalog extends BaseMetastoreCatalog
   static final String INLINE_TM_CODEC = "fileio.catalog.inline.tm.codec";
   static final String DEFAULT_INLINE_TM_CODEC = "structural";
 
+  /**
+   * The largest inline table update the catalog writes, in bytes: a delta, or the full metadata
+   * with the manifest lists of new snapshots. A table whose update does not fit gets a metadata
+   * file instead and leaves inline storage until a later update fits in full. Defaults to {@link
+   * InlineDeltaCodec#APPEND_LIMIT}, sized to the smallest provider append (ADLS AppendBlock).
+   */
+  static final String INLINE_MAX_UPDATE_SIZE = "fileio.catalog.inline.max.update.size";
+
   private static final org.slf4j.Logger LOG =
       org.slf4j.LoggerFactory.getLogger(FileIOCatalog.class);
 
@@ -94,7 +102,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
   // Per-thread map of tables loaded via loadTable() to the ops instance that
   // received their staged ManifestListSink deltas. Populated lazily on
   // loadTable, drained by commitTransaction (multi-table catalog commit), then
-  // cleared. The single-table commitInline path drains the sink directly off
+  // cleared. The single-table doCommit path drains the sink directly off
   // `this` and does not consult this map. See iceberg_refine.md R2.
   private final ThreadLocal<Map<TableIdentifier, InlineManifestTableOperations>>
       txnSinkOps = ThreadLocal.withInitial(HashMap::new);
@@ -128,14 +136,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
       catalogName = name;
     }
 
-    // Validate config: inline.manifests requires inline
-    boolean inlineEnabled = Boolean.parseBoolean(
-        properties.getOrDefault(INLINE_ENABLED, "false"));
-    boolean inlineManifests = Boolean.parseBoolean(
-        properties.getOrDefault(INLINE_MANIFESTS, "false"));
-    Preconditions.checkArgument(
-        !inlineManifests || inlineEnabled,
-        "fileio.catalog.inline.manifests=true requires fileio.catalog.inline=true");
+    inlineSettings(); // validates the inline properties
 
     warehouseLocation = properties.get(CatalogProperties.WAREHOUSE_LOCATION);
     if (null == catalogLocation) {
@@ -210,7 +211,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
     Table tbl = super.loadTable(identifier);
     // Track InlineManifestTableOperations instances so commitTransaction can
     // drain the staged ManifestListSink deltas directly, mirroring the
-    // single-table commitInline path. The check is intentionally permissive:
+    // single-table doCommit path. The check is intentionally permissive:
     // if the loaded table doesn't expose ops, or the ops isn't a sink, we
     // simply don't track it; commitTransaction tolerates a missing entry.
     if (tbl instanceof HasTableOperations) {
@@ -235,37 +236,61 @@ public class FileIOCatalog extends BaseMetastoreCatalog
 
   @Override
   protected TableOperations newTableOps(TableIdentifier tableIdentifier) {
-    boolean inline = Boolean.parseBoolean(
-        catalogProperties.getOrDefault(INLINE_ENABLED, "false"));
-    boolean inlineManifests = Boolean.parseBoolean(
-        catalogProperties.getOrDefault(INLINE_MANIFESTS, "false"));
-    boolean inlineStrict = Boolean.parseBoolean(
-        catalogProperties.getOrDefault(INLINE_STRICT, "false"));
-    InlineMetadataCodec codec = configuredInlineCodec();
-    if (inlineManifests) {
-      return new InlineManifestTableOperations(
-          tableIdentifier, catalogLocation, format, fileIO, inline, inlineStrict, codec);
-    }
-    return new FileIOTableOperations(
-        tableIdentifier, catalogLocation, format, fileIO, inline, inlineStrict, codec);
+    return newTableOps(tableIdentifier, null);
   }
 
   FileIOTableOperations newTableOps(TableIdentifier tableIdentifier, CatalogFile catalogFile) {
-    boolean inline = Boolean.parseBoolean(
-        catalogProperties.getOrDefault(INLINE_ENABLED, "false"));
-    boolean inlineManifests = Boolean.parseBoolean(
-        catalogProperties.getOrDefault(INLINE_MANIFESTS, "false"));
-    boolean inlineStrict = Boolean.parseBoolean(
-        catalogProperties.getOrDefault(INLINE_STRICT, "false"));
-    InlineMetadataCodec codec = configuredInlineCodec();
-    if (inlineManifests) {
+    InlineSettings inline = inlineSettings();
+    if (inline.manifests) {
       return new InlineManifestTableOperations(
-          tableIdentifier, catalogLocation, format, fileIO,
-          inline, inlineStrict, codec, catalogFile);
+          tableIdentifier, catalogLocation, format, fileIO, inline, catalogFile);
     }
     return new FileIOTableOperations(
-        tableIdentifier, catalogLocation, format, fileIO,
-        inline, inlineStrict, codec, catalogFile);
+        tableIdentifier, catalogLocation, format, fileIO, inline, catalogFile);
+  }
+
+  /** How this catalog stores table metadata, from its {@code fileio.catalog.inline*} properties. */
+  private InlineSettings inlineSettings() {
+    return new InlineSettings(
+        Boolean.parseBoolean(catalogProperties.getOrDefault(INLINE_ENABLED, "false")),
+        Boolean.parseBoolean(catalogProperties.getOrDefault(INLINE_MANIFESTS, "false")),
+        Boolean.parseBoolean(catalogProperties.getOrDefault(INLINE_STRICT, "false")),
+        configuredInlineCodec(),
+        Integer.parseInt(
+            catalogProperties.getOrDefault(
+                INLINE_MAX_UPDATE_SIZE, String.valueOf(InlineDeltaCodec.APPEND_LIMIT))));
+  }
+
+  /** How a catalog stores table metadata: in the catalog file (inline) or in metadata files. */
+  static final class InlineSettings {
+    /** Inline TableMetadata: table updates go to the catalog file, as long as they fit. */
+    final boolean metadata;
+    /** Inline manifest lists too: snapshots stage their lists instead of writing Avro files. */
+    final boolean manifests;
+    /** Reject loading a table with both inline and file manifest lists, instead of warning. */
+    final boolean strict;
+    /** Codec for full inline TableMetadata. */
+    final InlineMetadataCodec codec;
+    /** The largest inline table update, in bytes; a larger one writes a metadata file. */
+    final int maxUpdateSize;
+
+    InlineSettings(
+        boolean metadata,
+        boolean manifests,
+        boolean strict,
+        InlineMetadataCodec codec,
+        int maxUpdateSize) {
+      Preconditions.checkArgument(
+          !manifests || metadata,
+          "fileio.catalog.inline.manifests=true requires fileio.catalog.inline=true");
+      Preconditions.checkArgument(
+          maxUpdateSize > 0, "Invalid %s: %s", INLINE_MAX_UPDATE_SIZE, maxUpdateSize);
+      this.metadata = metadata;
+      this.manifests = manifests;
+      this.strict = strict;
+      this.codec = codec;
+      this.maxUpdateSize = maxUpdateSize;
+    }
   }
 
   @Override
@@ -415,9 +440,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
     private final TableIdentifier tableId;
     private final CatalogFormat format;
     private final SupportsAtomicOperations fileIO;
-    private final boolean inlineEnabled;
-    private final boolean inlineStrict;
-    private final InlineMetadataCodec inlineCodec;
+    private final InlineSettings inline;
     private volatile CatalogFile lastCatalogFile = null;
 
     FileIOTableOperations(
@@ -425,11 +448,8 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         String catalogLocation,
         CatalogFormat format,
         SupportsAtomicOperations fileIO,
-        boolean inlineEnabled,
-        boolean inlineStrict,
-        InlineMetadataCodec inlineCodec) {
-      this(tableId, catalogLocation, format, fileIO,
-          inlineEnabled, inlineStrict, inlineCodec, null);
+        InlineSettings inline) {
+      this(tableId, catalogLocation, format, fileIO, inline, null);
     }
 
     FileIOTableOperations(
@@ -437,17 +457,13 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         String catalogLocation,
         CatalogFormat format,
         SupportsAtomicOperations fileIO,
-        boolean inlineEnabled,
-        boolean inlineStrict,
-        InlineMetadataCodec inlineCodec,
+        InlineSettings inline,
         CatalogFile catalogFile) {
       this.fileIO = fileIO;
       this.format = format;
       this.tableId = tableId;
       this.catalogLocation = catalogLocation;
-      this.inlineEnabled = inlineEnabled;
-      this.inlineStrict = inlineStrict;
-      this.inlineCodec = inlineCodec;
+      this.inline = inline;
       this.lastCatalogFile = catalogFile;
       if (catalogFile != null) {
         loadFromCatalogFile(catalogFile);
@@ -506,13 +522,64 @@ public class FileIOCatalog extends BaseMetastoreCatalog
       loadFromCatalogFile(updatedCatalogFile);
     }
 
-    // visible from commitTransaction
+    /**
+     * Writes {@code metadata} to a new metadata file and returns its location. A metadata file can
+     * name only manifest list files, so first each inline-ML snapshot's list, which the catalog
+     * held inline or a producer staged, is written to one: the table is leaving inline storage, or
+     * a writer that does not inline is committing to it.
+     */
     String writeUpdateMetadata(boolean isCreate, TableMetadata metadata) {
-      return writeNewMetadataIfRequired(isCreate, metadata);
+      return writeNewMetadataIfRequired(isCreate, withManifestListFiles(metadata));
     }
 
-    private boolean shouldInline() {
-      return inlineEnabled;
+    /**
+     * Where a file of {@code metadata}'s metadata directory goes, as {@link
+     * BaseMetastoreTableOperations} places metadata files. Taken from the new metadata, not {@link
+     * #current()}, which a create does not have.
+     */
+    private static String metadataDirectoryFile(TableMetadata metadata, String filename) {
+      String dir =
+          metadata.properties().get(org.apache.iceberg.TableProperties.WRITE_METADATA_LOCATION);
+      return dir != null
+          ? LocationUtil.stripTrailingSlash(dir) + "/" + filename
+          : metadata.location() + "/metadata/" + filename;
+    }
+
+    private TableMetadata withManifestListFiles(TableMetadata metadata) {
+      List<Snapshot> inlineSnapshots = Lists.newArrayList();
+      for (Snapshot s : metadata.snapshots()) {
+        if (s instanceof InlineSnapshot) {
+          inlineSnapshots.add(s);
+        } else if (s.manifestListLocation() != null
+            && s.manifestListLocation().startsWith("inline://")) {
+          throw new IllegalStateException(
+              "Snapshot " + s.snapshotId() + " of " + tableId + " has no manifest list: "
+                  + s.manifestListLocation());
+        }
+      }
+      if (inlineSnapshots.isEmpty()) {
+        return metadata;
+      }
+      Map<Long, Snapshot> replacements = new java.util.concurrent.ConcurrentHashMap<>();
+      org.apache.iceberg.util.Tasks.foreach(inlineSnapshots)
+          .stopOnFailure()
+          .throwFailureWhenFinished()
+          .executeWith(org.apache.iceberg.util.ThreadPools.getWorkerPool())
+          .run(
+              s -> {
+                String name =
+                    String.format("snap-%d-%s.avro", s.snapshotId(), java.util.UUID.randomUUID());
+                String file = metadataDirectoryFile(metadata, name);
+                replacements.put(
+                    s.snapshotId(),
+                    org.apache.iceberg.ManifestListFiles.write(
+                        metadata.formatVersion(), s, s.allManifests(io()),
+                        io().newOutputFile(file)));
+              });
+      TableMetadata.Builder builder = TableMetadata.buildFrom(metadata);
+      builder.replaceSnapshots(replacements);
+      builder.withMetadataLocation(metadata.metadataFileLocation());
+      return builder.discardChanges().build();
     }
 
     /**
@@ -580,32 +647,45 @@ public class FileIOCatalog extends BaseMetastoreCatalog
 
     @Override
     public void doCommit(TableMetadata base, TableMetadata metadata) {
-      final boolean isCreate = null == base;
+      Map<Long, InlineManifestTableOperations.StagedSnapshotData> staged = peekStagedDeltas();
       try {
-        if (shouldInline()) {
-          commitInline(base, metadata, isCreate);
+        CatalogFile.Mut<?, ?> mut = format.from(lastCatalogFile);
+        if (base == null) {
+          stageCreate(mut, metadata, staged);
         } else {
-          commitPointer(base, metadata, isCreate);
+          stageUpdate(mut, base, metadata, staged);
         }
+        clearStagedDeltas();
+        mut.commit(io());
       } catch (SupportsAtomicOperations.CASException e) {
         throw new CommitFailedException(e, "Failed to commit metadata for table %s", tableId);
       }
     }
 
-    private void commitInline(TableMetadata base, TableMetadata metadata, boolean isCreate) {
-      InlineMetadataCodec codec = inlineCodec;
-      if (isCreate) {
+    /**
+     * The manifest lists the commit's new snapshots staged inline, by snapshot id; empty unless
+     * this catalog inlines manifest lists.
+     */
+    Map<Long, InlineManifestTableOperations.StagedSnapshotData> peekStagedDeltas() {
+      return java.util.Collections.emptyMap();
+    }
+
+    /** Clears the staged manifest lists once they are in an update. */
+    void clearStagedDeltas() {}
+
+    /** Stages on {@code mut} the creation of this table with {@code metadata}. */
+    private void stageCreate(
+        CatalogFile.Mut<?, ?> mut,
+        TableMetadata metadata,
+        Map<Long, InlineManifestTableOperations.StagedSnapshotData> staged) {
+      if (inline.metadata) {
         // Errata D9: an inline-ML createTransaction with one or more
         // newFastAppend calls puts InlineSnapshots into `metadata`. Two things
         // must happen for those snapshots to round-trip on reload:
         //   1. The encoded TableMetadata must carry a sentinel manifest-list
         //      location (inline://<snapId>) — not v1-embedded `manifests`
         //      paths — so wrapInlineManifests can swap in the pool's
-        //      InlineSnapshot. The structural codec already emits this shape
-        //      for null manifestListLocation; the gzip codec falls into the
-        //      v1-embedded branch and loses partitionSpecId. Rewriting
-        //      InlineSnapshot → BaseSnapshot(+sentinel) before encode makes
-        //      both codecs uniform.
+        //      InlineSnapshot (rewriteInlineSnapshotsForFullEncode).
         //   2. The catalog's manifest pool and per-snapshot ref list must be
         //      populated atomically with the create. We achieve this by
         //      bundling AddManifestUpdate entries (built from the producer's
@@ -613,239 +693,104 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         //      CreateTableInlineAction.apply feeds through
         //      InlineDeltaCodec.applyDeltaWithManifests — the same hook the
         //      update path uses.
-        byte[] createDeltaBytes = null;
-        TableMetadata metadataToEncode = metadata;
-        if (this instanceof InlineManifestTableOperations
-            && ((InlineManifestTableOperations) this).hasStagedDeltas()) {
-          InlineManifestTableOperations sinkOps = (InlineManifestTableOperations) this;
-          Map<Long, InlineManifestTableOperations.StagedSnapshotData> drained =
-              sinkOps.drainStagedDeltas();
-
-          // Filter to staged entries whose snapshot id is actually in the
-          // metadata being committed (drop orphan stages, same rule as D7).
-          java.util.Set<Long> liveSnapIds = new java.util.HashSet<>();
-          for (org.apache.iceberg.Snapshot snap : metadata.snapshots()) {
-            liveSnapIds.add(snap.snapshotId());
+        List<InlineDeltaCodec.DeltaUpdate> manifests =
+            manifestUpdates(metadata, staged, "");
+        byte[] manifestBytes =
+            manifests.isEmpty()
+                ? null
+                : InlineDeltaCodec.encodeDelta(manifests, metadata.lastUpdatedMillis());
+        byte[] metadataBytes = inline.codec.encode(rewriteInlineSnapshotsForFullEncode(metadata));
+        if (metadataBytes.length + (manifestBytes != null ? manifestBytes.length : 0)
+            <= inline.maxUpdateSize) {
+          if (manifestBytes != null) {
+            mut.createTableInlineWithManifests(
+                tableId, metadataBytes, inline.codec.tag(), manifestBytes);
+          } else {
+            mut.createTableInline(tableId, metadataBytes, inline.codec.tag());
           }
-
-          // Build the AddManifestUpdate stream for the pool.
-          String manifestPrefix = "";
-          java.util.List<InlineDeltaCodec.DeltaUpdate> deltaUpdates =
-              new java.util.ArrayList<>();
-          for (Map.Entry<Long, InlineManifestTableOperations.StagedSnapshotData> entry
-              : drained.entrySet()) {
-            long snapId = entry.getKey();
-            if (!liveSnapIds.contains(snapId)) {
-              continue;
-            }
-            InlineManifestTableOperations.StagedSnapshotData staged = entry.getValue();
-            InlineDeltaCodec.attachManifestDelta(
-                deltaUpdates, snapId,
-                staged.delta.added(), staged.delta.removedPaths(), manifestPrefix);
-          }
-
-          if (!deltaUpdates.isEmpty()) {
-            createDeltaBytes =
-                InlineDeltaCodec.encodeDelta(deltaUpdates, metadata.lastUpdatedMillis());
-
-            // Rewrite InlineSnapshots → BaseSnapshot with the inline://<id>
-            // sentinel so the on-wire TM is codec-agnostic and matches what
-            // wrapInlineManifests expects.
-            Map<Long, Snapshot> sentinelReplacements = new java.util.HashMap<>();
-            for (Snapshot s : metadata.snapshots()) {
-              if (s.manifestListLocation() == null) {
-                Map<String, String> summary = s.summary() != null
-                    ? new java.util.HashMap<>(s.summary())
-                    : new java.util.HashMap<>();
-                if (s.operation() != null && !summary.containsKey("operation")) {
-                  summary.put("operation", s.operation());
-                }
-                Snapshot replacement = org.apache.iceberg.InlineDeltaSnapshots.create(
-                    s.sequenceNumber(), s.snapshotId(), s.parentId(),
-                    s.timestampMillis(), summary, s.schemaId(),
-                    "inline://" + s.snapshotId(),
-                    s.firstRowId(), s.addedRows(), s.keyId());
-                sentinelReplacements.put(s.snapshotId(), replacement);
-              }
-            }
-            if (!sentinelReplacements.isEmpty()) {
-              TableMetadata.Builder b = TableMetadata.buildFrom(metadata);
-              b.replaceSnapshots(sentinelReplacements);
-              b.withMetadataLocation(metadata.metadataFileLocation());
-              metadataToEncode = b.discardChanges().build();
-            }
-          }
+          return;
         }
-
-        byte[] metadataBytes = codec.encode(metadataToEncode);
-        CatalogFile.Mut<?, ?> mut = format.from(lastCatalogFile);
-        if (createDeltaBytes != null) {
-          mut.createTableInlineWithManifests(
-              tableId, metadataBytes, codec.tag(), createDeltaBytes);
-        } else {
-          mut.createTableInline(tableId, metadataBytes, codec.tag());
-        }
-        mut.commit(io());
-      } else {
-        // Try delta mode first, fall back to full or pointer
-        String manifestPrefix = "";
-        if (lastCatalogFile.isInlineTable(tableId)) {
-          Integer tblId = null;
-          if (lastCatalogFile instanceof ProtoCatalogFile) {
-            tblId = ((ProtoCatalogFile) lastCatalogFile).tableId(tableId);
-            if (tblId != null) {
-              String p = ((ProtoCatalogFile) lastCatalogFile).manifestListPrefix(tblId);
-              if (p != null) { manifestPrefix = p; }
-            }
-          }
-        }
-
-        java.util.List<InlineDeltaCodec.DeltaUpdate> delta =
-            InlineDeltaCodec.computeDelta(base, metadata, manifestPrefix);
-
-        // Attach manifest list deltas if this ops implements ManifestListSink.
-        // Iterate the staged map directly so deltas on snapshot ids already
-        // present in base.snapshots() (manifest rewrites against an existing
-        // snapshot) also reach attachManifestDelta. Filter by liveSnapIds to
-        // drop deltas for snapshot ids that aren't present in the target
-        // metadata (orphaned stages from a rolled-back producer). Errata D7.
-        //
-        // Peek (don't drain) here so the staged data survives a
-        // CommitFailedException throw below. Iceberg's transaction layer
-        // retries the commit by re-running the producer chain, but if we drain
-        // before throwing, the retry's underlyingOps.commit sees an empty sink
-        // and writes a sentinel manifest-list location with no pool entry —
-        // catalog state corruption surfaced on the next load. Drain only on
-        // the success path, just before encode.
-        boolean hasMLDeltas = false;
-        boolean stagedMLPendingApply = false;
-        Map<Long, InlineManifestTableOperations.StagedSnapshotData> mlDeltas =
-            java.util.Collections.emptyMap();
-        if (this instanceof InlineManifestTableOperations) {
-          mlDeltas = ((InlineManifestTableOperations) this).peekStagedDeltas();
-          java.util.Set<Long> liveSnapIds = new java.util.HashSet<>();
-          for (org.apache.iceberg.Snapshot snap : metadata.snapshots()) {
-            liveSnapIds.add(snap.snapshotId());
-          }
-          for (Map.Entry<Long, InlineManifestTableOperations.StagedSnapshotData> entry
-              : mlDeltas.entrySet()) {
-            long snapId = entry.getKey();
-            if (!liveSnapIds.contains(snapId)) {
-              continue;
-            }
-            InlineManifestTableOperations.StagedSnapshotData staged = entry.getValue();
-            boolean stagedHasContent = !staged.delta.added().isEmpty()
-                || !staged.delta.removedPaths().isEmpty();
-            if (delta != null) {
-              InlineDeltaCodec.attachManifestDelta(
-                  delta, snapId,
-                  staged.delta.added(), staged.delta.removedPaths(), manifestPrefix);
-              hasMLDeltas = true;
-            } else if (stagedHasContent) {
-              stagedMLPendingApply = true;
-            }
-          }
-        }
-
-        // Errata D6: computeDelta returned null (idCollidesWithDifferentContent
-        // — concurrent-replace race assigning the same schema/spec/sort-order id
-        // to different content), but we have ML data staged on live snapshots.
-        // The retry strategy doesn't help: Iceberg's replace-transaction retry
-        // refreshes `base` but reuses the producer's `current`, so the colliding
-        // id keeps recurring on every attempt. Build a focused ML delta payload
-        // and bundle it with the FULL-mode TM update so the new snapshot's pool
-        // entries land atomically with the TM replacement (mirror of
-        // CreateTableInlineWithManifests for the update path).
-        byte[] collisionMlDeltaBytes = null;
-        if (stagedMLPendingApply) {
-          java.util.List<InlineDeltaCodec.DeltaUpdate> fixupDelta =
-              new java.util.ArrayList<>();
-          java.util.Set<Long> liveSnapIds = new java.util.HashSet<>();
-          for (org.apache.iceberg.Snapshot snap : metadata.snapshots()) {
-            liveSnapIds.add(snap.snapshotId());
-          }
-          for (Map.Entry<Long, InlineManifestTableOperations.StagedSnapshotData> entry
-              : mlDeltas.entrySet()) {
-            long snapId = entry.getKey();
-            if (!liveSnapIds.contains(snapId)) {
-              continue;
-            }
-            InlineManifestTableOperations.StagedSnapshotData staged = entry.getValue();
-            InlineDeltaCodec.attachManifestDelta(
-                fixupDelta, snapId,
-                staged.delta.added(), staged.delta.removedPaths(), manifestPrefix);
-          }
-          collisionMlDeltaBytes = InlineDeltaCodec.encodeDelta(
-              fixupDelta, metadata.lastUpdatedMillis());
-        }
-
-        // Past the staged-ML inspection — safe to drain so the next commit on
-        // this ops instance doesn't re-attach stale data.
-        if (this instanceof InlineManifestTableOperations) {
-          ((InlineManifestTableOperations) this).clearStagedDeltas();
-        }
-
-        String mode = InlineDeltaCodec.selectMode(delta, metadata, 0, codec);
-        // Force delta mode in two cases:
-        // 1. hasMLDeltas: the current commit staged new ML deltas; full/pointer
-        //    lose them because they serialize TableMetadata (InlineSnapshot ->
-        //    v1 embedded-manifests branch in SnapshotParser.toJson).
-        // 2. hasMLPool: the table already has an ML pool from a prior commit; a
-        //    full-mode write rewrites the TM JSON with `inline://` sentinel
-        //    manifest-list locations, and even though the replay-side full-mode
-        //    fix (§1.1) preserves the pool, we still avoid writing bloated full
-        //    TM blobs on ML-populated tables. See ML_INLINE_REVIEW2.md §1.1.
-        boolean hasMLPool = false;
-        if (lastCatalogFile instanceof ProtoCatalogFile) {
-          ProtoCatalogFile proto = (ProtoCatalogFile) lastCatalogFile;
-          Integer tblIdNum = proto.tableId(tableId);
-          if (tblIdNum != null) {
-            hasMLPool = !proto.manifestPool(tblIdNum).isEmpty();
-          }
-        }
-        // Don't force delta when computeDelta returned null (e.g. a stats-only
-        // change with no representable delta updates) — encodeDelta(null) NPEs
-        // and full mode is the correct fallback. See errata D1.
-        if ((hasMLDeltas || hasMLPool) && !"delta".equals(mode) && delta != null) {
-          mode = "delta";
-        }
-
-        // Pointer → inline transition: when the catalog has the table as
-        // pointer (no inline metadata yet) but selectMode picked delta, the
-        // delta would silently no-op on apply — UpdateTableInlineAction.apply
-        // bails when currentMeta is null. Force full mode so the catalog
-        // actually receives the inline bytes that seed future deltas.
-        if ("delta".equals(mode) && !lastCatalogFile.isInlineTable(tableId)) {
-          mode = "full";
-        }
-
-        CatalogFile.Mut<?, ?> mut = format.from(lastCatalogFile);
-        switch (mode) {
-          case "delta":
-            byte[] deltaBytes =
-                InlineDeltaCodec.encodeDelta(delta, metadata.lastUpdatedMillis());
-            mut.updateTableInlineDelta(tableId, deltaBytes);
-            break;
-          case "full":
-            byte[] fullBytes =
-                codec.encode(rewriteInlineSnapshotsForFullEncode(metadata));
-            if (collisionMlDeltaBytes != null) {
-              // Concurrent-replace fixup: bundle the staged ML pool deltas so the
-              // new snapshot's manifest pool entries are populated atomically
-              // with the TM replacement.
-              mut.updateTableInlineWithManifests(
-                  tableId, fullBytes, codec.tag(), collisionMlDeltaBytes);
-            } else {
-              mut.updateTableInline(tableId, fullBytes, codec.tag());
-            }
-            break;
-          case "pointer":
-            String loc = writeUpdateMetadata(false, metadata);
-            mut.updateTable(tableId, loc);
-            break;
-        }
-        mut.commit(io());
       }
+      mut.createTable(tableId, writeUpdateMetadata(true, metadata));
+    }
+
+    /**
+     * Stages on {@code mut} the commit of {@code metadata}, built on {@code base}, to this table as
+     * {@link #lastCatalogFile} holds it. {@code staged} holds the manifest lists of the commit's
+     * new inline-ML snapshots. In an inline catalog the update takes the first form that fits in
+     * {@code fileio.catalog.inline.max.update.size}: a delta, if the table is inline (the common
+     * case); the full metadata, inline, which re-inlines a pointer table; else a metadata file,
+     * which evicts the table from inline storage.
+     */
+    void stageUpdate(
+        CatalogFile.Mut<?, ?> mut,
+        TableMetadata base,
+        TableMetadata metadata,
+        Map<Long, InlineManifestTableOperations.StagedSnapshotData> staged) {
+      if (inline.metadata) {
+        ProtoCatalogFile proto = (ProtoCatalogFile) lastCatalogFile;
+        Integer tblId = proto.tableId(tableId);
+        boolean isInline = tblId != null && proto.isInlineTable(tblId);
+        String prefix = isInline && proto.manifestListPrefix(tblId) != null
+            ? proto.manifestListPrefix(tblId)
+            : "";
+        List<InlineDeltaCodec.DeltaUpdate> manifests =
+            manifestUpdates(metadata, staged, prefix);
+        if (isInline) {
+          // Null if delta encoding cannot express the change (errata D1, D6): full mode then.
+          List<InlineDeltaCodec.DeltaUpdate> delta =
+              InlineDeltaCodec.computeDelta(base, metadata, prefix);
+          if (delta != null) {
+            delta.addAll(manifests);
+            byte[] deltaBytes = InlineDeltaCodec.encodeDelta(delta, metadata.lastUpdatedMillis());
+            if (deltaBytes.length <= inline.maxUpdateSize) {
+              mut.updateTableInlineDelta(tableId, deltaBytes);
+              return;
+            }
+          }
+        }
+        // Full mode keeps the manifest pool (I3) and lands the new snapshots' lists with the
+        // metadata: the replay builds each new inline snapshot's list on its parent's.
+        byte[] fullBytes = inline.codec.encode(rewriteInlineSnapshotsForFullEncode(metadata));
+        byte[] manifestBytes =
+            manifests.isEmpty()
+                ? null
+                : InlineDeltaCodec.encodeDelta(manifests, metadata.lastUpdatedMillis());
+        if (fullBytes.length + (manifestBytes != null ? manifestBytes.length : 0)
+            <= inline.maxUpdateSize) {
+          if (manifestBytes != null) {
+            mut.updateTableInlineWithManifests(
+                tableId, fullBytes, inline.codec.tag(), manifestBytes);
+          } else {
+            mut.updateTableInline(tableId, fullBytes, inline.codec.tag());
+          }
+          return;
+        }
+      }
+      mut.updateTable(tableId, writeUpdateMetadata(false, metadata));
+    }
+
+    /**
+     * The manifest list updates for the inline-ML snapshots {@code metadata} adds, from the lists
+     * their producers staged, each a delta against its parent's. Stages for snapshots not in
+     * {@code metadata} are dropped: a producer staged them and then rolled back (errata D7).
+     */
+    private List<InlineDeltaCodec.DeltaUpdate> manifestUpdates(
+        TableMetadata metadata,
+        Map<Long, InlineManifestTableOperations.StagedSnapshotData> staged,
+        String prefix) {
+      List<InlineDeltaCodec.DeltaUpdate> updates = new java.util.ArrayList<>();
+      for (Map.Entry<Long, InlineManifestTableOperations.StagedSnapshotData> entry
+          : staged.entrySet()) {
+        Snapshot snapshot = metadata.snapshot(entry.getKey());
+        if (snapshot == null) {
+          continue;
+        }
+        ManifestListDelta delta = entry.getValue().delta;
+        InlineDeltaCodec.attachManifestDelta(
+            updates, snapshot.snapshotId(), delta.added(), delta.removedPaths(), prefix);
+      }
+      return updates;
     }
 
     /**
@@ -898,7 +843,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         // rejection would break tables mid-migration. Production deployments
         // can opt into hard rejection via fileio.catalog.inline.strict=true,
         // which throws ValidationException here.
-        if (inlineStrict) {
+        if (inline.strict) {
           throw new ValidationException(
               "Table %s is in mixed mode: has both inline and pointer-mode "
                   + "snapshots. Strict mode (fileio.catalog.inline.strict=true) "
@@ -937,19 +882,6 @@ public class FileIOCatalog extends BaseMetastoreCatalog
       builder.withMetadataLocation(parsed.metadataFileLocation());
       return builder.discardChanges().build();
     }
-
-    private void commitPointer(TableMetadata base, TableMetadata metadata, boolean isCreate) {
-      final String newMetadataLocation = writeUpdateMetadata(isCreate, metadata);
-      if (isCreate) {
-        format.from(lastCatalogFile)
-            .createTable(tableId, newMetadataLocation)
-            .commit(io());
-      } else {
-        format.from(lastCatalogFile)
-            .updateTable(tableId, newMetadataLocation)
-            .commit(io());
-      }
-    }
   }
 
   /**
@@ -980,19 +912,15 @@ public class FileIOCatalog extends BaseMetastoreCatalog
 
     InlineManifestTableOperations(
         TableIdentifier tableId, String catalogLocation,
-        CatalogFormat format, SupportsAtomicOperations fileIO,
-        boolean inlineEnabled, boolean inlineStrict, InlineMetadataCodec inlineCodec) {
-      super(tableId, catalogLocation, format, fileIO,
-          inlineEnabled, inlineStrict, inlineCodec);
+        CatalogFormat format, SupportsAtomicOperations fileIO, InlineSettings inline) {
+      super(tableId, catalogLocation, format, fileIO, inline);
     }
 
     InlineManifestTableOperations(
         TableIdentifier tableId, String catalogLocation,
-        CatalogFormat format, SupportsAtomicOperations fileIO,
-        boolean inlineEnabled, boolean inlineStrict, InlineMetadataCodec inlineCodec,
+        CatalogFormat format, SupportsAtomicOperations fileIO, InlineSettings inline,
         CatalogFile catalogFile) {
-      super(tableId, catalogLocation, format, fileIO,
-          inlineEnabled, inlineStrict, inlineCodec, catalogFile);
+      super(tableId, catalogLocation, format, fileIO, inline, catalogFile);
     }
 
     @Override
@@ -1014,11 +942,13 @@ public class FileIOCatalog extends BaseMetastoreCatalog
      * to trigger a producer-level retry); pair with {@link #clearStagedDeltas()}
      * once the write is committed.
      */
+    @Override
     Map<Long, StagedSnapshotData> peekStagedDeltas() {
       return new LinkedHashMap<>(stagedDeltas);
     }
 
     /** Clears all staged sink data after a successful encode. */
+    @Override
     void clearStagedDeltas() {
       stagedDeltas.clear();
     }
@@ -1038,8 +968,8 @@ public class FileIOCatalog extends BaseMetastoreCatalog
    * {@code inline://<snapshotId>} sentinel, then returns a rebuilt
    * {@link TableMetadata}. Called immediately before
    * {@code InlineMetadataCodec.encode} on the full-mode commit paths
-   * ({@code commitInline} update branch and {@code commitTransaction}'s
-   * inner full-mode arm) so the on-disk bytes are codec-agnostic.
+   * ({@code stageCreate} and {@code stageUpdate}) so the on-disk bytes are
+   * codec-agnostic.
    *
    * <p>Without this rewrite the gzip codec's {@code SnapshotParser.toJson}
    * falls into the v1-embedded-manifests branch (no {@code manifest-list}
@@ -1125,113 +1055,15 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         if (newMetadata.changes().isEmpty()) {
           continue;
         }
-        boolean inline = Boolean.parseBoolean(
-            catalogProperties.getOrDefault(INLINE_ENABLED, "false"));
-        boolean inlineManifests = Boolean.parseBoolean(
-            catalogProperties.getOrDefault(INLINE_MANIFESTS, "false"));
-        if (inline) {
-          // Compute delta from current to new metadata
-          String manifestPrefix = "";
-          ProtoCatalogFile proto = null;
-          Integer tblIdNum = null;
-          if (current instanceof ProtoCatalogFile) {
-            proto = (ProtoCatalogFile) current;
-            tblIdNum = proto.tableId(tableId);
-            if (tblIdNum != null) {
-              String p = proto.manifestListPrefix(tblIdNum);
-              if (p != null) { manifestPrefix = p; }
-            }
-          }
-          java.util.List<InlineDeltaCodec.DeltaUpdate> delta =
-              InlineDeltaCodec.computeDelta(currentMetadata, newMetadata, manifestPrefix);
-
-          // Drain the per-snapshot ManifestListSink deltas staged on the
-          // user-loaded ops during the transaction. iceberg-core R2 forwards
-          // SnapshotProducer's stageManifestListDelta calls through
-          // BaseTransaction.TransactionTableOperationsWithSink to the
-          // underlying InlineManifestTableOperations — which is the same
-          // instance loadTable() recorded in txnSinkOps. The added/removed
-          // sets are the exact ones SnapshotProducer would have written into
-          // a snap-*.avro; we attach them directly without rereading them.
-          // Single-table commitInline does the same drain off `this`. See
-          // iceberg_refine.md R2.
-          boolean hasMLPool = proto != null && tblIdNum != null
-              && !proto.manifestPool(tblIdNum).isEmpty();
-          boolean hasMLDeltas = false;
-          boolean stagedMLPendingApply = false;
-          if (inlineManifests) {
-            InlineManifestTableOperations sinkOps = sinkOpsByTable.get(tableId);
-            if (sinkOps != null) {
-              Map<Long, InlineManifestTableOperations.StagedSnapshotData> staged =
-                  sinkOps.drainStagedDeltas();
-              // Iterate staged entries directly (see commitInline / errata D7).
-              // Drop entries whose snapshot id is not in newMetadata.snapshots()
-              // — those are orphaned stages.
-              Set<Long> liveSnapIds = new HashSet<>();
-              for (Snapshot snap : newMetadata.snapshots()) {
-                liveSnapIds.add(snap.snapshotId());
-              }
-              for (Map.Entry<Long, InlineManifestTableOperations.StagedSnapshotData> entry
-                  : staged.entrySet()) {
-                long snapId = entry.getKey();
-                if (!liveSnapIds.contains(snapId)) {
-                  continue;
-                }
-                InlineManifestTableOperations.StagedSnapshotData data = entry.getValue();
-                boolean stagedHasContent = !data.delta.added().isEmpty()
-                    || !data.delta.removedPaths().isEmpty();
-                if (delta != null) {
-                  InlineDeltaCodec.attachManifestDelta(
-                      delta, snapId,
-                      data.delta.added(), data.delta.removedPaths(), manifestPrefix);
-                  hasMLDeltas = true;
-                } else if (stagedHasContent) {
-                  stagedMLPendingApply = true;
-                }
-              }
-            }
-          }
-          // Errata D6: see commitInline for the rationale. CommitFailedException
-          // forces the producer to refresh + re-stage on top of the rebased base.
-          if (stagedMLPendingApply) {
-            throw new CommitFailedException(
-                "Cannot encode inline-ML delta for %s: concurrent-replace id "
-                    + "collision blocks delta encoding; retry will rebase",
-                tableId);
-          }
-
-          InlineMetadataCodec codec = configuredInlineCodec();
-          String mode = InlineDeltaCodec.selectMode(delta, newMetadata, 0, codec);
-          // See commitInline — full-mode avoidance, but never with null delta
-          // (encodeDelta would NPE; full is the correct fallback). See errata D1.
-          if ((hasMLDeltas || hasMLPool) && !"delta".equals(mode) && delta != null) {
-            mode = "delta";
-          }
-          // Pointer → inline transition: same reason as commitInline.
-          // Without this, a delta lands but applies to nothing.
-          if ("delta".equals(mode) && !current.isInlineTable(tableId)) {
-            mode = "full";
-          }
-          switch (mode) {
-            case "delta":
-              newCatalog.updateTableInlineDelta(
-                  tableId,
-                  InlineDeltaCodec.encodeDelta(delta, newMetadata.lastUpdatedMillis()));
-              break;
-            case "full":
-              newCatalog.updateTableInline(
-                  tableId,
-                  codec.encode(rewriteInlineSnapshotsForFullEncode(newMetadata)),
-                  codec.tag());
-              break;
-            default:
-              String loc = ops.writeUpdateMetadata(false, newMetadata);
-              newCatalog.updateTable(tableId, loc);
-          }
-        } else {
-          final String newLocation = ops.writeUpdateMetadata(false, newMetadata);
-          newCatalog.updateTable(tableId, newLocation);
-        }
+        // The manifest lists SnapshotProducer staged for the table's new snapshots went to the
+        // ops instance the transaction loaded the table with (BaseTransaction forwards the sink
+        // calls to it), which loadTable recorded in txnSinkOps. See iceberg_refine.md R2.
+        InlineManifestTableOperations sinkOps = sinkOpsByTable.get(tableId);
+        Map<Long, InlineManifestTableOperations.StagedSnapshotData> staged =
+            sinkOps != null
+                ? sinkOps.drainStagedDeltas()
+                : java.util.Collections.emptyMap();
+        ops.stageUpdate(newCatalog, currentMetadata, newMetadata, staged);
       }
       try {
         newCatalog.commit(fileIO);

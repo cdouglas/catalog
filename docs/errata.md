@@ -61,17 +61,6 @@ the whole table.
 
 ## Deferred Functionality
 
-### D3. Pointer-mode eviction of an inline-ML table does not materialize Avro manifest lists
-
-If an inline TM falls back to pointer mode (size eviction), any snapshot
-with inline ML keeps its manifest data in the checkpoint. Pointer-mode
-eviction writes `metadata.json`, not `snap-*.avro`. Snapshots that need
-an Avro manifest list at read time would have to materialize one
-on demand, which is not implemented today.
-
-**Trigger to revisit:** if a real workload hits the path. Until then,
-inline ML implies the table stays inline.
-
 ### D4. `RewriteTablePathUtil` does not handle inline-ML tables
 
 `core/.../RewriteTablePathUtil.java:252,280` calls `ManifestLists.write()`
@@ -267,7 +256,9 @@ cost.
 
 **Trigger:** measure pool size at 100 / 1000 / 10000 retained snapshots
 on a representative table; decide whether to add a per-table
-"checkpoint-too-big → evict to pointer" threshold.
+"checkpoint-too-big → evict to pointer" threshold. Eviction today is by
+update size only (`fileio.catalog.inline.max.update.size`): a table whose
+deltas fit stays inline however large its metadata and pool grow.
 
 ### U4. Behavior under storage provider edge cases
 

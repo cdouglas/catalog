@@ -84,6 +84,7 @@ emulators (LocalStack, fake-gcs-server, Azurite).
 |-----------------------------------|---------------|--------|
 | `fileio.catalog.inline`           | `false`       | Inline table metadata (no `metadata.json`) |
 | `fileio.catalog.inline.manifests` | `false`       | Inline manifest lists (no `snap-*.avro`); requires `inline=true` |
+| `fileio.catalog.inline.max.update.size` | `4190208` | Largest inline table update (a delta, or full metadata); a table whose update does not fit gets a `metadata.json` and leaves inline storage until an update fits in full |
 | `fileio.catalog.inline.tm.codec`  | `structural`  | Codec for newly-written inline `TableMetadata` bytes: `structural` (binary, columnar; default) or `gzip` (Iceberg-style gzipped JSON). Decode follows the on-wire codec tag, so writers can change this setting freely |
 | `fileio.catalog.max.append.count` | `10000`       | Soft limit on log records before CAS compaction. `0` forces CAS-only mode (S3 standard, GCS) |
 | `fileio.catalog.max.append.size`  | `16777216`    | Soft target for catalog-file size before compaction |

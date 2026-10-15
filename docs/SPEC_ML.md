@@ -197,40 +197,37 @@ manifest list to a `snap-*.avro` file as before and returns a normal
 sink path when the catalog is prepared to store ML deltas.
 
 `stageManifestListDelta` stashes the delta on an instance field keyed by
-snapshot id. After `SnapshotProducer.commit()` returns, `commitInline`
-drains those staged deltas and attaches them to the same intention
-record that carries the TM delta:
+snapshot id. After `SnapshotProducer.commit()` returns, `doCommit`
+drains those staged deltas and turns them into manifest updates in the
+same intention record that carries the table update
+(`FileIOTableOperations.manifestUpdates`):
 
 ```java
-List<DeltaUpdate> delta = InlineDeltaCodec.computeDelta(base, metadata, prefix);
-Map<Long, StagedSnapshotData> mlDeltas = ops.drainStagedDeltas();
-
-// Filter staged entries to snapshot ids actually present in the target
-// metadata. Iteration is over the staged map (not metadata.snapshots())
-// so manifest rewrites against an existing snapshot id — compaction /
-// future RewriteManifests / etc. — also reach attachManifestDelta.
-// Orphan stages (snapshot ids no longer in the metadata, e.g. a
-// rolled-back producer run) are dropped here.
-Set<Long> liveSnapIds = metadata.snapshots().stream()
-    .map(Snapshot::snapshotId).collect(toSet());
-for (var entry : mlDeltas.entrySet()) {
-  long snapId = entry.getKey();
-  if (!liveSnapIds.contains(snapId)) continue;        // drop orphan
-  if (delta == null) {                                // see "ID collision"
-    if (entry.getValue().delta.added().isEmpty()
-        && entry.getValue().delta.removedPaths().isEmpty()) continue;
-    throw new CommitFailedException(...);             // force retry
-  }
-  InlineDeltaCodec.attachManifestDelta(
-      delta, snapId,
-      entry.getValue().delta.added(),
-      entry.getValue().delta.removedPaths(),
-      prefix);
+List<DeltaUpdate> manifests = new ArrayList<>();
+for (var entry : staged.entrySet()) {
+  Snapshot snap = metadata.snapshot(entry.getKey());
+  if (snap == null) continue;                         // orphan stage (errata D7)
+  attachManifestDelta(manifests, snap.snapshotId(),
+      entry.getValue().delta.added(), entry.getValue().delta.removedPaths(), prefix);
 }
 ```
 
-A multi-table `commitTransaction` follows the same pattern: deltas are
-drained per table and attached to each table's `UpdateTableInline`.
+Iteration is over the staged map (not `metadata.snapshots()`) so
+manifest rewrites against an existing snapshot id also reach
+`attachManifestDelta`. A staged list is a delta against the parent's
+list, and the replay builds it on the parent's inline list
+(`NewSnapshotManifests`).
+
+The manifest updates ride in whichever form the table update takes
+(see [SPEC_TM.md](SPEC_TM.md) §"Delivery Modes"): appended to the TM
+delta, or bundled with full metadata as the `UpdateTableInline.ml_delta`
+payload. A
+metadata-file update (eviction) writes each inline snapshot's list to
+an Avro file instead.
+
+A multi-table `commitTransaction` follows the same path: the deltas
+staged on the ops each table was loaded with are drained per table and
+passed to that table's `stageUpdate`.
 
 ### Create-with-snapshots
 
@@ -253,14 +250,37 @@ multi-spec create transactions surface the wrong spec on read.
 `InlineDeltaCodec.computeDelta` returns `null` when two racing replace
 transactions have independently assigned the same schema / spec /
 sort-order id to different content (see [SPEC_TM.md](SPEC_TM.md)
-§"Concurrent-replace id collisions"). For an inline-ML table with
-non-empty staged ML data on a live snapshot, `commitInline` /
-`commitTransaction` raise `CommitFailedException` rather than
-silently falling back to full or pointer mode — both of those drop
-the staged ML data (full mode serializes `TableMetadata` only; pointer
-mode evicts and clears the pool). The producer's retry loop refreshes
-the base and re-stages on top of the rebased state, where the
-colliding id has been reassigned naturally.
+§"Concurrent-replace id collisions"). The commit then takes full mode,
+which carries the staged manifest updates as its `ml_delta` payload, so
+the new snapshots' lists land atomically with the TM replacement. (The
+multi-table path used to throw `CommitFailedException` here instead;
+Iceberg's replace-transaction retry reuses the producer's metadata, so
+the collision recurred on every attempt.)
+
+### Writers in Different Modes
+
+Writers sharing a catalog need not agree on `fileio.catalog.inline*`:
+each writer's properties decide only how *it* writes. A table is either
+inline or a pointer table, never both: an `UpdateTable` record (a
+metadata file location) clears the table's inline state, pool included.
+
+- A **pointer writer** (no inline TM) committing to an inline-ML table,
+  and an inline writer **evicting** one (an update that does not fit in
+  `fileio.catalog.inline.max.update.size`), write a metadata file. A
+  metadata file can name only manifest list files, so
+  `writeUpdateMetadata` first writes each `InlineSnapshot`'s list to
+  `<metadata dir>/snap-<snapshotId>-<uuid>.avro`
+  (`ManifestListFiles.write`, the same writer `SnapshotProducer` uses;
+  the manifests are already final, so they are copied unchanged). The
+  snapshot then names that file. The lists are written before the
+  catalog commit; a commit that fails leaves them behind, as it leaves
+  its metadata file.
+- An **inline-TM writer** committing a snapshot to an inline-ML table
+  writes an Avro manifest list for it; the table stays inline, in mixed
+  mode.
+- An **inline-ML writer** committing to a pointer table brings the
+  table back inline if the full metadata, with the manifest updates,
+  fits; the older snapshots keep their files.
 
 ### Loading
 
@@ -277,6 +297,7 @@ original `manifestListLocation`.
 |-----------------------------------|---------|-------------|
 | `fileio.catalog.inline`           | `false` | Inline TM (see SPEC_TM.md). |
 | `fileio.catalog.inline.manifests` | `false` | Inline ML. Requires `inline=true`. |
+| `fileio.catalog.inline.max.update.size` | 4,190,208 | Largest inline table update, manifest updates included (see SPEC_TM.md). |
 
 Setting `inline.manifests=true` without `inline=true` raises
 `IllegalArgumentException` at catalog initialization. ML requires TM
