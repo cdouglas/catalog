@@ -142,6 +142,14 @@ inline or a pointer table, never both, and the metadata file it names
 carries a manifest list file for every snapshot (its writer wrote the
 inline ones out first).
 
+### I3a. A committed snapshot's manifest list never changes
+
+Whether a snapshot's list is inline or a file, and whichever writer
+reads it, it lists the same manifests with the same entries (sequence
+numbers, spec, adding snapshot, counts). Eviction writes inline lists to
+files unchanged; a new inline snapshot on a parent whose list is a file
+carries its whole list.
+
 ### I4. Inline replay is byte-stable
 
 Two reads of the same catalog state must produce identical inline-table

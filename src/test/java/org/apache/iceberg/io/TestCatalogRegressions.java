@@ -2197,4 +2197,58 @@ public class TestCatalogRegressions {
       assertThat(manifestLists(io, table).get(table.currentSnapshot().snapshotId())).isEmpty();
     }
   }
+
+  // ============================================================
+  // Bug 31: a commit applied its staged inline manifest lists to any
+  // snapshot in its metadata, including ones already committed: a rule for
+  // in-place manifest rewrites, which no producer performs. Lists must stay
+  // staged on the table handle until a commit lands, since Iceberg's
+  // transaction retry re-stages them only if the table changed; then a
+  // commit whose outcome its writer did not learn -- it landed, but the
+  // catalog could not be read back (CommitStateUnknownException) -- leaves
+  // its stage behind, the handle's next commit sends it again for the now
+  // committed snapshot, and the replay lists that snapshot's manifests a
+  // second time. Found by TestCatalogFaultProperties once the lists were
+  // kept. Stages now apply only to the snapshots a commit adds; a committed
+  // snapshot's list never changes.
+  // ============================================================
+
+  @Nested
+  class StageOfACommitWithUnknownOutcome {
+
+    @Test
+    void nextCommitDoesNotReplayIt() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog ml = catalog(io, LocalCatalogMode.APPEND_ML);
+      ml.createNamespace(mixedNs);
+      Table table = ml.createTable(mixed, intSchema);
+      table.newFastAppend().appendFile(dataFile("a")).commit();
+
+      // The append lands, but its writer cannot read the catalog back to learn so.
+      boolean[] landed = {false};
+      io.injectFaults(
+          (location, strategy) -> {
+            if (landed[0]) {
+              return Fault.NONE;
+            }
+            landed[0] = true;
+            return Fault.LANDED_AS_CONFLICT;
+          });
+      io.injectReadFaults(
+          location -> landed[0] && location.equals(CATALOG) ? ReadFault.FAIL : ReadFault.NONE);
+      assertThatThrownBy(() -> table.newAppend().appendFile(dataFile("b")).commit())
+          .isInstanceOf(CommitStateUnknownException.class);
+      io.injectFaults((location, strategy) -> Fault.NONE);
+      io.injectReadFaults(location -> ReadFault.NONE);
+      Map<Long, List<String>> lists = manifestLists(io, ml.loadTable(mixed));
+
+      table.newFastAppend().appendFile(dataFile("c")).commit();
+
+      Table reloaded = ml.loadTable(mixed);
+      assertThat(manifestLists(io, reloaded)).containsAllEntriesOf(lists);
+      assertThat(dataFiles(reloaded))
+          .containsExactly(
+              "mem:///data/a.parquet", "mem:///data/b.parquet", "mem:///data/c.parquet");
+    }
+  }
 }

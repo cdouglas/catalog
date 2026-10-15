@@ -1102,19 +1102,17 @@ public class TestInlineManifestEndToEnd {
     }
 
     /**
-     * Errata D7: an ML delta staged against a snapshot id that is already
-     * present in base.snapshots() (the "existing snapshot" path) must reach
-     * attachManifestDelta. The previous filter dropped these silently because
-     * it iterated metadata.snapshots() and skipped ids present in oldSnapIds.
-     *
-     * <p>No upstream Iceberg producer currently stages on an existing snapshot
-     * id (SnapshotProducer always mints a fresh id), so this test drives the
-     * sink interface directly, mirroring the future cases the errata calls
-     * out (compaction / RewriteManifests / etc. that mutate a snapshot's
-     * manifest list in place).
+     * An ML delta staged against a snapshot id already present in
+     * base.snapshots() is ignored: a committed snapshot's manifest list never
+     * changes (design.md I3a). No Iceberg producer stages on an existing
+     * snapshot id (SnapshotProducer always mints a fresh one, and
+     * RewriteManifests makes a new snapshot); such a stage is left over from a
+     * commit whose outcome the writer did not learn, and applying it would
+     * list the snapshot's manifests twice. This test drives the sink
+     * interface directly.
      */
     @Test
-    void stagedDeltaOnExistingSnapshotIdSurvivesCommit() {
+    void stagedDeltaOnACommittedSnapshotIsIgnored() {
       createNamespaceAndTable();
       Table tbl = catalog.loadTable(TBL);
       tbl.newFastAppend().appendFile(FILE_A).commit();
@@ -1163,11 +1161,10 @@ public class TestInlineManifestEndToEnd {
       assertThat(s1).isNotNull();
       List<ManifestFile> after = s1.allManifests(io);
       assertThat(after)
-          .as("staged delta on existing snapshot id must replace the manifest list")
+          .as("a committed snapshot's manifest list does not change")
           .hasSize(1);
-      assertThat(after.get(0).path())
-          .as("manifest list for s1 must reflect the staged replacement")
-          .isEqualTo(replacementPath);
+      assertThat(after.get(0).path()).isEqualTo(originalManifestPath);
+      assertThat(out.properties()).containsEntry("d7.test", "tripped");
     }
 
     /**

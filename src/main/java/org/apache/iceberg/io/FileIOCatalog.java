@@ -655,11 +655,13 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         } else {
           stageUpdate(mut, base, metadata, staged);
         }
-        clearStagedDeltas();
         mut.commit(io());
       } catch (SupportsAtomicOperations.CASException e) {
         throw new CommitFailedException(e, "Failed to commit metadata for table %s", tableId);
       }
+      // Only now: a transaction that retries a failed commit re-applies its producers, which
+      // stage their lists again, only if the table changed (BaseTransaction.applyUpdates).
+      clearStagedDeltas();
     }
 
     /**
@@ -670,7 +672,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
       return java.util.Collections.emptyMap();
     }
 
-    /** Clears the staged manifest lists once they are in an update. */
+    /** Clears the staged manifest lists once a commit has landed. */
     void clearStagedDeltas() {}
 
     /** Stages on {@code mut} the creation of this table with {@code metadata}. */
@@ -694,7 +696,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         //      InlineDeltaCodec.applyManifestsOnly — the same hook a full-mode
         //      update uses.
         List<InlineDeltaCodec.DeltaUpdate> manifests =
-            manifestUpdates(null, metadata, staged, "");
+            manifestUpdates(null, null, metadata, staged, "");
         byte[] manifestBytes =
             manifests == null
                 ? null
@@ -735,7 +737,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
             ? proto.manifestListPrefix(tblId)
             : "";
         List<InlineDeltaCodec.DeltaUpdate> manifests =
-            manifestUpdates(isInline ? proto : null, metadata, staged, prefix);
+            manifestUpdates(isInline ? proto : null, base, metadata, staged, prefix);
         if (isInline) {
           // Null if delta encoding cannot express the change (errata D1, D6): full mode then.
           List<InlineDeltaCodec.DeltaUpdate> delta =
@@ -780,14 +782,22 @@ public class FileIOCatalog extends BaseMetastoreCatalog
      * InlineDeltaCodec.NewSnapshotManifests}). So a snapshot whose parent has no inline list in
      * {@code proto} (the table's state the update applies to, null if the table is not inline) or
      * among the new snapshots carries its whole list: its parent's list is a file, written by a
-     * writer that does not inline manifest lists or by an eviction. Stages for snapshots not in
-     * {@code metadata} are dropped: a producer staged them and then rolled back (errata D7).
-     * Returns null if no staged snapshot is in {@code metadata}; else the updates, which are none
-     * if the new snapshots change no manifests (a delete that matched nothing) but must still be
+     * writer that does not inline manifest lists or by an eviction.
+     *
+     * <p>Only snapshots new in this commit, in {@code metadata} but not in {@code base}, take
+     * their stages. One not in {@code metadata} was staged by a producer that then rolled back
+     * (errata D7). One in {@code base} is committed, and a committed snapshot's list never
+     * changes: its stage is left over from a commit that failed after it landed, whose outcome
+     * the writer did not learn (CommitStateUnknownException), and replaying it would list its
+     * manifests twice.
+     *
+     * <p>Returns null if the commit adds no staged snapshot; else the updates, which are none if
+     * the new snapshots change no manifests (a delete that matched nothing) but must still be
      * sent, so that the catalog registers their lists.
      */
     private List<InlineDeltaCodec.DeltaUpdate> manifestUpdates(
         ProtoCatalogFile proto,
+        TableMetadata base,
         TableMetadata metadata,
         Map<Long, InlineManifestTableOperations.StagedSnapshotData> staged,
         String prefix) {
@@ -796,16 +806,21 @@ public class FileIOCatalog extends BaseMetastoreCatalog
       for (Map.Entry<Long, InlineManifestTableOperations.StagedSnapshotData> entry
           : staged.entrySet()) {
         Snapshot snapshot = metadata.snapshot(entry.getKey());
-        if (snapshot == null) {
+        if (snapshot == null || (base != null && base.snapshot(entry.getKey()) != null)) {
           continue;
         }
         if (updates == null) {
           updates = new java.util.ArrayList<>();
         }
         Long parentId = snapshot.parentId();
+        boolean parentNew =
+            parentId != null
+                && staged.containsKey(parentId)
+                && metadata.snapshot(parentId) != null
+                && (base == null || base.snapshot(parentId) == null);
         boolean parentInline =
             parentId == null
-                || (staged.containsKey(parentId) && metadata.snapshot(parentId) != null)
+                || parentNew
                 || (tblId != null && proto.hasInlineManifests(tblId, parentId));
         ManifestListDelta delta = entry.getValue().delta;
         if (parentInline) {
@@ -973,7 +988,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
       return new LinkedHashMap<>(stagedDeltas);
     }
 
-    /** Clears all staged sink data after a successful encode. */
+    /** Clears all staged sink data after a successful commit. */
     @Override
     void clearStagedDeltas() {
       stagedDeltas.clear();

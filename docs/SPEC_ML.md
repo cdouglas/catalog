@@ -207,10 +207,11 @@ List<DeltaUpdate> manifests = null;                   // null: no new inline sna
 for (var entry : staged.entrySet()) {
   Snapshot snap = metadata.snapshot(entry.getKey());
   if (snap == null) continue;                         // orphan stage (errata D7)
+  if (base.snapshot(snap.snapshotId()) != null) continue;  // committed: list is final
   if (manifests == null) manifests = new ArrayList<>();
   Long parent = snap.parentId();
   boolean parentInline = parent == null
-      || staged.containsKey(parent)                   // new in this commit
+      || staged.containsKey(parent) && base.snapshot(parent) == null  // new here
       || base.hasInlineManifests(tblId, parent);      // inline in the table's state
   if (parentInline) {
     attachManifestDelta(manifests, snap.snapshotId(),
@@ -222,9 +223,12 @@ for (var entry : staged.entrySet()) {
 }
 ```
 
-Iteration is over the staged map (not `metadata.snapshots()`) so
-manifest rewrites against an existing snapshot id also reach
-`attachManifestDelta`. A staged list is a delta against the parent's
+Only snapshots the commit adds take their stages. A committed
+snapshot's list never changes (design.md I3a); a stage for one is left
+over from a commit that landed although its writer saw
+`CommitStateUnknownException` (stages stay on the table handle until a
+commit lands, since Iceberg's transaction retry re-stages only if the
+table changed). A staged list is a delta against the parent's
 list, and the replay builds it on the parent's *inline* list
 (`NewSnapshotManifests`). A parent whose list is an Avro file has no
 inline list, so a snapshot on such a parent carries its whole list
@@ -299,6 +303,9 @@ metadata file location) clears the table's inline state, pool included.
   sends the new snapshot's whole list (above). Committing to a pointer
   table, it brings the table back inline if the full metadata, with the
   manifest updates, fits; the older snapshots keep their files.
+
+A committed snapshot's manifest list never changes, whether it is
+inline or a file, so any writer reads the same manifests.
 
 ### Loading
 
