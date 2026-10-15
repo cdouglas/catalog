@@ -80,8 +80,11 @@ import org.apache.iceberg.types.Types;
  * manifest rewrites, table create / drop / rename, and multi-table catalog transactions whose
  * loads, appends and commit are separate steps, so other writers' operations run in between. A
  * command may also preempt the one before it: it runs to completion just before one of that
- * operation's reads of the catalog or its first conditional write, so the two race. Every catalog
- * mode runs (append / CAS / compaction, pointer / inline TM / inline ML).
+ * operation's reads of the catalog or its first conditional write, so the two race. Each writer
+ * has its own catalog mode (append / CAS / compaction, pointer / inline TM / inline ML), or all
+ * writers share one. A small limit on inline updates moves tables out of inline storage and back:
+ * a big property evicts a table to a metadata file, and a later update that fits in full returns
+ * it.
  *
  * <p>In {@link #faultyStorageNeverMisreportsACommit}, each operation's storage also fails as its
  * command says: its first two conditional writes (see {@link InMemoryAtomicFileIO.Fault}) and one
@@ -100,7 +103,9 @@ import org.apache.iceberg.types.Types;
  *       effect. Iceberg deletes a commit's new files on a {@code CleanableFailure} such as {@link
  *       CommitFailedException}, so a commit reported that way that took effect loses them.
  *   <li>An operation whose outcome is unknown took effect entirely or not at all.
- *   <li>Every table loads, and every manifest of every snapshot exists.
+ *   <li>Every table loads; every snapshot has its manifest list, inline or in a file, and every
+ *       manifest exists; a snapshot's manifest list never changes; no table is stored both inline
+ *       and in a metadata file.
  *   <li>An acknowledged catalog transaction saw no concurrent change it must not miss: under
  *       serializable isolation, to the main branch (or, without one, the metadata) of any table it
  *       loaded; under snapshot isolation, to the main branch of any table it appended to.
@@ -115,6 +120,7 @@ class TestCatalogFaultProperties {
   private static final Schema SCHEMA = new Schema(required(1, "id", Types.IntegerType.get()));
   private static final String KEY_PREFIX = "fz.";
   private static final List<String> KEYS = List.of("fz.k1", "fz.k2");
+  private static final String BIG_KEY = "fz.big";
   private static final String WAREHOUSE = "mem:///warehouse";
   private static final String CATALOG_NAME = "fuzz";
   private static final String CATALOG_LOCATION = WAREHOUSE + "/catalog-" + CATALOG_NAME;
@@ -151,20 +157,40 @@ class TestCatalogFaultProperties {
 
   @Property(tries = 100)
   void catalogMatchesModel(
-      @ForAll LocalCatalogMode mode,
+      @ForAll("modes") List<LocalCatalogMode> modes,
       @ForAll @IntRange(min = 2, max = 3) int writers,
+      @ForAll("maxUpdateSizes") int maxUpdateSize,
       @ForAll boolean strictVersions,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(mode, writers, false, strictVersions).execute(schedule);
+    new Run(modes.subList(0, writers), maxUpdateSize, false, strictVersions).execute(schedule);
   }
 
   @Property(tries = 100)
   void faultyStorageNeverMisreportsACommit(
-      @ForAll LocalCatalogMode mode,
+      @ForAll("modes") List<LocalCatalogMode> modes,
       @ForAll @IntRange(min = 2, max = 3) int writers,
+      @ForAll("maxUpdateSizes") int maxUpdateSize,
       @ForAll boolean strictVersions,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(mode, writers, true, strictVersions).execute(schedule);
+    new Run(modes.subList(0, writers), maxUpdateSize, true, strictVersions).execute(schedule);
+  }
+
+  /** Each writer's mode: one for all, a quarter of the time, else each its own. */
+  @Provide
+  Arbitrary<List<LocalCatalogMode>> modes() {
+    Arbitrary<LocalCatalogMode> mode = Arbitraries.of(LocalCatalogMode.class);
+    return Arbitraries.frequencyOf(
+        Tuple.of(1, mode.map(m -> List.of(m, m, m))),
+        Tuple.of(3, mode.list().ofSize(3)));
+  }
+
+  /**
+   * The largest inline table update. Small limits move tables in and out of inline storage: a
+   * big property evicts a table, and removing it lets the table back in.
+   */
+  @Provide
+  Arbitrary<Integer> maxUpdateSizes() {
+    return Arbitraries.of(768, 2048, 8192, InlineDeltaCodec.APPEND_LIMIT);
   }
 
   @Provide
@@ -178,6 +204,8 @@ class TestCatalogFaultProperties {
             Tuple.of(2, Kind.MERGE_APPEND),
             Tuple.of(2, Kind.DELETE_FILE),
             Tuple.of(2, Kind.SET_PROPERTY),
+            Tuple.of(1, Kind.SET_BIG_PROPERTY),
+            Tuple.of(1, Kind.REMOVE_PROPERTY),
             Tuple.of(2, Kind.ADD_COLUMN),
             Tuple.of(2, Kind.TABLE_TXN),
             Tuple.of(1, Kind.EXPIRE_SNAPSHOTS),
@@ -223,6 +251,13 @@ class TestCatalogFaultProperties {
     MERGE_APPEND,
     DELETE_FILE,
     SET_PROPERTY,
+    /**
+     * Sets a property to a random value of about half, 1.2 or 3 times the largest inline update,
+     * as {@code b} picks: an update that fits as a delta, one that fits only in full (full
+     * metadata is compressed, a delta is not), or one that evicts the table.
+     */
+    SET_BIG_PROPERTY,
+    REMOVE_PROPERTY,
     ADD_COLUMN,
     TABLE_TXN,
     EXPIRE_SNAPSHOTS,
@@ -329,10 +364,18 @@ class TestCatalogFaultProperties {
 
     @Override
     public String toString() {
+      Map<String, String> shown = new TreeMap<>();
+      props.forEach((k, v) -> shown.put(k, abbreviate(v)));
       return String.format(
           "{uuid=%s files=%s props=%s columns=%s}",
-          uuid.substring(0, 8), sortedFiles(), props, columns);
+          uuid.substring(0, 8), sortedFiles(), shown, columns);
     }
+  }
+
+  private static String abbreviate(String value) {
+    return value.length() <= 16
+        ? value
+        : value.substring(0, 8) + "...(" + value.length() + " chars)";
   }
 
   private static Map<TableIdentifier, TableState> copy(Map<TableIdentifier, TableState> model) {
@@ -448,7 +491,7 @@ class TestCatalogFaultProperties {
   }
 
   private static final class Run {
-    private final LocalCatalogMode mode;
+    private final int maxUpdateSize;
     private final boolean faults;
     private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
     private final Writer[] writers;
@@ -457,6 +500,11 @@ class TestCatalogFaultProperties {
     private final StringBuilder trace = new StringBuilder();
     private int nextFile = 0;
     private int nextValue = 0;
+    // Each snapshot's manifest list when first seen, by table UUID and snapshot id: a committed
+    // snapshot never changes, whether its list is inline or a file, and whichever writer reads it.
+    private final Map<String, Map<Long, List<String>>> manifestLists = new HashMap<>();
+    // Each table's storage at the last check, by UUID: inline or a metadata file.
+    private final Map<String, String> storage = new HashMap<>();
 
     // The running top-level command's storage plan. Faults and preemption apply only while armed,
     // and only on the thread that runs the schedule.
@@ -472,23 +520,27 @@ class TestCatalogFaultProperties {
     private int reads;
     private final List<String> fired = new ArrayList<>();
 
-    Run(LocalCatalogMode mode, int writers, boolean faults, boolean strictVersions) {
-      this.mode = mode;
+    Run(List<LocalCatalogMode> modes, int maxUpdateSize, boolean faults, boolean strictVersions) {
+      this.maxUpdateSize = maxUpdateSize;
       this.faults = faults;
       io.failSupersededReads(strictVersions);
-      this.writers = new Writer[writers];
-      for (int i = 0; i < writers; i++) {
+      Map<String, String> properties = new HashMap<>(PROPERTIES);
+      properties.put(FileIOCatalog.INLINE_MAX_UPDATE_SIZE, String.valueOf(maxUpdateSize));
+      this.writers = new Writer[modes.size()];
+      for (int i = 0; i < modes.size(); i++) {
         this.writers[i] =
-            new Writer(i, mode.catalog(io, WAREHOUSE, CATALOG_NAME, PROPERTIES));
+            new Writer(i, modes.get(i).catalog(io, WAREHOUSE, CATALOG_NAME, properties));
       }
-      this.checker = mode.catalog(io, WAREHOUSE, CATALOG_NAME, PROPERTIES);
+      // Reading does not depend on a catalog's mode.
+      this.checker = LocalCatalogMode.APPEND.catalog(io, WAREHOUSE, CATALOG_NAME, properties);
       FileIOCatalog seed = this.writers[0].catalog;
       seed.createNamespace(NS);
       seed.createTable(TABLES.get(0), SCHEMA);
       seed.createTable(TABLES.get(1), SCHEMA).newFastAppend().appendFile(newFile()).commit();
       this.model = actual();
-      trace.append(String.format("mode %s, %d writers%s%nseed: %s%n", mode, writers,
-          strictVersions ? ", strict versions" : "", model));
+      trace.append(String.format("modes %s, max update size %d%s%nseed: %s%n", modes,
+          maxUpdateSize, strictVersions ? ", strict versions" : "", model));
+      Statistics.label("modes").collect(new TreeSet<>(modes).size() == 1 ? "one" : "mixed");
       io.injectFaults(this::onWrite);
       io.injectReadFaults(this::onRead);
     }
@@ -583,6 +635,17 @@ class TestCatalogFaultProperties {
 
     // ---------------- operations ----------------
 
+    /** A random value of {@code size} characters, which compresses little. */
+    private String randomValue(int size) {
+      java.util.Random random = new java.util.Random(nextValue++);
+      String alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+      StringBuilder value = new StringBuilder(size);
+      for (int i = 0; i < size; i++) {
+        value.append(alphabet.charAt(random.nextInt(alphabet.length())));
+      }
+      return value.toString();
+    }
+
     private DataFile newFile() {
       return DataFiles.builder(PartitionSpec.unpartitioned())
           .withPath("mem:///data/f" + nextFile++ + ".parquet")
@@ -668,9 +731,10 @@ class TestCatalogFaultProperties {
               },
               (m, actual) -> existing(m, id).files.add(appended.location()));
         case DELETE_FILE:
+          // A quarter of the time a file the table does not have: a snapshot with no changes.
           TableState target = model.get(id);
           String path =
-              target == null || target.files.isEmpty()
+              target == null || target.files.isEmpty() || cmd.b % 4 == 3
                   ? "mem:///data/missing.parquet"
                   : target.sortedFiles().get(cmd.b % target.files.size());
           return new Op(
@@ -684,6 +748,21 @@ class TestCatalogFaultProperties {
               "setProperty(" + id + ", " + key + "=" + value + ")",
               () -> handle(w, id, cmd.fresh).updateProperties().set(key, value).commit(),
               (m, actual) -> existing(m, id).props.put(key, value));
+        case SET_BIG_PROPERTY:
+          // At the default limit, a big property stays well inside it.
+          int scale = Math.min(maxUpdateSize, 8192);
+          int size = (int) (scale * new double[] {0.5, 1.2, 3}[cmd.b % 3]);
+          String big = randomValue(size);
+          return new Op(
+              "setProperty(" + id + ", " + BIG_KEY + "=" + abbreviate(big) + ")",
+              () -> handle(w, id, cmd.fresh).updateProperties().set(BIG_KEY, big).commit(),
+              (m, actual) -> existing(m, id).props.put(BIG_KEY, big));
+        case REMOVE_PROPERTY:
+          String removed = cmd.b % 3 == 2 ? BIG_KEY : KEYS.get(cmd.b % 3);
+          return new Op(
+              "removeProperty(" + id + ", " + removed + ")",
+              () -> handle(w, id, cmd.fresh).updateProperties().remove(removed).commit(),
+              (m, actual) -> existing(m, id).props.remove(removed));
         case ADD_COLUMN:
           String column = "c" + nextValue++;
           return new Op(
@@ -921,21 +1000,45 @@ class TestCatalogFaultProperties {
           });
     }
 
-    /** The catalog's state, read without faults; fails if a table does not load whole. */
+    /**
+     * The catalog's state, read without faults; fails if a table does not load whole, if a table
+     * is stored both inline and in a metadata file, or if a snapshot's manifest list changed.
+     */
     private Map<TableIdentifier, TableState> actual() {
       Map<TableIdentifier, TableState> tables = new TreeMap<>(BY_NAME);
+      ProtoCatalogFile file =
+          new ProtoCatalogFormat(PROPERTIES).read(io, io.newInputFile(CATALOG_LOCATION));
       for (TableIdentifier id : checker.listTables(NS)) {
         TableState state;
         try {
           Table table = checker.loadTable(id);
           TableMetadata metadata = ((HasTableOperations) table).operations().current();
           state = new TableState(metadata.uuid());
+          check(file.location(id) == null || !file.isInlineTable(id),
+              "%s has both a metadata file and inline metadata", id);
+          String stored = file.isInlineTable(id) ? "inline" : "metadata file";
+          String before = storage.put(metadata.uuid(), stored);
+          if (before != null && !before.equals(stored)) {
+            Statistics.label("storage change").collect(before + " -> " + stored);
+          }
+          Map<Long, List<String>> lists =
+              manifestLists.computeIfAbsent(metadata.uuid(), k -> new HashMap<>());
           for (Snapshot snapshot : table.snapshots()) {
+            String list = snapshot.manifestListLocation();
+            check(list == null ? snapshot instanceof org.apache.iceberg.InlineSnapshot
+                    : io.newInputFile(list).exists(),
+                "%s: snapshot %d has no manifest list: %s", id, snapshot.snapshotId(), list);
+            List<String> manifests = new ArrayList<>();
             for (ManifestFile manifest : snapshot.allManifests(io)) {
               check(io.newInputFile(manifest.path()).exists(),
                   "%s: snapshot %d references missing manifest %s",
                   id, snapshot.snapshotId(), manifest.path());
+              manifests.add(describe(manifest));
             }
+            List<String> first = lists.putIfAbsent(snapshot.snapshotId(), manifests);
+            check(first == null || first.equals(manifests),
+                "%s: the manifest list of snapshot %d changed from %s to %s",
+                id, snapshot.snapshotId(), first, manifests);
           }
           try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
             for (FileScanTask task : tasks) {
@@ -963,6 +1066,14 @@ class TestCatalogFaultProperties {
         tables.put(id, state);
       }
       return tables;
+    }
+
+    private static String describe(ManifestFile m) {
+      return String.format("%s(%s spec=%d seq=%d/%d snap=%d files=%d/%d/%d rows=%d/%d/%d)",
+          m.path().substring(m.path().lastIndexOf('/') + 1), m.content(), m.partitionSpecId(),
+          m.sequenceNumber(), m.minSequenceNumber(), m.snapshotId(),
+          m.addedFilesCount(), m.existingFilesCount(), m.deletedFilesCount(),
+          m.addedRowsCount(), m.existingRowsCount(), m.deletedRowsCount());
     }
 
     private AssertionError unexpected(RuntimeException e) {
