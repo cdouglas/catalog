@@ -166,9 +166,12 @@ canary fails and the upgrader knows to delete the workaround.
   iceberg `e0bc582f7`, so the six conflict tests in each `GCSCatalogTest*`
   class failed on the emulator. `FakeGcsEmulatorCanaries` checks
   `ifGenerationMatch` on both kinds of upload. Zonal (Rapid) buckets take
-  a single XML API PUT instead; fake-gcs-server has no zonal semantics,
-  so that path is covered by iceberg's `GcsRapidCanaries` and
-  `GcsFileIOAtomicRapidTest` against a real Rapid bucket (`RAPID_BUCKET`).
+  a single XML API PUT for CAS and an appendable upload for regular
+  writes (manifests, data files), since they reject resumable uploads;
+  fake-gcs-server has no zonal semantics, so those paths are covered by
+  iceberg's `GcsRapidCanaries` and `GcsFileIOAtomicRapidTest` against a
+  real Rapid bucket (`RAPID_BUCKET`), and by running these suites with
+  `GCS_TEST_BUCKET` set to one.
 
 ### T4. `testRegisterTable` (inline) needs a register-from-bytes API
 
