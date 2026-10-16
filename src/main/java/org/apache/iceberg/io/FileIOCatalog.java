@@ -646,7 +646,8 @@ public class FileIOCatalog extends BaseMetastoreCatalog
                 : InlineDeltaCodec.encodeDelta(manifests, metadata.lastUpdatedMillis());
         byte[] metadataBytes = inline.codec.encode(rewriteInlineSnapshotsForFullEncode(metadata));
         if (metadataBytes.length + (manifestBytes != null ? manifestBytes.length : 0)
-            <= inline.maxUpdateSize) {
+                <= inline.maxUpdateSize
+            && !restatesAManifest(null, null, metadata)) {
           if (manifestBytes != null) {
             mut.createTableInlineWithManifests(
                 tableId, metadataBytes, inline.codec.tag(), manifestBytes);
@@ -677,6 +678,10 @@ public class FileIOCatalog extends BaseMetastoreCatalog
             : "";
         List<InlineDeltaCodec.DeltaUpdate> manifests =
             manifestUpdates(isInline ? proto : null, base, metadata, prefix);
+        if (manifests != null && restatesAManifest(isInline ? proto : null, base, metadata)) {
+          mut.updateTable(tableId, writeUpdateMetadata(false, metadata));
+          return;
+        }
         if (isInline) {
           // Null if delta encoding cannot express the change (errata D1, D6): full mode then.
           List<InlineDeltaCodec.DeltaUpdate> delta =
@@ -762,6 +767,35 @@ public class FileIOCatalog extends BaseMetastoreCatalog
             prefix);
       }
       return updates;
+    }
+
+    /**
+     * Whether a snapshot {@code metadata} adds lists a manifest with another first row id than
+     * the table's inline lists, or an earlier new snapshot, hold for its path: the first snapshot
+     * of a table upgraded to v3, which gives row ids to the data manifests it keeps. The inline
+     * lists share one entry per path, and changing it would change the lists that hold it (design.md
+     * I3a), so the commit writes a metadata file, which holds each snapshot's list as it is.
+     */
+    private boolean restatesAManifest(
+        ProtoCatalogFile proto, TableMetadata base, TableMetadata metadata) {
+      Integer tblId = proto != null ? proto.tableId(tableId) : null;
+      Map<String, Long> firstRowIds = new HashMap<>();
+      if (tblId != null) {
+        proto.manifestPool(tblId).forEach((path, m) -> firstRowIds.put(path, m.firstRowId()));
+      }
+      for (Snapshot snapshot : metadata.snapshots()) {
+        if (!isNew(snapshot, base)) {
+          continue;
+        }
+        for (ManifestFile m : snapshot.allManifests(io())) {
+          if (firstRowIds.containsKey(m.path())
+              && !java.util.Objects.equals(firstRowIds.get(m.path()), m.firstRowId())) {
+            return true;
+          }
+          firstRowIds.put(m.path(), m.firstRowId());
+        }
+      }
+      return false;
     }
 
     /** Whether {@code snapshot} is an inline-ML snapshot that a commit on {@code base} adds. */

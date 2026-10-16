@@ -235,6 +235,15 @@ inline list, so a snapshot on such a parent carries its whole list.
 Such parents come from writers that do not inline manifest lists and
 from eviction (see "Writers in Different Modes" below).
 
+The pool holds one entry per manifest path, shared by every snapshot
+that lists it. The first snapshot of a table upgraded to v3 lists the
+data manifests it keeps with first row ids they did not have before
+(v3 spec: every data manifest in a v3 snapshot's list has one), so its
+entries differ from the pooled ones; replacing those would change the
+lists of the snapshots before it (design.md I3a). Such a commit writes
+a metadata file, which holds each snapshot's list as it is, and the
+table returns inline with a later update that fits in full.
+
 The commit used to send the deltas the sink was offered, kept on the
 table handle that received them until a commit landed. A catalog
 transaction's commit has only its tables' new metadata, so it looked

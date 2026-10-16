@@ -2436,6 +2436,50 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 36: the first snapshot of a table upgraded to v3 gives row ids to
+  // the data manifests it keeps from before the upgrade. The catalog's
+  // inline lists hold one entry per manifest path, shared by the table's
+  // snapshots, and the snapshot sent only the manifests its parent's list
+  // lacked: the kept manifests' new first row ids were dropped, so their
+  // files never had row ids inline, and a manifest list file written for
+  // the snapshot later gave them a range another manifest held. Updating
+  // the shared entry would change the parent's list (design.md I3a), so
+  // such a commit now writes a metadata file, which holds each snapshot's
+  // list exactly; the table returns inline with a later update. Found by
+  // TestCatalogFaultProperties with v3 tables.
+  // ============================================================
+
+  @Nested
+  class FirstSnapshotAfterAnUpgradeToV3 {
+
+    @Test
+    void givesRowIdsToTheFilesItKeeps() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog ml = catalog(io, LocalCatalogMode.APPEND_ML);
+      ml.createNamespace(mixedNs);
+      ml.createTable(mixed, intSchema).newFastAppend().appendFile(dataFile("a")).commit();
+      ml.loadTable(mixed)
+          .updateProperties()
+          .set(org.apache.iceberg.TableProperties.FORMAT_VERSION, "3")
+          .commit();
+      Map<Long, List<String>> before = manifestLists(io, ml.loadTable(mixed));
+
+      ml.loadTable(mixed).newFastAppend().appendFile(dataFile("b")).commit();
+
+      // a's manifest gets row ids after b's, which a fast append lists first.
+      Map<String, Long> expected = Map.of("mem:///data/a.parquet", 1L, "mem:///data/b.parquet", 0L);
+      assertThat(rowIds(ml.loadTable(mixed))).isEqualTo(expected);
+      assertThat(manifestLists(io, ml.loadTable(mixed))).containsAllEntriesOf(before);
+
+      ml.loadTable(mixed).updateProperties().set("k", "v").commit();
+
+      assertThat(catalogFile(io).isInlineTable(mixed)).as("returned").isTrue();
+      assertThat(rowIds(ml.loadTable(mixed))).isEqualTo(expected);
+      assertThat(manifestLists(io, ml.loadTable(mixed))).containsAllEntriesOf(before);
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)

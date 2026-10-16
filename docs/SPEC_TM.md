@@ -415,6 +415,9 @@ function stageCreate(mut, metadata):                   # base == null
 function stageUpdate(mut, base, metadata):
     if inline:
         manifests = manifestUpdates(base, metadata)     # new snapshots' lists; SPEC_ML
+        if restatesAPooledManifest(base, metadata):     # first snapshot after a v3 upgrade
+            mut.updateTable(tableId, writeUpdateMetadata(metadata))
+            return
         if lastCatalogFile.isInlineTable(tableId):
             delta = computeDelta(base, metadata, prefix)   # null: inexpressible
             if delta != null and size(delta + manifests) <= maxUpdateSize:
