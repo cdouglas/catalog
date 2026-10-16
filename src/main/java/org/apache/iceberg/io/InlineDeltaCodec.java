@@ -185,7 +185,7 @@ public class InlineDeltaCodec {
   private static final int SNAP_MANIFEST_SUFFIX = 2;
   private static final int SNAP_SUMMARY = 3;
   private static final int SNAP_TIMESTAMP_DELTA = 4;
-  private static final int SNAP_SCHEMA_ID = 5;
+  private static final int SNAP_SCHEMA_ID = 5;    // optional; varint
   private static final int SNAP_ADDED_ROWS = 6;   // optional; varint64
   private static final int SNAP_PARENT_ID = 7;    // optional; fixed64
   private static final int SNAP_FIRST_ROW_ID = 8; // optional; varint64
@@ -685,9 +685,10 @@ public class InlineDeltaCodec {
           }
         }
         long timestampDelta = snap.timestampMillis() - oldMeta.lastUpdatedMillis();
-        int schemaId = snap.schemaId() != null
+        // Absent when it is the base's current schema, which replay falls back to.
+        Integer schemaId = snap.schemaId() != null
             && snap.schemaId() != oldMeta.currentSchemaId()
-            ? snap.schemaId() : 0;
+            ? snap.schemaId() : null;
         // Always carry parent snapshot ID explicitly. This is required for
         // stage-only, branch, cherry-pick; reconstructing from base.currentSnapshot
         // on replay is wrong in those cases.
@@ -1259,29 +1260,33 @@ public class InlineDeltaCodec {
     public final String manifestListSuffix;
     public final Map<String, String> summary;
     public final long timestampDeltaMs;
-    public final int schemaId;
     // Optional fields. Absent values:
+    //   schemaId == null          -> base.currentSchemaId() (schema 0 included when present)
     //   addedRows == null         -> no row lineage (a v3 snapshot has it, 0 included)
     //   parentSnapshotId == null  -> fall back to base.currentSnapshot()
     //   firstRowId == null        -> no row lineage
     //   keyId == null             -> no encryption key
+    public final Integer schemaId;
     public final Long addedRows;
     public final Long parentSnapshotId;
     public final Long firstRowId;
     public final String keyId;
 
-    /** Back-compat constructor: no explicit parent/firstRowId/keyId; addedRows 0 is absent. */
+    /**
+     * Back-compat constructor: no explicit parent/firstRowId/keyId; schemaId and addedRows 0 are
+     * absent.
+     */
     public AddSnapshotUpdate(
         long snapshotId, String manifestListSuffix, Map<String, String> summary,
         long timestampDeltaMs, int schemaId, long addedRows) {
-      this(snapshotId, manifestListSuffix, summary, timestampDeltaMs, schemaId,
-          addedRows > 0 ? addedRows : null, null, null, null);
+      this(snapshotId, manifestListSuffix, summary, timestampDeltaMs,
+          schemaId > 0 ? schemaId : null, addedRows > 0 ? addedRows : null, null, null, null);
     }
 
     /** Full constructor with optional parent snapshot id, first row id, key id. */
     public AddSnapshotUpdate(
         long snapshotId, String manifestListSuffix, Map<String, String> summary,
-        long timestampDeltaMs, int schemaId, Long addedRows,
+        long timestampDeltaMs, Integer schemaId, Long addedRows,
         Long parentSnapshotId, Long firstRowId, String keyId) {
       this.snapshotId = snapshotId;
       this.manifestListSuffix = manifestListSuffix;
@@ -1312,7 +1317,7 @@ public class InlineDeltaCodec {
       // prior snapshot's manifest list into the replacement.
       Long resolvedParentId = parentSnapshotId;
       long timestamp = base.lastUpdatedMillis() + timestampDeltaMs;
-      Integer resolvedSchemaId = schemaId > 0 ? schemaId : base.currentSchemaId();
+      Integer resolvedSchemaId = schemaId != null ? schemaId : base.currentSchemaId();
       // For inline-ML snapshots (empty suffix), the manifest-list location is a
       // sentinel; the inline-ML read path swaps the BaseSnapshot for an
       // InlineSnapshot in wrapInlineManifests before any FileIO call resolves it.
@@ -1530,7 +1535,7 @@ public class InlineDeltaCodec {
       // encode summary as CompactSummary
       writeLengthDelimited(inner, SNAP_SUMMARY, encodeCompactSummary(u.summary));
       writeSVarint64(inner, SNAP_TIMESTAMP_DELTA, u.timestampDeltaMs);
-      if (u.schemaId > 0) {
+      if (u.schemaId != null) {
         writeVarint(inner, SNAP_SCHEMA_ID, u.schemaId);
       }
       if (u.addedRows != null) {
@@ -1894,7 +1899,7 @@ public class InlineDeltaCodec {
     Long addedRows = null;
     String manifestSuffix = "";
     Map<String, String> summary = new HashMap<>();
-    int schemaId = 0;
+    Integer schemaId = null;
     Long parentId = null;
     Long firstRowId = null;
     String keyId = null;

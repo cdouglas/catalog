@@ -315,6 +315,8 @@ message AddSnapshot {
   string         manifest_list_suffix   = 2;
   CompactSummary summary                = 3;
   sint64         timestamp_delta_ms     = 4;
+  // Present, 0 included, unless it is the base's current schema, which replay
+  // uses when it is absent.
   int32          schema_id              = 5;
   // Present for a v3+ snapshot, 0 included (a snapshot that adds no rows);
   // absent for a snapshot without row lineage.

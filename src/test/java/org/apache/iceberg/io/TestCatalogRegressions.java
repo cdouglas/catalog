@@ -2515,6 +2515,43 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 38: an inline delta wrote a new snapshot's schema id only when it
+  // was positive and not the base's current schema, and replay took an
+  // absent id as the base's current schema. A snapshot written with
+  // schema 0 on a base whose current schema is another -- a replace
+  // transaction back to a table's first schema -- replayed with the other
+  // schema. The schema id is now written whenever it is not the base's
+  // current schema, 0 included. Found by reading the delta codec while
+  // adding v3 tables to TestCatalogFaultProperties.
+  // ============================================================
+
+  @Nested
+  class SnapshotOfAReplaceToTheFirstSchema {
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND_TM", "APPEND_ML"})
+    void keepsItsSchemaId(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, mode);
+      catalog.createNamespace(mixedNs);
+      catalog.createTable(mixed, intSchema)
+          .updateSchema()
+          .addColumn("c", Types.IntegerType.get())
+          .commit();
+
+      org.apache.iceberg.Transaction replace =
+          catalog.buildTable(mixed, intSchema).replaceTransaction();
+      replace.newFastAppend().appendFile(dataFile("a")).commit();
+      replace.commitTransaction();
+
+      Table table = catalog(io, LocalCatalogMode.APPEND).loadTable(mixed);
+      assertThat(table.schema().schemaId()).isEqualTo(0);
+      assertThat(table.currentSnapshot().schemaId()).isEqualTo(0);
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)

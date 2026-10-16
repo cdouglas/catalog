@@ -198,7 +198,8 @@ message AddSnapshot {
                                              // empty for inline-ML snapshots
   CompactSummary summary              = 3;   // typed summary (replaces map)
   sint64         timestamp_delta_ms   = 4;   // signed delta from lastUpdatedMs
-  int32          schema_id            = 5;   // only if changed
+  int32          schema_id            = 5;   // present (0 included) unless it is
+                                             // the base's current schema
   int64          added_rows           = 6;   // v3+: present, 0 included
   fixed64        parent_snapshot_id   = 7;   // optional: stage-only / branch
                                              // / cherry-pick. Absent => fall
