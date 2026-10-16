@@ -731,12 +731,11 @@ public class InlineDeltaCodec {
     if (!replayKeepsTheWritersIds(oldMeta, newMeta)) {
       return null;
     }
-    // Replay stamps the snapshot-log entry of a main-branch change with the commit's
-    // last-updated-ms. A transaction that moved main and then changed something else (a branch)
-    // logged main at the earlier time, which only full mode carries.
-    List<org.apache.iceberg.HistoryEntry> log = newMeta.snapshotLog();
-    if (!log.equals(oldMeta.snapshotLog()) && !log.isEmpty()
-        && log.get(log.size() - 1).timestampMillis() != newMeta.lastUpdatedMillis()) {
+    // Replay logs one new snapshot-log entry, main's new snapshot at the commit's last-updated-ms,
+    // if main moved. A transaction that moved main and then changed something else (a branch)
+    // logged main at the earlier time, and one that moved main and back (append, roll back)
+    // logged main again: only full mode carries those.
+    if (!replayLogsAsTheWriterDid(oldMeta, newMeta)) {
       return null;
     }
     List<DeltaUpdate> updates = new ArrayList<>();
@@ -927,6 +926,30 @@ public class InlineDeltaCodec {
     }
 
     return updates.isEmpty() ? null : updates;
+  }
+
+  /**
+   * Whether {@code newMeta}'s snapshot log has the entries replay adds to {@code oldMeta}'s: none
+   * if main did not move, else main's new snapshot at the commit's last-updated-ms, last.
+   */
+  private static boolean replayLogsAsTheWriterDid(TableMetadata oldMeta, TableMetadata newMeta) {
+    Set<org.apache.iceberg.HistoryEntry> old = new HashSet<>(oldMeta.snapshotLog());
+    List<org.apache.iceberg.HistoryEntry> log = newMeta.snapshotLog();
+    List<org.apache.iceberg.HistoryEntry> added = new ArrayList<>();
+    for (org.apache.iceberg.HistoryEntry entry : log) {
+      if (!old.contains(entry)) {
+        added.add(entry);
+      }
+    }
+    org.apache.iceberg.Snapshot main = newMeta.currentSnapshot();
+    org.apache.iceberg.Snapshot was = oldMeta.currentSnapshot();
+    if (main == null || (was != null && was.snapshotId() == main.snapshotId())) {
+      return added.isEmpty();
+    }
+    return added.size() == 1
+        && log.get(log.size() - 1) == added.get(0)
+        && added.get(0).snapshotId() == main.snapshotId()
+        && added.get(0).timestampMillis() == newMeta.lastUpdatedMillis();
   }
 
   /**

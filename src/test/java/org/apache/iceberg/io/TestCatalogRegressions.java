@@ -3595,6 +3595,44 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 58: replay of an inline delta logs one snapshot-log entry, main's
+  // new snapshot at the commit's time, if main moved. A transaction that
+  // moved main and back -- an append rolled back to where main was --
+  // left main's ref as it was, so its delta set no ref, but Iceberg logs
+  // main again: readers of an inline table lost that entry. computeDelta
+  // checked only the time of the log's last entry; it now checks that
+  // the log gained only what replay adds, and else sends the full
+  // metadata. Found by TestInlineDifferentialProperties with catalog
+  // transactions; a table transaction does it too.
+  // ============================================================
+
+  @Nested
+  class MainMovedAndBack {
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND", "APPEND_TM", "APPEND_ML"})
+    void logsMainAgain(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, mode);
+      catalog.createNamespace(mixedNs);
+      Table table = catalog.createTable(mixed, intSchema);
+      table.newFastAppend().appendFile(dataFile("a")).commit();
+      long first = table.currentSnapshot().snapshotId();
+
+      org.apache.iceberg.Transaction txn = table.newTransaction();
+      txn.newFastAppend().appendFile(dataFile("b")).commit();
+      txn.manageSnapshots().rollbackTo(first).commit();
+      txn.commitTransaction();
+
+      List<Long> log = Lists.transform(
+          catalog(io, LocalCatalogMode.APPEND).loadTable(mixed).history(),
+          org.apache.iceberg.HistoryEntry::snapshotId);
+      assertThat(log).containsExactly(first, first);
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)
