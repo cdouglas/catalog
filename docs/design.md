@@ -228,6 +228,20 @@ table, an inline table without a prefix. `CheckpointRoundTrip` checks
 every catalog file written in `TestCatalogFaultProperties`,
 `TestMultiWriterProperties` and the `TestLocalCatalog*` suites.
 
+### I7. A delta replays to the metadata its writer committed
+
+An inline delta must hold every change of its commit, or
+`InlineDeltaCodec.computeDelta` must refuse it (return null, so the
+commit sends the full metadata). A change the delta has no update for
+and does not refuse is lost on replay: a format-version upgrade (Bug 37)
+or a removed ref (Bug 39) made alongside another change, a schema id or
+count of 0 written as absent (Bugs 33, 38, 40), a value derived on
+replay that the commit did not derive the same way (Bugs 41, 42).
+`TestInlineDeltaProperties` runs random Iceberg operations and checks
+that each commit's delta, replayed on its base as the inline codec
+stores it, gives the committed metadata, and that the codec stores
+every version exactly (Bug 43).
+
 ## Operation × Operation Conflict Matrix
 
 The matrix below falls out of I2 (action versions are bumped on apply)
