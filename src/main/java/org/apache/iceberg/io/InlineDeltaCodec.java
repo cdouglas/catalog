@@ -89,6 +89,7 @@ public class InlineDeltaCodec {
   private static final int UPDATE_REMOVE_MANIFEST = 13;
   private static final int ADD_MF_SNAPSHOT_ID = 1;
   private static final int ADD_MF_MANIFEST = 2;
+  private static final int ADD_MF_POSITION = 3; // optional; varint
   private static final int REMOVE_MF_SNAPSHOT_ID = 1;
   private static final int REMOVE_MF_PATH_SUFFIX = 2;
 
@@ -344,7 +345,7 @@ public class InlineDeltaCodec {
                 : null,
             add.manifest.firstRowId());
         catalogBuilder.addManifestToPool(tableId, resolved);
-        newSnapshots.addManifest(current, add.snapshotId, resolved.path());
+        newSnapshots.addManifest(current, add.snapshotId, resolved.path(), add.position);
       } else if (update instanceof RemoveManifestUpdate) {
         RemoveManifestUpdate rm = (RemoveManifestUpdate) update;
         newSnapshots.removeManifest(current, rm.snapshotId, rm.manifestPathSuffix);
@@ -389,7 +390,9 @@ public class InlineDeltaCodec {
     private final Map<Long, Long> parents = new LinkedHashMap<>();
     // The parent's list when the snapshot was added: final unless the delta also adds the parent.
     private final Map<Long, List<String>> inherited = new HashMap<>();
+    // Each new snapshot's added manifests, with their positions in its list (null: at the end).
     private final Map<Long, List<String>> added = new HashMap<>();
+    private final Map<Long, List<Integer>> positions = new HashMap<>();
     private final Map<Long, List<String>> removedSuffixes = new HashMap<>();
 
     NewSnapshotManifests(ProtoCatalogFile.Builder builder, int tableId) {
@@ -411,13 +414,23 @@ public class InlineDeltaCodec {
       builder.setSnapshotManifests(tableId, snapshotId, base);
     }
 
-    void addManifest(TableMetadata current, long snapshotId, String path) {
+    void addManifest(TableMetadata current, long snapshotId, String path, Integer position) {
       if (parents.containsKey(snapshotId)) {
         added.computeIfAbsent(snapshotId, k -> new ArrayList<>()).add(path);
+        positions.computeIfAbsent(snapshotId, k -> new ArrayList<>()).add(position);
       }
       List<String> refs = refs(current, snapshotId);
-      refs.add(path);
+      insert(refs, path, position);
       builder.setSnapshotManifests(tableId, snapshotId, refs);
+    }
+
+    /** Inserts {@code path} at {@code position}, or at the end if it is null or past the end. */
+    private static void insert(List<String> refs, String path, Integer position) {
+      if (position != null && position <= refs.size()) {
+        refs.add(position, path);
+      } else {
+        refs.add(path);
+      }
     }
 
     void removeManifest(TableMetadata current, long snapshotId, String suffix) {
@@ -440,7 +453,11 @@ public class InlineDeltaCodec {
       return new ArrayList<>(builder.snapshotManifestPaths(tableId, snapshotId));
     }
 
-    /** Settles each new snapshot's list: its parent's final list, plus and less its own. */
+    /**
+     * Settles each new snapshot's list: its parent's final list, less the manifests it removes,
+     * with the ones it adds at their positions, in order (the positions are indices in the final
+     * list, so each lands after every manifest that precedes it).
+     */
     void finish() {
       Map<Long, List<String>> lists = new HashMap<>();
       Set<Long> registered = builder.snapshotManifestKeys(tableId);
@@ -451,9 +468,19 @@ public class InlineDeltaCodec {
                     parentId != null && lists.containsKey(parentId)
                         ? lists.get(parentId)
                         : inherited.get(snapshotId));
-            refs.addAll(added.getOrDefault(snapshotId, List.of()));
             for (String suffix : removedSuffixes.getOrDefault(snapshotId, List.of())) {
               refs.removeIf(p -> p.endsWith(suffix));
+            }
+            List<String> paths = added.getOrDefault(snapshotId, List.of());
+            List<Integer> at = positions.getOrDefault(snapshotId, List.of());
+            List<Integer> order = new ArrayList<>();
+            for (int i = 0; i < paths.size(); i++) {
+              order.add(i);
+            }
+            order.sort(java.util.Comparator.comparing(
+                i -> at.get(i) == null ? Integer.MAX_VALUE : at.get(i)));
+            for (int i : order) {
+              insert(refs, paths.get(i), at.get(i));
             }
             lists.put(snapshotId, refs);
             if (registered.contains(snapshotId)) { // not removed by the same delta
@@ -533,7 +560,7 @@ public class InlineDeltaCodec {
                 : null,
             add.manifest.firstRowId());
         catalogBuilder.addManifestToPool(tableId, resolved);
-        newSnapshots.addManifest(current, add.snapshotId, resolved.path());
+        newSnapshots.addManifest(current, add.snapshotId, resolved.path(), add.position);
       } else if (update instanceof RemoveManifestUpdate) {
         RemoveManifestUpdate rm = (RemoveManifestUpdate) update;
         newSnapshots.removeManifest(current, rm.snapshotId, rm.manifestPathSuffix);
@@ -1444,11 +1471,19 @@ public class InlineDeltaCodec {
     public final long snapshotId;
     public final ManifestFile manifest;
     public final String pathPrefix;
+    // The manifest's index in the snapshot's list; null to append it.
+    public final Integer position;
 
     public AddManifestUpdate(long snapshotId, ManifestFile manifest, String pathPrefix) {
+      this(snapshotId, manifest, pathPrefix, null);
+    }
+
+    public AddManifestUpdate(
+        long snapshotId, ManifestFile manifest, String pathPrefix, Integer position) {
       this.snapshotId = snapshotId;
       this.manifest = manifest;
       this.pathPrefix = pathPrefix;
+      this.position = position;
     }
 
     @Override
@@ -1490,8 +1525,20 @@ public class InlineDeltaCodec {
   public static void attachManifestDelta(
       List<DeltaUpdate> delta, long snapshotId,
       List<ManifestFile> added, List<String> removedPaths, String pathPrefix) {
-    for (ManifestFile mf : added) {
-      delta.add(new AddManifestUpdate(snapshotId, mf, pathPrefix));
+    attachManifestDelta(delta, snapshotId, added, null, removedPaths, pathPrefix);
+  }
+
+  /**
+   * Like {@link #attachManifestDelta(List, long, List, List, String)}, with each added manifest's
+   * index in the snapshot's final list ({@code positions}, parallel to {@code added}; null to
+   * append them).
+   */
+  public static void attachManifestDelta(
+      List<DeltaUpdate> delta, long snapshotId, List<ManifestFile> added,
+      List<Integer> positions, List<String> removedPaths, String pathPrefix) {
+    for (int i = 0; i < added.size(); i++) {
+      delta.add(new AddManifestUpdate(
+          snapshotId, added.get(i), pathPrefix, positions == null ? null : positions.get(i)));
     }
     for (String path : removedPaths) {
       String suffix = path;
@@ -1642,6 +1689,9 @@ public class InlineDeltaCodec {
       writeFixed64(inner, ADD_MF_SNAPSHOT_ID, u.snapshotId);
       byte[] mfBytes = ProtoCodec.encodeManifestFileEntry(u.manifest, u.pathPrefix);
       writeLengthDelimited(inner, ADD_MF_MANIFEST, mfBytes);
+      if (u.position != null) {
+        writeVarint(inner, ADD_MF_POSITION, u.position);
+      }
       writeLengthDelimited(out, UPDATE_ADD_MANIFEST, inner.toByteArray());
 
     } else if (update instanceof RemoveManifestUpdate) {
@@ -1706,6 +1756,7 @@ public class InlineDeltaCodec {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
     long snapshotId = 0;
     ManifestFile manifest = null;
+    Integer position = null;
 
     while (in.available() > 0) {
       int tag = readVarint(in);
@@ -1718,11 +1769,14 @@ public class InlineDeltaCodec {
           // Decode with empty prefix; full path will be resolved by the caller
           manifest = ProtoCodec.decodeManifestFileEntry(readLengthDelimitedBytes(in), "");
           break;
+        case ADD_MF_POSITION:
+          position = readVarint(in);
+          break;
         default:
           skipField(in, tag & 0x7);
       }
     }
-    return new AddManifestUpdate(snapshotId, manifest, "");
+    return new AddManifestUpdate(snapshotId, manifest, "", position);
   }
 
   private static RemoveManifestUpdate decodeRemoveManifest(byte[] bytes) throws IOException {

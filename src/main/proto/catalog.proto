@@ -303,6 +303,10 @@ message TableMetadataUpdate {
 message AddManifestDelta {
   int64              snapshot_id = 1;
   ManifestFileEntry  manifest    = 2;
+  // Optional: the manifest's index in the snapshot's list, which replay builds
+  // from the parent's, less the removed manifests, inserting the added ones at
+  // their positions in order. Absent: appended.
+  int32              position    = 3;
 }
 
 message RemoveManifestDelta {

@@ -3062,6 +3062,43 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 50: an inline delta sent a new snapshot's list as the manifests it
+  // adds to and removes from its parent's, and replay appended the added
+  // ones to the parent's list. Iceberg lists a fast append's new manifest
+  // first, so readers of an inline-ML table saw each list in another order
+  // than its writer -- and than a pointer catalog -- which changes which
+  // manifests a merge append later bins together. Each added manifest now
+  // carries its position, and a snapshot whose kept manifests are not in
+  // its parent's order replaces the list whole. Found by
+  // TestInlineDifferentialProperties.
+  // ============================================================
+
+  @Nested
+  class InlineManifestListOrder {
+
+    @Test
+    void isTheWritersOrder() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog ml = catalog(io, LocalCatalogMode.APPEND_ML);
+      ml.createNamespace(mixedNs);
+      Table table = ml.createTable(mixed, intSchema);
+      table.newFastAppend().appendFile(dataFile("a")).commit();
+      table.newFastAppend().appendFile(dataFile("b")).commit();
+      List<Long> written =
+          Lists.transform(table.currentSnapshot().allManifests(io),
+              org.apache.iceberg.ManifestFile::snapshotId);
+
+      Table read = catalog(io, LocalCatalogMode.APPEND).loadTable(mixed);
+
+      assertThat(Lists.transform(read.currentSnapshot().allManifests(io),
+              org.apache.iceberg.ManifestFile::snapshotId))
+          .containsExactlyElementsOf(written)
+          .first()
+          .isEqualTo(read.currentSnapshot().snapshotId());
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)

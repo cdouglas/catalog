@@ -113,6 +113,7 @@ Two `TableMetadataUpdate` types carry manifest list changes inside an
 message AddManifestDelta {
   int64              snapshot_id = 1;
   ManifestFileEntry  manifest    = 2;   // full ManifestFile entry
+  int32              position    = 3;   // optional: index in the snapshot's list
 }
 
 message RemoveManifestDelta {
@@ -224,6 +225,12 @@ for (Snapshot snap : metadata.snapshots()) {
   }
 }
 ```
+
+A list keeps its writer's order: each added manifest carries its index
+in the new list, and replay inserts the added manifests, in order of
+index, into the parent's list less the removed ones. When the manifests
+a snapshot keeps are not in its parent's order, it removes them all and
+adds its whole list.
 
 Only snapshots the commit adds send lists. A committed snapshot's list
 never changes (design.md I3a), so a delta the sink was offered for one,

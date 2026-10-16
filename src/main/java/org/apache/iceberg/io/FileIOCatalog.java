@@ -795,25 +795,41 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         }
         List<ManifestFile> manifests = snapshot.allManifests(io());
         List<ManifestFile> parent = parentList(proto, base, metadata, snapshot.parentId());
-        if (parent == null) {
-          InlineDeltaCodec.attachManifestDelta(
-              updates, snapshot.snapshotId(), manifests, List.of(), prefix);
-          continue;
-        }
-        Set<String> parentPaths =
-            parent.stream().map(ManifestFile::path).collect(Collectors.toSet());
         Set<String> paths = manifests.stream().map(ManifestFile::path).collect(Collectors.toSet());
+        // The list is rebuilt in order: the parent's, less what the snapshot removes, with what it
+        // adds at the positions it has. If the manifests it keeps are not in the parent's order,
+        // it replaces the parent's list whole.
+        List<String> kept =
+            parent == null
+                ? List.of()
+                : parent.stream()
+                    .map(ManifestFile::path)
+                    .filter(paths::contains)
+                    .collect(Collectors.toList());
+        Set<String> keptPaths = new HashSet<>(kept);
+        boolean inOrder =
+            kept.equals(
+                manifests.stream()
+                    .map(ManifestFile::path)
+                    .filter(keptPaths::contains)
+                    .collect(Collectors.toList()));
+        List<ManifestFile> added = new java.util.ArrayList<>();
+        List<Integer> positions = new java.util.ArrayList<>();
+        for (int i = 0; i < manifests.size(); i++) {
+          if (!inOrder || !keptPaths.contains(manifests.get(i).path())) {
+            added.add(manifests.get(i));
+            positions.add(i);
+          }
+        }
+        List<String> removed =
+            parent == null
+                ? List.of()
+                : parent.stream()
+                    .map(ManifestFile::path)
+                    .filter(path -> !inOrder || !paths.contains(path))
+                    .collect(Collectors.toList());
         InlineDeltaCodec.attachManifestDelta(
-            updates,
-            snapshot.snapshotId(),
-            manifests.stream()
-                .filter(m -> !parentPaths.contains(m.path()))
-                .collect(Collectors.toList()),
-            parent.stream()
-                .map(ManifestFile::path)
-                .filter(path -> !paths.contains(path))
-                .collect(Collectors.toList()),
-            prefix);
+            updates, snapshot.snapshotId(), added, positions, removed, prefix);
       }
       return updates;
     }
