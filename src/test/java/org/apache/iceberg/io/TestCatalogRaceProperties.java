@@ -50,6 +50,12 @@ import org.apache.iceberg.types.Types;
  * run after it.) One exception: an operation through a table handle (a property change, an
  * append, a delete) that Iceberg refuses because the table it loaded was dropped and another
  * created under its name since (its UUID changed) must leave the catalog as the others alone do.
+ * A catalog transaction (it loads one table or two and appends to the first) is not serial that
+ * way either: it must fail, and leave the catalog as the others alone do, if an operation that
+ * ran before its writes changed what it read -- under serializable isolation the main branch of
+ * each table it loaded (or the table, if main had no snapshot), under snapshot isolation that of
+ * the table it appended to. It may fail otherwise too, as it does when another commit changed a
+ * table it writes at all (a failure is safe: its client retries); the property counts those.
  *
  * <p>The operations are namespace creates (of nested namespaces too, which create their parents),
  * drops and property changes; table creates, drops, renames and property changes; and appends and
@@ -95,13 +101,21 @@ class TestCatalogRaceProperties {
     String[] results = new String[racers.size()];
     int[] writes = {0};
     boolean[] nested = {false};
+    boolean[] changedItsReads = {false}; // whether a racer changed what A, a transaction, read
+    List<Map<TableIdentifier, String>> loaded = new java.util.ArrayList<>(); // as A loaded them
     io.injectFaults((location, strategy) -> {
       if (!nested[0] && location.equals(CATALOG)) {
         int k = writes[0]++;
         if (k < racers.size()) {
           nested[0] = true;
           try {
+            if (a.kind == Kind.CATALOG_TXN && loaded.isEmpty()) {
+              loaded.add(a.reads(io)); // nothing has written since A loaded its tables
+            }
             results[k] = racers.get(k).run(writers.get(k), name(k));
+            if (!loaded.isEmpty() && !a.unchanged(loaded.get(0), a.reads(io))) {
+              changedItsReads[0] = true;
+            }
           } finally {
             nested[0] = false;
           }
@@ -117,9 +131,23 @@ class TestCatalogRaceProperties {
     }
     String raceState = state(io);
 
-    // The serial run on another copy: the racers that ran before A's writes, A, the rest. A
-    // handle whose table was replaced since it was loaded cannot commit, so then without A.
-    boolean replaced = a.kind.throughAHandle() && raceA.equals(REPLACED);
+    // A transaction whose reads a racer changed must fail; one whose reads held may fail too.
+    boolean txnFailed = a.kind == Kind.CATALOG_TXN && before > 0 && !raceA.startsWith("ok");
+    if (a.kind == Kind.CATALOG_TXN && before > 0) {
+      Statistics.label("transaction racing")
+          .collect((changedItsReads[0] ? "reads changed, " : "reads held, ")
+              + (txnFailed ? "failed" : "committed"));
+      if (changedItsReads[0] && !txnFailed) {
+        throw new AssertionError(String.format(
+            "the transaction %s committed, but the racers before its writes changed what it "
+                + "read: %s, %s%nsetup %s",
+            a, racers.get(0), before > 1 ? racers.get(1) : "", setup));
+      }
+    }
+    // The serial run on another copy: the racers that ran before A's writes, A, the rest; without
+    // A if it failed as it may: a transaction, or a handle whose table was replaced since it was
+    // loaded.
+    boolean replaced = (a.kind.throughAHandle() && raceA.equals(REPLACED)) || txnFailed;
     InMemoryAtomicFileIO serialIo = new InMemoryAtomicFileIO();
     setup.apply(LocalCatalogMode.APPEND.catalog(serialIo, WAREHOUSE, "c", Map.of()));
     String[] serial = new String[racers.size()];
@@ -128,13 +156,13 @@ class TestCatalogRaceProperties {
           racerModes.get(k).catalog(serialIo, WAREHOUSE, "c", Map.of()), name(k));
     }
     String serialA =
-        replaced ? REPLACED : a.run(modeA.catalog(serialIo, WAREHOUSE, "c", Map.of()), "A");
+        replaced ? raceA : a.run(modeA.catalog(serialIo, WAREHOUSE, "c", Map.of()), "A");
     for (int k = before; k < racers.size(); k++) {
       serial[k] = racers.get(k).run(
           racerModes.get(k).catalog(serialIo, WAREHOUSE, "c", Map.of()), name(k));
     }
     String serialState = state(serialIo);
-    Statistics.label("A's table replaced under its handle").collect(replaced);
+    Statistics.label("A failed as it may").collect(replaced);
 
     Statistics.label("racers before A's writes").collect(before + " of " + racers.size());
     Statistics.label("A").collect(a.kind + " " + (raceA.startsWith("ok") ? "ok" : "fails"));
@@ -240,7 +268,12 @@ class TestCatalogRaceProperties {
     /** Appends a file named for the writer. */
     FAST_APPEND,
     /** Deletes every row: the files live when the delete applies, after any retry. */
-    DELETE_ALL;
+    DELETE_ALL,
+    /**
+     * Loads one table, or two (the second if it exists), in a catalog transaction, appends to the
+     * first and commits; serializable when {@code x / 4} is even, else snapshot isolation.
+     */
+    CATALOG_TXN;
 
     /** Whether the operation loads a table and commits through its handle. */
     boolean throughAHandle() {
@@ -274,6 +307,59 @@ class TestCatalogRaceProperties {
 
     private String key() {
       return KEYS.get(y % KEYS.size());
+    }
+
+    private boolean serializable() {
+      return x / 4 % 2 == 0;
+    }
+
+    /** The tables a transaction reads: both it loads if serializable, else the appended one. */
+    private List<TableIdentifier> readTables() {
+      return serializable() && !other().equals(table()) ? List.of(table(), other())
+          : List.of(table());
+    }
+
+    /** What the transaction's isolation checks of each table it reads, as stored now. */
+    Map<TableIdentifier, String> reads(InMemoryAtomicFileIO io) {
+      FileIOCatalog reader = LocalCatalogMode.APPEND.catalog(io, WAREHOUSE, "c", Map.of());
+      Map<TableIdentifier, String> reads = new TreeMap<>(
+          java.util.Comparator.comparing(TableIdentifier::toString));
+      for (TableIdentifier id : readTables()) {
+        if (!reader.tableExists(id)) {
+          reads.put(id, "missing");
+          continue;
+        }
+        org.apache.iceberg.TableMetadata metadata =
+            ((org.apache.iceberg.HasTableOperations) reader.loadTable(id)).operations().current();
+        org.apache.iceberg.SnapshotRef main = metadata.ref(org.apache.iceberg.SnapshotRef.MAIN_BRANCH);
+        reads.put(id, metadata.uuid() + " " + (main == null ? "-" : main.snapshotId()) + " "
+            + metadata.metadataFileLocation());
+      }
+      return reads;
+    }
+
+    /**
+     * Whether the tables are as the transaction read them: the same table, on the same main
+     * snapshot; or, under serializable isolation where main had or has no snapshot, the same
+     * metadata.
+     */
+    boolean unchanged(Map<TableIdentifier, String> then, Map<TableIdentifier, String> now) {
+      for (TableIdentifier id : then.keySet()) {
+        String[] t = then.get(id).split(" ");
+        String[] n = now.get(id).split(" ");
+        if (t.length == 1) {
+          continue; // missing then: the transaction did not load it
+        }
+        if (n.length == 1 || !t[0].equals(n[0])) {
+          return false; // missing now, or another table
+        }
+        boolean snapshots = !t[1].equals("-") && !n[1].equals("-");
+        if (snapshots ? !t[1].equals(n[1])
+            : serializable() ? !t[2].equals(n[2]) : !t[1].equals(n[1])) {
+          return false;
+        }
+      }
+      return true;
     }
 
     /** Runs the operation as {@code who}; returns "ok" and its result, or the exception's class. */
@@ -314,6 +400,25 @@ class TestCatalogRaceProperties {
                     .build())
                 .commit();
             return "ok";
+          case CATALOG_TXN:
+            org.apache.iceberg.catalog.CatalogTransaction txn = catalog.createTransaction(
+                serializable()
+                    ? org.apache.iceberg.catalog.CatalogTransaction.IsolationLevel.SERIALIZABLE
+                    : org.apache.iceberg.catalog.CatalogTransaction.IsolationLevel.SNAPSHOT);
+            org.apache.iceberg.catalog.Catalog txCatalog = txn.asCatalog();
+            Table appended = txCatalog.loadTable(table());
+            if (!other().equals(table()) && catalog.tableExists(other())) {
+              txCatalog.loadTable(other());
+            }
+            appended.newFastAppend()
+                .appendFile(org.apache.iceberg.DataFiles.builder(appended.spec())
+                    .withPath("mem:///data/" + who + "-txn.parquet")
+                    .withFileSizeInBytes(10)
+                    .withRecordCount(1)
+                    .build())
+                .commit();
+            txn.commitTransaction();
+            return "ok";
           default:
             catalog.loadTable(table()).newDelete()
                 .deleteFromRowFilter(org.apache.iceberg.expressions.Expressions.alwaysTrue())
@@ -331,6 +436,9 @@ class TestCatalogRaceProperties {
 
     @Override
     public String toString() {
+      if (kind == null) {
+        return "none";
+      }
       switch (kind) {
         case CREATE_NAMESPACE:
           return "createNamespace(" + ns() + (y % 2 == 1 ? ", " + key() : "") + ")";
@@ -346,6 +454,10 @@ class TestCatalogRaceProperties {
           return "fastAppend(" + table() + ")";
         case DELETE_ALL:
           return "deleteAll(" + table() + ")";
+        case CATALOG_TXN:
+          return String.format("catalogTxn(%s, append to %s%s)",
+              serializable() ? "serializable" : "snapshot", table(),
+              other().equals(table()) ? "" : ", read " + other());
         default:
           return kind + "(" + table() + ")";
       }
