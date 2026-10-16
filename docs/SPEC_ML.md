@@ -332,12 +332,16 @@ list from the pool. Snapshots without inline ML (older pointer-mode
 snapshots that survived a migration) remain as `BaseSnapshot` with their
 original `manifestListLocation`.
 
-The `InlineSnapshot`'s manifests are Iceberg's own `GenericManifestFile`,
+The `InlineSnapshot`'s manifests are Iceberg's own classes,
+`GenericManifestFile` with `GenericPartitionFieldSummary` partitions,
 not the catalog's decoded entries. Iceberg compares manifests by
 equality, which for `GenericManifestFile` is by path: expiry's
 `ReachableFileCleanup` finds the manifests retained snapshots still
 use that way, and found none of the catalog's own entries, which are
-equal only to themselves, so it deleted their files.
+equal only to themselves, so it deleted their files. And Iceberg's
+Avro manifest-list writer takes only `GenericPartitionFieldSummary`
+records, so a writer that does not inline, or an eviction, could not
+write a list holding a partitioned table's inline manifest.
 
 ## Configuration
 

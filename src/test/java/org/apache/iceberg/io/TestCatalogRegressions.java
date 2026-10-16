@@ -2836,6 +2836,64 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 45: the catalog decoded an inline manifest's partition summaries
+  // as its own PartitionFieldSummary class, and Iceberg's Avro manifest
+  // list writer takes only its GenericPartitionFieldSummary records. So a
+  // manifest list file could not be written with a manifest of a
+  // partitioned inline-ML table: a writer that does not inline could not
+  // commit to the table (ClassCastException), nor could the table leave
+  // inline storage. The summaries are now decoded as
+  // GenericPartitionFieldSummary. Found by TestCatalogFaultProperties
+  // with partition-spec changes.
+  // ============================================================
+
+  @Nested
+  class PartitionedInlineManifestLists {
+
+    private final org.apache.iceberg.PartitionSpec byId =
+        org.apache.iceberg.PartitionSpec.builderFor(intSchema).identity("id").build();
+
+    private org.apache.iceberg.DataFile partitioned(String name) {
+      return org.apache.iceberg.DataFiles.builder(byId)
+          .withPath("mem:///data/" + name + ".parquet")
+          .withFileSizeInBytes(10)
+          .withRecordCount(1)
+          .withPartitionPath("id=1")
+          .build();
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND", "APPEND_TM"})
+    void takeACommitFromAWriterThatDoesNotInlineThem(LocalCatalogMode writer) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog ml = catalog(io, LocalCatalogMode.APPEND_ML);
+      ml.createNamespace(mixedNs);
+      ml.buildTable(mixed, intSchema).withPartitionSpec(byId).create()
+          .newFastAppend().appendFile(partitioned("a")).commit();
+
+      catalog(io, writer).loadTable(mixed).newFastAppend().appendFile(partitioned("b")).commit();
+
+      assertThat(dataFiles(ml.loadTable(mixed)))
+          .containsExactly("mem:///data/a.parquet", "mem:///data/b.parquet");
+    }
+
+    @Test
+    void leaveInlineStorage() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog ml = small(io, LocalCatalogMode.APPEND_ML);
+      ml.createNamespace(mixedNs);
+      ml.buildTable(mixed, intSchema).withPartitionSpec(byId).create()
+          .newFastAppend().appendFile(partitioned("a")).commit();
+
+      ml.loadTable(mixed).updateProperties().set("big", bigValue(6000)).commit();
+
+      assertThat(catalogFile(io).isInlineTable(mixed)).as("evicted").isFalse();
+      assertThat(dataFiles(ml.loadTable(mixed))).containsExactly("mem:///data/a.parquet");
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)

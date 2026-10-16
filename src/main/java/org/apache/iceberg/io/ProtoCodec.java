@@ -2001,7 +2001,8 @@ public class ProtoCodec {
           skipField(in, wireType);
       }
     }
-    return new DecodedPartitionFieldSummary(
+    // Iceberg's own class: its Avro manifest list writer takes no other.
+    return new org.apache.iceberg.GenericPartitionFieldSummary(
         containsNull, containsNaN,
         lowerBound != null ? ByteBuffer.wrap(lowerBound) : null,
         upperBound != null ? ByteBuffer.wrap(upperBound) : null);
@@ -2074,29 +2075,6 @@ public class ProtoCodec {
     @Override public ByteBuffer keyMetadata() { return keyMetadata; }
     @Override public Long firstRowId() { return firstRowId; }
     @Override public ManifestFile copy() { return this; }
-  }
-
-  /** Lightweight PartitionFieldSummary decoded from protobuf. */
-  public static class DecodedPartitionFieldSummary implements PartitionFieldSummary {
-    private final boolean containsNull;
-    private final Boolean containsNaN;
-    private final ByteBuffer lowerBound;
-    private final ByteBuffer upperBound;
-
-    DecodedPartitionFieldSummary(
-        boolean containsNull, boolean containsNaN,
-        ByteBuffer lowerBound, ByteBuffer upperBound) {
-      this.containsNull = containsNull;
-      this.containsNaN = containsNaN;
-      this.lowerBound = lowerBound;
-      this.upperBound = upperBound;
-    }
-
-    @Override public boolean containsNull() { return containsNull; }
-    @Override public Boolean containsNaN() { return containsNaN; }
-    @Override public ByteBuffer lowerBound() { return lowerBound; }
-    @Override public ByteBuffer upperBound() { return upperBound; }
-    @Override public PartitionFieldSummary copy() { return this; }
   }
 
   // ============================================================
