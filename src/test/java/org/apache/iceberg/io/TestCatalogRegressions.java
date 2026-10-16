@@ -2400,6 +2400,42 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 35: a manifest list file for an inline snapshot of a v3 table was
+  // written in v3, which needs the snapshot's first row id. A table
+  // upgraded from v2 keeps the snapshots it had, which have none, so no
+  // metadata file could be written for it: it could not leave inline
+  // storage, and a writer that does not inline could not commit to it. A
+  // snapshot without row ids now gets a v2 list, as it had when written.
+  // Found by TestCatalogFaultProperties with v3 tables.
+  // ============================================================
+
+  @Nested
+  class TableUpgradedToV3 {
+
+    @Test
+    void leavesInlineStorage() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog ml = catalog(io, LocalCatalogMode.APPEND_ML);
+      FileIOCatalog pointer = catalog(io, LocalCatalogMode.APPEND);
+      ml.createNamespace(mixedNs);
+      ml.createTable(mixed, intSchema).newFastAppend().appendFile(dataFile("a")).commit();
+      ml.loadTable(mixed)
+          .updateProperties()
+          .set(org.apache.iceberg.TableProperties.FORMAT_VERSION, "3")
+          .commit();
+      Map<Long, List<String>> before = manifestLists(io, ml.loadTable(mixed));
+
+      pointer.loadTable(mixed).updateProperties().set("k", "v").commit();
+
+      assertThat(manifestLists(io, ml.loadTable(mixed))).isEqualTo(before);
+      // The next snapshot gives a's manifest row ids, after b's, which a fast append lists first.
+      ml.loadTable(mixed).newFastAppend().appendFile(dataFile("b")).commit();
+      assertThat(rowIds(ml.loadTable(mixed)))
+          .isEqualTo(Map.of("mem:///data/a.parquet", 1L, "mem:///data/b.parquet", 0L));
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)

@@ -37,21 +37,18 @@ public final class ManifestListFiles {
   /**
    * Writes {@code manifests}, {@code snapshot}'s manifest list, to {@code file} and returns the
    * snapshot backed by that file. The manifests are already final (sequence numbers and first row
-   * ids assigned), so the writer copies them unchanged.
+   * ids assigned), so the writer copies them unchanged. A snapshot of a v3 table without a first
+   * row id was written before the table was upgraded to v3, and gets the v2 list it had then.
    */
   public static Snapshot write(
       int formatVersion, Snapshot snapshot, List<ManifestFile> manifests, OutputFile file) {
     Preconditions.checkArgument(
         snapshot.keyId() == null, "Cannot write an encrypted manifest list: %s", snapshot);
     Long firstRowId = formatVersion >= 3 ? snapshot.firstRowId() : null;
-    Preconditions.checkArgument(
-        formatVersion < 3 || firstRowId != null,
-        "Snapshot %s of a v%s table has no first row id",
-        snapshot.snapshotId(),
-        formatVersion);
+    int listVersion = formatVersion >= 3 && firstRowId == null ? 2 : formatVersion;
     try (ManifestListWriter writer =
         ManifestLists.write(
-            formatVersion,
+            listVersion,
             file,
             snapshot.snapshotId(),
             snapshot.parentId(),
