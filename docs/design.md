@@ -212,6 +212,21 @@ The delta-update path emits sentinels through `AddSnapshotUpdate`
 empty and the consumer reconstructs `inline://<snapshotId>`). The
 full-mode and pointer-mode write paths rely on the I5 rewrite.
 
+### I6. A checkpoint holds exactly the replayed state
+
+Compaction writes a checkpoint of the state a writer replayed from the
+checkpoint and log, so replaying the log and decoding a checkpoint of
+the result must give the same state: every namespace, property and
+table by id, with its metadata location, inline metadata, codec,
+manifest list prefix, manifest pool and snapshot references, and the
+name lookups, id counters and committed-transaction set. An apply step
+may not leave state a checkpoint does not represent: a table with both
+a metadata location and inline metadata (Bug 27, which the next
+compaction reverted to the inline copy), inline state for a dropped
+table, an inline table without a prefix. `CheckpointRoundTrip` checks
+every catalog file written in `TestCatalogFaultProperties`,
+`TestMultiWriterProperties` and the `TestLocalCatalog*` suites.
+
 ## Operation × Operation Conflict Matrix
 
 The matrix below falls out of I2 (action versions are bumped on apply)

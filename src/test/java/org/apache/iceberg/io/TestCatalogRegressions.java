@@ -2253,6 +2253,54 @@ public class TestCatalogRegressions {
   }
 
   // ============================================================
+  // A checkpoint of a replayed catalog file held less than the replay did,
+  // in two ways readers do not see. Dropping a table kept its inline
+  // metadata and manifest lists, under an id never used again, until a
+  // checkpoint left them out. A table that returned to inline storage had
+  // no manifest list prefix, where a created one and a checkpoint have the
+  // empty prefix; readers treat the two alike. Dropping a table now removes
+  // its inline state, and a returning table gets the empty prefix. Found by
+  // TestCatalogFaultProperties' checkpoint round trip.
+  // ============================================================
+
+  @Nested
+  class CheckpointOfAReplayedCatalog {
+
+    @Test
+    void droppedInlineTableLeavesNothing() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog ml = catalog(io, LocalCatalogMode.APPEND_ML);
+      ml.createNamespace(mixedNs);
+      ml.createTable(mixed, intSchema).newFastAppend().appendFile(dataFile("a")).commit();
+      int id = catalogFile(io).tableId(mixed);
+
+      ml.dropTable(mixed, false);
+
+      ProtoCatalogFile file = catalogFile(io);
+      assertThat(file.isInlineTable(id)).isFalse();
+      assertThat(file.snapshotManifests(id)).isEmpty();
+      assertThat(CheckpointRoundTrip.difference(file)).isNull();
+    }
+
+    @Test
+    void tableReturningInlineHasTheEmptyPrefix() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog inline = small(io, LocalCatalogMode.APPEND_TM);
+      inline.createNamespace(mixedNs);
+      inline.createTable(mixed, intSchema);
+      inline.loadTable(mixed).updateProperties().set("big", bigValue(6000)).commit();
+      assertThat(catalogFile(io).isInlineTable(mixed)).as("evicted").isFalse();
+
+      inline.loadTable(mixed).updateProperties().remove("big").commit();
+
+      ProtoCatalogFile file = catalogFile(io);
+      assertThat(file.isInlineTable(mixed)).as("returned").isTrue();
+      assertThat(file.manifestListPrefix(file.tableId(mixed))).isEmpty();
+      assertThat(CheckpointRoundTrip.difference(file)).isNull();
+    }
+  }
+
+  // ============================================================
   // Bug 32: a catalog transaction committed its tables' new inline-ML
   // snapshots with manifest lists staged on whichever handle to the table
   // the thread loaded first and that still held a stage: the transaction's

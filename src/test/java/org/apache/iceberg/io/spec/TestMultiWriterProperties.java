@@ -52,6 +52,7 @@ import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.io.AtomicOutputFile;
 import org.apache.iceberg.io.CatalogFile;
+import org.apache.iceberg.io.CheckpointRoundTrip;
 import org.apache.iceberg.io.InMemoryAtomicFileIO;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.ReadFault;
@@ -78,6 +79,8 @@ import org.apache.iceberg.io.ProtoCatalogFormat;
  *       This catches bugs that the serial and concurrent paths share.
  *   <li>Rejection: a rejected transaction whose record landed leaves the state unchanged.
  *   <li>Integrity: every table's namespace and every namespace's parent exist.
+ *   <li>Checkpoints: every version written reads the same as a checkpoint of it, which the next
+ *       compaction would write (see {@link CheckpointRoundTrip}).
  * </ul>
  *
  * <p>Conflicts are not asserted: rejecting a commit is always safe. The outcome statistics report
@@ -788,6 +791,9 @@ class TestMultiWriterProperties {
           effective.add(wr);
         }
         checkIntegrity(after);
+        String difference = CheckpointRoundTrip.difference(wr.after());
+        check(difference == null, "a checkpoint of the %s write differs from it: %s",
+            wr.strategy(), difference);
       }
       // The write the transaction's effects are checked on: the one that changed the state, else
       // (for a transaction without effects) the first.

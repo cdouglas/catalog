@@ -653,12 +653,13 @@ public class ProtoCatalogFile extends CatalogFile {
       return this;
     }
 
+    /** Removes a table, with its inline metadata and manifest lists if it has them. */
     public Builder removeTable(int id) {
       TblEntry entry = tableById.remove(id);
       if (entry != null) {
         removeLookup(tableLookup, tableKeyOrNull(entry), id);
       }
-      return this;
+      return removeInlineMetadata(id);
     }
 
     public Builder updateTableLocation(int id, int newVersion, String metadataLocation) {
@@ -731,11 +732,13 @@ public class ProtoCatalogFile extends CatalogFile {
 
     /**
      * Updates inline metadata and version, recording the codec used to encode
-     * {@code metadata}. Preserves the manifest pool.
+     * {@code metadata}. Preserves the manifest pool. A table that returns to
+     * inline storage gets the empty manifest list prefix, as a created one does.
      */
     public Builder updateInlineMetadata(int id, int newVersion, byte[] metadata, byte codec) {
       tblInlineMetadata.put(id, metadata);
       tblInlineMetadataCodec.put(id, codec);
+      tblManifestPrefix.putIfAbsent(id, "");
       TblEntry old = tableById.get(id);
       if (old != null) {
         tableById.put(id, new TblEntry(old.namespaceId, old.name, newVersion, null));

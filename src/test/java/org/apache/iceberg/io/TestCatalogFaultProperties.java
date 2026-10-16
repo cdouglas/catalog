@@ -106,6 +106,8 @@ import org.apache.iceberg.types.Types;
  *   <li>Every table loads; every snapshot has its manifest list, inline or in a file, and every
  *       manifest exists; a snapshot's manifest list never changes; no table is stored both inline
  *       and in a metadata file.
+ *   <li>Every version of the catalog file that a writer wrote reads the same as a checkpoint of
+ *       it, which the next compaction would write (see {@link CheckpointRoundTrip}).
  *   <li>An acknowledged catalog transaction saw no concurrent change it must not miss: under
  *       serializable isolation, to the main branch (or, without one, the metadata) of any table it
  *       loaded; under snapshot isolation, to the main branch of any table it appended to.
@@ -505,6 +507,8 @@ class TestCatalogFaultProperties {
     private final Map<String, Map<Long, List<String>>> manifestLists = new HashMap<>();
     // Each table's storage at the last check, by UUID: inline or a metadata file.
     private final Map<String, String> storage = new HashMap<>();
+    // Conditional writes whose catalog file has been checked against a checkpoint of it.
+    private int checkedWrites = 0;
 
     // The running top-level command's storage plan. Faults and preemption apply only while armed,
     // and only on the thread that runs the schedule.
@@ -564,6 +568,7 @@ class TestCatalogFaultProperties {
           runTopLevel(late);
         }
       }
+      checkCheckpoints();
     }
 
     private Writer writer(Cmd cmd) {
@@ -1000,11 +1005,27 @@ class TestCatalogFaultProperties {
           });
     }
 
+    /** Checks each catalog file written since the last check against a checkpoint of it. */
+    private void checkCheckpoints() {
+      List<InMemoryAtomicFileIO.Write> history = io.history();
+      for (; checkedWrites < history.size(); checkedWrites++) {
+        InMemoryAtomicFileIO.Write write = history.get(checkedWrites);
+        if (write.location().equals(CATALOG_LOCATION)) {
+          String difference = CheckpointRoundTrip.difference(write.after());
+          check(difference == null,
+              "a checkpoint of catalog write #%d (%s) differs from it: %s",
+              checkedWrites, write.strategy(), difference);
+        }
+      }
+    }
+
     /**
      * The catalog's state, read without faults; fails if a table does not load whole, if a table
-     * is stored both inline and in a metadata file, or if a snapshot's manifest list changed.
+     * is stored both inline and in a metadata file, if a snapshot's manifest list changed, or if a
+     * catalog file written since the last check differs from a checkpoint of it.
      */
     private Map<TableIdentifier, TableState> actual() {
+      checkCheckpoints();
       Map<TableIdentifier, TableState> tables = new TreeMap<>(BY_NAME);
       ProtoCatalogFile file =
           new ProtoCatalogFormat(PROPERTIES).read(io, io.newInputFile(CATALOG_LOCATION));

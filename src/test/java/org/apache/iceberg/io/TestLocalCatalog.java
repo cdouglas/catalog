@@ -53,6 +53,7 @@ public class TestLocalCatalog {
     @AfterEach
     public void checkCommitPolicy() {
       mode().assertCommitPolicy(io);
+      CheckpointRoundTrip.assertEveryWrite(io);
     }
 
     @Override
