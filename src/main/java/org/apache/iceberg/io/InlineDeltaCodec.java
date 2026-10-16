@@ -1936,33 +1936,35 @@ public class InlineDeltaCodec {
 
   private static final String[] OPERATION_NAMES = {"append", "overwrite", "delete", "replace"};
 
+  /**
+   * Encodes a snapshot summary: the operation and the standard counts as typed fields, every other
+   * entry as an extra. An entry a typed field cannot hold exactly -- an operation not in {@link
+   * #OPERATION_NAMES}, a count not written as a plain number -- is an extra too. A count is written
+   * whenever the summary has it, 0 included: an absent count is unknown, not zero.
+   */
   private static byte[] encodeCompactSummary(Map<String, String> summary) throws IOException {
     ByteArrayOutputStream out = new ByteArrayOutputStream();
+    Set<String> typed = new HashSet<>();
     String op = summary.getOrDefault("operation", "append");
-    int opVal = 0;
-    for (int i = 0; i < OPERATION_NAMES.length; i++) {
-      if (OPERATION_NAMES[i].equals(op)) { opVal = i; break; }
+    int opVal = java.util.Arrays.asList(OPERATION_NAMES).indexOf(op);
+    if (opVal > 0) {
+      writeVarint(out, CS_OPERATION, opVal);
     }
-    if (opVal != 0) { writeVarint(out, CS_OPERATION, opVal); }
-
-    writeSummaryLong(out, summary, "added-data-files", CS_ADDED_DATA_FILES);
-    writeSummaryLong(out, summary, "added-records", CS_ADDED_RECORDS);
-    writeSummaryLong(out, summary, "added-files-size", CS_ADDED_FILES_SIZE);
-    writeSummaryLong(out, summary, "total-data-files", CS_TOTAL_DATA_FILES);
-    writeSummaryLong(out, summary, "total-records", CS_TOTAL_RECORDS);
-    writeSummaryLong(out, summary, "total-files-size", CS_TOTAL_FILES_SIZE);
-    writeSummaryLong(out, summary, "added-delete-files", CS_ADDED_DELETE_FILES);
-    writeSummaryLong(out, summary, "total-delete-files", CS_TOTAL_DELETE_FILES);
-    writeSummaryLong(out, summary, "total-equality-deletes", CS_TOTAL_EQUALITY_DELETES);
-    writeSummaryLong(out, summary, "total-position-deletes", CS_TOTAL_POSITION_DELETES);
-
-    // Extra entries (non-standard)
-    Set<String> standardKeys = Set.of("operation", "added-data-files", "added-records",
-        "added-files-size", "total-data-files", "total-records", "total-files-size",
-        "added-delete-files", "total-delete-files", "total-equality-deletes",
-        "total-position-deletes");
+    if (opVal >= 0) {
+      typed.add("operation"); // "append" is the decoder's default
+    }
+    writeSummaryLong(out, summary, "added-data-files", CS_ADDED_DATA_FILES, typed);
+    writeSummaryLong(out, summary, "added-records", CS_ADDED_RECORDS, typed);
+    writeSummaryLong(out, summary, "added-files-size", CS_ADDED_FILES_SIZE, typed);
+    writeSummaryLong(out, summary, "total-data-files", CS_TOTAL_DATA_FILES, typed);
+    writeSummaryLong(out, summary, "total-records", CS_TOTAL_RECORDS, typed);
+    writeSummaryLong(out, summary, "total-files-size", CS_TOTAL_FILES_SIZE, typed);
+    writeSummaryLong(out, summary, "added-delete-files", CS_ADDED_DELETE_FILES, typed);
+    writeSummaryLong(out, summary, "total-delete-files", CS_TOTAL_DELETE_FILES, typed);
+    writeSummaryLong(out, summary, "total-equality-deletes", CS_TOTAL_EQUALITY_DELETES, typed);
+    writeSummaryLong(out, summary, "total-position-deletes", CS_TOTAL_POSITION_DELETES, typed);
     for (Map.Entry<String, String> e : summary.entrySet()) {
-      if (!standardKeys.contains(e.getKey())) {
+      if (!typed.contains(e.getKey())) {
         out.write(encodeMapEntry(CS_EXTRA, e.getKey(), e.getValue()));
       }
     }
@@ -2012,13 +2014,23 @@ public class InlineDeltaCodec {
     return summary;
   }
 
+  /** Writes {@code key} as a typed field, adding it to {@code typed}, if it is a plain number. */
   private static void writeSummaryLong(
-      ByteArrayOutputStream out, Map<String, String> summary, String key, int fieldNum)
-      throws IOException {
+      ByteArrayOutputStream out, Map<String, String> summary, String key, int fieldNum,
+      Set<String> typed) throws IOException {
     String val = summary.get(key);
-    if (val != null) {
-      long v = Long.parseLong(val);
-      if (v != 0) { writeVarint64(out, fieldNum, v); }
+    if (val == null) {
+      return;
+    }
+    long v;
+    try {
+      v = Long.parseLong(val);
+    } catch (NumberFormatException e) {
+      return;
+    }
+    if (String.valueOf(v).equals(val)) {
+      writeVarint64(out, fieldNum, v);
+      typed.add(key);
     }
   }
 

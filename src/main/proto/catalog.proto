@@ -339,6 +339,8 @@ enum OperationType {
   REPLACE   = 3;
 }
 
+// A count is present whenever the summary has it, 0 included. An entry the
+// typed fields cannot hold exactly goes in extra.
 message CompactSummary {
   OperationType      operation              = 1;
   int64              added_data_files       = 2;

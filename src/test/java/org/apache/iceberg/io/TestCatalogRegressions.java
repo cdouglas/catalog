@@ -2605,6 +2605,43 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 40: an inline delta's compact snapshot summary wrote a standard
+  // count only when it was not zero, so a reader's summary lacked the
+  // zero totals the writer's had ("total-delete-files": "0" and the like),
+  // reading them as unknown. The typed fields now hold every count, 0
+  // included; an entry they cannot hold exactly (an operation without a
+  // name in the codec, a count not written as a plain number) is kept as
+  // an extra entry rather than read back as "append" or failing the
+  // commit. Found by TestInlineDeltaProperties.
+  // ============================================================
+
+  @Nested
+  class SnapshotSummaryInADelta {
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND_TM", "APPEND_ML"})
+    void keepsEveryEntry(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, mode);
+      catalog.createNamespace(mixedNs);
+      catalog.createTable(mixed, intSchema);
+
+      catalog.loadTable(mixed)
+          .newFastAppend()
+          .appendFile(dataFile("a"))
+          .commit();
+
+      Map<String, String> summary =
+          catalog(io, LocalCatalogMode.APPEND).loadTable(mixed).currentSnapshot().summary();
+      assertThat(summary)
+          .containsEntry("total-delete-files", "0")
+          .containsEntry("total-position-deletes", "0")
+          .containsEntry("total-equality-deletes", "0");
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)

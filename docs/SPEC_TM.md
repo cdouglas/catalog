@@ -249,8 +249,11 @@ message CompactSummary {
 }
 ```
 
-Zero-valued fields are omitted (proto3 semantics). The `extra` map captures
-non-standard summary entries that engines may add.
+A count is present whenever the summary has it, 0 included: an absent count
+is one the summary lacks, which readers take as unknown. `operation` is
+omitted for `APPEND`, the default. The `extra` map captures the other entries
+engines add, and any entry the typed fields cannot hold exactly (an operation
+not in `OperationType`, a count not written as a plain decimal number).
 
 ### Other Updates
 
