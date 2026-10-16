@@ -6,7 +6,9 @@ grouped by what they are; within each group, ordering is suggestive, not
 strict.
 
 For invariants that must not regress, see [design.md](design.md). For the
-wire format see [SPEC.md](SPEC.md).
+wire format see [SPEC.md](SPEC.md). Bugs in Apache Iceberg itself, which
+this project's tests work around, are in
+[ICEBERG_ISSUES.md](ICEBERG_ISSUES.md).
 
 ## Current Shortcuts
 

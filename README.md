@@ -32,6 +32,7 @@ docs/SPEC_TM.md                              inline table metadata
 docs/SPEC_ML.md                              inline manifest lists
 docs/design.md                               invariants, conflict matrix, best practices
 docs/errata.md                               current shortcuts, gaps, known unknowns
+docs/ICEBERG_ISSUES.md                       Iceberg core bugs the tests work around
 ```
 
 ## Dependencies on the Iceberg fork
