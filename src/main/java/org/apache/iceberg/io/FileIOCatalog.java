@@ -179,12 +179,25 @@ public class FileIOCatalog extends BaseMetastoreCatalog
   @Override
   public boolean dropTable(TableIdentifier identifier, boolean purge) {
     final InputFile catalog = fileIO.newInputFile(catalogLocation);
-    final CatalogFile catalogFile = format.read(fileIO, catalog);
-    try {
-      format.from(catalogFile).dropTable(identifier).commit(fileIO);
+    // A drop does not depend on the table's state, but its record names the version it read, so
+    // one that conflicts with a concurrent commit to the table is retried on a fresh read. false
+    // means only that the table did not exist.
+    for (int attempt = 1; ; attempt++) {
+      final CatalogFile catalogFile = format.read(fileIO, catalog);
+      if (!catalogFile.containsTable(identifier)) {
+        return false;
+      }
+      try {
+        format.from(catalogFile).dropTable(identifier).commit(fileIO);
+      } catch (NoSuchTableException e) {
+        return false;
+      } catch (CommitFailedException e) {
+        if (attempt >= org.apache.iceberg.TableProperties.COMMIT_NUM_RETRIES_DEFAULT + 1) {
+          throw e;
+        }
+        continue;
+      }
       return true;
-    } catch (CommitFailedException | NoSuchTableException e) {
-      return false;
     }
   }
 

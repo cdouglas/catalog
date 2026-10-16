@@ -366,7 +366,8 @@ message CreateTable {
 
 message DropTable {
   int32 id      = 1;
-  int32 version = 2;
+  int32 version = 2; // must match current; FileIOCatalog.dropTable retries on a
+                     // fresh read when another commit changed the table
 }
 
 message UpdateTableLocation {

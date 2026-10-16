@@ -2944,6 +2944,44 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 47: dropTable returned false, which Catalog defines as "the table
+  // did not exist", when its record conflicted with a concurrent commit to
+  // the table (the record names the version it read). A drop does not
+  // depend on the table's state, so it now retries on a fresh read until
+  // it lands or the table is gone. Found by reading dropTable.
+  // ============================================================
+
+  @Nested
+  class DropRacingACommit {
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND", "CAS", "APPEND_TM"})
+    void dropsTheTable(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog dropping = catalog(io, mode);
+      FileIOCatalog other = catalog(io, mode);
+      dropping.createNamespace(mixedNs);
+      dropping.createTable(mixed, intSchema);
+      boolean[] raced = {false};
+      io.injectFaults((location, strategy) -> {
+        if (!raced[0] && location.equals(CATALOG)) {
+          raced[0] = true; // just before the drop's write, another writer commits to the table
+          other.loadTable(mixed).updateProperties().set("k", "v").commit();
+        }
+        return Fault.NONE;
+      });
+
+      boolean dropped = dropping.dropTable(mixed, false);
+
+      io.injectFaults((location, strategy) -> Fault.NONE);
+      assertThat(raced[0]).isTrue();
+      assertThat(dropped).isTrue();
+      assertThat(other.tableExists(mixed)).isFalse();
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)
