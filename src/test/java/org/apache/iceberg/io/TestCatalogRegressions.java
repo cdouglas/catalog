@@ -3479,6 +3479,122 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 57: Iceberg's metadata tables (snapshots, history, refs,
+  // partitions, metadata_log_entries; with inline manifest lists also
+  // manifests and all_manifests) take the length of the table's metadata
+  // file, and an inline table's metadata location is synthetic: each
+  // failed with NotFoundException ("File does not exist: inline://..."),
+  // so SELECT * FROM t.snapshots did not work on an inline table. A
+  // table's FileIO now reads its current inline metadata location as a
+  // file of the stored metadata's length (which cannot be opened), and is
+  // the catalog's FileIO otherwise. Found by probing metadata tables.
+  // ============================================================
+
+  @Nested
+  class MetadataTablesOfInlineTables {
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND_TM", "APPEND_ML", "CAS_ML"})
+    void readLikeAPointerTables(LocalCatalogMode mode) throws IOException {
+      Map<String, List<String>> inline = metadataTables(mode);
+      Map<String, List<String>> pointer = metadataTables(LocalCatalogMode.APPEND);
+      assertThat(inline.keySet()).isEqualTo(pointer.keySet());
+      for (String type : pointer.keySet()) {
+        assertThat(inline.get(type)).as(type).isEqualTo(pointer.get(type));
+      }
+      assertThat(inline.get("SNAPSHOTS")).hasSize(3);
+      assertThat(inline.get("ALL_MANIFESTS")).hasSize(6);
+    }
+
+    /** A table's FileIO goes to Spark's workers serialized: there it is the catalog's FileIO. */
+    @Test
+    void ioSerializes() throws Exception {
+      CasFileIO catalogIO = new CasFileIO();
+      catalogIO.newOutputFile("mem:///data/a").createOrOverwrite().close();
+      String location = "inline://ns.t#1.2";
+      FileIO io = InlineMetadataFileIO.of(catalogIO, path -> path.equals(location) ? 42L : null);
+      assertThat(io.newInputFile(location).getLength()).isEqualTo(42L);
+      assertThatThrownBy(() -> io.newInputFile(location).newStream())
+          .isInstanceOf(UnsupportedOperationException.class);
+
+      ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+      try (java.io.ObjectOutputStream out = new java.io.ObjectOutputStream(bytes)) {
+        out.writeObject(io);
+      }
+      FileIO copy;
+      try (java.io.ObjectInputStream in =
+          new java.io.ObjectInputStream(new java.io.ByteArrayInputStream(bytes.toByteArray()))) {
+        copy = (FileIO) in.readObject();
+      }
+
+      assertThat(copy).isInstanceOf(SupportsAtomicOperations.class);
+      assertThat(copy.newInputFile("mem:///data/a").exists()).isTrue();
+      assertThat(copy.newInputFile(location).exists()).isFalse();
+    }
+
+    /**
+     * Each metadata table's rows, as text, after three appends and a property change: snapshot
+     * ids, timestamps and file names, which differ between catalogs, are left out.
+     */
+    private Map<String, List<String>> metadataTables(LocalCatalogMode mode) throws IOException {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, mode);
+      catalog.createNamespace(mixedNs);
+      Table table = catalog.createTable(mixed, intSchema);
+      for (String name : List.of("a", "b", "c")) {
+        table.newFastAppend().appendFile(dataFile(name)).commit();
+      }
+      table.updateProperties().set("k", "v").commit();
+      Map<String, List<String>> rows = new java.util.TreeMap<>();
+      for (org.apache.iceberg.MetadataTableType type : org.apache.iceberg.MetadataTableType.values()) {
+        Table metadata = catalog.loadTable(
+            TableIdentifier.of("ns", "t", type.name().toLowerCase(java.util.Locale.ROOT)));
+        List<String> found = Lists.newArrayList();
+        if (type == org.apache.iceberg.MetadataTableType.POSITION_DELETES) {
+          try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.ScanTask> tasks =
+              metadata.newBatchScan().planFiles()) {
+            tasks.forEach(task -> found.add("task"));
+          }
+        } else {
+          try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.FileScanTask> tasks =
+              metadata.newScan().planFiles()) {
+            for (org.apache.iceberg.FileScanTask task : tasks) {
+              try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.StructLike> data =
+                  task.asDataTask().rows()) {
+                data.forEach(row -> found.add(describe(metadata.schema(), row)));
+              }
+            }
+          }
+        }
+        found.sort(String::compareTo);
+        rows.put(type.name(), found);
+      }
+      return rows;
+    }
+
+    /** The row's fields that are the same in any catalog: counts, operations, names, sizes. */
+    private String describe(Schema schema, org.apache.iceberg.StructLike row) {
+      List<String> fields = Lists.newArrayList();
+      List<Types.NestedField> columns = schema.columns();
+      for (int i = 0; i < columns.size(); i++) {
+        String name = columns.get(i).name();
+        Object value = row.get(i, Object.class);
+        boolean differs = name.contains("snapshot_id") || name.contains("timestamp")
+            || name.contains("committed_at") || name.contains("made_current_at")
+            || name.contains("path") || name.equals("file") || name.contains("summary")
+            || name.equals("readable_metrics") || name.contains("length")
+            || name.equals("data_file") || name.contains("last_updated")
+            || name.equals("latest_schema_id") || name.equals("parent_id")
+            || name.equals("manifest_list") || name.equals("added_snapshot_id")
+            || name.equals("reference_snapshot_id");
+        fields.add(name + "=" + (differs ? "*" : value));
+      }
+      return String.join(" ", fields);
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)

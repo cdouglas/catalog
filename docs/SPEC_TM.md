@@ -474,8 +474,12 @@ check relies on it: when the table hasn't changed, the synthetic
 location matches `currentMetadataLocation`, refresh short-circuits, and
 the cached `TableMetadata` instance survives. A wall-clock-based suffix would force
 a reload on every refresh and break BaseTransaction's reference-equality
-check (`base != underlyingOps.refresh()`). The synthetic location never
-reaches `FileIO`. **No changes to `BaseMetastoreCatalog` or
+check (`base != underlyingOps.refresh()`). The synthetic location reaches
+`FileIO` only from Iceberg's metadata tables (snapshots, history, refs,
+partitions, manifests, ...), which take the length of the table's metadata
+file: a table's FileIO (`InlineMetadataFileIO`) reads its current synthetic
+location as a file of the stored metadata's length, which cannot be opened,
+and is the catalog's FileIO otherwise. **No changes to `BaseMetastoreCatalog` or
 `BaseMetastoreTableOperations` are required** — the existing protected
 API supports this integration cleanly.
 

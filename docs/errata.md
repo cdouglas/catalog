@@ -81,6 +81,22 @@ JSON parsers are already in upstream Iceberg.
 **Trigger to revisit:** when a stats-maintaining workload shows up where
 the full-mode size penalty matters.
 
+### D10. `SerializableTable` cannot load an inline table's metadata lazily
+
+`SerializableTable` (what Spark and Flink ship to workers) copies a
+table's schema, spec, properties, FileIO and location eagerly, but loads
+the rest -- `schemas()`, `sortOrders()`, `snapshots()`,
+`currentSnapshot()`, `history()`, statistics files, new scans -- by
+reading the table's metadata file through `StaticTableOperations`. An
+inline table's metadata location is synthetic (`inline://...`): a
+table's FileIO gives it a length, for Iceberg's metadata tables (Bug
+57), but no content, so those calls fail on a serialized inline table.
+Serving the metadata as JSON would work where the table was loaded, but
+not on a worker, whose FileIO is the catalog's.
+
+**Trigger to revisit:** a worker-side code path that needs one of the
+lazily loaded parts of an inline table.
+
 ### D8. Typed-protobuf encoding for Iceberg structural types (skip JSON serde)
 
 `AddSortOrderUpdate` is encoded structurally (see SPEC_TM.md §"Other

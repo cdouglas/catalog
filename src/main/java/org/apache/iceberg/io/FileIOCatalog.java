@@ -471,6 +471,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
     private final TableIdentifier tableId;
     private final CatalogFormat format;
     private final SupportsAtomicOperations fileIO;
+    private final InlineMetadataFileIO tableIO;
     private final InlineSettings inline;
     private volatile CatalogFile lastCatalogFile = null;
 
@@ -491,6 +492,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         InlineSettings inline,
         CatalogFile catalogFile) {
       this.fileIO = fileIO;
+      this.tableIO = InlineMetadataFileIO.of(fileIO, this::inlineMetadataLength);
       this.format = format;
       this.tableId = tableId;
       this.catalogLocation = catalogLocation;
@@ -502,9 +504,20 @@ public class FileIOCatalog extends BaseMetastoreCatalog
       }
     }
 
+    /** The catalog's FileIO, through which this table's current inline metadata has a length. */
     @Override
     public SupportsAtomicOperations io() {
-      return fileIO;
+      return tableIO;
+    }
+
+    /** The stored length of this table's inline metadata, if {@code location} is its current. */
+    private Long inlineMetadataLength(String location) {
+      CatalogFile catalogFile = lastCatalogFile;
+      if (catalogFile == null || !catalogFile.isInlineTable(tableId)
+          || !location.equals(metadataLocation(catalogFile, tableId))) {
+        return null;
+      }
+      return (long) catalogFile.inlineMetadata(tableId).length;
     }
 
     /**
