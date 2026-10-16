@@ -250,6 +250,21 @@ that each commit's delta, replayed on its base as the inline codec
 stores it, gives the committed metadata, and that the codec stores
 every version exactly (Bug 43).
 
+### I8. An inline catalog reads like a pointer catalog
+
+Storing a table inline -- its metadata, its manifest lists, or both --
+changes how it is stored, not what a reader sees. The same operations
+on a table in a pointer catalog and on one in an inline catalog must
+commit or fail alike and read back the same: format version, sequence
+numbers and next row id, schemas, specs, sort orders and properties,
+snapshots (by position, with their summaries and row-id fields) and
+their manifest lists entry by entry and in order, refs and the snapshot
+log, and every ref's live data and delete files with their sequence
+numbers and row ids. Snapshot ids, UUIDs, timestamps and the names of
+manifest and metadata files differ. `TestInlineDifferentialProperties`
+checks this after every step of generated schedules, in each inline
+mode, with tables moving in and out of inline storage (Bugs 50, 51).
+
 ## Operation × Operation Conflict Matrix
 
 The matrix below falls out of I2 (action versions are bumped on apply)
