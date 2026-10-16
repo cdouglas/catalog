@@ -65,7 +65,7 @@ import org.apache.iceberg.TableMetadataParser;
  * <p>Wire format (gzip-wrapped):
  *
  * <pre>{@code
- *   varint  format_version  (currently 1; future-proofs the layout)
+ *   varint  format_version  (currently 2; future-proofs the layout)
  *   varint  json_len
  *   bytes   json (TableMetadata minus "snapshots" and "metadata-log")
  *   varint  snap_block_len
@@ -105,6 +105,23 @@ import org.apache.iceberg.TableMetadataParser;
  *   N x string operation
  * }</pre>
  *
+ * <p>{@code mdlog_block}:
+ *
+ * <pre>{@code
+ *   varint  N (entry count; nothing follows if 0)
+ *   byte    path_mode (0 = "{version}-{UUID}" template, 1 = raw-with-shared-affixes)
+ *   string  path_prefix (in mode 0, never ending in a digit)
+ *   string  path_suffix
+ *   if path_mode = 0: varint width (versions are zero-padded to it), N x (varint version,
+ *                     16 bytes uuid)
+ *   if path_mode = 1: N x length-prefixed variable_middle
+ *   fixed64 timestamp_base
+ *   N x signed varint  timestamp_delta
+ * }</pre>
+ *
+ * <p>A template mode is used only if it rebuilds every path exactly; any other path (an unpadded
+ * or differently padded version, a UUID not in lowercase canonical form) takes the raw mode.
+ *
  * <p>The leading {@code format_version} varint lets future codec evolutions
  * (added blocks, alternative path templates) ride the same proto enum value
  * — bump the version, gate new branches behind the bumped value, keep old
@@ -113,7 +130,7 @@ import org.apache.iceberg.TableMetadataParser;
 public final class StructuralInlineMetadataCodec implements InlineMetadataCodec {
 
   /** Current structural-format version. */
-  public static final int FORMAT_VERSION = 1;
+  public static final int FORMAT_VERSION = 2;
 
   private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -313,19 +330,23 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
     for (int i = 0; i < n; i++) {
       paths[i] = entries.get(i).file();
     }
-    String prefix = longestCommonPrefix(paths);
+    // The version's digits stay out of the prefix: Iceberg zero-pads them ("00009", "00010"), and
+    // a prefix holding some of the zeros would leave versions that do not rebuild the paths.
+    String prefix = stripTrailingDigits(longestCommonPrefix(paths));
     String suffix = longestCommonSuffix(paths, prefix.length());
 
     long[] versions = new long[n];
     byte[][] uuids = new byte[n][];
+    int width = Integer.MAX_VALUE;
     boolean templated = true;
     for (int i = 0; i < n; i++) {
       String mid = paths[i].substring(prefix.length(), paths[i].length() - suffix.length());
       int dash = mid.indexOf('-');
-      if (dash < 0) {
+      if (dash <= 0) {
         templated = false;
         break;
       }
+      width = Math.min(width, dash);
       try {
         versions[i] = Long.parseLong(mid.substring(0, dash));
       } catch (NumberFormatException e) {
@@ -339,11 +360,15 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
       }
       uuids[i] = uuidBytes;
     }
+    for (int i = 0; templated && i < n; i++) {
+      templated = paths[i].equals(mdlogPath(prefix, width, versions[i], uuids[i], suffix));
+    }
 
     out.write(templated ? 0 : 1);
     writeString(out, prefix);
     writeString(out, suffix);
     if (templated) {
+      writeVarint(out, width);
       for (int i = 0; i < n; i++) {
         writeVarint(out, versions[i]);
         writeBytes(out, uuids[i]);
@@ -434,6 +459,14 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
       uuids[i] = uuidBytes;
     }
 
+    // The template holds the paths only if it rebuilds each exactly (no leading zeros or sign in
+    // the attempt number, a lowercase canonical UUID).
+    for (int i = 0; templated && i < n; i++) {
+      templated =
+          paths[i].equals(
+              p.commonPrefix + snaps.get(i).snapshotId() + "-" + nParts[i] + "-"
+                  + formatUuid(uuids[i]) + p.commonSuffix);
+    }
     if (templated) {
       p.mode = 0;
       p.nParts = nParts;
@@ -449,6 +482,25 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
       p.middles = middles;
     }
     return p;
+  }
+
+  /** A metadata-log path of the template: the version zero-padded to {@code width} digits. */
+  private static String mdlogPath(
+      String prefix, int width, long version, byte[] uuid, String suffix) {
+    String digits = Long.toString(version);
+    StringBuilder path = new StringBuilder(prefix);
+    for (int pad = digits.length(); pad < width; pad++) {
+      path.append('0');
+    }
+    return path.append(digits).append('-').append(formatUuid(uuid)).append(suffix).toString();
+  }
+
+  private static String stripTrailingDigits(String s) {
+    int end = s.length();
+    while (end > 0 && Character.isDigit(s.charAt(end - 1))) {
+      end--;
+    }
+    return s.substring(0, end);
   }
 
   private static String longestCommonPrefix(String[] paths) {
@@ -584,6 +636,8 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
         } else {
           try {
             ints[i] = Long.parseLong(v);
+            // A value is an int only if it reads back as the same text ("007" is not).
+            allInt &= Long.toString(ints[i]).equals(v);
           } catch (NumberFormatException e) {
             allInt = false;
           }
@@ -649,7 +703,8 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
 
   private static String reconstructMdlogPath(Decoded d, int i) {
     if (d.mdlogPathMode == 0) {
-      return d.mdlogPrefix + d.mdlogVersions[i] + "-" + formatUuid(d.mdlogUuids[i]) + d.mdlogSuffix;
+      return mdlogPath(
+          d.mdlogPrefix, d.mdlogWidth, d.mdlogVersions[i], d.mdlogUuids[i], d.mdlogSuffix);
     }
     return d.mdlogPrefix + d.mdlogMiddles[i] + d.mdlogSuffix;
   }
@@ -731,6 +786,7 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
     int mdlogPathMode;
     String mdlogPrefix;
     String mdlogSuffix;
+    int mdlogWidth;
     long[] mdlogVersions;
     byte[][] mdlogUuids;
     String[] mdlogMiddles;
@@ -903,6 +959,7 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
       d.mdlogPrefix = c.readString();
       d.mdlogSuffix = c.readString();
       if (d.mdlogPathMode == 0) {
+        d.mdlogWidth = c.readVarint32();
         d.mdlogVersions = new long[d.mdlogCount];
         d.mdlogUuids = new byte[d.mdlogCount][];
         for (int i = 0; i < d.mdlogCount; i++) {

@@ -2741,6 +2741,61 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 43: the structural inline codec kept a metadata-log path as a
+  // shared prefix plus a version number, and a number-like snapshot
+  // summary value as an integer, rebuilding both from the number: a
+  // prefix that took some of a zero-padded version's zeros ("00009" and
+  // "00010" share "000") lost one, so a table that returned inline listed
+  // metadata files that do not exist; and a summary value "007" read
+  // back as "7". The templates are now used only if they rebuild every
+  // path exactly (versions keep their padding width), and a value is an
+  // integer only if it reads back as the same text. Found by
+  // TestInlineDeltaProperties.
+  // ============================================================
+
+  @Nested
+  class StructuralCodecRebuildsWhatItStores {
+
+    @Test
+    void metadataLogOfATableReturningInline() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog pointer = catalog(io, LocalCatalogMode.APPEND);
+      FileIOCatalog inline = catalog(io, LocalCatalogMode.APPEND_TM);
+      pointer.createNamespace(mixedNs);
+      pointer.createTable(mixed, intSchema);
+      for (int i = 0; i < 11; i++) {
+        pointer.loadTable(mixed).updateProperties().set("k", "v" + i).commit();
+      }
+
+      inline.loadTable(mixed).updateProperties().set("k", "inline").commit();
+
+      assertThat(catalogFile(io).isInlineTable(mixed)).isTrue();
+      List<org.apache.iceberg.TableMetadata.MetadataLogEntry> log =
+          ((org.apache.iceberg.HasTableOperations) inline.loadTable(mixed)).operations()
+              .current().previousFiles();
+      assertThat(log).hasSizeGreaterThan(10);
+      for (org.apache.iceberg.TableMetadata.MetadataLogEntry entry : log) {
+        assertThat(io.newInputFile(entry.file()).exists()).as(entry.file()).isTrue();
+      }
+    }
+
+    @Test
+    void summaryValueThatLooksLikeANumber() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog inline = catalog(io, LocalCatalogMode.APPEND_TM);
+      inline.createNamespace(mixedNs);
+      inline.createTable(mixed, intSchema);
+
+      inline.loadTable(mixed).newFastAppend().appendFile(dataFile("a")).set("custom", "007")
+          .commit();
+
+      assertThat(catalog(io, LocalCatalogMode.APPEND).loadTable(mixed).currentSnapshot()
+              .summary())
+          .containsEntry("custom", "007");
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)
