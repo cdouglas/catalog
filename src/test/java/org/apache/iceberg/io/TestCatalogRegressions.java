@@ -3125,6 +3125,71 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 52: replay of an inline delta adds the commit's new schemas and
+  // partition specs before it removes the ones the commit dropped, and
+  // TableMetadata.Builder numbers each schema or spec it adds: the id of an
+  // equal one it holds, else one past the highest. A transaction whose
+  // expiry cleaned up unused specs and schemas and then went back to one of
+  // them (dropped the partition field or column the removed one lacked)
+  // had a fresh id from its writer, but on replay took the removed one's:
+  // the default spec or current schema was missing, the writer reported
+  // its commit's state unknown, and no reader could load the catalog. Such
+  // a commit now goes in full. Found by TestInlineDeltaProperties.
+  // ============================================================
+
+  @Nested
+  class ReturnToARemovedSpecOrSchema {
+
+    private final Schema twoColumns =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.IntegerType.get()),
+            Types.NestedField.optional(2, "data", Types.StringType.get()));
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND_TM", "APPEND_ML"})
+    void spec(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, mode);
+      catalog.createNamespace(mixedNs);
+      Table table = catalog.buildTable(mixed, twoColumns)
+          .withPartitionSpec(
+              org.apache.iceberg.PartitionSpec.builderFor(twoColumns).identity("id").build())
+          .create();
+      table.updateSpec().addField("data").commit();
+
+      org.apache.iceberg.Transaction txn = table.newTransaction();
+      txn.expireSnapshots().cleanExpiredMetadata(true).commit();
+      txn.updateSpec().removeField("data").commit();
+      txn.commitTransaction();
+
+      Table read = catalog(io, LocalCatalogMode.APPEND).loadTable(mixed);
+      assertThat(read.spec().specId()).isEqualTo(table.spec().specId()).isEqualTo(2);
+      assertThat(read.specs().keySet()).containsExactlyInAnyOrder(1, 2);
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND_TM", "APPEND_ML"})
+    void schema(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, mode);
+      catalog.createNamespace(mixedNs);
+      Table table = catalog.createTable(mixed, intSchema);
+      table.updateSchema().addColumn("data", Types.StringType.get()).commit();
+
+      org.apache.iceberg.Transaction txn = table.newTransaction();
+      txn.expireSnapshots().cleanExpiredMetadata(true).commit();
+      txn.updateSchema().deleteColumn("data").commit();
+      txn.commitTransaction();
+
+      Table read = catalog(io, LocalCatalogMode.APPEND).loadTable(mixed);
+      assertThat(read.schema().schemaId()).isEqualTo(table.schema().schemaId()).isEqualTo(2);
+      assertThat(read.schemas().keySet()).containsExactlyInAnyOrder(1, 2);
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)

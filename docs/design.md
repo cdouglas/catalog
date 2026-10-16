@@ -241,7 +241,10 @@ Replay must also build as the writer did: TableMetadata.Builder checks
 the default spec and sort order against the current schema on every
 build, so a run of metadata updates is applied to one builder and built
 once (Bug 49: an intermediate state of a replace to a schema without
-the partition column did not validate).
+the partition column did not validate). And it must number new schemas
+and specs as the writer did: the builder gives each the id of an equal
+one, else one past the highest, and replay adds before it removes (Bug
+52: a transaction that cleaned up unused specs, then went back to one).
 `TestInlineDeltaProperties` runs random Iceberg operations and checks
 that each commit's delta, replayed on its base as the inline codec
 stores it, gives the committed metadata, and that the codec stores

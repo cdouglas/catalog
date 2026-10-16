@@ -724,6 +724,13 @@ public class InlineDeltaCodec {
     if (!sequenceAndRowIdsFollow(oldMeta, newMeta)) {
       return null;
     }
+    // Replay adds the commit's new schemas and specs to the base's before it removes any, and
+    // Iceberg numbers each one it adds afresh: the id of an equal one it holds, else one past the
+    // highest. A transaction that removed unused ones (an expiry's metadata cleanup) before it
+    // added one gave it another id, which only full mode carries.
+    if (!replayKeepsTheWritersIds(oldMeta, newMeta)) {
+      return null;
+    }
     // Replay stamps the snapshot-log entry of a main-branch change with the commit's
     // last-updated-ms. A transaction that moved main and then changed something else (a branch)
     // logged main at the earlier time, which only full mode carries.
@@ -920,6 +927,62 @@ public class InlineDeltaCodec {
     }
 
     return updates.isEmpty() ? null : updates;
+  }
+
+  /**
+   * Whether replay, adding the new schemas and specs in order to the base's, numbers each as the
+   * writer did. Mirrors TableMetadata.Builder: a schema takes the id of the first equal schema,
+   * else one past the highest id it has passed, starting from the current schema's; a spec takes
+   * the id of the first compatible spec, else one past the highest.
+   */
+  private static boolean replayKeepsTheWritersIds(TableMetadata oldMeta, TableMetadata newMeta) {
+    Set<Integer> oldSchemaIds = new HashSet<>();
+    List<org.apache.iceberg.Schema> schemas = new ArrayList<>(oldMeta.schemas());
+    for (org.apache.iceberg.Schema s : schemas) {
+      oldSchemaIds.add(s.schemaId());
+    }
+    for (org.apache.iceberg.Schema added : newMeta.schemas()) {
+      if (oldSchemaIds.contains(added.schemaId())) {
+        continue;
+      }
+      int id = oldMeta.currentSchemaId();
+      for (org.apache.iceberg.Schema s : schemas) {
+        if (s.sameSchema(added)) {
+          id = s.schemaId();
+          break;
+        } else if (s.schemaId() >= id) {
+          id = s.schemaId() + 1;
+        }
+      }
+      if (id != added.schemaId()) {
+        return false;
+      }
+      schemas.add(added);
+    }
+    Set<Integer> oldSpecIds = new HashSet<>();
+    List<org.apache.iceberg.PartitionSpec> specs = new ArrayList<>(oldMeta.specs());
+    for (org.apache.iceberg.PartitionSpec s : specs) {
+      oldSpecIds.add(s.specId());
+    }
+    for (org.apache.iceberg.PartitionSpec added : newMeta.specs()) {
+      if (oldSpecIds.contains(added.specId())) {
+        continue;
+      }
+      int id = 0;
+      for (org.apache.iceberg.PartitionSpec s : specs) {
+        if (added.compatibleWith(s)) {
+          id = s.specId();
+          break;
+        } else if (s.specId() >= id) {
+          id = s.specId() + 1;
+        }
+      }
+      if (id != added.specId()) {
+        return false;
+      }
+      specs.add(added);
+    }
+    return true;
   }
 
   /**
