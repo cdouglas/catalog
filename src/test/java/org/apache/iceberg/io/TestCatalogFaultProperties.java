@@ -76,9 +76,10 @@ import org.apache.iceberg.types.Types;
  *
  * <p>A generated schedule runs, on one thread, operations by several writers, each with its own
  * catalog instance and table handles over shared {@link InMemoryAtomicFileIO} storage: fast and
- * merge appends, deletes, property and schema changes, table transactions, snapshot expiry,
- * manifest rewrites, table create / drop / rename, upgrades from format v2 to v3, and multi-table
- * catalog transactions whose
+ * merge appends, deletes, row-level deletes (equality, position, deletion vectors), property,
+ * schema and partition-spec changes, table transactions, snapshot expiry, manifest rewrites, table
+ * create / drop / rename / replace, upgrades from format v2 to v3, and multi-table catalog
+ * transactions whose
  * loads, appends and commit are separate steps, so other writers' operations run in between. A
  * command may also preempt the one before it: it runs to completion just before one of that
  * operation's reads of the catalog or its first conditional write, so the two race. Each writer
@@ -96,9 +97,9 @@ import org.apache.iceberg.types.Types;
  * (see {@link InMemoryAtomicFileIO#failSupersededReads}).
  *
  * <p>Tables are created in format v2 or v3; v3 tables do not merge manifests, which in Iceberg
- * core renumbers existing rows (see {@code V3_PROPERTIES}). A model holds each table's UUID, format version, live
- * data files, properties and added columns. After every operation the catalog, read back without
- * faults, must match it:
+ * core renumbers existing rows (see {@code V3_PROPERTIES}). A model holds each table's UUID,
+ * format version, live data and delete files, properties and added columns. After every operation
+ * the catalog, read back without faults, must match it:
  *
  * <ul>
  *   <li>An acknowledged operation took effect once, and nothing else changed.
@@ -222,6 +223,10 @@ class TestCatalogFaultProperties {
             Tuple.of(1, Kind.REMOVE_PROPERTY),
             Tuple.of(2, Kind.ADD_COLUMN),
             Tuple.of(1, Kind.UPGRADE_TABLE),
+            Tuple.of(1, Kind.REPLACE_TABLE),
+            Tuple.of(2, Kind.ROW_DELTA),
+            Tuple.of(1, Kind.ADD_PARTITION_FIELD),
+            Tuple.of(1, Kind.REMOVE_PARTITION_FIELD),
             Tuple.of(2, Kind.TABLE_TXN),
             Tuple.of(1, Kind.EXPIRE_SNAPSHOTS),
             Tuple.of(1, Kind.REWRITE_MANIFESTS),
@@ -277,6 +282,19 @@ class TestCatalogFaultProperties {
     ADD_COLUMN,
     /** Upgrades a table to format v3; a v3 table is unchanged. */
     UPGRADE_TABLE,
+    /**
+     * Replaces a table with one of the seed schema, in a replace transaction (a create-or-replace
+     * one when {@code b % 3 == 0}) that appends a file when {@code b} is odd.
+     */
+    REPLACE_TABLE,
+    /**
+     * Adds an equality delete file, or when {@code b} is odd a position delete for a live data
+     * file: in v3 a deletion vector, which a later delete of its data file removes with it.
+     */
+    ROW_DELTA,
+    /** Partitions a table by identity, bucket[4] or truncate[10] of its id, as {@code b} picks. */
+    ADD_PARTITION_FIELD,
+    REMOVE_PARTITION_FIELD,
     TABLE_TXN,
     EXPIRE_SNAPSHOTS,
     REWRITE_MANIFESTS,
@@ -355,11 +373,18 @@ class TestCatalogFaultProperties {
     final String uuid;
     int formatVersion;
     final List<String> files = new ArrayList<>();
+    // Live delete files, each to the data file it is a deletion vector for, or "". Those in
+    // maybeDropped may have been dropped by the last commit (see ageOutDeletes).
+    final Map<String, String> deletes = new TreeMap<>();
+    final Set<String> maybeDropped = new TreeSet<>();
     final Map<String, String> props = new TreeMap<>();
     final Set<String> columns = new TreeSet<>();
-    // Observed, not modeled: Iceberg chooses snapshot ids and metadata locations.
+    // Observed, not modeled: Iceberg chooses snapshot ids, metadata locations and sequence numbers
+    // (of the table, and the data sequence numbers of its live data and delete files).
     Long snapshotId = null;
     String metadataLocation = null;
+    long lastSequenceNumber = 0;
+    final Map<String, Long> sequenceNumbers = new HashMap<>();
 
     TableState(String uuid, int formatVersion) {
       this.uuid = uuid;
@@ -369,10 +394,14 @@ class TestCatalogFaultProperties {
     TableState copy() {
       TableState copy = new TableState(uuid, formatVersion);
       copy.files.addAll(files);
+      copy.deletes.putAll(deletes);
+      copy.maybeDropped.addAll(maybeDropped);
       copy.props.putAll(props);
       copy.columns.addAll(columns);
       copy.snapshotId = snapshotId;
       copy.metadataLocation = metadataLocation;
+      copy.lastSequenceNumber = lastSequenceNumber;
+      copy.sequenceNumbers.putAll(sequenceNumbers);
       return copy;
     }
 
@@ -387,8 +416,8 @@ class TestCatalogFaultProperties {
       Map<String, String> shown = new TreeMap<>();
       props.forEach((k, v) -> shown.put(k, abbreviate(v)));
       return String.format(
-          "{uuid=%s v%d files=%s props=%s columns=%s}",
-          uuid.substring(0, 8), formatVersion, sortedFiles(), shown, columns);
+          "{uuid=%s v%d files=%s deletes=%s props=%s columns=%s}",
+          uuid.substring(0, 8), formatVersion, sortedFiles(), deletes, shown, columns);
     }
   }
 
@@ -416,12 +445,28 @@ class TestCatalogFaultProperties {
       if (!e.uuid.equals(a.uuid)
           || e.formatVersion != a.formatVersion
           || !e.sortedFiles().equals(a.sortedFiles())
+          || !deletesMatch(e, a)
           || !e.props.equals(a.props)
           || !e.columns.equals(a.columns)) {
         return id + ": expected " + e + ", found " + a;
       }
     }
     return null;
+  }
+
+  /** Whether {@code a}'s delete files are {@code e}'s, less any of those that may be dropped. */
+  private static boolean deletesMatch(TableState e, TableState a) {
+    for (Map.Entry<String, String> d : a.deletes.entrySet()) {
+      if (!d.getValue().equals(e.deletes.get(d.getKey()))) {
+        return false;
+      }
+    }
+    for (String d : e.deletes.keySet()) {
+      if (!a.deletes.containsKey(d) && !e.maybeDropped.contains(d)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /** An operation's intended change to the model; throws if it cannot apply. */
@@ -529,6 +574,11 @@ class TestCatalogFaultProperties {
     private final Map<String, String> storage = new HashMap<>();
     // Each data file's first row id when first seen with one, by table UUID: row ids never change.
     private final Map<String, Map<String, Long>> rowIds = new HashMap<>();
+    // The data files each table had when upgraded to v3, by UUID. Iceberg core can give such a
+    // file a second range: a commit that retries after another gave the file's manifest row ids
+    // reuses its copy of the manifest from before (SnapshotProducer caches carried manifests by
+    // path). Their row ids are checked like any other's, but not for change.
+    private final Map<String, Set<String>> preUpgrade = new HashMap<>();
     // Conditional writes whose catalog file has been checked against a checkpoint of it.
     private int checkedWrites = 0;
 
@@ -681,6 +731,41 @@ class TestCatalogFaultProperties {
           .build();
     }
 
+    /** {@code file} in {@code table}'s current spec, which may have changed since it was named. */
+    private static DataFile inSpec(Table table, DataFile file) {
+      return DataFiles.builder(table.spec())
+          .withPath(file.location())
+          .withFileSizeInBytes(file.fileSizeInBytes())
+          .withRecordCount(file.recordCount())
+          .withPartitionPath(partitionPath(table.spec()))
+          .build();
+    }
+
+    /** The one partition files are written to: 1 for identity, 0 for bucket and truncate. */
+    private static String partitionPath(PartitionSpec spec) {
+      List<String> path = new ArrayList<>();
+      for (org.apache.iceberg.PartitionField field : spec.fields()) {
+        String transform = field.transform().toString();
+        String value = transform.equals("identity") ? "1" : transform.equals("void") ? "null" : "0";
+        path.add(field.name() + "=" + value);
+      }
+      return String.join("/", path);
+    }
+
+    /** The live data file at {@code path} in {@code table}, or null. */
+    private static DataFile liveFile(Table table, String path) {
+      try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+        for (FileScanTask task : tasks) {
+          if (task.file().location().equals(path)) {
+            return task.file();
+          }
+        }
+      } catch (IOException e) {
+        throw new UncheckedIOException(e);
+      }
+      return null;
+    }
+
     private static Table create(Catalog catalog, TableIdentifier id, int formatVersion) {
       Catalog.TableBuilder builder =
           catalog
@@ -763,9 +848,17 @@ class TestCatalogFaultProperties {
               (fast ? "fastAppend(" : "mergeAppend(") + id + ", " + appended.location() + ")",
               () -> {
                 Table table = handle(w, id, cmd.fresh);
-                (fast ? table.newFastAppend() : table.newAppend()).appendFile(appended).commit();
+                (fast ? table.newFastAppend() : table.newAppend())
+                    .appendFile(inSpec(table, appended))
+                    .commit();
               },
-              (m, actual) -> existing(m, id).files.add(appended.location()));
+              (m, actual) -> {
+                TableState state = existing(m, id);
+                state.files.add(appended.location());
+                if (!fast) {
+                  ageOutDeletes(state, actual.get(id));
+                }
+              });
         case DELETE_FILE:
           // A quarter of the time a file the table does not have: a snapshot with no changes.
           TableState target = model.get(id);
@@ -776,7 +869,104 @@ class TestCatalogFaultProperties {
           return new Op(
               "deleteFile(" + id + ", " + path + ")",
               () -> handle(w, id, cmd.fresh).newDelete().deleteFile(path).commit(),
-              (m, actual) -> existing(m, id).files.removeIf(path::equals));
+              (m, actual) -> {
+                TableState state = existing(m, id);
+                if (state.files.removeIf(path::equals)) {
+                  state.deletes.values().removeIf(path::equals); // its deletion vector
+                }
+                ageOutDeletes(state, actual.get(id));
+              });
+        case ROW_DELTA:
+          TableState deleting = model.get(id);
+          // A position delete for a live data file without a deletion vector, else an equality one.
+          String dataPath = null;
+          if (cmd.b % 2 == 1 && deleting != null) {
+            for (String f : deleting.sortedFiles()) {
+              if (!deleting.deletes.containsValue(f) && (dataPath == null || cmd.b % 4 == 3)) {
+                dataPath = f;
+              }
+            }
+          }
+          boolean dv = dataPath != null && deleting.formatVersion >= 3;
+          String deletePath =
+              "mem:///data/" + (dataPath == null ? "eq" : dv ? "dv" : "pos") + nextFile++
+                  + (dv ? ".puffin" : ".parquet");
+          String referenced = dataPath;
+          return new Op(
+              String.format("rowDelta(%s, %s%s)", id, deletePath,
+                  referenced == null ? "" : " for " + referenced),
+              () -> {
+                Table table = handle(w, id, cmd.fresh);
+                org.apache.iceberg.FileMetadata.Builder delete =
+                    org.apache.iceberg.FileMetadata.deleteFileBuilder(table.spec())
+                        .withPath(deletePath)
+                        .withFileSizeInBytes(10)
+                        .withRecordCount(1);
+                if (referenced == null) {
+                  delete.ofEqualityDeletes(1).withPartitionPath(partitionPath(table.spec()));
+                } else {
+                  DataFile data = liveFile(table, referenced);
+                  if (data == null) {
+                    throw new ValidationException("%s is not live", referenced);
+                  }
+                  delete = org.apache.iceberg.FileMetadata.deleteFileBuilder(
+                          table.specs().get(data.specId()))
+                      .withPath(deletePath)
+                      .withFileSizeInBytes(10)
+                      .withRecordCount(1)
+                      .ofPositionDeletes()
+                      .withPartition(data.partition());
+                  if (dv) {
+                    delete.withFormat(org.apache.iceberg.FileFormat.PUFFIN)
+                        .withReferencedDataFile(referenced)
+                        .withContentOffset(4)
+                        .withContentSizeInBytes(6);
+                  }
+                }
+                table.newRowDelta().addDeletes(delete.build()).commit();
+              },
+              (m, actual) -> {
+                TableState state = existing(m, id);
+                state.deletes.put(deletePath, dv ? referenced : "");
+                ageOutDeletes(state, actual.get(id));
+              });
+        case ADD_PARTITION_FIELD:
+          return new Op(
+              "addPartitionField(" + id + ", " + new String[] {"id", "bucket", "truncate"}[cmd.b % 3]
+                  + ")",
+              () -> {
+                org.apache.iceberg.UpdatePartitionSpec update =
+                    handle(w, id, cmd.fresh).updateSpec();
+                try {
+                  switch (cmd.b % 3) {
+                    case 0:
+                      update.addField("id");
+                      break;
+                    case 1:
+                      update.addField(org.apache.iceberg.expressions.Expressions.bucket("id", 4));
+                      break;
+                    default:
+                      update.addField(
+                          org.apache.iceberg.expressions.Expressions.truncate("id", 10));
+                  }
+                } catch (IllegalArgumentException e) {
+                  throw new ValidationException(e, "%s", e.getMessage()); // already a field
+                }
+                update.commit();
+              },
+              (m, actual) -> existing(m, id));
+        case REMOVE_PARTITION_FIELD:
+          return new Op(
+              "removePartitionField(" + id + ")",
+              () -> {
+                Table table = handle(w, id, cmd.fresh);
+                List<org.apache.iceberg.PartitionField> fields = table.spec().fields();
+                if (fields.isEmpty()) {
+                  throw new ValidationException("%s is not partitioned", id);
+                }
+                table.updateSpec().removeField(fields.get(cmd.b % fields.size()).name()).commit();
+              },
+              (m, actual) -> existing(m, id));
         case SET_PROPERTY:
           String key = KEYS.get(cmd.b % KEYS.size());
           String value = "v" + nextValue++;
@@ -820,7 +1010,57 @@ class TestCatalogFaultProperties {
                 V3_PROPERTIES.forEach(update::set);
                 update.commit();
               },
-              (m, actual) -> existing(m, id).formatVersion = 3);
+              (m, actual) -> {
+                TableState state = existing(m, id);
+                if (state.formatVersion < 3) {
+                  preUpgrade.computeIfAbsent(state.uuid, k -> new java.util.HashSet<>())
+                      .addAll(state.files);
+                }
+                state.formatVersion = 3;
+              });
+        case REPLACE_TABLE:
+          boolean orCreate = cmd.b % 3 == 0;
+          DataFile replacing = cmd.b % 2 == 1 ? newFile() : null;
+          // A replace commits the table it built at the start over any change since, keeping
+          // that table's properties and format version: record them as the transaction saw them.
+          TableState built = new TableState(null, 0);
+          return new Op(
+              String.format("%s(%s%s)", orCreate ? "createOrReplace" : "replace", id,
+                  replacing == null ? "" : ", " + replacing.location()),
+              () -> {
+                Catalog.TableBuilder builder = w.catalog.buildTable(id, SCHEMA);
+                Transaction replace =
+                    orCreate ? builder.createOrReplaceTransaction() : builder.replaceTransaction();
+                if (replacing != null) {
+                  replace.newFastAppend().appendFile(inSpec(replace.table(), replacing)).commit();
+                }
+                TableMetadata replacement = ((HasTableOperations) replace.table()).operations()
+                    .current();
+                built.formatVersion = replacement.formatVersion();
+                replacement.properties().forEach((k, v) -> {
+                  if (k.startsWith(KEY_PREFIX)) {
+                    built.props.put(k, v);
+                  }
+                });
+                replace.commitTransaction();
+              },
+              (m, actual) -> {
+                TableState before = m.get(id);
+                if (before == null && !orCreate) {
+                  throw new IllegalStateException(id + " does not exist");
+                }
+                TableState now = actual.get(id);
+                if (now == null) {
+                  throw new IllegalStateException(id + " is missing");
+                }
+                String uuid = before != null ? before.uuid : now.uuid;
+                TableState replaced = new TableState(uuid, built.formatVersion);
+                replaced.props.putAll(built.props);
+                if (replacing != null) {
+                  replaced.files.add(replacing.location());
+                }
+                m.put(id, replaced);
+              });
         case TABLE_TXN:
           DataFile txnFile = newFile();
           String txnKey = KEYS.get(cmd.b % KEYS.size());
@@ -830,7 +1070,7 @@ class TestCatalogFaultProperties {
                   "tableTxn(%s, %s, %s=%s)", id, txnFile.location(), txnKey, txnValue),
               () -> {
                 Transaction txn = handle(w, id, cmd.fresh).newTransaction();
-                txn.newFastAppend().appendFile(txnFile).commit();
+                txn.newFastAppend().appendFile(inSpec(txn.table(), txnFile)).commit();
                 txn.updateProperties().set(txnKey, txnValue).commit();
                 txn.commitTransaction();
               },
@@ -881,7 +1121,7 @@ class TestCatalogFaultProperties {
                   w.loaded.computeIfAbsent(
                       id, k -> new Loaded(((HasTableOperations) table).operations().current()));
                   if (staged != null) {
-                    table.newFastAppend().appendFile(staged).commit();
+                    table.newFastAppend().appendFile(inSpec(table, staged)).commit();
                     w.loaded.get(id).appended = true;
                     w.staged.add(Map.entry(id, staged.location()));
                   }
@@ -1043,8 +1283,15 @@ class TestCatalogFaultProperties {
       // Observe what the model cannot predict.
       model.forEach(
           (id, state) -> {
-            state.snapshotId = actual.get(id).snapshotId;
-            state.metadataLocation = actual.get(id).metadataLocation;
+            TableState now = actual.get(id);
+            state.deletes.keySet().removeIf(d -> state.maybeDropped.contains(d)
+                && !now.deletes.containsKey(d));
+            state.maybeDropped.clear();
+            state.snapshotId = now.snapshotId;
+            state.metadataLocation = now.metadataLocation;
+            state.lastSequenceNumber = now.lastSequenceNumber;
+            state.sequenceNumbers.clear();
+            state.sequenceNumbers.putAll(now.sequenceNumbers);
           });
     }
 
@@ -1125,10 +1372,25 @@ class TestCatalogFaultProperties {
           try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
             for (FileScanTask task : tasks) {
               state.files.add(task.file().location());
+              state.sequenceNumbers.put(task.file().location(), task.file().dataSequenceNumber());
               live.add(task.file());
             }
           }
           checkRowLineage(id, metadata, table.currentSnapshot(), live);
+          if (table.currentSnapshot() != null) {
+            for (ManifestFile m : table.currentSnapshot().deleteManifests(io)) {
+              check(m.firstRowId() == null, "%s: delete manifest %s has first row id %s",
+                  id, m.path(), m.firstRowId());
+              try (org.apache.iceberg.ManifestReader<org.apache.iceberg.DeleteFile> reader =
+                  org.apache.iceberg.ManifestFiles.readDeleteManifest(m, io, table.specs())) {
+                for (org.apache.iceberg.DeleteFile f : reader) {
+                  state.deletes.put(f.location(),
+                      f.referencedDataFile() == null ? "" : f.referencedDataFile());
+                  state.sequenceNumbers.put(f.location(), f.dataSequenceNumber());
+                }
+              }
+            }
+          }
           table.properties().forEach((k, v) -> {
             if (k.startsWith(KEY_PREFIX)) {
               state.props.put(k, v);
@@ -1142,6 +1404,7 @@ class TestCatalogFaultProperties {
           state.snapshotId =
               table.currentSnapshot() == null ? null : table.currentSnapshot().snapshotId();
           state.metadataLocation = metadata.metadataFileLocation();
+          state.lastSequenceNumber = metadata.lastSequenceNumber();
         } catch (IOException e) {
           throw new UncheckedIOException(e);
         } catch (RuntimeException e) {
@@ -1153,6 +1416,34 @@ class TestCatalogFaultProperties {
     }
 
     /**
+     * Marks in {@code state} the delete files that a commit by a merging producer (a merge append,
+     * a delete, a row delta) may drop: Iceberg drops those older than the base's last sequence
+     * number and than the minimum sequence number of every data manifest, which can no longer
+     * apply to a row. The manifests' minimums also count deleted entries, so they are not known
+     * here; the minimum over live data files bounds them, so a delete file at or above it must stay
+     * and one below it may go. {@code state}'s sequence numbers are as last observed, before the
+     * commit; {@code now}'s after it.
+     */
+    private static void ageOutDeletes(TableState state, TableState now) {
+      if (now == null) {
+        return;
+      }
+      long min = state.lastSequenceNumber;
+      for (String file : now.files) {
+        Long seq = now.sequenceNumbers.get(file);
+        if (seq != null) {
+          min = Math.min(min, seq);
+        }
+      }
+      for (String d : state.deletes.keySet()) {
+        Long seq = state.sequenceNumbers.get(d);
+        if (seq != null && seq < min) {
+          state.maybeDropped.add(d);
+        }
+      }
+    }
+
+    /**
      * Checks the row ids of a table's live data files: in a v3 table whose current snapshot has
      * row ids, every file has them, and their ranges are disjoint and below the next row id. In
      * any table, a file's first row id never changes once it has one.
@@ -1160,8 +1451,9 @@ class TestCatalogFaultProperties {
     private void checkRowLineage(
         TableIdentifier id, TableMetadata metadata, Snapshot current, List<DataFile> live) {
       Map<String, Long> seen = rowIds.computeIfAbsent(metadata.uuid(), k -> new HashMap<>());
+      Set<String> upgraded = preUpgrade.getOrDefault(metadata.uuid(), Set.of());
       for (DataFile f : live) {
-        if (f.firstRowId() != null) {
+        if (f.firstRowId() != null && !upgraded.contains(f.location())) {
           Long first = seen.putIfAbsent(f.location(), f.firstRowId());
           check(first == null || first.equals(f.firstRowId()),
               "%s: the first row id of %s changed from %d to %d",
@@ -1193,11 +1485,28 @@ class TestCatalogFaultProperties {
 
     private static String describe(ManifestFile m) {
       return String.format(
-          "%s(%s spec=%d seq=%d/%d snap=%d files=%d/%d/%d rows=%d/%d/%d first-row-id=%s)",
+          "%s(%s spec=%d seq=%d/%d snap=%d files=%d/%d/%d rows=%d/%d/%d first-row-id=%s"
+              + " partitions=%s)",
           m.path().substring(m.path().lastIndexOf('/') + 1), m.content(), m.partitionSpecId(),
           m.sequenceNumber(), m.minSequenceNumber(), m.snapshotId(),
           m.addedFilesCount(), m.existingFilesCount(), m.deletedFilesCount(),
-          m.addedRowsCount(), m.existingRowsCount(), m.deletedRowsCount(), m.firstRowId());
+          m.addedRowsCount(), m.existingRowsCount(), m.deletedRowsCount(), m.firstRowId(),
+          m.partitions() == null ? null : m.partitions().stream()
+              .map(p -> String.format("%s/%s/%s/%s", p.containsNull(), p.containsNaN(),
+                  hex(p.lowerBound()), hex(p.upperBound())))
+              .collect(java.util.stream.Collectors.toList()));
+    }
+
+    private static String hex(java.nio.ByteBuffer buffer) {
+      if (buffer == null) {
+        return null;
+      }
+      StringBuilder out = new StringBuilder();
+      java.nio.ByteBuffer copy = buffer.duplicate();
+      while (copy.hasRemaining()) {
+        out.append(String.format("%02x", copy.get()));
+      }
+      return out.toString();
     }
 
     private AssertionError unexpected(RuntimeException e) {
