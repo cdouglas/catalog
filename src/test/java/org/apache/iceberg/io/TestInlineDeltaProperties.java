@@ -125,10 +125,22 @@ class TestInlineDeltaProperties {
     }
   }
 
-  /** The metadata as JSON, less the metadata log, which inline storage synthesizes. */
+  /**
+   * The metadata as JSON, less the metadata log, which inline storage synthesizes, and with its
+   * statistics files by snapshot id: TableMetadata.Builder lists them in a HashMap's order, so a
+   * replay that builds the metadata in fewer steps than its writer can list them otherwise.
+   */
   private static JsonNode canonical(TableMetadata metadata) {
     ObjectNode node = (ObjectNode) json(metadata);
     node.remove("metadata-log");
+    for (String field : List.of("statistics", "partition-statistics")) {
+      if (node.get(field) != null) {
+        List<JsonNode> files = new java.util.ArrayList<>();
+        node.get(field).forEach(files::add);
+        files.sort(java.util.Comparator.comparingLong(f -> f.get("snapshot-id").asLong()));
+        node.set(field, JSON.valueToTree(files));
+      }
+    }
     return node;
   }
 

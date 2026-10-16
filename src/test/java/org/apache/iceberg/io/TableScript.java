@@ -23,6 +23,7 @@ import static org.apache.iceberg.types.Types.NestedField.required;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import net.jqwik.api.Arbitraries;
 import net.jqwik.api.Arbitrary;
 import net.jqwik.api.Combinators;
@@ -106,9 +107,25 @@ final class TableScript {
     UPGRADE,
     /** Sets a property to random characters of about 3 KiB. */
     BIG_PROPERTY,
+    /** Replaces a live data file with a new one, as compaction does. */
+    REWRITE_FILES,
+    /** Overwrites every row with a new file. */
+    OVERWRITE,
+    /** Replaces the partitions of a new file (a dynamic overwrite). */
+    REPLACE_PARTITIONS,
+    /** Sets a snapshot's statistics file, or removes one when {@code c} is odd. */
+    STATISTICS,
+    /** Sets a snapshot's partition statistics file, or removes one when {@code c} is odd. */
+    PARTITION_STATISTICS,
     REPLACE,
     /** Runs the next {@code a % 3 + 2} commands in one table transaction. */
     TRANSACTION,
+    /**
+     * Runs the next {@code a % 3 + 2} commands on the table loaded in a catalog transaction,
+     * serializable if {@code b} is even, else snapshot isolation; a table transaction in a catalog
+     * without them.
+     */
+    CATALOG_TXN,
     /**
      * Runs the next command on a handle loaded at the previous STALE step (or at creation), from
      * the runner's other catalog, whose commit retries on the current metadata or fails.
@@ -138,15 +155,16 @@ final class TableScript {
 
 
   /**
-   * The steps of {@code schedule}: each command alone, but a TRANSACTION command with the next
-   * {@code a % 3 + 2} commands, which run in one table transaction, and a STALE command with the
-   * next.
+   * The steps of {@code schedule}: each command alone, but a TRANSACTION or CATALOG_TXN command
+   * with the next {@code a % 3 + 2} commands, which run in one transaction, and a STALE command
+   * with the next.
    */
   static List<List<Cmd>> steps(List<Cmd> schedule) {
     List<List<Cmd>> steps = new ArrayList<>();
     for (int i = 0; i < schedule.size(); i++) {
       Cmd cmd = schedule.get(i);
-      if (cmd.kind == Kind.TRANSACTION || cmd.kind == Kind.STALE) {
+      if (cmd.kind == Kind.TRANSACTION || cmd.kind == Kind.CATALOG_TXN
+          || cmd.kind == Kind.STALE) {
         int n = Math.min(
             cmd.kind == Kind.STALE ? 1 : cmd.a % 3 + 2, schedule.size() - i - 1);
         steps.add(new ArrayList<>(schedule.subList(i, i + 1 + n)));
@@ -211,19 +229,29 @@ final class TableScript {
         }
         return null;
       }
-      if (first.kind == Kind.TRANSACTION) {
+      if (first.kind == Kind.TRANSACTION || first.kind == Kind.CATALOG_TXN) {
         List<Cmd> group = step.subList(1, step.size());
-        trace.append("transaction ").append(group).append('\n');
+        org.apache.iceberg.catalog.CatalogTransaction catalogTxn =
+            first.kind == Kind.CATALOG_TXN
+                && catalog instanceof org.apache.iceberg.catalog.SupportsCatalogTransactions
+                ? ((org.apache.iceberg.catalog.SupportsCatalogTransactions) catalog)
+                    .createTransaction(first.b % 2 == 0
+                        ? org.apache.iceberg.catalog.CatalogTransaction.IsolationLevel.SERIALIZABLE
+                        : org.apache.iceberg.catalog.CatalogTransaction.IsolationLevel.SNAPSHOT)
+                : null;
+        trace.append(catalogTxn != null ? "catalog transaction (" + catalogTxn.isolationLevel()
+            + ") " : "transaction ").append(group).append('\n');
         try {
-          Transaction txn = table.newTransaction();
+          Transaction txn = catalogTxn == null ? table.newTransaction() : null;
+          Table target = txn != null ? txn.table() : catalogTxn.asCatalog().loadTable(ID);
           int staged = 0;
           for (Cmd member : group) {
-            if (member.kind == Kind.TRANSACTION || member.kind == Kind.REPLACE
-                || member.kind == Kind.STALE) {
+            if (member.kind == Kind.TRANSACTION || member.kind == Kind.CATALOG_TXN
+                || member.kind == Kind.REPLACE || member.kind == Kind.STALE) {
               continue;
             }
             try {
-              run(member, txn.table());
+              run(member, target);
               staged += 1;
             } catch (RuntimeException e) {
               trace.append("  member skipped: ").append(e).append('\n');
@@ -232,7 +260,11 @@ final class TableScript {
           if (staged == 0) {
             throw new IllegalStateException("no member staged");
           }
-          txn.commitTransaction();
+          if (txn != null) {
+            txn.commitTransaction();
+          } else {
+            catalogTxn.commitTransaction();
+          }
         } catch (RuntimeException e) {
           trace.append("  skipped: ").append(e).append('\n');
           return e;
@@ -282,6 +314,31 @@ final class TableScript {
                       .withPartitionPath(partitionPath(target.spec()))
                       .build())
               .commit();
+          break;
+        case REWRITE_FILES:
+          List<DataFile> rewritten = liveFiles(target);
+          if (rewritten.isEmpty()) {
+            throw new IllegalStateException("no live data file");
+          }
+          DataFile compacted = rewritten.get(cmd.b % rewritten.size());
+          target.newRewrite()
+              .deleteFile(compacted)
+              .addFile(DataFiles.builder(target.specs().get(compacted.specId()))
+                  .withPath("mem:///data/r" + nextFile++ + ".parquet")
+                  .withFileSizeInBytes(10)
+                  .withRecordCount(compacted.recordCount())
+                  .withPartition(compacted.partition())
+                  .build())
+              .commit();
+          break;
+        case OVERWRITE:
+          target.newOverwrite()
+              .overwriteByRowFilter(Expressions.alwaysTrue())
+              .addFile(newFile(target))
+              .commit();
+          break;
+        case REPLACE_PARTITIONS:
+          target.newReplacePartitions().addFile(newFile(target)).commit();
           break;
         case POSITION_DELETE:
           List<DataFile> live = new ArrayList<>();
@@ -458,6 +515,36 @@ final class TableScript {
           }
           target.updateProperties().set("big", big.toString()).commit();
           break;
+        case STATISTICS:
+          Snapshot measured = pick(snapshots, cmd.b);
+          if (cmd.c % 2 == 1) {
+            target.updateStatistics().removeStatistics(measured.snapshotId()).commit();
+          } else {
+            target.updateStatistics()
+                .setStatistics(new org.apache.iceberg.GenericStatisticsFile(
+                    measured.snapshotId(), "mem:///stats/s" + nextFile++ + ".puffin", 100, 10,
+                    List.of(new org.apache.iceberg.GenericBlobMetadata(
+                        "apache-datasketches-theta-v1", measured.snapshotId(),
+                        measured.sequenceNumber(), List.of(1), Map.of("ndv", "3")))))
+                .commit();
+          }
+          break;
+        case PARTITION_STATISTICS:
+          Snapshot partitioned = pick(snapshots, cmd.b);
+          if (cmd.c % 2 == 1) {
+            target.updatePartitionStatistics()
+                .removePartitionStatistics(partitioned.snapshotId()).commit();
+          } else {
+            target.updatePartitionStatistics()
+                .setPartitionStatistics(
+                    org.apache.iceberg.ImmutableGenericPartitionStatisticsFile.builder()
+                        .snapshotId(partitioned.snapshotId())
+                        .path("mem:///stats/p" + nextFile++ + ".parquet")
+                        .fileSizeInBytes(42)
+                        .build())
+                .commit();
+          }
+          break;
         default:
           throw new IllegalStateException("Unknown kind " + cmd.kind);
       }
@@ -488,6 +575,19 @@ final class TableScript {
         replace.newFastAppend().appendFile(newFile(replace.table())).commit();
       }
       replace.commitTransaction();
+    }
+
+    /** The live data files of the main branch, by path. */
+    private static List<DataFile> liveFiles(Table target) {
+      List<DataFile> live = new ArrayList<>();
+      try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.FileScanTask> tasks =
+          target.newScan().planFiles()) {
+        tasks.forEach(task -> live.add(task.file()));
+      } catch (java.io.IOException e) {
+        throw new java.io.UncheckedIOException(e);
+      }
+      live.sort(java.util.Comparator.comparing(DataFile::location));
+      return live;
     }
 
     private static String ref(int index) {

@@ -187,6 +187,20 @@ class TestInlineDifferentialProperties {
     items.put("sort orders", metadata.defaultSortOrderId() + " " + metadata.sortOrders().stream()
         .map(SortOrderParser::toJson).collect(java.util.stream.Collectors.toList()));
     items.put("properties", new TreeMap<>(metadata.properties()).toString());
+    items.put("statistics", metadata.statisticsFiles().stream()
+        .map(f -> String.format("#%s %s %d/%d %s", position.get(f.snapshotId()), f.path(),
+            f.fileSizeInBytes(), f.fileFooterSizeInBytes(), f.blobMetadata().stream()
+                .map(b -> String.format("%s #%s seq=%d %s %s", b.type(),
+                    position.get(b.sourceSnapshotId()), b.sourceSnapshotSequenceNumber(),
+                    b.fields(), b.properties()))
+                .collect(java.util.stream.Collectors.toList())))
+        .sorted()
+        .collect(java.util.stream.Collectors.toList()).toString());
+    items.put("partition statistics", metadata.partitionStatisticsFiles().stream()
+        .map(f -> String.format("#%s %s %d", position.get(f.snapshotId()), f.path(),
+            f.fileSizeInBytes()))
+        .sorted()
+        .collect(java.util.stream.Collectors.toList()).toString());
     for (int i = 0; i < snapshots.size(); i++) {
       Snapshot s = snapshots.get(i);
       Map<String, String> summary = new TreeMap<>(s.summary());
@@ -209,6 +223,7 @@ class TestInlineDifferentialProperties {
             partitions(m)));
       }
       items.put(String.format("snapshot %02d manifests", i), manifests.toString());
+      items.put(String.format("snapshot %02d changes", i), changes(table, s));
     }
     for (Map.Entry<String, SnapshotRef> r : metadata.refs().entrySet()) {
       SnapshotRef ref = r.getValue();
@@ -220,7 +235,96 @@ class TestInlineDifferentialProperties {
     items.put("snapshot log", metadata.snapshotLog().stream()
         .map(e -> "#" + position.get(e.snapshotId()))
         .collect(java.util.stream.Collectors.toList()).toString());
+    for (org.apache.iceberg.MetadataTableType type : org.apache.iceberg.MetadataTableType.values()) {
+      if (type != org.apache.iceberg.MetadataTableType.POSITION_DELETES) {
+        items.put("metadata table " + type, metadataTable(table, type, position));
+      }
+    }
     return items;
+  }
+
+  /**
+   * The rows of {@code table}'s metadata table {@code type}, sorted, with snapshot ids as
+   * positions and what differs between the two runs (times, file names, sizes) left out. So is
+   * first_row_id in the all_* tables: Iceberg core keeps one copy of each manifest reachable
+   * from several snapshots, whichever its parallel planning reaches first, and the copy in a
+   * list written before a v3 upgrade has no row ids (each snapshot's list is compared above).
+   */
+  private static String metadataTable(
+      Table table, org.apache.iceberg.MetadataTableType type, Map<Long, Integer> position) {
+    Table metadata = org.apache.iceberg.MetadataTableUtils.createMetadataTableInstance(table, type);
+    List<String> rows = new ArrayList<>();
+    try (org.apache.iceberg.io.CloseableIterable<FileScanTask> tasks =
+        metadata.newScan().planFiles()) {
+      for (FileScanTask task : tasks) {
+        try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.StructLike> data =
+            task.asDataTask().rows()) {
+          boolean all = type.name().startsWith("ALL_");
+          data.forEach(
+              row -> rows.add(describe(metadata.schema().asStruct(), row, position, all)));
+        }
+      }
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    } catch (RuntimeException e) {
+      return "fails: " + e;
+    }
+    rows.sort(String::compareTo);
+    return rows.toString();
+  }
+
+  private static String describe(
+      org.apache.iceberg.types.Types.StructType type, org.apache.iceberg.StructLike row,
+      Map<Long, Integer> position, boolean all) {
+    List<String> fields = new ArrayList<>();
+    for (int i = 0; i < type.fields().size(); i++) {
+      org.apache.iceberg.types.Types.NestedField field = type.fields().get(i);
+      String name = field.name();
+      Object value = row.get(i, Object.class);
+      String shown;
+      if (value != null && (name.endsWith("snapshot_id") || name.equals("parent_id"))) {
+        shown = "#" + position.get((Long) value);
+      } else if (name.contains("timestamp") || name.contains("committed_at")
+          || name.contains("made_current_at") || name.contains("path") || name.equals("file")
+          || name.contains("length") || name.equals("manifest_list")
+          || name.contains("last_updated") || name.equals("readable_metrics")
+          || name.equals("summary") || name.equals("file_size_in_bytes")
+          || (all && name.equals("first_row_id"))) {
+        shown = "*";
+      } else if (value instanceof org.apache.iceberg.StructLike && field.type().isStructType()) {
+        shown = "{" + describe(field.type().asStructType(), (org.apache.iceberg.StructLike) value,
+            position, all) + "}";
+      } else if (value instanceof List && field.type().isListType()
+          && field.type().asListType().elementType().isStructType()) {
+        List<String> elements = new ArrayList<>();
+        for (Object element : (List<?>) value) {
+          elements.add("{" + describe(field.type().asListType().elementType().asStructType(),
+              (org.apache.iceberg.StructLike) element, position, all) + "}");
+        }
+        shown = elements.toString();
+      } else if (value instanceof ByteBuffer) {
+        shown = hex((ByteBuffer) value);
+      } else {
+        shown = String.valueOf(value);
+      }
+      fields.add(name + "=" + shown);
+    }
+    return String.join(" ", fields);
+  }
+
+  /** The data and delete files {@code s} added and removed, as incremental scans read them. */
+  private static String changes(Table table, Snapshot s) {
+    List<String> out = new ArrayList<>();
+    try {
+      s.addedDataFiles(table.io()).forEach(f -> out.add("+data " + f.location()));
+      s.removedDataFiles(table.io()).forEach(f -> out.add("-data " + f.location()));
+      s.addedDeleteFiles(table.io()).forEach(f -> out.add("+delete " + f.location()));
+      s.removedDeleteFiles(table.io()).forEach(f -> out.add("-delete " + f.location()));
+    } catch (RuntimeException e) {
+      return "fails: " + e;
+    }
+    out.sort(String::compareTo);
+    return out.toString();
   }
 
   private static String partitions(ManifestFile m) {
@@ -251,6 +355,9 @@ class TestInlineDifferentialProperties {
       }
     } catch (IOException e) {
       throw new UncheckedIOException(e);
+    } catch (RuntimeException e) {
+      // As planning fails in either catalog: Iceberg core refuses some states its operations make.
+      return "fails: " + e;
     }
     out.sort(String::compareTo);
     return out.toString();
