@@ -139,16 +139,20 @@ class TestInlineDifferentialProperties {
     return TableScript.schedules();
   }
 
-  /** Reads the table from each storage with a fresh pointer-mode reader and compares. */
+  /** Reads the tables from each storage with a fresh pointer-mode reader and compares. */
   private static void compare(
       InMemoryAtomicFileIO pointerIo, InMemoryAtomicFileIO inlineIo, StringBuilder trace) {
-    Map<String, String> expected =
-        view(LocalCatalogMode.APPEND.catalog(pointerIo, WAREHOUSE, "c", Map.of())
-            .loadTable(TableScript.ID));
-    Table inlineTable =
-        LocalCatalogMode.APPEND.catalog(inlineIo, WAREHOUSE, "c", Map.of())
-            .loadTable(TableScript.ID);
+    FileIOCatalog pointerReader =
+        LocalCatalogMode.APPEND.catalog(pointerIo, WAREHOUSE, "c", Map.of());
+    FileIOCatalog inlineReader =
+        LocalCatalogMode.APPEND.catalog(inlineIo, WAREHOUSE, "c", Map.of());
+    Map<String, String> expected = view(pointerReader.loadTable(TableScript.ID));
+    Table inlineTable = inlineReader.loadTable(TableScript.ID);
     Map<String, String> actual = view(inlineTable);
+    view(pointerReader.loadTable(TableScript.OTHER))
+        .forEach((key, value) -> expected.put(TableScript.OTHER.name() + ": " + key, value));
+    view(inlineReader.loadTable(TableScript.OTHER))
+        .forEach((key, value) -> actual.put(TableScript.OTHER.name() + ": " + key, value));
     List<String> differences = new ArrayList<>();
     java.util.Set<String> keys = new java.util.TreeSet<>(expected.keySet());
     keys.addAll(actual.keySet());

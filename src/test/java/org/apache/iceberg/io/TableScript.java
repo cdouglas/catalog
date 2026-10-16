@@ -56,6 +56,8 @@ import org.apache.iceberg.types.Types;
  */
 final class TableScript {
   static final TableIdentifier ID = TableIdentifier.of("ns", "t");
+  /** A second table, which the odd members of a catalog transaction change. */
+  static final TableIdentifier OTHER = TableIdentifier.of("ns", "u");
   static final Schema SCHEMA =
       new Schema(
           required(1, "id", Types.IntegerType.get()),
@@ -121,9 +123,9 @@ final class TableScript {
     /** Runs the next {@code a % 3 + 2} commands in one table transaction. */
     TRANSACTION,
     /**
-     * Runs the next {@code a % 3 + 2} commands on the table loaded in a catalog transaction,
-     * serializable if {@code b} is even, else snapshot isolation; a table transaction in a catalog
-     * without them.
+     * Runs the next {@code a % 3 + 2} commands in a catalog transaction, the odd ones on {@link
+     * #OTHER}, serializable if {@code b} is even, else snapshot isolation; in a table transaction
+     * in a catalog without them.
      */
     CATALOG_TXN,
     /**
@@ -186,7 +188,9 @@ final class TableScript {
     private int nextFile = 0;
     private int nextValue = 0;
 
-    /** Creates the table, in {@code formatVersion}, partitioned by cat if {@code partitioned}. */
+    /**
+     * Creates the tables, in {@code formatVersion}, partitioned by cat if {@code partitioned}.
+     */
     Runner(Catalog catalog, int formatVersion, boolean partitioned, StringBuilder trace) {
       this(catalog, catalog, formatVersion, partitioned, trace);
     }
@@ -207,6 +211,11 @@ final class TableScript {
               .withPartitionSpec(spec)
               .withProperty(TableProperties.FORMAT_VERSION, String.valueOf(formatVersion))
               .create();
+      catalog
+          .buildTable(OTHER, SCHEMA)
+          .withPartitionSpec(spec)
+          .withProperty(TableProperties.FORMAT_VERSION, String.valueOf(formatVersion))
+          .create();
       this.stale = other.loadTable(ID);
     }
 
@@ -244,14 +253,16 @@ final class TableScript {
         try {
           Transaction txn = catalogTxn == null ? table.newTransaction() : null;
           Table target = txn != null ? txn.table() : catalogTxn.asCatalog().loadTable(ID);
+          Table second = txn != null ? target : catalogTxn.asCatalog().loadTable(OTHER);
           int staged = 0;
-          for (Cmd member : group) {
+          for (int i = 0; i < group.size(); i++) {
+            Cmd member = group.get(i);
             if (member.kind == Kind.TRANSACTION || member.kind == Kind.CATALOG_TXN
                 || member.kind == Kind.REPLACE || member.kind == Kind.STALE) {
               continue;
             }
             try {
-              run(member, target);
+              run(member, i % 2 == 1 ? second : target);
               staged += 1;
             } catch (RuntimeException e) {
               trace.append("  member skipped: ").append(e).append('\n');
