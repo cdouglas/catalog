@@ -36,6 +36,7 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.CommitStateUnknownException;
+import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 
 /**
@@ -796,8 +797,10 @@ public class ProtoCatalogFormat
     /**
      * The most informative error for a transaction that does not hold on {@code state}:
      * AlreadyExistsException if a pending create or rename destination now exists (Iceberg's
-     * create-race semantic), CommitFailedException otherwise, so the caller can refresh and
-     * re-apply.
+     * create-race semantic), NoSuchTableException if a rename's source is gone,
+     * CommitFailedException otherwise, so the caller can refresh and re-apply. A rename is judged
+     * as renameTable checks it, source first: one that lost a race to the same rename reports the
+     * source gone, as it would have after it.
      */
     private RuntimeException conflict(ProtoCatalogFile state, String message) {
       for (Map.Entry<TableIdentifier, String> e : tables.entrySet()) {
@@ -810,9 +813,12 @@ public class ProtoCatalogFormat
           return new AlreadyExistsException("Table already exists: %s", e.getKey());
         }
       }
-      for (TableIdentifier dest : tableRenames.values()) {
-        if (state.containsTable(dest)) {
-          return new AlreadyExistsException("Table already exists: %s", dest);
+      for (Map.Entry<TableIdentifier, TableIdentifier> rename : tableRenames.entrySet()) {
+        if (!state.containsTable(rename.getKey())) {
+          return new NoSuchTableException("Table does not exist: %s", rename.getKey());
+        }
+        if (state.containsTable(rename.getValue())) {
+          return new AlreadyExistsException("Table already exists: %s", rename.getValue());
         }
       }
       return new CommitFailedException("%s", message);

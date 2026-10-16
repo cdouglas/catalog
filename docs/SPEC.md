@@ -638,7 +638,9 @@ function COMMIT(fileIO, original, mutations):
             # retry on top of it (append or CAS, as that state calls for): the
             # commit is accepted exactly when a serial commit would be.
             # Otherwise fail without writing: AlreadyExists if a pending create
-            # now collides, CommitFailed otherwise. The client retries.
+            # or rename destination now collides, NoSuchTable if a rename's
+            # source is gone (checked first, as renameTable does),
+            # CommitFailed otherwise. The client retries.
             current = fileIO.newInputFile(current.location)
             base    = READ(fileIO, current)
             if txn.id in base.committed:

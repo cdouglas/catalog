@@ -506,7 +506,10 @@ class TestMultiWriterProperties {
 
   enum Outcome {
     ACKNOWLEDGED,
-    /** CommitFailedException or AlreadyExistsException: a definite no. */
+    /**
+     * CommitFailedException, AlreadyExistsException or NoSuchTableException (a rename whose
+     * source is gone): a definite no.
+     */
     REJECTED,
     /** CommitStateUnknownException: the commit may or may not have taken effect. */
     UNKNOWN,
@@ -756,7 +759,7 @@ class TestMultiWriterProperties {
         ctx.active = true;
         mut(w.snapshot, ops).commit(io);
         outcome = Outcome.ACKNOWLEDGED;
-      } catch (CommitFailedException | AlreadyExistsException e) {
+      } catch (CommitFailedException | AlreadyExistsException | NoSuchTableException e) {
         outcome = Outcome.REJECTED;
         reason = " (" + e.getClass().getSimpleName() + ")";
       } catch (CommitStateUnknownException e) {

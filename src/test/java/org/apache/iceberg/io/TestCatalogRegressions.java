@@ -3379,6 +3379,46 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 55: of two writers renaming a table to the same name at once, the
+  // one that lost got AlreadyExistsException: a rename that conflicted
+  // was judged by its destination first, which the winner had just
+  // created. Run after the other, it fails because its source is gone
+  // (NoSuchTableException), as renameTable checks the source first; the
+  // conflict now does too. Found by TestCatalogRaceProperties.
+  // ============================================================
+
+  @Nested
+  class RenameRacingTheSameRename {
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND", "CAS", "APPEND_TM"})
+    void reportsTheSourceGone(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, mode);
+      FileIOCatalog racer = catalog(io, mode);
+      catalog.createNamespace(mixedNs);
+      catalog.createTable(mixed, intSchema);
+      TableIdentifier to = TableIdentifier.of(mixedNs, "u");
+      boolean[] raced = {false};
+      io.injectFaults((location, strategy) -> {
+        if (!raced[0] && location.equals(CATALOG)) {
+          raced[0] = true;
+          racer.renameTable(mixed, to);
+        }
+        return Fault.NONE;
+      });
+
+      assertThatThrownBy(() -> catalog.renameTable(mixed, to))
+          .isInstanceOf(NoSuchTableException.class);
+
+      io.injectFaults((location, strategy) -> Fault.NONE);
+      assertThat(raced[0]).isTrue();
+      assertThat(catalog(io, mode).listTables(mixedNs)).containsExactly(to);
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)
