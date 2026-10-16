@@ -25,6 +25,7 @@ import net.jqwik.api.ForAll;
 import net.jqwik.api.From;
 import net.jqwik.api.Property;
 import net.jqwik.api.Provide;
+import net.jqwik.api.Tuple;
 import net.jqwik.api.statistics.Statistics;
 import org.apache.iceberg.io.CatalogFile;
 import org.apache.iceberg.io.ProtoCatalogFile;
@@ -64,8 +65,9 @@ class TestInvariantProperties {
    */
   @Property
   void p4_wellFormednessPreserved(
-      @ForAll @From("catalogStates") CatalogFile state,
-      @ForAll @From("actionsFor") ProtoCodec.Action action) {
+      @ForAll @From("statesWithActions") Tuple.Tuple2<CatalogFile, ProtoCodec.Action> drawn) {
+    CatalogFile state = drawn.get1();
+    ProtoCodec.Action action = drawn.get2();
     assertThat(WellFormed.check(state))
         .as("generated catalog state must itself be well-formed: %s", state)
         .isTrue();
@@ -89,8 +91,10 @@ class TestInvariantProperties {
     return CatalogStateGenerators.catalogStates();
   }
 
+  /** A state and an action drawn for it (one drawn for another state may verify by chance). */
   @Provide
-  Arbitrary<ProtoCodec.Action> actionsFor() {
-    return catalogStates().flatMap(CatalogStateGenerators::actions);
+  Arbitrary<Tuple.Tuple2<CatalogFile, ProtoCodec.Action>> statesWithActions() {
+    return catalogStates()
+        .flatMap(s -> CatalogStateGenerators.actions(s).map(a -> Tuple.of(s, a)));
   }
 }

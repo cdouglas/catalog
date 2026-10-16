@@ -172,7 +172,12 @@ final class CatalogStateGenerators {
    * {@code nextNamespaceId()}, {@code nextTableId()}.
    */
   static Arbitrary<ProtoCodec.Action> actions(CatalogFile state) {
-    return Arbitraries.randomValue(rng -> {
+    return Arbitraries.randomValue(rng -> action(state, rng));
+  }
+
+  /** An action for {@code state}, drawn with {@code rng}; see {@link #actions}. */
+  static ProtoCodec.Action action(CatalogFile state, java.util.Random rng) {
+    {
       if (!(state instanceof ProtoCatalogFile)) {
         return freshCreateNamespace(rng, state);
       }
@@ -234,7 +239,7 @@ final class CatalogStateGenerators {
           return new ProtoCodec.UpdateTableLocationAction(tblId, tblVersion, newLoc);
         }
       }
-    });
+    }
   }
 
   /**

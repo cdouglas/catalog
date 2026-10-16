@@ -26,6 +26,7 @@ import net.jqwik.api.ForAll;
 import net.jqwik.api.From;
 import net.jqwik.api.Property;
 import net.jqwik.api.Provide;
+import net.jqwik.api.constraints.Size;
 import org.apache.iceberg.io.CatalogFile;
 import org.apache.iceberg.io.ProtoCatalogFile;
 import org.apache.iceberg.io.ProtoCatalogFormatTestSupport;
@@ -42,19 +43,22 @@ import org.apache.iceberg.io.ProtoCodec;
  * an independent model: if the Builder accumulates state that encodes
  * differently from a freshly decoded state, the final bytes differ.
  *
- * <p>Known limitation: {@link #actionLists()} draws each action from its own
- * generated state, so many actions do not apply to the seed.
+ * <p>Each action is drawn for the state it applies to, from one of {@code seeds}. An
+ * action drawn from an unrelated state could pass verify by coincidence (its parent's
+ * version number happening to match) and then add a second namespace of a name the
+ * state has, which no single catalog history can produce.
  */
 class TestCanonicalStateProperty {
 
   @Property(tries = 200)
   void p6_builderStateSurvivesCodec(
       @ForAll @From("catalogStates") CatalogFile seed,
-      @ForAll @From("actionLists") List<ProtoCodec.Action> actions) {
+      @ForAll @Size(min = 1, max = 6) List<Long> seeds) {
     CanonicalState canonical = CanonicalState.from(seed);
     ProtoCatalogFile real = (ProtoCatalogFile) seed;
 
-    for (ProtoCodec.Action a : actions) {
+    for (long actionSeed : seeds) {
+      ProtoCodec.Action a = CatalogStateGenerators.action(real, new java.util.Random(actionSeed));
       ProtoCatalogFile.Builder builder = SpecUtils.stateToBuilder(real);
       if (!a.verify(builder)) {
         continue;
@@ -72,14 +76,5 @@ class TestCanonicalStateProperty {
   @Provide
   Arbitrary<CatalogFile> catalogStates() {
     return CatalogStateGenerators.catalogStates();
-  }
-
-  @Provide
-  Arbitrary<List<ProtoCodec.Action>> actionLists() {
-    return CatalogStateGenerators.catalogStates()
-        .flatMap(CatalogStateGenerators::actions)
-        .list()
-        .ofMinSize(1)
-        .ofMaxSize(6);
   }
 }
