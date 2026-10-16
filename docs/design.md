@@ -265,6 +265,19 @@ manifest and metadata files differ. `TestInlineDifferentialProperties`
 checks this after every step of generated schedules, in each inline
 mode, with tables moving in and out of inline storage (Bugs 50, 51).
 
+### I9. A catalog operation that races others ends as a serial run
+
+A catalog operation -- a namespace create, drop or property change, a
+table create, drop, rename or property change -- depends on what it
+read only through its preconditions, which it checks again when its
+write conflicts. So one whose writes others' operations preceded must
+report what it would have, and leave the catalog as it would, had it
+run after them: return the same value or fail the same way, with the
+same namespaces, properties and tables. `TestCatalogRaceProperties`
+runs one operation with another just before its first write and a
+third just before its second, in mixed modes, against a serial run of
+the same operations on another copy (Bugs 53, 54, 55).
+
 ## Operation × Operation Conflict Matrix
 
 The matrix below falls out of I2 (action versions are bumped on apply)
