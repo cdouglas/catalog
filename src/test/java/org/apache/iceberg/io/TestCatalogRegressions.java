@@ -2691,6 +2691,56 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 42: replay numbers a delta's new snapshots after the base's last
+  // sequence number, in order, and advances next-row-id by their added
+  // rows; the delta carries neither. A transaction that added a snapshot
+  // and expired it before adding another left a gap, so the later
+  // snapshot replayed with a sequence number one lower than its manifests
+  // carry, and the table's last sequence number and next row id fell
+  // behind: the next commit reused them. A commit whose numbers do not
+  // follow now takes full mode. Found by TestInlineDeltaProperties.
+  // ============================================================
+
+  @Nested
+  class SnapshotExpiredInTheTransactionThatAddedIt {
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND_TM", "APPEND_ML"})
+    void leavesItsNumbersUsed(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, mode);
+      catalog.createNamespace(mixedNs);
+      v3(catalog).newFastAppend().appendFile(dataFile("a")).commit();
+
+      org.apache.iceberg.Transaction txn = catalog.loadTable(mixed).newTransaction();
+      txn.newFastAppend().appendFile(dataFile("b")).stageOnly().commit();
+      long staged =
+          ((org.apache.iceberg.HasTableOperations) txn.table()).operations().current()
+              .snapshots().stream()
+              .mapToLong(org.apache.iceberg.Snapshot::snapshotId)
+              .filter(id -> id != txn.table().currentSnapshot().snapshotId())
+              .findFirst()
+              .getAsLong();
+      txn.expireSnapshots().expireSnapshotId(staged).cleanExpiredFiles(false).commit();
+      txn.newFastAppend().appendFile(dataFile("c")).commit();
+      org.apache.iceberg.TableMetadata written =
+          ((org.apache.iceberg.HasTableOperations) txn.table()).operations().current();
+      txn.commitTransaction();
+
+      org.apache.iceberg.TableMetadata read =
+          ((org.apache.iceberg.HasTableOperations) catalog(io, LocalCatalogMode.APPEND)
+                  .loadTable(mixed))
+              .operations()
+              .current();
+      assertThat(read.currentSnapshot().sequenceNumber())
+          .isEqualTo(written.currentSnapshot().sequenceNumber());
+      assertThat(read.lastSequenceNumber()).isEqualTo(written.lastSequenceNumber());
+      assertThat(read.nextRowId()).isEqualTo(written.nextRowId());
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)

@@ -668,6 +668,12 @@ public class InlineDeltaCodec {
     if (!newMeta.refs().keySet().containsAll(oldMeta.refs().keySet())) {
       return null;
     }
+    // Replay numbers the commit's new snapshots after the base's last sequence number, in order,
+    // and advances next-row-id by their added rows. A transaction that also expired a snapshot it
+    // added left a gap, which only full mode carries.
+    if (!sequenceAndRowIdsFollow(oldMeta, newMeta)) {
+      return null;
+    }
     // Replay stamps the snapshot-log entry of a main-branch change with the commit's
     // last-updated-ms. A transaction that moved main and then changed something else (a branch)
     // logged main at the earlier time, which only full mode carries.
@@ -913,6 +919,29 @@ public class InlineDeltaCodec {
             .equals(new java.util.HashSet<>(newMeta.statisticsFiles()))
         || !new java.util.HashSet<>(oldMeta.partitionStatisticsFiles())
             .equals(new java.util.HashSet<>(newMeta.partitionStatisticsFiles()));
+  }
+
+  /**
+   * Whether replay derives {@code newMeta}'s new snapshots' sequence numbers, its last sequence
+   * number and (v3) its next row id from {@code oldMeta}: each new snapshot numbered one after the
+   * one before, from the base's last sequence number, and row ids advanced by their added rows.
+   */
+  private static boolean sequenceAndRowIdsFollow(TableMetadata oldMeta, TableMetadata newMeta) {
+    long sequenceNumber = oldMeta.lastSequenceNumber();
+    long nextRowId = oldMeta.nextRowId();
+    for (org.apache.iceberg.Snapshot s : newMeta.snapshots()) {
+      if (oldMeta.snapshot(s.snapshotId()) != null) {
+        continue;
+      }
+      if (newMeta.formatVersion() >= 2 && s.sequenceNumber() != ++sequenceNumber) {
+        return false;
+      }
+      if (s.addedRows() != null) {
+        nextRowId += s.addedRows();
+      }
+    }
+    return (newMeta.formatVersion() < 2 || newMeta.lastSequenceNumber() == sequenceNumber)
+        && (newMeta.formatVersion() < 3 || newMeta.nextRowId() == nextRowId);
   }
 
   private static boolean refsEqual(
