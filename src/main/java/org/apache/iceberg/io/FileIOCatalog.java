@@ -165,6 +165,11 @@ public class FileIOCatalog extends BaseMetastoreCatalog
   }
 
   @Override
+  public String name() {
+    return catalogName;
+  }
+
+  @Override
   protected Map<String, String> properties() {
     return catalogProperties;
   }

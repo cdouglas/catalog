@@ -47,6 +47,12 @@ fork has since changed both:
   transaction read, not a refresh of it, so a write to a table that
   changed after the transaction read it fails the commit's requirements
   at either isolation level (Bug 23).
+- `BaseCatalogTransaction` knows a table by the identifier it was
+  loaded by. It used to recover the identifier from the table's name:
+  it removed the catalog's name wherever it occurred and split the rest
+  at dots. So a transaction looked up the wrong identifier for a table
+  whose namespace repeated the catalog's name, or had a dot in a level
+  (Bug 59).
 
 So this catalog is not a drop-in replacement in an existing Iceberg
 deployment: anything that implements or calls `commitTransaction` must

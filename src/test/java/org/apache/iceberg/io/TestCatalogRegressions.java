@@ -3633,6 +3633,53 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 59: FileIOCatalog did not override Catalog.name(), whose default
+  // is toString(): a catalog was "FileIOCatalog{}" whatever it was named,
+  // and so began its tables' names ("FileIOCatalog{}.ns.t"), which Iceberg
+  // reports in scan and commit metrics. Overriding it needed a fix in the
+  // iceberg fork first: BaseCatalogTransaction found a table by removing
+  // the catalog's name, wherever it occurred, from the table's, so a
+  // transaction on table t in namespace "c" of catalog "c" ("c.c.t")
+  // looked for a table "t". It now knows a table by the identifier it was
+  // loaded by. Found in a probe's output.
+  // ============================================================
+
+  @Nested
+  class CatalogName {
+
+    @Test
+    void namesTheCatalogAndItsTables() {
+      FileIOCatalog catalog = catalog(new InMemoryAtomicFileIO(), LocalCatalogMode.APPEND);
+      catalog.createNamespace(mixedNs);
+
+      assertThat(catalog.name()).isEqualTo("c");
+      assertThat(catalog.createTable(mixed, intSchema).name()).isEqualTo("c.ns.t");
+      assertThat(catalog.loadTable(mixed).name()).isEqualTo("c.ns.t");
+      assertThat(catalog.loadTable(TableIdentifier.of("ns", "t", "snapshots")).name())
+          .isEqualTo("c.ns.t.snapshots");
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(LocalCatalogMode.class)
+    void commitsATransactionInANamespaceNamedLikeTheCatalog(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, mode);
+      TableIdentifier table = TableIdentifier.of("c", "t");
+      catalog.createNamespace(table.namespace());
+      catalog.createTable(table, intSchema);
+
+      org.apache.iceberg.catalog.CatalogTransaction txn =
+          catalog.createTransaction(
+              org.apache.iceberg.catalog.CatalogTransaction.IsolationLevel.SERIALIZABLE);
+      txn.asCatalog().loadTable(table).newFastAppend().appendFile(dataFile("a")).commit();
+      txn.commitTransaction();
+
+      assertThat(dataFiles(catalog(io, LocalCatalogMode.APPEND).loadTable(table)))
+          .containsExactly(dataFile("a").location());
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)
