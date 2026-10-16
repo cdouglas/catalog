@@ -1854,7 +1854,9 @@ public class ProtoCodec {
       manifest.keyMetadata().duplicate().get(km);
       writeBytes(out, MF_KEY_METADATA, km);
     }
-    if (manifest.firstRowId() != null && manifest.firstRowId() != 0) {
+    // Present whenever the manifest has one: a v3 table's first data manifest starts at row 0,
+    // and an absent first_row_id means its rows have no ids yet.
+    if (manifest.firstRowId() != null) {
       writeVarint64(out, MF_FIRST_ROW_ID, manifest.firstRowId());
     }
 

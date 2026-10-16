@@ -146,7 +146,7 @@ inline ones out first).
 
 Whether a snapshot's list is inline or a file, and whichever writer
 reads it, it lists the same manifests with the same entries (sequence
-numbers, spec, adding snapshot, counts). A commit sends
+numbers, spec, adding snapshot, counts, first row id). A commit sends
 the lists of only the snapshots it adds, taken from the snapshots
 themselves. Eviction writes inline lists to files unchanged; a new
 inline snapshot on a parent whose list is a file carries its whole

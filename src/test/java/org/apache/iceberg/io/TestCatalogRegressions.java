@@ -2370,10 +2370,51 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 34: a manifest list entry's first_row_id was stored only when not
+  // zero, so the first data manifest of a v3 table, whose rows start at 0,
+  // lost it: read inline, its files had no row ids, and a manifest list
+  // file written for it (by a pointer writer or an eviction) gave it a new
+  // range, which a later manifest's already held. The entry now stores
+  // first_row_id whenever the manifest has one. Found by
+  // TestCatalogFaultProperties with v3 tables.
+  // ============================================================
+
+  @Nested
+  class V3FirstManifest {
+
+    @Test
+    void keepsItsRowIds() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog ml = catalog(io, LocalCatalogMode.APPEND_ML);
+      FileIOCatalog pointer = catalog(io, LocalCatalogMode.APPEND);
+      ml.createNamespace(mixedNs);
+      v3(ml).newFastAppend().appendFile(dataFile("a")).commit();
+      ml.loadTable(mixed).newFastAppend().appendFile(dataFile("b")).commit();
+      Map<String, Long> expected = Map.of("mem:///data/a.parquet", 0L, "mem:///data/b.parquet", 1L);
+      assertThat(rowIds(ml.loadTable(mixed))).as("inline").isEqualTo(expected);
+
+      pointer.loadTable(mixed).updateProperties().set("k", "v").commit();
+
+      assertThat(rowIds(ml.loadTable(mixed))).as("manifest list files").isEqualTo(expected);
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)
         .withProperty(org.apache.iceberg.TableProperties.FORMAT_VERSION, "3")
         .create();
+  }
+
+  private static Map<String, Long> rowIds(Table table) {
+    Map<String, Long> ids = new HashMap<>();
+    try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.FileScanTask> tasks =
+        table.newScan().planFiles()) {
+      tasks.forEach(task -> ids.put(task.file().location(), task.file().firstRowId()));
+    } catch (IOException e) {
+      throw new java.io.UncheckedIOException(e);
+    }
+    return ids;
   }
 }

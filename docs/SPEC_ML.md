@@ -85,7 +85,7 @@ message ManifestFileEntry {
   int64  deleted_rows_count     = 13;
   repeated PartitionFieldSummaryEntry partitions = 14;
   bytes  key_metadata           = 15;
-  int64  first_row_id           = 16;
+  int64  first_row_id           = 16;  // present whenever set, 0 included
 }
 
 message PartitionFieldSummaryEntry {
