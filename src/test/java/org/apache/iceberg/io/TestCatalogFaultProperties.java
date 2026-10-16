@@ -77,7 +77,8 @@ import org.apache.iceberg.types.Types;
  * <p>A generated schedule runs, on one thread, operations by several writers, each with its own
  * catalog instance and table handles over shared {@link InMemoryAtomicFileIO} storage: fast and
  * merge appends, deletes, property and schema changes, table transactions, snapshot expiry,
- * manifest rewrites, table create / drop / rename, and multi-table catalog transactions whose
+ * manifest rewrites, table create / drop / rename, upgrades from format v2 to v3, and multi-table
+ * catalog transactions whose
  * loads, appends and commit are separate steps, so other writers' operations run in between. A
  * command may also preempt the one before it: it runs to completion just before one of that
  * operation's reads of the catalog or its first conditional write, so the two race. Each writer
@@ -94,8 +95,10 @@ import org.apache.iceberg.types.Types;
  * also be strict about versions, as it is in practice: a read pinned to a replaced version fails
  * (see {@link InMemoryAtomicFileIO#failSupersededReads}).
  *
- * <p>A model holds each table's UUID, live data files, properties and added columns. After every
- * operation the catalog, read back without faults, must match it:
+ * <p>Tables are created in format v2 or v3; v3 tables do not merge manifests, which in Iceberg
+ * core renumbers existing rows (see {@code V3_PROPERTIES}). A model holds each table's UUID, format version, live
+ * data files, properties and added columns. After every operation the catalog, read back without
+ * faults, must match it:
  *
  * <ul>
  *   <li>An acknowledged operation took effect once, and nothing else changed.
@@ -108,6 +111,9 @@ import org.apache.iceberg.types.Types;
  *       and in a metadata file.
  *   <li>Every version of the catalog file that a writer wrote reads the same as a checkpoint of
  *       it, which the next compaction would write (see {@link CheckpointRoundTrip}).
+ *   <li>Row lineage, in a v3 table: once a snapshot has row ids, every live data file has them; the
+ *       files' ranges are disjoint and below the table's next row id; a file's first row id never
+ *       changes, nor do a snapshot's first row id and added rows.
  *   <li>An acknowledged catalog transaction saw no concurrent change it must not miss: under
  *       serializable isolation, to the main branch (or, without one, the metadata) of any table it
  *       loaded; under snapshot isolation, to the main branch of any table it appended to.
@@ -140,6 +146,12 @@ class TestCatalogFaultProperties {
           "true",
           CatalogProperties.TABLE_DEFAULT_PREFIX + TableProperties.METADATA_PREVIOUS_VERSIONS_MAX,
           "2");
+
+  // Iceberg core gives an existing data file a new first row id when a delete merges the manifest
+  // it rewrote into others (a v3 spec violation, also without this catalog), so v3 tables do not
+  // merge manifests.
+  private static final Map<String, String> V3_PROPERTIES =
+      Map.of(TableProperties.MANIFEST_MERGE_ENABLED, "false");
 
   // A command's writeFaults operand picks the faults for its first two conditional writes, by its
   // remainder and quotient mod 12; later writes succeed.
@@ -209,6 +221,7 @@ class TestCatalogFaultProperties {
             Tuple.of(1, Kind.SET_BIG_PROPERTY),
             Tuple.of(1, Kind.REMOVE_PROPERTY),
             Tuple.of(2, Kind.ADD_COLUMN),
+            Tuple.of(1, Kind.UPGRADE_TABLE),
             Tuple.of(2, Kind.TABLE_TXN),
             Tuple.of(1, Kind.EXPIRE_SNAPSHOTS),
             Tuple.of(1, Kind.REWRITE_MANIFESTS),
@@ -246,6 +259,7 @@ class TestCatalogFaultProperties {
   // ============================================================
 
   enum Kind {
+    /** Creates a table in format v2 or v3, as {@code b} picks. */
     CREATE_TABLE,
     DROP_TABLE,
     RENAME_TABLE,
@@ -261,6 +275,8 @@ class TestCatalogFaultProperties {
     SET_BIG_PROPERTY,
     REMOVE_PROPERTY,
     ADD_COLUMN,
+    /** Upgrades a table to format v3; a v3 table is unchanged. */
+    UPGRADE_TABLE,
     TABLE_TXN,
     EXPIRE_SNAPSHOTS,
     REWRITE_MANIFESTS,
@@ -337,6 +353,7 @@ class TestCatalogFaultProperties {
   /** What the model tracks of a table, and what it observed of it at the last check. */
   static final class TableState {
     final String uuid;
+    int formatVersion;
     final List<String> files = new ArrayList<>();
     final Map<String, String> props = new TreeMap<>();
     final Set<String> columns = new TreeSet<>();
@@ -344,12 +361,13 @@ class TestCatalogFaultProperties {
     Long snapshotId = null;
     String metadataLocation = null;
 
-    TableState(String uuid) {
+    TableState(String uuid, int formatVersion) {
       this.uuid = uuid;
+      this.formatVersion = formatVersion;
     }
 
     TableState copy() {
-      TableState copy = new TableState(uuid);
+      TableState copy = new TableState(uuid, formatVersion);
       copy.files.addAll(files);
       copy.props.putAll(props);
       copy.columns.addAll(columns);
@@ -369,8 +387,8 @@ class TestCatalogFaultProperties {
       Map<String, String> shown = new TreeMap<>();
       props.forEach((k, v) -> shown.put(k, abbreviate(v)));
       return String.format(
-          "{uuid=%s files=%s props=%s columns=%s}",
-          uuid.substring(0, 8), sortedFiles(), shown, columns);
+          "{uuid=%s v%d files=%s props=%s columns=%s}",
+          uuid.substring(0, 8), formatVersion, sortedFiles(), shown, columns);
     }
   }
 
@@ -396,6 +414,7 @@ class TestCatalogFaultProperties {
       TableState e = expected.get(id);
       TableState a = actual.get(id);
       if (!e.uuid.equals(a.uuid)
+          || e.formatVersion != a.formatVersion
           || !e.sortedFiles().equals(a.sortedFiles())
           || !e.props.equals(a.props)
           || !e.columns.equals(a.columns)) {
@@ -502,11 +521,14 @@ class TestCatalogFaultProperties {
     private final StringBuilder trace = new StringBuilder();
     private int nextFile = 0;
     private int nextValue = 0;
-    // Each snapshot's manifest list when first seen, by table UUID and snapshot id: a committed
-    // snapshot never changes, whether its list is inline or a file, and whichever writer reads it.
+    // Each snapshot's fields and manifest list when first seen, by table UUID and snapshot id: a
+    // committed snapshot never changes, whether its list is inline or a file, and whichever writer
+    // reads it.
     private final Map<String, Map<Long, List<String>>> manifestLists = new HashMap<>();
     // Each table's storage at the last check, by UUID: inline or a metadata file.
     private final Map<String, String> storage = new HashMap<>();
+    // Each data file's first row id when first seen with one, by table UUID: row ids never change.
+    private final Map<String, Map<String, Long>> rowIds = new HashMap<>();
     // Conditional writes whose catalog file has been checked against a checkpoint of it.
     private int checkedWrites = 0;
 
@@ -539,8 +561,8 @@ class TestCatalogFaultProperties {
       this.checker = LocalCatalogMode.APPEND.catalog(io, WAREHOUSE, CATALOG_NAME, properties);
       FileIOCatalog seed = this.writers[0].catalog;
       seed.createNamespace(NS);
-      seed.createTable(TABLES.get(0), SCHEMA);
-      seed.createTable(TABLES.get(1), SCHEMA).newFastAppend().appendFile(newFile()).commit();
+      create(seed, TABLES.get(0), 3);
+      create(seed, TABLES.get(1), 2).newFastAppend().appendFile(newFile()).commit();
       this.model = actual();
       trace.append(String.format("modes %s, max update size %d%s%nseed: %s%n", modes,
           maxUpdateSize, strictVersions ? ", strict versions" : "", model));
@@ -659,6 +681,14 @@ class TestCatalogFaultProperties {
           .build();
     }
 
+    private static Table create(Catalog catalog, TableIdentifier id, int formatVersion) {
+      Catalog.TableBuilder builder =
+          catalog
+              .buildTable(id, SCHEMA)
+              .withProperty(TableProperties.FORMAT_VERSION, String.valueOf(formatVersion));
+      return (formatVersion >= 3 ? builder.withProperties(V3_PROPERTIES) : builder).create();
+    }
+
     private TableIdentifier pickTable(int index) {
       List<TableIdentifier> tables = new ArrayList<>(model.keySet());
       return index >= 8 || tables.isEmpty()
@@ -687,14 +717,15 @@ class TestCatalogFaultProperties {
               cmd.a >= 8 || missing.isEmpty()
                   ? TABLES.get(cmd.a % TABLES.size())
                   : missing.get(cmd.a % missing.size());
+          int version = 2 + cmd.b % 2;
           return new Op(
-              "createTable(" + created + ")",
-              () -> w.catalog.createTable(created, SCHEMA),
+              "createTable(" + created + ", v" + version + ")",
+              () -> create(w.catalog, created, version),
               (m, actual) -> {
                 if (m.containsKey(created) || !actual.containsKey(created)) {
                   throw new IllegalStateException("cannot create " + created);
                 }
-                m.put(created, new TableState(actual.get(created).uuid));
+                m.put(created, new TableState(actual.get(created).uuid, version));
               });
         case DROP_TABLE:
           return new Op(
@@ -778,6 +809,18 @@ class TestCatalogFaultProperties {
                       .addColumn(column, Types.IntegerType.get())
                       .commit(),
               (m, actual) -> existing(m, id).columns.add(column));
+        case UPGRADE_TABLE:
+          return new Op(
+              "upgrade(" + id + ", v3)",
+              () -> {
+                org.apache.iceberg.UpdateProperties update =
+                    handle(w, id, cmd.fresh)
+                        .updateProperties()
+                        .set(TableProperties.FORMAT_VERSION, "3");
+                V3_PROPERTIES.forEach(update::set);
+                update.commit();
+              },
+              (m, actual) -> existing(m, id).formatVersion = 3);
         case TABLE_TXN:
           DataFile txnFile = newFile();
           String txnKey = KEYS.get(cmd.b % KEYS.size());
@@ -1011,7 +1054,15 @@ class TestCatalogFaultProperties {
       for (; checkedWrites < history.size(); checkedWrites++) {
         InMemoryAtomicFileIO.Write write = history.get(checkedWrites);
         if (write.location().equals(CATALOG_LOCATION)) {
-          String difference = CheckpointRoundTrip.difference(write.after());
+          String difference;
+          try {
+            difference = CheckpointRoundTrip.difference(write.after());
+          } catch (RuntimeException e) {
+            AssertionError error = fail("catalog write #%d (%s) does not replay: %s",
+                checkedWrites, write.strategy(), e);
+            error.initCause(e);
+            throw error;
+          }
           check(difference == null,
               "a checkpoint of catalog write #%d (%s) differs from it: %s",
               checkedWrites, write.strategy(), difference);
@@ -1021,8 +1072,9 @@ class TestCatalogFaultProperties {
 
     /**
      * The catalog's state, read without faults; fails if a table does not load whole, if a table
-     * is stored both inline and in a metadata file, if a snapshot's manifest list changed, or if a
-     * catalog file written since the last check differs from a checkpoint of it.
+     * is stored both inline and in a metadata file, if a snapshot's manifest list or row ids
+     * changed, if a v3 table's row ids are missing or overlap, or if a catalog file written since
+     * the last check differs from a checkpoint of it.
      */
     private Map<TableIdentifier, TableState> actual() {
       checkCheckpoints();
@@ -1034,7 +1086,7 @@ class TestCatalogFaultProperties {
         try {
           Table table = checker.loadTable(id);
           TableMetadata metadata = ((HasTableOperations) table).operations().current();
-          state = new TableState(metadata.uuid());
+          state = new TableState(metadata.uuid(), metadata.formatVersion());
           check(file.location(id) == null || !file.isInlineTable(id),
               "%s has both a metadata file and inline metadata", id);
           String stored = file.isInlineTable(id) ? "inline" : "metadata file";
@@ -1042,6 +1094,9 @@ class TestCatalogFaultProperties {
           if (before != null && !before.equals(stored)) {
             Statistics.label("storage change").collect(before + " -> " + stored);
           }
+          Statistics.label("tables read").collect(
+              String.format("v%d %s%s", metadata.formatVersion(), stored,
+                  table.currentSnapshot() == null ? ", no snapshot" : ""));
           Map<Long, List<String>> lists =
               manifestLists.computeIfAbsent(metadata.uuid(), k -> new HashMap<>());
           for (Snapshot snapshot : table.snapshots()) {
@@ -1050,6 +1105,11 @@ class TestCatalogFaultProperties {
                     : io.newInputFile(list).exists(),
                 "%s: snapshot %d has no manifest list: %s", id, snapshot.snapshotId(), list);
             List<String> manifests = new ArrayList<>();
+            manifests.add(String.format(
+                "seq=%d parent=%s ts=%d op=%s schema=%s first-row-id=%s added-rows=%s summary=%s",
+                snapshot.sequenceNumber(), snapshot.parentId(), snapshot.timestampMillis(),
+                snapshot.operation(), snapshot.schemaId(), snapshot.firstRowId(),
+                snapshot.addedRows(), new TreeMap<>(snapshot.summary())));
             for (ManifestFile manifest : snapshot.allManifests(io)) {
               check(io.newInputFile(manifest.path()).exists(),
                   "%s: snapshot %d references missing manifest %s",
@@ -1061,11 +1121,14 @@ class TestCatalogFaultProperties {
                 "%s: the manifest list of snapshot %d changed from %s to %s",
                 id, snapshot.snapshotId(), first, manifests);
           }
+          List<DataFile> live = new ArrayList<>();
           try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
             for (FileScanTask task : tasks) {
               state.files.add(task.file().location());
+              live.add(task.file());
             }
           }
+          checkRowLineage(id, metadata, table.currentSnapshot(), live);
           table.properties().forEach((k, v) -> {
             if (k.startsWith(KEY_PREFIX)) {
               state.props.put(k, v);
@@ -1089,12 +1152,52 @@ class TestCatalogFaultProperties {
       return tables;
     }
 
+    /**
+     * Checks the row ids of a table's live data files: in a v3 table whose current snapshot has
+     * row ids, every file has them, and their ranges are disjoint and below the next row id. In
+     * any table, a file's first row id never changes once it has one.
+     */
+    private void checkRowLineage(
+        TableIdentifier id, TableMetadata metadata, Snapshot current, List<DataFile> live) {
+      Map<String, Long> seen = rowIds.computeIfAbsent(metadata.uuid(), k -> new HashMap<>());
+      for (DataFile f : live) {
+        if (f.firstRowId() != null) {
+          Long first = seen.putIfAbsent(f.location(), f.firstRowId());
+          check(first == null || first.equals(f.firstRowId()),
+              "%s: the first row id of %s changed from %d to %d",
+              id, f.location(), first, f.firstRowId());
+        }
+      }
+      if (metadata.formatVersion() < 3 || current == null || current.firstRowId() == null) {
+        return; // no row ids yet: a table upgraded to v3 gets them with its next snapshot
+      }
+      List<DataFile> byFirstRowId = new ArrayList<>();
+      for (DataFile f : live) {
+        check(f.firstRowId() != null, "%s: %s has no row ids in snapshot %d",
+            id, f.location(), current.snapshotId());
+        byFirstRowId.add(f);
+      }
+      byFirstRowId.sort(Comparator.comparing(DataFile::firstRowId));
+      long next = 0;
+      String previous = null;
+      for (DataFile f : byFirstRowId) {
+        check(f.firstRowId() >= next, "%s: the row ids of %s and %s overlap (%d < %d)",
+            id, previous, f.location(), f.firstRowId(), next);
+        next = f.firstRowId() + f.recordCount();
+        previous = f.location();
+      }
+      check(next <= metadata.nextRowId(), "%s: row ids up to %d, but the next row id is %d",
+          id, next, metadata.nextRowId());
+      Statistics.label("row ids checked").collect(live.isEmpty() ? "no files" : "files");
+    }
+
     private static String describe(ManifestFile m) {
-      return String.format("%s(%s spec=%d seq=%d/%d snap=%d files=%d/%d/%d rows=%d/%d/%d)",
+      return String.format(
+          "%s(%s spec=%d seq=%d/%d snap=%d files=%d/%d/%d rows=%d/%d/%d first-row-id=%s)",
           m.path().substring(m.path().lastIndexOf('/') + 1), m.content(), m.partitionSpecId(),
           m.sequenceNumber(), m.minSequenceNumber(), m.snapshotId(),
           m.addedFilesCount(), m.existingFilesCount(), m.deletedFilesCount(),
-          m.addedRowsCount(), m.existingRowsCount(), m.deletedRowsCount());
+          m.addedRowsCount(), m.existingRowsCount(), m.deletedRowsCount(), m.firstRowId());
     }
 
     private AssertionError unexpected(RuntimeException e) {

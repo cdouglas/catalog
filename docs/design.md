@@ -150,7 +150,8 @@ numbers, spec, adding snapshot, counts, first row id). A commit sends
 the lists of only the snapshots it adds, taken from the snapshots
 themselves. Eviction writes inline lists to files unchanged; a new
 inline snapshot on a parent whose list is a file carries its whole
-list. `TestCatalogFaultProperties` checks this after every operation.
+list. `TestCatalogFaultProperties` checks this after every operation,
+and in v3 tables that a data file's row ids never change.
 
 ### I4. Inline replay is byte-stable
 
