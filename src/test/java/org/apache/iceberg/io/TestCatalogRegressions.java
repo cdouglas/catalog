@@ -2642,6 +2642,55 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 41: an inline delta stores each new snapshot's timestamp relative
+  // to the base's last-updated-ms, and replay resolved it against the
+  // metadata as the delta's earlier updates left it, whose last-updated-ms
+  // the first new snapshot had moved: a commit's later snapshots replayed
+  // at the wrong times. Replay also stamps the snapshot-log entry of a
+  // main-branch change with the commit's last-updated-ms, which is not the
+  // time main moved in a transaction that changed a branch after it. Both
+  // are now exact: timestamps resolve against the delta's base, and a
+  // commit whose log entry has another time takes full mode. Found by
+  // TestInlineDeltaProperties.
+  // ============================================================
+
+  @Nested
+  class TimesInACommitOfSeveralChanges {
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND_TM", "APPEND_ML"})
+    void replayAsWritten(LocalCatalogMode mode) throws InterruptedException {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, mode);
+      catalog.createNamespace(mixedNs);
+      catalog.createTable(mixed, intSchema).newFastAppend().appendFile(dataFile("a")).commit();
+
+      org.apache.iceberg.Transaction txn = catalog.loadTable(mixed).newTransaction();
+      txn.newFastAppend().appendFile(dataFile("b")).commit();
+      Thread.sleep(5);
+      txn.newFastAppend().appendFile(dataFile("c")).commit();
+      Thread.sleep(5);
+      txn.newFastAppend().appendFile(dataFile("d")).toBranch("b").commit();
+      org.apache.iceberg.TableMetadata written =
+          ((org.apache.iceberg.HasTableOperations) txn.table()).operations().current();
+      txn.commitTransaction();
+
+      org.apache.iceberg.TableMetadata read =
+          ((org.apache.iceberg.HasTableOperations) catalog(io, LocalCatalogMode.APPEND)
+                  .loadTable(mixed))
+              .operations()
+              .current();
+      for (org.apache.iceberg.Snapshot s : written.snapshots()) {
+        assertThat(read.snapshot(s.snapshotId()).timestampMillis())
+            .as("snapshot %d", s.snapshotId())
+            .isEqualTo(s.timestampMillis());
+      }
+      assertThat(read.snapshotLog()).isEqualTo(written.snapshotLog());
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)

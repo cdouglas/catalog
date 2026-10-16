@@ -96,7 +96,7 @@ for framing):
 | Mode        | Payload                            | When used                                   |
 |-------------|------------------------------------|---------------------------------------------|
 | **Delta**   | Structured `TableMetadataDelta`    | The table is inline (common path for data commits and DDL) |
-| **Full**    | Complete encoded `TableMetadata`   | No delta: the table is a pointer table (re-inlining), the delta does not fit, or `computeDelta` cannot express the change (a format-version upgrade, a removed ref, a statistics change, an id collision) |
+| **Full**    | Complete encoded `TableMetadata`   | No delta: the table is a pointer table (re-inlining), the delta does not fit, or `computeDelta` cannot express the change (a format-version upgrade, a removed ref, a statistics change, an id collision, a snapshot-log entry not at the commit's last-updated-ms) |
 | **Pointer** | Metadata file location (`UpdateTableLocation`) | Neither fits: the table leaves inline storage (eviction) |
 
 Manifest updates of new inline-ML snapshots count toward the payload

@@ -280,7 +280,7 @@ public class InlineDeltaCodec {
       if (update instanceof AddSnapshotUpdate) {
         // Route through the prefix-accepting overload (avoids the throw in applyTo(Builder))
         AddSnapshotUpdate addSnap = (AddSnapshotUpdate) update;
-        current = addSnap.applyTo(current, prefix);
+        current = addSnap.applyTo(current, prefix, base.lastUpdatedMillis());
         addedInThisDelta.add(addSnap.snapshotId);
         // Inline-ML snapshots (empty suffix → `inline://<snapId>` sentinel) must
         // have a pool entry, otherwise wrapInlineManifests treats the sentinel as
@@ -666,6 +666,14 @@ public class InlineDeltaCodec {
     }
     // Nor has a removed ref (a replace transaction's main branch, removeBranch, removeTag).
     if (!newMeta.refs().keySet().containsAll(oldMeta.refs().keySet())) {
+      return null;
+    }
+    // Replay stamps the snapshot-log entry of a main-branch change with the commit's
+    // last-updated-ms. A transaction that moved main and then changed something else (a branch)
+    // logged main at the earlier time, which only full mode carries.
+    List<org.apache.iceberg.HistoryEntry> log = newMeta.snapshotLog();
+    if (!log.equals(oldMeta.snapshotLog()) && !log.isEmpty()
+        && log.get(log.size() - 1).timestampMillis() != newMeta.lastUpdatedMillis()) {
       return null;
     }
     List<DeltaUpdate> updates = new ArrayList<>();
@@ -1308,6 +1316,17 @@ public class InlineDeltaCodec {
      * Requires the manifest list prefix from the inline table's checkpoint entry.
      */
     public TableMetadata applyTo(TableMetadata base, String manifestListPrefix) {
+      return applyTo(base, manifestListPrefix, base.lastUpdatedMillis());
+    }
+
+    /**
+     * Adds the snapshot to {@code base}, which may already hold the delta's earlier updates. Its
+     * timestamp is relative to {@code deltaBaseUpdatedMillis}, the last-updated-ms of the metadata
+     * the delta was computed against: adding a snapshot moves last-updated-ms, so a commit's later
+     * snapshots resolved against {@code base} would get the wrong time.
+     */
+    public TableMetadata applyTo(
+        TableMetadata base, String manifestListPrefix, long deltaBaseUpdatedMillis) {
       // v1 tables don't carry sequence numbers; TableMetadata's constructor rejects
       // any non-zero value. Synthesize seqNum only for v2+.
       long seqNum = base.formatVersion() >= 2 ? base.lastSequenceNumber() + 1 : 0;
@@ -1320,7 +1339,7 @@ public class InlineDeltaCodec {
       // the manifest carry-forward in applyDeltaWithManifests inherit the
       // prior snapshot's manifest list into the replacement.
       Long resolvedParentId = parentSnapshotId;
-      long timestamp = base.lastUpdatedMillis() + timestampDeltaMs;
+      long timestamp = deltaBaseUpdatedMillis + timestampDeltaMs;
       Integer resolvedSchemaId = schemaId != null ? schemaId : base.currentSchemaId();
       // For inline-ML snapshots (empty suffix), the manifest-list location is a
       // sentinel; the inline-ML read path swaps the BaseSnapshot for an
