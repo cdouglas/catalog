@@ -3190,6 +3190,127 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 53: FileIOCatalog's namespace operations and renameTable committed
+  // once. Each record names the versions it read -- of its namespace, of
+  // the parent of a namespace it creates or drops, of a table it renames --
+  // and any change there bumps them: a table created in the namespace, a
+  // sibling namespace created, its properties set. Such a race failed the
+  // operation with CommitFailedException, though it depends on nothing the
+  // other changed (two writers creating top-level namespaces at once), and
+  // setProperties and removeProperties instead returned false, which
+  // callers such as Spark ignore: the update was lost. Each now retries on
+  // a fresh read, where it checks existence again. Found by reading
+  // setProperties.
+  // ============================================================
+
+  @Nested
+  class CatalogOperationsRacingAChange {
+
+    private final Namespace other = Namespace.of("other");
+
+    /** Runs {@code race} on another catalog just before {@code catalog}'s next write. */
+    private void before(InMemoryAtomicFileIO io, java.util.function.Consumer<FileIOCatalog> race,
+        LocalCatalogMode mode, boolean[] raced) {
+      FileIOCatalog racer = catalog(io, mode);
+      io.injectFaults((location, strategy) -> {
+        if (!raced[0] && location.equals(CATALOG)) {
+          raced[0] = true;
+          race.accept(racer);
+        }
+        return Fault.NONE;
+      });
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND", "CAS"})
+    void setAndRemoveProperties(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, mode);
+      catalog.createNamespace(mixedNs, Map.of("old", "v"));
+      boolean[] raced = {false};
+      before(io, c -> c.createTable(TableIdentifier.of(mixedNs, "a"), intSchema), mode, raced);
+      assertThat(catalog.setProperties(mixedNs, Map.of("k", "v"))).isTrue();
+      assertThat(raced[0]).isTrue();
+
+      raced[0] = false;
+      before(io, c -> c.createTable(TableIdentifier.of(mixedNs, "b"), intSchema), mode, raced);
+      assertThat(catalog.removeProperties(mixedNs, java.util.Set.of("old"))).isTrue();
+      assertThat(raced[0]).isTrue();
+
+      assertThat(catalog(io, mode).loadNamespaceMetadata(mixedNs)).isEqualTo(Map.of("k", "v"));
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND", "CAS"})
+    void createAndDropNamespaces(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, mode);
+      boolean[] raced = {false};
+      before(io, c -> c.createNamespace(other), mode, raced);
+      catalog.createNamespace(mixedNs);
+      assertThat(raced[0]).isTrue();
+
+      raced[0] = false;
+      before(io, c -> c.setProperties(mixedNs, Map.of("k", "v")), mode, raced);
+      assertThat(catalog.dropNamespace(mixedNs)).isTrue();
+      assertThat(raced[0]).isTrue();
+
+      assertThat(catalog(io, mode).listNamespaces(Namespace.empty())).containsExactly(other);
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND", "CAS"})
+    void renameTable(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, mode);
+      catalog.createNamespace(mixedNs);
+      catalog.createNamespace(other);
+      catalog.createTable(mixed, intSchema);
+      boolean[] raced = {false};
+      before(io, c -> c.createTable(TableIdentifier.of(other, "a"), intSchema), mode, raced);
+
+      catalog.renameTable(mixed, TableIdentifier.of(other, "t"));
+
+      assertThat(raced[0]).isTrue();
+      assertThat(catalog(io, mode).listTables(other))
+          .containsExactly(TableIdentifier.of(other, "a"), TableIdentifier.of(other, "t"));
+    }
+
+    /** A retry checks existence again: a race the operation does depend on still fails it. */
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND", "CAS"})
+    void failOnARaceTheyDependOn(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, mode);
+      boolean[] raced = {false};
+      before(io, c -> c.createNamespace(mixedNs), mode, raced);
+      assertThatThrownBy(() -> catalog.createNamespace(mixedNs))
+          .isInstanceOf(AlreadyExistsException.class);
+
+      raced[0] = false;
+      before(io, c -> c.createTable(mixed, intSchema), mode, raced);
+      assertThatThrownBy(() -> catalog.dropNamespace(mixedNs))
+          .isInstanceOf(NamespaceNotEmptyException.class);
+
+      catalog.createNamespace(other);
+      raced[0] = false;
+      before(io, c -> c.dropNamespace(other), mode, raced);
+      assertThatThrownBy(() -> catalog.setProperties(other, Map.of("k", "v")))
+          .isInstanceOf(NoSuchNamespaceException.class);
+
+      raced[0] = false;
+      before(io, c -> c.createTable(TableIdentifier.of(mixedNs, "u"), intSchema), mode, raced);
+      assertThatThrownBy(() -> catalog.renameTable(mixed, TableIdentifier.of(mixedNs, "u")))
+          .isInstanceOf(AlreadyExistsException.class);
+      assertThat(raced[0]).isTrue();
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)

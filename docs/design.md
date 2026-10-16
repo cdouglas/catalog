@@ -319,6 +319,11 @@ What the matrix says:
 5. The root is a parent like any other: an ordinary namespace row with
    id 0, so top-level creates and drops serialize on its version. It
    cannot be named, created, or dropped (SPEC.md §State Model).
+6. A conflict fails the record, not the operation: Iceberg re-applies a
+   table commit on a fresh read, and FileIOCatalog re-applies a catalog
+   operation -- a namespace create, drop or property change, a table
+   rename or drop -- which depends on nothing a concurrent change alters
+   but existence, checked again on the fresh read (Bugs 47, 53).
 
 ## Late-Binding
 

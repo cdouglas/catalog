@@ -24,6 +24,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.apache.iceberg.ManifestListSink;
 import org.apache.iceberg.ManifestListSink.ManifestListDelta;
@@ -239,9 +240,29 @@ public class FileIOCatalog extends BaseMetastoreCatalog
 
   @Override
   public void renameTable(TableIdentifier from, TableIdentifier to) {
+    commitOnAFreshRead(catalogFile -> format.from(catalogFile).renameTable(from, to));
+  }
+
+  /**
+   * Commits what {@code stage} stages on a fresh read of the catalog, and on another if it
+   * conflicts with a concurrent change. A catalog operation does not depend on what its caller
+   * read, but its record names the versions it read: of its namespace, or of the parent of one it
+   * creates or drops, which any change there bumps (a table created in it, a sibling created, its
+   * properties set), and of a table it renames. {@code stage} checks existence on each read.
+   * Throws the conflict after Iceberg's default number of attempts.
+   */
+  private void commitOnAFreshRead(Function<CatalogFile, CatalogFile.Mut<?, ?>> stage) {
     final InputFile catalog = fileIO.newInputFile(catalogLocation);
-    final CatalogFile catalogFile = format.read(fileIO, catalog);
-    format.from(catalogFile).renameTable(from, to).commit(fileIO);
+    for (int attempt = 1; ; attempt++) {
+      try {
+        stage.apply(format.read(fileIO, catalog)).commit(fileIO);
+        return;
+      } catch (CommitFailedException e) {
+        if (attempt >= org.apache.iceberg.TableProperties.COMMIT_NUM_RETRIES_DEFAULT + 1) {
+          throw e;
+        }
+      }
+    }
   }
 
   @Override
@@ -372,9 +393,8 @@ public class FileIOCatalog extends BaseMetastoreCatalog
 
   @Override
   public void createNamespace(Namespace namespace, Map<String, String> metadata) {
-    final InputFile catalog = fileIO.newInputFile(catalogLocation);
-    final CatalogFile catalogFile = format.read(fileIO, catalog);
-    format.from(catalogFile).createNamespace(namespace, metadata).commit(fileIO);
+    commitOnAFreshRead(
+        catalogFile -> format.from(catalogFile).createNamespace(namespace, metadata));
   }
 
   @Override
@@ -412,15 +432,10 @@ public class FileIOCatalog extends BaseMetastoreCatalog
 
   @Override
   public boolean dropNamespace(Namespace namespace) throws NamespaceNotEmptyException {
-    final InputFile catalog = fileIO.newInputFile(catalogLocation);
-    // XXX TODO wait, wtf?
-    //     TODO catalog ops must also follow the refresh cycle, or only TableOperations detect
-    // concurrent changes?
-    final CatalogFile catalogFile = format.read(fileIO, catalog);
     try {
-      format.from(catalogFile).dropNamespace(namespace).commit(fileIO);
+      commitOnAFreshRead(catalogFile -> format.from(catalogFile).dropNamespace(namespace));
     } catch (NoSuchNamespaceException e) {
-      return false; // sigh.
+      return false;
     }
     return true;
   }
@@ -428,12 +443,8 @@ public class FileIOCatalog extends BaseMetastoreCatalog
   @Override
   public boolean setProperties(Namespace namespace, Map<String, String> properties)
       throws NoSuchNamespaceException {
-    final CatalogFile catalogFile = getCatalogFile();
-    try {
-      format.from(catalogFile).updateProperties(namespace, properties).commit(fileIO);
-    } catch (CommitFailedException e) {
-      return false; // sigh.
-    }
+    commitOnAFreshRead(
+        catalogFile -> format.from(catalogFile).updateProperties(namespace, properties));
     return true;
   }
 
