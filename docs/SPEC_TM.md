@@ -385,7 +385,7 @@ this at the top of the diff and returns `null`, which the commit
 routes to **full mode**. Full mode serializes the new TM verbatim, so
 the collision resolves naturally on the next read.
 
-For an **inline-ML** table, full mode carries the staged manifest-list
+For an **inline-ML** table, full mode carries the new snapshots' manifest-list
 updates in its `ml_delta` payload, so the new snapshots' lists land
 atomically with the TM replacement; pointer mode writes them to Avro
 files (see [SPEC_ML.md](SPEC_ML.md) §"Writers in Different Modes").
@@ -405,7 +405,7 @@ files (see [SPEC_ML.md](SPEC_ML.md) §"Writers in Different Modes").
 
 ```
 function stageCreate(mut, metadata):                   # base == null
-    manifests = manifestUpdates(staged, metadata)       # null: no inline-ML snapshot
+    manifests = manifestUpdates(null, metadata)         # null: no inline-ML snapshot
     bytes = codec.encode(rewriteInlineSnapshotsToSentinels(metadata))
     if inline and size(bytes, manifests) <= maxUpdateSize:
         mut.createTableInlineWithManifests(tableId, bytes, codec.tag(), manifests)
@@ -414,7 +414,7 @@ function stageCreate(mut, metadata):                   # base == null
 
 function stageUpdate(mut, base, metadata):
     if inline:
-        manifests = manifestUpdates(staged, metadata)   # SPEC_ML
+        manifests = manifestUpdates(base, metadata)     # new snapshots' lists; SPEC_ML
         if lastCatalogFile.isInlineTable(tableId):
             delta = computeDelta(base, metadata, prefix)   # null: inexpressible
             if delta != null and size(delta + manifests) <= maxUpdateSize:

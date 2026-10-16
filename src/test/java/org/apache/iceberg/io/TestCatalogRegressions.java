@@ -2251,4 +2251,45 @@ public class TestCatalogRegressions {
               "mem:///data/a.parquet", "mem:///data/b.parquet", "mem:///data/c.parquet");
     }
   }
+
+  // ============================================================
+  // Bug 32: a catalog transaction committed its tables' new inline-ML
+  // snapshots with manifest lists staged on whichever handle to the table
+  // the thread loaded first and that still held a stage: the transaction's
+  // own if none, but another's if that one held a stage left from a table
+  // transaction that was abandoned, or whose commit failed before it landed
+  // (Bug 31 keeps such stages). The new snapshot then took no list of its
+  // own: replay gave it its parent's, and the acknowledged append was lost.
+  // A commit now takes each new snapshot's list from the snapshot, which
+  // holds it, and nothing is staged. Found by TestCatalogFaultProperties.
+  // ============================================================
+
+  @Nested
+  class CatalogTransactionWithAnotherHandleStaged {
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void keepsItsOwnAppend(boolean failedCommit) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog ml = catalog(io, LocalCatalogMode.APPEND_ML);
+      ml.createNamespace(mixedNs);
+      ml.createTable(mixed, intSchema).newFastAppend().appendFile(dataFile("a")).commit();
+      // Another handle stages an append in a table transaction that does not land.
+      org.apache.iceberg.Transaction other = ml.loadTable(mixed).newTransaction();
+      other.newFastAppend().appendFile(dataFile("b")).commit();
+      if (failedCommit) {
+        io.injectReadFaults(location -> ReadFault.FAIL);
+        assertThatThrownBy(other::commitTransaction).isInstanceOf(RuntimeException.class);
+        io.injectReadFaults(location -> ReadFault.NONE);
+      }
+
+      org.apache.iceberg.catalog.CatalogTransaction txn =
+          ml.createTransaction(org.apache.iceberg.catalog.CatalogTransaction.IsolationLevel.SNAPSHOT);
+      txn.asCatalog().loadTable(mixed).newFastAppend().appendFile(dataFile("c")).commit();
+      txn.commitTransaction();
+
+      assertThat(dataFiles(ml.loadTable(mixed)))
+          .containsExactly("mem:///data/a.parquet", "mem:///data/c.parquet");
+    }
+  }
 }

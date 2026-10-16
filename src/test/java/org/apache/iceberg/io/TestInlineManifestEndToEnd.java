@@ -1102,14 +1102,12 @@ public class TestInlineManifestEndToEnd {
     }
 
     /**
-     * An ML delta staged against a snapshot id already present in
-     * base.snapshots() is ignored: a committed snapshot's manifest list never
-     * changes (design.md I3a). No Iceberg producer stages on an existing
-     * snapshot id (SnapshotProducer always mints a fresh one, and
-     * RewriteManifests makes a new snapshot); such a stage is left over from a
-     * commit whose outcome the writer did not learn, and applying it would
-     * list the snapshot's manifests twice. This test drives the sink
-     * interface directly.
+     * An ML delta offered to the sink for a snapshot id already present in
+     * base.snapshots() changes nothing: a committed snapshot's manifest list
+     * never changes (design.md I3a), and a commit takes lists only from the
+     * snapshots it adds. No Iceberg producer offers one (SnapshotProducer
+     * always mints a fresh id, and RewriteManifests makes a new snapshot).
+     * This test drives the sink interface directly.
      */
     @Test
     void stagedDeltaOnACommittedSnapshotIsIgnored() {
@@ -1207,27 +1205,16 @@ public class TestInlineManifestEndToEnd {
           .as("collision pair must yield null delta")
           .isNull();
 
-      // Add a snapshot to the new metadata so we can stage an ML delta on it.
+      // Add a new inline-ML snapshot, holding its manifest list as a producer's does.
       long snapId = 0xD6D6D6L;
-      org.apache.iceberg.Snapshot newSnap = org.apache.iceberg.InlineDeltaSnapshots.create(
-          1L, snapId, null, System.currentTimeMillis(),
-          java.util.Map.of("operation", "append"),
-          newWithB.currentSchemaId(),
-          "inline://" + snapId,
-          null, 0L, null);
-      org.apache.iceberg.TableMetadata newWithBPlusSnap =
-          org.apache.iceberg.TableMetadata.buildFrom(newWithB).addSnapshot(newSnap).build();
-
-      // Stage ML data for the new snapshot.
       org.apache.iceberg.ManifestFile mf = new TestProtoActions.TestManifestFile(
           "mem:///warehouse/db/tbl/metadata/d6-m0.avro", 1024L, 0,
           org.apache.iceberg.ManifestContent.DATA,
           1L, 1L, snapId, 1, 0, 0, 1L, 0L, 0L, null, null, null);
-      ops.stageManifestListDelta(
-          1L, snapId, null, null,
-          new org.apache.iceberg.ManifestListSink.ManifestListDelta(
-              java.util.List.of(mf), java.util.List.of()),
-          null);
+      org.apache.iceberg.TableMetadata newWithBPlusSnap =
+          org.apache.iceberg.TableMetadata.buildFrom(newWithB)
+              .addSnapshot(inlineSnapshot(snapId, newWithB.currentSchemaId(), List.of(mf)))
+              .build();
 
       // Commit must succeed. The FULL+ML-bundle path replaces the TM and
       // populates the new snapshot's pool entry; loading the table afterwards
@@ -1243,13 +1230,12 @@ public class TestInlineManifestEndToEnd {
     }
 
     /**
-     * Errata D6 companion: an empty staged-delta entry (the producer staged a
-     * delta with no added/removed manifests, e.g. a metadata-only operation
-     * that still goes through the sink) must NOT trigger the D6 retry path.
-     * Empty staging is benign — there's no ML data to preserve.
+     * Errata D6 companion: a new inline-ML snapshot with an empty manifest
+     * list (a delete that matched nothing) lands through the full-mode path
+     * too, and its empty list is registered.
      */
     @Test
-    void concurrentReplaceCollisionWithEmptyStagedMLFallsThrough() {
+    void concurrentReplaceCollisionWithEmptyManifestListLandsViaFullMode() {
       createNamespaceAndTable();
       org.apache.iceberg.Table tbl = catalog.loadTable(TBL);
 
@@ -1268,44 +1254,32 @@ public class TestInlineManifestEndToEnd {
           .buildFrom(current).setDefaultSortOrder(orderB).build();
 
       long snapId = 0xD6E000L;
-      org.apache.iceberg.Snapshot newSnap = org.apache.iceberg.InlineDeltaSnapshots.create(
-          1L, snapId, null, System.currentTimeMillis(),
-          java.util.Map.of("operation", "append"),
-          newWithB.currentSchemaId(),
-          "inline://" + snapId,
-          null, 0L, null);
       org.apache.iceberg.TableMetadata newWithBPlusSnap =
-          org.apache.iceberg.TableMetadata.buildFrom(newWithB).addSnapshot(newSnap).build();
+          org.apache.iceberg.TableMetadata.buildFrom(newWithB)
+              .addSnapshot(inlineSnapshot(snapId, newWithB.currentSchemaId(), List.of()))
+              .build();
 
-      // Empty staged delta — no added, no removed.
-      ops.stageManifestListDelta(
-          1L, snapId, null, null,
-          new org.apache.iceberg.ManifestListSink.ManifestListDelta(
-              java.util.List.of(), java.util.List.of()),
-          null);
+      ops.doCommit(baseWithA, newWithBPlusSnap);
 
-      // Should NOT throw the D6 CFE. The full-mode fallback runs; the empty
-      // staged delta carries no data so nothing is lost. (The commit itself
-      // may succeed or fail for unrelated reasons; we only assert the absence
-      // of the D6-specific error message.)
-      try {
-        ops.doCommit(baseWithA, newWithBPlusSnap);
-      } catch (org.apache.iceberg.exceptions.CommitFailedException e) {
-        assertThat(e.getMessage())
-            .as("empty staged delta must not trigger D6 path")
-            .doesNotContain("concurrent-replace");
-      } catch (Exception ignored) {
-        // Other exceptions from full-mode are acceptable; the only thing
-        // under test is "no D6 false positive".
-      }
+      org.apache.iceberg.Table reloaded = catalog.loadTable(TBL);
+      assertThat(reloaded.snapshot(snapId)).as("new snapshot must be reachable").isNotNull();
+      assertThat(reloaded.snapshot(snapId).allManifests(io)).isEmpty();
+    }
+
+    /** A new append snapshot that holds {@code manifests}, as SnapshotProducer returns one. */
+    private org.apache.iceberg.Snapshot inlineSnapshot(
+        long snapshotId, int schemaId, List<ManifestFile> manifests) {
+      return new org.apache.iceberg.InlineSnapshot(
+          1L, snapshotId, null, System.currentTimeMillis(), "append",
+          java.util.Map.of("operation", "append"), schemaId, null, null, null, manifests);
     }
 
     /**
-     * Errata D7 companion: a staged delta whose snapshot id is NOT in
-     * metadata.snapshots() (orphan stage, e.g. a producer that was rolled
-     * back before its snapshot landed in TableMetadata) must be dropped,
-     * not applied. Without the filter, an orphan AddManifest would attach a
-     * pool entry against a snapshot id that has no referent.
+     * Errata D7 companion: a delta offered for a snapshot id that is NOT in
+     * metadata.snapshots() (e.g. a producer that was rolled back before its
+     * snapshot landed in TableMetadata) changes nothing: a commit takes lists
+     * only from the snapshots it adds, so no pool entry attaches to a
+     * snapshot id that has no referent.
      */
     @Test
     void stagedDeltaForOrphanSnapshotIdIsDropped() {

@@ -622,39 +622,6 @@ public class TestInlineDelta {
   class InlineManifestTableOpsTests {
 
     @Test
-    void sinkStagesAndDrains() {
-      var ops = new FileIOCatalog.InlineManifestTableOperations(
-          org.apache.iceberg.catalog.TableIdentifier.of("db", "tbl"),
-          "mem:///catalog", new ProtoCatalogFormat(), null,
-          new FileIOCatalog.InlineSettings(
-              true, true, false, InlineMetadataCodecs.JSON_GZIP, InlineDeltaCodec.APPEND_LIMIT));
-
-      org.apache.iceberg.ManifestFile m1 = new TestProtoActions.TestManifestFile(
-          "s3://b/m1.avro", 1024, 0, org.apache.iceberg.ManifestContent.DATA,
-          1, 1, 100L, 5, 0, 0, 50L, 0L, 0L, null, null, null);
-
-      ops.stageManifestListDelta(1L, 100L, null, null,
-          new org.apache.iceberg.ManifestListSink.ManifestListDelta(
-              List.of(m1), List.of()),
-          null);
-      ops.stageManifestListDelta(2L, 200L, 100L, null,
-          new org.apache.iceberg.ManifestListSink.ManifestListDelta(
-              List.of(m1), List.of("s3://b/old.avro")),
-          null);
-
-      var drained = ops.drainStagedDeltas();
-      assertThat(drained).hasSize(2);
-      assertThat(drained.get(100L).delta.added()).hasSize(1);
-      assertThat(drained.get(100L).delta.removedPaths()).isEmpty();
-      assertThat(drained.get(200L).delta.removedPaths()).containsExactly("s3://b/old.avro");
-      // Staged parent/next-row-id fields captured alongside delta
-      assertThat(drained.get(200L).parentSnapshotId).isEqualTo(100L);
-
-      // drain clears
-      assertThat(ops.drainStagedDeltas()).isEmpty();
-    }
-
-    @Test
     void isInstanceOfManifestListSink() {
       var ops = new FileIOCatalog.InlineManifestTableOperations(
           org.apache.iceberg.catalog.TableIdentifier.of("db", "tbl"),

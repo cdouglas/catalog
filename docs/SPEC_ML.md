@@ -176,11 +176,12 @@ When the sink is present, the producer:
    would write to Avro).
 2. Computes the delta vs. the parent snapshot's manifest list, comparing
    by `manifest_path`.
-3. Calls `sink.stageManifestListDelta(...)` with the delta.
+3. Calls `sink.stageManifestListDelta(...)` with the delta, which
+   `FileIOCatalog` does not keep (below).
 4. Returns an `InlineSnapshot` (an Iceberg-core class with
    `manifestListLocation() == null`) holding the full in-memory list, so
    the same JVM session can continue without reading the manifest list
-   from storage.
+   from storage, and the commit can send it.
 
 **No `snap-*.avro` file is written** when the sink path is taken.
 
@@ -196,45 +197,52 @@ manifest list to a `snap-*.avro` file as before and returns a normal
 `FileIOTableOperations`. This ensures `SnapshotProducer` only takes the
 sink path when the catalog is prepared to store ML deltas.
 
-`stageManifestListDelta` stashes the delta on an instance field keyed by
-snapshot id. After `SnapshotProducer.commit()` returns, `doCommit`
-drains those staged deltas and turns them into manifest updates in the
-same intention record that carries the table update
+A commit takes each new snapshot's list from the snapshot: the snapshots
+in the new metadata that are `InlineSnapshot`s and not in the base, which
+the commit's producers returned. It turns them into manifest updates in
+the same intention record that carries the table update
 (`FileIOTableOperations.manifestUpdates`):
 
 ```java
 List<DeltaUpdate> manifests = null;                   // null: no new inline snapshot
-for (var entry : staged.entrySet()) {
-  Snapshot snap = metadata.snapshot(entry.getKey());
-  if (snap == null) continue;                         // orphan stage (errata D7)
-  if (base.snapshot(snap.snapshotId()) != null) continue;  // committed: list is final
+for (Snapshot snap : metadata.snapshots()) {
+  if (!(snap instanceof InlineSnapshot) || base.snapshot(snap.snapshotId()) != null) {
+    continue;                                         // committed: its list is final
+  }
   if (manifests == null) manifests = new ArrayList<>();
-  Long parent = snap.parentId();
-  boolean parentInline = parent == null
-      || staged.containsKey(parent) && base.snapshot(parent) == null  // new here
-      || base.hasInlineManifests(tblId, parent);      // inline in the table's state
-  if (parentInline) {
+  List<ManifestFile> list = snap.allManifests(io);    // held by the snapshot
+  List<ManifestFile> parent =                         // the list the replay builds on
+      snap.parentId() == null ? List.of()
+      : isNew(metadata.snapshot(snap.parentId())) ? metadata.snapshot(snap.parentId()).allManifests(io)
+      : proto.hasInlineManifests(tblId, snap.parentId()) ? proto.inlineManifests(tblId, snap.parentId())
+      : null;                                         // parent's list is a file
+  if (parent == null) {
+    attachManifestDelta(manifests, snap.snapshotId(), list, List.of(), prefix);
+  } else {
     attachManifestDelta(manifests, snap.snapshotId(),
-        entry.getValue().delta.added(), entry.getValue().delta.removedPaths(), prefix);
-  } else {                                            // parent's list is a file
-    attachManifestDelta(manifests, snap.snapshotId(),
-        snap.allManifests(io), List.of(), prefix);
+        added(parent, list), removedPaths(parent, list), prefix);   // by manifest path
   }
 }
 ```
 
-Only snapshots the commit adds take their stages. A committed
-snapshot's list never changes (design.md I3a); a stage for one is left
-over from a commit that landed although its writer saw
-`CommitStateUnknownException` (stages stay on the table handle until a
-commit lands, since Iceberg's transaction retry re-stages only if the
-table changed). A staged list is a delta against the parent's
+Only snapshots the commit adds send lists. A committed snapshot's list
+never changes (design.md I3a), so a delta the sink was offered for one,
+or for a snapshot that never reached the metadata (errata D7), changes
+nothing. A new snapshot's list is sent as a delta against its parent's
 list, and the replay builds it on the parent's *inline* list
 (`NewSnapshotManifests`). A parent whose list is an Avro file has no
-inline list, so a snapshot on such a parent carries its whole list
-(the `InlineSnapshot` the producer returned holds it). Such parents
-come from writers that do not inline manifest lists and from eviction
-(see "Writers in Different Modes" below).
+inline list, so a snapshot on such a parent carries its whole list.
+Such parents come from writers that do not inline manifest lists and
+from eviction (see "Writers in Different Modes" below).
+
+The commit used to send the deltas the sink was offered, kept on the
+table handle that received them until a commit landed. A catalog
+transaction's commit has only its tables' new metadata, so it looked
+the handle up in a per-thread registry of loaded tables, and took
+another handle's leftover stage when one had it (a table transaction
+abandoned, or whose commit failed before it landed): its own snapshot
+then got its parent's list, and the acknowledged append was lost
+(`TestCatalogRegressions.CatalogTransactionWithAnotherHandleStaged`).
 
 The manifest updates ride in whichever form the table update takes
 (see [SPEC_TM.md](SPEC_TM.md) §"Delivery Modes"): appended to the TM
@@ -246,9 +254,8 @@ inline snapshot's list, so the invariant *sentinel ⇒ list* holds. A
 metadata-file update (eviction) writes each inline snapshot's list to
 an Avro file instead.
 
-A multi-table `commitTransaction` follows the same path: the deltas
-staged on the ops each table was loaded with are drained per table and
-passed to that table's `stageUpdate`.
+A multi-table `commitTransaction` follows the same path: each table's
+new snapshots hold their lists, and its `stageUpdate` sends them.
 
 ### Create-with-snapshots
 
@@ -272,7 +279,7 @@ multi-spec create transactions surface the wrong spec on read.
 transactions have independently assigned the same schema / spec /
 sort-order id to different content (see [SPEC_TM.md](SPEC_TM.md)
 §"Concurrent-replace id collisions"). The commit then takes full mode,
-which carries the staged manifest updates as its `ml_delta` payload, so
+which carries the manifest updates as its `ml_delta` payload, so
 the new snapshots' lists land atomically with the TM replacement. (The
 multi-table path used to throw `CommitFailedException` here instead;
 Iceberg's replace-transaction retry reuses the producer's metadata, so

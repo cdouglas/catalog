@@ -21,12 +21,10 @@ package org.apache.iceberg.io;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
-import org.apache.iceberg.HasTableOperations;
 import org.apache.iceberg.ManifestListSink;
 import org.apache.iceberg.ManifestListSink.ManifestListDelta;
 import org.apache.iceberg.BaseMetastoreCatalog;
@@ -36,7 +34,6 @@ import org.apache.iceberg.InlineSnapshot;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.CatalogUtil;
-import org.apache.iceberg.Table;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.catalog.BaseCatalogTransaction;
@@ -98,14 +95,6 @@ public class FileIOCatalog extends BaseMetastoreCatalog
   private CatalogFormat<?, ?> format;
   private SupportsAtomicOperations fileIO;
   private final Map<String, String> catalogProperties;
-
-  // Per-thread map of tables loaded via loadTable() to the ops instance that
-  // received their staged ManifestListSink deltas. Populated lazily on
-  // loadTable, drained by commitTransaction (multi-table catalog commit), then
-  // cleared. The single-table doCommit path drains the sink directly off
-  // `this` and does not consult this map. See iceberg_refine.md R2.
-  private final ThreadLocal<Map<TableIdentifier, InlineManifestTableOperations>>
-      txnSinkOps = ThreadLocal.withInitial(HashMap::new);
 
   @SuppressWarnings("unused") // reflection cstr
   FileIOCatalog() {
@@ -204,34 +193,6 @@ public class FileIOCatalog extends BaseMetastoreCatalog
     final InputFile catalog = fileIO.newInputFile(catalogLocation);
     final CatalogFile catalogFile = format.read(fileIO, catalog);
     format.from(catalogFile).renameTable(from, to).commit(fileIO);
-  }
-
-  @Override
-  public Table loadTable(TableIdentifier identifier) {
-    Table tbl = super.loadTable(identifier);
-    // Track InlineManifestTableOperations instances so commitTransaction can
-    // drain the staged ManifestListSink deltas directly, mirroring the
-    // single-table doCommit path. The check is intentionally permissive:
-    // if the loaded table doesn't expose ops, or the ops isn't a sink, we
-    // simply don't track it; commitTransaction tolerates a missing entry.
-    if (tbl instanceof HasTableOperations) {
-      TableOperations ops = ((HasTableOperations) tbl).operations();
-      if (ops instanceof InlineManifestTableOperations) {
-        // Peek-not-clobber: BaseCatalogTransaction.validateSerializableIsolation
-        // calls origin.loadTable() during its own commitTransaction(), creating a
-        // fresh InlineManifestTableOperations whose stagedDeltas is empty. If we
-        // overwrite the user-loaded ops (which holds the actual staged deltas)
-        // here, FileIOCatalog#commitTransaction would later drain the empty
-        // validation ops, drop all AddManifestUpdate entries, and write a
-        // sentinel-without-pool snapshot. Skip the overwrite when the existing
-        // entry has unflushed staged deltas.
-        InlineManifestTableOperations existing = txnSinkOps.get().get(identifier);
-        if (existing == null || !existing.hasStagedDeltas()) {
-          txnSinkOps.get().put(identifier, (InlineManifestTableOperations) ops);
-        }
-      }
-    }
-    return tbl;
   }
 
   @Override
@@ -647,39 +608,21 @@ public class FileIOCatalog extends BaseMetastoreCatalog
 
     @Override
     public void doCommit(TableMetadata base, TableMetadata metadata) {
-      Map<Long, InlineManifestTableOperations.StagedSnapshotData> staged = peekStagedDeltas();
       try {
         CatalogFile.Mut<?, ?> mut = format.from(lastCatalogFile);
         if (base == null) {
-          stageCreate(mut, metadata, staged);
+          stageCreate(mut, metadata);
         } else {
-          stageUpdate(mut, base, metadata, staged);
+          stageUpdate(mut, base, metadata);
         }
         mut.commit(io());
       } catch (SupportsAtomicOperations.CASException e) {
         throw new CommitFailedException(e, "Failed to commit metadata for table %s", tableId);
       }
-      // Only now: a transaction that retries a failed commit re-applies its producers, which
-      // stage their lists again, only if the table changed (BaseTransaction.applyUpdates).
-      clearStagedDeltas();
     }
-
-    /**
-     * The manifest lists the commit's new snapshots staged inline, by snapshot id; empty unless
-     * this catalog inlines manifest lists.
-     */
-    Map<Long, InlineManifestTableOperations.StagedSnapshotData> peekStagedDeltas() {
-      return java.util.Collections.emptyMap();
-    }
-
-    /** Clears the staged manifest lists once a commit has landed. */
-    void clearStagedDeltas() {}
 
     /** Stages on {@code mut} the creation of this table with {@code metadata}. */
-    private void stageCreate(
-        CatalogFile.Mut<?, ?> mut,
-        TableMetadata metadata,
-        Map<Long, InlineManifestTableOperations.StagedSnapshotData> staged) {
+    private void stageCreate(CatalogFile.Mut<?, ?> mut, TableMetadata metadata) {
       if (inline.metadata) {
         // Errata D9: an inline-ML createTransaction with one or more
         // newFastAppend calls puts InlineSnapshots into `metadata`. Two things
@@ -690,13 +633,13 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         //      InlineSnapshot (rewriteInlineSnapshotsForFullEncode).
         //   2. The catalog's manifest pool and per-snapshot ref list must be
         //      populated atomically with the create. We achieve this by
-        //      bundling AddManifestUpdate entries (built from the producer's
-        //      staged ManifestListDelta) into a delta payload that
+        //      bundling AddManifestUpdate entries (built from the lists the
+        //      InlineSnapshots hold) into a delta payload that
         //      CreateTableInlineAction.apply feeds through
         //      InlineDeltaCodec.applyManifestsOnly — the same hook a full-mode
         //      update uses.
         List<InlineDeltaCodec.DeltaUpdate> manifests =
-            manifestUpdates(null, null, metadata, staged, "");
+            manifestUpdates(null, null, metadata, "");
         byte[] manifestBytes =
             manifests == null
                 ? null
@@ -718,17 +661,13 @@ public class FileIOCatalog extends BaseMetastoreCatalog
 
     /**
      * Stages on {@code mut} the commit of {@code metadata}, built on {@code base}, to this table as
-     * {@link #lastCatalogFile} holds it. {@code staged} holds the manifest lists of the commit's
-     * new inline-ML snapshots. In an inline catalog the update takes the first form that fits in
+     * {@link #lastCatalogFile} holds it. In an inline catalog the update takes the first form that
+     * fits in
      * {@code fileio.catalog.inline.max.update.size}: a delta, if the table is inline (the common
      * case); the full metadata, inline, which re-inlines a pointer table; else a metadata file,
      * which evicts the table from inline storage.
      */
-    void stageUpdate(
-        CatalogFile.Mut<?, ?> mut,
-        TableMetadata base,
-        TableMetadata metadata,
-        Map<Long, InlineManifestTableOperations.StagedSnapshotData> staged) {
+    void stageUpdate(CatalogFile.Mut<?, ?> mut, TableMetadata base, TableMetadata metadata) {
       if (inline.metadata) {
         ProtoCatalogFile proto = (ProtoCatalogFile) lastCatalogFile;
         Integer tblId = proto.tableId(tableId);
@@ -737,7 +676,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
             ? proto.manifestListPrefix(tblId)
             : "";
         List<InlineDeltaCodec.DeltaUpdate> manifests =
-            manifestUpdates(isInline ? proto : null, base, metadata, staged, prefix);
+            manifestUpdates(isInline ? proto : null, base, metadata, prefix);
         if (isInline) {
           // Null if delta encoding cannot express the change (errata D1, D6): full mode then.
           List<InlineDeltaCodec.DeltaUpdate> delta =
@@ -776,62 +715,79 @@ public class FileIOCatalog extends BaseMetastoreCatalog
     }
 
     /**
-     * The manifest list updates for the inline-ML snapshots {@code metadata} adds, from the lists
-     * their producers staged. A producer stages a list as a delta against its parent's, and the
-     * catalog builds the list on its parent's inline list ({@code
-     * InlineDeltaCodec.NewSnapshotManifests}). So a snapshot whose parent has no inline list in
-     * {@code proto} (the table's state the update applies to, null if the table is not inline) or
-     * among the new snapshots carries its whole list: its parent's list is a file, written by a
+     * The manifest list updates for the inline-ML snapshots {@code metadata} adds, those not in
+     * {@code base}. Each is an {@link InlineSnapshot} that its producer returned, holding its whole
+     * list; a committed snapshot's list never changes, so one in {@code base} sends nothing. The
+     * catalog builds a new snapshot's list on its parent's inline list ({@code
+     * InlineDeltaCodec.NewSnapshotManifests}), so a snapshot sends the manifests it adds to and
+     * removes from its parent's list: one new in this commit, or one inline in {@code proto} (the
+     * table's state the update applies to, null if the table is not inline). A snapshot whose
+     * parent has no inline list sends its whole list: its parent's list is a file, written by a
      * writer that does not inline manifest lists or by an eviction.
      *
-     * <p>Only snapshots new in this commit, in {@code metadata} but not in {@code base}, take
-     * their stages. One not in {@code metadata} was staged by a producer that then rolled back
-     * (errata D7). One in {@code base} is committed, and a committed snapshot's list never
-     * changes: its stage is left over from a commit that failed after it landed, whose outcome
-     * the writer did not learn (CommitStateUnknownException), and replaying it would list its
-     * manifests twice.
-     *
-     * <p>Returns null if the commit adds no staged snapshot; else the updates, which are none if
+     * <p>Returns null if the commit adds no inline snapshot; else the updates, which are none if
      * the new snapshots change no manifests (a delete that matched nothing) but must still be
      * sent, so that the catalog registers their lists.
      */
     private List<InlineDeltaCodec.DeltaUpdate> manifestUpdates(
-        ProtoCatalogFile proto,
-        TableMetadata base,
-        TableMetadata metadata,
-        Map<Long, InlineManifestTableOperations.StagedSnapshotData> staged,
-        String prefix) {
+        ProtoCatalogFile proto, TableMetadata base, TableMetadata metadata, String prefix) {
       List<InlineDeltaCodec.DeltaUpdate> updates = null;
-      Integer tblId = proto != null ? proto.tableId(tableId) : null;
-      for (Map.Entry<Long, InlineManifestTableOperations.StagedSnapshotData> entry
-          : staged.entrySet()) {
-        Snapshot snapshot = metadata.snapshot(entry.getKey());
-        if (snapshot == null || (base != null && base.snapshot(entry.getKey()) != null)) {
+      for (Snapshot snapshot : metadata.snapshots()) {
+        if (!isNew(snapshot, base)) {
           continue;
         }
         if (updates == null) {
           updates = new java.util.ArrayList<>();
         }
-        Long parentId = snapshot.parentId();
-        boolean parentNew =
-            parentId != null
-                && staged.containsKey(parentId)
-                && metadata.snapshot(parentId) != null
-                && (base == null || base.snapshot(parentId) == null);
-        boolean parentInline =
-            parentId == null
-                || parentNew
-                || (tblId != null && proto.hasInlineManifests(tblId, parentId));
-        ManifestListDelta delta = entry.getValue().delta;
-        if (parentInline) {
+        List<ManifestFile> manifests = snapshot.allManifests(io());
+        List<ManifestFile> parent = parentList(proto, base, metadata, snapshot.parentId());
+        if (parent == null) {
           InlineDeltaCodec.attachManifestDelta(
-              updates, snapshot.snapshotId(), delta.added(), delta.removedPaths(), prefix);
-        } else {
-          InlineDeltaCodec.attachManifestDelta(
-              updates, snapshot.snapshotId(), snapshot.allManifests(io()), List.of(), prefix);
+              updates, snapshot.snapshotId(), manifests, List.of(), prefix);
+          continue;
         }
+        Set<String> parentPaths =
+            parent.stream().map(ManifestFile::path).collect(Collectors.toSet());
+        Set<String> paths = manifests.stream().map(ManifestFile::path).collect(Collectors.toSet());
+        InlineDeltaCodec.attachManifestDelta(
+            updates,
+            snapshot.snapshotId(),
+            manifests.stream()
+                .filter(m -> !parentPaths.contains(m.path()))
+                .collect(Collectors.toList()),
+            parent.stream()
+                .map(ManifestFile::path)
+                .filter(path -> !paths.contains(path))
+                .collect(Collectors.toList()),
+            prefix);
       }
       return updates;
+    }
+
+    /** Whether {@code snapshot} is an inline-ML snapshot that a commit on {@code base} adds. */
+    private static boolean isNew(Snapshot snapshot, TableMetadata base) {
+      return snapshot instanceof InlineSnapshot
+          && (base == null || base.snapshot(snapshot.snapshotId()) == null);
+    }
+
+    /**
+     * The inline list a new snapshot's list is built on: none for a snapshot without a parent, a
+     * parent's new in this commit, or a parent's inline in {@code proto}. Null if the parent's
+     * list is not inline.
+     */
+    private List<ManifestFile> parentList(
+        ProtoCatalogFile proto, TableMetadata base, TableMetadata metadata, Long parentId) {
+      if (parentId == null) {
+        return List.of();
+      }
+      Snapshot parent = metadata.snapshot(parentId);
+      if (parent != null && isNew(parent, base)) {
+        return parent.allManifests(io());
+      }
+      Integer tblId = proto != null ? proto.tableId(tableId) : null;
+      return tblId != null && proto.hasInlineManifests(tblId, parentId)
+          ? proto.inlineManifests(tblId, parentId)
+          : null;
     }
 
     /**
@@ -926,30 +882,15 @@ public class FileIOCatalog extends BaseMetastoreCatalog
   }
 
   /**
-   * Extension of FileIOTableOperations that also implements ManifestListSink,
-   * enabling SnapshotProducer to hand off manifest list deltas instead of writing
-   * snap-*.avro files. Activated when fileio.catalog.inline.manifests=true.
+   * Table operations of a catalog that inlines manifest lists (fileio.catalog.inline.manifests).
+   * As a {@link ManifestListSink}, they make {@link org.apache.iceberg.SnapshotProducer} write no
+   * manifest list file but return an {@link InlineSnapshot} that holds the list, from which the
+   * commit takes it ({@link FileIOTableOperations#manifestUpdates}). The delta the producer
+   * offers is not kept: a commit would have to find it through the handle that received it, and
+   * a catalog transaction's commit has only the snapshots.
    */
   static class InlineManifestTableOperations extends FileIOTableOperations
       implements ManifestListSink {
-
-    /** Staged per-snapshot sink data, keyed by snapshot id. */
-    static final class StagedSnapshotData {
-      final ManifestListDelta delta;
-      final Long parentSnapshotId;
-      final Long nextRowId;
-      final Long nextRowIdAfter;
-
-      StagedSnapshotData(ManifestListDelta delta, Long parentSnapshotId,
-          Long nextRowId, Long nextRowIdAfter) {
-        this.delta = delta;
-        this.parentSnapshotId = parentSnapshotId;
-        this.nextRowId = nextRowId;
-        this.nextRowIdAfter = nextRowIdAfter;
-      }
-    }
-
-    private final Map<Long, StagedSnapshotData> stagedDeltas = new LinkedHashMap<>();
 
     InlineManifestTableOperations(
         TableIdentifier tableId, String catalogLocation,
@@ -967,39 +908,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
     @Override
     public void stageManifestListDelta(
         long sequenceNumber, long snapshotId, Long parentSnapshotId,
-        Long nextRowId, ManifestListDelta delta, Long nextRowIdAfter) {
-      stagedDeltas.put(snapshotId,
-          new StagedSnapshotData(delta, parentSnapshotId, nextRowId, nextRowIdAfter));
-    }
-
-    /** Returns true if there are unflushed staged sink deltas. */
-    boolean hasStagedDeltas() {
-      return !stagedDeltas.isEmpty();
-    }
-
-    /**
-     * Returns a snapshot of the staged sink data without clearing it. Use this
-     * when the caller might decide not to commit (e.g. throws CommitFailedException
-     * to trigger a producer-level retry); pair with {@link #clearStagedDeltas()}
-     * once the write is committed.
-     */
-    @Override
-    Map<Long, StagedSnapshotData> peekStagedDeltas() {
-      return new LinkedHashMap<>(stagedDeltas);
-    }
-
-    /** Clears all staged sink data after a successful commit. */
-    @Override
-    void clearStagedDeltas() {
-      stagedDeltas.clear();
-    }
-
-    /** Returns and clears all staged sink data (keyed by snapshot id). */
-    Map<Long, StagedSnapshotData> drainStagedDeltas() {
-      Map<Long, StagedSnapshotData> result = new LinkedHashMap<>(stagedDeltas);
-      stagedDeltas.clear();
-      return result;
-    }
+        Long nextRowId, ManifestListDelta delta, Long nextRowIdAfter) {}
   }
 
   /**
@@ -1060,62 +969,46 @@ public class FileIOCatalog extends BaseMetastoreCatalog
       Map<BaseCatalogTransaction.TableRef, TableMetadata> reads, List<TableCommit> commits) {
     // TableCommit validations check the table UUID and snapshot ref for each table
     // if all validations pass for the current CatalogFile, then attempt atomic replace
-    final Map<TableIdentifier, InlineManifestTableOperations> sinkOpsByTable =
-        txnSinkOps.get();
-    try {
-      final CatalogFile current = getCatalogFile();
-      final CatalogFile.Mut<?, ?> newCatalog = format.from(current);
-      // Each branch the transaction read must be as it read it, from then until the commit
-      // lands. BaseCatalogTransaction checked that before calling, but a commit may have landed
-      // since; check again on the state this commit builds on, and readTable makes the commit
-      // fail if the table changes before it lands.
-      for (Map.Entry<BaseCatalogTransaction.TableRef, TableMetadata> read : reads.entrySet()) {
-        TableIdentifier readTable = read.getKey().identifier();
-        String ref = read.getKey().ref();
-        TableMetadata now = newTableOps(readTable, current).current();
-        if (!BaseCatalogTransaction.unchangedSinceRead(ref, read.getValue(), now)) {
-          throw new ValidationException(
-              "SERIALIZABLE isolation violation: Found table metadata updates to table '%s' after it was read on branch '%s'",
-              readTable, ref);
-        }
-        newCatalog.readTable(readTable);
+    final CatalogFile current = getCatalogFile();
+    final CatalogFile.Mut<?, ?> newCatalog = format.from(current);
+    // Each branch the transaction read must be as it read it, from then until the commit
+    // lands. BaseCatalogTransaction checked that before calling, but a commit may have landed
+    // since; check again on the state this commit builds on, and readTable makes the commit
+    // fail if the table changes before it lands.
+    for (Map.Entry<BaseCatalogTransaction.TableRef, TableMetadata> read : reads.entrySet()) {
+      TableIdentifier readTable = read.getKey().identifier();
+      String ref = read.getKey().ref();
+      TableMetadata now = newTableOps(readTable, current).current();
+      if (!BaseCatalogTransaction.unchangedSinceRead(ref, read.getValue(), now)) {
+        throw new ValidationException(
+            "SERIALIZABLE isolation violation: Found table metadata updates to table '%s' after it was read on branch '%s'",
+            readTable, ref);
       }
-      for (TableCommit commit : commits) {
-        final TableIdentifier tableId = commit.identifier();
-        // use fixed catalog snapshot for validation
-        FileIOTableOperations ops = newTableOps(tableId, current);
-        final TableMetadata currentMetadata = ops.current();
-        if (currentMetadata == null) {
-          throw new NoSuchTableException("Table does not exist: %s", tableId);
-        }
-        commit.requirements().forEach(req -> req.validate(currentMetadata));
+      newCatalog.readTable(readTable);
+    }
+    for (TableCommit commit : commits) {
+      final TableIdentifier tableId = commit.identifier();
+      // use fixed catalog snapshot for validation
+      FileIOTableOperations ops = newTableOps(tableId, current);
+      final TableMetadata currentMetadata = ops.current();
+      if (currentMetadata == null) {
+        throw new NoSuchTableException("Table does not exist: %s", tableId);
+      }
+      commit.requirements().forEach(req -> req.validate(currentMetadata));
 
-        TableMetadata.Builder newMetadataBuilder = TableMetadata.buildFrom(currentMetadata);
-        commit.updates().forEach(update -> update.applyTo(newMetadataBuilder));
-        final TableMetadata newMetadata = newMetadataBuilder.build();
-        if (newMetadata.changes().isEmpty()) {
-          continue;
-        }
-        // The manifest lists SnapshotProducer staged for the table's new snapshots went to the
-        // ops instance the transaction loaded the table with (BaseTransaction forwards the sink
-        // calls to it), which loadTable recorded in txnSinkOps. See iceberg_refine.md R2.
-        InlineManifestTableOperations sinkOps = sinkOpsByTable.get(tableId);
-        Map<Long, InlineManifestTableOperations.StagedSnapshotData> staged =
-            sinkOps != null
-                ? sinkOps.drainStagedDeltas()
-                : java.util.Collections.emptyMap();
-        ops.stageUpdate(newCatalog, currentMetadata, newMetadata, staged);
+      TableMetadata.Builder newMetadataBuilder = TableMetadata.buildFrom(currentMetadata);
+      commit.updates().forEach(update -> update.applyTo(newMetadataBuilder));
+      final TableMetadata newMetadata = newMetadataBuilder.build();
+      if (newMetadata.changes().isEmpty()) {
+        continue;
       }
-      try {
-        newCatalog.commit(fileIO);
-      } catch (SupportsAtomicOperations.CASException e) {
-        throw new CommitFailedException(e, "Failed to commit metadata for multi-table commit");
-      }
-    } finally {
-      // Clear the per-thread map. Subsequent loadTable calls will repopulate
-      // it. This keeps the map bounded and prevents stale ops references
-      // outliving their useful window.
-      txnSinkOps.remove();
+      // The table's new inline-ML snapshots hold their manifest lists.
+      ops.stageUpdate(newCatalog, currentMetadata, newMetadata);
+    }
+    try {
+      newCatalog.commit(fileIO);
+    } catch (SupportsAtomicOperations.CASException e) {
+      throw new CommitFailedException(e, "Failed to commit metadata for multi-table commit");
     }
   }
 
