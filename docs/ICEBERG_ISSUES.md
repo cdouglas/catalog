@@ -31,7 +31,7 @@ Checked on 2026-10-16 against three versions:
 |---|---|---|---|---|
 | C1. A merging delete renumbers rows | yes | fixed | fixed | fixed by [#16263](https://github.com/apache/iceberg/pull/16263), in 1.11.0 |
 | C2. A retried commit renumbers rows | yes | yes | yes | not reported |
-| C3. A replace restores an expired snapshot | yes | yes | yes | part of [#16232](https://github.com/apache/iceberg/issues/16232), open |
+| C3. A replace restores an expired snapshot | yes | yes | yes | [#16942](https://github.com/apache/iceberg/issues/16942), part of [#16232](https://github.com/apache/iceberg/issues/16232); fix in PR [#16943](https://github.com/apache/iceberg/pull/16943), open |
 | C4. A stale handle fails on a newer spec | yes | yes | yes | not reported |
 | C5. Rewriting manifests fails with no snapshot | yes | yes | yes | not reported |
 | C6. A repeated cherry-pick leaves the table unplannable | yes | yes | yes | not reported |
@@ -97,10 +97,20 @@ included, over whatever changed since
 between therefore comes back, though the expiry deleted its manifest
 list, so reading that snapshot fails.
 
-- **Upstream:** #16232 (open) reports the general problem: a replace
-  silently overwrites concurrent schema, property, data and expiry
-  changes. Iceberg means a replace to win over concurrent changes, but it
-  should not restore what an expiry removed.
+- **Upstream:**
+  - #16232 (open) reports the general problem: a replace silently
+    overwrites concurrent schema, property, data and expiry changes.
+  - #16942 (open) reports a concurrent writer's snapshot dropped by a
+    `createOrReplace`.
+  - PR #16943 (open, by 2026-10-12) would fix both for
+    `BaseMetastoreCatalog` catalogs, `FileIOCatalog` among them. When the
+    table changed, it rebuilds the replacement on the refreshed metadata
+    and replays the transaction's updates. It falls back to today's
+    behavior when the rebuilt schema, spec, sort order or format version
+    would differ, or an update can't be replayed.
+
+  Iceberg means a replace to win over concurrent changes, but it should
+  not restore what an expiry removed.
 - **Test:** `aReplaceBringsBackASnapshotExpiredSinceItStarted`.
 - **Workarounds:**
   - `TestCatalogFaultProperties` checks manifest lists only for
@@ -191,7 +201,10 @@ The replace commits the metadata it built at its start, whatever
 changed since (C3 is the case where that is clearly wrong). So
 `TestCatalogRaceProperties` doesn't race replace transactions, and
 `TestCatalogFaultProperties` models a replace as the table the
-transaction saw at its start.
+transaction saw at its start. PR #16943 (C3) would make a replace keep
+concurrent changes where it can. A release with it breaks that model,
+which should then expect the concurrent changes kept, and replace
+transactions can join the race property.
 
 ### A2. A create-or-replace that races a create fails
 
