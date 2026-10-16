@@ -3311,6 +3311,74 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 54: a table create's record names the version of the namespace it
+  // read, which any change there bumps -- another table created or dropped
+  // in it, its properties set -- and Iceberg takes a create's conflict to
+  // mean the table exists: two writers creating different tables in a
+  // namespace at once, and one got AlreadyExistsException ("Table was
+  // created concurrently") for a table that did not exist. A create now
+  // stages again on a fresh read, which fails if the table exists by then.
+  // Found while fixing Bug 53.
+  // ============================================================
+
+  @Nested
+  class CreateRacingAChangeToItsNamespace {
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND", "CAS", "APPEND_TM", "APPEND_ML"})
+    void createsTheTable(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, mode);
+      FileIOCatalog racer = catalog(io, mode);
+      catalog.createNamespace(mixedNs);
+      TableIdentifier first = TableIdentifier.of(mixedNs, "first");
+      boolean[] raced = {false};
+      io.injectFaults((location, strategy) -> {
+        if (!raced[0] && location.equals(CATALOG)) {
+          raced[0] = true;
+          racer.createTable(first, intSchema);
+        }
+        return Fault.NONE;
+      });
+
+      catalog.buildTable(mixed, intSchema).createTransaction().commitTransaction();
+      Table table = catalog.loadTable(mixed);
+
+      io.injectFaults((location, strategy) -> Fault.NONE);
+      assertThat(raced[0]).isTrue();
+      assertThat(table.schema().asStruct()).isEqualTo(intSchema.asStruct());
+      assertThat(catalog(io, LocalCatalogMode.APPEND).listTables(mixedNs))
+          .containsExactly(first, mixed);
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND", "CAS", "APPEND_TM"})
+    void failsIfTheTableWasCreated(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, mode);
+      FileIOCatalog racer = catalog(io, mode);
+      catalog.createNamespace(mixedNs);
+      boolean[] raced = {false};
+      io.injectFaults((location, strategy) -> {
+        if (!raced[0] && location.equals(CATALOG)) {
+          raced[0] = true;
+          racer.createTable(mixed, intSchema);
+        }
+        return Fault.NONE;
+      });
+
+      assertThatThrownBy(() -> catalog.createTable(mixed, intSchema))
+          .isInstanceOf(AlreadyExistsException.class);
+
+      io.injectFaults((location, strategy) -> Fault.NONE);
+      assertThat(raced[0]).isTrue();
+      assertThat(catalog(io, LocalCatalogMode.APPEND).listTables(mixedNs)).containsExactly(mixed);
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)

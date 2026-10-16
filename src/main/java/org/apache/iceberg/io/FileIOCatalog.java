@@ -24,6 +24,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.apache.iceberg.ManifestListSink;
@@ -669,20 +670,48 @@ public class FileIOCatalog extends BaseMetastoreCatalog
     @Override
     public void doCommit(TableMetadata base, TableMetadata metadata) {
       try {
-        CatalogFile.Mut<?, ?> mut = format.from(lastCatalogFile);
         if (base == null) {
-          stageCreate(mut, metadata);
-        } else {
-          stageUpdate(mut, base, metadata);
+          commitCreate(metadata);
+          return;
         }
+        CatalogFile.Mut<?, ?> mut = format.from(lastCatalogFile);
+        stageUpdate(mut, base, metadata);
         mut.commit(io());
       } catch (SupportsAtomicOperations.CASException e) {
         throw new CommitFailedException(e, "Failed to commit metadata for table %s", tableId);
       }
     }
 
-    /** Stages on {@code mut} the creation of this table with {@code metadata}. */
-    private void stageCreate(CatalogFile.Mut<?, ?> mut, TableMetadata metadata) {
+    /**
+     * Commits the creation of this table with {@code metadata}. Its record names the version of
+     * the namespace it read, which any change there bumps (another table created or dropped in
+     * it, its properties set), and Iceberg takes a create's conflict to mean the table exists. So
+     * one that conflicts is staged again on a fresh read, which fails if the table exists by then.
+     * Throws the conflict after Iceberg's default number of attempts.
+     */
+    private void commitCreate(TableMetadata metadata) {
+      Consumer<CatalogFile.Mut<?, ?>> create = stageCreate(metadata);
+      CatalogFile catalogFile = lastCatalogFile;
+      for (int attempt = 1; ; attempt++) {
+        CatalogFile.Mut<?, ?> mut = format.from(catalogFile);
+        create.accept(mut);
+        try {
+          mut.commit(io());
+          return;
+        } catch (CommitFailedException e) {
+          if (attempt >= org.apache.iceberg.TableProperties.COMMIT_NUM_RETRIES_DEFAULT + 1) {
+            throw e;
+          }
+          catalogFile = format.read(fileIO, fileIO.newInputFile(catalogLocation));
+        }
+      }
+    }
+
+    /**
+     * Stages the creation of this table with {@code metadata}: inline, or in a metadata file that
+     * it writes now, so the step stages the same create on any catalog file.
+     */
+    private Consumer<CatalogFile.Mut<?, ?>> stageCreate(TableMetadata metadata) {
       if (inline.metadata) {
         // Errata D9: an inline-ML createTransaction with one or more
         // newFastAppend calls puts InlineSnapshots into `metadata`. Two things
@@ -709,15 +738,14 @@ public class FileIOCatalog extends BaseMetastoreCatalog
                 <= inline.maxUpdateSize
             && !restatesAManifest(null, null, metadata)) {
           if (manifestBytes != null) {
-            mut.createTableInlineWithManifests(
+            return mut -> mut.createTableInlineWithManifests(
                 tableId, metadataBytes, inline.codec.tag(), manifestBytes);
-          } else {
-            mut.createTableInline(tableId, metadataBytes, inline.codec.tag());
           }
-          return;
+          return mut -> mut.createTableInline(tableId, metadataBytes, inline.codec.tag());
         }
       }
-      mut.createTable(tableId, writeUpdateMetadata(true, metadata));
+      String location = writeUpdateMetadata(true, metadata);
+      return mut -> mut.createTable(tableId, location);
     }
 
     /**

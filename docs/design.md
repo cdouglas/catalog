@@ -322,8 +322,9 @@ What the matrix says:
 6. A conflict fails the record, not the operation: Iceberg re-applies a
    table commit on a fresh read, and FileIOCatalog re-applies a catalog
    operation -- a namespace create, drop or property change, a table
-   rename or drop -- which depends on nothing a concurrent change alters
-   but existence, checked again on the fresh read (Bugs 47, 53).
+   create, rename or drop -- which depends on nothing a concurrent change
+   alters but existence, checked again on the fresh read (Bugs 47, 53,
+   54).
 
 ## Late-Binding
 
