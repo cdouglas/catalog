@@ -664,6 +664,10 @@ public class InlineDeltaCodec {
     if (newMeta.formatVersion() != oldMeta.formatVersion()) {
       return null;
     }
+    // Nor has a removed ref (a replace transaction's main branch, removeBranch, removeTag).
+    if (!newMeta.refs().keySet().containsAll(oldMeta.refs().keySet())) {
+      return null;
+    }
     List<DeltaUpdate> updates = new ArrayList<>();
 
     // New snapshots (most common path: data commits)

@@ -2552,6 +2552,59 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 39: an inline delta carried added and changed refs but not removed
+  // ones. A commit that only removed refs left the delta empty, which takes
+  // full mode; one with another change lost the removal: a replace
+  // transaction that also reset the schema kept the replaced table's
+  // current snapshot (its main branch), and a branch removed in a
+  // transaction that set a property came back. A commit that removes a
+  // ref now takes full mode. Found by TestCatalogFaultProperties with
+  // replace transactions.
+  // ============================================================
+
+  @Nested
+  class RemovedRef {
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND_TM", "APPEND_ML"})
+    void replaceDropsTheCurrentSnapshot(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, mode);
+      catalog.createNamespace(mixedNs);
+      catalog.createTable(mixed, intSchema).newFastAppend().appendFile(dataFile("a")).commit();
+      catalog.loadTable(mixed).updateSchema().addColumn("c", Types.IntegerType.get()).commit();
+
+      catalog.buildTable(mixed, intSchema).replaceTransaction().commitTransaction();
+
+      Table table = catalog(io, LocalCatalogMode.APPEND).loadTable(mixed);
+      assertThat(table.currentSnapshot()).isNull();
+      assertThat(dataFiles(table)).isEmpty();
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND_TM", "APPEND_ML"})
+    void removeBranchAndTagWithAProperty(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, mode);
+      catalog.createNamespace(mixedNs);
+      Table table = catalog.createTable(mixed, intSchema);
+      table.newFastAppend().appendFile(dataFile("a")).commit();
+      long snapshot = table.currentSnapshot().snapshotId();
+      table.manageSnapshots().createBranch("b", snapshot).createTag("t", snapshot).commit();
+
+      org.apache.iceberg.Transaction txn = catalog.loadTable(mixed).newTransaction();
+      txn.manageSnapshots().removeBranch("b").removeTag("t").commit();
+      txn.updateProperties().set("k", "v").commit();
+      txn.commitTransaction();
+
+      assertThat(catalog(io, LocalCatalogMode.APPEND).loadTable(mixed).refs())
+          .containsOnlyKeys("main");
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)
