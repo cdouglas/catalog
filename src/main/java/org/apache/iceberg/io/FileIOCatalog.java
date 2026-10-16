@@ -187,6 +187,8 @@ public class FileIOCatalog extends BaseMetastoreCatalog
       if (!catalogFile.containsTable(identifier)) {
         return false;
       }
+      // The metadata a purge deletes the files of: the version this drop removes.
+      TableMetadata dropped = purge ? newTableOps(identifier, catalogFile).current() : null;
       try {
         format.from(catalogFile).dropTable(identifier).commit(fileIO);
       } catch (NoSuchTableException e) {
@@ -197,8 +199,42 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         }
         continue;
       }
+      if (dropped != null) {
+        // The drop has landed: a file the purge cannot read or delete is left behind, not
+        // reported as a failed drop.
+        try {
+          CatalogUtil.dropTableData(skippingInlinePaths(fileIO), dropped);
+        } catch (RuntimeException e) {
+          LOG.warn("Dropped table {}, but could not delete all of its files", identifier, e);
+        }
+      }
       return true;
     }
+  }
+
+  /**
+   * {@code io}, ignoring deletes of the inline:// pseudo-locations an inline table's metadata
+   * names.
+   */
+  private static FileIO skippingInlinePaths(FileIO io) {
+    return new FileIO() {
+      @Override
+      public InputFile newInputFile(String path) {
+        return io.newInputFile(path);
+      }
+
+      @Override
+      public OutputFile newOutputFile(String path) {
+        return io.newOutputFile(path);
+      }
+
+      @Override
+      public void deleteFile(String path) {
+        if (!path.startsWith("inline://")) {
+          io.deleteFile(path);
+        }
+      }
+    };
   }
 
   @Override

@@ -2982,6 +2982,48 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 48: dropTable ignored purge, so a purged table's data files,
+  // manifests, manifest lists and metadata files stayed in storage. A purge
+  // now deletes them once the drop has landed, as BaseMetastoreCatalog
+  // does (through CatalogUtil.dropTableData, skipping an inline table's
+  // inline:// pseudo-locations). Found by reading dropTable.
+  // ============================================================
+
+  @Nested
+  class DropWithPurge {
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND", "APPEND_TM", "APPEND_ML"})
+    void deletesTheTablesFiles(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, mode);
+      catalog.createNamespace(mixedNs);
+      Table table = catalog.createTable(mixed, intSchema);
+      table.newFastAppend().appendFile(dataFile("a")).commit();
+      table.newFastAppend().appendFile(dataFile("b")).commit();
+      Table loaded = catalog.loadTable(mixed);
+      List<String> files = Lists.newArrayList();
+      for (org.apache.iceberg.Snapshot s : loaded.snapshots()) {
+        s.allManifests(io).forEach(m -> files.add(m.path()));
+        if (s.manifestListLocation() != null) {
+          files.add(s.manifestListLocation());
+        }
+      }
+      org.apache.iceberg.TableMetadata metadata =
+          ((org.apache.iceberg.HasTableOperations) loaded).operations().current();
+      if (!metadata.metadataFileLocation().startsWith("inline://")) {
+        files.add(metadata.metadataFileLocation());
+      }
+      assertThat(files).isNotEmpty().allMatch(f -> io.newInputFile(f).exists());
+
+      assertThat(catalog.dropTable(mixed, true)).isTrue();
+
+      assertThat(files).noneMatch(f -> io.newInputFile(f).exists());
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)
