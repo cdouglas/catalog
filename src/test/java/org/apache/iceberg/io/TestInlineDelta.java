@@ -438,7 +438,7 @@ public class TestInlineDelta {
       Map<String, String> originSummary = new java.util.HashMap<>();
       originSummary.put("operation", "append");
       InlineDeltaCodec.AddSnapshotUpdate origin = new InlineDeltaCodec.AddSnapshotUpdate(
-          11L, "origin.avro", originSummary, 0L, 0, 0,
+          11L, "origin.avro", originSummary, 0L, 0, /* addedRows */ null,
           /* parentSnapshotId */ null, /* firstRowId */ null, /* keyId */ null);
       TableMetadata baseWithCurrent = origin.applyTo(baseMetadata(), "");
       baseWithCurrent = TableMetadata.buildFrom(baseWithCurrent)
@@ -451,7 +451,7 @@ public class TestInlineDelta {
       Map<String, String> replacementSummary = new java.util.HashMap<>();
       replacementSummary.put("operation", "append");
       InlineDeltaCodec.AddSnapshotUpdate replacement = new InlineDeltaCodec.AddSnapshotUpdate(
-          22L, "replacement.avro", replacementSummary, 0L, 0, 0,
+          22L, "replacement.avro", replacementSummary, 0L, 0, /* addedRows */ null,
           /* parentSnapshotId */ null, /* firstRowId */ null, /* keyId */ null);
       TableMetadata afterReplacement = replacement.applyTo(baseWithCurrent, "");
 
@@ -838,7 +838,7 @@ public class TestInlineDelta {
       // Now add a second with explicit parent = 100 (same as current in this trivial case)
       InlineDeltaCodec.AddSnapshotUpdate second = new InlineDeltaCodec.AddSnapshotUpdate(
           200L, "", Map.of("operation", "append"),
-          1000L, 0, 0,
+          1000L, 0, /* addedRows */ null,
           /* parent */ 100L, /* firstRowId */ null, /* keyId */ null);
       TableMetadata withSecond = second.applyTo(withFirst, "");
 

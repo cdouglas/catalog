@@ -316,6 +316,8 @@ message AddSnapshot {
   CompactSummary summary                = 3;
   sint64         timestamp_delta_ms     = 4;
   int32          schema_id              = 5;
+  // Present for a v3+ snapshot, 0 included (a snapshot that adds no rows);
+  // absent for a snapshot without row lineage.
   int64          added_rows             = 6;
   // Optional: explicit parent snapshot ID (for stage-only, branch, cherry-pick).
   // When omitted, replay defaults to base.currentSnapshot().snapshotId().

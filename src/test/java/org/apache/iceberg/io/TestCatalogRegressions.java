@@ -2340,4 +2340,40 @@ public class TestCatalogRegressions {
           .containsExactly("mem:///data/a.parquet", "mem:///data/c.parquet");
     }
   }
+
+  // ============================================================
+  // Bug 33: a v3 snapshot that adds no rows (a delete that matched nothing,
+  // or of a table's last file) has added-rows 0. An inline delta wrote the
+  // field only when positive and replay rebuilt it as absent, which
+  // BaseSnapshot rejects when first-row-id is set: no reader could replay
+  // the catalog file, so the commit made every table unreadable. The delta
+  // now writes added-rows whenever the snapshot has it. Found by
+  // TestCatalogFaultProperties with v3 tables.
+  // ============================================================
+
+  @Nested
+  class V3SnapshotThatAddsNoRows {
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND_TM", "APPEND_ML"})
+    void replays(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, mode);
+      catalog.createNamespace(mixedNs);
+      v3(catalog).newDelete().deleteFile("mem:///data/missing.parquet").commit();
+
+      Table table = catalog(io, LocalCatalogMode.APPEND).loadTable(mixed);
+      assertThat(table.currentSnapshot().firstRowId()).isEqualTo(0L);
+      assertThat(table.currentSnapshot().addedRows()).isEqualTo(0L);
+      assertThat(CheckpointRoundTrip.difference(catalogFile(io))).isNull();
+    }
+  }
+
+  private Table v3(FileIOCatalog catalog) {
+    return catalog
+        .buildTable(mixed, intSchema)
+        .withProperty(org.apache.iceberg.TableProperties.FORMAT_VERSION, "3")
+        .create();
+  }
 }

@@ -186,7 +186,7 @@ public class InlineDeltaCodec {
   private static final int SNAP_SUMMARY = 3;
   private static final int SNAP_TIMESTAMP_DELTA = 4;
   private static final int SNAP_SCHEMA_ID = 5;
-  private static final int SNAP_ADDED_ROWS = 6;
+  private static final int SNAP_ADDED_ROWS = 6;   // optional; varint64
   private static final int SNAP_PARENT_ID = 7;    // optional; fixed64
   private static final int SNAP_FIRST_ROW_ID = 8; // optional; varint64
   private static final int SNAP_KEY_ID = 9;       // optional; string
@@ -689,7 +689,6 @@ public class InlineDeltaCodec {
         Long parentId = snap.parentId();
         Long firstRowId = snap.firstRowId();
         String keyId = snap.keyId();
-        long addedRowsValue = snap.addedRows() != null ? snap.addedRows() : 0L;
         // Ensure the operation name is carried in the summary. snap.operation()
         // is the authoritative source; snap.summary() may or may not include
         // the "operation" key depending on the producer, and encoding relies on
@@ -701,7 +700,7 @@ public class InlineDeltaCodec {
         }
         updates.add(new AddSnapshotUpdate(
             snap.snapshotId(), suffix, summary,
-            timestampDelta, schemaId, addedRowsValue,
+            timestampDelta, schemaId, snap.addedRows(),
             parentId, firstRowId, keyId));
       }
     }
@@ -1256,27 +1255,28 @@ public class InlineDeltaCodec {
     public final Map<String, String> summary;
     public final long timestampDeltaMs;
     public final int schemaId;
-    public final long addedRows;
     // Optional fields. Absent values:
+    //   addedRows == null         -> no row lineage (a v3 snapshot has it, 0 included)
     //   parentSnapshotId == null  -> fall back to base.currentSnapshot()
     //   firstRowId == null        -> no row lineage
     //   keyId == null             -> no encryption key
+    public final Long addedRows;
     public final Long parentSnapshotId;
     public final Long firstRowId;
     public final String keyId;
 
-    /** Back-compat constructor: no explicit parent/firstRowId/keyId. */
+    /** Back-compat constructor: no explicit parent/firstRowId/keyId; addedRows 0 is absent. */
     public AddSnapshotUpdate(
         long snapshotId, String manifestListSuffix, Map<String, String> summary,
         long timestampDeltaMs, int schemaId, long addedRows) {
       this(snapshotId, manifestListSuffix, summary, timestampDeltaMs, schemaId,
-          addedRows, null, null, null);
+          addedRows > 0 ? addedRows : null, null, null, null);
     }
 
     /** Full constructor with optional parent snapshot id, first row id, key id. */
     public AddSnapshotUpdate(
         long snapshotId, String manifestListSuffix, Map<String, String> summary,
-        long timestampDeltaMs, int schemaId, long addedRows,
+        long timestampDeltaMs, int schemaId, Long addedRows,
         Long parentSnapshotId, Long firstRowId, String keyId) {
       this.snapshotId = snapshotId;
       this.manifestListSuffix = manifestListSuffix;
@@ -1324,7 +1324,7 @@ public class InlineDeltaCodec {
           resolvedSchemaId,
           manifestList,
           firstRowId,
-          addedRows > 0 ? addedRows : null,
+          addedRows,
           keyId == null || keyId.isEmpty() ? null : keyId);
 
       return TableMetadata.buildFrom(base)
@@ -1528,7 +1528,7 @@ public class InlineDeltaCodec {
       if (u.schemaId > 0) {
         writeVarint(inner, SNAP_SCHEMA_ID, u.schemaId);
       }
-      if (u.addedRows > 0) {
+      if (u.addedRows != null) {
         writeVarint64(inner, SNAP_ADDED_ROWS, u.addedRows);
       }
       // Optional fields for stage-only/branch/cherry-pick/v3+/encrypted tables
@@ -1885,7 +1885,8 @@ public class InlineDeltaCodec {
 
   private static AddSnapshotUpdate decodeAddSnapshot(byte[] bytes) throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
-    long snapId = 0, timestampDelta = 0, addedRows = 0;
+    long snapId = 0, timestampDelta = 0;
+    Long addedRows = null;
     String manifestSuffix = "";
     Map<String, String> summary = new HashMap<>();
     int schemaId = 0;
