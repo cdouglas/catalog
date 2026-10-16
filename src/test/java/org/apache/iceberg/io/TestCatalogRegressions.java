@@ -2796,6 +2796,46 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 44: snapshot expiry deletes the manifests of expired snapshots
+  // that no retained snapshot lists. With more refs than main, Iceberg's
+  // ReachableFileCleanup finds those by removing each retained snapshot's
+  // manifests from a set of candidates, comparing ManifestFile objects;
+  // GenericManifestFile is equal by path, but an inline snapshot's
+  // manifests were the catalog's own DecodedManifestFile, equal only to
+  // itself. So no inline manifest was ever found in use: expiry deleted
+  // every manifest an expired snapshot shared with a retained inline-ML
+  // snapshot, and the table could no longer be read. Inline snapshots now
+  // hold GenericManifestFile copies. Found by TestCatalogFaultProperties.
+  // ============================================================
+
+  @Nested
+  class ExpiryOfATableWithATag {
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND_ML", "APPEND_TM", "APPEND"})
+    void keepsTheManifestsOfRetainedSnapshots(LocalCatalogMode expiring) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog ml = catalog(io, LocalCatalogMode.APPEND_ML);
+      ml.createNamespace(mixedNs);
+      Table table = ml.createTable(mixed, intSchema);
+      table.newFastAppend().appendFile(dataFile("a")).commit();
+      long first = table.currentSnapshot().snapshotId();
+      table.newFastAppend().appendFile(dataFile("b")).commit();
+      table.manageSnapshots().createTag("t", table.currentSnapshot().snapshotId()).commit();
+
+      catalog(io, expiring).loadTable(mixed).expireSnapshots().expireSnapshotId(first).commit();
+
+      Table reloaded = ml.loadTable(mixed);
+      for (org.apache.iceberg.ManifestFile m : reloaded.currentSnapshot().allManifests(io)) {
+        assertThat(io.newInputFile(m.path()).exists()).as(m.path()).isTrue();
+      }
+      assertThat(dataFiles(reloaded))
+          .containsExactly("mem:///data/a.parquet", "mem:///data/b.parquet");
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)

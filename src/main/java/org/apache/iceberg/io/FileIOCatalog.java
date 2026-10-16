@@ -894,7 +894,14 @@ public class FileIOCatalog extends BaseMetastoreCatalog
       Map<Long, Snapshot> replacements = new java.util.HashMap<>();
       for (Snapshot s : parsed.snapshots()) {
         if (proto.hasInlineManifests(tblId, s.snapshotId())) {
-          List<ManifestFile> manifests = proto.inlineManifests(tblId, s.snapshotId());
+          // GenericManifestFile copies: Iceberg compares manifests by equality, which for
+          // GenericManifestFile is by path. Expiry's ReachableFileCleanup finds the manifests that
+          // retained snapshots still use that way; the catalog's own entries, equal only to
+          // themselves, were never found in use, and their files were deleted.
+          List<ManifestFile> manifests = new java.util.ArrayList<>();
+          for (ManifestFile m : proto.inlineManifests(tblId, s.snapshotId())) {
+            manifests.add(org.apache.iceberg.GenericManifestFile.copyOf(m).build());
+          }
           replacements.put(s.snapshotId(), new InlineSnapshot(
               s.sequenceNumber(), s.snapshotId(), s.parentId(),
               s.timestampMillis(), s.operation(), s.summary(),
