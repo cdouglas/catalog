@@ -218,7 +218,16 @@ final class CatalogStateGenerators {
           int nsId = nsIdVer[0];
           int nsVersion = nsIdVer[1];
           int newTblId = pcf.nextTableId() + rng.nextInt(100) + 1;
-          String tblName = randomLowercaseName(rng, 1, 8, java.util.Collections.emptyList());
+          // A name the namespace does not have: a generated state's versions need not count its
+          // entries, so a create of a name in use could verify, which no history allows.
+          List<String> inUse = new ArrayList<>();
+          for (TableIdentifier tbl : pcf.tables()) {
+            Integer tblId = pcf.tableId(tbl);
+            if (tblId != null && pcf.tableEntry(tblId).namespaceId == nsId) {
+              inUse.add(tbl.name());
+            }
+          }
+          String tblName = randomLowercaseName(rng, 1, 8, inUse);
           if (tblName == null) tblName = "tbl" + newTblId;
           String loc = "test://warehouse/ns" + nsId + "/" + tblName + "/v1.metadata.json";
           return new ProtoCodec.CreateTableAction(newTblId, 1, nsId, nsVersion, tblName, loc);
@@ -253,7 +262,14 @@ final class CatalogStateGenerators {
         ? ((ProtoCatalogFile) state).nextNamespaceId()
         : 100;
     int newNsId = baseNsId + rng.nextInt(50);
-    String name = randomLowercaseName(rng, 1, 8, java.util.Collections.emptyList());
+    // A name no top-level namespace has (see the table names in action).
+    List<String> inUse = new ArrayList<>();
+    for (Namespace ns : state.namespaces()) {
+      if (ns.length() == 1) {
+        inUse.add(ns.level(0));
+      }
+    }
+    String name = randomLowercaseName(rng, 1, 8, inUse);
     if (name == null) name = "ns" + newNsId;
     return new ProtoCodec.CreateNamespaceAction(newNsId, 1, 0, 0, name);
   }
