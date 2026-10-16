@@ -99,6 +99,78 @@ not on a worker, whose FileIO is the catalog's.
 **Trigger to revisit:** a worker-side code path that needs one of the
 lazily loaded parts of an inline table.
 
+### D12. Catalog transactions don't retry a lost race
+
+`FileIOCatalog.commitTransaction` does all of its work on one read of
+the catalog file:
+1. It checks the read set (serializable isolation) and each table
+   commit's requirements against that read.
+2. It applies the commits' updates to the tables as they stand in it.
+3. It makes one conditional write.
+
+Some commits that land first on the same tables make the transaction
+fail with `CommitFailedException`:
+- one to a table the transaction writes;
+- under serializable isolation, one to a table it read.
+
+The record's actions conflict with such a commit (design.md, conflict
+matrix), so the format's commit loop can't rebase the record onto it.
+The transaction fails even when the other commit changed nothing it
+depends on, such as a property of a table it appends to. A commit to any
+other table doesn't fail it: the format's commit loop retries a record
+whose actions still hold.
+
+Nothing above this retries:
+- `BaseCatalogTransaction` doesn't, as its "TODO: should this be
+  retryable?" notes.
+- So the caller must run the whole transaction again.
+
+Every other operation re-applies itself on a fresh read: Iceberg retries
+a table commit, and `commitOnAFreshRead` retries namespace operations,
+renames and creates (Bugs 47, 53, 54).
+
+`TestCatalogRaceProperties` counts the transactions that fail although
+nothing they read changed. In a 200,000-try run, 24 of the 8,469 racing
+transactions (0.28%) failed that way. That rate measures one race window
+per try, not production.
+
+The retry would loop as `commitOnAFreshRead` does: on a
+`CommitFailedException` from the write, read the catalog file again and
+redo all three steps. Iceberg's REST server does the same for one table
+(`CatalogHandlers.commit`). Redoing them is safe because each attempt
+makes every check again on its fresh read:
+
+- **The read set:** `unchangedSinceRead` for each branch the
+  transaction read, as now.
+- **Each commit's requirements:** `UpdateRequirements` derives these
+  from the version the transaction read (Bug 23): the table's UUID, the
+  head of each branch the commit moves, and the current schema, spec and
+  sort order where it changes them. A concurrent property change leaves
+  them all holding. A concurrent append to the same branch moves its head
+  and fails them, as it must.
+- **`TableMetadata.Builder`:** it rejects a snapshot whose sequence
+  number or first row id another commit has since passed.
+
+The retry needs four cautions:
+
+- Stop, without retrying, when a requirement or a read check fails, as
+  `CatalogHandlers` does (`ValidationFailureException`). Only a lost
+  write race is worth another attempt.
+- Retry only a definite failure. `CommitStateUnknownException` must
+  still propagate. The format's commit loop already reports
+  `CommitFailedException` only after a read without the record, and
+  returns success for a record that landed though storage reported a
+  failed precondition. The retry relies on that. Otherwise a landed
+  transaction's next attempt would fail its own requirements and report
+  a committed transaction as failed.
+- Stage each attempt on its own read: build a new `Mut`, and call
+  `stageUpdate`, which stages inline-ML manifest lists, from scratch.
+- Then make the race property assert that no transaction fails unless
+  what it read changed, instead of counting those failures.
+
+**Trigger to revisit:** a workload whose multi-table transactions race
+other writers on their tables.
+
 ### D8. Typed-protobuf encoding for Iceberg structural types (skip JSON serde)
 
 `AddSortOrderUpdate` is encoded structurally (see SPEC_TM.md §"Other
