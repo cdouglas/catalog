@@ -237,6 +237,11 @@ and does not refuse is lost on replay: a format-version upgrade (Bug 37)
 or a removed ref (Bug 39) made alongside another change, a schema id or
 count of 0 written as absent (Bugs 33, 38, 40), a value derived on
 replay that the commit did not derive the same way (Bugs 41, 42).
+Replay must also build as the writer did: TableMetadata.Builder checks
+the default spec and sort order against the current schema on every
+build, so a run of metadata updates is applied to one builder and built
+once (Bug 49: an intermediate state of a replace to a schema without
+the partition column did not validate).
 `TestInlineDeltaProperties` runs random Iceberg operations and checks
 that each commit's delta, replayed on its base as the inline codec
 stores it, gives the committed metadata, and that the codec stores

@@ -3024,6 +3024,44 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 49: replay of an inline delta built table metadata after each of its
+  // updates, and TableMetadata.Builder.build checks the default partition
+  // spec and sort order against the current schema. The writer applies all
+  // of a commit's changes before one build, so a commit that changed the
+  // schema and the spec together -- a replace transaction to a schema
+  // without the column the old spec partitioned by -- left an intermediate
+  // state that does not validate: replay threw, and no reader could load
+  // the catalog. Replay now applies a delta's consecutive metadata updates
+  // to one builder and builds it once. Found by TestInlineDeltaProperties.
+  // ============================================================
+
+  @Nested
+  class ReplaceToASchemaWithoutThePartitionColumn {
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND_TM", "APPEND_ML"})
+    void replays(LocalCatalogMode mode) {
+      Schema withTs =
+          new Schema(
+              Types.NestedField.required(1, "id", Types.IntegerType.get()),
+              Types.NestedField.optional(2, "ts", Types.TimestampType.withZone()));
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, mode);
+      catalog.createNamespace(mixedNs);
+      catalog.buildTable(mixed, withTs)
+          .withPartitionSpec(org.apache.iceberg.PartitionSpec.builderFor(withTs).day("ts").build())
+          .create();
+
+      catalog.buildTable(mixed, intSchema).replaceTransaction().commitTransaction();
+
+      Table table = catalog(io, LocalCatalogMode.APPEND).loadTable(mixed);
+      assertThat(table.schema().asStruct()).isEqualTo(intSchema.asStruct());
+      assertThat(table.spec().isUnpartitioned()).isTrue();
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)

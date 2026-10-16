@@ -276,7 +276,29 @@ public class InlineDeltaCodec {
     java.util.Set<Long> addedInThisDelta = new java.util.HashSet<>();
     NewSnapshotManifests newSnapshots = new NewSnapshotManifests(catalogBuilder, tableId);
     TableMetadata current = base;
+    // Consecutive TableMetadata updates (schema, spec, sort order, refs, properties, ...) apply to
+    // one builder, built once, as the writer's were: build() checks the default spec and sort
+    // order against the current schema, which an intermediate state, a new schema without the
+    // column the old spec partitions by, would fail.
+    TableMetadata.Builder pending = null;
     for (DeltaUpdate update : updates) {
+      boolean metadataOnly =
+          !(update instanceof AddSnapshotUpdate)
+              && !(update instanceof AddManifestUpdate)
+              && !(update instanceof RemoveManifestUpdate)
+              && !(update instanceof RemoveSnapshotsUpdate);
+      if (metadataOnly) {
+        if (pending == null) {
+          pending = TableMetadata.buildFrom(current);
+          pending.setLastUpdatedMillis(writerLastUpdatedMillis);
+        }
+        update.applyTo(pending);
+        continue;
+      }
+      if (pending != null) {
+        current = pending.discardChanges().build();
+        pending = null;
+      }
       if (update instanceof AddSnapshotUpdate) {
         // Route through the prefix-accepting overload (avoids the throw in applyTo(Builder))
         AddSnapshotUpdate addSnap = (AddSnapshotUpdate) update;
@@ -341,13 +363,10 @@ public class InlineDeltaCodec {
         tmBuilder.setLastUpdatedMillis(writerLastUpdatedMillis);
         update.applyTo(tmBuilder);
         current = tmBuilder.discardChanges().build();
-      } else {
-        // Schema, properties, sort order, refs, etc. — apply to TableMetadata.Builder.
-        TableMetadata.Builder tmBuilder = TableMetadata.buildFrom(current);
-        tmBuilder.setLastUpdatedMillis(writerLastUpdatedMillis);
-        update.applyTo(tmBuilder);
-        current = tmBuilder.discardChanges().build();
       }
+    }
+    if (pending != null) {
+      current = pending.discardChanges().build();
     }
     newSnapshots.finish();
     return baseCodec.encode(current);
