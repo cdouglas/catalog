@@ -63,6 +63,8 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.CommitStateUnknownException;
+import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
+import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
@@ -78,8 +80,8 @@ import org.apache.iceberg.types.Types;
  * catalog instance and table handles over shared {@link InMemoryAtomicFileIO} storage: fast and
  * merge appends, deletes, row-level deletes (equality, position, deletion vectors), property,
  * schema and partition-spec changes, table transactions, snapshot expiry, manifest rewrites, table
- * create / drop / rename / replace, upgrades from format v2 to v3, and multi-table catalog
- * transactions whose
+ * create / drop / rename (across namespaces too) / replace, upgrades from format v2 to v3,
+ * namespace create / drop and property changes, and multi-table catalog transactions whose
  * loads, appends and commit are separate steps, so other writers' operations run in between. A
  * command may also preempt the one before it: it runs to completion just before one of that
  * operation's reads of the catalog or its first conditional write, so the two race. Each writer
@@ -97,9 +99,9 @@ import org.apache.iceberg.types.Types;
  * (see {@link InMemoryAtomicFileIO#failSupersededReads}).
  *
  * <p>Tables are created in format v2 or v3; v3 tables do not merge manifests, which in Iceberg
- * core renumbers existing rows (see {@code V3_PROPERTIES}). A model holds each table's UUID,
- * format version, live data and delete files, properties and added columns. After every operation
- * the catalog, read back without faults, must match it:
+ * core renumbers existing rows (see {@code V3_PROPERTIES}). A model holds the namespaces and their
+ * properties, and each table's UUID, format version, live data and delete files, properties and
+ * added columns. After every operation the catalog, read back without faults, must match it:
  *
  * <ul>
  *   <li>An acknowledged operation took effect once, and nothing else changed.
@@ -107,9 +109,9 @@ import org.apache.iceberg.types.Types;
  *       effect. Iceberg deletes a commit's new files on a {@code CleanableFailure} such as {@link
  *       CommitFailedException}, so a commit reported that way that took effect loses them.
  *   <li>An operation whose outcome is unknown took effect entirely or not at all.
- *   <li>Every table loads; every snapshot has its manifest list, inline or in a file, and every
- *       manifest exists; a snapshot's manifest list never changes; no table is stored both inline
- *       and in a metadata file.
+ *   <li>Every table is in a namespace; every table loads; every snapshot has its manifest list,
+ *       inline or in a file, and every manifest exists; a snapshot's manifest list never changes;
+ *       no table is stored both inline and in a metadata file.
  *   <li>Every version of the catalog file that a writer wrote reads the same as a checkpoint of
  *       it, which the next compaction would write (see {@link CheckpointRoundTrip}).
  *   <li>Row lineage, in a v3 table: once a snapshot has row ids, every live data file has them; the
@@ -123,9 +125,12 @@ import org.apache.iceberg.types.Types;
 class TestCatalogFaultProperties {
 
   private static final Namespace NS = Namespace.of("ns");
+  private static final Namespace NS2 = Namespace.of("ns2");
   // A small universe, so writers collide often.
+  private static final List<Namespace> NAMESPACES = List.of(NS, NS2);
   private static final List<TableIdentifier> TABLES =
-      List.of(TableIdentifier.of(NS, "t0"), TableIdentifier.of(NS, "t1"), TableIdentifier.of(NS, "t2"));
+      List.of(TableIdentifier.of(NS, "t0"), TableIdentifier.of(NS, "t1"), TableIdentifier.of(NS, "t2"),
+          TableIdentifier.of(NS2, "t0"));
   private static final Schema SCHEMA = new Schema(required(1, "id", Types.IntegerType.get()));
   private static final String KEY_PREFIX = "fz.";
   private static final List<String> KEYS = List.of("fz.k1", "fz.k2");
@@ -241,6 +246,10 @@ class TestCatalogFaultProperties {
             Tuple.of(2, Kind.TABLE_TXN),
             Tuple.of(1, Kind.EXPIRE_SNAPSHOTS),
             Tuple.of(1, Kind.REWRITE_MANIFESTS),
+            Tuple.of(1, Kind.CREATE_NAMESPACE),
+            Tuple.of(1, Kind.DROP_NAMESPACE),
+            Tuple.of(2, Kind.SET_NAMESPACE_PROPERTY),
+            Tuple.of(1, Kind.REMOVE_NAMESPACE_PROPERTY),
             Tuple.of(3, Kind.TXN_BEGIN),
             Tuple.of(4, Kind.TXN_APPEND),
             Tuple.of(2, Kind.TXN_READ),
@@ -323,6 +332,14 @@ class TestCatalogFaultProperties {
     TABLE_TXN,
     EXPIRE_SNAPSHOTS,
     REWRITE_MANIFESTS,
+    /** Creates ns or ns2, as {@code b} picks, with a property when {@code b} is odd. */
+    CREATE_NAMESPACE,
+    /** Drops ns or ns2, as {@code b} picks, which fails unless it is empty. */
+    DROP_NAMESPACE,
+    /** Sets fz.k1 or fz.k2 on ns or ns2, as {@code b} picks. */
+    SET_NAMESPACE_PROPERTY,
+    /** Removes fz.k1 or fz.k2 from ns or ns2, as {@code b} picks. */
+    REMOVE_NAMESPACE_PROPERTY,
     /** Opens a catalog transaction; {@code b} picks the isolation level. */
     TXN_BEGIN,
     /** Loads a table in the open catalog transaction and stages an append to it. */
@@ -392,6 +409,21 @@ class TestCatalogFaultProperties {
 
   private static final Comparator<TableIdentifier> BY_NAME =
       Comparator.comparing(TableIdentifier::toString);
+
+  /** The tables' states, by identifier, and the namespaces' properties. */
+  static final class Model extends TreeMap<TableIdentifier, TableState> {
+    final Map<Namespace, Map<String, String>> namespaces =
+        new TreeMap<>(Comparator.comparing(Namespace::toString));
+
+    Model() {
+      super(BY_NAME);
+    }
+
+    @Override
+    public String toString() {
+      return "namespaces " + namespaces + ", tables " + super.toString();
+    }
+  }
 
   /** What the model tracks of a table, and what it observed of it at the last check. */
   static final class TableState {
@@ -465,15 +497,18 @@ class TestCatalogFaultProperties {
         : value.substring(0, 8) + "...(" + value.length() + " chars)";
   }
 
-  private static Map<TableIdentifier, TableState> copy(Map<TableIdentifier, TableState> model) {
-    Map<TableIdentifier, TableState> copy = new TreeMap<>(BY_NAME);
+  private static Model copy(Model model) {
+    Model copy = new Model();
     model.forEach((id, state) -> copy.put(id, state.copy()));
+    model.namespaces.forEach((ns, props) -> copy.namespaces.put(ns, new TreeMap<>(props)));
     return copy;
   }
 
   /** How {@code actual} differs from {@code expected}, or null if it matches. */
-  private static String diff(
-      Map<TableIdentifier, TableState> expected, Map<TableIdentifier, TableState> actual) {
+  private static String diff(Model expected, Model actual) {
+    if (!expected.namespaces.equals(actual.namespaces)) {
+      return "namespaces " + expected.namespaces + " expected, found " + actual.namespaces;
+    }
     if (!expected.keySet().equals(actual.keySet())) {
       return "tables " + expected.keySet() + " expected, found " + actual.keySet();
     }
@@ -513,7 +548,7 @@ class TestCatalogFaultProperties {
   /** An operation's intended change to the model; throws if it cannot apply. */
   @FunctionalInterface
   interface Effect {
-    void apply(Map<TableIdentifier, TableState> model, Map<TableIdentifier, TableState> actual);
+    void apply(Model model, Model actual);
   }
 
   /** What an operation does to storage, through Iceberg. */
@@ -603,7 +638,7 @@ class TestCatalogFaultProperties {
     private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
     private final Writer[] writers;
     private final FileIOCatalog checker;
-    private Map<TableIdentifier, TableState> model;
+    private Model model;
     private final StringBuilder trace = new StringBuilder();
     private int nextFile = 0;
     private int nextValue = 0;
@@ -872,7 +907,8 @@ class TestCatalogFaultProperties {
               "createTable(" + created + ", v" + version + ")",
               () -> create(w.catalog, created, version),
               (m, actual) -> {
-                if (m.containsKey(created) || !actual.containsKey(created)) {
+                if (m.containsKey(created) || !actual.containsKey(created)
+                    || !m.namespaces.containsKey(created.namespace())) {
                   throw new IllegalStateException("cannot create " + created);
                 }
                 m.put(created, new TableState(actual.get(created).uuid, version));
@@ -903,6 +939,9 @@ class TestCatalogFaultProperties {
                 TableState state = existing(m, id);
                 if (m.containsKey(to)) {
                   throw new IllegalStateException(to + " exists");
+                }
+                if (!m.namespaces.containsKey(to.namespace())) {
+                  throw new IllegalStateException(to.namespace() + " does not exist");
                 }
                 m.remove(id);
                 m.put(to, state);
@@ -1247,7 +1286,7 @@ class TestCatalogFaultProperties {
               },
               (m, actual) -> {
                 TableState before = m.get(id);
-                if (before == null && !orCreate) {
+                if (before == null && (!orCreate || !m.namespaces.containsKey(id.namespace()))) {
                   throw new IllegalStateException(id + " does not exist");
                 }
                 TableState now = actual.get(id);
@@ -1370,6 +1409,11 @@ class TestCatalogFaultProperties {
                 }
               },
               (m, actual) -> existing(m, id));
+        case CREATE_NAMESPACE:
+        case DROP_NAMESPACE:
+        case SET_NAMESPACE_PROPERTY:
+        case REMOVE_NAMESPACE_PROPERTY:
+          return namespaceOp(cmd, w, NAMESPACES.get(cmd.b % NAMESPACES.size()));
         case TXN_BEGIN:
           if (w.txn != null) {
             return null;
@@ -1426,6 +1470,70 @@ class TestCatalogFaultProperties {
       }
     }
 
+    /** A namespace operation on {@code ns}. */
+    private Op namespaceOp(Cmd cmd, Writer w, Namespace ns) {
+      String key = KEYS.get(cmd.b / 2 % KEYS.size());
+      switch (cmd.kind) {
+        case CREATE_NAMESPACE:
+          Map<String, String> props = cmd.b % 2 == 1 ? Map.of(key, "v" + nextValue++) : Map.of();
+          return new Op(
+              "createNamespace(" + ns + ", " + props + ")",
+              () -> w.catalog.createNamespace(ns, props),
+              (m, actual) -> {
+                if (m.namespaces.containsKey(ns)) {
+                  throw new IllegalStateException(ns + " exists");
+                }
+                m.namespaces.put(ns, new TreeMap<>(props));
+              });
+        case DROP_NAMESPACE:
+          return new Op(
+              "dropNamespace(" + ns + ")",
+              () -> {
+                if (!w.catalog.dropNamespace(ns)) {
+                  throw new NoSuchNamespaceException("dropNamespace returned false: %s", ns);
+                }
+              },
+              (m, actual) -> {
+                if (!m.namespaces.containsKey(ns)) {
+                  throw new IllegalStateException(ns + " does not exist");
+                }
+                if (m.keySet().stream().anyMatch(id -> id.namespace().equals(ns))) {
+                  throw new IllegalStateException(ns + " is not empty");
+                }
+                m.namespaces.remove(ns);
+              });
+        case SET_NAMESPACE_PROPERTY:
+          String value = "v" + nextValue++;
+          return new Op(
+              "setProperties(" + ns + ", " + key + "=" + value + ")",
+              () -> {
+                if (!w.catalog.setProperties(ns, Map.of(key, value))) {
+                  throw new IllegalStateException("setProperties returned false");
+                }
+              },
+              (m, actual) -> {
+                if (!m.namespaces.containsKey(ns)) {
+                  throw new IllegalStateException(ns + " does not exist");
+                }
+                m.namespaces.get(ns).put(key, value);
+              });
+        default:
+          return new Op(
+              "removeProperties(" + ns + ", " + key + ")",
+              () -> {
+                if (!w.catalog.removeProperties(ns, Set.of(key))) {
+                  throw new IllegalStateException("removeProperties returned false");
+                }
+              },
+              (m, actual) -> {
+                if (!m.namespaces.containsKey(ns)) {
+                  throw new IllegalStateException(ns + " does not exist");
+                }
+                m.namespaces.get(ns).remove(key);
+              });
+      }
+    }
+
     /**
      * Throws if a catalog transaction that loaded {@code loaded} could not have committed on
      * {@code current}, the state its effects apply to.
@@ -1476,7 +1584,8 @@ class TestCatalogFaultProperties {
       } catch (CommitStateUnknownException e) {
         outcome = Outcome.UNKNOWN;
         reason = firstLine(e);
-      } catch (CommitFailedException | ValidationException | AlreadyExistsException e) {
+      } catch (CommitFailedException | ValidationException | AlreadyExistsException
+          | NoSuchNamespaceException | NamespaceNotEmptyException e) {
         outcome = Outcome.REJECTED;
         reason = e.getClass().getSimpleName() + ": " + firstLine(e);
       } catch (NoSuchTableException e) {
@@ -1516,8 +1625,8 @@ class TestCatalogFaultProperties {
 
     /** Checks the catalog against the model, given what {@code op} reported. */
     private void resolve(Op op, Outcome outcome, String reason) {
-      Map<TableIdentifier, TableState> actual = actual();
-      Map<TableIdentifier, TableState> with = copy(model);
+      Model actual = actual();
+      Model with = copy(model);
       String applies = null;
       try {
         op.effect.apply(with, actual);
@@ -1596,12 +1705,19 @@ class TestCatalogFaultProperties {
      * changed, if a v3 table's row ids are missing or overlap, or if a catalog file written since
      * the last check differs from a checkpoint of it.
      */
-    private Map<TableIdentifier, TableState> actual() {
+    private Model actual() {
       checkCheckpoints();
-      Map<TableIdentifier, TableState> tables = new TreeMap<>(BY_NAME);
+      Model tables = new Model();
       ProtoCatalogFile file =
           new ProtoCatalogFormat(PROPERTIES).read(io, io.newInputFile(CATALOG_LOCATION));
-      for (TableIdentifier id : checker.listTables(NS)) {
+      List<TableIdentifier> ids = new ArrayList<>();
+      for (Namespace ns : checker.listNamespaces(Namespace.empty())) {
+        tables.namespaces.put(ns, new TreeMap<>(checker.loadNamespaceMetadata(ns)));
+        ids.addAll(checker.listTables(ns));
+      }
+      check(file.tables().size() == ids.size(),
+          "the catalog has tables %s, but its namespaces list %s", file.tables(), ids);
+      for (TableIdentifier id : ids) {
         TableState state;
         try {
           Table table = checker.loadTable(id);
