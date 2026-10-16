@@ -659,6 +659,11 @@ public class InlineDeltaCodec {
     if (idCollidesWithDifferentContent(oldMeta, newMeta)) {
       return null;
     }
+    // A format-version upgrade has no DeltaUpdate type: full mode carries it. Without this, an
+    // upgrade with any other change went as a delta of the other change alone.
+    if (newMeta.formatVersion() != oldMeta.formatVersion()) {
+      return null;
+    }
     List<DeltaUpdate> updates = new ArrayList<>();
 
     // New snapshots (most common path: data commits)

@@ -2480,6 +2480,41 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 37: an inline delta has no update for the format version, and
+  // computeDelta did not look at it. An upgrade alone left the delta
+  // empty, which takes full mode, so it landed; an upgrade with any other
+  // change in the same commit went as a delta without it, and was
+  // acknowledged but lost. A format-version change now takes full mode.
+  // Found by TestCatalogFaultProperties with v3 tables.
+  // ============================================================
+
+  @Nested
+  class UpgradeWithAnotherChange {
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND_TM", "APPEND_ML"})
+    void lands(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, mode);
+      catalog.createNamespace(mixedNs);
+      catalog.createTable(mixed, intSchema);
+
+      catalog.loadTable(mixed)
+          .updateProperties()
+          .set(org.apache.iceberg.TableProperties.FORMAT_VERSION, "3")
+          .set("k", "v")
+          .commit();
+
+      Table table = catalog(io, LocalCatalogMode.APPEND).loadTable(mixed);
+      assertThat(((org.apache.iceberg.HasTableOperations) table).operations().current()
+              .formatVersion())
+          .isEqualTo(3);
+      assertThat(table.properties()).containsEntry("k", "v");
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)
