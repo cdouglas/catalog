@@ -47,13 +47,17 @@ import org.apache.iceberg.types.Types;
  * have, and leave the catalog as it would, had it run after the operations that ran before its
  * writes: the same as a serial run of those, then A, then the rest, on another copy of the same
  * catalog. (If A does not write -- it fails on what it read, or has nothing to change -- B and C
- * run after it.)
+ * run after it.) One exception: an operation through a table handle (a property change, an
+ * append, a delete) that Iceberg refuses because the table it loaded was dropped and another
+ * created under its name since (its UUID changed) must leave the catalog as the others alone do.
  *
  * <p>The operations are namespace creates (of nested namespaces too, which create their parents),
- * drops and property changes, and table creates, drops, renames and property changes, on a small
- * universe of names, from a generated catalog state; each writer has its own catalog mode. A
- * result is a return value or an exception's class; the catalog's state is its namespaces with
- * their properties and its tables with theirs (a table created carries its creator's name).
+ * drops and property changes; table creates, drops, renames and property changes; and appends and
+ * deletes of every row, which Iceberg retries on a conflict as it does a property change (unlike
+ * a schema change). They run on a small universe of names, from a generated catalog state; each
+ * writer has its own catalog mode. A result is a return value or an exception's class; the
+ * catalog's state is its namespaces with their properties and its tables with theirs (a table
+ * created carries its creator's name) and their live data files.
  */
 class TestCatalogRaceProperties {
 
@@ -113,7 +117,9 @@ class TestCatalogRaceProperties {
     }
     String raceState = state(io);
 
-    // The serial run on another copy: the racers that ran before A's writes, A, the rest.
+    // The serial run on another copy: the racers that ran before A's writes, A, the rest. A
+    // handle whose table was replaced since it was loaded cannot commit, so then without A.
+    boolean replaced = a.kind.throughAHandle() && raceA.equals(REPLACED);
     InMemoryAtomicFileIO serialIo = new InMemoryAtomicFileIO();
     setup.apply(LocalCatalogMode.APPEND.catalog(serialIo, WAREHOUSE, "c", Map.of()));
     String[] serial = new String[racers.size()];
@@ -121,12 +127,14 @@ class TestCatalogRaceProperties {
       serial[k] = racers.get(k).run(
           racerModes.get(k).catalog(serialIo, WAREHOUSE, "c", Map.of()), name(k));
     }
-    String serialA = a.run(modeA.catalog(serialIo, WAREHOUSE, "c", Map.of()), "A");
+    String serialA =
+        replaced ? REPLACED : a.run(modeA.catalog(serialIo, WAREHOUSE, "c", Map.of()), "A");
     for (int k = before; k < racers.size(); k++) {
       serial[k] = racers.get(k).run(
           racerModes.get(k).catalog(serialIo, WAREHOUSE, "c", Map.of()), name(k));
     }
     String serialState = state(serialIo);
+    Statistics.label("A's table replaced under its handle").collect(replaced);
 
     Statistics.label("racers before A's writes").collect(before + " of " + racers.size());
     Statistics.label("A").collect(a.kind + " " + (raceA.startsWith("ok") ? "ok" : "fails"));
@@ -151,6 +159,9 @@ class TestCatalogRaceProperties {
   private static String name(int racer) {
     return racer == 0 ? "B" : "C";
   }
+
+  /** What Iceberg reports for a handle to a table that was dropped and created again. */
+  private static final String REPLACED = "IllegalStateException: Table UUID does not match";
 
   @Provide
   Arbitrary<LocalCatalogMode> modes() {
@@ -225,7 +236,16 @@ class TestCatalogRaceProperties {
     CREATE_TABLE_TXN,
     DROP_TABLE,
     RENAME_TABLE,
-    SET_TABLE_PROPERTY
+    SET_TABLE_PROPERTY,
+    /** Appends a file named for the writer. */
+    FAST_APPEND,
+    /** Deletes every row: the files live when the delete applies, after any retry. */
+    DELETE_ALL;
+
+    /** Whether the operation loads a table and commits through its handle. */
+    boolean throughAHandle() {
+      return this == SET_TABLE_PROPERTY || this == FAST_APPEND || this == DELETE_ALL;
+    }
   }
 
   /** An operation; {@code x} and {@code y} pick its operands. */
@@ -281,12 +301,30 @@ class TestCatalogRaceProperties {
           case RENAME_TABLE:
             catalog.renameTable(table(), other());
             return "ok";
-          default:
+          case SET_TABLE_PROPERTY:
+            catalog.loadTable(table()).updateProperties().set(key(), who).commit();
+            return "ok";
+          case FAST_APPEND:
             Table table = catalog.loadTable(table());
-            table.updateProperties().set(key(), who).commit();
+            table.newFastAppend()
+                .appendFile(org.apache.iceberg.DataFiles.builder(table.spec())
+                    .withPath("mem:///data/" + who + ".parquet")
+                    .withFileSizeInBytes(10)
+                    .withRecordCount(1)
+                    .build())
+                .commit();
+            return "ok";
+          default:
+            catalog.loadTable(table()).newDelete()
+                .deleteFromRowFilter(org.apache.iceberg.expressions.Expressions.alwaysTrue())
+                .commit();
             return "ok";
         }
       } catch (RuntimeException e) {
+        if (e instanceof IllegalStateException && e.getMessage() != null
+            && e.getMessage().startsWith("Table UUID does not match")) {
+          return REPLACED;
+        }
         return e.getClass().getSimpleName();
       }
     }
@@ -304,6 +342,10 @@ class TestCatalogRaceProperties {
           return "renameTable(" + table() + ", " + other() + ")";
         case SET_TABLE_PROPERTY:
           return "setTableProperty(" + table() + ", " + key() + ")";
+        case FAST_APPEND:
+          return "fastAppend(" + table() + ")";
+        case DELETE_ALL:
+          return "deleteAll(" + table() + ")";
         default:
           return kind + "(" + table() + ")";
       }
@@ -319,9 +361,17 @@ class TestCatalogRaceProperties {
       Namespace ns = pending.remove(0);
       state.put("namespace " + ns, new TreeMap<>(reader.loadNamespaceMetadata(ns)).toString());
       for (TableIdentifier id : reader.listTables(ns)) {
-        Map<String, String> props = new TreeMap<>(reader.loadTable(id).properties());
+        Table table = reader.loadTable(id);
+        Map<String, String> props = new TreeMap<>(table.properties());
         props.keySet().removeIf(k -> !k.equals("origin") && !KEYS.contains(k));
-        state.put("table " + id, props.toString());
+        java.util.Set<String> files = new java.util.TreeSet<>();
+        try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.FileScanTask> tasks =
+            table.newScan().planFiles()) {
+          tasks.forEach(task -> files.add(task.file().location()));
+        } catch (java.io.IOException e) {
+          throw new java.io.UncheckedIOException(e);
+        }
+        state.put("table " + id, props + " files " + files);
       }
       pending.addAll(reader.listNamespaces(ns));
     }
