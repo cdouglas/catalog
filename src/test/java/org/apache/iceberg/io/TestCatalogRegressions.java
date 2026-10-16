@@ -3419,6 +3419,66 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 56: FileIOCatalog.initialize creates the catalog file if there is
+  // none, and of two catalogs starting on a new warehouse at once, the one
+  // whose create lost failed to initialize (CommitFailedException:
+  // "Catalog creation failed: ... exists"); so did one whose create landed
+  // with its reply lost (CommitStateUnknownException). Either now uses the
+  // file that exists. Found by reading initialize.
+  // ============================================================
+
+  @Nested
+  class InitializeRacingAnotherInitialize {
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND", "CAS"})
+    void usesTheOthersCatalog(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      boolean[] raced = {false};
+      FileIOCatalog[] other = {null};
+      io.injectFaults((location, strategy) -> {
+        if (!raced[0]) {
+          raced[0] = true;
+          other[0] = catalog(io, mode); // just before this catalog's create
+        }
+        return Fault.NONE;
+      });
+
+      FileIOCatalog catalog = catalog(io, mode);
+
+      io.injectFaults((location, strategy) -> Fault.NONE);
+      assertThat(other[0]).isNotNull();
+      other[0].createNamespace(mixedNs);
+      assertThat(catalog.namespaceExists(mixedNs)).isTrue();
+    }
+
+    @Test
+    void usesItsOwnCatalogWhoseReplyWasLost() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      boolean[] faulted = {false};
+      int[] failingReads = {0};
+      io.injectReadFaults(location -> failingReads[0]-- > 0 ? ReadFault.FAIL : ReadFault.NONE);
+      io.injectFaults((location, strategy) -> {
+        if (!faulted[0]) {
+          faulted[0] = true;
+          failingReads[0] = 1; // and the read that would settle it fails
+          return Fault.LOST_REPLY;
+        }
+        return Fault.NONE;
+      });
+
+      FileIOCatalog catalog = catalog(io, LocalCatalogMode.APPEND);
+
+      io.injectFaults((location, strategy) -> Fault.NONE);
+      io.injectReadFaults(location -> ReadFault.NONE);
+      assertThat(faulted[0]).isTrue();
+      catalog.createNamespace(mixedNs);
+      assertThat(catalog(io, LocalCatalogMode.APPEND).namespaceExists(mixedNs)).isTrue();
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)

@@ -46,6 +46,7 @@ import org.apache.iceberg.catalog.SupportsNamespaces;
 import org.apache.iceberg.catalog.TableCommit;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.CommitFailedException;
+import org.apache.iceberg.exceptions.CommitStateUnknownException;
 import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
@@ -151,7 +152,15 @@ public class FileIOCatalog extends BaseMetastoreCatalog
     }
     final InputFile catalogFile = fileIO.newInputFile(catalogLocation);
     if (!catalogFile.exists()) {
-      format.empty(catalogFile).commit(fileIO);
+      try {
+        format.empty(catalogFile).commit(fileIO);
+      } catch (CommitFailedException | CommitStateUnknownException e) {
+        // Another catalog created it since (two processes starting on a new warehouse), or this
+        // one's create landed though its reply was lost: either way, use it.
+        if (!fileIO.newInputFile(catalogLocation).exists()) {
+          throw e;
+        }
+      }
     }
   }
 
