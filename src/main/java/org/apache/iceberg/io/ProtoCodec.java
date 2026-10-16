@@ -149,6 +149,7 @@ public class ProtoCodec {
   private static final int MF_PARTITIONS = 14;
   private static final int MF_KEY_METADATA = 15;
   private static final int MF_FIRST_ROW_ID = 16;
+  private static final int MF_NO_PARTITIONS = 17; // present (true) when partitions is null
 
   // PartitionFieldSummaryEntry field numbers
   private static final int PFS_CONTAINS_NULL = 1;
@@ -1848,6 +1849,9 @@ public class ProtoCodec {
         byte[] pfsBytes = encodePartitionFieldSummary(pfs);
         writeLengthDelimited(out, MF_PARTITIONS, pfsBytes);
       }
+    } else {
+      // Unlike an empty list (an unpartitioned spec), null means no summaries (a v1 manifest).
+      writeVarint(out, MF_NO_PARTITIONS, 1);
     }
     if (manifest.keyMetadata() != null) {
       byte[] km = new byte[manifest.keyMetadata().remaining()];
@@ -1885,6 +1889,7 @@ public class ProtoCodec {
     List<PartitionFieldSummary> partitions = new ArrayList<>();
     byte[] keyMetadata = null;
     Long firstRowId = null;
+    boolean noPartitions = false;
 
     while (in.available() > 0) {
       int tag = readVarint(in);
@@ -1939,6 +1944,9 @@ public class ProtoCodec {
         case MF_FIRST_ROW_ID:
           firstRowId = readVarint64(in);
           break;
+        case MF_NO_PARTITIONS:
+          noPartitions = readVarint(in) != 0;
+          break;
         default:
           skipField(in, wireType);
       }
@@ -1948,7 +1956,7 @@ public class ProtoCodec {
     return new DecodedManifestFile(
         fullPath, length, specId, content, seqNum, minSeqNum, snapshotId,
         addedFiles, existingFiles, deletedFiles, addedRows, existingRows, deletedRows,
-        partitions.isEmpty() ? null : ImmutableList.copyOf(partitions),
+        noPartitions ? null : ImmutableList.copyOf(partitions),
         keyMetadata, firstRowId);
   }
 

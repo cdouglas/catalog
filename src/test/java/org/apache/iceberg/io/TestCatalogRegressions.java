@@ -3099,6 +3099,32 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 51: a manifest list entry's partition summaries were not written
+  // when there were none, and decoded as null either way, so an
+  // unpartitioned manifest, which lists none, read back as one with no
+  // summaries (null), as a v1 manifest has. The entry now marks a null
+  // list, and an empty one reads back empty. Found by
+  // TestInlineDifferentialProperties.
+  // ============================================================
+
+  @Nested
+  class UnpartitionedInlineManifest {
+
+    @Test
+    void hasAnEmptyListOfSummaries() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog ml = catalog(io, LocalCatalogMode.APPEND_ML);
+      ml.createNamespace(mixedNs);
+      ml.createTable(mixed, intSchema).newFastAppend().appendFile(dataFile("a")).commit();
+
+      Table read = catalog(io, LocalCatalogMode.APPEND).loadTable(mixed);
+
+      assertThat(read.currentSnapshot().allManifests(io))
+          .allSatisfy(m -> assertThat(m.partitions()).isNotNull().isEmpty());
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)

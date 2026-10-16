@@ -475,6 +475,9 @@ message ManifestFileEntry {
   // Present whenever the manifest has one, 0 included (a v3 table's first data
   // manifest); absent for a manifest whose rows have no ids yet.
   int64  first_row_id           = 16;
+  // True when the manifest has no partition summaries (null, as in a v1
+  // manifest); absent for a list, which may be empty (an unpartitioned spec).
+  bool   no_partitions          = 17;
 }
 
 message PartitionFieldSummaryEntry {

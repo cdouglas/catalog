@@ -86,6 +86,7 @@ message ManifestFileEntry {
   repeated PartitionFieldSummaryEntry partitions = 14;
   bytes  key_metadata           = 15;
   int64  first_row_id           = 16;  // present whenever set, 0 included
+  bool   no_partitions          = 17;  // partitions is null, not an empty list
 }
 
 message PartitionFieldSummaryEntry {
