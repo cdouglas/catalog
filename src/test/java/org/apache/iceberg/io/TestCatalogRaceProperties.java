@@ -54,8 +54,9 @@ import org.apache.iceberg.types.Types;
  * way either: it must fail, and leave the catalog as the others alone do, if an operation that
  * ran before its writes changed what it read -- under serializable isolation the main branch of
  * each table it loaded (or the table, if main had no snapshot), under snapshot isolation that of
- * the table it appended to. It may fail otherwise too, as it does when another commit changed a
- * table it writes at all (a failure is safe: its client retries); the property counts those.
+ * the table it appended to. It also fails when another commit changed a table it writes in any
+ * other way, a property change included, as the catalog's transactions conflict on a table's whole
+ * version (errata D12); the property counts those.
  *
  * <p>The operations are namespace creates (of nested namespaces too, which create their parents),
  * drops and property changes; table creates, drops, renames and property changes; and appends and
@@ -131,7 +132,8 @@ class TestCatalogRaceProperties {
     }
     String raceState = state(io);
 
-    // A transaction whose reads a racer changed must fail; one whose reads held may fail too.
+    // A transaction whose reads a racer changed must fail; one whose reads held fails too if a
+    // racer otherwise changed a table it pins (errata D12).
     boolean txnFailed = a.kind == Kind.CATALOG_TXN && before > 0 && !raceA.startsWith("ok");
     if (a.kind == Kind.CATALOG_TXN && before > 0) {
       Statistics.label("transaction racing")

@@ -337,9 +337,10 @@ What the matrix says:
    operation -- a namespace create, drop or property change, a table
    create, rename or drop -- which depends on nothing a concurrent change
    alters but existence, checked again on the fresh read (Bugs 47, 53,
-   54). A catalog transaction doesn't re-apply itself yet: one that
-   conflicts fails, and its caller runs it again ([errata.md](errata.md)
-   §D12).
+   54). A catalog transaction is the exception: it conflicts on the
+   whole version of each table it writes, or reads under serializable
+   isolation, and one that conflicts fails, for its caller to run again
+   ([errata.md](errata.md) §D12).
 
 ## Late-Binding
 

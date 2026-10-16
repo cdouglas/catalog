@@ -1172,7 +1172,8 @@ public class FileIOCatalog extends BaseMetastoreCatalog
       // The table's new inline-ML snapshots hold their manifest lists.
       ops.stageUpdate(newCatalog, currentMetadata, newMetadata);
     }
-    // Not retried on a conflict, unlike the catalog's other operations: see errata D12.
+    // Not retried: a transaction conflicts on the whole version of each table it pins, so a
+    // conflict fails it (errata D12).
     try {
       newCatalog.commit(fileIO);
     } catch (SupportsAtomicOperations.CASException e) {
