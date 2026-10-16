@@ -668,6 +668,10 @@ public class InlineDeltaCodec {
     if (!newMeta.refs().keySet().containsAll(oldMeta.refs().keySet())) {
       return null;
     }
+    // Nor has a change to a v3 table's encryption keys.
+    if (!encryptionKeyIds(newMeta).equals(encryptionKeyIds(oldMeta))) {
+      return null;
+    }
     // Replay numbers the commit's new snapshots after the base's last sequence number, in order,
     // and advances next-row-id by their added rows. A transaction that also expired a snapshot it
     // added left a gap, which only full mode carries.
@@ -942,6 +946,14 @@ public class InlineDeltaCodec {
     }
     return (newMeta.formatVersion() < 2 || newMeta.lastSequenceNumber() == sequenceNumber)
         && (newMeta.formatVersion() < 3 || newMeta.nextRowId() == nextRowId);
+  }
+
+  private static Set<String> encryptionKeyIds(TableMetadata metadata) {
+    Set<String> ids = new HashSet<>();
+    for (org.apache.iceberg.encryption.EncryptedKey key : metadata.encryptionKeys()) {
+      ids.add(key.keyId());
+    }
+    return ids;
   }
 
   private static boolean refsEqual(

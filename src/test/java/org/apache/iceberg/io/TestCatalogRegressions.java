@@ -2894,6 +2894,56 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 46: an inline delta has no update for a v3 table's encryption keys,
+  // and computeDelta did not compare them, so a key added or removed with
+  // another change in the same commit was lost on replay (a commit that
+  // changed only keys left the delta empty, which takes full mode). A
+  // commit that changes the keys now takes full mode. Found by reading
+  // computeDelta while adding TestInlineDeltaProperties; FileIOCatalog has
+  // no table encryption of its own, so this replays the delta directly.
+  // ============================================================
+
+  @Nested
+  class EncryptionKeysInADelta {
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void replay(boolean structural) {
+      InlineMetadataCodec codec =
+          structural ? InlineMetadataCodecs.STRUCTURAL : InlineMetadataCodecs.JSON_GZIP;
+      org.apache.iceberg.TableMetadata base =
+          codec.decodeFull(
+              codec.encode(
+                  org.apache.iceberg.TableMetadata.newTableMetadata(
+                      intSchema, org.apache.iceberg.PartitionSpec.unpartitioned(),
+                      org.apache.iceberg.SortOrder.unsorted(), "mem:///w/ns/t",
+                      Map.of("format-version", "3"))),
+              "inline://base");
+      org.apache.iceberg.TableMetadata next =
+          org.apache.iceberg.TableMetadata.buildFrom(base)
+              .addEncryptionKey(
+                  new org.apache.iceberg.encryption.BaseEncryptedKey(
+                      "k1", java.nio.ByteBuffer.wrap(new byte[] {1, 2, 3}), "kek", Map.of()))
+              .setProperties(Map.of("k", "v"))
+              .build();
+
+      List<InlineDeltaCodec.DeltaUpdate> delta = InlineDeltaCodec.computeDelta(base, next, "");
+
+      if (delta != null) {
+        ProtoCatalogFile.Builder builder =
+            ProtoCatalogFile.builder(new InMemoryInputFile("mem:///stub", new byte[0]))
+                .addInlineTable(1, 0, "t", 1, codec.encode(base), codec.tag(), "");
+        ProtoCodec.UpdateTableInlineAction.delta(
+                1, 1, InlineDeltaCodec.encodeDelta(delta, next.lastUpdatedMillis()))
+            .apply(builder);
+        org.apache.iceberg.TableMetadata replayed =
+            codec.decodeFull(builder.inlineMetadata(1), "inline://replayed");
+        assertThat(replayed.encryptionKeys()).hasSize(1);
+      }
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)
