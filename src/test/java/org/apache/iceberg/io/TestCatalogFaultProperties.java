@@ -176,8 +176,10 @@ class TestCatalogFaultProperties {
       @ForAll @IntRange(min = 2, max = 3) int writers,
       @ForAll("maxUpdateSizes") int maxUpdateSize,
       @ForAll boolean strictVersions,
+      @ForAll @IntRange(min = 0, max = 7) int gzipWriters,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(modes.subList(0, writers), maxUpdateSize, false, strictVersions).execute(schedule);
+    new Run(modes.subList(0, writers), maxUpdateSize, false, strictVersions, gzipWriters)
+        .execute(schedule);
   }
 
   @Property(tries = 100)
@@ -186,8 +188,10 @@ class TestCatalogFaultProperties {
       @ForAll @IntRange(min = 2, max = 3) int writers,
       @ForAll("maxUpdateSizes") int maxUpdateSize,
       @ForAll boolean strictVersions,
+      @ForAll @IntRange(min = 0, max = 7) int gzipWriters,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(modes.subList(0, writers), maxUpdateSize, true, strictVersions).execute(schedule);
+    new Run(modes.subList(0, writers), maxUpdateSize, true, strictVersions, gzipWriters)
+        .execute(schedule);
   }
 
   /** Each writer's mode: one for all, a quarter of the time, else each its own. */
@@ -227,6 +231,13 @@ class TestCatalogFaultProperties {
             Tuple.of(2, Kind.ROW_DELTA),
             Tuple.of(1, Kind.ADD_PARTITION_FIELD),
             Tuple.of(1, Kind.REMOVE_PARTITION_FIELD),
+            Tuple.of(1, Kind.CREATE_TAG),
+            Tuple.of(1, Kind.CREATE_BRANCH),
+            Tuple.of(2, Kind.BRANCH_APPEND),
+            Tuple.of(1, Kind.FAST_FORWARD),
+            Tuple.of(1, Kind.REMOVE_REF),
+            Tuple.of(1, Kind.STAGE_APPEND),
+            Tuple.of(1, Kind.CHERRY_PICK),
             Tuple.of(2, Kind.TABLE_TXN),
             Tuple.of(1, Kind.EXPIRE_SNAPSHOTS),
             Tuple.of(1, Kind.REWRITE_MANIFESTS),
@@ -295,6 +306,20 @@ class TestCatalogFaultProperties {
     /** Partitions a table by identity, bucket[4] or truncate[10] of its id, as {@code b} picks. */
     ADD_PARTITION_FIELD,
     REMOVE_PARTITION_FIELD,
+    /** Tags the current snapshot as t0 or t1, as {@code b} picks. */
+    CREATE_TAG,
+    /** Branches b0 or b1 from the current snapshot, as {@code b} picks. */
+    CREATE_BRANCH,
+    /** Appends a file to branch b0 or b1, which creates the branch from main if there is none. */
+    BRANCH_APPEND,
+    /** Fast-forwards main to branch b0 or b1. */
+    FAST_FORWARD,
+    /** Removes a branch or tag the table has. */
+    REMOVE_REF,
+    /** Stages an append (write-audit-publish) under a new wap.id, leaving main as it is. */
+    STAGE_APPEND,
+    /** Publishes a staged append to main (a cherry-pick). */
+    CHERRY_PICK,
     TABLE_TXN,
     EXPIRE_SNAPSHOTS,
     REWRITE_MANIFESTS,
@@ -379,6 +404,13 @@ class TestCatalogFaultProperties {
     final Set<String> maybeDropped = new TreeSet<>();
     final Map<String, String> props = new TreeMap<>();
     final Set<String> columns = new TreeSet<>();
+    // Branches other than main, each to its live data files; tags, each to the live data files of
+    // the snapshot it names, as when it was created, and that snapshot (observed then).
+    final Map<String, Set<String>> branches = new TreeMap<>();
+    final Map<String, Set<String>> tags = new TreeMap<>();
+    final Map<String, Long> tagSnapshots = new TreeMap<>();
+    // Staged appends not yet published nor expired, by wap.id, to the file each adds.
+    final Map<String, String> staged = new TreeMap<>();
     // Observed, not modeled: Iceberg chooses snapshot ids, metadata locations and sequence numbers
     // (of the table, and the data sequence numbers of its live data and delete files).
     Long snapshotId = null;
@@ -398,6 +430,10 @@ class TestCatalogFaultProperties {
       copy.maybeDropped.addAll(maybeDropped);
       copy.props.putAll(props);
       copy.columns.addAll(columns);
+      branches.forEach((name, files) -> copy.branches.put(name, new TreeSet<>(files)));
+      tags.forEach((name, files) -> copy.tags.put(name, new TreeSet<>(files)));
+      copy.tagSnapshots.putAll(tagSnapshots);
+      copy.staged.putAll(staged);
       copy.snapshotId = snapshotId;
       copy.metadataLocation = metadataLocation;
       copy.lastSequenceNumber = lastSequenceNumber;
@@ -416,8 +452,10 @@ class TestCatalogFaultProperties {
       Map<String, String> shown = new TreeMap<>();
       props.forEach((k, v) -> shown.put(k, abbreviate(v)));
       return String.format(
-          "{uuid=%s v%d files=%s deletes=%s props=%s columns=%s}",
-          uuid.substring(0, 8), formatVersion, sortedFiles(), deletes, shown, columns);
+          "{uuid=%s v%d files=%s deletes=%s props=%s columns=%s%s%s}",
+          uuid.substring(0, 8), formatVersion, sortedFiles(), deletes, shown, columns,
+          branches.isEmpty() ? "" : " branches=" + branches,
+          tags.isEmpty() ? "" : " tags=" + tags);
     }
   }
 
@@ -446,6 +484,9 @@ class TestCatalogFaultProperties {
           || e.formatVersion != a.formatVersion
           || !e.sortedFiles().equals(a.sortedFiles())
           || !deletesMatch(e, a)
+          || !e.branches.equals(a.branches)
+          || !e.tags.equals(a.tags)
+          || !e.tagSnapshots.equals(a.tagSnapshots)
           || !e.props.equals(a.props)
           || !e.columns.equals(a.columns)) {
         return id + ": expected " + e + ", found " + a;
@@ -596,7 +637,13 @@ class TestCatalogFaultProperties {
     private int reads;
     private final List<String> fired = new ArrayList<>();
 
-    Run(List<LocalCatalogMode> modes, int maxUpdateSize, boolean faults, boolean strictVersions) {
+    /**
+     * Writer {@code i} writes inline metadata with the gzip codec if bit {@code i} of {@code
+     * gzipWriters} is set, else the structural one: a delta keeps its base's codec, and a full
+     * update writes the writer's.
+     */
+    Run(List<LocalCatalogMode> modes, int maxUpdateSize, boolean faults, boolean strictVersions,
+        int gzipWriters) {
       this.maxUpdateSize = maxUpdateSize;
       this.faults = faults;
       io.failSupersededReads(strictVersions);
@@ -604,8 +651,11 @@ class TestCatalogFaultProperties {
       properties.put(FileIOCatalog.INLINE_MAX_UPDATE_SIZE, String.valueOf(maxUpdateSize));
       this.writers = new Writer[modes.size()];
       for (int i = 0; i < modes.size(); i++) {
+        Map<String, String> writerProperties = new HashMap<>(properties);
+        writerProperties.put(
+            FileIOCatalog.INLINE_TM_CODEC, (gzipWriters >> i & 1) == 1 ? "gzip" : "structural");
         this.writers[i] =
-            new Writer(i, modes.get(i).catalog(io, WAREHOUSE, CATALOG_NAME, properties));
+            new Writer(i, modes.get(i).catalog(io, WAREHOUSE, CATALOG_NAME, writerProperties));
       }
       // Reading does not depend on a catalog's mode.
       this.checker = LocalCatalogMode.APPEND.catalog(io, WAREHOUSE, CATALOG_NAME, properties);
@@ -614,8 +664,9 @@ class TestCatalogFaultProperties {
       create(seed, TABLES.get(0), 3);
       create(seed, TABLES.get(1), 2).newFastAppend().appendFile(newFile()).commit();
       this.model = actual();
-      trace.append(String.format("modes %s, max update size %d%s%nseed: %s%n", modes,
-          maxUpdateSize, strictVersions ? ", strict versions" : "", model));
+      trace.append(String.format("modes %s, max update size %d%s, gzip writers %s%nseed: %s%n",
+          modes, maxUpdateSize, strictVersions ? ", strict versions" : "",
+          Integer.toBinaryString(gzipWriters), model));
       Statistics.label("modes").collect(new TreeSet<>(modes).size() == 1 ? "one" : "mixed");
       io.injectFaults(this::onWrite);
       io.injectReadFaults(this::onRead);
@@ -731,6 +782,20 @@ class TestCatalogFaultProperties {
           .build();
     }
 
+    /**
+     * Runs a commit by a merging producer (merge append, delete, row delta). Iceberg core's
+     * MergingSnapshotProducer takes the partition specs of the handle's metadata when created, and
+     * one whose commit then refreshes to a newer spec dereferences a missing spec when it rewrites
+     * a manifest written in it, before writing anything: a rejection here.
+     */
+    private static void staleSpecs(TableIdentifier id, Runnable commit) {
+      try {
+        commit.run();
+      } catch (NullPointerException e) {
+        throw new ValidationException(e, "%s: a partition spec newer than the handle", id);
+      }
+    }
+
     /** {@code file} in {@code table}'s current spec, which may have changed since it was named. */
     private static DataFile inSpec(Table table, DataFile file) {
       return DataFiles.builder(table.spec())
@@ -813,10 +878,12 @@ class TestCatalogFaultProperties {
                 m.put(created, new TableState(actual.get(created).uuid, version));
               });
         case DROP_TABLE:
+          // Purging half the time: its deletes must spare every other table's files.
+          boolean purge = cmd.b % 2 == 1;
           return new Op(
-              "dropTable(" + id + ")",
+              "dropTable(" + id + (purge ? ", purge" : "") + ")",
               () -> {
-                if (!w.catalog.dropTable(id, false)) {
+                if (!w.catalog.dropTable(id, purge)) {
                   throw new NoSuchTableException("dropTable returned false: %s", id);
                 }
               },
@@ -848,9 +915,9 @@ class TestCatalogFaultProperties {
               (fast ? "fastAppend(" : "mergeAppend(") + id + ", " + appended.location() + ")",
               () -> {
                 Table table = handle(w, id, cmd.fresh);
-                (fast ? table.newFastAppend() : table.newAppend())
+                staleSpecs(id, () -> (fast ? table.newFastAppend() : table.newAppend())
                     .appendFile(inSpec(table, appended))
-                    .commit();
+                    .commit());
               },
               (m, actual) -> {
                 TableState state = existing(m, id);
@@ -868,7 +935,8 @@ class TestCatalogFaultProperties {
                   : target.sortedFiles().get(cmd.b % target.files.size());
           return new Op(
               "deleteFile(" + id + ", " + path + ")",
-              () -> handle(w, id, cmd.fresh).newDelete().deleteFile(path).commit(),
+              () -> staleSpecs(id,
+                  () -> handle(w, id, cmd.fresh).newDelete().deleteFile(path).commit()),
               (m, actual) -> {
                 TableState state = existing(m, id);
                 if (state.files.removeIf(path::equals)) {
@@ -887,19 +955,24 @@ class TestCatalogFaultProperties {
               }
             }
           }
-          boolean dv = dataPath != null && deleting.formatVersion >= 3;
-          String deletePath =
-              "mem:///data/" + (dataPath == null ? "eq" : dv ? "dv" : "pos") + nextFile++
-                  + (dv ? ".puffin" : ".parquet");
           String referenced = dataPath;
+          int deleteFile = nextFile++;
+          // A deletion vector if the table is v3 when the operation runs, which may be a table
+          // another writer created since the model was read.
+          String[] deletePath = {null};
+          boolean[] dv = {false};
           return new Op(
-              String.format("rowDelta(%s, %s%s)", id, deletePath,
-                  referenced == null ? "" : " for " + referenced),
+              String.format("rowDelta(%s, %s%d%s)", id, referenced == null ? "eq" : "pos/dv",
+                  deleteFile, referenced == null ? "" : " for " + referenced),
               () -> {
                 Table table = handle(w, id, cmd.fresh);
+                dv[0] = referenced != null
+                    && ((HasTableOperations) table).operations().current().formatVersion() >= 3;
+                deletePath[0] = "mem:///data/" + (referenced == null ? "eq" : dv[0] ? "dv" : "pos")
+                    + deleteFile + (dv[0] ? ".puffin" : ".parquet");
                 org.apache.iceberg.FileMetadata.Builder delete =
                     org.apache.iceberg.FileMetadata.deleteFileBuilder(table.spec())
-                        .withPath(deletePath)
+                        .withPath(deletePath[0])
                         .withFileSizeInBytes(10)
                         .withRecordCount(1);
                 if (referenced == null) {
@@ -911,23 +984,27 @@ class TestCatalogFaultProperties {
                   }
                   delete = org.apache.iceberg.FileMetadata.deleteFileBuilder(
                           table.specs().get(data.specId()))
-                      .withPath(deletePath)
+                      .withPath(deletePath[0])
                       .withFileSizeInBytes(10)
                       .withRecordCount(1)
                       .ofPositionDeletes()
                       .withPartition(data.partition());
-                  if (dv) {
+                  if (dv[0]) {
                     delete.withFormat(org.apache.iceberg.FileFormat.PUFFIN)
                         .withReferencedDataFile(referenced)
                         .withContentOffset(4)
                         .withContentSizeInBytes(6);
                   }
                 }
-                table.newRowDelta().addDeletes(delete.build()).commit();
+                org.apache.iceberg.DeleteFile built = delete.build();
+                staleSpecs(id, () -> table.newRowDelta().addDeletes(built).commit());
               },
               (m, actual) -> {
                 TableState state = existing(m, id);
-                state.deletes.put(deletePath, dv ? referenced : "");
+                if (deletePath[0] == null) {
+                  throw new IllegalStateException("the row delta did not run");
+                }
+                state.deletes.put(deletePath[0], dv[0] ? referenced : "");
                 ageOutDeletes(state, actual.get(id));
               });
         case ADD_PARTITION_FIELD:
@@ -967,6 +1044,113 @@ class TestCatalogFaultProperties {
                 table.updateSpec().removeField(fields.get(cmd.b % fields.size()).name()).commit();
               },
               (m, actual) -> existing(m, id));
+        case CREATE_TAG:
+        case CREATE_BRANCH:
+          boolean tag = cmd.kind == Kind.CREATE_TAG;
+          String refName = (tag ? "t" : "b") + cmd.b % 2;
+          // What the ref holds is observed: it names the current snapshot of the writer's handle
+          // when the operation runs, which may be stale. A tag's content must never change after.
+          return new Op(
+              (tag ? "createTag(" : "createBranch(") + id + ", " + refName + ")",
+              () -> {
+                Table table = handle(w, id, cmd.fresh);
+                if (table.currentSnapshot() == null) {
+                  throw new ValidationException("%s has no snapshot", id);
+                }
+                long snapshotId = table.currentSnapshot().snapshotId();
+                try {
+                  if (tag) {
+                    table.manageSnapshots().createTag(refName, snapshotId).commit();
+                  } else {
+                    table.manageSnapshots().createBranch(refName, snapshotId).commit();
+                  }
+                } catch (IllegalArgumentException e) {
+                  throw new ValidationException(e, "%s", e.getMessage()); // the ref exists
+                }
+              },
+              (m, actual) -> {
+                TableState state = existing(m, id);
+                TableState now = actual.get(id);
+                if (state.branches.containsKey(refName) || state.tags.containsKey(refName)
+                    || now == null || !(tag ? now.tags : now.branches).containsKey(refName)) {
+                  throw new IllegalStateException("cannot create " + refName);
+                }
+                if (tag) {
+                  state.tags.put(refName, new TreeSet<>(now.tags.get(refName)));
+                  state.tagSnapshots.put(refName, now.tagSnapshots.get(refName));
+                } else {
+                  state.branches.put(refName, new TreeSet<>(now.branches.get(refName)));
+                }
+              });
+        case BRANCH_APPEND:
+          String branch = "b" + cmd.b % 2;
+          DataFile branchFile = newFile();
+          return new Op(
+              "branchAppend(" + id + ", " + branch + ", " + branchFile.location() + ")",
+              () -> {
+                Table table = handle(w, id, cmd.fresh);
+                table.newFastAppend().appendFile(inSpec(table, branchFile)).toBranch(branch)
+                    .commit();
+              },
+              (m, actual) -> {
+                // Appending to a branch the table does not have creates it from main.
+                TableState state = existing(m, id);
+                state.branches.computeIfAbsent(branch, k -> new TreeSet<>(state.files))
+                    .add(branchFile.location());
+              });
+        case FAST_FORWARD:
+          String ffTarget = "b" + cmd.b % 2;
+          return new Op(
+              "fastForward(" + id + ", main to " + ffTarget + ")",
+              () -> {
+                try {
+                  handle(w, id, cmd.fresh).manageSnapshots().fastForwardBranch("main", ffTarget)
+                      .commit();
+                } catch (IllegalArgumentException e) {
+                  throw new ValidationException(e, "%s", e.getMessage()); // no such branch
+                }
+              },
+              (m, actual) -> {
+                TableState state = existing(m, id);
+                Set<String> files = state.branches.get(ffTarget);
+                if (files == null) {
+                  throw new IllegalStateException("no branch " + ffTarget);
+                }
+                state.files.clear();
+                state.files.addAll(files);
+                // Main takes the branch's delete files, which the model does not follow.
+                state.deletes.clear();
+                state.deletes.putAll(actual.get(id).deletes);
+              });
+        case REMOVE_REF:
+          TableState holding = model.get(id);
+          if (holding == null || holding.branches.isEmpty() && holding.tags.isEmpty()) {
+            return null;
+          }
+          List<String> refs = new ArrayList<>(holding.branches.keySet());
+          refs.addAll(holding.tags.keySet());
+          String ref = refs.get(cmd.b % refs.size());
+          boolean isTag = holding.tags.containsKey(ref);
+          return new Op(
+              "removeRef(" + id + ", " + ref + ")",
+              () -> {
+                try {
+                  if (isTag) {
+                    handle(w, id, cmd.fresh).manageSnapshots().removeTag(ref).commit();
+                  } else {
+                    handle(w, id, cmd.fresh).manageSnapshots().removeBranch(ref).commit();
+                  }
+                } catch (IllegalArgumentException e) {
+                  throw new ValidationException(e, "%s", e.getMessage()); // no such ref
+                }
+              },
+              (m, actual) -> {
+                TableState state = existing(m, id);
+                if ((isTag ? state.tags.remove(ref) : state.branches.remove(ref)) == null) {
+                  throw new IllegalStateException("no ref " + ref);
+                }
+                state.tagSnapshots.remove(ref);
+              });
         case SET_PROPERTY:
           String key = KEYS.get(cmd.b % KEYS.size());
           String value = "v" + nextValue++;
@@ -1037,6 +1221,23 @@ class TestCatalogFaultProperties {
                 TableMetadata replacement = ((HasTableOperations) replace.table()).operations()
                     .current();
                 built.formatVersion = replacement.formatVersion();
+                // Its refs and snapshots, too: the commit puts back a ref or a staged append
+                // removed since, and drops one added since.
+                replacement.refs().forEach((name, r) -> {
+                  if (!name.equals(org.apache.iceberg.SnapshotRef.MAIN_BRANCH)) {
+                    if (r.isBranch()) {
+                      built.branches.put(name, new TreeSet<>());
+                    } else {
+                      built.tagSnapshots.put(name, r.snapshotId());
+                    }
+                  }
+                });
+                for (Snapshot snapshot : replacement.snapshots()) {
+                  String wap = snapshot.summary().get("wap.id");
+                  if (wap != null) {
+                    built.staged.put(wap, "");
+                  }
+                }
                 replacement.properties().forEach((k, v) -> {
                   if (k.startsWith(KEY_PREFIX)) {
                     built.props.put(k, v);
@@ -1056,6 +1257,24 @@ class TestCatalogFaultProperties {
                 String uuid = before != null ? before.uuid : now.uuid;
                 TableState replaced = new TableState(uuid, built.formatVersion);
                 replaced.props.putAll(built.props);
+                // Branches as observed (the commit may have taken one back to where it was);
+                // a tag the model had keeps the files it named, else as observed.
+                built.branches.keySet().forEach(n ->
+                    replaced.branches.put(n, new TreeSet<>(now.branches.getOrDefault(n, Set.of()))));
+                built.tagSnapshots.forEach((n, snapshotId) -> {
+                  boolean known = before != null && before.tags.containsKey(n)
+                      && snapshotId.equals(before.tagSnapshots.get(n));
+                  replaced.tags.put(n, new TreeSet<>(
+                      known ? before.tags.get(n) : now.tags.getOrDefault(n, Set.of())));
+                  replaced.tagSnapshots.put(n, snapshotId);
+                });
+                if (before != null) {
+                  built.staged.keySet().forEach(wap -> {
+                    if (before.staged.containsKey(wap)) {
+                      replaced.staged.put(wap, before.staged.get(wap));
+                    }
+                  });
+                }
                 if (replacing != null) {
                   replaced.files.add(replacing.location());
                 }
@@ -1080,22 +1299,76 @@ class TestCatalogFaultProperties {
                 state.props.put(txnKey, txnValue);
               });
         case EXPIRE_SNAPSHOTS:
+          // Half the time also removing the schemas and partition specs no snapshot uses.
+          boolean cleanMetadata = cmd.b % 2 == 1;
           return new Op(
-              "expireSnapshots(" + id + ")",
+              "expireSnapshots(" + id + (cleanMetadata ? ", cleaning metadata" : "") + ")",
               () ->
                   handle(w, id, cmd.fresh)
                       .expireSnapshots()
                       .expireOlderThan(System.currentTimeMillis() + 1)
                       .retainLast(1)
+                      .cleanExpiredMetadata(cleanMetadata)
                       .commit(),
-              (m, actual) -> existing(m, id));
+              (m, actual) -> existing(m, id).staged.clear()); // no ref holds a staged append
+        case STAGE_APPEND:
+          String wapId = "wap" + nextValue++;
+          DataFile stagedFile = newFile();
+          return new Op(
+              "stageAppend(" + id + ", " + wapId + ", " + stagedFile.location() + ")",
+              () -> {
+                Table table = handle(w, id, cmd.fresh);
+                table.newFastAppend().appendFile(inSpec(table, stagedFile)).set("wap.id", wapId)
+                    .stageOnly().commit();
+              },
+              (m, actual) -> existing(m, id).staged.put(wapId, stagedFile.location()));
+        case CHERRY_PICK:
+          TableState staging = model.get(id);
+          if (staging == null || staging.staged.isEmpty()) {
+            return null;
+          }
+          List<String> wapIds = new ArrayList<>(staging.staged.keySet());
+          String picked = wapIds.get(cmd.b % wapIds.size());
+          return new Op(
+              "cherryPick(" + id + ", " + picked + ")",
+              () -> {
+                Table table = handle(w, id, cmd.fresh);
+                Long snapshotId = null;
+                for (Snapshot snapshot : table.snapshots()) {
+                  if (picked.equals(snapshot.summary().get("wap.id"))) {
+                    snapshotId = snapshot.snapshotId();
+                  }
+                }
+                if (snapshotId == null) {
+                  throw new ValidationException("no snapshot staged as %s", picked);
+                }
+                table.manageSnapshots().cherrypick(snapshotId).commit();
+              },
+              (m, actual) -> {
+                TableState state = existing(m, id);
+                String file = state.staged.remove(picked); // a wap.id is published once
+                if (file == null) {
+                  throw new IllegalStateException(picked + " is not staged");
+                }
+                state.files.add(file);
+              });
         case REWRITE_MANIFESTS:
           if (model.containsKey(id) && model.get(id).snapshotId == null) {
             return null; // Iceberg's rewrite needs a current snapshot
           }
           return new Op(
               "rewriteManifests(" + id + ")",
-              () -> handle(w, id, cmd.fresh).rewriteManifests().clusterBy(f -> "all").commit(),
+              () -> {
+                try {
+                  handle(w, id, cmd.fresh).rewriteManifests().clusterBy(f -> "all").commit();
+                } catch (NullPointerException e) {
+                  // Iceberg core, in a rewrite that retries, before it commits: after a concurrent
+                  // replace left the table without a current snapshot, it dereferences that
+                  // (BaseRewriteManifests.apply); after a concurrent spec change, it writes a
+                  // manifest in a spec it does not have, as it keeps the handle's specs.
+                  throw new ValidationException(e, "%s: a rewrite on a stale handle", id);
+                }
+              },
               (m, actual) -> existing(m, id));
         case TXN_BEGIN:
           if (w.txn != null) {
@@ -1346,7 +1619,16 @@ class TestCatalogFaultProperties {
                   table.currentSnapshot() == null ? ", no snapshot" : ""));
           Map<Long, List<String>> lists =
               manifestLists.computeIfAbsent(metadata.uuid(), k -> new HashMap<>());
+          // Only snapshots a ref reaches: Iceberg core's replace commits the snapshots of the
+          // table it built at its start, so one expired since comes back without its files.
+          Set<Long> reachable = new java.util.HashSet<>();
+          metadata.refs().values().forEach(r -> reachable.addAll(
+              org.apache.iceberg.util.SnapshotUtil.ancestorIds(
+                  metadata.snapshot(r.snapshotId()), metadata::snapshot)));
           for (Snapshot snapshot : table.snapshots()) {
+            if (!reachable.contains(snapshot.snapshotId())) {
+              continue;
+            }
             String list = snapshot.manifestListLocation();
             check(list == null ? snapshot instanceof org.apache.iceberg.InlineSnapshot
                     : io.newInputFile(list).exists(),
@@ -1377,6 +1659,22 @@ class TestCatalogFaultProperties {
             }
           }
           checkRowLineage(id, metadata, table.currentSnapshot(), live);
+          for (Map.Entry<String, org.apache.iceberg.SnapshotRef> r : metadata.refs().entrySet()) {
+            if (r.getKey().equals(org.apache.iceberg.SnapshotRef.MAIN_BRANCH)) {
+              continue;
+            }
+            Set<String> refFiles = new TreeSet<>();
+            try (CloseableIterable<FileScanTask> tasks =
+                table.newScan().useRef(r.getKey()).planFiles()) {
+              tasks.forEach(task -> refFiles.add(task.file().location()));
+            }
+            if (r.getValue().isBranch()) {
+              state.branches.put(r.getKey(), refFiles);
+            } else {
+              state.tags.put(r.getKey(), refFiles);
+              state.tagSnapshots.put(r.getKey(), r.getValue().snapshotId());
+            }
+          }
           if (table.currentSnapshot() != null) {
             for (ManifestFile m : table.currentSnapshot().deleteManifests(io)) {
               check(m.firstRowId() == null, "%s: delete manifest %s has first row id %s",

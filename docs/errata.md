@@ -291,5 +291,14 @@ we have not exhaustively walked all upstream Iceberg code that builds
 sets of snapshots — there could be a path that legitimately wants
 manifest-list equality.
 
+The manifest side of this did hide a bug (Bug 44): expiry's
+`ReachableFileCleanup` compares `ManifestFile` objects, and an inline
+snapshot's manifests were the catalog's own class, equal only to
+itself, so expiry deleted manifests retained snapshots still listed.
+Inline snapshots now hold `GenericManifestFile` copies, which are equal
+by path as Iceberg expects; `TestCatalogFaultProperties` expires
+snapshots of tables with tags, branches and replaced histories, and
+checks that every retained snapshot's manifests exist.
+
 **Trigger:** any retention or cleanup bug report that involves an
 inline-ML table.
