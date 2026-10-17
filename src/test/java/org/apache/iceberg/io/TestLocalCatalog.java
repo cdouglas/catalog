@@ -18,6 +18,8 @@
  */
 package org.apache.iceberg.io;
 
+import java.io.IOException;
+import java.nio.file.Path;
 import java.util.Map;
 import java.util.UUID;
 import org.apache.iceberg.catalog.CatalogTests;
@@ -27,6 +29,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 /**
  * Runs Iceberg's {@link CatalogTests} against {@link FileIOCatalog} in every {@link
@@ -87,6 +90,14 @@ public class TestLocalCatalog {
       Assumptions.assumeFalse(
           mode().inlineTM, "inline TM has no metadata.json to re-register; errata T4");
       super.testRegisterTable();
+    }
+
+    // CatalogTests moves the metadata file on the local file system.
+    @Override
+    @Test
+    public void testLoadTableWithMissingMetadataFile(@TempDir Path tempDir) throws IOException {
+      InlineCompatAssertions.runLoadTableWithMissingMetadataFile(
+          catalog(), TBL, SCHEMA, requiresNamespaceCreate());
     }
 
     // Inline tables have no metadata.json files to track; use the inline-aware variant.

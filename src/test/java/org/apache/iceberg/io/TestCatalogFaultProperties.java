@@ -98,8 +98,7 @@ import org.apache.iceberg.types.Types;
  * also be strict about versions, as it is in practice: a read pinned to a replaced version fails
  * (see {@link InMemoryAtomicFileIO#failSupersededReads}).
  *
- * <p>Tables are created in format v2 or v3; v3 tables do not merge manifests, which in Iceberg
- * core renumbers existing rows (see {@code V3_PROPERTIES}). A model holds the namespaces and their
+ * <p>Tables are created in format v2 or v3. A model holds the namespaces and their
  * properties, and each table's UUID, format version, live data and delete files, properties and
  * added columns. After every operation the catalog, read back without faults, must match it:
  *
@@ -152,12 +151,6 @@ class TestCatalogFaultProperties {
           "true",
           CatalogProperties.TABLE_DEFAULT_PREFIX + TableProperties.METADATA_PREVIOUS_VERSIONS_MAX,
           "2");
-
-  // Iceberg core gives an existing data file a new first row id when a delete merges the manifest
-  // it rewrote into others (a v3 spec violation, also without this catalog), so v3 tables do not
-  // merge manifests.
-  private static final Map<String, String> V3_PROPERTIES =
-      Map.of(TableProperties.MANIFEST_MERGE_ENABLED, "false");
 
   // A command's writeFaults operand picks the faults for its first two conditional writes, by its
   // remainder and quotient mod 12; later writes succeed.
@@ -867,11 +860,10 @@ class TestCatalogFaultProperties {
     }
 
     private static Table create(Catalog catalog, TableIdentifier id, int formatVersion) {
-      Catalog.TableBuilder builder =
-          catalog
-              .buildTable(id, SCHEMA)
-              .withProperty(TableProperties.FORMAT_VERSION, String.valueOf(formatVersion));
-      return (formatVersion >= 3 ? builder.withProperties(V3_PROPERTIES) : builder).create();
+      return catalog
+          .buildTable(id, SCHEMA)
+          .withProperty(TableProperties.FORMAT_VERSION, String.valueOf(formatVersion))
+          .create();
     }
 
     private TableIdentifier pickTable(int index) {
@@ -1226,12 +1218,10 @@ class TestCatalogFaultProperties {
           return new Op(
               "upgrade(" + id + ", v3)",
               () -> {
-                org.apache.iceberg.UpdateProperties update =
-                    handle(w, id, cmd.fresh)
-                        .updateProperties()
-                        .set(TableProperties.FORMAT_VERSION, "3");
-                V3_PROPERTIES.forEach(update::set);
-                update.commit();
+                handle(w, id, cmd.fresh)
+                    .updateProperties()
+                    .set(TableProperties.FORMAT_VERSION, "3")
+                    .commit();
               },
               (m, actual) -> {
                 TableState state = existing(m, id);

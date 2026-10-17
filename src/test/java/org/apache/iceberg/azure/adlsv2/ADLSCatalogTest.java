@@ -25,6 +25,7 @@ import static org.mockito.Mockito.spy;
 
 import com.azure.storage.file.datalake.DataLakeFileSystemClientBuilder;
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.Map;
 import java.util.UUID;
 import org.apache.iceberg.CatalogProperties;
@@ -35,6 +36,7 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.io.CatalogFormat;
 import org.apache.iceberg.io.CloudMode;
 import org.apache.iceberg.io.FileIOCatalog;
+import org.apache.iceberg.io.InlineCompatAssertions;
 import org.apache.iceberg.io.IntegTestEnv;
 import org.apache.iceberg.io.ProtoCatalogFormat;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
@@ -47,6 +49,7 @@ import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.TestWatcher;
+import org.junit.jupiter.api.io.TempDir;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -214,6 +217,14 @@ public class ADLSCatalogTest extends CatalogTests<FileIOCatalog> {
   @Override
   protected String baseTableLocation(TableIdentifier identifier) {
     return warehouseLocation + "/" + identifier.namespace() + "/" + identifier.name();
+  }
+
+  // CatalogTests moves the metadata file on the local file system.
+  @Override
+  @Test
+  public void testLoadTableWithMissingMetadataFile(@TempDir Path tempDir) throws IOException {
+    InlineCompatAssertions.runLoadTableWithMissingMetadataFile(
+        catalog(), TBL, SCHEMA, requiresNamespaceCreate());
   }
 
   @Override

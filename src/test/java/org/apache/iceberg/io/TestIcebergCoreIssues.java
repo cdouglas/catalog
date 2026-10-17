@@ -72,32 +72,6 @@ class TestIcebergCoreIssues {
       new Schema(Types.NestedField.required(1, "id", Types.IntegerType.get()));
 
   /**
-   * C1. A delete that merges manifests gives an existing data file a new first_row_id. It should
-   * not: the spec has the inherited first_row_id written into existing and deleted entries when a
-   * manifest is rewritten. Without the merge (a higher {@code
-   * commit.manifest.min-count-to-merge}), f6 keeps row id 1.
-   */
-  @Test
-  void aDeleteThatMergesManifestsRenumbersRows() {
-    Table table =
-        catalog()
-            .buildTable(ID, SCHEMA)
-            .withProperty(TableProperties.FORMAT_VERSION, "3")
-            .withProperty(TableProperties.MANIFEST_MIN_MERGE_COUNT, "2")
-            .create();
-    table.newFastAppend().appendFile(file("f5")).commit();
-    table.newFastAppend().appendFile(file("f6")).commit();
-    table.rewriteManifests().clusterBy(file -> "all").commit(); // one manifest of f5 and f6
-    table.newFastAppend().appendFile(file("f8")).commit();
-    table.newFastAppend().appendFile(file("f10")).commit();
-    assertThat(rowIds(table)).containsEntry(path("f6"), 1L);
-
-    table.newDelete().deleteFile(path("f5")).commit(); // merges the three manifests
-
-    assertThat(rowIds(table).get(path("f6"))).as(FIXED, "C1").isEqualTo(6L); // should be 1
-  }
-
-  /**
    * C2. A commit that retries after another commit gave row ids to a manifest it carries gives
    * that manifest a second range. SnapshotProducer caches the manifests it carries, with their
    * metadata, by ManifestFile equality (the path), and the retry reuses its copy from before the

@@ -24,7 +24,7 @@
 
   <groupId>org.apache.iceberg</groupId>
   <artifactId>iceberg-fileio-catalog</artifactId>
-  <version>1.11.0-SNAPSHOT</version>
+  <version>1.12.0-atomicio-SNAPSHOT</version>
   <packaging>jar</packaging>
 
   <name>Iceberg FileIO Catalog</name>
@@ -32,20 +32,19 @@
 
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <maven.compiler.source>11</maven.compiler.source>
-    <maven.compiler.target>11</maven.compiler.target>
-    <iceberg.version>1.11.0-SNAPSHOT</iceberg.version>
-    <hadoop.version>3.4.0</hadoop.version>
-    <junit.version>5.10.1</junit.version>
-    <assertj.version>3.24.2</assertj.version>
+    <maven.compiler.release>17</maven.compiler.release>
+    <iceberg.version>1.12.0-atomicio-SNAPSHOT</iceberg.version>
+    <hadoop.version>3.4.3</hadoop.version>
+    <junit.version>5.14.4</junit.version>
+    <assertj.version>3.27.7</assertj.version>
     <mockito.version>4.11.0</mockito.version>
     <!-- Cloud SDK and Jackson BOMs: keep in step with iceberg/gradle/libs.versions.toml
          (awssdk-bom, azuresdk-bom, google-libraries-bom, jackson-bom), so the tests run
          iceberg's cloud FileIOs against the SDK versions they were compiled against. -->
-    <awssdk.bom.version>2.33.0</awssdk.bom.version>
-    <azuresdk.bom.version>1.2.37</azuresdk.bom.version>
-    <google.libraries.bom.version>26.80.0</google.libraries.bom.version>
-    <jackson.bom.version>2.19.2</jackson.bom.version>
+    <awssdk.bom.version>2.54.17</awssdk.bom.version>
+    <azuresdk.bom.version>1.3.8</azuresdk.bom.version>
+    <google.libraries.bom.version>26.88.1</google.libraries.bom.version>
+    <jackson.bom.version>2.22.2</jackson.bom.version>
     <testcontainers.version>1.21.4</testcontainers.version>
   </properties>
 
@@ -177,7 +176,7 @@
     <dependency>
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-simple</artifactId>
-      <version>2.0.17</version>
+      <version>2.0.18</version>
       <scope>test</scope>
     </dependency>
 
@@ -236,6 +235,12 @@
       <scope>test</scope>
     </dependency>
     <dependency>
+      <!-- iceberg-aws's default sync HTTP client; iceberg-aws declares it compileOnly -->
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>apache5-client</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
       <!-- iceberg-aws's AwsClientFactories static init references KMS model classes -->
       <groupId>software.amazon.awssdk</groupId>
       <artifactId>kms</artifactId>
@@ -275,8 +280,7 @@
         <artifactId>maven-compiler-plugin</artifactId>
         <version>3.11.0</version>
         <configuration>
-          <source>11</source>
-          <target>11</target>
+          <release>17</release>
         </configuration>
       </plugin>
       <plugin>

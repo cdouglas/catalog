@@ -18,7 +18,9 @@
  */
 package org.apache.iceberg.aws.s3;
 
+import java.io.IOException;
 import java.net.URI;
+import java.nio.file.Path;
 import java.util.Map;
 import java.util.UUID;
 import org.apache.iceberg.CatalogProperties;
@@ -28,6 +30,7 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.io.CatalogFormat;
 import org.apache.iceberg.io.CloudMode;
 import org.apache.iceberg.io.FileIOCatalog;
+import org.apache.iceberg.io.InlineCompatAssertions;
 import org.apache.iceberg.io.IntegTestEnv;
 import org.apache.iceberg.io.ProtoCatalogFormat;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
@@ -36,10 +39,12 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.TestWatcher;
+import org.junit.jupiter.api.io.TempDir;
 import software.amazon.awssdk.services.s3.S3Client;
 
 @ExtendWith(TestS3Catalog.SuccessCleanupExtension.class)
@@ -173,6 +178,14 @@ public class TestS3Catalog extends CatalogTests<FileIOCatalog> {
   @Override
   protected String baseTableLocation(TableIdentifier identifier) {
     return warehouseLocation + "/" + identifier.namespace() + "/" + identifier.name();
+  }
+
+  // CatalogTests moves the metadata file on the local file system.
+  @Override
+  @Test
+  public void testLoadTableWithMissingMetadataFile(@TempDir Path tempDir) throws IOException {
+    InlineCompatAssertions.runLoadTableWithMissingMetadataFile(
+        catalog(), TBL, SCHEMA, requiresNamespaceCreate());
   }
 
   @Override

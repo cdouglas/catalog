@@ -114,7 +114,7 @@ After running a meaningful slice of the cloud matrix:
 
 ```bash
 cd /home/chris/work/catalog/iceberg && \
-  ./gradlew publishToMavenLocal -x test -x integrationTest -x generateGitProperties
+  ./gradlew publishToMavenLocal -x test -x integrationTest
 
 cd /home/chris/work/catalog/fileio-catalog
 

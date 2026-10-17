@@ -5,8 +5,8 @@ Bugs in Apache Iceberg that this project's fuzzers found. None is in
 The project's tests work around them, so this page records them for a
 rebase onto a newer Iceberg, and for reports or fixes upstream.
 
-`TestIcebergCoreIssues` has a test for each issue. Each test asserts what
-Iceberg does now, and its Javadoc says what Iceberg should do instead.
+`TestIcebergCoreIssues` has a test for each open issue. Each test asserts
+what Iceberg does now, and its Javadoc says what Iceberg should do instead.
 So a test passes while its issue remains and fails once a release fixes
 or changes it, with the message "Iceberg issue C*n* no longer
 reproduces". The tests use only iceberg-core, so they also run in
@@ -22,14 +22,13 @@ cd iceberg && ./gradlew :iceberg-core:test --tests org.apache.iceberg.io.TestIce
 
 ## Status
 
-Checked on 2026-10-16 against three versions:
-- **Fork:** the atomicio fork, whose upstream base is `2114bf6` (2025-09-05).
-- **1.12.0:** the Iceberg 1.12.0 release.
-- **main:** upstream main at `524fe9e`, as of 2026-10-16.
+Checked on 2026-10-16 against Iceberg 1.12.0 and upstream main at
+`524fe9e`. On 2026-10-17 the atomicio fork moved from the 1.10.1 release
+to the 1.12.0 release, so the fork's column is now 1.12.0's.
 
 | Issue | Fork | 1.12.0 | main | Upstream |
 |---|---|---|---|---|
-| C1. A merging delete renumbers rows | yes | fixed | fixed | fixed by [#16263](https://github.com/apache/iceberg/pull/16263), in 1.11.0 |
+| C1. A merging delete renumbers rows | fixed | fixed | fixed | fixed by [#16263](https://github.com/apache/iceberg/pull/16263), in 1.11.0 |
 | C2. A retried commit renumbers rows | yes | yes | yes | not reported |
 | C3. A replace restores an expired snapshot | yes | yes | yes | [#16942](https://github.com/apache/iceberg/issues/16942), part of [#16232](https://github.com/apache/iceberg/issues/16232); fix in PR [#16943](https://github.com/apache/iceberg/pull/16943), open |
 | C4. A stale handle fails on a newer spec | yes | yes | yes | not reported |
@@ -42,35 +41,40 @@ requests found nothing for the issue.
 
 ## Rebasing onto a newer Iceberg
 
-1. Run `TestIcebergCoreIssues` on the new release.
-2. For each test that fails, the release fixed or changed that issue:
+The fork fixes some of these issues itself, each in a commit of its own
+on branch `core-fixes`, which sits on the release; `atomicio` sits on
+`core-fixes`. An issue the fork fixes has no test here: its fix carries
+an upstream-style test in iceberg-core, and its workarounds are gone.
+
+1. Rebase `core-fixes` onto the new release first. Drop each fix that
+   upstream merged, and record the release here.
+2. Rebase `atomicio` onto `core-fixes`.
+3. Run `TestIcebergCoreIssues` on the new release.
+4. For each test that fails, the release fixed or changed that issue:
    - Remove the issue's workarounds, listed under it below.
    - Run the fuzzers long (CLAUDE.md lists them), so they can confirm
      the fix.
    - Make the test assert the fixed behavior, or delete it.
    - Mark the issue fixed here.
-3. For each test that still passes, keep the issue's workarounds.
-
-C1 is fixed in 1.11.0, so a rebase onto 1.11.0 or later can drop its
-workaround now.
+5. For each test that still passes, keep the issue's workarounds.
 
 ## Issues
 
 ### C1. A delete that merges manifests gives existing rows new ids
 
 On a v3 table, a delete whose commit merges manifests gives an existing
-data file a new `first_row_id`. In the test, file f6 goes from row id 1 to
-6. The spec requires the inherited `first_row_id` to be written into
+data file a new `first_row_id`. In the test, file f6 went from row id 1
+to 6. The spec requires the inherited `first_row_id` to be written into
 existing and deleted entries when a manifest is rewritten. Without the
 merge, f6 keeps its id.
 
-- **Test:** `aDeleteThatMergesManifestsRenumbersRows`.
-- **Workaround:** `TestCatalogFaultProperties.V3_PROPERTIES` turns off
-  manifest merging on v3 tables, both on creation and on upgrade. The
-  class Javadoc mentions it.
 - **Upstream:** fixed by #16263, "Core: Fix row ID assignment for
-  EXISTING entry during a manifest merge", released in 1.11.0. After the
-  rebase, drop `V3_PROPERTIES` and keep the fuzzer's row-lineage check.
+  EXISTING entry during a manifest merge", released in 1.11.0.
+- **Removed on the rebase onto 1.12.0:** the test,
+  `aDeleteThatMergesManifestsRenumbersRows`, and the workaround,
+  `TestCatalogFaultProperties.V3_PROPERTIES`, which turned off manifest
+  merging on v3 tables. The fuzzer merges manifests on v3 tables again,
+  and its row-lineage check stays.
 
 ### C2. A retried commit gives a manifest a second row-id range
 
@@ -82,7 +86,11 @@ second range. In the test, f0 goes from row id 0 to 2.
 - **Cause:** `SnapshotProducer` caches the manifests it carries, with
   their metadata, keyed by `ManifestFile` equality (the path). The retry
   reuses the copy it made before the other commit assigned the manifest's
-  `first_row_id`.
+  `first_row_id`. Three more caches keep the same stale copy, on paths
+  the test does not take: `ManifestFilterManager.filterManifest` (kept and
+  rewritten manifests), `ManifestMergeManager.createManifest` (merged
+  bins, keyed by lists of manifests) and
+  `BaseRewriteManifests.requiresRewrite`.
 - **Should:** a data file's row ids never change.
 - **Test:** `aRetriedCommitGivesAManifestASecondRowIdRange`.
 - **Workaround:** `TestCatalogFaultProperties` (the `preUpgrade` map)

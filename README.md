@@ -39,8 +39,9 @@ docs/ICEBERG_ISSUES.md                       Iceberg core bugs the tests work ar
 
 This project does not run against stock Iceberg. It consumes the fork at
 [github.com/cdouglas/iceberg](https://github.com/cdouglas/iceberg) (locally
-at `../iceberg`, branch `atomicio`) as a Maven `1.11.0-SNAPSHOT` artifact.
-That branch carries both the atomic-operations hooks used by the base
+at `../iceberg`, branch `atomicio`) as a Maven `1.12.0-atomicio-SNAPSHOT`
+artifact: the fork is based on the Iceberg 1.12.0 release and names it in its
+version. That branch carries both the atomic-operations hooks used by the base
 catalog and the manifest-list-inlining hooks used by `inline.manifests`.
 
 The fork adds these extension points; everything else is stock Iceberg.
@@ -69,7 +70,7 @@ iceberg first:
 
 ```bash
 cd ../iceberg
-./gradlew publishToMavenLocal -x test -x integrationTest -x generateGitProperties
+./gradlew publishToMavenLocal -x test -x integrationTest
 
 cd ../fileio-catalog
 mvn clean install

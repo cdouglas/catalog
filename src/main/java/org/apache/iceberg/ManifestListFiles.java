@@ -20,6 +20,7 @@ package org.apache.iceberg;
 
 import java.io.IOException;
 import java.util.List;
+import org.apache.iceberg.encryption.PlaintextEncryptionManager;
 import org.apache.iceberg.exceptions.RuntimeIOException;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -50,6 +51,7 @@ public final class ManifestListFiles {
         ManifestLists.write(
             listVersion,
             file,
+            PlaintextEncryptionManager.instance(),
             snapshot.snapshotId(),
             snapshot.parentId(),
             snapshot.sequenceNumber(),

@@ -22,10 +22,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.ManifestContent;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.ManifestFiles;
+import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.TableIdentifier;
@@ -158,7 +160,7 @@ class TestSampleLosslessness {
       Table table = replay.catalog.loadTable(TableIdentifier.of("db", "t" + t));
       List<String> snapSigs = new ArrayList<>();
       for (Snapshot snapshot : orderedSnapshots(table)) {
-        snapSigs.add(snapshotSignature(snapshot, replay.io));
+        snapSigs.add(snapshotSignature(snapshot, replay.io, table.specs()));
       }
       perTable.add(snapSigs);
     }
@@ -188,7 +190,8 @@ class TestSampleLosslessness {
    * carries. Order-independent across manifests (Iceberg does not promise a stable
    * manifest order), so the outer list is sorted.
    */
-  private static String snapshotSignature(Snapshot snapshot, FileIO io) {
+  private static String snapshotSignature(
+      Snapshot snapshot, FileIO io, Map<Integer, PartitionSpec> specsById) {
     List<String> manifestSigs = new ArrayList<>();
     for (ManifestFile manifest : snapshot.allManifests(io)) {
       // The sample workload only adds/removes data files (FastAppend/Overwrite/
@@ -199,7 +202,7 @@ class TestSampleLosslessness {
             "unexpected " + manifest.content() + " manifest in sample workload: " + manifest.path());
       }
       List<String> files = new ArrayList<>();
-      try (CloseableIterable<DataFile> reader = ManifestFiles.read(manifest, io)) {
+      try (CloseableIterable<DataFile> reader = ManifestFiles.read(manifest, io, specsById)) {
         for (DataFile df : reader) {
           files.add(df.path() + "|" + df.recordCount());
         }

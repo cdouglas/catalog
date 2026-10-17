@@ -37,7 +37,6 @@ import java.util.Random;
 import java.util.UUID;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.catalog.CatalogTransactionTests;
-import org.apache.iceberg.gcp.GCPProperties;
 import org.apache.iceberg.io.CloudMode;
 import org.apache.iceberg.io.FileIOCatalog;
 import org.apache.iceberg.io.IntegTestEnv;
@@ -90,7 +89,7 @@ public class GCSFileIOCatalogTransactionTests extends CatalogTransactionTests<Fi
   }
 
   static void cleanupWarehouseLocation() {
-    try (GCSFileIO io = new GCSFileIO(() -> storage, new GCPProperties())) {
+    try (GCSFileIO io = new GCSFileIO(() -> storage)) {
       if (io.listPrefix(warehouseLocation).iterator().hasNext()) {
         io.deletePrefix(warehouseLocation);
       }
@@ -180,7 +179,7 @@ public class GCSFileIOCatalogTransactionTests extends CatalogTransactionTests<Fi
   @BeforeEach
   public void before(TestInfo info) {
     // XXX don't call io.initialize(), as it will overwrite this config
-    GCSFileIO io = new GCSFileIO(() -> storage, new GCPProperties());
+    GCSFileIO io = new GCSFileIO(() -> storage);
 
     final String testName = info.getTestMethod().orElseThrow(RuntimeException::new).getName();
     warehouseLocation =

@@ -19,7 +19,11 @@
 package org.apache.iceberg.io;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
@@ -27,7 +31,9 @@ import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.exceptions.NotFoundException;
 import org.apache.iceberg.types.Types;
+import org.junit.jupiter.api.Assumptions;
 
 /**
  * Shared inline-equivalent test bodies for the {@code *InlineTM} cloud subclasses (errata T4).
@@ -104,6 +110,45 @@ public final class InlineCompatAssertions {
       table.updateSchema().addColumn("e" + i, Types.LongType.get()).commit();
       meta = ((BaseTable) catalog.loadTable(tableId)).operations().current();
       assertThat(meta.previousFiles()).hasSize(maxPreviousVersionsToKeep);
+    }
+  }
+
+  /**
+   * FileIO equivalent of upstream {@link
+   * org.apache.iceberg.catalog.CatalogTests#testLoadTableWithMissingMetadataFile}, which moves the
+   * table's metadata file on the local file system: this deletes it through the table's FileIO, as
+   * Iceberg's {@code TestInMemoryCatalog} does, and puts it back after. An inline table has no
+   * metadata file to lose.
+   */
+  public static void runLoadTableWithMissingMetadataFile(
+      FileIOCatalog catalog, TableIdentifier tableId, Schema schema, boolean createNamespace)
+      throws IOException {
+    if (createNamespace) {
+      catalog.createNamespace(tableId.namespace());
+    }
+
+    catalog.buildTable(tableId, schema).create();
+    assertThat(catalog.tableExists(tableId)).as("Table should exist").isTrue();
+
+    Table table = catalog.loadTable(tableId);
+    String metadataFileLocation =
+        ((BaseTable) table).operations().current().metadataFileLocation();
+    Assumptions.assumeFalse(
+        metadataFileLocation.startsWith("inline:"), "an inline table has no metadata file");
+    byte[] metadata;
+    try (InputStream in = table.io().newInputFile(metadataFileLocation).newStream()) {
+      metadata = in.readAllBytes();
+    }
+    table.io().deleteFile(metadataFileLocation);
+    try {
+      assertThatThrownBy(() -> catalog.loadTable(tableId))
+          .isInstanceOf(NotFoundException.class)
+          .hasMessageContaining(metadataFileLocation);
+    } finally {
+      try (OutputStream out =
+          table.io().newOutputFile(metadataFileLocation).createOrOverwrite()) {
+        out.write(metadata);
+      }
     }
   }
 }

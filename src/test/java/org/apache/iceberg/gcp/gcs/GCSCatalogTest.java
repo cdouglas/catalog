@@ -32,24 +32,27 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.nio.file.Path;
 import java.util.Map;
 import java.util.UUID;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.catalog.CatalogTests;
 import org.apache.iceberg.catalog.TableIdentifier;
-import org.apache.iceberg.gcp.GCPProperties;
 import org.apache.iceberg.io.CloudMode;
 import org.apache.iceberg.io.FileIOCatalog;
+import org.apache.iceberg.io.InlineCompatAssertions;
 import org.apache.iceberg.io.IntegTestEnv;
 import org.apache.iceberg.io.ProtoCatalogFormat;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.TestWatcher;
+import org.junit.jupiter.api.io.TempDir;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.testcontainers.containers.GenericContainer;
@@ -94,7 +97,7 @@ public class GCSCatalogTest extends CatalogTests<FileIOCatalog> {
   }
 
   static void cleanupWarehouseLocation() {
-    try (GCSFileIO io = new GCSFileIO(() -> storage, new GCPProperties())) {
+    try (GCSFileIO io = new GCSFileIO(() -> storage)) {
       if (io.listPrefix(warehouseLocation).iterator().hasNext()) {
         io.deletePrefix(warehouseLocation);
       }
@@ -186,7 +189,7 @@ public class GCSCatalogTest extends CatalogTests<FileIOCatalog> {
   @BeforeEach
   public void before(TestInfo info) {
     // XXX don't call io.initialize(), as it will overwrite this config
-    GCSFileIO io = new GCSFileIO(() -> storage, new GCPProperties());
+    GCSFileIO io = new GCSFileIO(() -> storage);
 
     final String testName = info.getTestMethod().orElseThrow(RuntimeException::new).getName();
     warehouseLocation =
@@ -218,6 +221,14 @@ public class GCSCatalogTest extends CatalogTests<FileIOCatalog> {
     return warehouseLocation + "/" + identifier.namespace() + "/" + identifier.name();
   }
 
+  // CatalogTests moves the metadata file on the local file system.
+  @Override
+  @Test
+  public void testLoadTableWithMissingMetadataFile(@TempDir Path tempDir) throws IOException {
+    InlineCompatAssertions.runLoadTableWithMissingMetadataFile(
+        catalog(), TBL, SCHEMA, requiresNamespaceCreate());
+  }
+
   @Override
   protected boolean requiresNamespaceCreate() {
     return true;
@@ -235,7 +246,7 @@ public class GCSCatalogTest extends CatalogTests<FileIOCatalog> {
 
   @Override
   protected FileIOCatalog initCatalog(String catalogName, Map<String, String> additionalProperties) {
-    GCSFileIO io = new GCSFileIO(() -> storage, new GCPProperties());
+    GCSFileIO io = new GCSFileIO(() -> storage);
     final Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
     properties.put("fileio.catalog.inline", String.valueOf(inlineTM()));

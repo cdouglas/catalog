@@ -55,7 +55,7 @@ credential chain on this workload by a meaningful margin. Microsoft's
 ```bash
 # Build iceberg SNAPSHOTs first
 cd ../iceberg
-./gradlew publishToMavenLocal -x test -x integrationTest -x generateGitProperties
+./gradlew publishToMavenLocal -x test -x integrationTest
 cd ../fileio-catalog
 
 # Unit tests only

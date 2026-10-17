@@ -56,6 +56,7 @@ import org.apache.iceberg.relocated.com.google.common.base.Strings;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.util.LocationUtil;
+import org.apache.iceberg.util.PropertyUtil;
 
 public class FileIOCatalog extends BaseMetastoreCatalog
     implements SupportsNamespaces, SupportsCatalogTransactions {
@@ -341,8 +342,15 @@ public class FileIOCatalog extends BaseMetastoreCatalog
 
   @Override
   protected String defaultWarehouseLocation(TableIdentifier tableIdentifier) {
+    boolean unique =
+        PropertyUtil.propertyAsBoolean(
+            catalogProperties,
+            CatalogProperties.UNIQUE_TABLE_LOCATION,
+            CatalogProperties.UNIQUE_TABLE_LOCATION_DEFAULT);
     return String.join(
-        "/", defaultNamespaceLocation(tableIdentifier.namespace()), tableIdentifier.name());
+        "/",
+        defaultNamespaceLocation(tableIdentifier.namespace()),
+        LocationUtil.tableLocation(tableIdentifier, unique));
   }
 
   private String defaultNamespaceLocation(Namespace namespace) {
