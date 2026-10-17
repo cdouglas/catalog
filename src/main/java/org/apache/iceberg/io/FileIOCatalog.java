@@ -755,7 +755,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         //      InlineDeltaCodec.applyManifestsOnly — the same hook a full-mode
         //      update uses.
         List<InlineDeltaCodec.DeltaUpdate> manifests =
-            manifestUpdates(null, null, metadata, "");
+            manifestUpdates(null, null, metadata, "", true);
         byte[] manifestBytes =
             manifests == null
                 ? null
@@ -763,7 +763,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         byte[] metadataBytes = inline.codec.encode(rewriteInlineSnapshotsForFullEncode(metadata));
         if (metadataBytes.length + (manifestBytes != null ? manifestBytes.length : 0)
                 <= inline.maxUpdateSize
-            && !restatesAManifest(null, null, metadata)) {
+            && !restatesAManifest(null, null, metadata, true)) {
           if (manifestBytes != null) {
             return mut -> mut.createTableInlineWithManifests(
                 tableId, metadataBytes, inline.codec.tag(), manifestBytes);
@@ -792,8 +792,9 @@ public class FileIOCatalog extends BaseMetastoreCatalog
             ? proto.manifestListPrefix(tblId)
             : "";
         List<InlineDeltaCodec.DeltaUpdate> manifests =
-            manifestUpdates(isInline ? proto : null, base, metadata, prefix);
-        if (manifests != null && restatesAManifest(isInline ? proto : null, base, metadata)) {
+            manifestUpdates(isInline ? proto : null, base, metadata, prefix, false);
+        if (manifests != null
+            && restatesAManifest(isInline ? proto : null, base, metadata, false)) {
           mut.updateTable(tableId, writeUpdateMetadata(false, metadata));
           return;
         }
@@ -814,7 +815,14 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         }
         // Full mode keeps the manifest pool (I3) and lands the new snapshots' lists with the
         // metadata: the replay registers each new inline snapshot on its parent's list, even one
-        // with no updates of its own.
+        // with no updates of its own. It also sends the list of any inline snapshot the table
+        // holds no list for, which the full metadata names by its sentinel (Bug 62).
+        manifests = manifestUpdates(isInline ? proto : null, base, metadata, prefix, true);
+        if (manifests != null
+            && restatesAManifest(isInline ? proto : null, base, metadata, true)) {
+          mut.updateTable(tableId, writeUpdateMetadata(false, metadata));
+          return;
+        }
         byte[] fullBytes = inline.codec.encode(rewriteInlineSnapshotsForFullEncode(metadata));
         byte[] manifestBytes =
             manifests == null
@@ -845,15 +853,23 @@ public class FileIOCatalog extends BaseMetastoreCatalog
      * parent has no inline list sends its whole list: its parent's list is a file, written by a
      * writer that does not inline manifest lists or by an eviction.
      *
+     * <p>With {@code full}, for a commit of the full metadata, which replaces the table's, the
+     * updates also hold the list of each inline snapshot in {@code base} that the table holds no
+     * inline list for (see {@link #sendsList}).
+     *
      * <p>Returns null if the commit adds no inline snapshot; else the updates, which are none if
      * the new snapshots change no manifests (a delete that matched nothing) but must still be
      * sent, so that the catalog registers their lists.
      */
     private List<InlineDeltaCodec.DeltaUpdate> manifestUpdates(
-        ProtoCatalogFile proto, TableMetadata base, TableMetadata metadata, String prefix) {
+        ProtoCatalogFile proto,
+        TableMetadata base,
+        TableMetadata metadata,
+        String prefix,
+        boolean full) {
       List<InlineDeltaCodec.DeltaUpdate> updates = null;
       for (Snapshot snapshot : metadata.snapshots()) {
-        if (!isNew(snapshot, base)) {
+        if (!sendsList(snapshot, proto, base, full)) {
           continue;
         }
         if (updates == null) {
@@ -908,14 +924,14 @@ public class FileIOCatalog extends BaseMetastoreCatalog
      * I3a), so the commit writes a metadata file, which holds each snapshot's list as it is.
      */
     private boolean restatesAManifest(
-        ProtoCatalogFile proto, TableMetadata base, TableMetadata metadata) {
+        ProtoCatalogFile proto, TableMetadata base, TableMetadata metadata, boolean full) {
       Integer tblId = proto != null ? proto.tableId(tableId) : null;
       Map<String, Long> firstRowIds = new HashMap<>();
       if (tblId != null) {
         proto.manifestPool(tblId).forEach((path, m) -> firstRowIds.put(path, m.firstRowId()));
       }
       for (Snapshot snapshot : metadata.snapshots()) {
-        if (!isNew(snapshot, base)) {
+        if (!sendsList(snapshot, proto, base, full)) {
           continue;
         }
         for (ManifestFile m : snapshot.allManifests(io())) {
@@ -927,6 +943,27 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         }
       }
       return false;
+    }
+
+    /**
+     * Whether a commit of {@code metadata} on {@code base} sends {@code snapshot}'s list: if it is
+     * an inline-ML snapshot the commit adds, or, with {@code full}, one the table, as {@code proto}
+     * holds it (null if the table is not inline), has no inline list for. Full metadata names
+     * every inline snapshot by its sentinel, and a commit's handle can hold one whose list the
+     * table no longer has: it loaded the table inline, and another writer has since evicted it,
+     * which wrote the lists to files and dropped them (Bug 62: a replace transaction commits the
+     * snapshots it loaded). A delta keeps each snapshot in {@code base} as the table has it.
+     */
+    private boolean sendsList(
+        Snapshot snapshot, ProtoCatalogFile proto, TableMetadata base, boolean full) {
+      if (isNew(snapshot, base)) {
+        return true;
+      }
+      if (!full || !(snapshot instanceof InlineSnapshot)) {
+        return false;
+      }
+      Integer tblId = proto != null ? proto.tableId(tableId) : null;
+      return tblId == null || !proto.hasInlineManifests(tblId, snapshot.snapshotId());
     }
 
     /** Whether {@code snapshot} is an inline-ML snapshot that a commit on {@code base} adds. */

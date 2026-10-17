@@ -3815,6 +3815,58 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 62: a replace transaction commits the table it built at its
+  // start, snapshots included (Iceberg behavior A1). If the table was
+  // inline with inline manifest lists, the handle held its snapshots as
+  // inline snapshots. When another writer evicted the table in between
+  // (a commit too big for the inline update limit, which writes the
+  // snapshots' lists to files and drops them from the catalog's pool),
+  // the replace brought the table back inline in full, naming those
+  // snapshots by their sentinels, but sent lists only for the snapshots
+  // it added: the table no longer loaded ("sentinel ... but no pool
+  // entry"). A commit of full metadata now also sends the list of each
+  // inline snapshot the table holds no list for. Found by
+  // TestCatalogFaultProperties in a long run; it reproduces on the fork
+  // before the rebase onto Iceberg 1.12.0 too.
+  // ============================================================
+
+  @Nested
+  class ReplaceOfATableEvictedSinceItBegan {
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void keepsTheListsOfItsSnapshots(boolean orCreate) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = small(io, LocalCatalogMode.APPEND_ML);
+      catalog.createNamespace(mixedNs);
+      Table table = catalog.createTable(mixed, intSchema);
+      table.newFastAppend().appendFile(dataFile("a")).commit();
+      long first = table.currentSnapshot().snapshotId();
+
+      org.apache.iceberg.Transaction replace =
+          catalog.newReplaceTableTransaction(mixed, intSchema, orCreate);
+      FileIOCatalog evicts = small(io, LocalCatalogMode.APPEND_ML);
+      boolean[] raced = {false};
+      io.injectFaults((location, strategy) -> {
+        if (!raced[0] && location.equals(CATALOG)) {
+          raced[0] = true;
+          // Too big for the 2 KiB inline update limit: the table leaves inline storage.
+          evicts.loadTable(mixed).updateProperties().set("big", bigValue(2457)).commit();
+        }
+        return Fault.NONE;
+      });
+      replace.commitTransaction();
+      assertThat(raced[0]).isTrue();
+
+      Table read = catalog(io, LocalCatalogMode.APPEND).loadTable(mixed);
+      assertThat(manifestLists(io, read).get(first)).hasSize(1);
+      assertThat(read.snapshot(first).addedDataFiles(io))
+          .extracting(org.apache.iceberg.ContentFile::location)
+          .containsExactly(dataFile("a").location());
+    }
+  }
+
   /**
    * Storage with prefix and bulk operations, as S3, GCS and ADLS have (a table's FileIO passes
    * bulk deletes on only for those), whose bulk deletes fail.
