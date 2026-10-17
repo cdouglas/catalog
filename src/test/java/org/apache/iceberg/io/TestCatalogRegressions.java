@@ -3778,6 +3778,69 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 61: once a table commit lands, FileIOCatalog deletes the metadata
+  // files that dropped out of the table's metadata log
+  // (write.metadata.delete-after-commit.enabled). Through a FileIO with bulk
+  // deletes (S3, GCS, ADLS), a delete that failed threw out of the commit,
+  // so Iceberg reported a commit that had landed as failed, and a caller
+  // that retried it committed twice. The non-bulk path logged and went on.
+  // It now deletes with CatalogUtil.deleteFiles, which logs either kind of
+  // failure, as Iceberg's own catalogs do. Found by reading FileIOCatalog
+  // against Iceberg 1.12.0, which made deleteFiles public.
+  // ============================================================
+
+  @Nested
+  class MetadataCleanupThatFails {
+
+    @Test
+    void leavesTheCommitThatLanded() {
+      BulkDeletesFail io = new BulkDeletesFail();
+      FileIOCatalog catalog = catalog(io, LocalCatalogMode.APPEND);
+      catalog.createNamespace(mixedNs);
+      Table table =
+          catalog
+              .buildTable(mixed, intSchema)
+              .withProperty(
+                  org.apache.iceberg.TableProperties.METADATA_DELETE_AFTER_COMMIT_ENABLED, "true")
+              .withProperty(org.apache.iceberg.TableProperties.METADATA_PREVIOUS_VERSIONS_MAX, "1")
+              .create();
+      table.newFastAppend().appendFile(dataFile("a")).commit();
+      // Drops the table's first metadata file from its log, so the commit deletes it.
+      table.newFastAppend().appendFile(dataFile("b")).commit();
+
+      assertThat(io.bulkDeletes).as("bulk deletes").isPositive();
+      assertThat(dataFiles(catalog(io, LocalCatalogMode.APPEND).loadTable(mixed)))
+          .containsExactly(dataFile("a").location(), dataFile("b").location());
+    }
+  }
+
+  /**
+   * Storage with prefix and bulk operations, as S3, GCS and ADLS have (a table's FileIO passes
+   * bulk deletes on only for those), whose bulk deletes fail.
+   */
+  private static class BulkDeletesFail extends InMemoryAtomicFileIO
+      implements org.apache.iceberg.io.DelegateFileIO {
+    private int bulkDeletes = 0;
+
+    @Override
+    public void deleteFiles(Iterable<String> paths) {
+      bulkDeletes += 1;
+      throw new org.apache.iceberg.io.BulkDeletionFailureException(
+          org.apache.iceberg.relocated.com.google.common.collect.Iterables.size(paths));
+    }
+
+    @Override
+    public Iterable<org.apache.iceberg.io.FileInfo> listPrefix(String prefix) {
+      throw new UnsupportedOperationException("listPrefix");
+    }
+
+    @Override
+    public void deletePrefix(String prefix) {
+      throw new UnsupportedOperationException("deletePrefix");
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)

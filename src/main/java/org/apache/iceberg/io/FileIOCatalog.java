@@ -687,19 +687,11 @@ public class FileIOCatalog extends BaseMetastoreCatalog
       if (removed.isEmpty()) {
         return;
       }
-      Iterable<String> paths =
-          removed.stream().map(TableMetadata.MetadataLogEntry::file)::iterator;
-      if (io() instanceof org.apache.iceberg.io.SupportsBulkOperations) {
-        ((org.apache.iceberg.io.SupportsBulkOperations) io()).deleteFiles(paths);
-      } else {
-        for (String path : paths) {
-          try {
-            io().deleteFile(path);
-          } catch (RuntimeException e) {
-            LOG.warn("Delete failed for previous metadata file: {}", path, e);
-          }
-        }
-      }
+      // The commit landed: a file that cannot be deleted is logged, not thrown.
+      CatalogUtil.deleteFiles(
+          io(),
+          removed.stream().map(TableMetadata.MetadataLogEntry::file).collect(Collectors.toSet()),
+          "metadata");
     }
 
     @Override
