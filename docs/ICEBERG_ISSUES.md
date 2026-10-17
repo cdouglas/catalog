@@ -227,3 +227,14 @@ A commit through a handle to a table that was dropped and created again
 under its name fails with `IllegalStateException` ("Table UUID does not
 match"), not `CommitFailedException`. `TestCatalogRaceProperties`
 (`REPLACED`) and `TestCatalogFaultProperties` accept that failure.
+
+### A4. A delete file is checked against the version its commit lands on
+
+Since 1.12.0 (#16146, "Core: Validate v2 deletes against concurrent
+format upgrade"), a row delta checks each delete file against the format
+version of the metadata its commit lands on, not the handle's. A handle
+loaded while the table was v2 that adds a position delete file after
+another writer upgraded the table to v3 fails with
+`IllegalArgumentException` ("Must use DVs for position deletes in V3").
+Before, the commit landed a v2 position delete in a v3 table.
+`TestCatalogFaultProperties` counts that failure as a rejection.

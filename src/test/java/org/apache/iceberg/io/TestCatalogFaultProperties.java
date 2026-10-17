@@ -1028,7 +1028,20 @@ class TestCatalogFaultProperties {
                   }
                 }
                 org.apache.iceberg.DeleteFile built = delete.build();
-                staleSpecs(id, () -> table.newRowDelta().addDeletes(built).commit());
+                staleSpecs(id, () -> {
+                  try {
+                    table.newRowDelta().addDeletes(built).commit();
+                  } catch (IllegalArgumentException e) {
+                    // Iceberg checks a delete file against the format version of the metadata the
+                    // commit lands on: a position delete for a v2 table is not one for a table
+                    // another writer has upgraded to v3 since (A4 in docs/ICEBERG_ISSUES.md).
+                    if (dv[0] || e.getMessage() == null
+                        || !e.getMessage().startsWith("Must use DVs for position deletes")) {
+                      throw e;
+                    }
+                    throw new ValidationException(e, "%s: upgraded to v3 since the handle", id);
+                  }
+                });
               },
               (m, actual) -> {
                 TableState state = existing(m, id);
