@@ -277,42 +277,60 @@ public class InlineDeltaCodec {
     java.util.Set<Long> addedInThisDelta = new java.util.HashSet<>();
     NewSnapshotManifests newSnapshots = new NewSnapshotManifests(catalogBuilder, tableId);
     TableMetadata current = base;
-    // Consecutive TableMetadata updates (schema, spec, sort order, refs, properties, ...) apply to
-    // one builder, built once, as the writer's were: build() checks the default spec and sort
-    // order against the current schema, which an intermediate state, a new schema without the
-    // column the old spec partitions by, would fail.
+    // Consecutive TableMetadata updates (snapshots, refs, schema, spec, sort order, properties,
+    // ...) apply to one builder, built once, as the writer's were. build() checks the default spec
+    // and sort order against the current schema, which an intermediate state, a new schema without
+    // the column the old spec partitions by, would fail. And setRef logs main's move to a snapshot
+    // at the snapshot's own timestamp only if the same builder added it (else at last-updated-ms),
+    // as a writer's commit adds its snapshot and moves the branch in one builder.
     TableMetadata.Builder pending = null;
+    // The last sequence number of the metadata pending builds, which numbers the next snapshot.
+    long lastSequenceNumber = 0L;
     for (DeltaUpdate update : updates) {
-      boolean metadataOnly =
-          !(update instanceof AddSnapshotUpdate)
-              && !(update instanceof AddManifestUpdate)
-              && !(update instanceof RemoveManifestUpdate)
-              && !(update instanceof RemoveSnapshotsUpdate);
-      if (metadataOnly) {
+      boolean tableMetadata =
+          !(update instanceof AddManifestUpdate) && !(update instanceof RemoveManifestUpdate);
+      if (tableMetadata) {
         if (pending == null) {
           pending = TableMetadata.buildFrom(current);
           pending.setLastUpdatedMillis(writerLastUpdatedMillis);
+          lastSequenceNumber = current.lastSequenceNumber();
         }
-        update.applyTo(pending);
+        if (update instanceof AddSnapshotUpdate) {
+          AddSnapshotUpdate addSnap = (AddSnapshotUpdate) update;
+          // v1 tables don't carry sequence numbers; TableMetadata's constructor rejects any
+          // non-zero value.
+          long sequenceNumber = current.formatVersion() >= 2 ? ++lastSequenceNumber : 0L;
+          pending.addSnapshot(
+              addSnap.snapshot(
+                  sequenceNumber, current.currentSchemaId(), prefix, base.lastUpdatedMillis()));
+          addedInThisDelta.add(addSnap.snapshotId);
+          // Inline-ML snapshots (empty suffix → `inline://<snapId>` sentinel) must
+          // have a pool entry, otherwise wrapInlineManifests treats the sentinel as
+          // catalog state corruption. Register it now, even if no AddManifest or
+          // RemoveManifest update follows.
+          if (addSnap.manifestListSuffix.isEmpty()) {
+            newSnapshots.add(addSnap.snapshotId, addSnap.parentSnapshotId);
+          }
+        } else if (update instanceof RemoveSnapshotsUpdate) {
+          // Cascade snapshot removal to the catalog pool: drop the snapshot's ref
+          // list and GC any pool entries no longer referenced. Without this, the
+          // pool grows unboundedly as snapshots are expired.
+          // See ML_INLINE_REVIEW2.md §2.6 / ML_INLINE_DESIGN_NOTES.md Gap 1.
+          for (long snapId : ((RemoveSnapshotsUpdate) update).snapshotIds) {
+            catalogBuilder.removeSnapshotManifests(tableId, snapId);
+          }
+          // Builder.removeSnapshots also cleans up the TM side's dangling refs.
+          update.applyTo(pending);
+        } else {
+          update.applyTo(pending);
+        }
         continue;
       }
       if (pending != null) {
         current = pending.discardChanges().build();
         pending = null;
       }
-      if (update instanceof AddSnapshotUpdate) {
-        // Route through the prefix-accepting overload (avoids the throw in applyTo(Builder))
-        AddSnapshotUpdate addSnap = (AddSnapshotUpdate) update;
-        current = addSnap.applyTo(current, prefix, base.lastUpdatedMillis());
-        addedInThisDelta.add(addSnap.snapshotId);
-        // Inline-ML snapshots (empty suffix → `inline://<snapId>` sentinel) must
-        // have a pool entry, otherwise wrapInlineManifests treats the sentinel as
-        // catalog state corruption. Register it now, even if no AddManifest or
-        // RemoveManifest update follows.
-        if (addSnap.manifestListSuffix.isEmpty()) {
-          newSnapshots.add(current, addSnap.snapshotId);
-        }
-      } else if (update instanceof AddManifestUpdate) {
+      if (update instanceof AddManifestUpdate) {
         AddManifestUpdate add = (AddManifestUpdate) update;
         // Assert ordering: if we're adding a manifest for a snapshot not yet in
         // current, carry-forward lookup will fail to find the parent. Flag it.
@@ -349,21 +367,6 @@ public class InlineDeltaCodec {
       } else if (update instanceof RemoveManifestUpdate) {
         RemoveManifestUpdate rm = (RemoveManifestUpdate) update;
         newSnapshots.removeManifest(current, rm.snapshotId, rm.manifestPathSuffix);
-      } else if (update instanceof RemoveSnapshotsUpdate) {
-        // Cascade snapshot removal to the catalog pool: drop the snapshot's ref
-        // list and GC any pool entries no longer referenced. Without this, the
-        // pool grows unboundedly as snapshots are expired.
-        // See ML_INLINE_REVIEW2.md §2.6 / ML_INLINE_DESIGN_NOTES.md Gap 1.
-        RemoveSnapshotsUpdate rs = (RemoveSnapshotsUpdate) update;
-        for (long snapId : rs.snapshotIds) {
-          catalogBuilder.removeSnapshotManifests(tableId, snapId);
-        }
-        // Also remove from TableMetadata (Builder.removeSnapshots handles the
-        // dangling-refs cleanup for the TM side).
-        TableMetadata.Builder tmBuilder = TableMetadata.buildFrom(current);
-        tmBuilder.setLastUpdatedMillis(writerLastUpdatedMillis);
-        update.applyTo(tmBuilder);
-        current = tmBuilder.discardChanges().build();
       }
     }
     if (pending != null) {
@@ -402,11 +405,15 @@ public class InlineDeltaCodec {
 
     /** Registers {@code snapshotId}, just added to {@code current}, unless it has a list. */
     void add(TableMetadata current, long snapshotId) {
+      Snapshot snap = current.snapshot(snapshotId);
+      add(snapshotId, snap != null ? snap.parentId() : null);
+    }
+
+    /** Registers {@code snapshotId}, a child of {@code parentId} (null: none), unless it has a list. */
+    void add(long snapshotId, Long parentId) {
       if (builder.snapshotManifestKeys(tableId).contains(snapshotId)) {
         return;
       }
-      Snapshot snap = current.snapshot(snapshotId);
-      Long parentId = snap != null ? snap.parentId() : null;
       List<String> base =
           parentId != null ? builder.snapshotManifestPaths(tableId, parentId) : List.of();
       parents.put(snapshotId, parentId);
@@ -930,7 +937,9 @@ public class InlineDeltaCodec {
 
   /**
    * Whether {@code newMeta}'s snapshot log has the entries replay adds to {@code oldMeta}'s: none
-   * if main did not move, else main's new snapshot at the commit's last-updated-ms, last.
+   * if main did not move, else main's new snapshot, last. Replay adds the commit's snapshots and
+   * moves main in one builder, which logs a snapshot it added at the snapshot's timestamp and one
+   * it did not (a rollback) at the commit's last-updated-ms.
    */
   private static boolean replayLogsAsTheWriterDid(TableMetadata oldMeta, TableMetadata newMeta) {
     Set<org.apache.iceberg.HistoryEntry> old = new HashSet<>(oldMeta.snapshotLog());
@@ -946,10 +955,14 @@ public class InlineDeltaCodec {
     if (main == null || (was != null && was.snapshotId() == main.snapshotId())) {
       return added.isEmpty();
     }
+    long loggedAt =
+        oldMeta.snapshot(main.snapshotId()) == null
+            ? main.timestampMillis()
+            : newMeta.lastUpdatedMillis();
     return added.size() == 1
         && log.get(log.size() - 1) == added.get(0)
         && added.get(0).snapshotId() == main.snapshotId()
-        && added.get(0).timestampMillis() == newMeta.lastUpdatedMillis();
+        && added.get(0).timestampMillis() == loggedAt;
   }
 
   /**
@@ -1503,6 +1516,27 @@ public class InlineDeltaCodec {
       // v1 tables don't carry sequence numbers; TableMetadata's constructor rejects
       // any non-zero value. Synthesize seqNum only for v2+.
       long seqNum = base.formatVersion() >= 2 ? base.lastSequenceNumber() + 1 : 0;
+      Snapshot snapshot =
+          snapshot(seqNum, base.currentSchemaId(), manifestListPrefix, deltaBaseUpdatedMillis);
+      // Iceberg's builder no longer takes last-updated-ms from an added snapshot (since 1.12.0),
+      // so pin it to the snapshot's time, as it was, rather than the wall clock.
+      return TableMetadata.buildFrom(base)
+          .setLastUpdatedMillis(snapshot.timestampMillis())
+          .addSnapshot(snapshot)
+          .discardChanges()
+          .build();
+    }
+
+    /**
+     * The snapshot this update adds, numbered {@code sequenceNumber}, with its timestamp relative
+     * to {@code deltaBaseUpdatedMillis} and, if the delta names none, schema {@code
+     * currentSchemaId}: the base's current schema.
+     */
+    Snapshot snapshot(
+        long sequenceNumber,
+        int currentSchemaId,
+        String manifestListPrefix,
+        long deltaBaseUpdatedMillis) {
       // parentSnapshotId is authoritative. The encoder (computeDelta line 533)
       // captures snap.parentId() verbatim and the wire treats field absence as
       // explicit null. Falling back to base.currentSnapshot() is wrong for
@@ -1513,7 +1547,7 @@ public class InlineDeltaCodec {
       // prior snapshot's manifest list into the replacement.
       Long resolvedParentId = parentSnapshotId;
       long timestamp = deltaBaseUpdatedMillis + timestampDeltaMs;
-      Integer resolvedSchemaId = schemaId != null ? schemaId : base.currentSchemaId();
+      Integer resolvedSchemaId = schemaId != null ? schemaId : currentSchemaId;
       // For inline-ML snapshots (empty suffix), the manifest-list location is a
       // sentinel; the inline-ML read path swaps the BaseSnapshot for an
       // InlineSnapshot in wrapInlineManifests before any FileIO call resolves it.
@@ -1521,8 +1555,8 @@ public class InlineDeltaCodec {
           ? "inline://" + snapshotId
           : manifestListPrefix + manifestListSuffix;
 
-      Snapshot snapshot = InlineDeltaSnapshots.create(
-          seqNum,
+      return InlineDeltaSnapshots.create(
+          sequenceNumber,
           snapshotId,
           resolvedParentId,
           timestamp,
@@ -1532,11 +1566,6 @@ public class InlineDeltaCodec {
           firstRowId,
           addedRows,
           keyId == null || keyId.isEmpty() ? null : keyId);
-
-      return TableMetadata.buildFrom(base)
-          .addSnapshot(snapshot)
-          .discardChanges()
-          .build();
     }
 
     @Override

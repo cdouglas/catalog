@@ -3680,6 +3680,104 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 60: Iceberg 1.12.0 (apache/iceberg#14504) no longer takes a
+  // table's last-updated-ms from a snapshot it adds, and logs main's move
+  // to a snapshot at the snapshot's own time if the same builder added
+  // it. Replay of an inline delta added each snapshot in a builder of its
+  // own, without the writer's last-updated-ms: a commit that only added a
+  // snapshot (a staged append) replayed at the reader's clock, and the
+  // times of the next delta's snapshots, which it stores relative to that,
+  // drifted. And computeDelta expected main's new log entry at the
+  // commit's last-updated-ms, so on 1.12.0 nearly every append went in
+  // full. Replay now adds a delta's snapshots in the builder that sets its
+  // refs, at the writer's last-updated-ms, and computeDelta expects the
+  // entry Iceberg logs. Found by TestInlineDeltaProperties,
+  // TestInlineDifferentialProperties and TestCatalogFaultProperties on the
+  // rebase onto Iceberg 1.12.0.
+  // ============================================================
+
+  @Nested
+  class TimesOfAddedSnapshots {
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND_TM", "APPEND_ML"})
+    void aCommitThatOnlyAddsASnapshotReplaysAsWritten(LocalCatalogMode mode)
+        throws InterruptedException {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, mode);
+      catalog.createNamespace(mixedNs);
+      catalog.createTable(mixed, intSchema).newFastAppend().appendFile(dataFile("a")).commit();
+
+      for (String file : List.of("b", "c")) {
+        org.apache.iceberg.Transaction txn = catalog.loadTable(mixed).newTransaction();
+        txn.newFastAppend().appendFile(dataFile(file)).stageOnly().commit();
+        org.apache.iceberg.TableMetadata written =
+            ((org.apache.iceberg.HasTableOperations) txn.table()).operations().current();
+        txn.commitTransaction();
+        Thread.sleep(5);
+
+        org.apache.iceberg.TableMetadata read =
+            ((org.apache.iceberg.HasTableOperations) catalog(io, LocalCatalogMode.APPEND)
+                    .loadTable(mixed))
+                .operations()
+                .current();
+        assertThat(read.lastUpdatedMillis())
+            .as("last-updated-ms after staging %s", file)
+            .isEqualTo(written.lastUpdatedMillis());
+        for (org.apache.iceberg.Snapshot s : written.snapshots()) {
+          assertThat(read.snapshot(s.snapshotId()).timestampMillis())
+              .as("snapshot %d", s.snapshotId())
+              .isEqualTo(s.timestampMillis());
+        }
+      }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void anAppendGoesAsADelta(boolean structural) {
+      InlineMetadataCodec codec =
+          structural ? InlineMetadataCodecs.STRUCTURAL : InlineMetadataCodecs.JSON_GZIP;
+      org.apache.iceberg.TableMetadata base =
+          codec.decodeFull(
+              codec.encode(
+                  org.apache.iceberg.TableMetadata.newTableMetadata(
+                      intSchema, org.apache.iceberg.PartitionSpec.unpartitioned(),
+                      org.apache.iceberg.SortOrder.unsorted(), "mem:///w/ns/t",
+                      Map.of("format-version", "2"))),
+              "inline://base");
+      long created = base.lastUpdatedMillis() + 1;
+      org.apache.iceberg.Snapshot snapshot =
+          org.apache.iceberg.InlineDeltaSnapshots.create(
+              1, 7L, null, created, Map.of("operation", "append"), 0,
+              "mem:///w/ns/t/metadata/snap-7.avro", null, null, null);
+      // A commit a second after its snapshot was made: Iceberg logs main's move at the
+      // snapshot's time and the commit at the commit's.
+      org.apache.iceberg.TableMetadata next =
+          org.apache.iceberg.TableMetadata.buildFrom(base)
+              .setLastUpdatedMillis(created + 1000)
+              .setBranchSnapshot(snapshot, org.apache.iceberg.SnapshotRef.MAIN_BRANCH)
+              .build();
+      assertThat(next.snapshotLog().get(0).timestampMillis()).isEqualTo(created);
+
+      List<InlineDeltaCodec.DeltaUpdate> delta = InlineDeltaCodec.computeDelta(base, next, "");
+      assertThat(delta).as("the append's delta").isNotNull();
+
+      ProtoCatalogFile.Builder builder =
+          ProtoCatalogFile.builder(new InMemoryInputFile("mem:///stub", new byte[0]))
+              .addInlineTable(1, 0, "t", 1, codec.encode(base), codec.tag(), "");
+      ProtoCodec.UpdateTableInlineAction.delta(
+              1, 1, InlineDeltaCodec.encodeDelta(delta, next.lastUpdatedMillis()))
+          .apply(builder);
+      org.apache.iceberg.TableMetadata replayed =
+          codec.decodeFull(builder.inlineMetadata(1), "inline://replayed");
+      assertThat(replayed.lastUpdatedMillis()).isEqualTo(next.lastUpdatedMillis());
+      assertThat(replayed.snapshotLog()).isEqualTo(next.snapshotLog());
+      assertThat(replayed.currentSnapshot().timestampMillis()).isEqualTo(created);
+    }
+  }
+
   private Table v3(FileIOCatalog catalog) {
     return catalog
         .buildTable(mixed, intSchema)

@@ -363,14 +363,17 @@ properties make this work:
 
 2. **`lastUpdatedMillis` pin BEFORE `applyTo`.** `Builder.lastUpdatedMillis`
    starts null and `Builder.build()` defaults to
-   `System.currentTimeMillis()` when unset. Several updates (notably
-   `SetSnapshotRefUpdate` for the `main` branch, which calls
-   `Builder.setRef`) read the field synchronously to stamp a new
-   `SnapshotLogEntry`, so a null reads as wall-clock time. Both replay
-   loops set `tmBuilder.setLastUpdatedMillis(current.lastUpdatedMillis())`
-   before calling `update.applyTo(tmBuilder)`. `AddSnapshotUpdate` is
-   exempt: its `applyTo` calls `addSnapshot(snapshot)` which itself pins
-   `lastUpdatedMillis` to the snapshot's deterministic timestamp.
+   `System.currentTimeMillis()` when unset, as does
+   `SetSnapshotRefUpdate` for the `main` branch (`Builder.setRef`) when it
+   stamps a new `SnapshotLogEntry` for a snapshot the builder did not add.
+   Both replay loops pin the writer's last-updated-ms, which the delta
+   carries, before calling `update.applyTo(builder)`. The run of table
+   metadata updates up to the delta's first manifest update, its
+   `AddSnapshotUpdate`s included, goes to one builder: Iceberg logs
+   main's move to a snapshot the same builder added at the snapshot's
+   timestamp (Iceberg 1.12.0 no longer takes last-updated-ms from
+   `addSnapshot`), so the snapshot and the ref that moves to it must be
+   applied together, as the writer did.
 
 Without these two properties, replay produces different bytes on each
 read, the synthetic `metadataFileLocation` (Arrays.hashCode of the bytes)

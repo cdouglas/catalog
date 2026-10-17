@@ -174,18 +174,22 @@ Two operational rules in `InlineDeltaCodec` keep the bytes stable:
    `Builder.buildFrom(base).discardChanges().build()` skips
    `addPreviousFile` and the new TM's metadata-log loses the entry for
    the prior version.
-2. `tmBuilder.setLastUpdatedMillis(current.lastUpdatedMillis())` runs
-   **before** `update.applyTo(tmBuilder)` in every Builder rebuild loop.
-   `Builder.lastUpdatedMillis` starts null; `Builder.setRef` (invoked by
-   `SetSnapshotRefUpdate` for `main`) reads it synchronously to stamp a
-   `SnapshotLogEntry`, and a null reads as `System.currentTimeMillis()`
-   inside `Builder.build`'s fallback. Pinning before `applyTo` makes the
-   stamp deterministic and the bytes stable.
+2. Every builder replay opens is pinned to the writer's last-updated-ms,
+   which the delta carries (`setLastUpdatedMillis`), **before** any update
+   is applied. `Builder.lastUpdatedMillis` starts null, and both
+   `Builder.setRef` for `main` and `Builder.build` then stamp
+   `System.currentTimeMillis()`: setRef as the snapshot-log time of a move
+   to a snapshot the builder did not add, build as the table's
+   last-updated-ms. Since Iceberg 1.12.0 `Builder.addSnapshot` no longer
+   sets the field, so a delta that only adds a snapshot needs the pin too
+   (Bug 60).
 
-`AddSnapshotUpdate.applyTo` is exempt from rule 2 because
-`Builder.addSnapshot` itself pins `lastUpdatedMillis` to
-`snapshot.timestampMillis()`, which is reconstructed deterministically
-from `base.lastUpdatedMillis() + timestampDeltaMs`.
+A delta's new snapshots are added in the same builder as its refs and
+other metadata updates, as a writer's commit adds its snapshot and moves
+the branch in one builder: Iceberg logs main's move to a snapshot that
+builder added at the snapshot's own timestamp, which replay reconstructs
+as `base.lastUpdatedMillis() + timestampDeltaMs`, and a move to any
+other snapshot (a rollback) at last-updated-ms (Bug 60).
 
 ### I5. Inline-ML snapshots encode as sentinels, never as embedded paths
 
@@ -241,7 +245,9 @@ Replay must also build as the writer did: TableMetadata.Builder checks
 the default spec and sort order against the current schema on every
 build, so a run of metadata updates is applied to one builder and built
 once (Bug 49: an intermediate state of a replace to a schema without
-the partition column did not validate). And it must number new schemas
+the partition column did not validate), with the commit's new snapshots
+in it (Bug 60: Iceberg logs main's move to a snapshot at the snapshot's
+time only if the same builder added it). And it must number new schemas
 and specs as the writer did: the builder gives each the id of an equal
 one, else one past the highest, and replay adds before it removes (Bug
 52: a transaction that cleaned up unused specs, then went back to one).
