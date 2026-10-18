@@ -1438,6 +1438,14 @@ class TestCatalogFaultProperties {
                     w.loaded.get(id).appended = true;
                     w.staged.add(Map.entry(id, staged.location()));
                   }
+                } catch (org.apache.iceberg.exceptions.NotFoundException e) {
+                  // The transaction stages on the version it read; an expiry, or a drop with
+                  // purge, since may have deleted that version's manifest list, which the append
+                  // reads. A rejection, as for a stale handle (the transaction would fail at
+                  // commit anyway: the table changed since it read it). A live snapshot without
+                  // its manifest list is still caught by the check of every snapshot's list.
+                  w.closeTxn();
+                  throw new ValidationException(e, "the transaction's snapshot is gone");
                 } catch (RuntimeException e) {
                   w.closeTxn(); // abandon the transaction
                   throw e;
