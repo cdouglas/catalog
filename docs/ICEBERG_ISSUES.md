@@ -31,7 +31,7 @@ issues (see "Rebasing onto a newer Iceberg"). The Fork column is
 | Issue | Fork | 1.12.0 | main | Upstream |
 |---|---|---|---|---|
 | C1. A merging delete renumbers rows | fixed | fixed | fixed | fixed by [#16263](https://github.com/apache/iceberg/pull/16263), in 1.11.0 |
-| C2. A retried commit renumbers rows | yes | yes | yes | not reported |
+| C2. A retried commit renumbers rows | fixed, `core-fixes` 6c6b6fd | yes | yes | not reported |
 | C3. A replace restores an expired snapshot | yes | yes | yes | [#16942](https://github.com/apache/iceberg/issues/16942), part of [#16232](https://github.com/apache/iceberg/issues/16232); fix in PR [#16943](https://github.com/apache/iceberg/pull/16943), open |
 | C4. A stale handle fails on a newer spec | fixed, `core-fixes` bfc20da | yes | yes | not reported |
 | C5. Rewriting manifests fails with no snapshot | fixed, `core-fixes` f723a52 | yes | yes | not reported |
@@ -80,24 +80,32 @@ merge, f6 keeps its id.
 
 ### C2. A retried commit gives a manifest a second row-id range
 
-Suppose a commit has to retry because another commit landed first, and
+Suppose a commit had to retry because another commit landed first, and
 that other commit gave row ids to a manifest the retrying commit carries,
-one written before a v3 upgrade. The retry then gives the manifest a
-second range. In the test, f0 goes from row id 0 to 2.
+one written before a v3 upgrade. The retry then gave the manifest a
+second range: its data files' row ids changed.
 
-- **Cause:** `SnapshotProducer` caches the manifests it carries, with
-  their metadata, keyed by `ManifestFile` equality (the path). The retry
-  reuses the copy it made before the other commit assigned the manifest's
-  `first_row_id`. Three more caches keep the same stale copy, on paths
-  the test does not take: `ManifestFilterManager.filterManifest` (kept and
-  rewritten manifests), `ManifestMergeManager.createManifest` (merged
-  bins, keyed by lists of manifests) and
-  `BaseRewriteManifests.requiresRewrite`.
-- **Should:** a data file's row ids never change.
-- **Test:** `aRetriedCommitGivesAManifestASecondRowIdRange`.
-- **Workaround:** `TestCatalogFaultProperties` (the `preUpgrade` map)
-  exempts files a table had at its v3 upgrade from the check that a row
-  id never changes.
+- **Cause:** four caches kept what a commit made on an earlier attempt,
+  keyed by `ManifestFile` equality (the path), from the copy of the
+  manifest that attempt saw, without `first_row_id`:
+  - `SnapshotProducer`'s manifests with metadata (the manifests a commit
+    carries: a fast append);
+  - `ManifestFilterManager.filterManifest` (kept and rewritten manifests:
+    a delete);
+  - `ManifestMergeManager.createManifest` (merged bins, keyed by lists of
+    manifests: a merge append);
+  - `BaseRewriteManifests.requiresRewrite` (a manifest rewrite).
+- **Fork:** fixed on `core-fixes` by 6c6b6fd, "Core: Keep the row ids of
+  the manifests a retried commit carries". `SnapshotProducer` no longer
+  caches manifests that need no metadata, and the other three redo their
+  work for a manifest whose `first_row_id` changed. Its tests are the
+  `*RetryAfterUpgrade` cases in `TestRowLineageAssignment`, one for each
+  cache; each fails without its cache's part of the fix.
+- **Removed with the fix:** the test,
+  `aRetriedCommitGivesAManifestASecondRowIdRange`, and the workaround,
+  `TestCatalogFaultProperties`'s `preUpgrade` map, which exempted the
+  files a table had at its v3 upgrade from the check that a row id never
+  changes.
 
 ### C3. A replace transaction brings back a snapshot expired since it began
 

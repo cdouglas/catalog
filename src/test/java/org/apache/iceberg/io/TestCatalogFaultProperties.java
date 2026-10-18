@@ -643,11 +643,6 @@ class TestCatalogFaultProperties {
     private final Map<String, String> storage = new HashMap<>();
     // Each data file's first row id when first seen with one, by table UUID: row ids never change.
     private final Map<String, Map<String, Long>> rowIds = new HashMap<>();
-    // The data files each table had when upgraded to v3, by UUID. Iceberg core can give such a
-    // file a second range: a commit that retries after another gave the file's manifest row ids
-    // reuses its copy of the manifest from before (SnapshotProducer caches carried manifests by
-    // path). Their row ids are checked like any other's, but not for change.
-    private final Map<String, Set<String>> preUpgrade = new HashMap<>();
     // Conditional writes whose catalog file has been checked against a checkpoint of it.
     private int checkedWrites = 0;
 
@@ -1219,14 +1214,7 @@ class TestCatalogFaultProperties {
                     .set(TableProperties.FORMAT_VERSION, "3")
                     .commit();
               },
-              (m, actual) -> {
-                TableState state = existing(m, id);
-                if (state.formatVersion < 3) {
-                  preUpgrade.computeIfAbsent(state.uuid, k -> new java.util.HashSet<>())
-                      .addAll(state.files);
-                }
-                state.formatVersion = 3;
-              });
+              (m, actual) -> existing(m, id).formatVersion = 3);
         case REPLACE_TABLE:
           boolean orCreate = cmd.b % 3 == 0;
           DataFile replacing = cmd.b % 2 == 1 ? newFile() : null;
@@ -1838,9 +1826,8 @@ class TestCatalogFaultProperties {
     private void checkRowLineage(
         TableIdentifier id, TableMetadata metadata, Snapshot current, List<DataFile> live) {
       Map<String, Long> seen = rowIds.computeIfAbsent(metadata.uuid(), k -> new HashMap<>());
-      Set<String> upgraded = preUpgrade.getOrDefault(metadata.uuid(), Set.of());
       for (DataFile f : live) {
-        if (f.firstRowId() != null && !upgraded.contains(f.location())) {
+        if (f.firstRowId() != null) {
           Long first = seen.putIfAbsent(f.location(), f.firstRowId());
           check(first == null || first.equals(f.firstRowId()),
               "%s: the first row id of %s changed from %d to %d",

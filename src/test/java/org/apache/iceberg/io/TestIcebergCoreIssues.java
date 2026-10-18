@@ -24,7 +24,6 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.UUID;
-import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
@@ -62,30 +61,6 @@ class TestIcebergCoreIssues {
   private static final TableIdentifier ID = TableIdentifier.of("ns", "t");
   private static final Schema SCHEMA =
       new Schema(Types.NestedField.required(1, "id", Types.IntegerType.get()));
-
-  /**
-   * C2. A commit that retries after another commit gave row ids to a manifest it carries gives
-   * that manifest a second range. SnapshotProducer caches the manifests it carries, with their
-   * metadata, by ManifestFile equality (the path), and the retry reuses its copy from before the
-   * other commit assigned the manifest's first_row_id. A data file's row ids should not change.
-   */
-  @Test
-  void aRetriedCommitGivesAManifestASecondRowIdRange() {
-    InMemoryCatalog catalog = catalog();
-    Table table = catalog.createTable(ID, SCHEMA);
-    table.newFastAppend().appendFile(file("f0")).commit();
-    table.updateProperties().set(TableProperties.FORMAT_VERSION, "3").commit();
-
-    AppendFiles append = catalog.loadTable(ID).newFastAppend().appendFile(file("f1"));
-    append.apply(); // the first attempt, while f0's manifest has no row ids
-    catalog.loadTable(ID).newDelete().deleteFile(path("missing")).commit();
-    assertThat(rowIds(catalog.loadTable(ID))).containsEntry(path("f0"), 0L);
-    append.commit(); // retries on the new base
-
-    assertThat(rowIds(catalog.loadTable(ID)).get(path("f0")))
-        .as(FIXED, "C2")
-        .isEqualTo(2L); // should be 0
-  }
 
   /**
    * C3. A replace transaction commits the table it built at its start, snapshots included, over
