@@ -18,7 +18,6 @@
  */
 package org.apache.iceberg.io;
 
-import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.util.Map;
@@ -33,13 +32,10 @@ import org.apache.iceberg.FileMetadata;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
-import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
-import org.apache.iceberg.Transaction;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
-import org.apache.iceberg.exceptions.NotFoundException;
 import org.apache.iceberg.inmemory.InMemoryCatalog;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.types.Types;
@@ -61,31 +57,6 @@ class TestIcebergCoreIssues {
   private static final TableIdentifier ID = TableIdentifier.of("ns", "t");
   private static final Schema SCHEMA =
       new Schema(Types.NestedField.required(1, "id", Types.IntegerType.get()));
-
-  /**
-   * C3. A replace transaction commits the table it built at its start, snapshots included, over
-   * whatever changed since (BaseTransaction.commitReplaceTransaction), so a snapshot expired in
-   * between comes back, though the expiry deleted its manifest list. A replace means to win over
-   * concurrent changes, but it should not restore what an expiry removed.
-   */
-  @Test
-  void aReplaceBringsBackASnapshotExpiredSinceItStarted() {
-    InMemoryCatalog catalog = catalog();
-    Table table = catalog.createTable(ID, SCHEMA);
-    table.newFastAppend().appendFile(file("a")).commit();
-    long first = table.currentSnapshot().snapshotId();
-    table.newFastAppend().appendFile(file("b")).commit();
-
-    Transaction replace = catalog.buildTable(ID, SCHEMA).replaceTransaction();
-    replace.newFastAppend().appendFile(file("c")).commit();
-    catalog.loadTable(ID).expireSnapshots().expireSnapshotId(first).commit();
-    replace.commitTransaction();
-
-    Snapshot expired = catalog.loadTable(ID).snapshot(first);
-    assertThat(expired).as(FIXED, "C3").isNotNull(); // should be null
-    assertThatThrownBy(() -> expired.allManifests(table.io())) // its manifest list is gone
-        .isInstanceOf(NotFoundException.class);
-  }
 
   /**
    * C6. Cherry-picking a snapshot again once its earlier pick has expired adds its data files a

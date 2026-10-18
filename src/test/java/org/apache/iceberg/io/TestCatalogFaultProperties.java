@@ -1221,6 +1221,10 @@ class TestCatalogFaultProperties {
           // A replace commits the table it built at the start over any change since, keeping
           // that table's properties and format version: record them as the transaction saw them.
           TableState built = new TableState(null, 0);
+          // The snapshot each of its refs other than main names, and the snapshots it committed:
+          // those it built with, less any expired since it began.
+          Map<String, Long> builtRefs = new HashMap<>();
+          Set<Long> committed = new java.util.HashSet<>();
           return new Op(
               String.format("%s(%s%s)", orCreate ? "createOrReplace" : "replace", id,
                   replacing == null ? "" : ", " + replacing.location()),
@@ -1234,10 +1238,11 @@ class TestCatalogFaultProperties {
                 TableMetadata replacement = ((HasTableOperations) replace.table()).operations()
                     .current();
                 built.formatVersion = replacement.formatVersion();
-                // Its refs and snapshots, too: the commit puts back a ref or a staged append
-                // removed since, and drops one added since.
+                // Its refs and snapshots, too: the commit puts back a ref removed since, unless
+                // its snapshot was expired since, and drops one added since.
                 replacement.refs().forEach((name, r) -> {
                   if (!name.equals(org.apache.iceberg.SnapshotRef.MAIN_BRANCH)) {
+                    builtRefs.put(name, r.snapshotId());
                     if (r.isBranch()) {
                       built.branches.put(name, new TreeSet<>());
                     } else {
@@ -1256,7 +1261,13 @@ class TestCatalogFaultProperties {
                     built.props.put(k, v);
                   }
                 });
-                replace.commitTransaction();
+                try {
+                  replace.commitTransaction();
+                } finally {
+                  // what it committed, or would have if it failed
+                  ((org.apache.iceberg.BaseTransaction) replace).currentMetadata().snapshots()
+                      .forEach(snapshot -> committed.add(snapshot.snapshotId()));
+                }
               },
               (m, actual) -> {
                 TableState before = m.get(id);
@@ -1271,10 +1282,17 @@ class TestCatalogFaultProperties {
                 TableState replaced = new TableState(uuid, built.formatVersion);
                 replaced.props.putAll(built.props);
                 // Branches as observed (the commit may have taken one back to where it was);
-                // a tag the model had keeps the files it named, else as observed.
-                built.branches.keySet().forEach(n ->
-                    replaced.branches.put(n, new TreeSet<>(now.branches.getOrDefault(n, Set.of()))));
+                // a tag the model had keeps the files it named, else as observed. A ref goes
+                // with its snapshot.
+                built.branches.keySet().forEach(n -> {
+                  if (committed.contains(builtRefs.get(n))) {
+                    replaced.branches.put(n, new TreeSet<>(now.branches.getOrDefault(n, Set.of())));
+                  }
+                });
                 built.tagSnapshots.forEach((n, snapshotId) -> {
+                  if (!committed.contains(snapshotId)) {
+                    return;
+                  }
                   boolean known = before != null && before.tags.containsKey(n)
                       && snapshotId.equals(before.tagSnapshots.get(n));
                   replaced.tags.put(n, new TreeSet<>(
@@ -1696,16 +1714,7 @@ class TestCatalogFaultProperties {
                   table.currentSnapshot() == null ? ", no snapshot" : ""));
           Map<Long, List<String>> lists =
               manifestLists.computeIfAbsent(metadata.uuid(), k -> new HashMap<>());
-          // Only snapshots a ref reaches: Iceberg core's replace commits the snapshots of the
-          // table it built at its start, so one expired since comes back without its files.
-          Set<Long> reachable = new java.util.HashSet<>();
-          metadata.refs().values().forEach(r -> reachable.addAll(
-              org.apache.iceberg.util.SnapshotUtil.ancestorIds(
-                  metadata.snapshot(r.snapshotId()), metadata::snapshot)));
           for (Snapshot snapshot : table.snapshots()) {
-            if (!reachable.contains(snapshot.snapshotId())) {
-              continue;
-            }
             String list = snapshot.manifestListLocation();
             check(list == null ? snapshot instanceof org.apache.iceberg.InlineSnapshot
                     : io.newInputFile(list).exists(),

@@ -32,7 +32,7 @@ issues (see "Rebasing onto a newer Iceberg"). The Fork column is
 |---|---|---|---|---|
 | C1. A merging delete renumbers rows | fixed | fixed | fixed | fixed by [#16263](https://github.com/apache/iceberg/pull/16263), in 1.11.0 |
 | C2. A retried commit renumbers rows | fixed, `core-fixes` 6c6b6fd | yes | yes | not reported |
-| C3. A replace restores an expired snapshot | yes | yes | yes | [#16942](https://github.com/apache/iceberg/issues/16942), part of [#16232](https://github.com/apache/iceberg/issues/16232); fix in PR [#16943](https://github.com/apache/iceberg/pull/16943), open |
+| C3. A replace restores an expired snapshot | fixed, `core-fixes` 56527cb | yes | yes | [#16942](https://github.com/apache/iceberg/issues/16942), part of [#16232](https://github.com/apache/iceberg/issues/16232); fix in PR [#16943](https://github.com/apache/iceberg/pull/16943), open |
 | C4. A stale handle fails on a newer spec | fixed, `core-fixes` bfc20da | yes | yes | not reported |
 | C5. Rewriting manifests fails with no snapshot | fixed, `core-fixes` f723a52 | yes | yes | not reported |
 | C6. A repeated cherry-pick leaves the table unplannable | yes | yes | yes | not reported |
@@ -112,8 +112,8 @@ second range: its data files' row ids changed.
 A replace transaction commits the table it built at its start, snapshots
 included, over whatever changed since
 (`BaseTransaction.commitReplaceTransaction`). A snapshot expired in
-between therefore comes back, though the expiry deleted its manifest
-list, so reading that snapshot fails.
+between therefore came back, though the expiry deleted its manifest
+list, so reading that snapshot failed.
 
 - **Upstream:**
   - #16232 (open) reports the general problem: a replace silently
@@ -129,12 +129,20 @@ list, so reading that snapshot fails.
 
   Iceberg means a replace to win over concurrent changes, but it should
   not restore what an expiry removed.
-- **Test:** `aReplaceBringsBackASnapshotExpiredSinceItStarted`.
-- **Workarounds:**
-  - `TestCatalogFaultProperties` checks manifest lists only for
-    snapshots a ref reaches (see "Only snapshots a ref reaches").
-  - Its `REPLACE_TABLE` model has the replace win over everything since
-    the transaction began. A1 below covers that.
+- **Fork:** fixed on `core-fixes` by 56527cb, "Core: Don't bring back
+  snapshots expired during a replace transaction". When a retry finds the
+  table changed, the replacement drops the snapshots the table had at the
+  start but no longer has, and with them any ref that named one. A
+  replace still wins over other concurrent changes (A1). The fix is
+  smaller than PR #16943, and also applies where that PR falls back to
+  today's behavior. Its test is
+  `TestReplaceTransaction.testReplaceTransactionWithConcurrentExpiry`.
+- **Removed with the fix:** the test,
+  `aReplaceBringsBackASnapshotExpiredSinceItStarted`, and the workaround,
+  `TestCatalogFaultProperties`'s check of manifest lists only for the
+  snapshots a ref reaches: it checks every snapshot again. Its
+  `REPLACE_TABLE` model now drops a ref of the replacement whose snapshot
+  was expired since the replace began.
 
 ### C4. A stale handle fails on a manifest in a newer partition spec
 
