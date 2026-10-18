@@ -89,16 +89,21 @@ class TestCatalogRaceProperties {
       @ForAll("states") Setup setup,
       @ForAll("ops") Op a,
       @ForAll("ops") Op b,
-      @ForAll("maybeOps") Op c) {
+      @ForAll("maybeOps") Op c,
+      @ForAll boolean gc) {
     List<Op> racers = c.kind == null ? List.of(b) : List.of(b, c);
     List<LocalCatalogMode> racerModes = List.of(modeB, modeC);
+    // With gc, each CAS drops every committed transaction id older than its own (Bug 64).
+    Map<String, String> props =
+        gc ? Map.of(ProtoCatalogFormat.COMMITTED_RETENTION_MS, "0") : Map.of();
+    Statistics.label("gc").collect(gc);
 
     // The race: the k-th racer runs just before A's k-th write to the catalog.
     InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
     setup.apply(LocalCatalogMode.APPEND.catalog(io, WAREHOUSE, "c", Map.of()));
-    FileIOCatalog writerA = modeA.catalog(io, WAREHOUSE, "c", Map.of());
+    FileIOCatalog writerA = modeA.catalog(io, WAREHOUSE, "c", props);
     List<FileIOCatalog> writers = List.of(
-        modeB.catalog(io, WAREHOUSE, "c", Map.of()), modeC.catalog(io, WAREHOUSE, "c", Map.of()));
+        modeB.catalog(io, WAREHOUSE, "c", props), modeC.catalog(io, WAREHOUSE, "c", props));
     String[] results = new String[racers.size()];
     int[] writes = {0};
     boolean[] nested = {false};
@@ -150,26 +155,32 @@ class TestCatalogRaceProperties {
     // A if it failed as it may: a transaction, or a handle whose table was replaced since it was
     // loaded.
     boolean replaced = (a.kind.throughAHandle() && raceA.equals(REPLACED)) || txnFailed;
-    InMemoryAtomicFileIO serialIo = new InMemoryAtomicFileIO();
-    setup.apply(LocalCatalogMode.APPEND.catalog(serialIo, WAREHOUSE, "c", Map.of()));
+    // With gc, a racer's CAS may drop committed ids newer than A's transaction id, putting it at
+    // or below the committed set's horizon: replay then rejects A's record, and A cannot learn
+    // whether an earlier write of it landed (Bug 64). A fails or is unknown, and the race must
+    // end as a serial run with A or without it.
+    boolean lost = gc && (raceA.equals("CommitFailedException")
+        || raceA.equals("CommitStateUnknownException"));
     String[] serial = new String[racers.size()];
-    for (int k = 0; k < before; k++) {
-      serial[k] = racers.get(k).run(
-          racerModes.get(k).catalog(serialIo, WAREHOUSE, "c", Map.of()), name(k));
+    String[] first = serialRun(setup, replaced || lost ? null : a, modeA, racers, racerModes,
+        before, props, serial);
+    String serialA = replaced || lost ? raceA : first[0];
+    String serialState = first[1];
+    if (lost && !raceState.equals(serialState)) {
+      String[] withA = new String[racers.size()];
+      String[] landed = serialRun(setup, a, modeA, racers, racerModes, before, props, withA);
+      if (raceState.equals(landed[1])) {
+        serial = withA;
+        serialState = landed[1];
+      }
     }
-    String serialA =
-        replaced ? raceA : a.run(modeA.catalog(serialIo, WAREHOUSE, "c", Map.of()), "A");
-    for (int k = before; k < racers.size(); k++) {
-      serial[k] = racers.get(k).run(
-          racerModes.get(k).catalog(serialIo, WAREHOUSE, "c", Map.of()), name(k));
-    }
-    String serialState = state(serialIo);
     Statistics.label("A failed as it may").collect(replaced);
+    Statistics.label("A lost its outcome to gc").collect(lost);
 
     Statistics.label("racers before A's writes").collect(before + " of " + racers.size());
     Statistics.label("A").collect(a.kind + " " + (raceA.startsWith("ok") ? "ok" : "fails"));
     StringBuilder context = new StringBuilder(
-        String.format("%nsetup %s%nA (%s): %s", setup, modeA, a));
+        String.format("%nsetup %s%s%nA (%s): %s", setup, gc ? ", gc" : "", modeA, a));
     for (int k = 0; k < racers.size(); k++) {
       context.append(String.format("%n%s (%s): %s, %s", name(k), racerModes.get(k),
           racers.get(k), k < before ? "just before A's write #" + k : "after A"));
@@ -184,6 +195,29 @@ class TestCatalogRaceProperties {
       throw new AssertionError(String.format(
           "the race left%n  %s%nthe serial run%n  %s%s", raceState, serialState, context));
     }
+    CheckpointRoundTrip.assertEveryWrite(io);
+  }
+
+  /**
+   * A serial run on a copy of {@code setup}: the racers that ran before A's writes, then A unless
+   * it is null, then the rest. Fills {@code results} with the racers' results; returns A's result
+   * and the catalog's state.
+   */
+  private static String[] serialRun(Setup setup, Op a, LocalCatalogMode modeA, List<Op> racers,
+      List<LocalCatalogMode> racerModes, int before, Map<String, String> props,
+      String[] results) {
+    InMemoryAtomicFileIO serialIo = new InMemoryAtomicFileIO();
+    setup.apply(LocalCatalogMode.APPEND.catalog(serialIo, WAREHOUSE, "c", Map.of()));
+    for (int k = 0; k < before; k++) {
+      results[k] = racers.get(k).run(
+          racerModes.get(k).catalog(serialIo, WAREHOUSE, "c", props), name(k));
+    }
+    String resultA = a == null ? null : a.run(modeA.catalog(serialIo, WAREHOUSE, "c", props), "A");
+    for (int k = before; k < racers.size(); k++) {
+      results[k] = racers.get(k).run(
+          racerModes.get(k).catalog(serialIo, WAREHOUSE, "c", props), name(k));
+    }
+    return new String[] {resultA, state(serialIo)};
   }
 
   private static String name(int racer) {

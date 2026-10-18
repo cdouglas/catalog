@@ -111,6 +111,9 @@ class TestInlineDifferentialProperties {
           .collect(step.get(0).kind + (pointerRejected == null ? "" : " rejected"));
       compare(pointerIo, inlineIo, trace);
     }
+    // Every catalog file either catalog wrote conforms to catalog.proto and survives a checkpoint.
+    CheckpointRoundTrip.assertEveryWrite(pointerIo);
+    CheckpointRoundTrip.assertEveryWrite(inlineIo);
   }
 
   @Provide

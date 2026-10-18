@@ -175,8 +175,10 @@ class TestCatalogFaultProperties {
       @ForAll("maxUpdateSizes") int maxUpdateSize,
       @ForAll boolean strictVersions,
       @ForAll @IntRange(min = 0, max = 7) int gzipWriters,
+      @ForAll @IntRange(min = 0, max = 7) int gcWriters,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(modes.subList(0, writers), maxUpdateSize, false, strictVersions, gzipWriters)
+    new Run(modes.subList(0, writers), maxUpdateSize, false, strictVersions, gzipWriters,
+        gcWriters)
         .execute(schedule);
   }
 
@@ -187,8 +189,10 @@ class TestCatalogFaultProperties {
       @ForAll("maxUpdateSizes") int maxUpdateSize,
       @ForAll boolean strictVersions,
       @ForAll @IntRange(min = 0, max = 7) int gzipWriters,
+      @ForAll @IntRange(min = 0, max = 7) int gcWriters,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(modes.subList(0, writers), maxUpdateSize, true, strictVersions, gzipWriters)
+    new Run(modes.subList(0, writers), maxUpdateSize, true, strictVersions, gzipWriters,
+        gcWriters)
         .execute(schedule);
   }
 
@@ -663,10 +667,12 @@ class TestCatalogFaultProperties {
     /**
      * Writer {@code i} writes inline metadata with the gzip codec if bit {@code i} of {@code
      * gzipWriters} is set, else the structural one: a delta keeps its base's codec, and a full
-     * update writes the writer's.
+     * update writes the writer's. Writer {@code i} keeps no committed transaction ids older than
+     * its own commit's when it compacts (a retention of 0) if bit {@code i} of {@code gcWriters}
+     * is set, else the default 6 hours, which no run reaches.
      */
     Run(List<LocalCatalogMode> modes, int maxUpdateSize, boolean faults, boolean strictVersions,
-        int gzipWriters) {
+        int gzipWriters, int gcWriters) {
       this.maxUpdateSize = maxUpdateSize;
       this.faults = faults;
       io.failSupersededReads(strictVersions);
@@ -677,6 +683,9 @@ class TestCatalogFaultProperties {
         Map<String, String> writerProperties = new HashMap<>(properties);
         writerProperties.put(
             FileIOCatalog.INLINE_TM_CODEC, (gzipWriters >> i & 1) == 1 ? "gzip" : "structural");
+        if ((gcWriters >> i & 1) == 1) {
+          writerProperties.put(ProtoCatalogFormat.COMMITTED_RETENTION_MS, "0");
+        }
         this.writers[i] =
             new Writer(i, modes.get(i).catalog(io, WAREHOUSE, CATALOG_NAME, writerProperties));
       }
@@ -687,9 +696,12 @@ class TestCatalogFaultProperties {
       create(seed, TABLES.get(0), 3);
       create(seed, TABLES.get(1), 2).newFastAppend().appendFile(newFile()).commit();
       this.model = actual();
-      trace.append(String.format("modes %s, max update size %d%s, gzip writers %s%nseed: %s%n",
+      trace.append(String.format(
+          "modes %s, max update size %d%s, gzip writers %s, gc writers %s%nseed: %s%n",
           modes, maxUpdateSize, strictVersions ? ", strict versions" : "",
-          Integer.toBinaryString(gzipWriters), model));
+          Integer.toBinaryString(gzipWriters), Integer.toBinaryString(gcWriters), model));
+      Statistics.label("gc writers")
+          .collect(Integer.bitCount(gcWriters & ((1 << modes.size()) - 1)));
       Statistics.label("modes").collect(new TreeSet<>(modes).size() == 1 ? "one" : "mixed");
       io.injectFaults(this::onWrite);
       io.injectReadFaults(this::onRead);
