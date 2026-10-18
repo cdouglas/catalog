@@ -50,6 +50,16 @@ public final class UuidV7 {
   }
 
   /**
+   * Mints a UUIDv7 later than {@code afterMs}: at the current time, or at {@code afterMs + 1} if
+   * the clock has not passed it. A writer mints its transaction id after the committed set's GC
+   * horizon, so that a clock behind another writer's does not put its record at or below the
+   * horizon, which replay rejects.
+   */
+  public static UUID newUuidV7After(long afterMs) {
+    return newUuidV7(Math.max(System.currentTimeMillis(), afterMs + 1), RANDOM);
+  }
+
+  /**
    * Test/seeded variant. Mints a UUIDv7 with the supplied timestamp and the
    * supplied {@code Random} as the entropy source. Use a {@code Random}
    * with a fixed seed for deterministic test fixtures.

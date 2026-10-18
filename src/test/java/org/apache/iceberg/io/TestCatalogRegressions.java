@@ -3960,4 +3960,142 @@ public class TestCatalogRegressions {
     }
     return ids;
   }
+
+  // ============================================================
+  // Bug 64: a CAS write drops the committed transaction ids at or below its
+  // watermark (now less fileio.catalog.committed.retention.ms) and records
+  // the largest as the set's horizon, below which an id is unknown. Replay
+  // asked the set about every record, so a record whose id was at or below
+  // the horizon threw DedupHorizonExceededException on every read: the
+  // catalog could not be read, nor compacted, by anyone. The record of a
+  // writer whose clock was behind by more than the retention landed so; and
+  // with retention 0, so did a writer's own CAS after a conflict, which
+  // dropped the newer id of the commit it rebased on. Commits let the
+  // exception escape too. Replay now rejects a record the set cannot vouch
+  // for; a CAS write keeps the ids at or after its own; writers mint ids
+  // above the horizon; and a commit whose id falls below it fails, or is
+  // unknown if a write of it may have landed. Found by a review of the
+  // committed-set docs (GC.md said the throw was unreachable).
+  // ============================================================
+
+  @Nested
+  class CommittedSetHorizon {
+    private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+    private final String location = "mem:///wh/catalog-gc";
+    /** CAS only, and every CAS drops every id older than now. */
+    private final ProtoCatalogFormat format = new ProtoCatalogFormat(0, Long.MAX_VALUE, 0L);
+
+    private ProtoCatalogFile read() {
+      return format.read(io, io.newInputFile(location));
+    }
+
+    private ProtoCatalogFile commit(ProtoCatalogFile base, java.util.function.Consumer<ProtoCatalogFormat.Mut> change) {
+      ProtoCatalogFormat.Mut mut = (ProtoCatalogFormat.Mut) format.from(base);
+      change.accept(mut);
+      return (ProtoCatalogFile) mut.commit(io);
+    }
+
+    private ProtoCatalogFile catalogWithTwoNamespaces() throws InterruptedException {
+      format.empty(io.newInputFile(location)).commit(io);
+      commit(read(), mut -> mut.createNamespace(Namespace.of("x")).createNamespace(Namespace.of("y")));
+      Thread.sleep(2);
+      return read();
+    }
+
+    @Test
+    void aCasAfterAConflictKeepsItsOwnRecord() throws InterruptedException {
+      ProtoCatalogFile base = catalogWithTwoNamespaces();
+      boolean[] raced = {false};
+      io.injectFaults((loc, strategy) -> {
+        if (!raced[0]) {
+          raced[0] = true; // just before the first writer's CAS, a second commits
+          try {
+            Thread.sleep(2);
+            commit(base, mut -> mut.updateProperties(Namespace.of("y"), Map.of("k", "second")));
+            Thread.sleep(2);
+          } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+          }
+        }
+        return Fault.NONE;
+      });
+
+      // Its CAS conflicts, rebases, and drops the second writer's newer id.
+      commit(base, mut -> mut.updateProperties(Namespace.of("x"), Map.of("k", "first")));
+
+      ProtoCatalogFile after = read();
+      assertThat(after.namespaceProperties(Namespace.of("x"))).containsEntry("k", "first");
+      assertThat(after.namespaceProperties(Namespace.of("y"))).containsEntry("k", "second");
+    }
+
+    @Test
+    void aRecordBelowTheHorizonIsRejectedNotUnreadable() throws Exception {
+      ProtoCatalogFile base = catalogWithTwoNamespaces();
+      commit(base, mut -> mut.updateProperties(Namespace.of("x"), Map.of("k", "v")));
+      ProtoCatalogFile compacted = read();
+      long horizon = compacted.highestDroppedTimestampMs();
+      assertThat(horizon).isPositive();
+
+      // A record minted at the horizon, as by a writer whose clock is behind, or one that
+      // stalled past the retention between minting it and appending it.
+      ProtoCodec.Transaction late =
+          new ProtoCodec.Transaction(
+              UuidV7.newUuidV7(horizon, new java.util.Random(64)),
+              List.of(new ProtoCodec.SetNamespacePropertyAction(
+                  compacted.namespaceId(Namespace.of("y")),
+                  compacted.namespaceVersion(compacted.namespaceId(Namespace.of("y"))),
+                  "late", "v")));
+      byte[] record = ProtoCodec.encodeTransaction(late);
+      ByteArrayOutputStream file = new ByteArrayOutputStream();
+      try (InputStream in = io.newInputFile(location).newStream()) {
+        file.write(in.readAllBytes());
+      }
+      int length = record.length;
+      while ((length & ~0x7F) != 0) {
+        file.write((length & 0x7F) | 0x80);
+        length >>>= 7;
+      }
+      file.write(length);
+      file.write(record);
+      io.seed(location, file.toByteArray());
+
+      ProtoCatalogFile after = read();
+      assertThat(after.namespaceProperties(Namespace.of("y"))).doesNotContainKey("late");
+      // ...and the catalog still takes commits.
+      commit(after, mut -> mut.updateProperties(Namespace.of("y"), Map.of("next", "v")));
+      assertThat(read().namespaceProperties(Namespace.of("y"))).containsEntry("next", "v");
+    }
+
+    @Test
+    void aWriterBehindTheHorizonMintsAboveIt() throws Exception {
+      ProtoCatalogFile base = catalogWithTwoNamespaces();
+      // A checkpoint whose horizon is an hour ahead of this writer's clock, as a compaction by a
+      // writer whose clock is ahead would leave.
+      long ahead = System.currentTimeMillis() + 3_600_000L;
+      ProtoCatalogFile.Builder builder = ProtoCatalogFormat.replay(
+          io.newInputFile(location), io.newInputFile(location).newStream(),
+          (int) io.newInputFile(location).getLength());
+      builder.addCommittedTransaction(UuidV7.newUuidV7(ahead, new java.util.Random(1)));
+      ProtoCatalogFile withFuture = builder.build();
+      ProtoCatalogFormat.ProtoIdManager ids = new ProtoCatalogFormat.ProtoIdManager();
+      ids.setGlobals(withFuture.nextNamespaceId(), withFuture.nextTableId());
+      byte[] checkpoint = ProtoCodec.encodeCheckpoint(
+          withFuture, new ProtoCatalogFormat.Mut(withFuture), ids, ahead);
+      ByteArrayOutputStream file = new ByteArrayOutputStream();
+      file.write(ProtoCatalogFormat.MAGIC);
+      file.write(new byte[] {0, 0, 0, (byte) ProtoCatalogFormat.FORMAT_VERSION});
+      int length = checkpoint.length;
+      while ((length & ~0x7F) != 0) {
+        file.write((length & 0x7F) | 0x80);
+        length >>>= 7;
+      }
+      file.write(length);
+      file.write(checkpoint);
+      io.seed(location, file.toByteArray());
+      assertThat(read().highestDroppedTimestampMs()).isEqualTo(ahead);
+
+      commit(read(), mut -> mut.updateProperties(Namespace.of("x"), Map.of("k", "v")));
+      assertThat(read().namespaceProperties(Namespace.of("x"))).containsEntry("k", "v");
+    }
+  }
 }

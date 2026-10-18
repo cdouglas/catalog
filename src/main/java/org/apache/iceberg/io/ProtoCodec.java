@@ -2104,7 +2104,8 @@ public class ProtoCodec {
     public static Transaction from(
         CatalogFile.Mut<ProtoCatalogFile, ?> mut,
         ProtoCatalogFormat.ProtoIdManager idManager) {
-      UUID txnId = UuidV7.newUuidV7();
+      // After the horizon of the catalog this writer read, where replay rejects a record (Bug 64).
+      UUID txnId = UuidV7.newUuidV7After(mut.original.highestDroppedTimestampMs());
       List<Action> actions = new ArrayList<>();
 
       // Build actions from mutations accumulated in mut

@@ -889,11 +889,10 @@ public class ProtoCatalogFile extends CatalogFile {
      * throws {@link DedupHorizonExceededException} when the UUID is missing
      * and at or below the horizon.
      *
-     * <p>Replay-path note: the just-appended txn UUID is minted at append
-     * time (minutes ago at most) while the watermark is hours back, so the
-     * throw branch is unreachable in normal operation. If a malformed /
-     * skewed writer manages to append a UUID below the watermark, the
-     * exception surfaces the bug rather than silently mis-deduping.
+     * <p>A writer asks this of its own transaction. Replay asks {@link #mayApply} instead: a
+     * record at or below the horizon is reachable (a writer whose clock is behind by more than
+     * the retention, one that stalled that long, or any race with a retention of 0), and replay
+     * must reject it rather than fail the read.
      */
     public boolean containsTransaction(UUID txnId) {
       if (addedCommittedTransactions.contains(txnId)) {
@@ -909,6 +908,22 @@ public class ProtoCatalogFile extends CatalogFile {
         }
       }
       return false;
+    }
+
+    /**
+     * Whether replay may apply the record of {@code txnId}: the committed set neither holds the
+     * id (the record is a retry of one already applied) nor dropped ids at or after its time. A
+     * record at or below the horizon may be a retry of a commit whose id aged out, so replay
+     * rejects it; asking {@link #containsTransaction} instead threw on every read of the catalog
+     * (Bug 64).
+     */
+    public boolean mayApply(UUID txnId) {
+      if (addedCommittedTransactions.contains(txnId)
+          || ProtoCodec.committedSetContains(originalCommittedBytes, txnId)) {
+        return false;
+      }
+      long horizon = ProtoCodec.committedSetHorizon(originalCommittedBytes);
+      return !UuidV7.isV7(txnId) || horizon == 0L || UuidV7.timestampMs(txnId) > horizon;
     }
 
     /**

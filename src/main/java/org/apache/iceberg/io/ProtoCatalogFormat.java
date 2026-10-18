@@ -239,8 +239,9 @@ public class ProtoCatalogFormat
         appendCount++;
 
         ProtoCodec.Transaction txn = ProtoCodec.decodeTransaction(txnBytes);
-        if (builder.containsTransaction(txn.id())) {
-          // Already applied (duplicate from retry)
+        if (!builder.mayApply(txn.id())) {
+          // Already applied (a retry), or its id is at or below the committed set's GC horizon,
+          // where the set cannot tell a retry of an aged-out commit from a new one.
           continue;
         }
         if (txn.verify(builder)) {
@@ -602,13 +603,13 @@ public class ProtoCatalogFormat
       // Case 0: Initial commit (file doesn't exist)
       if (!current.exists()) {
         try {
-          return tryCAS(original, current, txnBytes, fileIO);
+          return tryCAS(original, current, txn, txnBytes, fileIO);
         } catch (AmbiguousWrite | SupportsAtomicOperations.CASException e) {
           // The creation may have landed: its reply was lost, reading it back failed, or it
           // failed its precondition, as a transport retry of a creation that landed does.
           Throwable failure = e instanceof AmbiguousWrite ? e.getCause() : e;
           ProtoCatalogFile.Builder fresh = resolve(failure, fileIO.newInputFile(current.location()));
-          if (fresh != null && fresh.containsTransaction(txn.id())) {
+          if (fresh != null && landed(fresh::containsTransaction, txn, failure)) {
             return fresh.build(); // the creation landed
           }
           if (fresh != null && !(e instanceof AmbiguousWrite)) {
@@ -657,7 +658,7 @@ public class ProtoCatalogFormat
               // replaced (a GCS read by generation, an S3 or ADLS read with If-Match).
               current = fileIO.newInputFile(current.location());
               ProtoCatalogFile.Builder fresh = replay(current);
-              if (fresh.containsTransaction(txn.id())) {
+              if (landed(fresh::containsTransaction, txn, earlier(ambiguous, unresolved))) {
                 return fresh.build(); // an append reported as a lost race landed
               }
               unresolved = null;
@@ -665,7 +666,10 @@ public class ProtoCatalogFormat
               baseIsCurrent = true;
             }
             try {
-              return validateCommit(tryCAS(baseCatalog, current, txnBytes, fileIO), txn);
+              return validateCommit(
+                  tryCAS(baseCatalog, current, txn, txnBytes, fileIO),
+                  txn,
+                  earlier(ambiguous, unresolved));
             } catch (SupportsAtomicOperations.CASException e) {
               unresolved = e;
             }
@@ -678,7 +682,7 @@ public class ProtoCatalogFormat
             // refreshes and re-applies.
             current = fileIO.newInputFile(current.location());
             ProtoCatalogFile.Builder fresh = replay(current);
-            if (fresh.containsTransaction(txn.id())) {
+            if (landed(fresh::containsTransaction, txn, earlier(ambiguous, unresolved))) {
               return fresh.build(); // an earlier attempt landed
             }
             unresolved = null;
@@ -691,7 +695,8 @@ public class ProtoCatalogFormat
             }
           } else {
             try {
-              return validateCommit(tryAppend(current, txnBytes, fileIO), txn);
+              return validateCommit(
+                  tryAppend(current, txnBytes, fileIO), txn, earlier(ambiguous, unresolved));
             } catch (SupportsAtomicOperations.AppendException e) {
               unresolved = e;
             }
@@ -707,7 +712,7 @@ public class ProtoCatalogFormat
               // above, since current's version may be replaced by now.
               current = fileIO.newInputFile(current.location());
               ProtoCatalogFile.Builder fresh = replay(current);
-              if (fresh.containsTransaction(txn.id())) {
+              if (landed(fresh::containsTransaction, txn, earlier(ambiguous, unresolved))) {
                 return fresh.build(); // an append reported as a lost race landed
               }
               unresolved = null;
@@ -734,7 +739,7 @@ public class ProtoCatalogFormat
           if (fresh == null) {
             throw new CommitStateUnknownException(e.getCause());
           }
-          if (fresh.containsTransaction(txn.id())) {
+          if (landed(fresh::containsTransaction, txn, e.getCause())) {
             return fresh.build(); // the write landed
           }
           unresolved = null;
@@ -765,7 +770,7 @@ public class ProtoCatalogFormat
         if (fresh == null) {
           throw new CommitStateUnknownException(unresolved);
         }
-        if (fresh.containsTransaction(txn.id())) {
+        if (landed(fresh::containsTransaction, txn, unresolved)) {
           return fresh.build();
         }
       }
@@ -785,8 +790,36 @@ public class ProtoCatalogFormat
       }
     }
 
-    private ProtoCatalogFile validateCommit(ProtoCatalogFile result, ProtoCodec.Transaction txn) {
-      if (!result.containsTransaction(txn.id())) {
+    /**
+     * Whether a read holds {@code txn}, by {@code contains}. If its id is at or below the
+     * committed set's GC horizon, the set cannot say, and replay rejects its record from now on
+     * (Bug 64): the commit failed, unless {@code earlier}, a write of it that may have landed,
+     * did, before its id aged out.
+     */
+    private boolean landed(
+        java.util.function.Predicate<UUID> contains, ProtoCodec.Transaction txn, Throwable earlier) {
+      try {
+        return contains.test(txn.id());
+      } catch (DedupHorizonExceededException e) {
+        if (earlier != null) {
+          earlier.addSuppressed(e);
+          throw new CommitStateUnknownException(earlier);
+        }
+        throw new CommitFailedException(
+            e, "Cannot commit: transaction %s is at or below the catalog's committed-set horizon",
+            txn.id());
+      }
+    }
+
+    /** The last write of this commit that may have landed, or null. */
+    private static Throwable earlier(
+        AmbiguousWrite ambiguous, SupportsAtomicOperations.AtomicOperationException unresolved) {
+      return ambiguous != null ? ambiguous.getCause() : unresolved;
+    }
+
+    private ProtoCatalogFile validateCommit(
+        ProtoCatalogFile result, ProtoCodec.Transaction txn, Throwable earlier) {
+      if (!landed(result::containsTransaction, txn, earlier)) {
         // Our record landed but at least one action's verify rejected it
         // (e.g., a concurrent writer bumped the table version).
         throw conflict(result, "Cannot commit: concurrent transaction invalidated this update");
@@ -851,12 +884,13 @@ public class ProtoCatalogFormat
     private ProtoCatalogFile tryCAS(
         ProtoCatalogFile base,
         InputFile current,
+        ProtoCodec.Transaction txn,
         byte[] txnBytes,
         SupportsAtomicOperations fileIO) {
       // Build the wire bytes once; retries reuse the same payload.
       final byte[] fullFile;
       try {
-        fullFile = buildFullFile(base, txnBytes);
+        fullFile = buildFullFile(base, txn, txnBytes);
       } catch (IOException e) {
         throw new CommitFailedException(e, "CAS commit failed: %s", e.getMessage());
       }
@@ -970,7 +1004,8 @@ public class ProtoCatalogFormat
       }
     }
 
-    private byte[] buildFullFile(ProtoCatalogFile base, byte[] txnBytes) throws IOException {
+    private byte[] buildFullFile(ProtoCatalogFile base, ProtoCodec.Transaction txn, byte[] txnBytes)
+        throws IOException {
       ByteArrayOutputStream out = new ByteArrayOutputStream();
 
       // Header
@@ -981,9 +1016,13 @@ public class ProtoCatalogFormat
       // is the only place the committed-set is rewritten, so this is also the GC
       // site: any inherited UUIDv7 with timestamp_ms <= watermark is dropped.
       // watermark = now - committedRetentionMs, clamped to 0 (never negative);
-      // Long.MAX_VALUE retention disables GC.
+      // Long.MAX_VALUE retention disables GC. It stays below this transaction's
+      // own time: the horizon must not reach the record that follows, or replay
+      // rejects it (Bug 64). A short retention would otherwise drop the id of a
+      // commit this one rebased on, minted after it.
       long now = System.currentTimeMillis();
       long watermark = committedRetentionMs >= now ? 0L : now - committedRetentionMs;
+      watermark = Math.max(0L, Math.min(watermark, UuidV7.timestampMs(txn.id()) - 1));
       ProtoIdManager baseIds = new ProtoIdManager();
       baseIds.setGlobals(base.nextNamespaceId(), base.nextTableId());
       byte[] checkpointBytes = ProtoCodec.encodeCheckpoint(base, this, baseIds, watermark);
