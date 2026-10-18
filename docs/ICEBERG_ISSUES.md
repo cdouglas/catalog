@@ -36,7 +36,7 @@ issues (see "Rebasing onto a newer Iceberg"). The Fork column is
 | C4. A stale handle fails on a newer spec | fixed, `core-fixes` bfc20da | yes | yes | not reported |
 | C5. Rewriting manifests fails with no snapshot | fixed, `core-fixes` f723a52 | yes | yes | not reported |
 | C6. A repeated cherry-pick leaves the table unplannable | yes | yes | yes | not reported |
-| C7. The all_* tables miss row ids | yes | yes | yes | not reported |
+| C7. The all_* tables miss row ids | fixed, `core-fixes` 2779515 | yes | yes | not reported |
 
 "Not reported" means a search of apache/iceberg's issues and pull
 requests found nothing for the issue.
@@ -197,17 +197,22 @@ number (7)".
 
 ### C7. The all_* metadata tables miss the row ids of an upgraded file
 
-The `all_*` metadata tables read every snapshot's manifest list and keep
+The `all_*` metadata tables read every snapshot's manifest list and kept
 one copy of each manifest, whichever they read first:
-`BaseAllMetadataTableScan.reachableManifests` fills a `HashSet` from a
+`BaseAllMetadataTableScan.reachableManifests` filled a `HashSet` from a
 `ParallelIterable`. A manifest carried across a v3 upgrade has no
 `first_row_id` in a list written before the upgrade. So `all_data_files`
-can report no row id for a data file that has one, and which copy it
-reports can vary between runs.
+could report no row id for a data file that has one, and which copy it
+reported could vary between runs.
 
-- **Should:** report the file's row ids.
-- **Test:** `allDataFilesMissesTheRowIdsOfAFileCarriedAcrossAnUpgrade`.
-- **Workaround:** `TestInlineDifferentialProperties.metadataTable` masks
+- **Fork:** fixed on `core-fixes` by 2779515, "Core: Keep the row ids of
+  upgraded manifests in all_* metadata tables". The scan keeps, for each
+  manifest path, the copy with an assigned `first_row_id`. Its test is
+  `TestRowLineageAssignment.testAllDataFilesAfterUpgrade`, which plans on
+  one thread so the lists are read oldest first.
+- **Removed with the fix:** the test,
+  `allDataFilesMissesTheRowIdsOfAFileCarriedAcrossAnUpgrade`, and the
+  workaround, `TestInlineDifferentialProperties.metadataTable`'s mask of
   `first_row_id` in the `all_*` tables.
 
 ## Accepted Iceberg Behavior

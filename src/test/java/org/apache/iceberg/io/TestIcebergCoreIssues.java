@@ -21,7 +21,6 @@ package org.apache.iceberg.io;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.UUID;
@@ -33,12 +32,9 @@ import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.FileMetadata;
 import org.apache.iceberg.FileScanTask;
-import org.apache.iceberg.MetadataTableType;
-import org.apache.iceberg.MetadataTableUtils;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Snapshot;
-import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.Transaction;
@@ -147,26 +143,6 @@ class TestIcebergCoreIssues {
         .hasMessageContaining("DV data sequence number");
   }
 
-  /**
-   * C7. The all_* metadata tables read every snapshot's manifest list and keep one copy of each
-   * manifest, whichever they read first (BaseAllMetadataTableScan.reachableManifests fills a
-   * HashSet from a ParallelIterable). A manifest carried across a v3 upgrade has no first_row_id
-   * in a list written before the upgrade, so all_data_files can report none for a data file that
-   * has row ids, and which copy it reports may vary. It should report the file's row ids.
-   */
-  @Test
-  void allDataFilesMissesTheRowIdsOfAFileCarriedAcrossAnUpgrade() {
-    Table table = catalog().createTable(ID, SCHEMA);
-    table.newFastAppend().appendFile(file("f0")).commit();
-    table.updateProperties().set(TableProperties.FORMAT_VERSION, "3").commit();
-    table.newFastAppend().appendFile(file("f1")).commit();
-    assertThat(firstRowIds(table, MetadataTableType.FILES)).containsEntry(path("f0"), 1L);
-
-    assertThat(firstRowIds(table, MetadataTableType.ALL_DATA_FILES))
-        .as(FIXED, "C7")
-        .containsEntry(path("f0"), null); // should be 1
-  }
-
   private static InMemoryCatalog catalog() {
     InMemoryCatalog catalog = new InMemoryCatalog();
     catalog.initialize(
@@ -206,25 +182,6 @@ class TestIcebergCoreIssues {
     Map<String, Long> ids = new TreeMap<>();
     try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
       tasks.forEach(task -> ids.put(task.file().location(), task.file().firstRowId()));
-    } catch (java.io.IOException e) {
-      throw new java.io.UncheckedIOException(e);
-    }
-    return ids;
-  }
-
-  /** The first_row_id column of a files metadata table, by file_path. */
-  private static Map<String, Long> firstRowIds(Table table, MetadataTableType type) {
-    Table files = MetadataTableUtils.createMetadataTableInstance(table, type);
-    List<Types.NestedField> fields = files.schema().columns();
-    int path = fields.indexOf(files.schema().findField("file_path"));
-    int rowId = fields.indexOf(files.schema().findField("first_row_id"));
-    Map<String, Long> ids = new TreeMap<>();
-    try (CloseableIterable<FileScanTask> tasks = files.newScan().planFiles()) {
-      for (FileScanTask task : tasks) {
-        try (CloseableIterable<StructLike> rows = task.asDataTask().rows()) {
-          rows.forEach(row -> ids.put(row.get(path, String.class), row.get(rowId, Long.class)));
-        }
-      }
     } catch (java.io.IOException e) {
       throw new java.io.UncheckedIOException(e);
     }

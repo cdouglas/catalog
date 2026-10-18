@@ -249,10 +249,7 @@ class TestInlineDifferentialProperties {
 
   /**
    * The rows of {@code table}'s metadata table {@code type}, sorted, with snapshot ids as
-   * positions and what differs between the two runs (times, file names, sizes) left out. So is
-   * first_row_id in the all_* tables: Iceberg core keeps one copy of each manifest reachable
-   * from several snapshots, whichever its parallel planning reaches first, and the copy in a
-   * list written before a v3 upgrade has no row ids (each snapshot's list is compared above).
+   * positions and what differs between the two runs (times, file names, sizes) left out.
    */
   private static String metadataTable(
       Table table, org.apache.iceberg.MetadataTableType type, Map<Long, Integer> position) {
@@ -263,9 +260,7 @@ class TestInlineDifferentialProperties {
       for (FileScanTask task : tasks) {
         try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.StructLike> data =
             task.asDataTask().rows()) {
-          boolean all = type.name().startsWith("ALL_");
-          data.forEach(
-              row -> rows.add(describe(metadata.schema().asStruct(), row, position, all)));
+          data.forEach(row -> rows.add(describe(metadata.schema().asStruct(), row, position)));
         }
       }
     } catch (IOException e) {
@@ -279,7 +274,7 @@ class TestInlineDifferentialProperties {
 
   private static String describe(
       org.apache.iceberg.types.Types.StructType type, org.apache.iceberg.StructLike row,
-      Map<Long, Integer> position, boolean all) {
+      Map<Long, Integer> position) {
     List<String> fields = new ArrayList<>();
     for (int i = 0; i < type.fields().size(); i++) {
       org.apache.iceberg.types.Types.NestedField field = type.fields().get(i);
@@ -292,18 +287,17 @@ class TestInlineDifferentialProperties {
           || name.contains("made_current_at") || name.contains("path") || name.equals("file")
           || name.contains("length") || name.equals("manifest_list")
           || name.contains("last_updated") || name.equals("readable_metrics")
-          || name.equals("summary") || name.equals("file_size_in_bytes")
-          || (all && name.equals("first_row_id"))) {
+          || name.equals("summary") || name.equals("file_size_in_bytes")) {
         shown = "*";
       } else if (value instanceof org.apache.iceberg.StructLike && field.type().isStructType()) {
         shown = "{" + describe(field.type().asStructType(), (org.apache.iceberg.StructLike) value,
-            position, all) + "}";
+            position) + "}";
       } else if (value instanceof List && field.type().isListType()
           && field.type().asListType().elementType().isStructType()) {
         List<String> elements = new ArrayList<>();
         for (Object element : (List<?>) value) {
           elements.add("{" + describe(field.type().asListType().elementType().asStructType(),
-              (org.apache.iceberg.StructLike) element, position, all) + "}");
+              (org.apache.iceberg.StructLike) element, position) + "}");
         }
         shown = elements.toString();
       } else if (value instanceof ByteBuffer) {
