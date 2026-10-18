@@ -2,8 +2,11 @@
 
 Bugs in Apache Iceberg that this project's fuzzers found. None is in
 `FileIOCatalog`: each one reproduces on Iceberg's own `InMemoryCatalog`.
-This page records them for a rebase onto a newer Iceberg, and for reports
-or fixes upstream.
+This page records them for a rebase onto a newer Iceberg. Each issue also
+has a document of its own in [iceberg-issues/](iceberg-issues/), for
+reports or pull requests upstream. It covers the reproduction, the cause
+with links to the 1.12.0 source, the fix, its tests, and what to settle
+before a PR.
 
 Upstream fixed C1. The fork fixes C2 to C7 on branch `core-fixes`, each
 in an upstream-style commit with its tests, so the project's tests no
@@ -57,6 +60,8 @@ workarounds here are gone.
 
 ### C1. A delete that merges manifests gives existing rows new ids
 
+Details: [iceberg-issues/C1.md](iceberg-issues/C1.md).
+
 On a v3 table, a delete whose commit merges manifests gives an existing
 data file a new `first_row_id`. In the test, file f6 went from row id 1
 to 6. The spec requires the inherited `first_row_id` to be written into
@@ -72,6 +77,8 @@ merge, f6 keeps its id.
   and its row-lineage check stays.
 
 ### C2. A retried commit gives a manifest a second row-id range
+
+Details: [iceberg-issues/C2.md](iceberg-issues/C2.md).
 
 Suppose a commit had to retry because another commit landed first, and
 that other commit gave row ids to a manifest the retrying commit carries,
@@ -101,6 +108,8 @@ second range: its data files' row ids changed.
   changes.
 
 ### C3. A replace transaction brings back a snapshot expired since it began
+
+Details: [iceberg-issues/C3.md](iceberg-issues/C3.md).
 
 A replace transaction commits the table it built at its start, snapshots
 included, over whatever changed since
@@ -139,6 +148,8 @@ list, so reading that snapshot failed.
 
 ### C4. A stale handle fails on a manifest in a newer partition spec
 
+Details: [iceberg-issues/C4.md](iceberg-issues/C4.md).
+
 A handle loaded before another writer added a partition spec couldn't run
 some commits once the table had a manifest in the new spec. These failed
 with a `NullPointerException`:
@@ -166,6 +177,8 @@ with a `NullPointerException`:
 
 ### C5. Rewriting manifests fails on a table without a current snapshot
 
+Details: [iceberg-issues/C5.md](iceberg-issues/C5.md).
+
 `rewriteManifests` threw a `NullPointerException` when the table had no
 current snapshot, either because it never had one or because a replace
 left it with none after the handle was loaded.
@@ -189,6 +202,8 @@ metadata it commits on.
 
 ### C6. A repeated cherry-pick leaves a table it can't plan
 
+Details: [iceberg-issues/C6.md](iceberg-issues/C6.md).
+
 Cherry-picking a snapshot a second time, once its earlier pick had been
 expired, added the snapshot's data files again at a new sequence number.
 Once one of those files had a deletion vector, planning failed: "DV data
@@ -210,6 +225,8 @@ number (7)".
   failure as the string "fails: ...".
 
 ### C7. The all_* metadata tables miss the row ids of an upgraded file
+
+Details: [iceberg-issues/C7.md](iceberg-issues/C7.md).
 
 The `all_*` metadata tables read every snapshot's manifest list and kept
 one copy of each manifest, whichever they read first:
