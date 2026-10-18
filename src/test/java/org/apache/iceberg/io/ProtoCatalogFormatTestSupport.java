@@ -85,8 +85,7 @@ public final class ProtoCatalogFormatTestSupport {
   }
 
   // -----------------------------------------------------------------------
-  // Private helpers (mirrors FormatExplorerFixtures, kept local to avoid
-  // coupling the test-support class to that fixture generator).
+  // Private helpers
   // -----------------------------------------------------------------------
 
   private static void writeBigEndianInt(ByteArrayOutputStream out, int v) {

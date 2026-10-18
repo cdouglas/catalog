@@ -18,7 +18,12 @@
  */
 package org.apache.iceberg.io;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -26,6 +31,7 @@ import java.util.Objects;
 import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.CRC32;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.catalog.Namespace;
@@ -44,6 +50,9 @@ import org.apache.iceberg.catalog.TableIdentifier;
  */
 public final class CheckpointRoundTrip {
   private static final int MAX_REPORTED = 4;
+  /** With {@code -Dexplorer.dump=<dir>}, each checked file is written there for check.mjs. */
+  private static final String DUMP = System.getProperty("explorer.dump");
+  private static final AtomicInteger DUMPED = new AtomicInteger();
 
   private CheckpointRoundTrip() {}
 
@@ -62,9 +71,31 @@ public final class CheckpointRoundTrip {
     }
   }
 
-  /** How the state in {@code catalogFile} and a checkpoint of it differ, or null if they do not. */
+  /**
+   * How the state in {@code catalogFile} and a checkpoint of it differ, or null if they do not.
+   * Also checks that the file conforms to catalog.proto ({@link CatalogProto#violation}), so
+   * everything a suite writes keeps the schema of record in step with the codecs.
+   */
   public static String difference(byte[] catalogFile) {
+    dump(catalogFile);
+    String violation = CatalogProto.violation(catalogFile);
+    if (violation != null) {
+      return "the file does not conform to catalog.proto: " + violation;
+    }
     return difference(ProtoCatalogFormatTestSupport.decodeFullFile(catalogFile));
+  }
+
+  private static void dump(byte[] catalogFile) {
+    if (DUMP == null) {
+      return;
+    }
+    try {
+      Path dir = Paths.get(DUMP);
+      Files.createDirectories(dir);
+      Files.write(dir.resolve(String.format("%07d.lcat", DUMPED.incrementAndGet())), catalogFile);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
   }
 
   /** How {@code state} and a checkpoint of it differ, or null if they do not. */

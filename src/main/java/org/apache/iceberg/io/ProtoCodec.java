@@ -2565,7 +2565,7 @@ public class ProtoCodec {
 
     @Override
     public boolean verify(ProtoCatalogFile.Builder builder) {
-      // Read action fails if table version has changed (read-your-writes validation)
+      // Fails if the table changed since the transaction read it (a serializable read)
       int currentVersion = builder.tableVersion(id);
       return currentVersion == version;
     }

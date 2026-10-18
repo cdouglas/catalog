@@ -18,243 +18,147 @@
  */
 package org.apache.iceberg.io;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.UUID;
+import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import org.apache.iceberg.GenericPartitionFieldSummary;
+import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableMetadataParser;
+import org.apache.iceberg.catalog.Namespace;
+import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.types.Types;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 
 /**
- * Generates byte-accurate wire-format fixtures for the docs/format-explorer
- * visualizer. Each scenario builds a real catalog file (header + checkpoint +
- * appended transactions) by calling {@link ProtoCodec} and
- * {@link InlineDeltaCodec} directly, then emits a JSON descriptor consumed by
- * the JS decoder in {@code docs/format-explorer/index.html}.
+ * Generates the fixtures of the format explorer, {@code docs/format-explorer/index.html}: the
+ * schema it decodes with (catalog.proto, parsed by {@link CatalogProto}) and a set of scenarios,
+ * each a catalog file with notes.
  *
- * <p>The generator also parses {@code catalog.proto} into a schema descriptor
- * so the visualizer can render every field's name, type, and leading comment
- * without hand-transcribing the schema. A pre-flight check asserts that field
- * numbers in the {@code .proto} agree with the {@code private static final
- * int} constants in {@code ProtoCodec.java} -- so wire/schema drift surfaces
- * as a build failure here rather than as silently wrong tooltips.
+ * <p>Each scenario's file is built the way a writer builds one. A record holds the actions {@link
+ * ProtoCatalogFormat.Mut#buildActions} makes for a change to the snapshot its writer read (so
+ * creates carry late-bound ids); a CAS write is a checkpoint of the base and the commit's record;
+ * an inline delta is the one {@link InlineDeltaCodec#computeDelta} sends for its commit. Only the
+ * transaction ids, table UUIDs and times are pinned, so the bytes are the same on every run. Each
+ * file must conform to catalog.proto and replay to the outcome its notes describe.
  *
- * <p>This class is excluded from the default test run (system-property gated).
- * To regenerate fixtures:
+ * <p>{@code TestFormatExplorer} fails when the fixtures embedded in index.html differ from these.
+ * To regenerate them in place:
+ *
  * <pre>
  *   mvn test -Dtest=FormatExplorerFixtures -Dexplorer.regenerate=true
- *   docs/format-explorer/splice-fixtures.py
  * </pre>
  *
- * <p>Output: {@code target/format-explorer/fixtures.json}.
+ * <p>which also writes {@code target/format-explorer/fixtures.json}.
  */
 public class FormatExplorerFixtures {
 
+  static final Path HTML = Paths.get("docs/format-explorer/index.html");
+  private static final Path OUTPUT = Paths.get("target/format-explorer/fixtures.json");
+  private static final Pattern FIXTURES =
+      Pattern.compile("(<script id=\"fixtures-data\"[^>]*>)(.*?)(</script>)", Pattern.DOTALL);
+
   private static final InputFile LOCATION = new MemInputFile("test://format-explorer");
-  private static final UUID FIXED_CATALOG_UUID =
-      UUID.fromString("01900000-0000-7000-8000-000000000001");
-  private static final Path PROJECT_ROOT = Paths.get(".").toAbsolutePath().normalize();
-  private static final Path PROTO_FILE =
-      PROJECT_ROOT.resolve("src/main/proto/catalog.proto");
-  private static final Path CODEC_FILE =
-      PROJECT_ROOT.resolve("src/main/java/org/apache/iceberg/io/ProtoCodec.java");
-  private static final Path INLINE_DELTA_FILE =
-      PROJECT_ROOT.resolve("src/main/java/org/apache/iceberg/io/InlineDeltaCodec.java");
-  private static final Path OUTPUT =
-      PROJECT_ROOT.resolve("target/format-explorer/fixtures.json");
+  private static final UUID CATALOG_UUID = UUID.fromString("01900000-0000-7000-8000-000000000001");
+  private static final long PINNED_TS = 1_746_518_400_000L; // 2025-05-06 08:00:00Z
+  private static final Namespace WAREHOUSE = Namespace.of("warehouse");
 
   @Test
   @EnabledIfSystemProperty(named = "explorer.regenerate", matches = "true")
-  void regenerate() throws Exception {
-    SchemaDescriptor schema = parseProto(PROTO_FILE);
-    verifyFieldNumbersAgainstCodec(schema, CODEC_FILE, INLINE_DELTA_FILE);
-
-    List<Scenario> scenarios = new ArrayList<>();
-    scenarios.add(scenarioEmptyBootstrap());
-    scenarios.add(scenarioPostCasMultiNamespace());
-    scenarios.add(scenarioLateBindMultiAction());
-    scenarios.add(scenarioCreateTableInlineGzip());
-    scenarios.add(scenarioCreateTableInlineStructural());
-    scenarios.add(scenarioUpdateTableInlineDelta());
-    scenarios.add(scenarioPointerMultiTableConflictRetry());
-    scenarios.add(scenarioInlineMultiTableConflictRetry());
-
-    for (Scenario s : scenarios) {
-      verifyParses(s);
-    }
-    // The two conflict/retry scenarios are designed to exercise the full
-    // read path (verify + apply). Their wire bytes must round-trip through
-    // ProtoCatalogFormat.readInternal with the documented outcomes.
-    verifyConflictRetryReplay(
-        scenarios.get(6), /* aSucceeds */ true, /* bAtV2 */ "s3://lake/warehouse/B/v2.metadata.json",
-        "s3://lake/warehouse/A/v3.metadata.json");
-    verifyInlineConflictRetryReplay(scenarios.get(7));
-
+  void regenerate() throws IOException {
+    String json = fixturesJson();
     Files.createDirectories(OUTPUT.getParent());
-    Files.writeString(OUTPUT, emitJson(schema, scenarios));
-    System.out.println("Wrote fixtures to " + OUTPUT);
-  }
-
-  /**
-   * Sanity check: each scenario's bytes must decode at the wire-format level.
-   * Header + checkpoint are decoded via {@link ProtoCodec#decodeCheckpoint},
-   * each transaction record via {@link ProtoCodec#decodeTransaction}. We
-   * deliberately do NOT exercise the apply/replay path
-   * ({@link ProtoCatalogFormat#readInternal}) because that requires the
-   * carried inline metadata to be a fully-valid Iceberg TableMetadata --
-   * which is orthogonal to "the bytes are well-formed protobuf the
-   * visualizer can decode".
-   */
-  private static void verifyParses(Scenario s) {
-    try {
-      java.io.ByteArrayInputStream in = new java.io.ByteArrayInputStream(s.bytes);
-      byte[] header = in.readNBytes(8);
-      if (header.length != 8 || header[0] != 'L' || header[1] != 'C'
-          || header[2] != 'A' || header[3] != 'T') {
-        throw new IllegalStateException("Bad magic");
-      }
-      int chkLen = readVarintFromStream(in);
-      byte[] chkBytes = in.readNBytes(chkLen);
-      ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(LOCATION);
-      ProtoCodec.decodeCheckpoint(chkBytes, builder);
-
-      while (in.available() > 0) {
-        int txnLen = readVarintFromStream(in);
-        byte[] txnBytes = in.readNBytes(txnLen);
-        ProtoCodec.Transaction txn = ProtoCodec.decodeTransaction(txnBytes);
-        if (txn == null) {
-          throw new IllegalStateException("Transaction decoded as null");
-        }
-      }
-    } catch (Exception e) {
-      throw new AssertionError(
-          "Scenario " + s.name + " failed to wire-decode: " + e.getMessage(), e);
+    Files.writeString(OUTPUT, json);
+    String html = Files.readString(HTML);
+    String spliced = splice(html, json);
+    if (spliced.equals(html)) {
+      System.out.println("The fixtures in " + HTML + " are current");
+    } else {
+      Files.writeString(HTML, spliced);
+      System.out.println("Wrote " + json.length() + " bytes of fixtures to " + HTML);
     }
   }
 
   /**
-   * For the pointer-mode multi-table scenario: actually exercise the read
-   * path and assert T1+T3 commit while T2 is silently skipped. This is the
-   * strongest correctness guarantee the test can offer for the scenario.
+   * The fixtures: catalog.proto's schema, the format versions the explorer checks, a deflate
+   * probe and each scenario. Fails if a scenario does not conform to catalog.proto or does not
+   * replay to its documented outcome.
    */
-  private static void verifyConflictRetryReplay(
-      Scenario s, boolean aSucceedsT3, String bExpectedLocationT3, String aExpectedLocationT3)
-      throws IOException {
-    ProtoCatalogFile result = ProtoCatalogFormat.readInternal(
-        LOCATION,
-        new java.io.ByteArrayInputStream(s.bytes),
-        s.bytes.length);
+  static String fixturesJson() {
+    List<Scenario> scenarios =
+        List.of(
+            emptyBootstrap(),
+            lateBoundCreates(),
+            createTableInline("create-table-inline-gzip", InlineMetadataCodecs.TAG_JSON_GZIP),
+            createTableInline(
+                "create-table-inline-structural", InlineMetadataCodecs.TAG_STRUCTURAL),
+            updateTableInlineDelta(),
+            evolveTableInlineDelta(),
+            pointerMultiTableConflictRetry(),
+            inlineMultiTableConflictRetry(),
+            concurrentCreatesBoundAtReplay(),
+            renameTableAcrossNamespaces(),
+            inlineManifestList(),
+            compactionWithCommittedSetGc());
+    for (Scenario scenario : scenarios) {
+      String violation = CatalogProto.violation(scenario.bytes);
+      if (violation != null) {
+        throw new AssertionError(scenario.name + " does not conform to catalog.proto: " + violation);
+      }
+      try {
+        scenario.check.accept(replay(scenario.bytes));
+      } catch (RuntimeException | AssertionError e) {
+        throw new AssertionError(scenario.name + " does not replay as its notes say", e);
+      }
+    }
+    return emitJson(CatalogProto.schema(), scenarios);
+  }
 
-    java.util.UUID t1 = java.util.UUID.fromString("01900000-0000-7000-8000-000000000071");
-    java.util.UUID t2 = java.util.UUID.fromString("01900000-0000-7000-8000-000000000072");
-    java.util.UUID t3 = java.util.UUID.fromString("01900000-0000-7000-8000-000000000073");
-    if (!result.containsTransaction(t1)) {
-      throw new AssertionError(s.name + ": T1 expected to commit, but didn't");
+  /** The fixtures embedded in {@code html}, or null if it has no fixtures block. */
+  static String embeddedFixtures(String html) {
+    Matcher m = FIXTURES.matcher(html);
+    return m.find() ? m.group(2) : null;
+  }
+
+  static String splice(String html, String json) {
+    Matcher m = FIXTURES.matcher(html);
+    if (!m.find()) {
+      throw new IllegalStateException("index.html has no <script id=\"fixtures-data\"> block");
     }
-    if (result.containsTransaction(t2)) {
-      throw new AssertionError(s.name + ": T2 expected to be rejected, but was committed");
-    }
-    if (!result.containsTransaction(t3)) {
-      throw new AssertionError(s.name + ": T3 expected to commit, but didn't");
-    }
-    org.apache.iceberg.catalog.Namespace warehouse =
-        org.apache.iceberg.catalog.Namespace.of("warehouse");
-    String aLoc = result.location(
-        org.apache.iceberg.catalog.TableIdentifier.of(warehouse, "A"));
-    String bLoc = result.location(
-        org.apache.iceberg.catalog.TableIdentifier.of(warehouse, "B"));
-    if (!aExpectedLocationT3.equals(aLoc)) {
-      throw new AssertionError(s.name + ": A.location = " + aLoc
-          + ", expected " + aExpectedLocationT3);
-    }
-    if (!bExpectedLocationT3.equals(bLoc)) {
-      throw new AssertionError(s.name + ": B.location = " + bLoc
-          + ", expected " + bExpectedLocationT3);
-    }
+    return html.substring(0, m.start(2)) + json + html.substring(m.end(2));
   }
 
   /**
-   * Same outcomes as {@link #verifyConflictRetryReplay} but for the
-   * inline scenario: assert each table's inline metadata bytes match the
-   * post-T3 expectation.
+   * The gzip codec's encoding of a fixed table metadata. Gzip output depends on the JDK's zlib
+   * build, so {@code TestFormatExplorer} compares the fixtures only on a JDK that encodes this as
+   * the fixtures' generator did.
    */
-  private static void verifyInlineConflictRetryReplay(Scenario s) throws IOException {
-    ProtoCatalogFile result = ProtoCatalogFormat.readInternal(
-        LOCATION,
-        new java.io.ByteArrayInputStream(s.bytes),
-        s.bytes.length);
-
-    java.util.UUID t1 = java.util.UUID.fromString("01900000-0000-7000-8000-000000000081");
-    java.util.UUID t2 = java.util.UUID.fromString("01900000-0000-7000-8000-000000000082");
-    java.util.UUID t3 = java.util.UUID.fromString("01900000-0000-7000-8000-000000000083");
-    if (!result.containsTransaction(t1) || result.containsTransaction(t2)
-        || !result.containsTransaction(t3)) {
-      throw new AssertionError(s.name + ": expected commit set {T1,T3}, got "
-          + "T1=" + result.containsTransaction(t1)
-          + " T2=" + result.containsTransaction(t2)
-          + " T3=" + result.containsTransaction(t3));
-    }
-    org.apache.iceberg.catalog.Namespace warehouse =
-        org.apache.iceberg.catalog.Namespace.of("warehouse");
-    Integer aId = result.tableId(
-        org.apache.iceberg.catalog.TableIdentifier.of(warehouse, "A"));
-    Integer bId = result.tableId(
-        org.apache.iceberg.catalog.TableIdentifier.of(warehouse, "B"));
-    InlineMetadataCodec aCodec = InlineMetadataCodecs.byTag(result.inlineMetadataCodec(aId));
-    InlineMetadataCodec bCodec = InlineMetadataCodecs.byTag(result.inlineMetadataCodec(bId));
-    TableMetadata aMeta = aCodec.decodeFull(result.inlineMetadata(aId), null);
-    TableMetadata bMeta = bCodec.decodeFull(result.inlineMetadata(bId), null);
-    // After T3 commits, A holds {S1A, S3A} with main->S3A; B holds {S3B} with
-    // main->S3B. Neither carries the snapshots from the rejected T2.
-    long aT3Snap = 0x3333333333333333L;
-    long bT3Snap = 0x3333333333333334L;
-    long aT2StaleSnap = 0x2222222222222222L;
-    long bT2StaleSnap = 0x2222222222222223L;
-    if (aMeta.currentSnapshot() == null || aMeta.currentSnapshot().snapshotId() != aT3Snap) {
-      throw new AssertionError(s.name + ": A.currentSnapshot != S3A; got " + aMeta.currentSnapshot());
-    }
-    if (bMeta.currentSnapshot() == null || bMeta.currentSnapshot().snapshotId() != bT3Snap) {
-      throw new AssertionError(s.name + ": B.currentSnapshot != S3B; got " + bMeta.currentSnapshot());
-    }
-    if (aMeta.snapshot(aT2StaleSnap) != null) {
-      throw new AssertionError(s.name + ": A retained the rejected T2 snapshot");
-    }
-    if (bMeta.snapshot(bT2StaleSnap) != null) {
-      throw new AssertionError(s.name + ": B retained the rejected T2 snapshot");
-    }
-  }
-
-  private static int readVarintFromStream(java.io.InputStream in) throws IOException {
-    int result = 0;
-    int shift = 0;
-    int b;
-    do {
-      b = in.read();
-      if (b < 0) {
-        throw new IOException("EOF reading varint");
-      }
-      result |= (b & 0x7F) << shift;
-      shift += 7;
-    } while ((b & 0x80) != 0);
-    return result;
+  static String deflateProbe() {
+    return toHex(
+        InlineMetadataCodecs.JSON_GZIP.encode(
+            tableMetadata("019000ff-0000-7000-8000-000000000001", "s3://lake/probe", Map.of())));
   }
 
   // ============================================================
@@ -262,522 +166,742 @@ public class FormatExplorerFixtures {
   // ============================================================
 
   /**
-   * Minimum viable catalog: header + a 1-namespace checkpoint + one txn that
-   * creates a single namespace. Teaches header bytes, length framing, and
-   * the {@code Action} oneof discriminator.
+   * The file {@code FileIOCatalog.initialize} creates, a CAS write of an empty catalog with an
+   * empty transaction, and the first create appended to it.
    */
-  private Scenario scenarioEmptyBootstrap() {
-    ProtoCatalogFile catalog = ProtoCatalogFile.builder(LOCATION)
-        .setCatalogUuid(FIXED_CATALOG_UUID)
-        .setNextNamespaceId(1)
-        .setNextTableId(1)
-        .build();
-    byte[] file = encodeFile(catalog);
-    UUID txnId = UUID.fromString("01900000-0000-7000-8000-000000000010");
-    ProtoCodec.Transaction txn = new ProtoCodec.Transaction(
-        txnId,
-        List.of(new ProtoCodec.CreateNamespaceAction(1, 1, 0, -1, "analytics")));
-    file = appendTxn(file, txn);
-
-    List<Note> notes = List.of(
-        new Note(0, 4, "Magic bytes \"LCAT\""),
-        new Note(4, 8, "Format version (big-endian int32 = 1)"));
-    return new Scenario(
+  private static Scenario emptyBootstrap() {
+    Log log = Log.cas(emptyCatalog(), txn(1), mut -> {}, 0L,
+        "Record 0: the empty transaction FileIOCatalog.initialize commits to create the file. "
+            + "Its id joins the committed set, like any other.");
+    log.append(txn(2), mut -> mut.createNamespace(Namespace.of("analytics")),
+        "Record 1: CreateNamespace(id = -1, version = 1, parent_id = 0, parent_version = 0). "
+            + "The id is late-bound: replay binds -1 to the checkpoint's next_namespace_id, 1. "
+            + "parent_version is the root's version when the writer read it; replay bumps the "
+            + "root to 1, so a concurrent top-level create or drop that read version 0 is "
+            + "rejected.");
+    return log.scenario(
         "empty-bootstrap",
-        "Smallest realistic catalog: 8-byte header, a checkpoint that is "
-            + "essentially just a UUID + ID counters, and a single transaction "
-            + "with a single CreateNamespace action. Walk every byte to learn "
-            + "how length framing and oneof discriminators work.",
-        file, notes);
+        "The smallest catalog: an 8-byte header, a checkpoint with only the catalog UUID, the "
+            + "id counters and the root namespace row (id 0, empty name), and two records. Walk "
+            + "every byte to learn the length framing and the Action oneof.",
+        List.of(
+            "The checkpoint's first field is min_reader_version (field 4): written first so an "
+                + "old reader fails before decoding the rest.",
+            "Every catalog holds the root as an ordinary Namespace row, id 0. It is not "
+                + "addressable by name, but its version orders top-level creates and drops."),
+        state -> {
+          expect(state.namespaceId(Namespace.of("analytics")), 1, "analytics id");
+          expect(state.namespaceVersion(ProtoCatalogFile.ROOT_ID), 1, "root version");
+        });
+  }
+
+  /** A namespace and a table in it, created in one transaction. */
+  private static Scenario lateBoundCreates() {
+    Log log = Log.cas(emptyCatalog(), txn(10), mut -> {}, 0L, "Record 0: initialize.");
+    TableIdentifier rawEvents = TableIdentifier.of(Namespace.of("staging"), "raw_events");
+    log.append(txn(11),
+        mut -> mut.createNamespace(Namespace.of("staging"))
+            .createTable(rawEvents, "s3://lake/staging/raw_events/v1.metadata.json"),
+        "Record 1: CreateNamespace(id = -1) and CreateTable(id = -1, namespace_id = -1, "
+            + "namespace_version = -1). The table names the namespace by its late-bound id; "
+            + "replay binds the namespace first, then the table to it. A version of -1 means "
+            + "the namespace is created in this transaction, so there is no version to check.");
+    return log.scenario(
+        "txn-multi-action-with-late-bind",
+        "Two actions in one transaction, a CreateNamespace and a CreateTable in it. Look for "
+            + "the 5-byte varints of the negative ids.",
+        List.of(
+            "QUIRK: a negative int32 (a late-bound id, or a -1 version) is a 5-byte varint, not "
+                + "the 10-byte sign extension proto3 specifies: ProtoCodec.writeRawVarint(int) "
+                + "shifts a 32-bit int right unsigned. Readers generated by protoc accept it."),
+        state -> {
+          expect(state.namespaceId(Namespace.of("staging")), 1, "staging id");
+          expect(state.tableId(rawEvents), 1, "raw_events id");
+        });
+  }
+
+  /** An inline table created with {@code codec}. */
+  private static Scenario createTableInline(String name, byte codec) {
+    boolean structural = codec == InlineMetadataCodecs.TAG_STRUCTURAL;
+    String table = structural ? "products" : "orders";
+    TableIdentifier ident = TableIdentifier.of(WAREHOUSE, table);
+    ProtoCatalogFile base = warehouse(20 + codec);
+    TableMetadata meta =
+        tableMetadata(
+            structural
+                ? "019000cc-0000-7000-8000-000000000001"
+                : "019000aa-0000-7000-8000-000000000001",
+            "s3://lake/warehouse/" + table,
+            Map.of("table-name", table));
+    byte[] metadata = InlineMetadataCodecs.byTag(codec).encode(meta);
+    Log log = Log.cas(base, txn(30 + codec), mut -> mut.createTableInline(ident, metadata, codec),
+        0L,
+        "The CAS write that creates the table: a checkpoint of the catalog before it, then the "
+            + "CreateTableInline record. Replay binds the table's id -1 to 1.");
+    String description =
+        structural
+            ? "CreateTableInline carrying a TableMetadata in the structural codec "
+                + "(metadata_codec = CODEC_STRUCTURAL, 1): gzip around a columnar layout, a "
+                + "varint layout version, the JSON without snapshots and metadata log, then "
+                + "snap_block and mdlog_block, both empty here. 'Show compact form' lists the "
+                + "segments. At the corpus median the layout is 40% smaller than gzip(JSON) and "
+                + "4-7x faster to decode lazily (docs/TM_ENCODING_BENCH_RESULTS.md)."
+            : "CreateTableInline carrying a TableMetadata in the gzip codec (metadata_codec = "
+                + "CODEC_JSON_GZIP, 0): Iceberg's gzip-compressed metadata JSON, format version "
+                + "2, six columns, partitioned by day(ts). Expand 'Show recovered JSON'.";
+    return log.scenario(name, description,
+        List.of("The codec field is written even when it is 0: the decoder requires it."),
+        List.of(structural ? structuralView(metadata, meta) : gzipView(metadata, meta)),
+        state -> {
+          expect(state.tableId(ident), 1, table + " id");
+          expect(state.inlineMetadataCodec(1), (int) codec, "codec");
+        });
+  }
+
+  /** An append to an inline table, sent as a delta. */
+  private static Scenario updateTableInlineDelta() {
+    TableIdentifier events = TableIdentifier.of(WAREHOUSE, "events");
+    TableMetadata meta =
+        tableMetadata(
+            "019000bb-0000-7000-8000-000000000001",
+            "s3://lake/warehouse/events",
+            Map.of("table-name", "events"));
+    byte[] metadata = InlineMetadataCodecs.JSON_GZIP.encode(meta);
+    ProtoCatalogFile base =
+        Log.of(warehouse(40))
+            .append(txn(41),
+                mut -> mut.createTableInline(events, metadata, InlineMetadataCodecs.TAG_JSON_GZIP),
+                null)
+            .state();
+    long snapshotId = 0x4f6c4a8e1234abcdL;
+    byte[] delta =
+        writerDelta(base, events,
+            List.of(
+                append(snapshotId, null, "events/metadata/snap-4f6c4a8e1234abcd-1-m0.avro",
+                    60_000L),
+                main(snapshotId)),
+            PINNED_TS + 60_000L);
+    Log log = Log.cas(base, txn(42), mut -> mut.updateTableInlineDelta(events, delta), 0L,
+        "The append, as a TableMetadataDelta: an AddSnapshot (its summary a CompactSummary), "
+            + "then a SetSnapshotRef moving main to it. The snapshot's time is a delta from the "
+            + "base's last-updated-ms; the delta's own last_updated_ms is the committed one.");
+    return log.scenario(
+        "update-table-inline-delta",
+        "An UpdateTableInline whose payload is the delta InlineDeltaCodec.computeDelta sends for "
+            + "an append to an inline table. Look for fixed64 (snapshot_id), a zigzag sint64 "
+            + "(timestamp_delta_ms) and the deepest nesting in the format. The checkpoint's "
+            + "InlineTable.metadata is the base metadata, gzip-encoded; click it to see the JSON.",
+        List.of(),
+        List.of(gzipView(metadata, meta)),
+        state -> {
+          TableMetadata committed = inlineMetadata(state, events);
+          expect(committed.currentSnapshot().snapshotId(), snapshotId, "current snapshot");
+        });
+  }
+
+  /** A schema, partition spec, sort order and property change to an inline table, as a delta. */
+  private static Scenario evolveTableInlineDelta() {
+    TableIdentifier orders = TableIdentifier.of(WAREHOUSE, "orders");
+    TableMetadata meta =
+        tableMetadata(
+            "019000ee-0000-7000-8000-000000000001",
+            "s3://lake/warehouse/orders",
+            Map.of("table-name", "orders", "commit.retry.num-retries", "4"));
+    byte[] metadata = InlineMetadataCodecs.JSON_GZIP.encode(meta);
+    ProtoCatalogFile base =
+        Log.of(warehouse(45))
+            .append(txn(46),
+                mut -> mut.createTableInline(orders, metadata, InlineMetadataCodecs.TAG_JSON_GZIP),
+                null)
+            .state();
+    Schema evolved =
+        new Schema(
+            org.apache.iceberg.relocated.com.google.common.collect.Lists.newArrayList(
+                    Iterables.concat(
+                        meta.schema().columns(),
+                        List.of(Types.NestedField.optional(8, "region", Types.StringType.get()))))
+                .stream()
+                .collect(Collectors.toList()));
+    Map<String, String> properties = new LinkedHashMap<>(meta.properties());
+    properties.put("write.parquet.compression-codec", "lz4");
+    properties.remove("commit.retry.num-retries");
+    TableMetadata after =
+        TableMetadata.buildFrom(replayBase(base, orders))
+            .setCurrentSchema(evolved, 8)
+            .setDefaultPartitionSpec(
+                PartitionSpec.builderFor(evolved).day("ts").identity("region").build())
+            .setDefaultSortOrder(SortOrder.builderFor(evolved).asc("region").desc("ts").build())
+            .setProperties(properties)
+            .removeProperties(java.util.Set.of("commit.retry.num-retries"))
+            .setLastUpdatedMillis(PINNED_TS + 60_000L)
+            .discardChanges()
+            .build();
+    byte[] delta = writerDelta(base, orders, after);
+    Log log = Log.cas(base, txn(47), mut -> mut.updateTableInlineDelta(orders, delta), 0L,
+        "The change as a TableMetadataDelta: AddSchema with the new schema's JSON (gzip) and "
+            + "SetCurrentSchema; AddPartitionSpec and SetDefaultPartitionSpec; AddSortOrder, "
+            + "structured (no JSON), and SetDefaultSortOrder; and SetTableProperties with the "
+            + "updated and removed keys. Replay ignores the schema, spec and order ids the "
+            + "record carries and lets Iceberg's builder assign them, so a commit whose ids "
+            + "replay would assign differently goes in full mode.");
+    return log.scenario(
+        "evolve-table-inline-delta",
+        "An UpdateTableInline delta that evolves a table: adds a column, partitions by it, sorts "
+            + "by it and changes two properties. Click AddSchema.schema_json for the schema; "
+            + "SortField's enums decode to their names.",
+        List.of(),
+        List.of(gzipView(metadata, meta)),
+        state -> {
+          TableMetadata committed = inlineMetadata(state, orders);
+          expect(committed.schema().findField("region") != null, true, "region column");
+          expect(committed.spec().fields().size(), 2, "partition fields");
+          expect(committed.sortOrder().fields().size(), 2, "sort fields");
+          expect(committed.properties().get("write.parquet.compression-codec"), "lz4", "codec");
+          expect(committed.properties().containsKey("commit.retry.num-retries"), false,
+              "removed property");
+        });
   }
 
   /**
-   * Post-CAS catalog: 2 namespaces (one nested), 1 pointer-mode table, and
-   * a namespace property. No appended transactions -- this is what a fresh
-   * compaction commit looks like.
+   * Two pointer tables, and three transactions: T1 updates A; T2, from the snapshot before T1,
+   * updates A and B and is rejected as a whole; T3 retries it.
    */
-  private Scenario scenarioPostCasMultiNamespace() {
-    ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(LOCATION)
-        .setCatalogUuid(FIXED_CATALOG_UUID)
-        .addNamespace(1, 0, "warehouse", 2)
-        .addNamespace(2, 1, "bronze", 1)
-        .addTable(1, 2, "events", 3, "s3://lake/warehouse/bronze/events/v3.metadata.json")
-        .setNamespaceProperty(1, "owner", "data-platform")
-        .setNextNamespaceId(3)
-        .setNextTableId(2);
-    // Five recent committed transaction IDs, demonstrating the
-    // CommittedTransactions sub-message: descending timestamp sort,
-    // per-entry timestamp delta + 10 packed random bytes. UUIDs are
-    // hand-crafted v7 with successive 1-ms-spaced timestamps in the
-    // version nibble = 7 / variant nibble = 8 layout.
-    builder.addCommittedTransaction(UUID.fromString("0190a8ec-1900-7000-8000-000000000301"));
-    builder.addCommittedTransaction(UUID.fromString("0190a8ec-1901-7000-8000-000000000302"));
-    builder.addCommittedTransaction(UUID.fromString("0190a8ec-1902-7000-8000-000000000303"));
-    builder.addCommittedTransaction(UUID.fromString("0190a8ec-1904-7000-8000-000000000304"));
-    builder.addCommittedTransaction(UUID.fromString("0190a8ec-1907-7000-8000-000000000305"));
-    ProtoCatalogFile catalog = builder.rebuildLookups().build();
-    byte[] file = encodeFile(catalog);
-    return new Scenario(
-        "namespaces-and-pointer-tables",
-        "A compacted (CAS-only) catalog with two namespaces, one nested "
-            + "under the other, a pointer-mode table referenced by S3 URL, "
-            + "one namespace property, and five committed transactions in "
-            + "the dedup set. Demonstrates repeated message fields, "
-            + "parent_id chaining, and the CommittedTransactions sub-message "
-            + "(field 20): UUIDv7s sorted descending, with each entry "
-            + "interleaving a varint timestamp delta (gap from the previous "
-            + "entry) and 10 packed random bytes (rand_a + rand_b, "
-            + "version+variant bits implicit) into a single packed_entries "
-            + "blob. The catalog scans this blob in one linear pass with no "
-            + "per-call heap allocation. Click the packed_entries node to "
-            + "see the reconstructed UUIDs.",
-        file, List.of());
+  private static Scenario pointerMultiTableConflictRetry() {
+    TableIdentifier a = TableIdentifier.of(WAREHOUSE, "A");
+    TableIdentifier b = TableIdentifier.of(WAREHOUSE, "B");
+    ProtoCatalogFile base =
+        Log.of(warehouse(50))
+            .append(txn(51), mut -> mut.createTable(a, "s3://lake/warehouse/A/v1.metadata.json")
+                .createTable(b, "s3://lake/warehouse/B/v1.metadata.json"), null)
+            .state();
+    Log log = Log.checkpoint(base, 0L);
+    log.append(txn(52), mut -> mut.updateTable(a, "s3://lake/warehouse/A/v2.metadata.json"),
+        "T1: UpdateTableLocation(A, version = 1). Applies; A moves to version 2.");
+    log.append(base, txn(53),
+        mut -> mut.updateTable(a, "s3://lake/warehouse/A/v3.metadata.json")
+            .updateTable(b, "s3://lake/warehouse/B/v2.metadata.json"),
+        "T2, from the snapshot T1 did not see: UpdateTableLocation(A, version = 1) and "
+            + "UpdateTableLocation(B, version = 1). Rejected: A is at version 2, and a "
+            + "transaction applies all its actions or none, so B is not updated either. The "
+            + "record stays in the log; replay skips it.");
+    ProtoCatalogFile afterT1 = log.state(); // T2 was rejected
+    log.append(afterT1, txn(54),
+        mut -> mut.updateTable(a, "s3://lake/warehouse/A/v3.metadata.json")
+            .updateTable(b, "s3://lake/warehouse/B/v2.metadata.json"),
+        "T3: T2 retried on a fresh read, UpdateTableLocation(A, version = 2) and "
+            + "UpdateTableLocation(B, version = 1). Applies.");
+    return log.scenario(
+        "pointer-multi-table-conflict-retry",
+        "Two pointer tables A and B. Three appended transactions show version-based conflict "
+            + "detection and atomic multi-table commits: T1 commits, T2 (both tables) is "
+            + "rejected because A's version is stale, T3 (the retry) commits both.",
+        List.of(),
+        state -> {
+          expect(state.containsTransaction(txn(52)), true, "T1 committed");
+          expect(state.containsTransaction(txn(53)), false, "T2 committed");
+          expect(state.containsTransaction(txn(54)), true, "T3 committed");
+          expect(state.location(a), "s3://lake/warehouse/A/v3.metadata.json", "A");
+          expect(state.location(b), "s3://lake/warehouse/B/v2.metadata.json", "B");
+        });
+  }
+
+  /** The inline counterpart of {@link #pointerMultiTableConflictRetry}: each update a delta. */
+  private static Scenario inlineMultiTableConflictRetry() {
+    TableIdentifier a = TableIdentifier.of(WAREHOUSE, "A");
+    TableIdentifier b = TableIdentifier.of(WAREHOUSE, "B");
+    TableMetadata aMeta =
+        tableMetadata("019000a1-0000-7000-8000-000000000001", "s3://lake/warehouse/A",
+            Map.of("table-name", "A"));
+    TableMetadata bMeta =
+        tableMetadata("019000b1-0000-7000-8000-000000000001", "s3://lake/warehouse/B",
+            Map.of("table-name", "B"));
+    byte[] aBytes = InlineMetadataCodecs.JSON_GZIP.encode(aMeta);
+    byte[] bBytes = InlineMetadataCodecs.JSON_GZIP.encode(bMeta);
+    ProtoCatalogFile base =
+        Log.of(warehouse(60))
+            .append(txn(61),
+                mut -> mut.createTableInline(a, aBytes, InlineMetadataCodecs.TAG_JSON_GZIP)
+                    .createTableInline(b, bBytes, InlineMetadataCodecs.TAG_JSON_GZIP),
+                null)
+            .state();
+    long s1 = 0x1111111111111111L;
+    long s2a = 0x2222222222222222L;
+    long s2b = 0x2222222222222223L;
+    long s3a = 0x3333333333333333L;
+    long s3b = 0x3333333333333334L;
+    Log log = Log.checkpoint(base, 0L);
+    byte[] t1 = writerDelta(base, a, appendToMain(s1, null, "A/metadata/snap-1.avro", 60_000L),
+        PINNED_TS + 60_000L);
+    log.append(txn(62), mut -> mut.updateTableInlineDelta(a, t1),
+        "T1: UpdateTableInline(A, version = 1), a delta adding snapshot S1A and moving main to "
+            + "it. Applies; A moves to version 2.");
+    byte[] t2a = writerDelta(base, a, appendToMain(s2a, null, "A/metadata/snap-2.avro", 120_000L),
+        PINNED_TS + 120_000L);
+    byte[] t2b = writerDelta(base, b, appendToMain(s2b, null, "B/metadata/snap-2.avro", 120_000L),
+        PINNED_TS + 120_000L);
+    log.append(base, txn(63),
+        mut -> mut.updateTableInlineDelta(a, t2a).updateTableInlineDelta(b, t2b),
+        "T2, from the snapshot T1 did not see: UpdateTableInline(A, version = 1) and "
+            + "UpdateTableInline(B, version = 1). Rejected as a whole: A is at version 2. B's "
+            + "delta, valid on its own, never lands; this record is the only place its "
+            + "snapshot appears, and the next CAS write drops it.");
+    ProtoCatalogFile afterT1 = log.state(); // T2 was rejected
+    byte[] t3a = writerDelta(afterT1, a, appendToMain(s3a, s1, "A/metadata/snap-3.avro", 120_000L),
+        PINNED_TS + 180_000L);
+    byte[] t3b = writerDelta(afterT1, b, appendToMain(s3b, null, "B/metadata/snap-3.avro", 180_000L),
+        PINNED_TS + 180_000L);
+    log.append(afterT1, txn(64),
+        mut -> mut.updateTableInlineDelta(a, t3a).updateTableInlineDelta(b, t3b),
+        "T3: the retry, UpdateTableInline(A, version = 2) with S3A on S1A, and "
+            + "UpdateTableInline(B, version = 1). Applies.");
+    return log.scenario(
+        "inline-multi-table-conflict-retry",
+        "The inline counterpart of pointer-multi-table-conflict-retry: each update is the delta "
+            + "a writer sends for an append (AddSnapshot, SetSnapshotRef), in UpdateTableInline "
+            + "(Action field 9) where the pointer scenario has UpdateTableLocation (field 7). In "
+            + "pointer mode T2 names metadata files already written; here its delta is the only "
+            + "copy of its snapshots. Click either InlineTable.metadata for the base JSON.",
+        List.of(),
+        List.of(gzipView(aBytes, aMeta), gzipView(bBytes, bMeta)),
+        state -> {
+          expect(state.containsTransaction(txn(63)), false, "T2 committed");
+          TableMetadata aAfter = inlineMetadata(state, a);
+          TableMetadata bAfter = inlineMetadata(state, b);
+          expect(aAfter.currentSnapshot().snapshotId(), s3a, "A's current snapshot");
+          expect(aAfter.currentSnapshot().parentId(), s1, "S3A's parent");
+          expect(bAfter.currentSnapshot().snapshotId(), s3b, "B's current snapshot");
+          expect(aAfter.snapshot(s2a) == null && bAfter.snapshot(s2b) == null, true,
+              "T2's snapshots absent");
+        });
   }
 
   /**
-   * Append-mode commit with late binding: the txn creates a namespace AND a
-   * table referencing it via negative ID sentinels. Highlights the 5-byte
-   * non-canonical varint quirk and {@code parent_version=-1}.
+   * Three writers read one snapshot and each create a table. Replay binds their late-bound ids
+   * in log order, so the two that commit get different ids; the third, in the namespace the
+   * first changed, is rejected.
    */
-  private Scenario scenarioLateBindMultiAction() {
-    ProtoCatalogFile catalog = ProtoCatalogFile.builder(LOCATION)
-        .setCatalogUuid(FIXED_CATALOG_UUID)
+  private static Scenario concurrentCreatesBoundAtReplay() {
+    Namespace sales = Namespace.of("sales");
+    Namespace ops = Namespace.of("ops");
+    ProtoCatalogFile base =
+        Log.of(emptyCatalog())
+            .append(txn(70), mut -> mut.createNamespace(sales).createNamespace(ops), null)
+            .state();
+    Log log = Log.checkpoint(base, 0L);
+    log.append(base, txn(71),
+        mut -> mut.createTable(TableIdentifier.of(sales, "orders"),
+            "s3://lake/sales/orders/v1.metadata.json"),
+        "W1: CreateTable(sales.orders, id = -1, namespace_version = 1). Applies: replay binds "
+            + "-1 to next_table_id, 1, and bumps sales to version 2.");
+    log.append(base, txn(72),
+        mut -> mut.createTable(TableIdentifier.of(ops, "alerts"),
+            "s3://lake/ops/alerts/v1.metadata.json"),
+        "W2, from the same snapshot: CreateTable(ops.alerts, id = -1). Also -1, but replay binds "
+            + "it to the next id now, 2. Before late binding both writers took id 1 from their "
+            + "snapshot, and the second create overwrote the first (Bug 10).");
+    log.append(base, txn(73),
+        mut -> mut.createTable(TableIdentifier.of(sales, "refunds"),
+            "s3://lake/sales/refunds/v1.metadata.json"),
+        "W3, from the same snapshot: CreateTable(sales.refunds, namespace_version = 1). "
+            + "Rejected: W1 moved sales to version 2. Creates in one namespace serialize on "
+            + "its version; creates in different namespaces do not conflict.");
+    return log.scenario(
+        "concurrent-creates-bound-at-replay",
+        "Three writers read the same snapshot and each append a create. The records carry the "
+            + "same late-bound id; replay binds them to different ids in log order. The parent "
+            + "namespace's version orders creates under it.",
+        List.of(),
+        state -> {
+          expect(state.tableId(TableIdentifier.of(sales, "orders")), 1, "sales.orders id");
+          expect(state.tableId(TableIdentifier.of(ops, "alerts")), 2, "ops.alerts id");
+          expect(state.containsTable(TableIdentifier.of(sales, "refunds")), false,
+              "sales.refunds exists");
+        });
+  }
+
+  /** A rename into another namespace, and a stale update of the renamed table. */
+  private static Scenario renameTableAcrossNamespaces() {
+    Namespace staging = Namespace.of("staging");
+    Namespace prod = Namespace.of("prod");
+    TableIdentifier from = TableIdentifier.of(staging, "daily");
+    TableIdentifier to = TableIdentifier.of(prod, "daily_v2");
+    ProtoCatalogFile base =
+        Log.of(emptyCatalog())
+            .append(txn(80), mut -> mut.createNamespace(staging).createNamespace(prod)
+                .createTable(from, "s3://lake/staging/daily/v1.metadata.json"), null)
+            .state();
+    Log log = Log.checkpoint(base, 0L);
+    log.append(base, txn(81), mut -> mut.renameTable(from, to),
+        "RenameTable(id = 1, version = 1, new_namespace_id = 2, new_namespace_version = 1, "
+            + "new_name = \"daily_v2\"). Applies: the table keeps its id and metadata, moves to "
+            + "version 2, and both namespaces' versions are bumped, as a drop and a create "
+            + "would bump them.");
+    log.append(base, txn(82),
+        mut -> mut.updateTable(from, "s3://lake/staging/daily/v2.metadata.json"),
+        "An update from the snapshot before the rename: UpdateTableLocation(id = 1, version = "
+            + "1). Rejected: the rename moved the table to version 2.");
+    return log.scenario(
+        "rename-table-across-namespaces",
+        "A RenameTable (Action field 11) moving a table to another namespace, then a stale "
+            + "writer's update of it. The table is addressed by id, so the update finds it, but "
+            + "its version check fails.",
+        List.of(),
+        state -> {
+          expect(state.tableId(to), 1, "prod.daily_v2 id");
+          expect(state.containsTable(from), false, "staging.daily exists");
+          expect(state.location(to), "s3://lake/staging/daily/v1.metadata.json", "location");
+        });
+  }
+
+  /**
+   * An inline-ML table: its snapshots' manifest lists live in the catalog, as a manifest pool
+   * and each snapshot's indices into it.
+   */
+  private static Scenario inlineManifestList() {
+    TableIdentifier clicks = TableIdentifier.of(WAREHOUSE, "clicks");
+    TableMetadata meta =
+        tableMetadata("019000dd-0000-7000-8000-000000000001", "s3://lake/warehouse/clicks",
+            Map.of("table-name", "clicks"));
+    byte[] metadata = InlineMetadataCodecs.JSON_GZIP.encode(meta);
+    long s1 = 0x5151515151515151L;
+    long s2 = 0x5252525252525252L;
+    ManifestFile m1 = manifest("clicks/metadata/m1.avro", s1, 1, 20_200);
+    ManifestFile m2 = manifest("clicks/metadata/m2.avro", s1, 1, 20_201);
+    ManifestFile m3 = manifest("clicks/metadata/m3.avro", s2, 2, 20_200);
+    // Inline-ML deltas are built by hand: the writer's manifest updates come from the
+    // InlineSnapshot its producer returned, which only FileIOCatalog holds.
+    byte[] first =
+        InlineDeltaCodec.encodeDelta(
+            List.of(
+                append(s1, null, "", 60_000L),
+                main(s1),
+                new InlineDeltaCodec.AddManifestUpdate(s1, m1, "", 0),
+                new InlineDeltaCodec.AddManifestUpdate(s1, m2, "", 1)),
+            PINNED_TS + 60_000L);
+    ProtoCatalogFile afterFirst =
+        Log.of(warehouse(90))
+            .append(txn(91),
+                mut -> mut.createTableInline(clicks, metadata, InlineMetadataCodecs.TAG_JSON_GZIP),
+                null)
+            .append(txn(92), mut -> mut.updateTableInlineDelta(clicks, first), null)
+            .state();
+    byte[] second =
+        InlineDeltaCodec.encodeDelta(
+            List.of(
+                append(s2, s1, "", 120_000L),
+                main(s2),
+                new InlineDeltaCodec.RemoveManifestUpdate(s2, m1.path()),
+                new InlineDeltaCodec.AddManifestUpdate(s2, m3, "", 0)),
+            PINNED_TS + 120_000L);
+    Log log = Log.cas(afterFirst, txn(93), mut -> mut.updateTableInlineDelta(clicks, second), 0L,
+        "A CAS write. The checkpoint's InlineTable holds the pool [m1, m2] and S1's indices "
+            + "[0, 1]. The record's delta adds S2 on S1 with an empty manifest_list_suffix (its "
+            + "list is inline), removes m1 from S2's list and inserts m3 at position 0: replay "
+            + "builds S2's list from its parent's, less the removed, with the added at their "
+            + "positions, [m3, m2].");
+    return log.scenario(
+        "inline-manifest-list",
+        "An inline-ML table (fileio.catalog.inline.manifests): no manifest list files. The "
+            + "checkpoint carries each table's manifest_pool and per-snapshot snapshot_refs; a "
+            + "delta changes a snapshot's list with AddManifestDelta and RemoveManifestDelta.",
+        List.of(
+            "snapshot_refs.pool_indices is a repeated int32 the codec writes unpacked, one "
+                + "varint each: catalog.proto declares it [packed = false]."),
+        List.of(gzipView(metadata, meta)),
+        state -> {
+          int id = state.tableId(clicks);
+          expect(paths(state.inlineManifests(id, s1)), List.of(m1.path(), m2.path()), "S1's list");
+          expect(paths(state.inlineManifests(id, s2)), List.of(m3.path(), m2.path()), "S2's list");
+        });
+  }
+
+  /**
+   * A CAS write whose checkpoint drops the oldest committed transaction ids, as every CAS write
+   * does for ids older than the retention window, and records the horizon.
+   */
+  private static Scenario compactionWithCommittedSetGc() {
+    Namespace bronze = Namespace.of("warehouse", "bronze");
+    TableIdentifier events = TableIdentifier.of(bronze, "events");
+    Log history = Log.of(emptyCatalog());
+    history.append(txn(100), mut -> mut.createNamespace(WAREHOUSE), null);
+    history.append(txn(101), mut -> mut.createNamespace(bronze), null);
+    history.append(txn(102),
+        mut -> mut.createTable(events, "s3://lake/warehouse/bronze/events/v1.metadata.json"),
+        null);
+    history.append(txn(103),
+        mut -> mut.updateProperties(WAREHOUSE, Map.of("owner", "data-platform")), null);
+    history.append(txn(104),
+        mut -> mut.updateTable(events, "s3://lake/warehouse/bronze/events/v2.metadata.json"),
+        null);
+    ProtoCatalogFile base = history.state();
+    long watermark = UuidV7.timestampMs(txn(101));
+    Log log = Log.cas(base, txn(105),
+        mut -> mut.updateTable(events, "s3://lake/warehouse/bronze/events/v3.metadata.json"),
+        watermark,
+        "The compacting commit's own record, UpdateTableLocation(events, version = 2). Its id "
+            + "joins the committed set when replay applies it.");
+    return log.scenario(
+        "compaction-with-committed-set-gc",
+        "A CAS write: the checkpoint holds two nested namespaces, a pointer table and a "
+            + "namespace property, then the commit's record follows. The checkpoint's "
+            + "CommittedTransactions (field 20) is the dedup set: UUIDv7s sorted descending, each "
+            + "a varint gap from the previous timestamp plus 10 random bytes, in one "
+            + "packed_entries blob the catalog scans without allocating. Click it to see the "
+            + "UUIDs.",
+        List.of(
+            "GC: this CAS write dropped the ids at or below its watermark (now - "
+                + "fileio.catalog.committed.retention.ms, 6 hours by default) and recorded the "
+                + "largest dropped timestamp as highest_dropped_timestamp_ms. A lookup of an id "
+                + "at or below it is unknown (DedupHorizonExceededException), not 'absent': "
+                + "the commit may have landed and aged out."),
+        state -> {
+          expect(state.highestDroppedTimestampMs(), watermark, "horizon");
+          expect(state.containsTransaction(txn(105)), true, "the compacting commit");
+          expect(state.containsTransaction(txn(102)), true, "a retained id");
+          try {
+            state.containsTransaction(txn(100));
+            throw new AssertionError("expected an id below the horizon to be unknown");
+          } catch (DedupHorizonExceededException expected) {
+            // an id at or below the horizon is neither committed nor absent
+          }
+        });
+  }
+
+  // ============================================================
+  // Building catalog files
+  // ============================================================
+
+  /**
+   * A catalog file as writers build it: a header and checkpoint, then records, each the
+   * transaction a writer makes for a change to the snapshot it read.
+   */
+  private static final class Log {
+    private byte[] file;
+    private final List<Note> notes = new ArrayList<>();
+
+    private Log(byte[] file) {
+      this.file = file;
+    }
+
+    /** A file of a checkpoint of {@code state} and no records. */
+    static Log checkpoint(ProtoCatalogFile state, long watermark) {
+      return new Log(header(checkpointBytes(state, watermark)));
+    }
+
+    /** A file of a checkpoint of {@code state}, to build a later state with records. */
+    static Log of(ProtoCatalogFile state) {
+      return checkpoint(state, 0L);
+    }
+
+    /**
+     * A CAS write of the change {@code change} makes to {@code base}: a checkpoint of {@code
+     * base}, dropping committed ids at or below {@code watermark}, and the change's record.
+     */
+    static Log cas(ProtoCatalogFile base, UUID id, Consumer<ProtoCatalogFormat.Mut> change,
+        long watermark, String note) {
+      return checkpoint(base, watermark).append(base, id, change, note);
+    }
+
+    /** Appends the record of a writer that read the current state. */
+    Log append(UUID id, Consumer<ProtoCatalogFormat.Mut> change, String note) {
+      return append(state(), id, change, note);
+    }
+
+    /** Appends the record of a writer that read {@code snapshot}. */
+    Log append(ProtoCatalogFile snapshot, UUID id, Consumer<ProtoCatalogFormat.Mut> change,
+        String note) {
+      ProtoCatalogFormat.Mut mut = new ProtoCatalogFormat.Mut(snapshot);
+      change.accept(mut);
+      List<ProtoCodec.Action> actions = new ArrayList<>();
+      mut.buildActions(actions, new ProtoCatalogFormat.ProtoIdManager());
+      byte[] body = ProtoCodec.encodeTransaction(new ProtoCodec.Transaction(id, actions));
+      ByteArrayOutputStream out = new ByteArrayOutputStream();
+      out.writeBytes(file);
+      writeVarint(out, body.length);
+      out.writeBytes(body);
+      if (note != null) {
+        notes.add(new Note(file.length, out.size(), note));
+      }
+      file = out.toByteArray();
+      return this;
+    }
+
+    /** The state the file replays to. */
+    ProtoCatalogFile state() {
+      return replay(file);
+    }
+
+    Scenario scenario(String name, String description, List<String> fileNotes,
+        Consumer<ProtoCatalogFile> check) {
+      return scenario(name, description, fileNotes, List.of(), check);
+    }
+
+    Scenario scenario(String name, String description, List<String> fileNotes,
+        List<StructuralView> views, Consumer<ProtoCatalogFile> check) {
+      List<Note> all = new ArrayList<>(notes);
+      for (String note : fileNotes) {
+        all.add(new Note(-1, -1, note));
+      }
+      return new Scenario(name, description, file, all, views, check);
+    }
+  }
+
+  private static ProtoCatalogFile replay(byte[] file) {
+    try {
+      return ProtoCatalogFormat.readInternal(LOCATION, new ByteArrayInputStream(file), file.length);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
+  private static byte[] header(byte[] checkpoint) {
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    out.writeBytes(ProtoCatalogFormat.MAGIC);
+    out.writeBytes(ByteBuffer.allocate(4).putInt(ProtoCatalogFormat.FORMAT_VERSION).array());
+    writeVarint(out, checkpoint.length);
+    out.writeBytes(checkpoint);
+    return out.toByteArray();
+  }
+
+  private static byte[] checkpointBytes(ProtoCatalogFile state, long watermark) {
+    ProtoCatalogFormat.ProtoIdManager ids = new ProtoCatalogFormat.ProtoIdManager();
+    ids.setGlobals(state.nextNamespaceId(), state.nextTableId());
+    return ProtoCodec.encodeCheckpoint(state, new ProtoCatalogFormat.Mut(state), ids, watermark);
+  }
+
+  private static void writeVarint(ByteArrayOutputStream out, int value) {
+    while ((value & ~0x7F) != 0) {
+      out.write((value & 0x7F) | 0x80);
+      value >>>= 7;
+    }
+    out.write(value);
+  }
+
+  private static ProtoCatalogFile emptyCatalog() {
+    return ProtoCatalogFile.builder(LOCATION)
+        .setCatalogUuid(CATALOG_UUID)
         .setNextNamespaceId(1)
         .setNextTableId(1)
         .build();
-    byte[] file = encodeFile(catalog);
-    UUID txnId = UUID.fromString("01900000-0000-7000-8000-000000000020");
-    ProtoCodec.Transaction txn = new ProtoCodec.Transaction(
-        txnId,
-        List.of(
-            new ProtoCodec.CreateNamespaceAction(1, 1, 0, -1, "staging"),
-            new ProtoCodec.CreateTableAction(
-                1, 1, 1, -1, "raw_events", "s3://lake/staging/raw_events/v1.metadata.json")));
-    file = appendTxn(file, txn);
+  }
 
-    List<Note> notes = List.of(
-        new Note(-1, -1, "QUIRK: parent_version = -1 (late-bind sentinel) "
-            + "encodes as a 5-byte varint, not the 10-byte sign-extended form "
-            + "proto3 specifies. See ProtoCodec.writeRawVarint(int) -- the "
-            + "unsigned >>>= 7 on a 32-bit int terminates after 5 iterations."));
-    return new Scenario(
-        "txn-multi-action-with-late-bind",
-        "Two actions in one transaction: CreateNamespace and CreateTable. "
-            + "The CreateTable references the new namespace via "
-            + "namespace_version = -1 (late-bind sentinel). Look for the "
-            + "5-byte negative-int varint -- a quirk of the manual encoder.",
-        file, notes);
+  /** A catalog holding namespace {@code warehouse}, created by an initialized catalog. */
+  private static ProtoCatalogFile warehouse(int seq) {
+    return Log.cas(emptyCatalog(), txn(1000 + seq), mut -> {}, 0L, null)
+        .append(txn(2000 + seq), mut -> mut.createNamespace(WAREHOUSE), null)
+        .state();
   }
 
   /**
-   * Inline table mode (gzip codec): CreateTableInline carries a gzip-encoded
-   * Iceberg TableMetadata in the {@code metadata} bytes field, with the
-   * {@code metadata_codec} enum field set to {@code CODEC_JSON_GZIP}. Shows
-   * the codec discriminator on the wire alongside the gzip-wrapped JSON.
+   * A UUIDv7 transaction id, pinned: {@code n} seconds after the fixtures' epoch, its random bits
+   * seeded by {@code n}.
    */
-  private Scenario scenarioCreateTableInlineGzip() {
-    ProtoCatalogFile catalog = ProtoCatalogFile.builder(LOCATION)
-        .setCatalogUuid(FIXED_CATALOG_UUID)
-        .addNamespace(1, 0, "warehouse", 1)
-        .setNextNamespaceId(2)
-        .setNextTableId(1)
-        .rebuildLookups()
-        .build();
-    byte[] file = encodeFile(catalog);
+  private static UUID txn(int n) {
+    return UuidV7.newUuidV7(PINNED_TS + n * 1000L, new Random(n));
+  }
 
-    TableMetadata meta = realTableMetadataObject(
-        "019000aa-0000-7000-8000-000000000001",
-        "s3://lake/warehouse/orders",
-        Map.of("table-name", "orders", "owner", "commerce-team"),
-        PINNED_TS);
-    byte[] metadataBytes = InlineMetadataCodecs.JSON_GZIP.encode(meta);
+  // ============================================================
+  // Inline table metadata
+  // ============================================================
 
-    UUID txnId = UUID.fromString("01900000-0000-7000-8000-000000000030");
-    ProtoCodec.Transaction txn = new ProtoCodec.Transaction(
-        txnId,
-        List.of(new ProtoCodec.CreateTableInlineAction(
-            1, 1, 1, 1, "orders", metadataBytes,
-            InlineMetadataCodecs.TAG_JSON_GZIP)));
-    file = appendTxn(file, txn);
-
-    StructuralView view = gzipStructuralView(metadataBytes, meta);
-
-    return new Scenario(
-        "create-table-inline-gzip",
-        "CreateTableInline action carrying a gzip-encoded Iceberg "
-            + "TableMetadata (format-version 2, schema with 6 fields, "
-            + "day-partitioned on ts, four table properties). The "
-            + "metadata_codec enum field on the action is CODEC_JSON_GZIP "
-            + "(0). Expand 'Show recovered JSON' to see the decompressed "
-            + "TableMetadata.",
-        file, List.of(), List.of(view));
+  /**
+   * The delta a writer sends for the commit {@code updates} make to {@code table} in {@code
+   * snapshot}: {@link InlineDeltaCodec#computeDelta} of the metadata before and after, as {@code
+   * FileIOCatalog} stages it. Fails if the updates do not commit, or if replay of the computed
+   * delta does not produce the same metadata.
+   */
+  private static byte[] writerDelta(ProtoCatalogFile snapshot, TableIdentifier table,
+      List<InlineDeltaCodec.DeltaUpdate> updates, long lastUpdatedMillis) {
+    byte[] intended = InlineDeltaCodec.encodeDelta(updates, lastUpdatedMillis);
+    TableMetadata after =
+        inlineMetadata(
+            Log.of(snapshot).append(txn(9999), mut -> mut.updateTableInlineDelta(table, intended),
+                null).state(),
+            table);
+    return writerDelta(snapshot, table, after);
   }
 
   /**
-   * Inline table mode (structural codec): CreateTableInline carries a
-   * structurally-encoded Iceberg TableMetadata. The {@code metadata_codec}
-   * enum field is {@code CODEC_STRUCTURAL = 1}, and the bytes are a gzip
-   * wrapper around the columnar layout described in
-   * {@link StructuralInlineMetadataCodec}.
+   * The delta a writer sends to commit {@code after} to {@code table} in {@code snapshot}. Fails
+   * if the commit goes in full mode, or if replay of the delta does not produce {@code after}.
    */
-  private Scenario scenarioCreateTableInlineStructural() {
-    ProtoCatalogFile catalog = ProtoCatalogFile.builder(LOCATION)
-        .setCatalogUuid(FIXED_CATALOG_UUID)
-        .addNamespace(1, 0, "warehouse", 1)
-        .setNextNamespaceId(2)
-        .setNextTableId(1)
-        .rebuildLookups()
-        .build();
-    byte[] file = encodeFile(catalog);
-
-    TableMetadata meta = realTableMetadataObject(
-        "019000cc-0000-7000-8000-000000000001",
-        "s3://lake/warehouse/products",
-        Map.of("table-name", "products", "owner", "catalog-team"),
-        PINNED_TS);
-    byte[] metadataBytes = InlineMetadataCodecs.STRUCTURAL.encode(meta);
-
-    UUID txnId = UUID.fromString("01900000-0000-7000-8000-000000000031");
-    ProtoCodec.Transaction txn = new ProtoCodec.Transaction(
-        txnId,
-        List.of(new ProtoCodec.CreateTableInlineAction(
-            1, 1, 1, 1, "products", metadataBytes,
-            InlineMetadataCodecs.TAG_STRUCTURAL)));
-    file = appendTxn(file, txn);
-
-    // The catalog under test has no snapshots in this fresh-create scenario,
-    // so the structural payload's snap_block / mdlog_block are both empty
-    // (N=0). We still walk the wrapper so the explorer can show what each
-    // segment contains.
-    StructuralView view = structuralStructuralView(metadataBytes, meta);
-
-    return new Scenario(
-        "create-table-inline-structural",
-        "CreateTableInline action carrying a structurally-encoded "
-            + "TableMetadata. The metadata_codec enum field is "
-            + "CODEC_STRUCTURAL (1) and the bytes are a gzip wrapper around "
-            + "the columnar layout described in "
-            + "StructuralInlineMetadataCodec: a varint format_version, then "
-            + "a stripped JSON document (TableMetadata minus snapshots and "
-            + "metadata-log), then snap_block and mdlog_block columnar "
-            + "segments. The 'Show compact form' expander lists each segment "
-            + "so you can see how the bytes are laid out — at the corpus "
-            + "median this layout is 40% smaller than gzip(JSON) and 4-7x "
-            + "faster on lazy-decode workloads (see "
-            + "docs/TM_ENCODING_BENCH_RESULTS.md).",
-        file, List.of(), List.of(view));
+  private static byte[] writerDelta(
+      ProtoCatalogFile snapshot, TableIdentifier table, TableMetadata after) {
+    TableMetadata before = inlineMetadata(snapshot, table);
+    List<InlineDeltaCodec.DeltaUpdate> delta =
+        InlineDeltaCodec.computeDelta(before, after, snapshot.manifestListPrefix(
+            snapshot.tableId(table)));
+    if (delta == null) {
+      throw new AssertionError("computeDelta sends " + table + "'s commit in full mode");
+    }
+    byte[] bytes = InlineDeltaCodec.encodeDelta(delta, after.lastUpdatedMillis());
+    TableMetadata replayed =
+        inlineMetadata(
+            Log.of(snapshot).append(txn(9999), mut -> mut.updateTableInlineDelta(table, bytes),
+                null).state(),
+            table);
+    if (!TableMetadataParser.toJson(replayed).equals(TableMetadataParser.toJson(after))) {
+      throw new AssertionError("the computed delta of " + table + " replays differently:\n"
+          + TableMetadataParser.toJson(after) + "\n" + TableMetadataParser.toJson(replayed)
+          + "\n" + delta);
+    }
+    return bytes;
   }
 
-  /**
-   * Inline delta mode: an UpdateTableInline action carrying a structured
-   * TableMetadataDelta with AddSnapshot (containing CompactSummary),
-   * SetSnapshotRef, and AddManifestDelta with one ManifestFileEntry. This is
-   * the deepest message nesting in the format.
-   */
-  private Scenario scenarioUpdateTableInlineDelta() {
-    TableMetadata baseMeta = realTableMetadataObject(
-        "019000bb-0000-7000-8000-000000000001",
-        "s3://lake/warehouse/events",
-        Map.of("table-name", "events", "owner", "telemetry-team"),
-        PINNED_TS);
-    // gzip-encode so the on-disk bytes match the codec field (default = gzip)
-    // and the visualizer can recover the JSON via the per-record codec.
-    byte[] baseMetadata = InlineMetadataCodecs.JSON_GZIP.encode(baseMeta);
+  /** An append moving main to it, {@code timestampDeltaMs} after the base's last update. */
+  private static List<InlineDeltaCodec.DeltaUpdate> appendToMain(
+      long snapshotId, Long parentId, String manifestList, long timestampDeltaMs) {
+    return List.of(append(snapshotId, parentId, manifestList, timestampDeltaMs), main(snapshotId));
+  }
 
-    ProtoCatalogFile catalog = ProtoCatalogFile.builder(LOCATION)
-        .setCatalogUuid(FIXED_CATALOG_UUID)
-        .addNamespace(1, 0, "warehouse", 1)
-        .addInlineTable(1, 1, "events", 1, baseMetadata,
-            "s3://lake/warehouse/events/metadata/snap-")
-        .setNextNamespaceId(2)
-        .setNextTableId(2)
-        .rebuildLookups()
-        .build();
-    byte[] file = encodeFile(catalog);
-
-    long snapshotId = 0x4f6c4a8e1234abcdL;
+  /** An append snapshot of format version 2: no row lineage. */
+  private static InlineDeltaCodec.AddSnapshotUpdate append(
+      long snapshotId, Long parentId, String manifestList, long timestampDeltaMs) {
     Map<String, String> summary = new LinkedHashMap<>();
     summary.put("operation", "append");
     summary.put("added-data-files", "1");
     summary.put("added-records", "1024");
+    summary.put("total-data-files", "1");
+    summary.put("total-records", "1024");
+    return new InlineDeltaCodec.AddSnapshotUpdate(
+        snapshotId, manifestList, summary, timestampDeltaMs, null, null, parentId, null, null);
+  }
 
-    InlineDeltaCodec.AddSnapshotUpdate addSnap =
-        new InlineDeltaCodec.AddSnapshotUpdate(
-            snapshotId, "", summary, 60_000L, 0, 1024L, null, null, null);
-    InlineDeltaCodec.SetSnapshotRefUpdate setRef =
-        new InlineDeltaCodec.SetSnapshotRefUpdate(
-            "main", snapshotId, "branch", 0, 0L, 0L);
-    ProtoCodec.DecodedManifestFile manifest = new ProtoCodec.DecodedManifestFile(
-        "s3://lake/warehouse/events/metadata/snap-m0.avro",
-        4096L,
-        0,
-        0,
-        1L,
-        1L,
-        snapshotId,
-        1,
-        0,
-        0,
-        1024L,
-        0L,
-        0L,
-        Collections.emptyList(),
-        null,
-        null);
-    InlineDeltaCodec.AddManifestUpdate addManifest =
-        new InlineDeltaCodec.AddManifestUpdate(
-            snapshotId, manifest, "s3://lake/warehouse/events/metadata/snap-");
+  private static InlineDeltaCodec.SetSnapshotRefUpdate main(long snapshotId) {
+    return new InlineDeltaCodec.SetSnapshotRefUpdate("main", snapshotId, "branch", 0, 0L, 0L);
+  }
 
-    byte[] deltaBytes = InlineDeltaCodec.encodeDelta(
-        List.of(addSnap, setRef, addManifest), 1746518460000L);
+  /** A data manifest of one file in day {@code day} of the demo spec. */
+  private static ManifestFile manifest(String path, long snapshotId, long sequenceNumber,
+      int day) {
+    ByteBuffer bound = ByteBuffer.allocate(4).order(java.nio.ByteOrder.LITTLE_ENDIAN).putInt(0, day);
+    return new ProtoCodec.DecodedManifestFile(
+        path, 6_144L, 0, 0, sequenceNumber, sequenceNumber, snapshotId,
+        1, 0, 0, 1_024L, 0L, 0L,
+        List.of(new GenericPartitionFieldSummary(false, false, bound, bound)),
+        null, null);
+  }
 
-    UUID txnId = UUID.fromString("01900000-0000-7000-8000-000000000040");
-    ProtoCodec.Transaction txn = new ProtoCodec.Transaction(
-        txnId,
-        List.of(ProtoCodec.UpdateTableInlineAction.delta(1, 1, deltaBytes)));
-    file = appendTxn(file, txn);
-
-    return new Scenario(
-        "update-table-inline-delta",
-        "An UpdateTableInline action whose payload is a structured "
-            + "TableMetadataDelta. The delta carries an AddSnapshot (with a "
-            + "nested CompactSummary), a SetSnapshotRef pointing 'main' at "
-            + "the new snapshot, and an AddManifestDelta with one "
-            + "ManifestFileEntry. Look for fixed64 (snapshot_id), sint64 "
-            + "(timestamp_delta_ms), and the deepest message nesting in the "
-            + "format. The InlineTable.metadata field in the checkpoint "
-            + "carries the pre-delta base TableMetadata (gzip-encoded); "
-            + "click it to see the recovered JSON.",
-        file, List.of(),
-        List.of(gzipStructuralView(baseMetadata, baseMeta)));
+  private static List<String> paths(List<ManifestFile> manifests) {
+    return manifests.stream().map(ManifestFile::path).collect(Collectors.toList());
   }
 
   /**
-   * Two pointer-mode tables A and B in the same namespace, then three
-   * appended UpdateTable transactions:
-   * <ol>
-   *   <li>T1 updates A — succeeds, A advances to v=2.</li>
-   *   <li>T2 wants to update A and B together but captured A.version=1 —
-   *       A's verify fails (current is now 2), the entire txn is rejected
-   *       and B is NOT updated either (all-or-nothing).</li>
-   *   <li>T3 retries with A.version=2 — both actions apply.</li>
-   * </ol>
-   * Demonstrates atomic multi-table commits and version-based optimistic
-   * conflict detection.
+   * {@code table}'s metadata as replay decodes it to apply a delta: under the synthetic location
+   * that the committed metadata's log then names as its previous file.
    */
-  private Scenario scenarioPointerMultiTableConflictRetry() {
-    ProtoCatalogFile catalog = ProtoCatalogFile.builder(LOCATION)
-        .setCatalogUuid(FIXED_CATALOG_UUID)
-        .addNamespace(1, 0, "warehouse", 1)
-        .addTable(1, 1, "A", 1, "s3://lake/warehouse/A/v1.metadata.json")
-        .addTable(2, 1, "B", 1, "s3://lake/warehouse/B/v1.metadata.json")
-        .setNextNamespaceId(2)
-        .setNextTableId(3)
-        .rebuildLookups()
-        .build();
-    byte[] file = encodeFile(catalog);
-
-    UUID t1Id = UUID.fromString("01900000-0000-7000-8000-000000000071");
-    UUID t2Id = UUID.fromString("01900000-0000-7000-8000-000000000072");
-    UUID t3Id = UUID.fromString("01900000-0000-7000-8000-000000000073");
-
-    ProtoCodec.Transaction t1 = new ProtoCodec.Transaction(
-        t1Id,
-        List.of(new ProtoCodec.UpdateTableLocationAction(
-            1, 1, "s3://lake/warehouse/A/v2.metadata.json")));
-    ProtoCodec.Transaction t2 = new ProtoCodec.Transaction(
-        t2Id,
-        List.of(
-            new ProtoCodec.UpdateTableLocationAction(
-                1, 1, "s3://lake/warehouse/A/v3.metadata.json"),  // STALE: captured v=1
-            new ProtoCodec.UpdateTableLocationAction(
-                2, 1, "s3://lake/warehouse/B/v2.metadata.json")));
-    ProtoCodec.Transaction t3 = new ProtoCodec.Transaction(
-        t3Id,
-        List.of(
-            new ProtoCodec.UpdateTableLocationAction(
-                1, 2, "s3://lake/warehouse/A/v3.metadata.json"),  // RETRY: captured v=2
-            new ProtoCodec.UpdateTableLocationAction(
-                2, 1, "s3://lake/warehouse/B/v2.metadata.json")));
-
-    int[] r1 = new int[2];
-    int[] r2 = new int[2];
-    int[] r3 = new int[2];
-    file = appendTxnTrack(file, t1, r1);
-    file = appendTxnTrack(file, t2, r2);
-    file = appendTxnTrack(file, t3, r3);
-
-    List<Note> notes = List.of(
-        new Note(r1[0], r1[1], "T1: UpdateTableLocation(A, v=1) — APPLIES. A advances to v=2."),
-        new Note(r2[0], r2[1], "T2: UpdateTableLocation(A, v=1) + UpdateTableLocation(B, v=1) — REJECTED. "
-            + "A's captured version (1) no longer matches current (2) after T1, so the entire transaction "
-            + "fails verify(); B is also not updated (all-or-nothing). The bytes still sit in the log on "
-            + "disk; replay silently skips them."),
-        new Note(r3[0], r3[1], "T3: UpdateTableLocation(A, v=2) + UpdateTableLocation(B, v=1) — APPLIES. "
-            + "Same intent as T2, retried with A's correct current version."));
-    return new Scenario(
-        "pointer-multi-table-conflict-retry",
-        "Two pointer-mode tables A and B in one namespace. Three appended transactions show how "
-            + "version-based conflict detection and atomic multi-table commits interact: T1 succeeds, "
-            + "T2 (multi-table) is rejected because A's captured version is stale, then T3 (the retry) "
-            + "applies both actions. T2's bytes remain in the log — read replay skips them silently.",
-        file, notes);
+  private static TableMetadata replayBase(ProtoCatalogFile state, TableIdentifier table) {
+    int id = state.tableId(table);
+    byte[] bytes = state.inlineMetadata(id);
+    return InlineMetadataCodecs.byTag(state.inlineMetadataCodec(id))
+        .decodeFull(bytes, "inline://#" + Integer.toHexString(Arrays.hashCode(bytes)));
   }
 
-  /**
-   * Same A/B two-table scenario but for inline tables. Each
-   * {@code UpdateTableInline} carries a real-shape data-commit delta:
-   * an {@code AddSnapshot} plus a {@code SetSnapshotRef} pointing the
-   * {@code main} branch at the new snapshot. Conflict detection is
-   * identical to the pointer variant: T2 captures A.v=1, fails verify
-   * after T1, T3 retries with A.v=2.
-   */
-  private Scenario scenarioInlineMultiTableConflictRetry() {
-    // Seed each table at a distinct UUID; deltas only carry the
-    // AddSnapshot/SetSnapshotRef pair, mirroring the production
-    // (checkpoint + delta) replay model. Inline base bytes are encoded with
-    // the gzip codec (matches the default codec recorded by the catalog when
-    // the explicit codec field is absent).
-    TableMetadata aMeta = realTableMetadataObject(
-        "019000a1-0000-7000-8000-000000000001",
-        "s3://lake/warehouse/A",
-        Map.of("table-name", "A"),
-        PINNED_TS);
-    TableMetadata bMeta = realTableMetadataObject(
-        "019000b1-0000-7000-8000-000000000001",
-        "s3://lake/warehouse/B",
-        Map.of("table-name", "B"),
-        PINNED_TS);
-    byte[] aV1 = InlineMetadataCodecs.JSON_GZIP.encode(aMeta);
-    byte[] bV1 = InlineMetadataCodecs.JSON_GZIP.encode(bMeta);
-
-    long aT1Snap = 0x1111111111111111L;
-    long aT2StaleSnap = 0x2222222222222222L;
-    long bT2StaleSnap = 0x2222222222222223L;
-    long aT3Snap = 0x3333333333333333L;
-    long bT3Snap = 0x3333333333333334L;
-
-    byte[] aT1Delta = encodeAppendSnapshotDelta(
-        aT1Snap, "T1.avro", PINNED_TS, PINNED_TS_AFTER_T1, /* parentSnapshotId */ null);
-    byte[] aT2StaleDelta = encodeAppendSnapshotDelta(
-        aT2StaleSnap, "T2-stale.avro", PINNED_TS, PINNED_TS_AFTER_T2, null);
-    byte[] bT2StaleDelta = encodeAppendSnapshotDelta(
-        bT2StaleSnap, "T2-stale.avro", PINNED_TS, PINNED_TS_AFTER_T2, null);
-    byte[] aT3Delta = encodeAppendSnapshotDelta(
-        aT3Snap, "T3.avro", PINNED_TS_AFTER_T1, PINNED_TS_AFTER_T3,
-        /* parentSnapshotId */ aT1Snap);
-    byte[] bT3Delta = encodeAppendSnapshotDelta(
-        bT3Snap, "T3.avro", PINNED_TS, PINNED_TS_AFTER_T3, null);
-
-    ProtoCatalogFile catalog = ProtoCatalogFile.builder(LOCATION)
-        .setCatalogUuid(FIXED_CATALOG_UUID)
-        .addNamespace(1, 0, "warehouse", 1)
-        .addInlineTable(1, 1, "A", 1, aV1, "s3://lake/warehouse/A/m/snap-")
-        .addInlineTable(2, 1, "B", 1, bV1, "s3://lake/warehouse/B/m/snap-")
-        .setNextNamespaceId(2)
-        .setNextTableId(3)
-        .rebuildLookups()
-        .build();
-    byte[] file = encodeFile(catalog);
-
-    UUID t1Id = UUID.fromString("01900000-0000-7000-8000-000000000081");
-    UUID t2Id = UUID.fromString("01900000-0000-7000-8000-000000000082");
-    UUID t3Id = UUID.fromString("01900000-0000-7000-8000-000000000083");
-
-    ProtoCodec.Transaction t1 = new ProtoCodec.Transaction(
-        t1Id,
-        List.of(ProtoCodec.UpdateTableInlineAction.delta(1, 1, aT1Delta)));
-    ProtoCodec.Transaction t2 = new ProtoCodec.Transaction(
-        t2Id,
-        List.of(
-            ProtoCodec.UpdateTableInlineAction.delta(1, 1, aT2StaleDelta),  // STALE
-            ProtoCodec.UpdateTableInlineAction.delta(2, 1, bT2StaleDelta)));
-    ProtoCodec.Transaction t3 = new ProtoCodec.Transaction(
-        t3Id,
-        List.of(
-            ProtoCodec.UpdateTableInlineAction.delta(1, 2, aT3Delta),  // RETRY
-            ProtoCodec.UpdateTableInlineAction.delta(2, 1, bT3Delta)));
-
-    int[] r1 = new int[2];
-    int[] r2 = new int[2];
-    int[] r3 = new int[2];
-    file = appendTxnTrack(file, t1, r1);
-    file = appendTxnTrack(file, t2, r2);
-    file = appendTxnTrack(file, t3, r3);
-
-    List<Note> notes = List.of(
-        new Note(r1[0], r1[1], "T1: UpdateTableInline(A, v=1, delta) — APPLIES. "
-            + "Delta carries an AddSnapshot + SetSnapshotRef('main', S1A). A advances to v=2."),
-        new Note(r2[0], r2[1], "T2: UpdateTableInline(A, v=1) + UpdateTableInline(B, v=1) — REJECTED. "
-            + "Multi-table all-or-nothing: A's captured v=1 no longer matches current v=2 after T1, "
-            + "so the entire transaction fails verify(). B's delta (a perfectly valid AddSnapshot) "
-            + "never lands. The record stays in the log until the next CAS-mode commit reclaims the space."),
-        new Note(r3[0], r3[1], "T3: UpdateTableInline(A, v=2) + UpdateTableInline(B, v=1) — APPLIES. "
-            + "Each table's AddSnapshot delta lands atomically; A's main now points at S3A "
-            + "(parent=S1A), B's at S3B."));
-    return new Scenario(
-        "inline-multi-table-conflict-retry",
-        "Inline-mode counterpart of pointer-multi-table-conflict-retry. Each transaction is a "
-            + "real-shape data commit: a TableMetadataDelta with an AddSnapshot + SetSnapshotRef "
-            + "pinning the new snapshot to main. The structural shape is identical to the pointer "
-            + "scenario except UpdateTableInline (Action field 9) replaces UpdateTableLocation "
-            + "(Action field 7), and the payload is a length-delimited delta message instead of a "
-            + "metadata-location string. Compare T2's wasted bytes between the two scenarios: in "
-            + "pointer mode T2 references already-written metadata.json files; in inline mode T2's "
-            + "delta is the only place its rejected snapshots appeared on the wire. The "
-            + "InlineTable.metadata fields for both A and B in the checkpoint are gzip-encoded; "
-            + "click either to see the recovered JSON.",
-        file, notes,
-        List.of(
-            gzipStructuralView(aV1, aMeta),
-            gzipStructuralView(bV1, bMeta)));
+  private static TableMetadata inlineMetadata(ProtoCatalogFile state, TableIdentifier table) {
+    int id = state.tableId(table);
+    return InlineMetadataCodecs.byTag(state.inlineMetadataCodec(id))
+        .decodeFull(state.inlineMetadata(id), null);
   }
-
-  /**
-   * Builds a {@code TableMetadataDelta} bytes payload representing a typical
-   * data commit on an inline table: an {@code AddSnapshot} plus a
-   * {@code SetSnapshotRef} pointing the {@code main} branch at the new
-   * snapshot. The {@code manifest_list_suffix} is appended to the table's
-   * stored {@code manifest_list_prefix} on replay; passing a real path
-   * suffix (e.g., {@code "T1.avro"}) produces a regular external
-   * manifest-list location, not an inline-ML sentinel.
-   */
-  private static byte[] encodeAppendSnapshotDelta(
-      long snapshotId, String manifestListSuffix,
-      long baseLastUpdatedMs, long deltaLastUpdatedMs, Long parentSnapshotId) {
-    Map<String, String> summary = new LinkedHashMap<>();
-    summary.put("operation", "append");
-    summary.put("added-data-files", "1");
-    summary.put("added-records", "1024");
-    long timestampDeltaMs = deltaLastUpdatedMs - baseLastUpdatedMs;
-    InlineDeltaCodec.AddSnapshotUpdate addSnap =
-        new InlineDeltaCodec.AddSnapshotUpdate(
-            snapshotId, manifestListSuffix, summary,
-            timestampDeltaMs, /* schemaId */ 0, /* addedRows */ 1024L,
-            parentSnapshotId, /* firstRowId */ null, /* keyId */ null);
-    InlineDeltaCodec.SetSnapshotRefUpdate setRef =
-        new InlineDeltaCodec.SetSnapshotRefUpdate(
-            "main", snapshotId, "branch", 0, 0L, 0L);
-    return InlineDeltaCodec.encodeDelta(List.of(addSnap, setRef), deltaLastUpdatedMs);
-  }
-
-  // ============================================================
-  // Real Iceberg TableMetadata helpers
-  //
-  // The catalog format treats inline table metadata as opaque length-
-  // delimited bytes -- it never parses the JSON. Most catalog tests
-  // therefore use minimal "{}"-style placeholders. The format-explorer
-  // visualizer is different: developers open it precisely to see what
-  // realistic payloads look like on the wire. So we build genuine Iceberg
-  // TableMetadata via TableMetadata.buildFromEmpty(), serialize via
-  // TableMetadataParser.toJson, and pin both the UUID and last-updated-ms
-  // so fixture regenerations produce stable bytes.
-  // ============================================================
-
-  private static final long PINNED_TS = 1_746_518_400_000L;     // 2025-05-06 12:00:00Z
-  private static final long PINNED_TS_AFTER_T1 = PINNED_TS + 60_000L;
-  private static final long PINNED_TS_AFTER_T2 = PINNED_TS + 120_000L;
-  private static final long PINNED_TS_AFTER_T3 = PINNED_TS + 180_000L;
 
   private static Schema demoSchema() {
     return new Schema(
@@ -790,511 +914,134 @@ public class FormatExplorerFixtures {
         Types.NestedField.optional(6, "payload", Types.StringType.get()));
   }
 
-  /** Real Iceberg TableMetadata for a fresh table; deterministic JSON bytes. */
-  private static byte[] realTableMetadata(
-      String tableUuid, String location, Map<String, String> extraProps, long timestamp) {
-    return TableMetadataParser
-        .toJson(realTableMetadataObject(tableUuid, location, extraProps, timestamp))
-        .getBytes(StandardCharsets.UTF_8);
-  }
-
-  /** Same shape as {@link #realTableMetadata} but returns the TableMetadata object. */
-  private static TableMetadata realTableMetadataObject(
-      String tableUuid, String location, Map<String, String> extraProps, long timestamp) {
+  /**
+   * A table's first metadata, format version 2, day-partitioned on ts, with the UUID and
+   * last-updated-ms pinned so the encoding is the same on every run.
+   */
+  private static TableMetadata tableMetadata(
+      String tableUuid, String location, Map<String, String> extraProps) {
     Schema schema = demoSchema();
-    PartitionSpec spec = PartitionSpec.builderFor(schema).day("ts").build();
     Map<String, String> props = new LinkedHashMap<>();
     props.put("write.format.default", "parquet");
     props.put("write.parquet.compression-codec", "zstd");
     props.put("write.target-file-size-bytes", "536870912");
     props.put("owner", "data-platform");
-    if (extraProps != null) {
-      props.putAll(extraProps);
-    }
+    props.putAll(extraProps);
     return TableMetadata.buildFromEmpty()
         .setLocation(location)
         .setCurrentSchema(schema, /* lastColumnId */ 7)
-        .addPartitionSpec(spec)
+        .addPartitionSpec(PartitionSpec.builderFor(schema).day("ts").build())
         .addSortOrder(SortOrder.unsorted())
         .setProperties(props)
         .assignUUID(tableUuid)
-        .setLastUpdatedMillis(timestamp)
+        .setLastUpdatedMillis(PINNED_TS)
         .discardChanges()
         .build();
   }
 
-  /**
-   * Builds a {@link StructuralView} for a gzip-encoded inline-TM record:
-   * recovered JSON plus a single segment summarising the wrapped payload
-   * (gzip is one logical segment, so the compact-form table is one row).
-   */
-  private static StructuralView gzipStructuralView(byte[] gzipBytes, TableMetadata meta) {
-    String recoveredJson = TableMetadataParser.toJson(meta);
-    String label = "gzip-wrapped JSON (decompresses to " + recoveredJson.length()
-        + " bytes of TableMetadata)";
+  /** The explorer's view of gzip-codec metadata: the JSON, and the gzip envelope as a segment. */
+  private static StructuralView gzipView(byte[] gzipBytes, TableMetadata meta) {
+    String json = TableMetadataParser.toJson(meta);
     return new StructuralView(
         gzipBytes,
-        prettyJson(recoveredJson),
-        List.of(new StructuralSegment(label, gzipBytes)));
+        prettyJson(json),
+        List.of(new StructuralSegment(
+            "gzip-wrapped JSON (decompresses to " + json.length() + " bytes of TableMetadata)",
+            gzipBytes)));
   }
 
-  /**
-   * Builds a {@link StructuralView} for a structural-encoded inline-TM
-   * record: recovered JSON plus a labelled segment per top-level field of
-   * the columnar wire layout.
-   */
-  private static StructuralView structuralStructuralView(byte[] structBytes, TableMetadata meta) {
+  /** The explorer's view of structural-codec metadata: the JSON, and a segment per field. */
+  private static StructuralView structuralView(byte[] structBytes, TableMetadata meta) {
     return new StructuralView(
-        structBytes,
-        prettyJson(TableMetadataParser.toJson(meta)),
-        walkStructuralPayload(structBytes));
+        structBytes, prettyJson(TableMetadataParser.toJson(meta)), structuralSegments(structBytes));
   }
 
-  /**
-   * Pretty-prints a JSON document for the explorer's "Show recovered JSON"
-   * pane. Falls back to the raw input if the parse fails (defensive — the
-   * scenarios produce valid JSON).
-   */
   private static String prettyJson(String json) {
     try {
       com.fasterxml.jackson.databind.ObjectMapper mapper =
           new com.fasterxml.jackson.databind.ObjectMapper();
-      return mapper.writerWithDefaultPrettyPrinter()
-          .writeValueAsString(mapper.readTree(json));
+      return mapper.writerWithDefaultPrettyPrinter().writeValueAsString(mapper.readTree(json));
     } catch (IOException e) {
       return json;
     }
   }
 
   /**
-   * Walks the (gzip-decompressed) structural payload and emits a sequence of
-   * labelled segments matching {@link StructuralInlineMetadataCodec}'s wire
-   * layout. The decompressed buffer starts with:
-   *
-   * <pre>{@code
-   *   varint format_version
-   *   varint json_len
-   *   bytes  stripped_json
-   *   varint snap_block_len
-   *   bytes  snap_block
-   *   varint mdlog_block_len
-   *   bytes  mdlog_block
-   * }</pre>
-   *
-   * <p>For the bench-targeted purpose of teaching the format, this walker
-   * goes one level deep into the wrapper (segments per top-level field) and
-   * does not crack open snap_block or mdlog_block beyond reporting their
-   * sizes. That's enough to show readers what structural saves bytes on.
+   * The top-level segments of a structural payload ({@link StructuralInlineMetadataCodec}): after
+   * gunzip, a varint layout version, the JSON without snapshots and metadata log, then the
+   * snapshot and metadata-log blocks, each after a varint length. The blocks are not opened.
    */
-  private static List<StructuralSegment> walkStructuralPayload(byte[] gzipped) {
-    byte[] inner = gunzip(gzipped);
+  private static List<StructuralSegment> structuralSegments(byte[] gzipped) {
+    byte[] inner = InlineMetadataIO.gunzip(gzipped);
     List<StructuralSegment> out = new ArrayList<>();
-    int pos = 0;
-
-    int formatVerStart = pos;
-    long formatVer = readVarint64(inner, pos);
-    pos += varintSize(formatVer);
-    out.add(new StructuralSegment(
-        "format_version (varint = " + formatVer + ")",
-        Arrays.copyOfRange(inner, formatVerStart, pos)));
-
-    int jsonLenStart = pos;
-    long jsonLen = readVarint64(inner, pos);
-    pos += varintSize(jsonLen);
-    out.add(new StructuralSegment(
-        "json_len (varint = " + jsonLen + ")",
-        Arrays.copyOfRange(inner, jsonLenStart, pos)));
-
-    int jsonStart = pos;
-    pos += (int) jsonLen;
-    out.add(new StructuralSegment(
-        "stripped_json (TableMetadata minus snapshots and metadata-log)",
-        Arrays.copyOfRange(inner, jsonStart, pos)));
-
-    int snapLenStart = pos;
-    long snapLen = readVarint64(inner, pos);
-    pos += varintSize(snapLen);
-    out.add(new StructuralSegment(
-        "snap_block_len (varint = " + snapLen + ")",
-        Arrays.copyOfRange(inner, snapLenStart, pos)));
-
-    int snapStart = pos;
-    pos += (int) snapLen;
-    out.add(new StructuralSegment(
-        snapLen == 1
+    int[] pos = {0};
+    long version = segmentVarint(inner, pos, out, "format_version");
+    if (version != StructuralInlineMetadataCodec.FORMAT_VERSION) {
+      throw new AssertionError("structural layout version " + version);
+    }
+    long jsonLength = segmentVarint(inner, pos, out, "json_len");
+    segment(inner, pos, (int) jsonLength, out,
+        "stripped_json (TableMetadata minus snapshots and metadata-log)");
+    long snapLength = segmentVarint(inner, pos, out, "snap_block_len");
+    segment(inner, pos, (int) snapLength, out,
+        snapLength == 1
             ? "snap_block (empty: N=0)"
-            : "snap_block (columnar: snapshot_ids, parent_offsets, summaries, "
-                + "timestamp/sequence deltas, schema-id RLE, manifest-list "
-                + "template paths)",
-        Arrays.copyOfRange(inner, snapStart, pos)));
-
-    int mdlogLenStart = pos;
-    long mdlogLen = readVarint64(inner, pos);
-    pos += varintSize(mdlogLen);
-    out.add(new StructuralSegment(
-        "mdlog_block_len (varint = " + mdlogLen + ")",
-        Arrays.copyOfRange(inner, mdlogLenStart, pos)));
-
-    int mdlogStart = pos;
-    pos += (int) mdlogLen;
-    out.add(new StructuralSegment(
-        mdlogLen == 1
+            : "snap_block (columnar: snapshot ids, parents, summaries, times, schema ids, "
+                + "manifest-list templates)");
+    long logLength = segmentVarint(inner, pos, out, "mdlog_block_len");
+    segment(inner, pos, (int) logLength, out,
+        logLength == 1
             ? "mdlog_block (empty: N=0)"
-            : "mdlog_block (columnar: timestamp deltas + path templates for "
-                + "previous-metadata-log entries)",
-        Arrays.copyOfRange(inner, mdlogStart, pos)));
-
+            : "mdlog_block (columnar: times and path templates of the metadata log)");
     return out;
   }
 
-  private static long readVarint64(byte[] buf, int pos) {
-    long result = 0;
+  private static long segmentVarint(byte[] buf, int[] pos, List<StructuralSegment> out,
+      String label) {
+    int start = pos[0];
+    long value = 0;
     int shift = 0;
-    while (true) {
-      byte b = buf[pos++];
-      result |= ((long) (b & 0x7F)) << shift;
-      if ((b & 0x80) == 0) return result;
+    byte b;
+    do {
+      b = buf[pos[0]++];
+      value |= (long) (b & 0x7F) << shift;
       shift += 7;
-    }
+    } while ((b & 0x80) != 0);
+    out.add(new StructuralSegment(label + " (varint = " + value + ")",
+        Arrays.copyOfRange(buf, start, pos[0])));
+    return value;
   }
 
-  private static int varintSize(long v) {
-    int size = 1;
-    while ((v & ~0x7FL) != 0L) {
-      size++;
-      v >>>= 7;
-    }
-    return size;
+  private static void segment(byte[] buf, int[] pos, int length, List<StructuralSegment> out,
+      String label) {
+    out.add(new StructuralSegment(label, Arrays.copyOfRange(buf, pos[0], pos[0] + length)));
+    pos[0] += length;
   }
 
-  private static byte[] gunzip(byte[] in) {
-    try (java.util.zip.GZIPInputStream gz =
-            new java.util.zip.GZIPInputStream(new java.io.ByteArrayInputStream(in));
-        ByteArrayOutputStream out = new ByteArrayOutputStream(in.length * 4)) {
-      byte[] buf = new byte[8192];
-      int n;
-      while ((n = gz.read(buf)) > 0) {
-        out.write(buf, 0, n);
-      }
-      return out.toByteArray();
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
+  private static void expect(Object actual, Object expected, String what) {
+    Object a = actual instanceof Number && expected instanceof Number
+        ? (Object) ((Number) actual).longValue() : actual;
+    Object e = actual instanceof Number && expected instanceof Number
+        ? (Object) ((Number) expected).longValue() : expected;
+    if (!java.util.Objects.equals(a, e)) {
+      throw new AssertionError(what + ": expected " + expected + ", got " + actual);
     }
-  }
-
-  // ============================================================
-  // File / transaction byte construction
-  // ============================================================
-
-  private static byte[] encodeFile(ProtoCatalogFile catalog) {
-    try {
-      ByteArrayOutputStream out = new ByteArrayOutputStream();
-      out.write(ProtoCatalogFormat.MAGIC);
-      writeBigEndianInt(out, ProtoCatalogFormat.FORMAT_VERSION);
-      ProtoCatalogFormat.ProtoIdManager idManager = new ProtoCatalogFormat.ProtoIdManager();
-      idManager.setGlobals(catalog.nextNamespaceId(), catalog.nextTableId());
-      ProtoCatalogFormat.Mut mut = new ProtoCatalogFormat.Mut(catalog);
-      byte[] checkpoint = ProtoCodec.encodeCheckpoint(catalog, mut, idManager);
-      writeVarint(out, checkpoint.length);
-      out.write(checkpoint);
-      return out.toByteArray();
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
-    }
-  }
-
-  private static byte[] appendTxn(byte[] file, ProtoCodec.Transaction txn) {
-    return appendTxnTrack(file, txn, null);
-  }
-
-  /**
-   * Appends a transaction record and (optionally) records its byte range
-   * (varint length + body, half-open) into {@code outRange[0..1]} for use
-   * in scenario notes.
-   */
-  private static byte[] appendTxnTrack(byte[] file, ProtoCodec.Transaction txn, int[] outRange) {
-    try {
-      byte[] body = ProtoCodec.encodeTransaction(txn);
-      ByteArrayOutputStream out = new ByteArrayOutputStream();
-      out.write(file);
-      int recordStart = file.length;
-      writeVarint(out, body.length);
-      out.write(body);
-      byte[] result = out.toByteArray();
-      if (outRange != null) {
-        outRange[0] = recordStart;
-        outRange[1] = result.length;
-      }
-      return result;
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
-    }
-  }
-
-  private static void writeBigEndianInt(ByteArrayOutputStream out, int v) {
-    out.write((v >>> 24) & 0xFF);
-    out.write((v >>> 16) & 0xFF);
-    out.write((v >>> 8) & 0xFF);
-    out.write(v & 0xFF);
-  }
-
-  private static void writeVarint(ByteArrayOutputStream out, int v) {
-    while ((v & ~0x7F) != 0) {
-      out.write((v & 0x7F) | 0x80);
-      v >>>= 7;
-    }
-    out.write(v);
-  }
-
-  // ============================================================
-  // Proto schema parser (text-driven; ~1 source file)
-  // ============================================================
-
-  static SchemaDescriptor parseProto(Path protoPath) throws IOException {
-    String src = Files.readString(protoPath);
-    String stripped = stripBlockComments(src);
-    String[] lines = stripped.split("\n");
-
-    Map<String, MessageDef> messages = new LinkedHashMap<>();
-    Map<String, EnumDef> enums = new LinkedHashMap<>();
-
-    Pattern messageStart = Pattern.compile("^\\s*message\\s+(\\w+)\\s*\\{");
-    Pattern enumStart = Pattern.compile("^\\s*enum\\s+(\\w+)\\s*\\{");
-    Pattern oneofStart = Pattern.compile("^\\s*oneof\\s+(\\w+)\\s*\\{");
-    Pattern fieldDecl = Pattern.compile(
-        "^\\s*(repeated\\s+)?([\\w.]+)\\s+(\\w+)\\s*=\\s*(\\d+)\\s*;");
-    Pattern mapDecl = Pattern.compile(
-        "^\\s*map<\\s*([\\w.]+)\\s*,\\s*([\\w.]+)\\s*>\\s+(\\w+)\\s*=\\s*(\\d+)\\s*;");
-    Pattern enumValue = Pattern.compile("^\\s*(\\w+)\\s*=\\s*(\\d+)\\s*;");
-    Pattern closeBrace = Pattern.compile("^\\s*\\}");
-
-    String currentMessage = null;
-    String currentEnum = null;
-    String currentOneof = null;
-    StringBuilder pendingComment = new StringBuilder();
-
-    for (String rawLine : lines) {
-      String line = rawLine;
-      int slash = line.indexOf("//");
-      String commentTail = slash >= 0 ? line.substring(slash + 2).trim() : null;
-      String code = slash >= 0 ? line.substring(0, slash) : line;
-      String trimmed = code.trim();
-
-      if (trimmed.isEmpty()) {
-        if (commentTail != null && !commentTail.isEmpty()) {
-          if (pendingComment.length() > 0) {
-            pendingComment.append(' ');
-          }
-          pendingComment.append(commentTail);
-        }
-        continue;
-      }
-
-      Matcher m;
-      if ((m = messageStart.matcher(code)).find()) {
-        currentMessage = m.group(1);
-        messages.put(currentMessage, new MessageDef(currentMessage));
-        pendingComment.setLength(0);
-        continue;
-      }
-      if ((m = enumStart.matcher(code)).find()) {
-        currentEnum = m.group(1);
-        enums.put(currentEnum, new EnumDef(currentEnum));
-        pendingComment.setLength(0);
-        continue;
-      }
-      if ((m = oneofStart.matcher(code)).find() && currentMessage != null) {
-        currentOneof = m.group(1);
-        pendingComment.setLength(0);
-        continue;
-      }
-      if (closeBrace.matcher(trimmed).find()) {
-        if (currentOneof != null) {
-          currentOneof = null;
-        } else if (currentEnum != null) {
-          currentEnum = null;
-        } else {
-          currentMessage = null;
-        }
-        pendingComment.setLength(0);
-        continue;
-      }
-
-      if (currentEnum != null && (m = enumValue.matcher(code)).find()) {
-        enums.get(currentEnum).values.add(
-            new EnumValue(m.group(1), Integer.parseInt(m.group(2))));
-        pendingComment.setLength(0);
-        continue;
-      }
-
-      if (currentMessage != null) {
-        if ((m = mapDecl.matcher(code)).find()) {
-          String type = "map<" + m.group(1) + "," + m.group(2) + ">";
-          int number = Integer.parseInt(m.group(4));
-          String comment = consumeComment(pendingComment, commentTail);
-          messages.get(currentMessage).fields.add(
-              new FieldDef(number, m.group(3), type, false, currentOneof, comment));
-          continue;
-        }
-        if ((m = fieldDecl.matcher(code)).find()) {
-          boolean repeated = m.group(1) != null;
-          String type = m.group(2);
-          String name = m.group(3);
-          int number = Integer.parseInt(m.group(4));
-          String comment = consumeComment(pendingComment, commentTail);
-          messages.get(currentMessage).fields.add(
-              new FieldDef(number, name, type, repeated, currentOneof, comment));
-          continue;
-        }
-      }
-
-      if (commentTail != null && !commentTail.isEmpty()) {
-        if (pendingComment.length() > 0) {
-          pendingComment.append(' ');
-        }
-        pendingComment.append(commentTail);
-      } else {
-        pendingComment.setLength(0);
-      }
-    }
-
-    return new SchemaDescriptor(messages, enums);
-  }
-
-  private static String consumeComment(StringBuilder pending, String tail) {
-    StringBuilder sb = new StringBuilder();
-    if (pending.length() > 0) {
-      sb.append(pending);
-      pending.setLength(0);
-    }
-    if (tail != null && !tail.isEmpty()) {
-      if (sb.length() > 0) {
-        sb.append(' ');
-      }
-      sb.append(tail);
-    }
-    return sb.toString();
-  }
-
-  private static String stripBlockComments(String src) {
-    StringBuilder out = new StringBuilder(src.length());
-    int i = 0;
-    while (i < src.length()) {
-      if (i + 1 < src.length() && src.charAt(i) == '/' && src.charAt(i + 1) == '*') {
-        int end = src.indexOf("*/", i + 2);
-        if (end < 0) {
-          break;
-        }
-        for (int j = i; j < end + 2; j++) {
-          if (src.charAt(j) == '\n') {
-            out.append('\n');
-          }
-        }
-        i = end + 2;
-      } else {
-        out.append(src.charAt(i));
-        i++;
-      }
-    }
-    return out.toString();
-  }
-
-  // ============================================================
-  // Drift check: compare proto field numbers against codec source
-  // ============================================================
-
-  private static void verifyFieldNumbersAgainstCodec(
-      SchemaDescriptor schema, Path codecPath, Path inlineDeltaPath) throws IOException {
-    Map<String, Integer> codecConsts = new LinkedHashMap<>();
-    extractIntConsts(codecPath, codecConsts);
-    extractIntConsts(inlineDeltaPath, codecConsts);
-
-    Map<String, Map<String, Integer>> protoByMessage = expectedConstants(schema);
-
-    List<String> mismatches = new ArrayList<>();
-    for (Map.Entry<String, Map<String, Integer>> messageEntry : protoByMessage.entrySet()) {
-      for (Map.Entry<String, Integer> field : messageEntry.getValue().entrySet()) {
-        Integer codecValue = codecConsts.get(field.getKey());
-        if (codecValue != null && !codecValue.equals(field.getValue())) {
-          mismatches.add(String.format(
-              "%s: %s.%s = %d in codec, but %d in catalog.proto",
-              messageEntry.getKey(), messageEntry.getKey(), field.getKey(),
-              codecValue, field.getValue()));
-        }
-      }
-    }
-    if (!mismatches.isEmpty()) {
-      throw new IllegalStateException(
-          "Schema/code drift between catalog.proto and ProtoCodec/InlineDeltaCodec:\n  "
-              + String.join("\n  ", mismatches));
-    }
-  }
-
-  private static void extractIntConsts(Path javaPath, Map<String, Integer> sink)
-      throws IOException {
-    String src = Files.readString(javaPath);
-    Pattern p = Pattern.compile(
-        "(?:private|public|protected)?\\s*static\\s+final\\s+int\\s+(\\w+)\\s*=\\s*(-?\\d+)\\s*;");
-    Matcher m = p.matcher(src);
-    while (m.find()) {
-      sink.put(m.group(1), Integer.parseInt(m.group(2)));
-    }
-  }
-
-  /**
-   * Maps proto message + field combinations to the expected codec constant
-   * name. Only the messages whose constants appear in {@link ProtoCodec} or
-   * {@link InlineDeltaCodec} are listed -- everything else is skipped.
-   */
-  private static Map<String, Map<String, Integer>> expectedConstants(SchemaDescriptor schema) {
-    Map<String, String> messageToPrefix = new LinkedHashMap<>();
-    messageToPrefix.put("Checkpoint", "CHECKPOINT");
-    messageToPrefix.put("CommittedTransactions", "COMMITTED_TXNS");
-    messageToPrefix.put("Namespace", "NS");
-    messageToPrefix.put("Table", "TBL");
-    messageToPrefix.put("NamespaceProperty", "NSPROP");
-    messageToPrefix.put("InlineTable", "INLINE_TBL");
-    messageToPrefix.put("ManifestFileEntry", "MF");
-    messageToPrefix.put("PartitionFieldSummaryEntry", "PFS");
-    messageToPrefix.put("SnapshotManifestRefs", "SMR");
-    messageToPrefix.put("Transaction", "TXN");
-    messageToPrefix.put("Action", "ACTION");
-    messageToPrefix.put("CreateNamespace", "CREATE_NS");
-    messageToPrefix.put("DropNamespace", "DROP_NS");
-    messageToPrefix.put("SetNamespaceProperty", "SET_NSPROP");
-    messageToPrefix.put("RemoveNamespaceProperty", "REMOVE_NSPROP");
-    messageToPrefix.put("CreateTable", "CREATE_TBL");
-    messageToPrefix.put("DropTable", "DROP_TBL");
-    messageToPrefix.put("UpdateTableLocation", "UPDATE_TBL");
-    messageToPrefix.put("ReadTable", "READ_TBL");
-    messageToPrefix.put("UpdateTableInline", "UPDATE_INLINE");
-    messageToPrefix.put("CreateTableInline", "CREATE_INLINE_TBL");
-    messageToPrefix.put("RenameTable", "RENAME_TBL");
-
-    Map<String, Map<String, Integer>> out = new LinkedHashMap<>();
-    for (Map.Entry<String, String> e : messageToPrefix.entrySet()) {
-      MessageDef def = schema.messages.get(e.getKey());
-      if (def == null) {
-        continue;
-      }
-      Map<String, Integer> fields = new LinkedHashMap<>();
-      for (FieldDef f : def.fields) {
-        fields.put(e.getValue() + "_" + f.name.toUpperCase(), f.number);
-      }
-      out.put(e.getKey(), fields);
-    }
-    return out;
   }
 
   // ============================================================
   // JSON emission (no external dependency -- the schema/scenarios are simple)
   // ============================================================
 
-  private static String emitJson(SchemaDescriptor schema, List<Scenario> scenarios) {
+  private static String emitJson(CatalogProto.Schema schema, List<Scenario> scenarios) {
     StringBuilder sb = new StringBuilder();
     sb.append("{\n");
+    sb.append("  \"formatVersion\": ").append(ProtoCatalogFormat.FORMAT_VERSION).append(",\n");
+    sb.append("  \"readerVersion\": ").append(ProtoCodec.SUPPORTED_READER_VERSION).append(",\n");
+    sb.append("  \"structuralFormatVersion\": ")
+        .append(StructuralInlineMetadataCodec.FORMAT_VERSION).append(",\n");
+    sb.append("  \"deflateProbe\": ").append(jsonString(deflateProbe())).append(",\n");
     sb.append("  \"schema\": ");
-    appendSchemaJson(sb, schema, 1);
+    appendSchemaJson(sb, schema);
     sb.append(",\n");
     sb.append("  \"scenarios\": [\n");
     for (int i = 0; i < scenarios.size(); i++) {
@@ -1309,10 +1056,7 @@ public class FormatExplorerFixtures {
         sb.append("        {\"start\": ").append(n.start)
             .append(", \"end\": ").append(n.end)
             .append(", \"label\": ").append(jsonString(n.label)).append("}");
-        if (j < s.notes.size() - 1) {
-          sb.append(',');
-        }
-        sb.append('\n');
+        sb.append(j < s.notes.size() - 1 ? ",\n" : "\n");
       }
       sb.append("      ]");
       if (!s.structuralViews.isEmpty()) {
@@ -1329,87 +1073,63 @@ public class FormatExplorerFixtures {
             sb.append("            {\"label\": ").append(jsonString(seg.label))
                 .append(", \"hex\": ").append(jsonString(seg.hex))
                 .append(", \"byteCount\": ").append(seg.byteCount).append("}");
-            if (j < view.compactSegments.size() - 1) {
-              sb.append(',');
-            }
-            sb.append('\n');
+            sb.append(j < view.compactSegments.size() - 1 ? ",\n" : "\n");
           }
           sb.append("          ]\n");
           sb.append("        }");
-          if (v < s.structuralViews.size() - 1) {
-            sb.append(',');
-          }
-          sb.append('\n');
+          sb.append(v < s.structuralViews.size() - 1 ? ",\n" : "\n");
         }
         sb.append("      ]");
       }
       sb.append("\n    }");
-      if (i < scenarios.size() - 1) {
-        sb.append(',');
-      }
-      sb.append('\n');
+      sb.append(i < scenarios.size() - 1 ? ",\n" : "\n");
     }
     sb.append("  ]\n");
     sb.append("}\n");
     return sb.toString();
   }
 
-  private static void appendSchemaJson(StringBuilder sb, SchemaDescriptor schema, int indent) {
-    String pad = "  ".repeat(indent);
+  private static void appendSchemaJson(StringBuilder sb, CatalogProto.Schema schema) {
+    String pad = "  ";
     sb.append("{\n");
     sb.append(pad).append("  \"messages\": {\n");
     int mi = 0;
-    int total = schema.messages.size();
-    for (Map.Entry<String, MessageDef> e : schema.messages.entrySet()) {
-      MessageDef def = e.getValue();
+    for (Map.Entry<String, CatalogProto.Message> e : schema.messages.entrySet()) {
       sb.append(pad).append("    ").append(jsonString(e.getKey())).append(": {\n");
       sb.append(pad).append("      \"fields\": [\n");
-      for (int i = 0; i < def.fields.size(); i++) {
-        FieldDef f = def.fields.get(i);
+      List<CatalogProto.Field> fields = e.getValue().fields;
+      for (int i = 0; i < fields.size(); i++) {
+        CatalogProto.Field f = fields.get(i);
         sb.append(pad).append("        {")
             .append("\"number\": ").append(f.number)
             .append(", \"name\": ").append(jsonString(f.name))
             .append(", \"type\": ").append(jsonString(f.type))
             .append(", \"repeated\": ").append(f.repeated)
+            .append(", \"packed\": ").append(f.packed)
             .append(", \"oneof\": ").append(f.oneof == null ? "null" : jsonString(f.oneof))
             .append(", \"comment\": ").append(jsonString(f.comment))
             .append("}");
-        if (i < def.fields.size() - 1) {
-          sb.append(',');
-        }
-        sb.append('\n');
+        sb.append(i < fields.size() - 1 ? ",\n" : "\n");
       }
       sb.append(pad).append("      ]\n");
       sb.append(pad).append("    }");
-      if (mi < total - 1) {
-        sb.append(',');
-      }
-      sb.append('\n');
-      mi++;
+      sb.append(++mi < schema.messages.size() ? ",\n" : "\n");
     }
     sb.append(pad).append("  },\n");
     sb.append(pad).append("  \"enums\": {\n");
     int ei = 0;
-    for (Map.Entry<String, EnumDef> e : schema.enums.entrySet()) {
-      EnumDef def = e.getValue();
+    for (Map.Entry<String, CatalogProto.EnumDef> e : schema.enums.entrySet()) {
       sb.append(pad).append("    ").append(jsonString(e.getKey())).append(": [\n");
-      for (int i = 0; i < def.values.size(); i++) {
-        EnumValue v = def.values.get(i);
+      int vi = 0;
+      for (Map.Entry<String, Integer> v : e.getValue().values.entrySet()) {
         sb.append(pad).append("      {")
-            .append("\"name\": ").append(jsonString(v.name))
-            .append(", \"number\": ").append(v.number)
+            .append("\"name\": ").append(jsonString(v.getKey()))
+            .append(", \"number\": ").append(v.getValue())
             .append("}");
-        if (i < def.values.size() - 1) {
-          sb.append(',');
-        }
-        sb.append('\n');
+        sb.append(++vi < e.getValue().values.size() ? ",\n" : "\n");
       }
       sb.append(pad).append("    ]");
-      if (ei < schema.enums.size() - 1) {
-        sb.append(',');
-      }
-      sb.append('\n');
-      ei++;
+      sb.append(++ei < schema.enums.size() ? ",\n" : "\n");
     }
     sb.append(pad).append("  }\n");
     sb.append(pad).append("}");
@@ -1430,12 +1150,6 @@ public class FormatExplorerFixtures {
         case '\\':
           sb.append("\\\\");
           break;
-        case '\b':
-          sb.append("\\b");
-          break;
-        case '\f':
-          sb.append("\\f");
-          break;
         case '\n':
           sb.append("\\n");
           break;
@@ -1444,6 +1158,10 @@ public class FormatExplorerFixtures {
           break;
         case '\t':
           sb.append("\\t");
+          break;
+        case '<':
+          // Keeps "</script>" in a value from closing the fixtures block.
+          sb.append("\\u003c");
           break;
         default:
           if (c < 0x20) {
@@ -1458,7 +1176,7 @@ public class FormatExplorerFixtures {
     return sb.toString();
   }
 
-  private static String toHex(byte[] bytes) {
+  static String toHex(byte[] bytes) {
     char[] hex = "0123456789abcdef".toCharArray();
     char[] out = new char[bytes.length * 2];
     for (int i = 0; i < bytes.length; i++) {
@@ -1478,44 +1196,35 @@ public class FormatExplorerFixtures {
     final byte[] bytes;
     final List<Note> notes;
     /**
-     * One {@link StructuralView} per inline-TM bytes field carried in this
-     * scenario. The visualizer matches a clicked bytes node to its view by
-     * comparing hex of {@code state.bytes[node.byteStart..node.byteEnd]}
-     * against {@link StructuralView#bytesHex}; mismatched / unknown bytes
-     * fall back to the standard "<N bytes>" display.
+     * One {@link StructuralView} per inline-TM bytes field carried in this scenario. The explorer
+     * matches a clicked bytes node to its view by the hex of its bytes; other bytes fall back to
+     * the standard "<N bytes>" display, or to the explorer's own decode.
      */
     final List<StructuralView> structuralViews;
-
-    Scenario(String name, String description, byte[] bytes, List<Note> notes) {
-      this(name, description, bytes, notes, Collections.emptyList());
-    }
+    /** Checks the state the file replays to against the scenario's notes. */
+    final Consumer<ProtoCatalogFile> check;
 
     Scenario(String name, String description, byte[] bytes, List<Note> notes,
-        List<StructuralView> structuralViews) {
+        List<StructuralView> structuralViews, Consumer<ProtoCatalogFile> check) {
       this.name = name;
       this.description = description;
       this.bytes = bytes;
       this.notes = notes;
       this.structuralViews = structuralViews;
+      this.check = check;
     }
   }
 
   /**
-   * Decoded preview of an inline-TM bytes record: the recovered canonical
-   * JSON plus a list of labelled segments that walk the (gzip-decompressed)
-   * wire layout. Embedded into {@code fixtures.json} keyed by
-   * {@link #bytesHex} so the HTML visualizer can match it to the right
-   * bytes node when the user clicks. Avoids needing a JS port of the
-   * structural decoder.
+   * Decoded preview of an inline-TM bytes record: the recovered canonical JSON plus labelled
+   * segments of its (gzip-decompressed) wire layout, keyed by {@link #bytesHex}.
    */
   static final class StructuralView {
-    /** Hex of the on-wire bytes this view describes. Used as the match key. */
     final String bytesHex;
     final String recoveredJson;
     final List<StructuralSegment> compactSegments;
 
-    StructuralView(byte[] bytes, String recoveredJson,
-        List<StructuralSegment> compactSegments) {
+    StructuralView(byte[] bytes, String recoveredJson, List<StructuralSegment> compactSegments) {
       this.bytesHex = toHex(bytes);
       this.recoveredJson = recoveredJson;
       this.compactSegments = compactSegments;
@@ -1524,7 +1233,7 @@ public class FormatExplorerFixtures {
 
   static final class StructuralSegment {
     final String label;
-    final String hex;       // hex bytes of this segment (decompressed wire)
+    final String hex;
     final int byteCount;
 
     StructuralSegment(String label, byte[] bytes) {
@@ -1534,6 +1243,7 @@ public class FormatExplorerFixtures {
     }
   }
 
+  /** A note on bytes {@code [start, end)}, or on the whole file if both are -1. */
   static final class Note {
     final int start;
     final int end;
@@ -1546,67 +1256,7 @@ public class FormatExplorerFixtures {
     }
   }
 
-  static final class SchemaDescriptor {
-    final Map<String, MessageDef> messages;
-    final Map<String, EnumDef> enums;
-
-    SchemaDescriptor(Map<String, MessageDef> messages, Map<String, EnumDef> enums) {
-      this.messages = messages;
-      this.enums = enums;
-    }
-  }
-
-  static final class MessageDef {
-    final String name;
-    final List<FieldDef> fields = new ArrayList<>();
-
-    MessageDef(String name) {
-      this.name = name;
-    }
-  }
-
-  static final class FieldDef {
-    final int number;
-    final String name;
-    final String type;
-    final boolean repeated;
-    final String oneof;
-    final String comment;
-
-    FieldDef(int number, String name, String type, boolean repeated,
-        String oneof, String comment) {
-      this.number = number;
-      this.name = name;
-      this.type = type;
-      this.repeated = repeated;
-      this.oneof = oneof;
-      this.comment = comment;
-    }
-  }
-
-  static final class EnumDef {
-    final String name;
-    final List<EnumValue> values = new ArrayList<>();
-
-    EnumDef(String name) {
-      this.name = name;
-    }
-  }
-
-  static final class EnumValue {
-    final String name;
-    final int number;
-
-    EnumValue(String name, int number) {
-      this.name = name;
-      this.number = number;
-    }
-  }
-
-  // ============================================================
-  // Minimal in-memory InputFile (we only need location()).
-  // ============================================================
-
+  /** A minimal in-memory InputFile; replay needs only its location. */
   private static final class MemInputFile implements InputFile {
     private final String location;
 

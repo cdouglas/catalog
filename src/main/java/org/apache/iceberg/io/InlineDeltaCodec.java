@@ -1495,7 +1495,7 @@ public class InlineDeltaCodec {
     // Optional fields. Absent values:
     //   schemaId == null          -> base.currentSchemaId() (schema 0 included when present)
     //   addedRows == null         -> no row lineage (a v3 snapshot has it, 0 included)
-    //   parentSnapshotId == null  -> fall back to base.currentSnapshot()
+    //   parentSnapshotId == null  -> no parent (not base.currentSnapshot(); see snapshot())
     //   firstRowId == null        -> no row lineage
     //   keyId == null             -> no encryption key
     public final Integer schemaId;
