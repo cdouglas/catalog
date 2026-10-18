@@ -738,6 +738,13 @@ public class InlineDeltaCodec {
     if (!replayKeepsTheWritersIds(oldMeta, newMeta)) {
       return null;
     }
+    // Replay takes the base's last column and partition ids up to the highest in the schemas and
+    // specs the commit added. A transaction that added one and removed it again with unused ones
+    // (an expiry's metadata cleanup) left a last id above every schema's or spec's: only full mode
+    // carries that.
+    if (!replayKeepsTheLastIds(oldMeta, newMeta)) {
+      return null;
+    }
     // Replay logs one new snapshot-log entry, main's new snapshot at the commit's last-updated-ms,
     // if main moved. A transaction that moved main and then changed something else (a branch)
     // logged main at the earlier time, and one that moved main and back (append, roll back)
@@ -971,6 +978,33 @@ public class InlineDeltaCodec {
    * else one past the highest id it has passed, starting from the current schema's; a spec takes
    * the id of the first compatible spec, else one past the highest.
    */
+  private static boolean replayKeepsTheLastIds(TableMetadata oldMeta, TableMetadata newMeta) {
+    Set<Integer> oldSchemaIds = new HashSet<>();
+    for (org.apache.iceberg.Schema s : oldMeta.schemas()) {
+      oldSchemaIds.add(s.schemaId());
+    }
+    int lastColumnId = oldMeta.lastColumnId();
+    for (org.apache.iceberg.Schema s : newMeta.schemas()) {
+      if (!oldSchemaIds.contains(s.schemaId())) {
+        lastColumnId = Math.max(lastColumnId, s.highestFieldId());
+      }
+    }
+    Set<Integer> oldSpecIds = new HashSet<>();
+    for (org.apache.iceberg.PartitionSpec s : oldMeta.specs()) {
+      oldSpecIds.add(s.specId());
+    }
+    int lastPartitionId = oldMeta.lastAssignedPartitionId();
+    for (org.apache.iceberg.PartitionSpec s : newMeta.specs()) {
+      if (!oldSpecIds.contains(s.specId())) {
+        for (org.apache.iceberg.PartitionField field : s.fields()) {
+          lastPartitionId = Math.max(lastPartitionId, field.fieldId());
+        }
+      }
+    }
+    return lastColumnId == newMeta.lastColumnId()
+        && lastPartitionId == newMeta.lastAssignedPartitionId();
+  }
+
   private static boolean replayKeepsTheWritersIds(TableMetadata oldMeta, TableMetadata newMeta) {
     Set<Integer> oldSchemaIds = new HashSet<>();
     List<org.apache.iceberg.Schema> schemas = new ArrayList<>(oldMeta.schemas());

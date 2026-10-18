@@ -251,6 +251,10 @@ time only if the same builder added it). And it must number new schemas
 and specs as the writer did: the builder gives each the id of an equal
 one, else one past the highest, and replay adds before it removes (Bug
 52: a transaction that cleaned up unused specs, then went back to one).
+Replay's last column and partition ids are the base's, up to the
+highest in the schemas and specs it adds, so a commit whose last id is
+above those goes in full (Bug 63: a transaction that added a partition
+field, removed it, and cleaned up the spec that had it).
 `TestInlineDeltaProperties` runs random Iceberg operations and checks
 that each commit's delta, replayed on its base as the inline codec
 stores it, gives the committed metadata, and that the codec stores

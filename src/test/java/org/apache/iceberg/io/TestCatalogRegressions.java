@@ -3867,6 +3867,56 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 63: an inline delta carries the schemas and partition specs a
+  // commit added, and replay takes the table's last column and partition
+  // ids up to the highest among them, as Iceberg does when it adds one. A
+  // transaction that added a partition field, removed it again and expired
+  // snapshots with metadata cleanup, which dropped the spec it had added,
+  // left the last partition id above every spec's: the delta replayed to
+  // the earlier one. Such a commit now goes in full. Found by
+  // TestInlineDeltaProperties in a long run.
+  // ============================================================
+
+  @Nested
+  class SpecAddedAndRemovedInOneCommit {
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND_TM", "APPEND_ML"})
+    void replaysToItsLastPartitionId(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, mode);
+      catalog.createNamespace(mixedNs);
+      Table table = catalog.createTable(mixed, intSchema);
+      table.newFastAppend().appendFile(dataFile("a")).commit();
+      table.newFastAppend().appendFile(dataFile("b")).commit();
+
+      org.apache.iceberg.Transaction txn = table.newTransaction();
+      txn.updateSpec().addField("id").commit();
+      txn.updateSpec().removeField("id").commit();
+      txn.expireSnapshots()
+          .expireOlderThan(System.currentTimeMillis() + 1)
+          .retainLast(1)
+          .cleanExpiredMetadata(true)
+          .commit();
+      org.apache.iceberg.TableMetadata written =
+          ((org.apache.iceberg.HasTableOperations) txn.table()).operations().current();
+      txn.commitTransaction();
+      assertThat(written.specs()).as("the specs after the cleanup").hasSize(1);
+      assertThat(written.lastAssignedPartitionId()).as("the written id").isEqualTo(1000);
+
+      org.apache.iceberg.TableMetadata read =
+          ((org.apache.iceberg.HasTableOperations) catalog(io, LocalCatalogMode.APPEND)
+                  .loadTable(mixed))
+              .operations()
+              .current();
+      assertThat(read.lastAssignedPartitionId())
+          .as("the replayed id")
+          .isEqualTo(written.lastAssignedPartitionId());
+    }
+  }
+
   /**
    * Storage with prefix and bulk operations, as S3, GCS and ADLS have (a table's FileIO passes
    * bulk deletes on only for those), whose bulk deletes fail.
