@@ -826,7 +826,10 @@ class TestCatalogFaultProperties {
       return String.join("/", path);
     }
 
-    /** The live data file at {@code path} in {@code table}, or null. */
+    /**
+     * The live data file at {@code path} in {@code table}, or null. A stale handle cannot plan once
+     * an expiry has removed its current snapshot: a rejection.
+     */
     private static DataFile liveFile(Table table, String path) {
       try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
         for (FileScanTask task : tasks) {
@@ -836,6 +839,8 @@ class TestCatalogFaultProperties {
         }
       } catch (IOException e) {
         throw new UncheckedIOException(e);
+      } catch (org.apache.iceberg.exceptions.NotFoundException e) {
+        throw new ValidationException(e, "the handle's snapshot was expired since: %s", path);
       }
       return null;
     }
