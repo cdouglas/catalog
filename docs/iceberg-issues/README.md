@@ -23,3 +23,4 @@ conflicts, and only if C7 isn't picked first.
 | [C5. Rewriting manifests fails on a table without a current snapshot](C5.md) | [`f723a52`](https://github.com/cdouglas/iceberg/commit/f723a52a663326cf5fd80d763df1a2d4988dc1f7) | empty snapshot or no commit |
 | [C6. A repeated cherry-pick leaves a table it can't plan](C6.md) | [`724608a`](https://github.com/cdouglas/iceberg/commit/724608a099eec717e59b11cd09cb062a4dfceb28) | least certain: cost and semantics |
 | [C7. The all_* metadata tables miss the row ids of an upgraded file](C7.md) | [`2779515`](https://github.com/cdouglas/iceberg/commit/27795151cf7ec998a6ee018e31f6cbe85b021cd1) | ready |
+| [C8. A deletion vector older than its data file leaves a table Iceberg can't plan](C8.md) | none yet | choose where to fix it |

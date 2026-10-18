@@ -40,8 +40,9 @@ to the 1.12.0 release. By 2026-10-18 its branch `core-fixes` had all six
 fixes, C2 to C7 (see "Rebasing onto a newer Iceberg"). On 2026-10-18 the
 per-issue documents were checked against main at `9bbee07`: the files
 each fix changes are unchanged there since `524fe9e`, and each fix
-cherry-picks onto it (C2's test file only after C7's). The Fork column is
-`atomicio`, which sits on `core-fixes`.
+cherry-picks onto it (C2's test file only after C7's). C8, found the same
+day, is not fixed. The Fork column is `atomicio`, which sits on
+`core-fixes`.
 
 | Issue | Fork | 1.12.0 | main | Upstream |
 |---|---|---|---|---|
@@ -52,6 +53,7 @@ cherry-picks onto it (C2's test file only after C7's). The Fork column is
 | C5. Rewriting manifests fails with no snapshot | fixed, `core-fixes` f723a52 | yes | yes | not reported |
 | C6. A repeated cherry-pick leaves the table unplannable | fixed, `core-fixes` 724608a | yes | yes | not reported |
 | C7. The all_* tables miss row ids | fixed, `core-fixes` 2779515 | yes | yes | not reported |
+| C8. A DV older than its data file leaves the table unplannable | **no** | yes | yes | not reported |
 
 "Not reported" means a search of apache/iceberg's issues and pull
 requests found nothing for the issue.
@@ -280,6 +282,34 @@ reported could vary between runs.
   workaround, `TestInlineDifferentialProperties.metadataTable`'s mask of
   `first_row_id` in the `all_*` tables.
 - **Canary:** `allDataFilesHasTheRowIdsOfAFileCarriedAcrossAnUpgrade`.
+
+### C8. A deletion vector older than its data file leaves a table Iceberg can't plan
+
+Details: [iceberg-issues/C8.md](iceberg-issues/C8.md). Not fixed.
+
+A row delta that does not validate its referenced data files can commit a
+deletion vector for a file that is not live where it commits: through a
+stale handle, or for a file only staged. A later commit that adds that
+file, a cherry-pick of the snapshot that has it, gives the file a newer
+data sequence number than its deletion vector, and planning the branch
+fails: "DV data sequence number (5) must be greater than or equal to data
+file sequence number (6)". The symptom is C6's, by another path: the pick
+is a first pick, so C6's fix does not apply.
+
+- **Cause:** `DeleteFileIndex.findDV` throws for a deletion vector whose
+  data sequence number is below its data file's. The spec says when a
+  deletion vector must apply, not that this state is an error. Nothing
+  stops the commits that make it.
+- **Found by:** `TestInlineDifferentialProperties`, 2026-10-18, at try
+  999 of a 6,000-try run on the fork (core-fixes included); planning
+  failed in both catalogs alike. Reproduces on 1.12.0 and on main at
+  `524fe9e` (the files involved are unchanged at `9bbee07`).
+- **Workaround:** `TestInlineDifferentialProperties.files` compares a
+  planning failure with this message as the string "fails (C8): ...",
+  which both catalogs must produce alike.
+- **Canary:** `aDeletionVectorOlderThanItsDataFileLeavesATableItCannotPlan`,
+  which asserts the bug is present: it fails when the bug is fixed, and
+  the workaround can then go.
 
 ## Accepted Iceberg Behavior
 
