@@ -130,8 +130,9 @@ class TestMultiWriterProperties {
       @ForAll("maxAppendCounts") int maxAppendCount,
       @ForAll("appendHeadrooms") long appendHeadroom,
       @ForAll boolean strictVersions,
+      @ForAll boolean gc,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(writers, maxAppendCount, appendHeadroom, false, strictVersions).execute(schedule);
+    new Run(writers, maxAppendCount, appendHeadroom, false, strictVersions, gc).execute(schedule);
   }
 
   @Property(tries = 300)
@@ -140,8 +141,9 @@ class TestMultiWriterProperties {
       @ForAll("maxAppendCounts") int maxAppendCount,
       @ForAll("appendHeadrooms") long appendHeadroom,
       @ForAll boolean strictVersions,
+      @ForAll boolean gc,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(writers, maxAppendCount, appendHeadroom, true, strictVersions).execute(schedule);
+    new Run(writers, maxAppendCount, appendHeadroom, true, strictVersions, gc).execute(schedule);
   }
 
   // A commit step's operands pick the faults for its first two conditional writes; later writes
@@ -553,18 +555,26 @@ class TestMultiWriterProperties {
     private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
     private final ProtoCatalogFormat format;
     private final boolean faults;
+    private final boolean gc;
     private final Writer[] writers;
     private final StringBuilder trace = new StringBuilder();
     private final Deque<Context> commits = new ArrayDeque<>();
     private int nextValue = 0;
 
     Run(int writers, int maxAppendCount, long appendHeadroom) {
-      this(writers, maxAppendCount, appendHeadroom, false, false);
+      this(writers, maxAppendCount, appendHeadroom, false, false, false);
     }
 
+    /**
+     * With {@code gc}, the retention of committed transaction ids is 0: every CAS drops every id
+     * older than its own commit's. A commit whose id a preempting CAS puts at or below the
+     * horizon fails, or cannot learn its outcome (Bug 64), so its outcome may be unknown without
+     * a fault.
+     */
     Run(int writers, int maxAppendCount, long appendHeadroom, boolean faults,
-        boolean strictVersions) {
+        boolean strictVersions, boolean gc) {
       this.faults = faults;
+      this.gc = gc;
       CatalogFile.Mut<ProtoCatalogFile, ?> seed =
           new ProtoCatalogFormat().empty(io.newInputFile(CATALOG));
       seed.createNamespace(Namespace.of("a"));
@@ -578,16 +588,17 @@ class TestMultiWriterProperties {
               appendHeadroom < 0
                   ? ProtoCatalogFormat.DEFAULT_MAX_APPEND_SIZE
                   : seedLength + appendHeadroom,
-              ProtoCatalogFormat.DEFAULT_COMMITTED_RETENTION_MS,
+              gc ? 0L : ProtoCatalogFormat.DEFAULT_COMMITTED_RETENTION_MS,
               0); // retry throttled writes without sleeping
       this.writers = new Writer[writers];
       for (int i = 0; i < writers; i++) {
         this.writers[i] = new Writer(i);
       }
       trace.append(String.format(
-          "format: maxAppendCount=%d maxAppendSize=%d (seed %d bytes)%s%n",
+          "format: maxAppendCount=%d maxAppendSize=%d (seed %d bytes)%s%s%n",
           format.maxAppendCount(), format.maxAppendSize(), seedLength,
-          strictVersions ? ", strict versions" : ""));
+          strictVersions ? ", strict versions" : "", gc ? ", retention 0" : ""));
+      Statistics.label("gc").collect(gc);
       trace.append("seed: ").append(View.of(read())).append('\n');
       io.failSupersededReads(strictVersions);
       io.injectFaults(this::onWrite);
@@ -819,9 +830,13 @@ class TestMultiWriterProperties {
       } else if (preempting != null) {
         Statistics.label("preemption").collect("commit ended first");
       }
-      // Storage that does not fail leaves no outcome unknown, races and replaced versions included.
-      check(outcome != Outcome.UNKNOWN || ctx.faulted(),
+      // Storage that does not fail leaves no outcome unknown, races and replaced versions included,
+      // unless a retention of 0 drops the ids of commits still in flight.
+      check(outcome != Outcome.UNKNOWN || ctx.faulted() || gc,
           "commit outcome unknown without an injected fault%s", reason);
+      if (outcome == Outcome.UNKNOWN && !ctx.faulted()) {
+        Statistics.label("unknown without a fault (gc)").collect(true);
+      }
       Statistics.label("commit path").collect(path);
       Statistics.label("operations per transaction").collect(Math.min(ops.size(), 5));
       if (!faults) {
