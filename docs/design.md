@@ -40,8 +40,19 @@ atomically:
 2. Create a `Mut` builder from it.
 3. Accumulate changes (`createTable`, `dropNamespace`, etc.).
 4. `commit()` builds an intention record and writes it atomically.
-5. On `CASException` or `AppendException`, retry from step 1 (or, for
-   append failures with idempotent bytes, retry at the new offset).
+5. The format's commit loop (`ProtoCatalogFormat.Mut.commit`) handles
+   what storage reports. After a CAS conflict it replays the new file,
+   checks the record's preconditions again, and rebases the same record
+   onto it; after a lost append race it retries the same bytes at the new
+   offset; it retries a throttled write after a backoff (`retryThrottled`,
+   `fileio.catalog.throttle.retry.min-wait-ms`); and it settles a write
+   whose outcome it did not learn by reading the catalog for the
+   transaction's id, or throws `CommitStateUnknownException` (I10). A
+   record whose preconditions fail goes back to the caller: FileIOCatalog
+   stages a catalog operation again on a fresh read
+   (`commitOnAFreshRead`), and Iceberg re-applies a table commit; a
+   catalog transaction fails ([errata.md](errata.md) §D12). See
+   [SPEC.md](SPEC.md) §"Commit Protocol".
 
 ### Two Mutation Strategies
 
@@ -63,8 +74,10 @@ Three codecs cooperate at write/read time:
 - `ProtoCodec` handles catalog-level messages: `Checkpoint`, `Transaction`,
   `Action` oneof, all catalog/namespace/table actions.
 - `InlineDeltaCodec` handles inline TM delta messages:
-  `TableMetadataDelta`, all 13 `TableMetadataUpdate` types,
-  `CompactSummary`, `ManifestFileEntry`.
+  `TableMetadataDelta`, all 15 `TableMetadataUpdate` types,
+  `CompactSummary`. The `ManifestFileEntry` an `AddManifestDelta`
+  carries is encoded by `ProtoCodec`, which also writes it in the
+  checkpoint's manifest pool.
 - `InlineMetadataCodec` (with two implementations,
   `StructuralInlineMetadataCodec` and `GzipInlineMetadataCodec`)
   encodes full `TableMetadata` bytes inside `InlineTable`,
@@ -75,10 +88,18 @@ Three codecs cooperate at write/read time:
   for new writes; decode always follows the wire tag, so codecs can
   mix freely within a single catalog file.
 
-All three implement protobuf wire format manually; none depends on
-`protoc`-generated classes. The output is wire-compatible with
-`catalog.proto` so any protobuf tool can decode the catalog-level
-framing given the schema.
+`ProtoCodec` and `InlineDeltaCodec` write protobuf by hand; nothing is
+generated from `catalog.proto`. Inline TM bytes are opaque `bytes`
+fields in it, in the format their codec tag names. `catalog.proto`
+declares every field the codecs write, with the wire type they use, and
+two tests hold it to that (516e9c4): `CatalogProto` checks every catalog
+file the suites and fuzzers write against it (through
+`CheckpointRoundTrip`), and `TestFormatExplorer` checks the codecs'
+field-number constants against it in both directions. So a protobuf
+tool given `catalog.proto` decodes the checkpoint and each log record
+(past the file's header and length prefixes). The one departure from
+`protoc`'s output, a negative int32 as a 5-byte varint, is one `protoc`
+readers accept (see the header of `catalog.proto`).
 
 ### Component Separation
 
@@ -125,11 +146,12 @@ replay of the same record against the post-apply state fails `verify`.
 This is the second line of defence alongside `committedTxn` deduplication
 — both must hold.
 
-`apply()` bumps the version of any entity whose state it mutates,
-including the *parent namespace* on actions that change a namespace's
-children set or properties (`CreateNamespace`, `DropNamespace`,
-`SetNamespaceProperty`, `RemoveNamespaceProperty`, `CreateTable`,
-`CreateTableInline`, `DropTable`).
+`apply()` bumps the version of any entity whose state it mutates: the
+table on a table update or rename, the namespace itself on
+`SetNamespaceProperty` and `RemoveNamespaceProperty`, and the *parent
+namespace* on actions that change its children set (`CreateNamespace`,
+`DropNamespace`, `CreateTable`, `CreateTableInline`, `DropTable`).
+`RenameTable` bumps both the source and the destination namespace.
 
 ### I3. Inline metadata rotation preserves the manifest pool
 
@@ -146,27 +168,31 @@ inline ones out first).
 
 Whether a snapshot's list is inline or a file, and whichever writer
 reads it, it lists the same manifests with the same entries (sequence
-numbers, spec, adding snapshot, counts, first row id). A commit sends
+numbers, spec, adding snapshot, counts, first row id). A delta sends
 the lists of only the snapshots it adds, taken from the snapshots
-themselves. Eviction writes inline lists to files unchanged; a new
-inline snapshot on a parent whose list is a file carries its whole
-list. `TestCatalogFaultProperties` checks this after every operation,
-and in v3 tables that a data file's row ids never change.
+themselves. A full-metadata commit (a create, or an update in full
+mode) also sends the list of every inline snapshot it names that the
+table no longer holds a list for: its handle loaded the table inline,
+and another writer has since evicted it (Bug 62: a replace transaction
+commits the snapshots it loaded). Eviction writes inline lists to
+files unchanged; a new inline snapshot on a parent whose list is a file
+carries its whole list. `TestCatalogFaultProperties` checks this after
+every operation, and in v3 tables that a data file's row ids never
+change.
 
-### I4. Inline replay is byte-stable
+### I4. Inline replay is deterministic
 
-Two reads of the same catalog state must produce identical inline-table
-bytes for every table. The synthetic `metadataFileLocation` is the
-hex-hash of those bytes (see [SPEC_TM.md](SPEC_TM.md) §"Table Loading"),
-and `BaseMetastoreTableOperations.refreshFromMetadataLocation` short-
-circuits a refresh exactly when that location matches the cached one.
-Without byte-stability the cache misses on every refresh,
-`BaseTransaction.applyUpdates`'s reference-equality check
-(`base != underlyingOps.refresh()`) trips, and any `commitTransaction`
-that doesn't swap to a fresh base throws "Table metadata refresh is
-required".
+Every reader that replays the same records rebuilds the same metadata
+for every inline table, whatever its clock. I6 and I7 rest on this: a
+compactor writes a checkpoint of the state it replayed, and a delta
+must replay to the metadata its writer committed. The location a table
+loads from does not depend on the bytes: it is
+`inline://<table>#<id>.<version>` (`FileIOCatalog.metadataLocation`;
+keyed by version since 416b2c9, and by table id since Bug 22), so
+`BaseMetastoreTableOperations` reloads when the table's version changes
+(see [SPEC_TM.md](SPEC_TM.md) §"Table Loading").
 
-Two operational rules in `InlineDeltaCodec` keep the bytes stable:
+Two operational rules in `InlineDeltaCodec` keep replay deterministic:
 
 1. The base parsed inside `applyDelta` / `applyDeltaWithManifests` is
    given a deterministic synthetic `metadataFileLocation`
@@ -209,8 +235,9 @@ on-wire shape: a `manifest-list` field with the sentinel, no embedded
 On the read side, `wrapInlineManifests` (FileIOCatalog) reverses the
 transformation by swapping each sentinel-bearing `BaseSnapshot` for an
 `InlineSnapshot` whose `manifests` come from the pool. Loading rejects
-a sentinel without a matching pool entry (§2.3 check) — catalog state
-must always satisfy "sentinel ⇒ pool entry".
+a sentinel without a matching pool entry (`IllegalStateException`,
+"catalog state corrupt") — catalog state must always satisfy "sentinel
+⇒ pool entry".
 
 The delta-update path emits sentinels through `AddSnapshotUpdate`
 (which encodes the manifest-list suffix; for inline-ML the suffix is
@@ -287,6 +314,29 @@ same namespaces, properties and tables. `TestCatalogRaceProperties`
 runs one operation with another just before its first write and a
 third just before its second, in mixed modes, against a serial run of
 the same operations on another copy (Bugs 53, 54, 55).
+
+### I10. A landed commit is never reported as failed
+
+Iceberg deletes a commit's new files when it fails with
+`CommitFailedException` (a `CleanableFailure`), and a caller may run a
+failed commit again, so a commit that landed must not report failure.
+The commit loop reports a definite failure only before any write, or
+after a read of the catalog without its record. A write whose outcome
+it did not learn -- a lost reply, a failed read-back, a throttled write
+that may have landed -- it settles by reading the catalog for the
+transaction's id; if that read fails, or the loop runs out of attempts
+while such a write may still be in flight, the commit ends in
+`CommitStateUnknownException`. So does a commit whose id the committed
+set's GC horizon has passed, if one of its writes may have landed;
+otherwise it fails, since replay rejects its record from then on (Bug
+64). A retention shorter than a commit takes is legal but lossy: it
+makes this case common, but never incorrect ([GC.md](GC.md)). Work
+after the commit lands does not change its outcome: FileIOCatalog
+deletes the metadata files that dropped out of a table's log through
+`CatalogUtil.deleteFiles`, which logs a failure instead of throwing it
+(Bug 61). `TestCatalogFaultProperties` and `TestMultiWriterProperties`
+check that an operation reported failed any way but unknown did not
+take effect.
 
 ## Operation × Operation Conflict Matrix
 
@@ -387,36 +437,56 @@ crosses either threshold:
 
 No on-disk hint is needed. Atomic append + atomic CAS at the storage
 layer are sufficient to linearize commits, and either writer in a race
-will independently decide to compact based on the live file's
-length / appendCount. Field 2 in `Transaction` (formerly a `sealed` bool
-flag) is reserved.
+will independently decide to compact based on the live file's length
+and the append count of the last version it read. After a lost append
+race the loop retries without reading the file again, so its
+`appendCount` is a lower bound; the count limit is soft. Field 2 in
+`Transaction` (formerly a `sealed` bool flag) is reserved.
 
 ## Best Practices
 
 ### Adding a new catalog action
 
-1. Add the message to `catalog.proto` and a new variant in the
-   `Action.action` oneof.
-2. Add an `Action` subclass in `ProtoCodec` (or its inner class hierarchy)
-   with an `encode`, `decode`, `verify`, and `apply` method.
-3. `apply` must bump the version of every entity whose state it mutates,
+1. Add the message to `catalog.proto`, a new variant in the
+   `Action.action` oneof, and its field-number constants in `ProtoCodec`.
+   Regenerate the format explorer's fixtures (`mvn test
+   -Dtest=FormatExplorerFixtures -Dexplorer.regenerate=true`).
+   `TestFormatExplorer` fails until the constants match `catalog.proto`
+   and the fixtures are current.
+2. Implement `ProtoCodec.Action` (an interface: `verify`, `apply`,
+   `bind`) and add a branch for it to `encodeAction` and `decodeAction`.
+3. An action that references a namespace or table id must implement
+   `bind(IdBinding)`, defining the late-bound ids it creates and
+   resolving the ones it references (808bca7). The default `bind`
+   returns the action unchanged: its late-bound ids would reach `apply`
+   unbound, and `Transaction.verify`, which rejects a record whose
+   reference precedes its create when `bind` throws, would not see
+   them. Add it to `Transaction.selfConsistent` too, so a record that
+   also drops what it references is rejected (Bug 14).
+4. `apply` must bump the version of every entity whose state it mutates,
    including the parent namespace if it changes the namespace's
-   children set or properties (I2).
-4. Add an `apply()` row to the conflict matrix above and one test in
+   children set (I2).
+5. Add an `apply()` row to the conflict matrix above and one test in
    `TestProtoActions$ConflictTests` per cell.
-5. Add an idempotency test to `TestProtoActions$IdempotencyTests`:
+6. Add an idempotency test to `TestProtoActions$IdempotencyTests`:
    replaying the action with a fresh UUID against the post-apply state
    must be rejected.
 
 ### Adding a new inline TM delta type
 
-1. Add the message to `catalog.proto` under `TableMetadataUpdate.update`.
-2. Add a `DeltaUpdate` subclass in `InlineDeltaCodec` with `encodeUpdate`,
-   `decodeUpdate`, and either `applyTo(TableMetadata.Builder)` (for
-   metadata-only changes) or routing through the prefix-accepting
-   overload (for changes that reference inline state like manifest pools).
+1. Add the message to `catalog.proto` under `TableMetadataUpdate.update`
+   and its field-number constants in `InlineDeltaCodec`, and regenerate
+   the explorer's fixtures, as for a catalog action.
+2. Implement `InlineDeltaCodec.DeltaUpdate` (an interface with
+   `applyTo(TableMetadata.Builder)`), and add a branch for it to the
+   static `encodeUpdate` and `decodeUpdate` dispatchers. An update that
+   references inline state such as the manifest pool is routed in
+   `applyDeltaWithManifests` instead of applied to the builder.
 3. Update `computeDelta` to emit the new update when relevant; the diff
-   should be minimal (only emit when the field differs).
+   should be minimal (only emit when the field differs). It must refuse
+   (return null) any change it cannot express (I7);
+   `TestInlineDeltaProperties` checks that every delta replays to the
+   committed metadata.
 4. **Update ordering** matters when a Builder method rejects the
    operation against the current state (e.g. `removeSchemas` rejects
    removing the current schema id). Emit `Add → SetCurrent / SetDefault →
@@ -426,17 +496,19 @@ flag) is reserved.
    entry, etc.), make sure the rebuild loop in `applyDeltaWithManifests`
    pins that value before `applyTo` runs. See I4.
 6. Add unit tests in `TestInlineDelta`: encode/decode round-trip,
-   apply against a fresh `TableMetadata`, idempotency on replay,
-   byte-stability across repeated replays of the same delta.
+   apply against a fresh `TableMetadata`, idempotency on replay, the
+   same metadata from repeated replays of the same delta (I4).
 7. If the new update type interacts with manifest-pool state, also extend
    the routing in `applyDeltaWithManifests` (see SPEC_TM.md and SPEC_ML.md).
 
 ### Choosing append vs CAS
 
 The default `max.append.count = 10000` works for S3 Express and Azure
-AppendBlob. For S3 standard or GCS — providers that support conditional
-full-object replace but not conditional append — set `max.append.count = 0`
-to force CAS-only mode.
+AppendBlob. GCS has no append, and the format commits every write there
+by CAS whatever the setting (`GCSFileIO.supportsAppend()` is false). For
+S3 standard buckets, which support conditional full-object replace but
+not conditional append, set `max.append.count = 0` to force CAS-only
+mode.
 
 The default `max.append.size = 16 MiB` is a soft target. Larger catalogs
 mean longer reads on every load; tune down for read-heavy workloads, up
@@ -447,10 +519,16 @@ for write-heavy.
 - `inline=false` works on every storage provider; baseline behaviour with
   external `metadata.json` and `snap-*.avro` files.
 - `inline=true, inline.manifests=false` saves the metadata-file write
-  but keeps Avro manifest lists. Works with stock Iceberg.
-- `inline=true, inline.manifests=true` saves both writes; **requires the
-  Iceberg fork** for `ManifestListSink` and `InlineSnapshot`. See the
-  [README](../README.md) for fork dependencies.
+  but keeps Avro manifest lists. Replay needs the fork's
+  `TableMetadata.Builder.setLastUpdatedMillis` (I4).
+- `inline=true, inline.manifests=true` saves both writes; it also needs
+  the fork's `ManifestListSink`, `InlineSnapshot` and
+  `TableMetadata.Builder.replaceSnapshots`.
+
+Every mode needs the Iceberg fork for `SupportsAtomicOperations`. The
+fork's `core-fixes` branch also fixes the Iceberg core issues in
+[ICEBERG_ISSUES.md](ICEBERG_ISSUES.md), which come back on stock
+Iceberg. See the [README](../README.md) for fork dependencies.
 
 ### Choosing the inline-TM codec
 
@@ -470,11 +548,13 @@ catalogs can carry a mix produced by different writers.
 ## Hand-Rolled Wire Format
 
 `ProtoCodec` and `InlineDeltaCodec` implement protobuf wire format
-manually rather than using `protoc`-generated classes. This choice lets
-the codebase validate correctness against `catalog.proto` before
-committing to generated-code dependencies; the wire format is still
-standard protobuf (field tags, varints, length-delimited messages), so
-any protobuf tool can decode the output given the `.proto` file.
+manually rather than using `protoc`-generated classes: no runtime
+`protobuf-java` dependency or build-time `protoc`, and latitude for
+lazy scanning (see the header of `catalog.proto`). The wire format is
+still standard protobuf (field tags, varints, length-delimited
+messages), and `catalog.proto` declares every field the codecs write:
+`CatalogProto` and `TestFormatExplorer` check that in every `mvn test`
+(see §"Codec Layout").
 
 The trade-off: when adding a new field number, both `encode` and `decode`
 need explicit handling, and `decodeXxx` must include a default case that
@@ -490,10 +570,22 @@ classes handle this for you; manual codecs require it as a discipline.
 | `TestProtoCommitKnobs` | `max.append.count` / `max.append.size` thresholds; `MockIO` |
 | `TestInlineDelta` | Inline TM delta encode/decode/apply, `computeDelta`, ML delta types |
 | `TestInlineManifestEndToEnd` | End-to-end commit→reload across BASELINE / TM_ONLY / TM_ML configs; per-`SnapshotProducer` operation coverage; codec-axis subclass parameterized over `gzip` / `structural` |
-| `CatalogTests`, `CatalogTransactionTests` | Abstract suites consumed from `iceberg-core-tests.jar` (R4 / commit `35076d6`) and run by cloud-provider subclasses |
-| `GCSCatalogTest`, `TestS3Catalog`, `ADLSCatalogTest` | Cloud integration tests, append-mode + pointer (require credentials/emulators) |
+| `CatalogTests`, `CatalogTransactionTests` | Abstract suites consumed from `iceberg-core-tests.jar` (commit `35076d6`) and run by the local and cloud subclasses |
+| `TestLocalCatalog`, `TestLocalCatalogTransaction` | Both abstract suites in every `LocalCatalogMode` (append / CAS / compact × pointer / inline TM / inline ML) over `InMemoryAtomicFileIO` |
+| `TestCatalogFaultProperties` | jqwik: several writers run Iceberg operations through FileIOCatalog on faulty storage, in mixed modes; the catalog must match a model after every operation (I3a, I6, I10) |
+| `TestCatalogRaceProperties` | jqwik: a catalog operation raced by others must end as a serial run (I9) |
+| `TestInlineDeltaProperties` | jqwik: each commit's delta replays to the committed metadata, and each codec stores every version exactly (I7) |
+| `TestInlineDifferentialProperties` | jqwik: the same schedule on a pointer catalog and an inline one commits alike and reads the same (I8) |
+| `TestCatalogRegressions` | One nested group per catalog bug, with the smallest scenario that reproduces it |
+| `TestCommittedSetGc`, `TestCommittedTransactions` | Committed-set encoding, GC merge and horizon, tri-state lookup ([GC.md](GC.md)) |
+| `TestIcebergCoreIssues` | Canaries asserting each Iceberg core issue C1-C7 ([ICEBERG_ISSUES.md](ICEBERG_ISSUES.md)) is absent |
+| `TestFormatExplorer` | Codec field-number constants against `catalog.proto` both ways; explorer fixtures current |
+| `spec/` (`TestCodecProperties`, `TestInvariantProperties`, `TestCanonicalStateProperty`, `TestMultiWriterProperties`) | jqwik at the format layer: codec round trip and determinism, well-formedness, builder state through the codec, and a multi-writer fuzzer of the commit protocol |
+| `GCSCatalogTest`, `TestS3Catalog`, `ADLSCatalogTest` | Cloud integration tests, pointer mode; append mode on S3 and ADLS, CAS on GCS (require credentials/emulators) |
 | `*CAS`, `*InlineTM`, `*InlineML` subclasses | Cloud matrix subclasses overriding `maxAppendCount()` / `inlineTM()` / `inlineML()` -- see [COMPAT.md](COMPAT.md) for status |
 
-The end-to-end suite uses an in-memory `MemoryFileIO` so commit→reload
-cycles run without storage. Cloud tests verify that the actual provider
-APIs honour `SupportsAtomicOperations` semantics.
+The end-to-end suite uses an in-memory `MemoryFileIO`, and the local
+suites and fuzzers `InMemoryAtomicFileIO`, which enforces conditional
+CAS and append, so commit→reload cycles run without storage. Cloud tests
+verify that the actual provider APIs honour `SupportsAtomicOperations`
+semantics.

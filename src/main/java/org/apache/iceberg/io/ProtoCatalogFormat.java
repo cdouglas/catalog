@@ -82,14 +82,17 @@ public class ProtoCatalogFormat
   /**
    * Retention window for the committed-transaction dedup set, in milliseconds.
    * On every CAS / compaction commit the writer drops any UUIDv7 from
-   * {@code CommittedTransactions} whose timestamp is older than
-   * {@code now - committedRetentionMs}. Aged-out entries become
-   * {@code highest_dropped_timestamp_ms}, after which a query for a UUID below
-   * the horizon throws {@link DedupHorizonExceededException}. Default: 6 hours
-   * — long enough to cover normal CAS-conflict retry windows, short enough to
-   * bound dedup-set size on long-lived catalogs. {@code Long.MAX_VALUE}
-   * disables GC; {@code 0} means "drop everything older than now"
-   * (degenerate but legal). See {@code docs/GC.md}.
+   * {@code CommittedTransactions} whose timestamp is at or below
+   * {@code now - committedRetentionMs} (and below its own transaction's). The
+   * largest dropped timestamp becomes {@code highest_dropped_timestamp_ms}: a
+   * query for a UUID at or below it throws {@link DedupHorizonExceededException},
+   * and replay rejects a record whose id is at or below it (Bug 64). Default: 6
+   * hours, long enough to cover any commit's retries, short enough to bound the
+   * set on long-lived catalogs. {@code Long.MAX_VALUE} disables GC. A window
+   * shorter than a commit takes is legal but lossy: a writer whose id falls
+   * below the horizon while it commits fails, or cannot learn whether it
+   * committed (CommitStateUnknownException); {@code 0} drops everything older
+   * than the compacting commit. See {@code docs/GC.md}.
    */
   public static final String COMMITTED_RETENTION_MS = "fileio.catalog.committed.retention.ms";
   public static final long DEFAULT_COMMITTED_RETENTION_MS = 6L * 60 * 60 * 1000;
@@ -564,7 +567,7 @@ public class ProtoCatalogFormat
         }
       }
 
-      // Process table renames (in-place, id-stable). See errata.md §D5.
+      // Process table renames (in-place, id-stable). See SPEC_TM.md "Rename".
       for (Map.Entry<TableIdentifier, TableIdentifier> entry : tableRenames.entrySet()) {
         TableIdentifier from = entry.getKey();
         TableIdentifier to = entry.getValue();

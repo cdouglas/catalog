@@ -75,8 +75,10 @@ mvn verify -Preal-cloud
 
 Each provider's `@BeforeAll` decides its mode independently. With only
 AWS credentials set under default `mvn verify`, S3 hits real S3, GCS uses
-fake-gcs-server, and ADLS uses Azurite (with class-level skip — see
-[`errata.md`](errata.md) §T3).
+fake-gcs-server, and ADLS uses Azurite, where every test of the ADLS
+catalog suites skips: each test's `@BeforeEach` calls `assumeRealCloud`,
+since Azurite has no Data Lake rename (see [`errata.md`](errata.md) §T3).
+Only `AzuriteEmulatorCanaries` runs.
 
 Under `mvn verify -Preal-cloud` the same configuration fails — the
 profile requires every provider's env vars.

@@ -230,10 +230,9 @@ public class ProtoCodec {
   private static final int UPDATE_INLINE_METADATA_LOCATION = 5;
   // Codec for full_metadata bytes; ignored in delta / pointer modes.
   private static final int UPDATE_INLINE_FULL_METADATA_CODEC = 6;
-  // Optional ML pool delta bytes carried alongside FULL mode. Used when delta
-  // encoding can't represent a TM diff (e.g. concurrent-replace id collision)
-  // but the commit still has staged manifest-list updates that must land in
-  // the pool atomically with the TM replacement. Same wire shape as
+  // Optional ML pool delta bytes carried alongside FULL mode: the commit's
+  // manifest-list updates, which must land in the pool atomically with the
+  // TM replacement. Same wire shape as
   // {@link #CREATE_INLINE_TBL_DELTA}.
   private static final int UPDATE_INLINE_ML_DELTA = 7;
 
@@ -246,7 +245,7 @@ public class ProtoCodec {
   private static final int CREATE_INLINE_TBL_METADATA = 6;
   private static final int CREATE_INLINE_TBL_METADATA_CODEC = 7;
   // Optional delta bytes carrying initial manifest-pool entries for an
-  // inline-ML create-with-snapshots commit. See errata D9.
+  // inline-ML create-with-snapshots commit.
   private static final int CREATE_INLINE_TBL_DELTA = 8;
 
   // RenameTable field numbers
@@ -2632,9 +2631,9 @@ public class ProtoCodec {
 
     /**
      * Creates an UpdateTableInlineAction in FULL mode that also carries an ML
-     * pool delta. Used when delta-mode TM encoding is infeasible (e.g. concurrent-
-     * replace id collision) but the commit still has staged manifest-list updates
-     * that must land in the per-table pool atomically with the TM replacement.
+     * pool delta. Used when the commit goes in full (re-inlining, a delta too large,
+     * or one delta encoding cannot express) and has manifest-list updates that must
+     * land in the per-table pool atomically with the TM replacement.
      */
     public static UpdateTableInlineAction full(
         int id, int version, byte[] fullMetadata, byte fullMetadataCodec, byte[] mlDeltaBytes) {
@@ -2678,28 +2677,25 @@ public class ProtoCodec {
         // manifest pool. `removeInlineMetadata` (used by the POINTER branch
         // below) also clears the pool — that's the correct behavior for
         // pointer-mode eviction, but would silently corrupt an ML-populated
-        // table on a non-ML commit (schema evolution, etc.). See
-        // ML_INLINE_REVIEW2.md §1.1.
+        // table on a non-ML commit (schema evolution, etc.).
         ProtoCatalogFile.TblEntry old = builder.tableEntry(id);
         if (old != null) {
           builder.updateInlineMetadata(id, version + 1, fullMetadata, fullMetadataCodec);
           // Apply bundled ML pool delta first (if any), so any AddManifest
           // entries for new snapshots populate the pool before we reconcile
-          // refs against the new TM. Used when delta-mode TM encoding wasn't
-          // possible (e.g. concurrent-replace id collision) but the commit
-          // still has staged manifest-list updates that must land atomically
-          // with the TM replacement. The ML delta is decoded against the new
-          // TM bytes — applyDeltaWithManifests's snapshot-add steps are
-          // idempotent against the just-stored TM since the snapshots already
-          // present are skipped at the addSnapshot apply level.
+          // refs against the new TM. A full-mode commit carries one whenever it
+          // adds an inline-ML snapshot or names one the table has no list for,
+          // so the lists land atomically with the TM replacement.
+          // applyManifestsOnly finds each snapshot's parent in the new TM bytes
+          // and ignores any table metadata update, which the new TM holds.
           if (mlDeltaBytes != null) {
             InlineMetadataCodec codec = InlineMetadataCodecs.byTag(fullMetadataCodec);
             InlineDeltaCodec.applyManifestsOnly(mlDeltaBytes, builder, id, codec, fullMetadata);
           }
           // Reconcile snapshot manifest refs (and orphan'd pool entries)
           // against the snapshots present in the new TM. Delta-mode replay
-          // handles this via RemoveSnapshotsUpdate (InlineDeltaCodec
-          // line 317); full-mode replay swaps the entire TM bytes in one
+          // handles this via RemoveSnapshotsUpdate (in InlineDeltaCodec
+          // applyDeltaWithManifests); full-mode replay swaps the entire TM bytes in one
           // shot, so we re-derive the live snapshot set from the new bytes
           // and prune anything that's no longer referenced. Without this,
           // a full-mode commit that drops a snapshot (e.g. expireSnapshots
@@ -2748,10 +2744,10 @@ public class ProtoCodec {
     /**
      * Optional initial manifest-pool delta. Set when an inline-ML
      * create-transaction commits with one or more staged snapshots — apply()
-     * routes these entries through {@link InlineDeltaCodec#applyDeltaWithManifests}
+     * routes these entries through {@link InlineDeltaCodec#applyManifestsOnly}
      * so the per-table manifest pool and per-snapshot ref list are populated
      * atomically with the table create. {@code null} for non-inline-ML
-     * creates and for inline-ML creates with no snapshots. See errata D9.
+     * creates and for inline-ML creates with no snapshots.
      */
     final byte[] deltaBytes;
 
@@ -2796,8 +2792,8 @@ public class ProtoCodec {
 
     @Override
     public void apply(ProtoCatalogFile.Builder builder) {
-      // manifest list prefix is derived from metadata at checkpoint time;
-      // for newly created tables, we default to empty (set later on first snapshot)
+      // The manifest list prefix is always empty: nothing sets one, and a
+      // checkpoint copies it.
       builder.addInlineTable(id, namespaceId, name, version, metadata, metadataCodec, "");
       if (deltaBytes != null) {
         // Inline-ML create: land the manifest lists of the create transaction's snapshots,
@@ -2826,7 +2822,7 @@ public class ProtoCodec {
    *
    * <p>Apply bumps the source and destination namespaces' children-set version,
    * matching the rule for {@link CreateTableAction} / {@link DropTableAction}.
-   * See errata.md §D5 and design.md "Operation × Operation Conflict Matrix".
+   * See SPEC_TM.md "Rename" and design.md "Operation × Operation Conflict Matrix".
    */
   public static class RenameTableAction implements Action {
     final int id;

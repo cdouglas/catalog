@@ -26,11 +26,22 @@ protobuf messages. It supports two mutation strategies:
 Both strategies rely on cloud-storage conditional writes
 (`SupportsAtomicOperations`).
 
-The codec (`ProtoCodec`) implements protobuf wire format manually — it does
-not use `protoc`-generated classes. The encoding follows standard protobuf
-conventions (varints, field tags, length-delimited fields) and is wire-
-compatible with `catalog.proto`. Any protobuf tool given the `.proto` file
-can decode the output.
+The codec (`ProtoCodec`, with `InlineDeltaCodec` for table-metadata deltas)
+implements protobuf wire format manually — it does not use `protoc`-generated
+classes. The encoding follows standard protobuf conventions (varints, field
+tags, length-delimited fields), and `catalog.proto` declares every field the
+codecs write, with a type of the wire type it is written with. Tests keep the
+two in step: `CatalogProto` walks every catalog file the suites write against
+the schema, and `TestFormatExplorer` checks the codecs' field-number constants
+against it. A protobuf tool given the `.proto` file can decode the output.
+Where the bytes differ from `protoc`'s, readers `protoc` generates accept them:
+a negative `int32` is a 5-byte varint, not proto3's 10-byte sign extension;
+zero-valued fields are written; and the repeated scalar fields are unpacked,
+as the `.proto` declares (`[packed = false]`). Interop does not hold the other
+way: `ProtoCodec`'s 32-bit varint reader decodes `protoc`'s 10-byte form only
+for -1 to -8 (a ninth late-bound id, -9, reads as -1), and `protoc` omits
+zero-valued fields that the decoders require, such as a `CODEC_JSON_GZIP` (0)
+codec tag (see [Wire Format Details](#wire-format-details)).
 
 ## File Layout
 
@@ -98,8 +109,12 @@ Written on compaction (CAS). Contains the full materialized catalog state.
 ```protobuf
 message Checkpoint {
   bytes  catalog_uuid              = 1;   // 16 bytes, UUIDv7
+  // Replay binds a transaction's late-bound ids to these, in log order.
   int32  next_namespace_id         = 2;
   int32  next_table_id             = 3;
+  // The reader version this checkpoint needs (ProtoCodec
+  // SUPPORTED_READER_VERSION, now 1). Written first; required.
+  int32  min_reader_version        = 4;
   repeated Namespace          namespaces             = 10;
   repeated Table              tables                 = 11;  // pointer-mode tables
   repeated NamespaceProperty  namespace_properties   = 12;
@@ -108,13 +123,22 @@ message Checkpoint {
 }
 
 message CommittedTransactions {
-  fixed64 max_timestamp_ms = 1;   // largest timestamp in the set
+  // Largest timestamp in the set; 0 when the set is empty. Always written.
+  fixed64 max_timestamp_ms             = 1;
   // Per entry, descending order, back-to-back inside one packed bytes
-  // field: varint delta_ms (gap from previous) || 10 random bytes
-  // (rand_a + rand_b + 6-bit pad).
-  bytes   packed_entries   = 2;
+  // field: varint delta_ms (gap from previous; the first is 0) || 10 random
+  // bytes (rand_a + rand_b + 6-bit zero pad).
+  bytes   packed_entries               = 2;
+  // GC horizon: the largest timestamp of any id a retention pass dropped.
+  // 0 (absent) until the first drop; ids at or below it are UNKNOWN.
+  fixed64 highest_dropped_timestamp_ms = 3;
 }
 ```
+
+The encoder writes `min_reader_version` before every other field, so a reader
+that cannot read the checkpoint fails before decoding the rest; the decoder
+fails if it is absent or exceeds `ProtoCodec.SUPPORTED_READER_VERSION`.
+`committed_transactions` is omitted when the set is empty and has no horizon.
 
 A table ID appears in either `tables` (pointer mode) or `inline_tables`
 (inline mode), never both.
@@ -130,10 +154,13 @@ reconstructed on decode) are interleaved back-to-back inside a single
 saves ~30% per entry vs the older `repeated bytes` form.
 
 The interleaved layout lets `ProtoCatalogFile.containsTransaction` walk
-the wire bytes in a single linear pass with no per-call heap
-allocation: the catalog file holds the inner-message bytes directly
-(no materialized `HashSet<UUID>`), and re-encoding to a fresh checkpoint
-is a byte copy when no commits have been added since decode.
+the wire bytes in a single linear pass without materializing the set:
+the catalog file holds the inner-message bytes directly (no
+`HashSet<UUID>`). A read that applies no log records keeps the
+checkpoint's bytes as they are; one that applies records merges their
+ids in (`ProtoCodec.rewriteCommittedBytes`). A CAS copies the bytes into
+its checkpoint unchanged only when GC is off; otherwise it rewrites them
+on every CAS (see below).
 
 All entries must be UUIDv7; non-v7 IDs are rejected at the dedup-set
 entry point (`ProtoCatalogFile.Builder.addCommittedTransaction`) and
@@ -152,114 +179,129 @@ See [GC.md](GC.md) for the implementation rationale.
 
 **Premise: UUIDv7 timestamps approximate commit time.** Transaction IDs
 are minted in `ProtoCodec.Transaction.from()` (called from `Mut.commit`)
-using `UuidV7.newUuidV7()`, which embeds `System.currentTimeMillis()`
-in the high 48 bits. Because the mint happens at commit-submission
-time — not at transaction-begin time — a long-running transaction
-does not get a stale timestamp; a transaction that ran for a week and
-then commits has a UUID timestamp from the moment of commit, not from
-a week prior. Retention can therefore be expressed in wall-clock terms
-without disadvantaging slow workloads.
+using `UuidV7.newUuidV7After(original.highestDroppedTimestampMs())`,
+which embeds `System.currentTimeMillis()` in the high 48 bits, or the
+horizon of the catalog the writer read plus 1 ms if the clock has not
+passed it (see the clock-skew note below). Because the mint happens at
+commit-submission time — not at transaction-begin time — a long-running
+transaction does not get a stale timestamp; a transaction that ran for a
+week and then commits has a UUID timestamp from the moment of commit, not
+from a week prior. Retention can therefore be expressed in wall-clock
+terms without disadvantaging slow workloads.
 
-**Wire format addition.** The `CommittedTransactions` message gains a
-new field:
+**Horizon.** `CommittedTransactions.highest_dropped_timestamp_ms` (field
+3) is the set's GC horizon: the largest timestamp of any id a retention
+pass has dropped. It is absent (0) until the first drop and never
+decreases: each pass keeps the larger of the inherited horizon and what
+it drops.
 
-```protobuf
-message CommittedTransactions {
-  fixed64 max_timestamp_ms              = 1;
-  bytes   packed_entries                = 2;
-  // Highest UUIDv7 timestamp that was dropped during the most recent
-  // compaction. Implicitly 0 (no GC has occurred yet) when absent.
-  // Monotonically non-decreasing across compactions.
-  fixed64 highest_dropped_timestamp_ms  = 3;
-}
-```
-
-**GC algorithm at compaction.** At every compaction (any CAS-mode
-commit, including the always-CAS path when `maxAppendCount=0`):
+**GC algorithm.** The set changes in two places. A read merges the id of
+each record replay applies into the set, dropping nothing
+(`ProtoCatalogFile.Builder.build()`). A CAS (any CAS-mode commit,
+including the always-CAS path when `maxAppendCount=0`) then filters the
+set of the state it checkpoints (`ProtoCatalogFormat` `buildFullFile`,
+through `ProtoCodec.encodeCheckpoint`):
 
 ```
-function compactCheckpoint(oldCheckpoint, logTxns, retentionMs):
-    nowMs        = System.currentTimeMillis()
-    watermarkMs  = nowMs - retentionMs
+function compactCommitted(base, txn, retentionMs):
+    # base: the replayed state of the file being replaced. Its set holds the
+    # checkpoint's ids and those of every log record replay applied.
+    nowMs       = System.currentTimeMillis()
+    watermarkMs = retentionMs >= nowMs ? 0 : nowMs - retentionMs
+    # Below this commit's own id: its record follows the checkpoint, and
+    # replay rejects a record at or below the horizon.
+    watermarkMs = max(0, min(watermarkMs, timestamp(txn.id) - 1))
+    if watermarkMs == 0:
+        return base.committed                    # GC off: copied unchanged
 
-    // 1. Inherited committed-set: keep only entries above the watermark.
-    keptInherited = []
-    droppedHighest = oldCheckpoint.highest_dropped_timestamp_ms
-    for entry in decode(oldCheckpoint.packed_entries):
-        if uuidv7_timestamp(entry) > watermarkMs:
-            keptInherited.append(entry)
+    kept    = []
+    horizon = base.committed.highest_dropped_timestamp_ms
+    for entry in decode(base.committed.packed_entries):   # descending
+        if timestamp(entry) > watermarkMs:
+            kept.append(entry)
         else:
-            droppedHighest = max(droppedHighest, uuidv7_timestamp(entry))
+            horizon = max(horizon, timestamp(entry))
 
-    // 2. Log transactions are NEVER dropped — they all become part of
-    //    the new compacted checkpoint, regardless of timestamp. A log
-    //    entry whose UUIDv7 timestamp is older than the watermark
-    //    (clock skew, late retry, etc.) survives this compaction; it
-    //    only becomes eligible for GC at the *next* compaction.
-    newCommitted = mergeSortDescending(keptInherited, logTxns.map(txn => txn.id))
-
+    if kept is empty and horizon == 0:
+        return absent                             # field omitted
     return CommittedTransactions(
-        max_timestamp_ms             = newCommitted[0].timestamp or 0,
-        packed_entries               = encode(newCommitted),
-        highest_dropped_timestamp_ms = droppedHighest)
+        max_timestamp_ms             = kept[0].timestamp or 0,
+        packed_entries               = encode(kept),
+        highest_dropped_timestamp_ms = horizon)   # omitted when 0
 ```
 
-The merge step preserves the streaming-friendly property: both
-`keptInherited` and `logTxns` are already sorted descending by
-UUID, so a single linear merge produces the new packed_entries body
-without random-access materialization. The single-pass rewrite that
-fuses decode + filter + merge into one walk is implemented in
-`ProtoCodec.rewriteCommittedBytes`.
+The log records of the file being replaced are in `base`'s set by then,
+so they are as eligible for GC as the checkpoint's own entries. Only the
+compacting commit's record, which follows the new checkpoint, is outside
+the pass; its id joins the set when a read replays it. Both passes are
+`ProtoCodec.rewriteCommittedBytes`, one linear walk of the descending
+entries: the merge at read with no watermark, the filter at CAS with no
+additions.
 
-**Edge case: highest dropped can exceed max retained.** It is possible
-(though rare) for `highest_dropped_timestamp_ms` to be *more recent*
-than `max_timestamp_ms` of the same checkpoint. This happens when the
-inherited committed-set had its newest entries below the watermark
-(all dropped) and the log contributed only entries whose timestamps
-are even older — typically a clock-skewed writer or a heavily-retried
-old commit. The two timestamps must be tracked independently.
+**Edge case: the horizon can exceed `max_timestamp_ms`.** A pass that
+drops every entry writes a horizon-only body (`max_timestamp_ms = 0`,
+`highest_dropped_timestamp_ms` non-zero), so that the horizon survives
+later compactions. The two timestamps are tracked independently.
 
-**Query semantics: tri-state.** With GC in place, `containsTransaction`
-is no longer a clean boolean. A query for UUID `q` against
-`CommittedTransactions(packed_entries=P, highest_dropped=H)` resolves
-to one of:
+**Query semantics: tri-state.** `containsTransaction(UUID)` (on
+`ProtoCatalogFile` and its `Builder`) resolves a query for UUID `q`
+against `CommittedTransactions(packed_entries=P, highest_dropped=H)` to
+one of:
 
-| Outcome | Condition | Meaning |
-|---|---|---|
-| `COMMITTED` | `q ∈ P` | the transaction landed |
-| `ABSENT` | `q ∉ P` and `timestamp(q) > H` | the transaction was never committed |
-| `UNKNOWN` | `q ∉ P` and `timestamp(q) <= H` | may have been GC'd; cannot distinguish from never-committed |
+| Outcome | Condition | Result | Meaning |
+|---|---|---|---|
+| `COMMITTED` | `q ∈ P` | `true` | the transaction landed |
+| `ABSENT` | `q ∉ P` and (`H = 0` or `timestamp(q) > H`) | `false` | the transaction was never committed |
+| `UNKNOWN` | `q ∉ P` and `0 < H` and `timestamp(q) <= H` | throws `DedupHorizonExceededException` | may have been GC'd; cannot distinguish from never-committed |
 
-For the dedup-replay path (`readInternal`'s idempotency check), the
-querying transaction was just appended within the current append
-window, so its timestamp is always above any reasonable watermark and
-the result is always definitive. The tri-state distinction matters for
-the writer-confirmation use case: a writer that comes back to confirm
-its own commit after the retention window must be prepared to receive
-`UNKNOWN` and decide its own policy (assume committed, retry, escalate).
+A non-v7 `q` returns `false` without consulting the horizon.
+`highestDroppedTimestampMs()` returns `H`.
 
-The recommended public API:
+**Replay rejects a record at or below the horizon.** Replay does not ask
+`containsTransaction`, which would throw for such a record and so fail
+every read of the catalog (Bug 64). It asks
+`ProtoCatalogFile.Builder.mayApply`, which admits a record only if the
+set does not hold its id (else it is a retry of a record already
+applied) and its timestamp is above the horizon (else it may be a retry
+of a commit whose id aged out). Such records are reachable: a writer
+whose clock is behind another's by more than the retention, one that
+stalls that long between minting its id and writing, or a race under a
+short retention. Replay skips them as it skips a record that fails
+verification.
 
-- `boolean containsTransaction(UUID)` — `true` iff `COMMITTED`. Existing
-  callers (replay) continue to use this.
-- `TxnDedupStatus dedupStatus(UUID)` — returns `COMMITTED` / `ABSENT`
-  / `UNKNOWN`. New API for writers that care about the GC ambiguity.
-- `long highestDroppedTimestampMs()` — exposed for callers building
-  bespoke logic.
+**Writers.** A writer asks `containsTransaction` of its own id on each
+read that decides its commit (`ProtoCatalogFormat.Mut.landed`). Its own
+CAS keeps the horizon below its record (the watermark cap above), and it
+mints its id after the horizon of the catalog it read. Another writer's
+compaction can still raise the horizon past an id in flight: a commit
+whose id is at or below the horizon of a read fails
+(`CommitFailedException`), or is unknown (`CommitStateUnknownException`)
+if a write of it may have landed before its id aged out. A caller that
+must confirm such a commit later needs another oracle (see GC.md "Two
+oracles").
 
 **Configuration knob.**
 
 | Property | Default | Purpose |
 |---|---|---|
-| `fileio.catalog.committed.retention.ms` | `21_600_000` (6h) | Minimum age before a committed-txn UUID becomes eligible for GC. Should comfortably exceed the longest plausible retry window for a writer learning its outcome. Setting to `Long.MAX_VALUE` disables GC. Setting to `0` would GC aggressively but is not recommended — would routinely produce `UNKNOWN` for any post-CAS query. |
+| `fileio.catalog.committed.retention.ms` | `21_600_000` (6h) | Minimum age before a committed-txn UUID becomes eligible for GC. Should comfortably exceed the longest plausible retry window for a writer learning its outcome. Setting to `Long.MAX_VALUE` disables GC. A retention shorter than a commit takes, `0` included, is legal but lossy (below). |
+
+**A short retention is lossy.** A concurrent CAS can drop a committed id
+newer than an in-flight writer's transaction id, or minted in the same
+millisecond (with a retention of 0, each CAS drops every id older than its
+own). The
+horizon then covers the writer's id, replay rejects its record, and the writer
+fails (`CommitFailedException`) or, if an earlier write of it may have landed,
+cannot learn its outcome (`CommitStateUnknownException`). The catalog is never
+made incorrect or unreadable. The default 6 h exceeds any commit's retries.
 
 A 6-hour default is pessimistic by design: it bounds the `CommittedTransactions`
 section size to `retention × commit-rate` even for CAS-only catalogs
 that compact on every commit, while leaving a generous window for
 writers to confirm. For a 1-commit/sec workload with 6h retention the
 section caps at ~21,600 entries (~250 KB compressed); for 100/sec it
-caps at ~2.16M entries (~25 MB compressed) — still bounded, predictable,
-and recoverable from the writer side via the `UNKNOWN` signal.
+caps at ~2.16M entries (~25 MB compressed) — still bounded and
+predictable.
 
 **Clock-skew note.** Watermark comparisons use the compactor's local
 clock against UUIDv7 timestamps minted by other writers. Wall-clock
@@ -267,12 +309,17 @@ skew between writers translates directly into GC-window jitter: a
 writer with a clock 10 minutes behind has its UUID timestamps appear
 10 minutes "older," shrinking its effective retention by 10 minutes.
 Keep writer clocks NTP-synced. This is a deployment requirement, not a
-correctness invariant — a wildly skewed clock can cause spurious
-`UNKNOWN` results but cannot violate idempotency for in-window writers.
+correctness invariant: a writer behind by more than the retention still
+mints its id above the horizon it read, and a record that lands at or
+below the horizon is rejected, never applied twice or left to fail
+reads. Skew costs commits that fail, or report
+`CommitStateUnknownException`, spuriously.
 
 ### Catalog Entities
 
 ```protobuf
+// Every checkpoint holds the root namespace as a row: id 0, parent 0, empty
+// name. Its version orders top-level creates and drops like any parent's.
 message Namespace {
   int32  id        = 1;
   int32  version   = 2;
@@ -303,7 +350,8 @@ Appended atomically to the log region.
 
 ```protobuf
 message Transaction {
-  bytes           transaction_id = 1;    // UUIDv7, 16 bytes
+  reserved 2;                            // was `sealed`
+  bytes           transaction_id = 1;    // UUIDv7, 16 bytes; required
   repeated Action actions        = 3;
 }
 
@@ -316,7 +364,7 @@ message Action {
     CreateTable             create_table              = 5;
     DropTable               drop_table                = 6;
     UpdateTableLocation     update_table_location     = 7;
-    ReadTable               read_table                = 8;
+    ReadTable               read_table                = 8;   // pins a version read
     UpdateTableInline       update_table_inline       = 9;   // see SPEC_TM
     CreateTableInline       create_table_inline       = 10;  // see SPEC_TM
     RenameTable             rename_table              = 11;
@@ -326,14 +374,19 @@ message Action {
 
 ### Pointer-Mode Action Messages
 
-Each action carries version fields for optimistic conflict detection.
+Each action carries version fields for optimistic conflict detection. A
+create names its new entity by a late-bound (negative) id, `-1, -2, ...` for
+namespaces and, separately, for tables, in the order of their creates; later
+actions of the same transaction may name it (see [Late-Binding](#late-binding)).
+A `*_version` of -1 means the entity it names is late-bound, so there is no
+version to check.
 
 ```protobuf
 message CreateNamespace {
-  int32  id             = 1;    // assigned ID, or negative for late-bind
-  int32  version        = 2;    // -1 for late-bind
-  int32  parent_id      = 3;
-  int32  parent_version = 4;    // -1 if parent is late-bound
+  int32  id             = 1;    // late-bound (negative); 0, the root, is rejected
+  int32  version        = 2;    // the new namespace's version (1)
+  int32  parent_id      = 3;    // 0 = root; negative if created in this transaction
+  int32  parent_version = 4;    // must match; -1 if the parent is late-bound
   string name           = 5;
 }
 
@@ -344,22 +397,22 @@ message DropNamespace {
 
 message SetNamespaceProperty {
   int32  namespace_id      = 1;
-  int32  namespace_version = 2; // -1 if created in same txn
+  int32  namespace_version = 2; // must match; -1 if created in same txn
   string key               = 3;
   string value             = 4;
 }
 
 message RemoveNamespaceProperty {
   int32  namespace_id      = 1;
-  int32  namespace_version = 2;
+  int32  namespace_version = 2; // must match
   string key               = 3;
 }
 
 message CreateTable {
-  int32  id                = 1; // -1 for late-bind
-  int32  version           = 2;
-  int32  namespace_id      = 3;
-  int32  namespace_version = 4; // -1 if namespace is late-bound
+  int32  id                = 1; // late-bound (negative)
+  int32  version           = 2; // the new table's version (1)
+  int32  namespace_id      = 3; // negative if created in this transaction
+  int32  namespace_version = 4; // must match; -1 if the namespace is late-bound
   string name              = 5;
   string metadata_location = 6;
 }
@@ -385,13 +438,14 @@ message ReadTable {
 // Renames a table in place — the int32 table id is stable, only
 // (namespace, name) on TblEntry changes. Applies to both pointer-mode and
 // inline tables (the id-keyed manifest pool / snapshot refs follow by
-// construction). See SPEC_TM.md "Rename" and design.md "Operation × Operation
+// construction). Apply bumps the version of the table and of both
+// namespaces. See SPEC_TM.md "Rename" and design.md "Operation × Operation
 // Conflict Matrix" entry RT'.
 message RenameTable {
   int32  id                    = 1;
   int32  version               = 2; // source tbl_v; must match current
-  int32  new_namespace_id      = 3;
-  int32  new_namespace_version = 4; // -1 if dest ns is created in same txn
+  int32  new_namespace_id      = 3; // negative if created in this transaction
+  int32  new_namespace_version = 4; // must match; -1 if late-bound
   string new_name              = 5;
 }
 ```
@@ -409,20 +463,35 @@ offsets.
 
 ### Create a namespace and a table
 
-`createNamespace("db")` then `createTable("db.t")`, shown *before* compaction so
-the two appended records are visible:
+The file `FileIOCatalog.initialize` creates, then `createNamespace("db")` and
+`createTable("db.t")`, shown *before* compaction so the appended records are
+visible (the format explorer's `empty-bootstrap` and
+`txn-multi-action-with-late-bind` scenarios walk the bytes the code writes):
 
 ```abnf
-file       = header checkpoint record-1 record-2
-checkpoint = framed<Checkpoint{ next_namespace_id=1, next_table_id=1 }>   ; empty
-record-1   = framed<Transaction{ CreateNamespace(id=1, version=1,
-                                                  parent_id=0, name="db") }>
-record-2   = framed<Transaction{ CreateTable(id=1, version=1,
+file       = header checkpoint record-1 record-2 record-3
+checkpoint = framed<Checkpoint{ min_reader_version=1, catalog_uuid=…,
+               next_namespace_id=1, next_table_id=1,
+               Namespace{id=0, version=0, parent_id=0, name=""} }>   ; empty
+record-1   = framed<Transaction{ transaction_id=… }>                 ; no actions
+record-2   = framed<Transaction{ CreateNamespace(id=-1, version=1,
+                                  parent_id=0, parent_version=0, name="db") }>
+record-3   = framed<Transaction{ CreateTable(id=-1, version=1,
                                   namespace_id=1, namespace_version=1,
                                   name="t", metadata_location="…/meta-A.json") }>
 ```
 
-<!-- protocol "Magic = LCAT:32,Format Version = 1:32,CP Length (varint):16,Checkpoint - empty (next_ns_id=1 next_tbl_id=1):48,Rec1 Length (varint):16,Record 1 - CreateNamespace (id=1 v=1 db):48,Rec2 Length (varint):16,Record 2 - CreateTable (id=1 v=1 ns=1 name=t):48" -->
+`FileIOCatalog.initialize` creates the file with a CAS of the empty catalog
+(Case 0 of [COMMIT](#commit-protocol)): a checkpoint holding only the root row,
+then the empty transaction's record, whose id joins the committed set like any
+other. Replay binds record 2's namespace -1 to `next_namespace_id`, 1, and bumps
+the root to version 1; `parent_version` is the root's version when the writer
+read it. Record 3's writer read `db` as id 1 at version 1; replay binds the table
+-1 to id 1 and bumps `db` to version 2. Created in one transaction, the two
+actions would share one record, the `CreateTable` naming the namespace by its
+late-bound id (`namespace_id=-1, namespace_version=-1`).
+
+<!-- protocol "Magic = LCAT:32,Format Version = 1:32,CP Length (varint):16,Checkpoint - empty (root row; next ids 1):48,Rec1 Length (varint):16,Record 1 - empty txn (initialize):48,Rec2 Length (varint):16,Record 2 - CreateNamespace (id=-1 v=1 db):48,Rec3 Length (varint):16,Record 3 - CreateTable (id=-1 v=1 ns=1 t):48" -->
 ```
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
@@ -433,27 +502,38 @@ record-2   = framed<Transaction{ CreateTable(id=1, version=1,
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |       CP Length (varint)      |                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
-|        Checkpoint - empty (next_ns_id=1 next_tbl_id=1)        |
+|           Checkpoint - empty (root row; next ids 1)           |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |      Rec1 Length (varint)     |                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
-|            Record 1 - CreateNamespace (id=1 v=1 db)           |
+|               Record 1 - empty txn (initialize)               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |      Rec2 Length (varint)     |                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
-|         Record 2 - CreateTable (id=1 v=1 ns=1 name=t)         |
+|           Record 2 - CreateNamespace (id=-1 v=1 db)           |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|      Rec3 Length (varint)     |                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
+|           Record 3 - CreateTable (id=-1 v=1 ns=1 t)           |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
-After a CAS compaction the two records fold into the checkpoint, leaving one
-carry-over record (the compacting commit's own transaction id, kept for dedup):
+A commit that CASes next, say an `UpdateTableLocation` of `t`, writes a
+checkpoint of the replayed state and then its own record, in full:
 
 ```
-checkpoint: next_ns_id=2  next_tbl_id=2
-            Namespace{ id=1  v=1  "db" }
+checkpoint: min_reader_version=1  next_ns_id=2  next_tbl_id=2
+            Namespace{ id=0  v=1  parent=0  "" }     ; root, bumped by the create of db
+            Namespace{ id=1  v=2  parent=0  "db" }   ; bumped by the create of t
             Table{ id=1  v=1  ns=1  "t" -> …/meta-A.json }
-record 1  : carry-over (last txn id; dedup only)
+            committed_transactions: the ids of records 1-3, less any at or
+                                    below this CAS's GC watermark
+record 1  : Transaction{ UpdateTableLocation(id=1, version=1,
+                                             metadata_location="…/meta-B.json") }
 ```
+
+Replay verifies and applies record 1 on top of the checkpoint, as it would an
+append, leaving `t` at version 2.
 
 ### Multi-table transaction
 
@@ -463,7 +543,7 @@ current version and advance it by one:
 
 ```abnf
 file       = header checkpoint record-1
-checkpoint = framed<Checkpoint{ next_table_id=5,
+checkpoint = framed<Checkpoint{ min_reader_version=1, …, next_table_id=5,
                Table{id=1,version=3,name="a"}, Table{id=2,version=5,name="b"},
                Table{id=3,version=2,name="c"}, Table{id=4,version=7,name="d"} }>
 record-1   = framed<Transaction{
@@ -509,17 +589,31 @@ rejected):
 The codec uses standard protobuf encoding:
 
 - **Field tag** = `(field_number << 3) | wire_type`
-- **Wire type 0** (varint): `int32`, `bool`
+- **Wire type 0** (varint): `int32`, `int64`, `bool`, enums, and `sint64`
+- **Wire type 1** (fixed64): snapshot IDs and the committed set's
+  timestamps (`max_timestamp_ms`, `highest_dropped_timestamp_ms`)
 - **Wire type 2** (length-delimited): `string`, `bytes`, nested messages
-- **Wire type 1/5** (fixed64/fixed32): used for snapshot IDs
+- **Wire type 5** (fixed32): never written; skipped on read
 
 Varints use the standard protobuf unsigned encoding (7 bits per byte, MSB
-continuation). Signed integers are not zigzag-encoded: a negative `int32`
-(a late-bound ID) is written as the 5-byte varint of its 32-bit two's
-complement.
+continuation). `int32` and `int64` are not zigzag-encoded: a negative `int32`
+(a late-bound ID, or a version of -1) is written as the 5-byte varint of its
+32-bit two's complement. The one `sint64`, `AddSnapshot.timestamp_delta_ms`
+(SPEC_TM), is zigzag-encoded.
 
-Default-valued fields (zero for ints, false for bools, empty for
-strings/bytes) are omitted per proto3 conventions.
+Unlike proto3, `ProtoCodec` writes the fields of the catalog entities and
+actions unconditionally, zero and empty values included (an id or version of 0,
+the root's `parent_id = 0`, an empty string such as the root's name). Optional
+fields are written only when present: `committed_transactions` (omitted when
+the set is empty with no horizon), `highest_dropped_timestamp_ms` (omitted when
+0), the one case of `UpdateTableInline`'s payload, and the optional inline
+fields SPEC_TM and SPEC_ML describe. `ManifestFileEntry` omits zero or null
+counts, a zero spec id or sequence number, and the content of a data manifest. A decoder takes an
+absent scalar as zero or empty, but some fields are required, and their absence
+fails the read: `Checkpoint.min_reader_version`, `Transaction.transaction_id`,
+every inline-metadata codec tag (`InlineTable.metadata_codec`,
+`CreateTableInline.metadata_codec`, and `UpdateTableInline.full_metadata_codec`
+with `full_metadata`; 0 included), and `TableMetadataDelta.last_updated_ms`.
 
 ## Read Protocol
 
@@ -531,14 +625,16 @@ function READ(fileIO, location):
     # 1. Read and validate header
     header = stream.read(8)
     assert header[0..4] == "LCAT"
-    assert readInt(header, 4) == 1          # format version
+    assert readInt(header, 4) == 1          # format version: must equal 1
 
     # 2. Read checkpoint
     chkLen   = readVarint(stream)
     chkBytes = stream.read(chkLen)
     state    = decodeCheckpoint(chkBytes)   # populates UUID, IDs, entities,
                                             # committed txns, inline tables,
-                                            # manifest pools
+                                            # manifest pools; fails if
+                                            # min_reader_version is absent or
+                                            # > SUPPORTED_READER_VERSION (1)
 
     # 3. Read and apply transaction log
     while stream.hasRemaining():
@@ -546,19 +642,21 @@ function READ(fileIO, location):
         txnBytes = stream.read(txnLen)
         txn      = decodeTransaction(txnBytes)
 
-        if state.committedTxn.contains(txn.id):
-            continue                         # already applied (idempotent)
+        if not state.mayApply(txn.id):
+            continue                         # in the committed set (a retry), or
+                                             # at or below its GC horizon
         if txn.verify(state):
             txn.apply(state)
             state.committedTxn.add(txn.id)
 
-    return freeze(state)
+    return freeze(state)                     # merges the added ids into the set
 ```
 
-A transaction that fails verification during read is silently skipped (not
-applied, no error). This is correct behaviour: concurrent writers may append
-transactions that conflict with each other, and during log replay the losing
-transaction has no effect.
+A transaction that fails verification during read, or that `mayApply` rejects
+(see [Committed-set retention](#committed-set-retention-gc)), is silently
+skipped (not applied, no error). This is correct behaviour: concurrent writers
+may append transactions that conflict with each other, and during log replay
+the losing transaction has no effect.
 
 Inline-mode `UpdateTableInline` actions in delta mode fold their delta
 into the in-memory checkpoint via
@@ -570,21 +668,29 @@ two reads of the same catalog state — see [SPEC_TM.md](SPEC_TM.md)
 
 ## Commit Protocol
 
-Two thresholds control whether a commit takes the append path or the CAS
-(compaction) path:
+Two thresholds, and whether the FileIO can append, control whether a commit
+takes the append path or the CAS (compaction) path:
 
 | Property                          | Default     | Purpose |
 |-----------------------------------|-------------|---------|
-| `fileio.catalog.max.append.count` | 10000       | Soft limit on log records: a writer that reads at least this many CASes instead of appending. Writers retrying a lost append race do not re-read the count, so the log can run a few records past it. Sized to provider limits (S3 Express 10k parts, Azure AppendBlob 50k blocks). **Setting to 0 forces CAS on every commit**, for providers without conditional append (S3 standard, GCS). |
+| `fileio.catalog.max.append.count` | 10000       | Soft limit on log records: a writer that reads at least this many CASes instead of appending. Writers retrying a lost append race do not re-read the count, so the log can run a few records past it. Sized to provider limits (S3 Express 10k parts, Azure AppendBlob 50k blocks). **Setting to 0 forces CAS on every commit**, which an S3 standard bucket needs: `S3FileIO` reports `supportsAppend()`, but only S3 Express accepts its offset appends. A FileIO whose `supportsAppend()` is false (`GCSFileIO`) is CAS-only whatever the setting. |
 | `fileio.catalog.max.append.size`  | 16777216    | Soft performance target for total file size. Larger catalogs take longer to read. |
-| `fileio.catalog.throttle.retry.min-wait-ms` | 200 | First wait before retrying a write that storage throttled; later waits double, up to 5 s, for 8 attempts in all. |
+| `fileio.catalog.throttle.retry.min-wait-ms` | 200 | First wait before retrying a write that storage throttled; later waits double, up to the larger of 5 s and this value, each plus up to 50% random jitter, for 8 attempts in all. |
 
 `ProtoCatalogFile` tracks `appendCount` (the number of transaction records in
 the log portion), computed during `readInternal`.
 
 ```
+# landed(state): whether state's committed set holds txn.id
+# (containsTransaction). If txn.id is at or below state's GC horizon, the set
+# cannot say: throw CommitStateUnknown if a write of txn may have landed (the
+# write this read resolves, or an earlier one that ambiguous or unresolved
+# tracks), else CommitFailed (ProtoCatalogFormat.Mut.landed).
+# validateCommit(state, txn) returns state if landed(state), else throws
+# conflict(state).
+
 function COMMIT(fileIO, original, mutations):
-    txn      = buildTransaction(original, mutations)
+    txn      = buildTransaction(original, mutations)   # id minted after original's horizon
     txnBytes = encodeTransaction(txn)
     current  = original.location
     base     = original          # parsed state of current, unless stale
@@ -593,13 +699,13 @@ function COMMIT(fileIO, original, mutations):
     # Case 0: catalog does not exist yet
     if not current.exists():
         try:
-            return tryCAS(original, current, txnBytes, fileIO)
+            return tryCAS(original, current, txn, txnBytes, fileIO)
         catch Ambiguous or Conflict as e:
             # The creation may have landed: its reply was lost, reading it back
             # failed, or it failed its precondition, as a transport retry of a
             # creation that landed does.
             fresh = READ(fileIO, current.location)   # failure: throw CommitStateUnknown
-            if txn.id in fresh.committed:
+            if landed(fresh):
                 return fresh                 # the creation landed
             if e is Conflict:
                 throw CommitFailed           # another writer created the catalog
@@ -609,9 +715,10 @@ function COMMIT(fileIO, original, mutations):
     unresolved = false   # a write failed its precondition; no read has ruled it out
     for attempt in 0..9:
       try:
-        # Must CAS when either limit is at/beyond threshold based on the
-        # observable file state. (maxAppendCount=0 forces CAS on every
-        # commit — useful for backends without conditional append.)
+        # Must CAS when the FileIO cannot append, or either limit is
+        # at/beyond threshold based on the observable file state.
+        # (maxAppendCount=0 forces CAS on every commit, for a backend that
+        # reports supportsAppend() but cannot append, as an S3 standard bucket.)
         mustCAS = not fileIO.supportsAppend()
             or base.appendCount >= maxAppendCount
             or current.length + len(txnBytes) > maxAppendSize
@@ -626,11 +733,11 @@ function COMMIT(fileIO, original, mutations):
                 current = fileIO.newInputFile(current.location)
                 base    = READ(fileIO, current)
                 stale   = false
-                if txn.id in base.committed:
+                if landed(base):
                     return base              # an append reported as a lost race landed
                 unresolved = false
             try:
-                return validateCommit(tryCAS(base, current, txnBytes, fileIO), txn)
+                return validateCommit(tryCAS(base, current, txn, txnBytes, fileIO), txn)
             catch Conflict:
                 unresolved = true
             # CAS conflict: rebase. Replay checks txn's preconditions against
@@ -643,7 +750,7 @@ function COMMIT(fileIO, original, mutations):
             # CommitFailed otherwise. The client retries.
             current = fileIO.newInputFile(current.location)
             base    = READ(fileIO, current)
-            if txn.id in base.committed:
+            if landed(base):
                 return base                  # an earlier attempt landed
             unresolved = false
             if not txn.verify(base):
@@ -665,7 +772,7 @@ function COMMIT(fileIO, original, mutations):
                 # decision sees the current appendCount; afresh, as above.
                 current = fileIO.newInputFile(current.location)
                 base    = READ(fileIO, current)
-                if txn.id in base.committed:
+                if landed(base):
                     return base              # an append reported as a lost race landed
                 unresolved = false
             else:
@@ -685,7 +792,7 @@ function COMMIT(fileIO, original, mutations):
         current = fileIO.newInputFile(current.location)
         base    = READ(fileIO, current)  # failure here: throw CommitStateUnknown
         stale   = false
-        if txn.id in base.committed:
+        if landed(base):
             return base                  # the write landed
         unresolved = false
         if not txn.verify(base):
@@ -703,7 +810,7 @@ function COMMIT(fileIO, original, mutations):
     if unresolved:
         # The last append lost a race, which its own landing also reports.
         base = READ(fileIO, current.location)  # failure here: throw CommitStateUnknown
-        if txn.id in base.committed:
+        if landed(base):
             return base
     throw CommitFailed("exceeded retry limit")
 ```
@@ -726,14 +833,26 @@ landed too: a transport retry of a write that landed fails it. But that write
 landed before the reply, so a read of the catalog that does not show it rules
 it out; until one does, a failed read is `CommitStateUnknown`.
 
+`COMMIT` fails a transaction that no longer holds on the state it lost a race
+to; restaging it on a fresh read is the caller's choice. `FileIOCatalog`
+restages namespace operations, renames and drops on a fresh read and retries
+their `CommitFailedException`, up to Iceberg's default number of attempts
+(`commitOnAFreshRead`, `dropTable`; a table create likewise, in
+`FileIOTableOperations.commitCreate`). `commitTransaction` does not retry: a
+catalog transaction conflicts on the whole version of each table it pins.
+
 ### CAS-only Mode
 
 Setting `fileio.catalog.max.append.count=0` makes every commit go through
 `tryCAS`. A CAS that loses a race rebases as above, so concurrent commits whose
-preconditions do not overlap all succeed, as they would on the append path. This is required for storage providers that support conditional
-full-object replacement but not conditional append (S3 standard via if-match
-ETag, GCS via generation number). The commit loop never enters the append
-branch because `appendCount >= 0` is always true.
+preconditions do not overlap all succeed, as they would on the append path. The
+commit loop never enters the append branch because `appendCount >= 0` is always
+true. A storage provider that supports conditional full-object replacement but
+not conditional append needs CAS-only commits. On GCS (CAS via generation
+number) the format forces them: `GCSFileIO.supportsAppend()` is false. On an S3
+standard bucket (CAS via if-match ETag) the setting is required: `S3FileIO`
+reports `supportsAppend()`, but appends with a write offset, which only S3
+Express directory buckets accept.
 
 ### tryCAS
 
@@ -741,15 +860,17 @@ Builds a full file (header + checkpoint + transaction) and writes it
 atomically, conditioned on the ETag / generation number of the existing file.
 
 ```
-function tryCAS(base, current, txnBytes, fileIO):
-    return WRITE(current, buildFullFile(base, txnBytes), Strategy.CAS, fileIO)
+function tryCAS(base, current, txn, txnBytes, fileIO):
+    return WRITE(current, buildFullFile(base, txn, txnBytes), Strategy.CAS, fileIO)
 ```
 
 `buildFullFile` creates:
 `[MAGIC][VERSION][varint(chkLen)][checkpoint][varint(txnLen)][txn]`. The
 checkpoint is encoded from `base` alone, the replayed state of the file being
-replaced; the pending mutations are only in the transaction record, which
-replay verifies against `base` and applies, exactly as for an append. `base`
+replaced, its committed set filtered at a GC watermark capped below `txn`'s own
+id (see [Committed-set retention](#committed-set-retention-gc)); the pending
+mutations are only in the transaction record, which replay verifies against
+`base` and applies, exactly as for an append. `base`
 is usually the writer's `original`. After a lost append race it is the state
 the writer re-read, and a transaction whose preconditions no longer hold is
 rejected at replay (`validateCommit` throws).
@@ -767,14 +888,15 @@ function tryAppend(current, txnBytes, fileIO):
 Both write through `WRITE`, which retries a write that storage throttles
 (`StorageThrottleException`: a 429, a 5xx, the GCS per-object update rate)
 after a backoff that starts at `fileio.catalog.throttle.retry.min-wait-ms` and
-doubles up to 5 s. Every attempt carries the same precondition, so at most one
-lands; a retry of one that landed fails its precondition, which `COMMIT`
-resolves by reading.
+doubles up to the larger of 5 s and that value, each wait plus up to 50% random
+jitter (`ProtoCatalogFormat.Mut.retryThrottled`). Every attempt carries the
+same precondition, so at most one lands; a retry of one that landed fails its
+precondition, which `COMMIT` resolves by reading.
 
 ```
 function WRITE(current, bytes, strategy, fileIO):
     for attempt in 0..7:
-        outputFile = fileIO.newAtomicOutputFile(current)
+        outputFile = fileIO.newOutputFile(current)
         token      = outputFile.prepare(bytes, strategy)
         try:
             written = outputFile.writeAtomic(token, bytes)
@@ -795,11 +917,13 @@ Compaction is triggered by observable file state — no per-transaction
 hint flag is required, because correctness rests on atomic append + atomic
 CAS at the storage layer:
 
-1. The next writer reads the file. If `appendCount >= maxAppendCount` or
+1. The next writer reads the file. If its FileIO cannot append
+   (`supportsAppend()` is false), `appendCount >= maxAppendCount`, or
    `current.length + len(txnBytes) > maxAppendSize`, it enters the CAS
    branch.
-2. The CAS builds a fresh checkpoint from the fully-replayed state and
-   writes `[header][checkpoint][new-txn]`, replacing the entire file.
+2. The CAS builds a fresh checkpoint from the fully-replayed state,
+   dropping committed ids at or below its GC watermark, and writes
+   `[header][checkpoint][new-txn]`, replacing the entire file.
 3. After CAS, the file has a single record in the log portion (the
    committing transaction), and `appendCount = 1`.
 
@@ -808,7 +932,7 @@ disagree on when to compact, but they cannot corrupt the catalog: the
 worst case is one writer continues appending past another writer's
 preferred threshold. Both atomic primitives still enforce linearizable
 ordering. The committed-transaction-ID set is carried forward in the
-checkpoint for idempotency.
+checkpoint for idempotency, less the ids its GC pass drops.
 
 ## Late-Binding
 
@@ -819,21 +943,24 @@ late-bound ID, and replay binds it to a real ID:
   children) and numbers new namespaces and tables `-1, -2, ...`
   (separate sequences). Actions later in the same transaction reference
   a new entity by its late-bound ID.
-- Version fields are set to `-1` when the referenced entity was created
-  in the same txn.
+- A create's own `version` is 1, the version replay gives the new
+  entity. A version field that names another entity (`parent_version`,
+  `namespace_version`, `new_namespace_version`) is `-1` when that entity
+  is created in the same txn.
 - On replay, `Transaction.apply` binds each late-bound ID, at its
   defining create, to the replaying state's next namespace / table ID
   (`ProtoCodec.IdBinding`), and resolves later references to it. Every
   reader replays the log in the same order, so every reader assigns the
   same IDs.
 - `Transaction.verify` rejects a record that references a late-bound ID
-  before (or without) the create that defines it.
+  before (or without) the create that defines it, or that defines one
+  twice.
 
 Binding at replay is what keeps concurrent creates apart. When writers
 allocated IDs from their own snapshot, two writers that read the same
 snapshot and created unrelated entities -- e.g. tables in different
-namespaces -- wrote records with the same ID. Both records verified, and replay let the second overwrite the
-first.
+namespaces -- wrote records with the same ID. Both records verified,
+and replay let the second overwrite the first.
 
 ## State Model
 
@@ -842,23 +969,26 @@ The catalog state is held in `ProtoCatalogFile` (immutable snapshot):
 | Field                | Type                             | Description                          |
 |----------------------|----------------------------------|--------------------------------------|
 | `uuid`               | `UUID`                           | Catalog identity (UUIDv7)            |
-| `nextNamespaceId`    | `int`                            | Next namespace ID to allocate        |
-| `nextTableId`        | `int`                            | Next table ID to allocate            |
+| `nextNamespaceId`    | `int`                            | Next namespace ID replay binds       |
+| `nextTableId`        | `int`                            | Next table ID replay binds           |
 | `appendCount`        | `int`                            | Transaction records in the log       |
 | `namespaceById`      | `Map<Integer, NsEntry>`          | Namespace ID → entry                 |
 | `namespaceLookup`    | `Map<Namespace, Integer>`        | Namespace path → ID (derived)        |
 | `nsProperties`       | `Map<Integer, Map<Str, Str>>`    | Namespace ID → properties            |
 | `tableById`          | `Map<Integer, TblEntry>`         | Table ID → entry                     |
 | `tableLookup`        | `Map<TableIdentifier, Integer>`  | Table name → ID (derived)            |
-| `tblInlineMetadata`  | `Map<Integer, byte[]>`           | Table ID → TableMetadata JSON bytes  |
+| `tblInlineMetadata`  | `Map<Integer, byte[]>`           | Table ID → encoded TableMetadata bytes |
+| `tblInlineMetadataCodec` | `Map<Integer, Byte>`         | Table ID → codec tag of those bytes  |
 | `tblManifestPrefix`  | `Map<Integer, String>`           | Table ID → manifest-list prefix      |
 | `manifestPool`       | `Map<Integer, Map<String, ManifestFile>>` | Per-table manifest pool     |
 | `snapshotManifests`  | `Map<Integer, Map<Long, List<String>>>`   | Per-snapshot manifest paths |
-| `committedTxns`      | `Set<UUID>`                      | Applied transaction IDs              |
+| `committedTransactionsBytes` | `byte[]`                 | Applied transaction IDs: the inner `CommittedTransactions` bytes (compressed) |
 
-Inline-only fields (`tblInlineMetadata`, `tblManifestPrefix`, `manifestPool`,
-`snapshotManifests`) are described in [SPEC_TM.md](SPEC_TM.md) and
-[SPEC_ML.md](SPEC_ML.md).
+Inline-only fields (`tblInlineMetadata`, `tblInlineMetadataCodec`,
+`tblManifestPrefix`, `manifestPool`, `snapshotManifests`) are described in
+[SPEC_TM.md](SPEC_TM.md) and [SPEC_ML.md](SPEC_ML.md). The committed set is
+queried in place (`containsTransaction`); `committedTransactions()` decodes a
+`Set<UUID>` on demand, for tests and tooling.
 
 **The root namespace** is an ordinary `NsEntry` row with id 0
 (`parentId = 0`, `name = ""`), present in every catalog and written to
@@ -872,9 +1002,10 @@ parent. The root is otherwise reserved:
   `Namespace.empty()` does not exist as far as callers are concerned;
 - no action may create or drop it (`CreateNamespace` / `DropNamespace`
   with id 0 fail verification);
-- tables and namespace properties cannot live on it: `FileIOCatalog`
-  rejects table identifiers with an empty namespace
-  (`supportsEmptyNamespace() = false` in the Iceberg catalog contract).
+- tables and namespace properties cannot live on it. Writers enforce
+  this, not replay: `CatalogFile.Mut` treats the empty namespace as one
+  that does not exist, and `FileIOCatalog.isValidIdentifier` rejects a
+  table identifier with an empty namespace.
 
 **Entry classes:**
 
@@ -896,31 +1027,64 @@ would lose its metadata file there.
 
 ## Action Verification Rules
 
-Each action's `verify()` checks version-based preconditions:
+Replay applies a record only if `ProtoCatalogFile.Builder.mayApply`
+admits its id (not in the committed set, and above the set's GC horizon;
+see [Committed-set retention](#committed-set-retention-gc)) and
+`Transaction.verify` accepts it. `Transaction.verify` rejects a record
+whose:
+
+- transaction id is not a UUIDv7;
+- late-bound id is referenced before (or without) its defining create,
+  or defined twice (`ProtoCodec.IdBinding`);
+- action references a namespace or table that another of its actions
+  drops (`Transaction.selfConsistent`, Bug 14): every action verifies
+  against the state before the transaction, so such a record would pass
+  and apply to a state no read could build;
+- action fails its own `verify()`, checked against the state before the
+  transaction, not after the record's earlier actions:
 
 | Action                   | Precondition                                              |
 |--------------------------|-----------------------------------------------------------|
-| CreateNamespace          | not the root (id 0); parent version matches (skip if late-bound) |
+| CreateNamespace          | not the root (id 0); parent version matches (skipped if -1: late-bound) |
 | DropNamespace            | not the root (id 0); namespace version matches            |
-| SetNamespaceProperty     | namespace version matches (skip if late-bound)            |
-| RemoveNamespaceProperty  | namespace version matches (skip if late-bound)            |
-| CreateTable              | namespace version matches (skip if late-bound)            |
+| SetNamespaceProperty     | namespace version matches (skipped if -1)                 |
+| RemoveNamespaceProperty  | namespace version matches (skipped if -1)                 |
+| CreateTable              | namespace version matches (skipped if -1)                 |
 | DropTable                | table version matches                                     |
 | UpdateTableLocation      | table version matches                                     |
 | ReadTable                | table version matches                                     |
-| CreateTableInline        | namespace version matches (skip if late-bound)            |
+| CreateTableInline        | namespace version matches (skipped if -1)                 |
 | UpdateTableInline        | table version matches                                     |
+| RenameTable              | table version matches; destination namespace version matches (skipped if -1) |
+| unknown action type      | always passes (`UnknownAction`)                           |
 
-Each `apply()` bumps the version of any entity whose state it mutates. See
-[design.md](design.md) for the operation × operation conflict matrix that
-falls out of these rules.
+Each `apply()` bumps the version of any entity whose state it mutates: a
+table update or rename bumps the table, and a create starts its entity at
+the record's `version` (1). A namespace's version covers its children and
+properties: creating, dropping or renaming a child bumps the parent
+namespace (a rename bumps both, when they differ), and setting or removing
+a property bumps that namespace. `ReadTable` and unknown actions change
+nothing. See [design.md](design.md) for the operation × operation conflict
+matrix that falls out of these rules.
 
 ## Schema Evolution
 
 Protobuf's forward and backward compatibility applies: new field numbers
 can be added without breaking old readers, and removed fields leave their
-numbers reserved. Unknown fields are silently skipped during decode (see
-`ProtoCodec.skipField`).
+numbers reserved (`Transaction` reserves 2, the former `sealed`).
+
+- Unknown fields are silently skipped during decode (`ProtoCodec.skipField`,
+  for wire types 0, 1, 2 and 5); an unknown wire type throws, failing the
+  read.
+- An unknown action type decodes as `UnknownAction`, which always
+  verifies and applies nothing; the record's other actions apply.
+- The header's `formatVersion` must equal `ProtoCatalogFormat.FORMAT_VERSION`
+  (1).
+- `Checkpoint.min_reader_version` gates changes a reader cannot skip safely:
+  every checkpoint carries `ProtoCodec.SUPPORTED_READER_VERSION` (1), and a
+  reader refuses one that lacks the field or carries more than it supports. It
+  gates checkpoints only: a record appended to a checkpoint is read by any
+  reader that accepts the checkpoint.
 
 ## Key Files
 

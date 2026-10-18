@@ -1,8 +1,8 @@
 # Committed-transaction-set encoding benchmarks
 
-JMH results for four candidate encodings of `Checkpoint.committed_transaction_ids`.
+JMH results for four candidate encodings of the checkpoint's committed-transaction set, then `repeated bytes committed_transaction_ids` and now `Checkpoint.committed_transactions` (message `CommittedTransactions`, field 20).
 
-- **D**: status quo. 16 raw bytes per UUID. Decoder materializes into a `HashSet<UUID>` for O(1) lookups.
+- **D**: status quo at the time. 16 raw bytes per UUID. Decoder materializes into a `HashSet<UUID>` for O(1) lookups.
 - **A**: successive deltas (varint), descending sort, linear scan with early exit. Operates on compressed bytes — no materialization.
 - **B**: fixed64 base+delta, descending sort, binary search on the delta column. Operates on compressed bytes.
 - **C**: indexed varint with skip-list (skip every 16 entries; per-bucket cumulative-delta anchor).
@@ -10,9 +10,11 @@ JMH results for four candidate encodings of `Checkpoint.committed_transaction_id
 Source: `src/test/java/org/apache/iceberg/io/bench/CommittedTxnsBench.java`. Run via:
 
 ```
-mvn exec:java -Dexec.mainClass=org.openjdk.jmh.Main -Dexec.classpathScope=test \
+mvn test-compile exec:java -Dexec.mainClass=org.apache.iceberg.io.bench.CommittedTxnsBench -Dexec.classpathScope=test \
   -Dexec.args="-f 0 -wi 2 -i 3 -r 1s -w 1s -rf json -rff target/jmh-results.json"
 ```
+
+The class's `main` passes its arguments to JMH, runs only this class's benchmarks (`org.openjdk.jmh.Main` would also run `TableMetadataEncodingBench`), and prints the encoded-size table.
 
 ## Encoded sizes
 
@@ -102,7 +104,9 @@ If a future deployment is memory-constrained (millions of committed-txn entries,
 
 ## Decision
 
-Implement **encoding A** for `Checkpoint.committed_transaction_ids`. Keep HashSet materialization at decode time. This delivers the requested compression with zero query-latency regression.
+Implement **encoding A** for the committed set (now `Checkpoint.committed_transactions`). Keep HashSet materialization at decode time. This delivers the requested compression with zero query-latency regression.
+
+As built (a19051a), lookups do not materialize a HashSet: they scan the encoded bytes (`ProtoCodec.committedSetContains`), a linear scan like A's above. Only a builder's in-flight additions are held in a `HashSet`.
 
 Defer encoding B / on-compressed lookup as a future option; the wire format leaves room to add a "skip materialization" mode without changing the bytes.
 

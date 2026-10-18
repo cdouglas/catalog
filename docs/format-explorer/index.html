@@ -581,7 +581,7 @@
           {"number": 5, "name": "name", "type": "string", "repeated": false, "packed": false, "oneof": null, "comment": ""},
           {"number": 6, "name": "metadata", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": "encoded TableMetadata bytes; see metadata_codec"},
           {"number": 7, "name": "metadata_codec", "type": "InlineMetadataCodec", "repeated": false, "packed": false, "oneof": null, "comment": "codec for `metadata`"},
-          {"number": 8, "name": "delta", "type": "TableMetadataDelta", "repeated": false, "packed": false, "oneof": null, "comment": "Optional: the manifest pool entries of the inline-ML snapshots a create transaction commits with the table (AddManifestDelta updates only; errata D9)."}
+          {"number": 8, "name": "delta", "type": "TableMetadataDelta", "repeated": false, "packed": false, "oneof": null, "comment": "Optional: the manifest lists of the inline-ML snapshots a create transaction commits with the table, as manifest updates only (each snapshot's list as a delta on its parent's; errata D9). Applied with the metadata."}
         ]
       },
       "UpdateTableInline": {
@@ -592,7 +592,7 @@
           {"number": 4, "name": "full_metadata", "type": "bytes", "repeated": false, "packed": false, "oneof": "payload", "comment": "encoded TableMetadata; see full_metadata_codec"},
           {"number": 5, "name": "metadata_location", "type": "string", "repeated": false, "packed": false, "oneof": "payload", "comment": "pointer fallback (eviction)"},
           {"number": 6, "name": "full_metadata_codec", "type": "InlineMetadataCodec", "repeated": false, "packed": false, "oneof": null, "comment": "Codec for `full_metadata`. Only meaningful when the oneof is set to full_metadata; ignored otherwise."},
-          {"number": 7, "name": "ml_delta", "type": "TableMetadataDelta", "repeated": false, "packed": false, "oneof": null, "comment": "Optional, with full_metadata only: the manifest pool entries of the inline-ML snapshots the commit adds (AddManifestDelta updates only), so they land with the metadata."}
+          {"number": 7, "name": "ml_delta", "type": "TableMetadataDelta", "repeated": false, "packed": false, "oneof": null, "comment": "Optional, with full_metadata only: manifest updates for the lists of the inline-ML snapshots the commit adds, and of any inline snapshot the table holds no list for (Bug 62), so they land with the metadata."}
         ]
       },
       "TableMetadataDelta": {

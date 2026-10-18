@@ -6,9 +6,30 @@ grouped by what they are; within each group, ordering is suggestive, not
 strict.
 
 For invariants that must not regress, see [design.md](design.md). For the
-wire format see [SPEC.md](SPEC.md). Bugs in Apache Iceberg itself, which
-this project's tests work around, are in
-[ICEBERG_ISSUES.md](ICEBERG_ISSUES.md).
+wire format see [SPEC.md](SPEC.md). Bugs in Apache Iceberg itself are in
+[ICEBERG_ISSUES.md](ICEBERG_ISSUES.md). Upstream fixed C1 (1.11.0), and
+the fork's `core-fixes` branch fixes C2-C7, so this project's tests no
+longer work around them (63dd25e, b82ceb9, dbac28b, 411f73c, e2c6b7b);
+`TestIcebergCoreIssues` asserts each is absent. On stock Iceberg 1.12.0
+C2-C7 come back.
+
+An entry's ID is not reused: a fixed entry is deleted or marked
+resolved, and its ID retired. Retired: S3, D1-D3, D5-D7, D11, T1, T2,
+U3 (`git log -p docs/errata.md` has each). Five IDs were reused before
+this rule, so an older code comment or commit citing one may mean the
+earlier entry:
+
+- S2: `BaseTransaction.TransactionTableOperations` did not forward
+  `ManifestListSink` (fixed 6f30fbb).
+- D9: an inline-ML create transaction lost its manifests' partition
+  spec ids (fixed 3c614c2: the create carries its manifest-pool delta).
+- D10: single-pass rewrite of the committed set (fixed b1af354); then
+  ADLS CAS with vended SAS credentials (fixed in the fork, entry dropped
+  a8aa0e9).
+- T4: the abstract suites were duplicated (fixed 35076d6); then inline
+  `CatalogTests` reachability tests (14ac8d2).
+- T5: `TestInlineDelta` lacked a reconstruction round trip for
+  `addSnapshot` (fixed 07195d5).
 
 ## Current Shortcuts
 
@@ -17,13 +38,24 @@ this project's tests work around, are in
 `FileIOCatalog.wrapInlineManifests` calls
 `TableMetadata.Builder.replaceSnapshots(Map<Long, Snapshot>)` to swap
 parsed `BaseSnapshot` instances for `InlineSnapshot` wrappers after
-`TableMetadataParser.fromJson` returns. `replaceSnapshots` is a 32-line
+`TableMetadataParser.fromJson` returns. `replaceSnapshots` is a 28-line
 addition to `TableMetadata.Builder` in the iceberg fork (with a
-`snapshotsReplaced` flag wiring it into `hasChanges()`).
+`snapshotsReplaced` flag wiring it into `hasChanges()`). The fork makes
+two more changes to core for inline tables:
 
-This works, but it is a builder semantics change in core that would have
-to be upstreamed — or rewritten — before this catalog could ride a stock
-Iceberg. The cleaner alternative is a parser-level hook: detect the
+- `TableMetadata.Builder.setLastUpdatedMillis` (17 lines, 6085f96f4)
+  lets replay pin the writer's last-updated-ms, which `buildFrom`
+  resets and `setRef` and `build` otherwise take from the clock; since
+  Iceberg 1.12.0 a delta that only adds a snapshot needs it too
+  (design.md I4, Bug 60).
+- `BaseSnapshot.equals` accepts any `Snapshot`, not only a
+  `BaseSnapshot` (d0b03bc1b), so a `BaseSnapshot` and an
+  `InlineSnapshot` of the same snapshot are equal both ways.
+
+These work, but they are builder and equality changes in core that
+would have to be upstreamed — or rewritten — before this catalog could
+ride a stock Iceberg. For `replaceSnapshots`, the cleaner alternative is
+a parser-level hook: detect the
 `inline://<snapshotId>` sentinel during snapshot deserialization, look up
 pool entries, and construct `InlineSnapshot` directly. **Trigger to
 revisit:** any plan to drop the iceberg fork or upstream the changes.
@@ -57,7 +89,7 @@ fork has since changed both:
 So this catalog is not a drop-in replacement in an existing Iceberg
 deployment: anything that implements or calls `commitTransaction` must
 use the new signature, and a catalog transaction run against a stock
-`BaseCatalogTransaction` keeps both bugs. `RESTCatalog` accepts the read
+`BaseCatalogTransaction` keeps all three bugs. `RESTCatalog` accepts the read
 set but does not send it, so a REST server sees only the table commits'
 requirements and keeps the race Bug 21 closes here.
 
@@ -71,16 +103,20 @@ the whole table.
 
 ### D4. `RewriteTablePathUtil` does not handle inline-ML tables
 
-`core/.../RewriteTablePathUtil.java:252,280` calls `ManifestLists.write()`
-unconditionally and dereferences `snapshot.manifestListLocation()` with
-no null check. Running the path-rewrite migration utility on an
-inline-ML table NPEs. Pre-existing in upstream; flagged here so users
-who hit it mid-migration can recognize it.
+The path-rewrite migration utility writes a new manifest list file for
+each snapshot, and an inline-ML snapshot has none to rewrite. Rewriting
+the paths of an inline-ML table is unsupported: evict it to pointer mode
+first (a commit through a catalog with `fileio.catalog.inline=false`
+does), which writes its manifest lists to files. The fork's
+`RewriteTablePathUtil` fails fast with `IllegalStateException`
+(`checkSnapshotIsNotInline`, fork 904c23865) on a snapshot without a
+manifest list location, in both `replacePaths` and
+`rewriteManifestList`.
 
 ### D9. Statistics-file changes force full mode (perf, not correctness)
 
 `InlineDeltaCodec.computeDelta` returns `null` whenever a stats file
-changed (the `statisticsChanged` check around line 784). Any commit that
+changed (the `statisticsChanged` check around line 938). Any commit that
 runs `setStatistics` in addition to a real change pays full-mode bytes,
 defeating the delta-mode benefit on tables that maintain stats. Adding
 `AddStatistics` / `RemoveStatistics` delta types is straightforward; the
@@ -254,7 +290,8 @@ canary fails and the upgrader knows to delete the workaround.
   with `ifGenerationMatch`), which fake-gcs-server has always enforced.
   Before 1.55.0 it ignored `ifGenerationMatch` on resumable uploads
   (`BlobWriteSession`, `WriteChannel`), the path `GCSFileIO` used until
-  iceberg `e0bc582f7`, so the six conflict tests in each `GCSCatalogTest*`
+  iceberg `8f94c5100` (`e0bc582f7` before the 1.12.0 rebase, on tag
+  `atomicio-1.10.1`), so the six conflict tests in each `GCSCatalogTest*`
   class failed on the emulator. `FakeGcsEmulatorCanaries` checks
   `ifGenerationMatch` on both kinds of upload. Zonal (Rapid) buckets take
   a single XML API PUT for CAS and an appendable upload for regular
@@ -266,8 +303,12 @@ canary fails and the upgrader knows to delete the workaround.
 
 ### T4. `testRegisterTable` (inline) needs a register-from-bytes API
 
-`TestS3CatalogCASInlineTM` and `GCSCatalogTestInlineTM` keep a
-single `@Disabled` override on `testRegisterTable`. The upstream test
+The inline-TM catalog suites (`TestS3CatalogInlineTM`,
+`TestS3CatalogCASInlineTM`, `GCSCatalogTestInlineTM`,
+`ADLSCatalogTestInlineTM`, `ADLSCatalogTestCASInlineTM`, and the
+`*InlineML` suites that extend them) keep a single `@Disabled` override
+on `testRegisterTable`, and `TestLocalCatalog` assumes it away in its
+inline-TM modes. The upstream test
 calls `catalog.dropTable(t)` then `catalog.registerTable(t, oldLoc)`
 with the previously-loaded metadata location string. After drop, the
 inline metadata bytes are gone, and there is no `registerTable(name,
@@ -284,30 +325,27 @@ bytes)` API on `FileIOCatalog` to re-inline them. Two options:
 **Trigger to revisit:** when a real workload needs catalog
 re-registration of a previously-dropped inline table.
 
-### T5. `catalog.proto` is a schema-of-record with no drift-detection oracle
+### T5. `catalog.proto` is a schema-of-record with no drift-detection oracle — RESOLVED
 
-`src/main/proto/catalog.proto` documents the on-disk wire format in
-protobuf IDL, but the build does not compile it. All encode/decode is
-hand-rolled in `ProtoCodec.java` and `InlineDeltaCodec.java` and stays
-byte-compatible with what `protoc`-generated code would produce by
-convention only. Field numbers, wire types, oneof membership, and
-message structure must agree between the `.proto` and the Java
-constants; today nothing fails the build if they diverge. The header
-comment in `catalog.proto` calls this out, but the comment is not a
-test.
+Resolved 2026-10-18 (516e9c4). The build still does not compile
+`catalog.proto`, and the codecs stay hand-rolled, but two tests now fail
+when the schema and the codecs diverge, with no `protobuf-java`
+dependency:
 
-A proportionate fix is a test-scope dependency on `protobuf-java`
-plus a CI-time validation oracle: feed a corpus of catalog files
-through both encoders, assert they produce identical bytes, and have
-the test framework parse `catalog.proto` so a missing field surfaces
-at test time. Estimate: ~30 minutes to wire up, ~50 MB of
-test-only dependency weight, no impact on runtime artifacts. The
-runtime stays lean; only CI carries the toolchain.
+- `CatalogProto` parses `catalog.proto` and checks that a catalog file
+  conforms to it: every field declared in its message, with a type of
+  the wire type it was written with, a declared enum value, a singular
+  field or oneof member at most once, valid UTF-8 in strings.
+  `CheckpointRoundTrip` applies it to every catalog file the suites and
+  fuzzers write.
+- `TestFormatExplorer` checks the codecs' field-number constants
+  against `catalog.proto` in both directions, so a field the codecs
+  write but the schema lacks, or one the schema declares but no codec
+  reads, fails even if no test writes it; and it checks that the format
+  explorer's embedded fixtures are the ones the current code generates.
 
-**Trigger to revisit:** the first time we ship a wire-format change
-that compiled-tool consumers (rather than the hand-rolled codec) need
-to read, or the first time review misses a drift between `.proto` and
-Java field numbers.
+The drift these found when they landed (missing fields and messages,
+wrong wire types, packed declarations) is fixed in `catalog.proto`.
 
 ## Known Unknowns
 

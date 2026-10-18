@@ -20,22 +20,27 @@ changed the behavior. The canaries assert only that the bug is absent,
 not the fork's way of fixing it, so a different fix upstream passes too.
 They matter most for C3 and C6, which the fuzzers don't reach reliably.
 The tests use only iceberg-core, so they also run in Iceberg's own test
-tree, where on stock 1.12.0 every canary but C1's fails:
+tree, where on stock 1.12.0 every canary but C1's fails. From the
+fileio-catalog directory, with the clone in a temporary directory:
 
 ```bash
-git clone --depth 1 --branch apache-iceberg-1.12.0 https://github.com/apache/iceberg.git
-mkdir -p iceberg/core/src/test/java/org/apache/iceberg/io
+tmp=$(mktemp -d)
+git clone --depth 1 --branch apache-iceberg-1.12.0 https://github.com/apache/iceberg.git "$tmp/iceberg"
+mkdir -p "$tmp/iceberg/core/src/test/java/org/apache/iceberg/io"
 cp src/test/java/org/apache/iceberg/io/TestIcebergCoreIssues.java \
-   iceberg/core/src/test/java/org/apache/iceberg/io/
-cd iceberg && ./gradlew :iceberg-core:test --tests org.apache.iceberg.io.TestIcebergCoreIssues
+   "$tmp/iceberg/core/src/test/java/org/apache/iceberg/io/"
+cd "$tmp/iceberg" && ./gradlew :iceberg-core:test --tests org.apache.iceberg.io.TestIcebergCoreIssues
 ```
 
 ## Status
 
 Checked on 2026-10-16 against Iceberg 1.12.0 and upstream main at
 `524fe9e`. On 2026-10-17 the atomicio fork moved from the 1.10.1 release
-to the 1.12.0 release, and its branch `core-fixes` began fixing these
-issues (see "Rebasing onto a newer Iceberg"). The Fork column is
+to the 1.12.0 release. By 2026-10-18 its branch `core-fixes` had all six
+fixes, C2 to C7 (see "Rebasing onto a newer Iceberg"). On 2026-10-18 the
+per-issue documents were checked against main at `9bbee07`: the files
+each fix changes are unchanged there since `524fe9e`, and each fix
+cherry-picks onto it (C2's test file only after C7's). The Fork column is
 `atomicio`, which sits on `core-fixes`.
 
 | Issue | Fork | 1.12.0 | main | Upstream |
@@ -66,8 +71,15 @@ workarounds here are gone.
 2. Rebase `atomicio` onto `core-fixes`.
 3. Run the full `iceberg-core` tests on `core-fixes`. Then run
    fileio-catalog's suite on the published fork: its canaries
-   (`TestIcebergCoreIssues`) must all pass. Then run the fuzzers long
-   (CLAUDE.md lists them).
+   (`TestIcebergCoreIssues`) must all pass. Then run the fuzzers long:
+   `TestCatalogFaultProperties`, `TestCatalogRaceProperties`,
+   `TestInlineDifferentialProperties` and `TestInlineDeltaProperties`,
+   which drive Iceberg's APIs, and `spec/TestMultiWriterProperties`, at
+   the catalog-format layer. Each sets its tries in
+   `@Property(tries = …)`, which no system property overrides (jqwik's
+   `jqwik.tries.default` applies only to properties without one), so
+   raise them in the source for the run and put them back after. Run one
+   with `mvn test -Dtest=TestCatalogFaultProperties`.
 
 ## Issues
 
@@ -88,6 +100,7 @@ merge, f6 keeps its id.
   `TestCatalogFaultProperties.V3_PROPERTIES`, which turned off manifest
   merging on v3 tables. The fuzzer merges manifests on v3 tables again,
   and its row-lineage check stays.
+- **Canary:** `aDeleteThatMergesManifestsKeepsRowIds`.
 
 ### C2. A retried commit gives a manifest a second row-id range
 
@@ -119,6 +132,7 @@ second range: its data files' row ids changed.
   `TestCatalogFaultProperties`'s `preUpgrade` map, which exempted the
   files a table had at its v3 upgrade from the check that a row id never
   changes.
+- **Canary:** `aRetriedCommitKeepsAManifestsRowIds`.
 
 ### C3. A replace transaction brings back a snapshot expired since it began
 
@@ -158,6 +172,7 @@ list, so reading that snapshot failed.
   snapshots a ref reaches: it checks every snapshot again. Its
   `REPLACE_TABLE` model now drops a ref of the replacement whose snapshot
   was expired since the replace began.
+- **Canary:** `aReplaceDoesNotBringBackASnapshotExpiredSinceItStarted`.
 
 ### C4. A stale handle fails on a manifest in a newer partition spec
 
@@ -187,6 +202,8 @@ with a `NullPointerException`:
   `TestCatalogFaultProperties`: `staleSpecs`, which turned the exception
   into a rejection for merge appends, deletes and row deltas, and the
   `rewriteManifests` op's catch.
+- **Canary:** `aStaleHandleCommitsOnAManifestInANewerSpec`, for each
+  commit above but the row delta.
 
 ### C5. Rewriting manifests fails on a table without a current snapshot
 
@@ -212,6 +229,8 @@ metadata it commits on.
   in `TestCatalogFaultProperties`: it didn't generate a rewrite for a
   table its model said had no snapshot, and its `rewriteManifests` op
   caught the exception from a concurrent replace.
+- **Canary:** `aRewriteOfManifestsRunsOnATableWithoutASnapshot`, for both
+  cases.
 
 ### C6. A repeated cherry-pick leaves a table it can't plan
 
@@ -233,9 +252,11 @@ number (7)".
   table is v1. Its tests are in `TestWapWorkflow`.
 - **Removed with the fix:** the test,
   `aCherryPickRepeatedAfterAnExpiryLeavesATableItCannotPlan`, with
-  `TestIcebergCoreIssues` (the last of its tests), and the workaround,
+  `TestIcebergCoreIssues` (the last of its tests; the class came back with
+  the canaries), and the workaround,
   `TestInlineDifferentialProperties.files`'s comparison of a planning
   failure as the string "fails: ...".
+- **Canary:** `aCherryPickRepeatedAfterAnExpiryIsRefused`.
 
 ### C7. The all_* metadata tables miss the row ids of an upgraded file
 
@@ -258,6 +279,7 @@ reported could vary between runs.
   `allDataFilesMissesTheRowIdsOfAFileCarriedAcrossAnUpgrade`, and the
   workaround, `TestInlineDifferentialProperties.metadataTable`'s mask of
   `first_row_id` in the `all_*` tables.
+- **Canary:** `allDataFilesHasTheRowIdsOfAFileCarriedAcrossAnUpgrade`.
 
 ## Accepted Iceberg Behavior
 

@@ -108,7 +108,7 @@ public abstract class CatalogFile {
     // to {@link #inlineTables}: an entry here carries the AddManifestUpdate
     // payload that {@link ProtoCodec.CreateTableInlineAction#apply} applies
     // immediately after the table create. {@code null} / absent for non-ML
-    // creates and for inline-ML creates with no snapshots. Errata D9.
+    // creates and for inline-ML creates with no snapshots.
     protected final Map<TableIdentifier, byte[]> inlineTableCreateDeltas;
     // Companion to {@link #inlineTableUpdates}: optional ML-pool delta carried
     // alongside a FULL-mode update. Set when delta-mode TM encoding wasn't
@@ -120,7 +120,7 @@ public abstract class CatalogFile {
     protected final Map<TableIdentifier, Byte> inlineTableCodecs;
     protected final Map<TableIdentifier, Byte> inlineTableUpdateCodecs;
     // Pending renames: from-identifier -> to-identifier. The id stays put; only
-    // the (namespace, name) pair on TblEntry changes. See errata.md §D5.
+    // the (namespace, name) pair on TblEntry changes. See SPEC_TM.md "Rename".
     protected final Map<TableIdentifier, TableIdentifier> tableRenames;
 
     protected Mut(C original) {
@@ -303,7 +303,7 @@ public abstract class CatalogFile {
      * Renames a table in place: the table id stays put, only the
      * {@code (namespace, name)} pair on {@code TblEntry} changes. Inline state
      * keyed by id (manifest pool, snapshot manifest refs, inline TM bytes)
-     * follows by construction. See errata.md §D5.
+     * follows by construction. See SPEC_TM.md "Rename".
      */
     public T renameTable(TableIdentifier from, TableIdentifier to) {
       Preconditions.checkNotNull(from, "Source table cannot be null");
@@ -361,7 +361,7 @@ public abstract class CatalogFile {
      * staged snapshots. {@code deltaBytes} carries the AddManifestUpdate entries
      * that populate the per-table manifest pool atomically with the table
      * create — required so the on-disk encoded TableMetadata's
-     * {@code inline://&lt;snapId&gt;} sentinels resolve on reload. Errata D9.
+     * {@code inline://&lt;snapId&gt;} sentinels resolve on reload.
      */
     public T createTableInlineWithManifests(
         TableIdentifier table, byte[] metadata, byte codecTag, byte[] deltaBytes) {

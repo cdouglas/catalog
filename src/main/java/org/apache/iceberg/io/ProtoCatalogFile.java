@@ -674,8 +674,8 @@ public class ProtoCatalogFile extends CatalogFile {
      * Renames a table in place: keeps the id, swaps namespaceId/name/version, and
      * preserves the existing metadataLocation (inline tables carry null here).
      * Inline state (tblInlineMetadata, tblManifestPrefix, manifestPool,
-     * snapshotManifests) is id-keyed and intentionally untouched. See errata.md
-     * §D5.
+     * snapshotManifests) is id-keyed and intentionally untouched. See SPEC_TM.md
+     * "Rename".
      */
     public Builder renameTable(int id, int newNamespaceId, String newName, int newVersion) {
       TblEntry old = tableById.get(id);
@@ -803,7 +803,7 @@ public class ProtoCatalogFile extends CatalogFile {
     /**
      * Drops a snapshot's manifest ref list and GCs any pool entries no longer
      * referenced. Called from RemoveSnapshotsUpdate replay to prevent unbounded
-     * pool growth after snapshot expiration. See ML_INLINE_DESIGN_NOTES.md Gap 1.
+     * pool growth after snapshot expiration (SPEC_ML.md).
      */
     public Builder removeSnapshotManifests(int tblId, long snapshotId) {
       Map<Long, List<String>> refs = snapshotManifests.get(tblId);

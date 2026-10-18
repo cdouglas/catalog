@@ -1,11 +1,14 @@
 # TableMetadata inline-encoding benchmarks
 
 JMH results for four candidate encodings of inline `TableMetadata` bytes in
-`fileio-catalog`. Today the catalog stores `TableMetadataParser.toJson(meta)`
-unchanged (no compression) inside its protobuf `bytes` fields, with a 4 MiB
-budget per commit before falling back to "pointer mode" (external metadata
-file). Bytes saved per inline TableMetadata directly extends inline-snapshot
-headroom.
+`fileio-catalog`. When these were measured (2026-05-08), the catalog stored
+`TableMetadataParser.toJson(meta)` unchanged (no compression) inside its
+protobuf `bytes` fields, with a 4 MiB budget per commit before falling back
+to "pointer mode" (external metadata file). Bytes saved per inline
+TableMetadata directly extends inline-snapshot headroom. The catalog now
+writes the structural encoding by default (`StructuralInlineMetadataCodec`;
+`GzipInlineMetadataCodec` with `fileio.catalog.inline.tm.codec=gzip`), so
+this page is the record of that choice.
 
 - **json-gzip** (baseline). Iceberg's existing `TableMetadataParser.Codec.GZIP`.
   The bar to beat.
@@ -20,17 +23,20 @@ headroom.
   schema-id RLE). Everything else is unchanged JSON; whole thing gzipped.
 
 Source: `src/test/java/org/apache/iceberg/io/bench/`. The bench's
-`@State` parameterizes on the eight pathology scenarios in
-`SyntheticTableMetadata.Scenario` at `Intensity.MEDIUM`.
+`@State` parameterizes on eight of the nine pathology scenarios in the enum
+`org.apache.iceberg.io.bench.Scenario` (all but `SNAPSHOT_ACCUMULATION`) at
+`SyntheticTableMetadata.Intensity.MEDIUM`.
 
 Run via:
 
 ```
 mvn test-compile exec:java \
   -Dexec.mainClass=org.apache.iceberg.io.bench.TableMetadataEncodingBench \
-  -Dexec.classpathScope=test \
-  -Dexec.args="-wi 2 -i 3 -r 1s"
+  -Dexec.classpathScope=test
 ```
+
+`main` ignores its arguments; the warmup and measurement settings are the
+class's JMH annotations.
 
 The bench runs in-process (`forks(0)`) because `mvn exec:java` doesn't propagate
 the test classpath to JMH's forked JVMs. Relative comparisons remain
@@ -47,7 +53,7 @@ mvn test-compile exec:java \
   -Dexec.classpathScope=test
 ```
 
-312 checks across 4 encoders × 8 scenarios × 3 intensities (minus the
+312 checks across 4 encoders × 9 scenarios × 3 intensities (minus the
 50k-snapshot cell that hits the iterative-builder cliff): all pass.
 
 ## Why the candidate space is what it is — Phase A measurements
@@ -242,8 +248,10 @@ codec. The wins are:
   gzip(JSON) within ~1% on `VERBOSE_PROPERTIES`.
 
 The wire format is well-defined, hand-rolled (no proto codegen), and the
-encoder/decoder is self-contained in a single file. Wiring it into
-`FileIOCatalog`'s read/write path is a follow-up.
+encoder/decoder is self-contained in a single file. It has since been wired
+into `FileIOCatalog` as `StructuralInlineMetadataCodec`, the default (since
+revised to layout version 2, which stores metadata-log paths and summary
+values exactly: Bug 43).
 
 ## Caveats
 

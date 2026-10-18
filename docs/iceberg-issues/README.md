@@ -3,7 +3,8 @@
 Bugs in Apache Iceberg's core that fileio-catalog's fuzzers found. Each
 document covers the bug, a reproduction on Iceberg's own `InMemoryCatalog`,
 the cause with links to the 1.12.0 source, and the fix. It also lists the
-fix's tests, the workaround fileio-catalog dropped, and what to settle
+fix's tests, the workaround fileio-catalog dropped, its canary in
+`TestIcebergCoreIssues` that asserts the bug is absent, and what to settle
 before a pull request upstream. [../ICEBERG_ISSUES.md](../ICEBERG_ISSUES.md)
 tracks their status for rebases.
 

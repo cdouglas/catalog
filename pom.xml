@@ -296,8 +296,11 @@
           </excludes>
         </configuration>
       </plugin>
-      <!-- exec:java target for the JMH benchmark runner. Invoke:
-           mvn test-compile exec:java -Dexec.mainClass=org.apache.iceberg.io.bench.CommittedTxnsBench -Dexec.classpathScope=test -->
+      <!-- exec:java target for the JMH benchmarks in org.apache.iceberg.io.bench. Invoke:
+           mvn test-compile exec:java -Dexec.mainClass=org.apache.iceberg.io.bench.CommittedTxnsBench -Dexec.classpathScope=test -Dexec.args="-f 0"
+           -f 0 runs JMH in-process: exec:java does not give forked JVMs the test classpath.
+           TableMetadataEncodingBench runs in-process already and ignores its arguments. See
+           docs/UUID_V7_BENCH_RESULTS.md and docs/TM_ENCODING_BENCH_RESULTS.md. -->
       <plugin>
         <groupId>org.codehaus.mojo</groupId>
         <artifactId>exec-maven-plugin</artifactId>

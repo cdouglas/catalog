@@ -26,7 +26,8 @@ Inlining manifest lists into the catalog intention record:
 
 - removes the per-commit `snap-*.avro` write entirely;
 - combined with TM, reduces a typical data commit from ~100 KB across
-  three writes to **~250 bytes in one write**;
+  three writes to **a few hundred bytes in one write** (~0.38 KB per
+  log record in [sample/](sample/README.md));
 - carries forward unchanged manifests at zero per-commit cost (they live
   in the catalog's manifest pool, not in every snapshot's list).
 
@@ -64,29 +65,30 @@ snapshots' references.
 
 ```protobuf
 message InlineTable {
-  // fields 1-6: see SPEC_TM.md
+  // fields 1-6 and 9: see SPEC_TM.md
   repeated ManifestFileEntry     manifest_pool  = 7;
   repeated SnapshotManifestRefs  snapshot_refs  = 8;
 }
 
 message ManifestFileEntry {
-  string manifest_path_suffix   = 1;   // relative to table.manifest_list_prefix
-  int64  manifest_length        = 2;
-  int32  partition_spec_id      = 3;
-  int32  content                = 4;   // 0 = data, 1 = deletes
-  int64  sequence_number        = 5;
-  int64  min_sequence_number    = 6;
-  int64  added_snapshot_id      = 7;   // fixed64 encoding
-  int32  added_files_count      = 8;
-  int32  existing_files_count   = 9;
-  int32  deleted_files_count    = 10;
-  int64  added_rows_count       = 11;
-  int64  existing_rows_count    = 12;
-  int64  deleted_rows_count     = 13;
+  string  manifest_path_suffix   = 1;   // relative to table.manifest_list_prefix
+                                        //   (always "": the full path)
+  int64   manifest_length        = 2;
+  int32   partition_spec_id      = 3;
+  int32   content                = 4;   // 0 = data, 1 = deletes
+  int64   sequence_number        = 5;
+  int64   min_sequence_number    = 6;
+  fixed64 added_snapshot_id      = 7;
+  int32   added_files_count      = 8;   // counts 8-13: omitted when null
+  int32   existing_files_count   = 9;   //   or 0, and decode as 0
+  int32   deleted_files_count    = 10;
+  int64   added_rows_count       = 11;
+  int64   existing_rows_count    = 12;
+  int64   deleted_rows_count     = 13;
   repeated PartitionFieldSummaryEntry partitions = 14;
-  bytes  key_metadata           = 15;
-  int64  first_row_id           = 16;  // present whenever set, 0 included
-  bool   no_partitions          = 17;  // partitions is null, not an empty list
+  bytes   key_metadata           = 15;
+  int64   first_row_id           = 16;  // present whenever set, 0 included
+  bool    no_partitions          = 17;  // partitions is null, not an empty list
 }
 
 message PartitionFieldSummaryEntry {
@@ -97,41 +99,54 @@ message PartitionFieldSummaryEntry {
 }
 
 message SnapshotManifestRefs {
-  int64          snapshot_id  = 1;
-  repeated int32 pool_indices = 2;  // positions in manifest_pool
+  fixed64        snapshot_id  = 1;
+  repeated int32 pool_indices = 2 [packed = false];  // positions in manifest_pool
 }
 ```
 
 Wire encoding uses positional indices into `manifest_pool` so the on-disk
 representation is compact. The path-keyed map is reconstructed on decode.
+A checkpoint writes a `SnapshotManifestRefs` for every snapshot with an
+inline list, even an empty one and even when the pool is empty: the
+snapshot's `inline://` manifest-list location resolves through it.
 
 ## Delta Updates
 
-Two `TableMetadataUpdate` types carry manifest list changes inside an
-`UpdateTableInline` delta:
+Two `TableMetadataUpdate` types carry manifest list changes inside a
+delta (an `UpdateTableInline` delta or `ml_delta`, or
+`CreateTableInline.delta`):
 
 ```protobuf
 message AddManifestDelta {
-  int64              snapshot_id = 1;
+  fixed64            snapshot_id = 1;
   ManifestFileEntry  manifest    = 2;   // full ManifestFile entry
-  int32              position    = 3;   // optional: index in the snapshot's list
+  int32              position    = 3;   // index in the snapshot's list;
+                                        //   absent: appended
 }
 
 message RemoveManifestDelta {
-  int64  snapshot_id          = 1;
-  string manifest_path_suffix = 2;      // identifies manifest to remove
+  fixed64 snapshot_id          = 1;
+  string  manifest_path_suffix = 2;     // identifies manifest to remove
 }
 ```
 
 These are independent updates, not embedded in `AddSnapshot`. Each carries
-the snapshot ID it belongs to. On apply:
+the snapshot ID it belongs to; in a TM delta it follows that snapshot's
+`AddSnapshot` (SPEC_TM). A new snapshot's list starts as its parent's
+inline list (empty for none). On apply:
 
-- `AddManifestDelta` adds `manifest` to the table's pool (idempotent by
-  path) and appends the path to the snapshot's reference list.
+- `AddManifestDelta` adds `manifest` to the table's pool, replacing an
+  entry for the same path (entries for one path could differ only in
+  first row id, which the restate rule below keeps from changing), and
+  inserts the path in the snapshot's list at `position`, or at the end
+  if it is absent. Writers always set it.
 - `RemoveManifestDelta` removes the path from the snapshot's reference
   list.
+- `RemoveSnapshots` (SPEC_TM) drops each removed snapshot's list and the
+  pool entries no remaining list references. A full-mode update prunes
+  the lists of the snapshots its new metadata lacks the same way.
 
-Both operations cover every `SnapshotProducer` subclass in Iceberg —
+The two manifest updates cover every `SnapshotProducer` subclass in Iceberg —
 `FastAppend`, `MergeAppend`, `BaseOverwriteFiles`, `BaseRowDelta`,
 `BaseRewriteFiles`, `BaseReplacePartitions`, `StreamingDelete`,
 `CherryPickOperation`, `BaseRewriteManifests`. The
@@ -203,29 +218,15 @@ A commit takes each new snapshot's list from the snapshot: the snapshots
 in the new metadata that are `InlineSnapshot`s and not in the base, which
 the commit's producers returned. It turns them into manifest updates in
 the same intention record that carries the table update
-(`FileIOTableOperations.manifestUpdates`):
-
-```java
-List<DeltaUpdate> manifests = null;                   // null: no new inline snapshot
-for (Snapshot snap : metadata.snapshots()) {
-  if (!(snap instanceof InlineSnapshot) || base.snapshot(snap.snapshotId()) != null) {
-    continue;                                         // committed: its list is final
-  }
-  if (manifests == null) manifests = new ArrayList<>();
-  List<ManifestFile> list = snap.allManifests(io);    // held by the snapshot
-  List<ManifestFile> parent =                         // the list the replay builds on
-      snap.parentId() == null ? List.of()
-      : isNew(metadata.snapshot(snap.parentId())) ? metadata.snapshot(snap.parentId()).allManifests(io)
-      : proto.hasInlineManifests(tblId, snap.parentId()) ? proto.inlineManifests(tblId, snap.parentId())
-      : null;                                         // parent's list is a file
-  if (parent == null) {
-    attachManifestDelta(manifests, snap.snapshotId(), list, List.of(), prefix);
-  } else {
-    attachManifestDelta(manifests, snap.snapshotId(),
-        added(parent, list), removedPaths(parent, list), prefix);   // by manifest path
-  }
-}
-```
+(`FileIOTableOperations.manifestUpdates`). Each snapshot's list is
+diffed, by manifest path, against the list replay builds it on: none
+for a snapshot without a parent; its parent's, if the commit adds the
+parent too; else the parent's inline list in the catalog file the
+commit builds on. A manifest the snapshot keeps from that list is not
+sent; each other manifest in its list is an `AddManifestDelta` with its
+index in the list, and each manifest it drops a `RemoveManifestDelta`.
+If the parent's list is a file, so the catalog holds none, the snapshot
+sends its whole list.
 
 A list keeps its writer's order: each added manifest carries its index
 in the new list, and replay inserts the added manifests, in order of
@@ -233,10 +234,15 @@ index, into the parent's list less the removed ones. When the manifests
 a snapshot keeps are not in its parent's order, it removes them all and
 adds its whole list.
 
-Only snapshots the commit adds send lists. A committed snapshot's list
-never changes (design.md I3a), so a delta the sink was offered for one,
-or for a snapshot that never reached the metadata (errata D7), changes
-nothing. A new snapshot's list is sent as a delta against its parent's
+Only snapshots the commit adds send lists, with one exception: a full
+update or a create also sends the list of each inline snapshot in its
+metadata that the table holds no inline list for. Full metadata names
+every inline snapshot by its sentinel, and a handle that loaded the
+table inline can hold one whose list another writer has since written
+to a file and dropped, by evicting the table (a replace transaction
+commits the snapshots it loaded). A committed snapshot's list never
+changes (design.md I3a): one sent again is the list the snapshot has.
+A new snapshot's list is sent as a delta against its parent's
 list, and the replay builds it on the parent's *inline* list
 (`NewSnapshotManifests`). A parent whose list is an Avro file has no
 inline list, so a snapshot on such a parent carries its whole list.
@@ -252,38 +258,38 @@ lists of the snapshots before it (design.md I3a). Such a commit writes
 a metadata file, which holds each snapshot's list as it is, and the
 table returns inline with a later update that fits in full.
 
-The commit used to send the deltas the sink was offered, kept on the
-table handle that received them until a commit landed. A catalog
-transaction's commit has only its tables' new metadata, so it looked
-the handle up in a per-thread registry of loaded tables, and took
-another handle's leftover stage when one had it (a table transaction
-abandoned, or whose commit failed before it landed): its own snapshot
-then got its parent's list, and the acknowledged append was lost
-(`TestCatalogRegressions.CatalogTransactionWithAnotherHandleStaged`).
+The commit does not use the deltas the sink is offered: it would have
+to find them through the table handle that received them, and a catalog
+transaction's commit has only its tables' new metadata.
 
 The manifest updates ride in whichever form the table update takes
 (see [SPEC_TM.md](SPEC_TM.md) §"Delivery Modes"): appended to the TM
 delta, or bundled with full metadata as the `UpdateTableInline.ml_delta`
 payload. A full update or a create sends the payload whenever the commit
-adds an inline snapshot, even with no updates in it (a delete that
-matched nothing changes no manifests); the replay registers every new
-inline snapshot's list, so the invariant *sentinel ⇒ list* holds. A
-metadata-file update (eviction) writes each inline snapshot's list to
-an Avro file instead.
+adds an inline snapshot or names one the table has no list for, even
+with no updates in it (a delete that matched nothing changes no
+manifests); the replay registers the list of every inline snapshot of
+the new metadata that has none, so the invariant *sentinel ⇒ list*
+holds. A metadata-file update (eviction) writes each inline snapshot's
+list to an Avro file instead.
 
 A multi-table `commitTransaction` follows the same path: each table's
 new snapshots hold their lists, and its `stageUpdate` sends them.
 
 ### Create-with-snapshots
 
-A `createTransaction()` that runs one or more `newFastAppend` calls
+A `createTransaction()` whose snapshot producers (any of them:
+`newAppend`, `newFastAppend`, `newOverwrite`, `newDelete`, ...) run
 before `commitTransaction()` lands as a single inline create with
-embedded snapshots. The `CreateTableInline` action carries an optional
-`delta` field (`AddManifestDelta` entries only) that
-`InlineDeltaCodec.applyManifestsOnly` consumes on apply, the way a
-full-mode update does. The TM bytes inside the same
-action carry sentinel manifest-list locations
-(`inline://<snapshotId>`) for every freshly-created snapshot — see
+embedded snapshots. The `CreateTableInline` action carries their
+manifest updates in its optional `delta` field, built as a full
+update's are: the first snapshot's whole list, and each later
+snapshot's `AddManifestDelta` and `RemoveManifestDelta` updates against
+its parent's, so the payload may be empty.
+`InlineDeltaCodec.applyManifestsOnly` consumes it on apply, the way a
+full-mode update does. The TM bytes inside the same action carry
+sentinel manifest-list locations (`inline://<snapshotId>`) for every
+freshly-created snapshot — see
 [SPEC_TM.md](SPEC_TM.md) §"Commit Protocol" for the `InlineSnapshot →
 BaseSnapshot+sentinel` rewrite that produces them. Without the rewrite,
 the `gzip` codec falls into Iceberg's v1-embedded-manifests serialization
@@ -297,10 +303,7 @@ transactions have independently assigned the same schema / spec /
 sort-order id to different content (see [SPEC_TM.md](SPEC_TM.md)
 §"Concurrent-replace id collisions"). The commit then takes full mode,
 which carries the manifest updates as its `ml_delta` payload, so
-the new snapshots' lists land atomically with the TM replacement. (The
-multi-table path used to throw `CommitFailedException` here instead;
-Iceberg's replace-transaction retry reuses the producer's metadata, so
-the collision recurred on every attempt.)
+the new snapshots' lists land atomically with the TM replacement.
 
 ### Writers in Different Modes
 
@@ -311,15 +314,18 @@ metadata file location) clears the table's inline state, pool included.
 
 - A **pointer writer** (no inline TM) committing to an inline-ML table,
   and an inline writer **evicting** one (an update that does not fit in
-  `fileio.catalog.inline.max.update.size`), write a metadata file. A
-  metadata file can name only manifest list files, so
+  `fileio.catalog.inline.max.update.size`, or restates a pooled manifest,
+  above), write a metadata file. A metadata file can name only manifest
+  list files, so
   `writeUpdateMetadata` first writes each `InlineSnapshot`'s list to
   `<metadata dir>/snap-<snapshotId>-<uuid>.avro`
   (`ManifestListFiles.write`, the same writer `SnapshotProducer` uses;
   the manifests are already final, so they are copied unchanged). The
-  snapshot then names that file. The lists are written before the
-  catalog commit; a commit that fails leaves them behind, as it leaves
-  its metadata file.
+  snapshot then names that file. A v3 table's snapshot without a first
+  row id (from before the upgrade) gets the v2 list it had; an encrypted
+  snapshot (`key_id` set) cannot be written, and the commit fails. The
+  lists are written before the catalog commit; a commit that fails
+  leaves them behind, as it leaves its metadata file.
 - An **inline-TM writer** committing a snapshot to an inline-ML table
   writes an Avro manifest list for it; the table stays inline, in mixed
   mode.
@@ -338,7 +344,11 @@ ID is in the table's `snapshotManifests` map, replaces the parsed
 `BaseSnapshot` with an `InlineSnapshot` carrying the resolved manifest
 list from the pool. Snapshots without inline ML (older pointer-mode
 snapshots that survived a migration) remain as `BaseSnapshot` with their
-original `manifestListLocation`.
+original `manifestListLocation`. A snapshot whose location is the
+`inline://` sentinel but which has no inline list fails the load
+(catalog state corrupt). A table with both inline lists and list files
+(mixed mode) loads with a warning, or fails with
+`fileio.catalog.inline.strict=true`.
 
 The `InlineSnapshot`'s manifests are Iceberg's own classes,
 `GenericManifestFile` with `GenericPartitionFieldSummary` partitions,
@@ -358,6 +368,7 @@ write a list holding a partitioned table's inline manifest.
 | `fileio.catalog.inline`           | `false` | Inline TM (see SPEC_TM.md). |
 | `fileio.catalog.inline.manifests` | `false` | Inline ML. Requires `inline=true`. |
 | `fileio.catalog.inline.max.update.size` | 4,190,208 | Largest inline table update, manifest updates included (see SPEC_TM.md). |
+| `fileio.catalog.inline.strict`    | `false` | Fail loading a mixed-mode table (inline lists and list files) instead of logging a warning (see "Loading"). |
 
 Setting `inline.manifests=true` without `inline=true` raises
 `IllegalArgumentException` at catalog initialization. ML requires TM

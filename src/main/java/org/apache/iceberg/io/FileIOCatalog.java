@@ -740,7 +740,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
      */
     private Consumer<CatalogFile.Mut<?, ?>> stageCreate(TableMetadata metadata) {
       if (inline.metadata) {
-        // Errata D9: an inline-ML createTransaction with one or more
+        // An inline-ML createTransaction with one or more
         // newFastAppend calls puts InlineSnapshots into `metadata`. Two things
         // must happen for those snapshots to round-trip on reload:
         //   1. The encoded TableMetadata must carry a sentinel manifest-list
@@ -799,7 +799,8 @@ public class FileIOCatalog extends BaseMetastoreCatalog
           return;
         }
         if (isInline) {
-          // Null if delta encoding cannot express the change (errata D1, D6): full mode then.
+          // Null if delta encoding cannot express the change (a statistics change, errata D9; a
+          // concurrent replace's id collision, SPEC_TM.md): full mode then.
           List<InlineDeltaCodec.DeltaUpdate> delta =
               InlineDeltaCodec.computeDelta(base, metadata, prefix);
           if (delta != null) {
@@ -1006,11 +1007,11 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         return parsed;
       }
 
-      // §2.3: Any snapshot with an inline:// sentinel manifest-list location
-      // MUST have a pool entry — the sentinel is only written when the sink
-      // path is active, and the pool and sentinel must be committed atomically.
-      // A sentinel without a pool entry means the pool was clobbered (§1.1 bug
-      // or similar), and loading the BaseSnapshot as-is would result in
+      // Any snapshot with an inline:// sentinel manifest-list location MUST
+      // have a pool entry — the sentinel is only written when the sink path is
+      // active, and the pool and sentinel must be committed atomically. A
+      // sentinel without a pool entry means the pool was lost (a format bug),
+      // and loading the BaseSnapshot as-is would result in
       // FileNotFound when allManifests() tries to read `inline://<id>`. Fail
       // loudly instead of silently corrupting the read.
       for (Snapshot s : parsed.snapshots()) {
@@ -1138,7 +1139,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
    * tables silently lose {@code partitionSpecId}. The structural codec
    * already writes the sentinel via {@code planPaths}; this aligns the gzip
    * encoding with the structural codec and matches the create-path rewrite
-   * (errata D9).
+   * ({@code stageCreate}).
    */
   private static TableMetadata rewriteInlineSnapshotsForFullEncode(TableMetadata metadata) {
     Map<Long, Snapshot> sentinelReplacements = null;

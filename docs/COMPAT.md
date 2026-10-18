@@ -1,13 +1,13 @@
 ---
-last-verified: 2026-05-12 — full real-cloud matrix run under both gzip and structural inline-TM codecs (1961 tests, 0 failures, 163 skipped per codec).
+last-verified: 2026-05-12 — full real-cloud matrix run twice (1961 tests, 0 failures, 163 skipped each). Both runs wrote the default structural codec (see "How to update this doc"). Not re-run since; every cell is unverified on the current code.
 ---
 
 # Cloud-store compatibility matrix
 
 Status of `FileIOCatalog` cloud test suites across the
-**atomic-mode × inline-mode** grid:
+**cloud-store × commit-mode × inline-mode** grid:
 
-- **Atomic mode** — how `ProtoCatalogFormat` commits the catalog file:
+- **Commit mode** — how `ProtoCatalogFormat` commits the catalog file:
   - `CAS` — every commit is a compare-and-swap replace. Requested via
     `fileio.catalog.max.append.count=0`. Supported by every
     `SupportsAtomicOperations` FileIO.
@@ -34,16 +34,19 @@ Status of `FileIOCatalog` cloud test suites across the
     fallback.
   - `structural` — purpose-built columnar layout. 40% smaller at the corpus
     median, 4–7× faster on lazy-decode workloads. Default.
-  Cells in the matrix below are reported as `gzip / structural`. The two
-  codecs share the same code paths apart from the encode/decode methods,
-  so a regression in one is generally also a regression in the other; the
-  per-codec column is a redundancy check.
+  Cells in the matrix below are reported as `gzip / structural`. The cloud
+  runs never selected `gzip`, so its column was not separately exercised on
+  cloud storage. Locally, `TestInlineManifestEndToEnd`'s codec axis,
+  `TestCatalogFaultProperties` and `TestInlineDifferentialProperties`
+  write both codecs.
 
 Cell legend:
 
 | Code  | Meaning                                                      |
 |-------|--------------------------------------------------------------|
 | `OK`  | green — full `CatalogTests` + `CatalogTransactionTests` pass |
+| `OK*` | passed on 2026-05-12, not re-run since (see below)           |
+| `NR`  | not run: the suite exists, but this codec was not exercised  |
 | `WIP` | partial — known failures tracked in `errata.md`              |
 | `BAD` | broken                                                       |
 | `--`  | no suite for this cell yet                                   |
@@ -51,11 +54,18 @@ Cell legend:
 
 ## Matrix
 
-| Store | CAS · file | CAS · TM | CAS · TM+ML | append · file | append · TM | append · TM+ML |
-|-------|------------|----------|-------------|---------------|-------------|----------------|
-| GCS   | OK         | OK / OK  | OK / OK     | NA            | NA          | NA             |
-| S3    | OK         | OK / OK  | OK / OK     | OK            | OK / OK     | OK / OK        |
-| ADLS  | OK         | OK / OK  | OK / OK     | OK            | OK / OK     | OK / OK        |
+| Store | CAS · file | CAS · TM  | CAS · TM+ML | append · file | append · TM | append · TM+ML |
+|-------|------------|-----------|-------------|---------------|-------------|----------------|
+| GCS   | OK*        | NR / OK*  | NR / OK*    | NA            | NA          | NA             |
+| S3    | OK*        | NR / OK*  | NR / OK*    | OK*           | NR / OK*    | NR / OK*       |
+| ADLS  | OK*        | NR / OK*  | NR / OK*    | OK*           | NR / OK*    | NR / OK*       |
+
+Since the 2026-05-12 run the code under every cell has changed: for
+all stores, the fork's rebase onto Iceberg 1.12.0 (9296e10) and the
+fixes for Bugs 10-64; for ADLS, the catalog file kept an Append Blob
+with CAS by stage and rename (fork 7a0d5edf2); for GCS, each CAS in one
+request (fork 8f94c5100). The emulator runs also moved from MinIO to
+versitygw (a549bcf).
 
 ## Notes
 
@@ -63,49 +73,51 @@ Cell legend:
 
 - **Append is unsupported.** `GCSOutputFile.prepare` rejects
   `Strategy.APPEND` with a `Preconditions` check; the only honest
-  implementation would already be a CAS replace. `ProtoCatalogFormat`
-  detects this at init and coerces `max.append.count=0`.
-- **CAS · file (OK)** — `GCSCatalogTest`,
+  implementation would already be a CAS replace. `GCSFileIO.supportsAppend()`
+  returns false, and `ProtoCatalogFormat` checks it on each commit and
+  commits by CAS whatever `max.append.count` says.
+- **CAS · file (OK*)** — `GCSCatalogTest`,
   `GCSFileIOCatalogTransactionTests`.
-- **CAS · TM (OK)** — `GCSCatalogTestInlineTM`,
+- **CAS · TM (OK*)** — `GCSCatalogTestInlineTM`,
   `GCSFileIOCatalogTransactionTestsInlineTM`.
-- **CAS · TM+ML (OK)** — `GCSCatalogTestInlineML`,
+- **CAS · TM+ML (OK*)** — `GCSCatalogTestInlineML`,
   `GCSFileIOCatalogTransactionTestsInlineML`.
 
 ### S3
 
-- **CAS · file (OK)** — `TestS3CatalogCAS`,
+- **CAS · file (OK*)** — `TestS3CatalogCAS`,
   `TestS3FileIOCatalogTransactionCAS`.
-- **append · file (OK)** — `TestS3Catalog`,
+- **append · file (OK*)** — `TestS3Catalog`,
   `TestS3FileIOCatalogTransaction`. Runs against an S3 Express One Zone
   bucket (the only S3 surface that natively supports
   `WriteOffsetBytes`).
-- **CAS · TM (OK)** — `TestS3CatalogCASInlineTM`,
+- **CAS · TM (OK*)** — `TestS3CatalogCASInlineTM`,
   `TestS3FileIOCatalogTransactionCASInlineTM`.
-- **CAS · TM+ML (OK)** — `TestS3CatalogCASInlineML`,
+- **CAS · TM+ML (OK*)** — `TestS3CatalogCASInlineML`,
   `TestS3FileIOCatalogTransactionCASInlineML`.
-- **append · TM (OK)** — `TestS3CatalogInlineTM`,
+- **append · TM (OK*)** — `TestS3CatalogInlineTM`,
   `TestS3FileIOCatalogTransactionInlineTM`.
-- **append · TM+ML (OK)** — `TestS3CatalogInlineML`,
+- **append · TM+ML (OK*)** — `TestS3CatalogInlineML`,
   `TestS3FileIOCatalogTransactionInlineML`.
 
 ### ADLS
 
-- **append · file (OK)** — `ADLSCatalogTest`,
+- **append · file (OK*)** — `ADLSCatalogTest`,
   `ADLSFileIOCatalogTransactionTests`. The default `ProtoCatalogFormat`
-  configuration leaves `max.append.count` at 10 000, and `ADLSFileIO`
-  honours `Strategy.APPEND` via lease-protected appends in
-  `ADLSOutputFile`.
-- **CAS · file (OK)** — `ADLSCatalogTestCAS`,
+  configuration leaves `max.append.count` at 10 000. `ADLSFileIO` keeps
+  the catalog file an Append Blob: `Strategy.APPEND` is one conditional
+  `AppendBlock`, and CAS stages a temp Append Blob and renames it onto
+  the catalog file (fork 7a0d5edf2, after the 2026-05-12 run).
+- **CAS · file (OK*)** — `ADLSCatalogTestCAS`,
   `ADLSFileIOCatalogTransactionTestsCAS`. One-line subclasses that flip
   `maxAppendCount()` to 0, mirroring the S3 CAS suites.
-- **CAS · TM (OK)** — `ADLSCatalogTestCASInlineTM`,
+- **CAS · TM (OK*)** — `ADLSCatalogTestCASInlineTM`,
   `ADLSFileIOCatalogTransactionTestsCASInlineTM`.
-- **append · TM (OK)** — `ADLSCatalogTestInlineTM`,
+- **append · TM (OK*)** — `ADLSCatalogTestInlineTM`,
   `ADLSFileIOCatalogTransactionTestsInlineTM`.
-- **CAS · TM+ML (OK)** — `ADLSCatalogTestCASInlineML`,
+- **CAS · TM+ML (OK*)** — `ADLSCatalogTestCASInlineML`,
   `ADLSFileIOCatalogTransactionTestsCASInlineML`.
-- **append · TM+ML (OK)** — `ADLSCatalogTestInlineML`,
+- **append · TM+ML (OK*)** — `ADLSCatalogTestInlineML`,
   `ADLSFileIOCatalogTransactionTestsInlineML`.
 
 ## How to update this doc
@@ -118,19 +130,16 @@ cd /home/chris/work/catalog/iceberg && \
 
 cd /home/chris/work/catalog/fileio-catalog
 
-# Run once per codec (gzip then structural). The same inline-TM suites run
-# under both — only the encoded bytes on disk change. The -Preal-cloud profile
-# fails fast if any provider's env vars are missing.
-for c in gzip structural; do
-  mvn verify -Preal-cloud -Dfileio.catalog.inline.tm.codec=$c \
-    > target/compat-$c.log 2>&1
-done
+# The -Preal-cloud profile fails fast if any provider's env vars are missing.
+mvn verify -Preal-cloud > target/compat.log 2>&1
 ```
 
-The `inline.tm.codec` system property only affects the encode path. Decode
-is always driven by the per-record codec discriminator written on the wire,
-so the run verifies that bytes *written* with the configured codec
-round-trip correctly through every cell in the matrix.
+A `-Dfileio.catalog.inline.tm.codec=<codec>` flag on this command has
+no effect: `FileIOCatalog` reads the codec only from its catalog
+properties, and the cloud test bases do not pass the system property
+through, so every cloud run writes the default `structural` codec. A
+`gzip` column needs the bases to set `fileio.catalog.inline.tm.codec`
+in their catalog properties.
 
 Update the cell codes and bump `last-verified` in the frontmatter to
 match the date of the run. Keep notes terse — link to `errata.md` for

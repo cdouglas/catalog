@@ -237,7 +237,8 @@ public class InlineDeltaCodec {
   /**
    * Applies a delta (encoded bytes) to base metadata, routing ML updates to the
    * ProtoCatalogFile.Builder and TM updates (including AddSnapshot) to TableMetadata.
-   * This is the ML-aware replacement for {@link #applyDelta(byte[], byte[])}.
+   * This is the replay of an UpdateTableInline delta; {@link #applyDelta}, which cannot
+   * apply AddSnapshot, has no production caller.
    *
    * <p><b>Ordering invariant:</b> {@code AddSnapshotUpdate} entries for a given
    * snapshot must appear in the delta list <em>before</em> any
@@ -314,8 +315,7 @@ public class InlineDeltaCodec {
         } else if (update instanceof RemoveSnapshotsUpdate) {
           // Cascade snapshot removal to the catalog pool: drop the snapshot's ref
           // list and GC any pool entries no longer referenced. Without this, the
-          // pool grows unboundedly as snapshots are expired.
-          // See ML_INLINE_REVIEW2.md §2.6 / ML_INLINE_DESIGN_NOTES.md Gap 1.
+          // pool grows unboundedly as snapshots are expired (SPEC_ML.md).
           for (long snapId : ((RemoveSnapshotsUpdate) update).snapshotIds) {
             catalogBuilder.removeSnapshotManifests(tableId, snapId);
           }
@@ -696,7 +696,8 @@ public class InlineDeltaCodec {
    * @param oldMeta base metadata (from the inline table's current state)
    * @param newMeta target metadata (after applying the table operation)
    * @param manifestListPrefix shared prefix for manifest list paths
-   * @return list of delta updates, or null if metadata is identical
+   * @return list of delta updates, or null if a delta cannot express the change or has no update
+   *     (the commit then sends the full metadata)
    */
   public static List<DeltaUpdate> computeDelta(
       TableMetadata oldMeta, TableMetadata newMeta, String manifestListPrefix) {
@@ -745,10 +746,11 @@ public class InlineDeltaCodec {
     if (!replayKeepsTheLastIds(oldMeta, newMeta)) {
       return null;
     }
-    // Replay logs one new snapshot-log entry, main's new snapshot at the commit's last-updated-ms,
-    // if main moved. A transaction that moved main and then changed something else (a branch)
-    // logged main at the earlier time, and one that moved main and back (append, roll back)
-    // logged main again: only full mode carries those.
+    // Replay logs one new snapshot-log entry if main moved: main's new snapshot, at the snapshot's
+    // own timestamp if the commit added it, else (a rollback) at the commit's last-updated-ms. A
+    // transaction that rolled main back and then changed something else (a branch) logged main at
+    // the earlier time, and one that moved main and back (append, roll back) logged main again:
+    // only full mode carries those.
     if (!replayLogsAsTheWriterDid(oldMeta, newMeta)) {
       return null;
     }
@@ -973,10 +975,9 @@ public class InlineDeltaCodec {
   }
 
   /**
-   * Whether replay, adding the new schemas and specs in order to the base's, numbers each as the
-   * writer did. Mirrors TableMetadata.Builder: a schema takes the id of the first equal schema,
-   * else one past the highest id it has passed, starting from the current schema's; a spec takes
-   * the id of the first compatible spec, else one past the highest.
+   * Whether replay derives {@code newMeta}'s last column and partition ids: the base's, raised to
+   * the highest field id in the schemas and specs the commit adds, as TableMetadata.Builder does
+   * when it adds one.
    */
   private static boolean replayKeepsTheLastIds(TableMetadata oldMeta, TableMetadata newMeta) {
     Set<Integer> oldSchemaIds = new HashSet<>();
@@ -1005,6 +1006,12 @@ public class InlineDeltaCodec {
         && lastPartitionId == newMeta.lastAssignedPartitionId();
   }
 
+  /**
+   * Whether replay, adding the new schemas and specs in order to the base's, numbers each as the
+   * writer did. Mirrors TableMetadata.Builder: a schema takes the id of the first equal schema,
+   * else one past the highest id it has passed, starting from the current schema's; a spec takes
+   * the id of the first compatible spec, else one past the highest.
+   */
   private static boolean replayKeepsTheWritersIds(TableMetadata oldMeta, TableMetadata newMeta) {
     Set<Integer> oldSchemaIds = new HashSet<>();
     List<org.apache.iceberg.Schema> schemas = new ArrayList<>(oldMeta.schemas());
@@ -1571,7 +1578,7 @@ public class InlineDeltaCodec {
         int currentSchemaId,
         String manifestListPrefix,
         long deltaBaseUpdatedMillis) {
-      // parentSnapshotId is authoritative. The encoder (computeDelta line 533)
+      // parentSnapshotId is authoritative. The encoder (computeDelta)
       // captures snap.parentId() verbatim and the wire treats field absence as
       // explicit null. Falling back to base.currentSnapshot() is wrong for
       // replace transactions, where the new snapshot is intentionally rooted
@@ -1614,7 +1621,8 @@ public class InlineDeltaCodec {
 
   /**
    * Adds a ManifestFile to a snapshot's inline manifest list. During log replay, this
-   * adds the manifest to the table's pool and appends it to the snapshot's reference list.
+   * adds the manifest to the table's pool and inserts it in the snapshot's reference list at
+   * {@link #position}, or at the end if that is null.
    */
   public static class AddManifestUpdate implements DeltaUpdate {
     public final long snapshotId;
@@ -1638,7 +1646,7 @@ public class InlineDeltaCodec {
     @Override
     public void applyTo(TableMetadata.Builder builder) {
       // ML deltas are applied to ProtoCatalogFile.Builder, not TableMetadata.Builder.
-      // This is a no-op here; handled by applyManifestDelta.
+      // This is a no-op here; handled by applyDeltaWithManifests / applyManifestsOnly.
     }
   }
 
@@ -1657,7 +1665,7 @@ public class InlineDeltaCodec {
     @Override
     public void applyTo(TableMetadata.Builder builder) {
       // ML deltas are applied to ProtoCatalogFile.Builder, not TableMetadata.Builder.
-      // This is a no-op here; handled by applyManifestDelta.
+      // This is a no-op here; handled by applyDeltaWithManifests / applyManifestsOnly.
     }
   }
 
