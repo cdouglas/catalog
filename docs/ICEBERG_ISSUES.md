@@ -2,23 +2,19 @@
 
 Bugs in Apache Iceberg that this project's fuzzers found. None is in
 `FileIOCatalog`: each one reproduces on Iceberg's own `InMemoryCatalog`.
-The project's tests work around them, so this page records them for a
-rebase onto a newer Iceberg, and for reports or fixes upstream.
+This page records them for a rebase onto a newer Iceberg, and for reports
+or fixes upstream.
 
-`TestIcebergCoreIssues` has a test for each open issue. Each test asserts
-what Iceberg does now, and its Javadoc says what Iceberg should do instead.
-So a test passes while its issue remains and fails once a release fixes
-or changes it, with the message "Iceberg issue C*n* no longer
-reproduces". The tests use only iceberg-core, so they also run in
-Iceberg's own test tree:
+Upstream fixed C1. The fork fixes C2 to C7 on branch `core-fixes`, each
+in an upstream-style commit with its tests, so the project's tests no
+longer work around any of them.
 
-```bash
-git clone --depth 1 --branch apache-iceberg-1.12.0 https://github.com/apache/iceberg.git
-mkdir -p iceberg/core/src/test/java/org/apache/iceberg/io
-cp src/test/java/org/apache/iceberg/io/TestIcebergCoreIssues.java \
-   iceberg/core/src/test/java/org/apache/iceberg/io/
-cd iceberg && ./gradlew :iceberg-core:test --tests org.apache.iceberg.io.TestIcebergCoreIssues
-```
+`TestIcebergCoreIssues` held a test for each issue the fork didn't fix.
+Each test asserted what Iceberg did, so it failed once a release fixed the
+issue. With every issue fixed, the class was removed. For a new Iceberg
+core bug that the fork does not fix, restore it from history
+(`git show 411f73c:src/test/java/org/apache/iceberg/io/TestIcebergCoreIssues.java`
+has the C6 test and the helpers), and add the issue's test.
 
 ## Status
 
@@ -35,7 +31,7 @@ issues (see "Rebasing onto a newer Iceberg"). The Fork column is
 | C3. A replace restores an expired snapshot | fixed, `core-fixes` 56527cb | yes | yes | [#16942](https://github.com/apache/iceberg/issues/16942), part of [#16232](https://github.com/apache/iceberg/issues/16232); fix in PR [#16943](https://github.com/apache/iceberg/pull/16943), open |
 | C4. A stale handle fails on a newer spec | fixed, `core-fixes` bfc20da | yes | yes | not reported |
 | C5. Rewriting manifests fails with no snapshot | fixed, `core-fixes` f723a52 | yes | yes | not reported |
-| C6. A repeated cherry-pick leaves the table unplannable | yes | yes | yes | not reported |
+| C6. A repeated cherry-pick leaves the table unplannable | fixed, `core-fixes` 724608a | yes | yes | not reported |
 | C7. The all_* tables miss row ids | fixed, `core-fixes` 2779515 | yes | yes | not reported |
 
 "Not reported" means a search of apache/iceberg's issues and pull
@@ -43,22 +39,19 @@ requests found nothing for the issue.
 
 ## Rebasing onto a newer Iceberg
 
-The fork fixes some of these issues itself, each in a commit of its own
-on branch `core-fixes`, which sits on the release; `atomicio` sits on
-`core-fixes`. An issue the fork fixes has no test here: its fix carries
-an upstream-style test in iceberg-core, and its workarounds are gone.
+The fork fixes these issues itself, each in a commit of its own on branch
+`core-fixes`, which sits on the release; `atomicio` sits on `core-fixes`.
+Each fix carries an upstream-style test in iceberg-core, and the issue's
+workarounds here are gone.
 
 1. Rebase `core-fixes` onto the new release first. Drop each fix that
-   upstream merged, and record the release here.
+   upstream merged, and record the release here. A fix that upstream
+   merged comes out empty or conflicts; its tests still pass after it is
+   dropped.
 2. Rebase `atomicio` onto `core-fixes`.
-3. Run `TestIcebergCoreIssues` on the new release.
-4. For each test that fails, the release fixed or changed that issue:
-   - Remove the issue's workarounds, listed under it below.
-   - Run the fuzzers long (CLAUDE.md lists them), so they can confirm
-     the fix.
-   - Make the test assert the fixed behavior, or delete it.
-   - Mark the issue fixed here.
-5. For each test that still passes, keep the issue's workarounds.
+3. Run the full `iceberg-core` tests on `core-fixes`, then fileio-catalog's
+   suite on the published fork, and the fuzzers long (CLAUDE.md lists
+   them).
 
 ## Issues
 
@@ -196,20 +189,25 @@ metadata it commits on.
 
 ### C6. A repeated cherry-pick leaves a table it can't plan
 
-Cherry-picking a snapshot a second time, once its earlier pick has been
-expired, adds the snapshot's data files again at a new sequence number.
-Once one of those files has a deletion vector, planning fails: "DV data
+Cherry-picking a snapshot a second time, once its earlier pick had been
+expired, added the snapshot's data files again at a new sequence number.
+Once one of those files had a deletion vector, planning failed: "DV data
 sequence number (5) must be greater than or equal to data file sequence
 number (7)".
 
 - **Cause:** `CherryPickOperation` finds an earlier pick through the
-  `source-snapshot-id` of the current snapshot's ancestors, and the
-  expiry removed the ancestor that carried it.
-- **Should:** refuse the second pick as a duplicate.
-- **Test:** `aCherryPickRepeatedAfterAnExpiryLeavesATableItCannotPlan`.
-- **Workaround:** `TestInlineDifferentialProperties` compares a planning
-  failure as the string "fails: ...", which both catalogs must produce
-  alike.
+  `source-snapshot-id` (or published `wap.id`) of the current snapshot's
+  ancestors, and the expiry removed the ancestor that carried it.
+- **Fork:** fixed on `core-fixes` by 724608a, "Core: Refuse a cherry-pick
+  repeated after its earlier pick expired". The pick refuses data files
+  already in the table when an expiry may have removed an earlier pick:
+  the oldest remaining ancestor is newer than the picked snapshot, or the
+  table is v1. Its tests are in `TestWapWorkflow`.
+- **Removed with the fix:** the test,
+  `aCherryPickRepeatedAfterAnExpiryLeavesATableItCannotPlan`, with
+  `TestIcebergCoreIssues` (the last of its tests), and the workaround,
+  `TestInlineDifferentialProperties.files`'s comparison of a planning
+  failure as the string "fails: ...".
 
 ### C7. The all_* metadata tables miss the row ids of an upgraded file
 

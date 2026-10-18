@@ -353,9 +353,6 @@ class TestInlineDifferentialProperties {
       }
     } catch (IOException e) {
       throw new UncheckedIOException(e);
-    } catch (RuntimeException e) {
-      // As planning fails in either catalog: Iceberg core refuses some states its operations make.
-      return "fails: " + e;
     }
     out.sort(String::compareTo);
     return out.toString();
