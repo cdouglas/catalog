@@ -12,12 +12,23 @@ Upstream fixed C1. The fork fixes C2 to C7 on branch `core-fixes`, each
 in an upstream-style commit with its tests, so the project's tests no
 longer work around any of them.
 
-`TestIcebergCoreIssues` held a test for each issue the fork didn't fix.
-Each test asserted what Iceberg did, so it failed once a release fixed the
-issue. With every issue fixed, the class was removed. For a new Iceberg
-core bug that the fork does not fix, restore it from history
-(`git show 411f73c:src/test/java/org/apache/iceberg/io/TestIcebergCoreIssues.java`
-has the C6 test and the helpers), and add the issue's test.
+`TestIcebergCoreIssues` has a canary for each issue: a test on
+`InMemoryCatalog` that asserts the bug is absent, with the message
+"Iceberg issue C*n* is back". Every canary passes against the fork. A
+canary that fails means a rebase dropped the fork's fix, or a release
+changed the behavior. The canaries assert only that the bug is absent,
+not the fork's way of fixing it, so a different fix upstream passes too.
+They matter most for C3 and C6, which the fuzzers don't reach reliably.
+The tests use only iceberg-core, so they also run in Iceberg's own test
+tree, where on stock 1.12.0 every canary but C1's fails:
+
+```bash
+git clone --depth 1 --branch apache-iceberg-1.12.0 https://github.com/apache/iceberg.git
+mkdir -p iceberg/core/src/test/java/org/apache/iceberg/io
+cp src/test/java/org/apache/iceberg/io/TestIcebergCoreIssues.java \
+   iceberg/core/src/test/java/org/apache/iceberg/io/
+cd iceberg && ./gradlew :iceberg-core:test --tests org.apache.iceberg.io.TestIcebergCoreIssues
+```
 
 ## Status
 
@@ -49,12 +60,14 @@ workarounds here are gone.
 
 1. Rebase `core-fixes` onto the new release first. Drop each fix that
    upstream merged, and record the release here. A fix that upstream
-   merged comes out empty or conflicts; its tests still pass after it is
-   dropped.
+   merged comes out empty or conflicts. Before dropping it, check that
+   its tests and its canary in `TestIcebergCoreIssues` pass on the new
+   release without it.
 2. Rebase `atomicio` onto `core-fixes`.
-3. Run the full `iceberg-core` tests on `core-fixes`, then fileio-catalog's
-   suite on the published fork, and the fuzzers long (CLAUDE.md lists
-   them).
+3. Run the full `iceberg-core` tests on `core-fixes`. Then run
+   fileio-catalog's suite on the published fork: its canaries
+   (`TestIcebergCoreIssues`) must all pass. Then run the fuzzers long
+   (CLAUDE.md lists them).
 
 ## Issues
 
