@@ -810,20 +810,6 @@ class TestCatalogFaultProperties {
           .build();
     }
 
-    /**
-     * Runs a commit by a merging producer (merge append, delete, row delta). Iceberg core's
-     * MergingSnapshotProducer takes the partition specs of the handle's metadata when created, and
-     * one whose commit then refreshes to a newer spec dereferences a missing spec when it rewrites
-     * a manifest written in it, before writing anything: a rejection here.
-     */
-    private static void staleSpecs(TableIdentifier id, Runnable commit) {
-      try {
-        commit.run();
-      } catch (NullPointerException e) {
-        throw new ValidationException(e, "%s: a partition spec newer than the handle", id);
-      }
-    }
-
     /** {@code file} in {@code table}'s current spec, which may have changed since it was named. */
     private static DataFile inSpec(Table table, DataFile file) {
       return DataFiles.builder(table.spec())
@@ -946,9 +932,9 @@ class TestCatalogFaultProperties {
               (fast ? "fastAppend(" : "mergeAppend(") + id + ", " + appended.location() + ")",
               () -> {
                 Table table = handle(w, id, cmd.fresh);
-                staleSpecs(id, () -> (fast ? table.newFastAppend() : table.newAppend())
+                (fast ? table.newFastAppend() : table.newAppend())
                     .appendFile(inSpec(table, appended))
-                    .commit());
+                    .commit();
               },
               (m, actual) -> {
                 TableState state = existing(m, id);
@@ -966,8 +952,7 @@ class TestCatalogFaultProperties {
                   : target.sortedFiles().get(cmd.b % target.files.size());
           return new Op(
               "deleteFile(" + id + ", " + path + ")",
-              () -> staleSpecs(id,
-                  () -> handle(w, id, cmd.fresh).newDelete().deleteFile(path).commit()),
+              () -> handle(w, id, cmd.fresh).newDelete().deleteFile(path).commit(),
               (m, actual) -> {
                 TableState state = existing(m, id);
                 if (state.files.removeIf(path::equals)) {
@@ -1028,20 +1013,18 @@ class TestCatalogFaultProperties {
                   }
                 }
                 org.apache.iceberg.DeleteFile built = delete.build();
-                staleSpecs(id, () -> {
-                  try {
-                    table.newRowDelta().addDeletes(built).commit();
-                  } catch (IllegalArgumentException e) {
-                    // Iceberg checks a delete file against the format version of the metadata the
-                    // commit lands on: a position delete for a v2 table is not one for a table
-                    // another writer has upgraded to v3 since (A4 in docs/ICEBERG_ISSUES.md).
-                    if (dv[0] || e.getMessage() == null
-                        || !e.getMessage().startsWith("Must use DVs for position deletes")) {
-                      throw e;
-                    }
-                    throw new ValidationException(e, "%s: upgraded to v3 since the handle", id);
+                try {
+                  table.newRowDelta().addDeletes(built).commit();
+                } catch (IllegalArgumentException e) {
+                  // Iceberg checks a delete file against the format version of the metadata the
+                  // commit lands on: a position delete for a v2 table is not one for a table
+                  // another writer has upgraded to v3 since (A4 in docs/ICEBERG_ISSUES.md).
+                  if (dv[0] || e.getMessage() == null
+                      || !e.getMessage().startsWith("Must use DVs for position deletes")) {
+                    throw e;
                   }
-                });
+                  throw new ValidationException(e, "%s: upgraded to v3 since the handle", id);
+                }
               },
               (m, actual) -> {
                 TableState state = existing(m, id);
@@ -1395,22 +1378,9 @@ class TestCatalogFaultProperties {
                 state.files.add(file);
               });
         case REWRITE_MANIFESTS:
-          if (model.containsKey(id) && model.get(id).snapshotId == null) {
-            return null; // Iceberg's rewrite needs a current snapshot
-          }
           return new Op(
               "rewriteManifests(" + id + ")",
-              () -> {
-                try {
-                  handle(w, id, cmd.fresh).rewriteManifests().clusterBy(f -> "all").commit();
-                } catch (NullPointerException e) {
-                  // Iceberg core, in a rewrite that retries, before it commits: after a concurrent
-                  // replace left the table without a current snapshot, it dereferences that
-                  // (BaseRewriteManifests.apply); after a concurrent spec change, it writes a
-                  // manifest in a spec it does not have, as it keeps the handle's specs.
-                  throw new ValidationException(e, "%s: a rewrite on a stale handle", id);
-                }
-              },
+              () -> handle(w, id, cmd.fresh).rewriteManifests().clusterBy(f -> "all").commit(),
               (m, actual) -> existing(m, id));
         case CREATE_NAMESPACE:
         case DROP_NAMESPACE:

@@ -24,15 +24,17 @@ cd iceberg && ./gradlew :iceberg-core:test --tests org.apache.iceberg.io.TestIce
 
 Checked on 2026-10-16 against Iceberg 1.12.0 and upstream main at
 `524fe9e`. On 2026-10-17 the atomicio fork moved from the 1.10.1 release
-to the 1.12.0 release, so the fork's column is now 1.12.0's.
+to the 1.12.0 release, and its branch `core-fixes` began fixing these
+issues (see "Rebasing onto a newer Iceberg"). The Fork column is
+`atomicio`, which sits on `core-fixes`.
 
 | Issue | Fork | 1.12.0 | main | Upstream |
 |---|---|---|---|---|
 | C1. A merging delete renumbers rows | fixed | fixed | fixed | fixed by [#16263](https://github.com/apache/iceberg/pull/16263), in 1.11.0 |
 | C2. A retried commit renumbers rows | yes | yes | yes | not reported |
 | C3. A replace restores an expired snapshot | yes | yes | yes | [#16942](https://github.com/apache/iceberg/issues/16942), part of [#16232](https://github.com/apache/iceberg/issues/16232); fix in PR [#16943](https://github.com/apache/iceberg/pull/16943), open |
-| C4. A stale handle fails on a newer spec | yes | yes | yes | not reported |
-| C5. Rewriting manifests fails with no snapshot | yes | yes | yes | not reported |
+| C4. A stale handle fails on a newer spec | fixed, `core-fixes` bfc20da | yes | yes | not reported |
+| C5. Rewriting manifests fails with no snapshot | fixed, `core-fixes` f723a52 | yes | yes | not reported |
 | C6. A repeated cherry-pick leaves the table unplannable | yes | yes | yes | not reported |
 | C7. The all_* tables miss row ids | yes | yes | yes | not reported |
 
@@ -128,42 +130,53 @@ list, so reading that snapshot fails.
 
 ### C4. A stale handle fails on a manifest in a newer partition spec
 
-A handle loaded before another writer added a partition spec can't run
-some commits once the table has a manifest in the new spec. These fail
+A handle loaded before another writer added a partition spec couldn't run
+some commits once the table had a manifest in the new spec. These failed
 with a `NullPointerException`:
 - a delete by path;
 - an overwrite by row filter;
 - a dynamic partition replace;
+- a row delta that removes a delete file;
 - a manifest rewrite.
 
-A merge append, a fast append, a row delta and a delete of an old-spec
-file through the same handle all commit.
-
 - **Cause:** `MergingSnapshotProducer`'s filter managers and
-  `BaseRewriteManifests` take the partition specs of the handle's metadata
-  when they are created. Their commit then refreshes to metadata with a
-  spec they don't have.
-- **Should:** use the specs of the metadata they commit on.
-- **Test:** `aStaleHandleFailsOnAManifestInANewerSpec`, one case per
-  failing operation.
-- **Workarounds** in `TestCatalogFaultProperties`, which both turn the
-  `NullPointerException` into a rejection:
-  - `staleSpecs` wraps merge appends, deletes and row deltas.
-  - The `rewriteManifests` op catches it.
+  `BaseRewriteManifests` took the partition specs of the handle's metadata
+  when they were created. Their commit then refreshed to metadata with a
+  spec they didn't have.
+- **Fork:** fixed on `core-fixes` by bfc20da, "Core: Use the partition
+  specs of the metadata a commit applies to". The filter managers and the
+  rewrite now look specs up in the metadata each commit attempt applies
+  to, as the merge managers already did. Its tests are the
+  `*WithConcurrentSpecChange` cases in `TestDeleteFiles`, `TestOverwrite`,
+  `TestReplacePartitions`, `TestRowDelta` and `TestRewriteManifests`.
+- **Removed with the fix:** the test,
+  `aStaleHandleFailsOnAManifestInANewerSpec`, and the workarounds in
+  `TestCatalogFaultProperties`: `staleSpecs`, which turned the exception
+  into a rejection for merge appends, deletes and row deltas, and the
+  `rewriteManifests` op's catch.
 
 ### C5. Rewriting manifests fails on a table without a current snapshot
 
-`rewriteManifests` throws a `NullPointerException` when the table has no
+`rewriteManifests` threw a `NullPointerException` when the table had no
 current snapshot, either because it never had one or because a replace
 left it with none after the handle was loaded.
-`BaseRewriteManifests.apply` dereferences the current snapshot of the
+`BaseRewriteManifests.apply` dereferenced the current snapshot of the
 metadata it commits on.
 
-- **Should:** commit nothing.
-- **Test:** `aRewriteOfManifestsFailsOnATableWithoutASnapshot`.
-- **Workarounds:** `TestCatalogFaultProperties` doesn't generate a
-  rewrite for a table its model says has no snapshot. Its
-  `rewriteManifests` op catches the exception from a concurrent replace.
+- **Fork:** fixed on `core-fixes` by f723a52, "Core: Rewrite the manifests
+  of a table without a current snapshot". With no current snapshot, the
+  rewrite has no manifests to rewrite. It commits a snapshot without
+  manifests, as it commits a snapshot that keeps every manifest when it
+  has nothing to rewrite, and as an empty append does. (Committing nothing
+  would need a way for a `SnapshotProducer` to skip its commit, decided
+  again on each retry.) Its tests are `testRewriteManifestsWithoutSnapshot`
+  and `testRewriteManifestsWithConcurrentReplace` in
+  `TestRewriteManifests`.
+- **Removed with the fix:** the test,
+  `aRewriteOfManifestsFailsOnATableWithoutASnapshot`, and the workarounds
+  in `TestCatalogFaultProperties`: it didn't generate a rewrite for a
+  table its model said had no snapshot, and its `rewriteManifests` op
+  caught the exception from a concurrent replace.
 
 ### C6. A repeated cherry-pick leaves a table it can't plan
 

@@ -45,14 +45,10 @@ import org.apache.iceberg.Transaction;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.NotFoundException;
-import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.inmemory.InMemoryCatalog;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.types.Types;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.EnumSource;
-import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * Issues in Iceberg core, without this catalog: each test reproduces one on Iceberg's own
@@ -120,79 +116,6 @@ class TestIcebergCoreIssues {
         .isInstanceOf(NotFoundException.class);
   }
 
-  /** Commits through a handle loaded before another writer added a partition spec. */
-  enum StaleOp {
-    DELETE_BY_PATH,
-    OVERWRITE_BY_FILTER,
-    REPLACE_PARTITIONS,
-    REWRITE_MANIFESTS
-  }
-
-  /**
-   * C4. A commit through a handle loaded before another writer added a partition spec fails with
-   * a NullPointerException on a manifest written in the new spec. MergingSnapshotProducer's
-   * filter managers and BaseRewriteManifests keep the partition specs of the handle's metadata,
-   * and their commit refreshes to metadata with a spec they do not have. They should use the
-   * specs of the metadata they commit on. (A merge append, a fast append and a row delta in the
-   * handle's spec commit.)
-   */
-  @ParameterizedTest
-  @EnumSource(StaleOp.class)
-  void aStaleHandleFailsOnAManifestInANewerSpec(StaleOp op) {
-    InMemoryCatalog catalog = catalog();
-    Table stale = catalog.createTable(ID, SCHEMA);
-    stale.newFastAppend().appendFile(file("z")).commit();
-    Table other = catalog.loadTable(ID);
-    other.updateSpec().addField("id").commit();
-    other.newFastAppend().appendFile(file(other.spec(), "a")).commit();
-
-    assertThatThrownBy(
-            () -> {
-              switch (op) {
-                case DELETE_BY_PATH:
-                  stale.newDelete().deleteFile(path("a")).commit();
-                  break;
-                case OVERWRITE_BY_FILTER:
-                  stale
-                      .newOverwrite()
-                      .overwriteByRowFilter(Expressions.equal("id", 1))
-                      .addFile(file("b"))
-                      .commit();
-                  break;
-                case REPLACE_PARTITIONS:
-                  stale.newReplacePartitions().addFile(file("b")).commit();
-                  break;
-                case REWRITE_MANIFESTS:
-                  stale.rewriteManifests().clusterBy(file -> "all").commit();
-                  break;
-              }
-            })
-        .as(FIXED, "C4")
-        .isInstanceOf(NullPointerException.class); // should commit
-  }
-
-  /**
-   * C5. Rewriting the manifests of a table without a current snapshot fails with a
-   * NullPointerException: BaseRewriteManifests.apply dereferences the current snapshot of the
-   * metadata it commits on. The table may have none from its creation, or a replace may have left
-   * it with none since the handle was loaded. The rewrite should commit nothing.
-   */
-  @ParameterizedTest
-  @ValueSource(booleans = {false, true})
-  void aRewriteOfManifestsFailsOnATableWithoutASnapshot(boolean replacedSince) {
-    InMemoryCatalog catalog = catalog();
-    Table table = catalog.createTable(ID, SCHEMA);
-    if (replacedSince) {
-      table.newFastAppend().appendFile(file("a")).commit();
-      catalog.buildTable(ID, SCHEMA).replaceTransaction().commitTransaction();
-    }
-
-    assertThatThrownBy(() -> table.rewriteManifests().clusterBy(file -> "all").commit())
-        .as(FIXED, "C5")
-        .isInstanceOf(NullPointerException.class)
-        .hasMessageContaining("currentSnapshot()");
-  }
-
   /**
    * C6. Cherry-picking a snapshot again once its earlier pick has expired adds its data files a
    * second time, at a new sequence number, and once one of them has a deletion vector the table
@@ -257,13 +180,11 @@ class TestIcebergCoreIssues {
   }
 
   private static DataFile file(String name) {
-    return file(PartitionSpec.unpartitioned(), name);
-  }
-
-  private static DataFile file(PartitionSpec spec, String name) {
-    DataFiles.Builder file =
-        DataFiles.builder(spec).withPath(path(name)).withFileSizeInBytes(10).withRecordCount(1);
-    return spec.isPartitioned() ? file.withPartitionPath("id=1").build() : file.build();
+    return DataFiles.builder(PartitionSpec.unpartitioned())
+        .withPath(path(name))
+        .withFileSizeInBytes(10)
+        .withRecordCount(1)
+        .build();
   }
 
   /** A deletion vector of one row of {@code data}. */
