@@ -3917,6 +3917,47 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 65: Iceberg binds a table's default sort order to its current
+  // schema, and its other sort orders unchecked, so an earlier order may
+  // name a column dropped since. Replay of an inline delta adds each new
+  // order with TableMetadata.Builder.addSortOrder, which binds it to the
+  // schema current by then: the commit's. A transaction that sorted by a
+  // column, sorted by another, and dropped the first committed a delta
+  // whose replay threw ("Cannot find source column for sort field") on
+  // every read of the catalog. Such a commit, and one whose new partition
+  // spec does not bind to the commit's schema, now goes in full. Found by
+  // TestInlineDeltaProperties in a long run.
+  // ============================================================
+
+  @Nested
+  class SortOrderOnAColumnDroppedInOneCommit {
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND_TM", "APPEND_ML"})
+    void readsBack(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, mode);
+      catalog.createNamespace(mixedNs);
+      Table table = catalog.createTable(mixed, intSchema);
+      table.updateSchema().addColumn("extra", Types.IntegerType.get()).commit();
+
+      org.apache.iceberg.Transaction txn = table.newTransaction();
+      txn.replaceSortOrder().asc("extra").commit();
+      txn.replaceSortOrder().asc("id").commit();
+      txn.updateSchema().deleteColumn("extra").commit();
+      org.apache.iceberg.TableMetadata written =
+          ((org.apache.iceberg.HasTableOperations) txn.table()).operations().current();
+      txn.commitTransaction();
+
+      Table read = catalog(io, LocalCatalogMode.APPEND).loadTable(mixed);
+      assertThat(read.sortOrders()).hasSameSizeAs(written.sortOrders());
+      assertThat(read.sortOrder().orderId()).isEqualTo(written.defaultSortOrderId());
+      assertThat(read.schema().findField("extra")).isNull();
+    }
+  }
+
   /**
    * Storage with prefix and bulk operations, as S3, GCS and ADLS have (a table's FileIO passes
    * bulk deletes on only for those), whose bulk deletes fail.

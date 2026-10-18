@@ -102,7 +102,7 @@ for framing):
 | Mode        | Payload                            | When used                                   |
 |-------------|------------------------------------|---------------------------------------------|
 | **Delta**   | Structured `TableMetadataDelta`    | The table is inline (common path for data commits and DDL) |
-| **Full**    | Complete encoded `TableMetadata`   | No delta: the table is a pointer table (re-inlining), the delta does not fit, or `computeDelta` returns none: it finds no update, or cannot express the change (a format-version upgrade, a removed ref, a change to the encryption keys, a statistics change, an id collision, a new schema or spec that replay would number otherwise, a last column or partition id other than the larger of the base's and the highest field id in the commit's new schemas or specs, new snapshot-log entries other than replay's: none if main did not move, else one, last, for main's new snapshot at the snapshot's own timestamp if the commit added it and at last-updated-ms otherwise (a rollback), new snapshots whose sequence numbers or row ids do not follow the base's) |
+| **Full**    | Complete encoded `TableMetadata`   | No delta: the table is a pointer table (re-inlining), the delta does not fit, or `computeDelta` returns none: it finds no update, or cannot express the change (a format-version upgrade, a removed ref, a change to the encryption keys, a statistics change, an id collision, a new schema or spec that replay would number otherwise, a new sort order or spec that does not bind to the commit's schema, a last column or partition id other than the larger of the base's and the highest field id in the commit's new schemas or specs, new snapshot-log entries other than replay's: none if main did not move, else one, last, for main's new snapshot at the snapshot's own timestamp if the commit added it and at last-updated-ms otherwise (a rollback), new snapshots whose sequence numbers or row ids do not follow the base's) |
 | **Pointer** | Metadata file location (`UpdateTableLocation`) | Neither fits, or a new inline-ML snapshot restates a pooled manifest (see [SPEC_ML.md](SPEC_ML.md)): the table leaves inline storage (eviction) |
 
 Manifest updates of new inline-ML snapshots count toward the payload
@@ -322,7 +322,11 @@ carry (`schema_id`, `last_column_id`, `spec_id`, `last_partition_id`,
 it adds (an equal one's id, else one past the highest) and raises the
 last column and partition ids to the added fields'. So `computeDelta`
 sends in full a commit whose new schema or spec ids, or last column or
-partition ids, replay would derive otherwise (see "Delivery Modes").
+partition ids, replay would derive otherwise (see "Delivery Modes"). The
+builder also binds each sort order and spec it adds to the schema current
+by then, the commit's, while Iceberg's metadata parser binds sort orders
+other than the default unchecked: an order that names a column the commit
+dropped goes in full too (Bug 65).
 
 Schemas and partition specs are serialized as gzip-wrapped JSON via
 Iceberg's existing parsers (`SchemaParser`, `PartitionSpecParser`). The

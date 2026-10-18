@@ -746,6 +746,13 @@ public class InlineDeltaCodec {
     if (!replayKeepsTheLastIds(oldMeta, newMeta)) {
       return null;
     }
+    // Replay adds the commit's new sort orders and specs with the builder, which binds each to the
+    // schema current by then, the commit's. Iceberg binds orders other than the default unchecked:
+    // a transaction that sorted by a column, sorted by another and dropped the first left an
+    // order that does not bind, which only full mode carries (Bug 65).
+    if (!replayBindsWhatItAdds(oldMeta, newMeta)) {
+      return null;
+    }
     // Replay logs one new snapshot-log entry if main moved: main's new snapshot, at the snapshot's
     // own timestamp if the commit added it, else (a rollback) at the commit's last-updated-ms. A
     // transaction that rolled main back and then changed something else (a branch) logged main at
@@ -972,6 +979,36 @@ public class InlineDeltaCodec {
         && log.get(log.size() - 1) == added.get(0)
         && added.get(0).snapshotId() == main.snapshotId()
         && added.get(0).timestampMillis() == loggedAt;
+  }
+
+  /**
+   * Whether each sort order and partition spec {@code newMeta} has and {@code oldMeta} lacks binds
+   * to {@code newMeta}'s current schema, as replay binds it when it adds it.
+   */
+  private static boolean replayBindsWhatItAdds(TableMetadata oldMeta, TableMetadata newMeta) {
+    Set<Integer> oldOrderIds = new HashSet<>();
+    for (SortOrder order : oldMeta.sortOrders()) {
+      oldOrderIds.add(order.orderId());
+    }
+    Set<Integer> oldSpecIds = new HashSet<>();
+    for (org.apache.iceberg.PartitionSpec spec : oldMeta.specs()) {
+      oldSpecIds.add(spec.specId());
+    }
+    try {
+      for (SortOrder order : newMeta.sortOrders()) {
+        if (!oldOrderIds.contains(order.orderId())) {
+          order.toUnbound().bind(newMeta.schema());
+        }
+      }
+      for (org.apache.iceberg.PartitionSpec spec : newMeta.specs()) {
+        if (!oldSpecIds.contains(spec.specId())) {
+          spec.toUnbound().bind(newMeta.schema());
+        }
+      }
+    } catch (org.apache.iceberg.exceptions.ValidationException | IllegalArgumentException e) {
+      return false;
+    }
+    return true;
   }
 
   /**
