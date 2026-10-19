@@ -115,10 +115,13 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
   private static final class Version {
     final byte[] bytes;
     final long generation;
+    /** Writes the object holds: 1 for the write that made it, plus 1 per append since. */
+    final int segments;
 
-    Version(byte[] bytes, long generation) {
+    Version(byte[] bytes, long generation, int segments) {
       this.bytes = bytes;
       this.generation = generation;
+      this.segments = segments;
     }
   }
 
@@ -165,6 +168,8 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
   private final Map<Fault, Integer> injected = Maps.newEnumMap(Fault.class);
   private volatile ReadFaults readFaults = location -> ReadFault.NONE;
   private volatile boolean failSupersededReads = false;
+  private volatile int maxSegments = 0;
+  private volatile Supplier<RuntimeException> segmentLimitError = null;
   private final Map<ReadFault, Integer> injectedReads = Maps.newEnumMap(ReadFault.class);
 
   public InMemoryAtomicFileIO() {
@@ -222,6 +227,24 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
     this.failSupersededReads = fail;
   }
 
+  /**
+   * Caps the writes an object holds at {@code max}, as S3 Express caps an object at 10,000 parts
+   * and an Azure Append Blob at 50,000 blocks: the write that creates or replaces the object is
+   * one, and each append adds one. An append past the cap fails, before landing, with {@link
+   * SegmentLimitException}, as the providers' FileIOs surface it. 0 removes the cap.
+   */
+  public void limitSegments(int max) {
+    limitSegments(
+        max,
+        () -> new SegmentLimitException("injected: the object holds " + max + " writes", null));
+  }
+
+  /** As {@link #limitSegments(int)}, failing the append with {@code error}. */
+  public void limitSegments(int max, Supplier<RuntimeException> error) {
+    this.maxSegments = max;
+    this.segmentLimitError = error;
+  }
+
   /** Fails read requests as {@code plan} chooses; {@link ReadFault#NONE} for all by default. */
   public void injectReadFaults(ReadFaults plan) {
     this.readFaults = plan;
@@ -277,7 +300,11 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
   }
 
   private synchronized Version put(String location, byte[] bytes) {
-    Version v = new Version(bytes, generations.incrementAndGet());
+    return put(location, bytes, 1);
+  }
+
+  private synchronized Version put(String location, byte[] bytes, int segments) {
+    Version v = new Version(bytes, generations.incrementAndGet(), segments);
     objects.put(location, v);
     return v;
   }
@@ -472,6 +499,10 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
           throw new StorageInvariantException(msg, new IOException(msg));
         }
         final byte[] next;
+        int segments = strategy == Strategy.APPEND && live != null ? live.segments + 1 : 1;
+        if (maxSegments > 0 && segments > maxSegments) {
+          throw segmentLimitError.get();
+        }
         if (strategy == Strategy.APPEND && live != null) {
           next = new byte[live.bytes.length + data.length];
           System.arraycopy(live.bytes, 0, next, 0, live.bytes.length);
@@ -480,7 +511,7 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
           next = data;
         }
         history.add(new Write(location, strategy, live == null ? null : live.bytes, next));
-        BoundInputFile written = new BoundInputFile(location, put(location, next));
+        BoundInputFile written = new BoundInputFile(location, put(location, next, segments));
         String landed = "injected: " + strategy + " at " + location + " landed, but ";
         switch (fault) {
           case LOST_REPLY:

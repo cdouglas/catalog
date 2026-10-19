@@ -3958,6 +3958,76 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 66: S3 Express caps an object at 10,000 parts, and Azure an
+  // Append Blob at 50,000 blocks: an append past the cap fails. The
+  // providers' FileIOs let the SDK error out raw, so the commit loop took
+  // the append for ambiguous, re-read the catalog and appended again,
+  // compacting only once the append count reached
+  // fileio.catalog.max.append.count. With that set above the store's cap,
+  // no writer ever compacted: every commit ended CommitStateUnknown, for
+  // good. At the cap, an append that lost a race overshot it and recovered
+  // only through the ambiguous path. The FileIOs now throw
+  // SegmentLimitException, and the commit loop compacts by CAS. Found by
+  // testing the hard limits TOO_MANY_PARTS.md described.
+  // ============================================================
+
+  @Nested
+  class AppendsPastTheStoresLimit {
+
+    @Test
+    void anAppendCountAboveTheLimitCompacts() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      io.limitSegments(5);
+      FileIOCatalog catalog =
+          LocalCatalogMode.APPEND.catalog(
+              io, WAREHOUSE, "c", Map.of(ProtoCatalogFormat.MAX_APPEND_COUNT, "100"));
+      for (int i = 0; i < 12; i++) {
+        catalog.createNamespace(Namespace.of("n" + i));
+      }
+
+      assertThat(catalog(io, LocalCatalogMode.APPEND).listNamespaces()).hasSize(12);
+      assertThat(io.conditionalWrites().get(CATALOG))
+          .as("compactions when the object is full")
+          .containsSubsequence(
+              AtomicOutputFile.Strategy.CAS, AtomicOutputFile.Strategy.APPEND, AtomicOutputFile.Strategy.APPEND, AtomicOutputFile.Strategy.APPEND, AtomicOutputFile.Strategy.APPEND,
+              AtomicOutputFile.Strategy.CAS, AtomicOutputFile.Strategy.APPEND, AtomicOutputFile.Strategy.APPEND, AtomicOutputFile.Strategy.APPEND, AtomicOutputFile.Strategy.APPEND,
+              AtomicOutputFile.Strategy.CAS);
+    }
+
+    @Test
+    void anAppendThatLosesARaceToTheLimitCompacts() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      io.limitSegments(5);
+      Map<String, String> atTheLimit = Map.of(ProtoCatalogFormat.MAX_APPEND_COUNT, "5");
+      FileIOCatalog a = LocalCatalogMode.APPEND.catalog(io, WAREHOUSE, "c", atTheLimit);
+      FileIOCatalog b = LocalCatalogMode.APPEND.catalog(io, WAREHOUSE, "c", atTheLimit);
+      for (int i = 0; i < 3; i++) {
+        a.createNamespace(Namespace.of("n" + i)); // a CAS and three appends: four writes
+      }
+      boolean[] raced = {false};
+      io.injectFaults((location, strategy) -> {
+        if (!raced[0] && location.equals(CATALOG)) {
+          raced[0] = true;
+          // the fifth, and no conflict with A's (a create under the root conflicts with one)
+          b.setProperties(Namespace.of("n0"), Map.of("k", "v"));
+        }
+        return Fault.NONE;
+      });
+
+      // A read four records, appends, loses the race, and retries its append at the new length.
+      a.createNamespace(Namespace.of("a"));
+
+      io.injectFaults((location, strategy) -> Fault.NONE);
+      assertThat(catalog(io, LocalCatalogMode.APPEND).namespaceExists(Namespace.of("a"))).isTrue();
+      assertThat(io.conditionalWrites().get(CATALOG))
+          .as("A compacted, its own record in the CAS")
+          .hasSize(6)
+          .last()
+          .isEqualTo(AtomicOutputFile.Strategy.CAS);
+    }
+  }
+
   /**
    * Storage with prefix and bulk operations, as S3, GCS and ADLS have (a table's FileIO passes
    * bulk deletes on only for those), whose bulk deletes fail.

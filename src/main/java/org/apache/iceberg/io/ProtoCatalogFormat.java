@@ -638,6 +638,10 @@ public class ProtoCatalogFormat
       // landed. A transport retry of a write that landed fails its precondition, so the failure is
       // no proof; but the write landed before the reply, so a read without it settles it.
       SupportsAtomicOperations.AtomicOperationException unresolved = null;
+      // Whether storage refused an append because the object holds as many writes as it allows (S3
+      // Express: 10,000 parts; an Azure Append Blob: 50,000 blocks): only a CAS can commit then,
+      // whatever the append count says.
+      boolean full = false;
 
       for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
         try {
@@ -646,7 +650,8 @@ public class ProtoCatalogFormat
           // Either limit (count or size) being met forces CAS on the next commit.
           // Setting maxAppendCount=0 forces CAS on every commit.
           boolean mustCAS =
-              !appendSupported
+              full
+                  || !appendSupported
                   || baseCatalog.appendCount() >= maxAppendCount
                   || length(current) + txnBytes.length > maxAppendSize;
 
@@ -668,6 +673,7 @@ public class ProtoCatalogFormat
               baseCatalog = fresh.build();
               baseIsCurrent = true;
             }
+            full = false;
             try {
               return validateCommit(
                   tryCAS(baseCatalog, current, txn, txnBytes, fileIO),
@@ -700,6 +706,13 @@ public class ProtoCatalogFormat
             try {
               return validateCommit(
                   tryAppend(current, txnBytes, fileIO), txn, earlier(ambiguous, unresolved));
+            } catch (SupportsAtomicOperations.SegmentLimitException e) {
+              // Nothing landed, and no append to this object can: compact it by CAS, on a fresh
+              // read. Without this the commit took the append for ambiguous, and with an append
+              // count above the store's limit no writer ever compacted (Bug 66).
+              full = true;
+              baseIsCurrent = false;
+              continue;
             } catch (SupportsAtomicOperations.AppendException e) {
               unresolved = e;
             }

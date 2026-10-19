@@ -176,9 +176,10 @@ class TestCatalogFaultProperties {
       @ForAll boolean strictVersions,
       @ForAll @IntRange(min = 0, max = 7) int gzipWriters,
       @ForAll @IntRange(min = 0, max = 7) int gcWriters,
+      @ForAll("segmentLimits") int segmentLimit,
       @ForAll("schedules") List<Cmd> schedule) {
     new Run(modes.subList(0, writers), maxUpdateSize, false, strictVersions, gzipWriters,
-        gcWriters)
+        gcWriters, segmentLimit)
         .execute(schedule);
   }
 
@@ -190,9 +191,10 @@ class TestCatalogFaultProperties {
       @ForAll boolean strictVersions,
       @ForAll @IntRange(min = 0, max = 7) int gzipWriters,
       @ForAll @IntRange(min = 0, max = 7) int gcWriters,
+      @ForAll("segmentLimits") int segmentLimit,
       @ForAll("schedules") List<Cmd> schedule) {
     new Run(modes.subList(0, writers), maxUpdateSize, true, strictVersions, gzipWriters,
-        gcWriters)
+        gcWriters, segmentLimit)
         .execute(schedule);
   }
 
@@ -203,6 +205,15 @@ class TestCatalogFaultProperties {
     return Arbitraries.frequencyOf(
         Tuple.of(1, mode.map(m -> List.of(m, m, m))),
         Tuple.of(3, mode.list().ofSize(3)));
+  }
+
+  /**
+   * The most writes the catalog object holds, as S3 Express and Azure Append Blobs cap them (0: no
+   * cap). A small cap makes appends hit it before the append count calls for a compaction.
+   */
+  @Provide
+  Arbitrary<Integer> segmentLimits() {
+    return Arbitraries.of(0, 0, 3, 7);
   }
 
   /**
@@ -669,13 +680,18 @@ class TestCatalogFaultProperties {
      * gzipWriters} is set, else the structural one: a delta keeps its base's codec, and a full
      * update writes the writer's. Writer {@code i} keeps no committed transaction ids older than
      * its own commit's when it compacts (a retention of 0) if bit {@code i} of {@code gcWriters}
-     * is set, else the default 6 hours, which no run reaches.
+     * is set, else the default 6 hours, which no run reaches. With a {@code segmentLimit}, the
+     * catalog object holds at most that many writes, and an append past it fails (Bug 66).
      */
     Run(List<LocalCatalogMode> modes, int maxUpdateSize, boolean faults, boolean strictVersions,
-        int gzipWriters, int gcWriters) {
+        int gzipWriters, int gcWriters, int segmentLimit) {
       this.maxUpdateSize = maxUpdateSize;
       this.faults = faults;
       io.failSupersededReads(strictVersions);
+      if (segmentLimit > 0) {
+        io.limitSegments(segmentLimit);
+      }
+      Statistics.label("segment limit").collect(segmentLimit);
       Map<String, String> properties = new HashMap<>(PROPERTIES);
       properties.put(FileIOCatalog.INLINE_MAX_UPDATE_SIZE, String.valueOf(maxUpdateSize));
       this.writers = new Writer[modes.size()];
@@ -697,9 +713,11 @@ class TestCatalogFaultProperties {
       create(seed, TABLES.get(1), 2).newFastAppend().appendFile(newFile()).commit();
       this.model = actual();
       trace.append(String.format(
-          "modes %s, max update size %d%s, gzip writers %s, gc writers %s%nseed: %s%n",
+          "modes %s, max update size %d%s, gzip writers %s, gc writers %s, segment limit %d%n"
+              + "seed: %s%n",
           modes, maxUpdateSize, strictVersions ? ", strict versions" : "",
-          Integer.toBinaryString(gzipWriters), Integer.toBinaryString(gcWriters), model));
+          Integer.toBinaryString(gzipWriters), Integer.toBinaryString(gcWriters), segmentLimit,
+          model));
       Statistics.label("gc writers")
           .collect(Integer.bitCount(gcWriters & ((1 << modes.size()) - 1)));
       Statistics.label("modes").collect(new TreeSet<>(modes).size() == 1 ? "one" : "mixed");

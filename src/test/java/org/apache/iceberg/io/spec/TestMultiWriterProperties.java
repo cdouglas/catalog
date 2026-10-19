@@ -131,8 +131,10 @@ class TestMultiWriterProperties {
       @ForAll("appendHeadrooms") long appendHeadroom,
       @ForAll boolean strictVersions,
       @ForAll boolean gc,
+      @ForAll("segmentLimits") int segmentLimit,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(writers, maxAppendCount, appendHeadroom, false, strictVersions, gc).execute(schedule);
+    new Run(writers, maxAppendCount, appendHeadroom, false, strictVersions, gc, segmentLimit)
+        .execute(schedule);
   }
 
   @Property(tries = 300)
@@ -142,8 +144,10 @@ class TestMultiWriterProperties {
       @ForAll("appendHeadrooms") long appendHeadroom,
       @ForAll boolean strictVersions,
       @ForAll boolean gc,
+      @ForAll("segmentLimits") int segmentLimit,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(writers, maxAppendCount, appendHeadroom, true, strictVersions, gc).execute(schedule);
+    new Run(writers, maxAppendCount, appendHeadroom, true, strictVersions, gc, segmentLimit)
+        .execute(schedule);
   }
 
   // A commit step's operands pick the faults for its first two conditional writes; later writes
@@ -187,6 +191,12 @@ class TestMultiWriterProperties {
   @Provide
   Arbitrary<Integer> maxAppendCounts() {
     return Arbitraries.of(0, 1, 2, 3, 10_000);
+  }
+
+  /** The most writes the catalog object holds (0: no cap); below the append counts drawn. */
+  @Provide
+  Arbitrary<Integer> segmentLimits() {
+    return Arbitraries.of(0, 0, 2, 4);
   }
 
   /**
@@ -562,19 +572,25 @@ class TestMultiWriterProperties {
     private int nextValue = 0;
 
     Run(int writers, int maxAppendCount, long appendHeadroom) {
-      this(writers, maxAppendCount, appendHeadroom, false, false, false);
+      this(writers, maxAppendCount, appendHeadroom, false, false, false, 0);
     }
 
     /**
      * With {@code gc}, the retention of committed transaction ids is 0: every CAS drops every id
      * older than its own commit's. A commit whose id a preempting CAS puts at or below the
      * horizon fails, or cannot learn its outcome (Bug 64), so its outcome may be unknown without
-     * a fault.
+     * a fault. With a {@code segmentLimit}, the catalog object holds at most that many writes, as
+     * S3 Express and Azure Append Blobs cap them, and an append past it fails (Bug 66): the commit
+     * compacts, and its outcome is never unknown for it.
      */
     Run(int writers, int maxAppendCount, long appendHeadroom, boolean faults,
-        boolean strictVersions, boolean gc) {
+        boolean strictVersions, boolean gc, int segmentLimit) {
       this.faults = faults;
       this.gc = gc;
+      if (segmentLimit > 0) {
+        io.limitSegments(segmentLimit);
+      }
+      Statistics.label("segment limit").collect(segmentLimit);
       CatalogFile.Mut<ProtoCatalogFile, ?> seed =
           new ProtoCatalogFormat().empty(io.newInputFile(CATALOG));
       seed.createNamespace(Namespace.of("a"));

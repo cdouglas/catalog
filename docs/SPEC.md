@@ -673,7 +673,7 @@ takes the append path or the CAS (compaction) path:
 
 | Property                          | Default     | Purpose |
 |-----------------------------------|-------------|---------|
-| `fileio.catalog.max.append.count` | 10000       | Soft limit on log records: a writer that reads at least this many CASes instead of appending. Writers retrying a lost append race do not re-read the count, so the log can run a few records past it. Sized to provider limits (S3 Express 10k parts, Azure AppendBlob 50k blocks). **Setting to 0 forces CAS on every commit**, which an S3 standard bucket needs: `S3FileIO` reports `supportsAppend()`, but only S3 Express accepts its offset appends. A FileIO whose `supportsAppend()` is false (`GCSFileIO`) is CAS-only whatever the setting. |
+| `fileio.catalog.max.append.count` | 10000       | Soft limit on log records: a writer that reads at least this many CASes instead of appending. Writers retrying a lost append race do not re-read the count, so the log can run a few records past it. Sized to provider limits (S3 Express 10k parts, Azure AppendBlob 50k blocks); an append past one fails with `SegmentLimitException`, and the writer compacts instead, so a count above the store's limit costs a refused append, not a stuck catalog. **Setting to 0 forces CAS on every commit**, which an S3 standard bucket needs: `S3FileIO` reports `supportsAppend()`, but only S3 Express accepts its offset appends. A FileIO whose `supportsAppend()` is false (`GCSFileIO`) is CAS-only whatever the setting. |
 | `fileio.catalog.max.append.size`  | 16777216    | Soft performance target for total file size. Larger catalogs take longer to read. |
 | `fileio.catalog.throttle.retry.min-wait-ms` | 200 | First wait before retrying a write that storage throttled; later waits double, up to the larger of 5 s and this value, each plus up to 50% random jitter, for 8 attempts in all. |
 
@@ -713,13 +713,15 @@ function COMMIT(fileIO, original, mutations):
 
     ambiguous  = false   # a write's outcome is unknown; it may still be in flight
     unresolved = false   # a write failed its precondition; no read has ruled it out
+    full       = false   # storage refused an append: the object holds all the writes it can
     for attempt in 0..9:
       try:
-        # Must CAS when the FileIO cannot append, or either limit is
-        # at/beyond threshold based on the observable file state.
+        # Must CAS when the FileIO cannot append, the object is full, or
+        # either limit is at/beyond threshold based on the observable file state.
         # (maxAppendCount=0 forces CAS on every commit, for a backend that
         # reports supportsAppend() but cannot append, as an S3 standard bucket.)
-        mustCAS = not fileIO.supportsAppend()
+        mustCAS = full
+            or not fileIO.supportsAppend()
             or base.appendCount >= maxAppendCount
             or current.length + len(txnBytes) > maxAppendSize
 
@@ -736,6 +738,7 @@ function COMMIT(fileIO, original, mutations):
                 if landed(base):
                     return base              # an append reported as a lost race landed
                 unresolved = false
+            full = false
             try:
                 return validateCommit(tryCAS(base, current, txn, txnBytes, fileIO), txn)
             catch Conflict:
@@ -759,6 +762,13 @@ function COMMIT(fileIO, original, mutations):
         else:
             try:
                 return validateCommit(tryAppend(current, txnBytes, fileIO), txn)
+            catch SegmentLimit:
+                # The object holds as many writes as the store allows (S3 Express:
+                # 10,000 parts; an Azure Append Blob: 50,000 blocks). Nothing landed,
+                # and no append can: compact by CAS on a fresh read (Bug 66).
+                full  = true
+                stale = true
+                continue
             catch Conflict:
                 unresolved = true
 
@@ -920,7 +930,9 @@ CAS at the storage layer:
 1. The next writer reads the file. If its FileIO cannot append
    (`supportsAppend()` is false), `appendCount >= maxAppendCount`, or
    `current.length + len(txnBytes) > maxAppendSize`, it enters the CAS
-   branch.
+   branch. So does a writer whose append storage refused with
+   `SegmentLimitException`: the object holds as many writes as the store
+   allows, whatever the knobs say.
 2. The CAS builds a fresh checkpoint from the fully-replayed state,
    dropping committed ids at or below its GC watermark, and writes
    `[header][checkpoint][new-txn]`, replacing the entire file.
