@@ -356,14 +356,6 @@ class TestInlineDifferentialProperties {
       }
     } catch (IOException e) {
       throw new UncheckedIOException(e);
-    } catch (org.apache.iceberg.exceptions.ValidationException e) {
-      // Iceberg issue C8 (docs/ICEBERG_ISSUES.md): a deletion vector older than its data file
-      // leaves a table Iceberg cannot plan. Both catalogs must fail alike.
-      if (e.getMessage() == null || !e.getMessage().startsWith("DV data sequence number")) {
-        throw e;
-      }
-      Statistics.label("Iceberg issue C8").collect(true);
-      return "fails (C8): " + e.getMessage();
     }
     out.sort(String::compareTo);
     return out.toString();

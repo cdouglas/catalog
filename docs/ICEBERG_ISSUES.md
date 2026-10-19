@@ -41,8 +41,8 @@ fixes, C2 to C7 (see "Rebasing onto a newer Iceberg"). On 2026-10-18 the
 per-issue documents were checked against main at `9bbee07`: the files
 each fix changes are unchanged there since `524fe9e`, and each fix
 cherry-picks onto it (C2's test file only after C7's). C8, found the same
-day, is not fixed. The Fork column is `atomicio`, which sits on
-`core-fixes`.
+day, was fixed on `core-fixes` on 2026-10-19. The Fork column is
+`atomicio`, which sits on `core-fixes`.
 
 | Issue | Fork | 1.12.0 | main | Upstream |
 |---|---|---|---|---|
@@ -53,7 +53,7 @@ day, is not fixed. The Fork column is `atomicio`, which sits on
 | C5. Rewriting manifests fails with no snapshot | fixed, `core-fixes` f723a52 | yes | yes | not reported |
 | C6. A repeated cherry-pick leaves the table unplannable | fixed, `core-fixes` 724608a | yes | yes | not reported |
 | C7. The all_* tables miss row ids | fixed, `core-fixes` 2779515 | yes | yes | not reported |
-| C8. A DV older than its data file leaves the table unplannable | **no** | yes | yes | not reported |
+| C8. A DV older than its data file leaves the table unplannable | fixed, `core-fixes` 1d46241 | yes | yes | not reported |
 
 "Not reported" means a search of apache/iceberg's issues and pull
 requests found nothing for the issue.
@@ -285,7 +285,7 @@ reported could vary between runs.
 
 ### C8. A deletion vector older than its data file leaves a table Iceberg can't plan
 
-Details: [iceberg-issues/C8.md](iceberg-issues/C8.md). Not fixed.
+Details: [iceberg-issues/C8.md](iceberg-issues/C8.md).
 
 A row delta that does not validate its referenced data files can commit a
 deletion vector for a file that is not live where it commits: through a
@@ -304,12 +304,15 @@ is a first pick, so C6's fix does not apply.
   999 of a 6,000-try run on the fork (core-fixes included); planning
   failed in both catalogs alike. Reproduces on 1.12.0 and on main at
   `524fe9e` (the files involved are unchanged at `9bbee07`).
-- **Workaround:** `TestInlineDifferentialProperties.files` compares a
-  planning failure with this message as the string "fails (C8): ...",
-  which both catalogs must produce alike.
-- **Canary:** `aDeletionVectorOlderThanItsDataFileLeavesATableItCannotPlan`,
-  which asserts the bug is present: it fails when the bug is fixed, and
-  the workaround can then go.
+- **Fork:** fixed on `core-fixes` by 1d46241, "Core: Skip a DV older than
+  its data file, and refuse to add a data file a DV names". Planning skips
+  such a DV with a warning, as the spec's rule implies, and a commit that
+  adds a data file whose path a live DV names is refused. Its tests are
+  in `TestWapWorkflow`, `TestFastAppend` and the delete-index tests.
+- **Removed with the fix:** the workaround,
+  `TestInlineDifferentialProperties.files`'s comparison of a planning
+  failure with this message as "fails (C8): ...".
+- **Canary:** `aDataFileADeletionVectorNamesIsNotAddedAgain`.
 
 ## Accepted Iceberg Behavior
 

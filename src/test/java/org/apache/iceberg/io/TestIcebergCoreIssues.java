@@ -56,16 +56,14 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * Canaries for the Iceberg core bugs this project's fuzzers found, C1 to C8 in
- * docs/ICEBERG_ISSUES.md: one test each, on Iceberg's own InMemoryCatalog. For C1 to C7 it asserts
- * the bug is absent: upstream fixed C1, and the fork's core-fixes branch fixes the others, so
- * these pass against the fork. C8 is not fixed, and its test asserts the bug: when it fails, the
- * bug is fixed and fileio-catalog's workaround for it can go. A test of C1 to C7 that fails means
- * its bug is back: a rebase dropped the fork's fix, or a release changed the behavior. Before
- * dropping a core-fixes commit that upstream seems to have merged, check that its test here still
- * passes. Each test asserts only that the bug is absent, not the fork's way of fixing it, so a
- * different upstream fix passes too. The fuzzers
- * do not reach some of these reliably (C3, C6). The tests need only iceberg-core, so they also run
- * in Iceberg's own test tree.
+ * docs/ICEBERG_ISSUES.md: one test each, on Iceberg's own InMemoryCatalog, that asserts the bug is
+ * absent. Upstream fixed C1, and the fork's core-fixes branch fixes the others, so every test
+ * passes against the fork. A test that fails means its bug is back: a rebase dropped the fork's
+ * fix, or a release changed the behavior. Before dropping a core-fixes commit that upstream seems
+ * to have merged, check that its test here still passes. Each test asserts only that the bug is
+ * absent, not the fork's way of fixing it, so a different upstream fix passes too. The fuzzers do
+ * not reach some of these reliably (C3, C6). The tests need only iceberg-core, so they also run in
+ * Iceberg's own test tree.
  */
 class TestIcebergCoreIssues {
 
@@ -254,14 +252,12 @@ class TestIcebergCoreIssues {
   }
 
   /**
-   * C8, not fixed. A deletion vector for a data file that is not live where it commits (a row
-   * delta that does not validate its referenced files, say through a stale handle) stays in the
-   * table; a later commit that adds that file, at a newer sequence number, leaves a table Iceberg
-   * cannot plan. This test asserts the bug: when it fails, the bug is fixed, and the tolerance in
-   * TestInlineDifferentialProperties.files can go.
+   * C8. A commit must not add a data file that a live deletion vector names: a DV committed for a
+   * file not live where it commits (a row delta that does not validate its referenced files)
+   * would be older than the file once a commit added it, and the table could not be planned.
    */
   @Test
-  void aDeletionVectorOlderThanItsDataFileLeavesATableItCannotPlan() {
+  void aDataFileADeletionVectorNamesIsNotAddedAgain() {
     Table table =
         catalog().buildTable(ID, SCHEMA).withProperty(TableProperties.FORMAT_VERSION, "3").create();
     table.newFastAppend().appendFile(file("x")).commit();
@@ -269,12 +265,11 @@ class TestIcebergCoreIssues {
     table.newFastAppend().appendFile(staged).stageOnly().commit();
     long stagedId = Iterables.getLast(table.snapshots()).snapshotId();
     table.newRowDelta().addDeletes(dv(table, staged)).commit(); // d is not live on main
-    table.manageSnapshots().cherrypick(stagedId).commit(); // adds d, newer than its DV
 
-    assertThatThrownBy(() -> rowIds(table))
-        .as("Iceberg issue C8 no longer reproduces: see docs/ICEBERG_ISSUES.md")
-        .isInstanceOf(ValidationException.class)
-        .hasMessageStartingWith("DV data sequence number");
+    assertThatThrownBy(() -> table.manageSnapshots().cherrypick(stagedId).commit())
+        .as(BACK, "C8")
+        .isInstanceOf(ValidationException.class);
+    assertThat(rowIds(table)).as(BACK, "C8").containsOnlyKeys(path("x")); // plans
   }
 
   private static InMemoryCatalog catalog() {
