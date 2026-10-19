@@ -8,7 +8,7 @@ reports or pull requests upstream. It covers the reproduction, the cause
 with links to the 1.12.0 source, the fix, its tests, and what to settle
 before a PR.
 
-Upstream fixed C1. The fork fixes C2 to C7 on branch `core-fixes`, each
+Upstream fixed C1. The fork fixes C2 to C9 on branch `core-fixes`, each
 in an upstream-style commit with its tests, so the project's tests no
 longer work around any of them.
 
@@ -41,7 +41,8 @@ fixes, C2 to C7 (see "Rebasing onto a newer Iceberg"). On 2026-10-18 the
 per-issue documents were checked against main at `9bbee07`: the files
 each fix changes are unchanged there since `524fe9e`, and each fix
 cherry-picks onto it (C2's test file only after C7's). C8, found the same
-day, was fixed on `core-fixes` on 2026-10-19. The Fork column is
+day, was fixed on `core-fixes` on 2026-10-19, as was C9, found that day;
+C9 was checked against main at `6890694bd`. The Fork column is
 `atomicio`, which sits on `core-fixes`.
 
 | Issue | Fork | 1.12.0 | main | Upstream |
@@ -54,6 +55,7 @@ day, was fixed on `core-fixes` on 2026-10-19. The Fork column is
 | C6. A repeated cherry-pick leaves the table unplannable | fixed, `core-fixes` 724608a | yes | yes | not reported |
 | C7. The all_* tables miss row ids | fixed, `core-fixes` 2779515 | yes | yes | not reported |
 | C8. A DV older than its data file leaves the table unplannable | fixed, `core-fixes` 1d46241 | yes | yes | not reported |
+| C9. A create-or-replace replaces a table created since it began | fixed, `core-fixes` b7a2abd | yes | yes | not reported; PR [#16943](https://github.com/apache/iceberg/pull/16943) would change it (see C9) |
 
 "Not reported" means a search of apache/iceberg's issues and pull
 requests found nothing for the issue.
@@ -314,6 +316,39 @@ is a first pick, so C6's fix does not apply.
   failure with this message as "fails (C8): ...".
 - **Canary:** `aDataFileADeletionVectorNamesIsNotAddedAgain`.
 
+### C9. A create-or-replace replaces a table created since it began with a different one
+
+Details: [iceberg-issues/C9.md](iceberg-issues/C9.md).
+
+A create-or-replace transaction that began without its table, on a
+metastore catalog, committed the new table it built over one another
+writer created before its commit refreshed the table. The table took the
+transaction's UUID and lost the created table's history; neither order of
+the two commits gives that. When the create landed after the refresh, the
+commit failed with `AlreadyExistsException` instead (A2), as it always
+does on REST.
+
+- **Cause:** `BaseTransaction.commitReplaceTransaction` commits the
+  metadata it built at the start over whatever the refresh found, and a
+  transaction that began without a table has no UUID to check the refreshed
+  table against.
+- **Found by:** `TestCatalogFaultProperties`, 2026-10-19, in both its
+  properties (tries 8,202 and 18,447 of 30,000-try runs), shrunk to a
+  create-or-replace preempted by a create of the same table. Reproduces on
+  `InMemoryCatalog`.
+- **Fork:** fixed on `core-fixes` by b7a2abd, "Core: Fail a
+  create-or-replace when its table was created since it began". When the
+  refresh finds a table where the transaction began without one, the
+  commit fails with `AlreadyExistsException`, as it does when the create
+  lands later. Its tests are
+  `TestReplaceTransaction.testCreateOrReplaceTransactionWithConcurrentCreate`
+  and `CatalogTests.testCreateOrReplaceTransactionConcurrentCreate`, which
+  expected this all along but ran only on REST catalogs; it now runs on
+  every catalog, `FileIOCatalog`'s modes in `TestLocalCatalog` included.
+- **No workaround** to remove: the fuzzer's model expected a serial
+  outcome.
+- **Canary:** `aCreateOrReplaceKeepsATableCreatedSinceItBegan`.
+
 ## Accepted Iceberg Behavior
 
 The oracles accept these behaviors as Iceberg's semantics, not as
@@ -336,7 +371,9 @@ transactions can join the race property.
 A create-or-replace transaction that finds no table, while another
 writer creates one before it commits, fails with
 `AlreadyExistsException`. It doesn't replace the new table.
-`TestCatalogFaultProperties` counts that failure as a rejection.
+`TestCatalogFaultProperties` counts that failure as a rejection. Until
+C9's fix, it did so only when the create landed after the commit's
+refresh of the table.
 
 ### A3. A handle to a re-created table can't commit
 

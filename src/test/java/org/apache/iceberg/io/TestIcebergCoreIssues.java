@@ -44,6 +44,7 @@ import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.Transaction;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.exceptions.AlreadyExistsException;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.inmemory.InMemoryCatalog;
@@ -55,7 +56,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
- * Canaries for the Iceberg core bugs this project's fuzzers found, C1 to C8 in
+ * Canaries for the Iceberg core bugs this project's fuzzers found, C1 to C9 in
  * docs/ICEBERG_ISSUES.md: one test each, on Iceberg's own InMemoryCatalog, that asserts the bug is
  * absent. Upstream fixed C1, and the fork's core-fixes branch fixes the others, so every test
  * passes against the fork. A test that fails means its bug is back: a rebase dropped the fork's
@@ -270,6 +271,31 @@ class TestIcebergCoreIssues {
         .as(BACK, "C8")
         .isInstanceOf(ValidationException.class);
     assertThat(rowIds(table)).as(BACK, "C8").containsOnlyKeys(path("x")); // plans
+  }
+
+  /**
+   * C9. A create-or-replace transaction that began without its table must not replace a table
+   * another writer created since with the one it built: the replacement had the transaction's new
+   * UUID and none of the created table's history (BaseTransaction.commitReplaceTransaction).
+   */
+  @Test
+  void aCreateOrReplaceKeepsATableCreatedSinceItBegan() {
+    InMemoryCatalog catalog = catalog();
+    Transaction createOrReplace = catalog.buildTable(ID, SCHEMA).createOrReplaceTransaction();
+    createOrReplace.newFastAppend().appendFile(file("a")).commit();
+    Table created = catalog.createTable(ID, SCHEMA);
+    created.newFastAppend().appendFile(file("b")).commit();
+    long appended = created.currentSnapshot().snapshotId();
+
+    try {
+      createOrReplace.commitTransaction();
+    } catch (AlreadyExistsException e) {
+      // failing, as a create does, keeps the created table too
+    }
+
+    Table table = catalog.loadTable(ID);
+    assertThat(table.uuid()).as(BACK, "C9").isEqualTo(created.uuid());
+    assertThat(table.snapshot(appended)).as(BACK, "C9").isNotNull();
   }
 
   private static InMemoryCatalog catalog() {

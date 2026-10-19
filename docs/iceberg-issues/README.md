@@ -12,7 +12,8 @@ The fixes are on branch
 [`core-fixes`](https://github.com/cdouglas/iceberg/tree/core-fixes) of the
 fork, one commit each on the `apache-iceberg-1.12.0` tag. As of 2026-10-18,
 each cherry-picks onto upstream `main` (`9bbee07`); only C2's test file
-conflicts, and only if C7 isn't picked first, and C8's, if C6 isn't.
+conflicts, and only if C7 isn't picked first, and C8's, if C6 isn't. C9,
+added 2026-10-19, cherry-picks onto `main` at `6890694bd` after C3.
 
 | Issue | Fix | Before a PR |
 |---|---|---|
@@ -24,3 +25,4 @@ conflicts, and only if C7 isn't picked first, and C8's, if C6 isn't.
 | [C6. A repeated cherry-pick leaves a table it can't plan](C6.md) | [`724608a`](https://github.com/cdouglas/iceberg/commit/724608a099eec717e59b11cd09cb062a4dfceb28) | least certain: cost and semantics |
 | [C7. The all_* metadata tables miss the row ids of an upgraded file](C7.md) | [`2779515`](https://github.com/cdouglas/iceberg/commit/27795151cf7ec998a6ee018e31f6cbe85b021cd1) | ready |
 | [C8. A deletion vector older than its data file leaves a table Iceberg can't plan](C8.md) | [`1d46241`](https://github.com/cdouglas/iceberg/commit/1d46241c7cb1693801b1f6b2dc5300e233e5495e) | replaces an upstream test's assertion |
+| [C9. A create-or-replace replaces a table created since it began with a different one](C9.md) | [`b7a2abd`](https://github.com/cdouglas/iceberg/commit/b7a2abd8ff75f5f00681c5ac4e24f0b0d99b3a36) | coordinate with PR #16943, which turns the race into a replace |
