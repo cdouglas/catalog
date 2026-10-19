@@ -4209,4 +4209,62 @@ public class TestCatalogRegressions {
       assertThat(read().namespaceProperties(Namespace.of("x"))).containsEntry("k", "v");
     }
   }
+
+  // ============================================================
+  // Bug 67: a transaction that read or updated a table and then dropped it
+  // could never commit. CatalogFile.Mut staged the drop beside the read or
+  // update, and replay rejects a record that drops a table it also reads or
+  // updates (Bug 14), so the commit failed with CommitFailedException even
+  // with nothing racing it, every time. updateTable and readTable already
+  // refused a table the transaction dropped; dropTable now drops what the
+  // transaction read or changed of the table, as dropNamespace drops its
+  // pending property changes. The drop carries the same precondition, the
+  // table's version, so the record means what the operations do in order.
+  // Found by TestMultiWriterProperties' check that a commit nothing raced
+  // is acknowledged, which the TLA+ model's oracle analysis motivated.
+  // ============================================================
+
+  @Nested
+  class UpdateThenDropTable {
+    private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+    private final ProtoCatalogFormat fmt = format(APPEND);
+    private final TableIdentifier table = TableIdentifier.of("a", "t");
+
+    private ProtoCatalogFile seeded() {
+      CatalogFile.Mut<ProtoCatalogFile, ?> create = fmt.from(seed(io, fmt, "a"));
+      create.createTable(table, "mem:///a/t/v0");
+      create.commit(io);
+      return reread(io, fmt);
+    }
+
+    @Test
+    void aTableUpdatedThenDroppedInOneTransactionIsDropped() {
+      CatalogFile.Mut<ProtoCatalogFile, ?> txn = fmt.from(seeded());
+      txn.updateTable(table, "mem:///a/t/v1");
+      txn.dropTable(table);
+      txn.commit(io);
+      assertThat(reread(io, fmt).containsTable(table)).isFalse();
+    }
+
+    @Test
+    void aTableReadThenDroppedInOneTransactionIsDropped() {
+      CatalogFile.Mut<ProtoCatalogFile, ?> txn = fmt.from(seeded());
+      txn.readTable(table);
+      txn.dropTable(table);
+      txn.commit(io);
+      assertThat(reread(io, fmt).containsTable(table)).isFalse();
+    }
+
+    @Test
+    void theDropStillConflictsWithAConcurrentUpdate() {
+      CatalogFile.Mut<ProtoCatalogFile, ?> txn = fmt.from(seeded());
+      CatalogFile.Mut<ProtoCatalogFile, ?> other = fmt.from(reread(io, fmt));
+      other.updateTable(table, "mem:///a/t/other");
+      other.commit(io);
+      txn.updateTable(table, "mem:///a/t/v1");
+      txn.dropTable(table);
+      assertThatThrownBy(() -> txn.commit(io)).isInstanceOf(CommitFailedException.class);
+      assertThat(reread(io, fmt).location(table)).isEqualTo("mem:///a/t/other");
+    }
+  }
 }

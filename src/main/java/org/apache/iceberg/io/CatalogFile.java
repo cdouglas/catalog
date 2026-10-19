@@ -335,6 +335,15 @@ public abstract class CatalogFile {
         throw new NoSuchTableException("Table does not exist: %s", tableId);
       }
       checkNotRenamed(tableId);
+      // The drop supersedes what this transaction read or changed of the table, as dropNamespace
+      // does a namespace's property changes: its precondition is the same table version, and
+      // replay rejects a record that drops a table it also reads or updates.
+      readTables.remove(tableId);
+      tableUpdates.remove(tableId);
+      inlineTableUpdates.remove(tableId);
+      inlineTableUpdateCodecs.remove(tableId);
+      inlineTableUpdateMlDeltas.remove(tableId);
+      inlineTableDeltaUpdates.remove(tableId);
       tables.put(tableId, null);
       return self();
     }
