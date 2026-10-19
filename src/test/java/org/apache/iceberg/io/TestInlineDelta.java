@@ -1064,6 +1064,16 @@ public class TestInlineDelta {
   @Nested
   class ReplayDeterminismTests {
 
+    /** Replays {@code deltaBytes} on gzip-encoded {@code baseBytes} as the catalog does. */
+    private byte[] replay(byte[] baseBytes, byte[] deltaBytes) {
+      ProtoCatalogFile.Builder catalog =
+          ProtoCatalogFile.builder(new org.apache.iceberg.inmemory.InMemoryInputFile(new byte[0]))
+              .addInlineTable(
+                  1, 0, "t", 1, baseBytes, InlineMetadataCodecs.TAG_JSON_GZIP, "");
+      return InlineDeltaCodec.applyDeltaWithManifests(
+          baseBytes, InlineMetadataCodecs.JSON_GZIP, deltaBytes, catalog, 1);
+    }
+
     /**
      * Property-only delta: no AddSnapshot, no setRef. Exercises
      * {@code Builder.build()}'s wall-clock fallback path (TableMetadata.java line
@@ -1077,8 +1087,7 @@ public class TestInlineDelta {
       byte[] deltaBytes = InlineDeltaCodec.encodeDelta(updates, TestInlineDelta.TEST_TS);
       byte[] baseBytes = metadataBytes(baseMetadata());
 
-      byte[] r1 = InlineDeltaCodec.applyDelta(
-          baseBytes, InlineMetadataCodecs.JSON_GZIP, deltaBytes);
+      byte[] r1 = replay(baseBytes, deltaBytes);
       TableMetadata m1 = parseMetadataBytes(r1);
       assertThat(m1.lastUpdatedMillis())
           .as("top-level last-updated-ms must equal the writer's value")
@@ -1108,10 +1117,8 @@ public class TestInlineDelta {
       byte[] deltaBytes = InlineDeltaCodec.encodeDelta(updates, TestInlineDelta.TEST_TS);
       byte[] baseBytes = metadataBytes(base);
 
-      byte[] r1 = InlineDeltaCodec.applyDelta(
-          baseBytes, InlineMetadataCodecs.JSON_GZIP, deltaBytes);
-      byte[] r2 = InlineDeltaCodec.applyDelta(
-          baseBytes, InlineMetadataCodecs.JSON_GZIP, deltaBytes);
+      byte[] r1 = replay(baseBytes, deltaBytes);
+      byte[] r2 = replay(baseBytes, deltaBytes);
       TableMetadata m1 = parseMetadataBytes(r1);
       TableMetadata m2 = parseMetadataBytes(r2);
 

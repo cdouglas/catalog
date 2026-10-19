@@ -211,34 +211,10 @@ public class InlineDeltaCodec {
   // ============================================================
 
   /**
-   * Applies a delta (encoded bytes) to a codec-encoded base TableMetadata blob,
-   * returning the updated bytes encoded with the same codec.
-   *
-   * <p>Delta mode preserves the on-disk codec — codec changes only happen via
-   * full re-inline (CreateTableInline / UpdateTableInline.full_metadata).
-   */
-  public static byte[] applyDelta(
-      byte[] baseMetadataBytes, InlineMetadataCodec baseCodec, byte[] deltaBytes) {
-    // Synthesize a deterministic metadata-file location for the parsed base so the
-    // rebuilt TM's `previousFiles()` history accumulates an entry for the prior
-    // version. The exact format isn't load-bearing — `inline://` URIs are opaque
-    // strings that never resolve through FileIO — only that the value is stable
-    // for the same input bytes (a hashCode collision would only produce equal
-    // metadata-log entries, which `MetadataLogEntry` deduplicates by file+timestamp
-    // anyway).
-    String syntheticLoc =
-        "inline://#" + Integer.toHexString(Arrays.hashCode(baseMetadataBytes));
-    TableMetadata base = baseCodec.decodeFull(baseMetadataBytes, syntheticLoc);
-    DecodedDelta decoded = decodeDelta(deltaBytes);
-    TableMetadata result = applyUpdates(base, decoded.updates, decoded.lastUpdatedMillis);
-    return baseCodec.encode(result);
-  }
-
-  /**
    * Applies a delta (encoded bytes) to base metadata, routing ML updates to the
-   * ProtoCatalogFile.Builder and TM updates (including AddSnapshot) to TableMetadata.
-   * This is the replay of an UpdateTableInline delta; {@link #applyDelta}, which cannot
-   * apply AddSnapshot, has no production caller.
+   * ProtoCatalogFile.Builder and TM updates (including AddSnapshot) to TableMetadata, and
+   * returning the updated bytes encoded with the base's codec: a delta keeps the on-disk codec,
+   * which changes only with full metadata. This is the replay of an UpdateTableInline delta.
    *
    * <p><b>Ordering invariant:</b> {@code AddSnapshotUpdate} entries for a given
    * snapshot must appear in the delta list <em>before</em> any
@@ -253,9 +229,11 @@ public class InlineDeltaCodec {
   public static byte[] applyDeltaWithManifests(
       byte[] baseMetadataBytes, InlineMetadataCodec baseCodec, byte[] deltaBytes,
       ProtoCatalogFile.Builder catalogBuilder, int tableId) {
-    // Synthetic metadata-file location for the parsed base — see applyDelta()
-    // for the rationale. The string is opaque to FileIO; it only flows into
-    // `previousFiles()` as a metadata-log entry.
+    // A deterministic metadata-file location for the parsed base, so the rebuilt
+    // metadata's `previousFiles()` gains an entry for the prior version. The string
+    // is opaque to FileIO (an `inline://` URI never resolves); only its stability
+    // for the same input bytes matters (a hash collision only gives equal
+    // metadata-log entries, which `MetadataLogEntry` deduplicates).
     String syntheticLoc =
         "inline://#" + Integer.toHexString(Arrays.hashCode(baseMetadataBytes));
     TableMetadata base = baseCodec.decodeFull(baseMetadataBytes, syntheticLoc);
