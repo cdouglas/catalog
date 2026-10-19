@@ -17,9 +17,7 @@ target/
 # TLC tools (downloaded, not vendored)
 spec/tla/tools/
 
-# TLC run artifacts
+# TLC run artifacts (spec/tla/check.py writes its configurations and output here)
 spec/tla/states/
-
-spec/tla/FileIOCatalog.cfg
-spec/tla/FileIOCatalog.old
-spec/tla/FileIOCatalog_TTrace_*
+spec/tla/*_TTrace_*
+spec/tla/__pycache__/
