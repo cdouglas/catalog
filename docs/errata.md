@@ -395,12 +395,12 @@ have not exercised:
 - region-failover redirects mid-write;
 - conditional appends that succeed at the storage layer but return a
   partial offset (does any provider do this?);
-- the ADLS mapping of the 50,000-block hard limit: every ADLS APPEND is
-  one block, and the 409 `BlockCountExceedsLimit` past the limit becomes
-  `SegmentLimitException`, on which a writer compacts (Bug 66). S3
-  Express's 10,000-part limit was checked against the real service
-  (`S3ExpressFileIOAtomicTest.appendPastTheSegmentLimitFails`); ADLS's has
-  not been, for want of credentials.
+- the stores' hard limits on writes per object. Answered (Bug 66): an
+  S3 Express object holds 10,000 parts and an ADLS Append Blob 50,000
+  blocks, each counting the write that creates the object; the append
+  past the limit fails with `SegmentLimitException`, on which a writer
+  compacts. `appendPastTheSegmentLimitFails` checked both against the
+  real services (2026-10-19).
 
 **Trigger:** the first time a real workload sees an unexpected commit
 failure on a specific provider.
