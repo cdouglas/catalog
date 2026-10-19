@@ -107,7 +107,9 @@ import org.apache.iceberg.types.Types;
  *   <li>An operation that failed any way but {@link CommitStateUnknownException} did not take
  *       effect. Iceberg deletes a commit's new files on a {@code CleanableFailure} such as {@link
  *       CommitFailedException}, so a commit reported that way that took effect loses them.
- *   <li>An operation whose outcome is unknown took effect entirely or not at all.
+ *   <li>An operation whose outcome is unknown took effect entirely or not at all, and a fault was
+ *       injected into it, unless a writer compacts with a retention of 0 (which can put a commit
+ *       in flight at or below the committed set's horizon).
  *   <li>Every table is in a namespace; every table loads; every snapshot has its manifest list,
  *       inline or in a file, and every manifest exists; a snapshot's manifest list never changes;
  *       no table is stored both inline and in a metadata file.
@@ -643,6 +645,8 @@ class TestCatalogFaultProperties {
   private static final class Run {
     private final int maxUpdateSize;
     private final boolean faults;
+    // whether a writer compacts with a retention of 0, which can leave a commit's outcome unknown
+    private final boolean gc;
     private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
     private final Writer[] writers;
     private final FileIOCatalog checker;
@@ -687,6 +691,7 @@ class TestCatalogFaultProperties {
         int gzipWriters, int gcWriters, int segmentLimit) {
       this.maxUpdateSize = maxUpdateSize;
       this.faults = faults;
+      this.gc = (gcWriters & ((1 << modes.size()) - 1)) != 0;
       io.failSupersededReads(strictVersions);
       if (segmentLimit > 0) {
         io.limitSegments(segmentLimit);
@@ -1633,6 +1638,12 @@ class TestCatalogFaultProperties {
         }
       }
       String faultsFired = topLevel && !fired.isEmpty() ? " after " + fired : "";
+      // Bug 66 left an outcome unknown on storage that did not fail. A preempting operation runs
+      // without faults.
+      if (outcome == Outcome.UNKNOWN && faultsFired.isEmpty() && !gc) {
+        throw fail("%s has an unknown outcome (%s), but no fault was injected and no writer drops "
+            + "committed ids", op, reason);
+      }
       trace.append(String.format("%s  -> %s%s%s%n", indent, outcome,
           reason.isEmpty() ? "" : " (" + reason + ")", faultsFired));
       Statistics.label("outcome").collect(cmd.kind + " " + outcome);

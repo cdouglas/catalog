@@ -158,20 +158,24 @@ class TestCatalogRaceProperties {
     // With gc, a racer's CAS may drop committed ids newer than A's transaction id, putting it at
     // or below the committed set's horizon: replay then rejects A's record, and A cannot learn
     // whether an earlier write of it landed (Bug 64). A fails or is unknown, and the race must
-    // end as a serial run with A or without it.
-    boolean lost = gc && (raceA.equals("CommitFailedException")
+    // end as a serial run with A or without it. Only a racer that ran before one of A's writes
+    // can do that: A mints its id above the horizon it read, and its own compaction keeps the
+    // horizon below its record.
+    boolean lost = gc && before > 0 && (raceA.equals("CommitFailedException")
         || raceA.equals("CommitStateUnknownException"));
     String[] serial = new String[racers.size()];
     String[] first = serialRun(setup, replaced || lost ? null : a, modeA, racers, racerModes,
         before, props, serial);
     String serialA = replaced || lost ? raceA : first[0];
     String serialState = first[1];
+    boolean tookEffect = false; // A lost its outcome, but the race ends as the serial run with A
     if (lost && !raceState.equals(serialState)) {
       String[] withA = new String[racers.size()];
       String[] landed = serialRun(setup, a, modeA, racers, racerModes, before, props, withA);
       if (raceState.equals(landed[1])) {
         serial = withA;
         serialState = landed[1];
+        tookEffect = true;
       }
     }
     Statistics.label("A failed as it may").collect(replaced);
@@ -184,6 +188,9 @@ class TestCatalogRaceProperties {
     for (int k = 0; k < racers.size(); k++) {
       context.append(String.format("%n%s (%s): %s, %s", name(k), racerModes.get(k),
           racers.get(k), k < before ? "just before A's write #" + k : "after A"));
+    }
+    if (tookEffect && !raceA.equals("CommitStateUnknownException")) {
+      throw new AssertionError(String.format("A reported %s, but took effect%s", raceA, context));
     }
     String race = "A=" + raceA + " " + java.util.Arrays.toString(results);
     String serialRun = "A=" + serialA + " " + java.util.Arrays.toString(serial);

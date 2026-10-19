@@ -22,6 +22,9 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 
 /**
  * Test-only bridge that exposes the full-file encode/decode cycle for
@@ -84,9 +87,47 @@ public final class ProtoCatalogFormatTestSupport {
     }
   }
 
+  /**
+   * The state the checkpoint of a full LCAT file holds: what replay starts from, before it applies
+   * any record.
+   */
+  public static ProtoCatalogFile.Builder decodeCheckpoint(byte[] bytes) {
+    int[] at = {ProtoCatalogFormat.HEADER_SIZE};
+    int length = readVarint(bytes, at);
+    ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(new StubInputFile("test://decoded"));
+    ProtoCodec.decodeCheckpoint(Arrays.copyOfRange(bytes, at[0], at[0] + length), builder);
+    return builder;
+  }
+
+  /** The transaction records of a full LCAT file, in log order. */
+  public static List<ProtoCodec.Transaction> decodeRecords(byte[] bytes) {
+    int[] at = {ProtoCatalogFormat.HEADER_SIZE};
+    int checkpointLength = readVarint(bytes, at);
+    at[0] += checkpointLength;
+    List<ProtoCodec.Transaction> records = new ArrayList<>();
+    while (at[0] < bytes.length) {
+      int length = readVarint(bytes, at);
+      records.add(ProtoCodec.decodeTransaction(Arrays.copyOfRange(bytes, at[0], at[0] + length)));
+      at[0] += length;
+    }
+    return records;
+  }
+
   // -----------------------------------------------------------------------
   // Private helpers
   // -----------------------------------------------------------------------
+
+  /** Reads the varint at {@code at[0]} and advances {@code at[0]} past it. */
+  private static int readVarint(byte[] bytes, int[] at) {
+    int value = 0;
+    for (int shift = 0; ; shift += 7) {
+      byte b = bytes[at[0]++];
+      value |= (b & 0x7F) << shift;
+      if (b >= 0) {
+        return value;
+      }
+    }
+  }
 
   private static void writeBigEndianInt(ByteArrayOutputStream out, int v) {
     out.write((v >>> 24) & 0xFF);

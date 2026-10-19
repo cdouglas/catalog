@@ -225,7 +225,9 @@ everywhere except the missed cells.
    Its `resolve` accepts an unknown outcome if the catalog is with or without
    the operation. Bug 66 (an unknown outcome on a full segment) is reachable on
    its schedules and passes it; the multi-writer test catches it with its rule
-   that an outcome is unknown only after an injected fault.
+   that an outcome is unknown only after an injected fault. (The Java test did
+   fail on Bug 66, but only because its own setup's writes fill a segment limit
+   of 3; with a limit of 7 it passes with the bug in place.)
 3. **No oracle asserts that an uncontested commit succeeds.** Bugs that cause only
    spurious failures pass all three oracles. Bug 64b is one: with retention 0,
    a CAS whose own watermark reached its record rejected it, and a writer
@@ -247,22 +249,34 @@ everywhere except the missed cells.
 ### Oracle changes
 
 The tightened oracles in `CatalogOracles.tla` (`check.py --matrix --tight`)
-pass on the correct model:
+pass on the correct model. All but one part are now in the Java tests. Each
+was calibrated by putting its bug back in the code:
 
-1. `CheckpointRoundTrip`: for each CAS write, its record applies if it holds on
-   the checkpoint written (`CasAppliesItsRecord`). Every fuzzer runs it on
-   every write, so this one catches 64b on all three fuzzers, and 64c where the
-   skew is reachable.
+1. `CheckpointRoundTrip`: the record that follows a checkpoint, the compacting
+   commit's own, applies if it holds on the checkpoint (`CasAppliesItsRecord`).
+   Every fuzzer runs it on every write. With Bug 64b put back, all three
+   fuzzers now fail on it at their default tries.
 2. TestMultiWriterProperties: a commit with no commit since its snapshot, no
-   preemption and no fault must be acknowledged (`OracleMW2`). Catches 64b and
-   64c.
+   preemption and no fault must be acknowledged (`OracleMW2`). Bug 64b put
+   back, with change 1 off: it fails on it. On the correct code it found **Bug
+   67**: a transaction that read or updated a table and then dropped it could
+   never commit, because replay rejects a record that drops a table it also
+   reads or updates. The model could not find that, since its transactions
+   have no such structure.
 3. TestCatalogFaultProperties: an outcome is unknown only after an injected
-   fault, or with gc; and an operation nothing raced commits (`OracleFault2`).
-   Catches 66, 64b and 64c.
+   fault, or with a gc writer. With Bug 66 put back and a segment limit its
+   setup survives, it fails on it; without the rule, it passed. The model's
+   `OracleFault2` also asks that an operation nothing raced commits. That part
+   is not in the Java test: unlike the model's, the fuzzer's operations can be
+   rejected for what they do (a create of a table that exists, a stale
+   handle's validation), and its model has no way to tell those from a
+   spurious rejection.
 4. TestCatalogRaceProperties: with gc, A may lose its outcome only if a racer
    ran before one of its writes; and if A took effect, its outcome must be
-   unknown (`RacePred2`). This closes the hole in finding 4; change 1 is what
-   catches 64b there.
+   unknown (`RacePred2`). This closes the hole in finding 4, which no race
+   schedule reaches, so there is no bug to calibrate it with. In the Java test
+   the first racer always runs before A's first write, so the first condition
+   holds whenever A writes. Change 1 is what catches 64b there.
 
 ## History
 

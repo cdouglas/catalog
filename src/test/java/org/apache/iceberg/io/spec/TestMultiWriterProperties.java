@@ -78,13 +78,16 @@ import org.apache.iceberg.io.ProtoCatalogFormat;
  *   <li>Effects: {@code post} is {@code pre} plus the transaction's own changes and nothing else.
  *       This catches bugs that the serial and concurrent paths share.
  *   <li>Rejection: a rejected transaction whose record landed leaves the state unchanged.
+ *   <li>Progress: a commit nothing raced (no commit since its snapshot, none inside it), on storage
+ *       that did not fail, is acknowledged.
  *   <li>Integrity: every table's namespace and every namespace's parent exist.
  *   <li>Checkpoints: every version written reads the same as a checkpoint of it, which the next
  *       compaction would write (see {@link CheckpointRoundTrip}).
  * </ul>
  *
- * <p>Conflicts are not asserted: rejecting a commit is always safe. The outcome statistics report
- * how often a rejected transaction would have re-executed cleanly (a spurious conflict).
+ * <p>Otherwise conflicts are not asserted: rejecting a commit that raced another is always safe.
+ * The outcome statistics report how often a rejected transaction would have re-executed cleanly (a
+ * spurious conflict).
  *
  * <p>A commit may also be preempted: another writer with a transaction open commits it to
  * completion just before one of the first commit's storage requests (its conditional writes and
@@ -853,6 +856,11 @@ class TestMultiWriterProperties {
       if (outcome == Outcome.UNKNOWN && !ctx.faulted()) {
         Statistics.label("unknown without a fault (gc)").collect(true);
       }
+      // Rejecting a commit nothing raced is no conflict: Bug 64's compaction rejected its own
+      // record that way, with a retention of 0.
+      boolean raced = ctx.preemptedAt >= 0 || !Arrays.equals(liveBefore, w.snapshotBytes);
+      check(outcome == Outcome.ACKNOWLEDGED || raced || ctx.faulted(),
+          "a commit nothing raced, on storage that did not fail, was %s%s", outcome, reason);
       Statistics.label("commit path").collect(path);
       Statistics.label("operations per transaction").collect(Math.min(ops.size(), 5));
       if (!faults) {

@@ -47,6 +47,11 @@ import org.apache.iceberg.catalog.TableIdentifier;
  * tables with their metadata locations, inline metadata and its codec, manifest list prefixes,
  * manifest pools and each snapshot's references into them, the name lookups, the id counters and
  * the committed-transaction set. Only the log's record count differs by design.
+ *
+ * <p>A catalog file is also checked against the compaction that wrote its checkpoint: the record
+ * that follows the checkpoint is that commit's own, and if it holds on the checkpoint, replay
+ * applies it. A compaction keeps its committed set's GC horizon below its own record; Bug 64 was a
+ * compaction whose horizon reached its record, so replay rejected the commit it had just written.
  */
 public final class CheckpointRoundTrip {
   private static final int MAX_REPORTED = 4;
@@ -82,7 +87,40 @@ public final class CheckpointRoundTrip {
     if (violation != null) {
       return "the file does not conform to catalog.proto: " + violation;
     }
+    String rejected = compactionRecordRejected(catalogFile);
+    if (rejected != null) {
+      return rejected;
+    }
     return difference(ProtoCatalogFormatTestSupport.decodeFullFile(catalogFile));
+  }
+
+  /**
+   * Why replay rejects the record that follows the checkpoint of {@code catalogFile} though it
+   * holds on the checkpoint, or null if it does not: the record is at or below the committed set's
+   * horizon.
+   */
+  static String compactionRecordRejected(byte[] catalogFile) {
+    List<ProtoCodec.Transaction> records = ProtoCatalogFormatTestSupport.decodeRecords(catalogFile);
+    if (records.isEmpty()) {
+      return null;
+    }
+    ProtoCodec.Transaction own = records.get(0);
+    ProtoCatalogFile.Builder checkpoint = ProtoCatalogFormatTestSupport.decodeCheckpoint(catalogFile);
+    if (checkpoint.mayApply(own.id()) || !own.verify(checkpoint)) {
+      return null;
+    }
+    try {
+      if (checkpoint.containsTransaction(own.id())) {
+        return null; // the checkpoint holds it already
+      }
+    } catch (DedupHorizonExceededException e) {
+      // at or below the horizon: below
+    }
+    return String.format(
+        "the record that follows the checkpoint, %s, holds on it, but replay rejects it: it is at "
+            + "or below the committed set's horizon (%d)",
+        own.id(),
+        ProtoCatalogFormatTestSupport.decodeFullFile(catalogFile).highestDroppedTimestampMs());
   }
 
   private static void dump(byte[] catalogFile) {
