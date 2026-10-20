@@ -429,9 +429,11 @@ class TestCatalogFaultProperties {
 
     @Override
     public String toString() {
+      // the faults too, when there are any, so that a failing sample can be replayed
       return String.format(
-          "w%d:%s(%d,%d,%d%s)%s",
-          writer, kind, a, b, c, fresh ? ",fresh" : "", preempt >= 0 ? "@" + preempt : "");
+          "w%d:%s(%d,%d,%d%s)%s%s",
+          writer, kind, a, b, c, fresh ? ",fresh" : "", preempt >= 0 ? "@" + preempt : "",
+          writeFaults != 0 || readFault != 0 ? "!" + writeFaults + "/" + readFault : "");
     }
   }
 
@@ -1356,6 +1358,13 @@ class TestCatalogFaultProperties {
                     built.staged.put(wap, "");
                   }
                 }
+                // and the maximum ref ages it keeps, the table's and each ref's
+                built.refsAge = replacement.properties().containsKey(TableProperties.MAX_REF_AGE_MS);
+                replacement.refs().forEach((name, r) -> {
+                  if (r.maxRefAgeMs() != null) {
+                    built.agingRefs.add(name);
+                  }
+                });
                 replacement.properties().forEach((k, v) -> {
                   if (k.startsWith(KEY_PREFIX)) {
                     built.props.put(k, v);
@@ -1381,6 +1390,12 @@ class TestCatalogFaultProperties {
                 String uuid = before != null ? before.uuid : now.uuid;
                 TableState replaced = new TableState(uuid, built.formatVersion);
                 replaced.props.putAll(built.props);
+                // An expiry may remove a ref it could before, or one the replacement ages out.
+                replaced.refsAge = built.refsAge || before != null && before.refsAge;
+                replaced.agingRefs.addAll(built.agingRefs);
+                if (before != null) {
+                  replaced.agingRefs.addAll(before.agingRefs);
+                }
                 // Branches as observed (the commit may have taken one back to where it was);
                 // a tag the model had keeps the files it named, else as observed. A ref goes
                 // with its snapshot.
