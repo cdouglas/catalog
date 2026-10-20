@@ -1217,6 +1217,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
       if (newMetadata.changes().isEmpty()) {
         continue;
       }
+      checkAddedSnapshots(tableId, currentMetadata, newMetadata, ops.io());
       // The table's new inline-ML snapshots hold their manifest lists.
       ops.stageUpdate(newCatalog, currentMetadata, newMetadata);
     }
@@ -1226,6 +1227,36 @@ public class FileIOCatalog extends BaseMetastoreCatalog
       newCatalog.commit(fileIO);
     } catch (SupportsAtomicOperations.CASException e) {
       throw new CommitFailedException(e, "Failed to commit metadata for multi-table commit");
+    }
+  }
+
+  /**
+   * Checks that each snapshot a transaction adds to {@code tableId} names a schema and partition
+   * specs that {@code updated} has. The transaction built its snapshots on the version of the
+   * table it read, and its updates apply to the current version, checked only against the
+   * requirements Iceberg derives from them; an append's are that its branch is unchanged. An
+   * expiry that cleaned expired metadata since may have removed the schema or a partition spec a
+   * snapshot uses, and the table could not read it (Bug 69).
+   */
+  private static void checkAddedSnapshots(
+      TableIdentifier tableId, TableMetadata current, TableMetadata updated, FileIO io) {
+    for (Snapshot snapshot : updated.snapshots()) {
+      if (current.snapshot(snapshot.snapshotId()) != null) {
+        continue;
+      }
+      Integer schemaId = snapshot.schemaId();
+      if (schemaId != null && !updated.schemasById().containsKey(schemaId)) {
+        throw new ValidationException(
+            "Cannot commit snapshot %s of %s: its schema %s was removed concurrently",
+            snapshot.snapshotId(), tableId, schemaId);
+      }
+      for (ManifestFile manifest : snapshot.allManifests(io)) {
+        if (!updated.specsById().containsKey(manifest.partitionSpecId())) {
+          throw new ValidationException(
+              "Cannot commit snapshot %s of %s: its partition spec %s was removed concurrently",
+              snapshot.snapshotId(), tableId, manifest.partitionSpecId());
+        }
+      }
     }
   }
 

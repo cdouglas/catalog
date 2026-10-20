@@ -34,6 +34,7 @@ import java.util.function.Supplier;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.catalog.CatalogTransaction;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
@@ -42,6 +43,7 @@ import org.apache.iceberg.exceptions.CommitStateUnknownException;
 import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
+import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.inmemory.InMemoryInputFile;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.types.Types;
@@ -50,6 +52,7 @@ import org.apache.iceberg.io.InMemoryAtomicFileIO.ReadFault;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
@@ -4319,6 +4322,66 @@ public class TestCatalogRegressions {
       before.forEach((snapshot, list) -> assertThat(after.get(snapshot))
           .as("the manifest list of snapshot %d", snapshot)
           .isEqualTo(list));
+    }
+  }
+
+  // ============================================================
+  // Bug 69: a catalog transaction commits its updates of a table on the
+  // table's current metadata, checking only the requirements Iceberg derives
+  // from them; for an append, that its branch is unchanged. An expiry that
+  // cleaned expired metadata since could have removed the partition spec of
+  // the appended files, or the schema the snapshot names: the commit added a
+  // snapshot the table could not read. It now checks each snapshot it adds
+  // against the metadata it commits. Found by TestCatalogFaultProperties
+  // once its expiries varied (fuzz5); the client-side commit of the same
+  // append fails since Iceberg issue C11.
+  // ============================================================
+
+  @Nested
+  class TransactionOverARemovedSpecOrSchema {
+
+    private CatalogTransaction stagedAppend(FileIOCatalog catalog) {
+      catalog.createNamespace(mixedNs);
+      catalog.createTable(mixed, intSchema);
+      CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      txn.asCatalog().loadTable(mixed).newFastAppend().appendFile(dataFile("a")).commit();
+      return txn;
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = LocalCatalogMode.class, names = {"APPEND", "APPEND_ML"})
+    void aRemovedSpecFailsTheCommit(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      CatalogTransaction txn = stagedAppend(catalog(io, mode));
+
+      // another writer partitions the table and expires its unpartitioned spec
+      Table other = catalog(io, mode).loadTable(mixed);
+      other.updateSpec().addField("id").commit();
+      other.expireSnapshots().cleanExpiredMetadata(true).commit();
+      assertThat(other.specs()).doesNotContainKey(0);
+
+      assertThatThrownBy(txn::commitTransaction)
+          .isInstanceOf(ValidationException.class)
+          .hasMessageEndingWith("its partition spec 0 was removed concurrently");
+      assertThat(catalog(io, mode).loadTable(mixed).currentSnapshot()).isNull();
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = LocalCatalogMode.class, names = {"APPEND", "APPEND_ML"})
+    void aRemovedSchemaFailsTheCommit(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      CatalogTransaction txn = stagedAppend(catalog(io, mode));
+
+      // another writer adds a column and expires the schema before it
+      Table other = catalog(io, mode).loadTable(mixed);
+      other.updateSchema().addColumn("c", Types.IntegerType.get()).commit();
+      other.expireSnapshots().cleanExpiredMetadata(true).commit();
+      assertThat(other.schemas()).doesNotContainKey(0);
+
+      assertThatThrownBy(txn::commitTransaction)
+          .isInstanceOf(ValidationException.class)
+          .hasMessageEndingWith("its schema 0 was removed concurrently");
+      assertThat(catalog(io, mode).loadTable(mixed).currentSnapshot()).isNull();
     }
   }
 }
