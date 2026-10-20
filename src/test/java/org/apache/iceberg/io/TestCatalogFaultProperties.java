@@ -1491,6 +1491,12 @@ class TestCatalogFaultProperties {
                 }
               },
               (m, actual) -> {
+                // An expiry with nothing to expire writes nothing, and its file cleanup reads the
+                // catalog after: an operation that preempts that read, and drops the table, runs
+                // after the expiry, which leaves it nothing to apply to.
+                if (writes == 0 && !m.containsKey(id)) {
+                  return;
+                }
                 TableState state = existing(m, id);
                 if (expiry == Expiry.OLDER_THAN_NOW) {
                   state.staged.clear(); // no ref holds a staged append, and each is old enough
