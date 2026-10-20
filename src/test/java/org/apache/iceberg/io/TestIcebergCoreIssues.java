@@ -23,6 +23,9 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.catchThrowable;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -33,6 +36,7 @@ import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.DeleteFile;
+import org.apache.iceberg.ExpireSnapshots;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.FileMetadata;
 import org.apache.iceberg.FileScanTask;
@@ -62,7 +66,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
- * Canaries for the Iceberg core bugs this project's fuzzers found, C1 to C11 in
+ * Canaries for the Iceberg core bugs this project's fuzzers found, C1 to C13 in
  * docs/ICEBERG_ISSUES.md: one test each, on Iceberg's own InMemoryCatalog, that asserts the bug is
  * absent. Upstream fixed C1, and the fork's core-fixes branch fixes the others, so every test
  * passes against the fork. A test that fails means its bug is back: a rebase dropped the fork's
@@ -366,6 +370,71 @@ class TestIcebergCoreIssues {
     }
   }
 
+  /**
+   * C12. An expiry must follow the GC and retention settings of the metadata it commits on:
+   * RemoveSnapshots read them when it was created, so it deleted files after another writer
+   * disabled GC, and expired snapshots that retention raised since keeps.
+   */
+  @Test
+  void anExpiryFollowsSettingsChangedSinceItWasCreated() throws InterruptedException {
+    InMemoryCatalog catalog = catalog();
+    Table table = catalog.createTable(ID, SCHEMA);
+    table.newFastAppend().appendFile(file("a")).commit();
+    table.newFastAppend().appendFile(file("b")).commit();
+    Thread.sleep(2);
+    long now = System.currentTimeMillis();
+
+    List<String> deleted = new ArrayList<>();
+    ExpireSnapshots expire = table.expireSnapshots().expireOlderThan(now).deleteWith(deleted::add);
+    catalog.loadTable(ID).updateProperties().set(TableProperties.GC_ENABLED, "false").commit();
+    catchThrowable(expire::commit);
+    assertThat(deleted).as(BACK, "C12").isEmpty();
+
+    catalog.loadTable(ID).updateProperties().set(TableProperties.GC_ENABLED, "true").commit();
+    ExpireSnapshots retaining = catalog.loadTable(ID).expireSnapshots().expireOlderThan(now);
+    catalog.loadTable(ID).updateProperties().set(TableProperties.MIN_SNAPSHOTS_TO_KEEP, "2")
+        .commit();
+    retaining.commit();
+    assertThat(catalog.loadTable(ID).snapshots()).as(BACK, "C12").hasSize(2);
+  }
+
+  /**
+   * C13. An expiry that committed must not report a failure because its cleanup of the expired
+   * files failed: RemoveSnapshots let a failure to read the table back after the commit escape
+   * commit().
+   */
+  @Test
+  void anExpiryThatCommittedDoesNotFailOnItsCleanup() throws InterruptedException {
+    InMemoryCatalog catalog = catalog();
+    Table table = catalog.createTable(ID, SCHEMA);
+    table.newFastAppend().appendFile(file("a")).commit();
+    table.newFastAppend().appendFile(file("b")).commit();
+    Thread.sleep(2);
+    long now = System.currentTimeMillis();
+
+    boolean[] committed = {false};
+    Table failingRefresh = new BaseTable(new Forwarding(table) {
+      @Override
+      public void commit(TableMetadata base, TableMetadata metadata) {
+        super.commit(base, metadata);
+        committed[0] = true;
+      }
+
+      @Override
+      public TableMetadata refresh() {
+        if (committed[0]) {
+          throw new UncheckedIOException(new IOException("injected: refresh failed"));
+        }
+        return super.refresh();
+      }
+    }, table.name());
+
+    Throwable failure = catchThrowable(() -> failingRefresh.expireSnapshots()
+        .expireOlderThan(now).commit());
+    assertThat(committed[0]).isTrue();
+    assertThat(failure).as(BACK, "C13").isNull();
+  }
+
   /** As another writer, partitions an unpartitioned table and expires its unpartitioned spec. */
   private static void removeUnpartitionedSpec(InMemoryCatalog catalog, TableIdentifier id) {
     Table table = catalog.loadTable(id);
@@ -378,44 +447,56 @@ class TestIcebergCoreIssues {
    * whose attempt it then invalidates.
    */
   private static Table racing(Table table, Runnable otherWriter) {
-    TableOperations ops = ((HasTableOperations) table).operations();
     boolean[] raced = {false};
-    TableOperations racing = new TableOperations() {
-      @Override
-      public TableMetadata current() {
-        return ops.current();
-      }
-
-      @Override
-      public TableMetadata refresh() {
-        return ops.refresh();
-      }
-
+    return new BaseTable(new Forwarding(table) {
       @Override
       public void commit(TableMetadata base, TableMetadata metadata) {
         if (!raced[0]) {
           raced[0] = true;
           otherWriter.run();
         }
-        ops.commit(base, metadata);
+        super.commit(base, metadata);
       }
+    }, table.name());
+  }
 
-      @Override
-      public org.apache.iceberg.io.FileIO io() {
-        return ops.io();
-      }
+  /** The operations of {@code table}, for a test to override some of. */
+  private static class Forwarding implements TableOperations {
+    private final TableOperations ops;
 
-      @Override
-      public String metadataFileLocation(String fileName) {
-        return ops.metadataFileLocation(fileName);
-      }
+    Forwarding(Table table) {
+      this.ops = ((HasTableOperations) table).operations();
+    }
 
-      @Override
-      public org.apache.iceberg.io.LocationProvider locationProvider() {
-        return ops.locationProvider();
-      }
-    };
-    return new BaseTable(racing, table.name());
+    @Override
+    public TableMetadata current() {
+      return ops.current();
+    }
+
+    @Override
+    public TableMetadata refresh() {
+      return ops.refresh();
+    }
+
+    @Override
+    public void commit(TableMetadata base, TableMetadata metadata) {
+      ops.commit(base, metadata);
+    }
+
+    @Override
+    public org.apache.iceberg.io.FileIO io() {
+      return ops.io();
+    }
+
+    @Override
+    public String metadataFileLocation(String fileName) {
+      return ops.metadataFileLocation(fileName);
+    }
+
+    @Override
+    public org.apache.iceberg.io.LocationProvider locationProvider() {
+      return ops.locationProvider();
+    }
   }
 
   private static InMemoryCatalog catalog() {

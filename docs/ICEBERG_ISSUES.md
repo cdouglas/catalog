@@ -8,7 +8,7 @@ reports or pull requests upstream. It covers the reproduction, the cause
 with links to the 1.12.0 source, the fix, its tests, and what to settle
 before a PR.
 
-Upstream fixed C1. The fork fixes C2 to C11 on branch `core-fixes`, each
+Upstream fixed C1. The fork fixes C2 to C13 on branch `core-fixes`, each
 in an upstream-style commit with its tests, so the project's tests no
 longer work around any of them.
 
@@ -43,8 +43,8 @@ each fix changes are unchanged there since `524fe9e`, and each fix
 cherry-picks onto it (C2's test file only after C7's). C8, found the same
 day, was fixed on `core-fixes` on 2026-10-19, as were C9 and C10, found
 that day; C9 was checked against main at `6890694bd`, C10 at
-`ddbd99073`. C11 was fixed on 2026-10-20 and checked against main at
-`3738f4a97`. The Fork column is
+`ddbd99073`. C11 to C13 were fixed on 2026-10-20 and checked against
+main at `3738f4a97`. The Fork column is
 `atomicio`, which sits on `core-fixes`.
 
 | Issue | Fork | 1.12.0 | main | Upstream |
@@ -60,6 +60,8 @@ that day; C9 was checked against main at `6890694bd`, C10 at
 | C9. A create-or-replace replaces a table created since it began | fixed, `core-fixes` b7a2abd | yes | yes | not reported; PR [#16943](https://github.com/apache/iceberg/pull/16943) would change it (see C9) |
 | C10. An expiry that retries fails on what its first attempt removed | fixed, `core-fixes` 8900018 | yes | yes | not reported |
 | C11. An append commits files of a spec another writer removed | fixed, `core-fixes` 69e83ef | yes | yes | not reported |
+| C12. An expiry follows the GC and retention settings of when it was created | fixed, `core-fixes` 0824e0d | yes | yes | not reported |
+| C13. An expiry that committed reports a failure when its cleanup fails | fixed, `core-fixes` 7f3708a | yes | yes | not reported |
 
 "Not reported" means a search of apache/iceberg's issues and pull
 requests found nothing for the issue.
@@ -409,6 +411,55 @@ scan can read. An appended manifest of the spec was committed as it was.
 - **No workaround** to remove: the fuzzer counted the exception as
   unexpected.
 - **Canary:** `anAppendNeverCommitsFilesOfARemovedSpec`.
+
+### C12. An expiry follows the GC and retention settings its table had when it was created
+
+Details: [iceberg-issues/C12.md](iceberg-issues/C12.md).
+
+`ExpireSnapshots` checked `gc.enabled`, and read the table's retention
+defaults (`history.expire.*`), when it was created. Each attempt follows
+the retention of the refs in the metadata it commits on, but kept the
+table settings from creation: an expiry created before another writer
+disabled GC deleted files anyway, and one created before another writer
+raised the table's retention expired snapshots the new retention keeps.
+
+- **Cause:** the `RemoveSnapshots` constructor reads the settings from
+  `ops.current()`; `internalApply` refreshes `base` but not them.
+- **Found by:** reading `RemoveSnapshots` while adding retention settings
+  to `TestCatalogFaultProperties`, 2026-10-20. The fuzzer's model does not
+  follow snapshot history, so it cannot see this. Reproduces on
+  `InMemoryCatalog`.
+- **Fork:** fixed on `core-fixes` by 0824e0d, "Core: Read an expiry's GC and
+  retention settings on each attempt's metadata". Its tests are
+  `TestRemoveSnapshots.testRetentionRaisedSinceCreated`,
+  `testRefAgeSetSinceCreated` and `testGcDisabledSinceCreated`.
+- **No workaround** to remove.
+- **Canary:** `anExpiryFollowsSettingsChangedSinceItWasCreated`.
+
+### C13. An expiry that committed reports a failure when its file cleanup fails
+
+Details: [iceberg-issues/C13.md](iceberg-issues/C13.md).
+
+`ExpireSnapshots.commit()` cleans up the expired files after it commits.
+If reading the table back failed, or the reachable cleanup could not read
+a manifest list, the exception escaped `commit()`: the caller was told an
+expiry that committed had failed, and one that retried left the expired
+files behind.
+
+- **Cause:** `RemoveSnapshots.commit` runs `cleanExpiredSnapshots` after
+  the commit loop, outside any handler; `SnapshotProducer` logs such
+  failures instead.
+- **Found by:** `TestCatalogFaultProperties`, 2026-10-20 (try 3,172 of a
+  30,000-try run of `faultyStorageNeverMisreportsACommit`): an expiry
+  whose commit landed failed when reading the catalog back failed. The
+  fuzzer saw it once an expiry could remove a ref its model follows.
+  Reproduces on `InMemoryCatalog`.
+- **Fork:** fixed on `core-fixes` by 7f3708a, "Core: Let an expiry that
+  committed stand when its file cleanup fails". Its tests are
+  `TestRemoveSnapshots.testCommittedExpiryWhoseRefreshFails` and
+  `testCommittedExpiryWhoseCleanupFails`.
+- **No workaround** to remove.
+- **Canary:** `anExpiryThatCommittedDoesNotFailOnItsCleanup`.
 
 ## Accepted Iceberg Behavior
 
