@@ -32,6 +32,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.concurrent.TimeUnit;
 import net.jqwik.api.Arbitraries;
 import net.jqwik.api.Arbitrary;
 import net.jqwik.api.Combinators;
@@ -45,12 +46,15 @@ import net.jqwik.api.statistics.Statistics;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
+import org.apache.iceberg.ExpireSnapshots;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.HasTableOperations;
+import org.apache.iceberg.ManageSnapshots;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Snapshot;
+import org.apache.iceberg.SnapshotRef;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableProperties;
@@ -79,7 +83,9 @@ import org.apache.iceberg.types.Types;
  * <p>A generated schedule runs, on one thread, operations by several writers, each with its own
  * catalog instance and table handles over shared {@link InMemoryAtomicFileIO} storage: fast and
  * merge appends, deletes, row-level deletes (equality, position, deletion vectors), property,
- * schema and partition-spec changes, table transactions, snapshot expiry, manifest rewrites, table
+ * schema and partition-spec changes, table transactions, snapshot expiry (of everything older than
+ * now or than one of the table's snapshots, of one snapshot by id, or of what the retention of the
+ * table and its refs alone expires) and those retention settings, manifest rewrites, table
  * create / drop / rename (across namespaces too) / replace, upgrades from format v2 to v3,
  * namespace create / drop and property changes, and multi-table catalog transactions whose
  * loads, appends and commit are separate steps, so other writers' operations run in between. A
@@ -254,7 +260,8 @@ class TestCatalogFaultProperties {
             Tuple.of(1, Kind.STAGE_APPEND),
             Tuple.of(1, Kind.CHERRY_PICK),
             Tuple.of(2, Kind.TABLE_TXN),
-            Tuple.of(1, Kind.EXPIRE_SNAPSHOTS),
+            Tuple.of(2, Kind.EXPIRE_SNAPSHOTS),
+            Tuple.of(1, Kind.SET_RETENTION),
             Tuple.of(1, Kind.REWRITE_MANIFESTS),
             Tuple.of(1, Kind.CREATE_NAMESPACE),
             Tuple.of(1, Kind.DROP_NAMESPACE),
@@ -273,16 +280,19 @@ class TestCatalogFaultProperties {
             Tuple.of(2, 2),
             Tuple.of(1, 3),
             Tuple.of(1, 4));
+    // b and c together: a combinator takes at most eight arbitraries
+    Arbitrary<int[]> operands = Combinators.combine(small, small).as((b, c) -> new int[] {b, c});
     return Combinators.combine(
             kinds,
             Arbitraries.integers().between(0, 2),
             small,
-            small,
+            operands,
             Arbitraries.of(true, false),
             preempt,
             Arbitraries.integers().between(0, 143),
             small)
-        .as(Cmd::new)
+        .as((kind, writer, a, bc, fresh, pre, writeFaults, readFault) ->
+            new Cmd(kind, writer, a, bc[0], bc[1], fresh, pre, writeFaults, readFault))
         .list()
         .ofMinSize(1)
         .ofMaxSize(40)
@@ -340,7 +350,17 @@ class TestCatalogFaultProperties {
     /** Publishes a staged append to main (a cherry-pick). */
     CHERRY_PICK,
     TABLE_TXN,
+    /**
+     * Expires snapshots as {@code c} picks (see {@link Expiry}); {@code b} picks whether it also
+     * removes the schemas and partition specs no snapshot uses, and whether it keeps the files of
+     * the snapshots it expires.
+     */
     EXPIRE_SNAPSHOTS,
+    /**
+     * Sets a retention, as {@code c} picks: a branch's minimum number of snapshots or maximum
+     * snapshot age, a ref's maximum age, or a table property that sets one for all.
+     */
+    SET_RETENTION,
     REWRITE_MANIFESTS,
     /** Creates ns or ns2, as {@code b} picks, with a property when {@code b} is odd. */
     CREATE_NAMESPACE,
@@ -374,17 +394,19 @@ class TestCatalogFaultProperties {
     final int writer;
     final int a;
     final int b;
+    final int c;
     final boolean fresh;
     final int preempt;
     final int writeFaults;
     final int readFault;
 
-    Cmd(Kind kind, int writer, int a, int b, boolean fresh, int preempt, int writeFaults,
+    Cmd(Kind kind, int writer, int a, int b, int c, boolean fresh, int preempt, int writeFaults,
         int readFault) {
       this.kind = kind;
       this.writer = writer;
       this.a = a;
       this.b = b;
+      this.c = c;
       this.fresh = fresh;
       this.preempt = preempt;
       this.writeFaults = writeFaults;
@@ -408,9 +430,21 @@ class TestCatalogFaultProperties {
     @Override
     public String toString() {
       return String.format(
-          "w%d:%s(%d,%d%s)%s",
-          writer, kind, a, b, fresh ? ",fresh" : "", preempt >= 0 ? "@" + preempt : "");
+          "w%d:%s(%d,%d,%d%s)%s",
+          writer, kind, a, b, c, fresh ? ",fresh" : "", preempt >= 0 ? "@" + preempt : "");
     }
+  }
+
+  /** What an expiry expires, as its command's {@code c % 4} picks; {@code c / 4} is an operand. */
+  enum Expiry {
+    /** Every snapshot older than now that no ref retains, keeping the last 1 to 3 of a branch. */
+    OLDER_THAN_NOW,
+    /** The snapshots older than one of the table's, the operand picking which, oldest first. */
+    OLDER_THAN_A_SNAPSHOT,
+    /** One of the table's snapshots, the operand picking which, oldest first. */
+    A_SNAPSHOT,
+    /** What the retention settings of the table and its refs alone expire. */
+    BY_RETENTION
   }
 
   // ============================================================
@@ -453,6 +487,10 @@ class TestCatalogFaultProperties {
     final Map<String, Long> tagSnapshots = new TreeMap<>();
     // Staged appends not yet published nor expired, by wap.id, to the file each adds.
     final Map<String, String> staged = new TreeMap<>();
+    // Refs given a short maximum age, and whether the table gives every ref one: an expiry may
+    // remove them. A name stays here once added, as a replace can put back a ref removed since.
+    final Set<String> agingRefs = new TreeSet<>();
+    boolean refsAge = false;
     // Observed, not modeled: Iceberg chooses snapshot ids, metadata locations and sequence numbers
     // (of the table, and the data sequence numbers of its live data and delete files).
     Long snapshotId = null;
@@ -476,11 +514,24 @@ class TestCatalogFaultProperties {
       tags.forEach((name, files) -> copy.tags.put(name, new TreeSet<>(files)));
       copy.tagSnapshots.putAll(tagSnapshots);
       copy.staged.putAll(staged);
+      copy.agingRefs.addAll(agingRefs);
+      copy.refsAge = refsAge;
       copy.snapshotId = snapshotId;
       copy.metadataLocation = metadataLocation;
       copy.lastSequenceNumber = lastSequenceNumber;
       copy.sequenceNumbers.putAll(sequenceNumbers);
       return copy;
+    }
+
+    /** Drops the refs that may have aged out and that {@code now}, observed, no longer has. */
+    void ageOutRefs(TableState now) {
+      branches.keySet().removeIf(ref -> mayAge(ref) && !now.branches.containsKey(ref));
+      tags.keySet().removeIf(ref -> mayAge(ref) && !now.tags.containsKey(ref));
+      tagSnapshots.keySet().retainAll(tags.keySet());
+    }
+
+    private boolean mayAge(String ref) {
+      return refsAge || agingRefs.contains(ref);
     }
 
     List<String> sortedFiles() {
@@ -892,6 +943,15 @@ class TestCatalogFaultProperties {
       return index >= 8 || tables.isEmpty()
           ? TABLES.get(index % TABLES.size())
           : tables.get(index % tables.size());
+    }
+
+    /** The snapshots of {@code table}, oldest first. */
+    private static List<Snapshot> oldestFirst(Table table) {
+      List<Snapshot> history = new ArrayList<>();
+      table.snapshots().forEach(history::add);
+      history.sort(Comparator.comparingLong(Snapshot::timestampMillis)
+          .thenComparingLong(Snapshot::sequenceNumber));
+      return history;
     }
 
     private Table handle(Writer w, TableIdentifier id, boolean fresh) {
@@ -1370,18 +1430,133 @@ class TestCatalogFaultProperties {
                 state.props.put(txnKey, txnValue);
               });
         case EXPIRE_SNAPSHOTS:
-          // Half the time also removing the schemas and partition specs no snapshot uses.
           boolean cleanMetadata = cmd.b % 2 == 1;
+          boolean keepFiles = cmd.b / 2 % 2 == 1;
+          Expiry expiry = Expiry.values()[cmd.c % 4];
+          int operand = cmd.c / 4;
+          String expired;
+          switch (expiry) {
+            case OLDER_THAN_NOW:
+              expired = "older than now, retaining " + (operand + 1);
+              break;
+            case OLDER_THAN_A_SNAPSHOT:
+              expired = "older than snapshot #" + operand;
+              break;
+            case A_SNAPSHOT:
+              expired = "snapshot #" + operand;
+              break;
+            default:
+              expired = "by retention";
+          }
           return new Op(
-              "expireSnapshots(" + id + (cleanMetadata ? ", cleaning metadata" : "") + ")",
-              () ->
-                  handle(w, id, cmd.fresh)
-                      .expireSnapshots()
-                      .expireOlderThan(System.currentTimeMillis() + 1)
-                      .retainLast(1)
-                      .cleanExpiredMetadata(cleanMetadata)
-                      .commit(),
-              (m, actual) -> existing(m, id).staged.clear()); // no ref holds a staged append
+              "expireSnapshots(" + id + ", " + expired + (cleanMetadata ? ", cleaning metadata" : "")
+                  + (keepFiles ? ", keeping files" : "") + ")",
+              () -> {
+                Table table = handle(w, id, cmd.fresh);
+                ExpireSnapshots expire = table.expireSnapshots()
+                    .cleanExpiredFiles(!keepFiles)
+                    .cleanExpiredMetadata(cleanMetadata);
+                List<Snapshot> history = oldestFirst(table);
+                Snapshot picked = history.isEmpty() ? null : history.get(operand % history.size());
+                if (expiry == Expiry.OLDER_THAN_NOW) {
+                  expire.expireOlderThan(System.currentTimeMillis() + 1).retainLast(operand + 1);
+                } else if (expiry == Expiry.OLDER_THAN_A_SNAPSHOT && picked != null) {
+                  expire.expireOlderThan(picked.timestampMillis());
+                } else if (expiry == Expiry.A_SNAPSHOT && picked != null) {
+                  expire.expireSnapshotId(picked.snapshotId());
+                }
+                Statistics.label("expiry").collect(expiry);
+                try {
+                  expire.commit();
+                } catch (IllegalArgumentException e) {
+                  if (e.getMessage() == null || !e.getMessage().startsWith("Cannot expire ")) {
+                    throw e;
+                  }
+                  throw new ValidationException(e, "%s", e.getMessage()); // a ref holds it
+                }
+              },
+              (m, actual) -> {
+                TableState state = existing(m, id);
+                if (expiry == Expiry.OLDER_THAN_NOW) {
+                  state.staged.clear(); // no ref holds a staged append, and each is old enough
+                }
+                if (actual.containsKey(id)) {
+                  state.ageOutRefs(actual.get(id));
+                }
+              });
+        case SET_RETENTION:
+          // An age of 1 ms expires what it covers at the next expiry; a day, never in a run.
+          int setting = cmd.c % 4;
+          int amount = cmd.c / 4;
+          long age = amount == 0 ? 1 : TimeUnit.DAYS.toMillis(1);
+          // a ref the table has: a branch, main too, or for a maximum age, a branch or tag
+          TableState retaining = model.get(id);
+          List<String> branchNames = new ArrayList<>(List.of(SnapshotRef.MAIN_BRANCH));
+          List<String> refNames = new ArrayList<>();
+          if (retaining != null) {
+            branchNames.addAll(retaining.branches.keySet());
+            refNames.addAll(retaining.branches.keySet());
+            refNames.addAll(retaining.tags.keySet());
+          }
+          if (setting == 2 && refNames.isEmpty()) {
+            return null; // main has no maximum age
+          }
+          String retained = setting == 2
+              ? refNames.get(cmd.b % refNames.size())
+              : branchNames.get(cmd.b % branchNames.size());
+          String tableKey = List.of(TableProperties.MAX_REF_AGE_MS,
+              TableProperties.MIN_SNAPSHOTS_TO_KEEP, TableProperties.MAX_SNAPSHOT_AGE_MS).get(amount);
+          String tableValue = amount == 1 ? "2" : "1";
+          String retention;
+          switch (setting) {
+            case 0:
+              retention = "minSnapshotsToKeep(" + retained + ", " + (amount + 1) + ")";
+              break;
+            case 1:
+              retention = "maxSnapshotAgeMs(" + retained + ", " + age + ")";
+              break;
+            case 2:
+              retention = "maxRefAgeMs(" + retained + ", " + age + ")";
+              break;
+            default:
+              retention = tableKey + "=" + tableValue;
+          }
+          return new Op(
+              "setRetention(" + id + ", " + retention + ")",
+              () -> {
+                Table table = handle(w, id, cmd.fresh);
+                if (setting == 3) {
+                  table.updateProperties().set(tableKey, tableValue).commit();
+                  return;
+                }
+                try {
+                  ManageSnapshots manage = table.manageSnapshots();
+                  if (setting == 0) {
+                    manage.setMinSnapshotsToKeep(retained, amount + 1);
+                  } else if (setting == 1) {
+                    manage.setMaxSnapshotAgeMs(retained, age);
+                  } else {
+                    manage.setMaxRefAgeMs(retained, age);
+                  }
+                  manage.commit();
+                } catch (IllegalArgumentException e) {
+                  throw new ValidationException(e, "%s", e.getMessage()); // no such ref
+                }
+              },
+              (m, actual) -> {
+                TableState state = existing(m, id);
+                if (setting == 3) {
+                  state.refsAge |= amount == 0;
+                  return;
+                }
+                if (!retained.equals(SnapshotRef.MAIN_BRANCH)
+                    && !state.branches.containsKey(retained) && !state.tags.containsKey(retained)) {
+                  throw new IllegalStateException("no ref " + retained);
+                }
+                if (setting == 2 && amount == 0) {
+                  state.agingRefs.add(retained);
+                }
+              });
         case STAGE_APPEND:
           String wapId = "wap" + nextValue++;
           DataFile stagedFile = newFile();
