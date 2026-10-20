@@ -27,6 +27,7 @@ import java.util.Map;
 import java.util.TreeMap;
 import java.util.UUID;
 import org.apache.iceberg.AppendFiles;
+import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
@@ -40,6 +41,8 @@ import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.TableMetadata;
+import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.Transaction;
 import org.apache.iceberg.catalog.Namespace;
@@ -56,7 +59,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
- * Canaries for the Iceberg core bugs this project's fuzzers found, C1 to C9 in
+ * Canaries for the Iceberg core bugs this project's fuzzers found, C1 to C10 in
  * docs/ICEBERG_ISSUES.md: one test each, on Iceberg's own InMemoryCatalog, that asserts the bug is
  * absent. Upstream fixed C1, and the fork's core-fixes branch fixes the others, so every test
  * passes against the fork. A test that fails means its bug is back: a rebase dropped the fork's
@@ -296,6 +299,70 @@ class TestIcebergCoreIssues {
     Table table = catalog.loadTable(ID);
     assertThat(table.uuid()).as(BACK, "C9").isEqualTo(created.uuid());
     assertThat(table.snapshot(appended)).as(BACK, "C9").isNotNull();
+  }
+
+  /**
+   * C10. An expiry whose commit retries after a conflict must work out what to remove on the
+   * metadata it retries on: RemoveSnapshots kept the snapshots its earlier attempt removed, and
+   * failed when another writer had expired them since (or tagged one).
+   */
+  @Test
+  void anExpiryRetriesAfterAConcurrentExpiry() throws InterruptedException {
+    InMemoryCatalog catalog = catalog();
+    Table table = catalog.createTable(ID, SCHEMA);
+    table.newFastAppend().appendFile(file("a")).commit();
+    table.newFastAppend().appendFile(file("b")).commit();
+    table.newFastAppend().appendFile(file("c")).commit();
+    long current = table.currentSnapshot().snapshotId();
+    Thread.sleep(2);
+    long now = System.currentTimeMillis();
+
+    TableOperations ops = ((org.apache.iceberg.HasTableOperations) table).operations();
+    boolean[] raced = {false};
+    TableOperations racing = new TableOperations() {
+      @Override
+      public TableMetadata current() {
+        return ops.current();
+      }
+
+      @Override
+      public TableMetadata refresh() {
+        return ops.refresh();
+      }
+
+      @Override
+      public void commit(TableMetadata base, TableMetadata metadata) {
+        if (!raced[0]) {
+          raced[0] = true; // another writer expires the same snapshots first
+          catalog.loadTable(ID).expireSnapshots().expireOlderThan(now).retainLast(1).commit();
+        }
+        ops.commit(base, metadata);
+      }
+
+      @Override
+      public org.apache.iceberg.io.FileIO io() {
+        return ops.io();
+      }
+
+      @Override
+      public String metadataFileLocation(String fileName) {
+        return ops.metadataFileLocation(fileName);
+      }
+
+      @Override
+      public org.apache.iceberg.io.LocationProvider locationProvider() {
+        return ops.locationProvider();
+      }
+    };
+
+    assertThatCode(() -> new BaseTable(racing, "t").expireSnapshots()
+            .expireOlderThan(now).retainLast(1).commit())
+        .as(BACK, "C10")
+        .doesNotThrowAnyException();
+    assertThat(raced[0]).isTrue();
+    assertThat(catalog.loadTable(ID).snapshots())
+        .extracting(org.apache.iceberg.Snapshot::snapshotId)
+        .containsExactly(current);
   }
 
   private static InMemoryCatalog catalog() {

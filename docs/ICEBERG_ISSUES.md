@@ -8,7 +8,7 @@ reports or pull requests upstream. It covers the reproduction, the cause
 with links to the 1.12.0 source, the fix, its tests, and what to settle
 before a PR.
 
-Upstream fixed C1. The fork fixes C2 to C9 on branch `core-fixes`, each
+Upstream fixed C1. The fork fixes C2 to C10 on branch `core-fixes`, each
 in an upstream-style commit with its tests, so the project's tests no
 longer work around any of them.
 
@@ -41,8 +41,9 @@ fixes, C2 to C7 (see "Rebasing onto a newer Iceberg"). On 2026-10-18 the
 per-issue documents were checked against main at `9bbee07`: the files
 each fix changes are unchanged there since `524fe9e`, and each fix
 cherry-picks onto it (C2's test file only after C7's). C8, found the same
-day, was fixed on `core-fixes` on 2026-10-19, as was C9, found that day;
-C9 was checked against main at `6890694bd`. The Fork column is
+day, was fixed on `core-fixes` on 2026-10-19, as were C9 and C10, found
+that day; C9 was checked against main at `6890694bd`, C10 at
+`ddbd99073`. The Fork column is
 `atomicio`, which sits on `core-fixes`.
 
 | Issue | Fork | 1.12.0 | main | Upstream |
@@ -56,6 +57,7 @@ C9 was checked against main at `6890694bd`. The Fork column is
 | C7. The all_* tables miss row ids | fixed, `core-fixes` 2779515 | yes | yes | not reported |
 | C8. A DV older than its data file leaves the table unplannable | fixed, `core-fixes` 1d46241 | yes | yes | not reported |
 | C9. A create-or-replace replaces a table created since it began | fixed, `core-fixes` b7a2abd | yes | yes | not reported; PR [#16943](https://github.com/apache/iceberg/pull/16943) would change it (see C9) |
+| C10. An expiry that retries fails on what its first attempt removed | fixed, `core-fixes` 93e8831 | yes | yes | not reported |
 
 "Not reported" means a search of apache/iceberg's issues and pull
 requests found nothing for the issue.
@@ -348,6 +350,32 @@ does on REST.
 - **No workaround** to remove: the fuzzer's model expected a serial
   outcome.
 - **Canary:** `aCreateOrReplaceKeepsATableCreatedSinceItBegan`.
+
+### C10. An expiry that retries after a conflict fails on what its first attempt removed
+
+Details: [iceberg-issues/C10.md](iceberg-issues/C10.md).
+
+`ExpireSnapshots` kept the snapshots its earlier attempts chose to remove
+when it retried after a `CommitFailedException`. If another writer had
+expired them in between, the retry failed with `IllegalArgumentException:
+arraySize cannot be negative`; if another writer had tagged one, with
+"Cannot expire ... Still referenced by refs".
+
+- **Cause:** `RemoveSnapshots.internalApply` adds each attempt's choice to
+  `idsToRemove`, the set of ids the caller named, and a retry starts from
+  it.
+- **Found by:** `TestCatalogFaultProperties`, 2026-10-19 (try 13,678 of a
+  30,000-try run): an expiry with metadata cleanup, preempted by another
+  writer's expiry of the same table. Reproduces on `InMemoryCatalog`.
+- **Fork:** fixed on `core-fixes` by 93e8831, "Core: Work out what an expiry
+  removes on the metadata each attempt commits on". Each attempt works out
+  what to remove on its own metadata: the snapshots it has that the caller
+  named or that it does not retain. Its tests are
+  `TestRemoveSnapshots.testRetryAfterConcurrentExpiry` and
+  `testRetryAfterConcurrentTag`.
+- **No workaround** to remove: the fuzzer counted the exception as
+  unexpected.
+- **Canary:** `anExpiryRetriesAfterAConcurrentExpiry`.
 
 ## Accepted Iceberg Behavior
 
