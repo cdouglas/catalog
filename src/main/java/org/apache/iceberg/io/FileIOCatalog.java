@@ -877,7 +877,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
           updates = new java.util.ArrayList<>();
         }
         List<ManifestFile> manifests = snapshot.allManifests(io());
-        List<ManifestFile> parent = parentList(proto, base, metadata, snapshot.parentId());
+        List<ManifestFile> parent = parentList(proto, base, metadata, snapshot.parentId(), full);
         Set<String> paths = manifests.stream().map(ManifestFile::path).collect(Collectors.toSet());
         // The list is rebuilt in order: the parent's, less what the snapshot removes, with what it
         // adds at the positions it has. If the manifests it keeps are not in the parent's order,
@@ -975,16 +975,21 @@ public class FileIOCatalog extends BaseMetastoreCatalog
 
     /**
      * The inline list a new snapshot's list is built on: none for a snapshot without a parent, a
-     * parent's new in this commit, or a parent's inline in {@code proto}. Null if the parent's
-     * list is not inline.
+     * parent's this commit sends (a new one, or with {@code full}, one whose list the table has
+     * lost: Bug 68), or a parent's inline in {@code proto}. Null if the parent's list is not
+     * inline.
      */
     private List<ManifestFile> parentList(
-        ProtoCatalogFile proto, TableMetadata base, TableMetadata metadata, Long parentId) {
+        ProtoCatalogFile proto,
+        TableMetadata base,
+        TableMetadata metadata,
+        Long parentId,
+        boolean full) {
       if (parentId == null) {
         return List.of();
       }
       Snapshot parent = metadata.snapshot(parentId);
-      if (parent != null && isNew(parent, base)) {
+      if (parent != null && sendsList(parent, proto, base, full)) {
         return parent.allManifests(io());
       }
       Integer tblId = proto != null ? proto.tableId(tableId) : null;

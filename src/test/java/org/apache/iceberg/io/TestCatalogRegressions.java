@@ -4267,4 +4267,58 @@ public class TestCatalogRegressions {
       assertThat(reread(io, fmt).location(table)).isEqualTo("mem:///a/t/other");
     }
   }
+
+  // ============================================================
+  // Bug 68: a replace of a table another writer evicted since it began
+  // sends the lists of the snapshots it loaded inline (Bug 62). A snapshot
+  // whose parent it also sent sent its whole list, as if the parent's were
+  // a file, and replay built that list on the parent's, which the same
+  // commit had just sent: the parent's manifests appeared twice in the
+  // child's list. The parent of a snapshot now counts as inline when the
+  // commit sends its list. Found by TestCatalogFaultProperties in a long run
+  // (an inline-ML writer's replace, with a pointer writer's row delta
+  // inside its commit).
+  // ============================================================
+
+  @Nested
+  class ReplaceThatSendsAParentsList {
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void keepsEachSnapshotsList(boolean byAPointerWriter) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = small(io, LocalCatalogMode.APPEND_ML);
+      catalog.createNamespace(mixedNs);
+      Table table = catalog.createTable(mixed, intSchema);
+      table.newFastAppend().appendFile(dataFile("a")).commit();
+      table.newFastAppend().appendFile(dataFile("b")).commit();
+      Map<Long, List<String>> before = manifestLists(io, catalog.loadTable(mixed));
+
+      org.apache.iceberg.Transaction replace =
+          catalog.newReplaceTableTransaction(mixed, intSchema, false);
+      boolean[] raced = {false};
+      io.injectFaults((location, strategy) -> {
+        if (!raced[0] && location.equals(CATALOG)) {
+          raced[0] = true;
+          // Either takes the table out of inline storage, its lists to files.
+          if (byAPointerWriter) {
+            catalog(io, LocalCatalogMode.APPEND).loadTable(mixed)
+                .newFastAppend().appendFile(dataFile("c")).commit();
+          } else {
+            small(io, LocalCatalogMode.APPEND_ML).loadTable(mixed)
+                .updateProperties().set("big", bigValue(2457)).commit();
+          }
+        }
+        return Fault.NONE;
+      });
+      replace.commitTransaction();
+      assertThat(raced[0]).isTrue();
+
+      Map<Long, List<String>> after =
+          manifestLists(io, catalog(io, LocalCatalogMode.APPEND).loadTable(mixed));
+      before.forEach((snapshot, list) -> assertThat(after.get(snapshot))
+          .as("the manifest list of snapshot %d", snapshot)
+          .isEqualTo(list));
+    }
+  }
 }
