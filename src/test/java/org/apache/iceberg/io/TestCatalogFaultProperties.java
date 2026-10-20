@@ -1492,8 +1492,8 @@ class TestCatalogFaultProperties {
               },
               (m, actual) -> {
                 // An expiry with nothing to expire writes nothing, and its file cleanup reads the
-                // catalog after: an operation that preempts that read, and drops the table, runs
-                // after the expiry, which leaves it nothing to apply to.
+                // catalog after: an operation that preempts that read, and drops or renames the
+                // table, runs after the expiry, which leaves it nothing to apply to.
                 if (writes == 0 && !m.containsKey(id)) {
                   return;
                 }
