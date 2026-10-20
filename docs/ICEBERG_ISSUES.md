@@ -8,7 +8,7 @@ reports or pull requests upstream. It covers the reproduction, the cause
 with links to the 1.12.0 source, the fix, its tests, and what to settle
 before a PR.
 
-Upstream fixed C1. The fork fixes C2 to C10 on branch `core-fixes`, each
+Upstream fixed C1. The fork fixes C2 to C11 on branch `core-fixes`, each
 in an upstream-style commit with its tests, so the project's tests no
 longer work around any of them.
 
@@ -43,7 +43,8 @@ each fix changes are unchanged there since `524fe9e`, and each fix
 cherry-picks onto it (C2's test file only after C7's). C8, found the same
 day, was fixed on `core-fixes` on 2026-10-19, as were C9 and C10, found
 that day; C9 was checked against main at `6890694bd`, C10 at
-`ddbd99073`. The Fork column is
+`ddbd99073`. C11 was fixed on 2026-10-20 and checked against main at
+`3738f4a97`. The Fork column is
 `atomicio`, which sits on `core-fixes`.
 
 | Issue | Fork | 1.12.0 | main | Upstream |
@@ -57,7 +58,8 @@ that day; C9 was checked against main at `6890694bd`, C10 at
 | C7. The all_* tables miss row ids | fixed, `core-fixes` 2779515 | yes | yes | not reported |
 | C8. A DV older than its data file leaves the table unplannable | fixed, `core-fixes` 1d46241 | yes | yes | not reported |
 | C9. A create-or-replace replaces a table created since it began | fixed, `core-fixes` b7a2abd | yes | yes | not reported; PR [#16943](https://github.com/apache/iceberg/pull/16943) would change it (see C9) |
-| C10. An expiry that retries fails on what its first attempt removed | fixed, `core-fixes` 93e8831 | yes | yes | not reported |
+| C10. An expiry that retries fails on what its first attempt removed | fixed, `core-fixes` 8900018 | yes | yes | not reported |
+| C11. An append commits files of a spec another writer removed | fixed, `core-fixes` 69e83ef | yes | yes | not reported |
 
 "Not reported" means a search of apache/iceberg's issues and pull
 requests found nothing for the issue.
@@ -367,7 +369,7 @@ arraySize cannot be negative`; if another writer had tagged one, with
 - **Found by:** `TestCatalogFaultProperties`, 2026-10-19 (try 13,678 of a
   30,000-try run): an expiry with metadata cleanup, preempted by another
   writer's expiry of the same table. Reproduces on `InMemoryCatalog`.
-- **Fork:** fixed on `core-fixes` by 93e8831, "Core: Work out what an expiry
+- **Fork:** fixed on `core-fixes` by 8900018, "Core: Work out what an expiry
   removes on the metadata each attempt commits on". Each attempt works out
   what to remove on its own metadata: the snapshots it has that the caller
   named or that it does not retain. Its tests are
@@ -376,6 +378,37 @@ arraySize cannot be negative`; if another writer had tagged one, with
 - **No workaround** to remove: the fuzzer counted the exception as
   unexpected.
 - **Canary:** `anExpiryRetriesAfterAConcurrentExpiry`.
+
+### C11. An append commits files of a partition spec another writer removed
+
+Details: [iceberg-issues/C11.md](iceberg-issues/C11.md).
+
+An expiry that cleans expired metadata removes the specs no remaining
+snapshot uses. A commit that had added files of such a spec failed with a
+`NullPointerException` if the spec went before its attempt. If it went
+between two attempts, the retry committed the first attempt's manifest:
+a snapshot whose manifest names a spec the table does not have, which no
+scan can read. An appended manifest of the spec was committed as it was.
+
+- **Cause:** a file's spec is checked when it is added, against the
+  handle's metadata. Each attempt looks it up again in the refreshed
+  metadata without a check, and a reused or appended manifest's spec is
+  not looked up at all.
+- **Found by:** `TestCatalogFaultProperties`, 2026-10-20 (try 26,798 of a
+  30,000-try run): a merge append through a handle loaded before another
+  writer partitioned the table and expired with metadata cleanup.
+  Reproduces on `InMemoryCatalog`.
+- **Fork:** fixed on `core-fixes` by 69e83ef, "Core: Fail a commit of files
+  whose partition spec was removed concurrently". The commit fails with
+  `ValidationException` when its metadata lacks the spec of a file it
+  writes (`SnapshotProducer.specForNewFiles`) or of a manifest of the new
+  snapshot. Its tests are in `TestFastAppend`, `TestMergeAppend` and
+  `TestRowDelta` (`*ConcurrentSpecRemoval`). On a REST catalog the window
+  between the client's attempt and the server's commit stays open (see
+  C11.md).
+- **No workaround** to remove: the fuzzer counted the exception as
+  unexpected.
+- **Canary:** `anAppendNeverCommitsFilesOfARemovedSpec`.
 
 ## Accepted Iceberg Behavior
 

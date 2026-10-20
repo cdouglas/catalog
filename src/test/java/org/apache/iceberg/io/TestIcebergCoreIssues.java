@@ -21,6 +21,7 @@ package org.apache.iceberg.io;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowable;
 
 import java.util.List;
 import java.util.Map;
@@ -35,6 +36,8 @@ import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.FileMetadata;
 import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.HasTableOperations;
+import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.MetadataTableType;
 import org.apache.iceberg.MetadataTableUtils;
 import org.apache.iceberg.PartitionSpec;
@@ -59,7 +62,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
- * Canaries for the Iceberg core bugs this project's fuzzers found, C1 to C10 in
+ * Canaries for the Iceberg core bugs this project's fuzzers found, C1 to C11 in
  * docs/ICEBERG_ISSUES.md: one test each, on Iceberg's own InMemoryCatalog, that asserts the bug is
  * absent. Upstream fixed C1, and the fork's core-fixes branch fixes the others, so every test
  * passes against the fork. A test that fails means its bug is back: a rebase dropped the fork's
@@ -317,7 +320,65 @@ class TestIcebergCoreIssues {
     Thread.sleep(2);
     long now = System.currentTimeMillis();
 
-    TableOperations ops = ((org.apache.iceberg.HasTableOperations) table).operations();
+    boolean[] raced = {false};
+    Table racing = racing(table, () -> {
+      raced[0] = true; // another writer expires the same snapshots first
+      catalog.loadTable(ID).expireSnapshots().expireOlderThan(now).retainLast(1).commit();
+    });
+
+    assertThatCode(() -> racing.expireSnapshots().expireOlderThan(now).retainLast(1).commit())
+        .as(BACK, "C10")
+        .doesNotThrowAnyException();
+    assertThat(raced[0]).isTrue();
+    assertThat(catalog.loadTable(ID).snapshots())
+        .extracting(org.apache.iceberg.Snapshot::snapshotId)
+        .containsExactly(current);
+  }
+
+  /**
+   * C11. An append must not commit files of a partition spec another writer removed since they were
+   * added, by an expiry that cleans expired metadata: the append failed with a NullPointerException
+   * or, when the spec went between its attempts, committed a manifest of it that no scan could read.
+   */
+  @Test
+  void anAppendNeverCommitsFilesOfARemovedSpec() {
+    InMemoryCatalog catalog = catalog();
+    TableIdentifier before = TableIdentifier.of("ns", "before");
+    AppendFiles append = catalog.createTable(before, SCHEMA).newFastAppend().appendFile(file("a"));
+    removeUnpartitionedSpec(catalog, before);
+
+    assertThat(catchThrowable(append::commit))
+        .as(BACK, "C11")
+        .isNotInstanceOf(NullPointerException.class);
+
+    TableIdentifier between = TableIdentifier.of("ns", "between");
+    Table racing =
+        racing(catalog.createTable(between, SCHEMA), () -> removeUnpartitionedSpec(catalog, between));
+    catchThrowable(() -> racing.newFastAppend().appendFile(file("b")).commit());
+
+    Table table = catalog.loadTable(between);
+    assertThat(table.specs()).doesNotContainKey(0);
+    for (org.apache.iceberg.Snapshot snapshot : table.snapshots()) {
+      assertThat(snapshot.allManifests(table.io()))
+          .extracting(ManifestFile::partitionSpecId)
+          .as(BACK, "C11")
+          .allMatch(table.specs()::containsKey);
+    }
+  }
+
+  /** As another writer, partitions an unpartitioned table and expires its unpartitioned spec. */
+  private static void removeUnpartitionedSpec(InMemoryCatalog catalog, TableIdentifier id) {
+    Table table = catalog.loadTable(id);
+    table.updateSpec().addField("id").commit();
+    table.expireSnapshots().cleanExpiredMetadata(true).commit();
+  }
+
+  /**
+   * {@code table}, through operations that run {@code otherWriter} just before their first commit,
+   * whose attempt it then invalidates.
+   */
+  private static Table racing(Table table, Runnable otherWriter) {
+    TableOperations ops = ((HasTableOperations) table).operations();
     boolean[] raced = {false};
     TableOperations racing = new TableOperations() {
       @Override
@@ -333,8 +394,8 @@ class TestIcebergCoreIssues {
       @Override
       public void commit(TableMetadata base, TableMetadata metadata) {
         if (!raced[0]) {
-          raced[0] = true; // another writer expires the same snapshots first
-          catalog.loadTable(ID).expireSnapshots().expireOlderThan(now).retainLast(1).commit();
+          raced[0] = true;
+          otherWriter.run();
         }
         ops.commit(base, metadata);
       }
@@ -354,15 +415,7 @@ class TestIcebergCoreIssues {
         return ops.locationProvider();
       }
     };
-
-    assertThatCode(() -> new BaseTable(racing, "t").expireSnapshots()
-            .expireOlderThan(now).retainLast(1).commit())
-        .as(BACK, "C10")
-        .doesNotThrowAnyException();
-    assertThat(raced[0]).isTrue();
-    assertThat(catalog.loadTable(ID).snapshots())
-        .extracting(org.apache.iceberg.Snapshot::snapshotId)
-        .containsExactly(current);
+    return new BaseTable(racing, table.name());
   }
 
   private static InMemoryCatalog catalog() {
