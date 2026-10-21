@@ -416,8 +416,8 @@ from external storage.
 
 ## Iceberg-Core Hooks
 
-The fork in `../iceberg/` adds these extension points (all on the
-`atomicio` branch, alongside the atomic-operations hooks):
+The iceberg fork adds these extension points (all on its `atomicio`
+branch, alongside the atomic-operations hooks):
 
 | Hook | File | Notes |
 |------|------|-------|

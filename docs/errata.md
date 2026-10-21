@@ -8,10 +8,10 @@ strict.
 For invariants that must not regress, see [design.md](design.md). For the
 wire format see [SPEC.md](SPEC.md). Bugs in Apache Iceberg itself are in
 [ICEBERG_ISSUES.md](ICEBERG_ISSUES.md). Upstream fixed C1 (1.11.0), and
-the fork's `core-fixes` branch fixes C2-C7, so this project's tests no
-longer work around them (63dd25e, b82ceb9, dbac28b, 411f73c, e2c6b7b);
-`TestIcebergCoreIssues` asserts each is absent. On stock Iceberg 1.12.0
-C2-C7 come back.
+the fork's `core-fixes` branch fixes C2-C24, so this project's tests
+work around none of them (the workarounds for C2-C8 were dropped in
+63dd25e, b82ceb9, dbac28b, 411f73c, e2c6b7b and 890fd8d); `TestIcebergCoreIssues`
+asserts each is absent. On stock Iceberg 1.12.0 C2-C24 come back.
 
 An entry's ID is not reused: a fixed entry is deleted or marked
 resolved, and its ID retired. Retired: S3, D1-D3, D5-D7, D11, T1, T2,
@@ -416,8 +416,12 @@ have not exercised:
   S3 Express object holds 10,000 parts and an ADLS Append Blob 50,000
   blocks, each counting the write that creates the object; the append
   past the limit fails with `SegmentLimitException`, on which a writer
-  compacts. `appendPastTheSegmentLimitFails` checked both against the
-  real services (2026-10-19).
+  compacts. The fork's `appendPastTheSegmentLimitFails` checked both
+  against the real services (2026-10-19 and 2026-10-21). It is a canary
+  for a change in the stores, not a regular check (it makes 10,000 and
+  50,000 appends); the catalog's reaction to the exception is tested on
+  `InMemoryAtomicFileIO` with a small limit (Bug 66, and the fault and
+  multi-writer fuzzers).
 
 **Trigger:** the first time a real workload sees an unexpected commit
 failure on a specific provider.

@@ -106,8 +106,9 @@ readers accept (see the header of `catalog.proto`).
 This project consumes Iceberg as a Maven SNAPSHOT artifact. The
 `SupportsAtomicOperations` interface, the `ManifestListSink` extension
 point, and the cloud-provider `SupportsAtomicOperations` implementations
-(`S3FileIO`, `GCSFileIO`, `ADLSFileIO`) all live in the iceberg fork at
-`../iceberg/`. The catalog format and the FileIO catalog itself live here.
+(`S3FileIO`, `GCSFileIO`, `ADLSFileIO`) all live in the iceberg fork
+(branch `atomicio`, see the [README](../README.md)). The catalog format
+and the FileIO catalog itself live here.
 
 ## Invariants
 
@@ -578,7 +579,8 @@ classes handle this for you; manual codecs require it as a discipline.
 | `TestInlineDifferentialProperties` | jqwik: the same schedule on a pointer catalog and an inline one commits alike and reads the same (I8) |
 | `TestCatalogRegressions` | One nested group per catalog bug, with the smallest scenario that reproduces it |
 | `TestCommittedSetGc`, `TestCommittedTransactions` | Committed-set encoding, GC merge and horizon, tri-state lookup ([GC.md](GC.md)) |
-| `TestIcebergCoreIssues` | Canaries asserting each Iceberg core issue C1-C7 ([ICEBERG_ISSUES.md](ICEBERG_ISSUES.md)) is absent |
+| `TestIcebergCoreIssues` | Canaries asserting each Iceberg core issue C1-C24 ([ICEBERG_ISSUES.md](ICEBERG_ISSUES.md)) is absent |
+| `CheckpointRoundTrip` | Not a test class: checks a catalog file against `catalog.proto` and its replayed state against a checkpoint of it (I6); the local suites and the fault and multi-writer fuzzers run it on every write, and other suites use it too |
 | `TestFormatExplorer` | Codec field-number constants against `catalog.proto` both ways; explorer fixtures current |
 | `spec/` (`TestCodecProperties`, `TestInvariantProperties`, `TestCanonicalStateProperty`, `TestMultiWriterProperties`) | jqwik at the format layer: codec round trip and determinism, well-formedness, builder state through the codec, and a multi-writer fuzzer of the commit protocol |
 | `GCSCatalogTest`, `TestS3Catalog`, `ADLSCatalogTest` | Cloud integration tests, pointer mode; append mode on S3 and ADLS, CAS on GCS (require credentials/emulators) |

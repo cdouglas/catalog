@@ -20,6 +20,20 @@ separate metastore, no Hive, no Glue, no REST.
   (S3 with if-match, GCS with generation number, ADLS with AppendBlock)
   works as a catalog backend.
 
+## Status
+
+A research prototype. The on-disk format can still change without a
+migration path. Catalog transactions are serializable across tables and
+namespaces, and stricter than Iceberg's: a transaction fails if any table
+it writes changed after it first read it, a property change included
+([docs/errata.md](docs/errata.md) D12). On real S3 (general-purpose and
+Express One Zone buckets), GCS (standard and zonal buckets) and ADLS
+Gen2, it passes Iceberg's `CatalogTests` and `CatalogTransactionTests` in
+every commit and inline mode each store supports
+([docs/COMPAT.md](docs/COMPAT.md)); [Testing](#testing) describes the
+fuzzers and the TLA+ model. It does not run on stock Iceberg (see the
+next section).
+
 ## What's in here
 
 ```
@@ -33,22 +47,28 @@ docs/SPEC_TM.md                              inline table metadata
 docs/SPEC_ML.md                              inline manifest lists
 docs/design.md                               invariants, conflict matrix, best practices
 docs/errata.md                               current shortcuts, gaps, known unknowns
+docs/GC.md                                   retention of the committed-transaction set
+docs/COMPAT.md                               cloud-store x commit-mode x inline-mode results
+docs/INTEGRATION_TESTING.md                  running the suites on emulators or real cloud
 docs/ICEBERG_ISSUES.md                       Iceberg core bugs the fuzzers found, and their fixes
+docs/iceberg-issues/                         one document per Iceberg issue, for upstream reports
 docs/format-explorer/                        byte-level viewer of catalog files
+docs/sample/                                 measured footprint of each inline mode
+spec/tla/                                    TLA+ model of the commit loop and the fuzzers' oracles
 ```
 
 ## Dependencies on the Iceberg fork
 
 This project does not run against stock Iceberg. It consumes the fork at
-[github.com/cdouglas/iceberg](https://github.com/cdouglas/iceberg) (locally
-at `../iceberg`, branch `atomicio`) as a Maven `1.12.0-atomicio-SNAPSHOT`
-artifact: the fork is based on the Iceberg 1.12.0 release and names it in its
-version. That branch carries both the atomic-operations hooks used by the base
-catalog and the manifest-list-inlining hooks used by `inline.manifests`.
+[github.com/cdouglas/iceberg](https://github.com/cdouglas/iceberg), branch
+`atomicio`, as a Maven `1.12.0-atomicio-SNAPSHOT` artifact: the fork is
+based on the Iceberg 1.12.0 release and names it in its version. That
+branch carries both the atomic-operations hooks used by the base catalog
+and the manifest-list-inlining hooks used by `inline.manifests`.
 
 The fork adds these extension points. Its other changes to stock Iceberg
-include the fixes for core bugs C2 to C7 (branch `core-fixes`, see
-[docs/ICEBERG_ISSUES.md](docs/ICEBERG_ISSUES.md)),
+include the fixes for core bugs C2 to C24 (branch `core-fixes`, which
+`atomicio` sits on; see [docs/ICEBERG_ISSUES.md](docs/ICEBERG_ISSUES.md)),
 `TableMetadata.Builder.setLastUpdatedMillis` for inline replay, a guard
 that makes `RewriteTablePathUtil` reject inline-ML snapshots, catalog
 transactions in `RESTCatalog`, and the fork's version
@@ -56,13 +76,13 @@ transactions in `RESTCatalog`, and the fork's version
 
 | Addition | File | What it provides |
 |----------|------|------------------|
-| `SupportsAtomicOperations` | `api/.../SupportsAtomicOperations.java` | FileIO extension with `AtomicOutputFile`, `CAS` / `APPEND` strategies, `CASException` / `AppendException` |
+| `SupportsAtomicOperations` | `api/.../SupportsAtomicOperations.java` | FileIO extension with `AtomicOutputFile`, `CAS` / `APPEND` strategies, `CASException` (`StorageInvariantException`, `StorageThrottleException`), `AppendException`, `SegmentLimitException` |
 | `AtomicOutputFile`         | `api/.../AtomicOutputFile.java` | `CAS prepare(Supplier<InputStream>, Strategy)` + `InputFile writeAtomic(CAS, Supplier<InputStream>)` |
 | `FileChecksum`             | `api/.../FileChecksum.java` | Content checksum (`update`, `contentChecksumBytes`, `contentHeaderString`). The ETag / generation a write replaces is pinned by the `InputFile` passed to `newOutputFile(InputFile)` |
 | `S3FileIO` atomic ops      | `aws/.../S3FileIO.java` | If-Match / If-None-Match conditional puts; APPEND at an offset on S3 Express |
-| `GCSFileIO` atomic ops     | `gcp/.../GCSFileIO.java` | Generation-number conditional puts |
+| `GCSFileIO` atomic ops     | `gcp/.../GCSFileIO.java` | Generation-number conditional puts, one request per CAS (an XML API PUT on zonal buckets) |
 | `ADLSFileIO` atomic ops    | `azure/.../ADLSFileIO.java` | APPEND: one conditional `AppendBlock`. CAS: stage an Append Blob, then rename it onto the target with If-Match |
-| `SupportsCatalogTransactions`, `BaseCatalogTransaction` | `core/.../catalog/` | Multi-table transaction API |
+| `SupportsCatalogTransactions`, `BaseCatalogTransaction` | `core/.../catalog/` | Multi-table transaction API. `commitTransaction` takes a read set: each table the transaction writes and, under serializable isolation, each branch it read, as it first read them |
 | `ManifestListSink`         | `core/.../ManifestListSink.java` | Hook for `SnapshotProducer` to deliver finalized manifest list deltas instead of writing `snap-*.avro` |
 | `InlineSnapshot`           | `core/.../InlineSnapshot.java` | `Snapshot` whose `manifestListLocation()` is null and whose manifests are held in memory |
 
@@ -70,26 +90,76 @@ transactions in `RESTCatalog`, and the fork's version
 (`TableMetadata.Builder.replaceSnapshots`) and a loosened `BaseSnapshot.equals`
 in core, both listed in [docs/SPEC_ML.md](docs/SPEC_ML.md) ("Iceberg-Core
 Hooks") and tracked as integration debt in
-[docs/errata.md](docs/errata.md) (S1).
+[docs/errata.md](docs/errata.md) (S1). The catalog-transaction API is
+errata S2.
 
 ## Building
 
-The fileio-catalog depends on Iceberg SNAPSHOT artifacts. Always build
-iceberg first:
+The fork builds with JDK 17 or 21, and this project targets Java 17.
+Publish the fork to the local Maven repository first:
 
 ```bash
-cd ../iceberg
+git clone --branch atomicio https://github.com/cdouglas/iceberg.git
+cd iceberg
 ./gradlew publishToMavenLocal -x test -x integrationTest
+```
 
-cd ../fileio-catalog
+This also publishes the fork's `tests` jars, from which this project
+runs Iceberg's abstract `CatalogTests` and `CatalogTransactionTests`.
+Then, in this repository:
+
+```bash
 mvn clean install
 ```
 
-`mvn test` runs unit + in-memory end-to-end tests. `mvn verify` adds the
-cloud integration suites (S3, GCS, ADLS); these need credentials or
-emulators (versitygw, fake-gcs-server, Azurite). On Azurite, which has no
-Data Lake rename, the ADLS catalog suites skip; see
-[docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
+`mvn test` runs unit tests, the in-memory end-to-end suites and the
+property tests. `mvn verify` adds the cloud integration suites (S3, GCS,
+ADLS); these need credentials or emulators (versitygw, fake-gcs-server,
+Azurite). On Azurite, which has no Data Lake rename, the ADLS catalog
+suites skip; see [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
+
+## Testing
+
+- **Iceberg's catalog suites.** `TestLocalCatalog` and
+  `TestLocalCatalogTransaction` run `CatalogTests` and
+  `CatalogTransactionTests` in every local mode (append, CAS and
+  compaction, each with pointer, inline TM and inline ML tables) over
+  `InMemoryAtomicFileIO`, which enforces the conditions of CAS and
+  append writes. The cloud suites run the same tests against each store
+  ([docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md)).
+- **Property tests** ([jqwik](https://jqwik.net/)), in `mvn test`:
+  - `TestCatalogFaultProperties` runs concurrent writers, each in its own
+    commit and inline mode, through Iceberg's table and catalog APIs on
+    storage that fails, throttles, lands a write but loses its reply, or
+    reports a landed write as a conflict. After each operation the
+    catalog must match a model: an acknowledged operation took effect
+    once, a failed one not at all, an unknown one entirely or not at all,
+    and every table loads and keeps its row lineage. Its javadoc lists
+    the operations and checks.
+  - `TestCatalogRaceProperties` runs other operations just before an
+    operation's catalog writes, and requires the result of a serial run.
+  - `TestInlineDifferentialProperties` runs one schedule of table
+    operations on a pointer catalog and an inline one, and requires the
+    same results and reads; `TestInlineDeltaProperties` checks that every
+    inline delta replays to the metadata it committed.
+  - `spec/` checks the format itself: concurrent writers, invariants,
+    codecs, and canonical state.
+
+  Each property's `tries` is in its `@Property` annotation; raise it for
+  a longer run. Every bug the fuzzers or reviews found in this project
+  has a regression test in `TestCatalogRegressions` (Bug *N* in commit
+  subjects). Bugs they found in Iceberg itself are in
+  [docs/ICEBERG_ISSUES.md](docs/ICEBERG_ISSUES.md), and
+  `TestIcebergCoreIssues` checks that each is still fixed.
+- **Format checks.** `CheckpointRoundTrip` checks every catalog file the
+  suites and fuzzers write against `catalog.proto`, and that its replayed
+  state equals a checkpoint of it. `TestFormatExplorer` checks the codecs'
+  field numbers against `catalog.proto`.
+- **Model checking.** [spec/tla/](spec/tla/README.md) models the commit
+  loop in TLA+ and states the fuzzers' oracles over the model. The
+  commit-loop bugs the fuzzers and reviews found are switches in the
+  model that put each bug back; each one must break a property, and the
+  fuzzers' oracles must catch it.
 
 ## Configuration
 

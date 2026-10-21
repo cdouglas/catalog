@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-05-12 — full real-cloud matrix run twice (1961 tests, 0 failures, 163 skipped each). Both runs wrote the default structural codec (see "How to update this doc"). Not re-run since; every cell is unverified on the current code.
+last-verified: 2026-10-21 — fileio-catalog 9f792e8 on fork atomicio bee565b. Every suite below on real cloud, five stores: 3,072 tests, 0 failures, 280 skipped. All runs wrote the default structural codec (see "How to update this doc").
 ---
 
 # Cloud-store compatibility matrix
@@ -45,7 +45,6 @@ Cell legend:
 | Code  | Meaning                                                      |
 |-------|--------------------------------------------------------------|
 | `OK`  | green — full `CatalogTests` + `CatalogTransactionTests` pass |
-| `OK*` | passed on 2026-05-12, not re-run since (see below)           |
 | `NR`  | not run: the suite exists, but this codec was not exercised  |
 | `WIP` | partial — known failures tracked in `errata.md`              |
 | `BAD` | broken                                                       |
@@ -56,16 +55,36 @@ Cell legend:
 
 | Store | CAS · file | CAS · TM  | CAS · TM+ML | append · file | append · TM | append · TM+ML |
 |-------|------------|-----------|-------------|---------------|-------------|----------------|
-| GCS   | OK*        | NR / OK*  | NR / OK*    | NA            | NA          | NA             |
-| S3    | OK*        | NR / OK*  | NR / OK*    | OK*           | NR / OK*    | NR / OK*       |
-| ADLS  | OK*        | NR / OK*  | NR / OK*    | OK*           | NR / OK*    | NR / OK*       |
+| GCS, standard bucket | OK | NR / OK | NR / OK | NA | NA | NA |
+| GCS, zonal bucket    | OK | NR / OK | NR / OK | NA | NA | NA |
+| S3, general-purpose bucket | OK | NR / OK | NR / OK | NA | NA | NA |
+| S3 Express One Zone  | OK | NR / OK | NR / OK | OK | NR / OK | NR / OK |
+| ADLS Gen2 (HNS)      | OK | NR / OK | NR / OK | OK | NR / OK | NR / OK |
 
-Since the 2026-05-12 run the code under every cell has changed: for
-all stores, the fork's rebase onto Iceberg 1.12.0 (9296e10) and the
-fixes for Bugs 10-64; for ADLS, the catalog file kept an Append Blob
-with CAS by stage and rename (fork 7a0d5edf2); for GCS, each CAS in one
-request (fork 8f94c5100). The emulator runs also moved from MinIO to
-versitygw (a549bcf).
+The 2026-10-21 run, by store:
+
+| Store | Suites | Tests | Failed | Skipped |
+|---|---|---|---|---|
+| GCS, standard bucket | `GCS*` | 438 | 0 | 40 |
+| GCS, zonal bucket | `GCS*` | 438 | 0 | 40 |
+| S3, general-purpose bucket | `TestS3*CAS*` | 438 | 0 | 40 |
+| S3 Express One Zone | `TestS3*` | 876 | 0 | 80 |
+| ADLS Gen2 (HNS) | `ADLS*` | 882 | 0 | 80 |
+
+Each `CatalogTests` class skips 12 tests of features the suites don't
+declare (`supportsEmptyNamespace`, `supportsVariant`,
+`supportsServerSideRetry`); an inline one skips 2 more, which need a
+`metadata.json` (`testLoadTableWithMissingMetadataFile`, and
+`testRegisterTable`, errata T4). The `CatalogTransactionTests` classes
+skip none.
+
+The fork's `SupportsAtomicOperations` contract tests passed on the same
+stores the same day (the fork's README, "Testing on real cloud
+storage").
+
+Earlier runs: 2026-10-20 at 6031709, every suite green on the same
+stores; 2026-05-12, 1961 tests, 0 failures, before the rebase onto
+Iceberg 1.12.0, the ADLS Append Blob writes and the one-request GCS CAS.
 
 ## Notes
 
@@ -76,63 +95,68 @@ versitygw (a549bcf).
   implementation would already be a CAS replace. `GCSFileIO.supportsAppend()`
   returns false, and `ProtoCatalogFormat` checks it on each commit and
   commits by CAS whatever `max.append.count` says.
-- **CAS · file (OK*)** — `GCSCatalogTest`,
-  `GCSFileIOCatalogTransactionTests`.
-- **CAS · TM (OK*)** — `GCSCatalogTestInlineTM`,
+- **Zonal buckets** take a different write path: each CAS is one XML API
+  PUT, and regular writes (manifests, data files) an appendable upload.
+  The same suites run on them with `GCS_TEST_BUCKET` set to a zonal
+  bucket.
+- **CAS · file** — `GCSCatalogTest`, `GCSFileIOCatalogTransactionTests`.
+- **CAS · TM** — `GCSCatalogTestInlineTM`,
   `GCSFileIOCatalogTransactionTestsInlineTM`.
-- **CAS · TM+ML (OK*)** — `GCSCatalogTestInlineML`,
+- **CAS · TM+ML** — `GCSCatalogTestInlineML`,
   `GCSFileIOCatalogTransactionTestsInlineML`.
 
 ### S3
 
-- **CAS · file (OK*)** — `TestS3CatalogCAS`,
-  `TestS3FileIOCatalogTransactionCAS`.
-- **append · file (OK*)** — `TestS3Catalog`,
+- **append · file** — `TestS3Catalog`,
   `TestS3FileIOCatalogTransaction`. Runs against an S3 Express One Zone
   bucket (the only S3 surface that natively supports
-  `WriteOffsetBytes`).
-- **CAS · TM (OK*)** — `TestS3CatalogCASInlineTM`,
+  `WriteOffsetBytes`); a general-purpose bucket rejects it, so only the
+  CAS suites run there.
+- **CAS · file** — `TestS3CatalogCAS`,
+  `TestS3FileIOCatalogTransactionCAS`.
+- **CAS · TM** — `TestS3CatalogCASInlineTM`,
   `TestS3FileIOCatalogTransactionCASInlineTM`.
-- **CAS · TM+ML (OK*)** — `TestS3CatalogCASInlineML`,
+- **CAS · TM+ML** — `TestS3CatalogCASInlineML`,
   `TestS3FileIOCatalogTransactionCASInlineML`.
-- **append · TM (OK*)** — `TestS3CatalogInlineTM`,
+- **append · TM** — `TestS3CatalogInlineTM`,
   `TestS3FileIOCatalogTransactionInlineTM`.
-- **append · TM+ML (OK*)** — `TestS3CatalogInlineML`,
+- **append · TM+ML** — `TestS3CatalogInlineML`,
   `TestS3FileIOCatalogTransactionInlineML`.
 
 ### ADLS
 
-- **append · file (OK*)** — `ADLSCatalogTest`,
+- **append · file** — `ADLSCatalogTest`,
   `ADLSFileIOCatalogTransactionTests`. The default `ProtoCatalogFormat`
   configuration leaves `max.append.count` at 10 000. `ADLSFileIO` keeps
   the catalog file an Append Blob: `Strategy.APPEND` is one conditional
   `AppendBlock`, and CAS stages a temp Append Blob and renames it onto
-  the catalog file (fork 7a0d5edf2, after the 2026-05-12 run).
-- **CAS · file (OK*)** — `ADLSCatalogTestCAS`,
+  the catalog file.
+- **CAS · file** — `ADLSCatalogTestCAS`,
   `ADLSFileIOCatalogTransactionTestsCAS`. One-line subclasses that flip
   `maxAppendCount()` to 0, mirroring the S3 CAS suites.
-- **CAS · TM (OK*)** — `ADLSCatalogTestCASInlineTM`,
+- **CAS · TM** — `ADLSCatalogTestCASInlineTM`,
   `ADLSFileIOCatalogTransactionTestsCASInlineTM`.
-- **append · TM (OK*)** — `ADLSCatalogTestInlineTM`,
+- **append · TM** — `ADLSCatalogTestInlineTM`,
   `ADLSFileIOCatalogTransactionTestsInlineTM`.
-- **CAS · TM+ML (OK*)** — `ADLSCatalogTestCASInlineML`,
+- **CAS · TM+ML** — `ADLSCatalogTestCASInlineML`,
   `ADLSFileIOCatalogTransactionTestsCASInlineML`.
-- **append · TM+ML (OK*)** — `ADLSCatalogTestInlineML`,
+- **append · TM+ML** — `ADLSCatalogTestInlineML`,
   `ADLSFileIOCatalogTransactionTestsInlineML`.
 
 ## How to update this doc
 
-After running a meaningful slice of the cloud matrix:
+After running a meaningful slice of the cloud matrix, with the fork
+published to the local Maven repository (see the
+[README](../README.md#building)) and the env vars of
+[INTEGRATION_TESTING.md](INTEGRATION_TESTING.md) set:
 
 ```bash
-cd /home/chris/work/catalog/iceberg && \
-  ./gradlew publishToMavenLocal -x test -x integrationTest
-
-cd /home/chris/work/catalog/fileio-catalog
-
 # The -Preal-cloud profile fails fast if any provider's env vars are missing.
 mvn verify -Preal-cloud > target/compat.log 2>&1
 ```
+
+or one provider or bucket at a time with `-Dit.test`, as
+INTEGRATION_TESTING.md describes.
 
 A `-Dfileio.catalog.inline.tm.codec=<codec>` flag on this command has
 no effect: `FileIOCatalog` reads the codec only from its catalog
