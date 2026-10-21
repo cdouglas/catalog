@@ -1572,6 +1572,9 @@ class TestCatalogFaultProperties {
                   throw new IllegalStateException(picked + " is not staged");
                 }
                 state.files.add(file);
+                // a pick that commits the staged files anew may drop deletes older than every
+                // live data file, as the other merging commits do
+                ageOutDeletes(state, actual.get(id));
               });
         case REWRITE_MANIFESTS:
           return new Op(
