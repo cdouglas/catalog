@@ -67,7 +67,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
- * Canaries for the Iceberg core bugs this project's fuzzers and reviews found, C1 to C22 in
+ * Canaries for the Iceberg core bugs this project's fuzzers and reviews found, C1 to C23 in
  * docs/ICEBERG_ISSUES.md: one test each, on Iceberg's own InMemoryCatalog, that asserts the bug is
  * absent. Upstream fixed C1, and the fork's core-fixes branch fixes the others, so every test
  * passes against the fork. A test that fails means its bug is back: a rebase dropped the fork's
@@ -657,6 +657,31 @@ class TestIcebergCoreIssues {
     Table reloaded = catalog.loadTable(ID);
     assertThat(reloaded.refs()).as(BACK, "C22").containsKey("tag");
     assertThat(reloaded.snapshot(expired)).as(BACK, "C22").isNotNull();
+  }
+
+  /**
+   * C23. A replace transaction must not drop what another writer committed since it began: it
+   * committed the replacement it built then, putting another branch back where it was and dropping
+   * the other writer's snapshot.
+   */
+  @Test
+  void aReplaceKeepsWhatOtherWritersCommittedSinceItBegan() {
+    InMemoryCatalog catalog = catalog();
+    Table table = catalog.createTable(ID, SCHEMA);
+    table.newFastAppend().appendFile(file("a")).commit();
+    long first = table.currentSnapshot().snapshotId();
+    table.manageSnapshots().createBranch("b", first).commit();
+    Transaction replace = catalog.buildTable(ID, SCHEMA).replaceTransaction();
+    replace.newFastAppend().appendFile(file("c")).commit();
+
+    Table other = catalog.loadTable(ID);
+    other.newFastAppend().appendFile(file("b")).toBranch("b").commit();
+    long branchCommit = other.refs().get("b").snapshotId();
+    catchThrowable(replace::commitTransaction);
+
+    Table after = catalog.loadTable(ID);
+    assertThat(after.snapshot(branchCommit)).as(BACK, "C23").isNotNull();
+    assertThat(after.refs().get("b").snapshotId()).as(BACK, "C23").isEqualTo(branchCommit);
   }
 
   /** Applies updates computed on {@code base}, as a REST server applies a client's commit. */

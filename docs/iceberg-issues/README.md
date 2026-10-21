@@ -20,7 +20,7 @@ added the same day, onto `ddbd99073` on its own. C11, added 2026-10-20,
 onto `3738f4a97` on its own, C12, the same day, after C10, and C13 after
 C10 and C12; C14 after C6 and C8. C15 to C22, from the review, onto
 `834441b96`: C16, C17, C19, C21 and C22 on their own, C15 after C10, C12
-and C13, and C18 and C20 after C11.
+and C13, and C18 and C20 after C11; C23 after C3, C9 and C15.
 
 | Issue | Fix | Before a PR |
 |---|---|---|
@@ -46,3 +46,4 @@ and C13, and C18 and C20 after C11.
 | [C20. A row delta whose starting snapshot expired fails with IllegalArgumentException](C20.md) | [`b967a0a`](https://github.com/cdouglas/iceberg/commit/b967a0a857788117019d5dba37e4b2faddfda0b2) | ready |
 | [C21. Ref and spec removals applied to newer metadata lose a concurrent commit or remove a spec in use](C21.md) | [`517c1c4`](https://github.com/cdouglas/iceberg/commit/517c1c4a882f0b9613093947d5ed2bb92c35bac1) | more expiry conflicts with main; new branches still a gap |
 | [C22. A snapshot removal applied to newer metadata drops a ref set since](C22.md) | [`a2a7847`](https://github.com/cdouglas/iceberg/commit/a2a78474660be2204654565b40d2874344b8a7e5) | check other clients' `remove-snapshots` |
+| [C23. A replace transaction drops what other writers committed since it began](C23.md) | [`29566e9`](https://github.com/cdouglas/iceberg/commit/29566e98f465165b647d310c30c70af4ee613ba0) | coordinate with PR #16943: propose failing where it falls back |

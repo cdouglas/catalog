@@ -492,7 +492,7 @@ class TestCatalogFaultProperties {
     // Staged appends not yet published nor expired, by wap.id, to the file each adds.
     final Map<String, String> staged = new TreeMap<>();
     // Refs given a short maximum age, and whether the table gives every ref one: an expiry may
-    // remove them. A name stays here once added, as a replace can put back a ref removed since.
+    // remove them. A name stays here once added.
     final Set<String> agingRefs = new TreeSet<>();
     boolean refsAge = false;
     // Observed, not modeled: Iceberg chooses snapshot ids, metadata locations and sequence numbers
@@ -1325,13 +1325,8 @@ class TestCatalogFaultProperties {
         case REPLACE_TABLE:
           boolean orCreate = cmd.b % 3 == 0;
           DataFile replacing = cmd.b % 2 == 1 ? newFile() : null;
-          // A replace commits the table it built at the start over any change since, keeping
-          // that table's properties and format version: record them as the transaction saw them.
+          // Without a table, a create-or-replace creates one: record the table it builds.
           TableState built = new TableState(null, 0);
-          // The snapshot each of its refs other than main names, and the snapshots it committed:
-          // those it built with, less any expired since it began.
-          Map<String, Long> builtRefs = new HashMap<>();
-          Set<Long> committed = new java.util.HashSet<>();
           return new Op(
               String.format("%s(%s%s)", orCreate ? "createOrReplace" : "replace", id,
                   replacing == null ? "" : ", " + replacing.location()),
@@ -1345,44 +1340,12 @@ class TestCatalogFaultProperties {
                 TableMetadata replacement = ((HasTableOperations) replace.table()).operations()
                     .current();
                 built.formatVersion = replacement.formatVersion();
-                // Its refs and snapshots, too: the commit puts back a ref removed since, unless
-                // its snapshot was expired since, and drops one added since.
-                replacement.refs().forEach((name, r) -> {
-                  if (!name.equals(org.apache.iceberg.SnapshotRef.MAIN_BRANCH)) {
-                    builtRefs.put(name, r.snapshotId());
-                    if (r.isBranch()) {
-                      built.branches.put(name, new TreeSet<>());
-                    } else {
-                      built.tagSnapshots.put(name, r.snapshotId());
-                    }
-                  }
-                });
-                for (Snapshot snapshot : replacement.snapshots()) {
-                  String wap = snapshot.summary().get("wap.id");
-                  if (wap != null) {
-                    built.staged.put(wap, "");
-                  }
-                }
-                // and the maximum ref ages it keeps, the table's and each ref's
-                built.refsAge =
-                    replacement.properties().containsKey(TableProperties.MAX_REF_AGE_MS);
-                replacement.refs().forEach((name, r) -> {
-                  if (r.maxRefAgeMs() != null) {
-                    built.agingRefs.add(name);
-                  }
-                });
                 replacement.properties().forEach((k, v) -> {
                   if (k.startsWith(KEY_PREFIX)) {
                     built.props.put(k, v);
                   }
                 });
-                try {
-                  replace.commitTransaction();
-                } finally {
-                  // what it committed, or would have if it failed
-                  ((org.apache.iceberg.BaseTransaction) replace).currentMetadata().snapshots()
-                      .forEach(snapshot -> committed.add(snapshot.snapshotId()));
-                }
+                replace.commitTransaction();
               },
               (m, actual) -> {
                 TableState before = m.get(id);
@@ -1393,40 +1356,23 @@ class TestCatalogFaultProperties {
                 if (now == null) {
                   throw new IllegalStateException(id + " is missing");
                 }
-                String uuid = before != null ? before.uuid : now.uuid;
-                TableState replaced = new TableState(uuid, built.formatVersion);
-                replaced.props.putAll(built.props);
-                // An expiry may remove a ref it could before, or one the replacement ages out.
-                replaced.refsAge = built.refsAge || before != null && before.refsAge;
-                replaced.agingRefs.addAll(built.agingRefs);
-                if (before != null) {
-                  replaced.agingRefs.addAll(before.agingRefs);
-                }
-                // Branches as observed (the commit may have taken one back to where it was);
-                // a tag the model had keeps the files it named, else as observed. A ref goes
-                // with its snapshot.
-                built.branches.keySet().forEach(n -> {
-                  if (committed.contains(builtRefs.get(n))) {
-                    replaced.branches.put(n, new TreeSet<>(now.branches.getOrDefault(n, Set.of())));
+                if (before == null) {
+                  TableState fresh = new TableState(now.uuid, built.formatVersion);
+                  fresh.props.putAll(built.props);
+                  if (replacing != null) {
+                    fresh.files.add(replacing.location());
                   }
-                });
-                built.tagSnapshots.forEach((n, snapshotId) -> {
-                  if (!committed.contains(snapshotId)) {
-                    return;
-                  }
-                  boolean known = before != null && before.tags.containsKey(n)
-                      && snapshotId.equals(before.tagSnapshots.get(n));
-                  replaced.tags.put(n, new TreeSet<>(
-                      known ? before.tags.get(n) : now.tags.getOrDefault(n, Set.of())));
-                  replaced.tagSnapshots.put(n, snapshotId);
-                });
-                if (before != null) {
-                  built.staged.keySet().forEach(wap -> {
-                    if (before.staged.containsKey(wap)) {
-                      replaced.staged.put(wap, before.staged.get(wap));
-                    }
-                  });
+                  m.put(id, fresh);
+                  return;
                 }
+                // A replace replaces main's data and the schema, and keeps the rest of the table
+                // as it is when the replace commits, what other writers committed since it began
+                // included: it rebuilds its replacement on that, or fails (Iceberg issue C23).
+                TableState replaced = before.copy();
+                replaced.files.clear();
+                replaced.deletes.clear();
+                replaced.maybeDropped.clear();
+                replaced.columns.clear();
                 if (replacing != null) {
                   replaced.files.add(replacing.location());
                 }

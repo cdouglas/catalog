@@ -4,14 +4,16 @@ Bugs in Apache Iceberg that this project's fuzzers found, and, from C15
 on, a review of Iceberg's commit retry paths that the fuzzers' finds
 prompted. None is in `FileIOCatalog`: each one reproduces on Iceberg's
 own `InMemoryCatalog`, directly or, for C21 and C22, by applying a
-client's updates through `CatalogHandlers` as a REST server does.
+client's updates through `CatalogHandlers` as a REST server does. C23
+was accepted behavior (A1) until the review, on 2026-10-20, showed which
+part of it upstream itself calls a bug.
 This page records them for a rebase onto a newer Iceberg. Each issue also
 has a document of its own in [iceberg-issues/](iceberg-issues/), for
 reports or pull requests upstream. It covers the reproduction, the cause
 with links to the 1.12.0 source, the fix, its tests, and what to settle
 before a PR.
 
-Upstream fixed C1. The fork fixes C2 to C22 on branch `core-fixes`, each
+Upstream fixed C1. The fork fixes C2 to C23 on branch `core-fixes`, each
 in an upstream-style commit with its tests, so the project's tests no
 longer work around any of them.
 
@@ -48,7 +50,8 @@ day, was fixed on `core-fixes` on 2026-10-19, as were C9 and C10, found
 that day; C9 was checked against main at `6890694bd`, C10 at
 `ddbd99073`. C11 to C14 were fixed on 2026-10-20 and checked against
 main at `3738f4a97`. C15 to C22, from the review, were fixed the same
-day and checked against main at `834441b96`. The Fork column is
+day and checked against main at `834441b96`, as was C23, fixed later
+that day. The Fork column is
 `atomicio`, which sits on `core-fixes`.
 
 | Issue | Fork | 1.12.0 | main | Upstream |
@@ -75,6 +78,7 @@ day and checked against main at `834441b96`. The Fork column is
 | C20. A row delta whose starting snapshot expired fails with IllegalArgumentException | fixed, `core-fixes` b967a0a | yes | yes | not reported |
 | C21. Ref and spec removals applied to newer metadata lose a commit or a spec in use | fixed, `core-fixes` 517c1c4 | yes | yes | not reported |
 | C22. A snapshot removal applied to newer metadata drops a ref set since | fixed, `core-fixes` a2a7847 | yes | yes | not reported |
+| C23. A replace transaction drops what other writers committed since it began | fixed, `core-fixes` 29566e9 | yes | yes | [#16232](https://github.com/apache/iceberg/issues/16232), open; PR [#16943](https://github.com/apache/iceberg/pull/16943), open, which this follows except where it falls back |
 
 "Not reported" means a search of apache/iceberg's issues and pull
 requests found nothing for the issue.
@@ -189,6 +193,9 @@ list, so reading that snapshot failed.
   smaller than PR #16943, and also applies where that PR falls back to
   today's behavior. Its test is
   `TestReplaceTransaction.testReplaceTransactionWithConcurrentExpiry`.
+  C23 supersedes it where the catalog's table builder lets the
+  transaction rebuild its replacement; C3's change remains for the
+  rest.
 - **Removed with the fix:** the test,
   `aReplaceBringsBackASnapshotExpiredSinceItStarted`, and the workaround,
   `TestCatalogFaultProperties`'s check of manifest lists only for the
@@ -656,32 +663,55 @@ rollback to one.
 - **No workaround** to remove.
 - **Canary:** `aRemovalAppliedToNewerMetadataKeepsAConcurrentTag`.
 
+### C23. A replace transaction drops what other writers committed since it began
+
+Details: [iceberg-issues/C23.md](iceberg-issues/C23.md).
+
+A replace transaction committed the replacement it built from the table
+as it began over whatever the table had become, dropping other writers'
+commits to main and to other branches, tags, properties (such as
+`gc.enabled=false`) and format upgrades (downgrading the table), and
+bringing back expired snapshots (C3). Upstream holds that a replace
+wins without a conflict check (rdblue, on PR #16289), but that it must
+keep the table's history, and that erasing a concurrent change "as
+though the concurrent commit never happened" is a bug.
+
+- **Cause:** `BaseTransaction.commitReplaceTransaction` commits the
+  replacement as built; it can't build it again.
+- **Found by:** the review of 2026-10-20; fileio-catalog had accepted it
+  as A1.
+- **Fork:** fixed on `core-fixes` by 29566e9, "Core: Rebuild a replace on
+  a table changed since it began, or fail". As in PR #16943, the table
+  builder passes a function that builds the replacement, and the
+  transaction rebuilds it on the refreshed table and applies its updates
+  again. Where it can't do so exactly (another schema, spec, sort order
+  or format version; an update that commits once), it fails with
+  `CommitFailedException`, where #16943 commits the replacement as it
+  began. Two `CatalogTests` racing-replace cases expect the failure
+  outside REST. Tests in `TestReplaceTransaction` and `CatalogTests`.
+- **Workaround removed:** `TestCatalogFaultProperties` modeled a replace
+  as the table the transaction saw when it began; it now models the
+  table as the replace commits over it.
+- **Canary:** `aReplaceKeepsWhatOtherWritersCommittedSinceItBegan`.
+
 ## Accepted Iceberg Behavior
 
 The oracles accept these behaviors as Iceberg's semantics, not as
 issues. A release that changes one of them breaks the oracle that
 accepts it, so a rebase finds out anyway.
 
-### A1. A replace transaction wins over concurrent changes
+### A1. A replace transaction wins over concurrent changes, keeping their history
 
-The replace commits the metadata it built at its start, whatever
-changed since (C3 is the case where that is clearly wrong). So
-`TestCatalogRaceProperties` doesn't race replace transactions, and
-`TestCatalogFaultProperties` models a replace as the table the
-transaction saw at its start. PR #16943 (C3) would make a replace keep
-concurrent changes where it can. A release with it breaks that model,
-which should then expect the concurrent changes kept, and replace
-transactions can join the race property.
-
-The review of 2026-10-20 found more that a replace drops than the
-fuzzers model: a commit another writer made to a branch since the
-replace began (the branch goes back, and the snapshot is gone), tags
-created since, a `gc.enabled=false` set since (a later expiry may then
-delete files another table shares), and a format upgrade since (the
-replace downgrades the table, which the spec forbids). Upstream tracks
-these as [#16232](https://github.com/apache/iceberg/issues/16232), open;
-its fix in PR [#16289](https://github.com/apache/iceberg/pull/16289),
-which failed a replace on any concurrent change, was closed unmerged.
+A replace replaces the table's data, schema and partitioning, whatever
+changed since it began, without a conflict check: two racing replaces
+with the same definition end as the second built it. That much is
+Iceberg's intended semantics (rdblue, on PR #16289), and the fuzzers
+accept it. Until 2026-10-20 they also accepted that the replace dropped
+everything else other writers committed since it began, which C23 now
+fixes: `TestCatalogFaultProperties` models a replace as the table when
+it commits, with main's data and the schema replaced, and counts a
+replace that can't be rebuilt, and fails, as a rejection.
+`TestCatalogRaceProperties` still doesn't race replace transactions.
 
 ### A2. A create-or-replace that races a create fails
 
