@@ -51,24 +51,27 @@ that day; C9 was checked against main at `6890694bd`, C10 at
 `ddbd99073`. C11 to C14 were fixed on 2026-10-20 and checked against
 main at `3738f4a97`. C15 to C22, from the review, were fixed the same
 day and checked against main at `834441b96`, as were C23, fixed later
-that day, and C24, which round 9 of the fuzzers found on 2026-10-21. The
-Fork column is
+that day, and C24, which round 9 of the fuzzers found on 2026-10-21. On
+2026-10-21 each issue was checked against a local copy of upstream's
+record: every issue and PR (from the GitHub API), every PR's branch, and
+the issues@ and dev@ lists, which carry each issue's and PR's discussion.
+What that found is in each issue's document. The Fork column is
 `atomicio`, which sits on `core-fixes`.
 
 | Issue | Fork | 1.12.0 | main | Upstream |
 |---|---|---|---|---|
 | C1. A merging delete renumbers rows | fixed | fixed | fixed | fixed by [#16263](https://github.com/apache/iceberg/pull/16263), in 1.11.0 |
 | C2. A retried commit renumbers rows | fixed, `core-fixes` 6c6b6fd | yes | yes | not reported |
-| C3. A replace restores an expired snapshot | fixed, `core-fixes` 56527cb | yes | yes | [#16942](https://github.com/apache/iceberg/issues/16942), part of [#16232](https://github.com/apache/iceberg/issues/16232); fix in PR [#16943](https://github.com/apache/iceberg/pull/16943), open |
+| C3. A replace restores an expired snapshot | fixed, `core-fixes` 56527cb | yes | yes | [#13651](https://github.com/apache/iceberg/issues/13651), closed by the stale bot after a maintainer called it a bug; [#16942](https://github.com/apache/iceberg/issues/16942), part of [#16232](https://github.com/apache/iceberg/issues/16232); fix in PR [#16943](https://github.com/apache/iceberg/pull/16943), open |
 | C4. A stale handle fails on a newer spec | fixed, `core-fixes` bfc20da | yes | yes | not reported |
-| C5. Rewriting manifests fails with no snapshot | fixed, `core-fixes` f723a52 | yes | yes | not reported |
+| C5. Rewriting manifests fails with no snapshot | fixed, `core-fixes` f723a52 | yes | yes | not reported; fix in PR [#16645](https://github.com/apache/iceberg/pull/16645), open |
 | C6. A repeated cherry-pick leaves the table unplannable | fixed, `core-fixes` 724608a | yes | yes | not reported |
 | C7. The all_* tables miss row ids | fixed, `core-fixes` 2779515 | yes | yes | not reported |
-| C8. A DV older than its data file leaves the table unplannable | fixed, `core-fixes` 1d46241 | yes | yes | not reported |
+| C8. A DV older than its data file leaves the table unplannable | fixed, `core-fixes` 1d46241 | yes | yes | not reported; maintainers oppose fixing it in planning (see C8) |
 | C9. A create-or-replace replaces a table created since it began | fixed, `core-fixes` b7a2abd | yes | yes | not reported; PR [#16943](https://github.com/apache/iceberg/pull/16943) would change it (see C9) |
 | C10. An expiry that retries fails on what its first attempt removed | fixed, `core-fixes` 8900018 | yes | yes | not reported |
 | C11. An append commits files of a spec another writer removed | fixed, `core-fixes` 69e83ef | yes | yes | not reported |
-| C12. An expiry follows the GC and retention settings of when it was created | fixed, `core-fixes` 0824e0d | yes | yes | not reported |
+| C12. An expiry follows the GC and retention settings of when it was created | fixed, `core-fixes` 0824e0d | yes | yes | `gc.enabled`: PR [#17791](https://github.com/apache/iceberg/pull/17791), open; retention: not reported |
 | C13. An expiry that committed reports a failure when its cleanup fails | fixed, `core-fixes` 7f3708a | yes | yes | not reported |
 | C14. A cherry-pick of a snapshot expired since it was picked fails with an NPE | fixed, `core-fixes` b1f2e01 | yes | yes | not reported |
 | C15. An expiry in a transaction deletes files before the transaction commits | fixed, `core-fixes` 44fce44 | yes | yes | not reported; a regression from [#13631](https://github.com/apache/iceberg/pull/13631), in 1.10.0 |
@@ -78,12 +81,13 @@ Fork column is
 | C19. A sort order replaced after a rename fails with an NPE | fixed, `core-fixes` 7e4517f | yes | yes | not reported |
 | C20. A row delta whose starting snapshot expired fails with IllegalArgumentException | fixed, `core-fixes` b967a0a | yes | yes | not reported |
 | C21. Ref and spec removals applied to newer metadata lose a commit or a spec in use | fixed, `core-fixes` 517c1c4 | yes | yes | not reported |
-| C22. A snapshot removal applied to newer metadata drops a ref set since | fixed, `core-fixes` a2a7847 | yes | yes | not reported |
-| C23. A replace transaction drops what other writers committed since it began | fixed, `core-fixes` 29566e9 | yes | yes | [#16232](https://github.com/apache/iceberg/issues/16232), open; PR [#16943](https://github.com/apache/iceberg/pull/16943), open, which this follows except where it falls back |
+| C22. A snapshot removal applied to newer metadata drops a ref set since | fixed, `core-fixes` a2a7847 | yes | yes | reported in a comment on [#6710](https://github.com/apache/iceberg/issues/6710) and on dev@ (2026-02), not fixed |
+| C23. A replace transaction drops what other writers committed since it began | fixed, `core-fixes` 29566e9 | yes | yes | [#16232](https://github.com/apache/iceberg/issues/16232), open; PR [#16943](https://github.com/apache/iceberg/pull/16943), open, which this follows except where it falls back; three earlier attempts closed by the stale bot |
 | C24. A commit that removes a data file keeps its deletion vector | fixed, `core-fixes` 86c4847 | yes | yes | PR [#18197](https://github.com/apache/iceberg/pull/18197), open, which this takes |
 
-"Not reported" means a search of apache/iceberg's issues and pull
-requests found nothing for the issue.
+"Not reported" means a search of apache/iceberg's issues, pull requests
+and PR branches, and of the issues@ and dev@ lists, found nothing for the
+issue (2026-10-21).
 
 ## Rebasing onto a newer Iceberg
 
@@ -174,11 +178,14 @@ between therefore came back, though the expiry deleted its manifest
 list, so reading that snapshot failed.
 
 - **Upstream:**
+  - #13651 reported C3 itself; the stale bot closed it, though
+    RussellSpitzer had called it "a bug now". Its fix, PR #13764, was
+    closed by the stale bot unreviewed.
   - #16232 (open) reports the general problem: a replace silently
     overwrites concurrent schema, property, data and expiry changes.
   - #16942 (open) reports a concurrent writer's snapshot dropped by a
     `createOrReplace`.
-  - PR #16943 (open, by 2026-10-12) would fix both for
+  - PR #16943 (open on 2026-10-21) would fix both for
     `BaseMetastoreCatalog` catalogs, `FileIOCatalog` among them. When the
     table changed, it rebuilds the replacement on the refreshed metadata
     and replays the transaction's updates. It falls back to today's
@@ -247,6 +254,8 @@ left it with none after the handle was loaded.
 `BaseRewriteManifests.apply` dereferenced the current snapshot of the
 metadata it commits on.
 
+- **Upstream:** PR #16645 (open) makes the same change, as part of
+  branch support for `RewriteManifests`.
 - **Fork:** fixed on `core-fixes` by f723a52, "Core: Rewrite the manifests
   of a table without a current snapshot". With no current snapshot, the
   rewrite has no manifests to rewrite. It commits a snapshot without
@@ -334,6 +343,9 @@ is a first pick, so C6's fix does not apply.
   999 of a 6,000-try run on the fork (core-fixes included); planning
   failed in both catalogs alike. Reproduces on 1.12.0 and on main at
   `524fe9e` (the files involved are unchanged at `9bbee07`).
+- **Upstream:** not reported. Maintainers oppose skipping such a DV in
+  planning, which this fix's first part does; the spec requires writers to
+  remove a removed data file's DVs (see C8.md).
 - **Fork:** fixed on `core-fixes` by 1d46241, "Core: Skip a DV older than
   its data file, and refuse to add a data file a DV names". Planning skips
   such a DV with a warning, as the spec's rule implies, and a commit that
@@ -451,6 +463,8 @@ raised the table's retention expired snapshots the new retention keeps.
   to `TestCatalogFaultProperties`, 2026-10-20. The fuzzer's model does not
   follow snapshot history, so it cannot see this. Reproduces on
   `InMemoryCatalog`.
+- **Upstream:** PR #17791 (open) checks `gc.enabled` on each attempt, and
+  changes what it gates; the retention part is not reported.
 - **Fork:** fixed on `core-fixes` by 0824e0d, "Core: Read an expiry's GC and
   retention settings on each attempt's metadata". Its tests are
   `TestRemoveSnapshots.testRetentionRaisedSinceCreated`,
@@ -658,6 +672,8 @@ rollback to one.
   and no requirement can say that no new ref points to a snapshot.
 - **Found by:** the review, 2026-10-20. Reproduces through
   `CatalogHandlers` on `InMemoryCatalog`.
+- **Upstream:** reported in a comment on #6710 (2025-11) and in a dev@
+  thread (2026-02), with no fix or decision.
 - **Fork:** fixed on `core-fixes` by a2a7847, "Core: Fail to apply the removal
   of a snapshot that a ref points to", with
   `RetryableValidationException`, which a REST client retries. Its test is
