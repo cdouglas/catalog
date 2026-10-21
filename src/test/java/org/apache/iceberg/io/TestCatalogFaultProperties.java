@@ -1359,7 +1359,8 @@ class TestCatalogFaultProperties {
                   }
                 }
                 // and the maximum ref ages it keeps, the table's and each ref's
-                built.refsAge = replacement.properties().containsKey(TableProperties.MAX_REF_AGE_MS);
+                built.refsAge =
+                    replacement.properties().containsKey(TableProperties.MAX_REF_AGE_MS);
                 replacement.refs().forEach((name, r) -> {
                   if (r.maxRefAgeMs() != null) {
                     built.agingRefs.add(name);
@@ -1464,7 +1465,8 @@ class TestCatalogFaultProperties {
               expired = "by retention";
           }
           return new Op(
-              "expireSnapshots(" + id + ", " + expired + (cleanMetadata ? ", cleaning metadata" : "")
+              "expireSnapshots(" + id + ", " + expired
+                  + (cleanMetadata ? ", cleaning metadata" : "")
                   + (keepFiles ? ", keeping files" : "") + ")",
               () -> {
                 Table table = handle(w, id, cmd.fresh);
@@ -1526,7 +1528,8 @@ class TestCatalogFaultProperties {
               ? refNames.get(cmd.b % refNames.size())
               : branchNames.get(cmd.b % branchNames.size());
           String tableKey = List.of(TableProperties.MAX_REF_AGE_MS,
-              TableProperties.MIN_SNAPSHOTS_TO_KEEP, TableProperties.MAX_SNAPSHOT_AGE_MS).get(amount);
+                  TableProperties.MIN_SNAPSHOTS_TO_KEEP, TableProperties.MAX_SNAPSHOT_AGE_MS)
+              .get(amount);
           String tableValue = amount == 1 ? "2" : "1";
           String retention;
           switch (setting) {
@@ -1964,11 +1967,21 @@ class TestCatalogFaultProperties {
                   table.currentSnapshot() == null ? ", no snapshot" : ""));
           Map<Long, List<String>> lists =
               manifestLists.computeIfAbsent(metadata.uuid(), k -> new HashMap<>());
+          // Each ref names a snapshot the table has, each snapshot a schema it has, and each
+          // manifest a partition spec it has (Iceberg issue C11, Bug 69): a reader that time
+          // travels to a snapshot, or plans a branch, needs them.
+          metadata.refs().forEach((name, ref) -> check(metadata.snapshot(ref.snapshotId()) != null,
+              "%s: ref %s names snapshot %d, which the table does not have",
+              id, name, ref.snapshotId()));
           for (Snapshot snapshot : table.snapshots()) {
             String list = snapshot.manifestListLocation();
             check(list == null ? snapshot instanceof org.apache.iceberg.InlineSnapshot
                     : io.newInputFile(list).exists(),
                 "%s: snapshot %d has no manifest list: %s", id, snapshot.snapshotId(), list);
+            check(snapshot.schemaId() == null
+                    || metadata.schemasById().containsKey(snapshot.schemaId()),
+                "%s: snapshot %d names schema %d, which the table does not have",
+                id, snapshot.snapshotId(), snapshot.schemaId());
             List<String> manifests = new ArrayList<>();
             manifests.add(String.format(
                 "seq=%d parent=%s ts=%d op=%s schema=%s first-row-id=%s added-rows=%s summary=%s",
@@ -1979,6 +1992,10 @@ class TestCatalogFaultProperties {
               check(io.newInputFile(manifest.path()).exists(),
                   "%s: snapshot %d references missing manifest %s",
                   id, snapshot.snapshotId(), manifest.path());
+              check(metadata.specsById().containsKey(manifest.partitionSpecId()),
+                  "%s: snapshot %d has manifest %s of partition spec %d, which the table does not "
+                      + "have", id, snapshot.snapshotId(), manifest.path(),
+                  manifest.partitionSpecId());
               manifests.add(describe(manifest));
             }
             List<String> first = lists.putIfAbsent(snapshot.snapshotId(), manifests);
