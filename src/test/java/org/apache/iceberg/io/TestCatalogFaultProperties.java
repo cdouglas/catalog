@@ -25,6 +25,7 @@ import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -123,7 +124,7 @@ import org.apache.iceberg.types.Types;
  *       it, which the next compaction would write (see {@link CheckpointRoundTrip}).
  *   <li>Row lineage, in a v3 table: once a snapshot has row ids, every live data file has them; the
  *       files' ranges are disjoint and below the table's next row id; a file's first row id never
- *       changes, nor do a snapshot's first row id and added rows.
+ *       changes along main's lineage, nor do a snapshot's first row id and added rows.
  *   <li>An acknowledged catalog transaction saw no concurrent change it must not miss: under
  *       serializable isolation, to the main branch (or, without one, the metadata) of any table it
  *       loaded; under snapshot isolation, to the main branch of any table it appended to.
@@ -713,8 +714,11 @@ class TestCatalogFaultProperties {
     private final Map<String, Map<Long, List<String>>> manifestLists = new HashMap<>();
     // Each table's storage at the last check, by UUID: inline or a metadata file.
     private final Map<String, String> storage = new HashMap<>();
-    // Each data file's first row id when first seen with one, by table UUID: row ids never change.
-    private final Map<String, Map<String, Long>> rowIds = new HashMap<>();
+    // Each data file's first row id, and the snapshot of main it was last seen in, by table UUID:
+    // row ids never change along main's lineage.
+    private final Map<String, Map<String, long[]>> rowIds = new HashMap<>();
+    // The parent of every snapshot a check has seen, by table UUID, which outlives its expiry.
+    private final Map<String, Map<Long, Long>> parents = new HashMap<>();
     // Conditional writes whose catalog file has been checked against a checkpoint of it.
     private int checkedWrites = 0;
 
@@ -2094,20 +2098,40 @@ class TestCatalogFaultProperties {
       }
     }
 
+    /** Whether {@code snapshot} is {@code ancestor} or descends from it, by the parents seen. */
+    private static boolean descendsFrom(Map<Long, Long> parentOf, long snapshot, long ancestor) {
+      Set<Long> visited = new HashSet<>();
+      for (Long s = snapshot; s != null && visited.add(s); s = parentOf.get(s)) {
+        if (s == ancestor) {
+          return true;
+        }
+      }
+      return false;
+    }
+
     /**
      * Checks the row ids of a table's live data files: in a v3 table whose current snapshot has
      * row ids, every file has them, and their ranges are disjoint and below the next row id. In
-     * any table, a file's first row id never changes once it has one.
+     * any table, a file's first row id never changes along main's lineage once it has one. A file
+     * written before the table's upgrade to v3 gets its row ids in each lineage that first carries
+     * it into a v3 snapshot, so after main moves to another lineage, such as a branch from before
+     * the upgrade, it may have others (ICEBERG_ISSUES.md, A5).
      */
     private void checkRowLineage(
         TableIdentifier id, TableMetadata metadata, Snapshot current, List<DataFile> live) {
-      Map<String, Long> seen = rowIds.computeIfAbsent(metadata.uuid(), k -> new HashMap<>());
+      Map<Long, Long> parentOf = parents.computeIfAbsent(metadata.uuid(), k -> new HashMap<>());
+      metadata.snapshots().forEach(s -> parentOf.put(s.snapshotId(), s.parentId()));
+      Map<String, long[]> seen = rowIds.computeIfAbsent(metadata.uuid(), k -> new HashMap<>());
       for (DataFile f : live) {
         if (f.firstRowId() != null) {
-          Long first = seen.putIfAbsent(f.location(), f.firstRowId());
-          check(first == null || first.equals(f.firstRowId()),
-              "%s: the first row id of %s changed from %d to %d",
-              id, f.location(), first, f.firstRowId());
+          long[] first = seen.get(f.location());
+          if (first != null && first[0] != f.firstRowId()) {
+            boolean sameLineage = descendsFrom(parentOf, current.snapshotId(), first[1]);
+            check(!sameLineage, "%s: the first row id of %s changed from %d to %d",
+                id, f.location(), first[0], f.firstRowId());
+            Statistics.label("row ids of another lineage").collect(true);
+          }
+          seen.put(f.location(), new long[] {f.firstRowId(), current.snapshotId()});
         }
       }
       if (metadata.formatVersion() < 3 || current == null || current.firstRowId() == null) {

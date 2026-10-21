@@ -529,3 +529,18 @@ another writer upgraded the table to v3 fails with
 `IllegalArgumentException` ("Must use DVs for position deletes in V3").
 Before, the commit landed a v2 position delete in a v3 table.
 `TestCatalogFaultProperties` counts that failure as a rejection.
+
+### A5. A file from before a v3 upgrade gets its row ids once per lineage
+
+A v3 commit gives row ids to every manifest it carries that has none,
+as the manifests of a table's files from before its upgrade to v3 have
+none. Each lineage does so on its own: on a branch from before the
+upgrade, the same file gets ids that main's lineage didn't give it.
+After main moves to such a branch (a replace that leaves main empty,
+then a fast-forward to the branch; or a rollback to a snapshot from
+before the upgrade), its next commit gives the file new ids, from the
+table's next row id. The table's row ids stay disjoint, and stable along
+each lineage. `TestCatalogFaultProperties` checks that a file's first
+row id never changes along main's lineage (it keeps every snapshot's
+parent, so the check holds across expiries); before round 7 of
+2026-10-20 it checked across lineages and failed on this.
