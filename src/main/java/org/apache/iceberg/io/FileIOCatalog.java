@@ -1189,10 +1189,16 @@ public class FileIOCatalog extends BaseMetastoreCatalog
     // Each branch the transaction read must be as it read it, from then until the commit
     // lands. BaseCatalogTransaction checked that before calling, but a commit may have landed
     // since; check again on the state this commit builds on, and readTable makes the commit
-    // fail if the table changes before it lands.
+    // fail if the table changes before it lands. Each table it writes (a null ref) must be the
+    // version it first read, checked with the table's commit below (errata D12).
+    Map<TableIdentifier, TableMetadata> written = new HashMap<>();
     for (Map.Entry<BaseCatalogTransaction.TableRef, TableMetadata> read : reads.entrySet()) {
       TableIdentifier readTable = read.getKey().identifier();
       String ref = read.getKey().ref();
+      if (ref == null) {
+        written.put(readTable, read.getValue());
+        continue;
+      }
       TableMetadata now = newTableOps(readTable, current).current();
       if (!BaseCatalogTransaction.unchangedSinceRead(ref, read.getValue(), now)) {
         throw new ValidationException(
@@ -1210,6 +1216,14 @@ public class FileIOCatalog extends BaseMetastoreCatalog
         throw new NoSuchTableException("Table does not exist: %s", tableId);
       }
       commit.requirements().forEach(req -> req.validate(currentMetadata));
+      // after the requirements, which say more specifically what changed; stageUpdate pins the
+      // version until the commit lands
+      TableMetadata firstRead = written.get(tableId);
+      if (firstRead != null
+          && !BaseCatalogTransaction.unchangedSinceRead(null, firstRead, currentMetadata)) {
+        throw new CommitFailedException(
+            "Cannot commit transaction: table %s changed since the transaction read it", tableId);
+      }
 
       TableMetadata.Builder newMetadataBuilder = TableMetadata.buildFrom(currentMetadata);
       commit.updates().forEach(update -> update.applyTo(newMetadataBuilder));

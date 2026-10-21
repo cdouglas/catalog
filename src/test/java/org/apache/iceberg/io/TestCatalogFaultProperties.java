@@ -125,9 +125,10 @@ import org.apache.iceberg.types.Types;
  *   <li>Row lineage, in a v3 table: once a snapshot has row ids, every live data file has them; the
  *       files' ranges are disjoint and below the table's next row id; a file's first row id never
  *       changes along main's lineage, nor do a snapshot's first row id and added rows.
- *   <li>An acknowledged catalog transaction saw no concurrent change it must not miss: under
+ *   <li>An acknowledged catalog transaction saw no concurrent change it must not miss: any change
+ *       to a table it appended to, since it first loaded the table (errata D12); and, under
  *       serializable isolation, to the main branch (or, without one, the metadata) of any table it
- *       loaded; under snapshot isolation, to the main branch of any table it appended to.
+ *       loaded.
  * </ul>
  */
 class TestCatalogFaultProperties {
@@ -1780,9 +1781,12 @@ class TestCatalogFaultProperties {
             if (now == null || !now.uuid.equals(at.uuid)) {
               throw new IsolationViolation(level + ": " + id + " was replaced or dropped");
             }
+            // a table it wrote: any change since it first read it (errata D12); a table it only
+            // read, serializable: its main branch or, without one, its metadata
             boolean unchanged =
-                level == IsolationLevel.SERIALIZABLE
-                        && (at.snapshotId == null || now.snapshotId == null)
+                at.appended
+                        || level == IsolationLevel.SERIALIZABLE
+                            && (at.snapshotId == null || now.snapshotId == null)
                     ? Objects.equals(at.metadataLocation, now.metadataLocation)
                     : Objects.equals(at.snapshotId, now.snapshotId);
             if (!unchanged) {

@@ -50,6 +50,12 @@ public class TestLocalCatalogTransaction {
     }
 
     @Override
+    protected boolean conflictsOnTableVersions() {
+      // a transaction conflicts on the whole version of each table it writes (errata D12)
+      return true;
+    }
+
+    @Override
     protected FileIOCatalog catalog() {
       return catalog;
     }

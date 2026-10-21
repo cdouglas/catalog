@@ -4340,19 +4340,26 @@ public class TestCatalogRegressions {
   @Nested
   class TransactionOverARemovedSpecOrSchema {
 
-    private CatalogTransaction stagedAppend(FileIOCatalog catalog) {
+    /**
+     * An append staged on the table as it is now, committed as a table commit with no read set,
+     * which applies its updates to the table's current metadata. A catalog transaction would fail
+     * on any change to the table since (Bug 70).
+     */
+    private org.apache.iceberg.catalog.TableCommit stagedAppend(FileIOCatalog catalog) {
       catalog.createNamespace(mixedNs);
       catalog.createTable(mixed, intSchema);
-      CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
-      txn.asCatalog().loadTable(mixed).newFastAppend().appendFile(dataFile("a")).commit();
-      return txn;
+      org.apache.iceberg.BaseTransaction txn =
+          (org.apache.iceberg.BaseTransaction) catalog.loadTable(mixed).newTransaction();
+      txn.newFastAppend().appendFile(dataFile("a")).commit();
+      return org.apache.iceberg.catalog.TableCommit.create(
+          mixed, txn.startMetadata(), txn.currentMetadata());
     }
 
     @ParameterizedTest
     @EnumSource(value = LocalCatalogMode.class, names = {"APPEND", "APPEND_ML"})
     void aRemovedSpecFailsTheCommit(LocalCatalogMode mode) {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
-      CatalogTransaction txn = stagedAppend(catalog(io, mode));
+      org.apache.iceberg.catalog.TableCommit commit = stagedAppend(catalog(io, mode));
 
       // another writer partitions the table and expires its unpartitioned spec
       Table other = catalog(io, mode).loadTable(mixed);
@@ -4360,7 +4367,7 @@ public class TestCatalogRegressions {
       other.expireSnapshots().cleanExpiredMetadata(true).commit();
       assertThat(other.specs()).doesNotContainKey(0);
 
-      assertThatThrownBy(txn::commitTransaction)
+      assertThatThrownBy(() -> catalog(io, mode).commitTransaction(commit))
           .isInstanceOf(ValidationException.class)
           .hasMessageEndingWith("its partition spec 0 was removed concurrently");
       assertThat(catalog(io, mode).loadTable(mixed).currentSnapshot()).isNull();
@@ -4370,7 +4377,7 @@ public class TestCatalogRegressions {
     @EnumSource(value = LocalCatalogMode.class, names = {"APPEND", "APPEND_ML"})
     void aRemovedSchemaFailsTheCommit(LocalCatalogMode mode) {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
-      CatalogTransaction txn = stagedAppend(catalog(io, mode));
+      org.apache.iceberg.catalog.TableCommit commit = stagedAppend(catalog(io, mode));
 
       // another writer adds a column and expires the schema before it
       Table other = catalog(io, mode).loadTable(mixed);
@@ -4378,10 +4385,70 @@ public class TestCatalogRegressions {
       other.expireSnapshots().cleanExpiredMetadata(true).commit();
       assertThat(other.schemas()).doesNotContainKey(0);
 
-      assertThatThrownBy(txn::commitTransaction)
+      assertThatThrownBy(() -> catalog(io, mode).commitTransaction(commit))
           .isInstanceOf(ValidationException.class)
           .hasMessageEndingWith("its schema 0 was removed concurrently");
       assertThat(catalog(io, mode).loadTable(mixed).currentSnapshot()).isNull();
+    }
+  }
+
+  /**
+   * Bug 70: a catalog transaction checked a table it writes only by the requirements Iceberg
+   * derives from its commit, between its first read of the table and the commit. A change those
+   * requirements don't name went through and was lost or broke the table: another writer's
+   * property change (a name mapping a schema update rewrote), a commit to another branch of it,
+   * or a tag on a snapshot the transaction expired. A transaction now conflicts on any change to
+   * a table it writes since it first read it (errata D12).
+   */
+  @Nested
+  class WrittenTableChangedSinceRead {
+
+    @Test
+    void aPropertyChangeFailsTheTransaction() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, LocalCatalogMode.APPEND);
+      catalog.createNamespace(mixedNs);
+      catalog.createTable(mixed, intSchema);
+      // snapshot isolation: a serializable one fails first on its read of the table, which has
+      // no snapshot
+      CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      txn.asCatalog().loadTable(mixed).newFastAppend().appendFile(dataFile("a")).commit();
+
+      // another writer sets a property, which no requirement of the append names
+      catalog(io, LocalCatalogMode.APPEND).loadTable(mixed).updateProperties().set("k", "v").commit();
+
+      assertThatThrownBy(txn::commitTransaction)
+          .isInstanceOf(CommitFailedException.class)
+          .hasMessage("Cannot commit transaction: table ns.t changed since the transaction read it");
+      Table table = catalog(io, LocalCatalogMode.APPEND).loadTable(mixed);
+      assertThat(table.properties()).containsEntry("k", "v");
+      assertThat(table.currentSnapshot()).isNull();
+    }
+
+    @ParameterizedTest
+    @EnumSource(CatalogTransaction.IsolationLevel.class)
+    void aTagOnASnapshotTheTransactionExpiresFailsIt(CatalogTransaction.IsolationLevel isolation) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = catalog(io, LocalCatalogMode.APPEND);
+      catalog.createNamespace(mixedNs);
+      Table table = catalog.createTable(mixed, intSchema);
+      table.newFastAppend().appendFile(dataFile("a")).commit();
+      long first = table.currentSnapshot().snapshotId();
+      table.newFastAppend().appendFile(dataFile("b")).commit();
+      CatalogTransaction txn = catalog.createTransaction(isolation);
+      txn.asCatalog().loadTable(mixed).expireSnapshots().expireSnapshotId(first).commit();
+
+      // another writer tags the snapshot the transaction expires
+      catalog(io, LocalCatalogMode.APPEND)
+          .loadTable(mixed)
+          .manageSnapshots()
+          .createTag("tag", first)
+          .commit();
+
+      assertThatThrownBy(txn::commitTransaction).isInstanceOf(CommitFailedException.class);
+      Table after = catalog(io, LocalCatalogMode.APPEND).loadTable(mixed);
+      assertThat(after.refs()).containsKey("tag");
+      assertThat(after.snapshot(first)).isNotNull();
     }
   }
 }

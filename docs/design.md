@@ -398,9 +398,9 @@ What the matrix says:
    create, rename or drop -- which depends on nothing a concurrent change
    alters but existence, checked again on the fresh read (Bugs 47, 53,
    54). A catalog transaction is the exception: it conflicts on the
-   whole version of each table it writes, or reads under serializable
-   isolation, and one that conflicts fails, for its caller to run again
-   ([errata.md](errata.md) §D12).
+   whole version of each table it writes, as it first read it, or reads
+   under serializable isolation, and one that conflicts fails, for its
+   caller to run again ([errata.md](errata.md) §D12).
 
 ## Late-Binding
 

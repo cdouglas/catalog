@@ -54,9 +54,9 @@ import org.apache.iceberg.types.Types;
  * way either: it must fail, and leave the catalog as the others alone do, if an operation that
  * ran before its writes changed what it read -- under serializable isolation the main branch of
  * each table it loaded (or the table, if main had no snapshot), under snapshot isolation that of
- * the table it appended to. It also fails when another commit changed a table it writes in any
- * other way, a property change included, as the catalog's transactions conflict on a table's whole
- * version (errata D12); the property counts those.
+ * the table it appended to. It must also fail when another commit changed the table it writes in
+ * any other way, a property change included: a catalog transaction conflicts on the whole version
+ * of each table it writes, from when it first read the table (errata D12).
  *
  * <p>The operations are namespace creates (of nested namespaces too, which create their parents),
  * drops and property changes; table creates, drops, renames and property changes; and appends and
@@ -108,6 +108,7 @@ class TestCatalogRaceProperties {
     int[] writes = {0};
     boolean[] nested = {false};
     boolean[] changedItsReads = {false}; // whether a racer changed what A, a transaction, read
+    boolean[] changedItsTable = {false}; // whether a racer changed the table A appends to at all
     List<Map<TableIdentifier, String>> loaded = new java.util.ArrayList<>(); // as A loaded them
     io.injectFaults((location, strategy) -> {
       if (!nested[0] && location.equals(CATALOG)) {
@@ -121,6 +122,9 @@ class TestCatalogRaceProperties {
             results[k] = racers.get(k).run(writers.get(k), name(k));
             if (!loaded.isEmpty() && !a.unchanged(loaded.get(0), a.reads(io))) {
               changedItsReads[0] = true;
+            }
+            if (!loaded.isEmpty() && !a.sameVersion(loaded.get(0), a.reads(io))) {
+              changedItsTable[0] = true;
             }
           } finally {
             nested[0] = false;
@@ -137,13 +141,21 @@ class TestCatalogRaceProperties {
     }
     String raceState = state(io);
 
-    // A transaction whose reads a racer changed must fail; one whose reads held fails too if a
-    // racer otherwise changed a table it pins (errata D12).
+    // A transaction whose reads a racer changed must fail, and so must one whose table a racer
+    // changed in any way, a property change included: a transaction conflicts on the whole
+    // version of each table it writes (errata D12).
     boolean txnFailed = a.kind == Kind.CATALOG_TXN && before > 0 && !raceA.startsWith("ok");
     if (a.kind == Kind.CATALOG_TXN && before > 0) {
       Statistics.label("transaction racing")
           .collect((changedItsReads[0] ? "reads changed, " : "reads held, ")
+              + (changedItsTable[0] ? "table changed, " : "table held, ")
               + (txnFailed ? "failed" : "committed"));
+      if (changedItsTable[0] && !txnFailed) {
+        throw new AssertionError(String.format(
+            "the transaction %s committed, but the racers before its writes changed the table it "
+                + "appends to: %s, %s%nsetup %s",
+            a, racers.get(0), before > 1 ? racers.get(1) : "", setup));
+      }
       if (changedItsReads[0] && !txnFailed) {
         throw new AssertionError(String.format(
             "the transaction %s committed, but the racers before its writes changed what it "
@@ -379,6 +391,11 @@ class TestCatalogRaceProperties {
             + metadata.metadataFileLocation());
       }
       return reads;
+    }
+
+    /** Whether the table the transaction appends to is the version it read: the same metadata. */
+    boolean sameVersion(Map<TableIdentifier, String> then, Map<TableIdentifier, String> now) {
+      return then.get(table()).equals(now.get(table()));
     }
 
     /**

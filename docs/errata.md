@@ -147,7 +147,15 @@ A catalog transaction's record pins the version of each table it writes
 and, under serializable isolation, of each table it read. A commit that
 lands first on one of those tables bumps its version, and the
 transaction fails with `CommitFailedException` (design.md, conflict
-matrix). Any change counts, a property change included. This is the
+matrix). Any change counts, a property change included. The version a
+written table must still have is the one the transaction first read,
+not the one current when it commits: `BaseCatalogTransaction` passes it
+in the read set (with a null ref, under either isolation level), and
+`commitTransaction` fails if the table changed since, after checking the
+commit's requirements, which say more specifically what changed. Before
+Bug 70, a change between the transaction's read and its commit that the
+requirements don't name went through: a property change, a commit to
+another branch, a tag on a snapshot the transaction expired. This is the
 catalog's semantics, and it's stricter than Iceberg's:
 - The requirements `UpdateRequirements` derives for a table commit name
   only the table's UUID, the heads of the branches it moves, and the
@@ -164,9 +172,18 @@ catalog retries. `BaseCatalogTransaction` doesn't (its "TODO: should
 this be retryable?"), so a caller whose transaction failed runs it
 again.
 
-`TestCatalogRaceProperties` counts the transactions that fail this way
-although what Iceberg's isolation checks (the branches they read) held.
-In a 200,000-try run, 24 of the 8,469 racing transactions (0.28%) did.
+The fork's `RESTCatalog` ignores the read set, written tables included:
+its server checks only the requirements.
+
+`TestCatalogFaultProperties` checks that an acknowledged transaction's
+written tables are the versions it first read; with the check in
+`commitTransaction` disabled, it fails within about 1,200 tries.
+`TestCatalogRaceProperties` checks that a transaction whose table a
+racer changed fails (its racers run within the commit, so the
+commit loop's pin catches them too), and counts the transactions that
+fail although what Iceberg's isolation checks (the branches they read)
+held. In a 200,000-try run, 24 of the 8,469 racing transactions (0.28%)
+did.
 
 **Later: depend on part of a table.** A table's version could be split
 into its metadata (properties) and the rest, with the intention record

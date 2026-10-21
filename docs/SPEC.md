@@ -849,7 +849,8 @@ restages namespace operations, renames and drops on a fresh read and retries
 their `CommitFailedException`, up to Iceberg's default number of attempts
 (`commitOnAFreshRead`, `dropTable`; a table create likewise, in
 `FileIOTableOperations.commitCreate`). `commitTransaction` does not retry: a
-catalog transaction conflicts on the whole version of each table it pins.
+catalog transaction conflicts on the whole version of each table it pins, a
+table it writes from when it first read it.
 
 ### CAS-only Mode
 
