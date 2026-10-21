@@ -67,7 +67,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
- * Canaries for the Iceberg core bugs this project's fuzzers and reviews found, C1 to C23 in
+ * Canaries for the Iceberg core bugs this project's fuzzers and reviews found, C1 to C24 in
  * docs/ICEBERG_ISSUES.md: one test each, on Iceberg's own InMemoryCatalog, that asserts the bug is
  * absent. Upstream fixed C1, and the fork's core-fixes branch fixes the others, so every test
  * passes against the fork. A test that fails means its bug is back: a rebase dropped the fork's
@@ -682,6 +682,47 @@ class TestIcebergCoreIssues {
     Table after = catalog.loadTable(ID);
     assertThat(after.snapshot(branchCommit)).as(BACK, "C23").isNotNull();
     assertThat(after.refs().get("b").snapshotId()).as(BACK, "C23").isEqualTo(branchCommit);
+  }
+
+  /**
+   * C24. A delete of a v3 table's data file, retried after another writer merged the delete
+   * manifests, must remove the file's deletion vector: the retry skipped the merged manifest.
+   */
+  @Test
+  void aRemovedDataFilesDeletionVectorIsRemovedOnRetry() throws IOException {
+    InMemoryCatalog catalog = catalog();
+    Table table =
+        catalog
+            .buildTable(ID, SCHEMA)
+            .withProperty(TableProperties.FORMAT_VERSION, "3")
+            .withProperty(TableProperties.MANIFEST_MIN_MERGE_COUNT, "2")
+            .create();
+    DataFile a = file("a");
+    table.newFastAppend().appendFile(a).commit();
+    table.newFastAppend().appendFile(file("b")).commit();
+    table.newRowDelta().addDeletes(dv(table, a)).commit();
+    DeleteFile equality =
+        FileMetadata.deleteFileBuilder(table.spec())
+            .ofEqualityDeletes(1)
+            .withPath(path("eq"))
+            .withFileSizeInBytes(10)
+            .withRecordCount(1)
+            .build();
+
+    racing(table, () -> catalog.loadTable(ID).newRowDelta().addDeletes(equality).commit())
+        .newDelete()
+        .deleteFile(a.location())
+        .commit();
+
+    Table after = catalog.loadTable(ID);
+    List<String> referenced = new ArrayList<>();
+    for (ManifestFile manifest : after.currentSnapshot().deleteManifests(after.io())) {
+      try (org.apache.iceberg.ManifestReader<DeleteFile> reader =
+          org.apache.iceberg.ManifestFiles.readDeleteManifest(manifest, after.io(), after.specs())) {
+        reader.forEach(file -> referenced.add(String.valueOf(file.referencedDataFile())));
+      }
+    }
+    assertThat(referenced).as(BACK, "C24").doesNotContain(a.location());
   }
 
   /** Applies updates computed on {@code base}, as a REST server applies a client's commit. */

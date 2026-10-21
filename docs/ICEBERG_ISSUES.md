@@ -13,7 +13,7 @@ reports or pull requests upstream. It covers the reproduction, the cause
 with links to the 1.12.0 source, the fix, its tests, and what to settle
 before a PR.
 
-Upstream fixed C1. The fork fixes C2 to C23 on branch `core-fixes`, each
+Upstream fixed C1. The fork fixes C2 to C24 on branch `core-fixes`, each
 in an upstream-style commit with its tests, so the project's tests no
 longer work around any of them.
 
@@ -50,8 +50,9 @@ day, was fixed on `core-fixes` on 2026-10-19, as were C9 and C10, found
 that day; C9 was checked against main at `6890694bd`, C10 at
 `ddbd99073`. C11 to C14 were fixed on 2026-10-20 and checked against
 main at `3738f4a97`. C15 to C22, from the review, were fixed the same
-day and checked against main at `834441b96`, as was C23, fixed later
-that day. The Fork column is
+day and checked against main at `834441b96`, as were C23, fixed later
+that day, and C24, which round 9 of the fuzzers found on 2026-10-21. The
+Fork column is
 `atomicio`, which sits on `core-fixes`.
 
 | Issue | Fork | 1.12.0 | main | Upstream |
@@ -79,6 +80,7 @@ that day. The Fork column is
 | C21. Ref and spec removals applied to newer metadata lose a commit or a spec in use | fixed, `core-fixes` 517c1c4 | yes | yes | not reported |
 | C22. A snapshot removal applied to newer metadata drops a ref set since | fixed, `core-fixes` a2a7847 | yes | yes | not reported |
 | C23. A replace transaction drops what other writers committed since it began | fixed, `core-fixes` 29566e9 | yes | yes | [#16232](https://github.com/apache/iceberg/issues/16232), open; PR [#16943](https://github.com/apache/iceberg/pull/16943), open, which this follows except where it falls back |
+| C24. A commit that removes a data file keeps its deletion vector | fixed, `core-fixes` 86c4847 | yes | yes | PR [#18197](https://github.com/apache/iceberg/pull/18197), open, which this takes |
 
 "Not reported" means a search of apache/iceberg's issues and pull
 requests found nothing for the issue.
@@ -693,6 +695,32 @@ though the concurrent commit never happened" is a bug.
   as the table the transaction saw when it began; it now models the
   table as the replace commits over it.
 - **Canary:** `aReplaceKeepsWhatOtherWritersCommittedSinceItBegan`.
+
+### C24. A commit that removes a data file keeps its deletion vector
+
+Details: [iceberg-issues/C24.md](iceberg-issues/C24.md).
+
+In a v3 table, a commit that removes a data file removes its deletion
+vector too. The filter's check of which delete manifests to open looked
+at the partitions of explicitly deleted files first, and only without
+them at the removed data files, so it skipped the DV's manifest when it
+lay outside those partitions: a row delta that also removes a delete
+file of another partition, or a commit retried after another writer
+merged the DV's manifest into a new one (the first attempt's dropped DV
+counts as an explicit delete without a partition).
+
+- **Cause:** `ManifestFilterManager.canContainDroppedFiles` returns the
+  partition check before it reaches `removedDataFilePaths` (#13222,
+  1.10.0).
+- **Found by:** `TestCatalogFaultProperties`, 2026-10-21 (round 9, try
+  8,582 of a 30,000-try run): a delete retried after a concurrent row
+  delta merged delete manifests. Reproduces on `InMemoryCatalog`.
+- **Fork:** fixed on `core-fixes` by 86c4847, "Core: Remove a removed data
+  file's deletion vector from any delete manifest", which takes PR
+  #18197's fix and test. Its tests are `TestManifestFilterManager` and
+  `TestRowDelta.test*TheFilesDV`.
+- **No workaround** to remove.
+- **Canary:** `aRemovedDataFilesDeletionVectorIsRemovedOnRetry`.
 
 ## Accepted Iceberg Behavior
 
