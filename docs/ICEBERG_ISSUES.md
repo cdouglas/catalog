@@ -8,7 +8,7 @@ reports or pull requests upstream. It covers the reproduction, the cause
 with links to the 1.12.0 source, the fix, its tests, and what to settle
 before a PR.
 
-Upstream fixed C1. The fork fixes C2 to C13 on branch `core-fixes`, each
+Upstream fixed C1. The fork fixes C2 to C14 on branch `core-fixes`, each
 in an upstream-style commit with its tests, so the project's tests no
 longer work around any of them.
 
@@ -43,7 +43,7 @@ each fix changes are unchanged there since `524fe9e`, and each fix
 cherry-picks onto it (C2's test file only after C7's). C8, found the same
 day, was fixed on `core-fixes` on 2026-10-19, as were C9 and C10, found
 that day; C9 was checked against main at `6890694bd`, C10 at
-`ddbd99073`. C11 to C13 were fixed on 2026-10-20 and checked against
+`ddbd99073`. C11 to C14 were fixed on 2026-10-20 and checked against
 main at `3738f4a97`. The Fork column is
 `atomicio`, which sits on `core-fixes`.
 
@@ -62,6 +62,7 @@ main at `3738f4a97`. The Fork column is
 | C11. An append commits files of a spec another writer removed | fixed, `core-fixes` 69e83ef | yes | yes | not reported |
 | C12. An expiry follows the GC and retention settings of when it was created | fixed, `core-fixes` 0824e0d | yes | yes | not reported |
 | C13. An expiry that committed reports a failure when its cleanup fails | fixed, `core-fixes` 7f3708a | yes | yes | not reported |
+| C14. A cherry-pick of a snapshot expired since it was picked fails with an NPE | fixed, `core-fixes` b1f2e01 | yes | yes | not reported |
 
 "Not reported" means a search of apache/iceberg's issues and pull
 requests found nothing for the issue.
@@ -460,6 +461,30 @@ files behind.
   `testCommittedExpiryWhoseCleanupFails`.
 - **No workaround** to remove.
 - **Canary:** `anExpiryThatCommittedDoesNotFailOnItsCleanup`.
+
+### C14. A cherry-pick of a snapshot expired since it was picked fails with a NullPointerException
+
+Details: [iceberg-issues/C14.md](iceberg-issues/C14.md).
+
+A cherry-pick checks that its snapshot exists when it is set up. If
+another writer expired it before the pick committed, as an expiry does a
+staged snapshot that no ref holds, the attempt failed with a
+`NullPointerException`: in `WapUtil.validateWapPublish` for a pick that
+adds the snapshot's files, or committing a null snapshot for a
+fast-forward.
+
+- **Cause:** `CherryPickOperation.apply()` refreshes the table but keeps
+  the snapshot it looked up when the pick was set up.
+- **Found by:** `TestCatalogFaultProperties`, 2026-10-20 (try 25,453 of a
+  30,000-try run): a cherry-pick preempted by an expiry of the table.
+  Reproduces on `InMemoryCatalog`.
+- **Fork:** fixed on `core-fixes` by b1f2e01, "Core: Fail a cherry-pick of a
+  snapshot expired since it was picked": `apply()` fails with
+  `ValidationException` when the refreshed table lacks the snapshot. Its
+  tests are `TestWapWorkflow.testCherrypickOfASnapshotExpiredSincePicked`
+  and `testFastForwardToASnapshotExpiredSincePicked`.
+- **No workaround** to remove.
+- **Canary:** `aCherryPickOfASnapshotExpiredSincePickedFailsCleanly`.
 
 ## Accepted Iceberg Behavior
 

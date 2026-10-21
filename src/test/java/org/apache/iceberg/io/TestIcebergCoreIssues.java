@@ -66,7 +66,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
- * Canaries for the Iceberg core bugs this project's fuzzers found, C1 to C13 in
+ * Canaries for the Iceberg core bugs this project's fuzzers found, C1 to C14 in
  * docs/ICEBERG_ISSUES.md: one test each, on Iceberg's own InMemoryCatalog, that asserts the bug is
  * absent. Upstream fixed C1, and the fork's core-fixes branch fixes the others, so every test
  * passes against the fork. A test that fails means its bug is back: a rebase dropped the fork's
@@ -433,6 +433,28 @@ class TestIcebergCoreIssues {
         .expireOlderThan(now).commit());
     assertThat(committed[0]).isTrue();
     assertThat(failure).as(BACK, "C13").isNull();
+  }
+
+  /**
+   * C14. A cherry-pick of a snapshot that another writer expired after the pick was set up must
+   * fail cleanly: CherryPickOperation kept the snapshot it looked up then, and failed with a
+   * NullPointerException on the refreshed table that no longer had it.
+   */
+  @Test
+  void aCherryPickOfASnapshotExpiredSincePickedFailsCleanly() {
+    InMemoryCatalog catalog = catalog();
+    Table table = catalog.createTable(ID, SCHEMA);
+    table.newFastAppend().appendFile(file("a")).commit();
+    table.newFastAppend().appendFile(file("b")).stageOnly().commit();
+    long staged = Iterables.getOnlyElement(Iterables.filter(table.snapshots(),
+        s -> s.snapshotId() != table.currentSnapshot().snapshotId())).snapshotId();
+    org.apache.iceberg.ManageSnapshots pick = table.manageSnapshots().cherrypick(staged);
+
+    catalog.loadTable(ID).expireSnapshots().expireSnapshotId(staged).commit();
+
+    assertThat(catchThrowable(pick::commit))
+        .as(BACK, "C14")
+        .isNotInstanceOf(NullPointerException.class);
   }
 
   /** As another writer, partitions an unpartitioned table and expires its unpartitioned spec. */

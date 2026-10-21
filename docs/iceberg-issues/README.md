@@ -16,7 +16,7 @@ conflicts, and only if C7 isn't picked first, and C8's, if C6 isn't. C9,
 added 2026-10-19, cherry-picks onto `main` at `6890694bd` after C3; C10,
 added the same day, onto `ddbd99073` on its own. C11, added 2026-10-20,
 onto `3738f4a97` on its own, C12, the same day, after C10, and C13 after
-C10 and C12.
+C10 and C12; C14 after C6 and C8.
 
 | Issue | Fix | Before a PR |
 |---|---|---|
@@ -33,3 +33,4 @@ C10 and C12.
 | [C11. An append commits files of a partition spec another writer removed](C11.md) | [`69e83ef`](https://github.com/cdouglas/iceberg/commit/69e83effcbc7c59ec1c2822c6af38605d445501f) | the REST window needs a requirement or a server-side check |
 | [C12. An expiry follows the GC and retention settings its table had when it was created](C12.md) | [`0824e0d`](https://github.com/cdouglas/iceberg/commit/0824e0d62d00c16e4015b5ba61044b599f4f7b79) | ready; settle whether `now` should be per attempt |
 | [C13. An expiry that committed reports a failure when its file cleanup fails](C13.md) | [`7f3708a`](https://github.com/cdouglas/iceberg/commit/7f3708a2219a897bf5f5df81a39e845ea72c9580) | ready; the incremental-cleanup checks have the same flaw |
+| [C14. A cherry-pick of a snapshot expired since it was picked fails with a NullPointerException](C14.md) | [`b1f2e01`](https://github.com/cdouglas/iceberg/commit/b1f2e01e4d761d2725adbcd3a8896b6f7ada07ab) | ready |
