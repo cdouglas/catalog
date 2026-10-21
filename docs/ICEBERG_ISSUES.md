@@ -1,14 +1,17 @@
 # Iceberg Core Issues
 
-Bugs in Apache Iceberg that this project's fuzzers found. None is in
-`FileIOCatalog`: each one reproduces on Iceberg's own `InMemoryCatalog`.
+Bugs in Apache Iceberg that this project's fuzzers found, and, from C15
+on, a review of Iceberg's commit retry paths that the fuzzers' finds
+prompted. None is in `FileIOCatalog`: each one reproduces on Iceberg's
+own `InMemoryCatalog`, directly or, for C21 and C22, by applying a
+client's updates through `CatalogHandlers` as a REST server does.
 This page records them for a rebase onto a newer Iceberg. Each issue also
 has a document of its own in [iceberg-issues/](iceberg-issues/), for
 reports or pull requests upstream. It covers the reproduction, the cause
 with links to the 1.12.0 source, the fix, its tests, and what to settle
 before a PR.
 
-Upstream fixed C1. The fork fixes C2 to C14 on branch `core-fixes`, each
+Upstream fixed C1. The fork fixes C2 to C22 on branch `core-fixes`, each
 in an upstream-style commit with its tests, so the project's tests no
 longer work around any of them.
 
@@ -44,7 +47,8 @@ cherry-picks onto it (C2's test file only after C7's). C8, found the same
 day, was fixed on `core-fixes` on 2026-10-19, as were C9 and C10, found
 that day; C9 was checked against main at `6890694bd`, C10 at
 `ddbd99073`. C11 to C14 were fixed on 2026-10-20 and checked against
-main at `3738f4a97`. The Fork column is
+main at `3738f4a97`. C15 to C22, from the review, were fixed the same
+day and checked against main at `834441b96`. The Fork column is
 `atomicio`, which sits on `core-fixes`.
 
 | Issue | Fork | 1.12.0 | main | Upstream |
@@ -63,6 +67,14 @@ main at `3738f4a97`. The Fork column is
 | C12. An expiry follows the GC and retention settings of when it was created | fixed, `core-fixes` 0824e0d | yes | yes | not reported |
 | C13. An expiry that committed reports a failure when its cleanup fails | fixed, `core-fixes` 7f3708a | yes | yes | not reported |
 | C14. A cherry-pick of a snapshot expired since it was picked fails with an NPE | fixed, `core-fixes` b1f2e01 | yes | yes | not reported |
+| C15. An expiry in a transaction deletes files before the transaction commits | fixed, `core-fixes` 44fce44 | yes | yes | not reported; a regression from [#13631](https://github.com/apache/iceberg/pull/13631), in 1.10.0 |
+| C16. A rollback undoes another writer's rollback | fixed, `core-fixes` 14d869e | yes | yes | not reported |
+| C17. Location and partition statistics updates fail after one concurrent commit | fixed, `core-fixes` b0669b6 | yes | yes | partition statistics: PR [#18204](https://github.com/apache/iceberg/pull/18204), open; location: not reported |
+| C18. Replace, overwrite and merge paths fail with an NPE on a removed spec | fixed, `core-fixes` 4692c71 | yes | yes | not reported |
+| C19. A sort order replaced after a rename fails with an NPE | fixed, `core-fixes` 7e4517f | yes | yes | not reported |
+| C20. A row delta whose starting snapshot expired fails with IllegalArgumentException | fixed, `core-fixes` b967a0a | yes | yes | not reported |
+| C21. Ref and spec removals applied to newer metadata lose a commit or a spec in use | fixed, `core-fixes` 517c1c4 | yes | yes | not reported |
+| C22. A snapshot removal applied to newer metadata drops a ref set since | fixed, `core-fixes` a2a7847 | yes | yes | not reported |
 
 "Not reported" means a search of apache/iceberg's issues and pull
 requests found nothing for the issue.
@@ -486,6 +498,164 @@ fast-forward.
 - **No workaround** to remove.
 - **Canary:** `aCherryPickOfASnapshotExpiredSincePickedFailsCleanly`.
 
+### C15. An expiry in a transaction deletes files before the transaction commits
+
+Details: [iceberg-issues/C15.md](iceberg-issues/C15.md).
+
+An expiry in a transaction deleted the files of the snapshots it removed
+when it was committed to the transaction. If the transaction failed,
+those snapshots stayed without their manifest lists; if it retried after
+a concurrent tag, the retry kept the tagged snapshot, whose files were
+gone.
+
+- **Cause:** `BaseTransaction.expireSnapshots()` lost its deferred
+  `deleteWith` in #13631 (1.10.0), and the deferral it had did not
+  handle a failed or retried transaction either.
+- **Found by:** the review of Iceberg's commit retry paths, 2026-10-20.
+  Reproduces on `TestTables`.
+- **Fork:** fixed on `core-fixes` by 44fce44, "Core: Clean up a transaction's
+  expired files once the transaction commits". Its tests are
+  `TestRemoveSnapshots.testTransactionExpiryDeletesNothingWhenTheTransactionFails`
+  and `testTransactionExpiryRetriedAfterConcurrentTag`.
+- **No workaround** to remove.
+- **Canary:** `aTransactionsExpiryDeletesFilesOnlyOnceItCommits`.
+
+### C16. A rollback undoes another writer's rollback, or fails with an NPE when its target expires
+
+Details: [iceberg-issues/C16.md](iceberg-issues/C16.md).
+
+`rollbackTo` checked that its target was an ancestor of main only when
+called. After another writer rolled main back further, the rollback
+moved main forward again. A target expired in between failed
+`rollbackTo` and `setCurrentSnapshot` with a `NullPointerException`.
+
+- **Cause:** `SetSnapshotOperation.apply()` checks ancestry again only
+  for `rollbackToTime`, and returns a null snapshot for an expired
+  target.
+- **Found by:** the review, 2026-10-20. Reproduces on `TestTables`.
+- **Fork:** fixed on `core-fixes` by 14d869e, "Core: Check a rollback's target
+  on each attempt". Its tests are in `TestSnapshotManager`
+  (`*Concurrent*`).
+- **No workaround** to remove.
+- **Canary:** `aRollbackDoesNotUndoAConcurrentRollbackPastIt`.
+
+### C17. Location and partition statistics updates fail after one concurrent commit
+
+Details: [iceberg-issues/C17.md](iceberg-issues/C17.md).
+
+`UpdateLocation`, for tables and views, refreshed once before its
+retries, and `UpdatePartitionStatistics` committed once without a
+refresh, so one concurrent commit failed them with
+`CommitFailedException`.
+
+- **Cause:** neither refreshes per attempt, as `SetStatistics` does since
+  #15148.
+- **Found by:** the review, 2026-10-20. PR #18204, open, fixes the
+  partition statistics part.
+- **Fork:** fixed on `core-fixes` by b0669b6, "Core: Refresh location and
+  partition statistics updates on each attempt". Its tests are in
+  `TestSetLocation`, `TestSetPartitionStatistics` and
+  `TestInMemoryViewCatalog`.
+- **No workaround** to remove.
+- **Canary:** `aLocationUpdateRetriesOnARefreshedTable`.
+
+### C18. A replace of partitions, an overwrite checking its filter, or a merge of appended manifests fails with an NPE on a removed spec
+
+Details: [iceberg-issues/C18.md](iceberg-issues/C18.md).
+
+Three paths looked up the spec of a commit's files before C11's checks,
+and failed with a `NullPointerException` when another writer had
+removed it: `ReplacePartitions`, `OverwriteFiles` with
+`validateAddedFilesMatchOverwriteFilter`, and the merge of appended
+manifests.
+
+- **Cause:** `MergingSnapshotProducer.dataSpec()` and the manifest merge
+  managers look the spec up without a check.
+- **Found by:** the review, 2026-10-20, of the paths C11 left.
+- **Fork:** fixed on `core-fixes` by 4692c71, "Core: Fail cleanly on a removed
+  spec in replace, overwrite and merge paths", with C11's
+  `specForNewFiles`. Its tests are in `TestReplacePartitions`,
+  `TestOverwrite` and `TestMergeAppend` (`*ConcurrentSpecRemoval`).
+- **No workaround** to remove.
+- **Canary:** `aReplaceOfPartitionsOfARemovedSpecFailsCleanly`.
+
+### C19. A sort order replaced after another writer renamed its column fails with an NPE
+
+Details: [iceberg-issues/C19.md](iceberg-issues/C19.md).
+
+`ReplaceSortOrder` binds its fields to the schema it is created with.
+After a concurrent rename of a sort column, the metadata builder looked
+the old name up in the new schema, and the commit failed with a
+`NullPointerException`.
+
+- **Cause:** `TableMetadata.freshSortOrder` maps fields by name from the
+  order's schema to the current one.
+- **Found by:** the review, 2026-10-20. Reproduces on `TestTables`.
+- **Fork:** fixed on `core-fixes` by 7e4517f, "Core: Bind a replaced sort order
+  to the schema each attempt commits on", by field id, as a REST server
+  binds it. Its tests are in `TestSortOrder` (`*AfterConcurrent*`).
+- **No workaround** to remove.
+- **Canary:** `aSortOrderReplacedAfterARenameDoesNotFail`.
+
+### C20. A row delta whose starting snapshot expired fails with IllegalArgumentException
+
+Details: [iceberg-issues/C20.md](iceberg-issues/C20.md).
+
+A row delta's check that its starting snapshot is an ancestor of the
+branch runs on each attempt's metadata, but failed with
+`IllegalArgumentException`, as for a bad argument, when another writer
+had expired the snapshot or rolled the branch back past it.
+
+- **Cause:** the check uses `Preconditions.checkArgument`.
+- **Found by:** the review, 2026-10-20. Reproduces on `TestTables`.
+- **Fork:** fixed on `core-fixes` by b967a0a, "Core: Fail a row delta whose
+  starting snapshot is gone with ValidationException". Its test is
+  `TestRowDelta.testValidateFromSnapshotExpiredConcurrently`.
+- **No workaround** to remove. (A4's `IllegalArgumentException` is a
+  different check, which upstream chose and tests.)
+- **Canary:** `aRowDeltaFromAnExpiredSnapshotFailsValidation`.
+
+### C21. Ref and spec removals applied to newer metadata lose a concurrent commit or remove a spec in use
+
+Details: [iceberg-issues/C21.md](iceberg-issues/C21.md).
+
+A REST server, and `FileIOCatalog.commitTransaction`, apply a commit's
+updates to the table's current metadata, checked by the requirements
+`UpdateRequirements` derives. A ref removal required nothing, so a
+branch rename racing a commit to the branch lost the commit. A spec or
+schema removal required every branch but main, so a commit of old-spec
+files to main that landed first left the table unscannable.
+
+- **Cause:** no requirement for `RemoveSnapshotRef`; `requireNoBranchesChanged`
+  skips main (#10755).
+- **Found by:** the review, 2026-10-20. Reproduces through
+  `CatalogHandlers` on `InMemoryCatalog`.
+- **Fork:** fixed on `core-fixes` by 517c1c4, "Core: Require the refs that ref
+  and spec removals depend on". Its tests are in `TestUpdateRequirements`.
+- **No workaround** to remove. Bug 69's check covers the opposite order
+  in `FileIOCatalog`.
+- **Canary:** `removalsAppliedToNewerMetadataRequireTheirRefs`.
+
+### C22. A snapshot removal applied to newer metadata drops a ref set since
+
+Details: [iceberg-issues/C22.md](iceberg-issues/C22.md).
+
+Removing snapshots from metadata also removes the refs that point to
+them. Applied to newer metadata, an expiry's removal dropped a tag
+another writer had created on an expired snapshot, or main after a
+rollback to one.
+
+- **Cause:** `TableMetadata.Builder.removeSnapshots` drops dangling refs,
+  and no requirement can say that no new ref points to a snapshot.
+- **Found by:** the review, 2026-10-20. Reproduces through
+  `CatalogHandlers` on `InMemoryCatalog`.
+- **Fork:** fixed on `core-fixes` by a2a7847, "Core: Fail to apply the removal
+  of a snapshot that a ref points to", with
+  `RetryableValidationException`, which a REST client retries. Its test is
+  `TestTableMetadata.testRemovingAReferencedSnapshotIsRetryable`.
+- **No workaround** to remove.
+- **Canary:** `aRemovalAppliedToNewerMetadataKeepsAConcurrentTag`.
+
 ## Accepted Iceberg Behavior
 
 The oracles accept these behaviors as Iceberg's semantics, not as
@@ -502,6 +672,16 @@ transaction saw at its start. PR #16943 (C3) would make a replace keep
 concurrent changes where it can. A release with it breaks that model,
 which should then expect the concurrent changes kept, and replace
 transactions can join the race property.
+
+The review of 2026-10-20 found more that a replace drops than the
+fuzzers model: a commit another writer made to a branch since the
+replace began (the branch goes back, and the snapshot is gone), tags
+created since, a `gc.enabled=false` set since (a later expiry may then
+delete files another table shares), and a format upgrade since (the
+replace downgrades the table, which the spec forbids). Upstream tracks
+these as [#16232](https://github.com/apache/iceberg/issues/16232), open;
+its fix in PR [#16289](https://github.com/apache/iceberg/pull/16289),
+which failed a replace on any concurrent change, was closed unmerged.
 
 ### A2. A create-or-replace that races a create fails
 

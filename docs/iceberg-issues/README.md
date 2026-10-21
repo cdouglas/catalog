@@ -1,6 +1,8 @@
 # Iceberg core issues, one document each
 
-Bugs in Apache Iceberg's core that fileio-catalog's fuzzers found. Each
+Bugs in Apache Iceberg's core that fileio-catalog's fuzzers found, and,
+from C15 on, a review of Iceberg's commit retry paths that their finds
+prompted. Each
 document covers the bug, a reproduction on Iceberg's own `InMemoryCatalog`,
 the cause with links to the 1.12.0 source, and the fix. It also lists the
 fix's tests, the workaround fileio-catalog dropped, its canary in
@@ -16,7 +18,9 @@ conflicts, and only if C7 isn't picked first, and C8's, if C6 isn't. C9,
 added 2026-10-19, cherry-picks onto `main` at `6890694bd` after C3; C10,
 added the same day, onto `ddbd99073` on its own. C11, added 2026-10-20,
 onto `3738f4a97` on its own, C12, the same day, after C10, and C13 after
-C10 and C12; C14 after C6 and C8.
+C10 and C12; C14 after C6 and C8. C15 to C22, from the review, onto
+`834441b96`: C16, C17, C19, C21 and C22 on their own, C15 after C10, C12
+and C13, and C18 and C20 after C11.
 
 | Issue | Fix | Before a PR |
 |---|---|---|
@@ -34,3 +38,11 @@ C10 and C12; C14 after C6 and C8.
 | [C12. An expiry follows the GC and retention settings its table had when it was created](C12.md) | [`0824e0d`](https://github.com/cdouglas/iceberg/commit/0824e0d62d00c16e4015b5ba61044b599f4f7b79) | ready; settle whether `now` should be per attempt |
 | [C13. An expiry that committed reports a failure when its file cleanup fails](C13.md) | [`7f3708a`](https://github.com/cdouglas/iceberg/commit/7f3708a2219a897bf5f5df81a39e845ea72c9580) | ready; the incremental-cleanup checks have the same flaw |
 | [C14. A cherry-pick of a snapshot expired since it was picked fails with a NullPointerException](C14.md) | [`b1f2e01`](https://github.com/cdouglas/iceberg/commit/b1f2e01e4d761d2725adbcd3a8896b6f7ada07ab) | ready |
+| [C15. An expiry in a transaction deletes files before the transaction commits](C15.md) | [`44fce44`](https://github.com/cdouglas/iceberg/commit/44fce44fa44468738dd6a56316307aedcf764453) | ready; cite the #13631 regression |
+| [C16. A rollback undoes another writer's rollback, or fails with an NPE when its target expires](C16.md) | [`14d869e`](https://github.com/cdouglas/iceberg/commit/14d869e9d4d0c135c736f775d26dbea9ce49f735) | ready |
+| [C17. Location and partition statistics updates fail after one concurrent commit](C17.md) | [`b0669b6`](https://github.com/cdouglas/iceberg/commit/b0669b67740742fdf9c56511d80ccb46557731ff) | coordinate with PR #18204 (partition statistics) |
+| [C18. A replace of partitions, an overwrite checking its filter, or a merge of appended manifests fails with an NPE on a removed spec](C18.md) | [`4692c71`](https://github.com/cdouglas/iceberg/commit/4692c719a5a8d796fa99b62518839ea63ba58360) | fold into C11's PR |
+| [C19. A sort order replaced after another writer renamed its column fails with an NPE](C19.md) | [`7e4517f`](https://github.com/cdouglas/iceberg/commit/7e4517f5d6acdccfcb2c60ae070e56d09ffba9a5) | ready; succeed (as REST does) or fail |
+| [C20. A row delta whose starting snapshot expired fails with IllegalArgumentException](C20.md) | [`b967a0a`](https://github.com/cdouglas/iceberg/commit/b967a0a857788117019d5dba37e4b2faddfda0b2) | ready |
+| [C21. Ref and spec removals applied to newer metadata lose a concurrent commit or remove a spec in use](C21.md) | [`517c1c4`](https://github.com/cdouglas/iceberg/commit/517c1c4a882f0b9613093947d5ed2bb92c35bac1) | more expiry conflicts with main; new branches still a gap |
+| [C22. A snapshot removal applied to newer metadata drops a ref set since](C22.md) | [`a2a7847`](https://github.com/cdouglas/iceberg/commit/a2a78474660be2204654565b40d2874344b8a7e5) | check other clients' `remove-snapshots` |

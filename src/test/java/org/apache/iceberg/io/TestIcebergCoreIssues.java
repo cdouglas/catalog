@@ -28,6 +28,7 @@ import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
 import org.apache.iceberg.AppendFiles;
@@ -66,7 +67,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
- * Canaries for the Iceberg core bugs this project's fuzzers found, C1 to C14 in
+ * Canaries for the Iceberg core bugs this project's fuzzers and reviews found, C1 to C22 in
  * docs/ICEBERG_ISSUES.md: one test each, on Iceberg's own InMemoryCatalog, that asserts the bug is
  * absent. Upstream fixed C1, and the fork's core-fixes branch fixes the others, so every test
  * passes against the fork. A test that fails means its bug is back: a rebase dropped the fork's
@@ -455,6 +456,225 @@ class TestIcebergCoreIssues {
     assertThat(catchThrowable(pick::commit))
         .as(BACK, "C14")
         .isNotInstanceOf(NullPointerException.class);
+  }
+
+  /**
+   * C15. An expiry in a transaction must not delete the files of the snapshots it removes before
+   * the transaction commits: a retry after another writer tagged one of them kept the snapshot,
+   * whose manifest list was gone.
+   */
+  @Test
+  void aTransactionsExpiryDeletesFilesOnlyOnceItCommits() throws InterruptedException {
+    InMemoryCatalog catalog = catalog();
+    Table table = catalog.createTable(ID, SCHEMA);
+    table.newFastAppend().appendFile(file("a")).commit();
+    long tagged = table.currentSnapshot().snapshotId();
+    table.newFastAppend().appendFile(file("b")).commit();
+    Thread.sleep(2);
+    long now = System.currentTimeMillis();
+    Transaction txn = table.newTransaction();
+    txn.expireSnapshots().expireOlderThan(now).retainLast(1).commit();
+
+    catalog.loadTable(ID).manageSnapshots().createTag("tag", tagged).commit();
+    txn.commitTransaction();
+
+    Table reloaded = catalog.loadTable(ID);
+    assertThat(reloaded.snapshot(tagged)).isNotNull();
+    assertThat(catchThrowable(() -> reloaded.snapshot(tagged).allManifests(reloaded.io())))
+        .as(BACK, "C15")
+        .isNull();
+  }
+
+  /**
+   * C16. A rollback must not move main forward past another writer's rollback to an older
+   * snapshot: rollbackTo checked that its target was an ancestor only when it was called.
+   */
+  @Test
+  void aRollbackDoesNotUndoAConcurrentRollbackPastIt() {
+    InMemoryCatalog catalog = catalog();
+    Table table = catalog.createTable(ID, SCHEMA);
+    table.newFastAppend().appendFile(file("a")).commit();
+    long first = table.currentSnapshot().snapshotId();
+    table.newFastAppend().appendFile(file("b")).commit();
+    long second = table.currentSnapshot().snapshotId();
+    table.newFastAppend().appendFile(file("c")).commit();
+    org.apache.iceberg.ManageSnapshots rollback = table.manageSnapshots().rollbackTo(second);
+
+    catalog.loadTable(ID).manageSnapshots().rollbackTo(first).commit();
+    catchThrowable(rollback::commit);
+
+    assertThat(catalog.loadTable(ID).currentSnapshot().snapshotId())
+        .as(BACK, "C16")
+        .isEqualTo(first);
+  }
+
+  /**
+   * C17. A location update must retry on the table as it is after another writer's commit:
+   * SetLocation refreshed once, before its retries, and committed on that metadata each time.
+   */
+  @Test
+  void aLocationUpdateRetriesOnARefreshedTable() {
+    InMemoryCatalog catalog = catalog();
+    Table table = catalog.createTable(ID, SCHEMA);
+    Table racing =
+        racing(table, () -> catalog.loadTable(ID).updateProperties().set("k", "v").commit());
+
+    assertThatCode(() -> racing.updateLocation().setLocation(table.location() + "-moved").commit())
+        .as(BACK, "C17")
+        .doesNotThrowAnyException();
+  }
+
+  /**
+   * C18. A replace of partitions whose spec another writer removed must fail cleanly: it looked the
+   * spec up before C11's check, and failed with a NullPointerException.
+   */
+  @Test
+  void aReplaceOfPartitionsOfARemovedSpecFailsCleanly() {
+    InMemoryCatalog catalog = catalog();
+    Table table = catalog.createTable(ID, SCHEMA);
+    org.apache.iceberg.ReplacePartitions replace =
+        table.newReplacePartitions().addFile(file("a"));
+
+    removeUnpartitionedSpec(catalog, ID);
+
+    assertThat(catchThrowable(replace::commit))
+        .as(BACK, "C18")
+        .isNotInstanceOf(NullPointerException.class);
+  }
+
+  /**
+   * C19. A sort order replaced after another writer renamed its column must not fail with a
+   * NullPointerException: the metadata builder looked the column up by its old name.
+   */
+  @Test
+  void aSortOrderReplacedAfterARenameDoesNotFail() {
+    InMemoryCatalog catalog = catalog();
+    Table table = catalog.createTable(ID, SCHEMA);
+    org.apache.iceberg.ReplaceSortOrder order = table.replaceSortOrder().asc("id");
+
+    catalog.loadTable(ID).updateSchema().renameColumn("id", "key").commit();
+
+    Throwable failure = catchThrowable(order::commit);
+    assertThat(failure instanceof NullPointerException).as(BACK, "C19").isFalse();
+  }
+
+  /**
+   * C20. A row delta whose starting snapshot another writer expired must fail with a validation
+   * failure, not an IllegalArgumentException as for a bad argument.
+   */
+  @Test
+  void aRowDeltaFromAnExpiredSnapshotFailsValidation() {
+    InMemoryCatalog catalog = catalog();
+    Table table =
+        catalog.buildTable(ID, SCHEMA).withProperty(TableProperties.FORMAT_VERSION, "2").create();
+    table.newFastAppend().appendFile(file("a")).commit();
+    long read = table.currentSnapshot().snapshotId();
+    org.apache.iceberg.RowDelta delta =
+        table
+            .newRowDelta()
+            .addRows(file("b"))
+            .validateFromSnapshot(read)
+            .validateNoConflictingDataFiles();
+
+    Table other = catalog.loadTable(ID);
+    other.newFastAppend().appendFile(file("c")).commit();
+    other.expireSnapshots().expireSnapshotId(read).commit();
+
+    assertThat(catchThrowable(delta::commit))
+        .as(BACK, "C20")
+        .isInstanceOf(ValidationException.class);
+  }
+
+  /**
+   * C21. Updates applied to a table's newer metadata, as a REST server applies them, must not lose
+   * a commit to a branch they rename, nor remove a spec that a commit to main since uses: the
+   * requirements derived for a ref removal named nothing, and those for a spec removal skipped
+   * main.
+   */
+  @Test
+  void removalsAppliedToNewerMetadataRequireTheirRefs() {
+    InMemoryCatalog catalog = catalog();
+    Table table = catalog.createTable(ID, SCHEMA);
+    table.newFastAppend().appendFile(file("a")).commit();
+    long first = table.currentSnapshot().snapshotId();
+    table.manageSnapshots().createBranch("b", first).commit();
+    TableMetadata base = ((HasTableOperations) table).operations().current();
+    TableMetadata renamed =
+        TableMetadata.buildFrom(base)
+            .removeRef("b")
+            .setRef("c", org.apache.iceberg.SnapshotRef.branchBuilder(first).build())
+            .build();
+
+    Table other = catalog.loadTable(ID);
+    other.newFastAppend().appendFile(file("b")).toBranch("b").commit();
+    long branchCommit = other.refs().get("b").snapshotId();
+    catchThrowable(() -> applyAsRestServer(catalog, base, renamed.changes()));
+
+    assertThat(catalog.loadTable(ID).refs().values())
+        .as(BACK, "C21")
+        .extracting(org.apache.iceberg.SnapshotRef::snapshotId)
+        .contains(branchCommit);
+
+    // a spec removal, computed before the table's first commit, which adds a file of the spec
+    TableIdentifier id = TableIdentifier.of("ns", "specs");
+    Table specs = catalog.createTable(id, SCHEMA);
+    specs.updateSpec().addField("id").commit();
+    TableMetadata unpartitioned = ((HasTableOperations) specs).operations().current();
+    catalog.loadTable(id).newFastAppend().appendFile(file("c")).commit();
+    catchThrowable(
+        () ->
+            applyAsRestServer(
+                catalog,
+                id,
+                unpartitioned,
+                List.of(new org.apache.iceberg.MetadataUpdate.RemovePartitionSpecs(Set.of(0)))));
+
+    assertThat(catalog.loadTable(id).specs()).as(BACK, "C21").containsKey(0);
+  }
+
+  /**
+   * C22. A snapshot removal applied to a table's newer metadata, as a REST server applies an
+   * expiry's updates, must not drop a ref another writer set on the snapshot since: removing a
+   * snapshot removed the refs that point to it.
+   */
+  @Test
+  void aRemovalAppliedToNewerMetadataKeepsAConcurrentTag() {
+    InMemoryCatalog catalog = catalog();
+    Table table = catalog.createTable(ID, SCHEMA);
+    table.newFastAppend().appendFile(file("a")).commit();
+    long expired = table.currentSnapshot().snapshotId();
+    table.newFastAppend().appendFile(file("b")).commit();
+    TableMetadata base = ((HasTableOperations) table).operations().current();
+
+    catalog.loadTable(ID).manageSnapshots().createTag("tag", expired).commit();
+    catchThrowable(
+        () ->
+            applyAsRestServer(
+                catalog,
+                base,
+                List.of(new org.apache.iceberg.MetadataUpdate.RemoveSnapshots(Set.of(expired)))));
+
+    Table reloaded = catalog.loadTable(ID);
+    assertThat(reloaded.refs()).as(BACK, "C22").containsKey("tag");
+    assertThat(reloaded.snapshot(expired)).as(BACK, "C22").isNotNull();
+  }
+
+  /** Applies updates computed on {@code base}, as a REST server applies a client's commit. */
+  private static void applyAsRestServer(
+      InMemoryCatalog catalog, TableMetadata base, List<org.apache.iceberg.MetadataUpdate> updates) {
+    applyAsRestServer(catalog, ID, base, updates);
+  }
+
+  private static void applyAsRestServer(
+      InMemoryCatalog catalog,
+      TableIdentifier id,
+      TableMetadata base,
+      List<org.apache.iceberg.MetadataUpdate> updates) {
+    org.apache.iceberg.rest.CatalogHandlers.updateTable(
+        catalog,
+        id,
+        org.apache.iceberg.rest.requests.UpdateTableRequest.create(
+            id, org.apache.iceberg.UpdateRequirements.forUpdateTable(base, updates), updates));
   }
 
   /** As another writer, partitions an unpartitioned table and expires its unpartitioned spec. */
