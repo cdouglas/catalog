@@ -34,6 +34,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.inmemory.InMemoryInputFile;
+import org.intentlog.DedupHorizonExceededException;
+import org.intentlog.wire.UuidV7;
 import org.junit.jupiter.api.Test;
 
 /**

@@ -25,6 +25,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -54,7 +55,6 @@ public class TestFormatExplorer {
   static {
     Map<String, String> codec = new LinkedHashMap<>();
     codec.put("CHECKPOINT_", "Checkpoint");
-    codec.put("COMMITTED_TXNS_", "CommittedTransactions");
     codec.put("NS_", "Namespace");
     codec.put("TBL_", "Table");
     codec.put("NSPROP_", "NamespaceProperty");
@@ -76,6 +76,10 @@ public class TestFormatExplorer {
     codec.put("CREATE_INLINE_TBL_", "CreateTableInline");
     codec.put("RENAME_TBL_", "RenameTable");
     PREFIXES.put("ProtoCodec", codec);
+
+    Map<String, String> committed = new LinkedHashMap<>();
+    committed.put("COMMITTED_TXNS_", "CommittedTransactions");
+    PREFIXES.put("CommittedSetCodec", committed);
 
     Map<String, String> delta = new LinkedHashMap<>();
     delta.put("DELTA_", "TableMetadataDelta");
@@ -132,9 +136,7 @@ public class TestFormatExplorer {
     List<String> problems = new ArrayList<>();
     Map<String, Set<Integer>> numbered = new LinkedHashMap<>();
     for (Map.Entry<String, Map<String, String>> codec : PREFIXES.entrySet()) {
-      String source =
-          Files.readString(
-              Paths.get("src/main/java/org/apache/iceberg/io/" + codec.getKey() + ".java"));
+      String source = Files.readString(source(codec.getKey()));
       Matcher m =
           Pattern.compile("static\\s+final\\s+int\\s+([A-Z][A-Z0-9_]*)\\s*=\\s*(-?\\d+)\\s*;")
               .matcher(source);
@@ -197,6 +199,13 @@ public class TestFormatExplorer {
       }
     }
     assertThat(problems).isEmpty();
+  }
+
+  /** The source of a codec: this module's, or intentlog-core's for the committed set. */
+  private static Path source(String codec) {
+    return codec.equals("CommittedSetCodec")
+        ? Paths.get("../intentlog-core/src/main/java/org/intentlog/wire/CommittedSetCodec.java")
+        : Paths.get("src/main/java/org/apache/iceberg/io/" + codec + ".java");
   }
 
   /**

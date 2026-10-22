@@ -19,25 +19,19 @@
 package org.apache.iceberg.io;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import java.io.ByteArrayInputStream;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
-import java.util.List;
 import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
+import org.intentlog.wire.UuidV7;
 import org.junit.jupiter.api.Test;
 
 /**
- * Round-trip and defensive-decode tests for the compressed
- * {@code CommittedTransactions} sub-message that backs
- * {@code Checkpoint.committed_transaction_ids}.
+ * The committed set through the checkpoint codec. The set's own round-trip and
+ * defensive-decode tests are intentlog-core's.
  */
 class TestCommittedTransactions {
 
@@ -47,114 +41,6 @@ class TestCommittedTransactions {
     @Override public String location() { return "test://committed-txns"; }
     @Override public boolean exists() { return false; }
   };
-
-  @Test
-  void emptySetRoundTrips() throws IOException {
-    byte[] body = ProtoCodec.encodeCommittedTransactions(java.util.Collections.emptyList());
-    ProtoCatalogFile cat = ProtoCatalogFile.builder(LOC)
-        .setCommittedTransactionsBytes(body)
-        .build();
-    assertThat(cat.committedTransactions()).isEmpty();
-  }
-
-  @Test
-  void singleEntryRoundTrips() throws IOException {
-    UUID u = UuidV7.newUuidV7();
-    Set<UUID> recovered = roundTripImpl(java.util.List.of(u));
-    assertThat(recovered).containsExactly(u);
-  }
-
-  @Test
-  void tenEntriesRoundTrip() throws IOException {
-    Random rand = new Random(0xCAFE);
-    Set<UUID> input = new LinkedHashSet<>();
-    long ts = System.currentTimeMillis();
-    for (int i = 0; i < 10; i++) {
-      input.add(UuidV7.newUuidV7(ts + i * 17, rand));
-    }
-    Set<UUID> recovered = roundTripImpl(input);
-    assertThat(recovered).isEqualTo(input);
-  }
-
-  @Test
-  void thousandEntriesRoundTrip() throws IOException {
-    Random rand = new Random(0xBEEF);
-    Set<UUID> input = new LinkedHashSet<>();
-    long base = System.currentTimeMillis();
-    for (int i = 0; i < 1000; i++) {
-      input.add(UuidV7.newUuidV7(base + rand.nextInt(60_000), rand));
-    }
-    Set<UUID> recovered = roundTripImpl(input);
-    assertThat(recovered).hasSize(input.size()).isEqualTo(input);
-  }
-
-  @Test
-  void determinismIndependentOfIterationOrder() throws IOException {
-    Random rand = new Random(0xD00D);
-    java.util.List<UUID> list = new ArrayList<>();
-    long base = System.currentTimeMillis();
-    for (int i = 0; i < 50; i++) {
-      list.add(UuidV7.newUuidV7(base + i * 13, rand));
-    }
-    byte[] forward = ProtoCodec.encodeCommittedTransactions(list);
-    java.util.List<UUID> reversed = new ArrayList<>(list);
-    Collections.reverse(reversed);
-    byte[] reversedBytes = ProtoCodec.encodeCommittedTransactions(reversed);
-    assertThat(forward).as("encode is sort-stable: same set should produce identical bytes")
-        .isEqualTo(reversedBytes);
-  }
-
-  @Test
-  void compactnessAtThousandEntries() throws IOException {
-    Random rand = new Random(0xABCD);
-    java.util.List<UUID> input = new ArrayList<>();
-    long base = System.currentTimeMillis();
-    // Clustered within 60s — typical commit traffic.
-    for (int i = 0; i < 1000; i++) {
-      input.add(UuidV7.newUuidV7(base + rand.nextInt(60_000), rand));
-    }
-    byte[] body = ProtoCodec.encodeCommittedTransactions(input);
-    // Status quo would be 1000 * 18 = 18000 bytes (with framing). Compressed
-    // body should be substantially smaller. Allow up to 13.5 bytes/entry to
-    // stay robust across distributions.
-    assertThat(body.length).isLessThan(1000 * 14);
-  }
-
-  @Test
-  void truncatedPackedEntryThrows() throws IOException {
-    // Hand-craft a payload whose packed_entries blob declares a delta but
-    // doesn't include the expected 10 random bytes after it. Field tags:
-    //   field 1, fixed64 (wire 1):     tag 0x09
-    //   field 2, length-delim (wire 2): tag 0x12
-    java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
-    out.write(0x09);
-    for (int i = 0; i < 8; i++) out.write(0);
-    out.write(0x12);
-    // packed_entries length = 4: one delta varint (0x00 = 0), then only 3
-    // random bytes — should be 10. Decode must reject.
-    out.write(4);
-    out.write(0);
-    out.write(0);
-    out.write(0);
-    out.write(0);
-    byte[] body = out.toByteArray();
-
-    assertThatThrownBy(() -> ProtoCodec.decodeCommittedTransactions(body))
-        .isInstanceOf(IOException.class)
-        .hasMessageContaining("CommittedTransactions");
-  }
-
-  @Test
-  void roundTripPreservesUuidValuesExactly() throws IOException {
-    // Use canonical fixture UUIDs the project uses elsewhere (all v7-shaped).
-    java.util.List<UUID> input = java.util.List.of(
-        UUID.fromString("01900000-0000-7000-8000-000000000001"),
-        UUID.fromString("01900000-0000-7000-8000-000000000071"),
-        UUID.fromString("01900000-0000-7000-8000-000000000081"),
-        UUID.fromString("01900000-0000-7fff-bfff-ffffffffffff"));
-    Set<UUID> recovered = roundTripImpl(input);
-    assertThat(recovered).containsExactlyInAnyOrderElementsOf(input);
-  }
 
   @Test
   void fullCheckpointRoundTripWithCommittedSet() throws IOException {
@@ -186,23 +72,5 @@ class TestCommittedTransactions {
     ProtoCatalogFile decoded = decodedBuilder.build();
 
     assertThat(new HashSet<>(decoded.committedTransactions())).isEqualTo(txns);
-  }
-
-  // ============================================================
-  // Helpers
-  // ============================================================
-
-  /**
-   * Round-trip via the bulk-load Builder path used by readInternal: encode
-   * the input set, install the bytes on a fresh Builder via
-   * setCommittedTransactionsBytes, and recover the canonical Set through
-   * the resulting ProtoCatalogFile's lazy committedTransactions() getter.
-   */
-  private static Set<UUID> roundTripImpl(java.util.Collection<UUID> input) throws IOException {
-    byte[] body = ProtoCodec.encodeCommittedTransactions(input);
-    ProtoCatalogFile cat = ProtoCatalogFile.builder(LOC)
-        .setCommittedTransactionsBytes(body)
-        .build();
-    return new HashSet<>(cat.committedTransactions());
   }
 }

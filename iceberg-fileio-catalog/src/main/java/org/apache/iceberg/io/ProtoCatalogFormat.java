@@ -38,6 +38,8 @@ import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.CommitStateUnknownException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.intentlog.DedupHorizonExceededException;
+import org.intentlog.wire.UuidV7;
 
 /**
  * Protobuf-based catalog format with checkpoint + append log structure.

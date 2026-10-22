@@ -158,7 +158,7 @@ the wire bytes in a single linear pass without materializing the set:
 the catalog file holds the inner-message bytes directly (no
 `HashSet<UUID>`). A read that applies no log records keeps the
 checkpoint's bytes as they are; one that applies records merges their
-ids in (`ProtoCodec.rewriteCommittedBytes`). A CAS copies the bytes into
+ids in (`CommittedSetCodec.rewrite`, in intentlog-core). A CAS copies the bytes into
 its checkpoint unchanged only when GC is off; otherwise it rewrites them
 on every CAS (see below).
 
@@ -234,7 +234,7 @@ The log records of the file being replaced are in `base`'s set by then,
 so they are as eligible for GC as the checkpoint's own entries. Only the
 compacting commit's record, which follows the new checkpoint, is outside
 the pass; its id joins the set when a read replays it. Both passes are
-`ProtoCodec.rewriteCommittedBytes`, one linear walk of the descending
+`CommittedSetCodec.rewrite` (intentlog-core), one linear walk of the descending
 entries: the merge at read with no watermark, the filter at CAS with no
 additions.
 

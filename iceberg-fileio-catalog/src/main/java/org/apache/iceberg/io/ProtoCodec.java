@@ -18,6 +18,21 @@
  */
 package org.apache.iceberg.io;
 
+import static org.intentlog.wire.ProtoWire.bytesToUuid;
+import static org.intentlog.wire.ProtoWire.readFixed64;
+import static org.intentlog.wire.ProtoWire.readLengthDelimitedBytes;
+import static org.intentlog.wire.ProtoWire.readString;
+import static org.intentlog.wire.ProtoWire.readVarint;
+import static org.intentlog.wire.ProtoWire.readVarint64;
+import static org.intentlog.wire.ProtoWire.skipField;
+import static org.intentlog.wire.ProtoWire.uuidToBytes;
+import static org.intentlog.wire.ProtoWire.writeBytes;
+import static org.intentlog.wire.ProtoWire.writeFixed64;
+import static org.intentlog.wire.ProtoWire.writeLengthDelimited;
+import static org.intentlog.wire.ProtoWire.writeString;
+import static org.intentlog.wire.ProtoWire.writeVarint;
+import static org.intentlog.wire.ProtoWire.writeVarint64;
+
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -25,7 +40,6 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -42,6 +56,8 @@ import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+import org.intentlog.wire.CommittedSetCodec;
+import org.intentlog.wire.UuidV7;
 
 /**
  * Protobuf encoding/decoding for catalog state.
@@ -71,9 +87,6 @@ public class ProtoCodec {
   public static final int SUPPORTED_READER_VERSION = 1;
 
   // Wire types
-  private static final int WIRE_VARINT = 0;
-  private static final int WIRE_64BIT = 1;
-  private static final int WIRE_LENGTH_DELIMITED = 2;
 
   // Checkpoint field numbers (from catalog.proto)
   private static final int CHECKPOINT_CATALOG_UUID = 1;
@@ -99,9 +112,6 @@ public class ProtoCodec {
   // Entries are interleaved (varint delta + 10 random bytes per entry,
   // back-to-back) into a single packed_entries blob so the scanner can walk
   // the wire bytes in one linear pass without allocating intermediates.
-  private static final int COMMITTED_TXNS_MAX_TIMESTAMP_MS = 1;
-  private static final int COMMITTED_TXNS_PACKED_ENTRIES = 2;
-  private static final int COMMITTED_TXNS_HIGHEST_DROPPED_TIMESTAMP_MS = 3;
 
   // Namespace field numbers
   private static final int NS_ID = 1;
@@ -338,14 +348,14 @@ public class ProtoCodec {
 
       // Committed transactions (compressed UUIDv7 set, see CommittedTransactions
       // proto). The catalog file stores the inner-message bytes directly. When
-      // dropBeforeTimestampMs > 0, this is also the GC site: rewriteCommittedBytes
+      // dropBeforeTimestampMs > 0, this is also the GC site: CommittedSetCodec.rewrite
       // drops inherited entries whose v7 timestamp is below the watermark and
       // updates highest_dropped_timestamp_ms accordingly. Empty set with no
       // horizon is omitted for wire-byte parity with the prior encoding.
       byte[] inheritedBytes = original.committedTransactionsBytes();
       byte[] committedBytes =
           dropBeforeTimestampMs > 0L
-              ? rewriteCommittedBytes(
+              ? CommittedSetCodec.rewrite(
                   inheritedBytes, java.util.Collections.emptyList(), dropBeforeTimestampMs)
               : inheritedBytes;
       if (committedBytes.length > 0) {
@@ -419,438 +429,6 @@ public class ProtoCodec {
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
-  }
-
-  /**
-   * Encodes a UUIDv7 set as a {@code CommittedTransactions} sub-message body
-   * with no GC horizon. See {@link #encodeCommittedTransactions(java.util.Collection, long)}
-   * for the GC-aware variant.
-   */
-  static byte[] encodeCommittedTransactions(java.util.Collection<UUID> txns)
-      throws IOException {
-    return encodeCommittedTransactions(txns, 0L);
-  }
-
-  /**
-   * Encodes a UUIDv7 set as a {@code CommittedTransactions} sub-message body.
-   * Sorts entries descending by UUID (= descending by timestamp for v7),
-   * emits {@code max_timestamp_ms}, then a single packed bytes field whose
-   * payload is the interleaved (varint delta + 10 random bytes) per entry,
-   * and optionally a {@code highest_dropped_timestamp_ms} field when the
-   * caller has performed a GC pass.
-   *
-   * <p>Caller is responsible for omitting the outer field when the set is empty
-   * AND the horizon is zero (i.e., no observable state to record).
-   */
-  static byte[] encodeCommittedTransactions(java.util.Collection<UUID> txns,
-                                             long highestDroppedTimestampMs)
-      throws IOException {
-    UUID[] sorted = txns.toArray(new UUID[0]);
-    java.util.Arrays.sort(sorted, (a, b) -> b.compareTo(a));
-    ByteArrayOutputStream out = new ByteArrayOutputStream();
-    long maxTs = sorted.length == 0 ? 0L : UuidV7.timestampMs(sorted[0]);
-    writeFixed64(out, COMMITTED_TXNS_MAX_TIMESTAMP_MS, maxTs);
-
-    ByteArrayOutputStream packed = new ByteArrayOutputStream(13 * sorted.length);
-    long prev = maxTs;
-    for (UUID u : sorted) {
-      long ts = UuidV7.timestampMs(u);
-      writeRawVarint64(packed, prev - ts);
-      prev = ts;
-      packed.write(UuidV7.packRandomBits(u));
-    }
-    writeBytes(out, COMMITTED_TXNS_PACKED_ENTRIES, packed.toByteArray());
-    if (highestDroppedTimestampMs != 0L) {
-      writeFixed64(out, COMMITTED_TXNS_HIGHEST_DROPPED_TIMESTAMP_MS, highestDroppedTimestampMs);
-    }
-    return out.toByteArray();
-  }
-
-  /**
-   * Single-pass rewrite of an inherited {@code CommittedTransactions} body.
-   * Streams the inherited entries in descending order, drops any whose
-   * {@code timestamp_ms <= dropBeforeTimestampMs} (updating
-   * {@code highest_dropped_timestamp_ms}), and merges in the supplied
-   * additions in descending order. Additions are emitted unconditionally —
-   * the caller's invariant is that they correspond to just-applied log
-   * transactions which must remain queryable regardless of the watermark.
-   *
-   * <p>An exact-duplicate addition (same UUID as an inherited entry) is
-   * deduped: the merged output emits a single copy.
-   *
-   * <p>Returns an empty byte array iff there are no entries to emit AND the
-   * resulting {@code highest_dropped_timestamp_ms} is zero (no observable
-   * state). Otherwise returns the encoded body — including a horizon-only
-   * body when every entry was dropped but the horizon is non-zero, so that
-   * monotonicity is preserved across subsequent compactions.
-   */
-  static byte[] rewriteCommittedBytes(
-      byte[] inheritedBytes,
-      java.util.Collection<UUID> addUnconditionally,
-      long dropBeforeTimestampMs) {
-    UUID[] adds = addUnconditionally.toArray(new UUID[0]);
-    long[] addTs = new long[adds.length];
-    byte[][] addRand = new byte[adds.length][];
-    for (int i = 0; i < adds.length; i++) {
-      Preconditions.checkArgument(UuidV7.isV7(adds[i]),
-          "Committed transaction IDs must be UUIDv7; got %s", adds[i]);
-      addTs[i] = UuidV7.timestampMs(adds[i]);
-      addRand[i] = UuidV7.packRandomBits(adds[i]);
-    }
-    // Sort additions descending: by ts desc, then by packed-random desc
-    // (lexicographic unsigned matches UUID.compareTo for v7 — see UuidV7).
-    Integer[] addIdx = new Integer[adds.length];
-    for (int i = 0; i < adds.length; i++) {
-      addIdx[i] = i;
-    }
-    java.util.Arrays.sort(addIdx, (a, b) -> {
-      int c = Long.compare(addTs[b], addTs[a]);
-      if (c != 0) return c;
-      for (int k = 0; k < 10; k++) {
-        int d = (addRand[b][k] & 0xFF) - (addRand[a][k] & 0xFF);
-        if (d != 0) return d;
-      }
-      return 0;
-    });
-    long[] sortedAddTs = new long[adds.length];
-    byte[][] sortedAddRand = new byte[adds.length][];
-    for (int i = 0; i < adds.length; i++) {
-      sortedAddTs[i] = addTs[addIdx[i]];
-      sortedAddRand[i] = addRand[addIdx[i]];
-    }
-
-    // Parse the inherited body's top-level fields.
-    long prevMaxTs = 0L;
-    int packedStart = -1;
-    int packedEnd = -1;
-    long prevHorizon = 0L;
-    if (inheritedBytes.length > 0) {
-      try {
-        ByteArrayInputStream in = new ByteArrayInputStream(inheritedBytes);
-        while (in.available() > 0) {
-          int tag = readVarint(in);
-          int fieldNumber = tag >>> 3;
-          int wireType = tag & 0x7;
-          switch (fieldNumber) {
-            case COMMITTED_TXNS_MAX_TIMESTAMP_MS:
-              prevMaxTs = readFixed64(in);
-              break;
-            case COMMITTED_TXNS_PACKED_ENTRIES:
-              int len = readVarint(in);
-              packedStart = inheritedBytes.length - in.available();
-              packedEnd = packedStart + len;
-              long skipped = in.skip(len);
-              if (skipped != len) {
-                throw new IOException(
-                    "Truncated CommittedTransactions: expected " + len
-                        + " packed bytes, got " + skipped);
-              }
-              break;
-            case COMMITTED_TXNS_HIGHEST_DROPPED_TIMESTAMP_MS:
-              prevHorizon = readFixed64(in);
-              break;
-            default:
-              skipField(in, wireType);
-          }
-        }
-      } catch (IOException e) {
-        throw new UncheckedIOException(e);
-      }
-    }
-
-    // Two-pointer merge of inherited entries (in descending order) against
-    // the sorted additions. Output is buffered in (ts, rand) parallel arrays
-    // because we don't know max_timestamp_ms until we've seen the first
-    // emitted entry.
-    int inheritedUpper = packedStart < 0 ? 0 : ((packedEnd - packedStart) / 11) + 1;
-    int capacity = inheritedUpper + adds.length;
-    long[] outTs = new long[capacity];
-    byte[][] outRand = new byte[capacity][];
-    int outCount = 0;
-    long newHorizon = prevHorizon;
-
-    long ts = prevMaxTs;
-    int off = packedStart < 0 ? 0 : packedStart;
-    int end = packedStart < 0 ? 0 : packedEnd;
-    int aPtr = 0;
-
-    while (off < end) {
-      // Decode next inherited entry: varint delta + 10 random bytes.
-      long delta = 0L;
-      int shift = 0;
-      while (true) {
-        if (off >= end) {
-          throw new UncheckedIOException(new IOException(
-              "Malformed CommittedTransactions: truncated varint"));
-        }
-        int b = inheritedBytes[off++] & 0xFF;
-        delta |= ((long) (b & 0x7F)) << shift;
-        if ((b & 0x80) == 0) break;
-        shift += 7;
-      }
-      ts -= delta;
-      if (off + 10 > end) {
-        throw new UncheckedIOException(new IOException(
-            "Malformed CommittedTransactions: truncated random bytes"));
-      }
-      int randOff = off;
-      off += 10;
-
-      // Emit any additions strictly greater than the inherited entry first.
-      while (aPtr < sortedAddTs.length
-          && compareTsRand(sortedAddTs[aPtr], sortedAddRand[aPtr],
-              ts, inheritedBytes, randOff) > 0) {
-        outTs[outCount] = sortedAddTs[aPtr];
-        outRand[outCount] = sortedAddRand[aPtr];
-        outCount++;
-        aPtr++;
-      }
-
-      if (ts <= dropBeforeTimestampMs) {
-        // Drop this inherited entry; the addition (if any) at the same key
-        // still stands and will be emitted from the addition stream.
-        if (ts > newHorizon) {
-          newHorizon = ts;
-        }
-      } else {
-        // Dedup: an addition equal to this inherited entry collapses to one.
-        if (aPtr < sortedAddTs.length
-            && compareTsRand(sortedAddTs[aPtr], sortedAddRand[aPtr],
-                ts, inheritedBytes, randOff) == 0) {
-          aPtr++;
-        }
-        outTs[outCount] = ts;
-        byte[] copy = new byte[10];
-        System.arraycopy(inheritedBytes, randOff, copy, 0, 10);
-        outRand[outCount] = copy;
-        outCount++;
-      }
-    }
-
-    // Drain remaining additions (older than the smallest inherited entry, or
-    // older-than-watermark inherited that got dropped left holes in the
-    // descending stream — additions still survive unconditionally).
-    while (aPtr < sortedAddTs.length) {
-      outTs[outCount] = sortedAddTs[aPtr];
-      outRand[outCount] = sortedAddRand[aPtr];
-      outCount++;
-      aPtr++;
-    }
-
-    if (outCount == 0 && newHorizon == 0L) {
-      return new byte[0];
-    }
-
-    try {
-      ByteArrayOutputStream out = new ByteArrayOutputStream();
-      long maxTs = outCount > 0 ? outTs[0] : 0L;
-      writeFixed64(out, COMMITTED_TXNS_MAX_TIMESTAMP_MS, maxTs);
-
-      ByteArrayOutputStream packed = new ByteArrayOutputStream(13 * outCount);
-      long prev = maxTs;
-      for (int i = 0; i < outCount; i++) {
-        long entryTs = outTs[i];
-        writeRawVarint64(packed, prev - entryTs);
-        prev = entryTs;
-        packed.write(outRand[i]);
-      }
-      writeBytes(out, COMMITTED_TXNS_PACKED_ENTRIES, packed.toByteArray());
-
-      if (newHorizon != 0L) {
-        writeFixed64(out, COMMITTED_TXNS_HIGHEST_DROPPED_TIMESTAMP_MS, newHorizon);
-      }
-      return out.toByteArray();
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
-    }
-  }
-
-  /**
-   * Compares an addition entry {@code (aTs, aRand)} against an inherited entry
-   * stored in {@code body[bOff..bOff+10)} with timestamp {@code bTs}. Negative
-   * iff a < b, zero iff equal, positive iff a > b.
-   */
-  private static int compareTsRand(long aTs, byte[] aRand, long bTs, byte[] body, int bOff) {
-    if (aTs != bTs) {
-      return Long.compare(aTs, bTs);
-    }
-    for (int i = 0; i < 10; i++) {
-      int cmp = (aRand[i] & 0xFF) - (body[bOff + i] & 0xFF);
-      if (cmp != 0) return cmp;
-    }
-    return 0;
-  }
-
-  /**
-   * Scans the inner {@code CommittedTransactions} body for a v7 UUID. Returns
-   * true iff the set contains the query. Walks the wire bytes linearly with
-   * no per-call allocation: tracks the running timestamp by summing varint
-   * deltas, compares the random-bits region of each entry against the
-   * query's packed bits in place, and exits early when the running timestamp
-   * passes the query's timestamp (descending order).
-   *
-   * <p>Returns false for non-v7 queries (the dedup set only stores v7 IDs).
-   */
-  static boolean committedSetContains(byte[] body, UUID query) {
-    if (body.length == 0 || !UuidV7.isV7(query)) {
-      return false;
-    }
-    long queryTs = UuidV7.timestampMs(query);
-    byte[] queryRand = UuidV7.packRandomBits(query);
-    try {
-      ByteArrayInputStream in = new ByteArrayInputStream(body);
-      long maxTs = 0L;
-      int packedStart = -1;
-      int packedEnd = -1;
-      while (in.available() > 0) {
-        int tag = readVarint(in);
-        int fieldNumber = tag >>> 3;
-        int wireType = tag & 0x7;
-        switch (fieldNumber) {
-          case COMMITTED_TXNS_MAX_TIMESTAMP_MS:
-            maxTs = readFixed64(in);
-            break;
-          case COMMITTED_TXNS_PACKED_ENTRIES:
-            int len = readVarint(in);
-            packedStart = body.length - in.available();
-            packedEnd = packedStart + len;
-            in.skip(len);
-            break;
-          // COMMITTED_TXNS_HIGHEST_DROPPED_TIMESTAMP_MS: ignored here; the
-          // membership predicate doesn't consult the horizon. The horizon-aware
-          // tri-state result lives in ProtoCatalogFile.containsTransaction,
-          // which calls committedSetHorizon on a miss.
-          default:
-            skipField(in, wireType);
-        }
-      }
-      if (packedStart < 0 || queryTs > maxTs) {
-        return false;
-      }
-      long ts = maxTs;
-      int off = packedStart;
-      while (off < packedEnd) {
-        // Inline varint read to avoid wrapping with InputStream.
-        long delta = 0;
-        int shift = 0;
-        while (true) {
-          int b = body[off++] & 0xFF;
-          delta |= ((long) (b & 0x7F)) << shift;
-          if ((b & 0x80) == 0) break;
-          shift += 7;
-        }
-        ts -= delta;
-        if (off + 10 > packedEnd) {
-          return false; // malformed; treat as not-contained
-        }
-        if (ts == queryTs && randomMatches(body, off, queryRand)) {
-          return true;
-        }
-        if (ts < queryTs) {
-          return false; // descending order: any further entries are older
-        }
-        off += 10;
-      }
-      return false;
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
-    }
-  }
-
-  /**
-   * Reads the {@code highest_dropped_timestamp_ms} field from a committed-set
-   * body. Returns 0 when the body is empty, the field is absent, or no GC has
-   * ever fired on this set. Walks only the top-level fields and skips the
-   * (potentially large) {@code packed_entries} payload, so this is cheap.
-   */
-  static long committedSetHorizon(byte[] body) {
-    if (body.length == 0) {
-      return 0L;
-    }
-    try {
-      ByteArrayInputStream in = new ByteArrayInputStream(body);
-      long horizon = 0L;
-      while (in.available() > 0) {
-        int tag = readVarint(in);
-        int fieldNumber = tag >>> 3;
-        int wireType = tag & 0x7;
-        if (fieldNumber == COMMITTED_TXNS_HIGHEST_DROPPED_TIMESTAMP_MS) {
-          horizon = readFixed64(in);
-        } else {
-          skipField(in, wireType);
-        }
-      }
-      return horizon;
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
-    }
-  }
-
-  private static boolean randomMatches(byte[] body, int off, byte[] query) {
-    for (int i = 0; i < 10; i++) {
-      if (body[off + i] != query[i]) return false;
-    }
-    return true;
-  }
-
-  /**
-   * Decodes a {@code CommittedTransactions} body into the canonical {@code Set<UUID>}.
-   * Used by the {@code committedTransactions()} bulk-getter and during merge in
-   * {@code Builder.build()}; not on the query hot path.
-   */
-  static java.util.LinkedHashSet<UUID> decodeCommittedTransactions(byte[] body)
-      throws IOException {
-    java.util.LinkedHashSet<UUID> out = new java.util.LinkedHashSet<>();
-    if (body.length == 0) {
-      return out;
-    }
-    ByteArrayInputStream in = new ByteArrayInputStream(body);
-    long maxTs = 0L;
-    byte[] packed = new byte[0];
-    while (in.available() > 0) {
-      int tag = readVarint(in);
-      int fieldNumber = tag >>> 3;
-      int wireType = tag & 0x7;
-      switch (fieldNumber) {
-        case COMMITTED_TXNS_MAX_TIMESTAMP_MS:
-          maxTs = readFixed64(in);
-          break;
-        case COMMITTED_TXNS_PACKED_ENTRIES:
-          packed = readLengthDelimitedBytes(in);
-          break;
-        // COMMITTED_TXNS_HIGHEST_DROPPED_TIMESTAMP_MS: skipped — this bulk
-        // entrypoint surfaces only the entries, not the GC horizon. Callers
-        // that need the horizon use committedSetHorizon (cheap) or peek at
-        // it during a single-pass merge in rewriteCommittedBytes.
-        default:
-          skipField(in, wireType);
-      }
-    }
-    long ts = maxTs;
-    int off = 0;
-    while (off < packed.length) {
-      int start = off;
-      long delta = 0;
-      int shift = 0;
-      while (true) {
-        if (off >= packed.length) {
-          throw new IOException("Malformed CommittedTransactions: truncated varint at " + start);
-        }
-        int b = packed[off++] & 0xFF;
-        delta |= ((long) (b & 0x7F)) << shift;
-        if ((b & 0x80) == 0) break;
-        shift += 7;
-      }
-      ts -= delta;
-      if (off + 10 > packed.length) {
-        throw new IOException(
-            "Malformed CommittedTransactions: entry at offset " + start
-                + " missing 10 random bytes (have " + (packed.length - off) + ")");
-      }
-      out.add(UuidV7.fromTimestampAndRandom(ts, packed, off));
-      off += 10;
-    }
-    return out;
   }
 
   private static byte[] encodeNamespace(int id, ProtoCatalogFile.NsEntry entry) throws IOException {
@@ -1646,151 +1224,6 @@ public class ProtoCodec {
   // ============================================================
   // Wire format utilities
   // ============================================================
-
-  private static void writeVarint(OutputStream out, int fieldNumber, int value) throws IOException {
-    int tag = (fieldNumber << 3) | WIRE_VARINT;
-    writeRawVarint(out, tag);
-    writeRawVarint(out, value);
-  }
-
-  private static void writeString(OutputStream out, int fieldNumber, String value) throws IOException {
-    byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
-    writeLengthDelimited(out, fieldNumber, bytes);
-  }
-
-  private static void writeBytes(OutputStream out, int fieldNumber, byte[] value) throws IOException {
-    writeLengthDelimited(out, fieldNumber, value);
-  }
-
-  private static void writeLengthDelimited(OutputStream out, int fieldNumber, byte[] value) throws IOException {
-    int tag = (fieldNumber << 3) | WIRE_LENGTH_DELIMITED;
-    writeRawVarint(out, tag);
-    writeRawVarint(out, value.length);
-    out.write(value);
-  }
-
-  private static void writeVarint64(OutputStream out, int fieldNumber, long value) throws IOException {
-    writeRawVarint(out, (fieldNumber << 3) | WIRE_VARINT);
-    writeRawVarint64(out, value);
-  }
-
-  private static void writeFixed64(OutputStream out, int fieldNumber, long value) throws IOException {
-    writeRawVarint(out, (fieldNumber << 3) | WIRE_64BIT);
-    for (int i = 0; i < 8; i++) {
-      out.write((int) (value & 0xFF));
-      value >>>= 8;
-    }
-  }
-
-  private static void writeRawVarint(OutputStream out, int value) throws IOException {
-    while ((value & ~0x7F) != 0) {
-      out.write((value & 0x7F) | 0x80);
-      value >>>= 7;
-    }
-    out.write(value);
-  }
-
-  private static void writeRawVarint64(OutputStream out, long value) throws IOException {
-    while ((value & ~0x7FL) != 0) {
-      out.write((int) (value & 0x7F) | 0x80);
-      value >>>= 7;
-    }
-    out.write((int) value);
-  }
-
-  private static int readVarint(InputStream in) throws IOException {
-    int result = 0;
-    int shift = 0;
-    int b;
-    do {
-      b = in.read();
-      if (b < 0) {
-        throw new IOException("Unexpected end of stream reading varint");
-      }
-      result |= (b & 0x7F) << shift;
-      shift += 7;
-    } while ((b & 0x80) != 0);
-    return result;
-  }
-
-  private static String readString(InputStream in) throws IOException {
-    byte[] bytes = readLengthDelimitedBytes(in);
-    return new String(bytes, StandardCharsets.UTF_8);
-  }
-
-  private static byte[] readLengthDelimitedBytes(InputStream in) throws IOException {
-    int length = readVarint(in);
-    byte[] bytes = new byte[length];
-    int read = 0;
-    while (read < length) {
-      int n = in.read(bytes, read, length - read);
-      if (n < 0) {
-        throw new IOException("Unexpected end of stream");
-      }
-      read += n;
-    }
-    return bytes;
-  }
-
-  private static long readVarint64(InputStream in) throws IOException {
-    long result = 0;
-    int shift = 0, b;
-    do {
-      b = in.read();
-      if (b < 0) {
-        throw new IOException("Unexpected end of stream");
-      }
-      result |= (long) (b & 0x7F) << shift;
-      shift += 7;
-    } while ((b & 0x80) != 0);
-    return result;
-  }
-
-  private static long readFixed64(InputStream in) throws IOException {
-    long result = 0;
-    for (int i = 0; i < 8; i++) {
-      int b = in.read();
-      if (b < 0) {
-        throw new IOException("Unexpected end of stream");
-      }
-      result |= (long) (b & 0xFF) << (i * 8);
-    }
-    return result;
-  }
-
-  private static void skipField(InputStream in, int wireType) throws IOException {
-    switch (wireType) {
-      case WIRE_VARINT:
-        readVarint64(in);
-        break;
-      case WIRE_64BIT:
-        in.skip(8);
-        break;
-      case WIRE_LENGTH_DELIMITED:
-        int length = readVarint(in);
-        in.skip(length);
-        break;
-      case 5: // 32-bit
-        in.skip(4);
-        break;
-      default:
-        throw new IOException("Unknown wire type: " + wireType);
-    }
-  }
-
-  private static byte[] uuidToBytes(UUID uuid) {
-    ByteBuffer buffer = ByteBuffer.allocate(16);
-    buffer.putLong(uuid.getMostSignificantBits());
-    buffer.putLong(uuid.getLeastSignificantBits());
-    return buffer.array();
-  }
-
-  private static UUID bytesToUuid(byte[] bytes) {
-    ByteBuffer buffer = ByteBuffer.wrap(bytes);
-    long msb = buffer.getLong();
-    long lsb = buffer.getLong();
-    return new UUID(msb, lsb);
-  }
 
   // ============================================================
   // ManifestFile encode/decode

@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.iceberg.io.bench;
+package org.intentlog.bench;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -31,7 +31,7 @@ import java.util.List;
 import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
-import org.apache.iceberg.io.UuidV7;
+import org.intentlog.wire.UuidV7;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
 import org.openjdk.jmh.annotations.Fork;
@@ -65,8 +65,8 @@ import org.openjdk.jmh.runner.options.OptionsBuilder;
  * <p>Three timestamp distributions × four sizes × encode/lookup workloads.
  * Output is the encoded size (bytes) and per-operation latencies (ns).
  *
- * <p>Run via: {@code mvn -pl iceberg-fileio-catalog test-compile exec:java
- *   -Dexec.mainClass=org.apache.iceberg.io.bench.CommittedTxnsBench
+ * <p>Run via: {@code mvn -pl intentlog-core test-compile exec:java
+ *   -Dexec.mainClass=org.intentlog.bench.CommittedTxnsBench
  *   -Dexec.classpathScope=test}
  */
 @State(Scope.Benchmark)
@@ -597,7 +597,7 @@ public class CommittedTxnsBench {
     for (RunResult rr : results) {
       Result<?> primary = rr.getPrimaryResult();
       String label = rr.getParams().getBenchmark()
-          .replace("org.apache.iceberg.io.bench.CommittedTxnsBench.", "");
+          .replace("org.intentlog.bench.CommittedTxnsBench.", "");
       String n = rr.getParams().getParam("n");
       String dist = rr.getParams().getParam("dist");
       System.out.printf("%-20s n=%-6s dist=%-15s  %.1f %s%n",

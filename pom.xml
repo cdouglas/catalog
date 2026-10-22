@@ -31,6 +31,7 @@
   <description>Reactor for the FileIO catalog and the modules it is built from</description>
 
   <modules>
+    <module>intentlog-core</module>
     <module>iceberg-fileio-catalog</module>
   </modules>
 
@@ -126,6 +127,11 @@
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-jar-plugin</artifactId>
           <version>3.4.2</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-enforcer-plugin</artifactId>
+          <version>3.5.0</version>
         </plugin>
         <plugin>
           <groupId>org.codehaus.mojo</groupId>

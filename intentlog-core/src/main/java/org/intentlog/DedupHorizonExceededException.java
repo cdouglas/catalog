@@ -16,14 +16,15 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.iceberg.io;
+package org.intentlog;
 
 import java.util.UUID;
+import org.intentlog.wire.UuidV7;
 
 /**
- * Thrown by {@link ProtoCatalogFile#containsTransaction} when the queried
- * UUIDv7's timestamp falls at or below the catalog's
- * {@code highest_dropped_timestamp_ms}: the dedup oracle can no longer
+ * Thrown by {@link CommittedSet#contains} when the queried
+ * UUIDv7's timestamp falls at or below the set's
+ * GC horizon ({@code highest_dropped_timestamp_ms}): the dedup oracle can no longer
  * distinguish "was committed and aged out" from "never committed."
  *
  * <p>Callers must fall back to a different oracle. See {@code docs/GC.md}

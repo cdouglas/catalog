@@ -18,7 +18,6 @@
  */
 package org.apache.iceberg.io;
 
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -34,7 +33,9 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
-import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
+import org.intentlog.DedupHorizonExceededException;
+import org.intentlog.CommittedSet;
+import org.intentlog.wire.UuidV7;
 
 /**
  * Immutable snapshot of catalog state in protobuf format.
@@ -78,11 +79,9 @@ public class ProtoCatalogFile extends CatalogFile {
   // tblId -> (snapshotId -> list of manifest paths in the pool)
   private final Map<Integer, Map<Long, List<String>>> snapshotManifests;
 
-  // Committed transactions for deduplication. Stored as the raw inner
-  // CommittedTransactions wire bytes (compressed UUIDv7 set). Queries scan
-  // the bytes directly via ProtoCodec.committedSetContains; the canonical
-  // Set<UUID> is materialized only on demand.
-  private final byte[] committedTransactionsBytes;
+  // Committed transactions for deduplication: the CommittedTransactions wire bytes, which
+  // queries scan in place.
+  private final CommittedSet committed;
 
   // Number of transaction records in the log portion of the catalog file.
   // Computed during readInternal; used by commit() to enforce max-append-count.
@@ -102,7 +101,7 @@ public class ProtoCatalogFile extends CatalogFile {
     this.tblManifestPrefix = ImmutableMap.copyOf(builder.tblManifestPrefix);
     this.manifestPool = deepCopyManifestPool(builder.manifestPool);
     this.snapshotManifests = deepCopySnapshotManifests(builder.snapshotManifests);
-    this.committedTransactionsBytes = builder.materializeCommittedBytes(builder.dropBeforeTimestampMs);
+    this.committed = builder.committed.build(builder.dropBeforeTimestampMs);
     this.appendCount = builder.appendCount;
   }
 
@@ -273,16 +272,7 @@ public class ProtoCatalogFile extends CatalogFile {
    * without consulting the horizon.
    */
   public boolean containsTransaction(UUID txnId) {
-    if (ProtoCodec.committedSetContains(committedTransactionsBytes, txnId)) {
-      return true;
-    }
-    if (UuidV7.isV7(txnId)) {
-      long horizon = ProtoCodec.committedSetHorizon(committedTransactionsBytes);
-      if (horizon > 0L && UuidV7.timestampMs(txnId) <= horizon) {
-        throw new DedupHorizonExceededException(txnId, horizon);
-      }
-    }
-    return false;
+    return committed.contains(txnId);
   }
 
   /**
@@ -292,12 +282,17 @@ public class ProtoCatalogFile extends CatalogFile {
    * has fired yet.
    */
   public long highestDroppedTimestampMs() {
-    return ProtoCodec.committedSetHorizon(committedTransactionsBytes);
+    return committed.horizon();
+  }
+
+  /** The committed-transaction set. */
+  public CommittedSet committed() {
+    return committed;
   }
 
   /** Raw inner-message bytes of the committed-txn set. Empty array iff the set is empty. */
   public byte[] committedTransactionsBytes() {
-    return committedTransactionsBytes;
+    return committed.bytes();
   }
 
   /**
@@ -307,16 +302,9 @@ public class ProtoCatalogFile extends CatalogFile {
    * for membership checks.
    */
   public Set<UUID> committedTransactions() {
-    if (committedTransactionsBytes.length == 0) {
-      return ImmutableSet.of();
-    }
-    try {
-      return ImmutableSet.copyOf(
-          ProtoCodec.decodeCommittedTransactions(committedTransactionsBytes));
-    } catch (IOException e) {
-      throw new java.io.UncheckedIOException(e);
-    }
+    return committed.ids();
   }
+
 
   public Integer namespaceId(Namespace ns) {
     return namespaceLookup.get(ns);
@@ -502,13 +490,9 @@ public class ProtoCatalogFile extends CatalogFile {
     private final Map<Integer, String> tblManifestPrefix = new HashMap<>();
     private final Map<Integer, Map<String, ManifestFile>> manifestPool = new HashMap<>();
     private final Map<Integer, Map<Long, List<String>>> snapshotManifests = new HashMap<>();
-    // Committed-txn dedup state. originalCommittedBytes is the inner
-    // CommittedTransactions message body inherited from a decoded checkpoint
-    // (empty if built from scratch). addedCommittedTransactions accumulates
-    // UUIDs added via addCommittedTransaction during the lifetime of this
-    // builder. build() merges them.
-    private byte[] originalCommittedBytes = new byte[0];
-    private final Set<UUID> addedCommittedTransactions = new HashSet<>();
+    // Committed-txn dedup state: the set inherited from a decoded checkpoint (empty if built
+    // from scratch) and the ids replay adds to it, merged by build().
+    private final CommittedSet.Builder committed = CommittedSet.builder();
     private int appendCount = 0;
     // GC watermark passed via build(long); 0 means "no GC pass on this build".
     // Set by Mut prior to invoking build during a CAS / compaction commit.
@@ -864,9 +848,7 @@ public class ProtoCatalogFile extends CatalogFile {
     }
 
     public Builder addCommittedTransaction(UUID txnId) {
-      Preconditions.checkArgument(UuidV7.isV7(txnId),
-          "Committed transaction IDs must be UUIDv7; got %s", txnId);
-      addedCommittedTransactions.add(txnId);
+      committed.add(txnId);
       return this;
     }
 
@@ -874,10 +856,10 @@ public class ProtoCatalogFile extends CatalogFile {
      * Bulk-load entrypoint: install the inner CommittedTransactions message
      * body inherited from a decoded checkpoint, without materializing the
      * canonical Set. Subsequent {@link #addCommittedTransaction} calls layer
-     * additions on top; build-time merge happens in {@link #materializeCommittedBytes}.
+     * additions on top, and build() merges them.
      */
     public Builder setCommittedTransactionsBytes(byte[] bytes) {
-      this.originalCommittedBytes = bytes != null ? bytes : new byte[0];
+      committed.inherit(bytes);
       return this;
     }
 
@@ -895,19 +877,7 @@ public class ProtoCatalogFile extends CatalogFile {
      * must reject it rather than fail the read.
      */
     public boolean containsTransaction(UUID txnId) {
-      if (addedCommittedTransactions.contains(txnId)) {
-        return true;
-      }
-      if (ProtoCodec.committedSetContains(originalCommittedBytes, txnId)) {
-        return true;
-      }
-      if (UuidV7.isV7(txnId)) {
-        long horizon = ProtoCodec.committedSetHorizon(originalCommittedBytes);
-        if (horizon > 0L && UuidV7.timestampMs(txnId) <= horizon) {
-          throw new DedupHorizonExceededException(txnId, horizon);
-        }
-      }
-      return false;
+      return committed.contains(txnId);
     }
 
     /**
@@ -918,27 +888,7 @@ public class ProtoCatalogFile extends CatalogFile {
      * (Bug 64).
      */
     public boolean mayApply(UUID txnId) {
-      if (addedCommittedTransactions.contains(txnId)
-          || ProtoCodec.committedSetContains(originalCommittedBytes, txnId)) {
-        return false;
-      }
-      long horizon = ProtoCodec.committedSetHorizon(originalCommittedBytes);
-      return !UuidV7.isV7(txnId) || horizon == 0L || UuidV7.timestampMs(txnId) > horizon;
-    }
-
-    /**
-     * Produces the final inner CommittedTransactions wire bytes for the
-     * resulting ProtoCatalogFile. Single-pass merge of inherited entries +
-     * additions, with optional GC drop of inherited entries whose v7 timestamp
-     * is &lt;= {@code dropBeforeTimestampMs}. {@code 0} disables the GC pass
-     * (pass-through when there are no additions).
-     */
-    byte[] materializeCommittedBytes(long dropBeforeTimestampMs) {
-      if (addedCommittedTransactions.isEmpty() && dropBeforeTimestampMs == 0L) {
-        return originalCommittedBytes;
-      }
-      return ProtoCodec.rewriteCommittedBytes(
-          originalCommittedBytes, addedCommittedTransactions, dropBeforeTimestampMs);
+      return committed.mayApply(txnId);
     }
 
     public Builder setAppendCount(int count) {

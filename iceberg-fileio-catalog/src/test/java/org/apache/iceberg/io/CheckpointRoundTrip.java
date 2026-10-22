@@ -36,6 +36,7 @@ import java.util.zip.CRC32;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.intentlog.DedupHorizonExceededException;
 
 /**
  * The checkpoint round trip: the state a reader replays from a catalog file is the state it

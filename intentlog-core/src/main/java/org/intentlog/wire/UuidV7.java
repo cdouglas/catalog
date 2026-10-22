@@ -16,14 +16,14 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.iceberg.io;
+package org.intentlog.wire;
 
 import java.security.SecureRandom;
 import java.util.Random;
 import java.util.UUID;
 
 /**
- * UUIDv7 (RFC 9562) generation and bit-level helpers used by the catalog format.
+ * UUIDv7 (RFC 9562) generation and bit-level helpers used by the log format.
  *
  * <p>Layout (128 bits):
  * <pre>

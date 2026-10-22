@@ -7,10 +7,10 @@ JMH results for four candidate encodings of the checkpoint's committed-transacti
 - **B**: fixed64 base+delta, descending sort, binary search on the delta column. Operates on compressed bytes.
 - **C**: indexed varint with skip-list (skip every 16 entries; per-bucket cumulative-delta anchor).
 
-Source: `iceberg-fileio-catalog/src/test/java/org/apache/iceberg/io/bench/CommittedTxnsBench.java`. Run via:
+Source: `intentlog-core/src/test/java/org/intentlog/bench/CommittedTxnsBench.java`. Run via:
 
 ```
-mvn -pl iceberg-fileio-catalog test-compile exec:java -Dexec.mainClass=org.apache.iceberg.io.bench.CommittedTxnsBench -Dexec.classpathScope=test \
+mvn -pl intentlog-core test-compile exec:java -Dexec.mainClass=org.intentlog.bench.CommittedTxnsBench -Dexec.classpathScope=test \
   -Dexec.args="-f 0 -wi 2 -i 3 -r 1s -w 1s -rf json -rff target/jmh-results.json"
 ```
 
@@ -106,7 +106,7 @@ If a future deployment is memory-constrained (millions of committed-txn entries,
 
 Implement **encoding A** for the committed set (now `Checkpoint.committed_transactions`). Keep HashSet materialization at decode time. This delivers the requested compression with zero query-latency regression.
 
-As built (a19051a), lookups do not materialize a HashSet: they scan the encoded bytes (`ProtoCodec.committedSetContains`), a linear scan like A's above. Only a builder's in-flight additions are held in a `HashSet`.
+As built (a19051a), lookups do not materialize a HashSet: they scan the encoded bytes (`ProtoCodec.committedSetContains`, now `CommittedSetCodec.contains` in intentlog-core), a linear scan like A's above. Only a builder's in-flight additions are held in a `HashSet`.
 
 Defer encoding B / on-compressed lookup as a future option; the wire format leaves room to add a "skip materialization" mode without changing the bytes.
 

@@ -35,6 +35,12 @@
   <description>A storage catalog implementation for Apache Iceberg using FileIO with atomic operations</description>
 
   <dependencies>
+    <dependency>
+      <groupId>org.intentlog</groupId>
+      <artifactId>intentlog-core</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+
     <!-- Iceberg dependencies -->
     <dependency>
       <groupId>org.apache.iceberg</groupId>
@@ -96,8 +102,7 @@
       <scope>test</scope>
     </dependency>
 
-    <!-- JMH for committed-transaction-set encoding benchmarks (see
-         src/test/java/org/apache/iceberg/io/bench/CommittedTxnsBench.java). -->
+    <!-- JMH for the table-metadata encoding benchmarks in org.apache.iceberg.io.bench. -->
     <dependency>
       <groupId>org.openjdk.jmh</groupId>
       <artifactId>jmh-core</artifactId>
@@ -238,10 +243,9 @@
         </configuration>
       </plugin>
       <!-- exec:java target for the JMH benchmarks in org.apache.iceberg.io.bench. Invoke:
-           mvn -pl iceberg-fileio-catalog test-compile exec:java -Dexec.mainClass=org.apache.iceberg.io.bench.CommittedTxnsBench -Dexec.classpathScope=test -Dexec.args="-f 0"
-           -f 0 runs JMH in-process: exec:java does not give forked JVMs the test classpath.
-           TableMetadataEncodingBench runs in-process already and ignores its arguments. See
-           docs/UUID_V7_BENCH_RESULTS.md and docs/TM_ENCODING_BENCH_RESULTS.md. -->
+           mvn -pl iceberg-fileio-catalog test-compile exec:java -Dexec.mainClass=org.apache.iceberg.io.bench.TableMetadataEncodingBench -Dexec.classpathScope=test
+           It runs in-process: exec:java does not give forked JVMs the test classpath. See
+           docs/TM_ENCODING_BENCH_RESULTS.md, and intentlog-core for the committed-set bench. -->
       <plugin>
         <groupId>org.codehaus.mojo</groupId>
         <artifactId>exec-maven-plugin</artifactId>

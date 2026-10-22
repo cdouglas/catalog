@@ -64,7 +64,7 @@ compaction, or any commit in CAS-only mode) GCs; an append never does.
 `now - fileio.catalog.committed.retention.ms` (0 if the retention is at
 least `now`, so `Long.MAX_VALUE` disables GC), and passes it to
 `ProtoCodec.encodeCheckpoint`. That calls
-`ProtoCodec.rewriteCommittedBytes` on the base state's set: one pass
+`CommittedSetCodec.rewrite` (intentlog-core) on the base state's set: one pass
 over the compressed entries that drops every id at or below the
 watermark and raises the horizon to the newest one dropped. The horizon
 never decreases, and it can exceed the newest id kept.
@@ -123,11 +123,13 @@ behind the horizon).
 
 ## Tests
 
-- `TestCommittedSetGc`: `rewriteCommittedBytes` (pass-through, merge,
-  drops at the watermark, horizon above the newest id kept, monotonic
-  horizon), the tri-state lookup, and `Builder.build(long)`.
-- `TestCommittedTransactions`: round trip and defensive decode of the
-  compressed set.
+- `TestCommittedSetGc` (intentlog-core): `CommittedSetCodec.rewrite`
+  (pass-through, merge, drops at the watermark, horizon above the newest
+  id kept, monotonic horizon), the tri-state lookup, and
+  `Builder.build(long)`; the catalog's `TestCommittedSetGc` checks that
+  `ProtoCatalogFile` delegates to it.
+- `TestCommittedTransactions` (intentlog-core): round trip and defensive
+  decode of the compressed set; the catalog's, through the checkpoint.
 - `TestProtoCommitKnobs`: the retention property, and end to end, a
   lookup of a committed id that throws after another writer's CAS with
   retention 0.
@@ -139,7 +141,7 @@ behind the horizon).
 - The format explorer's committed-set GC scenario shows the horizon;
   regenerate its fixtures with
   `mvn test -Dtest=FormatExplorerFixtures -Dexplorer.regenerate=true`.
-- `bench/CommittedTxnsBench` (JMH): set size and lookup cost.
+- `CommittedTxnsBench` (JMH, in intentlog-core): set size and lookup cost.
 
 ## Out of scope
 
