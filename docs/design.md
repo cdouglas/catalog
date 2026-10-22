@@ -40,11 +40,12 @@ atomically:
 2. Create a `Mut` builder from it.
 3. Accumulate changes (`createTable`, `dropNamespace`, etc.).
 4. `commit()` builds an intention record and writes it atomically.
-5. The format's commit loop (`ProtoCatalogFormat.Mut.commit`) handles
+5. The commit loop (intentlog-core's `LogRuntime.commit`, over the
+   catalog file's `AtomicFileLog`) handles
    what storage reports. After a CAS conflict it replays the new file,
    checks the record's preconditions again, and rebases the same record
    onto it; after a lost append race it retries the same bytes at the new
-   offset; it retries a throttled write after a backoff (`retryThrottled`,
+   offset; it retries a throttled write after a backoff (`write`,
    `fileio.catalog.throttle.retry.min-wait-ms`); and it settles a write
    whose outcome it did not learn by reading the catalog for the
    transaction's id, or throws `CommitStateUnknownException` (I10). A

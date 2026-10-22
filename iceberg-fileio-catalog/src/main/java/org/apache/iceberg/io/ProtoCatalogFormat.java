@@ -19,19 +19,14 @@
 package org.apache.iceberg.io;
 
 import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.io.UncheckedIOException;
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.function.Supplier;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
@@ -39,10 +34,14 @@ import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.CommitStateUnknownException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
-import org.intentlog.DedupHorizonExceededException;
+import org.intentlog.CommitOutcomeUnknownException;
+import org.intentlog.CommitRejectedException;
+import org.intentlog.CompactionPolicy;
+import org.intentlog.LogRuntime;
 import org.intentlog.Replay;
-import org.intentlog.wire.LogEnvelope;
-import org.intentlog.wire.UuidV7;
+import org.intentlog.Replica;
+import org.intentlog.RuntimeConfig;
+import org.intentlog.fileio.AtomicFileLog;
 
 /**
  * Protobuf-based catalog format with checkpoint + append log structure.
@@ -202,12 +201,26 @@ public class ProtoCatalogFormat
 
   @Override
   public ProtoCatalogFile read(SupportsAtomicOperations fileIO, InputFile catalogLocation) {
-    InputFile refresh = fileIO.newInputFile(catalogLocation.location());
-    try (SeekableInputStream in = refresh.newStream()) {
-      return readInternal(refresh, in, (int) refresh.getLength());
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
-    }
+    return ProtoCatalogFile.of(
+        runtime(fileIO, catalogLocation.location(), maxAppendCount, maxAppendSize,
+            committedRetentionMs, throttleMinWaitMs).read());
+  }
+
+  /**
+   * The intention-log runtime over the catalog file at {@code location}: the catalog's state
+   * machine, replicated through one object of a store with conditional writes.
+   */
+  static LogRuntime<ProtoCatalogFile, ProtoCatalogFile.Builder, ProtoCodec.CatalogIntention>
+      runtime(
+          SupportsAtomicOperations fileIO, String location, int maxAppendCount,
+          long maxAppendSize, long committedRetentionMs, long throttleMinWaitMs) {
+    return new LogRuntime<>(
+        new AtomicFileLog(fileIO, location),
+        new CatalogStateMachine(fileIO.newInputFile(location)),
+        RuntimeConfig.of(
+            CompactionPolicy.limits(maxAppendCount, maxAppendSize),
+            committedRetentionMs,
+            throttleMinWaitMs));
   }
 
   static ProtoCatalogFile readInternal(InputFile location, InputStream in, int fileLength)
@@ -591,256 +604,35 @@ public class ProtoCatalogFormat
       }
     }
 
+    /**
+     * Commits this transaction's intention through the catalog file's intention log ({@link
+     * LogRuntime}), and returns the catalog its record landed in. Maps the runtime's outcomes onto
+     * Iceberg's: a conflict to the most informative error ({@link #conflict}), any other rejection
+     * to {@link CommitFailedException}, an unknown outcome to {@link CommitStateUnknownException}.
+     */
     @Override
     public ProtoCatalogFile commit(SupportsAtomicOperations fileIO) {
-      final int MAX_ATTEMPTS = 10;
-
-      // baseCatalog is the parsed state of current unless baseIsCurrent is false:
-      // after a lost append race, current is refreshed without reading it.
-      ProtoCatalogFile baseCatalog = original;
-      InputFile current = original.location();
-      boolean baseIsCurrent = true;
-      ProtoCodec.Transaction txn = buildTransaction();
-      byte[] txnBytes = ProtoCodec.encodeTransaction(txn);
-
-      // Case 0: Initial commit (file doesn't exist)
-      if (!current.exists()) {
-        try {
-          return tryCAS(original, current, txn, txnBytes, fileIO);
-        } catch (AmbiguousWrite | SupportsAtomicOperations.CASException e) {
-          // The creation may have landed: its reply was lost, reading it back failed, or it
-          // failed its precondition, as a transport retry of a creation that landed does.
-          Throwable failure = e instanceof AmbiguousWrite ? e.getCause() : e;
-          ProtoCatalogFile.Builder fresh = resolve(failure, fileIO.newInputFile(current.location()));
-          if (fresh != null && landed(fresh::containsTransaction, txn, failure)) {
-            return fresh.build(); // the creation landed
-          }
-          if (fresh != null && !(e instanceof AmbiguousWrite)) {
-            throw new CommitFailedException(e, "Catalog creation failed: %s exists", current.location());
-          }
-          throw new CommitStateUnknownException(failure);
-        }
-      }
-
-      // Backends without an append primitive (e.g. GCS) coerce every commit to CAS,
-      // regardless of how the format was configured. Without this guard, a catalog
-      // pointed at GCS with a non-zero max.append.count would silently overwrite the
-      // catalog file in tryAppend (writeAtomic with Strategy.APPEND replaces the
-      // object on GCS) -- and now GCSOutputFile.prepare() rejects APPEND outright,
-      // so an unguarded append commit would surface as IllegalArgumentException.
-      final boolean appendSupported = fileIO.supportsAppend();
-
-      // The last write whose outcome is unknown, if any: its reply was lost, or reading back what
-      // it wrote failed. It may still be in flight, so once one has happened, running out of
-      // attempts no longer means the commit failed.
-      AmbiguousWrite ambiguous = null;
-      // The last write that failed its precondition, until a read of the catalog rules out that it
-      // landed. A transport retry of a write that landed fails its precondition, so the failure is
-      // no proof; but the write landed before the reply, so a read without it settles it.
-      SupportsAtomicOperations.AtomicOperationException unresolved = null;
-      // Whether storage refused an append because the object holds as many writes as it allows (S3
-      // Express: 10,000 parts; an Azure Append Blob: 50,000 blocks): only a CAS can commit then,
-      // whatever the append count says.
-      boolean full = false;
-
-      for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-        try {
-          // Decide whether to CAS (compact) or append based on observable state
-          // of the live file: backend support, append count, and current size.
-          // Either limit (count or size) being met forces CAS on the next commit.
-          // Setting maxAppendCount=0 forces CAS on every commit.
-          boolean mustCAS =
-              full
-                  || !appendSupported
-                  || baseCatalog.appendCount() >= maxAppendCount
-                  || length(current) + txnBytes.length > maxAppendSize;
-
-          if (mustCAS) {
-            if (!baseIsCurrent) {
-              // The CAS replaces current, so its checkpoint must hold the state
-              // current names: a checkpoint of original would erase every record
-              // committed since. Our transaction record follows the checkpoint and
-              // replay verifies it against that state, as it would an append.
-              // Read the live version afresh rather than the one current was bound
-              // to: storage fails a read pinned to a version another writer has since
-              // replaced (a GCS read by generation, an S3 or ADLS read with If-Match).
-              current = fileIO.newInputFile(current.location());
-              ProtoCatalogFile.Builder fresh = replay(current);
-              if (landed(fresh::containsTransaction, txn, earlier(ambiguous, unresolved))) {
-                return fresh.build(); // an append reported as a lost race landed
-              }
-              unresolved = null;
-              baseCatalog = fresh.build();
-              baseIsCurrent = true;
-            }
-            full = false;
-            try {
-              return validateCommit(
-                  tryCAS(baseCatalog, current, txn, txnBytes, fileIO),
-                  txn,
-                  earlier(ambiguous, unresolved));
-            } catch (SupportsAtomicOperations.CASException e) {
-              unresolved = e;
-            }
-            // CAS conflict: another writer changed the file since we read it.
-            // Rebase onto the new state. Replay checks this transaction's
-            // preconditions against the state its record lands on, so if they
-            // hold on the new state, retry on top of it -- by append or CAS, as
-            // that state calls for -- and the commit is accepted exactly when a
-            // serial commit would be. If not, fail without writing; the client
-            // refreshes and re-applies.
-            current = fileIO.newInputFile(current.location());
-            ProtoCatalogFile.Builder fresh = replay(current);
-            if (landed(fresh::containsTransaction, txn, earlier(ambiguous, unresolved))) {
-              return fresh.build(); // an earlier attempt landed
-            }
-            unresolved = null;
-            boolean holds = txn.verify(fresh);
-            baseCatalog = fresh.build();
-            baseIsCurrent = true;
-            if (!holds) {
-              throw conflict(
-                  baseCatalog, "Cannot commit: catalog file changed concurrently at " + current.location());
-            }
-          } else {
-            try {
-              return validateCommit(
-                  tryAppend(current, txnBytes, fileIO), txn, earlier(ambiguous, unresolved));
-            } catch (SupportsAtomicOperations.SegmentLimitException e) {
-              // Nothing landed, and no append to this object can: compact it by CAS, on a fresh
-              // read. Without this the commit took the append for ambiguous, and with an append
-              // count above the store's limit no writer ever compacted (Bug 66).
-              full = true;
-              baseIsCurrent = false;
-              continue;
-            } catch (SupportsAtomicOperations.AppendException e) {
-              unresolved = e;
-            }
-            // Append failed: another writer appended first (offset mismatch).
-            // The transaction bytes are identical and idempotent (UUID-deduplicated),
-            // so we can retry the append at the new offset without re-reading the
-            // catalog. Only need to refresh the InputFile to get the current length.
-            long oldLength = length(current);
-            current = fileIO.newInputFile(current.location());
-            if (length(current) < oldLength) {
-              // File shrank -- another writer compacted. Re-read to refresh
-              // appendCount so the next mustCAS decision is accurate; afresh, as
-              // above, since current's version may be replaced by now.
-              current = fileIO.newInputFile(current.location());
-              ProtoCatalogFile.Builder fresh = replay(current);
-              if (landed(fresh::containsTransaction, txn, earlier(ambiguous, unresolved))) {
-                return fresh.build(); // an append reported as a lost race landed
-              }
-              unresolved = null;
-              baseCatalog = fresh.build();
-              baseIsCurrent = true;
-            } else {
-              // File grew (normal concurrent append). Retry with same bytes at the
-              // new offset; the append count is now a lower bound, which is fine
-              // for a soft limit. No read needed unless the next attempt CASes.
-              baseIsCurrent = false;
-            }
-          }
-        } catch (AmbiguousWrite e) {
-          // The write may have landed: its reply was lost, or reading back what it wrote failed.
-          // Its record carries this transaction's id, so a fresh read says which. If it has not
-          // landed, retry from the fresh state: a write still in flight carries the same
-          // transaction and a precondition on the version it saw, so at most one of the two lands,
-          // and replay applies the transaction once. A definite rejection stays definite: replay
-          // verifies a record against the state it lands on, so a late landing of a transaction
-          // that does not hold changes nothing.
-          ambiguous = e;
-          current = fileIO.newInputFile(current.location());
-          ProtoCatalogFile.Builder fresh = resolve(e.getCause(), current);
-          if (fresh == null) {
-            throw new CommitStateUnknownException(e.getCause());
-          }
-          if (landed(fresh::containsTransaction, txn, e.getCause())) {
-            return fresh.build(); // the write landed
-          }
-          unresolved = null;
-          boolean holds = txn.verify(fresh);
-          baseCatalog = fresh.build();
-          baseIsCurrent = true;
-          if (!holds) {
-            throw conflict(
-                baseCatalog, "Cannot commit: catalog file changed concurrently at " + current.location());
-          }
-        } catch (UnreadableCatalog e) {
-          // A read failed. The commit failed too, unless one of its writes may have landed.
-          Throwable write = ambiguous != null ? ambiguous.getCause() : unresolved;
-          if (write == null) {
-            throw e.failure();
-          }
-          write.addSuppressed(e.failure());
-          throw new CommitStateUnknownException(write);
-        }
-      }
-
-      if (ambiguous != null) {
-        throw new CommitStateUnknownException(ambiguous.getCause());
-      }
-      if (unresolved != null) {
-        // The last attempt lost an append race, which its own landing would also report.
-        ProtoCatalogFile.Builder fresh = resolve(unresolved, fileIO.newInputFile(current.location()));
-        if (fresh == null) {
-          throw new CommitStateUnknownException(unresolved);
-        }
-        if (landed(fresh::containsTransaction, txn, unresolved)) {
-          return fresh.build();
-        }
-      }
-      throw new CommitFailedException("Exceeded maximum commit attempts");
-    }
-
-    /**
-     * Re-reads the catalog after a write that may have landed, or returns null if that fails too
-     * (the read failure is attached to {@code writeFailure}).
-     */
-    private ProtoCatalogFile.Builder resolve(Throwable writeFailure, InputFile file) {
+      String location = original.location().location();
+      List<ProtoCodec.Action> actions = new ArrayList<>();
+      buildActions(actions, idManager);
       try {
-        return replay(file);
-      } catch (UnreadableCatalog readFailure) {
-        writeFailure.addSuppressed(readFailure.failure());
-        return null;
-      }
-    }
-
-    /**
-     * Whether a read holds {@code txn}, by {@code contains}. If its id is at or below the
-     * committed set's GC horizon, the set cannot say, and replay rejects its record from now on
-     * (Bug 64): the commit failed, unless {@code earlier}, a write of it that may have landed,
-     * did, before its id aged out.
-     */
-    private boolean landed(
-        java.util.function.Predicate<UUID> contains, ProtoCodec.Transaction txn, Throwable earlier) {
-      try {
-        return contains.test(txn.id());
-      } catch (DedupHorizonExceededException e) {
-        if (earlier != null) {
-          earlier.addSuppressed(e);
-          throw new CommitStateUnknownException(earlier);
+        return ProtoCatalogFile.of(
+            runtime(fileIO, location, maxAppendCount, maxAppendSize, committedRetentionMs,
+                throttleMinWaitMs)
+                .commit(original.replica(), new ProtoCodec.CatalogIntention(actions)));
+      } catch (CommitRejectedException e) {
+        switch (e.reason()) {
+          case CONFLICT:
+            Replica<ProtoCatalogFile> lostTo = e.state();
+            throw conflict(lostTo.state(), e.getMessage() + " at " + location);
+          case CREATE_LOST:
+            throw new CommitFailedException(e, "Catalog creation failed: %s exists", location);
+          default:
+            throw new CommitFailedException(e, "%s", e.getMessage());
         }
-        throw new CommitFailedException(
-            e, "Cannot commit: transaction %s is at or below the catalog's committed-set horizon",
-            txn.id());
+      } catch (CommitOutcomeUnknownException e) {
+        throw new CommitStateUnknownException(e.getCause());
       }
-    }
-
-    /** The last write of this commit that may have landed, or null. */
-    private static Throwable earlier(
-        AmbiguousWrite ambiguous, SupportsAtomicOperations.AtomicOperationException unresolved) {
-      return ambiguous != null ? ambiguous.getCause() : unresolved;
-    }
-
-    private ProtoCatalogFile validateCommit(
-        ProtoCatalogFile result, ProtoCodec.Transaction txn, Throwable earlier) {
-      if (!landed(result::containsTransaction, txn, earlier)) {
-        // Our record landed but at least one action's verify rejected it
-        // (e.g., a concurrent writer bumped the table version).
-        throw conflict(result, "Cannot commit: concurrent transaction invalidated this update");
-      }
-      return result;
     }
 
     /**
@@ -873,200 +665,6 @@ public class ProtoCatalogFormat
       return new CommitFailedException("%s", message);
     }
 
-    /** Reads and parses {@code file}; any failure becomes {@link UnreadableCatalog}. */
-    private ProtoCatalogFile.Builder replay(InputFile file) {
-      try (SeekableInputStream in = file.newStream()) {
-        return ProtoCatalogFormat.replay(file, in, (int) file.getLength());
-      } catch (IOException e) {
-        throw new UnreadableCatalog(new UncheckedIOException(e));
-      } catch (RuntimeException e) {
-        throw new UnreadableCatalog(e);
-      }
-    }
-
-    /** The length of {@code file}; a failure to read it becomes {@link UnreadableCatalog}. */
-    private static long length(InputFile file) {
-      try {
-        return file.getLength();
-      } catch (RuntimeException e) {
-        throw new UnreadableCatalog(e);
-      }
-    }
-
-    /**
-     * Replaces {@code current}, whose parsed state is {@code base}, with base + txnBytes. Throws
-     * {@link SupportsAtomicOperations.CASException} if {@code current} is no longer live.
-     */
-    private ProtoCatalogFile tryCAS(
-        ProtoCatalogFile base,
-        InputFile current,
-        ProtoCodec.Transaction txn,
-        byte[] txnBytes,
-        SupportsAtomicOperations fileIO) {
-      // Build the wire bytes once; retries reuse the same payload.
-      final byte[] fullFile;
-      try {
-        fullFile = buildFullFile(base, txn, txnBytes);
-      } catch (IOException e) {
-        throw new CommitFailedException(e, "CAS commit failed: %s", e.getMessage());
-      }
-
-      return retryThrottled(
-          current.location(),
-          () -> {
-            AtomicOutputFile outputFile = fileIO.newOutputFile(current);
-            try (ByteArrayInputStream serBytes = new ByteArrayInputStream(fullFile)) {
-              serBytes.mark(fullFile.length);
-              CAS token = outputFile.prepare(() -> serBytes, AtomicOutputFile.Strategy.CAS);
-              serBytes.reset();
-              return writeAndRead(outputFile, token, () -> serBytes);
-            } catch (IOException e) {
-              throw new CommitFailedException(e, "CAS commit failed: %s", e.getMessage());
-            }
-          });
-    }
-
-    /**
-     * Appends txnBytes to {@code current}. Throws {@link SupportsAtomicOperations.AppendException}
-     * if {@code current} is no longer live.
-     */
-    private ProtoCatalogFile tryAppend(
-        InputFile current, byte[] txnBytes, SupportsAtomicOperations fileIO) {
-      final byte[] record;
-      try {
-        record = buildTransactionRecord(txnBytes);
-      } catch (IOException e) {
-        throw new UncheckedIOException("Append commit failed: " + e.getMessage(), e);
-      }
-      return retryThrottled(
-          current.location(),
-          () -> {
-            AtomicOutputFile outputFile = fileIO.newOutputFile(current);
-            try (ByteArrayInputStream serBytes = new ByteArrayInputStream(record)) {
-              serBytes.mark(record.length);
-              CAS token = outputFile.prepare(() -> serBytes, AtomicOutputFile.Strategy.APPEND);
-              serBytes.reset();
-              return writeAndRead(outputFile, token, () -> serBytes);
-            } catch (IOException e) {
-              throw new UncheckedIOException("Append commit failed: " + e.getMessage(), e);
-            }
-          });
-    }
-
-    /**
-     * Performs {@code write}, retrying it after a backoff while storage applies backpressure
-     * (StorageThrottleException: a 429, a 5xx, the GCS per-object update rate). Each retry carries
-     * the same precondition, so at most one attempt lands. A throttled write may have landed even
-     * so: a 5xx can follow a write the service applied, and an SDK's own retries report only the
-     * last attempt. A retry of a write that landed fails its precondition, which the commit loop
-     * resolves by reading the catalog; running out of retries leaves the outcome unknown in the
-     * same way, so it is an {@link AmbiguousWrite}. An interrupt during the backoff stops the
-     * commit with its outcome unknown.
-     */
-    private ProtoCatalogFile retryThrottled(String location, Supplier<ProtoCatalogFile> write) {
-      final int maxThrottleAttempts = 8;
-      long backoffMs = throttleMinWaitMs;
-      SupportsAtomicOperations.StorageThrottleException lastThrottle = null;
-      for (int attempt = 0; attempt < maxThrottleAttempts; attempt++) {
-        try {
-          return write.get();
-        } catch (SupportsAtomicOperations.StorageThrottleException e) {
-          lastThrottle = e;
-          long sleepMs =
-              backoffMs + java.util.concurrent.ThreadLocalRandom.current().nextLong(backoffMs / 2 + 1);
-          try {
-            Thread.sleep(sleepMs);
-          } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            e.addSuppressed(ie);
-            throw new CommitStateUnknownException(e);
-          }
-          backoffMs = Math.min(backoffMs * 2, Math.max(5_000L, throttleMinWaitMs));
-        } catch (CommitFailedException | UncheckedIOException e) {
-          // This attempt failed before writing; an earlier, throttled one may have landed.
-          if (lastThrottle == null) {
-            throw e;
-          }
-          e.addSuppressed(lastThrottle);
-          throw new AmbiguousWrite(e);
-        }
-      }
-      throw new AmbiguousWrite(
-          new IOException(
-              String.format(
-                  "Storage throttled %d attempts at %s", maxThrottleAttempts, location),
-              lastThrottle));
-    }
-
-    /**
-     * Performs a conditional write and parses what it wrote. The protocol's conflict and throttling
-     * signals propagate; any other failure of the write, or of reading back what it wrote, leaves
-     * its outcome unknown and becomes {@link AmbiguousWrite}.
-     */
-    private ProtoCatalogFile writeAndRead(
-        AtomicOutputFile outputFile, CAS token, Supplier<InputStream> bytes) {
-      InputFile written;
-      try {
-        written = outputFile.writeAtomic(token, bytes);
-      } catch (SupportsAtomicOperations.AtomicOperationException e) {
-        throw e;
-      } catch (IOException | RuntimeException e) {
-        throw new AmbiguousWrite(e);
-      }
-      try (SeekableInputStream in = written.newStream()) {
-        return readInternal(written, in, (int) written.getLength());
-      } catch (IOException | RuntimeException e) {
-        throw new AmbiguousWrite(e);
-      }
-    }
-
-    private byte[] buildFullFile(ProtoCatalogFile base, ProtoCodec.Transaction txn, byte[] txnBytes)
-        throws IOException {
-      ByteArrayOutputStream out = new ByteArrayOutputStream();
-
-      // Header
-      out.write(MAGIC);
-      writeInt(out, FORMAT_VERSION);
-
-      // Checkpoint of the base state, exactly as replay reached it; pending changes go in the
-      // record below.
-      ProtoIdManager baseIds = new ProtoIdManager();
-      baseIds.setGlobals(base.nextNamespaceId(), base.nextTableId());
-      byte[] checkpointBytes = ProtoCodec.encodeCheckpoint(base, this, baseIds);
-      writeVarint(out, checkpointBytes.length);
-      out.write(checkpointBytes);
-
-      // GC of the committed set, as a record: replay drops the ids at or below the
-      // watermark, now - committedRetentionMs, clamped to 0 (never negative);
-      // Long.MAX_VALUE retention disables GC, and no record is written. Being a record,
-      // not a filter on the checkpoint, every checkpoint is a replay of the log before it
-      // (I11). The watermark stays below this transaction's own time: the horizon must
-      // not reach the record that follows, or replay rejects it (Bug 64). A short
-      // retention would otherwise drop the id of a commit this one rebased on, minted
-      // after it.
-      long now = System.currentTimeMillis();
-      long watermark = committedRetentionMs >= now ? 0L : now - committedRetentionMs;
-      watermark = Math.max(0L, Math.min(watermark, UuidV7.timestampMs(txn.id()) - 1));
-      if (watermark > 0L) {
-        byte[] gcBytes = LogEnvelope.encodeAdvanceHorizon(watermark);
-        writeVarint(out, gcBytes.length);
-        out.write(gcBytes);
-      }
-
-      // Transaction: the checkpoint holds the base state only; replay verifies
-      // and applies this record on top of it (binding any late-bound ids).
-      writeVarint(out, txnBytes.length);
-      out.write(txnBytes);
-
-      return out.toByteArray();
-    }
-
-    private byte[] buildTransactionRecord(byte[] txnBytes) throws IOException {
-      ByteArrayOutputStream out = new ByteArrayOutputStream();
-      writeVarint(out, txnBytes.length);
-      out.write(txnBytes);
-      return out.toByteArray();
-    }
   }
 
   // ============================================================
@@ -1093,24 +691,6 @@ public class ProtoCatalogFormat
     public void setGlobals(int nextNsid, int nextTblid) {
       this.nextNsid = nextNsid;
       this.nextTblid = nextTblid;
-    }
-  }
-
-  /** A conditional write that may or may not have taken effect. */
-  private static class AmbiguousWrite extends RuntimeException {
-    AmbiguousWrite(Exception cause) {
-      super(cause);
-    }
-  }
-
-  /** A failed read of the catalog during a commit. */
-  private static class UnreadableCatalog extends RuntimeException {
-    UnreadableCatalog(RuntimeException cause) {
-      super(cause);
-    }
-
-    RuntimeException failure() {
-      return (RuntimeException) getCause();
     }
   }
 }

@@ -74,7 +74,8 @@ its writer's clock would not guarantee.
 
 A CAS write (a compaction, or any commit in CAS-only mode) writes the
 GC record, between its checkpoint and its own record; an append never
-does. `ProtoCatalogFormat.Mut.buildFullFile` computes the watermark,
+does. The commit loop (intentlog-core's `LogRuntime`, which writes a
+compaction's records) computes the watermark,
 `now - fileio.catalog.committed.retention.ms` (0 if the retention is at
 least `now`, so `Long.MAX_VALUE` disables GC and writes no record). A
 GC record carries no id, is not deduped (replaying one again changes
@@ -108,14 +109,14 @@ a commit reports true:
    one at or below the horizon may be a retry of a commit whose id aged
    out, so replay skips both.
 2. **A CAS write's watermark stays below its own transaction's time.**
-   `buildFullFile` clamps its GC record's watermark to one less than the
+   `LogRuntime` clamps its GC record's watermark to one less than the
    time of the id it commits, so its own GC never raises the horizon to
    the record that follows it.
 3. **Writers mint ids after the horizon they read.**
    `ProtoCodec.Transaction.from` mints with
    `UuidV7.newUuidV7After(highestDroppedTimestampMs())`, so a writer
    whose clock is behind still commits.
-4. **The commit loop maps it to an outcome.** `ProtoCatalogFormat.Mut.landed`
+4. **The commit loop maps it to an outcome.** `LogRuntime`'s `landed`
    catches `DedupHorizonExceededException` on any read the commit loop
    makes: the commit fails (`CommitFailedException`), since replay
    rejects its record from then on, unless a write of it may have

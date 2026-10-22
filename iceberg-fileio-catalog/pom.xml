@@ -40,6 +40,19 @@
       <artifactId>intentlog-core</artifactId>
       <version>${project.version}</version>
     </dependency>
+    <dependency>
+      <groupId>org.intentlog</groupId>
+      <artifactId>intentlog-fileio</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <!-- InMemoryAtomicFileIO, the fault-injecting store the local suites and fuzzers run on -->
+      <groupId>org.intentlog</groupId>
+      <artifactId>intentlog-fileio</artifactId>
+      <version>${project.version}</version>
+      <type>test-jar</type>
+      <scope>test</scope>
+    </dependency>
 
     <!-- Iceberg dependencies -->
     <dependency>

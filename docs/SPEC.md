@@ -210,7 +210,7 @@ preserving the dedup guarantee inside a configurable window.
 See [GC.md](GC.md) for the implementation rationale.
 
 **Premise: UUIDv7 timestamps approximate commit time.** Transaction IDs
-are minted in `ProtoCodec.Transaction.from()` (called from `Mut.commit`)
+are minted by the commit loop (`LogRuntime.commit`, intentlog-core)
 using `UuidV7.newUuidV7After(original.highestDroppedTimestampMs())`,
 which embeds `System.currentTimeMillis()` in the high 48 bits, or the
 horizon of the catalog the writer read plus 1 ms if the clock has not
@@ -243,7 +243,7 @@ each record replay applies into the set, dropping nothing
 (`ProtoCatalogFile.Builder.build()`), and applies each GC record
 (`advanceHorizon`). A CAS (any CAS-mode commit, including the always-CAS
 path when `maxAppendCount=0`) writes a GC record between its checkpoint and
-its own record (`ProtoCatalogFormat` `buildFullFile`):
+its own record (`LogRuntime`, intentlog-core):
 
 ```
 function gcRecord(txn, retentionMs):
@@ -311,7 +311,7 @@ short retention. Replay skips them as it skips a record that fails
 verification.
 
 **Writers.** A writer asks `containsTransaction` of its own id on each
-read that decides its commit (`ProtoCatalogFormat.Mut.landed`). Its own
+read that decides its commit (`LogRuntime`'s `landed`). Its own
 CAS keeps the horizon below its record (the watermark cap above), and it
 mints its id after the horizon of the catalog it read. Another writer's
 compaction can still raise the horizon past an id in flight: a commit
@@ -730,7 +730,7 @@ the log portion), computed during `readInternal`.
 # (containsTransaction). If txn.id is at or below state's GC horizon, the set
 # cannot say: throw CommitStateUnknown if a write of txn may have landed (the
 # write this read resolves, or an earlier one that ambiguous or unresolved
-# tracks), else CommitFailed (ProtoCatalogFormat.Mut.landed).
+# tracks), else CommitFailed (LogRuntime's landed).
 # validateCommit(state, txn) returns state if landed(state), else throws
 # conflict(state).
 
@@ -946,7 +946,7 @@ Both write through `WRITE`, which retries a write that storage throttles
 (`StorageThrottleException`: a 429, a 5xx, the GCS per-object update rate)
 after a backoff that starts at `fileio.catalog.throttle.retry.min-wait-ms` and
 doubles up to the larger of 5 s and that value, each wait plus up to 50% random
-jitter (`ProtoCatalogFormat.Mut.retryThrottled`). Every attempt carries the
+jitter (`LogRuntime`'s `write`). Every attempt carries the
 same precondition, so at most one lands; a retry of one that landed fails its
 precondition, which `COMMIT` resolves by reading.
 

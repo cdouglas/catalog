@@ -35,7 +35,9 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.intentlog.DedupHorizonExceededException;
 import org.intentlog.CommittedSet;
+import org.intentlog.Replica;
 import org.intentlog.StateMachine;
+import org.intentlog.fileio.AtomicFileLog;
 import org.intentlog.wire.UuidV7;
 
 /**
@@ -88,6 +90,10 @@ public class ProtoCatalogFile extends CatalogFile {
   // Computed during readInternal; used by commit() to enforce max-append-count.
   private final int appendCount;
 
+  // The read of the catalog's intention log this state came from, if any: what the next commit
+  // writes on top of (LogRuntime). Null for a state built otherwise (empty, tests).
+  private final Replica<ProtoCatalogFile> replica;
+
   private ProtoCatalogFile(Builder builder) {
     super(builder.catalogUuid, builder.location);
     this.nextNamespaceId = builder.nextNamespaceId;
@@ -104,6 +110,45 @@ public class ProtoCatalogFile extends CatalogFile {
     this.snapshotManifests = deepCopySnapshotManifests(builder.snapshotManifests);
     this.committed = builder.committed.build();
     this.appendCount = builder.appendCount;
+    this.replica = null;
+  }
+
+  /** {@code state} as the read {@code replica} found it: its location, id, committed set. */
+  private ProtoCatalogFile(ProtoCatalogFile state, Replica<ProtoCatalogFile> replica) {
+    super(replica.logId(), AtomicFileLog.fileOf(replica.tail()));
+    this.nextNamespaceId = state.nextNamespaceId;
+    this.nextTableId = state.nextTableId;
+    this.namespaceById = state.namespaceById;
+    this.namespaceLookup = state.namespaceLookup;
+    this.tableById = state.tableById;
+    this.tableLookup = state.tableLookup;
+    this.nsProperties = state.nsProperties;
+    this.tblInlineMetadata = state.tblInlineMetadata;
+    this.tblInlineMetadataCodec = state.tblInlineMetadataCodec;
+    this.tblManifestPrefix = state.tblManifestPrefix;
+    this.manifestPool = state.manifestPool;
+    this.snapshotManifests = state.snapshotManifests;
+    this.committed = replica.committed();
+    this.appendCount = (int) replica.intentionRecords();
+    this.replica = replica;
+  }
+
+  /**
+   * The catalog a read of its intention log found: the replica's state, at the version of the
+   * catalog file the read ended at, with the log's id and committed set.
+   */
+  static ProtoCatalogFile of(Replica<ProtoCatalogFile> replica) {
+    return new ProtoCatalogFile(replica.state(), replica);
+  }
+
+  /**
+   * The replica the next commit writes on top of: the read this state came from, or, for a state
+   * built otherwise (an empty catalog not yet created), this state at its location.
+   */
+  Replica<ProtoCatalogFile> replica() {
+    return replica != null
+        ? replica
+        : new Replica<>(this, committed, AtomicFileLog.tailOf(location()), appendCount, uuid());
   }
 
   private static Map<Integer, Map<String, String>> deepCopyProperties(

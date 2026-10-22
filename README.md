@@ -37,9 +37,15 @@ next section).
 ## What's in here
 
 ```
+intentlog-core/                              the intention log: replicated state machine SPI,
+                                             log SPI, replay, committed set, commit loop
+                                             (LogRuntime); JDK only
+intentlog-fileio/                            the log in one object of a store with conditional
+                                             writes (AtomicFileLog, over SupportsAtomicOperations)
 iceberg-fileio-catalog/                      the catalog module (Maven), under src/:
   main/java/.../FileIOCatalog.java           catalog implementation
-  main/java/.../ProtoCatalogFormat.java      on-disk format (PB)
+  main/java/.../ProtoCatalogFormat.java      the catalog's format over the log runtime
+  main/java/.../CatalogStateMachine.java     the catalog as a state machine
   main/java/.../ProtoCodec.java              wire encoding for catalog
   main/java/.../InlineDeltaCodec.java        wire encoding for TM/ML deltas
   main/proto/catalog.proto                   protobuf schema
