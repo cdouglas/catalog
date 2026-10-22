@@ -175,8 +175,8 @@ public class TestProtoCatalogFormat {
   public void testTransactionEncodeDecode() {
     // Create a transaction with some actions
     List<ProtoCodec.Action> actions = List.of(
-        new ProtoCodec.CreateNamespaceAction(1, 1, 0, -1, "mydb"),
-        new ProtoCodec.CreateTableAction(1, 1, 1, -1, "mytable", "s3://bucket/metadata.json")
+        new ProtoCodec.CreateNamespaceAction(-1, 1, 0, -1, "mydb"),
+        new ProtoCodec.CreateTableAction(-1, 1, -1, -1, "mytable", "s3://bucket/metadata.json")
     );
 
     UUID txnId = UuidV7.newUuidV7();
@@ -221,8 +221,8 @@ public class TestProtoCatalogFormat {
 
     // Create a transaction that creates a namespace and table
     List<ProtoCodec.Action> actions = List.of(
-        new ProtoCodec.CreateNamespaceAction(1, 1, 0, -1, "mydb"),
-        new ProtoCodec.CreateTableAction(1, 1, 1, -1, "mytable", "s3://bucket/metadata.json")
+        new ProtoCodec.CreateNamespaceAction(-1, 1, 0, -1, "mydb"),
+        new ProtoCodec.CreateTableAction(-1, 1, -1, -1, "mytable", "s3://bucket/metadata.json")
     );
 
     ProtoCodec.Transaction txn = new ProtoCodec.Transaction(UuidV7.newUuidV7(), actions);
@@ -274,7 +274,7 @@ public class TestProtoCatalogFormat {
 
     // Write a transaction
     List<ProtoCodec.Action> actions = List.of(
-        new ProtoCodec.CreateNamespaceAction(1, 1, 0, -1, "testns")
+        new ProtoCodec.CreateNamespaceAction(-1, 1, 0, -1, "testns")
     );
     ProtoCodec.Transaction txn = new ProtoCodec.Transaction(UuidV7.newUuidV7(), actions);
     byte[] txnBytes = ProtoCodec.encodeTransaction(txn);
@@ -332,11 +332,11 @@ public class TestProtoCatalogFormat {
     byte[] origBytes = toFullFileBytes(orig);
 
     // Transaction A: create dingos -> dingos.yaks -> tblY
-    // Build actions directly to control the exact IDs
+    // Build actions directly: late-bound ids, a later create naming an earlier one's
     List<ProtoCodec.Action> actionsA = List.of(
-        new ProtoCodec.CreateNamespaceAction(1, 1, 0, -1, "dingos"),
-        new ProtoCodec.CreateNamespaceAction(2, 1, 1, -1, "yaks"),
-        new ProtoCodec.CreateTableAction(1, 1, 2, -1, "tblY", "yak://chinchilla/tblY")
+        new ProtoCodec.CreateNamespaceAction(-1, 1, 0, -1, "dingos"),
+        new ProtoCodec.CreateNamespaceAction(-2, 1, -1, -1, "yaks"),
+        new ProtoCodec.CreateTableAction(-1, 1, -2, -1, "tblY", "yak://chinchilla/tblY")
     );
     ProtoCodec.Transaction txnA = new ProtoCodec.Transaction(UuidV7.newUuidV7(), actionsA);
     byte[] txnABytes = toTransactionRecord(txnA);
@@ -377,14 +377,14 @@ public class TestProtoCatalogFormat {
 
     // txnB: create tblD in dingos - should succeed
     List<ProtoCodec.Action> actionsB = List.of(
-        new ProtoCodec.CreateTableAction(2, 1, 1, 1, "tblD", "yak://chinchilla/tblD")
+        new ProtoCodec.CreateTableAction(-1, 1, 1, 1, "tblD", "yak://chinchilla/tblD")
     );
     ProtoCodec.Transaction txnB = new ProtoCodec.Transaction(UuidV7.newUuidV7(), actionsB);
 
     // txnC: also tries to update tblY from version 1 - should FAIL
     // because txnA already updated it to version 2
     List<ProtoCodec.Action> actionsC = List.of(
-        new ProtoCodec.CreateNamespaceAction(3, 1, 0, -1, "yaks"),
+        new ProtoCodec.CreateNamespaceAction(-1, 1, 0, -1, "yaks"),
         new ProtoCodec.UpdateTableLocationAction(1, 1, "yak://chinchilla/tblY3")
     );
     ProtoCodec.Transaction txnC = new ProtoCodec.Transaction(UuidV7.newUuidV7(), actionsC);
@@ -414,15 +414,45 @@ public class TestProtoCatalogFormat {
     assertThat(result.containsTransaction(txnC.id())).isFalse();
   }
 
+  /**
+   * A create names its entity by a late-bound id, which replay binds. Replay rejects a record whose
+   * create names a concrete id (and the read succeeds): such a create could bring back an id a
+   * drop retired, at version 1, and a stale record whose preconditions failed before the drop
+   * would hold again. Rejection stays stable, which a log that writes without conditions relies on.
+   */
+  @Test
+  public void testCreateOfAConcreteIdIsRejected() throws IOException {
+    InputFile location = new TestInputFile("test://catalog");
+    ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(location);
+    builder.setNextNamespaceId(2);
+    builder.setNextTableId(2);
+    builder.addNamespace(1, 0, "dingos", 1);
+    byte[] origBytes = toFullFileBytes(builder.build());
+
+    ProtoCodec.Transaction namespace = new ProtoCodec.Transaction(UuidV7.newUuidV7(),
+        List.of(new ProtoCodec.CreateNamespaceAction(2, 1, 0, 0, "yaks")));
+    ProtoCodec.Transaction table = new ProtoCodec.Transaction(UuidV7.newUuidV7(),
+        List.of(new ProtoCodec.CreateTableAction(1, 1, 1, 1, "tblY", "yak://chinchilla/tblY")));
+    byte[] combined =
+        appendBytes(origBytes, toTransactionRecord(namespace), toTransactionRecord(table));
+
+    ProtoCatalogFile result = ProtoCatalogFormat.readInternal(
+        location, new ByteArrayInputStream(combined), combined.length);
+    assertThat(result.containsNamespace(Namespace.of("yaks"))).isFalse();
+    assertThat(result.containsTransaction(namespace.id())).isFalse();
+    assertThat(result.tables()).isEmpty();
+    assertThat(result.containsTransaction(table.id())).isFalse();
+  }
+
   @Test
   public void testDuplicateTransactionIdIgnored() throws IOException {
     InputFile location = new TestInputFile("test://catalog");
     ProtoCatalogFile orig = ProtoCatalogFile.empty(location);
     byte[] origBytes = toFullFileBytes(orig);
 
-    // txnA: create namespace with explicit ID
+    // txnA: create a namespace
     List<ProtoCodec.Action> actionsA = List.of(
-        new ProtoCodec.CreateNamespaceAction(1, 1, 0, -1, "dingos")
+        new ProtoCodec.CreateNamespaceAction(-1, 1, 0, -1, "dingos")
     );
     ProtoCodec.Transaction txnA = new ProtoCodec.Transaction(UuidV7.newUuidV7(), actionsA);
     byte[] txnARecord = toTransactionRecord(txnA);
@@ -506,7 +536,7 @@ public class TestProtoCatalogFormat {
     // txnB: read table at version 1 - should fail because txnA updated it
     List<ProtoCodec.Action> actionsB = List.of(
         new ProtoCodec.ReadTableAction(1, 1),
-        new ProtoCodec.CreateNamespaceAction(2, 1, 0, -1, "newns")
+        new ProtoCodec.CreateNamespaceAction(-1, 1, 0, -1, "newns")
     );
     ProtoCodec.Transaction txnB = new ProtoCodec.Transaction(UuidV7.newUuidV7(), actionsB);
 

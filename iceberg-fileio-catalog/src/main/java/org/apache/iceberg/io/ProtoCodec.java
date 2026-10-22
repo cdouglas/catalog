@@ -1651,10 +1651,15 @@ public class ProtoCodec {
       this.nextTableId = builder.nextTableId();
     }
 
-    /** Binds a namespace id at its defining create. Concrete ids pass through. */
+    /**
+     * Binds a namespace id at its defining create. A create must name its namespace by a
+     * late-bound (negative) id: one with a concrete id could bring back an id a drop retired, at
+     * version 1, and a stale record whose preconditions failed before the drop would then hold
+     * again. Replay rejects such a record (verify fails), so a rejection is stable.
+     */
     int defineNamespace(int id) {
       if (id >= 0) {
-        return id;
+        throw new IllegalStateException("A create names a concrete namespace id: " + id);
       }
       int real = Math.max(nextNamespaceId, builder.nextNamespaceId());
       nextNamespaceId = real + 1;
@@ -1667,10 +1672,10 @@ public class ProtoCodec {
       return id >= 0 ? id : resolve(namespaces, id, "namespace");
     }
 
-    /** Binds a table id at its defining create. Concrete ids pass through. */
+    /** Binds a table id at its defining create, which must be late-bound (as a namespace's). */
     int defineTable(int id) {
       if (id >= 0) {
-        return id;
+        throw new IllegalStateException("A create names a concrete table id: " + id);
       }
       int real = Math.max(nextTableId, builder.nextTableId());
       nextTableId = real + 1;

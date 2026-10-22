@@ -140,11 +140,82 @@ public class TestProtoActions {
   // ============================================================
 
   static ProtoCodec.Transaction txn(ProtoCodec.Action... actions) {
-    return new ProtoCodec.Transaction(UuidV7.newUuidV7(), List.of(actions));
+    return txn(UuidV7.newUuidV7(), actions);
   }
 
+  /**
+   * A transaction of {@code actions}, its creates' ids late-bound as a writer's are: replay rejects
+   * a create that names a concrete id, so that a rejection is stable. A create's id here is the id
+   * the test expects replay to bind (the catalog's next id, in the order of the transaction's
+   * creates); the record carries -1, -2, ... in its place, per kind, and the transaction's
+   * references to it are rewritten to match. A transaction that already names a late-bound id is
+   * left as it is.
+   */
   static ProtoCodec.Transaction txn(UUID id, ProtoCodec.Action... actions) {
-    return new ProtoCodec.Transaction(id, List.of(actions));
+    return new ProtoCodec.Transaction(id, lateBound(List.of(actions)));
+  }
+
+  /** {@code actions} with their creates' concrete ids late-bound (see {@link #txn}). */
+  static List<ProtoCodec.Action> lateBound(List<ProtoCodec.Action> actions) {
+    Map<Integer, Integer> ns = new HashMap<>();
+    Map<Integer, Integer> tbl = new HashMap<>();
+    for (ProtoCodec.Action a : actions) {
+      if (a instanceof ProtoCodec.CreateNamespaceAction) {
+        int created = ((ProtoCodec.CreateNamespaceAction) a).id;
+        if (created < 0) {
+          return actions;
+        }
+        ns.put(created, -(ns.size() + 1));
+      } else if (a instanceof ProtoCodec.CreateTableAction
+          || a instanceof ProtoCodec.CreateTableInlineAction) {
+        int created = a instanceof ProtoCodec.CreateTableAction
+            ? ((ProtoCodec.CreateTableAction) a).id
+            : ((ProtoCodec.CreateTableInlineAction) a).id;
+        if (created < 0) {
+          return actions;
+        }
+        tbl.put(created, -(tbl.size() + 1));
+      }
+    }
+    if (ns.isEmpty() && tbl.isEmpty()) {
+      return actions;
+    }
+    List<ProtoCodec.Action> bound = new ArrayList<>(actions.size());
+    for (ProtoCodec.Action a : actions) {
+      if (a instanceof ProtoCodec.CreateNamespaceAction) {
+        ProtoCodec.CreateNamespaceAction c = (ProtoCodec.CreateNamespaceAction) a;
+        bound.add(new ProtoCodec.CreateNamespaceAction(
+            ns.get(c.id), c.version, ns.getOrDefault(c.parentId, c.parentId), c.parentVersion,
+            c.name));
+      } else if (a instanceof ProtoCodec.CreateTableAction) {
+        ProtoCodec.CreateTableAction c = (ProtoCodec.CreateTableAction) a;
+        bound.add(new ProtoCodec.CreateTableAction(
+            tbl.get(c.id), c.version, ns.getOrDefault(c.namespaceId, c.namespaceId),
+            c.namespaceVersion, c.name, c.metadataLocation));
+      } else if (a instanceof ProtoCodec.CreateTableInlineAction) {
+        ProtoCodec.CreateTableInlineAction c = (ProtoCodec.CreateTableInlineAction) a;
+        bound.add(new ProtoCodec.CreateTableInlineAction(
+            tbl.get(c.id), c.version, ns.getOrDefault(c.namespaceId, c.namespaceId),
+            c.namespaceVersion, c.name, c.metadata, c.metadataCodec, c.deltaBytes));
+      } else if (a instanceof ProtoCodec.SetNamespacePropertyAction) {
+        ProtoCodec.SetNamespacePropertyAction c = (ProtoCodec.SetNamespacePropertyAction) a;
+        bound.add(new ProtoCodec.SetNamespacePropertyAction(
+            ns.getOrDefault(c.namespaceId, c.namespaceId), c.namespaceVersion, c.key, c.value));
+      } else if (a instanceof ProtoCodec.RemoveNamespacePropertyAction) {
+        ProtoCodec.RemoveNamespacePropertyAction c = (ProtoCodec.RemoveNamespacePropertyAction) a;
+        bound.add(new ProtoCodec.RemoveNamespacePropertyAction(
+            ns.getOrDefault(c.namespaceId, c.namespaceId), c.namespaceVersion, c.key));
+      } else if (a instanceof ProtoCodec.RenameTableAction) {
+        ProtoCodec.RenameTableAction c = (ProtoCodec.RenameTableAction) a;
+        bound.add(new ProtoCodec.RenameTableAction(
+            tbl.getOrDefault(c.id, c.id), c.version,
+            ns.getOrDefault(c.newNamespaceId, c.newNamespaceId), c.newNamespaceVersion,
+            c.newName));
+      } else {
+        bound.add(a);
+      }
+    }
+    return bound;
   }
 
   static ProtoCodec.CreateNamespaceAction createNs(
