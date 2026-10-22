@@ -103,7 +103,15 @@ public final class AtomicFileLog implements SharedLog {
   @Override
   public LogTail probe() {
     FileTail tail = new FileTail(io.newInputFile(location));
-    tail.bytes();
+    try {
+      tail.bytes();
+    } catch (RuntimeException e) {
+      // Each store reports a missing object its own way. The log does not exist yet if the object
+      // does not; else the object could not be read.
+      if (tail.exists()) {
+        throw e;
+      }
+    }
     return tail;
   }
 
@@ -119,6 +127,11 @@ public final class AtomicFileLog implements SharedLog {
 
   @Override
   public Receipt replace(LogTail expected, byte[] checkpoint, List<byte[]> records) {
+    return write(fileOf(expected), encode(checkpoint, records), AtomicOutputFile.Strategy.CAS);
+  }
+
+  /** The object a replace writes: the header, {@code checkpoint}, and {@code records} after it. */
+  public static byte[] encode(byte[] checkpoint, List<byte[]> records) {
     ByteArrayOutputStream out = new ByteArrayOutputStream();
     out.writeBytes(MAGIC);
     out.write((FORMAT_VERSION >>> 24) & 0xFF);
@@ -129,7 +142,15 @@ public final class AtomicFileLog implements SharedLog {
     for (byte[] record : records) {
       frame(out, record);
     }
-    return write(fileOf(expected), out.toByteArray(), AtomicOutputFile.Strategy.CAS);
+    return out.toByteArray();
+  }
+
+  /**
+   * The checkpoint and records of an object's bytes, which an append may have extended past what
+   * {@link #encode} wrote. The view's tail is the bytes' length, bound to no object.
+   */
+  public static LogView decode(byte[] bytes) {
+    return decode(bytes, new BytesTail(bytes.length));
   }
 
   /**
@@ -169,6 +190,12 @@ public final class AtomicFileLog implements SharedLog {
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
+    FileTail tail = new FileTail(file);
+    tail.length = bytes.length;
+    return decode(bytes, tail);
+  }
+
+  private static LogView decode(byte[] bytes, LogTail tail) {
     if (bytes.length < HEADER_SIZE) {
       throw new IllegalStateException("A catalog file of " + bytes.length + " bytes has no header");
     }
@@ -191,8 +218,6 @@ public final class AtomicFileLog implements SharedLog {
       while (in.available() > 0) {
         records.add(ProtoWire.readLengthDelimitedBytes(in));
       }
-      FileTail tail = new FileTail(file);
-      tail.length = bytes.length;
       return new FileView(tail, checkpoint, records);
     } catch (IOException e) {
       throw new UncheckedIOException(e);
@@ -254,12 +279,36 @@ public final class AtomicFileLog implements SharedLog {
     }
   }
 
+  /** The tail of bytes that {@link #decode} read, bound to no object. */
+  private static final class BytesTail implements LogTail {
+    private final long length;
+
+    BytesTail(long length) {
+      this.length = length;
+    }
+
+    @Override
+    public boolean exists() {
+      return true;
+    }
+
+    @Override
+    public long bytes() {
+      return length;
+    }
+
+    @Override
+    public boolean continues(LogTail earlier) {
+      return length >= earlier.bytes();
+    }
+  }
+
   private static final class FileView implements LogView {
-    private final FileTail tail;
+    private final LogTail tail;
     private final byte[] checkpoint;
     private final List<byte[]> records;
 
-    FileView(FileTail tail, byte[] checkpoint, List<byte[]> records) {
+    FileView(LogTail tail, byte[] checkpoint, List<byte[]> records) {
       this.tail = tail;
       this.checkpoint = checkpoint;
       this.records = records;

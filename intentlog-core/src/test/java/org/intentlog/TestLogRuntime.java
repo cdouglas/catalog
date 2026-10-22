@@ -52,11 +52,6 @@ class TestLogRuntime {
     return new LogRuntime<>(log, ToyMachine.INSTANCE, config(maxRecords, retentionMs));
   }
 
-  /** A replica of the log before it exists, as a writer bootstrapping it has. */
-  private Replica<Map<String, Integer>> nothing() {
-    return new Replica<>(Map.of(), CommittedSet.EMPTY, log.probe(), 0, UuidV7.newUuidV7());
-  }
-
   private Replica<Map<String, Integer>> bump(Replica<Map<String, Integer>> base, String key) {
     return runtime.commit(base, ToyMachine.Bump.of(base.state(), key));
   }
@@ -69,7 +64,7 @@ class TestLogRuntime {
   }
 
   private Replica<Map<String, Integer>> created() {
-    return bump(nothing(), "init");
+    return bump(runtime.empty(), "init");
   }
 
   @Test
@@ -82,11 +77,47 @@ class TestLogRuntime {
 
   @Test
   void case0ThatLostTheCreateIsRejected() {
-    Replica<Map<String, Integer>> before = nothing();
+    Replica<Map<String, Integer>> before = runtime.empty();
     created(); // another writer created the log first
     assertThatThrownBy(() -> runtime.commit(before, ToyMachine.Bump.of(before.state(), "k")))
         .isInstanceOfSatisfying(CommitRejectedException.class,
             e -> assertThat(e.reason()).isEqualTo(CommitRejectedException.Reason.CREATE_LOST));
+  }
+
+  @Test
+  void emptyIsTheStateBeforeTheLogExists() {
+    Replica<Map<String, Integer>> empty = runtime.empty();
+    assertThat(empty.state()).isEmpty();
+    assertThat(empty.tail().exists()).isFalse();
+    created();
+    assertThatThrownBy(runtime::empty).isInstanceOf(IllegalStateException.class);
+  }
+
+  @Test
+  void bootstrapCreatesTheLogOnce() {
+    runtime.bootstrap(ToyMachine.Bump.of(Map.of(), "init"));
+    runtime.bootstrap(ToyMachine.Bump.of(Map.of(), "init"));
+    assertThat(runtime.read().state()).containsEntry("init", 1);
+    assertThat(log.versionCount()).isEqualTo(1);
+  }
+
+  @Test
+  void bootstrapThatAnotherWriterBeatFindsItsLog() {
+    log.beforeNextWrite(this::created);
+    runtime.bootstrap(ToyMachine.Bump.of(Map.of(), "mine"));
+    assertThat(runtime.read().state()).containsEntry("init", 1).doesNotContainKey("mine");
+  }
+
+  @Test
+  void bootstrapThatCreatedNothingFails() {
+    log.faults(Fault.LOST_REQUEST);
+    assertThatThrownBy(() -> runtime.bootstrap(ToyMachine.Bump.of(Map.of(), "init")))
+        .isInstanceOf(CommitOutcomeUnknownException.class);
+    log.faults(Fault.NOT_SENT);
+    assertThatThrownBy(() -> runtime.bootstrap(ToyMachine.Bump.of(Map.of(), "init")))
+        .isInstanceOfSatisfying(CommitRejectedException.class,
+            e -> assertThat(e.reason()).isEqualTo(CommitRejectedException.Reason.NOT_SENT));
+    assertThat(log.probe().exists()).isFalse();
   }
 
   @Test

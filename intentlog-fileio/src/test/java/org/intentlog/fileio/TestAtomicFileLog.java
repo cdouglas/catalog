@@ -21,6 +21,7 @@ package org.intentlog.fileio;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
@@ -119,6 +120,36 @@ class TestAtomicFileLog {
     LogView appended = log.readThrough(log.append(bytes("r2"), created.tail()), Duration.ZERO);
     assertThatThrownBy(() -> log.append(bytes("r3"), appended.tail()))
         .isInstanceOf(LogFullException.class);
+  }
+
+  @Test
+  void aProbeOfAMissingObjectIsATailThatCreatesIt() {
+    LogTail missing = log.probe();
+    assertThat(missing.exists()).isFalse();
+    log.replace(missing, bytes("chk"), List.of());
+    assertThat(log.probe().exists()).isTrue();
+    assertThatThrownBy(() -> log.replace(missing, bytes("c2"), List.of()))
+        .isInstanceOf(LogConflictException.class);
+  }
+
+  @Test
+  void aProbeThatCannotReadAnObjectThatExistsFails() {
+    create();
+    io.injectReadFaults(location -> InMemoryAtomicFileIO.ReadFault.FAIL);
+    assertThatThrownBy(log::probe).isInstanceOf(UncheckedIOException.class);
+  }
+
+  @Test
+  void theLayoutDecodesAsAReadFindsIt() {
+    LogView created = create();
+    log.append(bytes("r2"), created.tail());
+    byte[] object = io.history().get(1).after();
+    LogView decoded = AtomicFileLog.decode(object);
+    assertThat(string(decoded.checkpoint().orElseThrow())).isEqualTo("chk");
+    assertThat(decoded.records()).extracting(TestAtomicFileLog::string).containsExactly("r1", "r2");
+    assertThat(decoded.tail().bytes()).isEqualTo(object.length);
+    assertThat(AtomicFileLog.encode(bytes("chk"), List.of(bytes("r1"))))
+        .isEqualTo(io.history().get(0).after());
   }
 
   @Test

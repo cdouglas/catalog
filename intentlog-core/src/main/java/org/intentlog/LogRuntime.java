@@ -56,6 +56,45 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
   }
 
   /**
+   * A replica of the log before it exists: the empty state, with a new log id, at the tail of the
+   * log not yet created. A commit on it creates the log, and is rejected ({@link
+   * CommitRejectedException.Reason#CREATE_LOST}) if another writer created it first.
+   *
+   * @throws IllegalStateException if the log exists
+   */
+  public Replica<S> empty() {
+    LogTail tail = log.probe();
+    if (tail.exists()) {
+      throw new IllegalStateException("The log exists");
+    }
+    return before(tail);
+  }
+
+  /**
+   * Creates the log, with a record of {@code initial}, unless it exists. Writers may bootstrap the
+   * same log at once: one creates it, and the others find it created. A create that fails or
+   * whose outcome is unknown is no failure if the log exists afterwards: another writer created
+   * it, or this create landed.
+   */
+  public void bootstrap(I initial) {
+    LogTail tail = log.probe();
+    if (tail.exists()) {
+      return;
+    }
+    try {
+      commit(before(tail), initial);
+    } catch (CommitRejectedException | CommitOutcomeUnknownException e) {
+      if (!log.probe().exists()) {
+        throw e;
+      }
+    }
+  }
+
+  private Replica<S> before(LogTail absent) {
+    return new Replica<>(machine.empty().build(), CommittedSet.EMPTY, absent, 0, UuidV7.newUuidV7());
+  }
+
+  /**
    * Commits {@code intention}, built from {@code base}, and returns the replica of the log its
    * record landed in.
    *

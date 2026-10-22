@@ -60,7 +60,11 @@ public interface SharedLog {
    */
   LogView readThrough(Receipt receipt, Duration wait);
 
-  /** The tail of the log, without its records: the precondition for a conditional write. */
+  /**
+   * The tail of the log, without its records: the precondition for a conditional write. If the
+   * log does not exist yet, a tail that says so ({@link LogTail#exists} is false), which a {@link
+   * #replace} that creates the log names.
+   */
   LogTail probe();
 
   /**
