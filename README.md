@@ -40,8 +40,13 @@ next section).
 intentlog-core/                              the intention log: replicated state machine SPI,
                                              log SPI, replay, committed set, commit loop
                                              (LogRuntime); JDK only
+intentlog-memory/                            a shared log in memory, with checkpoints apart
+                                             (InMemorySharedLog, CORFU-like; fault hooks)
 intentlog-fileio/                            the log in one object of a store with conditional
                                              writes (AtomicFileLog, over SupportsAtomicOperations)
+intentlog-testkit/                           what providers' tests share: the SharedLog contract,
+                                             a state machine of entity versions, and the
+                                             commit-protocol fuzzer (CommitProtocol)
 iceberg-fileio-catalog/                      the catalog module (Maven), under src/:
   main/java/.../LogCatalog.java              catalog over any shared log (Iceberg Catalog,
                                              namespaces, multi-table transactions)
@@ -140,7 +145,8 @@ suites skip; see [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
   `CatalogTransactionTests` in every local mode (append, CAS and
   compaction, each with pointer, inline TM and inline ML tables) over
   `InMemoryAtomicFileIO`, which enforces the conditions of CAS and
-  append writes. The cloud suites run the same tests against each store
+  append writes, and on a shared log (`InMemorySharedLog`) in each table
+  mode. The cloud suites run the same tests against each store
   ([docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md)).
 - **Property tests** ([jqwik](https://jqwik.net/)), in `mvn test`:
   - `TestCatalogFaultProperties` runs concurrent writers, each in its own
@@ -153,12 +159,22 @@ suites skip; see [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
     the operations and checks.
   - `TestCatalogRaceProperties` runs other operations just before an
     operation's catalog writes, and requires the result of a serial run.
+    It and `TestCatalogFaultProperties` draw the catalog's log: one
+    object, or a shared log.
   - `TestInlineDifferentialProperties` runs one schedule of table
     operations on a pointer catalog and an inline one, and requires the
     same results and reads; `TestInlineDeltaProperties` checks that every
     inline delta replays to the metadata it committed.
-  - `spec/` checks the format itself: concurrent writers, invariants,
-    codecs, and canonical state.
+  - `spec/` checks the format itself: concurrent writers (on one object
+    and on a shared log, with copies of records appended again, and
+    sends that land late), invariants, codecs, and canonical state.
+  - `CommitProtocol` (intentlog-testkit) fuzzes the commit protocol on
+    each provider (`TestMemoryCommitProtocol`,
+    `TestAtomicFileCommitProtocol`), over a state machine of entity
+    versions: faults, compactors and GC records inside commits, stale
+    reads, and copies of any record that ever landed, which must never
+    apply again. `SharedLogContract` holds each provider to the SharedLog
+    obligations.
 
   Each property's `tries` is in its `@Property` annotation; raise it for
   a longer run. Every bug the fuzzers or reviews found in this project

@@ -39,6 +39,8 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.intentlog.CommittedSet;
 import org.intentlog.DedupHorizonExceededException;
 import org.intentlog.Replica;
+import org.intentlog.fileio.AtomicFileLog;
+import org.intentlog.memory.InMemorySharedLog;
 import org.intentlog.wire.LogEnvelope;
 
 /**
@@ -83,6 +85,36 @@ public final class CheckpointRoundTrip {
                 "a checkpoint of write #%d (%s) to %s differs from it: %s",
                 i, write.strategy(), write.location(), difference));
       }
+    }
+  }
+
+  /**
+   * Fails if a checkpoint {@code log} stores is not the replay of the log through its position
+   * (I11), or the log, as a catalog file, differs from a checkpoint of it.
+   */
+  public static void assertEveryCheckpoint(InMemorySharedLog log) {
+    if (log.checkpoints().isEmpty()) {
+      return;
+    }
+    List<String> violations = new ArrayList<>(log.violations());
+    byte[] first = log.checkpoints().get(0L);
+    List<byte[]> records = log.records();
+    String whole = difference(AtomicFileLog.encode(first, records));
+    if (whole != null) {
+      violations.add("the log: " + whole);
+    }
+    for (Map.Entry<Long, byte[]> c : log.checkpoints().entrySet()) {
+      if (c.getKey() > 0L) {
+        String difference = checkpointIsReplay(
+            AtomicFileLog.encode(first, records.subList(0, c.getKey().intValue())),
+            AtomicFileLog.encode(c.getValue(), List.of()));
+        if (difference != null) {
+          violations.add("the checkpoint at position " + c.getKey() + ": " + difference);
+        }
+      }
+    }
+    if (!violations.isEmpty()) {
+      throw new AssertionError("checkpoints of " + log + ": " + violations);
     }
   }
 

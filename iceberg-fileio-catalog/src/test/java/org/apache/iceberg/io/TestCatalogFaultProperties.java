@@ -75,11 +75,12 @@ import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.ReadFault;
 import org.apache.iceberg.types.Types;
+import org.intentlog.memory.InMemorySharedLog;
 
 /**
- * Multi-writer fuzzer for {@link FileIOCatalog} on faulty storage, through Iceberg's table and
- * catalog APIs: the tier above {@code TestMultiWriterProperties}, which drives the catalog format
- * directly.
+ * Multi-writer fuzzer for {@link FileIOCatalog} (or a {@link LogCatalog} on a shared log, which a
+ * run draws) on faulty storage, through Iceberg's table and catalog APIs: the tier above {@code
+ * TestMultiWriterProperties}, which drives the catalog format directly.
  *
  * <p>A generated schedule runs, on one thread, operations by several writers, each with its own
  * catalog instance and table handles over shared {@link InMemoryAtomicFileIO} storage: fast and
@@ -180,6 +181,7 @@ class TestCatalogFaultProperties {
 
   @Property(tries = 100)
   void catalogMatchesModel(
+      @ForAll boolean sharedLog,
       @ForAll("modes") List<LocalCatalogMode> modes,
       @ForAll @IntRange(min = 2, max = 3) int writers,
       @ForAll("maxUpdateSizes") int maxUpdateSize,
@@ -188,13 +190,14 @@ class TestCatalogFaultProperties {
       @ForAll @IntRange(min = 0, max = 7) int gcWriters,
       @ForAll("segmentLimits") int segmentLimit,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(modes.subList(0, writers), maxUpdateSize, false, strictVersions, gzipWriters,
-        gcWriters, segmentLimit)
+    new Run(onLog(sharedLog, modes.subList(0, writers)), maxUpdateSize, false, strictVersions,
+        gzipWriters, gcWriters, segmentLimit)
         .execute(schedule);
   }
 
   @Property(tries = 100)
   void faultyStorageNeverMisreportsACommit(
+      @ForAll boolean sharedLog,
       @ForAll("modes") List<LocalCatalogMode> modes,
       @ForAll @IntRange(min = 2, max = 3) int writers,
       @ForAll("maxUpdateSizes") int maxUpdateSize,
@@ -203,15 +206,23 @@ class TestCatalogFaultProperties {
       @ForAll @IntRange(min = 0, max = 7) int gcWriters,
       @ForAll("segmentLimits") int segmentLimit,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(modes.subList(0, writers), maxUpdateSize, true, strictVersions, gzipWriters,
-        gcWriters, segmentLimit)
+    new Run(onLog(sharedLog, modes.subList(0, writers)), maxUpdateSize, true, strictVersions,
+        gzipWriters, gcWriters, segmentLimit)
         .execute(schedule);
+  }
+
+  /**
+   * The writers' modes on one catalog object, or on a shared log with the same table metadata
+   * storage: writers of one catalog share its log.
+   */
+  private static List<LocalCatalogMode> onLog(boolean sharedLog, List<LocalCatalogMode> modes) {
+    return sharedLog ? modes.stream().map(LocalCatalogMode::onSharedLog).toList() : modes;
   }
 
   /** Each writer's mode: one for all, a quarter of the time, else each its own. */
   @Provide
   Arbitrary<List<LocalCatalogMode>> modes() {
-    Arbitrary<LocalCatalogMode> mode = Arbitraries.of(LocalCatalogMode.class);
+    Arbitrary<LocalCatalogMode> mode = Arbitraries.of(LocalCatalogMode.fileModes());
     return Arbitraries.frequencyOf(
         Tuple.of(1, mode.map(m -> List.of(m, m, m))),
         Tuple.of(3, mode.list().ofSize(3)));
@@ -679,13 +690,13 @@ class TestCatalogFaultProperties {
 
   private static final class Writer {
     final int id;
-    final FileIOCatalog catalog;
+    final LogCatalog catalog;
     final Map<TableIdentifier, Table> handles = new HashMap<>();
     CatalogTransaction txn = null;
     final Map<TableIdentifier, Loaded> loaded = new LinkedHashMap<>();
     final List<Map.Entry<TableIdentifier, String>> staged = new ArrayList<>();
 
-    Writer(int id, FileIOCatalog catalog) {
+    Writer(int id, LogCatalog catalog) {
       this.id = id;
       this.catalog = catalog;
     }
@@ -704,7 +715,9 @@ class TestCatalogFaultProperties {
     private final boolean gc;
     private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
     private final Writer[] writers;
-    private final FileIOCatalog checker;
+    private final LogCatalog checker;
+    // The catalog's shared log, or null if the catalog is one object of the store.
+    private final InMemorySharedLog sharedLog;
     private Model model;
     private final StringBuilder trace = new StringBuilder();
     private int nextFile = 0;
@@ -768,9 +781,12 @@ class TestCatalogFaultProperties {
         this.writers[i] =
             new Writer(i, modes.get(i).catalog(io, WAREHOUSE, CATALOG_NAME, writerProperties));
       }
-      // Reading does not depend on a catalog's mode.
-      this.checker = LocalCatalogMode.APPEND.catalog(io, WAREHOUSE, CATALOG_NAME, properties);
-      FileIOCatalog seed = this.writers[0].catalog;
+      // Reading does not depend on a catalog's mode, only on its log.
+      this.checker = LocalCatalogMode.readerFor(io, CATALOG_LOCATION)
+          .catalog(io, WAREHOUSE, CATALOG_NAME, properties);
+      this.sharedLog = modes.get(0).sharedLog
+          ? LocalCatalogMode.sharedLog(io, CATALOG_LOCATION) : null;
+      LogCatalog seed = this.writers[0].catalog;
       seed.createNamespace(NS);
       create(seed, TABLES.get(0), 3);
       create(seed, TABLES.get(1), 2).newFastAppend().appendFile(newFile()).commit();
@@ -784,8 +800,30 @@ class TestCatalogFaultProperties {
       Statistics.label("gc writers")
           .collect(Integer.bitCount(gcWriters & ((1 << modes.size()) - 1)));
       Statistics.label("modes").collect(new TreeSet<>(modes).size() == 1 ? "one" : "mixed");
+      Statistics.label("log").collect(sharedLog != null ? "shared log" : "one object");
       io.injectFaults(this::onWrite);
       io.injectReadFaults(this::onRead);
+      if (sharedLog != null) {
+        // The log's requests meet the faults and preemption the catalog object's would.
+        sharedLog.intercept(new InMemorySharedLog.Interceptor() {
+          @Override
+          public InMemorySharedLog.WriteFault beforeWrite(
+              InMemorySharedLog.Request request, byte[] payload) {
+            if (request != InMemorySharedLog.Request.APPEND) {
+              return InMemorySharedLog.WriteFault.NONE;
+            }
+            Fault fault = onWrite(CATALOG_LOCATION, AtomicOutputFile.Strategy.APPEND);
+            return InMemorySharedLog.WriteFault.valueOf(
+                fault == Fault.LOST_REPLY_RUNTIME ? "LOST_REPLY" : fault.name());
+          }
+
+          @Override
+          public InMemorySharedLog.ReadShape beforeRead(InMemorySharedLog.Request request) {
+            return onRead(CATALOG_LOCATION) == ReadFault.NONE
+                ? InMemorySharedLog.ReadShape.NORMAL : InMemorySharedLog.ReadShape.FAIL;
+          }
+        });
+      }
     }
 
     void execute(List<Cmd> schedule) {
@@ -1866,8 +1904,19 @@ class TestCatalogFaultProperties {
           });
     }
 
-    /** Checks each catalog file written since the last check against a checkpoint of it. */
+    /**
+     * Checks each catalog file written since the last check against a checkpoint of it; on a
+     * shared log, every checkpoint stored against a replay of the log through it.
+     */
     private void checkCheckpoints() {
+      if (sharedLog != null) {
+        try {
+          CheckpointRoundTrip.assertEveryCheckpoint(sharedLog);
+        } catch (AssertionError e) {
+          throw fail("%s", e.getMessage());
+        }
+        return;
+      }
       List<InMemoryAtomicFileIO.Write> history = io.history();
       for (; checkedWrites < history.size(); checkedWrites++) {
         InMemoryAtomicFileIO.Write write = history.get(checkedWrites);
@@ -1897,7 +1946,9 @@ class TestCatalogFaultProperties {
     private Model actual() {
       checkCheckpoints();
       Model tables = new Model();
-      CatalogState file = CatalogTestSupport.log(io, CATALOG_LOCATION, PROPERTIES).read().state();
+      CatalogState file = (sharedLog != null
+          ? new CatalogLog(sharedLog, LogCatalogProperties.runtimeConfig(PROPERTIES))
+          : CatalogTestSupport.log(io, CATALOG_LOCATION, PROPERTIES)).read().state();
       List<TableIdentifier> ids = new ArrayList<>();
       for (Namespace ns : checker.listNamespaces(Namespace.empty())) {
         tables.namespaces.put(ns, new TreeMap<>(checker.loadNamespaceMetadata(ns)));

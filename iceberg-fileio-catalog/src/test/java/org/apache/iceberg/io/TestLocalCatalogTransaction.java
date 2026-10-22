@@ -26,14 +26,16 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 
 /**
- * Runs Iceberg's {@link CatalogTransactionTests} against {@link FileIOCatalog} in every {@link
- * LocalCatalogMode}, over {@link InMemoryAtomicFileIO}. Companion to {@link TestLocalCatalog}.
+ * Runs Iceberg's {@link CatalogTransactionTests} against {@link LogCatalog} in every {@link
+ * LocalCatalogMode}, over {@link InMemoryAtomicFileIO} (with the catalog's log in an {@link
+ * org.intentlog.memory.InMemorySharedLog} in the {@code MEMLOG} modes). Companion to {@link
+ * TestLocalCatalog}.
  */
 public class TestLocalCatalogTransaction {
 
-  abstract static class Suite extends CatalogTransactionTests<FileIOCatalog> {
+  abstract static class Suite extends CatalogTransactionTests<LogCatalog> {
     private InMemoryAtomicFileIO io;
-    private FileIOCatalog catalog;
+    private LogCatalog catalog;
 
     abstract LocalCatalogMode mode();
 
@@ -56,7 +58,7 @@ public class TestLocalCatalogTransaction {
     }
 
     @Override
-    protected FileIOCatalog catalog() {
+    protected LogCatalog catalog() {
       return catalog;
     }
   }
@@ -130,6 +132,30 @@ public class TestLocalCatalogTransaction {
     @Override
     LocalCatalogMode mode() {
       return LocalCatalogMode.COMPACT_ML;
+    }
+  }
+
+  @Nested
+  class SharedLog extends Suite {
+    @Override
+    LocalCatalogMode mode() {
+      return LocalCatalogMode.MEMLOG;
+    }
+  }
+
+  @Nested
+  class SharedLogInlineTM extends Suite {
+    @Override
+    LocalCatalogMode mode() {
+      return LocalCatalogMode.MEMLOG_TM;
+    }
+  }
+
+  @Nested
+  class SharedLogInlineML extends Suite {
+    @Override
+    LocalCatalogMode mode() {
+      return LocalCatalogMode.MEMLOG_ML;
     }
   }
 }

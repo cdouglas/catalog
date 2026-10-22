@@ -32,17 +32,18 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * Runs Iceberg's {@link CatalogTests} against {@link FileIOCatalog} in every {@link
- * LocalCatalogMode}, over {@link InMemoryAtomicFileIO}. The cloud drivers ({@code TestS3Catalog*},
- * {@code GCSCatalogTest*}, {@code ADLSCatalogTest*}) run the same suite against storage, but only
- * under {@code mvn verify} and, for append mode, only on real S3 Express.
+ * Runs Iceberg's {@link CatalogTests} against {@link LogCatalog} in every {@link LocalCatalogMode},
+ * over {@link InMemoryAtomicFileIO} (with the catalog's log in an {@link
+ * org.intentlog.memory.InMemorySharedLog} in the {@code MEMLOG} modes). The cloud drivers ({@code
+ * TestS3Catalog*}, {@code GCSCatalogTest*}, {@code ADLSCatalogTest*}) run the same suite against
+ * storage, but only under {@code mvn verify} and, for append mode, only on real S3 Express.
  */
 public class TestLocalCatalog {
 
-  abstract static class Suite extends CatalogTests<FileIOCatalog> {
+  abstract static class Suite extends CatalogTests<LogCatalog> {
     private InMemoryAtomicFileIO io;
     private String warehouse;
-    private FileIOCatalog catalog;
+    private LogCatalog catalog;
 
     abstract LocalCatalogMode mode();
 
@@ -60,12 +61,12 @@ public class TestLocalCatalog {
     }
 
     @Override
-    protected FileIOCatalog catalog() {
+    protected LogCatalog catalog() {
       return catalog;
     }
 
     @Override
-    protected FileIOCatalog initCatalog(String name, Map<String, String> additionalProperties) {
+    protected LogCatalog initCatalog(String name, Map<String, String> additionalProperties) {
       return mode().catalog(io, warehouse, name, additionalProperties);
     }
 
@@ -182,6 +183,30 @@ public class TestLocalCatalog {
     @Override
     LocalCatalogMode mode() {
       return LocalCatalogMode.COMPACT_ML;
+    }
+  }
+
+  @Nested
+  class SharedLog extends Suite {
+    @Override
+    LocalCatalogMode mode() {
+      return LocalCatalogMode.MEMLOG;
+    }
+  }
+
+  @Nested
+  class SharedLogInlineTM extends Suite {
+    @Override
+    LocalCatalogMode mode() {
+      return LocalCatalogMode.MEMLOG_TM;
+    }
+  }
+
+  @Nested
+  class SharedLogInlineML extends Suite {
+    @Override
+    LocalCatalogMode mode() {
+      return LocalCatalogMode.MEMLOG_ML;
     }
   }
 }

@@ -79,8 +79,8 @@ class TestInlineDifferentialProperties {
     Map<String, String> inlineProperties = properties(maxUpdateSize, gzip);
     InMemoryAtomicFileIO pointerIo = new InMemoryAtomicFileIO();
     InMemoryAtomicFileIO inlineIo = new InMemoryAtomicFileIO();
-    FileIOCatalog pointer = LocalCatalogMode.APPEND.catalog(pointerIo, WAREHOUSE, "c", Map.of());
-    FileIOCatalog inline = mode.catalog(inlineIo, WAREHOUSE, "c", inlineProperties);
+    LogCatalog pointer = LocalCatalogMode.APPEND.catalog(pointerIo, WAREHOUSE, "c", Map.of());
+    LogCatalog inline = mode.catalog(inlineIo, WAREHOUSE, "c", inlineProperties);
     pointer.createNamespace(Namespace.of("ns"));
     inline.createNamespace(Namespace.of("ns"));
     StringBuilder trace =
@@ -118,12 +118,12 @@ class TestInlineDifferentialProperties {
 
   @Provide
   Arbitrary<LocalCatalogMode> inlineModes() {
-    return Arbitraries.of(LocalCatalogMode.values()).filter(m -> m.inlineTM);
+    return Arbitraries.of(LocalCatalogMode.fileModes()).filter(m -> m.inlineTM);
   }
 
   @Provide
   Arbitrary<LocalCatalogMode> otherModes() {
-    return Arbitraries.of(LocalCatalogMode.values());
+    return Arbitraries.of(LocalCatalogMode.fileModes());
   }
 
   private static Map<String, String> properties(int maxUpdateSize, boolean gzip) {
@@ -145,9 +145,9 @@ class TestInlineDifferentialProperties {
   /** Reads the tables from each storage with a fresh pointer-mode reader and compares. */
   private static void compare(
       InMemoryAtomicFileIO pointerIo, InMemoryAtomicFileIO inlineIo, StringBuilder trace) {
-    FileIOCatalog pointerReader =
+    LogCatalog pointerReader =
         LocalCatalogMode.APPEND.catalog(pointerIo, WAREHOUSE, "c", Map.of());
-    FileIOCatalog inlineReader =
+    LogCatalog inlineReader =
         LocalCatalogMode.APPEND.catalog(inlineIo, WAREHOUSE, "c", Map.of());
     Map<String, String> expected = view(pointerReader.loadTable(TableScript.ID));
     Table inlineTable = inlineReader.loadTable(TableScript.ID);

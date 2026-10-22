@@ -1401,7 +1401,7 @@ public class TestCatalogRegressions {
         names = {"APPEND_ML", "CAS_ML", "COMPACT_ML"})
     void deleteThatMatchesNothingKeepsTheParentsManifests(LocalCatalogMode mode)
         throws IOException {
-      FileIOCatalog catalog = mode.catalog(new InMemoryAtomicFileIO(), "mem:///w", "c", Map.of());
+      LogCatalog catalog = mode.catalog(new InMemoryAtomicFileIO(), "mem:///w", "c", Map.of());
       catalog.createNamespace(Namespace.of("ns"));
       Table table = catalog.createTable(id, schema);
       table.newFastAppend().appendFile(file("a")).commit();
@@ -1417,8 +1417,8 @@ public class TestCatalogRegressions {
         names = {"APPEND_ML", "CAS_ML", "COMPACT_ML"})
     void deleteRebasedOntoARacingAppendKeepsIt(LocalCatalogMode mode) throws IOException {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
-      FileIOCatalog first = mode.catalog(io, "mem:///w", "c", Map.of());
-      FileIOCatalog second = mode.catalog(io, "mem:///w", "c", Map.of());
+      LogCatalog first = mode.catalog(io, "mem:///w", "c", Map.of());
+      LogCatalog second = mode.catalog(io, "mem:///w", "c", Map.of());
       first.createNamespace(Namespace.of("ns"));
       first.createTable(id, schema);
       Table table = first.loadTable(id);
@@ -1445,7 +1445,7 @@ public class TestCatalogRegressions {
         value = LocalCatalogMode.class,
         names = {"APPEND_ML", "CAS_ML", "COMPACT_ML"})
     void twoAppendsInOneCatalogTransactionKeepBoth(LocalCatalogMode mode) throws IOException {
-      FileIOCatalog catalog = mode.catalog(new InMemoryAtomicFileIO(), "mem:///w", "c", Map.of());
+      LogCatalog catalog = mode.catalog(new InMemoryAtomicFileIO(), "mem:///w", "c", Map.of());
       catalog.createNamespace(Namespace.of("ns"));
       catalog.createTable(id, schema).newFastAppend().appendFile(file("a")).commit();
 
@@ -1465,7 +1465,7 @@ public class TestCatalogRegressions {
         names = {"APPEND_ML", "CAS_ML", "COMPACT_ML"})
     void appendAfterADeleteThatMatchesNothingInOneTransaction(LocalCatalogMode mode)
         throws IOException {
-      FileIOCatalog catalog = mode.catalog(new InMemoryAtomicFileIO(), "mem:///w", "c", Map.of());
+      LogCatalog catalog = mode.catalog(new InMemoryAtomicFileIO(), "mem:///w", "c", Map.of());
       catalog.createNamespace(Namespace.of("ns"));
       Table table = catalog.createTable(id, schema);
       table.newFastAppend().appendFile(file("a")).commit();
@@ -1506,8 +1506,8 @@ public class TestCatalogRegressions {
     @org.junit.jupiter.params.provider.EnumSource(LocalCatalogMode.class)
     void changeToAReadTableAfterValidationFailsTheCommit(LocalCatalogMode mode) {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
-      FileIOCatalog first = mode.catalog(io, "mem:///w", "c", Map.of());
-      FileIOCatalog second = mode.catalog(io, "mem:///w", "c", Map.of());
+      LogCatalog first = mode.catalog(io, "mem:///w", "c", Map.of());
+      LogCatalog second = mode.catalog(io, "mem:///w", "c", Map.of());
       Namespace ns = Namespace.of("ns");
       first.createNamespace(ns);
       Schema schema = new Schema(Types.NestedField.required(1, "id", Types.IntegerType.get()));
@@ -1524,21 +1524,42 @@ public class TestCatalogRegressions {
       txc.loadTable(written).newFastAppend().appendFile(file("w1")).commit();
 
       // The commit reads the catalog once per table to validate, then once to commit. Another
-      // writer changes the read table just before that last read.
+      // writer changes the read table just before that last read: a read of the catalog object,
+      // or of the shared log.
       int[] reads = {0};
       Thread committer = Thread.currentThread();
-      io.injectReadFaults(
-          location -> {
-            if (location.equals("mem:///w/catalog-c")
-                && Thread.currentThread() == committer
-                && reads[0]++ == 2) {
-              second.loadTable(read).newFastAppend().appendFile(file("r1")).commit();
-            }
-            return ReadFault.NONE;
-          });
+      Runnable race = () -> {
+        if (Thread.currentThread() == committer && reads[0]++ == 2) {
+          second.loadTable(read).newFastAppend().appendFile(file("r1")).commit();
+        }
+      };
+      if (mode.sharedLog) {
+        LocalCatalogMode.sharedLog(io, "mem:///w/catalog-c").intercept(
+            new org.intentlog.memory.InMemorySharedLog.Interceptor() {
+              @Override
+              public org.intentlog.memory.InMemorySharedLog.ReadShape beforeRead(
+                  org.intentlog.memory.InMemorySharedLog.Request request) {
+                if (request == org.intentlog.memory.InMemorySharedLog.Request.READ) {
+                  race.run();
+                }
+                return org.intentlog.memory.InMemorySharedLog.ReadShape.NORMAL;
+              }
+            });
+      } else {
+        io.injectReadFaults(
+            location -> {
+              if (location.equals("mem:///w/catalog-c")) {
+                race.run();
+              }
+              return ReadFault.NONE;
+            });
+      }
       assertThatThrownBy(txn::commitTransaction)
           .isInstanceOf(org.apache.iceberg.exceptions.ValidationException.class);
       io.injectReadFaults(location -> ReadFault.NONE);
+      if (mode.sharedLog) {
+        LocalCatalogMode.sharedLog(io, "mem:///w/catalog-c").intercept(null);
+      }
 
       assertThat(first.loadTable(written).currentSnapshot()).isNull();
     }
@@ -1564,7 +1585,7 @@ public class TestCatalogRegressions {
         names = {"APPEND_TM", "CAS_TM", "COMPACT_TM", "APPEND_ML", "CAS_ML", "COMPACT_ML"})
     void handleToADroppedTableCannotCommitToItsSuccessor(LocalCatalogMode mode)
         throws IOException {
-      FileIOCatalog catalog = mode.catalog(new InMemoryAtomicFileIO(), "mem:///w", "c", Map.of());
+      LogCatalog catalog = mode.catalog(new InMemoryAtomicFileIO(), "mem:///w", "c", Map.of());
       catalog.createNamespace(Namespace.of("ns"));
       TableIdentifier id = TableIdentifier.of("ns", "t");
       Schema schema = new Schema(Types.NestedField.required(1, "id", Types.IntegerType.get()));
@@ -1599,7 +1620,7 @@ public class TestCatalogRegressions {
     @ParameterizedTest
     @org.junit.jupiter.params.provider.EnumSource(LocalCatalogMode.class)
     void commitAfterTheTableWasDroppedIsNoSuchTable(LocalCatalogMode mode) {
-      FileIOCatalog catalog = mode.catalog(new InMemoryAtomicFileIO(), "mem:///w", "c", Map.of());
+      LogCatalog catalog = mode.catalog(new InMemoryAtomicFileIO(), "mem:///w", "c", Map.of());
       catalog.createNamespace(Namespace.of("ns"));
       TableIdentifier id = TableIdentifier.of("ns", "t");
       catalog.createTable(id, new Schema(Types.NestedField.required(1, "id", Types.IntegerType.get())));
@@ -1843,12 +1864,14 @@ public class TestCatalogRegressions {
   private static final String WAREHOUSE = "mem:///w";
   private static final String CATALOG = WAREHOUSE + "/catalog-c";
 
-  private static FileIOCatalog catalog(InMemoryAtomicFileIO io, LocalCatalogMode mode) {
+  private static <C extends LogCatalog> C catalog(
+      InMemoryAtomicFileIO io, LocalCatalogMode mode) {
     return mode.catalog(io, WAREHOUSE, "c", Map.of());
   }
 
   /** A catalog whose inline updates must fit in 2 KiB. */
-  private static FileIOCatalog small(InMemoryAtomicFileIO io, LocalCatalogMode mode) {
+  private static <C extends LogCatalog> C small(
+      InMemoryAtomicFileIO io, LocalCatalogMode mode) {
     return mode.catalog(io, WAREHOUSE, "c", Map.of(FileIOCatalog.INLINE_MAX_UPDATE_SIZE, "2048"));
   }
 
@@ -3670,7 +3693,7 @@ public class TestCatalogRegressions {
     @org.junit.jupiter.params.provider.EnumSource(LocalCatalogMode.class)
     void commitsATransactionInANamespaceNamedLikeTheCatalog(LocalCatalogMode mode) {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
-      FileIOCatalog catalog = catalog(io, mode);
+      LogCatalog catalog = catalog(io, mode);
       TableIdentifier table = TableIdentifier.of("c", "t");
       catalog.createNamespace(table.namespace());
       catalog.createTable(table, intSchema);
@@ -3681,7 +3704,7 @@ public class TestCatalogRegressions {
       txn.asCatalog().loadTable(table).newFastAppend().appendFile(dataFile("a")).commit();
       txn.commitTransaction();
 
-      assertThat(dataFiles(catalog(io, LocalCatalogMode.APPEND).loadTable(table)))
+      assertThat(dataFiles(catalog(io, mode).loadTable(table)))
           .containsExactly(dataFile("a").location());
     }
   }

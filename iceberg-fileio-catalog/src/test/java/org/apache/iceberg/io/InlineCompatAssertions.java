@@ -63,7 +63,7 @@ public final class InlineCompatAssertions {
    * {@code METADATA_PREVIOUS_VERSIONS_MAX}) are preserved verbatim.
    */
   public static void runMetadataFileLocationsRemovalAfterCommit(
-      FileIOCatalog catalog,
+      LogCatalog catalog,
       TableIdentifier tableId,
       Namespace ns,
       Schema schema,
@@ -121,7 +121,7 @@ public final class InlineCompatAssertions {
    * metadata file to lose.
    */
   public static void runLoadTableWithMissingMetadataFile(
-      FileIOCatalog catalog, TableIdentifier tableId, Schema schema, boolean createNamespace)
+      LogCatalog catalog, TableIdentifier tableId, Schema schema, boolean createNamespace)
       throws IOException {
     if (createNamespace) {
       catalog.createNamespace(tableId.namespace());

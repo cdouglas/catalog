@@ -37,6 +37,8 @@ import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
 import org.apache.iceberg.types.Types;
+import org.intentlog.memory.InMemorySharedLog;
+import org.intentlog.wire.LogEnvelope;
 
 /**
  * Catalog operations race, and the outcome is a serial one. Writer A runs an operation, and
@@ -83,14 +85,22 @@ class TestCatalogRaceProperties {
 
   @Property(tries = 1000)
   void aRaceEndsAsASerialRun(
-      @ForAll("modes") LocalCatalogMode modeA,
-      @ForAll("modes") LocalCatalogMode modeB,
-      @ForAll("modes") LocalCatalogMode modeC,
+      @ForAll("modes") LocalCatalogMode fileModeA,
+      @ForAll("modes") LocalCatalogMode fileModeB,
+      @ForAll("modes") LocalCatalogMode fileModeC,
+      @ForAll boolean sharedLog,
       @ForAll("states") Setup setup,
       @ForAll("ops") Op a,
       @ForAll("ops") Op b,
       @ForAll("maybeOps") Op c,
       @ForAll boolean gc) {
+    // The writers' modes on one catalog object, or on a shared log with the same table metadata
+    // storage.
+    LocalCatalogMode modeA = sharedLog ? fileModeA.onSharedLog() : fileModeA;
+    LocalCatalogMode modeB = sharedLog ? fileModeB.onSharedLog() : fileModeB;
+    LocalCatalogMode modeC = sharedLog ? fileModeC.onSharedLog() : fileModeC;
+    LocalCatalogMode base = sharedLog ? LocalCatalogMode.MEMLOG : LocalCatalogMode.APPEND;
+    Statistics.label("log").collect(sharedLog ? "shared log" : "one object");
     List<Op> racers = c.kind == null ? List.of(b) : List.of(b, c);
     List<LocalCatalogMode> racerModes = List.of(modeB, modeC);
     // With gc, each CAS drops every committed transaction id older than its own (Bug 64).
@@ -100,9 +110,9 @@ class TestCatalogRaceProperties {
 
     // The race: the k-th racer runs just before A's k-th write to the catalog.
     InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
-    setup.apply(LocalCatalogMode.APPEND.catalog(io, WAREHOUSE, "c", Map.of()));
-    FileIOCatalog writerA = modeA.catalog(io, WAREHOUSE, "c", props);
-    List<FileIOCatalog> writers = List.of(
+    setup.apply(base.catalog(io, WAREHOUSE, "c", Map.of()));
+    LogCatalog writerA = modeA.catalog(io, WAREHOUSE, "c", props);
+    List<LogCatalog> writers = List.of(
         modeB.catalog(io, WAREHOUSE, "c", props), modeC.catalog(io, WAREHOUSE, "c", props));
     String[] results = new String[racers.size()];
     int[] writes = {0};
@@ -110,31 +120,54 @@ class TestCatalogRaceProperties {
     boolean[] changedItsReads = {false}; // whether a racer changed what A, a transaction, read
     boolean[] changedItsTable = {false}; // whether a racer changed the table A appends to at all
     List<Map<TableIdentifier, String>> loaded = new java.util.ArrayList<>(); // as A loaded them
-    io.injectFaults((location, strategy) -> {
-      if (!nested[0] && location.equals(CATALOG)) {
-        int k = writes[0]++;
-        if (k < racers.size()) {
-          nested[0] = true;
-          try {
-            if (a.kind == Kind.CATALOG_TXN && loaded.isEmpty()) {
-              loaded.add(a.reads(io)); // nothing has written since A loaded its tables
-            }
-            results[k] = racers.get(k).run(writers.get(k), name(k));
-            if (!loaded.isEmpty() && !a.unchanged(loaded.get(0), a.reads(io))) {
-              changedItsReads[0] = true;
-            }
-            if (!loaded.isEmpty() && !a.sameVersion(loaded.get(0), a.reads(io))) {
-              changedItsTable[0] = true;
-            }
-          } finally {
-            nested[0] = false;
+    Runnable beforeAWrite = () -> {
+      int k = writes[0]++;
+      if (k < racers.size()) {
+        nested[0] = true;
+        try {
+          if (a.kind == Kind.CATALOG_TXN && loaded.isEmpty()) {
+            loaded.add(a.reads(io)); // nothing has written since A loaded its tables
           }
+          results[k] = racers.get(k).run(writers.get(k), name(k));
+          if (!loaded.isEmpty() && !a.unchanged(loaded.get(0), a.reads(io))) {
+            changedItsReads[0] = true;
+          }
+          if (!loaded.isEmpty() && !a.sameVersion(loaded.get(0), a.reads(io))) {
+            changedItsTable[0] = true;
+          }
+        } finally {
+          nested[0] = false;
         }
       }
-      return Fault.NONE;
-    });
+    };
+    InMemorySharedLog log = sharedLog ? LocalCatalogMode.sharedLog(io, CATALOG) : null;
+    if (log != null) {
+      // A's writes are its intention records: the GC record of a compaction after its commit
+      // landed is not one.
+      log.intercept(new InMemorySharedLog.Interceptor() {
+        @Override
+        public InMemorySharedLog.WriteFault beforeWrite(
+            InMemorySharedLog.Request request, byte[] payload) {
+          if (!nested[0] && request == InMemorySharedLog.Request.APPEND
+              && !LogEnvelope.decodeRecord(payload).isAdvanceHorizon()) {
+            beforeAWrite.run();
+          }
+          return InMemorySharedLog.WriteFault.NONE;
+        }
+      });
+    } else {
+      io.injectFaults((location, strategy) -> {
+        if (!nested[0] && location.equals(CATALOG)) {
+          beforeAWrite.run();
+        }
+        return Fault.NONE;
+      });
+    }
     String raceA = a.run(writerA, "A");
     io.injectFaults((location, strategy) -> Fault.NONE);
+    if (log != null) {
+      log.intercept(null);
+    }
     int before = Math.min(writes[0], racers.size()); // racers that ran before one of A's writes
     for (int k = before; k < racers.size(); k++) {
       results[k] = racers.get(k).run(writers.get(k), name(k));
@@ -215,6 +248,9 @@ class TestCatalogRaceProperties {
           "the race left%n  %s%nthe serial run%n  %s%s", raceState, serialState, context));
     }
     CheckpointRoundTrip.assertEveryWrite(io);
+    if (log != null) {
+      CheckpointRoundTrip.assertEveryCheckpoint(log);
+    }
   }
 
   /**
@@ -226,7 +262,8 @@ class TestCatalogRaceProperties {
       List<LocalCatalogMode> racerModes, int before, Map<String, String> props,
       String[] results) {
     InMemoryAtomicFileIO serialIo = new InMemoryAtomicFileIO();
-    setup.apply(LocalCatalogMode.APPEND.catalog(serialIo, WAREHOUSE, "c", Map.of()));
+    setup.apply((modeA.sharedLog ? LocalCatalogMode.MEMLOG : LocalCatalogMode.APPEND)
+        .catalog(serialIo, WAREHOUSE, "c", Map.of()));
     for (int k = 0; k < before; k++) {
       results[k] = racers.get(k).run(
           racerModes.get(k).catalog(serialIo, WAREHOUSE, "c", props), name(k));
@@ -248,7 +285,7 @@ class TestCatalogRaceProperties {
 
   @Provide
   Arbitrary<LocalCatalogMode> modes() {
-    return Arbitraries.of(LocalCatalogMode.class);
+    return Arbitraries.of(LocalCatalogMode.fileModes());
   }
 
   /** A catalog state: some namespaces, with properties, and some tables in them. */
@@ -288,7 +325,7 @@ class TestCatalogRaceProperties {
       this.tables = tables;
     }
 
-    void apply(FileIOCatalog catalog) {
+    void apply(LogCatalog catalog) {
       for (int i = 0; i < NAMESPACES.size(); i++) {
         Namespace ns = NAMESPACES.get(i);
         if ((namespaces >> i & 1) == 1 && !catalog.namespaceExists(ns)) {
@@ -376,7 +413,8 @@ class TestCatalogRaceProperties {
 
     /** What the transaction's isolation checks of each table it reads, as stored now. */
     Map<TableIdentifier, String> reads(InMemoryAtomicFileIO io) {
-      FileIOCatalog reader = LocalCatalogMode.APPEND.catalog(io, WAREHOUSE, "c", Map.of());
+      LogCatalog reader =
+          LocalCatalogMode.readerFor(io, CATALOG).catalog(io, WAREHOUSE, "c", Map.of());
       Map<TableIdentifier, String> reads = new TreeMap<>(
           java.util.Comparator.comparing(TableIdentifier::toString));
       for (TableIdentifier id : readTables()) {
@@ -423,7 +461,7 @@ class TestCatalogRaceProperties {
     }
 
     /** Runs the operation as {@code who}; returns "ok" and its result, or the exception's class. */
-    String run(FileIOCatalog catalog, String who) {
+    String run(LogCatalog catalog, String who) {
       try {
         switch (kind) {
           case CREATE_NAMESPACE:
@@ -526,7 +564,8 @@ class TestCatalogRaceProperties {
 
   /** The catalog's namespaces with their properties, and its tables with theirs. */
   private static String state(InMemoryAtomicFileIO io) {
-    FileIOCatalog reader = LocalCatalogMode.APPEND.catalog(io, WAREHOUSE, "c", Map.of());
+    LogCatalog reader =
+        LocalCatalogMode.readerFor(io, CATALOG).catalog(io, WAREHOUSE, "c", Map.of());
     Map<String, String> state = new TreeMap<>();
     List<Namespace> pending = new java.util.ArrayList<>(reader.listNamespaces(Namespace.empty()));
     while (!pending.isEmpty()) {
