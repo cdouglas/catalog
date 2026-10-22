@@ -106,4 +106,32 @@ class TestReplay {
     assertThat(result.builder().build()).doesNotContainKey("k");
     assertThat(result.outcome()).isEqualTo(Replay.Outcome.REJECTED);
   }
+
+  @Test
+  void seesAWatchedRecordEvenWhenItSkipsIt() {
+    UUID a = id(100);
+    // A copy of a record a checkpoint holds: replay skips it, but saw it.
+    byte[] checkpoint = LogEnvelope.encodeCheckpoint(id(1),
+        CommittedSet.builder().add(a).build().bytes(), MACHINE.encodeCheckpoint(Map.of("k", 1)));
+    Replay.Result<ToyMachine.Versions> result =
+        Replay.replay(MACHINE, checkpoint, List.of(record(a, "k", 0)), a);
+    assertThat(result.outcome()).isEqualTo(Replay.Outcome.NOT_SEEN);
+    assertThat(result.seen()).isTrue();
+    assertThat(Replay.replay(MACHINE, checkpoint, List.of(), a).seen()).isFalse();
+  }
+
+  @Test
+  void replayOntoAReplicaContinuesWhereItsReadEnded() {
+    List<byte[]> log = List.of(record(id(100), "k", 0), record(id(101), "j", 0),
+        LogEnvelope.encodeAdvanceHorizon(100), record(id(102), "k", 1));
+    Replay.Result<ToyMachine.Versions> whole = Replay.replay(MACHINE, null, log, null);
+    Replay.Result<ToyMachine.Versions> first =
+        Replay.replay(MACHINE, null, log.subList(0, 2), null);
+    Replay.Result<ToyMachine.Versions> rest = Replay.replayOnto(MACHINE,
+        MACHINE.toBuilder(first.builder().build()), first.committed().build().toBuilder(), null,
+        first.intentionRecords(), log.subList(2, 4), null);
+    assertThat(rest.builder().build()).isEqualTo(whole.builder().build());
+    assertThat(rest.committed().build().bytes()).isEqualTo(whole.committed().build().bytes());
+    assertThat(rest.intentionRecords()).isEqualTo(whole.intentionRecords());
+  }
 }

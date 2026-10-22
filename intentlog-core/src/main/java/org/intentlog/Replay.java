@@ -52,15 +52,17 @@ public final class Replay {
     private final UUID logId;
     private final long intentionRecords;
     private final Outcome outcome;
+    private final boolean seen;
 
     private Result(
         B builder, CommittedSet.Builder committed, UUID logId, long intentionRecords,
-        Outcome outcome) {
+        Outcome outcome, boolean seen) {
       this.builder = builder;
       this.committed = committed;
       this.logId = logId;
       this.intentionRecords = intentionRecords;
       this.outcome = outcome;
+      this.seen = seen;
     }
 
     /** The state machine's builder, the records applied. */
@@ -87,6 +89,15 @@ public final class Replay {
     public Outcome outcome() {
       return outcome;
     }
+
+    /**
+     * Whether a record of the watched id was among the records replayed, judged or skipped (a
+     * retry of one applied, or at or below the horizon). A read through a write whose record is
+     * not among them cannot settle the write's outcome.
+     */
+    public boolean seen() {
+      return seen;
+    }
   }
 
   /**
@@ -98,22 +109,26 @@ public final class Replay {
    */
   public static <S, B extends StateMachine.Builder<S>, I extends Intention<B>> Result<B> replay(
       StateMachine<S, B, I> machine, byte[] checkpoint, Iterable<byte[]> records, UUID watch) {
-    B builder;
-    CommittedSet.Builder committed;
-    UUID logId;
     if (checkpoint != null) {
       LogEnvelope.Checkpoint envelope = LogEnvelope.decodeCheckpoint(checkpoint);
-      builder = machine.decodeCheckpoint(envelope.state());
-      committed = CommittedSet.of(envelope.committed()).toBuilder();
-      logId = envelope.logId();
-    } else {
-      builder = machine.empty();
-      committed = CommittedSet.builder();
-      logId = null;
+      return replayOnto(machine, machine.decodeCheckpoint(envelope.state()),
+          CommittedSet.of(envelope.committed()).toBuilder(), envelope.logId(), 0, records, watch);
     }
+    return replayOnto(machine, machine.empty(), CommittedSet.builder(), null, 0, records, watch);
+  }
 
-    long intentionRecords = 0;
+  /**
+   * Replays {@code records} onto a state and committed set already replayed (a replica that a
+   * read reached, which the records follow), which this mutates.
+   *
+   * @param logId the log's id, or null if unknown
+   * @param intentionRecords the intention records replayed before these, after the checkpoint
+   */
+  public static <S, B extends StateMachine.Builder<S>, I extends Intention<B>> Result<B> replayOnto(
+      StateMachine<S, B, I> machine, B builder, CommittedSet.Builder committed, UUID logId,
+      long intentionRecords, Iterable<byte[]> records, UUID watch) {
     Outcome outcome = Outcome.NOT_SEEN;
+    boolean seen = false;
     for (byte[] bytes : records) {
       LogEnvelope.Record record = LogEnvelope.decodeRecord(bytes);
       if (record.isAdvanceHorizon()) {
@@ -122,6 +137,7 @@ public final class Replay {
       }
       intentionRecords++;
       UUID id = record.id();
+      seen |= id.equals(watch);
       if (!committed.mayApply(id)) {
         // Already applied (a retry), or its id is at or below the committed set's GC horizon,
         // where the set cannot tell a retry of an aged-out commit from a new one.
@@ -141,6 +157,6 @@ public final class Replay {
         outcome = Outcome.REJECTED;
       }
     }
-    return new Result<>(builder, committed, logId, intentionRecords, outcome);
+    return new Result<>(builder, committed, logId, intentionRecords, outcome, seen);
   }
 }

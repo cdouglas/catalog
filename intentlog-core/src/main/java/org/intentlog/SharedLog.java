@@ -33,7 +33,9 @@ import java.util.List;
  *   <li>P1: one total order of records, and every read returns a checkpoint and a prefix of the
  *       records after it.
  *   <li>P2: an acknowledged write (append, replace, checkpoint) is durable.
- *   <li>P3: {@link #readThrough} returns a view that contains the receipt's record.
+ *   <li>P3: {@link #readThrough} returns a view whose records (after its checkpoint) include the
+ *       receipt's record, or fails: a view whose checkpoint already holds the record cannot say
+ *       whether it applied once the committed set's GC drops its id.
  *   <li>P4: of several conditional writes on the same tail, at most one lands.
  *   <li>P5: no trim before a durable checkpoint covers the records trimmed.
  *   <li>P6: {@link LogFullException} and {@link LogNotSentException} mean nothing landed.
@@ -54,9 +56,10 @@ public interface SharedLog {
   LogView read();
 
   /**
-   * A view that contains the record {@code receipt} acknowledged (P3): for a log whose reads lag
-   * its appends, waiting up to {@code wait} for it. Any exception leaves the write's outcome
-   * unknown.
+   * A view whose records include the one {@code receipt} acknowledged (P3): for a log whose reads
+   * lag its appends, waiting up to {@code wait} for it ({@link LogLagException} after). A log that
+   * trimmed the record, so that every checkpoint it keeps already holds it, throws {@link
+   * TrimmedException}. Any exception leaves the write's outcome unknown.
    */
   LogView readThrough(Receipt receipt, Duration wait);
 
@@ -84,7 +87,9 @@ public interface SharedLog {
 
   /**
    * Stores {@code checkpoint}, the state of the log through {@code through}, apart from the
-   * records. Idempotent: every checkpoint at one position is the same (I11). Needs {@link
+   * records. Idempotent: every checkpoint at one position is the same (I11). If {@code through}
+   * says the log does not exist ({@link LogTail#exists}), creates the log with {@code checkpoint}
+   * as its first, unless it exists with another ({@link LogConflictException}). Needs {@link
    * Capabilities#separateCheckpoints}.
    */
   default void putCheckpoint(LogTail through, byte[] checkpoint) {
@@ -95,10 +100,11 @@ public interface SharedLog {
   default void trim(LogTail through) {}
 
   /**
-   * The records after the view {@code since}, as a view to fold onto it; may throw {@link
-   * TrimmedException} if the log dropped them. By default, a fresh {@link #read}.
+   * The records after the tail {@code since}, as a view without a checkpoint to fold onto the
+   * replica read at {@code since}; or a whole view (with a checkpoint) to replay afresh. May throw
+   * {@link TrimmedException} if the log dropped them. By default, a fresh {@link #read}.
    */
-  default LogView readAfter(LogView since) {
+  default LogView readAfter(LogTail since) {
     return read();
   }
 }

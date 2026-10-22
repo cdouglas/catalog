@@ -32,6 +32,8 @@
 
   <modules>
     <module>intentlog-core</module>
+    <module>intentlog-testkit</module>
+    <module>intentlog-memory</module>
     <module>intentlog-fileio</module>
     <module>iceberg-fileio-catalog</module>
   </modules>

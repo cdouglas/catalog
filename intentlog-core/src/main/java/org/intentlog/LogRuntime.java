@@ -56,6 +56,104 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
   }
 
   /**
+   * {@code prior} brought up to date: the records appended since folded onto it, if the log reads
+   * them apart ({@link SharedLog#readAfter}); else, or if it trimmed them, a fresh read. Either
+   * way the same replica, since replay is deterministic and every checkpoint is the replay of the
+   * log through it (I11).
+   */
+  public Replica<S> refresh(Replica<S> prior) {
+    LogView view;
+    try {
+      view = log.readAfter(prior.tail());
+    } catch (TrimmedException e) {
+      return read();
+    }
+    if (view.checkpoint().isPresent()) {
+      return replay(view, null, prior.logId()).replica();
+    }
+    Replay.Result<B> result =
+        Replay.replayOnto(machine, machine.toBuilder(prior.state()), prior.committed().toBuilder(),
+            prior.logId(), prior.intentionRecords(), view.records(), null);
+    return new Replayed(view, result, prior.logId()).replica();
+  }
+
+  /**
+   * Compacts a log that keeps its checkpoints apart from its records ({@link
+   * Capabilities#separateCheckpoints}): appends a GC record at the clock less the retention (none
+   * when GC is off), reads through it, stores the replay there as a checkpoint, and trims the
+   * records it holds. Any compactor may run it at any time, and each step is safe to repeat or
+   * to abandon: a GC record that lands twice drops nothing new, a checkpoint is the replay of the
+   * log through its position whoever writes it (I11), and the trim follows a durable checkpoint
+   * (P5). Returns the replica it checkpointed.
+   */
+  public Replica<S> compact() {
+    if (!log.capabilities().separateCheckpoints()) {
+      throw new UnsupportedOperationException(
+          "A log that replaces itself compacts as it commits: " + log);
+    }
+    long watermark = watermark(Long.MAX_VALUE);
+    LogView view;
+    if (watermark > 0L) {
+      byte[] gc = LogEnvelope.encodeAdvanceHorizon(watermark);
+      view = log.readThrough(sendThrottled(() -> log.append(gc, null)), config.visibilityWait());
+    } else {
+      view = log.read();
+    }
+    Replica<S> through = replay(view, null).replica();
+    log.putCheckpoint(view.tail(), checkpoint(through));
+    log.trim(view.tail());
+    return through;
+  }
+
+  /**
+   * The GC watermark a compaction writes now: the clock less the retention, at most {@code
+   * ceiling}; 0 (no GC record) when the retention reaches back past the epoch ({@code
+   * Long.MAX_VALUE} disables GC).
+   */
+  private long watermark(long ceiling) {
+    long now = config.clockMs().getAsLong();
+    long retention = config.committedRetentionMs();
+    long watermark = retention >= now ? 0L : now - retention;
+    return Math.max(0L, Math.min(watermark, ceiling));
+  }
+
+  /** The checkpoint of {@code replica}: exactly its log id, committed set and state. */
+  private byte[] checkpoint(Replica<S> replica) {
+    return LogEnvelope.encodeCheckpoint(
+        replica.logId(), replica.committed().bytes(), machine.encodeCheckpoint(replica.state()));
+  }
+
+  /** Sends a write again while the log throttles it, with the commit loop's backoff. */
+  private Receipt sendThrottled(Supplier<Receipt> send) {
+    long backoffMs = config.throttleMinWaitMs();
+    for (int attempt = 1; ; attempt++) {
+      try {
+        return send.get();
+      } catch (LogThrottledException e) {
+        if (attempt >= config.maxThrottleAttempts()) {
+          throw e;
+        }
+        sleep(backoffMs + ThreadLocalRandom.current().nextLong(backoffMs / 2 + 1), e);
+        backoffMs = Math.min(backoffMs * 2, Math.max(5_000L, config.throttleMinWaitMs()));
+      }
+    }
+  }
+
+  /** Sleeps; an interrupt stops the caller, with {@code cause} (its outcome unknown) thrown. */
+  private static void sleep(long ms, RuntimeException cause) {
+    if (ms <= 0L) {
+      return;
+    }
+    try {
+      Thread.sleep(ms);
+    } catch (InterruptedException ie) {
+      Thread.currentThread().interrupt();
+      cause.addSuppressed(ie);
+      throw new CommitOutcomeUnknownException(cause);
+    }
+  }
+
+  /**
    * A replica of the log before it exists: the empty state, with a new log id, at the tail of the
    * log not yet created. A commit on it creates the log, and is rejected ({@link
    * CommitRejectedException.Reason#CREATE_LOST}) if another writer created it first.
@@ -102,8 +200,23 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
    * @throws CommitOutcomeUnknownException if it may or may not have
    */
   public Replica<S> commit(Replica<S> base, I intention) {
-    return new Commit(base, intention).run();
+    Replica<S> landed = new Commit(base, intention).run();
+    Capabilities caps = log.capabilities();
+    if (caps.separateCheckpoints() && !caps.fusedReplace()) {
+      // The writer whose commit landed compacts, as the policy says of the log it read; the commit
+      // stands whatever becomes of the compaction.
+      try {
+        if (config.compaction().due(landed.intentionRecords(), landed.tail().bytes(), 0)) {
+          compact();
+        }
+      } catch (RuntimeException e) {
+        LOG.log(System.Logger.Level.WARNING, "Compaction after a commit failed: " + log, e);
+      }
+    }
+    return landed;
   }
+
+  private static final System.Logger LOG = System.getLogger(LogRuntime.class.getName());
 
   // ============================================================
   // Replay
@@ -195,6 +308,14 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     // Express: 10,000 parts; an Azure Append Blob: 50,000 blocks): only a replace can commit
     // then, whatever the policy says.
     private boolean full = false;
+    // A send that the log throttled before the one it acknowledged, if the send was unconditional:
+    // it may have landed too, so the record may be in the log twice (on one object, the second
+    // send fails its condition instead, P4).
+    private Throwable duplicate = null;
+    // On a log that cannot replace itself, the tail no read of this commit may fall behind: the
+    // read it staged on, or a later one it adopted. On a read that lags behind it, the intention
+    // may not hold yet while its record has applied.
+    private LogTail floor;
 
     Commit(Replica<S> base, I intention) {
       this.base = base;
@@ -204,6 +325,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
       this.record = LogEnvelope.encodeRecord(id, machine.encodeIntention(intention));
       this.current = base;
       this.tail = base.tail();
+      this.floor = !caps.fusedReplace() && tail.exists() ? tail : null;
     }
 
     Replica<S> run() {
@@ -224,10 +346,13 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     }
 
     private Replica<S> loop() {
-      // Case 0: the log does not exist yet. Only a replace creates it.
-      if (!tail.exists()) {
+      // Case 0: the log does not exist yet. A log that replaces itself is created by a replace of
+      // the absent log; one that keeps checkpoints apart, by its first checkpoint.
+      if (!tail.exists() && !caps.fusedReplace()) {
+        create();
+      } else if (!tail.exists()) {
         try {
-          return validate(write(() -> log.replace(tail, checkpoint(base), records(base))));
+          return validate(write(() -> log.replace(tail, checkpoint(base), records(base)), false));
         } catch (AmbiguousWrite | LogConflictException e) {
           // The creation may have landed: its reply was lost, reading it back failed, or it failed
           // its condition, as a transport retry of a creation that landed does.
@@ -274,7 +399,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
             try {
               Replica<S> on = current;
               LogTail at = tail;
-              return validate(write(() -> log.replace(at, checkpoint(on), records(on))));
+              return validate(write(() -> log.replace(at, checkpoint(on), records(on)), false));
             } catch (LogConflictException e) {
               unresolved = e;
             }
@@ -296,7 +421,9 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
           } else {
             try {
               LogTail at = tail;
-              return validate(write(() -> log.append(record, caps.conditionalAppend() ? at : null)));
+              boolean conditional = caps.conditionalAppend();
+              return validate(
+                  write(() -> log.append(record, conditional ? at : null), !conditional));
             } catch (LogFullException e) {
               // Nothing landed, and no append to this log can: replace it, on a fresh read.
               // Without this the commit took the append for ambiguous, and with a count above the
@@ -382,17 +509,44 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
       current = fresh.replica();
       tail = current.tail();
       stale = false;
+      if (!caps.fusedReplace()) {
+        floor = tail;
+      }
     }
 
-    /** The last write of this commit that may have landed, or null. */
+    /** The last write of this commit, but one acknowledged, that may have landed, or null. */
     private Throwable earlier() {
-      return ambiguous != null ? ambiguous.getCause() : unresolved;
+      return ambiguous != null ? ambiguous.getCause() : unresolved != null ? unresolved : duplicate;
     }
 
-    /** The checkpoint a replace of the log at {@code on} writes: exactly {@code on}'s state. */
-    private byte[] checkpoint(Replica<S> on) {
-      return LogEnvelope.encodeCheckpoint(
-          on.logId(), on.committed().bytes(), machine.encodeCheckpoint(on.state()));
+    /**
+     * Creates a log that keeps its checkpoints apart: stores the base's checkpoint (the empty
+     * state, with the new log's id) as the log's first, and adopts a read of the log created.
+     * Nothing of the intention has been sent, so a create that another writer beat, or whose
+     * outcome no read settles, rejects the commit.
+     */
+    private void create() {
+      RuntimeException failure = null;
+      try {
+        log.putCheckpoint(tail, checkpoint(base));
+      } catch (RuntimeException e) {
+        failure = e; // another writer's create, or one of ours that may have landed
+      }
+      Replayed fresh;
+      try {
+        fresh = replay(log.read(), id, base.logId());
+      } catch (RuntimeException e) {
+        if (failure != null) {
+          e.addSuppressed(failure);
+        }
+        throw new CommitRejectedException(CommitRejectedException.Reason.NOT_SENT, null,
+            "Cannot commit: creating the log failed, and reading it failed too: " + e, e);
+      }
+      if (!fresh.replica().logId().equals(base.logId())) {
+        throw new CommitRejectedException(CommitRejectedException.Reason.CREATE_LOST,
+            fresh.replica(), "Cannot commit: another writer created the log first", failure);
+      }
+      adopt(fresh);
     }
 
     /**
@@ -405,10 +559,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
      * rebased on, minted after it.
      */
     private List<byte[]> records(Replica<S> on) {
-      long now = config.clockMs().getAsLong();
-      long retention = config.committedRetentionMs();
-      long watermark = retention >= now ? 0L : now - retention;
-      watermark = Math.max(0L, Math.min(watermark, UuidV7.timestampMs(id) - 1));
+      long watermark = watermark(UuidV7.timestampMs(id) - 1);
       List<byte[]> records = new ArrayList<>(2);
       if (watermark > 0L) {
         records.add(LogEnvelope.encodeAdvanceHorizon(watermark));
@@ -428,7 +579,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
      * The protocol's conflict and full signals propagate; any other failure of the write, or of
      * reading back what it wrote, is an {@link AmbiguousWrite}.
      */
-    private Replayed write(Supplier<Receipt> send) {
+    private Replayed write(Supplier<Receipt> send, boolean unconditional) {
       long backoffMs = config.throttleMinWaitMs();
       LogThrottledException lastThrottle = null;
       for (int attempt = 0; attempt < config.maxThrottleAttempts(); attempt++) {
@@ -437,14 +588,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
           receipt = send.get();
         } catch (LogThrottledException e) {
           lastThrottle = e;
-          long sleepMs = backoffMs + ThreadLocalRandom.current().nextLong(backoffMs / 2 + 1);
-          try {
-            Thread.sleep(sleepMs);
-          } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            e.addSuppressed(ie);
-            throw new CommitOutcomeUnknownException(e);
-          }
+          sleep(backoffMs + ThreadLocalRandom.current().nextLong(backoffMs / 2 + 1), e);
           backoffMs = Math.min(backoffMs * 2, Math.max(5_000L, config.throttleMinWaitMs()));
           continue;
         } catch (LogNotSentException e) {
@@ -459,11 +603,24 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
         } catch (RuntimeException e) {
           throw new AmbiguousWrite(e);
         }
+        if (unconditional && lastThrottle != null) {
+          // The throttled send may have landed beside this one, and a view through this one may
+          // start from a checkpoint that holds the other (dup in SharedLogCommit.tla).
+          duplicate = lastThrottle;
+        }
+        Replayed written;
         try {
-          return replay(log.readThrough(receipt, config.visibilityWait()), id, base.logId());
+          written = replay(log.readThrough(receipt, config.visibilityWait()), id, base.logId());
         } catch (RuntimeException e) {
           throw new AmbiguousWrite(e);
         }
+        if (!written.result.seen()) {
+          // Only a view whose records include this one can settle it (P3): a checkpoint that holds
+          // it cannot say whether it applied once GC drops its id.
+          throw new AmbiguousWrite(new IllegalStateException(
+              "A read through a write to " + log + " does not include its record"));
+        }
+        return written;
       }
       throw new AmbiguousWrite(
           new IOException(
@@ -471,10 +628,25 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
               lastThrottle));
     }
 
-    /** A fresh read; any failure becomes {@link UnreadableLog}. */
+    /**
+     * A fresh read; any failure becomes {@link UnreadableLog}. On a log that cannot replace itself,
+     * a read that lags behind {@link #floor} is read again, waiting up to the visibility wait in
+     * all, and then fails ({@link LogLagException}).
+     */
     private Replayed read() {
       try {
-        return replay(log.read(), id, base.logId());
+        LogView view = log.read();
+        for (int attempt = 1; floor != null && !view.tail().continues(floor); attempt++) {
+          if (attempt >= config.maxThrottleAttempts()) {
+            throw new LogLagException("A read of " + log + " lags behind one this commit made");
+          }
+          sleep(config.visibilityWait().toMillis() / config.maxThrottleAttempts(),
+              new LogLagException("Interrupted waiting for " + log));
+          view = log.read();
+        }
+        return replay(view, id, base.logId());
+      } catch (CommitOutcomeUnknownException e) {
+        throw new UnreadableLog((RuntimeException) e.getCause()); // interrupted waiting
       } catch (RuntimeException e) {
         throw new UnreadableLog(e);
       }
