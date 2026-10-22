@@ -32,7 +32,7 @@ fileio-catalog directory, with the clone in a temporary directory:
 tmp=$(mktemp -d)
 git clone --depth 1 --branch apache-iceberg-1.12.0 https://github.com/apache/iceberg.git "$tmp/iceberg"
 mkdir -p "$tmp/iceberg/core/src/test/java/org/apache/iceberg/io"
-cp src/test/java/org/apache/iceberg/io/TestIcebergCoreIssues.java \
+cp iceberg-fileio-catalog/src/test/java/org/apache/iceberg/io/TestIcebergCoreIssues.java \
    "$tmp/iceberg/core/src/test/java/org/apache/iceberg/io/"
 cd "$tmp/iceberg" && ./gradlew :iceberg-core:test --tests org.apache.iceberg.io.TestIcebergCoreIssues
 ```

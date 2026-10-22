@@ -100,7 +100,7 @@ Offset  Size   Field             Description
 
 ## Protobuf Schema
 
-Defined in `src/main/proto/catalog.proto`, package `iceberg.catalog`.
+Defined in `iceberg-fileio-catalog/src/main/proto/catalog.proto`, package `iceberg.catalog`.
 
 ### Checkpoint
 
@@ -1103,11 +1103,11 @@ numbers reserved (`Transaction` reserves 2, the former `sealed`).
 
 | File | Purpose |
 |------|---------|
-| `src/main/proto/catalog.proto` | Protobuf schema (catalog + inline TM + ML) |
-| `src/main/java/.../ProtoCatalogFormat.java` | Format implementation (read, commit, CAS/append) |
-| `src/main/java/.../ProtoCatalogFile.java` | Immutable catalog snapshot + builder |
-| `src/main/java/.../ProtoCodec.java` | Wire encoding/decoding, action types |
-| `src/main/java/.../InlineDeltaCodec.java` | Inline TM/ML delta encode/decode/apply |
-| `src/main/java/.../FileIOCatalog.java` | Catalog + `FileIOTableOperations` |
-| `src/main/java/.../CatalogFormat.java` | Format strategy interface |
-| `src/main/java/.../CatalogFile.java` | Abstract base + inline-aware `Mut` API |
+| `iceberg-fileio-catalog/src/main/proto/catalog.proto` | Protobuf schema (catalog + inline TM + ML) |
+| `iceberg-fileio-catalog/src/main/java/.../ProtoCatalogFormat.java` | Format implementation (read, commit, CAS/append) |
+| `iceberg-fileio-catalog/src/main/java/.../ProtoCatalogFile.java` | Immutable catalog snapshot + builder |
+| `iceberg-fileio-catalog/src/main/java/.../ProtoCodec.java` | Wire encoding/decoding, action types |
+| `iceberg-fileio-catalog/src/main/java/.../InlineDeltaCodec.java` | Inline TM/ML delta encode/decode/apply |
+| `iceberg-fileio-catalog/src/main/java/.../FileIOCatalog.java` | Catalog + `FileIOTableOperations` |
+| `iceberg-fileio-catalog/src/main/java/.../CatalogFormat.java` | Format strategy interface |
+| `iceberg-fileio-catalog/src/main/java/.../CatalogFile.java` | Abstract base + inline-aware `Mut` API |

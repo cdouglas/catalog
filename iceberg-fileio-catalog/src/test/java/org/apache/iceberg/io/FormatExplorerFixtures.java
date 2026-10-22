@@ -75,7 +75,8 @@ import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
  */
 public class FormatExplorerFixtures {
 
-  static final Path HTML = Paths.get("docs/format-explorer/index.html");
+  static final Path HTML =
+      Paths.get(System.getProperty("repo.root", ".."), "docs/format-explorer/index.html");
   private static final Path OUTPUT = Paths.get("target/format-explorer/fixtures.json");
   private static final Pattern FIXTURES =
       Pattern.compile("(<script id=\"fixtures-data\"[^>]*>)(.*?)(</script>)", Pattern.DOTALL);

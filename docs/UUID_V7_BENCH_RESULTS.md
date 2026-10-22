@@ -7,10 +7,10 @@ JMH results for four candidate encodings of the checkpoint's committed-transacti
 - **B**: fixed64 base+delta, descending sort, binary search on the delta column. Operates on compressed bytes.
 - **C**: indexed varint with skip-list (skip every 16 entries; per-bucket cumulative-delta anchor).
 
-Source: `src/test/java/org/apache/iceberg/io/bench/CommittedTxnsBench.java`. Run via:
+Source: `iceberg-fileio-catalog/src/test/java/org/apache/iceberg/io/bench/CommittedTxnsBench.java`. Run via:
 
 ```
-mvn test-compile exec:java -Dexec.mainClass=org.apache.iceberg.io.bench.CommittedTxnsBench -Dexec.classpathScope=test \
+mvn -pl iceberg-fileio-catalog test-compile exec:java -Dexec.mainClass=org.apache.iceberg.io.bench.CommittedTxnsBench -Dexec.classpathScope=test \
   -Dexec.args="-f 0 -wi 2 -i 3 -r 1s -w 1s -rf json -rff target/jmh-results.json"
 ```
 

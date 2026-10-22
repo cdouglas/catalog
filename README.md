@@ -37,11 +37,12 @@ next section).
 ## What's in here
 
 ```
-src/main/java/.../FileIOCatalog.java         catalog implementation
-src/main/java/.../ProtoCatalogFormat.java    on-disk format (PB)
-src/main/java/.../ProtoCodec.java            wire encoding for catalog
-src/main/java/.../InlineDeltaCodec.java      wire encoding for TM/ML deltas
-src/main/proto/catalog.proto                 protobuf schema
+iceberg-fileio-catalog/                      the catalog module (Maven), under src/:
+  main/java/.../FileIOCatalog.java           catalog implementation
+  main/java/.../ProtoCatalogFormat.java      on-disk format (PB)
+  main/java/.../ProtoCodec.java              wire encoding for catalog
+  main/java/.../InlineDeltaCodec.java        wire encoding for TM/ML deltas
+  main/proto/catalog.proto                   protobuf schema
 docs/SPEC.md                                 base format spec
 docs/SPEC_TM.md                              inline table metadata
 docs/SPEC_ML.md                              inline manifest lists
@@ -111,6 +112,11 @@ Then, in this repository:
 ```bash
 mvn clean install
 ```
+
+The root `pom.xml` is a reactor over the modules; build and test from the
+root. `mvn test -Dtest=TestProtoActions` runs one class in whichever module
+holds it, and `mvn -pl iceberg-fileio-catalog ...` runs a goal in one module
+(add `-am` to build the modules it depends on).
 
 `mvn test` runs unit tests, the in-memory end-to-end suites and the
 property tests. `mvn verify` adds the cloud integration suites (S3, GCS,

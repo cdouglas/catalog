@@ -58,7 +58,7 @@ import org.apache.iceberg.types.Types;
  *
  * <p>Sanity-check via {@code main()}:
  * <pre>{@code
- * mvn test-compile exec:java \
+ * mvn -pl iceberg-fileio-catalog test-compile exec:java \
  *   -Dexec.mainClass=org.apache.iceberg.io.bench.SyntheticTableMetadata \
  *   -Dexec.classpathScope=test
  * }</pre>
@@ -569,7 +569,7 @@ public final class SyntheticTableMetadata {
   // ---------------------------------------------------------------------------
   // Sanity-check entry point: prints raw-JSON byte counts per scenario / intensity.
   // Run via:
-  //   mvn test-compile exec:java \
+  //   mvn -pl iceberg-fileio-catalog test-compile exec:java \
   //     -Dexec.mainClass=org.apache.iceberg.io.bench.SyntheticTableMetadata \
   //     -Dexec.classpathScope=test
   // ---------------------------------------------------------------------------

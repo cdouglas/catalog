@@ -54,7 +54,7 @@ import org.apache.iceberg.types.Types;
  * <p>Run:
  *
  * <pre>{@code
- * mvn test-compile exec:java \
+ * mvn -pl iceberg-fileio-catalog test-compile exec:java \
  *   -Dexec.mainClass=org.apache.iceberg.io.sample.SampleGenerator \
  *   -Dexec.classpathScope=test \
  *   -Dexec.args="--out docs/sample"          # optionally: --scenario 1tbl-50x50

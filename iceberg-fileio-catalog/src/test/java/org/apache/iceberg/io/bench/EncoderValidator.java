@@ -48,7 +48,7 @@ import org.apache.iceberg.io.bench.encoders.StructuralSnapshotsEncoder;
  *
  * <p>Run via:
  * <pre>{@code
- * mvn test-compile exec:java \
+ * mvn -pl iceberg-fileio-catalog test-compile exec:java \
  *   -Dexec.mainClass=org.apache.iceberg.io.bench.EncoderValidator \
  *   -Dexec.classpathScope=test
  * }</pre>

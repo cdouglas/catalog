@@ -65,7 +65,7 @@ import org.openjdk.jmh.runner.options.OptionsBuilder;
  * <p>Three timestamp distributions × four sizes × encode/lookup workloads.
  * Output is the encoded size (bytes) and per-operation latencies (ns).
  *
- * <p>Run via: {@code mvn test-compile exec:java
+ * <p>Run via: {@code mvn -pl iceberg-fileio-catalog test-compile exec:java
  *   -Dexec.mainClass=org.apache.iceberg.io.bench.CommittedTxnsBench
  *   -Dexec.classpathScope=test}
  */

@@ -270,7 +270,7 @@ falling back to live cloud when the provider's env vars are set.
 `mvn verify -Preal-cloud` requires live cloud and fails fast if any
 required env var is missing. See [INTEGRATION_TESTING.md](INTEGRATION_TESTING.md)
 for the env-var contract and the
-[`IntegTestEnv`](../src/test/java/org/apache/iceberg/io/IntegTestEnv.java)
+[`IntegTestEnv`](../iceberg-fileio-catalog/src/test/java/org/apache/iceberg/io/IntegTestEnv.java)
 util for the constants.
 
 `CloudMode#assumeRealCloud` skips individual tests when the configured

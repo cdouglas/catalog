@@ -68,7 +68,7 @@ import org.apache.iceberg.TableMetadataParser;
  *
  * <p>Run via:
  * <pre>{@code
- * mvn test-compile exec:java \
+ * mvn -pl iceberg-fileio-catalog test-compile exec:java \
  *   -Dexec.mainClass=org.apache.iceberg.io.bench.TableMetadataBaselineProbe \
  *   -Dexec.classpathScope=test
  * }</pre>

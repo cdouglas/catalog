@@ -22,7 +22,7 @@ this page is the record of that choice.
   templates, summary key-set + numeric-value typing, timestamp/sequence deltas,
   schema-id RLE). Everything else is unchanged JSON; whole thing gzipped.
 
-Source: `src/test/java/org/apache/iceberg/io/bench/`. The bench's
+Source: `iceberg-fileio-catalog/src/test/java/org/apache/iceberg/io/bench/`. The bench's
 `@State` parameterizes on eight of the nine pathology scenarios in the enum
 `org.apache.iceberg.io.bench.Scenario` (all but `SNAPSHOT_ACCUMULATION`) at
 `SyntheticTableMetadata.Intensity.MEDIUM`.
@@ -30,7 +30,7 @@ Source: `src/test/java/org/apache/iceberg/io/bench/`. The bench's
 Run via:
 
 ```
-mvn test-compile exec:java \
+mvn -pl iceberg-fileio-catalog test-compile exec:java \
   -Dexec.mainClass=org.apache.iceberg.io.bench.TableMetadataEncodingBench \
   -Dexec.classpathScope=test
 ```
@@ -48,7 +48,7 @@ strict round-trip check (decodeFull JSON byte-equality, decodeCurrentSnapshotOnl
 and decodeRecentSnapshots equivalence via `SnapshotParser.toJson`):
 
 ```
-mvn test-compile exec:java \
+mvn -pl iceberg-fileio-catalog test-compile exec:java \
   -Dexec.mainClass=org.apache.iceberg.io.bench.EncoderValidator \
   -Dexec.classpathScope=test
 ```

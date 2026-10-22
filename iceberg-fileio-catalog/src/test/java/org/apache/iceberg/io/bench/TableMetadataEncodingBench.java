@@ -61,7 +61,7 @@ import org.openjdk.jmh.runner.options.OptionsBuilder;
  *
  * <p>Run via:
  * <pre>{@code
- * mvn test-compile exec:java \
+ * mvn -pl iceberg-fileio-catalog test-compile exec:java \
  *   -Dexec.mainClass=org.apache.iceberg.io.bench.TableMetadataEncodingBench \
  *   -Dexec.classpathScope=test
  * }</pre>

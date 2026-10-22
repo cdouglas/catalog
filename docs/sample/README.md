@@ -248,7 +248,7 @@ Under the hood the script runs the generator and then the analysis; either can b
 run directly:
 
 ```bash
-mvn test-compile exec:java \
+mvn -pl iceberg-fileio-catalog test-compile exec:java \
   -Dexec.mainClass=org.apache.iceberg.io.sample.SampleGenerator \
   -Dexec.classpathScope=test \
   -Dexec.args="--seed 0xC0FFEE --out docs/sample/figures/0xC0FFEE"   # add --scenario <name> to limit
@@ -256,7 +256,7 @@ python3 docs/sample/analyze.py --root docs/sample/figures/0xC0FFEE
 ```
 
 The generator and analysis live at
-`src/test/java/org/apache/iceberg/io/sample/` and `docs/sample/analyze.py`.
+`iceberg-fileio-catalog/src/test/java/org/apache/iceberg/io/sample/` and `docs/sample/analyze.py`.
 
 ### Determinism
 

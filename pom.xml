@@ -23,12 +23,16 @@
   <modelVersion>4.0.0</modelVersion>
 
   <groupId>org.apache.iceberg</groupId>
-  <artifactId>iceberg-fileio-catalog</artifactId>
+  <artifactId>iceberg-fileio-catalog-parent</artifactId>
   <version>1.12.0-atomicio-SNAPSHOT</version>
-  <packaging>jar</packaging>
+  <packaging>pom</packaging>
 
-  <name>Iceberg FileIO Catalog</name>
-  <description>A storage catalog implementation for Apache Iceberg using FileIO with atomic operations</description>
+  <name>Iceberg FileIO Catalog (parent)</name>
+  <description>Reactor for the FileIO catalog and the modules it is built from</description>
+
+  <modules>
+    <module>iceberg-fileio-catalog</module>
+  </modules>
 
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -38,6 +42,8 @@
     <junit.version>5.14.4</junit.version>
     <assertj.version>3.27.7</assertj.version>
     <mockito.version>4.11.0</mockito.version>
+    <jqwik.version>1.9.1</jqwik.version>
+    <jmh.version>1.37</jmh.version>
     <!-- Cloud SDK and Jackson BOMs: keep in step with iceberg/gradle/libs.versions.toml
          (awssdk-bom, azuresdk-bom, google-libraries-bom, jackson-bom), so the tests run
          iceberg's cloud FileIOs against the SDK versions they were compiled against. -->
@@ -83,281 +89,51 @@
     </dependencies>
   </dependencyManagement>
 
-  <dependencies>
-    <!-- Iceberg dependencies -->
-    <dependency>
-      <groupId>org.apache.iceberg</groupId>
-      <artifactId>iceberg-api</artifactId>
-      <version>${iceberg.version}</version>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.iceberg</groupId>
-      <artifactId>iceberg-core</artifactId>
-      <version>${iceberg.version}</version>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.iceberg</groupId>
-      <artifactId>iceberg-bundled-guava</artifactId>
-      <version>${iceberg.version}</version>
-    </dependency>
-
-    <!-- Hadoop (for Configurable interface and LimitInputStream) -->
-    <dependency>
-      <groupId>org.apache.hadoop</groupId>
-      <artifactId>hadoop-common</artifactId>
-      <version>${hadoop.version}</version>
-      <scope>provided</scope>
-      <exclusions>
-        <exclusion>
-          <groupId>org.slf4j</groupId>
-          <artifactId>slf4j-log4j12</artifactId>
-        </exclusion>
-        <exclusion>
-          <groupId>org.apache.avro</groupId>
-          <artifactId>avro</artifactId>
-        </exclusion>
-      </exclusions>
-    </dependency>
-
-    <!-- Test dependencies -->
-    <dependency>
-      <groupId>org.junit.jupiter</groupId>
-      <artifactId>junit-jupiter</artifactId>
-      <version>${junit.version}</version>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>org.junit.jupiter</groupId>
-      <artifactId>junit-jupiter-engine</artifactId>
-      <version>${junit.version}</version>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>org.assertj</groupId>
-      <artifactId>assertj-core</artifactId>
-      <version>${assertj.version}</version>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>org.mockito</groupId>
-      <artifactId>mockito-core</artifactId>
-      <version>${mockito.version}</version>
-      <scope>test</scope>
-    </dependency>
-
-    <!-- JMH for committed-transaction-set encoding benchmarks (see
-         src/test/java/org/apache/iceberg/io/bench/CommittedTxnsBench.java). -->
-    <dependency>
-      <groupId>org.openjdk.jmh</groupId>
-      <artifactId>jmh-core</artifactId>
-      <version>1.37</version>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>org.openjdk.jmh</groupId>
-      <artifactId>jmh-generator-annprocess</artifactId>
-      <version>1.37</version>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.iceberg</groupId>
-      <artifactId>iceberg-core</artifactId>
-      <version>${iceberg.version}</version>
-      <type>test-jar</type>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.iceberg</groupId>
-      <artifactId>iceberg-api</artifactId>
-      <version>${iceberg.version}</version>
-      <type>test-jar</type>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>org.slf4j</groupId>
-      <artifactId>slf4j-simple</artifactId>
-      <version>2.0.18</version>
-      <scope>test</scope>
-    </dependency>
-
-    <!-- JUnit params for parameterized tests -->
-    <dependency>
-      <groupId>org.junit.jupiter</groupId>
-      <artifactId>junit-jupiter-params</artifactId>
-      <version>${junit.version}</version>
-      <scope>test</scope>
-    </dependency>
-
-    <!-- jqwik: property-based tests in org.apache.iceberg.io.spec -->
-    <dependency>
-      <groupId>net.jqwik</groupId>
-      <artifactId>jqwik</artifactId>
-      <version>1.9.1</version>
-      <scope>test</scope>
-    </dependency>
-
-    <!-- GCP dependencies for integration tests -->
-    <dependency>
-      <groupId>org.apache.iceberg</groupId>
-      <artifactId>iceberg-gcp</artifactId>
-      <version>${iceberg.version}</version>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>com.google.cloud</groupId>
-      <artifactId>google-cloud-storage</artifactId>
-      <scope>test</scope>
-    </dependency>
-
-    <!-- Testcontainers for local integration tests -->
-    <dependency>
-      <groupId>org.testcontainers</groupId>
-      <artifactId>testcontainers</artifactId>
-      <version>${testcontainers.version}</version>
-      <scope>test</scope>
-    </dependency>
-
-    <!-- AWS dependencies for integration tests -->
-    <dependency>
-      <groupId>org.apache.iceberg</groupId>
-      <artifactId>iceberg-aws</artifactId>
-      <version>${iceberg.version}</version>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>software.amazon.awssdk</groupId>
-      <artifactId>s3</artifactId>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>software.amazon.awssdk</groupId>
-      <artifactId>sts</artifactId>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <!-- iceberg-aws's default sync HTTP client; iceberg-aws declares it compileOnly -->
-      <groupId>software.amazon.awssdk</groupId>
-      <artifactId>apache5-client</artifactId>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <!-- iceberg-aws's AwsClientFactories static init references KMS model classes -->
-      <groupId>software.amazon.awssdk</groupId>
-      <artifactId>kms</artifactId>
-      <scope>test</scope>
-    </dependency>
-
-    <!-- Azure dependencies for integration tests -->
-    <dependency>
-      <groupId>org.apache.iceberg</groupId>
-      <artifactId>iceberg-azure</artifactId>
-      <version>${iceberg.version}</version>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.iceberg</groupId>
-      <artifactId>iceberg-azure</artifactId>
-      <version>${iceberg.version}</version>
-      <type>test-jar</type>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>com.azure</groupId>
-      <artifactId>azure-storage-file-datalake</artifactId>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>com.azure</groupId>
-      <artifactId>azure-identity</artifactId>
-      <scope>test</scope>
-    </dependency>
-  </dependencies>
-
   <build>
-    <plugins>
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-compiler-plugin</artifactId>
-        <version>3.11.0</version>
-        <configuration>
-          <release>17</release>
-        </configuration>
-      </plugin>
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-surefire-plugin</artifactId>
-        <version>3.2.2</version>
-        <configuration>
-          <useModulePath>false</useModulePath>
-          <excludes>
-            <exclude>**/aws/**</exclude>
-            <exclude>**/gcp/**</exclude>
-            <exclude>**/azure/**</exclude>
-          </excludes>
-        </configuration>
-      </plugin>
-      <!-- exec:java target for the JMH benchmarks in org.apache.iceberg.io.bench. Invoke:
-           mvn test-compile exec:java -Dexec.mainClass=org.apache.iceberg.io.bench.CommittedTxnsBench -Dexec.classpathScope=test -Dexec.args="-f 0"
-           -f 0 runs JMH in-process: exec:java does not give forked JVMs the test classpath.
-           TableMetadataEncodingBench runs in-process already and ignores its arguments. See
-           docs/UUID_V7_BENCH_RESULTS.md and docs/TM_ENCODING_BENCH_RESULTS.md. -->
-      <plugin>
-        <groupId>org.codehaus.mojo</groupId>
-        <artifactId>exec-maven-plugin</artifactId>
-        <version>3.1.1</version>
-      </plugin>
-
-      <!-- Integration tests (S3, GCS, ADLS): mvn verify (Docker required for the
-           emulator fallbacks; use -DskipITs to skip). With AWS_ACCESS_KEY_ID,
-           AZURE_STORAGE_ACCOUNT, or GOOGLE_APPLICATION_CREDENTIALS set, the
-           corresponding suite hits the real service instead of its emulator. -->
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-failsafe-plugin</artifactId>
-        <version>3.2.2</version>
-        <configuration>
-          <useModulePath>false</useModulePath>
-          <includes>
-            <include>**/aws/**</include>
-            <include>**/gcp/**</include>
-            <include>**/azure/**</include>
-          </includes>
-        </configuration>
-        <executions>
-          <execution>
-            <id>integration-test</id>
-            <goals>
-              <goal>integration-test</goal>
-              <goal>verify</goal>
-            </goals>
-          </execution>
-        </executions>
-      </plugin>
-    </plugins>
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-compiler-plugin</artifactId>
+          <version>3.11.0</version>
+          <configuration>
+            <release>17</release>
+          </configuration>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <version>3.2.2</version>
+          <configuration>
+            <useModulePath>false</useModulePath>
+            <!-- -Dtest=Foo names a class in one module: the others have none. -->
+            <failIfNoSpecifiedTests>false</failIfNoSpecifiedTests>
+            <systemPropertyVariables>
+              <!-- Tests run in their module's directory; docs/ is at the root, one up. -->
+              <repo.root>${project.basedir}/..</repo.root>
+            </systemPropertyVariables>
+          </configuration>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-failsafe-plugin</artifactId>
+          <version>3.2.2</version>
+          <configuration>
+            <useModulePath>false</useModulePath>
+          </configuration>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-jar-plugin</artifactId>
+          <version>3.4.2</version>
+        </plugin>
+        <plugin>
+          <groupId>org.codehaus.mojo</groupId>
+          <artifactId>exec-maven-plugin</artifactId>
+          <version>3.1.1</version>
+        </plugin>
+      </plugins>
+    </pluginManagement>
   </build>
-
-  <profiles>
-    <!-- Real-cloud integration tests. Activate with: mvn verify -Preal-cloud
-         Requires the env vars documented in docs/INTEGRATION_TESTING.md.
-         Under this profile, CloudMode#assumeRealCloud throws instead of skipping,
-         and each provider's @BeforeAll fails fast if its real-cloud env vars are
-         missing. -->
-    <profile>
-      <id>real-cloud</id>
-      <build>
-        <plugins>
-          <plugin>
-            <groupId>org.apache.maven.plugins</groupId>
-            <artifactId>maven-failsafe-plugin</artifactId>
-            <configuration>
-              <systemPropertyVariables combine.children="append">
-                <require.real.cloud>true</require.real.cloud>
-              </systemPropertyVariables>
-            </configuration>
-          </plugin>
-        </plugins>
-      </build>
-    </profile>
-  </profiles>
 
 </project>

@@ -19,7 +19,7 @@ validate against live storage.
 ## Environment variables
 
 Constants live in
-[`IntegTestEnv`](../src/test/java/org/apache/iceberg/io/IntegTestEnv.java).
+[`IntegTestEnv`](../iceberg-fileio-catalog/src/test/java/org/apache/iceberg/io/IntegTestEnv.java).
 
 ### AWS (S3)
 
