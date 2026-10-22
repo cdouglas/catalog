@@ -1,7 +1,8 @@
 # TLA+ model of the catalog commit protocol
 
-`CatalogCommit.tla` models `ProtoCatalogFormat.Mut.commit` and replay over one
-catalog object in storage with conditional writes. `CatalogOracles.tla` states
+`CatalogCommit.tla` models the commit loop (`LogRuntime.commit`, formerly
+`ProtoCatalogFormat.Mut.commit`) and replay over one catalog object in storage
+with conditional writes. `CatalogOracles.tla` states
 the jqwik fuzzers' oracles as predicates over the same model. The model's purpose
 is to check the oracles: that what the property tests assert is enough to imply
 the protocol's properties, and that each historical protocol bug breaks a
@@ -13,7 +14,8 @@ are out of scope.
 
 | File | What it holds |
 |---|---|
-| `CatalogCommit.tla` | The protocol: storage, replay, the commit loop, faults, GC, the bug switches, the properties |
+| `RSM.tla` | The state machine and replay (`Replay`, `CommittedSet`, `landed`'s verdict), and the serial execution the properties compare with |
+| `CatalogCommit.tla` | The protocol: storage, the commit loop, faults, GC, the bug switches, the properties |
 | `CatalogOracles.tla` | The three fuzzers' oracles, their tightened versions, and `Adequate` |
 | `MC.tla` | Scenarios (what each writer commits) and the coverage witnesses |
 | `check.py` | The configurations, and what TLC must report for each |
@@ -58,12 +60,18 @@ replayed, unfiltered, then a GC record at its watermark, then its own record
 gets a fresh generation, and every conditional write names the generation it
 expects. An append past `SegLimit` writes is refused.
 
-**State.** Each entity (namespace or table, alike) has a version. A transaction
-reads some entities at the versions its snapshot had, writes some of them, and
-may create an entity under one it writes. Replay applies a record if `mayApply`
-admits its id (not in `C`, above `H`) and its reads still hold
-(`Transaction.verify`). The checkpoint carries a ghost history: the records
+**State** (`RSM.tla`). Each entity (namespace or table, alike) has a version. A
+transaction reads some entities at the versions its snapshot had, writes some of
+them, and may create an entity under one it writes. Replay applies a record if
+`mayApply` admits its id (not in `C`, above `H`) and its reads still hold
+(`Intention.verify`). The checkpoint carries a ghost history: the records
 replay applied, in order. The properties are stated over it.
+
+A commit judges its own record as `LogRuntime.landed` does: by what replay did
+with it first (applied or rejected), and only if replay did not judge it, by the
+committed set. On one object a GC record precedes every record of its version,
+so the two agree: judging by the committed set alone reached the same states in
+every configuration.
 
 **Writers.** Each writer runs its operations in turn. Each writer action is
 one storage request, so other writers interleave between any two. Faults are

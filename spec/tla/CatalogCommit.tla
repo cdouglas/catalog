@@ -1,33 +1,24 @@
 --------------------------- MODULE CatalogCommit ---------------------------
 (***************************************************************************)
 (* The FileIOCatalog commit protocol over one catalog object in storage    *)
-(* with conditional writes: ProtoCatalogFormat.Mut.commit and replay       *)
-(* (ProtoCatalogFormat.replay), as of fileio-catalog 4a44e16.              *)
-(*                                                                         *)
-(* The catalog's state is abstracted to entity versions (namespaces and    *)
-(* tables alike) and the entities that creates add. A transaction reads    *)
-(* some entities at the versions its snapshot had, writes some of them     *)
-(* (bumping their versions), and may create an entity under one it         *)
-(* writes. Replay applies a record only if the dedup set and its horizon   *)
-(* admit its id (mayApply) and its reads still hold (Transaction.verify).  *)
+(* with conditional writes: LogRuntime's commit loop over an AtomicFileLog *)
+(* (ProtoCatalogFormat.Mut.commit as of fileio-catalog 4a44e16). The       *)
+(* catalog's state and replay are RSM's: entity versions (namespaces and   *)
+(* tables alike) and the entities that creates add.                        *)
 (*                                                                         *)
 (* Each writer action is one storage request of the commit loop, so other  *)
 (* writers interleave between any two; the comments name the code branch.  *)
-(* `hist`, inside the replayed state, is a ghost: the records replay       *)
-(* applied, in order, carried through checkpoints. The properties below    *)
-(* are stated over it.                                                     *)
+(* The properties below are stated over RSM's ghost history, `hist`.       *)
 (*                                                                         *)
 (* Bug switches put back protocol bugs the fuzzers and reviews found       *)
 (* (Bug N in fileio-catalog's commit subjects), to calibrate the           *)
 (* properties and the oracles (CatalogOracles.tla). Sched restricts the    *)
 (* interleavings to those a fuzzer's schedules produce, for the oracles.   *)
 (***************************************************************************)
-EXTENDS Integers, Sequences, FiniteSets, TLC
+EXTENDS RSM, TLC
 
 CONSTANTS
   Writers,          \* writer ids
-  Entities,         \* catalog entities, by name
-  None,             \* no value
   Shapes,           \* Writers -> Seq of [rd, wr: SUBSET Entities, cr: Entities \cup {None},
                     \*   retry: BOOLEAN]: an operation (retry: FileIOCatalog restages it
                     \*   on a fresh read after CommitFailedException) or a transaction
@@ -44,14 +35,14 @@ CONSTANTS
   FaultKinds,       \* the faults it may inject (see Write and the reads)
   ClientRetries,    \* how many times an operation is restaged (Iceberg: 4)
   Strict,           \* a read pinned to a replaced version fails (GCS, S3/ADLS If-Match)
-  Sched,            \* "free": any interleaving. A fuzzer's schedules, where operations
+  Sched             \* "free": any interleaving. A fuzzer's schedules, where operations
                     \* run one at a time and others may run to completion inside one:
                     \* "mw" (TestMultiWriterProperties: one, before any request, on a
                     \* snapshot taken earlier), "fault" (TestCatalogFaultProperties:
                     \* one, before the first write), "race" (TestCatalogRaceProperties:
                     \* writer 1 runs A, and each other writer runs fresh just before
                     \* one of A's writes, in turn, or after A)
-  Bugs              \* protocol bugs put back, by number (strings)
+                    \* Bugs (RSM): protocol bugs put back, by number
 
 WriteFaults == {"failBefore", "lostReply", "landedConflict", "throttled",
                 "landedThrottled", "inflight"}
@@ -62,11 +53,6 @@ ASSUME /\ FaultKinds \subseteq WriteFaults \cup ReadFaults
        /\ Sched \in {"free", "mw", "fault", "race"}
        /\ Bugs \subseteq {"10", "12", "16", "17", "18", "25", "26",
                           "64a", "64b", "64c", "64d", "66", "ckgc"}
-
-Has(b) == b \in Bugs
-Max(a, b) == IF a > b THEN a ELSE b
-Min(a, b) == IF a < b THEN a ELSE b
-SetMax(S) == CHOOSE x \in S : \A y \in S : y <= x
 
 VARIABLES
   file,      \* the catalog object: [gen, chk: [st, C, H], log, segs]
@@ -83,77 +69,27 @@ VARIABLES
 vars == <<file, inflight, now, nf, ws, ended, res, ook, sched>>
 
 -----------------------------------------------------------------------------
-(* The catalog's state, and replay *)
-
-\* The state a catalog file's checkpoint holds. `made` holds the entities
-\* creates added: [id, p] for an entity with id `id` under `p`. `next` is
-\* the next id replay binds (Checkpoint.next_table_id). `hist` is a ghost.
-InitSt == [ver |-> [e \in Entities |-> 1], made |-> {}, next |-> 1, hist |-> << >>]
+(* The catalog object, and reads of it *)
 
 InitFile == [gen |-> 1, chk |-> [st |-> InitSt, C |-> {}, H |-> 0],
              log |-> << >>, segs |-> 1]
 
-\* Transaction.verify: the record's reads hold.
-Verify(st, r) == \A e \in DOMAIN r.rd : st.ver[e] = r.rd[e]
-
-\* The id a create gets: bound at replay (ProtoCodec.IdBinding), or, with
-\* Bug 10, the one the writer took from its snapshot.
-BindId(st, r) == IF r.cid > 0 THEN r.cid ELSE st.next
-
-\* Transaction.apply. A create of an id already in use replaces that entity,
-\* as replay's tableById did (Bug 10).
-Apply(st, r) ==
-  LET id == BindId(st, r) IN
-  [ver  |-> [e \in Entities |-> IF e \in r.wr THEN st.ver[e] + 1 ELSE st.ver[e]],
-   made |-> IF r.cr = None THEN st.made
-            ELSE {m \in st.made : m.id # id} \cup {[id |-> id, p |-> r.cr]},
-   next |-> IF r.cr = None THEN st.next ELSE Max(st.next, id + 1),
-   hist |-> Append(st.hist, r)]
-
-\* containsTransaction: committed, absent, or unknown (at or below the
-\* horizon: DedupHorizonExceededException).
-Contains(C, H, id) ==
-  IF id \in C THEN "yes" ELSE IF H > 0 /\ id.ts <= H THEN "unknown" ELSE "no"
-
-\* ProtoCatalogFile.Builder.mayApply.
-MayApply(C, H, id) == id \notin C /\ (H = 0 \/ id.ts > H)
-
-\* A log holds intention records and GC records, [wm]: AdvanceHorizon(wm),
-\* which drops the committed ids at or below wm and raises the horizon to the
-\* newest it dropped. Only GC records move the horizon.
-IsGc(r) == "wm" \in DOMAIN r
-Txns(log) == SelectSeq(log, LAMBDA r : ~IsGc(r))
-
-Gc(a, wm) ==
-  LET drop == {i \in a.C : i.ts <= wm}
-  IN IF drop = {} THEN a
-     ELSE [a EXCEPT !.C = @ \ drop, !.H = Max(@, SetMax({i.ts : i \in drop}))]
-
-\* ProtoCatalogFormat.replay over a log. With Bug 64a, replay asks the set
-\* (containsTransaction) about each record, which throws at the horizon.
-RECURSIVE Fold(_, _)
-Fold(a, log) ==
-  IF log = << >> \/ a.err THEN a
-  ELSE LET r == Head(log)
-           b == IF IsGc(r) THEN Gc(a, r.wm)
-                ELSE IF Has("64a") /\ Contains(a.C, a.H, r.id) = "unknown"
-                  THEN [a EXCEPT !.err = TRUE]
-                ELSE IF ~MayApply(a.C, a.H, r.id) THEN a
-                ELSE IF Verify(a.st, r)
-                  THEN [a EXCEPT !.st = Apply(@, r), !.C = @ \cup {r.id}]
-                ELSE a
-       IN Fold(b, Tail(log))
-
-\* A read: the replayed state, the version read and its length (in records,
-\* the checkpoint counting one), and the intention-record count (appendCount).
-Replay(f) ==
-  LET a == Fold([st |-> f.chk.st, C |-> f.chk.C, H |-> f.chk.H, err |-> FALSE], f.log)
-  IN [st |-> a.st, C |-> a.C, H |-> a.H, err |-> a.err,
+\* A read: the replayed state, what replay did with the record of `watch`,
+\* the version read and its length (in records, the checkpoint counting
+\* one), and the intention-record count (intentionRecords).
+ReplayOf(f, watch) ==
+  LET a == Fold(Acc(f.chk.st, f.chk.C, f.chk.H, watch), f.log)
+  IN [st |-> a.st, C |-> a.C, H |-> a.H, err |-> a.err, out |-> a.out,
       cnt |-> Len(Txns(f.log)), gen |-> f.gen, len |-> Len(f.log) + 1]
+
+Replay(f) == ReplayOf(f, None)
 
 FileLen(f) == Len(f.log) + 1
 
 LiveR == Replay(file)
+
+\* A commit's read of the live catalog, watching its own record.
+LiveOf(s) == ReplayOf(file, s.txn.id)
 
 -----------------------------------------------------------------------------
 (* Writes *)
@@ -268,12 +204,14 @@ End(w, s, out, landed) ==
 \* the commit may have landed, else the read's failure.
 Unreadable(w, s) == End(w, s, IF Earlier(s) THEN "unknown" ELSE "error", FALSE)
 
-\* landed(): what a read R says of the commit's own record. Committed if R
-\* holds its id; at or below R's horizon, unknown if a write may have
-\* landed, else CommitFailedException (with Bug 64d the exception escaped
-\* raw); otherwise `then`.
+\* landed(): what a read R (watching the commit's record) says of the
+\* commit's own record. Committed if replay applied it, or if R holds its
+\* id; at or below R's horizon, unknown if a write may have landed, else
+\* CommitFailedException (with Bug 64d the exception escaped raw);
+\* otherwise `then`. On one object, a GC record precedes every record of
+\* its version, so replay's judgment and the committed set agree.
 Judge(w, s, R, then) ==
-  LET c == Contains(R.C, R.H, s.txn.id) IN
+  LET c == Landed(R, s.txn.id) IN
   CASE c = "yes" -> End(w, s, "committed", FALSE)
     [] c = "unknown" -> End(w, s, IF Has("64d") THEN "error"
                                  ELSE IF Earlier(s) THEN "unknown" ELSE "failed", FALSE)
@@ -441,7 +379,7 @@ Write(w, fk) ==
 \* failed read, or (strict) one of a version replaced since, is ambiguous.
 ReadBack(w, fk) ==
   LET s == ws[w]
-      R == Replay(s.written)
+      R == ReplayOf(s.written, s.txn.id)
       s1 == [Faulted(s, fk) EXCEPT !.written = None]
   IN /\ CanStep(w) /\ s.pc = "readback"
      /\ fk \in RFaultsOf(w)
@@ -467,7 +405,7 @@ Rebase(w, fk) ==
       s1 == [Faulted(s, fk) EXCEPT !.cx = @ \/ Crossed(LiveR, s.txn)]
   IN /\ ReadLive(w, fk, s, {"rebase"})
      /\ IF fk = "readFail" \/ LiveR.err THEN Unreadable(w, Faulted(s, fk))
-        ELSE Judge(w, s1, LiveR,
+        ELSE Judge(w, s1, LiveOf(s),
                IF Verify(LiveR.st, s.txn)
                  THEN Go(w, [Rebased(s1, LiveR) EXCEPT !.att = @ + 1, !.pc = "loop"], FALSE)
                  ELSE End(w, [s1 EXCEPT !.unres = FALSE], "failed", FALSE))
@@ -491,7 +429,7 @@ Shrink(w, fk) ==
       s1 == [Faulted(s, fk) EXCEPT !.cx = @ \/ Crossed(LiveR, s.txn)]
   IN /\ ReadLive(w, fk, s, {"shrink"})
      /\ IF fk = "readFail" \/ LiveR.err THEN Unreadable(w, Faulted(s, fk))
-        ELSE Judge(w, s1, LiveR,
+        ELSE Judge(w, s1, LiveOf(s),
                Go(w, [Rebased(s1, LiveR) EXCEPT !.att = @ + 1, !.pc = "loop"], FALSE))
 
 \* The loop must CAS but base is stale: read the live version afresh, then
@@ -505,7 +443,7 @@ FreshForCAS(w, fk) ==
      /\ ReadLive(w, fk, s, {"loop"})
      /\ IF fk = "readFail" \/ LiveR.err \/ (Has("26") /\ Strict /\ file.gen # s.cur.gen)
           THEN Unreadable(w, Faulted(s, fk))
-        ELSE Judge(w, s1, LiveR, Go(w, [Rebased(s1, LiveR) EXCEPT !.pc = "cas"], FALSE))
+        ELSE Judge(w, s1, LiveOf(s), Go(w, [Rebased(s1, LiveR) EXCEPT !.pc = "cas"], FALSE))
 
 \* catch (AmbiguousWrite): a fresh read decides. If the record is not there,
 \* retry on that read if the transaction holds on it, else fail. A failed
@@ -515,7 +453,7 @@ Resolve(w, fk) ==
       s1 == [Faulted(s, fk) EXCEPT !.cx = @ \/ Crossed(LiveR, s.txn)]
   IN /\ ReadLive(w, fk, s, {"resolve"})
      /\ IF fk = "readFail" \/ LiveR.err THEN Unreadable(w, Faulted(s, fk))
-        ELSE Judge(w, s1, LiveR,
+        ELSE Judge(w, s1, LiveOf(s),
                IF Verify(LiveR.st, s.txn)
                  THEN Go(w, [Rebased(s1, LiveR) EXCEPT !.att = @ + 1, !.pc = "loop"], FALSE)
                  ELSE End(w, [s1 EXCEPT !.unres = FALSE], "failed", FALSE))
@@ -535,7 +473,7 @@ FinalRead(w, fk) ==
   IN /\ s.pc = "loop" /\ s.att >= MaxAttempts /\ ~s.amb /\ s.unres
      /\ ReadLive(w, fk, s, {"loop"})
      /\ IF fk = "readFail" \/ LiveR.err THEN Unreadable(w, Faulted(s, fk))
-        ELSE Judge(w, s1, LiveR, End(w, s1, "failed", FALSE))
+        ELSE Judge(w, s1, LiveOf(s), End(w, s1, "failed", FALSE))
 
 \* A timed-out write lands after all, while its precondition holds.
 LandInflight(i) ==
@@ -593,7 +531,6 @@ FairSpec == Spec /\ \A w \in Writers : WF_vars(WriterNext(w))
 (* Properties *)
 
 Hist == LiveR.st.hist
-IdsOf(h) == {h[i].id : i \in 1..Len(h)}
 
 \* Every version of the catalog replays (Bug 64: one record at the horizon
 \* failed every read).
@@ -602,18 +539,8 @@ Readable == ~LiveR.err
 \* No transaction applies twice.
 ExactlyOnce == \A i, j \in 1..Len(Hist) : i # j => Hist[i].id # Hist[j].id
 
-\* The serial execution of the applied transactions, in order: each one's
-\* reads (as its snapshot had them) hold where it applies, and creates bind
-\* fresh ids. ok is FALSE if some transaction's reads do not hold.
-ValidOn(st, r) == \A e \in DOMAIN r.ird : st.ver[e] = r.ird[e]
-SerialApply(st, r) == [Apply(st, [r EXCEPT !.cid = 0]) EXCEPT !.hist = Append(st.hist, r)]
-RECURSIVE SerialFold(_, _)
-SerialFold(st, h) ==
-  IF h = << >> THEN [ok |-> TRUE, st |-> st]
-  ELSE IF ~ValidOn(st, Head(h)) THEN [ok |-> FALSE, st |-> st]
-  ELSE SerialFold(SerialApply(st, Head(h)), Tail(h))
-
-\* The catalog is the serial execution of the transactions applied.
+\* The catalog is the serial execution of the transactions applied
+\* (RSM's SerialFold).
 Serializable == SerialFold(InitSt, Hist) = [ok |-> TRUE, st |-> LiveR.st]
 
 \* No id names two entities (S4 in FileIOCatalog.tla; Bug 10).
