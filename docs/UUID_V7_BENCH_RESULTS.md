@@ -1,6 +1,6 @@
 # Committed-transaction-set encoding benchmarks
 
-JMH results for four candidate encodings of the checkpoint's committed-transaction set, then `repeated bytes committed_transaction_ids` and now `Checkpoint.committed_transactions` (message `CommittedTransactions`, field 20).
+JMH results for four candidate encodings of the checkpoint's committed-transaction set, then `repeated bytes committed_transaction_ids` then `Checkpoint.committed_transactions` (message `CommittedTransactions`, field 20), and now the log envelope's `LogCheckpoint.committed` (field 3).
 
 - **D**: status quo at the time. 16 raw bytes per UUID. Decoder materializes into a `HashSet<UUID>` for O(1) lookups.
 - **A**: successive deltas (varint), descending sort, linear scan with early exit. Operates on compressed bytes — no materialization.
@@ -104,7 +104,7 @@ If a future deployment is memory-constrained (millions of committed-txn entries,
 
 ## Decision
 
-Implement **encoding A** for the committed set (now `Checkpoint.committed_transactions`). Keep HashSet materialization at decode time. This delivers the requested compression with zero query-latency regression.
+Implement **encoding A** for the committed set (then `Checkpoint.committed_transactions`, now the log envelope's `LogCheckpoint.committed`). Keep HashSet materialization at decode time. This delivers the requested compression with zero query-latency regression.
 
 As built (a19051a), lookups do not materialize a HashSet: they scan the encoded bytes (`ProtoCodec.committedSetContains`, now `CommittedSetCodec.contains` in intentlog-core), a linear scan like A's above. Only a builder's in-flight additions are held in a `HashSet`.
 

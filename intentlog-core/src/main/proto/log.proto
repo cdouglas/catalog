@@ -1,0 +1,104 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+syntax = "proto3";
+package intentlog;
+
+// ============================================================
+// READ FIRST: THIS FILE IS NOT COMPILED.
+// ============================================================
+//
+// The schema of record for the intention log's envelope: the checkpoint and
+// record framing every log provider stores, whatever state machine it
+// replicates. Like the catalog's catalog.proto, it is written by hand, by
+// `org.intentlog.wire.LogEnvelope` and `CommittedSetCodec`, in protobuf wire
+// format that protoc-generated readers accept (see catalog.proto's header for
+// how the hand-written codecs depart from protoc's output).
+//
+// The envelope owns what the runtime needs to replicate any state machine:
+// the log's identity, record ids and the committed set that dedups them. The
+// state machine's own bytes ride in `LogCheckpoint.state` and
+// `LogRecord.intention`; the catalog's are catalog.proto's `Checkpoint` and
+// `Intention`. The catalog's tests (`CatalogProto`) decode the two schemas as
+// one, typing those two fields as the catalog's messages.
+
+// The state a replay of a log reached, which replay of the records after it
+// continues from.
+message LogCheckpoint {
+  // The envelope reader version this checkpoint needs (LogEnvelope
+  // SUPPORTED_READER_VERSION, now 1); a reader that supports less refuses it.
+  // Written first, so a reader fails before it decodes the rest.
+  int32 min_reader_version = 1;
+
+  // The log's identity: a UUIDv7 (16 bytes), minted when the log is created.
+  bytes log_id = 2;
+
+  // The ids of the records replay applied, less those GC dropped. Absent when
+  // the set is empty and no GC has run.
+  CommittedTransactions committed = 3;
+
+  // The state machine's checkpoint (the catalog: iceberg.catalog.Checkpoint).
+  bytes state = 4;
+}
+
+// Compressed UUIDv7 set. The encoder sorts entries descending by UUID
+// (= descending by timestamp, since v7's high bits are timestamp), records
+// the largest timestamp as `max_timestamp_ms`, and emits per-entry the gap
+// from the previous timestamp plus 10 bytes of random material (rand_a +
+// rand_b, with the fixed version and variant bits dropped). The decoder
+// reconstructs each UUID by reapplying the version (=0x7) and variant
+// (=0b10) bits.
+//
+// Entries are interleaved into a single packed bytes field so the codec
+// can walk them in one linear pass without allocating intermediate
+// arrays — `CommittedSet.contains` runs directly against the wire bytes
+// with zero per-call heap.
+//
+// Per-entry wire cost: 1-3 (delta varint) + 10 (random) ≈ 11-13 bytes,
+// vs 18 bytes (16 + tag + length) for a `repeated bytes` encoding. ~30%
+// reduction at typical sizes; see docs/UUID_V7_BENCH_RESULTS.md.
+message CommittedTransactions {
+  // Largest (most recent) timestamp in ms; 0 when the set is empty. Always
+  // written.
+  fixed64 max_timestamp_ms = 1;
+
+  // Per entry, in descending timestamp order, back-to-back:
+  //   varint delta_ms  -- gap from previous entry (first delta is 0)
+  //   10 bytes         -- 12 bits rand_a + 62 bits rand_b + 6 bits zero pad
+  // The number of entries is recovered by walking the buffer.
+  bytes packed_entries = 2;
+
+  // GC horizon: the largest timestamp_ms of any UUIDv7 that has been dropped
+  // from this set by a retention pass. 0 (absent) means no GC has happened yet.
+  // Queries for UUIDs whose timestamp_ms <= this value are UNKNOWN — the entry
+  // may have been committed and aged out, or it may never have been committed.
+  // See docs/SPEC.md "Committed-set retention (GC)" and docs/GC.md.
+  fixed64 highest_dropped_timestamp_ms = 3;
+}
+
+// One entry of the log: an intention, which replay applies once, if its
+// preconditions hold where it lands.
+message LogRecord {
+  // A UUIDv7 (16 bytes): replay applies a record whose id the committed set
+  // does not hold, and a writer learns from the set whether its record did.
+  bytes id = 1;
+
+  oneof body {
+    // The state machine's intention (the catalog: iceberg.catalog.Intention).
+    bytes intention = 2;
+  }
+}

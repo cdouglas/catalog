@@ -18,14 +18,12 @@
  */
 package org.apache.iceberg.io;
 
-import static org.intentlog.wire.ProtoWire.bytesToUuid;
 import static org.intentlog.wire.ProtoWire.readFixed64;
 import static org.intentlog.wire.ProtoWire.readLengthDelimitedBytes;
 import static org.intentlog.wire.ProtoWire.readString;
 import static org.intentlog.wire.ProtoWire.readVarint;
 import static org.intentlog.wire.ProtoWire.readVarint64;
 import static org.intentlog.wire.ProtoWire.skipField;
-import static org.intentlog.wire.ProtoWire.uuidToBytes;
 import static org.intentlog.wire.ProtoWire.writeBytes;
 import static org.intentlog.wire.ProtoWire.writeFixed64;
 import static org.intentlog.wire.ProtoWire.writeLengthDelimited;
@@ -57,6 +55,7 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.intentlog.wire.CommittedSetCodec;
+import org.intentlog.wire.LogEnvelope;
 import org.intentlog.wire.UuidV7;
 
 /**
@@ -89,7 +88,6 @@ public class ProtoCodec {
   // Wire types
 
   // Checkpoint field numbers (from catalog.proto)
-  private static final int CHECKPOINT_CATALOG_UUID = 1;
   private static final int CHECKPOINT_NEXT_NAMESPACE_ID = 2;
   private static final int CHECKPOINT_NEXT_TABLE_ID = 3;
   /**
@@ -106,7 +104,6 @@ public class ProtoCodec {
   private static final int CHECKPOINT_TABLES = 11;
   private static final int CHECKPOINT_NAMESPACE_PROPERTIES = 12;
   private static final int CHECKPOINT_INLINE_TABLES = 13;
-  private static final int CHECKPOINT_COMMITTED_TXNS = 20;
 
   // CommittedTransactions field numbers (compressed UUIDv7 set).
   // Entries are interleaved (varint delta + 10 random bytes per entry,
@@ -172,8 +169,7 @@ public class ProtoCodec {
   private static final int SMR_POOL_INDICES = 2;
 
   // Transaction field numbers
-  private static final int TXN_ID = 1;
-  private static final int TXN_ACTIONS = 3;
+  private static final int INTENTION_ACTIONS = 3;
 
   // Action type field numbers (oneof)
   private static final int ACTION_CREATE_NAMESPACE = 1;
@@ -300,9 +296,6 @@ public class ProtoCodec {
       // chewing through the rest of the payload.
       writeVarint(out, CHECKPOINT_MIN_READER_VERSION, SUPPORTED_READER_VERSION);
 
-      // Catalog UUID
-      writeBytes(out, CHECKPOINT_CATALOG_UUID, uuidToBytes(original.uuid()));
-
       // Next IDs: the original state's. Replay allocates the ids of the
       // transaction record that follows this checkpoint.
       writeVarint(out, CHECKPOINT_NEXT_NAMESPACE_ID, idManager.getNextNsid());
@@ -346,34 +339,33 @@ public class ProtoCodec {
         }
       }
 
-      // Committed transactions (compressed UUIDv7 set, see CommittedTransactions
-      // proto). The catalog file stores the inner-message bytes directly. When
-      // dropBeforeTimestampMs > 0, this is also the GC site: CommittedSetCodec.rewrite
-      // drops inherited entries whose v7 timestamp is below the watermark and
-      // updates highest_dropped_timestamp_ms accordingly. Empty set with no
-      // horizon is omitted for wire-byte parity with the prior encoding.
+      // The catalog's id and committed transactions (a compressed UUIDv7 set) are the log's:
+      // the envelope (log.proto LogCheckpoint) carries them, and this checkpoint as its state.
+      // When dropBeforeTimestampMs > 0, this is also the GC site: CommittedSetCodec.rewrite
+      // drops inherited entries whose v7 timestamp is below the watermark and updates
+      // highest_dropped_timestamp_ms accordingly.
       byte[] inheritedBytes = original.committedTransactionsBytes();
       byte[] committedBytes =
           dropBeforeTimestampMs > 0L
               ? CommittedSetCodec.rewrite(
                   inheritedBytes, java.util.Collections.emptyList(), dropBeforeTimestampMs)
               : inheritedBytes;
-      if (committedBytes.length > 0) {
-        writeLengthDelimited(out, CHECKPOINT_COMMITTED_TXNS, committedBytes);
-      }
-
-      return out.toByteArray();
+      return LogEnvelope.encodeCheckpoint(original.uuid(), committedBytes, out.toByteArray());
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
   }
 
   /**
-   * Decodes a checkpoint into a builder.
+   * Decodes a checkpoint (a log.proto LogCheckpoint whose state is the catalog's Checkpoint) into
+   * a builder.
    */
   public static void decodeCheckpoint(byte[] bytes, ProtoCatalogFile.Builder builder) {
+    LogEnvelope.Checkpoint envelope = LogEnvelope.decodeCheckpoint(bytes);
+    builder.setCatalogUuid(envelope.logId());
+    builder.setCommittedTransactionsBytes(envelope.committed());
     try {
-      ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+      ByteArrayInputStream in = new ByteArrayInputStream(envelope.state());
       boolean sawMinReaderVersion = false;
       while (in.available() > 0) {
         int tag = readVarint(in);
@@ -393,9 +385,6 @@ public class ProtoCodec {
             }
             sawMinReaderVersion = true;
             break;
-          case CHECKPOINT_CATALOG_UUID:
-            builder.setCatalogUuid(bytesToUuid(readLengthDelimitedBytes(in)));
-            break;
           case CHECKPOINT_NEXT_NAMESPACE_ID:
             builder.setNextNamespaceId(readVarint(in));
             break;
@@ -413,9 +402,6 @@ public class ProtoCodec {
             break;
           case CHECKPOINT_INLINE_TABLES:
             decodeInlineTable(readLengthDelimitedBytes(in), builder);
-            break;
-          case CHECKPOINT_COMMITTED_TXNS:
-            builder.setCommittedTransactionsBytes(readLengthDelimitedBytes(in));
             break;
           default:
             skipField(in, wireType);
@@ -699,39 +685,34 @@ public class ProtoCodec {
   // ============================================================
 
   /**
-   * Encodes a transaction from accumulated mutations.
+   * Encodes a transaction as a log record (log.proto LogRecord): its id, and its actions as the
+   * record's intention (the catalog's Intention).
    */
   public static byte[] encodeTransaction(Transaction txn) {
     try {
       ByteArrayOutputStream out = new ByteArrayOutputStream();
-      writeBytes(out, TXN_ID, uuidToBytes(txn.id()));
       for (Action action : txn.actions()) {
         byte[] actionBytes = encodeAction(action);
-        writeLengthDelimited(out, TXN_ACTIONS, actionBytes);
+        writeLengthDelimited(out, INTENTION_ACTIONS, actionBytes);
       }
-      return out.toByteArray();
+      return LogEnvelope.encodeRecord(txn.id(), out.toByteArray());
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
   }
 
-  /**
-   * Decodes a transaction from bytes.
-   */
+  /** Decodes a transaction from a log record. */
   public static Transaction decodeTransaction(byte[] bytes) {
+    LogEnvelope.Record record = LogEnvelope.decodeRecord(bytes);
     try {
-      ByteArrayInputStream in = new ByteArrayInputStream(bytes);
-      UUID txnId = null;
+      ByteArrayInputStream in = new ByteArrayInputStream(record.intention());
       List<Action> actions = new ArrayList<>();
 
       while (in.available() > 0) {
         int tag = readVarint(in);
         int fieldNumber = tag >>> 3;
         switch (fieldNumber) {
-          case TXN_ID:
-            txnId = bytesToUuid(readLengthDelimitedBytes(in));
-            break;
-          case TXN_ACTIONS:
+          case INTENTION_ACTIONS:
             actions.add(decodeAction(readLengthDelimitedBytes(in)));
             break;
           default:
@@ -739,8 +720,7 @@ public class ProtoCodec {
         }
       }
 
-      Preconditions.checkNotNull(txnId, "Transaction ID is required");
-      return new Transaction(txnId, actions);
+      return new Transaction(record.id(), actions);
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }

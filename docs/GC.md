@@ -2,7 +2,7 @@
 
 ## Context
 
-`Checkpoint.committed_transactions` is the per-catalog dedup set: the
+`LogCheckpoint.committed` (log.proto) is the per-catalog dedup set: the
 UUIDv7 of every committed transaction GC has not dropped, compressed
 (delta-varint timestamps, newest first). Replay uses it to apply a
 record once, so a retried append whose first attempt landed changes

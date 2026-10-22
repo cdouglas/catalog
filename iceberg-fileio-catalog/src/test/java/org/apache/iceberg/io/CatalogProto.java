@@ -37,8 +37,9 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * {@code src/main/proto/catalog.proto}, the schema of record for the catalog file format, and a
- * check that catalog file bytes conform to it. The codecs are written by hand ({@link ProtoCodec},
+ * {@code src/main/proto/catalog.proto}, the schema of record for the catalog's checkpoints and
+ * intentions, with intentlog-core's {@code log.proto}, the schema of the log envelope that carries
+ * them, and a check that catalog file bytes conform to the two. The codecs are written by hand ({@link ProtoCodec},
  * {@link InlineDeltaCodec}), so nothing else ties them to the schema; the format explorer decodes
  * files with it, and a field it lacks shows as unknown there.
  *
@@ -50,6 +51,11 @@ import java.util.regex.Pattern;
  */
 final class CatalogProto {
   static final Path PROTO_FILE = Paths.get("src/main/proto/catalog.proto");
+  static final Path LOG_PROTO_FILE = Paths.get("../intentlog-core/src/main/proto/log.proto");
+
+  /** The envelope's payload fields (bytes in log.proto), and the catalog message each carries. */
+  static final Map<String, String> PAYLOADS =
+      Map.of("LogCheckpoint.state", "Checkpoint", "LogRecord.intention", "Intention");
 
   private static final int WIRE_VARINT = 0;
   private static final int WIRE_FIXED64 = 1;
@@ -77,11 +83,11 @@ final class CatalogProto {
 
   private CatalogProto() {}
 
-  /** catalog.proto, parsed once. */
+  /** log.proto and catalog.proto, parsed once. */
   static synchronized Schema schema() {
     if (schema == null) {
       try {
-        schema = parse(Files.readString(PROTO_FILE));
+        schema = parse(Files.readString(LOG_PROTO_FILE), Files.readString(PROTO_FILE));
       } catch (IOException e) {
         throw new UncheckedIOException(e);
       }
@@ -185,6 +191,39 @@ final class CatalogProto {
   private static final Pattern RESERVED = Pattern.compile("^\\s*reserved\\s+([\\d\\s,]+);");
   private static final Pattern ENUM_VALUE = Pattern.compile("^\\s*(\\w+)\\s*=\\s*(-?\\d+)\\s*;");
   private static final Pattern CLOSE = Pattern.compile("^\\s*\\}");
+
+  /**
+   * log.proto and catalog.proto as one schema, the envelope's payload fields ({@link #PAYLOADS})
+   * typed as the catalog messages they carry: a payload is length-delimited either way, and a
+   * protobuf reader decodes it with the message the field names.
+   */
+  static Schema parse(String logSource, String catalogSource) {
+    Schema log = parse(logSource);
+    Schema catalog = parse(catalogSource);
+    Map<String, Message> messages = new LinkedHashMap<>(log.messages);
+    Map<String, EnumDef> enums = new LinkedHashMap<>(log.enums);
+    for (Message message : catalog.messages.values()) {
+      if (messages.put(message.name, message) != null) {
+        throw new IllegalArgumentException("log.proto and catalog.proto both declare " + message.name);
+      }
+    }
+    enums.putAll(catalog.enums);
+    for (Map.Entry<String, String> payload : PAYLOADS.entrySet()) {
+      String[] at = payload.getKey().split("\\.");
+      Message envelope = messages.get(at[0]);
+      for (int i = 0; envelope != null && i < envelope.fields.size(); i++) {
+        Field field = envelope.fields.get(i);
+        if (field.name.equals(at[1])) {
+          envelope.fields.set(
+              i,
+              new Field(
+                  field.number, field.name, payload.getValue(), field.repeated, field.packed,
+                  field.oneof, field.comment));
+        }
+      }
+    }
+    return new Schema(messages, enums);
+  }
 
   /**
    * Parses the subset of proto3 that catalog.proto uses: messages with fields, maps, oneofs,
@@ -338,10 +377,10 @@ final class CatalogProto {
         throw new Violation("header version " + version);
       }
       pos = ProtoCatalogFormat.HEADER_SIZE;
-      message("Checkpoint", "checkpoint", frame("checkpoint"));
+      message("LogCheckpoint", "checkpoint", frame("checkpoint"));
       for (int record = 0; pos < bytes.length; record++) {
         String path = "record " + record;
-        message("Transaction", path, frame(path));
+        message("LogRecord", path, frame(path));
       }
     }
 

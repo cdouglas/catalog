@@ -50,17 +50,20 @@ import org.intentlog.wire.UuidV7;
  * [Magic: 4 bytes "LCAT"]
  * [Version: 4 bytes, big-endian int]
  * [Checkpoint length: varint]
- * [Checkpoint: protobuf bytes]
- * [Transaction 1 length: varint][Transaction 1: protobuf bytes]
- * [Transaction 2 length: varint][Transaction 2: protobuf bytes]
+ * [Checkpoint: protobuf bytes, a log.proto LogCheckpoint]
+ * [Record 1 length: varint][Record 1: protobuf bytes, a log.proto LogRecord]
+ * [Record 2 length: varint][Record 2: protobuf bytes, a log.proto LogRecord]
  * ...
  * </pre>
+ *
+ * <p>The envelopes (intentlog-core's LogEnvelope) carry the catalog's checkpoint and each
+ * transaction's actions (catalog.proto's Checkpoint and Intention).
  */
 public class ProtoCatalogFormat
     implements CatalogFormat<ProtoCatalogFile, ProtoCatalogFormat.Mut> {
 
   public static final byte[] MAGIC = "LCAT".getBytes(StandardCharsets.US_ASCII);
-  public static final int FORMAT_VERSION = 1;
+  public static final int FORMAT_VERSION = 2;
   public static final int HEADER_SIZE = 8; // magic (4) + version (4)
 
   /**

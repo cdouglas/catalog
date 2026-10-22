@@ -62,7 +62,7 @@ public class TestFormatExplorer {
     codec.put("MF_", "ManifestFileEntry");
     codec.put("PFS_", "PartitionFieldSummaryEntry");
     codec.put("SMR_", "SnapshotManifestRefs");
-    codec.put("TXN_", "Transaction");
+    codec.put("INTENTION_", "Intention");
     codec.put("ACTION_", "Action");
     codec.put("CREATE_NS_", "CreateNamespace");
     codec.put("DROP_NS_", "DropNamespace");
@@ -80,6 +80,11 @@ public class TestFormatExplorer {
     Map<String, String> committed = new LinkedHashMap<>();
     committed.put("COMMITTED_TXNS_", "CommittedTransactions");
     PREFIXES.put("CommittedSetCodec", committed);
+
+    Map<String, String> envelope = new LinkedHashMap<>();
+    envelope.put("LOG_CHECKPOINT_", "LogCheckpoint");
+    envelope.put("LOG_RECORD_", "LogRecord");
+    PREFIXES.put("LogEnvelope", envelope);
 
     Map<String, String> delta = new LinkedHashMap<>();
     delta.put("DELTA_", "TableMetadataDelta");
@@ -201,10 +206,10 @@ public class TestFormatExplorer {
     assertThat(problems).isEmpty();
   }
 
-  /** The source of a codec: this module's, or intentlog-core's for the committed set. */
+  /** The source of a codec: this module's, or intentlog-core's for the envelope's. */
   private static Path source(String codec) {
-    return codec.equals("CommittedSetCodec")
-        ? Paths.get("../intentlog-core/src/main/java/org/intentlog/wire/CommittedSetCodec.java")
+    return codec.equals("CommittedSetCodec") || codec.equals("LogEnvelope")
+        ? Paths.get("../intentlog-core/src/main/java/org/intentlog/wire/" + codec + ".java")
         : Paths.get("src/main/java/org/apache/iceberg/io/" + codec + ".java");
   }
 
@@ -262,7 +267,8 @@ public class TestFormatExplorer {
     String proto = Files.readString(CatalogProto.PROTO_FILE);
     String withoutRename = proto.replaceAll("(?m)^\\s*RenameTable\\s+rename_table\\s*=\\s*11;.*$", "");
     assertThat(withoutRename).isNotEqualTo(proto);
-    CatalogProto.Schema schema = CatalogProto.parse(withoutRename);
+    CatalogProto.Schema schema =
+        CatalogProto.parse(Files.readString(CatalogProto.LOG_PROTO_FILE), withoutRename);
     JsonNode fixtures = new ObjectMapper().readTree(embedded());
     for (JsonNode scenario : fixtures.path("scenarios")) {
       if (scenario.path("name").asText().equals("rename-table-across-namespaces")) {

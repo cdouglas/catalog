@@ -49,22 +49,22 @@ A fixed 8-byte header, a length-prefixed checkpoint, then a series of
 length-prefixed transaction records appended on top of it:
 
 <!-- RFC frame generated with luismartingarcia/protocol:
-protocol "Magic = LCAT:32,Format Version = 1:32,Checkpoint Length (varint):16,Checkpoint (protobuf - variable):48,Record Length (varint):16,Transaction (protobuf - variable):48" -->
+protocol "Magic = LCAT:32,Format Version = 2:32,Checkpoint Length (varint):16,LogCheckpoint (protobuf - variable):48,Record Length (varint):16,LogRecord (protobuf - variable):48" -->
 ```
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                          Magic = LCAT                         |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                       Format Version = 1                      |
+|                       Format Version = 2                      |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |   Checkpoint Length (varint)  |                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
-|                Checkpoint (protobuf - variable)               |
+|              LogCheckpoint (protobuf - variable)              |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |     Record Length (varint)    |                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
-|               Transaction (protobuf - variable)               |
+|                LogRecord (protobuf - variable)                |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
@@ -75,16 +75,17 @@ protobuf message):
 catalog-file = header checkpoint *record
 header       = magic version
 magic        = %x4C.43.41.54        ; "LCAT"
-version      = u32                  ; big-endian, currently 1
-checkpoint   = framed               ; protobuf Checkpoint
-record       = framed               ; protobuf Transaction
+version      = u32                  ; big-endian, currently 2
+checkpoint   = framed               ; protobuf LogCheckpoint (log.proto)
+record       = framed               ; protobuf LogRecord (log.proto)
 framed       = varint *OCTET        ; varint length L, then L octets
 ```
 
 The header is 8 bytes fixed. Everything after the header is variable-length,
-using varint length prefixes for each record. There is no separate
-committed-transaction-ID block; the checkpoint message carries that set
-internally. The bit-grid widths for the varint and protobuf regions above are
+using varint length prefixes for each record. The checkpoint and the records
+are the intention log's envelopes, which carry the catalog's own messages
+(see [Protobuf Schema](#protobuf-schema)). There is no separate
+committed-transaction-ID block; the checkpoint's envelope carries that set. The bit-grid widths for the varint and protobuf regions above are
 schematic: a varint is 1+ bytes, and the protobuf bodies are tag-keyed with no
 fixed offsets (the same caveat applies to the worked-example frames below).
 
@@ -100,15 +101,45 @@ Offset  Size   Field             Description
 
 ## Protobuf Schema
 
-Defined in `iceberg-fileio-catalog/src/main/proto/catalog.proto`, package `iceberg.catalog`.
+Two schemas, one inside the other. The envelope of the checkpoint and of
+each record is the intention log's, defined in
+`intentlog-core/src/main/proto/log.proto`, package `intentlog`: it carries
+the log's identity (the catalog's UUID), each record's id and the committed
+set that dedups them, whatever state machine the log replicates. The catalog's
+own messages, its checkpoint state and each transaction's actions, ride inside
+it; they are defined in `iceberg-fileio-catalog/src/main/proto/catalog.proto`,
+package `iceberg.catalog`.
+
+### The envelope (log.proto)
+
+```protobuf
+message LogCheckpoint {
+  int32  min_reader_version         = 1;   // LogEnvelope SUPPORTED_READER_VERSION, now 1; required, first
+  bytes  log_id                     = 2;   // 16 bytes, UUIDv7: the catalog's identity; required
+  CommittedTransactions committed   = 3;   // compressed UUIDv7 set; absent when empty with no horizon
+  bytes  state                      = 4;   // the catalog's Checkpoint; required
+}
+
+message LogRecord {
+  bytes id = 1;                            // UUIDv7, 16 bytes: the transaction id; required
+  oneof body {
+    bytes intention = 2;                   // the catalog's Intention: the transaction's actions
+  }
+}
+```
+
+A reader fails on a `LogCheckpoint` whose `min_reader_version` exceeds
+`LogEnvelope.SUPPORTED_READER_VERSION`, or that lacks it, the log id or the
+state, and on a `LogRecord` without an id or a body.
 
 ### Checkpoint
 
-Written on compaction (CAS). Contains the full materialized catalog state.
+The state of a `LogCheckpoint`. Written on compaction (CAS). Contains the
+full materialized catalog state.
 
 ```protobuf
 message Checkpoint {
-  bytes  catalog_uuid              = 1;   // 16 bytes, UUIDv7
+  reserved 1, 20;                         // were catalog_uuid and committed_transactions
   // Replay binds a transaction's late-bound ids to these, in log order.
   int32  next_namespace_id         = 2;
   int32  next_table_id             = 3;
@@ -119,10 +150,9 @@ message Checkpoint {
   repeated Table              tables                 = 11;  // pointer-mode tables
   repeated NamespaceProperty  namespace_properties   = 12;
   repeated InlineTable        inline_tables          = 13;  // inline-mode tables
-  CommittedTransactions       committed_transactions = 20;  // compressed UUIDv7 set
 }
 
-message CommittedTransactions {
+message CommittedTransactions {           // log.proto
   // Largest timestamp in the set; 0 when the set is empty. Always written.
   fixed64 max_timestamp_ms             = 1;
   // Per entry, descending order, back-to-back inside one packed bytes
@@ -138,12 +168,13 @@ message CommittedTransactions {
 The encoder writes `min_reader_version` before every other field, so a reader
 that cannot read the checkpoint fails before decoding the rest; the decoder
 fails if it is absent or exceeds `ProtoCodec.SUPPORTED_READER_VERSION`.
-`committed_transactions` is omitted when the set is empty and has no horizon.
+The envelope's `committed` is omitted when the set is empty and has no
+horizon.
 
 A table ID appears in either `tables` (pointer mode) or `inline_tables`
 (inline mode), never both.
 
-The `committed_transactions` sub-message exploits the structure of UUIDv7
+The `CommittedTransactions` sub-message exploits the structure of UUIDv7
 to compress the dedup set. Entries are sorted descending by UUID (= by
 timestamp), the largest timestamp is stored once as `max_timestamp_ms`,
 and each entry's varint gap-from-previous and 10 bytes of random
@@ -153,7 +184,7 @@ reconstructed on decode) are interleaved back-to-back inside a single
 `packed_entries` bytes blob. For typical clustered commit traffic this
 saves ~30% per entry vs the older `repeated bytes` form.
 
-The interleaved layout lets `ProtoCatalogFile.containsTransaction` walk
+The interleaved layout lets `CommittedSet.contains` (intentlog-core) walk
 the wire bytes in a single linear pass without materializing the set:
 the catalog file holds the inner-message bytes directly (no
 `HashSet<UUID>`). A read that applies no log records keeps the
@@ -170,7 +201,7 @@ study that informed this choice.
 
 #### Committed-set retention (GC)
 
-The dedup set in `Checkpoint.committed_transactions` grows monotonically
+The dedup set in `LogCheckpoint.committed` grows monotonically
 across compactions. Without a retention policy, even with v7 compression
 the section's size scales linearly with the catalog's total commit
 history. The retention policy below trims old entries at compaction
@@ -344,14 +375,14 @@ message NamespaceProperty {
 
 For `InlineTable`, see [SPEC_TM.md](SPEC_TM.md).
 
-### Transaction
+### Intention
 
-Appended atomically to the log region.
+The intention of a `LogRecord`: a transaction's actions. Appended atomically to
+the log region, inside the record, whose `id` is the transaction id.
 
 ```protobuf
-message Transaction {
-  reserved 2;                            // was `sealed`
-  bytes           transaction_id = 1;    // UUIDv7, 16 bytes; required
+message Intention {
+  reserved 1, 2;                         // were transaction_id and `sealed`
   repeated Action actions        = 3;
 }
 
@@ -470,15 +501,18 @@ visible (the format explorer's `empty-bootstrap` and
 
 ```abnf
 file       = header checkpoint record-1 record-2 record-3
-checkpoint = framed<Checkpoint{ min_reader_version=1, catalog_uuid=…,
-               next_namespace_id=1, next_table_id=1,
-               Namespace{id=0, version=0, parent_id=0, name=""} }>   ; empty
-record-1   = framed<Transaction{ transaction_id=… }>                 ; no actions
-record-2   = framed<Transaction{ CreateNamespace(id=-1, version=1,
-                                  parent_id=0, parent_version=0, name="db") }>
-record-3   = framed<Transaction{ CreateTable(id=-1, version=1,
-                                  namespace_id=1, namespace_version=1,
-                                  name="t", metadata_location="…/meta-A.json") }>
+checkpoint = framed<LogCheckpoint{ min_reader_version=1, log_id=…,
+               state=Checkpoint{ min_reader_version=1,
+                 next_namespace_id=1, next_table_id=1,
+                 Namespace{id=0, version=0, parent_id=0, name=""} } }>   ; empty
+record-1   = framed<LogRecord{ id=…, intention=Intention{} }>          ; no actions
+record-2   = framed<LogRecord{ id=…, intention=Intention{
+               CreateNamespace(id=-1, version=1,
+                               parent_id=0, parent_version=0, name="db") } }>
+record-3   = framed<LogRecord{ id=…, intention=Intention{
+               CreateTable(id=-1, version=1,
+                           namespace_id=1, namespace_version=1,
+                           name="t", metadata_location="…/meta-A.json") } }>
 ```
 
 `FileIOCatalog.initialize` creates the file with a CAS of the empty catalog
@@ -491,14 +525,14 @@ read it. Record 3's writer read `db` as id 1 at version 1; replay binds the tabl
 actions would share one record, the `CreateTable` naming the namespace by its
 late-bound id (`namespace_id=-1, namespace_version=-1`).
 
-<!-- protocol "Magic = LCAT:32,Format Version = 1:32,CP Length (varint):16,Checkpoint - empty (root row; next ids 1):48,Rec1 Length (varint):16,Record 1 - empty txn (initialize):48,Rec2 Length (varint):16,Record 2 - CreateNamespace (id=-1 v=1 db):48,Rec3 Length (varint):16,Record 3 - CreateTable (id=-1 v=1 ns=1 t):48" -->
+<!-- protocol "Magic = LCAT:32,Format Version = 2:32,CP Length (varint):16,Checkpoint - empty (root row; next ids 1):48,Rec1 Length (varint):16,Record 1 - empty txn (initialize):48,Rec2 Length (varint):16,Record 2 - CreateNamespace (id=-1 v=1 db):48,Rec3 Length (varint):16,Record 3 - CreateTable (id=-1 v=1 ns=1 t):48" -->
 ```
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                          Magic = LCAT                         |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                       Format Version = 1                      |
+|                       Format Version = 2                      |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |       CP Length (varint)      |                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
@@ -522,14 +556,14 @@ A commit that CASes next, say an `UpdateTableLocation` of `t`, writes a
 checkpoint of the replayed state and then its own record, in full:
 
 ```
-checkpoint: min_reader_version=1  next_ns_id=2  next_tbl_id=2
-            Namespace{ id=0  v=1  parent=0  "" }     ; root, bumped by the create of db
-            Namespace{ id=1  v=2  parent=0  "db" }   ; bumped by the create of t
-            Table{ id=1  v=1  ns=1  "t" -> …/meta-A.json }
-            committed_transactions: the ids of records 1-3, less any at or
-                                    below this CAS's GC watermark
-record 1  : Transaction{ UpdateTableLocation(id=1, version=1,
-                                             metadata_location="…/meta-B.json") }
+checkpoint: log_id   committed: the ids of records 1-3, less any at or
+                                below this CAS's GC watermark
+            state: min_reader_version=1  next_ns_id=2  next_tbl_id=2
+              Namespace{ id=0  v=1  parent=0  "" }     ; root, bumped by the create of db
+              Namespace{ id=1  v=2  parent=0  "db" }   ; bumped by the create of t
+              Table{ id=1  v=1  ns=1  "t" -> …/meta-A.json }
+record 1  : id   intention: UpdateTableLocation(id=1, version=1,
+                                                metadata_location="…/meta-B.json")
 ```
 
 Replay verifies and applies record 1 on top of the checkpoint, as it would an
@@ -543,24 +577,24 @@ current version and advance it by one:
 
 ```abnf
 file       = header checkpoint record-1
-checkpoint = framed<Checkpoint{ min_reader_version=1, …, next_table_id=5,
+checkpoint = framed<LogCheckpoint{ …, state=Checkpoint{ …, next_table_id=5,
                Table{id=1,version=3,name="a"}, Table{id=2,version=5,name="b"},
-               Table{id=3,version=2,name="c"}, Table{id=4,version=7,name="d"} }>
-record-1   = framed<Transaction{
+               Table{id=3,version=2,name="c"}, Table{id=4,version=7,name="d"} } }>
+record-1   = framed<LogRecord{ id=…, intention=Intention{
                UpdateTableLocation(id=1, version=3, metadata_location="…/a-4.json"),
                UpdateTableLocation(id=2, version=5, metadata_location="…/b-6.json"),
                UpdateTableLocation(id=3, version=2, metadata_location="…/c-3.json"),
-               UpdateTableLocation(id=4, version=7, metadata_location="…/d-8.json") }>
+               UpdateTableLocation(id=4, version=7, metadata_location="…/d-8.json") } }>
 ```
 
-<!-- protocol "Magic = LCAT:32,Format Version = 1:32,CP Length (varint):16,Checkpoint - Tables a(v3) b(v5) c(v2) d(v7):48,Record Length (varint):16,Record - 4x UpdateTableLocation bumps a-d:48" -->
+<!-- protocol "Magic = LCAT:32,Format Version = 2:32,CP Length (varint):16,Checkpoint - Tables a(v3) b(v5) c(v2) d(v7):48,Record Length (varint):16,Record - 4x UpdateTableLocation bumps a-d:48" -->
 ```
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                          Magic = LCAT                         |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                       Format Version = 1                      |
+|                       Format Version = 2                      |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |       CP Length (varint)      |                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
@@ -604,13 +638,14 @@ continuation). `int32` and `int64` are not zigzag-encoded: a negative `int32`
 Unlike proto3, `ProtoCodec` writes the fields of the catalog entities and
 actions unconditionally, zero and empty values included (an id or version of 0,
 the root's `parent_id = 0`, an empty string such as the root's name). Optional
-fields are written only when present: `committed_transactions` (omitted when
+fields are written only when present: the envelope's `committed` (omitted when
 the set is empty with no horizon), `highest_dropped_timestamp_ms` (omitted when
 0), the one case of `UpdateTableInline`'s payload, and the optional inline
 fields SPEC_TM and SPEC_ML describe. `ManifestFileEntry` omits zero or null
 counts, a zero spec id or sequence number, and the content of a data manifest. A decoder takes an
 absent scalar as zero or empty, but some fields are required, and their absence
-fails the read: `Checkpoint.min_reader_version`, `Transaction.transaction_id`,
+fails the read: `LogCheckpoint.min_reader_version`, `log_id` and `state`,
+`Checkpoint.min_reader_version`, `LogRecord.id` and its body,
 every inline-metadata codec tag (`InlineTable.metadata_codec`,
 `CreateTableInline.metadata_codec`, and `UpdateTableInline.full_metadata_codec`
 with `full_metadata`; 0 included), and `TableMetadataDelta.last_updated_ms`.
@@ -625,7 +660,7 @@ function READ(fileIO, location):
     # 1. Read and validate header
     header = stream.read(8)
     assert header[0..4] == "LCAT"
-    assert readInt(header, 4) == 1          # format version: must equal 1
+    assert readInt(header, 4) == 2          # format version: must equal 2
 
     # 2. Read checkpoint
     chkLen   = readVarint(stream)
