@@ -9,10 +9,12 @@ record once, so a retried append whose first attempt landed changes
 nothing, and a writer uses it to learn whether its commit landed.
 
 Without a bound the set grows with the catalog's whole commit history.
-GC (b1af354) bounds it to about retention × commit rate: a CAS write
+GC (b1af354) bounds it to about retention × commit rate: each compaction
 writes a GC record that drops the ids older than the retention window,
-and records the newest time it dropped as the set's horizon. The wire format and the policy
-are in [SPEC.md](SPEC.md) §"Committed-set retention (GC)".
+and records the newest time it dropped as the set's horizon. The set
+belongs to the intention log, not to the catalog: its wire format, GC and
+lookup are the same for any state machine on any provider, and are
+specified in [LOG.md](LOG.md) §"The committed set and GC".
 
 ## Two oracles for "did my commit land?"
 
@@ -73,13 +75,19 @@ records: readers starting from different checkpoints of the same log
 apply the same records, which a horizon filtered into a checkpoint by
 its writer's clock would not guarantee.
 
-A CAS write (a compaction, or any commit in CAS-only mode) writes the
-GC record, between its checkpoint and its own record; an append never
-does. The commit loop (intentlog-core's `LogRuntime`, which writes a
-compaction's records) computes the watermark,
-`now - fileio.catalog.committed.retention.ms` (0 if the retention is at
-least `now`, so `Long.MAX_VALUE` disables GC and writes no record). A
-GC record carries no id, is not deduped (replaying one again changes
+Two writes carry a GC record; an append of an intention never does.
+The watermark is `now - fileio.catalog.committed.retention.ms` (0 if the
+retention is at least `now`, so `Long.MAX_VALUE` disables GC and writes
+no record):
+
+- On the catalog file, a CAS write (a compaction, or any commit in
+  CAS-only mode) writes it between its checkpoint and its own record,
+  capped below its own id (rule 2 below).
+- On a log with checkpoints apart, `LogRuntime.compact()` appends it,
+  reads through it, and checkpoints there; a writer whose commit landed
+  runs it when the log is due, and so may a background compactor.
+
+A GC record carries no id, is not deduped (replaying one again changes
 nothing), and does not count toward `max.append.count`.
 
 The retention defaults to 6 hours, longer than any commit's retries.
@@ -119,15 +127,43 @@ a commit reports true:
    whose clock is behind still commits.
 4. **The commit loop maps it to an outcome.** `LogRuntime`'s `landed`
    catches `DedupHorizonExceededException` on any read the commit loop
-   makes: the commit fails (`CommitFailedException`), since replay
-   rejects its record from then on, unless a write of it may have
-   landed before its id aged out, when it is unknown
-   (`CommitStateUnknownException`). The exception does not escape a
-   commit.
+   makes: the commit is rejected (`BEYOND_HORIZON`; the catalog throws
+   `CommitFailedException`), since replay rejects its record from then
+   on, unless a write of it may have landed before its id aged out, when
+   it is unknown (`CommitStateUnknownException`). The exception does not
+   escape a commit.
 
 `TestCatalogRegressions.CommittedSetHorizon` covers each case (a CAS
 after a conflict with retention 0, a record at the horizon, a writer
 behind the horizon).
+
+## GC on a shared log
+
+On one object, a version's only GC record precedes every record appended
+to it, so a writer that reads its record back finds the committed set and
+replay in agreement. On a log with checkpoints apart, compactors append
+GC records whenever they run, and three more cases follow
+([LOG.md](LOG.md) §"The commit loop", found by `SharedLogCommit.tla`):
+
+- **A GC record lands between a writer's record and its read back**, and
+  drops the id of a record that applied. The committed set then cannot
+  say, so a writer judges its record first by what replay did with it
+  where it landed, and asks the set only if replay judged none.
+- **A throttled send lands beside its retry**, a compactor checkpoints
+  between the two copies, and a GC record drops the id. A read through
+  the acknowledged copy starts from that checkpoint, where replay skips
+  the copy as committed and the set cannot say. The writer counts the
+  throttled send as a write that may have landed, so the commit is
+  unknown, not failed.
+- **A read back answers from a checkpoint that already holds the
+  record**, whose id GC has dropped. The provider must return a view whose
+  records include it (P3); the runtime treats one that does not as an
+  ambiguous write and reads again.
+
+A compactor's GC record has no commit of its own to stay below, so its
+watermark can pass the id of a record still in flight, as a short
+retention does on one object: replay rejects that record, and its writer
+is rejected or unknown, never told it committed.
 
 ## Tests
 
@@ -138,7 +174,16 @@ behind the horizon).
   idempotent).
 - `CheckpointRoundTrip`: every CAS write's checkpoint is the replay of
   the version it replaced, committed set and horizon included (I11),
-  in the local suites and both fuzzers.
+  in the local suites and both fuzzers; on a shared log, every stored
+  checkpoint is the replay of the log through it.
+- `TestSharedLogRuntime` (intentlog-memory): the three shared-log cases
+  above, each a schedule that fails with its rule removed, and copies of
+  records whose originals GC compacted out or passed.
+- The protocol fuzzers (`TestMemoryCommitProtocol`,
+  `TestAtomicFileCommitProtocol`) and `TestMultiWriterProperties` run
+  compactors with retention 0, inside commits too, and append copies of
+  records that ever landed: none may apply, whether its original is a
+  record, in a checkpoint, or past the horizon.
 - `TestCommittedTransactions` (intentlog-core): round trip and defensive
   decode of the compressed set; the catalog's, through the checkpoint.
 - `TestProtoCommitKnobs`: the retention property, and end to end, a

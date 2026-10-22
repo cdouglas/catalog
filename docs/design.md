@@ -1,7 +1,9 @@
 # FileIOCatalog Design Notes
 
 High-level design, invariants, and best practices for working in this
-codebase. For wire-format details see [SPEC.md](SPEC.md), [SPEC_TM.md](SPEC_TM.md),
+codebase. For the intention log the catalog runs on see [LOG.md](LOG.md),
+for the catalog file's layout [ATOMIC_FILE_LOG.md](ATOMIC_FILE_LOG.md), and
+for the catalog's messages [SPEC.md](SPEC.md), [SPEC_TM.md](SPEC_TM.md) and
 [SPEC_ML.md](SPEC_ML.md). For known shortcuts and open issues see
 [errata.md](errata.md).
 
@@ -13,6 +15,13 @@ single object in cloud storage. There is no separate metastore. All
 mutation goes through cloud-storage conditional writes (`if-match` ETag,
 generation number, append offset), provided by the `SupportsAtomicOperations`
 extension to `FileIO`.
+
+The catalog is a state machine replicated through an intention log
+(intentlog-core, [LOG.md](LOG.md)), and the object is one provider of that
+log (`AtomicFileLog`). `LogCatalog`, the catalog's code, runs on any provider:
+`FileIOCatalog` is `LogCatalog` over an `AtomicFileLog`, and the test suites
+also run it on a shared log whose checkpoints are stored apart from its
+records (`InMemorySharedLog`).
 
 The catalog absorbs successive levels of Iceberg state:
 
@@ -42,40 +51,44 @@ on it and commits them atomically:
 3. Accumulate changes (`createTable`, `dropNamespace`, etc.).
 4. `commit()` appends its intention (`CatalogMutation.intention`) to the
    log as one record.
-5. The commit loop (intentlog-core's `LogRuntime.commit`, over the
-   catalog file's `AtomicFileLog`) handles
-   what storage reports. After a CAS conflict it replays the new file,
-   checks the record's preconditions again, and rebases the same record
-   onto it; after a lost append race it retries the same bytes at the new
-   offset; it retries a throttled write after a backoff (`write`,
-   `fileio.catalog.throttle.retry.min-wait-ms`); and it settles a write
-   whose outcome it did not learn by reading the catalog for the
-   transaction's id, or throws `CommitStateUnknownException` (I10). A
+5. The commit loop (intentlog-core's `LogRuntime.commit`) handles what
+   the log reports. After a CAS conflict it replays the new log, checks
+   the record's preconditions again, and rebases the same record onto it;
+   after a lost append race it resends the same record at the new tail;
+   it resends a throttled write after a backoff
+   (`fileio.catalog.throttle.retry.min-wait-ms`); and it settles a write
+   whose outcome it did not learn by reading the log for the
+   transaction's record, or throws `CommitStateUnknownException` (I10). A
    record whose preconditions fail goes back to the caller: the catalog
    (`LogCatalog`) stages a catalog operation again on a fresh read
    (`commitOnAFreshRead`), and Iceberg re-applies a table commit; a
    catalog transaction fails ([errata.md](errata.md) §D12). See
-   [SPEC.md](SPEC.md) §"Commit Protocol".
+   [LOG.md](LOG.md) §"The commit loop".
 
 ### Two Mutation Strategies
 
-Every commit is either:
+On the catalog file, every commit is either:
 
-- **Append** — append a length-prefixed transaction record to the end of
+- **Append** — append a length-prefixed intention record to the end of
   the file, conditional on the file's current length.
-- **CAS** — atomically replace the entire file with `[header][checkpoint][txn]`,
-  conditional on the file's ETag/generation.
+- **CAS** — atomically replace the entire file with
+  `[header][checkpoint][gc][record]`, conditional on the file's
+  ETag/generation.
 
 Append is fast and incremental; CAS is full-rewrite but compacts the log.
 The format alternates between them based on log-size thresholds. See
-[SPEC.md](SPEC.md) §"Commit Protocol".
+[ATOMIC_FILE_LOG.md](ATOMIC_FILE_LOG.md) §"Commits on one object". On a
+shared log with checkpoints apart, every commit appends, and a writer
+whose commit landed compacts by the same thresholds: a GC record, a
+checkpoint through it, a trim ([LOG.md](LOG.md) §"Compaction").
 
 ### Codec Layout
 
 Three codecs cooperate at write/read time:
 
-- `ProtoCodec` handles catalog-level messages: `Checkpoint`, `Transaction`,
-  `Action` oneof, all catalog/namespace/table actions.
+- `ProtoCodec` handles catalog-level messages: `Checkpoint`, `Intention`,
+  `Action` oneof, all catalog/namespace/table actions. The envelope around
+  them (log.proto) is intentlog-core's `LogEnvelope`.
 - `InlineDeltaCodec` handles inline TM delta messages:
   `TableMetadataDelta`, all 15 `TableMetadataUpdate` types,
   `CompactSummary`. The `ManifestFileEntry` an `AddManifestDelta`
@@ -111,18 +124,33 @@ This project consumes Iceberg as a Maven SNAPSHOT artifact. The
 point, and the cloud-provider `SupportsAtomicOperations` implementations
 (`S3FileIO`, `GCSFileIO`, `ADLSFileIO`) all live in the iceberg fork
 (branch `atomicio`, see the [README](../README.md)). The catalog format
-and the FileIO catalog itself live here.
+and the FileIO catalog itself live here, in modules:
+
+- `intentlog-core`: the intention log, with no Iceberg in it (the
+  enforcer bans Iceberg, Hadoop and Guava): the SPIs, replay, the
+  committed set, the commit loop, the envelope.
+- `intentlog-fileio` and `intentlog-memory`: its providers,
+  `AtomicFileLog` and `InMemorySharedLog`.
+- `intentlog-testkit`: the provider contract and the commit-protocol
+  fuzzer.
+- `iceberg-fileio-catalog`: the catalog, its state machine and codecs.
 
 ## Invariants
 
-These hold in the current code and must not regress.
+These hold in the current code and must not regress. I1, I2, I6, I10 and
+I11 are the intention log's, for any state machine on any provider; each
+says what the catalog adds.
 
 ### I1. One intention record per commit
 
-A single `doCommit` / `commitTransaction` produces exactly one
-transaction-level record per affected table, encoded into one transaction
-and written to storage in one atomic operation (append or CAS). Every
-configuration is subject to this rule:
+A commit (`LogRuntime.commit`) writes its intention as one record, in one
+atomic write: an append, or the replace that compacts. Replay applies the
+record whole or not at all, and every resend of it is the same bytes under
+the same id. So a reader never sees part of a commit.
+
+In the catalog, a single `doCommit` / `commitTransaction` stages one
+intention, with one action per affected table. Every configuration is
+subject to this rule:
 
 - **pointer**: one `UpdateTableLocation` / `CreateTable` action referencing
   a pre-written `v<N>.metadata.json`.
@@ -142,13 +170,21 @@ A compaction or crash mid-flight must not be able to observe a half-applied
 commit. ML actions are never written separately from the TM action that
 introduces the snapshot they belong to.
 
-### I2. Actions are idempotent on replay
+### I2. A record applies at most once
 
-Each action's `verify` checks preconditions (table version, namespace
-version, read-set versions); each action's `apply` mutates state so a
-replay of the same record against the post-apply state fails `verify`.
-This is the second line of defence alongside `committedTxn` deduplication
-— both must hold.
+Replay applies a record once, whatever copies of it the log holds: a resend
+after a lost reply or a lost race, a send the log throttled and that landed
+beside its retry, a request delayed in flight. The committed set skips a
+copy whose id it holds, and its GC horizon one whose id GC may have dropped
+([LOG.md](LOG.md) §"The committed set and GC"). This holds for any state
+machine, blind writes included. The protocol fuzzers append a copy of any
+record that ever landed, trimmed or compacted ones included, and require
+that the state, the committed set and the horizon do not change.
+
+The catalog adds a second line of defence: each action's `verify` checks
+preconditions (table version, namespace version, read-set versions), and
+each action's `apply` mutates state so a replay of the same record against
+the post-apply state fails `verify` (S2, S3). Both must hold.
 
 `apply()` bumps the version of any entity whose state it mutates: the
 table on a table update or rename, the namespace itself on
@@ -251,8 +287,11 @@ full-mode and pointer-mode write paths rely on the I5 rewrite.
 ### I6. A checkpoint holds exactly the replayed state
 
 Compaction writes a checkpoint of the state a writer replayed from the
-checkpoint and log, so replaying the log and decoding a checkpoint of
-the result must give the same state: every namespace, property and
+checkpoint and log: the log's id, the committed set and its horizon
+exactly, and the state machine's `encodeCheckpoint` of the state, which
+must round-trip (S4). So replaying the log and decoding a checkpoint of
+the result must give the same state. For the catalog: every namespace,
+property and
 table by id, with its metadata location, inline metadata, codec,
 manifest list prefix, manifest pool and snapshot references, and the
 name lookups, id counters and committed-transaction set. An apply step
@@ -321,26 +360,59 @@ the same operations on another copy (Bugs 53, 54, 55).
 
 ### I10. A landed commit is never reported as failed
 
-Iceberg deletes a commit's new files when it fails with
-`CommitFailedException` (a `CleanableFailure`), and a caller may run a
-failed commit again, so a commit that landed must not report failure.
-The commit loop reports a definite failure only before any write, or
-after a read of the catalog without its record. A write whose outcome
-it did not learn -- a lost reply, a failed read-back, a throttled write
-that may have landed -- it settles by reading the catalog for the
-transaction's id; if that read fails, or the loop runs out of attempts
-while such a write may still be in flight, the commit ends in
-`CommitStateUnknownException`. So does a commit whose id the committed
-set's GC horizon has passed, if one of its writes may have landed;
-otherwise it fails, since replay rejects its record from then on (Bug
-64). A retention shorter than a commit takes is legal but lossy: it
-makes this case common, but never incorrect ([GC.md](GC.md)). Work
-after the commit lands does not change its outcome: FileIOCatalog
-deletes the metadata files that dropped out of a table's log through
-`CatalogUtil.deleteFiles`, which logs a failure instead of throwing it
-(Bug 61). `TestCatalogFaultProperties` and `TestMultiWriterProperties`
-check that an operation reported failed any way but unknown did not
-take effect.
+A commit's outcome is one of three, and a caller can rely on each: it
+returned (the intention took effect, once), it was rejected
+(`CommitRejectedException`: it did not and never will), or it is unknown.
+The commit loop rejects a commit only before any write, or after a read
+of the log that shows its record rejected or absent with no write of it
+still able to land. A write whose outcome it did not learn -- a lost
+reply, a failed read-back, a throttled write that may have landed -- it
+settles by reading the log; if that read fails, or the loop runs out of
+attempts while such a write may still be in flight, the commit is
+unknown. So is a commit whose id the committed set's GC horizon has
+passed, if one of its writes may have landed; otherwise it is rejected,
+since replay rejects its record from then on (Bug 64). A retention
+shorter than a commit takes is legal but lossy: it makes this case
+common, but never incorrect ([GC.md](GC.md)). A writer judges its
+record by replay's judgment where it landed before the committed set,
+since another compactor's GC can drop the id of a record that applied;
+and on a log without conditional appends, it counts a throttled send as
+a write that may have landed, never lets a read fall behind the one it
+staged on, and settles a write only on a read whose records include it
+([LOG.md](LOG.md) §"The commit loop").
+
+For the catalog the stakes are files: Iceberg deletes a commit's new
+files when it fails with `CommitFailedException` (a `CleanableFailure`),
+and a caller may run a failed commit again, so a commit that landed must
+not report failure. `CatalogLog` maps a rejection to
+`CommitFailedException` (or the conflict it explains) and an unknown
+outcome to `CommitStateUnknownException`. Work after the commit lands
+does not change its outcome: the catalog deletes the metadata files that
+dropped out of a table's log through `CatalogUtil.deleteFiles`, which
+logs a failure instead of throwing it (Bug 61). `TestCatalogFaultProperties`,
+`TestMultiWriterProperties` and the `CommitProtocol` fuzzer check that an
+operation reported failed any way but unknown did not take effect, and the
+latter two check it again once every delayed write has landed.
+
+### I11. A checkpoint is the replay of the log through its position
+
+Every checkpoint holds exactly what replay of the log through its position
+reaches, whoever wrote it and whatever their clock said. So every
+checkpoint at one position is the same, and readers that start from
+different checkpoints of one log apply the same records and agree. Only a
+GC record moves the committed set's horizon; a checkpoint never filters
+the set by its writer's clock (it did before GC records, which made
+readers of a shared log disagree: `ckclock` in the TLA+ models). A
+compaction on the catalog file writes the checkpoint of the version it
+replaces, then its GC record, then its own record; a compaction on a
+shared log appends its GC record first and checkpoints after it
+([LOG.md](LOG.md) §"Compaction"). `CheckpointRoundTrip` checks every
+replace in the local suites and the fuzzers (its checkpoint equals the
+replay of the version replaced, committed set and horizon included);
+`InMemorySharedLog` refuses a second checkpoint at a position that
+differs from the first; and the `CommitProtocol` and multi-writer
+fuzzers check every stored checkpoint against a replay of the log
+through it.
 
 ## Operation × Operation Conflict Matrix
 
@@ -411,19 +483,20 @@ What the matrix says:
 Writers never allocate entity IDs. A create action carries a negative
 late-bound ID, and replay binds it to a real ID:
 
-- `buildActions()` sorts new namespaces by depth (parents before
-  children) and numbers new namespaces and tables `-1, -2, ...`
+- `CatalogMutation.intention()` sorts new namespaces by depth (parents
+  before children) and numbers new namespaces and tables `-1, -2, ...`
   (separate sequences). Actions later in the same transaction reference
   a new entity by its late-bound ID.
 - Version fields are set to `-1` when the referenced entity was created
   in the same txn.
-- On replay, `Transaction.apply` binds each late-bound ID, at its
+- On replay, `CatalogIntention.apply` binds each late-bound ID, at its
   defining create, to the replaying state's next namespace / table ID
   (`ProtoCodec.IdBinding`), and resolves later references to it. Every
   reader replays the log in the same order, so every reader assigns the
   same IDs.
-- `Transaction.verify` rejects a record that references a late-bound ID
-  before (or without) the create that defines it.
+- `CatalogIntention.verify` rejects a record that references a late-bound
+  ID before (or without) the create that defines it, or whose create
+  names a concrete ID ([SPEC.md](SPEC.md) §"Late-Binding").
 
 Binding at replay is what keeps concurrent creates apart. When writers
 allocated IDs from their own snapshot, two writers that read the same
@@ -433,19 +506,23 @@ first.
 
 ## Compaction Trigger
 
-Compaction happens at write time when the file's observable state
-crosses either threshold:
+Compaction happens at write time when the log's observable state
+crosses either threshold (`CompactionPolicy.limits`):
 
-- `appendCount >= maxAppendCount`, or
-- `current.length + len(txnBytes) > maxAppendSize`.
+- the read the commit staged on holds at least `max.append.count`
+  intention records after its checkpoint (GC records not counted), or
+- the record would take the log past `max.append.size` bytes.
 
 No on-disk hint is needed. Atomic append + atomic CAS at the storage
 layer are sufficient to linearize commits, and either writer in a race
 will independently decide to compact based on the live file's length
-and the append count of the last version it read. After a lost append
-race the loop retries without reading the file again, so its
-`appendCount` is a lower bound; the count limit is soft. Field 2 in
-`Transaction` (formerly a `sealed` bool flag) is reserved.
+and the record count of the last version it read. After a lost append
+race the loop resends without reading the file again, so its count is
+a lower bound; the count limit is soft. Field 2 of `Intention` (formerly
+a `sealed` bool flag) is reserved. On a shared log with checkpoints
+apart, a writer whose commit landed checks the same thresholds against
+the log it landed in, and compacts after the commit
+([LOG.md](LOG.md) §"Compaction").
 
 ## Best Practices
 
@@ -463,9 +540,9 @@ race the loop retries without reading the file again, so its
    `bind(IdBinding)`, defining the late-bound ids it creates and
    resolving the ones it references (808bca7). The default `bind`
    returns the action unchanged: its late-bound ids would reach `apply`
-   unbound, and `Transaction.verify`, which rejects a record whose
+   unbound, and `CatalogIntention.verify`, which rejects a record whose
    reference precedes its create when `bind` throws, would not see
-   them. Add it to `Transaction.selfConsistent` too, so a record that
+   them. Add it to `CatalogIntention.selfConsistent` too, so a record that
    also drops what it references is rejected (Bug 14).
 4. `apply` must bump the version of every entity whose state it mutates,
    including the parent namespace if it changes the namespace's
@@ -575,22 +652,27 @@ classes handle this for you; manual codecs require it as a discipline.
 | `TestInlineDelta` | Inline TM delta encode/decode/apply, `computeDelta`, ML delta types |
 | `TestInlineManifestEndToEnd` | End-to-end commit→reload across BASELINE / TM_ONLY / TM_ML configs; per-`SnapshotProducer` operation coverage; codec-axis subclass parameterized over `gzip` / `structural` |
 | `CatalogTests`, `CatalogTransactionTests` | Abstract suites consumed from `iceberg-core-tests.jar` (commit `35076d6`) and run by the local and cloud subclasses |
-| `TestLocalCatalog`, `TestLocalCatalogTransaction` | Both abstract suites in every `LocalCatalogMode` (append / CAS / compact × pointer / inline TM / inline ML) over `InMemoryAtomicFileIO` |
-| `TestCatalogFaultProperties` | jqwik: several writers run Iceberg operations through FileIOCatalog on faulty storage, in mixed modes; the catalog must match a model after every operation (I3a, I6, I10) |
-| `TestCatalogRaceProperties` | jqwik: a catalog operation raced by others must end as a serial run (I9) |
+| `TestLocalCatalog`, `TestLocalCatalogTransaction` | Both abstract suites in every `LocalCatalogMode`: append / CAS / compact × pointer / inline TM / inline ML over `InMemoryAtomicFileIO`, and the `MEMLOG*` modes on an `InMemorySharedLog` |
+| `TestCatalogFaultProperties` | jqwik: several writers run Iceberg operations through the catalog on faulty storage, in mixed modes, on one object or a shared log; the catalog must match a model after every operation (I3a, I6, I10, I11) |
+| `TestCatalogRaceProperties` | jqwik: a catalog operation raced by others must end as a serial run (I9), on one object or a shared log |
 | `TestInlineDeltaProperties` | jqwik: each commit's delta replays to the committed metadata, and each codec stores every version exactly (I7) |
 | `TestInlineDifferentialProperties` | jqwik: the same schedule on a pointer catalog and an inline one commits alike and reads the same (I8) |
 | `TestCatalogRegressions` | One nested group per catalog bug, with the smallest scenario that reproduces it |
-| `TestCommittedSetGc`, `TestCommittedTransactions` | Committed-set encoding, GC merge and horizon, tri-state lookup ([GC.md](GC.md)) |
+| `TestCommittedSetGc`, `TestCommittedTransactions`, `TestUuidV7` (intentlog-core) | Committed-set encoding, GC merge and horizon, tri-state lookup ([GC.md](GC.md)); UUIDv7 minting |
+| `TestReplay`, `TestLogRuntime` (intentlog-core) | Replay, and the commit loop branch by branch on a scripted log laid out as one object, each test named for the TLA+ action it drives |
+| `TestSharedLogRuntime` (intentlog-memory) | The commit loop on a shared log with checkpoints apart: the append branch, creation, compaction, refresh, and the schedules the shared-log model found (`dup`, `lagread`, `p3`), with copies of records that must never apply again |
+| `TestAtomicFileLog`, `TestAtomicFileLogContract`, `TestInMemorySharedLogContract` | Each provider's layout and signals, and `SharedLogContract` (P1, P3-P5, I11) on each |
+| `TestMemoryCommitProtocol`, `TestAtomicFileCommitProtocol` | jqwik: the testkit's `CommitProtocol` on each provider, over `EntityVersionsMachine`: faults, compactors and GC records inside commits, stale and P3-breaking reads, delayed appends, and copies of any record that ever landed (I2, I10, I11) |
 | `TestIcebergCoreIssues` | Canaries asserting each Iceberg core issue C1-C24 ([ICEBERG_ISSUES.md](ICEBERG_ISSUES.md)) is absent |
-| `CheckpointRoundTrip` | Not a test class: checks a catalog file against `catalog.proto` and its replayed state against a checkpoint of it (I6); the local suites and the fault and multi-writer fuzzers run it on every write, and other suites use it too |
+| `CheckpointRoundTrip` | Not a test class: checks a catalog file against `catalog.proto` and its replayed state against a checkpoint of it (I6), and a compaction's checkpoint against a replay of what it replaced (I11); the local suites and the fault and multi-writer fuzzers run it on every write and every stored checkpoint, and other suites use it too |
 | `TestFormatExplorer` | Codec field-number constants against `catalog.proto` both ways; explorer fixtures current |
-| `spec/` (`TestCodecProperties`, `TestInvariantProperties`, `TestCanonicalStateProperty`, `TestMultiWriterProperties`) | jqwik at the format layer: codec round trip and determinism, well-formedness, builder state through the codec, and a multi-writer fuzzer of the commit protocol |
+| `spec/` (`TestCodecProperties`, `TestInvariantProperties`, `TestCanonicalStateProperty`, `TestMultiWriterProperties`) | jqwik at the format layer: codec round trip and determinism, well-formedness, builder state through the codec, and a multi-writer fuzzer of the commit protocol on one object and on a shared log, with copies of records and late landings |
 | `GCSCatalogTest`, `TestS3Catalog`, `ADLSCatalogTest` | Cloud integration tests, pointer mode; append mode on S3 and ADLS, CAS on GCS (require credentials/emulators) |
 | `*CAS`, `*InlineTM`, `*InlineML` subclasses | Cloud matrix subclasses overriding `maxAppendCount()` / `inlineTM()` / `inlineML()` -- see [COMPAT.md](COMPAT.md) for status |
 
 The end-to-end suite uses an in-memory `MemoryFileIO`, and the local
 suites and fuzzers `InMemoryAtomicFileIO`, which enforces conditional
-CAS and append, so commit→reload cycles run without storage. Cloud tests
+CAS and append, or `InMemorySharedLog`, so commit→reload cycles run
+without storage. Cloud tests
 verify that the actual provider APIs honour `SupportsAtomicOperations`
 semantics.

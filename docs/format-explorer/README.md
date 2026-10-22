@@ -1,13 +1,13 @@
-# ProtoCatalogFormat Explorer
+# Catalog File Explorer
 
-A self-contained HTML page that shows `ProtoCatalogFormat` catalog files byte by byte: the
-header, the checkpoint and each transaction record, in a Wireshark-style three-pane layout (hex,
-decoded tree, field detail). It decodes with the format's schemas of record, intentlog-core's
-`log.proto` for the envelope of the checkpoint and each record, and the catalog module's
-`catalog.proto` for the catalog's messages inside them, which are embedded in the page as one
-schema with a set of scenarios. The scenarios are generated from
-the codecs (`FormatExplorerFixtures`), and `TestFormatExplorer` fails the build when the embedded
-copy is stale, so the page always shows what the implementation writes.
+A self-contained HTML page that shows catalog files (`AtomicFileLog`'s layout,
+[ATOMIC_FILE_LOG.md](../ATOMIC_FILE_LOG.md)) byte by byte: the header, the checkpoint and each
+record, in a Wireshark-style three-pane layout (hex, decoded tree, field detail). It decodes with
+the format's schemas of record, intentlog-core's `log.proto` for the envelope of the checkpoint and
+each record, and the catalog module's `catalog.proto` for the catalog's messages inside them, which
+are embedded in the page as one schema with a set of scenarios. The scenarios are generated from the
+codecs (`FormatExplorerFixtures`), and `TestFormatExplorer` fails the build when the embedded copy
+is stale, so the page always shows what the implementation writes.
 
 ## Open the explorer
 

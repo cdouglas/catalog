@@ -6,7 +6,8 @@ grouped by what they are; within each group, ordering is suggestive, not
 strict.
 
 For invariants that must not regress, see [design.md](design.md). For the
-wire format see [SPEC.md](SPEC.md). Bugs in Apache Iceberg itself are in
+wire format see [SPEC.md](SPEC.md), [ATOMIC_FILE_LOG.md](ATOMIC_FILE_LOG.md)
+and [LOG.md](LOG.md). Bugs in Apache Iceberg itself are in
 [ICEBERG_ISSUES.md](ICEBERG_ISSUES.md). Upstream fixed C1 (1.11.0), and
 the fork's `core-fixes` branch fixes C2-C24, so this project's tests
 work around none of them (the workarounds for C2-C8 were dropped in

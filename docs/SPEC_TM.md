@@ -3,7 +3,7 @@
 This document specifies the inline-table-metadata extension to the catalog
 format: how tables can store their `TableMetadata` directly in
 the catalog instead of in external `metadata.json` files. See
-[SPEC.md](SPEC.md) for the base format and [SPEC_ML.md](SPEC_ML.md) for the
+[SPEC.md](SPEC.md) for the base catalog format and [SPEC_ML.md](SPEC_ML.md) for the
 manifest-list extension that builds on this one.
 
 ## Why
@@ -455,7 +455,7 @@ the TM replacement; pointer mode writes them to Avro files (see
 | `fileio.catalog.inline.max.update.size` | 4,190,208 | Largest inline table update in bytes (a delta, or full metadata with its manifest updates). A larger update writes a metadata file. See "Delivery Modes". |
 
 `fileio.catalog.max.append.count` and `fileio.catalog.max.append.size`
-(see [SPEC.md](SPEC.md)) still apply.
+(see [ATOMIC_FILE_LOG.md](ATOMIC_FILE_LOG.md)) still apply.
 
 ## Commit Protocol
 

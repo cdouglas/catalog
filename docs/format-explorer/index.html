@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>ProtoCatalogFormat Explorer</title>
+  <title>Catalog File Explorer</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     /* ============================================================
@@ -372,11 +372,11 @@
 </head>
 <body>
   <header>
-    <h1>ProtoCatalogFormat Explorer</h1>
+    <h1>Catalog File Explorer</h1>
     <div class="scenario-row">
       <label for="scenario">Scenario:</label>
       <select id="scenario"></select>
-      <label class="file-loader" id="file-loader" title="Load any ProtoCatalogFormat file (drag-and-drop or click)">
+      <label class="file-loader" id="file-loader" title="Load any catalog file (drag-and-drop or click)">
         <input type="file" id="file-input" accept=".cat,.bin,application/octet-stream,*/*">
         <span>📂 Load catalog file…</span>
         <span id="file-loader-name" class="file-loader-name"></span>
@@ -438,7 +438,7 @@
         "fields": [
           {"number": 1, "name": "max_timestamp_ms", "type": "fixed64", "repeated": false, "packed": false, "oneof": null, "comment": "Largest (most recent) timestamp in ms; 0 when the set is empty. Always written."},
           {"number": 2, "name": "packed_entries", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": "Per entry, in descending timestamp order, back-to-back: varint delta_ms  -- gap from previous entry (first delta is 0) 10 bytes         -- 12 bits rand_a + 62 bits rand_b + 6 bits zero pad The number of entries is recovered by walking the buffer."},
-          {"number": 3, "name": "highest_dropped_timestamp_ms", "type": "fixed64", "repeated": false, "packed": false, "oneof": null, "comment": "GC horizon: the largest timestamp_ms of any UUIDv7 that has been dropped from this set by a retention pass. 0 (absent) means no GC has happened yet. Queries for UUIDs whose timestamp_ms \u003c= this value are UNKNOWN — the entry may have been committed and aged out, or it may never have been committed. See docs/SPEC.md \"Committed-set retention (GC)\" and docs/GC.md."}
+          {"number": 3, "name": "highest_dropped_timestamp_ms", "type": "fixed64", "repeated": false, "packed": false, "oneof": null, "comment": "GC horizon: the largest timestamp_ms of any UUIDv7 that has been dropped from this set by a GC record. 0 (absent) means no GC has happened yet. Queries for UUIDs whose timestamp_ms \u003c= this value are UNKNOWN — the entry may have been committed and aged out, or it may never have been committed. See docs/LOG.md \"The committed set and GC\" and docs/GC.md."}
         ]
       },
       "LogRecord": {
@@ -1186,7 +1186,7 @@
       var magicNode = newNode({
         kind: 'magic', label: 'magic', byteStart: 0, byteEnd: 4,
         decodedValue: '"LCAT"',
-        detail: 'ASCII "LCAT" (0x4C 0x43 0x41 0x54). Identifies the file as a ProtoCatalogFormat catalog.',
+        detail: 'ASCII "LCAT" (0x4C 0x43 0x41 0x54). Identifies the object as an AtomicFileLog (a catalog file).',
         children: []
       });
       root.children.push(magicNode);
@@ -2686,7 +2686,7 @@
 
     /**
      * File-loader wiring (Layer 1): a click-to-pick + drag-and-drop input
-     * that swaps in any user-supplied ProtoCatalogFormat byte stream. The
+     * that swaps in any user-supplied catalog file. The
      * proto walk and inline-TM dynamic decode (Layer 2) work on the loaded
      * bytes the same as on a bundled scenario.
      */

@@ -5,6 +5,14 @@ entire catalog state — namespaces, tables, optionally table metadata,
 optionally manifest lists — lives in a single object in cloud storage. No
 separate metastore, no Hive, no Glue, no REST.
 
+The catalog is a state machine replicated through an intention log
+(`intentlog-*`, [docs/LOG.md](docs/LOG.md)): writers append intentions,
+and every reader replays them in order from a checkpoint. The object in
+cloud storage is one provider of that log. The same catalog also runs on
+a shared log whose checkpoints are stored apart from its records, the
+shape of Kafka, a queue with an archiver, or a ledger; an in-memory one
+is implemented and tested, and the others are mapped on paper.
+
 ## Goals
 
 - **One atomic write per commit.** Cloud-storage conditional writes
@@ -57,7 +65,10 @@ iceberg-fileio-catalog/                      the catalog module (Maven), under s
   main/java/.../ProtoCodec.java              wire encoding for catalog
   main/java/.../InlineDeltaCodec.java        wire encoding for TM/ML deltas
   main/proto/catalog.proto                   protobuf schema
-docs/SPEC.md                                 base format spec
+docs/LOG.md                                  the intention log: SPIs, envelope, replay, GC,
+                                             commit loop, compaction, providers
+docs/ATOMIC_FILE_LOG.md                      the catalog file: AtomicFileLog's layout and commits
+docs/SPEC.md                                 the catalog's state machine: checkpoint, actions
 docs/SPEC_TM.md                              inline table metadata
 docs/SPEC_ML.md                              inline manifest lists
 docs/design.md                               invariants, conflict matrix, best practices
@@ -207,6 +218,7 @@ suites skip; see [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
 | `fileio.catalog.committed.retention.ms` | `21600000` (6h) | Minimum age before a committed-txn UUID becomes eligible for GC at compaction. `Long.MAX_VALUE` disables; `0` GCs aggressively (not recommended) |
 | `fileio.catalog.throttle.retry.min-wait-ms` | `200` | First wait before retrying a write that storage throttled; each later wait doubles, up to 5 s |
 
-See [docs/SPEC.md](docs/SPEC.md) for the commit protocol and
-[docs/design.md](docs/design.md) for guidance on choosing append vs CAS
-and which inline mode and codec to enable.
+See [docs/LOG.md](docs/LOG.md) for the commit protocol,
+[docs/ATOMIC_FILE_LOG.md](docs/ATOMIC_FILE_LOG.md) for how the catalog file
+commits, and [docs/design.md](docs/design.md) for guidance on choosing
+append vs CAS and which inline mode and codec to enable.
