@@ -156,7 +156,7 @@ public class TestInlineDelta {
       org.apache.iceberg.catalog.TableIdentifier tbl =
           org.apache.iceberg.catalog.TableIdentifier.of(ns, "tbl");
 
-      ProtoCatalogFile result = TestProtoActions.apply(file, txn);
+      CatalogState result = TestProtoActions.apply(file, txn);
       assertThat(result.isInlineTable(result.tableId(tbl))).isTrue();
       assertThat(result.tableVersion(result.tableId(tbl))).isEqualTo(2);
 
@@ -504,7 +504,7 @@ public class TestInlineDelta {
       // Version 1 doesn't match actual 3
       ProtoCodec.Transaction txn = TestProtoActions.txn(
           ProtoCodec.UpdateTableInlineAction.delta(1, 1, deltaBytes));
-      ProtoCatalogFile result = TestProtoActions.apply(file, txn);
+      CatalogState result = TestProtoActions.apply(file, txn);
       assertThat(result.containsTransaction(txn.id())).isFalse();
     }
   }
@@ -685,7 +685,7 @@ public class TestInlineDelta {
         @Override public String location() { return "test://catalog"; }
         @Override public boolean exists() { return true; }
       };
-      ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(loc);
+      CatalogState.Builder builder = CatalogState.builder(loc);
       builder.addNamespace(0, 0, "", 1);
       builder.addNamespace(1, 0, "db", 1);
       builder.setNextNamespaceId(2);
@@ -730,7 +730,7 @@ public class TestInlineDelta {
         @Override public String location() { return "test://catalog"; }
         @Override public boolean exists() { return true; }
       };
-      ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(loc);
+      CatalogState.Builder builder = CatalogState.builder(loc);
       builder.addNamespace(0, 0, "", 1);
       builder.addNamespace(1, 0, "db", 1);
       builder.setNextNamespaceId(2);
@@ -875,7 +875,7 @@ public class TestInlineDelta {
         @Override public String location() { return "test://catalog"; }
         @Override public boolean exists() { return true; }
       };
-      ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(loc);
+      CatalogState.Builder builder = CatalogState.builder(loc);
       builder.addNamespace(0, 0, "", 1);
       builder.addNamespace(1, 0, "db", 1);
       builder.setNextNamespaceId(2);
@@ -1066,8 +1066,8 @@ public class TestInlineDelta {
 
     /** Replays {@code deltaBytes} on gzip-encoded {@code baseBytes} as the catalog does. */
     private byte[] replay(byte[] baseBytes, byte[] deltaBytes) {
-      ProtoCatalogFile.Builder catalog =
-          ProtoCatalogFile.builder(new org.apache.iceberg.inmemory.InMemoryInputFile(new byte[0]))
+      CatalogState.Builder catalog =
+          CatalogState.builder(new org.apache.iceberg.inmemory.InMemoryInputFile(new byte[0]))
               .addInlineTable(
                   1, 0, "t", 1, baseBytes, InlineMetadataCodecs.TAG_JSON_GZIP, "");
       return InlineDeltaCodec.applyDeltaWithManifests(

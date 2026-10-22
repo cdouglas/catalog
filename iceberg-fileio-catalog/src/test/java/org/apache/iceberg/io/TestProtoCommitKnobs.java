@@ -169,8 +169,8 @@ public class TestProtoCommitKnobs {
   }
 
   /** Performs N createNamespace commits on the given format, returns the final catalog. */
-  private ProtoCatalogFile commitN(ProtoCatalogFormat format, MockIO io, int n) {
-    ProtoCatalogFile current = null;
+  private CatalogState commitN(ProtoCatalogFormat format, MockIO io, int n) {
+    CatalogState current = null;
     for (int i = 0; i < n; i++) {
       InputFile catalogFile = io.trackedInput();
       ProtoCatalogFormat.Mut mut;
@@ -181,7 +181,7 @@ public class TestProtoCommitKnobs {
         mut = (ProtoCatalogFormat.Mut) format.from(current);
       }
       mut.createNamespace(Namespace.of("ns" + i));
-      current = (ProtoCatalogFile) mut.commit(io.fileIO);
+      current = (CatalogState) mut.commit(io.fileIO);
     }
     return current;
   }
@@ -268,7 +268,7 @@ public class TestProtoCommitKnobs {
     ProtoCatalogFormat format = new ProtoCatalogFormat(Integer.MAX_VALUE, Long.MAX_VALUE);
     MockIO io = new MockIO();
 
-    ProtoCatalogFile cat = commitN(format, io, 4);
+    CatalogState cat = commitN(format, io, 4);
     // After 4 commits (1 CAS + 3 appends), log should have 4 records
     assertThat(cat.appendCount()).isEqualTo(4);
   }
@@ -279,7 +279,7 @@ public class TestProtoCommitKnobs {
     MockIO io = new MockIO();
 
     // With limit=3, the 4th commit CASes. After CAS, count=1 (just the new txn).
-    ProtoCatalogFile cat = commitN(format, io, 4);
+    CatalogState cat = commitN(format, io, 4);
     assertThat(cat.appendCount()).isEqualTo(1);
   }
 
@@ -293,8 +293,8 @@ public class TestProtoCommitKnobs {
    *
    * <p>Exercises the full pipeline: the test writer commits → the new
    * checkpoint persists the txn UUID inside the {@code CommittedTransactions}
-   * sub-message → a fresh {@link ProtoCatalogFile} parses that sub-message
-   * lazily and {@link ProtoCatalogFile#containsTransaction} scans the wire
+   * sub-message → a fresh {@link CatalogState} parses that sub-message
+   * lazily and {@link CatalogState#containsTransaction} scans the wire
    * bytes directly without HashSet materialization.
    */
   @Test
@@ -307,24 +307,24 @@ public class TestProtoCommitKnobs {
 
     // Initial commit creates the catalog and adds a namespace. The Transaction
     // mints a v7 UUID inside Mut.commit; we recover it by inspecting the
-    // returned ProtoCatalogFile's committed-set (size == 1 here).
+    // returned CatalogState's committed-set (size == 1 here).
     InputFile catalogFile = io.trackedInput();
     ProtoCatalogFormat.Mut mut = (ProtoCatalogFormat.Mut) format.empty(catalogFile);
     mut.createNamespace(Namespace.of("warehouse"));
-    ProtoCatalogFile afterCommit = (ProtoCatalogFile) mut.commit(io.fileIO);
+    CatalogState afterCommit = (CatalogState) mut.commit(io.fileIO);
 
     assertThat(afterCommit.committedTransactions())
         .as("CAS-mode commit must record exactly the one new txn UUID")
         .hasSize(1);
     UUID txnId = afterCommit.committedTransactions().iterator().next();
     assertThat(UuidV7.isV7(txnId)).isTrue();
-    // Sanity check: the in-memory ProtoCatalogFile post-commit should also
+    // Sanity check: the in-memory CatalogState post-commit should also
     // confirm via the scan-on-bytes path.
     assertThat(afterCommit.containsTransaction(txnId)).isTrue();
 
     // Fresh read: simulate a different writer (or the same writer at a later
     // time) loading the catalog file and querying for the original txn.
-    ProtoCatalogFile fresh = format.read(io.fileIO, io.trackedInput());
+    CatalogState fresh = format.read(io.fileIO, io.trackedInput());
 
     // Confirms the commit landed in the post-CAS checkpoint and is still
     // visible via the lazy scan.
@@ -343,13 +343,13 @@ public class TestProtoCommitKnobs {
     // across compactions.
     ProtoCatalogFormat.Mut mut2 = (ProtoCatalogFormat.Mut) format.from(fresh);
     mut2.createNamespace(Namespace.of("bronze"));
-    ProtoCatalogFile afterSecond = (ProtoCatalogFile) mut2.commit(io.fileIO);
+    CatalogState afterSecond = (CatalogState) mut2.commit(io.fileIO);
 
     ProtoCatalogFormat.Mut mut3 = (ProtoCatalogFormat.Mut) format.from(afterSecond);
     mut3.createNamespace(Namespace.of("silver"));
     mut3.commit(io.fileIO);
 
-    ProtoCatalogFile afterMore = format.read(io.fileIO, io.trackedInput());
+    CatalogState afterMore = format.read(io.fileIO, io.trackedInput());
     assertThat(afterMore.containsTransaction(txnId))
         .as("the original txn must survive subsequent compactions")
         .isTrue();
@@ -409,7 +409,7 @@ public class TestProtoCommitKnobs {
     InputFile catalogFile = io.trackedInput();
     ProtoCatalogFormat.Mut mutA = (ProtoCatalogFormat.Mut) format.empty(catalogFile);
     mutA.createNamespace(Namespace.of("warehouse"));
-    ProtoCatalogFile afterA = (ProtoCatalogFile) mutA.commit(io.fileIO);
+    CatalogState afterA = (CatalogState) mutA.commit(io.fileIO);
     assertThat(afterA.committedTransactions()).hasSize(1);
     UUID txnX = afterA.committedTransactions().iterator().next();
     long txnXTs = UuidV7.timestampMs(txnX);
@@ -424,7 +424,7 @@ public class TestProtoCommitKnobs {
     mutB.commit(io.fileIO);
 
     // Fresh read.
-    ProtoCatalogFile fresh = format.read(io.fileIO, io.trackedInput());
+    CatalogState fresh = format.read(io.fileIO, io.trackedInput());
 
     // Horizon now covers txn_X.
     assertThat(fresh.highestDroppedTimestampMs())
@@ -463,19 +463,19 @@ public class TestProtoCommitKnobs {
     InputFile catalogFile = io.trackedInput();
     ProtoCatalogFormat.Mut mut = (ProtoCatalogFormat.Mut) format.empty(catalogFile);
     mut.createNamespace(Namespace.of("warehouse"));
-    ProtoCatalogFile afterCommit = (ProtoCatalogFile) mut.commit(io.fileIO);
+    CatalogState afterCommit = (CatalogState) mut.commit(io.fileIO);
     UUID txnId = afterCommit.committedTransactions().iterator().next();
 
     // Several more CAS rewrites — none of them GC anything because the
     // watermark = now - 6h is well before the test's start.
     for (int i = 0; i < 3; i++) {
-      ProtoCatalogFile current = format.read(io.fileIO, io.trackedInput());
+      CatalogState current = format.read(io.fileIO, io.trackedInput());
       ProtoCatalogFormat.Mut m = (ProtoCatalogFormat.Mut) format.from(current);
       m.createNamespace(Namespace.of("ns" + i));
       m.commit(io.fileIO);
     }
 
-    ProtoCatalogFile fresh = format.read(io.fileIO, io.trackedInput());
+    CatalogState fresh = format.read(io.fileIO, io.trackedInput());
     assertThat(fresh.containsTransaction(txnId)).isTrue();
     assertThat(fresh.highestDroppedTimestampMs())
         .as("default retention is far enough back that no GC pass should fire on test-time commits")
@@ -507,13 +507,13 @@ public class TestProtoCommitKnobs {
     // then the 4th attempt succeeds.
     io.injectAppendFailures = 3;
 
-    ProtoCatalogFile current = format.read(io.fileIO, io.trackedInput());
+    CatalogState current = format.read(io.fileIO, io.trackedInput());
     int readsAfterLoad = io.readCount;
 
     ProtoCatalogFormat.Mut mut =
         (ProtoCatalogFormat.Mut) format.from(current);
     mut.createNamespace(Namespace.of("test_ns"));
-    ProtoCatalogFile result = (ProtoCatalogFile) mut.commit(io.fileIO);
+    CatalogState result = (CatalogState) mut.commit(io.fileIO);
 
     // The commit should have succeeded
     assertThat(result.containsNamespace(Namespace.of("test_ns"))).isTrue();
@@ -547,11 +547,11 @@ public class TestProtoCommitKnobs {
     // Inject 5 offset conflicts, then succeed
     io.injectAppendFailures = 5;
 
-    ProtoCatalogFile current = format.read(io.fileIO, io.trackedInput());
+    CatalogState current = format.read(io.fileIO, io.trackedInput());
     ProtoCatalogFormat.Mut mut =
         (ProtoCatalogFormat.Mut) format.from(current);
     mut.createNamespace(Namespace.of("new_ns"));
-    ProtoCatalogFile result = (ProtoCatalogFile) mut.commit(io.fileIO);
+    CatalogState result = (CatalogState) mut.commit(io.fileIO);
 
     // Both the original and new namespace should be present
     assertThat(result.containsNamespace(Namespace.of("existing"))).isTrue();
@@ -573,10 +573,10 @@ public class TestProtoCommitKnobs {
 
     // Inject 8 consecutive failures (just under the 10-attempt limit)
     io.injectAppendFailures = 8;
-    ProtoCatalogFile current = format.read(io.fileIO, io.trackedInput());
+    CatalogState current = format.read(io.fileIO, io.trackedInput());
     ProtoCatalogFormat.Mut mut = (ProtoCatalogFormat.Mut) format.from(current);
     mut.createNamespace(Namespace.of("final"));
-    ProtoCatalogFile result = (ProtoCatalogFile) mut.commit(io.fileIO);
+    CatalogState result = (CatalogState) mut.commit(io.fileIO);
 
     assertThat(result.containsNamespace(Namespace.of("final"))).isTrue();
     assertThat(result.containsNamespace(Namespace.of("existing"))).isTrue();
@@ -594,15 +594,15 @@ public class TestProtoCommitKnobs {
     InputFile catalogFile = io.trackedInput();
     ProtoCatalogFormat.Mut mut0 = (ProtoCatalogFormat.Mut) format.empty(catalogFile);
     mut0.createNamespace(Namespace.of("base"));
-    ProtoCatalogFile initial = (ProtoCatalogFile) mut0.commit(io.fileIO);
+    CatalogState initial = (CatalogState) mut0.commit(io.fileIO);
 
     // Commit with 1 retry (inject 1 failure)
     io.injectAppendFailures = 1;
-    ProtoCatalogFile current = format.read(io.fileIO, io.trackedInput());
+    CatalogState current = format.read(io.fileIO, io.trackedInput());
     ProtoCatalogFormat.Mut mut =
         (ProtoCatalogFormat.Mut) format.from(current);
     mut.createNamespace(Namespace.of("new_ns"));
-    ProtoCatalogFile result = (ProtoCatalogFile) mut.commit(io.fileIO);
+    CatalogState result = (CatalogState) mut.commit(io.fileIO);
 
     // The namespace should appear exactly once
     assertThat(result.containsNamespace(Namespace.of("new_ns"))).isTrue();

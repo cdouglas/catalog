@@ -28,7 +28,7 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.io.CatalogFile;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.ProtoCodec;
-import org.apache.iceberg.io.ProtoCatalogFile;
+import org.apache.iceberg.io.CatalogState;
 import org.apache.iceberg.io.SeekableInputStream;
 
 /**
@@ -70,8 +70,8 @@ final class CatalogStateGenerators {
    */
   static Arbitrary<CatalogFile> catalogStates() {
     return Arbitraries.randomValue(rng -> {
-      ProtoCatalogFile.Builder builder =
-          ProtoCatalogFile.builder(STUB_LOCATION).setCatalogUuid(UUID.randomUUID());
+      CatalogState.Builder builder =
+          CatalogState.builder(STUB_LOCATION).setCatalogUuid(UUID.randomUUID());
 
       // Draw 0–3 namespaces using the PRNG jqwik supplies.
       int nsCount = rng.nextInt(4); // 0, 1, 2, or 3
@@ -162,10 +162,10 @@ final class CatalogStateGenerators {
    * set or produces a version mismatch.
    *
    * <p>{@code Action.verify} / {@code Action.apply} take a
-   * {@link ProtoCatalogFile.Builder}; property classes build one from the
+   * {@link CatalogState.Builder}; property classes build one from the
    * snapshot with {@link SpecUtils#stateToBuilder}.
    *
-   * <p>This generator uses only public accessors on {@code ProtoCatalogFile}:
+   * <p>This generator uses only public accessors on {@code CatalogState}:
    * {@code namespaces()}, {@code namespaceId(Namespace)},
    * {@code namespaceVersion(int)}, {@code tables()}, {@code tableId(TableIdentifier)},
    * {@code tableVersion(int)}, {@code tableEntry(int)}, {@code isInlineTable(int)},
@@ -178,10 +178,10 @@ final class CatalogStateGenerators {
   /** An action for {@code state}, drawn with {@code rng}; see {@link #actions}. */
   static ProtoCodec.Action action(CatalogFile state, java.util.Random rng) {
     {
-      if (!(state instanceof ProtoCatalogFile)) {
+      if (!(state instanceof CatalogState)) {
         return freshCreateNamespace(rng, state);
       }
-      ProtoCatalogFile pcf = (ProtoCatalogFile) state;
+      CatalogState pcf = (CatalogState) state;
 
       // Collect ns IDs and versions using public accessors
       List<int[]> nsIdVersions = new ArrayList<>(); // [nsId, nsVersion]
@@ -258,8 +258,8 @@ final class CatalogStateGenerators {
    */
   private static ProtoCodec.CreateNamespaceAction freshCreateNamespace(
       java.util.Random rng, CatalogFile state) {
-    int baseNsId = (state instanceof ProtoCatalogFile)
-        ? ((ProtoCatalogFile) state).nextNamespaceId()
+    int baseNsId = (state instanceof CatalogState)
+        ? ((CatalogState) state).nextNamespaceId()
         : 100;
     int newNsId = baseNsId + rng.nextInt(50);
     // A name no top-level namespace has (see the table names in action).

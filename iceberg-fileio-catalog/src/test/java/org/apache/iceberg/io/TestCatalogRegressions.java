@@ -609,7 +609,7 @@ public class TestCatalogRegressions {
   }
 
   /** Commits {@code namespaces} and returns the snapshot both racing writers start from. */
-  private static ProtoCatalogFile seed(
+  private static CatalogState seed(
       SupportsAtomicOperations io, ProtoCatalogFormat fmt, String... namespaces) {
     ProtoCatalogFormat.Mut mut = (ProtoCatalogFormat.Mut) fmt.empty(io.newInputFile(RACE_LOC));
     for (String ns : namespaces) {
@@ -619,7 +619,7 @@ public class TestCatalogRegressions {
     return reread(io, fmt);
   }
 
-  private static ProtoCatalogFile reread(SupportsAtomicOperations io, ProtoCatalogFormat fmt) {
+  private static CatalogState reread(SupportsAtomicOperations io, ProtoCatalogFormat fmt) {
     return fmt.read(io, io.newInputFile(RACE_LOC));
   }
 
@@ -649,14 +649,14 @@ public class TestCatalogRegressions {
     void appendCreatesInDifferentNamespacesBothSurvive() {
       CasFileIO io = new CasFileIO();
       ProtoCatalogFormat fmt = format(APPEND);
-      ProtoCatalogFile snap = seed(io, fmt, "a", "b");
+      CatalogState snap = seed(io, fmt, "a", "b");
       TableIdentifier t1 = TableIdentifier.of("a", "t1");
       TableIdentifier t2 = TableIdentifier.of("b", "t2");
 
       fmt.from(snap).createTable(t1, "mem:///a/t1/v1.metadata.json").commit(io);
       fmt.from(snap).createTable(t2, "mem:///b/t2/v1.metadata.json").commit(io);
 
-      ProtoCatalogFile result = reread(io, fmt);
+      CatalogState result = reread(io, fmt);
       assertThat(result.tables()).containsExactlyInAnyOrder(t1, t2);
       assertThat(result.location(t1)).isEqualTo("mem:///a/t1/v1.metadata.json");
       assertThat(result.location(t2)).isEqualTo("mem:///b/t2/v1.metadata.json");
@@ -670,7 +670,7 @@ public class TestCatalogRegressions {
       // allocated in the same transaction.
       CasFileIO io = new CasFileIO();
       ProtoCatalogFormat fmt = format(APPEND);
-      ProtoCatalogFile snap = seed(io, fmt, "a", "b");
+      CatalogState snap = seed(io, fmt, "a", "b");
       TableIdentifier at = TableIdentifier.of("a", "p", "c", "t");
       TableIdentifier bt = TableIdentifier.of("b", "q", "c", "t");
 
@@ -685,7 +685,7 @@ public class TestCatalogRegressions {
           .createTable(bt, "mem:///b/q/c/t/v1.metadata.json")
           .commit(io);
 
-      ProtoCatalogFile result = reread(io, fmt);
+      CatalogState result = reread(io, fmt);
       assertThat(result.namespaces())
           .containsExactlyInAnyOrder(
               Namespace.of("a"), Namespace.of("a", "p"), Namespace.of("a", "p", "c"),
@@ -703,7 +703,7 @@ public class TestCatalogRegressions {
       // The CAS path may reject the second writer; it must not drop the first.
       CasFileIO io = new CasFileIO();
       ProtoCatalogFormat fmt = format(maxAppendCount);
-      ProtoCatalogFile snap = seed(io, fmt, "a", "b");
+      CatalogState snap = seed(io, fmt, "a", "b");
       Map<TableIdentifier, String> acknowledged = new HashMap<>();
       Map<TableIdentifier, String> creates =
           Map.of(
@@ -719,7 +719,7 @@ public class TestCatalogRegressions {
         }
       }
 
-      ProtoCatalogFile result = reread(io, fmt);
+      CatalogState result = reread(io, fmt);
       assertThat(acknowledged).isNotEmpty();
       acknowledged.forEach(
           (ident, location) -> assertThat(result.location(ident)).as("%s", ident).isEqualTo(location));
@@ -745,7 +745,7 @@ public class TestCatalogRegressions {
       // under any other parent do.
       CasFileIO io = new CasFileIO();
       ProtoCatalogFormat fmt = format(APPEND);
-      ProtoCatalogFile snap = seed(io, fmt, "seed");
+      CatalogState snap = seed(io, fmt, "seed");
 
       fmt.from(snap).createNamespace(Namespace.of("x")).commit(io);
       assertThatThrownBy(() -> fmt.from(snap).createNamespace(Namespace.of("y")).commit(io))
@@ -759,13 +759,13 @@ public class TestCatalogRegressions {
     void appendCreatesOfSameRootNamespaceConflict() {
       CasFileIO io = new CasFileIO();
       ProtoCatalogFormat fmt = format(APPEND);
-      ProtoCatalogFile snap = seed(io, fmt, "seed");
+      CatalogState snap = seed(io, fmt, "seed");
 
       fmt.from(snap).createNamespace(Namespace.of("x")).commit(io);
       assertThatThrownBy(() -> fmt.from(snap).createNamespace(Namespace.of("x")).commit(io))
           .isInstanceOfAny(AlreadyExistsException.class, CommitFailedException.class);
 
-      ProtoCatalogFile result = reread(io, fmt);
+      CatalogState result = reread(io, fmt);
       assertThat(result.namespaceById().values().stream().filter(e -> e.name.equals("x")))
           .hasSize(1);
     }
@@ -774,7 +774,7 @@ public class TestCatalogRegressions {
     void droppingTopLevelNamespaceConflictsWithTopLevelCreate() {
       CasFileIO io = new CasFileIO();
       ProtoCatalogFormat fmt = format(APPEND);
-      ProtoCatalogFile snap = seed(io, fmt, "a");
+      CatalogState snap = seed(io, fmt, "a");
 
       fmt.from(snap).dropNamespace(Namespace.of("a")).commit(io);
       assertThatThrownBy(() -> fmt.from(snap).createNamespace(Namespace.of("b")).commit(io))
@@ -791,7 +791,7 @@ public class TestCatalogRegressions {
       fmt.from(reread(io, fmt)).createNamespace(Namespace.of("b")).commit(io);
       fmt.from(reread(io, fmt)).createNamespace(Namespace.of("c")).commit(io);
 
-      assertThat(reread(io, fmt).namespaceVersion(ProtoCatalogFile.ROOT_ID)).isEqualTo(3);
+      assertThat(reread(io, fmt).namespaceVersion(CatalogState.ROOT_ID)).isEqualTo(3);
     }
 
     @Test
@@ -800,8 +800,8 @@ public class TestCatalogRegressions {
       FileIOCatalog cat = catalog(io);
       cat.createNamespace(Namespace.of("a"));
 
-      ProtoCatalogFile file = reread(io, format(0));
-      assertThat(file.namespaceEntry(ProtoCatalogFile.ROOT_ID)).isNotNull();
+      CatalogState file = reread(io, format(0));
+      assertThat(file.namespaceEntry(CatalogState.ROOT_ID)).isNotNull();
       assertThat(file.namespaces()).containsExactly(Namespace.of("a"));
       assertThat(cat.namespaceExists(Namespace.empty())).isFalse();
       assertThat(cat.listNamespaces()).containsExactly(Namespace.of("a"));
@@ -809,17 +809,17 @@ public class TestCatalogRegressions {
 
     @Test
     void replayNeverDropsOrReplacesTheRoot() {
-      ProtoCatalogFile.Builder builder =
-          ProtoCatalogFile.builder(new InMemoryInputFile(new byte[0]));
-      int rootVersion = builder.namespaceVersion(ProtoCatalogFile.ROOT_ID);
+      CatalogState.Builder builder =
+          CatalogState.builder(new InMemoryInputFile(new byte[0]));
+      int rootVersion = builder.namespaceVersion(CatalogState.ROOT_ID);
 
-      assertThat(new ProtoCodec.DropNamespaceAction(ProtoCatalogFile.ROOT_ID, rootVersion)
+      assertThat(new ProtoCodec.DropNamespaceAction(CatalogState.ROOT_ID, rootVersion)
               .verify(builder))
           .isFalse();
-      assertThat(new ProtoCodec.CreateNamespaceAction(ProtoCatalogFile.ROOT_ID, 1, 0, -1, "x")
+      assertThat(new ProtoCodec.CreateNamespaceAction(CatalogState.ROOT_ID, 1, 0, -1, "x")
               .verify(builder))
           .isFalse();
-      assertThatThrownBy(() -> builder.removeNamespace(ProtoCatalogFile.ROOT_ID))
+      assertThatThrownBy(() -> builder.removeNamespace(CatalogState.ROOT_ID))
           .isInstanceOf(IllegalArgumentException.class);
     }
 
@@ -827,7 +827,7 @@ public class TestCatalogRegressions {
     void tableInRootIsRejected() {
       CasFileIO io = new CasFileIO();
       ProtoCatalogFormat fmt = format(APPEND);
-      ProtoCatalogFile snap = seed(io, fmt, "a");
+      CatalogState snap = seed(io, fmt, "a");
 
       assertThatThrownBy(
               () -> fmt.from(snap).createTable(TableIdentifier.of("t"), "mem:///t/v1.metadata.json"))
@@ -865,7 +865,7 @@ public class TestCatalogRegressions {
     @Test
     void compactionAfterLostAppendRaceKeepsTheWinner() {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
-      ProtoCatalogFile snap = seed(io, format(APPEND), "a", "b");
+      CatalogState snap = seed(io, format(APPEND), "a", "b");
       // A small transaction fits under the size limit; the winner's large one
       // does not, so the loser's retry sees a file that must be compacted.
       ProtoCatalogFormat fmt =
@@ -895,7 +895,7 @@ public class TestCatalogRegressions {
       fmt.from(reread(io, fmt))
           .createNamespace(Namespace.of("big"), Map.of("k", "x".repeat(4_000)))
           .commit(io);
-      ProtoCatalogFile snap = reread(io, fmt);
+      CatalogState snap = reread(io, fmt);
 
       fmt.from(reread(io, fmt)).dropNamespace(Namespace.of("big")).commit(io);
       for (String ns : new String[] {"y", "z", "v"}) {
@@ -942,10 +942,10 @@ public class TestCatalogRegressions {
     private final TableIdentifier at = TableIdentifier.of("a", "t");
     private final TableIdentifier bt = TableIdentifier.of("b", "t");
 
-    private CatalogFile.Mut<ProtoCatalogFile, ?> txn() {
+    private CatalogFile.Mut<CatalogState, ?> txn() {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       ProtoCatalogFormat fmt = format(APPEND);
-      CatalogFile.Mut<ProtoCatalogFile, ?> seed = fmt.empty(io.newInputFile(RACE_LOC));
+      CatalogFile.Mut<CatalogState, ?> seed = fmt.empty(io.newInputFile(RACE_LOC));
       seed.createNamespace(Namespace.of("a"));
       seed.createNamespace(Namespace.of("b"));
       seed.createTable(at, "mem:///a/t/v1.metadata.json");
@@ -955,14 +955,14 @@ public class TestCatalogRegressions {
 
     @Test
     void renamedTableCannotBeDroppedUnderItsOldName() {
-      CatalogFile.Mut<ProtoCatalogFile, ?> txn = txn();
+      CatalogFile.Mut<CatalogState, ?> txn = txn();
       txn.renameTable(at, bt);
       assertThatThrownBy(() -> txn.dropTable(at)).isInstanceOf(NoSuchTableException.class);
     }
 
     @Test
     void renamedTableCannotBeRenamedAgainUnderItsOldName() {
-      CatalogFile.Mut<ProtoCatalogFile, ?> txn = txn();
+      CatalogFile.Mut<CatalogState, ?> txn = txn();
       txn.renameTable(at, bt);
       assertThatThrownBy(() -> txn.renameTable(at, TableIdentifier.of("b", "u")))
           .isInstanceOf(NoSuchTableException.class);
@@ -970,7 +970,7 @@ public class TestCatalogRegressions {
 
     @Test
     void renamedTableCannotBeUpdatedUnderItsOldName() {
-      CatalogFile.Mut<ProtoCatalogFile, ?> txn = txn();
+      CatalogFile.Mut<CatalogState, ?> txn = txn();
       txn.renameTable(at, bt);
       assertThatThrownBy(() -> txn.updateTable(at, "mem:///a/t/v2.metadata.json"))
           .isInstanceOf(NoSuchTableException.class);
@@ -978,7 +978,7 @@ public class TestCatalogRegressions {
 
     @Test
     void renameDestinationCannotBeCreated() {
-      CatalogFile.Mut<ProtoCatalogFile, ?> txn = txn();
+      CatalogFile.Mut<CatalogState, ?> txn = txn();
       txn.renameTable(at, bt);
       assertThatThrownBy(() -> txn.createTable(bt, "mem:///b/t/v1.metadata.json"))
           .isInstanceOf(AlreadyExistsException.class);
@@ -986,7 +986,7 @@ public class TestCatalogRegressions {
 
     @Test
     void namespaceWithRenamedInTableCannotBeDropped() {
-      CatalogFile.Mut<ProtoCatalogFile, ?> txn = txn();
+      CatalogFile.Mut<CatalogState, ?> txn = txn();
       txn.renameTable(at, bt);
       assertThatThrownBy(() -> txn.dropNamespace(Namespace.of("b")))
           .isInstanceOf(NamespaceNotEmptyException.class);
@@ -994,7 +994,7 @@ public class TestCatalogRegressions {
 
     @Test
     void droppedNamespaceCannotReceiveTables() {
-      CatalogFile.Mut<ProtoCatalogFile, ?> txn = txn();
+      CatalogFile.Mut<CatalogState, ?> txn = txn();
       txn.dropNamespace(Namespace.of("b"));
       assertThatThrownBy(() -> txn.createTable(bt, "mem:///b/t/v1.metadata.json"))
           .isInstanceOf(NoSuchNamespaceException.class);
@@ -1004,7 +1004,7 @@ public class TestCatalogRegressions {
 
     @Test
     void droppedNamespaceCannotTakeProperties() {
-      CatalogFile.Mut<ProtoCatalogFile, ?> txn = txn();
+      CatalogFile.Mut<CatalogState, ?> txn = txn();
       txn.dropNamespace(Namespace.of("b"));
       assertThatThrownBy(() -> txn.updateProperties(Namespace.of("b"), Map.of("k", "v")))
           .isInstanceOf(NoSuchNamespaceException.class);
@@ -1028,7 +1028,7 @@ public class TestCatalogRegressions {
     void droppedNamespaceCannotGainAChild() {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       ProtoCatalogFormat fmt = format(APPEND);
-      CatalogFile.Mut<ProtoCatalogFile, ?> txn = fmt.from(seed(io, fmt, "a", "b"));
+      CatalogFile.Mut<CatalogState, ?> txn = fmt.from(seed(io, fmt, "a", "b"));
       txn.dropNamespace(Namespace.of("b"));
       assertThatThrownBy(() -> txn.createNamespace(Namespace.of("b", "x")))
           .isInstanceOf(IllegalStateException.class)
@@ -1040,7 +1040,7 @@ public class TestCatalogRegressions {
       // Bypass the Mut: append the record it used to write.
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       ProtoCatalogFormat fmt = format(APPEND);
-      ProtoCatalogFile snap = seed(io, fmt, "a", "b");
+      CatalogState snap = seed(io, fmt, "a", "b");
       int b = snap.namespaceId(Namespace.of("b"));
       int version = snap.namespaceVersion(b);
       ProtoCodec.Transaction txn =
@@ -1064,7 +1064,7 @@ public class TestCatalogRegressions {
       file.write(record);
       io.seed(RACE_LOC, file.toByteArray());
 
-      ProtoCatalogFile result = reread(io, fmt);
+      CatalogState result = reread(io, fmt);
       assertThat(result.containsTransaction(txn.id())).isFalse();
       assertThat(result.namespaces()).containsExactlyInAnyOrder(Namespace.of("a"), Namespace.of("b"));
     }
@@ -1090,7 +1090,7 @@ public class TestCatalogRegressions {
       seed(io, fmt, "a", "b");
       fmt.from(reread(io, fmt)).createNamespace(Namespace.of("a", "x")).commit(io);
 
-      CatalogFile.Mut<ProtoCatalogFile, ?> txn = fmt.from(reread(io, fmt));
+      CatalogFile.Mut<CatalogState, ?> txn = fmt.from(reread(io, fmt));
       txn.dropNamespace(Namespace.of("a", "x"));
       txn.dropNamespace(Namespace.of("a"));
       txn.commit(io);
@@ -1101,9 +1101,9 @@ public class TestCatalogRegressions {
     @ParameterizedTest(name = "parentFirst={0}")
     @ValueSource(booleans = {true, false})
     void replayAppliesTheDropsInEitherOrder(boolean parentFirst) {
-      ProtoCatalogFile.Builder builder =
-          ProtoCatalogFile.builder(new InMemoryInputFile(new byte[0]));
-      builder.addNamespace(1, ProtoCatalogFile.ROOT_ID, "a", 1);
+      CatalogState.Builder builder =
+          CatalogState.builder(new InMemoryInputFile(new byte[0]));
+      builder.addNamespace(1, CatalogState.ROOT_ID, "a", 1);
       builder.addNamespace(2, 1, "x", 1);
       builder.addTable(1, 2, "t", 1, "mem:///a/x/t/v1.metadata.json");
       builder.rebuildLookups();
@@ -1117,16 +1117,16 @@ public class TestCatalogRegressions {
         builder.removeNamespace(1);
       }
 
-      ProtoCatalogFile result = builder.build();
+      CatalogState result = builder.build();
       assertThat(result.namespaces()).isEmpty();
       assertThat(result.tables()).isEmpty();
     }
 
     @Test
     void tableRemovedAfterItsNamespace() {
-      ProtoCatalogFile.Builder builder =
-          ProtoCatalogFile.builder(new InMemoryInputFile(new byte[0]));
-      builder.addNamespace(1, ProtoCatalogFile.ROOT_ID, "a", 1);
+      CatalogState.Builder builder =
+          CatalogState.builder(new InMemoryInputFile(new byte[0]));
+      builder.addNamespace(1, CatalogState.ROOT_ID, "a", 1);
       builder.addTable(1, 1, "t", 1, "mem:///a/t/v1.metadata.json");
       builder.rebuildLookups();
 
@@ -1155,7 +1155,7 @@ public class TestCatalogRegressions {
     void namespaceCreatedInTheTransactionCannotBeDropped() {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       ProtoCatalogFormat fmt = format(APPEND);
-      CatalogFile.Mut<ProtoCatalogFile, ?> txn = fmt.from(seed(io, fmt, "a"));
+      CatalogFile.Mut<CatalogState, ?> txn = fmt.from(seed(io, fmt, "a"));
       txn.createNamespace(Namespace.of("a", "x"));
       assertThatThrownBy(() -> txn.dropNamespace(Namespace.of("a", "x")))
           .isInstanceOf(IllegalArgumentException.class)
@@ -1188,7 +1188,7 @@ public class TestCatalogRegressions {
     void casWhoseReplyWasLostIsCommitted() {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       ProtoCatalogFormat fmt = format(0);
-      ProtoCatalogFile snap = seed(io, fmt, "a");
+      CatalogState snap = seed(io, fmt, "a");
       int writes = io.history().size();
 
       failNext(io, Fault.LOST_REPLY);
@@ -1204,7 +1204,7 @@ public class TestCatalogRegressions {
     void appendWhoseReplyWasLostIsCommitted() {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       ProtoCatalogFormat fmt = format(10_000);
-      ProtoCatalogFile snap = seed(io, fmt, "a");
+      CatalogState snap = seed(io, fmt, "a");
       int writes = io.history().size();
 
       failNext(io, Fault.LOST_REPLY_RUNTIME);
@@ -1221,7 +1221,7 @@ public class TestCatalogRegressions {
     void writeThatFailedBeforeLandingIsRetried() {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       ProtoCatalogFormat fmt = format(10_000);
-      ProtoCatalogFile snap = seed(io, fmt, "a");
+      CatalogState snap = seed(io, fmt, "a");
       int writes = io.history().size();
 
       failNext(io, Fault.FAIL_BEFORE, Fault.FAIL_BEFORE);
@@ -1237,7 +1237,7 @@ public class TestCatalogRegressions {
     void outcomeThatNeverResolvesIsCommitStateUnknown() {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       ProtoCatalogFormat fmt = format(0);
-      ProtoCatalogFile snap = seed(io, fmt, "a");
+      CatalogState snap = seed(io, fmt, "a");
       int writes = io.history().size();
 
       io.injectFaults((location, strategy) -> Fault.FAIL_BEFORE);
@@ -1290,7 +1290,7 @@ public class TestCatalogRegressions {
     void writeReportedAsConflictThatLandedIsCommitted(int maxAppendCount) {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       ProtoCatalogFormat fmt = format(maxAppendCount);
-      ProtoCatalogFile snap = seed(io, fmt, "a");
+      CatalogState snap = seed(io, fmt, "a");
 
       landFirstAsConflict(io, false);
       fmt.from(snap).createNamespace(Namespace.of("c")).commit(io);
@@ -1304,7 +1304,7 @@ public class TestCatalogRegressions {
     void unreadableCatalogAfterAConflictThatLandedIsCommitStateUnknown(int maxAppendCount) {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       ProtoCatalogFormat fmt = format(maxAppendCount);
-      ProtoCatalogFile snap = seed(io, fmt, "a");
+      CatalogState snap = seed(io, fmt, "a");
 
       landFirstAsConflict(io, true);
       assertThatThrownBy(() -> fmt.from(snap).createNamespace(Namespace.of("c")).commit(io))
@@ -1661,7 +1661,7 @@ public class TestCatalogRegressions {
     void writeThatLandedBeforeThrottlingRanOutIsCommitted(int maxAppendCount) {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       ProtoCatalogFormat fmt = format(maxAppendCount, 0);
-      ProtoCatalogFile snap = seed(io, fmt, "a");
+      CatalogState snap = seed(io, fmt, "a");
       int writes = io.history().size();
 
       plan(io, throttled(Fault.LANDED_THROTTLED, 8)); // every retry throttled
@@ -1676,7 +1676,7 @@ public class TestCatalogRegressions {
     void writeThrottledUntilTheRetriesRanOutIsRetried(int maxAppendCount) {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       ProtoCatalogFormat fmt = format(maxAppendCount, 0);
-      ProtoCatalogFile snap = seed(io, fmt, "a");
+      CatalogState snap = seed(io, fmt, "a");
       int writes = io.history().size();
 
       plan(io, throttled(Fault.THROTTLED, 8));
@@ -1690,7 +1690,7 @@ public class TestCatalogRegressions {
     void throttlingThatNeverEndsIsCommitStateUnknown() {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       ProtoCatalogFormat fmt = format(0, 0);
-      ProtoCatalogFile snap = seed(io, fmt, "a");
+      CatalogState snap = seed(io, fmt, "a");
       int writes = io.history().size();
 
       io.injectFaults((location, strategy) -> Fault.THROTTLED);
@@ -1706,7 +1706,7 @@ public class TestCatalogRegressions {
     void interruptedBackoffIsCommitStateUnknown() {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       ProtoCatalogFormat fmt = format(0, 1);
-      ProtoCatalogFile snap = seed(io, fmt, "a");
+      CatalogState snap = seed(io, fmt, "a");
 
       plan(io, List.of(Fault.LANDED_THROTTLED));
       Thread.currentThread().interrupt(); // the backoff's sleep throws at once
@@ -1740,7 +1740,7 @@ public class TestCatalogRegressions {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       io.failSupersededReads(true);
       ProtoCatalogFormat appending = format(10_000);
-      ProtoCatalogFile stale = seed(io, appending, "a");
+      CatalogState stale = seed(io, appending, "a");
 
       // Another writer appends a large record.
       ProtoCatalogFormat.Mut big = (ProtoCatalogFormat.Mut) appending.from(stale);
@@ -1748,7 +1748,7 @@ public class TestCatalogRegressions {
         big.createNamespace(Namespace.of(ns));
       }
       big.commit(io);
-      ProtoCatalogFile afterBig = reread(io, appending);
+      CatalogState afterBig = reread(io, appending);
       long length = io.newInputFile(RACE_LOC).getLength();
 
       // The stale writer's small append fits its view but loses the race; at the new length it
@@ -1768,7 +1768,7 @@ public class TestCatalogRegressions {
           .commit(io);
       io.injectReadFaults(location -> ReadFault.NONE);
 
-      ProtoCatalogFile result = reread(io, appending);
+      CatalogState result = reread(io, appending);
       assertThat(result.namespaces()).contains(Namespace.of("x1"), Namespace.of("z"));
       assertThat(result.namespaceProperties(Namespace.of("a"))).containsEntry("k", "v");
     }
@@ -1788,7 +1788,7 @@ public class TestCatalogRegressions {
     void casConflictRebasesWhenTheTransactionStillHolds() {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       ProtoCatalogFormat fmt = format(0);
-      ProtoCatalogFile snap = seed(io, fmt, "a", "b");
+      CatalogState snap = seed(io, fmt, "a", "b");
       TableIdentifier t1 = TableIdentifier.of("a", "t1");
       TableIdentifier t2 = TableIdentifier.of("b", "t2");
 
@@ -1796,7 +1796,7 @@ public class TestCatalogRegressions {
       fmt.from(snap).createTable(t2, "mem:///b/t2/v1.metadata.json").commit(io);
 
       assertThat(io.rejected(AtomicOutputFile.Strategy.CAS)).isEqualTo(1);
-      ProtoCatalogFile result = reread(io, fmt);
+      CatalogState result = reread(io, fmt);
       assertThat(result.location(t1)).isEqualTo("mem:///a/t1/v1.metadata.json");
       assertThat(result.location(t2)).isEqualTo("mem:///b/t2/v1.metadata.json");
     }
@@ -1805,7 +1805,7 @@ public class TestCatalogRegressions {
     void casConflictThatNoLongerHoldsFailsWithoutWriting() {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       ProtoCatalogFormat fmt = format(0);
-      ProtoCatalogFile snap = seed(io, fmt, "a", "b");
+      CatalogState snap = seed(io, fmt, "a", "b");
 
       fmt.from(snap).updateProperties(Namespace.of("a"), new HashMap<>(Map.of("k", "1"))).commit(io);
       int writes = io.history().size();
@@ -1824,7 +1824,7 @@ public class TestCatalogRegressions {
     void casCreateRaceIsAlreadyExists() {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       ProtoCatalogFormat fmt = format(0);
-      ProtoCatalogFile snap = seed(io, fmt, "a");
+      CatalogState snap = seed(io, fmt, "a");
       TableIdentifier t = TableIdentifier.of("a", "t");
 
       fmt.from(snap).createTable(t, "mem:///a/t/v1.metadata.json").commit(io);
@@ -1905,7 +1905,7 @@ public class TestCatalogRegressions {
     return lists;
   }
 
-  private static ProtoCatalogFile catalogFile(InMemoryAtomicFileIO io) {
+  private static CatalogState catalogFile(InMemoryAtomicFileIO io) {
     return new ProtoCatalogFormat().read(io, io.newInputFile(CATALOG));
   }
 
@@ -2281,7 +2281,7 @@ public class TestCatalogRegressions {
 
       ml.dropTable(mixed, false);
 
-      ProtoCatalogFile file = catalogFile(io);
+      CatalogState file = catalogFile(io);
       assertThat(file.isInlineTable(id)).isFalse();
       assertThat(file.snapshotManifests(id)).isEmpty();
       assertThat(CheckpointRoundTrip.difference(file)).isNull();
@@ -2298,7 +2298,7 @@ public class TestCatalogRegressions {
 
       inline.loadTable(mixed).updateProperties().remove("big").commit();
 
-      ProtoCatalogFile file = catalogFile(io);
+      CatalogState file = catalogFile(io);
       assertThat(file.isInlineTable(mixed)).as("returned").isTrue();
       assertThat(file.manifestListPrefix(file.tableId(mixed))).isEmpty();
       assertThat(CheckpointRoundTrip.difference(file)).isNull();
@@ -2936,8 +2936,8 @@ public class TestCatalogRegressions {
       List<InlineDeltaCodec.DeltaUpdate> delta = InlineDeltaCodec.computeDelta(base, next, "");
 
       if (delta != null) {
-        ProtoCatalogFile.Builder builder =
-            ProtoCatalogFile.builder(new InMemoryInputFile("mem:///stub", new byte[0]))
+        CatalogState.Builder builder =
+            CatalogState.builder(new InMemoryInputFile("mem:///stub", new byte[0]))
                 .addInlineTable(1, 0, "t", 1, codec.encode(base), codec.tag(), "");
         ProtoCodec.UpdateTableInlineAction.delta(
                 1, 1, InlineDeltaCodec.encodeDelta(delta, next.lastUpdatedMillis()))
@@ -3769,8 +3769,8 @@ public class TestCatalogRegressions {
       List<InlineDeltaCodec.DeltaUpdate> delta = InlineDeltaCodec.computeDelta(base, next, "");
       assertThat(delta).as("the append's delta").isNotNull();
 
-      ProtoCatalogFile.Builder builder =
-          ProtoCatalogFile.builder(new InMemoryInputFile("mem:///stub", new byte[0]))
+      CatalogState.Builder builder =
+          CatalogState.builder(new InMemoryInputFile("mem:///stub", new byte[0]))
               .addInlineTable(1, 0, "t", 1, codec.encode(base), codec.tag(), "");
       ProtoCodec.UpdateTableInlineAction.delta(
               1, 1, InlineDeltaCodec.encodeDelta(delta, next.lastUpdatedMillis()))
@@ -4101,17 +4101,17 @@ public class TestCatalogRegressions {
     /** CAS only, and every CAS drops every id older than now. */
     private final ProtoCatalogFormat format = new ProtoCatalogFormat(0, Long.MAX_VALUE, 0L);
 
-    private ProtoCatalogFile read() {
+    private CatalogState read() {
       return format.read(io, io.newInputFile(location));
     }
 
-    private ProtoCatalogFile commit(ProtoCatalogFile base, java.util.function.Consumer<ProtoCatalogFormat.Mut> change) {
+    private CatalogState commit(CatalogState base, java.util.function.Consumer<ProtoCatalogFormat.Mut> change) {
       ProtoCatalogFormat.Mut mut = (ProtoCatalogFormat.Mut) format.from(base);
       change.accept(mut);
-      return (ProtoCatalogFile) mut.commit(io);
+      return (CatalogState) mut.commit(io);
     }
 
-    private ProtoCatalogFile catalogWithTwoNamespaces() throws InterruptedException {
+    private CatalogState catalogWithTwoNamespaces() throws InterruptedException {
       format.empty(io.newInputFile(location)).commit(io);
       commit(read(), mut -> mut.createNamespace(Namespace.of("x")).createNamespace(Namespace.of("y")));
       Thread.sleep(2);
@@ -4120,7 +4120,7 @@ public class TestCatalogRegressions {
 
     @Test
     void aCasAfterAConflictKeepsItsOwnRecord() throws InterruptedException {
-      ProtoCatalogFile base = catalogWithTwoNamespaces();
+      CatalogState base = catalogWithTwoNamespaces();
       boolean[] raced = {false};
       io.injectFaults((loc, strategy) -> {
         if (!raced[0]) {
@@ -4139,16 +4139,16 @@ public class TestCatalogRegressions {
       // Its CAS conflicts, rebases, and drops the second writer's newer id.
       commit(base, mut -> mut.updateProperties(Namespace.of("x"), Map.of("k", "first")));
 
-      ProtoCatalogFile after = read();
+      CatalogState after = read();
       assertThat(after.namespaceProperties(Namespace.of("x"))).containsEntry("k", "first");
       assertThat(after.namespaceProperties(Namespace.of("y"))).containsEntry("k", "second");
     }
 
     @Test
     void aRecordBelowTheHorizonIsRejectedNotUnreadable() throws Exception {
-      ProtoCatalogFile base = catalogWithTwoNamespaces();
+      CatalogState base = catalogWithTwoNamespaces();
       commit(base, mut -> mut.updateProperties(Namespace.of("x"), Map.of("k", "v")));
-      ProtoCatalogFile compacted = read();
+      CatalogState compacted = read();
       long horizon = compacted.highestDroppedTimestampMs();
       assertThat(horizon).isPositive();
 
@@ -4175,7 +4175,7 @@ public class TestCatalogRegressions {
       file.write(record);
       io.seed(location, file.toByteArray());
 
-      ProtoCatalogFile after = read();
+      CatalogState after = read();
       assertThat(after.namespaceProperties(Namespace.of("y"))).doesNotContainKey("late");
       // ...and the catalog still takes commits.
       commit(after, mut -> mut.updateProperties(Namespace.of("y"), Map.of("next", "v")));
@@ -4184,16 +4184,16 @@ public class TestCatalogRegressions {
 
     @Test
     void aWriterBehindTheHorizonMintsAboveIt() throws Exception {
-      ProtoCatalogFile base = catalogWithTwoNamespaces();
+      CatalogState base = catalogWithTwoNamespaces();
       // A checkpoint whose horizon is an hour ahead of this writer's clock, as a compaction by a
       // writer whose clock is ahead would leave.
       long ahead = System.currentTimeMillis() + 3_600_000L;
-      ProtoCatalogFile.Builder builder = ProtoCatalogFormat.replay(
+      CatalogState.Builder builder = ProtoCatalogFormat.replay(
           io.newInputFile(location), io.newInputFile(location).newStream(),
           (int) io.newInputFile(location).getLength());
       builder.addCommittedTransaction(UuidV7.newUuidV7(ahead, new java.util.Random(1)));
       builder.advanceHorizon(ahead); // a GC record of that writer, replayed into the checkpoint
-      ProtoCatalogFile withFuture = builder.build();
+      CatalogState withFuture = builder.build();
       ProtoCatalogFormat.ProtoIdManager ids = new ProtoCatalogFormat.ProtoIdManager();
       ids.setGlobals(withFuture.nextNamespaceId(), withFuture.nextTableId());
       byte[] checkpoint = ProtoCodec.encodeCheckpoint(
@@ -4236,8 +4236,8 @@ public class TestCatalogRegressions {
     private final ProtoCatalogFormat fmt = format(APPEND);
     private final TableIdentifier table = TableIdentifier.of("a", "t");
 
-    private ProtoCatalogFile seeded() {
-      CatalogFile.Mut<ProtoCatalogFile, ?> create = fmt.from(seed(io, fmt, "a"));
+    private CatalogState seeded() {
+      CatalogFile.Mut<CatalogState, ?> create = fmt.from(seed(io, fmt, "a"));
       create.createTable(table, "mem:///a/t/v0");
       create.commit(io);
       return reread(io, fmt);
@@ -4245,7 +4245,7 @@ public class TestCatalogRegressions {
 
     @Test
     void aTableUpdatedThenDroppedInOneTransactionIsDropped() {
-      CatalogFile.Mut<ProtoCatalogFile, ?> txn = fmt.from(seeded());
+      CatalogFile.Mut<CatalogState, ?> txn = fmt.from(seeded());
       txn.updateTable(table, "mem:///a/t/v1");
       txn.dropTable(table);
       txn.commit(io);
@@ -4254,7 +4254,7 @@ public class TestCatalogRegressions {
 
     @Test
     void aTableReadThenDroppedInOneTransactionIsDropped() {
-      CatalogFile.Mut<ProtoCatalogFile, ?> txn = fmt.from(seeded());
+      CatalogFile.Mut<CatalogState, ?> txn = fmt.from(seeded());
       txn.readTable(table);
       txn.dropTable(table);
       txn.commit(io);
@@ -4263,8 +4263,8 @@ public class TestCatalogRegressions {
 
     @Test
     void theDropStillConflictsWithAConcurrentUpdate() {
-      CatalogFile.Mut<ProtoCatalogFile, ?> txn = fmt.from(seeded());
-      CatalogFile.Mut<ProtoCatalogFile, ?> other = fmt.from(reread(io, fmt));
+      CatalogFile.Mut<CatalogState, ?> txn = fmt.from(seeded());
+      CatalogFile.Mut<CatalogState, ?> other = fmt.from(reread(io, fmt));
       other.updateTable(table, "mem:///a/t/other");
       other.commit(io);
       txn.updateTable(table, "mem:///a/t/v1");

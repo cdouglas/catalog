@@ -523,7 +523,7 @@ public class TestInlineManifestEndToEnd {
       pointerCat.buildTable(TBL, TEST_SCHEMA).create();
 
       ProtoCatalogFormat fmt = new ProtoCatalogFormat();
-      ProtoCatalogFile beforeUpdate = (ProtoCatalogFile) fmt.read(
+      CatalogState beforeUpdate = (CatalogState) fmt.read(
           io, io.newInputFile("mem:///warehouse/catalog"));
       Integer tblId = beforeUpdate.tableId(TBL);
       assertThat(beforeUpdate.isInlineTable(tblId))
@@ -545,7 +545,7 @@ public class TestInlineManifestEndToEnd {
       assertThat(action.metadataLocation).isNull();
 
       // Catalog state: table is now inline.
-      ProtoCatalogFile afterUpdate = (ProtoCatalogFile) fmt.read(
+      CatalogState afterUpdate = (CatalogState) fmt.read(
           io, io.newInputFile("mem:///warehouse/catalog"));
       assertThat(afterUpdate.isInlineTable(tblId))
           .as("table must be inline after the update")
@@ -710,7 +710,7 @@ public class TestInlineManifestEndToEnd {
       // Surgically clobber the manifest pool: reconstruct the catalog file
       // with inline metadata intact but empty pool/snapshotRefs
       ProtoCatalogFormat fmt = new ProtoCatalogFormat();
-      ProtoCatalogFile original = (ProtoCatalogFile) fmt.read(
+      CatalogState original = (CatalogState) fmt.read(
           io, io.newInputFile("mem:///warehouse/catalog"));
       Integer tblId = original.tableId(TBL);
       byte[] inlineMeta = original.inlineMetadata(tblId);
@@ -718,7 +718,7 @@ public class TestInlineManifestEndToEnd {
       var tblEntry = original.tableById().get(tblId);
 
       // Build a catalog file with ALL original state except the pool
-      ProtoCatalogFile.Builder b = ProtoCatalogFile.builder(
+      CatalogState.Builder b = CatalogState.builder(
           io.newInputFile("mem:///warehouse/catalog"));
       b.setCatalogUuid(original.uuid());
       for (var e : original.namespaceById().entrySet()) {
@@ -731,7 +731,7 @@ public class TestInlineManifestEndToEnd {
           tblEntry.version, inlineMeta, original.inlineMetadataCodec(tblId), prefix);
       b.setNextNamespaceId(original.nextNamespaceId());
       b.setNextTableId(original.nextTableId());
-      ProtoCatalogFile poisoned = b.build();
+      CatalogState poisoned = b.build();
 
       // Serialize the poisoned file back to io, overwriting the catalog
       ProtoCatalogFormat.Mut mut = new ProtoCatalogFormat.Mut(poisoned);
@@ -785,7 +785,7 @@ public class TestInlineManifestEndToEnd {
       // Read the inline TableMetadata that the catalog wrote for S1, using
       // the codec recorded on the proto record to decode the bytes.
       ProtoCatalogFormat fmt = new ProtoCatalogFormat();
-      ProtoCatalogFile original = (ProtoCatalogFile) fmt.read(
+      CatalogState original = (CatalogState) fmt.read(
           io, io.newInputFile("mem:///warehouse/catalog"));
       Integer tblIdNum = original.tableId(TBL);
       byte[] inlineMeta = original.inlineMetadata(tblIdNum);
@@ -868,7 +868,7 @@ public class TestInlineManifestEndToEnd {
 
       // Inspect pool directly: should not have entries for the expired snapshot
       ProtoCatalogFormat fmt = new ProtoCatalogFormat();
-      ProtoCatalogFile proto = (ProtoCatalogFile) fmt.read(
+      CatalogState proto = (CatalogState) fmt.read(
           io, io.newInputFile("mem:///warehouse/catalog"));
       Integer tblId = proto.tableId(TBL);
       // The expired snapshot's ref list must be gone
@@ -1381,7 +1381,7 @@ public class TestInlineManifestEndToEnd {
       assertThat(reloaded.snapshots()).hasSize(1);
 
       // Verify the inlined record on disk records the codec we asked for.
-      ProtoCatalogFile decoded = (ProtoCatalogFile) new ProtoCatalogFormat()
+      CatalogState decoded = (CatalogState) new ProtoCatalogFormat()
           .read(io, io.newInputFile(wh + "/catalog"));
       Integer tblId = decoded.tableId(TBL);
       byte expectedTag = InlineMetadataCodecs.byShortName(codecName).tag();
@@ -1569,7 +1569,7 @@ public class TestInlineManifestEndToEnd {
       // wrapInlineManifests rescue reconstructs GenericManifestFile(specId=0).
       // Structural codec already writes the sentinel via planPaths.
       if ("gzip".equals(codecName)) {
-        ProtoCatalogFile decoded = (ProtoCatalogFile) new ProtoCatalogFormat()
+        CatalogState decoded = (CatalogState) new ProtoCatalogFormat()
             .read(io, io.newInputFile(wh + "/catalog"));
         Integer probeTblId = decoded.tableId(TBL);
         byte[] storedInline = decoded.inlineMetadata(probeTblId);
@@ -1676,7 +1676,7 @@ public class TestInlineManifestEndToEnd {
       // On-disk assertion: full-mode encode in commitTransaction must also
       // rewrite InlineSnapshots to inline:// sentinels (see companion test).
       if ("gzip".equals(codecName)) {
-        ProtoCatalogFile probeCatalog = (ProtoCatalogFile) new ProtoCatalogFormat()
+        CatalogState probeCatalog = (CatalogState) new ProtoCatalogFormat()
             .read(io, io.newInputFile(wh + "/catalog"));
         Integer probeTblId = probeCatalog.tableId(TBL);
         byte[] storedInline = probeCatalog.inlineMetadata(probeTblId);
@@ -1805,7 +1805,7 @@ public class TestInlineManifestEndToEnd {
       long secondSnap = tbl.currentSnapshot().snapshotId();
 
       // Sanity: pool has refs for both snapshots before the full-mode commit.
-      ProtoCatalogFile before = (ProtoCatalogFile) new ProtoCatalogFormat()
+      CatalogState before = (CatalogState) new ProtoCatalogFormat()
           .read(io, io.newInputFile(wh + "/catalog"));
       Integer tblId = before.tableId(TBL);
       assertThat(before.snapshotManifests(tblId).keySet())
@@ -1825,7 +1825,7 @@ public class TestInlineManifestEndToEnd {
       // per-snapshot ref list AND from the shared pool. Today the
       // full-mode apply path preserves the pool wholesale, so this test
       // fails — exposing the orphan-leak invariant gap.
-      ProtoCatalogFile after = (ProtoCatalogFile) new ProtoCatalogFormat()
+      CatalogState after = (CatalogState) new ProtoCatalogFormat()
           .read(io, io.newInputFile(wh + "/catalog"));
       Integer tblIdAfter = after.tableId(TBL);
       assertThat(after.snapshotManifests(tblIdAfter).keySet())
@@ -1868,7 +1868,7 @@ public class TestInlineManifestEndToEnd {
       // Expire the first snapshot via a normal expire (delta-path).
       tbl.expireSnapshots().expireSnapshotId(firstSnap).commit();
 
-      ProtoCatalogFile cat = (ProtoCatalogFile) new ProtoCatalogFormat()
+      CatalogState cat = (CatalogState) new ProtoCatalogFormat()
           .read(io, io.newInputFile(wh + "/catalog"));
       Integer tblId = cat.tableId(TBL);
 
@@ -1913,7 +1913,7 @@ public class TestInlineManifestEndToEnd {
       assertThat(reloaded.currentSnapshot().allManifests(io)).isNotEmpty();
 
       // Verify the on-wire codec discriminator matches what we configured.
-      ProtoCatalogFile decoded = (ProtoCatalogFile) new ProtoCatalogFormat()
+      CatalogState decoded = (CatalogState) new ProtoCatalogFormat()
           .read(io, io.newInputFile(wh + "/catalog"));
       Integer tblId = decoded.tableId(TBL);
       byte expectedTag = InlineMetadataCodecs.byShortName(codecName).tag();

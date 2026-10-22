@@ -21,7 +21,7 @@ package org.apache.iceberg.io.spec;
 import java.util.Map;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
-import org.apache.iceberg.io.ProtoCatalogFile;
+import org.apache.iceberg.io.CatalogState;
 
 /**
  * Shared test utilities for the {@code org.apache.iceberg.io.spec} property tests.
@@ -34,12 +34,12 @@ final class SpecUtils {
   private SpecUtils() {}
 
   /**
-   * Reconstructs a {@link ProtoCatalogFile.Builder} from an immutable
-   * {@link ProtoCatalogFile} snapshot using only public accessors.
+   * Reconstructs a {@link CatalogState.Builder} from an immutable
+   * {@link CatalogState} snapshot using only public accessors.
    *
    * <p>This is the canonical bridge between the immutable snapshot world
    * ({@code CatalogFile}) and the mutable builder world
-   * ({@code ProtoCatalogFile.Builder}) that {@code Action.verify} /
+   * ({@code CatalogState.Builder}) that {@code Action.verify} /
    * {@code Action.apply} operate on.  It mirrors what the production decoder
    * does after loading a checkpoint and replaying the transaction log, just
    * without the I/O layer.
@@ -50,9 +50,9 @@ final class SpecUtils {
    * {@code namespaces()} / {@code tables()} sets and resolve IDs, entries, and
    * properties through public accessors.
    */
-  static ProtoCatalogFile.Builder stateToBuilder(ProtoCatalogFile pcf) {
-    ProtoCatalogFile.Builder builder =
-        ProtoCatalogFile.builder(CatalogStateGenerators.STUB_LOCATION)
+  static CatalogState.Builder stateToBuilder(CatalogState pcf) {
+    CatalogState.Builder builder =
+        CatalogState.builder(CatalogStateGenerators.STUB_LOCATION)
             .setCatalogUuid(pcf.uuid())
             .setNextNamespaceId(pcf.nextNamespaceId())
             .setNextTableId(pcf.nextTableId());
@@ -65,7 +65,7 @@ final class SpecUtils {
     for (Namespace ns : pcf.namespaces()) {
       Integer nsId = pcf.namespaceId(ns);
       if (nsId == null) continue;
-      ProtoCatalogFile.NsEntry entry = pcf.namespaceEntry(nsId);
+      CatalogState.NsEntry entry = pcf.namespaceEntry(nsId);
       if (entry == null) continue;
       builder.addNamespace(nsId, entry.parentId, entry.name, entry.version);
 
@@ -81,7 +81,7 @@ final class SpecUtils {
     for (TableIdentifier tbl : pcf.tables()) {
       Integer tblId = pcf.tableId(tbl);
       if (tblId == null) continue;
-      ProtoCatalogFile.TblEntry entry = pcf.tableEntry(tblId);
+      CatalogState.TblEntry entry = pcf.tableEntry(tblId);
       if (entry == null) continue;
       if (pcf.isInlineTable(tblId)) {
         byte[] meta = pcf.inlineMetadata(tblId);

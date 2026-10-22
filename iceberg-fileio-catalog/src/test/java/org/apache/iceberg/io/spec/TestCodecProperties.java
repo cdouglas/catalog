@@ -28,8 +28,8 @@ import net.jqwik.api.Provide;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.io.CatalogFile;
-import org.apache.iceberg.io.ProtoCatalogFile;
-import org.apache.iceberg.io.ProtoCatalogFormatTestSupport;
+import org.apache.iceberg.io.CatalogState;
+import org.apache.iceberg.io.CatalogTestSupport;
 
 /**
  * Codec-level properties of the checkpoint encoding.
@@ -55,15 +55,15 @@ class TestCodecProperties {
    */
   @Property
   void p1_codecRoundtrip(@ForAll @From("catalogStates") CatalogFile cat) {
-    byte[] bytes = ProtoCatalogFormatTestSupport.encodeFullFile((ProtoCatalogFile) cat);
-    CatalogFile decoded = ProtoCatalogFormatTestSupport.decodeFullFile(bytes);
+    byte[] bytes = CatalogTestSupport.encodeFullFile((CatalogState) cat);
+    CatalogFile decoded = CatalogTestSupport.decodeFullFile(bytes);
     assertCatalogEquals(cat, decoded);
   }
 
   /**
    * P2 — Encode determinism.
    *
-   * <p>Calls {@code encodeFullFile} twice on the same {@link ProtoCatalogFile}
+   * <p>Calls {@code encodeFullFile} twice on the same {@link CatalogState}
    * instance and asserts that the produced wire bytes are bit-for-bit identical.
    * This would fail if the encoder iterated over a collection whose traversal
    * order can differ across calls. It does not check determinism across JVMs or
@@ -71,8 +71,8 @@ class TestCodecProperties {
    */
   @Property
   void p2_encodeIsDeterministic(@ForAll @From("catalogStates") CatalogFile cat) {
-    byte[] a = ProtoCatalogFormatTestSupport.encodeFullFile((ProtoCatalogFile) cat);
-    byte[] b = ProtoCatalogFormatTestSupport.encodeFullFile((ProtoCatalogFile) cat);
+    byte[] a = CatalogTestSupport.encodeFullFile((CatalogState) cat);
+    byte[] b = CatalogTestSupport.encodeFullFile((CatalogState) cat);
     assertThat(a).isEqualTo(b);
   }
 

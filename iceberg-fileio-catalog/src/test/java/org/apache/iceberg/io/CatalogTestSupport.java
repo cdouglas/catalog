@@ -35,18 +35,18 @@ import org.intentlog.wire.LogEnvelope;
  * package-private {@link ProtoCatalogFormat#readInternal} and the
  * package-private {@link ProtoCatalogFormat.Mut} constructor.
  */
-public final class ProtoCatalogFormatTestSupport {
+public final class CatalogTestSupport {
 
-  private ProtoCatalogFormatTestSupport() {}
+  private CatalogTestSupport() {}
 
   /**
-   * Encodes a {@link ProtoCatalogFile} to full LCAT wire bytes:
+   * Encodes a {@link CatalogState} to full LCAT wire bytes:
    * {@code [MAGIC][version][varint-len][checkpoint-bytes]}.
    *
    * <p>No appended transaction records are included; the checkpoint already
    * contains the complete catalog state.
    */
-  public static byte[] encodeFullFile(ProtoCatalogFile catalog) {
+  public static byte[] encodeFullFile(CatalogState catalog) {
     try {
       ByteArrayOutputStream out = new ByteArrayOutputStream();
 
@@ -72,14 +72,14 @@ public final class ProtoCatalogFormatTestSupport {
 
   /**
    * Decodes a full LCAT file (as produced by {@link #encodeFullFile}) back to a
-   * {@link ProtoCatalogFile}, replaying any appended transaction records.
+   * {@link CatalogState}, replaying any appended transaction records.
    *
    * <p>The returned file is bound to a stub {@link InputFile} at location
    * {@code "test://decoded"}.
    */
-  public static ProtoCatalogFile decodeFullFile(byte[] bytes) {
+  public static CatalogState decodeFullFile(byte[] bytes) {
     // Stub InputFile: readInternal stores it as the location reference on the
-    // resulting ProtoCatalogFile. The location string is not used during decode.
+    // resulting CatalogState. The location string is not used during decode.
     InputFile location = new StubInputFile("test://decoded");
     try {
       return ProtoCatalogFormat.readInternal(location, new ByteArrayInputStream(bytes), bytes.length);
@@ -92,10 +92,10 @@ public final class ProtoCatalogFormatTestSupport {
    * The state the checkpoint of a full LCAT file holds: what replay starts from, before it applies
    * any record.
    */
-  public static ProtoCatalogFile.Builder decodeCheckpoint(byte[] bytes) {
+  public static CatalogState.Builder decodeCheckpoint(byte[] bytes) {
     int[] at = {ProtoCatalogFormat.HEADER_SIZE};
     int length = readVarint(bytes, at);
-    ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(new StubInputFile("test://decoded"));
+    CatalogState.Builder builder = CatalogState.builder(new StubInputFile("test://decoded"));
     ProtoCodec.decodeCheckpoint(Arrays.copyOfRange(bytes, at[0], at[0] + length), builder);
     return builder;
   }

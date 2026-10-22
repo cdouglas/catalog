@@ -68,7 +68,7 @@ public class TestProtoCatalogFormat {
   public void testProtoCodecRoundtrip() throws IOException {
     // Create a catalog file with some state
     InputFile location = new TestInputFile("test://catalog");
-    ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(location);
+    CatalogState.Builder builder = CatalogState.builder(location);
 
     builder.setNextNamespaceId(3);
     builder.setNextTableId(2);
@@ -78,7 +78,7 @@ public class TestProtoCatalogFormat {
     builder.setNamespaceProperty(1, "owner", "alice");
     builder.addCommittedTransaction(UuidV7.newUuidV7());
 
-    ProtoCatalogFile original = builder.build();
+    CatalogState original = builder.build();
 
     // Encode checkpoint
     ProtoCatalogFormat.ProtoIdManager idManager = new ProtoCatalogFormat.ProtoIdManager();
@@ -89,9 +89,9 @@ public class TestProtoCatalogFormat {
     byte[] checkpointBytes = ProtoCodec.encodeCheckpoint(original, mut, idManager);
 
     // Decode into a new builder
-    ProtoCatalogFile.Builder newBuilder = ProtoCatalogFile.builder(location);
+    CatalogState.Builder newBuilder = CatalogState.builder(location);
     ProtoCodec.decodeCheckpoint(checkpointBytes, newBuilder);
-    ProtoCatalogFile decoded = newBuilder.build();
+    CatalogState decoded = newBuilder.build();
 
     // Verify the decoded state matches
     assertThat(decoded.namespaces()).containsExactlyInAnyOrderElementsOf(original.namespaces());
@@ -124,7 +124,7 @@ public class TestProtoCatalogFormat {
     int futureLogVersion = LogEnvelope.SUPPORTED_READER_VERSION + 1;
     byte[] envelope = new byte[]{(byte) ((1 << 3) | 0), (byte) futureLogVersion};
     assertThatThrownBy(
-            () -> ProtoCodec.decodeCheckpoint(envelope, ProtoCatalogFile.builder(location)))
+            () -> ProtoCodec.decodeCheckpoint(envelope, CatalogState.builder(location)))
         .isInstanceOf(IllegalStateException.class)
         .hasMessageContaining("requires log reader version " + futureLogVersion)
         .hasMessageContaining("supports up to " + LogEnvelope.SUPPORTED_READER_VERSION);
@@ -136,7 +136,7 @@ public class TestProtoCatalogFormat {
         LogEnvelope.encodeCheckpoint(
             UuidV7.newUuidV7(), new byte[0], new byte[]{(byte) ((4 << 3) | 0), (byte) futureVersion});
     assertThatThrownBy(
-            () -> ProtoCodec.decodeCheckpoint(checkpoint, ProtoCatalogFile.builder(location)))
+            () -> ProtoCodec.decodeCheckpoint(checkpoint, CatalogState.builder(location)))
         .isInstanceOf(IllegalStateException.class)
         .hasMessageContaining("requires reader version " + futureVersion)
         .hasMessageContaining("supports up to " + ProtoCodec.SUPPORTED_READER_VERSION);
@@ -157,7 +157,7 @@ public class TestProtoCatalogFormat {
     envelope[0] = (byte) ((2 << 3) | 2); // LOG_CHECKPOINT_LOG_ID, wire-type length-delimited
     envelope[1] = 16; // varint length
     assertThatThrownBy(
-            () -> ProtoCodec.decodeCheckpoint(envelope, ProtoCatalogFile.builder(location)))
+            () -> ProtoCodec.decodeCheckpoint(envelope, CatalogState.builder(location)))
         .isInstanceOf(IllegalStateException.class)
         .hasMessageContaining("missing required min_reader_version");
 
@@ -166,7 +166,7 @@ public class TestProtoCatalogFormat {
         LogEnvelope.encodeCheckpoint(
             UuidV7.newUuidV7(), new byte[0], new byte[]{(byte) ((2 << 3) | 0), 1});
     assertThatThrownBy(
-            () -> ProtoCodec.decodeCheckpoint(checkpoint, ProtoCatalogFile.builder(location)))
+            () -> ProtoCodec.decodeCheckpoint(checkpoint, CatalogState.builder(location)))
         .isInstanceOf(IllegalStateException.class)
         .hasMessageContaining("missing required min_reader_version");
   }
@@ -217,7 +217,7 @@ public class TestProtoCatalogFormat {
   @Test
   public void testTransactionVerifyAndApply() {
     InputFile location = new TestInputFile("test://catalog");
-    ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(location);
+    CatalogState.Builder builder = CatalogState.builder(location);
 
     // Create a transaction that creates a namespace and table
     List<ProtoCodec.Action> actions = List.of(
@@ -233,7 +233,7 @@ public class TestProtoCatalogFormat {
     // Apply
     txn.apply(builder);
 
-    ProtoCatalogFile result = builder.build();
+    CatalogState result = builder.build();
     assertThat(result.containsNamespace(Namespace.of("mydb"))).isTrue();
     assertThat(result.location(TableIdentifier.of(Namespace.of("mydb"), "mytable")))
         .isEqualTo("s3://bucket/metadata.json");
@@ -242,7 +242,7 @@ public class TestProtoCatalogFormat {
   @Test
   public void testDropNamespaceVerifyFailsOnVersionMismatch() {
     InputFile location = new TestInputFile("test://catalog");
-    ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(location);
+    CatalogState.Builder builder = CatalogState.builder(location);
     builder.addNamespace(1, 0, "mydb", 2);  // version 2
 
     // Try to drop with wrong version
@@ -265,7 +265,7 @@ public class TestProtoCatalogFormat {
 
     // Write empty checkpoint
     InputFile location = new TestInputFile("test://catalog");
-    ProtoCatalogFile empty = ProtoCatalogFile.empty(location);
+    CatalogState empty = CatalogState.empty(location);
     ProtoCatalogFormat.ProtoIdManager idManager = new ProtoCatalogFormat.ProtoIdManager();
     ProtoCatalogFormat.Mut mut = new ProtoCatalogFormat.Mut(empty);
     byte[] checkpointBytes = ProtoCodec.encodeCheckpoint(empty, mut, idManager);
@@ -285,7 +285,7 @@ public class TestProtoCatalogFormat {
     byte[] fileBytes = out.toByteArray();
     ByteArrayInputStream in = new ByteArrayInputStream(fileBytes);
 
-    ProtoCatalogFile result = ProtoCatalogFormat.readInternal(
+    CatalogState result = ProtoCatalogFormat.readInternal(
         location, in, fileBytes.length);
 
     // Verify the transaction was applied
@@ -296,7 +296,7 @@ public class TestProtoCatalogFormat {
   @Test
   public void testBuildActionsFromMut() {
     InputFile location = new TestInputFile("test://catalog");
-    ProtoCatalogFile empty = ProtoCatalogFile.empty(location);
+    CatalogState empty = CatalogState.empty(location);
     ProtoCatalogFormat.Mut mut = new ProtoCatalogFormat.Mut(empty);
 
     // Accumulate some changes
@@ -328,7 +328,7 @@ public class TestProtoCatalogFormat {
   public void testApplyTransactionConditionally() throws IOException {
     // Create an empty base catalog
     InputFile location = new TestInputFile("test://catalog");
-    ProtoCatalogFile orig = ProtoCatalogFile.empty(location);
+    CatalogState orig = CatalogState.empty(location);
     byte[] origBytes = toFullFileBytes(orig);
 
     // Transaction A: create dingos -> dingos.yaks -> tblY
@@ -345,7 +345,7 @@ public class TestProtoCatalogFormat {
     byte[] combined = appendBytes(origBytes, txnABytes);
 
     // Read the combined file
-    ProtoCatalogFile result = ProtoCatalogFormat.readInternal(
+    CatalogState result = ProtoCatalogFormat.readInternal(
         location, new ByteArrayInputStream(combined), combined.length);
 
     // Verify txnA was applied
@@ -360,13 +360,13 @@ public class TestProtoCatalogFormat {
     InputFile location = new TestInputFile("test://catalog");
 
     // Start with a catalog that has dingos.yaks namespace and tblY at version 1
-    ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(location);
+    CatalogState.Builder builder = CatalogState.builder(location);
     builder.setNextNamespaceId(3);
     builder.setNextTableId(2);
     builder.addNamespace(1, 0, "dingos", 1);
     builder.addNamespace(2, 1, "yaks", 1);
     builder.addTable(1, 2, "tblY", 1, "yak://chinchilla/tblY");
-    ProtoCatalogFile orig = builder.build();
+    CatalogState orig = builder.build();
     byte[] origBytes = toFullFileBytes(orig);
 
     // txnA: update tblY (from version 1 to 2) - should succeed
@@ -397,7 +397,7 @@ public class TestProtoCatalogFormat {
         toTransactionRecord(txnC)
     );
 
-    ProtoCatalogFile result = ProtoCatalogFormat.readInternal(
+    CatalogState result = ProtoCatalogFormat.readInternal(
         location, new ByteArrayInputStream(allTxns), allTxns.length);
 
     // txnA succeeded - tblY updated to version 2
@@ -423,7 +423,7 @@ public class TestProtoCatalogFormat {
   @Test
   public void testCreateOfAConcreteIdIsRejected() throws IOException {
     InputFile location = new TestInputFile("test://catalog");
-    ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(location);
+    CatalogState.Builder builder = CatalogState.builder(location);
     builder.setNextNamespaceId(2);
     builder.setNextTableId(2);
     builder.addNamespace(1, 0, "dingos", 1);
@@ -436,7 +436,7 @@ public class TestProtoCatalogFormat {
     byte[] combined =
         appendBytes(origBytes, toTransactionRecord(namespace), toTransactionRecord(table));
 
-    ProtoCatalogFile result = ProtoCatalogFormat.readInternal(
+    CatalogState result = ProtoCatalogFormat.readInternal(
         location, new ByteArrayInputStream(combined), combined.length);
     assertThat(result.containsNamespace(Namespace.of("yaks"))).isFalse();
     assertThat(result.containsTransaction(namespace.id())).isFalse();
@@ -447,7 +447,7 @@ public class TestProtoCatalogFormat {
   @Test
   public void testDuplicateTransactionIdIgnored() throws IOException {
     InputFile location = new TestInputFile("test://catalog");
-    ProtoCatalogFile orig = ProtoCatalogFile.empty(location);
+    CatalogState orig = CatalogState.empty(location);
     byte[] origBytes = toFullFileBytes(orig);
 
     // txnA: create a namespace
@@ -460,7 +460,7 @@ public class TestProtoCatalogFormat {
     // Duplicate the same transaction (simulating retry)
     byte[] withDuplicates = appendBytes(origBytes, txnARecord, txnARecord, txnARecord);
 
-    ProtoCatalogFile result = ProtoCatalogFormat.readInternal(
+    CatalogState result = ProtoCatalogFormat.readInternal(
         location, new ByteArrayInputStream(withDuplicates), withDuplicates.length);
 
     // Transaction should only be applied once
@@ -478,13 +478,13 @@ public class TestProtoCatalogFormat {
     InputFile location = new TestInputFile("test://catalog");
 
     // Start with a catalog that has a table
-    ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(location);
+    CatalogState.Builder builder = CatalogState.builder(location);
     builder.setNextNamespaceId(3);
     builder.setNextTableId(2);
     builder.addNamespace(1, 0, "dingos", 2);
     builder.addNamespace(2, 1, "yaks", 1);
     builder.addTable(1, 2, "tblY", 1, "yak://original");
-    ProtoCatalogFile orig = builder.build();
+    CatalogState orig = builder.build();
     byte[] origBytes = toFullFileBytes(orig);
 
     // txnA: update table to version 2
@@ -503,7 +503,7 @@ public class TestProtoCatalogFormat {
         toTransactionRecord(txnA),
         toTransactionRecord(txnB));
 
-    ProtoCatalogFile result = ProtoCatalogFormat.readInternal(
+    CatalogState result = ProtoCatalogFormat.readInternal(
         location, new ByteArrayInputStream(combined), combined.length);
 
     // txnA succeeds
@@ -519,12 +519,12 @@ public class TestProtoCatalogFormat {
     InputFile location = new TestInputFile("test://catalog");
 
     // Start with a catalog that has a table at version 1
-    ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(location);
+    CatalogState.Builder builder = CatalogState.builder(location);
     builder.setNextNamespaceId(2);
     builder.setNextTableId(2);
     builder.addNamespace(1, 0, "ns", 1);
     builder.addTable(1, 1, "tbl", 1, "s3://original");
-    ProtoCatalogFile orig = builder.build();
+    CatalogState orig = builder.build();
     byte[] origBytes = toFullFileBytes(orig);
 
     // txnA: update table
@@ -544,7 +544,7 @@ public class TestProtoCatalogFormat {
         toTransactionRecord(txnA),
         toTransactionRecord(txnB));
 
-    ProtoCatalogFile result = ProtoCatalogFormat.readInternal(
+    CatalogState result = ProtoCatalogFormat.readInternal(
         location, new ByteArrayInputStream(combined), combined.length);
 
     // txnA succeeds
@@ -560,7 +560,7 @@ public class TestProtoCatalogFormat {
     InputFile location = new TestInputFile("test://catalog");
 
     // Create a catalog with known structure
-    ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(location);
+    CatalogState.Builder builder = CatalogState.builder(location);
     builder.setNextNamespaceId(5);
     builder.setNextTableId(3);
     builder.addNamespace(1, 0, "db1", 2);
@@ -574,13 +574,13 @@ public class TestProtoCatalogFormat {
     builder.addCommittedTransaction(UuidV7.newUuidV7());
     builder.addCommittedTransaction(UuidV7.newUuidV7());
 
-    ProtoCatalogFile original = builder.build();
+    CatalogState original = builder.build();
 
     // Roundtrip through bytes
     byte[] bytes = toFullFileBytes(original);
     assertThat(bytes.length).isGreaterThan(ProtoCatalogFormat.HEADER_SIZE);
 
-    ProtoCatalogFile roundtripped = ProtoCatalogFormat.readInternal(
+    CatalogState roundtripped = ProtoCatalogFormat.readInternal(
         location, new ByteArrayInputStream(bytes), bytes.length);
 
     // Verify all state matches
@@ -604,9 +604,9 @@ public class TestProtoCatalogFormat {
   // Helper Methods
   // ============================================================
 
-  private ProtoCatalogFile generateRandomProtoCatalogFile(long seed, InputFile location) {
+  private CatalogState generateRandomCatalogState(long seed, InputFile location) {
     final Random rand = new Random(seed);
-    ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(location);
+    CatalogState.Builder builder = CatalogState.builder(location);
 
     final int nextNsid = rand.nextInt(20) + 10;
     final int nextTblid = rand.nextInt(100) + 10;
@@ -658,7 +658,7 @@ public class TestProtoCatalogFormat {
     return builder.build();
   }
 
-  private byte[] toFullFileBytes(ProtoCatalogFile catalog) throws IOException {
+  private byte[] toFullFileBytes(CatalogState catalog) throws IOException {
     ByteArrayOutputStream out = new ByteArrayOutputStream();
 
     // Header

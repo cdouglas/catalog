@@ -212,7 +212,7 @@ public class InlineDeltaCodec {
 
   /**
    * Applies a delta (encoded bytes) to base metadata, routing ML updates to the
-   * ProtoCatalogFile.Builder and TM updates (including AddSnapshot) to TableMetadata, and
+   * CatalogState.Builder and TM updates (including AddSnapshot) to TableMetadata, and
    * returning the updated bytes encoded with the base's codec: a delta keeps the on-disk codec,
    * which changes only with full metadata. This is the replay of an UpdateTableInline delta.
    *
@@ -228,7 +228,7 @@ public class InlineDeltaCodec {
    */
   public static byte[] applyDeltaWithManifests(
       byte[] baseMetadataBytes, InlineMetadataCodec baseCodec, byte[] deltaBytes,
-      ProtoCatalogFile.Builder catalogBuilder, int tableId) {
+      CatalogState.Builder catalogBuilder, int tableId) {
     // A deterministic metadata-file location for the parsed base, so the rebuilt
     // metadata's `previousFiles()` gains an entry for the prior version. The string
     // is opaque to FileIO (an `inline://` URI never resolves); only its stability
@@ -365,7 +365,7 @@ public class InlineDeltaCodec {
    * which keeps its parent's manifests in the pool if the same delta removes the parent snapshot.
    */
   private static final class NewSnapshotManifests {
-    private final ProtoCatalogFile.Builder builder;
+    private final CatalogState.Builder builder;
     private final int tableId;
     // Each new snapshot's parent (null for none), in the order added.
     private final Map<Long, Long> parents = new LinkedHashMap<>();
@@ -376,7 +376,7 @@ public class InlineDeltaCodec {
     private final Map<Long, List<Integer>> positions = new HashMap<>();
     private final Map<Long, List<String>> removedSuffixes = new HashMap<>();
 
-    NewSnapshotManifests(ProtoCatalogFile.Builder builder, int tableId) {
+    NewSnapshotManifests(CatalogState.Builder builder, int tableId) {
       this.builder = builder;
       this.tableId = tableId;
     }
@@ -492,7 +492,7 @@ public class InlineDeltaCodec {
    * pool removal for snapshots dropped from the new TM).
    */
   public static void applyManifestsOnly(
-      byte[] deltaBytes, ProtoCatalogFile.Builder catalogBuilder, int tableId,
+      byte[] deltaBytes, CatalogState.Builder catalogBuilder, int tableId,
       InlineMetadataCodec newMetadataCodec, byte[] newMetadataBytes) {
     String prefix = catalogBuilder.manifestListPrefix(tableId);
     if (prefix == null) {
@@ -1660,7 +1660,7 @@ public class InlineDeltaCodec {
 
     @Override
     public void applyTo(TableMetadata.Builder builder) {
-      // ML deltas are applied to ProtoCatalogFile.Builder, not TableMetadata.Builder.
+      // ML deltas are applied to CatalogState.Builder, not TableMetadata.Builder.
       // This is a no-op here; handled by applyDeltaWithManifests / applyManifestsOnly.
     }
   }
@@ -1679,7 +1679,7 @@ public class InlineDeltaCodec {
 
     @Override
     public void applyTo(TableMetadata.Builder builder) {
-      // ML deltas are applied to ProtoCatalogFile.Builder, not TableMetadata.Builder.
+      // ML deltas are applied to CatalogState.Builder, not TableMetadata.Builder.
       // This is a no-op here; handled by applyDeltaWithManifests / applyManifestsOnly.
     }
   }

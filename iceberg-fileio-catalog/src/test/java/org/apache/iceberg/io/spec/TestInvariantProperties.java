@@ -28,7 +28,7 @@ import net.jqwik.api.Provide;
 import net.jqwik.api.Tuple;
 import net.jqwik.api.statistics.Statistics;
 import org.apache.iceberg.io.CatalogFile;
-import org.apache.iceberg.io.ProtoCatalogFile;
+import org.apache.iceberg.io.CatalogState;
 import org.apache.iceberg.io.ProtoCodec;
 
 /**
@@ -37,7 +37,7 @@ import org.apache.iceberg.io.ProtoCodec;
  * <p>P4 — Well-formedness preservation: {@code wellFormed(s) ∧ verify(a, s) ⇒ wellFormed(apply(a, s))}.
  *
  * <p>{@code Action.verify} and {@code Action.apply} operate on a
- * {@link ProtoCatalogFile.Builder}, so P4 builds a Builder from the state, calls
+ * {@link CatalogState.Builder}, so P4 builds a Builder from the state, calls
  * {@code verify}, and when it holds calls {@code apply} then {@code build()} to
  * obtain the successor state.
  *
@@ -72,14 +72,14 @@ class TestInvariantProperties {
         .as("generated catalog state must itself be well-formed: %s", state)
         .isTrue();
 
-    ProtoCatalogFile.Builder builder = SpecUtils.stateToBuilder((ProtoCatalogFile) state);
+    CatalogState.Builder builder = SpecUtils.stateToBuilder((CatalogState) state);
 
     boolean applicable = action.verify(builder);
     Statistics.label("apply-path").collect(applicable ? "applied" : "skipped-verify-false");
 
     if (applicable) {
       action.apply(builder);
-      ProtoCatalogFile next = builder.build();
+      CatalogState next = builder.build();
       assertThat(WellFormed.check(next))
           .as("action %s broke well-formedness starting from %s", action, state)
           .isTrue();

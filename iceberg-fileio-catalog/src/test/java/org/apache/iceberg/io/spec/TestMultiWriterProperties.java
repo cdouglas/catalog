@@ -56,7 +56,7 @@ import org.apache.iceberg.io.CheckpointRoundTrip;
 import org.apache.iceberg.io.InMemoryAtomicFileIO;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.ReadFault;
-import org.apache.iceberg.io.ProtoCatalogFile;
+import org.apache.iceberg.io.CatalogState;
 import org.apache.iceberg.io.ProtoCatalogFormat;
 
 /**
@@ -333,7 +333,7 @@ class TestMultiWriterProperties {
       return new Op(OpKind.RENAME_TABLE, null, from, to, null, null, null);
     }
 
-    void stage(CatalogFile.Mut<ProtoCatalogFile, ?> mut) {
+    void stage(CatalogFile.Mut<CatalogState, ?> mut) {
       switch (kind) {
         case CREATE_NAMESPACE:
           Map<String, String> props = new HashMap<>();
@@ -510,7 +510,7 @@ class TestMultiWriterProperties {
 
   private static final class Writer {
     final int id;
-    ProtoCatalogFile snapshot; // null when idle
+    CatalogState snapshot; // null when idle
     byte[] snapshotBytes;
     List<Op> ops;
 
@@ -594,7 +594,7 @@ class TestMultiWriterProperties {
         io.limitSegments(segmentLimit);
       }
       Statistics.label("segment limit").collect(segmentLimit);
-      CatalogFile.Mut<ProtoCatalogFile, ?> seed =
+      CatalogFile.Mut<CatalogState, ?> seed =
           new ProtoCatalogFormat().empty(io.newInputFile(CATALOG));
       seed.createNamespace(Namespace.of("a"));
       seed.createNamespace(Namespace.of("b"));
@@ -727,7 +727,7 @@ class TestMultiWriterProperties {
     }
 
     /** Concrete operands for {@code cmd} from the writer's snapshot, or null if none fit. */
-    private Op interpret(Cmd cmd, ProtoCatalogFile snap) {
+    private Op interpret(Cmd cmd, CatalogState snap) {
       List<Namespace> namespaces = new ArrayList<>(snap.namespaces());
       namespaces.sort(NS_ORDER);
       List<TableIdentifier> tables = new ArrayList<>(snap.tables());
@@ -900,13 +900,13 @@ class TestMultiWriterProperties {
      * its own effects.
      */
     private void checkTransition(InMemoryAtomicFileIO.Write write, List<Op> ops) {
-      ProtoCatalogFile pre = parse(write.before());
+      CatalogState pre = parse(write.before());
       View post = View.of(parse(write.after()));
       String invalid = reexecutionViolation(pre, ops);
       check(invalid == null, "acknowledged transaction is invalid on the state it replaced: %s",
           invalid);
       InMemoryAtomicFileIO alone = scratch(write.before());
-      ProtoCatalogFile fresh = format.read(alone, alone.newInputFile(CATALOG));
+      CatalogState fresh = format.read(alone, alone.newInputFile(CATALOG));
       View serial = View.of(mut(fresh, ops).commit(alone));
       check(serial.equals(post), "serial re-execution differs:%n  serial: %s%n  actual: %s",
           serial, post);
@@ -917,7 +917,7 @@ class TestMultiWriterProperties {
     }
 
     /** Why {@code ops} cannot be re-executed serially on {@code state}, or null if they can. */
-    private String reexecutionViolation(ProtoCatalogFile state, List<Op> ops) {
+    private String reexecutionViolation(CatalogState state, List<Op> ops) {
       for (Op op : ops) {
         if (!op.baseHolds(state)) {
           return op + " expects " + op.base + ", found " + state.location(op.table);
@@ -944,14 +944,14 @@ class TestMultiWriterProperties {
       }
     }
 
-    private CatalogFile.Mut<ProtoCatalogFile, ?> mut(ProtoCatalogFile base, List<Op> ops) {
-      CatalogFile.Mut<ProtoCatalogFile, ?> mut = format.from(base);
+    private CatalogFile.Mut<CatalogState, ?> mut(CatalogState base, List<Op> ops) {
+      CatalogFile.Mut<CatalogState, ?> mut = format.from(base);
       ops.forEach(op -> op.stage(mut));
       return mut;
     }
 
     /** Whether {@code ops} stage cleanly on {@code base}: the client-side validity check. */
-    private boolean stages(ProtoCatalogFile base, List<Op> ops) {
+    private boolean stages(CatalogState base, List<Op> ops) {
       try {
         mut(base, ops);
         return true;
@@ -965,7 +965,7 @@ class TestMultiWriterProperties {
       }
     }
 
-    private ProtoCatalogFile read() {
+    private CatalogState read() {
       return format.read(io, io.newInputFile(CATALOG));
     }
 
@@ -983,7 +983,7 @@ class TestMultiWriterProperties {
       return scratch;
     }
 
-    private ProtoCatalogFile parse(byte[] bytes) {
+    private CatalogState parse(byte[] bytes) {
       InMemoryAtomicFileIO scratch = scratch(bytes);
       return format.read(scratch, scratch.newInputFile(CATALOG));
     }

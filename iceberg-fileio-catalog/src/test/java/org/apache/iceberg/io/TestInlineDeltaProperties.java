@@ -112,8 +112,8 @@ class TestInlineDeltaProperties {
     }
     Statistics.label("commit").collect("delta");
     byte[] deltaBytes = InlineDeltaCodec.encodeDelta(delta, next.lastUpdatedMillis());
-    ProtoCatalogFile.Builder builder =
-        ProtoCatalogFile.builder(CatalogStateGeneratorsStub.LOCATION)
+    CatalogState.Builder builder =
+        CatalogState.builder(CatalogStateGeneratorsStub.LOCATION)
             .addInlineTable(1, 0, "t", 1, codec.encode(stored), codec.tag(), "");
     ProtoCodec.UpdateTableInlineAction.delta(1, 1, deltaBytes).apply(builder);
     TableMetadata replayed = codec.decodeFull(builder.inlineMetadata(1), "inline://replayed");

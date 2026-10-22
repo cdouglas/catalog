@@ -374,8 +374,8 @@ public class FileIOCatalog extends BaseMetastoreCatalog
       return location;
     }
     String version = "-1";
-    if (catalogFile instanceof ProtoCatalogFile) {
-      ProtoCatalogFile proto = (ProtoCatalogFile) catalogFile;
+    if (catalogFile instanceof CatalogState) {
+      CatalogState proto = (CatalogState) catalogFile;
       Integer numId = proto.tableId(table);
       if (numId != null) {
         version = numId + "." + proto.tableVersion(numId);
@@ -406,7 +406,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
    * {@link CatalogFile#isInlineTable(TableIdentifier)}.
    */
   private static byte inlineCodecTag(CatalogFile catalogFile, TableIdentifier table) {
-    ProtoCatalogFile proto = (ProtoCatalogFile) catalogFile;
+    CatalogState proto = (CatalogState) catalogFile;
     return proto.inlineMetadataCodec(proto.tableId(table));
   }
 
@@ -785,7 +785,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
      */
     void stageUpdate(CatalogFile.Mut<?, ?> mut, TableMetadata base, TableMetadata metadata) {
       if (inline.metadata) {
-        ProtoCatalogFile proto = (ProtoCatalogFile) lastCatalogFile;
+        CatalogState proto = (CatalogState) lastCatalogFile;
         Integer tblId = proto.tableId(tableId);
         boolean isInline = tblId != null && proto.isInlineTable(tblId);
         String prefix = isInline && proto.manifestListPrefix(tblId) != null
@@ -863,7 +863,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
      * sent, so that the catalog registers their lists.
      */
     private List<InlineDeltaCodec.DeltaUpdate> manifestUpdates(
-        ProtoCatalogFile proto,
+        CatalogState proto,
         TableMetadata base,
         TableMetadata metadata,
         String prefix,
@@ -925,7 +925,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
      * I3a), so the commit writes a metadata file, which holds each snapshot's list as it is.
      */
     private boolean restatesAManifest(
-        ProtoCatalogFile proto, TableMetadata base, TableMetadata metadata, boolean full) {
+        CatalogState proto, TableMetadata base, TableMetadata metadata, boolean full) {
       Integer tblId = proto != null ? proto.tableId(tableId) : null;
       Map<String, Long> firstRowIds = new HashMap<>();
       if (tblId != null) {
@@ -956,7 +956,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
      * snapshots it loaded). A delta keeps each snapshot in {@code base} as the table has it.
      */
     private boolean sendsList(
-        Snapshot snapshot, ProtoCatalogFile proto, TableMetadata base, boolean full) {
+        Snapshot snapshot, CatalogState proto, TableMetadata base, boolean full) {
       if (isNew(snapshot, base)) {
         return true;
       }
@@ -980,7 +980,7 @@ public class FileIOCatalog extends BaseMetastoreCatalog
      * inline.
      */
     private List<ManifestFile> parentList(
-        ProtoCatalogFile proto,
+        CatalogState proto,
         TableMetadata base,
         TableMetadata metadata,
         Long parentId,
@@ -1003,10 +1003,10 @@ public class FileIOCatalog extends BaseMetastoreCatalog
      * Snapshots without inline ML data keep their original manifestListLocation (Avro pointer).
      */
     private TableMetadata wrapInlineManifests(TableMetadata parsed, CatalogFile catalogFile) {
-      if (!(catalogFile instanceof ProtoCatalogFile)) {
+      if (!(catalogFile instanceof CatalogState)) {
         return parsed;
       }
-      ProtoCatalogFile proto = (ProtoCatalogFile) catalogFile;
+      CatalogState proto = (CatalogState) catalogFile;
       Integer tblId = proto.tableId(tableId);
       if (tblId == null) {
         return parsed;

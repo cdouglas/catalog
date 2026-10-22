@@ -34,7 +34,7 @@ import org.junit.jupiter.api.Test;
 
 /**
  * The catalog's committed set: the Builder's replay of a GC record (advanceHorizon) and the tri-state
- * {@link ProtoCatalogFile#containsTransaction}, which delegate to intentlog-core's
+ * {@link CatalogState#containsTransaction}, which delegate to intentlog-core's
  * CommittedSet (whose own tests cover the codec and GC).
  *
  * <p>End-to-end (catalog write → CAS rewrite with retention=0 → fresh read →
@@ -59,7 +59,7 @@ class TestCommittedSetGc {
     long base = System.currentTimeMillis();
     UUID u = UuidV7.newUuidV7(base, rand);
     byte[] body = CommittedSetCodec.encode(java.util.List.of(u));
-    ProtoCatalogFile cat = ProtoCatalogFile.builder(LOC)
+    CatalogState cat = CatalogState.builder(LOC)
         .setCommittedTransactionsBytes(body)
         .build();
     assertThat(cat.containsTransaction(u)).isTrue();
@@ -75,7 +75,7 @@ class TestCommittedSetGc {
     byte[] body = CommittedSetCodec.encode(inherited);
     byte[] rewritten = CommittedSetCodec.rewrite(body, Collections.emptyList(), base);
 
-    ProtoCatalogFile cat = ProtoCatalogFile.builder(LOC)
+    CatalogState cat = CatalogState.builder(LOC)
         .setCommittedTransactionsBytes(rewritten)
         .build();
 
@@ -94,7 +94,7 @@ class TestCommittedSetGc {
     byte[] body = CommittedSetCodec.encode(inherited);
     byte[] rewritten = CommittedSetCodec.rewrite(body, Collections.emptyList(), base);
 
-    ProtoCatalogFile cat = ProtoCatalogFile.builder(LOC)
+    CatalogState cat = CatalogState.builder(LOC)
         .setCommittedTransactionsBytes(rewritten)
         .build();
 
@@ -118,7 +118,7 @@ class TestCommittedSetGc {
     inherited.add(UuidV7.newUuidV7(base - 100, rand));
     byte[] body = CommittedSetCodec.encode(inherited);
     byte[] rewritten = CommittedSetCodec.rewrite(body, Collections.emptyList(), base);
-    ProtoCatalogFile cat = ProtoCatalogFile.builder(LOC)
+    CatalogState cat = CatalogState.builder(LOC)
         .setCommittedTransactionsBytes(rewritten)
         .build();
 
@@ -134,13 +134,13 @@ class TestCommittedSetGc {
     inherited.add(UuidV7.newUuidV7(base - 100, rand));
     byte[] body = CommittedSetCodec.encode(inherited);
     byte[] rewritten = CommittedSetCodec.rewrite(body, Collections.emptyList(), base);
-    ProtoCatalogFile cat = ProtoCatalogFile.builder(LOC)
+    CatalogState cat = CatalogState.builder(LOC)
         .setCommittedTransactionsBytes(rewritten)
         .build();
     assertThat(cat.highestDroppedTimestampMs()).isEqualTo(base - 100);
 
     // Empty / no-GC case: 0.
-    ProtoCatalogFile fresh = ProtoCatalogFile.builder(LOC).build();
+    CatalogState fresh = CatalogState.builder(LOC).build();
     assertThat(fresh.highestDroppedTimestampMs()).isZero();
   }
 
@@ -157,7 +157,7 @@ class TestCommittedSetGc {
     inherited.add(UuidV7.newUuidV7(base + 100, rand));
     byte[] body = CommittedSetCodec.encode(inherited);
 
-    ProtoCatalogFile cat = ProtoCatalogFile.builder(LOC)
+    CatalogState cat = CatalogState.builder(LOC)
         .setCommittedTransactionsBytes(body)
         .advanceHorizon(base)
         .build();
@@ -173,7 +173,7 @@ class TestCommittedSetGc {
     inherited.add(UuidV7.newUuidV7(base - 100, rand));
     byte[] body = CommittedSetCodec.encode(inherited);
 
-    ProtoCatalogFile cat = ProtoCatalogFile.builder(LOC)
+    CatalogState cat = CatalogState.builder(LOC)
         .setCommittedTransactionsBytes(body)
         .build();
     assertThat(cat.highestDroppedTimestampMs()).isZero();

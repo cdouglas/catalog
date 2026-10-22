@@ -46,7 +46,7 @@ import org.intentlog.wire.UuidV7;
  * <p>This class holds the catalog contents read from a protobuf-encoded file:
  * namespaces, tables, namespace properties, and transaction tracking state.
  */
-public class ProtoCatalogFile extends CatalogFile {
+public class CatalogState extends CatalogFile {
 
   /** Id of the root namespace's row. Every catalog has one; it is never dropped. */
   static final int ROOT_ID = 0;
@@ -92,9 +92,9 @@ public class ProtoCatalogFile extends CatalogFile {
 
   // The read of the catalog's intention log this state came from, if any: what the next commit
   // writes on top of (LogRuntime). Null for a state built otherwise (empty, tests).
-  private final Replica<ProtoCatalogFile> replica;
+  private final Replica<CatalogState> replica;
 
-  private ProtoCatalogFile(Builder builder) {
+  private CatalogState(Builder builder) {
     super(builder.catalogUuid, builder.location);
     this.nextNamespaceId = builder.nextNamespaceId;
     this.nextTableId = builder.nextTableId;
@@ -114,7 +114,7 @@ public class ProtoCatalogFile extends CatalogFile {
   }
 
   /** {@code state} as the read {@code replica} found it: its location, id, committed set. */
-  private ProtoCatalogFile(ProtoCatalogFile state, Replica<ProtoCatalogFile> replica) {
+  private CatalogState(CatalogState state, Replica<CatalogState> replica) {
     super(replica.logId(), AtomicFileLog.fileOf(replica.tail()));
     this.nextNamespaceId = state.nextNamespaceId;
     this.nextTableId = state.nextTableId;
@@ -137,15 +137,15 @@ public class ProtoCatalogFile extends CatalogFile {
    * The catalog a read of its intention log found: the replica's state, at the version of the
    * catalog file the read ended at, with the log's id and committed set.
    */
-  static ProtoCatalogFile of(Replica<ProtoCatalogFile> replica) {
-    return new ProtoCatalogFile(replica.state(), replica);
+  static CatalogState of(Replica<CatalogState> replica) {
+    return new CatalogState(replica.state(), replica);
   }
 
   /**
    * The replica the next commit writes on top of: the read this state came from, or, for a state
    * built otherwise (an empty catalog not yet created), this state at its location.
    */
-  Replica<ProtoCatalogFile> replica() {
+  Replica<CatalogState> replica() {
     return replica != null
         ? replica
         : new Replica<>(this, committed, AtomicFileLog.tailOf(location()), appendCount, uuid());
@@ -182,7 +182,7 @@ public class ProtoCatalogFile extends CatalogFile {
     return outer.build();
   }
 
-  public static ProtoCatalogFile empty(InputFile location) {
+  public static CatalogState empty(InputFile location) {
     return builder(location).build();
   }
 
@@ -520,7 +520,7 @@ public class ProtoCatalogFile extends CatalogFile {
   // Builder
   // ============================================================
 
-  public static class Builder implements StateMachine.Builder<ProtoCatalogFile> {
+  public static class Builder implements StateMachine.Builder<CatalogState> {
     private final InputFile location;
     private UUID catalogUuid;
     private int nextNamespaceId = 1;
@@ -923,7 +923,7 @@ public class ProtoCatalogFile extends CatalogFile {
 
     /**
      * Tri-state membership check, mirroring
-     * {@link ProtoCatalogFile#containsTransaction}: returns {@code true} if
+     * {@link CatalogState#containsTransaction}: returns {@code true} if
      * found among in-flight additions or in the inherited bytes; returns
      * {@code false} for a v7 UUID whose timestamp is above the GC horizon;
      * throws {@link DedupHorizonExceededException} when the UUID is missing
@@ -1015,10 +1015,10 @@ public class ProtoCatalogFile extends CatalogFile {
     }
 
     @Override
-    public ProtoCatalogFile build() {
+    public CatalogState build() {
       // Ensure all lookups are complete before building immutable file
       rebuildLookups();
-      return new ProtoCatalogFile(this);
+      return new CatalogState(this);
     }
   }
 }

@@ -269,8 +269,8 @@ public class ProtoCodec {
    * it (I11).
    */
   public static byte[] encodeCheckpoint(
-      ProtoCatalogFile original,
-      CatalogFile.Mut<ProtoCatalogFile, ?> mut,
+      CatalogState original,
+      CatalogFile.Mut<CatalogState, ?> mut,
       ProtoCatalogFormat.ProtoIdManager idManager) {
     // The catalog's id and committed transactions (a compressed UUIDv7 set) are the log's: the
     // envelope (log.proto LogCheckpoint) carries them, and the catalog's Checkpoint as its state.
@@ -281,7 +281,7 @@ public class ProtoCodec {
 
   /** Encodes the catalog's state, the payload of a checkpoint (catalog.proto Checkpoint). */
   public static byte[] encodeCheckpointState(
-      ProtoCatalogFile original, ProtoCatalogFormat.ProtoIdManager idManager) {
+      CatalogState original, ProtoCatalogFormat.ProtoIdManager idManager) {
     try {
       ByteArrayOutputStream out = new ByteArrayOutputStream();
 
@@ -295,13 +295,13 @@ public class ProtoCodec {
       writeVarint(out, CHECKPOINT_NEXT_TABLE_ID, idManager.getNextTblid());
 
       // Namespaces - write from original state (mutations will be applied via transaction)
-      for (Map.Entry<Integer, ProtoCatalogFile.NsEntry> entry : original.namespaceById().entrySet()) {
+      for (Map.Entry<Integer, CatalogState.NsEntry> entry : original.namespaceById().entrySet()) {
         byte[] nsBytes = encodeNamespace(entry.getKey(), entry.getValue());
         writeLengthDelimited(out, CHECKPOINT_NAMESPACES, nsBytes);
       }
 
       // Tables (pointer-mode only; inline tables encoded separately)
-      for (Map.Entry<Integer, ProtoCatalogFile.TblEntry> entry : original.tableById().entrySet()) {
+      for (Map.Entry<Integer, CatalogState.TblEntry> entry : original.tableById().entrySet()) {
         if (!original.isInlineTable(entry.getKey())) {
           byte[] tblBytes = encodeTable(entry.getKey(), entry.getValue());
           writeLengthDelimited(out, CHECKPOINT_TABLES, tblBytes);
@@ -320,7 +320,7 @@ public class ProtoCodec {
       // Inline tables (with optional manifest pool + snapshot refs)
       for (Map.Entry<Integer, byte[]> inlineEntry : original.allInlineMetadata().entrySet()) {
         int tblId = inlineEntry.getKey();
-        ProtoCatalogFile.TblEntry tblEntry = original.tableById().get(tblId);
+        CatalogState.TblEntry tblEntry = original.tableById().get(tblId);
         if (tblEntry != null) {
           String prefix = original.allManifestPrefixes().getOrDefault(tblId, "");
           Map<String, ManifestFile> pool = original.manifestPool(tblId);
@@ -342,7 +342,7 @@ public class ProtoCodec {
    * Decodes a checkpoint (a log.proto LogCheckpoint whose state is the catalog's Checkpoint) into
    * a builder.
    */
-  public static void decodeCheckpoint(byte[] bytes, ProtoCatalogFile.Builder builder) {
+  public static void decodeCheckpoint(byte[] bytes, CatalogState.Builder builder) {
     LogEnvelope.Checkpoint envelope = LogEnvelope.decodeCheckpoint(bytes);
     builder.setCatalogUuid(envelope.logId());
     builder.setCommittedTransactionsBytes(envelope.committed());
@@ -350,7 +350,7 @@ public class ProtoCodec {
   }
 
   /** Decodes the catalog's state, the payload of a checkpoint (catalog.proto Checkpoint). */
-  public static void decodeCheckpointState(byte[] state, ProtoCatalogFile.Builder builder) {
+  public static void decodeCheckpointState(byte[] state, CatalogState.Builder builder) {
     try {
       ByteArrayInputStream in = new ByteArrayInputStream(state);
       boolean sawMinReaderVersion = false;
@@ -404,7 +404,7 @@ public class ProtoCodec {
     }
   }
 
-  private static byte[] encodeNamespace(int id, ProtoCatalogFile.NsEntry entry) throws IOException {
+  private static byte[] encodeNamespace(int id, CatalogState.NsEntry entry) throws IOException {
     ByteArrayOutputStream out = new ByteArrayOutputStream();
     writeVarint(out, NS_ID, id);
     writeVarint(out, NS_VERSION, entry.version);
@@ -413,7 +413,7 @@ public class ProtoCodec {
     return out.toByteArray();
   }
 
-  private static void decodeNamespace(byte[] bytes, ProtoCatalogFile.Builder builder) throws IOException {
+  private static void decodeNamespace(byte[] bytes, CatalogState.Builder builder) throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
     int id = 0, version = 0, parentId = 0;
     String name = "";
@@ -441,7 +441,7 @@ public class ProtoCodec {
     builder.addNamespace(id, parentId, name, version);
   }
 
-  private static byte[] encodeTable(int id, ProtoCatalogFile.TblEntry entry) throws IOException {
+  private static byte[] encodeTable(int id, CatalogState.TblEntry entry) throws IOException {
     ByteArrayOutputStream out = new ByteArrayOutputStream();
     writeVarint(out, TBL_ID, id);
     writeVarint(out, TBL_VERSION, entry.version);
@@ -451,7 +451,7 @@ public class ProtoCodec {
     return out.toByteArray();
   }
 
-  private static void decodeTable(byte[] bytes, ProtoCatalogFile.Builder builder) throws IOException {
+  private static void decodeTable(byte[] bytes, CatalogState.Builder builder) throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
     int id = 0, version = 0, nsId = 0;
     String name = "", metadataLocation = "";
@@ -490,7 +490,7 @@ public class ProtoCodec {
     return out.toByteArray();
   }
 
-  private static void decodeNamespaceProperty(byte[] bytes, ProtoCatalogFile.Builder builder) throws IOException {
+  private static void decodeNamespaceProperty(byte[] bytes, CatalogState.Builder builder) throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
     int nsId = 0;
     String key = "", value = "";
@@ -516,7 +516,7 @@ public class ProtoCodec {
   }
 
   private static byte[] encodeInlineTable(
-      int id, ProtoCatalogFile.TblEntry entry, byte[] metadata, byte metadataCodec,
+      int id, CatalogState.TblEntry entry, byte[] metadata, byte metadataCodec,
       String manifestPrefix,
       Map<String, ManifestFile> pool, Map<Long, List<String>> snapRefs)
       throws IOException {
@@ -570,7 +570,7 @@ public class ProtoCodec {
     return out.toByteArray();
   }
 
-  private static void decodeInlineTable(byte[] bytes, ProtoCatalogFile.Builder builder)
+  private static void decodeInlineTable(byte[] bytes, CatalogState.Builder builder)
       throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
     int id = 0, version = 0, nsId = 0;
@@ -637,7 +637,7 @@ public class ProtoCodec {
 
   private static void decodeSnapshotManifestRefs(
       byte[] bytes, int tblId, List<ManifestFile> poolList,
-      ProtoCatalogFile.Builder builder) throws IOException {
+      CatalogState.Builder builder) throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
     long snapshotId = 0;
     List<Integer> indices = new ArrayList<>();
@@ -1522,7 +1522,7 @@ public class ProtoCodec {
     }
 
     public static Transaction from(
-        CatalogFile.Mut<ProtoCatalogFile, ?> mut,
+        CatalogFile.Mut<CatalogState, ?> mut,
         ProtoCatalogFormat.ProtoIdManager idManager) {
       // After the horizon of the catalog this writer read, where replay rejects a record (Bug 64).
       UUID txnId = UuidV7.newUuidV7After(mut.original.highestDroppedTimestampMs());
@@ -1557,12 +1557,12 @@ public class ProtoCodec {
      * that the next checkpoint can't represent. Skip silently — same
      * read-time behavior as any other rejected transaction.
      */
-    public boolean verify(ProtoCatalogFile.Builder builder) {
+    public boolean verify(CatalogState.Builder builder) {
       return UuidV7.isV7(id) && intention.verify(builder);
     }
 
     /** Applies this transaction's intention (see {@link CatalogIntention#apply}). */
-    public void apply(ProtoCatalogFile.Builder builder) {
+    public void apply(CatalogState.Builder builder) {
       intention.apply(builder);
     }
   }
@@ -1572,7 +1572,7 @@ public class ProtoCodec {
    * applies the whole intention where its record lands if every action's preconditions hold there,
    * binding the transaction's late-bound ids to real ones.
    */
-  public static class CatalogIntention implements Intention<ProtoCatalogFile.Builder> {
+  public static class CatalogIntention implements Intention<CatalogState.Builder> {
     private final List<Action> actions;
 
     public CatalogIntention(List<Action> actions) {
@@ -1589,7 +1589,7 @@ public class ProtoCodec {
      * each action verifies.
      */
     @Override
-    public boolean verify(ProtoCatalogFile.Builder builder) {
+    public boolean verify(CatalogState.Builder builder) {
       // Every late-bound reference must follow the create that defines it;
       // otherwise apply could not bind it. Reject the record, don't fail the read.
       IdBinding ids = new IdBinding(builder);
@@ -1677,7 +1677,7 @@ public class ProtoCodec {
      * applied.
      */
     @Override
-    public void apply(ProtoCatalogFile.Builder builder) {
+    public void apply(CatalogState.Builder builder) {
       IdBinding ids = new IdBinding(builder);
       for (Action action : actions) {
         action.bind(ids).apply(builder);
@@ -1697,13 +1697,13 @@ public class ProtoCodec {
    * second overwrite the first.
    */
   static final class IdBinding {
-    private final ProtoCatalogFile.Builder builder;
+    private final CatalogState.Builder builder;
     private final Map<Integer, Integer> namespaces = new HashMap<>();
     private final Map<Integer, Integer> tables = new HashMap<>();
     private int nextNamespaceId;
     private int nextTableId;
 
-    IdBinding(ProtoCatalogFile.Builder builder) {
+    IdBinding(CatalogState.Builder builder) {
       this.builder = builder;
       this.nextNamespaceId = builder.nextNamespaceId();
       this.nextTableId = builder.nextTableId();
@@ -1761,8 +1761,8 @@ public class ProtoCodec {
   // ============================================================
 
   public interface Action {
-    boolean verify(ProtoCatalogFile.Builder builder);
-    void apply(ProtoCatalogFile.Builder builder);
+    boolean verify(CatalogState.Builder builder);
+    void apply(CatalogState.Builder builder);
 
     /**
      * Returns this action with its late-bound ids bound to real ids. Actions
@@ -1789,8 +1789,8 @@ public class ProtoCodec {
     }
 
     @Override
-    public boolean verify(ProtoCatalogFile.Builder builder) {
-      if (id == ProtoCatalogFile.ROOT_ID) {
+    public boolean verify(CatalogState.Builder builder) {
+      if (id == CatalogState.ROOT_ID) {
         return false;  // the root row exists in every catalog; never replace it
       }
       // Parent version must match (skipped when the parent is late-bound).
@@ -1811,7 +1811,7 @@ public class ProtoCodec {
     }
 
     @Override
-    public void apply(ProtoCatalogFile.Builder builder) {
+    public void apply(CatalogState.Builder builder) {
       builder.addNamespace(id, parentId, name, version);
       // Creating a child namespace mutates the parent's children set; bump so
       // concurrent mutations of the parent (create sibling, drop parent, set
@@ -1830,8 +1830,8 @@ public class ProtoCodec {
     }
 
     @Override
-    public boolean verify(ProtoCatalogFile.Builder builder) {
-      if (id == ProtoCatalogFile.ROOT_ID) {
+    public boolean verify(CatalogState.Builder builder) {
+      if (id == CatalogState.ROOT_ID) {
         return false;  // the root is never dropped
       }
       int currentVersion = builder.namespaceVersion(id);
@@ -1839,10 +1839,10 @@ public class ProtoCodec {
     }
 
     @Override
-    public void apply(ProtoCatalogFile.Builder builder) {
+    public void apply(CatalogState.Builder builder) {
       // Capture parent before removing so we can bump the parent's version
       // (dropping a child mutates the parent's children set).
-      ProtoCatalogFile.NsEntry entry = builder.namespaceEntry(id);
+      CatalogState.NsEntry entry = builder.namespaceEntry(id);
       int parentId = entry != null ? entry.parentId : 0;
       builder.removeNamespace(id);
       builder.bumpNamespaceVersion(parentId);
@@ -1863,7 +1863,7 @@ public class ProtoCodec {
     }
 
     @Override
-    public boolean verify(ProtoCatalogFile.Builder builder) {
+    public boolean verify(CatalogState.Builder builder) {
       if (namespaceVersion >= 0) {
         int currentVersion = builder.namespaceVersion(namespaceId);
         return currentVersion == namespaceVersion;
@@ -1877,7 +1877,7 @@ public class ProtoCodec {
     }
 
     @Override
-    public void apply(ProtoCatalogFile.Builder builder) {
+    public void apply(CatalogState.Builder builder) {
       builder.setNamespaceProperty(namespaceId, key, value);
       builder.bumpNamespaceVersion(namespaceId);
     }
@@ -1895,7 +1895,7 @@ public class ProtoCodec {
     }
 
     @Override
-    public boolean verify(ProtoCatalogFile.Builder builder) {
+    public boolean verify(CatalogState.Builder builder) {
       if (namespaceVersion >= 0) {
         int currentVersion = builder.namespaceVersion(namespaceId);
         return currentVersion == namespaceVersion;
@@ -1909,7 +1909,7 @@ public class ProtoCodec {
     }
 
     @Override
-    public void apply(ProtoCatalogFile.Builder builder) {
+    public void apply(CatalogState.Builder builder) {
       builder.removeNamespaceProperty(namespaceId, key);
       builder.bumpNamespaceVersion(namespaceId);
     }
@@ -1934,7 +1934,7 @@ public class ProtoCodec {
     }
 
     @Override
-    public boolean verify(ProtoCatalogFile.Builder builder) {
+    public boolean verify(CatalogState.Builder builder) {
       if (namespaceVersion >= 0) {
         int currentNsVersion = builder.namespaceVersion(namespaceId);
         if (currentNsVersion != namespaceVersion) {
@@ -1952,7 +1952,7 @@ public class ProtoCodec {
     }
 
     @Override
-    public void apply(ProtoCatalogFile.Builder builder) {
+    public void apply(CatalogState.Builder builder) {
       builder.addTable(id, namespaceId, name, version, metadataLocation);
       // Adding a table mutates the parent's children set; bump so concurrent
       // ns mutations (drop, set-property, create sibling table) fail verify.
@@ -1970,16 +1970,16 @@ public class ProtoCodec {
     }
 
     @Override
-    public boolean verify(ProtoCatalogFile.Builder builder) {
+    public boolean verify(CatalogState.Builder builder) {
       int currentVersion = builder.tableVersion(id);
       return currentVersion == version;
     }
 
     @Override
-    public void apply(ProtoCatalogFile.Builder builder) {
+    public void apply(CatalogState.Builder builder) {
       // Capture parent before removing so we can bump the parent's version
       // (dropping a table mutates the parent's children set).
-      ProtoCatalogFile.TblEntry entry = builder.tableEntry(id);
+      CatalogState.TblEntry entry = builder.tableEntry(id);
       int parentNsId = entry != null ? entry.namespaceId : 0;
       builder.removeTable(id);
       builder.bumpNamespaceVersion(parentNsId);
@@ -1998,13 +1998,13 @@ public class ProtoCodec {
     }
 
     @Override
-    public boolean verify(ProtoCatalogFile.Builder builder) {
+    public boolean verify(CatalogState.Builder builder) {
       int currentVersion = builder.tableVersion(id);
       return currentVersion == version;
     }
 
     @Override
-    public void apply(ProtoCatalogFile.Builder builder) {
+    public void apply(CatalogState.Builder builder) {
       // A table is a pointer table or an inline table, never both: the metadata file is now the
       // table's whole state (its writer gave every snapshot a manifest list file). Inline state
       // left behind would be read again, by an inline writer's delta and by the next checkpoint,
@@ -2024,14 +2024,14 @@ public class ProtoCodec {
     }
 
     @Override
-    public boolean verify(ProtoCatalogFile.Builder builder) {
+    public boolean verify(CatalogState.Builder builder) {
       // Fails if the table changed since the transaction read it (a serializable read)
       int currentVersion = builder.tableVersion(id);
       return currentVersion == version;
     }
 
     @Override
-    public void apply(ProtoCatalogFile.Builder builder) {
+    public void apply(CatalogState.Builder builder) {
       // Read actions don't modify state
     }
   }
@@ -2107,13 +2107,13 @@ public class ProtoCodec {
     }
 
     @Override
-    public boolean verify(ProtoCatalogFile.Builder builder) {
+    public boolean verify(CatalogState.Builder builder) {
       int currentVersion = builder.tableVersion(id);
       return currentVersion == version;
     }
 
     @Override
-    public void apply(ProtoCatalogFile.Builder builder) {
+    public void apply(CatalogState.Builder builder) {
       if (deltaBytes != null) {
         // DELTA mode: apply structured changes to current inline metadata.
         // Decode base, apply delta, re-encode with the SAME codec the base
@@ -2127,7 +2127,7 @@ public class ProtoCodec {
           byte[] updatedMeta = InlineDeltaCodec.applyDeltaWithManifests(
               currentMeta, baseCodec, deltaBytes, builder, id);
           // Rotate the inline metadata without clearing manifest pool/refs.
-          ProtoCatalogFile.TblEntry old = builder.tableEntry(id);
+          CatalogState.TblEntry old = builder.tableEntry(id);
           if (old != null) {
             builder.updateInlineMetadata(id, version + 1, updatedMeta, baseCodecTag);
           }
@@ -2138,7 +2138,7 @@ public class ProtoCodec {
         // below) also clears the pool — that's the correct behavior for
         // pointer-mode eviction, but would silently corrupt an ML-populated
         // table on a non-ML commit (schema evolution, etc.).
-        ProtoCatalogFile.TblEntry old = builder.tableEntry(id);
+        CatalogState.TblEntry old = builder.tableEntry(id);
         if (old != null) {
           builder.updateInlineMetadata(id, version + 1, fullMetadata, fullMetadataCodec);
           // Apply bundled ML pool delta first (if any), so any AddManifest
@@ -2232,7 +2232,7 @@ public class ProtoCodec {
     }
 
     @Override
-    public boolean verify(ProtoCatalogFile.Builder builder) {
+    public boolean verify(CatalogState.Builder builder) {
       if (namespaceVersion >= 0) {
         int currentNsVersion = builder.namespaceVersion(namespaceId);
         if (currentNsVersion != namespaceVersion) {
@@ -2251,7 +2251,7 @@ public class ProtoCodec {
     }
 
     @Override
-    public void apply(ProtoCatalogFile.Builder builder) {
+    public void apply(CatalogState.Builder builder) {
       // The manifest list prefix is always empty: nothing sets one, and a
       // checkpoint copies it.
       builder.addInlineTable(id, namespaceId, name, version, metadata, metadataCodec, "");
@@ -2301,7 +2301,7 @@ public class ProtoCodec {
     }
 
     @Override
-    public boolean verify(ProtoCatalogFile.Builder builder) {
+    public boolean verify(CatalogState.Builder builder) {
       // Source tbl_v must match. Catches concurrent drop / update / rename of
       // the same id.
       int currentVersion = builder.tableVersion(id);
@@ -2327,8 +2327,8 @@ public class ProtoCodec {
     }
 
     @Override
-    public void apply(ProtoCatalogFile.Builder builder) {
-      ProtoCatalogFile.TblEntry old = builder.tableEntry(id);
+    public void apply(CatalogState.Builder builder) {
+      CatalogState.TblEntry old = builder.tableEntry(id);
       int oldNsId = old != null ? old.namespaceId : 0;
       builder.renameTable(id, newNamespaceId, newName, version + 1);
       // Renaming mutates the source ns's children set (table left) and the
@@ -2355,13 +2355,13 @@ public class ProtoCodec {
     }
 
     @Override
-    public boolean verify(ProtoCatalogFile.Builder builder) {
+    public boolean verify(CatalogState.Builder builder) {
       // Unknown actions always verify (forward compatibility)
       return true;
     }
 
     @Override
-    public void apply(ProtoCatalogFile.Builder builder) {
+    public void apply(CatalogState.Builder builder) {
       // Unknown actions don't modify state
     }
   }

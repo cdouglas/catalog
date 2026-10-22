@@ -62,7 +62,7 @@ import org.intentlog.fileio.AtomicFileLog;
  * transaction's actions (catalog.proto's Checkpoint and Intention).
  */
 public class ProtoCatalogFormat
-    implements CatalogFormat<ProtoCatalogFile, ProtoCatalogFormat.Mut> {
+    implements CatalogFormat<CatalogState, ProtoCatalogFormat.Mut> {
 
   public static final byte[] MAGIC = "LCAT".getBytes(StandardCharsets.US_ASCII);
   public static final int FORMAT_VERSION = 2;
@@ -182,17 +182,17 @@ public class ProtoCatalogFormat
   }
 
   @Override
-  public CatalogFile.Mut<ProtoCatalogFile, Mut> empty(InputFile input) {
+  public CatalogFile.Mut<CatalogState, Mut> empty(InputFile input) {
     return new Mut(input, maxAppendCount, maxAppendSize, committedRetentionMs, throttleMinWaitMs);
   }
 
   @Override
-  public CatalogFile.Mut<ProtoCatalogFile, Mut> from(CatalogFile other) {
-    if (!(other instanceof ProtoCatalogFile)) {
-      throw new IllegalArgumentException("Cannot convert to ProtoCatalogFile: " + other);
+  public CatalogFile.Mut<CatalogState, Mut> from(CatalogFile other) {
+    if (!(other instanceof CatalogState)) {
+      throw new IllegalArgumentException("Cannot convert to CatalogState: " + other);
     }
     return new Mut(
-        (ProtoCatalogFile) other,
+        (CatalogState) other,
         maxAppendCount,
         maxAppendSize,
         committedRetentionMs,
@@ -200,8 +200,8 @@ public class ProtoCatalogFormat
   }
 
   @Override
-  public ProtoCatalogFile read(SupportsAtomicOperations fileIO, InputFile catalogLocation) {
-    return ProtoCatalogFile.of(
+  public CatalogState read(SupportsAtomicOperations fileIO, InputFile catalogLocation) {
+    return CatalogState.of(
         runtime(fileIO, catalogLocation.location(), maxAppendCount, maxAppendSize,
             committedRetentionMs, throttleMinWaitMs).read());
   }
@@ -210,7 +210,7 @@ public class ProtoCatalogFormat
    * The intention-log runtime over the catalog file at {@code location}: the catalog's state
    * machine, replicated through one object of a store with conditional writes.
    */
-  static LogRuntime<ProtoCatalogFile, ProtoCatalogFile.Builder, ProtoCodec.CatalogIntention>
+  static LogRuntime<CatalogState, CatalogState.Builder, ProtoCodec.CatalogIntention>
       runtime(
           SupportsAtomicOperations fileIO, String location, int maxAppendCount,
           long maxAppendSize, long committedRetentionMs, long throttleMinWaitMs) {
@@ -223,13 +223,13 @@ public class ProtoCatalogFormat
             throttleMinWaitMs));
   }
 
-  static ProtoCatalogFile readInternal(InputFile location, InputStream in, int fileLength)
+  static CatalogState readInternal(InputFile location, InputStream in, int fileLength)
       throws IOException {
     return replay(location, in, fileLength).build();
   }
 
   /** Decodes the checkpoint and replays the log, returning the builder before {@code build()}. */
-  static ProtoCatalogFile.Builder replay(InputFile location, InputStream in, int fileLength)
+  static CatalogState.Builder replay(InputFile location, InputStream in, int fileLength)
       throws IOException {
     // Read and validate header
     byte[] header = new byte[HEADER_SIZE];
@@ -262,9 +262,9 @@ public class ProtoCatalogFormat
 
     // Replay: GC records advance the committed set's horizon; each intention record applies once,
     // where its preconditions hold.
-    Replay.Result<ProtoCatalogFile.Builder> replayed =
+    Replay.Result<CatalogState.Builder> replayed =
         Replay.replay(new CatalogStateMachine(location), checkpointBytes, records, null);
-    ProtoCatalogFile.Builder builder = replayed.builder();
+    CatalogState.Builder builder = replayed.builder();
     builder.setCatalogUuid(replayed.logId());
     builder.useCommitted(replayed.committed());
     builder.setAppendCount((int) replayed.intentionRecords());
@@ -330,9 +330,9 @@ public class ProtoCatalogFormat
   // ============================================================
 
   /**
-   * Mutable builder for ProtoCatalogFile that accumulates changes and commits atomically.
+   * Mutable builder for CatalogState that accumulates changes and commits atomically.
    */
-  public static class Mut extends CatalogFile.Mut<ProtoCatalogFile, Mut> {
+  public static class Mut extends CatalogFile.Mut<CatalogState, Mut> {
 
     private final ProtoIdManager idManager = new ProtoIdManager();
     private final int maxAppendCount;
@@ -342,21 +342,21 @@ public class ProtoCatalogFormat
     private ProtoCodec.Transaction pendingTransaction;
 
     Mut(InputFile input) {
-      this(ProtoCatalogFile.empty(input));
+      this(CatalogState.empty(input));
     }
 
-    Mut(ProtoCatalogFile other) {
+    Mut(CatalogState other) {
       this(other, DEFAULT_MAX_APPEND_COUNT, DEFAULT_MAX_APPEND_SIZE,
           DEFAULT_COMMITTED_RETENTION_MS, DEFAULT_THROTTLE_MIN_WAIT_MS);
     }
 
     Mut(InputFile input, int maxAppendCount, long maxAppendSize, long committedRetentionMs,
         long throttleMinWaitMs) {
-      this(ProtoCatalogFile.empty(input), maxAppendCount, maxAppendSize, committedRetentionMs,
+      this(CatalogState.empty(input), maxAppendCount, maxAppendSize, committedRetentionMs,
           throttleMinWaitMs);
     }
 
-    Mut(ProtoCatalogFile other, int maxAppendCount, long maxAppendSize,
+    Mut(CatalogState other, int maxAppendCount, long maxAppendSize,
         long committedRetentionMs, long throttleMinWaitMs) {
       super(other);
       this.maxAppendCount = maxAppendCount;
@@ -611,19 +611,19 @@ public class ProtoCatalogFormat
      * to {@link CommitFailedException}, an unknown outcome to {@link CommitStateUnknownException}.
      */
     @Override
-    public ProtoCatalogFile commit(SupportsAtomicOperations fileIO) {
+    public CatalogState commit(SupportsAtomicOperations fileIO) {
       String location = original.location().location();
       List<ProtoCodec.Action> actions = new ArrayList<>();
       buildActions(actions, idManager);
       try {
-        return ProtoCatalogFile.of(
+        return CatalogState.of(
             runtime(fileIO, location, maxAppendCount, maxAppendSize, committedRetentionMs,
                 throttleMinWaitMs)
                 .commit(original.replica(), new ProtoCodec.CatalogIntention(actions)));
       } catch (CommitRejectedException e) {
         switch (e.reason()) {
           case CONFLICT:
-            Replica<ProtoCatalogFile> lostTo = e.state();
+            Replica<CatalogState> lostTo = e.state();
             throw conflict(lostTo.state(), e.getMessage() + " at " + location);
           case CREATE_LOST:
             throw new CommitFailedException(e, "Catalog creation failed: %s exists", location);
@@ -643,7 +643,7 @@ public class ProtoCatalogFormat
      * as renameTable checks it, source first: one that lost a race to the same rename reports the
      * source gone, as it would have after it.
      */
-    private RuntimeException conflict(ProtoCatalogFile state, String message) {
+    private RuntimeException conflict(CatalogState state, String message) {
       for (Map.Entry<TableIdentifier, String> e : tables.entrySet()) {
         if (e.getValue() != null && state.containsTable(e.getKey())) {
           return new AlreadyExistsException("Table already exists: %s", e.getKey());

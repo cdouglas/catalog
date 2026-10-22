@@ -44,7 +44,7 @@ class TestCommittedTransactions {
 
   @Test
   void fullCheckpointRoundTripWithCommittedSet() throws IOException {
-    // End-to-end: build a full ProtoCatalogFile with committed txns, encode
+    // End-to-end: build a full CatalogState with committed txns, encode
     // through the checkpoint codec (not just the inner sub-message), decode,
     // verify set equality. This exercises the wire-level integration.
     Random rand = new Random(0xFEEDFACE);
@@ -53,23 +53,23 @@ class TestCommittedTransactions {
     for (int i = 0; i < 25; i++) {
       txns.add(UuidV7.newUuidV7(base + i * 31, rand));
     }
-    ProtoCatalogFile.Builder b = ProtoCatalogFile.builder(LOC)
+    CatalogState.Builder b = CatalogState.builder(LOC)
         .setCatalogUuid(UuidV7.newUuidV7(base, rand))
         .setNextNamespaceId(1)
         .setNextTableId(1);
     for (UUID u : txns) {
       b.addCommittedTransaction(u);
     }
-    ProtoCatalogFile original = b.rebuildLookups().build();
+    CatalogState original = b.rebuildLookups().build();
 
     ProtoCatalogFormat.ProtoIdManager idManager = new ProtoCatalogFormat.ProtoIdManager();
     idManager.setGlobals(original.nextNamespaceId(), original.nextTableId());
     ProtoCatalogFormat.Mut mut = new ProtoCatalogFormat.Mut(original);
     byte[] checkpointBytes = ProtoCodec.encodeCheckpoint(original, mut, idManager);
 
-    ProtoCatalogFile.Builder decodedBuilder = ProtoCatalogFile.builder(LOC);
+    CatalogState.Builder decodedBuilder = CatalogState.builder(LOC);
     ProtoCodec.decodeCheckpoint(checkpointBytes, decodedBuilder);
-    ProtoCatalogFile decoded = decodedBuilder.build();
+    CatalogState decoded = decodedBuilder.build();
 
     assertThat(new HashSet<>(decoded.committedTransactions())).isEqualTo(txns);
   }

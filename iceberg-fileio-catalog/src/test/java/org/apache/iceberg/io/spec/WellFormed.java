@@ -21,7 +21,7 @@ package org.apache.iceberg.io.spec;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.io.CatalogFile;
-import org.apache.iceberg.io.ProtoCatalogFile;
+import org.apache.iceberg.io.CatalogState;
 
 /**
  * Structural well-formedness check for P4 ({@link TestInvariantProperties}).
@@ -51,7 +51,7 @@ import org.apache.iceberg.io.ProtoCatalogFile;
  * pool and per-snapshot sentinel list are stored in package-private fields
  * ({@code allManifestPrefixes}, {@code allInlineMetadata}, etc.) that are not
  * accessible from the {@code CatalogFile} public API. Rather than adding new
- * production accessors, we perform the check via {@link ProtoCatalogFile}'s
+ * production accessors, we perform the check via {@link CatalogState}'s
  * existing public {@code isInlineTable(TableIdentifier)} and
  * {@code inlineMetadata(TableIdentifier)} which confirm that the inline byte
  * blob is non-empty for each inline table — a necessary (though not
@@ -137,14 +137,14 @@ final class WellFormed {
    * {@code TblEntry.metadataLocation}). If {@code isInlineTable} is false,
    * location must be non-null.
    *
-   * <p>Note: For ProtoCatalogFile, inline tables are stored with
+   * <p>Note: For CatalogState, inline tables are stored with
    * {@code metadataLocation = null} in tableById, so location() returns null.
    * Non-inline tables must have a non-null location. This is the disjointness
    * invariant.
    */
   private static boolean inlinePointerDisjoint(CatalogFile state) {
-    if (!(state instanceof ProtoCatalogFile)) {
-      // Only ProtoCatalogFile enforces this layout; skip for other impls.
+    if (!(state instanceof CatalogState)) {
+      // Only CatalogState enforces this layout; skip for other impls.
       return true;
     }
     for (TableIdentifier tbl : state.tables()) {

@@ -195,7 +195,7 @@ public class FormatExplorerFixtures {
                 + "addressable by name, but its version orders top-level creates and drops."),
         state -> {
           expect(state.namespaceId(Namespace.of("analytics")), 1, "analytics id");
-          expect(state.namespaceVersion(ProtoCatalogFile.ROOT_ID), 1, "root version");
+          expect(state.namespaceVersion(CatalogState.ROOT_ID), 1, "root version");
         });
   }
 
@@ -229,7 +229,7 @@ public class FormatExplorerFixtures {
     boolean structural = codec == InlineMetadataCodecs.TAG_STRUCTURAL;
     String table = structural ? "products" : "orders";
     TableIdentifier ident = TableIdentifier.of(WAREHOUSE, table);
-    ProtoCatalogFile base = warehouse(20 + codec);
+    CatalogState base = warehouse(20 + codec);
     TableMetadata meta =
         tableMetadata(
             structural
@@ -270,7 +270,7 @@ public class FormatExplorerFixtures {
             "s3://lake/warehouse/events",
             Map.of("table-name", "events"));
     byte[] metadata = InlineMetadataCodecs.JSON_GZIP.encode(meta);
-    ProtoCatalogFile base =
+    CatalogState base =
         Log.of(warehouse(40))
             .append(txn(41),
                 mut -> mut.createTableInline(events, metadata, InlineMetadataCodecs.TAG_JSON_GZIP),
@@ -311,7 +311,7 @@ public class FormatExplorerFixtures {
             "s3://lake/warehouse/orders",
             Map.of("table-name", "orders", "commit.retry.num-retries", "4"));
     byte[] metadata = InlineMetadataCodecs.JSON_GZIP.encode(meta);
-    ProtoCatalogFile base =
+    CatalogState base =
         Log.of(warehouse(45))
             .append(txn(46),
                 mut -> mut.createTableInline(orders, metadata, InlineMetadataCodecs.TAG_JSON_GZIP),
@@ -372,7 +372,7 @@ public class FormatExplorerFixtures {
   private static Scenario pointerMultiTableConflictRetry() {
     TableIdentifier a = TableIdentifier.of(WAREHOUSE, "A");
     TableIdentifier b = TableIdentifier.of(WAREHOUSE, "B");
-    ProtoCatalogFile base =
+    CatalogState base =
         Log.of(warehouse(50))
             .append(txn(51), mut -> mut.createTable(a, "s3://lake/warehouse/A/v1.metadata.json")
                 .createTable(b, "s3://lake/warehouse/B/v1.metadata.json"), null)
@@ -387,7 +387,7 @@ public class FormatExplorerFixtures {
             + "UpdateTableLocation(B, version = 1). Rejected: A is at version 2, and a "
             + "transaction applies all its actions or none, so B is not updated either. The "
             + "record stays in the log; replay skips it.");
-    ProtoCatalogFile afterT1 = log.state(); // T2 was rejected
+    CatalogState afterT1 = log.state(); // T2 was rejected
     log.append(afterT1, txn(54),
         mut -> mut.updateTable(a, "s3://lake/warehouse/A/v3.metadata.json")
             .updateTable(b, "s3://lake/warehouse/B/v2.metadata.json"),
@@ -420,7 +420,7 @@ public class FormatExplorerFixtures {
             Map.of("table-name", "B"));
     byte[] aBytes = InlineMetadataCodecs.JSON_GZIP.encode(aMeta);
     byte[] bBytes = InlineMetadataCodecs.JSON_GZIP.encode(bMeta);
-    ProtoCatalogFile base =
+    CatalogState base =
         Log.of(warehouse(60))
             .append(txn(61),
                 mut -> mut.createTableInline(a, aBytes, InlineMetadataCodecs.TAG_JSON_GZIP)
@@ -448,7 +448,7 @@ public class FormatExplorerFixtures {
             + "UpdateTableInline(B, version = 1). Rejected as a whole: A is at version 2. B's "
             + "delta, valid on its own, never lands; this record is the only place its "
             + "snapshot appears, and the next CAS write drops it.");
-    ProtoCatalogFile afterT1 = log.state(); // T2 was rejected
+    CatalogState afterT1 = log.state(); // T2 was rejected
     byte[] t3a = writerDelta(afterT1, a, appendToMain(s3a, s1, "A/metadata/snap-3.avro", 120_000L),
         PINNED_TS + 180_000L);
     byte[] t3b = writerDelta(afterT1, b, appendToMain(s3b, null, "B/metadata/snap-3.avro", 180_000L),
@@ -486,7 +486,7 @@ public class FormatExplorerFixtures {
   private static Scenario concurrentCreatesBoundAtReplay() {
     Namespace sales = Namespace.of("sales");
     Namespace ops = Namespace.of("ops");
-    ProtoCatalogFile base =
+    CatalogState base =
         Log.of(emptyCatalog())
             .append(txn(70), mut -> mut.createNamespace(sales).createNamespace(ops), null)
             .state();
@@ -528,7 +528,7 @@ public class FormatExplorerFixtures {
     Namespace prod = Namespace.of("prod");
     TableIdentifier from = TableIdentifier.of(staging, "daily");
     TableIdentifier to = TableIdentifier.of(prod, "daily_v2");
-    ProtoCatalogFile base =
+    CatalogState base =
         Log.of(emptyCatalog())
             .append(txn(80), mut -> mut.createNamespace(staging).createNamespace(prod)
                 .createTable(from, "s3://lake/staging/daily/v1.metadata.json"), null)
@@ -581,7 +581,7 @@ public class FormatExplorerFixtures {
                 new InlineDeltaCodec.AddManifestUpdate(s1, m1, "", 0),
                 new InlineDeltaCodec.AddManifestUpdate(s1, m2, "", 1)),
             PINNED_TS + 60_000L);
-    ProtoCatalogFile afterFirst =
+    CatalogState afterFirst =
         Log.of(warehouse(90))
             .append(txn(91),
                 mut -> mut.createTableInline(clicks, metadata, InlineMetadataCodecs.TAG_JSON_GZIP),
@@ -636,7 +636,7 @@ public class FormatExplorerFixtures {
     history.append(txn(104),
         mut -> mut.updateTable(events, "s3://lake/warehouse/bronze/events/v2.metadata.json"),
         null);
-    ProtoCatalogFile base = history.state();
+    CatalogState base = history.state();
     long watermark = UuidV7.timestampMs(txn(101));
     Log log = Log.checkpoint(base)
         .gc(watermark,
@@ -690,12 +690,12 @@ public class FormatExplorerFixtures {
     }
 
     /** A file of a checkpoint of {@code state} and no records. */
-    static Log checkpoint(ProtoCatalogFile state) {
+    static Log checkpoint(CatalogState state) {
       return new Log(header(checkpointBytes(state)));
     }
 
     /** A file of a checkpoint of {@code state}, to build a later state with records. */
-    static Log of(ProtoCatalogFile state) {
+    static Log of(CatalogState state) {
       return checkpoint(state);
     }
 
@@ -703,7 +703,7 @@ public class FormatExplorerFixtures {
      * A CAS write of the change {@code change} makes to {@code base}: a checkpoint of {@code
      * base} and the change's record.
      */
-    static Log cas(ProtoCatalogFile base, UUID id, Consumer<ProtoCatalogFormat.Mut> change,
+    static Log cas(CatalogState base, UUID id, Consumer<ProtoCatalogFormat.Mut> change,
         String note) {
       return checkpoint(base).append(base, id, change, note);
     }
@@ -719,7 +719,7 @@ public class FormatExplorerFixtures {
     }
 
     /** Appends the record of a writer that read {@code snapshot}. */
-    Log append(ProtoCatalogFile snapshot, UUID id, Consumer<ProtoCatalogFormat.Mut> change,
+    Log append(CatalogState snapshot, UUID id, Consumer<ProtoCatalogFormat.Mut> change,
         String note) {
       ProtoCatalogFormat.Mut mut = new ProtoCatalogFormat.Mut(snapshot);
       change.accept(mut);
@@ -742,17 +742,17 @@ public class FormatExplorerFixtures {
     }
 
     /** The state the file replays to. */
-    ProtoCatalogFile state() {
+    CatalogState state() {
       return replay(file);
     }
 
     Scenario scenario(String name, String description, List<String> fileNotes,
-        Consumer<ProtoCatalogFile> check) {
+        Consumer<CatalogState> check) {
       return scenario(name, description, fileNotes, List.of(), check);
     }
 
     Scenario scenario(String name, String description, List<String> fileNotes,
-        List<StructuralView> views, Consumer<ProtoCatalogFile> check) {
+        List<StructuralView> views, Consumer<CatalogState> check) {
       List<Note> all = new ArrayList<>(notes);
       for (String note : fileNotes) {
         all.add(new Note(-1, -1, note));
@@ -761,7 +761,7 @@ public class FormatExplorerFixtures {
     }
   }
 
-  private static ProtoCatalogFile replay(byte[] file) {
+  private static CatalogState replay(byte[] file) {
     try {
       return ProtoCatalogFormat.readInternal(LOCATION, new ByteArrayInputStream(file), file.length);
     } catch (IOException e) {
@@ -778,7 +778,7 @@ public class FormatExplorerFixtures {
     return out.toByteArray();
   }
 
-  private static byte[] checkpointBytes(ProtoCatalogFile state) {
+  private static byte[] checkpointBytes(CatalogState state) {
     ProtoCatalogFormat.ProtoIdManager ids = new ProtoCatalogFormat.ProtoIdManager();
     ids.setGlobals(state.nextNamespaceId(), state.nextTableId());
     return ProtoCodec.encodeCheckpoint(state, new ProtoCatalogFormat.Mut(state), ids);
@@ -792,8 +792,8 @@ public class FormatExplorerFixtures {
     out.write(value);
   }
 
-  private static ProtoCatalogFile emptyCatalog() {
-    return ProtoCatalogFile.builder(LOCATION)
+  private static CatalogState emptyCatalog() {
+    return CatalogState.builder(LOCATION)
         .setCatalogUuid(CATALOG_UUID)
         .setNextNamespaceId(1)
         .setNextTableId(1)
@@ -801,7 +801,7 @@ public class FormatExplorerFixtures {
   }
 
   /** A catalog holding namespace {@code warehouse}, created by an initialized catalog. */
-  private static ProtoCatalogFile warehouse(int seq) {
+  private static CatalogState warehouse(int seq) {
     return Log.cas(emptyCatalog(), txn(1000 + seq), mut -> {}, null)
         .append(txn(2000 + seq), mut -> mut.createNamespace(WAREHOUSE), null)
         .state();
@@ -825,7 +825,7 @@ public class FormatExplorerFixtures {
    * FileIOCatalog} stages it. Fails if the updates do not commit, or if replay of the computed
    * delta does not produce the same metadata.
    */
-  private static byte[] writerDelta(ProtoCatalogFile snapshot, TableIdentifier table,
+  private static byte[] writerDelta(CatalogState snapshot, TableIdentifier table,
       List<InlineDeltaCodec.DeltaUpdate> updates, long lastUpdatedMillis) {
     byte[] intended = InlineDeltaCodec.encodeDelta(updates, lastUpdatedMillis);
     TableMetadata after =
@@ -841,7 +841,7 @@ public class FormatExplorerFixtures {
    * if the commit goes in full mode, or if replay of the delta does not produce {@code after}.
    */
   private static byte[] writerDelta(
-      ProtoCatalogFile snapshot, TableIdentifier table, TableMetadata after) {
+      CatalogState snapshot, TableIdentifier table, TableMetadata after) {
     TableMetadata before = inlineMetadata(snapshot, table);
     List<InlineDeltaCodec.DeltaUpdate> delta =
         InlineDeltaCodec.computeDelta(before, after, snapshot.manifestListPrefix(
@@ -905,14 +905,14 @@ public class FormatExplorerFixtures {
    * {@code table}'s metadata as replay decodes it to apply a delta: under the synthetic location
    * that the committed metadata's log then names as its previous file.
    */
-  private static TableMetadata replayBase(ProtoCatalogFile state, TableIdentifier table) {
+  private static TableMetadata replayBase(CatalogState state, TableIdentifier table) {
     int id = state.tableId(table);
     byte[] bytes = state.inlineMetadata(id);
     return InlineMetadataCodecs.byTag(state.inlineMetadataCodec(id))
         .decodeFull(bytes, "inline://#" + Integer.toHexString(Arrays.hashCode(bytes)));
   }
 
-  private static TableMetadata inlineMetadata(ProtoCatalogFile state, TableIdentifier table) {
+  private static TableMetadata inlineMetadata(CatalogState state, TableIdentifier table) {
     int id = state.tableId(table);
     return InlineMetadataCodecs.byTag(state.inlineMetadataCodec(id))
         .decodeFull(state.inlineMetadata(id), null);
@@ -1217,10 +1217,10 @@ public class FormatExplorerFixtures {
      */
     final List<StructuralView> structuralViews;
     /** Checks the state the file replays to against the scenario's notes. */
-    final Consumer<ProtoCatalogFile> check;
+    final Consumer<CatalogState> check;
 
     Scenario(String name, String description, byte[] bytes, List<Note> notes,
-        List<StructuralView> structuralViews, Consumer<ProtoCatalogFile> check) {
+        List<StructuralView> structuralViews, Consumer<CatalogState> check) {
       this.name = name;
       this.description = description;
       this.bytes = bytes;

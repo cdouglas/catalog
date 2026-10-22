@@ -19,14 +19,14 @@
 package org.apache.iceberg.io.spec;
 
 import org.apache.iceberg.io.CatalogFile;
-import org.apache.iceberg.io.ProtoCatalogFile;
-import org.apache.iceberg.io.ProtoCatalogFormatTestSupport;
+import org.apache.iceberg.io.CatalogState;
+import org.apache.iceberg.io.CatalogTestSupport;
 import org.apache.iceberg.io.ProtoCodec;
 
 /**
  * A catalog state that is re-canonicalised after every action: each
  * {@link #apply} applies the action through the production
- * {@link ProtoCatalogFile.Builder} path and then round-trips the result through
+ * {@link CatalogState.Builder} path and then round-trips the result through
  * encode→decode, so the held state is exactly what a reader of the encoded
  * bytes would see.
  *
@@ -53,16 +53,16 @@ final class CanonicalState {
    * checked {@code action.verify(builder)} first.
    */
   CanonicalState apply(ProtoCodec.Action action) {
-    ProtoCatalogFile.Builder builder = SpecUtils.stateToBuilder((ProtoCatalogFile) state);
+    CatalogState.Builder builder = SpecUtils.stateToBuilder((CatalogState) state);
     action.apply(builder);
-    ProtoCatalogFile next = builder.build();
+    CatalogState next = builder.build();
 
-    byte[] canonical = ProtoCatalogFormatTestSupport.encodeFullFile(next);
-    return new CanonicalState(ProtoCatalogFormatTestSupport.decodeFullFile(canonical));
+    byte[] canonical = CatalogTestSupport.encodeFullFile(next);
+    return new CanonicalState(CatalogTestSupport.decodeFullFile(canonical));
   }
 
   /** Encodes the current state to full LCAT wire bytes. */
   byte[] encode() {
-    return ProtoCatalogFormatTestSupport.encodeFullFile((ProtoCatalogFile) state);
+    return CatalogTestSupport.encodeFullFile((CatalogState) state);
   }
 }

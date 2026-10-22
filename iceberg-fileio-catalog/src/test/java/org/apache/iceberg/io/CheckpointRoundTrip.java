@@ -106,8 +106,8 @@ public final class CheckpointRoundTrip {
     if (before == null || before.length == 0) {
       return null;
     }
-    ProtoCatalogFile replayed = ProtoCatalogFormatTestSupport.decodeFullFile(before);
-    ProtoCatalogFile checkpoint = ProtoCatalogFormatTestSupport.decodeCheckpoint(after).build();
+    CatalogState replayed = CatalogTestSupport.decodeFullFile(before);
+    CatalogState checkpoint = CatalogTestSupport.decodeCheckpoint(after).build();
     SortedMap<String, String> expected = contents(replayed);
     SortedMap<String, String> actual = contents(checkpoint);
     if (expected.equals(actual)) {
@@ -141,7 +141,7 @@ public final class CheckpointRoundTrip {
     if (rejected != null) {
       return rejected;
     }
-    return difference(ProtoCatalogFormatTestSupport.decodeFullFile(catalogFile));
+    return difference(CatalogTestSupport.decodeFullFile(catalogFile));
   }
 
   /**
@@ -150,9 +150,9 @@ public final class CheckpointRoundTrip {
    * the record is at or below the committed set's horizon.
    */
   static String compactionRecordRejected(byte[] catalogFile) {
-    ProtoCatalogFile.Builder checkpoint = ProtoCatalogFormatTestSupport.decodeCheckpoint(catalogFile);
+    CatalogState.Builder checkpoint = CatalogTestSupport.decodeCheckpoint(catalogFile);
     ProtoCodec.Transaction own = null;
-    for (LogEnvelope.Record record : ProtoCatalogFormatTestSupport.decodeLogRecords(catalogFile)) {
+    for (LogEnvelope.Record record : CatalogTestSupport.decodeLogRecords(catalogFile)) {
       if (!record.isAdvanceHorizon()) {
         own = ProtoCodec.decodeTransaction(record.id(), record.intention());
         break;
@@ -176,7 +176,7 @@ public final class CheckpointRoundTrip {
         "the record that follows the checkpoint, %s, holds on it, but replay rejects it: it is at "
             + "or below the committed set's horizon (%d)",
         own.id(),
-        ProtoCatalogFormatTestSupport.decodeFullFile(catalogFile).highestDroppedTimestampMs());
+        CatalogTestSupport.decodeFullFile(catalogFile).highestDroppedTimestampMs());
   }
 
   private static void dump(byte[] catalogFile) {
@@ -193,12 +193,12 @@ public final class CheckpointRoundTrip {
   }
 
   /** How {@code state} and a checkpoint of it differ, or null if they do not. */
-  public static String difference(ProtoCatalogFile state) {
-    ProtoCatalogFile checkpoint;
+  public static String difference(CatalogState state) {
+    CatalogState checkpoint;
     try {
       checkpoint =
-          ProtoCatalogFormatTestSupport.decodeFullFile(
-              ProtoCatalogFormatTestSupport.encodeFullFile(state));
+          CatalogTestSupport.decodeFullFile(
+              CatalogTestSupport.encodeFullFile(state));
     } catch (RuntimeException e) {
       return "a checkpoint of the state does not decode: " + e;
     }
@@ -224,13 +224,13 @@ public final class CheckpointRoundTrip {
   }
 
   /** Everything a checkpoint of {@code file} holds, by item. */
-  static SortedMap<String, String> contents(ProtoCatalogFile file) {
+  static SortedMap<String, String> contents(CatalogState file) {
     SortedMap<String, String> items = new TreeMap<>();
     items.put("catalog uuid", String.valueOf(file.uuid()));
     items.put("next ids", file.nextNamespaceId() + "/" + file.nextTableId());
     items.put("committed transactions", fingerprint(file.committedTransactionsBytes()));
-    for (Map.Entry<Integer, ProtoCatalogFile.NsEntry> e : file.namespaceById().entrySet()) {
-      ProtoCatalogFile.NsEntry ns = e.getValue();
+    for (Map.Entry<Integer, CatalogState.NsEntry> e : file.namespaceById().entrySet()) {
+      CatalogState.NsEntry ns = e.getValue();
       items.put(
           "namespace " + e.getKey(),
           String.format("parent=%d name=%s version=%d", ns.parentId, ns.name, ns.version));
@@ -241,8 +241,8 @@ public final class CheckpointRoundTrip {
     for (Namespace ns : file.namespaces()) {
       items.put("namespace name " + ns, String.valueOf(file.namespaceId(ns)));
     }
-    for (Map.Entry<Integer, ProtoCatalogFile.TblEntry> e : file.tableById().entrySet()) {
-      ProtoCatalogFile.TblEntry t = e.getValue();
+    for (Map.Entry<Integer, CatalogState.TblEntry> e : file.tableById().entrySet()) {
+      CatalogState.TblEntry t = e.getValue();
       items.put(
           "table " + e.getKey(),
           String.format(

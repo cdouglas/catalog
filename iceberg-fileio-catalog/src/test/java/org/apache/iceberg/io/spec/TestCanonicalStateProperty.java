@@ -28,15 +28,15 @@ import net.jqwik.api.Property;
 import net.jqwik.api.Provide;
 import net.jqwik.api.constraints.Size;
 import org.apache.iceberg.io.CatalogFile;
-import org.apache.iceberg.io.ProtoCatalogFile;
-import org.apache.iceberg.io.ProtoCatalogFormatTestSupport;
+import org.apache.iceberg.io.CatalogState;
+import org.apache.iceberg.io.CatalogTestSupport;
 import org.apache.iceberg.io.ProtoCodec;
 
 /**
  * P6 — Builder state survives the codec.
  *
  * <p>Replays a list of actions two ways from the same seed: incrementally on a
- * {@link ProtoCatalogFile.Builder} ({@code stateToBuilder → verify → apply →
+ * {@link CatalogState.Builder} ({@code stateToBuilder → verify → apply →
  * build}), and on a {@link CanonicalState}, which additionally encodes and
  * decodes after every step. Both use the same action code, so this is a check
  * that encode/decode is stable along action sequences, not a comparison against
@@ -55,11 +55,11 @@ class TestCanonicalStateProperty {
       @ForAll @From("catalogStates") CatalogFile seed,
       @ForAll @Size(min = 1, max = 6) List<Long> seeds) {
     CanonicalState canonical = CanonicalState.from(seed);
-    ProtoCatalogFile real = (ProtoCatalogFile) seed;
+    CatalogState real = (CatalogState) seed;
 
     for (long actionSeed : seeds) {
       ProtoCodec.Action a = CatalogStateGenerators.action(real, new java.util.Random(actionSeed));
-      ProtoCatalogFile.Builder builder = SpecUtils.stateToBuilder(real);
+      CatalogState.Builder builder = SpecUtils.stateToBuilder(real);
       if (!a.verify(builder)) {
         continue;
       }
@@ -70,7 +70,7 @@ class TestCanonicalStateProperty {
       canonical = canonical.apply(a);
     }
 
-    assertThat(canonical.encode()).isEqualTo(ProtoCatalogFormatTestSupport.encodeFullFile(real));
+    assertThat(canonical.encode()).isEqualTo(CatalogTestSupport.encodeFullFile(real));
   }
 
   @Provide

@@ -1897,7 +1897,7 @@ class TestCatalogFaultProperties {
     private Model actual() {
       checkCheckpoints();
       Model tables = new Model();
-      ProtoCatalogFile file =
+      CatalogState file =
           new ProtoCatalogFormat(PROPERTIES).read(io, io.newInputFile(CATALOG_LOCATION));
       List<TableIdentifier> ids = new ArrayList<>();
       for (Namespace ns : checker.listNamespaces(Namespace.empty())) {
