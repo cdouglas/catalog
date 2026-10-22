@@ -54,6 +54,7 @@ import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+import org.intentlog.Intention;
 import org.intentlog.wire.LogEnvelope;
 import org.intentlog.wire.UuidV7;
 
@@ -274,6 +275,16 @@ public class ProtoCodec {
       ProtoCatalogFile original,
       CatalogFile.Mut<ProtoCatalogFile, ?> mut,
       ProtoCatalogFormat.ProtoIdManager idManager) {
+    // The catalog's id and committed transactions (a compressed UUIDv7 set) are the log's: the
+    // envelope (log.proto LogCheckpoint) carries them, and the catalog's Checkpoint as its state.
+    return LogEnvelope.encodeCheckpoint(
+        original.uuid(), original.committedTransactionsBytes(),
+        encodeCheckpointState(original, idManager));
+  }
+
+  /** Encodes the catalog's state, the payload of a checkpoint (catalog.proto Checkpoint). */
+  public static byte[] encodeCheckpointState(
+      ProtoCatalogFile original, ProtoCatalogFormat.ProtoIdManager idManager) {
     try {
       ByteArrayOutputStream out = new ByteArrayOutputStream();
 
@@ -324,10 +335,7 @@ public class ProtoCodec {
         }
       }
 
-      // The catalog's id and committed transactions (a compressed UUIDv7 set) are the log's:
-      // the envelope (log.proto LogCheckpoint) carries them, and this checkpoint as its state.
-      return LogEnvelope.encodeCheckpoint(
-          original.uuid(), original.committedTransactionsBytes(), out.toByteArray());
+      return out.toByteArray();
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
@@ -341,8 +349,13 @@ public class ProtoCodec {
     LogEnvelope.Checkpoint envelope = LogEnvelope.decodeCheckpoint(bytes);
     builder.setCatalogUuid(envelope.logId());
     builder.setCommittedTransactionsBytes(envelope.committed());
+    decodeCheckpointState(envelope.state(), builder);
+  }
+
+  /** Decodes the catalog's state, the payload of a checkpoint (catalog.proto Checkpoint). */
+  public static void decodeCheckpointState(byte[] state, ProtoCatalogFile.Builder builder) {
     try {
-      ByteArrayInputStream in = new ByteArrayInputStream(envelope.state());
+      ByteArrayInputStream in = new ByteArrayInputStream(state);
       boolean sawMinReaderVersion = false;
       while (in.available() > 0) {
         int tag = readVarint(in);
@@ -666,13 +679,17 @@ public class ProtoCodec {
    * record's intention (the catalog's Intention).
    */
   public static byte[] encodeTransaction(Transaction txn) {
+    return LogEnvelope.encodeRecord(txn.id(), encodeIntention(txn.intention()));
+  }
+
+  /** Encodes an intention, the payload of a log record (catalog.proto Intention). */
+  public static byte[] encodeIntention(CatalogIntention intention) {
     try {
       ByteArrayOutputStream out = new ByteArrayOutputStream();
-      for (Action action : txn.actions()) {
-        byte[] actionBytes = encodeAction(action);
-        writeLengthDelimited(out, INTENTION_ACTIONS, actionBytes);
+      for (Action action : intention.actions()) {
+        writeLengthDelimited(out, INTENTION_ACTIONS, encodeAction(action));
       }
-      return LogEnvelope.encodeRecord(txn.id(), out.toByteArray());
+      return out.toByteArray();
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
@@ -688,6 +705,11 @@ public class ProtoCodec {
 
   /** Decodes the transaction of id {@code id} from its intention (catalog.proto Intention). */
   public static Transaction decodeTransaction(UUID id, byte[] intention) {
+    return new Transaction(id, decodeIntention(intention));
+  }
+
+  /** Decodes an intention, the payload of a log record (catalog.proto Intention). */
+  public static CatalogIntention decodeIntention(byte[] intention) {
     try {
       ByteArrayInputStream in = new ByteArrayInputStream(intention);
       List<Action> actions = new ArrayList<>();
@@ -704,7 +726,7 @@ public class ProtoCodec {
         }
       }
 
-      return new Transaction(id, actions);
+      return new CatalogIntention(actions);
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
@@ -1486,15 +1508,20 @@ public class ProtoCodec {
   // ============================================================
 
   /**
-   * Represents a decoded transaction with verify/apply semantics.
+   * A transaction: its id, which the log's committed set dedups, and its intention, the actions
+   * replay verifies and applies.
    */
   public static class Transaction {
     private final UUID id;
-    private final List<Action> actions;
+    private final CatalogIntention intention;
 
     public Transaction(UUID id, List<Action> actions) {
+      this(id, new CatalogIntention(actions));
+    }
+
+    public Transaction(UUID id, CatalogIntention intention) {
       this.id = id;
-      this.actions = actions;
+      this.intention = intention;
     }
 
     public static Transaction from(
@@ -1517,8 +1544,12 @@ public class ProtoCodec {
       return id;
     }
 
+    public CatalogIntention intention() {
+      return intention;
+    }
+
     public List<Action> actions() {
-      return actions;
+      return intention.actions();
     }
 
     /**
@@ -1530,9 +1561,38 @@ public class ProtoCodec {
      * read-time behavior as any other rejected transaction.
      */
     public boolean verify(ProtoCatalogFile.Builder builder) {
-      if (!UuidV7.isV7(id)) {
-        return false;
-      }
+      return UuidV7.isV7(id) && intention.verify(builder);
+    }
+
+    /** Applies this transaction's intention (see {@link CatalogIntention#apply}). */
+    public void apply(ProtoCatalogFile.Builder builder) {
+      intention.apply(builder);
+    }
+  }
+
+  /**
+   * The catalog's intention: a transaction's actions. Each names the versions it depends on; replay
+   * applies the whole intention where its record lands if every action's preconditions hold there,
+   * binding the transaction's late-bound ids to real ones.
+   */
+  public static class CatalogIntention implements Intention<ProtoCatalogFile.Builder> {
+    private final List<Action> actions;
+
+    public CatalogIntention(List<Action> actions) {
+      this.actions = actions;
+    }
+
+    public List<Action> actions() {
+      return actions;
+    }
+
+    /**
+     * Whether every action's preconditions hold on the state before the intention: each late-bound
+     * reference follows the create that defines it, no action depends on what another drops, and
+     * each action verifies.
+     */
+    @Override
+    public boolean verify(ProtoCatalogFile.Builder builder) {
       // Every late-bound reference must follow the create that defines it;
       // otherwise apply could not bind it. Reject the record, don't fail the read.
       IdBinding ids = new IdBinding(builder);
@@ -1616,9 +1676,10 @@ public class ProtoCodec {
     }
 
     /**
-     * Applies all actions in this transaction to the builder, binding late-bound
-     * ids to real ids as their creates are applied.
+     * Applies all actions to the builder, binding late-bound ids to real ids as their creates are
+     * applied.
      */
+    @Override
     public void apply(ProtoCatalogFile.Builder builder) {
       IdBinding ids = new IdBinding(builder);
       for (Action action : actions) {

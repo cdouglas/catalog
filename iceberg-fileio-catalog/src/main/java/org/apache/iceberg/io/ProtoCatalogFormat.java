@@ -26,6 +26,7 @@ import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -39,6 +40,7 @@ import org.apache.iceberg.exceptions.CommitStateUnknownException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.intentlog.DedupHorizonExceededException;
+import org.intentlog.Replay;
 import org.intentlog.wire.LogEnvelope;
 import org.intentlog.wire.UuidV7;
 
@@ -226,50 +228,33 @@ public class ProtoCatalogFormat
           "Unsupported format version: " + version + ", expected: " + FORMAT_VERSION);
     }
 
-    // Read checkpoint
+    // Read the checkpoint and the records after it
     int checkpointLen = readVarint(in);
     byte[] checkpointBytes = new byte[checkpointLen];
     IOUtil.readFully(in, checkpointBytes, 0, checkpointLen);
-    ProtoCatalogFile.Builder builder = ProtoCatalogFile.builder(location);
-    ProtoCodec.decodeCheckpoint(checkpointBytes, builder);
-
-    // Read and apply transaction log
     int logStart = HEADER_SIZE + varintSize(checkpointLen) + checkpointLen;
     int remaining = fileLength - logStart;
-    int appendCount = 0;
+    List<byte[]> records = new ArrayList<>();
     if (remaining > 0) {
       byte[] logBytes = new byte[remaining];
       IOUtil.readFully(in, logBytes, 0, remaining);
       ByteArrayInputStream logStream = new ByteArrayInputStream(logBytes);
-
       while (logStream.available() > 0) {
-        int txnLen = readVarint(logStream);
-        byte[] txnBytes = new byte[txnLen];
-        IOUtil.readFully(logStream, txnBytes, 0, txnLen);
-
-        LogEnvelope.Record record = LogEnvelope.decodeRecord(txnBytes);
-        if (record.isAdvanceHorizon()) {
-          // A GC of the committed set: the only thing that moves its horizon. Not counted in
-          // appendCount, which counts the commits the log holds.
-          builder.advanceHorizon(record.watermarkMs());
-          continue;
-        }
-        appendCount++;
-
-        ProtoCodec.Transaction txn = ProtoCodec.decodeTransaction(record.id(), record.intention());
-        if (!builder.mayApply(txn.id())) {
-          // Already applied (a retry), or its id is at or below the committed set's GC horizon,
-          // where the set cannot tell a retry of an aged-out commit from a new one.
-          continue;
-        }
-        if (txn.verify(builder)) {
-          txn.apply(builder);
-          builder.addCommittedTransaction(txn.id());
-        }
+        int recordLen = readVarint(logStream);
+        byte[] recordBytes = new byte[recordLen];
+        IOUtil.readFully(logStream, recordBytes, 0, recordLen);
+        records.add(recordBytes);
       }
     }
-    builder.setAppendCount(appendCount);
 
+    // Replay: GC records advance the committed set's horizon; each intention record applies once,
+    // where its preconditions hold.
+    Replay.Result<ProtoCatalogFile.Builder> replayed =
+        Replay.replay(new CatalogStateMachine(location), checkpointBytes, records, null);
+    ProtoCatalogFile.Builder builder = replayed.builder();
+    builder.setCatalogUuid(replayed.logId());
+    builder.useCommitted(replayed.committed());
+    builder.setAppendCount((int) replayed.intentionRecords());
     return builder;
   }
 

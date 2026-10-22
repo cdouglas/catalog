@@ -35,6 +35,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.intentlog.DedupHorizonExceededException;
 import org.intentlog.CommittedSet;
+import org.intentlog.StateMachine;
 import org.intentlog.wire.UuidV7;
 
 /**
@@ -474,7 +475,7 @@ public class ProtoCatalogFile extends CatalogFile {
   // Builder
   // ============================================================
 
-  public static class Builder {
+  public static class Builder implements StateMachine.Builder<ProtoCatalogFile> {
     private final InputFile location;
     private UUID catalogUuid;
     private int nextNamespaceId = 1;
@@ -492,7 +493,7 @@ public class ProtoCatalogFile extends CatalogFile {
     private final Map<Integer, Map<Long, List<String>>> snapshotManifests = new HashMap<>();
     // Committed-txn dedup state: the set inherited from a decoded checkpoint (empty if built
     // from scratch) and the ids replay adds to it, merged by build().
-    private final CommittedSet.Builder committed = CommittedSet.builder();
+    private CommittedSet.Builder committed = CommittedSet.builder();
     private int appendCount = 0;
 
     Builder(InputFile location) {
@@ -860,6 +861,12 @@ public class ProtoCatalogFile extends CatalogFile {
       return this;
     }
 
+    /** Takes {@code set} as this builder's committed set: the one a replay built (Replay). */
+    public Builder useCommitted(CommittedSet.Builder set) {
+      this.committed = set;
+      return this;
+    }
+
     /**
      * Replays a GC record ({@code AdvanceHorizon}): drops the committed ids at or below {@code
      * watermarkMs}, and raises the horizon to the newest one dropped.
@@ -962,6 +969,7 @@ public class ProtoCatalogFile extends CatalogFile {
       return Namespace.of(levels);
     }
 
+    @Override
     public ProtoCatalogFile build() {
       // Ensure all lookups are complete before building immutable file
       rebuildLookups();
