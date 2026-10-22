@@ -1,12 +1,19 @@
-# TLA+ model of the catalog commit protocol
+# TLA+ models of the commit protocol
 
-`CatalogCommit.tla` models the commit loop (`LogRuntime.commit`, formerly
-`ProtoCatalogFormat.Mut.commit`) and replay over one catalog object in storage
-with conditional writes. `CatalogOracles.tla` states
-the jqwik fuzzers' oracles as predicates over the same model. The model's purpose
-is to check the oracles: that what the property tests assert is enough to imply
-the protocol's properties, and that each historical protocol bug breaks a
-property and is caught by an oracle.
+Two models of the commit loop (`LogRuntime.commit`, formerly
+`ProtoCatalogFormat.Mut.commit`) over one replicated state machine (`RSM.tla`):
+
+- `CatalogCommit.tla`: one catalog object in storage with conditional writes
+  (`AtomicFileLog`). `CatalogOracles.tla` states the jqwik fuzzers' oracles as
+  predicates over it. Its purpose is to check the oracles: that what the
+  property tests assert is enough to imply the protocol's properties, and that
+  each historical protocol bug breaks a property and is caught by an oracle.
+  The sections from [The file model](#the-file-model) to
+  [The oracles](#the-oracles) are about it.
+- `SharedLogCommit.tla`: a shared log with checkpoints apart from its records
+  (Kafka, SQS, a ledger, `InMemorySharedLog`). It was written before the Java it
+  validates, to say what that Java must do; see
+  [The shared-log model](#the-shared-log-model).
 
 The model reproduces the commit loop, not Iceberg. Table metadata (inline TM and
 ML, deltas, row lineage, DVs), byte encoding, SDK error mapping and performance
@@ -18,7 +25,10 @@ are out of scope.
 | `CatalogCommit.tla` | The protocol: storage, the commit loop, faults, GC, the bug switches, the properties |
 | `CatalogOracles.tla` | The three fuzzers' oracles, their tightened versions, and `Adequate` |
 | `MC.tla` | Scenarios (what each writer commits) and the coverage witnesses |
-| `check.py` | The configurations, and what TLC must report for each |
+| `SharedLogCommit.tla` | The shared-log protocol: the log, checkpoints and trims, writers, compactors, faults, the bug switches, the properties |
+| `SharedLogOracles.tla` | Oracles a fuzzer of the shared log can assert, and `Adequate` |
+| `MCShared.tla` | Its scenarios and coverage witnesses |
+| `check.py` | The configurations of both models (`log-*` for the shared log), and what TLC must report for each |
 
 ## Running
 
@@ -29,8 +39,9 @@ curl -L -o spec/tla/tools/tla2tools.jar \
 
 spec/tla/check.py               # every configuration; each must give its expected verdict
 spec/tla/check.py -k bug        # the configurations whose names contain "bug"
+spec/tla/check.py -k log-       # the shared-log model's
 spec/tla/check.py --witnesses   # every branch and interleaving listed below is reached
-spec/tla/check.py --matrix      # the oracle matrix (about 40 minutes)
+spec/tla/check.py --matrix      # the oracle matrices of both models (about 20 minutes)
 spec/tla/check.py --matrix --tight  # the tightened oracles on the same cells
 ```
 
@@ -40,14 +51,16 @@ to `states/out/<name>.txt` (both ignored by git). To rerun one by hand, from
 
 ```bash
 java -cp tools/tla2tools.jar tlc2.TLC -workers 2 -config states/cfg/mix.cfg MC
+java -cp tools/tla2tools.jar tlc2.TLC -workers 2 -config states/cfg/log-mix.cfg MCShared
 ```
 
 `TLC_WORKERS` (default 2) and `TLC_HEAP` (default 2g) size the runs. Checked with
 TLC 2026.10.13.164326 (rev 210df3a), the version that jar reported. The whole
-table takes about 20 minutes; most configurations take seconds, and `mix`,
-`mix-lenient` and `skew` take 2 to 4 minutes each.
+table takes about 35 minutes. Most configurations take seconds; `mix`,
+`mix-lenient`, `skew` and `log-mix` take 3 to 6 minutes each, and `log-three`
+8 to 11.
 
-## The model
+## The file model
 
 **Storage.** One object: `[gen, chk, log, segs]`. `chk` is the checkpoint: the
 state, the committed set `C` and its GC horizon `H`. `log` holds the records
@@ -292,6 +305,171 @@ was calibrated by putting its bug back in the code:
    schedule reaches, so there is no bug to calibrate it with. In the Java test
    the first racer always runs before A's first write, so the first condition
    holds whenever A writes. Change 1 is what catches 64b there.
+
+## The shared-log model
+
+`SharedLogCommit.tla` models the same commit loop on a log that cannot replace
+itself: `LogRuntime`'s append branch over a `SharedLog` whose checkpoints are
+stored apart from its records (Kafka, SQS FIFO with an archiver, a ledger,
+`InMemorySharedLog`). It was written before the Java it validates (stage 6 of the
+intention-log split: the unconditional path, `compact()`, `InMemorySharedLog`),
+so it states what that code must do. The state machine and replay are `RSM.tla`'s.
+
+**The log.** One total order of records (P1). `log` holds all of it, trimmed
+records included, as a ghost; a reader sees only what follows the checkpoint it
+starts from. A checkpoint is `[pos, st, C, H]`: the replay of the log through
+`log[pos]`. The first, at 0, is the empty state. A reader may start from any
+usable checkpoint (one at or past the trim point). With `Lag`, its read may end
+anywhere after that checkpoint, as a lagging replica's does.
+
+**Writers.** Each stages a transaction on a read, appends its record
+unconditionally (`Send`), and reads through it (`ReadBack`). A write that fails
+or loses its reply is resolved by a fresh read (`Resolve`), as on the file:
+committed if the record is there; otherwise sent again if the transaction holds,
+else failed. The faults are the file model's, less `landedConflict` (there is no
+condition to fail), plus `notSent` (`LogNotSentException`: nothing landed).
+
+**Compactors.** Within budgets, in any order and interleaved with the writers:
+
+- `AppendGc` appends a GC record at a compactor's clock less the retention;
+- `PutCheckpoint(p)` stores the replay through any position `p`, read from a
+  usable checkpoint before it;
+- `Trim(p)` trims through a position that a stored checkpoint covers (P5).
+
+`LogRuntime.compact()` (a GC record, a read through it, a checkpoint there, a
+trim) is one order of these.
+
+### Properties
+
+The file model's, restated over the whole log, with these differences:
+
+| Property | Statement |
+|---|---|
+| `Readable` | some stored checkpoint covers the trimmed prefix |
+| `Deterministic` | every reader, from whichever usable checkpoint, replays the log to the same state, committed set and horizon |
+| `CheckpointIsReplay` | a checkpoint at `p` is the replay of the log through `p` (I11) |
+| `ExactlyOnce` | no commit applies twice, whatever ids it took |
+| `SoloCommits` | as on the file; checkpoints and trims are no race, a lagging read is |
+
+`CasAppliesItsRecord` has no counterpart (there is no fused write).
+
+### Results
+
+Every configuration of the correct protocol passes:
+
+| Config | What it adds | States |
+|---|---|---|
+| `log-base`, `log-creates`, `log-blind` | two writers, one transaction each: contending; creating; each writing what the other reads (write skew, and a copy of a record that would apply twice but for its id) | 40 each |
+| `log-two-each` | two transactions each | 617 |
+| `log-faults`, `log-faults2` | every fault, late landings included; two faults within two attempts | 546; 4,058 |
+| `log-ckpt` | two checkpoints and two trims: reads from a later checkpoint, a read back past a trim | 446 |
+| `log-gc` | a compactor's GC record at retention 0, checkpoints, a trim | 27,741 |
+| `log-lag` | the same, with lagging reads | 45,020 |
+| `log-skew` | retention 1, a writer's clock behind by 2 and a compactor's ahead by 2 | 124,021 |
+| `log-gc-faults`, `log-blind-faults` | compaction and every fault | 286,486; 300,888 |
+| `log-mix` | compaction, every fault, lagging reads | 540,348 |
+| `log-three` | three writers, with compaction | 1,259,308 |
+
+**Coverage.** `check.py --witnesses` reaches, in the passing configurations:
+
+- a read from a later checkpoint, two usable checkpoints (so `Deterministic`
+  is not vacuous), a trim, a read back of a record trimmed since;
+- a GC record that drops a record's id before its writer reads it back;
+- a record whose id the horizon passed before it landed (the commit fails);
+- a horizon, an unknown outcome without a fault, an error (`notSent`);
+- a record twice in the log, and a copy that can land after its commit reported;
+- a failed commit whose record is in the log;
+- throttle retries, the last attempt spent, an unknown outcome;
+- a commit resolving an ambiguous write after a read of it lagged.
+
+### Calibration
+
+Each switch puts back a mistake this kind of log admits. The first five were
+planned with the model; the last three are what the model found (below):
+
+| Switch | What it does | Caught by |
+|---|---|---|
+| `ckclock` | a checkpoint drops the ids its compactor's clock says are past the retention, as the file's did before GC records | `Deterministic` |
+| `setonly` | a commit judges its record by the committed set alone, as `landed` did before stage 3 | `HonestFailed` |
+| `trimearly` | a trim before a checkpoint covers what it drops | `Readable` |
+| `noverify` | after an ambiguous write, a commit whose record is not in the read fails without asking whether its transaction holds | `HonestFailed` |
+| `freshid` | the retry after an ambiguous write takes a new id | `ExactlyOnce` |
+| `dup` | a throttled send before the acknowledged one is not counted as a write that may have landed | `HonestFailed` |
+| `lagread` | the read that resolves an ambiguous write may lag behind the one the commit staged on | `HonestFailed` |
+| `p3` | `readThrough` may answer from a checkpoint that already holds the record | `HonestFailed` |
+
+### What the model found
+
+The protocol holds on every configuration once three rules are in place. The
+Java must follow each of them before the unconditional path runs (stage 6):
+
+1. **A throttled send is an earlier write** (`dup`). On a log without
+   conditional appends, a send the log throttled may have landed, and its
+   retry lands beside it. If a compactor checkpoints between the two copies and
+   then appends a GC record that drops the id, a read through the acknowledged
+   copy starts from that checkpoint. There replay skips the copy (its id is
+   committed), and the committed set can no longer say. The commit must report
+   unknown, not failed. `LogRuntime.write` keeps its throttle exception local,
+   so `landed` does not see it. On one object this cannot happen: the retry
+   fails its condition (P4).
+2. **A commit's reads do not go back** (`lagread`). P1 lets a read return any
+   prefix of the log. After an ambiguous write, a commit fails if its
+   transaction does not hold on a fresh read. That is sound only on a read at or
+   past the one the transaction was staged on: S2 holds from there, and every
+   copy of the record lands after it. On a read that lags behind it, the
+   transaction may not hold *yet*, while its record has applied. The runtime
+   must require each read to reach its base's tail (`continues`), waiting or
+   treating it as unreadable.
+3. **`readThrough` returns a view whose records include the record** (`p3`),
+   or fails (`TrimmedException`, which leaves the write ambiguous). A view
+   whose checkpoint already holds the record cannot tell an applied record
+   whose id GC dropped from one that never applied, and the commit would report
+   failed. The plan proposed instead counting the acknowledged append as a
+   write that may have landed. That would also be safe, but it reports unknown
+   where this rule reports exactly.
+
+Two of the planned rules hold as designed. A commit judges its record by
+replay's judgment before the committed set (`setonly`): another compactor's GC
+record can land between its record and its read back. And a GC record is the
+only thing that moves the horizon (`ckclock`): a checkpoint with GC of its own
+makes readers disagree.
+
+### The oracles
+
+`SharedLogOracles.tla` states two oracles a fuzzer of the shared log can
+assert. Its harness owns the log, so it can replay all of it, trimmed records
+included, and it knows the faults it injected; it cannot see the runtime's
+reads.
+
+- `now`: each commit judged as it ends, against a replay of the whole log at
+  that moment, as `TestMultiWriterProperties` judges commits on the file. A
+  committed commit applied, a failed one did not, an error follows a fault,
+  and an unknown outcome follows a fault (or GC).
+- `drain`: `now`, and once the run is over and every delayed append has landed,
+  every outcome is checked against the final log. Each commit applied at most
+  once (the harness tags each intention with its commit), every stored
+  checkpoint equals a replay through it (`InMemorySharedLog.putCheckpoint`),
+  and the state is the serial execution of what applied.
+
+`check.py --matrix` runs both with each switch, on free schedules, with the
+same three checks as the file model's matrix:
+
+| Switch | `now` | `drain` |
+|---|---|---|
+| none (also with write skew, and with lagging reads) | passes | passes |
+| `setonly`, `trimearly`, `p3`, `dup` | caught | caught |
+| `ckclock`, `freshid`, `lagread` | caught on some schedules, **missed** on others | caught |
+| `noverify` | **missed** | caught |
+
+`drain` is adequate everywhere: wherever it passes, the properties hold. `now`
+misses what happens after a commit has ended. A copy of a failed commit's
+record lands later and applies (`noverify`, `lagread`), and a retry under a new
+id applies beside the original (`freshid`). It also misses a checkpoint that
+disagrees with the log, unless a writer happens to read from it and misjudge
+its own record (`ckclock`). So `TestMultiWriterProperties` ported to the shared
+log (stage 6) cannot judge only as each commit ends. Its harness must deliver
+what it delayed, judge the whole run again, and check each checkpoint against
+a replay.
 
 ## History
 

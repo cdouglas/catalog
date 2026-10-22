@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Runs TLC on the CatalogCommit model configurations and checks each verdict.
+"""Runs TLC on the model configurations and checks each verdict.
 
-Usage: spec/tla/check.py [-k SUBSTRING] [--list] [--keep]
+Usage: spec/tla/check.py [-k SUBSTRING] [--list] [--keep] [--witnesses | --matrix [--tight]]
 
-Each configuration is a base (see BASE) with overrides. `expect` is "pass", or
-the name of the property TLC must report violated. The configurations are
+Each configuration is a base (BASE for CatalogCommit, through MC; LOG_BASE for
+SharedLogCommit, through MCShared, for the configurations named log-*) with
+overrides. `expect` is "pass", or the name of the property TLC must report
+violated (or a set of names, any of which will do). The configurations are
 written to states/cfg/ and the TLC output to states/out/<name>.txt.
 """
 import argparse
@@ -116,6 +118,80 @@ CONFIGS = {
 }
 
 
+# The shared-log model (SharedLogCommit, through MCShared).
+LOG_BASE = {
+    "Writers": "{1, 2}",
+    "Entities": "<- Ents",
+    "Shapes": "<- Contend",
+    "MaxAttempts": "3",
+    "MaxThrottle": "2",
+    "Retention": "<- GcOff",
+    "MaxTime": "0",
+    "Skew": "<- NoSkew2",
+    "CompSkews": "{0}",
+    "MaxGc": "0",
+    "MaxCkpt": "0",
+    "MaxTrim": "0",
+    "MaxFaults": "0",
+    "FaultKinds": "{}",
+    "Lag": "FALSE",
+    "Bugs": "{}",
+}
+
+LOG_SAFETY = ["Readable", "Deterministic", "CheckpointIsReplay", "ExactlyOnce", "Serializable",
+              "UniqueIds", "HonestCommitted", "HonestFailed", "UnknownExplained", "SoloCommits"]
+LOG_ACTIONS = ["HistGrows"]
+
+LOG_FAULTS = ('{"failBefore", "notSent", "lostReply", "throttled", "landedThrottled", '
+              '"inflight", "readFail"}')
+# Compaction: a GC record, checkpoints and a trim, with retention 0; with faults, one checkpoint.
+COMPACT = {"Retention": "0", "MaxTime": "1", "MaxGc": "1", "MaxCkpt": "2", "MaxTrim": "1"}
+COMPACT1 = {**COMPACT, "MaxCkpt": "1"}
+
+LOG_CONFIGS = {
+    "log-base": ({}, "pass"),
+    "log-creates": ({"Shapes": "<- Creates"}, "pass"),
+    "log-blind": ({"Shapes": "<- Blind"}, "pass"),
+    "log-two-each": ({"Shapes": "<- TwoEach"}, "pass"),
+    "log-faults": ({"MaxFaults": "1", "FaultKinds": LOG_FAULTS}, "pass"),
+    "log-faults2": ({"MaxFaults": "2", "FaultKinds": LOG_FAULTS, "Shapes": "<- Blind",
+                     "MaxAttempts": "2"}, "pass"),
+    "log-ckpt": ({"MaxCkpt": "2", "MaxTrim": "2"}, "pass"),
+    "log-gc": ({**COMPACT}, "pass"),
+    "log-lag": ({**COMPACT, "Lag": "TRUE"}, "pass"),
+    "log-skew": ({**COMPACT, "Retention": "1", "MaxTime": "2", "Skew": "<- Behind2",
+                  "CompSkews": "{0, 2}"}, "pass"),
+    "log-gc-faults": ({**COMPACT1, "MaxFaults": "1", "FaultKinds": LOG_FAULTS}, "pass"),
+    "log-blind-faults": ({**COMPACT1, "Shapes": "<- Blind", "MaxFaults": "1",
+                          "FaultKinds": LOG_FAULTS}, "pass"),
+    # Everything at once, at small bounds.
+    "log-mix": ({**COMPACT1, "MaxFaults": "1", "FaultKinds": LOG_FAULTS, "Lag": "TRUE"}, "pass"),
+    "log-three": ({**COMPACT1, "Writers": "{1, 2, 3}", "Shapes": "<- Three",
+                   "Skew": "<- NoSkew3"}, "pass"),
+    # Calibration: each bug, put back, must break a property.
+    "log-ckclock": ({**COMPACT, "MaxGc": "0", "MaxTrim": "0", "Bugs": '{"ckclock"}'},
+                    {"Deterministic"}),
+    "log-setonly": ({**COMPACT, "MaxCkpt": "0", "MaxTrim": "0", "Bugs": '{"setonly"}'},
+                    {"HonestFailed"}),
+    "log-trimearly": ({"MaxTrim": "1", "Bugs": '{"trimearly"}'}, {"Readable"}),
+    "log-noverify": ({"MaxFaults": "1", "FaultKinds": LOG_FAULTS, "Bugs": '{"noverify"}'},
+                     {"HonestFailed"}),
+    "log-freshid": ({"Shapes": "<- Blind", "MaxFaults": "1", "FaultKinds": LOG_FAULTS,
+                     "Bugs": '{"freshid"}'}, {"ExactlyOnce"}),
+    "log-p3": ({**COMPACT, "MaxTrim": "0", "Bugs": '{"p3"}'}, {"HonestFailed"}),
+    "log-dup": ({**COMPACT, "MaxTrim": "0", "MaxFaults": "1", "FaultKinds": LOG_FAULTS,
+                 "Bugs": '{"dup"}'}, {"HonestFailed"}),
+    "log-lagread": ({"Lag": "TRUE", "MaxFaults": "1", "FaultKinds": LOG_FAULTS,
+                     "Bugs": '{"lagread"}'}, {"HonestFailed"}),
+}
+
+MODELS = {"MC": (BASE, SAFETY, ACTIONS), "MCShared": (LOG_BASE, LOG_SAFETY, LOG_ACTIONS)}
+
+
+def model_of(name):
+    return "MCShared" if name.startswith("log-") else "MC"
+
+
 # Witnesses: (config, Not_ invariant); TLC must report it violated.
 WITNESSES = [
     ("long", "Not_Shrink"), ("mix", "Not_CasAfterFreshRead"), ("cas-only", "Not_Rebase"),
@@ -131,6 +207,14 @@ WITNESSES = [
     ("sched-race-op", "Not_Restaged"), ("sched-fault", "Not_Restaged"),
     ("faults", "Not_LateLandingAfterEnd"), ("skew", "Not_ClockBehindHorizon"),
     ("mix", "Not_ResolveAfterGc"),
+    ("log-ckpt", "Not_LaterCheckpoint"), ("log-ckpt", "Not_TwoUsable"),
+    ("log-ckpt", "Not_Trimmed"), ("log-ckpt", "Not_ReadBackTrimmed"),
+    ("log-gc", "Not_GcBeforeReadBack"), ("log-gc", "Not_RecordBelowHorizon"),
+    ("log-gc", "Not_Horizon"), ("log-gc", "Not_UnknownWithoutFault"),
+    ("log-faults", "Not_DuplicateRecord"), ("log-faults", "Not_LateLandingAfterEnd"),
+    ("log-base", "Not_FailedButLanded"), ("log-faults2", "Not_Unknown"),
+    ("log-faults", "Not_Error"), ("log-faults", "Not_Throttled"),
+    ("log-faults2", "Not_Exhausted"), ("log-lag", "Not_LaggingRead"),
 ]
 
 
@@ -165,6 +249,24 @@ BUG_KNOBS = {
 }
 CREATES = {"mw": "<- Creates", "fault": "<- Creates", "race": "<- RaceCreates",
            "race1": "<- RaceCreates1"}
+
+# The shared-log oracles (SharedLogOracles), on free schedules: "now" judges each commit as it
+# ends; "drain" also judges the whole run once what was in flight has landed.
+LOG_ORACLES = ["now", "drain"]
+LOG_F1 = {"MaxFaults": "1", "FaultKinds": LOG_FAULTS}
+LOG_BUG_KNOBS = {
+    "none": {**COMPACT1, **LOG_F1},
+    "none-blind": {**COMPACT1, **LOG_F1, "Shapes": "<- Blind"},
+    "none-lag": {**LOG_F1, "Lag": "TRUE"},
+    "ckclock": LOG_CONFIGS["log-ckclock"][0],
+    "setonly": LOG_CONFIGS["log-setonly"][0],
+    "trimearly": LOG_CONFIGS["log-trimearly"][0],
+    "noverify": LOG_CONFIGS["log-noverify"][0],
+    "freshid": LOG_CONFIGS["log-freshid"][0],
+    "p3": LOG_CONFIGS["log-p3"][0],
+    "dup": LOG_CONFIGS["log-dup"][0],
+    "lagread": LOG_CONFIGS["log-lagread"][0],
+}
 SKEWED = {"mw": "<- Behind2", "fault": "<- Behind2", "race": "<- Behind3", "race1": "<- Behind2"}
 
 
@@ -187,15 +289,16 @@ def matrix_overrides(oracle, bug):
     return o
 
 
-def cfg_text(overrides, invariants=None, properties=None):
-    consts = dict(BASE)
+def cfg_text(overrides, invariants=None, properties=None, model="MC"):
+    base, safety, actions = MODELS[model]
+    consts = dict(base)
     consts.update(overrides)
     lines = ["SPECIFICATION Spec", "CONSTANTS", "  None = None"]
     for k, v in consts.items():
         lines.append(f"  {k} {v}" if v.startswith("<-") else f"  {k} = {v}")
     lines.append("INVARIANTS")
-    lines += [f"  {p}" for p in (SAFETY if invariants is None else invariants)]
-    props = ACTIONS if properties is None else properties
+    lines += [f"  {p}" for p in (safety if invariants is None else invariants)]
+    props = actions if properties is None else properties
     if props:
         lines.append("PROPERTIES")
         lines += [f"  {p}" for p in props]
@@ -203,18 +306,19 @@ def cfg_text(overrides, invariants=None, properties=None):
 
 
 def run(name, overrides, expect, keep, invariants=None, properties=None):
+    model = model_of(name)
     os.makedirs(os.path.join(HERE, "states", "cfg"), exist_ok=True)
     os.makedirs(os.path.join(HERE, "states", "out"), exist_ok=True)
     cfg = os.path.join("states", "cfg", name + ".cfg")
     with open(os.path.join(HERE, cfg), "w") as f:
-        f.write(cfg_text(overrides, invariants, properties))
+        f.write(cfg_text(overrides, invariants, properties, model))
     start = time.time()
     proc = subprocess.run(
         ["java", "-XX:+UseParallelGC", "-Xmx" + os.environ.get("TLC_HEAP", "2g"),
          "-cp", "tools/tla2tools.jar", "tlc2.TLC",
          "-workers", os.environ.get("TLC_WORKERS", "2"), "-noGenerateSpecTE",
          "-metadir", os.path.join("states", "meta", name),
-         "-config", cfg, "MC"],
+         "-config", cfg, model],
         cwd=HERE, capture_output=True, text=True)
     out = proc.stdout + proc.stderr
     with open(os.path.join(HERE, "states", "out", name + ".txt"), "w") as f:
@@ -232,25 +336,25 @@ def run(name, overrides, expect, keep, invariants=None, properties=None):
         verdict = "ERROR: " + (err.group(1) if err else "see output")
     ok = verdict == expect if isinstance(expect, str) else verdict in expect
     shown = expect if isinstance(expect, str) else "/".join(sorted(expect))
-    print(f"{'ok  ' if ok else 'FAIL'} {name:12} {verdict:22} (expect {shown}) "
+    print(f"{'ok  ' if ok else 'FAIL'} {name:16} {verdict:22} (expect {shown}) "
           f"{states[-1] if states else '?':>12} states {time.time() - start:6.1f}s",
           flush=True)
     return ok
 
 
-def run_quiet(name, overrides, invariants, properties):
+def run_quiet(name, overrides, invariants, properties, model="MC"):
     """Runs one configuration; returns its verdict. An unreadable catalog stops every writer, so
     a run that checks no Readable may deadlock: deadlock is not checked."""
     os.makedirs(os.path.join(HERE, "states", "cfg"), exist_ok=True)
     os.makedirs(os.path.join(HERE, "states", "out"), exist_ok=True)
     cfg = os.path.join("states", "cfg", name + ".cfg")
     with open(os.path.join(HERE, cfg), "w") as f:
-        f.write(cfg_text(overrides, invariants, properties))
+        f.write(cfg_text(overrides, invariants, properties, model))
     proc = subprocess.run(
         ["java", "-XX:+UseParallelGC", "-Xmx" + os.environ.get("TLC_HEAP", "2g"),
          "-cp", "tools/tla2tools.jar", "tlc2.TLC",
          "-workers", os.environ.get("TLC_WORKERS", "2"), "-noGenerateSpecTE",
-         "-deadlock", "-metadir", os.path.join("states", "meta", name), "-config", cfg, "MC"],
+         "-deadlock", "-metadir", os.path.join("states", "meta", name), "-config", cfg, model],
         cwd=HERE, capture_output=True, text=True)
     out = proc.stdout + proc.stderr
     with open(os.path.join(HERE, "states", "out", name + ".txt"), "w") as f:
@@ -262,6 +366,9 @@ def run_quiet(name, overrides, invariants, properties):
         return "pass"
     err = re.search(r"Error: (.*)", out)
     return "ERROR: " + (err.group(1) if err else "see output")
+
+
+ALL = {**CONFIGS, **LOG_CONFIGS}
 
 
 def main():
@@ -293,22 +400,38 @@ def main():
                     verdicts.append(run_quiet(f"{name}.{what}", o, invs, []))
                 print(f"{name:16} safety {verdicts[0]:18} oracle {verdicts[1]:12} "
                       f"adequate {verdicts[2]}", flush=True)
+        if args.tight:
+            return 0
+        for oracle in LOG_ORACLES:
+            for bug in LOG_BUG_KNOBS:
+                name = f"log-{oracle}.{bug}"
+                if args.k not in name:
+                    continue
+                o = dict(LOG_BUG_KNOBS[bug])
+                o["OracleAtEnd"] = "<- OracleNow"
+                suffix = oracle.capitalize()
+                verdicts = []
+                for what, invs in (("safety", LOG_SAFETY), ("oracle", ["OracleHolds" + suffix]),
+                                   ("adequate", ["Adequate" + suffix])):
+                    verdicts.append(run_quiet(f"{name}.{what}", o, invs, [], "MCShared"))
+                print(f"{name:20} safety {verdicts[0]:18} oracle {verdicts[1]:20} "
+                      f"adequate {verdicts[2]}", flush=True)
         return 0
     if args.witnesses:
         failed = []
         for cfg, inv in WITNESSES:
             name = f"{cfg}.{inv}"
-            if args.k in name and not run(name, CONFIGS[cfg][0], inv, args.keep, [inv], []):
+            if args.k in name and not run(name, ALL[cfg][0], inv, args.keep, [inv], []):
                 failed.append(name)
         if failed:
             print("unreached:", ", ".join(failed))
         return 1 if failed else 0
-    names = [n for n in CONFIGS if args.k in n]
+    names = [n for n in ALL if args.k in n]
     if args.list:
         for n in names:
-            print(n, CONFIGS[n])
+            print(n, ALL[n])
         return 0
-    failed = [n for n in names if not run(n, *CONFIGS[n], args.keep)]
+    failed = [n for n in names if not run(n, *ALL[n], args.keep)]
     if failed:
         print("unexpected verdicts:", ", ".join(failed))
         return 1

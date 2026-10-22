@@ -64,7 +64,7 @@ docs/ICEBERG_ISSUES.md                       Iceberg core bugs the fuzzers found
 docs/iceberg-issues/                         one document per Iceberg issue, for upstream reports
 docs/format-explorer/                        byte-level viewer of catalog files
 docs/sample/                                 measured footprint of each inline mode
-spec/tla/                                    TLA+ model of the commit loop and the fuzzers' oracles
+spec/tla/                                    TLA+ models of the commit loop and the fuzzers' oracles
 ```
 
 ## Dependencies on the Iceberg fork
@@ -171,10 +171,11 @@ suites skip; see [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
   state equals a checkpoint of it. `TestFormatExplorer` checks the codecs'
   field numbers against `catalog.proto`.
 - **Model checking.** [spec/tla/](spec/tla/README.md) models the commit
-  loop in TLA+ and states the fuzzers' oracles over the model. The
-  commit-loop bugs the fuzzers and reviews found are switches in the
-  model that put each bug back; each one must break a property, and the
-  fuzzers' oracles must catch it.
+  loop in TLA+, on one catalog object and on a shared log with
+  checkpoints apart from it, and states the fuzzers' oracles over the
+  models. The commit-loop bugs the fuzzers and reviews found are switches
+  in the model that put each bug back; each one must break a property,
+  and the fuzzers' oracles must catch it.
 
 ## Configuration
 
