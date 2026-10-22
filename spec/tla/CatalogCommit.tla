@@ -96,8 +96,9 @@ LiveOf(s) == ReplayOf(file, s.txn.id)
 
 Clock(w) == 1 + now + Skew[w]
 
-\* The file a CAS writes, but its generation: buildFullFile, a checkpoint of
-\* `b`, a GC record at the watermark (none when GC is off), then the record.
+\* The file a CAS writes, but its generation (LogRuntime's replace and
+\* `records`): a checkpoint of `b`, a GC record at the watermark (none when GC
+\* is off), then the record.
 \* The checkpoint is the replay of the version the CAS replaces, whatever the
 \* clock says (I11). With Bug 64b the watermark is not capped below the
 \* record's own time. With "ckgc" the checkpoint itself is filtered at the
@@ -135,7 +136,7 @@ Idle(k, n) ==
 \* pc: idle, staged, loop, cas, throttled, readback, rebase, refresh, shrink,
 \*   resolve, restage.
 \* rt: the times the operation was restaged; nw: its write requests.
-\* base: the parsed state of cur (baseCatalog), unless stale (!baseIsCurrent).
+\* base: the parsed state of cur (current), unless stale (stale).
 \* cur: the version the next write is conditioned on [gen, len] (current).
 \* amb: a write's outcome was unknown (ambiguous); unres: a write failed its
 \*   precondition and no read has ruled out that it landed (unresolved);
@@ -200,7 +201,7 @@ End(w, s, out, landed) ==
               ELSE IF w = sched.nest THEN [sched EXCEPT !.nest = None]
               ELSE [sched EXCEPT !.active = None, !.nest = None, !.pre = 0]
 
-\* A read the commit cannot use: UnreadableCatalog. Unknown if a write of
+\* A read the commit cannot use: UnreadableLog. Unknown if a write of
 \* the commit may have landed, else the read's failure.
 Unreadable(w, s) == End(w, s, IF Earlier(s) THEN "unknown" ELSE "error", FALSE)
 
@@ -252,7 +253,7 @@ NextWrite(w) ==
        [] OTHER -> None
 
 \* The transaction staged for operation sh on a read R of the catalog
-\* (CatalogFile.Mut), as w's n-th commit. Its id is minted after the horizon
+\* (CatalogMutation), as w's n-th commit. Its id is minted after the horizon
 \* of R (UuidV7.newUuidV7After; not with Bug 64c). With Bug 16 the record
 \* carries the preconditions of the entities it writes, not of those it only
 \* reads.
@@ -329,7 +330,7 @@ Restage(w, fk) ==
      ELSE Go(w, [Staged(s, LiveR, Stage(w, Shapes[w][s.k], LiveR, s.n)) EXCEPT !.pc = "loop"],
              FALSE)
 
-\* tryCAS / tryAppend through retryThrottled and writeAndRead: one request.
+\* A replace or an append through LogRuntime's write: one request.
 \* Faults: failBefore (an IOException before landing), lostReply (landed,
 \* reply lost), landedConflict (landed; a transport retry of it failed its
 \* precondition), throttled (not landed), landedThrottled (landed, then
@@ -375,7 +376,7 @@ Write(w, fk) ==
                ELSE IF Has("25") THEN End(w, s1, "failed", lands)
                ELSE Ambig(w, s1, lands)
 
-\* writeAndRead reads back the version it wrote; validateCommit judges it. A
+\* write reads back the version it wrote (readThrough); validate judges it. A
 \* failed read, or (strict) one of a version replaced since, is ambiguous.
 ReadBack(w, fk) ==
   LET s == ws[w]

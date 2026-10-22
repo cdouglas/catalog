@@ -116,29 +116,30 @@ as FileIOCatalog and Iceberg do. Catalog transactions are not.
 
 ### Actions, code, and the jqwik checks that cover them
 
-Line numbers are of `ProtoCatalogFormat.java` at 4a44e16 unless stated.
+Line numbers are of `LogRuntime.java` at 7e056b3 unless stated. `TestLogRuntime`
+(intentlog-core) drives each branch on a scripted log; each test names its action.
 
 | Action | Code | Covered by |
 |---|---|---|
-| `Begin`, `Stage` | `CatalogFile.Mut`, `buildTransaction` :358; id minted after the read's horizon (`ProtoCodec.java:2107`) | all three fuzzers |
-| `Start` | `commit()` :595 | all |
-| `Write` (CAS) | `tryCAS` :900, `buildFullFile` :1023 (GC watermark :1040), `retryThrottled` :966 | all |
-| `Write` (APPEND) | `tryAppend` :933, `retryThrottled` :966 | all |
-| `Write` with `SegOK` false | `catch SegmentLimitException` :709 (Bug 66) | MW, fault (segment limits drawn) |
-| `Write` with faults | `writeAndRead` :1006, `retryThrottled` :966 | MW, fault (`InMemoryAtomicFileIO.Fault`) |
-| `ReadBack` | `writeAndRead`'s read :1006, `validateCommit` :836 | all; strict versions: MW, fault |
-| `Rebase` | `catch CASException` :682 and the rebase after it | all |
-| `Refresh` | `catch AppendException` :716, `length(current)` :725 | all |
-| `Shrink` | the re-read when the file shrank :725 | MW |
-| `FreshForCAS` | `mustCAS && !baseIsCurrent` :659 (Bugs 12, 26) | MW |
-| `Resolve` | `catch AmbiguousWrite` :744 | MW, fault |
-| `Exhaust`, `FinalRead` | after the loop :780, :783 | MW (faults) |
-| `Unreadable` | `catch UnreadableCatalog` :769 | MW, fault (read faults) |
-| `Judge` | `landed` :815; `containsTransaction` (`ProtoCatalogFile.java:897`) | MW, fault, race (gc) |
-| `Restage` | `FileIOCatalog.commitOnAFreshRead` (`FileIOCatalog.java:270`); Iceberg's table commit retry | fault, race |
-| `Replay`, `Fold` | `replay` :210, `mayApply` (`ProtoCatalogFile.java:920`), `verify` :250 | all (every read), `CheckpointRoundTrip` |
+| `Begin`, `Stage` | `CatalogMutation.intention()` (`CatalogMutation.java:398`); id minted after the read's horizon :324 | all three fuzzers |
+| `Start` | `commit` :202, `loop` :348 | all |
+| `Write` (CAS) | `log.replace` :402, `records` :561 (GC watermark :562), `write` :582; `AtomicFileLog.write` (`AtomicFileLog.java:167`) | all |
+| `Write` (APPEND) | `log.append` :426, `write` :582 | all |
+| `Write` with `SegOK` false | `catch LogFullException` :427 (Bug 66) | MW, fault (segment limits drawn) |
+| `Write` with faults | `write` :582; the store's signals mapped by `AtomicFileLog.write` | MW, fault (`InMemoryAtomicFileIO.Fault`) |
+| `ReadBack` | `write`'s `readThrough` :613, `validate` :720 | all; strict versions: MW, fault |
+| `Rebase` | `catch LogConflictException` :403 and the read after it :411 | all |
+| `Refresh` | `catch LogConflictException` :434, `probe().continues` :440 | all |
+| `Shrink` | the read when the log was replaced :444 | MW |
+| `FreshForCAS` | `mustReplace` with `stale` :385 (Bugs 12, 26) | MW |
+| `Resolve` | `catch AmbiguousWrite` :458 | MW, fault |
+| `Exhaust`, `FinalRead` | after the loop :491, :494 | MW (faults) |
+| `Unreadable` | `catch UnreadableLog` :480 | MW, fault (read faults) |
+| `Judge` | `landed` :694; `CommittedSet.Builder.contains` (`CommittedSet.java:142`) | MW, fault, race (gc) |
+| `Restage` | `LogCatalog.commitOnAFreshRead` (`LogCatalog.java:281`); Iceberg's table commit retry | fault, race |
+| `Replay`, `Fold` | `Replay.replayOnto` (`Replay.java:127`), `mayApply` (`CommittedSet.java:151`), `CatalogIntention.verify` (`ProtoCodec.java:1560`) | all (every read), `CheckpointRoundTrip` |
 | `LandInflight` | none: a timed-out request that lands later | none |
-| `Tick`, `Skew` | `System.currentTimeMillis` | gc runs (wall clock); no fuzzer skews clocks |
+| `Tick`, `Skew` | the runtime's clock (`RuntimeConfig.clockMs`) | gc runs (wall clock); no fuzzer skews clocks |
 
 Not modelled: creating the catalog file (`commit()`'s case 0), the size of
 records (`MaxSize` counts records), and backoff timing.
@@ -311,9 +312,11 @@ was calibrated by putting its bug back in the code:
 `SharedLogCommit.tla` models the same commit loop on a log that cannot replace
 itself: `LogRuntime`'s append branch over a `SharedLog` whose checkpoints are
 stored apart from its records (Kafka, SQS FIFO with an archiver, a ledger,
-`InMemorySharedLog`). It was written before the Java it validates (stage 6 of the
-intention-log split: the unconditional path, `compact()`, `InMemorySharedLog`),
-so it states what that code must do. The state machine and replay are `RSM.tla`'s.
+`InMemorySharedLog`). It was written before the Java it validates (the
+unconditional path, `compact()`, `InMemorySharedLog`), to state what that code
+must do; the Java follows it, and the Java fuzzers were calibrated against its
+bug switches ([Calibration in Java](#calibration-in-java)). The state machine
+and replay are `RSM.tla`'s.
 
 **The log.** One total order of records (P1). `log` holds all of it, trimmed
 records included, as a ghost; a reader sees only what follows the checkpoint it
@@ -338,6 +341,29 @@ condition to fail), plus `notSent` (`LogNotSentException`: nothing landed).
 
 `LogRuntime.compact()` (a GC record, a read through it, a checkpoint there, a
 trim) is one order of these.
+
+### Actions and code
+
+Line numbers are of `LogRuntime.java` at 7e056b3. `TestSharedLogRuntime`
+(intentlog-memory) drives each schedule the model found, with its switch in
+brackets.
+
+| Action | Code | Covered by |
+|---|---|---|
+| `Begin` | `commit` :202; the id minted after the read's horizon :324; the commit's floor :328 | protocol, MW |
+| `Send` | `log.append(record, null)` :426, through `write` :582; a throttled send kept as `duplicate` :609 (`dup`) | protocol, MW |
+| `ReadBack` | `readThrough` :613; a view without the record is ambiguous :617 (`p3`) | protocol, MW |
+| `Resolve` | `catch AmbiguousWrite` :458; `read` reads again until it reaches the floor :639 (`lagread`) | protocol, MW |
+| `Exhaust` | after the loop :491 | protocol |
+| `Judge` | `landed` :694: replay's outcome first, then the committed set (`setonly`) | protocol, MW |
+| `AppendGc`, `PutCheckpoint`, `Trim` | `compact` :89; `InMemorySharedLog.putCheckpoint` and `trim` | protocol (also inside commits, whole or GC record only), MW (between operations) |
+| `LandInflight` | a `DELAYED` append, landed by `InMemorySharedLog.deliverDelayed` | protocol, MW |
+| lagging reads (`Lag`), reads from older checkpoints | `InMemorySharedLog`'s read shapes (`ReadShape`) | protocol (stale reads) |
+
+"protocol" is `TestMemoryCommitProtocol` (the testkit's `CommitProtocol` on
+`InMemorySharedLog`); "MW" is `TestMultiWriterProperties` on the shared log.
+Not modelled: creating the log (its first checkpoint, `create` :528), and
+`refresh`.
 
 ### Properties
 
@@ -400,8 +426,9 @@ planned with the model; the last three are what the model found (below):
 
 ### What the model found
 
-The protocol holds on every configuration once three rules are in place. The
-Java must follow each of them before the unconditional path runs (stage 6):
+The protocol holds on every configuration once three rules are in place.
+`LogRuntime` follows each of them, and `TestSharedLogRuntime` has the schedule
+that breaks each without it:
 
 1. **A throttled send is an earlier write** (`dup`). On a log without
    conditional appends, a send the log throttled may have landed, and its
@@ -409,24 +436,28 @@ Java must follow each of them before the unconditional path runs (stage 6):
    then appends a GC record that drops the id, a read through the acknowledged
    copy starts from that checkpoint. There replay skips the copy (its id is
    committed), and the committed set can no longer say. The commit must report
-   unknown, not failed. `LogRuntime.write` keeps its throttle exception local,
-   so `landed` does not see it. On one object this cannot happen: the retry
-   fails its condition (P4).
+   unknown, not failed. `LogRuntime.write` kept its throttle exception local,
+   so `landed` did not see it; it now keeps it as `duplicate`, an earlier
+   write. On one object this cannot happen: the retry fails its condition
+   (P4).
 2. **A commit's reads do not go back** (`lagread`). P1 lets a read return any
    prefix of the log. After an ambiguous write, a commit fails if its
    transaction does not hold on a fresh read. That is sound only on a read at or
    past the one the transaction was staged on: S2 holds from there, and every
    copy of the record lands after it. On a read that lags behind it, the
-   transaction may not hold *yet*, while its record has applied. The runtime
-   must require each read to reach its base's tail (`continues`), waiting or
-   treating it as unreadable.
+   transaction may not hold *yet*, while its record has applied. Each of
+   the commit's reads must reach its floor (`continues`): the tail it staged
+   on, or a later read it adopted. One that lags is read again, then the log
+   is unreadable (`LogLagException`).
 3. **`readThrough` returns a view whose records include the record** (`p3`),
    or fails (`TrimmedException`, which leaves the write ambiguous). A view
    whose checkpoint already holds the record cannot tell an applied record
    whose id GC dropped from one that never applied, and the commit would report
    failed. The plan proposed instead counting the acknowledged append as a
    write that may have landed. That would also be safe, but it reports unknown
-   where this rule reports exactly.
+   where this rule reports exactly. `SharedLog.readThrough` states the
+   obligation, and the runtime checks it: a read back whose records do not
+   include the record (`Replay.Result.seen`) leaves the write ambiguous.
 
 Two of the planned rules hold as designed. A commit judges its record by
 replay's judgment before the committed set (`setonly`): another compactor's GC
@@ -466,10 +497,39 @@ misses what happens after a commit has ended. A copy of a failed commit's
 record lands later and applies (`noverify`, `lagread`), and a retry under a new
 id applies beside the original (`freshid`). It also misses a checkpoint that
 disagrees with the log, unless a writer happens to read from it and misjudge
-its own record (`ckclock`). So `TestMultiWriterProperties` ported to the shared
-log (stage 6) cannot judge only as each commit ends. Its harness must deliver
-what it delayed, judge the whole run again, and check each checkpoint against
-a replay.
+its own record (`ckclock`). So the Java fuzzers of the shared log do not judge
+only as each commit ends: `CommitProtocol` and `TestMultiWriterProperties`
+deliver what they delayed, judge the whole run again, and check each
+checkpoint against a replay.
+
+### Calibration in Java
+
+Each switch was put back in `LogRuntime` or `Replay` in turn, and each fuzzer
+run against it, with two more mutants of the committed set: `nodedup` (replay
+ignores the committed set) and `ckempty` (a checkpoint drops it). The tries
+are the failing try of the default run (2,000 for the protocol fuzzers, 3,000
+for MW) unless stated:
+
+| Mutant | protocol, memory | protocol, file | MW, shared log |
+|---|---|---|---|
+| `dup` | caught (1,126 tries) | missed | missed |
+| `lagread` | caught at 20,000 tries (602) | missed | caught |
+| `p3` | caught at 20,000 tries (4,354) | missed | not run |
+| `setonly` | caught (69) | missed | missed |
+| `noverify` | caught (19) | missed | caught |
+| `freshid` | caught (1) | missed | caught |
+| `ckclock` | caught (57) | missed | caught |
+| `trimearly` | caught (8) | not applicable (no trim) | not run |
+| `nodedup` | caught (5) | caught (1) | caught (9) |
+| `ckempty` | caught (2) | caught (2) | caught (1) |
+
+"protocol, file" is `TestAtomicFileCommitProtocol`, which misses the
+shared-log switches at 20,000 tries, as the model predicts: on one object a
+conditional write makes each of those mistakes harmless. MW misses `dup` and
+`setonly`, which need a compactor's GC record to land inside a commit; only
+the protocol fuzzer schedules that. The schedules that break the three rules,
+`setonly`, `noverify` and `freshid` are also unit tests in
+`TestSharedLogRuntime`.
 
 ## History
 

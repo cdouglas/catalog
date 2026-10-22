@@ -4,7 +4,7 @@ EXTENDS CatalogOracles
 
 Ents == {"a", "b"}
 
-\* A transaction (CatalogFile.Mut, a catalog transaction), and an operation
+\* A transaction (CatalogMutation, a catalog transaction), and an operation
 \* FileIOCatalog restages on a fresh read when it conflicts.
 T(rd, wr) == [rd |-> rd, wr |-> wr, cr |-> None, retry |-> FALSE]
 Op(rd, wr) == [rd |-> rd, wr |-> wr, cr |-> None, retry |-> TRUE]
