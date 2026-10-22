@@ -54,7 +54,6 @@ import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
-import org.intentlog.wire.CommittedSetCodec;
 import org.intentlog.wire.LogEnvelope;
 import org.intentlog.wire.UuidV7;
 
@@ -266,29 +265,15 @@ public class ProtoCodec {
   // ============================================================
 
   /**
-   * Encodes a checkpoint from the original catalog state plus pending mutations,
-   * using {@code dropBeforeTimestampMs = 0} (no committed-set GC).
+   * Encodes a checkpoint of {@code original}, the state a replay reached, in the log's envelope.
+   * It holds exactly that state, committed set included: a GC of the set is a record in the log
+   * (AdvanceHorizon), never a filter on a checkpoint, so every checkpoint of a log is a replay of
+   * it (I11).
    */
   public static byte[] encodeCheckpoint(
       ProtoCatalogFile original,
       CatalogFile.Mut<ProtoCatalogFile, ?> mut,
       ProtoCatalogFormat.ProtoIdManager idManager) {
-    return encodeCheckpoint(original, mut, idManager, 0L);
-  }
-
-  /**
-   * Encodes a checkpoint, optionally GC-ing the inherited committed-transaction
-   * set: any UUIDv7 with {@code timestamp_ms <= dropBeforeTimestampMs} is
-   * dropped from the encoded body and contributes to
-   * {@code highest_dropped_timestamp_ms}. Called from the CAS / compaction path
-   * in {@link ProtoCatalogFormat.Mut} where {@code dropBeforeTimestampMs} is
-   * computed as {@code now - committedRetentionMs}.
-   */
-  public static byte[] encodeCheckpoint(
-      ProtoCatalogFile original,
-      CatalogFile.Mut<ProtoCatalogFile, ?> mut,
-      ProtoCatalogFormat.ProtoIdManager idManager,
-      long dropBeforeTimestampMs) {
     try {
       ByteArrayOutputStream out = new ByteArrayOutputStream();
 
@@ -341,16 +326,8 @@ public class ProtoCodec {
 
       // The catalog's id and committed transactions (a compressed UUIDv7 set) are the log's:
       // the envelope (log.proto LogCheckpoint) carries them, and this checkpoint as its state.
-      // When dropBeforeTimestampMs > 0, this is also the GC site: CommittedSetCodec.rewrite
-      // drops inherited entries whose v7 timestamp is below the watermark and updates
-      // highest_dropped_timestamp_ms accordingly.
-      byte[] inheritedBytes = original.committedTransactionsBytes();
-      byte[] committedBytes =
-          dropBeforeTimestampMs > 0L
-              ? CommittedSetCodec.rewrite(
-                  inheritedBytes, java.util.Collections.emptyList(), dropBeforeTimestampMs)
-              : inheritedBytes;
-      return LogEnvelope.encodeCheckpoint(original.uuid(), committedBytes, out.toByteArray());
+      return LogEnvelope.encodeCheckpoint(
+          original.uuid(), original.committedTransactionsBytes(), out.toByteArray());
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
@@ -701,11 +678,18 @@ public class ProtoCodec {
     }
   }
 
-  /** Decodes a transaction from a log record. */
+  /** Decodes a transaction from a log record, which must carry an intention. */
   public static Transaction decodeTransaction(byte[] bytes) {
     LogEnvelope.Record record = LogEnvelope.decodeRecord(bytes);
+    Preconditions.checkArgument(
+        !record.isAdvanceHorizon(), "The record is a GC record, not a transaction");
+    return decodeTransaction(record.id(), record.intention());
+  }
+
+  /** Decodes the transaction of id {@code id} from its intention (catalog.proto Intention). */
+  public static Transaction decodeTransaction(UUID id, byte[] intention) {
     try {
-      ByteArrayInputStream in = new ByteArrayInputStream(record.intention());
+      ByteArrayInputStream in = new ByteArrayInputStream(intention);
       List<Action> actions = new ArrayList<>();
 
       while (in.available() > 0) {
@@ -720,7 +704,7 @@ public class ProtoCodec {
         }
       }
 
-      return new Transaction(record.id(), actions);
+      return new Transaction(id, actions);
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }

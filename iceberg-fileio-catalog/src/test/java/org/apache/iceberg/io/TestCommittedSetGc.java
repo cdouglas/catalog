@@ -33,7 +33,7 @@ import org.intentlog.wire.UuidV7;
 import org.junit.jupiter.api.Test;
 
 /**
- * The catalog's committed set: the Builder/build(watermark) path and the tri-state
+ * The catalog's committed set: the Builder's replay of a GC record (advanceHorizon) and the tri-state
  * {@link ProtoCatalogFile#containsTransaction}, which delegate to intentlog-core's
  * CommittedSet (whose own tests cover the codec and GC).
  *
@@ -145,11 +145,11 @@ class TestCommittedSetGc {
   }
 
   // ============================================================
-  // Builder.build(watermark)
+  // Builder.advanceHorizon (a GC record)
   // ============================================================
 
   @Test
-  void builderBuildWithWatermarkAppliesGc() throws Exception {
+  void builderAdvanceHorizonAppliesGc() throws Exception {
     Random rand = new Random(0x666);
     long base = 1_000_000L;
     LinkedHashSet<UUID> inherited = new LinkedHashSet<>();
@@ -159,7 +159,8 @@ class TestCommittedSetGc {
 
     ProtoCatalogFile cat = ProtoCatalogFile.builder(LOC)
         .setCommittedTransactionsBytes(body)
-        .build(base);
+        .advanceHorizon(base)
+        .build();
     assertThat(cat.highestDroppedTimestampMs()).isEqualTo(base - 100);
     assertThat(cat.committedTransactions()).hasSize(1);
   }

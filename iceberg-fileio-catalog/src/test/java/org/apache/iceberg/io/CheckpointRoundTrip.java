@@ -37,10 +37,13 @@ import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.intentlog.DedupHorizonExceededException;
+import org.intentlog.wire.LogEnvelope;
 
 /**
  * The checkpoint round trip: the state a reader replays from a catalog file is the state it
- * decodes from a checkpoint of that state. Compaction writes such a checkpoint, so a difference is
+ * decodes from a checkpoint of that state. And a compaction's checkpoint is the state a reader
+ * replays from the version it replaced, committed set included (I11): a GC is a record that
+ * follows the checkpoint, not a filter on it, so every checkpoint is a function of the log. Compaction writes such a checkpoint, so a difference is
  * a change the next compaction makes. Bug 27 was one: a table with both a metadata file and inline
  * metadata read as the file until a checkpoint kept only the inline metadata.
  *
@@ -49,10 +52,11 @@ import org.intentlog.DedupHorizonExceededException;
  * manifest pools and each snapshot's references into them, the name lookups, the id counters and
  * the committed-transaction set. Only the log's record count differs by design.
  *
- * <p>A catalog file is also checked against the compaction that wrote its checkpoint: the record
- * that follows the checkpoint is that commit's own, and if it holds on the checkpoint, replay
- * applies it. A compaction keeps its committed set's GC horizon below its own record; Bug 64 was a
- * compaction whose horizon reached its record, so replay rejected the commit it had just written.
+ * <p>A catalog file is also checked against the compaction that wrote its checkpoint: the first
+ * intention record after the checkpoint (past a GC record) is that commit's own, and if it holds
+ * on the checkpoint, replay applies it. A compaction keeps its GC record's watermark below its
+ * own record; Bug 64 was a compaction whose horizon reached its record, so replay rejected the
+ * commit it had just written.
  */
 public final class CheckpointRoundTrip {
   private static final int MAX_REPORTED = 4;
@@ -62,12 +66,15 @@ public final class CheckpointRoundTrip {
 
   private CheckpointRoundTrip() {}
 
-  /** Fails if a catalog file written to {@code io} differs from a checkpoint of it. */
+  /**
+   * Fails if a catalog file written to {@code io} differs from a checkpoint of it, or a
+   * compaction's checkpoint differs from a replay of the version it replaced.
+   */
   public static void assertEveryWrite(InMemoryAtomicFileIO io) {
     List<InMemoryAtomicFileIO.Write> history = io.history();
     for (int i = 0; i < history.size(); i++) {
       InMemoryAtomicFileIO.Write write = history.get(i);
-      String difference = difference(write.after());
+      String difference = difference(write);
       if (difference != null) {
         throw new AssertionError(
             String.format(
@@ -75,6 +82,48 @@ public final class CheckpointRoundTrip {
                 i, write.strategy(), write.location(), difference));
       }
     }
+  }
+
+  /**
+   * {@link #difference(byte[])} of the catalog file {@code write} wrote, and for a CAS, how its
+   * checkpoint and a replay of the version it replaced differ ({@link #checkpointIsReplay}).
+   */
+  public static String difference(InMemoryAtomicFileIO.Write write) {
+    String difference = difference(write.after());
+    if (difference == null && write.strategy() == AtomicOutputFile.Strategy.CAS) {
+      difference = checkpointIsReplay(write.before(), write.after());
+    }
+    return difference;
+  }
+
+  /**
+   * How the checkpoint a CAS wrote ({@code after}) and a replay of the version it replaced
+   * ({@code before}) differ, or null if they do not or the CAS created the catalog. A compaction
+   * checkpoints the state it replayed of the version it replaces, and nothing else: its clock
+   * shows only in the GC record that follows (I11).
+   */
+  static String checkpointIsReplay(byte[] before, byte[] after) {
+    if (before == null || before.length == 0) {
+      return null;
+    }
+    ProtoCatalogFile replayed = ProtoCatalogFormatTestSupport.decodeFullFile(before);
+    ProtoCatalogFile checkpoint = ProtoCatalogFormatTestSupport.decodeCheckpoint(after).build();
+    SortedMap<String, String> expected = contents(replayed);
+    SortedMap<String, String> actual = contents(checkpoint);
+    if (expected.equals(actual)) {
+      return null;
+    }
+    TreeSet<String> items = new TreeSet<>(expected.keySet());
+    items.addAll(actual.keySet());
+    List<String> differences = new ArrayList<>();
+    for (String item : items) {
+      if (!Objects.equals(expected.get(item), actual.get(item))) {
+        differences.add(String.format(
+            "%s: %s -> %s", item, expected.get(item), actual.get(item)));
+      }
+    }
+    return "the compaction's checkpoint is not a replay of the version it replaced: "
+        + String.join("; ", differences.subList(0, Math.min(differences.size(), MAX_REPORTED)));
   }
 
   /**
@@ -96,17 +145,23 @@ public final class CheckpointRoundTrip {
   }
 
   /**
-   * Why replay rejects the record that follows the checkpoint of {@code catalogFile} though it
-   * holds on the checkpoint, or null if it does not: the record is at or below the committed set's
-   * horizon.
+   * Why replay rejects the first intention record after the checkpoint of {@code catalogFile}
+   * (past the compaction's GC record) though it holds on the checkpoint, or null if it does not:
+   * the record is at or below the committed set's horizon.
    */
   static String compactionRecordRejected(byte[] catalogFile) {
-    List<ProtoCodec.Transaction> records = ProtoCatalogFormatTestSupport.decodeRecords(catalogFile);
-    if (records.isEmpty()) {
+    ProtoCatalogFile.Builder checkpoint = ProtoCatalogFormatTestSupport.decodeCheckpoint(catalogFile);
+    ProtoCodec.Transaction own = null;
+    for (LogEnvelope.Record record : ProtoCatalogFormatTestSupport.decodeLogRecords(catalogFile)) {
+      if (!record.isAdvanceHorizon()) {
+        own = ProtoCodec.decodeTransaction(record.id(), record.intention());
+        break;
+      }
+      checkpoint.advanceHorizon(record.watermarkMs());
+    }
+    if (own == null) {
       return null;
     }
-    ProtoCodec.Transaction own = records.get(0);
-    ProtoCatalogFile.Builder checkpoint = ProtoCatalogFormatTestSupport.decodeCheckpoint(catalogFile);
     if (checkpoint.mayApply(own.id()) || !own.verify(checkpoint)) {
       return null;
     }

@@ -101,7 +101,7 @@ public class ProtoCatalogFile extends CatalogFile {
     this.tblManifestPrefix = ImmutableMap.copyOf(builder.tblManifestPrefix);
     this.manifestPool = deepCopyManifestPool(builder.manifestPool);
     this.snapshotManifests = deepCopySnapshotManifests(builder.snapshotManifests);
-    this.committed = builder.committed.build(builder.dropBeforeTimestampMs);
+    this.committed = builder.committed.build();
     this.appendCount = builder.appendCount;
   }
 
@@ -494,9 +494,6 @@ public class ProtoCatalogFile extends CatalogFile {
     // from scratch) and the ids replay adds to it, merged by build().
     private final CommittedSet.Builder committed = CommittedSet.builder();
     private int appendCount = 0;
-    // GC watermark passed via build(long); 0 means "no GC pass on this build".
-    // Set by Mut prior to invoking build during a CAS / compaction commit.
-    private long dropBeforeTimestampMs = 0L;
 
     Builder(InputFile location) {
       this.location = location;
@@ -864,6 +861,15 @@ public class ProtoCatalogFile extends CatalogFile {
     }
 
     /**
+     * Replays a GC record ({@code AdvanceHorizon}): drops the committed ids at or below {@code
+     * watermarkMs}, and raises the horizon to the newest one dropped.
+     */
+    public Builder advanceHorizon(long watermarkMs) {
+      committed.advanceHorizon(watermarkMs);
+      return this;
+    }
+
+    /**
      * Tri-state membership check, mirroring
      * {@link ProtoCatalogFile#containsTransaction}: returns {@code true} if
      * found among in-flight additions or in the inherited bytes; returns
@@ -957,26 +963,6 @@ public class ProtoCatalogFile extends CatalogFile {
     }
 
     public ProtoCatalogFile build() {
-      return build(0L);
-    }
-
-    /**
-     * Builds a ProtoCatalogFile, performing a GC pass on the inherited
-     * committed-set when {@code dropBeforeTimestampMs > 0}: any inherited
-     * UUIDv7 with {@code timestamp_ms <= dropBeforeTimestampMs} is dropped
-     * and contributes to {@code highest_dropped_timestamp_ms}. Additions
-     * via {@link #addCommittedTransaction} are kept unconditionally.
-     *
-     * <p>Callers (notably the CAS / compaction path in
-     * {@link ProtoCatalogFormat.Mut}) compute {@code dropBeforeTimestampMs}
-     * as {@code now - committedRetentionMs}. The no-arg {@link #build()}
-     * variant disables the GC pass and is used for read-only rebuilds (decode
-     * round-trips, tests).
-     */
-    public ProtoCatalogFile build(long dropBeforeTimestampMs) {
-      Preconditions.checkArgument(dropBeforeTimestampMs >= 0L,
-          "dropBeforeTimestampMs must be >= 0, got %s", dropBeforeTimestampMs);
-      this.dropBeforeTimestampMs = dropBeforeTimestampMs;
       // Ensure all lookups are complete before building immutable file
       rebuildLookups();
       return new ProtoCatalogFile(this);

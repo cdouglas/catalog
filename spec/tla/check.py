@@ -40,7 +40,7 @@ BASE = {
 
 SAFETY = ["Readable", "ExactlyOnce", "Serializable", "UniqueIds", "HonestCommitted",
           "HonestFailed", "UnknownExplained", "SoloCommits"]
-ACTIONS = ["HistGrows", "CasAppliesItsRecord"]
+ACTIONS = ["HistGrows", "CasAppliesItsRecord", "CheckpointIsReplay"]
 
 ALL_FAULTS = ('{"failBefore", "lostReply", "landedConflict", "throttled", '
               '"landedThrottled", "inflight", "readFail"}')
@@ -109,6 +109,10 @@ CONFIGS = {
                {"HonestFailed"}),
     "bug66": ({"SegLimit": "2", "MaxCount": "10", "Shapes": "<- TwoEach", "Bugs": '{"66"}'},
               {"UnknownExplained", "SoloCommits"}),
+    # Not a bug the fuzzers found: the design before GC records, a CAS whose checkpoint is
+    # filtered at its writer's clock rather than a replay of the log.
+    "ckgc": ({"Retention": "0", "MaxTime": "2", "Shapes": "<- TwoEach", "MaxCount": "1",
+              "Bugs": '{"ckgc"}'}, {"CheckpointIsReplay"}),
 }
 
 
@@ -118,7 +122,8 @@ WITNESSES = [
     ("two-each", "Not_StaleAppend"), ("faults", "Not_Throttled"), ("seg", "Not_Full"),
     ("faults2", "Not_FinalRead"), ("faults", "Not_LateLanding"),
     ("faults", "Not_DuplicateRecord"), ("base", "Not_FailedButLanded"),
-    ("gc0", "Not_Horizon"), ("gc0", "Not_UnknownWithoutFault"), ("faults", "Not_Unknown"),
+    ("gc0", "Not_Horizon"), ("gc0", "Not_GcRecord"), ("gc0", "Not_UnknownWithoutFault"),
+    ("faults", "Not_Unknown"),
     ("faults", "Not_CommittedAfterFault"), ("two-each", "Not_Overshoot"),
     ("faults2", "Not_Exhausted"),
     ("sched-mw", "Not_Preempted"), ("sched-fault", "Not_Preempted"),

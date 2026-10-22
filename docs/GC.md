@@ -10,8 +10,8 @@ nothing, and a writer uses it to learn whether its commit landed.
 
 Without a bound the set grows with the catalog's whole commit history.
 GC (b1af354) bounds it to about retention × commit rate: a CAS write
-drops the ids older than the retention window, and records the newest
-time it dropped as the set's horizon. The wire format and the policy
+writes a GC record that drops the ids older than the retention window,
+and records the newest time it dropped as the set's horizon. The wire format and the policy
 are in [SPEC.md](SPEC.md) §"Committed-set retention (GC)".
 
 ## Two oracles for "did my commit land?"
@@ -58,21 +58,27 @@ returns the horizon (0 before any GC).
 
 ## Where GC runs
 
-Only a CAS write rewrites the checkpoint, so only a CAS write (a
-compaction, or any commit in CAS-only mode) GCs; an append never does.
-`ProtoCatalogFormat.Mut.buildFullFile` computes the watermark,
-`now - fileio.catalog.committed.retention.ms` (0 if the retention is at
-least `now`, so `Long.MAX_VALUE` disables GC), and passes it to
-`ProtoCodec.encodeCheckpoint`. That calls
-`CommittedSetCodec.rewrite` (intentlog-core) on the base state's set: one pass
-over the compressed entries that drops every id at or below the
-watermark and raises the horizon to the newest one dropped. The horizon
-never decreases, and it can exceed the newest id kept.
+GC is a record in the log: `LogRecord.advance_horizon`, an
+`AdvanceHorizon{watermark_ms}` (log.proto). Replay applies one wherever
+it lands (`ProtoCatalogFile.Builder.advanceHorizon`, through
+`CommittedSet.Builder.advanceHorizon` in intentlog-core): it drops every
+id the set holds there, the checkpoint's and those replay added, at or
+below the watermark, and raises the horizon to the newest one dropped.
+The horizon moves nowhere else; it never decreases, and it can exceed
+the newest id kept. A checkpoint holds exactly the set the replay before
+it reached, so it is a replay of the log, whatever clock wrote it (I11).
+That matters for a log whose checkpoints are stored apart from its
+records: readers starting from different checkpoints of the same log
+apply the same records, which a horizon filtered into a checkpoint by
+its writer's clock would not guarantee.
 
-`ProtoCatalogFile.Builder.build(long)` runs the same merge on a
-builder's set, keeping the ids replay added; the commit path does not
-use it (it builds with `build()`, no GC), and `TestCommittedSetGc`
-covers it.
+A CAS write (a compaction, or any commit in CAS-only mode) writes the
+GC record, between its checkpoint and its own record; an append never
+does. `ProtoCatalogFormat.Mut.buildFullFile` computes the watermark,
+`now - fileio.catalog.committed.retention.ms` (0 if the retention is at
+least `now`, so `Long.MAX_VALUE` disables GC and writes no record). A
+GC record carries no id, is not deduped (replaying one again changes
+nothing), and does not count toward `max.append.count`.
 
 The retention defaults to 6 hours, longer than any commit's retries.
 A retention shorter than a commit takes is legal but lossy. With a
@@ -90,8 +96,8 @@ A record whose id is at or below the horizon is reachable: a writer
 whose clock is behind another's by more than the retention, one that
 stalls that long between minting its id and appending, or, with a
 retention of 0, a racer's CAS (above), or a writer's own CAS after a
-conflict, whose checkpoint dropped the newer id of the commit it rebased
-on (rule 2 now prevents the last). Replay used to ask
+conflict, whose GC dropped the newer id of the commit it rebased on
+(rule 2 now prevents the last). Replay used to ask
 `containsTransaction` about every record, so one such record threw on
 every read of the catalog, and nothing could compact it away, since
 compacting reads first. Four rules keep the catalog readable and what
@@ -102,9 +108,9 @@ a commit reports true:
    one at or below the horizon may be a retry of a commit whose id aged
    out, so replay skips both.
 2. **A CAS write's watermark stays below its own transaction's time.**
-   `buildFullFile` clamps it to one less than the time of the id it
-   commits, so its own GC never raises the horizon to the record that
-   follows the checkpoint.
+   `buildFullFile` clamps its GC record's watermark to one less than the
+   time of the id it commits, so its own GC never raises the horizon to
+   the record that follows it.
 3. **Writers mint ids after the horizon they read.**
    `ProtoCodec.Transaction.from` mints with
    `UuidV7.newUuidV7After(highestDroppedTimestampMs())`, so a writer
@@ -126,8 +132,12 @@ behind the horizon).
 - `TestCommittedSetGc` (intentlog-core): `CommittedSetCodec.rewrite`
   (pass-through, merge, drops at the watermark, horizon above the newest
   id kept, monotonic horizon), the tri-state lookup, and
-  `Builder.build(long)`; the catalog's `TestCommittedSetGc` checks that
+  `Builder.advanceHorizon` (a GC record's replay: added ids dropped too,
+  idempotent); the catalog's `TestCommittedSetGc` checks that
   `ProtoCatalogFile` delegates to it.
+- `CheckpointRoundTrip`: every CAS write's checkpoint is the replay of
+  the version it replaced, committed set and horizon included (I11),
+  in the local suites and both fuzzers.
 - `TestCommittedTransactions` (intentlog-core): round trip and defensive
   decode of the compressed set; the catalog's, through the checkpoint.
 - `TestProtoCommitKnobs`: the retention property, and end to end, a

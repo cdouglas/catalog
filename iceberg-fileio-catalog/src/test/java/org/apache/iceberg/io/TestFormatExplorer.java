@@ -84,6 +84,7 @@ public class TestFormatExplorer {
     Map<String, String> envelope = new LinkedHashMap<>();
     envelope.put("LOG_CHECKPOINT_", "LogCheckpoint");
     envelope.put("LOG_RECORD_", "LogRecord");
+    envelope.put("ADVANCE_HORIZON_", "AdvanceHorizon");
     PREFIXES.put("LogEnvelope", envelope);
 
     Map<String, String> delta = new LinkedHashMap<>();

@@ -1874,7 +1874,7 @@ class TestCatalogFaultProperties {
         if (write.location().equals(CATALOG_LOCATION)) {
           String difference;
           try {
-            difference = CheckpointRoundTrip.difference(write.after());
+            difference = CheckpointRoundTrip.difference(write);
           } catch (RuntimeException e) {
             AssertionError error = fail("catalog write #%d (%s) does not replay: %s",
                 checkedWrites, write.strategy(), e);

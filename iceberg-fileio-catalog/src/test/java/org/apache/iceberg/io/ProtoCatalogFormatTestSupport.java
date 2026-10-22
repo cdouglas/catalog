@@ -25,6 +25,7 @@ import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import org.intentlog.wire.LogEnvelope;
 
 /**
  * Test-only bridge that exposes the full-file encode/decode cycle for
@@ -99,15 +100,26 @@ public final class ProtoCatalogFormatTestSupport {
     return builder;
   }
 
-  /** The transaction records of a full LCAT file, in log order. */
+  /** The transaction records of a full LCAT file, in log order, without its GC records. */
   public static List<ProtoCodec.Transaction> decodeRecords(byte[] bytes) {
+    List<ProtoCodec.Transaction> records = new ArrayList<>();
+    for (LogEnvelope.Record record : decodeLogRecords(bytes)) {
+      if (!record.isAdvanceHorizon()) {
+        records.add(ProtoCodec.decodeTransaction(record.id(), record.intention()));
+      }
+    }
+    return records;
+  }
+
+  /** Every record of a full LCAT file, GC records included, in log order. */
+  public static List<LogEnvelope.Record> decodeLogRecords(byte[] bytes) {
     int[] at = {ProtoCatalogFormat.HEADER_SIZE};
     int checkpointLength = readVarint(bytes, at);
     at[0] += checkpointLength;
-    List<ProtoCodec.Transaction> records = new ArrayList<>();
+    List<LogEnvelope.Record> records = new ArrayList<>();
     while (at[0] < bytes.length) {
       int length = readVarint(bytes, at);
-      records.add(ProtoCodec.decodeTransaction(Arrays.copyOfRange(bytes, at[0], at[0] + length)));
+      records.add(LogEnvelope.decodeRecord(Arrays.copyOfRange(bytes, at[0], at[0] + length)));
       at[0] += length;
     }
     return records;

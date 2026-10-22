@@ -87,16 +87,19 @@ Not_FinalRead == \A w \in Writers :
 Not_LateLanding == \A i \in inflight : file.gen # i.x.cond
 \* A record twice in the log: exactly-once is not vacuous.
 Not_DuplicateRecord ==
-  \A i, j \in 1..Len(file.log) : i # j => file.log[i].id # file.log[j].id
+  \A i, j \in 1..Len(Txns(file.log)) : i # j => Txns(file.log)[i].id # Txns(file.log)[j].id
 \* A record in the log that replay rejected, of a commit that failed.
 Not_FailedButLanded ==
-  \A e \in ended : e.out = "failed" => \A i \in 1..Len(file.log) : file.log[i].id # e.id
-Not_Horizon == file.chk.H = 0
+  \A e \in ended : e.out = "failed" => \A i \in 1..Len(Txns(file.log)) : Txns(file.log)[i].id # e.id
+\* The horizon replay reaches: a GC record follows the checkpoint that precedes it.
+Not_Horizon == LiveR.H = 0
+\* A GC record in the log.
+Not_GcRecord == \A i \in 1..Len(file.log) : ~IsGc(file.log[i])
 Not_UnknownWithoutFault == \A e \in ended : e.out = "unknown" => e.cf
 Not_Unknown == \A e \in ended : e.out # "unknown"
 Not_CommittedAfterFault == \A e \in ended : e.cf => e.out # "committed"
 \* The log runs past max.append.count (a soft limit).
-Not_Overshoot == Len(file.log) <= MaxCount \/ MaxCount = 0
+Not_Overshoot == Len(Txns(file.log)) <= MaxCount \/ MaxCount = 0
 \* The fuzzers' schedules: one operation ran inside another; two did (race);
 \* an operation was restaged; A, a transaction, failed by a race.
 Not_Preempted == sched.racers = {}
@@ -108,7 +111,7 @@ Not_RaceFailedA == res[1] # "failed"
 \* horizon; a writer resolving a lost reply after GC dropped its id.
 Not_LateLandingAfterEnd ==
   \A i \in inflight : file.gen = i.x.cond => ws[i.w].txn # None /\ ws[i.w].txn.id = i.id
-Not_ClockBehindHorizon == \A w \in Writers : Clock(w) > file.chk.H
+Not_ClockBehindHorizon == \A w \in Writers : Clock(w) > LiveR.H
 Not_ResolveAfterGc ==
   \A w \in Writers :
     ~(ws[w].pc = "resolve" /\ ws[w].txn.id \in IdsOf(Hist) /\ ws[w].txn.id \notin LiveR.C)

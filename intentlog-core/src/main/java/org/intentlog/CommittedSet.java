@@ -158,24 +158,29 @@ public final class CommittedSet {
       return CommittedSetCodec.horizon(inherited);
     }
 
-    public CommittedSet build() {
-      return build(0L);
+    /**
+     * Applies a GC record ({@code AdvanceHorizon}): drops every id at or below {@code
+     * watermarkMs}, inherited or added, and raises the horizon to the newest one dropped. A
+     * watermark at or below the horizon drops nothing new.
+     */
+    public Builder advanceHorizon(long watermarkMs) {
+      if (watermarkMs < 0L) {
+        throw new IllegalArgumentException("watermarkMs must be >= 0, got " + watermarkMs);
+      }
+      if (watermarkMs > 0L) {
+        byte[] merged =
+            added.isEmpty() ? inherited : CommittedSetCodec.rewrite(inherited, added, 0L);
+        this.inherited = CommittedSetCodec.rewrite(merged, Collections.emptySet(), watermarkMs);
+        added.clear();
+      }
+      return this;
     }
 
-    /**
-     * Builds the set, first dropping every inherited id at or below {@code dropBeforeTimestampMs}
-     * (0: none) and raising the horizon to the newest one dropped. Added ids are kept whatever
-     * their time.
-     */
-    public CommittedSet build(long dropBeforeTimestampMs) {
-      if (dropBeforeTimestampMs < 0L) {
-        throw new IllegalArgumentException(
-            "dropBeforeTimestampMs must be >= 0, got " + dropBeforeTimestampMs);
-      }
-      if (added.isEmpty() && dropBeforeTimestampMs == 0L) {
+    public CommittedSet build() {
+      if (added.isEmpty()) {
         return of(inherited);
       }
-      return of(CommittedSetCodec.rewrite(inherited, added, dropBeforeTimestampMs));
+      return of(CommittedSetCodec.rewrite(inherited, added, 0L));
     }
   }
 }

@@ -824,7 +824,7 @@ class TestMultiWriterProperties {
           effective.add(wr);
         }
         checkIntegrity(after);
-        String difference = CheckpointRoundTrip.difference(wr.after());
+        String difference = CheckpointRoundTrip.difference(wr);
         check(difference == null, "a checkpoint of the %s write differs from it: %s",
             wr.strategy(), difference);
       }

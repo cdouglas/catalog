@@ -61,7 +61,7 @@ ASSUME /\ FaultKinds \subseteq WriteFaults \cup ReadFaults
        /\ MaxAttempts >= 1 /\ MaxThrottle >= 1
        /\ Sched \in {"free", "mw", "fault", "race"}
        /\ Bugs \subseteq {"10", "12", "16", "17", "18", "25", "26",
-                          "64a", "64b", "64c", "64d", "66"}
+                          "64a", "64b", "64c", "64d", "66", "ckgc"}
 
 Has(b) == b \in Bugs
 Max(a, b) == IF a > b THEN a ELSE b
@@ -118,13 +118,25 @@ Contains(C, H, id) ==
 \* ProtoCatalogFile.Builder.mayApply.
 MayApply(C, H, id) == id \notin C /\ (H = 0 \/ id.ts > H)
 
+\* A log holds intention records and GC records, [wm]: AdvanceHorizon(wm),
+\* which drops the committed ids at or below wm and raises the horizon to the
+\* newest it dropped. Only GC records move the horizon.
+IsGc(r) == "wm" \in DOMAIN r
+Txns(log) == SelectSeq(log, LAMBDA r : ~IsGc(r))
+
+Gc(a, wm) ==
+  LET drop == {i \in a.C : i.ts <= wm}
+  IN IF drop = {} THEN a
+     ELSE [a EXCEPT !.C = @ \ drop, !.H = Max(@, SetMax({i.ts : i \in drop}))]
+
 \* ProtoCatalogFormat.replay over a log. With Bug 64a, replay asks the set
 \* (containsTransaction) about each record, which throws at the horizon.
 RECURSIVE Fold(_, _)
 Fold(a, log) ==
   IF log = << >> \/ a.err THEN a
   ELSE LET r == Head(log)
-           b == IF Has("64a") /\ Contains(a.C, a.H, r.id) = "unknown"
+           b == IF IsGc(r) THEN Gc(a, r.wm)
+                ELSE IF Has("64a") /\ Contains(a.C, a.H, r.id) = "unknown"
                   THEN [a EXCEPT !.err = TRUE]
                 ELSE IF ~MayApply(a.C, a.H, r.id) THEN a
                 ELSE IF Verify(a.st, r)
@@ -133,11 +145,11 @@ Fold(a, log) ==
        IN Fold(b, Tail(log))
 
 \* A read: the replayed state, the version read and its length (in records,
-\* the checkpoint counting one), and the record count (appendCount).
+\* the checkpoint counting one), and the intention-record count (appendCount).
 Replay(f) ==
   LET a == Fold([st |-> f.chk.st, C |-> f.chk.C, H |-> f.chk.H, err |-> FALSE], f.log)
   IN [st |-> a.st, C |-> a.C, H |-> a.H, err |-> a.err,
-      cnt |-> Len(f.log), gen |-> f.gen, len |-> Len(f.log) + 1]
+      cnt |-> Len(Txns(f.log)), gen |-> f.gen, len |-> Len(f.log) + 1]
 
 FileLen(f) == Len(f.log) + 1
 
@@ -149,18 +161,21 @@ LiveR == Replay(file)
 Clock(w) == 1 + now + Skew[w]
 
 \* The file a CAS writes, but its generation: buildFullFile, a checkpoint of
-\* `b` with its committed set filtered at the GC watermark, then the record.
-\* With Bug 64b the watermark is not capped below the record's own time.
+\* `b`, a GC record at the watermark (none when GC is off), then the record.
+\* The checkpoint is the replay of the version the CAS replaces, whatever the
+\* clock says (I11). With Bug 64b the watermark is not capped below the
+\* record's own time. With "ckgc" the checkpoint itself is filtered at the
+\* watermark, as it was before GC records: a reader starting from another
+\* checkpoint of the same log would not see the same horizon.
 CasPayload(w, b, t) ==
   LET c    == Clock(w)
       wm0  == IF Retention < 0 \/ Retention >= c THEN 0 ELSE c - Retention
       wm   == IF Has("64b") THEN wm0 ELSE Max(0, Min(wm0, t.id.ts - 1))
-      drop == {i \in b.C : i.ts <= wm}
-  IN [chk |-> [st |-> b.st,
-               C  |-> IF wm = 0 THEN b.C ELSE b.C \ drop,
-               H  |-> IF wm = 0 \/ drop = {} THEN b.H
-                      ELSE Max(b.H, SetMax({i.ts : i \in drop}))],
-      log |-> << t >>]
+      ckgc == Gc([C |-> b.C, H |-> b.H], wm)
+  IN IF Has("ckgc")
+       THEN [chk |-> [st |-> b.st, C |-> ckgc.C, H |-> ckgc.H], log |-> << t >>]
+       ELSE [chk |-> [st |-> b.st, C |-> b.C, H |-> b.H],
+             log |-> IF wm = 0 THEN << t >> ELSE << [wm |-> wm], t >>]
 
 \* Storage applies a write x = [strat, cond, payload] to f.
 Land(f, x) ==
@@ -632,6 +647,14 @@ CasAppliesItsRecord ==
         /\ file' = Land(file, NextWrite(w))
         /\ Verify(NextWrite(w).payload.chk.st, s.txn))
          => s.txn.id \in IdsOf(Replay(file').st.hist)]_vars
+
+\* A CAS's checkpoint is the replay of the version it replaces: a function of
+\* the log, not of the writer's clock (I11). A log with checkpoints apart from
+\* its records needs this, so that every reader, from whichever checkpoint,
+\* applies the same records.
+CheckpointIsReplay ==
+  [][(file'.gen # file.gen /\ file'.segs = 1) =>
+       LET R == Replay(file) IN file'.chk = [st |-> R.st, C |-> R.C, H |-> R.H]]_file
 
 Safety ==
   Readable /\ ExactlyOnce /\ Serializable /\ UniqueIds

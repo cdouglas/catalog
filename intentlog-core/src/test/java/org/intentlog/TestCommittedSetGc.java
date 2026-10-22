@@ -34,7 +34,7 @@ import org.junit.jupiter.api.Test;
 
 /**
  * Tests for committed-set GC: {@link CommittedSetCodec#rewrite}, the
- * Builder/build(watermark) path, and the tri-state
+ * Builder.advanceHorizon path (a GC record's replay), and the tri-state
  * {@link CommittedSet#contains} semantic with
  * {@link DedupHorizonExceededException}.
  *
@@ -321,11 +321,11 @@ class TestCommittedSetGc {
   }
 
   // ============================================================
-  // Builder.build(watermark)
+  // Builder.advanceHorizon (a GC record)
   // ============================================================
 
   @Test
-  void builderBuildWithWatermarkAppliesGc() throws Exception {
+  void builderAdvanceHorizonAppliesGc() throws Exception {
     Random rand = new Random(0x666);
     long base = 1_000_000L;
     LinkedHashSet<UUID> inherited = new LinkedHashSet<>();
@@ -333,9 +333,52 @@ class TestCommittedSetGc {
     inherited.add(UuidV7.newUuidV7(base + 100, rand));
     byte[] body = CommittedSetCodec.encode(inherited);
 
-    CommittedSet cat = CommittedSet.of(body).toBuilder().build(base);
+    CommittedSet cat = CommittedSet.of(body).toBuilder().advanceHorizon(base).build();
     assertThat(cat.horizon()).isEqualTo(base - 100);
     assertThat(cat.ids()).hasSize(1);
+  }
+
+  /**
+   * A GC record drops the ids replay added before it as well as the inherited ones: it sits at a
+   * position in the log, and drops whatever the set holds there.
+   */
+  @Test
+  void builderAdvanceHorizonDropsAddedIds() throws Exception {
+    Random rand = new Random(0x888);
+    long base = 1_000_000L;
+    UUID inherited = UuidV7.newUuidV7(base - 300, rand);
+    UUID addedOld = UuidV7.newUuidV7(base - 200, rand);
+    UUID addedNew = UuidV7.newUuidV7(base + 200, rand);
+
+    CommittedSet.Builder builder =
+        CommittedSet.of(CommittedSetCodec.encode(List.of(inherited))).toBuilder();
+    builder.add(addedOld).add(addedNew).advanceHorizon(base);
+    UUID addedAfter = UuidV7.newUuidV7(base - 100, rand); // below the watermark, added after it
+    builder.add(addedAfter);
+    CommittedSet cat = builder.build();
+
+    assertThat(cat.horizon()).isEqualTo(base - 200);
+    assertThat(cat.ids()).containsExactlyInAnyOrder(addedNew, addedAfter);
+    assertThatThrownBy(() -> cat.contains(inherited))
+        .isInstanceOf(DedupHorizonExceededException.class);
+  }
+
+  /** Replaying the same GC record again, or an older one, changes nothing. */
+  @Test
+  void builderAdvanceHorizonIsIdempotent() throws Exception {
+    Random rand = new Random(0x999);
+    long base = 1_000_000L;
+    LinkedHashSet<UUID> inherited = new LinkedHashSet<>();
+    for (int i = 0; i < 10; i++) {
+      inherited.add(UuidV7.newUuidV7(base - 500 + i * 100, rand));
+    }
+    byte[] once =
+        CommittedSet.of(CommittedSetCodec.encode(inherited)).toBuilder()
+            .advanceHorizon(base).build().bytes();
+    byte[] again =
+        CommittedSet.of(once).toBuilder().advanceHorizon(base).advanceHorizon(base - 300).build()
+            .bytes();
+    assertThat(again).isEqualTo(once);
   }
 
   @Test

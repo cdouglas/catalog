@@ -4192,11 +4192,12 @@ public class TestCatalogRegressions {
           io.newInputFile(location), io.newInputFile(location).newStream(),
           (int) io.newInputFile(location).getLength());
       builder.addCommittedTransaction(UuidV7.newUuidV7(ahead, new java.util.Random(1)));
+      builder.advanceHorizon(ahead); // a GC record of that writer, replayed into the checkpoint
       ProtoCatalogFile withFuture = builder.build();
       ProtoCatalogFormat.ProtoIdManager ids = new ProtoCatalogFormat.ProtoIdManager();
       ids.setGlobals(withFuture.nextNamespaceId(), withFuture.nextTableId());
       byte[] checkpoint = ProtoCodec.encodeCheckpoint(
-          withFuture, new ProtoCatalogFormat.Mut(withFuture), ids, ahead);
+          withFuture, new ProtoCatalogFormat.Mut(withFuture), ids);
       ByteArrayOutputStream file = new ByteArrayOutputStream();
       file.write(ProtoCatalogFormat.MAGIC);
       file.write(new byte[] {0, 0, 0, (byte) ProtoCatalogFormat.FORMAT_VERSION});

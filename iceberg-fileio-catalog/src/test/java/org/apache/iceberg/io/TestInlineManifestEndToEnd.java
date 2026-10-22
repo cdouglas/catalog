@@ -368,8 +368,11 @@ public class TestInlineManifestEndToEnd {
     ProtoCodec.Transaction last = null;
     while (in.available() > 0) {
       int txnLen = readVarintFromStream(in);
-      byte[] txnBytes = in.readNBytes(txnLen);
-      last = ProtoCodec.decodeTransaction(txnBytes);
+      org.intentlog.wire.LogEnvelope.Record record =
+          org.intentlog.wire.LogEnvelope.decodeRecord(in.readNBytes(txnLen));
+      if (!record.isAdvanceHorizon()) { // a CAS's GC record precedes its transaction
+        last = ProtoCodec.decodeTransaction(record.id(), record.intention());
+      }
     }
     if (last == null) {
       throw new IllegalStateException("no appended transaction in catalog file");

@@ -189,9 +189,9 @@ the wire bytes in a single linear pass without materializing the set:
 the catalog file holds the inner-message bytes directly (no
 `HashSet<UUID>`). A read that applies no log records keeps the
 checkpoint's bytes as they are; one that applies records merges their
-ids in (`CommittedSetCodec.rewrite`, in intentlog-core). A CAS copies the bytes into
-its checkpoint unchanged only when GC is off; otherwise it rewrites them
-on every CAS (see below).
+ids in (`CommittedSetCodec.rewrite`, in intentlog-core). A CAS copies the
+replayed set into its checkpoint unchanged; a GC record after it drops the
+old ids (see below).
 
 All entries must be UUIDv7; non-v7 IDs are rejected at the dedup-set
 entry point (`ProtoCatalogFile.Builder.addCommittedTransaction`) and
@@ -205,7 +205,8 @@ The dedup set in `LogCheckpoint.committed` grows monotonically
 across compactions. Without a retention policy, even with v7 compression
 the section's size scales linearly with the catalog's total commit
 history. The retention policy below trims old entries at compaction
-time while preserving the dedup guarantee inside a configurable window.
+time, by a GC record each compaction writes after its checkpoint, while
+preserving the dedup guarantee inside a configurable window.
 See [GC.md](GC.md) for the implementation rationale.
 
 **Premise: UUIDv7 timestamps approximate commit time.** Transaction IDs
@@ -226,48 +227,57 @@ pass has dropped. It is absent (0) until the first drop and never
 decreases: each pass keeps the larger of the inherited horizon and what
 it drops.
 
-**GC algorithm.** The set changes in two places. A read merges the id of
+**GC is a record.** Only a GC record (`LogRecord.advance_horizon`, an
+`AdvanceHorizon{watermark_ms}`) drops ids or moves the horizon. Replay
+applies one wherever it lands: it drops every id the set holds at that
+point, checkpoint's and replayed alike, whose timestamp is at or below
+`watermark_ms`, and raises the horizon to the newest it drops. Replaying
+it twice, or an older one, changes nothing. A checkpoint holds exactly
+the set the replay before it reached, so every checkpoint is a replay of
+the log before it, whatever clock wrote it (I11): a log whose checkpoints
+are stored apart from its records, where readers start from different
+checkpoints, needs this for every reader to apply the same records.
+
+**GC algorithm.** The set changes in three places. A read merges the id of
 each record replay applies into the set, dropping nothing
-(`ProtoCatalogFile.Builder.build()`). A CAS (any CAS-mode commit,
-including the always-CAS path when `maxAppendCount=0`) then filters the
-set of the state it checkpoints (`ProtoCatalogFormat` `buildFullFile`,
-through `ProtoCodec.encodeCheckpoint`):
+(`ProtoCatalogFile.Builder.build()`), and applies each GC record
+(`advanceHorizon`). A CAS (any CAS-mode commit, including the always-CAS
+path when `maxAppendCount=0`) writes a GC record between its checkpoint and
+its own record (`ProtoCatalogFormat` `buildFullFile`):
 
 ```
-function compactCommitted(base, txn, retentionMs):
-    # base: the replayed state of the file being replaced. Its set holds the
-    # checkpoint's ids and those of every log record replay applied.
+function gcRecord(txn, retentionMs):
     nowMs       = System.currentTimeMillis()
     watermarkMs = retentionMs >= nowMs ? 0 : nowMs - retentionMs
-    # Below this commit's own id: its record follows the checkpoint, and
+    # Below this commit's own id: its record follows the GC record, and
     # replay rejects a record at or below the horizon.
     watermarkMs = max(0, min(watermarkMs, timestamp(txn.id) - 1))
     if watermarkMs == 0:
-        return base.committed                    # GC off: copied unchanged
+        return none                               # GC off: no record
+    return LogRecord{ advance_horizon = AdvanceHorizon{ watermark_ms = watermarkMs } }
 
+function advanceHorizon(set, watermarkMs):        # replay of a GC record
     kept    = []
-    horizon = base.committed.highest_dropped_timestamp_ms
-    for entry in decode(base.committed.packed_entries):   # descending
+    horizon = set.highest_dropped_timestamp_ms
+    for entry in set:                             # checkpoint's and replayed, descending
         if timestamp(entry) > watermarkMs:
             kept.append(entry)
         else:
             horizon = max(horizon, timestamp(entry))
-
-    if kept is empty and horizon == 0:
-        return absent                             # field omitted
     return CommittedTransactions(
         max_timestamp_ms             = kept[0].timestamp or 0,
         packed_entries               = encode(kept),
         highest_dropped_timestamp_ms = horizon)   # omitted when 0
 ```
 
-The log records of the file being replaced are in `base`'s set by then,
-so they are as eligible for GC as the checkpoint's own entries. Only the
-compacting commit's record, which follows the new checkpoint, is outside
-the pass; its id joins the set when a read replays it. Both passes are
-`CommittedSetCodec.rewrite` (intentlog-core), one linear walk of the descending
-entries: the merge at read with no watermark, the filter at CAS with no
-additions.
+The log records of the file being replaced are in the checkpoint's set,
+so they are as eligible for GC as its older entries. Only the compacting
+commit's record, which follows the GC record, is outside the pass; its id
+joins the set when a read replays it. Both passes are
+`CommittedSetCodec.rewrite` (intentlog-core), one linear walk of the
+descending entries: the merge at read with no watermark, the filter at a
+GC record with no additions. A GC record carries no id, is not deduped,
+and does not count toward `max.append.count`.
 
 **Edge case: the horizon can exceed `max_timestamp_ms`.** A pass that
 drops every entry writes a horizon-only body (`max_timestamp_ms = 0`,
@@ -911,11 +921,12 @@ function tryCAS(base, current, txn, txnBytes, fileIO):
 ```
 
 `buildFullFile` creates:
-`[MAGIC][VERSION][varint(chkLen)][checkpoint][varint(txnLen)][txn]`. The
-checkpoint is encoded from `base` alone, the replayed state of the file being
-replaced, its committed set filtered at a GC watermark capped below `txn`'s own
-id (see [Committed-set retention](#committed-set-retention-gc)); the pending
-mutations are only in the transaction record, which replay verifies against
+`[MAGIC][VERSION][varint(chkLen)][checkpoint][varint(gcLen)][gc][varint(txnLen)][txn]`.
+The checkpoint is encoded from `base` alone, the replayed state of the file
+being replaced, committed set included; the GC record that follows it drops
+the ids at or below a watermark capped below `txn`'s own id, and is omitted
+when GC is off (see [Committed-set retention](#committed-set-retention-gc));
+the pending mutations are only in the transaction record, which replay verifies against
 `base` and applies, exactly as for an append. `base`
 is usually the writer's `original`. After a lost append race it is the state
 the writer re-read, and a transaction whose preconditions no longer hold is

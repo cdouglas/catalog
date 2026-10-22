@@ -91,14 +91,26 @@ message CommittedTransactions {
 }
 
 // One entry of the log: an intention, which replay applies once, if its
-// preconditions hold where it lands.
+// preconditions hold where it lands, or a GC of the committed set.
 message LogRecord {
-  // A UUIDv7 (16 bytes): replay applies a record whose id the committed set
-  // does not hold, and a writer learns from the set whether its record did.
+  // An intention's UUIDv7 (16 bytes): replay applies a record whose id the
+  // committed set does not hold, and a writer learns from the set whether its
+  // record did. Required with an intention; a GC record has none.
   bytes id = 1;
 
   oneof body {
     // The state machine's intention (the catalog: iceberg.catalog.Intention).
     bytes intention = 2;
+    // A GC of the committed set. Only these move the horizon, so every
+    // checkpoint is a replay of the log before it, whatever clock wrote it.
+    AdvanceHorizon advance_horizon = 3;
   }
+}
+
+// Drops the committed ids at or below watermark_ms, and raises the horizon to
+// the newest it drops. Replay applies it wherever it lands, and applying it
+// twice changes nothing. Its writer picks the watermark (now less its
+// retention), below the id of any record it writes after it.
+message AdvanceHorizon {
+  fixed64 watermark_ms = 1;
 }

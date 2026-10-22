@@ -49,7 +49,12 @@ table takes about 20 minutes; most configurations take seconds, and `mix`,
 
 **Storage.** One object: `[gen, chk, log, segs]`. `chk` is the checkpoint: the
 state, the committed set `C` and its GC horizon `H`. `log` holds the records
-appended since, and `segs` the writes since the object was created. Every write
+appended since, and `segs` the writes since the object was created. A record
+is a transaction or a GC record, `[wm]` (log.proto's `AdvanceHorizon`): replay
+drops the committed ids at or below `wm` and raises `H` to the newest it drops,
+and nothing else moves `H`. A CAS writes the checkpoint of the state it
+replayed, unfiltered, then a GC record at its watermark, then its own record
+(`CasPayload`). The append count (`cnt`) counts transactions only. Every write
 gets a fresh generation, and every conditional write names the generation it
 expects. An append past `SegLimit` writes is refused.
 
@@ -74,8 +79,8 @@ nondeterministic, within a budget (`MaxFaults`):
 | `inflight` | the request times out but stays in flight, and may land later (`LandInflight`) |
 | `readFail` | a read fails |
 
-Clocks tick (`Tick`), each writer has a skew, and a CAS drops committed ids at
-its GC watermark.
+Clocks tick (`Tick`), each writer has a skew, and a CAS writes a GC record at
+its watermark.
 
 **Schedules.** `Sched = "free"` allows any interleaving. The other modes give the
 schedules of one fuzzer each: operations run one at a time, and another may run
@@ -131,6 +136,7 @@ records (`MaxSize` counts records), and backoff timing.
 | `SoloCommits` | a commit no other write raced, on storage that did not fail, commits |
 | `HistGrows` (action) | the history only grows, one transaction at a time |
 | `CasAppliesItsRecord` (action) | a CAS applies its own record when the record holds on the checkpoint it wrote |
+| `CheckpointIsReplay` (action) | a CAS's checkpoint is the replay of the version it replaces: a function of the log, not of its writer's clock (I11) |
 
 ## Results
 
@@ -143,10 +149,10 @@ Every configuration passes:
 | `two-each`, `long` | several transactions per writer: compaction racing appends, the shrink path | 958, 538 |
 | `creates` | creates in different namespaces | 61 |
 | `faults`, `faults-strict`, `faults2` | every fault, late landings included; strict versions; two faults | 1,021; 1,183; 160,075 |
-| `gc0`, `skew` | retention 0; a writer's clock behind by more than the retention | 21,991; 750,212 |
+| `gc0`, `skew` | retention 0; a writer's clock behind by more than the retention | 22,049; 768,774 |
 | `seg` | a segment cap below max.append.count | 77 |
-| `mix`, `mix-lenient` | everything at once | 401,402; 712,767 |
-| `long-faults`, `three` | faults with the shrink path; three writers | 99,183; 106,249 |
+| `mix`, `mix-lenient` | everything at once | 401,396; 620,919 |
+| `long-faults`, `three` | faults with the shrink path; three writers | 100,928; 106,249 |
 | `sched-*` | each fuzzer's schedules | 33 to 7,636 |
 
 **Calibration.** Each bug switch puts back a bug the fuzzers or reviews found
@@ -166,6 +172,7 @@ Every configuration passes:
 | 64c | ids are minted without regard to the horizon | `CasAppliesItsRecord` |
 | 64d | `DedupHorizonExceededException` escapes the commit | `HonestFailed` |
 | 66 | `SegmentLimitException` is taken as ambiguous | `UnknownExplained` |
+| `ckgc` | not a bug: the design before GC records, a CAS whose checkpoint is filtered at its writer's watermark | `CheckpointIsReplay` |
 
 **Coverage.** `check.py --witnesses` checks, for each `Not_` predicate in
 `MC.tla`, that some passing configuration violates it, so that configuration
@@ -173,7 +180,7 @@ reaches the branch:
 
 - the shrink path, the CAS after a fresh read, a CAS rebase, a stale append retry;
 - throttle retries, a full segment, the final read after the last attempt;
-- a record twice in the log (so exactly-once is not vacuous);
+- a record twice in the log (so exactly-once is not vacuous); a GC record in the log;
 - a failed commit whose record landed, a horizon, unknown outcomes with and without faults;
 - the log past max.append.count;
 - preemption on each fuzzer's schedules, two racers, restages, A failing its race;

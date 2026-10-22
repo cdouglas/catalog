@@ -39,6 +39,7 @@ import org.apache.iceberg.exceptions.CommitStateUnknownException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.intentlog.DedupHorizonExceededException;
+import org.intentlog.wire.LogEnvelope;
 import org.intentlog.wire.UuidV7;
 
 /**
@@ -86,10 +87,11 @@ public class ProtoCatalogFormat
 
   /**
    * Retention window for the committed-transaction dedup set, in milliseconds.
-   * On every CAS / compaction commit the writer drops any UUIDv7 from
-   * {@code CommittedTransactions} whose timestamp is at or below
-   * {@code now - committedRetentionMs} (and below its own transaction's). The
-   * largest dropped timestamp becomes {@code highest_dropped_timestamp_ms}: a
+   * Every CAS / compaction commit writes a GC record (AdvanceHorizon) after its
+   * checkpoint, which drops any UUIDv7 from {@code CommittedTransactions} whose
+   * timestamp is at or below {@code now - committedRetentionMs} (and below its
+   * own transaction's). The largest dropped timestamp becomes
+   * {@code highest_dropped_timestamp_ms}: a
    * query for a UUID at or below it throws {@link DedupHorizonExceededException},
    * and replay rejects a record whose id is at or below it (Bug 64). Default: 6
    * hours, long enough to cover any commit's retries, short enough to bound the
@@ -244,9 +246,17 @@ public class ProtoCatalogFormat
         int txnLen = readVarint(logStream);
         byte[] txnBytes = new byte[txnLen];
         IOUtil.readFully(logStream, txnBytes, 0, txnLen);
+
+        LogEnvelope.Record record = LogEnvelope.decodeRecord(txnBytes);
+        if (record.isAdvanceHorizon()) {
+          // A GC of the committed set: the only thing that moves its horizon. Not counted in
+          // appendCount, which counts the commits the log holds.
+          builder.advanceHorizon(record.watermarkMs());
+          continue;
+        }
         appendCount++;
 
-        ProtoCodec.Transaction txn = ProtoCodec.decodeTransaction(txnBytes);
+        ProtoCodec.Transaction txn = ProtoCodec.decodeTransaction(record.id(), record.intention());
         if (!builder.mayApply(txn.id())) {
           // Already applied (a retry), or its id is at or below the committed set's GC horizon,
           // where the set cannot tell a retry of an aged-out commit from a new one.
@@ -1033,22 +1043,30 @@ public class ProtoCatalogFormat
       out.write(MAGIC);
       writeInt(out, FORMAT_VERSION);
 
-      // Checkpoint of the base state; pending changes go in the record below. CAS / compaction
-      // is the only place the committed-set is rewritten, so this is also the GC
-      // site: any inherited UUIDv7 with timestamp_ms <= watermark is dropped.
-      // watermark = now - committedRetentionMs, clamped to 0 (never negative);
-      // Long.MAX_VALUE retention disables GC. It stays below this transaction's
-      // own time: the horizon must not reach the record that follows, or replay
-      // rejects it (Bug 64). A short retention would otherwise drop the id of a
-      // commit this one rebased on, minted after it.
+      // Checkpoint of the base state, exactly as replay reached it; pending changes go in the
+      // record below.
+      ProtoIdManager baseIds = new ProtoIdManager();
+      baseIds.setGlobals(base.nextNamespaceId(), base.nextTableId());
+      byte[] checkpointBytes = ProtoCodec.encodeCheckpoint(base, this, baseIds);
+      writeVarint(out, checkpointBytes.length);
+      out.write(checkpointBytes);
+
+      // GC of the committed set, as a record: replay drops the ids at or below the
+      // watermark, now - committedRetentionMs, clamped to 0 (never negative);
+      // Long.MAX_VALUE retention disables GC, and no record is written. Being a record,
+      // not a filter on the checkpoint, every checkpoint is a replay of the log before it
+      // (I11). The watermark stays below this transaction's own time: the horizon must
+      // not reach the record that follows, or replay rejects it (Bug 64). A short
+      // retention would otherwise drop the id of a commit this one rebased on, minted
+      // after it.
       long now = System.currentTimeMillis();
       long watermark = committedRetentionMs >= now ? 0L : now - committedRetentionMs;
       watermark = Math.max(0L, Math.min(watermark, UuidV7.timestampMs(txn.id()) - 1));
-      ProtoIdManager baseIds = new ProtoIdManager();
-      baseIds.setGlobals(base.nextNamespaceId(), base.nextTableId());
-      byte[] checkpointBytes = ProtoCodec.encodeCheckpoint(base, this, baseIds, watermark);
-      writeVarint(out, checkpointBytes.length);
-      out.write(checkpointBytes);
+      if (watermark > 0L) {
+        byte[] gcBytes = LogEnvelope.encodeAdvanceHorizon(watermark);
+        writeVarint(out, gcBytes.length);
+        out.write(gcBytes);
+      }
 
       // Transaction: the checkpoint holds the base state only; replay verifies
       // and applies this record on top of it (binding any late-bound ids).

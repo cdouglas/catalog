@@ -19,11 +19,13 @@
 package org.intentlog.wire;
 
 import static org.intentlog.wire.ProtoWire.bytesToUuid;
+import static org.intentlog.wire.ProtoWire.readFixed64;
 import static org.intentlog.wire.ProtoWire.readLengthDelimitedBytes;
 import static org.intentlog.wire.ProtoWire.readVarint;
 import static org.intentlog.wire.ProtoWire.skipField;
 import static org.intentlog.wire.ProtoWire.uuidToBytes;
 import static org.intentlog.wire.ProtoWire.writeBytes;
+import static org.intentlog.wire.ProtoWire.writeFixed64;
 import static org.intentlog.wire.ProtoWire.writeVarint;
 
 import java.io.ByteArrayInputStream;
@@ -35,7 +37,8 @@ import java.util.UUID;
 /**
  * The envelope of a log's checkpoints and records (log.proto): {@code LogCheckpoint} carries the
  * log's id, the committed set and the state machine's checkpoint; {@code LogRecord} carries a
- * record's id and the state machine's intention. The state machine's bytes are opaque here.
+ * record's id and the state machine's intention, or a GC of the committed set ({@code
+ * AdvanceHorizon}). The state machine's bytes are opaque here.
  */
 public final class LogEnvelope {
 
@@ -52,6 +55,9 @@ public final class LogEnvelope {
 
   public static final int LOG_RECORD_ID = 1;
   public static final int LOG_RECORD_INTENTION = 2;
+  public static final int LOG_RECORD_ADVANCE_HORIZON = 3;
+
+  public static final int ADVANCE_HORIZON_WATERMARK_MS = 1;
 
   private LogEnvelope() {}
 
@@ -81,22 +87,44 @@ public final class LogEnvelope {
     }
   }
 
-  /** A decoded {@code LogRecord}. */
+  /** A decoded {@code LogRecord}: an intention with its id, or a GC record. */
   public static final class Record {
     private final UUID id;
     private final byte[] intention;
+    private final long watermarkMs;
 
-    public Record(UUID id, byte[] intention) {
+    private Record(UUID id, byte[] intention, long watermarkMs) {
       this.id = id;
       this.intention = intention;
+      this.watermarkMs = watermarkMs;
     }
 
+    public static Record intention(UUID id, byte[] intention) {
+      return new Record(id, intention, -1L);
+    }
+
+    public static Record advanceHorizon(long watermarkMs) {
+      return new Record(null, null, watermarkMs);
+    }
+
+    /** Whether this is a GC record ({@code AdvanceHorizon}) rather than an intention. */
+    public boolean isAdvanceHorizon() {
+      return intention == null;
+    }
+
+    /** The intention's id; null for a GC record. */
     public UUID id() {
       return id;
     }
 
+    /** The intention; null for a GC record. */
     public byte[] intention() {
       return intention;
+    }
+
+    /** A GC record's watermark: it drops the committed ids at or below it. */
+    public long watermarkMs() {
+      return watermarkMs;
     }
   }
 
@@ -179,12 +207,29 @@ public final class LogEnvelope {
     }
   }
 
-  /** Decodes a {@code LogRecord}. Fails if it lacks the id or a body. */
+  /** Encodes a {@code LogRecord} that carries a GC of the committed set at {@code watermarkMs}. */
+  public static byte[] encodeAdvanceHorizon(long watermarkMs) {
+    try {
+      ByteArrayOutputStream gc = new ByteArrayOutputStream(9);
+      writeFixed64(gc, ADVANCE_HORIZON_WATERMARK_MS, watermarkMs);
+      ByteArrayOutputStream out = new ByteArrayOutputStream(11);
+      writeBytes(out, LOG_RECORD_ADVANCE_HORIZON, gc.toByteArray());
+      return out.toByteArray();
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
+  /**
+   * Decodes a {@code LogRecord}. Fails if it has no body, or more than one, or an intention
+   * without an id.
+   */
   public static Record decodeRecord(byte[] bytes) {
     try {
       ByteArrayInputStream in = new ByteArrayInputStream(bytes);
       UUID id = null;
       byte[] intention = null;
+      Long watermarkMs = null;
       while (in.available() > 0) {
         int tag = readVarint(in);
         switch (tag >>> 3) {
@@ -194,16 +239,38 @@ public final class LogEnvelope {
           case LOG_RECORD_INTENTION:
             intention = readLengthDelimitedBytes(in);
             break;
+          case LOG_RECORD_ADVANCE_HORIZON:
+            watermarkMs = decodeAdvanceHorizon(readLengthDelimitedBytes(in));
+            break;
           default:
             skipField(in, tag & 0x7);
         }
       }
+      check(intention != null || watermarkMs != null, "Record has no body");
+      check(intention == null || watermarkMs == null, "Record has two bodies");
+      if (watermarkMs != null) {
+        return Record.advanceHorizon(watermarkMs);
+      }
       check(id != null, "Record missing required id field");
-      check(intention != null, "Record has no body");
-      return new Record(id, intention);
+      return Record.intention(id, intention);
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
+  }
+
+  private static long decodeAdvanceHorizon(byte[] bytes) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    Long watermarkMs = null;
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      if (tag >>> 3 == ADVANCE_HORIZON_WATERMARK_MS) {
+        watermarkMs = readFixed64(in);
+      } else {
+        skipField(in, tag & 0x7);
+      }
+    }
+    check(watermarkMs != null, "AdvanceHorizon missing required watermark_ms field");
+    return watermarkMs;
   }
 
   private static void check(boolean condition, String message) {

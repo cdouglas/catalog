@@ -50,6 +50,7 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.types.Types;
 import org.intentlog.DedupHorizonExceededException;
+import org.intentlog.wire.LogEnvelope;
 import org.intentlog.wire.UuidV7;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
@@ -173,7 +174,7 @@ public class FormatExplorerFixtures {
    * empty transaction, and the first create appended to it.
    */
   private static Scenario emptyBootstrap() {
-    Log log = Log.cas(emptyCatalog(), txn(1), mut -> {}, 0L,
+    Log log = Log.cas(emptyCatalog(), txn(1), mut -> {},
         "Record 0: the empty transaction FileIOCatalog.initialize commits to create the file. "
             + "Its id joins the committed set, like any other.");
     log.append(txn(2), mut -> mut.createNamespace(Namespace.of("analytics")),
@@ -200,7 +201,7 @@ public class FormatExplorerFixtures {
 
   /** A namespace and a table in it, created in one transaction. */
   private static Scenario lateBoundCreates() {
-    Log log = Log.cas(emptyCatalog(), txn(10), mut -> {}, 0L, "Record 0: initialize.");
+    Log log = Log.cas(emptyCatalog(), txn(10), mut -> {}, "Record 0: initialize.");
     TableIdentifier rawEvents = TableIdentifier.of(Namespace.of("staging"), "raw_events");
     log.append(txn(11),
         mut -> mut.createNamespace(Namespace.of("staging"))
@@ -238,7 +239,6 @@ public class FormatExplorerFixtures {
             Map.of("table-name", table));
     byte[] metadata = InlineMetadataCodecs.byTag(codec).encode(meta);
     Log log = Log.cas(base, txn(30 + codec), mut -> mut.createTableInline(ident, metadata, codec),
-        0L,
         "The CAS write that creates the table: a checkpoint of the catalog before it, then the "
             + "CreateTableInline record. Replay binds the table's id -1 to 1.");
     String description =
@@ -284,7 +284,7 @@ public class FormatExplorerFixtures {
                     60_000L),
                 main(snapshotId)),
             PINNED_TS + 60_000L);
-    Log log = Log.cas(base, txn(42), mut -> mut.updateTableInlineDelta(events, delta), 0L,
+    Log log = Log.cas(base, txn(42), mut -> mut.updateTableInlineDelta(events, delta),
         "The append, as a TableMetadataDelta: an AddSnapshot (its summary a CompactSummary), "
             + "then a SetSnapshotRef moving main to it. The snapshot's time is a delta from the "
             + "base's last-updated-ms; the delta's own last_updated_ms is the committed one.");
@@ -340,7 +340,7 @@ public class FormatExplorerFixtures {
             .discardChanges()
             .build();
     byte[] delta = writerDelta(base, orders, after);
-    Log log = Log.cas(base, txn(47), mut -> mut.updateTableInlineDelta(orders, delta), 0L,
+    Log log = Log.cas(base, txn(47), mut -> mut.updateTableInlineDelta(orders, delta),
         "The change as a TableMetadataDelta: AddSchema with the new schema's JSON (gzip) and "
             + "SetCurrentSchema; AddPartitionSpec and SetDefaultPartitionSpec; AddSortOrder, "
             + "structured (no JSON), and SetDefaultSortOrder; and SetTableProperties with the "
@@ -377,7 +377,7 @@ public class FormatExplorerFixtures {
             .append(txn(51), mut -> mut.createTable(a, "s3://lake/warehouse/A/v1.metadata.json")
                 .createTable(b, "s3://lake/warehouse/B/v1.metadata.json"), null)
             .state();
-    Log log = Log.checkpoint(base, 0L);
+    Log log = Log.checkpoint(base);
     log.append(txn(52), mut -> mut.updateTable(a, "s3://lake/warehouse/A/v2.metadata.json"),
         "T1: UpdateTableLocation(A, version = 1). Applies; A moves to version 2.");
     log.append(base, txn(53),
@@ -432,7 +432,7 @@ public class FormatExplorerFixtures {
     long s2b = 0x2222222222222223L;
     long s3a = 0x3333333333333333L;
     long s3b = 0x3333333333333334L;
-    Log log = Log.checkpoint(base, 0L);
+    Log log = Log.checkpoint(base);
     byte[] t1 = writerDelta(base, a, appendToMain(s1, null, "A/metadata/snap-1.avro", 60_000L),
         PINNED_TS + 60_000L);
     log.append(txn(62), mut -> mut.updateTableInlineDelta(a, t1),
@@ -490,7 +490,7 @@ public class FormatExplorerFixtures {
         Log.of(emptyCatalog())
             .append(txn(70), mut -> mut.createNamespace(sales).createNamespace(ops), null)
             .state();
-    Log log = Log.checkpoint(base, 0L);
+    Log log = Log.checkpoint(base);
     log.append(base, txn(71),
         mut -> mut.createTable(TableIdentifier.of(sales, "orders"),
             "s3://lake/sales/orders/v1.metadata.json"),
@@ -533,7 +533,7 @@ public class FormatExplorerFixtures {
             .append(txn(80), mut -> mut.createNamespace(staging).createNamespace(prod)
                 .createTable(from, "s3://lake/staging/daily/v1.metadata.json"), null)
             .state();
-    Log log = Log.checkpoint(base, 0L);
+    Log log = Log.checkpoint(base);
     log.append(base, txn(81), mut -> mut.renameTable(from, to),
         "RenameTable(id = 1, version = 1, new_namespace_id = 2, new_namespace_version = 1, "
             + "new_name = \"daily_v2\"). Applies: the table keeps its id and metadata, moves to "
@@ -596,7 +596,7 @@ public class FormatExplorerFixtures {
                 new InlineDeltaCodec.RemoveManifestUpdate(s2, m1.path()),
                 new InlineDeltaCodec.AddManifestUpdate(s2, m3, "", 0)),
             PINNED_TS + 120_000L);
-    Log log = Log.cas(afterFirst, txn(93), mut -> mut.updateTableInlineDelta(clicks, second), 0L,
+    Log log = Log.cas(afterFirst, txn(93), mut -> mut.updateTableInlineDelta(clicks, second),
         "A CAS write. The checkpoint's InlineTable holds the pool [m1, m2] and S1's indices "
             + "[0, 1]. The record's delta adds S2 on S1 with an empty manifest_list_suffix (its "
             + "list is inline), removes m1 from S2's list and inserts m3 at position 0: replay "
@@ -619,7 +619,7 @@ public class FormatExplorerFixtures {
   }
 
   /**
-   * A CAS write whose checkpoint drops the oldest committed transaction ids, as every CAS write
+   * A CAS write whose GC record drops the oldest committed transaction ids, as every CAS write
    * does for ids older than the retention window, and records the horizon.
    */
   private static Scenario compactionWithCommittedSetGc() {
@@ -638,25 +638,28 @@ public class FormatExplorerFixtures {
         null);
     ProtoCatalogFile base = history.state();
     long watermark = UuidV7.timestampMs(txn(101));
-    Log log = Log.cas(base, txn(105),
-        mut -> mut.updateTable(events, "s3://lake/warehouse/bronze/events/v3.metadata.json"),
-        watermark,
-        "The compacting commit's own record, UpdateTableLocation(events, version = 2). Its id "
-            + "joins the committed set when replay applies it.");
+    Log log = Log.checkpoint(base)
+        .gc(watermark,
+            "GC: AdvanceHorizon drops the committed ids at or below its watermark (now - "
+                + "fileio.catalog.committed.retention.ms, 6 hours by default, kept below the "
+                + "commit's own id) and records the largest dropped timestamp as "
+                + "highest_dropped_timestamp_ms. A lookup of an id at or below it is unknown "
+                + "(DedupHorizonExceededException), not 'absent': the commit may have landed "
+                + "and aged out.")
+        .append(base, txn(105),
+            mut -> mut.updateTable(events, "s3://lake/warehouse/bronze/events/v3.metadata.json"),
+            "The compacting commit's own record, UpdateTableLocation(events, version = 2). Its "
+                + "id joins the committed set when replay applies it.");
     return log.scenario(
         "compaction-with-committed-set-gc",
         "A CAS write: the checkpoint holds two nested namespaces, a pointer table and a "
-            + "namespace property, then the commit's record follows. The checkpoint's "
-            + "CommittedTransactions (field 20) is the dedup set: UUIDv7s sorted descending, each "
-            + "a varint gap from the previous timestamp plus 10 random bytes, in one "
-            + "packed_entries blob the catalog scans without allocating. Click it to see the "
-            + "UUIDs.",
-        List.of(
-            "GC: this CAS write dropped the ids at or below its watermark (now - "
-                + "fileio.catalog.committed.retention.ms, 6 hours by default) and recorded the "
-                + "largest dropped timestamp as highest_dropped_timestamp_ms. A lookup of an id "
-                + "at or below it is unknown (DedupHorizonExceededException), not 'absent': "
-                + "the commit may have landed and aged out."),
+            + "namespace property, then a GC record and the commit's record follow. The "
+            + "checkpoint's committed set (LogCheckpoint.committed) is the dedup set: UUIDv7s "
+            + "sorted descending, each a varint gap from the previous timestamp plus 10 random "
+            + "bytes, in one packed_entries blob the catalog scans without allocating. Click it "
+            + "to see the UUIDs. The checkpoint holds the whole set the replay before it reached: "
+            + "a GC is a record in the log, never a filter on a checkpoint.",
+        List.of(),
         state -> {
           expect(state.highestDroppedTimestampMs(), watermark, "horizon");
           expect(state.containsTransaction(txn(105)), true, "the compacting commit");
@@ -687,22 +690,27 @@ public class FormatExplorerFixtures {
     }
 
     /** A file of a checkpoint of {@code state} and no records. */
-    static Log checkpoint(ProtoCatalogFile state, long watermark) {
-      return new Log(header(checkpointBytes(state, watermark)));
+    static Log checkpoint(ProtoCatalogFile state) {
+      return new Log(header(checkpointBytes(state)));
     }
 
     /** A file of a checkpoint of {@code state}, to build a later state with records. */
     static Log of(ProtoCatalogFile state) {
-      return checkpoint(state, 0L);
+      return checkpoint(state);
     }
 
     /**
      * A CAS write of the change {@code change} makes to {@code base}: a checkpoint of {@code
-     * base}, dropping committed ids at or below {@code watermark}, and the change's record.
+     * base} and the change's record.
      */
     static Log cas(ProtoCatalogFile base, UUID id, Consumer<ProtoCatalogFormat.Mut> change,
-        long watermark, String note) {
-      return checkpoint(base, watermark).append(base, id, change, note);
+        String note) {
+      return checkpoint(base).append(base, id, change, note);
+    }
+
+    /** Appends a GC record that drops the committed ids at or below {@code watermark}. */
+    Log gc(long watermark, String note) {
+      return appendRecord(LogEnvelope.encodeAdvanceHorizon(watermark), note);
     }
 
     /** Appends the record of a writer that read the current state. */
@@ -717,7 +725,11 @@ public class FormatExplorerFixtures {
       change.accept(mut);
       List<ProtoCodec.Action> actions = new ArrayList<>();
       mut.buildActions(actions, new ProtoCatalogFormat.ProtoIdManager());
-      byte[] body = ProtoCodec.encodeTransaction(new ProtoCodec.Transaction(id, actions));
+      return appendRecord(
+          ProtoCodec.encodeTransaction(new ProtoCodec.Transaction(id, actions)), note);
+    }
+
+    private Log appendRecord(byte[] body, String note) {
       ByteArrayOutputStream out = new ByteArrayOutputStream();
       out.writeBytes(file);
       writeVarint(out, body.length);
@@ -766,10 +778,10 @@ public class FormatExplorerFixtures {
     return out.toByteArray();
   }
 
-  private static byte[] checkpointBytes(ProtoCatalogFile state, long watermark) {
+  private static byte[] checkpointBytes(ProtoCatalogFile state) {
     ProtoCatalogFormat.ProtoIdManager ids = new ProtoCatalogFormat.ProtoIdManager();
     ids.setGlobals(state.nextNamespaceId(), state.nextTableId());
-    return ProtoCodec.encodeCheckpoint(state, new ProtoCatalogFormat.Mut(state), ids, watermark);
+    return ProtoCodec.encodeCheckpoint(state, new ProtoCatalogFormat.Mut(state), ids);
   }
 
   private static void writeVarint(ByteArrayOutputStream out, int value) {
@@ -790,7 +802,7 @@ public class FormatExplorerFixtures {
 
   /** A catalog holding namespace {@code warehouse}, created by an initialized catalog. */
   private static ProtoCatalogFile warehouse(int seq) {
-    return Log.cas(emptyCatalog(), txn(1000 + seq), mut -> {}, 0L, null)
+    return Log.cas(emptyCatalog(), txn(1000 + seq), mut -> {}, null)
         .append(txn(2000 + seq), mut -> mut.createNamespace(WAREHOUSE), null)
         .state();
   }
