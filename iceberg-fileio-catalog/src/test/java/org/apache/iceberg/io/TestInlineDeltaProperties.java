@@ -113,7 +113,7 @@ class TestInlineDeltaProperties {
     Statistics.label("commit").collect("delta");
     byte[] deltaBytes = InlineDeltaCodec.encodeDelta(delta, next.lastUpdatedMillis());
     CatalogState.Builder builder =
-        CatalogState.builder(CatalogStateGeneratorsStub.LOCATION)
+        CatalogState.builder()
             .addInlineTable(1, 0, "t", 1, codec.encode(stored), codec.tag(), "");
     ProtoCodec.UpdateTableInlineAction.delta(1, 1, deltaBytes).apply(builder);
     TableMetadata replayed = codec.decodeFull(builder.inlineMetadata(1), "inline://replayed");
@@ -191,31 +191,5 @@ class TestInlineDeltaProperties {
   private static String abbreviate(JsonNode node) {
     String s = node.toString();
     return s.length() <= 300 ? s : s.substring(0, 300) + "...";
-  }
-
-  /** A location for builders that never read a file. */
-  private static final class CatalogStateGeneratorsStub {
-    static final InputFile LOCATION =
-        new InputFile() {
-          @Override
-          public long getLength() {
-            return 0;
-          }
-
-          @Override
-          public SeekableInputStream newStream() {
-            throw new UnsupportedOperationException();
-          }
-
-          @Override
-          public String location() {
-            return "test://delta-round-trip";
-          }
-
-          @Override
-          public boolean exists() {
-            return false;
-          }
-        };
   }
 }

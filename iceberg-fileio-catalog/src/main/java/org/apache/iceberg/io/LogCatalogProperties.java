@@ -1,0 +1,113 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.iceberg.io;
+
+import java.util.Map;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.intentlog.CompactionPolicy;
+import org.intentlog.RuntimeConfig;
+
+/** How a catalog over a shared log ({@link LogCatalog}) commits: its log's properties. */
+public final class LogCatalogProperties {
+
+  private LogCatalogProperties() {}
+
+  /**
+   * Maximum number of transaction records in the log portion before a new commit
+   * must CAS (compact) instead of append. Default: 10000. Set to 0 to force CAS on
+   * every commit (for storage providers that don't support conditional append).
+   *
+   * <p>Provider hard limits: S3 Express ~10000, Azure AppendBlob 50000.
+   */
+  public static final String MAX_APPEND_COUNT = "fileio.catalog.max.append.count";
+  public static final int DEFAULT_MAX_APPEND_COUNT = 10_000;
+
+  /**
+   * Maximum size in bytes of the catalog file before a new commit must CAS (compact)
+   * instead of append. This is a performance target; larger catalogs take longer to
+   * read. Default: 16 MB.
+   */
+  public static final String MAX_APPEND_SIZE = "fileio.catalog.max.append.size";
+  public static final long DEFAULT_MAX_APPEND_SIZE = 16L * 1024 * 1024;
+
+  /**
+   * Retention window for the committed-transaction dedup set, in milliseconds.
+   * Every CAS / compaction commit writes a GC record (AdvanceHorizon) after its
+   * checkpoint, which drops any UUIDv7 from {@code CommittedTransactions} whose
+   * timestamp is at or below {@code now - committedRetentionMs} (and below its
+   * own transaction's). The largest dropped timestamp becomes
+   * {@code highest_dropped_timestamp_ms}: a
+   * query for a UUID at or below it throws {@link org.intentlog.DedupHorizonExceededException},
+   * and replay rejects a record whose id is at or below it (Bug 64). Default: 6
+   * hours, long enough to cover any commit's retries, short enough to bound the
+   * set on long-lived catalogs. {@code Long.MAX_VALUE} disables GC. A window
+   * shorter than a commit takes is legal but lossy: a writer whose id falls
+   * below the horizon while it commits fails, or cannot learn whether it
+   * committed (CommitStateUnknownException); {@code 0} drops everything older
+   * than the compacting commit. See {@code docs/GC.md}.
+   */
+  public static final String COMMITTED_RETENTION_MS = "fileio.catalog.committed.retention.ms";
+  public static final long DEFAULT_COMMITTED_RETENTION_MS = 6L * 60 * 60 * 1000;
+
+  /**
+   * First wait before retrying a write that storage throttled; each later wait doubles, up to 5 s.
+   */
+  public static final String THROTTLE_MIN_WAIT_MS = "fileio.catalog.throttle.retry.min-wait-ms";
+  public static final long DEFAULT_THROTTLE_MIN_WAIT_MS = 200L;
+
+  /** The runtime configuration {@code properties} set; the defaults for those they do not. */
+  public static RuntimeConfig runtimeConfig(Map<String, String> properties) {
+    return runtimeConfig(
+        intProperty(properties, MAX_APPEND_COUNT, DEFAULT_MAX_APPEND_COUNT),
+        longProperty(properties, MAX_APPEND_SIZE, DEFAULT_MAX_APPEND_SIZE),
+        longProperty(properties, COMMITTED_RETENTION_MS, DEFAULT_COMMITTED_RETENTION_MS),
+        longProperty(properties, THROTTLE_MIN_WAIT_MS, DEFAULT_THROTTLE_MIN_WAIT_MS));
+  }
+
+  /**
+   * The runtime configuration of a catalog that compacts at {@code maxAppendCount} records or
+   * {@code maxAppendSize} bytes, keeps committed ids for {@code committedRetentionMs}, and first
+   * waits {@code throttleMinWaitMs} after a throttled write.
+   */
+  public static RuntimeConfig runtimeConfig(
+      int maxAppendCount, long maxAppendSize, long committedRetentionMs, long throttleMinWaitMs) {
+    Preconditions.checkArgument(maxAppendCount >= 0,
+        "maxAppendCount must be >= 0, got %s", maxAppendCount);
+    Preconditions.checkArgument(maxAppendSize >= 0,
+        "maxAppendSize must be >= 0, got %s", maxAppendSize);
+    Preconditions.checkArgument(committedRetentionMs >= 0,
+        "committedRetentionMs must be >= 0, got %s", committedRetentionMs);
+    Preconditions.checkArgument(throttleMinWaitMs >= 0,
+        "throttleMinWaitMs must be >= 0, got %s", throttleMinWaitMs);
+    return RuntimeConfig.of(
+        CompactionPolicy.limits(maxAppendCount, maxAppendSize),
+        committedRetentionMs,
+        throttleMinWaitMs);
+  }
+
+  private static int intProperty(Map<String, String> properties, String key, int dflt) {
+    String val = properties == null ? null : properties.get(key);
+    return val != null ? Integer.parseInt(val) : dflt;
+  }
+
+  private static long longProperty(Map<String, String> properties, String key, long dflt) {
+    String val = properties == null ? null : properties.get(key);
+    return val != null ? Long.parseLong(val) : dflt;
+  }
+}

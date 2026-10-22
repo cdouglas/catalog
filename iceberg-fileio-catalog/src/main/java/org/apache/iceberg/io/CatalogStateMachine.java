@@ -29,30 +29,25 @@ import org.intentlog.StateMachine;
 final class CatalogStateMachine
     implements StateMachine<CatalogState, CatalogState.Builder, ProtoCodec.CatalogIntention> {
 
-  // The catalog file a state reads from: CatalogState still carries it (CatalogFile.location).
-  private final InputFile location;
+  static final CatalogStateMachine INSTANCE = new CatalogStateMachine();
 
-  CatalogStateMachine(InputFile location) {
-    this.location = location;
-  }
+  private CatalogStateMachine() {}
 
   @Override
   public CatalogState.Builder empty() {
-    return CatalogState.builder(location);
+    return CatalogState.builder();
   }
 
   @Override
   public CatalogState.Builder decodeCheckpoint(byte[] state) {
-    CatalogState.Builder builder = CatalogState.builder(location);
+    CatalogState.Builder builder = CatalogState.builder();
     ProtoCodec.decodeCheckpointState(state, builder);
     return builder;
   }
 
   @Override
   public byte[] encodeCheckpoint(CatalogState state) {
-    ProtoCatalogFormat.ProtoIdManager ids = new ProtoCatalogFormat.ProtoIdManager();
-    ids.setGlobals(state.nextNamespaceId(), state.nextTableId());
-    return ProtoCodec.encodeCheckpointState(state, ids);
+    return ProtoCodec.encodeCheckpointState(state);
   }
 
   @Override

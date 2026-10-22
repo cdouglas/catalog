@@ -75,6 +75,12 @@ public final class AtomicFileLog implements SharedLog {
     this.location = location;
   }
 
+  /** The object's location. */
+  @Override
+  public String toString() {
+    return location;
+  }
+
   /** The tail of the object {@code file} names, as it is bound (or will bind on first use). */
   public static LogTail tailOf(InputFile file) {
     return new FileTail(file);

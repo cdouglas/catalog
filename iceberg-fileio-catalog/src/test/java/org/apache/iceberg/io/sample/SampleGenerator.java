@@ -39,8 +39,9 @@ import org.apache.iceberg.catalog.CatalogTransaction;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.io.FileIOCatalog;
-import org.apache.iceberg.io.ProtoCatalogFormat;
+import org.apache.iceberg.io.LogCatalogProperties;
 import org.apache.iceberg.types.Types;
+import org.intentlog.fileio.AtomicFileLog;
 
 /**
  * Generates the catalog-footprint sample artifacts under {@code docs/sample/}.
@@ -193,12 +194,12 @@ public final class SampleGenerator {
 
   private static FileIOCatalog newCatalog(
       String catalogLoc, Map<String, String> props, SampleFileIO io, long maxAppendCount) {
-    ProtoCatalogFormat format =
-        new ProtoCatalogFormat(
-            (int) Math.min(maxAppendCount, Integer.MAX_VALUE),
-            ProtoCatalogFormat.DEFAULT_MAX_APPEND_SIZE);
-    FileIOCatalog catalog = new FileIOCatalog("sample", catalogLoc, format, io, props);
-    catalog.initialize("sample", props);
+    Map<String, String> properties = new java.util.HashMap<>(props);
+    properties.put(
+        LogCatalogProperties.MAX_APPEND_COUNT,
+        String.valueOf(Math.min(maxAppendCount, Integer.MAX_VALUE)));
+    FileIOCatalog catalog = new FileIOCatalog("sample", catalogLoc, io, properties);
+    catalog.initialize("sample", properties);
     return catalog;
   }
 
@@ -346,34 +347,12 @@ public final class SampleGenerator {
     if (catalog == null) {
       return new int[0];
     }
-    int[] pos = {ProtoCatalogFormat.HEADER_SIZE};
-    int checkpointLen = readVarint(catalog, pos);
-    pos[0] += checkpointLen; // skip checkpoint payload
-    List<Integer> sizes = new ArrayList<>();
-    while (pos[0] < catalog.length) {
-      int txnLen = readVarint(catalog, pos);
-      sizes.add(txnLen);
-      pos[0] += txnLen;
-    }
-    int[] out = new int[sizes.size()];
+    List<byte[]> records = AtomicFileLog.decode(catalog).records();
+    int[] out = new int[records.size()];
     for (int i = 0; i < out.length; i++) {
-      out[i] = sizes.get(i);
+      out[i] = records.get(i).length;
     }
     return out;
-  }
-
-  private static int readVarint(byte[] b, int[] pos) {
-    int result = 0;
-    int shift = 0;
-    while (true) {
-      int x = b[pos[0]++] & 0xff;
-      result |= (x & 0x7f) << shift;
-      if ((x & 0x80) == 0) {
-        break;
-      }
-      shift += 7;
-    }
-    return result;
   }
 
   // -------------------------------------------------------------------------

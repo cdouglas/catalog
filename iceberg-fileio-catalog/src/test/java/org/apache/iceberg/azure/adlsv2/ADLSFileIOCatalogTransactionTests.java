@@ -30,11 +30,9 @@ import java.util.UUID;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.azure.AzureProperties;
 import org.apache.iceberg.catalog.CatalogTransactionTests;
-import org.apache.iceberg.io.CatalogFormat;
 import org.apache.iceberg.io.CloudMode;
 import org.apache.iceberg.io.FileIOCatalog;
 import org.apache.iceberg.io.IntegTestEnv;
-import org.apache.iceberg.io.ProtoCatalogFormat;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -62,7 +60,7 @@ public class ADLSFileIOCatalogTransactionTests extends CatalogTransactionTests<F
   private static String uniqTestRun;
 
   /**
-   * Catalog format's max.append.count for this suite. Subclasses override to flip the
+   * The catalog's max.append.count for this suite. Subclasses override to flip the
    * commit policy: 10000 (default) exercises the append branch via {@code ADLSFileIO}'s
    * lease-protected appends; 0 forces CAS on every commit.
    */
@@ -154,8 +152,7 @@ public class ADLSFileIOCatalogTransactionTests extends CatalogTransactionTests<F
     properties.put("fileio.catalog.inline", String.valueOf(inlineTM()));
     properties.put("fileio.catalog.inline.manifests", String.valueOf(inlineML()));
     final String location = warehouseLocation + "/catalog";
-    final CatalogFormat<?, ?> format = new ProtoCatalogFormat(properties);
-    catalog = new FileIOCatalog("test", location, format, io, Maps.newHashMap());
+    catalog = new FileIOCatalog("test", location, io, Maps.newHashMap());
     catalog.initialize(testName, properties);
   }
 

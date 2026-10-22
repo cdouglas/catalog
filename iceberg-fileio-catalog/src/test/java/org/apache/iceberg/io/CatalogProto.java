@@ -35,6 +35,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import org.intentlog.fileio.AtomicFileLog;
 
 /**
  * {@code src/main/proto/catalog.proto}, the schema of record for the catalog's checkpoints and
@@ -363,20 +364,20 @@ final class CatalogProto {
     }
 
     void file() {
-      if (bytes.length < ProtoCatalogFormat.HEADER_SIZE) {
+      if (bytes.length < AtomicFileLog.HEADER_SIZE) {
         throw new Violation("file of " + bytes.length + " bytes has no header");
       }
-      for (int i = 0; i < ProtoCatalogFormat.MAGIC.length; i++) {
-        if (bytes[i] != ProtoCatalogFormat.MAGIC[i]) {
+      for (int i = 0; i < AtomicFileLog.MAGIC.length; i++) {
+        if (bytes[i] != AtomicFileLog.MAGIC[i]) {
           throw new Violation("bad magic");
         }
       }
       int version =
-          ByteBuffer.wrap(bytes, ProtoCatalogFormat.MAGIC.length, 4).getInt();
-      if (version != ProtoCatalogFormat.FORMAT_VERSION) {
+          ByteBuffer.wrap(bytes, AtomicFileLog.MAGIC.length, 4).getInt();
+      if (version != AtomicFileLog.FORMAT_VERSION) {
         throw new Violation("header version " + version);
       }
-      pos = ProtoCatalogFormat.HEADER_SIZE;
+      pos = AtomicFileLog.HEADER_SIZE;
       message("LogCheckpoint", "checkpoint", frame("checkpoint"));
       for (int record = 0; pos < bytes.length; record++) {
         String path = "record " + record;

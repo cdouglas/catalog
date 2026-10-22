@@ -51,13 +51,17 @@ import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.io.AtomicOutputFile;
-import org.apache.iceberg.io.CatalogFile;
+import org.apache.iceberg.io.CatalogLog;
+import org.apache.iceberg.io.CatalogMutation;
+import org.apache.iceberg.io.CatalogTestSupport;
 import org.apache.iceberg.io.CheckpointRoundTrip;
 import org.apache.iceberg.io.InMemoryAtomicFileIO;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.ReadFault;
 import org.apache.iceberg.io.CatalogState;
-import org.apache.iceberg.io.ProtoCatalogFormat;
+import org.apache.iceberg.io.LogCatalogProperties;
+import org.intentlog.Replica;
+import org.intentlog.RuntimeConfig;
 
 /**
  * Multi-writer fuzzer for the commit protocol, at the catalog-format layer.
@@ -333,7 +337,7 @@ class TestMultiWriterProperties {
       return new Op(OpKind.RENAME_TABLE, null, from, to, null, null, null);
     }
 
-    void stage(CatalogFile.Mut<CatalogState, ?> mut) {
+    void stage(CatalogMutation mut) {
       switch (kind) {
         case CREATE_NAMESPACE:
           Map<String, String> props = new HashMap<>();
@@ -412,7 +416,7 @@ class TestMultiWriterProperties {
     }
 
     /** Iceberg's base-metadata check: an update or read needs the table it saw. */
-    boolean baseHolds(CatalogFile state) {
+    boolean baseHolds(CatalogState state) {
       return base == null || base.equals(state.location(table));
     }
 
@@ -442,7 +446,7 @@ class TestMultiWriterProperties {
     final Map<Namespace, Map<String, String>> namespaces = new TreeMap<>(NS_ORDER);
     final Map<TableIdentifier, String> tables = new TreeMap<>(TABLE_ORDER);
 
-    static View of(CatalogFile state) {
+    static View of(CatalogState state) {
       View view = new View();
       for (Namespace ns : state.namespaces()) {
         view.namespaces.put(ns, new TreeMap<>(state.namespaceProperties(ns)));
@@ -510,7 +514,7 @@ class TestMultiWriterProperties {
 
   private static final class Writer {
     final int id;
-    CatalogState snapshot; // null when idle
+    Replica<CatalogState> snapshot; // null when idle
     byte[] snapshotBytes;
     List<Op> ops;
 
@@ -566,7 +570,8 @@ class TestMultiWriterProperties {
 
   private static final class Run {
     private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
-    private final ProtoCatalogFormat format;
+    private final RuntimeConfig config;
+    private final CatalogLog log;
     private final boolean faults;
     private final boolean gc;
     private final Writer[] writers;
@@ -594,31 +599,34 @@ class TestMultiWriterProperties {
         io.limitSegments(segmentLimit);
       }
       Statistics.label("segment limit").collect(segmentLimit);
-      CatalogFile.Mut<CatalogState, ?> seed =
-          new ProtoCatalogFormat().empty(io.newInputFile(CATALOG));
+      CatalogLog seedLog = CatalogTestSupport.log(io, CATALOG);
+      CatalogMutation seed = new CatalogMutation(seedLog.empty());
       seed.createNamespace(Namespace.of("a"));
       seed.createNamespace(Namespace.of("b"));
       seed.createTable(TableIdentifier.of("a", "t"), "mem:///a/t/seed");
-      seed.commit(io);
+      seed.commit(seedLog);
       int seedLength = liveBytes().length;
-      this.format =
-          new ProtoCatalogFormat(
+      long maxAppendSize =
+          appendHeadroom < 0
+              ? LogCatalogProperties.DEFAULT_MAX_APPEND_SIZE
+              : seedLength + appendHeadroom;
+      this.config =
+          LogCatalogProperties.runtimeConfig(
               maxAppendCount,
-              appendHeadroom < 0
-                  ? ProtoCatalogFormat.DEFAULT_MAX_APPEND_SIZE
-                  : seedLength + appendHeadroom,
-              gc ? 0L : ProtoCatalogFormat.DEFAULT_COMMITTED_RETENTION_MS,
+              maxAppendSize,
+              gc ? 0L : LogCatalogProperties.DEFAULT_COMMITTED_RETENTION_MS,
               0); // retry throttled writes without sleeping
+      this.log = CatalogTestSupport.log(io, CATALOG, config);
       this.writers = new Writer[writers];
       for (int i = 0; i < writers; i++) {
         this.writers[i] = new Writer(i);
       }
       trace.append(String.format(
-          "format: maxAppendCount=%d maxAppendSize=%d (seed %d bytes)%s%s%n",
-          format.maxAppendCount(), format.maxAppendSize(), seedLength,
+          "log: maxAppendCount=%d maxAppendSize=%d (seed %d bytes)%s%s%n",
+          maxAppendCount, maxAppendSize, seedLength,
           strictVersions ? ", strict versions" : "", gc ? ", retention 0" : ""));
       Statistics.label("gc").collect(gc);
-      trace.append("seed: ").append(View.of(read())).append('\n');
+      trace.append("seed: ").append(View.of(read().state())).append('\n');
       io.failSupersededReads(strictVersions);
       io.injectFaults(this::onWrite);
       io.injectReadFaults(this::onRead);
@@ -684,8 +692,8 @@ class TestMultiWriterProperties {
             break;
           case OP:
             if (w.snapshot != null) {
-              Op op = interpret(cmd, w.snapshot);
-              if (op != null && stages(w.snapshot, append(w.ops, op))) {
+              Op op = interpret(cmd, w.snapshot.state());
+              if (op != null && stages(w.snapshot.state(), append(w.ops, op))) {
                 w.ops.add(op);
                 trace.append(String.format("w%d   %s%n", w.id, op));
                 Statistics.label("staged").collect(op.kind);
@@ -787,7 +795,7 @@ class TestMultiWriterProperties {
       String reason = "";
       try {
         ctx.active = true;
-        mut(w.snapshot, ops).commit(io);
+        mut(w.snapshot, ops).commit(log);
         outcome = Outcome.ACKNOWLEDGED;
       } catch (CommitFailedException | AlreadyExistsException | NoSuchTableException e) {
         outcome = Outcome.REJECTED;
@@ -906,8 +914,8 @@ class TestMultiWriterProperties {
       check(invalid == null, "acknowledged transaction is invalid on the state it replaced: %s",
           invalid);
       InMemoryAtomicFileIO alone = scratch(write.before());
-      CatalogState fresh = format.read(alone, alone.newInputFile(CATALOG));
-      View serial = View.of(mut(fresh, ops).commit(alone));
+      CatalogLog aloneLog = CatalogTestSupport.log(alone, CATALOG, config);
+      View serial = View.of(mut(aloneLog.read(), ops).commit(aloneLog).state());
       check(serial.equals(post), "serial re-execution differs:%n  serial: %s%n  actual: %s",
           serial, post);
       View expected = View.of(pre).copy();
@@ -944,8 +952,8 @@ class TestMultiWriterProperties {
       }
     }
 
-    private CatalogFile.Mut<CatalogState, ?> mut(CatalogState base, List<Op> ops) {
-      CatalogFile.Mut<CatalogState, ?> mut = format.from(base);
+    private CatalogMutation mut(Replica<CatalogState> base, List<Op> ops) {
+      CatalogMutation mut = new CatalogMutation(base);
       ops.forEach(op -> op.stage(mut));
       return mut;
     }
@@ -953,7 +961,7 @@ class TestMultiWriterProperties {
     /** Whether {@code ops} stage cleanly on {@code base}: the client-side validity check. */
     private boolean stages(CatalogState base, List<Op> ops) {
       try {
-        mut(base, ops);
+        mut(CatalogTestSupport.replicaOf(base), ops);
         return true;
       } catch (AlreadyExistsException
           | NoSuchNamespaceException
@@ -965,8 +973,8 @@ class TestMultiWriterProperties {
       }
     }
 
-    private CatalogState read() {
-      return format.read(io, io.newInputFile(CATALOG));
+    private Replica<CatalogState> read() {
+      return log.read();
     }
 
     private byte[] liveBytes() {
@@ -984,8 +992,7 @@ class TestMultiWriterProperties {
     }
 
     private CatalogState parse(byte[] bytes) {
-      InMemoryAtomicFileIO scratch = scratch(bytes);
-      return format.read(scratch, scratch.newInputFile(CATALOG));
+      return CatalogTestSupport.decodeFullFile(bytes);
     }
   }
 

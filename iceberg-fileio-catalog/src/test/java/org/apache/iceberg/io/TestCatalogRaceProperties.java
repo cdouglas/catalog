@@ -95,7 +95,7 @@ class TestCatalogRaceProperties {
     List<LocalCatalogMode> racerModes = List.of(modeB, modeC);
     // With gc, each CAS drops every committed transaction id older than its own (Bug 64).
     Map<String, String> props =
-        gc ? Map.of(ProtoCatalogFormat.COMMITTED_RETENTION_MS, "0") : Map.of();
+        gc ? Map.of(LogCatalogProperties.COMMITTED_RETENTION_MS, "0") : Map.of();
     Statistics.label("gc").collect(gc);
 
     // The race: the k-th racer runs just before A's k-th write to the catalog.

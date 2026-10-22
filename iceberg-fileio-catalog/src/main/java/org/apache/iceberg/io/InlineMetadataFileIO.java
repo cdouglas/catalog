@@ -29,7 +29,7 @@ import java.util.Map;
  * cannot be opened. Everything else goes to the catalog's FileIO; {@link #of} keeps the prefix and
  * bulk operations it supports.
  */
-class InlineMetadataFileIO implements SupportsAtomicOperations {
+class InlineMetadataFileIO implements FileIO {
 
   /** The stored length of the table's current inline metadata, if {@code location} names it. */
   @FunctionalInterface
@@ -37,22 +37,22 @@ class InlineMetadataFileIO implements SupportsAtomicOperations {
     Long of(String location);
   }
 
-  private final SupportsAtomicOperations io;
+  private final FileIO io;
   // Only where the table was loaded: a copy serialized to a worker is the catalog's FileIO.
   private final transient Lengths lengths;
 
-  static InlineMetadataFileIO of(SupportsAtomicOperations io, Lengths lengths) {
+  static InlineMetadataFileIO of(FileIO io, Lengths lengths) {
     return io instanceof DelegateFileIO
         ? new WithPrefixAndBulk(io, lengths)
         : new InlineMetadataFileIO(io, lengths);
   }
 
-  private InlineMetadataFileIO(SupportsAtomicOperations io, Lengths lengths) {
+  private InlineMetadataFileIO(FileIO io, Lengths lengths) {
     this.io = io;
     this.lengths = lengths;
   }
 
-  SupportsAtomicOperations delegate() {
+  FileIO delegate() {
     return io;
   }
 
@@ -70,16 +70,6 @@ class InlineMetadataFileIO implements SupportsAtomicOperations {
   @Override
   public OutputFile newOutputFile(String path) {
     return io.newOutputFile(path);
-  }
-
-  @Override
-  public AtomicOutputFile newOutputFile(InputFile replace) {
-    return io.newOutputFile(replace);
-  }
-
-  @Override
-  public boolean supportsAppend() {
-    return io.supportsAppend();
   }
 
   @Override
@@ -138,7 +128,7 @@ class InlineMetadataFileIO implements SupportsAtomicOperations {
   private static final class WithPrefixAndBulk extends InlineMetadataFileIO
       implements DelegateFileIO {
 
-    private WithPrefixAndBulk(SupportsAtomicOperations io, Lengths lengths) {
+    private WithPrefixAndBulk(FileIO io, Lengths lengths) {
       super(io, lengths);
     }
 

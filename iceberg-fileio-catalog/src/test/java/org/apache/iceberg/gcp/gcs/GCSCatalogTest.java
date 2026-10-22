@@ -42,7 +42,6 @@ import org.apache.iceberg.io.CloudMode;
 import org.apache.iceberg.io.FileIOCatalog;
 import org.apache.iceberg.io.InlineCompatAssertions;
 import org.apache.iceberg.io.IntegTestEnv;
-import org.apache.iceberg.io.ProtoCatalogFormat;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -198,7 +197,7 @@ public class GCSCatalogTest extends CatalogTests<FileIOCatalog> {
 
     final Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
-    // GCSFileIO.supportsAppend() returns false, so the format auto-coerces every
+    // GCSFileIO.supportsAppend() returns false, so the catalog coerces every
     // commit to CAS regardless of fileio.catalog.max.append.count.
     properties.put("fileio.catalog.inline", String.valueOf(inlineTM()));
     properties.put("fileio.catalog.inline.manifests", String.valueOf(inlineML()));
@@ -211,8 +210,7 @@ public class GCSCatalogTest extends CatalogTests<FileIOCatalog> {
     properties.put(CatalogProperties.TABLE_OVERRIDE_PREFIX + "override-key4", "catalog-override-key4");
     final String location = warehouseLocation + "/catalog";
     catalog =
-        new FileIOCatalog(
-            "test", location, new ProtoCatalogFormat(properties), io, Maps.newHashMap());
+        new FileIOCatalog("test", location, io, Maps.newHashMap());
     catalog.initialize(testName, properties);
   }
 
@@ -254,8 +252,7 @@ public class GCSCatalogTest extends CatalogTests<FileIOCatalog> {
     properties.putAll(additionalProperties);
     final String location = warehouseLocation + "/catalog-" + catalogName;
     FileIOCatalog c =
-        new FileIOCatalog(
-            catalogName, location, new ProtoCatalogFormat(properties), io, Maps.newHashMap());
+        new FileIOCatalog(catalogName, location, io, Maps.newHashMap());
     c.initialize(catalogName, properties);
     return c;
   }

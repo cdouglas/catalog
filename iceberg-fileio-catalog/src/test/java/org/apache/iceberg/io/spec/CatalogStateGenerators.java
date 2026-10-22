@@ -20,16 +20,12 @@ package org.apache.iceberg.io.spec;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.UUID;
 import net.jqwik.api.Arbitraries;
 import net.jqwik.api.Arbitrary;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
-import org.apache.iceberg.io.CatalogFile;
-import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.ProtoCodec;
 import org.apache.iceberg.io.CatalogState;
-import org.apache.iceberg.io.SeekableInputStream;
 
 /**
  * jqwik generators for catalog states and actions.
@@ -42,14 +38,6 @@ import org.apache.iceberg.io.SeekableInputStream;
 final class CatalogStateGenerators {
 
   private CatalogStateGenerators() {}
-
-  /** Sentinel InputFile used when no real file path is needed (generator/test context). */
-  static final InputFile STUB_LOCATION = new InputFile() {
-    @Override public long getLength() { return 0; }
-    @Override public SeekableInputStream newStream() { throw new UnsupportedOperationException(); }
-    @Override public String location() { return "test://catalog-state-generator"; }
-    @Override public boolean exists() { return false; }
-  };
 
   /** Namespace names: 1–8 lowercase ASCII letters. */
   static Arbitrary<String> namespaceNames() {
@@ -68,10 +56,10 @@ final class CatalogStateGenerators {
    * <p>Uses {@link Arbitraries#randomValue} so jqwik treats the stream as
    * inexhaustible and runs all 1000 tries (Arbitraries.create() only runs 1).
    */
-  static Arbitrary<CatalogFile> catalogStates() {
+  static Arbitrary<CatalogState> catalogStates() {
     return Arbitraries.randomValue(rng -> {
       CatalogState.Builder builder =
-          CatalogState.builder(STUB_LOCATION).setCatalogUuid(UUID.randomUUID());
+          CatalogState.builder();
 
       // Draw 0–3 namespaces using the PRNG jqwik supplies.
       int nsCount = rng.nextInt(4); // 0, 1, 2, or 3
@@ -171,17 +159,17 @@ final class CatalogStateGenerators {
    * {@code tableVersion(int)}, {@code tableEntry(int)}, {@code isInlineTable(int)},
    * {@code nextNamespaceId()}, {@code nextTableId()}.
    */
-  static Arbitrary<ProtoCodec.Action> actions(CatalogFile state) {
+  static Arbitrary<ProtoCodec.Action> actions(CatalogState state) {
     return Arbitraries.randomValue(rng -> action(state, rng));
   }
 
   /** An action for {@code state}, drawn with {@code rng}; see {@link #actions}. */
-  static ProtoCodec.Action action(CatalogFile state, java.util.Random rng) {
+  static ProtoCodec.Action action(CatalogState state, java.util.Random rng) {
     {
       if (!(state instanceof CatalogState)) {
         return freshCreateNamespace(rng, state);
       }
-      CatalogState pcf = (CatalogState) state;
+      CatalogState pcf = state;
 
       // Collect ns IDs and versions using public accessors
       List<int[]> nsIdVersions = new ArrayList<>(); // [nsId, nsVersion]
@@ -257,9 +245,9 @@ final class CatalogStateGenerators {
    * current {@code nextNamespaceId}.
    */
   private static ProtoCodec.CreateNamespaceAction freshCreateNamespace(
-      java.util.Random rng, CatalogFile state) {
+      java.util.Random rng, CatalogState state) {
     int baseNsId = (state instanceof CatalogState)
-        ? ((CatalogState) state).nextNamespaceId()
+        ? (state).nextNamespaceId()
         : 100;
     int newNsId = baseNsId + rng.nextInt(50);
     // A name no top-level namespace has (see the table names in action).

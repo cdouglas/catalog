@@ -18,7 +18,6 @@
  */
 package org.apache.iceberg.io.spec;
 
-import org.apache.iceberg.io.CatalogFile;
 import org.apache.iceberg.io.CatalogState;
 import org.apache.iceberg.io.CatalogTestSupport;
 import org.apache.iceberg.io.ProtoCodec;
@@ -36,14 +35,14 @@ import org.apache.iceberg.io.ProtoCodec;
  */
 final class CanonicalState {
 
-  private final CatalogFile state;
+  private final CatalogState state;
 
-  private CanonicalState(CatalogFile state) {
+  private CanonicalState(CatalogState state) {
     this.state = state;
   }
 
   /** Creates a {@code CanonicalState} seeded with the given catalog snapshot. */
-  static CanonicalState from(CatalogFile state) {
+  static CanonicalState from(CatalogState state) {
     return new CanonicalState(state);
   }
 
@@ -53,7 +52,7 @@ final class CanonicalState {
    * checked {@code action.verify(builder)} first.
    */
   CanonicalState apply(ProtoCodec.Action action) {
-    CatalogState.Builder builder = SpecUtils.stateToBuilder((CatalogState) state);
+    CatalogState.Builder builder = SpecUtils.stateToBuilder(state);
     action.apply(builder);
     CatalogState next = builder.build();
 
@@ -63,6 +62,6 @@ final class CanonicalState {
 
   /** Encodes the current state to full LCAT wire bytes. */
   byte[] encode() {
-    return CatalogTestSupport.encodeFullFile((CatalogState) state);
+    return CatalogTestSupport.encodeFullFile(state);
   }
 }

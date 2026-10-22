@@ -76,7 +76,7 @@ under the scenario's description.
 ## Regenerate the fixtures
 
 `FormatExplorerFixtures` builds each scenario the way a writer builds a catalog file. Each record
-holds the actions `ProtoCatalogFormat.Mut.buildActions` makes for a change to the snapshot its
+holds the intention `CatalogMutation.intention` makes for a change to the snapshot its
 writer read, a CAS write is a checkpoint of the base followed by the commit's record, and an
 inline delta is the one `InlineDeltaCodec.computeDelta` sends (inline-ML manifest updates are
 written by hand). Transaction ids, table UUIDs and times are pinned, so the bytes are stable.

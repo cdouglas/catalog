@@ -7,7 +7,7 @@ last-verified: 2026-10-21 — fileio-catalog 9f792e8 on fork atomicio bee565b. E
 Status of `FileIOCatalog` cloud test suites across the
 **cloud-store × commit-mode × inline-mode** grid:
 
-- **Commit mode** — how `ProtoCatalogFormat` commits the catalog file:
+- **Commit mode** — how the catalog (`LogRuntime` over `AtomicFileLog`) commits the catalog file:
   - `CAS` — every commit is a compare-and-swap replace. Requested via
     `fileio.catalog.max.append.count=0`. Supported by every
     `SupportsAtomicOperations` FileIO.
@@ -93,7 +93,7 @@ Iceberg 1.12.0, the ADLS Append Blob writes and the one-request GCS CAS.
 - **Append is unsupported.** `GCSOutputFile.prepare` rejects
   `Strategy.APPEND` with a `Preconditions` check; the only honest
   implementation would already be a CAS replace. `GCSFileIO.supportsAppend()`
-  returns false, and `ProtoCatalogFormat` checks it on each commit and
+  returns false, and `AtomicFileLog` reports no append, so the catalog
   commits by CAS whatever `max.append.count` says.
 - **Zonal buckets** take a different write path: each CAS is one XML API
   PUT, and regular writes (manifests, data files) an appendable upload.
@@ -126,7 +126,7 @@ Iceberg 1.12.0, the ADLS Append Blob writes and the one-request GCS CAS.
 ### ADLS
 
 - **append · file** — `ADLSCatalogTest`,
-  `ADLSFileIOCatalogTransactionTests`. The default `ProtoCatalogFormat`
+  `ADLSFileIOCatalogTransactionTests`. The default catalog
   configuration leaves `max.append.count` at 10 000. `ADLSFileIO` keeps
   the catalog file an Append Blob: `Strategy.APPEND` is one conditional
   `AppendBlock`, and CAS stages a temp Append Blob and renames it onto

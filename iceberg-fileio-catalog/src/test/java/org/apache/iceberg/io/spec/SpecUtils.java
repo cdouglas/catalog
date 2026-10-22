@@ -38,7 +38,7 @@ final class SpecUtils {
    * {@link CatalogState} snapshot using only public accessors.
    *
    * <p>This is the canonical bridge between the immutable snapshot world
-   * ({@code CatalogFile}) and the mutable builder world
+   * ({@code CatalogState}) and the mutable builder world
    * ({@code CatalogState.Builder}) that {@code Action.verify} /
    * {@code Action.apply} operate on.  It mirrors what the production decoder
    * does after loading a checkpoint and replaying the transaction log, just
@@ -52,8 +52,7 @@ final class SpecUtils {
    */
   static CatalogState.Builder stateToBuilder(CatalogState pcf) {
     CatalogState.Builder builder =
-        CatalogState.builder(CatalogStateGenerators.STUB_LOCATION)
-            .setCatalogUuid(pcf.uuid())
+        CatalogState.builder()
             .setNextNamespaceId(pcf.nextNamespaceId())
             .setNextTableId(pcf.nextTableId());
 
@@ -96,9 +95,6 @@ final class SpecUtils {
             entry.metadataLocation);
       }
     }
-
-    // Committed transactions (raw bytes; re-installed as original bytes)
-    builder.setCommittedTransactionsBytes(pcf.committedTransactionsBytes());
 
     // Rebuild lookups after bulk-loading
     builder.rebuildLookups();

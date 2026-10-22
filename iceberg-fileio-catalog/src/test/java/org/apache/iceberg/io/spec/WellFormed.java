@@ -20,7 +20,6 @@ package org.apache.iceberg.io.spec;
 
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
-import org.apache.iceberg.io.CatalogFile;
 import org.apache.iceberg.io.CatalogState;
 
 /**
@@ -31,7 +30,7 @@ import org.apache.iceberg.io.CatalogState;
  *   <li>I5: every inline-ML sentinel has a matching pool entry (not checked
  *       here — inline tables use opaque byte[] for metadata, and the manifest
  *       pool / sentinel structure is only observable through package-private
- *       accessors not reachable from {@code CatalogFile}; see proxy note
+ *       accessors not reachable from {@code CatalogState}; see proxy note
  *       below).</li>
  *   <li>Namespace lookup consistency: every namespace accessible via
  *       {@code namespaces()} is round-trip consistent with
@@ -50,7 +49,7 @@ import org.apache.iceberg.io.CatalogState;
  * <p>Proxy note — {@code sentinelImpliesPoolEntry}: The inline-ML manifest
  * pool and per-snapshot sentinel list are stored in package-private fields
  * ({@code allManifestPrefixes}, {@code allInlineMetadata}, etc.) that are not
- * accessible from the {@code CatalogFile} public API. Rather than adding new
+ * accessible from the {@code CatalogState} public API. Rather than adding new
  * production accessors, we perform the check via {@link CatalogState}'s
  * existing public {@code isInlineTable(TableIdentifier)} and
  * {@code inlineMetadata(TableIdentifier)} which confirm that the inline byte
@@ -67,7 +66,7 @@ final class WellFormed {
 
   private WellFormed() {}
 
-  static boolean check(CatalogFile state) {
+  static boolean check(CatalogState state) {
     return sentinelImpliesPoolEntry(state)
         && namespaceLookupConsistent(state)
         && tableLookupConsistent(state)
@@ -85,7 +84,7 @@ final class WellFormed {
    * check the necessary proxy: if the table is inline, the bytes must be
    * non-null and non-empty. The deep sentinel check is not implemented.
    */
-  private static boolean sentinelImpliesPoolEntry(CatalogFile state) {
+  private static boolean sentinelImpliesPoolEntry(CatalogState state) {
     for (TableIdentifier tbl : state.tables()) {
       if (state.isInlineTable(tbl)) {
         byte[] meta = state.inlineMetadata(tbl);
@@ -101,7 +100,7 @@ final class WellFormed {
    * Every namespace accessible via {@code namespaces()} is also recognized by
    * {@code containsNamespace()}, and vice-versa for the count.
    */
-  private static boolean namespaceLookupConsistent(CatalogFile state) {
+  private static boolean namespaceLookupConsistent(CatalogState state) {
     for (Namespace ns : state.namespaces()) {
       if (!state.containsNamespace(ns)) {
         return false;
@@ -114,7 +113,7 @@ final class WellFormed {
    * Every table in {@code tables()} is recognized by {@code containsTable()},
    * and no duplicate identifiers exist in the list.
    */
-  private static boolean tableLookupConsistent(CatalogFile state) {
+  private static boolean tableLookupConsistent(CatalogState state) {
     java.util.Set<TableIdentifier> seen = new java.util.HashSet<>();
     for (TableIdentifier tbl : state.tables()) {
       if (!state.containsTable(tbl)) {
@@ -142,7 +141,7 @@ final class WellFormed {
    * Non-inline tables must have a non-null location. This is the disjointness
    * invariant.
    */
-  private static boolean inlinePointerDisjoint(CatalogFile state) {
+  private static boolean inlinePointerDisjoint(CatalogState state) {
     if (!(state instanceof CatalogState)) {
       // Only CatalogState enforces this layout; skip for other impls.
       return true;

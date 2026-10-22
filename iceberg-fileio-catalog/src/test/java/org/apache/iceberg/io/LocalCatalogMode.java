@@ -71,7 +71,7 @@ enum LocalCatalogMode {
       InMemoryAtomicFileIO io, String warehouse, String name, Map<String, String> extra) {
     Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouse);
-    properties.put(ProtoCatalogFormat.MAX_APPEND_COUNT, String.valueOf(maxAppendCount));
+    properties.put(LogCatalogProperties.MAX_APPEND_COUNT, String.valueOf(maxAppendCount));
     properties.put("fileio.catalog.inline", String.valueOf(inlineTM));
     properties.put("fileio.catalog.inline.manifests", String.valueOf(inlineML));
     properties.put(CatalogProperties.TABLE_DEFAULT_PREFIX + "default-key1", "catalog-default-key1");
@@ -81,8 +81,7 @@ enum LocalCatalogMode {
     properties.put(CatalogProperties.TABLE_OVERRIDE_PREFIX + "override-key4", "catalog-override-key4");
     properties.putAll(extra);
     String location = warehouse + "/catalog-" + name;
-    CatalogFormat<?, ?> format = new ProtoCatalogFormat(properties);
-    FileIOCatalog catalog = new FileIOCatalog(name, location, format, io, Maps.newHashMap());
+    FileIOCatalog catalog = new FileIOCatalog(name, location, io, Maps.newHashMap());
     catalog.initialize(name, properties);
     return catalog;
   }

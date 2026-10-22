@@ -41,8 +41,9 @@ aggressively without losing absolute confirmability for data writers.
 
 ## Tri-state lookup
 
-`ProtoCatalogFile.containsTransaction(UUID)` (and the same method on
-its `Builder`, which also checks the ids replay has added) answers:
+`CommittedSet.contains(UUID)` (intentlog-core; a read's set is
+`Replica.committed()`, and the same method on its `Builder` also checks
+the ids replay has added) answers:
 
 - `true` — the id is in the set: the transaction committed.
 - `false` — the id is not in the set, and its v7 timestamp is above
@@ -53,15 +54,15 @@ its `Builder`, which also checks the ids replay has added) answers:
   aged-out commit from one that never landed. `queryId()` and
   `horizonMs()` give the id and the horizon.
 
-A non-v7 id is never in the set and never throws. `highestDroppedTimestampMs()`
-returns the horizon (0 before any GC).
+A non-v7 id is never in the set and never throws. `horizon()` returns
+the horizon (0 before any GC).
 
 ## Where GC runs
 
 GC is a record in the log: `LogRecord.advance_horizon`, an
 `AdvanceHorizon{watermark_ms}` (log.proto). Replay applies one wherever
-it lands (`ProtoCatalogFile.Builder.advanceHorizon`, through
-`CommittedSet.Builder.advanceHorizon` in intentlog-core): it drops every
+it lands (`CommittedSet.Builder.advanceHorizon` in intentlog-core, from
+`Replay`): it drops every
 id the set holds there, the checkpoint's and those replay added, at or
 below the watermark, and raises the horizon to the newest one dropped.
 The horizon moves nowhere else; it never decreases, and it can exceed
@@ -104,8 +105,8 @@ every read of the catalog, and nothing could compact it away, since
 compacting reads first. Four rules keep the catalog readable and what
 a commit reports true:
 
-1. **Replay rejects it.** `ProtoCatalogFormat.replay` asks
-   `Builder.mayApply`: a record whose id the set holds is a retry, and
+1. **Replay rejects it.** `Replay.replay` asks
+   `CommittedSet.Builder.mayApply`: a record whose id the set holds is a retry, and
    one at or below the horizon may be a retry of a commit whose id aged
    out, so replay skips both.
 2. **A CAS write's watermark stays below its own transaction's time.**
@@ -113,8 +114,8 @@ a commit reports true:
    time of the id it commits, so its own GC never raises the horizon to
    the record that follows it.
 3. **Writers mint ids after the horizon they read.**
-   `ProtoCodec.Transaction.from` mints with
-   `UuidV7.newUuidV7After(highestDroppedTimestampMs())`, so a writer
+   `LogRuntime.commit` mints with
+   `UuidV7.newUuidV7After(base.committed().horizon())`, so a writer
    whose clock is behind still commits.
 4. **The commit loop maps it to an outcome.** `LogRuntime`'s `landed`
    catches `DedupHorizonExceededException` on any read the commit loop
@@ -134,8 +135,7 @@ behind the horizon).
   (pass-through, merge, drops at the watermark, horizon above the newest
   id kept, monotonic horizon), the tri-state lookup, and
   `Builder.advanceHorizon` (a GC record's replay: added ids dropped too,
-  idempotent); the catalog's `TestCommittedSetGc` checks that
-  `ProtoCatalogFile` delegates to it.
+  idempotent).
 - `CheckpointRoundTrip`: every CAS write's checkpoint is the replay of
   the version it replaced, committed set and horizon included (I11),
   in the local suites and both fuzzers.

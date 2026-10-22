@@ -27,7 +27,6 @@ import net.jqwik.api.Property;
 import net.jqwik.api.Provide;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
-import org.apache.iceberg.io.CatalogFile;
 import org.apache.iceberg.io.CatalogState;
 import org.apache.iceberg.io.CatalogTestSupport;
 
@@ -37,11 +36,9 @@ import org.apache.iceberg.io.CatalogTestSupport;
  * <p>P1 — Codec roundtrip: {@code decode(encode(s)) ≡ s}.
  * <br>P2 — Encode determinism: {@code encode(s) == encode(s)} byte-equal.
  *
- * <p>Equality note: {@link CatalogFile} does not override {@code equals()}, so P1
- * compares structural fields directly: catalog UUID, namespace set, table list,
- * namespace properties, and table metadata locations. The file-path ({@code location()})
- * is intentionally excluded — it changes after encode/decode because the decoded
- * file is bound to a fresh stub location.
+ * <p>Equality note: {@link CatalogState} does not override {@code equals()}, so P1
+ * compares structural fields directly: namespace set, table list, namespace
+ * properties, and table metadata locations.
  *
  * <p>Generated states contain pointer-mode tables only, so neither property
  * exercises the inline-metadata codecs yet.
@@ -54,9 +51,9 @@ class TestCodecProperties {
    * is preserved.
    */
   @Property
-  void p1_codecRoundtrip(@ForAll @From("catalogStates") CatalogFile cat) {
-    byte[] bytes = CatalogTestSupport.encodeFullFile((CatalogState) cat);
-    CatalogFile decoded = CatalogTestSupport.decodeFullFile(bytes);
+  void p1_codecRoundtrip(@ForAll @From("catalogStates") CatalogState cat) {
+    byte[] bytes = CatalogTestSupport.encodeFullFile(cat);
+    CatalogState decoded = CatalogTestSupport.decodeFullFile(bytes);
     assertCatalogEquals(cat, decoded);
   }
 
@@ -70,31 +67,22 @@ class TestCodecProperties {
    * across independently built but equal states.
    */
   @Property
-  void p2_encodeIsDeterministic(@ForAll @From("catalogStates") CatalogFile cat) {
-    byte[] a = CatalogTestSupport.encodeFullFile((CatalogState) cat);
-    byte[] b = CatalogTestSupport.encodeFullFile((CatalogState) cat);
+  void p2_encodeIsDeterministic(@ForAll @From("catalogStates") CatalogState cat) {
+    byte[] a = CatalogTestSupport.encodeFullFile(cat);
+    byte[] b = CatalogTestSupport.encodeFullFile(cat);
     assertThat(a).isEqualTo(b);
   }
 
   @Provide
-  Arbitrary<CatalogFile> catalogStates() {
+  Arbitrary<CatalogState> catalogStates() {
     return CatalogStateGenerators.catalogStates();
   }
 
   /**
-   * Structural equality for {@link CatalogFile}: compares UUID, namespace set,
+   * Structural equality for {@link CatalogState}: compares the namespace set,
    * table list, namespace properties, and pointer-table metadata locations.
-   *
-   * <p>The file-path ({@link CatalogFile#location()}) is excluded: after
-   * encode/decode the decoded file is bound to a fresh stub location, while the
-   * original is bound to the generator's stub. This is intentional and does not
-   * represent a semantic difference.
    */
-  private static void assertCatalogEquals(CatalogFile expected, CatalogFile actual) {
-    assertThat(actual.uuid())
-        .as("catalog UUID")
-        .isEqualTo(expected.uuid());
-
+  private static void assertCatalogEquals(CatalogState expected, CatalogState actual) {
     assertThat(actual.namespaces())
         .as("namespace set")
         .containsExactlyInAnyOrderElementsOf(expected.namespaces());

@@ -263,25 +263,11 @@ public class ProtoCodec {
   // ============================================================
 
   /**
-   * Encodes a checkpoint of {@code original}, the state a replay reached, in the log's envelope.
-   * It holds exactly that state, committed set included: a GC of the set is a record in the log
-   * (AdvanceHorizon), never a filter on a checkpoint, so every checkpoint of a log is a replay of
-   * it (I11).
+   * Encodes the catalog's state, the payload of a checkpoint (catalog.proto Checkpoint). The
+   * catalog's id and committed transactions are the log's: the envelope (log.proto LogCheckpoint)
+   * carries them, with this as its state.
    */
-  public static byte[] encodeCheckpoint(
-      CatalogState original,
-      CatalogFile.Mut<CatalogState, ?> mut,
-      ProtoCatalogFormat.ProtoIdManager idManager) {
-    // The catalog's id and committed transactions (a compressed UUIDv7 set) are the log's: the
-    // envelope (log.proto LogCheckpoint) carries them, and the catalog's Checkpoint as its state.
-    return LogEnvelope.encodeCheckpoint(
-        original.uuid(), original.committedTransactionsBytes(),
-        encodeCheckpointState(original, idManager));
-  }
-
-  /** Encodes the catalog's state, the payload of a checkpoint (catalog.proto Checkpoint). */
-  public static byte[] encodeCheckpointState(
-      CatalogState original, ProtoCatalogFormat.ProtoIdManager idManager) {
+  public static byte[] encodeCheckpointState(CatalogState original) {
     try {
       ByteArrayOutputStream out = new ByteArrayOutputStream();
 
@@ -289,10 +275,10 @@ public class ProtoCodec {
       // chewing through the rest of the payload.
       writeVarint(out, CHECKPOINT_MIN_READER_VERSION, SUPPORTED_READER_VERSION);
 
-      // Next IDs: the original state's. Replay allocates the ids of the
-      // transaction record that follows this checkpoint.
-      writeVarint(out, CHECKPOINT_NEXT_NAMESPACE_ID, idManager.getNextNsid());
-      writeVarint(out, CHECKPOINT_NEXT_TABLE_ID, idManager.getNextTblid());
+      // Next IDs: the state's. Replay allocates the ids of the records that follow this
+      // checkpoint.
+      writeVarint(out, CHECKPOINT_NEXT_NAMESPACE_ID, original.nextNamespaceId());
+      writeVarint(out, CHECKPOINT_NEXT_TABLE_ID, original.nextTableId());
 
       // Namespaces - write from original state (mutations will be applied via transaction)
       for (Map.Entry<Integer, CatalogState.NsEntry> entry : original.namespaceById().entrySet()) {
@@ -336,17 +322,6 @@ public class ProtoCodec {
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
-  }
-
-  /**
-   * Decodes a checkpoint (a log.proto LogCheckpoint whose state is the catalog's Checkpoint) into
-   * a builder.
-   */
-  public static void decodeCheckpoint(byte[] bytes, CatalogState.Builder builder) {
-    LogEnvelope.Checkpoint envelope = LogEnvelope.decodeCheckpoint(bytes);
-    builder.setCatalogUuid(envelope.logId());
-    builder.setCommittedTransactionsBytes(envelope.committed());
-    decodeCheckpointState(envelope.state(), builder);
   }
 
   /** Decodes the catalog's state, the payload of a checkpoint (catalog.proto Checkpoint). */
@@ -1521,20 +1496,13 @@ public class ProtoCodec {
       this.intention = intention;
     }
 
-    public static Transaction from(
-        CatalogFile.Mut<CatalogState, ?> mut,
-        ProtoCatalogFormat.ProtoIdManager idManager) {
-      // After the horizon of the catalog this writer read, where replay rejects a record (Bug 64).
-      UUID txnId = UuidV7.newUuidV7After(mut.original.highestDroppedTimestampMs());
-      List<Action> actions = new ArrayList<>();
-
-      // Build actions from mutations accumulated in mut
-      // This delegates to the Mut to extract its pending changes
-      if (mut instanceof ProtoCatalogFormat.Mut) {
-        ((ProtoCatalogFormat.Mut) mut).buildActions(actions, idManager);
-      }
-
-      return new Transaction(txnId, actions);
+    /**
+     * The transaction of {@code mutation}'s intention, with an id after the horizon of the log its
+     * writer read, where replay rejects a record (Bug 64): the record a commit of it appends.
+     */
+    public static Transaction from(CatalogMutation mutation) {
+      return new Transaction(
+          UuidV7.newUuidV7After(mutation.base().committed().horizon()), mutation.intention());
     }
 
     public UUID id() {

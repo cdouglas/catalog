@@ -1,7 +1,7 @@
 # Inline Table Metadata (TM)
 
-This document specifies the inline-table-metadata extension to
-`ProtoCatalogFormat`: how tables can store their `TableMetadata` directly in
+This document specifies the inline-table-metadata extension to the catalog
+format: how tables can store their `TableMetadata` directly in
 the catalog instead of in external `metadata.json` files. See
 [SPEC.md](SPEC.md) for the base format and [SPEC_ML.md](SPEC_ML.md) for the
 manifest-list extension that builds on this one.
@@ -476,7 +476,7 @@ function stageUpdate(mut, base, metadata):
         if manifests != null and restatesAManifest(base, metadata, full=false):
             mut.updateTable(tableId, writeUpdateMetadata(metadata))  # first snapshot after a v3 upgrade
             return
-        if lastCatalogFile.isInlineTable(tableId):
+        if lastRead.state().isInlineTable(tableId):
             delta = computeDelta(base, metadata, prefix)   # null: inexpressible or empty
             if delta != null and size(delta + manifests) <= maxUpdateSize:
                 mut.updateTableInlineDelta(tableId, encodeDelta(delta + manifests, metadata.lastUpdatedMs))
@@ -518,8 +518,8 @@ branch (which would lose per-manifest `partitionSpecId` on decode).
 
 ## Table Loading
 
-`FileIOTableOperations.loadFromCatalogFile()` detects inline tables via
-`CatalogFile.isInlineTable()` and calls
+`FileIOTableOperations.loadFrom(CatalogState)` detects inline tables via
+`CatalogState.isInlineTable()` and calls
 `BaseMetastoreTableOperations.refreshFromMetadataLocation(syntheticLoc, null, 0, customLoader)`
 with a `Function<String, TableMetadata>` that parses from the catalog's
 inline bytes.

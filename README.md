@@ -43,9 +43,12 @@ intentlog-core/                              the intention log: replicated state
 intentlog-fileio/                            the log in one object of a store with conditional
                                              writes (AtomicFileLog, over SupportsAtomicOperations)
 iceberg-fileio-catalog/                      the catalog module (Maven), under src/:
-  main/java/.../FileIOCatalog.java           catalog implementation
-  main/java/.../ProtoCatalogFormat.java      the catalog's format over the log runtime
-  main/java/.../CatalogStateMachine.java     the catalog as a state machine
+  main/java/.../LogCatalog.java              catalog over any shared log (Iceberg Catalog,
+                                             namespaces, multi-table transactions)
+  main/java/.../FileIOCatalog.java           LogCatalog over an AtomicFileLog
+  main/java/.../CatalogLog.java              the catalog's log: reads, commits, Iceberg errors
+  main/java/.../CatalogMutation.java         a transaction, staged on a read, as an intention
+  main/java/.../CatalogStateMachine.java     the catalog as a state machine (CatalogState)
   main/java/.../ProtoCodec.java              wire encoding for catalog
   main/java/.../InlineDeltaCodec.java        wire encoding for TM/ML deltas
   main/proto/catalog.proto                   protobuf schema

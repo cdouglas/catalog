@@ -31,15 +31,17 @@ one object instead of three writes totalling ~100 KB.
 
 ### Snapshot + Mutation
 
-The catalog file is an **immutable snapshot** (`CatalogFile`,
-`ProtoCatalogFile`). All mutation goes through a builder (`CatalogFile.Mut`,
-`ProtoCatalogFile.Mut`) that accumulates pending changes and commits them
-atomically:
+A read of the catalog's log (`CatalogLog.read`) is an **immutable
+snapshot**: a `Replica` of the catalog's state (`CatalogState`) at the log
+position the read ended at, with the log's committed set. All mutation goes
+through a transaction (`CatalogMutation`) that accumulates pending changes
+on it and commits them atomically:
 
-1. Read the current `CatalogFile` snapshot.
-2. Create a `Mut` builder from it.
+1. Read the catalog (`CatalogLog.read`).
+2. Stage a `CatalogMutation` on the read.
 3. Accumulate changes (`createTable`, `dropNamespace`, etc.).
-4. `commit()` builds an intention record and writes it atomically.
+4. `commit()` appends its intention (`CatalogMutation.intention`) to the
+   log as one record.
 5. The commit loop (intentlog-core's `LogRuntime.commit`, over the
    catalog file's `AtomicFileLog`) handles
    what storage reports. After a CAS conflict it replays the new file,
@@ -49,8 +51,8 @@ atomically:
    `fileio.catalog.throttle.retry.min-wait-ms`); and it settles a write
    whose outcome it did not learn by reading the catalog for the
    transaction's id, or throws `CommitStateUnknownException` (I10). A
-   record whose preconditions fail goes back to the caller: FileIOCatalog
-   stages a catalog operation again on a fresh read
+   record whose preconditions fail goes back to the caller: the catalog
+   (`LogCatalog`) stages a catalog operation again on a fresh read
    (`commitOnAFreshRead`), and Iceberg re-applies a table commit; a
    catalog transaction fails ([errata.md](errata.md) §D12). See
    [SPEC.md](SPEC.md) §"Commit Protocol".
@@ -567,7 +569,7 @@ classes handle this for you; manual codecs require it as a discipline.
 
 | File | What it covers |
 |------|----------------|
-| `TestProtoCatalogFormat` | PB codec, format read/write, header validation |
+| `TestProtoCatalogFormat` | PB codec, replay of catalog files, reader-version gates |
 | `TestProtoActions` | Per-action positive/negative tests, conflict matrix, idempotency, randomized tests, inline tables, manifest-pool round-trip |
 | `TestProtoCommitKnobs` | `max.append.count` / `max.append.size` thresholds; `MockIO` |
 | `TestInlineDelta` | Inline TM delta encode/decode/apply, `computeDelta`, ML delta types |

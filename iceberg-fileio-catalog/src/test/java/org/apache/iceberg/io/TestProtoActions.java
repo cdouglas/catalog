@@ -36,13 +36,17 @@ import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.intentlog.CommittedSet;
+import org.intentlog.LogView;
+import org.intentlog.Replica;
+import org.intentlog.fileio.AtomicFileLog;
 import org.intentlog.wire.UuidV7;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 
 /**
- * Systematic tests for all ProtoCatalogFormat action types, covering both positive
+ * Systematic tests for all catalog action types, covering both positive
  * (action applies, state updated) and negative (version mismatch, state unchanged) cases.
  *
  * <p>Uses {@link CatalogBuilder} to construct serialized catalog files and
@@ -51,7 +55,6 @@ import org.junit.jupiter.api.Test;
  */
 public class TestProtoActions {
 
-  private static final InputFile LOCATION = new TestInputFile("test://catalog");
 
   // ============================================================
   // CatalogBuilder -- ergonomic test fixture construction
@@ -72,11 +75,12 @@ public class TestProtoActions {
    */
   static class CatalogBuilder {
     private final CatalogState.Builder inner;
+    private final CommittedSet.Builder committed = CommittedSet.builder();
     private int maxNsId = 0;
     private int maxTblId = 0;
 
     CatalogBuilder() {
-      this.inner = CatalogState.builder(LOCATION);
+      this.inner = CatalogState.builder();
     }
 
     /** Adds a namespace. Tracks max IDs automatically. */
@@ -117,7 +121,7 @@ public class TestProtoActions {
 
     /** Records a committed transaction ID. */
     CatalogBuilder committed(UUID txnId) {
-      inner.addCommittedTransaction(txnId);
+      committed.add(txnId);
       return this;
     }
 
@@ -125,8 +129,8 @@ public class TestProtoActions {
     byte[] build() {
       inner.setNextNamespaceId(maxNsId + 1);
       inner.setNextTableId(maxTblId + 1);
-      CatalogState catalog = inner.build();
-      return toFileBytes(catalog);
+      return CatalogTestSupport.encodeFullFile(
+          CatalogTestSupport.LOG_ID, committed.build(), inner.build());
     }
   }
 
@@ -296,84 +300,27 @@ public class TestProtoActions {
   // File construction / replay helpers
   // ============================================================
 
-  /** Serializes a CatalogState to full file bytes (header + checkpoint). */
+  /** A catalog file holding a checkpoint of {@code catalog} (and no records). */
   static byte[] toFileBytes(CatalogState catalog) {
-    try {
-      ByteArrayOutputStream out = new ByteArrayOutputStream();
-      out.write(ProtoCatalogFormat.MAGIC);
-      writeInt(out, ProtoCatalogFormat.FORMAT_VERSION);
-
-      // Compute correct next IDs from actual entries -- readInternal doesn't
-      // update the counters during transaction replay, so after applying
-      // transactions the stored nextId values may be stale.
-      int nextNsId = catalog.namespaceById().keySet().stream()
-          .mapToInt(i -> i).max().orElse(0) + 1;
-      int nextTblId = catalog.tableById().keySet().stream()
-          .mapToInt(i -> i).max().orElse(0) + 1;
-      nextNsId = Math.max(nextNsId, catalog.nextNamespaceId());
-      nextTblId = Math.max(nextTblId, catalog.nextTableId());
-
-      ProtoCatalogFormat.ProtoIdManager idManager = new ProtoCatalogFormat.ProtoIdManager();
-      idManager.setGlobals(nextNsId, nextTblId);
-      ProtoCatalogFormat.Mut mut = new ProtoCatalogFormat.Mut(catalog);
-      byte[] chk = ProtoCodec.encodeCheckpoint(catalog, mut, idManager);
-      writeVarint(out, chk.length);
-      out.write(chk);
-      return out.toByteArray();
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
-    }
+    return CatalogTestSupport.encodeFullFile(catalog);
   }
 
-  /** Serializes a transaction to a varint-length-prefixed record. */
-  static byte[] toRecord(ProtoCodec.Transaction txn) {
-    try {
-      byte[] txnBytes = ProtoCodec.encodeTransaction(txn);
-      ByteArrayOutputStream out = new ByteArrayOutputStream();
-      writeVarint(out, txnBytes.length);
-      out.write(txnBytes);
-      return out.toByteArray();
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
-    }
+  /** A catalog file holding a checkpoint of {@code catalog}, with its log id and committed set. */
+  static byte[] toFileBytes(Replica<CatalogState> catalog) {
+    return CatalogTestSupport.encodeFullFile(catalog);
   }
 
   /**
-   * Appends transactions to serialized file bytes and reads the result.
-   * This exercises the full read path: header parse, checkpoint decode, log replay.
+   * Replays {@code fileBytes} with {@code txns} appended to its log: the checkpoint, the records
+   * the file holds, then these, as a reader of the file with them appended would.
    */
-  static CatalogState apply(byte[] fileBytes, ProtoCodec.Transaction... txns) {
-    try {
-      byte[] combined = fileBytes;
-      for (ProtoCodec.Transaction txn : txns) {
-        combined = appendBytes(combined, toRecord(txn));
-      }
-      return ProtoCatalogFormat.readInternal(
-          LOCATION, new ByteArrayInputStream(combined), combined.length);
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
+  static Replica<CatalogState> apply(byte[] fileBytes, ProtoCodec.Transaction... txns) {
+    LogView view = AtomicFileLog.decode(fileBytes);
+    List<byte[]> records = new ArrayList<>(view.records());
+    for (ProtoCodec.Transaction txn : txns) {
+      records.add(ProtoCodec.encodeTransaction(txn));
     }
-  }
-
-  private static byte[] appendBytes(byte[] a, byte[] b) {
-    byte[] result = Arrays.copyOf(a, a.length + b.length);
-    System.arraycopy(b, 0, result, a.length, b.length);
-    return result;
-  }
-
-  private static void writeInt(ByteArrayOutputStream out, int value) {
-    out.write((value >> 24) & 0xFF);
-    out.write((value >> 16) & 0xFF);
-    out.write((value >> 8) & 0xFF);
-    out.write(value & 0xFF);
-  }
-
-  private static void writeVarint(ByteArrayOutputStream out, int value) {
-    while ((value & ~0x7F) != 0) {
-      out.write((value & 0x7F) | 0x80);
-      value >>>= 7;
-    }
-    out.write(value);
+    return CatalogTestSupport.replay(AtomicFileLog.encode(view.checkpoint().orElseThrow(), records));
   }
 
   // ============================================================
@@ -386,18 +333,18 @@ public class TestProtoActions {
     @Test
     void appliesUnderRoot() {
       byte[] file = catalog().build();
-      CatalogState result = apply(file, txn(createNs(1, 0, "db", 1, -1)));
+      Replica<CatalogState> result = apply(file, txn(createNs(1, 0, "db", 1, -1)));
 
-      assertThat(result.containsNamespace(Namespace.of("db"))).isTrue();
-      assertThat(result.namespaceVersion(result.namespaceId(Namespace.of("db")))).isEqualTo(1);
+      assertThat(result.state().containsNamespace(Namespace.of("db"))).isTrue();
+      assertThat(result.state().namespaceVersion(result.state().namespaceId(Namespace.of("db")))).isEqualTo(1);
     }
 
     @Test
     void appliesUnderExistingParent() {
       byte[] file = catalog().ns(1, 0, "db", 1).build();
-      CatalogState result = apply(file, txn(createNs(2, 1, "schema", 1, 1)));
+      Replica<CatalogState> result = apply(file, txn(createNs(2, 1, "schema", 1, 1)));
 
-      assertThat(result.containsNamespace(Namespace.of("db", "schema"))).isTrue();
+      assertThat(result.state().containsNamespace(Namespace.of("db", "schema"))).isTrue();
     }
 
     @Test
@@ -405,32 +352,32 @@ public class TestProtoActions {
       byte[] file = catalog().ns(1, 0, "db", 3).build();
       // parent_version=1 doesn't match db's actual version=3
       ProtoCodec.Transaction t = txn(createNs(2, 1, "schema", 1, 1));
-      CatalogState result = apply(file, t);
+      Replica<CatalogState> result = apply(file, t);
 
-      assertThat(result.containsNamespace(Namespace.of("db", "schema"))).isFalse();
-      assertThat(result.containsTransaction(t.id())).isFalse();
+      assertThat(result.state().containsNamespace(Namespace.of("db", "schema"))).isFalse();
+      assertThat(result.committed().contains(t.id())).isFalse();
     }
 
     @Test
     void appliesWithLateBoundParentVersion() {
       byte[] file = catalog().ns(1, 0, "db", 5).build();
       // parent_version=-1 means "don't check" (late-bound)
-      CatalogState result = apply(file, txn(createNs(2, 1, "schema", 1, -1)));
+      Replica<CatalogState> result = apply(file, txn(createNs(2, 1, "schema", 1, -1)));
 
-      assertThat(result.containsNamespace(Namespace.of("db", "schema"))).isTrue();
+      assertThat(result.state().containsNamespace(Namespace.of("db", "schema"))).isTrue();
     }
 
     @Test
     void multipleInSameTransaction() {
       byte[] file = catalog().build();
-      CatalogState result = apply(file, txn(
+      Replica<CatalogState> result = apply(file, txn(
           createNs(1, 0, "a", 1, -1),
           createNs(2, 0, "b", 1, -1),
           createNs(3, 1, "child", 1, -1)));
 
-      assertThat(result.containsNamespace(Namespace.of("a"))).isTrue();
-      assertThat(result.containsNamespace(Namespace.of("b"))).isTrue();
-      assertThat(result.containsNamespace(Namespace.of("a", "child"))).isTrue();
+      assertThat(result.state().containsNamespace(Namespace.of("a"))).isTrue();
+      assertThat(result.state().containsNamespace(Namespace.of("b"))).isTrue();
+      assertThat(result.state().containsNamespace(Namespace.of("a", "child"))).isTrue();
     }
   }
 
@@ -445,20 +392,20 @@ public class TestProtoActions {
     void appliesWithMatchingVersion() {
       byte[] file = catalog().ns(1, 0, "db", 2).build();
       ProtoCodec.Transaction t = txn(dropNs(1, 2));
-      CatalogState result = apply(file, t);
+      Replica<CatalogState> result = apply(file, t);
 
-      assertThat(result.containsNamespace(Namespace.of("db"))).isFalse();
-      assertThat(result.containsTransaction(t.id())).isTrue();
+      assertThat(result.state().containsNamespace(Namespace.of("db"))).isFalse();
+      assertThat(result.committed().contains(t.id())).isTrue();
     }
 
     @Test
     void rejectsOnVersionMismatch() {
       byte[] file = catalog().ns(1, 0, "db", 2).build();
       ProtoCodec.Transaction t = txn(dropNs(1, 1));
-      CatalogState result = apply(file, t);
+      Replica<CatalogState> result = apply(file, t);
 
-      assertThat(result.containsNamespace(Namespace.of("db"))).isTrue();
-      assertThat(result.containsTransaction(t.id())).isFalse();
+      assertThat(result.state().containsNamespace(Namespace.of("db"))).isTrue();
+      assertThat(result.committed().contains(t.id())).isFalse();
     }
 
     @Test
@@ -468,9 +415,9 @@ public class TestProtoActions {
           .prop(1, "owner", "alice")
           .prop(1, "comment", "test")
           .build();
-      CatalogState result = apply(file, txn(dropNs(1, 1)));
+      Replica<CatalogState> result = apply(file, txn(dropNs(1, 1)));
 
-      assertThat(result.containsNamespace(Namespace.of("db"))).isFalse();
+      assertThat(result.state().containsNamespace(Namespace.of("db"))).isFalse();
     }
   }
 
@@ -484,9 +431,9 @@ public class TestProtoActions {
     @Test
     void appliesWithMatchingVersion() {
       byte[] file = catalog().ns(1, 0, "db", 1).build();
-      CatalogState result = apply(file, txn(setNsProp(1, 1, "owner", "bob")));
+      Replica<CatalogState> result = apply(file, txn(setNsProp(1, 1, "owner", "bob")));
 
-      assertThat(result.namespaceProperties(Namespace.of("db")))
+      assertThat(result.state().namespaceProperties(Namespace.of("db")))
           .containsEntry("owner", "bob");
     }
 
@@ -497,20 +444,20 @@ public class TestProtoActions {
           .prop(1, "owner", "alice")
           .build();
       ProtoCodec.Transaction t = txn(setNsProp(1, 1, "owner", "bob"));
-      CatalogState result = apply(file, t);
+      Replica<CatalogState> result = apply(file, t);
 
-      assertThat(result.namespaceProperties(Namespace.of("db")))
+      assertThat(result.state().namespaceProperties(Namespace.of("db")))
           .containsEntry("owner", "alice");
-      assertThat(result.containsTransaction(t.id())).isFalse();
+      assertThat(result.committed().contains(t.id())).isFalse();
     }
 
     @Test
     void appliesWithLateBoundVersion() {
       byte[] file = catalog().ns(1, 0, "db", 5).build();
       // version=-1 means namespace was created in same txn (skip version check)
-      CatalogState result = apply(file, txn(setNsProp(1, -1, "k", "v")));
+      Replica<CatalogState> result = apply(file, txn(setNsProp(1, -1, "k", "v")));
 
-      assertThat(result.namespaceProperties(Namespace.of("db")))
+      assertThat(result.state().namespaceProperties(Namespace.of("db")))
           .containsEntry("k", "v");
     }
 
@@ -520,20 +467,20 @@ public class TestProtoActions {
           .ns(1, 0, "db", 1)
           .prop(1, "owner", "alice")
           .build();
-      CatalogState result = apply(file, txn(setNsProp(1, 1, "owner", "bob")));
+      Replica<CatalogState> result = apply(file, txn(setNsProp(1, 1, "owner", "bob")));
 
-      assertThat(result.namespaceProperties(Namespace.of("db")))
+      assertThat(result.state().namespaceProperties(Namespace.of("db")))
           .containsEntry("owner", "bob");
     }
 
     @Test
     void addsMultiplePropertiesInSameTransaction() {
       byte[] file = catalog().ns(1, 0, "db", 1).build();
-      CatalogState result = apply(file, txn(
+      Replica<CatalogState> result = apply(file, txn(
           setNsProp(1, 1, "owner", "alice"),
           setNsProp(1, 1, "env", "prod")));
 
-      Map<String, String> props = result.namespaceProperties(Namespace.of("db"));
+      Map<String, String> props = result.state().namespaceProperties(Namespace.of("db"));
       assertThat(props).containsEntry("owner", "alice");
       assertThat(props).containsEntry("env", "prod");
     }
@@ -553,9 +500,9 @@ public class TestProtoActions {
           .prop(1, "owner", "alice")
           .prop(1, "env", "prod")
           .build();
-      CatalogState result = apply(file, txn(removeNsProp(1, 1, "owner")));
+      Replica<CatalogState> result = apply(file, txn(removeNsProp(1, 1, "owner")));
 
-      Map<String, String> props = result.namespaceProperties(Namespace.of("db"));
+      Map<String, String> props = result.state().namespaceProperties(Namespace.of("db"));
       assertThat(props).doesNotContainKey("owner");
       assertThat(props).containsEntry("env", "prod");
     }
@@ -567,11 +514,11 @@ public class TestProtoActions {
           .prop(1, "owner", "alice")
           .build();
       ProtoCodec.Transaction t = txn(removeNsProp(1, 1, "owner"));
-      CatalogState result = apply(file, t);
+      Replica<CatalogState> result = apply(file, t);
 
-      assertThat(result.namespaceProperties(Namespace.of("db")))
+      assertThat(result.state().namespaceProperties(Namespace.of("db")))
           .containsEntry("owner", "alice");
-      assertThat(result.containsTransaction(t.id())).isFalse();
+      assertThat(result.committed().contains(t.id())).isFalse();
     }
 
     @Test
@@ -580,9 +527,9 @@ public class TestProtoActions {
           .ns(1, 0, "db", 1)
           .prop(1, "owner", "alice")
           .build();
-      CatalogState result = apply(file, txn(removeNsProp(1, -1, "owner")));
+      Replica<CatalogState> result = apply(file, txn(removeNsProp(1, -1, "owner")));
 
-      assertThat(result.namespaceProperties(Namespace.of("db")))
+      assertThat(result.state().namespaceProperties(Namespace.of("db")))
           .doesNotContainKey("owner");
     }
 
@@ -590,9 +537,9 @@ public class TestProtoActions {
     void noopWhenPropertyDoesNotExist() {
       byte[] file = catalog().ns(1, 0, "db", 1).build();
       ProtoCodec.Transaction t = txn(removeNsProp(1, 1, "nonexistent"));
-      CatalogState result = apply(file, t);
+      Replica<CatalogState> result = apply(file, t);
 
-      assertThat(result.containsTransaction(t.id())).isTrue();
+      assertThat(result.committed().contains(t.id())).isTrue();
     }
   }
 
@@ -606,11 +553,11 @@ public class TestProtoActions {
     @Test
     void appliesInExistingNamespace() {
       byte[] file = catalog().ns(1, 0, "db", 1).build();
-      CatalogState result = apply(file,
+      Replica<CatalogState> result = apply(file,
           txn(createTbl(1, 1, "users", 1, 1, "s3://bucket/users/v1")));
 
       TableIdentifier users = TableIdentifier.of(Namespace.of("db"), "users");
-      assertThat(result.location(users)).isEqualTo("s3://bucket/users/v1");
+      assertThat(result.state().location(users)).isEqualTo("s3://bucket/users/v1");
     }
 
     @Test
@@ -618,47 +565,47 @@ public class TestProtoActions {
       byte[] file = catalog().ns(1, 0, "db", 3).build();
       // ns_version=1 doesn't match actual version=3
       ProtoCodec.Transaction t = txn(createTbl(1, 1, "users", 1, 1, "s3://bucket/users/v1"));
-      CatalogState result = apply(file, t);
+      Replica<CatalogState> result = apply(file, t);
 
       TableIdentifier users = TableIdentifier.of(Namespace.of("db"), "users");
-      assertThat(result.location(users)).isNull();
-      assertThat(result.containsTransaction(t.id())).isFalse();
+      assertThat(result.state().location(users)).isNull();
+      assertThat(result.committed().contains(t.id())).isFalse();
     }
 
     @Test
     void appliesWithLateBoundNamespaceVersion() {
       byte[] file = catalog().ns(1, 0, "db", 5).build();
       // ns_version=-1 skips check (namespace created in same txn)
-      CatalogState result = apply(file,
+      Replica<CatalogState> result = apply(file,
           txn(createTbl(1, 1, "users", 1, -1, "s3://bucket/users/v1")));
 
       TableIdentifier users = TableIdentifier.of(Namespace.of("db"), "users");
-      assertThat(result.location(users)).isEqualTo("s3://bucket/users/v1");
+      assertThat(result.state().location(users)).isEqualTo("s3://bucket/users/v1");
     }
 
     @Test
     void createNamespaceAndTableInSameTransaction() {
       byte[] file = catalog().build();
-      CatalogState result = apply(file, txn(
+      Replica<CatalogState> result = apply(file, txn(
           createNs(1, 0, "db", 1, -1),
           createTbl(1, 1, "users", 1, -1, "s3://bucket/users/v1")));
 
-      assertThat(result.containsNamespace(Namespace.of("db"))).isTrue();
+      assertThat(result.state().containsNamespace(Namespace.of("db"))).isTrue();
       TableIdentifier users = TableIdentifier.of(Namespace.of("db"), "users");
-      assertThat(result.location(users)).isEqualTo("s3://bucket/users/v1");
+      assertThat(result.state().location(users)).isEqualTo("s3://bucket/users/v1");
     }
 
     @Test
     void multipleTablesInSameNamespace() {
       byte[] file = catalog().ns(1, 0, "db", 1).build();
-      CatalogState result = apply(file, txn(
+      Replica<CatalogState> result = apply(file, txn(
           createTbl(1, 1, "users", 1, 1, "s3://bucket/users/v1"),
           createTbl(2, 1, "orders", 1, 1, "s3://bucket/orders/v1")));
 
       Namespace db = Namespace.of("db");
-      assertThat(result.location(TableIdentifier.of(db, "users")))
+      assertThat(result.state().location(TableIdentifier.of(db, "users")))
           .isEqualTo("s3://bucket/users/v1");
-      assertThat(result.location(TableIdentifier.of(db, "orders")))
+      assertThat(result.state().location(TableIdentifier.of(db, "orders")))
           .isEqualTo("s3://bucket/orders/v1");
     }
   }
@@ -677,12 +624,12 @@ public class TestProtoActions {
           .tbl(1, 1, "users", 2, "s3://bucket/users/v2")
           .build();
       ProtoCodec.Transaction t = txn(dropTbl(1, 2));
-      CatalogState result = apply(file, t);
+      Replica<CatalogState> result = apply(file, t);
 
       TableIdentifier users = TableIdentifier.of(Namespace.of("db"), "users");
-      assertThat(result.location(users)).isNull();
-      assertThat(result.tables()).doesNotContain(users);
-      assertThat(result.containsTransaction(t.id())).isTrue();
+      assertThat(result.state().location(users)).isNull();
+      assertThat(result.state().tables()).doesNotContain(users);
+      assertThat(result.committed().contains(t.id())).isTrue();
     }
 
     @Test
@@ -692,11 +639,11 @@ public class TestProtoActions {
           .tbl(1, 1, "users", 2, "s3://bucket/users/v2")
           .build();
       ProtoCodec.Transaction t = txn(dropTbl(1, 1));
-      CatalogState result = apply(file, t);
+      Replica<CatalogState> result = apply(file, t);
 
       TableIdentifier users = TableIdentifier.of(Namespace.of("db"), "users");
-      assertThat(result.location(users)).isEqualTo("s3://bucket/users/v2");
-      assertThat(result.containsTransaction(t.id())).isFalse();
+      assertThat(result.state().location(users)).isEqualTo("s3://bucket/users/v2");
+      assertThat(result.committed().contains(t.id())).isFalse();
     }
 
     @Test
@@ -706,11 +653,11 @@ public class TestProtoActions {
           .tbl(1, 1, "users", 1, "s3://bucket/users/v1")
           .tbl(2, 1, "orders", 1, "s3://bucket/orders/v1")
           .build();
-      CatalogState result = apply(file, txn(dropTbl(1, 1)));
+      Replica<CatalogState> result = apply(file, txn(dropTbl(1, 1)));
 
       Namespace db = Namespace.of("db");
-      assertThat(result.location(TableIdentifier.of(db, "users"))).isNull();
-      assertThat(result.location(TableIdentifier.of(db, "orders")))
+      assertThat(result.state().location(TableIdentifier.of(db, "users"))).isNull();
+      assertThat(result.state().location(TableIdentifier.of(db, "orders")))
           .isEqualTo("s3://bucket/orders/v1");
     }
   }
@@ -728,13 +675,13 @@ public class TestProtoActions {
           .ns(1, 0, "db", 1)
           .tbl(1, 1, "users", 1, "s3://bucket/users/v1")
           .build();
-      CatalogState result = apply(file,
+      Replica<CatalogState> result = apply(file,
           txn(updateTbl(1, 1, "s3://bucket/users/v2")));
 
       TableIdentifier users = TableIdentifier.of(Namespace.of("db"), "users");
-      assertThat(result.location(users)).isEqualTo("s3://bucket/users/v2");
+      assertThat(result.state().location(users)).isEqualTo("s3://bucket/users/v2");
       // Version should be incremented
-      assertThat(result.tableVersion(result.tableId(users))).isEqualTo(2);
+      assertThat(result.state().tableVersion(result.state().tableId(users))).isEqualTo(2);
     }
 
     @Test
@@ -744,11 +691,11 @@ public class TestProtoActions {
           .tbl(1, 1, "users", 3, "s3://bucket/users/v3")
           .build();
       ProtoCodec.Transaction t = txn(updateTbl(1, 1, "s3://bucket/users/v4"));
-      CatalogState result = apply(file, t);
+      Replica<CatalogState> result = apply(file, t);
 
       TableIdentifier users = TableIdentifier.of(Namespace.of("db"), "users");
-      assertThat(result.location(users)).isEqualTo("s3://bucket/users/v3");
-      assertThat(result.containsTransaction(t.id())).isFalse();
+      assertThat(result.state().location(users)).isEqualTo("s3://bucket/users/v3");
+      assertThat(result.committed().contains(t.id())).isFalse();
     }
 
     @Test
@@ -762,11 +709,11 @@ public class TestProtoActions {
       ProtoCodec.Transaction t1 = txn(updateTbl(1, 1, "s3://v2"));
       // Second update: version 2 -> 3
       ProtoCodec.Transaction t2 = txn(updateTbl(1, 2, "s3://v3"));
-      CatalogState result = apply(file, t1, t2);
+      Replica<CatalogState> result = apply(file, t1, t2);
 
       TableIdentifier users = TableIdentifier.of(Namespace.of("db"), "users");
-      assertThat(result.location(users)).isEqualTo("s3://v3");
-      assertThat(result.tableVersion(result.tableId(users))).isEqualTo(3);
+      assertThat(result.state().location(users)).isEqualTo("s3://v3");
+      assertThat(result.state().tableVersion(result.state().tableId(users))).isEqualTo(3);
     }
 
     @Test
@@ -779,12 +726,12 @@ public class TestProtoActions {
       // Both try to update from version 1
       ProtoCodec.Transaction t1 = txn(updateTbl(1, 1, "s3://writer-a"));
       ProtoCodec.Transaction t2 = txn(updateTbl(1, 1, "s3://writer-b"));
-      CatalogState result = apply(file, t1, t2);
+      Replica<CatalogState> result = apply(file, t1, t2);
 
       TableIdentifier users = TableIdentifier.of(Namespace.of("db"), "users");
-      assertThat(result.location(users)).isEqualTo("s3://writer-a");
-      assertThat(result.containsTransaction(t1.id())).isTrue();
-      assertThat(result.containsTransaction(t2.id())).isFalse();
+      assertThat(result.state().location(users)).isEqualTo("s3://writer-a");
+      assertThat(result.committed().contains(t1.id())).isTrue();
+      assertThat(result.committed().contains(t2.id())).isFalse();
     }
   }
 
@@ -805,10 +752,10 @@ public class TestProtoActions {
       ProtoCodec.Transaction t = txn(
           readTbl(1, 1),
           createNs(2, 0, "other", 1, -1));
-      CatalogState result = apply(file, t);
+      Replica<CatalogState> result = apply(file, t);
 
-      assertThat(result.containsTransaction(t.id())).isTrue();
-      assertThat(result.containsNamespace(Namespace.of("other"))).isTrue();
+      assertThat(result.committed().contains(t.id())).isTrue();
+      assertThat(result.state().containsNamespace(Namespace.of("other"))).isTrue();
     }
 
     @Test
@@ -821,10 +768,10 @@ public class TestProtoActions {
       ProtoCodec.Transaction t = txn(
           readTbl(1, 1),
           createNs(2, 0, "other", 1, -1));
-      CatalogState result = apply(file, t);
+      Replica<CatalogState> result = apply(file, t);
 
-      assertThat(result.containsTransaction(t.id())).isFalse();
-      assertThat(result.containsNamespace(Namespace.of("other"))).isFalse();
+      assertThat(result.committed().contains(t.id())).isFalse();
+      assertThat(result.state().containsNamespace(Namespace.of("other"))).isFalse();
     }
 
     @Test
@@ -840,11 +787,11 @@ public class TestProtoActions {
       ProtoCodec.Transaction t2 = txn(
           readTbl(1, 1),
           createNs(2, 0, "marker", 1, -1));
-      CatalogState result = apply(file, t1, t2);
+      Replica<CatalogState> result = apply(file, t1, t2);
 
-      assertThat(result.containsTransaction(t1.id())).isTrue();
-      assertThat(result.containsTransaction(t2.id())).isFalse();
-      assertThat(result.containsNamespace(Namespace.of("marker"))).isFalse();
+      assertThat(result.committed().contains(t1.id())).isTrue();
+      assertThat(result.committed().contains(t2.id())).isFalse();
+      assertThat(result.state().containsNamespace(Namespace.of("marker"))).isFalse();
     }
 
     @Test
@@ -853,12 +800,12 @@ public class TestProtoActions {
           .ns(1, 0, "db", 1)
           .tbl(1, 1, "users", 1, "s3://v1")
           .build();
-      CatalogState result = apply(file, txn(readTbl(1, 1)));
+      Replica<CatalogState> result = apply(file, txn(readTbl(1, 1)));
 
       // Table version unchanged after ReadTable
       TableIdentifier users = TableIdentifier.of(Namespace.of("db"), "users");
-      assertThat(result.tableVersion(result.tableId(users))).isEqualTo(1);
-      assertThat(result.location(users)).isEqualTo("s3://v1");
+      assertThat(result.state().tableVersion(result.state().tableId(users))).isEqualTo(1);
+      assertThat(result.state().location(users)).isEqualTo("s3://v1");
     }
   }
 
@@ -875,14 +822,14 @@ public class TestProtoActions {
           .ns(1, 0, "db", 1)
           .tbl(1, 1, "users", 1, "s3://users/v1")
           .build();
-      CatalogState r = apply(file, txn(renameTbl(1, 1, 1, 1, "people")));
+      Replica<CatalogState> r = apply(file, txn(renameTbl(1, 1, 1, 1, "people")));
 
       Namespace db = Namespace.of("db");
       // Old name gone, new name resolves to the SAME id, location preserved.
-      assertThat(r.tableId(TableIdentifier.of(db, "users"))).isNull();
-      assertThat(r.tableId(TableIdentifier.of(db, "people"))).isEqualTo(1);
-      assertThat(r.location(TableIdentifier.of(db, "people"))).isEqualTo("s3://users/v1");
-      assertThat(r.tableVersion(1)).isEqualTo(2);
+      assertThat(r.state().tableId(TableIdentifier.of(db, "users"))).isNull();
+      assertThat(r.state().tableId(TableIdentifier.of(db, "people"))).isEqualTo(1);
+      assertThat(r.state().location(TableIdentifier.of(db, "people"))).isEqualTo("s3://users/v1");
+      assertThat(r.state().tableVersion(1)).isEqualTo(2);
     }
 
     @Test
@@ -892,21 +839,21 @@ public class TestProtoActions {
           .ns(2, 0, "archive", 1)
           .tbl(1, 1, "users", 1, "s3://users/v1")
           .build();
-      CatalogState r = apply(file, txn(renameTbl(1, 1, 2, 1, "users")));
+      Replica<CatalogState> r = apply(file, txn(renameTbl(1, 1, 2, 1, "users")));
 
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "users"))).isNull();
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("archive"), "users"))).isEqualTo(1);
-      assertThat(r.location(TableIdentifier.of(Namespace.of("archive"), "users")))
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("db"), "users"))).isNull();
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("archive"), "users"))).isEqualTo(1);
+      assertThat(r.state().location(TableIdentifier.of(Namespace.of("archive"), "users")))
           .isEqualTo("s3://users/v1");
       // Both source and destination ns versions bumped (children-set rule).
-      assertThat(r.namespaceVersion(1)).isEqualTo(2);
-      assertThat(r.namespaceVersion(2)).isEqualTo(2);
+      assertThat(r.state().namespaceVersion(1)).isEqualTo(2);
+      assertThat(r.state().namespaceVersion(2)).isEqualTo(2);
     }
 
     @Test
     void renameInlineTablePreservesInlineState() throws IOException {
       byte[] meta = "{\"format-version\":2}".getBytes();
-      CatalogState.Builder builder = CatalogState.builder(LOCATION);
+      CatalogState.Builder builder = CatalogState.builder();
       builder.addNamespace(1, 0, "db", 1);
       builder.addInlineTable(1, 1, "users", 1, meta, "s3://users/metadata/snap-");
       // Synthetic manifest pool entry + snapshot ref so we can prove they survive.
@@ -917,15 +864,15 @@ public class TestProtoActions {
           "s3://users/metadata/snap-m0.avro"));
       byte[] file = toFileBytes(builder.build());
 
-      CatalogState r = apply(file, txn(renameTbl(1, 1, 1, 1, "people")));
+      Replica<CatalogState> r = apply(file, txn(renameTbl(1, 1, 1, 1, "people")));
 
       // Id is stable, so the inline maps follow for free.
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "people"))).isEqualTo(1);
-      assertThat(r.isInlineTable(1)).isTrue();
-      assertThat(r.inlineMetadata(1)).isEqualTo(meta);
-      assertThat(r.manifestListPrefix(1)).isEqualTo("s3://users/metadata/snap-");
-      assertThat(r.hasInlineManifests(1, 100L)).isTrue();
-      assertThat(r.inlineManifests(1, 100L)).hasSize(1);
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("db"), "people"))).isEqualTo(1);
+      assertThat(r.state().isInlineTable(1)).isTrue();
+      assertThat(r.state().inlineMetadata(1)).isEqualTo(meta);
+      assertThat(r.state().manifestListPrefix(1)).isEqualTo("s3://users/metadata/snap-");
+      assertThat(r.state().hasInlineManifests(1, 100L)).isTrue();
+      assertThat(r.state().inlineManifests(1, 100L)).hasSize(1);
     }
 
     @Test
@@ -936,11 +883,11 @@ public class TestProtoActions {
           .build();
       // Action captured tbl_v=1 but real version is 3.
       ProtoCodec.Transaction t = txn(renameTbl(1, 1, 1, 1, "people"));
-      CatalogState r = apply(file, t);
+      Replica<CatalogState> r = apply(file, t);
 
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "users"))).isEqualTo(1);
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "people"))).isNull();
-      assertThat(r.containsTransaction(t.id())).isFalse();
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("db"), "users"))).isEqualTo(1);
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("db"), "people"))).isNull();
+      assertThat(r.committed().contains(t.id())).isFalse();
     }
 
     @Test
@@ -952,11 +899,11 @@ public class TestProtoActions {
           .build();
       // Action captured archive ns_v=1 but it's actually 5.
       ProtoCodec.Transaction t = txn(renameTbl(1, 1, 2, 1, "users"));
-      CatalogState r = apply(file, t);
+      Replica<CatalogState> r = apply(file, t);
 
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "users"))).isEqualTo(1);
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("archive"), "users"))).isNull();
-      assertThat(r.containsTransaction(t.id())).isFalse();
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("db"), "users"))).isEqualTo(1);
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("archive"), "users"))).isNull();
+      assertThat(r.committed().contains(t.id())).isFalse();
     }
 
     @Test
@@ -970,11 +917,11 @@ public class TestProtoActions {
       ProtoCodec.Transaction t = txn(
           createNs(2, 0, "archive", 1, -1),
           renameTbl(1, 1, 2, -1, "users"));
-      CatalogState r = apply(file, t);
+      Replica<CatalogState> r = apply(file, t);
 
-      assertThat(r.containsNamespace(Namespace.of("archive"))).isTrue();
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("archive"), "users"))).isEqualTo(1);
-      assertThat(r.containsTransaction(t.id())).isTrue();
+      assertThat(r.state().containsNamespace(Namespace.of("archive"))).isTrue();
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("archive"), "users"))).isEqualTo(1);
+      assertThat(r.committed().contains(t.id())).isTrue();
     }
   }
 
@@ -996,13 +943,13 @@ public class TestProtoActions {
       ProtoCodec.Transaction t = txn(
           createNs(2, 0, "newns", 1, -1),
           updateTbl(1, 1, "s3://v4"));  // expects version 1, actual is 3
-      CatalogState result = apply(file, t);
+      Replica<CatalogState> result = apply(file, t);
 
       // Neither action should have taken effect
-      assertThat(result.containsNamespace(Namespace.of("newns"))).isFalse();
-      assertThat(result.location(TableIdentifier.of(Namespace.of("db"), "users")))
+      assertThat(result.state().containsNamespace(Namespace.of("newns"))).isFalse();
+      assertThat(result.state().location(TableIdentifier.of(Namespace.of("db"), "users")))
           .isEqualTo("s3://v3");
-      assertThat(result.containsTransaction(t.id())).isFalse();
+      assertThat(result.committed().contains(t.id())).isFalse();
     }
 
     @Test
@@ -1014,16 +961,16 @@ public class TestProtoActions {
           createTbl(1, 1, "users", 1, 1, "s3://users/v1"));
       ProtoCodec.Transaction t3 = txn(
           createTbl(2, 2, "events", 1, -1, "s3://events/v1"));
-      CatalogState result = apply(file, t1, t2, t3);
+      Replica<CatalogState> result = apply(file, t1, t2, t3);
 
-      assertThat(result.containsNamespace(Namespace.of("analytics"))).isTrue();
-      assertThat(result.location(TableIdentifier.of(Namespace.of("db"), "users")))
+      assertThat(result.state().containsNamespace(Namespace.of("analytics"))).isTrue();
+      assertThat(result.state().location(TableIdentifier.of(Namespace.of("db"), "users")))
           .isEqualTo("s3://users/v1");
-      assertThat(result.location(TableIdentifier.of(Namespace.of("analytics"), "events")))
+      assertThat(result.state().location(TableIdentifier.of(Namespace.of("analytics"), "events")))
           .isEqualTo("s3://events/v1");
-      assertThat(result.containsTransaction(t1.id())).isTrue();
-      assertThat(result.containsTransaction(t2.id())).isTrue();
-      assertThat(result.containsTransaction(t3.id())).isTrue();
+      assertThat(result.committed().contains(t1.id())).isTrue();
+      assertThat(result.committed().contains(t2.id())).isTrue();
+      assertThat(result.committed().contains(t3.id())).isTrue();
     }
 
     @Test
@@ -1033,10 +980,10 @@ public class TestProtoActions {
 
       ProtoCodec.Transaction t = txn(sharedId, createNs(1, 0, "db", 1, -1));
       // Same ID appended twice
-      CatalogState result = apply(file, t, t);
+      Replica<CatalogState> result = apply(file, t, t);
 
-      assertThat(result.containsNamespace(Namespace.of("db"))).isTrue();
-      assertThat(result.namespaceVersion(result.namespaceId(Namespace.of("db")))).isEqualTo(1);
+      assertThat(result.state().containsNamespace(Namespace.of("db"))).isTrue();
+      assertThat(result.state().namespaceVersion(result.state().namespaceId(Namespace.of("db")))).isEqualTo(1);
     }
 
     @Test
@@ -1049,9 +996,9 @@ public class TestProtoActions {
 
       // Transaction with the same ID as one already in the checkpoint
       ProtoCodec.Transaction t = txn(priorTxnId, createNs(2, 0, "should_not_appear", 1, -1));
-      CatalogState result = apply(file, t);
+      Replica<CatalogState> result = apply(file, t);
 
-      assertThat(result.containsNamespace(Namespace.of("should_not_appear"))).isFalse();
+      assertThat(result.state().containsNamespace(Namespace.of("should_not_appear"))).isFalse();
     }
 
   }
@@ -1066,16 +1013,16 @@ public class TestProtoActions {
     @Test
     void lateBoundNestedNamespaceHierarchy() {
       byte[] file = catalog().build();
-      CatalogState result = apply(file, txn(
+      Replica<CatalogState> result = apply(file, txn(
           createNs(1, 0, "a", 1, -1),
           createNs(2, 1, "b", 1, -1),
           createNs(3, 2, "c", 1, -1),
           createTbl(1, 3, "leaf", 1, -1, "s3://deep/leaf")));
 
-      assertThat(result.containsNamespace(Namespace.of("a"))).isTrue();
-      assertThat(result.containsNamespace(Namespace.of("a", "b"))).isTrue();
-      assertThat(result.containsNamespace(Namespace.of("a", "b", "c"))).isTrue();
-      assertThat(result.location(TableIdentifier.of(Namespace.of("a", "b", "c"), "leaf")))
+      assertThat(result.state().containsNamespace(Namespace.of("a"))).isTrue();
+      assertThat(result.state().containsNamespace(Namespace.of("a", "b"))).isTrue();
+      assertThat(result.state().containsNamespace(Namespace.of("a", "b", "c"))).isTrue();
+      assertThat(result.state().location(TableIdentifier.of(Namespace.of("a", "b", "c"), "leaf")))
           .isEqualTo("s3://deep/leaf");
     }
 
@@ -1092,22 +1039,22 @@ public class TestProtoActions {
       ProtoCodec.Transaction t1 = txn(dropTbl(1, 1));
       ProtoCodec.Transaction t2 = txn(dropNs(1, 2));
       ProtoCodec.Transaction t3 = txn(createNs(2, 0, "production", 1, -1));
-      CatalogState result = apply(file, t1, t2, t3);
+      Replica<CatalogState> result = apply(file, t1, t2, t3);
 
-      assertThat(result.containsNamespace(Namespace.of("staging"))).isFalse();
-      assertThat(result.containsNamespace(Namespace.of("production"))).isTrue();
-      assertThat(result.tables()).isEmpty();
+      assertThat(result.state().containsNamespace(Namespace.of("staging"))).isFalse();
+      assertThat(result.state().containsNamespace(Namespace.of("production"))).isTrue();
+      assertThat(result.state().tables()).isEmpty();
     }
 
     @Test
     void createNamespaceWithPropertiesInSameTransaction() {
       byte[] file = catalog().build();
-      CatalogState result = apply(file, txn(
+      Replica<CatalogState> result = apply(file, txn(
           createNs(1, 0, "db", 1, -1),
           setNsProp(1, -1, "owner", "alice"),
           setNsProp(1, -1, "env", "prod")));
 
-      Map<String, String> props = result.namespaceProperties(Namespace.of("db"));
+      Map<String, String> props = result.state().namespaceProperties(Namespace.of("db"));
       assertThat(props).containsEntry("owner", "alice");
       assertThat(props).containsEntry("env", "prod");
     }
@@ -1120,9 +1067,9 @@ public class TestProtoActions {
       // must capture v=2 to verify against the post-set state.
       ProtoCodec.Transaction t1 = txn(setNsProp(1, 1, "owner", "alice"));
       ProtoCodec.Transaction t2 = txn(removeNsProp(1, 2, "owner"));
-      CatalogState result = apply(file, t1, t2);
+      Replica<CatalogState> result = apply(file, t1, t2);
 
-      assertThat(result.namespaceProperties(Namespace.of("db")))
+      assertThat(result.state().namespaceProperties(Namespace.of("db")))
           .doesNotContainKey("owner");
     }
 
@@ -1151,20 +1098,20 @@ public class TestProtoActions {
           readTbl(2, 1),
           dropTbl(1, 2));
 
-      CatalogState result = apply(file, t1, t2, t3, t4);
+      Replica<CatalogState> result = apply(file, t1, t2, t3, t4);
 
       // Verify final state
-      assertThat(result.containsNamespace(Namespace.of("warehouse"))).isTrue();
-      assertThat(result.containsNamespace(Namespace.of("warehouse", "bronze"))).isTrue();
-      assertThat(result.containsNamespace(Namespace.of("warehouse", "silver"))).isTrue();
-      assertThat(result.namespaceProperties(Namespace.of("warehouse")))
+      assertThat(result.state().containsNamespace(Namespace.of("warehouse"))).isTrue();
+      assertThat(result.state().containsNamespace(Namespace.of("warehouse", "bronze"))).isTrue();
+      assertThat(result.state().containsNamespace(Namespace.of("warehouse", "silver"))).isTrue();
+      assertThat(result.state().namespaceProperties(Namespace.of("warehouse")))
           .containsEntry("owner", "data-team");
 
       // raw_events was dropped
-      assertThat(result.location(TableIdentifier.of(
+      assertThat(result.state().location(TableIdentifier.of(
           Namespace.of("warehouse", "bronze"), "raw_events"))).isNull();
       // enriched still exists at original location
-      assertThat(result.location(TableIdentifier.of(
+      assertThat(result.state().location(TableIdentifier.of(
           Namespace.of("warehouse", "silver"), "enriched")))
           .isEqualTo("s3://wh/silver/enriched/v1");
     }
@@ -1182,23 +1129,23 @@ public class TestProtoActions {
           .build();
 
       // Read from bytes to verify checkpoint roundtrip
-      CatalogState result = apply(file);
+      Replica<CatalogState> result = apply(file);
 
-      assertThat(result.containsNamespace(Namespace.of("db"))).isTrue();
-      assertThat(result.containsNamespace(Namespace.of("db", "schema"))).isTrue();
-      assertThat(result.namespaceVersion(result.namespaceId(Namespace.of("db")))).isEqualTo(2);
-      assertThat(result.namespaceVersion(result.namespaceId(Namespace.of("db", "schema")))).isEqualTo(1);
+      assertThat(result.state().containsNamespace(Namespace.of("db"))).isTrue();
+      assertThat(result.state().containsNamespace(Namespace.of("db", "schema"))).isTrue();
+      assertThat(result.state().namespaceVersion(result.state().namespaceId(Namespace.of("db")))).isEqualTo(2);
+      assertThat(result.state().namespaceVersion(result.state().namespaceId(Namespace.of("db", "schema")))).isEqualTo(1);
 
       TableIdentifier t1 = TableIdentifier.of(Namespace.of("db", "schema"), "t1");
       TableIdentifier t2 = TableIdentifier.of(Namespace.of("db", "schema"), "t2");
-      assertThat(result.location(t1)).isEqualTo("s3://t1/v3");
-      assertThat(result.tableVersion(result.tableId(t1))).isEqualTo(3);
-      assertThat(result.location(t2)).isEqualTo("s3://t2/v1");
+      assertThat(result.state().location(t1)).isEqualTo("s3://t1/v3");
+      assertThat(result.state().tableVersion(result.state().tableId(t1))).isEqualTo(3);
+      assertThat(result.state().location(t2)).isEqualTo("s3://t2/v1");
 
-      assertThat(result.namespaceProperties(Namespace.of("db")))
+      assertThat(result.state().namespaceProperties(Namespace.of("db")))
           .containsEntry("owner", "alice")
           .containsEntry("env", "prod");
-      assertThat(result.namespaceProperties(Namespace.of("db", "schema")))
+      assertThat(result.state().namespaceProperties(Namespace.of("db", "schema")))
           .containsEntry("comment", "test schema");
     }
 
@@ -1206,11 +1153,11 @@ public class TestProtoActions {
     void emptyTransactionApplies() {
       byte[] file = catalog().ns(1, 0, "db", 1).build();
       ProtoCodec.Transaction t = new ProtoCodec.Transaction(UuidV7.newUuidV7(), List.of());
-      CatalogState result = apply(file, t);
+      Replica<CatalogState> result = apply(file, t);
 
       // No-op transaction should still be recorded
-      assertThat(result.containsTransaction(t.id())).isTrue();
-      assertThat(result.containsNamespace(Namespace.of("db"))).isTrue();
+      assertThat(result.committed().contains(t.id())).isTrue();
+      assertThat(result.state().containsNamespace(Namespace.of("db"))).isTrue();
     }
   }
 
@@ -1231,19 +1178,19 @@ public class TestProtoActions {
           .ns(1, 0, "db", 1)
           .inlineTbl(1, 1, "events", 1, SAMPLE_INLINE_METADATA, SAMPLE_MANIFEST_PREFIX)
           .build();
-      CatalogState result = apply(file);
+      Replica<CatalogState> result = apply(file);
 
       // Table exists and is accessible
       TableIdentifier events = TableIdentifier.of(Namespace.of("db"), "events");
-      assertThat(result.tables()).contains(events);
-      Integer tblId = result.tableId(events);
+      assertThat(result.state().tables()).contains(events);
+      Integer tblId = result.state().tableId(events);
       assertThat(tblId).isNotNull();
 
       // It's inline (no pointer location, has inline metadata)
-      assertThat(result.location(events)).isNull();
-      assertThat(result.isInlineTable(tblId)).isTrue();
-      assertThat(result.inlineMetadata(tblId)).isEqualTo(SAMPLE_INLINE_METADATA);
-      assertThat(result.manifestListPrefix(tblId)).isEqualTo(SAMPLE_MANIFEST_PREFIX);
+      assertThat(result.state().location(events)).isNull();
+      assertThat(result.state().isInlineTable(tblId)).isTrue();
+      assertThat(result.state().inlineMetadata(tblId)).isEqualTo(SAMPLE_INLINE_METADATA);
+      assertThat(result.state().manifestListPrefix(tblId)).isEqualTo(SAMPLE_MANIFEST_PREFIX);
     }
 
     @Test
@@ -1253,22 +1200,22 @@ public class TestProtoActions {
           .tbl(1, 1, "pointer_tbl", 1, "s3://bucket/pointer/v1")
           .inlineTbl(2, 1, "inline_tbl", 1, SAMPLE_INLINE_METADATA, SAMPLE_MANIFEST_PREFIX)
           .build();
-      CatalogState result = apply(file);
+      Replica<CatalogState> result = apply(file);
 
       TableIdentifier pointer = TableIdentifier.of(Namespace.of("db"), "pointer_tbl");
       TableIdentifier inline = TableIdentifier.of(Namespace.of("db"), "inline_tbl");
 
       // Both tables visible
-      assertThat(result.tables()).containsExactlyInAnyOrder(pointer, inline);
+      assertThat(result.state().tables()).containsExactlyInAnyOrder(pointer, inline);
 
       // Pointer table has location, not inline
-      assertThat(result.location(pointer)).isEqualTo("s3://bucket/pointer/v1");
-      assertThat(result.isInlineTable(result.tableId(pointer))).isFalse();
+      assertThat(result.state().location(pointer)).isEqualTo("s3://bucket/pointer/v1");
+      assertThat(result.state().isInlineTable(result.state().tableId(pointer))).isFalse();
 
       // Inline table has metadata, no location
-      assertThat(result.location(inline)).isNull();
-      assertThat(result.isInlineTable(result.tableId(inline))).isTrue();
-      assertThat(result.inlineMetadata(result.tableId(inline))).isEqualTo(SAMPLE_INLINE_METADATA);
+      assertThat(result.state().location(inline)).isNull();
+      assertThat(result.state().isInlineTable(result.state().tableId(inline))).isTrue();
+      assertThat(result.state().inlineMetadata(result.state().tableId(inline))).isEqualTo(SAMPLE_INLINE_METADATA);
     }
 
     @Test
@@ -1277,10 +1224,10 @@ public class TestProtoActions {
           .ns(1, 0, "db", 1)
           .inlineTbl(1, 1, "tbl", 3, SAMPLE_INLINE_METADATA, SAMPLE_MANIFEST_PREFIX)
           .build();
-      CatalogState result = apply(file);
+      Replica<CatalogState> result = apply(file);
 
-      Integer tblId = result.tableId(TableIdentifier.of(Namespace.of("db"), "tbl"));
-      assertThat(result.tableVersion(tblId)).isEqualTo(3);
+      Integer tblId = result.state().tableId(TableIdentifier.of(Namespace.of("db"), "tbl"));
+      assertThat(result.state().tableVersion(tblId)).isEqualTo(3);
     }
 
     @Test
@@ -1289,15 +1236,15 @@ public class TestProtoActions {
           .ns(1, 0, "db", 1)
           .inlineTbl(1, 1, "tbl", 1, SAMPLE_INLINE_METADATA, SAMPLE_MANIFEST_PREFIX)
           .build();
-      CatalogState result = apply(file);
+      Replica<CatalogState> result = apply(file);
 
       // location() returns null for inline tables -- they don't have an external file
       TableIdentifier tbl = TableIdentifier.of(Namespace.of("db"), "tbl");
-      assertThat(result.location(tbl)).isNull();
-      assertThat(result.isInlineTable(result.tableId(tbl))).isTrue();
+      assertThat(result.state().location(tbl)).isNull();
+      assertThat(result.state().isInlineTable(result.state().tableId(tbl))).isTrue();
 
       // A pointer table would return a location string
-      assertThat(result.inlineMetadata(result.tableId(tbl))).isNotNull();
+      assertThat(result.state().inlineMetadata(result.state().tableId(tbl))).isNotNull();
     }
 
     @Test
@@ -1307,11 +1254,11 @@ public class TestProtoActions {
           .ns(1, 0, "db", 1)
           .inlineTbl(1, 1, "tbl", 1, emptyMeta, "")
           .build();
-      CatalogState result = apply(file);
+      Replica<CatalogState> result = apply(file);
 
-      Integer tblId = result.tableId(TableIdentifier.of(Namespace.of("db"), "tbl"));
-      assertThat(result.inlineMetadata(tblId)).isEqualTo(emptyMeta);
-      assertThat(result.manifestListPrefix(tblId)).isEmpty();
+      Integer tblId = result.state().tableId(TableIdentifier.of(Namespace.of("db"), "tbl"));
+      assertThat(result.state().inlineMetadata(tblId)).isEqualTo(emptyMeta);
+      assertThat(result.state().manifestListPrefix(tblId)).isEmpty();
     }
 
     // --- CreateTableInline action tests ---
@@ -1319,14 +1266,14 @@ public class TestProtoActions {
     @Test
     void createTableInlineApplies() {
       byte[] file = catalog().ns(1, 0, "db", 1).build();
-      CatalogState result = apply(file,
+      Replica<CatalogState> result = apply(file,
           txn(createTblInline(1, 1, "events", 1, 1, SAMPLE_INLINE_METADATA)));
 
       TableIdentifier events = TableIdentifier.of(Namespace.of("db"), "events");
-      assertThat(result.tables()).contains(events);
-      assertThat(result.isInlineTable(result.tableId(events))).isTrue();
-      assertThat(result.inlineMetadata(result.tableId(events))).isEqualTo(SAMPLE_INLINE_METADATA);
-      assertThat(result.location(events)).isNull();
+      assertThat(result.state().tables()).contains(events);
+      assertThat(result.state().isInlineTable(result.state().tableId(events))).isTrue();
+      assertThat(result.state().inlineMetadata(result.state().tableId(events))).isEqualTo(SAMPLE_INLINE_METADATA);
+      assertThat(result.state().location(events)).isNull();
     }
 
     @Test
@@ -1334,37 +1281,37 @@ public class TestProtoActions {
       byte[] file = catalog().ns(1, 0, "db", 3).build();
       ProtoCodec.Transaction t = txn(
           createTblInline(1, 1, "events", 1, 1, SAMPLE_INLINE_METADATA));
-      CatalogState result = apply(file, t);
+      Replica<CatalogState> result = apply(file, t);
 
-      assertThat(result.containsTransaction(t.id())).isFalse();
-      assertThat(result.tables()).isEmpty();
+      assertThat(result.committed().contains(t.id())).isFalse();
+      assertThat(result.state().tables()).isEmpty();
     }
 
     @Test
     void createTableInlineWithLateBoundNamespace() {
       byte[] file = catalog().build();
-      CatalogState result = apply(file, txn(
+      Replica<CatalogState> result = apply(file, txn(
           createNs(1, 0, "db", 1, -1),
           createTblInline(1, 1, "events", 1, -1, SAMPLE_INLINE_METADATA)));
 
-      assertThat(result.containsNamespace(Namespace.of("db"))).isTrue();
+      assertThat(result.state().containsNamespace(Namespace.of("db"))).isTrue();
       TableIdentifier events = TableIdentifier.of(Namespace.of("db"), "events");
-      assertThat(result.isInlineTable(result.tableId(events))).isTrue();
+      assertThat(result.state().isInlineTable(result.state().tableId(events))).isTrue();
     }
 
     @Test
     void mixedInlineAndPointerCreatesInSameTransaction() {
       byte[] file = catalog().ns(1, 0, "db", 1).build();
-      CatalogState result = apply(file, txn(
+      Replica<CatalogState> result = apply(file, txn(
           createTbl(1, 1, "pointer", 1, 1, "s3://bucket/pointer/v1"),
           createTblInline(2, 1, "inline", 1, 1, SAMPLE_INLINE_METADATA)));
 
       TableIdentifier pointer = TableIdentifier.of(Namespace.of("db"), "pointer");
       TableIdentifier inline = TableIdentifier.of(Namespace.of("db"), "inline");
 
-      assertThat(result.location(pointer)).isEqualTo("s3://bucket/pointer/v1");
-      assertThat(result.isInlineTable(result.tableId(pointer))).isFalse();
-      assertThat(result.isInlineTable(result.tableId(inline))).isTrue();
+      assertThat(result.state().location(pointer)).isEqualTo("s3://bucket/pointer/v1");
+      assertThat(result.state().isInlineTable(result.state().tableId(pointer))).isFalse();
+      assertThat(result.state().isInlineTable(result.state().tableId(inline))).isTrue();
     }
 
     @Test
@@ -1396,12 +1343,12 @@ public class TestProtoActions {
           .build();
       byte[] newMeta = "{\"format-version\":2,\"updated\":true}".getBytes(
           java.nio.charset.StandardCharsets.UTF_8);
-      CatalogState result = apply(file, txn(updateTblInlineFull(1, 1, newMeta)));
+      Replica<CatalogState> result = apply(file, txn(updateTblInlineFull(1, 1, newMeta)));
 
       TableIdentifier tbl = TableIdentifier.of(Namespace.of("db"), "tbl");
-      assertThat(result.isInlineTable(result.tableId(tbl))).isTrue();
-      assertThat(result.inlineMetadata(result.tableId(tbl))).isEqualTo(newMeta);
-      assertThat(result.tableVersion(result.tableId(tbl))).isEqualTo(2);
+      assertThat(result.state().isInlineTable(result.state().tableId(tbl))).isTrue();
+      assertThat(result.state().inlineMetadata(result.state().tableId(tbl))).isEqualTo(newMeta);
+      assertThat(result.state().tableVersion(result.state().tableId(tbl))).isEqualTo(2);
     }
 
     @Test
@@ -1410,15 +1357,15 @@ public class TestProtoActions {
           .ns(1, 0, "db", 1)
           .inlineTbl(1, 1, "tbl", 1, SAMPLE_INLINE_METADATA, SAMPLE_MANIFEST_PREFIX)
           .build();
-      CatalogState result = apply(file,
+      Replica<CatalogState> result = apply(file,
           txn(updateTblInlinePointer(1, 1, "s3://bucket/evicted/v1.metadata.json")));
 
       TableIdentifier tbl = TableIdentifier.of(Namespace.of("db"), "tbl");
       // Table is now a pointer, no longer inline
-      assertThat(result.isInlineTable(result.tableId(tbl))).isFalse();
-      assertThat(result.location(tbl)).isEqualTo("s3://bucket/evicted/v1.metadata.json");
-      assertThat(result.inlineMetadata(result.tableId(tbl))).isNull();
-      assertThat(result.tableVersion(result.tableId(tbl))).isEqualTo(2);
+      assertThat(result.state().isInlineTable(result.state().tableId(tbl))).isFalse();
+      assertThat(result.state().location(tbl)).isEqualTo("s3://bucket/evicted/v1.metadata.json");
+      assertThat(result.state().inlineMetadata(result.state().tableId(tbl))).isNull();
+      assertThat(result.state().tableVersion(result.state().tableId(tbl))).isEqualTo(2);
     }
 
     @Test
@@ -1429,11 +1376,11 @@ public class TestProtoActions {
           .build();
       byte[] newMeta = "{}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
       ProtoCodec.Transaction t = txn(updateTblInlineFull(1, 1, newMeta));
-      CatalogState result = apply(file, t);
+      Replica<CatalogState> result = apply(file, t);
 
       // Version 1 doesn't match actual 3
-      assertThat(result.containsTransaction(t.id())).isFalse();
-      assertThat(result.inlineMetadata(result.tableId(
+      assertThat(result.committed().contains(t.id())).isFalse();
+      assertThat(result.state().inlineMetadata(result.state().tableId(
           TableIdentifier.of(Namespace.of("db"), "tbl")))).isEqualTo(SAMPLE_INLINE_METADATA);
     }
 
@@ -1448,11 +1395,11 @@ public class TestProtoActions {
 
       ProtoCodec.Transaction t1 = txn(updateTblInlineFull(1, 1, meta1));
       ProtoCodec.Transaction t2 = txn(updateTblInlineFull(1, 1, meta2));
-      CatalogState result = apply(file, t1, t2);
+      Replica<CatalogState> result = apply(file, t1, t2);
 
-      assertThat(result.containsTransaction(t1.id())).isTrue();
-      assertThat(result.containsTransaction(t2.id())).isFalse();
-      assertThat(result.inlineMetadata(result.tableId(
+      assertThat(result.committed().contains(t1.id())).isTrue();
+      assertThat(result.committed().contains(t2.id())).isFalse();
+      assertThat(result.state().inlineMetadata(result.state().tableId(
           TableIdentifier.of(Namespace.of("db"), "tbl")))).isEqualTo(meta1);
     }
 
@@ -1466,15 +1413,15 @@ public class TestProtoActions {
           .inlineTbl(1, 1, "t1", 1, meta1, "s3://b/db1/t1/metadata/snap-")
           .inlineTbl(2, 2, "t2", 1, meta2, "s3://b/db2/t2/metadata/snap-")
           .build();
-      CatalogState result = apply(file);
+      Replica<CatalogState> result = apply(file);
 
       TableIdentifier t1 = TableIdentifier.of(Namespace.of("db1"), "t1");
       TableIdentifier t2 = TableIdentifier.of(Namespace.of("db2"), "t2");
-      assertThat(result.inlineMetadata(result.tableId(t1))).isEqualTo(meta1);
-      assertThat(result.inlineMetadata(result.tableId(t2))).isEqualTo(meta2);
-      assertThat(result.manifestListPrefix(result.tableId(t1)))
+      assertThat(result.state().inlineMetadata(result.state().tableId(t1))).isEqualTo(meta1);
+      assertThat(result.state().inlineMetadata(result.state().tableId(t2))).isEqualTo(meta2);
+      assertThat(result.state().manifestListPrefix(result.state().tableId(t1)))
           .isEqualTo("s3://b/db1/t1/metadata/snap-");
-      assertThat(result.manifestListPrefix(result.tableId(t2)))
+      assertThat(result.state().manifestListPrefix(result.state().tableId(t2)))
           .isEqualTo("s3://b/db2/t2/metadata/snap-");
     }
 
@@ -1482,21 +1429,20 @@ public class TestProtoActions {
 
     @Test
     void mutCreateTableInlineProducesCorrectAction() throws IOException {
-      CatalogState orig = CatalogState.builder(LOCATION)
+      CatalogState orig = CatalogState.builder()
           .addNamespace(0, 0, "", 1)
           .addNamespace(1, 0, "db", 1)
           .setNextNamespaceId(2)
           .setNextTableId(1)
           .build();
       byte[] origBytes = toFileBytes(orig);
-      CatalogState fresh = ProtoCatalogFormat.readInternal(
-          LOCATION, new java.io.ByteArrayInputStream(origBytes), origBytes.length);
+      Replica<CatalogState> fresh = CatalogTestSupport.replay(origBytes);
 
-      ProtoCatalogFormat.Mut mut = new ProtoCatalogFormat.Mut(fresh);
+      CatalogMutation mut = new CatalogMutation(fresh);
       mut.createTableInline(
           TableIdentifier.of(Namespace.of("db"), "events"),
           SAMPLE_INLINE_METADATA, InlineMetadataCodecs.TAG_JSON_GZIP);
-      ProtoCodec.Transaction txn = mut.buildTransaction();
+      ProtoCodec.Transaction txn = ProtoCodec.Transaction.from(mut);
 
       // Should produce a CreateTableInlineAction
       assertThat(txn.actions()).hasSize(1);
@@ -1504,22 +1450,22 @@ public class TestProtoActions {
           .isInstanceOf(ProtoCodec.CreateTableInlineAction.class);
 
       // Apply and verify
-      CatalogState result = apply(origBytes, txn);
+      Replica<CatalogState> result = apply(origBytes, txn);
       TableIdentifier events = TableIdentifier.of(Namespace.of("db"), "events");
-      assertThat(result.isInlineTable(events)).isTrue();
-      assertThat(result.inlineMetadata(events)).isEqualTo(SAMPLE_INLINE_METADATA);
+      assertThat(result.state().isInlineTable(events)).isTrue();
+      assertThat(result.state().inlineMetadata(events)).isEqualTo(SAMPLE_INLINE_METADATA);
     }
 
     @Test
     void mutUpdateTableInlineProducesCorrectAction() throws IOException {
-      CatalogState orig = CatalogState.builder(LOCATION)
+      CatalogState orig = CatalogState.builder()
           .addNamespace(0, 0, "", 1)
           .addNamespace(1, 0, "db", 1)
           .setNextNamespaceId(2)
           .setNextTableId(2)
           .build();
       // Add inline table directly
-      orig.builder(LOCATION)
+      CatalogState.builder()
           .addNamespace(0, 0, "", 1)
           .addNamespace(1, 0, "db", 1)
           .addInlineTable(1, 1, "events", 1, SAMPLE_INLINE_METADATA, SAMPLE_MANIFEST_PREFIX)
@@ -1532,15 +1478,14 @@ public class TestProtoActions {
           .ns(1, 0, "db", 1)
           .inlineTbl(1, 1, "events", 1, SAMPLE_INLINE_METADATA, SAMPLE_MANIFEST_PREFIX)
           .build();
-      CatalogState fresh = ProtoCatalogFormat.readInternal(
-          LOCATION, new java.io.ByteArrayInputStream(origBytes), origBytes.length);
+      Replica<CatalogState> fresh = CatalogTestSupport.replay(origBytes);
 
       byte[] newMeta = "{\"updated\":true}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
-      ProtoCatalogFormat.Mut mut = new ProtoCatalogFormat.Mut(fresh);
+      CatalogMutation mut = new CatalogMutation(fresh);
       mut.updateTableInline(
           TableIdentifier.of(Namespace.of("db"), "events"),
           newMeta, InlineMetadataCodecs.TAG_JSON_GZIP);
-      ProtoCodec.Transaction txn = mut.buildTransaction();
+      ProtoCodec.Transaction txn = ProtoCodec.Transaction.from(mut);
 
       // Should produce an UpdateTableInlineAction
       assertThat(txn.actions()).hasSize(1);
@@ -1548,34 +1493,33 @@ public class TestProtoActions {
           .isInstanceOf(ProtoCodec.UpdateTableInlineAction.class);
 
       // Apply and verify
-      CatalogState result = apply(origBytes, txn);
+      Replica<CatalogState> result = apply(origBytes, txn);
       TableIdentifier events = TableIdentifier.of(Namespace.of("db"), "events");
-      assertThat(result.isInlineTable(events)).isTrue();
-      assertThat(result.inlineMetadata(events)).isEqualTo(newMeta);
-      assertThat(result.tableVersion(result.tableId(events))).isEqualTo(2);
+      assertThat(result.state().isInlineTable(events)).isTrue();
+      assertThat(result.state().inlineMetadata(events)).isEqualTo(newMeta);
+      assertThat(result.state().tableVersion(result.state().tableId(events))).isEqualTo(2);
     }
 
     @Test
     void mutMixedInlineAndPointerInSameTransaction() throws IOException {
       byte[] origBytes = catalog().ns(1, 0, "db", 1).build();
-      CatalogState fresh = ProtoCatalogFormat.readInternal(
-          LOCATION, new java.io.ByteArrayInputStream(origBytes), origBytes.length);
+      Replica<CatalogState> fresh = CatalogTestSupport.replay(origBytes);
 
-      ProtoCatalogFormat.Mut mut = new ProtoCatalogFormat.Mut(fresh);
+      CatalogMutation mut = new CatalogMutation(fresh);
       mut.createTable(
           TableIdentifier.of(Namespace.of("db"), "pointer_tbl"), "s3://bucket/pointer/v1");
       mut.createTableInline(
           TableIdentifier.of(Namespace.of("db"), "inline_tbl"),
           SAMPLE_INLINE_METADATA, InlineMetadataCodecs.TAG_JSON_GZIP);
-      ProtoCodec.Transaction txn = mut.buildTransaction();
+      ProtoCodec.Transaction txn = ProtoCodec.Transaction.from(mut);
 
       assertThat(txn.actions()).hasSize(2);
 
-      CatalogState result = apply(origBytes, txn);
+      Replica<CatalogState> result = apply(origBytes, txn);
       TableIdentifier pointer = TableIdentifier.of(Namespace.of("db"), "pointer_tbl");
       TableIdentifier inline = TableIdentifier.of(Namespace.of("db"), "inline_tbl");
-      assertThat(result.location(pointer)).isEqualTo("s3://bucket/pointer/v1");
-      assertThat(result.isInlineTable(inline)).isTrue();
+      assertThat(result.state().location(pointer)).isEqualTo("s3://bucket/pointer/v1");
+      assertThat(result.state().isInlineTable(inline)).isTrue();
     }
   }
 
@@ -1600,12 +1544,12 @@ public class TestProtoActions {
 
       ProtoCodec.Transaction txn = txn(
           createTblInline(-1, 1, "tbl", 1, 1, meta, InlineMetadataCodecs.TAG_STRUCTURAL));
-      CatalogState result = apply(file, txn);
+      Replica<CatalogState> result = apply(file, txn);
 
-      Integer id = result.tableId(TableIdentifier.of(Namespace.of("db"), "tbl"));
+      Integer id = result.state().tableId(TableIdentifier.of(Namespace.of("db"), "tbl"));
       assertThat(id).isNotNull();
-      assertThat(result.inlineMetadata(id)).isEqualTo(meta);
-      assertThat(result.inlineMetadataCodec(id))
+      assertThat(result.state().inlineMetadata(id)).isEqualTo(meta);
+      assertThat(result.state().inlineMetadataCodec(id))
           .isEqualTo(InlineMetadataCodecs.TAG_STRUCTURAL);
     }
 
@@ -1620,11 +1564,11 @@ public class TestProtoActions {
       byte[] meta1 = new byte[] {0x30, 0x40, 0x50};
       ProtoCodec.Transaction txn = txn(
           updateTblInlineFull(1, 1, meta1, InlineMetadataCodecs.TAG_STRUCTURAL));
-      CatalogState result = apply(file, txn);
+      Replica<CatalogState> result = apply(file, txn);
 
-      Integer id = result.tableId(TableIdentifier.of(Namespace.of("db"), "tbl"));
-      assertThat(result.inlineMetadata(id)).isEqualTo(meta1);
-      assertThat(result.inlineMetadataCodec(id))
+      Integer id = result.state().tableId(TableIdentifier.of(Namespace.of("db"), "tbl"));
+      assertThat(result.state().inlineMetadata(id)).isEqualTo(meta1);
+      assertThat(result.state().inlineMetadataCodec(id))
           .as("full-mode update must record the codec on the new inline bytes")
           .isEqualTo(InlineMetadataCodecs.TAG_STRUCTURAL);
     }
@@ -1688,11 +1632,7 @@ public class TestProtoActions {
 
   /** Decodes a serialized catalog file back to a CatalogState. */
   private static CatalogState decodeFile(byte[] file) {
-    try (java.io.ByteArrayInputStream in = new java.io.ByteArrayInputStream(file)) {
-      return ProtoCatalogFormat.readInternal(LOCATION, in, file.length);
-    } catch (java.io.IOException e) {
-      throw new java.io.UncheckedIOException(e);
-    }
+    return CatalogTestSupport.decodeFullFile(file);
   }
 
   // ============================================================
@@ -1707,7 +1647,7 @@ public class TestProtoActions {
     @Test
     void checkpointRoundtripWithManifestPool() {
       // Build a catalog with an inline table that has manifest pool + snapshot refs
-      CatalogState.Builder b = CatalogState.builder(LOCATION);
+      CatalogState.Builder b = CatalogState.builder();
       b.addNamespace(0, 0, "", 1);
       b.addNamespace(1, 0, "db", 1);
       b.setNextNamespaceId(2);
@@ -1740,22 +1680,22 @@ public class TestProtoActions {
 
       // Serialize to file bytes and re-read
       byte[] fileBytes = toFileBytes(original);
-      CatalogState result = apply(fileBytes);
+      Replica<CatalogState> result = apply(fileBytes);
 
       // Verify table exists and is inline
       TableIdentifier tbl = TableIdentifier.of(Namespace.of("db"), "tbl");
-      Integer tblId = result.tableId(tbl);
+      Integer tblId = result.state().tableId(tbl);
       assertThat(tblId).isNotNull();
-      assertThat(result.isInlineTable(tblId)).isTrue();
+      assertThat(result.state().isInlineTable(tblId)).isTrue();
 
       // Verify manifest pool round-tripped
-      assertThat(result.hasInlineManifests(tblId, 100L)).isTrue();
-      assertThat(result.hasInlineManifests(tblId, 200L)).isTrue();
-      assertThat(result.hasInlineManifests(tblId, 300L)).isTrue();
-      assertThat(result.hasInlineManifests(tblId, 999L)).isFalse();
+      assertThat(result.state().hasInlineManifests(tblId, 100L)).isTrue();
+      assertThat(result.state().hasInlineManifests(tblId, 200L)).isTrue();
+      assertThat(result.state().hasInlineManifests(tblId, 300L)).isTrue();
+      assertThat(result.state().hasInlineManifests(tblId, 999L)).isFalse();
 
       // Snapshot 100: just m1
-      List<org.apache.iceberg.ManifestFile> snap100 = result.inlineManifests(tblId, 100L);
+      List<org.apache.iceberg.ManifestFile> snap100 = result.state().inlineManifests(tblId, 100L);
       assertThat(snap100).hasSize(1);
       assertThat(snap100.get(0).path()).isEqualTo(m1.path());
       assertThat(snap100.get(0).length()).isEqualTo(1024);
@@ -1763,13 +1703,13 @@ public class TestProtoActions {
       assertThat(snap100.get(0).addedFilesCount()).isEqualTo(5);
 
       // Snapshot 200: m2, m1
-      List<org.apache.iceberg.ManifestFile> snap200 = result.inlineManifests(tblId, 200L);
+      List<org.apache.iceberg.ManifestFile> snap200 = result.state().inlineManifests(tblId, 200L);
       assertThat(snap200).hasSize(2);
       assertThat(snap200.get(0).path()).isEqualTo(m2.path());
       assertThat(snap200.get(1).path()).isEqualTo(m1.path());
 
       // Snapshot 300: m3, m2, m1 -- pool sharing verified (m1 + m2 stored once)
-      List<org.apache.iceberg.ManifestFile> snap300 = result.inlineManifests(tblId, 300L);
+      List<org.apache.iceberg.ManifestFile> snap300 = result.state().inlineManifests(tblId, 300L);
       assertThat(snap300).hasSize(3);
       assertThat(snap300.get(0).path()).isEqualTo(m3.path());
       assertThat(snap300.get(0).existingFilesCount()).isEqualTo(5);
@@ -1783,16 +1723,16 @@ public class TestProtoActions {
           .ns(1, 0, "db", 1)
           .inlineTbl(1, 1, "tbl", 1, SAMPLE_INLINE_METADATA, MANIFEST_PREFIX)
           .build();
-      CatalogState result = apply(file);
+      Replica<CatalogState> result = apply(file);
 
-      Integer tblId = result.tableId(TableIdentifier.of(Namespace.of("db"), "tbl"));
-      assertThat(result.hasInlineManifests(tblId, 1L)).isFalse();
-      assertThat(result.inlineManifests(tblId, 1L)).isNull();
+      Integer tblId = result.state().tableId(TableIdentifier.of(Namespace.of("db"), "tbl"));
+      assertThat(result.state().hasInlineManifests(tblId, 1L)).isFalse();
+      assertThat(result.state().inlineManifests(tblId, 1L)).isNull();
     }
 
     @Test
     void multipleTablesWithIndependentPools() {
-      CatalogState.Builder b = CatalogState.builder(LOCATION);
+      CatalogState.Builder b = CatalogState.builder();
       b.addNamespace(0, 0, "", 1);
       b.addNamespace(1, 0, "db", 1);
       b.setNextNamespaceId(2);
@@ -1818,18 +1758,18 @@ public class TestProtoActions {
       b.setSnapshotManifests(2, 20L, List.of(m2.path()));
 
       byte[] fileBytes = toFileBytes(b.build());
-      CatalogState result = apply(fileBytes);
+      Replica<CatalogState> result = apply(fileBytes);
 
-      Integer t1Id = result.tableId(TableIdentifier.of(Namespace.of("db"), "t1"));
-      Integer t2Id = result.tableId(TableIdentifier.of(Namespace.of("db"), "t2"));
+      Integer t1Id = result.state().tableId(TableIdentifier.of(Namespace.of("db"), "t1"));
+      Integer t2Id = result.state().tableId(TableIdentifier.of(Namespace.of("db"), "t2"));
 
-      assertThat(result.hasInlineManifests(t1Id, 10L)).isTrue();
-      assertThat(result.hasInlineManifests(t2Id, 20L)).isTrue();
-      assertThat(result.hasInlineManifests(t1Id, 20L)).isFalse();
-      assertThat(result.hasInlineManifests(t2Id, 10L)).isFalse();
+      assertThat(result.state().hasInlineManifests(t1Id, 10L)).isTrue();
+      assertThat(result.state().hasInlineManifests(t2Id, 20L)).isTrue();
+      assertThat(result.state().hasInlineManifests(t1Id, 20L)).isFalse();
+      assertThat(result.state().hasInlineManifests(t2Id, 10L)).isFalse();
 
-      assertThat(result.inlineManifests(t1Id, 10L).get(0).path()).isEqualTo(m1.path());
-      assertThat(result.inlineManifests(t2Id, 20L).get(0).path()).isEqualTo(m2.path());
+      assertThat(result.state().inlineManifests(t1Id, 10L).get(0).path()).isEqualTo(m1.path());
+      assertThat(result.state().inlineManifests(t2Id, 20L).get(0).path()).isEqualTo(m2.path());
     }
   }
 
@@ -2158,10 +2098,10 @@ public class TestProtoActions {
       // UUID: parent "db" is now v=2 (bumped by child create), action captured
       // parentVersion=1, must be rejected.
       ProtoCodec.Transaction replay = txn(createNs(3, 1, "schema2", 1, 1));
-      CatalogState result = apply(afterFirst, replay);
-      assertThat(result.containsNamespace(Namespace.of("db", "schema"))).isTrue();
-      assertThat(result.containsNamespace(Namespace.of("db", "schema2"))).isFalse();
-      assertThat(result.containsTransaction(replay.id())).isFalse();
+      Replica<CatalogState> result = apply(afterFirst, replay);
+      assertThat(result.state().containsNamespace(Namespace.of("db", "schema"))).isTrue();
+      assertThat(result.state().containsNamespace(Namespace.of("db", "schema2"))).isFalse();
+      assertThat(result.committed().contains(replay.id())).isFalse();
     }
 
     @Test
@@ -2182,12 +2122,12 @@ public class TestProtoActions {
       // and drop each bumped it); the captured nsVersion=1 must be rejected.
       ProtoCodec.Transaction replayA = txn(
           createTbl(1, 1, "t1", 1, 1, "s3://t1/v1"));
-      CatalogState result = apply(afterAB, replayA);
+      Replica<CatalogState> result = apply(afterAB, replayA);
 
-      assertThat(result.tableId(TableIdentifier.of(Namespace.of("db"), "t1")))
+      assertThat(result.state().tableId(TableIdentifier.of(Namespace.of("db"), "t1")))
           .as("replayed create must not resurrect the dropped table")
           .isNull();
-      assertThat(result.containsTransaction(replayA.id())).isFalse();
+      assertThat(result.committed().contains(replayA.id())).isFalse();
     }
 
     @Test
@@ -2200,11 +2140,11 @@ public class TestProtoActions {
       byte[] afterAB = replayAndSerialize(file, recordA, recordB);
 
       ProtoCodec.Transaction replayA = txn(createTblInline(1, 1, "t1", 1, 1, md));
-      CatalogState result = apply(afterAB, replayA);
+      Replica<CatalogState> result = apply(afterAB, replayA);
 
-      assertThat(result.tableId(TableIdentifier.of(Namespace.of("db"), "t1")))
+      assertThat(result.state().tableId(TableIdentifier.of(Namespace.of("db"), "t1")))
           .isNull();
-      assertThat(result.containsTransaction(replayA.id())).isFalse();
+      assertThat(result.committed().contains(replayA.id())).isFalse();
     }
 
     @Test
@@ -2215,10 +2155,10 @@ public class TestProtoActions {
 
       // Replay: ns version moved 1 -> 2; captured version=1 must be rejected.
       ProtoCodec.Transaction replay = txn(setNsProp(1, 1, "owner", "bob"));
-      CatalogState result = apply(afterFirst, replay);
-      assertThat(result.namespaceProperties(Namespace.of("db")))
+      Replica<CatalogState> result = apply(afterFirst, replay);
+      assertThat(result.state().namespaceProperties(Namespace.of("db")))
           .containsEntry("owner", "alice");
-      assertThat(result.containsTransaction(replay.id())).isFalse();
+      assertThat(result.committed().contains(replay.id())).isFalse();
     }
 
     @Test
@@ -2233,11 +2173,11 @@ public class TestProtoActions {
 
       // ns bumped 1 -> 2; captured v=1 must be rejected.
       ProtoCodec.Transaction replay = txn(removeNsProp(1, 1, "env"));
-      CatalogState result = apply(afterFirst, replay);
-      assertThat(result.namespaceProperties(Namespace.of("db")))
+      Replica<CatalogState> result = apply(afterFirst, replay);
+      assertThat(result.state().namespaceProperties(Namespace.of("db")))
           .doesNotContainKey("owner")
           .containsEntry("env", "prod");
-      assertThat(result.containsTransaction(replay.id())).isFalse();
+      assertThat(result.committed().contains(replay.id())).isFalse();
     }
 
     @Test
@@ -2248,9 +2188,9 @@ public class TestProtoActions {
 
       // Replay: ns is gone; namespaceVersion returns -1, which != captured 1.
       ProtoCodec.Transaction replay = txn(dropNs(1, 1));
-      CatalogState result = apply(afterFirst, replay);
-      assertThat(result.containsNamespace(Namespace.of("db"))).isFalse();
-      assertThat(result.containsTransaction(replay.id())).isFalse();
+      Replica<CatalogState> result = apply(afterFirst, replay);
+      assertThat(result.state().containsNamespace(Namespace.of("db"))).isFalse();
+      assertThat(result.committed().contains(replay.id())).isFalse();
     }
 
     @Test
@@ -2264,8 +2204,8 @@ public class TestProtoActions {
 
       // tbl is gone; tableVersion returns -1, captured=1, rejected.
       ProtoCodec.Transaction replay = txn(dropTbl(1, 1));
-      CatalogState result = apply(afterFirst, replay);
-      assertThat(result.containsTransaction(replay.id())).isFalse();
+      Replica<CatalogState> result = apply(afterFirst, replay);
+      assertThat(result.committed().contains(replay.id())).isFalse();
     }
 
     @Test
@@ -2279,10 +2219,10 @@ public class TestProtoActions {
 
       // tbl version bumped 1 -> 2; replay with captured v=1 rejected.
       ProtoCodec.Transaction replay = txn(updateTbl(1, 1, "s3://t1/v3"));
-      CatalogState result = apply(afterFirst, replay);
-      assertThat(result.location(TableIdentifier.of(Namespace.of("db"), "t1")))
+      Replica<CatalogState> result = apply(afterFirst, replay);
+      assertThat(result.state().location(TableIdentifier.of(Namespace.of("db"), "t1")))
           .isEqualTo("s3://t1/v2");
-      assertThat(result.containsTransaction(replay.id())).isFalse();
+      assertThat(result.committed().contains(replay.id())).isFalse();
     }
 
     @Test
@@ -2296,11 +2236,11 @@ public class TestProtoActions {
 
       // tbl version bumped 1 -> 2; replay capturing tbl_v=1 must be rejected.
       ProtoCodec.Transaction replay = txn(renameTbl(1, 1, 1, 2, "humans"));
-      CatalogState result = apply(afterFirst, replay);
+      Replica<CatalogState> result = apply(afterFirst, replay);
       Namespace db = Namespace.of("db");
-      assertThat(result.tableId(TableIdentifier.of(db, "people"))).isEqualTo(1);
-      assertThat(result.tableId(TableIdentifier.of(db, "humans"))).isNull();
-      assertThat(result.containsTransaction(replay.id())).isFalse();
+      assertThat(result.state().tableId(TableIdentifier.of(db, "people"))).isEqualTo(1);
+      assertThat(result.state().tableId(TableIdentifier.of(db, "humans"))).isNull();
+      assertThat(result.committed().contains(replay.id())).isFalse();
     }
 
     @Test
@@ -2311,9 +2251,9 @@ public class TestProtoActions {
       byte[] file = catalog().build();
       UUID sharedId = UuidV7.newUuidV7();
       ProtoCodec.Transaction t = txn(sharedId, createNs(1, 0, "db", 1, -1));
-      CatalogState result = apply(file, t, t);
-      assertThat(result.containsNamespace(Namespace.of("db"))).isTrue();
-      assertThat(result.namespaceVersion(result.namespaceId(Namespace.of("db"))))
+      Replica<CatalogState> result = apply(file, t, t);
+      assertThat(result.state().containsNamespace(Namespace.of("db"))).isTrue();
+      assertThat(result.state().namespaceVersion(result.state().namespaceId(Namespace.of("db"))))
           .isEqualTo(1);
     }
 
@@ -2355,10 +2295,10 @@ public class TestProtoActions {
       byte[] file = baseFile();
       ProtoCodec.Transaction t1 = txn(createNs(3, 0, "a", 1, 0));
       ProtoCodec.Transaction t2 = txn(createNs(4, 0, "b", 1, 0));
-      CatalogState r = apply(file, t1, t2);
-      assertThat(r.containsNamespace(Namespace.of("a"))).isTrue();
-      assertThat(r.containsNamespace(Namespace.of("b"))).isFalse();
-      assertThat(r.containsTransaction(t2.id())).isFalse();
+      Replica<CatalogState> r = apply(file, t1, t2);
+      assertThat(r.state().containsNamespace(Namespace.of("a"))).isTrue();
+      assertThat(r.state().containsNamespace(Namespace.of("b"))).isFalse();
+      assertThat(r.committed().contains(t2.id())).isFalse();
     }
 
     @Test
@@ -2368,10 +2308,10 @@ public class TestProtoActions {
       byte[] file = baseFile();
       ProtoCodec.Transaction t1 = txn(createNs(3, 1, "child1", 1, 1));
       ProtoCodec.Transaction t2 = txn(createNs(4, 1, "child2", 1, 1));
-      CatalogState r = apply(file, t1, t2);
-      assertThat(r.containsNamespace(Namespace.of("db", "child1"))).isTrue();
-      assertThat(r.containsNamespace(Namespace.of("db", "child2"))).isFalse();
-      assertThat(r.containsTransaction(t2.id())).isFalse();
+      Replica<CatalogState> r = apply(file, t1, t2);
+      assertThat(r.state().containsNamespace(Namespace.of("db", "child1"))).isTrue();
+      assertThat(r.state().containsNamespace(Namespace.of("db", "child2"))).isFalse();
+      assertThat(r.committed().contains(t2.id())).isFalse();
     }
 
     @Test
@@ -2379,11 +2319,11 @@ public class TestProtoActions {
       byte[] file = baseFile();
       ProtoCodec.Transaction t1 = txn(createNs(3, 1, "child", 1, 1));
       ProtoCodec.Transaction t2 = txn(setNsProp(1, 1, "env", "prod"));
-      CatalogState r = apply(file, t1, t2);
-      assertThat(r.containsNamespace(Namespace.of("db", "child"))).isTrue();
-      assertThat(r.namespaceProperties(Namespace.of("db")))
+      Replica<CatalogState> r = apply(file, t1, t2);
+      assertThat(r.state().containsNamespace(Namespace.of("db", "child"))).isTrue();
+      assertThat(r.state().namespaceProperties(Namespace.of("db")))
           .doesNotContainKey("env");
-      assertThat(r.containsTransaction(t2.id())).isFalse();
+      assertThat(r.committed().contains(t2.id())).isFalse();
     }
 
     @Test
@@ -2391,9 +2331,9 @@ public class TestProtoActions {
       byte[] file = baseFile();
       ProtoCodec.Transaction t1 = txn(createNs(3, 1, "child", 1, 1));
       ProtoCodec.Transaction t2 = txn(dropNs(1, 1));
-      CatalogState r = apply(file, t1, t2);
-      assertThat(r.containsNamespace(Namespace.of("db"))).isTrue();
-      assertThat(r.containsTransaction(t2.id())).isFalse();
+      Replica<CatalogState> r = apply(file, t1, t2);
+      assertThat(r.state().containsNamespace(Namespace.of("db"))).isTrue();
+      assertThat(r.committed().contains(t2.id())).isFalse();
     }
 
     @Test
@@ -2401,9 +2341,9 @@ public class TestProtoActions {
       byte[] file = baseFile();
       ProtoCodec.Transaction t1 = txn(createNs(3, 1, "child", 1, 1));
       ProtoCodec.Transaction t2 = txn(createTbl(3, 1, "t3", 1, 1, "s3://t3"));
-      CatalogState r = apply(file, t1, t2);
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "t3"))).isNull();
-      assertThat(r.containsTransaction(t2.id())).isFalse();
+      Replica<CatalogState> r = apply(file, t1, t2);
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("db"), "t3"))).isNull();
+      assertThat(r.committed().contains(t2.id())).isFalse();
     }
 
     // --- DropNamespace vs X ---
@@ -2413,9 +2353,9 @@ public class TestProtoActions {
       byte[] file = catalog().ns(1, 0, "db", 1).build();
       ProtoCodec.Transaction t1 = txn(dropNs(1, 1));
       ProtoCodec.Transaction t2 = txn(setNsProp(1, 1, "k", "v"));
-      CatalogState r = apply(file, t1, t2);
-      assertThat(r.containsNamespace(Namespace.of("db"))).isFalse();
-      assertThat(r.containsTransaction(t2.id())).isFalse();
+      Replica<CatalogState> r = apply(file, t1, t2);
+      assertThat(r.state().containsNamespace(Namespace.of("db"))).isFalse();
+      assertThat(r.committed().contains(t2.id())).isFalse();
     }
 
     @Test
@@ -2423,9 +2363,9 @@ public class TestProtoActions {
       byte[] file = catalog().ns(1, 0, "db", 1).build();
       ProtoCodec.Transaction t1 = txn(dropNs(1, 1));
       ProtoCodec.Transaction t2 = txn(createTbl(1, 1, "t1", 1, 1, "s3://t1"));
-      CatalogState r = apply(file, t1, t2);
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "t1"))).isNull();
-      assertThat(r.containsTransaction(t2.id())).isFalse();
+      Replica<CatalogState> r = apply(file, t1, t2);
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("db"), "t1"))).isNull();
+      assertThat(r.committed().contains(t2.id())).isFalse();
     }
 
     // --- SetNamespaceProperty vs X ---
@@ -2435,11 +2375,11 @@ public class TestProtoActions {
       byte[] file = baseFile();
       ProtoCodec.Transaction t1 = txn(setNsProp(1, 1, "owner", "bob"));
       ProtoCodec.Transaction t2 = txn(setNsProp(1, 1, "env", "prod"));
-      CatalogState r = apply(file, t1, t2);
-      assertThat(r.namespaceProperties(Namespace.of("db")))
+      Replica<CatalogState> r = apply(file, t1, t2);
+      assertThat(r.state().namespaceProperties(Namespace.of("db")))
           .containsEntry("owner", "bob")
           .doesNotContainKey("env");
-      assertThat(r.containsTransaction(t2.id())).isFalse();
+      assertThat(r.committed().contains(t2.id())).isFalse();
     }
 
     @Test
@@ -2447,11 +2387,11 @@ public class TestProtoActions {
       byte[] file = baseFile();
       ProtoCodec.Transaction t1 = txn(setNsProp(1, 1, "env", "prod"));
       ProtoCodec.Transaction t2 = txn(removeNsProp(1, 1, "owner"));
-      CatalogState r = apply(file, t1, t2);
-      assertThat(r.namespaceProperties(Namespace.of("db")))
+      Replica<CatalogState> r = apply(file, t1, t2);
+      assertThat(r.state().namespaceProperties(Namespace.of("db")))
           .containsEntry("owner", "alice")
           .containsEntry("env", "prod");
-      assertThat(r.containsTransaction(t2.id())).isFalse();
+      assertThat(r.committed().contains(t2.id())).isFalse();
     }
 
     @Test
@@ -2459,9 +2399,9 @@ public class TestProtoActions {
       byte[] file = baseFile();
       ProtoCodec.Transaction t1 = txn(setNsProp(1, 1, "env", "prod"));
       ProtoCodec.Transaction t2 = txn(createTbl(3, 1, "t3", 1, 1, "s3://t3"));
-      CatalogState r = apply(file, t1, t2);
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "t3"))).isNull();
-      assertThat(r.containsTransaction(t2.id())).isFalse();
+      Replica<CatalogState> r = apply(file, t1, t2);
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("db"), "t3"))).isNull();
+      assertThat(r.committed().contains(t2.id())).isFalse();
     }
 
     @Test
@@ -2469,15 +2409,15 @@ public class TestProtoActions {
       byte[] file = baseFile();
       ProtoCodec.Transaction t1 = txn(setNsProp(1, 1, "env", "prod"));
       ProtoCodec.Transaction t2 = txn(dropTbl(1, 1));
-      CatalogState r = apply(file, t1, t2);
+      Replica<CatalogState> r = apply(file, t1, t2);
       // Note: DropTable.verify checks TABLE version (not ns version), so the
       // drop succeeds. The ns-version bump from setNsProp doesn't directly
       // protect DropTable; that's by design — concurrent table-ops on
       // different tables in the same ns compose.
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "t1")))
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("db"), "t1")))
           .as("DropTable is independent of ns version; it succeeds")
           .isNull();
-      assertThat(r.containsTransaction(t2.id())).isTrue();
+      assertThat(r.committed().contains(t2.id())).isTrue();
     }
 
     // --- CreateTable vs CreateTable / UpdateTable / DropTable ---
@@ -2489,10 +2429,10 @@ public class TestProtoActions {
       byte[] file = baseFile();
       ProtoCodec.Transaction t1 = txn(createTbl(3, 1, "tA", 1, 1, "s3://tA"));
       ProtoCodec.Transaction t2 = txn(createTbl(4, 1, "tB", 1, 1, "s3://tB"));
-      CatalogState r = apply(file, t1, t2);
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "tA"))).isNotNull();
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "tB"))).isNull();
-      assertThat(r.containsTransaction(t2.id())).isFalse();
+      Replica<CatalogState> r = apply(file, t1, t2);
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("db"), "tA"))).isNotNull();
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("db"), "tB"))).isNull();
+      assertThat(r.committed().contains(t2.id())).isFalse();
     }
 
     @Test
@@ -2501,9 +2441,9 @@ public class TestProtoActions {
       byte[] file = baseFile();
       ProtoCodec.Transaction t1 = txn(createTbl(3, 1, "tA", 1, 1, "s3://tA"));
       ProtoCodec.Transaction t2 = txn(createTbl(4, 2, "tB", 1, 1, "s3://tB"));
-      CatalogState r = apply(file, t1, t2);
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "tA"))).isNotNull();
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("other"), "tB"))).isNotNull();
+      Replica<CatalogState> r = apply(file, t1, t2);
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("db"), "tA"))).isNotNull();
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("other"), "tB"))).isNotNull();
     }
 
     @Test
@@ -2511,10 +2451,10 @@ public class TestProtoActions {
       byte[] file = baseFile();
       ProtoCodec.Transaction t1 = txn(updateTbl(1, 1, "s3://t1/v2"));
       ProtoCodec.Transaction t2 = txn(updateTbl(1, 1, "s3://t1/v3"));
-      CatalogState r = apply(file, t1, t2);
-      assertThat(r.location(TableIdentifier.of(Namespace.of("db"), "t1")))
+      Replica<CatalogState> r = apply(file, t1, t2);
+      assertThat(r.state().location(TableIdentifier.of(Namespace.of("db"), "t1")))
           .isEqualTo("s3://t1/v2");
-      assertThat(r.containsTransaction(t2.id())).isFalse();
+      assertThat(r.committed().contains(t2.id())).isFalse();
     }
 
     @Test
@@ -2522,9 +2462,9 @@ public class TestProtoActions {
       byte[] file = baseFile();
       ProtoCodec.Transaction t1 = txn(updateTbl(1, 1, "s3://t1/v2"));
       ProtoCodec.Transaction t2 = txn(dropTbl(1, 1));
-      CatalogState r = apply(file, t1, t2);
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "t1"))).isNotNull();
-      assertThat(r.containsTransaction(t2.id())).isFalse();
+      Replica<CatalogState> r = apply(file, t1, t2);
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("db"), "t1"))).isNotNull();
+      assertThat(r.committed().contains(t2.id())).isFalse();
     }
 
     @Test
@@ -2533,10 +2473,10 @@ public class TestProtoActions {
       byte[] file = baseFile();
       ProtoCodec.Transaction t1 = txn(updateTbl(1, 1, "s3://t1/v2"));
       ProtoCodec.Transaction t2 = txn(updateTbl(2, 1, "s3://t2/v2"));
-      CatalogState r = apply(file, t1, t2);
-      assertThat(r.location(TableIdentifier.of(Namespace.of("db"), "t1")))
+      Replica<CatalogState> r = apply(file, t1, t2);
+      assertThat(r.state().location(TableIdentifier.of(Namespace.of("db"), "t1")))
           .isEqualTo("s3://t1/v2");
-      assertThat(r.location(TableIdentifier.of(Namespace.of("db"), "t2")))
+      assertThat(r.state().location(TableIdentifier.of(Namespace.of("db"), "t2")))
           .isEqualTo("s3://t2/v2");
     }
 
@@ -2546,8 +2486,8 @@ public class TestProtoActions {
       byte[] file = baseFile();
       ProtoCodec.Transaction t1 = txn(updateTbl(1, 1, "s3://t1/v2"));
       ProtoCodec.Transaction t2 = txn(readTbl(1, 1));
-      CatalogState r = apply(file, t1, t2);
-      assertThat(r.containsTransaction(t2.id())).isFalse();
+      Replica<CatalogState> r = apply(file, t1, t2);
+      assertThat(r.committed().contains(t2.id())).isFalse();
     }
 
     @Test
@@ -2556,8 +2496,8 @@ public class TestProtoActions {
       byte[] file = baseFile();
       ProtoCodec.Transaction t1 = txn(updateTbl(2, 1, "s3://t2/v2"));
       ProtoCodec.Transaction t2 = txn(readTbl(1, 1));
-      CatalogState r = apply(file, t1, t2);
-      assertThat(r.containsTransaction(t2.id())).isTrue();
+      Replica<CatalogState> r = apply(file, t1, t2);
+      assertThat(r.committed().contains(t2.id())).isTrue();
     }
 
     // --- RenameTable vs X ---
@@ -2568,10 +2508,10 @@ public class TestProtoActions {
       byte[] file = baseFile();
       ProtoCodec.Transaction t1 = txn(renameTbl(1, 1, 1, 1, "renamed_a"));
       ProtoCodec.Transaction t2 = txn(renameTbl(1, 1, 1, 1, "renamed_b"));
-      CatalogState r = apply(file, t1, t2);
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "renamed_a"))).isEqualTo(1);
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "renamed_b"))).isNull();
-      assertThat(r.containsTransaction(t2.id())).isFalse();
+      Replica<CatalogState> r = apply(file, t1, t2);
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("db"), "renamed_a"))).isEqualTo(1);
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("db"), "renamed_b"))).isNull();
+      assertThat(r.committed().contains(t2.id())).isFalse();
     }
 
     @Test
@@ -2579,10 +2519,10 @@ public class TestProtoActions {
       byte[] file = baseFile();
       ProtoCodec.Transaction t1 = txn(dropTbl(1, 1));
       ProtoCodec.Transaction t2 = txn(renameTbl(1, 1, 1, 1, "renamed"));
-      CatalogState r = apply(file, t1, t2);
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "t1"))).isNull();
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "renamed"))).isNull();
-      assertThat(r.containsTransaction(t2.id())).isFalse();
+      Replica<CatalogState> r = apply(file, t1, t2);
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("db"), "t1"))).isNull();
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("db"), "renamed"))).isNull();
+      assertThat(r.committed().contains(t2.id())).isFalse();
     }
 
     @Test
@@ -2590,10 +2530,10 @@ public class TestProtoActions {
       byte[] file = baseFile();
       ProtoCodec.Transaction t1 = txn(updateTbl(1, 1, "s3://t1/v2"));
       ProtoCodec.Transaction t2 = txn(renameTbl(1, 1, 1, 1, "renamed"));
-      CatalogState r = apply(file, t1, t2);
-      assertThat(r.location(TableIdentifier.of(Namespace.of("db"), "t1"))).isEqualTo("s3://t1/v2");
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "renamed"))).isNull();
-      assertThat(r.containsTransaction(t2.id())).isFalse();
+      Replica<CatalogState> r = apply(file, t1, t2);
+      assertThat(r.state().location(TableIdentifier.of(Namespace.of("db"), "t1"))).isEqualTo("s3://t1/v2");
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("db"), "renamed"))).isNull();
+      assertThat(r.committed().contains(t2.id())).isFalse();
     }
 
     @Test
@@ -2601,9 +2541,9 @@ public class TestProtoActions {
       byte[] file = baseFile();
       ProtoCodec.Transaction t1 = txn(renameTbl(1, 1, 1, 1, "renamed"));
       ProtoCodec.Transaction t2 = txn(readTbl(1, 1));
-      CatalogState r = apply(file, t1, t2);
-      assertThat(r.containsTransaction(t1.id())).isTrue();
-      assertThat(r.containsTransaction(t2.id())).isFalse();
+      Replica<CatalogState> r = apply(file, t1, t2);
+      assertThat(r.committed().contains(t1.id())).isTrue();
+      assertThat(r.committed().contains(t2.id())).isFalse();
     }
 
     @Test
@@ -2611,9 +2551,9 @@ public class TestProtoActions {
       byte[] file = baseFile();
       ProtoCodec.Transaction t1 = txn(renameTbl(1, 1, 1, 1, "renamed1"));
       ProtoCodec.Transaction t2 = txn(renameTbl(2, 1, 1, 2, "renamed2"));
-      CatalogState r = apply(file, t1, t2);
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "renamed1"))).isEqualTo(1);
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "renamed2"))).isEqualTo(2);
+      Replica<CatalogState> r = apply(file, t1, t2);
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("db"), "renamed1"))).isEqualTo(1);
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("db"), "renamed2"))).isEqualTo(2);
     }
 
     @Test
@@ -2625,10 +2565,10 @@ public class TestProtoActions {
       // captured newNamespaceVersion=1, so verify fails.
       ProtoCodec.Transaction t1 = txn(createTbl(3, 1, "newcomer", 1, 1, "s3://newcomer/v1"));
       ProtoCodec.Transaction t2 = txn(renameTbl(1, 1, 1, 1, "renamed"));
-      CatalogState r = apply(file, t1, t2);
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "newcomer"))).isEqualTo(3);
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("db"), "renamed"))).isNull();
-      assertThat(r.containsTransaction(t2.id())).isFalse();
+      Replica<CatalogState> r = apply(file, t1, t2);
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("db"), "newcomer"))).isEqualTo(3);
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("db"), "renamed"))).isNull();
+      assertThat(r.committed().contains(t2.id())).isFalse();
     }
 
     @Test
@@ -2640,11 +2580,11 @@ public class TestProtoActions {
       ProtoCodec.Transaction t1 = txn(renameTbl(1, 1, 2, 1, "t1"));
       ProtoCodec.Transaction t2 = txn(setNsProp(1, 1, "owner", "carol"));  // src ns
       ProtoCodec.Transaction t3 = txn(setNsProp(2, 1, "team", "data"));    // dest ns
-      CatalogState r = apply(file, t1, t2, t3);
-      assertThat(r.tableId(TableIdentifier.of(Namespace.of("other"), "t1"))).isEqualTo(1);
-      assertThat(r.containsTransaction(t1.id())).isTrue();
-      assertThat(r.containsTransaction(t2.id())).isFalse();
-      assertThat(r.containsTransaction(t3.id())).isFalse();
+      Replica<CatalogState> r = apply(file, t1, t2, t3);
+      assertThat(r.state().tableId(TableIdentifier.of(Namespace.of("other"), "t1"))).isEqualTo(1);
+      assertThat(r.committed().contains(t1.id())).isTrue();
+      assertThat(r.committed().contains(t2.id())).isFalse();
+      assertThat(r.committed().contains(t3.id())).isFalse();
     }
   }
 
@@ -2656,13 +2596,13 @@ public class TestProtoActions {
   class RandomizedTests {
 
     /**
-     * Generates a random CatalogState with reproducible state from a seed.
-     * Mirrors generateRandomLogCatalogFile from TestLogCatalogFormat.
+     * Generates a random catalog (a state, with its log's id and committed set) with reproducible
+     * state from a seed. Mirrors generateRandomLogCatalogFile from TestLogCatalogFormat.
      */
-    CatalogState generateRandom(long seed) {
+    Replica<CatalogState> generateRandom(long seed) {
       Random rand = new Random(seed);
-      CatalogState.Builder builder = CatalogState.builder(LOCATION);
-      builder.setCatalogUuid(UuidV7.newUuidV7(rand.nextLong() & 0xFFFFFFFFFFFFL, rand));
+      CatalogState.Builder builder = CatalogState.builder();
+      UUID logId = UuidV7.newUuidV7(rand.nextLong() & 0xFFFFFFFFFFFFL, rand);
 
       int nextNsid = rand.nextInt(20) + 10;
       int nextTblid = rand.nextInt(100) + 10;
@@ -2708,25 +2648,27 @@ public class TestProtoActions {
       Set<UUID> txns = IntStream.range(0, rand.nextInt(20) + 5)
           .mapToObj(i -> UuidV7.newUuidV7(rand.nextLong() & 0xFFFFFFFFFFFFL, rand))
           .collect(Collectors.toSet());
+      CommittedSet.Builder committed = CommittedSet.builder();
       for (UUID txnId : txns) {
-        builder.addCommittedTransaction(txnId);
+        committed.add(txnId);
       }
 
-      return builder.build();
+      return new Replica<>(builder.build(), committed.build(), null, 0, logId);
     }
 
     /**
-     * Asserts that two CatalogState instances have identical observable state.
-     * Does not compare nextNamespaceId / nextTableId because readInternal does not
-     * update those counters during transaction replay -- they are corrected on
-     * re-checkpoint but may differ between a replay-built catalog and a fresh one.
+     * Asserts that two catalogs have identical observable state, log id and committed set.
+     * Does not compare nextNamespaceId / nextTableId, which may differ between a replay-built
+     * catalog and a fresh one.
      */
-    void assertCatalogEquals(CatalogState expected, CatalogState actual) {
-      assertThat(actual.uuid()).isEqualTo(expected.uuid());
+    void assertCatalogEquals(Replica<CatalogState> expectedRead, Replica<CatalogState> actualRead) {
+      assertThat(actualRead.logId()).isEqualTo(expectedRead.logId());
+      assertThat(actualRead.committed().ids())
+          .containsExactlyInAnyOrderElementsOf(expectedRead.committed().ids());
+      CatalogState expected = expectedRead.state();
+      CatalogState actual = actualRead.state();
       assertThat(actual.namespaces()).containsExactlyInAnyOrderElementsOf(expected.namespaces());
       assertThat(actual.tables()).containsExactlyInAnyOrderElementsOf(expected.tables());
-      assertThat(actual.committedTransactions())
-          .containsExactlyInAnyOrderElementsOf(expected.committedTransactions());
 
       for (Namespace ns : expected.namespaces()) {
         assertThat(actual.namespaceProperties(ns))
@@ -2772,19 +2714,19 @@ public class TestProtoActions {
     @RepeatedTest(5)
     void checkpointRoundtripFromRandomState() throws IOException {
       long seed = System.nanoTime();
-      CatalogState original = generateRandom(seed);
-      CatalogState sameSeed = generateRandom(seed);
+      Replica<CatalogState> original = generateRandom(seed);
+      Replica<CatalogState> sameSeed = generateRandom(seed);
       assertCatalogEquals(original, sameSeed);
 
       byte[] fileBytes = toFileBytes(original);
-      assertThat(fileBytes.length).isGreaterThan(ProtoCatalogFormat.HEADER_SIZE);
+      assertThat(fileBytes.length).isGreaterThan(AtomicFileLog.HEADER_SIZE);
 
-      CatalogState roundtripped = ProtoCatalogFormat.readInternal(
-          LOCATION, new ByteArrayInputStream(fileBytes), fileBytes.length);
+      Replica<CatalogState> roundtripped = CatalogTestSupport.replay(fileBytes);
       assertCatalogEquals(original, roundtripped);
       // Pure checkpoint roundtrip (no transactions) should also preserve counters
-      assertThat(roundtripped.nextNamespaceId()).isEqualTo(original.nextNamespaceId());
-      assertThat(roundtripped.nextTableId()).isEqualTo(original.nextTableId());
+      assertThat(roundtripped.state().nextNamespaceId())
+          .isEqualTo(original.state().nextNamespaceId());
+      assertThat(roundtripped.state().nextTableId()).isEqualTo(original.state().nextTableId());
     }
 
     /**
@@ -2795,7 +2737,7 @@ public class TestProtoActions {
     @RepeatedTest(5)
     void applyMutTransactionOnRandomState() throws IOException {
       long seed = System.nanoTime();
-      CatalogState orig = generateRandom(seed);
+      Replica<CatalogState> orig = generateRandom(seed);
       byte[] origBytes = toFileBytes(orig);
 
       Namespace dingos = Namespace.of("dingos");
@@ -2804,52 +2746,51 @@ public class TestProtoActions {
       TableIdentifier tblD = TableIdentifier.of(dingos, "tblD");
 
       // txnA: create dingos -> dingos.yaks -> tblY
-      ProtoCatalogFormat.Mut mutA = new ProtoCatalogFormat.Mut(orig);
+      CatalogMutation mutA = new CatalogMutation(orig);
       mutA.createNamespace(dingos);
       mutA.createNamespace(dingos_yaks);
       mutA.createTable(tblY, "yak://chinchilla/tblY");
-      ProtoCodec.Transaction txnA = mutA.buildTransaction();
+      ProtoCodec.Transaction txnA = ProtoCodec.Transaction.from(mutA);
 
       // Append and read
-      CatalogState afterA = apply(origBytes, txnA);
-      assertThat(afterA.containsNamespace(dingos)).isTrue();
-      assertThat(afterA.containsNamespace(dingos_yaks)).isTrue();
-      assertThat(afterA.location(tblY)).isEqualTo("yak://chinchilla/tblY");
-      assertThat(afterA.containsTransaction(txnA.id())).isTrue();
+      Replica<CatalogState> afterA = apply(origBytes, txnA);
+      assertThat(afterA.state().containsNamespace(dingos)).isTrue();
+      assertThat(afterA.state().containsNamespace(dingos_yaks)).isTrue();
+      assertThat(afterA.state().location(tblY)).isEqualTo("yak://chinchilla/tblY");
+      assertThat(afterA.committed().contains(txnA.id())).isTrue();
 
       // Second round: re-checkpoint and re-read (as a concurrent writer would)
       byte[] afterABytes = toFileBytes(afterA);
-      CatalogState afterAFresh = ProtoCatalogFormat.readInternal(
-          LOCATION, new ByteArrayInputStream(afterABytes), afterABytes.length);
+      Replica<CatalogState> afterAFresh = CatalogTestSupport.replay(afterABytes);
 
       // txnB: update tblY
-      ProtoCatalogFormat.Mut mutB = new ProtoCatalogFormat.Mut(afterAFresh);
+      CatalogMutation mutB = new CatalogMutation(afterAFresh);
       mutB.updateTable(tblY, "yak://chinchilla/tblY2");
-      ProtoCodec.Transaction txnB = mutB.buildTransaction();
+      ProtoCodec.Transaction txnB = ProtoCodec.Transaction.from(mutB);
 
       // txnC: create tblD (independent, built from same snapshot)
-      ProtoCatalogFormat.Mut mutC = new ProtoCatalogFormat.Mut(afterAFresh);
+      CatalogMutation mutC = new CatalogMutation(afterAFresh);
       mutC.createTable(tblD, "yak://chinchilla/tblD");
-      ProtoCodec.Transaction txnC = mutC.buildTransaction();
+      ProtoCodec.Transaction txnC = ProtoCodec.Transaction.from(mutC);
 
       // txnD: also tries to update tblY from same snapshot -> should fail
       // because txnB already updated it
-      ProtoCatalogFormat.Mut mutD = new ProtoCatalogFormat.Mut(afterAFresh);
+      CatalogMutation mutD = new CatalogMutation(afterAFresh);
       mutD.updateTable(tblY, "yak://chinchilla/tblY3");
-      ProtoCodec.Transaction txnD = mutD.buildTransaction();
+      ProtoCodec.Transaction txnD = ProtoCodec.Transaction.from(mutD);
 
-      CatalogState afterAll = apply(afterABytes, txnB, txnC, txnD);
+      Replica<CatalogState> afterAll = apply(afterABytes, txnB, txnC, txnD);
 
       // txnB succeeded: tblY updated
-      assertThat(afterAll.location(tblY)).isEqualTo("yak://chinchilla/tblY2");
-      assertThat(afterAll.containsTransaction(txnB.id())).isTrue();
+      assertThat(afterAll.state().location(tblY)).isEqualTo("yak://chinchilla/tblY2");
+      assertThat(afterAll.committed().contains(txnB.id())).isTrue();
 
       // txnC succeeded: tblD created
-      assertThat(afterAll.location(tblD)).isEqualTo("yak://chinchilla/tblD");
-      assertThat(afterAll.containsTransaction(txnC.id())).isTrue();
+      assertThat(afterAll.state().location(tblD)).isEqualTo("yak://chinchilla/tblD");
+      assertThat(afterAll.committed().contains(txnC.id())).isTrue();
 
       // txnD failed: stale table version
-      assertThat(afterAll.containsTransaction(txnD.id())).isFalse();
+      assertThat(afterAll.committed().contains(txnD.id())).isFalse();
     }
 
     /**
@@ -2858,61 +2799,28 @@ public class TestProtoActions {
      */
     @RepeatedTest(5)
     void mutTransactionSurvivesReCheckpoint() throws IOException {
-      CatalogState orig = generateRandom(System.nanoTime());
+      Replica<CatalogState> orig = generateRandom(System.nanoTime());
       byte[] origBytes = toFileBytes(orig);
 
       Namespace ns = Namespace.of("roundtrip_ns");
       TableIdentifier tbl = TableIdentifier.of(ns, "roundtrip_tbl");
 
       // Build and apply a transaction via Mut
-      ProtoCatalogFormat.Mut mut = new ProtoCatalogFormat.Mut(orig);
+      CatalogMutation mut = new CatalogMutation(orig);
       mut.createNamespace(ns);
       mut.createTable(tbl, "s3://roundtrip/v1");
-      ProtoCodec.Transaction txn = mut.buildTransaction();
+      ProtoCodec.Transaction txn = ProtoCodec.Transaction.from(mut);
 
-      CatalogState afterTxn = apply(origBytes, txn);
+      Replica<CatalogState> afterTxn = apply(origBytes, txn);
 
       // Re-checkpoint (as would happen on compaction)
       byte[] reCheckpointed = toFileBytes(afterTxn);
-      CatalogState reRead = ProtoCatalogFormat.readInternal(
-          LOCATION, new ByteArrayInputStream(reCheckpointed), reCheckpointed.length);
+      Replica<CatalogState> reRead = CatalogTestSupport.replay(reCheckpointed);
 
       // Verify all original state + new additions survived
       assertCatalogEquals(afterTxn, reRead);
-      assertThat(reRead.containsNamespace(ns)).isTrue();
-      assertThat(reRead.location(tbl)).isEqualTo("s3://roundtrip/v1");
-    }
-  }
-
-  // ============================================================
-  // TestInputFile (same as in TestProtoCatalogFormat)
-  // ============================================================
-
-  private static class TestInputFile implements InputFile {
-    private final String location;
-
-    TestInputFile(String location) {
-      this.location = location;
-    }
-
-    @Override
-    public long getLength() {
-      return 0;
-    }
-
-    @Override
-    public SeekableInputStream newStream() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public String location() {
-      return location;
-    }
-
-    @Override
-    public boolean exists() {
-      return false;
+      assertThat(reRead.state().containsNamespace(ns)).isTrue();
+      assertThat(reRead.state().location(tbl)).isEqualTo("s3://roundtrip/v1");
     }
   }
 }

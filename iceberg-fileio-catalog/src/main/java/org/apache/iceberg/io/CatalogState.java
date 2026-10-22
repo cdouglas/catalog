@@ -26,27 +26,22 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.UUID;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
-import org.intentlog.DedupHorizonExceededException;
-import org.intentlog.CommittedSet;
-import org.intentlog.Replica;
 import org.intentlog.StateMachine;
-import org.intentlog.fileio.AtomicFileLog;
-import org.intentlog.wire.UuidV7;
 
 /**
- * Immutable snapshot of catalog state in protobuf format.
- *
- * <p>This class holds the catalog contents read from a protobuf-encoded file:
- * namespaces, tables, namespace properties, and transaction tracking state.
+ * The catalog's state, as replay of its log reaches it ({@link CatalogStateMachine}): namespaces
+ * and their properties, and tables, each with a pointer to its metadata file or its metadata (and
+ * manifest lists) inline. Every namespace and table has an id and a version, which each change to
+ * it bumps; a transaction's intention names the versions it read. Immutable; the log's id and
+ * committed set are the {@link org.intentlog.Replica}'s, not the state's.
  */
-public class CatalogState extends CatalogFile {
+public class CatalogState {
 
   /** Id of the root namespace's row. Every catalog has one; it is never dropped. */
   static final int ROOT_ID = 0;
@@ -82,20 +77,7 @@ public class CatalogState extends CatalogFile {
   // tblId -> (snapshotId -> list of manifest paths in the pool)
   private final Map<Integer, Map<Long, List<String>>> snapshotManifests;
 
-  // Committed transactions for deduplication: the CommittedTransactions wire bytes, which
-  // queries scan in place.
-  private final CommittedSet committed;
-
-  // Number of transaction records in the log portion of the catalog file.
-  // Computed during readInternal; used by commit() to enforce max-append-count.
-  private final int appendCount;
-
-  // The read of the catalog's intention log this state came from, if any: what the next commit
-  // writes on top of (LogRuntime). Null for a state built otherwise (empty, tests).
-  private final Replica<CatalogState> replica;
-
   private CatalogState(Builder builder) {
-    super(builder.catalogUuid, builder.location);
     this.nextNamespaceId = builder.nextNamespaceId;
     this.nextTableId = builder.nextTableId;
     this.namespaceById = ImmutableMap.copyOf(builder.namespaceById);
@@ -108,47 +90,6 @@ public class CatalogState extends CatalogFile {
     this.tblManifestPrefix = ImmutableMap.copyOf(builder.tblManifestPrefix);
     this.manifestPool = deepCopyManifestPool(builder.manifestPool);
     this.snapshotManifests = deepCopySnapshotManifests(builder.snapshotManifests);
-    this.committed = builder.committed.build();
-    this.appendCount = builder.appendCount;
-    this.replica = null;
-  }
-
-  /** {@code state} as the read {@code replica} found it: its location, id, committed set. */
-  private CatalogState(CatalogState state, Replica<CatalogState> replica) {
-    super(replica.logId(), AtomicFileLog.fileOf(replica.tail()));
-    this.nextNamespaceId = state.nextNamespaceId;
-    this.nextTableId = state.nextTableId;
-    this.namespaceById = state.namespaceById;
-    this.namespaceLookup = state.namespaceLookup;
-    this.tableById = state.tableById;
-    this.tableLookup = state.tableLookup;
-    this.nsProperties = state.nsProperties;
-    this.tblInlineMetadata = state.tblInlineMetadata;
-    this.tblInlineMetadataCodec = state.tblInlineMetadataCodec;
-    this.tblManifestPrefix = state.tblManifestPrefix;
-    this.manifestPool = state.manifestPool;
-    this.snapshotManifests = state.snapshotManifests;
-    this.committed = replica.committed();
-    this.appendCount = (int) replica.intentionRecords();
-    this.replica = replica;
-  }
-
-  /**
-   * The catalog a read of its intention log found: the replica's state, at the version of the
-   * catalog file the read ended at, with the log's id and committed set.
-   */
-  static CatalogState of(Replica<CatalogState> replica) {
-    return new CatalogState(replica.state(), replica);
-  }
-
-  /**
-   * The replica the next commit writes on top of: the read this state came from, or, for a state
-   * built otherwise (an empty catalog not yet created), this state at its location.
-   */
-  Replica<CatalogState> replica() {
-    return replica != null
-        ? replica
-        : new Replica<>(this, committed, AtomicFileLog.tailOf(location()), appendCount, uuid());
   }
 
   private static Map<Integer, Map<String, String>> deepCopyProperties(
@@ -182,24 +123,20 @@ public class CatalogState extends CatalogFile {
     return outer.build();
   }
 
-  public static CatalogState empty(InputFile location) {
-    return builder(location).build();
+  /** The state of a catalog with no namespaces or tables: a log before its first record. */
+  public static CatalogState empty() {
+    return builder().build();
   }
 
-  public static Builder builder(InputFile location) {
-    return new Builder(location);
+  public static Builder builder() {
+    return new Builder();
   }
 
   // ============================================================
-  // CatalogFile implementation
+  // Namespaces and tables by name
   // ============================================================
 
-  @Override
-  public boolean createsHierarchicalNamespaces() {
-    return true;
-  }
-
-  @Override
+  /** The location of {@code table}'s metadata file; null if it is inline or does not exist. */
   public String location(TableIdentifier table) {
     Integer id = tableLookup.get(table);
     if (id == null) {
@@ -209,17 +146,14 @@ public class CatalogState extends CatalogFile {
     return entry != null ? entry.metadataLocation : null;
   }
 
-  @Override
   public Set<Namespace> namespaces() {
     return namespaceLookup.keySet();
   }
 
-  @Override
   public boolean containsNamespace(Namespace ns) {
     return namespaceLookup.containsKey(ns);
   }
 
-  @Override
   public Map<String, String> namespaceProperties(Namespace ns) {
     Integer id = namespaceLookup.get(ns);
     if (id == null) {
@@ -229,63 +163,29 @@ public class CatalogState extends CatalogFile {
     return props != null ? props : ImmutableMap.of();
   }
 
-  @Override
   public List<TableIdentifier> tables() {
     return new ArrayList<>(tableLookup.keySet());
   }
 
-  @Override
+  /** Whether the table exists, inline or with a metadata file. */
   public boolean containsTable(TableIdentifier table) {
     return tableLookup.containsKey(table);
   }
 
-  @Override
+  /** Whether the table's metadata is inline, in the catalog. */
   public boolean isInlineTable(TableIdentifier table) {
     Integer id = tableLookup.get(table);
     return id != null && tblInlineMetadata.containsKey(id);
   }
 
-  @Override
+  /** The table's inline metadata (encoded by its codec), or null if it is not inline. */
   public byte[] inlineMetadata(TableIdentifier table) {
     Integer id = tableLookup.get(table);
     return id != null ? tblInlineMetadata.get(id) : null;
   }
 
-  @Override
-  Map<Namespace, Map<String, String>> namespaceProperties() {
-    ImmutableMap.Builder<Namespace, Map<String, String>> builder = ImmutableMap.builder();
-    for (Map.Entry<Integer, Map<String, String>> entry : nsProperties.entrySet()) {
-      Namespace ns = namespaceForId(entry.getKey());
-      if (ns != null) {
-        builder.put(ns, entry.getValue());
-      }
-    }
-    return builder.build();
-  }
-
-  @Override
-  Map<TableIdentifier, String> locations() {
-    ImmutableMap.Builder<TableIdentifier, String> builder = ImmutableMap.builder();
-    for (Map.Entry<TableIdentifier, Integer> entry : tableLookup.entrySet()) {
-      TblEntry tbl = tableById.get(entry.getValue());
-      if (tbl != null) {
-        builder.put(entry.getKey(), tbl.metadataLocation);
-      }
-    }
-    return builder.build();
-  }
-
-  private Namespace namespaceForId(int id) {
-    for (Map.Entry<Namespace, Integer> entry : namespaceLookup.entrySet()) {
-      if (entry.getValue() == id) {
-        return entry.getKey();
-      }
-    }
-    return null;
-  }
-
   // ============================================================
-  // Proto-specific accessors
+  // Ids, versions and inline storage
   // ============================================================
 
   public int nextNamespaceId() {
@@ -295,62 +195,6 @@ public class CatalogState extends CatalogFile {
   public int nextTableId() {
     return nextTableId;
   }
-
-  /**
-   * Returns whether {@code txnId} is in the committed-transaction dedup set.
-   *
-   * <p>Tri-state semantic, with the third state surfaced as an exception:
-   * <ul>
-   *   <li>{@code true} — UUID found in the set; definitively committed.</li>
-   *   <li>{@code false} — UUID not found AND its v7 timestamp is greater than
-   *       {@link #highestDroppedTimestampMs()}. Definitively not committed
-   *       (presumed abort): no record exists, and we know we would still have
-   *       it if it had committed (newer than the GC horizon).</li>
-   *   <li><em>throws {@link DedupHorizonExceededException}</em> — UUID not
-   *       found AND its v7 timestamp is at or below the GC horizon. The
-   *       catalog can no longer distinguish "committed and aged out" from
-   *       "never committed." Callers should fall back to the snapshot-oracle
-   *       pattern (see {@code docs/GC.md} §"Two oracles") or treat as a
-   *       hard error.</li>
-   * </ul>
-   *
-   * <p>For non-v7 UUIDs (the dedup set only stores v7), returns {@code false}
-   * without consulting the horizon.
-   */
-  public boolean containsTransaction(UUID txnId) {
-    return committed.contains(txnId);
-  }
-
-  /**
-   * The {@code highest_dropped_timestamp_ms} from the committed-transaction
-   * set: the largest v7 timestamp ever GC'd from this catalog. Queries for
-   * UUIDs at or below this watermark are UNKNOWN. Returns 0 when no GC pass
-   * has fired yet.
-   */
-  public long highestDroppedTimestampMs() {
-    return committed.horizon();
-  }
-
-  /** The committed-transaction set. */
-  public CommittedSet committed() {
-    return committed;
-  }
-
-  /** Raw inner-message bytes of the committed-txn set. Empty array iff the set is empty. */
-  public byte[] committedTransactionsBytes() {
-    return committed.bytes();
-  }
-
-  /**
-   * Materializes the committed-txn set on demand. Allocates a fresh
-   * {@code Set<UUID>} each call by decoding the compressed bytes; intended
-   * for tests and tooling, not query-hot paths. Use {@link #containsTransaction}
-   * for membership checks.
-   */
-  public Set<UUID> committedTransactions() {
-    return committed.ids();
-  }
-
 
   public Integer namespaceId(Namespace ns) {
     return namespaceLookup.get(ns);
@@ -415,11 +259,6 @@ public class CatalogState extends CatalogFile {
   /** Returns true if the table is stored inline (metadata in catalog, not external file). */
   public boolean isInlineTable(int tblId) {
     return tblInlineMetadata.containsKey(tblId);
-  }
-
-  /** Returns the number of transaction records in the log portion of the catalog file. */
-  public int appendCount() {
-    return appendCount;
   }
 
   Map<Integer, byte[]> allInlineMetadata() {
@@ -521,8 +360,6 @@ public class CatalogState extends CatalogFile {
   // ============================================================
 
   public static class Builder implements StateMachine.Builder<CatalogState> {
-    private final InputFile location;
-    private UUID catalogUuid;
     private int nextNamespaceId = 1;
     private int nextTableId = 1;
 
@@ -536,24 +373,13 @@ public class CatalogState extends CatalogFile {
     private final Map<Integer, String> tblManifestPrefix = new HashMap<>();
     private final Map<Integer, Map<String, ManifestFile>> manifestPool = new HashMap<>();
     private final Map<Integer, Map<Long, List<String>>> snapshotManifests = new HashMap<>();
-    // Committed-txn dedup state: the set inherited from a decoded checkpoint (empty if built
-    // from scratch) and the ids replay adds to it, merged by build().
-    private CommittedSet.Builder committed = CommittedSet.builder();
-    private int appendCount = 0;
 
-    Builder(InputFile location) {
-      this.location = location;
-      this.catalogUuid = UuidV7.newUuidV7();
+    Builder() {
       // The root namespace is an ordinary row with id 0, so it is versioned
       // like any other parent: creating or dropping a top-level namespace bumps
       // it. It cannot be created or dropped, and it is not addressable by name
       // (see rebuildLookups). A decoded checkpoint replaces this default row.
       namespaceById.put(ROOT_ID, new NsEntry(ROOT_ID, "", 0));
-    }
-
-    public Builder setCatalogUuid(UUID uuid) {
-      this.catalogUuid = uuid;
-      return this;
     }
 
     public Builder setNextNamespaceId(int id) {
@@ -747,7 +573,7 @@ public class CatalogState extends CatalogFile {
       // Same monotonicity argument as addTable: keep nextTableId ahead of any id
       // that arrived via transaction replay. Without this, a fresh checkpoint
       // (post-CAS) carries nextTableId from before the inline table was created;
-      // the next Mut allocates the same id again and the second
+      // the next replay allocates the same id again and the second
       // createTableInline overwrites the first in tableById / tblInlineMetadata.
       // testListTables, testRenameTableDestinationTableAlreadyExists, and the
       // append+TM transaction tests' NoSuchTable errors all trace back to this.
@@ -887,70 +713,6 @@ public class CatalogState extends CatalogFile {
       if (props != null) {
         props.remove(key);
       }
-      return this;
-    }
-
-    public Builder addCommittedTransaction(UUID txnId) {
-      committed.add(txnId);
-      return this;
-    }
-
-    /**
-     * Bulk-load entrypoint: install the inner CommittedTransactions message
-     * body inherited from a decoded checkpoint, without materializing the
-     * canonical Set. Subsequent {@link #addCommittedTransaction} calls layer
-     * additions on top, and build() merges them.
-     */
-    public Builder setCommittedTransactionsBytes(byte[] bytes) {
-      committed.inherit(bytes);
-      return this;
-    }
-
-    /** Takes {@code set} as this builder's committed set: the one a replay built (Replay). */
-    public Builder useCommitted(CommittedSet.Builder set) {
-      this.committed = set;
-      return this;
-    }
-
-    /**
-     * Replays a GC record ({@code AdvanceHorizon}): drops the committed ids at or below {@code
-     * watermarkMs}, and raises the horizon to the newest one dropped.
-     */
-    public Builder advanceHorizon(long watermarkMs) {
-      committed.advanceHorizon(watermarkMs);
-      return this;
-    }
-
-    /**
-     * Tri-state membership check, mirroring
-     * {@link CatalogState#containsTransaction}: returns {@code true} if
-     * found among in-flight additions or in the inherited bytes; returns
-     * {@code false} for a v7 UUID whose timestamp is above the GC horizon;
-     * throws {@link DedupHorizonExceededException} when the UUID is missing
-     * and at or below the horizon.
-     *
-     * <p>A writer asks this of its own transaction. Replay asks {@link #mayApply} instead: a
-     * record at or below the horizon is reachable (a writer whose clock is behind by more than
-     * the retention, one that stalled that long, or any race with a retention of 0), and replay
-     * must reject it rather than fail the read.
-     */
-    public boolean containsTransaction(UUID txnId) {
-      return committed.contains(txnId);
-    }
-
-    /**
-     * Whether replay may apply the record of {@code txnId}: the committed set neither holds the
-     * id (the record is a retry of one already applied) nor dropped ids at or after its time. A
-     * record at or below the horizon may be a retry of a commit whose id aged out, so replay
-     * rejects it; asking {@link #containsTransaction} instead threw on every read of the catalog
-     * (Bug 64).
-     */
-    public boolean mayApply(UUID txnId) {
-      return committed.mayApply(txnId);
-    }
-
-    public Builder setAppendCount(int count) {
-      this.appendCount = count;
       return this;
     }
 

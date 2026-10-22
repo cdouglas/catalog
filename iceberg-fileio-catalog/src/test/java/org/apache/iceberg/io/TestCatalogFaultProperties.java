@@ -152,7 +152,7 @@ class TestCatalogFaultProperties {
   // read them; keep two previous metadata files, so pointer-mode commits delete older ones.
   private static final Map<String, String> PROPERTIES =
       Map.of(
-          ProtoCatalogFormat.THROTTLE_MIN_WAIT_MS, "0",
+          LogCatalogProperties.THROTTLE_MIN_WAIT_MS, "0",
           CatalogProperties.TABLE_DEFAULT_PREFIX + TableProperties.COMMIT_MIN_RETRY_WAIT_MS, "1",
           CatalogProperties.TABLE_DEFAULT_PREFIX + TableProperties.COMMIT_MAX_RETRY_WAIT_MS, "1",
           CatalogProperties.TABLE_DEFAULT_PREFIX + TableProperties.MANIFEST_MIN_MERGE_COUNT, "2",
@@ -763,7 +763,7 @@ class TestCatalogFaultProperties {
         writerProperties.put(
             FileIOCatalog.INLINE_TM_CODEC, (gzipWriters >> i & 1) == 1 ? "gzip" : "structural");
         if ((gcWriters >> i & 1) == 1) {
-          writerProperties.put(ProtoCatalogFormat.COMMITTED_RETENTION_MS, "0");
+          writerProperties.put(LogCatalogProperties.COMMITTED_RETENTION_MS, "0");
         }
         this.writers[i] =
             new Writer(i, modes.get(i).catalog(io, WAREHOUSE, CATALOG_NAME, writerProperties));
@@ -1897,8 +1897,7 @@ class TestCatalogFaultProperties {
     private Model actual() {
       checkCheckpoints();
       Model tables = new Model();
-      CatalogState file =
-          new ProtoCatalogFormat(PROPERTIES).read(io, io.newInputFile(CATALOG_LOCATION));
+      CatalogState file = CatalogTestSupport.log(io, CATALOG_LOCATION, PROPERTIES).read().state();
       List<TableIdentifier> ids = new ArrayList<>();
       for (Namespace ns : checker.listNamespaces(Namespace.empty())) {
         tables.namespaces.put(ns, new TreeMap<>(checker.loadNamespaceMetadata(ns)));

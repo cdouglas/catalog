@@ -34,12 +34,14 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.inmemory.InMemoryInputFile;
+import org.intentlog.CompactionPolicy;
 import org.intentlog.DedupHorizonExceededException;
+import org.intentlog.Replica;
 import org.intentlog.wire.UuidV7;
 import org.junit.jupiter.api.Test;
 
 /**
- * Tests for the PB commit protocol knobs: {@code maxAppendCount} and
+ * Tests for the commit protocol knobs: {@code maxAppendCount} and
  * {@code maxAppendSize}. Verifies that each knob independently triggers
  * compaction, and that {@code maxAppendCount=0} forces CAS on every commit
  * (for storage providers without append support).
@@ -67,7 +69,7 @@ public class TestProtoCommitKnobs {
     @SuppressWarnings("unchecked")
     MockIO() {
       fileIO = mock(SupportsAtomicOperations.class);
-      // Mockito returns false for unstubbed boolean methods, but the format
+      // Mockito returns false for unstubbed boolean methods, but the log
       // interprets false as "no append primitive" and forces CAS-only. These
       // knob tests exercise the append branch, so opt back into the interface
       // default.
@@ -168,50 +170,52 @@ public class TestProtoCommitKnobs {
     }
   }
 
-  /** Performs N createNamespace commits on the given format, returns the final catalog. */
-  private CatalogState commitN(ProtoCatalogFormat format, MockIO io, int n) {
-    CatalogState current = null;
+  /** The catalog at {@link #CATALOG_LOC} of {@code io}, with these commit knobs. */
+  private static CatalogLog log(MockIO io, int maxAppendCount, long maxAppendSize) {
+    return CatalogTestSupport.log(io.fileIO, CATALOG_LOC, maxAppendCount, maxAppendSize);
+  }
+
+  /** Performs N createNamespace commits on the given log, returns the final catalog. */
+  private Replica<CatalogState> commitN(CatalogLog log, int n) {
+    Replica<CatalogState> current = null;
     for (int i = 0; i < n; i++) {
-      InputFile catalogFile = io.trackedInput();
-      ProtoCatalogFormat.Mut mut;
-      if (current == null) {
-        mut = (ProtoCatalogFormat.Mut) format.empty(catalogFile);
-      } else {
-        current = format.read(io.fileIO, catalogFile);
-        mut = (ProtoCatalogFormat.Mut) format.from(current);
-      }
-      mut.createNamespace(Namespace.of("ns" + i));
-      current = (CatalogState) mut.commit(io.fileIO);
+      Replica<CatalogState> base = current == null ? log.empty() : log.read();
+      current = new CatalogMutation(base).createNamespace(Namespace.of("ns" + i)).commit(log);
     }
     return current;
   }
 
+  /** Asserts that {@code policy} compacts at {@code maxRecords} records or {@code maxBytes}. */
+  private static void assertLimits(CompactionPolicy policy, int maxRecords, long maxBytes) {
+    assertThat(policy.due(maxRecords - 1, 0, 0)).isFalse();
+    assertThat(policy.due(maxRecords, 0, 0)).isTrue();
+    assertThat(policy.due(0, maxBytes - 1, 1)).isFalse();
+    assertThat(policy.due(0, maxBytes, 1)).isTrue();
+  }
+
   @Test
   void defaultConfigUsesLargeLimits() {
-    ProtoCatalogFormat format = new ProtoCatalogFormat();
-    assertThat(format.maxAppendCount())
-        .isEqualTo(ProtoCatalogFormat.DEFAULT_MAX_APPEND_COUNT);
-    assertThat(format.maxAppendSize())
-        .isEqualTo(ProtoCatalogFormat.DEFAULT_MAX_APPEND_SIZE);
+    assertLimits(
+        LogCatalogProperties.runtimeConfig(Map.of()).compaction(),
+        LogCatalogProperties.DEFAULT_MAX_APPEND_COUNT,
+        LogCatalogProperties.DEFAULT_MAX_APPEND_SIZE);
   }
 
   @Test
   void configFromProperties() {
     Map<String, String> props = new HashMap<>();
-    props.put(ProtoCatalogFormat.MAX_APPEND_COUNT, "100");
-    props.put(ProtoCatalogFormat.MAX_APPEND_SIZE, "4096");
-    ProtoCatalogFormat format = new ProtoCatalogFormat(props);
-    assertThat(format.maxAppendCount()).isEqualTo(100);
-    assertThat(format.maxAppendSize()).isEqualTo(4096L);
+    props.put(LogCatalogProperties.MAX_APPEND_COUNT, "100");
+    props.put(LogCatalogProperties.MAX_APPEND_SIZE, "4096");
+    assertLimits(LogCatalogProperties.runtimeConfig(props).compaction(), 100, 4096L);
   }
 
   @Test
   void casOnlyMode_zeroAppendCount() {
     // maxAppendCount=0 forces every commit through CAS
-    ProtoCatalogFormat format = new ProtoCatalogFormat(0, Long.MAX_VALUE);
     MockIO io = new MockIO();
+    CatalogLog log = log(io, 0, Long.MAX_VALUE);
 
-    commitN(format, io, 5);
+    commitN(log, 5);
 
     // All 5 commits should be CAS, no appends
     assertThat(io.casCount).isEqualTo(5);
@@ -221,11 +225,10 @@ public class TestProtoCommitKnobs {
   @Test
   void normalMode_usesAppendAfterInitialCAS() {
     // Unlimited -> all commits after the first should append
-    ProtoCatalogFormat format =
-        new ProtoCatalogFormat(Integer.MAX_VALUE, Long.MAX_VALUE);
     MockIO io = new MockIO();
+    CatalogLog log = log(io, Integer.MAX_VALUE, Long.MAX_VALUE);
 
-    commitN(format, io, 5);
+    commitN(log, 5);
 
     // First is CAS (initial), remaining 4 are appends
     assertThat(io.casCount).isEqualTo(1);
@@ -241,10 +244,10 @@ public class TestProtoCommitKnobs {
     // Commit 4: count(3) >= 3, CAS. count=1.
     // Commit 5: count(1) < 3, append. count=2.
     // Commit 6: count(2) < 3, append. count=3.
-    ProtoCatalogFormat format = new ProtoCatalogFormat(3, Long.MAX_VALUE);
     MockIO io = new MockIO();
+    CatalogLog log = log(io, 3, Long.MAX_VALUE);
 
-    commitN(format, io, 6);
+    commitN(log, 6);
 
     // 2 CASes (commit 1, commit 4), 4 appends
     assertThat(io.casCount).isEqualTo(2);
@@ -254,10 +257,10 @@ public class TestProtoCommitKnobs {
   @Test
   void appendSizeLimitTriggersCAS() {
     // Small size budget -> compaction kicks in after a few appends
-    ProtoCatalogFormat format = new ProtoCatalogFormat(Integer.MAX_VALUE, 200L);
     MockIO io = new MockIO();
+    CatalogLog log = log(io, Integer.MAX_VALUE, 200L);
 
-    commitN(format, io, 6);
+    commitN(log, 6);
 
     // Expect at least one CAS beyond the initial one (size-triggered)
     assertThat(io.casCount).isGreaterThanOrEqualTo(2);
@@ -265,22 +268,22 @@ public class TestProtoCommitKnobs {
 
   @Test
   void appendCountTracking_incrementsInReadState() {
-    ProtoCatalogFormat format = new ProtoCatalogFormat(Integer.MAX_VALUE, Long.MAX_VALUE);
     MockIO io = new MockIO();
+    CatalogLog log = log(io, Integer.MAX_VALUE, Long.MAX_VALUE);
 
-    CatalogState cat = commitN(format, io, 4);
+    Replica<CatalogState> cat = commitN(log, 4);
     // After 4 commits (1 CAS + 3 appends), log should have 4 records
-    assertThat(cat.appendCount()).isEqualTo(4);
+    assertThat(cat.intentionRecords()).isEqualTo(4);
   }
 
   @Test
   void appendCountResetsAfterCAS() {
-    ProtoCatalogFormat format = new ProtoCatalogFormat(3, Long.MAX_VALUE);
     MockIO io = new MockIO();
+    CatalogLog log = log(io, 3, Long.MAX_VALUE);
 
     // With limit=3, the 4th commit CASes. After CAS, count=1 (just the new txn).
-    CatalogState cat = commitN(format, io, 4);
-    assertThat(cat.appendCount()).isEqualTo(1);
+    Replica<CatalogState> cat = commitN(log, 4);
+    assertThat(cat.intentionRecords()).isEqualTo(1);
   }
 
   /**
@@ -293,95 +296,96 @@ public class TestProtoCommitKnobs {
    *
    * <p>Exercises the full pipeline: the test writer commits → the new
    * checkpoint persists the txn UUID inside the {@code CommittedTransactions}
-   * sub-message → a fresh {@link CatalogState} parses that sub-message
-   * lazily and {@link CatalogState#containsTransaction} scans the wire
-   * bytes directly without HashSet materialization.
+   * sub-message → a fresh read's committed set ({@link
+   * org.intentlog.CommittedSet#contains}) scans the wire bytes directly
+   * without HashSet materialization.
    */
   @Test
   void writerLearnsCommitOutcomeAfterCompaction() {
     // CAS-only mode: every commit is a full file rewrite. Equivalent to
     // "compaction happens on every commit" — strongest version of the
     // after-compaction question.
-    ProtoCatalogFormat format = new ProtoCatalogFormat(0, Long.MAX_VALUE);
     MockIO io = new MockIO();
+    CatalogLog log = log(io, 0, Long.MAX_VALUE);
 
-    // Initial commit creates the catalog and adds a namespace. The Transaction
-    // mints a v7 UUID inside Mut.commit; we recover it by inspecting the
-    // returned CatalogState's committed-set (size == 1 here).
-    InputFile catalogFile = io.trackedInput();
-    ProtoCatalogFormat.Mut mut = (ProtoCatalogFormat.Mut) format.empty(catalogFile);
+    // Initial commit creates the catalog and adds a namespace. The commit
+    // mints a v7 UUID; we recover it by inspecting the returned replica's
+    // committed set (size == 1 here).
+    CatalogMutation mut = new CatalogMutation(log.empty());
     mut.createNamespace(Namespace.of("warehouse"));
-    CatalogState afterCommit = (CatalogState) mut.commit(io.fileIO);
+    Replica<CatalogState> afterCommit = mut.commit(log);
 
-    assertThat(afterCommit.committedTransactions())
+    assertThat(afterCommit.committed().ids())
         .as("CAS-mode commit must record exactly the one new txn UUID")
         .hasSize(1);
-    UUID txnId = afterCommit.committedTransactions().iterator().next();
+    UUID txnId = afterCommit.committed().ids().iterator().next();
     assertThat(UuidV7.isV7(txnId)).isTrue();
-    // Sanity check: the in-memory CatalogState post-commit should also
+    // Sanity check: the replica the commit returned should also
     // confirm via the scan-on-bytes path.
-    assertThat(afterCommit.containsTransaction(txnId)).isTrue();
+    assertThat(afterCommit.committed().contains(txnId)).isTrue();
 
     // Fresh read: simulate a different writer (or the same writer at a later
     // time) loading the catalog file and querying for the original txn.
-    CatalogState fresh = format.read(io.fileIO, io.trackedInput());
+    Replica<CatalogState> fresh = log.read();
 
     // Confirms the commit landed in the post-CAS checkpoint and is still
     // visible via the lazy scan.
-    assertThat(fresh.containsTransaction(txnId))
+    assertThat(fresh.committed().contains(txnId))
         .as("a committed txn UUID must be findable in the post-compaction checkpoint")
         .isTrue();
 
     // Negative: an unrelated v7 UUID was never committed; scan must return false.
     UUID never = UuidV7.newUuidV7();
-    assertThat(fresh.containsTransaction(never))
+    assertThat(fresh.committed().contains(never))
         .as("an uncommitted UUID must not match")
         .isFalse();
 
     // After two more commits (each a CAS rewrite — i.e., two more compactions),
     // the original txn must STILL be findable: the dedup set is monotonic
     // across compactions.
-    ProtoCatalogFormat.Mut mut2 = (ProtoCatalogFormat.Mut) format.from(fresh);
+    CatalogMutation mut2 = new CatalogMutation(fresh);
     mut2.createNamespace(Namespace.of("bronze"));
-    CatalogState afterSecond = (CatalogState) mut2.commit(io.fileIO);
+    Replica<CatalogState> afterSecond = mut2.commit(log);
 
-    ProtoCatalogFormat.Mut mut3 = (ProtoCatalogFormat.Mut) format.from(afterSecond);
+    CatalogMutation mut3 = new CatalogMutation(afterSecond);
     mut3.createNamespace(Namespace.of("silver"));
-    mut3.commit(io.fileIO);
+    mut3.commit(log);
 
-    CatalogState afterMore = format.read(io.fileIO, io.trackedInput());
-    assertThat(afterMore.containsTransaction(txnId))
+    Replica<CatalogState> afterMore = log.read();
+    assertThat(afterMore.committed().contains(txnId))
         .as("the original txn must survive subsequent compactions")
         .isTrue();
-    assertThat(afterMore.committedTransactions()).hasSize(3);
+    assertThat(afterMore.committed().ids()).hasSize(3);
   }
 
   @Test
   void invalidNegativeConfigRejected() {
     org.assertj.core.api.Assertions.assertThatThrownBy(
-        () -> new ProtoCatalogFormat(-1, 1024L))
+        () -> LogCatalogProperties.runtimeConfig(-1, 1024L, 0L, 0L))
         .isInstanceOf(IllegalArgumentException.class);
     org.assertj.core.api.Assertions.assertThatThrownBy(
-        () -> new ProtoCatalogFormat(100, -1L))
+        () -> LogCatalogProperties.runtimeConfig(100, -1L, 0L, 0L))
         .isInstanceOf(IllegalArgumentException.class);
     org.assertj.core.api.Assertions.assertThatThrownBy(
-        () -> new ProtoCatalogFormat(100, 1024L, -1L))
+        () -> LogCatalogProperties.runtimeConfig(100, 1024L, -1L, 0L))
+        .isInstanceOf(IllegalArgumentException.class);
+    org.assertj.core.api.Assertions.assertThatThrownBy(
+        () -> LogCatalogProperties.runtimeConfig(100, 1024L, 0L, -1L))
         .isInstanceOf(IllegalArgumentException.class);
   }
 
   @Test
   void committedRetentionConfigFromProperties() {
     Map<String, String> props = new HashMap<>();
-    props.put(ProtoCatalogFormat.COMMITTED_RETENTION_MS, "300000");
-    ProtoCatalogFormat format = new ProtoCatalogFormat(props);
-    assertThat(format.committedRetentionMs()).isEqualTo(300_000L);
+    props.put(LogCatalogProperties.COMMITTED_RETENTION_MS, "300000");
+    assertThat(LogCatalogProperties.runtimeConfig(props).committedRetentionMs())
+        .isEqualTo(300_000L);
   }
 
   @Test
   void defaultCommittedRetentionIsSixHours() {
-    ProtoCatalogFormat format = new ProtoCatalogFormat();
-    assertThat(format.committedRetentionMs())
-        .isEqualTo(ProtoCatalogFormat.DEFAULT_COMMITTED_RETENTION_MS)
+    assertThat(LogCatalogProperties.runtimeConfig(Map.of()).committedRetentionMs())
+        .isEqualTo(LogCatalogProperties.DEFAULT_COMMITTED_RETENTION_MS)
         .isEqualTo(6L * 60 * 60 * 1000);
   }
 
@@ -402,16 +406,15 @@ public class TestProtoCommitKnobs {
   void retentionZeroGcsDedupSetOnEachCompaction() throws InterruptedException {
     // CAS-only mode (so every commit is a rewrite) + retention=0 (so every
     // rewrite drops everything older than now).
-    ProtoCatalogFormat format = new ProtoCatalogFormat(0, Long.MAX_VALUE, 0L);
     MockIO io = new MockIO();
+    CatalogLog log = CatalogTestSupport.log(io.fileIO, CATALOG_LOC, 0, Long.MAX_VALUE, 0L);
 
     // Writer A: initial commit, mints txn_X.
-    InputFile catalogFile = io.trackedInput();
-    ProtoCatalogFormat.Mut mutA = (ProtoCatalogFormat.Mut) format.empty(catalogFile);
+    CatalogMutation mutA = new CatalogMutation(log.empty());
     mutA.createNamespace(Namespace.of("warehouse"));
-    CatalogState afterA = (CatalogState) mutA.commit(io.fileIO);
-    assertThat(afterA.committedTransactions()).hasSize(1);
-    UUID txnX = afterA.committedTransactions().iterator().next();
+    Replica<CatalogState> afterA = mutA.commit(log);
+    assertThat(afterA.committed().ids()).hasSize(1);
+    UUID txnX = afterA.committed().ids().iterator().next();
     long txnXTs = UuidV7.timestampMs(txnX);
 
     // Bump the wall clock so Writer B's watermark moves past txn_X.
@@ -419,33 +422,33 @@ public class TestProtoCommitKnobs {
 
     // Writer B: CAS commit, which rewrites the checkpoint with watermark =
     // now > txnXTs → drops txn_X from the dedup set, sets horizon ≈ txnXTs.
-    ProtoCatalogFormat.Mut mutB = (ProtoCatalogFormat.Mut) format.from(afterA);
+    CatalogMutation mutB = new CatalogMutation(afterA);
     mutB.createNamespace(Namespace.of("bronze"));
-    mutB.commit(io.fileIO);
+    mutB.commit(log);
 
     // Fresh read.
-    CatalogState fresh = format.read(io.fileIO, io.trackedInput());
+    Replica<CatalogState> fresh = log.read();
 
     // Horizon now covers txn_X.
-    assertThat(fresh.highestDroppedTimestampMs())
+    assertThat(fresh.committed().horizon())
         .as("horizon after retention=0 compaction must overtake txn_X")
         .isGreaterThanOrEqualTo(txnXTs);
 
     // Querying for txn_X is UNKNOWN — throws.
-    org.assertj.core.api.Assertions.assertThatThrownBy(() -> fresh.containsTransaction(txnX))
+    org.assertj.core.api.Assertions.assertThatThrownBy(() -> fresh.committed().contains(txnX))
         .isInstanceOf(DedupHorizonExceededException.class)
         .satisfies(e -> {
           DedupHorizonExceededException ex = (DedupHorizonExceededException) e;
           assertThat(ex.queryId()).isEqualTo(txnX);
-          assertThat(ex.horizonMs()).isEqualTo(fresh.highestDroppedTimestampMs());
+          assertThat(ex.horizonMs()).isEqualTo(fresh.committed().horizon());
         });
 
     // Negative case: a UUID minted *after* the horizon that was never
     // committed returns false (presumed abort), no throw.
     UUID neverCommitted = UuidV7.newUuidV7();
     assertThat(UuidV7.timestampMs(neverCommitted))
-        .isGreaterThan(fresh.highestDroppedTimestampMs());
-    assertThat(fresh.containsTransaction(neverCommitted)).isFalse();
+        .isGreaterThan(fresh.committed().horizon());
+    assertThat(fresh.committed().contains(neverCommitted)).isFalse();
   }
 
   /**
@@ -457,27 +460,26 @@ public class TestProtoCommitKnobs {
    */
   @Test
   void defaultRetentionPreservesRecentCommits() {
-    ProtoCatalogFormat format = new ProtoCatalogFormat(0, Long.MAX_VALUE); // CAS-only, default retention
     MockIO io = new MockIO();
+    CatalogLog log = log(io, 0, Long.MAX_VALUE); // CAS-only, default retention
 
-    InputFile catalogFile = io.trackedInput();
-    ProtoCatalogFormat.Mut mut = (ProtoCatalogFormat.Mut) format.empty(catalogFile);
+    CatalogMutation mut = new CatalogMutation(log.empty());
     mut.createNamespace(Namespace.of("warehouse"));
-    CatalogState afterCommit = (CatalogState) mut.commit(io.fileIO);
-    UUID txnId = afterCommit.committedTransactions().iterator().next();
+    Replica<CatalogState> afterCommit = mut.commit(log);
+    UUID txnId = afterCommit.committed().ids().iterator().next();
 
     // Several more CAS rewrites — none of them GC anything because the
     // watermark = now - 6h is well before the test's start.
     for (int i = 0; i < 3; i++) {
-      CatalogState current = format.read(io.fileIO, io.trackedInput());
-      ProtoCatalogFormat.Mut m = (ProtoCatalogFormat.Mut) format.from(current);
+      Replica<CatalogState> current = log.read();
+      CatalogMutation m = new CatalogMutation(current);
       m.createNamespace(Namespace.of("ns" + i));
-      m.commit(io.fileIO);
+      m.commit(log);
     }
 
-    CatalogState fresh = format.read(io.fileIO, io.trackedInput());
-    assertThat(fresh.containsTransaction(txnId)).isTrue();
-    assertThat(fresh.highestDroppedTimestampMs())
+    Replica<CatalogState> fresh = log.read();
+    assertThat(fresh.committed().contains(txnId)).isTrue();
+    assertThat(fresh.committed().horizon())
         .as("default retention is far enough back that no GC pass should fire on test-time commits")
         .isZero();
   }
@@ -489,15 +491,13 @@ public class TestProtoCommitKnobs {
   @Test
   void appendRetry_doesNotReadCatalogOnOffsetConflict() {
     // Unlimited limits so we stay in the append path.
-    ProtoCatalogFormat format =
-        new ProtoCatalogFormat(Integer.MAX_VALUE, Long.MAX_VALUE);
     MockIO io = new MockIO();
+    CatalogLog log = log(io, Integer.MAX_VALUE, Long.MAX_VALUE);
 
     // Initial commit (CAS, creates the file)
-    InputFile catalogFile = io.trackedInput();
-    ProtoCatalogFormat.Mut mut0 = (ProtoCatalogFormat.Mut) format.empty(catalogFile);
+    CatalogMutation mut0 = new CatalogMutation(log.empty());
     mut0.createNamespace(Namespace.of("seed"));
-    mut0.commit(io.fileIO);
+    mut0.commit(log);
     // Reset counters after initial setup
     int readsAfterInit = io.readCount;
     io.casCount = 0;
@@ -507,16 +507,15 @@ public class TestProtoCommitKnobs {
     // then the 4th attempt succeeds.
     io.injectAppendFailures = 3;
 
-    CatalogState current = format.read(io.fileIO, io.trackedInput());
+    Replica<CatalogState> current = log.read();
     int readsAfterLoad = io.readCount;
 
-    ProtoCatalogFormat.Mut mut =
-        (ProtoCatalogFormat.Mut) format.from(current);
+    CatalogMutation mut = new CatalogMutation(current);
     mut.createNamespace(Namespace.of("test_ns"));
-    CatalogState result = (CatalogState) mut.commit(io.fileIO);
+    Replica<CatalogState> result = mut.commit(log);
 
     // The commit should have succeeded
-    assertThat(result.containsNamespace(Namespace.of("test_ns"))).isTrue();
+    assertThat(result.state().containsNamespace(Namespace.of("test_ns"))).isTrue();
 
     // 3 failed appends + 1 successful append
     assertThat(io.appendCount).isEqualTo(1);  // only the successful one counts
@@ -534,80 +533,72 @@ public class TestProtoCommitKnobs {
   @Test
   void appendRetry_sameBytesSucceedAfterConflict() {
     // Verify the retried append produces a valid catalog with the intended change.
-    ProtoCatalogFormat format =
-        new ProtoCatalogFormat(Integer.MAX_VALUE, Long.MAX_VALUE);
     MockIO io = new MockIO();
+    CatalogLog log = log(io, Integer.MAX_VALUE, Long.MAX_VALUE);
 
     // Setup: create initial catalog with one namespace
-    InputFile catalogFile = io.trackedInput();
-    ProtoCatalogFormat.Mut mut0 = (ProtoCatalogFormat.Mut) format.empty(catalogFile);
+    CatalogMutation mut0 = new CatalogMutation(log.empty());
     mut0.createNamespace(Namespace.of("existing"));
-    mut0.commit(io.fileIO);
+    mut0.commit(log);
 
     // Inject 5 offset conflicts, then succeed
     io.injectAppendFailures = 5;
 
-    CatalogState current = format.read(io.fileIO, io.trackedInput());
-    ProtoCatalogFormat.Mut mut =
-        (ProtoCatalogFormat.Mut) format.from(current);
+    Replica<CatalogState> current = log.read();
+    CatalogMutation mut = new CatalogMutation(current);
     mut.createNamespace(Namespace.of("new_ns"));
-    CatalogState result = (CatalogState) mut.commit(io.fileIO);
+    Replica<CatalogState> result = mut.commit(log);
 
     // Both the original and new namespace should be present
-    assertThat(result.containsNamespace(Namespace.of("existing"))).isTrue();
-    assertThat(result.containsNamespace(Namespace.of("new_ns"))).isTrue();
+    assertThat(result.state().containsNamespace(Namespace.of("existing"))).isTrue();
+    assertThat(result.state().containsNamespace(Namespace.of("new_ns"))).isTrue();
   }
 
   @Test
   void appendRetry_manyConflictsThenSuccess() {
     // Verify commit succeeds even after many consecutive offset conflicts.
-    ProtoCatalogFormat format =
-        new ProtoCatalogFormat(Integer.MAX_VALUE, Long.MAX_VALUE);
     MockIO io = new MockIO();
+    CatalogLog log = log(io, Integer.MAX_VALUE, Long.MAX_VALUE);
 
     // Setup
-    InputFile catalogFile = io.trackedInput();
-    ProtoCatalogFormat.Mut mut0 = (ProtoCatalogFormat.Mut) format.empty(catalogFile);
+    CatalogMutation mut0 = new CatalogMutation(log.empty());
     mut0.createNamespace(Namespace.of("existing"));
-    mut0.commit(io.fileIO);
+    mut0.commit(log);
 
     // Inject 8 consecutive failures (just under the 10-attempt limit)
     io.injectAppendFailures = 8;
-    CatalogState current = format.read(io.fileIO, io.trackedInput());
-    ProtoCatalogFormat.Mut mut = (ProtoCatalogFormat.Mut) format.from(current);
+    Replica<CatalogState> current = log.read();
+    CatalogMutation mut = new CatalogMutation(current);
     mut.createNamespace(Namespace.of("final"));
-    CatalogState result = (CatalogState) mut.commit(io.fileIO);
+    Replica<CatalogState> result = mut.commit(log);
 
-    assertThat(result.containsNamespace(Namespace.of("final"))).isTrue();
-    assertThat(result.containsNamespace(Namespace.of("existing"))).isTrue();
+    assertThat(result.state().containsNamespace(Namespace.of("final"))).isTrue();
+    assertThat(result.state().containsNamespace(Namespace.of("existing"))).isTrue();
   }
 
   @Test
   void appendRetry_idempotentTransactionId() {
     // Even if the same txn bytes are appended twice (shouldn't happen, but
     // testing the idempotency guarantee), the transaction should only apply once.
-    ProtoCatalogFormat format =
-        new ProtoCatalogFormat(Integer.MAX_VALUE, Long.MAX_VALUE);
     MockIO io = new MockIO();
+    CatalogLog log = log(io, Integer.MAX_VALUE, Long.MAX_VALUE);
 
     // Setup
-    InputFile catalogFile = io.trackedInput();
-    ProtoCatalogFormat.Mut mut0 = (ProtoCatalogFormat.Mut) format.empty(catalogFile);
+    CatalogMutation mut0 = new CatalogMutation(log.empty());
     mut0.createNamespace(Namespace.of("base"));
-    CatalogState initial = (CatalogState) mut0.commit(io.fileIO);
+    Replica<CatalogState> initial = mut0.commit(log);
 
     // Commit with 1 retry (inject 1 failure)
     io.injectAppendFailures = 1;
-    CatalogState current = format.read(io.fileIO, io.trackedInput());
-    ProtoCatalogFormat.Mut mut =
-        (ProtoCatalogFormat.Mut) format.from(current);
+    Replica<CatalogState> current = log.read();
+    CatalogMutation mut = new CatalogMutation(current);
     mut.createNamespace(Namespace.of("new_ns"));
-    CatalogState result = (CatalogState) mut.commit(io.fileIO);
+    Replica<CatalogState> result = mut.commit(log);
 
     // The namespace should appear exactly once
-    assertThat(result.containsNamespace(Namespace.of("new_ns"))).isTrue();
+    assertThat(result.state().containsNamespace(Namespace.of("new_ns"))).isTrue();
     // The committed transaction set should contain the txn ID
-    assertThat(result.committedTransactions().size())
-        .isGreaterThan(initial.committedTransactions().size());
+    assertThat(result.committed().ids().size())
+        .isGreaterThan(initial.committed().ids().size());
   }
 }

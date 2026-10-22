@@ -27,12 +27,10 @@ import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.aws.AwsClientFactories;
 import org.apache.iceberg.catalog.CatalogTests;
 import org.apache.iceberg.catalog.TableIdentifier;
-import org.apache.iceberg.io.CatalogFormat;
 import org.apache.iceberg.io.CloudMode;
 import org.apache.iceberg.io.FileIOCatalog;
 import org.apache.iceberg.io.InlineCompatAssertions;
 import org.apache.iceberg.io.IntegTestEnv;
-import org.apache.iceberg.io.ProtoCatalogFormat;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.util.SerializableSupplier;
 import org.junit.jupiter.api.AfterAll;
@@ -64,7 +62,7 @@ public class TestS3Catalog extends CatalogTests<FileIOCatalog> {
   private FileIOCatalog catalog;
 
   /**
-   * Catalog format's max.append.count for this suite. Subclasses override to flip the
+   * The catalog's max.append.count for this suite. Subclasses override to flip the
    * commit policy: 10000 (default) exercises the append branch on S3 Express One Zone;
    * 0 forces CAS on every commit.
    */
@@ -165,8 +163,7 @@ public class TestS3Catalog extends CatalogTests<FileIOCatalog> {
     properties.put(CatalogProperties.TABLE_DEFAULT_PREFIX + "override-key3", "catalog-default-key3");
     properties.put(CatalogProperties.TABLE_OVERRIDE_PREFIX + "override-key3", "catalog-override-key3");
     properties.put(CatalogProperties.TABLE_OVERRIDE_PREFIX + "override-key4", "catalog-override-key4");
-    final CatalogFormat<?, ?> format = new ProtoCatalogFormat(properties);
-    catalog = new FileIOCatalog("test", location, format, io, Maps.newHashMap());
+    catalog = new FileIOCatalog("test", location, io, Maps.newHashMap());
     catalog.initialize(testName, properties);
   }
 
@@ -214,8 +211,7 @@ public class TestS3Catalog extends CatalogTests<FileIOCatalog> {
     properties.put("fileio.catalog.inline", String.valueOf(inlineTM()));
     properties.put("fileio.catalog.inline.manifests", String.valueOf(inlineML()));
     properties.putAll(additionalProperties);
-    final CatalogFormat<?, ?> format = new ProtoCatalogFormat(properties);
-    FileIOCatalog c = new FileIOCatalog(catalogName, location, format, io, Maps.newHashMap());
+    FileIOCatalog c = new FileIOCatalog(catalogName, location, io, Maps.newHashMap());
     c.initialize(catalogName, properties);
     return c;
   }

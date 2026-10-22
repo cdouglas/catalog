@@ -24,11 +24,9 @@ import java.util.UUID;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.aws.AwsClientFactories;
 import org.apache.iceberg.catalog.CatalogTransactionTests;
-import org.apache.iceberg.io.CatalogFormat;
 import org.apache.iceberg.io.CloudMode;
 import org.apache.iceberg.io.FileIOCatalog;
 import org.apache.iceberg.io.IntegTestEnv;
-import org.apache.iceberg.io.ProtoCatalogFormat;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.util.SerializableSupplier;
 import org.junit.jupiter.api.AfterAll;
@@ -58,7 +56,7 @@ public class TestS3FileIOCatalogTransaction extends CatalogTransactionTests<File
   private FileIOCatalog catalog;
 
   /**
-   * Catalog format's max.append.count for this suite. Subclasses override to flip the
+   * The catalog's max.append.count for this suite. Subclasses override to flip the
    * commit policy: 10000 (default) exercises the append branch on S3 Express One Zone;
    * 0 forces CAS on every commit.
    */
@@ -152,8 +150,7 @@ public class TestS3FileIOCatalogTransaction extends CatalogTransactionTests<File
     properties.put("fileio.catalog.max.append.count", String.valueOf(maxAppendCount()));
     properties.put("fileio.catalog.inline", String.valueOf(inlineTM()));
     properties.put("fileio.catalog.inline.manifests", String.valueOf(inlineML()));
-    final CatalogFormat<?, ?> format = new ProtoCatalogFormat(properties);
-    catalog = new FileIOCatalog("test", location, format, io, Maps.newHashMap());
+    catalog = new FileIOCatalog("test", location, io, Maps.newHashMap());
     catalog.initialize(testName, properties);
   }
 

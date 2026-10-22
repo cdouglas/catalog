@@ -49,6 +49,8 @@ import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.inmemory.InMemoryInputFile;
 import org.apache.iceberg.types.Types;
+import org.intentlog.CommittedSet;
+import org.intentlog.Replica;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -315,8 +317,7 @@ public class TestInlineManifestEndToEnd {
       io = new MemoryFileIO();
       String wh = "mem:///warehouse";
       Map<String, String> props = config().catalogProperties(wh);
-      catalog = new FileIOCatalog(
-          "test", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      catalog = new FileIOCatalog("test", wh + "/catalog", io, props);
       catalog.initialize("test", props);
     }
 
@@ -329,8 +330,7 @@ public class TestInlineManifestEndToEnd {
     FileIOCatalog reloadCatalog() {
       String wh = "mem:///warehouse";
       Map<String, String> props = config().catalogProperties(wh);
-      FileIOCatalog fresh = new FileIOCatalog(
-          "test2", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      FileIOCatalog fresh = new FileIOCatalog("test2", wh + "/catalog", io, props);
       fresh.initialize("test2", props);
       return fresh;
     }
@@ -506,7 +506,7 @@ public class TestInlineManifestEndToEnd {
      * table, so a delta-mode apply would silently no-op
      * ({@code UpdateTableInlineAction.apply} bails when {@code currentMeta}
      * is null). {@code stageUpdate} therefore never writes a delta when
-     * {@code lastCatalogFile.isInlineTable(tableId)} is false. The wire
+     * {@code lastRead.state().isInlineTable(tableId)} is false. The wire
      * action must carry full_metadata, the catalog entry must transition
      * to inline, and the property update must survive reload.
      */
@@ -516,15 +516,13 @@ public class TestInlineManifestEndToEnd {
       // a real metadata.json exists and the catalog entry is pointer.
       Map<String, String> pointerProps = new HashMap<>(InlineConfig.BASELINE
           .catalogProperties("mem:///warehouse"));
-      FileIOCatalog pointerCat = new FileIOCatalog(
-          "pointer", "mem:///warehouse/catalog", new ProtoCatalogFormat(), io, pointerProps);
+      FileIOCatalog pointerCat = new FileIOCatalog("pointer", "mem:///warehouse/catalog", io, pointerProps);
       pointerCat.initialize("pointer", pointerProps);
       pointerCat.createNamespace(Namespace.of("db"));
       pointerCat.buildTable(TBL, TEST_SCHEMA).create();
 
-      ProtoCatalogFormat fmt = new ProtoCatalogFormat();
-      CatalogState beforeUpdate = (CatalogState) fmt.read(
-          io, io.newInputFile("mem:///warehouse/catalog"));
+      CatalogLog log = CatalogTestSupport.log(io, "mem:///warehouse/catalog");
+      CatalogState beforeUpdate = log.read().state();
       Integer tblId = beforeUpdate.tableId(TBL);
       assertThat(beforeUpdate.isInlineTable(tblId))
           .as("table must start as pointer-mode under BASELINE config")
@@ -545,8 +543,7 @@ public class TestInlineManifestEndToEnd {
       assertThat(action.metadataLocation).isNull();
 
       // Catalog state: table is now inline.
-      CatalogState afterUpdate = (CatalogState) fmt.read(
-          io, io.newInputFile("mem:///warehouse/catalog"));
+      CatalogState afterUpdate = log.read().state();
       assertThat(afterUpdate.isInlineTable(tblId))
           .as("table must be inline after the update")
           .isTrue();
@@ -709,18 +706,16 @@ public class TestInlineManifestEndToEnd {
 
       // Surgically clobber the manifest pool: reconstruct the catalog file
       // with inline metadata intact but empty pool/snapshotRefs
-      ProtoCatalogFormat fmt = new ProtoCatalogFormat();
-      CatalogState original = (CatalogState) fmt.read(
-          io, io.newInputFile("mem:///warehouse/catalog"));
+      CatalogLog log = CatalogTestSupport.log(io, "mem:///warehouse/catalog");
+      Replica<CatalogState> originalRead = log.read();
+      CatalogState original = originalRead.state();
       Integer tblId = original.tableId(TBL);
       byte[] inlineMeta = original.inlineMetadata(tblId);
       String prefix = original.manifestListPrefix(tblId);
       var tblEntry = original.tableById().get(tblId);
 
       // Build a catalog file with ALL original state except the pool
-      CatalogState.Builder b = CatalogState.builder(
-          io.newInputFile("mem:///warehouse/catalog"));
-      b.setCatalogUuid(original.uuid());
+      CatalogState.Builder b = CatalogState.builder();
       for (var e : original.namespaceById().entrySet()) {
         b.addNamespace(e.getKey(), e.getValue().parentId,
             e.getValue().name, e.getValue().version);
@@ -734,27 +729,9 @@ public class TestInlineManifestEndToEnd {
       CatalogState poisoned = b.build();
 
       // Serialize the poisoned file back to io, overwriting the catalog
-      ProtoCatalogFormat.Mut mut = new ProtoCatalogFormat.Mut(poisoned);
-      byte[] header = new byte[8];
-      System.arraycopy(ProtoCatalogFormat.MAGIC, 0, header, 0,
-          ProtoCatalogFormat.MAGIC.length);
-      header[4] = 0; header[5] = 0; header[6] = 0;
-      header[7] = (byte) ProtoCatalogFormat.FORMAT_VERSION;
-      ProtoCatalogFormat.ProtoIdManager idmgr = new ProtoCatalogFormat.ProtoIdManager();
-      idmgr.setGlobals(poisoned.nextNamespaceId(), poisoned.nextTableId());
-      byte[] checkpoint = ProtoCodec.encodeCheckpoint(poisoned, mut, idmgr);
-
-      java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
-      out.write(header);
-      // varint-encode checkpoint length
-      int len = checkpoint.length;
-      while ((len & ~0x7F) != 0) {
-        out.write((len & 0x7F) | 0x80);
-        len >>>= 7;
-      }
-      out.write(len);
-      out.write(checkpoint);
-      io.files.put("mem:///warehouse/catalog", out.toByteArray());
+      io.files.put(
+          "mem:///warehouse/catalog",
+          CatalogTestSupport.encodeFullFile(originalRead.logId(), CommittedSet.EMPTY, poisoned));
 
       // Attempt to load via a fresh catalog — should throw
       FileIOCatalog fresh = reloadCatalog();
@@ -784,9 +761,8 @@ public class TestInlineManifestEndToEnd {
 
       // Read the inline TableMetadata that the catalog wrote for S1, using
       // the codec recorded on the proto record to decode the bytes.
-      ProtoCatalogFormat fmt = new ProtoCatalogFormat();
-      CatalogState original = (CatalogState) fmt.read(
-          io, io.newInputFile("mem:///warehouse/catalog"));
+      CatalogLog log = CatalogTestSupport.log(io, "mem:///warehouse/catalog");
+      CatalogState original = log.read().state();
       Integer tblIdNum = original.tableId(TBL);
       byte[] inlineMeta = original.inlineMetadata(tblIdNum);
       InlineMetadataCodec inlineCodec =
@@ -818,7 +794,8 @@ public class TestInlineManifestEndToEnd {
       // Replace the inline TM bytes via the standard catalog mutation path
       // (preserves pool entries for S1). Use the same codec the table was
       // already encoded with.
-      fmt.from(original).updateTableInline(TBL, mixedBytes, inlineCodec.tag()).commit(io);
+      new CatalogMutation(log.read()).updateTableInline(TBL, mixedBytes, inlineCodec.tag())
+          .commit(log);
 
       // Default (lenient) reload: warn but succeed.
       FileIOCatalog lenient = reloadCatalog();
@@ -829,8 +806,7 @@ public class TestInlineManifestEndToEnd {
           .catalogProperties("mem:///warehouse"));
       strictProps.put("fileio.catalog.inline.strict", "true");
       FileIOCatalog strict = new FileIOCatalog(
-          "test-strict", "mem:///warehouse/catalog",
-          new ProtoCatalogFormat(), io, strictProps);
+          "test-strict", "mem:///warehouse/catalog", io, strictProps);
       strict.initialize("test-strict", strictProps);
       org.assertj.core.api.Assertions.assertThatThrownBy(() -> strict.loadTable(TBL))
           .isInstanceOf(org.apache.iceberg.exceptions.ValidationException.class)
@@ -867,9 +843,8 @@ public class TestInlineManifestEndToEnd {
       assertThat(reloaded.currentSnapshot().allManifests(io)).hasSize(2);
 
       // Inspect pool directly: should not have entries for the expired snapshot
-      ProtoCatalogFormat fmt = new ProtoCatalogFormat();
-      CatalogState proto = (CatalogState) fmt.read(
-          io, io.newInputFile("mem:///warehouse/catalog"));
+      CatalogLog log = CatalogTestSupport.log(io, "mem:///warehouse/catalog");
+      CatalogState proto = log.read().state();
       Integer tblId = proto.tableId(TBL);
       // The expired snapshot's ref list must be gone
       assertThat(proto.hasInlineManifests(tblId, firstSnapId))
@@ -1357,8 +1332,7 @@ public class TestInlineManifestEndToEnd {
       MemoryFileIO io = new MemoryFileIO();
       String wh = "mem:///warehouse-codec-evol-" + codecName;
       Map<String, String> props = InlineConfig.TM_ONLY.catalogProperties(wh, codecName);
-      FileIOCatalog catalog = new FileIOCatalog(
-          "test", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      FileIOCatalog catalog = new FileIOCatalog("test", wh + "/catalog", io, props);
       catalog.initialize("test", props);
 
       catalog.createNamespace(Namespace.of("db"));
@@ -1370,8 +1344,7 @@ public class TestInlineManifestEndToEnd {
       tbl.updateSchema().addColumn("ts",
           org.apache.iceberg.types.Types.TimestampType.withoutZone()).commit();
 
-      FileIOCatalog fresh = new FileIOCatalog(
-          "test2", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      FileIOCatalog fresh = new FileIOCatalog("test2", wh + "/catalog", io, props);
       fresh.initialize("test2", props);
       Table reloaded = fresh.loadTable(TBL);
       assertThat(reloaded.schema().findField("ts"))
@@ -1381,8 +1354,7 @@ public class TestInlineManifestEndToEnd {
       assertThat(reloaded.snapshots()).hasSize(1);
 
       // Verify the inlined record on disk records the codec we asked for.
-      CatalogState decoded = (CatalogState) new ProtoCatalogFormat()
-          .read(io, io.newInputFile(wh + "/catalog"));
+      CatalogState decoded = CatalogTestSupport.log(io, wh + "/catalog").read().state();
       Integer tblId = decoded.tableId(TBL);
       byte expectedTag = InlineMetadataCodecs.byShortName(codecName).tag();
       assertThat(decoded.inlineMetadataCodec(tblId))
@@ -1409,8 +1381,7 @@ public class TestInlineManifestEndToEnd {
       MemoryFileIO io = new MemoryFileIO();
       String wh = "mem:///warehouse-d9-single-" + codecName;
       Map<String, String> props = InlineConfig.TM_ML.catalogProperties(wh, codecName);
-      FileIOCatalog catalog = new FileIOCatalog(
-          "test", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      FileIOCatalog catalog = new FileIOCatalog("test", wh + "/catalog", io, props);
       catalog.initialize("test", props);
 
       catalog.createNamespace(Namespace.of("db"));
@@ -1420,8 +1391,7 @@ public class TestInlineManifestEndToEnd {
       txn.newFastAppend().appendFile(FILE_A).commit();
       txn.commitTransaction();
 
-      FileIOCatalog fresh = new FileIOCatalog(
-          "test2", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      FileIOCatalog fresh = new FileIOCatalog("test2", wh + "/catalog", io, props);
       fresh.initialize("test2", props);
       Table reloaded = fresh.loadTable(TBL);
       assertThat(reloaded.currentSnapshot())
@@ -1447,8 +1417,7 @@ public class TestInlineManifestEndToEnd {
       MemoryFileIO io = new MemoryFileIO();
       String wh = "mem:///warehouse-d9-multi-" + codecName;
       Map<String, String> props = InlineConfig.TM_ML.catalogProperties(wh, codecName);
-      FileIOCatalog catalog = new FileIOCatalog(
-          "test", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      FileIOCatalog catalog = new FileIOCatalog("test", wh + "/catalog", io, props);
       catalog.initialize("test", props);
 
       catalog.createNamespace(Namespace.of("db"));
@@ -1469,8 +1438,7 @@ public class TestInlineManifestEndToEnd {
       txn.newFastAppend().appendFile(anotherFile).commit();
       txn.commitTransaction();
 
-      FileIOCatalog fresh = new FileIOCatalog(
-          "test2", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      FileIOCatalog fresh = new FileIOCatalog("test2", wh + "/catalog", io, props);
       fresh.initialize("test2", props);
       Table reloaded = fresh.loadTable(TBL);
       assertThat(reloaded.snapshots())
@@ -1530,8 +1498,7 @@ public class TestInlineManifestEndToEnd {
       MemoryFileIO io = new MemoryFileIO();
       String wh = "mem:///warehouse-fullmode-multi-" + codecName;
       Map<String, String> props = InlineConfig.TM_ML.catalogProperties(wh, codecName);
-      FileIOCatalog catalog = new FileIOCatalog(
-          "test", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      FileIOCatalog catalog = new FileIOCatalog("test", wh + "/catalog", io, props);
       catalog.initialize("test", props);
 
       catalog.createNamespace(Namespace.of("db"));
@@ -1569,8 +1536,7 @@ public class TestInlineManifestEndToEnd {
       // wrapInlineManifests rescue reconstructs GenericManifestFile(specId=0).
       // Structural codec already writes the sentinel via planPaths.
       if ("gzip".equals(codecName)) {
-        CatalogState decoded = (CatalogState) new ProtoCatalogFormat()
-            .read(io, io.newInputFile(wh + "/catalog"));
+        CatalogState decoded = CatalogTestSupport.log(io, wh + "/catalog").read().state();
         Integer probeTblId = decoded.tableId(TBL);
         byte[] storedInline = decoded.inlineMetadata(probeTblId);
         java.util.zip.GZIPInputStream gz =
@@ -1584,8 +1550,7 @@ public class TestInlineManifestEndToEnd {
       }
 
       // Reload via fresh catalog (forces checkpoint+log replay).
-      FileIOCatalog fresh = new FileIOCatalog(
-          "test2", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      FileIOCatalog fresh = new FileIOCatalog("test2", wh + "/catalog", io, props);
       fresh.initialize("test2", props);
       Table reloaded = fresh.loadTable(TBL);
       Snapshot reloadedFirst = reloaded.snapshot(firstSnap);
@@ -1638,8 +1603,7 @@ public class TestInlineManifestEndToEnd {
       MemoryFileIO io = new MemoryFileIO();
       String wh = "mem:///warehouse-fullmode-multi-txn-" + codecName;
       Map<String, String> props = InlineConfig.TM_ML.catalogProperties(wh, codecName);
-      FileIOCatalog catalog = new FileIOCatalog(
-          "test", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      FileIOCatalog catalog = new FileIOCatalog("test", wh + "/catalog", io, props);
       catalog.initialize("test", props);
 
       catalog.createNamespace(Namespace.of("db"));
@@ -1676,8 +1640,7 @@ public class TestInlineManifestEndToEnd {
       // On-disk assertion: full-mode encode in commitTransaction must also
       // rewrite InlineSnapshots to inline:// sentinels (see companion test).
       if ("gzip".equals(codecName)) {
-        CatalogState probeCatalog = (CatalogState) new ProtoCatalogFormat()
-            .read(io, io.newInputFile(wh + "/catalog"));
+        CatalogState probeCatalog = CatalogTestSupport.log(io, wh + "/catalog").read().state();
         Integer probeTblId = probeCatalog.tableId(TBL);
         byte[] storedInline = probeCatalog.inlineMetadata(probeTblId);
         java.util.zip.GZIPInputStream gz =
@@ -1690,8 +1653,7 @@ public class TestInlineManifestEndToEnd {
             .contains("\"manifest-list\":\"inline://" + secondSnap + "\"");
       }
 
-      FileIOCatalog fresh = new FileIOCatalog(
-          "test2", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      FileIOCatalog fresh = new FileIOCatalog("test2", wh + "/catalog", io, props);
       fresh.initialize("test2", props);
       Table reloaded = fresh.loadTable(TBL);
       Snapshot reloadedFirst = reloaded.snapshot(firstSnap);
@@ -1733,8 +1695,7 @@ public class TestInlineManifestEndToEnd {
       MemoryFileIO io = new MemoryFileIO();
       String wh = "mem:///warehouse-rowlineage-" + codecName;
       Map<String, String> props = InlineConfig.TM_ML.catalogProperties(wh, codecName);
-      FileIOCatalog catalog = new FileIOCatalog(
-          "test", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      FileIOCatalog catalog = new FileIOCatalog("test", wh + "/catalog", io, props);
       catalog.initialize("test", props);
 
       catalog.createNamespace(Namespace.of("db"));
@@ -1761,8 +1722,7 @@ public class TestInlineManifestEndToEnd {
       Long expectedAddedRows = beforeReload.addedRows();
 
       // Reload via fresh catalog — exercises the full storage round-trip.
-      FileIOCatalog fresh = new FileIOCatalog(
-          "test2", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      FileIOCatalog fresh = new FileIOCatalog("test2", wh + "/catalog", io, props);
       fresh.initialize("test2", props);
       Table reloaded = fresh.loadTable(TBL);
       Snapshot reloadedSnap = reloaded.currentSnapshot();
@@ -1791,8 +1751,7 @@ public class TestInlineManifestEndToEnd {
       MemoryFileIO io = new MemoryFileIO();
       String wh = "mem:///warehouse-poolorphan";
       Map<String, String> props = InlineConfig.TM_ML.catalogProperties(wh);
-      FileIOCatalog catalog = new FileIOCatalog(
-          "test", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      FileIOCatalog catalog = new FileIOCatalog("test", wh + "/catalog", io, props);
       catalog.initialize("test", props);
 
       catalog.createNamespace(Namespace.of("db"));
@@ -1805,8 +1764,7 @@ public class TestInlineManifestEndToEnd {
       long secondSnap = tbl.currentSnapshot().snapshotId();
 
       // Sanity: pool has refs for both snapshots before the full-mode commit.
-      CatalogState before = (CatalogState) new ProtoCatalogFormat()
-          .read(io, io.newInputFile(wh + "/catalog"));
+      CatalogState before = CatalogTestSupport.log(io, wh + "/catalog").read().state();
       Integer tblId = before.tableId(TBL);
       assertThat(before.snapshotManifests(tblId).keySet())
           .as("baseline: both snapshots have pool refs")
@@ -1825,8 +1783,7 @@ public class TestInlineManifestEndToEnd {
       // per-snapshot ref list AND from the shared pool. Today the
       // full-mode apply path preserves the pool wholesale, so this test
       // fails — exposing the orphan-leak invariant gap.
-      CatalogState after = (CatalogState) new ProtoCatalogFormat()
-          .read(io, io.newInputFile(wh + "/catalog"));
+      CatalogState after = CatalogTestSupport.log(io, wh + "/catalog").read().state();
       Integer tblIdAfter = after.tableId(TBL);
       assertThat(after.snapshotManifests(tblIdAfter).keySet())
           .as("snapshotManifests must not retain a ref list for an expired snapshot")
@@ -1855,8 +1812,7 @@ public class TestInlineManifestEndToEnd {
       MemoryFileIO io = new MemoryFileIO();
       String wh = "mem:///warehouse-keyset-" + codecName;
       Map<String, String> props = InlineConfig.TM_ML.catalogProperties(wh, codecName);
-      FileIOCatalog catalog = new FileIOCatalog(
-          "test", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      FileIOCatalog catalog = new FileIOCatalog("test", wh + "/catalog", io, props);
       catalog.initialize("test", props);
 
       catalog.createNamespace(Namespace.of("db"));
@@ -1868,14 +1824,12 @@ public class TestInlineManifestEndToEnd {
       // Expire the first snapshot via a normal expire (delta-path).
       tbl.expireSnapshots().expireSnapshotId(firstSnap).commit();
 
-      CatalogState cat = (CatalogState) new ProtoCatalogFormat()
-          .read(io, io.newInputFile(wh + "/catalog"));
+      CatalogState cat = CatalogTestSupport.log(io, wh + "/catalog").read().state();
       Integer tblId = cat.tableId(TBL);
 
       // Recover the live snapshot ids from the catalog (via the catalog's
       // own load path, since that's the authoritative reload contract).
-      FileIOCatalog fresh = new FileIOCatalog(
-          "test2", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      FileIOCatalog fresh = new FileIOCatalog("test2", wh + "/catalog", io, props);
       fresh.initialize("test2", props);
       Table reloaded = fresh.loadTable(TBL);
       java.util.Set<Long> liveSnapIds = new java.util.HashSet<>();
@@ -1893,8 +1847,7 @@ public class TestInlineManifestEndToEnd {
       MemoryFileIO io = new MemoryFileIO();
       String wh = "mem:///warehouse-codec-" + config.name() + "-" + codecName;
       Map<String, String> props = config.catalogProperties(wh, codecName);
-      FileIOCatalog catalog = new FileIOCatalog(
-          "test", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      FileIOCatalog catalog = new FileIOCatalog("test", wh + "/catalog", io, props);
       catalog.initialize("test", props);
 
       catalog.createNamespace(Namespace.of("db"));
@@ -1904,8 +1857,7 @@ public class TestInlineManifestEndToEnd {
       tbl.newFastAppend().appendFile(FILE_B).commit();
 
       // Reload through a fresh catalog (forces checkpoint+log replay).
-      FileIOCatalog fresh = new FileIOCatalog(
-          "test2", wh + "/catalog", new ProtoCatalogFormat(), io, props);
+      FileIOCatalog fresh = new FileIOCatalog("test2", wh + "/catalog", io, props);
       fresh.initialize("test2", props);
       Table reloaded = fresh.loadTable(TBL);
       assertThat(reloaded.snapshots()).hasSize(2);
@@ -1913,8 +1865,7 @@ public class TestInlineManifestEndToEnd {
       assertThat(reloaded.currentSnapshot().allManifests(io)).isNotEmpty();
 
       // Verify the on-wire codec discriminator matches what we configured.
-      CatalogState decoded = (CatalogState) new ProtoCatalogFormat()
-          .read(io, io.newInputFile(wh + "/catalog"));
+      CatalogState decoded = CatalogTestSupport.log(io, wh + "/catalog").read().state();
       Integer tblId = decoded.tableId(TBL);
       byte expectedTag = InlineMetadataCodecs.byShortName(codecName).tag();
       assertThat(decoded.inlineMetadataCodec(tblId))

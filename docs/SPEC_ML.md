@@ -1,7 +1,7 @@
 # Inline Manifest Lists (ML)
 
-This document specifies the inline-manifest-list extension to
-`ProtoCatalogFormat`: how the catalog absorbs the *second* level of Iceberg
+This document specifies the inline-manifest-list extension to the catalog
+format: how the catalog absorbs the *second* level of Iceberg
 table state (the manifest list). It builds on inline table metadata
 ([SPEC_TM.md](SPEC_TM.md)) and the base catalog format ([SPEC.md](SPEC.md)).
 
@@ -52,7 +52,7 @@ verbatim.
 ### In-Memory Form
 
 ```java
-// On ProtoCatalogFile
+// On CatalogState
 Map<Integer, Map<String, ManifestFile>> manifestPool;     // tblId → path → entry
 Map<Integer, Map<Long, List<String>>>    snapshotManifests; // tblId → snapId → ordered paths
 ```
@@ -339,7 +339,7 @@ inline or a file, so any writer reads the same manifests.
 
 ### Loading
 
-`loadFromCatalogFile` detects inline tables and, for each snapshot whose
+`loadFrom(CatalogState)` detects inline tables and, for each snapshot whose
 ID is in the table's `snapshotManifests` map, replaces the parsed
 `BaseSnapshot` with an `InlineSnapshot` carrying the resolved manifest
 list from the pool. Snapshots without inline ML (older pointer-mode

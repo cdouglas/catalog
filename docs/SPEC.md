@@ -1,8 +1,9 @@
-# ProtoCatalogFormat Specification
+# Catalog File Format Specification
 
-This document specifies the protobuf-based catalog format implemented by
-`ProtoCatalogFormat`, the only catalog format used by `FileIOCatalog`. It uses
-a checkpoint + append-log architecture encoded as protobuf wire format.
+This document specifies the protobuf-based catalog format that `FileIOCatalog`
+keeps in one object: intentlog-core's log of the catalog's state machine
+(`CatalogStateMachine`), laid out by `AtomicFileLog`. It uses a checkpoint +
+append-log architecture encoded as protobuf wire format.
 
 For inline-table extensions, see:
 - [SPEC_TM.md](SPEC_TM.md) — inline table metadata (field 13 of `Checkpoint`,
@@ -194,7 +195,7 @@ replayed set into its checkpoint unchanged; a GC record after it drops the
 old ids (see below).
 
 All entries must be UUIDv7; non-v7 IDs are rejected at the dedup-set
-entry point (`ProtoCatalogFile.Builder.addCommittedTransaction`) and
+entry point (`CommittedSet.Builder.add`) and
 skipped at read-time replay (`Transaction.verify` returns false). See
 [UUID_V7_BENCH_RESULTS.md](UUID_V7_BENCH_RESULTS.md) for the encoding
 study that informed this choice.
@@ -240,7 +241,7 @@ checkpoints, needs this for every reader to apply the same records.
 
 **GC algorithm.** The set changes in three places. A read merges the id of
 each record replay applies into the set, dropping nothing
-(`ProtoCatalogFile.Builder.build()`), and applies each GC record
+(`CommittedSet.Builder.build()`), and applies each GC record
 (`advanceHorizon`). A CAS (any CAS-mode commit, including the always-CAS
 path when `maxAppendCount=0`) writes a GC record between its checkpoint and
 its own record (`LogRuntime`, intentlog-core):
@@ -284,8 +285,8 @@ drops every entry writes a horizon-only body (`max_timestamp_ms = 0`,
 `highest_dropped_timestamp_ms` non-zero), so that the horizon survives
 later compactions. The two timestamps are tracked independently.
 
-**Query semantics: tri-state.** `containsTransaction(UUID)` (on
-`ProtoCatalogFile` and its `Builder`) resolves a query for UUID `q`
+**Query semantics: tri-state.** `contains(UUID)` (on intentlog-core's
+`CommittedSet` and its `Builder`) resolves a query for UUID `q`
 against `CommittedTransactions(packed_entries=P, highest_dropped=H)` to
 one of:
 
@@ -301,7 +302,7 @@ A non-v7 `q` returns `false` without consulting the horizon.
 **Replay rejects a record at or below the horizon.** Replay does not ask
 `containsTransaction`, which would throw for such a record and so fail
 every read of the catalog (Bug 64). It asks
-`ProtoCatalogFile.Builder.mayApply`, which admits a record only if the
+`CommittedSet.Builder.mayApply`, which admits a record only if the
 set does not hold its id (else it is a retry of a record already
 applied) and its timestamp is above the horizon (else it may be a retry
 of a commit whose id aged out). Such records are reachable: a writer
@@ -722,8 +723,8 @@ takes the append path or the CAS (compaction) path:
 | `fileio.catalog.max.append.size`  | 16777216    | Soft performance target for total file size. Larger catalogs take longer to read. |
 | `fileio.catalog.throttle.retry.min-wait-ms` | 200 | First wait before retrying a write that storage throttled; later waits double, up to the larger of 5 s and this value, each plus up to 50% random jitter, for 8 attempts in all. |
 
-`ProtoCatalogFile` tracks `appendCount` (the number of transaction records in
-the log portion), computed during `readInternal`.
+A read (`Replica`) carries `intentionRecords` (the number of transaction
+records in the log portion, GC records not counted), which replay counts.
 
 ```
 # landed(state): whether state's committed set holds txn.id
@@ -1023,14 +1024,16 @@ and replay let the second overwrite the first.
 
 ## State Model
 
-The catalog state is held in `ProtoCatalogFile` (immutable snapshot):
+The catalog state is held in `CatalogState` (immutable snapshot). A read of
+the log (`Replica`) pairs it with the log's identity (`logId`, a UUIDv7), its
+committed set (`committed`, the inner `CommittedTransactions` bytes, queried in
+place) and the number of transaction records after the checkpoint
+(`intentionRecords`):
 
 | Field                | Type                             | Description                          |
 |----------------------|----------------------------------|--------------------------------------|
-| `uuid`               | `UUID`                           | Catalog identity (UUIDv7)            |
 | `nextNamespaceId`    | `int`                            | Next namespace ID replay binds       |
 | `nextTableId`        | `int`                            | Next table ID replay binds           |
-| `appendCount`        | `int`                            | Transaction records in the log       |
 | `namespaceById`      | `Map<Integer, NsEntry>`          | Namespace ID → entry                 |
 | `namespaceLookup`    | `Map<Namespace, Integer>`        | Namespace path → ID (derived)        |
 | `nsProperties`       | `Map<Integer, Map<Str, Str>>`    | Namespace ID → properties            |
@@ -1041,13 +1044,12 @@ The catalog state is held in `ProtoCatalogFile` (immutable snapshot):
 | `tblManifestPrefix`  | `Map<Integer, String>`           | Table ID → manifest-list prefix      |
 | `manifestPool`       | `Map<Integer, Map<String, ManifestFile>>` | Per-table manifest pool     |
 | `snapshotManifests`  | `Map<Integer, Map<Long, List<String>>>`   | Per-snapshot manifest paths |
-| `committedTransactionsBytes` | `byte[]`                 | Applied transaction IDs: the inner `CommittedTransactions` bytes (compressed) |
 
 Inline-only fields (`tblInlineMetadata`, `tblInlineMetadataCodec`,
 `tblManifestPrefix`, `manifestPool`, `snapshotManifests`) are described in
 [SPEC_TM.md](SPEC_TM.md) and [SPEC_ML.md](SPEC_ML.md). The committed set is
-queried in place (`containsTransaction`); `committedTransactions()` decodes a
-`Set<UUID>` on demand, for tests and tooling.
+queried in place (`CommittedSet.contains`); `ids()` decodes a `Set<UUID>` on
+demand, for tests and tooling.
 
 **The root namespace** is an ordinary `NsEntry` row with id 0
 (`parentId = 0`, `name = ""`), present in every catalog and written to
@@ -1062,7 +1064,7 @@ parent. The root is otherwise reserved:
 - no action may create or drop it (`CreateNamespace` / `DropNamespace`
   with id 0 fail verification);
 - tables and namespace properties cannot live on it. Writers enforce
-  this, not replay: `CatalogFile.Mut` treats the empty namespace as one
+  this, not replay: `CatalogMutation` treats the empty namespace as one
   that does not exist, and `FileIOCatalog.isValidIdentifier` rejects a
   table identifier with an empty namespace.
 
@@ -1086,7 +1088,7 @@ would lose its metadata file there.
 
 ## Action Verification Rules
 
-Replay applies a record only if `ProtoCatalogFile.Builder.mayApply`
+Replay applies a record only if `CommittedSet.Builder.mayApply`
 admits its id (not in the committed set, and above the set's GC horizon;
 see [Committed-set retention](#committed-set-retention-gc)) and
 `Transaction.verify` accepts it. `Transaction.verify` rejects a record
@@ -1137,8 +1139,8 @@ numbers reserved (`Transaction` reserves 2, the former `sealed`).
   read.
 - An unknown action type decodes as `UnknownAction`, which always
   verifies and applies nothing; the record's other actions apply.
-- The header's `formatVersion` must equal `ProtoCatalogFormat.FORMAT_VERSION`
-  (1).
+- The header's `formatVersion` must equal `AtomicFileLog.FORMAT_VERSION`
+  (2).
 - `Checkpoint.min_reader_version` gates changes a reader cannot skip safely:
   every checkpoint carries `ProtoCodec.SUPPORTED_READER_VERSION` (1), and a
   reader refuses one that lacks the field or carries more than it supports. It
@@ -1150,10 +1152,13 @@ numbers reserved (`Transaction` reserves 2, the former `sealed`).
 | File | Purpose |
 |------|---------|
 | `iceberg-fileio-catalog/src/main/proto/catalog.proto` | Protobuf schema (catalog + inline TM + ML) |
-| `iceberg-fileio-catalog/src/main/java/.../ProtoCatalogFormat.java` | Format implementation (read, commit, CAS/append) |
-| `iceberg-fileio-catalog/src/main/java/.../ProtoCatalogFile.java` | Immutable catalog snapshot + builder |
+| `intentlog-fileio/src/main/java/.../AtomicFileLog.java` | The file's layout; reads, CAS and appends |
+| `intentlog-core/src/main/java/.../LogRuntime.java` | Read (replay) and commit loop |
+| `iceberg-fileio-catalog/src/main/java/.../CatalogStateMachine.java` | The catalog as a state machine: checkpoints and intentions |
+| `iceberg-fileio-catalog/src/main/java/.../CatalogState.java` | Immutable catalog state + builder |
 | `iceberg-fileio-catalog/src/main/java/.../ProtoCodec.java` | Wire encoding/decoding, action types |
 | `iceberg-fileio-catalog/src/main/java/.../InlineDeltaCodec.java` | Inline TM/ML delta encode/decode/apply |
-| `iceberg-fileio-catalog/src/main/java/.../FileIOCatalog.java` | Catalog + `FileIOTableOperations` |
-| `iceberg-fileio-catalog/src/main/java/.../CatalogFormat.java` | Format strategy interface |
-| `iceberg-fileio-catalog/src/main/java/.../CatalogFile.java` | Abstract base + inline-aware `Mut` API |
+| `iceberg-fileio-catalog/src/main/java/.../LogCatalog.java` | Catalog + `FileIOTableOperations`, over any log |
+| `iceberg-fileio-catalog/src/main/java/.../FileIOCatalog.java` | `LogCatalog` over an `AtomicFileLog` |
+| `iceberg-fileio-catalog/src/main/java/.../CatalogLog.java` | The catalog's log: reads, commits, Iceberg's exceptions |
+| `iceberg-fileio-catalog/src/main/java/.../CatalogMutation.java` | A transaction staged on a read, with its intention |

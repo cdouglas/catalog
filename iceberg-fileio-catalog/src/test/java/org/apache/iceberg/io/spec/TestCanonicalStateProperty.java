@@ -27,7 +27,6 @@ import net.jqwik.api.From;
 import net.jqwik.api.Property;
 import net.jqwik.api.Provide;
 import net.jqwik.api.constraints.Size;
-import org.apache.iceberg.io.CatalogFile;
 import org.apache.iceberg.io.CatalogState;
 import org.apache.iceberg.io.CatalogTestSupport;
 import org.apache.iceberg.io.ProtoCodec;
@@ -52,10 +51,10 @@ class TestCanonicalStateProperty {
 
   @Property(tries = 200)
   void p6_builderStateSurvivesCodec(
-      @ForAll @From("catalogStates") CatalogFile seed,
+      @ForAll @From("catalogStates") CatalogState seed,
       @ForAll @Size(min = 1, max = 6) List<Long> seeds) {
     CanonicalState canonical = CanonicalState.from(seed);
-    CatalogState real = (CatalogState) seed;
+    CatalogState real = seed;
 
     for (long actionSeed : seeds) {
       ProtoCodec.Action a = CatalogStateGenerators.action(real, new java.util.Random(actionSeed));
@@ -74,7 +73,7 @@ class TestCanonicalStateProperty {
   }
 
   @Provide
-  Arbitrary<CatalogFile> catalogStates() {
+  Arbitrary<CatalogState> catalogStates() {
     return CatalogStateGenerators.catalogStates();
   }
 }

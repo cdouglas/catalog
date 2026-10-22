@@ -36,7 +36,9 @@ import java.util.zip.CRC32;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.intentlog.CommittedSet;
 import org.intentlog.DedupHorizonExceededException;
+import org.intentlog.Replica;
 import org.intentlog.wire.LogEnvelope;
 
 /**
@@ -106,10 +108,8 @@ public final class CheckpointRoundTrip {
     if (before == null || before.length == 0) {
       return null;
     }
-    CatalogState replayed = CatalogTestSupport.decodeFullFile(before);
-    CatalogState checkpoint = CatalogTestSupport.decodeCheckpoint(after).build();
-    SortedMap<String, String> expected = contents(replayed);
-    SortedMap<String, String> actual = contents(checkpoint);
+    SortedMap<String, String> expected = contents(CatalogTestSupport.replay(before));
+    SortedMap<String, String> actual = contents(CatalogTestSupport.checkpointOf(after));
     if (expected.equals(actual)) {
       return null;
     }
@@ -141,7 +141,7 @@ public final class CheckpointRoundTrip {
     if (rejected != null) {
       return rejected;
     }
-    return difference(CatalogTestSupport.decodeFullFile(catalogFile));
+    return difference(CatalogTestSupport.replay(catalogFile));
   }
 
   /**
@@ -151,22 +151,25 @@ public final class CheckpointRoundTrip {
    */
   static String compactionRecordRejected(byte[] catalogFile) {
     CatalogState.Builder checkpoint = CatalogTestSupport.decodeCheckpoint(catalogFile);
+    CommittedSet.Builder committed =
+        CommittedSet.builder()
+            .inherit(CatalogTestSupport.decodeCheckpointEnvelope(catalogFile).committed());
     ProtoCodec.Transaction own = null;
     for (LogEnvelope.Record record : CatalogTestSupport.decodeLogRecords(catalogFile)) {
       if (!record.isAdvanceHorizon()) {
         own = ProtoCodec.decodeTransaction(record.id(), record.intention());
         break;
       }
-      checkpoint.advanceHorizon(record.watermarkMs());
+      committed.advanceHorizon(record.watermarkMs());
     }
     if (own == null) {
       return null;
     }
-    if (checkpoint.mayApply(own.id()) || !own.verify(checkpoint)) {
+    if (committed.mayApply(own.id()) || !own.verify(checkpoint)) {
       return null;
     }
     try {
-      if (checkpoint.containsTransaction(own.id())) {
+      if (committed.contains(own.id())) {
         return null; // the checkpoint holds it already
       }
     } catch (DedupHorizonExceededException e) {
@@ -176,7 +179,7 @@ public final class CheckpointRoundTrip {
         "the record that follows the checkpoint, %s, holds on it, but replay rejects it: it is at "
             + "or below the committed set's horizon (%d)",
         own.id(),
-        CatalogTestSupport.decodeFullFile(catalogFile).highestDroppedTimestampMs());
+        committed.horizon());
   }
 
   private static void dump(byte[] catalogFile) {
@@ -192,17 +195,18 @@ public final class CheckpointRoundTrip {
     }
   }
 
-  /** How {@code state} and a checkpoint of it differ, or null if they do not. */
-  public static String difference(CatalogState state) {
-    CatalogState checkpoint;
+  /**
+   * How {@code replica} (a state, with its log's id and committed set) and a checkpoint of it
+   * differ, or null if they do not.
+   */
+  public static String difference(Replica<CatalogState> replica) {
+    Replica<CatalogState> checkpoint;
     try {
-      checkpoint =
-          CatalogTestSupport.decodeFullFile(
-              CatalogTestSupport.encodeFullFile(state));
+      checkpoint = CatalogTestSupport.replay(CatalogTestSupport.encodeFullFile(replica));
     } catch (RuntimeException e) {
       return "a checkpoint of the state does not decode: " + e;
     }
-    SortedMap<String, String> replayed = contents(state);
+    SortedMap<String, String> replayed = contents(replica);
     SortedMap<String, String> decoded = contents(checkpoint);
     TreeSet<String> items = new TreeSet<>(replayed.keySet());
     items.addAll(decoded.keySet());
@@ -223,12 +227,13 @@ public final class CheckpointRoundTrip {
             : "");
   }
 
-  /** Everything a checkpoint of {@code file} holds, by item. */
-  static SortedMap<String, String> contents(CatalogState file) {
+  /** Everything a checkpoint of {@code replica} holds, by item. */
+  static SortedMap<String, String> contents(Replica<CatalogState> replica) {
+    CatalogState file = replica.state();
     SortedMap<String, String> items = new TreeMap<>();
-    items.put("catalog uuid", String.valueOf(file.uuid()));
+    items.put("catalog uuid", String.valueOf(replica.logId()));
     items.put("next ids", file.nextNamespaceId() + "/" + file.nextTableId());
-    items.put("committed transactions", fingerprint(file.committedTransactionsBytes()));
+    items.put("committed transactions", fingerprint(replica.committed().bytes()));
     for (Map.Entry<Integer, CatalogState.NsEntry> e : file.namespaceById().entrySet()) {
       CatalogState.NsEntry ns = e.getValue();
       items.put(

@@ -18,92 +18,105 @@
  */
 package org.apache.iceberg.io;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import org.intentlog.CommittedSet;
+import org.intentlog.LogView;
+import org.intentlog.Replay;
+import org.intentlog.Replica;
+import org.intentlog.RuntimeConfig;
+import org.intentlog.fileio.AtomicFileLog;
 import org.intentlog.wire.LogEnvelope;
 
 /**
- * Test-only bridge that exposes the full-file encode/decode cycle for
- * property-based tests in {@code org.apache.iceberg.io.spec}.
- *
- * <p>Lives in {@code org.apache.iceberg.io} so it can access the
- * package-private {@link ProtoCatalogFormat#readInternal} and the
- * package-private {@link ProtoCatalogFormat.Mut} constructor.
+ * Catalog files as bytes, and catalog logs over an {@link InMemoryAtomicFileIO}, for tests here
+ * and in {@code org.apache.iceberg.io.spec}: encoding a state to a file, replaying a file
+ * ({@link CatalogStateMachine}, which is package-private), and decoding its checkpoint and
+ * records.
  */
 public final class CatalogTestSupport {
 
+  /**
+   * The log id of a file encoded from a state alone ({@link #encodeFullFile(CatalogState)}):
+   * fixed, so that the encoding is a function of the state.
+   */
+  public static final UUID LOG_ID = UUID.fromString("01890000-0000-7000-8000-000000000000");
+
   private CatalogTestSupport() {}
 
-  /**
-   * Encodes a {@link CatalogState} to full LCAT wire bytes:
-   * {@code [MAGIC][version][varint-len][checkpoint-bytes]}.
-   *
-   * <p>No appended transaction records are included; the checkpoint already
-   * contains the complete catalog state.
-   */
-  public static byte[] encodeFullFile(CatalogState catalog) {
-    try {
-      ByteArrayOutputStream out = new ByteArrayOutputStream();
+  /** A catalog file holding only a checkpoint of {@code state}, of log {@link #LOG_ID}. */
+  public static byte[] encodeFullFile(CatalogState state) {
+    return encodeFullFile(LOG_ID, CommittedSet.EMPTY, state);
+  }
 
-      // Header: 4-byte magic + 4-byte big-endian format version.
-      out.write(ProtoCatalogFormat.MAGIC);
-      writeBigEndianInt(out, ProtoCatalogFormat.FORMAT_VERSION);
+  /** A catalog file holding only a checkpoint of {@code replica}: its log id, ids and state. */
+  public static byte[] encodeFullFile(Replica<CatalogState> replica) {
+    return encodeFullFile(replica.logId(), replica.committed(), replica.state());
+  }
 
-      // Checkpoint: encode the catalog state using the standard ProtoCodec path.
-      ProtoCatalogFormat.ProtoIdManager idManager = new ProtoCatalogFormat.ProtoIdManager();
-      idManager.setGlobals(catalog.nextNamespaceId(), catalog.nextTableId());
-      // Mut with no pending mutations; we only need it as a CatalogFile.Mut reference.
-      ProtoCatalogFormat.Mut mut = new ProtoCatalogFormat.Mut(catalog);
-      byte[] checkpoint = ProtoCodec.encodeCheckpoint(catalog, mut, idManager);
+  /** A catalog file holding only a checkpoint of {@code state}, with this log id and ids. */
+  public static byte[] encodeFullFile(UUID logId, CommittedSet committed, CatalogState state) {
+    return AtomicFileLog.encode(checkpoint(logId, committed, state), List.of());
+  }
 
-      writeVarint(out, checkpoint.length);
-      out.write(checkpoint);
-
-      return out.toByteArray();
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
-    }
+  /** A checkpoint (log.proto LogCheckpoint) of {@code state}, with this log id and ids. */
+  public static byte[] checkpoint(UUID logId, CommittedSet committed, CatalogState state) {
+    return LogEnvelope.encodeCheckpoint(
+        logId, committed.bytes(), CatalogStateMachine.INSTANCE.encodeCheckpoint(state));
   }
 
   /**
-   * Decodes a full LCAT file (as produced by {@link #encodeFullFile}) back to a
-   * {@link CatalogState}, replaying any appended transaction records.
-   *
-   * <p>The returned file is bound to a stub {@link InputFile} at location
-   * {@code "test://decoded"}.
+   * The catalog a reader replays from {@code file}: its checkpoint, and the records after it. The
+   * replica's tail is the file's length, bound to no object.
    */
-  public static CatalogState decodeFullFile(byte[] bytes) {
-    // Stub InputFile: readInternal stores it as the location reference on the
-    // resulting CatalogState. The location string is not used during decode.
-    InputFile location = new StubInputFile("test://decoded");
-    try {
-      return ProtoCatalogFormat.readInternal(location, new ByteArrayInputStream(bytes), bytes.length);
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
-    }
+  public static Replica<CatalogState> replay(byte[] file) {
+    LogView view = AtomicFileLog.decode(file);
+    Replay.Result<CatalogState.Builder> result =
+        Replay.replay(
+            CatalogStateMachine.INSTANCE, view.checkpoint().orElse(null), view.records(), null);
+    return new Replica<>(
+        result.builder().build(),
+        result.committed().build(),
+        view.tail(),
+        result.intentionRecords(),
+        result.logId());
+  }
+
+  /** The state a reader replays from {@code file}. */
+  public static CatalogState decodeFullFile(byte[] file) {
+    return replay(file).state();
+  }
+
+  /** The checkpoint of {@code file}, with the committed set and log id the envelope holds. */
+  public static LogEnvelope.Checkpoint decodeCheckpointEnvelope(byte[] file) {
+    return LogEnvelope.decodeCheckpoint(AtomicFileLog.decode(file).checkpoint().orElseThrow());
   }
 
   /**
-   * The state the checkpoint of a full LCAT file holds: what replay starts from, before it applies
-   * any record.
+   * The state the checkpoint of {@code file} holds: what replay starts from, before it applies any
+   * record.
    */
-  public static CatalogState.Builder decodeCheckpoint(byte[] bytes) {
-    int[] at = {ProtoCatalogFormat.HEADER_SIZE};
-    int length = readVarint(bytes, at);
-    CatalogState.Builder builder = CatalogState.builder(new StubInputFile("test://decoded"));
-    ProtoCodec.decodeCheckpoint(Arrays.copyOfRange(bytes, at[0], at[0] + length), builder);
-    return builder;
+  public static CatalogState.Builder decodeCheckpoint(byte[] file) {
+    return CatalogStateMachine.INSTANCE.decodeCheckpoint(decodeCheckpointEnvelope(file).state());
   }
 
-  /** The transaction records of a full LCAT file, in log order, without its GC records. */
-  public static List<ProtoCodec.Transaction> decodeRecords(byte[] bytes) {
+  /** The checkpoint of {@code file} alone, as a replica: its log id, committed set and state. */
+  public static Replica<CatalogState> checkpointOf(byte[] file) {
+    LogEnvelope.Checkpoint envelope = decodeCheckpointEnvelope(file);
+    return new Replica<>(
+        decodeCheckpoint(file).build(),
+        CommittedSet.builder().inherit(envelope.committed()).build(),
+        null,
+        0,
+        envelope.logId());
+  }
+
+  /** The transaction records of a catalog file, in log order, without its GC records. */
+  public static List<ProtoCodec.Transaction> decodeRecords(byte[] file) {
     List<ProtoCodec.Transaction> records = new ArrayList<>();
-    for (LogEnvelope.Record record : decodeLogRecords(bytes)) {
+    for (LogEnvelope.Record record : decodeLogRecords(file)) {
       if (!record.isAdvanceHorizon()) {
         records.add(ProtoCodec.decodeTransaction(record.id(), record.intention()));
       }
@@ -111,63 +124,69 @@ public final class CatalogTestSupport {
     return records;
   }
 
-  /** Every record of a full LCAT file, GC records included, in log order. */
-  public static List<LogEnvelope.Record> decodeLogRecords(byte[] bytes) {
-    int[] at = {ProtoCatalogFormat.HEADER_SIZE};
-    int checkpointLength = readVarint(bytes, at);
-    at[0] += checkpointLength;
+  /** Every record of a catalog file, GC records included, in log order. */
+  public static List<LogEnvelope.Record> decodeLogRecords(byte[] file) {
     List<LogEnvelope.Record> records = new ArrayList<>();
-    while (at[0] < bytes.length) {
-      int length = readVarint(bytes, at);
-      records.add(LogEnvelope.decodeRecord(Arrays.copyOfRange(bytes, at[0], at[0] + length)));
-      at[0] += length;
+    for (byte[] record : AtomicFileLog.decode(file).records()) {
+      records.add(LogEnvelope.decodeRecord(record));
     }
     return records;
   }
 
-  // -----------------------------------------------------------------------
-  // Private helpers
-  // -----------------------------------------------------------------------
-
-  /** Reads the varint at {@code at[0]} and advances {@code at[0]} past it. */
-  private static int readVarint(byte[] bytes, int[] at) {
-    int value = 0;
-    for (int shift = 0; ; shift += 7) {
-      byte b = bytes[at[0]++];
-      value |= (b & 0x7F) << shift;
-      if (b >= 0) {
-        return value;
-      }
-    }
+  /**
+   * {@code state} as a read of log {@link #LOG_ID} with no committed ids would find it: to stage
+   * a transaction on ({@link CatalogMutation}) for its intention. It has no tail, so it cannot be
+   * committed.
+   */
+  public static Replica<CatalogState> replicaOf(CatalogState state) {
+    return new Replica<>(state, CommittedSet.EMPTY, null, 0, LOG_ID);
   }
 
-  private static void writeBigEndianInt(ByteArrayOutputStream out, int v) {
-    out.write((v >>> 24) & 0xFF);
-    out.write((v >>> 16) & 0xFF);
-    out.write((v >>> 8) & 0xFF);
-    out.write(v & 0xFF);
+  /** The intention of a transaction staged on {@code state}, by {@code change}. */
+  public static ProtoCodec.CatalogIntention intention(
+      CatalogState state, java.util.function.Consumer<CatalogMutation> change) {
+    CatalogMutation mutation = new CatalogMutation(replicaOf(state));
+    change.accept(mutation);
+    return mutation.intention();
   }
 
-  private static void writeVarint(ByteArrayOutputStream out, int v) {
-    while ((v & ~0x7F) != 0) {
-      out.write((v & 0x7F) | 0x80);
-      v >>>= 7;
-    }
-    out.write(v);
+  /** The catalog in the object at {@code location} of {@code io}, committing by the defaults. */
+  public static CatalogLog log(SupportsAtomicOperations io, String location) {
+    return log(io, location, Map.of());
   }
 
-  private static final class StubInputFile implements InputFile {
-    private final String location;
+  /** The catalog in the object at {@code location} of {@code io}, configured by {@code properties}. */
+  public static CatalogLog log(
+      SupportsAtomicOperations io, String location, Map<String, String> properties) {
+    return log(io, location, LogCatalogProperties.runtimeConfig(properties));
+  }
 
-    StubInputFile(String location) {
-      this.location = location;
-    }
+  /** The catalog in the object at {@code location} of {@code io}, with these commit knobs. */
+  public static CatalogLog log(
+      SupportsAtomicOperations io, String location, int maxAppendCount, long maxAppendSize) {
+    return log(io, location, maxAppendCount, maxAppendSize,
+        LogCatalogProperties.DEFAULT_COMMITTED_RETENTION_MS);
+  }
 
-    @Override public long getLength() { return 0; }
-    @Override public SeekableInputStream newStream() {
-      throw new UnsupportedOperationException("StubInputFile.newStream");
-    }
-    @Override public String location() { return location; }
-    @Override public boolean exists() { return false; }
+  /** The catalog in the object at {@code location} of {@code io}, with these commit knobs. */
+  public static CatalogLog log(
+      SupportsAtomicOperations io, String location, int maxAppendCount, long maxAppendSize,
+      long committedRetentionMs) {
+    return log(io, location, maxAppendCount, maxAppendSize, committedRetentionMs,
+        LogCatalogProperties.DEFAULT_THROTTLE_MIN_WAIT_MS);
+  }
+
+  /** The catalog in the object at {@code location} of {@code io}, with these commit knobs. */
+  public static CatalogLog log(
+      SupportsAtomicOperations io, String location, int maxAppendCount, long maxAppendSize,
+      long committedRetentionMs, long throttleMinWaitMs) {
+    return log(io, location, LogCatalogProperties.runtimeConfig(
+        maxAppendCount, maxAppendSize, committedRetentionMs, throttleMinWaitMs));
+  }
+
+  /** The catalog in the object at {@code location} of {@code io}, committing by {@code config}. */
+  public static CatalogLog log(
+      SupportsAtomicOperations io, String location, RuntimeConfig config) {
+    return new CatalogLog(new AtomicFileLog(io, location), config);
   }
 }

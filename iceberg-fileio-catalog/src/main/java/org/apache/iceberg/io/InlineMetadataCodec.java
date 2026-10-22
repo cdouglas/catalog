@@ -24,7 +24,7 @@ import org.apache.iceberg.TableMetadata;
 
 /**
  * Strategy for encoding and decoding {@link TableMetadata} bytes when stored
- * inline in {@code ProtoCatalogFormat} (the {@code metadata} field of
+ * inline in the catalog (the {@code metadata} field of
  * {@code CreateTableInline}, the {@code full_metadata} oneof case of
  * {@code UpdateTableInline}, and the {@code metadata} field of
  * {@code InlineTable} in the checkpoint).
