@@ -18,9 +18,7 @@
  */
 package org.apache.iceberg.io.spec;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -50,16 +48,14 @@ import org.apache.iceberg.exceptions.CommitStateUnknownException;
 import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
-import org.apache.iceberg.io.AtomicOutputFile;
 import org.apache.iceberg.io.CatalogLog;
 import org.apache.iceberg.io.CatalogMutation;
 import org.apache.iceberg.io.CatalogTestSupport;
-import org.apache.iceberg.io.CheckpointRoundTrip;
 import org.apache.iceberg.io.InMemoryAtomicFileIO;
-import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
-import org.apache.iceberg.io.InMemoryAtomicFileIO.ReadFault;
 import org.apache.iceberg.io.CatalogState;
 import org.apache.iceberg.io.LogCatalogProperties;
+import org.apache.iceberg.io.spec.MultiWriterStorage.ReadFault;
+import org.apache.iceberg.io.spec.MultiWriterStorage.WriteFault;
 import org.intentlog.Replica;
 import org.intentlog.RuntimeConfig;
 
@@ -103,19 +99,29 @@ import org.intentlog.RuntimeConfig;
  * the replaced bytes. With neither faults nor preemption, nothing in a commit fails.
  *
  * <p>{@link #faultyStorageNeverMisreportsACommit} runs the same schedules on storage that fails
- * (see {@link InMemoryAtomicFileIO.Fault}): a write may not land, or land with its reply lost, or
- * land and report a precondition failure, or be throttled before or after it lands; and a read of
- * the catalog during the commit may fail
- * (see {@link InMemoryAtomicFileIO.ReadFault}). A writer must be able to trust a definite answer.
+ * (see {@link MultiWriterStorage.WriteFault}): a write may not land, or land with its reply lost,
+ * or land and report a precondition failure, or be throttled before or after it lands; and a read
+ * of the catalog during the commit may fail (see {@link MultiWriterStorage.ReadFault}). A writer
+ * must be able to trust a definite answer.
  * Iceberg deletes a commit's new files on {@link CommitFailedException} (a {@code
  * CleanableFailure}) and, without strict cleanup, on any failure but {@link
  * CommitStateUnknownException}, so a transaction reported any other way as failed must not have
  * taken effect, and an acknowledged one took effect once. A commit may now retry, so it may write more than once; at most one of its writes changes
  * the state, and that one is checked as above.
+ *
+ * <p>Each property runs on one catalog object ({@link MultiWriterStorage.File}, as before the log
+ * was split from the catalog) and on a shared log with checkpoints apart ({@link
+ * MultiWriterStorage.Memory}). On the shared log a send may also be delayed in flight and land
+ * later ({@link Step#DELIVER}, and at the end of the run): a landing that takes effect must be the
+ * only effect of a commit whose outcome was unknown, and is checked as its write. A compactor may
+ * run between commits ({@link Step#COMPACT}), and the checkpoints it stores must be replays of the
+ * log through them. On both, a copy of any intention record that ever landed is appended again
+ * ({@link Step#DUPLICATE}), whether its original is still a record, folded into a checkpoint, or
+ * past the GC horizon: it must change nothing.
  */
 class TestMultiWriterProperties {
 
-  private static final String CATALOG = "mem:///warehouse/catalog";
+  private static final String CATALOG = MultiWriterStorage.CATALOG;
 
   // Small universes, so writers collide often.
   private static final List<Namespace> NAMESPACES =
@@ -140,8 +146,8 @@ class TestMultiWriterProperties {
       @ForAll boolean gc,
       @ForAll("segmentLimits") int segmentLimit,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(writers, maxAppendCount, appendHeadroom, false, strictVersions, gc, segmentLimit)
-        .execute(schedule);
+    new Run(new MultiWriterStorage.File(strictVersions, segmentLimit), writers, maxAppendCount,
+        appendHeadroom, false, gc).execute(schedule);
   }
 
   @Property(tries = 300)
@@ -153,38 +159,42 @@ class TestMultiWriterProperties {
       @ForAll boolean gc,
       @ForAll("segmentLimits") int segmentLimit,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(writers, maxAppendCount, appendHeadroom, true, strictVersions, gc, segmentLimit)
-        .execute(schedule);
+    new Run(new MultiWriterStorage.File(strictVersions, segmentLimit), writers, maxAppendCount,
+        appendHeadroom, true, gc).execute(schedule);
   }
 
-  // A commit step's operands pick the faults for its first two conditional writes; later writes
-  // succeed. The first fails two times in three, the second one time in three.
-  private static final List<Fault> FIRST_WRITE_FAULTS =
-      List.of(
-          Fault.NONE, Fault.NONE, Fault.NONE, Fault.NONE,
-          Fault.FAIL_BEFORE,
-          Fault.LOST_REPLY, Fault.LOST_REPLY,
-          Fault.LOST_REPLY_RUNTIME,
-          Fault.LANDED_AS_CONFLICT, Fault.LANDED_AS_CONFLICT,
-          Fault.THROTTLED, Fault.LANDED_THROTTLED);
-  private static final List<Fault> SECOND_WRITE_FAULTS =
-      List.of(
-          Fault.NONE, Fault.NONE, Fault.NONE, Fault.NONE,
-          Fault.NONE, Fault.NONE, Fault.NONE,
-          Fault.FAIL_BEFORE, Fault.LOST_REPLY, Fault.LOST_REPLY_RUNTIME, Fault.LANDED_AS_CONFLICT,
-          Fault.LANDED_THROTTLED);
+  @Property(tries = 300)
+  void onASharedLogHistoryIsSerialExecutionOfAcknowledgedTransactions(
+      @ForAll @IntRange(min = 2, max = 4) int writers,
+      @ForAll("maxAppendCounts") int maxAppendCount,
+      @ForAll("appendHeadrooms") long appendHeadroom,
+      @ForAll boolean conditional,
+      @ForAll boolean gc,
+      @ForAll("schedules") List<Cmd> schedule) {
+    new Run(new MultiWriterStorage.Memory(conditional), writers, maxAppendCount, appendHeadroom,
+        false, gc).execute(schedule);
+  }
+
+  @Property(tries = 300)
+  void onASharedLogFaultyStorageNeverMisreportsACommit(
+      @ForAll @IntRange(min = 2, max = 4) int writers,
+      @ForAll("maxAppendCounts") int maxAppendCount,
+      @ForAll("appendHeadrooms") long appendHeadroom,
+      @ForAll boolean conditional,
+      @ForAll boolean gc,
+      @ForAll("schedules") List<Cmd> schedule) {
+    new Run(new MultiWriterStorage.Memory(conditional), writers, maxAppendCount, appendHeadroom,
+        true, gc).execute(schedule);
+  }
 
   /**
    * A commit step's third operand picks a read of the catalog during the commit to fail, two times
-   * in three: one of its first four read requests, which fails outright or breaks mid-stream.
-   * Later reads succeed. Returns the index of the failing read, or -1.
+   * in three: one of its first four read requests, which fails (outright or mid-stream on one
+   * object; on a shared log, outright or served stale). Later reads succeed. Returns the index of
+   * the failing read, or -1.
    */
   private static int failingRead(int c) {
     return c < 4 ? -1 : (c - 4) / 2;
-  }
-
-  private static ReadFault readFault(int c) {
-    return c % 2 == 0 ? ReadFault.FAIL : ReadFault.FAIL_MID_STREAM;
   }
 
   /**
@@ -219,7 +229,8 @@ class TestMultiWriterProperties {
   @Provide
   Arbitrary<List<Cmd>> schedules() {
     Arbitrary<Step> steps = Arbitraries.frequency(
-        Tuple.of(2, Step.BEGIN), Tuple.of(8, Step.OP), Tuple.of(2, Step.COMMIT));
+        Tuple.of(2, Step.BEGIN), Tuple.of(8, Step.OP), Tuple.of(2, Step.COMMIT),
+        Tuple.of(1, Step.DUPLICATE), Tuple.of(1, Step.COMPACT), Tuple.of(1, Step.DELIVER));
     Arbitrary<Integer> small = Arbitraries.integers().between(0, 11);
     return Combinators.combine(
             steps,
@@ -243,7 +254,13 @@ class TestMultiWriterProperties {
   enum Step {
     BEGIN,
     OP,
-    COMMIT
+    COMMIT,
+    /** A copy of an intention record that landed ({@code a} picks it) is appended again. */
+    DUPLICATE,
+    /** A compactor runs, on a log that keeps checkpoints apart. */
+    COMPACT,
+    /** What was delayed in flight lands. */
+    DELIVER
   }
 
   enum OpKind {
@@ -292,9 +309,17 @@ class TestMultiWriterProperties {
       if (step == Step.OP) {
         return String.format("w%d:%s(%d,%d)", writer, op, a, b);
       }
-      return step == Step.COMMIT
-          ? String.format("w%d:COMMIT(%d,%d,%d,%d)", writer, a, b, c, d)
-          : String.format("w%d:%s", writer, step);
+      switch (step) {
+        case COMMIT:
+          return String.format("w%d:COMMIT(%d,%d,%d,%d)", writer, a, b, c, d);
+        case DUPLICATE:
+          return String.format("DUPLICATE(%d)", a);
+        case COMPACT:
+        case DELIVER:
+          return step.toString();
+        default:
+          return String.format("w%d:%s", writer, step);
+      }
     }
   }
 
@@ -542,8 +567,8 @@ class TestMultiWriterProperties {
    * while its own commit runs, not its checks or a preempting commit.
    */
   private static final class Context {
-    final List<Fault> plan;
-    final List<Fault> fired = new ArrayList<>();
+    final List<WriteFault> plan;
+    final List<WriteFault> fired = new ArrayList<>();
     final int failingRead;
     final ReadFault readFault;
     final List<String> readsFailed = new ArrayList<>();
@@ -555,7 +580,8 @@ class TestMultiWriterProperties {
     int requests = 0;
     boolean active = false;
 
-    Context(List<Fault> plan, int failingRead, ReadFault readFault, Writer pending, int preemptAt) {
+    Context(List<WriteFault> plan, int failingRead, ReadFault readFault, Writer pending,
+        int preemptAt) {
       this.plan = plan;
       this.failingRead = failingRead;
       this.readFault = readFault;
@@ -564,12 +590,25 @@ class TestMultiWriterProperties {
     }
 
     boolean faulted() {
-      return fired.stream().anyMatch(f -> f != Fault.NONE) || !readsFailed.isEmpty();
+      return fired.stream().anyMatch(f -> f != WriteFault.NONE) || !readsFailed.isEmpty();
+    }
+  }
+
+  /** A commit whose send was delayed in flight: its copy may land after the commit ended. */
+  private static final class Delayed {
+    final int writer;
+    final List<Op> ops;
+    Outcome outcome = null; // until the commit ends
+    boolean tookEffect = false;
+
+    Delayed(int writer, List<Op> ops) {
+      this.writer = writer;
+      this.ops = ops;
     }
   }
 
   private static final class Run {
-    private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+    private final MultiWriterStorage storage;
     private final RuntimeConfig config;
     private final CatalogLog log;
     private final boolean faults;
@@ -577,11 +616,10 @@ class TestMultiWriterProperties {
     private final Writer[] writers;
     private final StringBuilder trace = new StringBuilder();
     private final Deque<Context> commits = new ArrayDeque<>();
+    // The commits whose sends were delayed, by the record sent; and the one running, if any.
+    private final Map<ByteBuffer, Delayed> delayed = new HashMap<>();
+    private Delayed running = null;
     private int nextValue = 0;
-
-    Run(int writers, int maxAppendCount, long appendHeadroom) {
-      this(writers, maxAppendCount, appendHeadroom, false, false, false, 0);
-    }
 
     /**
      * With {@code gc}, the retention of committed transaction ids is 0: every CAS drops every id
@@ -591,21 +629,19 @@ class TestMultiWriterProperties {
      * S3 Express and Azure Append Blobs cap them, and an append past it fails (Bug 66): the commit
      * compacts, and its outcome is never unknown for it.
      */
-    Run(int writers, int maxAppendCount, long appendHeadroom, boolean faults,
-        boolean strictVersions, boolean gc, int segmentLimit) {
+    Run(MultiWriterStorage storage, int writers, int maxAppendCount, long appendHeadroom,
+        boolean faults, boolean gc) {
+      this.storage = storage;
       this.faults = faults;
       this.gc = gc;
-      if (segmentLimit > 0) {
-        io.limitSegments(segmentLimit);
-      }
-      Statistics.label("segment limit").collect(segmentLimit);
-      CatalogLog seedLog = CatalogTestSupport.log(io, CATALOG);
+      Statistics.label("storage").collect(storage.describe());
+      CatalogLog seedLog = storage.log(LogCatalogProperties.runtimeConfig(Map.of()));
       CatalogMutation seed = new CatalogMutation(seedLog.empty());
       seed.createNamespace(Namespace.of("a"));
       seed.createNamespace(Namespace.of("b"));
       seed.createTable(TableIdentifier.of("a", "t"), "mem:///a/t/seed");
       seed.commit(seedLog);
-      int seedLength = liveBytes().length;
+      int seedLength = storage.liveBytes().length;
       long maxAppendSize =
           appendHeadroom < 0
               ? LogCatalogProperties.DEFAULT_MAX_APPEND_SIZE
@@ -616,34 +652,53 @@ class TestMultiWriterProperties {
               maxAppendSize,
               gc ? 0L : LogCatalogProperties.DEFAULT_COMMITTED_RETENTION_MS,
               0); // retry throttled writes without sleeping
-      this.log = CatalogTestSupport.log(io, CATALOG, config);
+      this.log = storage.log(config);
+      if (storage instanceof MultiWriterStorage.Memory) {
+        // A compactor a second ahead of the writers, with their retention.
+        ((MultiWriterStorage.Memory) storage).compactWith(new RuntimeConfig(
+            config.maxAttempts(), config.maxThrottleAttempts(), 0L, config.committedRetentionMs(),
+            config.compaction(), config.visibilityWait(),
+            () -> System.currentTimeMillis() + 1_000L));
+      }
       this.writers = new Writer[writers];
       for (int i = 0; i < writers; i++) {
         this.writers[i] = new Writer(i);
       }
       trace.append(String.format(
-          "log: maxAppendCount=%d maxAppendSize=%d (seed %d bytes)%s%s%n",
-          maxAppendCount, maxAppendSize, seedLength,
-          strictVersions ? ", strict versions" : "", gc ? ", retention 0" : ""));
+          "log: %s, maxAppendCount=%d maxAppendSize=%d (seed %d bytes)%s%n",
+          storage.describe(), maxAppendCount, maxAppendSize, seedLength,
+          gc ? ", retention 0" : ""));
       Statistics.label("gc").collect(gc);
       trace.append("seed: ").append(View.of(read().state())).append('\n');
-      io.failSupersededReads(strictVersions);
-      io.injectFaults(this::onWrite);
-      io.injectReadFaults(this::onRead);
+      storage.hook(new MultiWriterStorage.Hooks() {
+        @Override
+        public WriteFault beforeWrite(byte[] record) {
+          return onWrite(record);
+        }
+
+        @Override
+        public ReadFault beforeRead() {
+          return onRead();
+        }
+      });
     }
 
-    private Fault onWrite(String location, AtomicOutputFile.Strategy strategy) {
+    private WriteFault onWrite(byte[] record) {
       Context c = commits.peek();
       if (c == null || !c.active) {
-        return Fault.NONE;
+        return WriteFault.NONE;
       }
       request(c);
-      Fault fault = c.fired.size() < c.plan.size() ? c.plan.get(c.fired.size()) : Fault.NONE;
+      WriteFault fault =
+          c.fired.size() < c.plan.size() ? c.plan.get(c.fired.size()) : WriteFault.NONE;
       c.fired.add(fault);
+      if (fault == WriteFault.DELAYED && record != null) {
+        delayed.put(ByteBuffer.wrap(record), running);
+      }
       return fault;
     }
 
-    private ReadFault onRead(String location) {
+    private ReadFault onRead() {
       Context c = commits.peek();
       if (c == null || !c.active) {
         return ReadFault.NONE;
@@ -666,10 +721,12 @@ class TestMultiWriterProperties {
       c.pending = null;
       c.preemptedAt = request;
       c.active = false;
-      int start = io.history().size();
+      int start = storage.writes();
+      Delayed was = running;
       trace.append(String.format("  preempted at request #%d by%n", request));
       commit(other, List.of(), -1, ReadFault.NONE, null, -1);
-      c.nested.add(new int[] {start, io.history().size()});
+      running = was;
+      c.nested.add(new int[] {start, storage.writes()});
       c.active = true;
     }
 
@@ -685,7 +742,7 @@ class TestMultiWriterProperties {
           case BEGIN:
             if (w.snapshot == null) {
               w.snapshot = read();
-              w.snapshotBytes = liveBytes();
+              w.snapshotBytes = storage.liveBytes();
               w.ops = new ArrayList<>();
               trace.append(String.format("w%d begin%n", w.id));
             }
@@ -713,6 +770,18 @@ class TestMultiWriterProperties {
               commit(w, cmd, other);
             }
             break;
+          case DUPLICATE:
+            duplicate(cmd.a);
+            break;
+          case COMPACT:
+            if (storage.compact()) {
+              trace.append("compacted\n");
+              Statistics.label("steps").collect("compact");
+            }
+            break;
+          case DELIVER:
+            deliver();
+            break;
           default:
             throw new IllegalStateException("Unknown step " + cmd.step);
         }
@@ -722,13 +791,66 @@ class TestMultiWriterProperties {
           commit(w, List.of(), -1, ReadFault.NONE, null, -1);
         }
       }
+      // The drain: what is still in flight lands, and is judged as it does.
+      deliver();
+      List<String> violations = storage.checkpointViolations();
+      check(violations.isEmpty(), "checkpoints: %s", violations);
+    }
+
+    /** A copy of a record that landed is appended again: it must change nothing. */
+    private void duplicate(int pick) {
+      List<byte[]> landed = storage.landedRecords();
+      if (landed.isEmpty()) {
+        return;
+      }
+      Replica<CatalogState> before = read();
+      if (!storage.appendCopy(landed.get(pick % landed.size()))) {
+        return;
+      }
+      Replica<CatalogState> after = read();
+      trace.append(String.format("duplicate of record #%d%n", pick % landed.size()));
+      check(View.of(after.state()).equals(View.of(before.state())),
+          "a copy of a record applied:%n  before: %s%n  after:  %s",
+          View.of(before.state()), View.of(after.state()));
+      check(Arrays.equals(after.committed().bytes(), before.committed().bytes()),
+          "a copy of a record changed the committed set or its horizon");
+      Statistics.label("steps").collect("duplicate");
+    }
+
+    /**
+     * Lands what was delayed. A landing that takes effect is its commit's write, checked as one:
+     * the commit's outcome was unknown, and nothing else of it took effect.
+     */
+    private void deliver() {
+      for (MultiWriterStorage.Write write : storage.deliverDelayed()) {
+        Delayed d = delayed.get(ByteBuffer.wrap(write.record));
+        check(d != null && d.outcome != null, "a delayed record of no commit that ended landed");
+        boolean effective =
+            !View.of(parse(write.after)).equals(View.of(parse(write.before)));
+        trace.append(String.format("delayed w%d record landed%s%n", d.writer,
+            effective ? " and took effect" : ""));
+        Statistics.label("delayed landing").collect(
+            (effective ? "took effect" : "changed nothing") + ", outcome " + d.outcome);
+        String difference = storage.difference(write);
+        check(difference == null, "a checkpoint of the delayed write differs from it: %s",
+            difference);
+        if (effective) {
+          check(d.outcome == Outcome.UNKNOWN,
+              "a commit reported %s took effect when its delayed send landed", d.outcome);
+          check(!d.tookEffect, "one commit changed the state twice (a delayed send landed)");
+          d.tookEffect = true;
+          checkIntegrity(View.of(parse(write.after)));
+          checkTransition(write, d.ops);
+        }
+      }
     }
 
     /** Commits {@code w}'s transaction with the faults {@code cmd} picks, if storage is faulty. */
     private void commit(Writer w, Cmd cmd, Writer preempting) {
       if (faults) {
-        commit(w, List.of(FIRST_WRITE_FAULTS.get(cmd.a % 12), SECOND_WRITE_FAULTS.get(cmd.b % 12)),
-            failingRead(cmd.c), readFault(cmd.c), preempting, preemptAt(cmd.d));
+        commit(w, List.of(storage.firstWriteFaults().get(cmd.a % 12),
+                storage.secondWriteFaults().get(cmd.b % 12)),
+            failingRead(cmd.c), storage.readFault(cmd.c), preempting, preemptAt(cmd.d));
       } else {
         commit(w, List.of(), -1, ReadFault.NONE, preempting, preemptAt(cmd.d));
       }
@@ -780,15 +902,17 @@ class TestMultiWriterProperties {
      * readFault} says. If {@code preempting} is not null, that writer commits just before storage
      * request number {@code preemptAt} of this commit.
      */
-    private void commit(Writer w, List<Fault> plan, int failingRead, ReadFault readFault,
+    private void commit(Writer w, List<WriteFault> plan, int failingRead, ReadFault readFault,
         Writer preempting, int preemptAt) {
       List<Op> ops = w.ops;
-      byte[] liveBefore = liveBytes();
-      int mark = io.history().size();
-      int lostAppends = io.rejected(AtomicOutputFile.Strategy.APPEND);
-      int lostCas = io.rejected(AtomicOutputFile.Strategy.CAS);
+      byte[] liveBefore = storage.liveBytes();
+      int mark = storage.writes();
+      int lostAppends = storage.rejected("APPEND");
+      int lostCas = storage.rejected("CAS");
       Context ctx = new Context(plan, failingRead, readFault, preempting, preemptAt);
-      List<Fault> fired = ctx.fired;
+      Delayed self = new Delayed(w.id, ops);
+      running = self;
+      List<WriteFault> fired = ctx.fired;
       List<String> readsFailed = ctx.readsFailed;
       commits.push(ctx);
       Outcome outcome;
@@ -813,42 +937,42 @@ class TestMultiWriterProperties {
       } finally {
         ctx.active = false;
         commits.pop();
+        running = null;
       }
-      // This commit's writes: those since it started, less those of the commit that preempted it.
-      List<InMemoryAtomicFileIO.Write> writes = new ArrayList<>();
-      List<InMemoryAtomicFileIO.Write> history = io.history();
-      for (int i = mark; i < history.size(); i++) {
-        final int at = i;
-        if (ctx.nested.stream().noneMatch(r -> at >= r[0] && at < r[1])) {
+      // This commit's writes: those since it started, less those of the commit that preempted it,
+      // and less the GC records a compaction appended once it landed.
+      List<MultiWriterStorage.Write> writes = new ArrayList<>();
+      List<MultiWriterStorage.Write> history = storage.writes(mark);
+      for (int i = 0; i < history.size(); i++) {
+        final int at = mark + i;
+        if (!history.get(i).gc() && ctx.nested.stream().noneMatch(r -> at >= r[0] && at < r[1])) {
           writes.add(history.get(i));
         }
       }
-      List<InMemoryAtomicFileIO.Write> effective = new ArrayList<>();
-      for (InMemoryAtomicFileIO.Write wr : writes) {
-        View after = View.of(parse(wr.after()));
-        check(after.equals(View.of(parse(wr.before()))) || effective.isEmpty(),
+      List<MultiWriterStorage.Write> effective = new ArrayList<>();
+      for (MultiWriterStorage.Write wr : writes) {
+        View after = View.of(parse(wr.after));
+        check(after.equals(View.of(parse(wr.before))) || effective.isEmpty(),
             "one commit changed the state twice");
-        if (!after.equals(View.of(parse(wr.before())))) {
+        if (!after.equals(View.of(parse(wr.before)))) {
           effective.add(wr);
         }
         checkIntegrity(after);
-        String difference = CheckpointRoundTrip.difference(wr);
+        String difference = storage.difference(wr);
         check(difference == null, "a checkpoint of the %s write differs from it: %s",
-            wr.strategy(), difference);
+            wr.kind, difference);
       }
       // The write the transaction's effects are checked on: the one that changed the state, else
       // (for a transaction without effects) the first.
-      InMemoryAtomicFileIO.Write write =
+      MultiWriterStorage.Write write =
           !effective.isEmpty() ? effective.get(0) : writes.isEmpty() ? null : writes.get(0);
       String faultsFired =
-          (fired.stream().anyMatch(f -> f != Fault.NONE) ? " after faults " + fired : "")
+          (fired.stream().anyMatch(f -> f != WriteFault.NONE) ? " after faults " + fired : "")
               + (readsFailed.isEmpty() ? "" : " after " + readsFailed.get(0));
       String path =
-          (io.rejected(AtomicOutputFile.Strategy.CAS) > lostCas ? "lost CAS race, " : "")
-              + (io.rejected(AtomicOutputFile.Strategy.APPEND) > lostAppends
-                  ? "lost append race, "
-                  : "")
-              + (write == null ? "no write" : write.strategy() + rebased(w, write));
+          (storage.rejected("CAS") > lostCas ? "lost CAS race, " : "")
+              + (storage.rejected("APPEND") > lostAppends ? "lost append race, " : "")
+              + (write == null ? "no write" : write.kind + rebased(w, write));
       trace.append(String.format("w%d commit -> %s%s via %s%s%n",
           w.id, outcome, reason, path, faultsFired));
       if (ctx.preemptedAt >= 0) {
@@ -889,14 +1013,16 @@ class TestMultiWriterProperties {
         check(effective.isEmpty(),
             "commit reported %s%s but took effect: %s -> %s",
             outcome, reason,
-            effective.isEmpty() ? null : View.of(parse(effective.get(0).before())),
-            effective.isEmpty() ? null : View.of(parse(effective.get(0).after())));
+            effective.isEmpty() ? null : View.of(parse(effective.get(0).before)),
+            effective.isEmpty() ? null : View.of(parse(effective.get(0).after)));
         boolean spurious = reexecutionViolation(parse(liveBefore), ops) == null;
         Statistics.label("outcome").collect(
             (outcome == Outcome.FAILED ? "failed"
                 : write == null ? "rejected by CAS conflict" : "rejected at replay")
                 + (spurious ? ", spurious" : ""));
       }
+      self.outcome = outcome;
+      self.tookEffect = !effective.isEmpty();
       w.snapshot = null;
       w.snapshotBytes = null;
       w.ops = null;
@@ -907,13 +1033,13 @@ class TestMultiWriterProperties {
      * transaction is valid on the former, re-executes serially to the latter, and changed exactly
      * its own effects.
      */
-    private void checkTransition(InMemoryAtomicFileIO.Write write, List<Op> ops) {
-      CatalogState pre = parse(write.before());
-      View post = View.of(parse(write.after()));
+    private void checkTransition(MultiWriterStorage.Write write, List<Op> ops) {
+      CatalogState pre = parse(write.before);
+      View post = View.of(parse(write.after));
       String invalid = reexecutionViolation(pre, ops);
       check(invalid == null, "acknowledged transaction is invalid on the state it replaced: %s",
           invalid);
-      InMemoryAtomicFileIO alone = scratch(write.before());
+      InMemoryAtomicFileIO alone = scratch(write.before);
       CatalogLog aloneLog = CatalogTestSupport.log(alone, CATALOG, config);
       View serial = View.of(mut(aloneLog.read(), ops).commit(aloneLog).state());
       check(serial.equals(post), "serial re-execution differs:%n  serial: %s%n  actual: %s",
@@ -934,9 +1060,8 @@ class TestMultiWriterProperties {
       return stages(state, ops) ? null : "staging " + ops + " on a fresh read fails";
     }
 
-    private String rebased(Writer w, InMemoryAtomicFileIO.Write write) {
-      return write.strategy() == AtomicOutputFile.Strategy.CAS
-              && !Arrays.equals(write.before(), w.snapshotBytes)
+    private String rebased(Writer w, MultiWriterStorage.Write write) {
+      return write.replace() && !Arrays.equals(write.before, w.snapshotBytes)
           ? " of a newer version"
           : "";
     }
@@ -975,14 +1100,6 @@ class TestMultiWriterProperties {
 
     private Replica<CatalogState> read() {
       return log.read();
-    }
-
-    private byte[] liveBytes() {
-      try (InputStream in = io.newInputFile(CATALOG).newStream()) {
-        return in.readAllBytes();
-      } catch (IOException e) {
-        throw new UncheckedIOException(e);
-      }
     }
 
     private InMemoryAtomicFileIO scratch(byte[] bytes) {

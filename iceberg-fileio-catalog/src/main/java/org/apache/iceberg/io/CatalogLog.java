@@ -99,6 +99,18 @@ public final class CatalogLog {
     }
   }
 
+  /**
+   * Compacts a log that keeps its checkpoints apart from its records (a GC record, a checkpoint
+   * through it, a trim), as a background compactor would; a writer whose commit lands compacts by
+   * the commit knobs anyway. Returns the catalog it checkpointed.
+   *
+   * @throws UnsupportedOperationException for a log that replaces itself, which compacts as it
+   *     commits
+   */
+  public Replica<CatalogState> compact() {
+    return runtime.compact();
+  }
+
   @Override
   public String toString() {
     return log.toString();

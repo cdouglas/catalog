@@ -91,9 +91,19 @@ public final class CheckpointRoundTrip {
    * checkpoint and a replay of the version it replaced differ ({@link #checkpointIsReplay}).
    */
   public static String difference(InMemoryAtomicFileIO.Write write) {
-    String difference = difference(write.after());
-    if (difference == null && write.strategy() == AtomicOutputFile.Strategy.CAS) {
-      difference = checkpointIsReplay(write.before(), write.after());
+    return difference(write.strategy() == AtomicOutputFile.Strategy.CAS, write.before(),
+        write.after());
+  }
+
+  /**
+   * {@link #difference(byte[])} of the catalog file {@code after}, a write wrote over {@code
+   * before}; for a compaction ({@code replace}), also how its checkpoint and a replay of {@code
+   * before} differ.
+   */
+  public static String difference(boolean replace, byte[] before, byte[] after) {
+    String difference = difference(after);
+    if (difference == null && replace) {
+      difference = checkpointIsReplay(before, after);
     }
     return difference;
   }
@@ -104,7 +114,7 @@ public final class CheckpointRoundTrip {
    * checkpoints the state it replayed of the version it replaces, and nothing else: its clock
    * shows only in the GC record that follows (I11).
    */
-  static String checkpointIsReplay(byte[] before, byte[] after) {
+  public static String checkpointIsReplay(byte[] before, byte[] after) {
     if (before == null || before.length == 0) {
       return null;
     }

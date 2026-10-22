@@ -46,6 +46,13 @@
       <version>${project.version}</version>
     </dependency>
     <dependency>
+      <!-- InMemorySharedLog, the shared log the catalog's tests run on besides one object. -->
+      <groupId>org.intentlog</groupId>
+      <artifactId>intentlog-memory</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
       <!-- InMemoryAtomicFileIO, the fault-injecting store the local suites and fuzzers run on -->
       <groupId>org.intentlog</groupId>
       <artifactId>intentlog-fileio</artifactId>
