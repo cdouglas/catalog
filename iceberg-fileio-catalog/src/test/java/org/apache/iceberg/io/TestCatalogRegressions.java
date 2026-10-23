@@ -3527,8 +3527,18 @@ public class TestCatalogRegressions {
     @org.junit.jupiter.params.provider.EnumSource(
         value = LocalCatalogMode.class, names = {"APPEND_TM", "APPEND_ML", "CAS_ML"})
     void readLikeAPointerTables(LocalCatalogMode mode) throws IOException {
-      Map<String, List<String>> inline = metadataTables(mode);
-      Map<String, List<String>> pointer = metadataTables(LocalCatalogMode.APPEND);
+      // latest_sequence_number derives from the order of timestamps, which a step of the wall
+      // clock changes (ClockSteps). The runs take a fraction of a second: run them again then.
+      ClockSteps clock = new ClockSteps();
+      Map<String, List<String>> inline = metadataTables(mode, clock);
+      Map<String, List<String>> pointer = metadataTables(LocalCatalogMode.APPEND, clock);
+      for (int attempt = 1; clock.stepped() && attempt < 5; attempt++) {
+        clock = new ClockSteps();
+        inline = metadataTables(mode, clock);
+        pointer = metadataTables(LocalCatalogMode.APPEND, clock);
+      }
+      org.junit.jupiter.api.Assumptions.assumeFalse(
+          clock.stepped(), "the wall clock stepped during each of 5 attempts");
       assertThat(inline.keySet()).isEqualTo(pointer.keySet());
       for (String type : pointer.keySet()) {
         assertThat(inline.get(type)).as(type).isEqualTo(pointer.get(type));
@@ -3565,17 +3575,22 @@ public class TestCatalogRegressions {
 
     /**
      * Each metadata table's rows, as text, after three appends and a property change: snapshot
-     * ids, timestamps and file names, which differ between catalogs, are left out.
+     * ids, timestamps and file names, which differ between catalogs, are left out. {@code clock}
+     * looks at the wall clock after each commit.
      */
-    private Map<String, List<String>> metadataTables(LocalCatalogMode mode) throws IOException {
+    private Map<String, List<String>> metadataTables(LocalCatalogMode mode, ClockSteps clock)
+        throws IOException {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       FileIOCatalog catalog = catalog(io, mode);
       catalog.createNamespace(mixedNs);
       Table table = catalog.createTable(mixed, intSchema);
+      clock.stepped();
       for (String name : List.of("a", "b", "c")) {
         table.newFastAppend().appendFile(dataFile(name)).commit();
+        clock.stepped();
       }
       table.updateProperties().set("k", "v").commit();
+      clock.stepped();
       Map<String, List<String>> rows = new java.util.TreeMap<>();
       for (org.apache.iceberg.MetadataTableType type : org.apache.iceberg.MetadataTableType.values()) {
         Table metadata = catalog.loadTable(

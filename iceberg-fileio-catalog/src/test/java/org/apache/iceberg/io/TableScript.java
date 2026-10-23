@@ -505,8 +505,11 @@ final class TableScript {
           target.manageSnapshots().cherrypick(pick(off, cmd.b).snapshotId()).commit();
           break;
         case EXPIRE_SNAPSHOTS:
+          // Every snapshot is old enough: the wall clock is not consulted, since after a step back
+          // "now" would precede the snapshots stamped just before the step (ClockSteps), and two
+          // runs of one schedule would expire different snapshots.
           target.expireSnapshots()
-              .expireOlderThan(System.currentTimeMillis() + 1)
+              .expireOlderThan(Long.MAX_VALUE)
               .retainLast(cmd.b % 3 + 1)
               .cleanExpiredFiles(false)
               .cleanExpiredMetadata(cmd.c % 2 == 0)

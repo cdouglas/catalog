@@ -61,6 +61,8 @@ import org.apache.iceberg.catalog.Namespace;
  * snapshot log, and the live data and delete files of every ref with their partitions, sequence
  * numbers and row ids. Snapshot ids, UUIDs, timestamps and file names of manifests and metadata
  * differ between the two runs, so snapshots are compared by position and manifests by content.
+ * Once the wall clock steps during a try, the metadata-table columns Iceberg derives from the
+ * order of timestamps ({@link ClockSteps#CLOCK_ORDERED}) are not compared for the rest of it.
  */
 class TestInlineDifferentialProperties {
 
@@ -77,6 +79,7 @@ class TestInlineDifferentialProperties {
       @ForAll boolean otherGzip,
       @ForAll("schedules") List<TableScript.Cmd> schedule) {
     Map<String, String> inlineProperties = properties(maxUpdateSize, gzip);
+    ClockSteps clock = new ClockSteps();
     InMemoryAtomicFileIO pointerIo = new InMemoryAtomicFileIO();
     InMemoryAtomicFileIO inlineIo = new InMemoryAtomicFileIO();
     LogCatalog pointer = LocalCatalogMode.APPEND.catalog(pointerIo, WAREHOUSE, "c", Map.of());
@@ -96,9 +99,10 @@ class TestInlineDifferentialProperties {
         new TableScript.Runner(inline,
             otherMode.catalog(inlineIo, WAREHOUSE, "c", properties(maxUpdateSize, otherGzip)),
             formatVersion, partitioned, trace);
-    compare(pointerIo, inlineIo, trace);
+    compare(pointerIo, inlineIo, trace, clockStepped(clock, trace));
     for (List<TableScript.Cmd> step : TableScript.steps(schedule)) {
       RuntimeException pointerRejected = p.run(step);
+      clock.stepped();
       RuntimeException inlineRejected = i.run(step);
       if ((pointerRejected == null) != (inlineRejected == null)) {
         throw new AssertionError(String.format(
@@ -109,8 +113,10 @@ class TestInlineDifferentialProperties {
       }
       Statistics.label("step")
           .collect(step.get(0).kind + (pointerRejected == null ? "" : " rejected"));
-      compare(pointerIo, inlineIo, trace);
+      compare(pointerIo, inlineIo, trace, clockStepped(clock, trace));
     }
+    Statistics.label("wall clock")
+        .collect(clock.stepped() ? "stepped: clock-ordered columns not compared" : "steady");
     // Every catalog file either catalog wrote conforms to catalog.proto and survives a checkpoint.
     CheckpointRoundTrip.assertEveryWrite(pointerIo);
     CheckpointRoundTrip.assertEveryWrite(inlineIo);
@@ -142,19 +148,36 @@ class TestInlineDifferentialProperties {
     return TableScript.schedules();
   }
 
-  /** Reads the tables from each storage with a fresh pointer-mode reader and compares. */
+  /** Whether the wall clock has stepped in this try; notes the first step in the trace. */
+  private static boolean clockStepped(ClockSteps clock, StringBuilder trace) {
+    boolean noted = trace.indexOf(CLOCK_STEPPED) >= 0;
+    boolean stepped = clock.stepped();
+    if (stepped && !noted) {
+      trace.append(CLOCK_STEPPED).append('\n');
+    }
+    return stepped;
+  }
+
+  private static final String CLOCK_STEPPED =
+      "(the wall clock stepped: clock-ordered metadata columns are not compared from here on)";
+
+  /**
+   * Reads the tables from each storage with a fresh pointer-mode reader and compares, all but the
+   * clock-ordered metadata columns if the wall clock has stepped.
+   */
   private static void compare(
-      InMemoryAtomicFileIO pointerIo, InMemoryAtomicFileIO inlineIo, StringBuilder trace) {
+      InMemoryAtomicFileIO pointerIo, InMemoryAtomicFileIO inlineIo, StringBuilder trace,
+      boolean clockStepped) {
     LogCatalog pointerReader =
         LocalCatalogMode.APPEND.catalog(pointerIo, WAREHOUSE, "c", Map.of());
     LogCatalog inlineReader =
         LocalCatalogMode.APPEND.catalog(inlineIo, WAREHOUSE, "c", Map.of());
-    Map<String, String> expected = view(pointerReader.loadTable(TableScript.ID));
+    Map<String, String> expected = view(pointerReader.loadTable(TableScript.ID), clockStepped);
     Table inlineTable = inlineReader.loadTable(TableScript.ID);
-    Map<String, String> actual = view(inlineTable);
-    view(pointerReader.loadTable(TableScript.OTHER))
+    Map<String, String> actual = view(inlineTable, clockStepped);
+    view(pointerReader.loadTable(TableScript.OTHER), clockStepped)
         .forEach((key, value) -> expected.put(TableScript.OTHER.name() + ": " + key, value));
-    view(inlineReader.loadTable(TableScript.OTHER))
+    view(inlineReader.loadTable(TableScript.OTHER), clockStepped)
         .forEach((key, value) -> actual.put(TableScript.OTHER.name() + ": " + key, value));
     List<String> differences = new ArrayList<>();
     java.util.Set<String> keys = new java.util.TreeSet<>(expected.keySet());
@@ -177,7 +200,7 @@ class TestInlineDifferentialProperties {
   }
 
   /** What a reader sees of {@code table}, by item, with snapshots by position. */
-  private static Map<String, String> view(Table table) {
+  private static Map<String, String> view(Table table, boolean clockStepped) {
     TableMetadata metadata = ((HasTableOperations) table).operations().current();
     Map<String, String> items = new TreeMap<>();
     List<Snapshot> snapshots = metadata.snapshots();
@@ -244,7 +267,8 @@ class TestInlineDifferentialProperties {
         .collect(java.util.stream.Collectors.toList()).toString());
     for (org.apache.iceberg.MetadataTableType type : org.apache.iceberg.MetadataTableType.values()) {
       if (type != org.apache.iceberg.MetadataTableType.POSITION_DELETES) {
-        items.put("metadata table " + type, metadataTable(table, type, position));
+        items.put("metadata table " + type,
+            metadataTable(table, type, position, clockStepped));
       }
     }
     return items;
@@ -252,10 +276,12 @@ class TestInlineDifferentialProperties {
 
   /**
    * The rows of {@code table}'s metadata table {@code type}, sorted, with snapshot ids as
-   * positions and what differs between the two runs (times, file names, sizes) left out.
+   * positions and what differs between the two runs (times, file names, sizes) left out: with the
+   * clock-ordered columns, if the wall clock stepped.
    */
   private static String metadataTable(
-      Table table, org.apache.iceberg.MetadataTableType type, Map<Long, Integer> position) {
+      Table table, org.apache.iceberg.MetadataTableType type, Map<Long, Integer> position,
+      boolean clockStepped) {
     Table metadata = org.apache.iceberg.MetadataTableUtils.createMetadataTableInstance(table, type);
     List<String> rows = new ArrayList<>();
     try (org.apache.iceberg.io.CloseableIterable<FileScanTask> tasks =
@@ -263,7 +289,8 @@ class TestInlineDifferentialProperties {
       for (FileScanTask task : tasks) {
         try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.StructLike> data =
             task.asDataTask().rows()) {
-          data.forEach(row -> rows.add(describe(metadata.schema().asStruct(), row, position)));
+          data.forEach(row -> rows.add(
+              describe(metadata.schema().asStruct(), row, position, clockStepped)));
         }
       }
     } catch (IOException e) {
@@ -277,14 +304,16 @@ class TestInlineDifferentialProperties {
 
   private static String describe(
       org.apache.iceberg.types.Types.StructType type, org.apache.iceberg.StructLike row,
-      Map<Long, Integer> position) {
+      Map<Long, Integer> position, boolean clockStepped) {
     List<String> fields = new ArrayList<>();
     for (int i = 0; i < type.fields().size(); i++) {
       org.apache.iceberg.types.Types.NestedField field = type.fields().get(i);
       String name = field.name();
       Object value = row.get(i, Object.class);
       String shown;
-      if (value != null && (name.endsWith("snapshot_id") || name.equals("parent_id"))) {
+      if (clockStepped && ClockSteps.CLOCK_ORDERED.contains(name)) {
+        shown = "*";
+      } else if (value != null && (name.endsWith("snapshot_id") || name.equals("parent_id"))) {
         shown = "#" + position.get((Long) value);
       } else if (name.contains("timestamp") || name.contains("committed_at")
           || name.contains("made_current_at") || name.contains("path") || name.equals("file")
@@ -294,13 +323,13 @@ class TestInlineDifferentialProperties {
         shown = "*";
       } else if (value instanceof org.apache.iceberg.StructLike && field.type().isStructType()) {
         shown = "{" + describe(field.type().asStructType(), (org.apache.iceberg.StructLike) value,
-            position) + "}";
+            position, clockStepped) + "}";
       } else if (value instanceof List && field.type().isListType()
           && field.type().asListType().elementType().isStructType()) {
         List<String> elements = new ArrayList<>();
         for (Object element : (List<?>) value) {
           elements.add("{" + describe(field.type().asListType().elementType().asStructType(),
-              (org.apache.iceberg.StructLike) element, position) + "}");
+              (org.apache.iceberg.StructLike) element, position, clockStepped) + "}");
         }
         shown = elements.toString();
       } else if (value instanceof ByteBuffer) {
