@@ -59,7 +59,9 @@ import org.intentlog.wire.ProtoWire;
  * Azure Append Blob's position); a replace writes a new object conditioned on the version it
  * replaces (an ETag or generation), or on its absence. Every replace writes a checkpoint and the
  * records after it in one write, so each record follows exactly one checkpoint. A store without
- * append (GCS, or a store whose {@code supportsAppend()} is false) commits by replace only.
+ * append (GCS, or a store whose {@code supportsAppend()} is false) commits by replace only, and a
+ * record too large for one append to the store ({@code maxAppendBytes}, less the record's length
+ * prefix: {@link Capabilities#maxRecordBytes}) goes in a replace.
  */
 public final class AtomicFileLog implements SharedLog {
 
@@ -69,10 +71,15 @@ public final class AtomicFileLog implements SharedLog {
 
   private final SupportsAtomicOperations io;
   private final String location;
+  private final long maxRecordBytes;
 
   public AtomicFileLog(SupportsAtomicOperations io, String location) {
     this.io = io;
     this.location = location;
+    // An append writes the record after its length, a varint no longer than the store's limit's
+    long maxAppend = io.maxAppendBytes(location);
+    int prefix = ProtoWire.varintSize((int) Math.min(maxAppend, Integer.MAX_VALUE));
+    this.maxRecordBytes = maxAppend > 0 ? Math.max(1L, maxAppend - prefix) : 0L;
   }
 
   /** The object's location. */
@@ -93,7 +100,7 @@ public final class AtomicFileLog implements SharedLog {
 
   @Override
   public Capabilities capabilities() {
-    return new Capabilities(io.supportsAppend(), true, true, false, true, 0L);
+    return new Capabilities(io.supportsAppend(), true, true, false, true, maxRecordBytes);
   }
 
   @Override

@@ -35,7 +35,12 @@ public class CommitRejectedException extends RuntimeException {
     /** It ran out of attempts, with no write that may have landed. */
     EXHAUSTED,
     /** A write failed before anything was sent, with no earlier write that may have landed. */
-    NOT_SENT
+    NOT_SENT,
+    /**
+     * Its record is larger than one append stores ({@link Capabilities#maxRecordBytes}), on a log
+     * that cannot replace itself. Nothing was sent.
+     */
+    TOO_LARGE
   }
 
   private final Reason reason;

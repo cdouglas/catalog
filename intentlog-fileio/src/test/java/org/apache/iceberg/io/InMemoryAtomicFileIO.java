@@ -170,6 +170,7 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
   private volatile boolean failSupersededReads = false;
   private volatile int maxSegments = 0;
   private volatile Supplier<RuntimeException> segmentLimitError = null;
+  private volatile int appendByteLimit = 0;
   private final Map<ReadFault, Integer> injectedReads = Maps.newEnumMap(ReadFault.class);
 
   public InMemoryAtomicFileIO() {
@@ -243,6 +244,22 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
   public void limitSegments(int max, Supplier<RuntimeException> error) {
     this.maxSegments = max;
     this.segmentLimitError = error;
+  }
+
+  /**
+   * Caps the bytes one append writes at {@code max}, and reports the cap ({@link
+   * #maxAppendBytes}), as Azure caps an {@code AppendBlock} (4 MiB before service version
+   * 2022-11-02, 100 MiB since) and the ADLS FileIO reports it. A larger append fails, before
+   * landing, with the raw error the ADLS FileIO lets out (a 413 from the service); a CAS is not
+   * capped, since the ADLS FileIO writes one in blocks of the cap. 0 removes the cap.
+   */
+  public void limitAppendBytes(int max) {
+    this.appendByteLimit = max;
+  }
+
+  @Override
+  public long maxAppendBytes(String location) {
+    return appendByteLimit;
   }
 
   /** Fails read requests as {@code plan} chooses; {@link ReadFault#NONE} for all by default. */
@@ -482,6 +499,11 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
         if (fault == Fault.THROTTLED) {
           String msg = "injected: " + strategy + " at " + location + " throttled";
           throw new StorageThrottleException(msg, new IOException(msg));
+        }
+        if (strategy == Strategy.APPEND && appendByteLimit > 0 && data.length > appendByteLimit) {
+          throw new UncheckedIOException(new IOException(String.format(
+              "injected: an append of %d bytes at %s is larger than the store allows (%d)",
+              data.length, location, appendByteLimit)));
         }
         Version live = objects.get(location);
         long expectedGen = expected == null ? 0 : expected.generation;

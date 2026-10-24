@@ -171,6 +171,17 @@ class TestLogRuntime {
   }
 
   @Test
+  void aRecordLargerThanAnAppendStoresIsReplaced() { // (Bug 71)
+    Replica<Map<String, Integer>> base = created();
+    log.limitRecordBytes(1);
+    log.calls.clear();
+    Replica<Map<String, Integer>> r = bump(base, "a");
+    assertThat(r.state()).containsEntry("a", 1);
+    assertThat(r.intentionRecords()).isEqualTo(1); // compacted: only its own record follows
+    assertThat(log.calls).containsExactly("replace", "readThrough");
+  }
+
+  @Test
   void aReplaceThatLostToACompatibleChangeRebases() { // [Rebase]
     runtime = runtime(0, NO_GC); // replace on every commit
     Replica<Map<String, Integer>> base = created();

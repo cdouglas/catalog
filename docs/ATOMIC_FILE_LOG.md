@@ -115,6 +115,9 @@ it can, and replaces the object when it must:
 - the FileIO cannot append (`supportsAppend()` is false: `GCSFileIO`);
 - an append was refused as full (`SegmentLimitException`): the object holds as
   many writes as the store allows, whatever the thresholds say (Bug 66);
+- the record is larger than one append to the store writes
+  (`maxAppendBytes`, less the record's length prefix; ADLS's `AppendBlock`
+  limit), whatever the thresholds say (Bug 71);
 - or the compaction policy says the object is due: the read it staged on holds
   at least `max.append.count` intention records, or its record would take the
   object past `max.append.size` bytes.
@@ -172,6 +175,6 @@ inside the envelope are gated by `LogCheckpoint.min_reader_version`
 | File | Purpose |
 |------|---------|
 | `intentlog-fileio/src/main/java/org/intentlog/fileio/AtomicFileLog.java` | The layout; reads, appends and replaces through `SupportsAtomicOperations` |
-| `intentlog-fileio/src/test/java/org/apache/iceberg/io/InMemoryAtomicFileIO.java` | An in-memory store that enforces conditional appends and replaces, with faults and segment limits, for tests |
+| `intentlog-fileio/src/test/java/org/apache/iceberg/io/InMemoryAtomicFileIO.java` | An in-memory store that enforces conditional appends and replaces, with faults, segment limits and append size limits, for tests |
 | `intentlog-core/src/main/java/org/intentlog/LogRuntime.java` | The commit loop |
 | `intentlog-core/src/main/proto/log.proto` | The envelope |

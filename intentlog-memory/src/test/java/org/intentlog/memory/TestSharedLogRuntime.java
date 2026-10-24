@@ -190,6 +190,16 @@ class TestSharedLogRuntime {
   }
 
   @Test
+  void aRecordLargerThanTheLogStoresIsRejectedBeforeItIsSent() { // (Bug 71)
+    Replica<State> base = created();
+    log.limitRecordBytes(1);
+    assertThatThrownBy(() -> writer.commit(base, txn(base, "t", Set.of(), Set.of("a"))))
+        .isInstanceOfSatisfying(CommitRejectedException.class, e ->
+            assertThat(e.reason()).isEqualTo(CommitRejectedException.Reason.TOO_LARGE));
+    assertThat(log.records()).hasSize(1);
+  }
+
+  @Test
   void aRecordWhoseReadsAnotherCommitChangedIsRejectedWhereItLands() { // [ReadBack, Judge]
     Replica<State> base = created();
     other("o", Set.of(), Set.of("a"));

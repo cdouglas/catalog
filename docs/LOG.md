@@ -106,9 +106,12 @@ envelopes, below); it stores and orders them. A `LogTail` is the end of the
 log as a read or probe saw it, and the condition a conditional write names:
 `exists` is false before the log is created, `bytes` is what the size
 threshold compares, and `continues(earlier)` says that the log only grew since
-`earlier` (on one object, it was not replaced). A `Receipt` is a provider's
-acknowledgement of a write: the version written, a log position, an offset or
-a sequence number.
+`earlier` (on one object, it was not replaced). `maxRecordBytes` is the
+largest record one append stores (0: no limit): the commit loop writes a
+larger record in a replace, on a log that replaces itself, and rejects it
+before sending it (`TOO_LARGE`) on one that does not (Bug 71). A `Receipt` is
+a provider's acknowledgement of a write: the version written, a log position,
+an offset or a sequence number.
 
 A log is created by its first write: a `replace` at a tail that does not
 exist, on a log that replaces itself; or a `putCheckpoint` at such a tail, on
@@ -380,8 +383,9 @@ three outcomes, and a caller can rely on each:
 - **`CommitRejectedException`**: it did not, and never will. Its `reason` is
   `CONFLICT` (its preconditions do not hold on `state()`, the replica it lost
   to), `BEYOND_HORIZON`, `CREATE_LOST` (another writer created the log first),
-  `EXHAUSTED` (out of attempts with no write that may have landed) or
-  `NOT_SENT`;
+  `EXHAUSTED` (out of attempts with no write that may have landed),
+  `NOT_SENT`, or `TOO_LARGE` (its record is larger than an append stores, on
+  a log that cannot replace itself; nothing was sent);
 - **`CommitOutcomeUnknownException`**: either. Its cause is the write that may
   have landed, with any read failures since suppressed on it.
 
@@ -414,6 +418,9 @@ function COMMIT(log, base, intention):
     caps    = log.capabilities()
     current = base;  tail = base.tail;  stale = false
     floor   = (not caps.fusedReplace and tail.exists) ? tail : none
+    oversized = caps.maxRecordBytes > 0 and len(record) > caps.maxRecordBytes
+    if oversized and not caps.fusedReplace:
+        reject TOO_LARGE                          # no append can store it (Bug 71)
 
     # Case 0: the log does not exist yet.
     if not tail.exists and caps.fusedReplace:
@@ -433,7 +440,7 @@ function COMMIT(log, base, intention):
     full = false                                  # the log refused an append: it is full
     for attempt in 1..maxAttempts (10):
       try:
-        mustReplace = caps.fusedReplace and (full or not caps.append
+        mustReplace = caps.fusedReplace and (full or oversized or not caps.append
                           or policy.due(current.intentionRecords, tail.bytes, len(record)))
         if mustReplace:
             if stale:
@@ -609,7 +616,8 @@ Compaction bounds what a reader replays, and with GC, the committed set.
 **On a log that replaces itself** (`fusedReplace`: `AtomicFileLog`), a commit
 compacts. It replaces the log with a checkpoint of the state it read, a GC
 record and its own record, when the log cannot append, an append was refused
-as full, or the compaction policy says the log is due:
+as full, the record is larger than an append stores (`maxRecordBytes`), or the
+compaction policy says the log is due:
 `CompactionPolicy.limits(maxRecords, maxBytes)` compacts once the log holds
 `maxRecords` intention records (0: every commit), or the record would take it
 past `maxBytes` (the catalog's `fileio.catalog.max.append.count` and
@@ -660,7 +668,10 @@ It reads back the version a write wrote, so P3 holds trivially. It maps the
 fork's exceptions onto the SPI's: `StorageThrottleException` to throttled
 (before `CASException`, its superclass), `SegmentLimitException` to full,
 `CASException` and `AppendException` to conflict, and a failure to prepare a
-write to not sent.
+write to not sent. Its `maxRecordBytes` is the FileIO's
+`maxAppendBytes(location)` less the record's length prefix: the ADLS FileIO's
+is its client's `AppendBlock` limit (4 MiB before service version 2022-11-02,
+100 MiB since); the others set none.
 
 **`InMemorySharedLog`** is a CORFU-like log: records at positions 1, 2, ...;
 checkpoints stored apart, each the state through a position; and a trim
@@ -686,6 +697,9 @@ trimmed ones included, for oracles to replay.
   covers. Kafka trims by `deleteRecords` through a checkpointed offset.
 - `putCheckpoint` is create-if-absent per position, so concurrent compactors
   write the same bytes or nothing (I11).
+- `maxRecordBytes`: the largest record it stores (Kafka's `max.message.bytes`,
+  SQS's message size). Such a log cannot replace itself, so the commit loop
+  rejects a larger record before sending it (`TOO_LARGE`).
 - A producer's own deduplication (Kafka's idempotent producer, SQS's
   deduplication id) only saves copies: replay's committed set dedups records
   whatever the producer does.

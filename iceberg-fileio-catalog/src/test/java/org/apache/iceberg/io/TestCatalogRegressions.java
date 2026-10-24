@@ -4072,6 +4072,87 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 71: a store caps the bytes of one append (an Azure AppendBlock:
+  // 4 MiB before service version 2022-11-02, 100 MiB since), and an append
+  // past the cap fails before landing, with the raw error the ADLS FileIO
+  // lets out. The commit loop took the append for ambiguous, read the
+  // catalog, found its record absent and appended it again, and after its
+  // last attempt reported the commit unknown; every retry of it did the
+  // same, unless the record took the file past
+  // fileio.catalog.max.append.size, which compacts by CAS (a CAS is not
+  // capped). fileio.catalog.inline.max.update.size does not keep a record
+  // under the cap: it bounds each table's update, and a catalog
+  // transaction's record holds one per table. SharedLog's
+  // Capabilities.maxRecordBytes, which would say what the cap is, was never
+  // read, and every provider reported 0. A FileIO now reports its cap
+  // (SupportsAtomicOperations.maxAppendBytes; the ADLS FileIO's is its
+  // client's AppendBlock limit), AtomicFileLog reports it less the record's
+  // length prefix, and the commit loop writes a larger record by CAS; on a
+  // log that cannot replace itself, it rejects the commit before sending it
+  // (TOO_LARGE). Found by a review of the SharedLog SPI.
+  // ============================================================
+
+  @Nested
+  class AppendsPastTheStoresSizeLimit {
+
+    @Test
+    void aRecordAboveTheLimitCompacts() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      io.limitAppendBytes(4096);
+      FileIOCatalog catalog = catalog(io, LocalCatalogMode.APPEND);
+      catalog.createNamespace(mixedNs);
+
+      catalog.setProperties(mixedNs, Map.of("k", bigValue(8192)));
+
+      assertThat(catalog(io, LocalCatalogMode.APPEND).loadNamespaceMetadata(mixedNs))
+          .containsEntry("k", bigValue(8192));
+      assertThat(io.conditionalWrites().get(CATALOG))
+          .as("the commit compacted, its own record in the CAS")
+          .last()
+          .isEqualTo(AtomicOutputFile.Strategy.CAS);
+    }
+
+    @Test
+    void aTransactionOfInlineUpdatesThatEachFitCompacts() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      io.limitAppendBytes(4096);
+      Map<String, String> fits = Map.of(FileIOCatalog.INLINE_MAX_UPDATE_SIZE, "3072");
+      FileIOCatalog catalog = LocalCatalogMode.APPEND_TM.catalog(io, WAREHOUSE, "c", fits);
+      TableIdentifier other = TableIdentifier.of(mixedNs, "u");
+      catalog.createNamespace(mixedNs);
+      catalog.createTable(mixed, intSchema);
+      catalog.createTable(other, intSchema);
+      assertThat(List.of(mixed, other))
+          .as("both tables inline")
+          .allMatch(id -> metadataLocation(catalog.loadTable(id)).startsWith("inline://"));
+      CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      txn.asCatalog().loadTable(mixed).updateProperties().set("k", bigValue(2500)).commit();
+      txn.asCatalog().loadTable(other).updateProperties().set("k", bigValue(2501)).commit();
+
+      // each update fits in 3 KiB, and the record that holds both does not fit in 4
+      txn.commitTransaction();
+
+      FileIOCatalog reader = LocalCatalogMode.APPEND_TM.catalog(io, WAREHOUSE, "c", fits);
+      assertThat(reader.loadTable(mixed).properties()).containsEntry("k", bigValue(2500));
+      assertThat(reader.loadTable(other).properties()).containsEntry("k", bigValue(2501));
+      assertThat(List.of(mixed, other))
+          .as("each update fit the inline limit")
+          .allMatch(id -> metadataLocation(reader.loadTable(id)).startsWith("inline://"));
+      assertThat(io.conditionalWrites().get(CATALOG))
+          .as("the commit compacted, its own record in the CAS")
+          .last()
+          .isEqualTo(AtomicOutputFile.Strategy.CAS);
+    }
+
+    private String metadataLocation(Table table) {
+      return ((org.apache.iceberg.HasTableOperations) table)
+          .operations()
+          .current()
+          .metadataFileLocation();
+    }
+  }
+
   /**
    * Storage with prefix and bulk operations, as S3, GCS and ADLS have (a table's FileIO passes
    * bulk deletes on only for those), whose bulk deletes fail.

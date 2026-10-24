@@ -113,6 +113,7 @@ final class ScriptedLog implements SharedLog {
   private boolean append = true;
   private int segmentLimit = 0;
   private int segments = 1;
+  private long recordLimit = 0;
   private final Deque<Fault> writeFaults = new ArrayDeque<>();
   private int failReads = 0;
   private Runnable beforeWrite = null;
@@ -132,6 +133,15 @@ final class ScriptedLog implements SharedLog {
   /** Refuses appends past {@code limit} writes to one lineage (0: no limit). */
   ScriptedLog limitSegments(int limit) {
     this.segmentLimit = limit;
+    return this;
+  }
+
+  /**
+   * Reports {@code limit} as the largest record an append stores, and fails a larger append, before
+   * it lands, with an error the log does not classify (0: no limit).
+   */
+  ScriptedLog limitRecordBytes(long limit) {
+    this.recordLimit = limit;
     return this;
   }
 
@@ -186,7 +196,7 @@ final class ScriptedLog implements SharedLog {
 
   @Override
   public Capabilities capabilities() {
-    return new Capabilities(append, true, true, false, true, 0L);
+    return new Capabilities(append, true, true, false, true, recordLimit);
   }
 
   @Override
@@ -218,6 +228,9 @@ final class ScriptedLog implements SharedLog {
       Version v = versions.get(live);
       if (segmentLimit > 0 && segments + 1 > segmentLimit) {
         throw new LogFullException("full", null);
+      }
+      if (recordLimit > 0 && record.length > recordLimit) {
+        throw new IllegalStateException("a record of " + record.length + " bytes is too large");
       }
       List<byte[]> records = new ArrayList<>(v.records);
       records.add(record);

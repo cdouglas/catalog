@@ -102,7 +102,7 @@ transactions in `RESTCatalog`, and the fork's version
 
 | Addition | File | What it provides |
 |----------|------|------------------|
-| `SupportsAtomicOperations` | `api/.../SupportsAtomicOperations.java` | FileIO extension with `AtomicOutputFile`, `CAS` / `APPEND` strategies, `CASException` (`StorageInvariantException`, `StorageThrottleException`), `AppendException`, `SegmentLimitException` |
+| `SupportsAtomicOperations` | `api/.../SupportsAtomicOperations.java` | FileIO extension with `AtomicOutputFile`, `CAS` / `APPEND` strategies, `CASException` (`StorageInvariantException`, `StorageThrottleException`), `AppendException`, `SegmentLimitException`; `supportsAppend()` and `maxAppendBytes(location)` |
 | `AtomicOutputFile`         | `api/.../AtomicOutputFile.java` | `CAS prepare(Supplier<InputStream>, Strategy)` + `InputFile writeAtomic(CAS, Supplier<InputStream>)` |
 | `FileChecksum`             | `api/.../FileChecksum.java` | Content checksum (`update`, `contentChecksumBytes`, `contentHeaderString`). The ETag / generation a write replaces is pinned by the `InputFile` passed to `newOutputFile(InputFile)` |
 | `S3FileIO` atomic ops      | `aws/.../S3FileIO.java` | If-Match / If-None-Match conditional puts; APPEND at an offset on S3 Express |

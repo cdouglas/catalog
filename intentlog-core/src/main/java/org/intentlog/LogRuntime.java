@@ -308,6 +308,10 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     // Express: 10,000 parts; an Azure Append Blob: 50,000 blocks): only a replace can commit
     // then, whatever the policy says.
     private boolean full = false;
+    // Whether the record is larger than one append stores (an Azure AppendBlock: 4 MiB before
+    // service version 2022-11-02, 100 MiB since): only a replace can commit it. An append of it
+    // fails without landing, which the commit took for ambiguous on every attempt (Bug 71).
+    private final boolean oversized;
     // A send that the log throttled before the one it acknowledged, if the send was unconditional:
     // it may have landed too, so the record may be in the log twice (on one object, the second
     // send fails its condition instead, P4).
@@ -323,6 +327,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
       // After the horizon of the log this writer read, where replay rejects a record (Bug 64).
       this.id = UuidV7.newUuidV7After(base.committed().horizon());
       this.record = LogEnvelope.encodeRecord(id, machine.encodeIntention(intention));
+      this.oversized = caps.maxRecordBytes() > 0 && record.length > caps.maxRecordBytes();
       this.current = base;
       this.tail = base.tail();
       this.floor = !caps.fusedReplace() && tail.exists() ? tail : null;
@@ -346,6 +351,14 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     }
 
     private Replica<S> loop() {
+      if (oversized && !caps.fusedReplace()) {
+        throw new CommitRejectedException(
+            CommitRejectedException.Reason.TOO_LARGE, null,
+            String.format("Cannot commit: a record of %d bytes is larger than %s stores (%d)",
+                record.length, log, caps.maxRecordBytes()),
+            null);
+      }
+
       // Case 0: the log does not exist yet. A log that replaces itself is created by a replace of
       // the absent log; one that keeps checkpoints apart, by its first checkpoint.
       if (!tail.exists() && !caps.fusedReplace()) {
@@ -373,10 +386,12 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
       for (int attempt = 0; attempt < config.maxAttempts(); attempt++) {
         try {
           // Replace (compact) or append, by what the log can do and what the policy says of its
-          // observable state. A log without append replaces on every commit.
+          // observable state. A log without append replaces on every commit, and a record larger
+          // than an append stores goes in a replace.
           boolean mustReplace =
               caps.fusedReplace()
                   && (full
+                      || oversized
                       || !caps.append()
                       || config.compaction().due(current.intentionRecords(), bytes(tail),
                           record.length));

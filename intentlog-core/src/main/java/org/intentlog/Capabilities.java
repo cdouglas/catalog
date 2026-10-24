@@ -28,7 +28,9 @@ package org.intentlog;
  * @param separateCheckpoints whether it stores checkpoints apart from records ({@link
  *     SharedLog#putCheckpoint}, {@link SharedLog#trim})
  * @param readYourAppends whether a read after an acknowledged append sees it at once
- * @param maxRecordBytes the largest record it stores (0: no limit)
+ * @param maxRecordBytes the largest record one append stores (0: no limit). The runtime writes a
+ *     larger record in a {@link SharedLog#replace} on a log that replaces itself; on one that does
+ *     not, it rejects the commit before sending it ({@link CommitRejectedException.Reason#TOO_LARGE})
  */
 public record Capabilities(
     boolean append,

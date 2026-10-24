@@ -142,7 +142,9 @@ Line numbers are of `LogRuntime.java` at 7e056b3 unless stated. `TestLogRuntime`
 | `Tick`, `Skew` | the runtime's clock (`RuntimeConfig.clockMs`) | gc runs (wall clock); no fuzzer skews clocks |
 
 Not modelled: creating the catalog file (`commit()`'s case 0), the size of
-records (`MaxSize` counts records), and backoff timing.
+records (`MaxSize` counts records, and a record larger than one append stores
+goes in a replace, `oversized` in `mustReplace`: Bug 71, covered by
+`TestLogRuntime` and `TestCatalogRegressions`), and backoff timing.
 
 ### Properties
 
@@ -362,8 +364,9 @@ brackets.
 
 "protocol" is `TestMemoryCommitProtocol` (the testkit's `CommitProtocol` on
 `InMemorySharedLog`); "MW" is `TestMultiWriterProperties` on the shared log.
-Not modelled: creating the log (its first checkpoint, `create` :528), and
-`refresh`.
+Not modelled: creating the log (its first checkpoint, `create` :528),
+`refresh`, and a record larger than the log stores, which `loop` rejects before
+sending it (`TOO_LARGE`, Bug 71; `TestSharedLogRuntime`).
 
 ### Properties
 

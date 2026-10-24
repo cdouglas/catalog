@@ -191,6 +191,7 @@ public final class InMemorySharedLog implements SharedLog {
   private final List<Write> history = new ArrayList<>();
   private final List<String> violations = new ArrayList<>();
   private long trimmed = 0;
+  private volatile long recordLimit = 0;
   private Interceptor interceptor = new Interceptor() {};
 
   /** A log with unconditional appends whose reads see every append acknowledged. */
@@ -209,6 +210,16 @@ public final class InMemorySharedLog implements SharedLog {
     this.readYourAppends = readYourAppends;
   }
 
+  /**
+   * Stores records of at most {@code limit} bytes, as a queue caps a message (0: no limit): its
+   * capabilities say so, and a larger append is refused before it is sent ({@link
+   * LogNotSentException}).
+   */
+  public synchronized InMemorySharedLog limitRecordBytes(long limit) {
+    this.recordLimit = limit;
+    return this;
+  }
+
   /** Replaces the test hooks. */
   public synchronized InMemorySharedLog intercept(Interceptor hooks) {
     this.interceptor = hooks != null ? hooks : new Interceptor() {};
@@ -222,7 +233,7 @@ public final class InMemorySharedLog implements SharedLog {
 
   @Override
   public Capabilities capabilities() {
-    return new Capabilities(true, conditionalAppend, false, true, readYourAppends, 0L);
+    return new Capabilities(true, conditionalAppend, false, true, readYourAppends, recordLimit);
   }
 
   // ============================================================
@@ -236,6 +247,10 @@ public final class InMemorySharedLog implements SharedLog {
     }
     WriteFault fault = interceptor.beforeWrite(Request.APPEND, record);
     checkExists();
+    if (recordLimit > 0 && record.length > recordLimit) {
+      throw new LogNotSentException(
+          "A record of " + record.length + " bytes is larger than " + name + " stores", null);
+    }
     failBefore(fault, Request.APPEND);
     if (fault == WriteFault.DELAYED) {
       delayed.add(record);

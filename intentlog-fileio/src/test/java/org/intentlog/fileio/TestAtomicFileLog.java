@@ -123,6 +123,21 @@ class TestAtomicFileLog {
   }
 
   @Test
+  void theLargestRecordIsTheStoresAppendLimitLessItsLengthPrefix() { // (Bug 71)
+    assertThat(log.capabilities().maxRecordBytes()).isZero();
+    io.limitAppendBytes(300);
+    AtomicFileLog limited = new AtomicFileLog(io, LOCATION);
+    assertThat(limited.capabilities().maxRecordBytes()).isEqualTo(298); // a 2-byte varint
+    LogView created = create();
+
+    LogView appended =
+        limited.readThrough(limited.append(new byte[298], created.tail()), Duration.ZERO);
+    assertThat(appended.records()).hasSize(2);
+    assertThatThrownBy(() -> limited.append(new byte[299], appended.tail()))
+        .isInstanceOf(UncheckedIOException.class);
+  }
+
+  @Test
   void aProbeOfAMissingObjectIsATailThatCreatesIt() {
     LogTail missing = log.probe();
     assertThat(missing.exists()).isFalse();
