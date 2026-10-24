@@ -182,6 +182,18 @@ class TestLogRuntime {
   }
 
   @Test
+  void aReadOfALogReplacedSinceTheFloorIsNewer() { // (Bug 72)
+    Replica<Map<String, Integer>> floor = bump(bump(created(), "a"), "b");
+    Replica<Map<String, Integer>> live = runtime.read();
+    log.replaceDirectly(
+        LogEnvelope.encodeCheckpoint(live.logId(), live.committed().bytes(),
+            ToyMachine.INSTANCE.encodeCheckpoint(Map.of("init", 1, "a", 1, "b", 1, "c", 1))),
+        List.of());
+    // the replace's tail does not continue the floor's, and is newer: the log replaced itself
+    assertThat(runtime.read(floor).state()).containsEntry("c", 1);
+  }
+
+  @Test
   void aReplaceThatLostToACompatibleChangeRebases() { // [Rebase]
     runtime = runtime(0, NO_GC); // replace on every commit
     Replica<Map<String, Integer>> base = created();

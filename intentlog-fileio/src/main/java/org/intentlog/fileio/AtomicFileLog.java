@@ -100,7 +100,7 @@ public final class AtomicFileLog implements SharedLog {
 
   @Override
   public Capabilities capabilities() {
-    return new Capabilities(io.supportsAppend(), true, true, false, true, maxRecordBytes);
+    return new Capabilities(io.supportsAppend(), true, true, false, maxRecordBytes);
   }
 
   @Override

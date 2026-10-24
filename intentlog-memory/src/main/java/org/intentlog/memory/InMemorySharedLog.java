@@ -184,7 +184,6 @@ public final class InMemorySharedLog implements SharedLog {
 
   private final String name;
   private final boolean conditionalAppend;
-  private final boolean readYourAppends;
   private final List<byte[]> records = new ArrayList<>();
   private final NavigableMap<Long, byte[]> checkpoints = new TreeMap<>();
   private final List<byte[]> delayed = new ArrayList<>();
@@ -194,20 +193,18 @@ public final class InMemorySharedLog implements SharedLog {
   private volatile long recordLimit = 0;
   private Interceptor interceptor = new Interceptor() {};
 
-  /** A log with unconditional appends whose reads see every append acknowledged. */
+  /**
+   * A log with unconditional appends. Its reads see every append acknowledged, unless a hook lags
+   * them.
+   */
   public InMemorySharedLog(String name) {
-    this(name, false, true);
+    this(name, false);
   }
 
-  /**
-   * @param conditionalAppend whether an append may name the tail it expects
-   * @param readYourAppends whether reads see every append acknowledged (what its capabilities
-   *     say; a hook lags reads either way)
-   */
-  public InMemorySharedLog(String name, boolean conditionalAppend, boolean readYourAppends) {
+  /** @param conditionalAppend whether an append may name the tail it expects */
+  public InMemorySharedLog(String name, boolean conditionalAppend) {
     this.name = name;
     this.conditionalAppend = conditionalAppend;
-    this.readYourAppends = readYourAppends;
   }
 
   /**
@@ -233,7 +230,7 @@ public final class InMemorySharedLog implements SharedLog {
 
   @Override
   public Capabilities capabilities() {
-    return new Capabilities(true, conditionalAppend, false, true, readYourAppends, recordLimit);
+    return new Capabilities(true, conditionalAppend, false, true, recordLimit);
   }
 
   // ============================================================

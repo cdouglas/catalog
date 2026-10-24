@@ -4153,6 +4153,78 @@ public class TestCatalogRegressions {
     }
   }
 
+  // ============================================================
+  // Bug 72: a shared log may serve a read from a replica that lags its
+  // appends (P1: a read returns a prefix of the log). The commit loop
+  // reads its own record through its receipt (P3), but a table handle
+  // threw away the replica its commit landed in, and Iceberg refreshes the
+  // handle right after a commit, by a fresh read of the log: on a replica
+  // that had not caught up, the writer's table went back to the version
+  // before its commit, and Iceberg, which refreshes to find the snapshot
+  // it committed, skipped cleaning up its manifests.
+  // Capabilities.readYourAppends, which said whether reads lag, was read by
+  // nothing, and is gone. CatalogLog now keeps the newest replica its
+  // catalog read or committed in, and a read that lags behind it serves it
+  // instead (LogRuntime.read(floor)), on a log that cannot replace itself.
+  // Found by a review of the SharedLog SPI.
+  // ============================================================
+
+  @Nested
+  class ReadsThatLagACommit {
+
+    /** Once armed, serves each fresh read one record behind the log, as a lagging replica would. */
+    private final class Lagging implements org.intentlog.memory.InMemorySharedLog.Interceptor {
+      boolean armOnNextAppend = false;
+      boolean armed = false;
+
+      @Override
+      public void afterLanding(org.intentlog.memory.InMemorySharedLog.Request request) {
+        if (armOnNextAppend && request == org.intentlog.memory.InMemorySharedLog.Request.APPEND) {
+          armOnNextAppend = false;
+          armed = true;
+        }
+      }
+
+      @Override
+      public org.intentlog.memory.InMemorySharedLog.ReadShape beforeRead(
+          org.intentlog.memory.InMemorySharedLog.Request request) {
+        return armed && request == org.intentlog.memory.InMemorySharedLog.Request.READ
+            ? org.intentlog.memory.InMemorySharedLog.ReadShape.of(0, 1)
+            : org.intentlog.memory.InMemorySharedLog.ReadShape.NORMAL;
+      }
+    }
+
+    @Test
+    void aWriterSeesItsOwnCommit() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      // no compaction, whose checkpoint would hold the commit and so hide the lag
+      LogCatalog catalog = LocalCatalogMode.MEMLOG.catalog(
+          io, WAREHOUSE, "c", Map.of(LogCatalogProperties.MAX_APPEND_COUNT, "10000"));
+      catalog.createNamespace(mixedNs);
+      Table table = catalog.createTable(mixed, intSchema);
+      table.newFastAppend().appendFile(dataFile("a")).commit();
+      Lagging lagging = new Lagging();
+      LocalCatalogMode.sharedLog(io, CATALOG).intercept(lagging);
+
+      // the replica falls behind once the commit's record lands, after the commit read its base
+      lagging.armOnNextAppend = true;
+      table.newFastAppend().appendFile(dataFile("b")).commit();
+
+      // the handle Iceberg refreshed after the commit, from the replica behind it
+      assertThat(dataFiles(table))
+          .as("the writer's table after its commit")
+          .containsExactly("mem:///data/a.parquet", "mem:///data/b.parquet");
+      assertThat(dataFiles(catalog.loadTable(mixed)))
+          .as("the table, loaded again from the writer's catalog")
+          .containsExactly("mem:///data/a.parquet", "mem:///data/b.parquet");
+      lagging.armed = false;
+      LogCatalog reader = LocalCatalogMode.MEMLOG.catalog(io, WAREHOUSE, "c", Map.of());
+      assertThat(dataFiles(reader.loadTable(mixed)))
+          .as("the log, read in full")
+          .containsExactly("mem:///data/a.parquet", "mem:///data/b.parquet");
+    }
+  }
+
   /**
    * Storage with prefix and bulk operations, as S3, GCS and ADLS have (a table's FileIO passes
    * bulk deletes on only for those), whose bulk deletes fail.

@@ -196,7 +196,7 @@ final class ScriptedLog implements SharedLog {
 
   @Override
   public Capabilities capabilities() {
-    return new Capabilities(append, true, true, false, true, recordLimit);
+    return new Capabilities(append, true, true, false, recordLimit);
   }
 
   @Override

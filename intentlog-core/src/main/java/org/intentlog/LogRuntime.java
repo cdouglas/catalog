@@ -56,20 +56,45 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
   }
 
   /**
+   * A fresh read, or {@code floor} if the read lags behind it: a replica this reader read or
+   * committed in, so a read of the log too (P1 lets a read return any prefix). A reader that
+   * passes the newest replica it has seen never sees the log go back, past its own commit
+   * included (Bug 72). A null floor is no floor.
+   */
+  public Replica<S> read(Replica<S> floor) {
+    return newer(floor, read());
+  }
+
+  /**
+   * {@code later}, unless it lags behind {@code earlier} (a replica read or committed in before
+   * it was read): then {@code earlier}. Only a log that cannot replace itself has reads that lag,
+   * as the commit loop's floor assumes; on one that replaces itself, a tail that does not continue
+   * an earlier one is a replace since, which is newer.
+   */
+  public Replica<S> newer(Replica<S> earlier, Replica<S> later) {
+    if (earlier == null || log.capabilities().fusedReplace()
+        || later.tail().continues(earlier.tail())) {
+      return later;
+    }
+    return earlier;
+  }
+
+  /**
    * {@code prior} brought up to date: the records appended since folded onto it, if the log reads
    * them apart ({@link SharedLog#readAfter}); else, or if it trimmed them, a fresh read. Either
    * way the same replica, since replay is deterministic and every checkpoint is the replay of the
-   * log through it (I11).
+   * log through it (I11). Never one behind {@code prior}, which a fresh read on a log whose reads
+   * lag could be.
    */
   public Replica<S> refresh(Replica<S> prior) {
     LogView view;
     try {
       view = log.readAfter(prior.tail());
     } catch (TrimmedException e) {
-      return read();
+      return read(prior);
     }
     if (view.checkpoint().isPresent()) {
-      return replay(view, null, prior.logId()).replica();
+      return newer(prior, replay(view, null, prior.logId()).replica());
     }
     Replay.Result<B> result =
         Replay.replayOnto(machine, machine.toBuilder(prior.state()), prior.committed().toBuilder(),

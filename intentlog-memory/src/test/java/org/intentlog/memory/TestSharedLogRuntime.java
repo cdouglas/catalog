@@ -219,7 +219,7 @@ class TestSharedLogRuntime {
 
   @Test
   void aConditionalAppendThatLostARaceIsSentAgainAtTheNewTail() {
-    InMemorySharedLog conditional = new InMemorySharedLog("log", true, true);
+    InMemorySharedLog conditional = new InMemorySharedLog("log", true);
     LogRuntime<State, EntityVersionsMachine.Builder, Txn> rt =
         new LogRuntime<>(conditional, MACHINE, config(NO_GC, NEVER));
     rt.bootstrap(new Txn("init", java.util.Map.of(), Set.of()));
@@ -354,6 +354,20 @@ class TestSharedLogRuntime {
     script.reads.add(ReadShape.of(0, 3));
     Replica<State> r = writer.commit(base, txn(base, "t", Set.of("a"), Set.of("b")));
     assertThat(r.state().history()).containsExactly("init", "o", "t");
+  }
+
+  @Test
+  void aReadThatLagsBehindTheReadersFloorServesTheFloor() { // (Bug 72)
+    Replica<State> base = created();
+    Replica<State> landed = writer.commit(base, txn(base, "t", Set.of(), Set.of("a")));
+    script.reads.add(ReadShape.of(0, 1));
+    assertThat(writer.read(landed).state().history()).containsExactly("init", "t");
+    script.reads.add(ReadShape.of(0, 1));
+    assertThat(writer.read().state().history()).as("without the floor").containsExactly("init");
+    other("o", Set.of(), Set.of("b"));
+    assertThat(writer.read(landed).state().history())
+        .as("a read past the floor")
+        .containsExactly("init", "t", "o");
   }
 
   @Test

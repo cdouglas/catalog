@@ -365,8 +365,10 @@ brackets.
 "protocol" is `TestMemoryCommitProtocol` (the testkit's `CommitProtocol` on
 `InMemorySharedLog`); "MW" is `TestMultiWriterProperties` on the shared log.
 Not modelled: creating the log (its first checkpoint, `create` :528),
-`refresh`, and a record larger than the log stores, which `loop` rejects before
-sending it (`TOO_LARGE`, Bug 71; `TestSharedLogRuntime`).
+`refresh`, a record larger than the log stores, which `loop` rejects before
+sending it (`TOO_LARGE`, Bug 71; `TestSharedLogRuntime`), and reads outside a
+commit, such as a catalog's right after its own, which `read(floor)` keeps
+from going back (Bug 72; `TestSharedLogRuntime`, `TestCatalogRegressions`).
 
 ### Properties
 

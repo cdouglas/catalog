@@ -19,6 +19,7 @@
 package org.apache.iceberg.io;
 
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.CommitStateUnknownException;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -38,15 +39,29 @@ public final class CatalogLog {
 
   private final SharedLog log;
   private final LogRuntime<CatalogState, CatalogState.Builder, ProtoCodec.CatalogIntention> runtime;
+  // The newest replica this catalog has read or committed in. A read of a log whose reads lag
+  // (a replica behind its appends) serves it instead when the read is behind it, so a reader
+  // never sees the catalog go back past a commit or a read of its own: Iceberg refreshes a table
+  // from the catalog right after committing to it (Bug 72).
+  private final AtomicReference<Replica<CatalogState>> newest = new AtomicReference<>();
 
   public CatalogLog(SharedLog log, RuntimeConfig config) {
     this.log = log;
     this.runtime = new LogRuntime<>(log, CatalogStateMachine.INSTANCE, config);
   }
 
-  /** The catalog as a fresh read of its log finds it. A read failure is thrown as it is. */
+  /**
+   * The catalog as a fresh read of its log finds it, or as this catalog last read or committed in
+   * it if the read lags behind that. A read failure is thrown as it is.
+   */
   public Replica<CatalogState> read() {
-    return runtime.read();
+    return seen(runtime.read(newest.get()));
+  }
+
+  /** Records {@code replica}, read or committed in, as the newest this catalog has seen. */
+  private Replica<CatalogState> seen(Replica<CatalogState> replica) {
+    newest.accumulateAndGet(replica, runtime::newer);
+    return replica;
   }
 
   /**
@@ -83,7 +98,7 @@ public final class CatalogLog {
   public Replica<CatalogState> commit(CatalogMutation mutation) {
     Preconditions.checkNotNull(mutation.base(), "Cannot commit a transaction staged on no read");
     try {
-      return runtime.commit(mutation.base(), mutation.intention());
+      return seen(runtime.commit(mutation.base(), mutation.intention()));
     } catch (CommitRejectedException e) {
       switch (e.reason()) {
         case CONFLICT:
@@ -108,7 +123,7 @@ public final class CatalogLog {
    *     commits
    */
   public Replica<CatalogState> compact() {
-    return runtime.compact();
+    return seen(runtime.compact());
   }
 
   @Override

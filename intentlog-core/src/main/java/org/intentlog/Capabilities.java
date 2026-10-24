@@ -19,7 +19,10 @@
 package org.intentlog;
 
 /**
- * What a {@link SharedLog} can do, which decides how the runtime commits to it.
+ * What a {@link SharedLog} can do, which decides how the runtime commits to it. Whether its reads
+ * lag its appends is not among them: any log's may (P1). The runtime reads a write it made
+ * through its receipt (P3), and a reader that must not go back passes a floor to {@link
+ * LogRuntime#read(Replica)}.
  *
  * @param append whether it appends at all (an object store without append writes every commit
  *     by {@link SharedLog#replace})
@@ -27,7 +30,6 @@ package org.intentlog;
  * @param fusedReplace whether it replaces a checkpoint and records in one conditional write
  * @param separateCheckpoints whether it stores checkpoints apart from records ({@link
  *     SharedLog#putCheckpoint}, {@link SharedLog#trim})
- * @param readYourAppends whether a read after an acknowledged append sees it at once
  * @param maxRecordBytes the largest record one append stores (0: no limit). The runtime writes a
  *     larger record in a {@link SharedLog#replace} on a log that replaces itself; on one that does
  *     not, it rejects the commit before sending it ({@link CommitRejectedException.Reason#TOO_LARGE})
@@ -37,5 +39,4 @@ public record Capabilities(
     boolean conditionalAppend,
     boolean fusedReplace,
     boolean separateCheckpoints,
-    boolean readYourAppends,
     long maxRecordBytes) {}

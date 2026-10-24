@@ -37,7 +37,7 @@ class TestInMemorySharedLogContract {
   class Conditional extends SharedLogContract {
     @Override
     protected SharedLog newLog() {
-      return new InMemorySharedLog("log", true, true);
+      return new InMemorySharedLog("log", true);
     }
 
     @Override

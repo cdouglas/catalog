@@ -329,7 +329,7 @@ abstract class MultiWriterStorage {
     private CatalogLog compactor = null;
 
     Memory(boolean conditional) {
-      this.log = new InMemorySharedLog(CATALOG, conditional, true);
+      this.log = new InMemorySharedLog(CATALOG, conditional);
       log.intercept(new InMemorySharedLog.Interceptor() {
         @Override
         public InMemorySharedLog.WriteFault beforeWrite(

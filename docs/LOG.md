@@ -94,7 +94,7 @@ interface SharedLog {
 }
 
 record Capabilities(boolean append, boolean conditionalAppend, boolean fusedReplace,
-                    boolean separateCheckpoints, boolean readYourAppends, long maxRecordBytes) {}
+                    boolean separateCheckpoints, long maxRecordBytes) {}
 
 interface LogView { LogTail tail(); Optional<byte[]> checkpoint(); List<byte[]> records(); }
 interface LogTail { boolean exists(); long bytes(); boolean continues(LogTail earlier); }
@@ -120,6 +120,19 @@ log exists with another first checkpoint. `readAfter(since)` returns the
 records after `since` as a view without a checkpoint, for `refresh` to fold
 onto the replica read at `since`, or a whole view to replay afresh; it may
 throw `TrimmedException`.
+
+Any log's reads may lag its appends (P1), and its capabilities do not say
+whether they do. A writer reads its own write through its receipt (P3), and a
+commit keeps its reads from falling behind the one it staged on (the floor, in
+the commit loop below). A reader that must not see the log go back, such as a
+catalog that has just committed, passes the newest replica it has seen to
+`LogRuntime.read(floor)`, which serves that replica when a fresh read lags
+behind it; `refresh(prior)` never returns one behind `prior`. On a log that
+replaces itself, a tail that does not continue an earlier one is a replace
+since, which is newer, so the floor applies only to a log that cannot
+(Bug 72). `CatalogLog` keeps the newest replica its catalog has read or
+committed in, so Iceberg's refresh of a table after committing to it sees the
+commit.
 
 ### Obligations
 
@@ -651,11 +664,11 @@ it does not.
 
 ## Providers
 
-| Provider | append | conditional | fused replace | checkpoints / trim | read your appends | receipt |
+| Provider | append | conditional | fused replace | checkpoints / trim | `readThrough` (P3) | receipt |
 |---|---|---|---|---|---|---|
-| `AtomicFileLog`, store with append (S3 Express, ADLS) | at an offset | yes | `[chk][gc][rec]` by CAS | in the object | yes | the version written |
-| `AtomicFileLog`, CAS only (GCS, S3 standard) | no | – | the same | in the object | yes | the version written |
-| `InMemorySharedLog` | yes | optional | no | a store apart, and a trim point | configurable | a position |
+| `AtomicFileLog`, store with append (S3 Express, ADLS) | at an offset | yes | `[chk][gc][rec]` by CAS | in the object | reads the version written | the version written |
+| `AtomicFileLog`, CAS only (GCS, S3 standard) | no | – | the same | in the object | reads the version written | the version written |
+| `InMemorySharedLog` | yes | optional | no | a store apart, and a trim point | from a checkpoint before the record | a position |
 | Kafka (one partition) and an object store | idempotent produce | no | no | `chk/<offset>` objects; `deleteRecords` | wait for the high watermark | an offset |
 | SQS FIFO and an archiver | `SendMessage`, deduplication id = record id | no | no | the archiver's: it appends GC records, checkpoints and trims | poll the archive | a sequence number |
 | A ledger (BookKeeper, Pulsar, a confidential ledger) | append | no | no | external, or in the ledger | wait for commit | an entry id |

@@ -38,7 +38,7 @@ class TestMemoryCommitProtocol {
       @ForAll boolean conditional,
       @ForAll("settings") CommitProtocol.Settings settings,
       @ForAll("schedules") List<CommitProtocol.Cmd> schedule) {
-    InMemorySharedLog log = new InMemorySharedLog("log", conditional, true);
+    InMemorySharedLog log = new InMemorySharedLog("log", conditional);
     CommitProtocol.run(new MemoryLogHarness(log, EntityVersionsMachine.INSTANCE), settings,
         schedule);
   }
