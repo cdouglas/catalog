@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-10-21 — fileio-catalog 9f792e8 on fork atomicio bee565b. Every suite below on real cloud, five stores: 3,072 tests, 0 failures, 280 skipped. All runs wrote the default structural codec (see "How to update this doc").
+last-verified: 2026-10-24 — fileio-catalog eb4298a on fork atomicio 9cebc695a. Every suite below on real cloud, five stores: 3,072 tests, 0 failures, 280 skipped. All runs wrote the default structural codec (see "How to update this doc").
 ---
 
 # Cloud-store compatibility matrix
@@ -61,7 +61,7 @@ Cell legend:
 | S3 Express One Zone  | OK | NR / OK | NR / OK | OK | NR / OK | NR / OK |
 | ADLS Gen2 (HNS)      | OK | NR / OK | NR / OK | OK | NR / OK | NR / OK |
 
-The 2026-10-21 run, by store:
+The 2026-10-24 run, by store:
 
 | Store | Suites | Tests | Failed | Skipped |
 |---|---|---|---|---|
@@ -78,11 +78,13 @@ declare (`supportsEmptyNamespace`, `supportsVariant`,
 `testRegisterTable`, errata T4). The `CatalogTransactionTests` classes
 skip none.
 
-The fork's `SupportsAtomicOperations` contract tests passed on the same
-stores the same day (the fork's README, "Testing on real cloud
-storage").
+The fork's `SupportsAtomicOperations` contract tests last passed on these
+stores on 2026-10-21, at atomicio bee565b (the fork's README, "Testing on
+real cloud storage"). The fork has since added only `maxAppendBytes`, which
+the ADLS suites above call as each catalog opens its log.
 
-Earlier runs: 2026-10-20 at 6031709, every suite green on the same
+Earlier runs: 2026-10-21 at 9f792e8, before the intention-log split, the
+same counts; 2026-10-20 at 6031709, every suite green on the same
 stores; 2026-05-12, 1961 tests, 0 failures, before the rebase onto
 Iceberg 1.12.0, the ADLS Append Blob writes and the one-request GCS CAS.
 
