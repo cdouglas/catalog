@@ -85,8 +85,8 @@ column is `atomicio`, which sits on `core-fixes`.
 | C21. Ref and spec removals applied to newer metadata lose a commit or a spec in use | fixed, `core-fixes` 517c1c4 | yes | yes | not reported |
 | C22. A snapshot removal applied to newer metadata drops a ref set since | fixed, `core-fixes` a2a7847 | yes | yes | reported in a comment on [#6710](https://github.com/apache/iceberg/issues/6710) and on dev@ (2026-02), not fixed |
 | C23. A replace transaction drops what other writers committed since it began | fixed, `core-fixes` 29566e9 | yes | yes | [#16232](https://github.com/apache/iceberg/issues/16232), open; PR [#16943](https://github.com/apache/iceberg/pull/16943), open, which this follows except where it falls back; three earlier attempts closed by the stale bot |
-| C24. A commit that removes a data file keeps its deletion vector | fixed, `core-fixes` 86c4847 | yes | yes | PR [#18197](https://github.com/apache/iceberg/pull/18197), open, which this takes |
-| C25. A rewrite with an older data sequence number drops a delete it still needs | fixed, `core-fixes` 37f3402 | yes | yes | [#10312](https://github.com/apache/iceberg/issues/10312), closed by the stale bot; PR [#10962](https://github.com/apache/iceberg/pull/10962), open, whose age-off half this takes (maintainers opposed the other half) |
+| C24. A commit that removes a data file keeps its deletion vector | fixed, `core-fixes` 7f88e98 | yes | yes | PR [#18197](https://github.com/apache/iceberg/pull/18197), open, whose first commit this takes (its second reverses [#11131](https://github.com/apache/iceberg/pull/11131)) |
+| C25. A rewrite with an older data sequence number drops a delete it still needs | fixed, `core-fixes` 0e0e9bb | yes | yes | [#10312](https://github.com/apache/iceberg/issues/10312), closed by the stale bot; PR [#10962](https://github.com/apache/iceberg/pull/10962), open, whose age-off half this takes (maintainers opposed the other half) |
 
 "Not reported" means a search of apache/iceberg's issues, pull requests
 and PR branches, and of the issues@ and dev@ lists, found nothing for the
@@ -734,9 +734,13 @@ counts as an explicit delete without a partition).
 - **Found by:** `TestCatalogFaultProperties`, 2026-10-21 (round 9, try
   8,582 of a 30,000-try run): a delete retried after a concurrent row
   delta merged delete manifests. Reproduces on `InMemoryCatalog`.
-- **Fork:** fixed on `core-fixes` by 86c4847, "Core: Remove a removed data
+- **Fork:** fixed on `core-fixes` by 7f88e98, "Core: Remove a removed data
   file's deletion vector from any delete manifest", which takes PR
-  #18197's fix and test. Its tests are `TestManifestFilterManager` and
+  #18197's first commit and its test. It leaves out the second, which
+  also rewrites a delete manifest just to drop delete files older than
+  every live data file: #11131 stopped that on purpose, as not needed for
+  correctness, and the maintainers held to it on #10962 (decided
+  2026-10-24). Its tests are `TestManifestFilterManager` and
   `TestRowDelta.test*TheFilesDV`.
 - **No workaround** to remove.
 - **Canary:** `aRemovedDataFilesDeletionVectorIsRemovedOnRetry`.
@@ -760,7 +764,7 @@ concurrent commit that removes the last older data file is enough.
 - **Found by:** the review of the conflict-encoding plan, 2026-10-24.
   Iceberg's retry is that work's test oracle, and this case makes the
   retry wrong. Reproduces on `InMemoryCatalog` with a single writer.
-- **Fork:** fixed on `core-fixes` by 37f3402, "Core: Keep the deletes a
+- **Fork:** fixed on `core-fixes` by 0e0e9bb, "Core: Keep the deletes a
   rewrite's older-sequence data files still need", which takes the
   age-off half of PR #10962. Its test is
   `TestRewriteFiles.testRewriteWithOldSequenceNumberKeepsTheDeletesAfterIt`.
