@@ -13,7 +13,7 @@ reports or pull requests upstream. It covers the reproduction, the cause
 with links to the 1.12.0 source, the fix, its tests, and what to settle
 before a PR.
 
-Upstream fixed C1. The fork fixes C2 to C24 on branch `core-fixes`, each
+Upstream fixed C1. The fork fixes C2 to C25 on branch `core-fixes`, each
 in an upstream-style commit with its tests, so the project's tests no
 longer work around any of them.
 
@@ -55,8 +55,10 @@ that day, and C24, which round 9 of the fuzzers found on 2026-10-21. On
 2026-10-21 each issue was checked against a local copy of upstream's
 record: every issue and PR (from the GitHub API), every PR's branch, and
 the issues@ and dev@ lists, which carry each issue's and PR's discussion.
-What that found is in each issue's document. The Fork column is
-`atomicio`, which sits on `core-fixes`.
+What that found is in each issue's document. C25, which the review of the
+conflict-encoding plan found on 2026-10-24, was fixed that day and
+checked against main at `e70a2efcd` and upstream's record. The Fork
+column is `atomicio`, which sits on `core-fixes`.
 
 | Issue | Fork | 1.12.0 | main | Upstream |
 |---|---|---|---|---|
@@ -84,6 +86,7 @@ What that found is in each issue's document. The Fork column is
 | C22. A snapshot removal applied to newer metadata drops a ref set since | fixed, `core-fixes` a2a7847 | yes | yes | reported in a comment on [#6710](https://github.com/apache/iceberg/issues/6710) and on dev@ (2026-02), not fixed |
 | C23. A replace transaction drops what other writers committed since it began | fixed, `core-fixes` 29566e9 | yes | yes | [#16232](https://github.com/apache/iceberg/issues/16232), open; PR [#16943](https://github.com/apache/iceberg/pull/16943), open, which this follows except where it falls back; three earlier attempts closed by the stale bot |
 | C24. A commit that removes a data file keeps its deletion vector | fixed, `core-fixes` 86c4847 | yes | yes | PR [#18197](https://github.com/apache/iceberg/pull/18197), open, which this takes |
+| C25. A rewrite with an older data sequence number drops a delete it still needs | fixed, `core-fixes` 37f3402 | yes | yes | [#10312](https://github.com/apache/iceberg/issues/10312), closed by the stale bot; PR [#10962](https://github.com/apache/iceberg/pull/10962), open, whose age-off half this takes (maintainers opposed the other half) |
 
 "Not reported" means a search of apache/iceberg's issues, pull requests
 and PR branches, and of the issues@ and dev@ lists, found nothing for the
@@ -737,6 +740,33 @@ counts as an explicit delete without a partition).
   `TestRowDelta.test*TheFilesDV`.
 - **No workaround** to remove.
 - **Canary:** `aRemovedDataFilesDeletionVectorIsRemovedOnRetry`.
+
+### C25. A rewrite with an older data sequence number drops a delete it still needs
+
+Details: [iceberg-issues/C25.md](iceberg-issues/C25.md).
+
+A commit drops the delete files older than the minimum data sequence
+number of the live data files. It took that minimum over the data
+manifests it kept, not over the files it adds. A `RewriteFiles` that
+commits its files with an older data sequence number (Spark's
+`rewrite_data_files` does by default) can need a delete newer than that.
+When no kept data file is older than the delete, the delete is dropped
+and the rows it deleted come back. A retry gets there more easily: a
+concurrent commit that removes the last older data file is enough.
+
+- **Cause:** `MergingSnapshotProducer.apply`'s age-off minimum leaves out
+  the new data files (#1105, 0.9.0; the rewrite's data sequence number
+  is from #3480, 0.13.0).
+- **Found by:** the review of the conflict-encoding plan, 2026-10-24.
+  Iceberg's retry is that work's test oracle, and this case makes the
+  retry wrong. Reproduces on `InMemoryCatalog` with a single writer.
+- **Fork:** fixed on `core-fixes` by 37f3402, "Core: Keep the deletes a
+  rewrite's older-sequence data files still need", which takes the
+  age-off half of PR #10962. Its test is
+  `TestRewriteFiles.testRewriteWithOldSequenceNumberKeepsTheDeletesAfterIt`.
+- **No workaround** to remove: the fuzzers' rewrites never set a data
+  sequence number.
+- **Canary:** `aRewriteWithAnOlderSequenceNumberKeepsTheDeletesItNeeds`.
 
 ## Accepted Iceberg Behavior
 

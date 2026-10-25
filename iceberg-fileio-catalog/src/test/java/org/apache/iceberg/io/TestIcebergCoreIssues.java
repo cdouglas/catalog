@@ -67,7 +67,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
- * Canaries for the Iceberg core bugs this project's fuzzers and reviews found, C1 to C24 in
+ * Canaries for the Iceberg core bugs this project's fuzzers and reviews found, C1 to C25 in
  * docs/ICEBERG_ISSUES.md: one test each, on Iceberg's own InMemoryCatalog, that asserts the bug is
  * absent. Upstream fixed C1, and the fork's core-fixes branch fixes the others, so every test
  * passes against the fork. A test that fails means its bug is back: a rebase dropped the fork's
@@ -723,6 +723,42 @@ class TestIcebergCoreIssues {
       }
     }
     assertThat(referenced).as(BACK, "C24").doesNotContain(a.location());
+  }
+
+  /**
+   * C25. A rewrite that keeps an older data sequence number for its new files must keep the delete
+   * files after that number, which still apply to them: the delete age-off took its minimum over
+   * the kept data manifests only.
+   */
+  @Test
+  void aRewriteWithAnOlderSequenceNumberKeepsTheDeletesItNeeds() throws IOException {
+    InMemoryCatalog catalog = catalog();
+    Table table =
+        catalog.buildTable(ID, SCHEMA).withProperty(TableProperties.FORMAT_VERSION, "2").create();
+    DataFile f = file("f");
+    table.newFastAppend().appendFile(f).commit();
+    long start = table.currentSnapshot().sequenceNumber(); // a compaction reads f
+    DeleteFile equality =
+        FileMetadata.deleteFileBuilder(table.spec())
+            .ofEqualityDeletes(1)
+            .withPath(path("eq"))
+            .withFileSizeInBytes(10)
+            .withRecordCount(1)
+            .build();
+    table.newRowDelta().addDeletes(equality).commit();
+    table.newFastAppend().appendFile(file("k")).commit(); // no live data file older than the delete
+
+    table.newRewrite().dataSequenceNumber(start).deleteFile(f).addFile(file("g")).commit();
+
+    List<String> deletesOfG = new ArrayList<>();
+    try (CloseableIterable<FileScanTask> tasks = catalog.loadTable(ID).newScan().planFiles()) {
+      for (FileScanTask task : tasks) {
+        if (task.file().location().equals(path("g"))) {
+          task.deletes().forEach(delete -> deletesOfG.add(delete.location()));
+        }
+      }
+    }
+    assertThat(deletesOfG).as(BACK, "C25").containsExactly(path("eq"));
   }
 
   /** Applies updates computed on {@code base}, as a REST server applies a client's commit. */

@@ -9,10 +9,10 @@ For invariants that must not regress, see [design.md](design.md). For the
 wire format see [SPEC.md](SPEC.md), [ATOMIC_FILE_LOG.md](ATOMIC_FILE_LOG.md)
 and [LOG.md](LOG.md). Bugs in Apache Iceberg itself are in
 [ICEBERG_ISSUES.md](ICEBERG_ISSUES.md). Upstream fixed C1 (1.11.0), and
-the fork's `core-fixes` branch fixes C2-C24, so this project's tests
+the fork's `core-fixes` branch fixes C2-C25, so this project's tests
 work around none of them (the workarounds for C2-C8 were dropped in
 63dd25e, b82ceb9, dbac28b, 411f73c, e2c6b7b and 890fd8d); `TestIcebergCoreIssues`
-asserts each is absent. On stock Iceberg 1.12.0 C2-C24 come back.
+asserts each is absent. On stock Iceberg 1.12.0 C2-C25 come back.
 
 An entry's ID is not reused: a fixed entry is deleted or marked
 resolved, and its ID retired. Retired: S3, D1-D3, D5-D7, D11, T1, T2,

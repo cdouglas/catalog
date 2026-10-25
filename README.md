@@ -93,7 +93,7 @@ branch carries both the atomic-operations hooks used by the base catalog
 and the manifest-list-inlining hooks used by `inline.manifests`.
 
 The fork adds these extension points. Its other changes to stock Iceberg
-include the fixes for core bugs C2 to C24 (branch `core-fixes`, which
+include the fixes for core bugs C2 to C25 (branch `core-fixes`, which
 `atomicio` sits on; see [docs/ICEBERG_ISSUES.md](docs/ICEBERG_ISSUES.md)),
 `TableMetadata.Builder.setLastUpdatedMillis` for inline replay, a guard
 that makes `RewriteTablePathUtil` reject inline-ML snapshots, catalog
