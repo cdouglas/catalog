@@ -80,7 +80,10 @@ public final class LogCatalogProperties {
    * lamport-minus-properties}, which lets an update that does not touch properties apply on a
    * table whose properties alone changed; {@code concern-vector}, which versions a table by its
    * concerns and refs; {@code blind-append}, which also lets appends that validate nothing land on
-   * one branch concurrently (docs/SPEC.md, "Conflict Encodings").
+   * one branch concurrently; {@code partition-vector} and {@code manifest-window}, which also let
+   * a commit that says what its retry checks (an overwrite, a row delta, a rewrite, a delete) land
+   * on a moved branch where those checks hold, judged by partition buckets or by the manifests
+   * written since (docs/SPEC.md, "Conflict Encodings").
    */
   public static final String CONFLICT_ENCODING = "fileio.catalog.conflict.encoding";
   public static final String DEFAULT_CONFLICT_ENCODING = LamportEncoding.NAME;

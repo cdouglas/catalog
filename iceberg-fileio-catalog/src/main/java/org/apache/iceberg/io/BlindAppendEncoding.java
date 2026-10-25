@@ -46,7 +46,7 @@ import org.apache.iceberg.ManifestFile;
  * it adds more than one snapshot to a moved table, it cannot be finalized and conflicts. Any other
  * record is judged as {@link ConcernVectorEncoding} judges it.
  */
-final class BlindAppendEncoding extends ConcernVectorEncoding {
+class BlindAppendEncoding extends ConcernVectorEncoding {
 
   static final String NAME = "blind-append";
 
@@ -56,7 +56,12 @@ final class BlindAppendEncoding extends ConcernVectorEncoding {
   static final int PARTITION_BUCKETS = 64;
 
   private BlindAppendEncoding() {
-    super(PARTITION_BUCKETS);
+    this(PARTITION_BUCKETS);
+  }
+
+  /** An encoding of {@code partitionBuckets} partition buckets. */
+  BlindAppendEncoding(int partitionBuckets) {
+    super(partitionBuckets);
   }
 
   @Override
@@ -70,38 +75,59 @@ final class BlindAppendEncoding extends ConcernVectorEncoding {
         || change.stages) {
       return super.reads(base, change, landing);
     }
-    String branch = change.advanced.iterator().next();
-    Witness witness =
-        Witness.of(base)
-            .concern(TableChange.Concern.TABLE)
-            .concern(TableChange.Concern.SPECS)
-            .concern(TableChange.Concern.REMOVAL)
-            .ref(branch, ConcernStamps.Ref.RESET);
+    Witness witness = guards(base, change);
     if (!change.drops.isEmpty()) {
-      witness.ref(branch, ConcernStamps.Ref.DROP);
+      witness.ref(change.advanced.iterator().next(), ConcernStamps.Ref.DROP);
     }
     if (landing.metadata().formatVersion() >= 3) {
       for (ManifestFile manifest : change.written) {
         if (manifest.content() == ManifestContent.DATA) {
           witness.partition(
-              ConcernStamps.Partition.DELETES_ADDED,
-              PartitionKey.bucket(manifest, PARTITION_BUCKETS));
+              ConcernStamps.Partition.DELETES_ADDED, PartitionKey.bucket(manifest, buckets()));
         }
       }
     }
     return witness;
   }
 
+  /**
+   * What a record that advances one branch with snapshots its producers judged (blind, or
+   * validated) reads, whatever its producers check: its branch not reset, no snapshots removed,
+   * its specs and the table unchanged.
+   */
+  static Witness guards(int base, TableChange change) {
+    return Witness.of(base)
+        .concern(TableChange.Concern.TABLE)
+        .concern(TableChange.Concern.SPECS)
+        .concern(TableChange.Concern.REMOVAL)
+        .ref(change.advanced.iterator().next(), ConcernStamps.Ref.RESET);
+  }
+
+  /** The partition buckets. */
+  int buckets() {
+    return PARTITION_BUCKETS;
+  }
+
+  /**
+   * Stamps, in the bucket of each manifest the change's snapshots wrote, what its files did: data
+   * files added or removed, delete files added. A manifest with neither (a merged or rewritten
+   * one's existing files) changes no partition; delete files removed are not a change any check
+   * reads.
+   */
   @Override
   void stamp(TableChange change, int version, ConcernStamps stamps) {
     super.stamp(change, version, stamps);
     for (ManifestFile manifest : change.written) {
-      int bucket = PartitionKey.bucket(manifest, PARTITION_BUCKETS);
+      int bucket = PartitionKey.bucket(manifest, buckets());
       if (manifest.content() == ManifestContent.DELETES) {
-        stamps.stampPartition(ConcernStamps.Partition.DELETES_ADDED, bucket, version);
+        if (manifest.hasAddedFiles()) {
+          stamps.stampPartition(ConcernStamps.Partition.DELETES_ADDED, bucket, version);
+        }
       } else {
-        stamps.stampPartition(ConcernStamps.Partition.DATA_ADDED, bucket, version);
-        if (manifest.deletedFilesCount() != null && manifest.deletedFilesCount() > 0) {
+        if (manifest.hasAddedFiles()) {
+          stamps.stampPartition(ConcernStamps.Partition.DATA_ADDED, bucket, version);
+        }
+        if (manifest.hasDeletedFiles()) {
           stamps.stampPartition(ConcernStamps.Partition.DATA_REMOVED, bucket, version);
         }
       }

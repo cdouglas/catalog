@@ -481,7 +481,9 @@ The encodings:
 | `lamport` | the version read | none | nothing |
 | `lamport-minus-properties` | the version read, and whether the record touches properties | the version at which properties last changed, and at which anything else did | a record that does not touch properties, on a table whose properties alone changed |
 | `concern-vector` | the concerns the record reads, and the branches it advances | the version at which each concern last changed (properties, schema, specs, sort orders, the table itself, statistics, snapshot removal), and for 16 buckets of ref names, the version at which a ref in it last advanced, was last reset, and last dropped manifests | a commit racing property, statistics or sort-order changes, or commits and refs on other branches |
-| `blind-append` | as `concern-vector`; for a blind record (every new snapshot's producer `BLIND`), no base version: its branch not reset (nor, if it merged manifests, dropping manifests), no snapshots removed, specs and the table unchanged, and in v3 no delete files added in its partitions | `concern-vector`'s, and for 64 partition buckets the version at which delete files (and data files) were last added there | concurrent appends to one branch (streaming ingest), each merged onto the one before |
+| `blind-append` | as `concern-vector`; for a blind record (every new snapshot's producer `BLIND`), no base version: its branch not reset (nor, if it merged manifests, dropping manifests), no snapshots removed, specs and the table unchanged, and in v3 no delete files added in its partitions | `concern-vector`'s, and for 64 partition buckets the version at which data files were last added, delete files added, and data files removed there | concurrent appends to one branch (streaming ingest), each merged onto the one before |
+| `partition-vector` | as `blind-append`; for a validated record (every new snapshot's producer `VALIDATED` or `BLIND`, on one branch), no base version: blind-append's guards and the schema, and for each of its checks, no change of the check's kind in the partition buckets its scope covers | `blind-append`'s | as `blind-append`, and overwrites, row deltas (MERGE, UPDATE, DELETE), deletes, rewrites (compaction) and dynamic overwrites racing commits in other partitions, or commits their checks do not read (a compaction racing appends) |
+| `manifest-window` | as `concern-vector`; for a blind or validated record of one snapshot on one branch: blind-append's guards (and the schema, if validated), and its checks, judged against each manifest written by the snapshots from its parent to its branch's head where it lands | `concern-vector`'s | as `partition-vector`, and a check whose scope buckets cannot name (a range filter), and commits on other branches |
 
 The concern encodings (`ConcernEncoding`) keep the Lamport witness for
 what Iceberg commits once: a schema or partition-spec update, or a ref
@@ -499,6 +501,29 @@ stamps the concerns its updates change; full metadata stamps what changed
 if only properties or statistics did, and every stamp otherwise; a metadata
 location or a rename stamps every one. A stamp is a table version, so it
 only grows (`ConcernStamps`).
+
+A validated record's checks are its producer's (`Footprint`, carried with
+each new snapshot, [SPEC_TM.md](SPEC_TM.md)): each says that no commit
+since its parent added data files, added delete files, or removed data
+files in a scope (every file; a row filter; partitions), the checks its
+retry's validation would make and, for a filter it deletes by or the
+partitions it drops, the files its retry would delete afresh. Every
+commit's files count, whatever its operation and branch under
+`partition-vector`, and whatever its operation under `manifest-window`:
+Iceberg's validations skip some operations (a compaction's new files are
+not data added), so both admit fewer than Iceberg's retry would, never more.
+`partition-vector` stamps a manifest's files in the bucket of its partition
+summaries (a partition's spec and values, hashed), or in every bucket if it
+spans partitions or holds an unpartitioned spec's delete files, and reads,
+for a filter, the buckets of the partitions its inclusive projection onto
+each spec names by equality (every bucket for a range). `manifest-window`
+keeps no partition stamps: it walks its branch from the head where it
+lands back to the record's parent and reads each manifest those snapshots
+wrote, by content, counts and partition summaries (a filter through
+Iceberg's `ManifestEvaluator`); a window it cannot see (a snapshot without
+an inline list, or longer than 1000 snapshots) conflicts. A validated
+record's removed manifests must be in its branch's head where it lands
+(`Landing.unmergeable`).
 
 ## Commits
 

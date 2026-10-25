@@ -181,6 +181,7 @@ Every configuration passes:
 | `sched-*` | each fuzzer's schedules | 33 to 7,636 |
 | `concerns`, `concerns-faults` | conflict encodings: a table's concerns as entities (below); with every fault | 2,097; 14,587 |
 | `blind-appends` | two blind appends, with every fault | 1,009 |
+| `validated` | three validated commits on partitions (below) | 2,133 |
 
 **Conflict encodings.** A conflict encoding (fileio-catalog's
 `ConflictEncoding`) versions a table by its concerns. In the model the
@@ -190,7 +191,11 @@ change reads `props` and an append reads `main` (concern-vector's witnesses),
 so either applies after the other; a change an encoding cannot see into
 reads `v`, the Lamport witness. A blind append (blind-append) reads nothing:
 `T({}, {"main", "v"})`, which `Verify` admits anywhere and only the record's
-id keeps from applying twice. That the stamps' judgments are sound rests on
+id keeps from applying twice. A validated commit (partition-vector,
+manifest-window) reads the partitions its checks cover and writes those it
+changes: with `PEnts`, commits on `p1` and `p2` apply in either order, and
+two on `p1` conflict, whichever lands second (`validated`). That the stamps'
+judgments are sound rests on
 S3, that a version counts the changes, which `StampsCount` states: the
 switch `basever` sets an entity's version to one past its version where the
 record was staged (`wv`), as a table version set to the record's base plus
@@ -420,6 +425,7 @@ Every configuration of the correct protocol passes:
 | `log-three` | three writers, with compaction | 1,259,308 |
 | `log-concerns`, `log-concerns-faults` | a table's concerns as entities; with every fault | 890; 18,562 |
 | `log-blind-appends` | two blind appends, with compaction and every fault | 301,950 |
+| `log-validated` | three validated commits on partitions | 890 |
 
 **Coverage.** `check.py --witnesses` reaches, in the passing configurations:
 

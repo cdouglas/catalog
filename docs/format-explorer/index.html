@@ -678,7 +678,31 @@
       },
       "CommitFootprint": {
         "fields": [
-          {"number": 1, "name": "kind", "type": "FootprintKind", "repeated": false, "packed": false, "oneof": null, "comment": ""}
+          {"number": 1, "name": "kind", "type": "FootprintKind", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "checks", "type": "FootprintCheck", "repeated": true, "packed": true, "oneof": null, "comment": "A VALIDATED commit's checks, in its producer's order: what its retry would check of the commits since its parent."}
+        ]
+      },
+      "FootprintCheck": {
+        "fields": [
+          {"number": 1, "name": "kind", "type": "CheckKind", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "filter", "type": "string", "repeated": false, "packed": false, "oneof": null, "comment": "The row filter, as Iceberg's expression JSON (ExpressionParser)."},
+          {"number": 3, "name": "partitions", "type": "PartitionScope", "repeated": false, "packed": false, "oneof": null, "comment": "Partitions; present, if empty, for a scope of none."}
+        ]
+      },
+      "PartitionScope": {
+        "fields": [
+          {"number": 1, "name": "tuples", "type": "PartitionTuple", "repeated": true, "packed": true, "oneof": null, "comment": ""}
+        ]
+      },
+      "PartitionTuple": {
+        "fields": [
+          {"number": 1, "name": "spec_id", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "values", "type": "PartitionValue", "repeated": true, "packed": true, "oneof": null, "comment": ""}
+        ]
+      },
+      "PartitionValue": {
+        "fields": [
+          {"number": 1, "name": "value", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": ""}
         ]
       },
       "CompactSummary": {
@@ -821,7 +845,14 @@
       "FootprintKind": [
         {"name": "FOOTPRINT_KIND_UNSPECIFIED", "number": 0},
         {"name": "BLIND", "number": 1},
-        {"name": "OPAQUE", "number": 2}
+        {"name": "OPAQUE", "number": 2},
+        {"name": "VALIDATED", "number": 3}
+      ],
+      "CheckKind": [
+        {"name": "CHECK_KIND_UNSPECIFIED", "number": 0},
+        {"name": "NO_DATA_ADDED", "number": 1},
+        {"name": "NO_DELETES_ADDED", "number": 2},
+        {"name": "NO_DATA_REMOVED", "number": 3}
       ],
       "OperationType": [
         {"name": "APPEND", "number": 0},
@@ -1008,9 +1039,9 @@
     {
       "name": "inline-manifest-list",
       "description": "An inline-ML table (fileio.catalog.inline.manifests): no manifest list files. The checkpoint carries each table's manifest_pool and per-snapshot snapshot_refs; a delta changes a snapshot's list with AddManifestDelta and RemoveManifestDelta.",
-      "hex": "4c43415400000002c00708011210019000000000700080000000000000011a3c0910c0bba496010000123100904e7a52a2e844c1c480c0843d603e68b30847003335c0f0f43ca7402e6d828bfe7d1f00e807acf76e65a434a80a8b8022eb06200110021802520808001001180022005211080110021800220977617265686f7573656ac5060801100218012206636c69636b732aa5051f8b08000000000000ff8d54db6edb300cfd95417bd900bbb19338b75f198a81b1e944a82e9e24af488bfefb48d996d3acb73c3810af873c249f456b9d8690ff45e7a535e2b0cc4480a3c2bcef65230ea228f74551344d4edf22dff267c79f62fe952213cad6106200e15787c542c1032e1ec1e1d9f61e17b592f583673bf021f7f8a74753636e7a7d44270ee5a8e8bb060236b9f624dbae3755b95b6f38c5a8afadeab5c919d8361375ef1c1a0a579f51439492e1f0a200bf9e45b874c88882ebeb2026dd64d94a54cd60c812026140b33dbd32e108a474480af2c66c8aa5ac3989976c70592697e0df770952a30fa0bbf0943c57c993fa8627eb2eaffc5b507e0e40f8e555d675f2056d7b133ef06cb0961ad48f72997d5bfe4c11aa19379cfcfbfea9834a7a4e830a35777c24607cce08678b9b802f53e64dcadcc1455968be50f6fdcb7d4695b4d02b22bbc37a22b00317244f5d940e4c5eebaf084e34fd6e805b1d1c18cfb3cf4d8a126f7b472339d21a5de3a3a4f11b20c4119c734eca2b6cd685dcba065d1ac6241960bc522678317ae76c87141b3df7dd3e1a5e0cc21620ef14848875dacd6974a6ad7a7432e05d0077c290b7922cbc7cc2fc78091c4d54abcd6e5beccb65321db6fe6e041ed970b49321198cefbbdaeacea1e7db40db47e344b64f3e34344af3fe19e8fcd90e6351edaa7d55adf6fbfd6eb75e964555ae98e13656a5411afeffdc631c8123d1549f058d4ff219697ee3847c21eab4896f5d18df6b0db487dc7d62623a67d07568784ca169e8344542b8c5dcd832891dd6c46d9415cb35136503a8ffad07f18d3555a7c1c896b0e571d3e80419250dd2217da38e9b43c6c343450572947109ee5f6dc68d263549d9d370233fecc9272de5dc1a03c43a3f8e580c11933577e5bad0efab62bd6f76d59a17fe1fe9c4e0a698060000320048003a3c0a17636c69636b732f6d657461646174612f6d312e6176726f108030280130013951515151515151514001588008720c1a04e84e00002204e84e00003a3c0a17636c69636b732f6d657461646174612f6d322e6176726f108030280130013951515151515151514001588008720c1a04e94e00002204e94e0000420d09515151515151515110001001df010a100196a49d47487d95bab956560e3ee9bf12ca011ac7014ac401080110021abd0110c0e1f6a4ea3218010a240a2209525252525252525212001a0a1001188008280130800820003951515151515151510a1912170a046d61696e1152525252525252521a066272616e63680a246a220952525252525252521217636c69636b732f6d657461646174612f6d312e6176726f0a4b6249095252525252525252123c0a17636c69636b732f6d657461646174612f6d332e6176726f108030280230023952525252525252524001588008720c1a04e84e00002204e84e00001800",
+      "hex": "4c43415400000002c00708011210019000000000700080000000000000011a3c0910c0bba496010000123100904e7a52a2e844c1c480c0843d603e68b30847003335c0f0f43ca7402e6d828bfe7d1f00e807acf76e65a434a80a8b8022eb06200110021802520808001001180022005211080110021800220977617265686f7573656ac5060801100218012206636c69636b732aa5051f8b08000000000000ff8d54db6edb300cfd95417bd900bbb19338b75f198a81b1e944a82e9e24af488bfefb48d996d3acb73c3810af873c249f456b9d8690ff45e7a535e2b0cc4480a3c2bcef65230ea228f74551344d4edf22dff267c79f62fe952213cad6106200e15787c542c1032e1ec1e1d9f61e17b592f583673bf021f7f8a74753636e7a7d44270ee5a8e8bb060236b9f624dbae3755b95b6f38c5a8afadeab5c919d8361375ef1c1a0a579f51439492e1f0a200bf9e45b874c88882ebeb2026dd64d94a54cd60c812026140b33dbd32e108a474480af2c66c8aa5ac3989976c70592697e0df770952a30fa0bbf0943c57c993fa8627eb2eaffc5b507e0e40f8e555d675f2056d7b133ef06cb0961ad48f72997d5bfe4c11aa19379cfcfbfea9834a7a4e830a35777c24607cce08678b9b802f53e64dcadcc1455968be50f6fdcb7d4695b4d02b22bbc37a22b00317244f5d940e4c5eebaf084e34fd6e805b1d1c18cfb3cf4d8a126f7b472339d21a5de3a3a4f11b20c4119c734eca2b6cd685dcba065d1ac6241960bc522678317ae76c87141b3df7dd3e1a5e0cc21620ef14848875dacd6974a6ad7a7432e05d0077c290b7922cbc7cc2fc78091c4d54abcd6e5beccb65321db6fe6e041ed970b49321198cefbbdaeacea1e7db40db47e344b64f3e34344af3fe19e8fcd90e6351edaa7d55adf6fbfd6eb75e964555ae98e13656a5411afeffdc631c8123d1549f058d4ff219697ee3847c21eab4896f5d18df6b0db487dc7d62623a67d07568784ca169e8344542b8c5dcd832891dd6c46d9415cb35136503a8ffad07f18d3555a7c1c896b0e571d3e80419250dd2217da38e9b43c6c343450572947109ee5f6dc68d263549d9d370233fecc9272de5dc1a03c43a3f8e580c11933577e5bad0efab62bd6f76d59a17fe1fe9c4e0a698060000320048003a3c0a17636c69636b732f6d657461646174612f6d312e6176726f108030280130013951515151515151514001588008720c1a04e84e00002204e84e00003a3c0a17636c69636b732f6d657461646174612f6d322e6176726f108030280130013951515151515151514001588008720c1a04e94e00002204e94e0000420d09515151515151515110001001f7010a100196a49d47487d95bab956560e3ee9bf12e2011adf014adc01080110021ad50110c0e1f6a4ea3218010a3c0a3a09525252525252525212001a0c080310011880082801308008200039515151515151515152140803121008021a0c0a0a080012060a04e84e00000a1912170a046d61696e1152525252525252521a066272616e63680a246a220952525252525252521217636c69636b732f6d657461646174612f6d312e6176726f0a4b6249095252525252525252123c0a17636c69636b732f6d657461646174612f6d332e6176726f108030280230023952525252525252524001588008720c1a04e84e00002204e84e00001800",
       "notes": [
-        {"start": 970, "end": 1195, "label": "A CAS write. The checkpoint's InlineTable holds the pool [m1, m2] and S1's indices [0, 1]. The record's delta adds S2 on S1 with an empty manifest_list_suffix (its list is inline), removes m1 from S2's list and inserts m3 at position 0: replay builds S2's list from its parent's, less the removed, with the added at their positions, [m3, m2]."},
+        {"start": 970, "end": 1219, "label": "A CAS write. The checkpoint's InlineTable holds the pool [m1, m2] and S1's indices [0, 1]. The record's delta adds S2 on S1 with an empty manifest_list_suffix (its list is inline), removes m1 from S2's list and inserts m3 at position 0: replay builds S2's list from its parent's, less the removed, with the added at their positions, [m3, m2]. Each new snapshot carries its producer's footprint: S1's BLIND (an append), S2's VALIDATED (a compaction of day 20200, m1's files into m3's, whose retry would check that no delete files were added in that day: one FootprintCheck, NO_DELETES_ADDED, over a PartitionScope of one PartitionTuple, the day as a 4-byte little-endian int)."},
         {"start": -1, "end": -1, "label": "snapshot_refs.pool_indices is a repeated int32 the codec writes unpacked, one varint each: catalog.proto declares it [packed = false]."}
       ],
       "structuralViews": [

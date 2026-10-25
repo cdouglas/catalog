@@ -585,7 +585,7 @@ public class FormatExplorerFixtures {
     byte[] first =
         InlineDeltaCodec.encodeDelta(
             List.of(
-                append(s1, null, "", 0L),
+                withFootprint(append(s1, null, "", 0L), "append", Footprint.BLIND),
                 main(s1),
                 new InlineDeltaCodec.AddManifestUpdate(s1, m1, "", 0),
                 new InlineDeltaCodec.AddManifestUpdate(s1, m2, "", 1)),
@@ -601,7 +601,7 @@ public class FormatExplorerFixtures {
     byte[] second =
         InlineDeltaCodec.encodeDelta(
             List.of(
-                append(s2, s1, "", 0L),
+                withFootprint(append(s2, s1, "", 0L), "replace", compactionOfDay(20_200)),
                 main(s2),
                 new InlineDeltaCodec.RemoveManifestUpdate(s2, m1.path()),
                 new InlineDeltaCodec.AddManifestUpdate(s2, m3, "", 0)),
@@ -612,7 +612,11 @@ public class FormatExplorerFixtures {
             + "[0, 1]. The record's delta adds S2 on S1 with an empty manifest_list_suffix (its "
             + "list is inline), removes m1 from S2's list and inserts m3 at position 0: replay "
             + "builds S2's list from its parent's, less the removed, with the added at their "
-            + "positions, [m3, m2].");
+            + "positions, [m3, m2]. Each new snapshot carries its producer's footprint: S1's "
+            + "BLIND (an append), S2's VALIDATED (a compaction of day 20200, m1's files into "
+            + "m3's, whose retry would check that no delete files were added in that day: one "
+            + "FootprintCheck, NO_DELETES_ADDED, over a PartitionScope of one PartitionTuple, "
+            + "the day as a 4-byte little-endian int).");
     return log.scenario(
         "inline-manifest-list",
         "An inline-ML table (fileio.catalog.inline.manifests): no manifest list files. The "
@@ -877,6 +881,27 @@ public class FormatExplorerFixtures {
     summary.put("total-records", "1024");
     return new InlineDeltaCodec.AddSnapshotUpdate(
         snapshotId, manifestList, summary, timestampDeltaMs, null, null, parentId, null, null);
+  }
+
+  /** {@code add} as an {@code operation}, with its producer's footprint. */
+  private static InlineDeltaCodec.AddSnapshotUpdate withFootprint(
+      InlineDeltaCodec.AddSnapshotUpdate add, String operation, Footprint footprint) {
+    Map<String, String> summary = new LinkedHashMap<>(add.summary);
+    summary.put("operation", operation);
+    return new InlineDeltaCodec.AddSnapshotUpdate(
+        add.snapshotId, add.manifestListSuffix, summary, add.timestampDeltaMs, add.schemaId,
+        add.addedRows, add.parentSnapshotId, add.firstRowId, add.keyId, footprint);
+  }
+
+  /** A compaction's footprint: no delete files added in day {@code day} of the demo spec. */
+  private static Footprint compactionOfDay(int day) {
+    ByteBuffer value =
+        ByteBuffer.allocate(4).order(java.nio.ByteOrder.LITTLE_ENDIAN).putInt(0, day);
+    return Footprint.validated(
+        List.of(
+            new Footprint.Check(
+                org.apache.iceberg.CommitFootprint.Check.Kind.NO_DELETES_ADDED,
+                Footprint.Scope.partitions(List.of(new Footprint.Partition(0, List.of(value)))))));
   }
 
   private static InlineDeltaCodec.SetSnapshotRefUpdate main(long snapshotId) {

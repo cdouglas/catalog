@@ -95,6 +95,8 @@ CONFIGS = {
                          "MaxFaults": "1", "FaultKinds": ALL_FAULTS, "Strict": "TRUE"}, "pass"),
     "blind-appends": ({"Entities": "<- CEnts", "Shapes": "<- BlindAppends", "MaxCount": "1",
                        "MaxFaults": "1", "FaultKinds": ALL_FAULTS}, "pass"),
+    "validated": ({"Writers": "{1, 2, 3}", "Skew": "<- NoSkew3", "Entities": "<- PEnts",
+                   "Shapes": "<- Validated", "MaxCount": "1"}, "pass"),
     # Calibration: each bug, put back, must break a property.
     "basever": ({"Entities": "<- CEnts", "Shapes": "<- Concerns2", "MaxCount": "1",
                  "Bugs": '{"basever"}'}, {"StampsCount", "HonestFailed", "Serializable"}),
@@ -184,6 +186,8 @@ LOG_CONFIGS = {
                              "MaxFaults": "1", "FaultKinds": LOG_FAULTS}, "pass"),
     "log-blind-appends": ({**COMPACT1, "Entities": "<- CEnts", "Shapes": "<- BlindAppends",
                            "MaxFaults": "1", "FaultKinds": LOG_FAULTS}, "pass"),
+    "log-validated": ({"Writers": "{1, 2, 3}", "Skew": "<- NoSkew3", "Entities": "<- PEnts",
+                       "Shapes": "<- Validated"}, "pass"),
     # Calibration: each bug, put back, must break a property.
     "log-basever": ({"Entities": "<- CEnts", "Shapes": "<- Concerns2", "Bugs": '{"basever"}'},
                     {"StampsCount", "HonestFailed", "Serializable"}),

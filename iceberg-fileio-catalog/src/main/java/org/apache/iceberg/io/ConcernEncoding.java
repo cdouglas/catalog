@@ -50,6 +50,8 @@ abstract class ConcernEncoding implements ConflictEncoding<ConcernEncoding.Witne
     /** The partition buckets it reads, by kind of change; {@link PartitionKey#ALL} for every one. */
     final Map<ConcernStamps.Partition, Set<Integer>> partitions =
         new EnumMap<>(ConcernStamps.Partition.class);
+    /** What it reads beyond stamps, judged on the table where it lands; null for nothing. */
+    Window window;
 
     private Witness(int base, boolean whole) {
       this.base = base;
@@ -88,12 +90,26 @@ abstract class ConcernEncoding implements ConflictEncoding<ConcernEncoding.Witne
       return this;
     }
 
+    Witness window(Window read) {
+      this.window = read;
+      return this;
+    }
+
     @Override
     public String toString() {
       return whole ? "version " + base
           : "concerns " + concerns + ", refs " + refs + ", partitions " + partitions
-              + " since " + base;
+              + (window != null ? ", " + window : "") + " since " + base;
     }
+  }
+
+  /**
+   * What a witness reads of the table where its record lands beyond the stamps (the manifests
+   * commits since wrote): a deterministic judgment of that table, which, once false, stays false
+   * on any later version where the witness's stamps still hold (S2).
+   */
+  interface Window {
+    boolean holds(ReplayView landing);
   }
 
   private final ConcernStamps.Codec codec;
@@ -166,7 +182,7 @@ abstract class ConcernEncoding implements ConflictEncoding<ConcernEncoding.Witne
         }
       }
     }
-    return true;
+    return witness.window == null || witness.window.holds(landing);
   }
 
   @Override

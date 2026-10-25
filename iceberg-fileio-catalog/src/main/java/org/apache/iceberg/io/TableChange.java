@@ -78,10 +78,18 @@ final class TableChange {
   final List<ManifestFile> written;
   /**
    * Whether it is blind: snapshots whose producers say they validate nothing ({@link
-   * org.apache.iceberg.CommitFootprint#BLIND}), and their refs and manifest lists, and nothing
-   * else.
+   * Footprint#BLIND}), and their refs and manifest lists, and nothing else.
    */
   final boolean blind;
+  /**
+   * Whether it is validated: snapshots whose producers say what their retries check ({@link
+   * Footprint.Kind#VALIDATED}, or blind), and their refs and manifest lists, and nothing else.
+   */
+  final boolean validated;
+  /** What its validated snapshots' retries check, in their order. */
+  final List<Footprint.Check> checks;
+  /** The snapshots it adds, in its order. */
+  final List<AddSnapshotUpdate> snapshots;
 
   private TableChange(
       EnumSet<Concern> concerns,
@@ -93,7 +101,10 @@ final class TableChange {
       boolean commitOnce,
       Set<String> drops,
       List<ManifestFile> written,
-      boolean blind) {
+      boolean blind,
+      boolean validated,
+      List<Footprint.Check> checks,
+      List<AddSnapshotUpdate> snapshots) {
     this.concerns = concerns;
     this.advanced = advanced;
     this.reset = reset;
@@ -104,6 +115,9 @@ final class TableChange {
     this.drops = drops;
     this.written = written;
     this.blind = blind;
+    this.validated = validated;
+    this.checks = checks;
+    this.snapshots = snapshots;
   }
 
   /**
@@ -133,16 +147,25 @@ final class TableChange {
     Map<String, Long> heads = new java.util.HashMap<>();
     boolean commitOnce = false;
     boolean blind = !added.isEmpty();
+    boolean validated = !added.isEmpty();
+    List<Footprint.Check> checks = new ArrayList<>();
     for (AddSnapshotUpdate add : action.addedSnapshots()) {
-      blind &= add.footprint != null
-          && add.footprint.kind() == org.apache.iceberg.CommitFootprint.Kind.BLIND;
+      Footprint.Kind kind = add.footprint != null ? add.footprint.kind : Footprint.Kind.OPAQUE;
+      blind &= kind == Footprint.Kind.BLIND;
+      validated &= kind != Footprint.Kind.OPAQUE;
+      if (kind == Footprint.Kind.VALIDATED) {
+        checks.addAll(add.footprint.checks);
+      }
     }
     Set<Long> dropping = new HashSet<>();
     List<ManifestFile> written = new ArrayList<>();
     for (DeltaUpdate update : action.delta().updates) {
-      blind &= update instanceof AddSnapshotUpdate || update instanceof SetSnapshotRefUpdate
+      boolean snapshotsOnly = update instanceof AddSnapshotUpdate
+          || update instanceof SetSnapshotRefUpdate
           || update instanceof InlineDeltaCodec.AddManifestUpdate
           || update instanceof InlineDeltaCodec.RemoveManifestUpdate;
+      blind &= snapshotsOnly;
+      validated &= snapshotsOnly;
       if (update instanceof InlineDeltaCodec.RemoveManifestUpdate) {
         dropping.add(((InlineDeltaCodec.RemoveManifestUpdate) update).snapshotId);
       } else if (update instanceof InlineDeltaCodec.AddManifestUpdate) {
@@ -224,7 +247,7 @@ final class TableChange {
           }
         });
     return new TableChange(concerns, advanced, reset, retained, !added.isEmpty(), stages,
-        commitOnce, drops, written, blind);
+        commitOnce, drops, written, blind, validated, checks, action.addedSnapshots());
   }
 
   /**
@@ -252,7 +275,8 @@ final class TableChange {
       return null;
     }
     return new TableChange(
-        concerns, Set.of(), Set.of(), Set.of(), false, false, false, Set.of(), List.of(), false);
+        concerns, Set.of(), Set.of(), Set.of(), false, false, false, Set.of(), List.of(), false,
+        false, List.of(), List.of());
   }
 
   private static com.fasterxml.jackson.databind.node.ObjectNode json(TableMetadata metadata) {

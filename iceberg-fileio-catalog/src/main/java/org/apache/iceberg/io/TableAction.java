@@ -146,14 +146,6 @@ final class TableAction {
     return updates(RemoveManifestUpdate.class);
   }
 
-  /**
-   * The producers' footprints the record carries: what each new snapshot's operation depends on.
-   * None yet; an encoding that needs one coarsens without it.
-   */
-  Object footprint() {
-    return null;
-  }
-
   /** Records that verify admitted the action on {@code view}. */
   void verifiedOn(ReplayView view) {
     this.verifiedOn = view;

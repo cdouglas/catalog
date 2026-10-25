@@ -403,17 +403,56 @@ message AddSnapshot {
 }
 
 message CommitFootprint {
-  FootprintKind kind = 1;
+  FootprintKind  kind   = 1;
+  // A VALIDATED commit's checks, in its producer's order: what its retry
+  // would check of the commits since its parent.
+  repeated FootprintCheck checks = 2;
 }
 
 // BLIND: the commit validates nothing and writes only new manifests (a fast
-// or merge append); its retry commits on any version of its branch. OPAQUE:
-// anything else. A kind a reader does not know (UNSPECIFIED included) reads
-// as no footprint.
+// or merge append); its retry commits on any version of its branch.
+// VALIDATED: its retry checks only its checks (an overwrite, a row delta, a
+// rewrite, a delete, a dynamic partition overwrite). OPAQUE: anything else.
+// A kind a reader does not know (UNSPECIFIED included) reads as no footprint.
 enum FootprintKind {
   FOOTPRINT_KIND_UNSPECIFIED = 0;
   BLIND                      = 1;
   OPAQUE                     = 2;
+  VALIDATED                  = 3;
+}
+
+// That no commit since added data files, added delete files, or removed data
+// files in a scope: a row filter, partitions, or (neither) every file. A
+// check of a kind a reader does not know makes its footprint OPAQUE.
+message FootprintCheck {
+  CheckKind      kind       = 1;
+  // The row filter, as Iceberg's expression JSON (ExpressionParser).
+  string         filter     = 2;
+  // Partitions; present, if empty, for a scope of none.
+  PartitionScope partitions = 3;
+}
+
+enum CheckKind {
+  CHECK_KIND_UNSPECIFIED = 0;
+  NO_DATA_ADDED          = 1;
+  NO_DELETES_ADDED       = 2;
+  NO_DATA_REMOVED        = 3;
+}
+
+message PartitionScope {
+  repeated PartitionTuple tuples = 1;
+}
+
+// A partition: its spec, and each field's value in Iceberg's single-value
+// serialization (as a manifest's partition summaries bound it).
+message PartitionTuple {
+  int32          spec_id = 1;
+  repeated PartitionValue values = 2;
+}
+
+// Absent value: null.
+message PartitionValue {
+  bytes          value = 1;
 }
 
 enum OperationType {

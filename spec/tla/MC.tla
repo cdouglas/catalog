@@ -83,6 +83,15 @@ Concerns2 == [w \in {1, 2} |->
 \* Blind appends (blind-append): each reads nothing, so both apply in either
 \* order; a copy of one would apply again but for its id.
 BlindAppends == [w \in {1, 2} |-> << T({}, {"main", "v"}) >>]
+\* Validated commits (partition-vector, manifest-window): a commit to main that
+\* checks a partition reads it and writes it. Commits checking and writing
+\* partitions p1 and p2 (writers 1 and 2) apply in either order; a third on p1
+\* conflicts with the first, whichever lands second.
+PEnts == {"v", "main", "p1", "p2"}
+Validated == [w \in {1, 2, 3} |->
+                CASE w = 1 -> << T({"p1"}, {"p1", "main", "v"}) >>
+                  [] w = 2 -> << T({"p2"}, {"p2", "main", "v"}) >>
+                  [] OTHER -> << T({"p1"}, {"p1", "main", "v"}) >>]
 
 NoSkew2 == [w \in {1, 2} |-> 0]
 NoSkew3 == [w \in {1, 2, 3} |-> 0]

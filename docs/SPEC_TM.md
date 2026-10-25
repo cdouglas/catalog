@@ -236,15 +236,41 @@ message AddSnapshot {
                                              // commit depends on (below)
 }
 
-message CommitFootprint { FootprintKind kind = 1; }
-enum FootprintKind { FOOTPRINT_KIND_UNSPECIFIED = 0; BLIND = 1; OPAQUE = 2; }
+message CommitFootprint {
+  FootprintKind kind = 1;
+  repeated FootprintCheck checks = 2;        // VALIDATED: what its retry checks
+}
+enum FootprintKind {
+  FOOTPRINT_KIND_UNSPECIFIED = 0; BLIND = 1; OPAQUE = 2; VALIDATED = 3;
+}
+message FootprintCheck {
+  CheckKind      kind       = 1;   // NO_DATA_ADDED = 1, NO_DELETES_ADDED = 2,
+                                   // NO_DATA_REMOVED = 3
+  string         filter     = 2;   // a row filter: Iceberg's expression JSON
+  PartitionScope partitions = 3;   // partitions; neither field: every file
+}
+message PartitionScope { repeated PartitionTuple tuples = 1; }
+message PartitionTuple {
+  int32 spec_id = 1;
+  repeated PartitionValue values = 2;   // each field's, in order
+}
+message PartitionValue { bytes value = 1; }   // single-value form; absent: null
 ```
 
 `footprint` is what the snapshot's producer says its commit depends on
 beyond what it writes (Iceberg's `SnapshotProducer.footprint`, carried by
 the `InlineSnapshot` an inline-ML producer returns): `BLIND` for a fast or
 merge append that validates nothing, whose retry commits on any version of
-its branch; `OPAQUE` for anything else. A snapshot whose producer the writer
+its branch; `VALIDATED` for a merging producer (an overwrite, a row delta,
+a rewrite, a delete, a dynamic partition overwrite) whose retry checks only
+its `checks`: each of its validations, in its scope, and for a row filter
+it deletes by or a partition it drops, that no data or delete files were
+added there (the retry would delete them too); `OPAQUE` for anything else
+(a commit that validates its ancestry, appends a manifest that keeps its
+path, has no parent, or cherry-picks). A partition value is the field's
+Iceberg single-value serialization, as a manifest's partition summaries
+bound it; a check of a kind a reader does not know makes the footprint
+`OPAQUE`. A snapshot whose producer the writer
 does not know (one with a manifest list file) has none, and a conflict
 encoding that needs it judges the record by its version (`blind-append`).
 

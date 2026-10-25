@@ -24,6 +24,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -48,6 +49,7 @@ import org.apache.iceberg.InlineDeltaSnapshots;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.UnboundPartitionSpec;
 import org.apache.iceberg.UnboundSortOrder;
+import org.apache.iceberg.util.ByteBuffers;
 import org.apache.iceberg.util.JsonUtil;
 
 /**
@@ -201,8 +203,23 @@ public class InlineDeltaCodec {
   // CommitFootprint field numbers, and FootprintKind wire values (1-based, so a missing kind is
   // told apart; the decoder treats it as no footprint)
   private static final int FP_KIND = 1;
+  private static final int FP_CHECKS = 2;
   static final int FK_BLIND = 1;
   static final int FK_OPAQUE = 2;
+  static final int FK_VALIDATED = 3;
+
+  // FootprintCheck, PartitionScope, PartitionTuple and PartitionValue field numbers, and
+  // CheckKind wire values (1-based; a kind the decoder does not know makes the footprint opaque)
+  private static final int FC_KIND = 1;
+  private static final int FC_FILTER = 2;
+  private static final int FC_PARTITIONS = 3;
+  private static final int PS_TUPLES = 1;
+  private static final int PT_SPEC_ID = 1;
+  private static final int PT_VALUES = 2;
+  private static final int PV_VALUE = 1;
+  static final int CK_NO_DATA_ADDED = 1;
+  static final int CK_NO_DELETES_ADDED = 2;
+  static final int CK_NO_DATA_REMOVED = 3;
 
   // CompactSummary field numbers
   private static final int CS_OPERATION = 1;
@@ -851,9 +868,10 @@ public class InlineDeltaCodec {
           summary.put("operation", snap.operation());
         }
         // The producer's footprint, which only an inline snapshot carries.
-        org.apache.iceberg.CommitFootprint footprint =
+        Footprint footprint =
             snap instanceof org.apache.iceberg.InlineSnapshot
-                ? ((org.apache.iceberg.InlineSnapshot) snap).footprint()
+                ? Footprint.of(
+                    ((org.apache.iceberg.InlineSnapshot) snap).footprint(), newMeta.specsById())
                 : null;
         updates.add(new AddSnapshotUpdate(
             snap.snapshotId(), suffix, summary,
@@ -1605,7 +1623,7 @@ public class InlineDeltaCodec {
      * What the producer's commit depends on beyond what it writes, if its writer knew (an inline
      * snapshot's producer); null if not.
      */
-    public final org.apache.iceberg.CommitFootprint footprint;
+    public final Footprint footprint;
 
     /**
      * Back-compat constructor: no explicit parent/firstRowId/keyId; schemaId and addedRows 0 are
@@ -1631,8 +1649,7 @@ public class InlineDeltaCodec {
     public AddSnapshotUpdate(
         long snapshotId, String manifestListSuffix, Map<String, String> summary,
         long timestampDeltaMs, Integer schemaId, Long addedRows,
-        Long parentSnapshotId, Long firstRowId, String keyId,
-        org.apache.iceberg.CommitFootprint footprint) {
+        Long parentSnapshotId, Long firstRowId, String keyId, Footprint footprint) {
       this.snapshotId = snapshotId;
       this.manifestListSuffix = manifestListSuffix;
       this.summary = summary;
@@ -1971,11 +1988,7 @@ public class InlineDeltaCodec {
         writeString(inner, SNAP_KEY_ID, u.keyId);
       }
       if (u.footprint != null) {
-        ByteArrayOutputStream footprint = new ByteArrayOutputStream();
-        writeVarint(footprint, FP_KIND,
-            u.footprint.kind() == org.apache.iceberg.CommitFootprint.Kind.BLIND
-                ? FK_BLIND : FK_OPAQUE);
-        writeLengthDelimited(inner, SNAP_FOOTPRINT, footprint.toByteArray());
+        writeLengthDelimited(inner, SNAP_FOOTPRINT, encodeFootprint(u.footprint));
       }
       writeLengthDelimited(out, UPDATE_ADD_SNAPSHOT, inner.toByteArray());
 
@@ -2336,7 +2349,7 @@ public class InlineDeltaCodec {
     Long parentId = null;
     Long firstRowId = null;
     String keyId = null;
-    org.apache.iceberg.CommitFootprint footprint = null;
+    Footprint footprint = null;
 
     while (in.available() > 0) {
       int tag = readVarint(in);
@@ -2361,27 +2374,152 @@ public class InlineDeltaCodec {
         schemaId, addedRows, parentId, firstRowId, keyId, footprint);
   }
 
-  /** A footprint, or null for a kind this build does not know: no footprint, which coarsens. */
-  private static org.apache.iceberg.CommitFootprint decodeFootprint(byte[] bytes)
-      throws IOException {
+  private static byte[] encodeFootprint(Footprint footprint) throws IOException {
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    switch (footprint.kind) {
+      case BLIND: writeVarint(out, FP_KIND, FK_BLIND); break;
+      case VALIDATED: writeVarint(out, FP_KIND, FK_VALIDATED); break;
+      default: writeVarint(out, FP_KIND, FK_OPAQUE);
+    }
+    for (Footprint.Check check : footprint.checks) {
+      ByteArrayOutputStream c = new ByteArrayOutputStream();
+      switch (check.kind) {
+        case NO_DATA_ADDED: writeVarint(c, FC_KIND, CK_NO_DATA_ADDED); break;
+        case NO_DELETES_ADDED: writeVarint(c, FC_KIND, CK_NO_DELETES_ADDED); break;
+        default: writeVarint(c, FC_KIND, CK_NO_DATA_REMOVED);
+      }
+      if (check.scope.filter != null) {
+        writeString(c, FC_FILTER, check.scope.filter);
+      } else if (check.scope.partitions != null) {
+        // present, if empty, for a scope of no partitions; absent with no filter: every file
+        ByteArrayOutputStream scope = new ByteArrayOutputStream();
+        for (Footprint.Partition partition : check.scope.partitions) {
+          ByteArrayOutputStream tuple = new ByteArrayOutputStream();
+          writeVarint(tuple, PT_SPEC_ID, partition.specId);
+          for (ByteBuffer value : partition.values) {
+            ByteArrayOutputStream v = new ByteArrayOutputStream();
+            if (value != null) {
+              writeLengthDelimited(v, PV_VALUE, ByteBuffers.toByteArray(value));
+            }
+            writeLengthDelimited(tuple, PT_VALUES, v.toByteArray());
+          }
+          writeLengthDelimited(scope, PS_TUPLES, tuple.toByteArray());
+        }
+        writeLengthDelimited(c, FC_PARTITIONS, scope.toByteArray());
+      }
+      writeLengthDelimited(out, FP_CHECKS, c.toByteArray());
+    }
+    return out.toByteArray();
+  }
+
+  /**
+   * A footprint; null for a kind this build does not know (no footprint, which coarsens), and
+   * opaque for a check it cannot read.
+   */
+  private static Footprint decodeFootprint(byte[] bytes) throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
     int kind = 0;
+    List<Footprint.Check> checks = new ArrayList<>();
+    boolean unreadable = false;
     while (in.available() > 0) {
       int tag = readVarint(in);
       if (tag >>> 3 == FP_KIND) {
         kind = readVarint(in);
+      } else if (tag >>> 3 == FP_CHECKS) {
+        Footprint.Check check = decodeCheck(readLengthDelimitedBytes(in));
+        unreadable |= check == null;
+        if (check != null) {
+          checks.add(check);
+        }
       } else {
         skipField(in, tag & 0x7);
       }
     }
     switch (kind) {
       case FK_BLIND:
-        return org.apache.iceberg.CommitFootprint.BLIND;
+        return Footprint.BLIND;
       case FK_OPAQUE:
-        return org.apache.iceberg.CommitFootprint.OPAQUE;
+        return Footprint.OPAQUE;
+      case FK_VALIDATED:
+        return unreadable ? Footprint.OPAQUE : Footprint.validated(checks);
       default:
         return null;
     }
+  }
+
+  /** A check, or null for a kind this build does not know. */
+  private static Footprint.Check decodeCheck(byte[] bytes) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    int kind = 0;
+    String filter = null;
+    List<Footprint.Partition> partitions = null;
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      switch (tag >>> 3) {
+        case FC_KIND: kind = readVarint(in); break;
+        case FC_FILTER: filter = readString(in); break;
+        case FC_PARTITIONS:
+          partitions = new ArrayList<>();
+          ByteArrayInputStream scope = new ByteArrayInputStream(readLengthDelimitedBytes(in));
+          while (scope.available() > 0) {
+            int t = readVarint(scope);
+            if (t >>> 3 == PS_TUPLES) {
+              partitions.add(decodePartition(readLengthDelimitedBytes(scope)));
+            } else {
+              skipField(scope, t & 0x7);
+            }
+          }
+          break;
+        default: skipField(in, tag & 0x7);
+      }
+    }
+    org.apache.iceberg.CommitFootprint.Check.Kind checkKind;
+    switch (kind) {
+      case CK_NO_DATA_ADDED:
+        checkKind = org.apache.iceberg.CommitFootprint.Check.Kind.NO_DATA_ADDED;
+        break;
+      case CK_NO_DELETES_ADDED:
+        checkKind = org.apache.iceberg.CommitFootprint.Check.Kind.NO_DELETES_ADDED;
+        break;
+      case CK_NO_DATA_REMOVED:
+        checkKind = org.apache.iceberg.CommitFootprint.Check.Kind.NO_DATA_REMOVED;
+        break;
+      default:
+        return null;
+    }
+    Footprint.Scope scope =
+        filter != null
+            ? Footprint.Scope.filter(filter)
+            : partitions != null ? Footprint.Scope.partitions(partitions)
+                : Footprint.Scope.EVERYTHING;
+    return new Footprint.Check(checkKind, scope);
+  }
+
+  private static Footprint.Partition decodePartition(byte[] bytes) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    int specId = 0;
+    List<ByteBuffer> values = new ArrayList<>();
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      if (tag >>> 3 == PT_SPEC_ID) {
+        specId = readVarint(in);
+      } else if (tag >>> 3 == PT_VALUES) {
+        ByteArrayInputStream v = new ByteArrayInputStream(readLengthDelimitedBytes(in));
+        ByteBuffer value = null;
+        while (v.available() > 0) {
+          int t = readVarint(v);
+          if (t >>> 3 == PV_VALUE) {
+            value = ByteBuffer.wrap(readLengthDelimitedBytes(v));
+          } else {
+            skipField(v, t & 0x7);
+          }
+        }
+        values.add(value);
+      } else {
+        skipField(in, tag & 0x7);
+      }
+    }
+    return new Footprint.Partition(specId, values);
   }
 
   // ============================================================

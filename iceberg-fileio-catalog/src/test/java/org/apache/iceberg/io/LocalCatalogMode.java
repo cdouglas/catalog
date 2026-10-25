@@ -80,7 +80,7 @@ enum LocalCatalogMode {
   static final List<String> ENCODINGS =
       List.of(
           LamportEncoding.NAME, LamportMinusPropertiesEncoding.NAME, ConcernVectorEncoding.NAME,
-          BlindAppendEncoding.NAME);
+          BlindAppendEncoding.NAME, PartitionVectorEncoding.NAME, ManifestWindowEncoding.NAME);
 
   /** The modes whose catalog is one object of the store. */
   static List<LocalCatalogMode> fileModes() {

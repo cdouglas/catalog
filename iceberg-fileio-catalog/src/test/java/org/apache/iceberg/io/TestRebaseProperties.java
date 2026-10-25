@@ -112,6 +112,23 @@ class TestRebaseProperties {
     check(BlindAppendEncoding.NAME, formatVersion, partitioned, mode, prefix, window, r);
   }
 
+  /**
+   * Partition-vector's and manifest-window's case: operations whose producers say what their
+   * retries check (overwrites, row deltas, deletes, rewrites, dynamic overwrites, and appends),
+   * racing data commits, half of them in the same partitions, on inline-ML tables.
+   */
+  @Property(tries = 300)
+  void aValidatedCommitIsWhatItsRetryWouldCommit(
+      @ForAll("validatedEncodings") String encoding,
+      @ForAll @IntRange(min = 2, max = 3) int formatVersion,
+      @ForAll boolean partitioned,
+      @ForAll("inlineManifestModes") LocalCatalogMode mode,
+      @ForAll("prefixes") List<TableScript.Cmd> prefix,
+      @ForAll("dataWindows") List<TableScript.Cmd> window,
+      @ForAll("validated") TableScript.Cmd r) {
+    check(encoding, formatVersion, partitioned, mode, prefix, window, r);
+  }
+
   private static void check(
       String encoding,
       int formatVersion,
@@ -199,6 +216,37 @@ class TestRebaseProperties {
   Arbitrary<TableScript.Cmd> appendLike() {
     return TableScript.commands(APPEND_LIKE::contains).withoutEdgeCases();
   }
+
+  /** The encodings that judge validated commits by their checks. */
+  @Provide
+  Arbitrary<String> validatedEncodings() {
+    return Arbitraries.of(PartitionVectorEncoding.NAME, ManifestWindowEncoding.NAME);
+  }
+
+  /** Operations whose producers' footprints are validated (or blind). */
+  @Provide
+  Arbitrary<TableScript.Cmd> validated() {
+    return TableScript.commands(VALIDATED::contains).withoutEdgeCases();
+  }
+
+  /** Windows of data commits, half the time, else of any single command. */
+  @Provide
+  Arbitrary<List<TableScript.Cmd>> dataWindows() {
+    return Arbitraries.oneOf(
+            TableScript.commands(VALIDATED::contains),
+            TableScript.windowCommands(TestRebaseProperties::single))
+        .withoutEdgeCases()
+        .list().ofMinSize(1).ofMaxSize(3);
+  }
+
+  private static final java.util.Set<TableScript.Kind> VALIDATED =
+      java.util.EnumSet.of(TableScript.Kind.FAST_APPEND, TableScript.Kind.MERGE_APPEND,
+          TableScript.Kind.BRANCH_APPEND, TableScript.Kind.INSERT_ROW_DELTA,
+          TableScript.Kind.DELETE_FILE, TableScript.Kind.EQUALITY_DELETE,
+          TableScript.Kind.POSITION_DELETE, TableScript.Kind.REWRITE_FILES,
+          TableScript.Kind.OVERWRITE, TableScript.Kind.REPLACE_PARTITIONS,
+          TableScript.Kind.OVERWRITE_PARTITION, TableScript.Kind.MERGE_ROW_DELTA,
+          TableScript.Kind.DELETE_PARTITION, TableScript.Kind.LONG_OVERWRITE);
 
   /** Windows of appends, half the time, else of any single command. */
   @Provide

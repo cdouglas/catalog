@@ -109,6 +109,11 @@ public class TestFormatExplorer {
     delta.put("SNAP_", "AddSnapshot");
     delta.put("FP_", "CommitFootprint");
     delta.put("FK_", "FootprintKind");
+    delta.put("FC_", "FootprintCheck");
+    delta.put("CK_", "CheckKind");
+    delta.put("PS_", "PartitionScope");
+    delta.put("PT_", "PartitionTuple");
+    delta.put("PV_", "PartitionValue");
     delta.put("CS_", "CompactSummary");
     delta.put("TK_", "TransformKind");
     delta.put("DIR_", "SortDirection");
