@@ -79,7 +79,8 @@ public final class LogCatalogProperties {
    * lamport}, an update applies only on the version of the table it read. The others: {@code
    * lamport-minus-properties}, which lets an update that does not touch properties apply on a
    * table whose properties alone changed; {@code concern-vector}, which versions a table by its
-   * concerns and refs (docs/SPEC.md, "Conflict Encodings").
+   * concerns and refs; {@code blind-append}, which also lets appends that validate nothing land on
+   * one branch concurrently (docs/SPEC.md, "Conflict Encodings").
    */
   public static final String CONFLICT_ENCODING = "fileio.catalog.conflict.encoding";
   public static final String DEFAULT_CONFLICT_ENCODING = LamportEncoding.NAME;

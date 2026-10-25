@@ -97,6 +97,21 @@ class TestRebaseProperties {
     check(AdmitDeltasEncoding.register(), formatVersion, partitioned, mode, prefix, window, r);
   }
 
+  /**
+   * Blind-append's own case: appends, and appends that validate (an exactly-once sink's checkpoint
+   * append, an insert-only row delta), racing appends on inline-ML tables.
+   */
+  @Property(tries = 300)
+  void aBlindAppendIsWhatItsRetryWouldCommit(
+      @ForAll @IntRange(min = 2, max = 3) int formatVersion,
+      @ForAll boolean partitioned,
+      @ForAll("inlineManifestModes") LocalCatalogMode mode,
+      @ForAll("prefixes") List<TableScript.Cmd> prefix,
+      @ForAll("appendWindows") List<TableScript.Cmd> window,
+      @ForAll("appendLike") TableScript.Cmd r) {
+    check(BlindAppendEncoding.NAME, formatVersion, partitioned, mode, prefix, window, r);
+  }
+
   private static void check(
       String encoding,
       int formatVersion,
@@ -178,6 +193,27 @@ class TestRebaseProperties {
     return Arbitraries.of(
         LocalCatalogMode.fileModes().stream().filter(m -> m.inlineML).toList());
   }
+
+  /** Appends, and operations that add data as an append does but validate it. */
+  @Provide
+  Arbitrary<TableScript.Cmd> appendLike() {
+    return TableScript.commands(APPEND_LIKE::contains).withoutEdgeCases();
+  }
+
+  /** Windows of appends, half the time, else of any single command. */
+  @Provide
+  Arbitrary<List<TableScript.Cmd>> appendWindows() {
+    return Arbitraries.oneOf(
+            TableScript.commands(APPEND_LIKE::contains),
+            TableScript.windowCommands(TestRebaseProperties::single))
+        .withoutEdgeCases()
+        .list().ofMinSize(1).ofMaxSize(3);
+  }
+
+  private static final java.util.Set<TableScript.Kind> APPEND_LIKE =
+      java.util.EnumSet.of(TableScript.Kind.FAST_APPEND, TableScript.Kind.MERGE_APPEND,
+          TableScript.Kind.BRANCH_APPEND, TableScript.Kind.CHECKPOINT_APPEND,
+          TableScript.Kind.INSERT_ROW_DELTA);
 
   /** Appends whose retry validates nothing, and so commits on any version of the table. */
   @Provide

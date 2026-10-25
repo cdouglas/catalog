@@ -697,7 +697,45 @@ public class LogCatalog extends BaseMetastoreCatalog
       }
       CatalogMutation mut = new CatalogMutation(lastRead);
       stageUpdate(mut, base, metadata);
+      if (commitsOnce(metadata.changes())) {
+        mut.pin(tableId);
+      }
       mut.commit(log);
+    }
+
+    /**
+     * Whether Iceberg commits {@code changes}, the updates of a commit (all of a table
+     * transaction's), only on the version of the table they read: it fails them on any other, so no
+     * conflict encoding may apply them there. A schema or partition-spec update does, and a ref
+     * change through {@code manageSnapshots}: any but a snapshot producer's move of a branch to the
+     * snapshot it just added (a ref created at, or moved to, an existing snapshot, removed, or given
+     * new retention).
+     */
+    static boolean commitsOnce(List<org.apache.iceberg.MetadataUpdate> changes) {
+      org.apache.iceberg.MetadataUpdate previous = null;
+      for (org.apache.iceberg.MetadataUpdate change : changes) {
+        if (change instanceof org.apache.iceberg.MetadataUpdate.AddSchema
+            || change instanceof org.apache.iceberg.MetadataUpdate.SetCurrentSchema
+            || change instanceof org.apache.iceberg.MetadataUpdate.AddPartitionSpec
+            || change instanceof org.apache.iceberg.MetadataUpdate.SetDefaultPartitionSpec
+            || change instanceof org.apache.iceberg.MetadataUpdate.RemoveSnapshotRef) {
+          return true;
+        }
+        if (change instanceof org.apache.iceberg.MetadataUpdate.SetSnapshotRef) {
+          long target = ((org.apache.iceberg.MetadataUpdate.SetSnapshotRef) change).snapshotId();
+          boolean producers =
+              previous instanceof org.apache.iceberg.MetadataUpdate.AddSnapshot
+                  && ((org.apache.iceberg.MetadataUpdate.AddSnapshot) previous)
+                          .snapshot()
+                          .snapshotId()
+                      == target;
+          if (!producers) {
+            return true;
+          }
+        }
+        previous = change;
+      }
+      return false;
     }
 
     /**

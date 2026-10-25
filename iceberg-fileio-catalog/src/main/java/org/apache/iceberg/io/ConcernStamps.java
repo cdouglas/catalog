@@ -26,36 +26,51 @@ import java.util.Arrays;
 import org.intentlog.wire.ProtoWire;
 
 /**
- * An encoding's state of a table as stamps: for each of a fixed set of the table's concerns, and
- * for each of a fixed number of ref buckets (a ref's name hashed), the version of the table at which
- * it last changed. A ref bucket has two stamps: one an advance of a ref in it moves (a commit to
- * the branch), one a reset moves (any other change: a rollback, a fast-forward, a ref created,
- * removed, or with new retention). Stamps only grow, so a witness that a stamp is at or below the
- * version its writer read, once false, stays false (S2). 0 is never changed since the table was
- * created, before any version a writer can read.
+ * An encoding's state of a table as stamps, each the version of the table at which something last
+ * changed: each of a fixed set of the table's concerns; each kind of change ({@link Ref}) to the
+ * refs of each of a fixed number of ref buckets (a ref's name hashed); and each kind of change
+ * ({@link Partition}) to the files of each of a fixed number of partition buckets. Stamps only
+ * grow, so a witness that a stamp is at or below the version its writer read, once false, stays
+ * false (S2). 0 is never changed since the table was created, before any version a writer can read.
  */
 final class ConcernStamps implements EncodingState {
 
+  /** Changes to a ref. */
+  enum Ref {
+    /** A commit to the branch: a new snapshot on its head. */
+    ADVANCE,
+    /** Any other change of its snapshot: a rollback, a fast-forward, a ref created or removed. */
+    RESET,
+    /** An advance whose snapshot drops manifests from its parent's list (a delete, a rewrite). */
+    DROP,
+    /** New retention, on the snapshot it had. */
+    RETENTION
+  }
+
+  /** Changes to the files of a partition. */
+  enum Partition {
+    /** Delete files added. */
+    DELETES_ADDED,
+    /** Data files added. */
+    DATA_ADDED,
+    /** Data files removed. */
+    DATA_REMOVED
+  }
+
   private final int[] concerns;
-  private final int[] advances;
-  private final int[] resets;
+  private final int[][] refs;
+  private final int[][] partitions;
 
-  ConcernStamps(int concerns, int buckets) {
-    this(new int[concerns], new int[buckets], new int[buckets]);
+  ConcernStamps(int concerns, int refKinds, int refBuckets, int partitionKinds,
+      int partitionBuckets) {
+    this(new int[concerns], new int[refKinds][refBuckets],
+        new int[partitionKinds][partitionBuckets]);
   }
 
-  private ConcernStamps(int[] concerns, int[] advances, int[] resets) {
+  private ConcernStamps(int[] concerns, int[][] refs, int[][] partitions) {
     this.concerns = concerns;
-    this.advances = advances;
-    this.resets = resets;
-  }
-
-  int concerns() {
-    return concerns.length;
-  }
-
-  int buckets() {
-    return advances.length;
+    this.refs = refs;
+    this.partitions = partitions;
   }
 
   /** The version at which concern {@code concern} last changed. */
@@ -63,49 +78,67 @@ final class ConcernStamps implements EncodingState {
     return concerns[concern];
   }
 
-  /** The version at which a ref in {@code bucket} last advanced. */
-  int advance(int bucket) {
-    return advances[bucket];
+  /** The version at which a ref in {@code bucket} last changed by {@code kind}. */
+  int ref(Ref kind, int bucket) {
+    return refs[kind.ordinal()][bucket];
   }
 
-  /** The version at which a ref in {@code bucket} was last reset. */
-  int reset(int bucket) {
-    return resets[bucket];
+  /** The version at which a partition in {@code bucket} last changed by {@code kind}. */
+  int partition(Partition kind, int bucket) {
+    return partitions[kind.ordinal()][bucket];
   }
 
   /** The bucket of the ref named {@code ref}. */
   int bucket(String ref) {
-    return Math.floorMod(ref.hashCode(), advances.length);
+    return Math.floorMod(ref.hashCode(), refs[0].length);
+  }
+
+  int partitionBuckets() {
+    return partitions.length > 0 ? partitions[0].length : 0;
   }
 
   void stampConcern(int concern, int version) {
     concerns[concern] = Math.max(concerns[concern], version);
   }
 
-  void stampAdvance(String ref, int version) {
+  void stampRef(Ref kind, String ref, int version) {
     int bucket = bucket(ref);
-    advances[bucket] = Math.max(advances[bucket], version);
+    refs[kind.ordinal()][bucket] = Math.max(refs[kind.ordinal()][bucket], version);
   }
 
-  void stampReset(String ref, int version) {
-    int bucket = bucket(ref);
-    resets[bucket] = Math.max(resets[bucket], version);
+  /** Stamps partition bucket {@code bucket}, or every one if it is {@link PartitionKey#ALL}. */
+  void stampPartition(Partition kind, int bucket, int version) {
+    int[] stamps = partitions[kind.ordinal()];
+    if (bucket == PartitionKey.ALL) {
+      Arrays.setAll(stamps, i -> Math.max(stamps[i], version));
+    } else {
+      stamps[bucket] = Math.max(stamps[bucket], version);
+    }
   }
 
-  /** Stamps every concern and every ref bucket: a change the encoding cannot see into. */
+  /** Stamps everything: a change the encoding cannot see into. */
   void stampAll(int version) {
     for (int i = 0; i < concerns.length; i++) {
       stampConcern(i, version);
     }
-    for (int i = 0; i < advances.length; i++) {
-      advances[i] = Math.max(advances[i], version);
-      resets[i] = Math.max(resets[i], version);
+    for (int[][] kinds : new int[][][] {refs, partitions}) {
+      for (int[] stamps : kinds) {
+        Arrays.setAll(stamps, i -> Math.max(stamps[i], version));
+      }
     }
   }
 
   @Override
   public EncodingState copy() {
-    return new ConcernStamps(concerns.clone(), advances.clone(), resets.clone());
+    return new ConcernStamps(concerns.clone(), deepClone(refs), deepClone(partitions));
+  }
+
+  private static int[][] deepClone(int[][] stamps) {
+    int[][] copy = new int[stamps.length][];
+    for (int i = 0; i < stamps.length; i++) {
+      copy[i] = stamps[i].clone();
+    }
+    return copy;
   }
 
   @Override
@@ -115,39 +148,45 @@ final class ConcernStamps implements EncodingState {
     }
     ConcernStamps that = (ConcernStamps) other;
     return Arrays.equals(concerns, that.concerns)
-        && Arrays.equals(advances, that.advances)
-        && Arrays.equals(resets, that.resets);
+        && Arrays.deepEquals(refs, that.refs)
+        && Arrays.deepEquals(partitions, that.partitions);
   }
 
   @Override
   public int hashCode() {
-    return Arrays.hashCode(concerns) * 31 + Arrays.hashCode(advances) * 7
-        + Arrays.hashCode(resets);
+    return Arrays.hashCode(concerns) * 31 + Arrays.deepHashCode(refs) * 7
+        + Arrays.deepHashCode(partitions);
   }
 
   @Override
   public String toString() {
-    return "concerns " + Arrays.toString(concerns) + ", advances " + Arrays.toString(advances)
-        + ", resets " + Arrays.toString(resets);
+    return "concerns " + Arrays.toString(concerns) + ", refs " + Arrays.deepToString(refs)
+        + (partitions.length > 0 ? ", partitions " + Arrays.deepToString(partitions) : "");
   }
 
   /**
-   * The stamps' codec: the concerns', then each bucket's advance and reset, as varints (field 1,
-   * repeated, unpacked); none for a table never observed.
+   * The stamps' codec: the concerns', then each ref kind's buckets, then each partition kind's
+   * buckets, as varints (field 1, repeated, unpacked); none for a table never observed.
    */
   static final class Codec implements EncodingState.Codec {
     private static final int STAMP = 1;
     private final int concerns;
-    private final int buckets;
+    private final int refKinds;
+    private final int refBuckets;
+    private final int partitionKinds;
+    private final int partitionBuckets;
 
-    Codec(int concerns, int buckets) {
+    Codec(int concerns, int refKinds, int refBuckets, int partitionKinds, int partitionBuckets) {
       this.concerns = concerns;
-      this.buckets = buckets;
+      this.refKinds = refKinds;
+      this.refBuckets = refBuckets;
+      this.partitionKinds = partitionKinds;
+      this.partitionBuckets = partitionBuckets;
     }
 
     @Override
     public EncodingState empty() {
-      return new ConcernStamps(concerns, buckets);
+      return new ConcernStamps(concerns, refKinds, refBuckets, partitionKinds, partitionBuckets);
     }
 
     @Override
@@ -161,9 +200,12 @@ final class ConcernStamps implements EncodingState {
         for (int stamp : stamps.concerns) {
           ProtoWire.writeVarint(out, STAMP, stamp);
         }
-        for (int i = 0; i < stamps.advances.length; i++) {
-          ProtoWire.writeVarint(out, STAMP, stamps.advances[i]);
-          ProtoWire.writeVarint(out, STAMP, stamps.resets[i]);
+        for (int[][] kinds : new int[][][] {stamps.refs, stamps.partitions}) {
+          for (int[] kind : kinds) {
+            for (int stamp : kind) {
+              ProtoWire.writeVarint(out, STAMP, stamp);
+            }
+          }
         }
         return out.toByteArray();
       } catch (IOException e) {
@@ -173,7 +215,8 @@ final class ConcernStamps implements EncodingState {
 
     @Override
     public EncodingState decode(byte[] bytes) {
-      int[] values = new int[concerns + 2 * buckets];
+      int[] values =
+          new int[concerns + refKinds * refBuckets + partitionKinds * partitionBuckets];
       int n = 0;
       try {
         ByteArrayInputStream in = new ByteArrayInputStream(bytes);
@@ -188,13 +231,16 @@ final class ConcernStamps implements EncodingState {
       } catch (IOException e) {
         throw new UncheckedIOException(e);
       }
-      int[] advances = new int[buckets];
-      int[] resets = new int[buckets];
-      for (int i = 0; i < buckets; i++) {
-        advances[i] = values[concerns + 2 * i];
-        resets[i] = values[concerns + 2 * i + 1];
+      int at = concerns;
+      int[][] refs = new int[refKinds][];
+      for (int k = 0; k < refKinds; k++, at += refBuckets) {
+        refs[k] = Arrays.copyOfRange(values, at, at + refBuckets);
       }
-      return new ConcernStamps(Arrays.copyOf(values, concerns), advances, resets);
+      int[][] partitions = new int[partitionKinds][];
+      for (int k = 0; k < partitionKinds; k++, at += partitionBuckets) {
+        partitions[k] = Arrays.copyOfRange(values, at, at + partitionBuckets);
+      }
+      return new ConcernStamps(Arrays.copyOf(values, concerns), refs, partitions);
     }
   }
 }

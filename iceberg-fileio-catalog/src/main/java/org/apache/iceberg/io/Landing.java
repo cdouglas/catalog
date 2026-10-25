@@ -395,19 +395,23 @@ final class Landing {
         manifest, manifest.path(), sequenceNumber, minSequenceNumber, firstRowId);
   }
 
-  /** {@code update}, keeping the retention of the branch it advances where the table moved. */
+  /**
+   * {@code update}, where the table moved: a branch it advances keeps its retention there, and one
+   * the table lacks there is created with none, as a producer's commit creates a branch (only
+   * {@code manageSnapshots}, which no encoding admits on a changed table, sets retention).
+   */
   SetSnapshotRefUpdate ref(SetSnapshotRefUpdate update) {
-    SnapshotRef current = stale ? table.ref(update.refName) : null;
-    if (current == null || !added.contains(update.snapshotId)) {
+    if (!stale || !added.contains(update.snapshotId)) {
       return update;
     }
+    SnapshotRef current = table.ref(update.refName);
     return new SetSnapshotRefUpdate(
         update.refName,
         update.snapshotId,
         update.refType,
-        current.minSnapshotsToKeep() != null ? current.minSnapshotsToKeep() : 0,
-        current.maxSnapshotAgeMs() != null ? current.maxSnapshotAgeMs() : 0L,
-        current.maxRefAgeMs() != null ? current.maxRefAgeMs() : 0L);
+        current != null && current.minSnapshotsToKeep() != null ? current.minSnapshotsToKeep() : 0,
+        current != null && current.maxSnapshotAgeMs() != null ? current.maxSnapshotAgeMs() : 0L,
+        current != null && current.maxRefAgeMs() != null ? current.maxRefAgeMs() : 0L);
   }
 
   /** The delta's new snapshots by id, in its order. */

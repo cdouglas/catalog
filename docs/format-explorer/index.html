@@ -619,7 +619,7 @@
           {"number": 5, "name": "metadata_location", "type": "string", "repeated": false, "packed": false, "oneof": "payload", "comment": "pointer fallback (eviction)"},
           {"number": 6, "name": "full_metadata_codec", "type": "InlineMetadataCodec", "repeated": false, "packed": false, "oneof": null, "comment": "Codec for `full_metadata`. Only meaningful when the oneof is set to full_metadata; ignored otherwise."},
           {"number": 7, "name": "ml_delta", "type": "TableMetadataDelta", "repeated": false, "packed": false, "oneof": null, "comment": "Optional, with full_metadata only: manifest updates for the lists of the inline-ML snapshots the commit adds, and of any inline snapshot the table holds no list for (Bug 62), so they land with the metadata."},
-          {"number": 8, "name": "pinned", "type": "bool", "repeated": false, "packed": false, "oneof": null, "comment": "True when the update applies only on the version it names, whatever the catalog's conflict encoding: a table a catalog transaction writes, which must be at the version the transaction first read (errata D12). Absent: a delta may apply on a later version if the encoding admits it there, finalized where it lands (SPEC_TM.md \"Late-bound fields\")."}
+          {"number": 8, "name": "pinned", "type": "bool", "repeated": false, "packed": false, "oneof": null, "comment": "True when the update applies only on the version it names, whatever the catalog's conflict encoding: a table a catalog transaction writes, which must be at the version the transaction first read (errata D12), or an update Iceberg commits once (a schema or spec update, a ref change through manageSnapshots). Absent: a delta may apply on a later version if the encoding admits it there, finalized where it lands (SPEC_TM.md \"Late-bound fields\")."}
         ]
       },
       "TableMetadataDelta": {
@@ -672,7 +672,13 @@
           {"number": 6, "name": "added_rows", "type": "int64", "repeated": false, "packed": false, "oneof": null, "comment": "Present for a v3+ snapshot, 0 included (a snapshot that adds no rows); absent for a snapshot without row lineage."},
           {"number": 7, "name": "parent_snapshot_id", "type": "fixed64", "repeated": false, "packed": false, "oneof": null, "comment": "The snapshot's parent; absent for a snapshot without one (a table's first, or a replace transaction's). Replay never infers it from the base's current snapshot, which is wrong for staged, branch and cherry-picked snapshots and for replaces."},
           {"number": 8, "name": "first_row_id", "type": "int64", "repeated": false, "packed": false, "oneof": null, "comment": "Optional: v3+ row lineage starting row ID for this snapshot."},
-          {"number": 9, "name": "key_id", "type": "string", "repeated": false, "packed": false, "oneof": null, "comment": "Optional: encryption key ID carried on the snapshot."}
+          {"number": 9, "name": "key_id", "type": "string", "repeated": false, "packed": false, "oneof": null, "comment": "Optional: encryption key ID carried on the snapshot."},
+          {"number": 10, "name": "footprint", "type": "CommitFootprint", "repeated": false, "packed": false, "oneof": null, "comment": "Optional: what the producer's commit depends on beyond what it writes, which an inline snapshot's producer says (Iceberg's SnapshotProducer.footprint). Absent: not known, and a conflict encoding that needs it coarsens."}
+        ]
+      },
+      "CommitFootprint": {
+        "fields": [
+          {"number": 1, "name": "kind", "type": "FootprintKind", "repeated": false, "packed": false, "oneof": null, "comment": ""}
         ]
       },
       "CompactSummary": {
@@ -811,6 +817,11 @@
       "InlineMetadataCodec": [
         {"name": "CODEC_JSON_GZIP", "number": 0},
         {"name": "CODEC_STRUCTURAL", "number": 1}
+      ],
+      "FootprintKind": [
+        {"name": "FOOTPRINT_KIND_UNSPECIFIED", "number": 0},
+        {"name": "BLIND", "number": 1},
+        {"name": "OPAQUE", "number": 2}
       ],
       "OperationType": [
         {"name": "APPEND", "number": 0},

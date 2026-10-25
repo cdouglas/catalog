@@ -19,13 +19,15 @@
 package org.apache.iceberg.io;
 
 /**
- * A test encoding that admits every table action: the framework then applies any unpinned delta
- * its late-bound fields can be finalized for ({@link Landing#unmergeable}), on whatever version of
- * the table its record lands. Not a conflict encoding (it detects no conflict), but a probe of
- * the merge: where the operation is one whose Iceberg retry succeeds on any table (an append
- * that validates nothing), the merged record must be what the retry commits.
+ * A test encoding that admits every table action but what Iceberg commits once ({@link
+ * TableChange#commitOnce}): the framework then applies any unpinned delta its late-bound fields
+ * can be finalized for ({@link Landing#unmergeable}), on whatever version of the table its record
+ * lands. Not a conflict encoding (it detects no conflict), but a probe of the merge: where the
+ * operation is one whose Iceberg retry succeeds on any table (an append that validates nothing),
+ * the merged record must be what the retry commits. Whatever it admits besides (a window's
+ * command on a stale handle) must still not be what Iceberg fails.
  */
-final class AdmitDeltasEncoding implements ConflictEncoding<Void> {
+final class AdmitDeltasEncoding implements ConflictEncoding<Boolean> {
 
   static final String NAME = "test-admit-deltas";
 
@@ -48,13 +50,20 @@ final class AdmitDeltasEncoding implements ConflictEncoding<Void> {
   }
 
   @Override
-  public Void witness(TableAction action, ReplayView landing) {
-    return null;
+  public Boolean witness(TableAction action, ReplayView landing) {
+    if (action.coarse() || landing.version() == action.baseVersion() || !landing.inline()) {
+      return true;
+    }
+    try {
+      return !TableChange.of(action, landing::metadata).commitOnce;
+    } catch (RuntimeException e) {
+      return false;
+    }
   }
 
   @Override
-  public boolean admits(Void witness, ReplayView landing, EncodingState state) {
-    return true;
+  public boolean admits(Boolean witness, ReplayView landing, EncodingState state) {
+    return witness;
   }
 
   @Override

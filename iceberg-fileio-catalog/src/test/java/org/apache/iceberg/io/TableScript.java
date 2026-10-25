@@ -86,12 +86,13 @@ final class TableScript {
   /**
    * The kinds of change conflict encodings tell apart from a table's other changes: property,
    * statistics, sort-order and location changes, commits and refs on other branches, staged
-   * snapshots, and appends.
+   * snapshots, appends, and a branch's retention.
    */
   static final java.util.Set<Kind> SEPARABLE =
       java.util.EnumSet.of(Kind.SET_PROPERTY, Kind.REMOVE_PROPERTY, Kind.STATISTICS,
           Kind.PARTITION_STATISTICS, Kind.SORT_ORDER, Kind.SET_LOCATION, Kind.BRANCH_APPEND,
-          Kind.STAGED_APPEND, Kind.CREATE_BRANCH, Kind.CREATE_TAG, Kind.FAST_APPEND);
+          Kind.STAGED_APPEND, Kind.CREATE_BRANCH, Kind.CREATE_TAG, Kind.FAST_APPEND,
+          Kind.RETENTION);
 
   /**
    * Single commands of the kinds {@code kinds} admits, half of them of the {@link #SEPARABLE}
@@ -176,6 +177,15 @@ final class TableScript {
      * ancestor committed that checkpoint.
      */
     CHECKPOINT_APPEND,
+    /**
+     * Overwrites partition {@code c % 4} as a job that read the table before its latest commit
+     * does: validating from the current snapshot's parent that no conflicting deletes (and, {@code
+     * b} even, data) were added since. A retry after that parent expired cannot tell the history
+     * and fails.
+     */
+    LONG_OVERWRITE,
+    /** Sets the retention of main ({@code b} even) or a branch: snapshots to keep, max age. */
+    RETENTION,
     REPLACE,
     /** Runs the next {@code a % 3 + 2} commands in one table transaction. */
     TRANSACTION,
@@ -451,6 +461,29 @@ final class TableScript {
             overwrite.validateNoConflictingData();
           }
           overwrite.commit();
+          break;
+        case RETENTION:
+          String retained = cmd.b % 2 == 0 ? org.apache.iceberg.SnapshotRef.MAIN_BRANCH : ref(cmd.b);
+          target.manageSnapshots()
+              .setMinSnapshotsToKeep(retained, cmd.c % 3 + 1)
+              .setMaxSnapshotAgeMs(retained, (cmd.c + 1) * 3_600_000L)
+              .commit();
+          break;
+        case LONG_OVERWRITE:
+          org.apache.iceberg.expressions.Expression overwritten = inPartition(cmd.c);
+          org.apache.iceberg.OverwriteFiles job =
+              target.newOverwrite().overwriteByRowFilter(overwritten)
+                  .addFile(newFile(target, cmd.c));
+          Snapshot read = target.currentSnapshot();
+          if (read != null) {
+            job.validateFromSnapshot(
+                read.parentId() != null ? read.parentId() : read.snapshotId());
+          }
+          job.conflictDetectionFilter(overwritten).validateNoConflictingDeletes();
+          if (cmd.b % 2 == 0) {
+            job.validateNoConflictingData();
+          }
+          job.commit();
           break;
         case MERGE_ROW_DELTA:
           org.apache.iceberg.FileScanTask updatedTask = pickLive(target, cmd.b);

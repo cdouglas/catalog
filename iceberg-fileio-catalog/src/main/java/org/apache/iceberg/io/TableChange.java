@@ -18,11 +18,14 @@
  */
 package org.apache.iceberg.io;
 
+import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.SnapshotRef;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.io.InlineDeltaCodec.AddSnapshotUpdate;
@@ -57,6 +60,8 @@ final class TableChange {
   final EnumSet<Concern> concerns;
   final Set<String> advanced;
   final Set<String> reset;
+  /** The refs it gives new retention, on the snapshot each had. */
+  final Set<String> retained;
   /** Whether it adds snapshots: a data commit. */
   final boolean addsSnapshots;
   /** Whether it adds a snapshot no ref moves to (staged), whose branch is not in the record. */
@@ -67,20 +72,38 @@ final class TableChange {
    * an advance that also changes the branch's retention).
    */
   final boolean commitOnce;
+  /** The branches it advances to a snapshot that drops manifests from its parent's list. */
+  final Set<String> drops;
+  /** The manifests its new snapshots wrote. */
+  final List<ManifestFile> written;
+  /**
+   * Whether it is blind: snapshots whose producers say they validate nothing ({@link
+   * org.apache.iceberg.CommitFootprint#BLIND}), and their refs and manifest lists, and nothing
+   * else.
+   */
+  final boolean blind;
 
   private TableChange(
       EnumSet<Concern> concerns,
       Set<String> advanced,
       Set<String> reset,
+      Set<String> retained,
       boolean addsSnapshots,
       boolean stages,
-      boolean commitOnce) {
+      boolean commitOnce,
+      Set<String> drops,
+      List<ManifestFile> written,
+      boolean blind) {
     this.concerns = concerns;
     this.advanced = advanced;
     this.reset = reset;
+    this.retained = retained;
     this.addsSnapshots = addsSnapshots;
     this.stages = stages;
     this.commitOnce = commitOnce;
+    this.drops = drops;
+    this.written = written;
+    this.blind = blind;
   }
 
   /**
@@ -101,13 +124,33 @@ final class TableChange {
     EnumSet<Concern> concerns = EnumSet.noneOf(Concern.class);
     Set<String> advanced = new HashSet<>();
     Set<String> reset = new HashSet<>();
+    Set<String> retained = new HashSet<>();
     Set<Long> added = new HashSet<>();
     for (AddSnapshotUpdate add : action.addedSnapshots()) {
       added.add(add.snapshotId);
     }
     Set<Long> onRefs = new HashSet<>();
+    Map<String, Long> heads = new java.util.HashMap<>();
     boolean commitOnce = false;
+    boolean blind = !added.isEmpty();
+    for (AddSnapshotUpdate add : action.addedSnapshots()) {
+      blind &= add.footprint != null
+          && add.footprint.kind() == org.apache.iceberg.CommitFootprint.Kind.BLIND;
+    }
+    Set<Long> dropping = new HashSet<>();
+    List<ManifestFile> written = new ArrayList<>();
     for (DeltaUpdate update : action.delta().updates) {
+      blind &= update instanceof AddSnapshotUpdate || update instanceof SetSnapshotRefUpdate
+          || update instanceof InlineDeltaCodec.AddManifestUpdate
+          || update instanceof InlineDeltaCodec.RemoveManifestUpdate;
+      if (update instanceof InlineDeltaCodec.RemoveManifestUpdate) {
+        dropping.add(((InlineDeltaCodec.RemoveManifestUpdate) update).snapshotId);
+      } else if (update instanceof InlineDeltaCodec.AddManifestUpdate) {
+        ManifestFile manifest = ((InlineDeltaCodec.AddManifestUpdate) update).manifest;
+        if (added.contains(manifest.snapshotId())) {
+          written.add(manifest);
+        }
+      }
       if (update instanceof InlineDeltaCodec.SetPropertiesUpdate) {
         concerns.add(Concern.PROPERTIES);
       } else if (update instanceof InlineDeltaCodec.SetLocationUpdate) {
@@ -143,6 +186,11 @@ final class TableChange {
             && (current == null || (current.isBranch() && sameRetention(current, ref)))) {
           advanced.add(ref.refName);
           onRefs.add(ref.snapshotId);
+          heads.put(ref.refName, ref.snapshotId);
+        } else if (current != null && current.snapshotId() == ref.snapshotId
+            && current.isBranch() == "branch".equals(ref.refType)) {
+          retained.add(ref.refName);
+          commitOnce = true;
         } else {
           reset.add(ref.refName);
           commitOnce = true;
@@ -164,7 +212,19 @@ final class TableChange {
     for (Long id : added) {
       stages |= !chained.contains(id);
     }
-    return new TableChange(concerns, advanced, reset, !added.isEmpty(), stages, commitOnce);
+    Set<String> drops = new HashSet<>();
+    heads.forEach(
+        (ref, head) -> {
+          Set<Long> seen = new HashSet<>();
+          for (Long s = head; s != null && added.contains(s) && seen.add(s); s = parents.get(s)) {
+            if (dropping.contains(s)) {
+              drops.add(ref);
+              break;
+            }
+          }
+        });
+    return new TableChange(concerns, advanced, reset, retained, !added.isEmpty(), stages,
+        commitOnce, drops, written, blind);
   }
 
   /**
@@ -191,7 +251,8 @@ final class TableChange {
     if (!was.equals(is)) {
       return null;
     }
-    return new TableChange(concerns, Set.of(), Set.of(), false, false, false);
+    return new TableChange(
+        concerns, Set.of(), Set.of(), Set.of(), false, false, false, Set.of(), List.of(), false);
   }
 
   private static com.fasterxml.jackson.databind.node.ObjectNode json(TableMetadata metadata) {
@@ -219,13 +280,16 @@ final class TableChange {
     return concerns.equals(EnumSet.of(Concern.PROPERTIES))
         && advanced.isEmpty()
         && reset.isEmpty()
+        && retained.isEmpty()
         && !addsSnapshots;
   }
 
   @Override
   public String toString() {
     return concerns + (advanced.isEmpty() ? "" : " advances " + advanced)
-        + (reset.isEmpty() ? "" : " resets " + reset) + (addsSnapshots ? " adds snapshots" : "")
+        + (reset.isEmpty() ? "" : " resets " + reset)
+        + (retained.isEmpty() ? "" : " retains " + retained)
+        + (addsSnapshots ? " adds snapshots" : "")
         + (stages ? " stages" : "") + (commitOnce ? " commit-once" : "");
   }
 }

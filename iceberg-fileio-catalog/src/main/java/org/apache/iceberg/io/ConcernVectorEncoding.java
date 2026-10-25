@@ -18,9 +18,6 @@
  */
 package org.apache.iceberg.io;
 
-import java.util.BitSet;
-import java.util.HashSet;
-import java.util.Set;
 import org.apache.iceberg.SnapshotRef;
 
 /**
@@ -43,7 +40,7 @@ import org.apache.iceberg.SnapshotRef;
  * other refs (WAP). What Iceberg commits once (a schema or spec update, a ref reset or retention
  * change) and what it removes have the Lamport witness.
  */
-final class ConcernVectorEncoding extends ConcernEncoding {
+class ConcernVectorEncoding extends ConcernEncoding {
 
   static final String NAME = "concern-vector";
 
@@ -53,7 +50,12 @@ final class ConcernVectorEncoding extends ConcernEncoding {
   static final int BUCKETS = 16;
 
   private ConcernVectorEncoding() {
-    super(TableChange.Concern.values().length, BUCKETS);
+    this(0);
+  }
+
+  /** An encoding that also keeps {@code partitionBuckets} partition buckets. */
+  ConcernVectorEncoding(int partitionBuckets) {
+    super(TableChange.Concern.values().length, BUCKETS, partitionBuckets);
   }
 
   @Override
@@ -62,36 +64,39 @@ final class ConcernVectorEncoding extends ConcernEncoding {
   }
 
   @Override
-  Witness reads(int base, TableChange change) {
+  Witness reads(int base, TableChange change, ReplayView landing) {
     if (change.concerns.contains(TableChange.Concern.REMOVAL)
         || change.concerns.contains(TableChange.Concern.SCHEMA)
         || change.concerns.contains(TableChange.Concern.SPECS)
         || change.concerns.contains(TableChange.Concern.STATISTICS)
-        || !change.reset.isEmpty()) {
+        || !change.reset.isEmpty() || !change.retained.isEmpty()) {
       return null;
     }
-    BitSet concerns = new BitSet();
-    Set<String> refs = new HashSet<>(change.advanced);
+    Witness witness = Witness.of(base);
+    for (String ref : change.advanced) {
+      witness.ref(ref, ConcernStamps.Ref.ADVANCE, ConcernStamps.Ref.RESET, ConcernStamps.Ref.DROP);
+    }
     if (change.addsSnapshots) {
-      concerns.set(TableChange.Concern.TABLE.ordinal());
-      concerns.set(TableChange.Concern.SCHEMA.ordinal());
-      concerns.set(TableChange.Concern.SPECS.ordinal());
-      concerns.set(TableChange.Concern.REMOVAL.ordinal());
+      witness
+          .concern(TableChange.Concern.TABLE)
+          .concern(TableChange.Concern.SCHEMA)
+          .concern(TableChange.Concern.SPECS)
+          .concern(TableChange.Concern.REMOVAL);
     }
     if (change.stages) {
-      refs.add(SnapshotRef.MAIN_BRANCH);
+      witness.ref(SnapshotRef.MAIN_BRANCH, ConcernStamps.Ref.ADVANCE, ConcernStamps.Ref.RESET,
+          ConcernStamps.Ref.DROP);
     }
     if (change.concerns.contains(TableChange.Concern.PROPERTIES)) {
-      concerns.set(TableChange.Concern.PROPERTIES.ordinal());
+      witness.concern(TableChange.Concern.PROPERTIES);
     }
     if (change.concerns.contains(TableChange.Concern.TABLE)) {
-      concerns.set(TableChange.Concern.TABLE.ordinal());
+      witness.concern(TableChange.Concern.TABLE);
     }
     if (change.concerns.contains(TableChange.Concern.SORT)) {
-      concerns.set(TableChange.Concern.SORT.ordinal());
-      concerns.set(TableChange.Concern.SCHEMA.ordinal());
+      witness.concern(TableChange.Concern.SORT).concern(TableChange.Concern.SCHEMA);
     }
-    return new Witness(base, false, concerns, refs);
+    return witness;
   }
 
   @Override
@@ -100,10 +105,16 @@ final class ConcernVectorEncoding extends ConcernEncoding {
       stamps.stampConcern(concern.ordinal(), version);
     }
     for (String ref : change.advanced) {
-      stamps.stampAdvance(ref, version);
+      stamps.stampRef(ConcernStamps.Ref.ADVANCE, ref, version);
+    }
+    for (String ref : change.drops) {
+      stamps.stampRef(ConcernStamps.Ref.DROP, ref, version);
     }
     for (String ref : change.reset) {
-      stamps.stampReset(ref, version);
+      stamps.stampRef(ConcernStamps.Ref.RESET, ref, version);
+    }
+    for (String ref : change.retained) {
+      stamps.stampRef(ConcernStamps.Ref.RETENTION, ref, version);
     }
   }
 }

@@ -36,6 +36,7 @@ final class ConflictEncodings {
     register(LamportEncoding.INSTANCE);
     register(LamportMinusPropertiesEncoding.INSTANCE);
     register(ConcernVectorEncoding.INSTANCE);
+    register(BlindAppendEncoding.INSTANCE);
   }
 
   private ConflictEncodings() {}

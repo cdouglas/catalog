@@ -60,6 +60,8 @@ import org.intentlog.wire.LogEnvelope;
  *       extension, where a copy of it could land later (stable, S2);
  *   <li>a copy the encoding admits anywhere applies without throwing (total: admits implies the
  *       merge), and every replay of the log, through each observe, succeeds;
+ *   <li>where R's record applies, each table it updates moves one past its version there (S3,
+ *       which the stamps' stability rests on);
  *   <li>an action the encoding cannot see into (a pointer table's, a full or location payload, a
  *       read pin, a pinned update) is admitted only on its base version (coarsens when blind).
  * </ul>
@@ -138,8 +140,25 @@ abstract class ConflictEncodingContract {
     }
     boolean stale = coarse(capture.record, first, admitted, trace);
     if (admitted) {
+      Map<Integer, Integer> versions = new HashMap<>();
+      for (ProtoCodec.Action action : intention(capture.record).actions()) {
+        TableAction table = tableAction(action);
+        if (table != null && table.kind() != TableAction.Kind.READ) {
+          versions.put(table.tableId(), first.tableVersion(table.tableId()));
+        }
+      }
       intention(capture.record).apply(first);
       intention(capture.record).apply(second);
+      // S3: each table it updates moves one past its version where the record landed (a version
+      // set from the one the writer read would go back, and let a rejected record apply later)
+      versions.forEach(
+          (table, version) -> {
+            if (first.tableVersion(table) != version + 1) {
+              throw new AssertionError(String.format(
+                  "table %d went from version %d to %d where R's record landed%n%s",
+                  table, version, first.tableVersion(table), trace));
+            }
+          });
       String a = state(first);
       if (!a.equals(state(second)) || !a.equals(state(landed.builder()))) {
         throw new AssertionError("R's record applies differently on equal states\n" + trace);

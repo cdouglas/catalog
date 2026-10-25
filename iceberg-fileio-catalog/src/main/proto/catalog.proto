@@ -312,7 +312,9 @@ message UpdateTableInline {
   TableMetadataDelta ml_delta = 7;
   // True when the update applies only on the version it names, whatever
   // the catalog's conflict encoding: a table a catalog transaction writes,
-  // which must be at the version the transaction first read (errata D12).
+  // which must be at the version the transaction first read (errata D12),
+  // or an update Iceberg commits once (a schema or spec update, a ref
+  // change through manageSnapshots).
   // Absent: a delta may apply on a later version if the encoding admits it
   // there, finalized where it lands (SPEC_TM.md "Late-bound fields").
   bool pinned = 8;
@@ -393,6 +395,25 @@ message AddSnapshot {
   int64          first_row_id           = 8;
   // Optional: encryption key ID carried on the snapshot.
   string         key_id                 = 9;
+  // Optional: what the producer's commit depends on beyond what it
+  // writes, which an inline snapshot's producer says (Iceberg's
+  // SnapshotProducer.footprint). Absent: not known, and a conflict
+  // encoding that needs it coarsens.
+  CommitFootprint footprint             = 10;
+}
+
+message CommitFootprint {
+  FootprintKind kind = 1;
+}
+
+// BLIND: the commit validates nothing and writes only new manifests (a fast
+// or merge append); its retry commits on any version of its branch. OPAQUE:
+// anything else. A kind a reader does not know (UNSPECIFIED included) reads
+// as no footprint.
+enum FootprintKind {
+  FOOTPRINT_KIND_UNSPECIFIED = 0;
+  BLIND                      = 1;
+  OPAQUE                     = 2;
 }
 
 enum OperationType {

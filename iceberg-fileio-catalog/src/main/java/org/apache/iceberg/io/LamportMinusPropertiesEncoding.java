@@ -18,9 +18,6 @@
  */
 package org.apache.iceberg.io;
 
-import java.util.BitSet;
-import java.util.Set;
-
 /**
  * The smallest separation of a table's concerns: its properties, and everything else. A record
  * that does not touch properties applies on a table whose properties alone changed since its
@@ -40,7 +37,7 @@ final class LamportMinusPropertiesEncoding extends ConcernEncoding {
   private static final int REST = 1;
 
   private LamportMinusPropertiesEncoding() {
-    super(2, 0);
+    super(2, 1, 0);
   }
 
   @Override
@@ -49,13 +46,11 @@ final class LamportMinusPropertiesEncoding extends ConcernEncoding {
   }
 
   @Override
-  Witness reads(int base, TableChange change) {
+  Witness reads(int base, TableChange change, ReplayView landing) {
     if (change.concerns.contains(TableChange.Concern.PROPERTIES)) {
       return null; // a record that touches properties conflicts with any change
     }
-    BitSet concerns = new BitSet();
-    concerns.set(REST);
-    return new Witness(base, false, concerns, Set.of());
+    return Witness.of(base).concern(REST);
   }
 
   @Override

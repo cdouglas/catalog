@@ -19,13 +19,19 @@
 package org.apache.iceberg.io;
 
 import java.util.BitSet;
+import java.util.EnumMap;
+import java.util.EnumSet;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 
 /**
  * A conflict encoding that versions a table by its concerns rather than as a whole: it keeps the
- * version at which each concern last changed ({@link ConcernStamps}), and admits a record on a
- * changed table if nothing it reads has changed since its writer read the table. Its subclasses
- * say how changes map onto stamps: what a record reads, and what an applied change moves.
+ * version at which each concern, each ref bucket and each partition bucket last changed ({@link
+ * ConcernStamps}), and admits a record on a changed table if nothing it reads has changed since its
+ * writer read the table. Its subclasses say how changes map onto stamps: what a record reads, and
+ * what an applied change moves.
  *
  * <p>Every encoding of this kind keeps the Lamport witness, the version read, for what it cannot
  * see into (a pointer table, full metadata, a read pin, a pinned update, a failure to decode) and
@@ -38,42 +44,71 @@ abstract class ConcernEncoding implements ConflictEncoding<ConcernEncoding.Witne
     final int base;
     /** The Lamport witness: only the base version itself. */
     final boolean whole;
-    final BitSet concerns;
-    final Set<String> refs;
+    final BitSet concerns = new BitSet();
+    /** The kinds of change to each ref it reads. */
+    final Map<String, EnumSet<ConcernStamps.Ref>> refs = new HashMap<>();
+    /** The partition buckets it reads, by kind of change; {@link PartitionKey#ALL} for every one. */
+    final Map<ConcernStamps.Partition, Set<Integer>> partitions =
+        new EnumMap<>(ConcernStamps.Partition.class);
 
-    Witness(int base, boolean whole, BitSet concerns, Set<String> refs) {
+    private Witness(int base, boolean whole) {
       this.base = base;
       this.whole = whole;
-      this.concerns = concerns;
-      this.refs = refs;
     }
 
     static Witness whole(int base) {
-      return new Witness(base, true, new BitSet(), Set.of());
+      return new Witness(base, true);
+    }
+
+    static Witness of(int base) {
+      return new Witness(base, false);
+    }
+
+    Witness concern(TableChange.Concern concern) {
+      concerns.set(concern.ordinal());
+      return this;
+    }
+
+    Witness concern(int concern) {
+      concerns.set(concern);
+      return this;
+    }
+
+    Witness ref(String ref, ConcernStamps.Ref... kinds) {
+      EnumSet<ConcernStamps.Ref> read =
+          refs.computeIfAbsent(ref, r -> EnumSet.noneOf(ConcernStamps.Ref.class));
+      for (ConcernStamps.Ref kind : kinds) {
+        read.add(kind);
+      }
+      return this;
+    }
+
+    Witness partition(ConcernStamps.Partition kind, int bucket) {
+      partitions.computeIfAbsent(kind, k -> new HashSet<>()).add(bucket);
+      return this;
     }
 
     @Override
     public String toString() {
-      return whole ? "version " + base : "concerns " + concerns + " and refs " + refs + " since "
-          + base;
+      return whole ? "version " + base
+          : "concerns " + concerns + ", refs " + refs + ", partitions " + partitions
+              + " since " + base;
     }
   }
 
-  private final int concerns;
-  private final int buckets;
   private final ConcernStamps.Codec codec;
 
-  ConcernEncoding(int concerns, int buckets) {
-    this.concerns = concerns;
-    this.buckets = buckets;
-    this.codec = new ConcernStamps.Codec(concerns, buckets);
+  /** An encoding of {@code concerns} concerns and these numbers of ref and partition buckets. */
+  ConcernEncoding(int concerns, int refBuckets, int partitionBuckets) {
+    this.codec = new ConcernStamps.Codec(concerns, ConcernStamps.Ref.values().length, refBuckets,
+        ConcernStamps.Partition.values().length, partitionBuckets);
   }
 
   /**
-   * The concerns of {@code change}, a record's, that a change since its base conflicts with, and
-   * its refs, each a branch whose head must not have moved; null for the Lamport witness.
+   * What {@code change}, a record's on {@code landing}, reads: the stamps that must be at or below
+   * {@code base}; null for the Lamport witness.
    */
-  abstract Witness reads(int base, TableChange change);
+  abstract Witness reads(int base, TableChange change, ReplayView landing);
 
   /** Stamps {@code stamps} at {@code version} for {@code change}, applied. */
   abstract void stamp(TableChange change, int version, ConcernStamps stamps);
@@ -89,7 +124,7 @@ abstract class ConcernEncoding implements ConflictEncoding<ConcernEncoding.Witne
       if (change.commitOnce) {
         return Witness.whole(base);
       }
-      Witness reads = reads(base, change);
+      Witness reads = reads(base, change, landing);
       return reads != null ? reads : Witness.whole(base);
     } catch (RuntimeException e) {
       return Witness.whole(base); // total: what it cannot decode, it does not see into
@@ -110,10 +145,25 @@ abstract class ConcernEncoding implements ConflictEncoding<ConcernEncoding.Witne
         return false;
       }
     }
-    for (String ref : witness.refs) {
-      int bucket = stamps.bucket(ref);
-      if (stamps.advance(bucket) > witness.base || stamps.reset(bucket) > witness.base) {
-        return false;
+    for (Map.Entry<String, EnumSet<ConcernStamps.Ref>> ref : witness.refs.entrySet()) {
+      int bucket = stamps.bucket(ref.getKey());
+      for (ConcernStamps.Ref kind : ref.getValue()) {
+        if (stamps.ref(kind, bucket) > witness.base) {
+          return false;
+        }
+      }
+    }
+    for (Map.Entry<ConcernStamps.Partition, Set<Integer>> kind : witness.partitions.entrySet()) {
+      for (int bucket : kind.getValue()) {
+        if (bucket == PartitionKey.ALL) {
+          for (int b = 0; b < stamps.partitionBuckets(); b++) {
+            if (stamps.partition(kind.getKey(), b) > witness.base) {
+              return false;
+            }
+          }
+        } else if (stamps.partition(kind.getKey(), bucket) > witness.base) {
+          return false;
+        }
       }
     }
     return true;
@@ -146,13 +196,5 @@ abstract class ConcernEncoding implements ConflictEncoding<ConcernEncoding.Witne
   @Override
   public EncodingState.Codec stateCodec() {
     return codec;
-  }
-
-  int concerns() {
-    return concerns;
-  }
-
-  int buckets() {
-    return buckets;
   }
 }

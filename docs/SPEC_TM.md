@@ -158,7 +158,9 @@ the catalog's conflict encoding, like `UpdateTableLocation` (SPEC.md
 encoding admits on a later version is finalized there ("Late-bound
 fields" below). `pinned` holds an update to its version under every
 encoding: `LogCatalog.commitTransaction` pins each table it writes, which
-must be at the version the transaction first read (errata D12).
+must be at the version the transaction first read (errata D12), and a
+table commit pins an update Iceberg commits once (a schema or spec update,
+a ref change through `manageSnapshots`: `LogCatalog.commitsOnce`).
 
 `CreateTableInline.delta` carries the manifest updates of the inline-ML
 snapshots a create transaction commits with the table (e.g.
@@ -230,8 +232,21 @@ message AddSnapshot {
   int64          first_row_id         = 8;   // present whenever the snapshot
                                              // has one, 0 included
   string         key_id               = 9;   // optional: encrypted tables
+  CommitFootprint footprint           = 10;  // optional: what the producer's
+                                             // commit depends on (below)
 }
+
+message CommitFootprint { FootprintKind kind = 1; }
+enum FootprintKind { FOOTPRINT_KIND_UNSPECIFIED = 0; BLIND = 1; OPAQUE = 2; }
 ```
+
+`footprint` is what the snapshot's producer says its commit depends on
+beyond what it writes (Iceberg's `SnapshotProducer.footprint`, carried by
+the `InlineSnapshot` an inline-ML producer returns): `BLIND` for a fast or
+merge append that validates nothing, whose retry commits on any version of
+its branch; `OPAQUE` for anything else. A snapshot whose producer the writer
+does not know (one with a manifest list file) has none, and a conflict
+encoding that needs it judges the record by its version (`blind-append`).
 
 **Fields derived from the base metadata (not transmitted)**, for the
 delta's k-th new snapshot (k = 1, 2, ...):

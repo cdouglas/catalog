@@ -79,7 +79,8 @@ enum LocalCatalogMode {
   /** The conflict encodings a catalog can be created with, which fuzzers draw from. */
   static final List<String> ENCODINGS =
       List.of(
-          LamportEncoding.NAME, LamportMinusPropertiesEncoding.NAME, ConcernVectorEncoding.NAME);
+          LamportEncoding.NAME, LamportMinusPropertiesEncoding.NAME, ConcernVectorEncoding.NAME,
+          BlindAppendEncoding.NAME);
 
   /** The modes whose catalog is one object of the store. */
   static List<LocalCatalogMode> fileModes() {

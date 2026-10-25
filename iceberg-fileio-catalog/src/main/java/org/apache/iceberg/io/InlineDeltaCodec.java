@@ -196,6 +196,13 @@ public class InlineDeltaCodec {
   private static final int SNAP_PARENT_ID = 7;    // optional; fixed64
   private static final int SNAP_FIRST_ROW_ID = 8; // optional; varint64
   private static final int SNAP_KEY_ID = 9;       // optional; string
+  private static final int SNAP_FOOTPRINT = 10;   // optional; CommitFootprint
+
+  // CommitFootprint field numbers, and FootprintKind wire values (1-based, so a missing kind is
+  // told apart; the decoder treats it as no footprint)
+  private static final int FP_KIND = 1;
+  static final int FK_BLIND = 1;
+  static final int FK_OPAQUE = 2;
 
   // CompactSummary field numbers
   private static final int CS_OPERATION = 1;
@@ -843,10 +850,15 @@ public class InlineDeltaCodec {
         if (snap.operation() != null && !summary.containsKey("operation")) {
           summary.put("operation", snap.operation());
         }
+        // The producer's footprint, which only an inline snapshot carries.
+        org.apache.iceberg.CommitFootprint footprint =
+            snap instanceof org.apache.iceberg.InlineSnapshot
+                ? ((org.apache.iceberg.InlineSnapshot) snap).footprint()
+                : null;
         updates.add(new AddSnapshotUpdate(
             snap.snapshotId(), suffix, summary,
             timestampDelta, schemaId, snap.addedRows(),
-            parentId, firstRowId, keyId));
+            parentId, firstRowId, keyId, footprint));
       }
     }
 
@@ -1589,6 +1601,11 @@ public class InlineDeltaCodec {
     public final Long parentSnapshotId;
     public final Long firstRowId;
     public final String keyId;
+    /**
+     * What the producer's commit depends on beyond what it writes, if its writer knew (an inline
+     * snapshot's producer); null if not.
+     */
+    public final org.apache.iceberg.CommitFootprint footprint;
 
     /**
      * Back-compat constructor: no explicit parent/firstRowId/keyId; schemaId and addedRows 0 are
@@ -1606,6 +1623,16 @@ public class InlineDeltaCodec {
         long snapshotId, String manifestListSuffix, Map<String, String> summary,
         long timestampDeltaMs, Integer schemaId, Long addedRows,
         Long parentSnapshotId, Long firstRowId, String keyId) {
+      this(snapshotId, manifestListSuffix, summary, timestampDeltaMs, schemaId, addedRows,
+          parentSnapshotId, firstRowId, keyId, null);
+    }
+
+    /** Full constructor, with the producer's footprint (null: unknown). */
+    public AddSnapshotUpdate(
+        long snapshotId, String manifestListSuffix, Map<String, String> summary,
+        long timestampDeltaMs, Integer schemaId, Long addedRows,
+        Long parentSnapshotId, Long firstRowId, String keyId,
+        org.apache.iceberg.CommitFootprint footprint) {
       this.snapshotId = snapshotId;
       this.manifestListSuffix = manifestListSuffix;
       this.summary = summary;
@@ -1615,6 +1642,7 @@ public class InlineDeltaCodec {
       this.parentSnapshotId = parentSnapshotId;
       this.firstRowId = firstRowId;
       this.keyId = keyId;
+      this.footprint = footprint;
     }
 
     /**
@@ -1941,6 +1969,13 @@ public class InlineDeltaCodec {
       }
       if (u.keyId != null && !u.keyId.isEmpty()) {
         writeString(inner, SNAP_KEY_ID, u.keyId);
+      }
+      if (u.footprint != null) {
+        ByteArrayOutputStream footprint = new ByteArrayOutputStream();
+        writeVarint(footprint, FP_KIND,
+            u.footprint.kind() == org.apache.iceberg.CommitFootprint.Kind.BLIND
+                ? FK_BLIND : FK_OPAQUE);
+        writeLengthDelimited(inner, SNAP_FOOTPRINT, footprint.toByteArray());
       }
       writeLengthDelimited(out, UPDATE_ADD_SNAPSHOT, inner.toByteArray());
 
@@ -2301,6 +2336,7 @@ public class InlineDeltaCodec {
     Long parentId = null;
     Long firstRowId = null;
     String keyId = null;
+    org.apache.iceberg.CommitFootprint footprint = null;
 
     while (in.available() > 0) {
       int tag = readVarint(in);
@@ -2317,11 +2353,35 @@ public class InlineDeltaCodec {
         case SNAP_PARENT_ID: parentId = readFixed64(in); break;
         case SNAP_FIRST_ROW_ID: firstRowId = readVarint64(in); break;
         case SNAP_KEY_ID: keyId = readString(in); break;
+        case SNAP_FOOTPRINT: footprint = decodeFootprint(readLengthDelimitedBytes(in)); break;
         default: skipField(in, tag & 0x7);
       }
     }
     return new AddSnapshotUpdate(snapId, manifestSuffix, summary, timestampDelta,
-        schemaId, addedRows, parentId, firstRowId, keyId);
+        schemaId, addedRows, parentId, firstRowId, keyId, footprint);
+  }
+
+  /** A footprint, or null for a kind this build does not know: no footprint, which coarsens. */
+  private static org.apache.iceberg.CommitFootprint decodeFootprint(byte[] bytes)
+      throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    int kind = 0;
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      if (tag >>> 3 == FP_KIND) {
+        kind = readVarint(in);
+      } else {
+        skipField(in, tag & 0x7);
+      }
+    }
+    switch (kind) {
+      case FK_BLIND:
+        return org.apache.iceberg.CommitFootprint.BLIND;
+      case FK_OPAQUE:
+        return org.apache.iceberg.CommitFootprint.OPAQUE;
+      default:
+        return null;
+    }
   }
 
   // ============================================================
