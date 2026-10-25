@@ -70,6 +70,11 @@ public class InlineDeltaCodec {
   // byte-stable across replays. Required (this prototype has no deployed
   // history; a delta missing this field is malformed and decode raises).
   private static final int DELTA_LAST_UPDATED_MS = 2;
+  // The base the writer computed the delta on: its last sequence number, and (v3) its next row id.
+  // Replay moves the sequence numbers and row ids the delta assigned by how far the table it lands
+  // on has moved past them (Landing). Absent in a delta of manifest updates only.
+  private static final int DELTA_BASE_LAST_SEQUENCE_NUMBER = 3;
+  private static final int DELTA_BASE_NEXT_ROW_ID = 4;
 
   // TableMetadataUpdate oneof field numbers
   private static final int UPDATE_ADD_SNAPSHOT = 1;
@@ -229,22 +234,51 @@ public class InlineDeltaCodec {
   public static byte[] applyDeltaWithManifests(
       byte[] baseMetadataBytes, InlineMetadataCodec baseCodec, byte[] deltaBytes,
       CatalogState.Builder catalogBuilder, int tableId) {
-    // A deterministic metadata-file location for the parsed base, so the rebuilt
-    // metadata's `previousFiles()` gains an entry for the prior version. The string
-    // is opaque to FileIO (an `inline://` URI never resolves); only its stability
-    // for the same input bytes matters (a hash collision only gives equal
-    // metadata-log entries, which `MetadataLogEntry` deduplicates).
-    String syntheticLoc =
-        "inline://#" + Integer.toHexString(Arrays.hashCode(baseMetadataBytes));
-    TableMetadata base = baseCodec.decodeFull(baseMetadataBytes, syntheticLoc);
-    DecodedDelta decoded = decodeDelta(deltaBytes);
+    return applyDeltaWithManifests(
+        baseMetadataBytes, baseCodec, decodeDelta(deltaBytes), catalogBuilder, tableId, false);
+  }
+
+  /**
+   * Applies {@code decoded} to the metadata {@code baseMetadataBytes} holds: its base, or with
+   * {@code stale}, a version of the table that changed since, on which its late-bound fields are
+   * finalized ({@link Landing}). A stale delta must be mergeable there ({@link
+   * Landing#unmergeable}).
+   */
+  static byte[] applyDeltaWithManifests(
+      byte[] baseMetadataBytes, InlineMetadataCodec baseCodec, DecodedDelta decoded,
+      CatalogState.Builder catalogBuilder, int tableId, boolean stale) {
+    return baseCodec.encode(
+        applyDelta(
+            decodeBase(baseMetadataBytes, baseCodec), decoded, catalogBuilder, tableId, stale));
+  }
+
+  /**
+   * The metadata {@code bytes} hold, with a deterministic metadata-file location, so the metadata
+   * a delta builds on it gains an entry for it in its `previousFiles()`. The string is opaque to
+   * FileIO (an `inline://` URI never resolves); only its stability for the same bytes matters (a
+   * hash collision only gives equal metadata-log entries, which `MetadataLogEntry` deduplicates).
+   */
+  static TableMetadata decodeBase(byte[] bytes, InlineMetadataCodec codec) {
+    return codec.decodeFull(bytes, "inline://#" + Integer.toHexString(Arrays.hashCode(bytes)));
+  }
+
+  /**
+   * Applies {@code decoded} to {@code base}, as {@link #applyDeltaWithManifests} does, and returns
+   * the new metadata; the manifest updates go to {@code catalogBuilder}'s lists of {@code
+   * tableId}.
+   */
+  static TableMetadata applyDelta(
+      TableMetadata base, DecodedDelta decoded, CatalogState.Builder catalogBuilder, int tableId,
+      boolean stale) {
     List<DeltaUpdate> updates = decoded.updates;
+    Landing landing = Landing.of(decoded, base, stale);
     // Pin the writer's last-updated-ms on every Builder pass before applyTo,
     // so `setRef(MAIN_BRANCH, ...)` (TableMetadata.java line 1324) reads the
     // writer's value rather than wall-clock when stamping new snapshot-log
     // entries. See TableMetadata.Builder#setLastUpdatedMillis for the upstream
-    // rationale.
+    // rationale. A snapshot's timestamp is relative to it, the commit's.
     long writerLastUpdatedMillis = decoded.lastUpdatedMillis;
+    long lastUpdatedMillis = landing.lastUpdatedMillis(writerLastUpdatedMillis);
     String prefix = catalogBuilder.manifestListPrefix(tableId);
     if (prefix == null) {
       prefix = "";
@@ -271,7 +305,7 @@ public class InlineDeltaCodec {
       if (tableMetadata) {
         if (pending == null) {
           pending = TableMetadata.buildFrom(current);
-          pending.setLastUpdatedMillis(writerLastUpdatedMillis);
+          pending.setLastUpdatedMillis(lastUpdatedMillis);
           lastSequenceNumber = current.lastSequenceNumber();
         }
         if (update instanceof AddSnapshotUpdate) {
@@ -281,14 +315,15 @@ public class InlineDeltaCodec {
           long sequenceNumber = current.formatVersion() >= 2 ? ++lastSequenceNumber : 0L;
           pending.addSnapshot(
               addSnap.snapshot(
-                  sequenceNumber, current.currentSchemaId(), prefix, base.lastUpdatedMillis()));
+                  sequenceNumber, current.currentSchemaId(), prefix, writerLastUpdatedMillis,
+                  landing));
           addedInThisDelta.add(addSnap.snapshotId);
           // Inline-ML snapshots (empty suffix → `inline://<snapId>` sentinel) must
           // have a pool entry, otherwise wrapInlineManifests treats the sentinel as
           // catalog state corruption. Register it now, even if no AddManifest or
           // RemoveManifest update follows.
           if (addSnap.manifestListSuffix.isEmpty()) {
-            newSnapshots.add(addSnap.snapshotId, addSnap.parentSnapshotId);
+            newSnapshots.add(addSnap.snapshotId, landing.parent(addSnap));
           }
         } else if (update instanceof RemoveSnapshotsUpdate) {
           // Cascade snapshot removal to the catalog pool: drop the snapshot's ref
@@ -299,6 +334,8 @@ public class InlineDeltaCodec {
           }
           // Builder.removeSnapshots also cleans up the TM side's dangling refs.
           update.applyTo(pending);
+        } else if (update instanceof SetSnapshotRefUpdate) {
+          landing.ref((SetSnapshotRefUpdate) update).applyTo(pending);
         } else {
           update.applyTo(pending);
         }
@@ -319,27 +356,7 @@ public class InlineDeltaCodec {
                   + " before its AddSnapshotUpdate — violates delta ordering invariant");
         }
         // The manifest decoded from the wire has a suffix-only path; resolve full path
-        String fullPath = add.manifest.path();
-        if (!prefix.isEmpty() && !fullPath.startsWith(prefix)) {
-          fullPath = prefix + fullPath;
-        }
-        ManifestFile resolved = new ProtoCodec.DecodedManifestFile(
-            fullPath, add.manifest.length(), add.manifest.partitionSpecId(),
-            add.manifest.content().id(),
-            add.manifest.sequenceNumber(), add.manifest.minSequenceNumber(),
-            add.manifest.snapshotId(),
-            add.manifest.addedFilesCount() != null ? add.manifest.addedFilesCount() : 0,
-            add.manifest.existingFilesCount() != null ? add.manifest.existingFilesCount() : 0,
-            add.manifest.deletedFilesCount() != null ? add.manifest.deletedFilesCount() : 0,
-            add.manifest.addedRowsCount() != null ? add.manifest.addedRowsCount() : 0,
-            add.manifest.existingRowsCount() != null ? add.manifest.existingRowsCount() : 0,
-            add.manifest.deletedRowsCount() != null ? add.manifest.deletedRowsCount() : 0,
-            add.manifest.partitions(),
-            add.manifest.keyMetadata() != null
-                ? java.nio.ByteBuffer.allocate(add.manifest.keyMetadata().remaining())
-                    .put(add.manifest.keyMetadata().duplicate()).array()
-                : null,
-            add.manifest.firstRowId());
+        ManifestFile resolved = landing.manifest(resolve(add.manifest, prefix));
         catalogBuilder.addManifestToPool(tableId, resolved);
         newSnapshots.addManifest(current, add.snapshotId, resolved.path(), add.position);
       } else if (update instanceof RemoveManifestUpdate) {
@@ -351,7 +368,41 @@ public class InlineDeltaCodec {
       current = pending.discardChanges().build();
     }
     newSnapshots.finish();
-    return baseCodec.encode(current);
+    return current;
+  }
+
+  /** {@code manifest} as the wire holds it, its path suffix resolved with {@code prefix}. */
+  private static ManifestFile resolve(ManifestFile manifest, String prefix) {
+    String fullPath = manifest.path();
+    if (!prefix.isEmpty() && !fullPath.startsWith(prefix)) {
+      fullPath = prefix + fullPath;
+    }
+    return manifestFile(
+        manifest, fullPath, manifest.sequenceNumber(), manifest.minSequenceNumber(),
+        manifest.firstRowId());
+  }
+
+  /** A copy of {@code manifest} at {@code path}, with these sequence numbers and first row id. */
+  static ManifestFile manifestFile(
+      ManifestFile manifest, String path, long sequenceNumber, long minSequenceNumber,
+      Long firstRowId) {
+    return new ProtoCodec.DecodedManifestFile(
+        path, manifest.length(), manifest.partitionSpecId(),
+        manifest.content().id(),
+        sequenceNumber, minSequenceNumber,
+        manifest.snapshotId(),
+        manifest.addedFilesCount() != null ? manifest.addedFilesCount() : 0,
+        manifest.existingFilesCount() != null ? manifest.existingFilesCount() : 0,
+        manifest.deletedFilesCount() != null ? manifest.deletedFilesCount() : 0,
+        manifest.addedRowsCount() != null ? manifest.addedRowsCount() : 0,
+        manifest.existingRowsCount() != null ? manifest.existingRowsCount() : 0,
+        manifest.deletedRowsCount() != null ? manifest.deletedRowsCount() : 0,
+        manifest.partitions(),
+        manifest.keyMetadata() != null
+            ? java.nio.ByteBuffer.allocate(manifest.keyMetadata().remaining())
+                .put(manifest.keyMetadata().duplicate()).array()
+            : null,
+        firstRowId);
   }
 
   /**
@@ -523,27 +574,7 @@ public class InlineDeltaCodec {
         }
       } else if (update instanceof AddManifestUpdate) {
         AddManifestUpdate add = (AddManifestUpdate) update;
-        String fullPath = add.manifest.path();
-        if (!prefix.isEmpty() && !fullPath.startsWith(prefix)) {
-          fullPath = prefix + fullPath;
-        }
-        ManifestFile resolved = new ProtoCodec.DecodedManifestFile(
-            fullPath, add.manifest.length(), add.manifest.partitionSpecId(),
-            add.manifest.content().id(),
-            add.manifest.sequenceNumber(), add.manifest.minSequenceNumber(),
-            add.manifest.snapshotId(),
-            add.manifest.addedFilesCount() != null ? add.manifest.addedFilesCount() : 0,
-            add.manifest.existingFilesCount() != null ? add.manifest.existingFilesCount() : 0,
-            add.manifest.deletedFilesCount() != null ? add.manifest.deletedFilesCount() : 0,
-            add.manifest.addedRowsCount() != null ? add.manifest.addedRowsCount() : 0,
-            add.manifest.existingRowsCount() != null ? add.manifest.existingRowsCount() : 0,
-            add.manifest.deletedRowsCount() != null ? add.manifest.deletedRowsCount() : 0,
-            add.manifest.partitions(),
-            add.manifest.keyMetadata() != null
-                ? java.nio.ByteBuffer.allocate(add.manifest.keyMetadata().remaining())
-                    .put(add.manifest.keyMetadata().duplicate()).array()
-                : null,
-            add.manifest.firstRowId());
+        ManifestFile resolved = resolve(add.manifest, prefix);
         catalogBuilder.addManifestToPool(tableId, resolved);
         newSnapshots.addManifest(current, add.snapshotId, resolved.path(), add.position);
       } else if (update instanceof RemoveManifestUpdate) {
@@ -598,10 +629,18 @@ public class InlineDeltaCodec {
   public static final class DecodedDelta {
     public final List<DeltaUpdate> updates;
     public final long lastUpdatedMillis;
+    /** The last sequence number of the delta's base; null in a delta of manifest updates only. */
+    public final Long baseLastSequenceNumber;
+    /** The next row id of the delta's base (v3); null if it has none or the delta does not say. */
+    public final Long baseNextRowId;
 
-    DecodedDelta(List<DeltaUpdate> updates, long lastUpdatedMillis) {
+    DecodedDelta(
+        List<DeltaUpdate> updates, long lastUpdatedMillis, Long baseLastSequenceNumber,
+        Long baseNextRowId) {
       this.updates = updates;
       this.lastUpdatedMillis = lastUpdatedMillis;
+      this.baseLastSequenceNumber = baseLastSequenceNumber;
+      this.baseNextRowId = baseNextRowId;
     }
   }
 
@@ -617,9 +656,26 @@ public class InlineDeltaCodec {
    * just-built {@code metadata.lastUpdatedMillis()}.
    */
   public static byte[] encodeDelta(List<DeltaUpdate> updates, long lastUpdatedMillis) {
+    return encodeDelta(updates, lastUpdatedMillis, null);
+  }
+
+  /**
+   * Encodes {@code updates}, the delta of a commit from {@code base} with {@code
+   * lastUpdatedMillis}, with the base's last sequence number and (v3) next row id, which replay
+   * moves the sequence numbers and row ids the commit assigned from ({@link Landing}). A null base
+   * writes neither: a delta of manifest updates only, which lands with full metadata.
+   */
+  public static byte[] encodeDelta(
+      List<DeltaUpdate> updates, long lastUpdatedMillis, TableMetadata base) {
     try {
       ByteArrayOutputStream out = new ByteArrayOutputStream();
       writeVarint64(out, DELTA_LAST_UPDATED_MS, lastUpdatedMillis);
+      if (base != null) {
+        writeVarint64(out, DELTA_BASE_LAST_SEQUENCE_NUMBER, base.lastSequenceNumber());
+        if (base.formatVersion() >= 3) {
+          writeVarint64(out, DELTA_BASE_NEXT_ROW_ID, base.nextRowId());
+        }
+      }
       for (DeltaUpdate update : updates) {
         byte[] updateBytes = encodeUpdate(update);
         writeLengthDelimited(out, DELTA_UPDATES, updateBytes);
@@ -639,6 +695,8 @@ public class InlineDeltaCodec {
       ByteArrayInputStream in = new ByteArrayInputStream(bytes);
       List<DeltaUpdate> updates = new ArrayList<>();
       Long lastUpdatedMillis = null;
+      Long baseLastSequenceNumber = null;
+      Long baseNextRowId = null;
       while (in.available() > 0) {
         int tag = readVarint(in);
         int fieldNumber = tag >>> 3;
@@ -647,6 +705,10 @@ public class InlineDeltaCodec {
           updates.add(decodeUpdate(readLengthDelimitedBytes(in)));
         } else if (fieldNumber == DELTA_LAST_UPDATED_MS) {
           lastUpdatedMillis = readVarint64(in);
+        } else if (fieldNumber == DELTA_BASE_LAST_SEQUENCE_NUMBER) {
+          baseLastSequenceNumber = readVarint64(in);
+        } else if (fieldNumber == DELTA_BASE_NEXT_ROW_ID) {
+          baseNextRowId = readVarint64(in);
         } else {
           skipField(in, wireType);
         }
@@ -655,7 +717,7 @@ public class InlineDeltaCodec {
         throw new IllegalStateException(
             "Malformed TableMetadataDelta: required field 2 (last_updated_ms) missing");
       }
-      return new DecodedDelta(updates, lastUpdatedMillis);
+      return new DecodedDelta(updates, lastUpdatedMillis, baseLastSequenceNumber, baseNextRowId);
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
@@ -759,7 +821,9 @@ public class InlineDeltaCodec {
             suffix = manifestList.substring(manifestListPrefix.length());
           }
         }
-        long timestampDelta = snap.timestampMillis() - oldMeta.lastUpdatedMillis();
+        // Relative to the commit's last-updated-ms, which the delta carries: replay finds it the
+        // same on whatever version of the table the delta lands.
+        long timestampDelta = snap.timestampMillis() - newMeta.lastUpdatedMillis();
         // Absent when it is the base's current schema, which replay falls back to.
         Integer schemaId = snap.schemaId() != null
             && snap.schemaId() != oldMeta.currentSchemaId()
@@ -1563,17 +1627,17 @@ public class InlineDeltaCodec {
 
     /**
      * Adds the snapshot to {@code base}, which may already hold the delta's earlier updates. Its
-     * timestamp is relative to {@code deltaBaseUpdatedMillis}, the last-updated-ms of the metadata
-     * the delta was computed against: adding a snapshot moves last-updated-ms, so a commit's later
-     * snapshots resolved against {@code base} would get the wrong time.
+     * timestamp is relative to {@code deltaUpdatedMillis}, the delta's last-updated-ms, which the
+     * commit's metadata has: adding a snapshot moves last-updated-ms, so a commit's later snapshots
+     * resolved against {@code base} would get the wrong time.
      */
     public TableMetadata applyTo(
-        TableMetadata base, String manifestListPrefix, long deltaBaseUpdatedMillis) {
+        TableMetadata base, String manifestListPrefix, long deltaUpdatedMillis) {
       // v1 tables don't carry sequence numbers; TableMetadata's constructor rejects
       // any non-zero value. Synthesize seqNum only for v2+.
       long seqNum = base.formatVersion() >= 2 ? base.lastSequenceNumber() + 1 : 0;
       Snapshot snapshot =
-          snapshot(seqNum, base.currentSchemaId(), manifestListPrefix, deltaBaseUpdatedMillis);
+          snapshot(seqNum, base.currentSchemaId(), manifestListPrefix, deltaUpdatedMillis);
       // Iceberg's builder no longer takes last-updated-ms from an added snapshot (since 1.12.0),
       // so pin it to the snapshot's time, as it was, rather than the wall clock.
       return TableMetadata.buildFrom(base)
@@ -1585,14 +1649,41 @@ public class InlineDeltaCodec {
 
     /**
      * The snapshot this update adds, numbered {@code sequenceNumber}, with its timestamp relative
-     * to {@code deltaBaseUpdatedMillis} and, if the delta names none, schema {@code
-     * currentSchemaId}: the base's current schema.
+     * to {@code deltaUpdatedMillis}, the delta's last-updated-ms, and, if the delta names none,
+     * schema {@code currentSchemaId}: the current schema of the table it lands on.
      */
     Snapshot snapshot(
         long sequenceNumber,
         int currentSchemaId,
         String manifestListPrefix,
-        long deltaBaseUpdatedMillis) {
+        long deltaUpdatedMillis) {
+      return snapshot(
+          sequenceNumber, currentSchemaId, manifestListPrefix, deltaUpdatedMillis,
+          parentSnapshotId, deltaUpdatedMillis + timestampDeltaMs, firstRowId, summary);
+    }
+
+    /** The snapshot this update adds where its delta lands, its late-bound fields finalized. */
+    Snapshot snapshot(
+        long sequenceNumber,
+        int currentSchemaId,
+        String manifestListPrefix,
+        long deltaUpdatedMillis,
+        Landing landing) {
+      return snapshot(
+          sequenceNumber, currentSchemaId, manifestListPrefix, deltaUpdatedMillis,
+          landing.parent(this), landing.timestamp(deltaUpdatedMillis + timestampDeltaMs),
+          landing.firstRowId(this), landing.summary(this));
+    }
+
+    private Snapshot snapshot(
+        long sequenceNumber,
+        int currentSchemaId,
+        String manifestListPrefix,
+        long deltaUpdatedMillis,
+        Long resolvedParentId,
+        long timestamp,
+        Long resolvedFirstRowId,
+        Map<String, String> resolvedSummary) {
       // parentSnapshotId is authoritative. The encoder (computeDelta)
       // captures snap.parentId() verbatim and the wire treats field absence as
       // explicit null. Falling back to base.currentSnapshot() is wrong for
@@ -1601,8 +1692,6 @@ public class InlineDeltaCodec {
       // — the fallback re-parented the replacement onto it, which then made
       // the manifest carry-forward in applyDeltaWithManifests inherit the
       // prior snapshot's manifest list into the replacement.
-      Long resolvedParentId = parentSnapshotId;
-      long timestamp = deltaBaseUpdatedMillis + timestampDeltaMs;
       Integer resolvedSchemaId = schemaId != null ? schemaId : currentSchemaId;
       // For inline-ML snapshots (empty suffix), the manifest-list location is a
       // sentinel; the inline-ML read path swaps the BaseSnapshot for an
@@ -1616,10 +1705,10 @@ public class InlineDeltaCodec {
           snapshotId,
           resolvedParentId,
           timestamp,
-          summary,
+          resolvedSummary,
           resolvedSchemaId,
           manifestList,
-          firstRowId,
+          resolvedFirstRowId,
           addedRows,
           keyId == null || keyId.isEmpty() ? null : keyId);
     }

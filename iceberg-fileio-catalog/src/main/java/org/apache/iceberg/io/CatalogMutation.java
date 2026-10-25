@@ -78,6 +78,9 @@ public class CatalogMutation {
   // Pending renames: from-identifier -> to-identifier. The id stays put; only
   // the (namespace, name) pair on TblEntry changes. See SPEC_TM.md "Rename".
   private final Map<TableIdentifier, TableIdentifier> tableRenames;
+  // Tables whose inline update applies only on the version read, whatever the catalog's conflict
+  // encoding (ProtoCodec.UpdateTableInlineAction.pinned).
+  private final Set<TableIdentifier> pinned;
 
   /** A transaction staged on {@code base}, a read of the catalog's log. */
   public CatalogMutation(Replica<CatalogState> base) {
@@ -96,6 +99,7 @@ public class CatalogMutation {
     this.inlineTableCodecs = Maps.newHashMap();
     this.inlineTableUpdateCodecs = Maps.newHashMap();
     this.tableRenames = Maps.newHashMap();
+    this.pinned = Sets.newHashSet();
   }
 
   /** The read of the log this transaction is staged on, and commits on top of. */
@@ -374,6 +378,17 @@ public class CatalogMutation {
     return this;
   }
 
+  /**
+   * Makes the update of {@code table} apply only on the version this transaction read, whatever
+   * the catalog's conflict encoding: a catalog transaction may have read anything in a table it
+   * writes, which must be at the version it first read (errata D12). An update of a pointer table
+   * applies only there anyway.
+   */
+  public CatalogMutation pin(TableIdentifier table) {
+    pinned.add(table);
+    return this;
+  }
+
   // True when the namespace does NOT exist once this transaction's pending
   // creates and drops apply. The empty namespace never exists: the format
   // cannot hold tables or properties on the root.
@@ -574,13 +589,10 @@ public class CatalogMutation {
       Integer tblId = original.tableId(ident);
       if (tblId != null) {
         int version = original.tableVersion(tblId);
-        if (mlDelta != null) {
-          actions.add(ProtoCodec.UpdateTableInlineAction.full(
-              tblId, version, metadata, codec, mlDelta));
-        } else {
-          actions.add(ProtoCodec.UpdateTableInlineAction.full(
-              tblId, version, metadata, codec));
-        }
+        ProtoCodec.UpdateTableInlineAction update = mlDelta != null
+            ? ProtoCodec.UpdateTableInlineAction.full(tblId, version, metadata, codec, mlDelta)
+            : ProtoCodec.UpdateTableInlineAction.full(tblId, version, metadata, codec);
+        actions.add(pinned.contains(ident) ? update.pin() : update);
       }
     }
 
@@ -591,7 +603,9 @@ public class CatalogMutation {
       Integer tblId = original.tableId(ident);
       if (tblId != null) {
         int version = original.tableVersion(tblId);
-        actions.add(ProtoCodec.UpdateTableInlineAction.delta(tblId, version, deltaBytes));
+        ProtoCodec.UpdateTableInlineAction update =
+            ProtoCodec.UpdateTableInlineAction.delta(tblId, version, deltaBytes);
+        actions.add(pinned.contains(ident) ? update.pin() : update);
       }
     }
 

@@ -69,6 +69,9 @@ message Checkpoint {
   // The reader version this checkpoint needs (ProtoCodec
   // SUPPORTED_READER_VERSION, now 1). Written first; required.
   int32  min_reader_version        = 4;
+  // The catalog's conflict encoding; absent until a record sets one
+  // (SetConflictEncoding), and then replay judges by "lamport".
+  string conflict_encoding         = 5;
   repeated Namespace          namespaces             = 10;
   repeated Table              tables                 = 11;  // pointer-mode tables
   repeated NamespaceProperty  namespace_properties   = 12;
@@ -82,6 +85,11 @@ fails if it is absent or exceeds `ProtoCodec.SUPPORTED_READER_VERSION`.
 
 A table ID appears in either `tables` (pointer mode) or `inline_tables`
 (inline mode), never both.
+
+`conflict_encoding` names how replay decides whether a table update
+conflicts with what landed since its writer read the table ([Conflict
+Encodings](#conflict-encodings)). A reader that does not know the encoding
+fails the read: its replay could differ.
 
 ### Catalog Entities
 
@@ -101,6 +109,8 @@ message Table {
   int32  namespace_id      = 3;
   string name              = 4;
   string metadata_location = 5;
+  bytes  conflict_state    = 6;   // the conflict encoding's state of the
+                                  //   table, in its own layout; absent: none
 }
 
 message NamespaceProperty {
@@ -136,6 +146,7 @@ message Action {
     UpdateTableInline       update_table_inline       = 9;   // see SPEC_TM
     CreateTableInline       create_table_inline       = 10;  // see SPEC_TM
     RenameTable             rename_table              = 11;
+    SetConflictEncoding     set_conflict_encoding     = 12;
   }
 }
 ```
@@ -216,6 +227,13 @@ message RenameTable {
   int32  new_namespace_version = 4; // must match; -1 if late-bound
   string new_name              = 5;
 }
+
+// Sets the catalog's conflict encoding. The catalog's first record carries
+// it; it applies only to a catalog with no encoding that has never had a
+// table, so no record is judged under one encoding and then another.
+message SetConflictEncoding {
+  string name = 1;
+}
 ```
 
 Inline action messages (`CreateTableInline`, `UpdateTableInline`) and the
@@ -246,7 +264,8 @@ checkpoint = framed<LogCheckpoint{ min_reader_version=1, log_id=…,
                  Namespace{id=0, version=0, parent_id=0, name=""} } }>   ; empty
 gc         = framed<LogRecord{ advance_horizon=AdvanceHorizon{
                watermark_ms=now - retention } }>                         ; drops nothing
-record-1   = framed<LogRecord{ id=…, intention=Intention{} }>          ; no actions
+record-1   = framed<LogRecord{ id=…, intention=Intention{
+               SetConflictEncoding(name="lamport") } }>                  ; the encoding
 record-2   = framed<LogRecord{ id=…, intention=Intention{
                CreateNamespace(id=-1, version=1,
                                parent_id=0, parent_version=0, name="db") } }>
@@ -258,8 +277,10 @@ record-3   = framed<LogRecord{ id=…, intention=Intention{
 
 `FileIOCatalog.initialize` creates the file with a replace of the absent
 object ([ATOMIC_FILE_LOG.md](ATOMIC_FILE_LOG.md) §"Commits on one object"): a
-checkpoint holding only the root row, a GC record, then the empty
-transaction's record, whose id joins the committed set like any other. Replay
+checkpoint holding only the root row, a GC record, then the bootstrap
+record, which sets the catalog's conflict encoding
+(`fileio.catalog.conflict.encoding`, default `lamport`) and whose id joins
+the committed set like any other. Replay
 binds record 2's namespace -1 to `next_namespace_id`, 1, and bumps the root to
 version 1; `parent_version` is the root's version when the writer read it.
 Record 3's writer read `db` as id 1 at version 1; replay binds the table -1 to
@@ -267,7 +288,7 @@ id 1 and bumps `db` to version 2. Created in one transaction, the two actions
 would share one record, the `CreateTable` naming the namespace by its
 late-bound id (`namespace_id=-1, namespace_version=-1`).
 
-<!-- protocol "Magic = LCAT:32,Format Version = 2:32,CP Length (varint):16,Checkpoint - empty (root row; next ids 1):48,GC Length (varint):16,GC record - AdvanceHorizon (drops nothing):48,Rec1 Length (varint):16,Record 1 - empty txn (initialize):48,Rec2 Length (varint):16,Record 2 - CreateNamespace (id=-1 v=1 db):48,Rec3 Length (varint):16,Record 3 - CreateTable (id=-1 v=1 ns=1 t):48" -->
+<!-- protocol "Magic = LCAT:32,Format Version = 2:32,CP Length (varint):16,Checkpoint - empty (root row; next ids 1):48,GC Length (varint):16,GC record - AdvanceHorizon (drops nothing):48,Rec1 Length (varint):16,Record 1 - SetConflictEncoding (initialize):48,Rec2 Length (varint):16,Record 2 - CreateNamespace (id=-1 v=1 db):48,Rec3 Length (varint):16,Record 3 - CreateTable (id=-1 v=1 ns=1 t):48" -->
 ```
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
@@ -286,7 +307,7 @@ late-bound id (`namespace_id=-1, namespace_version=-1`).
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |      Rec1 Length (varint)     |                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
-|               Record 1 - empty txn (initialize)               |
+|          Record 1 - SetConflictEncoding (initialize)          |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |      Rec2 Length (varint)     |                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
@@ -417,6 +438,42 @@ replay must be byte-stable so that every reader of the same records rebuilds
 the same metadata, whatever its clock — see [SPEC_TM.md](SPEC_TM.md)
 §"Replay determinism" for the two pinning rules.
 
+## Conflict Encodings
+
+A table action's precondition is decided by the catalog's conflict
+encoding (`ConflictEncoding`), which the bootstrap record sets
+(`SetConflictEncoding`) and every checkpoint keeps (`conflict_encoding`).
+An encoding takes a table action of a record (`TableAction`: the table,
+the version its writer read, and its payload, decoded once), extracts a
+conflict witness from it, and validates the witness against the table
+where the record lands (`ReplayView`) and against what the encoding keeps
+of the table (`EncodingState`, in `Table.conflict_state` /
+`InlineTable.conflict_state`). `lamport`, the default, is the Lamport
+clock: an action applies only on the version its writer read. Other
+encodings separate a table's concerns, so that replay applies a commit
+Iceberg's retry would have repaired, merged onto the commits that landed
+first.
+
+- `UpdateTableInline`, `UpdateTableLocation` and `ReadTable` verify through
+  the encoding (`ConflictEncodings.admits`); their applies, and a rename's,
+  let it observe the change. Namespace actions, creates, drops and renames
+  keep their own version checks.
+- Whatever the encoding, an action applies on a version of its table other
+  than the one its writer read only if it is an unpinned inline delta
+  whose late-bound fields can be finalized there ([SPEC_TM.md](SPEC_TM.md)
+  §"Late-bound fields"). A metadata location, full metadata, a read pin
+  and a pinned update (a table a catalog transaction writes, errata D12)
+  apply only on that version.
+- The table's version becomes its version where the record lands, plus
+  one.
+- An encoding is deterministic (S1), stable (S2: a rejection stays a
+  rejection, guarded by evidence that only accumulates in its state), and
+  total (it never throws); it coarsens to the Lamport witness where it
+  cannot see more, and admits only what merges exactly. Each encoding's
+  test extends `ConflictEncodingContract`, and `TestRebaseProperties`
+  checks that a record it admits on a changed table is what Iceberg's retry
+  of the operation commits there.
+
 ## Commits
 
 A writer stages a transaction on a read (`CatalogMutation`, on the `Replica`
@@ -503,6 +560,8 @@ and the number of intention records after the checkpoint
 | `tblManifestPrefix`  | `Map<Integer, String>`           | Table ID → manifest-list prefix      |
 | `manifestPool`       | `Map<Integer, Map<String, ManifestFile>>` | Per-table manifest pool     |
 | `snapshotManifests`  | `Map<Integer, Map<Long, List<String>>>`   | Per-snapshot manifest paths |
+| `conflictEncoding`   | `String`                         | The conflict encoding's name; null: unset (`lamport`) |
+| `conflictStates`     | `Map<Integer, EncodingState>`    | Table ID → the encoding's state of it |
 
 Inline-only fields (`tblInlineMetadata`, `tblInlineMetadataCodec`,
 `tblManifestPrefix`, `manifestPool`, `snapshotManifests`) are described in
@@ -570,16 +629,18 @@ the id is a UUIDv7, and `CatalogIntention.verify` accepts it.
 | RemoveNamespaceProperty  | namespace version matches (skipped if -1)                 |
 | CreateTable              | namespace version matches (skipped if -1)                 |
 | DropTable                | table version matches                                     |
-| UpdateTableLocation      | table version matches                                     |
-| ReadTable                | table version matches                                     |
+| UpdateTableLocation      | the conflict encoding admits it: the table version matches |
+| ReadTable                | the conflict encoding admits it: the table version matches |
 | CreateTableInline        | namespace version matches (skipped if -1)                 |
-| UpdateTableInline        | table version matches                                     |
+| UpdateTableInline        | the conflict encoding admits it ([Conflict Encodings](#conflict-encodings)): under `lamport`, the table version matches |
 | RenameTable              | table version matches; destination namespace version matches (skipped if -1) |
+| SetConflictEncoding      | the catalog has no encoding and has never had a table     |
 | unknown action type      | always passes (`UnknownAction`)                           |
 
 Each `apply()` bumps the version of any entity whose state it mutates: a
-table update or rename bumps the table, and a create starts its entity at
-the record's `version` (1). A namespace's version covers its children and
+table update or rename bumps the table (an update from its version where
+the record lands), and a create starts its entity at the record's
+`version` (1). A namespace's version covers its children and
 properties: creating, dropping or renaming a child bumps the parent
 namespace (a rename bumps both, when they differ), and setting or removing
 a property bumps that namespace. `ReadTable` and unknown actions change
@@ -599,6 +660,8 @@ committed set, now the envelope's).
   read.
 - An unknown action type decodes as `UnknownAction`, which always
   verifies and applies nothing; the record's other actions apply.
+- A reader refuses a checkpoint or record that names a conflict encoding it
+  does not know (`ConflictEncodings.byName`).
 - `Checkpoint.min_reader_version` gates changes a reader cannot skip safely:
   every checkpoint carries `ProtoCodec.SUPPORTED_READER_VERSION` (1), and a
   reader refuses one that lacks the field or carries more than it supports. It

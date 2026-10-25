@@ -254,7 +254,7 @@ A delta's new snapshots are added in the same builder as its refs and
 other metadata updates, as a writer's commit adds its snapshot and moves
 the branch in one builder: Iceberg logs main's move to a snapshot that
 builder added at the snapshot's own timestamp, which replay reconstructs
-as `base.lastUpdatedMillis() + timestampDeltaMs`, and a move to any
+as the delta's last-updated-ms plus `timestampDeltaMs`, and a move to any
 other snapshot (a rollback) at last-updated-ms (Bug 60).
 
 ### I5. Inline-ML snapshots encode as sentinels, never as embedded paths

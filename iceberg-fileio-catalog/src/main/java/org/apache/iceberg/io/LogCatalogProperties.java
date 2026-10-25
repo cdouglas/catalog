@@ -71,6 +71,32 @@ public final class LogCatalogProperties {
   public static final String THROTTLE_MIN_WAIT_MS = "fileio.catalog.throttle.retry.min-wait-ms";
   public static final long DEFAULT_THROTTLE_MIN_WAIT_MS = 200L;
 
+  /**
+   * The conflict encoding of a catalog this one creates, by name: how replay decides whether a
+   * table update conflicts with what landed since its writer read the table ({@link
+   * ConflictEncoding}). The catalog's first record sets it, and every reader judges by it; a
+   * catalog that opens an existing log uses that log's, whatever this says. Default: {@code
+   * lamport}, an update applies only on the version of the table it read.
+   */
+  public static final String CONFLICT_ENCODING = "fileio.catalog.conflict.encoding";
+  public static final String DEFAULT_CONFLICT_ENCODING = LamportEncoding.NAME;
+
+  /**
+   * The conflict encoding {@code properties} name for a catalog to create.
+   *
+   * @throws IllegalArgumentException if this build does not know it
+   */
+  public static String conflictEncoding(Map<String, String> properties) {
+    String name =
+        properties == null
+            ? DEFAULT_CONFLICT_ENCODING
+            : properties.getOrDefault(CONFLICT_ENCODING, DEFAULT_CONFLICT_ENCODING);
+    Preconditions.checkArgument(
+        ConflictEncodings.known(name),
+        "Unknown %s: %s (known: %s)", CONFLICT_ENCODING, name, ConflictEncodings.names());
+    return name;
+  }
+
   /** The runtime configuration {@code properties} set; the defaults for those they do not. */
   public static RuntimeConfig runtimeConfig(Map<String, String> properties) {
     return runtimeConfig(

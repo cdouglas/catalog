@@ -57,8 +57,13 @@ import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
  * </ul>
  *
  * <p>The statistics count, per encoding, the conflicts a retry repaired (false positives), those
- * a retry confirmed, and the admitted records. Until the catalog has encodings other than the
- * Lamport clock, the subject is a reference too, and the property sets their baseline.
+ * a retry confirmed, and the admitted records. Under the Lamport clock the subject is a reference
+ * too, and the property sets the baseline.
+ *
+ * <p>{@link #aMergedAppendIsWhatItsRetryWouldCommit} probes the merge ({@link Landing}) on its own:
+ * its subject admits every delta that can be finalized where it lands ({@link
+ * AdmitDeltasEncoding}), and R is an append that validates nothing, whose retry commits on any
+ * table.
  */
 class TestRebaseProperties {
 
@@ -77,12 +82,34 @@ class TestRebaseProperties {
       @ForAll("prefixes") List<TableScript.Cmd> prefix,
       @ForAll("windows") List<TableScript.Cmd> window,
       @ForAll("operations") TableScript.Cmd r) {
+    check(LamportEncoding.NAME, formatVersion, partitioned, mode, prefix, window, r);
+  }
+
+  @Property(tries = 300)
+  void aMergedAppendIsWhatItsRetryWouldCommit(
+      @ForAll @IntRange(min = 2, max = 3) int formatVersion,
+      @ForAll boolean partitioned,
+      @ForAll("inlineManifestModes") LocalCatalogMode mode,
+      @ForAll("prefixes") List<TableScript.Cmd> prefix,
+      @ForAll("windows") List<TableScript.Cmd> window,
+      @ForAll("appends") TableScript.Cmd r) {
+    check(AdmitDeltasEncoding.register(), formatVersion, partitioned, mode, prefix, window, r);
+  }
+
+  private static void check(
+      String encoding,
+      int formatVersion,
+      boolean partitioned,
+      LocalCatalogMode mode,
+      List<TableScript.Cmd> prefix,
+      List<TableScript.Cmd> window,
+      TableScript.Cmd r) {
     StringBuilder trace = new StringBuilder(String.format(
-        "v%d %s, %s%nprefix %s%nwindow %s%nR %s%n", formatVersion,
-        partitioned ? "partitioned" : "unpartitioned", mode, prefix, window, r));
-    Run subject = Run.of(mode, formatVersion, partitioned, prefix, window, r, trace);
-    Run reference = Run.of(mode, formatVersion, partitioned, prefix, window, r,
-        new StringBuilder());
+        "v%d %s, %s, %s%nprefix %s%nwindow %s%nR %s%n", formatVersion,
+        partitioned ? "partitioned" : "unpartitioned", mode, encoding, prefix, window, r));
+    Run subject = Run.of(encoding, mode, formatVersion, partitioned, prefix, window, r, trace);
+    Run reference = Run.of(LamportEncoding.NAME, mode, formatVersion, partitioned, prefix, window,
+        r, new StringBuilder());
 
     String outcome;
     if (!subject.raced) {
@@ -108,7 +135,7 @@ class TestRebaseProperties {
     } else {
       outcome = "failed without a conflict (" + subject.failure.getClass().getSimpleName() + ")";
     }
-    Statistics.label("R on a raced table").collect(outcome);
+    Statistics.label("R on a raced table").collect(encoding, outcome);
     Statistics.label("R").collect(r.kind + (subject.failure == null ? "" : " failed"));
 
     // Both runs end alike: what the subject admitted is what the retry committed.
@@ -131,6 +158,28 @@ class TestRebaseProperties {
   @Provide
   Arbitrary<LocalCatalogMode> modes() {
     return Arbitraries.of(LocalCatalogMode.fileModes());
+  }
+
+  /**
+   * The modes whose tables' updates are inline deltas, which can merge, with their manifest lists
+   * inline. A manifest list file hides the partition specs of its manifests, which a window may
+   * remove (an expiry that cleans up metadata): only an encoding, which stamps spec changes, can
+   * tell that it did.
+   */
+  @Provide
+  Arbitrary<LocalCatalogMode> inlineManifestModes() {
+    return Arbitraries.of(
+        LocalCatalogMode.fileModes().stream().filter(m -> m.inlineML).toList());
+  }
+
+  /** Appends whose retry validates nothing, and so commits on any version of the table. */
+  @Provide
+  Arbitrary<TableScript.Cmd> appends() {
+    return TableScript.commands(
+            kind -> kind == TableScript.Kind.FAST_APPEND || kind == TableScript.Kind.MERGE_APPEND
+                || kind == TableScript.Kind.BRANCH_APPEND
+                || kind == TableScript.Kind.STAGED_APPEND)
+        .withoutEdgeCases();
   }
 
   @Provide
@@ -175,11 +224,13 @@ class TestRebaseProperties {
       this.view = view;
     }
 
-    static Run of(LocalCatalogMode mode, int formatVersion, boolean partitioned,
+    static Run of(String encoding, LocalCatalogMode mode, int formatVersion, boolean partitioned,
         List<TableScript.Cmd> prefix, List<TableScript.Cmd> window, TableScript.Cmd r,
         StringBuilder trace) {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
-      LogCatalog catalog = mode.catalog(io, WAREHOUSE, "c", PROPERTIES);
+      Map<String, String> properties = new java.util.HashMap<>(PROPERTIES);
+      properties.put(LogCatalogProperties.CONFLICT_ENCODING, encoding);
+      LogCatalog catalog = mode.catalog(io, WAREHOUSE, "c", properties);
       catalog.createNamespace(Namespace.of("ns"));
       TableScript.Runner writer =
           new TableScript.Runner(catalog, formatVersion, partitioned, trace);

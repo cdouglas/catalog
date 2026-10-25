@@ -97,6 +97,8 @@ public class ProtoCodec {
    * safely) do not bump the version.
    */
   private static final int CHECKPOINT_MIN_READER_VERSION = 4;
+  /** The catalog's conflict encoding; absent until a record sets one. */
+  private static final int CHECKPOINT_CONFLICT_ENCODING = 5;
   private static final int CHECKPOINT_NAMESPACES = 10;
   private static final int CHECKPOINT_TABLES = 11;
   private static final int CHECKPOINT_NAMESPACE_PROPERTIES = 12;
@@ -119,6 +121,7 @@ public class ProtoCodec {
   private static final int TBL_NAMESPACE_ID = 3;
   private static final int TBL_NAME = 4;
   private static final int TBL_METADATA_LOCATION = 5;
+  private static final int TBL_CONFLICT_STATE = 6;
 
   // NamespaceProperty field numbers
   private static final int NSPROP_NAMESPACE_ID = 1;
@@ -135,6 +138,7 @@ public class ProtoCodec {
   private static final int INLINE_TBL_MANIFEST_POOL = 7;
   private static final int INLINE_TBL_SNAPSHOT_REFS = 8;
   private static final int INLINE_TBL_METADATA_CODEC = 9;
+  private static final int INLINE_TBL_CONFLICT_STATE = 10;
 
   // ManifestFileEntry field numbers
   private static final int MF_PATH_SUFFIX = 1;
@@ -180,6 +184,7 @@ public class ProtoCodec {
   private static final int ACTION_UPDATE_TABLE_INLINE = 9;
   private static final int ACTION_CREATE_TABLE_INLINE = 10;
   private static final int ACTION_RENAME_TABLE = 11;
+  private static final int ACTION_SET_CONFLICT_ENCODING = 12;
 
   // CreateNamespace field numbers
   private static final int CREATE_NS_ID = 1;
@@ -238,6 +243,9 @@ public class ProtoCodec {
   // TM replacement. Same wire shape as
   // {@link #CREATE_INLINE_TBL_DELTA}.
   private static final int UPDATE_INLINE_ML_DELTA = 7;
+  // The update applies only on the version it names, whatever the catalog's conflict encoding: a
+  // table a catalog transaction writes.
+  private static final int UPDATE_INLINE_PINNED = 8;
 
   // CreateTableInline field numbers
   private static final int CREATE_INLINE_TBL_ID = 1;
@@ -257,6 +265,9 @@ public class ProtoCodec {
   private static final int RENAME_TBL_NEW_NS_ID = 3;
   private static final int RENAME_TBL_NEW_NS_VERSION = 4;
   private static final int RENAME_TBL_NEW_NAME = 5;
+
+  // SetConflictEncoding field numbers
+  private static final int SET_CONFLICT_ENCODING_NAME = 1;
 
   // ============================================================
   // Checkpoint encoding/decoding
@@ -279,6 +290,10 @@ public class ProtoCodec {
       // checkpoint.
       writeVarint(out, CHECKPOINT_NEXT_NAMESPACE_ID, original.nextNamespaceId());
       writeVarint(out, CHECKPOINT_NEXT_TABLE_ID, original.nextTableId());
+      if (original.conflictEncodingName() != null) {
+        writeString(out, CHECKPOINT_CONFLICT_ENCODING, original.conflictEncodingName());
+      }
+      EncodingState.Codec stateCodec = original.conflictEncoding().stateCodec();
 
       // Namespaces - write from original state (mutations will be applied via transaction)
       for (Map.Entry<Integer, CatalogState.NsEntry> entry : original.namespaceById().entrySet()) {
@@ -289,7 +304,8 @@ public class ProtoCodec {
       // Tables (pointer-mode only; inline tables encoded separately)
       for (Map.Entry<Integer, CatalogState.TblEntry> entry : original.tableById().entrySet()) {
         if (!original.isInlineTable(entry.getKey())) {
-          byte[] tblBytes = encodeTable(entry.getKey(), entry.getValue());
+          byte[] tblBytes = encodeTable(entry.getKey(), entry.getValue(),
+              conflictState(original, stateCodec, entry.getKey()));
           writeLengthDelimited(out, CHECKPOINT_TABLES, tblBytes);
         }
       }
@@ -313,7 +329,8 @@ public class ProtoCodec {
           Map<Long, List<String>> snapRefs = original.snapshotManifests(tblId);
           byte codecTag = original.inlineMetadataCodec(tblId);
           byte[] inlineBytes = encodeInlineTable(
-              tblId, tblEntry, inlineEntry.getValue(), codecTag, prefix, pool, snapRefs);
+              tblId, tblEntry, inlineEntry.getValue(), codecTag, prefix, pool, snapRefs,
+              conflictState(original, stateCodec, tblId));
           writeLengthDelimited(out, CHECKPOINT_INLINE_TABLES, inlineBytes);
         }
       }
@@ -324,11 +341,19 @@ public class ProtoCodec {
     }
   }
 
+  /** The bytes of the conflict encoding's state of table {@code tblId}; empty if it has none. */
+  private static byte[] conflictState(CatalogState state, EncodingState.Codec codec, int tblId) {
+    EncodingState tableState = state.conflictStates().get(tblId);
+    return tableState != null ? codec.encode(tableState) : new byte[0];
+  }
+
   /** Decodes the catalog's state, the payload of a checkpoint (catalog.proto Checkpoint). */
   public static void decodeCheckpointState(byte[] state, CatalogState.Builder builder) {
     try {
       ByteArrayInputStream in = new ByteArrayInputStream(state);
       boolean sawMinReaderVersion = false;
+      // A table's conflict state decodes with the encoding's codec, which may come after it.
+      Map<Integer, byte[]> conflictStates = new HashMap<>();
       while (in.available() > 0) {
         int tag = readVarint(in);
         int fieldNumber = tag >>> 3;
@@ -353,17 +378,20 @@ public class ProtoCodec {
           case CHECKPOINT_NEXT_TABLE_ID:
             builder.setNextTableId(readVarint(in));
             break;
+          case CHECKPOINT_CONFLICT_ENCODING:
+            builder.setConflictEncoding(readString(in));
+            break;
           case CHECKPOINT_NAMESPACES:
             decodeNamespace(readLengthDelimitedBytes(in), builder);
             break;
           case CHECKPOINT_TABLES:
-            decodeTable(readLengthDelimitedBytes(in), builder);
+            decodeTable(readLengthDelimitedBytes(in), builder, conflictStates);
             break;
           case CHECKPOINT_NAMESPACE_PROPERTIES:
             decodeNamespaceProperty(readLengthDelimitedBytes(in), builder);
             break;
           case CHECKPOINT_INLINE_TABLES:
-            decodeInlineTable(readLengthDelimitedBytes(in), builder);
+            decodeInlineTable(readLengthDelimitedBytes(in), builder, conflictStates);
             break;
           default:
             skipField(in, wireType);
@@ -372,6 +400,9 @@ public class ProtoCodec {
       Preconditions.checkState(
           sawMinReaderVersion,
           "Checkpoint missing required min_reader_version field");
+      // Fails for an encoding this build does not know: its replay would differ.
+      EncodingState.Codec stateCodec = builder.conflictEncoding().stateCodec();
+      conflictStates.forEach((id, bytes) -> builder.setConflictState(id, stateCodec.decode(bytes)));
       // Rebuild lookups after all entries are loaded (handles out-of-order decoding)
       builder.rebuildLookups();
     } catch (IOException e) {
@@ -416,20 +447,27 @@ public class ProtoCodec {
     builder.addNamespace(id, parentId, name, version);
   }
 
-  private static byte[] encodeTable(int id, CatalogState.TblEntry entry) throws IOException {
+  private static byte[] encodeTable(int id, CatalogState.TblEntry entry, byte[] conflictState)
+      throws IOException {
     ByteArrayOutputStream out = new ByteArrayOutputStream();
     writeVarint(out, TBL_ID, id);
     writeVarint(out, TBL_VERSION, entry.version);
     writeVarint(out, TBL_NAMESPACE_ID, entry.namespaceId);
     writeString(out, TBL_NAME, entry.name);
     writeString(out, TBL_METADATA_LOCATION, entry.metadataLocation);
+    if (conflictState.length > 0) {
+      writeBytes(out, TBL_CONFLICT_STATE, conflictState);
+    }
     return out.toByteArray();
   }
 
-  private static void decodeTable(byte[] bytes, CatalogState.Builder builder) throws IOException {
+  private static void decodeTable(
+      byte[] bytes, CatalogState.Builder builder, Map<Integer, byte[]> conflictStates)
+      throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
     int id = 0, version = 0, nsId = 0;
     String name = "", metadataLocation = "";
+    byte[] conflictState = null;
 
     while (in.available() > 0) {
       int tag = readVarint(in);
@@ -450,11 +488,17 @@ public class ProtoCodec {
         case TBL_METADATA_LOCATION:
           metadataLocation = readString(in);
           break;
+        case TBL_CONFLICT_STATE:
+          conflictState = readLengthDelimitedBytes(in);
+          break;
         default:
           skipField(in, tag & 0x7);
       }
     }
     builder.addTable(id, nsId, name, version, metadataLocation);
+    if (conflictState != null) {
+      conflictStates.put(id, conflictState);
+    }
   }
 
   private static byte[] encodeNamespaceProperty(int nsId, String key, String value) throws IOException {
@@ -493,7 +537,7 @@ public class ProtoCodec {
   private static byte[] encodeInlineTable(
       int id, CatalogState.TblEntry entry, byte[] metadata, byte metadataCodec,
       String manifestPrefix,
-      Map<String, ManifestFile> pool, Map<Long, List<String>> snapRefs)
+      Map<String, ManifestFile> pool, Map<Long, List<String>> snapRefs, byte[] conflictState)
       throws IOException {
     ByteArrayOutputStream out = new ByteArrayOutputStream();
     writeVarint(out, INLINE_TBL_ID, id);
@@ -503,6 +547,9 @@ public class ProtoCodec {
     writeBytes(out, INLINE_TBL_METADATA, metadata);
     writeString(out, INLINE_TBL_MANIFEST_PREFIX, manifestPrefix);
     writeVarint(out, INLINE_TBL_METADATA_CODEC, metadataCodec & 0xFF);
+    if (conflictState.length > 0) {
+      writeBytes(out, INLINE_TBL_CONFLICT_STATE, conflictState);
+    }
 
     // Manifest pool (field 7): encode each unique ManifestFile entry, and build the
     // positional index for snapshot refs
@@ -545,7 +592,8 @@ public class ProtoCodec {
     return out.toByteArray();
   }
 
-  private static void decodeInlineTable(byte[] bytes, CatalogState.Builder builder)
+  private static void decodeInlineTable(
+      byte[] bytes, CatalogState.Builder builder, Map<Integer, byte[]> conflictStates)
       throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
     int id = 0, version = 0, nsId = 0;
@@ -554,6 +602,7 @@ public class ProtoCodec {
     Byte metadataCodec = null;
     List<byte[]> poolEntryBytes = new ArrayList<>();
     List<byte[]> snapRefBytes = new ArrayList<>();
+    byte[] conflictState = null;
 
     while (in.available() > 0) {
       int tag = readVarint(in);
@@ -586,6 +635,9 @@ public class ProtoCodec {
         case INLINE_TBL_METADATA_CODEC:
           metadataCodec = (byte) readVarint(in);
           break;
+        case INLINE_TBL_CONFLICT_STATE:
+          conflictState = readLengthDelimitedBytes(in);
+          break;
         default:
           skipField(in, tag & 0x7);
       }
@@ -594,6 +646,9 @@ public class ProtoCodec {
         metadataCodec != null,
         "Inline table %s record missing required codec tag", id);
     builder.addInlineTable(id, nsId, name, version, metadata, metadataCodec, manifestPrefix);
+    if (conflictState != null) {
+      conflictStates.put(id, conflictState);
+    }
 
     // Decode manifest pool (positional array) -> path-keyed map
     List<ManifestFile> poolList = new ArrayList<>(poolEntryBytes.size());
@@ -785,6 +840,9 @@ public class ProtoCodec {
       } else if (a.metadataLocation != null) {
         writeString(inner, UPDATE_INLINE_METADATA_LOCATION, a.metadataLocation);
       }
+      if (a.pinned) {
+        writeVarint(inner, UPDATE_INLINE_PINNED, 1);
+      }
       writeLengthDelimited(out, ACTION_UPDATE_TABLE_INLINE, inner.toByteArray());
     } else if (action instanceof CreateTableInlineAction) {
       CreateTableInlineAction a = (CreateTableInlineAction) action;
@@ -809,6 +867,10 @@ public class ProtoCodec {
       writeVarint(inner, RENAME_TBL_NEW_NS_VERSION, a.newNamespaceVersion);
       writeString(inner, RENAME_TBL_NEW_NAME, a.newName);
       writeLengthDelimited(out, ACTION_RENAME_TABLE, inner.toByteArray());
+    } else if (action instanceof SetConflictEncodingAction) {
+      ByteArrayOutputStream inner = new ByteArrayOutputStream();
+      writeString(inner, SET_CONFLICT_ENCODING_NAME, ((SetConflictEncodingAction) action).name);
+      writeLengthDelimited(out, ACTION_SET_CONFLICT_ENCODING, inner.toByteArray());
     }
     return out.toByteArray();
   }
@@ -842,6 +904,8 @@ public class ProtoCodec {
         return decodeCreateTableInline(actionBytes);
       case ACTION_RENAME_TABLE:
         return decodeRenameTable(actionBytes);
+      case ACTION_SET_CONFLICT_ENCODING:
+        return decodeSetConflictEncoding(actionBytes);
       default:
         return new UnknownAction(actionType, actionBytes);
     }
@@ -1108,6 +1172,7 @@ public class ProtoCodec {
     String metadataLocation = null;
     Byte fullMetadataCodec = null;
     byte[] mlDeltaBytes = null;
+    boolean pinned = false;
 
     while (in.available() > 0) {
       int tag = readVarint(in);
@@ -1134,6 +1199,9 @@ public class ProtoCodec {
         case UPDATE_INLINE_ML_DELTA:
           mlDeltaBytes = readLengthDelimitedBytes(in);
           break;
+        case UPDATE_INLINE_PINNED:
+          pinned = readVarint(in) != 0;
+          break;
         default:
           skipField(in, tag & 0x7);
       }
@@ -1145,7 +1213,22 @@ public class ProtoCodec {
     return new UpdateTableInlineAction(
         id, version, deltaBytes, fullMetadata,
         fullMetadataCodec != null ? fullMetadataCodec : InlineMetadataCodecs.TAG_JSON_GZIP,
-        metadataLocation, mlDeltaBytes);
+        metadataLocation, mlDeltaBytes, pinned);
+  }
+
+  private static SetConflictEncodingAction decodeSetConflictEncoding(byte[] bytes)
+      throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    String name = "";
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      if (tag >>> 3 == SET_CONFLICT_ENCODING_NAME) {
+        name = readString(in);
+      } else {
+        skipField(in, tag & 0x7);
+      }
+    }
+    return new SetConflictEncodingAction(name);
   }
 
   private static RenameTableAction decodeRenameTable(byte[] bytes) throws IOException {
@@ -1965,20 +2048,27 @@ public class ProtoCodec {
       this.metadataLocation = metadataLocation;
     }
 
+    /** The update as the catalog's conflict encoding sees it. */
+    TableAction table() {
+      return TableAction.of(TableAction.Kind.LOCATION, id, version);
+    }
+
     @Override
     public boolean verify(CatalogState.Builder builder) {
-      int currentVersion = builder.tableVersion(id);
-      return currentVersion == version;
+      // A metadata file replaces the table's whole state: it applies only on the version read.
+      return ConflictEncodings.admits(table(), builder);
     }
 
     @Override
     public void apply(CatalogState.Builder builder) {
+      ReplayView before = ReplayView.of(builder, id);
       // A table is a pointer table or an inline table, never both: the metadata file is now the
       // table's whole state (its writer gave every snapshot a manifest list file). Inline state
       // left behind would be read again, by an inline writer's delta and by the next checkpoint,
       // which encodes an inline table without its location, losing this commit.
       builder.removeInlineMetadata(id);
-      builder.updateTableLocation(id, version + 1, metadataLocation);
+      builder.updateTableLocation(id, builder.tableVersion(id) + 1, metadataLocation);
+      ConflictEncodings.observe(table(), before, builder);
     }
   }
 
@@ -1993,9 +2083,9 @@ public class ProtoCodec {
 
     @Override
     public boolean verify(CatalogState.Builder builder) {
-      // Fails if the table changed since the transaction read it (a serializable read)
-      int currentVersion = builder.tableVersion(id);
-      return currentVersion == version;
+      // Fails if the table changed since the transaction read it (a serializable read): a read pin
+      // applies only on the version read, whatever the encoding.
+      return ConflictEncodings.admits(TableAction.of(TableAction.Kind.READ, id, version), builder);
     }
 
     @Override
@@ -2026,6 +2116,14 @@ public class ProtoCodec {
      * {@link #full(int, int, byte[], byte, byte[])}.
      */
     final byte[] mlDeltaBytes;
+    /**
+     * Whether the update applies only on the version it names, whatever the catalog's conflict
+     * encoding: a table a catalog transaction writes must be at the version the transaction first
+     * read (errata D12).
+     */
+    final boolean pinned;
+    // The update as the catalog's conflict encoding sees it: decoded once, for verify and apply.
+    private TableAction table;
 
     public UpdateTableInlineAction(
         int id, int version, byte[] deltaBytes, byte[] fullMetadata,
@@ -2036,6 +2134,13 @@ public class ProtoCodec {
     public UpdateTableInlineAction(
         int id, int version, byte[] deltaBytes, byte[] fullMetadata,
         byte fullMetadataCodec, String metadataLocation, byte[] mlDeltaBytes) {
+      this(id, version, deltaBytes, fullMetadata, fullMetadataCodec, metadataLocation,
+          mlDeltaBytes, false);
+    }
+
+    public UpdateTableInlineAction(
+        int id, int version, byte[] deltaBytes, byte[] fullMetadata,
+        byte fullMetadataCodec, String metadataLocation, byte[] mlDeltaBytes, boolean pinned) {
       this.id = id;
       this.version = version;
       this.deltaBytes = deltaBytes;
@@ -2043,6 +2148,14 @@ public class ProtoCodec {
       this.fullMetadataCodec = fullMetadataCodec;
       this.metadataLocation = metadataLocation;
       this.mlDeltaBytes = mlDeltaBytes;
+      this.pinned = pinned;
+    }
+
+    /** This update, applying only on the version it names ({@link #pinned}). */
+    public UpdateTableInlineAction pin() {
+      return new UpdateTableInlineAction(
+          id, version, deltaBytes, fullMetadata, fullMetadataCodec, metadataLocation, mlDeltaBytes,
+          true);
     }
 
     /** Creates an UpdateTableInlineAction in DELTA mode (codec inherited from base). */
@@ -2074,14 +2187,31 @@ public class ProtoCodec {
       return new UpdateTableInlineAction(id, version, null, null, (byte) 0, metadataLocation);
     }
 
+    /** The update as the catalog's conflict encoding sees it. */
+    TableAction table() {
+      if (table == null) {
+        table = deltaBytes != null
+            ? TableAction.delta(id, version, deltaBytes, pinned)
+            : TableAction.of(
+                fullMetadata != null ? TableAction.Kind.FULL : TableAction.Kind.LOCATION,
+                id, version);
+      }
+      return table;
+    }
+
     @Override
     public boolean verify(CatalogState.Builder builder) {
-      int currentVersion = builder.tableVersion(id);
-      return currentVersion == version;
+      // The table's version must be the one the update read, unless the catalog's conflict
+      // encoding admits a delta on a version that changed since, finalized where it lands.
+      return ConflictEncodings.admits(table(), builder);
     }
 
     @Override
     public void apply(CatalogState.Builder builder) {
+      ReplayView before = ReplayView.of(builder, id);
+      // The table's next version: its version where the record lands, which is the one the update
+      // read unless a conflict encoding admitted it on a later one.
+      int next = builder.tableVersion(id) + 1;
       if (deltaBytes != null) {
         // DELTA mode: apply structured changes to current inline metadata.
         // Decode base, apply delta, re-encode with the SAME codec the base
@@ -2091,13 +2221,15 @@ public class ProtoCodec {
         if (currentMeta != null) {
           byte baseCodecTag = builder.inlineMetadataCodec(id);
           InlineMetadataCodec baseCodec = InlineMetadataCodecs.byTag(baseCodecTag);
-          // Apply delta — routes ML updates to builder's manifest pool
-          byte[] updatedMeta = InlineDeltaCodec.applyDeltaWithManifests(
-              currentMeta, baseCodec, deltaBytes, builder, id);
+          // Apply delta — routes ML updates to builder's manifest pool; on a version later than
+          // the one the update read, its late-bound fields are finalized there (Landing)
+          TableMetadata updated = InlineDeltaCodec.applyDelta(
+              table().landingMetadata(builder, before), table().delta(), builder, id,
+              next - 1 != version);
           // Rotate the inline metadata without clearing manifest pool/refs.
           CatalogState.TblEntry old = builder.tableEntry(id);
           if (old != null) {
-            builder.updateInlineMetadata(id, version + 1, updatedMeta, baseCodecTag);
+            builder.updateInlineMetadata(id, next, baseCodec.encode(updated), baseCodecTag);
           }
         }
       } else if (fullMetadata != null) {
@@ -2108,7 +2240,7 @@ public class ProtoCodec {
         // table on a non-ML commit (schema evolution, etc.).
         CatalogState.TblEntry old = builder.tableEntry(id);
         if (old != null) {
-          builder.updateInlineMetadata(id, version + 1, fullMetadata, fullMetadataCodec);
+          builder.updateInlineMetadata(id, next, fullMetadata, fullMetadataCodec);
           // Apply bundled ML pool delta first (if any), so any AddManifest
           // entries for new snapshots populate the pool before we reconcile
           // refs against the new TM. A full-mode commit carries one whenever it
@@ -2151,8 +2283,9 @@ public class ProtoCodec {
       } else if (metadataLocation != null) {
         // POINTER mode: evict from inline to pointer
         builder.removeInlineMetadata(id);
-        builder.updateTableLocation(id, version + 1, metadataLocation);
+        builder.updateTableLocation(id, next, metadataLocation);
       }
+      ConflictEncodings.observe(table(), before, builder);
     }
   }
 
@@ -2296,9 +2429,13 @@ public class ProtoCodec {
 
     @Override
     public void apply(CatalogState.Builder builder) {
+      ReplayView before = ReplayView.of(builder, id);
       CatalogState.TblEntry old = builder.tableEntry(id);
       int oldNsId = old != null ? old.namespaceId : 0;
       builder.renameTable(id, newNamespaceId, newName, version + 1);
+      // A handle to the old name cannot commit to the renamed table: every encoding sees a change.
+      ConflictEncodings.observe(
+          TableAction.of(TableAction.Kind.RENAME, id, version), before, builder);
       // Renaming mutates the source ns's children set (table left) and the
       // destination ns's children set (table arrived). Bump both, exactly like
       // DropTable + CreateTable would have.
@@ -2306,6 +2443,35 @@ public class ProtoCodec {
       if (newNamespaceId != oldNsId) {
         builder.bumpNamespaceVersion(newNamespaceId);
       }
+    }
+  }
+
+  /**
+   * Sets the catalog's conflict encoding ({@link ConflictEncoding}): the first record of a catalog
+   * carries it, which replay judges every later table action by. It applies only to a catalog that
+   * has no encoding and has never had a table, so a record that lost a race to a table action is
+   * never judged under another encoding later (S2).
+   */
+  public static class SetConflictEncodingAction implements Action {
+    final String name;
+
+    public SetConflictEncodingAction(String name) {
+      this.name = name;
+    }
+
+    @Override
+    public boolean verify(CatalogState.Builder builder) {
+      if (builder.conflictEncodingName() != null || builder.nextTableId() != 1) {
+        return false;
+      }
+      // Fails the read for an encoding this build does not know: its replay would differ.
+      ConflictEncodings.byName(name);
+      return true;
+    }
+
+    @Override
+    public void apply(CatalogState.Builder builder) {
+      builder.setConflictEncoding(name);
     }
   }
 

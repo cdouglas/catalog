@@ -46,6 +46,8 @@ message InlineTable {
   repeated SnapshotManifestRefs  snapshot_refs  = 8;  // see SPEC_ML.md
   InlineMetadataCodec metadata_codec = 9;  // required, 0 included (see
                                            //   "Inline-TM codecs")
+  bytes  conflict_state       = 10; // the conflict encoding's state of the
+                                    //   table (SPEC.md "Conflict Encodings")
 }
 ```
 
@@ -144,12 +146,19 @@ message UpdateTableInline {
   TableMetadataDelta  ml_delta            = 7;  // optional, with full_metadata
                                                 //   only: manifest updates
                                                 //   (see SPEC_ML.md)
+  bool                pinned              = 8;  // applies only on `version`,
+                                                //   whatever the encoding
 }
 ```
 
 `CreateTableInline` verifies the same way as `CreateTable` (namespace
-version check, late-bind support). `UpdateTableInline` verifies on the
-table version, like `UpdateTableLocation`.
+version check, late-bind support). `UpdateTableInline` verifies through
+the catalog's conflict encoding, like `UpdateTableLocation` (SPEC.md
+§"Conflict Encodings"): under `lamport`, on the table version. A delta the
+encoding admits on a later version is finalized there ("Late-bound
+fields" below). `pinned` holds an update to its version under every
+encoding: `LogCatalog.commitTransaction` pins each table it writes, which
+must be at the version the transaction first read (errata D12).
 
 `CreateTableInline.delta` carries the manifest updates of the inline-ML
 snapshots a create transaction commits with the table (e.g.
@@ -174,6 +183,9 @@ message TableMetadataDelta {
   repeated TableMetadataUpdate updates = 1;
   int64 last_updated_ms = 2;   // required: the committed last-updated-ms,
                                //   which replay sets
+  int64 base_last_sequence_number = 3;  // the writer's base's; absent in a
+  int64 base_next_row_id          = 4;  //   delta of manifest updates only;
+                                        //   base_next_row_id for v3 only
 }
 
 message TableMetadataUpdate {
@@ -209,8 +221,8 @@ message AddSnapshot {
                                              // (always "": the full path);
                                              // empty for inline-ML snapshots
   CompactSummary summary              = 3;   // typed summary (replaces map)
-  sint64         timestamp_delta_ms   = 4;   // signed delta from the base's
-                                             // last-updated-ms
+  sint64         timestamp_delta_ms   = 4;   // signed delta from the delta's
+                                             // last_updated_ms
   int32          schema_id            = 5;   // present (0 included) unless it is
                                              // the base's current schema
   int64          added_rows           = 6;   // v3+: present, 0 included
@@ -227,16 +239,19 @@ delta's k-th new snapshot (k = 1, 2, ...):
 | Field                | Derivation                                        |
 |----------------------|---------------------------------------------------|
 | `sequence_number`    | `base.lastSequenceNumber + k` (0 for v1)          |
-| `timestamp_ms`       | `base.lastUpdatedMs + timestamp_delta_ms`         |
+| `timestamp_ms`       | `delta.last_updated_ms + timestamp_delta_ms`      |
 | `manifest_list`      | `table.manifestListPrefix + manifest_list_suffix`; `inline://<snapshotId>` if the suffix is empty |
 | `schema_id`          | `base.currentSchemaId` (if field 5 absent)        |
 
-`base` is the metadata the delta was computed against, the same for every
-snapshot of the delta: adding a snapshot moves last-updated-ms, so
-resolving a later snapshot's time against the metadata as the earlier
-updates left it would get it wrong. A commit whose new snapshots are
-numbered otherwise, or whose next row id is not the base's advanced by
-their added rows, goes in full.
+`base` is the table where the delta lands: the metadata the delta was
+computed against, unless a conflict encoding admitted it on a later
+version ("Late-bound fields"). A snapshot's time is relative to the
+delta's own last-updated-ms, the commit's, which is the same wherever it
+lands; adding a snapshot moves the metadata's, so resolving a later
+snapshot's time against the metadata as the earlier updates left it would
+get it wrong. A commit whose new snapshots are numbered otherwise, or
+whose next row id is not the base's advanced by their added rows, goes in
+full.
 
 `parent_snapshot_id` is sent whenever the snapshot has a parent; absent
 means it has none (a table's first snapshot, a replace's). Replay never
@@ -446,6 +461,50 @@ the table holds no inline list for, so the lists land atomically with
 the TM replacement; pointer mode writes them to Avro files (see
 [SPEC_ML.md](SPEC_ML.md) §"Writers in Different Modes").
 
+### Late-bound fields
+
+A delta is computed on the version of the table its writer read, its
+base, and on it every field replays as the writer committed it. A
+conflict encoding may admit an unpinned delta on a later version, where
+commits the writer did not see have landed; replay then finalizes the
+fields that depend on the base as Iceberg's retry of the operation
+computes them there (`SnapshotProducer.apply` and `summary`), with
+`Landing`:
+
+- **Sequence numbers.** The delta's new snapshots are numbered after the
+  landing table's last sequence number, as on the base, and a sequence
+  number above `base_last_sequence_number` in a manifest one of them
+  wrote (`added_snapshot_id`) moves by as much: the manifest list writer
+  assigns the commit's to the manifests it wrote.
+- **Row ids** (v3). A snapshot's `first_row_id`, and the `first_row_id`
+  of a data manifest one of them wrote at or above `base_next_row_id`,
+  move by how far the landing table's next row id is past the base's.
+- **Parent and totals.** The first new snapshot of a chain a
+  `SetSnapshotRef` moves a branch to takes the branch's head as its parent,
+  and its summary's `total-*` counts are recounted from the head's summary
+  (from 0 if the branch is new), as `SnapshotProducer.summary` counts them.
+- **Timestamps.** The snapshots' timestamps and the table's last-updated-ms
+  are no earlier than the landing table's last-updated-ms, which keeps the
+  snapshot and metadata logs in order.
+- **Retention.** A branch the delta advances keeps its retention.
+- **Version.** The table's version becomes the landing version plus one.
+
+On the base each of these is the writer's value. A delta whose fields
+cannot be finalized on a version (`Landing.unmergeable`) applies only on
+its base, whatever the encoding: one that adds more than one snapshot to a
+table that has moved (a later snapshot's manifest files name the earlier
+ones' sequence numbers and row ids), numbers a new schema, spec or sort
+order, removes snapshots, schemas or specs, sets a ref to a snapshot the
+table no longer has, names a schema or spec it no longer has, adds a
+snapshot whose id or a manifest whose path is in the table already, has a
+snapshot whose manifest list is a file and moves, advances a branch that
+is gone or is a tag, re-parents a snapshot whose parent or new parent has
+no inline list or which removes a manifest the new parent does not list,
+stages a snapshot on a branch that has moved, or lands on v3 from an
+earlier base. These are what the finalization needs; whether a merge is
+correct is the encoding's to judge, and it must make each of them stable
+where it admits.
+
 ## Configuration
 
 | Property                          | Default       | Description |
@@ -630,8 +689,9 @@ fields it does not know.
 | Action                | Precondition                                              |
 |-----------------------|-----------------------------------------------------------|
 | `CreateTableInline`   | Namespace version matches (skip if late-bound)            |
-| `UpdateTableInline`   | Table version matches                                     |
+| `UpdateTableInline`   | The catalog's conflict encoding admits it (SPEC.md "Conflict Encodings"); under `lamport`, the table version matches |
 
 `UpdateTableInline` subsumes `UpdateTableLocation` for inline tables: a
-version mismatch means a concurrent writer modified the table; the
-transaction is rejected and retried with a refreshed catalog state.
+version mismatch means a concurrent writer modified the table, and unless
+the encoding admits the delta there, the transaction is rejected and
+retried with a refreshed catalog state.

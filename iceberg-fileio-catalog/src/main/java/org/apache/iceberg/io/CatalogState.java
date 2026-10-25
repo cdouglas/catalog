@@ -77,6 +77,11 @@ public class CatalogState {
   // tblId -> (snapshotId -> list of manifest paths in the pool)
   private final Map<Integer, Map<Long, List<String>>> snapshotManifests;
 
+  // The catalog's conflict encoding, null until its first record sets one (then Lamport), and
+  // the encoding's state of each table that has one: tblId -> state.
+  private final String conflictEncoding;
+  private final Map<Integer, EncodingState> conflictStates;
+
   private CatalogState(Builder builder) {
     this.nextNamespaceId = builder.nextNamespaceId;
     this.nextTableId = builder.nextTableId;
@@ -90,6 +95,10 @@ public class CatalogState {
     this.tblManifestPrefix = ImmutableMap.copyOf(builder.tblManifestPrefix);
     this.manifestPool = deepCopyManifestPool(builder.manifestPool);
     this.snapshotManifests = deepCopySnapshotManifests(builder.snapshotManifests);
+    this.conflictEncoding = builder.conflictEncoding;
+    ImmutableMap.Builder<Integer, EncodingState> states = ImmutableMap.builder();
+    builder.conflictStates.forEach((id, state) -> states.put(id, state.copy()));
+    this.conflictStates = states.build();
   }
 
   private static Map<Integer, Map<String, String>> deepCopyProperties(
@@ -325,6 +334,24 @@ public class CatalogState {
     return snapshotManifests;
   }
 
+  /**
+   * The name of the catalog's conflict encoding, or null if no record has set one: then replay
+   * judges by the Lamport clock ({@link ConflictEncoding}).
+   */
+  public String conflictEncodingName() {
+    return conflictEncoding;
+  }
+
+  /** The catalog's conflict encoding. */
+  ConflictEncoding<Object> conflictEncoding() {
+    return ConflictEncodings.byName(conflictEncoding != null ? conflictEncoding : LamportEncoding.NAME);
+  }
+
+  /** The encoding's state of each table that has one, for checkpoint encoding. */
+  Map<Integer, EncodingState> conflictStates() {
+    return conflictStates;
+  }
+
   // ============================================================
   // Entry types
   // ============================================================
@@ -373,6 +400,8 @@ public class CatalogState {
     private final Map<Integer, String> tblManifestPrefix = new HashMap<>();
     private final Map<Integer, Map<String, ManifestFile>> manifestPool = new HashMap<>();
     private final Map<Integer, Map<Long, List<String>>> snapshotManifests = new HashMap<>();
+    private String conflictEncoding;
+    private final Map<Integer, EncodingState> conflictStates = new HashMap<>();
 
     Builder() {
       // The root namespace is an ordinary row with id 0, so it is versioned
@@ -506,12 +535,16 @@ public class CatalogState {
       return this;
     }
 
-    /** Removes a table, with its inline metadata and manifest lists if it has them. */
+    /**
+     * Removes a table, with its inline metadata and manifest lists if it has them, and its
+     * conflict encoding's state.
+     */
     public Builder removeTable(int id) {
       TblEntry entry = tableById.remove(id);
       if (entry != null) {
         removeLookup(tableLookup, tableKeyOrNull(entry), id);
       }
+      conflictStates.remove(id);
       return removeInlineMetadata(id);
     }
 
@@ -621,6 +654,12 @@ public class CatalogState {
       snapshotManifests.computeIfAbsent(tblId, k -> new HashMap<>())
           .put(snapshotId, new ArrayList<>(paths));
       return this;
+    }
+
+    /** The table's manifest pool, by path: every manifest its inline lists name. */
+    Map<String, ManifestFile> manifestPool(int tblId) {
+      Map<String, ManifestFile> pool = manifestPool.get(tblId);
+      return pool != null ? Collections.unmodifiableMap(pool) : Map.of();
     }
 
     /** Returns true if the table has any manifest pool entries. */
@@ -752,6 +791,40 @@ public class CatalogState {
 
     public boolean namespaceExists(Namespace ns) {
       return namespaceLookup.containsKey(ns);
+    }
+
+    /** Sets the catalog's conflict encoding ({@link CatalogState#conflictEncodingName}). */
+    public Builder setConflictEncoding(String name) {
+      this.conflictEncoding = name;
+      return this;
+    }
+
+    public String conflictEncodingName() {
+      return conflictEncoding;
+    }
+
+    /** The catalog's conflict encoding: the one its records set, else the Lamport clock. */
+    ConflictEncoding<Object> conflictEncoding() {
+      return ConflictEncodings.byName(
+          conflictEncoding != null ? conflictEncoding : LamportEncoding.NAME);
+    }
+
+    /**
+     * The encoding's state of table {@code tblId}, which the encoding may change: its codec's empty
+     * state if the encoding has not observed the table, which is kept from then on.
+     */
+    EncodingState conflictState(int tblId) {
+      EncodingState.Codec codec = conflictEncoding().stateCodec();
+      if (codec == EncodingState.Codec.NONE) {
+        return EncodingState.NONE;
+      }
+      return conflictStates.computeIfAbsent(tblId, id -> codec.empty());
+    }
+
+    /** Sets the encoding's state of table {@code tblId}, as a checkpoint holds it. */
+    Builder setConflictState(int tblId, EncodingState state) {
+      conflictStates.put(tblId, state);
+      return this;
     }
 
     public boolean tableExists(TableIdentifier ident) {

@@ -75,6 +75,7 @@ public class TestFormatExplorer {
     codec.put("UPDATE_INLINE_", "UpdateTableInline");
     codec.put("CREATE_INLINE_TBL_", "CreateTableInline");
     codec.put("RENAME_TBL_", "RenameTable");
+    codec.put("SET_CONFLICT_ENCODING_", "SetConflictEncoding");
     PREFIXES.put("ProtoCodec", codec);
 
     Map<String, String> committed = new LinkedHashMap<>();

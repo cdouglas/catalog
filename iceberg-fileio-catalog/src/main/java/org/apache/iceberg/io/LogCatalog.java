@@ -139,6 +139,7 @@ public class LogCatalog extends BaseMetastoreCatalog
     }
 
     inlineSettings(); // validates the inline properties
+    String conflictEncoding = LogCatalogProperties.conflictEncoding(catalogProperties);
 
     warehouseLocation = properties.get(CatalogProperties.WAREHOUSE_LOCATION);
     if (sharedLog == null) {
@@ -149,7 +150,7 @@ public class LogCatalog extends BaseMetastoreCatalog
     log = new CatalogLog(sharedLog, LogCatalogProperties.runtimeConfig(catalogProperties));
     // Another catalog may create the log at once (two processes starting on a new warehouse):
     // either way, this one uses it.
-    log.bootstrap();
+    log.bootstrap(conflictEncoding);
   }
 
   /**
@@ -797,7 +798,8 @@ public class LogCatalog extends BaseMetastoreCatalog
             if (manifests != null) {
               delta.addAll(manifests);
             }
-            byte[] deltaBytes = InlineDeltaCodec.encodeDelta(delta, metadata.lastUpdatedMillis());
+            byte[] deltaBytes =
+                InlineDeltaCodec.encodeDelta(delta, metadata.lastUpdatedMillis(), base);
             if (deltaBytes.length <= inline.maxUpdateSize) {
               mut.updateTableInlineDelta(tableId, deltaBytes);
               return;
@@ -1221,6 +1223,8 @@ public class LogCatalog extends BaseMetastoreCatalog
       checkAddedSnapshots(tableId, currentMetadata, newMetadata, ops.io());
       // The table's new inline-ML snapshots hold their manifest lists.
       ops.stageUpdate(newCatalog, currentMetadata, newMetadata);
+      // Whatever the catalog's conflict encoding, the update applies only on the version it read.
+      newCatalog.pin(tableId);
     }
     // Not retried: a transaction conflicts on the whole version of each table it pins, so a
     // conflict fails it (errata D12).

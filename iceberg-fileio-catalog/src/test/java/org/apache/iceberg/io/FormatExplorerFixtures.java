@@ -283,14 +283,14 @@ public class FormatExplorerFixtures {
     byte[] delta =
         writerDelta(base, events,
             List.of(
-                append(snapshotId, null, "events/metadata/snap-4f6c4a8e1234abcd-1-m0.avro",
-                    60_000L),
+                append(snapshotId, null, "events/metadata/snap-4f6c4a8e1234abcd-1-m0.avro", 0L),
                 main(snapshotId)),
             PINNED_TS + 60_000L);
     Log log = Log.cas(base, txn(42), mut -> mut.updateTableInlineDelta(events, delta),
         "The append, as a TableMetadataDelta: an AddSnapshot (its summary a CompactSummary), "
-            + "then a SetSnapshotRef moving main to it. The snapshot's time is a delta from the "
-            + "base's last-updated-ms; the delta's own last_updated_ms is the committed one.");
+            + "then a SetSnapshotRef moving main to it. The delta's last_updated_ms is the "
+            + "committed one, and the snapshot's time is a delta from it; base_last_sequence_number "
+            + "is the base's, which replay numbers the snapshot after.");
     return log.scenario(
         "update-table-inline-delta",
         "An UpdateTableInline whose payload is the delta InlineDeltaCodec.computeDelta sends for "
@@ -439,14 +439,14 @@ public class FormatExplorerFixtures {
     long s3a = 0x3333333333333333L;
     long s3b = 0x3333333333333334L;
     Log log = Log.checkpoint(base);
-    byte[] t1 = writerDelta(base, a, appendToMain(s1, null, "A/metadata/snap-1.avro", 60_000L),
+    byte[] t1 = writerDelta(base, a, appendToMain(s1, null, "A/metadata/snap-1.avro", 0L),
         PINNED_TS + 60_000L);
     log.append(txn(62), mut -> mut.updateTableInlineDelta(a, t1),
         "T1: UpdateTableInline(A, version = 1), a delta adding snapshot S1A and moving main to "
             + "it. Applies; A moves to version 2.");
-    byte[] t2a = writerDelta(base, a, appendToMain(s2a, null, "A/metadata/snap-2.avro", 120_000L),
+    byte[] t2a = writerDelta(base, a, appendToMain(s2a, null, "A/metadata/snap-2.avro", 0L),
         PINNED_TS + 120_000L);
-    byte[] t2b = writerDelta(base, b, appendToMain(s2b, null, "B/metadata/snap-2.avro", 120_000L),
+    byte[] t2b = writerDelta(base, b, appendToMain(s2b, null, "B/metadata/snap-2.avro", 0L),
         PINNED_TS + 120_000L);
     log.append(base, txn(63),
         mut -> mut.updateTableInlineDelta(a, t2a).updateTableInlineDelta(b, t2b),
@@ -455,9 +455,9 @@ public class FormatExplorerFixtures {
             + "delta, valid on its own, never lands; this record is the only place its "
             + "snapshot appears, and the next CAS write drops it.");
     Replica<CatalogState> afterT1 = log.state(); // T2 was rejected
-    byte[] t3a = writerDelta(afterT1, a, appendToMain(s3a, s1, "A/metadata/snap-3.avro", 120_000L),
+    byte[] t3a = writerDelta(afterT1, a, appendToMain(s3a, s1, "A/metadata/snap-3.avro", 0L),
         PINNED_TS + 180_000L);
-    byte[] t3b = writerDelta(afterT1, b, appendToMain(s3b, null, "B/metadata/snap-3.avro", 180_000L),
+    byte[] t3b = writerDelta(afterT1, b, appendToMain(s3b, null, "B/metadata/snap-3.avro", 0L),
         PINNED_TS + 180_000L);
     log.append(afterT1, txn(64),
         mut -> mut.updateTableInlineDelta(a, t3a).updateTableInlineDelta(b, t3b),
@@ -585,11 +585,12 @@ public class FormatExplorerFixtures {
     byte[] first =
         InlineDeltaCodec.encodeDelta(
             List.of(
-                append(s1, null, "", 60_000L),
+                append(s1, null, "", 0L),
                 main(s1),
                 new InlineDeltaCodec.AddManifestUpdate(s1, m1, "", 0),
                 new InlineDeltaCodec.AddManifestUpdate(s1, m2, "", 1)),
-            PINNED_TS + 60_000L);
+            PINNED_TS + 60_000L,
+            meta);
     Replica<CatalogState> afterFirst =
         Log.of(warehouse(90))
             .append(txn(91),
@@ -600,11 +601,12 @@ public class FormatExplorerFixtures {
     byte[] second =
         InlineDeltaCodec.encodeDelta(
             List.of(
-                append(s2, s1, "", 120_000L),
+                append(s2, s1, "", 0L),
                 main(s2),
                 new InlineDeltaCodec.RemoveManifestUpdate(s2, m1.path()),
                 new InlineDeltaCodec.AddManifestUpdate(s2, m3, "", 0)),
-            PINNED_TS + 120_000L);
+            PINNED_TS + 120_000L,
+            inlineMetadata(afterFirst.state(), clicks));
     Log log = Log.cas(afterFirst, txn(93), mut -> mut.updateTableInlineDelta(clicks, second),
         "A CAS write. The checkpoint's InlineTable holds the pool [m1, m2] and S1's indices "
             + "[0, 1]. The record's delta adds S2 on S1 with an empty manifest_list_suffix (its "
@@ -844,7 +846,7 @@ public class FormatExplorerFixtures {
     if (delta == null) {
       throw new AssertionError("computeDelta sends " + table + "'s commit in full mode");
     }
-    byte[] bytes = InlineDeltaCodec.encodeDelta(delta, after.lastUpdatedMillis());
+    byte[] bytes = InlineDeltaCodec.encodeDelta(delta, after.lastUpdatedMillis(), before);
     TableMetadata replayed =
         inlineMetadata(
             Log.of(snapshot).append(txn(9999), mut -> mut.updateTableInlineDelta(table, bytes),
@@ -858,7 +860,7 @@ public class FormatExplorerFixtures {
     return bytes;
   }
 
-  /** An append moving main to it, {@code timestampDeltaMs} after the base's last update. */
+  /** An append moving main to it, {@code timestampDeltaMs} after the commit's last update. */
   private static List<InlineDeltaCodec.DeltaUpdate> appendToMain(
       long snapshotId, Long parentId, String manifestList, long timestampDeltaMs) {
     return List.of(append(snapshotId, parentId, manifestList, timestampDeltaMs), main(snapshotId));

@@ -93,6 +93,13 @@ message Checkpoint {
   // SUPPORTED_READER_VERSION, now 1); a reader that supports less refuses it.
   int32 min_reader_version = 4;
 
+  // The catalog's conflict encoding (ConflictEncoding): how replay decides
+  // whether a table update conflicts with what landed since its writer read
+  // the table. Absent until a record sets one (SetConflictEncoding), and
+  // then replay judges by the Lamport clock, "lamport". A reader that does
+  // not know the encoding refuses the checkpoint.
+  string conflict_encoding = 5;
+
   // Catalog contents
   repeated Namespace namespaces = 10;
   repeated Table tables = 11;
@@ -117,6 +124,10 @@ message Table {
   int32 namespace_id = 3;
   string name = 4;
   string metadata_location = 5;
+  // The conflict encoding's state of the table, in the encoding's own
+  // layout; absent while it has none (a table it has not observed, or an
+  // encoding that keeps none).
+  bytes conflict_state = 6;
 }
 
 message NamespaceProperty {
@@ -150,6 +161,7 @@ message InlineTable {
   repeated ManifestFileEntry manifest_pool       = 7;  // unique manifests for this table
   repeated SnapshotManifestRefs snapshot_refs    = 8;  // per-snapshot index lists into pool
   InlineMetadataCodec metadata_codec             = 9;  // codec for `metadata`
+  bytes  conflict_state                          = 10; // as Table.conflict_state
 }
 
 // ============================================================
@@ -176,6 +188,7 @@ message Action {
     UpdateTableInline  update_table_inline  = 9;
     CreateTableInline  create_table_inline  = 10;
     RenameTable        rename_table         = 11;
+    SetConflictEncoding set_conflict_encoding = 12;
   }
 }
 
@@ -253,6 +266,15 @@ message RenameTable {
   string new_name              = 5;
 }
 
+// Sets the catalog's conflict encoding: the first record of a catalog
+// carries it (LogCatalog.initialize). It applies only to a catalog with no
+// encoding that has never had a table, so a record judged under one
+// encoding is never judged under another (S2). A reader that does not know
+// the encoding fails the read.
+message SetConflictEncoding {
+  string name = 1;
+}
+
 // ============================================================
 // Inline table metadata actions
 // ============================================================
@@ -288,6 +310,12 @@ message UpdateTableInline {
   // the inline-ML snapshots the commit adds, and of any inline snapshot the
   // table holds no list for (Bug 62), so they land with the metadata.
   TableMetadataDelta ml_delta = 7;
+  // True when the update applies only on the version it names, whatever
+  // the catalog's conflict encoding: a table a catalog transaction writes,
+  // which must be at the version the transaction first read (errata D12).
+  // Absent: a delta may apply on a later version if the encoding admits it
+  // there, finalized where it lands (SPEC_TM.md "Late-bound fields").
+  bool pinned = 8;
 }
 
 // ============================================================
@@ -297,8 +325,17 @@ message UpdateTableInline {
 message TableMetadataDelta {
   repeated TableMetadataUpdate updates = 1;
   // Required: the committed metadata's last-updated-ms, which replay sets
-  // (Iceberg no longer derives it from a snapshot's timestamp).
+  // (Iceberg no longer derives it from a snapshot's timestamp), no earlier
+  // than the last-updated-ms of a later version it lands on. A new
+  // snapshot's timestamp is relative to it.
   int64 last_updated_ms = 2;
+  // The base the writer computed the delta on: its last sequence number,
+  // and its next row id (v3). Replay moves the sequence numbers and row ids
+  // the delta's snapshots assigned by how far the table it lands on has
+  // moved past them (SPEC_TM.md "Late-bound fields"). Absent in a delta of
+  // manifest updates only (CreateTableInline.delta, UpdateTableInline.ml_delta).
+  int64 base_last_sequence_number = 3;
+  int64 base_next_row_id = 4;
 }
 
 message TableMetadataUpdate {
@@ -339,6 +376,7 @@ message AddSnapshot {
   fixed64        snapshot_id            = 1;
   string         manifest_list_suffix   = 2;
   CompactSummary summary                = 3;
+  // The snapshot's timestamp less the delta's last_updated_ms.
   sint64         timestamp_delta_ms     = 4;
   // Present, 0 included, unless it is the base's current schema, which replay
   // uses when it is absent.

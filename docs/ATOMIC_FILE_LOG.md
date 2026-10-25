@@ -155,10 +155,11 @@ version. Writers configured with different thresholds disagree on when to
 compact, but cannot corrupt the catalog: every write is conditional (P4).
 
 **Creating the object.** `FileIOCatalog.initialize` calls
-`CatalogLog.bootstrap()`, which commits an intention with no actions to a log
-that does not exist: a replace conditioned on the object's absence, writing
-the checkpoint of the empty catalog, a GC record, and the empty intention's
-record, whose id joins the committed set like any other. Writers may
+`CatalogLog.bootstrap`, which commits an intention setting the catalog's
+conflict encoding (SPEC.md §"Conflict Encodings") to a log that does not
+exist: a replace conditioned on the object's absence, writing the
+checkpoint of the empty catalog, a GC record, and the bootstrap record,
+whose id joins the committed set like any other. Writers may
 bootstrap at once: one creates the object, and the others find it created.
 
 ## Schema evolution

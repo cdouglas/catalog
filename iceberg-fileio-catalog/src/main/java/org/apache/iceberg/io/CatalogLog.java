@@ -76,10 +76,15 @@ public final class CatalogLog {
     return runtime.empty();
   }
 
-  /** Creates the catalog's log, holding no namespaces or tables, unless it exists. */
-  public void bootstrap() {
+  /**
+   * Creates the catalog's log, holding no namespaces or tables and judging table updates by
+   * {@code conflictEncoding} ({@link ConflictEncoding}), unless it exists.
+   */
+  public void bootstrap(String conflictEncoding) {
     try {
-      runtime.bootstrap(new ProtoCodec.CatalogIntention(List.of()));
+      runtime.bootstrap(
+          new ProtoCodec.CatalogIntention(
+              List.of(new ProtoCodec.SetConflictEncodingAction(conflictEncoding))));
     } catch (CommitRejectedException e) {
       throw new CommitFailedException(e, "Cannot create the catalog at %s: %s", log, e.getMessage());
     } catch (CommitOutcomeUnknownException e) {
