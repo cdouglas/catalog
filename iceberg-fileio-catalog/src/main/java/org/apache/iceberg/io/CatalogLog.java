@@ -20,6 +20,7 @@ package org.apache.iceberg.io;
 
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.LongAdder;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.CommitStateUnknownException;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -44,6 +45,7 @@ public final class CatalogLog {
   // never sees the catalog go back past a commit or a read of its own: Iceberg refreshes a table
   // from the catalog right after committing to it (Bug 72).
   private final AtomicReference<Replica<CatalogState>> newest = new AtomicReference<>();
+  private final CommitCounts counts = new CommitCounts();
 
   public CatalogLog(SharedLog log, RuntimeConfig config) {
     this.log = log;
@@ -98,19 +100,64 @@ public final class CatalogLog {
   public Replica<CatalogState> commit(CatalogMutation mutation) {
     Preconditions.checkNotNull(mutation.base(), "Cannot commit a transaction staged on no read");
     try {
-      return seen(runtime.commit(mutation.base(), mutation.intention()));
+      Replica<CatalogState> landed = seen(runtime.commit(mutation.base(), mutation.intention()));
+      counts.committed.increment();
+      return landed;
     } catch (CommitRejectedException e) {
       switch (e.reason()) {
         case CONFLICT:
+          counts.conflicts.increment();
           Replica<CatalogState> lostTo = e.state();
           throw mutation.explain(lostTo.state(), e.getMessage() + " at " + log);
         case CREATE_LOST:
+          counts.rejected.increment();
           throw new CommitFailedException(e, "Catalog creation failed: %s exists", log);
         default:
+          counts.rejected.increment();
           throw new CommitFailedException(e, "%s", e.getMessage());
       }
     } catch (CommitOutcomeUnknownException e) {
+      counts.unknown.increment();
       throw new CommitStateUnknownException(e.getCause());
+    }
+  }
+
+  /** How this catalog's commits ended, since it opened its log. */
+  public CommitCounts counts() {
+    return counts;
+  }
+
+  /**
+   * Counts of a catalog's commits by outcome: each commit of a transaction ends committed, in
+   * conflict (its record did not apply where it landed, and Iceberg may retry the operation on a
+   * fresh read), rejected otherwise, or unknown.
+   */
+  public static final class CommitCounts {
+    private final LongAdder committed = new LongAdder();
+    private final LongAdder conflicts = new LongAdder();
+    private final LongAdder rejected = new LongAdder();
+    private final LongAdder unknown = new LongAdder();
+
+    public long committed() {
+      return committed.sum();
+    }
+
+    public long conflicts() {
+      return conflicts.sum();
+    }
+
+    public long rejected() {
+      return rejected.sum();
+    }
+
+    public long unknown() {
+      return unknown.sum();
+    }
+
+    @Override
+    public String toString() {
+      return String.format("committed=%d conflicts=%d rejected=%d unknown=%d",
+          committed(), conflicts(), rejected(), unknown());
     }
   }
 

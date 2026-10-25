@@ -51,8 +51,13 @@ import org.apache.iceberg.types.Types;
  * equality and position deletes (deletion vectors in v3), schema, partition-spec and sort-order
  * evolution, properties (some too big to keep inline), branches and tags, rollbacks, cherry-picks,
  * snapshot expiry, location changes, upgrades to v3 and replace transactions, alone or several in
- * a table transaction. A {@link Runner} runs them on a table of a catalog; two runners given one
- * schedule make the same calls with the same file names and values.
+ * a table transaction. Some validate against concurrent commits as engines configure them: an
+ * overwrite of a partition and a merge-on-read row delta as Spark's copy-on-write and
+ * merge-on-read writes do, an insert-only row delta that validates the data added under its
+ * filter, a compaction that keeps its starting sequence number, a validated dynamic overwrite, and
+ * an append with an exactly-once sink's ancestry check. New files go to one of four partitions,
+ * with bounds for {@code cat}. A {@link Runner} runs them on a table of a catalog; two runners
+ * given one schedule make the same calls with the same file names and values.
  */
 final class TableScript {
   static final TableIdentifier ID = TableIdentifier.of("ns", "t");
@@ -76,6 +81,14 @@ final class TableScript {
         .ofMinSize(1)
         .ofMaxSize(30)
         .withSizeDistribution(RandomDistribution.uniform());
+  }
+
+  /** Single commands of the kinds {@code kinds} admits. */
+  static Arbitrary<Cmd> commands(java.util.function.Predicate<Kind> kinds) {
+    Arbitrary<Integer> small = Arbitraries.integers().between(0, 11);
+    return Combinators.combine(Arbitraries.of(Kind.values()).filter(kinds::test), small, small,
+            small)
+        .as(Cmd::new);
   }
 
   enum Kind {
@@ -119,6 +132,32 @@ final class TableScript {
     STATISTICS,
     /** Sets a snapshot's partition statistics file, or removes one when {@code c} is odd. */
     PARTITION_STATISTICS,
+    /**
+     * Overwrites partition {@code c % 4} (rows with that {@code cat}) with a new file, validating
+     * from the current snapshot as Spark's copy-on-write overwrite does: no conflicting deletes,
+     * and under serializable isolation ({@code b} even) no conflicting data.
+     */
+    OVERWRITE_PARTITION,
+    /**
+     * A merge-on-read update of a live data file: a position delete (a deletion vector in v3) for
+     * it and a new file in its partition, validated as Spark's merge-on-read write does: the file
+     * still exists and isn't deleted, no conflicting delete files, and under serializable isolation
+     * ({@code c} even) no conflicting data under the file's partition.
+     */
+    MERGE_ROW_DELTA,
+    /**
+     * An insert-only row delta into partition {@code c % 4} that validates no data was added under
+     * its filter since the current snapshot: a serializable MERGE whose matches were all inserts.
+     * Its snapshot's operation is append.
+     */
+    INSERT_ROW_DELTA,
+    /** Deletes the rows of partition {@code c % 4} by a row filter, which a retry re-evaluates. */
+    DELETE_PARTITION,
+    /**
+     * Appends a file as checkpoint {@code b % 3} of an exactly-once sink, which validates that no
+     * ancestor committed that checkpoint.
+     */
+    CHECKPOINT_APPEND,
     REPLACE,
     /** Runs the next {@code a % 3 + 2} commands in one table transaction. */
     TRANSACTION,
@@ -185,6 +224,8 @@ final class TableScript {
     final StringBuilder trace;
     Table table;
     private Table stale;
+    /** Where the files this runner adds go: the start of their paths. */
+    private final String names;
     private int nextFile = 0;
     private int nextValue = 0;
 
@@ -201,6 +242,7 @@ final class TableScript {
       this.catalog = catalog;
       this.other = other;
       this.trace = trace;
+      this.names = "mem:///data/";
       PartitionSpec spec =
           partitioned
               ? PartitionSpec.builderFor(SCHEMA).identity("cat").build()
@@ -217,6 +259,19 @@ final class TableScript {
           .withProperty(TableProperties.FORMAT_VERSION, String.valueOf(formatVersion))
           .create();
       this.stale = other.loadTable(ID);
+    }
+
+    /**
+     * Runs commands on the tables another runner created, through {@code catalog}, with the files it
+     * adds under {@code mem:///data/<names>/}, apart from that runner's.
+     */
+    Runner(Catalog catalog, String names, StringBuilder trace) {
+      this.catalog = catalog;
+      this.other = catalog;
+      this.trace = trace;
+      this.names = "mem:///data/" + names + "/";
+      this.table = catalog.loadTable(ID);
+      this.stale = table;
     }
 
     /** Runs {@code step}; returns the exception that rejected it, or null if it committed. */
@@ -301,16 +356,17 @@ final class TableScript {
       target.snapshots().forEach(snapshots::add);
       switch (cmd.kind) {
         case FAST_APPEND:
-          target.newFastAppend().appendFile(newFile(target)).commit();
+          target.newFastAppend().appendFile(newFile(target, cmd.c)).commit();
           break;
         case MERGE_APPEND:
-          target.newAppend().appendFile(newFile(target)).commit();
+          target.newAppend().appendFile(newFile(target, cmd.c)).commit();
           break;
         case STAGED_APPEND:
-          target.newFastAppend().appendFile(newFile(target)).stageOnly().commit();
+          target.newFastAppend().appendFile(newFile(target, cmd.c)).stageOnly().commit();
           break;
         case BRANCH_APPEND:
-          target.newFastAppend().appendFile(newFile(target)).toBranch(ref(cmd.b)).commit();
+          target.newFastAppend().appendFile(newFile(target, cmd.c)).toBranch(ref(cmd.b))
+              .commit();
           break;
         case DELETE_FILE:
           target.newDelete().deleteFromRowFilter(Expressions.alwaysTrue()).commit();
@@ -319,10 +375,10 @@ final class TableScript {
           target.newRowDelta().addDeletes(
                   org.apache.iceberg.FileMetadata.deleteFileBuilder(target.spec())
                       .ofEqualityDeletes(1)
-                      .withPath("mem:///data/eq" + nextFile++ + ".parquet")
+                      .withPath(names + "eq" + nextFile++ + ".parquet")
                       .withFileSizeInBytes(10)
                       .withRecordCount(1)
-                      .withPartitionPath(partitionPath(target.spec()))
+                      .withPartitionPath(partitionPath(target.spec(), cmd.c))
                       .build())
               .commit();
           break;
@@ -332,24 +388,111 @@ final class TableScript {
             throw new IllegalStateException("no live data file");
           }
           DataFile compacted = rewritten.get(cmd.b % rewritten.size());
-          target.newRewrite()
+          org.apache.iceberg.RewriteFiles rewrite =
+              target.newRewrite().validateFromSnapshot(target.currentSnapshot().snapshotId());
+          if (cmd.c % 2 == 1) {
+            // a compaction that keeps its starting sequence number, as Spark's does by default
+            rewrite.dataSequenceNumber(target.currentSnapshot().sequenceNumber());
+          }
+          rewrite
               .deleteFile(compacted)
               .addFile(DataFiles.builder(target.specs().get(compacted.specId()))
-                  .withPath("mem:///data/r" + nextFile++ + ".parquet")
+                  .withPath(names + "r" + nextFile++ + ".parquet")
                   .withFileSizeInBytes(10)
                   .withRecordCount(compacted.recordCount())
                   .withPartition(compacted.partition())
+                  .withMetrics(catMetrics(compacted.recordCount(), cat(compacted)))
                   .build())
               .commit();
           break;
         case OVERWRITE:
           target.newOverwrite()
               .overwriteByRowFilter(Expressions.alwaysTrue())
-              .addFile(newFile(target))
+              .addFile(newFile(target, cmd.c))
               .commit();
           break;
         case REPLACE_PARTITIONS:
-          target.newReplacePartitions().addFile(newFile(target)).commit();
+          org.apache.iceberg.ReplacePartitions replace =
+              target.newReplacePartitions().addFile(newFile(target, cmd.c));
+          if (cmd.b % 2 == 1 && target.currentSnapshot() != null) {
+            replace.validateFromSnapshot(target.currentSnapshot().snapshotId())
+                .validateNoConflictingData()
+                .validateNoConflictingDeletes();
+          }
+          replace.commit();
+          break;
+        case OVERWRITE_PARTITION:
+          org.apache.iceberg.expressions.Expression partition = inPartition(cmd.c);
+          org.apache.iceberg.OverwriteFiles overwrite =
+              target.newOverwrite().overwriteByRowFilter(partition).addFile(newFile(target, cmd.c));
+          if (target.currentSnapshot() != null) {
+            overwrite.validateFromSnapshot(target.currentSnapshot().snapshotId());
+          }
+          overwrite.conflictDetectionFilter(partition).validateNoConflictingDeletes();
+          if (cmd.b % 2 == 0) {
+            overwrite.validateNoConflictingData();
+          }
+          overwrite.commit();
+          break;
+        case MERGE_ROW_DELTA:
+          org.apache.iceberg.FileScanTask updatedTask = pickLive(target, cmd.b);
+          DataFile updated = updatedTask.file();
+          org.apache.iceberg.expressions.Expression updatedPartition =
+              Expressions.equal("cat", cat(updated));
+          org.apache.iceberg.RowDelta merge = target.newRowDelta();
+          // a writer merges the file's deletion vector into the new one, which replaces it
+          for (org.apache.iceberg.DeleteFile previous : updatedTask.deletes()) {
+            if (previous.format() == org.apache.iceberg.FileFormat.PUFFIN) {
+              merge.removeDeletes(previous);
+            }
+          }
+          merge
+              .addDeletes(positionDelete(target, updated))
+              .addRows(newFile(target, cat(updated) - 1))
+              .validateFromSnapshot(target.currentSnapshot().snapshotId())
+              .conflictDetectionFilter(updatedPartition)
+              .validateDataFilesExist(List.of(updated.location()))
+              .validateDeletedFiles()
+              .validateNoConflictingDeleteFiles();
+          if (cmd.c % 2 == 0) {
+            merge.validateNoConflictingDataFiles();
+          }
+          merge.commit();
+          break;
+        case INSERT_ROW_DELTA:
+          org.apache.iceberg.RowDelta insert =
+              target.newRowDelta().addRows(newFile(target, cmd.c));
+          if (target.currentSnapshot() != null) {
+            insert.validateFromSnapshot(target.currentSnapshot().snapshotId());
+          }
+          insert.conflictDetectionFilter(inPartition(cmd.c)).validateNoConflictingDataFiles()
+              .commit();
+          break;
+        case DELETE_PARTITION:
+          target.newDelete().deleteFromRowFilter(inPartition(cmd.c)).commit();
+          break;
+        case CHECKPOINT_APPEND:
+          String checkpoint = "cp" + cmd.b % 3;
+          target.newFastAppend()
+              .appendFile(newFile(target, cmd.c))
+              .set("checkpoint", checkpoint)
+              .validateWith(new org.apache.iceberg.SnapshotAncestryValidator() {
+                @Override
+                public boolean validate(Iterable<Snapshot> ancestors) {
+                  for (Snapshot ancestor : ancestors) {
+                    if (checkpoint.equals(ancestor.summary().get("checkpoint"))) {
+                      return false;
+                    }
+                  }
+                  return true;
+                }
+
+                @Override
+                public String errorMessage() {
+                  return "checkpoint " + checkpoint + " is already committed";
+                }
+              })
+              .commit();
           break;
         case POSITION_DELETE:
           List<DataFile> live = new ArrayList<>();
@@ -364,22 +507,7 @@ final class TableScript {
           }
           live.sort(java.util.Comparator.comparing(DataFile::location));
           DataFile data = live.get(cmd.b % live.size());
-          org.apache.iceberg.FileMetadata.Builder delete =
-              org.apache.iceberg.FileMetadata.deleteFileBuilder(target.specs().get(data.specId()))
-                  .ofPositionDeletes()
-                  .withFileSizeInBytes(10)
-                  .withRecordCount(1)
-                  .withPartition(data.partition());
-          if (((HasTableOperations) target).operations().current().formatVersion() >= 3) {
-            delete.withFormat(org.apache.iceberg.FileFormat.PUFFIN)
-                .withPath("mem:///data/dv" + nextFile++ + ".puffin")
-                .withReferencedDataFile(data.location())
-                .withContentOffset(4)
-                .withContentSizeInBytes(6);
-          } else {
-            delete.withPath("mem:///data/pos" + nextFile++ + ".parquet");
-          }
-          target.newRowDelta().addDeletes(delete.build()).commit();
+          target.newRowDelta().addDeletes(positionDelete(target, data)).commit();
           break;
         case ADD_COLUMN:
           target.updateSchema().addColumn("c" + nextValue++, Types.IntegerType.get()).commit();
@@ -536,7 +664,7 @@ final class TableScript {
           } else {
             target.updateStatistics()
                 .setStatistics(new org.apache.iceberg.GenericStatisticsFile(
-                    measured.snapshotId(), "mem:///stats/s" + nextFile++ + ".puffin", 100, 10,
+                    measured.snapshotId(), names + "stats-s" + nextFile++ + ".puffin", 100, 10,
                     List.of(new org.apache.iceberg.GenericBlobMetadata(
                         "apache-datasketches-theta-v1", measured.snapshotId(),
                         measured.sequenceNumber(), List.of(1), Map.of("ndv", "3")))))
@@ -553,7 +681,7 @@ final class TableScript {
                 .setPartitionStatistics(
                     org.apache.iceberg.ImmutableGenericPartitionStatisticsFile.builder()
                         .snapshotId(partitioned.snapshotId())
-                        .path("mem:///stats/p" + nextFile++ + ".parquet")
+                        .path(names + "stats-p" + nextFile++ + ".parquet")
                         .fileSizeInBytes(42)
                         .build())
                 .commit();
@@ -586,7 +714,7 @@ final class TableScript {
                   : SortOrder.builderFor(schema).asc("id").build());
       Transaction replace = builder.replaceTransaction();
       if (cmd.b % 2 == 1) {
-        replace.newFastAppend().appendFile(newFile(replace.table())).commit();
+        replace.newFastAppend().appendFile(newFile(replace.table(), cmd.c)).commit();
       }
       replace.commitTransaction();
     }
@@ -628,35 +756,104 @@ final class TableScript {
       return snapshots.get(index % snapshots.size());
     }
 
-    /** A one-row file in the table's current spec, in partition 1 / bucket 0 / truncation 0. */
-    private DataFile newFile(Table target) {
+    /**
+     * A one-row file in the table's current spec, in partition {@code index % 4}: its {@code cat} is
+     * {@code index % 4 + 1}, with bounds that say so, and each partition field has the value of
+     * that row ({@link #partitionPath}).
+     */
+    private DataFile newFile(Table target, int index) {
+      int k = Math.floorMod(index, 4);
       return DataFiles.builder(target.spec())
-          .withPath("mem:///data/f" + nextFile++ + ".parquet")
+          .withPath(names + "f" + nextFile++ + ".parquet")
           .withFileSizeInBytes(10)
           .withRecordCount(1)
-          .withPartitionPath(partitionPath(target.spec()))
+          .withPartitionPath(partitionPath(target.spec(), k))
+          .withMetrics(catMetrics(1, k + 1))
           .build();
     }
 
-    /** The partition of {@link #newFile}'s files, one value for each transform. */
-    private static String partitionPath(PartitionSpec spec) {
+    /** Metrics of a file of {@code records} rows whose {@code cat} is {@code cat}. */
+    private static org.apache.iceberg.Metrics catMetrics(long records, int cat) {
+      java.nio.ByteBuffer bound = org.apache.iceberg.types.Conversions.toByteBuffer(
+          Types.IntegerType.get(), cat);
+      return new org.apache.iceberg.Metrics(
+          records, null, Map.of(3, records), Map.of(3, 0L), null, Map.of(3, bound),
+          Map.of(3, bound));
+    }
+
+    /** The {@code cat} of a file {@link #newFile} wrote: its lower bound, else 1. */
+    private static int cat(DataFile file) {
+      java.nio.ByteBuffer bound = file.lowerBounds() == null ? null : file.lowerBounds().get(3);
+      return bound == null ? 1
+          : org.apache.iceberg.types.Conversions.<Integer>fromByteBuffer(
+              Types.IntegerType.get(), bound);
+    }
+
+    /** The rows of partition {@code index % 4}: those whose {@code cat} is {@code index % 4 + 1}. */
+    private static org.apache.iceberg.expressions.Expression inPartition(int index) {
+      return Expressions.equal("cat", Math.floorMod(index, 4) + 1);
+    }
+
+    /** The scan task of a live data file of the main branch, the {@code index}-th by path. */
+    private static org.apache.iceberg.FileScanTask pickLive(Table target, int index) {
+      List<org.apache.iceberg.FileScanTask> live = new ArrayList<>();
+      try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.FileScanTask> tasks =
+          target.newScan().planFiles()) {
+        tasks.forEach(live::add);
+      } catch (java.io.IOException e) {
+        throw new java.io.UncheckedIOException(e);
+      }
+      if (live.isEmpty()) {
+        throw new IllegalStateException("no live data file");
+      }
+      live.sort(java.util.Comparator.comparing(t -> t.file().location()));
+      return live.get(Math.floorMod(index, live.size()));
+    }
+
+    /** A position delete of one row of {@code data}: in v3, a deletion vector. */
+    private org.apache.iceberg.DeleteFile positionDelete(Table target, DataFile data) {
+      org.apache.iceberg.FileMetadata.Builder delete =
+          org.apache.iceberg.FileMetadata.deleteFileBuilder(target.specs().get(data.specId()))
+              .ofPositionDeletes()
+              .withFileSizeInBytes(10)
+              .withRecordCount(1)
+              .withPartition(data.partition());
+      if (((HasTableOperations) target).operations().current().formatVersion() >= 3) {
+        delete.withFormat(org.apache.iceberg.FileFormat.PUFFIN)
+            .withPath(names + "dv" + nextFile++ + ".puffin")
+            .withReferencedDataFile(data.location())
+            .withContentOffset(4)
+            .withContentSizeInBytes(6);
+      } else {
+        delete.withPath(names + "pos" + nextFile++ + ".parquet");
+      }
+      return delete.build();
+    }
+
+    /**
+     * The partition of a row whose {@code cat} is {@code k + 1}, as {@link #newFile} writes it: one
+     * value for each transform, the k-th of four.
+     */
+    private static String partitionPath(PartitionSpec spec, int k) {
       List<String> path = new ArrayList<>();
       for (PartitionField field : spec.fields()) {
         String transform = field.transform().toString();
         String value;
         if (transform.equals("identity")) {
-          value = "1";
+          value = String.valueOf(k + 1);
         } else if (transform.equals("void")) {
           value = "null";
         } else if (transform.equals("day")) {
-          value = "2026-10-16";
+          value = "2026-10-1" + (6 + k);
         } else if (transform.equals("hour")) {
-          value = "2026-10-16-03";
+          value = "2026-10-16-0" + (3 + k);
         } else if (transform.startsWith("truncate") && spec.schema().findType(field.sourceId())
             .typeId() == org.apache.iceberg.types.Type.TypeID.STRING) {
-          value = "abc";
+          value = "ab" + (char) ('c' + k);
+        } else if (transform.startsWith("truncate")) {
+          value = String.valueOf(10 * k);
         } else {
-          value = "0";
+          value = String.valueOf(k); // a bucket of four or more
         }
         path.add(field.name() + "=" + value);
       }

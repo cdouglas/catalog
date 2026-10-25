@@ -18,14 +18,9 @@
  */
 package org.apache.iceberg.io;
 
-import java.io.IOException;
-import java.io.UncheckedIOException;
-import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.TreeMap;
 import net.jqwik.api.Arbitraries;
 import net.jqwik.api.Arbitrary;
 import net.jqwik.api.ForAll;
@@ -33,18 +28,8 @@ import net.jqwik.api.Property;
 import net.jqwik.api.Provide;
 import net.jqwik.api.constraints.IntRange;
 import net.jqwik.api.statistics.Statistics;
-import org.apache.iceberg.ContentFile;
-import org.apache.iceberg.DeleteFile;
-import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.HasTableOperations;
-import org.apache.iceberg.ManifestFile;
-import org.apache.iceberg.PartitionSpecParser;
-import org.apache.iceberg.SchemaParser;
-import org.apache.iceberg.Snapshot;
-import org.apache.iceberg.SnapshotRef;
-import org.apache.iceberg.SortOrderParser;
 import org.apache.iceberg.Table;
-import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.catalog.Namespace;
 
 /**
@@ -172,12 +157,12 @@ class TestInlineDifferentialProperties {
         LocalCatalogMode.APPEND.catalog(pointerIo, WAREHOUSE, "c", Map.of());
     LogCatalog inlineReader =
         LocalCatalogMode.APPEND.catalog(inlineIo, WAREHOUSE, "c", Map.of());
-    Map<String, String> expected = view(pointerReader.loadTable(TableScript.ID), clockStepped);
+    Map<String, String> expected = TableViews.physical(pointerReader.loadTable(TableScript.ID), clockStepped);
     Table inlineTable = inlineReader.loadTable(TableScript.ID);
-    Map<String, String> actual = view(inlineTable, clockStepped);
-    view(pointerReader.loadTable(TableScript.OTHER), clockStepped)
+    Map<String, String> actual = TableViews.physical(inlineTable, clockStepped);
+    TableViews.physical(pointerReader.loadTable(TableScript.OTHER), clockStepped)
         .forEach((key, value) -> expected.put(TableScript.OTHER.name() + ": " + key, value));
-    view(inlineReader.loadTable(TableScript.OTHER), clockStepped)
+    TableViews.physical(inlineReader.loadTable(TableScript.OTHER), clockStepped)
         .forEach((key, value) -> actual.put(TableScript.OTHER.name() + ": " + key, value));
     List<String> differences = new ArrayList<>();
     java.util.Set<String> keys = new java.util.TreeSet<>(expected.keySet());
@@ -197,214 +182,5 @@ class TestInlineDifferentialProperties {
           + String.join("\n  ", differences.subList(0, Math.min(4, differences.size())))
           + "\ntrace:\n" + trace);
     }
-  }
-
-  /** What a reader sees of {@code table}, by item, with snapshots by position. */
-  private static Map<String, String> view(Table table, boolean clockStepped) {
-    TableMetadata metadata = ((HasTableOperations) table).operations().current();
-    Map<String, String> items = new TreeMap<>();
-    List<Snapshot> snapshots = metadata.snapshots();
-    Map<Long, Integer> position = new HashMap<>();
-    for (int i = 0; i < snapshots.size(); i++) {
-      position.put(snapshots.get(i).snapshotId(), i);
-    }
-    items.put("format", metadata.formatVersion() + " last-seq=" + metadata.lastSequenceNumber()
-        + " next-row-id=" + metadata.nextRowId() + " location=" + metadata.location());
-    items.put("schemas", metadata.currentSchemaId() + " " + metadata.schemas().stream()
-        .map(SchemaParser::toJson).collect(java.util.stream.Collectors.toList()));
-    items.put("specs", metadata.defaultSpecId() + " " + metadata.specs().stream()
-        .map(PartitionSpecParser::toJson).collect(java.util.stream.Collectors.toList()));
-    items.put("sort orders", metadata.defaultSortOrderId() + " " + metadata.sortOrders().stream()
-        .map(SortOrderParser::toJson).collect(java.util.stream.Collectors.toList()));
-    items.put("properties", new TreeMap<>(metadata.properties()).toString());
-    items.put("statistics", metadata.statisticsFiles().stream()
-        .map(f -> String.format("#%s %s %d/%d %s", position.get(f.snapshotId()), f.path(),
-            f.fileSizeInBytes(), f.fileFooterSizeInBytes(), f.blobMetadata().stream()
-                .map(b -> String.format("%s #%s seq=%d %s %s", b.type(),
-                    position.get(b.sourceSnapshotId()), b.sourceSnapshotSequenceNumber(),
-                    b.fields(), b.properties()))
-                .collect(java.util.stream.Collectors.toList())))
-        .sorted()
-        .collect(java.util.stream.Collectors.toList()).toString());
-    items.put("partition statistics", metadata.partitionStatisticsFiles().stream()
-        .map(f -> String.format("#%s %s %d", position.get(f.snapshotId()), f.path(),
-            f.fileSizeInBytes()))
-        .sorted()
-        .collect(java.util.stream.Collectors.toList()).toString());
-    for (int i = 0; i < snapshots.size(); i++) {
-      Snapshot s = snapshots.get(i);
-      Map<String, String> summary = new TreeMap<>(s.summary());
-      if (summary.containsKey("source-snapshot-id")) {
-        summary.put("source-snapshot-id",
-            "#" + position.get(Long.parseLong(summary.get("source-snapshot-id"))));
-      }
-      items.put(String.format("snapshot %02d", i), String.format(
-          "seq=%d parent=%s op=%s schema=%s first-row-id=%s added-rows=%s summary=%s",
-          s.sequenceNumber(), s.parentId() == null ? null : "#" + position.get(s.parentId()),
-          s.operation(), s.schemaId(), s.firstRowId(), s.addedRows(), summary));
-      List<String> manifests = new ArrayList<>();
-      for (ManifestFile m : s.allManifests(table.io())) {
-        manifests.add(String.format(
-            "%s spec=%d seq=%d/%d by=%s files=%s/%s/%s rows=%s/%s/%s first-row-id=%s parts=%s",
-            m.content(), m.partitionSpecId(), m.sequenceNumber(), m.minSequenceNumber(),
-            m.snapshotId() == null ? null : "#" + position.get(m.snapshotId()),
-            m.addedFilesCount(), m.existingFilesCount(), m.deletedFilesCount(),
-            m.addedRowsCount(), m.existingRowsCount(), m.deletedRowsCount(), m.firstRowId(),
-            partitions(m)));
-      }
-      items.put(String.format("snapshot %02d manifests", i), manifests.toString());
-      items.put(String.format("snapshot %02d changes", i), changes(table, s));
-    }
-    for (Map.Entry<String, SnapshotRef> r : metadata.refs().entrySet()) {
-      SnapshotRef ref = r.getValue();
-      items.put("ref " + r.getKey(), String.format("#%s %s %s/%s/%s",
-          position.get(ref.snapshotId()), ref.isBranch() ? "branch" : "tag",
-          ref.minSnapshotsToKeep(), ref.maxSnapshotAgeMs(), ref.maxRefAgeMs()));
-      items.put("ref " + r.getKey() + " files", files(table, r.getKey()));
-    }
-    items.put("snapshot log", metadata.snapshotLog().stream()
-        .map(e -> "#" + position.get(e.snapshotId()))
-        .collect(java.util.stream.Collectors.toList()).toString());
-    for (org.apache.iceberg.MetadataTableType type : org.apache.iceberg.MetadataTableType.values()) {
-      if (type != org.apache.iceberg.MetadataTableType.POSITION_DELETES) {
-        items.put("metadata table " + type,
-            metadataTable(table, type, position, clockStepped));
-      }
-    }
-    return items;
-  }
-
-  /**
-   * The rows of {@code table}'s metadata table {@code type}, sorted, with snapshot ids as
-   * positions and what differs between the two runs (times, file names, sizes) left out: with the
-   * clock-ordered columns, if the wall clock stepped.
-   */
-  private static String metadataTable(
-      Table table, org.apache.iceberg.MetadataTableType type, Map<Long, Integer> position,
-      boolean clockStepped) {
-    Table metadata = org.apache.iceberg.MetadataTableUtils.createMetadataTableInstance(table, type);
-    List<String> rows = new ArrayList<>();
-    try (org.apache.iceberg.io.CloseableIterable<FileScanTask> tasks =
-        metadata.newScan().planFiles()) {
-      for (FileScanTask task : tasks) {
-        try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.StructLike> data =
-            task.asDataTask().rows()) {
-          data.forEach(row -> rows.add(
-              describe(metadata.schema().asStruct(), row, position, clockStepped)));
-        }
-      }
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
-    } catch (RuntimeException e) {
-      return "fails: " + e;
-    }
-    rows.sort(String::compareTo);
-    return rows.toString();
-  }
-
-  private static String describe(
-      org.apache.iceberg.types.Types.StructType type, org.apache.iceberg.StructLike row,
-      Map<Long, Integer> position, boolean clockStepped) {
-    List<String> fields = new ArrayList<>();
-    for (int i = 0; i < type.fields().size(); i++) {
-      org.apache.iceberg.types.Types.NestedField field = type.fields().get(i);
-      String name = field.name();
-      Object value = row.get(i, Object.class);
-      String shown;
-      if (clockStepped && ClockSteps.CLOCK_ORDERED.contains(name)) {
-        shown = "*";
-      } else if (value != null && (name.endsWith("snapshot_id") || name.equals("parent_id"))) {
-        shown = "#" + position.get((Long) value);
-      } else if (name.contains("timestamp") || name.contains("committed_at")
-          || name.contains("made_current_at") || name.contains("path") || name.equals("file")
-          || name.contains("length") || name.equals("manifest_list")
-          || name.contains("last_updated") || name.equals("readable_metrics")
-          || name.equals("summary") || name.equals("file_size_in_bytes")) {
-        shown = "*";
-      } else if (value instanceof org.apache.iceberg.StructLike && field.type().isStructType()) {
-        shown = "{" + describe(field.type().asStructType(), (org.apache.iceberg.StructLike) value,
-            position, clockStepped) + "}";
-      } else if (value instanceof List && field.type().isListType()
-          && field.type().asListType().elementType().isStructType()) {
-        List<String> elements = new ArrayList<>();
-        for (Object element : (List<?>) value) {
-          elements.add("{" + describe(field.type().asListType().elementType().asStructType(),
-              (org.apache.iceberg.StructLike) element, position, clockStepped) + "}");
-        }
-        shown = elements.toString();
-      } else if (value instanceof ByteBuffer) {
-        shown = hex((ByteBuffer) value);
-      } else {
-        shown = String.valueOf(value);
-      }
-      fields.add(name + "=" + shown);
-    }
-    return String.join(" ", fields);
-  }
-
-  /** The data and delete files {@code s} added and removed, as incremental scans read them. */
-  private static String changes(Table table, Snapshot s) {
-    List<String> out = new ArrayList<>();
-    try {
-      s.addedDataFiles(table.io()).forEach(f -> out.add("+data " + f.location()));
-      s.removedDataFiles(table.io()).forEach(f -> out.add("-data " + f.location()));
-      s.addedDeleteFiles(table.io()).forEach(f -> out.add("+delete " + f.location()));
-      s.removedDeleteFiles(table.io()).forEach(f -> out.add("-delete " + f.location()));
-    } catch (RuntimeException e) {
-      return "fails: " + e;
-    }
-    out.sort(String::compareTo);
-    return out.toString();
-  }
-
-  private static String partitions(ManifestFile m) {
-    if (m.partitions() == null) {
-      return "null";
-    }
-    List<String> out = new ArrayList<>();
-    for (ManifestFile.PartitionFieldSummary p : m.partitions()) {
-      out.add(p.containsNull() + "/" + p.containsNaN() + "/" + hex(p.lowerBound()) + "/"
-          + hex(p.upperBound()));
-    }
-    return out.toString();
-  }
-
-  /** The live data files of {@code ref}, each with its delete files, sorted by path. */
-  private static String files(Table table, String ref) {
-    List<String> out = new ArrayList<>();
-    try (org.apache.iceberg.io.CloseableIterable<FileScanTask> tasks =
-        table.newScan().useRef(ref).planFiles()) {
-      for (FileScanTask task : tasks) {
-        List<String> deletes = new ArrayList<>();
-        for (DeleteFile d : task.deletes()) {
-          deletes.add(describe(d) + " ref=" + d.referencedDataFile());
-        }
-        deletes.sort(String::compareTo);
-        out.add(describe(task.file()) + " first-row-id=" + task.file().firstRowId()
-            + " deletes=" + deletes);
-      }
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
-    }
-    out.sort(String::compareTo);
-    return out.toString();
-  }
-
-  private static String describe(ContentFile<?> f) {
-    return String.format("%s %s spec=%d partition=%s seq=%s/%s records=%d",
-        f.location(), f.content(), f.specId(), f.partition(), f.dataSequenceNumber(),
-        f.fileSequenceNumber(), f.recordCount());
-  }
-
-  private static String hex(ByteBuffer buffer) {
-    if (buffer == null) {
-      return null;
-    }
-    StringBuilder out = new StringBuilder();
-    ByteBuffer copy = buffer.duplicate();
-    while (copy.hasRemaining()) {
-      out.append(String.format("%02x", copy.get()));
-    }
-    return out.toString();
   }
 }
