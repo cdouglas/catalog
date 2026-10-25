@@ -56,9 +56,9 @@ import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
  *   <li>otherwise both runs are Iceberg's retries, and must end alike.
  * </ul>
  *
- * <p>The statistics count, per encoding, the conflicts a retry repaired (false positives), those
- * a retry confirmed, and the admitted records. Under the Lamport clock the subject is a reference
- * too, and the property sets the baseline.
+ * <p>The subject draws its encoding. The statistics count, per encoding, the conflicts a retry
+ * repaired (false positives), those a retry confirmed, and the admitted records. Under the Lamport
+ * clock the subject is a reference too, which sets the baseline.
  *
  * <p>{@link #aMergedAppendIsWhatItsRetryWouldCommit} probes the merge ({@link Landing}) on its own:
  * its subject admits every delta that can be finalized where it lands ({@link
@@ -76,13 +76,14 @@ class TestRebaseProperties {
 
   @Property(tries = 300)
   void anAdmittedCommitIsWhatItsRetryWouldCommit(
+      @ForAll("encodings") String encoding,
       @ForAll @IntRange(min = 2, max = 3) int formatVersion,
       @ForAll boolean partitioned,
       @ForAll("modes") LocalCatalogMode mode,
       @ForAll("prefixes") List<TableScript.Cmd> prefix,
       @ForAll("windows") List<TableScript.Cmd> window,
       @ForAll("operations") TableScript.Cmd r) {
-    check(LamportEncoding.NAME, formatVersion, partitioned, mode, prefix, window, r);
+    check(encoding, formatVersion, partitioned, mode, prefix, window, r);
   }
 
   @Property(tries = 300)
@@ -160,6 +161,12 @@ class TestRebaseProperties {
     return Arbitraries.of(LocalCatalogMode.fileModes());
   }
 
+  /** The conflict encodings a catalog can be created with. */
+  @Provide
+  Arbitrary<String> encodings() {
+    return Arbitraries.of(LocalCatalogMode.ENCODINGS);
+  }
+
   /**
    * The modes whose tables' updates are inline deltas, which can merge, with their manifest lists
    * inline. A manifest list file hides the partition specs of its manifests, which a window may
@@ -190,7 +197,7 @@ class TestRebaseProperties {
 
   @Provide
   Arbitrary<List<TableScript.Cmd>> windows() {
-    return TableScript.commands(TestRebaseProperties::single).withoutEdgeCases()
+    return TableScript.windowCommands(TestRebaseProperties::single).withoutEdgeCases()
         .list().ofMinSize(1).ofMaxSize(3);
   }
 

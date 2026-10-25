@@ -34,6 +34,8 @@ final class ConflictEncodings {
 
   static {
     register(LamportEncoding.INSTANCE);
+    register(LamportMinusPropertiesEncoding.INSTANCE);
+    register(ConcernVectorEncoding.INSTANCE);
   }
 
   private ConflictEncodings() {}
@@ -82,7 +84,7 @@ final class ConflictEncodings {
     }
     ConflictEncoding<Object> encoding = builder.conflictEncoding();
     Object witness = encoding.witness(action, landing);
-    if (!encoding.admits(witness, landing, builder.conflictState(action.tableId()))) {
+    if (!encoding.admits(witness, landing, builder.conflictStateOrEmpty(action.tableId()))) {
       return false;
     }
     if (landing.version() != action.baseVersion()) {

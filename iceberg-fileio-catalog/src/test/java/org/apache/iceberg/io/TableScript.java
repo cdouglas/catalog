@@ -83,6 +83,24 @@ final class TableScript {
         .withSizeDistribution(RandomDistribution.uniform());
   }
 
+  /**
+   * The kinds of change conflict encodings tell apart from a table's other changes: property,
+   * statistics, sort-order and location changes, commits and refs on other branches, staged
+   * snapshots, and appends.
+   */
+  static final java.util.Set<Kind> SEPARABLE =
+      java.util.EnumSet.of(Kind.SET_PROPERTY, Kind.REMOVE_PROPERTY, Kind.STATISTICS,
+          Kind.PARTITION_STATISTICS, Kind.SORT_ORDER, Kind.SET_LOCATION, Kind.BRANCH_APPEND,
+          Kind.STAGED_APPEND, Kind.CREATE_BRANCH, Kind.CREATE_TAG, Kind.FAST_APPEND);
+
+  /**
+   * Single commands of the kinds {@code kinds} admits, half of them of the {@link #SEPARABLE}
+   * kinds: windows a commit races, which conflict encodings may let it land after.
+   */
+  static Arbitrary<Cmd> windowCommands(java.util.function.Predicate<Kind> kinds) {
+    return Arbitraries.oneOf(commands(kinds), commands(k -> kinds.test(k) && SEPARABLE.contains(k)));
+  }
+
   /** Single commands of the kinds {@code kinds} admits. */
   static Arbitrary<Cmd> commands(java.util.function.Predicate<Kind> kinds) {
     Arbitrary<Integer> small = Arbitraries.integers().between(0, 11);

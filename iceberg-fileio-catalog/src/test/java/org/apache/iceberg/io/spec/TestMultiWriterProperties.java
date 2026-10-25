@@ -71,10 +71,12 @@ import org.intentlog.RuntimeConfig;
  *
  * <ul>
  *   <li>Serial re-execution: an acknowledged transaction, staged again on a fresh read of {@code
- *       pre} and committed alone, must be accepted and reach the state {@code post}. Table updates
- *       and reads also require the table to be unchanged since the writer's snapshot (Iceberg's
- *       base-metadata check). The history is then the serial execution of the acknowledged
- *       transactions in log order.
+ *       pre} and committed alone, must be accepted and reach the state {@code post}. Updates of a
+ *       table's metadata location and reads also require the table to be unchanged since the
+ *       writer's snapshot (Iceberg's base-metadata check); a property or location delta of an
+ *       inline table, which the catalog's conflict encoding (drawn per run) may apply on a table
+ *       that changed since, is judged by its re-execution alone. The history is then the serial
+ *       execution of the acknowledged transactions in log order.
  *   <li>Effects: {@code post} is {@code pre} plus the transaction's own changes and nothing else.
  *       This catches bugs that the serial and concurrent paths share.
  *   <li>Rejection: a rejected transaction whose record landed leaves the state unchanged.
@@ -145,9 +147,10 @@ class TestMultiWriterProperties {
       @ForAll boolean strictVersions,
       @ForAll boolean gc,
       @ForAll("segmentLimits") int segmentLimit,
+      @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
     new Run(new MultiWriterStorage.File(strictVersions, segmentLimit), writers, maxAppendCount,
-        appendHeadroom, false, gc).execute(schedule);
+        appendHeadroom, false, gc, encoding).execute(schedule);
   }
 
   @Property(tries = 300)
@@ -158,9 +161,10 @@ class TestMultiWriterProperties {
       @ForAll boolean strictVersions,
       @ForAll boolean gc,
       @ForAll("segmentLimits") int segmentLimit,
+      @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
     new Run(new MultiWriterStorage.File(strictVersions, segmentLimit), writers, maxAppendCount,
-        appendHeadroom, true, gc).execute(schedule);
+        appendHeadroom, true, gc, encoding).execute(schedule);
   }
 
   @Property(tries = 300)
@@ -170,9 +174,10 @@ class TestMultiWriterProperties {
       @ForAll("appendHeadrooms") long appendHeadroom,
       @ForAll boolean conditional,
       @ForAll boolean gc,
+      @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
     new Run(new MultiWriterStorage.Memory(conditional), writers, maxAppendCount, appendHeadroom,
-        false, gc).execute(schedule);
+        false, gc, encoding).execute(schedule);
   }
 
   @Property(tries = 300)
@@ -182,9 +187,10 @@ class TestMultiWriterProperties {
       @ForAll("appendHeadrooms") long appendHeadroom,
       @ForAll boolean conditional,
       @ForAll boolean gc,
+      @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
     new Run(new MultiWriterStorage.Memory(conditional), writers, maxAppendCount, appendHeadroom,
-        true, gc).execute(schedule);
+        true, gc, encoding).execute(schedule);
   }
 
   /**
@@ -203,6 +209,12 @@ class TestMultiWriterProperties {
    */
   private static int preemptAt(int d) {
     return d < 6 ? -1 : (d - 6) % 4;
+  }
+
+  /** The catalog's conflict encoding: how replay judges a table update that raced another. */
+  @Provide
+  Arbitrary<String> encodings() {
+    return Arbitraries.of(CatalogTestSupport.ENCODINGS);
   }
 
   @Provide
@@ -235,7 +247,7 @@ class TestMultiWriterProperties {
     return Combinators.combine(
             steps,
             Arbitraries.integers().between(0, 3),
-            Arbitraries.of(OpKind.values()),
+            opKinds(),
             small,
             small,
             small,
@@ -245,6 +257,16 @@ class TestMultiWriterProperties {
         .ofMinSize(1)
         .ofMaxSize(60)
         .withSizeDistribution(RandomDistribution.uniform());
+  }
+
+  /** Each kind once, and an inline table's deltas, which encodings judge apart, three times. */
+  private static Arbitrary<OpKind> opKinds() {
+    List<Tuple.Tuple2<Integer, OpKind>> kinds = new ArrayList<>();
+    for (OpKind kind : OpKind.values()) {
+      boolean delta = kind == OpKind.SET_TABLE_PROPERTY || kind == OpKind.SET_TABLE_LOCATION;
+      kinds.add(Tuple.of(delta ? 3 : 1, kind));
+    }
+    return Arbitraries.frequency(kinds.toArray(new Tuple.Tuple2[0]));
   }
 
   // ============================================================
@@ -272,7 +294,11 @@ class TestMultiWriterProperties {
     DROP_TABLE,
     UPDATE_TABLE,
     RENAME_TABLE,
-    READ_TABLE
+    READ_TABLE,
+    /** Sets a property of an inline table, by a delta. */
+    SET_TABLE_PROPERTY,
+    /** Moves an inline table's location, by a delta. */
+    SET_TABLE_LOCATION
   }
 
   /**
@@ -332,6 +358,10 @@ class TestMultiWriterProperties {
     final String key;
     final String value; // property value, or table location for create / update
     final String base; // table location in the writer's snapshot, for update / read
+    // An inline table's metadata, for a create; the delta, for a property or location change
+    final byte[] payload;
+    // The table's version in the writer's snapshot, for a delta
+    int read = -1;
 
     private Op(
         OpKind kind,
@@ -340,7 +370,8 @@ class TestMultiWriterProperties {
         TableIdentifier to,
         String key,
         String value,
-        String base) {
+        String base,
+        byte[] payload) {
       this.kind = kind;
       this.namespace = namespace;
       this.table = table;
@@ -348,18 +379,38 @@ class TestMultiWriterProperties {
       this.key = key;
       this.value = value;
       this.base = base;
+      this.payload = payload;
     }
 
     static Op namespace(OpKind kind, Namespace ns, String key, String value) {
-      return new Op(kind, ns, null, null, key, value, null);
+      return new Op(kind, ns, null, null, key, value, null, null);
     }
 
     static Op table(OpKind kind, TableIdentifier table, String location, String base) {
-      return new Op(kind, null, table, null, null, location, base);
+      return new Op(kind, null, table, null, null, location, base, null);
+    }
+
+    /** A create of an inline table at {@code location}. */
+    static Op inlineTable(TableIdentifier table, String location) {
+      return new Op(OpKind.CREATE_TABLE, null, table, null, null, location, null,
+          CatalogTestSupport.newInlineTable(location));
+    }
+
+    /**
+     * A delta of an inline table: a property set to {@code value}, or the location moved to it. It
+     * names no base: a conflict encoding may apply it on a table changed since the writer read it,
+     * which its re-execution judges.
+     */
+    static Op delta(OpKind kind, TableIdentifier table, String key, String value) {
+      long now = System.currentTimeMillis();
+      byte[] delta = kind == OpKind.SET_TABLE_PROPERTY
+          ? CatalogTestSupport.propertyDelta(key, value, now)
+          : CatalogTestSupport.locationDelta(value, now);
+      return new Op(kind, null, table, null, key, value, null, delta);
     }
 
     static Op rename(TableIdentifier from, TableIdentifier to) {
-      return new Op(OpKind.RENAME_TABLE, null, from, to, null, null, null);
+      return new Op(OpKind.RENAME_TABLE, null, from, to, null, null, null, null);
     }
 
     void stage(CatalogMutation mut) {
@@ -381,10 +432,18 @@ class TestMultiWriterProperties {
           mut.updateProperties(namespace, Collections.singletonMap(key, null));
           break;
         case CREATE_TABLE:
-          mut.createTable(table, value);
+          if (payload != null) {
+            mut.createTableInline(table, payload, CatalogTestSupport.inlineTableCodec());
+          } else {
+            mut.createTable(table, value);
+          }
           break;
         case DROP_TABLE:
           mut.dropTable(table);
+          break;
+        case SET_TABLE_PROPERTY:
+        case SET_TABLE_LOCATION:
+          mut.updateTableInlineDelta(table, payload);
           break;
         case UPDATE_TABLE:
           mut.updateTable(table, value);
@@ -424,14 +483,34 @@ class TestMultiWriterProperties {
           view.namespaces.get(namespace).remove(key);
           break;
         case CREATE_TABLE:
+          if (payload != null) {
+            view.tables.put(table, View.INLINE + value);
+            view.tableProperties.put(table, new TreeMap<>());
+          } else {
+            view.tables.put(table, value);
+          }
+          break;
         case UPDATE_TABLE:
+          // a metadata file: the table leaves inline storage
           view.tables.put(table, value);
+          view.tableProperties.remove(table);
           break;
         case DROP_TABLE:
           view.tables.remove(table);
+          view.tableProperties.remove(table);
           break;
         case RENAME_TABLE:
           view.tables.put(to, view.tables.remove(table));
+          Map<String, String> moved = view.tableProperties.remove(table);
+          if (moved != null) {
+            view.tableProperties.put(to, moved);
+          }
+          break;
+        case SET_TABLE_PROPERTY:
+          view.tableProperties.get(table).put(key, value);
+          break;
+        case SET_TABLE_LOCATION:
+          view.tables.put(table, View.INLINE + value);
           break;
         case READ_TABLE:
           break;
@@ -459,6 +538,11 @@ class TestMultiWriterProperties {
           return String.format("removeProperty(%s, %s)", namespace, key);
         case RENAME_TABLE:
           return String.format("renameTable(%s, %s)", table, to);
+        case SET_TABLE_PROPERTY:
+          return String.format("setTableProperty(%s, %s=%s)", table, key, value);
+        case CREATE_TABLE:
+          return String.format("create_table(%s, %s%s)", table, payload != null ? "inline " : "",
+              value);
         default:
           return String.format(
               "%s(%s%s)", kind.name().toLowerCase(), table, value == null ? "" : ", " + value);
@@ -468,8 +552,13 @@ class TestMultiWriterProperties {
 
   /** The logical catalog state: namespaces with properties, and table locations. */
   static final class View {
+    /** An inline table's entry in {@link #tables}: this, then its location. */
+    static final String INLINE = "inline:";
     final Map<Namespace, Map<String, String>> namespaces = new TreeMap<>(NS_ORDER);
+    // a table's metadata location, or INLINE and its location
     final Map<TableIdentifier, String> tables = new TreeMap<>(TABLE_ORDER);
+    // an inline table's properties, of KEYS
+    final Map<TableIdentifier, Map<String, String>> tableProperties = new TreeMap<>(TABLE_ORDER);
 
     static View of(CatalogState state) {
       View view = new View();
@@ -477,7 +566,15 @@ class TestMultiWriterProperties {
         view.namespaces.put(ns, new TreeMap<>(state.namespaceProperties(ns)));
       }
       for (TableIdentifier t : state.tables()) {
-        view.tables.put(t, state.location(t));
+        org.apache.iceberg.TableMetadata inline = CatalogTestSupport.inlineMetadata(state, t);
+        if (inline != null) {
+          view.tables.put(t, INLINE + inline.location());
+          Map<String, String> props = new TreeMap<>(inline.properties());
+          props.keySet().retainAll(KEYS);
+          view.tableProperties.put(t, props);
+        } else {
+          view.tables.put(t, state.location(t));
+        }
       }
       return view;
     }
@@ -486,6 +583,7 @@ class TestMultiWriterProperties {
       View view = new View();
       namespaces.forEach((ns, props) -> view.namespaces.put(ns, new TreeMap<>(props)));
       view.tables.putAll(tables);
+      tableProperties.forEach((t, props) -> view.tableProperties.put(t, new TreeMap<>(props)));
       return view;
     }
 
@@ -509,17 +607,19 @@ class TestMultiWriterProperties {
     public boolean equals(Object o) {
       return o instanceof View
           && namespaces.equals(((View) o).namespaces)
-          && tables.equals(((View) o).tables);
+          && tables.equals(((View) o).tables)
+          && tableProperties.equals(((View) o).tableProperties);
     }
 
     @Override
     public int hashCode() {
-      return Objects.hash(namespaces, tables);
+      return Objects.hash(namespaces, tables, tableProperties);
     }
 
     @Override
     public String toString() {
-      return "namespaces=" + namespaces + " tables=" + tables;
+      return "namespaces=" + namespaces + " tables=" + tables
+          + (tableProperties.isEmpty() ? "" : " table properties=" + tableProperties);
     }
   }
 
@@ -630,16 +730,22 @@ class TestMultiWriterProperties {
      * compacts, and its outcome is never unknown for it.
      */
     Run(MultiWriterStorage storage, int writers, int maxAppendCount, long appendHeadroom,
-        boolean faults, boolean gc) {
+        boolean faults, boolean gc, String encoding) {
       this.storage = storage;
       this.faults = faults;
       this.gc = gc;
       Statistics.label("storage").collect(storage.describe());
+      Statistics.label("encoding").collect(encoding);
       CatalogLog seedLog = storage.log(LogCatalogProperties.runtimeConfig(Map.of()));
-      CatalogMutation seed = new CatalogMutation(seedLog.empty());
+      // The catalog's first record sets its conflict encoding, as a catalog's creation does.
+      seedLog.bootstrap(encoding);
+      CatalogMutation seed = new CatalogMutation(seedLog.read());
       seed.createNamespace(Namespace.of("a"));
       seed.createNamespace(Namespace.of("b"));
       seed.createTable(TableIdentifier.of("a", "t"), "mem:///a/t/seed");
+      seed.createTableInline(TableIdentifier.of("b", "t"),
+          CatalogTestSupport.newInlineTable("mem:///b/t/seed"),
+          CatalogTestSupport.inlineTableCodec());
       seed.commit(seedLog);
       int seedLength = storage.liveBytes().length;
       long maxAppendSize =
@@ -749,7 +855,11 @@ class TestMultiWriterProperties {
             break;
           case OP:
             if (w.snapshot != null) {
-              Op op = interpret(cmd, w.snapshot.state());
+              Op interpreted = interpret(cmd, w.snapshot.state());
+              // a writer stages one update of a table per transaction
+              Op op = interpreted != null && changes(interpreted) && w.ops.stream()
+                  .anyMatch(o -> changes(o) && o.table.equals(interpreted.table))
+                  ? null : interpreted;
               if (op != null && stages(w.snapshot.state(), append(w.ops, op))) {
                 w.ops.add(op);
                 trace.append(String.format("w%d   %s%n", w.id, op));
@@ -856,6 +966,12 @@ class TestMultiWriterProperties {
       }
     }
 
+    /** Whether {@code op} updates a table: a metadata file, or a delta. */
+    private static boolean changes(Op op) {
+      return op.kind == OpKind.UPDATE_TABLE || op.kind == OpKind.SET_TABLE_PROPERTY
+          || op.kind == OpKind.SET_TABLE_LOCATION;
+    }
+
     /** Concrete operands for {@code cmd} from the writer's snapshot, or null if none fit. */
     private Op interpret(Cmd cmd, CatalogState snap) {
       List<Namespace> namespaces = new ArrayList<>(snap.namespaces());
@@ -881,7 +997,20 @@ class TestMultiWriterProperties {
         case CREATE_TABLE:
           TableIdentifier fresh =
               TableIdentifier.of(pick(namespaces, NAMESPACES, cmd.a), TABLE_NAMES.get(cmd.b % 2));
-          return Op.table(cmd.op, fresh, "mem:///" + fresh + "/" + value, null);
+          return cmd.b / 2 % 2 == 1
+              ? Op.inlineTable(fresh, "mem:///" + fresh + "/" + value)
+              : Op.table(cmd.op, fresh, "mem:///" + fresh + "/" + value, null);
+        case SET_TABLE_PROPERTY:
+        case SET_TABLE_LOCATION:
+          TableIdentifier inline = pick(tables, TABLES, cmd.a);
+          if (!snap.isInlineTable(inline)) {
+            return null; // a delta changes an inline table
+          }
+          Op delta = cmd.op == OpKind.SET_TABLE_PROPERTY
+              ? Op.delta(cmd.op, inline, KEYS.get(cmd.b % 2), value)
+              : Op.delta(cmd.op, inline, null, "mem:///" + inline + "/" + value);
+          delta.read = snap.tableVersion(snap.tableId(inline));
+          return delta;
         case DROP_TABLE:
           return Op.table(cmd.op, pick(tables, TABLES, cmd.a), null, null);
         case UPDATE_TABLE:
@@ -1048,6 +1177,13 @@ class TestMultiWriterProperties {
       ops.forEach(op -> op.applyTo(expected));
       check(expected.equals(post), "effects differ:%n  expected: %s%n  actual:   %s",
           expected, post);
+      for (Op op : ops) {
+        if (op.read >= 0) {
+          Statistics.label("an acknowledged delta landed")
+              .collect(pre.tableVersion(pre.tableId(op.table)) == op.read
+                  ? "on the table it read" : "on a changed table");
+        }
+      }
     }
 
     /** Why {@code ops} cannot be re-executed serially on {@code state}, or null if they can. */

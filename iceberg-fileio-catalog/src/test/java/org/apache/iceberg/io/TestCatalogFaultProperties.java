@@ -189,9 +189,10 @@ class TestCatalogFaultProperties {
       @ForAll @IntRange(min = 0, max = 7) int gzipWriters,
       @ForAll @IntRange(min = 0, max = 7) int gcWriters,
       @ForAll("segmentLimits") int segmentLimit,
+      @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
     new Run(onLog(sharedLog, modes.subList(0, writers)), maxUpdateSize, false, strictVersions,
-        gzipWriters, gcWriters, segmentLimit)
+        gzipWriters, gcWriters, segmentLimit, encoding)
         .execute(schedule);
   }
 
@@ -205,9 +206,10 @@ class TestCatalogFaultProperties {
       @ForAll @IntRange(min = 0, max = 7) int gzipWriters,
       @ForAll @IntRange(min = 0, max = 7) int gcWriters,
       @ForAll("segmentLimits") int segmentLimit,
+      @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
     new Run(onLog(sharedLog, modes.subList(0, writers)), maxUpdateSize, true, strictVersions,
-        gzipWriters, gcWriters, segmentLimit)
+        gzipWriters, gcWriters, segmentLimit, encoding)
         .execute(schedule);
   }
 
@@ -217,6 +219,11 @@ class TestCatalogFaultProperties {
    */
   private static List<LocalCatalogMode> onLog(boolean sharedLog, List<LocalCatalogMode> modes) {
     return sharedLog ? modes.stream().map(LocalCatalogMode::onSharedLog).toList() : modes;
+  }
+
+  @Provide
+  Arbitrary<String> encodings() {
+    return Arbitraries.of(LocalCatalogMode.ENCODINGS);
   }
 
   /** Each writer's mode: one for all, a quarter of the time, else each its own. */
@@ -759,7 +766,7 @@ class TestCatalogFaultProperties {
      * catalog object holds at most that many writes, and an append past it fails (Bug 66).
      */
     Run(List<LocalCatalogMode> modes, int maxUpdateSize, boolean faults, boolean strictVersions,
-        int gzipWriters, int gcWriters, int segmentLimit) {
+        int gzipWriters, int gcWriters, int segmentLimit, String encoding) {
       this.maxUpdateSize = maxUpdateSize;
       this.faults = faults;
       this.gc = (gcWriters & ((1 << modes.size()) - 1)) != 0;
@@ -770,6 +777,9 @@ class TestCatalogFaultProperties {
       Statistics.label("segment limit").collect(segmentLimit);
       Map<String, String> properties = new HashMap<>(PROPERTIES);
       properties.put(FileIOCatalog.INLINE_MAX_UPDATE_SIZE, String.valueOf(maxUpdateSize));
+      // The first writer creates the catalog, with the encoding its log keeps.
+      properties.put(LogCatalogProperties.CONFLICT_ENCODING, encoding);
+      Statistics.label("encoding").collect(encoding);
       this.writers = new Writer[modes.size()];
       for (int i = 0; i < modes.size(); i++) {
         Map<String, String> writerProperties = new HashMap<>(properties);

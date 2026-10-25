@@ -76,7 +76,10 @@ public final class LogCatalogProperties {
    * table update conflicts with what landed since its writer read the table ({@link
    * ConflictEncoding}). The catalog's first record sets it, and every reader judges by it; a
    * catalog that opens an existing log uses that log's, whatever this says. Default: {@code
-   * lamport}, an update applies only on the version of the table it read.
+   * lamport}, an update applies only on the version of the table it read. The others: {@code
+   * lamport-minus-properties}, which lets an update that does not touch properties apply on a
+   * table whose properties alone changed; {@code concern-vector}, which versions a table by its
+   * concerns and refs (docs/SPEC.md, "Conflict Encodings").
    */
   public static final String CONFLICT_ENCODING = "fileio.catalog.conflict.encoding";
   public static final String DEFAULT_CONFLICT_ENCODING = LamportEncoding.NAME;

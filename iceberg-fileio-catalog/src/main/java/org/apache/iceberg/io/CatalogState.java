@@ -821,6 +821,15 @@ public class CatalogState {
       return conflictStates.computeIfAbsent(tblId, id -> codec.empty());
     }
 
+    /**
+     * The encoding's state of table {@code tblId}, without keeping it: for a judgment, which does
+     * not change the state.
+     */
+    EncodingState conflictStateOrEmpty(int tblId) {
+      EncodingState state = conflictStates.get(tblId);
+      return state != null ? state : conflictEncoding().stateCodec().empty();
+    }
+
     /** Sets the encoding's state of table {@code tblId}, as a checkpoint holds it. */
     Builder setConflictState(int tblId, EncodingState state) {
       conflictStates.put(tblId, state);

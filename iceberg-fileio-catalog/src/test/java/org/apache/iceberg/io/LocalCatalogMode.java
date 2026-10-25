@@ -76,6 +76,11 @@ enum LocalCatalogMode {
     this.sharedLog = sharedLog;
   }
 
+  /** The conflict encodings a catalog can be created with, which fuzzers draw from. */
+  static final List<String> ENCODINGS =
+      List.of(
+          LamportEncoding.NAME, LamportMinusPropertiesEncoding.NAME, ConcernVectorEncoding.NAME);
+
   /** The modes whose catalog is one object of the store. */
   static List<LocalCatalogMode> fileModes() {
     return Arrays.stream(values()).filter(m -> !m.sharedLog).toList();

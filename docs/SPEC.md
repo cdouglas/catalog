@@ -474,6 +474,27 @@ first.
   checks that a record it admits on a changed table is what Iceberg's retry
   of the operation commits there.
 
+The encodings:
+
+| Encoding | Witness | State (`conflict_state`) | Admits beyond Lamport |
+|---|---|---|---|
+| `lamport` | the version read | none | nothing |
+| `lamport-minus-properties` | the version read, and whether the record touches properties | the version at which properties last changed, and at which anything else did | a record that does not touch properties, on a table whose properties alone changed |
+| `concern-vector` | the concerns the record reads, and the branches it advances | the version at which each concern last changed (properties, schema, specs, sort orders, the table itself, statistics, snapshot removal), and for 16 buckets of ref names, the version at which a ref in it last advanced and was last reset | a commit racing property, statistics or sort-order changes, or commits and refs on other branches |
+
+Both concern encodings (`ConcernEncoding`) keep the Lamport witness for
+what Iceberg commits once, which `TableChange` derives from the delta: a
+schema or partition-spec update, or a ref change other than an advance (a
+ref moved to a snapshot the record does not add, or given new retention).
+Under `concern-vector` a data commit (one that adds snapshots) reads the
+table, schema, specs and removal, and each branch it advances (main, for a
+snapshot it stages); a property change reads properties, a location change
+the table, a sort-order change the sort orders and schema. An applied delta
+stamps the concerns its updates change; full metadata stamps what changed
+if only properties or statistics did, and every stamp otherwise; a metadata
+location or a rename stamps every one. A stamp is a table version, so it
+only grows (`ConcernStamps`).
+
 ## Commits
 
 A writer stages a transaction on a read (`CatalogMutation`, on the `Replica`

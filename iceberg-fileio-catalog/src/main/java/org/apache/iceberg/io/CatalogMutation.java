@@ -234,8 +234,7 @@ public class CatalogMutation {
   }
 
   public CatalogMutation readTable(TableIdentifier table) {
-    final String newloc = tables.get(table);
-    if (original.location(table) != null && tables.containsKey(table) && newloc == null) {
+    if (markedForDrop(table)) {
       // TODO eh... this should be legal.
       throw new IllegalArgumentException(
           "Cannot include read dependency on table marked for deletion: " + table);
@@ -249,10 +248,10 @@ public class CatalogMutation {
       throw new NoSuchNamespaceException("Table does not exist: %s", table);
     }
     checkNotRenamed(table);
-    final String newloc = tables.get(table);
-    if (original.location(table) != null && tables.containsKey(table) && newloc == null) {
+    if (markedForDrop(table)) {
       throw new IllegalArgumentException("Cannot update table marked for deletion: " + table);
     }
+    final String newloc = tables.get(table);
     if (newloc != null) {
       tables.put(table, location);
     } else {
@@ -349,6 +348,9 @@ public class CatalogMutation {
       throw new NoSuchTableException("Table does not exist: %s", table);
     }
     checkNotRenamed(table);
+    if (markedForDrop(table)) {
+      throw new IllegalArgumentException("Cannot update table marked for deletion: " + table);
+    }
     inlineTableUpdates.put(table, metadata);
     inlineTableUpdateCodecs.put(table, codecTag);
     return this;
@@ -373,6 +375,9 @@ public class CatalogMutation {
       throw new NoSuchTableException("Table does not exist: %s", table);
     }
     checkNotRenamed(table);
+    if (markedForDrop(table)) {
+      throw new IllegalArgumentException("Cannot update table marked for deletion: " + table);
+    }
     // Store with a marker prefix to distinguish from full mode in buildActions
     inlineTableDeltaUpdates.put(table, deltaBytes);
     return this;
@@ -395,6 +400,12 @@ public class CatalogMutation {
   private boolean checkNamespaceExists(Namespace namespace) {
     Boolean pending = namespaces.get(namespace);
     return pending != null ? !pending : !original.containsNamespace(namespace);
+  }
+
+  // A table this transaction drops: replay rejects a record that drops a table it also reads or
+  // updates (Bug 14), whether the table is inline or not.
+  private boolean markedForDrop(TableIdentifier table) {
+    return tables.containsKey(table) && tables.get(table) == null;
   }
 
   // A table renamed earlier in this transaction no longer exists under its old name.

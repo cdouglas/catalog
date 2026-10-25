@@ -315,7 +315,7 @@ abstract class ConflictEncodingContract {
 
   @Provide
   Arbitrary<List<TableScript.Cmd>> windows() {
-    return TableScript.commands(ConflictEncodingContract::single).withoutEdgeCases()
+    return TableScript.windowCommands(ConflictEncodingContract::single).withoutEdgeCases()
         .list().ofMinSize(0).ofMaxSize(3);
   }
 

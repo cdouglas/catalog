@@ -322,6 +322,16 @@ public final class CheckpointRoundTrip {
                         items.put(
                             "table " + id + " snapshot " + snapshot + " manifests",
                             paths.toString())));
+    items.put("conflict encoding", String.valueOf(file.conflictEncodingName()));
+    EncodingState.Codec codec = file.conflictEncoding().stateCodec();
+    file.conflictStates()
+        .forEach(
+            (id, state) -> {
+              byte[] bytes = codec.encode(state); // a state never observed is none
+              if (bytes.length > 0) {
+                items.put("table " + id + " conflict state", state.toString());
+              }
+            });
     return items;
   }
 

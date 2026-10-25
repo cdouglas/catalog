@@ -83,6 +83,11 @@ class TestCatalogRaceProperties {
           TableIdentifier.of(Namespace.of("a", "c"), "t"));
   private static final List<String> KEYS = List.of("k1", "k2");
 
+  @Provide
+  Arbitrary<String> encodings() {
+    return Arbitraries.of(LocalCatalogMode.ENCODINGS);
+  }
+
   @Property(tries = 1000)
   void aRaceEndsAsASerialRun(
       @ForAll("modes") LocalCatalogMode fileModeA,
@@ -93,7 +98,8 @@ class TestCatalogRaceProperties {
       @ForAll("ops") Op a,
       @ForAll("ops") Op b,
       @ForAll("maybeOps") Op c,
-      @ForAll boolean gc) {
+      @ForAll boolean gc,
+      @ForAll("encodings") String encoding) {
     // The writers' modes on one catalog object, or on a shared log with the same table metadata
     // storage.
     LocalCatalogMode modeA = sharedLog ? fileModeA.onSharedLog() : fileModeA;
@@ -110,7 +116,10 @@ class TestCatalogRaceProperties {
 
     // The race: the k-th racer runs just before A's k-th write to the catalog.
     InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
-    setup.apply(base.catalog(io, WAREHOUSE, "c", Map.of()));
+    // The setup creates the catalog, with the encoding its log keeps.
+    setup.apply(
+        base.catalog(io, WAREHOUSE, "c", Map.of(LogCatalogProperties.CONFLICT_ENCODING, encoding)));
+    Statistics.label("encoding").collect(encoding);
     LogCatalog writerA = modeA.catalog(io, WAREHOUSE, "c", props);
     List<LogCatalog> writers = List.of(
         modeB.catalog(io, WAREHOUSE, "c", props), modeC.catalog(io, WAREHOUSE, "c", props));

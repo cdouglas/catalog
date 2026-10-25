@@ -189,4 +189,51 @@ public final class CatalogTestSupport {
       SupportsAtomicOperations io, String location, RuntimeConfig config) {
     return new CatalogLog(new AtomicFileLog(io, location), config);
   }
+
+  /** The conflict encodings a catalog can be created with, which fuzzers draw from. */
+  public static final java.util.List<String> ENCODINGS = LocalCatalogMode.ENCODINGS;
+
+  /** The inline metadata of a new table at {@code location}: one column, unpartitioned. */
+  public static byte[] newInlineTable(String location) {
+    org.apache.iceberg.Schema schema =
+        new org.apache.iceberg.Schema(
+            org.apache.iceberg.types.Types.NestedField.required(
+                1, "id", org.apache.iceberg.types.Types.LongType.get()));
+    return InlineMetadataCodecs.STRUCTURAL.encode(
+        org.apache.iceberg.TableMetadata.newTableMetadata(
+            schema, org.apache.iceberg.PartitionSpec.unpartitioned(), location, Map.of()));
+  }
+
+  /** The codec tag of {@link #newInlineTable}'s metadata. */
+  public static byte inlineTableCodec() {
+    return InlineMetadataCodecs.STRUCTURAL.tag();
+  }
+
+  /**
+   * The delta of a commit at {@code lastUpdatedMillis} that sets an inline table's property
+   * {@code key} to {@code value}, or removes it if {@code value} is null.
+   */
+  public static byte[] propertyDelta(String key, String value, long lastUpdatedMillis) {
+    InlineDeltaCodec.SetPropertiesUpdate update =
+        value != null
+            ? new InlineDeltaCodec.SetPropertiesUpdate(Map.of(key, value), java.util.Set.of())
+            : new InlineDeltaCodec.SetPropertiesUpdate(Map.of(), java.util.Set.of(key));
+    return InlineDeltaCodec.encodeDelta(java.util.List.of(update), lastUpdatedMillis);
+  }
+
+  /** The delta of a commit at {@code lastUpdatedMillis} that moves an inline table's location. */
+  public static byte[] locationDelta(String location, long lastUpdatedMillis) {
+    return InlineDeltaCodec.encodeDelta(
+        java.util.List.of(new InlineDeltaCodec.SetLocationUpdate(location)), lastUpdatedMillis);
+  }
+
+  /** An inline table's metadata as {@code state} holds it; null if it is not inline. */
+  public static org.apache.iceberg.TableMetadata inlineMetadata(
+      CatalogState state, org.apache.iceberg.catalog.TableIdentifier table) {
+    if (!state.isInlineTable(table)) {
+      return null;
+    }
+    return InlineMetadataCodecs.byTag(state.inlineMetadataCodec(state.tableId(table)))
+        .decodeFull(state.inlineMetadata(table), "inline://view");
+  }
 }
