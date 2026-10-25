@@ -52,7 +52,7 @@ ASSUME /\ FaultKinds \subseteq WriteFaults \cup ReadFaults
        /\ MaxAttempts >= 1 /\ MaxThrottle >= 1
        /\ Sched \in {"free", "mw", "fault", "race"}
        /\ Bugs \subseteq {"10", "12", "16", "17", "18", "25", "26",
-                          "64a", "64b", "64c", "64d", "66", "ckgc"}
+                          "64a", "64b", "64c", "64d", "66", "ckgc", "basever"}
 
 VARIABLES
   file,      \* the catalog object: [gen, chk: [st, C, H], log, segs]
@@ -262,7 +262,7 @@ Stage(w, sh, R, n) ==
       ird == [e \in sh.rd |-> R.st.ver[e]]
   IN [id |-> [w |-> w, n |-> n, ts |-> ts],
       rd |-> IF Has("16") THEN [e \in sh.wr |-> R.st.ver[e]] ELSE ird,
-      ird |-> ird, wr |-> sh.wr, cr |-> sh.cr,
+      ird |-> ird, wr |-> sh.wr, cr |-> sh.cr, wv |-> [e \in sh.wr |-> R.st.ver[e]],
       cid |-> IF Has("10") /\ sh.cr # None THEN R.st.next ELSE 0]
 
 Staged(s, R, r) ==
@@ -543,6 +543,9 @@ ExactlyOnce == \A i, j \in 1..Len(Hist) : i # j => Hist[i].id # Hist[j].id
 \* The catalog is the serial execution of the transactions applied
 \* (RSM's SerialFold).
 Serializable == SerialFold(InitSt, Hist) = [ok |-> TRUE, st |-> LiveR.st]
+
+\* S3, of the state replay reaches.
+StampsCount == CountsChanges(LiveR.st)
 
 \* No id names two entities (S4 in FileIOCatalog.tla; Bug 10).
 UniqueIds == \A m1, m2 \in LiveR.st.made : m1.id = m2.id => m1 = m2

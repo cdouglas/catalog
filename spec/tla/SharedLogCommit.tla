@@ -44,7 +44,7 @@ ReadFaults == {"readFail"}
 ASSUME /\ FaultKinds \subseteq WriteFaults \cup ReadFaults
        /\ MaxAttempts >= 1 /\ MaxThrottle >= 1
        /\ Bugs \subseteq {"ckclock", "setonly", "trimearly", "noverify", "freshid", "p3",
-                          "dup", "lagread"}
+                          "dup", "lagread", "basever"}
 
 VARIABLES
   log,       \* every record appended, in order (the trimmed ones too)
@@ -159,7 +159,8 @@ Judge(w, s, R, then) ==
 Stage(w, sh, R, n) ==
   LET rd == [e \in sh.rd |-> R.st.ver[e]] IN
   [id |-> [w |-> w, n |-> n, ts |-> Max(Clock(w), R.H + 1), k |-> 0],
-   rd |-> rd, ird |-> rd, wr |-> sh.wr, cr |-> sh.cr, cid |-> 0]
+   rd |-> rd, ird |-> rd, wr |-> sh.wr, cr |-> sh.cr, cid |-> 0,
+   wv |-> [e \in sh.wr |-> R.st.ver[e]]]
 
 \* Stage the next transaction on a read of the log, from any usable
 \* checkpoint. A read that lags misses records that have landed: a race.
@@ -382,6 +383,9 @@ ExactlyOnce == \A i, j \in 1..Len(Hist) : i # j => CommitOf(Hist[i]) # CommitOf(
 
 \* The state is the serial execution of the transactions applied.
 Serializable == SerialFold(InitSt, Hist) = [ok |-> TRUE, st |-> Full.st]
+
+\* S3, of the state replay reaches.
+StampsCount == CountsChanges(Full.st)
 
 \* No id names two entities.
 UniqueIds == \A m1, m2 \in Full.st.made : m1.id = m2.id => m1 = m2

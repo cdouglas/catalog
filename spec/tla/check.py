@@ -41,7 +41,7 @@ BASE = {
 }
 
 SAFETY = ["Readable", "ExactlyOnce", "Serializable", "UniqueIds", "HonestCommitted",
-          "HonestFailed", "UnknownExplained", "SoloCommits"]
+          "HonestFailed", "UnknownExplained", "SoloCommits", "StampsCount"]
 ACTIONS = ["HistGrows", "CasAppliesItsRecord", "CheckpointIsReplay"]
 
 ALL_FAULTS = ('{"failBefore", "lostReply", "landedConflict", "throttled", '
@@ -88,7 +88,16 @@ CONFIGS = {
                     "Shapes": "<- RaceTxn", "MaxCount": "1", "Strict": "TRUE"}, "pass"),
     "sched-race-op": ({"Sched": '"race"', "Writers": "{1, 2, 3}", "Skew": "<- NoSkew3",
                        "Shapes": "<- RaceOp", "MaxCount": "1"}, "pass"),
+    # Conflict encodings: a table's concerns as entities, and blind appends.
+    "concerns": ({"Writers": "{1, 2, 3}", "Skew": "<- NoSkew3", "Entities": "<- CEnts",
+                  "Shapes": "<- Concerns", "MaxCount": "1"}, "pass"),
+    "concerns-faults": ({"Entities": "<- CEnts", "Shapes": "<- Concerns2", "MaxCount": "1",
+                         "MaxFaults": "1", "FaultKinds": ALL_FAULTS, "Strict": "TRUE"}, "pass"),
+    "blind-appends": ({"Entities": "<- CEnts", "Shapes": "<- BlindAppends", "MaxCount": "1",
+                       "MaxFaults": "1", "FaultKinds": ALL_FAULTS}, "pass"),
     # Calibration: each bug, put back, must break a property.
+    "basever": ({"Entities": "<- CEnts", "Shapes": "<- Concerns2", "MaxCount": "1",
+                 "Bugs": '{"basever"}'}, {"StampsCount", "HonestFailed", "Serializable"}),
     "bug10": ({"Shapes": "<- Creates", "Bugs": '{"10"}'}, {"UniqueIds", "Serializable"}),
     "bug12": ({"MaxSize": "2", "Bugs": '{"12"}', "Shapes": "<- TwoEach"},
               {"HonestCommitted", "HistGrows", "Serializable"}),
@@ -138,7 +147,8 @@ LOG_BASE = {
     "Bugs": "{}",
 }
 
-LOG_SAFETY = ["Readable", "Deterministic", "CheckpointIsReplay", "ExactlyOnce", "Serializable",
+LOG_SAFETY = ["StampsCount", "Readable", "Deterministic", "CheckpointIsReplay", "ExactlyOnce",
+              "Serializable",
               "UniqueIds", "HonestCommitted", "HonestFailed", "UnknownExplained", "SoloCommits"]
 LOG_ACTIONS = ["HistGrows"]
 
@@ -168,7 +178,15 @@ LOG_CONFIGS = {
     "log-mix": ({**COMPACT1, "MaxFaults": "1", "FaultKinds": LOG_FAULTS, "Lag": "TRUE"}, "pass"),
     "log-three": ({**COMPACT1, "Writers": "{1, 2, 3}", "Shapes": "<- Three",
                    "Skew": "<- NoSkew3"}, "pass"),
+    "log-concerns": ({"Writers": "{1, 2, 3}", "Skew": "<- NoSkew3", "Entities": "<- CEnts",
+                      "Shapes": "<- Concerns"}, "pass"),
+    "log-concerns-faults": ({"Entities": "<- CEnts", "Shapes": "<- Concerns2",
+                             "MaxFaults": "1", "FaultKinds": LOG_FAULTS}, "pass"),
+    "log-blind-appends": ({**COMPACT1, "Entities": "<- CEnts", "Shapes": "<- BlindAppends",
+                           "MaxFaults": "1", "FaultKinds": LOG_FAULTS}, "pass"),
     # Calibration: each bug, put back, must break a property.
+    "log-basever": ({"Entities": "<- CEnts", "Shapes": "<- Concerns2", "Bugs": '{"basever"}'},
+                    {"StampsCount", "HonestFailed", "Serializable"}),
     "log-ckclock": ({**COMPACT, "MaxGc": "0", "MaxTrim": "0", "Bugs": '{"ckclock"}'},
                     {"Deterministic"}),
     "log-setonly": ({**COMPACT, "MaxCkpt": "0", "MaxTrim": "0", "Bugs": '{"setonly"}'},

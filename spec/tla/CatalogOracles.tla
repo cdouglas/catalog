@@ -17,7 +17,8 @@ View(f) == ViewOf(Replay(f).st)
 \* Operation sh staged afresh on st: what a serial run commits.
 Fresh(sh, st) ==
   LET rd == [e \in sh.rd |-> st.ver[e]] IN
-  [id |-> None, rd |-> rd, ird |-> rd, wr |-> sh.wr, cr |-> sh.cr, cid |-> 0]
+  [id |-> None, rd |-> rd, ird |-> rd, wr |-> sh.wr, cr |-> sh.cr, cid |-> 0,
+   wv |-> [e \in sh.wr |-> st.ver[e]]]
 
 AllDone == \A w \in Writers : ws[w].pc = "idle" /\ ws[w].k > Len(Shapes[w])
 

@@ -39,10 +39,16 @@ Verify(st, r) == \A e \in DOMAIN r.rd : st.ver[e] = r.rd[e]
 BindId(st, r) == IF r.cid > 0 THEN r.cid ELSE st.next
 
 \* Intention.apply. A create of an id already in use replaces that entity,
-\* as replay's tableById did (Bug 10).
+\* as replay's tableById did (Bug 10). Each entity written moves one past
+\* its version where the record lands; with "basever", one past its version
+\* where the record was staged (wv), as a table version set to the record's
+\* base + 1 does, which a conflict encoding that admits a record on a later
+\* version makes go back.
 Apply(st, r) ==
   LET id == BindId(st, r) IN
-  [ver  |-> [e \in Entities |-> IF e \in r.wr THEN st.ver[e] + 1 ELSE st.ver[e]],
+  [ver  |-> [e \in Entities |->
+               IF e \in r.wr THEN (IF Has("basever") THEN r.wv[e] ELSE st.ver[e]) + 1
+               ELSE st.ver[e]],
    made |-> IF r.cr = None THEN st.made
             ELSE {m \in st.made : m.id # id} \cup {[id |-> id, p |-> r.cr]},
    next |-> IF r.cr = None THEN st.next ELSE Max(st.next, id + 1),
@@ -99,6 +105,12 @@ Landed(R, id) ==
   CASE R.out = "applied" -> "yes"
     [] R.out = "rejected" -> "no"
     [] OTHER -> Contains(R.C, R.H, id)
+
+\* S3: an entity's version counts the records that changed it. Versions are
+\* the stamps a conflict encoding judges a record by: one that went back
+\* would let a record that lost a race verify later (S2).
+CountsChanges(st) ==
+  \A e \in Entities : st.ver[e] = 1 + Len(SelectSeq(st.hist, LAMBDA r : e \in r.wr))
 
 -----------------------------------------------------------------------------
 (* Serial execution: what the properties compare a history with *)

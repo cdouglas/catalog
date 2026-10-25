@@ -65,6 +65,25 @@ RaceCreates == [w \in {1, 2, 3} |->
                     [] w = 2 -> << [Create("b") EXCEPT !.retry = TRUE] >>
                     [] OTHER -> << Op({"b"}, {"b"}) >>]
 
+\* Conflict encodings: a table's concerns are entities, and its version, v,
+\* one more that every change of the table writes. A record reads the
+\* concerns it depends on: a property change (writer 1) and an append to
+\* main (writer 2) read only their own concern, so either applies after the
+\* other (concern-vector); a change the encoding cannot see into, full
+\* metadata or a schema change (writer 3), reads v, the Lamport witness.
+CEnts == {"v", "props", "main"}
+Concerns == [w \in {1, 2, 3} |->
+               CASE w = 1 -> << T({"props"}, {"props", "v"}) >>
+                 [] w = 2 -> << T({"main"}, {"main", "v"}) >>
+                 [] OTHER -> << T({"v"}, {"v", "props", "main"}) >>]
+\* Two of each: compaction and copies race the concern records.
+Concerns2 == [w \in {1, 2} |->
+                IF w = 1 THEN << T({"props"}, {"props", "v"}), T({"v"}, {"v", "props", "main"}) >>
+                ELSE << T({"main"}, {"main", "v"}), T({"props"}, {"props", "v"}) >>]
+\* Blind appends (blind-append): each reads nothing, so both apply in either
+\* order; a copy of one would apply again but for its id.
+BlindAppends == [w \in {1, 2} |-> << T({}, {"main", "v"}) >>]
+
 NoSkew2 == [w \in {1, 2} |-> 0]
 NoSkew3 == [w \in {1, 2, 3} |-> 0]
 Behind2 == [w \in {1, 2} |-> IF w = 1 THEN 0 ELSE 2]

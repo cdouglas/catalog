@@ -158,6 +158,7 @@ goes in a replace, `oversized` in `mustReplace`: Bug 71, covered by
 | `HonestFailed` | a commit reported failed, or any error but unknown, is not applied, now or later (a late landing included) |
 | `UnknownExplained` | an unknown outcome follows a fault, or a read that put the id at or below the horizon |
 | `SoloCommits` | a commit no other write raced, on storage that did not fail, commits |
+| `StampsCount` | S3: each entity's version counts the records that changed it, so it only grows |
 | `HistGrows` (action) | the history only grows, one transaction at a time |
 | `CasAppliesItsRecord` (action) | a CAS applies its own record when the record holds on the checkpoint it wrote |
 | `CheckpointIsReplay` (action) | a CAS's checkpoint is the replay of the version it replaces: a function of the log, not of its writer's clock (I11) |
@@ -178,6 +179,22 @@ Every configuration passes:
 | `mix`, `mix-lenient` | everything at once | 401,396; 620,919 |
 | `long-faults`, `three` | faults with the shrink path; three writers | 100,928; 106,249 |
 | `sched-*` | each fuzzer's schedules | 33 to 7,636 |
+| `concerns`, `concerns-faults` | conflict encodings: a table's concerns as entities (below); with every fault | 2,097; 14,587 |
+| `blind-appends` | two blind appends, with every fault | 1,009 |
+
+**Conflict encodings.** A conflict encoding (fileio-catalog's
+`ConflictEncoding`) versions a table by its concerns. In the model the
+concerns are entities: `CEnts` holds `v`, the table's version, which every
+change of the table writes, and two concerns, `props` and `main`. A property
+change reads `props` and an append reads `main` (concern-vector's witnesses),
+so either applies after the other; a change an encoding cannot see into
+reads `v`, the Lamport witness. A blind append (blind-append) reads nothing:
+`T({}, {"main", "v"})`, which `Verify` admits anywhere and only the record's
+id keeps from applying twice. That the stamps' judgments are sound rests on
+S3, that a version counts the changes, which `StampsCount` states: the
+switch `basever` sets an entity's version to one past its version where the
+record was staged (`wv`), as a table version set to the record's base plus
+one would after an encoding admitted the record on a later version.
 
 **Calibration.** Each bug switch puts back a bug the fuzzers or reviews found
 (Bug N in the commit subjects). Each one breaks a property:
@@ -197,6 +214,7 @@ Every configuration passes:
 | 64d | `DedupHorizonExceededException` escapes the commit | `HonestFailed` |
 | 66 | `SegmentLimitException` is taken as ambiguous | `UnknownExplained` |
 | `ckgc` | not a bug: the design before GC records, a CAS whose checkpoint is filtered at its writer's watermark | `CheckpointIsReplay` |
+| `basever` | not a bug: an entity's version set from the one its record was staged on (a conflict encoding's table version set to the record's base + 1) | `StampsCount` |
 
 **Coverage.** `check.py --witnesses` checks, for each `Not_` predicate in
 `MC.tla`, that some passing configuration violates it, so that configuration
@@ -400,6 +418,8 @@ Every configuration of the correct protocol passes:
 | `log-gc-faults`, `log-blind-faults` | compaction and every fault | 286,486; 300,888 |
 | `log-mix` | compaction, every fault, lagging reads | 540,348 |
 | `log-three` | three writers, with compaction | 1,259,308 |
+| `log-concerns`, `log-concerns-faults` | a table's concerns as entities; with every fault | 890; 18,562 |
+| `log-blind-appends` | two blind appends, with compaction and every fault | 301,950 |
 
 **Coverage.** `check.py --witnesses` reaches, in the passing configurations:
 
@@ -428,6 +448,7 @@ planned with the model; the last three are what the model found (below):
 | `dup` | a throttled send before the acknowledged one is not counted as a write that may have landed | `HonestFailed` |
 | `lagread` | the read that resolves an ambiguous write may lag behind the one the commit staged on | `HonestFailed` |
 | `p3` | `readThrough` may answer from a checkpoint that already holds the record | `HonestFailed` |
+| `basever` | an entity's version set from the one its record was staged on (see the file model) | `StampsCount` |
 
 ### What the model found
 
