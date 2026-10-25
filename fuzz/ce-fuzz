@@ -1,0 +1,199 @@
+#!/bin/bash
+# The fuzz image's driver: runs fileio-catalog's fuzz rounds and calibrations on commits of a git
+# bundle, against a chosen build of the Iceberg fork, offline.
+#
+#   ce-fuzz round <fork> <commit> <name>        a phase-exit round: the nine jobs below
+#   ce-fuzz calib <fork> <commit> <name> <set>  a calibration: each mutant of mutants/<set>.sh,
+#                                               put back in its own worktree, against the oracles
+#   ce-fuzz test <fork> <commit> <name> <tests> one job: mvn test -Dtest=<tests>, tries as written
+#   ce-fuzz status [name]                       each job of each run (or one): running or its exit,
+#                                               and its result lines
+#
+# <fork> names a build of the fork's jars (/opt/m2/forks/<fork>; `ls` it). <commit> is anything
+# git can resolve in /in/fileio.bundle. Logs go to /out/<name>/<job>.log, summaries to
+# /out/<name>/summary.txt. Env: JOBS, how many jobs run at once (default: all of them); HEAP,
+# each test JVM's heap (default 2g); SMOKE=1 sets every property's tries to 3 (to check the
+# image, not the code).
+#
+# A round's jobs (tries per @Property, in the order the class declares them):
+#   faultA1-2  TestCatalogFaultProperties.catalogMatchesModel, 30,000
+#   faultB1-2  TestCatalogFaultProperties.faultyStorageNeverMisreportsACommit, 30,000
+#   race       TestCatalogRaceProperties, 200,000
+#   mw         spec.TestMultiWriterProperties, 300,000 each
+#   proto      TestMemoryCommitProtocol and TestAtomicFileCommitProtocol, 300,000 each
+#   rebase     TestRebaseProperties, 3,000 each (REBASE_TRIES: each in turn)
+#   contract   the ConflictEncodingContract subclasses, 2,000 each
+set -uo pipefail
+
+BUNDLE=/in/fileio.bundle
+SRC=/work/src
+T=iceberg-fileio-catalog/src/test/java/org/apache/iceberg/io
+HEAP=${HEAP:-2g}
+
+die() { echo "ce-fuzz: $*" >&2; exit 2; }
+
+clone() {
+  [ -f $BUNDLE ] || die "no bundle at $BUNDLE (mount one: -v <file>:$BUNDLE:ro)"
+  # bare, so the bundle's branches are branches here, not origin/<branch>
+  [ -d $SRC ] || git clone -q --bare $BUNDLE $SRC || die "cannot clone $BUNDLE"
+}
+
+# fork name: the Maven repository of its jars, chained to the shared base
+repo() {
+  [ -d /opt/m2/forks/$1 ] || die "no fork build '$1' (have: $(ls /opt/m2/forks | tr '\n' ' '))"
+  echo "-Dmaven.repo.local=/opt/m2/forks/$1 -Dmaven.repo.local.tail=/opt/m2/base"
+  echo "-Dmaven.repo.local.tail.ignoreAvailability=true"
+}
+
+# worktree <dir> <commit>
+worktree() {
+  git -C $SRC worktree add -q --detach "$1" "$2" || die "cannot check out $2"
+}
+
+# tries <file> <tries...>: sets each @Property's tries, in order (one value: all of them)
+tries() {
+  [ "${SMOKE:-0}" = 1 ] && set -- "$1" 3
+  python3 - "$@" <<'PY'
+import sys, re
+f = sys.argv[1]; tries = sys.argv[2:]
+s = open(f).read(); n = [0]
+def sub(m):
+    t = tries[min(n[0], len(tries) - 1)]; n[0] += 1; return '@Property(tries = %s)' % t
+s = re.sub(r'@Property\(tries = \d+\)', sub, s); open(f, 'w').write(s)
+PY
+}
+
+# mutate <file> <old> <new>: replaces the one occurrence of <old>
+mutate() {
+  python3 - "$@" <<'PY'
+import sys
+f, old, new = sys.argv[1:4]
+s = open(f).read()
+if s.count(old) != 1:
+    sys.exit('%s: %d occurrences of the anchor, not 1:\n%s' % (f, s.count(old), old))
+open(f, 'w').write(s.replace(old, new))
+PY
+}
+
+# job <dir> <log> <tests>: one offline test run in <dir>, waiting for a free slot of JOBS
+job() {
+  while [ "$(jobs -rp | wc -l)" -ge "${JOBS:-64}" ]; do wait -n; done
+  (
+    cd "$1" || exit 2
+    start=$(date +%s)
+    echo "start $(date -Is) $(git rev-parse --short HEAD) fork=$FORK heap=$HEAP" > "$2"
+    # shellcheck disable=SC2046
+    MAVEN_OPTS=-Xmx512m mvn -o -B $(repo $FORK) test -DargLine=-Xmx$HEAP \
+      -Dsurefire.failIfNoSpecifiedTests=false -Dtest="$3" >> "$2" 2>&1
+    echo "exit=$? elapsed=$(( $(date +%s) - start ))s" >> "$2"
+  ) &
+}
+
+# the failures and errors per test class of <log>, as "f+e Class ..."
+classes() {
+  grep -ahE "Tests run:.*in org" "$1" \
+    | sed -E 's/.*Failures: ([0-9]+), Errors: ([0-9]+).* in org\.[a-z.]*\.([A-Za-z$]+)$/\1+\2 \3/' \
+    | tr '\n' ' '
+}
+
+status() {
+  for d in ${1:+/out/$1} ${1:-/out/*}; do
+    [ -d "$d" ] || continue
+    echo "### $(basename $d)"
+    for f in "$d"/*.log; do
+      [ -f "$f" ] || continue
+      end=$(grep -ah '^exit=' "$f" | tail -1)
+      echo "== $(basename $f .log): ${end:-running since $(head -1 $f | cut -d' ' -f2)}"
+      grep -ahE 'Tests run:.*in org|tries = |FAIL|original-sample|Property \[' "$f" \
+        | grep -v ' tries = 3 ' | head -8
+    done
+    [ -f "$d/summary.txt" ] && { echo "-- summary"; cat "$d/summary.txt"; }
+  done
+}
+
+round() {
+  for i in 1 2; do
+    worktree $W/faultA$i $COMMIT && tries $W/faultA$i/$T/TestCatalogFaultProperties.java 30000 1
+    worktree $W/faultB$i $COMMIT && tries $W/faultB$i/$T/TestCatalogFaultProperties.java 1 30000
+  done
+  worktree $W/race $COMMIT && tries $W/race/$T/TestCatalogRaceProperties.java 200000
+  worktree $W/mw $COMMIT && tries $W/mw/$T/spec/TestMultiWriterProperties.java 300000
+  worktree $W/proto $COMMIT
+  tries $W/proto/intentlog-memory/src/test/java/org/intentlog/memory/TestMemoryCommitProtocol.java 300000
+  tries $W/proto/intentlog-fileio/src/test/java/org/intentlog/fileio/TestAtomicFileCommitProtocol.java 300000
+  worktree $W/rebase $COMMIT && tries $W/rebase/$T/TestRebaseProperties.java ${REBASE_TRIES:-3000}
+  worktree $W/contract $COMMIT && tries $W/contract/$T/ConflictEncodingContract.java 2000
+  for i in 1 2; do
+    job $W/faultA$i $O/faultA$i.log TestCatalogFaultProperties
+    job $W/faultB$i $O/faultB$i.log TestCatalogFaultProperties
+  done
+  job $W/race $O/race.log TestCatalogRaceProperties
+  job $W/mw $O/mw.log TestMultiWriterProperties
+  job $W/proto $O/proto.log 'TestMemoryCommitProtocol,TestAtomicFileCommitProtocol'
+  job $W/rebase $O/rebase.log TestRebaseProperties
+  job $W/contract $O/contract.log 'Test*Encoding'
+  wait
+  for f in $O/*.log; do
+    echo "$(basename $f .log): $(grep -ah '^exit=' $f | tail -1) | $(classes $f)" >> $O/summary.txt
+  done
+}
+
+# A calibration set defines MUTANTS, ORACLES (one -Dtest), prepare <dir> (sets tries) and
+# mutant <name> <main dir> <test dir> (puts the mutant back). "none" runs the oracles unmutated
+# first: each must pass there, and fail on every mutant.
+calib() {
+  local set=/opt/ce-fuzz/mutants/$1.sh
+  [ -f $set ] || die "no calibration set $1 (have: $(ls /opt/ce-fuzz/mutants | tr '\n' ' '))"
+  # shellcheck source=/dev/null
+  . $set
+  for m in none $MUTANTS; do
+    worktree $W/$m $COMMIT
+    prepare $W/$m
+    if [ $m != none ]; then
+      (cd $W/$m && mutant $m iceberg-fileio-catalog/src/main/java/org/apache/iceberg/io \
+          iceberg-fileio-catalog/src/test/java/org/apache/iceberg/io) \
+        || { echo "$m: the mutant does not apply" >> $O/summary.txt; continue; }
+    fi
+    job $W/$m $O/$m.log "$ORACLES"
+  done
+  wait
+  for m in none $MUTANTS; do
+    [ -f $O/$m.log ] || continue
+    c=$(classes $O/$m.log)
+    if [ $m = none ]; then
+      verdict=$(echo "$c" | grep -qE '(^| )[1-9][0-9]*\+|\+[1-9]' && echo "ORACLES FAIL UNMUTATED" || echo "clean")
+    else
+      verdict=$(echo "$c" | grep -qE '(^| )[1-9][0-9]*\+|\+[1-9]' && echo "caught" || echo "NOT CAUGHT")
+    fi
+    echo "$m: $verdict | $c" >> $O/summary.txt
+  done
+}
+
+cmd=${1:-}; shift || true
+case $cmd in
+  round|calib|test)
+    [ $# -ge 3 ] || die "usage: ce-fuzz $cmd <fork> <commit> <name> ..."
+    FORK=$1; COMMIT=$2; NAME=$3; shift 3
+    repo $FORK > /dev/null
+    clone
+    git -C $SRC rev-parse -q --verify "$COMMIT^{commit}" > /dev/null || die "no commit $COMMIT in the bundle"
+    W=/work/$NAME; O=/out/$NAME
+    [ -e $W ] && die "$W exists: names are one run each in a container"
+    [ -n "$(ls -A $O 2>/dev/null)" ] && die "$O holds an earlier run: choose another name"
+    mkdir -p $W $O
+    echo "$cmd fork=$FORK commit=$(git -C $SRC rev-parse --short $COMMIT) jobs=${JOBS:-all} heap=$HEAP" \
+      "smoke=${SMOKE:-0} cpus=$(nproc) mem=$(free -g | awk '/Mem:/ {print $2}')G $(date -Is)" > $O/run.txt
+    case $cmd in
+      round) round ;;
+      calib) [ $# -ge 1 ] || die "usage: ce-fuzz calib <fork> <commit> <name> <set>"; calib $1 ;;
+      test)
+        [ $# -ge 1 ] || die "usage: ce-fuzz test <fork> <commit> <name> <tests>"
+        worktree $W/test $COMMIT
+        job $W/test $O/test.log "$1"; wait
+        echo "test: $(grep -ah '^exit=' $O/test.log | tail -1) | $(classes $O/test.log)" >> $O/summary.txt ;;
+    esac
+    echo "done $(date -Is)" >> $O/run.txt
+    cat $O/summary.txt ;;
+  status) status "${1:-}" ;;
+  *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac
