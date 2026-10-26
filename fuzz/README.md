@@ -30,13 +30,41 @@ commits too), `run.sh` and this file. For new commits, only the bundle changes:
     ./run.sh round p4 ce-phase4 p4                # the phase-exit round, detached
     ./run.sh calib p4 ce-phase4 p4-calib phase4   # the phase's calibration, detached
     ./run.sh status                               # every run: each job, running or its exit
+    ./run.sh mem                                  # each run's memory and CPU, and the host's
+    ./run.sh shrink p4 ce-phase4 p4-rebase p4/rebase   # shrink what failed in p4's rebase job
 
 Results go to `./out/<name>/`: a log per job, `summary.txt` (each job's exit and failures per
 test class; for a calibration, each mutant `caught` or `NOT CAUGHT`, and `none`, the unmutated
 oracles, which must be `clean`), and `run.txt` (the fork, commit, host). Copy `out/<name>/` back
 to keep it. `JOBS` limits the jobs at once (default all), `HEAP` each test JVM's heap (default
-2g; a job's resident size is about a gigabyte more). A round wants nine cores and about 30 GB;
-a calibration, a core and 3 GB per mutant.
+4g; a job's resident size is up to two gigabytes more, with Maven's). A round wants nine cores
+and about 56 GB; a calibration, a core and 6 GB per mutant.
+
+## Memory on a shared host
+
+Each run's container has a hard memory limit, without swap (`MEM`; by default its jobs at once
+times their heap and 2 GB, and 2 GB: 56 GB for a round), and the highest OOM score. A run that
+outgrows its limit loses one of its own JVMs to the kernel's OOM killer (the job fails, exit 137
+in its log), never another user's process; and should the host itself run short, the kernel
+kills this run first. `run.sh` warns if the limit did not take: rootless Docker applies it only
+where systemd delegates the memory controller to the user's cgroup (`cat
+/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers` lists
+`memory`). Without it, keep `JOBS` times `HEAP` well within the host's free memory (`run.sh
+mem`).
+
+## Shrinking
+
+A round runs without shrinking (`SHRINKING=OFF`): jqwik reports a failing property's original
+sample and its seed at once and moves on. Shrinking in the round's JVM retains every candidate it
+tries, so a long multi-writer sample could fill a small heap and thrash for hours. `run.sh shrink
+<fork> <commit> <name> <run>/<job>` then shrinks each property that failed in that job, one at a
+time: a worktree set up as the job's was (its tries, which also size jqwik's generation), the
+property pinned to the seed it failed with, run alone in a JVM of `SHRINK_HEAP` (default 16g),
+shrinking for `SHRINK_SECONDS` (default 1800), with a timeout of twice that and an hour. Its log
+is `out/<name>/<Class>.<method>.log`; `summary.txt` gives each one's exit and its shrunk sample's
+steps. Use the commit the job ran at. A round with `SHRINKING=BOUNDED` shrinks in place, for
+`SHRINK_SECONDS` each, in its jobs' heaps; `JOB_TIMEOUT` (as `timeout` takes it, `12h`) bounds any
+job.
 
 On rootful Docker the results are root's. Rootless Docker: the daemon is a user service, which stops at logout unless the user lingers
 (`loginctl enable-linger`); `run.sh` warns. Containers are kept after they exit (`run.sh stop

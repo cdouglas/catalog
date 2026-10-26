@@ -6,14 +6,23 @@
 #   ce-fuzz calib <fork> <commit> <name> <set>  a calibration: each mutant of mutants/<set>.sh,
 #                                               put back in its own worktree, against the oracles
 #   ce-fuzz test <fork> <commit> <name> <tests> one job: mvn test -Dtest=<tests>, tries as written
+#   ce-fuzz shrink <fork> <commit> <name> <run>/<job>
+#                                               shrinks each property that failed in a round's job
+#                                               (or a test job), one at a time: reruns it alone,
+#                                               with the job's tries and the seed it failed with,
+#                                               in a JVM of SHRINK_HEAP
 #   ce-fuzz status [name]                       each job of each run (or one): running or its exit,
 #                                               and its result lines
 #
 # <fork> names a build of the fork's jars (/opt/m2/forks/<fork>; `ls` it). <commit> is anything
 # git can resolve in /in/fileio.bundle. Logs go to /out/<name>/<job>.log, summaries to
-# /out/<name>/summary.txt. Env: JOBS, how many jobs run at once (default: all of them); HEAP,
-# each test JVM's heap (default 2g); SMOKE=1 sets every property's tries to 3 (to check the
-# image, not the code).
+# /out/<name>/summary.txt. Env: JOBS, how many jobs run at once (default: all of them; a
+# shrink's, 1); HEAP, each test JVM's heap (default 4g); SHRINKING, jqwik's shrinking in rounds,
+# calibrations and test jobs (default OFF: a failure reports its sample and seed at once, and
+# shrink shrinks it); SHRINK_HEAP (default 16g) and SHRINK_SECONDS (default 1800), a shrink's heap
+# and how long jqwik shrinks; JOB_TIMEOUT, a limit on each job's time (as timeout(1) takes it;
+# default none, a shrink's twice SHRINK_SECONDS and an hour); SMOKE=1 sets every property's
+# tries to 3 (to check the image, not the code).
 #
 # A round's jobs (tries per @Property, in the order the class declares them):
 #   faultA1-2  TestCatalogFaultProperties.catalogMatchesModel, 30,000
@@ -28,7 +37,8 @@ set -uo pipefail
 BUNDLE=/in/fileio.bundle
 SRC=/work/src
 T=iceberg-fileio-catalog/src/test/java/org/apache/iceberg/io
-HEAP=${HEAP:-2g}
+HEAP=${HEAP:-4g}
+SHRINKING=${SHRINKING:-OFF}
 
 die() { echo "ce-fuzz: $*" >&2; exit 2; }
 
@@ -75,15 +85,19 @@ open(f, 'w').write(s.replace(old, new))
 PY
 }
 
-# job <dir> <log> <tests>: one offline test run in <dir>, waiting for a free slot of JOBS
+# job <dir> <log> <tests>: one offline test run in <dir>, waiting for a free slot of JOBS. Its
+# test JVM has HEAP, and jqwik's shrinking is SHRINKING (for SHRINK_SECONDS when bounded).
 job() {
   while [ "$(jobs -rp | wc -l)" -ge "${JOBS:-64}" ]; do wait -n; done
   (
     cd "$1" || exit 2
     start=$(date +%s)
-    echo "start $(date -Is) $(git rev-parse --short HEAD) fork=$FORK heap=$HEAP" > "$2"
+    echo "start $(date -Is) $(git rev-parse --short HEAD) fork=$FORK heap=$HEAP" \
+      "shrinking=$SHRINKING timeout=${JOB_TIMEOUT:-none}" > "$2"
     # shellcheck disable=SC2046
-    MAVEN_OPTS=-Xmx512m mvn -o -B $(repo $FORK) test -DargLine=-Xmx$HEAP \
+    MAVEN_OPTS=-Xmx512m ${JOB_TIMEOUT:+timeout -k 120 $JOB_TIMEOUT} mvn -o -B $(repo $FORK) test \
+      "-DargLine=-Xmx$HEAP -Djqwik.shrinking.default=$SHRINKING
+        -Djqwik.shrinking.bounded.seconds=${SHRINK_SECONDS:-1800}" \
       -Dsurefire.failIfNoSpecifiedTests=false -Dtest="$3" >> "$2" 2>&1
     echo "exit=$? elapsed=$(( $(date +%s) - start ))s" >> "$2"
   ) &
@@ -111,31 +125,118 @@ status() {
   done
 }
 
+# A round's jobs
+ROUND_JOBS="faultA1 faultB1 faultA2 faultB2 race mw proto rebase contract"
+
+# tests_of <job>: the tests a round's job (or a test job) runs; a test job's are its own
+tests_of() {
+  case $1 in
+    faultA*|faultB*) echo TestCatalogFaultProperties ;;
+    race) echo TestCatalogRaceProperties ;;
+    mw) echo TestMultiWriterProperties ;;
+    proto) echo TestMemoryCommitProtocol,TestAtomicFileCommitProtocol ;;
+    rebase) echo TestRebaseProperties ;;
+    contract) echo 'Test*Encoding' ;;
+    test) ;;
+    *) die "no job $1 in a round" ;;
+  esac
+}
+
+# setup <job> <dir>: sets the tries of the job's properties in the worktree <dir>
+setup() {
+  case $1 in
+    faultA*) tries $2/$T/TestCatalogFaultProperties.java 30000 1 ;;
+    faultB*) tries $2/$T/TestCatalogFaultProperties.java 1 30000 ;;
+    race) tries $2/$T/TestCatalogRaceProperties.java 200000 ;;
+    mw) tries $2/$T/spec/TestMultiWriterProperties.java 300000 ;;
+    proto)
+      tries $2/intentlog-memory/src/test/java/org/intentlog/memory/TestMemoryCommitProtocol.java 300000
+      tries $2/intentlog-fileio/src/test/java/org/intentlog/fileio/TestAtomicFileCommitProtocol.java 300000 ;;
+    rebase) tries $2/$T/TestRebaseProperties.java ${REBASE_TRIES:-3000} ;;
+    contract) tries $2/$T/ConflictEncodingContract.java 2000 ;;
+    test) ;; # tries as written
+  esac
+}
+
 round() {
-  for i in 1 2; do
-    worktree $W/faultA$i $COMMIT && tries $W/faultA$i/$T/TestCatalogFaultProperties.java 30000 1
-    worktree $W/faultB$i $COMMIT && tries $W/faultB$i/$T/TestCatalogFaultProperties.java 1 30000
+  for j in $ROUND_JOBS; do
+    worktree $W/$j $COMMIT && setup $j $W/$j
   done
-  worktree $W/race $COMMIT && tries $W/race/$T/TestCatalogRaceProperties.java 200000
-  worktree $W/mw $COMMIT && tries $W/mw/$T/spec/TestMultiWriterProperties.java 300000
-  worktree $W/proto $COMMIT
-  tries $W/proto/intentlog-memory/src/test/java/org/intentlog/memory/TestMemoryCommitProtocol.java 300000
-  tries $W/proto/intentlog-fileio/src/test/java/org/intentlog/fileio/TestAtomicFileCommitProtocol.java 300000
-  worktree $W/rebase $COMMIT && tries $W/rebase/$T/TestRebaseProperties.java ${REBASE_TRIES:-3000}
-  worktree $W/contract $COMMIT && tries $W/contract/$T/ConflictEncodingContract.java 2000
-  for i in 1 2; do
-    job $W/faultA$i $O/faultA$i.log TestCatalogFaultProperties
-    job $W/faultB$i $O/faultB$i.log TestCatalogFaultProperties
+  for j in $ROUND_JOBS; do
+    job $W/$j $O/$j.log "$(tests_of $j)"
   done
-  job $W/race $O/race.log TestCatalogRaceProperties
-  job $W/mw $O/mw.log TestMultiWriterProperties
-  job $W/proto $O/proto.log 'TestMemoryCommitProtocol,TestAtomicFileCommitProtocol'
-  job $W/rebase $O/rebase.log TestRebaseProperties
-  job $W/contract $O/contract.log 'Test*Encoding'
   wait
   for f in $O/*.log; do
     echo "$(basename $f .log): $(grep -ah '^exit=' $f | tail -1) | $(classes $f)" >> $O/summary.txt
   done
+}
+
+# failed <log>: the properties that failed in a job's log, one "<class> <method> <seed>" each:
+# surefire names each failure, and jqwik's report of the property gives the seed it ran with
+failed() {
+  python3 - "$1" <<'PY'
+import re, sys
+text = open(sys.argv[1], errors='replace').read()
+seen = set()
+for m in re.finditer(r'^\[ERROR\] (?:[a-z]\w*\.)*([A-Z][\w$]*)\.(\w+) -- Time elapsed.*<<< (?:FAILURE|ERROR)!',
+                     text, re.M):
+    cls, method = m.group(1), m.group(2)
+    if (cls, method) in seen:
+        continue
+    seen.add((cls, method))
+    seed = None
+    header = r'^timestamp = [^,]*, ' + re.escape(cls) + ':' + re.escape(method) + r' = \s*$'
+    for r in re.finditer(header, text, re.M):
+        s = re.search(r'^seed = (-?\d+)', text[r.end():r.end() + 20000], re.M)
+        seed = s.group(1) if s else seed
+    if seed is None:
+        print('%s.%s: no seed in its report' % (cls, method), file=sys.stderr)
+        continue
+    print(cls, method, seed)
+PY
+}
+
+# pin <file> <method> <seed>: runs the property <method> of <file> with <seed>
+pin() {
+  python3 - "$@" <<'PY'
+import re, sys
+f, method, seed = sys.argv[1:4]
+s = open(f).read()
+m = re.search(r'@Property\(tries = (\d+)\)((?:\s+@[\w.]+(?:\([^)]*\))?)*\s+)void ' + re.escape(method) + r'\(', s)
+if not m:
+    sys.exit('%s: no @Property(tries = N) before void %s(' % (f, method))
+pinned = '@Property(tries = %s, seed = "%s")' % (m.group(1), seed)
+s = s[:m.start()] + pinned + s[m.start() + len('@Property(tries = %s)' % m.group(1)):]
+open(f, 'w').write(s)
+PY
+}
+
+# shrink <run>/<job>: each property that failed in the job, in a worktree set up as the job's
+# was, pinned to its seed, run alone (JOBS at a time, default 1), shrinking for SHRINK_SECONDS in
+# a JVM of SHRINK_HEAP
+shrink() {
+  local log=/out/$1.log job=${1#*/}
+  [ -f $log ] || die "no job log $log"
+  tests_of $job > /dev/null
+  HEAP=${SHRINK_HEAP:-16g}; SHRINKING=BOUNDED; JOBS=${JOBS:-1}
+  JOB_TIMEOUT=${JOB_TIMEOUT:-$(( 2 * ${SHRINK_SECONDS:-1800} + 3600 ))}
+  failed $log > $O/failed.txt 2>> $O/summary.txt
+  [ -s $O/failed.txt ] || { echo "no failed property with a seed in $log" >> $O/summary.txt; return; }
+  local cls method seed d file
+  while read -r cls method seed; do
+    d=$W/$method
+    worktree $d $COMMIT && setup $job $d
+    file=$(find $d -path '*/src/test/java/*' -name "$cls.java" | head -1)
+    [ -n "$file" ] || { echo "$cls.$method: no $cls.java" >> $O/summary.txt; continue; }
+    pin $file $method $seed 2>> $O/summary.txt || continue
+    job $d $O/$cls.$method.log "$cls#$method"
+  done < $O/failed.txt
+  wait
+  while read -r cls method seed; do
+    [ -f $O/$cls.$method.log ] || continue
+    echo "$cls.$method seed=$seed: $(grep -ah '^exit=' $O/$cls.$method.log | tail -1)" \
+      "| shrunk: $(grep -aE '^Shrunk Sample' $O/$cls.$method.log | head -1)" >> $O/summary.txt
+  done < $O/failed.txt
 }
 
 # A calibration set defines MUTANTS, ORACLES (one -Dtest), prepare <dir> (sets tries) and
@@ -171,7 +272,7 @@ calib() {
 
 cmd=${1:-}; shift || true
 case $cmd in
-  round|calib|test)
+  round|calib|test|shrink)
     [ $# -ge 3 ] || die "usage: ce-fuzz $cmd <fork> <commit> <name> ..."
     FORK=$1; COMMIT=$2; NAME=$3; shift 3
     repo $FORK > /dev/null
@@ -182,9 +283,11 @@ case $cmd in
     [ -n "$(ls -A $O 2>/dev/null)" ] && die "$O holds an earlier run: choose another name"
     mkdir -p $W $O
     echo "$cmd fork=$FORK commit=$(git -C $SRC rev-parse --short $COMMIT) jobs=${JOBS:-all} heap=$HEAP" \
-      "smoke=${SMOKE:-0} cpus=$(nproc) mem=$(free -g | awk '/Mem:/ {print $2}')G $(date -Is)" > $O/run.txt
+      "shrinking=$SHRINKING smoke=${SMOKE:-0} cpus=$(nproc) mem=$(free -g | awk '/Mem:/ {print $2}')G" \
+      "limit=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo unknown) $(date -Is)" > $O/run.txt
     case $cmd in
       round) round ;;
+      shrink) [ $# -ge 1 ] || die "usage: ce-fuzz shrink <fork> <commit> <name> <run>/<job>"; shrink $1 ;;
       calib) [ $# -ge 1 ] || die "usage: ce-fuzz calib <fork> <commit> <name> <set>"; calib $1 ;;
       test)
         [ $# -ge 1 ] || die "usage: ce-fuzz test <fork> <commit> <name> <tests>"
@@ -195,5 +298,5 @@ case $cmd in
     echo "done $(date -Is)" >> $O/run.txt
     cat $O/summary.txt ;;
   status) status "${1:-}" ;;
-  *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
