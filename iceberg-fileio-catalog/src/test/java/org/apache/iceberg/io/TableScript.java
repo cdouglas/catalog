@@ -770,11 +770,11 @@ final class TableScript {
       replace.commitTransaction();
     }
 
-    /** The live data files of the main branch, by path. */
+    /** The live data files of the main branch, by path, with their column bounds ({@link #cat}). */
     private static List<DataFile> liveFiles(Table target) {
       List<DataFile> live = new ArrayList<>();
       try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.FileScanTask> tasks =
-          target.newScan().planFiles()) {
+          target.newScan().includeColumnStats().planFiles()) {
         tasks.forEach(task -> live.add(task.file()));
       } catch (java.io.IOException e) {
         throw new java.io.UncheckedIOException(e);
@@ -832,7 +832,10 @@ final class TableScript {
           Map.of(3, bound));
     }
 
-    /** The {@code cat} of a file {@link #newFile} wrote: its lower bound, else 1. */
+    /**
+     * The {@code cat} of a file {@link #newFile} wrote: its lower bound, else 1. A scan's files
+     * have their bounds only if it includes column stats.
+     */
     private static int cat(DataFile file) {
       java.nio.ByteBuffer bound = file.lowerBounds() == null ? null : file.lowerBounds().get(3);
       return bound == null ? 1
@@ -845,11 +848,14 @@ final class TableScript {
       return Expressions.equal("cat", Math.floorMod(index, 4) + 1);
     }
 
-    /** The scan task of a live data file of the main branch, the {@code index}-th by path. */
+    /**
+     * The scan task of a live data file of the main branch, the {@code index}-th by path, its file
+     * with its column bounds ({@link #cat}).
+     */
     private static org.apache.iceberg.FileScanTask pickLive(Table target, int index) {
       List<org.apache.iceberg.FileScanTask> live = new ArrayList<>();
       try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.FileScanTask> tasks =
-          target.newScan().planFiles()) {
+          target.newScan().includeColumnStats().planFiles()) {
         tasks.forEach(live::add);
       } catch (java.io.IOException e) {
         throw new java.io.UncheckedIOException(e);

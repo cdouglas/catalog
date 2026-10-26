@@ -137,6 +137,24 @@ class TestRebaseProperties {
       List<TableScript.Cmd> prefix,
       List<TableScript.Cmd> window,
       TableScript.Cmd r) {
+    String[] outcome = verify(encoding, formatVersion, partitioned, mode, prefix, window, r);
+    Statistics.label("R on a raced table").collect(encoding, outcome[0]);
+    Statistics.label("R").collect(outcome[1]);
+  }
+
+  /**
+   * One try: R on the table the prefix built, the window run just before its first write, in the
+   * subject and in the reference. Returns how R's record went in the subject, and R's kind (with
+   * " failed" if it failed).
+   */
+  static String[] verify(
+      String encoding,
+      int formatVersion,
+      boolean partitioned,
+      LocalCatalogMode mode,
+      List<TableScript.Cmd> prefix,
+      List<TableScript.Cmd> window,
+      TableScript.Cmd r) {
     StringBuilder trace = new StringBuilder(String.format(
         "v%d %s, %s, %s%nprefix %s%nwindow %s%nR %s%n", formatVersion,
         partitioned ? "partitioned" : "unpartitioned", mode, encoding, prefix, window, r));
@@ -168,8 +186,6 @@ class TestRebaseProperties {
     } else {
       outcome = "failed without a conflict (" + subject.failure.getClass().getSimpleName() + ")";
     }
-    Statistics.label("R on a raced table").collect(encoding, outcome);
-    Statistics.label("R").collect(r.kind + (subject.failure == null ? "" : " failed"));
 
     // Both runs end alike: what the subject admitted is what the retry committed.
     if ((subject.failure == null) != (reference.failure == null)) {
@@ -186,6 +202,7 @@ class TestRebaseProperties {
           + "\n" + trace);
     }
     CheckpointRoundTrip.assertEveryWrite(subject.io);
+    return new String[] {outcome, r.kind + (subject.failure == null ? "" : " failed")};
   }
 
   @Provide

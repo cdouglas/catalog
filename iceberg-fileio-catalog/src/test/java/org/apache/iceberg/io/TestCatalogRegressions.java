@@ -4743,4 +4743,33 @@ public class TestCatalogRegressions {
           .isInstanceOf(NamespaceNotEmptyException.class);
     }
   }
+
+  /** A command of a rebase-oracle sample ({@link TestRebaseProperties}). */
+  private static TableScript.Cmd cmd(TableScript.Kind kind, int a, int b, int c) {
+    return new TableScript.Cmd(kind, a, b, c);
+  }
+
+  /**
+   * Bug 77: the fault-free rebase oracle read a table with two deletion vectors for one data file.
+   * A fuzzer's bug, not the catalog's: TableScript's merge row delta took its data file from a
+   * scan, which drops column bounds unless it includes column stats, so it read the file's
+   * partition as the default and gave its row delta a conflict detection filter for another one.
+   * Iceberg's checks for concurrent delete files, deletion vectors among them, are scoped by that
+   * filter, so Iceberg's own retry committed a second DV for the file, as did the merge under
+   * partition-vector, which judges the same checks. The script's scans now include column stats
+   * (a rewrite's new file also took the wrong bounds).
+   */
+  @Nested
+  class ConcurrentDeletionVectors {
+    @ParameterizedTest
+    @ValueSource(strings = {LamportEncoding.NAME, PartitionVectorEncoding.NAME,
+        ManifestWindowEncoding.NAME})
+    void aRowDeltaAfterAnotherDvForItsFile(String encoding) {
+      TestRebaseProperties.verify(encoding, 3, true, LocalCatalogMode.APPEND_ML,
+          List.of(cmd(TableScript.Kind.FAST_APPEND, 0, 0, 1)),
+          List.of(cmd(TableScript.Kind.POSITION_DELETE, 3, 7, 0)),
+          cmd(TableScript.Kind.MERGE_ROW_DELTA, 5, 11, 9));
+    }
+  }
+
 }
