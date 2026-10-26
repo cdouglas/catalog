@@ -39,11 +39,15 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
  *
  * <p>Every write gives the object a fresh generation, like a GCS generation or an S3 ETag. An
  * {@link InputFile} binds to the generation it first observes ({@code exists}, {@code getLength},
- * or {@code newStream}) and keeps reading those bytes afterwards, so a caller always parses the
- * version its precondition names. {@link AtomicOutputFile.Strategy#CAS} replaces the object only if
- * the live generation is the bound one (or, for an unbound absent file, the object still does not
- * exist). {@link AtomicOutputFile.Strategy#APPEND} adds the bytes at the end under the same
- * condition, as S3 Express does with {@code ifMatch} plus {@code writeOffsetBytes}. With {@link
+ * or {@code newStream}) and keeps reading those bytes afterwards. A conditional write expects the
+ * version its snapshot has seen ({@link SupportsAtomicOperations#newOutputFile(InputFile)}): one
+ * a write returned, or one a lookup ({@code exists}, {@code getLength}) found. A read alone sees
+ * none, as on S3, the store whose reads record the least. {@link AtomicOutputFile.Strategy#CAS}
+ * replaces the object only if the live generation is the one seen, or, from a snapshot that has
+ * seen none, creates it only if it does not exist. {@link AtomicOutputFile.Strategy#APPEND} adds
+ * the bytes at the end under the same condition, as S3 Express does with {@code ifMatch} plus
+ * {@code writeOffsetBytes}; from a snapshot that has seen no version it looks the object up first,
+ * and extends the version it finds if that is still the live one. With {@link
  * #failSupersededReads}, reading a bound generation that a later write replaced fails instead of
  * returning its bytes, as on real storage: GCS reads by generation, and S3 and ADLS with If-Match.
  *
@@ -330,6 +334,9 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
     private final String location;
     private boolean bound = false;
     private Version version = null;
+    // Whether a write returned the bound version or a lookup found it: what a conditional write
+    // from this snapshot expects
+    private boolean seen = false;
 
     BoundInputFile(String location) {
       this.location = location;
@@ -339,6 +346,7 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
       this.location = location;
       this.bound = true;
       this.version = version;
+      this.seen = true;
     }
 
     InMemoryAtomicFileIO owner() {
@@ -368,9 +376,32 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
       bound = true;
     }
 
+    /** The bound version, which a lookup has now seen. */
+    private Version lookUp() {
+      Version v = version();
+      synchronized (this) {
+        seen = true;
+      }
+      return v;
+    }
+
+    /**
+     * The version a conditional write from this snapshot expects (null: no object): the one it has
+     * seen; for one that has seen none, no object for a CAS, which assumes the object is absent,
+     * and for an APPEND, which extends an existing object, the one a lookup finds now.
+     */
+    Version expected(AtomicOutputFile.Strategy strategy) {
+      synchronized (this) {
+        if (seen) {
+          return version;
+        }
+      }
+      return strategy == AtomicOutputFile.Strategy.APPEND ? objects.get(location) : null;
+    }
+
     @Override
     public long getLength() {
-      Version v = version();
+      Version v = lookUp();
       if (v == null) {
         throw new NotFoundException("File does not exist: %s", location);
       }
@@ -411,7 +442,7 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
 
     @Override
     public boolean exists() {
-      return version() != null;
+      return lookUp() != null;
     }
   }
 
@@ -488,7 +519,7 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
       String location = location();
       Fault fault = faults.next(location, strategy);
       byte[] data = readAll(source.get());
-      Version expected = replace.version();
+      Version expected = replace.expected(strategy);
       synchronized (InMemoryAtomicFileIO.this) {
         if (fault != Fault.NONE) {
           injected.merge(fault, 1, Integer::sum);

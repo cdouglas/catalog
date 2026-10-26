@@ -89,7 +89,13 @@ object's bytes and back, for tests and tools.
 **Tails.** A tail is the object's version (an ETag or generation) and length.
 The next conditional write names that version: an append at that offset (S3
 Express's write offset, an Azure Append Blob's position), a replace of that
-version (if-match, a generation precondition). A tail continues an earlier one
+version (if-match, a generation precondition). A tail has always looked the
+object up: `read()` and `probe()` take the length through the snapshot the next
+write names (`getLength()`), which pins the version it saw on every store. The
+fork's atomic writes take a snapshot that has seen no version to name an absent
+object (a CAS from it creates the object only if none exists, with no lookup),
+so a tail that had not looked would turn a replace into a failed create. A tail
+continues an earlier one
 if the object did not shrink: an append makes it longer, while a replace
 usually makes it shorter. A replace that makes it longer reads as an append,
 which costs a resend at most: the record is the same, and replay applies it
