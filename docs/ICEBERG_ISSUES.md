@@ -13,7 +13,7 @@ reports or pull requests upstream. It covers the reproduction, the cause
 with links to the 1.12.0 source, the fix, its tests, and what to settle
 before a PR.
 
-Upstream fixed C1. The fork fixes C2 to C25 on branch `core-fixes`, each
+Upstream fixed C1. The fork fixes C2 to C26 on branch `core-fixes`, each
 in an upstream-style commit with its tests, so the project's tests no
 longer work around any of them.
 
@@ -57,8 +57,11 @@ record: every issue and PR (from the GitHub API), every PR's branch, and
 the issues@ and dev@ lists, which carry each issue's and PR's discussion.
 What that found is in each issue's document. C25, which the review of the
 conflict-encoding plan found on 2026-10-24, was fixed that day and
-checked against main at `e70a2efcd` and upstream's record. The Fork
-column is `atomicio`, which sits on `core-fixes`.
+checked against main at `e70a2efcd` and upstream's record. C26, which
+the conflict-encoding fuzz rounds found on 2026-10-25, was fixed that
+day; it reproduces on main at `97659351d4`, and had been reported
+upstream with a fix the stale bot closed. The Fork column is
+`atomicio`, which sits on `core-fixes`.
 
 | Issue | Fork | 1.12.0 | main | Upstream |
 |---|---|---|---|---|
@@ -87,6 +90,8 @@ column is `atomicio`, which sits on `core-fixes`.
 | C23. A replace transaction drops what other writers committed since it began | fixed, `core-fixes` 29566e9 | yes | yes | [#16232](https://github.com/apache/iceberg/issues/16232), open; PR [#16943](https://github.com/apache/iceberg/pull/16943), open, which this follows except where it falls back; three earlier attempts closed by the stale bot |
 | C24. A commit that removes a data file keeps its deletion vector | fixed, `core-fixes` 7f88e98 | yes | yes | PR [#18197](https://github.com/apache/iceberg/pull/18197), open, whose first commit this takes (its second reverses [#11131](https://github.com/apache/iceberg/pull/11131)) |
 | C25. A rewrite with an older data sequence number drops a delete it still needs | fixed, `core-fixes` 0e0e9bb | yes | yes | [#10312](https://github.com/apache/iceberg/issues/10312), closed by the stale bot; PR [#10962](https://github.com/apache/iceberg/pull/10962), open, whose age-off half this takes (maintainers opposed the other half) |
+| C26. A row delta whose conflict filter misses a file commits a second DV for it | fixed, `core-fixes` 04a2388 | yes | yes | PR [#15966](https://github.com/apache/iceberg/pull/15966), closed by the stale bot unreviewed; [#17206](https://github.com/apache/iceberg/issues/17206), open, on the unreadable tables it leaves |
+
 
 "Not reported" means a search of apache/iceberg's issues, pull requests
 and PR branches, and of the issues@ and dev@ lists, found nothing for the
@@ -771,6 +776,34 @@ concurrent commit that removes the last older data file is enough.
 - **No workaround** to remove: the fuzzers' rewrites never set a data
   sequence number.
 - **Canary:** `aRewriteWithAnOlderSequenceNumberKeepsTheDeletesItNeeds`.
+
+### C26. A row delta whose conflict filter misses a file commits a second deletion vector for it
+
+Details: [iceberg-issues/C26.md](iceberg-issues/C26.md).
+
+A row delta that adds a deletion vector for a data file checks that no
+commit since it began added one for the same file: two DVs for one file
+make every scan of the table fail. The check read only the delete
+manifests and entries that the operation's conflict detection filter
+matches, which bounds the rows it read and need not cover the files it
+adds DVs for. A concurrent DV outside the filter got through, and the
+commit added a second.
+
+- **Cause:** `MergingSnapshotProducer.validateAddedDVs` filters by the
+  conflict detection filter: its entries since #11495 (1.8.0), its
+  manifests too since #15653 (1.11.0).
+- **Found by:** `TestRebaseProperties`, 2026-10-25, whose merge row delta
+  had a conflict filter for the wrong partition (the fuzzer's Bug 77):
+  Iceberg's own retry committed the second DV.
+- **Upstream:** PR #15966 reported it with a fix, and was closed by the
+  stale bot unreviewed; #17206 (open) asks to read such tables, which
+  maintainers oppose.
+- **Fork:** fixed on `core-fixes` by 04a2388, "Core: Check for concurrent
+  deletion vectors outside the conflict filter", which scopes the check by
+  the partitions of the commit's own DVs. Its test is
+  `TestRowDelta.testConcurrentDVOutsideTheConflictDetectionFilter`.
+- **No workaround** to remove: the fuzzer's scans now include column stats.
+- **Canary:** `aConcurrentDvOutsideTheConflictFilterIsCaught`.
 
 ## Accepted Iceberg Behavior
 

@@ -67,7 +67,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
- * Canaries for the Iceberg core bugs this project's fuzzers and reviews found, C1 to C25 in
+ * Canaries for the Iceberg core bugs this project's fuzzers and reviews found, C1 to C26 in
  * docs/ICEBERG_ISSUES.md: one test each, on Iceberg's own InMemoryCatalog, that asserts the bug is
  * absent. Upstream fixed C1, and the fork's core-fixes branch fixes the others, so every test
  * passes against the fork. A test that fails means its bug is back: a rebase dropped the fork's
@@ -761,6 +761,60 @@ class TestIcebergCoreIssues {
     assertThat(deletesOfG).as(BACK, "C25").containsExactly(path("eq"));
   }
 
+  /**
+   * C26. A row delta whose conflict detection filter does not cover the data file it adds a
+   * deletion vector for must not commit after another writer added one for the file: the check for
+   * concurrently added DVs was scoped by the filter, and two DVs for one file leave the table
+   * unplannable.
+   */
+  @Test
+  void aConcurrentDvOutsideTheConflictFilterIsCaught() throws IOException {
+    InMemoryCatalog catalog = catalog();
+    PartitionSpec spec = PartitionSpec.builderFor(SCHEMA).identity("id").build();
+    Table table =
+        catalog
+            .buildTable(ID, SCHEMA)
+            .withPartitionSpec(spec)
+            .withProperty(TableProperties.FORMAT_VERSION, "3")
+            .create();
+    DataFile f =
+        DataFiles.builder(spec)
+            .withPath(path("f"))
+            .withFileSizeInBytes(10)
+            .withRecordCount(2)
+            .withPartitionPath("id=2")
+            .build();
+    table.newFastAppend().appendFile(f).commit();
+    long start = table.currentSnapshot().snapshotId();
+
+    catchThrowable(
+        () ->
+            racing(
+                    table,
+                    () ->
+                        catalog
+                            .loadTable(ID)
+                            .newRowDelta()
+                            .addDeletes(dv(table, f, "other"))
+                            .commit())
+                .newRowDelta()
+                .addDeletes(dv(table, f, "mine"))
+                .validateFromSnapshot(start)
+                .conflictDetectionFilter(Expressions.equal("id", 1))
+                .validateNoConflictingDeleteFiles()
+                .commit());
+
+    assertThatCode(
+            () -> {
+              try (CloseableIterable<FileScanTask> tasks =
+                  catalog.loadTable(ID).newScan().planFiles()) {
+                tasks.forEach(task -> {});
+              }
+            })
+        .as(BACK, "C26")
+        .doesNotThrowAnyException();
+  }
+
   /** Applies updates computed on {@code base}, as a REST server applies a client's commit. */
   private static void applyAsRestServer(
       InMemoryCatalog catalog, TableMetadata base, List<org.apache.iceberg.MetadataUpdate> updates) {
@@ -863,6 +917,21 @@ class TestIcebergCoreIssues {
     DataFiles.Builder file =
         DataFiles.builder(spec).withPath(path(name)).withFileSizeInBytes(10).withRecordCount(1);
     return spec.isPartitioned() ? file.withPartitionPath("id=1").build() : file.build();
+  }
+
+  /** A deletion vector of one row of {@code data}, in its partition, named {@code name}. */
+  private static DeleteFile dv(Table table, DataFile data, String name) {
+    return FileMetadata.deleteFileBuilder(table.specs().get(data.specId()))
+        .ofPositionDeletes()
+        .withFormat(FileFormat.PUFFIN)
+        .withPath(path(name) + ".puffin")
+        .withFileSizeInBytes(10)
+        .withRecordCount(1)
+        .withPartition(data.partition())
+        .withReferencedDataFile(data.location())
+        .withContentOffset(4)
+        .withContentSizeInBytes(6)
+        .build();
   }
 
   /** A deletion vector of one row of {@code data}. */
