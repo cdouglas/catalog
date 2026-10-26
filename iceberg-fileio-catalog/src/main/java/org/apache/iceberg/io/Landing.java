@@ -54,8 +54,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
  *   <li>the delta's new snapshots are numbered after the table's last sequence number, as on the
  *       base, and the manifests they wrote take their numbers: a sequence number above the base's
  *       last one moves with them;
- *   <li>their first row ids start at the table's next row id, and the data manifests they wrote
- *       move with them;
+ *   <li>their first row ids start at the table's next row id, and the data manifests they wrote,
+ *       or gave row ids to (ones written before the table's upgrade to v3), move with them;
  *   <li>the first new snapshot of a branch takes the branch's head as its parent, and its
  *       summary's totals start from the head's (from 0 if the branch has none);
  *   <li>their timestamps and the table's last-updated-ms are no earlier than the table's
@@ -66,8 +66,9 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
  * The table's version becomes the landing version + 1 ({@link ProtoCodec}). {@link #unmergeable}
  * says when a delta cannot be finalized on a changed table: among others, where the retry would
  * change its snapshot's manifest list beyond what the delta says, by dropping delete files (a
- * merging producer drops those older than every data file it keeps). A conflict encoding admits
- * a stale record only where it can be finalized.
+ * merging producer drops those older than every data file it keeps) or by giving row ids to
+ * manifests that have none. A conflict encoding admits a stale record only where it can be
+ * finalized.
  */
 final class Landing {
 
@@ -245,6 +246,11 @@ final class Landing {
         if (held != null && adds.containsKey(manifest.snapshotId())) {
           return "a manifest it wrote is in the table already";
         }
+        if (held != null && !Objects.equals(held.firstRowId(), manifest.firstRowId())) {
+          // its snapshot gave row ids to a manifest it kept, which the table's lists hold with
+          // others: they share one entry per path (design.md I3a)
+          return "it gives row ids to a manifest the table's lists hold with others";
+        }
       }
     }
     for (AddSnapshotUpdate add : adds.values()) {
@@ -310,6 +316,8 @@ final class Landing {
    * where it lands on {@code table}, beyond what its delta says; null if it would not.
    *
    * <ul>
+   *   <li>In v3, a commit gives row ids to the data manifests of its list that have none (written
+   *       before the table's upgrade), which only a head the delta did not see can hold.
    *   <li>A merging producer (MergingSnapshotProducer) drops the delete files whose data sequence
    *       numbers are older than every data file its list keeps, and than the table's last
    *       sequence number: they can apply to no row. It reads the delete manifests that may hold
@@ -321,6 +329,13 @@ final class Landing {
    */
   private static String retryChanges(
       List<ManifestFile> list, AddSnapshotUpdate add, TableMetadata table) {
+    if (table.formatVersion() >= 3) {
+      for (ManifestFile manifest : list) {
+        if (manifest.content() == ManifestContent.DATA && manifest.firstRowId() == null) {
+          return "its list keeps data manifests without row ids, which its retry would give ids";
+        }
+      }
+    }
     if (add.footprint != null && add.footprint.kind == Footprint.Kind.BLIND) {
       return null;
     }
@@ -473,15 +488,16 @@ final class Landing {
   /**
    * {@code manifest}, as the delta lists it, with the sequence numbers and first row id the delta
    * assigned moved to where it lands: a manifest one of its snapshots wrote numbers its entries
-   * after the base's last sequence number and ids from the base's next row id.
+   * after the base's last sequence number, and one it wrote, or kept without row ids, has ids from
+   * the base's next row id.
    */
   ManifestFile manifest(ManifestFile manifest) {
-    if (!added.contains(manifest.snapshotId()) || (sequenceShift == 0 && rowShift == 0)) {
+    if (sequenceShift == 0 && rowShift == 0) {
       return manifest;
     }
     long sequenceNumber = manifest.sequenceNumber();
     long minSequenceNumber = manifest.minSequenceNumber();
-    if (baseLastSequenceNumber != null) {
+    if (baseLastSequenceNumber != null && added.contains(manifest.snapshotId())) {
       if (sequenceNumber > baseLastSequenceNumber) {
         sequenceNumber += sequenceShift;
       }
@@ -489,9 +505,16 @@ final class Landing {
         minSequenceNumber += sequenceShift;
       }
     }
+    // ids from the base's next row id on are ones the delta gave: to a manifest it wrote, or to one
+    // it kept that had none
     Long firstRowId = manifest.firstRowId();
     if (firstRowId != null && baseNextRowId != null && firstRowId >= baseNextRowId) {
       firstRowId += rowShift;
+    }
+    if (sequenceNumber == manifest.sequenceNumber()
+        && minSequenceNumber == manifest.minSequenceNumber()
+        && Objects.equals(firstRowId, manifest.firstRowId())) {
+      return manifest;
     }
     return InlineDeltaCodec.manifestFile(
         manifest, manifest.path(), sequenceNumber, minSequenceNumber, firstRowId);

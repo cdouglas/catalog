@@ -137,16 +137,19 @@ inline list (empty for none). On apply:
 
 - `AddManifestDelta` adds `manifest` to the table's pool, replacing an
   entry for the same path (entries for one path could differ only in
-  first row id, which the restate rule below keeps from changing), and
+  first row id, which the restate rule below keeps from changing, and
+  which a delta merged on a later version may not change: SPEC_TM.md
+  §"Late-bound fields"), and
   inserts the path in the snapshot's list at `position`, or at the end
   if it is absent. Writers always set it.
 - `RemoveManifestDelta` removes the path from the snapshot's reference
   list.
 - A manifest one of the delta's snapshots wrote takes, where a conflict
   encoding admits the delta on a later version of the table, the sequence
-  numbers and (v3) first row id that snapshot gets there (SPEC_TM.md
-  §"Late-bound fields"); a snapshot whose parent changes builds its list on
-  the new parent's.
+  numbers and (v3) first row id that snapshot gets there, as does a
+  manifest it kept and gave a first row id (SPEC_TM.md §"Late-bound
+  fields"); a snapshot whose parent changes builds its list on the new
+  parent's.
 - `RemoveSnapshots` (SPEC_TM) drops each removed snapshot's list and the
   pool entries no remaining list references. A full-mode update prunes
   the lists of the snapshots its new metadata lacks the same way.

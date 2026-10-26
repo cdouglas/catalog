@@ -4773,6 +4773,48 @@ public class TestCatalogRegressions {
   }
 
   /**
+   * Bug 76: a merged record's row ids, in a table upgraded to v3. A commit gives row ids to every
+   * data manifest of its snapshot's list that has none (one written before the upgrade), from the
+   * table's next row id. A branch append on a head from before the upgrade did, and merged on a
+   * table whose next row id had moved, it kept the ids it gave on its base, which the commits since
+   * had given out too. Its record carried the manifest whole (its parent's list was a file), so
+   * replay also changed the entry the table's other lists share for its path. And an append that
+   * landed on a head whose manifests had none (in the merge's own probe, after a rollback) left
+   * them without. The rebase oracle found both. The merge now moves the ids a record gave with its
+   * own, and refuses a record that would change a shared entry, or that lands on manifests without
+   * row ids (Landing).
+   */
+  @Nested
+  class RowIdsOfManifestsWrittenBeforeTheUpgrade {
+    @Test
+    void aBranchAppendOnAHeadWithoutRowIds() {
+      TestRebaseProperties.verify(BlindAppendEncoding.NAME, 2, true, LocalCatalogMode.APPEND_ML,
+          List.of(cmd(TableScript.Kind.FAST_APPEND, 0, 0, 7), cmd(TableScript.Kind.UPGRADE, 11, 1, 10),
+              cmd(TableScript.Kind.CREATE_BRANCH, 0, 10, 9),
+              cmd(TableScript.Kind.EQUALITY_DELETE, 1, 4, 6),
+              cmd(TableScript.Kind.SET_PROPERTY, 3, 10, 6)),
+          List.of(cmd(TableScript.Kind.MERGE_APPEND, 9, 2, 2),
+              cmd(TableScript.Kind.REPLACE_PARTITIONS, 4, 6, 1)),
+          cmd(TableScript.Kind.BRANCH_APPEND, 11, 10, 0));
+    }
+
+    @Test
+    void anAppendMergedOntoARollback() {
+      TestRebaseProperties.verify(AdmitDeltasEncoding.register(), 2, true,
+          LocalCatalogMode.APPEND_ML,
+          List.of(cmd(TableScript.Kind.FAST_APPEND, 0, 0, 0),
+              cmd(TableScript.Kind.MERGE_APPEND, 6, 6, 10),
+              cmd(TableScript.Kind.PARTITION_STATISTICS, 9, 0, 8),
+              cmd(TableScript.Kind.SET_PROPERTY, 8, 2, 11),
+              cmd(TableScript.Kind.ADD_PARTITION_FIELD, 8, 9, 8),
+              cmd(TableScript.Kind.UPGRADE, 0, 10, 11), cmd(TableScript.Kind.RENAME_COLUMN, 4, 2, 0),
+              cmd(TableScript.Kind.REPLACE_PARTITIONS, 3, 0, 9)),
+          List.of(cmd(TableScript.Kind.ROLLBACK, 7, 4, 3)),
+          cmd(TableScript.Kind.FAST_APPEND, 6, 7, 1));
+    }
+  }
+
+  /**
    * Bug 77: the fault-free rebase oracle read a table with two deletion vectors for one data file.
    * A fuzzer's bug, not the catalog's: TableScript's merge row delta took its data file from a
    * scan, which drops column bounds unless it includes column stats, so it read the file's

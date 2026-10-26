@@ -518,8 +518,10 @@ computes them there (`SnapshotProducer.apply` and `summary`), with
   wrote (`added_snapshot_id`) moves by as much: the manifest list writer
   assigns the commit's to the manifests it wrote.
 - **Row ids** (v3). A snapshot's `first_row_id`, and the `first_row_id`
-  of a data manifest one of them wrote at or above `base_next_row_id`,
-  move by how far the landing table's next row id is past the base's.
+  at or above `base_next_row_id` of a data manifest in its list (one it
+  wrote, or one it kept that had none, written before the table's upgrade
+  to v3), move by how far the landing table's next row id is past the
+  base's.
 - **Parent and totals.** The first new snapshot of a chain a
   `SetSnapshotRef` moves a branch to takes the branch's head as its parent,
   and its summary's `total-*` counts are recounted from the head's summary
@@ -548,12 +550,15 @@ removal, reads like the first append of an empty table: Bug 73), or lands
 on v3 from an earlier base. Nor where the list of its snapshot where it
 lands (its new parent's inline list, or its own on a table whose sequence
 numbers or row ids moved) is not the list Iceberg's retry would commit:
-its producer is not blind, and the list keeps a delete manifest with files
-older than its oldest data (its data manifests' and the table's last
-sequence number): `MergingSnapshotProducer` drops the delete files older
-than every data file it keeps from each delete manifest it reads, every
-one once it removes a data file, which can drop files the delta does not
-(Bug 75). These
+it keeps v3 data manifests without row ids, which the retry gives ids
+(only a head the delta did not see can hold one: a rollback); it would
+replace a manifest the table's pool holds with one of another first row id
+(the pool's entry is every list's: design.md I3a); or its producer is not
+blind, and the list keeps a delete manifest with files older than its
+oldest data (its data manifests' and the table's last sequence number):
+`MergingSnapshotProducer` drops the delete files older than every data file
+it keeps from each delete manifest it reads, every one once it removes a
+data file, which can drop files the delta does not (Bugs 75 and 76). These
 are what the finalization needs; whether a merge is correct is the
 encoding's to judge, and it must make each of them stable where it
 admits.
