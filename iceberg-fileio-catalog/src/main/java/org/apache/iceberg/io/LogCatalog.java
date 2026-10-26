@@ -492,6 +492,8 @@ public class LogCatalog extends BaseMetastoreCatalog
     private final InlineMetadataFileIO tableIO;
     private final InlineSettings inline;
     private volatile Replica<CatalogState> lastRead = null;
+    // Whether a read found the table: once one has, a read that does not finds it dropped
+    private boolean loaded = false;
 
     FileIOTableOperations(
         TableIdentifier tableId, CatalogLog log, FileIO io, InlineSettings inline) {
@@ -531,10 +533,17 @@ public class LogCatalog extends BaseMetastoreCatalog
       return (long) read.state().inlineMetadata(tableId).length;
     }
 
-    /** Loads the table's metadata as {@code state} holds it: a pointer table's, or an inline one's. */
+    /**
+     * Loads the table's metadata as {@code state} holds it: a pointer table's, or an inline one's.
+     * Throws NoSuchTableException if an earlier read found the table and {@code state} has none:
+     * {@link BaseMetastoreTableOperations#refresh} drops the metadata when it throws, and the
+     * next read must not take the table for one not created yet, which has no metadata to update
+     * (Bug 78: an update read a null base) and whose commit creates it.
+     */
     private synchronized void loadFrom(CatalogState state) {
       String metadataFile = state.location(tableId);
       if (metadataFile != null) {
+        loaded = true;
         // Pointer table: load metadata from external file
         refreshFromMetadataLocation(metadataFile);
       } else if (state.isInlineTable(tableId)) {
@@ -547,13 +556,14 @@ public class LogCatalog extends BaseMetastoreCatalog
         // on every commit, and each table has its own id — so we derive the
         // location from (name, id, version) directly; see metadataLocation.
         // No content hashing, no collision worry.
+        loaded = true;
         byte[] inlineMeta = state.inlineMetadata(tableId);
         byte codecTag = inlineCodecTag(state, tableId);
         InlineMetadataCodec codec = InlineMetadataCodecs.byTag(codecTag);
         String syntheticLoc = metadataLocation(state, tableId);
         refreshFromMetadataLocation(syntheticLoc, null, 0,
             loc -> wrapInlineManifests(codec.decodeFull(inlineMeta, loc), state));
-      } else if (currentMetadataLocation() != null) {
+      } else if (loaded || currentMetadataLocation() != null) {
         // Table used to exist but is now missing
         throw new NoSuchTableException("Table %s was deleted", tableId);
       } else {

@@ -4837,4 +4837,35 @@ public class TestCatalogRegressions {
     }
   }
 
+  /**
+   * Bug 78: a table handle whose table was dropped committed with no base. After a drop, a
+   * handle's refresh threw NoSuchTableException once and left it no metadata; the next refresh
+   * took the path of a table not created yet and returned none (Iceberg's other metastore
+   * operations do the same). An update on the handle then read a null base: a properties update
+   * failed with a NullPointerException, and a commit with no base would have created the table
+   * again. The fault fuzzer found it at phase 3, where an expiry's file cleanup, which the fork
+   * lets fail after the expiry commits, swallowed the first NoSuchTableException. A handle that
+   * has loaded its table now reports the drop on every refresh.
+   */
+  @Nested
+  class HandleToADroppedTable {
+    @ParameterizedTest
+    @EnumSource(LocalCatalogMode.class)
+    void keepsReportingTheDrop(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = mode.catalog(io, "mem:///warehouse", "c", Map.of());
+      catalog.createNamespace(Namespace.of("ns"));
+      TableIdentifier id = TableIdentifier.of("ns", "t");
+      catalog.createTable(id, new Schema(Types.NestedField.required(1, "id", Types.IntegerType.get())));
+      Table handle = mode.catalog(io, "mem:///warehouse", "c", Map.of()).loadTable(id);
+      catalog.dropTable(id, false);
+
+      assertThatThrownBy(handle::refresh).isInstanceOf(NoSuchTableException.class);
+      assertThatThrownBy(() -> handle.updateProperties().set("k", "v").commit())
+          .isInstanceOf(NoSuchTableException.class);
+      assertThatThrownBy(() -> handle.newTransaction().updateProperties().set("k", "v").commit())
+          .isInstanceOf(NoSuchTableException.class);
+      assertThat(catalog.tableExists(id)).isFalse();
+    }
+  }
 }
