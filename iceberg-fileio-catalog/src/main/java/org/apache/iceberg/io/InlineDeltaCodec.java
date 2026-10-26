@@ -396,7 +396,7 @@ public class InlineDeltaCodec {
   }
 
   /** {@code manifest} as the wire holds it, its path suffix resolved with {@code prefix}. */
-  private static ManifestFile resolve(ManifestFile manifest, String prefix) {
+  static ManifestFile resolve(ManifestFile manifest, String prefix) {
     String fullPath = manifest.path();
     if (!prefix.isEmpty() && !fullPath.startsWith(prefix)) {
       fullPath = prefix + fullPath;

@@ -545,9 +545,18 @@ stages a snapshot on a branch that has moved, puts a snapshot with no
 parent on a branch that has a head (a replace transaction's snapshot starts
 a fresh history, and its delta, which carries refs' final values and no ref
 removal, reads like the first append of an empty table: Bug 73), or lands
-on v3 from an earlier base. These are what the finalization needs; whether a merge is
-correct is the encoding's to judge, and it must make each of them stable
-where it admits.
+on v3 from an earlier base. Nor where the list of its snapshot where it
+lands (its new parent's inline list, or its own on a table whose sequence
+numbers or row ids moved) is not the list Iceberg's retry would commit:
+its producer is not blind, and the list keeps a delete manifest with files
+older than its oldest data (its data manifests' and the table's last
+sequence number): `MergingSnapshotProducer` drops the delete files older
+than every data file it keeps from each delete manifest it reads, every
+one once it removes a data file, which can drop files the delta does not
+(Bug 75). These
+are what the finalization needs; whether a merge is correct is the
+encoding's to judge, and it must make each of them stable where it
+admits.
 
 ## Configuration
 

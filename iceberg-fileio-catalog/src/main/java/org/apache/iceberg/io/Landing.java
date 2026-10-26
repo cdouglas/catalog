@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.io;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -25,6 +26,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import org.apache.iceberg.ManifestContent;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.SnapshotRef;
 import org.apache.iceberg.SnapshotSummary;
@@ -62,8 +64,10 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
  * </ul>
  *
  * The table's version becomes the landing version + 1 ({@link ProtoCodec}). {@link #unmergeable}
- * says when a delta cannot be finalized on a changed table; a conflict encoding admits a stale
- * record only where it can.
+ * says when a delta cannot be finalized on a changed table: among others, where the retry would
+ * change its snapshot's manifest list beyond what the delta says, by dropping delete files (a
+ * merging producer drops those older than every data file it keeps). A conflict encoding admits
+ * a stale record only where it can be finalized.
  */
 final class Landing {
 
@@ -201,7 +205,8 @@ final class Landing {
     if (!adds.isEmpty() && table.formatVersion() >= 3 && delta.baseNextRowId == null) {
       return "its base had no row lineage";
     }
-    Set<String> pool = builder.manifestPool(tableId).keySet();
+    Map<String, ManifestFile> pool = builder.manifestPool(tableId);
+    String prefix = Objects.requireNonNullElse(builder.manifestListPrefix(tableId), "");
     for (DeltaUpdate update : delta.updates) {
       if (update instanceof InlineDeltaCodec.AddSchemaUpdate
           || update instanceof InlineDeltaCodec.AddPartitionSpecUpdate
@@ -231,11 +236,13 @@ final class Landing {
           return "it sets a ref to a snapshot the table no longer has";
         }
       } else if (update instanceof AddManifestUpdate) {
-        ManifestFile manifest = ((AddManifestUpdate) update).manifest;
+        ManifestFile manifest =
+            landing.manifest(InlineDeltaCodec.resolve(((AddManifestUpdate) update).manifest, prefix));
         if (table.spec(manifest.partitionSpecId()) == null) {
           return "a manifest's partition spec is gone";
         }
-        if (adds.containsKey(manifest.snapshotId()) && pool.contains(manifest.path())) {
+        ManifestFile held = pool.get(manifest.path());
+        if (held != null && adds.containsKey(manifest.snapshotId())) {
           return "a manifest it wrote is in the table already";
         }
       }
@@ -274,10 +281,7 @@ final class Landing {
         // its whole list
         return "its parent has no inline manifest list";
       }
-      List<String> headList =
-          head.getValue() != null
-              ? builder.snapshotManifestPaths(tableId, head.getValue())
-              : List.of();
+      List<String> headList = landing.parentList(adds.get(first), builder, tableId);
       for (DeltaUpdate update : delta.updates) {
         if (update instanceof RemoveManifestUpdate
             && ((RemoveManifestUpdate) update).snapshotId == first) {
@@ -288,7 +292,100 @@ final class Landing {
         }
       }
     }
+    if (adds.size() == 1 && (moved || !landing.parents.isEmpty())) {
+      // its snapshot's list is not the one its writer committed: another parent's, or the same
+      // on a table whose sequence numbers and row ids moved
+      AddSnapshotUpdate add = adds.values().iterator().next();
+      List<ManifestFile> list = landing.list(add, delta, builder, tableId, prefix);
+      if (list == null) {
+        return "its snapshot's list names a manifest the table lacks";
+      }
+      return retryChanges(list, add, table);
+    }
     return null;
+  }
+
+  /**
+   * Why Iceberg's retry would change {@code list}, the manifest list of {@code add}'s snapshot
+   * where it lands on {@code table}, beyond what its delta says; null if it would not.
+   *
+   * <ul>
+   *   <li>A merging producer (MergingSnapshotProducer) drops the delete files whose data sequence
+   *       numbers are older than every data file its list keeps, and than the table's last
+   *       sequence number: they can apply to no row. It reads the delete manifests that may hold
+   *       files it removes, which, as it removes any data file, is every one (a deletion vector of
+   *       the file may be in any). So where the oldest data, or the table's last sequence number,
+   *       moved past a delete manifest's oldest file, its retry may drop files the delta does not.
+   *       A blind producer (a fast or merge append) removes nothing, so drops nothing.
+   * </ul>
+   */
+  private static String retryChanges(
+      List<ManifestFile> list, AddSnapshotUpdate add, TableMetadata table) {
+    if (add.footprint != null && add.footprint.kind == Footprint.Kind.BLIND) {
+      return null;
+    }
+    // MergingSnapshotProducer.apply: the oldest data sequence number, of the data manifests it
+    // keeps (a new data file's is the commit's, or one it keeps from an older snapshot)
+    long oldestData = table.lastSequenceNumber();
+    for (ManifestFile manifest : list) {
+      if (manifest.content() == ManifestContent.DATA && manifest.minSequenceNumber() >= 0) {
+        oldestData = Math.min(oldestData, manifest.minSequenceNumber());
+      }
+    }
+    for (ManifestFile manifest : list) {
+      if (manifest.content() == ManifestContent.DELETES
+          && (manifest.hasAddedFiles() || manifest.hasExistingFiles())
+          && manifest.minSequenceNumber() > 0
+          && manifest.minSequenceNumber() < oldestData) {
+        return "its retry would drop delete files older than every data file it keeps";
+      }
+    }
+    return null;
+  }
+
+  /**
+   * The paths of the list that {@code add}'s snapshot starts from: its parent's inline list where
+   * it lands (empty if it has none).
+   */
+  private List<String> parentList(
+      AddSnapshotUpdate add, CatalogState.Builder builder, int tableId) {
+    Long parent = parent(add);
+    return parent != null ? builder.snapshotManifestPaths(tableId, parent) : List.of();
+  }
+
+  /**
+   * {@code add}'s snapshot's manifest list where it lands, as replay builds it ({@code
+   * InlineDeltaCodec.NewSnapshotManifests}): its parent's inline list there, less the manifests
+   * the delta removes from it, with those it adds, finalized; in no order. Null if the parent's
+   * list names a manifest the table's pool lacks.
+   */
+  private List<ManifestFile> list(
+      AddSnapshotUpdate add,
+      DecodedDelta delta,
+      CatalogState.Builder builder,
+      int tableId,
+      String prefix) {
+    Map<String, ManifestFile> pool = builder.manifestPool(tableId);
+    List<String> paths = new ArrayList<>(parentList(add, builder, tableId));
+    List<ManifestFile> list = new ArrayList<>();
+    for (DeltaUpdate update : delta.updates) {
+      if (update instanceof RemoveManifestUpdate
+          && ((RemoveManifestUpdate) update).snapshotId == add.snapshotId) {
+        String suffix = ((RemoveManifestUpdate) update).manifestPathSuffix;
+        paths.removeIf(path -> path.endsWith(suffix));
+      } else if (update instanceof AddManifestUpdate
+          && ((AddManifestUpdate) update).snapshotId == add.snapshotId) {
+        list.add(manifest(InlineDeltaCodec.resolve(((AddManifestUpdate) update).manifest, prefix)));
+      }
+    }
+    for (String path : paths) {
+      ManifestFile manifest = pool.get(path);
+      if (manifest == null) {
+        return null;
+      }
+      list.add(manifest);
+    }
+    return list;
   }
 
   /** Whether the table's version moved since the delta's base. */

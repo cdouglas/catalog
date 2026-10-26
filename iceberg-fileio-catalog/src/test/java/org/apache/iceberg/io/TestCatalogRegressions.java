@@ -4750,6 +4750,29 @@ public class TestCatalogRegressions {
   }
 
   /**
+   * Bug 75: a merged record kept delete files that Iceberg's retry drops. A merging producer
+   * (MergingSnapshotProducer: a delete, an overwrite, a row delta, a rewrite) drops the delete
+   * files older than every data file it keeps, which can apply to no row, from the delete manifests
+   * it reads, which, as it removes any data file, is every one. Which ones depends on the table it
+   * commits on: there, a delete of the last data file that lands after another commit added a
+   * delete file, in another partition, must drop it too. The rebase oracle found it under
+   * partition-vector. The merge now refuses a snapshot whose list keeps a delete manifest older
+   * than its oldest data (Landing).
+   */
+  @Nested
+  class DeleteFilesARetryDrops {
+    @ParameterizedTest
+    @ValueSource(strings = {PartitionVectorEncoding.NAME, ManifestWindowEncoding.NAME})
+    void aDeleteOfTheLastDataFile(String encoding) {
+      TestRebaseProperties.verify(encoding, 2, true, LocalCatalogMode.APPEND_ML,
+          List.of(cmd(TableScript.Kind.FAST_APPEND, 0, 0, 2)),
+          List.of(cmd(TableScript.Kind.EQUALITY_DELETE, 9, 5, 3),
+              cmd(TableScript.Kind.BRANCH_APPEND, 4, 0, 5)),
+          cmd(TableScript.Kind.DELETE_PARTITION, 10, 11, 10));
+    }
+  }
+
+  /**
    * Bug 77: the fault-free rebase oracle read a table with two deletion vectors for one data file.
    * A fuzzer's bug, not the catalog's: TableScript's merge row delta took its data file from a
    * scan, which drops column bounds unless it includes column stats, so it read the file's

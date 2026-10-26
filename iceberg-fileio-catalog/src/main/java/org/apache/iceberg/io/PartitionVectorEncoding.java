@@ -44,8 +44,9 @@ import org.apache.iceberg.ManifestFile;
  * retry would, never more.
  *
  * <p>A validated record also reads blind-append's guards (its branch not reset, no snapshots
- * removed, its specs and the table unchanged, and in v3 no delete files added in its partitions),
- * and the schema, which its retry binds its filters to. The manifests it removes must be in its
+ * removed, its specs and the table unchanged, and in v3 no delete files added in the partitions it
+ * adds data files in, or removes them from: Iceberg's retry drops the deletion vectors of the
+ * files it removes), and the schema, which its retry binds its filters to. The manifests it removes must be in its
  * branch's head ({@link Landing#unmergeable}): another commit that removed or rewrote one changed
  * what it removes. Any other record is judged as blind-append judges it.
  */
@@ -78,7 +79,8 @@ final class PartitionVectorEncoding extends BlindAppendEncoding {
     }
     if (landing.metadata().formatVersion() >= 3) {
       for (ManifestFile manifest : change.written) {
-        if (manifest.content() == ManifestContent.DATA && manifest.hasAddedFiles()) {
+        if (manifest.content() == ManifestContent.DATA
+            && (manifest.hasAddedFiles() || manifest.hasDeletedFiles())) {
           witness.partition(
               ConcernStamps.Partition.DELETES_ADDED, PartitionKey.bucket(manifest, buckets()));
         }

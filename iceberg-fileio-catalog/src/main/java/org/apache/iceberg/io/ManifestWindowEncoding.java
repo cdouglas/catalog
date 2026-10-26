@@ -48,7 +48,8 @@ import org.apache.iceberg.types.Type;
  * <p>It keeps no partition stamps: the window is the table's own state. It reads, beyond the
  * window, the guards that make it stable (S2): its branch not reset (so its parent stays an
  * ancestor of the head), no snapshots removed (so the window's snapshots and manifest lists stay),
- * the specs and the table unchanged, and for a validated record the schema; a blind record that
+ * the specs and the table unchanged, and for a validated record the schema; in v3, no delete
+ * files added in the partitions of the data files it adds or removes; a blind record that
  * merged manifests reads its branch's drops, as blind-append does. A window it cannot see (a
  * snapshot without an inline list, or longer than {@link #MAX_WINDOW}) conflicts. Every commit's
  * files count, whatever its operation, as in partition-vector. Any other record is judged as
@@ -88,7 +89,8 @@ final class ManifestWindowEncoding extends ConcernVectorEncoding {
     }
     List<ManifestFile> written = new ArrayList<>();
     for (ManifestFile manifest : change.written) {
-      if (manifest.content() == ManifestContent.DATA && manifest.hasAddedFiles()) {
+      if (manifest.content() == ManifestContent.DATA
+          && (manifest.hasAddedFiles() || manifest.hasDeletedFiles())) {
         written.add(manifest);
       }
     }
@@ -101,7 +103,11 @@ final class ManifestWindowEncoding extends ConcernVectorEncoding {
     private final String branch;
     private final Long parent;
     private final List<Footprint.Check> checks;
-    /** The data manifests the record adds files in, which, in v3, deletes since must not touch. */
+    /**
+     * The data manifests the record adds or removes files in, which, in v3, delete files added
+     * since must not touch: one may apply to a file it adds, and Iceberg's retry drops the
+     * deletion vectors of the files it removes.
+     */
     private final List<ManifestFile> written;
 
     ChecksSince(String branch, Long parent, List<Footprint.Check> checks,
@@ -181,7 +187,7 @@ final class ManifestWindowEncoding extends ConcernVectorEncoding {
       return true;
     }
 
-    /** Whether {@code manifest} adds delete files that may apply to the record's new files. */
+    /** Whether {@code manifest} adds delete files that may apply to files the record writes. */
     private boolean touchesWritten(ManifestFile manifest, TableMetadata table) {
       if (manifest.content() != ManifestContent.DELETES || !manifest.hasAddedFiles()) {
         return false;

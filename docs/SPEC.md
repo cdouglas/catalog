@@ -524,7 +524,10 @@ wrote, by content, counts and partition summaries (a filter through
 Iceberg's `ManifestEvaluator`); a window it cannot see (a snapshot without
 an inline list, or longer than 1000 snapshots) conflicts. A validated
 record's removed manifests must be in its branch's head where it lands
-(`Landing.unmergeable`).
+(`Landing.unmergeable`). In v3 both also read the delete files added since
+in the partitions of the data files a validated record removes (Iceberg's
+retry drops the deletion vectors of the files it removes), as blind-append
+reads those in the partitions a record adds files to.
 
 ## Commits
 
