@@ -1,8 +1,14 @@
 # Calibration of conflict-encoding phases 2 and 3 (lamport-minus-properties, concern-vector,
 # blind-append, the merge), anchored in the code as of phase 4 (blind-append's guards are also
 # partition-vector's and manifest-window's): each mutant must fail an oracle.
-MUTANTS="basever resetadvance noremoval noshift norest blindall noreparent nototals retention
-  blindnoreset blindnoremoval"
+MUTANTS="basever resetadvance noremoval noshift norest blindall noreparent nototals blindnoreset
+  blindnoremoval"
+# Equivalent, so no oracle can catch it: retention. The merge rewrites a branch's retention only
+# for a record whose retention differs from the table's where it lands, and TableChange takes such
+# a ref change for a reset, which Iceberg commits once, so neither an encoding nor the merge's
+# probe admits it there. A probe of every rebase property (300 tries each, 2026-10-26) saw the
+# merge rewrite no retention. (p3-calib's catch of it was the fuzzer's Bug 77 under lamport.)
+EQUIVALENT="retention"
 ORACLES=TestRebaseProperties,TestLamportMinusPropertiesEncoding,TestConcernVectorEncoding,TestBlindAppendEncoding,TestMultiWriterProperties
 
 prepare() {

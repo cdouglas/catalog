@@ -70,8 +70,9 @@ import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
  * AdmitDeltasEncoding}), and R is an append that validates nothing, whose retry commits on any
  * table; {@link #aMergedAppendAfterAnUpgradeIsWhatItsRetryWouldCommit} does so on tables upgraded
  * to v3. The other properties aim at what each encoding reads: blind-append's appends, the
- * validated commits partition-vector and manifest-window judge by their checks, and the guards all
- * of them read whatever a record checks.
+ * validated commits partition-vector and manifest-window judge by their checks (also racing the
+ * removal of the files they read, and delete files their retries drop), and the guards all of
+ * them read whatever a record checks.
  *
  * <p>Each was calibrated against mutants of what it guards (fuzz/mutants).
  */
@@ -121,7 +122,7 @@ class TestRebaseProperties {
       @ForAll boolean partitioned,
       @ForAll("inlineManifestModes") LocalCatalogMode mode,
       @ForAll("upgrades") List<TableScript.Cmd> prefix,
-      @ForAll("appendWindows") List<TableScript.Cmd> window,
+      @ForAll("upgradeWindows") List<TableScript.Cmd> window,
       @ForAll("appends") TableScript.Cmd r) {
     check(AdmitDeltasEncoding.register(), 2, partitioned, mode, true, prefix, window, r);
   }
@@ -192,6 +193,24 @@ class TestRebaseProperties {
       @ForAll("expiredHistories") List<TableScript.Cmd> window,
       @ForAll("validatingFromTheHead") TableScript.Cmd r) {
     check(encoding, formatVersion, true, mode, true, prefix, window, r);
+  }
+
+  /**
+   * What a validated commit's checks read of the files commits since removed, and what its retry
+   * drops: data in one partition; then commits that remove its files (an overwrite, a delete) or
+   * add delete files in another partition and move the table on race a commit on that partition
+   * that validates its files exist (a row delta, a rewrite) or removes them all (the partition's
+   * delete, overwrite or replacement). A merging retry drops the delete files older than every data
+   * file it keeps.
+   */
+  @Property(tries = 300)
+  void aValidatedCommitRacingRemovalsIsWhatItsRetryWouldCommit(
+      @ForAll("validatedEncodings") String encoding,
+      @ForAll @IntRange(min = 2, max = 3) int formatVersion,
+      @ForAll("inlineManifestModes") LocalCatalogMode mode,
+      @ForAll("removals") List<List<TableScript.Cmd>> sample) {
+    check(encoding, formatVersion, true, mode, true, sample.get(0), sample.get(1),
+        sample.get(2).get(0));
   }
 
   private static void check(
@@ -411,6 +430,72 @@ class TestRebaseProperties {
       return all;
     });
   }
+
+  /**
+   * Windows of a table upgraded to v3: appends, rollbacks (perhaps to a snapshot from before the
+   * upgrade, whose manifests have no row ids), and any single command.
+   */
+  @Provide
+  Arbitrary<List<TableScript.Cmd>> upgradeWindows() {
+    return Arbitraries.frequencyOf(
+            Tuple.of(2, TableScript.commands(APPEND_LIKE::contains)),
+            Tuple.of(1, TableScript.commands(kind -> kind == TableScript.Kind.ROLLBACK)),
+            Tuple.of(1, TableScript.windowCommands(TestRebaseProperties::single)))
+        .withoutEdgeCases()
+        .list().ofMinSize(1).ofMaxSize(3);
+  }
+
+  /**
+   * Samples of {@link #aValidatedCommitRacingRemovalsIsWhatItsRetryWouldCommit}, as prefix, window
+   * and R: appends to partition p; a window of removals of p's files, delete files in another
+   * partition q, and appends to q (to main or a branch); R on p.
+   */
+  @Provide
+  Arbitrary<List<List<TableScript.Cmd>>> removals() {
+    Arbitrary<Integer> small = Arbitraries.integers().between(0, 11);
+    Arbitrary<Integer> partitions = Arbitraries.integers().between(0, 3);
+    return Combinators.combine(partitions, Arbitraries.integers().between(1, 3), small.list()
+                .ofMinSize(1).ofMaxSize(3), small.list().ofMinSize(1).ofMaxSize(3), small, small,
+            Arbitraries.of(REMOVAL_R))
+        .as((p, offset, appends, window, b, j, kind) -> {
+          int q = (p + offset) % 4;
+          List<TableScript.Cmd> prefix = new ArrayList<>();
+          for (int a : appends) {
+            prefix.add(new TableScript.Cmd(
+                a % 2 == 0 ? TableScript.Kind.FAST_APPEND : TableScript.Kind.MERGE_APPEND, a, b,
+                p + 4 * (a % 3)));
+          }
+          List<TableScript.Cmd> racing = new ArrayList<>();
+          for (int w : window) {
+            switch (w % 6) {
+              case 0:
+                racing.add(new TableScript.Cmd(TableScript.Kind.DELETE_PARTITION, w, b, p));
+                break;
+              case 1:
+                racing.add(new TableScript.Cmd(TableScript.Kind.OVERWRITE, w, b, q));
+                break;
+              case 2:
+              case 3:
+                racing.add(new TableScript.Cmd(TableScript.Kind.EQUALITY_DELETE, w, b, q));
+                break;
+              case 4:
+                racing.add(new TableScript.Cmd(TableScript.Kind.FAST_APPEND, w, b, q));
+                break;
+              default:
+                racing.add(new TableScript.Cmd(TableScript.Kind.BRANCH_APPEND, w, b, q));
+            }
+          }
+          TableScript.Cmd r = new TableScript.Cmd(kind, j, b, p + 4 * (j % 3));
+          return List.of(prefix, racing, List.of(r));
+        })
+        .withoutEdgeCases();
+  }
+
+  /** Commits on one partition that validate its files exist, or remove them all. */
+  private static final List<TableScript.Kind> REMOVAL_R =
+      List.of(TableScript.Kind.MERGE_ROW_DELTA, TableScript.Kind.REWRITE_FILES,
+          TableScript.Kind.DELETE_PARTITION, TableScript.Kind.OVERWRITE_PARTITION,
+          TableScript.Kind.REPLACE_PARTITIONS);
 
   /** Appends to main, then a branch fast-forwarded to main's head. */
   @Provide
