@@ -261,6 +261,11 @@ final class Landing {
     for (Map.Entry<Long, Long> head : landing.parents.entrySet()) {
       long first = head.getKey();
       Long parent = adds.get(first).parentSnapshotId;
+      if (parent == null && head.getValue() != null) {
+        // a snapshot with no parent starts its branch's history afresh (a replace), or was the
+        // first of an empty table: either way not a commit on the head it would land on
+        return "it starts a fresh history on a branch that has a head";
+      }
       if (head.getValue() != null && !listed.contains(head.getValue())) {
         return "the head of its branch has no inline manifest list";
       }

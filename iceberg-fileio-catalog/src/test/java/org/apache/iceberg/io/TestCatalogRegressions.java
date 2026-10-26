@@ -32,6 +32,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 import org.apache.iceberg.CatalogProperties;
+import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.CatalogTransaction;
@@ -4634,6 +4635,86 @@ public class TestCatalogRegressions {
       Table after = catalog(io, LocalCatalogMode.APPEND).loadTable(mixed);
       assertThat(after.refs()).containsKey("tag");
       assertThat(after.snapshot(first)).isNotNull();
+    }
+  }
+
+  /**
+   * Bug 73: a replace transaction's record merged as an append. A replace starts its table's
+   * history afresh: its snapshot has no parent, and main moves to it. The record carries no ref
+   * removal (a delta sends refs' final values), so it reads as an append to a table that had no
+   * snapshot. Landing it on a changed table, the merge re-parented the snapshot onto main's head
+   * and built its manifest list from the head's: the replaced files stayed. The fault fuzzer
+   * found it at phase 2, before a writer pinned what Iceberg commits once (a replace removes
+   * main). Replay no longer relies on the pin: a record that moves a ref to a snapshot starting
+   * a fresh history resets the ref (TableChange), and the merge refuses to put a parentless
+   * snapshot on a branch with a head (Landing).
+   */
+  @Nested
+  class ReplaceIsNotAnAppend {
+    private final TableIdentifier table = TableIdentifier.of("db", "t");
+    private final long first = 0x1111111111111111L;
+    private final long replacement = 0x5555555555555555L;
+
+    private ManifestFile manifest(String name, long snapshotId) {
+      return new ProtoCodec.DecodedManifestFile(
+          "mem:///db/t/metadata/" + name + ".avro", 4_096L, 0, 0, 0L, 0L, snapshotId,
+          1, 0, 0, 10L, 0L, 0L, List.of(), null, null);
+    }
+
+    /** A snapshot's delta: a first snapshot of main (no parent), with its one manifest. */
+    private byte[] firstSnapshot(long snapshotId, String manifest, String operation,
+        org.apache.iceberg.TableMetadata base) {
+      Map<String, String> summary = new HashMap<>();
+      summary.put("operation", operation);
+      summary.put("added-data-files", "1");
+      summary.put("added-records", "10");
+      summary.put("total-data-files", "1");
+      summary.put("total-records", "10");
+      return InlineDeltaCodec.encodeDelta(
+          List.of(
+              new InlineDeltaCodec.AddSnapshotUpdate(
+                  snapshotId, "", summary, 0L, null, null, null, null, null, Footprint.BLIND),
+              new InlineDeltaCodec.SetSnapshotRefUpdate("main", snapshotId, "branch", 0, 0L, 0L),
+              new InlineDeltaCodec.AddManifestUpdate(snapshotId, manifest(manifest, snapshotId),
+                  "", 0)),
+          base.lastUpdatedMillis() + 1_000L,
+          base);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"lamport-minus-properties", "concern-vector", "blind-append",
+        "partition-vector", "manifest-window"})
+    void aStaleReplaceConflicts(String encoding) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      CatalogLog log = CatalogTestSupport.log(io, "mem:///catalog");
+      log.bootstrap(encoding);
+      CatalogMutation create = new CatalogMutation(log.read());
+      create.createNamespace(Namespace.of("db"));
+      create.createTableInline(table, CatalogTestSupport.newInlineTable("mem:///db/t"),
+          CatalogTestSupport.inlineTableCodec());
+      create.commit(log);
+      Replica<CatalogState> empty = log.read();
+      CatalogMutation append = new CatalogMutation(empty);
+      append.updateTableInlineDelta(table, firstSnapshot(first, "f2", "append",
+          CatalogTestSupport.inlineMetadata(empty.state(), table)));
+      append.commit(log);
+
+      // a replace staged on main at the first snapshot, unpinned
+      Replica<CatalogState> read = log.read();
+      CatalogMutation replace = new CatalogMutation(read);
+      replace.updateTableInlineDelta(table, firstSnapshot(replacement, "f5", "overwrite",
+          CatalogTestSupport.inlineMetadata(read.state(), table)));
+      // another writer's property change lands first
+      CatalogMutation property = new CatalogMutation(log.read());
+      property.updateTableInlineDelta(table, CatalogTestSupport.propertyDelta("k", "v",
+          CatalogTestSupport.inlineMetadata(read.state(), table).lastUpdatedMillis() + 2_000L));
+      property.commit(log);
+
+      assertThatThrownBy(() -> replace.commit(log)).isInstanceOf(CommitFailedException.class);
+      CatalogState state = log.read().state();
+      org.apache.iceberg.TableMetadata after = CatalogTestSupport.inlineMetadata(state, table);
+      assertThat(after.currentSnapshot().snapshotId()).isEqualTo(first);
+      assertThat(after.properties()).containsEntry("k", "v");
     }
   }
 }

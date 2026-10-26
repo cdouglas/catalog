@@ -541,8 +541,11 @@ snapshot whose id or a manifest whose path is in the table already, has a
 snapshot whose manifest list is a file and moves, advances a branch that
 is gone or is a tag, re-parents a snapshot whose parent or new parent has
 no inline list or which removes a manifest the new parent does not list,
-stages a snapshot on a branch that has moved, or lands on v3 from an
-earlier base. These are what the finalization needs; whether a merge is
+stages a snapshot on a branch that has moved, puts a snapshot with no
+parent on a branch that has a head (a replace transaction's snapshot starts
+a fresh history, and its delta, which carries refs' final values and no ref
+removal, reads like the first append of an empty table: Bug 73), or lands
+on v3 from an earlier base. These are what the finalization needs; whether a merge is
 correct is the encoding's to judge, and it must make each of them stable
 where it admits.
 

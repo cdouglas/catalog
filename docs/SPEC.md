@@ -492,7 +492,8 @@ change through `manageSnapshots`. Its writer pins such an update
 (`TableMetadata.changes()`, a table transaction's all together:
 `LogCatalog.commitsOnce`), and `TableChange` derives the same from the delta
 (a ref moved to a snapshot the record does not add, or given new
-retention).
+retention, or a ref the table has moved to a new snapshot that starts a
+fresh history: a replace).
 Under `concern-vector` a data commit (one that adds snapshots) reads the
 table, schema, specs and removal, and each branch it advances (main, for a
 snapshot it stages); a property change reads properties, a location change

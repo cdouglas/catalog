@@ -159,6 +159,10 @@ final class TableChange {
     }
     Set<Long> dropping = new HashSet<>();
     List<ManifestFile> written = new ArrayList<>();
+    Map<Long, Long> parents = new java.util.HashMap<>();
+    for (AddSnapshotUpdate add : action.addedSnapshots()) {
+      parents.put(add.snapshotId, add.parentSnapshotId);
+    }
     for (DeltaUpdate update : action.delta().updates) {
       boolean snapshotsOnly = update instanceof AddSnapshotUpdate
           || update instanceof SetSnapshotRefUpdate
@@ -204,13 +208,17 @@ final class TableChange {
       } else if (update instanceof SetSnapshotRefUpdate) {
         SetSnapshotRefUpdate ref = (SetSnapshotRefUpdate) update;
         SnapshotRef current = table != null ? table.ref(ref.refName) : null;
+        // a ref the table has, moved to a new snapshot that starts a fresh history (a replace
+        // transaction's main), is reset: the delta carries no ref removal (Bug 73)
+        boolean fresh = current != null && startsAfresh(ref.snapshotId, added, parents);
         if (added.contains(ref.snapshotId)
             && "branch".equals(ref.refType)
+            && !fresh
             && (current == null || (current.isBranch() && sameRetention(current, ref)))) {
           advanced.add(ref.refName);
           onRefs.add(ref.snapshotId);
           heads.put(ref.refName, ref.snapshotId);
-        } else if (current != null && current.snapshotId() == ref.snapshotId
+        } else if (!fresh && current != null && current.snapshotId() == ref.snapshotId
             && current.isBranch() == "branch".equals(ref.refType)) {
           retained.add(ref.refName);
           commitOnce = true;
@@ -222,10 +230,6 @@ final class TableChange {
     }
     // A snapshot on a chain to an advanced ref is not staged.
     boolean stages = false;
-    Map<Long, Long> parents = new java.util.HashMap<>();
-    for (AddSnapshotUpdate add : action.addedSnapshots()) {
-      parents.put(add.snapshotId, add.parentSnapshotId);
-    }
     Set<Long> chained = new HashSet<>();
     for (Long head : onRefs) {
       for (Long s = head; s != null && added.contains(s) && chained.add(s); s = parents.get(s)) {
@@ -287,6 +291,16 @@ final class TableChange {
     } catch (java.io.IOException e) {
       throw new java.io.UncheckedIOException(e);
     }
+  }
+
+  /** Whether {@code snapshotId} is a new snapshot whose chain of new parents ends in none. */
+  private static boolean startsAfresh(long snapshotId, Set<Long> added, Map<Long, Long> parents) {
+    Set<Long> seen = new HashSet<>();
+    Long at = snapshotId;
+    while (at != null && added.contains(at) && seen.add(at)) {
+      at = parents.get(at);
+    }
+    return at == null;
   }
 
   private static boolean sameRetention(SnapshotRef current, SetSnapshotRefUpdate update) {
