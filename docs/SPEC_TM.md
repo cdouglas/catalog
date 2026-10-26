@@ -543,7 +543,10 @@ snapshot whose id or a manifest whose path is in the table already, has a
 snapshot whose manifest list is a file and moves, advances a branch that
 is gone or is a tag, re-parents a snapshot whose parent or new parent has
 no inline list or which removes a manifest the new parent does not list,
-stages a snapshot on a branch that has moved, puts a snapshot with no
+adds a snapshot whose parent has no inline list where it lands (replay
+builds its list on that one, and the delta's manifests are relative to the
+list its writer read, which an eviction since wrote to a file and dropped:
+Bug 79), stages a snapshot on a branch that has moved, puts a snapshot with no
 parent on a branch that has a head (a replace transaction's snapshot starts
 a fresh history, and its delta, which carries refs' final values and no ref
 removal, reads like the first append of an empty table: Bug 73), or lands

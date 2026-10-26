@@ -4868,4 +4868,32 @@ public class TestCatalogRegressions {
       assertThat(catalog.tableExists(id)).isFalse();
     }
   }
+
+  /**
+   * Bug 79: a merged snapshot built its manifest list on a parent's inline list that was gone. A
+   * delta's manifests are relative to its new snapshot's parent's inline list, which replay builds
+   * the snapshot's list on where it lands. An eviction (here the first v3 commit of a branch, which
+   * gave row ids to a manifest the inline lists held) writes the table's lists to files and drops
+   * them, and a return to inline storage (the location change's full metadata) does not bring them
+   * back. A staged append on main, whose parent was still main's head where it landed, merged
+   * there with only its own manifest: its snapshot lost the parent's files. The merge checked the
+   * parent's list only for a snapshot it moved onto another head. The merge's probe found it on a
+   * table upgraded to v3 (TestRebaseProperties, once the oracle compared each snapshot's files);
+   * every conflict encoding stamps every concern on an eviction, so none admitted such a record.
+   * The merge now refuses a snapshot whose parent has no inline list where it lands (Landing).
+   */
+  @Nested
+  class ParentListEvicted {
+    @ParameterizedTest
+    @EnumSource(value = LocalCatalogMode.class, names = {"APPEND_ML", "CAS_ML"})
+    void aStagedAppendAfterAnEvictionAndAReturn(LocalCatalogMode mode) {
+      TestRebaseProperties.verify(AdmitDeltasEncoding.register(), 2, false, mode,
+          List.of(cmd(TableScript.Kind.BRANCH_APPEND, 9, 1, 11),
+              cmd(TableScript.Kind.UPGRADE, 0, 0, 0),
+              cmd(TableScript.Kind.LONG_OVERWRITE, 6, 6, 3)),
+          List.of(cmd(TableScript.Kind.BRANCH_APPEND, 10, 7, 3),
+              cmd(TableScript.Kind.SET_LOCATION, 10, 9, 8)),
+          cmd(TableScript.Kind.STAGED_APPEND, 9, 10, 1));
+    }
+  }
 }

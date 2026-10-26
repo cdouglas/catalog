@@ -298,6 +298,16 @@ final class Landing {
         }
       }
     }
+    for (AddSnapshotUpdate add : adds.values()) {
+      Long parent = landing.parent(add);
+      if (add.manifestListSuffix.isEmpty() && parent != null && !adds.containsKey(parent)
+          && !listed.contains(parent)) {
+        // replay builds its list on its parent's inline list where it lands, and its delta's
+        // manifests are relative to the one its writer read: an eviction since wrote that list to
+        // a file and dropped it, which a return to inline storage does not bring back (Bug 79)
+        return "its parent has no inline manifest list where it lands";
+      }
+    }
     if (adds.size() == 1 && (moved || !landing.parents.isEmpty())) {
       // its snapshot's list is not the one its writer committed: another parent's, or the same
       // on a table whose sequence numbers and row ids moved

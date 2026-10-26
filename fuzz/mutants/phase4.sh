@@ -2,10 +2,18 @@
 # rules for Bugs 75 and 76 (anchors as of ae7ec8e, and of the Bug 76 commit for those): each
 # mutant must fail an oracle.
 MUTANTS="pvnochecks pvrange pvnoremoved pvlower mwnowindow mwskiphead mwdataonly opaqueok
-  nodropcheck nonullrowids norestate noshiftkept"
+  nodropcheck nonullrowids noparentlist"
+# Equivalent under this code's writers, so no oracle can catch them: Bug 76's rules for a record
+# that gives row ids to a manifest it kept. A commit that would change a manifest an inline list
+# holds writes a metadata file instead (LogCatalog.restatesAManifest), so a delta does so only
+# for a manifest no inline list held when its writer read the table: its parent's list was a
+# file. Where it lands, that parent still has none (noparentlist's rule refuses it), or a return
+# to inline storage listed the manifest again without row ids (nonullrowids' rule refuses it). A
+# probe of every rebase property (300 tries each, 2026-10-26) admitted no record where either
+# rule held. They guard against other writers' records.
+EQUIVALENT="norestate noshiftkept"
 ORACLES=TestRebaseProperties,TestPartitionVectorEncoding,TestManifestWindowEncoding,TestFootprints,TestMultiWriterProperties
 
-# TestRebaseProperties: anAdmitted, aMerged, aBlind, aValidated
 prepare() {
   tries $1/$T/TestRebaseProperties.java 800
   tries $1/$T/ConflictEncodingContract.java 400
@@ -53,5 +61,7 @@ mutant() { # name main-dir test-dir
     # Bug 76: the row ids a record gave the manifests it kept do not move with its own
     noshiftkept) mutate $M/Landing.java "    if (firstRowId != null && baseNextRowId != null && firstRowId >= baseNextRowId) {" "    if (firstRowId != null && baseNextRowId != null && firstRowId >= baseNextRowId
         && added.contains(manifest.snapshotId())) {" ;;
+    # Bug 79: the merge builds a snapshot's list on a parent's inline list that is gone
+    noparentlist) mutate $M/Landing.java "      if (add.manifestListSuffix.isEmpty() && parent != null && !adds.containsKey(parent)" "      if (false && parent != null && !adds.containsKey(parent)" ;;
   esac
 }
