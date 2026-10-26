@@ -209,6 +209,11 @@ public class CatalogMutation {
                 .filter(e -> e.getValue() != null) // only table creations
                 .map(e -> e.getKey().namespace())
                 .noneMatch(ns -> ns.equals(namespace))
+            // inline tables this transaction creates (Bug 74: these were missed, so the drop
+            // staged, and replay rejected the commit as a conflict)
+            && inlineTables.keySet().stream()
+                .map(TableIdentifier::namespace)
+                .noneMatch(ns -> ns.equals(namespace))
             && tableRenames.values().stream()
                 .map(TableIdentifier::namespace)
                 .noneMatch(ns -> ns.equals(namespace));

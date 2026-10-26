@@ -4717,4 +4717,30 @@ public class TestCatalogRegressions {
       assertThat(after.properties()).containsEntry("k", "v");
     }
   }
+
+  /**
+   * Bug 74: a transaction could stage a namespace drop after creating an inline table in it.
+   * dropNamespace counted the pointer tables the transaction creates, not the inline ones, so
+   * the drop staged, and replay rejected the commit: a CommitFailedException with nothing
+   * racing, where staging should have refused the drop. The multi-writer fuzzer found it once
+   * its transactions created inline tables.
+   */
+  @Nested
+  class DropNamespaceWithANewInlineTable {
+    @Test
+    void stagingRefusesTheDrop() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      CatalogLog log = CatalogTestSupport.log(io, "mem:///catalog");
+      log.bootstrap(LamportEncoding.NAME);
+      CatalogMutation create = new CatalogMutation(log.read());
+      create.createNamespace(Namespace.of("c"));
+      create.commit(log);
+
+      CatalogMutation txn = new CatalogMutation(log.read());
+      txn.createTableInline(TableIdentifier.of("c", "t"),
+          CatalogTestSupport.newInlineTable("mem:///c/t"), CatalogTestSupport.inlineTableCodec());
+      assertThatThrownBy(() -> txn.dropNamespace(Namespace.of("c")))
+          .isInstanceOf(NamespaceNotEmptyException.class);
+    }
+  }
 }
