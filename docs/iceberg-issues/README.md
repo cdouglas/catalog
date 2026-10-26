@@ -22,8 +22,9 @@ C10 and C12; C14 after C6 and C8. C15 to C22, from the review, onto
 `834441b96`: C16, C17, C19, C21 and C22 on their own, C15 after C10, C12
 and C13, and C18 and C20 after C11; C23 after C3, C9 and C15. C24, added
 2026-10-21, onto `834441b96` after C4, C11 and C20. C25, added
-2026-10-24, onto `e70a2efcd` on its own. C26, added 2026-10-25, was
-written on 1.12.0; its files are unchanged on `main` at `97659351d4`.
+2026-10-24, onto `e70a2efcd` on its own. C26 and C27, added 2026-10-25,
+were written on 1.12.0; their files are unchanged on `main` at
+`97659351d4`.
 
 | Issue | Fix | Before a PR |
 |---|---|---|
@@ -53,3 +54,4 @@ written on 1.12.0; its files are unchanged on `main` at `97659351d4`.
 | [C24. A commit that removes a data file keeps its deletion vector](C24.md) | [`7f88e98`](https://github.com/cdouglas/iceberg/commit/7f88e9888e8686da101fe88c4c1fb4e5d8dd9860) | review PR #18197: propose its first commit; its second reverses #11131; offer the retry test |
 | [C25. A rewrite with an older data sequence number drops a delete it still needs](C25.md) | [`0e0e9bb`](https://github.com/cdouglas/iceberg/commit/0e0e9bb2794fb6a7233e5c03158dd6c42320934f) | review PR #10962: propose its age-off half alone; settle with C24's eager cleanup |
 | [C26. A row delta whose conflict filter misses a file commits a second deletion vector for it](C26.md) | [`04a2388`](https://github.com/cdouglas/iceberg/commit/04a2388943f6a7186b75808519e2a4c000af6eaa) | revive PR #15966 with the partition-scoped check, which keeps #15653's pruning; cite #17206 |
+| [C27. A handle to a dropped table fails with an NPE once it has reported the drop](C27.md) | [`628063f`](https://github.com/cdouglas/iceberg/commit/628063f534100322f00dea99f6e78ac530b77ae5) | ready; cite #1513 and #1553, which this completes; run the Hive and Glue tests |

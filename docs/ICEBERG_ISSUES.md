@@ -13,7 +13,7 @@ reports or pull requests upstream. It covers the reproduction, the cause
 with links to the 1.12.0 source, the fix, its tests, and what to settle
 before a PR.
 
-Upstream fixed C1. The fork fixes C2 to C26 on branch `core-fixes`, each
+Upstream fixed C1. The fork fixes C2 to C27 on branch `core-fixes`, each
 in an upstream-style commit with its tests, so the project's tests no
 longer work around any of them.
 
@@ -57,10 +57,11 @@ record: every issue and PR (from the GitHub API), every PR's branch, and
 the issues@ and dev@ lists, which carry each issue's and PR's discussion.
 What that found is in each issue's document. C25, which the review of the
 conflict-encoding plan found on 2026-10-24, was fixed that day and
-checked against main at `e70a2efcd` and upstream's record. C26, which
-the conflict-encoding fuzz rounds found on 2026-10-25, was fixed that
-day; it reproduces on main at `97659351d4`, and had been reported
-upstream with a fix the stale bot closed. The Fork column is
+checked against main at `e70a2efcd` and upstream's record. C26 and C27,
+which the conflict-encoding fuzz rounds found on 2026-10-25, were fixed
+that day; both reproduce on main at `97659351d4`, and both had been
+reported upstream, C26 with a fix the stale bot closed, C27 with a fix,
+in 2020, that missed the metastores' drop check. The Fork column is
 `atomicio`, which sits on `core-fixes`.
 
 | Issue | Fork | 1.12.0 | main | Upstream |
@@ -91,7 +92,7 @@ upstream with a fix the stale bot closed. The Fork column is
 | C24. A commit that removes a data file keeps its deletion vector | fixed, `core-fixes` 7f88e98 | yes | yes | PR [#18197](https://github.com/apache/iceberg/pull/18197), open, whose first commit this takes (its second reverses [#11131](https://github.com/apache/iceberg/pull/11131)) |
 | C25. A rewrite with an older data sequence number drops a delete it still needs | fixed, `core-fixes` 0e0e9bb | yes | yes | [#10312](https://github.com/apache/iceberg/issues/10312), closed by the stale bot; PR [#10962](https://github.com/apache/iceberg/pull/10962), open, whose age-off half this takes (maintainers opposed the other half) |
 | C26. A row delta whose conflict filter misses a file commits a second DV for it | fixed, `core-fixes` 04a2388 | yes | yes | PR [#15966](https://github.com/apache/iceberg/pull/15966), closed by the stale bot unreviewed; [#17206](https://github.com/apache/iceberg/issues/17206), open, on the unreadable tables it leaves |
-
+| C27. A handle to a dropped table fails with an NPE once it has reported the drop | fixed, `core-fixes` 628063f | yes | yes | [#1513](https://github.com/apache/iceberg/issues/1513), closed by [#1553](https://github.com/apache/iceberg/pull/1553) (0.10.0), which missed the metastores' check of the cleared location |
 
 "Not reported" means a search of apache/iceberg's issues, pull requests
 and PR branches, and of the issues@ and dev@ lists, found nothing for the
@@ -804,6 +805,32 @@ commit added a second.
   `TestRowDelta.testConcurrentDVOutsideTheConflictDetectionFilter`.
 - **No workaround** to remove: the fuzzer's scans now include column stats.
 - **Canary:** `aConcurrentDvOutsideTheConflictFilterIsCaught`.
+
+### C27. A handle to a dropped table fails with an NPE once it has reported the drop
+
+Details: [iceberg-issues/C27.md](iceberg-issues/C27.md).
+
+After another process drops a table, a handle's refresh throws
+NoSuchTableException and clears the handle's metadata location. The
+metastores' operations (Hive, JDBC, Glue, Nessie, Dell ECS) report a
+missing table only while they have one, so the handle's next refresh
+takes the table for one not created yet and leaves it no metadata, and
+its next update fails with a NullPointerException. Views alike.
+
+- **Cause:** `BaseMetastoreTableOperations.refresh` (and
+  `BaseViewOperations.refresh`) clear the location that `doRefresh`
+  tells a drop by; #1553 (0.10.0) meant the next refresh to fail again.
+- **Found by:** `TestCatalogFaultProperties`, 2026-10-25 (fileio-catalog's
+  Bug 78): an expiry's file cleanup swallowed the first exception (C13's
+  fix lets it), and the writer's next update hit the NPE.
+- **Fork:** fixed on `core-fixes` by 628063f, "Core: Keep failing on a
+  dropped table after the first refresh says so". Its tests are
+  `TestJdbcCatalog.testHandleToADroppedTableKeepsFailing` and
+  `TestJdbcViewCatalog.testHandleToADroppedViewKeepsFailing`.
+- **No workaround** to remove: `LogCatalog`'s table operations fixed their
+  own refresh (Bug 78), and keep it, so they work on stock Iceberg.
+- **Canary:** `aHandleToADroppedTableKeepsFailingWithNoSuchTable`, on
+  table operations of its own that report a drop as Hive's and JDBC's do.
 
 ## Accepted Iceberg Behavior
 

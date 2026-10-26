@@ -56,6 +56,8 @@ import org.apache.iceberg.Transaction;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
+import org.apache.iceberg.exceptions.CommitFailedException;
+import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.inmemory.InMemoryCatalog;
@@ -67,7 +69,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
- * Canaries for the Iceberg core bugs this project's fuzzers and reviews found, C1 to C26 in
+ * Canaries for the Iceberg core bugs this project's fuzzers and reviews found, C1 to C27 in
  * docs/ICEBERG_ISSUES.md: one test each, on Iceberg's own InMemoryCatalog, that asserts the bug is
  * absent. Upstream fixed C1, and the fork's core-fixes branch fixes the others, so every test
  * passes against the fork. A test that fails means its bug is back: a rebase dropped the fork's
@@ -813,6 +815,83 @@ class TestIcebergCoreIssues {
             })
         .as(BACK, "C26")
         .doesNotThrowAnyException();
+  }
+
+  /**
+   * C27. A handle to a table another process dropped must fail every use with
+   * NoSuchTableException: its first refresh threw it, and cleared the location that metastore
+   * operations, Hive's and JDBC's among them, tell a dropped table from one not created yet by, so
+   * the next refresh left the handle no metadata, and an update failed with a
+   * NullPointerException.
+   */
+  @Test
+  void aHandleToADroppedTableKeepsFailingWithNoSuchTable() {
+    Map<String, String> metastore = new java.util.HashMap<>();
+    org.apache.iceberg.io.FileIO io = new org.apache.iceberg.inmemory.InMemoryFileIO();
+    String location = "mem:///" + UUID.randomUUID() + "/t";
+    new MetastoreOperations(metastore, io)
+        .commit(
+            null,
+            TableMetadata.newTableMetadata(
+                SCHEMA, PartitionSpec.unpartitioned(), location, Map.of()));
+    Table handle = new BaseTable(new MetastoreOperations(metastore, io), "t");
+    handle.refresh();
+    metastore.remove("t"); // dropped by another process
+
+    assertThatThrownBy(handle::refresh).isInstanceOf(NoSuchTableException.class);
+    assertThatThrownBy(handle::refresh).as(BACK, "C27").isInstanceOf(NoSuchTableException.class);
+    assertThatThrownBy(() -> handle.updateProperties().set("k", "v").commit())
+        .as(BACK, "C27")
+        .isInstanceOf(NoSuchTableException.class);
+    assertThat(metastore).as(BACK, "C27").doesNotContainKey("t");
+  }
+
+  /**
+   * A metastore's table operations, over a map of table names to metadata locations, that report a
+   * dropped table as Hive's and JDBC's do: a refresh that finds no table throws
+   * NoSuchTableException if the operations have a current metadata location, and otherwise takes
+   * the table for one not created yet.
+   */
+  private static class MetastoreOperations extends org.apache.iceberg.BaseMetastoreTableOperations {
+    private final Map<String, String> metastore;
+    private final org.apache.iceberg.io.FileIO io;
+
+    MetastoreOperations(Map<String, String> metastore, org.apache.iceberg.io.FileIO io) {
+      this.metastore = metastore;
+      this.io = io;
+    }
+
+    @Override
+    protected String tableName() {
+      return "t";
+    }
+
+    @Override
+    public org.apache.iceberg.io.FileIO io() {
+      return io;
+    }
+
+    @Override
+    protected void doRefresh() {
+      String location = metastore.get("t");
+      if (location == null) {
+        if (currentMetadataLocation() != null) {
+          throw new NoSuchTableException("Table t was dropped");
+        }
+        disableRefresh();
+        return;
+      }
+      refreshFromMetadataLocation(location);
+    }
+
+    @Override
+    protected void doCommit(TableMetadata base, TableMetadata metadata) {
+      String expected = base == null ? null : base.metadataFileLocation();
+      if (!java.util.Objects.equals(metastore.get("t"), expected)) {
+        throw new CommitFailedException("Table t changed");
+      }
+      metastore.put("t", writeNewMetadataIfRequired(base == null, metadata));
+    }
   }
 
   /** Applies updates computed on {@code base}, as a REST server applies a client's commit. */
