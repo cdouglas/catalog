@@ -134,10 +134,17 @@ final class TableViews {
    * What {@code table} holds, by item, whatever its manifests' layout: its metadata, every snapshot
    * (sequence number, parent, operation, schema, summary without manifest counts) with the files it
    * added and removed, every ref with its live data files and their deletes (with partitions,
-   * sequence numbers and record counts), and the snapshot log. Row ids appear only as an
-   * invariant: the live files of each ref have disjoint row-id ranges below the next row id.
+   * sequence numbers and record counts), the snapshot log, and its row ids.
+   *
+   * <p>A commit's row ids depend on its layout: a manifest it writes takes ids for every row it
+   * holds, kept ones too (a merged manifest's), so a retry that merges otherwise gives its new rows
+   * others. The table's first {@code earlier} snapshots are the ones before the commit compared:
+   * the ids of their files, and their first row ids, are exact. A later snapshot's files show the
+   * ids an earlier one gave them; an id it gives must be fresh, at or above {@code
+   * nextRowIdBefore}, the table's next row id before it. Across all snapshots each file has one id
+   * once it has one, and the files' ranges are disjoint below the next row id.
    */
-  static Map<String, String> logical(Table table) {
+  static Map<String, String> logical(Table table, int earlier, long nextRowIdBefore) {
     TableMetadata metadata = ((HasTableOperations) table).operations().current();
     Map<String, String> items = new TreeMap<>();
     List<Snapshot> snapshots = metadata.snapshots();
@@ -163,18 +170,20 @@ final class TableViews {
             "#" + position.get(Long.parseLong(summary.get("source-snapshot-id"))));
       }
       items.put(String.format("snapshot %02d", i), String.format(
-          "seq=%d parent=%s op=%s schema=%s summary=%s",
+          "seq=%d parent=%s op=%s schema=%s%s summary=%s",
           s.sequenceNumber(), s.parentId() == null ? null : "#" + position.get(s.parentId()),
-          s.operation(), s.schemaId(), summary));
+          s.operation(), s.schemaId(),
+          i < earlier ? " first-row-id=" + s.firstRowId() + " added-rows=" + s.addedRows() : "",
+          summary));
       items.put(String.format("snapshot %02d changes", i), changes(table, s));
     }
+    rowIds(table, metadata, earlier, nextRowIdBefore, items);
     for (Map.Entry<String, SnapshotRef> r : metadata.refs().entrySet()) {
       SnapshotRef ref = r.getValue();
       items.put("ref " + r.getKey(), String.format("#%s %s %s/%s/%s",
           position.get(ref.snapshotId()), ref.isBranch() ? "branch" : "tag",
           ref.minSnapshotsToKeep(), ref.maxSnapshotAgeMs(), ref.maxRefAgeMs()));
       items.put("ref " + r.getKey() + " files", liveFiles(table, r.getKey()));
-      items.put("ref " + r.getKey() + " row ids", rowIds(table, r.getKey(), metadata));
     }
     items.put("snapshot log", metadata.snapshotLog().stream()
         .map(e -> "#" + position.get(e.snapshotId()))
@@ -222,43 +231,83 @@ final class TableViews {
   }
 
   /**
-   * Whether the live data files of {@code ref} that have row ids have disjoint row-id ranges below
-   * the table's next row id: "ok" with the number of files without row ids (those a v3 commit has
-   * not given ids yet, after an upgrade), or the first violation by path. Tables before v3 have
-   * no row ids.
+   * Puts in {@code items} the row ids of each snapshot's live data files, by path ({@link
+   * #logical}): exact for the first {@code earlier} snapshots; for a later one, the id its parent
+   * gave a file, else "fresh" if at or above {@code nextRowIdBefore} ("stale" and the id if not,
+   * null if none). And whether each snapshot keeps the ids its parent gave its files, and the
+   * ranges of the ids given are disjoint below the next row id: "ok", or the first violation by
+   * path. A file written before the table's upgrade to v3 takes ids in the first v3 commit of each
+   * branch that keeps it, so on two branches it can have two. Tables before v3 have no row ids.
    */
-  private static String rowIds(Table table, String ref, TableMetadata metadata) {
+  private static void rowIds(Table table, TableMetadata metadata, int earlier,
+      long nextRowIdBefore, Map<String, String> items) {
     if (metadata.formatVersion() < 3) {
-      return "none";
+      items.put("row ids", "none");
+      return;
     }
+    Map<Long, Map<String, Long>> given = new HashMap<>(); // each snapshot's files' ids, by path
+    Map<String, org.apache.iceberg.DataFile> assigned = new TreeMap<>(); // by path and id
+    String violation = null;
+    List<Snapshot> snapshots = metadata.snapshots();
+    for (int i = 0; i < snapshots.size(); i++) {
+      Snapshot snapshot = snapshots.get(i);
+      Map<String, Long> parent =
+          snapshot.parentId() != null ? given.get(snapshot.parentId()) : null;
+      Map<String, Long> mine = new HashMap<>();
+      List<String> ids = new ArrayList<>();
+      for (org.apache.iceberg.DataFile file : liveDataFiles(table, snapshot)) {
+        String path = file.location();
+        Long first = file.firstRowId();
+        Long was = parent != null ? parent.get(path) : null;
+        mine.put(path, first);
+        if (i < earlier || first == null) {
+          ids.add(path + "=" + first);
+        } else if (was != null) {
+          ids.add(path + "=" + (first.equals(was) ? first : first + " (was " + was + ")"));
+        } else {
+          ids.add(path + (first >= nextRowIdBefore ? "=fresh" : "=stale " + first));
+        }
+        if (was != null && !was.equals(first) && violation == null) {
+          violation = "a snapshot changed the row ids its parent gave: " + path;
+        }
+        if (first != null) {
+          assigned.putIfAbsent(path + "@" + first, file);
+        }
+      }
+      given.put(snapshot.snapshotId(), mine);
+      ids.sort(String::compareTo);
+      items.put(String.format("snapshot %02d row ids", i), ids.toString());
+    }
+    TreeMap<Long, Long> ranges = new TreeMap<>(); // first row id -> end
+    for (org.apache.iceberg.DataFile file : assigned.values()) {
+      if (violation != null) {
+        break;
+      }
+      long first = file.firstRowId();
+      long end = first + file.recordCount();
+      Map.Entry<Long, Long> before = ranges.floorEntry(first);
+      Map.Entry<Long, Long> after = ranges.ceilingEntry(first);
+      if (end > metadata.nextRowId()) {
+        violation = "past the next row id: " + file.location();
+      } else if ((before != null && before.getValue() > first)
+          || (after != null && after.getKey() < end)) {
+        violation = "overlapping row ids: " + file.location();
+      }
+      ranges.put(first, end);
+    }
+    items.put("row ids", violation != null ? violation : "ok");
+  }
+
+  /** The live data files of {@code snapshot}. */
+  private static List<org.apache.iceberg.DataFile> liveDataFiles(Table table, Snapshot snapshot) {
     List<org.apache.iceberg.DataFile> files = new ArrayList<>();
     try (org.apache.iceberg.io.CloseableIterable<FileScanTask> tasks =
-        table.newScan().useRef(ref).planFiles()) {
+        table.newScan().useSnapshot(snapshot.snapshotId()).planFiles()) {
       tasks.forEach(task -> files.add(task.file()));
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
-    files.sort(java.util.Comparator.comparing(org.apache.iceberg.DataFile::location));
-    TreeMap<Long, Long> ranges = new TreeMap<>(); // first row id -> end
-    int withoutIds = 0;
-    for (org.apache.iceberg.DataFile file : files) {
-      Long first = file.firstRowId();
-      if (first == null) {
-        withoutIds += 1;
-        continue;
-      }
-      long end = first + file.recordCount();
-      if (end > metadata.nextRowId()) {
-        return "past the next row id: " + file.location();
-      }
-      Map.Entry<Long, Long> before = ranges.floorEntry(first);
-      Map.Entry<Long, Long> after = ranges.ceilingEntry(first);
-      if ((before != null && before.getValue() > first) || (after != null && after.getKey() < end)) {
-        return "overlapping row ids: " + file.location();
-      }
-      ranges.put(first, end);
-    }
-    return "ok, " + withoutIds + " without row ids";
+    return files;
   }
 
   /**

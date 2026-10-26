@@ -111,6 +111,8 @@ public class LogCatalog extends BaseMetastoreCatalog
   private FileIO io;
   private CatalogLog log;
   private final Map<String, String> catalogProperties;
+  // Whether its table commits pin what Iceberg commits once (FileIOTableOperations.doCommit)
+  private boolean pinsCommitOnce = true;
 
   /** A catalog whose subclass opens its log and FileIO when it is initialized ({@link #openLog}). */
   protected LogCatalog(String catalogName, Map<String, String> catalogProperties) {
@@ -303,10 +305,22 @@ public class LogCatalog extends BaseMetastoreCatalog
    */
   FileIOTableOperations newTableOps(TableIdentifier tableIdentifier, Replica<CatalogState> read) {
     InlineSettings inline = inlineSettings();
-    if (inline.manifests) {
-      return new InlineManifestTableOperations(tableIdentifier, log, io, inline, read);
-    }
-    return new FileIOTableOperations(tableIdentifier, log, io, inline, read);
+    FileIOTableOperations ops =
+        inline.manifests
+            ? new InlineManifestTableOperations(tableIdentifier, log, io, inline, read)
+            : new FileIOTableOperations(tableIdentifier, log, io, inline, read);
+    ops.pinsCommitOnce = pinsCommitOnce;
+    return ops;
+  }
+
+  /**
+   * Makes this catalog's table commits leave what Iceberg commits once unpinned, as a writer that
+   * relies on replay to tell it from the delta ({@link TableChange#commitOnce}): for tests of that.
+   * A catalog transaction still pins the tables it writes.
+   */
+  LogCatalog leavingCommitOnceUnpinned() {
+    this.pinsCommitOnce = false;
+    return this;
   }
 
   /** How this catalog stores table metadata, from its {@code fileio.catalog.inline*} properties. */
@@ -494,6 +508,8 @@ public class LogCatalog extends BaseMetastoreCatalog
     private volatile Replica<CatalogState> lastRead = null;
     // Whether a read found the table: once one has, a read that does not finds it dropped
     private boolean loaded = false;
+    // Whether a commit of what Iceberg commits once pins it (LogCatalog.leavingCommitOnceUnpinned)
+    private boolean pinsCommitOnce = true;
 
     FileIOTableOperations(
         TableIdentifier tableId, CatalogLog log, FileIO io, InlineSettings inline) {
@@ -707,7 +723,7 @@ public class LogCatalog extends BaseMetastoreCatalog
       }
       CatalogMutation mut = new CatalogMutation(lastRead);
       stageUpdate(mut, base, metadata);
-      if (commitsOnce(metadata.changes())) {
+      if (pinsCommitOnce && commitsOnce(metadata.changes())) {
         mut.pin(tableId);
       }
       mut.commit(log);

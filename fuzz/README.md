@@ -9,7 +9,7 @@ jars, and the source as a git bundle mounted at run time, so one image serves an
 
 ## On the dev box: build and pack
 
-    fuzz/image.sh p12=$HOME/.m2/repository p3=$HOME/work/catalog/m2-ce p4=$HOME/work/catalog/m2-p4
+    fuzz/image.sh p4c=$HOME/.m2/repository     # or several: p3=<repo> p4c=<repo>
 
 Each `<name>=<repo>` bakes in the fork jars (`1.12.0-atomicio-SNAPSHOT`) of that local Maven
 repository as fork build `<name>`, so a run names the build its commit was tested with (the
@@ -77,5 +77,6 @@ commit, sets each property's tries (as the phase-exit rounds do: `ce-fuzz` with 
 lists them), and runs `mvn -o test -Dtest=...` in each, against `/opt/m2/forks/<fork>` chained
 to `/opt/m2/base` (Maven 3.9's `maven.repo.local.tail`). A calibration set
 (`mutants/<set>.sh`) names its mutants, its oracles and their tries; each mutant is a code
-change, put back by an exact-text replacement anchored in the commit it was written for
-(`phase3.sh`: 67e91f4; `phase4.sh`: the phase 4 commit), and must fail an oracle.
+change, put back by an exact-text replacement anchored in the code as the set's last commit
+left it (a calibration of an older commit needs the set as it was then), and must fail an
+oracle.
