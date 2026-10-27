@@ -1,0 +1,9 @@
+{
+  "label": "smoke",
+  "warmup_s": 2,
+  "duration_s": 5,
+  "drain_s": 5,
+  "writers": 4,
+  "preload_commits": 5,
+  "vary": {"encoding": ["lamport", "blind-append"]}
+}
