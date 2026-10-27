@@ -73,11 +73,11 @@ final class PartitionVectorEncoding extends BlindAppendEncoding {
     Witness witness = guards(base, change).concern(TableChange.Concern.SCHEMA);
     for (Footprint.Check check : change.checks) {
       ConcernStamps.Partition kind = kind(check.kind);
-      for (int bucket : PartitionKey.buckets(check.scope, landing.metadata(), buckets())) {
+      for (int bucket : PartitionKey.buckets(check.scope, landing.table(), buckets())) {
         witness.partition(kind, bucket);
       }
     }
-    if (landing.metadata().formatVersion() >= 3) {
+    if (landing.table().formatVersion() >= 3) {
       for (ManifestFile manifest : change.written) {
         if (manifest.content() == ManifestContent.DATA
             && (manifest.hasAddedFiles() || manifest.hasDeletedFiles())) {

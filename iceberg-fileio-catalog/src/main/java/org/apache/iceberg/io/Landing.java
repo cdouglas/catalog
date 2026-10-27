@@ -30,7 +30,6 @@ import org.apache.iceberg.ManifestContent;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.SnapshotRef;
 import org.apache.iceberg.SnapshotSummary;
-import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.io.InlineDeltaCodec.AddManifestUpdate;
 import org.apache.iceberg.io.InlineDeltaCodec.AddSnapshotUpdate;
 import org.apache.iceberg.io.InlineDeltaCodec.DecodedDelta;
@@ -100,7 +99,7 @@ final class Landing {
               SnapshotSummary.ADDED_EQ_DELETES_PROP,
               SnapshotSummary.REMOVED_EQ_DELETES_PROP));
 
-  private final TableMetadata table;
+  private final MetadataView table;
   private final boolean stale;
   private final Set<Long> added;
   private final Long baseLastSequenceNumber;
@@ -113,7 +112,7 @@ final class Landing {
   private final Map<Long, Map<String, String>> summaries;
 
   private Landing(
-      TableMetadata table,
+      MetadataView table,
       boolean stale,
       Set<Long> added,
       Long baseLastSequenceNumber,
@@ -137,7 +136,7 @@ final class Landing {
    * Where {@code delta} lands on {@code table}: its base if not {@code stale}, else a table that
    * changed since, where it must be mergeable ({@link #unmergeable} is null).
    */
-  static Landing of(DecodedDelta delta, TableMetadata table, boolean stale) {
+  static Landing of(DecodedDelta delta, MetadataView table, boolean stale) {
     Map<Long, AddSnapshotUpdate> adds = adds(delta);
     Long baseLastSequenceNumber = delta.baseLastSequenceNumber;
     long sequenceShift =
@@ -190,7 +189,7 @@ final class Landing {
    * judges that, and must make each of them stable where it admits.
    */
   static String unmergeable(
-      DecodedDelta delta, TableMetadata table, CatalogState.Builder builder, int tableId) {
+      DecodedDelta delta, MetadataView table, CatalogState.Builder builder, int tableId) {
     Map<Long, AddSnapshotUpdate> adds = adds(delta);
     Map<Long, String> branches = branches(delta, adds, table);
     if (branches == null) {
@@ -218,7 +217,7 @@ final class Landing {
           || update instanceof InlineDeltaCodec.RemoveSnapshotsUpdate) {
         return "it removes what it found unused on its base";
       } else if (update instanceof InlineDeltaCodec.SetCurrentSchemaUpdate) {
-        if (table.schemasById().get(((InlineDeltaCodec.SetCurrentSchemaUpdate) update).schemaId)
+        if (table.schema(((InlineDeltaCodec.SetCurrentSchemaUpdate) update).schemaId)
             == null) {
           return "its schema is gone";
         }
@@ -227,7 +226,7 @@ final class Landing {
           return "its partition spec is gone";
         }
       } else if (update instanceof InlineDeltaCodec.SetDefaultSortOrderUpdate) {
-        if (table.sortOrdersById().get(((InlineDeltaCodec.SetDefaultSortOrderUpdate) update).orderId)
+        if (table.sortOrder(((InlineDeltaCodec.SetDefaultSortOrderUpdate) update).orderId)
             == null) {
           return "its sort order is gone";
         }
@@ -257,7 +256,7 @@ final class Landing {
       if (table.snapshot(add.snapshotId) != null) {
         return "its snapshot id is in the table already";
       }
-      if (add.schemaId != null && table.schemasById().get(add.schemaId) == null) {
+      if (add.schemaId != null && table.schema(add.schemaId) == null) {
         return "its snapshot's schema is gone";
       }
       if (!add.manifestListSuffix.isEmpty()
@@ -338,7 +337,7 @@ final class Landing {
    * </ul>
    */
   private static String retryChanges(
-      List<ManifestFile> list, AddSnapshotUpdate add, TableMetadata table) {
+      List<ManifestFile> list, AddSnapshotUpdate add, MetadataView table) {
     if (table.formatVersion() >= 3) {
       for (ManifestFile manifest : list) {
         if (manifest.content() == ManifestContent.DATA && manifest.firstRowId() == null) {
@@ -471,7 +470,7 @@ final class Landing {
     return zeros;
   }
 
-  private static Map<String, String> summaryOrEmpty(TableMetadata table, long snapshotId) {
+  private static Map<String, String> summaryOrEmpty(MetadataView table, long snapshotId) {
     Map<String, String> summary = table.snapshot(snapshotId).summary();
     return summary != null ? summary : ImmutableMap.of();
   }
@@ -566,7 +565,7 @@ final class Landing {
    * a chain. A chain is a ref's new snapshot and its new ancestors.
    */
   private static Map<Long, String> branches(
-      DecodedDelta delta, Map<Long, AddSnapshotUpdate> adds, TableMetadata table) {
+      DecodedDelta delta, Map<Long, AddSnapshotUpdate> adds, MetadataView table) {
     Map<Long, String> branches = new HashMap<>();
     for (DeltaUpdate update : delta.updates) {
       if (!(update instanceof SetSnapshotRefUpdate)
@@ -591,7 +590,7 @@ final class Landing {
    * {@code SnapshotUtil.latestSnapshot}: the head of {@code branch}, or main's for a branch the
    * table lacks; null if it has none.
    */
-  private static Long latest(TableMetadata table, String branch) {
+  private static Long latest(MetadataView table, String branch) {
     SnapshotRef ref = table.ref(branch);
     return ref != null ? Long.valueOf(ref.snapshotId()) : currentSnapshotId(table);
   }
@@ -610,7 +609,7 @@ final class Landing {
     return first;
   }
 
-  private static Long currentSnapshotId(TableMetadata table) {
-    return table.currentSnapshot() != null ? table.currentSnapshot().snapshotId() : null;
+  private static Long currentSnapshotId(MetadataView table) {
+    return table.currentSnapshotId();
   }
 }

@@ -136,7 +136,7 @@ abstract class ConcernEncoding implements ConflictEncoding<ConcernEncoding.Witne
       return Witness.whole(base);
     }
     try {
-      TableChange change = TableChange.of(action, landing::metadata);
+      TableChange change = TableChange.of(action, landing::table);
       if (change.commitOnce) {
         return Witness.whole(base);
       }
@@ -193,7 +193,7 @@ abstract class ConcernEncoding implements ConflictEncoding<ConcernEncoding.Witne
     try {
       TableChange change;
       if (applied.kind() == TableAction.Kind.DELTA && before.inline() && after.inline()) {
-        change = TableChange.of(applied, before::metadata);
+        change = TableChange.of(applied, before::table);
       } else if (applied.kind() == TableAction.Kind.FULL && before.inline() && after.inline()) {
         change = TableChange.diff(before.metadata(), after.metadata());
       } else {

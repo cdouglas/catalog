@@ -125,8 +125,8 @@ final class TableChange {
    * record's witness, or the table before it, when it applies. {@code table} is decoded only for
    * the refs a delta sets or the snapshots it removes.
    */
-  static TableChange of(TableAction action, java.util.function.Supplier<TableMetadata> metadata) {
-    TableMetadata table = null;
+  static TableChange of(TableAction action, java.util.function.Supplier<MetadataView> metadata) {
+    MetadataView table = null;
     boolean needsTable = false;
     for (DeltaUpdate update : action.delta().updates) {
       needsTable |= update instanceof SetSnapshotRefUpdate

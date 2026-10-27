@@ -93,7 +93,7 @@ final class ConflictEncodings {
     if (landing.version() != action.baseVersion()) {
       if (action.pinned() || !landing.inline()
           || Landing.unmergeable(
-                  action.delta(), landing.metadata(), builder, action.tableId())
+                  action.delta(), landing.table(), builder, action.tableId())
               != null) {
         return false;
       }

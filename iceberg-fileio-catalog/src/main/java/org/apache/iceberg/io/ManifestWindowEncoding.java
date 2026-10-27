@@ -28,7 +28,6 @@ import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.SnapshotRef;
-import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.expressions.ManifestEvaluator;
 import org.apache.iceberg.types.Comparators;
 import org.apache.iceberg.types.Conversions;
@@ -128,13 +127,10 @@ final class ManifestWindowEncoding extends ConcernVectorEncoding {
     }
 
     private boolean judge(ReplayView landing) {
-      TableMetadata table = landing.metadata();
+      MetadataView table = landing.table();
       SnapshotRef ref = table.ref(branch);
       // a branch it creates lands on main's head, as Landing re-parents it
-      Long at =
-          ref != null
-              ? Long.valueOf(ref.snapshotId())
-              : table.currentSnapshot() != null ? table.currentSnapshot().snapshotId() : null;
+      Long at = ref != null ? Long.valueOf(ref.snapshotId()) : table.currentSnapshotId();
       List<Snapshot> window = new ArrayList<>();
       while (!Objects.equals(at, parent)) {
         Snapshot snapshot = at != null ? table.snapshot(at) : null;
@@ -167,7 +163,7 @@ final class ManifestWindowEncoding extends ConcernVectorEncoding {
     }
 
     /** Whether no check reads what {@code manifest}'s files did. */
-    private boolean passes(ManifestFile manifest, TableMetadata table) {
+    private boolean passes(ManifestFile manifest, MetadataView table) {
       for (Footprint.Check check : checks) {
         boolean did;
         switch (check.kind) {
@@ -188,7 +184,7 @@ final class ManifestWindowEncoding extends ConcernVectorEncoding {
     }
 
     /** Whether {@code manifest} adds delete files that may apply to files the record writes. */
-    private boolean touchesWritten(ManifestFile manifest, TableMetadata table) {
+    private boolean touchesWritten(ManifestFile manifest, MetadataView table) {
       if (manifest.content() != ManifestContent.DELETES || !manifest.hasAddedFiles()) {
         return false;
       }
@@ -207,7 +203,7 @@ final class ManifestWindowEncoding extends ConcernVectorEncoding {
   }
 
   /** Whether {@code manifest} may hold files in {@code scope}; true where it cannot tell. */
-  static boolean inScope(ManifestFile manifest, Footprint.Scope scope, TableMetadata table) {
+  static boolean inScope(ManifestFile manifest, Footprint.Scope scope, MetadataView table) {
     PartitionSpec spec = table.specsById().get(manifest.partitionSpecId());
     if (scope.isEverything() || spec == null) {
       return true;
@@ -256,7 +252,7 @@ final class ManifestWindowEncoding extends ConcernVectorEncoding {
    * Whether two manifests' files may share a partition: true if either is an unpartitioned spec's
    * delete manifest, false for two specs, else whether every field's bounds meet.
    */
-  static boolean overlaps(ManifestFile deletes, ManifestFile data, TableMetadata table) {
+  static boolean overlaps(ManifestFile deletes, ManifestFile data, MetadataView table) {
     PartitionSpec spec = table.specsById().get(deletes.partitionSpecId());
     if (spec == null || spec.isUnpartitioned()) {
       return true;

@@ -55,7 +55,7 @@ final class AdmitDeltasEncoding implements ConflictEncoding<Boolean> {
       return true;
     }
     try {
-      return !TableChange.of(action, landing::metadata).commitOnce;
+      return !TableChange.of(action, landing::table).commitOnce;
     } catch (RuntimeException e) {
       return false;
     }

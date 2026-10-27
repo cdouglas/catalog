@@ -28,7 +28,6 @@ import java.util.Set;
 import org.apache.iceberg.ManifestContent;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.PartitionSpec;
-import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.expressions.And;
 import org.apache.iceberg.expressions.Binder;
 import org.apache.iceberg.expressions.BoundPredicate;
@@ -100,7 +99,7 @@ final class PartitionKey {
    * of the table's specs that the filter's inclusive projection names by equality (on every
    * partition field, at most {@link #MAX_PARTITIONS}), or {@link #ALL} where it does not.
    */
-  static Set<Integer> buckets(Footprint.Scope scope, TableMetadata table, int buckets) {
+  static Set<Integer> buckets(Footprint.Scope scope, MetadataView table, int buckets) {
     Set<Integer> read = new HashSet<>();
     if (scope.isEverything()) {
       read.add(ALL);
@@ -111,7 +110,7 @@ final class PartitionKey {
     } else {
       try {
         Expression filter = scope.expression();
-        for (PartitionSpec spec : table.specs()) {
+        for (PartitionSpec spec : table.specsById().values()) {
           List<Footprint.Partition> partitions = partitions(filter, spec);
           if (partitions == null) {
             return Set.of(ALL);

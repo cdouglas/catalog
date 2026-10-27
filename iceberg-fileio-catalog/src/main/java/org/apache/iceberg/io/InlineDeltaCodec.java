@@ -295,7 +295,7 @@ public class InlineDeltaCodec {
       TableMetadata base, DecodedDelta decoded, CatalogState.Builder catalogBuilder, int tableId,
       boolean stale) {
     List<DeltaUpdate> updates = decoded.updates;
-    Landing landing = Landing.of(decoded, base, stale);
+    Landing landing = Landing.of(decoded, MetadataView.of(base), stale);
     // Pin the writer's last-updated-ms on every Builder pass before applyTo,
     // so `setRef(MAIN_BRANCH, ...)` (TableMetadata.java line 1324) reads the
     // writer's value rather than wall-clock when stamping new snapshot-log

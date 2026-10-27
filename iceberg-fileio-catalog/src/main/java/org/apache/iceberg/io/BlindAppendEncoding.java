@@ -79,7 +79,7 @@ class BlindAppendEncoding extends ConcernVectorEncoding {
     if (!change.drops.isEmpty()) {
       witness.ref(change.advanced.iterator().next(), ConcernStamps.Ref.DROP);
     }
-    if (landing.metadata().formatVersion() >= 3) {
+    if (landing.table().formatVersion() >= 3) {
       for (ManifestFile manifest : change.written) {
         if (manifest.content() == ManifestContent.DATA) {
           witness.partition(

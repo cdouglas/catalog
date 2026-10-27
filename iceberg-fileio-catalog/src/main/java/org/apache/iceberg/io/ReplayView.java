@@ -37,6 +37,7 @@ final class ReplayView {
   private final byte codecTag;
   private final String location;
   private TableMetadata metadata;
+  private MetadataView view;
 
   private ReplayView(CatalogState.Builder builder, int tableId) {
     this.builder = builder;
@@ -84,6 +85,14 @@ final class ReplayView {
           InlineDeltaCodec.decodeBase(inlineMetadata, InlineMetadataCodecs.byTag(codecTag));
     }
     return metadata;
+  }
+
+  /** What replay reads of an inline table's metadata; null for a pointer table. */
+  MetadataView table() {
+    if (view == null && inlineMetadata != null) {
+      view = MetadataView.of(metadata());
+    }
+    return view;
   }
 
   /** Whether the table has an inline manifest list for {@code snapshotId}. */

@@ -183,7 +183,7 @@ class TestFootprints {
    */
   @Test
   void aPartitionFilterAndManifestShareABucket() {
-    TableMetadata table = table(BY_CAT);
+    MetadataView table = table(BY_CAT);
     DataFile file =
         DataFiles.builder(BY_CAT)
             .withPath("/f.parquet")
@@ -210,7 +210,7 @@ class TestFootprints {
   /** Manifest-window reads a scope against a manifest's partition summaries. */
   @Test
   void aScopeReadsAManifestsSummaries() {
-    TableMetadata table = table(BY_CAT);
+    MetadataView table = table(BY_CAT);
     ManifestFile fiveToSeven = data(0, 5, 7, false);
     assertThat(ManifestWindowEncoding.inScope(fiveToSeven, Footprint.Scope.EVERYTHING, table))
         .isTrue();
@@ -238,7 +238,7 @@ class TestFootprints {
   /** In v3, delete files that may share a partition with the files a record adds conflict. */
   @Test
   void deletesOverlapDataByPartition() {
-    TableMetadata table = table(BY_CAT);
+    MetadataView table = table(BY_CAT);
     assertThat(ManifestWindowEncoding.overlaps(deletes(0, 5, 7), data(0, 7, 9, false), table))
         .isTrue();
     assertThat(ManifestWindowEncoding.overlaps(deletes(0, 5, 7), data(0, 8, 9, false), table))
@@ -252,9 +252,9 @@ class TestFootprints {
         List.of(new Footprint.Partition(specId, Arrays.asList(values))));
   }
 
-  private static TableMetadata table(PartitionSpec spec) {
-    return TableMetadata.newTableMetadata(
-        SCHEMA, spec, SortOrder.unsorted(), "mem:///t", Map.of("format-version", "2"));
+  private static MetadataView table(PartitionSpec spec) {
+    return MetadataView.of(TableMetadata.newTableMetadata(
+        SCHEMA, spec, SortOrder.unsorted(), "mem:///t", Map.of("format-version", "2")));
   }
 
   private static ManifestFile data(int specId, int lower, int upper, boolean nulls) {
