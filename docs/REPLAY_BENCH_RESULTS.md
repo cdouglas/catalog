@@ -16,7 +16,11 @@ that replaces its object on every commit, and the record each commit wrote is ke
 - `read` decodes a checkpoint taken `tail` (100) records before the end, replays the tail and
   builds the state, as each commit attempt does twice;
 - `load` loads the table through a `FileIOCatalog` on that object, as a client's refresh that finds
-  a new version does.
+  a new version does;
+- `reread` reads the object after `fresh` more records landed, from its checkpoint, as a reader
+  that reads afresh brings itself up to date; `fold` replays only those records onto the state
+  the reader holds, as the runtime does when a read continues the one its replica came from
+  (LOG.md "Replay").
 
 Run via (after `mvn test-compile`; async-profiler from a JetBrains IDE's `lib/async-profiler`):
 
@@ -95,11 +99,60 @@ Inline TM+ML, 300 commits, 2 forks of 5 iterations (± the 99.9% interval):
 The encodings' bookkeeping (each record's change observed into stamps) costs 10–20% of replay;
 a read is dominated by decoding its checkpoint either way.
 
+## Snapshots, and folding a read onto a replica
+
+Inline TM+ML under `manifest-window`, one table of 32 partitions, one file per commit, every
+snapshot kept (2026-10-27; intentlog's test suites shared the machine for part of the run). `op`
+is how the writer appends: `fast` (`newFastAppend`) never merges manifests, so a snapshot's list
+holds every manifest before it and the lists hold about snapshots²/2 entries; `merge`
+(`newAppend`, Iceberg's default) merges them once a list reaches 100, as Iceberg's defaults say.
+The capture now appends to its object instead of replacing it on every commit, so 3,000 commits
+take minutes. The reader read a checkpoint and the 100 records after it; `fresh` records landed
+since.
+
+The object (records are about 470 B each under `fast`, 550 B under `merge`):
+
+| snapshots | checkpoint, `fast` | manifests in the current list | checkpoint, `merge` | manifests in the current list |
+|---|---|---|---|---|
+| 300 | 77 KB | 299 | 57 KB | 2 |
+| 1,000 | 1.26 MB | 999 | 283 KB | 9 |
+| 3,000 | 12.8 MB | 2,999 | 927 KB | 29 |
+
+ms per operation, one fresh record (allocation per operation in parentheses):
+
+| | `fast` 300 | 1,000 | 3,000 | `merge` 300 | 1,000 | 3,000 |
+|---|---|---|---|---|---|---|
+| read (checkpoint and 100 records) | 3.7 (5.4 MB) | 20.8 (32 MB) | 163 (248 MB) | 3.5 (4.4 MB) | 8.9 (12 MB) | 23.8 (32 MB) |
+| reread (and the fresh record) | 3.6 | 18.5 | 143 | 3.5 | 8.7 | 23.9 |
+| fold of the fresh record | 0.084 (0.11 MB) | 0.33 (0.33 MB) | 1.16 (0.92 MB) | 0.082 (0.10 MB) | 0.33 (0.29 MB) | 1.14 (0.79 MB) |
+| fold of 16 fresh records | 0.32 | 0.65 | 1.89 | 0.71 | 0.88 | 1.32 |
+| load (the read, then the table's metadata) | 6.0 (8.6 MB) | 51 (64 MB) | 664 (533 MB) | 4.4 (5.9 MB) | 14.0 (17 MB) | 39 (47 MB) |
+
+- A reader that reads afresh pays for the checkpoint whatever landed: a reread of 1 or 16 new
+  records costs what the read did.
+- Folding them onto the replica it holds costs about 1/40 of a reread at 300 snapshots, and at
+  3,000 about 1/20 (merge appends) to 1/120 (fast appends). A fold still grows with the table (84 µs to 1.16 ms for one record from 300 to 3,000
+  snapshots): building on a replica copies the touched table's manifest pool, its map of
+  snapshots to manifest lists and its encoding's state (copy-on-write per table), and building
+  the state copies them again. Persistent maps would leave a fold the cost of its records.
+- Under fast appends the checkpoint grows with the square of the snapshots (12.8 MB at 3,000)
+  and a read with it (5.7 times from 300 to 1,000 snapshots, 7.8 times from 1,000 to 3,000);
+  under merge appends both grow about linearly (927 KB and 24 ms at 3,000).
+- A load at 3,000 fast-append snapshots takes 0.66 s and allocates 533 MB: making the table's
+  metadata makes every snapshot's manifest list (4.5 million entries). It is now the larger
+  cost for a client that loads a table its replica already holds.
+
+3,000 snapshots bracket the costs: fast appends without merging are past where inline manifest
+lists pay (the lists are quadratic, which Iceberg's merging appends avoid), and merge appends
+and the fold grow linearly, so the slope extrapolates. errata U2 asks for 10,000; a capture of
+that many commits takes about half an hour under merge appends.
+
 ## What remains
 
 A read's cost is now its checkpoint: decoding the table's structural metadata (snapshots go
 through JSON) and, with inline manifest lists, every snapshot's list of indices (O(snapshots x
 manifests) on the wire). A load still makes an `InlineSnapshot` list per snapshot. Candidates:
-decoding snapshots without JSON, delta-encoding snapshot lists on the wire, lists the fork's
-`InlineSnapshot` resolves lazily, and refreshing a replica from the bytes appended since it was
-read instead of from the checkpoint.
+decoding snapshots without JSON, delta-encoding snapshot lists on the wire, and lists the fork's
+`InlineSnapshot` resolves lazily (a load's cost above). Replay now folds a read onto the replica
+it continues, which removes the checkpoint from a reader's refresh between compactions, but the
+read still transfers the whole object (errata D15), and a fold copies the touched table's maps.
