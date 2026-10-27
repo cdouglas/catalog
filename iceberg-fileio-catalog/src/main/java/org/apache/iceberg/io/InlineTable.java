@@ -35,6 +35,7 @@ final class InlineTable {
   private volatile byte[] bytes;
   private volatile TableFields fields;
   private volatile TableMetadata metadata;
+  private volatile TableMetadata loaded;
 
   private InlineTable(byte codec, byte[] bytes, TableFields fields, TableMetadata metadata) {
     this.codec = codec;
@@ -115,6 +116,19 @@ final class InlineTable {
       made = decode(location != null ? location : "inline://decode");
     }
     metadata = made;
+    return made;
+  }
+
+  /**
+   * The metadata a client's load makes of this version at {@code location}: {@code load} applied
+   * to its {@link #metadata}, once per location.
+   */
+  TableMetadata loaded(String location, java.util.function.UnaryOperator<TableMetadata> load) {
+    TableMetadata made = loaded;
+    if (made == null || !java.util.Objects.equals(location, made.metadataFileLocation())) {
+      made = load.apply(metadata(location));
+      loaded = made;
+    }
     return made;
   }
 

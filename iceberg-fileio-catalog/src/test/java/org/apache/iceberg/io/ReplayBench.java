@@ -69,6 +69,12 @@ import org.openjdk.jmh.infra.Blackhole;
  * #decodeCheckpoint} code the final state, and {@link #decodeTable} decodes its first table's
  * inline metadata, as a table load does. Each {@code records} counter is records per second.
  *
+ * <p>Two benchmarks work on the log as a catalog's object holds it, a checkpoint {@code tail}
+ * records before the end and the records after it: {@link #read} reads it (decodes the checkpoint,
+ * replays the tail and builds the state), as each commit attempt does twice; {@link #load} loads
+ * the first table through a {@link FileIOCatalog} on it, as a client's refresh that finds a new
+ * version does (the read, then the table's metadata and manifest lists made).
+ *
  * <p>Run with the test classpath (after {@code mvn test-compile}):
  *
  * <pre>{@code
@@ -106,10 +112,17 @@ public class ReplayBench {
   @Param({LamportEncoding.NAME})
   public String encoding;
 
+  /** Records after the checkpoint, for {@link #read} and {@link #load}. */
+  @Param({"100"})
+  public int tail;
+
   private byte[] checkpoint;
   private List<byte[]> records;
   private CatalogState finalState;
   private byte[] finalCheckpoint;
+  private byte[] tailCheckpoint;
+  private List<byte[]> tailRecords;
+  private InMemoryAtomicFileIO tailIO;
 
   /** Records processed, reported as a rate. */
   @State(Scope.Thread)
@@ -125,6 +138,45 @@ public class ReplayBench {
     records = new ArrayList<>(log.records());
     finalState = replayAll().builder().build();
     finalCheckpoint = CatalogStateMachine.INSTANCE.encodeCheckpoint(finalState);
+
+    // The log as an object holds it: a checkpoint, then the last `tail` records
+    int at = Math.max(0, records.size() - tail);
+    LogEnvelope.Checkpoint envelope = LogEnvelope.decodeCheckpoint(checkpoint);
+    Replay.Result<CatalogState.Builder> before =
+        Replay.replayOnto(
+            CatalogStateMachine.INSTANCE,
+            CatalogStateMachine.INSTANCE.decodeCheckpoint(envelope.state()),
+            CommittedSet.of(envelope.committed()).toBuilder(), envelope.logId(), 0,
+            records.subList(0, at), null);
+    tailCheckpoint =
+        LogEnvelope.encodeCheckpoint(
+            envelope.logId(), before.committed().build().bytes(),
+            CatalogStateMachine.INSTANCE.encodeCheckpoint(before.builder().build()));
+    tailRecords = new ArrayList<>(records.subList(at, records.size()));
+    tailIO = new InMemoryAtomicFileIO();
+    tailIO.recordHistory(false);
+    tailIO.seed(CATALOG, AtomicFileLog.encode(tailCheckpoint, tailRecords));
+  }
+
+  @Benchmark
+  public CatalogState read() {
+    return Replay.replay(CatalogStateMachine.INSTANCE, tailCheckpoint, tailRecords, null)
+        .builder()
+        .build();
+  }
+
+  @Benchmark
+  public TableMetadata load() {
+    Map<String, String> props = new HashMap<>();
+    props.put(CatalogProperties.WAREHOUSE_LOCATION, "mem:///wh");
+    props.put("fileio.catalog.inline", String.valueOf(!mode.equals("pointer")));
+    props.put("fileio.catalog.inline.manifests", String.valueOf(mode.equals("ml")));
+    FileIOCatalog catalog = new FileIOCatalog("c", CATALOG, tailIO, new HashMap<>());
+    catalog.initialize("c", props);
+    return ((org.apache.iceberg.HasTableOperations) catalog.loadTable(
+            TableIdentifier.of("ns", "t0")))
+        .operations()
+        .current();
   }
 
   @Benchmark

@@ -707,7 +707,7 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
       root.set("metadata-log", mdArr);
     }
 
-    return TableMetadataParser.fromJson(metadataLocation, root.toString());
+    return TableMetadataParser.fromJson(metadataLocation, root);
   }
 
   private static String reconstructMdlogPath(Decoded d, int i) {

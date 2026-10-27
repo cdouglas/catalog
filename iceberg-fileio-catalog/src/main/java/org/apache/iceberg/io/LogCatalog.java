@@ -567,7 +567,7 @@ public class LogCatalog extends BaseMetastoreCatalog
         InlineTable inlineTable = state.inlineTable(state.tableId(tableId));
         String syntheticLoc = metadataLocation(state, tableId);
         refreshFromMetadataLocation(syntheticLoc, null, 0,
-            loc -> wrapInlineManifests(inlineTable.metadata(loc), state));
+            loc -> inlineTable.loaded(loc, parsed -> wrapInlineManifests(parsed, state)));
       } else if (loaded || currentMetadataLocation() != null) {
         // Table used to exist but is now missing
         throw new NoSuchTableException("Table %s was deleted", tableId);
@@ -1105,35 +1105,35 @@ public class LogCatalog extends BaseMetastoreCatalog
         return parsed;
       }
 
-      // Build a snapshot replacement map (id -> InlineSnapshot)
-      Map<Long, Snapshot> replacements = new java.util.HashMap<>();
+      // Each snapshot with an inline list becomes an InlineSnapshot holding it, of
+      // GenericManifestFile copies: Iceberg compares manifests by equality, which for
+      // GenericManifestFile is by path. Expiry's ReachableFileCleanup finds the manifests that
+      // retained snapshots still use that way; the catalog's own entries, equal only to
+      // themselves, were never found in use, and their files were deleted. One copy per manifest,
+      // which every list naming it shares.
+      Map<String, ManifestFile> copies = new java.util.HashMap<>();
+      List<Snapshot> snapshots = new java.util.ArrayList<>(parsed.snapshots().size());
       for (Snapshot s : parsed.snapshots()) {
         if (proto.hasInlineManifests(tblId, s.snapshotId())) {
-          // GenericManifestFile copies: Iceberg compares manifests by equality, which for
-          // GenericManifestFile is by path. Expiry's ReachableFileCleanup finds the manifests that
-          // retained snapshots still use that way; the catalog's own entries, equal only to
-          // themselves, were never found in use, and their files were deleted.
           List<ManifestFile> manifests = new java.util.ArrayList<>();
           for (ManifestFile m : proto.inlineManifests(tblId, s.snapshotId())) {
-            manifests.add(org.apache.iceberg.GenericManifestFile.copyOf(m).build());
+            manifests.add(
+                copies.computeIfAbsent(
+                    m.path(), path -> org.apache.iceberg.GenericManifestFile.copyOf(m).build()));
           }
-          replacements.put(s.snapshotId(), new InlineSnapshot(
+          snapshots.add(new InlineSnapshot(
               s.sequenceNumber(), s.snapshotId(), s.parentId(),
               s.timestampMillis(), s.operation(), s.summary(),
               s.schemaId(), s.firstRowId(), s.addedRows(), s.keyId(),
               manifests));
+        } else {
+          snapshots.add(s);
         }
       }
 
-      // Replace snapshots in-place without using removeSnapshots (which clears refs
-      // and doesn't reset lastSequenceNumber, causing validation failures on re-add).
-      // withMetadataLocation preserves parsed.metadataFileLocation() across the
-      // rebuild — without it, BaseCatalogTransaction.validateSerializableIsolation
-      // NPEs on .equals() against a null metadataFileLocation.
-      TableMetadata.Builder builder = TableMetadata.buildFrom(parsed);
-      builder.replaceSnapshots(replacements);
-      builder.withMetadataLocation(parsed.metadataFileLocation());
-      return builder.discardChanges().build();
+      // The same metadata, at the same location (BaseCatalogTransaction.validateSerializableIsolation
+      // compares it), with these snapshots in place of the others
+      return TableFields.of(parsed).withSnapshots(snapshots).toMetadata(parsed.metadataFileLocation());
     }
   }
 

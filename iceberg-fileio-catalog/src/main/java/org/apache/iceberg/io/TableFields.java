@@ -234,6 +234,37 @@ final class TableFields implements MetadataView {
         encryptionKeys);
   }
 
+  /** These fields with {@code newSnapshots}, the same snapshots by id, in their place. */
+  TableFields withSnapshots(List<Snapshot> newSnapshots) {
+    return new TableFields(
+        formatVersion,
+        uuid,
+        location,
+        lastSequenceNumber,
+        lastUpdatedMillis,
+        lastColumnId,
+        currentSchemaId,
+        schemas,
+        schemasById,
+        defaultSpecId,
+        specs,
+        specsById,
+        lastAssignedPartitionId,
+        defaultSortOrderId,
+        sortOrders,
+        sortOrdersById,
+        properties,
+        currentSnapshotId,
+        Chain.of(newSnapshots, Snapshot::snapshotId),
+        snapshotLog,
+        previousFiles,
+        refs,
+        statisticsFiles,
+        partitionStatisticsFiles,
+        nextRowId,
+        encryptionKeys);
+  }
+
   @Override
   public int formatVersion() {
     return formatVersion;
