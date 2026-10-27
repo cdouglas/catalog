@@ -1,0 +1,39 @@
+{
+  "label": "c6-openloop",
+  "arrival_dist": "lognormal",
+  "arrival_sigma": 0.5,
+  "max_inflight": 128,
+  "vary": {
+    "store": [
+      "s3x",
+      "s3"
+    ],
+    "+workload": [
+      {
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "mix": {
+          "fast_append": 0.9,
+          "validated_overwrite": 0.1
+        },
+        "runtime_median_ms": 2000,
+        "runtime_sigma": 0.5
+      }
+    ],
+    "arrival_rate": [
+      20,
+      40
+    ],
+    "encoding": [
+      "lamport",
+      "partition-vector"
+    ],
+    "repetition": [
+      0,
+      1
+    ]
+  }
+}

@@ -89,9 +89,12 @@ final class BenchConfig {
           + "\"retry_num\": 4,"
           + "\"retry_min_wait_ms\": 100,"
           + "\"retry_max_wait_ms\": 60000,"
-          // maintenance: expire all but the last `retain` snapshots every `expire_every_s`
+          // maintenance: every `expire_every_s`, expire the snapshots older than
+          // `expire_older_than_s` (0: every one) but the last `expire_retain`; a validated
+          // operation whose starting snapshot expires fails (Iceberg cannot tell its history)
           + "\"expire_every_s\": 5,"
           + "\"expire_retain\": 50,"
+          + "\"expire_older_than_s\": 0,"
           // sampling of the catalog object
           + "\"sample_every_ms\": 1000"
           + "}";
@@ -194,11 +197,25 @@ final class BenchConfig {
     }
   }
 
-  /** The first 12 hex digits of the SHA-256 of the configuration, less its label and repetition. */
+  /**
+   * Keys added after the first campaign (p5, 2026-10-27), with their defaults: one at its default
+   * is left out of the hash, so a configuration keeps the hash its earlier runs recorded.
+   */
+  private static final Map<String, String> LATER_KEYS = Map.of("expire_older_than_s", "0");
+
+  /**
+   * The first 12 hex digits of the SHA-256 of the configuration, less its label, its repetition and
+   * the later keys at their defaults.
+   */
   String hash() {
     ObjectNode copy = node.deepCopy();
     copy.remove("label");
     copy.remove("repetition");
+    LATER_KEYS.forEach((key, value) -> {
+      if (copy.has(key) && copy.get(key).asText().equals(value)) {
+        copy.remove(key);
+      }
+    });
     try {
       byte[] digest =
           MessageDigest.getInstance("SHA-256")

@@ -1,0 +1,52 @@
+{
+  "label": "c2-mixes",
+  "store": "s3x",
+  "runtime_sigma": 0.5,
+  "runtime_ms": {
+    "validated_overwrite": 2000,
+    "compaction": 5000
+  },
+  "vary": {
+    "+workload": [
+      {
+        "mix": {
+          "fast_append": 0.9,
+          "validated_overwrite": 0.1
+        }
+      },
+      {
+        "mix": {
+          "fast_append": 0.95,
+          "compaction": 0.05
+        }
+      },
+      {
+        "mix": {
+          "fast_append": 0.9,
+          "property": 0.1
+        }
+      },
+      {
+        "mix": {
+          "wap": 0.9,
+          "fast_append": 0.1
+        }
+      }
+    ],
+    "encoding": [
+      "lamport",
+      "lamport-minus-properties",
+      "concern-vector",
+      "blind-append",
+      "partition-vector",
+      "manifest-window"
+    ],
+    "writers": [
+      16
+    ],
+    "repetition": [
+      0,
+      1
+    ]
+  }
+}

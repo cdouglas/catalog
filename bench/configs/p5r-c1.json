@@ -1,0 +1,28 @@
+{
+  "label": "c1-fa-scaling",
+  "mix": {
+    "fast_append": 1.0
+  },
+  "vary": {
+    "store": [
+      "s3x",
+      "s3"
+    ],
+    "encoding": [
+      "lamport",
+      "lamport-minus-properties",
+      "concern-vector",
+      "blind-append",
+      "partition-vector",
+      "manifest-window"
+    ],
+    "writers": [
+      16,
+      32
+    ],
+    "repetition": [
+      0,
+      1
+    ]
+  }
+}

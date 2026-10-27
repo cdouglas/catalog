@@ -512,7 +512,8 @@ final class ContentionRun {
     try {
       catalog.loadTable(table(tableIndex)).expireSnapshots()
           .retainLast(config.integer("expire_retain"))
-          .expireOlderThan(System.currentTimeMillis())
+          .expireOlderThan(
+              System.currentTimeMillis() - 1000L * config.integer("expire_older_than_s"))
           .cleanExpiredFiles(false)
           .commit();
     } catch (RuntimeException e) {

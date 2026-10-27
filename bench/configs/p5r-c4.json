@@ -1,0 +1,25 @@
+{
+  "label": "c4-knobs",
+  "store": "s3x",
+  "mix": {
+    "fast_append": 1.0
+  },
+  "vary": {
+    "max_append_count": [
+      0,
+      100,
+      1000
+    ],
+    "encoding": [
+      "lamport",
+      "blind-append"
+    ],
+    "writers": [
+      16
+    ],
+    "repetition": [
+      0,
+      1
+    ]
+  }
+}
