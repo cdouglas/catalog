@@ -30,7 +30,9 @@ git_sha=$(git rev-parse HEAD)
 dirty=false
 [ -n "$(git status --porcelain -- . ':!bench/results' ':!lab')" ] && dirty=true
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
-build="$out/builds/$stamp-${git_sha:0:12}$([ "$dirty" = true ] && echo -dirty)"
+suffix=""
+[ "$dirty" = true ] && suffix=-dirty
+build="$out/builds/$stamp-${git_sha:0:12}$suffix"
 mkdir -p "$build/deps"
 
 MAVEN_OPTS=${MAVEN_OPTS:--Xmx768m} mvn -q -o test-compile dependency:build-classpath \
