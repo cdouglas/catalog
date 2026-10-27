@@ -22,7 +22,7 @@ run's manifest.
     ./run.sh mem                                         # each shard's memory and CPU
 
 A shard runs every JOBS-th run of the campaign's files, in order, so shards interleave over the
-axes. Results go to `./out/<name>/<label>-<hash>/<stamp>/` (manifest.json, ops.jsonl,
+axes. Results go to `./out/<name>/<label>-<hash>/<stamp>-r<repetition>/` (manifest.json, ops.jsonl,
 samples.jsonl); copy them back into the dev box's `bench/results/` and `lab ingest`. `JOBS`
 (default 8) shards at once, each with `HEAP` (default 3g), a memory limit `MEM` (default HEAP and
 2g, without swap, OOM score 1000: on a shared host the kernel kills this campaign's JVM first) and

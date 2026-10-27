@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs the multi-writer contention driver (org.apache.iceberg.io.contention.ContentionBench) over
-# configuration files, writing each run under bench/results/<label>-<hash>/<UTC start>/.
+# configuration files, writing each run under bench/results/<label>-<hash>/<UTC start>-r<repetition>/.
 #
 #   bench/run.sh [--heap 4g] [--out DIR] [--dry-run] bench/configs/<campaign>.json...
 #   bench/run.sh --build-only        builds and snapshots, and prints the snapshot's directory

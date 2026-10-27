@@ -34,9 +34,9 @@ import org.apache.iceberg.IcebergBuild;
 /**
  * The multi-writer contention driver: runs each configuration ({@link BenchConfig}) of the files
  * it is given ({@link ContentionRun}) and writes each run's results under the output directory as
- * {@code <label>-<config hash>/<UTC start>/}: {@code manifest.json} (the configuration, versions,
- * host and a summary), {@code ops.jsonl} (one record per operation) and {@code samples.jsonl} (the
- * catalog object, sampled). labbook reads them (fileio-catalog lab/).
+ * {@code <label>-<config hash>/<UTC start>-r<repetition>/}: {@code manifest.json} (the
+ * configuration, versions, host and a summary), {@code ops.jsonl} (one record per operation) and
+ * {@code samples.jsonl} (the catalog object, sampled). labbook reads them (fileio-catalog lab/).
  *
  * <pre>{@code
  * java -Xmx4g -Diceberg.worker.num-threads=256 -cp <test classpath> \
@@ -94,7 +94,7 @@ public final class ContentionBench {
         continue;
       }
       Instant started = Instant.now();
-      Path dir = out.resolve(name).resolve(STAMP.format(started));
+      Path dir = newRunDir(out.resolve(name), STAMP.format(started), config);
       System.out.printf("[%d/%d] %s -> %s%n", n, runs.size(), name, dir);
       Map<String, Object> manifest = new LinkedHashMap<>();
       manifest.put("label", config.string("label"));
@@ -117,6 +117,24 @@ public final class ContentionBench {
       manifest.put("elapsed_s", (finished.toEpochMilli() - started.toEpochMilli()) / 1000.0);
       write(dir, manifest);
       System.gc();
+    }
+  }
+
+  /**
+   * A new directory for a run under {@code parent}: its start and repetition, made here so no other
+   * run writes into it. Two shards can start the repetitions of one configuration in the same
+   * second (they are adjacent runs): in the p5 campaign two such runs shared a directory.
+   */
+  private static Path newRunDir(Path parent, String stamp, BenchConfig config) throws Exception {
+    Files.createDirectories(parent);
+    String base = stamp + "-r" + config.integer("repetition");
+    for (int n = 0; ; n++) {
+      Path dir = parent.resolve(n == 0 ? base : base + "-" + n);
+      try {
+        return Files.createDirectory(dir);
+      } catch (java.nio.file.FileAlreadyExistsException e) {
+        // a run of this configuration started in this second: take the next name
+      }
     }
   }
 
