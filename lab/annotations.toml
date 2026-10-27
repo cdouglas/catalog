@@ -55,3 +55,10 @@ select = ["c2r-expiry-*"]
 [campaigns.c7-backoff]
 title = "The commit loop's backoff after a lost race: none, 20 ms, 100 ms"
 select = ["c7-backoff-*"]
+
+# p6 (2026-10-27, fileio-catalog 8636dda, 16-CPU shards) reran every campaign on the code merged:
+# manifest-window by default, the backoff after a lost race, runs that cannot share a directory.
+[[annotate]]
+select = "where:git_sha LIKE '2afeb46%' AND regexp_matches(label, '^c[1-6]-')"
+mark = "superseded"
+note = "p5: 4-CPU shards (CPU-bound at 16+ writers), no backoff after a lost race; rerun as p6 at 8636dda"

@@ -60,7 +60,7 @@ lamport_fa_16 = val("compaction+fast_append", 16, "lamport", "fast_append", "com
 ```
 
 Fast appends with a minority of another kind of operation, on `s3x`, at 4 and 16 writers
-(campaign `c2-mixes`, two runs per point). A validated overwrite is Spark's copy-on-write
+(campaign `c2-mixes`, p6, two runs per point). A validated overwrite is Spark's copy-on-write
 overwrite of one partition under serializable isolation, validated from the snapshot its job read
 2 s (median) earlier; a compaction rewrites one partition's files, its job taking 5 s; a property
 set changes one table property; a WAP insert appends to the writer's own branch.
@@ -71,7 +71,8 @@ them. Under `partition-vector`, {eval}`f"{100 * pv_compaction_16:.0f}"`% of comp
 committed compaction merges the table's manifests, the catalog stays small and fast appends reach
 {eval}`f"{pv_fa_16:.1f}"` commits/s, against {eval}`f"{lamport_fa_16:.1f}"`. Most failed overwrites
 fail Iceberg's own validation, whatever the encoding: a fast append landed in their partition
-while their job ran, which a serializable overwrite must not miss.
+while their job ran, which a serializable overwrite must not miss. Many failed compactions here
+fail for another reason, the benchmark's: the next section.
 
 ```{code-cell} ipython3
 :label: c2-fast-appends
@@ -128,6 +129,24 @@ history = q("""
       AND m.kind IN ('compaction', 'validated_overwrite')
     GROUP BY ALL ORDER BY w.workload, r.writers, m.kind, r.encoding, history""")
 history["mix"] = history.workload.map(WORKLOADS).fillna(history.workload)
+
+kept = q("""
+    SELECT r.encoding, sum(m.committed) / sum(m.ops) AS committed_share,
+           sum(m.exhausted) / sum(m.ops) AS exhausted_share
+    FROM kind_metrics m JOIN canonical_runs r USING (run_id)
+    WHERE list_contains(r.campaigns, 'c2r-expiry') AND m.kind = 'compaction' AND r.writers = 16
+    GROUP BY ALL""").set_index("encoding")
+fa_kept = q("""
+    SELECT r.encoding, avg(m.commits_s) AS commits_s
+    FROM kind_metrics m JOIN canonical_runs r USING (run_id) JOIN run_workload w USING (run_id)
+    WHERE list_contains(r.campaigns, 'c2r-expiry') AND m.kind = 'fast_append' AND r.writers = 16
+      AND w.workload = 'compaction+fast_append'
+    GROUP BY ALL""").set_index("encoding")
+mw_kept = kept.loc["manifest-window", "committed_share"]
+lamport_kept = kept.loc["lamport", "committed_share"]
+lamport_kept_exh = kept.loc["lamport", "exhausted_share"]
+mw_fa_kept = fa_kept.loc["manifest-window", "commits_s"]
+lamport_fa_kept = fa_kept.loc["lamport", "commits_s"]
 ```
 
 The driver's maintenance expires all but the last 50 snapshots every 5 s, which at 10 or more
@@ -135,6 +154,14 @@ commits/s keeps less history than a 5 s compaction needs: Iceberg fails a valida
 whose starting snapshot expired ("Cannot determine history"), whatever the encoding. Campaign
 `c2r-expiry` runs the compaction and overwrite mixes again, keeping every snapshot younger than
 30 s.
+
+With the history kept, {eval}`f"{100 * mw_kept:.0f}"`% of compactions commit at 16 writers under
+`manifest-window`, against {eval}`f"{100 * lamport_kept:.0f}"`% under `lamport`, where
+{eval}`f"{100 * lamport_kept_exh:.0f}"`% now exhaust Iceberg's retries instead: under `lamport` any
+commit that lands between a compaction's read and its write conflicts with it, and at 16 writers
+one nearly always does. Fast appends beside them
+commit {eval}`f"{mw_fa_kept:.1f}"`/s under `manifest-window` and {eval}`f"{lamport_fa_kept:.1f}"`/s
+under `lamport`.
 
 ```{code-cell} ipython3
 :label: c2r-history

@@ -89,8 +89,12 @@ to tables of one `FileIOCatalog` over an in-memory store whose requests take a p
 
 ## Known runs
 
-- The p5 campaign (c1-c6, 2026-10-27, havoc, 8 shards of 4 CPUs) ran fileio-catalog 705b9be,
-  rebased since without change to the tree as 45ea26c (the manifests record the first).
+- The p5 campaign (c1-c6, 2026-10-27, havoc, 8 shards of 4 CPUs) ran fileio-catalog 2afeb46 (its
+  manifests' git_sha; rebased since as d85309b): before the backoff after a lost race, with
+  lamport the default. CPU-bound at 16 and 32 writers (`run_cpu`). Superseded by p6.
+- The p6 campaign (c1-c7 and c2r, 2026-10-27, havoc, 6 shards of 16 CPUs) ran 8636dda: the code
+  merged, manifest-window the catalog's default (the campaigns name their encodings), the backoff
+  after a lost race (20 ms unless `race_min_wait_ms` says otherwise).
 
 - `pilot-fa`, `pilot-mix` (2026-10-27) were pilots of the driver. The first `pilot-mix` runs gave
   fast appends the validated operations' 2 s runtime too; the runtime is per kind since.

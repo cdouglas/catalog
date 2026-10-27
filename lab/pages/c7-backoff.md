@@ -34,14 +34,41 @@ df = q("""
     WHERE list_contains(r.campaigns, 'c7-backoff')
     GROUP BY ALL ORDER BY r.store, r.writers, r.encoding, race_min_wait_ms""")
 df["backoff"] = df.race_min_wait_ms.map(lambda ms: "none" if ms == 0 else f"{ms} ms")
+
+def at(store, writers, encoding, ms, col):
+    row = df[(df.store == store) & (df.writers == writers) & (df.encoding == encoding)
+             & (df.race_min_wait_ms == ms)]
+    return float(row[col].iloc[0]) if len(row) else float("nan")
+
+mw = lambda store, writers, ms, col: at(store, writers, "manifest-window", ms, col)
+lp = lambda store, writers, ms, col: at(store, writers, "lamport", ms, col)
 ```
 
 A writer that loses a race for the catalog object (another writer's append or replace landed
 first) reads it again and resends. Since 2026-10-27 the commit loop first waits a random time
 below a bound that starts at `fileio.catalog.race.retry.min-wait-ms` and doubles with each race
 the commit loses, up to 1 s (campaign `c7-backoff`: fast appends, 16 and 32 writers, no backoff
-and bounds of 20 and 100 ms, two runs per point). On `s3` every commit replaces the object, so
-every lost race costs a read of all of it.
+and bounds of 20 and 100 ms, two runs per point, p6). On `s3` every commit replaces the object,
+so every lost race costs a read of all of it.
+
+Under `manifest-window`, the backoff pays on both stores, more with the larger bound. On `s3x` at 32
+writers it commits {eval}`f"{mw('s3x', 32, 0, 'commits_s'):.1f}"`/s with none,
+{eval}`f"{mw('s3x', 32, 20, 'commits_s'):.1f}"` at 20 ms and
+{eval}`f"{mw('s3x', 32, 100, 'commits_s'):.1f}"` at 100 ms. On `s3` at 32 writers its throughput
+barely moves ({eval}`f"{mw('s3', 32, 0, 'commits_s'):.1f}"`,
+{eval}`f"{mw('s3', 32, 20, 'commits_s'):.1f}"`, {eval}`f"{mw('s3', 32, 100, 'commits_s'):.1f}"`), but
+the races an operation loses fall from {eval}`f"{mw('s3', 32, 0, 'cas_lost'):.1f}"` to
+{eval}`f"{mw('s3', 32, 20, 'cas_lost'):.1f}"` and {eval}`f"{mw('s3', 32, 100, 'cas_lost'):.1f}"`, its
+CPU from {eval}`f"{mw('s3', 32, 0, 'cpu_ms'):.0f}"` ms to {eval}`f"{mw('s3', 32, 20, 'cpu_ms'):.0f}"`
+and {eval}`f"{mw('s3', 32, 100, 'cpu_ms'):.0f}"`, and the operations that exhaust Iceberg's retries
+from {eval}`f"{100 * mw('s3', 32, 0, 'exhausted_share'):.1f}"`% to
+{eval}`f"{100 * mw('s3', 32, 20, 'exhausted_share'):.1f}"`% and
+{eval}`f"{100 * mw('s3', 32, 100, 'exhausted_share'):.1f}"`%; its p99 latency rises.
+
+Under `lamport` the backoff costs throughput on `s3x`
+({eval}`f"{lp('s3x', 16, 0, 'commits_s'):.1f}"`, {eval}`f"{lp('s3x', 16, 20, 'commits_s'):.1f}"` and
+{eval}`f"{lp('s3x', 16, 100, 'commits_s'):.1f}"` commits/s at 16 writers), so a `lamport` catalog
+on an appending store may do better without it (`fileio.catalog.race.retry.min-wait-ms` 0).
 
 ```{code-cell} ipython3
 :label: c7-commits

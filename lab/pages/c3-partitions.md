@@ -33,15 +33,33 @@ df = q("""
     GROUP BY ALL ORDER BY m.kind, r.partition_dist, r.partitions_per_txn, r.encoding""")
 vo = df[df.kind == "validated_overwrite"]
 fa = df[df.kind == "fast_append"]
+
+def share(ppt, dist, encoding):
+    row = vo[(vo.partitions_per_txn == ppt) & (vo.partition_dist == dist) & (vo.encoding == encoding)]
+    return float(row.committed_share.iloc[0]) if len(row) else float("nan")
+
+mw_1 = share(1, "uniform", "manifest-window")
+lamport_1 = share(1, "uniform", "lamport")
+mw_1z = share(1, "zipf", "manifest-window")
+best_4 = vo[vo.partitions_per_txn >= 4].committed_share.max()
 ```
 
 Fast appends with 20% validated overwrites, 16 writers on `s3x`, each operation writing 1, 4 or
 16 of the table's 32 partitions, chosen uniformly or by a Zipf distribution (campaign
-`c3-partitions`, two runs per point). An overwrite validates, from the snapshot its job read 2 s
+`c3-partitions`, p6, two runs per point). An overwrite validates, from the snapshot its job read 2 s
 (median) earlier, that no data or deletes landed in its partitions; the encodings that judge it
 by its partitions (`partition-vector`, `manifest-window`) merge it onto commits elsewhere, and
-`lamport` and `blind-append` (which judges only blind records by partition) make Iceberg retry it.
+`lamport` and `blind-append` (which merges only records that validate nothing) make Iceberg
+retry it.
 Its validation fails, whatever the encoding, when a commit landed in one of its partitions.
+
+An overwrite of one partition commits {eval}`f"{100 * mw_1:.0f}"`% of the time under
+`manifest-window` with uniform partitions ({eval}`f"{100 * mw_1z:.0f}"`% under Zipf, which sends
+more appends to the partitions it picks), against {eval}`f"{100 * lamport_1:.0f}"`% under `lamport`.
+From 4 partitions on, {eval}`"none" if best_4 < 0.005 else f"at most {100 * best_4:.0f}%"` commit
+under any encoding: with 16
+writers appending to 32 partitions, some append lands in one of four partitions within a 2 s job
+almost every time, and Iceberg's validation fails the overwrite.
 
 ```{code-cell} ipython3
 :label: c3-overwrites

@@ -29,8 +29,8 @@ kinds = """
     JOIN canonical_runs r USING (run_id) JOIN run_workload w USING (run_id)
     WHERE list_contains(r.campaigns, $c) AND m.kind = $k AND w.workload = $w AND r.writers = 16
     GROUP BY ALL"""
-compaction = per_encoding(kinds, c="c2-mixes", k="compaction", w="compaction+fast_append")
-overwrite = per_encoding(kinds, c="c2-mixes", k="validated_overwrite", w="favo10")
+compaction = per_encoding(kinds, c="c2r-expiry", k="compaction", w="compaction+fast_append")
+overwrite = per_encoding(kinds, c="c2r-expiry", k="validated_overwrite", w="favo10")
 c3 = per_encoding("""
     SELECT r.encoding, sum(m.committed) / sum(m.ops) AS v FROM kind_metrics m
     JOIN canonical_runs r USING (run_id)
@@ -39,8 +39,8 @@ c3 = per_encoding("""
 summary = pd.DataFrame({
     "fast appends/s, 4 writers (s3x)": fa4.v,
     "operations exhausting retries, 16-32 writers": exh.v,
-    "compactions committed, 16 writers": compaction.v,
-    "overwrites committed, 16 writers": overwrite.v,
+    "compactions committed, 16 writers (30 s history)": compaction.v,
+    "overwrites committed, 16 writers (30 s history)": overwrite.v,
     "overwrites committed, partitions campaign": c3.v,
 }).reset_index()
 
@@ -51,6 +51,16 @@ knobs = q("""
     FROM run_metrics m JOIN canonical_runs r USING (run_id) JOIN catalog_metrics k USING (run_id)
     WHERE list_contains(r.campaigns, 'c4-knobs') GROUP BY ALL
     ORDER BY r.writers, r.encoding, r.max_append_count""")
+
+backoff = q("""
+    SELECT r.store, r.writers, r.encoding,
+           CAST(json_extract(r.params::JSON, '$.race_min_wait_ms') AS INTEGER) AS race_min_wait_ms,
+           avg(m.commits_s) AS commits_s, avg(m.cas_lost + m.appends_lost) AS races_lost,
+           avg(m.cpu_ms) AS cpu_ms, sum(m.exhausted) / sum(m.ops) AS exhausted_share,
+           avg(m.p99_ms) AS p99_ms
+    FROM run_metrics m JOIN canonical_runs r USING (run_id)
+    WHERE list_contains(r.campaigns, 'c7-backoff') GROUP BY ALL
+    ORDER BY r.store, r.writers, r.encoding, race_min_wait_ms""")
 ```
 
 What the campaigns say about `fileio.catalog.conflict.encoding` and
@@ -65,9 +75,11 @@ many attempts, how many exhausted retries, and how much throughput a table gets.
 table(summary, caption="Per encoding (means over the runs named; shares of operations)")
 ```
 
-The caveats of the pages apply: on havoc's 4-CPU shards, the merging encodings were CPU-bound
-at 16 and 32 writers (so their throughput there is a floor), and the driver's maintenance kept
-only 50 snapshots, which failed long compactions and overwrites whatever the encoding.
+These are the p6 runs (fileio-catalog 8636dda, havoc shards of 16 CPUs). The caveats of the
+pages apply: at 16 and 32 writers the merging encodings still kept their shards' CPUs busy,
+reading a catalog object that grows with the table (the read path is the next bound); the
+compactions and overwrites are those of `c2r-expiry`, which keeps 30 s of history, since keeping
+50 snapshots failed long jobs whatever the encoding.
 
 `max.append.count` (fast appends on `s3x`):
 
@@ -76,4 +88,13 @@ only 50 snapshots, which failed long compactions and overwrites whatever the enc
 :tags: [remove-input]
 
 table(knobs, caption="Per writer count, encoding and max.append.count")
+```
+
+The backoff after a lost race (`fileio.catalog.race.retry.min-wait-ms`, fast appends):
+
+```{code-cell} ipython3
+:label: defaults-backoff
+:tags: [remove-input]
+
+table(backoff, caption="Per store, writer count, encoding and backoff bound (ms)")
 ```

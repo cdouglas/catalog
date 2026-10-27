@@ -58,22 +58,47 @@ m_s3x_40 = get(fa, "fileio", "s3x", "fa", 40, "lamport", "commits_s")
 e_s3x_40 = get(fa, "endive", "s3x", "fa", 40, "lamport", "commits_s")
 m_s3_40 = get(fa, "fileio", "s3", "fa", 40, "lamport", "commits_s")
 e_s3_40 = get(fa, "endive", "s3", "fa", 40, "lamport", "commits_s")
+m_pv_s3x_20 = get(fa, "fileio", "s3x", "fa", 20, "partition-vector", "commits_s")
+e_pv_s3x_20 = get(fa, "endive", "s3x", "fa", 20, "partition-vector", "commits_s")
+m_pv_s3x_40 = get(fa, "fileio", "s3x", "fa", 40, "partition-vector", "commits_s")
+e_pv_s3x_40 = get(fa, "endive", "s3x", "fa", 40, "partition-vector", "commits_s")
+m_l_commit = get(fa, "fileio", "s3x", "fa", 20, "lamport", "commit_ms")
+e_l_commit = get(fa, "endive", "s3x", "fa", 20, "lamport", "commit_ms")
+m_pv_s3_20 = get(fa, "fileio", "s3", "fa", 20, "partition-vector", "commits_s")
+m_l_s3_20 = get(fa, "fileio", "s3", "fa", 20, "lamport", "commits_s")
+pv_s3_cpu = float(q("""
+    SELECT avg(m.cpu_ms) AS cpu FROM kind_metrics m JOIN canonical_runs r USING (run_id)
+    JOIN run_workload w USING (run_id)
+    WHERE list_contains(r.campaigns, 'c6-openloop') AND r.source = 'contention'
+      AND r.store = 's3' AND r.encoding = 'partition-vector' AND r.arrival_rate = 20
+      AND w.workload = 'fa' AND m.kind = 'fast_append'""").cpu[0])
 ```
 
 Open load: transactions arrive at a fixed rate (lognormal inter-arrival times, as endive draws
-them) and wait for one of 128 writers (campaign `c6-openloop`). The same configurations went to
+them) and wait for one of 128 writers (campaign `c6-openloop`, p6). The same configurations went to
 endive, a discrete-event simulator of Iceberg's optimistic commits on these stores
 (`bench/endive/gen.py` maps each run's store, workload, rate and encoding to endive's: S3 Express
 commits by conditional append, S3 by CAS; `lamport` is endive's one-partition table,
 `partition-vector` its 32 partitions). endive's rows are its steady state over an hour (two seeds);
 fileio-catalog's are 60 s measured (two runs).
 
-At 40 transactions/s of fast appends under `lamport`, fileio-catalog commits
-{eval}`f"{m_s3x_40:.1f}"`/s on `s3x` where endive predicts {eval}`f"{e_s3x_40:.1f}"`, and
-{eval}`f"{m_s3_40:.1f}"`/s on `s3` where endive predicts {eval}`f"{e_s3_40:.1f}"`. endive models a
-commit as a few requests of fixed latency; fileio-catalog's commits also read and replay the
-catalog object, which grows with the table (see the fast-append scaling page), and a lost append
-race makes a writer read the object again.
+Under `partition-vector`, fileio-catalog keeps up with endive's prediction on `s3x` at 20
+transactions/s ({eval}`f"{m_pv_s3x_20:.1f}"` commits/s against {eval}`f"{e_pv_s3x_20:.1f}"`), and
+falls behind at 40 ({eval}`f"{m_pv_s3x_40:.1f}"` against {eval}`f"{e_pv_s3x_40:.1f}"`). Under
+`lamport` it falls behind sooner: at 40/s it commits {eval}`f"{m_s3x_40:.1f}"`/s on `s3x` where
+endive predicts {eval}`f"{e_s3x_40:.1f}"`, and {eval}`f"{m_s3_40:.1f}"`/s on `s3` where endive
+predicts {eval}`f"{e_s3_40:.1f}"`. endive models a commit as a few requests of fixed latency;
+fileio-catalog's commits also read and replay the catalog object, which grows with the table (see
+the fast-append scaling page), so a commit takes longer (at 20/s on `s3x` under `lamport`,
+{eval}`f"{m_l_commit:.0f}"` ms against endive's {eval}`f"{e_l_commit:.0f}"`), more commits overlap,
+and under `lamport` each overlap is a conflict.
+
+On `s3`, where every commit replaces the object, `partition-vector` does worse than `lamport` under
+overload ({eval}`f"{m_pv_s3_20:.1f}"` against {eval}`f"{m_l_s3_20:.1f}"` commits/s at 20/s), even
+with the backoff after a lost race: with 128 writers waiting, every lost race is a read of the
+whole object, {eval}`f"{pv_s3_cpu:.0f}"` ms of CPU per operation. `lamport`'s conflicts go back to
+Iceberg's retry, whose longer backoff throttles the writers. (The backoff page measures larger
+bounds; errata D14.)
 
 ```{code-cell} ipython3
 :label: c6-commits
