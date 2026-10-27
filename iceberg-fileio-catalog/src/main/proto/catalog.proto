@@ -100,7 +100,8 @@ message Checkpoint {
   // not know the encoding refuses the checkpoint.
   string conflict_encoding = 5;
 
-  // Catalog contents
+  // Catalog contents, each in order of its key (id; namespace id and then key
+  // for properties), so that a checkpoint is a function of the state (I11)
   repeated Namespace namespaces = 10;
   repeated Table tables = 11;
   repeated NamespaceProperty namespace_properties = 12;
@@ -158,8 +159,8 @@ message InlineTable {
   string name                 = 4;
   bytes  metadata             = 5;  // encoded TableMetadata bytes; see metadata_codec
   string manifest_list_prefix = 6;  // per-table dictionary: shared manifest file path prefix
-  repeated ManifestFileEntry manifest_pool       = 7;  // unique manifests for this table
-  repeated SnapshotManifestRefs snapshot_refs    = 8;  // per-snapshot index lists into pool
+  repeated ManifestFileEntry manifest_pool       = 7;  // unique manifests for this table, by path
+  repeated SnapshotManifestRefs snapshot_refs    = 8;  // per-snapshot index lists into pool, by snapshot id
   InlineMetadataCodec metadata_codec             = 9;  // codec for `metadata`
   bytes  conflict_state                          = 10; // as Table.conflict_state
 }

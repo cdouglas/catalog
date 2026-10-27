@@ -459,7 +459,7 @@
           {"number": 3, "name": "next_table_id", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": ""},
           {"number": 4, "name": "min_reader_version", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": "The reader version this checkpoint needs (ProtoCodec SUPPORTED_READER_VERSION, now 1); a reader that supports less refuses it."},
           {"number": 5, "name": "conflict_encoding", "type": "string", "repeated": false, "packed": false, "oneof": null, "comment": "The catalog's conflict encoding (ConflictEncoding): how replay decides whether a table update conflicts with what landed since its writer read the table. Absent until a record sets one (SetConflictEncoding), and then replay judges by the Lamport clock, \"lamport\". A reader that does not know the encoding refuses the checkpoint."},
-          {"number": 10, "name": "namespaces", "type": "Namespace", "repeated": true, "packed": true, "oneof": null, "comment": "Catalog contents"},
+          {"number": 10, "name": "namespaces", "type": "Namespace", "repeated": true, "packed": true, "oneof": null, "comment": "Catalog contents, each in order of its key (id; namespace id and then key for properties), so that a checkpoint is a function of the state (I11)"},
           {"number": 11, "name": "tables", "type": "Table", "repeated": true, "packed": true, "oneof": null, "comment": ""},
           {"number": 12, "name": "namespace_properties", "type": "NamespaceProperty", "repeated": true, "packed": true, "oneof": null, "comment": ""},
           {"number": 13, "name": "inline_tables", "type": "InlineTable", "repeated": true, "packed": true, "oneof": null, "comment": "Inline table metadata (tables with metadata stored in the catalog)"}
@@ -498,8 +498,8 @@
           {"number": 4, "name": "name", "type": "string", "repeated": false, "packed": false, "oneof": null, "comment": ""},
           {"number": 5, "name": "metadata", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": "encoded TableMetadata bytes; see metadata_codec"},
           {"number": 6, "name": "manifest_list_prefix", "type": "string", "repeated": false, "packed": false, "oneof": null, "comment": "per-table dictionary: shared manifest file path prefix"},
-          {"number": 7, "name": "manifest_pool", "type": "ManifestFileEntry", "repeated": true, "packed": true, "oneof": null, "comment": "unique manifests for this table"},
-          {"number": 8, "name": "snapshot_refs", "type": "SnapshotManifestRefs", "repeated": true, "packed": true, "oneof": null, "comment": "per-snapshot index lists into pool"},
+          {"number": 7, "name": "manifest_pool", "type": "ManifestFileEntry", "repeated": true, "packed": true, "oneof": null, "comment": "unique manifests for this table, by path"},
+          {"number": 8, "name": "snapshot_refs", "type": "SnapshotManifestRefs", "repeated": true, "packed": true, "oneof": null, "comment": "per-snapshot index lists into pool, by snapshot id"},
           {"number": 9, "name": "metadata_codec", "type": "InlineMetadataCodec", "repeated": false, "packed": false, "oneof": null, "comment": "codec for `metadata`"},
           {"number": 10, "name": "conflict_state", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": "as Table.conflict_state"}
         ]

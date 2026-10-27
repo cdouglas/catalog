@@ -277,6 +277,10 @@ public class ProtoCodec {
    * Encodes the catalog's state, the payload of a checkpoint (catalog.proto Checkpoint). The
    * catalog's id and committed transactions are the log's: the envelope (log.proto LogCheckpoint)
    * carries them, with this as its state.
+   *
+   * <p>The encoding is a function of the state alone (I11): what it holds in maps it writes in
+   * the order of their keys, never in a map's iteration order, which depends on how the map was
+   * built (decoded from a checkpoint, or copied from a state and changed).
    */
   public static byte[] encodeCheckpointState(CatalogState original) {
     try {
@@ -296,13 +300,15 @@ public class ProtoCodec {
       EncodingState.Codec stateCodec = original.conflictEncoding().stateCodec();
 
       // Namespaces - write from original state (mutations will be applied via transaction)
-      for (Map.Entry<Integer, CatalogState.NsEntry> entry : original.namespaceById().entrySet()) {
+      for (Map.Entry<Integer, CatalogState.NsEntry> entry :
+          sorted(original.namespaceById()).entrySet()) {
         byte[] nsBytes = encodeNamespace(entry.getKey(), entry.getValue());
         writeLengthDelimited(out, CHECKPOINT_NAMESPACES, nsBytes);
       }
 
       // Tables (pointer-mode only; inline tables encoded separately)
-      for (Map.Entry<Integer, CatalogState.TblEntry> entry : original.tableById().entrySet()) {
+      for (Map.Entry<Integer, CatalogState.TblEntry> entry :
+          sorted(original.tableById()).entrySet()) {
         if (!original.isInlineTable(entry.getKey())) {
           byte[] tblBytes = encodeTable(entry.getKey(), entry.getValue(),
               conflictState(original, stateCodec, entry.getKey()));
@@ -311,16 +317,18 @@ public class ProtoCodec {
       }
 
       // Namespace properties
-      for (Map.Entry<Integer, Map<String, String>> nsProps : original.allNamespaceProperties().entrySet()) {
+      for (Map.Entry<Integer, Map<String, String>> nsProps :
+          sorted(original.allNamespaceProperties()).entrySet()) {
         int nsId = nsProps.getKey();
-        for (Map.Entry<String, String> prop : nsProps.getValue().entrySet()) {
+        for (Map.Entry<String, String> prop : sorted(nsProps.getValue()).entrySet()) {
           byte[] propBytes = encodeNamespaceProperty(nsId, prop.getKey(), prop.getValue());
           writeLengthDelimited(out, CHECKPOINT_NAMESPACE_PROPERTIES, propBytes);
         }
       }
 
       // Inline tables (with optional manifest pool + snapshot refs)
-      for (Map.Entry<Integer, InlineTable> inlineEntry : original.allInlineTables().entrySet()) {
+      for (Map.Entry<Integer, InlineTable> inlineEntry :
+          sorted(original.allInlineTables()).entrySet()) {
         int tblId = inlineEntry.getKey();
         CatalogState.TblEntry tblEntry = original.tableById().get(tblId);
         if (tblEntry != null) {
@@ -339,6 +347,11 @@ public class ProtoCodec {
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
+  }
+
+  /** {@code map} in the order of its keys. */
+  private static <K extends Comparable<K>, V> java.util.SortedMap<K, V> sorted(Map<K, V> map) {
+    return new java.util.TreeMap<>(map);
   }
 
   /** The bytes of the conflict encoding's state of table {@code tblId}; empty if it has none. */
@@ -551,11 +564,11 @@ public class ProtoCodec {
       writeBytes(out, INLINE_TBL_CONFLICT_STATE, conflictState);
     }
 
-    // Manifest pool (field 7): encode each unique ManifestFile entry, and build the
-    // positional index for snapshot refs
+    // Manifest pool (field 7): encode each unique ManifestFile entry, in the order of their paths,
+    // and build the positional index for snapshot refs
     Map<String, Integer> pathToIndex = new java.util.HashMap<>();
     if (pool != null) {
-      List<String> poolOrder = new ArrayList<>(pool.keySet());
+      List<String> poolOrder = new ArrayList<>(sorted(pool).keySet());
       for (int i = 0; i < poolOrder.size(); i++) {
         pathToIndex.put(poolOrder.get(i), i);
         ManifestFile mf = pool.get(poolOrder.get(i));
@@ -564,11 +577,12 @@ public class ProtoCodec {
       }
     }
 
-    // Snapshot refs (field 8): per-snapshot index arrays. A snapshot without manifests (a delete
-    // that matched nothing) has an empty array but still needs its entry, even when the pool is
-    // empty: its inline:// manifest-list location resolves through it.
+    // Snapshot refs (field 8): per-snapshot index arrays, in the order of the snapshots' ids. A
+    // snapshot without manifests (a delete that matched nothing) has an empty array but still
+    // needs its entry, even when the pool is empty: its inline:// manifest-list location resolves
+    // through it.
     if (snapRefs != null) {
-      for (Map.Entry<Long, List<String>> snapEntry : snapRefs.entrySet()) {
+      for (Map.Entry<Long, List<String>> snapEntry : sorted(snapRefs).entrySet()) {
         byte[] refBytes = encodeSnapshotManifestRefs(
             snapEntry.getKey(), snapEntry.getValue(), pathToIndex);
         writeLengthDelimited(out, INLINE_TBL_SNAPSHOT_REFS, refBytes);

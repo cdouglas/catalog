@@ -461,7 +461,12 @@ while replay may hold the table only as fields (§"Replay State"), so the
 inline codec must round-trip exactly: decoding a table's encoding and
 encoding the result again gives the same bytes, the order of every map
 included. The structural codec writes snapshot summaries in its uniform
-mode only when every summary has the same keys in the same order. A
+mode only when every summary has the same keys in the same order. The
+checkpoint writes what the catalog's state holds in maps (namespaces,
+tables, properties, an inline table's manifest pool and lists) in the
+order of their keys, not in a map's iteration order, which depends on how
+the map was built (Bug 80, found by the runtime's check of each fold of a
+read onto a replica against a replay of the whole view). A
 codec that normalized the order made a compaction's checkpoint differ
 from the replay it replaced (`TestBlindAppendEncoding`'s I11 check found
 it). In the suites, `InlineTable` checks the round trip on every encode.

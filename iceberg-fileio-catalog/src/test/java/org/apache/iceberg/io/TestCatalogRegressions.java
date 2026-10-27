@@ -24,7 +24,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -4894,6 +4896,58 @@ public class TestCatalogRegressions {
           List.of(cmd(TableScript.Kind.BRANCH_APPEND, 10, 7, 3),
               cmd(TableScript.Kind.SET_LOCATION, 10, 9, 8)),
           cmd(TableScript.Kind.STAGED_APPEND, 9, 10, 1));
+    }
+  }
+
+  /**
+   * Bug 80: a checkpoint's bytes depended on how its state's maps were built. A table's map of
+   * snapshots to inline manifest lists became a HashMap when a builder changed it, and the
+   * checkpoint wrote it in the map's iteration order, which depends on the map's history: a state
+   * replayed from a checkpoint and the same state built on a replica (copied, then changed) wrote
+   * different bytes. A catalog object never compared two writers' checkpoints, but every
+   * checkpoint at one position must be the same (I11), as a shared log's compactors need; the
+   * runtime's check of each fold of a read onto a replica against a replay of the whole view found
+   * it. A checkpoint now writes everything it holds in maps in the order of the keys (ProtoCodec).
+   */
+  @Nested
+  class CheckpointOrderOfMaps {
+    @Test
+    void theOrderAStatesMapsWereBuiltInLeavesItsCheckpoint() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = LocalCatalogMode.APPEND_ML.catalog(io, "mem:///wh", "bug80", Map.of());
+      catalog.createNamespace(Namespace.of("ns"));
+      Schema schema = new Schema(Types.NestedField.required(1, "id", Types.LongType.get()));
+      Table table = catalog.createTable(TableIdentifier.of("ns", "t"), schema);
+      for (int i = 0; i < 24; i++) {
+        table.newFastAppend()
+            .appendFile(org.apache.iceberg.DataFiles.builder(table.spec())
+                .withPath("mem:///data/f" + i + ".parquet")
+                .withFileSizeInBytes(10)
+                .withRecordCount(1)
+                .build())
+            .commit();
+      }
+      CatalogState state = catalog.log().read().state();
+      int tblId = state.tableId(TableIdentifier.of("ns", "t"));
+      Map<String, ManifestFile> pool = state.manifestPool(tblId);
+      Map<Long, List<String>> lists = state.snapshotManifests(tblId);
+      assertThat(lists).hasSizeGreaterThan(20);
+
+      // The same state, its table's pool and lists put back in the reverse order
+      CatalogState.Builder reordered = CatalogStateMachine.INSTANCE.toBuilder(state);
+      reordered.removeSnapshotManifests(tblId, lists.keySet());
+      List<String> paths = new ArrayList<>(pool.keySet());
+      Collections.reverse(paths);
+      paths.forEach(path -> reordered.addManifestToPool(tblId, pool.get(path)));
+      List<Long> snapshots = new ArrayList<>(lists.keySet());
+      Collections.reverse(snapshots);
+      snapshots.forEach(id -> reordered.setSnapshotManifests(tblId, id, lists.get(id)));
+      CatalogState other = reordered.build();
+
+      assertThat(other.manifestPool(tblId)).isEqualTo(pool);
+      assertThat(other.snapshotManifests(tblId)).isEqualTo(lists);
+      assertThat(CatalogStateMachine.INSTANCE.encodeCheckpoint(other))
+          .isEqualTo(CatalogStateMachine.INSTANCE.encodeCheckpoint(state));
     }
   }
 }

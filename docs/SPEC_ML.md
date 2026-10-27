@@ -106,6 +106,8 @@ message SnapshotManifestRefs {
 
 Wire encoding uses positional indices into `manifest_pool` so the on-disk
 representation is compact. The path-keyed map is reconstructed on decode.
+A checkpoint writes `manifest_pool` in order of path and `snapshot_refs` in
+order of snapshot id, so that it is a function of the state (I11, Bug 80).
 A checkpoint writes a `SnapshotManifestRefs` for every snapshot with an
 inline list, even an empty one and even when the pool is empty: the
 snapshot's `inline://` manifest-list location resolves through it.

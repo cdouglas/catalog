@@ -86,6 +86,15 @@ fails if it is absent or exceeds `ProtoCodec.SUPPORTED_READER_VERSION`.
 A table ID appears in either `tables` (pointer mode) or `inline_tables`
 (inline mode), never both.
 
+A checkpoint is a function of the state it holds (I11): the encoder writes
+`namespaces`, `tables` and `inline_tables` in order of id, and
+`namespace_properties` in order of namespace id and then key; within an inline
+table, `manifest_pool` in order of path and `snapshot_refs` in order of
+snapshot id ([SPEC_ML.md](SPEC_ML.md)). The order of a map in memory depends on
+how it was built (decoded from a checkpoint, or copied from a state and
+changed), so writing in it made two replicas of one state write different
+checkpoints (Bug 80). A decoder accepts any order.
+
 `conflict_encoding` names how replay decides whether a table update
 conflicts with what landed since its writer read the table ([Conflict
 Encodings](#conflict-encodings)). A reader that does not know the encoding
