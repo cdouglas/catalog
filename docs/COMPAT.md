@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-10-24 — fileio-catalog eb4298a on fork atomicio 9cebc695a. Every suite below on real cloud, five stores: 3,072 tests, 0 failures, 280 skipped. All runs wrote the default structural codec (see "How to update this doc").
+last-verified: 2026-10-27 — fileio-catalog 8636dda on fork atomicio af875ccfd1. Every suite below on real cloud, five stores: 3,072 tests, 0 failures, 280 skipped. All runs wrote the default structural codec and the default conflict encoding, manifest-window (see "How to update this doc").
 ---
 
 # Cloud-store compatibility matrix
@@ -46,8 +46,8 @@ Status of `FileIOCatalog` cloud test suites across the
   requests a commit makes of the store, so the matrix is run under the
   default only; the other encodings run locally (their contracts,
   `TestRebaseProperties`, `TestConflictMatrix`, and the fuzzers, which
-  draw the encoding). The 2026-10-24 run predates the encodings and the
-  native replay state.
+  draw the encoding). The 2026-10-27 run is the first under an encoding
+  other than `lamport` and with replay's native table state.
 
 Cell legend:
 
@@ -70,7 +70,8 @@ Cell legend:
 | S3 Express One Zone  | OK | NR / OK | NR / OK | OK | NR / OK | NR / OK |
 | ADLS Gen2 (HNS)      | OK | NR / OK | NR / OK | OK | NR / OK | NR / OK |
 
-The 2026-10-24 run, by store:
+The 2026-10-27 run, by store (fileio-catalog 8636dda: `manifest-window`,
+`max.append.count` 100, the backoff after a lost race):
 
 | Store | Suites | Tests | Failed | Skipped |
 |---|---|---|---|---|
@@ -88,12 +89,15 @@ declare (`supportsEmptyNamespace`, `supportsVariant`,
 skip none.
 
 The fork's `SupportsAtomicOperations` contract tests last passed on these
-stores on 2026-10-21, at atomicio bee565b (the fork's README, "Testing on
-real cloud storage"). The fork has since added only `maxAppendBytes`, which
-the ADLS suites above call as each catalog opens its log.
+stores on 2026-10-26: GCS and ADLS at atomicio af875ccfd1, S3 in the run
+just before it. af875ccfd1 changes only the GCS Rapid suite's test of a CAS
+over a regular write, which failed in that earlier run. See the fork's
+README, "Testing on real cloud storage".
 
-Earlier runs: 2026-10-21 at 9f792e8, before the intention-log split, the
-same counts; 2026-10-20 at 6031709, every suite green on the same
+Earlier runs: 2026-10-26, the conflict encodings at the end of their
+phase 4 under the then default `lamport`, on fork atomicio 1f7ea07f1a, and
+2026-10-24 at eb4298a, the same counts;
+2026-10-21 at 9f792e8, before the intention-log split, the same counts; 2026-10-20 at 6031709, every suite green on the same
 stores; 2026-05-12, 1961 tests, 0 failures, before the rebase onto
 Iceberg 1.12.0, the ADLS Append Blob writes and the one-request GCS CAS.
 
