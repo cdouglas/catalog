@@ -140,6 +140,72 @@ class TestLogRuntime {
   }
 
   @Test
+  void aCommitFoldsTheRecordItReadsBackOntoItsBase() {
+    Replica<Map<String, Integer>> base = created();
+    int folds = ToyMachine.FOLDS.get();
+    Replica<Map<String, Integer>> r = bump(base, "a");
+    assertThat(ToyMachine.FOLDS.get() - folds).isEqualTo(1);
+    assertThat(r.state()).containsEntry("init", 1).containsEntry("a", 1);
+    assertThat(r.intentionRecords()).isEqualTo(2);
+  }
+
+  @Test
+  void aReadThatContinuesTheFloorFoldsOnlyTheRecordsAppended() {
+    Replica<Map<String, Integer>> floor = created();
+    otherWriterBumps("a");
+    otherWriterBumps("b");
+    int folds = ToyMachine.FOLDS.get();
+    Replica<Map<String, Integer>> r = runtime.read(floor);
+    assertThat(ToyMachine.FOLDS.get() - folds).isEqualTo(1);
+    assertThat(r.state()).containsEntry("init", 1).containsEntry("a", 1).containsEntry("b", 1);
+    assertThat(r.intentionRecords()).isEqualTo(3);
+    assertThat(r.tail().continues(floor.tail())).isTrue();
+  }
+
+  @Test
+  void aReadOfALogReplacedSinceTheFloorReplaysItWhole() {
+    Replica<Map<String, Integer>> floor = created();
+    Replica<Map<String, Integer>> live = runtime.read();
+    log.replaceDirectly(
+        LogEnvelope.encodeCheckpoint(live.logId(), live.committed().bytes(),
+            ToyMachine.INSTANCE.encodeCheckpoint(live.state())),
+        List.of());
+    otherWriterBumps("a");
+    int folds = ToyMachine.FOLDS.get();
+    Replica<Map<String, Integer>> r = runtime.read(floor);
+    assertThat(ToyMachine.FOLDS.get() - folds).isZero();
+    assertThat(r.state()).containsEntry("init", 1).containsEntry("a", 1);
+    assertThat(r.intentionRecords()).isEqualTo(1);
+  }
+
+  @Test
+  void aReadOntoAReplicaHoldingItsOwnRecordReplaysWhole() {
+    // A commit adopts a read that holds its own record, rejected where it landed; a fold onto that
+    // read would not see the record, and could not say what replay did with it.
+    log.limitSegments(3);
+    Replica<Map<String, Integer>> base = created();
+    int[] writes = {0};
+    log.beforeEveryWrite(() -> {
+      writes[0]++;
+      if (writes[0] == 1) {
+        otherWriterBumps("k"); // the first append loses; the resend lands after this, rejected
+      } else if (writes[0] == 4) {
+        otherWriterBumps("other"); // the replace loses; the read after it holds the record
+      }
+    });
+    // The resend lands and reports a conflict; the next append finds the log full, and the
+    // commit replaces it on a read that holds its rejected record
+    log.faults(Fault.NONE, Fault.LANDED_CONFLICT);
+    int folds = ToyMachine.FOLDS.get();
+    assertThatThrownBy(() -> bump(base, "k"))
+        .isInstanceOfSatisfying(CommitRejectedException.class,
+            e -> assertThat(e.reason()).isEqualTo(CommitRejectedException.Reason.CONFLICT));
+    assertThat(ToyMachine.FOLDS.get() - folds).isEqualTo(1); // the read before the replace
+    assertThat(log.calls).containsSubsequence("append", "append", "append", "read", "replace",
+        "read");
+  }
+
+  @Test
   void aLostAppendRaceToAnAppendResendsWithoutReading() { // [Refresh]
     Replica<Map<String, Integer>> base = created();
     log.beforeNextWrite(() -> otherWriterBumps("other"));

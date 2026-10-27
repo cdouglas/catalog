@@ -115,6 +115,9 @@
             <systemPropertyVariables>
               <!-- Tests run in their module's directory; docs/ is at the root, one up. -->
               <repo.root>${project.basedir}/..</repo.root>
+              <!-- Every replay that folds records onto a replica is checked against a replay of
+                   the whole view (LogRuntime). -->
+              <intentlog.replay.check>true</intentlog.replay.check>
             </systemPropertyVariables>
           </configuration>
         </plugin>

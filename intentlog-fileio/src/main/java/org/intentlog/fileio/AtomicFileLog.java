@@ -26,6 +26,7 @@ import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import org.apache.iceberg.io.AtomicOutputFile;
@@ -231,7 +232,7 @@ public final class AtomicFileLog implements SharedLog {
       while (in.available() > 0) {
         records.add(ProtoWire.readLengthDelimitedBytes(in));
       }
-      return new FileView(tail, checkpoint, records);
+      return new FileView(tail, checkpoint, Collections.unmodifiableList(records));
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }

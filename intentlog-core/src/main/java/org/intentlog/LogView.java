@@ -21,7 +21,11 @@ package org.intentlog;
 import java.util.List;
 import java.util.Optional;
 
-/** A read of a log: its latest checkpoint and the records after it, in log order. */
+/**
+ * A read of a log: its latest checkpoint and the records after it, in log order. A view never
+ * changes once returned, its bytes included: the runtime keeps the one a replica was replayed from,
+ * to tell whether a later view continues it.
+ */
 public interface LogView {
 
   /** The tail the read ended at. */

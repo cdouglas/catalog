@@ -284,6 +284,21 @@ after the checkpoint, and the log's id. `refresh(prior)` folds the records a
 replays afresh if the log trimmed them or returned a whole view. By I11 the
 two give the same replica.
 
+A replica the runtime replays from a whole view keeps that view. A later whole
+view that continues it byte for byte (the same checkpoint, then the same
+records and more) is replayed by folding only the records after it onto the
+replica: a read with a floor (`read(floor)`, `refresh` of a whole view), a
+commit's reads after a lost race (onto the replica it holds) and its read
+through its own write (onto the replica the write followed, so one record
+after an append). The same bytes replay to the same result, so the fold is
+replay, not a cache that could go stale: no provider obligation, and nothing
+in the protocol, changes. Comparing the bytes costs a memory compare of the
+view; replaying them again costs decoding the checkpoint, which grows with
+the state (docs/REPLAY_BENCH_RESULTS.md). A view whose held records include
+one of the watched id is replayed whole, since the fold cannot say what replay
+did with that record. With `-Dintentlog.replay.check=true` (the test suites
+set it) each fold is checked against a replay of the whole view.
+
 ## The committed set and GC
 
 The committed set holds the id of every intention record replay applied, less

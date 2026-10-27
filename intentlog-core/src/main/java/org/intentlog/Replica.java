@@ -31,14 +31,25 @@ public final class Replica<S> {
   private final LogTail tail;
   private final long intentionRecords;
   private final UUID logId;
+  // The whole view (a checkpoint and every record after it) this replica is the replay of, if a
+  // runtime replayed it from one: a later read whose view continues it byte for byte replays only
+  // the records after it (LogRuntime#replay).
+  private final LogView view;
 
   public Replica(
       S state, CommittedSet committed, LogTail tail, long intentionRecords, UUID logId) {
+    this(state, committed, tail, intentionRecords, logId, null);
+  }
+
+  Replica(
+      S state, CommittedSet committed, LogTail tail, long intentionRecords, UUID logId,
+      LogView view) {
     this.state = state;
     this.committed = committed;
     this.tail = tail;
     this.intentionRecords = intentionRecords;
     this.logId = logId;
+    this.view = view;
   }
 
   public S state() {
@@ -63,5 +74,10 @@ public final class Replica<S> {
   /** The log's id, which its checkpoints carry. */
   public UUID logId() {
     return logId;
+  }
+
+  /** The whole view this is the replay of, or null. */
+  LogView view() {
+    return view;
   }
 }

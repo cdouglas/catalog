@@ -20,7 +20,9 @@ package org.intentlog;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Supplier;
@@ -39,6 +41,14 @@ import org.intentlog.wire.UuidV7;
  * write of it still able to land (I10).
  */
 public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends Intention<B>> {
+
+  /**
+   * With {@code -Dintentlog.replay.check=true} (the test suites set it), each replay that folds
+   * records onto a replica ({@link #replay(LogView, UUID, UUID, Replica)}) is checked against a
+   * replay of the whole view: the same checkpoint of the state, committed set, record count and
+   * outcome.
+   */
+  static final boolean CHECK = Boolean.getBoolean("intentlog.replay.check");
 
   private final SharedLog log;
   private final StateMachine<S, B, I> machine;
@@ -59,10 +69,11 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
    * A fresh read, or {@code floor} if the read lags behind it: a replica this reader read or
    * committed in, so a read of the log too (P1 lets a read return any prefix). A reader that
    * passes the newest replica it has seen never sees the log go back, past its own commit
-   * included (Bug 72). A null floor is no floor.
+   * included (Bug 72). A null floor is no floor. A read that continues the one {@code floor} was
+   * replayed from replays only the records after it.
    */
   public Replica<S> read(Replica<S> floor) {
-    return newer(floor, read());
+    return newer(floor, replay(log.read(), null, null, floor).replica());
   }
 
   /**
@@ -94,12 +105,13 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
       return read(prior);
     }
     if (view.checkpoint().isPresent()) {
-      return newer(prior, replay(view, null, prior.logId()).replica());
+      return newer(prior, replay(view, null, prior.logId(), prior).replica());
     }
     Replay.Result<B> result =
         Replay.replayOnto(machine, machine.toBuilder(prior.state()), prior.committed().toBuilder(),
             prior.logId(), prior.intentionRecords(), view.records(), null);
-    return new Replayed(view, result, prior.logId()).replica();
+    // The view holds only the records after prior's, so the replica is the replay of no view
+    return new Replayed(null, view.tail(), result, prior.logId()).replica();
   }
 
   /**
@@ -249,13 +261,20 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
 
   /** A replay of a view: the builder before it is built, so a commit can verify on it. */
   private final class Replayed {
+    // The whole view replayed, or null if the records replayed followed a replica's
     private final LogView view;
+    private final LogTail tail;
     private final Replay.Result<B> result;
     private final UUID logId;
     private Replica<S> replica;
 
     Replayed(LogView view, Replay.Result<B> result, UUID logId) {
+      this(view, view.tail(), result, logId);
+    }
+
+    Replayed(LogView view, LogTail tail, Replay.Result<B> result, UUID logId) {
       this.view = view;
+      this.tail = tail;
       this.result = result;
       this.logId = logId;
     }
@@ -270,9 +289,10 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
             new Replica<>(
                 result.builder().build(),
                 result.committed().build(),
-                view.tail(),
+                tail,
                 result.intentionRecords(),
-                result.logId() != null ? result.logId() : logId);
+                result.logId() != null ? result.logId() : logId,
+                view);
       }
       return replica;
     }
@@ -287,9 +307,90 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
         view, Replay.replay(machine, view.checkpoint().orElse(null), view.records(), watch), logId);
   }
 
-  // ============================================================
-  // The commit loop
-  // ============================================================
+  /**
+   * The replay of the whole view {@code view}: if it continues, byte for byte, the view {@code
+   * prior} is the replay of (the same checkpoint, then the same records and more), the records
+   * after those folded onto {@code prior}; else replayed from its checkpoint. The same result
+   * either way, since replay is a deterministic fold of the bytes; but a read that finds a few
+   * records appended to the log it last read replays only those, not the checkpoint and every
+   * record after it again. A record of {@code watch} among those {@code prior} replayed would
+   * leave the fold unable to say what replay did with it, so then the view is replayed whole.
+   */
+  private Replayed replay(LogView view, UUID watch, UUID logId, Replica<S> prior) {
+    int from = prior == null ? -1 : continued(prior.view(), view, watch);
+    if (from < 0) {
+      return replay(view, watch, logId);
+    }
+    List<byte[]> records = view.records();
+    Replay.Result<B> folded =
+        Replay.replayOnto(machine, machine.toBuilder(prior.state()), prior.committed().toBuilder(),
+            prior.logId(), prior.intentionRecords(), records.subList(from, records.size()), watch);
+    Replayed result = new Replayed(view, folded, logId);
+    if (CHECK) {
+      check(result, replay(view, watch, logId));
+    }
+    return result;
+  }
+
+  /**
+   * The number of records of {@code view} that {@code before} holds, if {@code view} continues it
+   * byte for byte and none of them is a record of {@code watch}; else -1.
+   */
+  private static int continued(LogView before, LogView view, UUID watch) {
+    if (before == null) {
+      return -1;
+    }
+    byte[] checkpoint = before.checkpoint().orElse(null);
+    if (!Arrays.equals(checkpoint, view.checkpoint().orElse(null))) {
+      return -1;
+    }
+    List<byte[]> held = before.records();
+    List<byte[]> records = view.records();
+    if (records.size() < held.size()) {
+      return -1;
+    }
+    for (int i = 0; i < held.size(); i++) {
+      byte[] record = held.get(i);
+      if (!Arrays.equals(record, records.get(i))) {
+        return -1;
+      }
+      if (watch != null) {
+        LogEnvelope.Record decoded = LogEnvelope.decodeRecord(record);
+        if (!decoded.isAdvanceHorizon() && decoded.id().equals(watch)) {
+          return -1;
+        }
+      }
+    }
+    return held.size();
+  }
+
+  /** Fails unless a fold replayed what the replay of the whole view did. */
+  private void check(Replayed folded, Replayed whole) {
+    Replica<S> a = folded.replica();
+    Replica<S> b = whole.replica();
+    List<String> differ = new ArrayList<>();
+    if (!Arrays.equals(machine.encodeCheckpoint(a.state()), machine.encodeCheckpoint(b.state()))) {
+      differ.add("state");
+    }
+    if (!Arrays.equals(a.committed().bytes(), b.committed().bytes())) {
+      differ.add("committed set");
+    }
+    if (a.intentionRecords() != b.intentionRecords()) {
+      differ.add("records");
+    }
+    if (folded.result.outcome() != whole.result.outcome()
+        || folded.result.seen() != whole.result.seen()) {
+      differ.add("outcome");
+    }
+    if (!Objects.equals(a.logId(), b.logId())) {
+      differ.add("log id");
+    }
+    if (!differ.isEmpty()) {
+      throw new IllegalStateException(
+          "A fold onto a replica of " + log + " differs from a replay of the whole view: "
+              + String.join(", ", differ));
+    }
+  }
 
   /** A write whose outcome is unknown: its reply was lost, or reading back what it wrote failed. */
   private static final class AmbiguousWrite extends RuntimeException {
@@ -673,7 +774,8 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
         }
         Replayed written;
         try {
-          written = replay(log.readThrough(receipt, config.visibilityWait()), id, base.logId());
+          written =
+              replay(log.readThrough(receipt, config.visibilityWait()), id, base.logId(), current);
         } catch (RuntimeException e) {
           throw new AmbiguousWrite(e);
         }
@@ -707,7 +809,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
               new LogLagException("Interrupted waiting for " + log));
           view = log.read();
         }
-        return replay(view, id, base.logId());
+        return replay(view, id, base.logId(), current);
       } catch (CommitOutcomeUnknownException e) {
         throw new UnreadableLog((RuntimeException) e.getCause()); // interrupted waiting
       } catch (RuntimeException e) {

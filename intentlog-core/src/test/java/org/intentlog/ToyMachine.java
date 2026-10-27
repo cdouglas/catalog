@@ -23,6 +23,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * A toy state machine for the runtime's tests: keys with versions, and intentions that bump a key
@@ -66,6 +67,17 @@ final class ToyMachine implements StateMachine<Map<String, Integer>, ToyMachine.
     public void apply(Versions state) {
       state.versions.merge(key, 1, Integer::sum);
     }
+  }
+
+  // Calls of toBuilder: each is a replay that folds records onto a replica (TestLogRuntime)
+  static final AtomicInteger FOLDS = new AtomicInteger();
+
+  @Override
+  public Versions toBuilder(Map<String, Integer> state) {
+    FOLDS.incrementAndGet();
+    Versions versions = new Versions();
+    versions.versions.putAll(state);
+    return versions;
   }
 
   @Override

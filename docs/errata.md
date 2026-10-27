@@ -284,8 +284,50 @@ A principled rule:
   one, costs a writer: bytes or replay time of the tail against the
   checkpoint's.
 
+Replay folds a read onto the replica it continues (LOG.md "Replay"), so a
+writer that holds a replica replays only the records appended since; a
+compaction changes the checkpoint, and every writer then decodes the new
+one. That shifts the trade toward compacting less often than the campaign's
+100, which was chosen before the fold.
+
 **Trigger to revisit:** a deployment on a store other than S3 Express, or
 the contention benchmark's Azure and GCS profiles.
+
+### D15. A read of the catalog object reads all of it
+
+A writer that holds a replica replays only the records appended since it
+read (LOG.md "Replay"), but `AtomicFileLog` still GETs the whole object for
+every read, read through a write, and refresh. The contention benchmark does
+not see this: endive's profiles price a GET by request, not by size. On a
+real store a catalog object of several MB (inline manifest lists over
+thousands of snapshots, docs/REPLAY_BENCH_RESULTS.md) costs its transfer on
+every attempt.
+
+`SharedLog.readAfter(since)` is the SPI for reading only what follows a tail
+(`InMemorySharedLog` implements it). On one object, a ranged GET from
+`since.bytes()` is sound only if the object is still the one `since` read,
+extended by appends: `FileTail.continues` compares lengths, which a replace
+that grows the object defeats, and a replace can write a record a reader
+already holds (a commit's own record, resent in its replace) at any offset.
+A sound design:
+
+- each replace writes a random incarnation id in the object's header
+  (format version 3), and each append frames its record with the id of the
+  incarnation it extends;
+- every append is conditioned on the exact version it extends, as it is
+  today on S3 Express (`If-Match` and the write offset) and on Azure (the
+  append position and `If-Match`), so a record can land only in the
+  incarnation it names;
+- a probe reads the header with a ranged GET instead of a HEAD, which gives
+  the version, the length and the incarnation in one request, so a resend
+  after a lost race names the incarnation it lands in;
+- `readAfter(since)` GETs from the start of the last frame `since` holds: if
+  those bytes match and the frames after them name `since`'s incarnation,
+  it returns the frames after; else it reads the whole object.
+
+**Trigger to revisit:** a deployment whose catalog object grows past a few
+MB on a store that appends, or a benchmark profile that prices a GET by its
+bytes.
 
 ### D8. Typed-protobuf encoding for Iceberg structural types (skip JSON serde)
 
