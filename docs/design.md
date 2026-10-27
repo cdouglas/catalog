@@ -761,7 +761,8 @@ conditional append, set `max.append.count = 0` to force CAS-only mode.
 A writer that loses a race for the object (another writer's append or
 replace landed first) waits before it reads again and resends: a time
 drawn below a bound that starts at `fileio.catalog.race.retry.min-wait-ms`
-(default 20 ms) and doubles with each race the commit loses, up to 1 s.
+(default 100 ms, the best of none, 20 and 100 ms in the contention benchmark's
+`c7-backoff` under `manifest-window`) and doubles with each race the commit loses, up to 1 s.
 Without it the writers who lost to one winner all read and resend at
 once, and on a store that only replaces, most lose again, each loss a
 read of the whole object: at 32 writers on an S3 general-purpose bucket,

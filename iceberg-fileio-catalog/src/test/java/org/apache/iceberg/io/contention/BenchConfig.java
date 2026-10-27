@@ -96,7 +96,7 @@ final class BenchConfig {
           + "\"expire_retain\": 50,"
           + "\"expire_older_than_s\": 0,"
           // the catalog's backoff after a lost race (fileio.catalog.race.retry.min-wait-ms)
-          + "\"race_min_wait_ms\": 20,"
+          + "\"race_min_wait_ms\": 100,"
           // sampling of the catalog object
           + "\"sample_every_ms\": 1000"
           + "}";
@@ -200,15 +200,16 @@ final class BenchConfig {
   }
 
   /**
-   * Keys added after the first campaign (p5, 2026-10-27), with their defaults: one at its default
-   * is left out of the hash, so a configuration keeps the hash its earlier runs recorded.
+   * Keys added after the first campaign (p5, 2026-10-27), with the value the runs that recorded no
+   * such key ran (race_min_wait_ms: p6's, the catalog's default then): one at that value is left
+   * out of the hash, so a configuration keeps the hash its earlier runs recorded.
    */
   private static final Map<String, String> LATER_KEYS =
       Map.of("expire_older_than_s", "0", "race_min_wait_ms", "20");
 
   /**
    * The first 12 hex digits of the SHA-256 of the configuration, less its label, its repetition and
-   * the later keys at their defaults.
+   * the later keys at their earlier values.
    */
   String hash() {
     ObjectNode copy = node.deepCopy();

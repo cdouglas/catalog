@@ -561,7 +561,7 @@ function CREATE():                                # a log with separate checkpoi
 twice the previous wait up to the larger of 5 s and that value, each plus up
 to 50% random jitter. `raceBackoff()` waits a time drawn uniformly below a
 bound (full jitter): `RuntimeConfig.raceMinWaitMs` (the catalog's
-`fileio.catalog.race.retry.min-wait-ms`, default 20 ms; 0: no wait) after the
+`fileio.catalog.race.retry.min-wait-ms`, default 100 ms; 0: no wait) after the
 commit's first lost race, doubled for each later one, up to the larger of
 1 s and that value. The writers who lost to one winner would otherwise all
 read and resend at once, and on a log that only replaces itself most of them

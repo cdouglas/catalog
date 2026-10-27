@@ -140,7 +140,7 @@ object holds one intention record.
 | `fileio.catalog.max.append.count` | 100 | Soft limit on intention records (GC records not counted): a writer that reads at least this many replaces instead of appending. Writers retrying a lost append race do not read the count again, so the log can run a few records past it. The stores bound it (S3 Express 10,000 parts, Azure Append Blob 50,000 blocks): an append past one is refused, and the writer compacts instead, so a count above the store's limit costs a refused append, not a stuck catalog. Measured best of 0, 100 and 1000 on S3 Express (design.md §"Choosing append vs CAS"). **0 replaces on every commit**, which an S3 general-purpose bucket needs |
 | `fileio.catalog.max.append.size` | 16777216 | Soft target for the object's size. Larger objects take longer to read |
 | `fileio.catalog.throttle.retry.min-wait-ms` | 200 | First wait before sending again a write that storage throttled ([LOG.md](LOG.md) §"The commit loop") |
-| `fileio.catalog.race.retry.min-wait-ms` | 20 | Bound of the random wait after a lost race, before the writer reads or probes the object again ([LOG.md](LOG.md) §"The commit loop") |
+| `fileio.catalog.race.retry.min-wait-ms` | 100 | Bound of the random wait after a lost race, before the writer reads or probes the object again ([LOG.md](LOG.md) §"The commit loop") |
 | `fileio.catalog.committed.retention.ms` | 21600000 (6 h) | How long the committed set keeps an id ([LOG.md](LOG.md) §"The committed set and GC") |
 
 **CAS-only mode.** A store that replaces conditionally but cannot append

@@ -256,19 +256,33 @@ chosen encoding.
 ### D14. `max.append.count` and the race backoff are fixed numbers, not per store
 
 `fileio.catalog.max.append.count` defaults to 100 and
-`fileio.catalog.race.retry.min-wait-ms` to 20 ms, both from one store's
-measurements (S3 Express, in the contention benchmark: design.md
-§"Choosing append vs CAS"). The best values depend on the store's
-latencies (an Azure append that loses its race takes about 2 s to say so;
-an S3 general-purpose bucket only replaces) and on the catalog: a reader
-replays the records after the checkpoint and reads the whole object, so
-the tail's cost grows with the records and the object, while a
-compaction's cost is the checkpoint's size and its race with the others'
-appends. A principled rule would compact when the tail costs a read more
-than a compaction amortized over the commits until the next one costs a
-writer (bytes or replay time of the records after the checkpoint against
-the checkpoint's), and would scale the backoff to the store's write
-latency, which the commit loop measures.
+`fileio.catalog.race.retry.min-wait-ms` to 100 ms, both from one store's
+latencies as the contention benchmark injects them (endive's S3 Express
+profile: a conditional append takes about 21 ms to land and 23 ms to lose;
+design.md §"Choosing append vs CAS"). The best values depend on the
+store's latencies as a writer sees them, which differ by store and by
+where the writer runs: from a cloud VM in the bucket's zone, S3 Express
+took about 11 ms an append (90 a second), so 100 ms is about nine appends
+there and five in the benchmark; an Azure append that loses its race takes
+about 2 s to say so, so 100 ms is too short there; an S3 general-purpose
+bucket only replaces. They also depend on the catalog: a reader replays
+the records after the checkpoint and reads the whole object, so the tail's
+cost grows with the records and the object, while a compaction's cost is
+the checkpoint's size and its race with the others' appends.
+
+A principled rule:
+
+- **Backoff by observed latency.** The commit loop times each write it
+  sends. After a lost race, wait a time drawn below a bound of a few times
+  the latency of the write that lost (or a moving average of the loop's
+  writes), doubled with each race the commit loses, with the property as a
+  floor and a cap of a few hundred writes' worth. The writers who lost to
+  one winner then spread over a few write slots, whatever the store and
+  however far the writer is from it.
+- **Compact by cost.** Compact when the records after the checkpoint cost a
+  reader more than a compaction, amortized over the commits until the next
+  one, costs a writer: bytes or replay time of the tail against the
+  checkpoint's.
 
 **Trigger to revisit:** a deployment on a store other than S3 Express, or
 the contention benchmark's Azure and GCS profiles.

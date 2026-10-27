@@ -80,7 +80,7 @@ public final class LogCatalogProperties {
    * that the writers who lost spread out instead of racing again at once. 0: resend at once.
    */
   public static final String RACE_MIN_WAIT_MS = "fileio.catalog.race.retry.min-wait-ms";
-  public static final long DEFAULT_RACE_MIN_WAIT_MS = 20L;
+  public static final long DEFAULT_RACE_MIN_WAIT_MS = 100L;
 
   /**
    * The conflict encoding of a catalog this one creates, by name: how replay decides whether a
