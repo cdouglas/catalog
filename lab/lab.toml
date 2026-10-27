@@ -6,7 +6,8 @@ name = "fileio-catalog"
 root = ".."
 
 # The multi-writer contention driver (bench/run.sh, org.apache.iceberg.io.contention) writes
-# bench/results/<label>-<config hash>/<UTC start>/ with manifest.json, ops.jsonl and samples.jsonl.
+# bench/results/<label>-<config hash>/<UTC start>-r<repetition>/ (in the p5 campaign, <UTC start>/)
+# with manifest.json, ops.jsonl and samples.jsonl.
 # builds/ holds the class snapshots of each campaign.
 [[runs]]
 name = "contention"

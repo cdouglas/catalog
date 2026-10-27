@@ -33,7 +33,11 @@ to tables of one `FileIOCatalog` over an in-memory store whose requests take a p
   snapshot the job read, so their runtime is their conflict window.
 - Iceberg's commit retry is on (`retry_num`, default 4, with its backoff from `retry_min_wait_ms`).
 - A maintenance thread expires all but the last `expire_retain` snapshots every `expire_every_s`
-  (kind `expire`), keeping tables at a steady size.
+  (kind `expire`), keeping tables at a steady size; with `expire_older_than_s` (added after the
+  p5 campaign; 0, its default, expires every snapshot but those) only snapshots older than that.
+  A validated operation whose starting snapshot expires during its job fails Iceberg's validation
+  ("Cannot determine history"): with 50 snapshots kept, at 10+ commits/s the history is shorter
+  than a 5 s compaction.
 
 ## `ops` (one row per operation)
 
@@ -72,7 +76,21 @@ to tables of one `FileIOCatalog` over an in-memory store whose requests take a p
 `catalog_bytes`, `checkpoint_bytes`, `records` (intention records after the checkpoint),
 `objects` (in the store) and `heap_used`.
 
+## The host
+
+- `run_cpu` (views/30_flags.sql): the driver's process CPU over the run, per CPU the JVM saw.
+  Above 60% (`cpu_bound`), the writers queued for the host's CPUs, which writers on their own
+  machines would not: such a run measured the host as much as the protocol. havoc's shards had 4
+  CPUs each in the p5 campaign; at 16 and 32 writers the merging encodings were CPU-bound there.
+- A writer's CPU per operation grows with the catalog object, which grows with the table: fast
+  appends never merge manifests, and an inline-ML checkpoint holds each snapshot's list of
+  manifests (snapshots x manifests). A run that commits faster ends with a larger object. A
+  compaction (a merging snapshot producer) merges manifests, which keeps the object small.
+
 ## Known runs
+
+- The p5 campaign (c1-c6, 2026-10-27, havoc, 8 shards of 4 CPUs) ran fileio-catalog 705b9be,
+  rebased since without change to the tree as 45ea26c (the manifests record the first).
 
 - `pilot-fa`, `pilot-mix` (2026-10-27) were pilots of the driver. The first `pilot-mix` runs gave
   fast appends the validated operations' 2 s runtime too; the runtime is per kind since.

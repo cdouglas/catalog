@@ -42,3 +42,16 @@ select = ["c5-tables-*"]
 [campaigns.c6-openloop]
 title = "Open load at endive's arrival rates, and endive's predictions for it"
 select = ["c6-openloop-*", "source:endive"]
+
+[[annotate]]
+select = ["c1-fa-scaling-5483b5ea1a71/20261027T065040Z", "c1-fa-scaling-362491b9b86e/20261027T065204Z"]
+mark = "excluded"
+note = "two runs (repetitions 0 and 1) started in the same second and wrote one directory; their ops interleave (fixed: a run's directory names its repetition)"
+
+[campaigns.c2r-expiry]
+title = "c2's compaction and overwrite mixes keeping 30 s of history, so expiry fails no job"
+select = ["c2r-expiry-*"]
+
+[campaigns.c7-backoff]
+title = "The commit loop's backoff after a lost race: none, 20 ms, 100 ms"
+select = ["c7-backoff-*"]

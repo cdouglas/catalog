@@ -26,3 +26,4 @@ bench/results/
 lab/lab.duckdb
 lab/_build/
 bench/build/
+lab/__pycache__/
