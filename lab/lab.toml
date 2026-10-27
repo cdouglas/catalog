@@ -1,0 +1,65 @@
+# labbook: where fileio-catalog's benchmark results are and how to read them (see the labbook skill).
+version = 1
+
+[project]
+name = "fileio-catalog"
+root = ".."
+
+# The multi-writer contention driver (bench/run.sh, org.apache.iceberg.io.contention) writes
+# bench/results/<label>-<config hash>/<UTC start>/ with manifest.json, ops.jsonl and samples.jsonl.
+# builds/ holds the class snapshots of each campaign.
+[[runs]]
+name = "contention"
+kind = "manifest"
+root = "bench/results"
+glob = "*/*"
+exclude = ["builds/*"]
+id = "{label}-{config_hash}/{dir.name}"
+
+[runs.fields]
+git_sha = "versions.fileio_git"
+git_dirty = "versions.fileio_dirty"
+
+[runs.promote]
+store = "config.store"
+encoding = "config.encoding"
+mode = "config.mode"
+writers = { path = "config.writers", type = "INTEGER" }
+arrival_rate = { path = "config.arrival_rate", type = "DOUBLE" }
+think_ms = { path = "config.think_ms", type = "DOUBLE" }
+tables = { path = "config.tables", type = "INTEGER" }
+partitions = { path = "config.partitions", type = "INTEGER" }
+partitions_per_txn = { path = "config.partitions_per_txn", type = "INTEGER" }
+partition_dist = "config.partition_dist"
+max_append_count = { path = "config.max_append_count", type = "INTEGER" }
+duration_s = { path = "config.duration_s", type = "DOUBLE" }
+warmup_s = { path = "config.warmup_s", type = "DOUBLE" }
+runtime_median_ms = { path = "config.runtime_median_ms", type = "DOUBLE" }
+expire_every_s = { path = "config.expire_every_s", type = "INTEGER" }
+seed = { path = "config.seed", type = "INTEGER" }
+repetition = { path = "config.repetition", type = "INTEGER" }
+mix = "config.mix"
+
+# One row per operation: what it was, when it arrived, started and ended (ms since the run's
+# start), how it ended, the commits its catalog attempted (conflicts: replay rejected the record
+# and Iceberg retried), and the requests it made of the store. measured = it started after the
+# warmup and before the end.
+[[facts]]
+name = "ops"
+runs = "contention"
+file = "ops.jsonl"
+format = "jsonl"
+mode = "table"
+only_finished = true
+options = { ignore_errors = true }
+
+# The catalog object, sampled every sample_every_ms: its size, its checkpoint's, the records after
+# the checkpoint, the store's objects and the driver's heap.
+[[facts]]
+name = "samples"
+runs = "contention"
+file = "samples.jsonl"
+format = "jsonl"
+mode = "table"
+only_finished = true
+options = { ignore_errors = true }

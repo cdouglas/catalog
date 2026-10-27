@@ -1,0 +1,12 @@
+{
+  "label": "pilot-fa",
+  "store": "s3x",
+  "mode": "ml",
+  "warmup_s": 5,
+  "duration_s": 30,
+  "mix": {"fast_append": 1.0},
+  "vary": {
+    "encoding": ["lamport", "blind-append"],
+    "writers": [1, 4, 16]
+  }
+}

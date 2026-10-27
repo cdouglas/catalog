@@ -21,3 +21,7 @@ spec/tla/tools/
 spec/tla/states/
 spec/tla/*_TTrace_*
 spec/tla/__pycache__/
+# contention driver results (bench/run.sh) and labbook artifacts
+bench/results/
+lab/lab.duckdb
+lab/_build/

@@ -1,0 +1,20 @@
+# What the raw results cannot say about themselves; applied by `lab ingest`, edited by hand or
+# with `lab annotate`. Selectors: a run_id glob, "path:<glob>" (path under the project root),
+# "source:<name>", or "where:<SQL over runs_raw>".
+
+# [campaigns.example]
+# title = "What this group of runs answers"
+# select = ["example-*"]
+
+# [[annotate]]
+# select = "path:results/superseded-*"
+# mark = "superseded"          # superseded | excluded | canonical | none
+# note = "why"
+# tags = ["tag"]
+
+[campaigns.pilot]
+select = ["pilot-mix-*", "pilot-fa-*"]
+[[annotate]]
+select = "where:label = 'pilot-mix' AND started_at < TIMESTAMP '2026-10-27 05:45:00'"
+mark = "superseded"
+note = "runtime applied to fast appends too (per-kind runtimes since)"

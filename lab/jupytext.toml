@@ -1,0 +1,4 @@
+# Pages open as notebooks in JupyterLab (`lab jupyter`; right-click a page, Open With, Jupytext
+# Notebook) and save back as MyST Markdown. Keep the page's frontmatter (title and the like);
+# leave out jupytext's own header and what the kernel adds.
+notebook_metadata_filter = "all,-jupytext,-language_info,-widgets"

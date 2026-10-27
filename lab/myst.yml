@@ -1,0 +1,10 @@
+version: 1
+project:
+  title: fileio-catalog results
+  toc:
+    - file: index.md
+    - pattern: pages/*.md
+  exclude:
+    - NOTES.md
+site:
+  template: book-theme
