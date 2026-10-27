@@ -61,13 +61,9 @@ public class CatalogState {
   // Namespace properties: nsId -> (key -> value)
   private final Map<Integer, Map<String, String>> nsProperties;
 
-  // Inline table metadata: tblId -> opaque encoded bytes (TableMetadata)
-  // A table ID appears in either tableById (pointer) or tblInlineMetadata (inline), not both.
+  // Inline table metadata: tblId -> the table's metadata (encoded, or as replay keeps it).
   // Inline tables also appear in tableById with metadataLocation = null for lookup purposes.
-  // tblInlineMetadataCodec is parallel to tblInlineMetadata: the codec used to
-  // encode the bytes.
-  private final Map<Integer, byte[]> tblInlineMetadata;
-  private final Map<Integer, Byte> tblInlineMetadataCodec;
+  private final Map<Integer, InlineTable> tblInlineMetadata;
   private final Map<Integer, String> tblManifestPrefix;
 
   // Inline manifest list state: per-table pool of unique ManifestFile entries keyed by path,
@@ -91,7 +87,6 @@ public class CatalogState {
     this.tableLookup = ImmutableMap.copyOf(builder.tableLookup);
     this.nsProperties = deepCopyProperties(builder.nsProperties);
     this.tblInlineMetadata = ImmutableMap.copyOf(builder.tblInlineMetadata);
-    this.tblInlineMetadataCodec = ImmutableMap.copyOf(builder.tblInlineMetadataCodec);
     this.tblManifestPrefix = ImmutableMap.copyOf(builder.tblManifestPrefix);
     this.manifestPool = deepCopyManifestPool(builder.manifestPool);
     this.snapshotManifests = deepCopySnapshotManifests(builder.snapshotManifests);
@@ -190,7 +185,7 @@ public class CatalogState {
   /** The table's inline metadata (encoded by its codec), or null if it is not inline. */
   public byte[] inlineMetadata(TableIdentifier table) {
     Integer id = tableLookup.get(table);
-    return id != null ? tblInlineMetadata.get(id) : null;
+    return id != null ? inlineMetadata(id) : null;
   }
 
   // ============================================================
@@ -243,8 +238,17 @@ public class CatalogState {
     return nsProperties;
   }
 
-  /** Returns inline metadata bytes for the given table ID, or null if not inline. */
+  /**
+   * Returns inline metadata bytes for the given table ID, or null if not inline. A table replay
+   * changed is encoded when first asked for.
+   */
   public byte[] inlineMetadata(int tblId) {
+    InlineTable table = tblInlineMetadata.get(tblId);
+    return table != null ? table.bytes() : null;
+  }
+
+  /** The table's inline metadata, or null if it is not inline. */
+  InlineTable inlineTable(int tblId) {
     return tblInlineMetadata.get(tblId);
   }
 
@@ -254,10 +258,10 @@ public class CatalogState {
    * be present alongside the inline metadata bytes.
    */
   public byte inlineMetadataCodec(int tblId) {
-    Byte tag = tblInlineMetadataCodec.get(tblId);
+    InlineTable table = tblInlineMetadata.get(tblId);
     Preconditions.checkState(
-        tag != null, "Not an inline table or missing codec tag: %s", tblId);
-    return tag;
+        table != null, "Not an inline table or missing codec tag: %s", tblId);
+    return table.codec();
   }
 
   /** Returns the manifest list prefix for the given inline table, or null. */
@@ -270,12 +274,8 @@ public class CatalogState {
     return tblInlineMetadata.containsKey(tblId);
   }
 
-  Map<Integer, byte[]> allInlineMetadata() {
+  Map<Integer, InlineTable> allInlineTables() {
     return tblInlineMetadata;
-  }
-
-  Map<Integer, Byte> allInlineMetadataCodecs() {
-    return tblInlineMetadataCodec;
   }
 
   Map<Integer, String> allManifestPrefixes() {
@@ -395,8 +395,7 @@ public class CatalogState {
     private final Map<Integer, TblEntry> tableById = new HashMap<>();
     private final Map<TableIdentifier, Integer> tableLookup = new HashMap<>();
     private final Map<Integer, Map<String, String>> nsProperties = new HashMap<>();
-    private final Map<Integer, byte[]> tblInlineMetadata = new HashMap<>();
-    private final Map<Integer, Byte> tblInlineMetadataCodec = new HashMap<>();
+    private final Map<Integer, InlineTable> tblInlineMetadata = new HashMap<>();
     private final Map<Integer, String> tblManifestPrefix = new HashMap<>();
     private final Map<Integer, Map<String, ManifestFile>> manifestPool = new HashMap<>();
     private final Map<Integer, Map<Long, List<String>>> snapshotManifests = new HashMap<>();
@@ -600,8 +599,7 @@ public class CatalogState {
       Namespace ns = buildNamespace(namespaceId);
       tableLookup.put(TableIdentifier.of(ns, name), id);
       // Store inline-specific data
-      tblInlineMetadata.put(id, metadata);
-      tblInlineMetadataCodec.put(id, metadataCodec);
+      tblInlineMetadata.put(id, InlineTable.ofBytes(metadata, metadataCodec));
       tblManifestPrefix.put(id, manifestListPrefix);
       // Same monotonicity argument as addTable: keep nextTableId ahead of any id
       // that arrived via transaction replay. Without this, a fresh checkpoint
@@ -622,8 +620,12 @@ public class CatalogState {
      * inline storage gets the empty manifest list prefix, as a created one does.
      */
     public Builder updateInlineMetadata(int id, int newVersion, byte[] metadata, byte codec) {
-      tblInlineMetadata.put(id, metadata);
-      tblInlineMetadataCodec.put(id, codec);
+      return updateInlineTable(id, newVersion, InlineTable.ofBytes(metadata, codec));
+    }
+
+    /** As {@link #updateInlineMetadata}, with the table's metadata as replay keeps it. */
+    Builder updateInlineTable(int id, int newVersion, InlineTable table) {
+      tblInlineMetadata.put(id, table);
       tblManifestPrefix.putIfAbsent(id, "");
       TblEntry old = tableById.get(id);
       if (old != null) {
@@ -635,7 +637,6 @@ public class CatalogState {
     /** Removes inline metadata for a table (e.g., when transitioning to pointer mode). */
     public Builder removeInlineMetadata(int id) {
       tblInlineMetadata.remove(id);
-      tblInlineMetadataCodec.remove(id);
       tblManifestPrefix.remove(id);
       manifestPool.remove(id);
       snapshotManifests.remove(id);
@@ -727,15 +728,36 @@ public class CatalogState {
     }
 
     public byte[] inlineMetadata(int id) {
+      InlineTable table = tblInlineMetadata.get(id);
+      return table != null ? table.bytes() : null;
+    }
+
+    /** The table's inline metadata, or null if it is not inline. */
+    InlineTable inlineTable(int id) {
       return tblInlineMetadata.get(id);
+    }
+
+    /**
+     * The metadata location of inline table {@code id} at its version, as a client's load names
+     * it ({@code LogCatalog.metadataLocation}); the metadata log of its next version records it.
+     */
+    String inlineLocation(int id) {
+      return inlineLocation(id, tableVersion(id));
+    }
+
+    /** {@link #inlineLocation(int)} at version {@code version} of the table. */
+    String inlineLocation(int id, int version) {
+      TblEntry entry = tableById.get(id);
+      TableIdentifier ident = entry != null ? tableKeyOrNull(entry) : null;
+      return "inline://" + ident + "#" + id + "." + version;
     }
 
     /** Codec tag for the bytes returned by {@link #inlineMetadata(int)}. */
     public byte inlineMetadataCodec(int id) {
-      Byte tag = tblInlineMetadataCodec.get(id);
+      InlineTable table = tblInlineMetadata.get(id);
       Preconditions.checkState(
-          tag != null, "Not an inline table or missing codec tag: %s", id);
-      return tag;
+          table != null, "Not an inline table or missing codec tag: %s", id);
+      return table.codec();
     }
 
     public String manifestListPrefix(int id) {

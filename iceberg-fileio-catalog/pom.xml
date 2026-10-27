@@ -255,6 +255,11 @@
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
         <configuration>
+          <systemPropertyVariables>
+            <!-- Every replay of a delta on a table's fields is checked against Iceberg's
+                 builder (NativeDelta). -->
+            <fileio.catalog.replay.check>true</fileio.catalog.replay.check>
+          </systemPropertyVariables>
           <excludes>
             <exclude>**/aws/**</exclude>
             <exclude>**/gcp/**</exclude>

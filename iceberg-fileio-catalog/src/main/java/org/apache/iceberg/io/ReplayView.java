@@ -33,11 +33,9 @@ final class ReplayView {
   private final CatalogState.Builder builder;
   private final int tableId;
   private final int version;
-  private final byte[] inlineMetadata;
-  private final byte codecTag;
+  private final InlineTable inline;
   private final String location;
-  private TableMetadata metadata;
-  private MetadataView view;
+  private String inlineLocation;
 
   private ReplayView(CatalogState.Builder builder, int tableId) {
     this.builder = builder;
@@ -45,8 +43,7 @@ final class ReplayView {
     CatalogState.TblEntry entry = builder.tableEntry(tableId);
     this.version = entry != null ? entry.version : -1;
     this.location = entry != null ? entry.metadataLocation : null;
-    this.inlineMetadata = builder.inlineMetadata(tableId);
-    this.codecTag = inlineMetadata != null ? builder.inlineMetadataCodec(tableId) : 0;
+    this.inline = builder.inlineTable(tableId);
   }
 
   /** Table {@code tableId} as {@code builder} holds it now. */
@@ -70,7 +67,7 @@ final class ReplayView {
 
   /** Whether the table's metadata is inline. */
   boolean inline() {
-    return inlineMetadata != null;
+    return inline != null;
   }
 
   /** A pointer table's metadata file; null for an inline table. */
@@ -78,21 +75,23 @@ final class ReplayView {
     return location;
   }
 
-  /** An inline table's metadata, decoded once; null for a pointer table. */
+  /**
+   * An inline table's metadata, at the location a client's load names it; null for a pointer
+   * table. Builds it whole: a judgment reads {@link #table} instead.
+   */
   TableMetadata metadata() {
-    if (metadata == null && inlineMetadata != null) {
-      metadata =
-          InlineDeltaCodec.decodeBase(inlineMetadata, InlineMetadataCodecs.byTag(codecTag));
+    if (inline == null) {
+      return null;
     }
-    return metadata;
+    if (inlineLocation == null) {
+      inlineLocation = builder.inlineLocation(tableId, version);
+    }
+    return inline.metadata(inlineLocation);
   }
 
   /** What replay reads of an inline table's metadata; null for a pointer table. */
   MetadataView table() {
-    if (view == null && inlineMetadata != null) {
-      view = MetadataView.of(metadata());
-    }
-    return view;
+    return inline != null ? inline.fields() : null;
   }
 
   /** Whether the table has an inline manifest list for {@code snapshotId}. */
@@ -108,13 +107,6 @@ final class ReplayView {
   /** The manifest the table's lists name by {@code path}, or null. */
   ManifestFile manifest(String path) {
     return builder.manifestPool(tableId).get(path);
-  }
-
-  /** Whether {@code builder} holds the table as this view does: same version, same metadata. */
-  boolean sameAs(CatalogState.Builder other) {
-    return other == builder
-        && other.tableVersion(tableId) == version
-        && other.inlineMetadata(tableId) == inlineMetadata;
   }
 
   @Override

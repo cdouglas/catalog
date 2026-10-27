@@ -449,13 +449,15 @@ final class Landing {
   /** {@code summary} with its totals counted from {@code previous}, a parent's summary. */
   private static Map<String, String> withTotals(
       Map<String, String> summary, Map<String, String> previous) {
+    // Each total keeps its place in the writer's summary, as SnapshotProducer.summary places it
     Map<String, String> counted = new LinkedHashMap<>(summary);
     for (List<String> total : TOTALS) {
-      counted.remove(total.get(0));
       String value =
           total(previous.get(total.get(0)), summary.get(total.get(1)), summary.get(total.get(2)));
       if (value != null) {
         counted.put(total.get(0), value);
+      } else {
+        counted.remove(total.get(0));
       }
     }
     return counted;

@@ -98,7 +98,6 @@ final class ConflictEncodings {
         return false;
       }
     }
-    action.verifiedOn(landing);
     return true;
   }
 

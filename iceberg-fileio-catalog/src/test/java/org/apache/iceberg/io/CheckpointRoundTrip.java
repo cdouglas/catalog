@@ -299,13 +299,12 @@ public final class CheckpointRoundTrip {
     for (TableIdentifier t : file.tables()) {
       items.put("table name " + t, String.valueOf(file.tableId(t)));
     }
-    file.allInlineMetadata()
+    file.allInlineTables()
         .forEach(
-            (id, bytes) ->
+            (id, table) ->
                 items.put(
                     "table " + id + " inline metadata",
-                    String.format(
-                        "codec=%s %s", file.allInlineMetadataCodecs().get(id), fingerprint(bytes))));
+                    String.format("codec=%s %s", table.codec(), fingerprint(table.bytes()))));
     file.allManifestPrefixes()
         .forEach((id, prefix) -> items.put("table " + id + " manifest prefix", prefix));
     file.allManifestPools()

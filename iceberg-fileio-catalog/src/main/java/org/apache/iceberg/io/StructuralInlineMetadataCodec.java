@@ -29,10 +29,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import org.apache.iceberg.InlineDeltaSnapshots;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.TableMetadata;
@@ -592,17 +590,16 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
       p.keys = new ArrayList<>();
       return p;
     }
+    // Uniform: every summary has the same keys in the same order, which the block then writes
+    // once. Order counts: decoding gives each summary the block's key order, and must give back
+    // the map encoded, so that a replica that decoded a table and one that built it by replay hold
+    // and encode the same (I11).
     Snapshot first = snaps.get(0);
-    Set<String> firstKeys = new LinkedHashSet<>();
-    if (first.operation() != null) firstKeys.add("operation");
-    if (first.summary() != null) firstKeys.addAll(first.summary().keySet());
+    List<String> firstKeys = summaryKeys(first);
 
     boolean uniform = true;
     for (Snapshot s : snaps) {
-      Set<String> keys = new LinkedHashSet<>();
-      if (s.operation() != null) keys.add("operation");
-      if (s.summary() != null) keys.addAll(s.summary().keySet());
-      if (!keys.equals(firstKeys)) {
+      if (!summaryKeys(s).equals(firstKeys)) {
         uniform = false;
         break;
       }
@@ -648,6 +645,18 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
       else p.stringValues[ki] = strs;
     }
     return p;
+  }
+
+  /** The keys of {@code snapshot}'s summary as the block writes them: the operation first. */
+  private static List<String> summaryKeys(Snapshot snapshot) {
+    List<String> keys = new ArrayList<>();
+    if (snapshot.operation() != null) {
+      keys.add("operation");
+    }
+    if (snapshot.summary() != null) {
+      keys.addAll(snapshot.summary().keySet());
+    }
+    return keys;
   }
 
   private static List<int[]> rleSchema(List<Snapshot> snaps) {

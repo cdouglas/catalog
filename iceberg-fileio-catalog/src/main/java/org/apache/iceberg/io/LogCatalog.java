@@ -420,15 +420,6 @@ public class LogCatalog extends BaseMetastoreCatalog
     return InlineMetadataCodecs.byShortName(shortName);
   }
 
-  /**
-   * Returns the codec tag recorded for the given inline table. Callers must
-   * have already verified the table is inline via
-   * {@link CatalogState#isInlineTable(TableIdentifier)}.
-   */
-  private static byte inlineCodecTag(CatalogState state, TableIdentifier table) {
-    return state.inlineMetadataCodec(state.tableId(table));
-  }
-
   //
   // SupportsNamespaces
   //
@@ -573,12 +564,10 @@ public class LogCatalog extends BaseMetastoreCatalog
         // location from (name, id, version) directly; see metadataLocation.
         // No content hashing, no collision worry.
         loaded = true;
-        byte[] inlineMeta = state.inlineMetadata(tableId);
-        byte codecTag = inlineCodecTag(state, tableId);
-        InlineMetadataCodec codec = InlineMetadataCodecs.byTag(codecTag);
+        InlineTable inlineTable = state.inlineTable(state.tableId(tableId));
         String syntheticLoc = metadataLocation(state, tableId);
         refreshFromMetadataLocation(syntheticLoc, null, 0,
-            loc -> wrapInlineManifests(codec.decodeFull(inlineMeta, loc), state));
+            loc -> wrapInlineManifests(inlineTable.metadata(loc), state));
       } else if (loaded || currentMetadataLocation() != null) {
         // Table used to exist but is now missing
         throw new NoSuchTableException("Table %s was deleted", tableId);

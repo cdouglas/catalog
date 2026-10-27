@@ -320,16 +320,16 @@ public class ProtoCodec {
       }
 
       // Inline tables (with optional manifest pool + snapshot refs)
-      for (Map.Entry<Integer, byte[]> inlineEntry : original.allInlineMetadata().entrySet()) {
+      for (Map.Entry<Integer, InlineTable> inlineEntry : original.allInlineTables().entrySet()) {
         int tblId = inlineEntry.getKey();
         CatalogState.TblEntry tblEntry = original.tableById().get(tblId);
         if (tblEntry != null) {
           String prefix = original.allManifestPrefixes().getOrDefault(tblId, "");
           Map<String, ManifestFile> pool = original.manifestPool(tblId);
           Map<Long, List<String>> snapRefs = original.snapshotManifests(tblId);
-          byte codecTag = original.inlineMetadataCodec(tblId);
+          InlineTable table = inlineEntry.getValue();
           byte[] inlineBytes = encodeInlineTable(
-              tblId, tblEntry, inlineEntry.getValue(), codecTag, prefix, pool, snapRefs,
+              tblId, tblEntry, table.bytes(), table.codec(), prefix, pool, snapRefs,
               conflictState(original, stateCodec, tblId));
           writeLengthDelimited(out, CHECKPOINT_INLINE_TABLES, inlineBytes);
         }
@@ -2213,24 +2213,32 @@ public class ProtoCodec {
       // read unless a conflict encoding admitted it on a later one.
       int next = builder.tableVersion(id) + 1;
       if (deltaBytes != null) {
-        // DELTA mode: apply structured changes to current inline metadata.
-        // Decode base, apply delta, re-encode with the SAME codec the base
-        // used (delta mode preserves the on-disk codec — codec changes only
-        // happen via FULL re-inline).
-        byte[] currentMeta = builder.inlineMetadata(id);
-        if (currentMeta != null) {
-          byte baseCodecTag = builder.inlineMetadataCodec(id);
-          InlineMetadataCodec baseCodec = InlineMetadataCodecs.byTag(baseCodecTag);
-          // Apply delta — routes ML updates to builder's manifest pool; on a version later than
-          // the one the update read, its late-bound fields are finalized there (Landing)
-          TableMetadata updated = InlineDeltaCodec.applyDelta(
-              table().landingMetadata(builder, before), table().delta(), builder, id,
-              next - 1 != version);
-          // Rotate the inline metadata without clearing manifest pool/refs.
-          CatalogState.TblEntry old = builder.tableEntry(id);
-          if (old != null) {
-            builder.updateInlineMetadata(id, next, baseCodec.encode(updated), baseCodecTag);
+        // DELTA mode: apply structured changes to current inline metadata, which keeps its codec
+        // (codec changes only happen via FULL re-inline). The ML updates go to the builder's
+        // manifest pool; on a version later than the one the update read, the delta's late-bound
+        // fields are finalized there (Landing). A delta of snapshots, refs and properties replays
+        // on the table's fields (NativeDelta); any other, on its metadata through Iceberg's
+        // builder.
+        InlineTable current = builder.inlineTable(id);
+        if (current != null && builder.tableEntry(id) != null) {
+          boolean stale = next - 1 != version;
+          String location = builder.inlineLocation(id);
+          InlineDeltaCodec.DecodedDelta delta = table().delta();
+          InlineTable updated;
+          if (NativeDelta.applies(delta)) {
+            TableFields base = current.fields();
+            TableFields applied = NativeDelta.apply(base, delta, builder, id, stale, location);
+            if (NativeDelta.CHECK) {
+              NativeDelta.check(
+                  base, location, delta, stale, builder.manifestListPrefix(id), applied);
+            }
+            updated = InlineTable.ofFields(applied, current.codec());
+          } else {
+            updated = InlineTable.ofMetadata(
+                InlineDeltaCodec.applyDelta(current.metadata(location), delta, builder, id, stale),
+                current.codec());
           }
+          builder.updateInlineTable(id, next, updated);
         }
       } else if (fullMetadata != null) {
         // FULL mode: replace inline metadata bytes in place, preserving the

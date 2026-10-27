@@ -927,11 +927,11 @@ public class FormatExplorerFixtures {
    * {@code table}'s metadata as replay decodes it to apply a delta: under the synthetic location
    * that the committed metadata's log then names as its previous file.
    */
+  /** The table's metadata at the location replay's metadata log records for its version. */
   private static TableMetadata replayBase(CatalogState state, TableIdentifier table) {
     int id = state.tableId(table);
-    byte[] bytes = state.inlineMetadata(id);
     return InlineMetadataCodecs.byTag(state.inlineMetadataCodec(id))
-        .decodeFull(bytes, "inline://#" + Integer.toHexString(Arrays.hashCode(bytes)));
+        .decodeFull(state.inlineMetadata(id), LogCatalog.metadataLocation(state, table));
   }
 
   private static TableMetadata inlineMetadata(CatalogState state, TableIdentifier table) {

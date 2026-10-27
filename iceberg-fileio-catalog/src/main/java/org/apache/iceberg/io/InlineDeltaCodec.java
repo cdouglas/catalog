@@ -382,10 +382,11 @@ public class InlineDeltaCodec {
         // The manifest decoded from the wire has a suffix-only path; resolve full path
         ManifestFile resolved = landing.manifest(resolve(add.manifest, prefix));
         catalogBuilder.addManifestToPool(tableId, resolved);
-        newSnapshots.addManifest(current, add.snapshotId, resolved.path(), add.position);
+        newSnapshots.addManifest(
+            MetadataView.of(current), add.snapshotId, resolved.path(), add.position);
       } else if (update instanceof RemoveManifestUpdate) {
         RemoveManifestUpdate rm = (RemoveManifestUpdate) update;
-        newSnapshots.removeManifest(current, rm.snapshotId, rm.manifestPathSuffix);
+        newSnapshots.removeManifest(MetadataView.of(current), rm.snapshotId, rm.manifestPathSuffix);
       }
     }
     if (pending != null) {
@@ -439,7 +440,7 @@ public class InlineDeltaCodec {
    * #finish} settles them in order. Until then each snapshot's ref list holds what is known so far,
    * which keeps its parent's manifests in the pool if the same delta removes the parent snapshot.
    */
-  private static final class NewSnapshotManifests {
+  static final class NewSnapshotManifests {
     private final CatalogState.Builder builder;
     private final int tableId;
     // Each new snapshot's parent (null for none), in the order added.
@@ -457,7 +458,7 @@ public class InlineDeltaCodec {
     }
 
     /** Registers {@code snapshotId}, just added to {@code current}, unless it has a list. */
-    void add(TableMetadata current, long snapshotId) {
+    void add(MetadataView current, long snapshotId) {
       Snapshot snap = current.snapshot(snapshotId);
       add(snapshotId, snap != null ? snap.parentId() : null);
     }
@@ -474,7 +475,7 @@ public class InlineDeltaCodec {
       builder.setSnapshotManifests(tableId, snapshotId, base);
     }
 
-    void addManifest(TableMetadata current, long snapshotId, String path, Integer position) {
+    void addManifest(MetadataView current, long snapshotId, String path, Integer position) {
       if (parents.containsKey(snapshotId)) {
         added.computeIfAbsent(snapshotId, k -> new ArrayList<>()).add(path);
         positions.computeIfAbsent(snapshotId, k -> new ArrayList<>()).add(position);
@@ -493,7 +494,7 @@ public class InlineDeltaCodec {
       }
     }
 
-    void removeManifest(TableMetadata current, long snapshotId, String suffix) {
+    void removeManifest(MetadataView current, long snapshotId, String suffix) {
       if (parents.containsKey(snapshotId)) {
         removedSuffixes.computeIfAbsent(snapshotId, k -> new ArrayList<>()).add(suffix);
       }
@@ -503,7 +504,7 @@ public class InlineDeltaCodec {
     }
 
     /** The snapshot's list so far; one this delta did not add starts as its parent's. */
-    private List<String> refs(TableMetadata current, long snapshotId) {
+    private List<String> refs(MetadataView current, long snapshotId) {
       if (!builder.snapshotManifestKeys(tableId).contains(snapshotId)) {
         Snapshot snap = current.snapshot(snapshotId);
         Long parentId = snap != null ? snap.parentId() : null;
@@ -585,7 +586,7 @@ public class InlineDeltaCodec {
       String location = snap.manifestListLocation();
       if (location != null && location.startsWith("inline://")
           && !listed.contains(snap.snapshotId())) {
-        newSnapshots.add(current, snap.snapshotId());
+        newSnapshots.add(MetadataView.of(current), snap.snapshotId());
       }
     }
     for (DeltaUpdate update : decoded.updates) {
@@ -594,16 +595,17 @@ public class InlineDeltaCodec {
         // Register sentinel snapshots so applyDeltaWithManifests's invariant
         // (sentinel ⇒ pool entry) holds even without manifest updates.
         if (addSnap.manifestListSuffix.isEmpty()) {
-          newSnapshots.add(current, addSnap.snapshotId);
+          newSnapshots.add(MetadataView.of(current), addSnap.snapshotId);
         }
       } else if (update instanceof AddManifestUpdate) {
         AddManifestUpdate add = (AddManifestUpdate) update;
         ManifestFile resolved = resolve(add.manifest, prefix);
         catalogBuilder.addManifestToPool(tableId, resolved);
-        newSnapshots.addManifest(current, add.snapshotId, resolved.path(), add.position);
+        newSnapshots.addManifest(
+            MetadataView.of(current), add.snapshotId, resolved.path(), add.position);
       } else if (update instanceof RemoveManifestUpdate) {
         RemoveManifestUpdate rm = (RemoveManifestUpdate) update;
-        newSnapshots.removeManifest(current, rm.snapshotId, rm.manifestPathSuffix);
+        newSnapshots.removeManifest(MetadataView.of(current), rm.snapshotId, rm.manifestPathSuffix);
       } else if (update instanceof RemoveSnapshotsUpdate) {
         RemoveSnapshotsUpdate rs = (RemoveSnapshotsUpdate) update;
         for (long snapId : rs.snapshotIds) {
@@ -1527,6 +1529,11 @@ public class InlineDeltaCodec {
 
     @Override
     public void applyTo(TableMetadata.Builder builder) {
+      builder.setRef(refName, toRef());
+    }
+
+    /** The ref this update sets. */
+    org.apache.iceberg.SnapshotRef toRef() {
       org.apache.iceberg.SnapshotRef.Builder refBuilder;
       if ("tag".equals(refType)) {
         refBuilder = org.apache.iceberg.SnapshotRef.tagBuilder(snapshotId);
@@ -1542,7 +1549,7 @@ public class InlineDeltaCodec {
       if (maxRefAgeMs > 0) {
         refBuilder.maxRefAgeMs(maxRefAgeMs);
       }
-      builder.setRef(refName, refBuilder.build());
+      return refBuilder.build();
     }
   }
 

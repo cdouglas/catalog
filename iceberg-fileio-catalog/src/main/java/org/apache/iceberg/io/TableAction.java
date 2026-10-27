@@ -21,7 +21,6 @@ package org.apache.iceberg.io;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.io.InlineDeltaCodec.AddManifestUpdate;
 import org.apache.iceberg.io.InlineDeltaCodec.AddSnapshotUpdate;
 import org.apache.iceberg.io.InlineDeltaCodec.DecodedDelta;
@@ -62,8 +61,6 @@ final class TableAction {
   private final boolean pinned;
   private final byte[] deltaBytes;
   private DecodedDelta delta;
-  // the view verify admitted the action on, which apply reuses while the table is unchanged
-  private ReplayView verifiedOn;
 
   private TableAction(Kind kind, int tableId, int baseVersion, boolean pinned, byte[] deltaBytes) {
     this.kind = kind;
@@ -144,23 +141,6 @@ final class TableAction {
   /** The manifests the delta's new snapshots remove from their parents' lists. */
   List<RemoveManifestUpdate> removedManifests() {
     return updates(RemoveManifestUpdate.class);
-  }
-
-  /** Records that verify admitted the action on {@code view}. */
-  void verifiedOn(ReplayView view) {
-    this.verifiedOn = view;
-  }
-
-  /**
-   * The table's metadata as {@code builder} holds it, which {@code now} views, decoded once:
-   * verify's, if the table is the one it admitted the action on.
-   */
-  TableMetadata landingMetadata(CatalogState.Builder builder, ReplayView now) {
-    ReplayView view = verifiedOn;
-    if (view == null || !view.sameAs(builder)) {
-      view = now;
-    }
-    return view.metadata();
   }
 
   @Override
