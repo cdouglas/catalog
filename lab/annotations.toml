@@ -18,3 +18,27 @@ select = ["pilot-mix-*", "pilot-fa-*"]
 select = "where:label = 'pilot-mix' AND started_at < TIMESTAMP '2026-10-27 05:45:00'"
 mark = "superseded"
 note = "runtime applied to fast appends too (per-kind runtimes since)"
+
+[campaigns.c1-fa-scaling]
+title = "Fast appends as writers scale, per encoding, on s3x (append) and s3 (CAS only)"
+select = ["c1-fa-scaling-*"]
+
+[campaigns.c2-mixes]
+title = "Fast appends with validated overwrites, compactions, property sets, and WAP branches"
+select = ["c2-mixes-*"]
+
+[campaigns.c3-partitions]
+title = "Partitions per operation and their skew, for the partition judges"
+select = ["c3-partitions-*"]
+
+[campaigns.c4-knobs]
+title = "max.append.count: CAS on every commit, 100, 1000"
+select = ["c4-knobs-*"]
+
+[campaigns.c5-tables]
+title = "Tables on one catalog object"
+select = ["c5-tables-*"]
+
+[campaigns.c6-openloop]
+title = "Open load at endive's arrival rates, and endive's predictions for it"
+select = ["c6-openloop-*", "source:endive"]
