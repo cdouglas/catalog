@@ -353,9 +353,8 @@ public class InlineDeltaCodec {
           // Cascade snapshot removal to the catalog pool: drop the snapshot's ref
           // list and GC any pool entries no longer referenced. Without this, the
           // pool grows unboundedly as snapshots are expired (SPEC_ML.md).
-          for (long snapId : ((RemoveSnapshotsUpdate) update).snapshotIds) {
-            catalogBuilder.removeSnapshotManifests(tableId, snapId);
-          }
+          catalogBuilder.removeSnapshotManifests(
+              tableId, ((RemoveSnapshotsUpdate) update).snapshotIds);
           // Builder.removeSnapshots also cleans up the TM side's dangling refs.
           update.applyTo(pending);
         } else if (update instanceof SetSnapshotRefUpdate) {
@@ -465,13 +464,13 @@ public class InlineDeltaCodec {
 
     /** Registers {@code snapshotId}, a child of {@code parentId} (null: none), unless it has a list. */
     void add(long snapshotId, Long parentId) {
-      if (builder.snapshotManifestKeys(tableId).contains(snapshotId)) {
+      if (builder.hasSnapshotManifests(tableId, snapshotId)) {
         return;
       }
       List<String> base =
           parentId != null ? builder.snapshotManifestPaths(tableId, parentId) : List.of();
       parents.put(snapshotId, parentId);
-      inherited.put(snapshotId, new ArrayList<>(base));
+      inherited.put(snapshotId, base);
       builder.setSnapshotManifests(tableId, snapshotId, base);
     }
 
@@ -505,7 +504,7 @@ public class InlineDeltaCodec {
 
     /** The snapshot's list so far; one this delta did not add starts as its parent's. */
     private List<String> refs(MetadataView current, long snapshotId) {
-      if (!builder.snapshotManifestKeys(tableId).contains(snapshotId)) {
+      if (!builder.hasSnapshotManifests(tableId, snapshotId)) {
         Snapshot snap = current.snapshot(snapshotId);
         Long parentId = snap != null ? snap.parentId() : null;
         return new ArrayList<>(
@@ -521,7 +520,6 @@ public class InlineDeltaCodec {
      */
     void finish() {
       Map<Long, List<String>> lists = new HashMap<>();
-      Set<Long> registered = builder.snapshotManifestKeys(tableId);
       parents.forEach(
           (snapshotId, parentId) -> {
             List<String> refs =
@@ -544,7 +542,7 @@ public class InlineDeltaCodec {
               insert(refs, paths.get(i), at.get(i));
             }
             lists.put(snapshotId, refs);
-            if (registered.contains(snapshotId)) { // not removed by the same delta
+            if (builder.hasSnapshotManifests(tableId, snapshotId)) { // not removed by the delta
               builder.setSnapshotManifests(tableId, snapshotId, refs);
             }
           });
@@ -607,10 +605,8 @@ public class InlineDeltaCodec {
         RemoveManifestUpdate rm = (RemoveManifestUpdate) update;
         newSnapshots.removeManifest(MetadataView.of(current), rm.snapshotId, rm.manifestPathSuffix);
       } else if (update instanceof RemoveSnapshotsUpdate) {
-        RemoveSnapshotsUpdate rs = (RemoveSnapshotsUpdate) update;
-        for (long snapId : rs.snapshotIds) {
-          catalogBuilder.removeSnapshotManifests(tableId, snapId);
-        }
+        catalogBuilder.removeSnapshotManifests(
+            tableId, ((RemoveSnapshotsUpdate) update).snapshotIds);
       }
       // All other update types are TM concerns and are already reflected in
       // newMetadataBytes — skip.

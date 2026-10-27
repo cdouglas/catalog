@@ -45,6 +45,12 @@ final class CatalogStateMachine
     return builder;
   }
 
+  /** A builder that continues from {@code state}, sharing it: no checkpoint round trip. */
+  @Override
+  public CatalogState.Builder toBuilder(CatalogState state) {
+    return state.toBuilder();
+  }
+
   @Override
   public byte[] encodeCheckpoint(CatalogState state) {
     return ProtoCodec.encodeCheckpointState(state);

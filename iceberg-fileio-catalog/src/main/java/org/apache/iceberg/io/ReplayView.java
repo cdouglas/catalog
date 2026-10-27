@@ -96,7 +96,7 @@ final class ReplayView {
 
   /** Whether the table has an inline manifest list for {@code snapshotId}. */
   boolean hasInlineList(long snapshotId) {
-    return builder.snapshotManifestKeys(tableId).contains(snapshotId);
+    return builder.hasSnapshotManifests(tableId, snapshotId);
   }
 
   /** The paths of {@code snapshotId}'s inline manifest list, in order; empty if it has none. */

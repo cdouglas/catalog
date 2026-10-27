@@ -88,8 +88,9 @@ public class CatalogState {
     this.nsProperties = deepCopyProperties(builder.nsProperties);
     this.tblInlineMetadata = ImmutableMap.copyOf(builder.tblInlineMetadata);
     this.tblManifestPrefix = ImmutableMap.copyOf(builder.tblManifestPrefix);
-    this.manifestPool = deepCopyManifestPool(builder.manifestPool);
-    this.snapshotManifests = deepCopySnapshotManifests(builder.snapshotManifests);
+    builder.freezeManifestLists();
+    this.manifestPool = ImmutableMap.copyOf(builder.manifestPool);
+    this.snapshotManifests = ImmutableMap.copyOf(builder.snapshotManifests);
     this.conflictEncoding = builder.conflictEncoding;
     ImmutableMap.Builder<Integer, EncodingState> states = ImmutableMap.builder();
     builder.conflictStates.forEach((id, state) -> states.put(id, state.copy()));
@@ -105,26 +106,27 @@ public class CatalogState {
     return builder.build();
   }
 
-  private static Map<Integer, Map<String, ManifestFile>> deepCopyManifestPool(
-      Map<Integer, Map<String, ManifestFile>> pool) {
-    ImmutableMap.Builder<Integer, Map<String, ManifestFile>> builder = ImmutableMap.builder();
-    for (Map.Entry<Integer, Map<String, ManifestFile>> entry : pool.entrySet()) {
-      builder.put(entry.getKey(), ImmutableMap.copyOf(entry.getValue()));
-    }
-    return builder.build();
-  }
-
-  private static Map<Integer, Map<Long, List<String>>> deepCopySnapshotManifests(
-      Map<Integer, Map<Long, List<String>>> refs) {
-    ImmutableMap.Builder<Integer, Map<Long, List<String>>> outer = ImmutableMap.builder();
-    for (Map.Entry<Integer, Map<Long, List<String>>> entry : refs.entrySet()) {
-      ImmutableMap.Builder<Long, List<String>> inner = ImmutableMap.builder();
-      for (Map.Entry<Long, List<String>> snap : entry.getValue().entrySet()) {
-        inner.put(snap.getKey(), ImmutableList.copyOf(snap.getValue()));
-      }
-      outer.put(entry.getKey(), inner.build());
-    }
-    return outer.build();
+  /**
+   * A builder that continues from this state, sharing what it holds: a table's manifest lists are
+   * copied on the builder's first change to them, and inline metadata is immutable.
+   */
+  Builder toBuilder() {
+    Builder builder = new Builder();
+    builder.nextNamespaceId = nextNamespaceId;
+    builder.nextTableId = nextTableId;
+    builder.namespaceById.clear();
+    builder.namespaceById.putAll(namespaceById);
+    builder.namespaceLookup.putAll(namespaceLookup);
+    builder.tableById.putAll(tableById);
+    builder.tableLookup.putAll(tableLookup);
+    nsProperties.forEach((id, props) -> builder.nsProperties.put(id, new HashMap<>(props)));
+    builder.tblInlineMetadata.putAll(tblInlineMetadata);
+    builder.tblManifestPrefix.putAll(tblManifestPrefix);
+    builder.manifestPool.putAll(manifestPool);
+    builder.snapshotManifests.putAll(snapshotManifests);
+    builder.conflictEncoding = conflictEncoding;
+    conflictStates.forEach((id, state) -> builder.conflictStates.put(id, state.copy()));
+    return builder;
   }
 
   /** The state of a catalog with no namespaces or tables: a log before its first record. */
@@ -397,8 +399,12 @@ public class CatalogState {
     private final Map<Integer, Map<String, String>> nsProperties = new HashMap<>();
     private final Map<Integer, InlineTable> tblInlineMetadata = new HashMap<>();
     private final Map<Integer, String> tblManifestPrefix = new HashMap<>();
+    // A table's manifest pool and lists: immutable, shared with the state this builder continues,
+    // until its first change here copies them (ownedPools, ownedLists). Each list is immutable.
     private final Map<Integer, Map<String, ManifestFile>> manifestPool = new HashMap<>();
     private final Map<Integer, Map<Long, List<String>>> snapshotManifests = new HashMap<>();
+    private final Set<Integer> ownedPools = new HashSet<>();
+    private final Set<Integer> ownedLists = new HashSet<>();
     private String conflictEncoding;
     private final Map<Integer, EncodingState> conflictStates = new HashMap<>();
 
@@ -640,21 +646,64 @@ public class CatalogState {
       tblManifestPrefix.remove(id);
       manifestPool.remove(id);
       snapshotManifests.remove(id);
+      ownedPools.remove(id);
+      ownedLists.remove(id);
       return this;
+    }
+
+    /** The table's manifest pool, to change: this builder's own. */
+    private Map<String, ManifestFile> poolToChange(int tblId) {
+      Map<String, ManifestFile> pool = manifestPool.get(tblId);
+      if (pool == null || ownedPools.add(tblId)) {
+        pool = pool != null ? new LinkedHashMap<>(pool) : new LinkedHashMap<>();
+        manifestPool.put(tblId, pool);
+        ownedPools.add(tblId);
+      }
+      return pool;
+    }
+
+    /** The table's manifest lists, to change: this builder's own. */
+    private Map<Long, List<String>> listsToChange(int tblId) {
+      Map<Long, List<String>> lists = snapshotManifests.get(tblId);
+      if (lists == null || ownedLists.add(tblId)) {
+        lists = lists != null ? new HashMap<>(lists) : new HashMap<>();
+        snapshotManifests.put(tblId, lists);
+        ownedLists.add(tblId);
+      }
+      return lists;
+    }
+
+    /**
+     * Freezes the manifest pools and lists this builder changed, which a state built now shares;
+     * a later change copies them again.
+     */
+    private void freezeManifestLists() {
+      for (int tblId : ownedPools) {
+        manifestPool.computeIfPresent(tblId, (id, pool) -> ImmutableMap.copyOf(pool));
+      }
+      for (int tblId : ownedLists) {
+        snapshotManifests.computeIfPresent(tblId, (id, lists) -> ImmutableMap.copyOf(lists));
+      }
+      ownedPools.clear();
+      ownedLists.clear();
     }
 
     /** Adds a ManifestFile to the table's pool. */
     public Builder addManifestToPool(int tblId, ManifestFile manifest) {
-      manifestPool.computeIfAbsent(tblId, k -> new LinkedHashMap<>())
-          .put(manifest.path(), manifest);
+      poolToChange(tblId).put(manifest.path(), manifest);
       return this;
     }
 
     /** Sets the manifest list for a snapshot (list of manifest paths in the pool). */
     public Builder setSnapshotManifests(int tblId, long snapshotId, List<String> paths) {
-      snapshotManifests.computeIfAbsent(tblId, k -> new HashMap<>())
-          .put(snapshotId, new ArrayList<>(paths));
+      listsToChange(tblId).put(snapshotId, List.copyOf(paths));
       return this;
+    }
+
+    /** Whether the table has an inline manifest list for {@code snapshotId}. */
+    public boolean hasSnapshotManifests(int tblId, long snapshotId) {
+      Map<Long, List<String>> refs = snapshotManifests.get(tblId);
+      return refs != null && refs.containsKey(snapshotId);
     }
 
     /** The table's manifest pool, by path: every manifest its inline lists name. */
@@ -699,25 +748,43 @@ public class CatalogState {
      * pool growth after snapshot expiration (SPEC_ML.md).
      */
     public Builder removeSnapshotManifests(int tblId, long snapshotId) {
+      return removeSnapshotManifests(tblId, List.of(snapshotId));
+    }
+
+    /**
+     * Drops the manifest ref lists of {@code snapshotIds} and GCs the pool entries no remaining
+     * list names, scanning the remaining lists once.
+     */
+    public Builder removeSnapshotManifests(int tblId, java.util.Collection<Long> snapshotIds) {
       Map<Long, List<String>> refs = snapshotManifests.get(tblId);
       if (refs == null) {
         return this;
       }
-      List<String> dropped = refs.remove(snapshotId);
-      if (dropped == null || dropped.isEmpty()) {
+      Set<String> dropped = new HashSet<>();
+      boolean any = false;
+      for (long snapshotId : snapshotIds) {
+        if (refs.containsKey(snapshotId)) {
+          any = true;
+          dropped.addAll(listsToChange(tblId).remove(snapshotId));
+          refs = snapshotManifests.get(tblId);
+        }
+      }
+      if (!any || dropped.isEmpty()) {
         return this;
       }
-      // Collect paths still referenced by any remaining snapshot
-      Set<String> stillReferenced = new HashSet<>();
+      // Paths still referenced by any remaining snapshot stay
       for (List<String> snapRefs : refs.values()) {
-        stillReferenced.addAll(snapRefs);
+        for (String path : snapRefs) {
+          dropped.remove(path);
+        }
+        if (dropped.isEmpty()) {
+          return this;
+        }
       }
-      Map<String, ManifestFile> pool = manifestPool.get(tblId);
-      if (pool != null) {
+      if (manifestPool.containsKey(tblId)) {
+        Map<String, ManifestFile> pool = poolToChange(tblId);
         for (String path : dropped) {
-          if (!stillReferenced.contains(path)) {
-            pool.remove(path);
-          }
+          pool.remove(path);
         }
       }
       return this;

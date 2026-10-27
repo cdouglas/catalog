@@ -269,7 +269,6 @@ final class Landing {
         return "it stages a snapshot on a branch that has moved";
       }
     }
-    Set<Long> listed = builder.snapshotManifestKeys(tableId);
     for (Map.Entry<Long, Long> head : landing.parents.entrySet()) {
       long first = head.getKey();
       Long parent = adds.get(first).parentSnapshotId;
@@ -278,10 +277,10 @@ final class Landing {
         // first of an empty table: either way not a commit on the head it would land on
         return "it starts a fresh history on a branch that has a head";
       }
-      if (head.getValue() != null && !listed.contains(head.getValue())) {
+      if (head.getValue() != null && !builder.hasSnapshotManifests(tableId, head.getValue())) {
         return "the head of its branch has no inline manifest list";
       }
-      if (parent != null && !listed.contains(parent)) {
+      if (parent != null && !builder.hasSnapshotManifests(tableId, parent)) {
         // its delta's manifests are relative to the parent's inline list; without one it sent
         // its whole list
         return "its parent has no inline manifest list";
@@ -300,7 +299,7 @@ final class Landing {
     for (AddSnapshotUpdate add : adds.values()) {
       Long parent = landing.parent(add);
       if (add.manifestListSuffix.isEmpty() && parent != null && !adds.containsKey(parent)
-          && !listed.contains(parent)) {
+          && !builder.hasSnapshotManifests(tableId, parent)) {
         // replay builds its list on its parent's inline list where it lands, and its delta's
         // manifests are relative to the one its writer read: an eviction since wrote that list to
         // a file and dropped it, which a return to inline storage does not bring back (Bug 79)
