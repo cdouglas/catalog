@@ -16,6 +16,7 @@ run's manifest.
 
     tar xf bench-<stamp>.tar && cd bench-<stamp>
     ./run.sh build                                       # pulls eclipse-temurin:17-jre
+    BASE=ce-fuzz:latest ./run.sh build                   # or builds on an image the host has
     ./run.sh campaign c1 c1-fa-scaling.json              # detached, JOBS shards
     ./run.sh status c1                                   # shards, and runs finished
     ./run.sh mem                                         # each shard's memory and CPU

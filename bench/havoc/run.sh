@@ -1,7 +1,7 @@
 #!/bin/bash
 # Runs contention-driver campaigns on a host with Docker (rootless is fine). See README.md.
 #
-#   run.sh build                          build the image from ./ctx (pulls eclipse-temurin:17-jre)
+#   run.sh build                          build the image from ./ctx on BASE (pulls it if absent)
 #   run.sh campaign <name> <configs...>   run configs/<file>s as JOBS shards, detached
 #   run.sh status [name]                  each shard's container, and the runs finished
 #   run.sh mem                            each shard's memory and CPU, and the host's
@@ -9,16 +9,18 @@
 #   run.sh stop <name>                    stop a campaign's shards (their results stay in $OUT)
 #
 # Env: OUT (default ./out; a campaign's runs go to $OUT/<name>/), IMAGE (default ce-bench:latest),
+# BASE (the image built on, any with Java 17; default eclipse-temurin:17-jre, or one the host has),
 # JOBS (shards at once, default 8), HEAP (each JVM's heap, default 3g), MEM (each container's
 # hard memory limit, default HEAP + 2g), CPUS (each container's CPUs, default 4).
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OUT=${OUT:-$HERE/out}
 IMAGE=${IMAGE:-ce-bench:latest}
+BASE=${BASE:-eclipse-temurin:17-jre}
 JOBS=${JOBS:-8}
 HEAP=${HEAP:-3g}
 CPUS=${CPUS:-4}
-usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 gigabytes() {
   case $1 in
     *[gG]) echo "${1%[gG]}" ;;
@@ -31,7 +33,7 @@ MEM=${MEM:-$(( $(gigabytes "$HEAP") + 2 ))g}
 cmd=${1:-}; shift || true
 case $cmd in
   build)
-    docker build -t "$IMAGE" "$HERE/ctx" ;;
+    docker build --build-arg BASE="$BASE" -t "$IMAGE" "$HERE/ctx" ;;
   campaign)
     [ $# -ge 2 ] || usage
     name=$1; shift
