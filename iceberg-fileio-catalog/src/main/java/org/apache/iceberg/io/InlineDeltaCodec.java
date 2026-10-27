@@ -243,7 +243,9 @@ public class InlineDeltaCodec {
    * Applies a delta (encoded bytes) to base metadata, routing ML updates to the
    * CatalogState.Builder and TM updates (including AddSnapshot) to TableMetadata, and
    * returning the updated bytes encoded with the base's codec: a delta keeps the on-disk codec,
-   * which changes only with full metadata. This is the replay of an UpdateTableInline delta.
+   * which changes only with full metadata. Replay applies an UpdateTableInline delta to the
+   * table's fields or metadata instead ({@code ProtoCodec.UpdateTableInlineAction}, {@link
+   * NativeDelta}), whose base location is its version's; this is the same apply on bytes alone.
    *
    * <p><b>Ordering invariant:</b> {@code AddSnapshotUpdate} entries for a given
    * snapshot must appear in the delta list <em>before</em> any
@@ -278,9 +280,10 @@ public class InlineDeltaCodec {
 
   /**
    * The metadata {@code bytes} hold, with a deterministic metadata-file location, so the metadata
-   * a delta builds on it gains an entry for it in its `previousFiles()`. The string is opaque to
-   * FileIO (an `inline://` URI never resolves); only its stability for the same bytes matters (a
-   * hash collision only gives equal metadata-log entries, which `MetadataLogEntry` deduplicates).
+   * a delta builds on it gains an entry for it in its `previousFiles()`, for an apply without a
+   * catalog (replay uses the version's location instead, {@code inline://<table>#<id>.<version>}).
+   * The string is opaque to FileIO (an `inline://` URI never resolves); only its stability for the
+   * same bytes matters.
    */
   static TableMetadata decodeBase(byte[] bytes, InlineMetadataCodec codec) {
     return codec.decodeFull(bytes, "inline://#" + Integer.toHexString(Arrays.hashCode(bytes)));

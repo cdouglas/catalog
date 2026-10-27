@@ -457,11 +457,15 @@ make this work:
    no-location overload) leaves `metadataFileLocation = null`, which makes
    `Builder.buildFrom(base).discardChanges().build()` skip
    `addPreviousFile` and drop the would-be metadata-log entry for the
-   prior version. Replay passes a deterministic synthetic location of
-   the form `inline://#<hash-of-base-bytes>` so the new TM's
-   `previousFiles()` history accumulates correctly. The exact format isn't
-   load-bearing — metadata-log entries are opaque strings, never resolved
-   as filesystem paths in inline mode — only determinism is.
+   prior version. Replay gives the base the location of its version,
+   `inline://<table>#<id>.<version>` (`CatalogState.Builder.inlineLocation`),
+   the one a load of that version reports ("Table Loading"), so the new
+   TM's `previousFiles()` history accumulates correctly and names the
+   versions a reader saw. A delta replayed on the table's fields
+   (`NativeDelta`, design.md §"Replay State") adds the same entry, trimmed
+   to `write.metadata.previous-versions-max` as the builder trims it.
+   Metadata-log entries are opaque strings, never resolved as filesystem
+   paths in inline mode; only determinism is load-bearing.
 
 2. **`lastUpdatedMillis` pin BEFORE `applyTo`.** `Builder.lastUpdatedMillis`
    starts null and `Builder.build()` defaults to
@@ -480,9 +484,7 @@ make this work:
 Without the first, the replayed metadata log loses the prior version's
 entry; without the second, each replay stamps the reader's clock, so
 readers of one catalog file decode different metadata and none decodes
-what the writer committed. The hash names only that metadata-log entry:
-a loaded inline table's location is `inline://<table>#<id>.<version>`
-(see "Table Loading").
+what the writer committed.
 
 ### Concurrent-replace id collisions
 

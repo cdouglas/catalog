@@ -39,6 +39,15 @@ Status of `FileIOCatalog` cloud test suites across the
   cloud storage. Locally, `TestInlineManifestEndToEnd`'s codec axis,
   `TestCatalogFaultProperties` and `TestInlineDifferentialProperties`
   write both codecs.
+- **Conflict encoding** — how replay decides whether a table update
+  conflicts with what landed since its writer read the table
+  (`fileio.catalog.conflict.encoding`, default `lamport`; SPEC.md
+  "Conflict Encodings"). An encoding changes replay's judgment, not the
+  requests a commit makes of the store, so the matrix is run under the
+  default only; the other encodings run locally (their contracts,
+  `TestRebaseProperties`, `TestConflictMatrix`, and the fuzzers, which
+  draw the encoding). The 2026-10-24 run predates the encodings and the
+  native replay state.
 
 Cell legend:
 

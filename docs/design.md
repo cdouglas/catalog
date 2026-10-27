@@ -117,6 +117,45 @@ tool given `catalog.proto` decodes the checkpoint and each log record
 `protoc`'s output, a negative int32 as a 5-byte varint, is one `protoc`
 readers accept (see the header of `catalog.proto`).
 
+### Replay State
+
+Replay keeps each inline table as fields, not as Iceberg objects.
+`CatalogState` maps a table to an `InlineTable`, which holds the table's
+encoded bytes, its `TableFields`, or both, and makes either from the
+other when asked. `TableFields` holds `TableMetadata`'s fields; its
+snapshots and snapshot log are `Chain`s, append-only lists that
+successive states share. Landing, `TableChange` and the encodings read a
+table through `MetadataView`, which `TableFields` implements, and which
+adapts a `TableMetadata` too.
+
+- A delta of snapshots, refs and properties (`AddSnapshot`,
+  `SetSnapshotRef`, `SetProperties`, then its manifest-list updates)
+  applies to the fields (`NativeDelta`). It reproduces
+  `TableMetadata.Builder` exactly: the sequence-number and row-id
+  checks, the next row id, the snapshot log with intermediate snapshots
+  suppressed, one metadata-log entry per record (trimmed to
+  `write.metadata.previous-versions-max`) and last-updated-ms. Any other
+  delta goes through the builder on the table's metadata
+  (`InlineDeltaCodec.applyDelta`), and full metadata replaces the bytes.
+- Iceberg's objects are made on demand, not per record: a
+  `TableMetadata` when a table is loaded (built directly by
+  `InlineTableMetadata.create` and kept per version), the encoded bytes
+  when a checkpoint is written, a builder only on the slow path above.
+  That the catalog can produce every object a v3 table would have stored
+  (metadata, manifest lists) is the compatibility it keeps; producing
+  them is not replay's job.
+- `CatalogState` is copy-on-write by table: building a state copies only
+  what a record changed, and manifest pools and lists are shared and
+  frozen when the state is built. A load wraps each inline manifest once.
+- In the test suites (surefire sets `-Dfileio.catalog.replay.check=true`),
+  every native apply also runs through the builder and must give the
+  same metadata, and every encode of an inline table must round-trip
+  exactly (I11).
+
+Replay went from about 200 records/s on a 300-snapshot table to over
+100,000 ([REPLAY_BENCH_RESULTS.md](REPLAY_BENCH_RESULTS.md), the JMH
+`ReplayBench`).
+
 ### Component Separation
 
 This project consumes Iceberg as a Maven SNAPSHOT artifact. The
@@ -232,14 +271,15 @@ keyed by version since 416b2c9, and by table id since Bug 22), so
 `BaseMetastoreTableOperations` reloads when the table's version changes
 (see [SPEC_TM.md](SPEC_TM.md) §"Table Loading").
 
-Two operational rules in `InlineDeltaCodec` keep replay deterministic:
+Two operational rules keep replay deterministic:
 
-1. The base parsed inside `applyDelta` / `applyDeltaWithManifests` is
-   given a deterministic synthetic `metadataFileLocation`
-   (`inline://#<hash-of-base-bytes>`), not null. Without it,
+1. The base a delta applies to has its version's location,
+   `inline://<table>#<id>.<version>`, the one a load of that version
+   reports, as its `metadataFileLocation`, not null. Without it,
    `Builder.buildFrom(base).discardChanges().build()` skips
    `addPreviousFile` and the new TM's metadata-log loses the entry for
-   the prior version.
+   the prior version. `NativeDelta` adds the same entry. (Before replay
+   kept tables as fields, the location was a hash of the base's bytes.)
 2. Every builder replay opens is pinned to the writer's last-updated-ms,
    which the delta carries (`setLastUpdatedMillis`), **before** any update
    is applied. `Builder.lastUpdatedMillis` starts null, and both
@@ -414,6 +454,52 @@ differs from the first; and the `CommitProtocol` and multi-writer
 fuzzers check every stored checkpoint against a replay of the log
 through it.
 
+For the catalog, a checkpoint writes each inline table's encoded bytes,
+while replay may hold the table only as fields (§"Replay State"), so the
+inline codec must round-trip exactly: decoding a table's encoding and
+encoding the result again gives the same bytes, the order of every map
+included. The structural codec writes snapshot summaries in its uniform
+mode only when every summary has the same keys in the same order. A
+codec that normalized the order made a compaction's checkpoint differ
+from the replay it replaced (`TestBlindAppendEncoding`'s I11 check found
+it). In the suites, `InlineTable` checks the round trip on every encode.
+
+### I12. A conflict encoding admits only what Iceberg's retry commits
+
+Every conflict encoding (`ConflictEncoding`, [SPEC.md](SPEC.md)
+§"Conflict Encodings") meets one contract, so the encoding decides how
+many records conflict, never what a table holds:
+
+1. **Deterministic** (S1): its witness and its judgment are functions of
+   the record and the state replay reached, so every reader admits the
+   same records (I4, I11). Its state is in the checkpoint
+   (`conflict_state`).
+2. **Stable** (S2): a record it rejects where it lands, it rejects at
+   every later position, since a writer that read the log may already
+   have reported the rejection (I10). A condition that could flip back
+   (a ref rolled back, an id reused, a snapshot expired) is guarded by
+   stamps that only grow.
+3. **Total**: it never throws; what it cannot decode, it coarsens.
+4. **Coarsens when blind**, to the Lamport witness, the version read: a
+   pointer table, full metadata, a read pin, a pinned update (a table a
+   catalog transaction writes, [errata.md](errata.md) §D12, or an update
+   Iceberg commits once), a record without the footprint it needs.
+5. **Merges exactly**: a record admitted on a changed table goes through
+   `Landing`, which finalizes its late-bound fields as Iceberg's retry
+   would ([SPEC_TM.md](SPEC_TM.md) §"Late-bound fields"), and an
+   encoding admits a record only where that merge succeeds.
+6. **No false negatives**: what it admits on a changed table is what
+   Iceberg's retry of the operation commits there, logically the same
+   table.
+
+Each encoding's test extends `ConflictEncodingContract` (S1, S2, the
+version a merged record moves the table to, totality).
+`TestRebaseProperties` is the oracle of 5 and 6: an operation runs after
+a window of commits it did not see, under the encoding and under a
+reference that conflicts on the whole version and lets Iceberg retry,
+and the two must end alike; it was calibrated against mutants of the
+encodings (`fuzz/mutants`). `TestConflictMatrix` holds the matrix below.
+
 ## Operation × Operation Conflict Matrix
 
 The matrix below falls out of I2 (action versions are bumped on apply)
@@ -451,7 +537,8 @@ Legend: **CN↓** `CreateNamespace` (child), **DN** `DropNamespace`,
 **UT** `UpdateTableLocation` / `UpdateTableInline`,
 **RT'** `RenameTable` (in-place; bumps both source and destination ns),
 **RT** `ReadTable`. "ns v" = parent namespace's version conflicts;
-"tbl v" = table version conflicts.
+"tbl v" = table version conflicts. A `UT` or `RT` cell of the same table
+is the `lamport` encoding's; the others relax `UT` × `UT` (below).
 
 What the matrix says:
 
@@ -477,6 +564,65 @@ What the matrix says:
    whole version of each table it writes, as it first read it, or reads
    under serializable isolation, and one that conflicts fails, for its
    caller to run again ([errata.md](errata.md) §D12).
+
+### The same table, per conflict encoding
+
+Two updates of one table (`UT` × `UT`) conflict under `lamport` whatever
+they change, and Iceberg retries the second on a fresh read. The other
+encodings merge the second onto the first where Iceberg's retry would
+commit the same (I12). The rows are commits W and R, where R's writer
+read the table just before W landed; `TestConflictMatrix` runs each row
+under each encoding against Iceberg's retry, on a v2 table partitioned
+by one column, inline TM+ML. "Overwrite" is a copy-on-write overwrite of
+a partition under serializable isolation (Spark's), which validates that
+no data or deletes were added in it.
+
+| W, then R | `lamport` | `lamport-minus-properties` | `concern-vector` | `blind-append` | `partition-vector` | `manifest-window` |
+|---|---|---|---|---|---|---|
+| property change, append | ↻ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| append, property change | ↻ | ↻ | ✓ | ✓ | ✓ | ✓ |
+| sort-order change, append | ↻ | ↻ | ✓ | ✓ | ✓ | ✓ |
+| statistics, append | ↻ | ↻ | ✓ | ✓ | ✓ | ✓ |
+| append to a branch, append to main | ↻ | ↻ | ✓ | ✓ | ✓ | ✓ |
+| append, append (another partition or the same) | ↻ | ↻ | ↻ | ✓ | ✓ | ✓ |
+| append, merge append | ↻ | ↻ | ↻ | ✓ | ✓ | ✓ |
+| append, overwrite of another partition | ↻ | ↻ | ↻ | ↻ | ✓ | ✓ |
+| append, delete by filter in another partition | ↻ | ↻ | ↻ | ↻ | ✓ | ✓ |
+| append, compaction (another partition or the same) | ↻ | ↻ | ↻ | ↻ | ✓ | ✓ |
+| append to a branch, overwrite on main of the same partition | ↻ | ↻ | ✓ | ✓ | ↻ | ✓ |
+| schema change, append | ↻ | ↻ | ↻ | ✓ | ✓ | ✓ |
+| schema change, overwrite | ↻ | ↻ | ↻ | ↻ | ↻ | ↻ |
+| partition-spec change, append | ↻ | ↻ | ↻ | ↻ | ↻ | ↻ |
+| snapshot expiry, append | ↻ | ↻ | ↻ | ↻ | ↻ | ↻ |
+| rollback, append | ↻ | ↻ | ↻ | ↻ | ↻ | ↻ |
+| append, overwrite of its partition | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| append, schema change | once | once | once | once | once | once |
+
+Legend: **✓** R merges onto W, in one commit attempt; **↻** R's record
+conflicts and Iceberg's retry commits it (a false positive, which costs
+an attempt: a read, a staging and a write); **✗** R conflicts and the
+retry fails its validation (a real conflict); **once** R conflicts and
+fails, since Iceberg commits a schema, spec or ref update once, on the
+version it read.
+
+What the per-encoding matrix says:
+
+1. No encoding admits what the retry would not commit (no ✓ where
+   `lamport` has ✗ or once), and none turns a real conflict into a merge.
+2. Each encoding, in the order listed, merges more of these rows than
+   the one before it, but not always the same ones and more:
+   `partition-vector` stamps the files of every branch, and judges a
+   validated record by its partitions alone, so it misses what
+   `concern-vector` sees: that main did not move. `manifest-window` reads
+   the branch's own history and sees both.
+3. The guards stay whole-table under every encoding: a spec change, a
+   snapshot expiry, a rollback, and (for a record that validates) a
+   schema change.
+4. Buckets can collide: ref names hash into 16 buckets and partitions
+   into 64, so two branches or partitions that share a bucket conflict
+   (a false positive, never a false merge).
+5. A catalog transaction pins every table it writes (D12), and conflicts
+   under every encoding as under `lamport`.
 
 ## Late-Binding
 
@@ -581,6 +727,16 @@ the log it landed in, and compacts after the commit
    same metadata from repeated replays of the same delta (I4).
 7. If the new update type interacts with manifest-pool state, also extend
    the routing in `applyDeltaWithManifests` (see SPEC_TM.md and SPEC_ML.md).
+8. A delta holding the new update replays through the builder
+   (`NativeDelta.applies` is false), which is correct but slower. To
+   replay it on the table's fields, extend `NativeDelta` to reproduce
+   what the builder does with it; the suites' replay check compares the
+   two on every apply (§"Replay State").
+9. Name the concern it changes in `TableChange.of`, which the conflict
+   encodings read and stamp by; or set `commitOnce` for it, which gives
+   its record the Lamport witness (I12). `TableChange.of` has no default
+   branch: an update it does not name changes no concern, and an
+   encoding would merge across it.
 
 ### Choosing append vs CAS
 
@@ -657,6 +813,7 @@ classes handle this for you; manual codecs require it as a discipline.
 | `TestCatalogRaceProperties` | jqwik: a catalog operation raced by others must end as a serial run (I9), on one object or a shared log |
 | `TestInlineDeltaProperties` | jqwik: each commit's delta replays to the committed metadata, and each codec stores every version exactly (I7) |
 | `TestInlineDifferentialProperties` | jqwik: the same schedule on a pointer catalog and an inline one commits alike and reads the same (I8) |
+| `Test*Encoding` (`ConflictEncodingContract`), `TestRebaseProperties`, `TestConflictMatrix` | The conflict encodings: each one's contract, the oracle against Iceberg's retry, and the per-encoding matrix (I12) |
 | `TestCatalogRegressions` | One nested group per catalog bug, with the smallest scenario that reproduces it |
 | `TestCommittedSetGc`, `TestCommittedTransactions`, `TestUuidV7` (intentlog-core) | Committed-set encoding, GC merge and horizon, tri-state lookup ([GC.md](GC.md)); UUIDv7 minting |
 | `TestReplay`, `TestLogRuntime` (intentlog-core) | Replay, and the commit loop branch by branch on a scripted log laid out as one object, each test named for the TLA+ action it drives |

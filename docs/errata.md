@@ -34,15 +34,19 @@ earlier entry:
 
 ## Current Shortcuts
 
-### S1. `wrapInlineManifests` mutates a parsed `TableMetadata` via a builder fork
+### S1. Inline tables rely on fork changes to `TableMetadata.Builder` and `BaseSnapshot`
 
-`FileIOCatalog.wrapInlineManifests` calls
-`TableMetadata.Builder.replaceSnapshots(Map<Long, Snapshot>)` to swap
-parsed `BaseSnapshot` instances for `InlineSnapshot` wrappers after
-`TableMetadataParser.fromJson` returns. `replaceSnapshots` is a 28-line
+`TableMetadata.Builder.replaceSnapshots(Map<Long, Snapshot>)` swaps a
+table's snapshots in place: `LogCatalog` uses it to give inline-ML
+snapshots their sentinel before an encode (design.md I5) and their
+manifest-list files when a table leaves inline storage. It is a 28-line
 addition to `TableMetadata.Builder` in the iceberg fork (with a
-`snapshotsReplaced` flag wiring it into `hasChanges()`). The fork makes
-two more changes to core for inline tables:
+`snapshotsReplaced` flag wiring it into `hasChanges()`). A load no longer
+uses it: `wrapInlineManifests` builds the metadata with its
+`InlineSnapshot`s directly (`InlineTableMetadata.create`, which calls
+`TableMetadata`'s package-private constructor from this project's
+`org.apache.iceberg` package, as `ManifestListFiles` does, with no fork
+change). The fork makes two more changes to core for inline tables:
 
 - `TableMetadata.Builder.setLastUpdatedMillis` (17 lines, 6085f96f4)
   lets replay pin the writer's last-updated-ms, which `buildFrom`
@@ -167,6 +171,19 @@ catalog's semantics, and it's stricter than Iceberg's:
 - Iceberg's spec doesn't say whether a commit depends on the table's
   properties.
 
+**Superseded for single-table commits.** A table commit outside a
+catalog transaction need not conflict on the table's whole version: under
+the conflict encodings beyond `lamport` (SPEC.md §"Conflict Encodings";
+design.md §"The same table, per conflict encoding", I12), replay merges
+its record onto a changed table where Iceberg's retry would commit the
+same. That is the split "Later" below proposes, finer (concerns, refs,
+partitions, a branch's manifests), and it needs no restaging: the record
+is an inline delta whose late-bound fields replay finalizes where it
+lands (SPEC_TM.md §"Late-bound fields"). A catalog transaction pins every
+table it writes (`UpdateTableInline.pinned`), so under every encoding it
+conflicts as this section says; a finer witness for it would need the
+transaction to declare what it read.
+
 A commit to any other table doesn't fail the transaction: the format's
 commit loop rebases a record whose actions still hold. Nothing above the
 catalog retries. `BaseCatalogTransaction` doesn't (its "TODO: should
@@ -186,7 +203,8 @@ fail although what Iceberg's isolation checks (the branches they read)
 held. In a 200,000-try run, 24 of the 8,469 racing transactions (0.28%)
 did.
 
-**Later: depend on part of a table.** A table's version could be split
+**Later: depend on part of a table** (for catalog transactions; single
+table commits have it, above). A table's version could be split
 into its metadata (properties) and the rest, with the intention record
 saying which of the two a transaction depends on. A transaction that
 depends only on the rest would then survive a concurrent property
@@ -218,6 +236,23 @@ The retry would need three cautions:
 **Trigger to revisit:** a workload whose multi-table transactions race
 property changes on their tables.
 
+### D13. `partition-vector` retries a validated commit that `concern-vector` merges
+
+`partition-vector` judges a validated record (an overwrite, a row delta,
+a compaction) by its checks against the partition buckets, which stamp
+the files every commit adds or removes on any branch. So a validated
+commit on main after a commit to another branch in the same partition
+conflicts there, and Iceberg retries it, although main did not move:
+`concern-vector` and `blind-append`, which judge that record by the
+branch it advances, merge it (design.md, "The same table, per conflict
+encoding"; `TestConflictMatrix`). `manifest-window` reads the branch's
+own history and merges it too. A validated record could be admitted if
+either witness holds: both are stable, so their disjunction is.
+
+**Trigger to revisit:** a workload of validated commits racing commits
+to other branches (write-audit-publish) where `partition-vector` is the
+chosen encoding.
+
 ### D8. Typed-protobuf encoding for Iceberg structural types (skip JSON serde)
 
 `AddSortOrderUpdate` is encoded structurally (see SPEC_TM.md §"Other
@@ -234,7 +269,7 @@ audit:
 
 | Type | Visibility | How we'd build one |
 |---|---|---|
-| `TableMetadata` | package-private | factory in our `org.apache.iceberg` package (same trick as `InlineDeltaSnapshots`) |
+| `TableMetadata` | package-private | factory in our `org.apache.iceberg` package: `InlineTableMetadata.create`, which replay's loads already use (same trick as `InlineDeltaSnapshots`) |
 | `BaseSnapshot`, `SnapshotLogEntry`, `MetadataLogEntry` | package-private | same |
 | `Schema` | public | direct `new Schema(...)` |
 | `PartitionSpec` | **`private`** | public `Builder` API |

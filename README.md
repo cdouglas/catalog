@@ -80,7 +80,12 @@ docs/ICEBERG_ISSUES.md                       Iceberg core bugs the fuzzers found
 docs/iceberg-issues/                         one document per Iceberg issue, for upstream reports
 docs/format-explorer/                        byte-level viewer of catalog files
 docs/sample/                                 measured footprint of each inline mode
+docs/REPLAY_BENCH_RESULTS.md                 replay throughput, read and load (JMH ReplayBench)
 spec/tla/                                    TLA+ models of the commit loop and the fuzzers' oracles
+bench/                                       the multi-writer contention driver's campaigns: configs,
+                                             run.sh, shards on another host (havoc/), endive's
+                                             predictions (endive/); results in bench/results/
+lab/                                         labbook over the campaigns' results (DuckDB, MyST pages)
 ```
 
 ## Dependencies on the Iceberg fork
@@ -187,6 +192,13 @@ suites skip; see [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
     apply again. `SharedLogContract` holds each provider to the SharedLog
     obligations.
 
+  - The conflict encodings: each one's test extends
+    `ConflictEncodingContract` (deterministic, stable, total), and
+    `TestRebaseProperties` runs an operation after commits it did not
+    see, under the encoding and under a reference that lets Iceberg
+    retry: a record the encoding merges must be what the retry commits.
+    `TestConflictMatrix` pins the per-encoding matrix of design.md.
+
   Each property's `tries` is in its `@Property` annotation; raise it for
   a longer run. Every bug the fuzzers or reviews found in this project
   has a regression test in `TestCatalogRegressions` (Bug *N* in commit
@@ -203,6 +215,23 @@ suites skip; see [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
   models. The commit-loop bugs the fuzzers and reviews found are switches
   in the model that put each bug back; each one must break a property,
   and the fuzzers' oracles must catch it.
+
+## Benchmarks
+
+- **Replay.** `ReplayBench` (JMH, in the catalog module's tests) measures
+  how fast a reader tests and applies records, and what a read and a
+  table load cost ([docs/REPLAY_BENCH_RESULTS.md](docs/REPLAY_BENCH_RESULTS.md)).
+- **Contention.** The contention driver (`org.apache.iceberg.io.contention`,
+  test scope) runs N writers, each with its own catalog, over an
+  in-memory store that injects a provider's latencies (endive's
+  profiles), under a workload of appends, overwrites, compactions and
+  property changes, and records every operation. `bench/run.sh` runs a
+  campaign of configurations locally; `bench/havoc/` packs one to run as
+  shards in containers on another host. [lab/](lab/NOTES.md) ingests the
+  results with labbook and compares them with the predictions of
+  endive, a discrete-event simulator of Iceberg's optimistic commits
+  across cloud stores (`bench/endive/` runs a checkout of it beside this
+  one, or at `ENDIVE`).
 
 ## Configuration
 
