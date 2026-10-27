@@ -176,6 +176,7 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
   private volatile Supplier<RuntimeException> segmentLimitError = null;
   private volatile int appendByteLimit = 0;
   private final Map<ReadFault, Integer> injectedReads = Maps.newEnumMap(ReadFault.class);
+  private volatile boolean recordHistory = true;
 
   public InMemoryAtomicFileIO() {
     this(true);
@@ -304,6 +305,14 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
   /** Number of conditional writes rejected because the object changed, by strategy. */
   public synchronized int rejected(AtomicOutputFile.Strategy strategy) {
     return strategy == AtomicOutputFile.Strategy.APPEND ? rejectedAppends : rejectedCas;
+  }
+
+  /**
+   * Whether conditional writes are kept for {@link #history} (the default). A benchmark that commits
+   * thousands of times to a large object turns it off: each kept write holds two versions of it.
+   */
+  public void recordHistory(boolean record) {
+    this.recordHistory = record;
   }
 
   /** Every successful conditional write, in the order they took effect. */
@@ -563,7 +572,9 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
         } else {
           next = data;
         }
-        history.add(new Write(location, strategy, live == null ? null : live.bytes, next));
+        if (recordHistory) {
+          history.add(new Write(location, strategy, live == null ? null : live.bytes, next));
+        }
         BoundInputFile written = new BoundInputFile(location, put(location, next, segments));
         String landed = "injected: " + strategy + " at " + location + " landed, but ";
         switch (fault) {
