@@ -63,3 +63,39 @@ format = "jsonl"
 mode = "table"
 only_finished = true
 options = { ignore_errors = true }
+
+# endive's predictions for the contention campaigns' open-loop runs (bench/endive/gen.py, run.sh):
+# experiments/<label>-<hash>/ with cfg.toml, and <seed>/results.parquet per repetition (seed 1000
+# + repetition). The label names what a run matches: c6e-<store>-<workload>-r<rate>-<encoding>.
+# endive's commit is in bench/results/endive/endive-version.txt (its experiments' version.txt holds
+# the commit of the directory it ran in, this tree's).
+[[runs]]
+name = "endive"
+kind = "manifest"
+root = "bench/results/endive/experiments"
+glob = "*"
+manifest = "cfg.toml"
+path_pattern = '^c6e-(?P<store>[^-]+)-(?P<workload>[^-]+)-r(?P<rate>[0-9.]+)-(?P<encoding>.+)-(?P<hash>[0-9a-f]{8})$'
+assume_finished = true
+id = "endive/{dir.name}"
+
+[runs.fields]
+label = "experiment.label"
+config_hash = "dir.hash"
+params = "."
+
+[runs.promote]
+store = "dir.store"
+encoding = "dir.encoding"
+workload = "dir.workload"
+arrival_rate = { path = "dir.rate", type = "DOUBLE" }
+
+# One row per simulated transaction (endive's Statistics): t_submit, t_commit (ms), latencies,
+# n_retries, status (committed/aborted), operation_type, abort_reason. Seed from the directory.
+[[facts]]
+name = "endive_txns"
+runs = "endive"
+file = "*/results.parquet"
+format = "parquet"
+path_pattern = '^(?P<seed>\d+)/'
+mode = "view"
