@@ -3,6 +3,7 @@
 # configuration files, writing each run under bench/results/<label>-<hash>/<UTC start>/.
 #
 #   bench/run.sh [--heap 4g] [--out DIR] [--dry-run] bench/configs/<campaign>.json...
+#   bench/run.sh --build-only        builds and snapshots, and prints the snapshot's directory
 #
 # It builds once, snapshots the compiled classes under bench/results/builds/ (so a rebuild during a
 # campaign changes nothing it runs), and records the commit (and whether the tree was dirty) in
@@ -13,11 +14,13 @@ root=$(cd "$here/.." && pwd)
 heap=4g
 out="$here/results"
 args=()
+build_only=false
 while [ $# -gt 0 ]; do
   case "$1" in
     --heap) heap="$2"; shift 2 ;;
     --out) out="$2"; shift 2 ;;
     --dry-run) args+=(--dry-run); shift ;;
+    --build-only) build_only=true; shift ;;
     *) args+=("$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"); shift ;;
   esac
 done
@@ -47,6 +50,12 @@ for e in "${entries[@]}"; do
   esac
 done
 echo "build: $build ($git_sha dirty=$dirty)"
+printf '%s\n' "${cp_snap#:}" > "$build/classpath.snapshot"
+printf 'FILEIO_GIT=%s\nFILEIO_DIRTY=%s\n' "$git_sha" "$dirty" > "$build/provenance.env"
+if [ "$build_only" = true ]; then
+  echo "$build"
+  exit 0
+fi
 
 export FILEIO_GIT="$git_sha" FILEIO_DIRTY="$dirty"
 exec java -Xmx"$heap" -XX:+UseG1GC \

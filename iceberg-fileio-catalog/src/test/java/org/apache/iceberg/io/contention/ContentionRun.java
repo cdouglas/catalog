@@ -281,9 +281,15 @@ final class ContentionRun {
             () -> {
               SplittableRandom random = new SplittableRandom(seed(-1));
               double meanMs = 1000.0 / config.number("arrival_rate");
+              boolean lognormal = config.string("arrival_dist").equals("lognormal");
+              double sigma = config.number("arrival_sigma");
               long next = System.nanoTime();
               while (next < endNanos && !stopping.get()) {
-                next += (long) (exponential(random, meanMs) * 1e6);
+                double gapMs =
+                    lognormal
+                        ? meanMs * Math.exp(sigma * gaussian(random))
+                        : exponential(random, meanMs);
+                next += (long) (gapMs * 1e6);
                 LockSupport.parkNanos(Math.max(0, next - System.nanoTime()));
                 if (!arrivals.offer(next)) {
                   record(dropped(next));

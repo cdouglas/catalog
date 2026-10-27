@@ -1,0 +1,11 @@
+#!/bin/sh
+# Runs the driver on one shard of a campaign: bench-entry <shard>/<shards> <configs...>
+# Env: HEAP (default 3g). Results go to /out.
+set -e
+. /app/provenance.env
+export FILEIO_GIT FILEIO_DIRTY
+shard=$1; shift
+exec java -Xmx"${HEAP:-3g}" -XX:+UseG1GC -Diceberg.worker.num-threads=256 \
+  -Dorg.slf4j.simpleLogger.defaultLogLevel=error \
+  -cp "$(cat /app/classpath)" org.apache.iceberg.io.contention.ContentionBench \
+  --out /out --shard "$shard" "$@"

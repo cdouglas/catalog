@@ -25,3 +25,4 @@ spec/tla/__pycache__/
 bench/results/
 lab/lab.duckdb
 lab/_build/
+bench/build/

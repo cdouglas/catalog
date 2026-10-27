@@ -1,0 +1,11 @@
+{
+  "label": "c5-tables",
+  "store": "s3x",
+  "writers": 16,
+  "mix": {"fast_append": 1.0},
+  "vary": {
+    "tables": [1, 4, 16],
+    "encoding": ["lamport", "blind-append"],
+    "repetition": [0, 1]
+  }
+}

@@ -68,6 +68,9 @@ final class BenchConfig {
           + "\"writers\": 4,"
           + "\"think_ms\": 0,"
           + "\"arrival_rate\": 0,"
+          // exponential gaps of mean 1/rate, or lognormal of median 1/rate (endive's "exponential")
+          + "\"arrival_dist\": \"exponential\","
+          + "\"arrival_sigma\": 0.5,"
           + "\"max_inflight\": 64,"
           + "\"duration_s\": 60,"
           + "\"warmup_s\": 10,"

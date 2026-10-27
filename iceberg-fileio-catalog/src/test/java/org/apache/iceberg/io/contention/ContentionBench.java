@@ -40,8 +40,12 @@ import org.apache.iceberg.IcebergBuild;
  *
  * <pre>{@code
  * java -Xmx4g -Diceberg.worker.num-threads=256 -cp <test classpath> \
- *   org.apache.iceberg.io.contention.ContentionBench --out bench/results config.json...
+ *   org.apache.iceberg.io.contention.ContentionBench [--out DIR] [--shard I/N] [--dry-run] \
+ *   config.json...
  * }</pre>
+ *
+ * <p>{@code --shard I/N} runs the runs whose index (over every file's runs, in order) is I modulo
+ * N, so N processes share a campaign.
  *
  * <p>Environment for the manifest: FILEIO_GIT (commit), FILEIO_DIRTY (true/false), set by
  * bench/run.sh.
@@ -55,19 +59,30 @@ public final class ContentionBench {
   public static void main(String[] args) throws Exception {
     Path out = Path.of("bench", "results");
     boolean dryRun = false;
+    int shard = 0;
+    int shards = 1;
     List<Path> files = new ArrayList<>();
     for (int i = 0; i < args.length; i++) {
       if (args[i].equals("--out")) {
         out = Path.of(args[++i]);
       } else if (args[i].equals("--dry-run")) {
         dryRun = true;
+      } else if (args[i].equals("--shard")) {
+        String[] parts = args[++i].split("/");
+        shard = Integer.parseInt(parts[0]);
+        shards = Integer.parseInt(parts[1]);
       } else {
         files.add(Path.of(args[i]));
       }
     }
-    List<BenchConfig> runs = new ArrayList<>();
+    List<BenchConfig> all = new ArrayList<>();
     for (Path file : files) {
-      runs.addAll(BenchConfig.expand(BenchConfig.MAPPER.readTree(file.toFile())));
+      all.addAll(BenchConfig.expand(BenchConfig.MAPPER.readTree(file.toFile())));
+    }
+    // A shard runs every shards-th run, from its index: shards interleave over each file's axes
+    List<BenchConfig> runs = new ArrayList<>();
+    for (int i = shard; i < all.size(); i += shards) {
+      runs.add(all.get(i));
     }
     System.out.printf("%d runs%n", runs.size());
     int n = 0;
