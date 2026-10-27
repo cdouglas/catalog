@@ -52,7 +52,7 @@ case $cmd in
       # JVM of this campaign, and only of it, should it outgrow its limit or the host run short.
       docker run -d --init --name "ce-bench-$name-$i" \
         --memory "$MEM" --memory-swap "$MEM" --oom-score-adj 1000 --cpus "$CPUS" \
-        -v "$OUT/$name:/out" -v "$HERE/configs:/configs:ro" -e HEAP="$HEAP" \
+        -v "$OUT/$name:/out" -v "$HERE/configs:/configs:ro" -e HEAP="$HEAP" -e CPUS="$CPUS" \
         "$IMAGE" "$i/$JOBS" "${files[@]}" > /dev/null
     done
     held=$(docker exec "ce-bench-$name-0" cat /sys/fs/cgroup/memory.max 2>/dev/null || true)
@@ -66,9 +66,16 @@ case $cmd in
     docker ps -a --filter "name=$filter" --format 'table {{.Names}}\t{{.Status}}'
     for d in "$OUT"/${1:-*}; do
       [ -d "$d" ] || continue
-      total=$(find "$d" -mindepth 3 -maxdepth 3 -name manifest.json | wc -l)
-      done_=$(grep -l '"finished"' $(find "$d" -mindepth 3 -maxdepth 3 -name manifest.json) 2>/dev/null | wc -l)
-      failed=$(grep -l '"failed"' $(find "$d" -mindepth 3 -maxdepth 3 -name manifest.json) 2>/dev/null | wc -l)
+      manifests=$(find "$d" -mindepth 3 -maxdepth 3 -name manifest.json)
+      total=$(echo "$manifests" | grep -c . || true)
+      done_=0
+      failed=0
+      if [ -n "$manifests" ]; then
+        # shellcheck disable=SC2086
+        done_=$(grep -l '"finished"' $manifests | wc -l || true)
+        # shellcheck disable=SC2086
+        failed=$(grep -l '"failed"' $manifests | wc -l || true)
+      fi
       echo "$(basename "$d"): $done_ finished, $failed failed, $((total - done_ - failed)) running"
     done ;;
   mem)
