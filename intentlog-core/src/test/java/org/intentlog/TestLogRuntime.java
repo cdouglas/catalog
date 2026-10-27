@@ -39,8 +39,13 @@ class TestLogRuntime {
   private static final long NO_GC = Long.MAX_VALUE;
 
   private static RuntimeConfig config(int maxRecords, long retentionMs) {
-    return new RuntimeConfig(4, 3, 0L, retentionMs, CompactionPolicy.limits(maxRecords, 1 << 20),
-        java.time.Duration.ZERO, System::currentTimeMillis);
+    return config(maxRecords, retentionMs, 0L);
+  }
+
+  private static RuntimeConfig config(int maxRecords, long retentionMs, long raceMinWaitMs) {
+    return new RuntimeConfig(4, 3, 0L, raceMinWaitMs, retentionMs,
+        CompactionPolicy.limits(maxRecords, 1 << 20), java.time.Duration.ZERO,
+        System::currentTimeMillis);
   }
 
   private final ScriptedLog log = new ScriptedLog();
@@ -143,6 +148,35 @@ class TestLogRuntime {
     assertThat(r.state()).containsEntry("other", 1).containsEntry("mine", 1);
     // The racer's read runs inside this writer's first append.
     assertThat(log.calls).containsExactly("append", "read", "probe", "append", "readThrough");
+  }
+
+  @Test
+  void aLostRaceBacksOffBeforeItProbes() {
+    runtime = new LogRuntime<>(log, ToyMachine.INSTANCE, config(10, NO_GC, 5L));
+    Replica<Map<String, Integer>> base = created();
+    log.beforeNextWrite(() -> otherWriterBumps("other"));
+    log.calls.clear();
+    Replica<Map<String, Integer>> r = bump(base, "mine");
+    assertThat(r.state()).containsEntry("other", 1).containsEntry("mine", 1);
+    assertThat(log.calls).containsExactly("append", "read", "probe", "append", "readThrough");
+  }
+
+  @Test
+  void anInterruptWhileBackingOffLeavesTheCommitUnknown() {
+    // a bound of 10^6 ms: the wait drawn below it is 0 (no sleep) once in a million
+    runtime = new LogRuntime<>(log, ToyMachine.INSTANCE, config(10, NO_GC, 1_000_000L));
+    Replica<Map<String, Integer>> base = created();
+    log.beforeNextWrite(() -> {
+      otherWriterBumps("other");
+      Thread.currentThread().interrupt();
+    });
+    try {
+      // the write that lost may have landed (a transport retry of one that did fails too)
+      assertThatThrownBy(() -> bump(base, "mine"))
+          .isInstanceOf(CommitOutcomeUnknownException.class);
+    } finally {
+      Thread.interrupted();
+    }
   }
 
   @Test

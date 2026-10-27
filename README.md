@@ -242,10 +242,12 @@ suites skip; see [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
 | `fileio.catalog.inline.strict`    | `false`       | Reject loading a table with both inline and file manifest lists, instead of logging a warning |
 | `fileio.catalog.inline.max.update.size` | `4190208` | Largest inline table update (a delta, or full metadata); a table whose update does not fit gets a `metadata.json` and leaves inline storage until an update fits in full |
 | `fileio.catalog.inline.tm.codec`  | `structural`  | Codec for newly-written inline `TableMetadata` bytes: `structural` (binary, columnar; default) or `gzip` (Iceberg-style gzipped JSON). Decode follows the on-wire codec tag, so writers can change this setting freely |
-| `fileio.catalog.max.append.count` | `10000`       | Soft limit on log records before CAS compaction. `0` forces CAS-only mode (S3 standard, GCS) |
+| `fileio.catalog.max.append.count` | `100`         | Soft limit on log records before CAS compaction. `0` forces CAS-only mode (S3 standard, GCS) |
 | `fileio.catalog.max.append.size`  | `16777216`    | Soft target for catalog-file size before compaction |
 | `fileio.catalog.committed.retention.ms` | `21600000` (6h) | Minimum age before a committed-txn UUID becomes eligible for GC at compaction. `Long.MAX_VALUE` disables; `0` GCs aggressively (not recommended) |
 | `fileio.catalog.throttle.retry.min-wait-ms` | `200` | First wait before retrying a write that storage throttled; each later wait doubles, up to 5 s |
+| `fileio.catalog.race.retry.min-wait-ms` | `20` | Bound of the random wait after a commit loses a race for the catalog, before it reads again; each later loss doubles it, up to 1 s. `0` resends at once |
+| `fileio.catalog.conflict.encoding` | `manifest-window` | How replay decides whether a table update conflicts with what landed since its writer read the table; fixed when the catalog is created ([docs/SPEC.md](docs/SPEC.md) "Conflict Encodings") |
 
 See [docs/LOG.md](docs/LOG.md) for the commit protocol,
 [docs/ATOMIC_FILE_LOG.md](docs/ATOMIC_FILE_LOG.md) for how the catalog file

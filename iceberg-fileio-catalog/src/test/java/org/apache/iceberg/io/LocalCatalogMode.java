@@ -135,6 +135,7 @@ enum LocalCatalogMode {
     Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouse);
     properties.put(LogCatalogProperties.MAX_APPEND_COUNT, String.valueOf(maxAppendCount));
+    properties.put(LogCatalogProperties.RACE_MIN_WAIT_MS, "0"); // resend a lost race at once
     properties.put("fileio.catalog.inline", String.valueOf(inlineTM));
     properties.put("fileio.catalog.inline.manifests", String.valueOf(inlineML));
     properties.put(CatalogProperties.TABLE_DEFAULT_PREFIX + "default-key1", "catalog-default-key1");

@@ -361,16 +361,19 @@ public class TestProtoCommitKnobs {
   @Test
   void invalidNegativeConfigRejected() {
     org.assertj.core.api.Assertions.assertThatThrownBy(
-        () -> LogCatalogProperties.runtimeConfig(-1, 1024L, 0L, 0L))
+        () -> LogCatalogProperties.runtimeConfig(-1, 1024L, 0L, 0L, 0L))
         .isInstanceOf(IllegalArgumentException.class);
     org.assertj.core.api.Assertions.assertThatThrownBy(
-        () -> LogCatalogProperties.runtimeConfig(100, -1L, 0L, 0L))
+        () -> LogCatalogProperties.runtimeConfig(100, -1L, 0L, 0L, 0L))
         .isInstanceOf(IllegalArgumentException.class);
     org.assertj.core.api.Assertions.assertThatThrownBy(
-        () -> LogCatalogProperties.runtimeConfig(100, 1024L, -1L, 0L))
+        () -> LogCatalogProperties.runtimeConfig(100, 1024L, -1L, 0L, 0L))
         .isInstanceOf(IllegalArgumentException.class);
     org.assertj.core.api.Assertions.assertThatThrownBy(
-        () -> LogCatalogProperties.runtimeConfig(100, 1024L, 0L, -1L))
+        () -> LogCatalogProperties.runtimeConfig(100, 1024L, 0L, -1L, 0L))
+        .isInstanceOf(IllegalArgumentException.class);
+    org.assertj.core.api.Assertions.assertThatThrownBy(
+        () -> LogCatalogProperties.runtimeConfig(100, 1024L, 0L, 0L, -1L))
         .isInstanceOf(IllegalArgumentException.class);
   }
 

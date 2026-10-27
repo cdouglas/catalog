@@ -468,7 +468,7 @@ function COMMIT(log, base, intention):
             try:
                 return validate(WRITE(log.replace(tail, checkpoint(current), gc() + [record])))
             catch Conflict as e:
-                unresolved = e
+                unresolved = e;  raceBackoff()      # interrupted: unknown
             # Rebase: replay verifies the record against the state it lands on, so if
             # the intention holds on the new state, retry on top of it (append or
             # replace, as that state calls for). The commit is accepted exactly when a
@@ -485,7 +485,7 @@ function COMMIT(log, base, intention):
             catch Full:
                 full = true;  stale = true;  continue       # replace on a fresh read (Bug 66)
             catch Conflict as e:
-                unresolved = e
+                unresolved = e;  raceBackoff()      # interrupted: unknown
             # Another writer appended first. The record is the same, and replay applies
             # it once, so only the new tail is needed.
             probed = log.probe()
@@ -559,7 +559,17 @@ function CREATE():                                # a log with separate checkpoi
 `backoff()` waits `RuntimeConfig.throttleMinWaitMs` (the catalog's
 `fileio.catalog.throttle.retry.min-wait-ms`, default 200 ms) at first, then
 twice the previous wait up to the larger of 5 s and that value, each plus up
-to 50% random jitter. `checkpoint(r)` is exactly `r`'s log id, committed set
+to 50% random jitter. `raceBackoff()` waits a time drawn uniformly below a
+bound (full jitter): `RuntimeConfig.raceMinWaitMs` (the catalog's
+`fileio.catalog.race.retry.min-wait-ms`, default 20 ms; 0: no wait) after the
+commit's first lost race, doubled for each later one, up to the larger of
+1 s and that value. The writers who lost to one winner would otherwise all
+read and resend at once, and on a log that only replaces itself most of them
+lose again, each loss costing a read of the whole log (the contention
+benchmark: 13.7 lost races per committed operation at 32 writers on an S3
+general-purpose bucket). A wait changes when a write is sent, never what
+it says, so the protocol (and its TLA+ models, which have no time) is
+unchanged. `checkpoint(r)` is exactly `r`'s log id, committed set
 and state.
 
 **What may have landed.** A commit is rejected only before any write, or after

@@ -112,6 +112,7 @@ final class ContentionRun {
     props.put("fileio.catalog.max.append.count", config.string("max_append_count"));
     props.put("fileio.catalog.max.append.size", config.string("max_append_size"));
     props.put("fileio.catalog.conflict.encoding", config.string("encoding"));
+    props.put("fileio.catalog.race.retry.min-wait-ms", config.string("race_min_wait_ms"));
     String prefix = CatalogProperties.TABLE_DEFAULT_PREFIX;
     props.put(prefix + TableProperties.COMMIT_NUM_RETRIES, config.string("retry_num"));
     props.put(prefix + TableProperties.COMMIT_MIN_RETRY_WAIT_MS, config.string("retry_min_wait_ms"));

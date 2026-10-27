@@ -56,7 +56,9 @@ on it and commits them atomically:
    the record's preconditions again, and rebases the same record onto it;
    after a lost append race it resends the same record at the new tail;
    it resends a throttled write after a backoff
-   (`fileio.catalog.throttle.retry.min-wait-ms`); and it settles a write
+   (`fileio.catalog.throttle.retry.min-wait-ms`); it waits a random,
+   growing time after each lost race before it reads again
+   (`fileio.catalog.race.retry.min-wait-ms`); and it settles a write
    whose outcome it did not learn by reading the log for the
    transaction's record, or throws `CommitStateUnknownException` (I10). A
    record whose preconditions fail goes back to the caller: the catalog
@@ -740,12 +742,30 @@ the log it landed in, and compacts after the commit
 
 ### Choosing append vs CAS
 
-The default `max.append.count = 10000` works for S3 Express and Azure
-AppendBlob. GCS has no append, and the format commits every write there
-by CAS whatever the setting (`GCSFileIO.supportsAppend()` is false). For
-S3 standard buckets, which support conditional full-object replace but
-not conditional append, set `max.append.count = 0` to force CAS-only
-mode.
+The default `max.append.count` is 100. A reader replays every record
+after the checkpoint, and every commit reads, so a long tail costs every
+writer; a compaction rewrites the checkpoint and races the others'
+appends, so a short one costs compactions. In the contention benchmark
+(fast appends on S3 Express, lab/ `c4-knobs`), 100 beat both a replace
+on every commit and 1000, under `lamport` and `blind-append`. It was
+10000, sized to the stores' append caps (S3 Express 10,000 parts, Azure
+Append Blob 50,000 blocks), which only bound it: a count above a store's
+cap costs a refused append, then a compaction (Bug 66). The best count
+depends on the store's latencies and the catalog's size, so it should be
+measured per store or set by a principled rule ([errata.md](errata.md)
+§D14). GCS has no append, and the format commits every write there by
+CAS whatever the setting (`GCSFileIO.supportsAppend()` is false). For S3
+standard buckets, which support conditional full-object replace but not
+conditional append, set `max.append.count = 0` to force CAS-only mode.
+
+A writer that loses a race for the object (another writer's append or
+replace landed first) waits before it reads again and resends: a time
+drawn below a bound that starts at `fileio.catalog.race.retry.min-wait-ms`
+(default 20 ms) and doubles with each race the commit loses, up to 1 s.
+Without it the writers who lost to one winner all read and resend at
+once, and on a store that only replaces, most lose again, each loss a
+read of the whole object: at 32 writers on an S3 general-purpose bucket,
+a committed operation lost 13.7 races on average.
 
 The default `max.append.size = 16 MiB` is a soft target. Larger catalogs
 mean longer reads on every load; tune down for read-heavy workloads, up

@@ -109,7 +109,7 @@ class TestSharedLogRuntime {
   }
 
   private RuntimeConfig config(long retentionMs, CompactionPolicy compaction) {
-    return new RuntimeConfig(4, 3, 0L, retentionMs, compaction, Duration.ZERO, clock::get);
+    return new RuntimeConfig(4, 3, 0L, 0L, retentionMs, compaction, Duration.ZERO, clock::get);
   }
 
   private LogRuntime<State, EntityVersionsMachine.Builder, Txn> runtime(

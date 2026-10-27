@@ -155,10 +155,15 @@ public final class CatalogTestSupport {
     return log(io, location, Map.of());
   }
 
-  /** The catalog in the object at {@code location} of {@code io}, configured by {@code properties}. */
+  /**
+   * The catalog in the object at {@code location} of {@code io}, configured by {@code properties};
+   * a lost race is resent at once unless they set a wait.
+   */
   public static CatalogLog log(
       SupportsAtomicOperations io, String location, Map<String, String> properties) {
-    return log(io, location, LogCatalogProperties.runtimeConfig(properties));
+    Map<String, String> withRaces = new java.util.HashMap<>(properties);
+    withRaces.putIfAbsent(LogCatalogProperties.RACE_MIN_WAIT_MS, "0");
+    return log(io, location, LogCatalogProperties.runtimeConfig(withRaces));
   }
 
   /** The catalog in the object at {@code location} of {@code io}, with these commit knobs. */
@@ -181,7 +186,7 @@ public final class CatalogTestSupport {
       SupportsAtomicOperations io, String location, int maxAppendCount, long maxAppendSize,
       long committedRetentionMs, long throttleMinWaitMs) {
     return log(io, location, LogCatalogProperties.runtimeConfig(
-        maxAppendCount, maxAppendSize, committedRetentionMs, throttleMinWaitMs));
+        maxAppendCount, maxAppendSize, committedRetentionMs, throttleMinWaitMs, 0L));
   }
 
   /** The catalog in the object at {@code location} of {@code io}, committing by {@code config}. */

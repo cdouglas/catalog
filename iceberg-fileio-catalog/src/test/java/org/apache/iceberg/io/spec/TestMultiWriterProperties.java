@@ -757,12 +757,14 @@ class TestMultiWriterProperties {
               maxAppendCount,
               maxAppendSize,
               gc ? 0L : LogCatalogProperties.DEFAULT_COMMITTED_RETENTION_MS,
-              0); // retry throttled writes without sleeping
+              0, // retry throttled writes without sleeping
+              0); // and lost races
       this.log = storage.log(config);
       if (storage instanceof MultiWriterStorage.Memory) {
         // A compactor a second ahead of the writers, with their retention.
         ((MultiWriterStorage.Memory) storage).compactWith(new RuntimeConfig(
-            config.maxAttempts(), config.maxThrottleAttempts(), 0L, config.committedRetentionMs(),
+            config.maxAttempts(), config.maxThrottleAttempts(), 0L, 0L,
+            config.committedRetentionMs(),
             config.compaction(), config.visibilityWait(),
             () -> System.currentTimeMillis() + 1_000L));
       }

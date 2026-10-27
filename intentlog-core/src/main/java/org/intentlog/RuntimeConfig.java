@@ -28,6 +28,10 @@ import java.util.function.LongSupplier;
  * @param maxThrottleAttempts the times a write is sent while storage throttles it (8)
  * @param throttleMinWaitMs the first backoff after a throttled write; later ones double, up to the
  *     larger of 5 s and this, each plus up to 50% jitter
+ * @param raceMinWaitMs the bound of the first wait after a lost race (a conditional write that
+ *     failed its condition), before the commit reads or probes the log again; each later lost race
+ *     of the commit doubles it, up to the larger of 1 s and this. The wait is drawn uniformly below
+ *     the bound (full jitter), so that writers who lost to one winner spread out (0: none)
  * @param committedRetentionMs how long the committed set keeps an id: a compaction's GC record
  *     drops those older ({@code Long.MAX_VALUE}: never)
  * @param compaction when a commit compacts
@@ -38,6 +42,7 @@ public record RuntimeConfig(
     int maxAttempts,
     int maxThrottleAttempts,
     long throttleMinWaitMs,
+    long raceMinWaitMs,
     long committedRetentionMs,
     CompactionPolicy compaction,
     Duration visibilityWait,
@@ -46,13 +51,15 @@ public record RuntimeConfig(
   public static final int DEFAULT_MAX_ATTEMPTS = 10;
   public static final int DEFAULT_MAX_THROTTLE_ATTEMPTS = 8;
 
-  /** The defaults, with the given compaction policy, retention and throttle backoff. */
+  /** The defaults, with the given compaction policy, retention, and throttle and race backoffs. */
   public static RuntimeConfig of(
-      CompactionPolicy compaction, long committedRetentionMs, long throttleMinWaitMs) {
+      CompactionPolicy compaction, long committedRetentionMs, long throttleMinWaitMs,
+      long raceMinWaitMs) {
     return new RuntimeConfig(
         DEFAULT_MAX_ATTEMPTS,
         DEFAULT_MAX_THROTTLE_ATTEMPTS,
         throttleMinWaitMs,
+        raceMinWaitMs,
         committedRetentionMs,
         compaction,
         Duration.ZERO,

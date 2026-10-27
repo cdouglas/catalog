@@ -333,6 +333,9 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     // Express: 10,000 parts; an Azure Append Blob: 50,000 blocks): only a replace can commit
     // then, whatever the policy says.
     private boolean full = false;
+    // The races this commit lost (writes that failed their condition): each doubles the bound of
+    // the wait before it reads or probes the log again (raceBackoff).
+    private int lostRaces = 0;
     // Whether the record is larger than one append stores (an Azure AppendBlock: 4 MiB before
     // service version 2022-11-02, 100 MiB since): only a replace can commit it. An append of it
     // fails without landing, which the commit took for ambiguous on every attempt (Bug 71).
@@ -442,6 +445,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
               return validate(write(() -> log.replace(at, checkpoint(on), records(on)), false));
             } catch (LogConflictException e) {
               unresolved = e;
+              raceBackoff(e);
             }
             // Replace conflict: another writer changed the log since we read it. Rebase onto the
             // new state. Replay checks this intention's preconditions against the state its
@@ -473,6 +477,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
               continue;
             } catch (LogConflictException e) {
               unresolved = e;
+              raceBackoff(e);
             }
             // Another writer appended first. The record is the same and replay applies it once
             // (by its id), so append it again at the new tail without reading the log: only the
@@ -543,6 +548,24 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
       }
       throw new CommitRejectedException(
           CommitRejectedException.Reason.EXHAUSTED, null, "Exceeded maximum commit attempts", null);
+    }
+
+    /**
+     * Waits after a lost race, before the commit reads or probes the log again: a time drawn
+     * uniformly below a bound that starts at {@code raceMinWaitMs} and doubles with each race the
+     * commit lost, up to the larger of 1 s and that (full jitter). The writers who lost to one
+     * winner would otherwise all read and resend at once, and on a log that only replaces itself
+     * most of them lose again: each loss costs a read of the whole log. An interrupt stops the
+     * commit, its outcome unknown (the write that lost may have landed).
+     */
+    private void raceBackoff(RuntimeException lost) {
+      lostRaces += 1;
+      long base = config.raceMinWaitMs();
+      if (base <= 0L) {
+        return;
+      }
+      long bound = Math.min(base << Math.min(lostRaces - 1, 20), Math.max(1_000L, base));
+      sleep(ThreadLocalRandom.current().nextLong(bound + 1), lost);
     }
 
     private void adopt(Replayed fresh) {

@@ -279,7 +279,7 @@ record-3   = framed<LogRecord{ id=…, intention=Intention{
 object ([ATOMIC_FILE_LOG.md](ATOMIC_FILE_LOG.md) §"Commits on one object"): a
 checkpoint holding only the root row, a GC record, then the bootstrap
 record, which sets the catalog's conflict encoding
-(`fileio.catalog.conflict.encoding`, default `lamport`) and whose id joins
+(`fileio.catalog.conflict.encoding`, default `manifest-window`) and whose id joins
 the committed set like any other. Replay
 binds record 2's namespace -1 to `next_namespace_id`, 1, and bumps the root to
 version 1; `parent_version` is the root's version when the writer read it.
@@ -448,8 +448,10 @@ the version its writer read, and its payload, decoded once), extracts a
 conflict witness from it, and validates the witness against the table
 where the record lands (`ReplayView`) and against what the encoding keeps
 of the table (`EncodingState`, in `Table.conflict_state` /
-`InlineTable.conflict_state`). `lamport`, the default, is the Lamport
-clock: an action applies only on the version its writer read. Other
+`InlineTable.conflict_state`). `lamport` is the Lamport clock: an action
+applies only on the version its writer read. `manifest-window`, the
+default, merges the most (design.md §"The same table, per conflict
+encoding"). Other
 encodings separate a table's concerns, so that replay applies a commit
 Iceberg's retry would have repaired, merged onto the commits that landed
 first.
@@ -561,7 +563,8 @@ compacts ([ATOMIC_FILE_LOG.md](ATOMIC_FILE_LOG.md) §"Commits on one object"),
 `fileio.catalog.committed.retention.ms` how long the committed set keeps an id
 ([LOG.md](LOG.md) §"The committed set and GC"), and
 `fileio.catalog.throttle.retry.min-wait-ms` the backoff after a throttled
-write.
+write, and `fileio.catalog.race.retry.min-wait-ms` the backoff after a lost
+race.
 
 ## Late-Binding
 

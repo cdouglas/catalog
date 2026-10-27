@@ -41,7 +41,7 @@ Status of `FileIOCatalog` cloud test suites across the
   write both codecs.
 - **Conflict encoding** — how replay decides whether a table update
   conflicts with what landed since its writer read the table
-  (`fileio.catalog.conflict.encoding`, default `lamport`; SPEC.md
+  (`fileio.catalog.conflict.encoding`, default `manifest-window`; SPEC.md
   "Conflict Encodings"). An encoding changes replay's judgment, not the
   requests a commit makes of the store, so the matrix is run under the
   default only; the other encodings run locally (their contracts,
@@ -138,7 +138,8 @@ Iceberg 1.12.0, the ADLS Append Blob writes and the one-request GCS CAS.
 
 - **append · file** — `ADLSCatalogTest`,
   `ADLSFileIOCatalogTransactionTests`. The default catalog
-  configuration leaves `max.append.count` at 10 000. `ADLSFileIO` keeps
+  configuration leaves `max.append.count` at its default (10 000 before
+  2026-10-27, 100 since). `ADLSFileIO` keeps
   the catalog file an Append Blob: `Strategy.APPEND` is one conditional
   `AppendBlock`, and CAS stages a temp Append Blob and renames it onto
   the catalog file.

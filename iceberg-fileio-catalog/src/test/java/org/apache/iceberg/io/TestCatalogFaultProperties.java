@@ -149,11 +149,13 @@ class TestCatalogFaultProperties {
   private static final String CATALOG_NAME = "fuzz";
   private static final String CATALOG_LOCATION = WAREHOUSE + "/catalog-" + CATALOG_NAME;
 
-  // Retry commits and throttled writes without sleeping; merge manifests early, so merge appends
-  // read them; keep two previous metadata files, so pointer-mode commits delete older ones.
+  // Retry commits, throttled writes and lost races without sleeping; merge manifests early, so
+  // merge appends read them; keep two previous metadata files, so pointer-mode commits delete
+  // older ones.
   private static final Map<String, String> PROPERTIES =
       Map.of(
           LogCatalogProperties.THROTTLE_MIN_WAIT_MS, "0",
+          LogCatalogProperties.RACE_MIN_WAIT_MS, "0",
           CatalogProperties.TABLE_DEFAULT_PREFIX + TableProperties.COMMIT_MIN_RETRY_WAIT_MS, "1",
           CatalogProperties.TABLE_DEFAULT_PREFIX + TableProperties.COMMIT_MAX_RETRY_WAIT_MS, "1",
           CatalogProperties.TABLE_DEFAULT_PREFIX + TableProperties.MANIFEST_MIN_MERGE_COUNT, "2",

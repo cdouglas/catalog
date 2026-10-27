@@ -1,0 +1,11 @@
+{
+  "label": "c7-backoff",
+  "mix": {"fast_append": 1.0},
+  "vary": {
+    "store": ["s3x", "s3"],
+    "encoding": ["lamport", "manifest-window"],
+    "writers": [16, 32],
+    "race_min_wait_ms": [0, 20, 100],
+    "repetition": [0, 1]
+  }
+}

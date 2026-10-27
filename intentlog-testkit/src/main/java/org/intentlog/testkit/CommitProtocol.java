@@ -274,10 +274,10 @@ public final class CommitProtocol {
       this.harness = harness;
       this.settings = settings;
       this.runtime = new LogRuntime<>(harness.log(), EntityVersionsMachine.INSTANCE,
-          new RuntimeConfig(4, 3, 0L, settings.retentionMs, settings.policy, Duration.ZERO,
+          new RuntimeConfig(4, 3, 0L, 0L, settings.retentionMs, settings.policy, Duration.ZERO,
               System::currentTimeMillis));
       this.compactor = new LogRuntime<>(harness.log(), EntityVersionsMachine.INSTANCE,
-          new RuntimeConfig(4, 3, 0L, settings.retentionMs, settings.policy, Duration.ZERO,
+          new RuntimeConfig(4, 3, 0L, 0L, settings.retentionMs, settings.policy, Duration.ZERO,
               () -> System.currentTimeMillis() + settings.compactorAheadMs));
       this.writers = new Writer[settings.writers];
       for (int i = 0; i < writers.length; i++) {

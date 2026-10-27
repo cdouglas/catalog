@@ -253,6 +253,26 @@ either witness holds: both are stable, so their disjunction is.
 to other branches (write-audit-publish) where `partition-vector` is the
 chosen encoding.
 
+### D14. `max.append.count` and the race backoff are fixed numbers, not per store
+
+`fileio.catalog.max.append.count` defaults to 100 and
+`fileio.catalog.race.retry.min-wait-ms` to 20 ms, both from one store's
+measurements (S3 Express, in the contention benchmark: design.md
+§"Choosing append vs CAS"). The best values depend on the store's
+latencies (an Azure append that loses its race takes about 2 s to say so;
+an S3 general-purpose bucket only replaces) and on the catalog: a reader
+replays the records after the checkpoint and reads the whole object, so
+the tail's cost grows with the records and the object, while a
+compaction's cost is the checkpoint's size and its race with the others'
+appends. A principled rule would compact when the tail costs a read more
+than a compaction amortized over the commits until the next one costs a
+writer (bytes or replay time of the records after the checkpoint against
+the checkpoint's), and would scale the backoff to the store's write
+latency, which the commit loop measures.
+
+**Trigger to revisit:** a deployment on a store other than S3 Express, or
+the contention benchmark's Azure and GCS profiles.
+
 ### D8. Typed-protobuf encoding for Iceberg structural types (skip JSON serde)
 
 `AddSortOrderUpdate` is encoded structurally (see SPEC_TM.md §"Other
