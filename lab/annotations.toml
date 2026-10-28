@@ -80,6 +80,10 @@ select = ["i5-fold-*"]
 title = "i4's compactions after the same changes, and gzip at its fastest level"
 select = ["i6-compaction-*"]
 
+[campaigns.i7-retention]
+title = "i6's steady-state compactions at the committed set's new default retention, 30 minutes"
+select = ["i7-retention-*"]
+
 [campaigns.c8-fold]
 title = "c1's fast appends on the code before (4e65a65) and after (56facd8) replay folds a read onto a replica"
 select = ["c8-fold-*"]
