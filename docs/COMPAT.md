@@ -89,10 +89,13 @@ declare (`supportsEmptyNamespace`, `supportsVariant`,
 skip none.
 
 The fork's `SupportsAtomicOperations` contract tests last passed on these
-stores on 2026-10-26: GCS and ADLS at atomicio af875ccfd1, S3 in the run
-just before it. af875ccfd1 changes only the GCS Rapid suite's test of a CAS
-over a regular write, which failed in that earlier run. See the fork's
-README, "Testing on real cloud storage".
+stores on 2026-10-27, at atomicio b58500c8f3 (its contract classes on all
+five stores: 91 tests, 0 failures, 24 skipped). b58500c8f3 adds a case: an
+append to a version that a CAS replaced with an object of the same length
+fails, which S3 Express and ADLS pass and the stores without append skip
+(errata D15 relies on it). The run before, 2026-10-26, passed GCS and ADLS
+at af875ccfd1 and S3 just before it. See the fork's README, "Testing on
+real cloud storage".
 
 Earlier runs: 2026-10-26, the conflict encodings at the end of their
 phase 4 under the then default `lamport`, on fork atomicio 1f7ea07f1a, and
