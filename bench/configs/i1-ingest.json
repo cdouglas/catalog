@@ -1,6 +1,10 @@
 {
   "label": "i1-ingest",
   "retention_s": 21600,
+  "arrivals": "uniform",
+  "lateness_p50_ms": 0,
+  "lateness_p99_ms": 0,
+  "clock_skew_ms": 0,
   "capture": {
     "label": "cap-i1",
     "encoding": "manifest-window",

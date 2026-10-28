@@ -98,6 +98,14 @@ to tables of one `FileIOCatalog` over an in-memory store whose requests take a p
   campaigns i1-i6 ran with and their configs pin; 30 min since). `prefill` starts the set at its
   steady state for the rate (rate x retention ids), so a short log measures a long-running
   catalog's set: at 1,000 records/s that is 21.6 million ids at 6 h, 1.8 million at 30 min.
+- How the ids are timed (since 2026-10-28; i1-i7 pin the old way, `arrivals` uniform with no
+  lateness or skew): records land as a Poisson process at the rate, and an id's time is its
+  landing less a lognormal lateness (`lateness_p50_ms` 585, `lateness_p99_ms` 2,980: a fast
+  append's latency with 16 writers on s3x under manifest-window, c8-fold, which bounds a commit's
+  from above) plus one of `clocks` writer clocks' offset (`clock_skew_ms` 10). Ids then reach the
+  committed set out of order, as in production; with uniform timing every id is newer than all the
+  set holds, its cheapest case. JMH (IngestFoldBench, 30-min steady set, 1,000/s): publishing after
+  every record 15.6k records/s modeled against 22.0k uniform; in batches of 64, within noise.
 - `batch` is the records folded before the state is built (published): a tailing reader's read.
   Building copies what the batch changed, and rewrites the committed set (its packed bytes) once
   per batch, so its cost per record falls with the batch.

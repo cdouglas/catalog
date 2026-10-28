@@ -51,7 +51,9 @@ import org.openjdk.jmh.annotations.Warmup;
  * IngestBench's pass as a JMH benchmark, for profiling (async-profiler: {@code -prof
  * async:libPath=...}): one operation folds the next {@code batch} records of a captured log onto
  * the state and committed set the records before them reached, and builds both, as an ingest
- * thread that publishes after each batch does. The log's ids are retimed to {@code rate}; the
+ * thread that publishes after each batch does. The log's ids are retimed to {@code rate}, by
+ * IngestRun's defaults ({@code ids = model}: Poisson arrivals, each id earlier than its landing by
+ * its commit's lateness and its writer's clock skew) or evenly and in order ({@code uniform}); the
  * state starts after the first {@code start} records, with the committed set {@code empty} (only
  * the log's ids), {@code steady} (prefilled with rate x retention ids, as IngestRun's prefill), or
  * {@code discard} (no ids kept). At the log's end it starts again from there. The {@code records}
@@ -85,6 +87,10 @@ public class IngestFoldBench {
   @Param({"20000"})
   public int start;
 
+  /** How the ids are timed: model (IngestRun's defaults) or uniform. */
+  @Param({"model"})
+  public String ids;
+
   private Folder<?, ?, ?> folder;
 
   /** Records folded, reported as a rate. */
@@ -100,9 +106,22 @@ public class IngestFoldBench {
       throw new IllegalArgumentException("Pass a capture's log.bin: -p log=<path>");
     }
     LogView captured = AtomicFileLog.decode(Files.readAllBytes(Paths.get(log)));
-    List<byte[]> records = IngestRun.retimed(captured.records(), rate);
+    IngestRun.Ids timing = timing();
+    List<byte[]> records = IngestRun.retimed(captured.records(), timing);
     folder = Folder.of(ContentionAccess.machine(), captured.checkpoint().orElseThrow(), records,
-        start, committed, rate, retentionS);
+        start, committed, timing, retentionS);
+  }
+
+  private IngestRun.Ids timing() {
+    switch (ids) {
+      case "model":
+        return IngestRun.Ids.of(BenchConfig.expand(BenchConfig.parse("{\"rate\": " + rate + "}"),
+            IngestRun.DEFAULTS).get(0));
+      case "uniform":
+        return IngestRun.Ids.uniform(rate);
+      default:
+        throw new IllegalArgumentException("ids is model or uniform: " + ids);
+    }
   }
 
   @Benchmark
@@ -151,13 +170,13 @@ public class IngestFoldBench {
 
     static <S, B extends StateMachine.Builder<S>, I extends Intention<B>> Folder<S, B, I> of(
         StateMachine<S, B, I> machine, byte[] checkpoint, List<byte[]> records, int start,
-        String committed, double rate, double retentionS) {
+        String committed, IngestRun.Ids timing, double retentionS) {
       boolean discard = committed.equals("discard");
       LogEnvelope.Checkpoint envelope = LogEnvelope.decodeCheckpoint(checkpoint);
       CommittedSet set = discard ? CommittedSet.EMPTY : CommittedSet.of(envelope.committed());
       if (committed.equals("steady")) {
         CommittedSet.Builder merged = IngestRun.prefill(
-            UuidV7.timestampMs(LogEnvelope.decodeRecord(records.get(0)).id()), rate, retentionS,
+            UuidV7.timestampMs(LogEnvelope.decodeRecord(records.get(0)).id()), timing, retentionS,
             0).toBuilder();
         set.ids().forEach(merged::add);
         set = merged.build();

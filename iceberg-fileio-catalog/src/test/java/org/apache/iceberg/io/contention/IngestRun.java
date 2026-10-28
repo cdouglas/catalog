@@ -47,7 +47,11 @@ import org.intentlog.wire.UuidV7;
  * reader can consume the log as the catalog grows, and how fast the catalog grows in bytes.
  *
  * <p>The log's ids are retimed to {@code rate} records/s (0: as captured): a production rate sets
- * how many ids the committed set holds within its retention. The captured GC records are dropped;
+ * how many ids the committed set holds within its retention. Records land at the rate, evenly or as
+ * a Poisson process ({@code arrivals}), and an id's time is when its commit began, by its writer's
+ * clock: its landing less a lognormal lateness ({@code lateness_p50_ms}, {@code lateness_p99_ms}),
+ * plus the offset of one of {@code clocks} writer clocks ({@code clock_skew_ms}, the offsets'
+ * standard deviation). So ids reach the committed set out of order, as they do in production. The captured GC records are dropped;
  * the run writes its own. Each {@code batch} records are folded onto the state, which is then built
  * (published, as a tailing reader would after each read; a batch ends where a compaction is due).
  * Every {@code compact_every} records a
@@ -80,6 +84,17 @@ final class IngestRun {
           + "\"rate\": 1000,"
           // the committed set's GC window (fileio.catalog.committed.retention.ms: 30 min)
           + "\"retention_s\": 1800,"
+          // when records land: uniform (one every 1/rate s) or poisson (a Poisson process)
+          + "\"arrivals\": \"poisson\","
+          // how long before landing a record's commit minted its id: a lognormal of this median
+          // and 99th percentile (0: none). The default is the latency of a fast append with 16
+          // writers on S3 Express under manifest-window (campaign c8-fold at 56facd8): an
+          // operation's latency, which bounds its last commit's from above
+          + "\"lateness_p50_ms\": 585,"
+          + "\"lateness_p99_ms\": 2980,"
+          // the writers' clocks, each offset by a normal of this standard deviation
+          + "\"clocks\": 16,"
+          + "\"clock_skew_ms\": 10,"
           // records between compactions (fileio.catalog.max.append.count); 0: none
           + "\"compact_every\": 100,"
           // records folded before the state is built, as one read of a tailing reader returns
@@ -112,7 +127,7 @@ final class IngestRun {
   Map<String, Object> run() throws IOException {
     LogView captured = AtomicFileLog.decode(Files.readAllBytes(log));
     byte[] checkpoint = captured.checkpoint().orElseThrow();
-    List<byte[]> records = retimed(captured.records(), config.number("rate"));
+    List<byte[]> records = retimed(captured.records(), Ids.of(config));
     return ingest(ContentionAccess.machine(), checkpoint, captured.records(), records);
   }
 
@@ -125,7 +140,7 @@ final class IngestRun {
 
     CommittedSet prefill = config.bool("prefill") && !discard()
         ? prefill(UuidV7.timestampMs(LogEnvelope.decodeRecord(records.get(0)).id()),
-            config.number("rate"), config.number("retention_s"), config.longValue("repetition"))
+            Ids.of(config), config.number("retention_s"), config.longValue("repetition"))
         : null;
     Pass<S> measured;
     try (BufferedWriter windows = writer("windows.jsonl");
@@ -141,7 +156,7 @@ final class IngestRun {
     summary.put("ingest_s", measured.nanos / 1e9);
     summary.put("records_s", measured.records / (measured.nanos / 1e9));
     summary.put("compactions", measured.compactions);
-    summary.put("prefill_ids", prefill != null ? config.number("rate") * config.number("retention_s") : 0);
+    summary.put("prefill_ids", prefill != null ? prefill.ids().size() : 0);
     summary.put("committed", config.string("committed"));
     if (measured.records == records.size()) {
       // The same state as a replay of the log as captured: retiming and the run's own GC records
@@ -162,18 +177,111 @@ final class IngestRun {
   }
 
   /**
-   * The committed set at steady state for the rate: rate x retention ids, one every 1/rate s over
-   * the retention window before the first record (seeded, so every run of a rate has the same).
+   * How a run times its ids: records land at {@code rate} records/s, evenly or as a Poisson
+   * process, and an id's time is its landing less its commit's lateness (lognormal, from its median
+   * and 99th percentile; none if the median is 0), plus the offset of its writer's clock (one of
+   * {@code clocks}, each a normal of standard deviation {@code skewMs}), in ms.
    */
-  static CommittedSet prefill(long first, double rate, double retentionS, long repetition) {
+  record Ids(double rate, boolean poisson, double latenessP50Ms, double latenessP99Ms, int clocks,
+      double skewMs) {
+    /** One every 1/rate s, minted as it lands: the ids in order, evenly spaced. */
+    static Ids uniform(double rate) {
+      return new Ids(rate, false, 0, 0, 1, 0);
+    }
+
+    static Ids of(BenchConfig config) {
+      String arrivals = config.string("arrivals");
+      if (!arrivals.equals("uniform") && !arrivals.equals("poisson")) {
+        throw new IllegalArgumentException("arrivals is uniform or poisson, not " + arrivals);
+      }
+      return new Ids(config.number("rate"), arrivals.equals("poisson"),
+          config.number("lateness_p50_ms"), config.number("lateness_p99_ms"),
+          config.integer("clocks"), config.number("clock_skew_ms"));
+    }
+
+    /** Each record's time, relative to the first's landing, as {@link #next} draws them. */
+    Clock clock(long seed) {
+      return new Clock(this, new java.util.Random(seed));
+    }
+  }
+
+  /** Draws the times of successive records' ids: see {@link Ids}. */
+  static final class Clock {
+    // Standard normal quantile of 0.99, to fit a lognormal to a median and 99th percentile
+    private static final double Z99 = 2.3263478740408408;
+
+    private final Ids ids;
+    private final java.util.Random random;
+    private final double[] offsets;
+    private final double mu;
+    private final double sigma;
+    private long count = 0;
+    private double landing = 0;
+
+    private Clock(Ids ids, java.util.Random random) {
+      this.ids = ids;
+      this.random = random;
+      this.offsets = new double[Math.max(1, ids.clocks())];
+      for (int i = 0; i < offsets.length && ids.skewMs() > 0; i++) {
+        offsets[i] = random.nextGaussian() * ids.skewMs();
+      }
+      this.mu = ids.latenessP50Ms() > 0 ? Math.log(ids.latenessP50Ms()) : 0;
+      this.sigma = ids.latenessP50Ms() > 0
+          ? Math.max(0, Math.log(ids.latenessP99Ms() / ids.latenessP50Ms())) / Z99
+          : 0;
+    }
+
+    /** The landing time of the next record, ms after the first's. */
+    double land() {
+      if (ids.poisson()) {
+        if (count > 0) {
+          landing += -Math.log(1 - random.nextDouble()) * 1000.0 / ids.rate();
+        }
+      } else {
+        landing = count * 1000.0 / ids.rate();
+      }
+      count++;
+      return landing;
+    }
+
+    /** The next record's id time, ms after the first's landing. */
+    double next() {
+      return land() + jitter();
+    }
+
+    /** How far an id's time is from its record's landing: less its lateness, plus its skew. */
+    double jitter() {
+      double by = 0;
+      if (ids.latenessP50Ms() > 0) {
+        by -= Math.exp(mu + sigma * random.nextGaussian());
+      }
+      if (ids.skewMs() > 0) {
+        by += offsets[random.nextInt(offsets.length)];
+      }
+      return by;
+    }
+  }
+
+  /**
+   * The committed set at steady state: the ids of the records that landed in the retention window
+   * before the first record, timed by {@code ids} (seeded, so every run of a configuration has the
+   * same).
+   */
+  static CommittedSet prefill(long first, Ids ids, double retentionS, long repetition) {
     long retentionMs = (long) (1000 * retentionS);
-    long count = (long) (rate * retentionS);
     java.util.Random random = new java.util.Random(repetition * 31 + 7);
+    Clock clock = ids.clock(repetition * 31 + 11);
     CommittedSet set = CommittedSet.EMPTY;
-    for (long from = 0; from < count; from += 1_000_000) {
+    boolean more = true;
+    while (more) {
       CommittedSet.Builder chunk = set.toBuilder();
-      for (long i = from; i < Math.min(count, from + 1_000_000); i++) {
-        long at = first - retentionMs + (long) Math.floor(i * 1000.0 / rate);
+      for (int i = 0; i < 1_000_000; i++) {
+        double landing = clock.land();
+        if (landing >= retentionMs) {
+          more = false;
+          break;
+        }
+        long at = first - retentionMs + (long) Math.floor(landing + clock.jitter());
         chunk.add(UuidV7.newUuidV7(Math.max(1L, at), random));
       }
       set = chunk.build();
@@ -317,13 +425,14 @@ final class IngestRun {
   }
 
   /**
-   * The intention records, their ids retimed to {@code rate} records/s from the first one's time
-   * (keeping each id's random bits; a copy of a record keeps its copy's id), without the GC
-   * records.
+   * The intention records, their ids retimed by {@code ids} from the first one's time (keeping
+   * each id's random bits; a copy of a record keeps its copy's id), without the GC records.
    */
-  static List<byte[]> retimed(List<byte[]> original, double rate) {
+  static List<byte[]> retimed(List<byte[]> original, Ids ids) {
+    double rate = ids.rate();
+    Clock clock = ids.clock(17);
     List<byte[]> records = new ArrayList<>(original.size());
-    Map<UUID, UUID> ids = new HashMap<>();
+    Map<UUID, UUID> retimed = new HashMap<>();
     long start = -1;
     for (byte[] bytes : original) {
       LogEnvelope.Record record = LogEnvelope.decodeRecord(bytes);
@@ -337,10 +446,12 @@ final class IngestRun {
       if (start < 0) {
         start = UuidV7.timestampMs(record.id());
       }
-      long at = start + (long) Math.floor(ids.size() * 1000.0 / rate);
-      UUID id =
-          ids.computeIfAbsent(record.id(),
-              old -> UuidV7.fromTimestampAndRandom(at, UuidV7.packRandomBits(old), 0));
+      UUID id = retimed.get(record.id());
+      if (id == null) {
+        long at = Math.max(1L, start + (long) Math.floor(clock.next()));
+        id = UuidV7.fromTimestampAndRandom(at, UuidV7.packRandomBits(record.id()), 0);
+        retimed.put(record.id(), id);
+      }
       records.add(LogEnvelope.encodeRecord(id, record.intention()));
     }
     return records;

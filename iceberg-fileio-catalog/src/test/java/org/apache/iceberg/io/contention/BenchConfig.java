@@ -157,7 +157,7 @@ final class BenchConfig {
     return configs;
   }
 
-  private static JsonNode parse(String json) {
+  static JsonNode parse(String json) {
     try {
       return MAPPER.readTree(json);
     } catch (java.io.IOException e) {
