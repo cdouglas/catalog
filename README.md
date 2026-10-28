@@ -65,6 +65,8 @@ iceberg-fileio-catalog/                      the catalog module (Maven), under s
   main/java/.../ProtoCodec.java              wire encoding for catalog
   main/java/.../InlineDeltaCodec.java        wire encoding for TM/ML deltas
   main/proto/catalog.proto                   protobuf schema
+docs/FORMAT.md                               the log format at a glance: where each part is
+                                             specified, and what each costs, as measured
 docs/LOG.md                                  the intention log: SPIs, envelope, replay, GC,
                                              commit loop, compaction, providers
 docs/ATOMIC_FILE_LOG.md                      the catalog file: AtomicFileLog's layout and commits
