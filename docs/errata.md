@@ -413,23 +413,25 @@ a record applied that was not, and drop it. The fixes, in order:
   records/s in batches of 64 and 19,968 one record at a time (campaign
   `i5-fold`, lab page `ingest-ladder`), against 30,143 with the ids
   discarded. The checkpoint still carries the whole set.
-- **Page out sealed runs.** A checkpoint could hold the newest run inline
-  and older ones as pointers to immutable objects, as pointer mode does for a
-  table's metadata. A compaction then writes the head and the pointers, and
-  a reader fetches a run only for a lookup in its span of time: a copy of an
-  old record, or a writer asking about an old id. Runs must be sealed at
-  boundaries the set determines (fixed spans of id time, say), so every
-  compactor writes the same objects and the same checkpoint (I11). A run
-  that cannot be fetched fails the read, since a lookup must not answer
-  "absent". And a run's object is deleted only when no checkpoint a reader
-  may still hold names it, as for expired metadata files.
+- **Page out the old ids** (designed in
+  [COMMITTED_PAGING.md](COMMITTED_PAGING.md), not built). The horizon splits in
+  two: a floor below which replay admits no record, and the horizon below which
+  lookups are unknown. The ids between them move to immutable pages, which the
+  checkpoint names by URI. A `PageOut` record seals the oldest block of the set
+  and raises the floor; it applies only if the block's digest matches what its
+  writer paged. The blocks are the maximal nodes of a binary trie over the ids'
+  timestamps holding at most 2^16 ids: deterministic, sized by density, never
+  pivoting on an id. The checkpoint then carries rate × the admission window
+  (5 minutes proposed), not rate × the retention. Replay never reads a page,
+  and a writer's lookup in the paged range fetches it and is exact.
 - **Derive the retention.** 6 hours was "longer than any commit's retries"
   (GC.md); the default is 30 minutes since 2026-10-28, which makes the set 12
   times smaller. What the set must cover is how late a copy of a record can
   land, which a store may bound (SigV4 and Azure Shared Key reject a request
   signed about 15 minutes earlier; to be checked per store), and how long a
   writer may ask whether its commit landed, which the snapshot oracle (GC.md)
-  answers past the horizon.
+  answers past the horizon. With paging, only the admission window sizes the
+  checkpoint, and the retention could grow again cheaply.
 
 **Trigger to revisit:** a commit rate past about 50 a second at the default
 retention (the set passes 1 MB there, and grows linearly with the rate), or the
