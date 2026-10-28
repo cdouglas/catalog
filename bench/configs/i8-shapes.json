@@ -1,0 +1,154 @@
+{
+  "label": "i8-shapes",
+  "max_ingest_s": 120,
+  "batch": 64,
+  "rate": 1000,
+  "prefill": true,
+  "committed": "keep",
+  "vary": {
+    "capture": [
+      {
+        "encoding": "manifest-window",
+        "writers": 16,
+        "tables": 16,
+        "race_min_wait_ms": 0,
+        "duration_s": 600,
+        "warmup_s": 5,
+        "drain_s": 10,
+        "expire_every_s": 5,
+        "expire_retain": 100,
+        "expire_retry_num": 100,
+        "label": "cap-i1",
+        "mix": {
+          "merge_append": 0.85,
+          "fast_append": 0.05,
+          "validated_overwrite": 0.05,
+          "compaction": 0.05
+        }
+      },
+      {
+        "encoding": "manifest-window",
+        "writers": 16,
+        "tables": 1,
+        "race_min_wait_ms": 0,
+        "duration_s": 600,
+        "warmup_s": 5,
+        "drain_s": 10,
+        "expire_every_s": 5,
+        "expire_retain": 100,
+        "expire_retry_num": 100,
+        "label": "cap-s-onetable",
+        "mix": {
+          "merge_append": 0.85,
+          "fast_append": 0.05,
+          "validated_overwrite": 0.05,
+          "compaction": 0.05
+        }
+      },
+      {
+        "encoding": "manifest-window",
+        "writers": 16,
+        "tables": 16,
+        "race_min_wait_ms": 0,
+        "duration_s": 600,
+        "warmup_s": 5,
+        "drain_s": 10,
+        "expire_every_s": 5,
+        "expire_retain": 100,
+        "expire_retry_num": 100,
+        "label": "cap-s-zipf",
+        "table_dist": "zipf",
+        "table_zipf_alpha": 1.1,
+        "mix": {
+          "merge_append": 0.85,
+          "fast_append": 0.05,
+          "validated_overwrite": 0.05,
+          "compaction": 0.05
+        }
+      },
+      {
+        "encoding": "manifest-window",
+        "writers": 16,
+        "tables": 16,
+        "race_min_wait_ms": 0,
+        "duration_s": 600,
+        "warmup_s": 5,
+        "drain_s": 10,
+        "expire_every_s": 5,
+        "expire_retain": 100,
+        "expire_retry_num": 100,
+        "label": "cap-s-fast",
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "encoding": "manifest-window",
+        "writers": 16,
+        "tables": 16,
+        "race_min_wait_ms": 0,
+        "duration_s": 600,
+        "warmup_s": 5,
+        "drain_s": 10,
+        "expire_every_s": 5,
+        "expire_retain": 100,
+        "expire_retry_num": 100,
+        "label": "cap-s-merge2",
+        "mix": {
+          "merge_append": 0.85,
+          "fast_append": 0.05,
+          "validated_overwrite": 0.05,
+          "compaction": 0.05
+        },
+        "table_properties": {
+          "commit.manifest.min-count-to-merge": "2"
+        }
+      },
+      {
+        "encoding": "manifest-window",
+        "writers": 16,
+        "tables": 16,
+        "race_min_wait_ms": 0,
+        "duration_s": 600,
+        "warmup_s": 5,
+        "drain_s": 10,
+        "expire_every_s": 5,
+        "expire_retain": 100,
+        "expire_retry_num": 100,
+        "label": "cap-s-txn",
+        "mix": {
+          "merge_append": 0.6,
+          "catalog_txn": 0.25,
+          "validated_overwrite": 0.05,
+          "compaction": 0.05,
+          "schema": 0.05
+        },
+        "txn_tables": 1.6,
+        "txn_tables_dist": "exponential",
+        "txn_tables_max": 8
+      },
+      {
+        "encoding": "manifest-window",
+        "writers": 16,
+        "tables": 16,
+        "race_min_wait_ms": 0,
+        "duration_s": 600,
+        "warmup_s": 5,
+        "drain_s": 10,
+        "expire_every_s": 5,
+        "expire_retain": 100,
+        "expire_retry_num": 100,
+        "label": "cap-s-txn4",
+        "mix": {
+          "merge_append": 0.5,
+          "catalog_txn": 0.5
+        },
+        "txn_tables": 4
+      }
+    ],
+    "compact_every": [
+      0,
+      100
+    ]
+  }
+}

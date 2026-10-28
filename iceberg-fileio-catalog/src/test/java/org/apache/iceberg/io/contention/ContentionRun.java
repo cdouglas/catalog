@@ -256,6 +256,7 @@ final class ContentionRun {
     for (int t = 0; t < config.integer("tables"); t++) {
       Table table =
           admin.buildTable(table(t), Operations.SCHEMA).withPartitionSpec(Operations.SPEC)
+              .withProperties(config.stringMap("table_properties"))
               .create();
       for (int i = 0; i < config.integer("preload_commits"); i++) {
         table.newFastAppend()
@@ -379,12 +380,13 @@ final class ContentionRun {
     return weights.get(weights.size() - 1);
   }
 
-  /** {@code n} distinct values of {@code [0, of)}, uniform or Zipf. */
-  private List<Integer> choose(SplittableRandom random, int n, int of, String dist) {
+  /** {@code n} distinct values of {@code [0, of)}, uniform or Zipf of exponent {@code alpha}. */
+  private static List<Integer> choose(
+      SplittableRandom random, int n, int of, String dist, double alpha) {
     List<Integer> chosen = new ArrayList<>(n);
     n = Math.min(n, of);
     while (chosen.size() < n) {
-      int v = dist.equals("zipf") ? zipf(random, of, config.number("zipf_alpha")) : random.nextInt(of);
+      int v = dist.equals("zipf") ? zipf(random, of, alpha) : random.nextInt(of);
       if (!chosen.contains(v)) {
         chosen.add(v);
       }
@@ -411,20 +413,54 @@ final class ContentionRun {
 
   private void operate(FileIOCatalog catalog, int writer, SplittableRandom random, long arrived) {
     String kind = pick(random);
-    int tableIndex = choose(random, 1, config.integer("tables"), config.string("table_dist")).get(0);
-    List<Integer> partitions =
-        choose(random, config.integer("partitions_per_txn"), config.integer("partitions"),
-            config.string("partition_dist"));
+    // A catalog transaction writes several tables, each in partitions of its own
+    List<Integer> tables = tables(random, kind.equals("catalog_txn") ? txnWidth(random) : 1);
+    Map<Integer, List<Integer>> partitions = new LinkedHashMap<>();
+    for (int t : tables) {
+      partitions.put(t, partitions(random));
+    }
     com.fasterxml.jackson.databind.JsonNode byKind = config.node().get("runtime_ms").get(kind);
     double median = byKind != null ? byKind.asDouble() : config.number("runtime_median_ms");
     double runtimeMs =
         median > 0 ? median * Math.exp(config.number("runtime_sigma") * gaussian(random)) : 0;
-    run(catalog, kind, tableIndex, partitions, runtimeMs, writer, arrived);
+    run(catalog, kind, partitions, runtimeMs, writer, random, arrived);
+  }
+
+  /** {@code n} distinct tables, as {@code table_dist} chooses them. */
+  private List<Integer> tables(SplittableRandom random, int n) {
+    return choose(random, n, config.integer("tables"), config.string("table_dist"),
+        config.number("table_zipf_alpha"));
+  }
+
+  /** The partitions an operation on a table touches, as {@code partition_dist} chooses them. */
+  private List<Integer> partitions(SplittableRandom random) {
+    return choose(random, config.integer("partitions_per_txn"), config.integer("partitions"),
+        config.string("partition_dist"), config.number("zipf_alpha"));
+  }
+
+  /**
+   * The tables a catalog transaction writes: {@code txn_tables}, or with {@code txn_tables_dist}
+   * exponential a draw of that mean, rounded down; at least 1, at most {@code txn_tables_max}.
+   */
+  private int txnWidth(SplittableRandom random) {
+    String dist = config.string("txn_tables_dist");
+    int k;
+    if (dist.equals("fixed")) {
+      k = config.integer("txn_tables");
+    } else if (dist.equals("exponential")) {
+      k = (int) Math.floor(exponential(random, config.number("txn_tables")));
+    } else {
+      throw new IllegalArgumentException("txn_tables_dist is fixed or exponential, not " + dist);
+    }
+    return Math.max(1, Math.min(k, config.integer("txn_tables_max")));
   }
 
   private void run(
-      FileIOCatalog catalog, String kind, int tableIndex, List<Integer> partitions,
-      double runtimeMs, int writer, long arrived) {
+      FileIOCatalog catalog, String kind, Map<Integer, List<Integer>> tablePartitions,
+      double runtimeMs, int writer, SplittableRandom random, long arrived) {
+    List<Integer> tables = new ArrayList<>(tablePartitions.keySet());
+    int tableIndex = tables.get(0);
+    List<Integer> partitions = tablePartitions.get(tableIndex);
     boolean measured = measuring.get() && !stopping.get();
     CatalogLog.CommitCounts counts = ContentionAccess.counts(catalog);
     long committed0 = counts.committed();
@@ -445,8 +481,8 @@ final class ContentionRun {
     String outcome = "committed";
     String error = null;
     try {
-      Table table = catalog.loadTable(table(tableIndex));
       Operations.Skip skip;
+      Table table = kind.equals("catalog_txn") ? null : catalog.loadTable(table(tableIndex));
       switch (kind) {
         case "fast_append":
           skip = Operations.fastAppend(table, partitions, config.integer("files_per_partition"),
@@ -469,6 +505,22 @@ final class ContentionRun {
           break;
         case "property":
           skip = Operations.property(table, partitions.get(0) % 8, ignored -> runtime.run());
+          break;
+        case "schema":
+          skip = Operations.schema(table, ignored -> runtime.run());
+          break;
+        case "catalog_txn":
+          List<TableIdentifier> ids = new ArrayList<>();
+          Map<TableIdentifier, List<Integer>> byId = new HashMap<>();
+          for (int t : tables) {
+            ids.add(table(t));
+            byId.put(table(t), tablePartitions.get(t));
+          }
+          skip = Operations.catalogTransaction(catalog, ids, byId::get,
+              config.integer("files_per_partition"), config.bool("txn_merge"),
+              new Operations.Retry(config.integer("retry_num"),
+                  config.longValue("retry_min_wait_ms"), config.longValue("retry_max_wait_ms")),
+              random, ignored -> runtime.run());
           break;
         default:
           throw new IllegalArgumentException("Unknown operation: " + kind);
@@ -497,6 +549,9 @@ final class ContentionRun {
     op.put("kind", kind);
     op.put("table", tableIndex);
     op.put("partitions", partitions);
+    if (kind.equals("catalog_txn")) {
+      op.put("tables", tables);
+    }
     op.put("measured", measured);
     op.put("arrived_ms", (arrived - startNanos) / 1e6);
     op.put("started_ms", (started - startNanos) / 1e6);

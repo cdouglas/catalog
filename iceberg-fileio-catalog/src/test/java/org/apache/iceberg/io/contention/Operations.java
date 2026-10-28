@@ -22,7 +22,11 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.SplittableRandom;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.LockSupport;
+import java.util.function.Function;
 import java.util.function.LongConsumer;
 import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.DataFile;
@@ -34,6 +38,12 @@ import org.apache.iceberg.RewriteFiles;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.catalog.CatalogTransaction;
+import org.apache.iceberg.catalog.SupportsCatalogTransactions;
+import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.exceptions.CommitFailedException;
+import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.CloseableIterable;
@@ -56,6 +66,12 @@ import org.apache.iceberg.types.Types;
  *       deletes of the files it rewrites conflict.
  *   <li>{@code property}: a property set (table maintenance, tuning).
  *   <li>{@code wap}: a write-audit-publish insert, to the writer's own branch.
+ *   <li>{@code catalog_txn}: an insert into several tables at once, one file per partition into
+ *       each, committed in one serializable catalog transaction, as a job that writes related
+ *       tables does. The catalog does not retry one that conflicts (errata D12), so the job does,
+ *       as Iceberg retries a table's commit.
+ *   <li>{@code schema}: a column added, or the oldest added one dropped once a table has eight:
+ *       a schema change, which Iceberg commits once.
  * </ul>
  */
 final class Operations {
@@ -168,5 +184,72 @@ final class Operations {
     table.updateProperties().set("bench.key" + key, String.valueOf(FILES.incrementAndGet()))
         .commit();
     return Skip.NONE;
+  }
+
+  /** Columns a {@link #schema} change adds, at most this many at once, then drops the oldest. */
+  static final int ADDED_COLUMNS = 8;
+
+  static Skip schema(Table table, LongConsumer runtime) {
+    runtime.accept(0);
+    List<Types.NestedField> added = new ArrayList<>();
+    for (Types.NestedField field : table.schema().columns()) {
+      if (field.name().startsWith("x")) {
+        added.add(field);
+      }
+    }
+    if (added.size() >= ADDED_COLUMNS) {
+      table.updateSchema().deleteColumn(added.get(0).name()).commit();
+    } else {
+      table.updateSchema()
+          .addColumn("x" + FILES.incrementAndGet(), Types.IntegerType.get())
+          .commit();
+    }
+    return Skip.NONE;
+  }
+
+  /** How a job retries what its catalog does not: as Iceberg's commit.retry.* configure it. */
+  record Retry(int retries, long minWaitMs, long maxWaitMs) {
+    /** The wait before attempt {@code attempt} (from 1): doubling from the least, jittered. */
+    long waitMs(int attempt, SplittableRandom random) {
+      double wait = Math.min(maxWaitMs, minWaitMs * Math.pow(2, attempt - 1));
+      return (long) (wait * (1 + 0.1 * random.nextDouble()));
+    }
+  }
+
+  /**
+   * An insert of {@code filesPerPartition} files per partition into each of {@code tables}, the
+   * partitions of each as {@code partitions} gives them, committed together in a serializable
+   * catalog transaction; on a conflict, loaded and staged again, up to {@code retry}'s retries.
+   */
+  static Skip catalogTransaction(
+      SupportsCatalogTransactions catalog, List<TableIdentifier> tables,
+      Function<TableIdentifier, List<Integer>> partitions, int filesPerPartition, boolean merge,
+      Retry retry, SplittableRandom random,
+      LongConsumer runtime) {
+    runtime.accept(0);
+    for (int attempt = 0; ; attempt++) {
+      try {
+        CatalogTransaction transaction =
+            catalog.createTransaction(CatalogTransaction.IsolationLevel.SERIALIZABLE);
+        Catalog view = transaction.asCatalog();
+        for (TableIdentifier id : tables) {
+          Table table = view.loadTable(id);
+          AppendFiles append = merge ? table.newAppend() : table.newFastAppend();
+          for (int p : partitions.apply(id)) {
+            for (int f = 0; f < filesPerPartition; f++) {
+              append.appendFile(newFile(table, p, 100));
+            }
+          }
+          append.commit();
+        }
+        transaction.commitTransaction();
+        return Skip.NONE;
+      } catch (CommitFailedException | ValidationException e) {
+        if (attempt >= retry.retries()) {
+          throw e;
+        }
+        LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(retry.waitMs(attempt + 1, random)));
+      }
+    }
   }
 }

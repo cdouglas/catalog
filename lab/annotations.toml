@@ -84,6 +84,10 @@ select = ["i6-compaction-*"]
 title = "i6's steady-state compactions at the committed set's new default retention, 30 minutes"
 select = ["i7-retention-*"]
 
+[campaigns.i8-shapes]
+title = "Ingest of seven workload shapes' logs: cap-i1's, one table, skewed tables, fast appends only, eager merges, YCSB-like and four-table catalog transactions"
+select = ["i8-shapes-*"]
+
 [campaigns.c8-fold]
 title = "c1's fast appends on the code before (4e65a65) and after (56facd8) replay folds a read onto a replica"
 select = ["c8-fold-*"]

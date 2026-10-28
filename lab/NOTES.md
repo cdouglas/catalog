@@ -32,6 +32,20 @@ to tables of one `FileIOCatalog` over an in-memory store whose requests take a p
   `apply`), so their runtime only paces the writer; validated operations validate from the
   snapshot the job read, so their runtime is their conflict window.
 - Iceberg's commit retry is on (`retry_num`, default 4, with its backoff from `retry_min_wait_ms`).
+- Tables: `tables` of them, created with `table_properties` (Iceberg's table properties, e.g.
+  `commit.manifest.min-count-to-merge`, which sets how many manifests a merge append removes and
+  writes); an operation's table is uniform or Zipf (`table_dist`, `table_zipf_alpha`, apart from
+  the partitions' `zipf_alpha` since 2026-10-28).
+- Operation kinds added 2026-10-28:
+  - `catalog_txn`: a serializable catalog transaction that fast-appends (merge-appends with
+    `txn_merge`) one file per partition into each of several tables, chosen as `table_dist`
+    chooses them: `txn_tables`, or with `txn_tables_dist` exponential a draw of that mean,
+    rounded down, from 1 to `txn_tables_max` (YCSB catalog-bench's is exponential of mean 1.6,
+    at most 8). One record, whatever its width. The catalog does not retry a transaction that
+    conflicts (errata D12), so the driver does, `retry_num` times with Iceberg's backoff, staging
+    it afresh on each; a row's `tables` lists them (`table` is the first).
+  - `schema`: a column added, or the oldest added dropped once a table has eight. Iceberg commits
+    a schema change once, with no retry of its own: one that conflicts ends `retries_exhausted`.
 - A maintenance thread expires all but the last `expire_retain` snapshots every `expire_every_s`
   (kind `expire`), keeping tables at a steady size; with `expire_older_than_s` (added after the
   p5 campaign; 0, its default, expires every snapshot but those) only snapshots older than that.
@@ -47,7 +61,7 @@ to tables of one `FileIOCatalog` over an in-memory store whose requests take a p
   - `committed`;
   - `validation_failed`: a real conflict (Iceberg's validation found a conflicting commit);
   - `retries_exhausted`: every attempt conflicted (`CommitFailedException` after `retry_num`
-    retries);
+    retries; at once for a `schema` change);
   - `unknown`;
   - `nothing_to_do` (a compaction of a partition with one file);
   - `error`;

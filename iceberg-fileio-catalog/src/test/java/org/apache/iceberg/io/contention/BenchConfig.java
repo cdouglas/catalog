@@ -58,9 +58,13 @@ final class BenchConfig {
           + "\"mode\": \"ml\","
           + "\"max_append_count\": 100,"
           + "\"max_append_size\": 16777216,"
-          // the tables: partitioned by identity on an int column
+          // the tables: partitioned by identity on an int column, each created with
+          // table_properties (as Iceberg's TableProperties: commit.manifest-merge.enabled,
+          // commit.manifest.min-count-to-merge, ...); an operation's table is uniform or Zipf
           + "\"tables\": 1,"
           + "\"table_dist\": \"uniform\","
+          + "\"table_zipf_alpha\": 1.5,"
+          + "\"table_properties\": {},"
           + "\"partitions\": 32,"
           + "\"format_version\": 2,"
           + "\"preload_commits\": 50,"
@@ -75,11 +79,20 @@ final class BenchConfig {
           + "\"duration_s\": 60,"
           + "\"warmup_s\": 10,"
           + "\"drain_s\": 30,"
-          // the operations: weights, partitions each touches, files per partition, job runtime
+          // the operations: weights (fast_append, merge_append, wap, validated_overwrite,
+          // compaction, property, schema, catalog_txn), partitions each touches in a table and
+          // their Zipf exponent, files per partition, job runtime
           + "\"mix\": {\"fast_append\": 1.0},"
           + "\"partitions_per_txn\": 1,"
           + "\"partition_dist\": \"uniform\","
           + "\"zipf_alpha\": 1.5,"
+          // a catalog transaction's tables (as table_dist chooses them): txn_tables, or with
+          // txn_tables_dist exponential a draw of that mean, rounded down, from 1 to
+          // txn_tables_max; each a fast append, or a merge append with txn_merge
+          + "\"txn_tables\": 2,"
+          + "\"txn_tables_dist\": \"fixed\","
+          + "\"txn_tables_max\": 8,"
+          + "\"txn_merge\": false,"
           + "\"files_per_partition\": 1,"
           // a job's runtime, lognormal about its median: by kind (runtime_ms), else the default
           + "\"runtime_median_ms\": 0,"
@@ -196,6 +209,13 @@ final class BenchConfig {
 
   boolean bool(String key) {
     return node.get(key).asBoolean();
+  }
+
+  /** The object at {@code key} as strings by name. */
+  Map<String, String> stringMap(String key) {
+    Map<String, String> map = new TreeMap<>();
+    node.get(key).fields().forEachRemaining(e -> map.put(e.getKey(), e.getValue().asText()));
+    return map;
   }
 
   /** The operation weights, by name, in a stable order. */
