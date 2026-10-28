@@ -223,6 +223,14 @@ interleaved back to back in one `packed_entries` blob. For typical clustered
 commit traffic this saves about 30% per entry over a `repeated bytes` form
 ([UUID_V7_BENCH_RESULTS.md](UUID_V7_BENCH_RESULTS.md)).
 
+In memory, `CommittedSet` keeps the packed entries in runs, newest first,
+each run's entries older than the run before it: ids newer than every entry
+(replay's almost always are) become a run of their own, the newest runs merge
+by concatenation up to 1 MiB, an older id merges only with the entries at or
+above it, and a GC drops the oldest runs and cuts the one its watermark falls
+in. So a build costs the ids it adds, not the set, and the bytes a checkpoint
+writes, the runs concatenated, are the ones above.
+
 The interleaved layout lets `CommittedSet.contains` walk the wire bytes in one
 linear pass without materializing the set. A read that applies no records
 keeps the checkpoint's bytes as they are; one that applies records merges

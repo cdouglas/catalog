@@ -146,9 +146,14 @@ adapts a `TableMetadata` too.
   That the catalog can produce every object a v3 table would have stored
   (metadata, manifest lists) is the compatibility it keeps; producing
   them is not replay's job.
-- `CatalogState` is copy-on-write by table: building a state copies only
-  what a record changed, and manifest pools and lists are shared and
-  frozen when the state is built. A load wraps each inline manifest once.
+- `CatalogState` shares what a batch of records leaves alone: a table's
+  manifest pool and lists are persistent maps (`PersistentMap`, a hash
+  array mapped trie), so a change copies the few nodes on its path and
+  building a state copies nothing; a table's conflict-encoding state is
+  copied on its first change in a builder. The committed set is kept in
+  runs that a build prepends to (LOG.md "The committed set and GC"). So a
+  fold costs its records, not the catalog. A load reuses the
+  `InlineSnapshot`s earlier loads made (`LogCatalog.InlineSnapshots`).
 - In the test suites (surefire sets `-Dfileio.catalog.replay.check=true`),
   every native apply also runs through the builder and must give the
   same metadata, and every encode of an inline table must round-trip
