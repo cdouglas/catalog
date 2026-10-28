@@ -4960,9 +4960,9 @@ public class TestCatalogRegressions {
    * common with the column's change and applied it, and the column stayed current; Iceberg's
    * retry of the replace rebuilds the replacement on that version and makes its schema current
    * again. Replay cannot tell such a record from a first append to an empty table (Bug 73), whose
-   * merge is right, so the writer says what it is: a replace commits the table's full metadata,
-   * which every encoding judges on the table's whole version. The fault fuzzer found it (round
-   * ir2).
+   * merge is right, so the writer says what it is: a replace's delta restates its schema, partition
+   * spec and sort order, as Iceberg's REST client does, and replay applies a delta that sets them
+   * only on the version it read. The fault fuzzer found it (round ir2).
    */
   @Nested
   class ReplaceRestatesTheSchema {
@@ -4976,37 +4976,74 @@ public class TestCatalogRegressions {
     void aReplaceRacingASchemaChangeKeepsItsSchema(String encoding) {
       for (LocalCatalogMode mode : List.of(LocalCatalogMode.APPEND_TM, LocalCatalogMode.APPEND_ML,
           LocalCatalogMode.CAS_TM, LocalCatalogMode.CAS_ML)) {
-        InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
-        Map<String, String> props = Map.of(LogCatalogProperties.CONFLICT_ENCODING, encoding);
-        LogCatalog first = mode.catalog(io, "mem:///w", "c", props);
-        LogCatalog second = mode.catalog(io, "mem:///w", "c", props);
-        first.createNamespace(Namespace.of("ns"));
-        first.createTable(id, seed);
-
-        org.apache.iceberg.Transaction replace = first.buildTable(id, seed).replaceTransaction();
-        replace.newAppend().appendFile(file("f1")).commit();
-        // The column lands just before the replace's first write to the catalog
-        boolean[] raced = {false};
-        io.injectFaults(
-            (location, strategy) -> {
-              if (!raced[0]) {
-                raced[0] = true;
-                second.loadTable(id).updateSchema().addColumn("c0", Types.IntegerType.get())
-                    .commit();
-              }
-              return Fault.NONE;
-            });
-        replace.commitTransaction();
-        io.injectFaults((location, strategy) -> Fault.NONE);
-
-        Table table = mode.<LogCatalog>catalog(io, "mem:///w", "c", props).loadTable(id);
-        assertThat(raced[0]).as(mode.name()).isTrue();
-        assertThat(table.schema().findField("c0")).as(mode.name()).isNull();
-        assertThat(table.currentSnapshot().addedDataFiles(table.io()))
-            .as(mode.name())
-            .extracting(f -> f.location())
-            .containsExactly("mem:///data/f1.parquet");
+        // A writer that pins what Iceberg commits once, and one that leaves it to replay
+        for (boolean pins : new boolean[] {true, false}) {
+          racingReplace(encoding, mode, pins);
+        }
       }
+    }
+
+    private void racingReplace(String encoding, LocalCatalogMode mode, boolean pins) {
+      String described = mode.name() + (pins ? "" : ", unpinned");
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      Map<String, String> props = Map.of(LogCatalogProperties.CONFLICT_ENCODING, encoding);
+      LogCatalog first = mode.catalog(io, "mem:///w", "c", props);
+      if (!pins) {
+        first.leavingCommitOnceUnpinned();
+      }
+      LogCatalog second = mode.catalog(io, "mem:///w", "c", props);
+      first.createNamespace(Namespace.of("ns"));
+      first.createTable(id, seed);
+
+      org.apache.iceberg.Transaction replace = first.buildTable(id, seed).replaceTransaction();
+      replace.newAppend().appendFile(file("f1")).commit();
+      // The column lands just before the replace's first write to the catalog
+      boolean[] raced = {false};
+      io.injectFaults(
+          (location, strategy) -> {
+            if (!raced[0]) {
+              raced[0] = true;
+              second.loadTable(id).updateSchema().addColumn("c0", Types.IntegerType.get())
+                  .commit();
+            }
+            return Fault.NONE;
+          });
+      replace.commitTransaction();
+      io.injectFaults((location, strategy) -> Fault.NONE);
+
+      Table table = mode.<LogCatalog>catalog(io, "mem:///w", "c", props).loadTable(id);
+      assertThat(raced[0]).as(described).isTrue();
+      assertThat(table.schema().findField("c0")).as(described).isNull();
+      assertThat(table.currentSnapshot().addedDataFiles(table.io()))
+          .as(described)
+          .extracting(f -> f.location())
+          .containsExactly("mem:///data/f1.parquet");
+    }
+
+    @Test
+    void aReplaceCommitsADeltaThatRestatesItsSchemaSpecAndSortOrder() throws IOException {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = LocalCatalogMode.APPEND_TM.catalog(io, "mem:///w", "c", Map.of());
+      catalog.createNamespace(Namespace.of("ns"));
+      catalog.createTable(id, seed);
+
+      org.apache.iceberg.Transaction replace = catalog.buildTable(id, seed).replaceTransaction();
+      replace.newAppend().appendFile(file("f1")).commit();
+      replace.commitTransaction();
+
+      byte[] bytes;
+      try (InputStream in = io.newInputFile("mem:///w/catalog-c").newStream()) {
+        bytes = in.readAllBytes();
+      }
+      List<ProtoCodec.Transaction> records = CatalogTestSupport.decodeRecords(bytes);
+      ProtoCodec.UpdateTableInlineAction action = (ProtoCodec.UpdateTableInlineAction)
+          records.get(records.size() - 1).actions().get(0);
+      assertThat(action.deltaBytes).isNotNull();
+      assertThat(action.pinned).isTrue();
+      assertThat(InlineDeltaCodec.decodeDelta(action.deltaBytes).updates)
+          .hasAtLeastOneElementOfType(InlineDeltaCodec.SetCurrentSchemaUpdate.class)
+          .hasAtLeastOneElementOfType(InlineDeltaCodec.SetDefaultSpecUpdate.class)
+          .hasAtLeastOneElementOfType(InlineDeltaCodec.SetDefaultSortOrderUpdate.class);
     }
   }
 }

@@ -111,7 +111,7 @@ for framing):
 | Mode        | Payload                            | When used                                   |
 |-------------|------------------------------------|---------------------------------------------|
 | **Delta**   | Structured `TableMetadataDelta`    | The table is inline (common path for data commits and DDL) |
-| **Full**    | Complete encoded `TableMetadata`   | No delta: the table is a pointer table (re-inlining), the update is a replace transaction's (below), the delta does not fit, or `computeDelta` returns none: it finds no update, or cannot express the change (a format-version upgrade, a removed ref, a change to the encryption keys, a statistics change, an id collision, a new schema or spec that replay would number otherwise, a new sort order or spec that does not bind to the commit's schema, a last column or partition id other than the larger of the base's and the highest field id in the commit's new schemas or specs, new snapshot-log entries other than replay's: none if main did not move, else one, last, for main's new snapshot at the snapshot's own timestamp if the commit added it and at last-updated-ms otherwise (a rollback), new snapshots whose sequence numbers or row ids do not follow the base's) |
+| **Full**    | Complete encoded `TableMetadata`   | No delta: the table is a pointer table (re-inlining), the delta does not fit, or `computeDelta` returns none: it finds no update, or cannot express the change (a format-version upgrade, a removed ref, a change to the encryption keys, a statistics change, an id collision, a new schema or spec that replay would number otherwise, a new sort order or spec that does not bind to the commit's schema, a last column or partition id other than the larger of the base's and the highest field id in the commit's new schemas or specs, new snapshot-log entries other than replay's: none if main did not move, else one, last, for main's new snapshot at the snapshot's own timestamp if the commit added it and at last-updated-ms otherwise (a rollback), new snapshots whose sequence numbers or row ids do not follow the base's) |
 | **Pointer** | Metadata file location (`UpdateTableLocation`) | Neither fits, or a new inline-ML snapshot restates a pooled manifest (see [SPEC_ML.md](SPEC_ML.md)): the table leaves inline storage (eviction) |
 
 Manifest updates of new inline-ML snapshots count toward the payload
@@ -122,16 +122,21 @@ however large its full metadata grows; only the update's size is
 bounded. A delta keeps the table's codec: replay re-encodes with the
 base record's, so a table changes codec only with a full-mode update.
 
-A replace transaction's update is never a delta (`LogCatalog`'s table
-builder marks its operations). A replace restates the table's schema,
-partition spec and sort order, but a delta from the version it read
+A replace transaction's delta restates its replacement's current schema,
+default partition spec and default sort order (`LogCatalog`'s table
+builder marks its operations, and `restateReplacement` adds a
+`SetCurrentSchema`, `SetDefaultSpec` or `SetDefaultSortOrder` the diff
+left out). A replace restates them, but a diff from the version it read
 carries them only where they differ there: replacing a table that has no
 snapshot with its own schema gives the delta of a first append to an empty
 table, which a merging encoding may land on a version where another writer
 changed the schema, and the change would stay, where Iceberg's retry of
 the replace rebuilds the replacement on that version (Bug 81; Bug 73 is the
-same delta landing on a version with snapshots). A full-mode update applies
-only on its version under every encoding.
+same delta landing on a version with snapshots). Replay applies a delta
+that sets any of the three only on its version, under every encoding
+(`TableChange`), and on that version they change nothing. Iceberg's REST
+client restates them for the same reason: a REST server applies a
+replace's updates to the table it holds.
 
 ### Action Messages
 
@@ -178,7 +183,8 @@ fields" below). `pinned` holds an update to its version under every
 encoding: `LogCatalog.commitTransaction` pins each table it writes, which
 must be at the version the transaction first read (errata D12), and a
 table commit pins an update Iceberg commits once (a schema or spec update,
-a ref change through `manageSnapshots`: `LogCatalog.commitsOnce`).
+a ref change through `manageSnapshots`: `LogCatalog.commitsOnce`; a
+replace).
 
 `CreateTableInline.delta` carries the manifest updates of the inline-ML
 snapshots a create transaction commits with the table (e.g.

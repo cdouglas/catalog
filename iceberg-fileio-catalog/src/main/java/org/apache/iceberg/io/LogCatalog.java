@@ -745,7 +745,7 @@ public class LogCatalog extends BaseMetastoreCatalog
       }
       CatalogMutation mut = new CatalogMutation(lastRead);
       stageUpdate(mut, base, metadata);
-      if (pinsCommitOnce && commitsOnce(metadata.changes())) {
+      if (pinsCommitOnce && (replaces || commitsOnce(metadata.changes()))) {
         mut.pin(tableId);
       }
       mut.commit(log);
@@ -875,16 +875,15 @@ public class LogCatalog extends BaseMetastoreCatalog
           mut.updateTable(tableId, writeUpdateMetadata(false, metadata));
           return;
         }
-        // A replace restates the table's schema, spec and sort order, which a delta from the
-        // version it read carries only where they differ there: such a delta can read as an
-        // append, which replay may merge onto a version another writer changed (Bug 81). The full
-        // metadata applies only on the version it read, whatever the catalog's encoding.
-        if (isInline && !replaces) {
+        if (isInline) {
           // Null if delta encoding cannot express the change (a statistics change, errata D9; a
           // concurrent replace's id collision, SPEC_TM.md): full mode then.
           List<InlineDeltaCodec.DeltaUpdate> delta =
               InlineDeltaCodec.computeDelta(base, metadata, prefix);
           if (delta != null) {
+            if (replaces) {
+              restateReplacement(delta, metadata);
+            }
             if (manifests != null) {
               delta.addAll(manifests);
             }
@@ -923,6 +922,37 @@ public class LogCatalog extends BaseMetastoreCatalog
         }
       }
       mut.updateTable(tableId, writeUpdateMetadata(false, metadata));
+    }
+
+    /**
+     * Adds to a replace's {@code delta} the current schema, default partition spec and default
+     * sort order of its replacement, {@code metadata}, where the delta does not set them. A replace
+     * restates them, but a delta from the version it read carries them only where they differ
+     * there: replacing a table that has no snapshot with its own schema gives the delta of a first
+     * append to an empty table, which a merging encoding may land on a version where another writer
+     * changed the schema, keeping the change (Bug 81). Replay commits a delta that sets any of them
+     * only on the version it read (TableChange), as Iceberg's REST client restates them for a
+     * server that applies a replace's updates to the table it holds.
+     */
+    private static void restateReplacement(
+        List<InlineDeltaCodec.DeltaUpdate> delta, TableMetadata metadata) {
+      boolean schema = false;
+      boolean spec = false;
+      boolean order = false;
+      for (InlineDeltaCodec.DeltaUpdate update : delta) {
+        schema |= update instanceof InlineDeltaCodec.SetCurrentSchemaUpdate;
+        spec |= update instanceof InlineDeltaCodec.SetDefaultSpecUpdate;
+        order |= update instanceof InlineDeltaCodec.SetDefaultSortOrderUpdate;
+      }
+      if (!schema) {
+        delta.add(new InlineDeltaCodec.SetCurrentSchemaUpdate(metadata.currentSchemaId()));
+      }
+      if (!spec) {
+        delta.add(new InlineDeltaCodec.SetDefaultSpecUpdate(metadata.defaultSpecId()));
+      }
+      if (!order) {
+        delta.add(new InlineDeltaCodec.SetDefaultSortOrderUpdate(metadata.defaultSortOrderId()));
+      }
     }
 
     /**
