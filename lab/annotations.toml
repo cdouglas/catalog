@@ -56,6 +56,10 @@ select = ["c2r-expiry-*"]
 title = "The commit loop's backoff after a lost race: none, 20 ms, 100 ms"
 select = ["c7-backoff-*"]
 
+[campaigns.c8-fold]
+title = "c1's fast appends on the code before (4e65a65) and after (56facd8) replay folds a read onto a replica"
+select = ["c8-fold-*"]
+
 # p6 (2026-10-27, fileio-catalog 8636dda, 16-CPU shards) reran every campaign on the code merged:
 # manifest-window by default, the backoff after a lost race, runs that cannot share a directory.
 [[annotate]]

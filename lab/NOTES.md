@@ -96,5 +96,10 @@ to tables of one `FileIOCatalog` over an in-memory store whose requests take a p
   merged, manifest-window the catalog's default (the campaigns name their encodings), the backoff
   after a lost race (20 ms unless `race_min_wait_ms` says otherwise).
 
+- `c8-fold` (2026-10-27, havoc, 3 shards of 16 CPUs per build, both builds at once) runs c1's grid
+  on 4e65a65 (before replay folded a read onto a replica) and 56facd8 (after), at the defaults of
+  4e65a65 (100 ms backoff); tell the builds apart by `git_sha`. Both builds' runs are canonical:
+  a page that reads the campaign must split them.
+
 - `pilot-fa`, `pilot-mix` (2026-10-27) were pilots of the driver. The first `pilot-mix` runs gave
   fast appends the validated operations' 2 s runtime too; the runtime is per kind since.
