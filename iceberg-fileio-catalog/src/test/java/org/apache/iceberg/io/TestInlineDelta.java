@@ -628,7 +628,8 @@ public class TestInlineDelta {
           org.apache.iceberg.catalog.TableIdentifier.of("db", "tbl"),
           null, null,
           new FileIOCatalog.InlineSettings(
-              true, true, false, InlineMetadataCodecs.JSON_GZIP, InlineDeltaCodec.APPEND_LIMIT));
+              true, true, false, InlineMetadataCodecs.JSON_GZIP, InlineDeltaCodec.APPEND_LIMIT),
+          new LogCatalog.InlineSnapshots(), null);
       assertThat(ops).isInstanceOf(org.apache.iceberg.ManifestListSink.class);
     }
 

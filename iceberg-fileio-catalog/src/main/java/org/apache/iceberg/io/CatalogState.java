@@ -72,6 +72,10 @@ public class CatalogState {
   private final Map<Integer, Map<String, ManifestFile>> manifestPool;
   // tblId -> (snapshotId -> list of manifest paths in the pool)
   private final Map<Integer, Map<Long, List<String>>> snapshotManifests;
+  // tblId -> how many times a pool entry was replaced by another for the same path: not state
+  // (no checkpoint holds it), but what tells a load that a list it resolved before may resolve to
+  // other entries now (LogCatalog.InlineSnapshots)
+  private final Map<Integer, Long> poolReplacements;
 
   // The catalog's conflict encoding, null until its first record sets one (then Lamport), and
   // the encoding's state of each table that has one: tblId -> state.
@@ -91,6 +95,7 @@ public class CatalogState {
     builder.freezeManifestLists();
     this.manifestPool = ImmutableMap.copyOf(builder.manifestPool);
     this.snapshotManifests = ImmutableMap.copyOf(builder.snapshotManifests);
+    this.poolReplacements = ImmutableMap.copyOf(builder.poolReplacements);
     this.conflictEncoding = builder.conflictEncoding;
     ImmutableMap.Builder<Integer, EncodingState> states = ImmutableMap.builder();
     builder.conflictStates.forEach((id, state) -> states.put(id, state.copy()));
@@ -124,6 +129,7 @@ public class CatalogState {
     builder.tblManifestPrefix.putAll(tblManifestPrefix);
     builder.manifestPool.putAll(manifestPool);
     builder.snapshotManifests.putAll(snapshotManifests);
+    builder.poolReplacements.putAll(poolReplacements);
     builder.conflictEncoding = conflictEncoding;
     conflictStates.forEach((id, state) -> builder.conflictStates.put(id, state.copy()));
     return builder;
@@ -326,6 +332,15 @@ public class CatalogState {
     return refs != null ? refs : ImmutableMap.of();
   }
 
+  /**
+   * How many times an entry of the table's manifest pool was replaced by another for the same path
+   * in the states this one descends from since it was decoded: while it is unchanged, a manifest
+   * path resolves to the entry it did.
+   */
+  long poolReplacements(int tblId) {
+    return poolReplacements.getOrDefault(tblId, 0L);
+  }
+
   /** Returns the full manifest pool map for checkpoint encoding. */
   Map<Integer, Map<String, ManifestFile>> allManifestPools() {
     return manifestPool;
@@ -405,6 +420,7 @@ public class CatalogState {
     private final Map<Integer, Map<Long, List<String>>> snapshotManifests = new HashMap<>();
     private final Set<Integer> ownedPools = new HashSet<>();
     private final Set<Integer> ownedLists = new HashSet<>();
+    private final Map<Integer, Long> poolReplacements = new HashMap<>();
     private String conflictEncoding;
     private final Map<Integer, EncodingState> conflictStates = new HashMap<>();
 
@@ -646,6 +662,7 @@ public class CatalogState {
       tblManifestPrefix.remove(id);
       manifestPool.remove(id);
       snapshotManifests.remove(id);
+      poolReplacements.remove(id);
       ownedPools.remove(id);
       ownedLists.remove(id);
       return this;
@@ -690,7 +707,10 @@ public class CatalogState {
 
     /** Adds a ManifestFile to the table's pool. */
     public Builder addManifestToPool(int tblId, ManifestFile manifest) {
-      poolToChange(tblId).put(manifest.path(), manifest);
+      ManifestFile replaced = poolToChange(tblId).put(manifest.path(), manifest);
+      if (replaced != null && replaced != manifest) {
+        poolReplacements.merge(tblId, 1L, Long::sum);
+      }
       return this;
     }
 

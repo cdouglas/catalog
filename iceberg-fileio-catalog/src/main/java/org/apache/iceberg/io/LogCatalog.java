@@ -113,6 +113,8 @@ public class LogCatalog extends BaseMetastoreCatalog
   private final Map<String, String> catalogProperties;
   // Whether its table commits pin what Iceberg commits once (FileIOTableOperations.doCommit)
   private boolean pinsCommitOnce = true;
+  // The InlineSnapshots this catalog's loads of inline tables made, for later loads to reuse
+  private final InlineSnapshots inlineSnapshots = new InlineSnapshots();
 
   /** A catalog whose subclass opens its log and FileIO when it is initialized ({@link #openLog}). */
   protected LogCatalog(String catalogName, Map<String, String> catalogProperties) {
@@ -307,8 +309,9 @@ public class LogCatalog extends BaseMetastoreCatalog
     InlineSettings inline = inlineSettings();
     FileIOTableOperations ops =
         inline.manifests
-            ? new InlineManifestTableOperations(tableIdentifier, log, io, inline, read)
-            : new FileIOTableOperations(tableIdentifier, log, io, inline, read);
+            ? new InlineManifestTableOperations(
+                tableIdentifier, log, io, inline, inlineSnapshots, read)
+            : new FileIOTableOperations(tableIdentifier, log, io, inline, inlineSnapshots, read);
     ops.pinsCommitOnce = pinsCommitOnce;
     return ops;
   }
@@ -496,6 +499,7 @@ public class LogCatalog extends BaseMetastoreCatalog
     private final CatalogLog log;
     private final InlineMetadataFileIO tableIO;
     private final InlineSettings inline;
+    private final InlineSnapshots inlineSnapshots;
     private volatile Replica<CatalogState> lastRead = null;
     // Whether a read found the table: once one has, a read that does not finds it dropped
     private boolean loaded = false;
@@ -503,20 +507,17 @@ public class LogCatalog extends BaseMetastoreCatalog
     private boolean pinsCommitOnce = true;
 
     FileIOTableOperations(
-        TableIdentifier tableId, CatalogLog log, FileIO io, InlineSettings inline) {
-      this(tableId, log, io, inline, null);
-    }
-
-    FileIOTableOperations(
         TableIdentifier tableId,
         CatalogLog log,
         FileIO io,
         InlineSettings inline,
+        InlineSnapshots inlineSnapshots,
         Replica<CatalogState> read) {
       this.tableIO = InlineMetadataFileIO.of(io, this::inlineMetadataLength);
       this.log = log;
       this.tableId = tableId;
       this.inline = inline;
+      this.inlineSnapshots = inlineSnapshots;
       this.lastRead = read;
       if (read != null) {
         loadFrom(read.state());
@@ -1105,35 +1106,113 @@ public class LogCatalog extends BaseMetastoreCatalog
         return parsed;
       }
 
-      // Each snapshot with an inline list becomes an InlineSnapshot holding it, of
-      // GenericManifestFile copies: Iceberg compares manifests by equality, which for
-      // GenericManifestFile is by path. Expiry's ReachableFileCleanup finds the manifests that
-      // retained snapshots still use that way; the catalog's own entries, equal only to
-      // themselves, were never found in use, and their files were deleted. One copy per manifest,
-      // which every list naming it shares.
-      Map<String, ManifestFile> copies = new java.util.HashMap<>();
-      List<Snapshot> snapshots = new java.util.ArrayList<>(parsed.snapshots().size());
-      for (Snapshot s : parsed.snapshots()) {
-        if (proto.hasInlineManifests(tblId, s.snapshotId())) {
-          List<ManifestFile> manifests = new java.util.ArrayList<>();
-          for (ManifestFile m : proto.inlineManifests(tblId, s.snapshotId())) {
-            manifests.add(
-                copies.computeIfAbsent(
-                    m.path(), path -> org.apache.iceberg.GenericManifestFile.copyOf(m).build()));
-          }
-          snapshots.add(new InlineSnapshot(
-              s.sequenceNumber(), s.snapshotId(), s.parentId(),
-              s.timestampMillis(), s.operation(), s.summary(),
-              s.schemaId(), s.firstRowId(), s.addedRows(), s.keyId(),
-              manifests));
-        } else {
-          snapshots.add(s);
-        }
-      }
+      List<Snapshot> snapshots = inlineSnapshots.wrap(proto, tblId, parsed.snapshots());
 
       // The same metadata, at the same location (BaseCatalogTransaction.validateSerializableIsolation
       // compares it), with these snapshots in place of the others
       return TableFields.of(parsed).withSnapshots(snapshots).toMetadata(parsed.metadataFileLocation());
+    }
+  }
+
+  /**
+   * The {@link InlineSnapshot}s a catalog's loads of inline tables made, which later loads reuse.
+   * A load makes every snapshot with an inline list an InlineSnapshot holding it, of
+   * GenericManifestFile copies: Iceberg compares manifests by equality, which for
+   * GenericManifestFile is by path. Expiry's ReachableFileCleanup finds the manifests that retained
+   * snapshots still use that way; the catalog's own entries, equal only to themselves, were never
+   * found in use, and their files were deleted. One copy per pool entry, which every list naming
+   * it shares.
+   *
+   * <p>A committed snapshot's list never changes, and a state shares the lists that did not change
+   * with the state before it (the same objects), so a load reuses the InlineSnapshot it made for a
+   * snapshot whose list is still the same object, unless an entry of the table's pool was replaced
+   * since ({@link CatalogState#poolReplacements}), when a path may resolve to another entry. It
+   * makes only the snapshots that are new since the last load, where it used to make every
+   * retained snapshot's list on each load (most of a writer's CPU under fast appends).
+   */
+  static final class InlineSnapshots {
+    private final Map<Integer, TableSnapshots> tables =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** What loads of one table made. */
+    private static final class TableSnapshots {
+      private long poolReplacements = -1L;
+      private final Map<Long, Made> made = new java.util.HashMap<>();
+      // pool entry (by identity) -> its copy
+      private final Map<ManifestFile, ManifestFile> copies = new java.util.IdentityHashMap<>();
+    }
+
+    /** An InlineSnapshot, and the list of manifest paths it was made from. */
+    private static final class Made {
+      private final List<String> paths;
+      private final InlineSnapshot snapshot;
+
+      Made(List<String> paths, InlineSnapshot snapshot) {
+        this.paths = paths;
+        this.snapshot = snapshot;
+      }
+    }
+
+    /**
+     * {@code parsed}, a load of inline table {@code tblId} in {@code state}, with each snapshot that
+     * has an inline list as an InlineSnapshot holding it.
+     */
+    List<Snapshot> wrap(CatalogState state, int tblId, List<Snapshot> parsed) {
+      TableSnapshots table = tables.computeIfAbsent(tblId, id -> new TableSnapshots());
+      Map<Long, List<String>> lists = state.snapshotManifests(tblId);
+      Map<String, ManifestFile> pool = state.manifestPool(tblId);
+      synchronized (table) {
+        long replacements = state.poolReplacements(tblId);
+        if (replacements != table.poolReplacements
+            || table.copies.size() > 2 * pool.size() + 64) {
+          table.made.clear();
+          table.copies.clear();
+          table.poolReplacements = replacements;
+        }
+        List<Snapshot> snapshots = new java.util.ArrayList<>(parsed.size());
+        java.util.Set<Long> loaded = new java.util.HashSet<>();
+        for (Snapshot s : parsed) {
+          List<String> paths = lists.get(s.snapshotId());
+          if (paths == null) {
+            snapshots.add(s);
+            continue;
+          }
+          loaded.add(s.snapshotId());
+          Made made = table.made.get(s.snapshotId());
+          if (made == null || made.paths != paths || !sameSnapshot(made.snapshot, s)) {
+            List<ManifestFile> manifests = new java.util.ArrayList<>(paths.size());
+            for (String path : paths) {
+              ManifestFile entry = pool.get(path);
+              if (entry != null) {
+                manifests.add(table.copies.computeIfAbsent(
+                    entry, m -> org.apache.iceberg.GenericManifestFile.copyOf(m).build()));
+              }
+            }
+            made = new Made(paths, new InlineSnapshot(
+                s.sequenceNumber(), s.snapshotId(), s.parentId(),
+                s.timestampMillis(), s.operation(), s.summary(),
+                s.schemaId(), s.firstRowId(), s.addedRows(), s.keyId(),
+                manifests));
+            table.made.put(s.snapshotId(), made);
+          }
+          snapshots.add(made.snapshot);
+        }
+        table.made.keySet().retainAll(loaded);
+        return snapshots;
+      }
+    }
+
+    /** Whether an InlineSnapshot made before holds what {@code parsed} would make it with. */
+    private static boolean sameSnapshot(InlineSnapshot made, Snapshot parsed) {
+      return made.sequenceNumber() == parsed.sequenceNumber()
+          && made.timestampMillis() == parsed.timestampMillis()
+          && java.util.Objects.equals(made.parentId(), parsed.parentId())
+          && java.util.Objects.equals(made.schemaId(), parsed.schemaId())
+          && java.util.Objects.equals(made.firstRowId(), parsed.firstRowId())
+          && java.util.Objects.equals(made.addedRows(), parsed.addedRows())
+          && java.util.Objects.equals(made.keyId(), parsed.keyId())
+          && java.util.Objects.equals(made.operation(), parsed.operation())
+          && made.summary().equals(parsed.summary());
     }
   }
 
@@ -1149,17 +1228,13 @@ public class LogCatalog extends BaseMetastoreCatalog
       implements ManifestListSink {
 
     InlineManifestTableOperations(
-        TableIdentifier tableId, CatalogLog log, FileIO io, InlineSettings inline) {
-      super(tableId, log, io, inline);
-    }
-
-    InlineManifestTableOperations(
         TableIdentifier tableId,
         CatalogLog log,
         FileIO io,
         InlineSettings inline,
+        InlineSnapshots inlineSnapshots,
         Replica<CatalogState> read) {
-      super(tableId, log, io, inline, read);
+      super(tableId, log, io, inline, inlineSnapshots, read);
     }
 
     @Override
