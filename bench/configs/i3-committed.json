@@ -1,5 +1,6 @@
 {
   "label": "i3-committed",
+  "retention_s": 21600,
   "capture": {
     "label": "cap-i1",
     "encoding": "manifest-window",

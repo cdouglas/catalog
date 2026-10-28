@@ -386,12 +386,12 @@ writing, or a race under a short retention. The commit loop maps each to an
 outcome ([The commit loop](#the-commit-loop)).
 
 **Retention.** `RuntimeConfig.committedRetentionMs` (the catalog's
-`fileio.catalog.committed.retention.ms`, default 6 hours): the minimum age
+`fileio.catalog.committed.retention.ms`, default 30 minutes): the minimum age
 before an id may be dropped. It should comfortably exceed the longest time a
 writer may take to learn its outcome. `Long.MAX_VALUE` disables GC. The set's
-size is bounded by retention × commit rate: about 21,600 entries (about
-250 KB compressed) at one commit a second with 6 hours, and about 2.16 M
-entries (25 MB) at 100 a second.
+size is bounded by retention × commit rate, at about 11 B an id: 1,800 ids
+(20 KB) at one commit a second with 30 minutes, 180,000 (2 MB) at 100 a
+second, and 1.8 million (20 MB) at 1,000.
 
 **A short retention is lossy.** A concurrent GC can drop a committed id newer
 than an in-flight writer's id, or minted in the same millisecond (with a

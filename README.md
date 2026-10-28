@@ -244,7 +244,7 @@ suites skip; see [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
 | `fileio.catalog.inline.tm.codec`  | `structural`  | Codec for newly-written inline `TableMetadata` bytes: `structural` (binary, columnar; default) or `gzip` (Iceberg-style gzipped JSON). Decode follows the on-wire codec tag, so writers can change this setting freely |
 | `fileio.catalog.max.append.count` | `100`         | Soft limit on log records before CAS compaction. `0` forces CAS-only mode (S3 standard, GCS) |
 | `fileio.catalog.max.append.size`  | `16777216`    | Soft target for catalog-file size before compaction |
-| `fileio.catalog.committed.retention.ms` | `21600000` (6h) | Minimum age before a committed-txn UUID becomes eligible for GC at compaction. `Long.MAX_VALUE` disables; `0` GCs aggressively (not recommended) |
+| `fileio.catalog.committed.retention.ms` | `1800000` (30 min) | Minimum age before a committed-txn UUID becomes eligible for GC at compaction. `Long.MAX_VALUE` disables; `0` GCs aggressively (not recommended) |
 | `fileio.catalog.throttle.retry.min-wait-ms` | `200` | First wait before retrying a write that storage throttled; each later wait doubles, up to 5 s |
 | `fileio.catalog.race.retry.min-wait-ms` | `100` | Bound of the random wait after a commit loses a race for the catalog, before it reads again; each later loss doubles it, up to 1 s. `0` resends at once |
 | `fileio.catalog.conflict.encoding` | `manifest-window` | How replay decides whether a table update conflicts with what landed since its writer read the table; fixed when the catalog is created ([docs/SPEC.md](docs/SPEC.md) "Conflict Encodings") |

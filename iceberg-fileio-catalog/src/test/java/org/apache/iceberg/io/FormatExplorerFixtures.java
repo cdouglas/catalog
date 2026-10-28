@@ -657,7 +657,7 @@ public class FormatExplorerFixtures {
     Log log = Log.checkpoint(base)
         .gc(watermark,
             "GC: AdvanceHorizon drops the committed ids at or below its watermark (now - "
-                + "fileio.catalog.committed.retention.ms, 6 hours by default, kept below the "
+                + "fileio.catalog.committed.retention.ms, 30 minutes by default, kept below the "
                 + "commit's own id) and records the largest dropped timestamp as "
                 + "highest_dropped_timestamp_ms. A lookup of an id at or below it is unknown "
                 + "(DedupHorizonExceededException), not 'absent': the commit may have landed "

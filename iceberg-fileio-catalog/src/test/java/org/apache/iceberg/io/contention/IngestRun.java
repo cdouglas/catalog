@@ -78,8 +78,8 @@ final class IngestRun {
           + "\"capture\": {},"
           // the log's production rate, records/s, its ids retimed to it (0: as captured)
           + "\"rate\": 1000,"
-          // the committed set's GC window (fileio.catalog.committed.retention.ms: 6 h)
-          + "\"retention_s\": 21600,"
+          // the committed set's GC window (fileio.catalog.committed.retention.ms: 30 min)
+          + "\"retention_s\": 1800,"
           // records between compactions (fileio.catalog.max.append.count); 0: none
           + "\"compact_every\": 100,"
           // records folded before the state is built, as one read of a tailing reader returns

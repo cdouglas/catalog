@@ -386,10 +386,10 @@ public class TestProtoCommitKnobs {
   }
 
   @Test
-  void defaultCommittedRetentionIsSixHours() {
+  void defaultCommittedRetentionIsThirtyMinutes() {
     assertThat(LogCatalogProperties.runtimeConfig(Map.of()).committedRetentionMs())
         .isEqualTo(LogCatalogProperties.DEFAULT_COMMITTED_RETENTION_MS)
-        .isEqualTo(6L * 60 * 60 * 1000);
+        .isEqualTo(30L * 60 * 1000);
   }
 
   /**
@@ -472,7 +472,7 @@ public class TestProtoCommitKnobs {
     UUID txnId = afterCommit.committed().ids().iterator().next();
 
     // Several more CAS rewrites — none of them GC anything because the
-    // watermark = now - 6h is well before the test's start.
+    // watermark = now - 30 min is well before the test's start.
     for (int i = 0; i < 3; i++) {
       Replica<CatalogState> current = log.read();
       CatalogMutation m = new CatalogMutation(current);

@@ -79,7 +79,7 @@ public class IngestFoldBench {
   @Param({"empty", "steady", "discard"})
   public String committed;
 
-  @Param({"21600"})
+  @Param({"1800"})
   public double retentionS;
 
   @Param({"20000"})

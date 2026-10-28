@@ -94,9 +94,10 @@ to tables of one `FileIOCatalog` over an in-memory store whose requests take a p
   service that tails the log would do, as fast as it can. The capture is real Iceberg writers'
   records (deltas, footprints, merges, rejections), cached under `bench/results/captures/`.
 - The log's ids are retimed to `rate` records/s; the rate matters only through the committed set,
-  which holds every id within `retention_s` (6 h, the catalog's default). `prefill` starts the set at
-  its steady state for the rate (rate x retention ids), so a short log measures a long-running
-  catalog's set: at 1,000 records/s that is 21.6 million ids.
+  which holds every id within `retention_s` (the catalog's default: 6 h until 2026-10-28, which
+  campaigns i1-i6 ran with and their configs pin; 30 min since). `prefill` starts the set at its
+  steady state for the rate (rate x retention ids), so a short log measures a long-running
+  catalog's set: at 1,000 records/s that is 21.6 million ids at 6 h, 1.8 million at 30 min.
 - `batch` is the records folded before the state is built (published): a tailing reader's read.
   Building copies what the batch changed, and rewrites the committed set (its packed bytes) once
   per batch, so its cost per record falls with the batch.

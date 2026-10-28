@@ -369,11 +369,13 @@ prices a GET by its bytes.
 ### D16. Replay rewrites the whole committed set, and every checkpoint carries it
 
 The committed set holds every id within the retention
-(`fileio.catalog.committed.retention.ms`, 6 hours by default; GC.md), so at
-a steady rate it holds rate × retention ids: 2.16 million at 100 commits a
-second, 21.6 million at 1,000. It is one packed blob (`CommittedTransactions`,
-LOG.md: newest first, per id a varint gap in ms from the one before and its
-10 random bytes) of about 11 B an id: 24.7 MB and 238 MB. A lookup scans it
+(`fileio.catalog.committed.retention.ms`, 30 minutes by default since
+2026-10-28, 6 hours before; GC.md), so at a steady rate it holds rate ×
+retention ids. At 6 hours that was 2.16 million at 100 commits a second and
+21.6 million at 1,000; at 30 minutes it is 180,000 and 1.8 million. It is one
+packed blob (`CommittedTransactions`, LOG.md: newest first, per id a varint gap
+in ms from the one before and its 10 random bytes) of about 11 B an id: 24.7 MB
+and 238 MB at 6 hours, 2 MB and 20 MB at 30 minutes. A lookup scans it
 in place, newest first, and a checkpoint copies it as it is
 (`LogRuntime.checkpoint`). But a replay that applies any record builds a new
 one: `CommittedSet.Builder.build` calls `CommittedSetCodec.rewrite`, which
@@ -383,7 +385,8 @@ Every writer's fold of a record pays it, and so does its read through its
 own write.
 
 The ingest benchmark (campaign `i1-ingest`, no compactions; lab page
-`ingest`) prefills the set to its steady state. Building the state after
+`ingest`) prefills the set to its steady state, at the 6-hour retention for
+the campaigns below. Building the state after
 every record, one thread ingests 758 records a second from an empty set, 10
 with 100 a second's set, and 1.2 with 1,000's: about 100 ms and 860 ms a
 build, linear in the set's size, against about 70 µs to fold the record. In
@@ -420,17 +423,17 @@ a record applied that was not, and drop it. The fixes, in order:
   that cannot be fetched fails the read, since a lookup must not answer
   "absent". And a run's object is deleted only when no checkpoint a reader
   may still hold names it, as for expired metadata files.
-- **Derive the retention.** 6 hours is "longer than any commit's retries"
-  (GC.md). What the set must cover is how late a copy of a record can land,
-  which a store may bound (SigV4 and Azure Shared Key reject a request
+- **Derive the retention.** 6 hours was "longer than any commit's retries"
+  (GC.md); the default is 30 minutes since 2026-10-28, which makes the set 12
+  times smaller. What the set must cover is how late a copy of a record can
+  land, which a store may bound (SigV4 and Azure Shared Key reject a request
   signed about 15 minutes earlier; to be checked per store), and how long a
-  writer may ask whether its commit landed, which the snapshot oracle
-  (GC.md) answers past the horizon. A retention of 30 minutes would make the
-  set 12 times smaller.
+  writer may ask whether its commit landed, which the snapshot oracle (GC.md)
+  answers past the horizon.
 
-**Trigger to revisit:** a commit rate past a few a second at the default
-retention (the set passes 1 MB at 4 a second, and grows linearly with the
-rate), or the ingest and materialization service.
+**Trigger to revisit:** a commit rate past about 50 a second at the default
+retention (the set passes 1 MB there, and grows linearly with the rate), or the
+ingest and materialization service.
 
 ### D17. A snapshot expiry never merges, so it starves under contention
 

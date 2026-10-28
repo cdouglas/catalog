@@ -141,7 +141,7 @@ object holds one intention record.
 | `fileio.catalog.max.append.size` | 16777216 | Soft target for the object's size. Larger objects take longer to read |
 | `fileio.catalog.throttle.retry.min-wait-ms` | 200 | First wait before sending again a write that storage throttled ([LOG.md](LOG.md) §"The commit loop") |
 | `fileio.catalog.race.retry.min-wait-ms` | 100 | Bound of the random wait after a lost race, before the writer reads or probes the object again ([LOG.md](LOG.md) §"The commit loop") |
-| `fileio.catalog.committed.retention.ms` | 21600000 (6 h) | How long the committed set keeps an id ([LOG.md](LOG.md) §"The committed set and GC") |
+| `fileio.catalog.committed.retention.ms` | 1800000 (30 min) | How long the committed set keeps an id ([LOG.md](LOG.md) §"The committed set and GC") |
 
 **CAS-only mode.** A store that replaces conditionally but cannot append
 needs every commit to replace. On GCS (a generation precondition) the log

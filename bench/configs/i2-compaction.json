@@ -1,5 +1,6 @@
 {
   "label": "i2-compaction",
+  "retention_s": 21600,
   "capture": {
     "label": "cap-i1",
     "encoding": "manifest-window",

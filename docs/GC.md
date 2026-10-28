@@ -90,7 +90,8 @@ no record):
 A GC record carries no id, is not deduped (replaying one again changes
 nothing), and does not count toward `max.append.count`.
 
-The retention defaults to 6 hours, longer than any commit's retries.
+The retention defaults to 30 minutes, far longer than any commit's retries
+(it was 6 hours until 2026-10-28; errata D16).
 A retention shorter than a commit takes is legal but lossy. With a
 retention of 0 (every CAS drops every id older than its own), a racer's
 CAS can drop a committed id newer than an in-flight writer's
@@ -204,5 +205,5 @@ is rejected or unknown, never told it committed.
 - Snapshot-oracle helper in the catalog. The writer-side pattern is
   documented in §"Two oracles" but no catalog API is added — the
   reverse index would duplicate state the writer already has.
-- Retention tuning per workload. The 6h default is documented; users
+- Retention tuning per workload. The 30-minute default is documented; users
   can override via the property, no per-table or per-namespace knob.

@@ -56,16 +56,16 @@ public final class LogCatalogProperties {
    * own transaction's). The largest dropped timestamp becomes
    * {@code highest_dropped_timestamp_ms}: a
    * query for a UUID at or below it throws {@link org.intentlog.DedupHorizonExceededException},
-   * and replay rejects a record whose id is at or below it (Bug 64). Default: 6
-   * hours, long enough to cover any commit's retries, short enough to bound the
-   * set on long-lived catalogs. {@code Long.MAX_VALUE} disables GC. A window
+   * and replay rejects a record whose id is at or below it (Bug 64). Default: 30
+   * minutes, far longer than a commit's retries (it was 6 hours until 2026-10-28; errata
+   * D16), short enough to bound the set on long-lived catalogs. {@code Long.MAX_VALUE} disables GC. A window
    * shorter than a commit takes is legal but lossy: a writer whose id falls
    * below the horizon while it commits fails, or cannot learn whether it
    * committed (CommitStateUnknownException); {@code 0} drops everything older
    * than the compacting commit. See {@code docs/GC.md}.
    */
   public static final String COMMITTED_RETENTION_MS = "fileio.catalog.committed.retention.ms";
-  public static final long DEFAULT_COMMITTED_RETENTION_MS = 6L * 60 * 60 * 1000;
+  public static final long DEFAULT_COMMITTED_RETENTION_MS = 30L * 60 * 1000;
 
   /**
    * First wait before retrying a write that storage throttled; each later wait doubles, up to 5 s.

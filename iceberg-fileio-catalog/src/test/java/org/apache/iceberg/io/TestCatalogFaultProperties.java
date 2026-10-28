@@ -764,7 +764,7 @@ class TestCatalogFaultProperties {
      * gzipWriters} is set, else the structural one: a delta keeps its base's codec, and a full
      * update writes the writer's. Writer {@code i} keeps no committed transaction ids older than
      * its own commit's when it compacts (a retention of 0) if bit {@code i} of {@code gcWriters}
-     * is set, else the default 6 hours, which no run reaches. With a {@code segmentLimit}, the
+     * is set, else the default 30 minutes, which no run reaches. With a {@code segmentLimit}, the
      * catalog object holds at most that many writes, and an append past it fails (Bug 66).
      */
     Run(List<LocalCatalogMode> modes, int maxUpdateSize, boolean faults, boolean strictVersions,
