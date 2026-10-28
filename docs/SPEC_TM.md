@@ -77,6 +77,13 @@ configured codec only affects newly-written records.
 | `structural` | `1` (`CODEC_STRUCTURAL`) | Default. Strips the snapshots and metadata-log arrays out of the canonical JSON envelope and re-encodes them as a binary-structural columnar block (RLE schema ids, templated manifest-list paths, per-snapshot dictionary summaries). 40% smaller than gzip-JSON at the corpus median; 4–7× faster on lazy-decode workloads. |
 | `gzip`       | `0` (`CODEC_JSON_GZIP`) | Iceberg-style `Codec.GZIP` JSON. Diagnostic / portable fallback. Compatible with any tool that knows how to read `metadata.json.gz`. |
 
+Every gzip stream the inline codecs write (both codecs' metadata, and the
+schemas and specs of deltas, below) is compressed at the fastest level
+(`Deflater.BEST_SPEED`): a checkpoint encodes every inline table changed
+since the last one, and in the ingest benchmark the fastest level made a
+compaction a fifth faster for 14% more inline metadata bytes, 1% of the
+checkpoint. A reader decodes any level alike.
+
 The codec selection is recorded in `InlineTable.metadata_codec` and in
 the codec field of each `CreateTableInline` / full-mode
 `UpdateTableInline` action. The tag is written on every such record,

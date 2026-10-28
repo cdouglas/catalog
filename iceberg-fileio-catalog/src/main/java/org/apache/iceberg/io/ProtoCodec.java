@@ -284,7 +284,7 @@ public class ProtoCodec {
    */
   public static byte[] encodeCheckpointState(CatalogState original) {
     try {
-      ByteArrayOutputStream out = new ByteArrayOutputStream();
+      ByteArrayOutputStream out = new BytesOut();
 
       // Stamp first so the reader fails fast on a version mismatch before
       // chewing through the rest of the payload.
@@ -424,7 +424,7 @@ public class ProtoCodec {
   }
 
   private static byte[] encodeNamespace(int id, CatalogState.NsEntry entry) throws IOException {
-    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    ByteArrayOutputStream out = new BytesOut();
     writeVarint(out, NS_ID, id);
     writeVarint(out, NS_VERSION, entry.version);
     writeVarint(out, NS_PARENT_ID, entry.parentId);
@@ -462,7 +462,7 @@ public class ProtoCodec {
 
   private static byte[] encodeTable(int id, CatalogState.TblEntry entry, byte[] conflictState)
       throws IOException {
-    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    ByteArrayOutputStream out = new BytesOut();
     writeVarint(out, TBL_ID, id);
     writeVarint(out, TBL_VERSION, entry.version);
     writeVarint(out, TBL_NAMESPACE_ID, entry.namespaceId);
@@ -515,7 +515,7 @@ public class ProtoCodec {
   }
 
   private static byte[] encodeNamespaceProperty(int nsId, String key, String value) throws IOException {
-    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    ByteArrayOutputStream out = new BytesOut();
     writeVarint(out, NSPROP_NAMESPACE_ID, nsId);
     writeString(out, NSPROP_KEY, key);
     writeString(out, NSPROP_VALUE, value);
@@ -552,7 +552,7 @@ public class ProtoCodec {
       String manifestPrefix,
       Map<String, ManifestFile> pool, Map<Long, List<String>> snapRefs, byte[] conflictState)
       throws IOException {
-    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    ByteArrayOutputStream out = new BytesOut();
     writeVarint(out, INLINE_TBL_ID, id);
     writeVarint(out, INLINE_TBL_VERSION, entry.version);
     writeVarint(out, INLINE_TBL_NAMESPACE_ID, entry.namespaceId);
@@ -566,12 +566,14 @@ public class ProtoCodec {
 
     // Manifest pool (field 7): encode each unique ManifestFile entry, in the order of their paths,
     // and build the positional index for snapshot refs
-    Map<String, Integer> pathToIndex = new java.util.HashMap<>();
+    Map<String, Integer> pathToIndex =
+        new java.util.HashMap<>(pool != null ? 2 * pool.size() : 16);
     if (pool != null) {
-      List<String> poolOrder = new ArrayList<>(sorted(pool).keySet());
-      for (int i = 0; i < poolOrder.size(); i++) {
-        pathToIndex.put(poolOrder.get(i), i);
-        ManifestFile mf = pool.get(poolOrder.get(i));
+      String[] poolOrder = pool.keySet().toArray(new String[0]);
+      java.util.Arrays.sort(poolOrder);
+      for (int i = 0; i < poolOrder.length; i++) {
+        pathToIndex.put(poolOrder[i], i);
+        ManifestFile mf = pool.get(poolOrder[i]);
         byte[] mfBytes = encodeManifestFileEntry(mf, manifestPrefix);
         writeLengthDelimited(out, INLINE_TBL_MANIFEST_POOL, mfBytes);
       }
@@ -582,9 +584,15 @@ public class ProtoCodec {
     // needs its entry, even when the pool is empty: its inline:// manifest-list location resolves
     // through it.
     if (snapRefs != null) {
-      for (Map.Entry<Long, List<String>> snapEntry : sorted(snapRefs).entrySet()) {
-        byte[] refBytes = encodeSnapshotManifestRefs(
-            snapEntry.getKey(), snapEntry.getValue(), pathToIndex);
+      long[] snapshotIds = new long[snapRefs.size()];
+      int n = 0;
+      for (long snapshotId : snapRefs.keySet()) {
+        snapshotIds[n++] = snapshotId;
+      }
+      java.util.Arrays.sort(snapshotIds);
+      for (long snapshotId : snapshotIds) {
+        byte[] refBytes =
+            encodeSnapshotManifestRefs(snapshotId, snapRefs.get(snapshotId), pathToIndex);
         writeLengthDelimited(out, INLINE_TBL_SNAPSHOT_REFS, refBytes);
       }
     }
@@ -595,7 +603,7 @@ public class ProtoCodec {
   private static byte[] encodeSnapshotManifestRefs(
       long snapshotId, List<String> paths, Map<String, Integer> pathToIndex)
       throws IOException {
-    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    ByteArrayOutputStream out = new BytesOut();
     writeFixed64(out, SMR_SNAPSHOT_ID, snapshotId);
     for (String path : paths) {
       Integer idx = pathToIndex.get(path);
@@ -726,7 +734,7 @@ public class ProtoCodec {
   /** Encodes an intention, the payload of a log record (catalog.proto Intention). */
   public static byte[] encodeIntention(CatalogIntention intention) {
     try {
-      ByteArrayOutputStream out = new ByteArrayOutputStream();
+      ByteArrayOutputStream out = new BytesOut();
       for (Action action : intention.actions()) {
         writeLengthDelimited(out, INTENTION_ACTIONS, encodeAction(action));
       }
@@ -778,10 +786,10 @@ public class ProtoCodec {
   // ============================================================
 
   private static byte[] encodeAction(Action action) throws IOException {
-    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    ByteArrayOutputStream out = new BytesOut();
     if (action instanceof CreateNamespaceAction) {
       CreateNamespaceAction a = (CreateNamespaceAction) action;
-      ByteArrayOutputStream inner = new ByteArrayOutputStream();
+      ByteArrayOutputStream inner = new BytesOut();
       writeVarint(inner, CREATE_NS_ID, a.id);
       writeVarint(inner, CREATE_NS_VERSION, a.version);
       writeVarint(inner, CREATE_NS_PARENT_ID, a.parentId);
@@ -790,13 +798,13 @@ public class ProtoCodec {
       writeLengthDelimited(out, ACTION_CREATE_NAMESPACE, inner.toByteArray());
     } else if (action instanceof DropNamespaceAction) {
       DropNamespaceAction a = (DropNamespaceAction) action;
-      ByteArrayOutputStream inner = new ByteArrayOutputStream();
+      ByteArrayOutputStream inner = new BytesOut();
       writeVarint(inner, DROP_NS_ID, a.id);
       writeVarint(inner, DROP_NS_VERSION, a.version);
       writeLengthDelimited(out, ACTION_DROP_NAMESPACE, inner.toByteArray());
     } else if (action instanceof SetNamespacePropertyAction) {
       SetNamespacePropertyAction a = (SetNamespacePropertyAction) action;
-      ByteArrayOutputStream inner = new ByteArrayOutputStream();
+      ByteArrayOutputStream inner = new BytesOut();
       writeVarint(inner, SET_NSPROP_NS_ID, a.namespaceId);
       writeVarint(inner, SET_NSPROP_NS_VERSION, a.namespaceVersion);
       writeString(inner, SET_NSPROP_KEY, a.key);
@@ -804,14 +812,14 @@ public class ProtoCodec {
       writeLengthDelimited(out, ACTION_SET_NS_PROPERTY, inner.toByteArray());
     } else if (action instanceof RemoveNamespacePropertyAction) {
       RemoveNamespacePropertyAction a = (RemoveNamespacePropertyAction) action;
-      ByteArrayOutputStream inner = new ByteArrayOutputStream();
+      ByteArrayOutputStream inner = new BytesOut();
       writeVarint(inner, REMOVE_NSPROP_NS_ID, a.namespaceId);
       writeVarint(inner, REMOVE_NSPROP_NS_VERSION, a.namespaceVersion);
       writeString(inner, REMOVE_NSPROP_KEY, a.key);
       writeLengthDelimited(out, ACTION_REMOVE_NS_PROPERTY, inner.toByteArray());
     } else if (action instanceof CreateTableAction) {
       CreateTableAction a = (CreateTableAction) action;
-      ByteArrayOutputStream inner = new ByteArrayOutputStream();
+      ByteArrayOutputStream inner = new BytesOut();
       writeVarint(inner, CREATE_TBL_ID, a.id);
       writeVarint(inner, CREATE_TBL_VERSION, a.version);
       writeVarint(inner, CREATE_TBL_NS_ID, a.namespaceId);
@@ -821,26 +829,26 @@ public class ProtoCodec {
       writeLengthDelimited(out, ACTION_CREATE_TABLE, inner.toByteArray());
     } else if (action instanceof DropTableAction) {
       DropTableAction a = (DropTableAction) action;
-      ByteArrayOutputStream inner = new ByteArrayOutputStream();
+      ByteArrayOutputStream inner = new BytesOut();
       writeVarint(inner, DROP_TBL_ID, a.id);
       writeVarint(inner, DROP_TBL_VERSION, a.version);
       writeLengthDelimited(out, ACTION_DROP_TABLE, inner.toByteArray());
     } else if (action instanceof UpdateTableLocationAction) {
       UpdateTableLocationAction a = (UpdateTableLocationAction) action;
-      ByteArrayOutputStream inner = new ByteArrayOutputStream();
+      ByteArrayOutputStream inner = new BytesOut();
       writeVarint(inner, UPDATE_TBL_ID, a.id);
       writeVarint(inner, UPDATE_TBL_VERSION, a.version);
       writeString(inner, UPDATE_TBL_METADATA_LOCATION, a.metadataLocation);
       writeLengthDelimited(out, ACTION_UPDATE_TABLE_LOCATION, inner.toByteArray());
     } else if (action instanceof ReadTableAction) {
       ReadTableAction a = (ReadTableAction) action;
-      ByteArrayOutputStream inner = new ByteArrayOutputStream();
+      ByteArrayOutputStream inner = new BytesOut();
       writeVarint(inner, READ_TBL_ID, a.id);
       writeVarint(inner, READ_TBL_VERSION, a.version);
       writeLengthDelimited(out, ACTION_READ_TABLE, inner.toByteArray());
     } else if (action instanceof UpdateTableInlineAction) {
       UpdateTableInlineAction a = (UpdateTableInlineAction) action;
-      ByteArrayOutputStream inner = new ByteArrayOutputStream();
+      ByteArrayOutputStream inner = new BytesOut();
       writeVarint(inner, UPDATE_INLINE_TBL_ID, a.id);
       writeVarint(inner, UPDATE_INLINE_TBL_VERSION, a.version);
       if (a.deltaBytes != null) {
@@ -860,7 +868,7 @@ public class ProtoCodec {
       writeLengthDelimited(out, ACTION_UPDATE_TABLE_INLINE, inner.toByteArray());
     } else if (action instanceof CreateTableInlineAction) {
       CreateTableInlineAction a = (CreateTableInlineAction) action;
-      ByteArrayOutputStream inner = new ByteArrayOutputStream();
+      ByteArrayOutputStream inner = new BytesOut();
       writeVarint(inner, CREATE_INLINE_TBL_ID, a.id);
       writeVarint(inner, CREATE_INLINE_TBL_VERSION, a.version);
       writeVarint(inner, CREATE_INLINE_TBL_NS_ID, a.namespaceId);
@@ -874,7 +882,7 @@ public class ProtoCodec {
       writeLengthDelimited(out, ACTION_CREATE_TABLE_INLINE, inner.toByteArray());
     } else if (action instanceof RenameTableAction) {
       RenameTableAction a = (RenameTableAction) action;
-      ByteArrayOutputStream inner = new ByteArrayOutputStream();
+      ByteArrayOutputStream inner = new BytesOut();
       writeVarint(inner, RENAME_TBL_ID, a.id);
       writeVarint(inner, RENAME_TBL_VERSION, a.version);
       writeVarint(inner, RENAME_TBL_NEW_NS_ID, a.newNamespaceId);
@@ -882,7 +890,7 @@ public class ProtoCodec {
       writeString(inner, RENAME_TBL_NEW_NAME, a.newName);
       writeLengthDelimited(out, ACTION_RENAME_TABLE, inner.toByteArray());
     } else if (action instanceof SetConflictEncodingAction) {
-      ByteArrayOutputStream inner = new ByteArrayOutputStream();
+      ByteArrayOutputStream inner = new BytesOut();
       writeString(inner, SET_CONFLICT_ENCODING_NAME, ((SetConflictEncodingAction) action).name);
       writeLengthDelimited(out, ACTION_SET_CONFLICT_ENCODING, inner.toByteArray());
     }
@@ -1290,7 +1298,7 @@ public class ProtoCodec {
    */
   public static byte[] encodeManifestFileEntry(ManifestFile manifest, String pathPrefix)
       throws IOException {
-    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    ByteArrayOutputStream out = new BytesOut();
 
     String suffix = manifest.path();
     if (pathPrefix != null && !pathPrefix.isEmpty() && suffix.startsWith(pathPrefix)) {
@@ -1448,7 +1456,7 @@ public class ProtoCodec {
   }
 
   private static byte[] encodePartitionFieldSummary(PartitionFieldSummary pfs) throws IOException {
-    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    ByteArrayOutputStream out = new BytesOut();
     if (pfs.containsNull()) {
       writeVarint(out, PFS_CONTAINS_NULL, 1);
     }

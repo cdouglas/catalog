@@ -18,6 +18,10 @@
  */
 package org.apache.iceberg.io;
 
+import com.fasterxml.jackson.core.JsonEncoding;
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.core.filter.FilteringGeneratorDelegate;
+import com.fasterxml.jackson.core.filter.TokenFilter;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -132,6 +136,17 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
 
   private static final ObjectMapper MAPPER = new ObjectMapper();
 
+  /** The metadata's top-level fields less the two the blocks hold. */
+  private static final TokenFilter WITHOUT_BLOCKS =
+      new TokenFilter() {
+        @Override
+        public TokenFilter includeProperty(String name) {
+          return name.equals("snapshots") || name.equals("metadata-log")
+              ? null
+              : TokenFilter.INCLUDE_ALL;
+        }
+      };
+
   /** 16-byte canonical UUID-as-bytes used inside templated path entries. */
   private static final int UUID_BYTES = 16;
 
@@ -154,27 +169,21 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
 
   @Override
   public byte[] encode(TableMetadata meta) {
-    String fullJson = TableMetadataParser.toJson(meta);
-    ObjectNode root;
-    try {
-      root = (ObjectNode) MAPPER.readTree(fullJson);
-    } catch (IOException e) {
-      throw new UncheckedIOException("re-parse of TableMetadata JSON failed", e);
-    }
-    root.remove("snapshots");
-    root.remove("metadata-log");
-    byte[] strippedJson;
-    try {
-      strippedJson = MAPPER.writeValueAsBytes(root);
-    } catch (IOException e) {
-      throw new UncheckedIOException("re-serialize stripped JSON failed", e);
+    byte[] strippedJson = strippedJson(meta);
+    if (NativeDelta.CHECK) {
+      byte[] reparsed = strippedJsonByTree(meta);
+      if (!java.util.Arrays.equals(strippedJson, reparsed)) {
+        throw new IllegalStateException("The metadata's JSON without its blocks differs from the"
+            + " re-parsed one:\n  written:  " + new String(strippedJson, StandardCharsets.UTF_8)
+            + "\n  reparsed: " + new String(reparsed, StandardCharsets.UTF_8));
+      }
     }
 
     byte[] snapBlock = encodeSnapshotsBlock(meta.snapshots());
     byte[] mdlogBlock = encodeMetadataLogBlock(meta.previousFiles());
 
     ByteArrayOutputStream wrapper =
-        new ByteArrayOutputStream(strippedJson.length + snapBlock.length + mdlogBlock.length + 32);
+        new BytesOut(strippedJson.length + snapBlock.length + mdlogBlock.length + 32);
     writeVarint(wrapper, FORMAT_VERSION);
     writeVarint(wrapper, strippedJson.length);
     writeBytes(wrapper, strippedJson);
@@ -185,8 +194,35 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
     return InlineMetadataIO.gzip(wrapper.toByteArray());
   }
 
+  /**
+   * The metadata's JSON without "snapshots" and "metadata-log", which the blocks hold: Iceberg's
+   * JSON of it, those two fields left out as it is written.
+   */
+  static byte[] strippedJson(TableMetadata meta) {
+    ByteArrayOutputStream out = new BytesOut(4096);
+    try (JsonGenerator generator = MAPPER.getFactory().createGenerator(out, JsonEncoding.UTF8)) {
+      TableMetadataParser.toJson(meta, new FilteringGeneratorDelegate(
+          generator, WITHOUT_BLOCKS, TokenFilter.Inclusion.INCLUDE_ALL_AND_PATH, true));
+    } catch (IOException e) {
+      throw new UncheckedIOException("TableMetadata JSON failed", e);
+    }
+    return out.toByteArray();
+  }
+
+  /** {@link #strippedJson} as it was made: the whole JSON, parsed, the two fields removed. */
+  private static byte[] strippedJsonByTree(TableMetadata meta) {
+    try {
+      ObjectNode root = (ObjectNode) MAPPER.readTree(TableMetadataParser.toJson(meta));
+      root.remove("snapshots");
+      root.remove("metadata-log");
+      return MAPPER.writeValueAsBytes(root);
+    } catch (IOException e) {
+      throw new UncheckedIOException("re-parse of TableMetadata JSON failed", e);
+    }
+  }
+
   static byte[] encodeSnapshotsBlock(List<Snapshot> snaps) {
-    ByteArrayOutputStream out = new ByteArrayOutputStream(snaps.size() * 64 + 256);
+    ByteArrayOutputStream out = new BytesOut(snaps.size() * 64 + 256);
     int n = snaps.size();
     writeVarint(out, n);
 
@@ -317,7 +353,7 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
   }
 
   static byte[] encodeMetadataLogBlock(List<MetadataLogEntry> entries) {
-    ByteArrayOutputStream out = new ByteArrayOutputStream(entries.size() * 32 + 64);
+    ByteArrayOutputStream out = new BytesOut(entries.size() * 32 + 64);
     int n = entries.size();
     writeVarint(out, n);
     if (n == 0) {
