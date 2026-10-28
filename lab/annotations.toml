@@ -72,6 +72,14 @@ select = ["i3-committed-*"]
 title = "i2's compactions after the O(added) build: the set kept, at steady state, and discarded"
 select = ["i4-compaction-*"]
 
+[campaigns.i5-fold]
+title = "i3's loads after replay stopped copying untouched tables and encodes skip the JSON re-parse"
+select = ["i5-fold-*"]
+
+[campaigns.i6-compaction]
+title = "i4's compactions after the same changes, and gzip at its fastest level"
+select = ["i6-compaction-*"]
+
 [campaigns.c8-fold]
 title = "c1's fast appends on the code before (4e65a65) and after (56facd8) replay folds a read onto a replica"
 select = ["c8-fold-*"]
