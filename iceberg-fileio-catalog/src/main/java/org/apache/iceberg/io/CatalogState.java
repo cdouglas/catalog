@@ -22,7 +22,6 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -92,14 +91,12 @@ public class CatalogState {
     this.nsProperties = deepCopyProperties(builder.nsProperties);
     this.tblInlineMetadata = ImmutableMap.copyOf(builder.tblInlineMetadata);
     this.tblManifestPrefix = ImmutableMap.copyOf(builder.tblManifestPrefix);
-    builder.freezeManifestLists();
     this.manifestPool = ImmutableMap.copyOf(builder.manifestPool);
     this.snapshotManifests = ImmutableMap.copyOf(builder.snapshotManifests);
     this.poolReplacements = ImmutableMap.copyOf(builder.poolReplacements);
     this.conflictEncoding = builder.conflictEncoding;
-    ImmutableMap.Builder<Integer, EncodingState> states = ImmutableMap.builder();
-    builder.conflictStates.forEach((id, state) -> states.put(id, state.copy()));
-    this.conflictStates = states.build();
+    // The builder no longer changes them once built (Builder#build)
+    this.conflictStates = ImmutableMap.copyOf(builder.conflictStates);
   }
 
   private static Map<Integer, Map<String, String>> deepCopyProperties(
@@ -131,7 +128,7 @@ public class CatalogState {
     builder.snapshotManifests.putAll(snapshotManifests);
     builder.poolReplacements.putAll(poolReplacements);
     builder.conflictEncoding = conflictEncoding;
-    conflictStates.forEach((id, state) -> builder.conflictStates.put(id, state.copy()));
+    builder.conflictStates.putAll(conflictStates);
     return builder;
   }
 
@@ -414,15 +411,17 @@ public class CatalogState {
     private final Map<Integer, Map<String, String>> nsProperties = new HashMap<>();
     private final Map<Integer, InlineTable> tblInlineMetadata = new HashMap<>();
     private final Map<Integer, String> tblManifestPrefix = new HashMap<>();
-    // A table's manifest pool and lists: immutable, shared with the state this builder continues,
-    // until its first change here copies them (ownedPools, ownedLists). Each list is immutable.
+    // A table's manifest pool and lists: persistent maps, shared with the state this builder
+    // continues; a change replaces the table's map with one sharing all but the changed path.
+    // Each list is immutable.
     private final Map<Integer, Map<String, ManifestFile>> manifestPool = new HashMap<>();
     private final Map<Integer, Map<Long, List<String>>> snapshotManifests = new HashMap<>();
-    private final Set<Integer> ownedPools = new HashSet<>();
-    private final Set<Integer> ownedLists = new HashSet<>();
     private final Map<Integer, Long> poolReplacements = new HashMap<>();
     private String conflictEncoding;
+    // A table's encoding state: shared with the state this builder continues until the encoding
+    // changes it here (conflictState), which copies it first (ownedStates)
     private final Map<Integer, EncodingState> conflictStates = new HashMap<>();
+    private final Set<Integer> ownedStates = new HashSet<>();
 
     Builder() {
       // The root namespace is an ordinary row with id 0, so it is versioned
@@ -566,6 +565,7 @@ public class CatalogState {
         removeLookup(tableLookup, tableKeyOrNull(entry), id);
       }
       conflictStates.remove(id);
+      ownedStates.remove(id);
       return removeInlineMetadata(id);
     }
 
@@ -663,51 +663,26 @@ public class CatalogState {
       manifestPool.remove(id);
       snapshotManifests.remove(id);
       poolReplacements.remove(id);
-      ownedPools.remove(id);
-      ownedLists.remove(id);
       return this;
     }
 
-    /** The table's manifest pool, to change: this builder's own. */
-    private Map<String, ManifestFile> poolToChange(int tblId) {
+    /** The table's manifest pool, which a change replaces. */
+    private PersistentMap<String, ManifestFile> pool(int tblId) {
       Map<String, ManifestFile> pool = manifestPool.get(tblId);
-      if (pool == null || ownedPools.add(tblId)) {
-        pool = pool != null ? new LinkedHashMap<>(pool) : new LinkedHashMap<>();
-        manifestPool.put(tblId, pool);
-        ownedPools.add(tblId);
-      }
-      return pool;
+      return pool != null ? PersistentMap.copyOf(pool) : PersistentMap.empty();
     }
 
-    /** The table's manifest lists, to change: this builder's own. */
-    private Map<Long, List<String>> listsToChange(int tblId) {
+    /** The table's manifest lists, which a change replaces. */
+    private PersistentMap<Long, List<String>> lists(int tblId) {
       Map<Long, List<String>> lists = snapshotManifests.get(tblId);
-      if (lists == null || ownedLists.add(tblId)) {
-        lists = lists != null ? new HashMap<>(lists) : new HashMap<>();
-        snapshotManifests.put(tblId, lists);
-        ownedLists.add(tblId);
-      }
-      return lists;
-    }
-
-    /**
-     * Freezes the manifest pools and lists this builder changed, which a state built now shares;
-     * a later change copies them again.
-     */
-    private void freezeManifestLists() {
-      for (int tblId : ownedPools) {
-        manifestPool.computeIfPresent(tblId, (id, pool) -> ImmutableMap.copyOf(pool));
-      }
-      for (int tblId : ownedLists) {
-        snapshotManifests.computeIfPresent(tblId, (id, lists) -> ImmutableMap.copyOf(lists));
-      }
-      ownedPools.clear();
-      ownedLists.clear();
+      return lists != null ? PersistentMap.copyOf(lists) : PersistentMap.empty();
     }
 
     /** Adds a ManifestFile to the table's pool. */
     public Builder addManifestToPool(int tblId, ManifestFile manifest) {
-      ManifestFile replaced = poolToChange(tblId).put(manifest.path(), manifest);
+      PersistentMap<String, ManifestFile> pool = pool(tblId);
+      ManifestFile replaced = pool.get(manifest.path());
+      manifestPool.put(tblId, pool.plus(manifest.path(), manifest));
       if (replaced != null && replaced != manifest) {
         poolReplacements.merge(tblId, 1L, Long::sum);
       }
@@ -716,7 +691,7 @@ public class CatalogState {
 
     /** Sets the manifest list for a snapshot (list of manifest paths in the pool). */
     public Builder setSnapshotManifests(int tblId, long snapshotId, List<String> paths) {
-      listsToChange(tblId).put(snapshotId, List.copyOf(paths));
+      snapshotManifests.put(tblId, lists(tblId).plus(snapshotId, List.copyOf(paths)));
       return this;
     }
 
@@ -729,7 +704,7 @@ public class CatalogState {
     /** The table's manifest pool, by path: every manifest its inline lists name. */
     Map<String, ManifestFile> manifestPool(int tblId) {
       Map<String, ManifestFile> pool = manifestPool.get(tblId);
-      return pool != null ? Collections.unmodifiableMap(pool) : Map.of();
+      return pool != null ? pool : Map.of();
     }
 
     /** Returns true if the table has any manifest pool entries. */
@@ -781,15 +756,20 @@ public class CatalogState {
         return this;
       }
       Set<String> dropped = new HashSet<>();
-      boolean any = false;
+      PersistentMap<Long, List<String>> lists = PersistentMap.copyOf(refs);
       for (long snapshotId : snapshotIds) {
-        if (refs.containsKey(snapshotId)) {
-          any = true;
-          dropped.addAll(listsToChange(tblId).remove(snapshotId));
-          refs = snapshotManifests.get(tblId);
+        List<String> paths = lists.get(snapshotId);
+        if (paths != null) {
+          dropped.addAll(paths);
+          lists = lists.minus(snapshotId);
         }
       }
-      if (!any || dropped.isEmpty()) {
+      if (lists == refs) {
+        return this;
+      }
+      snapshotManifests.put(tblId, lists);
+      refs = lists;
+      if (dropped.isEmpty()) {
         return this;
       }
       // Paths still referenced by any remaining snapshot stay
@@ -802,10 +782,11 @@ public class CatalogState {
         }
       }
       if (manifestPool.containsKey(tblId)) {
-        Map<String, ManifestFile> pool = poolToChange(tblId);
+        PersistentMap<String, ManifestFile> pool = pool(tblId);
         for (String path : dropped) {
-          pool.remove(path);
+          pool = pool.minus(path);
         }
+        manifestPool.put(tblId, pool);
       }
       return this;
     }
@@ -927,7 +908,17 @@ public class CatalogState {
       if (codec == EncodingState.Codec.NONE) {
         return EncodingState.NONE;
       }
-      return conflictStates.computeIfAbsent(tblId, id -> codec.empty());
+      EncodingState state = conflictStates.get(tblId);
+      if (state == null) {
+        state = codec.empty();
+      } else if (ownedStates.contains(tblId)) {
+        return state;
+      } else {
+        state = state.copy();
+      }
+      conflictStates.put(tblId, state);
+      ownedStates.add(tblId);
+      return state;
     }
 
     /**
@@ -942,6 +933,7 @@ public class CatalogState {
     /** Sets the encoding's state of table {@code tblId}, as a checkpoint holds it. */
     Builder setConflictState(int tblId, EncodingState state) {
       conflictStates.put(tblId, state);
+      ownedStates.remove(tblId);
       return this;
     }
 
@@ -971,7 +963,10 @@ public class CatalogState {
     public CatalogState build() {
       // Ensure all lookups are complete before building immutable file
       rebuildLookups();
-      return new CatalogState(this);
+      CatalogState state = new CatalogState(this);
+      // The states built now share the encoding states: a later change copies them again
+      ownedStates.clear();
+      return state;
     }
   }
 }
