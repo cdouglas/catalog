@@ -64,6 +64,14 @@ select = ["i1-ingest-*"]
 title = "Ingest with a compaction every 100 records: what the checkpoint costs and how it grows"
 select = ["i2-compaction-*"]
 
+[campaigns.i3-committed]
+title = "Ingest after the committed set's build became O(added) (2db98d7): kept at steady state, and discarded"
+select = ["i3-committed-*"]
+
+[campaigns.i4-compaction]
+title = "i2's compactions after the O(added) build: the set kept, at steady state, and discarded"
+select = ["i4-compaction-*"]
+
 [campaigns.c8-fold]
 title = "c1's fast appends on the code before (4e65a65) and after (56facd8) replay folds a read onto a replica"
 select = ["c8-fold-*"]

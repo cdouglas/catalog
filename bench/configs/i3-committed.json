@@ -1,0 +1,53 @@
+{
+  "label": "i3-committed",
+  "capture": {
+    "label": "cap-i1",
+    "encoding": "manifest-window",
+    "writers": 16,
+    "tables": 16,
+    "mix": {
+      "merge_append": 0.85,
+      "fast_append": 0.05,
+      "validated_overwrite": 0.05,
+      "compaction": 0.05
+    },
+    "race_min_wait_ms": 0,
+    "duration_s": 600,
+    "warmup_s": 5,
+    "drain_s": 10,
+    "expire_every_s": 5,
+    "expire_retain": 100,
+    "expire_retry_num": 100
+  },
+  "max_ingest_s": 120,
+  "compact_every": 0,
+  "vary": {
+    "+load": [
+      {
+        "rate": 1000,
+        "prefill": false,
+        "committed": "keep"
+      },
+      {
+        "rate": 1000,
+        "prefill": true,
+        "committed": "keep"
+      },
+      {
+        "rate": 100,
+        "prefill": true,
+        "committed": "keep"
+      },
+      {
+        "rate": 1000,
+        "prefill": false,
+        "committed": "discard"
+      }
+    ],
+    "batch": [
+      1,
+      64,
+      1024
+    ]
+  }
+}

@@ -91,6 +91,10 @@ final class IngestRun {
           // start with the committed set the rate holds at steady state: rate x retention ids,
           // spread over the retention window before the log's first record
           + "\"prefill\": false,"
+          // keep: the committed set as the catalog keeps it; discard: no ids kept (replay dedups
+          // within a batch only) and checkpoints carry none, what the set costs: a bound for
+          // keeping it out of the checkpoint and the replica
+          + "\"committed\": \"keep\","
           // stop the measured pass after this much ingest time (the windows say how far it got)
           + "\"max_ingest_s\": 300"
           + "}";
@@ -108,7 +112,7 @@ final class IngestRun {
   Map<String, Object> run() throws IOException {
     LogView captured = AtomicFileLog.decode(Files.readAllBytes(log));
     byte[] checkpoint = captured.checkpoint().orElseThrow();
-    List<byte[]> records = retimed(captured.records());
+    List<byte[]> records = retimed(captured.records(), config.number("rate"));
     return ingest(ContentionAccess.machine(), checkpoint, captured.records(), records);
   }
 
@@ -119,7 +123,10 @@ final class IngestRun {
     pass(machine, checkpoint, records.subList(0, warmup), null, null, null, Long.MAX_VALUE);
     System.gc();
 
-    CommittedSet prefill = config.bool("prefill") ? prefill(records) : null;
+    CommittedSet prefill = config.bool("prefill") && !discard()
+        ? prefill(UuidV7.timestampMs(LogEnvelope.decodeRecord(records.get(0)).id()),
+            config.number("rate"), config.number("retention_s"), config.longValue("repetition"))
+        : null;
     Pass<S> measured;
     try (BufferedWriter windows = writer("windows.jsonl");
         BufferedWriter compactions = writer("compactions.jsonl")) {
@@ -135,6 +142,7 @@ final class IngestRun {
     summary.put("records_s", measured.records / (measured.nanos / 1e9));
     summary.put("compactions", measured.compactions);
     summary.put("prefill_ids", prefill != null ? config.number("rate") * config.number("retention_s") : 0);
+    summary.put("committed", config.string("committed"));
     if (measured.records == records.size()) {
       // The same state as a replay of the log as captured: retiming and the run's own GC records
       // change the committed set, not what applies
@@ -145,16 +153,22 @@ final class IngestRun {
     return summary;
   }
 
+  private boolean discard() {
+    String committed = config.string("committed");
+    if (!committed.equals("keep") && !committed.equals("discard")) {
+      throw new IllegalArgumentException("committed is keep or discard, not " + committed);
+    }
+    return committed.equals("discard");
+  }
+
   /**
    * The committed set at steady state for the rate: rate x retention ids, one every 1/rate s over
    * the retention window before the first record (seeded, so every run of a rate has the same).
    */
-  private CommittedSet prefill(List<byte[]> records) {
-    double rate = config.number("rate");
-    long retentionMs = 1000L * config.longValue("retention_s");
-    long first = UuidV7.timestampMs(LogEnvelope.decodeRecord(records.get(0)).id());
-    long count = (long) (rate * config.number("retention_s"));
-    java.util.Random random = new java.util.Random(config.longValue("repetition") * 31 + 7);
+  static CommittedSet prefill(long first, double rate, double retentionS, long repetition) {
+    long retentionMs = (long) (1000 * retentionS);
+    long count = (long) (rate * retentionS);
+    java.util.Random random = new java.util.Random(repetition * 31 + 7);
     CommittedSet set = CommittedSet.EMPTY;
     for (long from = 0; from < count; from += 1_000_000) {
       CommittedSet.Builder chunk = set.toBuilder();
@@ -198,7 +212,8 @@ final class IngestRun {
     LogEnvelope.Checkpoint envelope = LogEnvelope.decodeCheckpoint(checkpoint);
     UUID logId = envelope.logId();
     S state = machine.decodeCheckpoint(envelope.state()).build();
-    CommittedSet committed = CommittedSet.of(envelope.committed());
+    boolean discard = discard();
+    CommittedSet committed = discard ? CommittedSet.EMPTY : CommittedSet.of(envelope.committed());
     if (prefill != null) {
       CommittedSet.Builder merged = prefill.toBuilder();
       committed.ids().forEach(merged::add);
@@ -226,7 +241,7 @@ final class IngestRun {
           Replay.replayOnto(machine, machine.toBuilder(state), committed.toBuilder(), logId,
               intentions, chunk, null);
       state = result.builder().build();
-      committed = result.committed().build();
+      committed = discard ? CommittedSet.EMPTY : result.committed().build();
       intentions = result.intentionRecords();
       foldNanos += System.nanoTime() - t0;
 
@@ -244,7 +259,7 @@ final class IngestRun {
         long c0 = System.nanoTime();
         long watermark =
             UuidV7.timestampMs(LogEnvelope.decodeRecord(records.get(end - 1)).id()) - retentionMs;
-        if (watermark > 0) {
+        if (watermark > 0 && !discard) {
           committed = committed.toBuilder().advanceHorizon(watermark).build();
         }
         byte[] stateBytes = machine.encodeCheckpoint(state);
@@ -256,7 +271,7 @@ final class IngestRun {
           Map<String, Object> row = new LinkedHashMap<>();
           row.put("position", end);
           row.put("checkpoint_bytes", encoded.length);
-          row.put("committed_bytes", committed.bytes().length);
+          row.put("committed_bytes", committed.encodedSize());
           row.put("state_bytes", stateBytes.length);
           ContentionAccess.checkpointSizes(stateBytes).forEach(row::put);
           row.put("tail_records", sinceCompaction);
@@ -287,7 +302,7 @@ final class IngestRun {
           row.put("compact_ms", compactNanos / 1e6);
           row.put("elapsed_s", totalNanos / 1e9);
           row.put("records_s", windowRecords / ((foldNanos + compactNanos) / 1e9));
-          row.put("committed_bytes", committed.bytes().length);
+          row.put("committed_bytes", committed.encodedSize());
           row.put("heap_used",
               Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory());
           write(windows, row);
@@ -306,8 +321,7 @@ final class IngestRun {
    * (keeping each id's random bits; a copy of a record keeps its copy's id), without the GC
    * records.
    */
-  private List<byte[]> retimed(List<byte[]> original) {
-    double rate = config.number("rate");
+  static List<byte[]> retimed(List<byte[]> original, double rate) {
     List<byte[]> records = new ArrayList<>(original.size());
     Map<UUID, UUID> ids = new HashMap<>();
     long start = -1;

@@ -120,6 +120,7 @@ git_dirty = "versions.fileio_dirty"
 [runs.promote]
 rate = { path = "config.rate", type = "DOUBLE" }
 batch = { path = "config.batch", type = "INTEGER" }
+committed = { path = "config.committed", type = "VARCHAR" }
 prefill = { path = "config.prefill", type = "BOOLEAN" }
 retention_s = { path = "config.retention_s", type = "DOUBLE" }
 compact_every = { path = "config.compact_every", type = "INTEGER" }
