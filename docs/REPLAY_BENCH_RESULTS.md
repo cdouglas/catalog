@@ -144,8 +144,8 @@ ms per operation, one fresh record (allocation per operation in parentheses):
 
 3,000 snapshots bracket the costs: fast appends without merging are past where inline manifest
 lists pay (the lists are quadratic, which Iceberg's merging appends avoid), and merge appends
-and the fold grow linearly, so the slope extrapolates. errata U2 asks for 10,000; a capture of
-that many commits takes about half an hour under merge appends.
+and the fold grow linearly, so the slope extrapolates (errata D18, which retired U2's request for
+10,000; a capture of that many commits takes about half an hour under merge appends).
 
 ## What remains
 

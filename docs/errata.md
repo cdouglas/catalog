@@ -9,14 +9,14 @@ For invariants that must not regress, see [design.md](design.md). For the
 wire format see [SPEC.md](SPEC.md), [ATOMIC_FILE_LOG.md](ATOMIC_FILE_LOG.md)
 and [LOG.md](LOG.md). Bugs in Apache Iceberg itself are in
 [ICEBERG_ISSUES.md](ICEBERG_ISSUES.md). Upstream fixed C1 (1.11.0), and
-the fork's `core-fixes` branch fixes C2-C25, so this project's tests
+the fork's `core-fixes` branch fixes C2-C27, so this project's tests
 work around none of them (the workarounds for C2-C8 were dropped in
 63dd25e, b82ceb9, dbac28b, 411f73c, e2c6b7b and 890fd8d); `TestIcebergCoreIssues`
-asserts each is absent. On stock Iceberg 1.12.0 C2-C25 come back.
+asserts each is absent. On stock Iceberg 1.12.0 C2-C27 come back.
 
 An entry's ID is not reused: a fixed entry is deleted or marked
 resolved, and its ID retired. Retired: S3, D1-D3, D5-D7, D11, T1, T2,
-U3 (`git log -p docs/errata.md` has each). Five IDs were reused before
+T5, U2 (answered: D18), U3 (`git log -p docs/errata.md` has each). Five IDs were reused before
 this rule, so an older code comment or commit citing one may mean the
 earlier entry:
 
@@ -104,6 +104,24 @@ the changes. The read set could travel as requirement-only
 checking a read branch's snapshot (`AssertRefSnapshotId`) rather than
 the whole table.
 
+### S4. The runtime trusts a shared log's checkpoints to continue its records
+
+On a log with separate checkpoints (`SharedLog.Capabilities#separateCheckpoints`),
+a read is the newest checkpoint and the records after it, and the runtime
+relies on the provider for their joint: one order of records, each read a
+checkpoint and a prefix of the records after it (P1), and no trim before a
+durable checkpoint covers what it trims (P5; LOG.md). A checkpoint does not
+say which position it covers, so a provider that served a checkpoint and
+records with a gap between them, or trimmed past its newest checkpoint,
+would lose the records in the gap and the runtime would not notice.
+`SharedLogContract` checks P1 and P5 on a provider, and the fuzzers' harnesses
+(`MemoryLogHarness`, `AtomicFileLogHarness`) report checkpoint violations. A
+checkpoint that named the last record it holds (its position, or its id)
+would let a read check that the records after it start where it ends.
+
+**Trigger to revisit:** a provider that `SharedLogContract` does not cover,
+or a production shared log.
+
 ## Deferred Functionality
 
 ### D4. `RewriteTablePathUtil` does not handle inline-ML tables
@@ -121,7 +139,7 @@ manifest list location, in both `replacePaths` and
 ### D9. Statistics-file changes force full mode (perf, not correctness)
 
 `InlineDeltaCodec.computeDelta` returns `null` whenever a stats file
-changed (the `statisticsChanged` check around line 938). Any commit that
+changed (its `statisticsChanged` check). Any commit that
 runs `setStatistics` in addition to a real change pays full-mode bytes,
 defeating the delta-mode benefit on tables that maintain stats. Adding
 `AddStatistics` / `RemoveStatistics` delta types is straightforward; the
@@ -290,6 +308,20 @@ compaction changes the checkpoint, and every writer then decodes the new
 one. That shifts the trade toward compacting less often than the campaign's
 100, which was chosen before the fold.
 
+A compaction writes the committed set whole (D16), and at the default
+retention and a steady commit rate the set is most of the checkpoint: 25 MB
+at 100 commits a second and 238 MB at 1,000, while the ingest benchmark's
+captured catalog state is under 1 MB. So a cost rule must count the set, or
+the set must leave the checkpoint (D16). The ingest benchmark (`IngestBench`,
+campaign `i2-compaction`, lab page `ingest`) measures a compaction's encode
+and decode as the catalog grows.
+
+The backoff matters most where every commit replaces the object: on `s3`
+under overload, `partition-vector` commits less than `lamport` (lab page
+`c6-endive`), since each lost race is another read of the whole object, while
+`lamport`'s conflicts go back to Iceberg's retry, whose longer backoff
+throttles the writers.
+
 **Trigger to revisit:** a deployment on a store other than S3 Express, or
 the contention benchmark's Azure and GCS profiles.
 
@@ -325,9 +357,143 @@ A sound design:
   those bytes match and the frames after them name `since`'s incarnation,
   it returns the frames after; else it reads the whole object.
 
+The design needs no read pinned to a version, which S3 does not give (T6):
+the incarnation id in each frame is what says whether the bytes after
+`since` extend the object `since` read.
+
 **Trigger to revisit:** a deployment whose catalog object grows past a few
-MB on a store that appends, or a benchmark profile that prices a GET by its
-bytes.
+MB on a store that appends (at the default retention, the committed set alone
+reaches 2.5 MB at 10 commits a second, D16), or a benchmark profile that
+prices a GET by its bytes.
+
+### D16. Replay rewrites the whole committed set, and every checkpoint carries it
+
+The committed set holds every id within the retention
+(`fileio.catalog.committed.retention.ms`, 6 hours by default; GC.md), so at
+a steady rate it holds rate × retention ids: 2.16 million at 100 commits a
+second, 21.6 million at 1,000. It is one packed blob (`CommittedTransactions`,
+LOG.md: newest first, per id a varint gap in ms from the one before and its
+10 random bytes) of about 11 B an id: 24.7 MB and 238 MB. A lookup scans it
+in place, newest first, and a checkpoint copies it as it is
+(`LogRuntime.checkpoint`). But a replay that applies any record builds a new
+one: `CommittedSet.Builder.build` calls `CommittedSetCodec.rewrite`, which
+unpacks every inherited entry (a 10-byte array each) to merge the new ids,
+then packs them all again, and a GC record (`advanceHorizon`) rewrites it too.
+Every writer's fold of a record pays it, and so does its read through its
+own write.
+
+The ingest benchmark (campaign `i1-ingest`, no compactions; lab page
+`ingest`) prefills the set to its steady state. Building the state after
+every record, one thread ingests 758 records a second from an empty set, 10
+with 100 a second's set, and 1.2 with 1,000's: about 100 ms and 860 ms a
+build, linear in the set's size, against about 70 µs to fold the record. In
+batches of 64 records it ingests 567 a second with 100 a second's set. The
+contention benchmark does not see this: its ten-minute runs start from an
+empty set. Beyond the build, the checkpoint a compaction writes and a fresh
+read GETs carries the whole set (D14, D15).
+
+The 74 random bits of a UUIDv7 do not compress, so an exact set costs at
+least about 9.25 B an id. A lossy one (a filter, truncated ids) could report
+a record applied that was not, and drop it. The fixes, in order:
+
+- **Build without unpacking (done, 2db98d7).** Entries are sorted newest first, and the ids
+  a replay adds are almost all newer than every entry it inherits, so adding
+  them is a prepend: pack the new ids and re-encode the gap of the first
+  inherited entry. A GC drops a suffix: cut the blob at the first entry at or
+  below the watermark. Only an id older than the newest entry (a commit that
+  retried while others landed, a writer whose clock is behind) needs a merge,
+  and only with the entries newer than it. A build then costs its ids and a
+  copy of the bytes; a set kept as a list of immutable runs, merged as they
+  accumulate, would not copy them at all. The wire format and I11 stay as
+  they are. The set is now kept in runs this way (`CommittedSet`), and the
+  ingest benchmark's steady state for 1,000 records/s ingests 23,907
+  records/s in batches of 64 and 19,968 one record at a time (campaign
+  `i5-fold`, lab page `ingest-ladder`), against 30,143 with the ids
+  discarded. The checkpoint still carries the whole set.
+- **Page out sealed runs.** A checkpoint could hold the newest run inline
+  and older ones as pointers to immutable objects, as pointer mode does for a
+  table's metadata. A compaction then writes the head and the pointers, and
+  a reader fetches a run only for a lookup in its span of time: a copy of an
+  old record, or a writer asking about an old id. Runs must be sealed at
+  boundaries the set determines (fixed spans of id time, say), so every
+  compactor writes the same objects and the same checkpoint (I11). A run
+  that cannot be fetched fails the read, since a lookup must not answer
+  "absent". And a run's object is deleted only when no checkpoint a reader
+  may still hold names it, as for expired metadata files.
+- **Derive the retention.** 6 hours is "longer than any commit's retries"
+  (GC.md). What the set must cover is how late a copy of a record can land,
+  which a store may bound (SigV4 and Azure Shared Key reject a request
+  signed about 15 minutes earlier; to be checked per store), and how long a
+  writer may ask whether its commit landed, which the snapshot oracle
+  (GC.md) answers past the horizon. A retention of 30 minutes would make the
+  set 12 times smaller.
+
+**Trigger to revisit:** a commit rate past a few a second at the default
+retention (the set passes 1 MB at 4 a second, and grows linearly with the
+rate), or the ingest and materialization service.
+
+### D17. A snapshot expiry never merges, so it starves under contention
+
+An expiry's record removes the snapshots it found unused on its base, and
+replay merges no record that removes something (`Landing`: "it removes what
+it found unused on its base"). So under every encoding an expiry fails if
+anything changed its table since it read it. That is sound: the snapshots it
+removes were unreferenced on its base, not necessarily where it lands (a
+concurrent commit may have tagged, cherry-picked or rolled back to one). But
+under contention an expiry rarely lands. In a contention-benchmark run (`s3x`,
+`manifest-window`, 32 writers on fast appends), 9 of 10 expiries exhausted
+their retries, and the ingest benchmark's capture raises the maintenance
+client's retries to 100 (`expire_retry_num`) to keep its tables at their
+last 100 snapshots. A table whose expiries starve keeps every snapshot, and
+its checkpoint and loads grow with them (D18): in the 32-writer profile a
+table reached about 1,400.
+
+A merge rule would admit an expiry onto a table changed since its base only
+by records that reference none of the snapshots it removes: no ref moved to
+one, no cherry-pick or rollback of one. It must also keep its writer's file
+cleanup safe. Iceberg picks the files to delete from the expiry's base and a
+refresh after its commit, and its incremental cleanup assumes the base is
+the version the commit replaced. Other commit-once records (schema and spec
+changes, ref changes) starve the same way, but they are rare; an expiry
+recurs, and bounds the table's growth.
+
+**Trigger to revisit:** a table with sustained concurrent commits whose
+expiries fail, or the ingest and materialization service.
+
+### D18. An inline-ML table stores each snapshot's manifest list whole
+
+An inline-ML table keeps each manifest once (its pool) but each retained
+snapshot's manifest list whole, so its checkpoint grows with the snapshots
+times the manifests each lists (this answers U2). ReplayBench
+(docs/REPLAY_BENCH_RESULTS.md) measured it. Under fast appends, which never
+merge manifests, the checkpoint grows with the square of the snapshots (12.8
+MB at 3,000); under merge appends about linearly (927 KB at 3,000). A load
+makes the table's metadata and each snapshot's `InlineSnapshot`. A later load
+reuses the ones an earlier load made while their lists are unchanged
+(`LogCatalog.InlineSnapshots`), so only a catalog's first load of a table
+makes every list (0.66 s at 3,000 fast-append snapshots), and its first
+after each compaction: a decoded checkpoint shares no list object with the
+state before it, and reuse goes by the list's identity.
+
+The options:
+
+- **Delta-encode the lists on the wire**: a snapshot's list as its parent's,
+  plus the manifests it adds and minus those it removes, so the checkpoint
+  grows with the snapshots plus the manifests. Replay already shares
+  unchanged lists in memory.
+- **Make lists lazily** (fork): an `InlineSnapshot` that resolves its list
+  on first use, so a load costs the snapshots, not their manifests.
+- **Page out old snapshots**: keep a table's recent snapshots inline and the
+  older ones, with their lists, in immutable objects the checkpoint points
+  to, as D16 proposes for the committed set. A load fetches them only for
+  history or time travel.
+- **Evict by size**: eviction is by update size only
+  (`fileio.catalog.inline.max.update.size`), so a table whose deltas fit
+  stays inline however large its lists grow. A per-table checkpoint-size
+  threshold would evict it to pointer mode.
+
+**Trigger to revisit:** a table that keeps thousands of snapshots without
+merging manifests, or whose expiries starve (D17).
 
 ### D8. Typed-protobuf encoding for Iceberg structural types (skip JSON serde)
 
@@ -454,27 +620,35 @@ bytes)` API on `FileIOCatalog` to re-inline them. Two options:
 **Trigger to revisit:** when a real workload needs catalog
 re-registration of a previously-dropped inline table.
 
-### T5. `catalog.proto` is a schema-of-record with no drift-detection oracle — RESOLVED
+### T6. The fuzzers pin reads, and S3 does not
 
-Resolved 2026-10-18 (516e9c4). The build still does not compile
-`catalog.proto`, and the codecs stay hand-rolled, but two tests now fail
-when the schema and the codecs diverge, with no `protobuf-java`
-dependency:
+`InMemoryAtomicFileIO` binds an `InputFile` to the generation it first
+observes and keeps reading those bytes, as a read conditioned on the version
+would. The fork's S3 reads are not conditioned: `S3InputStream` sends a
+ranged GET with no `If-Match`, and on a read error reopens the stream at its
+position with another. So an `AtomicFileLog` read on S3 (`getLength`, a
+HEAD, then the bytes) can return the first bytes of a newer object than the
+one its tail is bound to, or, after a reopen, the start of one object and
+the rest of another. ADLS and GCS read by version.
 
-- `CatalogProto` parses `catalog.proto` and checks that a catalog file
-  conforms to it: every field declared in its message, with a type of
-  the wire type it was written with, a declared enum value, a singular
-  field or oneof member at most once, valid UTF-8 in strings.
-  `CheckpointRoundTrip` applies it to every catalog file the suites and
-  fuzzers write.
-- `TestFormatExplorer` checks the codecs' field-number constants
-  against `catalog.proto` in both directions, so a field the codecs
-  write but the schema lacks, or one the schema declares but no codec
-  reads, fails even if no test writes it; and it checks that the format
-  explorer's embedded fixtures are the ones the current code generates.
+That this is safe is argued, not tested. A read cut inside a frame fails to
+decode, and the read fails. A frame-aligned prefix of a newer object is a
+state the log held, and its tail is still bound to the version the HEAD
+saw, so a write conditioned on it fails. A fold compares bytes, so it
+replays such a view whole. And a read through a write must include the
+write's record (`seen`), or the commit is ambiguous. A spliced view is the
+case the argument covers least: its bytes come from two objects, and only
+decoding stands between them and replay. D15's incarnation id in each frame
+would reject one.
 
-The drift these found when they landed (missing fields and messages,
-wrong wire types, packed declarations) is fixed in `catalog.proto`.
+A fuzzer mode would test it: an `InMemoryAtomicFileIO` option whose bound
+read returns the first bytes of the live generation, or splices two at a
+random offset. `InMemoryAtomicFileIO`'s doc also says S3 reads with
+`If-Match` (the `failSupersededReads` paragraph), which the fork's S3 reads
+do not.
+
+**Trigger to revisit:** before relying on S3 (general purpose or Express)
+in production, or when D15's ranged reads are built.
 
 ## Known Unknowns
 
@@ -493,22 +667,15 @@ specs we control. We have not measured against:
 - snapshot summaries with many `extra` entries;
 - v3+ row-lineage tables.
 
+The ingest benchmark's capture (16 writers on 16 tables, mostly merge
+appends with some fast appends, validated overwrites and compactions, over
+the contention driver's synthetic data files; lab page `ingest`) averages
+721 B a record. The estimates above are per delta; a record holds a
+snapshot's delta, the manifests it adds and removes, and its producer's
+footprint. The cases listed above remain unmeasured.
+
 **Trigger:** before publishing comparative benchmarks, validate the
 estimates with an instrumented run.
-
-### U2. Checkpoint size scaling with manifest-pool growth
-
-The pool stores each unique manifest once per table; consecutive
-`FastAppend` snapshots add one entry. Long-lived tables with many
-retained snapshots have not been measured. Compaction (CAS) writes the
-full pool every time, so pool size directly drives checkpoint write
-cost.
-
-**Trigger:** measure pool size at 100 / 1000 / 10000 retained snapshots
-on a representative table; decide whether to add a per-table
-"checkpoint-too-big → evict to pointer" threshold. Eviction today is by
-update size only (`fileio.catalog.inline.max.update.size`): a table whose
-deltas fit stays inline however large its metadata and pool grow.
 
 ### U4. Behavior under storage provider edge cases
 
