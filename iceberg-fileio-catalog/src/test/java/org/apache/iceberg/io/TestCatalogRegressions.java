@@ -4950,4 +4950,63 @@ public class TestCatalogRegressions {
           .isEqualTo(CatalogStateMachine.INSTANCE.encodeCheckpoint(state));
     }
   }
+
+  /**
+   * Bug 81: a replace transaction's record merged as an append onto a racing schema change. A
+   * replace restates the table's schema, partition spec and sort order, but its record is a delta
+   * from the version it read, which carries only what differs there: on a table with no snapshot
+   * whose schema was already the replacement's, a new snapshot, main and the properties. Landing
+   * it on a version where another writer had added a column, a merging encoding found nothing in
+   * common with the column's change and applied it, and the column stayed current; Iceberg's
+   * retry of the replace rebuilds the replacement on that version and makes its schema current
+   * again. Replay cannot tell such a record from a first append to an empty table (Bug 73), whose
+   * merge is right, so the writer says what it is: a replace commits the table's full metadata,
+   * which every encoding judges on the table's whole version. The fault fuzzer found it (round
+   * ir2).
+   */
+  @Nested
+  class ReplaceRestatesTheSchema {
+    private final TableIdentifier id = TableIdentifier.of("ns", "t");
+    private final Schema seed =
+        new Schema(Types.NestedField.required(1, "id", Types.LongType.get()));
+
+    @ParameterizedTest
+    @ValueSource(strings = {"lamport", "lamport-minus-properties", "concern-vector",
+        "blind-append", "partition-vector", "manifest-window"})
+    void aReplaceRacingASchemaChangeKeepsItsSchema(String encoding) {
+      for (LocalCatalogMode mode : List.of(LocalCatalogMode.APPEND_TM, LocalCatalogMode.APPEND_ML,
+          LocalCatalogMode.CAS_TM, LocalCatalogMode.CAS_ML)) {
+        InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+        Map<String, String> props = Map.of(LogCatalogProperties.CONFLICT_ENCODING, encoding);
+        LogCatalog first = mode.catalog(io, "mem:///w", "c", props);
+        LogCatalog second = mode.catalog(io, "mem:///w", "c", props);
+        first.createNamespace(Namespace.of("ns"));
+        first.createTable(id, seed);
+
+        org.apache.iceberg.Transaction replace = first.buildTable(id, seed).replaceTransaction();
+        replace.newAppend().appendFile(file("f1")).commit();
+        // The column lands just before the replace's first write to the catalog
+        boolean[] raced = {false};
+        io.injectFaults(
+            (location, strategy) -> {
+              if (!raced[0]) {
+                raced[0] = true;
+                second.loadTable(id).updateSchema().addColumn("c0", Types.IntegerType.get())
+                    .commit();
+              }
+              return Fault.NONE;
+            });
+        replace.commitTransaction();
+        io.injectFaults((location, strategy) -> Fault.NONE);
+
+        Table table = mode.<LogCatalog>catalog(io, "mem:///w", "c", props).loadTable(id);
+        assertThat(raced[0]).as(mode.name()).isTrue();
+        assertThat(table.schema().findField("c0")).as(mode.name()).isNull();
+        assertThat(table.currentSnapshot().addedDataFiles(table.io()))
+            .as(mode.name())
+            .extracting(f -> f.location())
+            .containsExactly("mem:///data/f1.parquet");
+      }
+    }
+  }
 }

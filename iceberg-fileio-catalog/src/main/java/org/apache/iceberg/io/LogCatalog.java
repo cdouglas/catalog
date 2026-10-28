@@ -31,13 +31,16 @@ import org.apache.iceberg.ManifestListSink;
 import org.apache.iceberg.ManifestListSink.ManifestListDelta;
 import org.apache.iceberg.BaseMetastoreCatalog;
 import org.apache.iceberg.BaseMetastoreTableOperations;
+import org.apache.iceberg.BaseTransaction;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.InlineSnapshot;
 import org.apache.iceberg.ManifestFile;
+import org.apache.iceberg.Schema;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.CatalogUtil;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableOperations;
+import org.apache.iceberg.Transaction;
 import org.apache.iceberg.catalog.BaseCatalogTransaction;
 import org.apache.iceberg.catalog.CatalogTransaction;
 import org.apache.iceberg.catalog.Namespace;
@@ -301,6 +304,33 @@ public class LogCatalog extends BaseMetastoreCatalog
     return newTableOps(tableIdentifier, null);
   }
 
+  @Override
+  public TableBuilder buildTable(TableIdentifier identifier, Schema schema) {
+    return new LogTableBuilder(identifier, schema);
+  }
+
+  /** Iceberg's table builder, whose replace transactions commit as replaces (Bug 81). */
+  private class LogTableBuilder extends BaseMetastoreCatalogTableBuilder {
+    LogTableBuilder(TableIdentifier identifier, Schema schema) {
+      super(identifier, schema);
+    }
+
+    @Override
+    public Transaction replaceTransaction() {
+      return replacing(super.replaceTransaction());
+    }
+
+    @Override
+    public Transaction createOrReplaceTransaction() {
+      return replacing(super.createOrReplaceTransaction());
+    }
+
+    private Transaction replacing(Transaction transaction) {
+      ((FileIOTableOperations) ((BaseTransaction) transaction).underlyingOps()).replaces = true;
+      return transaction;
+    }
+  }
+
   /**
    * Operations on {@code tableIdentifier}: as {@code read} holds it, without refresh, or, if null,
    * as the next refresh finds it.
@@ -505,6 +535,8 @@ public class LogCatalog extends BaseMetastoreCatalog
     private boolean loaded = false;
     // Whether a commit of what Iceberg commits once pins it (LogCatalog.leavingCommitOnceUnpinned)
     private boolean pinsCommitOnce = true;
+    // Whether these are a replace transaction's, whose commit restates the table (Bug 81)
+    private boolean replaces = false;
 
     FileIOTableOperations(
         TableIdentifier tableId,
@@ -843,7 +875,11 @@ public class LogCatalog extends BaseMetastoreCatalog
           mut.updateTable(tableId, writeUpdateMetadata(false, metadata));
           return;
         }
-        if (isInline) {
+        // A replace restates the table's schema, spec and sort order, which a delta from the
+        // version it read carries only where they differ there: such a delta can read as an
+        // append, which replay may merge onto a version another writer changed (Bug 81). The full
+        // metadata applies only on the version it read, whatever the catalog's encoding.
+        if (isInline && !replaces) {
           // Null if delta encoding cannot express the change (a statistics change, errata D9; a
           // concurrent replace's id collision, SPEC_TM.md): full mode then.
           List<InlineDeltaCodec.DeltaUpdate> delta =
