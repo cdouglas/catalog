@@ -3,6 +3,7 @@
 # configuration files, writing each run under bench/results/<label>-<hash>/<UTC start>-r<repetition>/.
 #
 #   bench/run.sh [--heap 4g] [--out DIR] [--dry-run] bench/configs/<campaign>.json...
+#   bench/run.sh --main IngestBench bench/configs/i<n>-*.json...   the ingest benchmark instead
 #   bench/run.sh --build-only        builds and snapshots, and prints the snapshot's directory
 #
 # It builds once, snapshots the compiled classes under bench/results/builds/ (so a rebuild during a
@@ -15,12 +16,14 @@ heap=4g
 out="$here/results"
 args=()
 build_only=false
+main=ContentionBench
 while [ $# -gt 0 ]; do
   case "$1" in
     --heap) heap="$2"; shift 2 ;;
-    --out) out="$2"; shift 2 ;;
+    --out) mkdir -p "$2"; out=$(cd "$2" && pwd); shift 2 ;;
     --dry-run) args+=(--dry-run); shift ;;
     --build-only) build_only=true; shift ;;
+    --main) main="$2"; shift 2 ;;
     *) args+=("$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"); shift ;;
   esac
 done
@@ -64,4 +67,4 @@ exec java -Xmx"$heap" -XX:+UseG1GC \
   -Diceberg.worker.num-threads=256 \
   -Dorg.slf4j.simpleLogger.defaultLogLevel=error \
   -cp "$build/test-classes:$build/classes$cp_snap" \
-  org.apache.iceberg.io.contention.ContentionBench --out "$out" "${args[@]}"
+  "org.apache.iceberg.io.contention.$main" --out "$out" "${args[@]}"

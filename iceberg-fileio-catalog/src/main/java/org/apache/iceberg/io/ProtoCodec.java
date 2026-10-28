@@ -99,10 +99,10 @@ public class ProtoCodec {
   private static final int CHECKPOINT_MIN_READER_VERSION = 4;
   /** The catalog's conflict encoding; absent until a record sets one. */
   private static final int CHECKPOINT_CONFLICT_ENCODING = 5;
-  private static final int CHECKPOINT_NAMESPACES = 10;
-  private static final int CHECKPOINT_TABLES = 11;
-  private static final int CHECKPOINT_NAMESPACE_PROPERTIES = 12;
-  private static final int CHECKPOINT_INLINE_TABLES = 13;
+  static final int CHECKPOINT_NAMESPACES = 10;
+  static final int CHECKPOINT_TABLES = 11;
+  static final int CHECKPOINT_NAMESPACE_PROPERTIES = 12;
+  static final int CHECKPOINT_INLINE_TABLES = 13;
 
   // CommittedTransactions field numbers (compressed UUIDv7 set).
   // Entries are interleaved (varint delta + 10 random bytes per entry,
@@ -133,12 +133,12 @@ public class ProtoCodec {
   private static final int INLINE_TBL_VERSION = 2;
   private static final int INLINE_TBL_NAMESPACE_ID = 3;
   private static final int INLINE_TBL_NAME = 4;
-  private static final int INLINE_TBL_METADATA = 5;
+  static final int INLINE_TBL_METADATA = 5;
   private static final int INLINE_TBL_MANIFEST_PREFIX = 6;
-  private static final int INLINE_TBL_MANIFEST_POOL = 7;
-  private static final int INLINE_TBL_SNAPSHOT_REFS = 8;
+  static final int INLINE_TBL_MANIFEST_POOL = 7;
+  static final int INLINE_TBL_SNAPSHOT_REFS = 8;
   private static final int INLINE_TBL_METADATA_CODEC = 9;
-  private static final int INLINE_TBL_CONFLICT_STATE = 10;
+  static final int INLINE_TBL_CONFLICT_STATE = 10;
 
   // ManifestFileEntry field numbers
   private static final int MF_PATH_SUFFIX = 1;

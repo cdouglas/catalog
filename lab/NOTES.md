@@ -87,6 +87,27 @@ to tables of one `FileIOCatalog` over an in-memory store whose requests take a p
   manifests (snapshots x manifests). A run that commits faster ends with a larger object. A
   compaction (a merging snapshot producer) merges manifests, which keeps the object small.
 
+## The ingest benchmark (source `ingest`)
+
+- A run replays a log the contention driver captured (`capture_log`: every record its writers'
+  commits landed, in order, with no store latency) on one thread, with no storage: what an ingest
+  service that tails the log would do, as fast as it can. The capture is real Iceberg writers'
+  records (deltas, footprints, merges, rejections), cached under `bench/results/captures/`.
+- The log's ids are retimed to `rate` records/s; the rate matters only through the committed set,
+  which holds every id within `retention_s` (6 h, the catalog's default). `prefill` starts the set at
+  its steady state for the rate (rate x retention ids), so a short log measures a long-running
+  catalog's set: at 1,000 records/s that is 21.6 million ids.
+- `batch` is the records folded before the state is built (published): a tailing reader's read.
+  Building copies what the batch changed, and rewrites the committed set (its packed bytes) once
+  per batch, so its cost per record falls with the batch.
+- `windows.records_s` is ingest alone; `compact_ms` is the run's own compactions (GC record and the
+  checkpoint encoded, then discarded), which a writer, not the reader, pays in the catalog. A
+  batch ends where a compaction is due (`compact_every`; 0: none).
+- Timings are one thread's wall-clock on the dev box (16 threads): run nothing else alongside.
+- `i1-ingest` and `i2-compaction` ran before the pass checked `max_ingest_s` per batch: it checked
+  at the end of a window (2,000 records), so their slowest runs overran it (1,000 records/s
+  prefilled, batch 1: 1,729 s for one window). Their windows are measured alike.
+
 ## Known runs
 
 - The p5 campaign (c1-c6, 2026-10-27, havoc, 8 shards of 4 CPUs) ran fileio-catalog 2afeb46 (its

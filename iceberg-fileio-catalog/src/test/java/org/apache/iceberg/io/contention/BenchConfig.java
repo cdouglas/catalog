@@ -98,7 +98,11 @@ final class BenchConfig {
           // the catalog's backoff after a lost race (fileio.catalog.race.retry.min-wait-ms)
           + "\"race_min_wait_ms\": 100,"
           // sampling of the catalog object
-          + "\"sample_every_ms\": 1000"
+          + "\"sample_every_ms\": 1000,"
+          // the maintenance client's retries (-1: retry_num), so expiry can keep up with appends
+          + "\"expire_retry_num\": -1,"
+          // write every record the catalog's writes landed, in order, to log.bin (IngestBench)
+          + "\"capture_log\": false"
           + "}";
 
   private final ObjectNode node;
@@ -109,7 +113,13 @@ final class BenchConfig {
 
   /** The runs a configuration file's JSON holds: its base, or each combination it varies. */
   static List<BenchConfig> expand(JsonNode file) {
-    ObjectNode base = (ObjectNode) defaults();
+    return expand(file, DEFAULTS);
+  }
+
+  /** The runs of a file of another driver's configuration, whose keys are {@code defaults}'. */
+  static List<BenchConfig> expand(JsonNode file, String defaults) {
+    ObjectNode base = (ObjectNode) parse(defaults);
+    JsonNode known = parse(defaults);
     ObjectNode given = file.deepCopy();
     JsonNode vary = given.remove("vary");
     merge(base, given);
@@ -138,7 +148,7 @@ final class BenchConfig {
     for (ObjectNode run : runs) {
       for (Iterator<String> it = run.fieldNames(); it.hasNext(); ) {
         String key = it.next();
-        if (!defaults().has(key)) {
+        if (!known.has(key)) {
           throw new IllegalArgumentException("Unknown configuration key: " + key);
         }
       }
@@ -147,9 +157,9 @@ final class BenchConfig {
     return configs;
   }
 
-  private static JsonNode defaults() {
+  private static JsonNode parse(String json) {
     try {
-      return MAPPER.readTree(DEFAULTS);
+      return MAPPER.readTree(json);
     } catch (java.io.IOException e) {
       throw new java.io.UncheckedIOException(e);
     }
@@ -161,6 +171,11 @@ final class BenchConfig {
 
   JsonNode node() {
     return node;
+  }
+
+  /** The configuration under {@code key}, an object, as one with {@code defaults}' keys. */
+  BenchConfig nested(String key, String defaults) {
+    return expand(node.get(key), defaults).get(0);
   }
 
   String string(String key) {
@@ -205,7 +220,8 @@ final class BenchConfig {
    * out of the hash, so a configuration keeps the hash its earlier runs recorded.
    */
   private static final Map<String, String> LATER_KEYS =
-      Map.of("expire_older_than_s", "0", "race_min_wait_ms", "20");
+      Map.of("expire_older_than_s", "0", "race_min_wait_ms", "20", "expire_retry_num", "-1",
+          "capture_log", "false");
 
   /**
    * The first 12 hex digits of the SHA-256 of the configuration, less its label, its repetition and

@@ -51,7 +51,7 @@ import org.apache.iceberg.IcebergBuild;
  * bench/run.sh.
  */
 public final class ContentionBench {
-  private static final DateTimeFormatter STAMP =
+  static final DateTimeFormatter STAMP =
       DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'").withZone(ZoneOffset.UTC);
 
   private ContentionBench() {}
@@ -125,7 +125,7 @@ public final class ContentionBench {
    * run writes into it. Two shards can start the repetitions of one configuration in the same
    * second (they are adjacent runs): in the p5 campaign two such runs shared a directory.
    */
-  private static Path newRunDir(Path parent, String stamp, BenchConfig config) throws Exception {
+  static Path newRunDir(Path parent, String stamp, BenchConfig config) throws Exception {
     Files.createDirectories(parent);
     String base = stamp + "-r" + config.integer("repetition");
     for (int n = 0; ; n++) {
@@ -138,13 +138,13 @@ public final class ContentionBench {
     }
   }
 
-  private static void write(Path dir, Map<String, Object> manifest) throws Exception {
+  static void write(Path dir, Map<String, Object> manifest) throws Exception {
     Files.createDirectories(dir);
     BenchConfig.MAPPER.writerWithDefaultPrettyPrinter()
         .writeValue(dir.resolve("manifest.json").toFile(), manifest);
   }
 
-  private static Map<String, Object> versions() {
+  static Map<String, Object> versions() {
     Map<String, Object> versions = new LinkedHashMap<>();
     versions.put("fileio_git", System.getenv().getOrDefault("FILEIO_GIT", "unknown"));
     versions.put("fileio_dirty", Boolean.parseBoolean(System.getenv("FILEIO_DIRTY")));
@@ -154,7 +154,7 @@ public final class ContentionBench {
     return versions;
   }
 
-  private static Map<String, Object> host() throws Exception {
+  static Map<String, Object> host() throws Exception {
     Map<String, Object> host = new LinkedHashMap<>();
     host.put("name", InetAddress.getLocalHost().getHostName());
     host.put("os", System.getProperty("os.name") + " " + System.getProperty("os.version"));

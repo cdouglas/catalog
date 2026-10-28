@@ -14,7 +14,7 @@ name = "contention"
 kind = "manifest"
 root = "bench/results"
 glob = "*/*"
-exclude = ["builds/*"]
+exclude = ["builds/*", "ingest/*", "captures/*"]
 id = "{label}-{config_hash}/{dir.name}"
 
 [runs.fields]
@@ -100,3 +100,51 @@ file = "*/results.parquet"
 format = "parquet"
 path_pattern = '^(?P<seed>\d+)/'
 mode = "view"
+
+# The ingest benchmark (bench/run.sh --main IngestBench, org.apache.iceberg.io.contention.IngestRun)
+# writes bench/results/ingest/<label>-<config hash>/<UTC start>-r<repetition>/ with manifest.json
+# (its capture's configuration and summary under "capture"), windows.jsonl and compactions.jsonl.
+# A capture (bench/results/captures/<label>-<hash>/) is a contention run with no store latency
+# that kept every record its writers landed (log.bin); it is not a run here.
+[[runs]]
+name = "ingest"
+kind = "manifest"
+root = "bench/results/ingest"
+glob = "*/*"
+id = "{label}-{config_hash}/{dir.name}"
+
+[runs.fields]
+git_sha = "versions.fileio_git"
+git_dirty = "versions.fileio_dirty"
+
+[runs.promote]
+rate = { path = "config.rate", type = "DOUBLE" }
+batch = { path = "config.batch", type = "INTEGER" }
+prefill = { path = "config.prefill", type = "BOOLEAN" }
+retention_s = { path = "config.retention_s", type = "DOUBLE" }
+compact_every = { path = "config.compact_every", type = "INTEGER" }
+capture_hash = "capture.config_hash"
+capture_records = { path = "capture.manifest.summary.captured_records", type = "INTEGER" }
+
+# Per window of records: the position after it, its records and their bytes, the time folding them
+# (fold_ms: replay and building the state after each batch) and compacting (compact_ms: GC record,
+# checkpoint encode) took, cumulative ingest time (elapsed_s), the committed set's bytes, the heap.
+[[facts]]
+name = "windows"
+runs = "ingest"
+file = "windows.jsonl"
+format = "jsonl"
+mode = "table"
+only_finished = true
+
+# Per compaction: the checkpoint's bytes and where they go (committed set; the state's namespaces,
+# tables, properties; inline tables' metadata, manifest pool, manifest lists, conflict state; value
+# bytes, not tags and lengths), the tail it replaced, encode_ms, and decode_ms every decode_every-th.
+[[facts]]
+name = "compactions"
+runs = "ingest"
+file = "compactions.jsonl"
+format = "jsonl"
+mode = "table"
+only_finished = true
+

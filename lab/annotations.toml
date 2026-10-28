@@ -56,6 +56,14 @@ select = ["c2r-expiry-*"]
 title = "The commit loop's backoff after a lost race: none, 20 ms, 100 ms"
 select = ["c7-backoff-*"]
 
+[campaigns.i1-ingest]
+title = "Ingest without storage: a captured log replayed by one thread, by rate, committed set and batch"
+select = ["i1-ingest-*"]
+
+[campaigns.i2-compaction]
+title = "Ingest with a compaction every 100 records: what the checkpoint costs and how it grows"
+select = ["i2-compaction-*"]
+
 [campaigns.c8-fold]
 title = "c1's fast appends on the code before (4e65a65) and after (56facd8) replay folds a read onto a replica"
 select = ["c8-fold-*"]

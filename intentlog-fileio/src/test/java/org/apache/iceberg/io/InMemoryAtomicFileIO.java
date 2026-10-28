@@ -177,6 +177,7 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
   private volatile int appendByteLimit = 0;
   private final Map<ReadFault, Integer> injectedReads = Maps.newEnumMap(ReadFault.class);
   private volatile boolean recordHistory = true;
+  private volatile WriteListener listener = null;
 
   public InMemoryAtomicFileIO() {
     this(true);
@@ -305,6 +306,21 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
   /** Number of conditional writes rejected because the object changed, by strategy. */
   public synchronized int rejected(AtomicOutputFile.Strategy strategy) {
     return strategy == AtomicOutputFile.Strategy.APPEND ? rejectedAppends : rejectedCas;
+  }
+
+  /** Sees each conditional write that lands, under the store's lock, so in the order they land. */
+  public interface WriteListener {
+    /** {@code data} is what the write sent: the bytes an append added, or a CAS's whole object. */
+    void landed(String location, AtomicOutputFile.Strategy strategy, byte[] data);
+  }
+
+  /**
+   * Calls {@code seen} with every conditional write that lands from now on (null: none). Unlike
+   * {@link #history}, which keeps each version's bytes, it costs only the call: a benchmark that
+   * keeps the records a log's writes add uses it.
+   */
+  public void onWrite(WriteListener seen) {
+    this.listener = seen;
   }
 
   /**
@@ -576,6 +592,10 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
           history.add(new Write(location, strategy, live == null ? null : live.bytes, next));
         }
         BoundInputFile written = new BoundInputFile(location, put(location, next, segments));
+        WriteListener seen = listener;
+        if (seen != null) {
+          seen.landed(location, strategy, data);
+        }
         String landed = "injected: " + strategy + " at " + location + " landed, but ";
         switch (fault) {
           case LOST_REPLY:

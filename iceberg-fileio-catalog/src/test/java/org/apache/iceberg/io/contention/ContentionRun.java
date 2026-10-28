@@ -19,6 +19,7 @@
 package org.apache.iceberg.io.contention;
 
 import java.io.BufferedWriter;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
@@ -44,11 +45,15 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.CommitStateUnknownException;
 import org.apache.iceberg.exceptions.ValidationException;
+import org.apache.iceberg.io.AtomicOutputFile;
 import org.apache.iceberg.io.CatalogLog;
 import org.apache.iceberg.io.ContentionAccess;
 import org.apache.iceberg.io.FileIOCatalog;
 import org.apache.iceberg.io.InMemoryAtomicFileIO;
 import org.apache.iceberg.io.SeekableInputStream;
+import org.intentlog.LogView;
+import org.intentlog.fileio.AtomicFileLog;
+import org.intentlog.wire.ProtoWire;
 
 /**
  * One run of the contention driver ({@link ContentionBench}): writers commit operations to tables
@@ -80,6 +85,12 @@ final class ContentionRun {
   private final double[] cumulative;
   private long startNanos;
   private BufferedWriter ops;
+  // With capture_log: the checkpoint the catalog object was created with, and every record its
+  // writes landed after it, in the order they landed. A later replace's checkpoint is the replay of
+  // the records before it (I11), so of a replace only its records are kept.
+  private byte[] firstCheckpoint = null;
+  private final List<byte[]> captured = new ArrayList<>();
+  private long capturedBytes = 0;
 
   ContentionRun(BenchConfig config, Path dir) {
     this.config = config;
@@ -87,6 +98,9 @@ final class ContentionRun {
     StoreProfile profile = StoreProfile.named(config.string("store"));
     this.store = new InMemoryAtomicFileIO(profile.supportsAppend);
     store.recordHistory(false);
+    if (config.bool("capture_log")) {
+      store.onWrite(this::capture);
+    }
     this.io =
         new LatencyFileIO(store, profile, CATALOG, config.number("time_scale"),
             config.longValue("seed") * 7919 + config.integer("repetition"));
@@ -122,9 +136,38 @@ final class ContentionRun {
   }
 
   private FileIOCatalog client(String name) {
+    return client(name, catalogProperties());
+  }
+
+  private FileIOCatalog client(String name, Map<String, String> properties) {
     FileIOCatalog catalog = new FileIOCatalog(name, CATALOG, io, new HashMap<>());
-    catalog.initialize(name, catalogProperties());
+    catalog.initialize(name, properties);
     return catalog;
+  }
+
+  /** Keeps the records a write to the catalog object landed (capture_log), under the store's lock. */
+  private void capture(String location, AtomicOutputFile.Strategy strategy, byte[] data) {
+    if (!location.equals(CATALOG)) {
+      return;
+    }
+    List<byte[]> records;
+    if (strategy == AtomicOutputFile.Strategy.APPEND) {
+      try {
+        records = List.of(ProtoWire.readLengthDelimitedBytes(new ByteArrayInputStream(data)));
+      } catch (java.io.IOException e) {
+        throw new java.io.UncheckedIOException(e);
+      }
+    } else {
+      LogView view = AtomicFileLog.decode(data);
+      if (firstCheckpoint == null) {
+        firstCheckpoint = view.checkpoint().orElseThrow();
+      }
+      records = view.records();
+    }
+    for (byte[] record : records) {
+      captured.add(record);
+      capturedBytes += record.length;
+    }
   }
 
   private static TableIdentifier table(int t) {
@@ -184,6 +227,14 @@ final class ContentionRun {
     }
     Map<String, Object> summary = new LinkedHashMap<>();
     summary.put("stragglers", stragglers);
+    if (config.bool("capture_log")) {
+      // The log as one catalog object that was never compacted: the first checkpoint and every
+      // record after it
+      store.onWrite(null);
+      Files.write(dir.resolve("log.bin"), AtomicFileLog.encode(firstCheckpoint, captured));
+      summary.put("captured_records", captured.size());
+      summary.put("captured_record_bytes", capturedBytes);
+    }
     summary.put("catalog_bytes", catalogBytes().length);
     // every thread's requests and the process's CPU over the measured duration
     summary.put("requests", requestsMeasured.fields());
@@ -490,7 +541,12 @@ final class ContentionRun {
   }
 
   private void maintain(long endNanos) {
-    FileIOCatalog catalog = client("maintenance");
+    Map<String, String> props = catalogProperties();
+    if (config.integer("expire_retry_num") >= 0) {
+      props.put(CatalogProperties.TABLE_DEFAULT_PREFIX + TableProperties.COMMIT_NUM_RETRIES,
+          config.string("expire_retry_num"));
+    }
+    FileIOCatalog catalog = client("maintenance", props);
     long every = TimeUnit.SECONDS.toNanos(config.integer("expire_every_s"));
     long next = System.nanoTime() + every;
     while (!stopping.get() && next < endNanos) {
