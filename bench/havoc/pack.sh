@@ -3,12 +3,17 @@
 # campaign configurations, a JRE image's context and the host-side run.sh, in
 # bench/build/bench-<UTC stamp>.tar. On the host: tar xf, ./run.sh build, ./run.sh campaign ...
 # (README.md).
+#
+# ROOT=<checkout> packs a build of another checkout (a git worktree of an earlier commit, to run
+# builds side by side), with this tree's harness and configurations; the tar is
+# bench-<stamp>-<commit>.tar in this tree's bench/build.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
-root=$(cd "$here/../.." && pwd)
+self=$(cd "$here/../.." && pwd)
+root=$(cd "${ROOT:-$self}" && pwd)
 build=$("$root/bench/run.sh" --build-only | tail -1)
-stamp=$(date -u +%Y%m%dT%H%M%SZ)
-pack="$root/bench/build/bench-$stamp"
+stamp=$(date -u +%Y%m%dT%H%M%SZ)-$(git -C "$root" rev-parse --short=9 HEAD)
+pack="$self/bench/build/bench-$stamp"
 mkdir -p "$pack/ctx/app/lib" "$pack/configs"
 cp -r "$build/classes" "$pack/ctx/app/classes"
 cp -r "$build/test-classes" "$pack/ctx/app/test-classes"
@@ -26,7 +31,7 @@ done
 printf '%s\n' "$cp_rel" > "$pack/ctx/app/classpath"
 cp "$here/Dockerfile" "$here/bench-entry" "$pack/ctx/"
 cp "$here/run.sh" "$here/README.md" "$pack/"
-cp "$root"/bench/configs/*.json "$pack/configs/"
-tar -C "$root/bench/build" -cf "$pack.tar" "bench-$stamp"
+cp "$self"/bench/configs/*.json "$pack/configs/"
+tar -C "$self/bench/build" -cf "$pack.tar" "bench-$stamp"
 du -sh "$pack.tar"
 echo "packed $pack.tar ($(cat "$build/provenance.env" | tr '\n' ' '))"

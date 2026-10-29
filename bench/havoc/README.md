@@ -31,3 +31,24 @@ replays and Iceberg's work, a core or two at 32 writers.
 
 A run's timings are wall-clock: the host's other load shows in its CPU-bound parts (replay,
 manifest writes), not in the latency it sleeps. Compare runs of one campaign on one host.
+
+## The ingest benchmark and JMH, build against build
+
+`run.sh ingest <name> <configs>` runs the ingest benchmark (IngestBench) in one container (16
+CPUs and a 6g heap unless `CPUS` and `HEAP` say otherwise: a capture runs 16 writers), its
+captures under `$OUT/<name>/captures/`. `run.sh jmh <name> <campaign...> -- <JMH args>` runs
+`IngestFoldBench.fold` over every log those campaigns captured, its JSON in `$OUT/<name>/`. To
+compare builds, pack each from a worktree of its commit and run them at once, one image each, so
+the host's load falls on all alike:
+
+    git worktree add ../wt-old <commit>
+    ROOT=../wt-old bench/havoc/pack.sh                   # bench-<stamp>-<commit>.tar
+
+    # on the host, per package (one OUT for all, so jmh sees every campaign's captures):
+    IMAGE=ce-bench:old BASE=ce-fuzz:latest ./run.sh build
+    OUT=~/data/bench-h1 IMAGE=ce-bench:old ./run.sh ingest h1-old h1-shapes.json
+    OUT=~/data/bench-h1 IMAGE=ce-bench:new ./run.sh jmh j1-new h1-new h1-old -- -p batch=64 \
+        -p committed=steady -f 1 -wi 3 -i 10
+
+A build's records are in its own format, so each campaign captures its own logs, and a newer
+build replays an older one's (a format change here only adds fields).

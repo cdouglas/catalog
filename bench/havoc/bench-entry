@@ -1,13 +1,30 @@
 #!/bin/sh
-# Runs the driver on one shard of a campaign: bench-entry <shard>/<shards> <configs...>
+# Runs one container of a campaign, by MAIN (default ContentionBench):
+#   ContentionBench  one shard of a contention campaign: bench-entry <shard>/<shards> <configs...>
+#   IngestBench      the ingest benchmark: bench-entry <configs...>
+#   jmh              JMH (IngestFoldBench, ReplayBench): bench-entry <JMH arguments...>, from /out,
+#                    with every campaign's results under /results
 # Env: HEAP (default 3g); CPUS (default 4), the container's CPU limit, which the JVM sizes its
 # pools to (the JVM may not see a rootless container's quota). Results go to /out.
 set -e
 . /app/provenance.env
 export FILEIO_GIT FILEIO_DIRTY
-shard=$1; shift
-exec java -Xmx"${HEAP:-3g}" -XX:+UseG1GC -XX:ActiveProcessorCount="${CPUS:-4}" \
-  -Diceberg.worker.num-threads=256 \
-  -Dorg.slf4j.simpleLogger.defaultLogLevel=error \
-  -cp "$(cat /app/classpath)" org.apache.iceberg.io.contention.ContentionBench \
-  --out /out --shard "$shard" "$@"
+run() {
+  exec java -Xmx"${HEAP:-3g}" -XX:+UseG1GC -XX:ActiveProcessorCount="${CPUS:-4}" \
+    -Diceberg.worker.num-threads=256 \
+    -Dorg.slf4j.simpleLogger.defaultLogLevel=error \
+    -cp "$(cat /app/classpath)" "$@"
+}
+case ${MAIN:-ContentionBench} in
+  ContentionBench)
+    shard=$1; shift
+    run org.apache.iceberg.io.contention.ContentionBench --out /out --shard "$shard" "$@" ;;
+  IngestBench)
+    run org.apache.iceberg.io.contention.IngestBench --out /out "$@" ;;
+  jmh)
+    cd /out
+    run org.openjdk.jmh.Main "$@" ;;
+  *)
+    echo "bench-entry: MAIN is ContentionBench, IngestBench or jmh: $MAIN" >&2
+    exit 2 ;;
+esac
