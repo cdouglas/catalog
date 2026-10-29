@@ -362,6 +362,9 @@ message TableMetadataUpdate {
   }
 }
 
+// A snapshot id a delta's update leaves out (AddManifestDelta,
+// RemoveManifestDelta and SetSnapshotRef's snapshot_id) is the delta's only
+// new snapshot: a delta that adds none or several states every one.
 message AddManifestDelta {
   fixed64            snapshot_id = 1;
   ManifestFileEntry  manifest    = 2;
@@ -379,7 +382,7 @@ message AddManifestDelta {
 // snapshot's list never changes), and a record whose parent the table no
 // longer has a list for does not apply there (SPEC_ML.md).
 message RemoveManifestDelta {
-  fixed64 snapshot_id             = 1;
+  fixed64 snapshot_id             = 1;  // absent: the delta's only new snapshot
   string manifest_path_suffix     = 2;
   repeated uint32 parent_indices  = 3;
 }
@@ -520,7 +523,7 @@ message CompactSummary {
 
 message SetSnapshotRef {
   string ref_name               = 1;
-  fixed64 snapshot_id           = 2;
+  fixed64 snapshot_id           = 2;  // absent: the delta's only new snapshot
   string ref_type               = 3;
   int32  min_snapshots_to_keep  = 4;
   int64  max_snapshot_age_ms    = 5;
@@ -631,6 +634,8 @@ message ManifestFileEntry {
   int32  content                = 4;   // 0=data, 1=deletes
   int64  sequence_number        = 5;
   int64  min_sequence_number    = 6;
+  // Absent: the manifest has none, but in an AddManifestDelta, where it is
+  // the delta update's snapshot (no_added_snapshot_id says it has none).
   fixed64 added_snapshot_id     = 7;
   int32  added_files_count      = 8;
   int32  existing_files_count   = 9;
@@ -646,6 +651,8 @@ message ManifestFileEntry {
   // True when the manifest has no partition summaries (null, as in a v1
   // manifest); absent for a list, which may be empty (an unpartitioned spec).
   bool   no_partitions          = 17;
+  // In an AddManifestDelta: true when the manifest has no added snapshot id.
+  bool   no_added_snapshot_id   = 18;
 }
 
 message PartitionFieldSummaryEntry {

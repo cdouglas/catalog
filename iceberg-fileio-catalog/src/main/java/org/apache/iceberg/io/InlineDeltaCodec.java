@@ -766,8 +766,9 @@ public class InlineDeltaCodec {
           writeVarint64(out, DELTA_BASE_NEXT_ROW_ID, base.nextRowId());
         }
       }
+      Long only = onlyNewSnapshot(updates);
       for (DeltaUpdate update : updates) {
-        byte[] updateBytes = encodeUpdate(update, base);
+        byte[] updateBytes = encodeUpdate(update, base, only);
         writeLengthDelimited(out, DELTA_UPDATES, updateBytes);
       }
       return out.toByteArray();
@@ -787,12 +788,13 @@ public class InlineDeltaCodec {
       Long lastUpdatedMillis = null;
       Long baseLastSequenceNumber = null;
       Long baseNextRowId = null;
+      List<byte[]> raw = new ArrayList<>();
       while (in.available() > 0) {
         int tag = readVarint(in);
         int fieldNumber = tag >>> 3;
         int wireType = tag & 0x7;
         if (fieldNumber == DELTA_UPDATES) {
-          updates.add(decodeUpdate(readLengthDelimitedBytes(in)));
+          raw.add(readLengthDelimitedBytes(in));
         } else if (fieldNumber == DELTA_LAST_UPDATED_MS) {
           lastUpdatedMillis = readVarint64(in);
         } else if (fieldNumber == DELTA_BASE_LAST_SEQUENCE_NUMBER) {
@@ -806,6 +808,23 @@ public class InlineDeltaCodec {
       if (lastUpdatedMillis == null) {
         throw new IllegalStateException(
             "Malformed TableMetadataDelta: required field 2 (last_updated_ms) missing");
+      }
+      // The snapshots first: an id the other updates leave out is the delta's only new snapshot's
+      DeltaUpdate[] decoded = new DeltaUpdate[raw.size()];
+      Long only = null;
+      int added = 0;
+      for (int i = 0; i < raw.size(); i++) {
+        if (updateType(raw.get(i)) == UPDATE_ADD_SNAPSHOT) {
+          decoded[i] = decodeUpdate(raw.get(i), null);
+          only = ((AddSnapshotUpdate) decoded[i]).snapshotId;
+          added++;
+        }
+      }
+      if (added != 1) {
+        only = null;
+      }
+      for (int i = 0; i < raw.size(); i++) {
+        updates.add(decoded[i] != null ? decoded[i] : decodeUpdate(raw.get(i), only));
       }
       return new DecodedDelta(updates, lastUpdatedMillis, baseLastSequenceNumber, baseNextRowId);
     } catch (IOException e) {
@@ -2041,11 +2060,31 @@ public class InlineDeltaCodec {
   // ============================================================
 
   /**
-   * Encodes {@code update}, of a delta from {@code base} (null: a delta of manifest updates only,
-   * which lands with full metadata). A new snapshot whose parent is in {@code base} states only the
-   * summary entries that differ from its parent's, where that is shorter.
+   * The id of the one snapshot {@code updates} add, which their other snapshot ids default to;
+   * null if they add none or several.
    */
-  private static byte[] encodeUpdate(DeltaUpdate update, TableMetadata base) throws IOException {
+  private static Long onlyNewSnapshot(List<DeltaUpdate> updates) {
+    Long only = null;
+    for (DeltaUpdate update : updates) {
+      if (update instanceof AddSnapshotUpdate) {
+        if (only != null) {
+          return null;
+        }
+        only = ((AddSnapshotUpdate) update).snapshotId;
+      }
+    }
+    return only;
+  }
+
+  /**
+   * Encodes {@code update}, of a delta from {@code base} (null: a delta of manifest updates only,
+   * which lands with full metadata) that adds the one snapshot {@code only} (null: none or
+   * several). A new snapshot whose parent is in {@code base} states only the summary entries that
+   * differ from its parent's, where that is shorter, and a snapshot id that is {@code only} is left
+   * out of a manifest update, a ref and an added manifest that names it.
+   */
+  private static byte[] encodeUpdate(DeltaUpdate update, TableMetadata base, Long only)
+      throws IOException {
     ByteArrayOutputStream out = new ByteArrayOutputStream();
 
     if (update instanceof SetPropertiesUpdate) {
@@ -2112,7 +2151,9 @@ public class InlineDeltaCodec {
       SetSnapshotRefUpdate u = (SetSnapshotRefUpdate) update;
       ByteArrayOutputStream inner = new ByteArrayOutputStream();
       writeString(inner, REF_NAME, u.refName);
-      writeFixed64(inner, REF_SNAPSHOT_ID, u.snapshotId);
+      if (only == null || u.snapshotId != only) {
+        writeFixed64(inner, REF_SNAPSHOT_ID, u.snapshotId);
+      }
       writeString(inner, REF_TYPE, u.refType);
       if (u.minSnapshotsToKeep > 0) {
         writeVarint(inner, REF_MIN_SNAPSHOTS, u.minSnapshotsToKeep);
@@ -2184,8 +2225,10 @@ public class InlineDeltaCodec {
     } else if (update instanceof AddManifestUpdate) {
       AddManifestUpdate u = (AddManifestUpdate) update;
       ByteArrayOutputStream inner = new ByteArrayOutputStream();
-      writeFixed64(inner, ADD_MF_SNAPSHOT_ID, u.snapshotId);
-      byte[] mfBytes = ProtoCodec.encodeManifestFileEntry(u.manifest, u.pathPrefix);
+      if (only == null || u.snapshotId != only) {
+        writeFixed64(inner, ADD_MF_SNAPSHOT_ID, u.snapshotId);
+      }
+      byte[] mfBytes = ProtoCodec.encodeManifestFileEntry(u.manifest, u.pathPrefix, u.snapshotId);
       writeLengthDelimited(inner, ADD_MF_MANIFEST, mfBytes);
       if (u.position != null) {
         writeVarint(inner, ADD_MF_POSITION, u.position);
@@ -2195,7 +2238,9 @@ public class InlineDeltaCodec {
     } else if (update instanceof RemoveManifestUpdate) {
       RemoveManifestUpdate u = (RemoveManifestUpdate) update;
       ByteArrayOutputStream inner = new ByteArrayOutputStream();
-      writeFixed64(inner, REMOVE_MF_SNAPSHOT_ID, u.snapshotId);
+      if (only == null || u.snapshotId != only) {
+        writeFixed64(inner, REMOVE_MF_SNAPSHOT_ID, u.snapshotId);
+      }
       if (u.manifestPathSuffix != null) {
         writeString(inner, REMOVE_MF_PATH_SUFFIX, u.manifestPathSuffix);
       }
@@ -2216,7 +2261,16 @@ public class InlineDeltaCodec {
   // Decoding
   // ============================================================
 
-  private static DeltaUpdate decodeUpdate(byte[] bytes) throws IOException {
+  /** The kind of the TableMetadataUpdate in {@code bytes}: the field number of its update. */
+  private static int updateType(byte[] bytes) throws IOException {
+    return readVarint(new ByteArrayInputStream(bytes)) >>> 3;
+  }
+
+  /**
+   * Decodes a TableMetadataUpdate of a delta that adds the one snapshot {@code only} (null: none
+   * or several), which a snapshot id the update leaves out is.
+   */
+  private static DeltaUpdate decodeUpdate(byte[] bytes, Long only) throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
     int tag = readVarint(in);
     int updateType = tag >>> 3;
@@ -2240,7 +2294,7 @@ public class InlineDeltaCodec {
       case UPDATE_SET_DEFAULT_SORT_ORDER:
         return decodeSetDefaultSortOrder(updateBytes);
       case UPDATE_SET_SNAPSHOT_REF:
-        return decodeSetSnapshotRef(updateBytes);
+        return decodeSetSnapshotRef(updateBytes, only);
       case UPDATE_REMOVE_SNAPSHOTS:
         return decodeRemoveSnapshots(updateBytes);
       case UPDATE_REMOVE_SCHEMAS:
@@ -2250,19 +2304,19 @@ public class InlineDeltaCodec {
       case UPDATE_ADD_SNAPSHOT:
         return decodeAddSnapshot(updateBytes);
       case UPDATE_ADD_MANIFEST:
-        return decodeAddManifest(updateBytes);
+        return decodeAddManifest(updateBytes, only);
       case UPDATE_REMOVE_MANIFEST:
-        return decodeRemoveManifest(updateBytes);
+        return decodeRemoveManifest(updateBytes, only);
       default:
         // Forward compatibility: skip unknown update types
         return builder -> {};
     }
   }
 
-  private static AddManifestUpdate decodeAddManifest(byte[] bytes) throws IOException {
+  private static AddManifestUpdate decodeAddManifest(byte[] bytes, Long only) throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
-    long snapshotId = 0;
-    ManifestFile manifest = null;
+    long snapshotId = only != null ? only : 0;
+    byte[] manifestBytes = null;
     Integer position = null;
 
     while (in.available() > 0) {
@@ -2273,8 +2327,7 @@ public class InlineDeltaCodec {
           snapshotId = readFixed64(in);
           break;
         case ADD_MF_MANIFEST:
-          // Decode with empty prefix; full path will be resolved by the caller
-          manifest = ProtoCodec.decodeManifestFileEntry(readLengthDelimitedBytes(in), "");
+          manifestBytes = readLengthDelimitedBytes(in);
           break;
         case ADD_MF_POSITION:
           position = readVarint(in);
@@ -2283,12 +2336,19 @@ public class InlineDeltaCodec {
           skipField(in, tag & 0x7);
       }
     }
+    // With an empty prefix: the caller resolves the full path. An added snapshot id it leaves out
+    // is the update's snapshot.
+    ManifestFile manifest =
+        manifestBytes != null
+            ? ProtoCodec.decodeManifestFileEntry(manifestBytes, "", snapshotId)
+            : null;
     return new AddManifestUpdate(snapshotId, manifest, "", position);
   }
 
-  private static RemoveManifestUpdate decodeRemoveManifest(byte[] bytes) throws IOException {
+  private static RemoveManifestUpdate decodeRemoveManifest(byte[] bytes, Long only)
+      throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
-    long snapshotId = 0;
+    long snapshotId = only != null ? only : 0;
     String pathSuffix = null;
     List<Integer> indices = null;
 
@@ -2499,10 +2559,11 @@ public class InlineDeltaCodec {
     return new SetDefaultSortOrderUpdate(orderId);
   }
 
-  private static SetSnapshotRefUpdate decodeSetSnapshotRef(byte[] bytes) throws IOException {
+  private static SetSnapshotRefUpdate decodeSetSnapshotRef(byte[] bytes, Long only)
+      throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
     String refName = "", refType = "branch";
-    long snapshotId = 0;
+    long snapshotId = only != null ? only : 0;
     int minKeep = 0;
     long maxSnapAge = 0, maxRefAge = 0;
     while (in.available() > 0) {

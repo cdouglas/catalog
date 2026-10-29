@@ -158,6 +158,7 @@ public class ProtoCodec {
   private static final int MF_KEY_METADATA = 15;
   private static final int MF_FIRST_ROW_ID = 16;
   private static final int MF_NO_PARTITIONS = 17; // present (true) when partitions is null
+  private static final int MF_NO_ADDED_SNAPSHOT_ID = 18; // where an absent id is implied
 
   // PartitionFieldSummaryEntry field numbers
   private static final int PFS_CONTAINS_NULL = 1;
@@ -1298,6 +1299,16 @@ public class ProtoCodec {
    */
   public static byte[] encodeManifestFileEntry(ManifestFile manifest, String pathPrefix)
       throws IOException {
+    return encodeManifestFileEntry(manifest, pathPrefix, null);
+  }
+
+  /**
+   * Encodes a ManifestFileEntry where an absent added snapshot id means {@code impliedSnapshotId}
+   * (an AddManifestDelta's snapshot; null where none is implied, as in the pool): the manifest's
+   * id is left out when it is that one, and a manifest with none says so (no_added_snapshot_id).
+   */
+  static byte[] encodeManifestFileEntry(
+      ManifestFile manifest, String pathPrefix, Long impliedSnapshotId) throws IOException {
     ByteArrayOutputStream out = new BytesOut();
 
     String suffix = manifest.path();
@@ -1318,7 +1329,11 @@ public class ProtoCodec {
     if (manifest.minSequenceNumber() != 0) {
       writeVarint64(out, MF_MIN_SEQ_NUM, manifest.minSequenceNumber());
     }
-    if (manifest.snapshotId() != null) {
+    if (manifest.snapshotId() == null) {
+      if (impliedSnapshotId != null) {
+        writeVarint(out, MF_NO_ADDED_SNAPSHOT_ID, 1);
+      }
+    } else if (!manifest.snapshotId().equals(impliedSnapshotId)) {
       writeFixed64(out, MF_SNAPSHOT_ID, manifest.snapshotId());
     }
     if (manifest.addedFilesCount() != null && manifest.addedFilesCount() != 0) {
@@ -1367,6 +1382,15 @@ public class ProtoCodec {
    */
   public static ManifestFile decodeManifestFileEntry(byte[] bytes, String pathPrefix)
       throws IOException {
+    return decodeManifestFileEntry(bytes, pathPrefix, null);
+  }
+
+  /**
+   * Decodes a ManifestFileEntry whose absent added snapshot id means {@code impliedSnapshotId}
+   * (see {@link #encodeManifestFileEntry(ManifestFile, String, Long)}).
+   */
+  static ManifestFile decodeManifestFileEntry(
+      byte[] bytes, String pathPrefix, Long impliedSnapshotId) throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
     String pathSuffix = "";
     long length = 0;
@@ -1374,7 +1398,7 @@ public class ProtoCodec {
     int content = 0;
     long seqNum = 0;
     long minSeqNum = 0;
-    Long snapshotId = null;
+    Long snapshotId = impliedSnapshotId;
     int addedFiles = 0;
     int existingFiles = 0;
     int deletedFiles = 0;
@@ -1441,6 +1465,11 @@ public class ProtoCodec {
           break;
         case MF_NO_PARTITIONS:
           noPartitions = readVarint(in) != 0;
+          break;
+        case MF_NO_ADDED_SNAPSHOT_ID:
+          if (readVarint(in) != 0) {
+            snapshotId = null;
+          }
           break;
         default:
           skipField(in, wireType);

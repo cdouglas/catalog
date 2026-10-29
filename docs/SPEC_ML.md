@@ -135,7 +135,11 @@ message RemoveManifestDelta {
 
 These are independent updates, not embedded in `AddSnapshot`. Each carries
 the snapshot ID it belongs to; in a TM delta it follows that snapshot's
-`AddSnapshot` (SPEC_TM). A new snapshot's list starts as its parent's
+`AddSnapshot` (SPEC_TM). A delta that adds one snapshot, nearly every delta,
+leaves its id out of them, of the refs it sets, and of the manifests it wrote
+(`ManifestFileEntry.added_snapshot_id`): an absent id is the delta's only new
+snapshot, and a manifest with no id says so (`no_added_snapshot_id`). A delta
+that adds several states every id. A new snapshot's list starts as its parent's
 inline list (empty for none). On apply:
 
 - `AddManifestDelta` adds `manifest` to the table's pool, replacing an
