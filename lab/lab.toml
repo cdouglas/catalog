@@ -14,7 +14,7 @@ name = "contention"
 kind = "manifest"
 root = "bench/results"
 glob = "*/*"
-exclude = ["builds/*", "ingest/*", "captures/*"]
+exclude = ["builds/*", "ingest/*", "captures/*", "anatomy/*"]
 id = "{label}-{config_hash}/{dir.name}"
 
 [runs.fields]
@@ -149,3 +149,27 @@ format = "jsonl"
 mode = "table"
 only_finished = true
 
+# Where a capture's record bytes go (docs/format-explorer/anatomy.mjs): every Nth record of a
+# capture's log decoded by the format explorer, writing bench/results/anatomy/<capture dir>/ with
+# manifest.json (the capture's label and config hash, which ingest runs promote as capture_hash;
+# record sizes over the sample) and fields.jsonl.
+[[runs]]
+name = "anatomy"
+kind = "manifest"
+root = "bench/results/anatomy"
+glob = "*"
+id = "anatomy/{dir.name}"
+
+[runs.fields]
+git_sha = "versions.fileio_git"
+git_dirty = "versions.fileio_dirty"
+
+# Per schema path of a leaf field (repeated fields' indices dropped): its bytes over the sampled
+# records (tag and length included), how often it occurred, and bytes per sampled record.
+[[facts]]
+name = "record_fields"
+runs = "anatomy"
+file = "fields.jsonl"
+format = "jsonl"
+mode = "table"
+only_finished = true

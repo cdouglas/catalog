@@ -131,6 +131,18 @@ to tables of one `FileIOCatalog` over an in-memory store whose requests take a p
   at the end of a window (2,000 records), so their slowest runs overran it (1,000 records/s
   prefilled, batch 1: 1,729 s for one window). Their windows are measured alike.
 
+## Record anatomy (source `anatomy`, fact `record_fields`, view `record_groups`)
+
+- One run per capture (`docs/format-explorer/anatomy.mjs`): every Nth record (`config.every`,
+  50 so far) decoded alone by the format explorer, bytes summed by leaf field's schema path, a
+  field's tag and length included in it. `count` is occurrences of the field; a map's entries are
+  split by key. Deterministic: rerunning over the same capture and format gives the same rows.
+- An anatomy run's `config_hash` is its capture's; ingest runs promote theirs as `capture_hash`.
+  The baseline's ingest runs name it `83601d8d3621` (the hash before new default keys changed it;
+  the capture is the same, `cap-i1-b26a3a9fc131`), so join the baseline by label.
+- A capture is in the format of the commit that captured it: after a format change, capture
+  again (and give the captures a new hash) before decoding or ingesting.
+
 ## Known runs
 
 - The p5 campaign (c1-c6, 2026-10-27, havoc, 8 shards of 4 CPUs) ran fileio-catalog 2afeb46 (its

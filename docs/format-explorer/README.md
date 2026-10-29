@@ -116,10 +116,23 @@ mvn test -Dtest=TestLocalCatalog -Dexplorer.dump=target/explorer-dump
 node docs/format-explorer/check.mjs target/explorer-dump # every file the suite wrote
 ```
 
+## Where record bytes go
+
+`anatomy.mjs` decodes every Nth record of a log the contention driver captured
+(`bench/results/captures/<label>-<hash>/log.bin`, `capture_log`) with the page's decoder and sums
+the bytes of each leaf field by its schema path, its tag and length included; a map's entries are
+split by key (`CompactSummary.extra{iceberg-version}`). It writes
+`bench/results/anatomy/<capture>/`, which the lab reads as the source `anatomy`.
+
+```bash
+node docs/format-explorer/anatomy.mjs --every 50 bench/results/captures/cap-i1-*
+```
+
 ## Files
 
 - `index.html`: the explorer (HTML, CSS, JS and the embedded fixtures)
 - `check.mjs`: the headless decoder check
+- `anatomy.mjs`: record bytes by field, over a captured log
 - `../../src/test/java/org/apache/iceberg/io/FormatExplorerFixtures.java`: the fixture generator
 - `../../src/test/java/org/apache/iceberg/io/TestFormatExplorer.java`: the drift and freshness checks
 - `../../src/test/java/org/apache/iceberg/io/CatalogProto.java`: the catalog.proto parser and
