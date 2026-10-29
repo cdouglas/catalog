@@ -157,5 +157,14 @@ to tables of one `FileIOCatalog` over an in-memory store whose requests take a p
   4e65a65 (100 ms backoff); tell the builds apart by `git_sha`. Both builds' runs are canonical:
   a page that reads the campaign must split them.
 
+- `i8-shapes` (2026-10-28, 1e86cf5) and `i9-format` (2026-10-29) ingest the same seven workloads,
+  i9's captured anew in the record format where a snapshot keeps its parent's summary entries and
+  names removed manifests by index (`capture_format` 2). i9's first ingests (dd84699) resolved a
+  summary's parent entries three times per snapshot and are superseded by a8bde7b's, on the same
+  captures. The two campaigns replay different logs (another capture of the same workload), and a
+  fold-only run lasts 1-4 s, so their fold rates differ by the log and the JIT as much as by the
+  code: compare replay across formats with JMH (IngestFoldBench), each code on its own capture.
+  Record bytes (source `anatomy`) and the runs with compactions compare directly.
+
 - `pilot-fa`, `pilot-mix` (2026-10-27) were pilots of the driver. The first `pilot-mix` runs gave
   fast appends the validated operations' 2 s runtime too; the runtime is per kind since.

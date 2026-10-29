@@ -61,23 +61,32 @@ records (builds it); a compaction encodes the state as a checkpoint.
 
 ## What a record holds
 
-The ingest benchmark's capture (`cap-i1`: 16 writers on 16 tables, 85% merge appends, 5% fast
-appends, 5% validated overwrites, 5% compactions, an expiry every 5 s keeping 100 snapshots),
-decoded by the format explorer, every 25th record of 93,154: a record is 733 B on average (p50
-470 B, p90 983 B, p99 8.9 KB).
+The ingest benchmark's baseline capture (`cap-i1`: 16 writers on 16 tables, 85% merge appends,
+5% fast appends, 5% validated overwrites, 5% compactions, an expiry every 5 s keeping 100
+snapshots), decoded by the format explorer (`format-explorer/anatomy.mjs`, every 50th record;
+lab source `anatomy`, page i8-shapes). Since records name what they keep of their parents
+(2026-10-29), a record is 333 B on average (p50 271 B, p90 628 B, p99 1.1 KB); before, it was
+744 B (p50 470 B, p99 8.9 KB), the largest being merges that named every manifest they removed.
 
-| Part | Bytes per record | Share |
-|---|---|---|
-| Snapshot summary entries outside `CompactSummary`'s fields (`extra`): `iceberg-version` (about 100 B, the same in every snapshot), `changed-partition-count`, `manifests-created`, `manifests-replaced`, ... | 213 | 29% |
-| The paths of the manifests a commit removes from its parent's list (`RemoveManifestDelta.manifest_path_suffix`) | 178 | 24% |
-| The paths of the manifests it adds (`ManifestFileEntry.manifest_path_suffix`) | 87 | 12% |
-| Snapshot ids, written again in each manifest update, ref and removal (and the snapshot's own and parent's) | 78 | 11% |
-| The record's id | 18 | 2% |
-| Everything else: summary counts, manifest counts and partition bounds, refs, footprints, framing | 159 | 22% |
+| Part | Bytes per record | Share | Before |
+|---|---|---|---|
+| The paths of the manifests it adds (`ManifestFileEntry.manifest_path_suffix`) | 88 | 26% | 87 |
+| Snapshot ids, written again in each manifest update and ref (and the snapshot's own and parent's) | 50 | 15% | 72 |
+| The other fields of the manifests it adds: counts, sequence numbers, partition bounds | 42 | 13% | 41 |
+| Summary counts (`CompactSummary`'s typed fields) | 37 | 11% | 26 |
+| The record's id and framing | 23 | 7% | 23 |
+| Summary entries beyond the counts (`extra`), now only those that differ from the parent's | 3 | 1% | 214 |
+| The manifests it removes from its parent's list (`RemoveManifestDelta`), now by index | 3 | 1% | 191 |
+| Everything else: refs, footprints, expiry's snapshot ids, update framing | 87 | 26% | 91 |
 
-Two thirds of a record name what the state or the record already holds: the summary's constant
-entries, a removed manifest (which is in the parent's list), a new manifest's path (Iceberg names
-manifests by a UUID and a counter, stored as text), and the snapshot's id.
+Before, two parts named what the state already held: the summary's entries that are the same in
+every snapshot (`iceberg-version` alone is ~110 B), and each removed manifest's path, which is in
+the parent's list. A snapshot now keeps its parent's extra entries (`inherits_parent_extra`,
+SPEC_TM.md "Summaries") and names what it removes by index in the parent's list
+(`parent_indices`, SPEC_ML.md). Across i8-shapes' seven workloads records shrank by 41% (fast
+appends only, 457 to 270 B) to 71% (one table, 1,226 to 351 B, where merges remove many
+manifests). What remains is mostly a new manifest's path, text where Iceberg writes a UUID and a
+counter, and the snapshot id repeated in each field that names it.
 
 ## What a checkpoint holds
 
@@ -147,7 +156,7 @@ Where an encode's time goes:
 
 | Part | Grows with | Cost now |
 |---|---|---|
-| A record | the commit's changes, plus a constant of summary text and paths | 733 B on average |
+| A record | the commit's changes, chiefly the paths of the manifests it adds | 333 B on average (744 B before records referred to their parents) |
 | The committed set | rate × retention | about 11 B per id |
 | A table's manifest pool | its live manifests | about 108 B per manifest |
 | A table's lists | its retained snapshots × manifests per list | about 134 B per snapshot here |
@@ -159,12 +168,15 @@ Where an encode's time goes:
 
 In order of what the measurements say each would save:
 
-- **Records** (the bytes every append and every read of the tail carries; two thirds of them, above):
-  - summary entries that are the same in every snapshot, sent once per table instead (29%);
-  - a removed manifest named by its index in the parent's list or a short hash of its path, not
-    its path (24%);
-  - manifest paths as Iceberg makes them, a 16-byte UUID and a counter, not text (12%);
-  - snapshot ids written once per record (11%).
+- **Records** (the bytes every append and every read of the tail carries):
+  - manifest paths as Iceberg makes them, a 16-byte UUID and a counter, not text (26%);
+  - snapshot ids written once per record (15%);
+  - done (2026-10-29): summary entries a snapshot shares with its parent, and removed manifests,
+    by index in the parent's list (together 55% of the baseline's bytes, above). Replaying the
+    new records costs 0-10% more per record (JMH IngestFoldBench on each of i8/i9's seven shapes,
+    each build on its own capture, steady set, batches of 64: -10% to +5%, mostly resolving a
+    snapshot's inherited entries); on records without parent references the new build is as fast
+    as the old.
 - **Checkpoints:**
   - the committed set paged out ([COMMITTED_PAGING.md](COMMITTED_PAGING.md)): 20 MB to 1-4 MB at
     1,000 records/s;
