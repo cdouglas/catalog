@@ -120,7 +120,65 @@ checkpoint that named the last record it holds (its position, or its id)
 would let a read check that the records after it start where it ends.
 
 **Trigger to revisit:** a provider that `SharedLogContract` does not cover,
-or a production shared log.
+or a production shared log. S5 makes the format check the joint.
+
+### S5. A read's continuity is the store's word, not the format's
+
+The log's invariant is one total order of records with no gaps: a read is a
+checkpoint and a prefix of the records after it (P1, LOG.md). The runtime
+relies on the provider for it and checks nothing. No record says what it
+follows, and no checkpoint says where it ends (S4). The providers give it
+physically only while each read sees one version of the log. ADLS and GCS
+read by version, and the in-memory providers do; the fork's S3 reads do not
+(T6). An S3 read is a ranged GET with no `If-Match`, reopened mid-stream by
+another, so a read that races a replace can return the start of one object
+and the rest of another.
+
+Commits are safe regardless. Every write is conditioned on the version its
+read bound to (P4), so a commit staged on such a view fails. But a reader that
+never writes (a load, a scan's planning) takes the view for the log. A splice
+at a frame boundary decodes: an old checkpoint followed by records written
+after a newer one, a state the log never held. Pinning S3's reads to the ETag
+the probe saw restores the invariant for whole reads, but not for the reads
+the format should allow:
+
+- **A tail read** (D15). An append changes the object's ETag, so a read pinned
+  to the ETag a reader holds fails after any append. One pinned to the new
+  ETag shows that the tail comes from one object, not that the object extends
+  the prefix the reader holds: a replace can grow past it.
+- **A shared log's checkpoints** (S4), which reach a reader apart from the
+  records after them, joined only by the provider.
+
+So the format should carry the invariant, and detect a gap or a splice where
+the log cannot rule one out:
+
+- Each record names what it follows: the incarnation of the log it extends
+  (D15's incarnation id) and its predecessor (its position, or a digest of the
+  record before it). Replay checks each record against the one before, and a
+  gap or a splice fails the read rather than applying.
+- Each checkpoint names the last record it covers (S4), and a read checks
+  that its records start where its checkpoint ends.
+- What a record's writer cannot know before it lands (its position, and on a
+  shared log that orders appends itself, its predecessor) the log
+  implementation adds in the envelope at append, as part of the SPI's
+  contract: an obligation beside P1-P6, checked by `SharedLogContract`. On one
+  object the writer knows both, since its append is conditioned on the exact
+  version and offset it extends.
+
+The models should say the same. `RSM.tla`, `CatalogCommit.tla` and
+`SharedLogCommit.tla` model a read as a prefix of the log. They need reads
+that skip or splice (a store misbehaving within what S3 allows), an oracle
+that no replica holds a state the log never held, and a bug switch per check
+the format adds. In Java, a fuzzer mode of `InMemoryAtomicFileIO` whose bound
+read returns the live generation or splices two (T6), and a shared-log harness
+that serves a gap.
+
+The cost is a few bytes a frame: an 8-byte incarnation id and a varint
+position (or a truncated digest), about 3% of a 330-byte record.
+
+**Trigger to revisit:** a dedicated task, before relying on S3 in production,
+before tail reads (D15), or before a production shared log (S4). It takes over
+the format half of D15 and the checks S4 and T6 ask for.
 
 ## Deferred Functionality
 
@@ -653,7 +711,8 @@ random offset. `InMemoryAtomicFileIO`'s doc also says S3 reads with
 do not.
 
 **Trigger to revisit:** before relying on S3 (general purpose or Express)
-in production, or when D15's ranged reads are built.
+in production, or when D15's ranged reads are built. S5 is the fix: the format
+detects a spliced or gapped read, whatever the store returns.
 
 ## Known Unknowns
 
