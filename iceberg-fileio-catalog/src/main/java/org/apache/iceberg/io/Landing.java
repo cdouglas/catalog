@@ -151,8 +151,10 @@ final class Landing {
             : 0L;
     Map<Long, Long> parents = new HashMap<>();
     Map<Long, Map<String, String>> summaries = new HashMap<>();
+    Map<Long, Map<String, String>> own = new HashMap<>();
     for (AddSnapshotUpdate add : adds.values()) {
       Map<String, String> summary = add.summary(table);
+      own.put(add.snapshotId, summary);
       if (add.inheritsParentExtra && summary != null) {
         summaries.put(add.snapshotId, summary);
       }
@@ -160,7 +162,7 @@ final class Landing {
     Map<Long, String> branches = stale ? branches(delta, adds, table) : null;
     if (branches != null) {
       for (AddSnapshotUpdate add : adds.values()) {
-        Map<String, String> summary = add.summary(table);
+        Map<String, String> summary = own.get(add.snapshotId);
         if (summary == null) {
           continue; // its parent is gone, so it cannot land here (unresolved)
         }
@@ -207,7 +209,8 @@ final class Landing {
     Map<Long, AddSnapshotUpdate> adds = adds(delta);
     for (AddSnapshotUpdate add : adds.values()) {
       if (add.inheritsParentExtra
-          && (adds.containsKey(add.parentSnapshotId) || add.summary(table) == null)) {
+          && (add.parentSnapshotId == null || adds.containsKey(add.parentSnapshotId)
+              || table.snapshot(add.parentSnapshotId) == null)) {
         return "the parent whose summary entries its snapshot takes is gone";
       }
     }

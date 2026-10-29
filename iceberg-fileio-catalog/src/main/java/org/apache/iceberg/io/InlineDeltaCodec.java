@@ -1686,6 +1686,9 @@ public class InlineDeltaCodec {
     public final boolean inheritsParentExtra;
     /** The parent's extra entries the summary does not have. */
     public final List<String> droppedExtra;
+    // The summary with its parent's extra entries, made once: a snapshot's summary never changes,
+    // so it is the same on every version of the table that has the parent
+    private volatile Map<String, String> withParentExtra;
     public final long timestampDeltaMs;
     // Optional fields. Absent values:
     //   schemaId == null          -> base.currentSchemaId() (schema 0 included when present)
@@ -1803,14 +1806,21 @@ public class InlineDeltaCodec {
       if (parent == null) {
         return null;
       }
-      Map<String, String> resolved = new HashMap<>(summary);
-      Map<String, String> parentSummary = parent.summary() != null ? parent.summary() : Map.of();
-      // In key order, so every replica builds the same map whatever order its parent's has
-      for (String key : new java.util.TreeSet<>(parentSummary.keySet())) {
-        String value = parentSummary.get(key);
-        if (inheritable(key, value) && !droppedExtra.contains(key) && !resolved.containsKey(key)) {
-          resolved.put(key, value);
+      Map<String, String> resolved = withParentExtra;
+      if (resolved == null) {
+        resolved = new HashMap<>(summary);
+        Map<String, String> parentSummary = parent.summary() != null ? parent.summary() : Map.of();
+        // In key order, so every replica builds the same map whatever order its parent's has
+        String[] keys = parentSummary.keySet().toArray(new String[0]);
+        Arrays.sort(keys);
+        for (String key : keys) {
+          String value = parentSummary.get(key);
+          if (inheritable(key, value) && !droppedExtra.contains(key)
+              && !resolved.containsKey(key)) {
+            resolved.put(key, value);
+          }
         }
+        withParentExtra = resolved;
       }
       return resolved;
     }
@@ -2737,8 +2747,8 @@ public class InlineDeltaCodec {
 
   /** The summary's counts CompactSummary's typed fields hold: each key's field number. */
   private static final Map<String, Integer> SUMMARY_COUNTS = new LinkedHashMap<>();
-  /** The key of each typed count's field number. */
-  private static final Map<Integer, String> SUMMARY_COUNT_KEYS = new HashMap<>();
+  /** The key of each typed count, by its field number. */
+  private static final String[] SUMMARY_COUNT_KEYS = new String[CS_DROPPED_EXTRA + 1];
 
   static {
     SUMMARY_COUNTS.put("added-data-files", CS_ADDED_DATA_FILES);
@@ -2770,7 +2780,7 @@ public class InlineDeltaCodec {
     SUMMARY_COUNTS.put("removed-equality-delete-files", CS_REMOVED_EQUALITY_DELETE_FILES);
     SUMMARY_COUNTS.put("added-dvs", CS_ADDED_DVS);
     SUMMARY_COUNTS.put("removed-dvs", CS_REMOVED_DVS);
-    SUMMARY_COUNTS.forEach((key, field) -> SUMMARY_COUNT_KEYS.put(field, key));
+    SUMMARY_COUNTS.forEach((key, field) -> SUMMARY_COUNT_KEYS[field] = key);
   }
 
   /** A summary as CompactSummary holds it: its stated entries, and what it takes of its parent's. */
@@ -2805,15 +2815,36 @@ public class InlineDeltaCodec {
 
   /** {@code value} as a number if it is one written plainly ("7", not "07" or "+7"); else null. */
   private static Long plainNumber(String value) {
-    if (value == null) {
+    if (!plain(value)) {
       return null;
     }
     try {
-      long v = Long.parseLong(value);
-      return String.valueOf(v).equals(value) ? v : null;
+      return Long.parseLong(value);
     } catch (NumberFormatException e) {
-      return null;
+      return null; // out of range
     }
+  }
+
+  /** Whether {@code value} is written as Long.toString writes a number, if it is one. */
+  private static boolean plain(String value) {
+    if (value == null || value.isEmpty()) {
+      return false;
+    }
+    int start = value.charAt(0) == '-' ? 1 : 0;
+    int length = value.length();
+    if (start == length || length - start > 19) {
+      return false;
+    }
+    if (value.charAt(start) == '0' && (length - start > 1 || start == 1)) {
+      return false; // "07", "-0"
+    }
+    for (int i = start; i < length; i++) {
+      char c = value.charAt(i);
+      if (c < '0' || c > '9') {
+        return false;
+      }
+    }
+    return true;
   }
 
   /**
@@ -2903,7 +2934,7 @@ public class InlineDeltaCodec {
     while (in.available() > 0) {
       int tag = readVarint(in);
       int fn = tag >>> 3;
-      String count = SUMMARY_COUNT_KEYS.get(fn);
+      String count = fn > 0 && fn < SUMMARY_COUNT_KEYS.length ? SUMMARY_COUNT_KEYS[fn] : null;
       if (count != null) {
         summary.put(count, String.valueOf(readVarint64(in)));
         continue;
