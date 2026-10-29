@@ -71,8 +71,7 @@ message InlineTable {
 }
 
 message ManifestFileEntry {
-  string  manifest_path_suffix   = 1;   // relative to table.manifest_list_prefix
-                                        //   (always "": the full path)
+  string  manifest_path          = 1;   // the path whole, unless 19-20 name it
   int64   manifest_length        = 2;
   int32   partition_spec_id      = 3;
   int32   content                = 4;   // 0 = data, 1 = deletes
@@ -89,6 +88,9 @@ message ManifestFileEntry {
   bytes   key_metadata           = 15;
   int64   first_row_id           = 16;  // present whenever set, 0 included
   bool    no_partitions          = 17;  // partitions is null, not an empty list
+  bool    no_added_snapshot_id   = 18;  // in a delta: the manifest has none
+  bytes   manifest_uuid          = 19;  // <manifest_prefix><uuid>-m<number>.avro
+  int64   manifest_number        = 20;  //   (SPEC_TM.md, field 6)
 }
 
 message PartitionFieldSummaryEntry {

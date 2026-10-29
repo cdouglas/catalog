@@ -109,7 +109,8 @@ final class NativeDelta {
     if (prefix == null) {
       prefix = "";
     }
-    TableFields current = applyTable(base, delta, landing, prefix, baseLocation);
+    // A delta writes manifest lists' paths whole; its manifests' names resolve under the prefix
+    TableFields current = applyTable(base, delta, landing, "", baseLocation);
 
     // The manifest updates, as InlineDeltaCodec.applyDelta replays them: each new inline-ML
     // snapshot's list starts as its parent's, then takes the manifests the delta adds and removes

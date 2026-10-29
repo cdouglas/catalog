@@ -199,13 +199,18 @@ final class Landing {
 
   /**
    * Why {@code delta} cannot replay on {@code table}, any version of the table, its base included,
-   * or null if it can: what it names by reference to its new snapshots' parents is not there. A
+   * or null if it can: what it names by reference is not there. Its manifests' names are under
+   * the manifest prefix of the table its writer read (DecodedDelta#unresolvedNames). A
    * new snapshot may take its parent's extra summary entries, and name the manifests it removes by
    * their indices in its parent's list ({@code builder}'s lists of {@code tableId}): the parent its
    * writer read, which a delta on its base finds there, while a later version may have expired it.
    */
   static String unresolved(
       DecodedDelta delta, MetadataView table, CatalogState.Builder builder, int tableId) {
+    String names = delta.unresolvedNames(builder.manifestListPrefix(tableId));
+    if (names != null) {
+      return names;
+    }
     Map<Long, AddSnapshotUpdate> adds = adds(delta);
     for (AddSnapshotUpdate add : adds.values()) {
       if (add.inheritsParentExtra

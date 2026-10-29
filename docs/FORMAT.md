@@ -35,7 +35,7 @@ LogCheckpoint                                  log.proto
     Table                                      a pointer table: its metadata file's location
     InlineTable                                an inline table:
       metadata                                   TableMetadata, structural codec (gzip at its fastest level)
-      manifest_list_prefix, manifest_pool        every manifest its snapshots list, once each
+      manifest_prefix, manifest_pool             every manifest its snapshots list, once each
       snapshot_refs                              per snapshot, its list as indices into the pool
       conflict_state                             what the catalog's encoding keeps of the table
     conflict_encoding

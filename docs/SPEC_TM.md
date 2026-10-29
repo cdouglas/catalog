@@ -41,7 +41,8 @@ message InlineTable {
   string name                 = 4;
   bytes  metadata             = 5;  // codec-encoded TableMetadata; codec
                                     //   identified by `metadata_codec`
-  string manifest_list_prefix = 6;  // per-table path dictionary; always ""
+  string manifest_prefix      = 6;  // per-table path dictionary: the
+                                    //   metadata directory (see below)
   repeated ManifestFileEntry     manifest_pool  = 7;  // see SPEC_ML.md
   repeated SnapshotManifestRefs  snapshot_refs  = 8;  // see SPEC_ML.md
   InlineMetadataCodec metadata_codec = 9;  // required, 0 included (see
@@ -60,11 +61,19 @@ catalog file. Storing the bytes opaque keeps the catalog codec decoupled
 from `TableMetadataParser`.
 
 Fields 7–8 belong to the manifest-list extension (see SPEC_ML.md).
-Field 6, `manifest_list_prefix`, is a per-table dictionary entry
-reserved for a path prefix that `AddSnapshot.manifest_list_suffix` and
-`ManifestFileEntry.manifest_path_suffix` are relative to. Nothing sets
-one: a create and a table that returns to inline storage get the empty
-prefix, and a checkpoint copies it, so every suffix is a full path.
+Field 6, `manifest_prefix`, is a per-table dictionary entry: the table's
+metadata directory (its `write.metadata.path`, or its location's `metadata/`
+folder) when it went inline, a create or a return from pointer storage,
+which replay derives from the metadata (empty if it does not decode) and a
+checkpoint copies. A manifest `SnapshotProducer` named under it
+(`<commit UUID>-m<N>.avro`) is written as the UUID's 16 bytes and N
+(`ManifestFileEntry.manifest_uuid`, `manifest_number`), in the table's pool
+and in its deltas; any other path is written whole (`manifest_path`). A
+delta that names a manifest so states the digest of the prefix it is under
+(`TableMetadataDelta.manifest_prefix_digest`), and does not apply where the
+table's prefix differs: a table that left inline storage and returned under
+another location. A manifest list's path (`AddSnapshot.manifest_list`) is
+written whole.
 
 ### Inline-TM codecs
 
@@ -243,9 +252,8 @@ derives from the base metadata are not transmitted.
 ```protobuf
 message AddSnapshot {
   fixed64        snapshot_id          = 1;
-  string         manifest_list_suffix = 2;   // path less the per-table prefix
-                                             // (always "": the full path);
-                                             // empty for inline-ML snapshots
+  string         manifest_list        = 2;   // the path, whole; empty for
+                                             // inline-ML snapshots
   CompactSummary summary              = 3;   // typed summary (replaces map)
   sint64         timestamp_delta_ms   = 4;   // signed delta from the delta's
                                              // last_updated_ms
@@ -305,7 +313,7 @@ delta's k-th new snapshot (k = 1, 2, ...):
 |----------------------|---------------------------------------------------|
 | `sequence_number`    | `base.lastSequenceNumber + k` (0 for v1)          |
 | `timestamp_ms`       | `delta.last_updated_ms + timestamp_delta_ms`      |
-| `manifest_list`      | `table.manifestListPrefix + manifest_list_suffix`; `inline://<snapshotId>` if the suffix is empty |
+| `manifest_list`      | `manifest_list`; `inline://<snapshotId>` if it is empty |
 | `schema_id`          | `base.currentSchemaId` (if field 5 absent)        |
 
 `base` is the table where the delta lands: the metadata the delta was

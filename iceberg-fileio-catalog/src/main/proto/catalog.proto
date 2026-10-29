@@ -159,7 +159,10 @@ message InlineTable {
   int32  namespace_id         = 3;
   string name                 = 4;
   bytes  metadata             = 5;  // encoded TableMetadata bytes; see metadata_codec
-  string manifest_list_prefix = 6;  // per-table dictionary: shared manifest file path prefix
+  // The table's metadata directory when it went inline (its
+  // write.metadata.path, or its location's metadata folder): the dictionary
+  // entry its manifests' names are under (ManifestFileEntry).
+  string manifest_prefix      = 6;
   repeated ManifestFileEntry manifest_pool       = 7;  // unique manifests for this table, by path
   repeated SnapshotManifestRefs snapshot_refs    = 8;  // per-snapshot index lists into pool, by snapshot id
   InlineMetadataCodec metadata_codec             = 9;  // codec for `metadata`
@@ -340,6 +343,11 @@ message TableMetadataDelta {
   // manifest updates only (CreateTableInline.delta, UpdateTableInline.ml_delta).
   int64 base_last_sequence_number = 3;
   int64 base_next_row_id = 4;
+  // The CRC-32 of the manifest prefix of the table the writer read, when a
+  // manifest it adds is named under it: replay resolves the names under the
+  // prefix of the table where the record lands, which must be the same (a
+  // table that left inline storage and returned may have another).
+  fixed32 manifest_prefix_digest = 5;
 }
 
 message TableMetadataUpdate {
@@ -389,7 +397,7 @@ message RemoveManifestDelta {
 
 message AddSnapshot {
   fixed64        snapshot_id            = 1;
-  string         manifest_list_suffix   = 2;
+  string         manifest_list          = 2;   // its manifest list's path, whole; empty: inline
   CompactSummary summary                = 3;
   // The snapshot's timestamp less the delta's last_updated_ms.
   sint64         timestamp_delta_ms     = 4;
@@ -627,8 +635,11 @@ message SetTableLocation {
 // Manifest list inline support
 // ============================================================
 
+// A manifest: its path whole (manifest_path), or a name SnapshotProducer
+// made (<commit UUID>-m<N>.avro) under its table's manifest prefix
+// (InlineTable.manifest_prefix) as manifest_uuid and manifest_number.
 message ManifestFileEntry {
-  string manifest_path_suffix   = 1;
+  string manifest_path          = 1;
   int64  manifest_length        = 2;
   int32  partition_spec_id      = 3;
   int32  content                = 4;   // 0=data, 1=deletes
@@ -653,6 +664,8 @@ message ManifestFileEntry {
   bool   no_partitions          = 17;
   // In an AddManifestDelta: true when the manifest has no added snapshot id.
   bool   no_added_snapshot_id   = 18;
+  bytes  manifest_uuid          = 19;  // 16 bytes
+  int64  manifest_number        = 20;
 }
 
 message PartitionFieldSummaryEntry {

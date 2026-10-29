@@ -249,6 +249,50 @@ class TestParentReferences {
     assertThat(reload(io).currentSnapshot().snapshotId()).isEqualTo(head);
   }
 
+  /** A writer names the manifests it adds under its table's manifest prefix. */
+  @Test
+  void aWritersRecordsNameManifestsUnderTheTablesPrefix() throws IOException {
+    InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+    Table table = twoAppends(io);
+    CatalogState state = CatalogTestSupport.log(io, "mem:///w/catalog-c").read().state();
+    String prefix = state.manifestListPrefix(state.tableId(id));
+    assertThat(prefix).isEqualTo(table.location() + "/metadata/");
+
+    List<List<DeltaUpdate>> deltas = deltas(io);
+    List<DeltaUpdate> last = deltas.get(deltas.size() - 1);
+    assertThat(last)
+        .filteredOn(InlineDeltaCodec.AddManifestUpdate.class::isInstance)
+        .map(u -> ((InlineDeltaCodec.AddManifestUpdate) u).manifest)
+        .isNotEmpty()
+        .allMatch(m -> ((ProtoCodec.DecodedManifestFile) m).relative() && !m.path().contains("/"));
+    assertThat(paths(reload(io).currentSnapshot().allManifests(table.io())))
+        .isEqualTo(paths(table.currentSnapshot().allManifests(table.io())))
+        .allMatch(path -> path.startsWith(prefix));
+  }
+
+  /** A delta whose manifests' names are under another prefix than the table's does not apply. */
+  @Test
+  void aRecordNamingManifestsUnderAnotherPrefixIsRefused() {
+    InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+    Table table = twoAppends(io);
+    TableMetadata base = ((HasTableOperations) table).operations().current();
+    long head = base.currentSnapshot().snapshotId();
+    String elsewhere = "mem:///elsewhere/metadata/";
+    ManifestFile named = new TestProtoActions.TestManifestFile(
+        elsewhere + "0b1e9a6c-2f3d-4e5f-8a9b-0c1d2e3f4a5b-m0.avro", 100L, 0,
+        org.apache.iceberg.ManifestContent.DATA, 0L, 0L, 33L, 1, 0, 0, 1L, 0L, 0L,
+        List.of(), null, null);
+
+    assertThatThrownBy(
+            () ->
+                commit(io, base, List.of(
+                    add(33L, head, false),
+                    new SetSnapshotRefUpdate("main", 33L, "branch", 0, 0L, 0L),
+                    new InlineDeltaCodec.AddManifestUpdate(33L, named, elsewhere, 0))))
+        .isInstanceOf(CommitFailedException.class);
+    assertThat(reload(io).currentSnapshot().snapshotId()).isEqualTo(head);
+  }
+
   /** A new inline-ML snapshot {@code snapshotId}, a child of {@code parentId}. */
   private static AddSnapshotUpdate add(long snapshotId, long parentId, boolean inherits) {
     Map<String, String> summary = new HashMap<>();

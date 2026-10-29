@@ -844,9 +844,8 @@ public class FormatExplorerFixtures {
   private static byte[] writerDelta(
       Replica<CatalogState> snapshot, TableIdentifier table, TableMetadata after) {
     TableMetadata before = inlineMetadata(snapshot.state(), table);
-    List<InlineDeltaCodec.DeltaUpdate> delta =
-        InlineDeltaCodec.computeDelta(before, after, snapshot.state().manifestListPrefix(
-            snapshot.state().tableId(table)));
+    // A writer sends manifest lists' paths whole (LogCatalog.stageUpdate)
+    List<InlineDeltaCodec.DeltaUpdate> delta = InlineDeltaCodec.computeDelta(before, after, "");
     if (delta == null) {
       throw new AssertionError("computeDelta sends " + table + "'s commit in full mode");
     }

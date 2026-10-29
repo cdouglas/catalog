@@ -148,7 +148,7 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
       };
 
   /** 16-byte canonical UUID-as-bytes used inside templated path entries. */
-  private static final int UUID_BYTES = 16;
+  private static final int UUID_BYTES = IcebergPaths.UUID_BYTES;
 
   /** Sentinel for "absolute parent" in the parent_offset column. */
   private static final long ABSOLUTE_PARENT_SENTINEL = 0xFFFFFFFFL;
@@ -387,7 +387,7 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
         templated = false;
         break;
       }
-      byte[] uuidBytes = parseUuidBytes(mid.substring(dash + 1));
+      byte[] uuidBytes = IcebergPaths.uuidBytes(mid.substring(dash + 1));
       if (uuidBytes == null) {
         templated = false;
         break;
@@ -485,7 +485,7 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
         templated = false;
         break;
       }
-      byte[] uuidBytes = parseUuidBytes(uuidStr);
+      byte[] uuidBytes = IcebergPaths.uuidBytes(uuidStr);
       if (uuidBytes == null) {
         templated = false;
         break;
@@ -499,7 +499,7 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
       templated =
           paths[i].equals(
               p.commonPrefix + snaps.get(i).snapshotId() + "-" + nParts[i] + "-"
-                  + formatUuid(uuids[i]) + p.commonSuffix);
+                  + IcebergPaths.uuid(uuids[i]) + p.commonSuffix);
     }
     if (templated) {
       p.mode = 0;
@@ -526,7 +526,8 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
     for (int pad = digits.length(); pad < width; pad++) {
       path.append('0');
     }
-    return path.append(digits).append('-').append(formatUuid(uuid)).append(suffix).toString();
+    return path.append(digits).append('-').append(IcebergPaths.uuid(uuid)).append(suffix)
+        .toString();
   }
 
   private static String stripTrailingDigits(String s) {
@@ -568,42 +569,6 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
       if (suffixLen == 0) break;
     }
     return first.substring(firstLen - suffixLen);
-  }
-
-  private static byte[] parseUuidBytes(String s) {
-    if (s == null || s.length() != 36) return null;
-    if (s.charAt(8) != '-' || s.charAt(13) != '-' || s.charAt(18) != '-' || s.charAt(23) != '-') {
-      return null;
-    }
-    byte[] out = new byte[UUID_BYTES];
-    int p = 0;
-    for (int i = 0; i < 36; i++) {
-      char c = s.charAt(i);
-      if (c == '-') continue;
-      int hi = hexVal(c);
-      char c2 = s.charAt(++i);
-      int lo = hexVal(c2);
-      if (hi < 0 || lo < 0) return null;
-      out[p++] = (byte) ((hi << 4) | lo);
-    }
-    return out;
-  }
-
-  private static String formatUuid(byte[] u) {
-    StringBuilder sb = new StringBuilder(36);
-    for (int i = 0; i < UUID_BYTES; i++) {
-      if (i == 4 || i == 6 || i == 8 || i == 10) sb.append('-');
-      sb.append(Character.forDigit((u[i] >> 4) & 0xF, 16));
-      sb.append(Character.forDigit(u[i] & 0xF, 16));
-    }
-    return sb.toString();
-  }
-
-  private static int hexVal(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
   }
 
   // ---------------------------------------------------------------------------
@@ -1039,7 +1004,7 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
           + "-"
           + d.nParts[i]
           + "-"
-          + formatUuid(d.uuids[i])
+          + IcebergPaths.uuid(d.uuids[i])
           + d.pathSuffix;
     }
     return d.pathPrefix + d.middles[i] + d.pathSuffix;

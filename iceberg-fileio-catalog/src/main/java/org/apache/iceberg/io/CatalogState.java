@@ -270,6 +270,23 @@ public class CatalogState {
   }
 
   /** Returns the manifest list prefix for the given inline table, or null. */
+  /**
+   * The manifest prefix an inline table gets when it goes inline (a create, or a return from
+   * pointer storage): its metadata directory, which its manifests' names are relative to until
+   * it leaves inline storage. A function of its metadata, so every replica gives the same.
+   */
+  static String manifestPrefix(InlineTable table) {
+    TableFields fields;
+    try {
+      fields = table.fields();
+    } catch (RuntimeException e) {
+      // Replay never throws on a record's metadata, which only a load reads: a table whose
+      // metadata does not decode gets the empty prefix, under which no name is written
+      return "";
+    }
+    return IcebergPaths.metadataDirectory(fields.location, fields.properties());
+  }
+
   public String manifestListPrefix(int tblId) {
     return tblManifestPrefix.get(tblId);
   }
@@ -639,7 +656,8 @@ public class CatalogState {
     /**
      * Updates inline metadata and version, recording the codec used to encode
      * {@code metadata}. Preserves the manifest pool. A table that returns to
-     * inline storage gets the empty manifest list prefix, as a created one does.
+     * inline storage gets its metadata directory as its manifest prefix, as a
+     * created one does ({@link CatalogState#manifestPrefix}).
      */
     public Builder updateInlineMetadata(int id, int newVersion, byte[] metadata, byte codec) {
       return updateInlineTable(id, newVersion, InlineTable.ofBytes(metadata, codec));
@@ -648,7 +666,7 @@ public class CatalogState {
     /** As {@link #updateInlineMetadata}, with the table's metadata as replay keeps it. */
     Builder updateInlineTable(int id, int newVersion, InlineTable table) {
       tblInlineMetadata.put(id, table);
-      tblManifestPrefix.putIfAbsent(id, "");
+      tblManifestPrefix.computeIfAbsent(id, k -> manifestPrefix(table));
       TblEntry old = tableById.get(id);
       if (old != null) {
         tableById.put(id, new TblEntry(old.namespaceId, old.name, newVersion, null));

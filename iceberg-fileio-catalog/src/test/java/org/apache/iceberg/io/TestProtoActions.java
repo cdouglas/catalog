@@ -1947,9 +1947,10 @@ public class TestProtoActions {
     }
 
     @Test
-    void pathPrefixStrippingAndRestore() throws Exception {
+    void aManifestNamedUnderThePrefixIsItsUuidAndNumber() throws Exception {
       String prefix = "gs://my-bucket/warehouse/db/tbl/metadata/";
-      String fullPath = prefix + "a1b2c3-m0.avro";
+      String name = "0b1e9a6c-2f3d-4e5f-8a9b-0c1d2e3f4a5b-m12.avro";
+      String fullPath = prefix + name;
 
       org.apache.iceberg.ManifestFile original = new TestManifestFile(
           fullPath, 512L, 0,
@@ -1963,11 +1964,23 @@ public class TestProtoActions {
           ProtoCodec.decodeManifestFileEntry(encoded, prefix);
 
       assertThat(decoded.path()).isEqualTo(fullPath);
+      // the 16-byte UUID and the number, not the text
+      assertThat(new String(encoded, java.nio.charset.StandardCharsets.ISO_8859_1))
+          .doesNotContain("avro");
+      assertThat(encoded.length)
+          .isLessThan(ProtoCodec.encodeManifestFileEntry(original, "").length - fullPath.length()
+              + 25);
 
-      // Verify the suffix was actually stripped (encoded bytes should be smaller)
-      org.apache.iceberg.ManifestFile decodedNoPrefix =
-          ProtoCodec.decodeManifestFileEntry(encoded, "");
-      assertThat(decodedNoPrefix.path()).isEqualTo("a1b2c3-m0.avro");
+      // a name SnapshotProducer did not make, or one outside the prefix, is written whole
+      for (String path : List.of(prefix + "a1b2c3-m0.avro", "gs://elsewhere/" + name,
+          prefix + name.toUpperCase(java.util.Locale.ROOT), prefix + name.replace("m12", "m012"))) {
+        org.apache.iceberg.ManifestFile other = new TestManifestFile(
+            path, 512L, 0, org.apache.iceberg.ManifestContent.DATA, 1L, 1L, 1L,
+            1, 0, 0, 10L, 0L, 0L, null, null, null);
+        assertThat(ProtoCodec.decodeManifestFileEntry(
+                ProtoCodec.encodeManifestFileEntry(other, prefix), prefix).path())
+            .isEqualTo(path);
+      }
     }
 
     @Test

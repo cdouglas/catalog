@@ -66,6 +66,7 @@ public class InlineDeltaCodec {
   private static final int WIRE_VARINT = 0;
   private static final int WIRE_64BIT = 1;
   private static final int WIRE_LENGTH_DELIMITED = 2;
+  private static final int WIRE_32BIT = 5;
 
   // TableMetadataDelta field numbers
   private static final int DELTA_UPDATES = 1;
@@ -78,6 +79,8 @@ public class InlineDeltaCodec {
   // on has moved past them (Landing). Absent in a delta of manifest updates only.
   private static final int DELTA_BASE_LAST_SEQUENCE_NUMBER = 3;
   private static final int DELTA_BASE_NEXT_ROW_ID = 4;
+  // The digest of the manifest prefix its manifests' names are under; absent: none is
+  private static final int DELTA_MANIFEST_PREFIX_DIGEST = 5;
 
   // TableMetadataUpdate oneof field numbers
   private static final int UPDATE_ADD_SNAPSHOT = 1;
@@ -192,7 +195,7 @@ public class InlineDeltaCodec {
 
   // AddSnapshot field numbers
   private static final int SNAP_ID = 1;
-  private static final int SNAP_MANIFEST_SUFFIX = 2;
+  private static final int SNAP_MANIFEST_LIST = 2;
   private static final int SNAP_SUMMARY = 3;
   private static final int SNAP_TIMESTAMP_DELTA = 4;
   private static final int SNAP_SCHEMA_ID = 5;    // optional; varint
@@ -365,7 +368,7 @@ public class InlineDeltaCodec {
           long sequenceNumber = current.formatVersion() >= 2 ? ++lastSequenceNumber : 0L;
           pending.addSnapshot(
               addSnap.snapshot(
-                  sequenceNumber, current.currentSchemaId(), prefix, writerLastUpdatedMillis,
+                  sequenceNumber, current.currentSchemaId(), "", writerLastUpdatedMillis,
                   landing));
           addedInThisDelta.add(addSnap.snapshotId);
           // Inline-ML snapshots (empty suffix → `inline://<snapId>` sentinel) must
@@ -420,15 +423,17 @@ public class InlineDeltaCodec {
     return current;
   }
 
-  /** {@code manifest} as the wire holds it, its path suffix resolved with {@code prefix}. */
+  /**
+   * {@code manifest} as a delta holds it, a manifest named by name alone resolved under {@code
+   * prefix}, its table's manifest prefix ({@link DecodedDelta#unresolvedNames}).
+   */
   static ManifestFile resolve(ManifestFile manifest, String prefix) {
-    String fullPath = manifest.path();
-    if (!prefix.isEmpty() && !fullPath.startsWith(prefix)) {
-      fullPath = prefix + fullPath;
+    if (!relative(manifest)) {
+      return manifest;
     }
     return manifestFile(
-        manifest, fullPath, manifest.sequenceNumber(), manifest.minSequenceNumber(),
-        manifest.firstRowId());
+        manifest, (prefix != null ? prefix : "") + manifest.path(), manifest.sequenceNumber(),
+        manifest.minSequenceNumber(), manifest.firstRowId());
   }
 
   /** A copy of {@code manifest} at {@code path}, with these sequence numbers and first row id. */
@@ -642,6 +647,11 @@ public class InlineDeltaCodec {
       prefix = "";
     }
     DecodedDelta decoded = decodeDelta(deltaBytes);
+    // Full metadata applies only on the version its writer read, so its names are under the
+    // table's prefix, and a create's payload names none: the check is the format's, not a race's
+    String unresolved = decoded.unresolvedNames(prefix);
+    Preconditions.checkState(unresolved == null, "Manifest updates of table %s: %s", tableId,
+        unresolved);
     TableMetadata current =
         newMetadataCodec.decodeFull(newMetadataBytes, "inline://manifests-only");
     NewSnapshotManifests newSnapshots = new NewSnapshotManifests(catalogBuilder, tableId);
@@ -723,15 +733,56 @@ public class InlineDeltaCodec {
     public final Long baseLastSequenceNumber;
     /** The next row id of the delta's base (v3); null if it has none or the delta does not say. */
     public final Long baseNextRowId;
+    /**
+     * The digest of the manifest prefix its manifests' names are under ({@link
+     * IcebergPaths#digest}); null if it names none by name alone.
+     */
+    public final Integer manifestPrefixDigest;
 
     DecodedDelta(
         List<DeltaUpdate> updates, long lastUpdatedMillis, Long baseLastSequenceNumber,
         Long baseNextRowId) {
+      this(updates, lastUpdatedMillis, baseLastSequenceNumber, baseNextRowId, null);
+    }
+
+    DecodedDelta(
+        List<DeltaUpdate> updates, long lastUpdatedMillis, Long baseLastSequenceNumber,
+        Long baseNextRowId, Integer manifestPrefixDigest) {
       this.updates = updates;
       this.lastUpdatedMillis = lastUpdatedMillis;
       this.baseLastSequenceNumber = baseLastSequenceNumber;
       this.baseNextRowId = baseNextRowId;
+      this.manifestPrefixDigest = manifestPrefixDigest;
     }
+
+    /**
+     * Why its manifests' names cannot resolve under {@code prefix}, the table's manifest prefix
+     * where it lands, or null if they can: it names a manifest by name alone, under a prefix
+     * other than the table's (its table left inline storage and returned under another
+     * location since its writer read it).
+     */
+    String unresolvedNames(String prefix) {
+      boolean names = false;
+      for (DeltaUpdate update : updates) {
+        if (update instanceof AddManifestUpdate && relative(((AddManifestUpdate) update).manifest)) {
+          names = true;
+          break;
+        }
+      }
+      if (!names) {
+        return null;
+      }
+      return manifestPrefixDigest != null
+              && manifestPrefixDigest == IcebergPaths.digest(prefix != null ? prefix : "")
+          ? null
+          : "its manifests' names are under another prefix than the table's";
+    }
+  }
+
+  /** Whether {@code manifest}, decoded from a delta, is a name its table's prefix resolves. */
+  private static boolean relative(ManifestFile manifest) {
+    return manifest instanceof ProtoCodec.DecodedManifestFile
+        && ((ProtoCodec.DecodedManifestFile) manifest).relative();
   }
 
   /**
@@ -771,6 +822,10 @@ public class InlineDeltaCodec {
         byte[] updateBytes = encodeUpdate(update, base, only);
         writeLengthDelimited(out, DELTA_UPDATES, updateBytes);
       }
+      String prefix = namesUnder(updates);
+      if (prefix != null) {
+        writeFixed32(out, DELTA_MANIFEST_PREFIX_DIGEST, IcebergPaths.digest(prefix));
+      }
       return out.toByteArray();
     } catch (IOException e) {
       throw new UncheckedIOException(e);
@@ -788,6 +843,7 @@ public class InlineDeltaCodec {
       Long lastUpdatedMillis = null;
       Long baseLastSequenceNumber = null;
       Long baseNextRowId = null;
+      Integer manifestPrefixDigest = null;
       List<byte[]> raw = new ArrayList<>();
       while (in.available() > 0) {
         int tag = readVarint(in);
@@ -801,6 +857,8 @@ public class InlineDeltaCodec {
           baseLastSequenceNumber = readVarint64(in);
         } else if (fieldNumber == DELTA_BASE_NEXT_ROW_ID) {
           baseNextRowId = readVarint64(in);
+        } else if (fieldNumber == DELTA_MANIFEST_PREFIX_DIGEST) {
+          manifestPrefixDigest = readFixed32(in);
         } else {
           skipField(in, wireType);
         }
@@ -826,7 +884,8 @@ public class InlineDeltaCodec {
       for (int i = 0; i < raw.size(); i++) {
         updates.add(decoded[i] != null ? decoded[i] : decodeUpdate(raw.get(i), only));
       }
-      return new DecodedDelta(updates, lastUpdatedMillis, baseLastSequenceNumber, baseNextRowId);
+      return new DecodedDelta(
+          updates, lastUpdatedMillis, baseLastSequenceNumber, baseNextRowId, manifestPrefixDigest);
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
@@ -2060,6 +2119,26 @@ public class InlineDeltaCodec {
   // ============================================================
 
   /**
+   * The manifest prefix the manifests {@code updates} add are named under (by their UUID and
+   * number, ProtoCodec.encodeManifestFileEntry), whose digest the delta states; null if none is.
+   */
+  private static String namesUnder(List<DeltaUpdate> updates) {
+    String prefix = null;
+    for (DeltaUpdate update : updates) {
+      if (update instanceof AddManifestUpdate) {
+        AddManifestUpdate add = (AddManifestUpdate) update;
+        if (IcebergPaths.manifestName(add.pathPrefix, add.manifest.path()) != null) {
+          Preconditions.checkState(
+              prefix == null || prefix.equals(add.pathPrefix),
+              "A delta's manifests are named under two prefixes: %s, %s", prefix, add.pathPrefix);
+          prefix = add.pathPrefix;
+        }
+      }
+    }
+    return prefix;
+  }
+
+  /**
    * The id of the one snapshot {@code updates} add, which their other snapshot ids default to;
    * null if they add none or several.
    */
@@ -2194,7 +2273,7 @@ public class InlineDeltaCodec {
       AddSnapshotUpdate u = (AddSnapshotUpdate) update;
       ByteArrayOutputStream inner = new ByteArrayOutputStream();
       writeFixed64(inner, SNAP_ID, u.snapshotId);
-      writeString(inner, SNAP_MANIFEST_SUFFIX, u.manifestListSuffix);
+      writeString(inner, SNAP_MANIFEST_LIST, u.manifestListSuffix);
       DecodedSummary summary =
           u.inheritsParentExtra
               ? new DecodedSummary(u.summary, true, u.droppedExtra)
@@ -2336,11 +2415,11 @@ public class InlineDeltaCodec {
           skipField(in, tag & 0x7);
       }
     }
-    // With an empty prefix: the caller resolves the full path. An added snapshot id it leaves out
-    // is the update's snapshot.
+    // A manifest named by name alone stays a name, which replay resolves under the table's
+    // manifest prefix (resolve). An added snapshot id it leaves out is the update's snapshot.
     ManifestFile manifest =
         manifestBytes != null
-            ? ProtoCodec.decodeManifestFileEntry(manifestBytes, "", snapshotId)
+            ? ProtoCodec.decodeManifestFileEntry(manifestBytes, null, snapshotId)
             : null;
     return new AddManifestUpdate(snapshotId, manifest, "", position);
   }
@@ -2633,7 +2712,7 @@ public class InlineDeltaCodec {
       int fn = tag >>> 3;
       switch (fn) {
         case SNAP_ID: snapId = readFixed64(in); break;
-        case SNAP_MANIFEST_SUFFIX: manifestSuffix = readString(in); break;
+        case SNAP_MANIFEST_LIST: manifestSuffix = readString(in); break;
         case SNAP_SUMMARY:
           summary = decodeCompactSummary(readLengthDelimitedBytes(in));
           break;
@@ -3066,6 +3145,15 @@ public class InlineDeltaCodec {
     writeVarint64(out, fieldNumber, (value << 1) ^ (value >> 63));
   }
 
+  private static void writeFixed32(OutputStream out, int fieldNumber, int value)
+      throws IOException {
+    writeRawVarint(out, (fieldNumber << 3) | WIRE_32BIT);
+    for (int i = 0; i < 4; i++) {
+      out.write(value & 0xFF);
+      value >>>= 8;
+    }
+  }
+
   private static void writeFixed64(OutputStream out, int fieldNumber, long value)
       throws IOException {
     writeRawVarint(out, (fieldNumber << 3) | WIRE_64BIT);
@@ -3140,6 +3228,16 @@ public class InlineDeltaCodec {
     return (raw >>> 1) ^ -(raw & 1); // zigzag decode
   }
 
+  private static int readFixed32(InputStream in) throws IOException {
+    int result = 0;
+    for (int i = 0; i < 4; i++) {
+      int b = in.read();
+      if (b < 0) { throw new IOException("Unexpected end of stream"); }
+      result |= (b & 0xFF) << (i * 8);
+    }
+    return result;
+  }
+
   private static long readFixed64(InputStream in) throws IOException {
     long result = 0;
     for (int i = 0; i < 8; i++) {
@@ -3171,7 +3269,7 @@ public class InlineDeltaCodec {
       case WIRE_VARINT: readVarint64(in); break;
       case WIRE_LENGTH_DELIMITED: in.skip(readVarint(in)); break;
       case WIRE_64BIT: in.skip(8); break;
-      case 5: in.skip(4); break;
+      case WIRE_32BIT: in.skip(4); break;
       default: throw new IOException("Unknown wire type: " + wireType);
     }
   }

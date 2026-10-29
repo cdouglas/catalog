@@ -141,7 +141,7 @@ public class ProtoCodec {
   static final int INLINE_TBL_CONFLICT_STATE = 10;
 
   // ManifestFileEntry field numbers
-  private static final int MF_PATH_SUFFIX = 1;
+  private static final int MF_PATH = 1;
   private static final int MF_LENGTH = 2;
   private static final int MF_SPEC_ID = 3;
   private static final int MF_CONTENT = 4;
@@ -159,6 +159,8 @@ public class ProtoCodec {
   private static final int MF_FIRST_ROW_ID = 16;
   private static final int MF_NO_PARTITIONS = 17; // present (true) when partitions is null
   private static final int MF_NO_ADDED_SNAPSHOT_ID = 18; // where an absent id is implied
+  private static final int MF_MANIFEST_UUID = 19; // with the number: the name, under the prefix
+  private static final int MF_MANIFEST_NUMBER = 20;
 
   // PartitionFieldSummaryEntry field numbers
   private static final int PFS_CONTAINS_NULL = 1;
@@ -1311,11 +1313,14 @@ public class ProtoCodec {
       ManifestFile manifest, String pathPrefix, Long impliedSnapshotId) throws IOException {
     ByteArrayOutputStream out = new BytesOut();
 
-    String suffix = manifest.path();
-    if (pathPrefix != null && !pathPrefix.isEmpty() && suffix.startsWith(pathPrefix)) {
-      suffix = suffix.substring(pathPrefix.length());
+    // A name SnapshotProducer made under the table's prefix as its UUID and number; else the path
+    IcebergPaths.ManifestName name = IcebergPaths.manifestName(pathPrefix, manifest.path());
+    if (name != null) {
+      writeBytes(out, MF_MANIFEST_UUID, name.uuid);
+      writeVarint64(out, MF_MANIFEST_NUMBER, name.number);
+    } else {
+      writeString(out, MF_PATH, manifest.path());
     }
-    writeString(out, MF_PATH_SUFFIX, suffix);
     writeVarint64(out, MF_LENGTH, manifest.length());
     if (manifest.partitionSpecId() != 0) {
       writeVarint(out, MF_SPEC_ID, manifest.partitionSpecId());
@@ -1378,7 +1383,8 @@ public class ProtoCodec {
   }
 
   /**
-   * Decodes a ManifestFileEntry from protobuf bytes, prepending the path prefix.
+   * Decodes a ManifestFileEntry from protobuf bytes, a manifest named by its UUID and number
+   * under {@code pathPrefix}, the table's manifest prefix.
    */
   public static ManifestFile decodeManifestFileEntry(byte[] bytes, String pathPrefix)
       throws IOException {
@@ -1387,12 +1393,16 @@ public class ProtoCodec {
 
   /**
    * Decodes a ManifestFileEntry whose absent added snapshot id means {@code impliedSnapshotId}
-   * (see {@link #encodeManifestFileEntry(ManifestFile, String, Long)}).
+   * (see {@link #encodeManifestFileEntry(ManifestFile, String, Long)}). With a null {@code
+   * pathPrefix}, a manifest named by its UUID and number keeps the bare name, which {@link
+   * DecodedManifestFile#relative} marks, for its reader to resolve under the prefix it knows.
    */
   static ManifestFile decodeManifestFileEntry(
       byte[] bytes, String pathPrefix, Long impliedSnapshotId) throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
-    String pathSuffix = "";
+    String path = "";
+    byte[] uuid = null;
+    long number = 0;
     long length = 0;
     int specId = 0;
     int content = 0;
@@ -1415,8 +1425,14 @@ public class ProtoCodec {
       int fieldNumber = tag >>> 3;
       int wireType = tag & 0x7;
       switch (fieldNumber) {
-        case MF_PATH_SUFFIX:
-          pathSuffix = readString(in);
+        case MF_PATH:
+          path = readString(in);
+          break;
+        case MF_MANIFEST_UUID:
+          uuid = readLengthDelimitedBytes(in);
+          break;
+        case MF_MANIFEST_NUMBER:
+          number = readVarint64(in);
           break;
         case MF_LENGTH:
           length = readVarint64(in);
@@ -1476,12 +1492,22 @@ public class ProtoCodec {
       }
     }
 
-    String fullPath = (pathPrefix != null ? pathPrefix : "") + pathSuffix;
+    boolean relative = false;
+    if (uuid != null) {
+      Preconditions.checkState(
+          uuid.length == IcebergPaths.UUID_BYTES, "Malformed ManifestFileEntry: a %s-byte UUID",
+          uuid.length);
+      path = new IcebergPaths.ManifestName(uuid, number).toString();
+      relative = pathPrefix == null;
+      if (!relative) {
+        path = pathPrefix + path;
+      }
+    }
     return new DecodedManifestFile(
-        fullPath, length, specId, content, seqNum, minSeqNum, snapshotId,
+        path, length, specId, content, seqNum, minSeqNum, snapshotId,
         addedFiles, existingFiles, deletedFiles, addedRows, existingRows, deletedRows,
         noPartitions ? null : ImmutableList.copyOf(partitions),
-        keyMetadata, firstRowId);
+        keyMetadata, firstRowId, relative);
   }
 
   private static byte[] encodePartitionFieldSummary(PartitionFieldSummary pfs) throws IOException {
@@ -1549,6 +1575,8 @@ public class ProtoCodec {
    * in memory; no Avro dependency.
    */
   public static class DecodedManifestFile implements ManifestFile {
+    // Whether path is a name under a table's manifest prefix, not yet resolved (decoded with none)
+    private final boolean relative;
     private final String path;
     private final long length;
     private final int specId;
@@ -1572,6 +1600,19 @@ public class ProtoCodec {
         int addedFilesCount, int existingFilesCount, int deletedFilesCount,
         long addedRowsCount, long existingRowsCount, long deletedRowsCount,
         List<PartitionFieldSummary> partitions, byte[] keyMetadata, Long firstRowId) {
+      this(path, length, specId, content, sequenceNumber, minSequenceNumber, snapshotId,
+          addedFilesCount, existingFilesCount, deletedFilesCount, addedRowsCount,
+          existingRowsCount, deletedRowsCount, partitions, keyMetadata, firstRowId, false);
+    }
+
+    private DecodedManifestFile(
+        String path, long length, int specId, int content,
+        long sequenceNumber, long minSequenceNumber, Long snapshotId,
+        int addedFilesCount, int existingFilesCount, int deletedFilesCount,
+        long addedRowsCount, long existingRowsCount, long deletedRowsCount,
+        List<PartitionFieldSummary> partitions, byte[] keyMetadata, Long firstRowId,
+        boolean relative) {
+      this.relative = relative;
       this.path = path;
       this.length = length;
       this.specId = specId;
@@ -1589,6 +1630,9 @@ public class ProtoCodec {
       this.keyMetadata = keyMetadata != null ? ByteBuffer.wrap(keyMetadata) : null;
       this.firstRowId = firstRowId;
     }
+
+    /** Whether {@link #path} is a name under its table's manifest prefix, still to resolve. */
+    boolean relative() { return relative; }
 
     @Override public String path() { return path; }
     @Override public long length() { return length; }
@@ -2281,7 +2325,7 @@ public class ProtoCodec {
             TableFields applied = NativeDelta.apply(base, delta, builder, id, stale, location);
             if (NativeDelta.CHECK) {
               NativeDelta.check(
-                  base, location, delta, stale, builder.manifestListPrefix(id), applied);
+                  base, location, delta, stale, "", applied);
             }
             updated = InlineTable.ofFields(applied, current.codec());
           } else {
@@ -2412,9 +2456,11 @@ public class ProtoCodec {
 
     @Override
     public void apply(CatalogState.Builder builder) {
-      // The manifest list prefix is always empty: nothing sets one, and a
-      // checkpoint copies it.
-      builder.addInlineTable(id, namespaceId, name, version, metadata, metadataCodec, "");
+      // The table's manifest prefix, its metadata directory, which its manifests' names are
+      // relative to while it stays inline; a checkpoint copies it.
+      builder.addInlineTable(
+          id, namespaceId, name, version, metadata, metadataCodec,
+          CatalogState.manifestPrefix(InlineTable.ofBytes(metadata, metadataCodec)));
       if (deltaBytes != null) {
         // Inline-ML create: land the manifest lists of the create transaction's snapshots,
         // the way a full-mode update does. Decodes the just-stored metadata so each snapshot's

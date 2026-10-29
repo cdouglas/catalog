@@ -2291,8 +2291,9 @@ public class TestCatalogRegressions {
   // checkpoint left them out. A table that returned to inline storage had
   // no manifest list prefix, where a created one and a checkpoint have the
   // empty prefix; readers treat the two alike. Dropping a table now removes
-  // its inline state, and a returning table gets the empty prefix. Found by
-  // TestCatalogFaultProperties' checkpoint round trip.
+  // its inline state, and a returning table gets the prefix a created one
+  // does (now its metadata directory). Found by TestCatalogFaultProperties'
+  // checkpoint round trip.
   // ============================================================
 
   @Nested
@@ -2315,7 +2316,7 @@ public class TestCatalogRegressions {
     }
 
     @Test
-    void tableReturningInlineHasTheEmptyPrefix() {
+    void tableReturningInlineHasItsMetadataDirectoryAsPrefix() {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       FileIOCatalog inline = small(io, LocalCatalogMode.APPEND_TM);
       inline.createNamespace(mixedNs);
@@ -2327,7 +2328,9 @@ public class TestCatalogRegressions {
 
       CatalogState file = catalogFile(io);
       assertThat(file.isInlineTable(mixed)).as("returned").isTrue();
-      assertThat(file.manifestListPrefix(file.tableId(mixed))).isEmpty();
+      // as a created one has (the empty prefix until 2026-10-29, when it became the dictionary
+      // entry manifests' names are under)
+      assertThat(file.manifestListPrefix(file.tableId(mixed))).isEqualTo("mem:///w/ns/t/metadata/");
       assertThat(CheckpointRoundTrip.difference(catalogRead(io))).isNull();
     }
   }
