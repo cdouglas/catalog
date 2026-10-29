@@ -65,29 +65,33 @@ parts["part"] = parts.part.map({
     "state_other": "rest of the state", "envelope": "envelope and tail"})
 parts["MB"] = parts.bytes / 1e6
 
-# record anatomy: the anatomy run of each shape's capture (its config hash is the capture's)
-records = q("""
+# record anatomy: the anatomy run of each shape's capture (its config hash is the capture's; the
+# baseline's runs name the hash before new default keys changed it, NOTES.md "Record anatomy")
+ANATOMY = """
+    SELECT run_id FROM canonical_runs
+    WHERE source = 'anatomy' AND (config_hash IN (
+      SELECT capture_hash FROM canonical_runs WHERE list_contains(campaigns, 'i8-shapes'))
+       OR run_id = 'anatomy/cap-i1-b26a3a9fc131')"""
+records = q(f"""
     SELECT a.label AS capture, g.part, g.bytes_per_record
     FROM record_groups g JOIN canonical_runs a USING (run_id)
-    WHERE a.source = 'anatomy' AND a.config_hash IN (
-      SELECT capture_hash FROM canonical_runs WHERE list_contains(campaigns, 'i8-shapes'))
-       OR a.label = 'cap-i1'""")
+    WHERE run_id IN ({ANATOMY})""")
 records["shape"] = records.capture.map(SHAPES)
 FIELDS = ["removed manifests", "new manifest paths", "new manifests, other fields", "snapshot ids",
           "summary: iceberg-version", "summary: other entries", "summary counts", "envelope",
           "other"]
 records["order"] = records.part.map(FIELDS.index)
-counts = q("""
+counts = q(f"""
     SELECT a.label AS capture,
       json_extract(a.manifest, '$.summary.sampled')::INT AS sampled,
       json_extract(a.manifest, '$.summary.p99')::INT AS p99,
       sum(f.count) FILTER (WHERE f.path = 'AddSnapshot.snapshot_id') AS snapshots,
       sum(f.count) FILTER (WHERE f.path = 'RemoveManifestDelta.manifest_path_suffix') AS removed,
       sum(f.bytes) FILTER (WHERE f.path LIKE 'CompactSummary.extra%') AS extra_bytes,
-      sum(f.bytes) FILTER (WHERE f.path = 'CompactSummary.extra{iceberg-version}') AS version_bytes,
+      sum(f.bytes) FILTER (WHERE f.path = 'CompactSummary.extra{{iceberg-version}}') AS version_bytes,
       sum(f.bytes) AS bytes
     FROM record_fields f JOIN canonical_runs a USING (run_id)
-    WHERE a.source = 'anatomy' GROUP BY ALL""").set_index("capture")
+    WHERE run_id IN ({ANATOMY}) GROUP BY ALL""").set_index("capture")
 removed_bytes = records[records.part == "removed manifests"].set_index("capture").bytes_per_record
 
 def fold_rate(capture, col="fold_records_s"):
@@ -239,7 +243,9 @@ alt.Chart(records).mark_bar().encode(
 ```
 
 Every 50th record of each capture, decoded by the format explorer
-(`docs/format-explorer/anatomy.mjs`; a field's bytes include its tag and length). Two fields carry
+(`docs/format-explorer/anatomy.mjs`; a field's bytes include its tag and length), in the format
+before records referred to their parents (campaign `i9-format` captures the same workloads in the
+format after; docs/FORMAT.md, "What a record holds"). Two fields carry
 most of the bytes. A snapshot's summary entries beyond the counts the format keeps as numbers,
 which it sends as Iceberg's strings, cost {eval}`f"{per_snapshot('cap-i1'):.0f}"` bytes per
 snapshot in the baseline and as much in every shape:
