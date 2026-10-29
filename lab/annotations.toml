@@ -88,6 +88,10 @@ select = ["i7-retention-*"]
 title = "Ingest of seven workload shapes' logs: cap-i1's, one table, skewed tables, fast appends only, eager merges, YCSB-like and four-table catalog transactions"
 select = ["i8-shapes-*"]
 
+[[annotate]]
+select = ["i8-shapes-2779642ff8da/*", "i8-shapes-1ca9bda95d85/*"]
+note = "capture cap-s-fast: 3 of its 16 writers died of OutOfMemoryError at 240 s (one 3 GB heap for 16 writers' InlineSnapshot lists, which fast appends grow without bound); the log is real records, from 13 writers after 240 s"
+
 [campaigns.c8-fold]
 title = "c1's fast appends on the code before (4e65a65) and after (56facd8) replay folds a read onto a replica"
 select = ["c8-fold-*"]
