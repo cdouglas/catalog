@@ -166,5 +166,11 @@ to tables of one `FileIOCatalog` over an in-memory store whose requests take a p
   code: compare replay across formats with JMH (IngestFoldBench), each code on its own capture.
   Record bytes (source `anatomy`) and the runs with compactions compare directly.
 
+- `i10-format` (2026-10-29, 32b408f) captures the seven workloads again in the format where a
+  delta's one new snapshot's id is written once and manifests are named by UUID and number under
+  their table's prefix (`capture_format` 3). It ran on a laptop that slept during some captures
+  and ingests: its record bytes and checkpoint breakdowns compare with i8's and i9's, its
+  timings do not. `h1-shapes` reruns the three builds side by side on havoc for the timings.
+
 - `pilot-fa`, `pilot-mix` (2026-10-27) were pilots of the driver. The first `pilot-mix` runs gave
   fast appends the validated operations' 2 s runtime too; the runtime is per kind since.
