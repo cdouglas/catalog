@@ -118,7 +118,8 @@ final class BenchConfig {
           + "\"capture_log\": false,"
           // the format of the records a captured log holds (IngestBench sets the current one), so
           // a change of format captures anew: 1 before RemoveManifestDelta.parent_indices and
-          // CompactSummary.inherits_parent_extra (2026-10-29)
+          // CompactSummary.inherits_parent_extra (2026-10-29), 2 before snapshot ids implied and
+          // manifests named by UUID and number
           + "\"capture_format\": 1"
           + "}";
 

@@ -113,7 +113,7 @@ public final class IngestBench {
    * to the records' format, so that a run captures its log anew rather than reading one an earlier
    * format wrote.
    */
-  static final int CAPTURE_FORMAT = 2;
+  static final int CAPTURE_FORMAT = 3;
 
   /**
    * The run's workload: its capture configuration, with no store latency, capturing its log in

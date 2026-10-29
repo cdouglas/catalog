@@ -19,7 +19,9 @@ SELECT
       THEN 'snapshot ids'
     WHEN path LIKE 'RemoveManifestDelta.%' OR path = 'TableMetadataUpdate.remove_manifest'
       THEN 'removed manifests'
-    WHEN path = 'ManifestFileEntry.manifest_path_suffix' THEN 'new manifest paths'
+    WHEN path IN ('ManifestFileEntry.manifest_path_suffix', 'ManifestFileEntry.manifest_path',
+                  'ManifestFileEntry.manifest_uuid', 'ManifestFileEntry.manifest_number')
+      THEN 'new manifest paths'
     WHEN path LIKE 'ManifestFileEntry.%' OR path LIKE 'AddManifestDelta.%'
       OR path LIKE 'PartitionFieldSummaryEntry.%' OR path = 'TableMetadataUpdate.add_manifest'
       THEN 'new manifests, other fields'
