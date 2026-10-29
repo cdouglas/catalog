@@ -325,11 +325,10 @@ cherry-picked snapshots and for replaces. `added_rows` is present for
 every v3+ snapshot and `first_row_id` whenever the snapshot has one, 0
 included; `key_id` only for encrypted tables.
 
-Most of a data commit's `AddSnapshot` is its summary (Iceberg puts
-`iceberg-version` in every summary, and engines add their own entries,
-all in `extra`) and, for a snapshot with a manifest list file, that
-file's full path; the whole log record of a data commit measures
-~0.35–0.39 KB in [sample/](sample/README.md).
+Iceberg puts `iceberg-version` in every summary, and engines add their own
+entries; a snapshot keeps those of its parent's that are the same rather
+than sending them (§"Summaries"). For a snapshot with a manifest list file,
+the record carries that file's path.
 
 ### CompactSummary
 
@@ -340,26 +339,45 @@ Field numbers serve as an implicit key dictionary.
 enum OperationType { APPEND = 0; OVERWRITE = 1; DELETE = 2; REPLACE = 3; }
 
 message CompactSummary {
-  OperationType      operation              = 1;
-  int64              added_data_files       = 2;
-  int64              added_records          = 3;
-  int64              added_files_size       = 4;
-  int64              total_data_files       = 5;
-  int64              total_records          = 6;
-  int64              total_files_size       = 7;
-  int64              added_delete_files     = 8;
-  int64              total_delete_files     = 9;
-  int64              total_equality_deletes = 10;
-  int64              total_position_deletes = 11;
-  map<string,string> extra                  = 15;
+  OperationType      operation             = 1;
+  int64              added_data_files      = 2;   // and Iceberg's other counts,
+  // ...                                          //   fields 3-14 and 16-31
+  map<string,string> extra                 = 15;
+  bool               inherits_parent_extra = 32;  // §"Summaries"
+  repeated string    dropped_extra         = 33;
 }
 ```
 
-A count is present whenever the summary has it, 0 included: an absent count
-is one the summary lacks, which readers take as unknown. `operation` is
-omitted for `APPEND`, the default. The `extra` map captures the other entries
-engines add, and any entry the typed fields cannot hold exactly (an operation
-not in `OperationType`, a count not written as a plain decimal number).
+catalog.proto lists the counts: the `added-*`, `total-*`, `deleted-*` and
+`removed-*` counts of files, records, sizes, delete files, deletes and DVs,
+`changed-partition-count`, and the `manifests-*` and `entries-processed` counts
+of manifest merges. A count is present whenever the summary has it, 0
+included: an absent count is one the summary lacks, which readers take as
+unknown. `operation` is omitted for `APPEND`, the default. The `extra` map
+captures the other entries engines add, and any entry the typed fields cannot
+hold exactly (an operation not in `OperationType`, a count not written as a
+plain decimal number).
+
+### Summaries
+
+A snapshot's summary repeats most of its parent's extra entries: Iceberg's
+`iceberg-version`, the engine's name and version, an application's ids. A
+delta from a base that holds the snapshot's parent (the snapshot its
+`AddSnapshot` names, not one the delta adds) sends only the extra entries that
+differ from the parent's, with `inherits_parent_extra`: the summary is the
+entries the record states, and the parent's extra entries (those its typed
+fields would not hold) less `dropped_extra` and those the record states. The
+operation is always stated. A writer inherits where that is shorter.
+
+Replay takes the parent's entries where the record lands, in key order, so
+every replica builds the same map. A snapshot's summary never changes, so the
+parent's entries are the writer's wherever the parent is. A record whose
+parent the table no longer has does not apply: on its base the writer's
+parent is there, so a writer's record always resolves; on a later version an
+expiry may have removed it, and the merge is refused (`Landing.unresolved`, a
+false positive the writer's retry repairs). A record on its base that names a
+parent the table lacks is malformed and refused too, rather than throwing in
+replay.
 
 ### Other Updates
 

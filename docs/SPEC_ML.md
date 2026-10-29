@@ -127,8 +127,9 @@ message AddManifestDelta {
 }
 
 message RemoveManifestDelta {
-  fixed64 snapshot_id          = 1;
-  string  manifest_path_suffix = 2;     // identifies manifest to remove
+  fixed64 snapshot_id             = 1;
+  string  manifest_path_suffix    = 2;  // the manifest it removes, by path;
+  repeated uint32 parent_indices  = 3;  //   or by index in the parent's list
 }
 ```
 
@@ -145,7 +146,13 @@ inline list (empty for none). On apply:
   inserts the path in the snapshot's list at `position`, or at the end
   if it is absent. Writers always set it.
 - `RemoveManifestDelta` removes the path from the snapshot's reference
-  list.
+  list, or the paths at `parent_indices` in its parent's list: the list of
+  the snapshot its `AddSnapshot` names as parent, which the writer read
+  inline, before the delta. A snapshot's list never changes, so the paths
+  there are the writer's wherever the parent is; a record whose parent the
+  table no longer has a list for does not apply (`Landing.unresolved`),
+  which on its base cannot happen, and on a later version, where a
+  merge would need that list anyway (Bug 79), refuses the merge.
 - A manifest one of the delta's snapshots wrote takes, where a conflict
   encoding admits the delta on a later version of the table, the sequence
   numbers and (v3) first row id that snapshot gets there, as does a
@@ -234,9 +241,13 @@ for a snapshot without a parent; its parent's, if the commit adds the
 parent too; else the parent's inline list in the catalog file the
 commit builds on. A manifest the snapshot keeps from that list is not
 sent; each other manifest in its list is an `AddManifestDelta` with its
-index in the list, and each manifest it drops a `RemoveManifestDelta`.
-If the parent's list is a file, so the catalog holds none, the snapshot
-sends its whole list.
+index in the list, and the manifests it drops a `RemoveManifestDelta`: by
+their indices in the parent's list (packed, ascending, in one update) when
+that is the parent's inline list in the catalog file, by path when the
+commit adds the parent too or writes full metadata. A merge that drops a
+hundred manifests names each in a byte or two rather than by its ~70-byte
+path. If the parent's list is a file, so the catalog holds none, the
+snapshot sends its whole list.
 
 A list keeps its writer's order: each added manifest carries its index
 in the new list, and replay inserts the added manifests, in order of

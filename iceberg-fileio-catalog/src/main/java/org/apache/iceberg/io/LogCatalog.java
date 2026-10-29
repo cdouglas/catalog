@@ -1023,8 +1023,16 @@ public class LogCatalog extends BaseMetastoreCatalog
                     .map(ManifestFile::path)
                     .filter(path -> !inOrder || !paths.contains(path))
                     .collect(Collectors.toList());
+        // A delta names what it removes by index in its parent's list where replay holds that list
+        // before the delta: the parent's inline list in proto, which a parent in base has (its
+        // list never changes), not a list the commit sends
+        List<String> parentPaths =
+            !full && parent != null && snapshot.parentId() != null && base != null
+                    && base.snapshot(snapshot.parentId()) != null
+                ? parent.stream().map(ManifestFile::path).collect(Collectors.toList())
+                : null;
         InlineDeltaCodec.attachManifestDelta(
-            updates, snapshot.snapshotId(), added, positions, removed, prefix);
+            updates, snapshot.snapshotId(), added, positions, removed, parentPaths, prefix);
       }
       return updates;
     }

@@ -108,7 +108,8 @@ final class Landing {
   private final long rowShift;
   // The first new snapshot of each branch whose head moved, by id: its parent there (null: none).
   private final Map<Long, Long> parents;
-  // Each new snapshot's summary, its totals counted where it lands; none on its base.
+  // Each new snapshot's summary where it lands: with its parent's extra entries, if it takes them,
+  // and its totals counted there if the table moved; none if it is the one its update states.
   private final Map<Long, Map<String, String>> summaries;
 
   private Landing(
@@ -150,9 +151,19 @@ final class Landing {
             : 0L;
     Map<Long, Long> parents = new HashMap<>();
     Map<Long, Map<String, String>> summaries = new HashMap<>();
+    for (AddSnapshotUpdate add : adds.values()) {
+      Map<String, String> summary = add.summary(table);
+      if (add.inheritsParentExtra && summary != null) {
+        summaries.put(add.snapshotId, summary);
+      }
+    }
     Map<Long, String> branches = stale ? branches(delta, adds, table) : null;
     if (branches != null) {
       for (AddSnapshotUpdate add : adds.values()) {
+        Map<String, String> summary = add.summary(table);
+        if (summary == null) {
+          continue; // its parent is gone, so it cannot land here (unresolved)
+        }
         // SnapshotProducer: the parent is the branch's latest snapshot (main's for a branch the
         // table lacks), and the totals count from the branch's head (from 0 if it has none).
         Map<String, String> previous;
@@ -167,7 +178,9 @@ final class Landing {
           SnapshotRef ref = table.ref(branch);
           previous = ref == null ? zeros() : summaryOrEmpty(table, ref.snapshotId());
         }
-        summaries.put(add.snapshotId, withTotals(add.summary, previous));
+        if (previous != null) {
+          summaries.put(add.snapshotId, withTotals(summary, previous));
+        }
       }
     }
     return new Landing(
@@ -183,6 +196,49 @@ final class Landing {
   }
 
   /**
+   * Why {@code delta} cannot replay on {@code table}, any version of the table, its base included,
+   * or null if it can: what it names by reference to its new snapshots' parents is not there. A
+   * new snapshot may take its parent's extra summary entries, and name the manifests it removes by
+   * their indices in its parent's list ({@code builder}'s lists of {@code tableId}): the parent its
+   * writer read, which a delta on its base finds there, while a later version may have expired it.
+   */
+  static String unresolved(
+      DecodedDelta delta, MetadataView table, CatalogState.Builder builder, int tableId) {
+    Map<Long, AddSnapshotUpdate> adds = adds(delta);
+    for (AddSnapshotUpdate add : adds.values()) {
+      if (add.inheritsParentExtra
+          && (adds.containsKey(add.parentSnapshotId) || add.summary(table) == null)) {
+        return "the parent whose summary entries its snapshot takes is gone";
+      }
+    }
+    for (DeltaUpdate update : delta.updates) {
+      if (update instanceof RemoveManifestUpdate
+          && ((RemoveManifestUpdate) update).parentIndices != null
+          && removed((RemoveManifestUpdate) update, adds, builder, tableId) == null) {
+        return "the parent's list whose manifests it removes by index is gone";
+      }
+    }
+    return null;
+  }
+
+  /**
+   * What {@code remove} removes, matched as path ends ({@link RemoveManifestUpdate#removed}): its
+   * indices name manifests of the list of its snapshot's parent as {@code adds} names it, which
+   * must be one the table holds, not one the delta adds. Null if they name what is not there.
+   */
+  private static List<String> removed(
+      RemoveManifestUpdate remove, Map<Long, AddSnapshotUpdate> adds,
+      CatalogState.Builder builder, int tableId) {
+    AddSnapshotUpdate add = adds.get(remove.snapshotId);
+    Long parent = add != null ? add.parentSnapshotId : null;
+    List<String> parentList =
+        parent != null && !adds.containsKey(parent) && builder.hasSnapshotManifests(tableId, parent)
+            ? builder.snapshotManifestPaths(tableId, parent)
+            : null;
+    return remove.removed(parentList);
+  }
+
+  /**
    * Why {@code delta} cannot be finalized on {@code table}, a version of the table other than its
    * base, or null if it can. {@code builder} holds the table's manifest lists ({@code tableId}).
    * These are what the finalization needs, not what makes the merge correct: a conflict encoding
@@ -190,6 +246,10 @@ final class Landing {
    */
   static String unmergeable(
       DecodedDelta delta, MetadataView table, CatalogState.Builder builder, int tableId) {
+    String unresolved = unresolved(delta, table, builder, tableId);
+    if (unresolved != null) {
+      return unresolved;
+    }
     Map<Long, AddSnapshotUpdate> adds = adds(delta);
     Map<Long, String> branches = branches(delta, adds, table);
     if (branches == null) {
@@ -289,9 +349,10 @@ final class Landing {
       for (DeltaUpdate update : delta.updates) {
         if (update instanceof RemoveManifestUpdate
             && ((RemoveManifestUpdate) update).snapshotId == first) {
-          String suffix = ((RemoveManifestUpdate) update).manifestPathSuffix;
-          if (headList.stream().noneMatch(path -> path.endsWith(suffix))) {
-            return "a manifest it removes is not in its branch's head";
+          for (String suffix : removed((RemoveManifestUpdate) update, adds, builder, tableId)) {
+            if (headList.stream().noneMatch(path -> path.endsWith(suffix))) {
+              return "a manifest it removes is not in its branch's head";
+            }
           }
         }
       }
@@ -391,11 +452,13 @@ final class Landing {
     Map<String, ManifestFile> pool = builder.manifestPool(tableId);
     List<String> paths = new ArrayList<>(parentList(add, builder, tableId));
     List<ManifestFile> list = new ArrayList<>();
+    Map<Long, AddSnapshotUpdate> adds = adds(delta);
     for (DeltaUpdate update : delta.updates) {
       if (update instanceof RemoveManifestUpdate
           && ((RemoveManifestUpdate) update).snapshotId == add.snapshotId) {
-        String suffix = ((RemoveManifestUpdate) update).manifestPathSuffix;
-        paths.removeIf(path -> path.endsWith(suffix));
+        for (String suffix : removed((RemoveManifestUpdate) update, adds, builder, tableId)) {
+          paths.removeIf(path -> path.endsWith(suffix));
+        }
       } else if (update instanceof AddManifestUpdate
           && ((AddManifestUpdate) update).snapshotId == add.snapshotId) {
         list.add(manifest(InlineDeltaCodec.resolve(((AddManifestUpdate) update).manifest, prefix)));
@@ -442,6 +505,11 @@ final class Landing {
    */
   Map<String, String> summary(AddSnapshotUpdate add) {
     Map<String, String> summary = summaries.get(add.snapshotId);
+    if (summary == null && add.inheritsParentExtra) {
+      // an admitted delta resolves where it lands (unresolved)
+      throw new IllegalStateException(
+          "Snapshot " + add.snapshotId + " takes the summary of a parent the table lacks");
+    }
     return summary != null ? summary : add.summary;
   }
 

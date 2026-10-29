@@ -76,9 +76,10 @@ final class ConflictEncodings {
   /**
    * Whether {@code action} applies where its record lands, on {@code builder}'s state: the
    * verify of a table action. The table must exist; the catalog's encoding must admit the action;
-   * and an action on a version of the table other than its base must be an unpinned delta whose
+   * an action on a version of the table other than its base must be an unpinned delta whose
    * late-bound fields can be finalized there ({@link Landing#unmergeable}), so that apply, which
-   * must never throw, can merge it.
+   * must never throw, can merge it; and a delta on its base must find there the parents it names
+   * by reference ({@link Landing#unresolved}), which a writer's always does.
    */
   static boolean admits(TableAction action, CatalogState.Builder builder) {
     ReplayView landing = ReplayView.of(builder, action.tableId());
@@ -97,6 +98,12 @@ final class ConflictEncodings {
               != null) {
         return false;
       }
+    } else if (action.kind() == TableAction.Kind.DELTA
+        && landing.inline()
+        && Landing.unresolved(action.delta(), landing.table(), builder, action.tableId())
+            != null) {
+      // its base must hold what it names by reference (a writer names only what it read there)
+      return false;
     }
     return true;
   }

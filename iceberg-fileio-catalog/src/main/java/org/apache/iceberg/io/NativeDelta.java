@@ -114,7 +114,7 @@ final class NativeDelta {
     // The manifest updates, as InlineDeltaCodec.applyDelta replays them: each new inline-ML
     // snapshot's list starts as its parent's, then takes the manifests the delta adds and removes
     InlineDeltaCodec.NewSnapshotManifests newSnapshots =
-        new InlineDeltaCodec.NewSnapshotManifests(builder, tableId);
+        new InlineDeltaCodec.NewSnapshotManifests(builder, tableId, delta);
     Set<Long> added = new HashSet<>();
     for (DeltaUpdate update : delta.updates) {
       if (update instanceof AddSnapshotUpdate) {
@@ -137,8 +137,7 @@ final class NativeDelta {
         builder.addManifestToPool(tableId, resolved);
         newSnapshots.addManifest(current, add.snapshotId, resolved.path(), add.position);
       } else if (update instanceof RemoveManifestUpdate) {
-        RemoveManifestUpdate rm = (RemoveManifestUpdate) update;
-        newSnapshots.removeManifest(current, rm.snapshotId, rm.manifestPathSuffix);
+        newSnapshots.removeManifest(current, (RemoveManifestUpdate) update);
       }
     }
     newSnapshots.finish();

@@ -49,6 +49,7 @@ import org.apache.iceberg.InlineDeltaSnapshots;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.UnboundPartitionSpec;
 import org.apache.iceberg.UnboundSortOrder;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.util.ByteBuffers;
 import org.apache.iceberg.util.JsonUtil;
 
@@ -99,6 +100,7 @@ public class InlineDeltaCodec {
   private static final int ADD_MF_POSITION = 3; // optional; varint
   private static final int REMOVE_MF_SNAPSHOT_ID = 1;
   private static final int REMOVE_MF_PATH_SUFFIX = 2;
+  private static final int REMOVE_MF_PARENT_INDICES = 3; // packed varints
 
   // Remove-schema / remove-spec field numbers (Iceberg metadata maintenance:
   // expireSnapshots().cleanExpiredMetadata(true) prunes unreachable schemas
@@ -233,7 +235,28 @@ public class InlineDeltaCodec {
   private static final int CS_TOTAL_DELETE_FILES = 9;
   private static final int CS_TOTAL_EQUALITY_DELETES = 10;
   private static final int CS_TOTAL_POSITION_DELETES = 11;
+  private static final int CS_CHANGED_PARTITION_COUNT = 12;
+  private static final int CS_DELETED_DATA_FILES = 13;
+  private static final int CS_DELETED_RECORDS = 14;
   private static final int CS_EXTRA = 15;
+  private static final int CS_REMOVED_FILES_SIZE = 16;
+  private static final int CS_MANIFESTS_CREATED = 17;
+  private static final int CS_MANIFESTS_REPLACED = 18;
+  private static final int CS_MANIFESTS_KEPT = 19;
+  private static final int CS_ENTRIES_PROCESSED = 20;
+  private static final int CS_REMOVED_DELETE_FILES = 21;
+  private static final int CS_ADDED_POSITION_DELETES = 22;
+  private static final int CS_REMOVED_POSITION_DELETES = 23;
+  private static final int CS_ADDED_EQUALITY_DELETES = 24;
+  private static final int CS_REMOVED_EQUALITY_DELETES = 25;
+  private static final int CS_ADDED_POSITION_DELETE_FILES = 26;
+  private static final int CS_REMOVED_POSITION_DELETE_FILES = 27;
+  private static final int CS_ADDED_EQUALITY_DELETE_FILES = 28;
+  private static final int CS_REMOVED_EQUALITY_DELETE_FILES = 29;
+  private static final int CS_ADDED_DVS = 30;
+  private static final int CS_REMOVED_DVS = 31;
+  private static final int CS_INHERITS_PARENT_EXTRA = 32;
+  private static final int CS_DROPPED_EXTRA = 33;
 
   // ============================================================
   // Public API
@@ -315,7 +338,7 @@ public class InlineDeltaCodec {
     // Ordering: AddSnapshot must precede AddManifest/RemoveManifest for the same snapshotId
     // (see javadoc). Track added snapshot ids to assert invariant.
     java.util.Set<Long> addedInThisDelta = new java.util.HashSet<>();
-    NewSnapshotManifests newSnapshots = new NewSnapshotManifests(catalogBuilder, tableId);
+    NewSnapshotManifests newSnapshots = new NewSnapshotManifests(catalogBuilder, tableId, decoded);
     TableMetadata current = base;
     // Consecutive TableMetadata updates (snapshots, refs, schema, spec, sort order, properties,
     // ...) apply to one builder, built once, as the writer's were. build() checks the default spec
@@ -387,8 +410,7 @@ public class InlineDeltaCodec {
         newSnapshots.addManifest(
             MetadataView.of(current), add.snapshotId, resolved.path(), add.position);
       } else if (update instanceof RemoveManifestUpdate) {
-        RemoveManifestUpdate rm = (RemoveManifestUpdate) update;
-        newSnapshots.removeManifest(MetadataView.of(current), rm.snapshotId, rm.manifestPathSuffix);
+        newSnapshots.removeManifest(MetadataView.of(current), (RemoveManifestUpdate) update);
       }
     }
     if (pending != null) {
@@ -453,10 +475,34 @@ public class InlineDeltaCodec {
     private final Map<Long, List<String>> added = new HashMap<>();
     private final Map<Long, List<Integer>> positions = new HashMap<>();
     private final Map<Long, List<String>> removedSuffixes = new HashMap<>();
+    // The list each new snapshot's writer built on, its parent's, by snapshot: what the indices of
+    // its RemoveManifestUpdate name. Taken before the delta changes any list (it may remove the
+    // parent), from the lists before it; a snapshot's list never changes.
+    private final Map<Long, List<String>> writerLists = new HashMap<>();
 
     NewSnapshotManifests(CatalogState.Builder builder, int tableId) {
+      this(builder, tableId, null);
+    }
+
+    /** For {@code delta}'s new snapshots, before anything of {@code delta} is applied. */
+    NewSnapshotManifests(CatalogState.Builder builder, int tableId, DecodedDelta delta) {
       this.builder = builder;
       this.tableId = tableId;
+      if (delta != null) {
+        for (DeltaUpdate update : delta.updates) {
+          if (update instanceof AddSnapshotUpdate) {
+            AddSnapshotUpdate add = (AddSnapshotUpdate) update;
+            writerLists.put(add.snapshotId, list(add.parentSnapshotId));
+          }
+        }
+      }
+    }
+
+    /** The inline list of {@code snapshotId} (null: none), or null if the table has none. */
+    private List<String> list(Long snapshotId) {
+      return snapshotId != null && builder.hasSnapshotManifests(tableId, snapshotId)
+          ? builder.snapshotManifestPaths(tableId, snapshotId)
+          : null;
     }
 
     /** Registers {@code snapshotId}, just added to {@code current}, unless it has a list. */
@@ -496,7 +542,27 @@ public class InlineDeltaCodec {
       }
     }
 
-    void removeManifest(MetadataView current, long snapshotId, String suffix) {
+    void removeManifest(MetadataView current, RemoveManifestUpdate remove) {
+      long snapshotId = remove.snapshotId;
+      List<String> writerList;
+      if (writerLists.containsKey(snapshotId)) {
+        writerList = writerLists.get(snapshotId);
+      } else {
+        Snapshot snap = current.snapshot(snapshotId);
+        writerList = list(snap != null ? snap.parentId() : null);
+      }
+      List<String> removed = remove.removed(writerList);
+      if (removed == null) {
+        throw new IllegalStateException(
+            "RemoveManifestUpdate for snapshot " + snapshotId
+                + " names an index its parent's list lacks");
+      }
+      for (String suffix : removed) {
+        removeManifest(current, snapshotId, suffix);
+      }
+    }
+
+    private void removeManifest(MetadataView current, long snapshotId, String suffix) {
       if (parents.containsKey(snapshotId)) {
         removedSuffixes.computeIfAbsent(snapshotId, k -> new ArrayList<>()).add(suffix);
       }
@@ -605,8 +671,7 @@ public class InlineDeltaCodec {
         newSnapshots.addManifest(
             MetadataView.of(current), add.snapshotId, resolved.path(), add.position);
       } else if (update instanceof RemoveManifestUpdate) {
-        RemoveManifestUpdate rm = (RemoveManifestUpdate) update;
-        newSnapshots.removeManifest(MetadataView.of(current), rm.snapshotId, rm.manifestPathSuffix);
+        newSnapshots.removeManifest(MetadataView.of(current), (RemoveManifestUpdate) update);
       } else if (update instanceof RemoveSnapshotsUpdate) {
         catalogBuilder.removeSnapshotManifests(
             tableId, ((RemoveSnapshotsUpdate) update).snapshotIds);
@@ -702,7 +767,7 @@ public class InlineDeltaCodec {
         }
       }
       for (DeltaUpdate update : updates) {
-        byte[] updateBytes = encodeUpdate(update);
+        byte[] updateBytes = encodeUpdate(update, base);
         writeLengthDelimited(out, DELTA_UPDATES, updateBytes);
       }
       return out.toByteArray();
@@ -1612,7 +1677,15 @@ public class InlineDeltaCodec {
   public static class AddSnapshotUpdate implements DeltaUpdate {
     public final long snapshotId;
     public final String manifestListSuffix;
+    /**
+     * The summary's entries the update states. With {@link #inheritsParentExtra}, the summary also
+     * has its parent's extra entries, less {@link #droppedExtra} ({@link #summary(MetadataView)}).
+     */
     public final Map<String, String> summary;
+    /** Whether the summary has its parent's extra entries too (CompactSummary). */
+    public final boolean inheritsParentExtra;
+    /** The parent's extra entries the summary does not have. */
+    public final List<String> droppedExtra;
     public final long timestampDeltaMs;
     // Optional fields. Absent values:
     //   schemaId == null          -> base.currentSchemaId() (schema 0 included when present)
@@ -1656,9 +1729,21 @@ public class InlineDeltaCodec {
         long snapshotId, String manifestListSuffix, Map<String, String> summary,
         long timestampDeltaMs, Integer schemaId, Long addedRows,
         Long parentSnapshotId, Long firstRowId, String keyId, Footprint footprint) {
+      this(snapshotId, manifestListSuffix, summary, false, List.of(), timestampDeltaMs, schemaId,
+          addedRows, parentSnapshotId, firstRowId, keyId, footprint);
+    }
+
+    /** As decoded: a summary that may have its parent's extra entries too. */
+    AddSnapshotUpdate(
+        long snapshotId, String manifestListSuffix, Map<String, String> summary,
+        boolean inheritsParentExtra, List<String> droppedExtra,
+        long timestampDeltaMs, Integer schemaId, Long addedRows,
+        Long parentSnapshotId, Long firstRowId, String keyId, Footprint footprint) {
       this.snapshotId = snapshotId;
       this.manifestListSuffix = manifestListSuffix;
       this.summary = summary;
+      this.inheritsParentExtra = inheritsParentExtra;
+      this.droppedExtra = droppedExtra;
       this.timestampDeltaMs = timestampDeltaMs;
       this.schemaId = schemaId;
       this.addedRows = addedRows;
@@ -1687,8 +1772,15 @@ public class InlineDeltaCodec {
       // v1 tables don't carry sequence numbers; TableMetadata's constructor rejects
       // any non-zero value. Synthesize seqNum only for v2+.
       long seqNum = base.formatVersion() >= 2 ? base.lastSequenceNumber() + 1 : 0;
+      Map<String, String> resolvedSummary = summary(MetadataView.of(base));
+      Preconditions.checkState(
+          resolvedSummary != null, "Snapshot %s inherits the summary of a snapshot %s lacks",
+          snapshotId, base.metadataFileLocation());
       Snapshot snapshot =
-          snapshot(seqNum, base.currentSchemaId(), manifestListPrefix, deltaUpdatedMillis);
+          snapshot(
+              seqNum, base.currentSchemaId(), manifestListPrefix, deltaUpdatedMillis,
+              parentSnapshotId, deltaUpdatedMillis + timestampDeltaMs, firstRowId,
+              resolvedSummary);
       // Iceberg's builder no longer takes last-updated-ms from an added snapshot (since 1.12.0),
       // so pin it to the snapshot's time, as it was, rather than the wall clock.
       return TableMetadata.buildFrom(base)
@@ -1699,18 +1791,28 @@ public class InlineDeltaCodec {
     }
 
     /**
-     * The snapshot this update adds, numbered {@code sequenceNumber}, with its timestamp relative
-     * to {@code deltaUpdatedMillis}, the delta's last-updated-ms, and, if the delta names none,
-     * schema {@code currentSchemaId}: the current schema of the table it lands on.
+     * The snapshot's summary on {@code table}, the table its delta lands on: the entries the update
+     * states, and, if it inherits them, its parent's extra entries there, less those it drops and
+     * those it states. Null if it inherits them and {@code table} lacks its parent.
      */
-    Snapshot snapshot(
-        long sequenceNumber,
-        int currentSchemaId,
-        String manifestListPrefix,
-        long deltaUpdatedMillis) {
-      return snapshot(
-          sequenceNumber, currentSchemaId, manifestListPrefix, deltaUpdatedMillis,
-          parentSnapshotId, deltaUpdatedMillis + timestampDeltaMs, firstRowId, summary);
+    Map<String, String> summary(MetadataView table) {
+      if (!inheritsParentExtra) {
+        return summary;
+      }
+      Snapshot parent = parentSnapshotId != null ? table.snapshot(parentSnapshotId) : null;
+      if (parent == null) {
+        return null;
+      }
+      Map<String, String> resolved = new HashMap<>(summary);
+      Map<String, String> parentSummary = parent.summary() != null ? parent.summary() : Map.of();
+      // In key order, so every replica builds the same map whatever order its parent's has
+      for (String key : new java.util.TreeSet<>(parentSummary.keySet())) {
+        String value = parentSummary.get(key);
+        if (inheritable(key, value) && !droppedExtra.contains(key) && !resolved.containsKey(key)) {
+          resolved.put(key, value);
+        }
+      }
+      return resolved;
     }
 
     /** The snapshot this update adds where its delta lands, its late-bound fields finalized. */
@@ -1806,15 +1908,53 @@ public class InlineDeltaCodec {
   }
 
   /**
-   * Removes a ManifestFile from a snapshot's inline manifest list by path suffix.
+   * Removes manifests from a new snapshot's inline manifest list: one by path suffix, or those at
+   * {@link #parentIndices} in its parent's list, the list of the snapshot its AddSnapshotUpdate
+   * names as parent ({@link #removed}).
    */
   public static class RemoveManifestUpdate implements DeltaUpdate {
     public final long snapshotId;
+    /** The path suffix of the manifest it removes; null if it names them by index. */
     public final String manifestPathSuffix;
+    /** The indices in the parent's list of the manifests it removes, ascending; null if none. */
+    public final int[] parentIndices;
 
     public RemoveManifestUpdate(long snapshotId, String manifestPathSuffix) {
+      this(snapshotId, manifestPathSuffix, null);
+    }
+
+    public RemoveManifestUpdate(long snapshotId, int[] parentIndices) {
+      this(snapshotId, null, parentIndices);
+    }
+
+    private RemoveManifestUpdate(long snapshotId, String manifestPathSuffix, int[] parentIndices) {
       this.snapshotId = snapshotId;
       this.manifestPathSuffix = manifestPathSuffix;
+      this.parentIndices = parentIndices;
+    }
+
+    /**
+     * What it removes, each matched as the end of a path: its path suffix, and the paths at its
+     * indices in {@code parentList}, its parent's list (null if the table has none). Null if it
+     * names an index that list lacks, or names any without one.
+     */
+    List<String> removed(List<String> parentList) {
+      List<String> removed = new ArrayList<>();
+      if (manifestPathSuffix != null) {
+        removed.add(manifestPathSuffix);
+      }
+      if (parentIndices != null) {
+        if (parentList == null) {
+          return null;
+        }
+        for (int index : parentIndices) {
+          if (index < 0 || index >= parentList.size()) {
+            return null;
+          }
+          removed.add(parentList.get(index));
+        }
+      }
+      return removed;
     }
 
     @Override
@@ -1848,9 +1988,34 @@ public class InlineDeltaCodec {
   public static void attachManifestDelta(
       List<DeltaUpdate> delta, long snapshotId, List<ManifestFile> added,
       List<Integer> positions, List<String> removedPaths, String pathPrefix) {
+    attachManifestDelta(delta, snapshotId, added, positions, removedPaths, null, pathPrefix);
+  }
+
+  /**
+   * Like {@link #attachManifestDelta(List, long, List, List, List, String)}, naming the removed
+   * manifests by their indices in {@code parentPaths}, the paths of the snapshot's parent's list,
+   * if it is the list replay holds for the parent (the parent's inline list in the state the delta
+   * is computed on, not one the commit sends); null to name them by path.
+   */
+  public static void attachManifestDelta(
+      List<DeltaUpdate> delta, long snapshotId, List<ManifestFile> added,
+      List<Integer> positions, List<String> removedPaths, List<String> parentPaths,
+      String pathPrefix) {
     for (int i = 0; i < added.size(); i++) {
       delta.add(new AddManifestUpdate(
           snapshotId, added.get(i), pathPrefix, positions == null ? null : positions.get(i)));
+    }
+    if (parentPaths != null && !removedPaths.isEmpty()) {
+      Map<String, Integer> index = new HashMap<>();
+      for (int i = 0; i < parentPaths.size(); i++) {
+        index.putIfAbsent(parentPaths.get(i), i);
+      }
+      if (index.size() == parentPaths.size() && index.keySet().containsAll(removedPaths)) {
+        delta.add(new RemoveManifestUpdate(
+            snapshotId,
+            removedPaths.stream().mapToInt(index::get).distinct().sorted().toArray()));
+        return;
+      }
     }
     for (String path : removedPaths) {
       String suffix = path;
@@ -1865,7 +2030,12 @@ public class InlineDeltaCodec {
   // Encoding
   // ============================================================
 
-  private static byte[] encodeUpdate(DeltaUpdate update) throws IOException {
+  /**
+   * Encodes {@code update}, of a delta from {@code base} (null: a delta of manifest updates only,
+   * which lands with full metadata). A new snapshot whose parent is in {@code base} states only the
+   * summary entries that differ from its parent's, where that is shorter.
+   */
+  private static byte[] encodeUpdate(DeltaUpdate update, TableMetadata base) throws IOException {
     ByteArrayOutputStream out = new ByteArrayOutputStream();
 
     if (update instanceof SetPropertiesUpdate) {
@@ -1974,8 +2144,11 @@ public class InlineDeltaCodec {
       ByteArrayOutputStream inner = new ByteArrayOutputStream();
       writeFixed64(inner, SNAP_ID, u.snapshotId);
       writeString(inner, SNAP_MANIFEST_SUFFIX, u.manifestListSuffix);
-      // encode summary as CompactSummary
-      writeLengthDelimited(inner, SNAP_SUMMARY, encodeCompactSummary(u.summary));
+      DecodedSummary summary =
+          u.inheritsParentExtra
+              ? new DecodedSummary(u.summary, true, u.droppedExtra)
+              : stated(u.summary, parentSummary(base, u.parentSnapshotId));
+      writeLengthDelimited(inner, SNAP_SUMMARY, encodeCompactSummary(summary));
       writeSVarint64(inner, SNAP_TIMESTAMP_DELTA, u.timestampDeltaMs);
       if (u.schemaId != null) {
         writeVarint(inner, SNAP_SCHEMA_ID, u.schemaId);
@@ -2013,7 +2186,16 @@ public class InlineDeltaCodec {
       RemoveManifestUpdate u = (RemoveManifestUpdate) update;
       ByteArrayOutputStream inner = new ByteArrayOutputStream();
       writeFixed64(inner, REMOVE_MF_SNAPSHOT_ID, u.snapshotId);
-      writeString(inner, REMOVE_MF_PATH_SUFFIX, u.manifestPathSuffix);
+      if (u.manifestPathSuffix != null) {
+        writeString(inner, REMOVE_MF_PATH_SUFFIX, u.manifestPathSuffix);
+      }
+      if (u.parentIndices != null) {
+        ByteArrayOutputStream packed = new ByteArrayOutputStream();
+        for (int index : u.parentIndices) {
+          writeRawVarint(packed, index);
+        }
+        writeLengthDelimited(inner, REMOVE_MF_PARENT_INDICES, packed.toByteArray());
+      }
       writeLengthDelimited(out, UPDATE_REMOVE_MANIFEST, inner.toByteArray());
     }
 
@@ -2097,7 +2279,8 @@ public class InlineDeltaCodec {
   private static RemoveManifestUpdate decodeRemoveManifest(byte[] bytes) throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
     long snapshotId = 0;
-    String pathSuffix = "";
+    String pathSuffix = null;
+    List<Integer> indices = null;
 
     while (in.available() > 0) {
       int tag = readVarint(in);
@@ -2109,11 +2292,28 @@ public class InlineDeltaCodec {
         case REMOVE_MF_PATH_SUFFIX:
           pathSuffix = readString(in);
           break;
+        case REMOVE_MF_PARENT_INDICES:
+          if (indices == null) {
+            indices = new ArrayList<>();
+          }
+          if ((tag & 0x7) == 2) { // packed
+            ByteArrayInputStream packed = new ByteArrayInputStream(readLengthDelimitedBytes(in));
+            while (packed.available() > 0) {
+              indices.add(readVarint(packed));
+            }
+          } else {
+            indices.add(readVarint(in));
+          }
+          break;
         default:
           skipField(in, tag & 0x7);
       }
     }
-    return new RemoveManifestUpdate(snapshotId, pathSuffix);
+    if (indices == null) {
+      return new RemoveManifestUpdate(snapshotId, pathSuffix != null ? pathSuffix : "");
+    }
+    return new RemoveManifestUpdate(
+        snapshotId, pathSuffix, indices.stream().mapToInt(Integer::intValue).toArray());
   }
 
   private static SetPropertiesUpdate decodeSetProperties(byte[] bytes) throws IOException {
@@ -2350,7 +2550,7 @@ public class InlineDeltaCodec {
     long snapId = 0, timestampDelta = 0;
     Long addedRows = null;
     String manifestSuffix = "";
-    Map<String, String> summary = new HashMap<>();
+    DecodedSummary summary = new DecodedSummary(new HashMap<>(), false, List.of());
     Integer schemaId = null;
     Long parentId = null;
     Long firstRowId = null;
@@ -2376,7 +2576,8 @@ public class InlineDeltaCodec {
         default: skipField(in, tag & 0x7);
       }
     }
-    return new AddSnapshotUpdate(snapId, manifestSuffix, summary, timestampDelta,
+    return new AddSnapshotUpdate(snapId, manifestSuffix, summary.entries,
+        summary.inheritsParentExtra, summary.droppedExtra, timestampDelta,
         schemaId, addedRows, parentId, firstRowId, keyId, footprint);
   }
 
@@ -2534,49 +2735,179 @@ public class InlineDeltaCodec {
 
   private static final String[] OPERATION_NAMES = {"append", "overwrite", "delete", "replace"};
 
+  /** The summary's counts CompactSummary's typed fields hold: each key's field number. */
+  private static final Map<String, Integer> SUMMARY_COUNTS = new LinkedHashMap<>();
+  /** The key of each typed count's field number. */
+  private static final Map<Integer, String> SUMMARY_COUNT_KEYS = new HashMap<>();
+
+  static {
+    SUMMARY_COUNTS.put("added-data-files", CS_ADDED_DATA_FILES);
+    SUMMARY_COUNTS.put("added-records", CS_ADDED_RECORDS);
+    SUMMARY_COUNTS.put("added-files-size", CS_ADDED_FILES_SIZE);
+    SUMMARY_COUNTS.put("total-data-files", CS_TOTAL_DATA_FILES);
+    SUMMARY_COUNTS.put("total-records", CS_TOTAL_RECORDS);
+    SUMMARY_COUNTS.put("total-files-size", CS_TOTAL_FILES_SIZE);
+    SUMMARY_COUNTS.put("added-delete-files", CS_ADDED_DELETE_FILES);
+    SUMMARY_COUNTS.put("total-delete-files", CS_TOTAL_DELETE_FILES);
+    SUMMARY_COUNTS.put("total-equality-deletes", CS_TOTAL_EQUALITY_DELETES);
+    SUMMARY_COUNTS.put("total-position-deletes", CS_TOTAL_POSITION_DELETES);
+    SUMMARY_COUNTS.put("changed-partition-count", CS_CHANGED_PARTITION_COUNT);
+    SUMMARY_COUNTS.put("deleted-data-files", CS_DELETED_DATA_FILES);
+    SUMMARY_COUNTS.put("deleted-records", CS_DELETED_RECORDS);
+    SUMMARY_COUNTS.put("removed-files-size", CS_REMOVED_FILES_SIZE);
+    SUMMARY_COUNTS.put("manifests-created", CS_MANIFESTS_CREATED);
+    SUMMARY_COUNTS.put("manifests-replaced", CS_MANIFESTS_REPLACED);
+    SUMMARY_COUNTS.put("manifests-kept", CS_MANIFESTS_KEPT);
+    SUMMARY_COUNTS.put("entries-processed", CS_ENTRIES_PROCESSED);
+    SUMMARY_COUNTS.put("removed-delete-files", CS_REMOVED_DELETE_FILES);
+    SUMMARY_COUNTS.put("added-position-deletes", CS_ADDED_POSITION_DELETES);
+    SUMMARY_COUNTS.put("removed-position-deletes", CS_REMOVED_POSITION_DELETES);
+    SUMMARY_COUNTS.put("added-equality-deletes", CS_ADDED_EQUALITY_DELETES);
+    SUMMARY_COUNTS.put("removed-equality-deletes", CS_REMOVED_EQUALITY_DELETES);
+    SUMMARY_COUNTS.put("added-position-delete-files", CS_ADDED_POSITION_DELETE_FILES);
+    SUMMARY_COUNTS.put("removed-position-delete-files", CS_REMOVED_POSITION_DELETE_FILES);
+    SUMMARY_COUNTS.put("added-equality-delete-files", CS_ADDED_EQUALITY_DELETE_FILES);
+    SUMMARY_COUNTS.put("removed-equality-delete-files", CS_REMOVED_EQUALITY_DELETE_FILES);
+    SUMMARY_COUNTS.put("added-dvs", CS_ADDED_DVS);
+    SUMMARY_COUNTS.put("removed-dvs", CS_REMOVED_DVS);
+    SUMMARY_COUNTS.forEach((key, field) -> SUMMARY_COUNT_KEYS.put(field, key));
+  }
+
+  /** A summary as CompactSummary holds it: its stated entries, and what it takes of its parent's. */
+  private static final class DecodedSummary {
+    private final Map<String, String> entries;
+    private final boolean inheritsParentExtra;
+    private final List<String> droppedExtra;
+
+    private DecodedSummary(
+        Map<String, String> entries, boolean inheritsParentExtra, List<String> droppedExtra) {
+      this.entries = entries;
+      this.inheritsParentExtra = inheritsParentExtra;
+      this.droppedExtra = droppedExtra;
+    }
+  }
+
+  /** Whether CompactSummary holds {@code key} with {@code value} in a typed field, not an extra. */
+  private static boolean typed(String key, String value) {
+    if ("operation".equals(key)) {
+      return Arrays.asList(OPERATION_NAMES).contains(value);
+    }
+    return SUMMARY_COUNTS.containsKey(key) && plainNumber(value) != null;
+  }
+
+  /**
+   * Whether a child's summary can take {@code key} with {@code value} from its parent's: an extra
+   * entry, but the operation, which a summary always states (the decoder's default is "append").
+   */
+  static boolean inheritable(String key, String value) {
+    return !"operation".equals(key) && !typed(key, value);
+  }
+
+  /** {@code value} as a number if it is one written plainly ("7", not "07" or "+7"); else null. */
+  private static Long plainNumber(String value) {
+    if (value == null) {
+      return null;
+    }
+    try {
+      long v = Long.parseLong(value);
+      return String.valueOf(v).equals(value) ? v : null;
+    } catch (NumberFormatException e) {
+      return null;
+    }
+  }
+
+  /**
+   * The summary {@code summary} of a snapshot whose parent's summary is {@code parent} (null: none
+   * to inherit from), as a delta states it: whether it takes its parent's extra entries, if that
+   * saves bytes, and then the entries it states and the parent's it drops.
+   */
+  private static DecodedSummary stated(Map<String, String> summary, Map<String, String> parent) {
+    if (parent == null) {
+      return new DecodedSummary(summary, false, List.of());
+    }
+    Map<String, String> stated = new LinkedHashMap<>(summary);
+    List<String> dropped = new ArrayList<>();
+    int saved = 0;
+    int cost = 2; // the flag
+    for (Map.Entry<String, String> entry : parent.entrySet()) {
+      if (!inheritable(entry.getKey(), entry.getValue())) {
+        continue;
+      }
+      String value = summary.get(entry.getKey());
+      if (value == null) {
+        dropped.add(entry.getKey());
+        cost += entry.getKey().length() + 3;
+      } else if (value.equals(entry.getValue())) {
+        stated.remove(entry.getKey());
+        saved += entry.getKey().length() + value.length() + 6;
+      }
+    }
+    if (saved <= cost) {
+      return new DecodedSummary(summary, false, List.of());
+    }
+    java.util.Collections.sort(dropped);
+    return new DecodedSummary(stated, true, dropped);
+  }
+
+  /** The summary of snapshot {@code parentId} in {@code base}; null if either is null or lacks it. */
+  private static Map<String, String> parentSummary(TableMetadata base, Long parentId) {
+    Snapshot parent = base != null && parentId != null ? base.snapshot(parentId) : null;
+    if (parent == null) {
+      return null;
+    }
+    return parent.summary() != null ? parent.summary() : Map.of();
+  }
+
   /**
    * Encodes a snapshot summary: the operation and the standard counts as typed fields, every other
    * entry as an extra. An entry a typed field cannot hold exactly -- an operation not in {@link
    * #OPERATION_NAMES}, a count not written as a plain number -- is an extra too. A count is written
-   * whenever the summary has it, 0 included: an absent count is unknown, not zero.
+   * whenever the summary has it, 0 included: an absent count is unknown, not zero. With {@code
+   * inheritsParentExtra}, the summary also has its parent's extra entries, less {@code dropped}.
    */
-  private static byte[] encodeCompactSummary(Map<String, String> summary) throws IOException {
+  private static byte[] encodeCompactSummary(DecodedSummary summary) throws IOException {
     ByteArrayOutputStream out = new ByteArrayOutputStream();
-    Set<String> typed = new HashSet<>();
-    String op = summary.getOrDefault("operation", "append");
-    int opVal = java.util.Arrays.asList(OPERATION_NAMES).indexOf(op);
+    Map<String, String> entries = summary.entries;
+    String op = entries.getOrDefault("operation", "append");
+    int opVal = Arrays.asList(OPERATION_NAMES).indexOf(op);
     if (opVal > 0) {
-      writeVarint(out, CS_OPERATION, opVal);
+      writeVarint(out, CS_OPERATION, opVal); // "append" is the decoder's default
     }
-    if (opVal >= 0) {
-      typed.add("operation"); // "append" is the decoder's default
+    for (Map.Entry<String, Integer> count : SUMMARY_COUNTS.entrySet()) {
+      Long value = plainNumber(entries.get(count.getKey()));
+      if (value != null) {
+        writeVarint64(out, count.getValue(), value);
+      }
     }
-    writeSummaryLong(out, summary, "added-data-files", CS_ADDED_DATA_FILES, typed);
-    writeSummaryLong(out, summary, "added-records", CS_ADDED_RECORDS, typed);
-    writeSummaryLong(out, summary, "added-files-size", CS_ADDED_FILES_SIZE, typed);
-    writeSummaryLong(out, summary, "total-data-files", CS_TOTAL_DATA_FILES, typed);
-    writeSummaryLong(out, summary, "total-records", CS_TOTAL_RECORDS, typed);
-    writeSummaryLong(out, summary, "total-files-size", CS_TOTAL_FILES_SIZE, typed);
-    writeSummaryLong(out, summary, "added-delete-files", CS_ADDED_DELETE_FILES, typed);
-    writeSummaryLong(out, summary, "total-delete-files", CS_TOTAL_DELETE_FILES, typed);
-    writeSummaryLong(out, summary, "total-equality-deletes", CS_TOTAL_EQUALITY_DELETES, typed);
-    writeSummaryLong(out, summary, "total-position-deletes", CS_TOTAL_POSITION_DELETES, typed);
-    for (Map.Entry<String, String> e : summary.entrySet()) {
-      if (!typed.contains(e.getKey())) {
+    for (Map.Entry<String, String> e : entries.entrySet()) {
+      if (!typed(e.getKey(), e.getValue())) {
         out.write(encodeMapEntry(CS_EXTRA, e.getKey(), e.getValue()));
+      }
+    }
+    if (summary.inheritsParentExtra) {
+      writeVarint(out, CS_INHERITS_PARENT_EXTRA, 1);
+      for (String key : summary.droppedExtra) {
+        writeString(out, CS_DROPPED_EXTRA, key);
       }
     }
     return out.toByteArray();
   }
 
-  private static Map<String, String> decodeCompactSummary(byte[] bytes) throws IOException {
+  private static DecodedSummary decodeCompactSummary(byte[] bytes) throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
     Map<String, String> summary = new HashMap<>();
     summary.put("operation", "append"); // default
+    boolean inherits = false;
+    List<String> dropped = new ArrayList<>();
 
     while (in.available() > 0) {
       int tag = readVarint(in);
       int fn = tag >>> 3;
+      String count = SUMMARY_COUNT_KEYS.get(fn);
+      if (count != null) {
+        summary.put(count, String.valueOf(readVarint64(in)));
+        continue;
+      }
       switch (fn) {
         case CS_OPERATION:
           int op = readVarint(in);
@@ -2584,52 +2915,16 @@ public class InlineDeltaCodec {
             summary.put("operation", OPERATION_NAMES[op]);
           }
           break;
-        case CS_ADDED_DATA_FILES:
-          summary.put("added-data-files", String.valueOf(readVarint64(in))); break;
-        case CS_ADDED_RECORDS:
-          summary.put("added-records", String.valueOf(readVarint64(in))); break;
-        case CS_ADDED_FILES_SIZE:
-          summary.put("added-files-size", String.valueOf(readVarint64(in))); break;
-        case CS_TOTAL_DATA_FILES:
-          summary.put("total-data-files", String.valueOf(readVarint64(in))); break;
-        case CS_TOTAL_RECORDS:
-          summary.put("total-records", String.valueOf(readVarint64(in))); break;
-        case CS_TOTAL_FILES_SIZE:
-          summary.put("total-files-size", String.valueOf(readVarint64(in))); break;
-        case CS_ADDED_DELETE_FILES:
-          summary.put("added-delete-files", String.valueOf(readVarint64(in))); break;
-        case CS_TOTAL_DELETE_FILES:
-          summary.put("total-delete-files", String.valueOf(readVarint64(in))); break;
-        case CS_TOTAL_EQUALITY_DELETES:
-          summary.put("total-equality-deletes", String.valueOf(readVarint64(in))); break;
-        case CS_TOTAL_POSITION_DELETES:
-          summary.put("total-position-deletes", String.valueOf(readVarint64(in))); break;
         case CS_EXTRA:
           decodeMapEntry(readLengthDelimitedBytes(in), summary); break;
+        case CS_INHERITS_PARENT_EXTRA:
+          inherits = readVarint(in) != 0; break;
+        case CS_DROPPED_EXTRA:
+          dropped.add(readString(in)); break;
         default: skipField(in, tag & 0x7);
       }
     }
-    return summary;
-  }
-
-  /** Writes {@code key} as a typed field, adding it to {@code typed}, if it is a plain number. */
-  private static void writeSummaryLong(
-      ByteArrayOutputStream out, Map<String, String> summary, String key, int fieldNum,
-      Set<String> typed) throws IOException {
-    String val = summary.get(key);
-    if (val == null) {
-      return;
-    }
-    long v;
-    try {
-      v = Long.parseLong(val);
-    } catch (NumberFormatException e) {
-      return;
-    }
-    if (String.valueOf(v).equals(val)) {
-      writeVarint64(out, fieldNum, v);
-      typed.add(key);
-    }
+    return new DecodedSummary(summary, inherits, dropped);
   }
 
   // ============================================================

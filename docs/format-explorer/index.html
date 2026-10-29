@@ -659,7 +659,8 @@
       "RemoveManifestDelta": {
         "fields": [
           {"number": 1, "name": "snapshot_id", "type": "fixed64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
-          {"number": 2, "name": "manifest_path_suffix", "type": "string", "repeated": false, "packed": false, "oneof": null, "comment": ""}
+          {"number": 2, "name": "manifest_path_suffix", "type": "string", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 3, "name": "parent_indices", "type": "uint32", "repeated": true, "packed": true, "oneof": null, "comment": ""}
         ]
       },
       "AddSnapshot": {
@@ -718,7 +719,28 @@
           {"number": 9, "name": "total_delete_files", "type": "int64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
           {"number": 10, "name": "total_equality_deletes", "type": "int64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
           {"number": 11, "name": "total_position_deletes", "type": "int64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
-          {"number": 15, "name": "extra", "type": "map\u003cstring,string>", "repeated": true, "packed": false, "oneof": null, "comment": ""}
+          {"number": 12, "name": "changed_partition_count", "type": "int64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 13, "name": "deleted_data_files", "type": "int64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 14, "name": "deleted_records", "type": "int64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 15, "name": "extra", "type": "map\u003cstring,string>", "repeated": true, "packed": false, "oneof": null, "comment": ""},
+          {"number": 16, "name": "removed_files_size", "type": "int64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 17, "name": "manifests_created", "type": "int64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 18, "name": "manifests_replaced", "type": "int64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 19, "name": "manifests_kept", "type": "int64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 20, "name": "entries_processed", "type": "int64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 21, "name": "removed_delete_files", "type": "int64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 22, "name": "added_position_deletes", "type": "int64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 23, "name": "removed_position_deletes", "type": "int64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 24, "name": "added_equality_deletes", "type": "int64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 25, "name": "removed_equality_deletes", "type": "int64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 26, "name": "added_position_delete_files", "type": "int64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 27, "name": "removed_position_delete_files", "type": "int64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 28, "name": "added_equality_delete_files", "type": "int64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 29, "name": "removed_equality_delete_files", "type": "int64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 30, "name": "added_dvs", "type": "int64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 31, "name": "removed_dvs", "type": "int64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 32, "name": "inherits_parent_extra", "type": "bool", "repeated": false, "packed": false, "oneof": null, "comment": "In an AddSnapshot of a delta (TableMetadataDelta): the summary also has the extra entries of its parent's summary (the entries of it these typed fields would not hold), less those named in dropped_extra and those extra sets. Its parent is the snapshot AddSnapshot names, which the writer read: replay takes them from the parent where the record lands, and a record whose parent the table no longer has does not apply there (SPEC_TM.md \"Summaries\"). Iceberg's iceberg-version and the engine's entries are the same in every snapshot a writer makes."},
+          {"number": 33, "name": "dropped_extra", "type": "string", "repeated": true, "packed": true, "oneof": null, "comment": ""}
         ]
       },
       "SetSnapshotRef": {
