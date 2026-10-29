@@ -115,7 +115,11 @@ final class BenchConfig {
           // the maintenance client's retries (-1: retry_num), so expiry can keep up with appends
           + "\"expire_retry_num\": -1,"
           // write every record the catalog's writes landed, in order, to log.bin (IngestBench)
-          + "\"capture_log\": false"
+          + "\"capture_log\": false,"
+          // the format of the records a captured log holds (IngestBench sets the current one), so
+          // a change of format captures anew: 1 before RemoveManifestDelta.parent_indices and
+          // CompactSummary.inherits_parent_extra (2026-10-29)
+          + "\"capture_format\": 1"
           + "}";
 
   private final ObjectNode node;
@@ -241,7 +245,7 @@ final class BenchConfig {
    */
   private static final Map<String, String> LATER_KEYS =
       Map.of("expire_older_than_s", "0", "race_min_wait_ms", "20", "expire_retry_num", "-1",
-          "capture_log", "false");
+          "capture_log", "false", "capture_format", "1");
 
   /**
    * The first 12 hex digits of the SHA-256 of the configuration, less its label, its repetition and

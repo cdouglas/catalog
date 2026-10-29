@@ -1,13 +1,17 @@
 -- Record bytes by what they carry (source anatomy, fact record_fields), per capture: the groups
 -- docs/FORMAT.md ranks. A snapshot id counts once per field it appears in: the new snapshot's own
 -- id, its parent's, its ref's, and each added or removed manifest's (the snapshot whose list it
--- changes); expiry's ids (RemoveSnapshots) are other. Bytes include each field's tag and length.
+-- changes); expiry's ids (RemoveSnapshots) are other. A summary's extra entries are split by key
+-- (path{key}), and what it takes of its parent's (inherits_parent_extra, dropped_extra) counts
+-- with them. Bytes include each field's tag and length.
 CREATE OR REPLACE TABLE record_groups AS
 SELECT
   run_id,
   CASE
     WHEN path = 'CompactSummary.extra{iceberg-version}' THEN 'summary: iceberg-version'
-    WHEN path LIKE 'CompactSummary.extra%' THEN 'summary: other entries'
+    WHEN path LIKE 'CompactSummary.extra%' OR path IN (
+        'CompactSummary.inherits_parent_extra', 'CompactSummary.dropped_extra')
+      THEN 'summary: other entries'
     WHEN path LIKE 'CompactSummary.%' THEN 'summary counts'
     WHEN path IN ('AddSnapshot.snapshot_id', 'AddSnapshot.parent_snapshot_id',
                   'SetSnapshotRef.snapshot_id', 'AddManifestDelta.snapshot_id',

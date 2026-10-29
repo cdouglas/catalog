@@ -108,11 +108,22 @@ public final class IngestBench {
     }
   }
 
-  /** The run's workload: its capture configuration, with no store latency, capturing its log. */
+  /**
+   * The format of the records this build writes ({@code capture_format}): raise it with a change
+   * to the records' format, so that a run captures its log anew rather than reading one an earlier
+   * format wrote.
+   */
+  static final int CAPTURE_FORMAT = 2;
+
+  /**
+   * The run's workload: its capture configuration, with no store latency, capturing its log in
+   * this build's format.
+   */
   private static BenchConfig workload(BenchConfig config) {
     ObjectNode capture = ((ObjectNode) config.node().get("capture")).deepCopy();
     capture.put("store", "none");
     capture.put("capture_log", true);
+    capture.put("capture_format", CAPTURE_FORMAT);
     return BenchConfig.expand(capture).get(0);
   }
 
