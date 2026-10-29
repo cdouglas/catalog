@@ -20,6 +20,7 @@ package org.apache.iceberg.io;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -36,15 +37,21 @@ import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+import java.util.zip.GZIPOutputStream;
 import org.apache.iceberg.GenericPartitionFieldSummary;
 import org.apache.iceberg.ManifestFile;
+import org.apache.iceberg.ManifestListFiles;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
+import org.apache.iceberg.Snapshot;
+import org.apache.iceberg.SnapshotRef;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableMetadataParser;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.inmemory.InMemoryOutputFile;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.types.Types;
 import org.intentlog.CommittedSet;
@@ -127,7 +134,8 @@ public class FormatExplorerFixtures {
             inlineManifestList(),
             compactionWithCommittedSetGc(),
             concurrentAppendsMerged(),
-            concurrentAppendRefused());
+            concurrentAppendRefused(),
+            new Day().scenario());
     for (Scenario scenario : scenarios) {
       String violation = CatalogProto.violation(scenario.bytes);
       if (violation != null) {
@@ -837,6 +845,307 @@ public class FormatExplorerFixtures {
         manifest.path(), manifest.length(), manifest.partitionSpecId(), manifest.content().id(),
         sequenceNumber, sequenceNumber, snapshotId, 1, 0, 0, 1_024L, 0L, 0L,
         manifest.partitions(), null, null);
+  }
+
+  /**
+   * A table after a day of commits, against the files Iceberg writes for the same history. One
+   * inline-ML table in the structural codec, a commit every 14.4 minutes: Spark's appends of one
+   * file each, which merge the table's manifests into one once there are {@code
+   * commit.manifest.min-count-to-merge} of them (the table sets 10), an expiry after the 90th
+   * keeping the newest 50 snapshots, and a CAS write at the 91st, after which the day's last nine
+   * commits append. Beside the catalog it keeps the table as Iceberg's files hold it, and measures
+   * them: a metadata.json per commit (uncompressed, Iceberg's default) and a manifest list per
+   * snapshot ({@link ManifestListFiles}: Iceberg's writer).
+   */
+  private static final class Day {
+    static final int COMMITS = 100;
+    static final int EXPIRE_AFTER = 90;
+    static final int KEEP = 50;
+    static final int MIN_COUNT_TO_MERGE = 10;
+    static final long EVERY_MS = 864_000L;
+    static final long RETENTION_MS = 1_800_000L;
+    static final int TODAY = 20_214; // 2025-05-06, days from the epoch
+    final TableIdentifier events = TableIdentifier.of(WAREHOUSE, "events");
+    final String prefix = "s3://lake/warehouse/events/metadata/";
+    final Random random = new Random(15);
+    final List<Long> snapshots = new ArrayList<>();
+    final Map<Long, Integer> listBytes = new LinkedHashMap<>();
+    List<ManifestFile> list = List.of();
+    long totalRecords;
+    long totalSize;
+    Log log;
+    Replica<CatalogState> state;
+    // The table as Iceberg's files hold it, and what they cost
+    TableMetadata iceberg;
+    int metadataFiles;
+    long metadataBytes;
+    long metadataGzipBytes;
+    int lastMetadataBytes;
+    // What the catalog wrote
+    long recordBytes;
+    long appendBytes;
+    int appends;
+    long mergeBytes;
+    int merges;
+    int expiryBytes;
+    int checkpointBytes;
+    int gcBytes;
+    Replica<CatalogState> atCas;
+
+    Day() {
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put("table-name", "events");
+      props.put("commit.manifest.min-count-to-merge", String.valueOf(MIN_COUNT_TO_MERGE));
+      TableMetadata meta =
+          tableMetadata("019000df-0000-7000-8000-000000000001", "s3://lake/warehouse/events",
+              props);
+      byte codec = InlineMetadataCodecs.TAG_STRUCTURAL;
+      byte[] metadata = InlineMetadataCodecs.byTag(codec).encode(meta);
+      log = Log.cas(warehouse(150), txnAt(at(0), 0),
+          mut -> mut.createTableInline(events, metadata, codec), null);
+      state = log.state();
+      iceberg = TableMetadataParser.fromJson(metadataFile(0), TableMetadataParser.toJson(meta));
+      for (int i = 1; i <= EXPIRE_AFTER; i++) {
+        commit(i, null);
+      }
+      expire();
+      atCas = state;
+      log = Log.checkpoint(atCas);
+      checkpointBytes = log.file.length;
+      log.gc(at(EXPIRE_AFTER + 1) - RETENTION_MS,
+          "GC: the CAS write drops the committed ids older than the retention (30 minutes), all "
+              + "but the last two commits' and the expiry's. The checkpoint before it holds every "
+              + "id of the day: a GC is a record, which replay applies.");
+      gcBytes = log.file.length - checkpointBytes;
+      commit(EXPIRE_AFTER + 1,
+          "The 91st commit, the first after the CAS write, is a merge append: its list is one "
+              + "manifest. RemoveManifestDelta names the nine manifests of its parent's list by "
+              + "index (parent_indices 0-8), and AddManifestDelta adds the merged manifest, "
+              + "<commit UUID>-m1.avro, as its UUID and number under the table's prefix. The "
+              + "summary keeps the parent's engine entries (inherits_parent_extra) and states "
+              + "its counts. The snapshot's id is written once, and its parent's.");
+      commit(EXPIRE_AFTER + 2,
+          "A fast append: the new manifest at the head of the list (position 0), m0 of its "
+              + "commit's UUID.");
+      for (int i = EXPIRE_AFTER + 3; i < COMMITS; i++) {
+        commit(i, null);
+      }
+      commit(COMMITS,
+          "The day's last commit merges again: one manifest of the table's 100 files "
+              + "(existing_files_count 99), its min_sequence_number the oldest file's.");
+    }
+
+    /** When commit {@code i} lands: the day starts an hour after the fixtures' epoch. */
+    static long at(int i) {
+      return PINNED_TS + 3_600_000L + i * EVERY_MS;
+    }
+
+    /** The id of the record at {@code ms}, its random bits seeded by {@code seed}. */
+    static UUID txnAt(long ms, int seed) {
+      return UuidV7.newUuidV7(ms, new Random(1500 + seed));
+    }
+
+    /** Commit {@code i}: an append of one file, merging the table's manifests if there are enough. */
+    void commit(int i, String note) {
+      TableMetadata base = inlineMetadata(state.state(), events);
+      long snapshotId = random.nextLong() & Long.MAX_VALUE;
+      UUID commit = uuidV4(random);
+      long sequenceNumber = base.lastSequenceNumber() + 1;
+      long rows = 40_000 + random.nextInt(80_000);
+      long size = rows * 37 + random.nextInt(4_096);
+      totalRecords += rows;
+      totalSize += size;
+      Map<String, String> summary = new LinkedHashMap<>();
+      summary.put("operation", "append");
+      summary.put("added-data-files", "1");
+      summary.put("added-records", String.valueOf(rows));
+      summary.put("added-files-size", String.valueOf(size));
+      summary.put("total-records", String.valueOf(totalRecords));
+      summary.put("total-files-size", String.valueOf(totalSize));
+      summary.put("total-data-files", String.valueOf(i));
+      summary.put("total-delete-files", "0");
+      summary.put("total-position-deletes", "0");
+      summary.put("total-equality-deletes", "0");
+      Long parent = base.currentSnapshot() == null ? null : base.currentSnapshot().snapshotId();
+      List<InlineDeltaCodec.DeltaUpdate> updates = new ArrayList<>();
+      updates.add(withEngine(new InlineDeltaCodec.AddSnapshotUpdate(
+          snapshotId, "", summary, 0L, null, null, parent, null, null, Footprint.BLIND)));
+      updates.add(main(snapshotId));
+      // MergeAppend writes the new file's manifest (-m0), then merges the table's manifests with
+      // it into one (-m1) once there are enough
+      ManifestFile written = dataManifest(prefix + commit + "-m0.avro", snapshotId,
+          sequenceNumber, sequenceNumber, 1, rows, 0L);
+      boolean merge = list.size() + 1 >= MIN_COUNT_TO_MERGE;
+      if (merge) {
+        updates.add(new InlineDeltaCodec.RemoveManifestUpdate(
+            snapshotId, IntStream.range(0, list.size()).toArray()));
+        long oldest = list.stream().mapToLong(ManifestFile::minSequenceNumber).min().orElseThrow();
+        written = dataManifest(prefix + commit + "-m1.avro", snapshotId, sequenceNumber, oldest,
+            i, rows, totalRecords - rows);
+        list = List.of(written);
+      } else {
+        List<ManifestFile> next = new ArrayList<>();
+        next.add(written);
+        next.addAll(list);
+        list = next;
+      }
+      updates.add(new InlineDeltaCodec.AddManifestUpdate(snapshotId, written, prefix, 0));
+      byte[] delta = InlineDeltaCodec.encodeDelta(updates, at(i), base);
+      int before = log.file.length;
+      log.append(state, txnAt(at(i), i), mut -> mut.updateTableInlineDelta(events, delta), note);
+      int bytes = log.file.length - before;
+      recordBytes += bytes;
+      if (merge) {
+        mergeBytes += bytes;
+        merges++;
+      } else {
+        appendBytes += bytes;
+        appends++;
+      }
+      state = log.state();
+      snapshots.add(snapshotId);
+
+      // Iceberg's files for the same commit: the snapshot's manifest list, and a metadata.json
+      CatalogState catalog = state.state();
+      Snapshot snapshot = inlineMetadata(catalog, events).snapshot(snapshotId);
+      InMemoryOutputFile file =
+          new InMemoryOutputFile(prefix + "snap-" + snapshotId + "-1-" + commit + ".avro");
+      Snapshot listed = ManifestListFiles.write(
+          2, snapshot, catalog.inlineManifests(catalog.tableId(events), snapshotId), file);
+      listBytes.put(snapshotId, file.toByteArray().length);
+      writeMetadata(TableMetadata.buildFrom(iceberg)
+          .addSnapshot(listed)
+          .setLastUpdatedMillis(at(i))
+          .setBranchSnapshot(snapshotId, SnapshotRef.MAIN_BRANCH)
+          .build());
+    }
+
+    /** The expiry after commit {@link #EXPIRE_AFTER}: all but the newest {@link #KEEP}. */
+    void expire() {
+      TableMetadata base = inlineMetadata(state.state(), events);
+      List<Long> expired = new ArrayList<>(snapshots.subList(0, snapshots.size() - KEEP));
+      long ms = at(EXPIRE_AFTER) + 300_000L;
+      byte[] delta = InlineDeltaCodec.encodeDelta(
+          List.of(new InlineDeltaCodec.RemoveSnapshotsUpdate(expired)), ms, base);
+      int before = log.file.length;
+      log.append(state, txnAt(ms, 1_000), mut -> mut.updateTableInlineDelta(events, delta), null);
+      expiryBytes = log.file.length - before;
+      recordBytes += expiryBytes;
+      state = log.state();
+      writeMetadata(TableMetadata.buildFrom(iceberg)
+          .removeSnapshots(expired)
+          .setLastUpdatedMillis(ms)
+          .build());
+    }
+
+    /** Writes {@code next} as Iceberg does, and reads it back as Iceberg's next commit does. */
+    void writeMetadata(TableMetadata next) {
+      byte[] json = TableMetadataParser.toJson(next).getBytes(StandardCharsets.UTF_8);
+      metadataFiles++;
+      metadataBytes += json.length;
+      metadataGzipBytes += gzipped(json);
+      lastMetadataBytes = json.length;
+      iceberg = TableMetadataParser.fromJson(
+          metadataFile(metadataFiles), new String(json, StandardCharsets.UTF_8));
+    }
+
+    /** The location of the table's {@code version}th metadata file, named as Iceberg names it. */
+    String metadataFile(int version) {
+      return prefix + String.format("%05d-%s.metadata.json", version, uuidV4(random));
+    }
+
+    /** A data manifest of {@code files} files in today's partition. */
+    static ManifestFile dataManifest(String path, long snapshotId, long sequenceNumber,
+        long minSequenceNumber, int files, long addedRows, long existingRows) {
+      ByteBuffer bound =
+          ByteBuffer.allocate(4).order(java.nio.ByteOrder.LITTLE_ENDIAN).putInt(0, TODAY);
+      return new ProtoCodec.DecodedManifestFile(
+          path, 6_100L + 420L * (files - 1), 0, 0, sequenceNumber, minSequenceNumber,
+          snapshotId, 1, files - 1, 0, addedRows, existingRows, 0L,
+          List.of(new GenericPartitionFieldSummary(false, false, bound, bound)), null, null);
+    }
+
+    Scenario scenario() {
+      CatalogState end = log.state().state();
+      int id = end.tableId(events);
+      TableMetadata table = inlineMetadata(end, events);
+      long retainedLists = table.snapshots().stream()
+          .mapToLong(s -> listBytes.get(s.snapshotId())).sum();
+      long allLists = listBytes.values().stream().mapToLong(Integer::longValue).sum();
+      long head = table.currentSnapshot().snapshotId();
+      long catalogWrote = recordBytes + checkpointBytes + gcBytes;
+      long icebergWrote = metadataBytes + allLists;
+      int pool = atCas.state().manifestPool(atCas.state().tableId(events)).size();
+      String history = String.format(
+          "The day as records: %d commits in %,d B (each with its length): a fast append %,d B "
+              + "on average, a merge %,d B, naming the manifests it replaces by index in its "
+              + "parent's list; the expiry %,d B. The CAS write's checkpoint, with the file's "
+              + "header, is %,d B: the table's %d snapshots in the structural codec, its pool of "
+              + "%d manifests and their lists, and the day's committed ids.",
+          COMMITS, recordBytes - expiryBytes, appendBytes / appends, mergeBytes / merges,
+          expiryBytes, checkpointBytes, KEEP, pool);
+      String files = String.format(
+          "Iceberg's files for the same history, by Iceberg's writers: %d metadata.json files "
+              + "of %,d B in all (uncompressed, Iceberg's default; %,d B gzipped), the last "
+              + "%,d B, each holding every retained snapshot, the metadata log and the snapshot "
+              + "log; and %d manifest lists, Avro, %,d B in all, %,d B for the %d snapshots the "
+              + "expiry kept. The manifests are the same files in both.",
+          metadataFiles, metadataBytes, metadataGzipBytes, lastMetadataBytes, COMMITS,
+          allLists, retainedLists, table.snapshots().size());
+      String compared = String.format(
+          "Over the day Iceberg writes %,d B of table metadata and the catalog %,d B (its "
+              + "records, the CAS write's checkpoint and GC record), %d times less (%d with "
+              + "Iceberg's metadata gzipped). A reader at the end of the day fetches the catalog "
+              + "file, %,d B, where Iceberg's reader fetches the last metadata.json, %,d B, and "
+              + "the head's manifest list, %,d B.",
+          icebergWrote, catalogWrote, icebergWrote / catalogWrote,
+          (metadataGzipBytes + allLists) / catalogWrote, log.file.length, lastMetadataBytes,
+          listBytes.get(head));
+      return log.scenario(
+          "a-day-of-commits",
+          "A table after a day of commits: Spark appending a file every 14.4 minutes to one "
+              + "inline-ML table in the structural codec, the table merging its manifests into "
+              + "one once there are 10 (commit.manifest.min-count-to-merge), an expiry after the "
+              + "90th commit keeping the newest 50 snapshots. The file is the last CAS write's: "
+              + "a checkpoint of the table after the expiry, a GC record, then the day's last ten "
+              + "commits. The notes measure the day against the files Iceberg writes for it.",
+          List.of(history, files, compared),
+          List.of(structuralView(atCas.state().inlineMetadata(atCas.state().tableId(events)),
+              inlineMetadata(atCas.state(), events))),
+          read -> {
+            CatalogState catalog = read.state();
+            TableMetadata replayed = inlineMetadata(catalog, events);
+            expect(replayed.snapshots().size(), COMMITS - EXPIRE_AFTER + KEEP, "snapshots");
+            expect(replayed.currentSnapshot().snapshotId(), head, "the head");
+            expect(paths(catalog.inlineManifests(id, head)), paths(list), "the head's list");
+            expect(replayed.currentSnapshot().summary().get("iceberg-version"), ICEBERG_VERSION,
+                "the head's iceberg-version, kept from its parent's summary");
+            expect(replayed.snapshots().stream().map(Snapshot::snapshotId)
+                    .collect(Collectors.toList()),
+                this.iceberg.snapshots().stream().map(Snapshot::snapshotId)
+                    .collect(Collectors.toList()),
+                "the snapshots Iceberg's metadata.json holds");
+            expect(replayed.currentSnapshot().summary(), this.iceberg.currentSnapshot().summary(),
+                "the head's summary in Iceberg's metadata.json");
+          });
+    }
+  }
+
+  /** A version 4 UUID from {@code random}, as {@code UUID.randomUUID} makes one. */
+  private static UUID uuidV4(Random random) {
+    long msb = (random.nextLong() & ~0xF000L) | 0x4000L;
+    long lsb = (random.nextLong() & 0x3FFF_FFFF_FFFF_FFFFL) | 0x8000_0000_0000_0000L;
+    return new UUID(msb, lsb);
+  }
+
+  private static int gzipped(byte[] bytes) {
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    try (GZIPOutputStream gzip = new GZIPOutputStream(out)) {
+      gzip.write(bytes);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+    return out.size();
   }
 
   /**

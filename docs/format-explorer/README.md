@@ -71,6 +71,7 @@ Nodes marked ⚠ (red) are explained in the detail pane:
 | 12 | `compaction-with-committed-set-gc` | the committed-transaction set, its GC horizon and the unknown answer below it |
 | 13 | `concurrent-appends-merged` | `SetConflictEncoding` (manifest-window); two appends to one version, both committed: replay merges the second where it lands (re-parented, renumbered, its list on the first's) |
 | 14 | `concurrent-append-refused` | the same race with an expiry between: the second record names its expired parent by reference and is refused; its writer's retry commits |
+| 15 | `a-day-of-commits` | a structural-codec inline-ML table after 100 appends (merges every few), an expiry and a CAS write, measured against the metadata.json files and manifest lists Iceberg writes for the same history |
 
 Each record's note says what it does and how replay treats it. Notes on the whole file appear
 under the scenario's description.
