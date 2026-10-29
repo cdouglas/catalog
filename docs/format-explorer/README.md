@@ -67,8 +67,10 @@ Nodes marked ⚠ (red) are explained in the detail pane:
 | 8 | `inline-multi-table-conflict-retry` | the same with inline tables and deltas |
 | 9 | `concurrent-creates-bound-at-replay` | three writers of one snapshot: replay binds their ids in log order; the parent's version serializes creates under it |
 | 10 | `rename-table-across-namespaces` | `RenameTable` (Action 11), and a stale update it rejects |
-| 11 | `inline-manifest-list` | an inline-ML table: the manifest pool, per-snapshot indices, `AddManifestDelta.position` |
+| 11 | `inline-manifest-list` | an inline-ML table: the manifest pool, per-snapshot indices, `AddManifestDelta.position`; what a delta names by reference: manifests by UUID and number under the table's prefix, removals by index in the parent's list, the parent's summary entries, the delta's one new snapshot's id |
 | 12 | `compaction-with-committed-set-gc` | the committed-transaction set, its GC horizon and the unknown answer below it |
+| 13 | `concurrent-appends-merged` | `SetConflictEncoding` (manifest-window); two appends to one version, both committed: replay merges the second where it lands (re-parented, renumbered, its list on the first's) |
+| 14 | `concurrent-append-refused` | the same race with an expiry between: the second record names its expired parent by reference and is refused; its writer's retry commits |
 
 Each record's note says what it does and how replay treats it. Notes on the whole file appear
 under the scenario's description.

@@ -125,7 +125,9 @@ public class FormatExplorerFixtures {
             concurrentCreatesBoundAtReplay(),
             renameTableAcrossNamespaces(),
             inlineManifestList(),
-            compactionWithCommittedSetGc());
+            compactionWithCommittedSetGc(),
+            concurrentAppendsMerged(),
+            concurrentAppendRefused());
     for (Scenario scenario : scenarios) {
       String violation = CatalogProto.violation(scenario.bytes);
       if (violation != null) {
@@ -575,20 +577,23 @@ public class FormatExplorerFixtures {
         tableMetadata("019000dd-0000-7000-8000-000000000001", "s3://lake/warehouse/clicks",
             Map.of("table-name", "clicks"));
     byte[] metadata = InlineMetadataCodecs.JSON_GZIP.encode(meta);
+    // The table's manifest prefix, which replay gives it from its metadata: the manifests its
+    // writers name under it (SnapshotProducer: <commit UUID>-m<N>.avro) are their UUID and N
+    String prefix = "s3://lake/warehouse/clicks/metadata/";
     long s1 = 0x5151515151515151L;
     long s2 = 0x5252525252525252L;
-    ManifestFile m1 = manifest("clicks/metadata/m1.avro", s1, 1, 20_200);
-    ManifestFile m2 = manifest("clicks/metadata/m2.avro", s1, 1, 20_201);
-    ManifestFile m3 = manifest("clicks/metadata/m3.avro", s2, 2, 20_200);
+    ManifestFile m1 = manifest(prefix + "9d1c2e3f-4a5b-4c6d-8e7f-0a1b2c3d4e5f-m0.avro", s1, 1, 20_200);
+    ManifestFile m2 = manifest(prefix + "9d1c2e3f-4a5b-4c6d-8e7f-0a1b2c3d4e5f-m1.avro", s1, 1, 20_201);
+    ManifestFile m3 = manifest(prefix + "1f2e3d4c-5b6a-4978-8a6b-5c4d3e2f1a0b-m0.avro", s2, 2, 20_200);
     // Inline-ML deltas are built by hand: the writer's manifest updates come from the
     // InlineSnapshot its producer returned, which only FileIOCatalog holds.
     byte[] first =
         InlineDeltaCodec.encodeDelta(
             List.of(
-                withFootprint(append(s1, null, "", 0L), "append", Footprint.BLIND),
+                withFootprint(withEngine(append(s1, null, "", 0L)), "append", Footprint.BLIND),
                 main(s1),
-                new InlineDeltaCodec.AddManifestUpdate(s1, m1, "", 0),
-                new InlineDeltaCodec.AddManifestUpdate(s1, m2, "", 1)),
+                new InlineDeltaCodec.AddManifestUpdate(s1, m1, prefix, 0),
+                new InlineDeltaCodec.AddManifestUpdate(s1, m2, prefix, 1)),
             PINNED_TS + 60_000L,
             meta);
     Replica<CatalogState> afterFirst =
@@ -598,40 +603,240 @@ public class FormatExplorerFixtures {
                 null)
             .append(txn(92), mut -> mut.updateTableInlineDelta(clicks, first), null)
             .state();
+    TableMetadata base = inlineMetadata(afterFirst.state(), clicks);
     byte[] second =
         InlineDeltaCodec.encodeDelta(
             List.of(
-                withFootprint(append(s2, s1, "", 0L), "replace", compactionOfDay(20_200)),
+                withFootprint(
+                    withEngine(append(s2, s1, "", 0L)), "replace", compactionOfDay(20_200)),
                 main(s2),
-                new InlineDeltaCodec.RemoveManifestUpdate(s2, m1.path()),
-                new InlineDeltaCodec.AddManifestUpdate(s2, m3, "", 0)),
+                new InlineDeltaCodec.RemoveManifestUpdate(s2, new int[] {0}),
+                new InlineDeltaCodec.AddManifestUpdate(s2, m3, prefix, 0)),
             PINNED_TS + 120_000L,
-            inlineMetadata(afterFirst.state(), clicks));
+            base);
     Log log = Log.cas(afterFirst, txn(93), mut -> mut.updateTableInlineDelta(clicks, second),
-        "A CAS write. The checkpoint's InlineTable holds the pool [m1, m2] and S1's indices "
-            + "[0, 1]. The record's delta adds S2 on S1 with an empty manifest_list_suffix (its "
-            + "list is inline), removes m1 from S2's list and inserts m3 at position 0: replay "
-            + "builds S2's list from its parent's, less the removed, with the added at their "
-            + "positions, [m3, m2]. Each new snapshot carries its producer's footprint: S1's "
-            + "BLIND (an append), S2's VALIDATED (a compaction of day 20200, m1's files into "
-            + "m3's, whose retry would check that no delete files were added in that day: one "
+        "A CAS write. The checkpoint's InlineTable holds its manifest prefix (the metadata "
+            + "directory of its location, which replay gave it at the create), the pool [m1, m2] "
+            + "as their commit's UUID (16 bytes) and number under it, and S1's indices [0, 1]. "
+            + "The record's delta adds S2 on S1 with an "
+            + "empty manifest_list (its list is inline), removes m1 by its index in S1's list "
+            + "(parent_indices [0]) and inserts m3 at position 0: replay builds S2's list from "
+            + "its parent's, less the removed, with the added at their positions, [m3, m2]. "
+            + "S2's summary keeps S1's extra entries (inherits_parent_extra: iceberg-version "
+            + "and the engine's, the same in every snapshot a writer makes) and states its "
+            + "counts. S2's id is written once, in AddSnapshot: the ref, the removal and the "
+            + "manifest it wrote leave it out, as the delta's only new snapshot's. m3 is named "
+            + "under the prefix, whose CRC-32 the delta states (manifest_prefix_digest). Each "
+            + "new snapshot carries its producer's footprint: S1's BLIND (an "
+            + "append), S2's VALIDATED (a compaction of day 20200, m1's files into m3's, whose "
+            + "retry would check that no delete files were added in that day: one "
             + "FootprintCheck, NO_DELETES_ADDED, over a PartitionScope of one PartitionTuple, "
-            + "the day as a 4-byte little-endian int).");
+            + "the day as a 4-byte little-endian int). A record that names S1's list or "
+            + "summary does not apply where S1 is gone.");
     return log.scenario(
         "inline-manifest-list",
         "An inline-ML table (fileio.catalog.inline.manifests): no manifest list files. The "
             + "checkpoint carries each table's manifest_pool and per-snapshot snapshot_refs; a "
-            + "delta changes a snapshot's list with AddManifestDelta and RemoveManifestDelta.",
+            + "delta changes a snapshot's list with AddManifestDelta and RemoveManifestDelta, "
+            + "naming what the state holds by reference: manifests by name under the table's "
+            + "prefix, removals by index in the parent's list, summary entries by the parent's.",
         List.of(
             "snapshot_refs.pool_indices is a repeated int32 the codec writes unpacked, one "
-                + "varint each: catalog.proto declares it [packed = false]."),
+                + "varint each: catalog.proto declares it [packed = false]. "
+                + "RemoveManifestDelta.parent_indices is packed."),
         List.of(gzipView(metadata, meta)),
         read -> {
           CatalogState state = read.state();
           int id = state.tableId(clicks);
+          expect(state.manifestListPrefix(id), prefix, "the manifest prefix");
           expect(paths(state.inlineManifests(id, s1)), List.of(m1.path(), m2.path()), "S1's list");
           expect(paths(state.inlineManifests(id, s2)), List.of(m3.path(), m2.path()), "S2's list");
+          expect(inlineMetadata(state, clicks).snapshot(s2).summary().get("iceberg-version"),
+              ICEBERG_VERSION, "S2's iceberg-version, kept from S1's summary");
         });
+  }
+
+  private static final String ICEBERG_VERSION =
+      "Apache Iceberg 1.12.0 (commit 4d7c2f1e9a8b6c5d3e2f1a0b9c8d7e6f5a4b3c2d)";
+
+  /** {@code add} with the entries Iceberg and a Spark job put in every snapshot's summary. */
+  private static InlineDeltaCodec.AddSnapshotUpdate withEngine(
+      InlineDeltaCodec.AddSnapshotUpdate add) {
+    Map<String, String> summary = new LinkedHashMap<>(add.summary);
+    summary.put("iceberg-version", ICEBERG_VERSION);
+    summary.put("engine-name", "spark");
+    summary.put("engine-version", "3.5.4");
+    summary.put("app-id", "local-1761300000000");
+    summary.put("changed-partition-count", "1");
+    return new InlineDeltaCodec.AddSnapshotUpdate(
+        add.snapshotId, add.manifestListSuffix, summary, add.timestampDeltaMs, add.schemaId,
+        add.addedRows, add.parentSnapshotId, add.firstRowId, add.keyId, add.footprint);
+  }
+
+  /**
+   * Two writers append to one version of a table under manifest-window: the second record lands
+   * on the table the first changed, and replay merges it there.
+   */
+  private static Scenario concurrentAppendsMerged() {
+    Race race = new Race(100);
+    byte[] second = race.append(race.s2b, race.afterS1, race.m3);
+    race.log.append(race.afterS1, txn(106), mut -> mut.updateTableInlineDelta(race.clicks, second),
+        "Writer B's append, from the same version as A's: S2B on S1, adding m3, as B read the "
+            + "table (sequence number 2, total-data-files 2). It lands on the version A's record "
+            + "made. Under manifest-window an append that validates nothing (its footprint, "
+            + "BLIND) and finds its branch not reset and no snapshot removed since merges: "
+            + "replay finalizes it as Iceberg's retry would commit it, S2B's parent S2A, its "
+            + "sequence number and m3's 3, total-data-files 3, its list built on S2A's, "
+            + "[m3, m2, m1]. Nothing is retried or rewritten: the record is the same bytes "
+            + "whichever version it lands on.");
+    return race.log.scenario(
+        "concurrent-appends-merged",
+        "Two writers append to one version of an inline-ML table in a catalog whose first "
+            + "record fixes its conflict encoding (SetConflictEncoding, manifest-window). Both "
+            + "commit, with no retry: the second record is merged where it lands. Under "
+            + "lamport, the default before manifest-window, it would be rejected for the "
+            + "version it read, and its writer would read again and resend.",
+        List.of(),
+        List.of(),
+        read -> {
+          TableMetadata table = inlineMetadata(read.state(), race.clicks);
+          expect(table.currentSnapshot().snapshotId(), race.s2b, "the head");
+          expect(table.snapshot(race.s2b).parentId(), race.s2a, "S2B's parent");
+          expect(table.snapshot(race.s2b).sequenceNumber(), 3L, "S2B's sequence number");
+          expect(table.snapshot(race.s2b).summary().get("total-data-files"), "3",
+              "S2B's total-data-files");
+          expect(paths(read.state().inlineManifests(read.state().tableId(race.clicks), race.s2b)),
+              List.of(race.m3.path(), race.m2.path(), race.m1.path()), "S2B's list");
+        });
+  }
+
+  /**
+   * The race of {@link #concurrentAppendsMerged}, with an expiry of S1 landing first: the second
+   * record does not apply, and its writer's retry does.
+   */
+  private static Scenario concurrentAppendRefused() {
+    Race race = new Race(110);
+    TableMetadata afterA = inlineMetadata(race.log.state().state(), race.clicks);
+    byte[] expiry =
+        InlineDeltaCodec.encodeDelta(
+            List.of(new InlineDeltaCodec.RemoveSnapshotsUpdate(List.of(race.s1))),
+            PINNED_TS + 300_000L, afterA);
+    race.log.append(txn(116), mut -> mut.updateTableInlineDelta(race.clicks, expiry),
+        "An expiry of S1, which only S2A's ancestry names: RemoveSnapshots drops S1 and its "
+            + "list; the pool keeps m1, which S2A's list holds.");
+    byte[] second = race.append(race.s2b, race.afterS1, race.m3);
+    race.log.append(race.afterS1, txn(117), mut -> mut.updateTableInlineDelta(race.clicks, second),
+        "Writer B's append, as in concurrent-appends-merged, from the version before A's append "
+            + "and the expiry. It does not apply, and stays in the log until a CAS write drops "
+            + "it. Manifest-window reads a snapshot removed since its base as a guard (the "
+            + "window and the lists it reads may be gone), and the record names what only S1 "
+            + "holds: its summary's extra entries (inherits_parent_extra) and, in a commit that "
+            + "removed manifests, S1's list by index. A record that names its parent by "
+            + "reference applies only where the parent is (Landing.unresolved).");
+    Replica<CatalogState> afterExpiry = race.log.state();
+    long s3b = race.s2b + 1;
+    byte[] retry = race.append(s3b, afterExpiry, race.m3, race.s2a, 3);
+    race.log.append(afterExpiry, txn(118),
+        mut -> mut.updateTableInlineDelta(race.clicks, retry),
+        "B's retry, from the version after the expiry: S3B on S2A, with m3 again. Applies.");
+    return race.log.scenario(
+        "concurrent-append-refused",
+        "The race of concurrent-appends-merged, with an expiry of the snapshot both writers read "
+            + "landing between them: the second writer's record names that snapshot by "
+            + "reference, so it is refused where the snapshot is gone, and the writer's retry "
+            + "commits on the table as it is.",
+        List.of(),
+        List.of(),
+        read -> {
+          TableMetadata table = inlineMetadata(read.state(), race.clicks);
+          expect(read.committed().contains(txn(117)), false, "B's first record committed");
+          expect(table.snapshot(race.s1) == null, true, "S1 expired");
+          expect(table.snapshot(race.s2b) == null, true, "S2B absent");
+          expect(table.currentSnapshot().snapshotId(), s3b, "the head");
+          expect(table.snapshot(s3b).parentId(), race.s2a, "S3B's parent");
+        });
+  }
+
+  /**
+   * An inline-ML table in a manifest-window catalog, S1 an append of m1, and writer A's append
+   * of m2 (S2A) from the version after S1, which a second writer read too.
+   */
+  private static final class Race {
+    final TableIdentifier clicks = TableIdentifier.of(WAREHOUSE, "clicks");
+    final String prefix = "s3://lake/warehouse/clicks/metadata/";
+    final long s1;
+    final long s2a;
+    final long s2b;
+    final ManifestFile m1;
+    final ManifestFile m2;
+    final ManifestFile m3;
+    final Log log;
+    final Replica<CatalogState> afterS1;
+
+    Race(int seq) {
+      s1 = 0x6161616161616161L + seq;
+      s2a = 0x6262626262626262L + seq;
+      s2b = 0x6363636363636363L + seq;
+      m1 = manifest(prefix + "0a0b0c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d-m0.avro", s1, 1, 20_200);
+      m2 = manifest(prefix + "1a1b1c1d-2e3f-4b4c-9d5e-6f7a8b9c0d1e-m0.avro", s2a, 2, 20_201);
+      m3 = manifest(prefix + "2a2b2c2d-3e4f-4c5d-ae6f-7a8b9c0d1e2f-m0.avro", s2b, 2, 20_202);
+      TableMetadata meta =
+          tableMetadata("019000de-0000-7000-8000-000000000001", "s3://lake/warehouse/clicks",
+              Map.of("table-name", "clicks"));
+      byte[] metadata = InlineMetadataCodecs.JSON_GZIP.encode(meta);
+      log = Log.of(emptyCatalog());
+      log.appendRecord(
+          ProtoCodec.encodeTransaction(new ProtoCodec.Transaction(txn(seq),
+              List.of(new ProtoCodec.SetConflictEncodingAction("manifest-window")))),
+          "SetConflictEncoding: the catalog's first record fixes how replay judges a table update "
+              + "on a version other than the one its writer read. manifest-window merges one "
+              + "where Iceberg's retry would commit it the same.");
+      log.append(txn(seq + 1), mut -> mut.createNamespace(WAREHOUSE), null);
+      log.append(txn(seq + 2),
+          mut -> mut.createTableInline(clicks, metadata, InlineMetadataCodecs.TAG_JSON_GZIP), null);
+      byte[] first = append(s1, log.state(), m1, null, 1);
+      log.append(txn(seq + 3), mut -> mut.updateTableInlineDelta(clicks, first),
+          "S1, an append of m1.");
+      afterS1 = log.state();
+      byte[] a = append(s2a, afterS1, m2);
+      log.append(afterS1, txn(seq + 5), mut -> mut.updateTableInlineDelta(clicks, a),
+          "Writer A's append: S2A on S1, adding m2 at the head of the list. Applies on the "
+              + "version it read.");
+    }
+
+    /** A fast append of {@code manifest} on S1, as a writer that read {@code read} sends it. */
+    byte[] append(long snapshotId, Replica<CatalogState> read, ManifestFile manifest) {
+      return append(snapshotId, read, manifest, s1, 2);
+    }
+
+    /** A fast append of {@code manifest} on {@code parent}, {@code total} data files after it. */
+    byte[] append(long snapshotId, Replica<CatalogState> read, ManifestFile manifest, Long parent,
+        int total) {
+      TableMetadata base = inlineMetadata(read.state(), clicks);
+      Map<String, String> summary = new LinkedHashMap<>();
+      summary.put("operation", "append");
+      summary.put("added-data-files", "1");
+      summary.put("added-records", "1024");
+      summary.put("total-data-files", String.valueOf(total));
+      summary.put("total-records", String.valueOf(1024 * total));
+      InlineDeltaCodec.AddSnapshotUpdate add =
+          new InlineDeltaCodec.AddSnapshotUpdate(
+              snapshotId, "", summary, 0L, null, null, parent, null, null, Footprint.BLIND);
+      ManifestFile written = manifestFile(manifest, snapshotId, base.lastSequenceNumber() + 1);
+      return InlineDeltaCodec.encodeDelta(
+          List.of(withEngine(add), main(snapshotId),
+              new InlineDeltaCodec.AddManifestUpdate(snapshotId, written, prefix, 0)),
+          base.lastUpdatedMillis() + 60_000L, base);
+    }
+  }
+
+  /** {@code manifest} as {@code snapshotId} writes it, numbered {@code sequenceNumber}. */
+  private static ManifestFile manifestFile(
+      ManifestFile manifest, long snapshotId, long sequenceNumber) {
+    return new ProtoCodec.DecodedManifestFile(
+        manifest.path(), manifest.length(), manifest.partitionSpecId(), manifest.content().id(),
+        sequenceNumber, sequenceNumber, snapshotId, 1, 0, 0, 1_024L, 0L, 0L,
+        manifest.partitions(), null, null);
   }
 
   /**
