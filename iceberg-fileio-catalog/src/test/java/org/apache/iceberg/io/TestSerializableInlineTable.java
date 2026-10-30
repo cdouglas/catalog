@@ -140,7 +140,7 @@ class TestSerializableInlineTable {
    * the test store's FileIO goes as Java serializes it, as the store itself.
    */
   @SuppressWarnings("unchecked")
-  private static <T> T kryoRoundTrip(T value) {
+  static <T> T kryoRoundTrip(T value) {
     Kryo kryo = new Kryo();
     kryo.setInstantiatorStrategy(
         new Kryo.DefaultInstantiatorStrategy(new StdInstantiatorStrategy()));

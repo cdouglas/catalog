@@ -629,10 +629,19 @@ final class TableScript {
           }
           break;
         case SET_PROPERTY:
-          target.updateProperties().set("k" + cmd.b % 3, "v" + nextValue++).commit();
+          if (cmd.b % 6 == 5) { // the metadata log's bound, to which replay trims its log (Window)
+            target.updateProperties()
+                .set(TableProperties.METADATA_PREVIOUS_VERSIONS_MAX, String.valueOf(cmd.c % 4))
+                .commit();
+          } else {
+            target.updateProperties().set("k" + cmd.b % 3, "v" + nextValue++).commit();
+          }
           break;
         case REMOVE_PROPERTY:
-          target.updateProperties().remove(cmd.b % 4 == 3 ? "big" : "k" + cmd.b % 3).commit();
+          target.updateProperties()
+              .remove(cmd.b % 6 == 5 ? TableProperties.METADATA_PREVIOUS_VERSIONS_MAX
+                  : cmd.b % 4 == 3 ? "big" : "k" + cmd.b % 3)
+              .commit();
           break;
         case CREATE_BRANCH:
           target.manageSnapshots().createBranch(ref(cmd.b), pick(snapshots, cmd.c).snapshotId())

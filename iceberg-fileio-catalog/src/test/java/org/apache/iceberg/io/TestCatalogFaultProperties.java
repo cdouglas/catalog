@@ -58,6 +58,7 @@ import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.SnapshotRef;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableMetadata;
+import org.apache.iceberg.TableMetadataParser;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.Transaction;
 import org.apache.iceberg.catalog.Catalog;
@@ -118,9 +119,13 @@ import org.intentlog.memory.InMemorySharedLog;
  *   <li>An operation whose outcome is unknown took effect entirely or not at all, and a fault was
  *       injected into it, unless a writer compacts with a retention of 0 (which can put a commit
  *       in flight at or below the committed set's horizon).
- *   <li>Every table is in a namespace; every table loads; every snapshot has its manifest list,
- *       inline or in a file, and every manifest exists; a snapshot's manifest list never changes;
- *       no table is stored both inline and in a metadata file.
+ *   <li>Every table is in a namespace; every table loads, and reads the same through a reader that
+ *       has read nothing before; every snapshot has its manifest list, inline or in a file, and
+ *       every manifest exists; a snapshot's manifest list never changes; no table is stored both
+ *       inline and in a metadata file.
+ *   <li>Numbering, from v2: a snapshot's sequence number is above its parent's, at most the
+ *       table's last and no other snapshot's; its manifests' are at most its own, and those it
+ *       wrote have its own. In v3, snapshots' row-id ranges are apart and below the next row id.
  *   <li>Every version of the catalog file that a writer wrote reads the same as a checkpoint of
  *       it, which the next compaction would write (see {@link CheckpointRoundTrip}).
  *   <li>Row lineage, in a v3 table: once a snapshot has row ids, every live data file has them; the
@@ -725,6 +730,7 @@ class TestCatalogFaultProperties {
     private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
     private final Writer[] writers;
     private final LogCatalog checker;
+    private final Map<String, String> readerProperties;
     // The catalog's shared log, or null if the catalog is one object of the store.
     private final InMemorySharedLog sharedLog;
     private Model model;
@@ -796,6 +802,7 @@ class TestCatalogFaultProperties {
       // Reading does not depend on a catalog's mode, only on its log.
       this.checker = LocalCatalogMode.readerFor(io, CATALOG_LOCATION)
           .catalog(io, WAREHOUSE, CATALOG_NAME, properties);
+      this.readerProperties = properties;
       this.sharedLog = modes.get(0).sharedLog
           ? LocalCatalogMode.sharedLog(io, CATALOG_LOCATION) : null;
       LogCatalog seed = this.writers[0].catalog;
@@ -1331,12 +1338,21 @@ class TestCatalogFaultProperties {
                 state.tagSnapshots.remove(ref);
               });
         case SET_PROPERTY:
-          String key = KEYS.get(cmd.b % KEYS.size());
-          String value = "v" + nextValue++;
+          // Now and then the metadata log's bound, to which replay trims its log (Window); the
+          // model keeps only fz.* properties
+          boolean bound = cmd.b % 6 == 5;
+          String key = bound ? TableProperties.METADATA_PREVIOUS_VERSIONS_MAX
+              : KEYS.get(cmd.b % KEYS.size());
+          String value = bound ? String.valueOf(cmd.c % 4) : "v" + nextValue++;
           return new Op(
               "setProperty(" + id + ", " + key + "=" + value + ")",
               () -> handle(w, id, cmd.fresh).updateProperties().set(key, value).commit(),
-              (m, actual) -> existing(m, id).props.put(key, value));
+              (m, actual) -> {
+                TableState table = existing(m, id);
+                if (!bound) {
+                  table.props.put(key, value);
+                }
+              });
         case SET_BIG_PROPERTY:
           // At the default limit, a big property stays well inside it.
           int scale = Math.min(maxUpdateSize, 8192);
@@ -1950,10 +1966,11 @@ class TestCatalogFaultProperties {
     }
 
     /**
-     * The catalog's state, read without faults; fails if a table does not load whole, if a table
-     * is stored both inline and in a metadata file, if a snapshot's manifest list or row ids
-     * changed, if a v3 table's row ids are missing or overlap, or if a catalog file written since
-     * the last check differs from a checkpoint of it.
+     * The catalog's state, read without faults; fails if a table does not load whole, or loads
+     * differently through a fresh reader, if a table is stored both inline and in a metadata file,
+     * if a snapshot's manifest list or row ids changed, if its numbering is off, if a v3 table's
+     * row ids are missing or overlap, or if a catalog file written since the last check differs
+     * from a checkpoint of it.
      */
     private Model actual() {
       checkCheckpoints();
@@ -1968,11 +1985,27 @@ class TestCatalogFaultProperties {
       }
       check(file.tables().size() == ids.size(),
           "the catalog has tables %s, but its namespaces list %s", file.tables(), ids);
+      // A reader that has read nothing before: the checker's loads reuse what its earlier loads
+      // made (LogCatalog.InlineSnapshots, InlineTable's metadata per version), and must read alike
+      LogCatalog cold = LocalCatalogMode.readerFor(io, CATALOG_LOCATION)
+          .catalog(io, WAREHOUSE, CATALOG_NAME, readerProperties);
       for (TableIdentifier id : ids) {
         TableState state;
         try {
           Table table = checker.loadTable(id);
           TableMetadata metadata = ((HasTableOperations) table).operations().current();
+          Table coldTable = cold.loadTable(id);
+          TableMetadata coldMetadata = ((HasTableOperations) coldTable).operations().current();
+          check(TableMetadataParser.toJson(coldMetadata).equals(TableMetadataParser.toJson(metadata)),
+              "%s loads differently through a fresh reader:%n  %s%n  %s", id,
+              TableMetadataParser.toJson(metadata), TableMetadataParser.toJson(coldMetadata));
+          for (Snapshot snapshot : coldTable.snapshots()) {
+            check(describe(snapshot, io).equals(describe(metadata.snapshot(snapshot.snapshotId()), io)),
+                "%s: snapshot %d loads differently through a fresh reader: %s, not %s", id,
+                snapshot.snapshotId(), describe(snapshot, io),
+                describe(metadata.snapshot(snapshot.snapshotId()), io));
+          }
+          checkNumbering(id, metadata);
           state = new TableState(metadata.uuid(), metadata.formatVersion());
           check(file.location(id) == null || !file.isInlineTable(id),
               "%s has both a metadata file and inline metadata", id);
@@ -2001,12 +2034,6 @@ class TestCatalogFaultProperties {
                     || metadata.schemasById().containsKey(snapshot.schemaId()),
                 "%s: snapshot %d names schema %d, which the table does not have",
                 id, snapshot.snapshotId(), snapshot.schemaId());
-            List<String> manifests = new ArrayList<>();
-            manifests.add(String.format(
-                "seq=%d parent=%s ts=%d op=%s schema=%s first-row-id=%s added-rows=%s summary=%s",
-                snapshot.sequenceNumber(), snapshot.parentId(), snapshot.timestampMillis(),
-                snapshot.operation(), snapshot.schemaId(), snapshot.firstRowId(),
-                snapshot.addedRows(), new TreeMap<>(snapshot.summary())));
             for (ManifestFile manifest : snapshot.allManifests(io)) {
               check(io.newInputFile(manifest.path()).exists(),
                   "%s: snapshot %d references missing manifest %s",
@@ -2015,8 +2042,8 @@ class TestCatalogFaultProperties {
                   "%s: snapshot %d has manifest %s of partition spec %d, which the table does not "
                       + "have", id, snapshot.snapshotId(), manifest.path(),
                   manifest.partitionSpecId());
-              manifests.add(describe(manifest));
             }
+            List<String> manifests = describe(snapshot, io);
             List<String> first = lists.putIfAbsent(snapshot.snapshotId(), manifests);
             check(first == null || first.equals(manifests),
                 "%s: the manifest list of snapshot %d changed from %s to %s",
@@ -2170,6 +2197,77 @@ class TestCatalogFaultProperties {
       check(next <= metadata.nextRowId(), "%s: row ids up to %d, but the next row id is %d",
           id, next, metadata.nextRowId());
       Statistics.label("row ids checked").collect(live.isEmpty() ? "no files" : "files");
+    }
+
+    /** A snapshot's fields, and each manifest of its list. */
+    private static List<String> describe(Snapshot snapshot, FileIO io) {
+      List<String> described = new ArrayList<>();
+      described.add(String.format(
+          "seq=%d parent=%s ts=%d op=%s schema=%s first-row-id=%s added-rows=%s summary=%s",
+          snapshot.sequenceNumber(), snapshot.parentId(), snapshot.timestampMillis(),
+          snapshot.operation(), snapshot.schemaId(), snapshot.firstRowId(),
+          snapshot.addedRows(), new TreeMap<>(snapshot.summary())));
+      for (ManifestFile manifest : snapshot.allManifests(io)) {
+        described.add(describe(manifest));
+      }
+      return described;
+    }
+
+    /**
+     * Checks the numbers a commit assigns, which replay assigns again to a commit it merges onto
+     * a table that changed (Landing): from v2, a snapshot's sequence number is above its parent's,
+     * at most the table's last, and no other snapshot's; its manifests' are at most its own and
+     * the ones it wrote have its own. In v3, the row ids of its snapshots are apart, and below
+     * the table's next.
+     */
+    private void checkNumbering(TableIdentifier id, TableMetadata metadata) {
+      if (metadata.formatVersion() < 2) {
+        return;
+      }
+      Map<Long, Long> numbered = new HashMap<>();
+      TreeMap<Long, Snapshot> byFirstRowId = new TreeMap<>();
+      for (Snapshot snapshot : metadata.snapshots()) {
+        long seq = snapshot.sequenceNumber();
+        check(seq <= metadata.lastSequenceNumber(),
+            "%s: snapshot %d has sequence number %d, above the table's last, %d",
+            id, snapshot.snapshotId(), seq, metadata.lastSequenceNumber());
+        Long other = numbered.put(seq, snapshot.snapshotId());
+        check(other == null, "%s: snapshots %d and %d have sequence number %d",
+            id, other, snapshot.snapshotId(), seq);
+        Snapshot parent =
+            snapshot.parentId() == null ? null : metadata.snapshot(snapshot.parentId());
+        check(parent == null || parent.sequenceNumber() < seq,
+            "%s: snapshot %d has sequence number %d, its parent %d %d", id,
+            snapshot.snapshotId(), seq, snapshot.parentId(),
+            parent == null ? -1 : parent.sequenceNumber());
+        for (ManifestFile m : snapshot.allManifests(io)) {
+          check(m.minSequenceNumber() <= m.sequenceNumber() && m.sequenceNumber() <= seq,
+              "%s: snapshot %d (sequence number %d) lists %s, sequence numbers %d/%d",
+              id, snapshot.snapshotId(), seq, m.path(), m.minSequenceNumber(),
+              m.sequenceNumber());
+          check(m.snapshotId() == null || m.snapshotId() != snapshot.snapshotId()
+                  || m.sequenceNumber() == seq,
+              "%s: snapshot %d (sequence number %d) wrote %s with sequence number %d",
+              id, snapshot.snapshotId(), seq, m.path(), m.sequenceNumber());
+        }
+        if (snapshot.firstRowId() != null && snapshot.addedRows() != null
+            && snapshot.addedRows() > 0) {
+          byFirstRowId.put(snapshot.firstRowId(), snapshot);
+        }
+      }
+      long next = 0;
+      Snapshot previous = null;
+      for (Snapshot snapshot : byFirstRowId.values()) {
+        check(snapshot.firstRowId() >= next,
+            "%s: the row ids of snapshots %d and %d overlap (%d < %d)", id,
+            previous == null ? null : previous.snapshotId(), snapshot.snapshotId(),
+            snapshot.firstRowId(), next);
+        next = snapshot.firstRowId() + snapshot.addedRows();
+        previous = snapshot;
+      }
+      check(next <= metadata.nextRowId(),
+          "%s: snapshots' row ids up to %d, but the next row id is %d", id, next,
+          metadata.nextRowId());
     }
 
     private static String describe(ManifestFile m) {

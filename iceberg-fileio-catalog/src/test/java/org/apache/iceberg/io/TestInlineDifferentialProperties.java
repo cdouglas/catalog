@@ -143,12 +143,21 @@ class TestInlineDifferentialProperties {
     return stepped;
   }
 
+  private static Table roundTripJava(Table table) {
+    try {
+      return org.apache.iceberg.TestHelpers.roundTripSerialize(table);
+    } catch (java.io.IOException | ClassNotFoundException e) {
+      throw new AssertionError("the table does not serialize", e);
+    }
+  }
+
   private static final String CLOCK_STEPPED =
       "(the wall clock stepped: clock-ordered metadata columns are not compared from here on)";
 
   /**
    * Reads the tables from each storage with a fresh pointer-mode reader and compares, all but the
-   * clock-ordered metadata columns if the wall clock has stepped.
+   * clock-ordered metadata columns if the wall clock has stepped; and the inline catalog's table
+   * with what a worker reads of it, sent by SerializableTable (by Java serialization and by Kryo).
    */
   private static void compare(
       InMemoryAtomicFileIO pointerIo, InMemoryAtomicFileIO inlineIo, StringBuilder trace,
@@ -160,11 +169,26 @@ class TestInlineDifferentialProperties {
     Map<String, String> expected = TableViews.physical(pointerReader.loadTable(TableScript.ID), clockStepped);
     Table inlineTable = inlineReader.loadTable(TableScript.ID);
     Map<String, String> actual = TableViews.physical(inlineTable, clockStepped);
+    // A worker sent the table (SerializableTable, as Spark and Flink send it) reads it as the table
+    List<String> differences = new ArrayList<>();
+    for (String serializer : List.of("java", "kryo")) {
+      Table copy = org.apache.iceberg.SerializableTable.copyOf(inlineTable);
+      Table shipped = serializer.equals("java") ? roundTripJava(copy)
+          : TestSerializableInlineTable.kryoRoundTrip(copy);
+      Map<String, String> view = TableViews.physical(shipped, clockStepped);
+      java.util.Set<String> items = new java.util.TreeSet<>(actual.keySet());
+      items.addAll(view.keySet());
+      for (String item : items) {
+        if (!java.util.Objects.equals(actual.get(item), view.get(item))) {
+          differences.add(String.format("%s (shipped by %s):%n    table:   %s%n    shipped: %s",
+              item, serializer, actual.get(item), view.get(item)));
+        }
+      }
+    }
     TableViews.physical(pointerReader.loadTable(TableScript.OTHER), clockStepped)
         .forEach((key, value) -> expected.put(TableScript.OTHER.name() + ": " + key, value));
     TableViews.physical(inlineReader.loadTable(TableScript.OTHER), clockStepped)
         .forEach((key, value) -> actual.put(TableScript.OTHER.name() + ": " + key, value));
-    List<String> differences = new ArrayList<>();
     java.util.Set<String> keys = new java.util.TreeSet<>(expected.keySet());
     keys.addAll(actual.keySet());
     for (String key : keys) {

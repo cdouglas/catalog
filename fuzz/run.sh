@@ -2,7 +2,7 @@
 # Runs fileio-catalog's fuzz image on a host with Docker (rootless is fine). See README.md.
 #
 #   run.sh build                                  build the image from ./ctx (pulls the base image)
-#   run.sh round <fork> <commit> <name>           a phase-exit round (nine jobs), detached
+#   run.sh round <fork> <commit> <name>           a phase-exit round (ten jobs), detached
 #   run.sh calib <fork> <commit> <name> <set>     a calibration (mutants/<set>.sh), detached
 #   run.sh test <fork> <commit> <name> <tests>    one test job, detached
 #   run.sh shrink <fork> <commit> <name> <run>/<job>
@@ -36,13 +36,13 @@ gigabytes() {
 }
 
 # limit <cmd> <args...>: the container's memory limit, unless MEM sets it: each job it runs at
-# once (JOBS, else a round's nine, a calibration's mutants and its unmutated run, one test or
+# once (JOBS, else a round's ten, a calibration's mutants and its unmutated run, one test or
 # shrink) with its heap and 2g for the JVM's other memory and Maven's, and 2g
 limit() {
   if [ -n "${MEM:-}" ]; then echo "$MEM"; return; fi
   local cmd=$1 slots heap=${HEAP:-4g}
   case $cmd in
-    round) slots=9 ;;
+    round) slots=10 ;;
     calib) slots=$(( $(cd "$HERE/ctx" && bash -c '. mutants/'"$5"'.sh && echo $MUTANTS' | wc -w) + 1 )) ;;
     shrink) slots=1; heap=${SHRINK_HEAP:-16g} ;;
     *) slots=1 ;;

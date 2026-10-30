@@ -183,15 +183,17 @@ suites skip; see [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
     reports a landed write as a conflict. After each operation the
     catalog must match a model: an acknowledged operation took effect
     once, a failed one not at all, an unknown one entirely or not at all,
-    and every table loads and keeps its row lineage. Its javadoc lists
-    the operations and checks.
+    and every table loads, alike through a fresh reader, and keeps its
+    row lineage and the sequence numbers and row ids its commits
+    assigned. Its javadoc lists the operations and checks.
   - `TestCatalogRaceProperties` runs other operations just before an
     operation's catalog writes, and requires the result of a serial run.
     It and `TestCatalogFaultProperties` draw the catalog's log: one
     object, or a shared log.
   - `TestInlineDifferentialProperties` runs one schedule of table
     operations on a pointer catalog and an inline one, and requires the
-    same results and reads; `TestInlineDeltaProperties` checks that every
+    same results and reads, also of the inline table as a worker it is
+    sent to reads it; `TestInlineDeltaProperties` checks that every
     inline delta replays to the metadata it committed.
   - `spec/` checks the format itself: concurrent writers (on one object
     and on a shared log, with copies of records appended again, and
@@ -218,8 +220,9 @@ suites skip; see [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
   [docs/ICEBERG_ISSUES.md](docs/ICEBERG_ISSUES.md), and
   `TestIcebergCoreIssues` checks that each is still fixed.
 - **Format checks.** `CheckpointRoundTrip` checks every catalog file the
-  suites and fuzzers write against `catalog.proto`, and that its replayed
-  state equals a checkpoint of it. `TestFormatExplorer` checks the codecs'
+  suites and fuzzers write against `catalog.proto`, that its inline
+  manifest lists are well formed, and that its replayed state equals a
+  checkpoint of it. `TestFormatExplorer` checks the codecs'
   field numbers against `catalog.proto`.
 - **Engines.** `TestSerializableInlineTable` ships a table to a worker
   as Spark and Flink do (`SerializableTable`, by Java serialization and

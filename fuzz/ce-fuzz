@@ -2,7 +2,7 @@
 # The fuzz image's driver: runs fileio-catalog's fuzz rounds and calibrations on commits of a git
 # bundle, against a chosen build of the Iceberg fork, offline.
 #
-#   ce-fuzz round <fork> <commit> <name>        a phase-exit round: the nine jobs below
+#   ce-fuzz round <fork> <commit> <name>        a phase-exit round: the ten jobs below
 #   ce-fuzz calib <fork> <commit> <name> <set>  a calibration: each mutant of mutants/<set>.sh,
 #                                               put back in its own worktree, against the oracles
 #   ce-fuzz test <fork> <commit> <name> <tests> one job: mvn test -Dtest=<tests>, tries as written
@@ -126,7 +126,7 @@ status() {
 }
 
 # A round's jobs
-ROUND_JOBS="faultA1 faultB1 faultA2 faultB2 race mw proto rebase contract"
+ROUND_JOBS="faultA1 faultB1 faultA2 faultB2 race mw proto rebase contract diff"
 
 # tests_of <job>: the tests a round's job (or a test job) runs; a test job's are its own
 tests_of() {
@@ -137,6 +137,7 @@ tests_of() {
     proto) echo TestMemoryCommitProtocol,TestAtomicFileCommitProtocol ;;
     rebase) echo TestRebaseProperties ;;
     contract) echo 'Test*Encoding' ;;
+    diff) echo TestInlineDifferentialProperties,TestInlineDeltaProperties ;;
     test) ;;
     *) die "no job $1 in a round" ;;
   esac
@@ -154,6 +155,9 @@ setup() {
       tries $2/intentlog-fileio/src/test/java/org/intentlog/fileio/TestAtomicFileCommitProtocol.java 300000 ;;
     rebase) tries $2/$T/TestRebaseProperties.java ${REBASE_TRIES:-3000} ;;
     contract) tries $2/$T/ConflictEncodingContract.java 2000 ;;
+    diff)
+      tries $2/$T/TestInlineDifferentialProperties.java 3500
+      tries $2/$T/TestInlineDeltaProperties.java 15000 ;;
     test) ;; # tries as written
   esac
 }

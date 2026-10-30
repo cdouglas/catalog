@@ -73,6 +73,7 @@ final class TableViews {
     items.put("sort orders", metadata.defaultSortOrderId() + " " + metadata.sortOrders().stream()
         .map(SortOrderParser::toJson).collect(java.util.stream.Collectors.toList()));
     items.put("properties", new TreeMap<>(metadata.properties()).toString());
+    items.put("metadata log length", String.valueOf(metadata.previousFiles().size()));
     items.put("statistics", metadata.statisticsFiles().stream()
         .map(f -> String.format("#%s %s %d/%d %s", position.get(f.snapshotId()), f.path(),
             f.fileSizeInBytes(), f.fileFooterSizeInBytes(), f.blobMetadata().stream()

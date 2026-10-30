@@ -272,7 +272,14 @@ commits the snapshots it loaded). Eviction writes inline lists to
 files unchanged; a new inline snapshot on a parent whose list is a file
 carries its whole list. `TestCatalogFaultProperties` checks this after
 every operation, and in v3 tables that a data file's row ids never
-change.
+change. It checks the numbers each commit assigned too, which replay
+assigns again to a record it merges onto a changed table (`Landing`):
+from v2, a snapshot's sequence number is above its parent's, at most the
+table's last and no other snapshot's, and its manifests' are at most its
+own, the ones it wrote its own; in v3, its snapshots' row ids are apart
+and below the table's next. And it loads each table through a reader
+that has read nothing before, which must read what the checker reads,
+whose loads reuse what earlier loads made.
 
 ### I4. Inline replay is deterministic
 
@@ -398,7 +405,10 @@ log, and every ref's live data and delete files with their sequence
 numbers and row ids. Snapshot ids, UUIDs, timestamps and the names of
 manifest and metadata files differ. `TestInlineDifferentialProperties`
 checks this after every step of generated schedules, in each inline
-mode, with tables moving in and out of inline storage (Bugs 50, 51).
+mode, with tables moving in and out of inline storage (Bugs 50, 51),
+the metadata log's length (its bound changes too), and that a worker
+sent the inline table (`SerializableTable`, as Spark and Flink send it,
+by Java serialization and by Kryo) reads it as the table.
 
 ### I9. A catalog operation that races others ends as a serial run
 
