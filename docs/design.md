@@ -250,7 +250,13 @@ the pool; `removeInlineMetadata` clears it. Callers pick by intent, not
 convenience. Every `UpdateTableLocation` is such an eviction: a table is
 inline or a pointer table, never both, and the metadata file it names
 carries a manifest list file for every snapshot (its writer wrote the
-inline ones out first).
+inline ones out first). An inline table's pool holds exactly the
+manifests its lists name, each under its own path; each list names a
+manifest once; and the table has a list for exactly each snapshot whose
+manifest list is an `inline://` sentinel (a load skips a path the pool
+lacks, so a lost entry would read as a manifest missing, not an error).
+`CheckpointRoundTrip` checks this on every catalog file the suites and
+fuzzers write (`malformedLists`).
 
 ### I3a. A committed snapshot's manifest list never changes
 

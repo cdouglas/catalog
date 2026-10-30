@@ -342,6 +342,7 @@ public class InlineDeltaCodec {
     // (see javadoc). Track added snapshot ids to assert invariant.
     java.util.Set<Long> addedInThisDelta = new java.util.HashSet<>();
     NewSnapshotManifests newSnapshots = new NewSnapshotManifests(catalogBuilder, tableId, decoded);
+    List<Long> removedSnapshots = new ArrayList<>();
     TableMetadata current = base;
     // Consecutive TableMetadata updates (snapshots, refs, schema, spec, sort order, properties,
     // ...) apply to one builder, built once, as the writer's were. build() checks the default spec
@@ -380,10 +381,9 @@ public class InlineDeltaCodec {
           }
         } else if (update instanceof RemoveSnapshotsUpdate) {
           // Cascade snapshot removal to the catalog pool: drop the snapshot's ref
-          // list and GC any pool entries no longer referenced. Without this, the
-          // pool grows unboundedly as snapshots are expired (SPEC_ML.md).
-          catalogBuilder.removeSnapshotManifests(
-              tableId, ((RemoveSnapshotsUpdate) update).snapshotIds);
+          // list and GC any pool entries no longer referenced (SPEC_ML.md), once
+          // the new snapshots' lists are settled, below
+          removedSnapshots.addAll(((RemoveSnapshotsUpdate) update).snapshotIds);
           // Builder.removeSnapshots also cleans up the TM side's dangling refs.
           update.applyTo(pending);
         } else if (update instanceof SetSnapshotRefUpdate) {
@@ -420,7 +420,22 @@ public class InlineDeltaCodec {
       current = pending.discardChanges().build();
     }
     newSnapshots.finish();
+    removeSnapshotManifests(catalogBuilder, tableId, removedSnapshots);
     return current;
+  }
+
+  /**
+   * Drops the lists of the snapshots a delta removed, and the pool entries no list names any more:
+   * after the delta's new snapshots' lists are settled ({@link NewSnapshotManifests#finish}). Until
+   * then a new snapshot's list is its parent's as it was when the snapshot was added, which may
+   * name a manifest its settled list drops, and a removal then would keep that manifest in the
+   * pool for good (Bug 82).
+   */
+  private static void removeSnapshotManifests(
+      CatalogState.Builder catalogBuilder, int tableId, List<Long> removedSnapshots) {
+    if (!removedSnapshots.isEmpty()) {
+      catalogBuilder.removeSnapshotManifests(tableId, removedSnapshots);
+    }
   }
 
   /**
@@ -655,6 +670,7 @@ public class InlineDeltaCodec {
     TableMetadata current =
         newMetadataCodec.decodeFull(newMetadataBytes, "inline://manifests-only");
     NewSnapshotManifests newSnapshots = new NewSnapshotManifests(catalogBuilder, tableId);
+    List<Long> removedSnapshots = new ArrayList<>();
     // Register the new TM's inline snapshots that have no list yet (the ones this update adds),
     // parents first, so the invariant sentinel => pool entry holds even for a snapshot that changes
     // no manifests and so has no updates here.
@@ -683,13 +699,13 @@ public class InlineDeltaCodec {
       } else if (update instanceof RemoveManifestUpdate) {
         newSnapshots.removeManifest(MetadataView.of(current), (RemoveManifestUpdate) update);
       } else if (update instanceof RemoveSnapshotsUpdate) {
-        catalogBuilder.removeSnapshotManifests(
-            tableId, ((RemoveSnapshotsUpdate) update).snapshotIds);
+        removedSnapshots.addAll(((RemoveSnapshotsUpdate) update).snapshotIds);
       }
       // All other update types are TM concerns and are already reflected in
       // newMetadataBytes — skip.
     }
     newSnapshots.finish();
+    removeSnapshotManifests(catalogBuilder, tableId, removedSnapshots);
   }
 
   /**

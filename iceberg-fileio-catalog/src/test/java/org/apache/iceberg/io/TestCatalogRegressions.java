@@ -5056,4 +5056,43 @@ public class TestCatalogRegressions {
           .hasAtLeastOneElementOfType(InlineDeltaCodec.SetDefaultSortOrderUpdate.class);
     }
   }
+
+  /**
+   * Bug 82: an expiry in the same table transaction as commits left a manifest of the expired
+   * snapshot in an inline-ML table's pool, though no list named it any more. Replay dropped the
+   * expired snapshot's list and collected the pool as it met the expiry, while a new snapshot's
+   * list was still its parent's as it was when the snapshot was added, which named the manifest;
+   * the list was settled after the whole delta, without it. A leak, not a misread (a load resolves
+   * only listed paths), but one no later commit collects. Replay now drops a delta's removed
+   * snapshots once its new snapshots' lists are settled. The rebase oracle found it, by the
+   * checkpoint check of every write (CheckpointRoundTrip.malformedLists).
+   */
+  @Nested
+  class ExpiryInATransactionCollectsThePool {
+    private final TableIdentifier id = TableIdentifier.of("ns", "t");
+
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND_ML", "CAS_ML", "COMPACT_ML"})
+    void anExpiryBesideCommitsLeavesNoManifestNoListNames(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = mode.catalog(io, "mem:///w", "c", Map.of());
+      catalog.createNamespace(Namespace.of("ns"));
+      Table table = catalog.createTable(id, intSchema);
+      table.newFastAppend().appendFile(file("f1")).commit();
+
+      // The delete rewrites the first snapshot's manifest; the append drops the rewritten one, all
+      // deletes; the expiry removes the first snapshot, whose manifest no list names after it
+      org.apache.iceberg.Transaction txn = table.newTransaction();
+      txn.newDelete().deleteFile("mem:///data/f1.parquet").commit();
+      txn.newFastAppend().appendFile(file("f2")).commit();
+      txn.expireSnapshots().expireOlderThan(Long.MAX_VALUE).retainLast(2)
+          .cleanExpiredFiles(false).commit();
+      txn.commitTransaction();
+
+      CatalogState state = CatalogTestSupport.log(io, "mem:///w/catalog-c").read().state();
+      int tableId = state.tableId(id);
+      assertThat(state.snapshotManifests(tableId)).as(mode.name()).hasSize(2);
+      assertThat(CheckpointRoundTrip.malformedLists(state)).as(mode.name()).isNull();
+    }
+  }
 }

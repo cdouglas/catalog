@@ -166,8 +166,12 @@ inline list (empty for none). On apply:
   fields"); a snapshot whose parent changes builds its list on the new
   parent's.
 - `RemoveSnapshots` (SPEC_TM) drops each removed snapshot's list and the
-  pool entries no remaining list references. A full-mode update prunes
-  the lists of the snapshots its new metadata lacks the same way.
+  pool entries no remaining list references, after the delta's other
+  updates: against the lists of its new snapshots as the delta leaves
+  them (an expiry in a transaction may remove the snapshot whose
+  manifest a new snapshot's list drops; Bug 82). A full-mode update
+  prunes the lists of the snapshots its new metadata lacks the same way.
+  So a table's pool holds exactly the manifests its lists name.
 
 The two manifest updates cover every `SnapshotProducer` subclass in Iceberg —
 `FastAppend`, `MergeAppend`, `BaseOverwriteFiles`, `BaseRowDelta`,

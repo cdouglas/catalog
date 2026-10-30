@@ -25,15 +25,18 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.CRC32;
 import org.apache.iceberg.ManifestFile;
+import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.intentlog.CommittedSet;
@@ -183,7 +186,79 @@ public final class CheckpointRoundTrip {
     if (rejected != null) {
       return rejected;
     }
-    return difference(CatalogTestSupport.replay(catalogFile));
+    Replica<CatalogState> replica = CatalogTestSupport.replay(catalogFile);
+    String malformed = malformedLists(replica.state());
+    if (malformed != null) {
+      return malformed;
+    }
+    return difference(replica);
+  }
+
+  /**
+   * How {@code state}'s inline manifest lists are malformed, or null if they are not: a table with
+   * a pool or lists is inline; each pool entry is under its own path, and some list names it; each
+   * list names manifests of its table's pool (a load skips a path the pool lacks), each once; and
+   * the lists are exactly those of the table's snapshots whose manifest list is inline (an
+   * {@code inline://} sentinel).
+   */
+  static String malformedLists(CatalogState state) {
+    List<String> problems = new ArrayList<>();
+    TreeSet<Integer> tables = new TreeSet<>(state.allInlineTables().keySet());
+    tables.addAll(state.allManifestPools().keySet());
+    tables.addAll(state.allSnapshotManifests().keySet());
+    for (int id : tables) {
+      Map<String, ManifestFile> pool = state.manifestPool(id);
+      Map<Long, List<String>> lists = state.snapshotManifests(id);
+      InlineTable inline = state.allInlineTables().get(id);
+      if (inline == null) {
+        problems.add(String.format("table %d has %d pool entries and %d lists but is not inline",
+            id, pool.size(), lists.size()));
+        continue;
+      }
+      pool.forEach((path, manifest) -> {
+        if (!path.equals(manifest.path())) {
+          problems.add(String.format("table %d pools %s under %s", id, manifest.path(), path));
+        }
+      });
+      Set<String> named = new HashSet<>();
+      lists.forEach((snapshot, paths) -> {
+        Set<String> listed = new HashSet<>();
+        for (String path : paths) {
+          if (!pool.containsKey(path)) {
+            problems.add(String.format("table %d snapshot %d lists %s, not in the pool",
+                id, snapshot, path));
+          }
+          if (!listed.add(path)) {
+            problems.add(String.format("table %d snapshot %d lists %s twice", id, snapshot, path));
+          }
+        }
+        named.addAll(paths);
+      });
+      pool.forEach((path, manifest) -> {
+        if (!named.contains(path)) {
+          problems.add(String.format(
+              "table %d pools %s (added by snapshot %s), which no list names (lists of %s)",
+              id, path, manifest.snapshotId(), new TreeSet<>(lists.keySet())));
+        }
+      });
+      Set<Long> sentinels = new HashSet<>();
+      for (Snapshot snapshot : inline.fields().snapshots) {
+        String list = snapshot.manifestListLocation();
+        if (list != null && list.startsWith("inline://")) {
+          sentinels.add(snapshot.snapshotId());
+        }
+      }
+      if (!sentinels.equals(lists.keySet())) {
+        problems.add(String.format("table %d has lists for snapshots %s, inline snapshots %s",
+            id, new TreeSet<>(lists.keySet()), new TreeSet<>(sentinels)));
+      }
+    }
+    if (problems.isEmpty()) {
+      return null;
+    }
+    int shown = Math.min(problems.size(), MAX_REPORTED);
+    return "malformed inline manifest lists: " + String.join("; ", problems.subList(0, shown))
+        + (problems.size() > shown ? String.format(" (and %d more)", problems.size() - shown) : "");
   }
 
   /**
