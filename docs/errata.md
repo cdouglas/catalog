@@ -27,7 +27,7 @@ earlier entry:
 - D10: single-pass rewrite of the committed set (fixed b1af354); then
   ADLS CAS with vended SAS credentials (fixed in the fork, entry dropped
   a8aa0e9); then `SerializableTable` could not load an inline table's
-  metadata on a worker (fixed in the fork, dd535157e4, with
+  metadata on a worker (fixed in the fork, 0f44056ccf, with
   `TestSerializableInlineTable`; ID retired).
 - T4: the abstract suites were duplicated (fixed 35076d6); then inline
   `CatalogTests` reachability tests (14ac8d2).

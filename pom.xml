@@ -40,6 +40,11 @@
 
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <!-- The tests' JVM options; a heap cap goes in on the command line: -DargLine=-Xmx2g -->
+    <argLine></argLine>
+    <!-- The packages Spark's launcher opens on Java 17 (JavaModuleOptions), which Kryo needs to
+         serialize a table as Spark may (TestSerializableInlineTable) -->
+    <test.jvm.opens>--add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.invoke=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.net=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.util.concurrent=ALL-UNNAMED --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/sun.nio.cs=ALL-UNNAMED --add-opens=java.base/sun.security.action=ALL-UNNAMED --add-opens=java.base/sun.util.calendar=ALL-UNNAMED</test.jvm.opens>
     <maven.compiler.release>17</maven.compiler.release>
     <iceberg.version>1.12.0-atomicio-SNAPSHOT</iceberg.version>
     <hadoop.version>3.4.3</hadoop.version>
@@ -110,6 +115,7 @@
           <version>3.2.2</version>
           <configuration>
             <useModulePath>false</useModulePath>
+            <argLine>${argLine} ${test.jvm.opens}</argLine>
             <!-- -Dtest=Foo names a class in one module: the others have none. -->
             <failIfNoSpecifiedTests>false</failIfNoSpecifiedTests>
             <systemPropertyVariables>
