@@ -3553,13 +3553,17 @@ public class TestCatalogRegressions {
       assertThat(inline.get("ALL_MANIFESTS")).hasSize(6);
     }
 
-    /** A table's FileIO goes to Spark's workers serialized: there it is the catalog's FileIO. */
+    /**
+     * A table's FileIO goes to Spark's workers serialized: there it is the catalog's FileIO, which
+     * gives the metadata the table had when serialized its length, and no other.
+     */
     @Test
     void ioSerializes() throws Exception {
       CasFileIO catalogIO = new CasFileIO();
       catalogIO.newOutputFile("mem:///data/a").createOrOverwrite().close();
       String location = "inline://ns.t#1.2";
-      FileIO io = InlineMetadataFileIO.of(catalogIO, path -> path.equals(location) ? 42L : null);
+      FileIO io =
+          InlineMetadataFileIO.of(catalogIO, () -> new InlineMetadataFileIO.Metadata(location, 42L));
       assertThat(io.newInputFile(location).getLength()).isEqualTo(42L);
       assertThatThrownBy(() -> io.newInputFile(location).newStream())
           .isInstanceOf(UnsupportedOperationException.class);
@@ -3576,7 +3580,10 @@ public class TestCatalogRegressions {
 
       assertThat(copy).isInstanceOf(InlineMetadataFileIO.class);
       assertThat(copy.newInputFile("mem:///data/a").exists()).isTrue();
-      assertThat(copy.newInputFile(location).exists()).isFalse();
+      assertThat(copy.newInputFile(location).getLength()).isEqualTo(42L);
+      assertThatThrownBy(() -> copy.newInputFile(location).newStream())
+          .isInstanceOf(UnsupportedOperationException.class);
+      assertThat(copy.newInputFile("inline://ns.t#1.3").exists()).isFalse();
     }
 
     /**

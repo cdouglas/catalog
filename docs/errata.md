@@ -15,7 +15,7 @@ work around none of them (the workarounds for C2-C8 were dropped in
 asserts each is absent. On stock Iceberg 1.12.0 C2-C27 come back.
 
 An entry's ID is not reused: a fixed entry is deleted or marked
-resolved, and its ID retired. Retired: S3, D1-D3, D5-D7, D11, T1, T2,
+resolved, and its ID retired. Retired: S3, D1-D3, D5-D7, D10, D11, T1, T2,
 T5, U2 (answered: D18), U3 (`git log -p docs/errata.md` has each). Five IDs were reused before
 this rule, so an older code comment or commit citing one may mean the
 earlier entry:
@@ -26,7 +26,9 @@ earlier entry:
   spec ids (fixed 3c614c2: the create carries its manifest-pool delta).
 - D10: single-pass rewrite of the committed set (fixed b1af354); then
   ADLS CAS with vended SAS credentials (fixed in the fork, entry dropped
-  a8aa0e9).
+  a8aa0e9); then `SerializableTable` could not load an inline table's
+  metadata on a worker (fixed in the fork, dd535157e4, with
+  `TestSerializableInlineTable`; ID retired).
 - T4: the abstract suites were duplicated (fixed 35076d6); then inline
   `CatalogTests` reachability tests (14ac8d2).
 - T5: `TestInlineDelta` lacked a reconstruction round trip for
@@ -206,22 +208,6 @@ JSON parsers are already in upstream Iceberg.
 **Trigger to revisit:** when a stats-maintaining workload shows up where
 the full-mode size penalty matters.
 
-### D10. `SerializableTable` cannot load an inline table's metadata lazily
-
-`SerializableTable` (what Spark and Flink ship to workers) copies a
-table's schema, spec, properties, FileIO and location eagerly, but loads
-the rest -- `schemas()`, `sortOrders()`, `snapshots()`,
-`currentSnapshot()`, `history()`, statistics files, new scans -- by
-reading the table's metadata file through `StaticTableOperations`. An
-inline table's metadata location is synthetic (`inline://...`): a
-table's FileIO gives it a length, for Iceberg's metadata tables (Bug
-57), but no content, so those calls fail on a serialized inline table.
-Serving the metadata as JSON would work where the table was loaded, but
-not on a worker, whose FileIO is the catalog's.
-
-**Trigger to revisit:** a worker-side code path that needs one of the
-lazily loaded parts of an inline table.
-
 ### D12. A catalog transaction conflicts on each table's whole version
 
 A catalog transaction's record pins the version of each table it writes
@@ -252,8 +238,9 @@ catalog transaction need not conflict on the table's whole version: under
 the conflict encodings beyond `lamport` (SPEC.md §"Conflict Encodings";
 design.md §"The same table, per conflict encoding", I12), replay merges
 its record onto a changed table where Iceberg's retry would commit the
-same. That is the split "Later" below proposes, finer (concerns, refs,
-partitions, a branch's manifests), and it needs no restaging: the record
+same. That is finer than splitting a table's version into its properties
+and the rest, as this entry once proposed (concerns, refs, partitions, a
+branch's manifests), and it needs no restaging: the record
 is an inline delta whose late-bound fields replay finalizes where it
 lands (SPEC_TM.md §"Late-bound fields"). A catalog transaction pins every
 table it writes (`UpdateTableInline.pinned`), so under every encoding it
@@ -279,38 +266,34 @@ fail although what Iceberg's isolation checks (the branches they read)
 held. In a 200,000-try run, 24 of the 8,469 racing transactions (0.28%)
 did.
 
-**Later: depend on part of a table** (for catalog transactions; single
-table commits have it, above). A table's version could be split
-into its metadata (properties) and the rest, with the intention record
-saying which of the two a transaction depends on. A transaction that
-depends only on the rest would then survive a concurrent property
-change. But the format's commit loop couldn't simply rebase its record.
-The record carries the table's new metadata as built on the version it
-read: a metadata file, or a full inline copy. Replaying it over the
-change would undo the change. So `commitTransaction` would have to
-re-apply the commits' updates on a fresh read, as `commitOnAFreshRead`
-and `CatalogHandlers.commit` do. Each attempt would make every check
-again on its read:
+**Later: a transaction's own witness.** Under a merging encoding, a
+transaction could conflict only where Iceberg's retry of it would fail,
+as a single-table commit does:
 
-- **The read set:** `unchangedSinceRead` for each branch read.
-- **Each commit's requirements:** derived from the version the
-  transaction read (Bug 23).
-- **`TableMetadata.Builder`:** it rejects a snapshot whose sequence
-  number or first row id another commit has since passed.
+- **The tables it writes:** its records go unpinned, as inline deltas
+  with their producers' footprints, which the catalog's encoding judges
+  where they land and `Landing` finalizes, as for a single-table commit.
+  A pointer-mode or full-mode write stays pinned.
+- **The tables it only read:** the record names what it read of each
+  (the branches and their heads: `BaseCatalogTransaction`'s read set,
+  which `unchangedSinceRead` checks), and replay checks that rather
+  than the table's version.
 
-The retry would need three cautions:
-- **Stop on a failed check.** When a requirement or a read check fails,
-  stop without retrying, as `CatalogHandlers` does
-  (`ValidationFailureException`).
-- **Retry only a definite failure.** `CommitStateUnknownException`
-  must still propagate. The format's commit loop reports
-  `CommitFailedException` only after a read without the record, so a
-  landed record is never retried.
-- **Stage each attempt on its own read:** build a new `Mut` and call
-  `stageUpdate`, which stages inline-ML manifest lists, from scratch.
+That is a format change (the read set in the intention record), and the
+conflict-encoding oracle would need to cover it: `TestRebaseProperties`
+landing a transaction after a window of commits it did not see, against
+a reference that runs the transaction again. The alternative without a
+format change is to restage a failed transaction on a fresh read in
+`commitTransaction`, as `commitOnAFreshRead` and `CatalogHandlers.commit`
+do. Each attempt would check the read set, the commits' requirements
+(derived from the version the transaction read, Bug 23) and
+`TableMetadata.Builder`'s sequence-number and row-id checks again on its
+read, stop on a failed check, retry only a definite failure
+(`CommitStateUnknownException` propagates), and stage from scratch
+(`stageUpdate`, inline-ML lists included).
 
 **Trigger to revisit:** a workload whose multi-table transactions race
-property changes on their tables.
+other commits to their tables.
 
 ### D13. `partition-vector` retries a validated commit that `concern-vector` merges
 

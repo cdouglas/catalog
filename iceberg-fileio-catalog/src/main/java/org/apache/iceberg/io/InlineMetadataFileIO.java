@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.io;
 
+import java.io.Serializable;
 import java.util.Map;
 
 /**
@@ -27,29 +28,63 @@ import java.util.Map;
  * partitions, manifests, all_manifests, metadata_log_entries) record the length of the table's
  * metadata file, and failed on an inline table without it. No metadata file is there, so it
  * cannot be opened. Everything else goes to the catalog's FileIO; {@link #of} keeps the prefix and
- * bulk operations it supports.
+ * bulk operations it supports. A copy serialized to a worker with the table (as Spark and Flink
+ * ship one) keeps the length of the metadata the table had when serialized.
  */
 class InlineMetadataFileIO implements FileIO {
 
-  /** The stored length of the table's current inline metadata, if {@code location} names it. */
+  /** A table's inline metadata: its synthetic location and stored length. */
+  static final class Metadata implements Serializable {
+    private final String location;
+    private final long length;
+
+    Metadata(String location, long length) {
+      this.location = location;
+      this.length = length;
+    }
+  }
+
+  /** The table's current inline metadata, or null if its metadata is in a file. */
   @FunctionalInterface
-  interface Lengths {
-    Long of(String location);
+  interface Current {
+    Metadata get();
+  }
+
+  /** The metadata a table had when its FileIO was serialized. */
+  private static final class AsSerialized implements Current, Serializable {
+    private final Metadata metadata;
+
+    AsSerialized(Metadata metadata) {
+      this.metadata = metadata;
+    }
+
+    @Override
+    public Metadata get() {
+      return metadata;
+    }
   }
 
   private final FileIO io;
-  // Only where the table was loaded: a copy serialized to a worker is the catalog's FileIO.
-  private final transient Lengths lengths;
+  // Where the table was loaded, as the catalog holds it now; in a serialized copy, AsSerialized
+  private final Current current;
 
-  static InlineMetadataFileIO of(FileIO io, Lengths lengths) {
+  static InlineMetadataFileIO of(FileIO io, Current current) {
     return io instanceof DelegateFileIO
-        ? new WithPrefixAndBulk(io, lengths)
-        : new InlineMetadataFileIO(io, lengths);
+        ? new WithPrefixAndBulk(io, current)
+        : new InlineMetadataFileIO(io, current);
   }
 
-  private InlineMetadataFileIO(FileIO io, Lengths lengths) {
+  private InlineMetadataFileIO(FileIO io, Current current) {
     this.io = io;
-    this.lengths = lengths;
+    this.current = current;
+  }
+
+  // Serialized as a copy that holds the table's current metadata, rather than the catalog's state
+  // it reads it from (not private: the subclass serializes so too, as its own class)
+  Object writeReplace() {
+    return current == null || current instanceof AsSerialized
+        ? this
+        : of(io, new AsSerialized(current.get()));
   }
 
   FileIO delegate() {
@@ -58,8 +93,10 @@ class InlineMetadataFileIO implements FileIO {
 
   @Override
   public InputFile newInputFile(String path) {
-    Long length = lengths != null && path.startsWith("inline://") ? lengths.of(path) : null;
-    return length != null ? new InlineMetadataFile(path, length) : io.newInputFile(path);
+    Metadata metadata = current != null && path.startsWith("inline://") ? current.get() : null;
+    return metadata != null && metadata.location.equals(path)
+        ? new InlineMetadataFile(path, metadata.length)
+        : io.newInputFile(path);
   }
 
   @Override
@@ -128,8 +165,8 @@ class InlineMetadataFileIO implements FileIO {
   private static final class WithPrefixAndBulk extends InlineMetadataFileIO
       implements DelegateFileIO {
 
-    private WithPrefixAndBulk(FileIO io, Lengths lengths) {
-      super(io, lengths);
+    private WithPrefixAndBulk(FileIO io, Current current) {
+      super(io, current);
     }
 
     private DelegateFileIO prefixAndBulk() {

@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.io;
 
+import java.io.Serializable;
 import java.util.AbstractList;
 import java.util.List;
 import java.util.RandomAccess;
@@ -35,7 +36,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <p>Thread-safe: a list may be read, or appended to, from any thread. Each slot of a buffer is
  * written once, by the append that claims it, before that append returns the list holding it.
  */
-final class Window<T> extends AbstractList<T> implements RandomAccess {
+final class Window<T> extends AbstractList<T> implements RandomAccess, Serializable {
 
   private static final int MIN_CAPACITY = 8;
   private static final int SLACK = 4;
@@ -100,5 +101,11 @@ final class Window<T> extends AbstractList<T> implements RandomAccess {
   @Override
   public int size() {
     return to - from;
+  }
+
+  // A serialized copy (a table shipped to a worker) is a plain list of the elements: the buffer is
+  // shared with the lists replay extends, which stay where they are
+  private Object writeReplace() {
+    return List.copyOf(this);
   }
 }

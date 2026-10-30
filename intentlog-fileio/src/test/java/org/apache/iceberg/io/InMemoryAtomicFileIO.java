@@ -183,6 +183,29 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
     this(true);
   }
 
+  // Java serialization within one JVM (a SerializableTable shipped to a "worker" in a test): the
+  // copy is this FileIO itself, its objects included, as InMemoryFileIO's copies share its store
+  private static final Map<Long, InMemoryAtomicFileIO> SERIALIZED = new ConcurrentHashMap<>();
+  private static final AtomicLong SERIAL_IDS = new AtomicLong();
+  private final long serialId = SERIAL_IDS.incrementAndGet();
+
+  private Object writeReplace() {
+    SERIALIZED.put(serialId, this);
+    return new Serialized(serialId);
+  }
+
+  private static final class Serialized implements java.io.Serializable {
+    private final long id;
+
+    Serialized(long id) {
+      this.id = id;
+    }
+
+    private Object readResolve() {
+      return SERIALIZED.get(id);
+    }
+  }
+
   /** @param supportsAppend false models a backend without an append primitive (GCS). */
   public InMemoryAtomicFileIO(boolean supportsAppend) {
     this.supportsAppend = supportsAppend;

@@ -545,7 +545,7 @@ public class LogCatalog extends BaseMetastoreCatalog
         InlineSettings inline,
         InlineSnapshots inlineSnapshots,
         Replica<CatalogState> read) {
-      this.tableIO = InlineMetadataFileIO.of(io, this::inlineMetadataLength);
+      this.tableIO = InlineMetadataFileIO.of(io, this::currentInlineMetadata);
       this.log = log;
       this.tableId = tableId;
       this.inline = inline;
@@ -564,13 +564,13 @@ public class LogCatalog extends BaseMetastoreCatalog
     }
 
     /** The stored length of this table's inline metadata, if {@code location} is its current. */
-    private Long inlineMetadataLength(String location) {
+    private InlineMetadataFileIO.Metadata currentInlineMetadata() {
       Replica<CatalogState> read = lastRead;
-      if (read == null || !read.state().isInlineTable(tableId)
-          || !location.equals(metadataLocation(read.state(), tableId))) {
+      if (read == null || !read.state().isInlineTable(tableId)) {
         return null;
       }
-      return (long) read.state().inlineMetadata(tableId).length;
+      return new InlineMetadataFileIO.Metadata(
+          metadataLocation(read.state(), tableId), read.state().inlineMetadata(tableId).length);
     }
 
     /**
