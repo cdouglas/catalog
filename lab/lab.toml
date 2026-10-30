@@ -14,7 +14,7 @@ name = "contention"
 kind = "manifest"
 root = "bench/results"
 glob = "*/*"
-exclude = ["builds/*", "ingest/*", "captures/*", "anatomy/*"]
+exclude = ["builds/*", "ingest/*", "captures/*", "anatomy/*", "traces/*"]
 id = "{label}-{config_hash}/{dir.name}"
 
 [runs.fields]
@@ -105,7 +105,9 @@ mode = "view"
 # writes bench/results/ingest/<label>-<config hash>/<UTC start>-r<repetition>/ with manifest.json
 # (its capture's configuration and summary under "capture"), windows.jsonl and compactions.jsonl.
 # A capture (bench/results/captures/<label>-<hash>/) is a contention run with no store latency
-# that kept every record its writers landed (log.bin); it is not a run here.
+# that kept every record its writers landed (log.bin); a trace (bench/results/traces/<label>-<hash>/)
+# is the log generator's (LogTrace: writers taking turns on a shared log, no storage, no clock).
+# Neither is a run here; an ingest run's manifest holds its capture's or trace's under "capture".
 [[runs]]
 name = "ingest"
 kind = "manifest"
@@ -126,6 +128,12 @@ retention_s = { path = "config.retention_s", type = "DOUBLE" }
 compact_every = { path = "config.compact_every", type = "INTEGER" }
 capture_hash = "capture.config_hash"
 capture_records = { path = "capture.manifest.summary.captured_records", type = "INTEGER" }
+# a generated trace's (LogTrace, under "generate"; bench/results/traces/<label>-<hash>/): its
+# encoding, whether it is the oracle trace, its writers, and the entries it holds
+trace_encoding = { path = "capture.manifest.config.encoding", type = "VARCHAR" }
+trace_oracle = { path = "capture.manifest.config.oracle", type = "BOOLEAN" }
+trace_writers = { path = "capture.manifest.config.writers", type = "INTEGER" }
+trace_entries = { path = "capture.manifest.summary.entries", type = "INTEGER" }
 
 # Per window of records: the position after it, its records and their bytes, the time folding them
 # (fold_ms: replay and building the state after each batch) and compacting (compact_ms: GC record,

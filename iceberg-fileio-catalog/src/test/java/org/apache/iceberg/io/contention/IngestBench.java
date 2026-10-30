@@ -73,7 +73,7 @@ public final class IngestBench {
             workload.string("label"), workload.hash(), config.canonical());
         continue;
       }
-      Path captured = capture(out, workload);
+      Path captured = generated(config) ? generate(out, workload) : capture(out, workload);
       Instant started = Instant.now();
       Path dir = ContentionBench.newRunDir(
           out.resolve("ingest").resolve(name), ContentionBench.STAMP.format(started), config);
@@ -115,16 +115,55 @@ public final class IngestBench {
    */
   static final int CAPTURE_FORMAT = 3;
 
+  /** Whether the run ingests a generated trace ({@link LogTrace}) rather than a captured log. */
+  private static boolean generated(BenchConfig config) {
+    return config.node().get("generate").size() > 0;
+  }
+
   /**
    * The run's workload: its capture configuration, with no store latency, capturing its log in
-   * this build's format.
+   * this build's format; or its generator's configuration, in this build's format.
    */
   private static BenchConfig workload(BenchConfig config) {
+    if (generated(config)) {
+      if (config.node().get("capture").size() > 0) {
+        throw new IllegalArgumentException("a run captures a log or generates one, not both");
+      }
+      ObjectNode generate = ((ObjectNode) config.node().get("generate")).deepCopy();
+      generate.put("capture_format", CAPTURE_FORMAT);
+      return BenchConfig.expand(generate, LogTrace.DEFAULTS).get(0);
+    }
     ObjectNode capture = ((ObjectNode) config.node().get("capture")).deepCopy();
     capture.put("store", "none");
     capture.put("capture_log", true);
     capture.put("capture_format", CAPTURE_FORMAT);
     return BenchConfig.expand(capture).get(0);
+  }
+
+  /** The directory of the workload's generated trace: generated now, unless an earlier run did. */
+  private static Path generate(Path out, BenchConfig workload) throws Exception {
+    Path dir = out.resolve("traces").resolve(workload.string("label") + "-" + workload.hash());
+    if (Files.exists(dir.resolve("log.bin")) && Files.exists(dir.resolve("manifest.json"))) {
+      return dir;
+    }
+    System.out.printf("generating %s -> %s%n", workload.canonical(), dir);
+    Files.createDirectories(dir);
+    Instant started = Instant.now();
+    Map<String, Object> manifest = new LinkedHashMap<>();
+    manifest.put("label", workload.string("label"));
+    manifest.put("config_hash", workload.hash());
+    manifest.put("config", workload.asMap());
+    manifest.put("started", started.toString());
+    manifest.put("versions", ContentionBench.versions());
+    manifest.put("host", ContentionBench.host());
+    Map<String, Object> summary = new LogTrace(workload, dir).run();
+    Instant finished = Instant.now();
+    manifest.put("summary", summary);
+    manifest.put("finished", finished.toString());
+    manifest.put("elapsed_s", (finished.toEpochMilli() - started.toEpochMilli()) / 1000.0);
+    ContentionBench.write(dir, manifest);
+    System.out.printf("  generated %s%n", summary);
+    return dir;
   }
 
   /** The directory of the workload's captured log: captured now, unless an earlier run did. */

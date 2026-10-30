@@ -125,11 +125,11 @@ select = ["c8-fold-*"]
 title = "Catalog transactions racing fast appends to their tables: width, table skew, isolation, encoding; conflicts by reason"
 select = ["c9-txn-*"]
 
-# c9 ran a build of 157e3bf plus the uncommitted conflict-attribution changes (git_sha 157e3bf,
-# dirty): the tree's diff is bench/build/bench-20261030T192135Z-157e3bfb6.patch (sha256 6b85983656b1).
+# c9 ran a build of 157e3bf plus the then uncommitted conflict attribution (git_sha 157e3bf,
+# dirty), the same code as 6c1e353, which committed that diff.
 [[annotate]]
 select = "c9-txn-*"
-note = "157e3bf + uncommitted conflict attribution (bench/build/bench-20261030T192135Z-157e3bfb6.patch); havoc, 8 shards of 12 CPUs"
+note = "157e3bf + uncommitted conflict attribution, the same code as 6c1e353; havoc, 8 shards of 12 CPUs"
 
 # p6 (2026-10-27, fileio-catalog 8636dda, 16-CPU shards) reran every campaign on the code merged:
 # manifest-window by default, the backoff after a lost race, runs that cannot share a directory.

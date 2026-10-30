@@ -248,7 +248,8 @@ final class BenchConfig {
    */
   private static final Map<String, String> LATER_KEYS =
       Map.of("expire_older_than_s", "0", "race_min_wait_ms", "20", "expire_retry_num", "-1",
-          "capture_log", "false", "capture_format", "1", "txn_isolation", "serializable");
+          "capture_log", "false", "capture_format", "1", "txn_isolation", "serializable",
+          "generate", "");
 
   /**
    * The first 12 hex digits of the SHA-256 of the configuration, less its label, its repetition and

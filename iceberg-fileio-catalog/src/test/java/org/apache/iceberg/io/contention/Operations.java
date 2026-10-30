@@ -23,6 +23,7 @@ import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.SplittableRandom;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
@@ -38,6 +39,7 @@ import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.RewriteFiles;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Snapshot;
+import org.apache.iceberg.SnapshotUpdate;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.CatalogTransaction;
@@ -85,6 +87,20 @@ final class Operations {
 
   private static final AtomicLong FILES = new AtomicLong();
 
+  /**
+   * The executor the calling thread's snapshot updates write and scan manifests with; Iceberg's
+   * worker pool if unset. The log generator ({@link LogTrace}) runs them inline: Iceberg waits for
+   * a parallel task's futures by polling every 10 ms ({@code Tasks.waitFor}), a wait that measures
+   * nothing in a log with no clock.
+   */
+  static final ThreadLocal<ExecutorService> MANIFESTS = new ThreadLocal<>();
+
+  /** {@code update}, writing manifests with this thread's executor ({@link #MANIFESTS}), if any. */
+  private static <T extends SnapshotUpdate<T>> T manifests(T update) {
+    ExecutorService executor = MANIFESTS.get();
+    return executor != null ? update.scanManifestsWith(executor) : update;
+  }
+
   private Operations() {}
 
   /** A new data file of {@code records} records in partition {@code partition}. */
@@ -116,7 +132,7 @@ final class Operations {
       Table table, List<Integer> partitions, int filesPerPartition, boolean merge,
       String branch, LongConsumer runtime) {
     runtime.accept(0);
-    AppendFiles append = merge ? table.newAppend() : table.newFastAppend();
+    AppendFiles append = manifests(merge ? table.newAppend() : table.newFastAppend());
     for (int p : partitions) {
       for (int f = 0; f < filesPerPartition; f++) {
         append.appendFile(newFile(table, p, 100));
@@ -134,7 +150,7 @@ final class Operations {
     Snapshot read = table.currentSnapshot();
     runtime.accept(0);
     Expression filter = inPartitions(partitions);
-    OverwriteFiles overwrite = table.newOverwrite().overwriteByRowFilter(filter);
+    OverwriteFiles overwrite = manifests(table.newOverwrite()).overwriteByRowFilter(filter);
     for (int p : partitions) {
       for (int f = 0; f < filesPerPartition; f++) {
         overwrite.addFile(newFile(table, p, 100));
@@ -170,7 +186,7 @@ final class Operations {
     runtime.accept(0);
     long records = 0;
     RewriteFiles rewrite =
-        table.newRewrite()
+        manifests(table.newRewrite())
             .validateFromSnapshot(read.snapshotId())
             .dataSequenceNumber(read.sequenceNumber());
     for (DataFile file : files) {
@@ -237,7 +253,7 @@ final class Operations {
         Catalog view = transaction.asCatalog();
         for (TableIdentifier id : tables) {
           Table table = view.loadTable(id);
-          AppendFiles append = merge ? table.newAppend() : table.newFastAppend();
+          AppendFiles append = manifests(merge ? table.newAppend() : table.newFastAppend());
           for (int p : partitions.apply(id)) {
             for (int f = 0; f < filesPerPartition; f++) {
               append.appendFile(newFile(table, p, 100));

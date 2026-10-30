@@ -1,0 +1,1188 @@
+{
+  "label": "g1-witness",
+  "max_ingest_s": 300,
+  "batch": 64,
+  "rate": 1000,
+  "compact_every": 0,
+  "warmup_records": 5000,
+  "vary": {
+    "generate": [
+      {
+        "label": "t1-fa",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "lamport",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "label": "t1-fa",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "lamport",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "label": "t1-fa",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "lamport-minus-properties",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "label": "t1-fa",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "lamport-minus-properties",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "label": "t1-fa",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "concern-vector",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "label": "t1-fa",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "concern-vector",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "label": "t1-fa",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "blind-append",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "label": "t1-fa",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "blind-append",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "label": "t1-fa",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "partition-vector",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "label": "t1-fa",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "partition-vector",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "label": "t1-fa",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "manifest-window",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "label": "t1-fa",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "manifest-window",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "label": "t1-fa",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "lamport",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "label": "t1-fa",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "lamport",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "label": "t1-fa",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "lamport-minus-properties",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "label": "t1-fa",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "lamport-minus-properties",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "label": "t1-fa",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "concern-vector",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "label": "t1-fa",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "concern-vector",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "label": "t1-fa",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "blind-append",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "label": "t1-fa",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "blind-append",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "label": "t1-fa",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "partition-vector",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "label": "t1-fa",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "partition-vector",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "label": "t1-fa",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "manifest-window",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "label": "t1-fa",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "manifest-window",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 1.0
+        }
+      },
+      {
+        "label": "t1-mix",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "lamport",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.7,
+          "validated_overwrite": 0.1,
+          "compaction": 0.05,
+          "property": 0.05,
+          "catalog_txn": 0.1
+        },
+        "runtime_steps": {
+          "validated_overwrite": 16,
+          "compaction": 32
+        }
+      },
+      {
+        "label": "t1-mix",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "lamport",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.7,
+          "validated_overwrite": 0.1,
+          "compaction": 0.05,
+          "property": 0.05,
+          "catalog_txn": 0.1
+        },
+        "runtime_steps": {
+          "validated_overwrite": 16,
+          "compaction": 32
+        }
+      },
+      {
+        "label": "t1-mix",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "lamport-minus-properties",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.7,
+          "validated_overwrite": 0.1,
+          "compaction": 0.05,
+          "property": 0.05,
+          "catalog_txn": 0.1
+        },
+        "runtime_steps": {
+          "validated_overwrite": 16,
+          "compaction": 32
+        }
+      },
+      {
+        "label": "t1-mix",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "lamport-minus-properties",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.7,
+          "validated_overwrite": 0.1,
+          "compaction": 0.05,
+          "property": 0.05,
+          "catalog_txn": 0.1
+        },
+        "runtime_steps": {
+          "validated_overwrite": 16,
+          "compaction": 32
+        }
+      },
+      {
+        "label": "t1-mix",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "concern-vector",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.7,
+          "validated_overwrite": 0.1,
+          "compaction": 0.05,
+          "property": 0.05,
+          "catalog_txn": 0.1
+        },
+        "runtime_steps": {
+          "validated_overwrite": 16,
+          "compaction": 32
+        }
+      },
+      {
+        "label": "t1-mix",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "concern-vector",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.7,
+          "validated_overwrite": 0.1,
+          "compaction": 0.05,
+          "property": 0.05,
+          "catalog_txn": 0.1
+        },
+        "runtime_steps": {
+          "validated_overwrite": 16,
+          "compaction": 32
+        }
+      },
+      {
+        "label": "t1-mix",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "blind-append",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.7,
+          "validated_overwrite": 0.1,
+          "compaction": 0.05,
+          "property": 0.05,
+          "catalog_txn": 0.1
+        },
+        "runtime_steps": {
+          "validated_overwrite": 16,
+          "compaction": 32
+        }
+      },
+      {
+        "label": "t1-mix",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "blind-append",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.7,
+          "validated_overwrite": 0.1,
+          "compaction": 0.05,
+          "property": 0.05,
+          "catalog_txn": 0.1
+        },
+        "runtime_steps": {
+          "validated_overwrite": 16,
+          "compaction": 32
+        }
+      },
+      {
+        "label": "t1-mix",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "partition-vector",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.7,
+          "validated_overwrite": 0.1,
+          "compaction": 0.05,
+          "property": 0.05,
+          "catalog_txn": 0.1
+        },
+        "runtime_steps": {
+          "validated_overwrite": 16,
+          "compaction": 32
+        }
+      },
+      {
+        "label": "t1-mix",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "partition-vector",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.7,
+          "validated_overwrite": 0.1,
+          "compaction": 0.05,
+          "property": 0.05,
+          "catalog_txn": 0.1
+        },
+        "runtime_steps": {
+          "validated_overwrite": 16,
+          "compaction": 32
+        }
+      },
+      {
+        "label": "t1-mix",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "manifest-window",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.7,
+          "validated_overwrite": 0.1,
+          "compaction": 0.05,
+          "property": 0.05,
+          "catalog_txn": 0.1
+        },
+        "runtime_steps": {
+          "validated_overwrite": 16,
+          "compaction": 32
+        }
+      },
+      {
+        "label": "t1-mix",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "manifest-window",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.7,
+          "validated_overwrite": 0.1,
+          "compaction": 0.05,
+          "property": 0.05,
+          "catalog_txn": 0.1
+        },
+        "runtime_steps": {
+          "validated_overwrite": 16,
+          "compaction": 32
+        }
+      },
+      {
+        "label": "t1-mix",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "lamport",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.7,
+          "validated_overwrite": 0.1,
+          "compaction": 0.05,
+          "property": 0.05,
+          "catalog_txn": 0.1
+        },
+        "runtime_steps": {
+          "validated_overwrite": 16,
+          "compaction": 32
+        }
+      },
+      {
+        "label": "t1-mix",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "lamport",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.7,
+          "validated_overwrite": 0.1,
+          "compaction": 0.05,
+          "property": 0.05,
+          "catalog_txn": 0.1
+        },
+        "runtime_steps": {
+          "validated_overwrite": 16,
+          "compaction": 32
+        }
+      },
+      {
+        "label": "t1-mix",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "lamport-minus-properties",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.7,
+          "validated_overwrite": 0.1,
+          "compaction": 0.05,
+          "property": 0.05,
+          "catalog_txn": 0.1
+        },
+        "runtime_steps": {
+          "validated_overwrite": 16,
+          "compaction": 32
+        }
+      },
+      {
+        "label": "t1-mix",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "lamport-minus-properties",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.7,
+          "validated_overwrite": 0.1,
+          "compaction": 0.05,
+          "property": 0.05,
+          "catalog_txn": 0.1
+        },
+        "runtime_steps": {
+          "validated_overwrite": 16,
+          "compaction": 32
+        }
+      },
+      {
+        "label": "t1-mix",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "concern-vector",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.7,
+          "validated_overwrite": 0.1,
+          "compaction": 0.05,
+          "property": 0.05,
+          "catalog_txn": 0.1
+        },
+        "runtime_steps": {
+          "validated_overwrite": 16,
+          "compaction": 32
+        }
+      },
+      {
+        "label": "t1-mix",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "concern-vector",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.7,
+          "validated_overwrite": 0.1,
+          "compaction": 0.05,
+          "property": 0.05,
+          "catalog_txn": 0.1
+        },
+        "runtime_steps": {
+          "validated_overwrite": 16,
+          "compaction": 32
+        }
+      },
+      {
+        "label": "t1-mix",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "blind-append",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.7,
+          "validated_overwrite": 0.1,
+          "compaction": 0.05,
+          "property": 0.05,
+          "catalog_txn": 0.1
+        },
+        "runtime_steps": {
+          "validated_overwrite": 16,
+          "compaction": 32
+        }
+      },
+      {
+        "label": "t1-mix",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "blind-append",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.7,
+          "validated_overwrite": 0.1,
+          "compaction": 0.05,
+          "property": 0.05,
+          "catalog_txn": 0.1
+        },
+        "runtime_steps": {
+          "validated_overwrite": 16,
+          "compaction": 32
+        }
+      },
+      {
+        "label": "t1-mix",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "partition-vector",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.7,
+          "validated_overwrite": 0.1,
+          "compaction": 0.05,
+          "property": 0.05,
+          "catalog_txn": 0.1
+        },
+        "runtime_steps": {
+          "validated_overwrite": 16,
+          "compaction": 32
+        }
+      },
+      {
+        "label": "t1-mix",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "partition-vector",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.7,
+          "validated_overwrite": 0.1,
+          "compaction": 0.05,
+          "property": 0.05,
+          "catalog_txn": 0.1
+        },
+        "runtime_steps": {
+          "validated_overwrite": 16,
+          "compaction": 32
+        }
+      },
+      {
+        "label": "t1-mix",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "manifest-window",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.7,
+          "validated_overwrite": 0.1,
+          "compaction": 0.05,
+          "property": 0.05,
+          "catalog_txn": 0.1
+        },
+        "runtime_steps": {
+          "validated_overwrite": 16,
+          "compaction": 32
+        }
+      },
+      {
+        "label": "t1-mix",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "manifest-window",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.7,
+          "validated_overwrite": 0.1,
+          "compaction": 0.05,
+          "property": 0.05,
+          "catalog_txn": 0.1
+        },
+        "runtime_steps": {
+          "validated_overwrite": 16,
+          "compaction": 32
+        }
+      },
+      {
+        "label": "t1-txn",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "lamport",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.5,
+          "catalog_txn": 0.5
+        },
+        "txn_tables": 4
+      },
+      {
+        "label": "t1-txn",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "lamport",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.5,
+          "catalog_txn": 0.5
+        },
+        "txn_tables": 4
+      },
+      {
+        "label": "t1-txn",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "lamport-minus-properties",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.5,
+          "catalog_txn": 0.5
+        },
+        "txn_tables": 4
+      },
+      {
+        "label": "t1-txn",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "lamport-minus-properties",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.5,
+          "catalog_txn": 0.5
+        },
+        "txn_tables": 4
+      },
+      {
+        "label": "t1-txn",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "concern-vector",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.5,
+          "catalog_txn": 0.5
+        },
+        "txn_tables": 4
+      },
+      {
+        "label": "t1-txn",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "concern-vector",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.5,
+          "catalog_txn": 0.5
+        },
+        "txn_tables": 4
+      },
+      {
+        "label": "t1-txn",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "blind-append",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.5,
+          "catalog_txn": 0.5
+        },
+        "txn_tables": 4
+      },
+      {
+        "label": "t1-txn",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "blind-append",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.5,
+          "catalog_txn": 0.5
+        },
+        "txn_tables": 4
+      },
+      {
+        "label": "t1-txn",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "partition-vector",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.5,
+          "catalog_txn": 0.5
+        },
+        "txn_tables": 4
+      },
+      {
+        "label": "t1-txn",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "partition-vector",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.5,
+          "catalog_txn": 0.5
+        },
+        "txn_tables": 4
+      },
+      {
+        "label": "t1-txn",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "manifest-window",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.5,
+          "catalog_txn": 0.5
+        },
+        "txn_tables": 4
+      },
+      {
+        "label": "t1-txn",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 4,
+        "encoding": "manifest-window",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.5,
+          "catalog_txn": 0.5
+        },
+        "txn_tables": 4
+      },
+      {
+        "label": "t1-txn",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "lamport",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.5,
+          "catalog_txn": 0.5
+        },
+        "txn_tables": 4
+      },
+      {
+        "label": "t1-txn",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "lamport",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.5,
+          "catalog_txn": 0.5
+        },
+        "txn_tables": 4
+      },
+      {
+        "label": "t1-txn",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "lamport-minus-properties",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.5,
+          "catalog_txn": 0.5
+        },
+        "txn_tables": 4
+      },
+      {
+        "label": "t1-txn",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "lamport-minus-properties",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.5,
+          "catalog_txn": 0.5
+        },
+        "txn_tables": 4
+      },
+      {
+        "label": "t1-txn",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "concern-vector",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.5,
+          "catalog_txn": 0.5
+        },
+        "txn_tables": 4
+      },
+      {
+        "label": "t1-txn",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "concern-vector",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.5,
+          "catalog_txn": 0.5
+        },
+        "txn_tables": 4
+      },
+      {
+        "label": "t1-txn",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "blind-append",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.5,
+          "catalog_txn": 0.5
+        },
+        "txn_tables": 4
+      },
+      {
+        "label": "t1-txn",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "blind-append",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.5,
+          "catalog_txn": 0.5
+        },
+        "txn_tables": 4
+      },
+      {
+        "label": "t1-txn",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "partition-vector",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.5,
+          "catalog_txn": 0.5
+        },
+        "txn_tables": 4
+      },
+      {
+        "label": "t1-txn",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "partition-vector",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.5,
+          "catalog_txn": 0.5
+        },
+        "txn_tables": 4
+      },
+      {
+        "label": "t1-txn",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "manifest-window",
+        "oracle": false,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.5,
+          "catalog_txn": 0.5
+        },
+        "txn_tables": 4
+      },
+      {
+        "label": "t1-txn",
+        "entries": 20000,
+        "tables": 16,
+        "table_dist": "zipf",
+        "writers": 16,
+        "encoding": "manifest-window",
+        "oracle": true,
+        "expire_every": 2000,
+        "mix": {
+          "fast_append": 0.5,
+          "catalog_txn": 0.5
+        },
+        "txn_tables": 4
+      }
+    ]
+  }
+}

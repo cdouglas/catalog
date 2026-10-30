@@ -26,6 +26,7 @@ import java.util.List;
 import java.util.Map;
 import org.intentlog.Intention;
 import org.intentlog.LogView;
+import org.intentlog.Replica;
 import org.intentlog.StateMachine;
 import org.intentlog.fileio.AtomicFileLog;
 import org.intentlog.wire.ProtoWire;
@@ -37,6 +38,11 @@ public final class ContentionAccess {
   /** How {@code catalog}'s commits ended since it opened its log. */
   public static CatalogLog.CommitCounts counts(LogCatalog catalog) {
     return catalog.log().counts();
+  }
+
+  /** A fresh read of {@code catalog}'s log. */
+  public static Replica<CatalogState> read(LogCatalog catalog) {
+    return catalog.log().read();
   }
 
   /** The intention records after the checkpoint of the catalog object {@code bytes}. */

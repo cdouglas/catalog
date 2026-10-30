@@ -83,8 +83,7 @@ final class ContentionRun {
   private final AtomicBoolean measuring = new AtomicBoolean(false);
   private final AtomicBoolean stopping = new AtomicBoolean(false);
   private final AtomicLong opIds = new AtomicLong();
-  private final List<String> weights = new ArrayList<>();
-  private final double[] cumulative;
+  private final Workload workload;
   private long startNanos;
   private BufferedWriter ops;
   // With capture_log: the checkpoint the catalog object was created with, and every record its
@@ -106,16 +105,7 @@ final class ContentionRun {
     this.io =
         new LatencyFileIO(store, profile, CATALOG, config.number("time_scale"),
             config.longValue("seed") * 7919 + config.integer("repetition"));
-    Map<String, Double> mix = config.mix();
-    double total = mix.values().stream().mapToDouble(Double::doubleValue).sum();
-    cumulative = new double[mix.size()];
-    double sum = 0;
-    int i = 0;
-    for (Map.Entry<String, Double> e : mix.entrySet()) {
-      weights.add(e.getKey());
-      sum += e.getValue() / total;
-      cumulative[i++] = sum;
-    }
+    this.workload = new Workload(config);
   }
 
   /** The catalog properties of every client. */
@@ -293,7 +283,7 @@ final class ContentionRun {
     while (!stopping.get() && System.nanoTime() < endNanos) {
       operate(catalog, writer, random, System.nanoTime());
       if (think > 0 && !stopping.get()) {
-        LockSupport.parkNanos((long) (exponential(random, think) * 1e6));
+        LockSupport.parkNanos((long) (Workload.exponential(random, think) * 1e6));
       }
     }
   }
@@ -342,8 +332,8 @@ final class ContentionRun {
               while (next < endNanos && !stopping.get()) {
                 double gapMs =
                     lognormal
-                        ? meanMs * Math.exp(sigma * gaussian(random))
-                        : exponential(random, meanMs);
+                        ? meanMs * Math.exp(sigma * Workload.gaussian(random))
+                        : Workload.exponential(random, meanMs);
                 next += (long) (gapMs * 1e6);
                 LockSupport.parkNanos(Math.max(0, next - System.nanoTime()));
                 if (!arrivals.offer(next)) {
@@ -364,97 +354,20 @@ final class ContentionRun {
     return config.longValue("seed") * 1_000_003L + config.integer("repetition") * 7_919L + writer;
   }
 
-  private static double exponential(SplittableRandom random, double mean) {
-    return -mean * Math.log(1.0 - random.nextDouble());
-  }
-
   // ============================================================
   // Operations
   // ============================================================
 
-  private String pick(SplittableRandom random) {
-    double u = random.nextDouble();
-    for (int i = 0; i < cumulative.length; i++) {
-      if (u < cumulative[i]) {
-        return weights.get(i);
-      }
-    }
-    return weights.get(weights.size() - 1);
-  }
-
-  /** {@code n} distinct values of {@code [0, of)}, uniform or Zipf of exponent {@code alpha}. */
-  private static List<Integer> choose(
-      SplittableRandom random, int n, int of, String dist, double alpha) {
-    List<Integer> chosen = new ArrayList<>(n);
-    n = Math.min(n, of);
-    while (chosen.size() < n) {
-      int v = dist.equals("zipf") ? zipf(random, of, alpha) : random.nextInt(of);
-      if (!chosen.contains(v)) {
-        chosen.add(v);
-      }
-    }
-    return chosen;
-  }
-
-  /** A truncated Zipf draw of {@code [0, n)}: P(k) proportional to 1/(k+1)^alpha. */
-  private static int zipf(SplittableRandom random, int n, double alpha) {
-    double norm = 0;
-    for (int k = 1; k <= n; k++) {
-      norm += 1.0 / Math.pow(k, alpha);
-    }
-    double u = random.nextDouble() * norm;
-    double sum = 0;
-    for (int k = 1; k <= n; k++) {
-      sum += 1.0 / Math.pow(k, alpha);
-      if (u < sum) {
-        return k - 1;
-      }
-    }
-    return n - 1;
-  }
-
   private void operate(FileIOCatalog catalog, int writer, SplittableRandom random, long arrived) {
-    String kind = pick(random);
-    // A catalog transaction writes several tables, each in partitions of its own
-    List<Integer> tables = tables(random, kind.equals("catalog_txn") ? txnWidth(random) : 1);
-    Map<Integer, List<Integer>> partitions = new LinkedHashMap<>();
-    for (int t : tables) {
-      partitions.put(t, partitions(random));
-    }
+    String kind = workload.pick(random);
+    Map<Integer, List<Integer>> partitions = workload.targets(random, kind);
     com.fasterxml.jackson.databind.JsonNode byKind = config.node().get("runtime_ms").get(kind);
     double median = byKind != null ? byKind.asDouble() : config.number("runtime_median_ms");
     double runtimeMs =
-        median > 0 ? median * Math.exp(config.number("runtime_sigma") * gaussian(random)) : 0;
+        median > 0
+            ? median * Math.exp(config.number("runtime_sigma") * Workload.gaussian(random))
+            : 0;
     run(catalog, kind, partitions, runtimeMs, writer, random, arrived);
-  }
-
-  /** {@code n} distinct tables, as {@code table_dist} chooses them. */
-  private List<Integer> tables(SplittableRandom random, int n) {
-    return choose(random, n, config.integer("tables"), config.string("table_dist"),
-        config.number("table_zipf_alpha"));
-  }
-
-  /** The partitions an operation on a table touches, as {@code partition_dist} chooses them. */
-  private List<Integer> partitions(SplittableRandom random) {
-    return choose(random, config.integer("partitions_per_txn"), config.integer("partitions"),
-        config.string("partition_dist"), config.number("zipf_alpha"));
-  }
-
-  /**
-   * The tables a catalog transaction writes: {@code txn_tables}, or with {@code txn_tables_dist}
-   * exponential a draw of that mean, rounded down; at least 1, at most {@code txn_tables_max}.
-   */
-  private int txnWidth(SplittableRandom random) {
-    String dist = config.string("txn_tables_dist");
-    int k;
-    if (dist.equals("fixed")) {
-      k = config.integer("txn_tables");
-    } else if (dist.equals("exponential")) {
-      k = (int) Math.floor(exponential(random, config.number("txn_tables")));
-    } else {
-      throw new IllegalArgumentException("txn_tables_dist is fixed or exponential, not " + dist);
-    }
-    return Math.max(1, Math.min(k, config.integer("txn_tables_max")));
   }
 
   private void run(
@@ -680,9 +593,10 @@ final class ContentionRun {
    * Counts into {@code failures} why each attempt of a catalog transaction failed: its record
    * conflicted where it landed (the reason is the op's {@code conflict_reasons}), or a check before
    * the catalog wrote it failed: the transaction's serializable read set, the commits'
-   * requirements, or a written table's version (errata D12).
+   * requirements, or a written table's version (errata D12); or, in a log generator's oracle trace
+   * ({@link LogTrace}), its entry was refused as one that would not apply.
    */
-  private static java.util.function.Consumer<RuntimeException> failedAttempt(
+  static java.util.function.Consumer<RuntimeException> failedAttempt(
       CatalogLog.CommitCounts counts, Map<String, Long> failures) {
     long[] conflicts = {counts.conflicts()};
     return e -> {
@@ -692,7 +606,9 @@ final class ContentionRun {
         cause = "catalog: its record conflicted";
       } else {
         String message = String.valueOf(e.getMessage());
-        if (message.contains("isolation violation")) {
+        if (message.contains(LogTrace.REFUSED)) {
+          cause = "oracle: its entry would not apply where it landed";
+        } else if (message.contains("isolation violation")) {
           cause = "isolation: a table it read changed";
         } else if (message.contains("changed since the transaction read it")) {
           cause = "pin: a table it writes changed (D12)";
@@ -740,11 +656,5 @@ final class ContentionRun {
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
-  }
-
-  private static double gaussian(SplittableRandom random) {
-    double u = 1.0 - random.nextDouble();
-    double v = random.nextDouble();
-    return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
   }
 }

@@ -104,13 +104,13 @@ case $cmd in
     name=$1; shift
     logs=()
     while [ $# -gt 0 ] && [ "$1" != -- ]; do
-      for log in "$OUT/$1"/captures/*/log.bin; do
+      for log in "$OUT/$1"/captures/*/log.bin "$OUT/$1"/traces/*/log.bin; do
         [ -f "$log" ] && logs+=("/results/${log#"$OUT"/}")
       done
       shift
     done
     [ "${1:-}" = -- ] && shift
-    [ ${#logs[@]} -gt 0 ] || { echo "run.sh: no captures under those campaigns" >&2; exit 2; }
+    [ ${#logs[@]} -gt 0 ] || { echo "run.sh: no captures or traces under those campaigns" >&2; exit 2; }
     joined=$(IFS=,; echo "${logs[*]}")
     run_one "ce-bench-$name-0" "$name" MAIN=jmh -- \
       IngestFoldBench.fold -p log="$joined" -rf json -rff "/out/$name.json" "$@"

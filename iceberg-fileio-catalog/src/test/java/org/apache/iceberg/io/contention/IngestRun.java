@@ -79,8 +79,10 @@ final class IngestRun {
       "{"
           + "\"label\": \"ingest\","
           + "\"repetition\": 0,"
-          // the workload: a contention configuration, run with store none and capture_log
+          // the workload: a contention configuration, run with store none and capture_log; or a
+          // log generator's (LogTrace), whose trace is ingested instead
           + "\"capture\": {},"
+          + "\"generate\": {},"
           // the log's production rate, records/s, its ids retimed to it (0: as captured)
           + "\"rate\": 1000,"
           // the committed set's GC window (fileio.catalog.committed.retention.ms: 30 min)
@@ -166,8 +168,13 @@ final class IngestRun {
     S whole = Replay.replay(machine, checkpoint, original, null,
             (id, reason) -> reasons.merge(reason != null ? reason : "unexplained", 1L, Long::sum))
         .builder().build();
-    summary.put("rejected", reasons.values().stream().mapToLong(Long::longValue).sum());
+    long rejected = reasons.values().stream().mapToLong(Long::longValue).sum();
+    summary.put("rejected", rejected);
     summary.put("rejection_reasons", reasons);
+    // the entries that applied, per second of ingest: committed operations (goodput), where every
+    // operation is one entry
+    summary.put("goodput_s",
+        measured.records / (measured.nanos / 1e9) * (records.size() - rejected) / records.size());
     if (measured.records == records.size()) {
       // The same state as a replay of the log as captured: retiming and the run's own GC records
       // change the committed set, not what applies

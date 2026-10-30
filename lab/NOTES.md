@@ -155,6 +155,38 @@ to tables of one `FileIOCatalog` over an in-memory store whose requests take a p
   at the end of a window (2,000 records), so their slowest runs overran it (1,000 records/s
   prefilled, batch 1: 1,729 s for one window). Their windows are measured alike.
 
+## The log benchmark: generated traces (since 2026-10-30)
+
+ContentionBench measures the log's contents, not the storage under it (a separate catalog
+benchmark will measure storage latency and other catalogs). Its traces come from the log generator
+(`LogTrace`, an ingest run's `generate` instead of `capture`; bench/results/traces/<label>-<hash>/):
+
+- Writers are threads, each a `LogCatalog` of its own over one in-memory shared log (appends land
+  unconditionally), taking turns as a seeded `Scheduler` picks them, one at a time, at each read
+  and append of the log and at a job's work. No storage latency, no clock: logical time is the
+  scheduler's steps, and a trace depends on its configuration and seed alone (`TestLogTrace`).
+- An entry's window is the entries other writers landed between its writer's read of the log and
+  its append (`windows` per op, `mean_window` per trace). `writers` (in flight), `runtime_steps`
+  (a job's work between its read of a table and its commit, by kind) and `commit_steps` widen it.
+  With 8 writers and no runtime the mean window is about 1.3 entries: each op takes 3-4 read turns
+  per append.
+- Contended trace (`oracle` false): replay judges each entry where it lands; a rejected entry stays
+  in the log, and Iceberg's retry (or a transaction's job) adds another. Oracle trace (`oracle`
+  true): an entry lands only if it applies at the tail (judged first, refused otherwise, and
+  restaged by Iceberg's retry): every entry is a committed operation, judged by the encoding as
+  the contended trace's are. Under `lamport` that means only fresh entries.
+- Summary: `entries`, `rejected` and `rejection_reasons` (as `conflict_reasons`), `refused` and
+  `refusal_reasons` (oracle), `outcomes` by kind, `steps`, `mean_window`. ops.jsonl: per op its
+  entries, windows, conflicts and refusals by reason, and a transaction's `txn_failures` (attempts
+  that never produced an entry: client-side checks).
+- Ingested (`IngestRun`): `records_s`, and `goodput_s`, the entries that applied per second of
+  ingest (every operation is one entry). The oracle trace's goodput is the encoding's ceiling; the
+  contended trace's is what it achieves. A short fold (20k records: under a second) is noisy:
+  compare with JMH over the traces (havoc `run.sh jmh` finds traces/ as captures/).
+- Generation is single-threaded by design (about 18 ms per entry on the dev box, mostly Iceberg's
+  commit and refresh), so a campaign's traces run in parallel. Writers write and scan manifests on
+  the calling thread (`Operations.MANIFESTS`): Iceberg polls a worker pool's futures every 10 ms.
+
 ## Record anatomy (source `anatomy`, fact `record_fields`, view `record_groups`)
 
 - One run per capture (`docs/format-explorer/anatomy.mjs`): every Nth record (`config.every`,
