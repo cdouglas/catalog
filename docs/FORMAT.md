@@ -197,9 +197,14 @@ In order of what the measurements say each would save:
     IngestFoldBench on havoc, campaign j1-fold: the builds side by side, each on its own capture
     of the same workload, steady set, batches of 64) is within JMH's error of the old format's in
     six of the seven workloads (one table 15% faster, at the edge of the error: removals by
-    index), and 35% slower on merge2 (41.3k to 26.9k records/s), whose lists hold one or two
-    manifests, so a record's fixed costs dominate. Not yet profiled; an earlier laptop run (-10%
-    to +5%) missed it.
+    index). On merge2, whose lists hold one or two manifests so that a record's fixed costs
+    dominate, j1-fold measured it 35% slower beside two other runs and a fuzz round; alone, with
+    three forks, 16% slower (37.2k to 31.2k records/s). Most of that was the table's metadata
+    log, up to 100 entries copied for every record, which cost more as the new records changed
+    what else replay touched (memory stalls: a lookup made faster, or a step skipped outright,
+    moved the time to the next one). Replay now extends the log in place (`Window`), which brings
+    merge2 back to 37.2k and leaves the baseline workload within its forks' noise (-1% over four
+    runs); a lazier summary or skipping the reference checks gained nothing measurable.
   - done (2026-10-29): manifests named by UUID and number under their table's prefix, and a
     delta's one new snapshot's id written once (another 26% of every workload's bytes). Replay is
     within JMH's error of the format before them in every workload (j1-fold). With a compaction
