@@ -4,7 +4,8 @@
 #   run.sh build                          build the image from ./ctx on BASE (pulls it if absent)
 #   run.sh campaign <name> <configs...>   run configs/<file>s as JOBS shards, detached
 #   run.sh ingest <name> <configs...>     the ingest benchmark on configs/<file>s, one container
-#                                         (CPUS 16, HEAP 6g unless set: a capture's 16 writers)
+#                                         (CPUS 16, HEAP 6g, MEM 12g unless set: a capture's 16
+#                                         writers)
 #   run.sh jmh <name> <campaign...> -- <JMH args...>
 #                                         IngestFoldBench.fold over every log the campaigns
 #                                         captured ($OUT/<campaign>/captures), and the JMH args
@@ -17,15 +18,16 @@
 # Env: OUT (default ./out; a campaign's runs go to $OUT/<name>/), IMAGE (default ce-bench:latest;
 # one image per build lets builds run side by side), BASE (the image built on, any with Java 17;
 # default eclipse-temurin:17-jre, or one the host has), JOBS (shards at once, default 8), HEAP
-# (each JVM's heap, default 3g), MEM (each container's hard memory limit, default HEAP + 2g; jmh:
-# HEAP + 8g, for the 6g fork), CPUS (each container's CPUs, default 4).
+# (each JVM's heap, default 3g), MEM (each container's hard memory limit, default HEAP + 2g;
+# ingest: HEAP + 6g, as an 8g limit killed h1's i8 ingest at a 6g heap; jmh: HEAP + 8g, for the 6g
+# fork), CPUS (each container's CPUs, default 4).
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OUT=${OUT:-$HERE/out}
 IMAGE=${IMAGE:-ce-bench:latest}
 BASE=${BASE:-eclipse-temurin:17-jre}
 JOBS=${JOBS:-8}
-usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 gigabytes() {
   case $1 in
     *[gG]) echo "${1%[gG]}" ;;
@@ -63,7 +65,7 @@ run_one() {
 
 cmd=${1:-}; shift || true
 case $cmd in
-  ingest) HEAP=${HEAP:-6g}; CPUS=${CPUS:-16} ;;
+  ingest) HEAP=${HEAP:-6g}; CPUS=${CPUS:-16}; MEM=${MEM:-$(( $(gigabytes "$HEAP") + 6 ))g} ;;
   jmh) HEAP=${HEAP:-1g}; CPUS=${CPUS:-4}; MEM=${MEM:-$(( $(gigabytes "$HEAP") + 8 ))g} ;;
   *) HEAP=${HEAP:-3g}; CPUS=${CPUS:-4} ;;
 esac

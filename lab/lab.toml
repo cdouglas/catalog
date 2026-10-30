@@ -149,6 +149,14 @@ format = "jsonl"
 mode = "table"
 only_finished = true
 
+# JMH runs of IngestFoldBench (bench/havoc/run.sh jmh), one JSON per run in bench/results/jmh/:
+# each benchmark's param log names the capture it folds, on havoc as
+# /results/<campaign>/captures/<label>-<hash>/log.bin, so the campaign (h1-i8, ...) gives the build.
+[[runs]]
+name = "jmh"
+kind = "jmh"
+root = "bench/results/jmh"
+
 # Where a capture's record bytes go (docs/format-explorer/anatomy.mjs): every Nth record of a
 # capture's log decoded by the format explorer, writing bench/results/anatomy/<capture dir>/ with
 # manifest.json (the capture's label and config hash, which ingest runs promote as capture_hash;

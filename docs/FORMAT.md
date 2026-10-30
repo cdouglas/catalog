@@ -193,15 +193,17 @@ In order of what the measurements say each would save:
   - the delta's `last_updated_ms` as a varint of the epoch (7 B), where the snapshot's timestamp
     is already a small delta from it;
   - done (2026-10-29): summary entries a snapshot shares with its parent, and removed manifests,
-    by index in the parent's list (together 55% of the baseline's bytes, above). Replaying the
-    new records costs 0-10% more per record (JMH IngestFoldBench on each of i8/i9's seven shapes,
-    each build on its own capture, steady set, batches of 64: -10% to +5%, mostly resolving a
-    snapshot's inherited entries); on records without parent references the new build is as fast
-    as the old.
+    by index in the parent's list (together 55% of the baseline's bytes, above). Replay (JMH
+    IngestFoldBench on havoc, campaign j1-fold: the builds side by side, each on its own capture
+    of the same workload, steady set, batches of 64) is within JMH's error of the old format's in
+    six of the seven workloads (one table 15% faster, at the edge of the error: removals by
+    index), and 35% slower on merge2 (41.3k to 26.9k records/s), whose lists hold one or two
+    manifests, so a record's fixed costs dominate. Not yet profiled; an earlier laptop run (-10%
+    to +5%) missed it.
   - done (2026-10-29): manifests named by UUID and number under their table's prefix, and a
-    delta's one new snapshot's id written once (another 26% of every workload's bytes). Their
-    replay cost is to be measured on havoc (campaign h1-shapes): i10-format's timings ran on a
-    laptop that slept through some of them.
+    delta's one new snapshot's id written once (another 26% of every workload's bytes). Replay is
+    within JMH's error of the format before them in every workload (j1-fold). With a compaction
+    every 100 records, the three formats ingest within 5% of each other (campaign h1-shapes).
 - **Checkpoints:**
   - the committed set paged out ([COMMITTED_PAGING.md](COMMITTED_PAGING.md)): 20 MB to 1-4 MB at
     1,000 records/s;

@@ -35,7 +35,8 @@ manifest writes), not in the latency it sleeps. Compare runs of one campaign on 
 ## The ingest benchmark and JMH, build against build
 
 `run.sh ingest <name> <configs>` runs the ingest benchmark (IngestBench) in one container (16
-CPUs and a 6g heap unless `CPUS` and `HEAP` say otherwise: a capture runs 16 writers), its
+CPUs, a 6g heap and a 12g limit unless `CPUS`, `HEAP` and `MEM` say otherwise: a capture runs 16
+writers, and a JVM of 13 ingests past a 6g heap outgrew 8g), its
 captures under `$OUT/<name>/captures/`. `run.sh jmh <name> <campaign...> -- <JMH args>` runs
 `IngestFoldBench.fold` over every log those campaigns captured, its JSON in `$OUT/<name>/`. To
 compare builds, pack each from a worktree of its commit and run them at once, one image each, so

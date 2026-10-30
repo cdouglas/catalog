@@ -109,6 +109,14 @@ select = ["i10-format-*"]
 select = "i10-format-*"
 note = "ran on a laptop that slept during the campaign (cap-s-fast's 10-minute capture took 37): record bytes and checkpoint breakdowns compare, timings do not; h1-shapes on havoc times the builds"
 
+[campaigns.h1-shapes]
+title = "i8-shapes' seven workloads on havoc, three builds side by side (i8 1e86cf5, i9 343f37b, i10 03ab333), each on its own captures: tell the builds apart by git_sha"
+select = ["h1-shapes-*"]
+
+[campaigns.j1-fold]
+title = "JMH IngestFoldBench.fold over h1-shapes' captures, one run per build (j1-i8, j1-i9, j1-i10), steady committed set, batches of 64"
+select = ["jmh/j1-*"]
+
 [campaigns.c8-fold]
 title = "c1's fast appends on the code before (4e65a65) and after (56facd8) replay folds a read onto a replica"
 select = ["c8-fold-*"]

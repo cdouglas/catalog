@@ -172,5 +172,16 @@ to tables of one `FileIOCatalog` over an in-memory store whose requests take a p
   and ingests: its record bytes and checkpoint breakdowns compare with i8's and i9's, its
   timings do not. `h1-shapes` reruns the three builds side by side on havoc for the timings.
 
+- `h1-shapes` (2026-10-30, havoc) runs i8-shapes' seven workloads on three builds at once, each
+  capturing its own logs: i8 (1e86cf5), i9 (343f37b), i10 (03ab333); tell them apart by
+  `git_sha`. Each build ran in one container (16 CPUs, 6g heap, 12g limit) beside a fuzz round.
+  A first pass (not copied) lost i8's container to an 8g limit at its 13th run; these runs are
+  the second pass, which reused the first pass's captures and ran only the ingests. Captures of
+  one workload hold about the same records in every build (e.g. merge2 88.0-88.7k), so the
+  builds compare. Fold-only runs last 6-15 s: compare replay with `j1-fold`.
+- `j1-fold` (2026-10-30, havoc) is JMH IngestFoldBench.fold over each build's h1 captures, one
+  JSON per build (source `jmh`, run ids `jmh/j1-<build>`; the capture is in `params['log']`).
+  The secondary metric `records` is records/s, `score_error` a 99.9% half-interval.
+
 - `pilot-fa`, `pilot-mix` (2026-10-27) were pilots of the driver. The first `pilot-mix` runs gave
   fast appends the validated operations' 2 s runtime too; the runtime is per kind since.
