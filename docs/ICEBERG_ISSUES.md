@@ -892,3 +892,19 @@ each lineage. `TestCatalogFaultProperties` checks that a file's first
 row id never changes along main's lineage (it keeps every snapshot's
 parent, so the check holds across expiries); before round 7 of
 2026-10-20 it checked across lineages and failed on this.
+
+### A6. A transaction trims the metadata log under the bound it began with
+
+Iceberg trims a table's metadata log to `write.metadata.previous-versions-max`
+only when a build adds the previous metadata file to it
+(`TableMetadata.Builder.addPreviousFile`), under that build's properties.
+A transaction builds once per operation, and only its first build has a
+previous file: a bound its later operations set takes effect at the next
+commit. A catalog that applies a commit's updates in one build, a REST
+server (`CatalogHandlers`) or the inline catalog's replay, trims under the
+bound the commit sets. So after a transaction that lowers the bound, a
+pointer table's log is longer than an inline table's, until the next
+commit trims both. The log is history, not the table's state;
+`TableScript`'s transactions leave the bound alone, so that
+`TestInlineDifferentialProperties` compares the logs' lengths (round si1,
+2026-10-30, found the difference when transactions set it).

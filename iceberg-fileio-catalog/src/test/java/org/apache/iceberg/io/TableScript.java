@@ -256,6 +256,8 @@ final class TableScript {
     private final String names;
     private int nextFile = 0;
     private int nextValue = 0;
+    // A transaction's members leave the metadata log's bound alone (ICEBERG_ISSUES.md A6)
+    private boolean inTransaction = false;
 
     /**
      * Creates the tables, in {@code formatVersion}, partitioned by cat if {@code partitioned}.
@@ -338,18 +340,23 @@ final class TableScript {
           Table target = txn != null ? txn.table() : catalogTxn.asCatalog().loadTable(ID);
           Table second = txn != null ? target : catalogTxn.asCatalog().loadTable(OTHER);
           int staged = 0;
-          for (int i = 0; i < group.size(); i++) {
-            Cmd member = group.get(i);
-            if (member.kind == Kind.TRANSACTION || member.kind == Kind.CATALOG_TXN
-                || member.kind == Kind.REPLACE || member.kind == Kind.STALE) {
-              continue;
+          inTransaction = true;
+          try {
+            for (int i = 0; i < group.size(); i++) {
+              Cmd member = group.get(i);
+              if (member.kind == Kind.TRANSACTION || member.kind == Kind.CATALOG_TXN
+                  || member.kind == Kind.REPLACE || member.kind == Kind.STALE) {
+                continue;
+              }
+              try {
+                run(member, i % 2 == 1 ? second : target);
+                staged += 1;
+              } catch (RuntimeException e) {
+                trace.append("  member skipped: ").append(e).append('\n');
+              }
             }
-            try {
-              run(member, i % 2 == 1 ? second : target);
-              staged += 1;
-            } catch (RuntimeException e) {
-              trace.append("  member skipped: ").append(e).append('\n');
-            }
+          } finally {
+            inTransaction = false;
           }
           if (staged == 0) {
             throw new IllegalStateException("no member staged");
@@ -629,7 +636,7 @@ final class TableScript {
           }
           break;
         case SET_PROPERTY:
-          if (cmd.b % 6 == 5) { // the metadata log's bound, to which replay trims its log (Window)
+          if (cmd.b % 6 == 5 && !inTransaction) { // the metadata log's bound (replay's Window)
             target.updateProperties()
                 .set(TableProperties.METADATA_PREVIOUS_VERSIONS_MAX, String.valueOf(cmd.c % 4))
                 .commit();
@@ -638,8 +645,9 @@ final class TableScript {
           }
           break;
         case REMOVE_PROPERTY:
+          boolean bound = cmd.b % 6 == 5 && !inTransaction;
           target.updateProperties()
-              .remove(cmd.b % 6 == 5 ? TableProperties.METADATA_PREVIOUS_VERSIONS_MAX
+              .remove(bound ? TableProperties.METADATA_PREVIOUS_VERSIONS_MAX
                   : cmd.b % 4 == 3 ? "big" : "k" + cmd.b % 3)
               .commit();
           break;

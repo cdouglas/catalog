@@ -184,13 +184,16 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
   }
 
   // Java serialization within one JVM (a SerializableTable shipped to a "worker" in a test): the
-  // copy is this FileIO itself, its objects included, as InMemoryFileIO's copies share its store
-  private static final Map<Long, InMemoryAtomicFileIO> SERIALIZED = new ConcurrentHashMap<>();
+  // copy is this FileIO itself, its objects included, as InMemoryFileIO's copies share its store.
+  // Held weakly: a fuzzer serializes a store per try, and a store no test holds is garbage.
+  private static final Map<Long, java.lang.ref.WeakReference<InMemoryAtomicFileIO>> SERIALIZED =
+      new ConcurrentHashMap<>();
   private static final AtomicLong SERIAL_IDS = new AtomicLong();
   private final long serialId = SERIAL_IDS.incrementAndGet();
 
   private Object writeReplace() {
-    SERIALIZED.put(serialId, this);
+    SERIALIZED.values().removeIf(ref -> ref.get() == null);
+    SERIALIZED.put(serialId, new java.lang.ref.WeakReference<>(this));
     return new Serialized(serialId);
   }
 
@@ -202,7 +205,12 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
     }
 
     private Object readResolve() {
-      return SERIALIZED.get(id);
+      java.lang.ref.WeakReference<InMemoryAtomicFileIO> ref = SERIALIZED.get(id);
+      InMemoryAtomicFileIO io = ref != null ? ref.get() : null;
+      if (io == null) {
+        throw new IllegalStateException("store " + id + " is gone: no test holds it");
+      }
+      return io;
     }
   }
 
