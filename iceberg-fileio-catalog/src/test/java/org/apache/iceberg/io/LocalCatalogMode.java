@@ -20,12 +20,9 @@ package org.apache.iceberg.io;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.WeakHashMap;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.io.AtomicOutputFile.Strategy;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
@@ -92,16 +89,15 @@ enum LocalCatalogMode {
     return Arrays.stream(values()).filter(m -> m.sharedLog).toList();
   }
 
-  /** The shared logs of the catalogs over each store, by location: catalogs there share one. */
-  private static final Map<InMemoryAtomicFileIO, Map<String, InMemorySharedLog>> SHARED_LOGS =
-      Collections.synchronizedMap(new WeakHashMap<>());
+  /**
+   * The key of the shared log of the catalog at a location over a store, kept beside the store
+   * ({@link InMemoryAtomicFileIO#attachment}) for as long as it lives: catalogs there share one.
+   */
+  private static final String SHARED_LOG = "shared log ";
 
   /** The shared log of the catalog at {@code location} over {@code io}. */
   static InMemorySharedLog sharedLog(InMemoryAtomicFileIO io, String location) {
-    synchronized (SHARED_LOGS) {
-      return SHARED_LOGS.computeIfAbsent(io, k -> new java.util.HashMap<>())
-          .computeIfAbsent(location, InMemorySharedLog::new);
-    }
+    return io.attachment(SHARED_LOG + location, key -> new InMemorySharedLog(location));
   }
 
   /** This mode's table metadata storage, on a shared log. */
@@ -111,16 +107,12 @@ enum LocalCatalogMode {
 
   /** A mode to read the catalog at {@code location} over {@code io} with, whichever log it has. */
   static LocalCatalogMode readerFor(InMemoryAtomicFileIO io, String location) {
-    synchronized (SHARED_LOGS) {
-      return SHARED_LOGS.getOrDefault(io, Map.of()).containsKey(location) ? MEMLOG : APPEND;
-    }
+    return io.hasAttachment(SHARED_LOG + location) ? MEMLOG : APPEND;
   }
 
   /** The shared logs of catalogs over {@code io}. */
   static List<InMemorySharedLog> sharedLogs(InMemoryAtomicFileIO io) {
-    synchronized (SHARED_LOGS) {
-      return new ArrayList<>(SHARED_LOGS.getOrDefault(io, Map.of()).values());
-    }
+    return io.attachments(SHARED_LOG, InMemorySharedLog.class);
   }
 
   /**

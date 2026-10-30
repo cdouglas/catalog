@@ -214,6 +214,33 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
     }
   }
 
+  // Objects tests keep beside this store, for as long as it lives: the shared logs of the catalogs
+  // over it (the catalog module's LocalCatalogMode). A registry keyed weakly by the store would
+  // keep them forever once a test hook on one held the store.
+  private final Map<String, Object> attachments = new ConcurrentHashMap<>();
+
+  /** The object kept beside this store under {@code key}, made by {@code make} if there is none. */
+  @SuppressWarnings("unchecked")
+  public <T> T attachment(String key, java.util.function.Function<String, T> make) {
+    return (T) attachments.computeIfAbsent(key, make);
+  }
+
+  /** Whether an object is kept beside this store under {@code key}. */
+  public boolean hasAttachment(String key) {
+    return attachments.containsKey(key);
+  }
+
+  /** The objects kept beside this store under keys that start with {@code prefix}. */
+  public <T> List<T> attachments(String prefix, Class<T> type) {
+    List<T> found = Lists.newArrayList();
+    attachments.forEach((key, value) -> {
+      if (key.startsWith(prefix)) {
+        found.add(type.cast(value));
+      }
+    });
+    return found;
+  }
+
   /** @param supportsAppend false models a backend without an append primitive (GCS). */
   public InMemoryAtomicFileIO(boolean supportsAppend) {
     this.supportsAppend = supportsAppend;
