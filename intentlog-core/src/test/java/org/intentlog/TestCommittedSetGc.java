@@ -147,7 +147,7 @@ class TestCommittedSetGc {
 
   @Test
   void rewriteHorizonCanExceedMaxTimestampMs() throws Exception {
-    // Edge case from docs/GC.md: when all kept entries are stale additions
+    // Edge case from docs/LOG.md: when all kept entries are stale additions
     // and inherited drops landed *above* them, highest_dropped > max_timestamp_ms.
     Random rand = new Random(0xEDDE);
     long base = 1_000_000L;

@@ -39,7 +39,7 @@ import java.util.UUID;
  * The {@code CommittedTransactions} message: a set of UUIDv7 transaction ids, sorted descending,
  * stored as a {@code max_timestamp_ms} and packed entries of (varint timestamp delta, 10 random
  * bytes), with the GC horizon {@code highest_dropped_timestamp_ms}. Queries scan the bytes in
- * place. See docs/GC.md.
+ * place. See docs/LOG.md "The committed set and GC".
  */
 public final class CommittedSetCodec {
 

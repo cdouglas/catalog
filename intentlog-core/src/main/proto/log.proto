@@ -86,7 +86,7 @@ message CommittedTransactions {
   // from this set by a GC record. 0 (absent) means no GC has happened yet.
   // Queries for UUIDs whose timestamp_ms <= this value are UNKNOWN — the entry
   // may have been committed and aged out, or it may never have been committed.
-  // See docs/LOG.md "The committed set and GC" and docs/GC.md.
+  // See docs/LOG.md "The committed set and GC".
   fixed64 highest_dropped_timestamp_ms = 3;
 }
 

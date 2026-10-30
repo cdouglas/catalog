@@ -126,9 +126,11 @@ Replay keeps each inline table as fields, not as Iceberg objects.
 encoded bytes, its `TableFields`, or both, and makes either from the
 other when asked. `TableFields` holds `TableMetadata`'s fields; its
 snapshots and snapshot log are `Chain`s, append-only lists that
-successive states share. Landing, `TableChange` and the encodings read a
-table through `MetadataView`, which `TableFields` implements, and which
-adapts a `TableMetadata` too.
+successive states share, and its metadata log a `Window`, the newest
+entries of such a list up to `write.metadata.previous-versions-max`, so
+that a record extends each in place rather than copying it. Landing,
+`TableChange` and the encodings read a table through `MetadataView`,
+which `TableFields` implements, and which adapts a `TableMetadata` too.
 
 - A delta of snapshots, refs and properties (`AddSnapshot`,
   `SetSnapshotRef`, `SetProperties`, then its manifest-list updates)
@@ -420,8 +422,9 @@ unknown. So is a commit whose id the committed set's GC horizon has
 passed, if one of its writes may have landed; otherwise it is rejected,
 since replay rejects its record from then on (Bug 64). A retention
 shorter than a commit takes is legal but lossy: it makes this case
-common, but never incorrect ([GC.md](GC.md)). A writer judges its
-record by replay's judgment where it landed before the committed set,
+common, but never incorrect ([LOG.md](LOG.md) "The committed set and
+GC"). A writer judges its record by replay's judgment where it landed
+before the committed set,
 since another compactor's GC can drop the id of a record that applied;
 and on a log without conditional appends, it counts a throttled send as
 a write that may have landed, never lets a read fall behind the one it
@@ -846,12 +849,14 @@ classes handle this for you; manual codecs require it as a discipline.
 | `TestInlineDifferentialProperties` | jqwik: the same schedule on a pointer catalog and an inline one commits alike and reads the same (I8) |
 | `Test*Encoding` (`ConflictEncodingContract`), `TestRebaseProperties`, `TestConflictMatrix` | The conflict encodings: each one's contract, the oracle against Iceberg's retry, and the per-encoding matrix (I12) |
 | `TestCatalogRegressions` | One nested group per catalog bug, with the smallest scenario that reproduces it |
-| `TestCommittedSetGc`, `TestCommittedTransactions`, `TestUuidV7` (intentlog-core) | Committed-set encoding, GC merge and horizon, tri-state lookup ([GC.md](GC.md)); UUIDv7 minting |
+| `TestCommittedSetGc`, `TestCommittedTransactions`, `TestUuidV7` (intentlog-core) | Committed-set encoding, GC merge and horizon, tri-state lookup ([LOG.md](LOG.md) "The committed set and GC"); UUIDv7 minting |
 | `TestReplay`, `TestLogRuntime` (intentlog-core) | Replay, and the commit loop branch by branch on a scripted log laid out as one object, each test named for the TLA+ action it drives |
 | `TestSharedLogRuntime` (intentlog-memory) | The commit loop on a shared log with checkpoints apart: the append branch, creation, compaction, refresh, and the schedules the shared-log model found (`dup`, `lagread`, `p3`), with copies of records that must never apply again |
 | `TestAtomicFileLog`, `TestAtomicFileLogContract`, `TestInMemorySharedLogContract` | Each provider's layout and signals, and `SharedLogContract` (P1, P3-P5, I11) on each |
 | `TestMemoryCommitProtocol`, `TestAtomicFileCommitProtocol` | jqwik: the testkit's `CommitProtocol` on each provider, over `EntityVersionsMachine`: faults, compactors and GC records inside commits, stale and P3-breaking reads, delayed appends, and copies of any record that ever landed (I2, I10, I11) |
-| `TestIcebergCoreIssues` | Canaries asserting each Iceberg core issue C1-C25 ([ICEBERG_ISSUES.md](ICEBERG_ISSUES.md)) is absent |
+| `TestIcebergCoreIssues` | Canaries asserting each Iceberg core issue C1-C27 ([ICEBERG_ISSUES.md](ICEBERG_ISSUES.md)) is absent |
+| `TestSerializableInlineTable` | A table shipped to a worker as Spark and Flink ship one (`SerializableTable`, by Java serialization and Kryo), in pointer and inline modes: the copy, and a copy of each metadata table, reads as the table |
+| `TestWindow`, `TestInlineSnapshotReuse` | Replay's shared lists: a `Window` against `TableMetadata.Builder`'s trim of the metadata log, appending to older lists and changing bounds; a load's reuse of the `InlineSnapshot`s earlier loads made |
 | `CheckpointRoundTrip` | Not a test class: checks a catalog file against `catalog.proto` and its replayed state against a checkpoint of it (I6), and a compaction's checkpoint against a replay of what it replaced (I11); the local suites and the fault and multi-writer fuzzers run it on every write and every stored checkpoint, and other suites use it too |
 | `TestFormatExplorer` | Codec field-number constants against `catalog.proto` both ways; explorer fixtures current |
 | `spec/` (`TestCodecProperties`, `TestInvariantProperties`, `TestCanonicalStateProperty`, `TestMultiWriterProperties`) | jqwik at the format layer: codec round trip and determinism, well-formedness, builder state through the codec, and a multi-writer fuzzer of the commit protocol on one object and on a shared log, with copies of records and late landings |

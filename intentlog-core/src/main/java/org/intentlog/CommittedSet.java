@@ -34,7 +34,8 @@ import org.intentlog.wire.UuidV7;
 /**
  * The ids of the committed transactions a log's replay has applied, less those GC dropped, and
  * the GC horizon: the newest timestamp it dropped. Replay applies a record once by its id, and a
- * writer learns from the set whether its commit landed. See docs/GC.md.
+ * writer learns from the set whether its commit landed. See docs/LOG.md "The committed set and
+ * GC".
  *
  * <p>The set is kept as the {@code CommittedTransactions} packed entries (newest first, each a
  * varint gap from the one before and 10 random bytes), in runs: slices of entries, newest run

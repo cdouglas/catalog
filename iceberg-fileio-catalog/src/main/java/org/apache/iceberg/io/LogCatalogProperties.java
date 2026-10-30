@@ -62,7 +62,7 @@ public final class LogCatalogProperties {
    * shorter than a commit takes is legal but lossy: a writer whose id falls
    * below the horizon while it commits fails, or cannot learn whether it
    * committed (CommitStateUnknownException); {@code 0} drops everything older
-   * than the compacting commit. See {@code docs/GC.md}.
+   * than the compacting commit. See {@code docs/LOG.md} "The committed set and GC".
    */
   public static final String COMMITTED_RETENTION_MS = "fileio.catalog.committed.retention.ms";
   public static final long DEFAULT_COMMITTED_RETENTION_MS = 30L * 60 * 1000;

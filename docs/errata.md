@@ -48,7 +48,7 @@ uses it: `wrapInlineManifests` builds the metadata with its
 `InlineSnapshot`s directly (`InlineTableMetadata.create`, which calls
 `TableMetadata`'s package-private constructor from this project's
 `org.apache.iceberg` package, as `ManifestListFiles` does, with no fork
-change). The fork makes two more changes to core for inline tables:
+change). The fork makes three more changes to core for inline tables:
 
 - `TableMetadata.Builder.setLastUpdatedMillis` (17 lines, 6085f96f4)
   lets replay pin the writer's last-updated-ms, which `buildFrom`
@@ -58,6 +58,12 @@ change). The fork makes two more changes to core for inline tables:
 - `BaseSnapshot.equals` accepts any `Snapshot`, not only a
   `BaseSnapshot` (d0b03bc1b), so a `BaseSnapshot` and an
   `InlineSnapshot` of the same snapshot are equal both ways.
+- `SerializableTable` ships a table whose metadata location is not a
+  `metadata.json` with its metadata as JSON and its `InlineSnapshot`s'
+  manifests (0f44056ccf), which a worker rebuilds with
+  `replaceSnapshots`: stock Iceberg loads a shipped table's metadata
+  from its file, which an inline table does not have, so a Spark or
+  Flink worker could not read one (`TestSerializableInlineTable`).
 
 These work, but they are builder and equality changes in core that
 would have to be upstreamed — or rewritten — before this catalog could
@@ -411,7 +417,7 @@ prices a GET by its bytes.
 
 The committed set holds every id within the retention
 (`fileio.catalog.committed.retention.ms`, 30 minutes by default since
-2026-10-28, 6 hours before; GC.md), so at a steady rate it holds rate ×
+2026-10-28, 6 hours before; LOG.md), so at a steady rate it holds rate ×
 retention ids. At 6 hours that was 2.16 million at 100 commits a second and
 21.6 million at 1,000; at 30 minutes it is 180,000 and 1.8 million. It is one
 packed blob (`CommittedTransactions`, LOG.md: newest first, per id a varint gap
@@ -465,12 +471,12 @@ a record applied that was not, and drop it. The fixes, in order:
   pivoting on an id. The checkpoint then carries rate × the admission window
   (5 minutes proposed), not rate × the retention. Replay never reads a page,
   and a writer's lookup in the paged range fetches it and is exact.
-- **Derive the retention.** 6 hours was "longer than any commit's retries"
-  (GC.md); the default is 30 minutes since 2026-10-28, which makes the set 12
+- **Derive the retention.** 6 hours was chosen as "longer than any commit's
+  retries"; the default is 30 minutes since 2026-10-28, which makes the set 12
   times smaller. What the set must cover is how late a copy of a record can
   land, which a store may bound (SigV4 and Azure Shared Key reject a request
   signed about 15 minutes earlier; to be checked per store), and how long a
-  writer may ask whether its commit landed, which the snapshot oracle (GC.md)
+  writer may ask whether its commit landed, which the snapshot oracle (LOG.md)
   answers past the horizon. With paging, only the admission window sizes the
   checkpoint, and the retention could grow again cheaply.
 

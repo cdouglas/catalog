@@ -22,8 +22,10 @@ is implemented and tested, and the others are mapped on paper.
 - **Absorb redundant writes.** A typical Iceberg data commit writes three
   files — manifest list (rewritten in full), table metadata (rewritten in
   full), and the catalog pointer. With both inline modes enabled, a
-  commit becomes one ~380-byte atomic write to the catalog object
-  ([docs/sample](docs/sample/README.md)).
+  commit becomes one atomic write to the catalog object, of about 240
+  bytes on average in the ingest benchmark's workload
+  ([docs/FORMAT.md](docs/FORMAT.md); each mode's footprint in
+  [docs/sample](docs/sample/README.md)).
 - **No new servers.** Anything that supports `SupportsAtomicOperations`
   (S3 with if-match, GCS with generation number, ADLS with AppendBlock)
   works as a catalog backend.
@@ -39,8 +41,10 @@ Express One Zone buckets), GCS (standard and zonal buckets) and ADLS
 Gen2, it passes Iceberg's `CatalogTests` and `CatalogTransactionTests` in
 every commit and inline mode each store supports
 ([docs/COMPAT.md](docs/COMPAT.md)); [Testing](#testing) describes the
-fuzzers and the TLA+ model. It does not run on stock Iceberg (see the
-next section).
+fuzzers and the TLA+ model. Spark and Flink ship an inline table to
+their workers as they ship any other (`SerializableTable`, by Java
+serialization or Kryo). It does not run on stock Iceberg (see the next
+section).
 
 ## What's in here
 
@@ -75,19 +79,23 @@ docs/SPEC_TM.md                              inline table metadata
 docs/SPEC_ML.md                              inline manifest lists
 docs/design.md                               invariants, conflict matrix, best practices
 docs/errata.md                               current shortcuts, gaps, known unknowns
-docs/GC.md                                   retention of the committed-transaction set
 docs/COMPAT.md                               cloud-store x commit-mode x inline-mode results
 docs/INTEGRATION_TESTING.md                  running the suites on emulators or real cloud
 docs/ICEBERG_ISSUES.md                       Iceberg core bugs the fuzzers found, and their fixes
 docs/iceberg-issues/                         one document per Iceberg issue, for upstream reports
 docs/format-explorer/                        byte-level viewer of catalog files
 docs/sample/                                 measured footprint of each inline mode
-docs/REPLAY_BENCH_RESULTS.md                 replay throughput, read and load (JMH ReplayBench)
+docs/COMMITTED_PAGING.md                     proposed: paging the committed set out of checkpoints
+docs/*_BENCH_RESULTS.md                      replay (JMH ReplayBench), and the measurements behind
+                                             the inline-metadata codec and the committed set's
+                                             encoding
 spec/tla/                                    TLA+ models of the commit loop and the fuzzers' oracles
 bench/                                       the multi-writer contention driver's campaigns: configs,
                                              run.sh, shards on another host (havoc/), endive's
                                              predictions (endive/); results in bench/results/
 lab/                                         labbook over the campaigns' results (DuckDB, MyST pages)
+fuzz/                                        long fuzz rounds and mutant calibration, in a container
+                                             on a bigger host
 ```
 
 ## Dependencies on the Iceberg fork
@@ -100,7 +108,7 @@ branch carries both the atomic-operations hooks used by the base catalog
 and the manifest-list-inlining hooks used by `inline.manifests`.
 
 The fork adds these extension points. Its other changes to stock Iceberg
-include the fixes for core bugs C2 to C25 (branch `core-fixes`, which
+include the fixes for core bugs C2 to C27 (branch `core-fixes`, which
 `atomicio` sits on; see [docs/ICEBERG_ISSUES.md](docs/ICEBERG_ISSUES.md)),
 `TableMetadata.Builder.setLastUpdatedMillis` for inline replay, a guard
 that makes `RewriteTablePathUtil` reject inline-ML snapshots, catalog
@@ -118,6 +126,8 @@ transactions in `RESTCatalog`, and the fork's version
 | `SupportsCatalogTransactions`, `BaseCatalogTransaction` | `core/.../catalog/` | Multi-table transaction API. `commitTransaction` takes a read set: each table the transaction writes and, under serializable isolation, each branch it read, as it first read them |
 | `ManifestListSink`         | `core/.../ManifestListSink.java` | Hook for `SnapshotProducer` to deliver finalized manifest list deltas instead of writing `snap-*.avro` |
 | `InlineSnapshot`           | `core/.../InlineSnapshot.java` | `Snapshot` whose `manifestListLocation()` is null and whose manifests are held in memory |
+| `CommitFootprint`          | `core/.../CommitFootprint.java` | What a snapshot producer's commit depends on (BLIND, VALIDATED with the checks its retry would make, OPAQUE), on its `InlineSnapshot`; the conflict encodings merge by it |
+| `SerializableTable`        | `core/.../SerializableTable.java` | A table without a metadata file (an inline table) is shipped with its metadata as JSON and its inline snapshots' manifests, so a Spark or Flink worker reads it |
 
 `InlineSnapshot` integration also requires a small builder change
 (`TableMetadata.Builder.replaceSnapshots`) and a loosened `BaseSnapshot.equals`
@@ -211,6 +221,10 @@ suites skip; see [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
   suites and fuzzers write against `catalog.proto`, and that its replayed
   state equals a checkpoint of it. `TestFormatExplorer` checks the codecs'
   field numbers against `catalog.proto`.
+- **Engines.** `TestSerializableInlineTable` ships a table to a worker
+  as Spark and Flink do (`SerializableTable`, by Java serialization and
+  by Kryo), in pointer and inline modes, and requires the copy, and a
+  copy of each of its metadata tables, to read as the table.
 - **Model checking.** [spec/tla/](spec/tla/README.md) models the commit
   loop in TLA+, on one catalog object and on a shared log with
   checkpoints apart from it, and states the fuzzers' oracles over the
@@ -223,6 +237,13 @@ suites skip; see [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
 - **Replay.** `ReplayBench` (JMH, in the catalog module's tests) measures
   how fast a reader tests and applies records, and what a read and a
   table load cost ([docs/REPLAY_BENCH_RESULTS.md](docs/REPLAY_BENCH_RESULTS.md)).
+- **Ingest.** `IngestBench` replays, on one thread with no storage, a log
+  the contention driver captured from real writers, with its ids retimed
+  to a production rate and the committed set at its steady state:
+  records/s as the catalog grows, with compactions encoded, and checkpoint
+  bytes by part; `IngestFoldBench` (JMH) times the fold alone.
+  [docs/FORMAT.md](docs/FORMAT.md) ties each part of the format to what it
+  costs, from these.
 - **Contention.** The contention driver (`org.apache.iceberg.io.contention`,
   test scope) runs N writers, each with its own catalog, over an
   in-memory store that injects a provider's latencies (endive's

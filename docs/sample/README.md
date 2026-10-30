@@ -29,10 +29,12 @@ inlining can shrink.
 The samples themselves are **not checked in** — regenerate them from a seed (see
 [Regenerating](#regenerating)). The exact tables and figures land in
 `figures/<seed>/REPORT.md`. As a sense of scale, a representative run (seed
-`0xC0FFEE`) shrinks the catalog-layer footprint of the `1tbl-50x50` example from
-~5 MB across 202 files (vanilla) — or ~1.3 MB gzipped — to ~38 KB in a **single**
-file under `tmml`; `ml-carry-forward` collapses from ~18 MB to ~80 KB. Numbers
-vary modestly with the seed; the report has the exact figures for your run.
+`0xC0FFEE`, regenerated 2026-10-30 with the format's records referring to their
+parents and naming manifests by number, [FORMAT.md](../FORMAT.md)) shrinks the
+catalog-layer footprint of the `1tbl-50x50` example from ~5 MB across 202 files
+(vanilla) — or ~1.3 MB gzipped — to ~22 KB in a **single** file under `tmml`;
+`ml-carry-forward` collapses from ~19 MB to ~40 KB. Numbers vary modestly with
+the seed; the report has the exact figures for your run.
 
 ## The examples
 
@@ -102,7 +104,7 @@ plus an `AddManifest`/`RemoveManifest` for the pool under `tmml`).
 
 1. **Eliminating `metadata.json` rewrites (TM inlining).** `orig` rewrites the
    full table metadata on every commit; as snapshot history grows, so does each
-   rewrite, and 101 of them accumulate. `tm` and `tmml` carry one ~0.35 KB delta
+   rewrite, and 101 of them accumulate. `tm` and `tmml` carry one ~0.2 KB delta
    record per commit instead. This is the largest single win.
 2. **Eliminating `snap-*.avro` rewrites (ML inlining).** `orig` and `tm` rewrite
    the full manifest list every commit. `tmml` stores each manifest once in the
@@ -112,7 +114,9 @@ plus an `AddManifest`/`RemoveManifest` for the pool under `tmml`).
    history — because consecutive snapshots share all but one manifest.
 
 The per-commit append-log records (the per-commit figure in the regenerated
-report) show the steady-state cost: a flat ~0.35–0.39 KB per commit, with
+report) show the steady-state cost: a flat ~0.2 KB per commit (a median of
+196 B under `tmml`, 232 B under `tm`, whose delta names its snapshot's manifest
+list by path), with
 occasional larger records for the overwrite/delete commits that carry both a
 remove and an add against the pool.
 
@@ -133,7 +137,7 @@ flowchart LR
 ```
 
 - **One write, four tables.** Under `tmml` each atomic transaction is a *single*
-  append-log record (~1.5 KB) carrying all four tables' snapshot deltas. Vanilla
+  append-log record (~0.7 KB) carrying all four tables' snapshot deltas. Vanilla
   Iceberg would need four independent table commits, each rewriting that table's
   `metadata.json` and `snap-*.avro` — and with no way to make the four atomic.
 - **The footprint difference is the same inlining story as the single-table case**

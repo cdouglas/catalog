@@ -313,8 +313,7 @@ The committed set holds the id of every intention record replay applied, less
 those GC dropped. Replay uses it to apply a record once: a copy of a record
 (a retried append whose first attempt landed, a send throttled and sent
 again, a request delayed in flight) changes nothing. A writer uses it to
-learn whether its record applied. [GC.md](GC.md) gives the rationale and the
-writer-side alternative.
+learn whether its record applied.
 
 **Ids approximate commit time.** A commit mints its id when it starts
 (`LogRuntime.commit`, with `UuidV7.newUuidV7After(base.committed().horizon())`),
@@ -385,6 +384,15 @@ more than the retention, one that stalls that long between minting its id and
 writing, or a race under a short retention. The commit loop maps each to an
 outcome ([The commit loop](#the-commit-loop)).
 
+**A writer has a second oracle.** Past the horizon a writer can still learn
+whether its commit landed from what it committed, which it knows: a data
+commit's snapshot ids (a load of any one of its tables that finds its
+snapshot proves the whole transaction applied, since all of it applies or
+none does), or a namespace's or property's new value. That is the writer's
+pattern, not the log's: the log keeps no index from an id to what its
+intention touched, and needs none, so the retention can be short without a
+writer losing the answer for good.
+
 **Retention.** `RuntimeConfig.committedRetentionMs` (the catalog's
 `fileio.catalog.committed.retention.ms`, default 30 minutes): the minimum age
 before an id may be dropped. It should comfortably exceed the longest time a
@@ -408,6 +416,24 @@ writer behind by more than the retention still mints its id above the horizon
 it read, and a record that lands at or below the horizon is rejected, never
 applied twice or left to fail reads. Skew costs spurious rejections and
 unknown outcomes.
+
+**Tests.** `TestCommittedSetGc` (intentlog-core) checks the set's rewrite
+(drops at the watermark, a horizon above the newest id kept, a monotonic
+horizon), the tri-state lookup and a GC record's replay (ids replay added are
+dropped too; idempotent); `TestCommittedTransactions` the set's codec and its
+defensive decode. `CheckpointRoundTrip` checks that every checkpoint, set and
+horizon included, is the replay of what it replaced (I11).
+`TestCatalogRegressions.CommittedSetHorizon` covers Bug 64 (a CAS after a
+conflict with retention 0, a record at the horizon, a writer behind it), and
+`TestSharedLogRuntime` the shared-log cases of [The commit
+loop](#the-commit-loop), each a schedule that fails with its rule removed. The
+protocol fuzzers (`TestMemoryCommitProtocol`, `TestAtomicFileCommitProtocol`)
+and `TestMultiWriterProperties` run compactors with retention 0, inside
+commits too, and append copies of records that ever landed, none of which may
+apply; `TestCatalogFaultProperties` (`gcWriters`) and
+`TestCatalogRaceProperties` (`gc`) run writers with retention 0, accepting a
+failed or unknown operation only if the run is serial with or without it.
+`CommittedTxnsBench` (JMH) measures the set's size and lookup cost.
 
 ## The commit loop
 

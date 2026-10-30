@@ -27,9 +27,9 @@ import org.intentlog.wire.UuidV7;
  * GC horizon ({@code highest_dropped_timestamp_ms}): the dedup oracle can no longer
  * distinguish "was committed and aged out" from "never committed."
  *
- * <p>Callers must fall back to a different oracle. See {@code docs/GC.md}
- * §"Two oracles" — the writer-side snapshot oracle is the documented pattern
- * for data writers that need definitive confirmation past the dedup horizon.
+ * <p>Callers must fall back to a different oracle. See {@code docs/LOG.md} §"The committed set
+ * and GC" — the writer-side snapshot oracle is the documented pattern for data writers that need
+ * definitive confirmation past the dedup horizon.
  */
 public class DedupHorizonExceededException extends RuntimeException {
   private final UUID queryId;

@@ -2094,7 +2094,7 @@ public class TestProtoActions {
   // Idempotency tests -- each action's apply() mutates state so that the
   // same intention record, replayed with a fresh UUID (bypassing the
   // committed-txn dedup set), fails verify against the post-apply state.
-  // See Invariant I2 in docs/catalog_errata.md.
+  // See invariant I2 in docs/design.md.
   // ============================================================
 
   @Nested
@@ -2281,7 +2281,7 @@ public class TestProtoActions {
   // the pre-A version and is applied to post-A state. Each test asserts
   // whether verify returns true (compose) or false (conflict) and,
   // on conflict, which field drives the rejection.
-  // The results are tabulated in docs/catalog_errata.md.
+  // The results are tabulated in docs/design.md ("Operation × Operation Conflict Matrix").
   // ============================================================
 
   @Nested

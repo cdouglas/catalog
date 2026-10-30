@@ -4,7 +4,7 @@ Status: proposed, 2026-10-28; not built. Errata D16 tracks the problem.
 
 ## Context
 
-The committed set ([LOG.md](LOG.md) §"The committed set and GC", [GC.md](GC.md))
+The committed set ([LOG.md](LOG.md) §"The committed set and GC")
 holds every id replay applied within the retention, about 11 B an id, and every
 checkpoint carries all of it. With the retention at 30 minutes (since
 2026-10-28; it was 6 hours), that is 2 MB at 100 commits a second and 20 MB at
@@ -230,9 +230,9 @@ contains(q):                         # tri-state, as today
 mayApply(q) = q > F and not inline.holds(q)               # replay never fetches
 ```
 
-- **Minting** (Rule 3 of GC.md) mints after F: `newUuidV7After(max(H, F))`.
+- **Minting**, after the horizon a writer read (LOG.md), mints after F: `newUuidV7After(max(H, F))`.
   A writer whose clock is behind still commits.
-- **A replace's write** (Rule 2) keeps its PageOuts below its own id, as its
+- **A replace's write**, whose GC record stays below its own id (LOG.md), keeps its PageOuts below its own id, as its
   GC record is.
 - **`landed`** (Rule 4) catches `PagedOut`, fetches the page through the
   provider's page store, and answers from it. The runtime caches pages by URI,
@@ -240,7 +240,7 @@ mayApply(q) = q > F and not inline.holds(q)               # replay never fetches
   never read as "absent". The lookup then falls under the failure rules as any
   read does (LOG.md §"Failures"): unknown if a write may have landed, else
   rethrown.
-- **Callers outside the commit loop** (GC.md's tri-state lookup) ask the
+- **Callers outside the commit loop** (the tri-state lookup, LOG.md) ask the
   runtime, which resolves pages the same way. `CommittedSet.contains` alone
   throws `PagedOut`, since the set holds references, not pages.
 - **Exceeding A.** An id at or below F whose record is not in its page is

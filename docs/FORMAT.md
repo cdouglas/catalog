@@ -8,7 +8,7 @@ listed below are the specs of record; this page restates only enough to name the
 
 | Layer | Documents | What they cover |
 |---|---|---|
-| The intention log, for any state machine on any provider | [LOG.md](LOG.md), [GC.md](GC.md), schema `intentlog-core/src/main/proto/log.proto` | The `SharedLog` interface and what a provider must guarantee (P1–P6), the checkpoint and record envelope, replay, the committed set and its GC, the commit loop, compaction, providers |
+| The intention log, for any state machine on any provider | [LOG.md](LOG.md), schema `intentlog-core/src/main/proto/log.proto` | The `SharedLog` interface and what a provider must guarantee (P1–P6), the checkpoint and record envelope, replay, the committed set and its GC, the commit loop, compaction, providers |
 | The log in one object | [ATOMIC_FILE_LOG.md](ATOMIC_FILE_LOG.md) | The catalog file: header, checkpoint, appended records; commits on one object |
 | The catalog as a state machine | [SPEC.md](SPEC.md), schema `iceberg-fileio-catalog/src/main/proto/catalog.proto` | The catalog's checkpoint and intentions, worked examples, wire format, replay, verification rules |
 | Conflict encodings | [SPEC.md](SPEC.md) §"Conflict Encodings", [SPEC_TM.md](SPEC_TM.md) §"Late-bound fields" | Each encoding's witness, the state it keeps per table and what it admits beyond `lamport`; how a delta admitted on a newer version is finalized there |
