@@ -355,11 +355,14 @@ final class NativeDelta {
                 properties,
                 TableProperties.METADATA_PREVIOUS_VERSIONS_MAX,
                 TableProperties.METADATA_PREVIOUS_VERSIONS_MAX_DEFAULT));
-    int from = previousFiles.size() >= maxSize ? previousFiles.size() - maxSize + 1 : 0;
-    ImmutableList.Builder<TableMetadata.MetadataLogEntry> log = ImmutableList.builder();
-    log.addAll(previousFiles.subList(from, previousFiles.size()));
-    log.add(InlineTableMetadata.metadataLogEntry(timestampMillis, previousFileLocation));
-    return log.build();
+    // The log shares its buffer with the version before it, as replay extends it once per version
+    @SuppressWarnings("unchecked")
+    Window<TableMetadata.MetadataLogEntry> log =
+        previousFiles instanceof Window
+            ? (Window<TableMetadata.MetadataLogEntry>) previousFiles
+            : Window.of(previousFiles);
+    return log.append(
+        InlineTableMetadata.metadataLogEntry(timestampMillis, previousFileLocation), maxSize);
   }
 
   /**
