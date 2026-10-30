@@ -44,47 +44,22 @@ class InlineMetadataFileIO implements FileIO {
     }
   }
 
-  /** The table's current inline metadata, or null if its metadata is in a file. */
-  @FunctionalInterface
-  interface Current {
-    Metadata get();
-  }
-
-  /** The metadata a table had when its FileIO was serialized. */
-  private static final class AsSerialized implements Current, Serializable {
-    private final Metadata metadata;
-
-    AsSerialized(Metadata metadata) {
-      this.metadata = metadata;
-    }
-
-    @Override
-    public Metadata get() {
-      return metadata;
-    }
-  }
-
   private final FileIO io;
-  // Where the table was loaded, as the catalog holds it now; in a serialized copy, AsSerialized
-  private final Current current;
+  // The table's current inline metadata, or null if its metadata is in a file: data its
+  // operations set on each load, which a copy serialized (by Java or Kryo) keeps as it was
+  private volatile Metadata current = null;
 
-  static InlineMetadataFileIO of(FileIO io, Current current) {
-    return io instanceof DelegateFileIO
-        ? new WithPrefixAndBulk(io, current)
-        : new InlineMetadataFileIO(io, current);
+  static InlineMetadataFileIO of(FileIO io) {
+    return io instanceof DelegateFileIO ? new WithPrefixAndBulk(io) : new InlineMetadataFileIO(io);
   }
 
-  private InlineMetadataFileIO(FileIO io, Current current) {
+  private InlineMetadataFileIO(FileIO io) {
     this.io = io;
-    this.current = current;
   }
 
-  // Serialized as a copy that holds the table's current metadata, rather than the catalog's state
-  // it reads it from (not private: the subclass serializes so too, as its own class)
-  Object writeReplace() {
-    return current == null || current instanceof AsSerialized
-        ? this
-        : of(io, new AsSerialized(current.get()));
+  /** Sets the table's current inline metadata, as a load of the table found it. */
+  void current(Metadata metadata) {
+    this.current = metadata;
   }
 
   FileIO delegate() {
@@ -93,7 +68,7 @@ class InlineMetadataFileIO implements FileIO {
 
   @Override
   public InputFile newInputFile(String path) {
-    Metadata metadata = current != null && path.startsWith("inline://") ? current.get() : null;
+    Metadata metadata = path.startsWith("inline://") ? current : null;
     return metadata != null && metadata.location.equals(path)
         ? new InlineMetadataFile(path, metadata.length)
         : io.newInputFile(path);
@@ -165,8 +140,8 @@ class InlineMetadataFileIO implements FileIO {
   private static final class WithPrefixAndBulk extends InlineMetadataFileIO
       implements DelegateFileIO {
 
-    private WithPrefixAndBulk(FileIO io, Current current) {
-      super(io, current);
+    private WithPrefixAndBulk(FileIO io) {
+      super(io);
     }
 
     private DelegateFileIO prefixAndBulk() {

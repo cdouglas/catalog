@@ -545,7 +545,7 @@ public class LogCatalog extends BaseMetastoreCatalog
         InlineSettings inline,
         InlineSnapshots inlineSnapshots,
         Replica<CatalogState> read) {
-      this.tableIO = InlineMetadataFileIO.of(io, this::currentInlineMetadata);
+      this.tableIO = InlineMetadataFileIO.of(io);
       this.log = log;
       this.tableId = tableId;
       this.inline = inline;
@@ -563,14 +563,12 @@ public class LogCatalog extends BaseMetastoreCatalog
       return tableIO;
     }
 
-    /** The stored length of this table's inline metadata, if {@code location} is its current. */
-    private InlineMetadataFileIO.Metadata currentInlineMetadata() {
-      Replica<CatalogState> read = lastRead;
-      if (read == null || !read.state().isInlineTable(tableId)) {
-        return null;
-      }
-      return new InlineMetadataFileIO.Metadata(
-          metadataLocation(read.state(), tableId), read.state().inlineMetadata(tableId).length);
+    /** This table's inline metadata in {@code state}, its location and stored length, or null. */
+    private InlineMetadataFileIO.Metadata inlineMetadata(CatalogState state) {
+      return state.isInlineTable(tableId)
+          ? new InlineMetadataFileIO.Metadata(
+              metadataLocation(state, tableId), state.inlineMetadata(tableId).length)
+          : null;
     }
 
     /**
@@ -581,6 +579,7 @@ public class LogCatalog extends BaseMetastoreCatalog
      * (Bug 78: an update read a null base) and whose commit creates it.
      */
     private synchronized void loadFrom(CatalogState state) {
+      tableIO.current(inlineMetadata(state));
       String metadataFile = state.location(tableId);
       if (metadataFile != null) {
         loaded = true;

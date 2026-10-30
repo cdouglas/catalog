@@ -3562,8 +3562,8 @@ public class TestCatalogRegressions {
       CasFileIO catalogIO = new CasFileIO();
       catalogIO.newOutputFile("mem:///data/a").createOrOverwrite().close();
       String location = "inline://ns.t#1.2";
-      FileIO io =
-          InlineMetadataFileIO.of(catalogIO, () -> new InlineMetadataFileIO.Metadata(location, 42L));
+      InlineMetadataFileIO io = InlineMetadataFileIO.of(catalogIO);
+      io.current(new InlineMetadataFileIO.Metadata(location, 42L));
       assertThat(io.newInputFile(location).getLength()).isEqualTo(42L);
       assertThatThrownBy(() -> io.newInputFile(location).newStream())
           .isInstanceOf(UnsupportedOperationException.class);

@@ -180,7 +180,7 @@ final class TableFields implements MetadataView {
         currentSnapshotId,
         List.copyOf(snapshots),
         List.copyOf(snapshotLog),
-        previousFiles,
+        List.copyOf(previousFiles),
         refs,
         statisticsFiles,
         partitionStatisticsFiles,
