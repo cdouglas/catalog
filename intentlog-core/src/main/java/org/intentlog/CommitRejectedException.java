@@ -45,15 +45,30 @@ public class CommitRejectedException extends RuntimeException {
 
   private final Reason reason;
   private final transient Object state;
+  private final String rejection;
 
   public CommitRejectedException(Reason reason, Object state, String message, Throwable cause) {
-    super(message, cause);
+    this(reason, state, message, null, cause);
+  }
+
+  public CommitRejectedException(
+      Reason reason, Object state, String message, String rejection, Throwable cause) {
+    super(rejection != null ? message + " (" + rejection + ")" : message, cause);
     this.reason = reason;
     this.state = state;
+    this.rejection = rejection;
   }
 
   public Reason reason() {
     return reason;
+  }
+
+  /**
+   * For {@link Reason#CONFLICT}, why the commit's intention does not hold on {@link #state()}, as
+   * it explains it ({@link Intention#explain}); else, or if it cannot say, null.
+   */
+  public String rejection() {
+    return rejection;
   }
 
   /**

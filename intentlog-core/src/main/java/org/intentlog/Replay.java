@@ -45,6 +45,19 @@ public final class Replay {
     REJECTED
   }
 
+  /**
+   * Told of each intention record replay rejects where it lands, with the reason its intention
+   * gives ({@link Intention#explain}); for counting conflicts by their cause.
+   */
+  @FunctionalInterface
+  public interface Rejections {
+    /** Replay rejected the record of {@code id}: {@code reason}, or null if it cannot say. */
+    void rejected(UUID id, String reason);
+  }
+
+  /** Why replay rejects a record whose id is not a UUIDv7. */
+  public static final String NOT_V7 = "log: not a UUIDv7 record";
+
   /** The result of a replay: the builder replay folded the records into, and what it saw. */
   public static final class Result<B> {
     private final B builder;
@@ -52,16 +65,18 @@ public final class Replay {
     private final UUID logId;
     private final long intentionRecords;
     private final Outcome outcome;
+    private final String rejection;
     private final boolean seen;
 
     private Result(
         B builder, CommittedSet.Builder committed, UUID logId, long intentionRecords,
-        Outcome outcome, boolean seen) {
+        Outcome outcome, String rejection, boolean seen) {
       this.builder = builder;
       this.committed = committed;
       this.logId = logId;
       this.intentionRecords = intentionRecords;
       this.outcome = outcome;
+      this.rejection = rejection;
       this.seen = seen;
     }
 
@@ -91,6 +106,14 @@ public final class Replay {
     }
 
     /**
+     * Why replay rejected the watched record, as its intention explains it, if the outcome is
+     * {@link Outcome#REJECTED}; else (or if it cannot say) null.
+     */
+    public String rejection() {
+      return rejection;
+    }
+
+    /**
      * Whether a record of the watched id was among the records replayed, judged or skipped (a
      * retry of one applied, or at or below the horizon). A read through a write whose record is
      * not among them cannot settle the write's outcome.
@@ -109,12 +132,24 @@ public final class Replay {
    */
   public static <S, B extends StateMachine.Builder<S>, I extends Intention<B>> Result<B> replay(
       StateMachine<S, B, I> machine, byte[] checkpoint, Iterable<byte[]> records, UUID watch) {
+    return replay(machine, checkpoint, records, watch, null);
+  }
+
+  /**
+   * Replays {@code records} onto the state {@code checkpoint} holds, telling {@code rejections}
+   * (if not null) of each record it rejects and why.
+   */
+  public static <S, B extends StateMachine.Builder<S>, I extends Intention<B>> Result<B> replay(
+      StateMachine<S, B, I> machine, byte[] checkpoint, Iterable<byte[]> records, UUID watch,
+      Rejections rejections) {
     if (checkpoint != null) {
       LogEnvelope.Checkpoint envelope = LogEnvelope.decodeCheckpoint(checkpoint);
       return replayOnto(machine, machine.decodeCheckpoint(envelope.state()),
-          CommittedSet.of(envelope.committed()).toBuilder(), envelope.logId(), 0, records, watch);
+          CommittedSet.of(envelope.committed()).toBuilder(), envelope.logId(), 0, records, watch,
+          rejections);
     }
-    return replayOnto(machine, machine.empty(), CommittedSet.builder(), null, 0, records, watch);
+    return replayOnto(machine, machine.empty(), CommittedSet.builder(), null, 0, records, watch,
+        rejections);
   }
 
   /**
@@ -127,7 +162,19 @@ public final class Replay {
   public static <S, B extends StateMachine.Builder<S>, I extends Intention<B>> Result<B> replayOnto(
       StateMachine<S, B, I> machine, B builder, CommittedSet.Builder committed, UUID logId,
       long intentionRecords, Iterable<byte[]> records, UUID watch) {
+    return replayOnto(machine, builder, committed, logId, intentionRecords, records, watch, null);
+  }
+
+  /**
+   * Replays {@code records} onto a replayed state and committed set, as {@link #replayOnto(
+   * StateMachine, StateMachine.Builder, CommittedSet.Builder, UUID, long, Iterable, UUID)} does,
+   * telling {@code rejections} (if not null) of each record it rejects and why.
+   */
+  public static <S, B extends StateMachine.Builder<S>, I extends Intention<B>> Result<B> replayOnto(
+      StateMachine<S, B, I> machine, B builder, CommittedSet.Builder committed, UUID logId,
+      long intentionRecords, Iterable<byte[]> records, UUID watch, Rejections rejections) {
     Outcome outcome = Outcome.NOT_SEEN;
+    String rejection = null;
     boolean seen = false;
     for (byte[] bytes : records) {
       LogEnvelope.Record record = LogEnvelope.decodeRecord(bytes);
@@ -153,10 +200,28 @@ public final class Replay {
         if (watched) {
           outcome = Outcome.APPLIED;
         }
-      } else if (watched) {
-        outcome = Outcome.REJECTED;
+      } else if (watched || rejections != null) {
+        // Why, from the state it was judged on: only where it was rejected, so a replay that
+        // rejects nothing pays nothing.
+        String why = intention == null ? NOT_V7 : explain(intention, builder);
+        if (watched) {
+          outcome = Outcome.REJECTED;
+          rejection = why;
+        }
+        if (rejections != null) {
+          rejections.rejected(id, why);
+        }
       }
     }
-    return new Result<>(builder, committed, logId, intentionRecords, outcome, seen);
+    return new Result<>(builder, committed, logId, intentionRecords, outcome, rejection, seen);
+  }
+
+  /** Why {@code intention} does not verify on {@code builder}; null if it cannot say. */
+  static <B> String explain(Intention<B> intention, B builder) {
+    try {
+      return intention.explain(builder);
+    } catch (RuntimeException e) {
+      return null; // an explanation must never fail a read
+    }
   }
 }

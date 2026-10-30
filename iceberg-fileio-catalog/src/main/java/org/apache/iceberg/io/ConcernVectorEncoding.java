@@ -100,6 +100,20 @@ class ConcernVectorEncoding extends ConcernEncoding {
   }
 
   @Override
+  String unseparated(TableChange change) {
+    if (change.concerns.contains(TableChange.Concern.REMOVAL)) {
+      return "removes snapshots";
+    } else if (change.concerns.contains(TableChange.Concern.SCHEMA)) {
+      return "removes schemas";
+    } else if (change.concerns.contains(TableChange.Concern.SPECS)) {
+      return "removes partition specs";
+    } else if (change.concerns.contains(TableChange.Concern.STATISTICS)) {
+      return "statistics";
+    }
+    return "changes a ref";
+  }
+
+  @Override
   void stamp(TableChange change, int version, ConcernStamps stamps) {
     for (TableChange.Concern concern : change.concerns) {
       stamps.stampConcern(concern.ordinal(), version);

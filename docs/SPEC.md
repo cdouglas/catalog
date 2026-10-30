@@ -540,6 +540,20 @@ in the partitions of the data files a validated record removes (Iceberg's
 retry drops the deletion vectors of the files it removes), as blind-append
 reads those in the partitions a record adds files to.
 
+A rejected table action explains itself (`ConflictEncodings.rejection`,
+called only on a rejection): `table: gone`; `whole: <why>` where the witness
+is the table's version (`lamport`, `removes snapshots`, `commit once: a schema
+change`, `pinned (a catalog transaction's table)`, `a read pin`, `full
+metadata`, `a pointer table`, ...); the first stamp it reads that moved
+(`concern: <concern>`, `ref: <advanced | reset | dropped manifests |
+retention>`, `partition: <kind>`); `window: <why>` for `manifest-window`'s
+walk; or `merge: <Landing's reason>` / `unresolved: <reason>` for a record the
+encoding admitted that cannot merge or name its parents. Other actions say
+`precondition: <action>`. Writers count their conflicts by reason
+(`CatalogLog.CommitCounts.conflictReasons`), and a replay of a log can count
+its rejected records the same way (LOG.md §"Replay"); `TestConflictAttribution`
+races one commit ahead of another for each kind.
+
 ## Commits
 
 A writer stages a transaction on a read (`CatalogMutation`, on the `Replica`

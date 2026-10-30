@@ -31,6 +31,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.SplittableRandom;
+import java.util.TreeMap;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -40,6 +41,7 @@ import java.util.concurrent.locks.LockSupport;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
+import org.apache.iceberg.catalog.CatalogTransaction;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.CommitFailedException;
@@ -467,6 +469,8 @@ final class ContentionRun {
     long conflicts0 = counts.conflicts();
     long rejected0 = counts.rejected();
     long unknown0 = counts.unknown();
+    Map<String, Long> reasons0 = counts.conflictReasons();
+    Map<String, Long> txnFailures = new TreeMap<>();
     Requests requests0 = Requests.mine().copy();
     long cpu0 = CPU.getCurrentThreadCpuTime();
     long started = System.nanoTime();
@@ -518,9 +522,11 @@ final class ContentionRun {
           }
           skip = Operations.catalogTransaction(catalog, ids, byId::get,
               config.integer("files_per_partition"), config.bool("txn_merge"),
+              CatalogTransaction.IsolationLevel.valueOf(
+                  config.string("txn_isolation").toUpperCase(java.util.Locale.ROOT)),
               new Operations.Retry(config.integer("retry_num"),
                   config.longValue("retry_min_wait_ms"), config.longValue("retry_max_wait_ms")),
-              random, ignored -> runtime.run());
+              random, failedAttempt(counts, txnFailures), ignored -> runtime.run());
           break;
         default:
           throw new IllegalArgumentException("Unknown operation: " + kind);
@@ -568,6 +574,10 @@ final class ContentionRun {
     op.put("attempts",
         counts.committed() - committed0 + counts.conflicts() - conflicts0
             + counts.rejected() - rejected0 + counts.unknown() - unknown0);
+    op.put("conflict_reasons", since(reasons0, counts.conflictReasons()));
+    if (kind.equals("catalog_txn")) {
+      op.put("txn_failures", txnFailures);
+    }
     op.put("cpu_ms", cpu / 1e6);
     op.putAll(Requests.mine().minus(requests0).fields());
     if (error != null) {
@@ -618,6 +628,7 @@ final class ContentionRun {
     CatalogLog.CommitCounts counts = ContentionAccess.counts(catalog);
     long conflicts0 = counts.conflicts();
     long committed0 = counts.committed();
+    Map<String, Long> reasons0 = counts.conflictReasons();
     long started = System.nanoTime();
     String outcome = "committed";
     String error = null;
@@ -646,10 +657,64 @@ final class ContentionRun {
     op.put("outcome", outcome);
     op.put("catalog_commits", counts.committed() - committed0);
     op.put("conflicts", counts.conflicts() - conflicts0);
+    op.put("conflict_reasons", since(reasons0, counts.conflictReasons()));
     if (error != null) {
       op.put("error", error.length() > 300 ? error.substring(0, 300) : error);
     }
     record(op);
+  }
+
+  /** The conflicts by reason from {@code before} to {@code after}, a catalog's counts. */
+  static Map<String, Long> since(Map<String, Long> before, Map<String, Long> after) {
+    Map<String, Long> since = new TreeMap<>();
+    after.forEach((reason, count) -> {
+      long more = count - before.getOrDefault(reason, 0L);
+      if (more > 0) {
+        since.put(reason, more);
+      }
+    });
+    return since;
+  }
+
+  /**
+   * Counts into {@code failures} why each attempt of a catalog transaction failed: its record
+   * conflicted where it landed (the reason is the op's {@code conflict_reasons}), or a check before
+   * the catalog wrote it failed: the transaction's serializable read set, the commits'
+   * requirements, or a written table's version (errata D12).
+   */
+  private static java.util.function.Consumer<RuntimeException> failedAttempt(
+      CatalogLog.CommitCounts counts, Map<String, Long> failures) {
+    long[] conflicts = {counts.conflicts()};
+    return e -> {
+      long now = counts.conflicts();
+      String cause;
+      if (now > conflicts[0]) {
+        cause = "catalog: its record conflicted";
+      } else {
+        String message = String.valueOf(e.getMessage());
+        if (message.contains("isolation violation")) {
+          cause = "isolation: a table it read changed";
+        } else if (message.contains("changed since the transaction read it")) {
+          cause = "pin: a table it writes changed (D12)";
+        } else if (message.startsWith("Requirement failed")) {
+          cause = "requirement: " + normalized(message);
+        } else {
+          cause = e.getClass().getSimpleName() + ": " + normalized(message);
+        }
+      }
+      conflicts[0] = now;
+      failures.merge(cause, 1L, Long::sum);
+    };
+  }
+
+  /** {@code message} without its ids and names, so that causes count together. */
+  private static String normalized(String message) {
+    String text = message.replaceAll("'[^']*'", "'…'").replaceAll("[0-9]+", "#");
+    int expected = text.indexOf(": expected");
+    if (expected > 0) {
+      text = text.substring(0, expected);
+    }
+    return text.length() > 120 ? text.substring(0, 120) : text;
   }
 
   /** Samples the catalog object (size, records since its checkpoint) until the run ends. */

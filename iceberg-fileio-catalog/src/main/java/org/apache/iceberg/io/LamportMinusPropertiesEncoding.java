@@ -54,6 +54,16 @@ final class LamportMinusPropertiesEncoding extends ConcernEncoding {
   }
 
   @Override
+  String unseparated(TableChange change) {
+    return "touches properties";
+  }
+
+  @Override
+  String concernName(int concern) {
+    return concern == PROPERTIES ? "properties" : "other than properties";
+  }
+
+  @Override
   void stamp(TableChange change, int version, ConcernStamps stamps) {
     if (change.concerns.contains(TableChange.Concern.PROPERTIES)) {
       stamps.stampConcern(PROPERTIES, version);

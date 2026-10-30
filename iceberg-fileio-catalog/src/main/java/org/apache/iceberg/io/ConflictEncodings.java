@@ -82,30 +82,47 @@ final class ConflictEncodings {
    * by reference ({@link Landing#unresolved}), which a writer's always does.
    */
   static boolean admits(TableAction action, CatalogState.Builder builder) {
+    return rejection(action, builder) == null;
+  }
+
+  /**
+   * Why {@code action} does not apply where its record lands, on {@code builder}'s state; null if
+   * it applies ({@link #admits}). A reason is a constant, or one built only where the action is
+   * rejected, so admitting costs no more than it would without one.
+   */
+  static String rejection(TableAction action, CatalogState.Builder builder) {
     ReplayView landing = ReplayView.of(builder, action.tableId());
     if (!landing.exists()) {
-      return false;
+      return "table: gone";
     }
     ConflictEncoding<Object> encoding = builder.conflictEncoding();
     Object witness = encoding.witness(action, landing);
-    if (!encoding.admits(witness, landing, builder.conflictStateOrEmpty(action.tableId()))) {
-      return false;
+    EncodingState state = builder.conflictStateOrEmpty(action.tableId());
+    if (!encoding.admits(witness, landing, state)) {
+      String why = encoding.explain(witness, landing, state);
+      return why != null ? why : "whole: " + encoding.name();
     }
     if (landing.version() != action.baseVersion()) {
-      if (action.pinned() || !landing.inline()
-          || Landing.unmergeable(
-                  action.delta(), landing.table(), builder, action.tableId())
-              != null) {
-        return false;
+      if (action.pinned()) {
+        return "merge: pinned";
       }
-    } else if (action.kind() == TableAction.Kind.DELTA
-        && landing.inline()
-        && Landing.unresolved(action.delta(), landing.table(), builder, action.tableId())
-            != null) {
+      if (!landing.inline()) {
+        return "merge: a pointer table";
+      }
+      String unmergeable =
+          Landing.unmergeable(action.delta(), landing.table(), builder, action.tableId());
+      if (unmergeable != null) {
+        return "merge: " + unmergeable;
+      }
+    } else if (action.kind() == TableAction.Kind.DELTA && landing.inline()) {
       // its base must hold what it names by reference (a writer names only what it read there)
-      return false;
+      String unresolved =
+          Landing.unresolved(action.delta(), landing.table(), builder, action.tableId());
+      if (unresolved != null) {
+        return "unresolved: " + unresolved;
+      }
     }
-    return true;
+    return null;
   }
 
   /**

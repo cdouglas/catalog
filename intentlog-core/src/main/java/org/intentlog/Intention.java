@@ -32,4 +32,13 @@ public interface Intention<B> {
 
   /** Applies this intention to {@code state}, on which {@link #verify} holds. */
   void apply(B state);
+
+  /**
+   * Why {@link #verify} fails on {@code state}, where it does: a short reason, one of a few kinds
+   * the state machine names, for counting conflicts by their cause; null if it cannot say. Called
+   * only where the intention was rejected, so it may repeat verify's work. Never throws.
+   */
+  default String explain(B state) {
+    return null;
+  }
 }

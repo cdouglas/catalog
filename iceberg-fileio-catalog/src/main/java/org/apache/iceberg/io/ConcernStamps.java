@@ -38,23 +38,37 @@ final class ConcernStamps implements EncodingState {
   /** Changes to a ref. */
   enum Ref {
     /** A commit to the branch: a new snapshot on its head. */
-    ADVANCE,
+    ADVANCE("advanced"),
     /** Any other change of its snapshot: a rollback, a fast-forward, a ref created or removed. */
-    RESET,
+    RESET("reset"),
     /** An advance whose snapshot drops manifests from its parent's list (a delete, a rewrite). */
-    DROP,
+    DROP("dropped manifests"),
     /** New retention, on the snapshot it had. */
-    RETENTION
+    RETENTION("retention");
+
+    /** Its name in a conflict's reason. */
+    final String label;
+
+    Ref(String label) {
+      this.label = label;
+    }
   }
 
   /** Changes to the files of a partition. */
   enum Partition {
     /** Delete files added. */
-    DELETES_ADDED,
+    DELETES_ADDED("delete files added"),
     /** Data files added. */
-    DATA_ADDED,
+    DATA_ADDED("data files added"),
     /** Data files removed. */
-    DATA_REMOVED
+    DATA_REMOVED("data files removed");
+
+    /** Its name in a conflict's reason. */
+    final String label;
+
+    Partition(String label) {
+      this.label = label;
+    }
   }
 
   private final int[] concerns;

@@ -74,6 +74,15 @@ interface ConflictEncoding<W> {
   boolean admits(W witness, ReplayView landing, EncodingState state);
 
   /**
+   * Why {@code witness} does not hold on {@code landing}, where {@link #admits} is false: a short
+   * reason of a few kinds ({@code "whole: ..."}, {@code "concern: ..."}, ...), for counting
+   * conflicts by their cause. Called only where the record was rejected. Never throws.
+   */
+  default String explain(W witness, ReplayView landing, EncodingState state) {
+    return "whole: " + name();
+  }
+
+  /**
    * Updates {@code state} for {@code applied}, which changed the table from {@code before} to
    * {@code after}. Total: never throws.
    */

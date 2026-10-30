@@ -48,6 +48,11 @@ final class LamportEncoding implements ConflictEncoding<Integer> {
   }
 
   @Override
+  public String explain(Integer witness, ReplayView landing, EncodingState state) {
+    return "whole: lamport";
+  }
+
+  @Override
   public void observe(
       TableAction applied, ReplayView before, ReplayView after, EncodingState state) {}
 

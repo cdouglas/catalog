@@ -559,9 +559,10 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
             }
             unresolved = null;
             boolean holds = intention.verify(fresh.builder());
+            String why = holds ? null : Replay.explain(intention, fresh.builder());
             adopt(fresh);
             if (!holds) {
-              throw conflict(fresh, "Cannot commit: the log changed concurrently");
+              throw conflict(fresh, "Cannot commit: the log changed concurrently", why);
             }
           } else {
             try {
@@ -619,9 +620,10 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
           }
           unresolved = null;
           boolean holds = intention.verify(fresh.builder());
+          String why = holds ? null : Replay.explain(intention, fresh.builder());
           adopt(fresh);
           if (!holds) {
-            throw conflict(fresh, "Cannot commit: the log changed concurrently");
+            throw conflict(fresh, "Cannot commit: the log changed concurrently", why);
           }
         } catch (UnreadableLog e) {
           // A read failed. The commit failed too, unless one of its writes may have landed.
@@ -885,14 +887,15 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     private Replica<S> validate(Replayed result) {
       if (!landed(result, earlier())) {
         // The record landed, but replay rejected it: a concurrent commit changed what it depends on.
-        throw conflict(result, "Cannot commit: a concurrent commit invalidated this one");
+        throw conflict(result, "Cannot commit: a concurrent commit invalidated this one",
+            result.result.rejection());
       }
       return result.replica();
     }
 
-    private CommitRejectedException conflict(Replayed on, String message) {
+    private CommitRejectedException conflict(Replayed on, String message, String rejection) {
       return new CommitRejectedException(
-          CommitRejectedException.Reason.CONFLICT, on.replica(), message, null);
+          CommitRejectedException.Reason.CONFLICT, on.replica(), message, rejection, null);
     }
   }
 }

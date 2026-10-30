@@ -121,6 +121,16 @@ select = ["jmh/j1-*"]
 title = "c1's fast appends on the code before (4e65a65) and after (56facd8) replay folds a read onto a replica"
 select = ["c8-fold-*"]
 
+[campaigns.c9-txn]
+title = "Catalog transactions racing fast appends to their tables: width, table skew, isolation, encoding; conflicts by reason"
+select = ["c9-txn-*"]
+
+# c9 ran a build of 157e3bf plus the uncommitted conflict-attribution changes (git_sha 157e3bf,
+# dirty): the tree's diff is bench/build/bench-20261030T192135Z-157e3bfb6.patch (sha256 6b85983656b1).
+[[annotate]]
+select = "c9-txn-*"
+note = "157e3bf + uncommitted conflict attribution (bench/build/bench-20261030T192135Z-157e3bfb6.patch); havoc, 8 shards of 12 CPUs"
+
 # p6 (2026-10-27, fileio-catalog 8636dda, 16-CPU shards) reran every campaign on the code merged:
 # manifest-window by default, the backoff after a lost race, runs that cannot share a directory.
 [[annotate]]

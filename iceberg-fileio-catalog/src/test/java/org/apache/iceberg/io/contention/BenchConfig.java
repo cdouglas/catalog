@@ -88,11 +88,13 @@ final class BenchConfig {
           + "\"zipf_alpha\": 1.5,"
           // a catalog transaction's tables (as table_dist chooses them): txn_tables, or with
           // txn_tables_dist exponential a draw of that mean, rounded down, from 1 to
-          // txn_tables_max; each a fast append, or a merge append with txn_merge
+          // txn_tables_max; each a fast append, or a merge append with txn_merge; serializable
+          // (its tables' reads checked at commit) or snapshot isolation
           + "\"txn_tables\": 2,"
           + "\"txn_tables_dist\": \"fixed\","
           + "\"txn_tables_max\": 8,"
           + "\"txn_merge\": false,"
+          + "\"txn_isolation\": \"serializable\","
           + "\"files_per_partition\": 1,"
           // a job's runtime, lognormal about its median: by kind (runtime_ms), else the default
           + "\"runtime_median_ms\": 0,"
@@ -246,7 +248,7 @@ final class BenchConfig {
    */
   private static final Map<String, String> LATER_KEYS =
       Map.of("expire_older_than_s", "0", "race_min_wait_ms", "20", "expire_retry_num", "-1",
-          "capture_log", "false", "capture_format", "1");
+          "capture_log", "false", "capture_format", "1", "txn_isolation", "serializable");
 
   /**
    * The first 12 hex digits of the SHA-256 of the configuration, less its label, its repetition and

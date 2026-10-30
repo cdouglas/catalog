@@ -29,6 +29,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.UUID;
 import org.apache.iceberg.io.ContentionAccess;
 import org.intentlog.CommittedSet;
@@ -158,10 +159,18 @@ final class IngestRun {
     summary.put("compactions", measured.compactions);
     summary.put("prefill_ids", prefill != null ? prefill.ids().size() : 0);
     summary.put("committed", config.string("committed"));
+    // The log as captured, replayed once more to say why each record its writers' commits landed
+    // but replay rejected did not apply (a conflict their retry, if any, followed): the trace's
+    // conflicts by reason, whatever the run's timing
+    Map<String, Long> reasons = new TreeMap<>();
+    S whole = Replay.replay(machine, checkpoint, original, null,
+            (id, reason) -> reasons.merge(reason != null ? reason : "unexplained", 1L, Long::sum))
+        .builder().build();
+    summary.put("rejected", reasons.values().stream().mapToLong(Long::longValue).sum());
+    summary.put("rejection_reasons", reasons);
     if (measured.records == records.size()) {
       // The same state as a replay of the log as captured: retiming and the run's own GC records
       // change the committed set, not what applies
-      S whole = Replay.replay(machine, checkpoint, original, null).builder().build();
       summary.put("verified",
           Arrays.equals(machine.encodeCheckpoint(whole), machine.encodeCheckpoint(measured.state)));
     }

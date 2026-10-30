@@ -44,6 +44,8 @@ abstract class ConcernEncoding implements ConflictEncoding<ConcernEncoding.Witne
     final int base;
     /** The Lamport witness: only the base version itself. */
     final boolean whole;
+    /** Why the witness is the Lamport witness, for {@link #explain}; null if it is not. */
+    final String why;
     final BitSet concerns = new BitSet();
     /** The kinds of change to each ref it reads. */
     final Map<String, EnumSet<ConcernStamps.Ref>> refs = new HashMap<>();
@@ -53,17 +55,19 @@ abstract class ConcernEncoding implements ConflictEncoding<ConcernEncoding.Witne
     /** What it reads beyond stamps, judged on the table where it lands; null for nothing. */
     Window window;
 
-    private Witness(int base, boolean whole) {
+    private Witness(int base, boolean whole, String why) {
       this.base = base;
       this.whole = whole;
+      this.why = why;
     }
 
-    static Witness whole(int base) {
-      return new Witness(base, true);
+    /** The Lamport witness, for the reason {@code why} (a constant). */
+    static Witness whole(int base, String why) {
+      return new Witness(base, true, why);
     }
 
     static Witness of(int base) {
-      return new Witness(base, false);
+      return new Witness(base, false, null);
     }
 
     Witness concern(TableChange.Concern concern) {
@@ -109,7 +113,8 @@ abstract class ConcernEncoding implements ConflictEncoding<ConcernEncoding.Witne
    * on any later version where the witness's stamps still hold (S2).
    */
   interface Window {
-    boolean holds(ReplayView landing);
+    /** Why the judgment of {@code landing} is false; null if it holds. */
+    String rejects(ReplayView landing);
   }
 
   private final ConcernStamps.Codec codec;
@@ -129,43 +134,104 @@ abstract class ConcernEncoding implements ConflictEncoding<ConcernEncoding.Witne
   /** Stamps {@code stamps} at {@code version} for {@code change}, applied. */
   abstract void stamp(TableChange change, int version, ConcernStamps stamps);
 
+  /**
+   * Why {@code change} has the Lamport witness where {@link #reads} gives none (a constant), for
+   * {@link #explain}.
+   */
+  String unseparated(TableChange change) {
+    return "unseparated";
+  }
+
+  /** The name of concern {@code concern}, for {@link #explain}. */
+  String concernName(int concern) {
+    return TableChange.Concern.values()[concern].label;
+  }
+
+  /** Why a pinned or commit-once delta has the Lamport witness. */
+  private static String pinned(TableAction action, ReplayView landing) {
+    try {
+      TableChange change = TableChange.of(action, landing::table);
+      if (change.commitOnce) {
+        return commitOnce(change);
+      }
+    } catch (RuntimeException e) {
+      // a pin it cannot see into is the writer's
+    }
+    return "pinned (a catalog transaction's table)";
+  }
+
+  /** What Iceberg commits once in {@code change}. */
+  private static String commitOnce(TableChange change) {
+    if (change.concerns.contains(TableChange.Concern.SPECS)) {
+      return "commit once: a partition-spec change";
+    } else if (change.concerns.contains(TableChange.Concern.SCHEMA)) {
+      return "commit once: a schema change";
+    } else if (!change.reset.isEmpty()) {
+      return "commit once: a ref reset";
+    }
+    return "commit once: a ref's retention";
+  }
+
   @Override
   public Witness witness(TableAction action, ReplayView landing) {
     int base = action.baseVersion();
-    if (action.coarse() || action.pinned() || landing.version() == base || !landing.inline()) {
-      return Witness.whole(base);
+    if (landing.version() == base) {
+      return Witness.whole(base, "the version read");
+    } else if (action.coarse()) {
+      return Witness.whole(base, action.kind() == TableAction.Kind.FULL ? "full metadata"
+          : action.kind() == TableAction.Kind.READ ? "a read pin" : "a metadata location");
+    } else if (action.pinned()) {
+      return Witness.whole(base, pinned(action, landing));
+    } else if (!landing.inline()) {
+      return Witness.whole(base, "a pointer table");
     }
     try {
       TableChange change = TableChange.of(action, landing::table);
       if (change.commitOnce) {
-        return Witness.whole(base);
+        return Witness.whole(base, commitOnce(change));
       }
       Witness reads = reads(base, change, landing);
-      return reads != null ? reads : Witness.whole(base);
+      return reads != null ? reads : Witness.whole(base, unseparated(change));
     } catch (RuntimeException e) {
-      return Witness.whole(base); // total: what it cannot decode, it does not see into
+      // total: what it cannot decode, it does not see into
+      return Witness.whole(base, "undecodable");
     }
   }
 
   @Override
   public boolean admits(Witness witness, ReplayView landing, EncodingState state) {
+    return rejection(witness, landing, state) == null;
+  }
+
+  @Override
+  public String explain(Witness witness, ReplayView landing, EncodingState state) {
+    return rejection(witness, landing, state);
+  }
+
+  /**
+   * Why {@code witness} does not hold on {@code landing}: the first of what it reads that changed
+   * since its base; null if nothing did. A reason is built only where it fails.
+   */
+  private String rejection(Witness witness, ReplayView landing, EncodingState state) {
     if (landing.version() == witness.base) {
-      return true;
+      return null;
     }
-    if (witness.whole || landing.version() < witness.base) {
-      return false;
+    if (landing.version() < witness.base) {
+      return "version: behind its base";
+    } else if (witness.whole) {
+      return "whole: " + witness.why;
     }
     ConcernStamps stamps = (ConcernStamps) state;
     for (int c = witness.concerns.nextSetBit(0); c >= 0; c = witness.concerns.nextSetBit(c + 1)) {
       if (stamps.concern(c) > witness.base) {
-        return false;
+        return "concern: " + concernName(c);
       }
     }
     for (Map.Entry<String, EnumSet<ConcernStamps.Ref>> ref : witness.refs.entrySet()) {
       int bucket = stamps.bucket(ref.getKey());
       for (ConcernStamps.Ref kind : ref.getValue()) {
         if (stamps.ref(kind, bucket) > witness.base) {
-          return false;
+          return "ref: " + kind.label;
         }
       }
     }
@@ -174,15 +240,21 @@ abstract class ConcernEncoding implements ConflictEncoding<ConcernEncoding.Witne
         if (bucket == PartitionKey.ALL) {
           for (int b = 0; b < stamps.partitionBuckets(); b++) {
             if (stamps.partition(kind.getKey(), b) > witness.base) {
-              return false;
+              return "partition: " + kind.getKey().label + " (any)";
             }
           }
         } else if (stamps.partition(kind.getKey(), bucket) > witness.base) {
-          return false;
+          return "partition: " + kind.getKey().label;
         }
       }
     }
-    return witness.window == null || witness.window.holds(landing);
+    if (witness.window != null) {
+      String why = witness.window.rejects(landing);
+      if (why != null) {
+        return "window: " + why;
+      }
+    }
+    return null;
   }
 
   @Override

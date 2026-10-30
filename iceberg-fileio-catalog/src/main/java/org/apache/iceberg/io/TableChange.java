@@ -46,15 +46,22 @@ final class TableChange {
 
   /** A table's concerns, apart from its refs. */
   enum Concern {
-    PROPERTIES,
-    SCHEMA,
-    SPECS,
-    SORT,
+    PROPERTIES("properties"),
+    SCHEMA("schema"),
+    SPECS("partition specs"),
+    SORT("sort orders"),
     /** The table itself: location, format version, uuid, encryption keys. */
-    TABLE,
-    STATISTICS,
+    TABLE("the table"),
+    STATISTICS("statistics"),
     /** Snapshots removed: an expiry, or a removed ref's. */
-    REMOVAL
+    REMOVAL("snapshot removal");
+
+    /** Its name in a conflict's reason. */
+    final String label;
+
+    Concern(String label) {
+      this.label = label;
+    }
   }
 
   final EnumSet<Concern> concerns;

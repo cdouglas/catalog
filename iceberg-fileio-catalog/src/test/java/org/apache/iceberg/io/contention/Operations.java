@@ -26,6 +26,7 @@ import java.util.SplittableRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.LongConsumer;
 import org.apache.iceberg.AppendFiles;
@@ -67,9 +68,10 @@ import org.apache.iceberg.types.Types;
  *   <li>{@code property}: a property set (table maintenance, tuning).
  *   <li>{@code wap}: a write-audit-publish insert, to the writer's own branch.
  *   <li>{@code catalog_txn}: an insert into several tables at once, one file per partition into
- *       each, committed in one serializable catalog transaction, as a job that writes related
- *       tables does. The catalog does not retry one that conflicts (errata D12), so the job does,
- *       as Iceberg retries a table's commit.
+ *       each, committed in one catalog transaction (serializable, or snapshot isolation with
+ *       {@code txn_isolation}), as a job that writes related tables does. The catalog does not
+ *       retry one that conflicts (errata D12), so the job does, as Iceberg retries a table's
+ *       commit.
  *   <li>{@code schema}: a column added, or the oldest added one dropped once a table has eight:
  *       a schema change, which Iceberg commits once.
  * </ul>
@@ -218,19 +220,20 @@ final class Operations {
 
   /**
    * An insert of {@code filesPerPartition} files per partition into each of {@code tables}, the
-   * partitions of each as {@code partitions} gives them, committed together in a serializable
-   * catalog transaction; on a conflict, loaded and staged again, up to {@code retry}'s retries.
+   * partitions of each as {@code partitions} gives them, committed together in a catalog
+   * transaction of {@code isolation}; on a conflict, loaded and staged again, up to {@code
+   * retry}'s retries.
+   * {@code failed} is told of each attempt's failure, the last one's included.
    */
   static Skip catalogTransaction(
       SupportsCatalogTransactions catalog, List<TableIdentifier> tables,
       Function<TableIdentifier, List<Integer>> partitions, int filesPerPartition, boolean merge,
-      Retry retry, SplittableRandom random,
-      LongConsumer runtime) {
+      CatalogTransaction.IsolationLevel isolation, Retry retry, SplittableRandom random,
+      Consumer<RuntimeException> failed, LongConsumer runtime) {
     runtime.accept(0);
     for (int attempt = 0; ; attempt++) {
       try {
-        CatalogTransaction transaction =
-            catalog.createTransaction(CatalogTransaction.IsolationLevel.SERIALIZABLE);
+        CatalogTransaction transaction = catalog.createTransaction(isolation);
         Catalog view = transaction.asCatalog();
         for (TableIdentifier id : tables) {
           Table table = view.loadTable(id);
@@ -245,6 +248,7 @@ final class Operations {
         transaction.commitTransaction();
         return Skip.NONE;
       } catch (CommitFailedException | ValidationException e) {
+        failed.accept(e);
         if (attempt >= retry.retries()) {
           throw e;
         }

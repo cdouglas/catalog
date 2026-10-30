@@ -1758,6 +1758,29 @@ public class ProtoCodec {
       return true;
     }
 
+    /** Why {@link #verify} fails on {@code builder}'s state: the first check that does. */
+    @Override
+    public String explain(CatalogState.Builder builder) {
+      IdBinding ids = new IdBinding(builder);
+      List<Action> bound = new ArrayList<>(actions.size());
+      try {
+        for (Action action : actions) {
+          bound.add(action.bind(ids));
+        }
+      } catch (IllegalStateException e) {
+        return "intention: a late-bound reference before its create";
+      }
+      if (!selfConsistent(bound)) {
+        return "intention: an action on what another drops";
+      }
+      for (Action action : actions) {
+        if (!action.verify(builder)) {
+          return action.explain(builder);
+        }
+      }
+      return null;
+    }
+
     /**
      * Whether no action references a namespace or table that another action of
      * this transaction drops. Every action verifies against the state before
@@ -1909,6 +1932,14 @@ public class ProtoCodec {
   public interface Action {
     boolean verify(CatalogState.Builder builder);
     void apply(CatalogState.Builder builder);
+
+    /**
+     * Why {@link #verify} fails on {@code builder}'s state, where it does: a short reason, for
+     * counting conflicts by their cause (CatalogIntention#explain).
+     */
+    default String explain(CatalogState.Builder builder) {
+      return "precondition: " + getClass().getSimpleName();
+    }
 
     /**
      * Returns this action with its late-bound ids bound to real ids. Actions
@@ -2155,6 +2186,11 @@ public class ProtoCodec {
     }
 
     @Override
+    public String explain(CatalogState.Builder builder) {
+      return ConflictEncodings.rejection(table(), builder);
+    }
+
+    @Override
     public void apply(CatalogState.Builder builder) {
       ReplayView before = ReplayView.of(builder, id);
       // A table is a pointer table or an inline table, never both: the metadata file is now the
@@ -2181,6 +2217,12 @@ public class ProtoCodec {
       // Fails if the table changed since the transaction read it (a serializable read): a read pin
       // applies only on the version read, whatever the encoding.
       return ConflictEncodings.admits(TableAction.of(TableAction.Kind.READ, id, version), builder);
+    }
+
+    @Override
+    public String explain(CatalogState.Builder builder) {
+      return ConflictEncodings.rejection(
+          TableAction.of(TableAction.Kind.READ, id, version), builder);
     }
 
     @Override
@@ -2299,6 +2341,11 @@ public class ProtoCodec {
       // The table's version must be the one the update read, unless the catalog's conflict
       // encoding admits a delta on a version that changed since, finalized where it lands.
       return ConflictEncodings.admits(table(), builder);
+    }
+
+    @Override
+    public String explain(CatalogState.Builder builder) {
+      return ConflictEncodings.rejection(table(), builder);
     }
 
     @Override

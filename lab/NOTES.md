@@ -74,6 +74,23 @@ to tables of one `FileIOCatalog` over an in-memory store whose requests take a p
 - Times, in ms from the run's start: `arrived_ms`, `started_ms` and `ended_ms`. Durations:
   `queue_ms`, `runtime_ms`, `commit_ms` (from the end of the runtime to the end) and `latency_ms`
   (arrival to end).
+- `conflict_reasons` (since 2026-10-30): the operation's conflicts by reason, as replay (or the
+  commit loop, on a fresh read before writing) explained each: `"<category>: <detail>"`, the first
+  thing the record read that changed since its writer's read (`concern: properties`, `concern:
+  snapshot removal`, `ref: advanced`, `partition: data files added`, `window: data files added in
+  its checks' scope`), why its witness was the table's whole version (`whole: lamport`, `whole:
+  removes snapshots`, `whole: commit once: a schema change`, `whole: pinned (a catalog
+  transaction's table)`, `whole: a read pin`, `whole: full metadata`, `whole: a pointer table`), or
+  why a record the encoding admitted could not merge (`merge: <Landing's reason>`). View
+  `conflict_reasons`, one row per operation and reason. Encoding-specific: under `lamport` every
+  conflict is `whole: lamport`.
+- `txn_failures` (catalog transactions, since 2026-10-30): why each attempt failed. `catalog: its
+  record conflicted` (its reason is in `conflict_reasons`), or a check before the catalog wrote
+  anything, which no encoding sees: `isolation: a table it read changed` (serializable: the
+  transaction's read set, `BaseCatalogTransaction` and `LogCatalog.commitTransaction`),
+  `requirement: ...` (the commits' requirements, e.g. `branch main has changed`), `pin: a table it
+  writes changed (D12)`. View `txn_failures`. `txn_isolation` (default serializable) sets the
+  isolation level.
 - `cpu_ms`: the writer thread's CPU for the operation. Iceberg's worker pool (manifest writes) is
   not in it.
 - Requests the writer thread made:
@@ -127,6 +144,13 @@ to tables of one `FileIOCatalog` over an in-memory store whose requests take a p
   checkpoint encoded, then discarded), which a writer, not the reader, pays in the catalog. A
   batch ends where a compaction is due (`compact_every`; 0: none).
 - Timings are one thread's wall-clock on the dev box (16 threads): run nothing else alongside.
+- `rejected`, `rejection_reasons` (summary, since 2026-10-30): the capture's records replay
+  rejected, by reason (as `conflict_reasons`), from one more replay of the log as captured. These
+  are the writers' conflicts that landed: on a store with conditional append a writer that lost a
+  race resends its record at the new tail and replay rejects it there; on a CAS-only store the
+  commit loop verifies on its fresh read and writes nothing, so none land. Attempts that failed a
+  client-side check (`txn_failures` other than `catalog:`) never reach the log either. View
+  `ingest_rejections`.
 - `i1-ingest` and `i2-compaction` ran before the pass checked `max_ingest_s` per batch: it checked
   at the end of a window (2,000 records), so their slowest runs overran it (1,000 records/s
   prefilled, batch 1: 1,729 s for one window). Their windows are measured alike.
@@ -182,6 +206,11 @@ to tables of one `FileIOCatalog` over an in-memory store whose requests take a p
 - `j1-fold` (2026-10-30, havoc) is JMH IngestFoldBench.fold over each build's h1 captures, one
   JSON per build (source `jmh`, run ids `jmh/j1-<build>`; the capture is in `params['log']`).
   The secondary metric `records` is records/s, `score_error` a 99.9% half-interval.
+
+- `c9-txn` (configured 2026-10-30): catalog transactions (fast appends into `txn_tables` tables,
+  uniform or Zipf) racing fast appends to the same 16 tables, 16 writers on `s3x`, under `lamport`
+  and `manifest-window`, serializable and snapshot isolation; the first campaign with
+  `conflict_reasons` and `txn_failures`.
 
 - `pilot-fa`, `pilot-mix` (2026-10-27) were pilots of the driver. The first `pilot-mix` runs gave
   fast appends the validated operations' 2 s runtime too; the runtime is per kind since.

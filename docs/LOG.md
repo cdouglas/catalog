@@ -45,6 +45,7 @@ interface StateMachine<S, B extends StateMachine.Builder<S>, I extends Intention
 interface Intention<B> {
   boolean verify(B state);                // its preconditions hold on the state before it
   void apply(B state);                    // called only where verify holds
+  default String explain(B state) {...}   // why verify fails there (or null): only on a rejection
 }
 ```
 
@@ -276,6 +277,17 @@ lands second has no effect. `watch` is a committing writer's own id:
 `outcome` is what replay did with the first record of it that it judged, and
 `seen` says whether any record of it was among the records replayed. A writer
 learns its outcome from these (see [The commit loop](#the-commit-loop)).
+
+Where replay rejects the watched record, it asks the intention why
+(`Intention.explain`, on the state it was judged on), and the result's
+`rejection()` carries the reason to the writer: a `CONFLICT`
+`CommitRejectedException` holds it (`rejection()`), as it does when the
+commit loop finds on a fresh read, before writing, that the intention no
+longer holds. A replay given a `Replay.Rejections` listener tells it of every
+record it rejects and why, for counting a log's conflicts by their cause.
+An explanation is asked for only on a rejection, so a replay that rejects
+nothing pays nothing; it never fails the read. The catalog's reasons are
+`"<category>: <detail>"` strings ([SPEC.md](SPEC.md) §"Conflict Encodings").
 
 Replay is deterministic: the state machine is (S1), the order is the log's
 (P1), and only GC records move the committed set's horizon (below). So every

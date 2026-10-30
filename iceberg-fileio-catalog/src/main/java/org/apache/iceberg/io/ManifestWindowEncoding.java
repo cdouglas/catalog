@@ -118,15 +118,16 @@ final class ManifestWindowEncoding extends ConcernVectorEncoding {
     }
 
     @Override
-    public boolean holds(ReplayView landing) {
+    public String rejects(ReplayView landing) {
       try {
         return judge(landing);
       } catch (RuntimeException e) {
-        return false; // total: a window it cannot read conflicts
+        return "unreadable"; // total: a window it cannot read conflicts
       }
     }
 
-    private boolean judge(ReplayView landing) {
+    /** Why the window fails the record's checks; null if it passes them. */
+    private String judge(ReplayView landing) {
       MetadataView table = landing.table();
       SnapshotRef ref = table.ref(branch);
       // a branch it creates lands on main's head, as Landing re-parents it
@@ -134,8 +135,10 @@ final class ManifestWindowEncoding extends ConcernVectorEncoding {
       List<Snapshot> window = new ArrayList<>();
       while (!Objects.equals(at, parent)) {
         Snapshot snapshot = at != null ? table.snapshot(at) : null;
-        if (snapshot == null || window.size() >= MAX_WINDOW) {
-          return false; // its parent is not an ancestor of the head, or the window is unseen
+        if (snapshot == null) {
+          return "its parent is not an ancestor of its branch's head";
+        } else if (window.size() >= MAX_WINDOW) {
+          return "longer than " + MAX_WINDOW + " snapshots";
         }
         window.add(snapshot);
         at = snapshot.parentId();
@@ -144,26 +147,30 @@ final class ManifestWindowEncoding extends ConcernVectorEncoding {
       for (Snapshot snapshot : window) {
         long id = snapshot.snapshotId();
         if (!landing.hasInlineList(id)) {
-          return false;
+          return "a snapshot without an inline list";
         }
         for (String path : landing.listPaths(id)) {
           ManifestFile manifest = landing.manifest(path);
           if (manifest == null) {
-            return false;
+            return "a manifest it cannot read";
           }
           if (manifest.snapshotId() != null && manifest.snapshotId() != id) {
             continue; // written by an earlier snapshot
           }
-          if (!passes(manifest, table) || (v3 && touchesWritten(manifest, table))) {
-            return false;
+          String failed = failedCheck(manifest, table);
+          if (failed != null) {
+            return failed;
+          }
+          if (v3 && touchesWritten(manifest, table)) {
+            return "delete files added that may apply to files it writes";
           }
         }
       }
-      return true;
+      return null;
     }
 
-    /** Whether no check reads what {@code manifest}'s files did. */
-    private boolean passes(ManifestFile manifest, MetadataView table) {
+    /** The check that reads what {@code manifest}'s files did; null for none. */
+    private String failedCheck(ManifestFile manifest, MetadataView table) {
       for (Footprint.Check check : checks) {
         boolean did;
         switch (check.kind) {
@@ -177,10 +184,17 @@ final class ManifestWindowEncoding extends ConcernVectorEncoding {
             did = manifest.content() == ManifestContent.DATA && manifest.hasDeletedFiles();
         }
         if (did && inScope(manifest, check.scope, table)) {
-          return false;
+          switch (check.kind) {
+            case NO_DATA_ADDED:
+              return "data files added in its checks' scope";
+            case NO_DELETES_ADDED:
+              return "delete files added in its checks' scope";
+            default:
+              return "data files removed in its checks' scope";
+          }
         }
       }
-      return true;
+      return null;
     }
 
     /** Whether {@code manifest} adds delete files that may apply to files the record writes. */

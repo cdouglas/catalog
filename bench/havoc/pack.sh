@@ -11,7 +11,8 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 self=$(cd "$here/../.." && pwd)
 root=$(cd "${ROOT:-$self}" && pwd)
-build=$("$root/bench/run.sh" --build-only | tail -1)
+# BUILD: a snapshot bench/run.sh already built (e.g. while a suite runs in the tree)
+build=${BUILD:-$("$root/bench/run.sh" --build-only | tail -1)}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)-$(git -C "$root" rev-parse --short=9 HEAD)
 pack="$self/bench/build/bench-$stamp"
 mkdir -p "$pack/ctx/app/lib" "$pack/configs"

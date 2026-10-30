@@ -19,6 +19,9 @@
 package org.apache.iceberg.io;
 
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 import org.apache.iceberg.exceptions.CommitFailedException;
@@ -112,6 +115,7 @@ public final class CatalogLog {
       switch (e.reason()) {
         case CONFLICT:
           counts.conflicts.increment();
+          counts.conflicted(e.rejection());
           Replica<CatalogState> lostTo = e.state();
           throw mutation.explain(lostTo.state(), e.getMessage() + " at " + log);
         case CREATE_LOST:
@@ -135,11 +139,16 @@ public final class CatalogLog {
   /**
    * Counts of a catalog's commits by outcome: each commit of a transaction ends committed, in
    * conflict (its record did not apply where it landed, and Iceberg may retry the operation on a
-   * fresh read), rejected otherwise, or unknown.
+   * fresh read), rejected otherwise, or unknown; and conflicts by their reason, as replay or the
+   * commit loop explained them ({@link CatalogMutation}'s intention's {@code explain}).
    */
   public static final class CommitCounts {
+    /** The reason of a conflict that has none. */
+    static final String UNEXPLAINED = "unexplained";
+
     private final LongAdder committed = new LongAdder();
     private final LongAdder conflicts = new LongAdder();
+    private final Map<String, LongAdder> reasons = new ConcurrentHashMap<>();
     private final LongAdder rejected = new LongAdder();
     private final LongAdder unknown = new LongAdder();
 
@@ -157,6 +166,18 @@ public final class CatalogLog {
 
     public long unknown() {
       return unknown.sum();
+    }
+
+    /** Conflicts by their reason, in its order. */
+    public Map<String, Long> conflictReasons() {
+      Map<String, Long> counts = new TreeMap<>();
+      reasons.forEach((reason, count) -> counts.put(reason, count.sum()));
+      return counts;
+    }
+
+    private void conflicted(String reason) {
+      reasons.computeIfAbsent(reason != null ? reason : UNEXPLAINED, r -> new LongAdder())
+          .increment();
     }
 
     @Override
