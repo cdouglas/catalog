@@ -2,7 +2,8 @@
 # inline manifest lists' structure (CheckpointRoundTrip.malformedLists), the numbering a commit or
 # replay's merge assigns (TestCatalogFaultProperties.checkNumbering), a fresh reader's loads
 # against a reader that reuses what it made, and the metadata log's bound, which the fuzzers now
-# change (anchors as of the commit that added this set): each mutant must fail an oracle.
+# change (anchors as of the commit that added this set; poolorphan's as of the expiry's two ways
+# of finding the entries to drop): each mutant must fail an oracle.
 MUTANTS="poolorphan seqnoshift windowfloor"
 # Equivalent under this code's writers, so no oracle can catch it: a pool entry is replaced only by
 # an equal copy (a record that sends again a manifest the pool holds: a list on a parent whose list
@@ -23,8 +24,12 @@ prepare() {
 mutant() { # name main-dir test-dir
   local M=$2
   case $1 in
-    # an expiry drops a snapshot's list but leaves the pool entries no list names any more
-    poolorphan) mutate $M/CatalogState.java "          pool = pool.minus(path);" "" ;;
+    # an expiry drops a snapshot's list but leaves the pool entries no list names any more, by
+    # either way it finds them (from the lists it removed, or from the lists kept)
+    poolorphan) mutate $M/CatalogState.java "        for (String path : dropped) {
+          pool = pool.minus(path);" "        for (String path : dropped) {" &&
+      mutate $M/CatalogState.java "          if (!kept.contains(path)) {
+            pool = pool.minus(path);" "          if (!kept.contains(path)) {" ;;
     # a merged record's own manifests keep the sequence number its writer gave them
     seqnoshift) mutate $M/Landing.java "      if (sequenceNumber > baseLastSequenceNumber) {
         sequenceNumber += sequenceShift;

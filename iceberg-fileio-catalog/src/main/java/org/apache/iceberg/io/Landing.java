@@ -379,6 +379,10 @@ final class Landing {
       // its snapshot's list is not the one its writer committed: another parent's, or the same
       // on a table whose sequence numbers and row ids moved
       AddSnapshotUpdate add = adds.values().iterator().next();
+      if (table.formatVersion() < 3
+          && add.footprint != null && add.footprint.kind == Footprint.Kind.BLIND) {
+        return null; // retryChanges reads nothing of a blind producer's list on v2
+      }
       List<ManifestFile> list = landing.list(add, delta, builder, tableId, prefix);
       if (list == null) {
         return "its snapshot's list names a manifest the table lacks";

@@ -144,10 +144,15 @@ final class ManifestWindowEncoding extends ConcernVectorEncoding {
         at = snapshot.parentId();
       }
       boolean v3 = table.formatVersion() >= 3;
+      // a blind append on v2 reads none of the window's manifests: skip walking their lists
+      boolean reads = !checks.isEmpty() || (v3 && !written.isEmpty());
       for (Snapshot snapshot : window) {
         long id = snapshot.snapshotId();
         if (!landing.hasInlineList(id)) {
           return "a snapshot without an inline list";
+        }
+        if (!reads) {
+          continue;
         }
         for (String path : landing.listPaths(id)) {
           ManifestFile manifest = landing.manifest(path);

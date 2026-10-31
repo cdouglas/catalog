@@ -773,12 +773,14 @@ public class CatalogState {
       if (refs == null) {
         return this;
       }
-      Set<String> dropped = new HashSet<>();
+      List<List<String>> removed = new ArrayList<>();
+      long removedPaths = 0;
       PersistentMap<Long, List<String>> lists = PersistentMap.copyOf(refs);
       for (long snapshotId : snapshotIds) {
         List<String> paths = lists.get(snapshotId);
         if (paths != null) {
-          dropped.addAll(paths);
+          removed.add(paths);
+          removedPaths += paths.size();
           lists = lists.minus(snapshotId);
         }
       }
@@ -787,8 +789,34 @@ public class CatalogState {
       }
       snapshotManifests.put(tblId, lists);
       refs = lists;
-      if (dropped.isEmpty()) {
+      if (removedPaths == 0) {
         return this;
+      }
+      long keptPaths = 0;
+      for (List<String> snapRefs : refs.values()) {
+        keptPaths += snapRefs.size();
+      }
+      Map<String, ManifestFile> held = manifestPool.get(tblId);
+      if (held != null && keptPaths + held.size() < removedPaths) {
+        // An expiry of a long history (lists that each name every manifest since the table's
+        // last rewrite): every pool entry is named by a list (SPEC_ML.md), so those no list
+        // left names are the ones to drop, cheaper to find from the lists kept
+        Set<String> kept = new HashSet<>();
+        for (List<String> snapRefs : refs.values()) {
+          kept.addAll(snapRefs);
+        }
+        PersistentMap<String, ManifestFile> pool = pool(tblId);
+        for (String path : held.keySet()) {
+          if (!kept.contains(path)) {
+            pool = pool.minus(path);
+          }
+        }
+        manifestPool.put(tblId, pool);
+        return this;
+      }
+      Set<String> dropped = new HashSet<>();
+      for (List<String> paths : removed) {
+        dropped.addAll(paths);
       }
       // Paths still referenced by any remaining snapshot stay
       for (List<String> snapRefs : refs.values()) {
