@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-10-27 — fileio-catalog 8636dda on fork atomicio af875ccfd1. Every suite below on real cloud, five stores: 3,072 tests, 0 failures, 280 skipped. All runs wrote the default structural codec and the default conflict encoding, manifest-window (see "How to update this doc").
+last-verified: 2026-10-31 — fileio-catalog 87ff156 on fork atomicio 0f44056ccf (contract tests at 8bbeeeed83, docs on top of it). Every suite below on real cloud, five stores: 3,072 tests, 0 failures, 280 skipped. All runs wrote the default structural codec and the default conflict encoding, manifest-window (see "How to update this doc").
 ---
 
 # Cloud-store compatibility matrix
@@ -70,8 +70,13 @@ Cell legend:
 | S3 Express One Zone  | OK | NR / OK | NR / OK | OK | NR / OK | NR / OK |
 | ADLS Gen2 (HNS)      | OK | NR / OK | NR / OK | OK | NR / OK | NR / OK |
 
-The 2026-10-27 run, by store (fileio-catalog 8636dda: `manifest-window`,
-`max.append.count` 100, the backoff after a lost race):
+The 2026-10-31 run, by store (fileio-catalog 87ff156: `manifest-window`,
+`max.append.count` 100, the backoff after a lost race). It is the first on
+cloud storage with record format 3 (records name what they keep of their
+parents; manifests by UUID and number), replay folding only the records after
+a view it continues, the 30-minute committed set, inline tables shipped to
+workers (`SerializableTable`), conflict attribution and the replay-cost fixes
+of 9446029:
 
 | Store | Suites | Tests | Failed | Skipped |
 |---|---|---|---|---|
@@ -89,15 +94,19 @@ declare (`supportsEmptyNamespace`, `supportsVariant`,
 skip none.
 
 The fork's `SupportsAtomicOperations` contract tests last passed on these
-stores on 2026-10-27, at atomicio b58500c8f3 (its contract classes on all
-five stores: 91 tests, 0 failures, 24 skipped). b58500c8f3 adds a case: an
+stores on 2026-10-31, at atomicio 8bbeeeed83 (its contract classes on all
+five stores: 91 tests, 0 failures, 24 skipped; the GCS Rapid canaries and
+the ADLS vended-credentials test pass too). b58500c8f3 added a case: an
 append to a version that a CAS replaced with an object of the same length
-fails, which S3 Express and ADLS pass and the stores without append skip
-(errata D15 relies on it). The run before, 2026-10-26, passed GCS and ADLS
-at af875ccfd1 and S3 just before it. See the fork's README, "Testing on
+fails, which S3 Express and ADLS pass (first on 2026-10-27) and the stores
+without append skip (errata D15 relies on it). Earlier: 2026-10-27 at
+b58500c8f3, the same counts; 2026-10-26, GCS and ADLS at af875ccfd1 and S3
+just before it. See the fork's README, "Testing on
 real cloud storage".
 
-Earlier runs: 2026-10-26, the conflict encodings at the end of their
+Earlier runs: 2026-10-27 at 8636dda on fork atomicio af875ccfd1, the
+same counts, the first under `manifest-window` and with replay's native
+table state; 2026-10-26, the conflict encodings at the end of their
 phase 4 under the then default `lamport`, on fork atomicio 1f7ea07f1a, and
 2026-10-24 at eb4298a, the same counts;
 2026-10-21 at 9f792e8, before the intention-log split, the same counts; 2026-10-20 at 6031709, every suite green on the same
