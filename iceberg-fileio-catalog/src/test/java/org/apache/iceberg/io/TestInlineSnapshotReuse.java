@@ -40,8 +40,10 @@ import org.junit.jupiter.params.provider.EnumSource;
 /**
  * {@link LogCatalog.InlineSnapshots}: a load of an inline-ML table reuses the InlineSnapshots an
  * earlier load made for the snapshots whose lists did not change, and reads what a fresh catalog's
- * load of the same log reads, also after a pool entry was replaced (a v3 upgrade gives existing
- * manifests first row ids) and after a compaction (a decoded state shares no list with the last).
+ * load of the same log reads, also after a pool entry was replaced (by an equal copy: a record that
+ * sends again a manifest the pool holds; a commit that would change one writes a metadata file,
+ * LogCatalog.restatesAManifest) and after a compaction (a decoded state shares no list with the
+ * last).
  */
 class TestInlineSnapshotReuse {
   private static final TableIdentifier TABLE = TableIdentifier.of("ns", "t");

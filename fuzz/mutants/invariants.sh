@@ -3,7 +3,16 @@
 # replay's merge assigns (TestCatalogFaultProperties.checkNumbering), a fresh reader's loads
 # against a reader that reuses what it made, and the metadata log's bound, which the fuzzers now
 # change (anchors as of the commit that added this set): each mutant must fail an oracle.
-MUTANTS="poolorphan seqnoshift reusestale windowfloor"
+MUTANTS="poolorphan seqnoshift windowfloor"
+# Equivalent under this code's writers, so no oracle can catch it: a pool entry is replaced only by
+# an equal copy (a record that sends again a manifest the pool holds: a list on a parent whose list
+# is a file, a full update's lists), since a commit that would change one writes a metadata file
+# instead (LogCatalog.restatesAManifest) and the merge refuses a record that would (Landing; see
+# phase4.sh's norestate). Calibration si2-calib (2026-10-30) did not catch it; counted in
+# TestCatalogFaultProperties, TestInlineDifferentialProperties, TestRebaseProperties and
+# TestCatalogRegressions, 768 replacements changed no entry's sequence numbers, first row id,
+# adding snapshot or counts. The check guards loads against an entry that did change.
+EQUIVALENT="reusestale"
 ORACLES=TestCatalogFaultProperties,TestInlineDifferentialProperties
 
 prepare() {
