@@ -129,7 +129,10 @@ compact_every = { path = "config.compact_every", type = "INTEGER" }
 capture_hash = "capture.config_hash"
 capture_records = { path = "capture.manifest.summary.captured_records", type = "INTEGER" }
 # a generated trace's (LogTrace, under "generate"; bench/results/traces/<label>-<hash>/): its
-# encoding, whether it is the oracle trace, its writers, and the entries it holds
+# workload (its label), encoding, whether it is the oracle trace, its writers, and the entries it
+# holds; trace_dir names it under bench/results/ (traces/<label>-<hash>), as JMH's log param does
+trace_label = { path = "capture.manifest.config.label", type = "VARCHAR" }
+trace_dir = "capture.dir"
 trace_encoding = { path = "capture.manifest.config.encoding", type = "VARCHAR" }
 trace_oracle = { path = "capture.manifest.config.oracle", type = "BOOLEAN" }
 trace_writers = { path = "capture.manifest.config.writers", type = "INTEGER" }

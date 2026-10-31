@@ -125,6 +125,27 @@ select = ["c8-fold-*"]
 title = "Catalog transactions racing fast appends to their tables: width, table skew, isolation, encoding; conflicts by reason"
 select = ["c9-txn-*"]
 
+[campaigns.g1-witness]
+title = "Generated log traces (LogTrace): fast appends, a mix, catalog transactions; 6 encodings x contended/oracle x 4/16 writers; and the fold (JMH) over them"
+select = ["g1-witness-*", "jmh/j-g1*"]
+
+# g1's ingest runs measure each trace once, on havoc beside other jobs (1-4 s of folding): too short
+# and noisy to compare encodings' fold rates. Use the JMH runs over the traces: j-g1?-8d9277a is the
+# same code, j-g1?-proto the replay-cost fixes before their commit (9446029, the same code: MW's
+# window skips a blind v2 append's walk, Landing skips the list a blind v2 append never reads,
+# expiry's pool GC takes the cheaper side). Local laptop, 1 fork: errors +-5-20%.
+[[annotate]]
+select = "g1-witness-*"
+note = "8d9277a on havoc, 9 shards of 3 CPUs; one ingest pass per trace (noisy rates; see jmh/j-g1*)"
+
+[[annotate]]
+select = "jmh/j-g1*-proto"
+note = "8d9277a + the replay-cost fixes uncommitted, the same code as 9446029 (MW blind-v2 window skip, Landing blind-v2 list skip, expiry pool GC by the cheaper side); laptop, 1 fork"
+
+[[annotate]]
+select = "jmh/j-g1*-8d9277a"
+note = "8d9277a classes; laptop, 1 fork"
+
 # c9 ran a build of 157e3bf plus the then uncommitted conflict attribution (git_sha 157e3bf,
 # dirty), the same code as 6c1e353, which committed that diff.
 [[annotate]]

@@ -180,9 +180,17 @@ benchmark will measure storage latency and other catalogs). Its traces come from
   entries, windows, conflicts and refusals by reason, and a transaction's `txn_failures` (attempts
   that never produced an entry: client-side checks).
 - Ingested (`IngestRun`): `records_s`, and `goodput_s`, the entries that applied per second of
-  ingest (every operation is one entry). The oracle trace's goodput is the encoding's ceiling; the
-  contended trace's is what it achieves. A short fold (20k records: under a second) is noisy:
-  compare with JMH over the traces (havoc `run.sh jmh` finds traces/ as captures/).
+  ingest (every operation is one entry). A short fold (20k records: under a second) is noisy:
+  compare with JMH over the traces (havoc `run.sh jmh` finds traces/ as captures/; view
+  `trace_fold`, joined to `trace_ingest` by `trace_dir`).
+- The oracle trace's fold rate is not a ceiling on the contended trace's goodput where an entry's
+  cost grows with the state (inline manifest lists that fast appends lengthen): a contended trace
+  that applies half its entries ends with half the snapshots, and folds each applied entry more
+  cheaply (g1: lamport's contended fast-append trace at 16 writers outran its oracle trace). The
+  log's efficiency (applied / landed: `trace_ingest`) is what an encoding buys; compare fold costs
+  at equal state.
+- View `trace_ingest`: one row per ingest run of a trace (workload `trace_label`, encoding, oracle,
+  writers; the generator's entries, rejected, refused, mean window; the ingest's rates).
 - Generation is single-threaded by design (about 18 ms per entry on the dev box, mostly Iceberg's
   commit and refresh), so a campaign's traces run in parallel. Writers write and scan manifests on
   the calling thread (`Operations.MANIFESTS`): Iceberg polls a worker pool's futures every 10 ms.
