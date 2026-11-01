@@ -116,7 +116,7 @@ public class IngestFoldBench {
     switch (ids) {
       case "model":
         return IngestRun.Ids.of(BenchConfig.expand(BenchConfig.parse("{\"rate\": " + rate + "}"),
-            IngestRun.DEFAULTS).get(0));
+            IngestRun.DEFAULTS, ContentionRun.LATER_KEYS).get(0));
       case "uniform":
         return IngestRun.Ids.uniform(rate);
       default:

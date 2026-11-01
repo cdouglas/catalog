@@ -77,7 +77,8 @@ public final class ContentionBench {
     }
     List<BenchConfig> all = new ArrayList<>();
     for (Path file : files) {
-      all.addAll(BenchConfig.expand(BenchConfig.MAPPER.readTree(file.toFile())));
+      all.addAll(BenchConfig.expand(BenchConfig.MAPPER.readTree(file.toFile()),
+          ContentionRun.DEFAULTS, ContentionRun.LATER_KEYS));
     }
     // A shard runs every shards-th run, from its index: shards interleave over each file's axes
     List<BenchConfig> runs = new ArrayList<>();

@@ -40,7 +40,8 @@ class TestLogTrace {
 
   private static Map<String, Object> trace(Path dir, boolean oracle) throws Exception {
     BenchConfig config = BenchConfig.expand(
-        BenchConfig.parse(String.format(WORKLOAD, oracle)), LogTrace.DEFAULTS).get(0);
+        BenchConfig.parse(String.format(WORKLOAD, oracle)), LogTrace.DEFAULTS,
+        ContentionRun.LATER_KEYS).get(0);
     return new LogTrace(config, dir).run();
   }
 

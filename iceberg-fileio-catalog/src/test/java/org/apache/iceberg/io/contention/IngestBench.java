@@ -60,7 +60,8 @@ public final class IngestBench {
     List<BenchConfig> runs = new ArrayList<>();
     for (Path file : files) {
       runs.addAll(
-          BenchConfig.expand(BenchConfig.MAPPER.readTree(file.toFile()), IngestRun.DEFAULTS));
+          BenchConfig.expand(BenchConfig.MAPPER.readTree(file.toFile()), IngestRun.DEFAULTS,
+              ContentionRun.LATER_KEYS));
     }
     System.out.printf("%d runs%n", runs.size());
     int n = 0;
@@ -131,13 +132,13 @@ public final class IngestBench {
       }
       ObjectNode generate = ((ObjectNode) config.node().get("generate")).deepCopy();
       generate.put("capture_format", CAPTURE_FORMAT);
-      return BenchConfig.expand(generate, LogTrace.DEFAULTS).get(0);
+      return BenchConfig.expand(generate, LogTrace.DEFAULTS, ContentionRun.LATER_KEYS).get(0);
     }
     ObjectNode capture = ((ObjectNode) config.node().get("capture")).deepCopy();
     capture.put("store", "none");
     capture.put("capture_log", true);
     capture.put("capture_format", CAPTURE_FORMAT);
-    return BenchConfig.expand(capture).get(0);
+    return BenchConfig.expand(capture, ContentionRun.DEFAULTS, ContentionRun.LATER_KEYS).get(0);
   }
 
   /** The directory of the workload's generated trace: generated now, unless an earlier run did. */

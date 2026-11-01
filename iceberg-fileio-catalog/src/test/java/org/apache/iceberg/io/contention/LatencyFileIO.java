@@ -45,7 +45,7 @@ import org.apache.iceberg.io.SupportsAtomicOperations;
  * store reads its state or checks the condition, and the reply comes back. A conditional append
  * that loses its race takes the store's failure latency in all.
  */
-final class LatencyFileIO implements SupportsAtomicOperations {
+public final class LatencyFileIO implements SupportsAtomicOperations {
 
   private final InMemoryAtomicFileIO store;
   private final StoreProfile profile;
@@ -58,7 +58,7 @@ final class LatencyFileIO implements SupportsAtomicOperations {
    * {@code store} with {@code profile}'s latencies, scaled by {@code timeScale} (1: as measured),
    * drawn from {@code seed}; the GETs of {@code catalogLocation} count apart.
    */
-  LatencyFileIO(
+  public LatencyFileIO(
       InMemoryAtomicFileIO store, StoreProfile profile, String catalogLocation, double timeScale,
       long seed) {
     this.store = store;

@@ -47,8 +47,15 @@ done
 
 # The base: an online build and a test run of HEAD in the base image, on the last fork's jars,
 # fill it with every plugin, dependency and surefire provider; then the fork's jars come out.
-last=${!#}; last=${last%%=*}
+last=${!#}; lastrepo=${last#*=}; last=${last%%=*}
 cp -r "$CTX/forks/$last/." "$CTX/base/"
+# The contention driver's shared parts come from catalog-bench's bench-core (../catalog-bench), on
+# no public repository: the last repository's go into the base, and stay there.
+[ -d "$lastrepo/org/catalogbench/bench-core" ] \
+  || { echo "image.sh: no catalog-bench bench-core in $lastrepo (mvn -pl bench-core install)" >&2; exit 1; }
+mkdir -p "$CTX/base/org" && cp -r "$lastrepo/org/catalogbench" "$CTX/base/org/"
+echo "bench-core: $(sha256sum "$lastrepo"/org/catalogbench/bench-core/*/bench-core-*.jar | cut -c1-16), from $lastrepo" \
+  | tee -a "$CTX/provenance.txt"
 git -C "$ROOT" archive HEAD | tar -x -C "$CTX/seed"
 # as the invoking user, so that rootful Docker leaves no root-owned files behind
 docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e MAVEN_CONFIG=/tmp/.m2 \

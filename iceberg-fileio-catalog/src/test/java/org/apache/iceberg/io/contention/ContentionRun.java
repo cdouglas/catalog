@@ -41,7 +41,6 @@ import java.util.concurrent.locks.LockSupport;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
-import org.apache.iceberg.catalog.CatalogTransaction;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.CommitFailedException;
@@ -75,6 +74,98 @@ final class ContentionRun {
       java.lang.management.ManagementFactory.getThreadMXBean();
   private static final String WAREHOUSE = "mem:///wh";
   private static final String CATALOG = WAREHOUSE + "/catalog";
+
+  /** Every key of a contention run's configuration ({@link BenchConfig}), with its default. */
+  static final String DEFAULTS =
+      "{"
+          + "\"label\": \"run\","
+          + "\"seed\": 1,"
+          + "\"repetition\": 0,"
+          // the store: an endive profile (StoreProfile), its time scaled (1: as measured)
+          + "\"store\": \"s3x\","
+          + "\"time_scale\": 1.0,"
+          // the catalog
+          + "\"encoding\": \"lamport\","
+          + "\"mode\": \"ml\","
+          + "\"max_append_count\": 100,"
+          + "\"max_append_size\": 16777216,"
+          // the tables: partitioned by identity on an int column, each created with
+          // table_properties (as Iceberg's TableProperties: commit.manifest-merge.enabled,
+          // commit.manifest.min-count-to-merge, ...); an operation's table is uniform or Zipf
+          + "\"tables\": 1,"
+          + "\"table_dist\": \"uniform\","
+          + "\"table_zipf_alpha\": 1.5,"
+          + "\"table_properties\": {},"
+          + "\"partitions\": 32,"
+          + "\"format_version\": 2,"
+          + "\"preload_commits\": 50,"
+          // the load: closed (writers, each thinking between operations) or open (arrivals/s)
+          + "\"writers\": 4,"
+          + "\"think_ms\": 0,"
+          + "\"arrival_rate\": 0,"
+          // exponential gaps of mean 1/rate, or lognormal of median 1/rate (endive's "exponential")
+          + "\"arrival_dist\": \"exponential\","
+          + "\"arrival_sigma\": 0.5,"
+          + "\"max_inflight\": 64,"
+          + "\"duration_s\": 60,"
+          + "\"warmup_s\": 10,"
+          + "\"drain_s\": 30,"
+          // the operations: weights (fast_append, merge_append, wap, validated_overwrite,
+          // compaction, property, schema, catalog_txn), partitions each touches in a table and
+          // their Zipf exponent, files per partition, job runtime
+          + "\"mix\": {\"fast_append\": 1.0},"
+          + "\"partitions_per_txn\": 1,"
+          + "\"partition_dist\": \"uniform\","
+          + "\"zipf_alpha\": 1.5,"
+          // a catalog transaction's tables (as table_dist chooses them): txn_tables, or with
+          // txn_tables_dist exponential a draw of that mean, rounded down, from 1 to
+          // txn_tables_max; each a fast append, or a merge append with txn_merge; serializable
+          // (its tables' reads checked at commit) or snapshot isolation
+          + "\"txn_tables\": 2,"
+          + "\"txn_tables_dist\": \"fixed\","
+          + "\"txn_tables_max\": 8,"
+          + "\"txn_merge\": false,"
+          + "\"txn_isolation\": \"serializable\","
+          + "\"files_per_partition\": 1,"
+          // a job's runtime, lognormal about its median: by kind (runtime_ms), else the default
+          + "\"runtime_median_ms\": 0,"
+          + "\"runtime_sigma\": 0,"
+          + "\"runtime_ms\": {},"
+          // Iceberg's commit retry (TableProperties commit.retry.*)
+          + "\"retry_num\": 4,"
+          + "\"retry_min_wait_ms\": 100,"
+          + "\"retry_max_wait_ms\": 60000,"
+          // maintenance: every `expire_every_s`, expire the snapshots older than
+          // `expire_older_than_s` (0: every one) but the last `expire_retain`; a validated
+          // operation whose starting snapshot expires fails (Iceberg cannot tell its history)
+          + "\"expire_every_s\": 5,"
+          + "\"expire_retain\": 50,"
+          + "\"expire_older_than_s\": 0,"
+          // the catalog's backoff after a lost race (fileio.catalog.race.retry.min-wait-ms)
+          + "\"race_min_wait_ms\": 100,"
+          // sampling of the catalog object
+          + "\"sample_every_ms\": 1000,"
+          // the maintenance client's retries (-1: retry_num), so expiry can keep up with appends
+          + "\"expire_retry_num\": -1,"
+          // write every record the catalog's writes landed, in order, to log.bin (IngestBench)
+          + "\"capture_log\": false,"
+          // the format of the records a captured log holds (IngestBench sets the current one), so
+          // a change of format captures anew: 1 before RemoveManifestDelta.parent_indices and
+          // CompactSummary.inherits_parent_extra (2026-10-29), 2 before snapshot ids implied and
+          // manifests named by UUID and number
+          + "\"capture_format\": 1"
+          + "}";
+
+  /**
+   * Keys added after the first campaign (p5, 2026-10-27), with the value the runs that recorded no
+   * such key ran (race_min_wait_ms: p6's, the catalog's default then): one at that value is left
+   * out of the hash, so a configuration keeps the hash its earlier runs recorded. Every driver of
+   * this package's configurations hashes with them.
+   */
+  static final Map<String, String> LATER_KEYS =
+      Map.of("expire_older_than_s", "0", "race_min_wait_ms", "20", "expire_retry_num", "-1",
+          "capture_log", "false", "capture_format", "1", "txn_isolation", "serializable",
+          "generate", "");
 
   private final BenchConfig config;
   private final Path dir;
@@ -433,10 +524,9 @@ final class ContentionRun {
             ids.add(table(t));
             byId.put(table(t), tablePartitions.get(t));
           }
-          skip = Operations.catalogTransaction(catalog, ids, byId::get,
+          skip = Operations.catalogTransaction(CatalogTxns.of(catalog), ids, byId::get,
               config.integer("files_per_partition"), config.bool("txn_merge"),
-              CatalogTransaction.IsolationLevel.valueOf(
-                  config.string("txn_isolation").toUpperCase(java.util.Locale.ROOT)),
+              config.string("txn_isolation"),
               new Operations.Retry(config.integer("retry_num"),
                   config.longValue("retry_min_wait_ms"), config.longValue("retry_max_wait_ms")),
               random, failedAttempt(counts, txnFailures), ignored -> runtime.run());

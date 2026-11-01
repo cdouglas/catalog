@@ -105,42 +105,15 @@ final class Workload {
 
   /** {@code n} distinct values of {@code [0, of)}, uniform or Zipf of exponent {@code alpha}. */
   static List<Integer> choose(SplittableRandom random, int n, int of, String dist, double alpha) {
-    List<Integer> chosen = new ArrayList<>(n);
-    n = Math.min(n, of);
-    while (chosen.size() < n) {
-      int v = dist.equals("zipf") ? zipf(random, of, alpha) : random.nextInt(of);
-      if (!chosen.contains(v)) {
-        chosen.add(v);
-      }
-    }
-    return chosen;
-  }
-
-  /** A truncated Zipf draw of {@code [0, n)}: P(k) proportional to 1/(k+1)^alpha. */
-  static int zipf(SplittableRandom random, int n, double alpha) {
-    double norm = 0;
-    for (int k = 1; k <= n; k++) {
-      norm += 1.0 / Math.pow(k, alpha);
-    }
-    double u = random.nextDouble() * norm;
-    double sum = 0;
-    for (int k = 1; k <= n; k++) {
-      sum += 1.0 / Math.pow(k, alpha);
-      if (u < sum) {
-        return k - 1;
-      }
-    }
-    return n - 1;
+    return Draws.choose(random, n, of, dist, alpha);
   }
 
   static double exponential(SplittableRandom random, double mean) {
-    return -mean * Math.log(1.0 - random.nextDouble());
+    return Draws.exponential(random, mean);
   }
 
   /** A standard normal draw (Box-Muller). */
   static double gaussian(SplittableRandom random) {
-    double u1 = 1.0 - random.nextDouble();
-    double u2 = random.nextDouble();
-    return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    return Draws.gaussian(random);
   }
 }

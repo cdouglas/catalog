@@ -35,7 +35,6 @@ import java.util.function.LongConsumer;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
-import org.apache.iceberg.catalog.CatalogTransaction;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.CommitFailedException;
@@ -368,10 +367,8 @@ final class LogTrace {
             ids.add(table(t));
             byId.put(table(t), targets.get(t));
           }
-          skip = Operations.catalogTransaction(catalog, ids, byId::get, filesPerPartition,
-              config.bool("txn_merge"),
-              CatalogTransaction.IsolationLevel.valueOf(
-                  config.string("txn_isolation").toUpperCase(java.util.Locale.ROOT)),
+          skip = Operations.catalogTransaction(CatalogTxns.of(catalog), ids, byId::get,
+              filesPerPartition, config.bool("txn_merge"), config.string("txn_isolation"),
               new Operations.Retry(config.integer("retry_num"), 0, 0), random,
               ContentionRun.failedAttempt(counts, txnFailures), work);
           break;

@@ -46,6 +46,15 @@
       <version>${project.version}</version>
     </dependency>
     <dependency>
+      <!-- The contention driver's shared parts (StoreProfile, Requests, BenchConfig, Operations,
+           Draws, TxnSupport), from catalog-bench (../../catalog-bench: mvn -pl bench-core
+           install) -->
+      <groupId>org.catalogbench</groupId>
+      <artifactId>bench-core</artifactId>
+      <version>0.1.0-SNAPSHOT</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
       <!-- InMemorySharedLog, the shared log the catalog's tests run on besides one object. -->
       <groupId>org.intentlog</groupId>
       <artifactId>intentlog-memory</artifactId>
@@ -279,6 +288,19 @@
             <exclude>**/azure/**</exclude>
           </excludes>
         </configuration>
+      </plugin>
+      <!-- The test-jar: catalog-bench's FileIOCatalog adapter runs on the contention driver's
+           store (LatencyFileIO). -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <executions>
+          <execution>
+            <goals>
+              <goal>test-jar</goal>
+            </goals>
+          </execution>
+        </executions>
       </plugin>
       <!-- exec:java target for the JMH benchmarks in org.apache.iceberg.io.bench. Invoke:
            mvn -pl iceberg-fileio-catalog test-compile exec:java -Dexec.mainClass=org.apache.iceberg.io.bench.TableMetadataEncodingBench -Dexec.classpathScope=test
