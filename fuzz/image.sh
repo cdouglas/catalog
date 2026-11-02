@@ -54,7 +54,7 @@ cp -r "$CTX/forks/$last/." "$CTX/base/"
 [ -d "$lastrepo/org/catalogbench/bench-core" ] \
   || { echo "image.sh: no catalog-bench bench-core in $lastrepo (mvn -pl bench-core install)" >&2; exit 1; }
 mkdir -p "$CTX/base/org" && cp -r "$lastrepo/org/catalogbench" "$CTX/base/org/"
-echo "bench-core: $(sha256sum "$lastrepo"/org/catalogbench/bench-core/*/bench-core-*.jar | cut -c1-16), from $lastrepo" \
+echo "bench-core: $(sha256sum "$lastrepo"/org/catalogbench/bench-core/*/bench-core-*[^s].jar | cut -c1-16), from $lastrepo" \
   | tee -a "$CTX/provenance.txt"
 git -C "$ROOT" archive HEAD | tar -x -C "$CTX/seed"
 # as the invoking user, so that rootful Docker leaves no root-owned files behind
