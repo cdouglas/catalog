@@ -412,6 +412,8 @@ the incarnation id in each frame is what says whether the bytes after
 MB on a store that appends (at the default retention, the committed set alone
 reaches 2.5 MB at 10 commits a second, D16), or a benchmark profile that
 prices a GET by its bytes.
+catalog-bench's `s3x-2026-11` profile (measured, 7 ms a MiB read) now prices
+it, and a commit pays it four times (D20).
 
 ### D16. Replay rewrites the whole committed set, and every checkpoint carries it
 
@@ -546,6 +548,105 @@ The options:
 
 **Trigger to revisit:** a table that keeps thousands of snapshots without
 merging manifests, or whose expiries starve (D17).
+
+### D19. Compaction is due by the whole object's size, so a large checkpoint compacts on every commit
+
+`CompactionPolicy.limits` (intentlog-core) compacts when the log holds
+`max.append.count` records or when `bytes + recordBytes > maxBytes`, and
+`bytes` is the whole object: checkpoint and tail. `fileio.catalog.max.append.size`
+(16 MB) so bounds the object, not the records after the checkpoint. Once the
+checkpoint alone passes it, compaction is due on every commit: each commit
+replaces the whole object by a CAS instead of appending its record, and the
+writers race whole-object replaces, each lost race another read and encode of
+the catalog.
+
+catalog-bench measured it (2026-11-02; its DESIGN.md "P4 findings", lab page
+`e3-depth`): 10 inline-ML tables aged 7,200 snapshots each hold 72,000
+snapshots, each with its list whole (D18), a 23.9 MB object. On S3 Express
+(`s3x-2026-11`), 8 writers offered 1.7 merge appends a second: every commit was
+a CAS (0 appends, 1.0 landed and 5.1 lost CASes a commit), a merge append wrote
+about 145 MB and read about 224 MB, and the runs committed 0.27 a second. At
+1,000 snapshots the object is 3.3 MB and commits append. On a store without
+append (S3 Standard, GCS) every commit replaces the object anyway, so there the
+checkpoint's size is every commit's cost.
+
+The knobs bound different things. The record count is a soft limit sized to
+a provider's caps (the S3 Express part count; Bug 66's SegmentLimitException
+handles the cap itself), and bounds what a reader replays after the
+checkpoint; the size is a performance target. Neither should make a
+checkpoint that is merely large compact on every commit. The direction, to
+design with paging:
+
+- **Bound the tail, not the object.** Compact when the records after the
+  checkpoint cost a reader more than a compaction, amortized over the commits
+  until the next, costs a writer (D14's "compact by cost"): the tail's bytes
+  and replay time against the checkpoint's. A provider's hard limits (an
+  object's or an append's size, Azure's 100 MiB append, the S3 Express part
+  count, SegmentLimitException) stay as caps.
+- **Bound the checkpoint by paging.** What a compaction writes is the
+  checkpoint, so its size is a policy too: page out the committed set's old
+  ids (D16) and a table's old snapshots with their lists (D18), so the
+  checkpoint holds what replay needs (the admission window, recent
+  snapshots) and names immutable pages for the rest. Compaction policy (when
+  to rewrite the checkpoint) and paging policy (what the checkpoint holds)
+  together bound both the write amplification and every read's cost (D15,
+  D20).
+
+**Trigger to revisit:** next after D20; a catalog whose checkpoint approaches
+`max.append.size`.
+
+### D20. A commit reads the whole catalog object four times (perf bug)
+
+A commit through Iceberg's API reads the catalog object four times, each
+time whole, in every mode. catalog-bench counted exactly four catalog GETs a
+merge append, pointer, inline TM and inline ML alike, from 100 to 3,000
+tables (2026-11-02; lab pages `f0-sizing`, `e1-knee`):
+
+1. `loadTable`: `FileIOTableOperations.doRefresh` reads the log
+   (`CatalogLog.read`).
+2. `SnapshotProducer.apply` refreshes before building the snapshot
+   (`SnapshotProducer.java:349`), milliseconds after 1.
+3. The commit reads through its own write (`LogRuntime`:
+   `log.readThrough(receipt)`, which `AtomicFileLog` answers with a parse of
+   the whole object written) to learn whether replay applied its record.
+4. `SnapshotProducer.commit` refreshes after committing
+   (`SnapshotProducer.java:841`), to find the snapshot it made for its
+   cleanup.
+
+Each is a GET of the whole object (D15) and a parse that copies its
+checkpoint and every record (`AtomicFileLog.decode`) before a replica folds
+only what is new, so a commit's cost grows with the catalog, not with its
+table. At 300 tables aged 100 snapshots on S3 Express, a merge append read
+31.7 MB in ML (a 7.6 MB object, four times), 11.2 MB in TM and 1.7 MB in
+pointer mode; its median took 317, 172 and 106 ms, against 67 ms for JDBC on
+the same store, which reads its own table's row and metadata file. In E3 TM
+reads 18.8 MB a commit at 7,200 snapshots. In the driver it is CPU and
+garbage too: one client aging 10 inline-ML tables to 7,200 snapshots took 9
+hours, about the square of the depth.
+
+Only the first is needed:
+
+- **3 after a conditional append.** An append conditional on the tail the
+  writer read (S3 Express's write offset and `If-Match`, Azure's append
+  position) lands right after the state on which the writer checked its
+  intention's preconditions, so replay there applies it exactly as the
+  writer did: the replica it lands in is the writer's plus its record,
+  known without a read. The read through stays for an unconditional append,
+  and for a write whose reply was lost (ambiguous, P3).
+- **4 from the landed replica.** The commit has just produced the replica
+  its record landed in; the table's operations can take it as their current
+  state, so the refresh after a commit reads nothing.
+- **2 from 1's replica.** A refresh milliseconds after a read can confirm the
+  object is unchanged with a conditional GET (`If-None-Match` on the version
+  it read) or read only the bytes after it (D15's `readAfter`).
+
+A commit then reads once, and with D15 reads only the records it does not
+hold, instead of four whole GETs. Iceberg's refresh contract stays: a
+refresh served from a replica must still see what landed since (a
+conditional or ranged read), and a stale base only costs a retry or a merge,
+since replay judges every record where it lands.
+
+**Trigger to revisit:** now (next); it is a performance bug, not a policy.
 
 ### D8. Typed-protobuf encoding for Iceberg structural types (skip JSON serde)
 
