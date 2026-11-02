@@ -24,7 +24,10 @@ package org.intentlog;
  */
 public interface LogTail {
 
-  /** Whether the log exists (a log that does not is created by a {@link SharedLog#replace}). */
+  /**
+   * Whether the log existed at this tail, as the read, probe or write that made it found it (a log
+   * that does not exist is created by a {@link SharedLog#replace}).
+   */
   boolean exists();
 
   /** The size of the log in bytes, checkpoint included: what the size knob compares. */

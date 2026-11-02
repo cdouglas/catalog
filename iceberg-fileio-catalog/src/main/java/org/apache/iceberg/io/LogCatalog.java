@@ -154,7 +154,8 @@ public class LogCatalog extends BaseMetastoreCatalog
     }
     Preconditions.checkState(
         sharedLog != null && io != null, "%s opened no log", getClass().getSimpleName());
-    log = new CatalogLog(sharedLog, LogCatalogProperties.runtimeConfig(catalogProperties));
+    log = new CatalogLog(sharedLog, LogCatalogProperties.runtimeConfig(catalogProperties),
+        LogCatalogProperties.checkpointMemoize(catalogProperties));
     // Another catalog may create the log at once (two processes starting on a new warehouse):
     // either way, this one uses it.
     log.bootstrap(conflictEncoding);
@@ -531,6 +532,8 @@ public class LogCatalog extends BaseMetastoreCatalog
     private final InlineSettings inline;
     private final InlineSnapshots inlineSnapshots;
     private volatile Replica<CatalogState> lastRead = null;
+    // The replica the last commit through these operations landed in, until commit() adopts it
+    private Replica<CatalogState> landed = null;
     // Whether a read found the table: once one has, a read that does not finds it dropped
     private boolean loaded = false;
     // Whether a commit of what Iceberg commits once pins it (LogCatalog.leavingCommitOnceUnpinned)
@@ -706,8 +709,32 @@ public class LogCatalog extends BaseMetastoreCatalog
       if (base == metadata) {
         return;
       }
+      landed = null;
       doCommit(base, metadata);
       deleteRemovedRealMetadataFiles(base, metadata);
+      adoptLanded();
+    }
+
+    /**
+     * Takes the replica the commit just landed in as the table's current state, as Iceberg's REST
+     * operations take the metadata a commit returns, so a look at the table after the commit reads
+     * nothing (errata D20; {@code SnapshotProducer} finds its snapshot in {@link #current()}). A
+     * {@link #refresh} still reads the log. The commit has landed whatever happens here: if the
+     * table cannot be loaded from the replica (a pointer table's metadata file unreadable), the
+     * next {@link #current()} refreshes instead.
+     */
+    private void adoptLanded() {
+      Replica<CatalogState> committed = landed;
+      landed = null;
+      if (committed != null) {
+        try {
+          loadFrom(committed.state());
+          lastRead = committed;
+          return;
+        } catch (RuntimeException e) {
+          LOG.warn("Cannot load {} from the catalog its commit landed in; refreshing", tableId, e);
+        }
+      }
       requestRefresh();
     }
 
@@ -747,7 +774,7 @@ public class LogCatalog extends BaseMetastoreCatalog
       if (pinsCommitOnce && (replaces || commitsOnce(metadata.changes()))) {
         mut.pin(tableId);
       }
-      mut.commit(log);
+      landed = mut.commit(log);
     }
 
     /**
@@ -799,7 +826,7 @@ public class LogCatalog extends BaseMetastoreCatalog
         CatalogMutation mut = new CatalogMutation(read);
         create.accept(mut);
         try {
-          mut.commit(log);
+          landed = mut.commit(log);
           return;
         } catch (CommitFailedException e) {
           if (attempt >= org.apache.iceberg.TableProperties.COMMIT_NUM_RETRIES_DEFAULT + 1) {

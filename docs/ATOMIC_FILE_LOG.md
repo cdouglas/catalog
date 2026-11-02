@@ -83,7 +83,7 @@ object's bytes and back, for tests and tools.
 | `probe()` | the object's version and length, without reading it; a tail that does not exist if the object does not |
 | `append(record, tail)` | appends `[varint length][record]` at the tail's length, conditioned on its version (`Strategy.APPEND`). An unconditional append is refused |
 | `replace(tail, checkpoint, records)` | writes `[header][checkpoint][records]` as the whole object, conditioned on the tail's version, or on the object's absence if the tail does not exist (`Strategy.CAS`) |
-| `readThrough(receipt)` | reads the version the write wrote, so its record is among the records (P3) |
+| `readThrough(receipt)` | the object the write left, so its record is among the records (P3): without a read when the write says what it holds (a replace holds what it wrote; an append conditioned on a tail whose bytes this log read or wrote holds those bytes and the record), else by reading the version the write wrote |
 | `putCheckpoint`, `trim`, `readAfter` | not supported (a replace checkpoints), or the default (a fresh read) |
 
 **Tails.** A tail is the object's version (an ETag or generation) and length.
@@ -100,6 +100,15 @@ if the object did not shrink: an append makes it longer, while a replace
 usually makes it shorter. A replace that makes it longer reads as an append,
 which costs a resend at most: the record is the same, and replay applies it
 once.
+
+An append conditioned on a tail must fail unless the object is exactly the
+version the tail is bound to, not merely as long: a provider requirement the
+fork's `SupportsAtomicOperationsContractTest` checks
+(`appendPinnedToAVersionReplacedAtTheSameLengthFails`; S3 Express's `If-Match`
+with the write offset, an Azure Append Blob's `If-Match` with the append
+position). A read through such an append, from a tail whose bytes the log read
+or wrote, rests on it: the object is those bytes and the record, known without a
+read (errata D20).
 
 **Signals.** Each write is prepared (`AtomicOutputFile.prepare`, which
 computes the checksum the store checks) and then sent (`writeAtomic`). The
@@ -126,7 +135,8 @@ it can, and replaces the object when it must:
   limit), whatever the thresholds say (Bug 71);
 - or the compaction policy says the object is due: the read it staged on holds
   at least `max.append.count` intention records, or its record would take the
-  object past `max.append.size` bytes.
+  records after the checkpoint past `max.append.size` bytes (the whole object,
+  with `max.append.size.basis` `object`).
 
 A replace is a compaction. It writes `[header][checkpoint][gc][record]`: the
 checkpoint of the state the writer read (after a lost race, one it read
@@ -138,7 +148,9 @@ object holds one intention record.
 | Property | Default | Purpose |
 |---|---|---|
 | `fileio.catalog.max.append.count` | 100 | Soft limit on intention records (GC records not counted): a writer that reads at least this many replaces instead of appending. Writers retrying a lost append race do not read the count again, so the log can run a few records past it. The stores bound it (S3 Express 10,000 parts, Azure Append Blob 50,000 blocks): an append past one is refused, and the writer compacts instead, so a count above the store's limit costs a refused append, not a stuck catalog. Measured best of 0, 100 and 1000 on S3 Express (design.md §"Choosing append vs CAS"). **0 replaces on every commit**, which an S3 general-purpose bucket needs |
-| `fileio.catalog.max.append.size` | 16777216 | Soft target for the object's size. Larger objects take longer to read |
+| `fileio.catalog.max.append.size` | 16777216 | Soft target for the records after the checkpoint (a reader replays them, a compaction rewrites them) |
+| `fileio.catalog.max.append.size.basis` | `tail` | What `max.append.size` bounds: `tail`, the records after the checkpoint, or `object`, the whole object (before errata D19's stopgap; for ablation) |
+| `fileio.catalog.checkpoint.memoize` | `true` | Whether a checkpoint writes an inline table unchanged since a decode or an earlier encode as the bytes it had (docs/CHECKPOINT_PLAN.md R0.2); `false` encodes every table (for ablation) |
 | `fileio.catalog.throttle.retry.min-wait-ms` | 200 | First wait before sending again a write that storage throttled ([LOG.md](LOG.md) §"The commit loop") |
 | `fileio.catalog.race.retry.min-wait-ms` | 100 | Bound of the random wait after a lost race, before the writer reads or probes the object again ([LOG.md](LOG.md) §"The commit loop") |
 | `fileio.catalog.committed.retention.ms` | 1800000 (30 min) | How long the committed set keeps an id ([LOG.md](LOG.md) §"The committed set and GC") |

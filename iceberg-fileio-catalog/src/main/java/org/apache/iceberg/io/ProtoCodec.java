@@ -286,6 +286,15 @@ public class ProtoCodec {
    * built (decoded from a checkpoint, or copied from a state and changed).
    */
   public static byte[] encodeCheckpointState(CatalogState original) {
+    return encodeCheckpointState(original, null);
+  }
+
+  /**
+   * Encodes the catalog's state as {@link #encodeCheckpointState(CatalogState)} does, writing
+   * each inline table that {@code memo} holds as it is as the bytes it holds, and recording the
+   * others' (none: a null memo).
+   */
+  static byte[] encodeCheckpointState(CatalogState original, CheckpointMemo memo) {
     try {
       ByteArrayOutputStream out = new BytesOut();
 
@@ -339,9 +348,20 @@ public class ProtoCodec {
           Map<String, ManifestFile> pool = original.manifestPool(tblId);
           Map<Long, List<String>> snapRefs = original.snapshotManifests(tblId);
           InlineTable table = inlineEntry.getValue();
-          byte[] inlineBytes = encodeInlineTable(
-              tblId, tblEntry, table.bytes(), table.codec(), prefix, pool, snapRefs,
-              conflictState(original, stateCodec, tblId));
+          CheckpointMemo.Inputs inputs = memo != null ? original.inlineInputs(tblId) : null;
+          byte[] inlineBytes = memo != null ? memo.get(tblId, inputs) : null;
+          if (inlineBytes == null || CheckpointMemo.CHECK) {
+            byte[] encoded = encodeInlineTable(
+                tblId, tblEntry, table.bytes(), table.codec(), prefix, pool, snapRefs,
+                conflictState(original, stateCodec, tblId));
+            Preconditions.checkState(
+                inlineBytes == null || java.util.Arrays.equals(inlineBytes, encoded),
+                "The memoized encoding of inline table %s differs from its encoding", tblId);
+            if (inlineBytes == null && memo != null) {
+              memo.put(tblId, inputs, encoded);
+            }
+            inlineBytes = encoded;
+          }
           writeLengthDelimited(out, CHECKPOINT_INLINE_TABLES, inlineBytes);
         }
       }
@@ -365,11 +385,23 @@ public class ProtoCodec {
 
   /** Decodes the catalog's state, the payload of a checkpoint (catalog.proto Checkpoint). */
   public static void decodeCheckpointState(byte[] state, CatalogState.Builder builder) {
+    decodeCheckpointState(state, builder, null);
+  }
+
+  /**
+   * Decodes the catalog's state as {@link #decodeCheckpointState(byte[], CatalogState.Builder)}
+   * does, recording in {@code memo} (unless null) each inline table's bytes beside the objects
+   * decoded from them.
+   */
+  static void decodeCheckpointState(
+      byte[] state, CatalogState.Builder builder, CheckpointMemo memo) {
     try {
       ByteArrayInputStream in = new ByteArrayInputStream(state);
       boolean sawMinReaderVersion = false;
       // A table's conflict state decodes with the encoding's codec, which may come after it.
       Map<Integer, byte[]> conflictStates = new HashMap<>();
+      // Each inline table's bytes, for the memo
+      Map<Integer, byte[]> inlineTables = memo != null ? new HashMap<>() : null;
       while (in.available() > 0) {
         int tag = readVarint(in);
         int fieldNumber = tag >>> 3;
@@ -407,7 +439,11 @@ public class ProtoCodec {
             decodeNamespaceProperty(readLengthDelimitedBytes(in), builder);
             break;
           case CHECKPOINT_INLINE_TABLES:
-            decodeInlineTable(readLengthDelimitedBytes(in), builder, conflictStates);
+            byte[] inlineTable = readLengthDelimitedBytes(in);
+            int inlineId = decodeInlineTable(inlineTable, builder, conflictStates);
+            if (inlineTables != null) {
+              inlineTables.put(inlineId, inlineTable);
+            }
             break;
           default:
             skipField(in, wireType);
@@ -421,6 +457,9 @@ public class ProtoCodec {
       conflictStates.forEach((id, bytes) -> builder.setConflictState(id, stateCodec.decode(bytes)));
       // Rebuild lookups after all entries are loaded (handles out-of-order decoding)
       builder.rebuildLookups();
+      if (inlineTables != null) {
+        inlineTables.forEach((id, bytes) -> memo.put(id, builder.inlineInputs(id), bytes));
+      }
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
@@ -617,7 +656,8 @@ public class ProtoCodec {
     return out.toByteArray();
   }
 
-  private static void decodeInlineTable(
+  /** Decodes an inline table into {@code builder}, and returns its id. */
+  private static int decodeInlineTable(
       byte[] bytes, CatalogState.Builder builder, Map<Integer, byte[]> conflictStates)
       throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
@@ -688,6 +728,7 @@ public class ProtoCodec {
     for (byte[] refBytes : snapRefBytes) {
       decodeSnapshotManifestRefs(refBytes, id, poolList, builder);
     }
+    return id;
   }
 
   private static void decodeSnapshotManifestRefs(

@@ -383,6 +383,14 @@ public class CatalogState {
     return conflictStates;
   }
 
+  /** What inline table {@code id}'s encoding in a checkpoint is a function of (CheckpointMemo). */
+  CheckpointMemo.Inputs inlineInputs(int id) {
+    return new CheckpointMemo.Inputs(
+        tableById.get(id), tblInlineMetadata.get(id), tblManifestPrefix.getOrDefault(id, ""),
+        manifestPool(id), snapshotManifests(id), conflictStates.get(id),
+        conflictEncoding().stateCodec());
+  }
+
   // ============================================================
   // Entry types
   // ============================================================
@@ -974,6 +982,19 @@ public class CatalogState {
     EncodingState conflictStateOrEmpty(int tblId) {
       EncodingState state = conflictStates.get(tblId);
       return state != null ? state : conflictEncoding().stateCodec().empty();
+    }
+
+    /**
+     * What inline table {@code id}'s encoding is a function of, as the state this builds now would
+     * hold it (CheckpointMemo).
+     */
+    CheckpointMemo.Inputs inlineInputs(int id) {
+      Map<String, ManifestFile> pool = manifestPool.get(id);
+      Map<Long, List<String>> lists = snapshotManifests.get(id);
+      return new CheckpointMemo.Inputs(
+          tableById.get(id), tblInlineMetadata.get(id), tblManifestPrefix.getOrDefault(id, ""),
+          pool != null ? pool : ImmutableMap.of(), lists != null ? lists : ImmutableMap.of(),
+          conflictStates.get(id), conflictEncoding().stateCodec());
     }
 
     /** Sets the encoding's state of table {@code tblId}, as a checkpoint holds it. */

@@ -41,12 +41,57 @@ public final class LogCatalogProperties {
   public static final int DEFAULT_MAX_APPEND_COUNT = 100;
 
   /**
-   * Maximum size in bytes of the catalog file before a new commit must CAS (compact)
-   * instead of append. This is a performance target; larger catalogs take longer to
-   * read. Default: 16 MB.
+   * Maximum size in bytes of the records after the catalog's checkpoint (or, with {@link
+   * #MAX_APPEND_SIZE_BASIS} {@code object}, of the whole catalog file) before a new commit must
+   * CAS (compact) instead of append. This is a performance target: a reader replays the records,
+   * and a compaction rewrites them. Default: 16 MB.
    */
   public static final String MAX_APPEND_SIZE = "fileio.catalog.max.append.size";
   public static final long DEFAULT_MAX_APPEND_SIZE = 16L * 1024 * 1024;
+
+  /**
+   * What {@link #MAX_APPEND_SIZE} bounds: {@code tail}, the records after the checkpoint, or
+   * {@code object}, the whole catalog file, as before errata D19's stopgap, under which a
+   * checkpoint past the bound makes every commit compact (docs/CHECKPOINT_PLAN.md R0.1; for
+   * ablation). Default: {@code tail}.
+   */
+  public static final String MAX_APPEND_SIZE_BASIS = "fileio.catalog.max.append.size.basis";
+  public static final String DEFAULT_MAX_APPEND_SIZE_BASIS = "tail";
+
+  /**
+   * Whether a checkpoint writes an inline table that has not changed since a decode or an
+   * earlier encode of this catalog as the bytes it had then, instead of encoding it again
+   * (docs/CHECKPOINT_PLAN.md R0.2). {@code false} encodes every table on every checkpoint, as
+   * before (for ablation). Default: {@code true}.
+   */
+  public static final String CHECKPOINT_MEMOIZE = "fileio.catalog.checkpoint.memoize";
+  public static final boolean DEFAULT_CHECKPOINT_MEMOIZE = true;
+
+  /** Whether {@code properties} ask a catalog to memoize its checkpoints' table encodings. */
+  public static boolean checkpointMemoize(Map<String, String> properties) {
+    String val = properties == null ? null : properties.get(CHECKPOINT_MEMOIZE);
+    if (val == null) {
+      return DEFAULT_CHECKPOINT_MEMOIZE;
+    }
+    Preconditions.checkArgument(val.equals("true") || val.equals("false"),
+        "%s must be true or false, got %s", CHECKPOINT_MEMOIZE, val);
+    return Boolean.parseBoolean(val);
+  }
+
+  /** The size basis {@code properties} name ({@link #MAX_APPEND_SIZE_BASIS}). */
+  static CompactionPolicy.SizeBasis sizeBasis(Map<String, String> properties) {
+    String val = properties == null ? null : properties.get(MAX_APPEND_SIZE_BASIS);
+    String basis = val != null ? val : DEFAULT_MAX_APPEND_SIZE_BASIS;
+    switch (basis) {
+      case "tail":
+        return CompactionPolicy.SizeBasis.TAIL;
+      case "object":
+        return CompactionPolicy.SizeBasis.OBJECT;
+      default:
+        throw new IllegalArgumentException(
+            String.format("%s must be tail or object, got %s", MAX_APPEND_SIZE_BASIS, basis));
+    }
+  }
 
   /**
    * Retention window for the committed-transaction dedup set, in milliseconds.
@@ -121,6 +166,7 @@ public final class LogCatalogProperties {
     return runtimeConfig(
         intProperty(properties, MAX_APPEND_COUNT, DEFAULT_MAX_APPEND_COUNT),
         longProperty(properties, MAX_APPEND_SIZE, DEFAULT_MAX_APPEND_SIZE),
+        sizeBasis(properties),
         longProperty(properties, COMMITTED_RETENTION_MS, DEFAULT_COMMITTED_RETENTION_MS),
         longProperty(properties, THROTTLE_MIN_WAIT_MS, DEFAULT_THROTTLE_MIN_WAIT_MS),
         longProperty(properties, RACE_MIN_WAIT_MS, DEFAULT_RACE_MIN_WAIT_MS));
@@ -135,6 +181,17 @@ public final class LogCatalogProperties {
   public static RuntimeConfig runtimeConfig(
       int maxAppendCount, long maxAppendSize, long committedRetentionMs, long throttleMinWaitMs,
       long raceMinWaitMs) {
+    return runtimeConfig(maxAppendCount, maxAppendSize, CompactionPolicy.SizeBasis.TAIL,
+        committedRetentionMs, throttleMinWaitMs, raceMinWaitMs);
+  }
+
+  /**
+   * As {@link #runtimeConfig(int, long, long, long, long)}, with {@code maxAppendSize} bounding
+   * what {@code sizeBasis} counts.
+   */
+  public static RuntimeConfig runtimeConfig(
+      int maxAppendCount, long maxAppendSize, CompactionPolicy.SizeBasis sizeBasis,
+      long committedRetentionMs, long throttleMinWaitMs, long raceMinWaitMs) {
     Preconditions.checkArgument(maxAppendCount >= 0,
         "maxAppendCount must be >= 0, got %s", maxAppendCount);
     Preconditions.checkArgument(maxAppendSize >= 0,
@@ -146,7 +203,7 @@ public final class LogCatalogProperties {
     Preconditions.checkArgument(raceMinWaitMs >= 0,
         "raceMinWaitMs must be >= 0, got %s", raceMinWaitMs);
     return RuntimeConfig.of(
-        CompactionPolicy.limits(maxAppendCount, maxAppendSize),
+        CompactionPolicy.limits(maxAppendCount, maxAppendSize, sizeBasis),
         committedRetentionMs,
         throttleMinWaitMs,
         raceMinWaitMs);

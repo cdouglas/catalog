@@ -702,10 +702,15 @@ compacts. It replaces the log with a checkpoint of the state it read, a GC
 record and its own record, when the log cannot append, an append was refused
 as full, the record is larger than an append stores (`maxRecordBytes`), or the
 compaction policy says the log is due:
-`CompactionPolicy.limits(maxRecords, maxBytes)` compacts once the log holds
-`maxRecords` intention records (0: every commit), or the record would take it
-past `maxBytes` (the catalog's `fileio.catalog.max.append.count` and
-`max.append.size`). Both limits are soft: a writer that loses an append race
+`CompactionPolicy.limits(maxRecords, maxBytes, basis)` compacts once the log
+holds `maxRecords` intention records (0: every commit), or the record would take
+what `basis` counts past `maxBytes`: the records after the checkpoint (`TAIL`,
+the default), or the whole log (`OBJECT`, as before errata D19's stopgap, under
+which a checkpoint past the bound compacts on every commit). The policy sees
+the replica's record count, its checkpoint's size and the log's
+(`CompactionPolicy.Input`); the catalog's knobs are
+`fileio.catalog.max.append.count`, `max.append.size` and
+`max.append.size.basis`. Both limits are soft: a writer that loses an append race
 resends at the new tail without reading the count again. Writers configured
 differently disagree on when to compact, but cannot corrupt the log: every
 write is conditional.
@@ -737,8 +742,8 @@ it does not.
 
 | Provider | append | conditional | fused replace | checkpoints / trim | `readThrough` (P3) | receipt |
 |---|---|---|---|---|---|---|
-| `AtomicFileLog`, store with append (S3 Express, ADLS) | at an offset | yes | `[chk][gc][rec]` by CAS | in the object | reads the version written | the version written |
-| `AtomicFileLog`, CAS only (GCS, S3 standard) | no | – | the same | in the object | reads the version written | the version written |
+| `AtomicFileLog`, store with append (S3 Express, ADLS) | at an offset | yes | `[chk][gc][rec]` by CAS | in the object | the object the write left: known from the write, or read | the version written |
+| `AtomicFileLog`, CAS only (GCS, S3 standard) | no | – | the same | in the object | what the replace wrote | the version written |
 | `InMemorySharedLog` | yes | optional | no | a store apart, and a trim point | from a checkpoint before the record | a position |
 | Kafka (one partition) and an object store | idempotent produce | no | no | `chk/<offset>` objects; `deleteRecords` | wait for the high watermark | an offset |
 | SQS FIFO and an archiver | `SendMessage`, deduplication id = record id | no | no | the archiver's: it appends GC records, checkpoints and trims | poll the archive | a sequence number |
@@ -748,7 +753,12 @@ it does not.
 the records appended after it ([ATOMIC_FILE_LOG.md](ATOMIC_FILE_LOG.md)). A
 tail is the object's version (ETag or generation) and length, and continues an
 earlier one if the object did not shrink; a replace usually makes it shorter.
-It reads back the version a write wrote, so P3 holds trivially. It maps the
+A read through a write returns the object the write left, so P3 holds
+trivially; it reads nothing when the write says what that is (a replace holds
+what it wrote, and an append conditioned on a tail whose bytes the log read or
+wrote holds those bytes and the record: the condition names the version, which
+no later write leaves in place), and reads the version written after an append
+at a tail a probe found (errata D20). It maps the
 fork's exceptions onto the SPI's: `StorageThrottleException` to throttled
 (before `CASException`, its superclass), `SegmentLimitException` to full,
 `CASException` and `AppendException` to conflict, and a failure to prepare a

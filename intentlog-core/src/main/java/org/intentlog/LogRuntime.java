@@ -110,8 +110,10 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     Replay.Result<B> result =
         Replay.replayOnto(machine, machine.toBuilder(prior.state()), prior.committed().toBuilder(),
             prior.logId(), prior.intentionRecords(), view.records(), null);
-    // The view holds only the records after prior's, so the replica is the replay of no view
-    return new Replayed(null, view.tail(), result, prior.logId()).replica();
+    // The view holds only the records after prior's, so the replica is the replay of no view;
+    // they follow prior's checkpoint
+    return new Replayed(null, view.tail(), prior.checkpointBytes(), result, prior.logId())
+        .replica();
   }
 
   /**
@@ -243,7 +245,8 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
       // The writer whose commit landed compacts, as the policy says of the log it read; the commit
       // stands whatever becomes of the compaction.
       try {
-        if (config.compaction().due(landed.intentionRecords(), landed.tail().bytes(), 0)) {
+        if (config.compaction().due(new CompactionPolicy.Input(landed.intentionRecords(),
+            landed.checkpointBytes(), landed.tail().bytes(), 0))) {
           compact();
         }
       } catch (RuntimeException e) {
@@ -266,15 +269,20 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     private final LogTail tail;
     private final Replay.Result<B> result;
     private final UUID logId;
+    // The size of the checkpoint the replayed records follow
+    private final long checkpointBytes;
     private Replica<S> replica;
 
     Replayed(LogView view, Replay.Result<B> result, UUID logId) {
-      this(view, view.tail(), result, logId);
+      this(view, view.tail(), view.checkpoint().map(c -> (long) c.length).orElse(0L), result,
+          logId);
     }
 
-    Replayed(LogView view, LogTail tail, Replay.Result<B> result, UUID logId) {
+    Replayed(
+        LogView view, LogTail tail, long checkpointBytes, Replay.Result<B> result, UUID logId) {
       this.view = view;
       this.tail = tail;
+      this.checkpointBytes = checkpointBytes;
       this.result = result;
       this.logId = logId;
     }
@@ -292,6 +300,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
                 tail,
                 result.intentionRecords(),
                 result.logId() != null ? result.logId() : logId,
+                checkpointBytes,
                 view);
       }
       return replica;
@@ -522,8 +531,9 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
                   && (full
                       || oversized
                       || !caps.append()
-                      || config.compaction().due(current.intentionRecords(), bytes(tail),
-                          record.length));
+                      || config.compaction().due(new CompactionPolicy.Input(
+                          current.intentionRecords(), current.checkpointBytes(), bytes(tail),
+                          record.length)));
 
           if (mustReplace) {
             if (stale) {

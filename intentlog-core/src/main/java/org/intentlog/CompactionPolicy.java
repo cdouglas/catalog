@@ -22,18 +22,52 @@ package org.intentlog;
 @FunctionalInterface
 public interface CompactionPolicy {
 
+  /** Whether the next commit compacts the log it would extend. */
+  boolean due(Input log);
+
   /**
-   * Whether the next commit compacts, given the intention records after the checkpoint, the log's
-   * size, and the size of the record it commits.
+   * What a policy sees of the log a commit would extend: the intention records after its
+   * checkpoint, the checkpoint's size, the log's size (checkpoint included), and the size of the
+   * record the commit would add.
    */
-  boolean due(long intentionRecords, long logBytes, int recordBytes);
+  record Input(long intentionRecords, long checkpointBytes, long logBytes, int recordBytes) {
+    /** The bytes after the checkpoint: the records, and the provider's framing of the log. */
+    public long tailBytes() {
+      return Math.max(0L, logBytes - checkpointBytes);
+    }
+  }
+
+  /** What a size bound counts. */
+  enum SizeBasis {
+    /**
+     * The records after the checkpoint: a log compacts by what it would replay and rewrite beyond
+     * its checkpoint, whatever the checkpoint's size (errata D19).
+     */
+    TAIL,
+    /**
+     * The whole log, checkpoint included, as before D19's stopgap: a checkpoint past the bound
+     * makes every commit compact.
+     */
+    OBJECT
+  }
 
   /**
    * Compacts once the log holds {@code maxRecords} intention records (0: every commit), or the
-   * record would take it past {@code maxBytes}. Both are soft: writers that lose an append race
-   * resend without reading the count again.
+   * record would take the records after the checkpoint past {@code maxBytes}.
    */
   static CompactionPolicy limits(int maxRecords, long maxBytes) {
-    return (records, bytes, recordBytes) -> records >= maxRecords || bytes + recordBytes > maxBytes;
+    return limits(maxRecords, maxBytes, SizeBasis.TAIL);
+  }
+
+  /**
+   * Compacts once the log holds {@code maxRecords} intention records (0: every commit), or the
+   * record would take what {@code basis} counts past {@code maxBytes}. Both are soft: writers that
+   * lose an append race resend without reading the count again.
+   */
+  static CompactionPolicy limits(int maxRecords, long maxBytes, SizeBasis basis) {
+    return log -> {
+      long bytes = basis == SizeBasis.TAIL ? log.tailBytes() : log.logBytes();
+      return log.intentionRecords() >= maxRecords || bytes + log.recordBytes() > maxBytes;
+    };
   }
 }

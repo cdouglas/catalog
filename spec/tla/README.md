@@ -127,7 +127,7 @@ Line numbers are of `LogRuntime.java` at 7e056b3 unless stated. `TestLogRuntime`
 | `Write` (APPEND) | `log.append` :426, `write` :582 | all |
 | `Write` with `SegOK` false | `catch LogFullException` :427 (Bug 66) | MW, fault (segment limits drawn) |
 | `Write` with faults | `write` :582; the store's signals mapped by `AtomicFileLog.write` | MW, fault (`InMemoryAtomicFileIO.Fault`) |
-| `ReadBack` | `write`'s `readThrough` :613, `validate` :720 | all; strict versions: MW, fault |
+| `ReadBack` | `write`'s `readThrough` :613, `validate` :720; `AtomicFileLog` answers it from the write when the write says what the object holds (a replace; an append from a tail whose bytes it read or wrote), with no request: the same view, since every write gives the object a version of its own (errata D20) | all; strict versions: MW, fault |
 | `Rebase` | `catch LogConflictException` :403 and the read after it :411 | all |
 | `Refresh` | `catch LogConflictException` :434, `probe().continues` :440 | all |
 | `Shrink` | the read when the log was replaced :444 | MW |

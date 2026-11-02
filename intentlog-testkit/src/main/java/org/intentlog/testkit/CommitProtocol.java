@@ -170,7 +170,7 @@ public final class CommitProtocol {
       this.retentionMs = retentionMs;
       this.compactorAheadMs = compactorAheadMs;
       this.policy = maxRecords < 0
-          ? (records, bytes, recordBytes) -> false
+          ? log -> false
           : CompactionPolicy.limits(maxRecords, 1 << 20);
       this.policyName = maxRecords < 0 ? "never" : "every " + maxRecords + " records";
     }

@@ -63,6 +63,13 @@ import org.intentlog.wire.ProtoWire;
  * append (GCS, or a store whose {@code supportsAppend()} is false) commits by replace only, and a
  * record too large for one append to the store ({@code maxAppendBytes}, less the record's length
  * prefix: {@link Capabilities#maxRecordBytes}) goes in a replace.
+ *
+ * <p>A read through a write reads nothing when the write says what the object holds: a replace
+ * holds what it wrote, and an append conditioned on a tail whose bytes this log read or wrote holds
+ * those bytes and the record (errata D20). The condition names the version the tail is bound to,
+ * which no write since can have left in place (each write lands a record with an id of its own, so
+ * no version recurs); a read of the object between the lookup that bound it and the append read
+ * that version. An append from a tail that only {@link #probe} found reads the object back.
  */
 public final class AtomicFileLog implements SharedLog {
 
@@ -111,7 +118,8 @@ public final class AtomicFileLog implements SharedLog {
 
   @Override
   public LogView readThrough(Receipt receipt, Duration wait) {
-    return parse(((FileReceipt) receipt).written);
+    FileReceipt written = (FileReceipt) receipt;
+    return written.view != null ? written.view : parse(written.written);
   }
 
   @Override
@@ -136,12 +144,40 @@ public final class AtomicFileLog implements SharedLog {
     }
     ByteArrayOutputStream out = new ByteArrayOutputStream(record.length + 5);
     frame(out, record);
-    return write(fileOf(expected), out.toByteArray(), AtomicOutputFile.Strategy.APPEND);
+    byte[] frame = out.toByteArray();
+    FileTail at = (FileTail) expected;
+    InputFile written = write(at.file, frame, AtomicOutputFile.Strategy.APPEND);
+    FileView before = at.view;
+    if (before == null) {
+      return new FileReceipt(written, null); // the bytes at the tail are unknown: read them back
+    }
+    List<byte[]> records = new ArrayList<>(before.records.size() + 1);
+    records.addAll(before.records);
+    records.add(record);
+    long length = at.length + frame.length;
+    return new FileReceipt(
+        written, view(written, length, before.checkpoint, Collections.unmodifiableList(records)));
   }
 
+  /**
+   * Replaces the object. The log keeps {@code checkpoint} and {@code records} as the view a read
+   * through the write returns: the caller must not change them.
+   */
   @Override
   public Receipt replace(LogTail expected, byte[] checkpoint, List<byte[]> records) {
-    return write(fileOf(expected), encode(checkpoint, records), AtomicOutputFile.Strategy.CAS);
+    byte[] bytes = encode(checkpoint, records);
+    InputFile written = write(fileOf(expected), bytes, AtomicOutputFile.Strategy.CAS);
+    return new FileReceipt(written, view(written, bytes.length, checkpoint, List.copyOf(records)));
+  }
+
+  /** The view of {@code file}: {@code length} bytes, holding {@code checkpoint} and {@code records}. */
+  private static FileView view(
+      InputFile file, long length, byte[] checkpoint, List<byte[]> records) {
+    FileTail tail = new FileTail(file);
+    tail.length = length;
+    FileView view = new FileView(tail, checkpoint, records);
+    tail.view = view;
+    return view;
   }
 
   /** The object a replace writes: the header, {@code checkpoint}, and {@code records} after it. */
@@ -171,8 +207,9 @@ public final class AtomicFileLog implements SharedLog {
    * Writes {@code bytes} conditioned on {@code current}, mapping the store's signals onto the
    * log's: a throttle, a failed condition (a CAS conflict or a lost append race), a full object.
    * A failure to prepare the write sent nothing; any other failure leaves its outcome unknown.
+   * Returns the version written.
    */
-  private Receipt write(InputFile current, byte[] bytes, AtomicOutputFile.Strategy strategy) {
+  private InputFile write(InputFile current, byte[] bytes, AtomicOutputFile.Strategy strategy) {
     AtomicOutputFile out;
     CAS token;
     ByteArrayInputStream source = new ByteArrayInputStream(bytes);
@@ -185,7 +222,7 @@ public final class AtomicFileLog implements SharedLog {
       throw new LogNotSentException(strategy + " write to " + location + " failed: " + e, e);
     }
     try {
-      return new FileReceipt(out.writeAtomic(token, () -> source));
+      return out.writeAtomic(token, () -> source);
     } catch (SupportsAtomicOperations.StorageThrottleException e) {
       throw new LogThrottledException("Storage throttled a write to " + location, e);
     } catch (SupportsAtomicOperations.SegmentLimitException e) {
@@ -198,6 +235,13 @@ public final class AtomicFileLog implements SharedLog {
   }
 
   private LogView parse(InputFile file) {
+    // The bytes read must be no older than the version the tail binds, as a replace from the view
+    // already needs: InMemoryAtomicFileIO binds the version as it opens the stream and reads its
+    // bytes; S3's stream opens lazily, after the lookup (getLength) binds the version, and reads
+    // it or a later one (errata T6). An append conditioned on the version lands only if no write
+    // came after the lookup, so the bytes read were the version's, and the view the append's
+    // receipt holds is the object (D20). (Looking up before opening would make a store that reads
+    // by version fail a read a write raced, where opening first reads the version it binds.)
     byte[] bytes;
     try (SeekableInputStream in = file.newStream()) {
       bytes = readFully(in, (int) file.getLength());
@@ -206,10 +250,12 @@ public final class AtomicFileLog implements SharedLog {
     }
     FileTail tail = new FileTail(file);
     tail.length = bytes.length;
-    return decode(bytes, tail);
+    FileView view = decode(bytes, tail);
+    tail.view = view;
+    return view;
   }
 
-  private static LogView decode(byte[] bytes, LogTail tail) {
+  private static FileView decode(byte[] bytes, LogTail tail) {
     if (bytes.length < HEADER_SIZE) {
       throw new IllegalStateException("A catalog file of " + bytes.length + " bytes has no header");
     }
@@ -269,14 +315,21 @@ public final class AtomicFileLog implements SharedLog {
   private static final class FileTail implements LogTail {
     private final InputFile file;
     private long length = -1;
+    // The frames of the version, if this log read or wrote them; null for a tail a probe found
+    private FileView view;
 
     FileTail(InputFile file) {
       this.file = file;
     }
 
+    /**
+     * Whether the object existed at this tail. A tail whose bytes the log read or wrote saw it; the
+     * store is not asked again, since it may answer for its version now (GCS looks up the
+     * generation a write returned, which a later write removes).
+     */
     @Override
     public boolean exists() {
-      return file.exists();
+      return view != null || file.exists();
     }
 
     @Override
@@ -344,12 +397,17 @@ public final class AtomicFileLog implements SharedLog {
     }
   }
 
-  /** The version a write wrote, which a read through it reads. */
+  /**
+   * The version a write wrote, and the view of it if the write says what it holds; else a read
+   * through the write reads it.
+   */
   private static final class FileReceipt implements Receipt {
     private final InputFile written;
+    private final FileView view;
 
-    FileReceipt(InputFile written) {
+    FileReceipt(InputFile written, FileView view) {
       this.written = written;
+      this.view = view;
     }
   }
 }

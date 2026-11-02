@@ -58,7 +58,7 @@ class TestSharedLogRuntime {
 
   private static final EntityVersionsMachine MACHINE = EntityVersionsMachine.INSTANCE;
   private static final long NO_GC = Long.MAX_VALUE;
-  private static final CompactionPolicy NEVER = (records, bytes, recordBytes) -> false;
+  private static final CompactionPolicy NEVER = log -> false;
 
   /** Scripted faults, for the writer under test only: hooks that run other writers pause them. */
   private static final class Script implements InMemorySharedLog.Interceptor {

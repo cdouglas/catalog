@@ -413,7 +413,8 @@ MB on a store that appends (at the default retention, the committed set alone
 reaches 2.5 MB at 10 commits a second, D16), or a benchmark profile that
 prices a GET by its bytes.
 catalog-bench's `s3x-2026-11` profile (measured, 7 ms a MiB read) now prices
-it, and a commit pays it four times (D20).
+it, and a commit paid it four times (D20); twice since D20's fix (its load and
+the refresh before it applies), which ranged reads would make once.
 
 ### D16. Replay rewrites the whole committed set, and every checkpoint carries it
 
@@ -592,8 +593,20 @@ design with paging:
   together bound both the write amplification and every read's cost (D15,
   D20).
 
-**Trigger to revisit:** next after D20; a catalog whose checkpoint approaches
-`max.append.size`.
+**Stopgap, 2026-11-02 (docs/CHECKPOINT_PLAN.md R0.1):** the policy sees the
+checkpoint's size apart from the log's (`CompactionPolicy.Input`, from the
+replica's `checkpointBytes`), and `max.append.size` bounds the records after
+the checkpoint (`fileio.catalog.max.append.size.basis` = `tail`, the default;
+`object` is the behaviour above, kept for ablation). A large checkpoint now
+compacts when its tail reaches the count or the size, not on every commit
+(`TestProtoCommitKnobs`). Compaction itself got cheaper with it: a checkpoint
+writes each inline table unchanged since a decode or an earlier encode as the
+bytes it had (R0.2, `fileio.catalog.checkpoint.memoize`). The checkpoint is
+still unbounded, and every compaction and fresh read still moves it whole:
+paging (R2) is the fix.
+
+**Trigger to revisit:** R2 of docs/CHECKPOINT_PLAN.md (paging), and D14's
+cost-based policy.
 
 ### D20. A commit reads the whole catalog object four times (perf bug)
 
@@ -646,7 +659,49 @@ refresh served from a replica must still see what landed since (a
 conditional or ranged read), and a stale base only costs a retry or a merge,
 since replay judges every record where it lands.
 
-**Trigger to revisit:** now (next); it is a performance bug, not a policy.
+**Fixed (3 and 4), 2026-11-02:** a merge append reads the catalog once, for
+the refresh in `apply` (`TestCommitReads`, in every one-object mode).
+
+- 3: `AtomicFileLog` answers a read through a write from the write when the
+  write says what the object holds: a replace holds what it wrote, and an
+  append conditioned on a tail whose bytes the log read or wrote holds those
+  bytes and the record. The condition names the version the tail is bound
+  to, and no version recurs (each write lands a record with an id of its
+  own), so the append landed on exactly those bytes; on S3, whose reads are
+  not pinned (T6), a read lands between the lookup that bound the version
+  and the append, so it read that version. An append from a tail that only
+  a probe found (a resend after a lost race) reads the object back, as
+  before. `LogRuntime` is unchanged: P3 holds, the view being the log the
+  instant the write landed.
+- 4: `FileIOTableOperations.commit` takes the replica the commit landed in
+  as the table's current state, as Iceberg's REST operations take the
+  metadata a commit returns, instead of requesting a refresh; the fork's
+  `SnapshotProducer.commit` looks the committed snapshot up in
+  `ops.current()` and refreshes only if it is not there. Upstream refreshed
+  there since #15511 (2026-03, the snapshot the catalog committed, not the
+  one staged, decides the cleanup), which brought back the load #14709
+  (2026-02) had removed from `MergingSnapshotProducer.updateEvent` for REST.
+  `current()` after a commit is the table as the catalog committed it on
+  every catalog: a REST commit's response, a metastore catalog's refresh
+  (`requestRefresh`), FileIOCatalog's landed replica (with any merge replay
+  made). A pointer table still reads the metadata file it just wrote, as a
+  metastore catalog does.
+- A commit can now run from the replica a write returned, whose tail names
+  the version the write made. GCS answers `exists()` of such a file by
+  looking that generation up, which a later write removes, so a raced commit
+  took the log for absent and failed as a lost create ("Catalog creation
+  failed"; the emulator's `CatalogTests` conflict tests caught it). A tail now
+  exists if the log read or wrote its bytes, without asking the store
+  (`LogTail.exists` is the tail's, not the object's now), and strict versions
+  in `InMemoryAtomicFileIO` (the fuzzers draw them) look a replaced
+  generation up as GCS does (`TestCommitReads`, `TestAtomicFileLog`).
+
+Still open: 2 needs a read that sees what landed since 1 without reading it
+whole (D15's ranged `readAfter`, or a conditional GET the FileIO API does
+not have), and 1 reads the whole object even for a client that holds a
+replica.
+
+**Trigger to revisit:** D15 (2 and a warm client's 1).
 
 ### D8. Typed-protobuf encoding for Iceberg structural types (skip JSON serde)
 

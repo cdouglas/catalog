@@ -25,6 +25,7 @@ import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.iceberg.io.AtomicOutputFile;
 import org.apache.iceberg.io.InMemoryAtomicFileIO;
 import org.intentlog.LogConflictException;
@@ -165,6 +166,85 @@ class TestAtomicFileLog {
     assertThat(decoded.tail().bytes()).isEqualTo(object.length);
     assertThat(AtomicFileLog.encode(bytes("chk"), List.of(bytes("r1"))))
         .isEqualTo(io.history().get(0).after());
+  }
+
+  /** Counts the read requests that reach the store from now on. */
+  private AtomicInteger countReads() {
+    AtomicInteger reads = new AtomicInteger();
+    io.injectReadFaults(location -> {
+      reads.incrementAndGet();
+      return InMemoryAtomicFileIO.ReadFault.NONE;
+    });
+    return reads;
+  }
+
+  private static void assertSameView(LogView actual, LogView expected) {
+    assertThat(actual.checkpoint().orElseThrow()).isEqualTo(expected.checkpoint().orElseThrow());
+    assertThat(actual.records()).containsExactlyElementsOf(expected.records());
+    assertThat(actual.tail().bytes()).isEqualTo(expected.tail().bytes());
+  }
+
+  @Test
+  void aReadThroughAWriteThatSaysWhatTheObjectHoldsReadsNothing() { // D20
+    LogTail absent = absent(); // a lookup
+    AtomicInteger reads = countReads();
+    LogView created =
+        log.readThrough(log.replace(absent, bytes("chk"), List.of(bytes("r1"))), Duration.ZERO);
+    LogView appended = log.readThrough(log.append(bytes("r2"), created.tail()), Duration.ZERO);
+    LogView again = log.readThrough(log.append(bytes("r3"), appended.tail()), Duration.ZERO);
+    LogView replaced =
+        log.readThrough(log.replace(again.tail(), bytes("c2"), List.of(bytes("r4"))), Duration.ZERO);
+    assertThat(reads).hasValue(0);
+
+    assertThat(again.records()).extracting(TestAtomicFileLog::string)
+        .containsExactly("r1", "r2", "r3");
+    assertThat(string(replaced.checkpoint().orElseThrow())).isEqualTo("c2");
+    // Each view is the object its write left, and its tail conditions the next write on it
+    LogView fresh = log.read();
+    assertSameView(replaced, fresh);
+    log.append(bytes("r5"), replaced.tail());
+    assertThat(log.read().records()).extracting(TestAtomicFileLog::string)
+        .containsExactly("r4", "r5");
+  }
+
+  @Test
+  void aReadThroughAnAppendAtAProbedTailReadsTheObject() { // D20
+    LogView created = create();
+    log.append(bytes("r2"), created.tail());
+    AtomicInteger reads = countReads();
+    LogTail probed = log.probe();
+    LogView appended = log.readThrough(log.append(bytes("r3"), probed), Duration.ZERO);
+    assertThat(reads.get()).isGreaterThan(1);
+    assertThat(appended.records()).extracting(TestAtomicFileLog::string)
+        .containsExactly("r1", "r2", "r3");
+    assertSameView(appended, log.read());
+  }
+
+  @Test
+  void aTailAWriteMadeExistsAfterALaterWrite() { // D20
+    // A store that looks a generation up (GCS) finds none once a later write replaced it; the
+    // tail saw the object, and a write from it conflicts rather than creating the log
+    io.failSupersededReads(true);
+    LogView created = create();
+    LogView appended = log.readThrough(log.append(bytes("r2"), created.tail()), Duration.ZERO);
+    LogView read = log.read();
+    log.replace(log.read().tail(), bytes("c2"), List.of());
+    assertThat(created.tail().exists()).isTrue();
+    assertThat(appended.tail().exists()).isTrue();
+    assertThat(read.tail().exists()).isTrue();
+    assertThatThrownBy(() -> log.append(bytes("r3"), appended.tail()))
+        .isInstanceOf(LogConflictException.class);
+  }
+
+  @Test
+  void anAppendFromAReadThatLostTheRaceKnowsNothing() { // D20
+    LogView created = create();
+    LogView read = log.read();
+    log.append(bytes("r2"), created.tail());
+    assertThatThrownBy(() -> log.append(bytes("r3"), read.tail()))
+        .isInstanceOf(LogConflictException.class);
+    assertThat(log.read().records()).extracting(TestAtomicFileLog::string)
+        .containsExactly("r1", "r2");
   }
 
   @Test

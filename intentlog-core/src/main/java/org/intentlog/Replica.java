@@ -31,6 +31,8 @@ public final class Replica<S> {
   private final LogTail tail;
   private final long intentionRecords;
   private final UUID logId;
+  // The size of the checkpoint the records follow (0 for a log not yet created)
+  private final long checkpointBytes;
   // The whole view (a checkpoint and every record after it) this replica is the replay of, if a
   // runtime replayed it from one: a later read whose view continues it byte for byte replays only
   // the records after it (LogRuntime#replay).
@@ -38,17 +40,18 @@ public final class Replica<S> {
 
   public Replica(
       S state, CommittedSet committed, LogTail tail, long intentionRecords, UUID logId) {
-    this(state, committed, tail, intentionRecords, logId, null);
+    this(state, committed, tail, intentionRecords, logId, 0L, null);
   }
 
   Replica(
       S state, CommittedSet committed, LogTail tail, long intentionRecords, UUID logId,
-      LogView view) {
+      long checkpointBytes, LogView view) {
     this.state = state;
     this.committed = committed;
     this.tail = tail;
     this.intentionRecords = intentionRecords;
     this.logId = logId;
+    this.checkpointBytes = checkpointBytes;
     this.view = view;
   }
 
@@ -74,6 +77,14 @@ public final class Replica<S> {
   /** The log's id, which its checkpoints carry. */
   public UUID logId() {
     return logId;
+  }
+
+  /**
+   * The size of the checkpoint the intention records follow: with {@link LogTail#bytes}, what
+   * the size knob compares (errata D19).
+   */
+  public long checkpointBytes() {
+    return checkpointBytes;
   }
 
   /** The whole view this is the replay of, or null. */

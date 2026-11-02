@@ -29,9 +29,28 @@ import org.intentlog.StateMachine;
 final class CatalogStateMachine
     implements StateMachine<CatalogState, CatalogState.Builder, ProtoCodec.CatalogIntention> {
 
-  static final CatalogStateMachine INSTANCE = new CatalogStateMachine();
+  /** The state machine without a memo: every checkpoint encodes every table. */
+  static final CatalogStateMachine INSTANCE = new CatalogStateMachine(null);
 
-  private CatalogStateMachine() {}
+  // The encodings of inline tables a checkpoint may write again, or null (CheckpointMemo)
+  private final CheckpointMemo memo;
+
+  private CatalogStateMachine(CheckpointMemo memo) {
+    this.memo = memo;
+  }
+
+  /**
+   * A state machine for one catalog: with its own {@link CheckpointMemo} if {@code memoize}, else
+   * {@link #INSTANCE}.
+   */
+  static CatalogStateMachine forCatalog(boolean memoize) {
+    return memoize ? new CatalogStateMachine(new CheckpointMemo()) : INSTANCE;
+  }
+
+  /** This machine's memo, or null. */
+  CheckpointMemo memo() {
+    return memo;
+  }
 
   @Override
   public CatalogState.Builder empty() {
@@ -41,7 +60,7 @@ final class CatalogStateMachine
   @Override
   public CatalogState.Builder decodeCheckpoint(byte[] state) {
     CatalogState.Builder builder = CatalogState.builder();
-    ProtoCodec.decodeCheckpointState(state, builder);
+    ProtoCodec.decodeCheckpointState(state, builder, memo);
     return builder;
   }
 
@@ -53,7 +72,7 @@ final class CatalogStateMachine
 
   @Override
   public byte[] encodeCheckpoint(CatalogState state) {
-    return ProtoCodec.encodeCheckpointState(state);
+    return ProtoCodec.encodeCheckpointState(state, memo);
   }
 
   @Override

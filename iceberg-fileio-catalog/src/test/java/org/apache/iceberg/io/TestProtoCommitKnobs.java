@@ -185,12 +185,71 @@ public class TestProtoCommitKnobs {
     return current;
   }
 
-  /** Asserts that {@code policy} compacts at {@code maxRecords} records or {@code maxBytes}. */
+  private static CompactionPolicy.Input log(
+      long records, long checkpointBytes, long logBytes, int recordBytes) {
+    return new CompactionPolicy.Input(records, checkpointBytes, logBytes, recordBytes);
+  }
+
+  /**
+   * Asserts that {@code policy} compacts at {@code maxRecords} records, or when a record would
+   * take the records after the checkpoint past {@code maxBytes}, however large the checkpoint
+   * (errata D19).
+   */
   private static void assertLimits(CompactionPolicy policy, int maxRecords, long maxBytes) {
-    assertThat(policy.due(maxRecords - 1, 0, 0)).isFalse();
-    assertThat(policy.due(maxRecords, 0, 0)).isTrue();
-    assertThat(policy.due(0, maxBytes - 1, 1)).isFalse();
-    assertThat(policy.due(0, maxBytes, 1)).isTrue();
+    assertThat(policy.due(log(maxRecords - 1, 0, 0, 0))).isFalse();
+    assertThat(policy.due(log(maxRecords, 0, 0, 0))).isTrue();
+    assertThat(policy.due(log(0, 0, maxBytes - 1, 1))).isFalse();
+    assertThat(policy.due(log(0, 0, maxBytes, 1))).isTrue();
+    // A checkpoint past the bound leaves the records' room
+    assertThat(policy.due(log(0, 2 * maxBytes, 2 * maxBytes + maxBytes - 1, 1))).isFalse();
+    assertThat(policy.due(log(0, 2 * maxBytes, 3 * maxBytes, 1))).isTrue();
+  }
+
+  /**
+   * Once the checkpoint is past {@code max.append.size}, small commits append by the tail basis,
+   * and each compacts (a CAS of the whole object) by the object basis (errata D19).
+   */
+  @org.junit.jupiter.params.ParameterizedTest
+  @org.junit.jupiter.params.provider.ValueSource(strings = {"tail", "object"})
+  void aCheckpointPastTheSizeBoundCompactsEveryCommitOnlyByTheObjectBasis(String basis) {
+    InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+    FileIOCatalog catalog = LocalCatalogMode.APPEND.catalog(io, "mem:///wh", "c",
+        Map.of(LogCatalogProperties.MAX_APPEND_COUNT, "100",
+            LogCatalogProperties.MAX_APPEND_SIZE, "1024",
+            LogCatalogProperties.MAX_APPEND_SIZE_BASIS, basis));
+    // Records whose state outgrows the bound: their tail compacts it into the checkpoint
+    for (int i = 0; i < 5; i++) {
+      catalog.createNamespace(Namespace.of("big" + i), Map.of("k", "v".repeat(400)));
+    }
+    java.util.List<AtomicOutputFile.Strategy> writes =
+        io.conditionalWrites().get("mem:///wh/catalog-c");
+    assertThat(writes).contains(AtomicOutputFile.Strategy.CAS);
+    int before = writes.size();
+    for (int i = 0; i < 3; i++) {
+      catalog.createNamespace(Namespace.of("small" + i));
+    }
+    java.util.List<AtomicOutputFile.Strategy> after =
+        io.conditionalWrites().get("mem:///wh/catalog-c").subList(before, before + 3);
+    assertThat(after).containsOnly(basis.equals("tail")
+        ? AtomicOutputFile.Strategy.APPEND
+        : AtomicOutputFile.Strategy.CAS);
+  }
+
+  @Test
+  void theObjectBasisBoundsTheWholeLog() { // errata D19, for ablation
+    Map<String, String> props = new HashMap<>();
+    props.put(LogCatalogProperties.MAX_APPEND_COUNT, "100");
+    props.put(LogCatalogProperties.MAX_APPEND_SIZE, "4096");
+    props.put(LogCatalogProperties.MAX_APPEND_SIZE_BASIS, "object");
+    CompactionPolicy policy = LogCatalogProperties.runtimeConfig(props).compaction();
+    assertThat(policy.due(log(0, 4096, 4096, 1))).isTrue();
+    assertThat(policy.due(log(0, 0, 4095, 1))).isFalse();
+    assertThat(policy.due(log(100, 0, 0, 0))).isTrue();
+    props.put(LogCatalogProperties.MAX_APPEND_SIZE_BASIS, "whole");
+    org.assertj.core.api.Assertions.assertThatThrownBy(
+            () -> LogCatalogProperties.runtimeConfig(props))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining(LogCatalogProperties.MAX_APPEND_SIZE_BASIS);
   }
 
   @Test

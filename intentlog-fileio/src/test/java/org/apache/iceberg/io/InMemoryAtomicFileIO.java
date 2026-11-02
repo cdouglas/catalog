@@ -49,7 +49,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
  * {@code writeOffsetBytes}; from a snapshot that has seen no version it looks the object up first,
  * and extends the version it finds if that is still the live one. With {@link
  * #failSupersededReads}, reading a bound generation that a later write replaced fails instead of
- * returning its bytes, as on real storage: GCS reads by generation, and S3 and ADLS with If-Match.
+ * returning its bytes, as on real storage: GCS reads by generation, and S3 and ADLS with If-Match;
+ * and looking it up ({@code exists}) finds nothing, as GCS's lookup of a generation does.
  *
  * <p>Plain {@link OutputFile} writes are unconditional, as for table metadata and data files.
  *
@@ -286,7 +287,9 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
 
   /**
    * Whether reading a bound generation that a later write replaced fails ({@link
-   * NotFoundException}), as on real storage, instead of returning the replaced bytes.
+   * NotFoundException}), as on real storage, instead of returning the replaced bytes; and whether
+   * {@code exists()} of such a file is false, as GCS answers a lookup of a generation (the input
+   * file a GCS write returns names the generation it wrote).
    */
   public void failSupersededReads(boolean fail) {
     this.failSupersededReads = fail;
@@ -525,7 +528,11 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
 
     @Override
     public boolean exists() {
-      return lookUp() != null;
+      Version v = lookUp();
+      if (v != null && failSupersededReads && objects.get(location) != v) {
+        return false; // a lookup of the generation, which a later write replaced
+      }
+      return v != null;
     }
   }
 

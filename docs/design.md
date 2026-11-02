@@ -688,7 +688,10 @@ crosses either threshold (`CompactionPolicy.limits`):
 
 - the read the commit staged on holds at least `max.append.count`
   intention records after its checkpoint (GC records not counted), or
-- the record would take the log past `max.append.size` bytes.
+- the record would take the records after the checkpoint past
+  `max.append.size` bytes (with `max.append.size.basis` `object`, the
+  whole log, as before errata D19's stopgap: a checkpoint past it then
+  compacts on every commit).
 
 No on-disk hint is needed. Atomic append + atomic CAS at the storage
 layer are sufficient to linearize commits, and either writer in a race
@@ -797,9 +800,10 @@ once, and on a store that only replaces, most lose again, each loss a
 read of the whole object: at 32 writers on an S3 general-purpose bucket,
 a committed operation lost 13.7 races on average.
 
-The default `max.append.size = 16 MiB` is a soft target. Larger catalogs
-mean longer reads on every load; tune down for read-heavy workloads, up
-for write-heavy.
+The default `max.append.size = 16 MiB` is a soft target for the records
+after the checkpoint: what a reader replays and a compaction rewrites
+beyond the checkpoint. It no longer bounds the checkpoint, whose size is
+the catalog's (docs/CHECKPOINT_PLAN.md pages it).
 
 ### Inline TM only vs TM+ML
 

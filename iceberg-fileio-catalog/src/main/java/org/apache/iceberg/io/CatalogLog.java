@@ -42,6 +42,7 @@ import org.intentlog.SharedLog;
 public final class CatalogLog {
 
   private final SharedLog log;
+  private final CatalogStateMachine machine;
   private final LogRuntime<CatalogState, CatalogState.Builder, ProtoCodec.CatalogIntention> runtime;
   // The newest replica this catalog has read or committed in. A read of a log whose reads lag
   // (a replica behind its appends) serves it instead when the read is behind it, so a reader
@@ -51,8 +52,17 @@ public final class CatalogLog {
   private final CommitCounts counts = new CommitCounts();
 
   public CatalogLog(SharedLog log, RuntimeConfig config) {
+    this(log, config, LogCatalogProperties.DEFAULT_CHECKPOINT_MEMOIZE);
+  }
+
+  /**
+   * A catalog log whose checkpoints write the inline tables that have not changed as the bytes
+   * they had, if {@code memoizeCheckpoints} ({@link LogCatalogProperties#CHECKPOINT_MEMOIZE}).
+   */
+  public CatalogLog(SharedLog log, RuntimeConfig config, boolean memoizeCheckpoints) {
     this.log = log;
-    this.runtime = new LogRuntime<>(log, CatalogStateMachine.INSTANCE, config);
+    this.machine = CatalogStateMachine.forCatalog(memoizeCheckpoints);
+    this.runtime = new LogRuntime<>(log, machine, config);
   }
 
   /**
@@ -129,6 +139,11 @@ public final class CatalogLog {
       counts.unknown.increment();
       throw new CommitStateUnknownException(e.getCause());
     }
+  }
+
+  /** The memo of this catalog's checkpoint encodings, or null if it keeps none. */
+  CheckpointMemo checkpointMemo() {
+    return machine.memo();
   }
 
   /** How this catalog's commits ended, since it opened its log. */
