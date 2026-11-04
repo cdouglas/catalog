@@ -692,6 +692,40 @@ public class CatalogState {
       return this;
     }
 
+    private static final boolean POOL_CHECK = Boolean.getBoolean("fileio.catalog.replay.check");
+
+    /** Whether two manifest list entries agree in every field. */
+    static boolean samePoolEntry(ManifestFile a, ManifestFile b) {
+      return poolEntry(a).equals(poolEntry(b));
+    }
+
+    /** Every field of a manifest list entry. */
+    static String poolEntry(ManifestFile m) {
+      StringBuilder partitions = new StringBuilder("[");
+      if (m.partitions() != null) {
+        for (ManifestFile.PartitionFieldSummary p : m.partitions()) {
+          partitions.append(String.format("(null=%s nan=%s lower=%s upper=%s)",
+              p.containsNull(), p.containsNaN(), hex(p.lowerBound()), hex(p.upperBound())));
+        }
+      }
+      partitions.append(']');
+      return String.format(
+          "path=%s length=%d spec=%d content=%s seq=%d min-seq=%d snapshot=%s"
+              + " files=%s/%s/%s rows=%s/%s/%s partitions=%s key=%s first-row-id=%s",
+          m.path(), m.length(), m.partitionSpecId(), m.content(), m.sequenceNumber(),
+          m.minSequenceNumber(), m.snapshotId(), m.addedFilesCount(), m.existingFilesCount(),
+          m.deletedFilesCount(), m.addedRowsCount(), m.existingRowsCount(),
+          m.deletedRowsCount(), m.partitions() == null ? null : partitions,
+          hex(m.keyMetadata()), m.firstRowId());
+    }
+
+    private static String hex(java.nio.ByteBuffer buffer) {
+      if (buffer == null) {
+        return null;
+      }
+      return java.util.HexFormat.of().formatHex(org.apache.iceberg.util.ByteBuffers.toByteArray(buffer));
+    }
+
     /** The table's manifest pool, which a change replaces. */
     private PersistentMap<String, ManifestFile> pool(int tblId) {
       Map<String, ManifestFile> pool = manifestPool.get(tblId);
@@ -710,6 +744,13 @@ public class CatalogState {
       ManifestFile replaced = pool.get(manifest.path());
       manifestPool.put(tblId, pool.plus(manifest.path(), manifest));
       if (replaced != null && replaced != manifest) {
+        // A pooled path's entry never changes (docs/CHECKPOINT_PLAN.md decision 3): the lists
+        // that name it share it. Checked under the replay check until replay enforces it.
+        if (POOL_CHECK && !samePoolEntry(replaced, manifest)) {
+          throw new AssertionError(String.format(
+              "table %d restates pooled manifest %s: %s -> %s",
+              tblId, manifest.path(), poolEntry(replaced), poolEntry(manifest)));
+        }
         poolReplacements.merge(tblId, 1L, Long::sum);
       }
       return this;
