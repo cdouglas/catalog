@@ -207,25 +207,48 @@ D20 (four reads per commit) cost goes with it.
 
 ## Ablation switches
 
-For the paper's ablations, R0's changes each have a switch to the behaviour
-before them (D20's fix, four reads per commit, has none yet):
+For the paper's ablations, the optimizations it reports each have a switch to
+the behaviour before them, to show what each contributes. Fixes of redundant
+work get none (decided 2026-11-03): D20's (four reads per commit) has no switch,
+since redundant calls are removed for every catalog the benchmark compares (a
+change in the client code they share reaches all of them, and a safe change of
+the same kind in a baseline's driver is made there too and stated in the paper;
+catalog-bench docs/DESIGN.md).
 
 | Property | Default | Before | Change |
 |---|---|---|---|
 | `fileio.catalog.max.append.size.basis` | `tail` | `object` | R0.1, D19 (whole-object compaction trigger) |
 | `fileio.catalog.checkpoint.memoize` | `true` | `false` | R0.2 |
 
-## Decisions open
+## Decisions
 
-1. Does replay ever read a page? Recommended: no. Records then carry what
-   replay needs of sealed history, expiry applies natively (tombstones,
-   rewritten at compaction) instead of through Iceberg's builder, and a window
-   reaching into a sealed block conflicts (stable under S2, since blocks only
-   become sealed). Loads and compaction read pages; replay does not.
-2. Page GC: one-way sealing with a floor, or a grace-period sweep.
-3. Whether an inline-ML pool is a pure dedup dictionary (entries for one path
-   never differ, SPEC_ML.md:147-151), which would let blocks copy entries and
-   let encode drop unreferenced ones; `CatalogState` counts same-path
-   replacements (:700-707), so this needs checking.
+1. **Replay never reads a page** (decided 2026-11-03). No part of the
+   checkpoint's encoding depends on anything paged out: replay is a function
+   of the root and the records. Records carry what replay needs of sealed
+   history, expiry applies natively (tombstones, rewritten at compaction)
+   instead of through Iceberg's builder, and a window reaching into a sealed
+   block conflicts (stable under S2, since blocks only become sealed). Loads
+   and compaction read pages; replay does not. The format ages out old
+   snapshots and transaction ids (the committed set, COMMITTED_PAGING.md), and
+   evicts tables untouched for a while to pointers. What moves a table out of
+   the root is a record, as an eviction is today, so a record staged on the
+   table before it does not apply under any encoding: replay never resolves
+   the pointer to validate it
+   (`TestConflictAttribution.aRecordOnATableEvictedBeforeItLandsDoesNotApply`).
+2. **Page GC**: one-way sealing with a floor, or a grace-period sweep. Open;
+   COMMITTED_PAGING.md is under review (2026-11-03).
+3. **The inline-ML pool is a pure dedup dictionary** (decided 2026-11-03):
+   once a path is pooled its entry never changes, and replay enforces it (a
+   record that re-adds a pooled path with another entry does not apply). This
+   lets blocks copy the entries their lists name and encode drop the ones no
+   list names. Today writers keep it (an entry that would change, the row ids
+   the first v3 commit gives kept manifests, evicts the table:
+   `restatesAManifest`), but replay replaces a re-added path's entry without
+   comparing (`CatalogState.Builder.addManifestToPool`), and
+   `poolReplacements` counts replacements by identity, equal entries
+   included. First an experiment: under the replay check,
+   `addManifestToPool` asserts every replacement is field-equal. The unit
+   suite (2,524 tests, 2026-11-03) never broke it; longer fuzzer runs come
+   before replay enforces it.
 
 Decided (2026-11-02): R0 now, with a switch for each change.

@@ -41,6 +41,8 @@ import org.intentlog.LogView;
 import org.intentlog.Replay;
 import org.intentlog.fileio.AtomicFileLog;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * Conflicts by their reason: a writer's catalog counts each conflict under the reason replay or its
@@ -57,19 +59,24 @@ class TestConflictAttribution {
 
   private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
 
-  private LogCatalog writer(String encoding) {
-    return LocalCatalogMode.APPEND_ML.catalog(
-        io, WAREHOUSE, "c", Map.of(LogCatalogProperties.CONFLICT_ENCODING, encoding));
+  private LogCatalog writer(String encoding, Map<String, String> props) {
+    Map<String, String> all = new TreeMap<>(props);
+    all.put(LogCatalogProperties.CONFLICT_ENCODING, encoding);
+    return LocalCatalogMode.APPEND_ML.catalog(io, WAREHOUSE, "c", all);
   }
 
   /** A's and B's catalogs, under {@code encoding}, and the table with two snapshots. */
   private LogCatalog[] writers(String encoding) {
-    LogCatalog a = writer(encoding);
+    return writers(encoding, Map.of());
+  }
+
+  private LogCatalog[] writers(String encoding, Map<String, String> props) {
+    LogCatalog a = writer(encoding, props);
     a.createNamespace(Namespace.of("ns"));
     Table table = a.createTable(ID, SCHEMA);
     table.newFastAppend().appendFile(file("f1")).commit();
     table.newFastAppend().appendFile(file("f2")).commit();
-    return new LogCatalog[] {a, writer(encoding)};
+    return new LogCatalog[] {a, writer(encoding, props)};
   }
 
   private static DataFile file(String name) {
@@ -190,5 +197,50 @@ class TestConflictAttribution {
     assertThat(w[0].log().counts().conflicts()).isZero();
     assertThat(reasons(w[0])).isEmpty();
     assertThat(rejectedInTheLog()).isEmpty();
+  }
+
+  /** {@code length} characters that no codec compresses below the inline update limit. */
+  private static String incompressible(int length) {
+    java.util.Random random = new java.util.Random(length);
+    StringBuilder value = new StringBuilder(length);
+    for (int i = 0; i < length; i++) {
+      value.append((char) ('!' + random.nextInt(90)));
+    }
+    return value.toString();
+  }
+
+  /**
+   * A record staged on an inline table that another writer evicts before the record lands (moves
+   * it out of inline storage to a metadata file: here a property too big for the inline update
+   * limit) does not apply, under any encoding: an eviction is a record, which changes the whole
+   * table (every concern), and no record merges onto a pointer table. Replay decides it from the
+   * log alone and never reads the metadata file the table now names (this test's replay has no
+   * FileIO). Iceberg's retry then commits on the pointer table. docs/CHECKPOINT_PLAN.md keeps this
+   * for pages: what moves a table out of the root is a record, and a record whose base predates it
+   * conflicts.
+   */
+  @ParameterizedTest
+  @ValueSource(strings = {LamportEncoding.NAME, LamportMinusPropertiesEncoding.NAME,
+      ConcernVectorEncoding.NAME, BlindAppendEncoding.NAME, PartitionVectorEncoding.NAME,
+      ManifestWindowEncoding.NAME})
+  void aRecordOnATableEvictedBeforeItLandsDoesNotApply(String encoding) {
+    LogCatalog[] w = writers(encoding, Map.of(LogCatalog.INLINE_MAX_UPDATE_SIZE, "2048"));
+    assertThat(w[0].log().read().state().isInlineTable(ID)).isTrue();
+    beforeAsWrite(() -> {
+      w[1].loadTable(ID).updateProperties().set("big", incompressible(3000)).commit();
+      assertThat(w[1].log().read().state().isInlineTable(ID)).as("evicted").isFalse();
+    });
+    w[0].loadTable(ID).newFastAppend().appendFile(file("a")).commit(); // Iceberg's retry commits
+
+    String reason = encoding.equals(LamportEncoding.NAME)
+        ? "whole: lamport" : "whole: a pointer table";
+    assertThat(reasons(w[0])).containsExactly(Map.entry(reason, 1L));
+    assertThat(rejectedInTheLog()).containsExactly(Map.entry(reason, 1L));
+    Table table = writer(encoding, Map.of()).loadTable(ID);
+    assertThat(table.snapshots()).hasSize(3);
+    assertThat(table.currentSnapshot().addedDataFiles(io))
+        .extracting(DataFile::location)
+        .containsExactly(file("a").location());
+    assertThat(table.properties()).containsKey("big");
   }
 }
