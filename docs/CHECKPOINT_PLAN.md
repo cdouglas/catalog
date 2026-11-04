@@ -235,8 +235,13 @@ catalog-bench docs/DESIGN.md).
    table before it does not apply under any encoding: replay never resolves
    the pointer to validate it
    (`TestConflictAttribution.aRecordOnATableEvictedBeforeItLandsDoesNotApply`).
-2. **Page GC**: one-way sealing with a floor, or a grace-period sweep. Open;
-   COMMITTED_PAGING.md is under review (2026-11-03).
+2. **Page GC**: one-way sealing with a floor, or a grace-period sweep. For
+   the committed set, one-way (2026-11-04): an id is a commit's, so its
+   block retires. A sealed block never reopens and the floor only rises; a
+   page is deleted once a GC record passes it, and an orphan once the floor
+   passes its node (COMMITTED_PAGING.md, revised after review). For the
+   state's pages, open, with the design of snapshot paging (R2.1, D18), a
+   document of its own.
 3. **The inline-ML pool is a pure dedup dictionary** (decided 2026-11-03,
    enforced): once a path is pooled its entry never changes. Replay does not
    apply an update that adds a pooled path with another entry

@@ -427,7 +427,9 @@ NTP-synced. That is a deployment requirement, not a correctness invariant: a
 writer behind by more than the retention still mints its id above the horizon
 it read, and a record that lands at or below the horizon is rejected, never
 applied twice or left to fail reads. Skew costs spurious rejections and
-unknown outcomes.
+unknown outcomes. Nothing bounds a stamp from above, so a clock far ahead
+costs more: its ids stay until the clocks reach them, and its compactions can
+move the horizon ahead of every clock (errata D21).
 
 **Tests.** `TestCommittedSetGc` (intentlog-core) checks the set's rewrite
 (drops at the watermark, a horizon above the newest id kept, a monotonic

@@ -467,7 +467,7 @@ a record applied that was not, and drop it. The fixes, in order:
   [COMMITTED_PAGING.md](COMMITTED_PAGING.md), not built). The horizon splits in
   two: a floor below which replay admits no record, and the horizon below which
   lookups are unknown. The ids between them move to immutable pages, which the
-  checkpoint names by URI. A `PageOut` record seals the oldest block of the set
+  checkpoint names by node and digest. A `PageOut` record seals the oldest block of the set
   and raises the floor; it applies only if the block's digest matches what its
   writer paged. The blocks are the maximal nodes of a binary trie over the ids'
   timestamps holding at most 2^16 ids: deterministic, sized by density, never
@@ -702,6 +702,49 @@ not have), and 1 reads the whole object even for a client that holds a
 replica.
 
 **Trigger to revisit:** D15 (2 and a warm client's 1).
+
+### D21. A commit id's timestamp has no upper bound
+
+A commit's id is a UUIDv7 stamped by its writer's clock, at least one past the
+horizon the writer read (LOG.md, Bug 64). Replay admits a record above the
+horizon however far ahead its stamp is, and a GC record's watermark is its
+writer's clock less the retention. Exactly-once holds whatever the clocks say;
+a clock far ahead costs retention and liveness:
+
+- A record stamped ahead stays in the committed set until the clocks reach
+  its stamp plus the retention.
+- A compactor whose clock is ahead by more than the retention drops the ids of
+  commits in flight: they are rejected, or unknown if a write may have landed.
+- Once such a compactor drops a stamp that is itself ahead (its own earlier
+  commit's), the horizon moves ahead of every clock. Every writer then mints
+  after it, and no other compactor's watermark reaches their ids, so the set
+  grows until the clocks catch up. The horizon cannot come back down, since a
+  lower one would admit copies.
+
+LOG.md ("Clock skew") makes synced clocks a deployment requirement. No test
+runs a writer ahead by more than the retention
+(`TestCatalogRegressions.CommittedSetHorizon` runs one behind).
+COMMITTED_PAGING.md keeps the exposure: its floor follows the oldest block,
+not a clock, but a compactor's ceiling (now less the admission window) does,
+so one far ahead can seal every block but the newest.
+
+Fixes, not built:
+
+- **Bound a writer's clock by the store's.** Every store answers with its time
+  (a response's `Date`, an object's `Last-Modified`). A writer whose clock is
+  ahead of it by more than a bound refuses to commit or compact. This catches
+  skew, the usual cause, but not a writer that stamps ahead on purpose or by a
+  bug.
+- **A bound replay enforces.** Rejecting a record stamped too far ahead needs a
+  time replay can trust and the writer does not choose: a shared log's append
+  time, recorded with the record. One object records none.
+- **GC by log time.** Cap a watermark also at the newest stamp in the
+  compactor's base less the retention, so a compactor whose clock alone is
+  ahead drops nothing younger than the retention. It does not help once
+  stamps ahead are in the base.
+
+**Trigger to revisit:** writers whose clocks one operator does not control, or
+COMMITTED_PAGING.md built.
 
 ### D8. Typed-protobuf encoding for Iceberg structural types (skip JSON serde)
 
