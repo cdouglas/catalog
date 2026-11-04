@@ -543,13 +543,10 @@ computes:
 | far ahead of every clock (errata D21) | applies | COMMITTED |
 
 A writer mints from the drawn stamp: the runtime mints from `RuntimeConfig`'s
-clock, and the test sets it just before the writer stages. The last row's
-oracles check safety only: what a stamp ahead does to the set's size and to H
-is D21's exposure, which the test records rather than asserts.
-
-The generator and the minting clock come first, before any paging. On today's
-format they already cover the rows that do not involve F: above and below H,
-copies, the same ms, and stamps ahead.
+clock, and the test sets it just before the writer stages. The generator is
+there to drive the paging code through its edges, and is built with it; it
+runs against today's horizon too. It does not address D21: the last row checks
+only that a stamp ahead breaks no oracle.
 
 **The set against a reference.** A walk of adds, builds, GCs, PageOuts and
 decodes against a sorted set with pages, as `TestCommittedSetRuns` does for
@@ -662,11 +659,11 @@ replay.
   (LOG.md §"Providers").
 - **The sweep's cadence**, and whether a page store should list by prefix or
   the runtime should track the orphans it made.
-- **How snapshots page** (errata D18): a design of its own (CHECKPOINT_PLAN.md
-  R2), under the same rule that replay never reads a page. The machinery, a
-  floor raised by a record naming an immutable object, may carry over, with a
-  table's sequence numbers in place of the ids' timestamps; what does not is
-  that expiry and tags leave holes in sealed history.
+- **How snapshots page** (errata D18): a design of its own,
+  [SNAPSHOT_PAGING.md](SNAPSHOT_PAGING.md), under the same rule that replay
+  never reads a page. It needs no PageOut: a table's blocks seal by its
+  sequence numbers, which are state, not by a clock, and the root keeps each
+  sealed block's live ids, so expiry's holes need no rewrite.
 - **A bound on stamps** (errata D21). The floor follows the oldest block, not a
   clock, but a compactor's ceiling, now − A, does: one whose clock is far
   ahead can seal every block but the newest.

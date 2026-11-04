@@ -198,7 +198,8 @@ D20 (four reads per commit) cost goes with it.
 
 1. Stable references within a table: lists as deltas of their parent's, with a
    whole list where a block starts, and a pool per block (D18, ML lists stored
-   whole).
+   whole). Designed in [SNAPSHOT_PAGING.md](SNAPSHOT_PAGING.md), with the
+   paging of old snapshots and the replay changes it needs first.
 2. The root and pages: envelope v2, `SharedLog` pages, the committed set paged
    (D16, replay rewrites committed set; COMMITTED_PAGING.md), state pages by
    table and block (D18, D19), page GC, and the TLA+ models extended.
@@ -240,8 +241,9 @@ catalog-bench docs/DESIGN.md).
    block retires. A sealed block never reopens and the floor only rises; a
    page is deleted once a GC record passes it, and an orphan once the floor
    passes its node (COMMITTED_PAGING.md, revised after review). For the
-   state's pages, open, with the design of snapshot paging (R2.1, D18), a
-   document of its own.
+   state's pages, proposed one-way by sequence numbers: a table's page is
+   garbage once every snapshot in it expired or the table is gone, neither of
+   which can be undone ([SNAPSHOT_PAGING.md](SNAPSHOT_PAGING.md), Page GC).
 3. **The inline-ML pool is a pure dedup dictionary** (decided 2026-11-03,
    enforced): once a path is pooled its entry never changes. Replay does not
    apply an update that adds a pooled path with another entry

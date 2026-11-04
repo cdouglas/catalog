@@ -542,6 +542,10 @@ The options:
   older ones, with their lists, in immutable objects the checkpoint points
   to, as D16 proposes for the committed set. A load fetches them only for
   history or time travel.
+- **Designed** in [SNAPSHOT_PAGING.md](SNAPSHOT_PAGING.md) (not built):
+  replay applies snapshot updates and expiry natively on a head without
+  history, lists by ordinal and as deltas, and old snapshots sealed into pages
+  by sequence number, which replay never reads.
 - **Evict by size**: eviction is by update size only
   (`fileio.catalog.inline.max.update.size`), so a table whose deltas fit
   stays inline however large its lists grow. A per-table checkpoint-size
@@ -745,6 +749,28 @@ Fixes, not built:
 
 **Trigger to revisit:** writers whose clocks one operator does not control, or
 COMMITTED_PAGING.md built.
+
+### D22. A format upgrade to v3 evicts an inline-ML table for good
+
+A v3 table gives every data row an id (row lineage). The first commit after
+an upgrade gives each data manifest it keeps, and that had none, a first row
+id (`SnapshotProducer`), so the new snapshot lists that manifest's path with
+an entry that differs from the one the table's pool holds. A pooled path's
+entry never changes (SPEC_ML.md; CHECKPOINT_PLAN.md decision 3), so the
+writer evicts the table instead (`LogCatalog.restatesAManifest`): it writes
+a metadata file and a list file per snapshot, and the table is a pointer from
+then on. Nothing brings a table back inline (SPEC_TM.md). An inline-TM table
+is not affected: its lists are files.
+
+Keeping the table inline would mean restating the pool's entries for the
+kept manifests in one record, and either rewriting the old snapshots' lists
+or letting an entry differ between a snapshot and its successors.
+SNAPSHOT_PAGING.md (not built) changes nothing here: a paged table is evicted
+the same way.
+
+**Trigger to revisit:** v3 upgrades of inline-ML tables in a workload the
+paper measures, or re-inlining tables (a compaction that moves a pointer
+table back).
 
 ### D8. Typed-protobuf encoding for Iceberg structural types (skip JSON serde)
 
