@@ -69,7 +69,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
- * Canaries for the Iceberg core bugs this project's fuzzers and reviews found, C1 to C27 in
+ * Canaries for the Iceberg core bugs this project's fuzzers and reviews found, C1 to C28 in
  * docs/ICEBERG_ISSUES.md: one test each, on Iceberg's own InMemoryCatalog, that asserts the bug is
  * absent. Upstream fixed C1, and the fork's core-fixes branch fixes the others, so every test
  * passes against the fork. A test that fails means its bug is back: a rebase dropped the fork's
@@ -844,6 +844,94 @@ class TestIcebergCoreIssues {
         .as(BACK, "C27")
         .isInstanceOf(NoSuchTableException.class);
     assertThat(metastore).as(BACK, "C27").doesNotContainKey("t");
+  }
+
+  /**
+   * C28. A JDBC commit whose UPDATE committed but whose reply was lost must commit: Iceberg's JDBC
+   * client pool runs a statement again after its connection fails, which then matched no row, and
+   * the CommitFailedException let Iceberg clean up the files of the commit the table now was
+   * (apache/iceberg#18743). JdbcCatalog on SQLite, as Iceberg's own JDBC tests run it.
+   */
+  @Test
+  void aJdbcCommitWhoseReplyIsLostCommits() throws IOException {
+    java.nio.file.Path db = java.nio.file.Files.createTempFile("c28", ".db");
+    boolean[] loseNextReply = {false};
+    org.apache.iceberg.jdbc.JdbcCatalog catalog =
+        new org.apache.iceberg.jdbc.JdbcCatalog(
+            props -> new org.apache.iceberg.inmemory.InMemoryFileIO(),
+            props -> new LostReplyPool(props.get(CatalogProperties.URI), props, loseNextReply),
+            true);
+    catalog.initialize(
+        "c28",
+        Map.of(
+            CatalogProperties.URI, "jdbc:sqlite:" + db.toAbsolutePath(),
+            CatalogProperties.WAREHOUSE_LOCATION, "mem:///" + UUID.randomUUID(),
+            "jdbc.schema-version", "V1"));
+    catalog.createNamespace(ID.namespace());
+    Table table =
+        catalog
+            .buildTable(ID, SCHEMA)
+            .withProperty(TableProperties.COMMIT_NUM_RETRIES, "0")
+            .create();
+    table.newFastAppend().appendFile(file("c28a")).commit();
+
+    loseNextReply[0] = true;
+    assertThatCode(() -> table.newFastAppend().appendFile(file("c28b")).commit())
+        .as(BACK, "C28")
+        .doesNotThrowAnyException();
+    assertThat(loseNextReply[0]).as("the reply was lost").isFalse();
+    assertThat(catalog.loadTable(ID).newScan().planFiles()).as(BACK, "C28").hasSize(2);
+  }
+
+  /** A JDBC client pool whose connection loses the reply of the next UPDATE of a table's row. */
+  private static class LostReplyPool extends org.apache.iceberg.jdbc.JdbcClientPool {
+    private final boolean[] loseNextReply;
+
+    LostReplyPool(String url, Map<String, String> props, boolean[] loseNextReply) {
+      super(url, props);
+      this.loseNextReply = loseNextReply;
+    }
+
+    @Override
+    protected java.sql.Connection newClient() {
+      java.sql.Connection connection = super.newClient();
+      return (java.sql.Connection)
+          java.lang.reflect.Proxy.newProxyInstance(
+              java.sql.Connection.class.getClassLoader(),
+              new Class<?>[] {java.sql.Connection.class},
+              (proxy, method, args) -> {
+                Object result = invoke(connection, method, args);
+                if (!method.getName().equals("prepareStatement")
+                    || !(args[0] instanceof String)
+                    || !((String) args[0]).startsWith("UPDATE iceberg_tables")) {
+                  return result;
+                }
+                java.sql.PreparedStatement statement = (java.sql.PreparedStatement) result;
+                return java.lang.reflect.Proxy.newProxyInstance(
+                    java.sql.PreparedStatement.class.getClassLoader(),
+                    new Class<?>[] {java.sql.PreparedStatement.class},
+                    (p, m, a) -> {
+                      Object out = invoke(statement, m, a);
+                      if (m.getName().equals("executeUpdate") && loseNextReply[0]) {
+                        loseNextReply[0] = false; // it ran; its reply is lost
+                        throw new java.sql.SQLException("Connection reset (test)", "08006");
+                      }
+                      return out;
+                    });
+              });
+    }
+
+    private static Object invoke(Object target, java.lang.reflect.Method method, Object[] args)
+        throws Exception {
+      try {
+        return method.invoke(target, args);
+      } catch (java.lang.reflect.InvocationTargetException e) {
+        if (e.getCause() instanceof Exception) {
+          throw (Exception) e.getCause();
+        }
+        throw (Error) e.getCause();
+      }
+    }
   }
 
   /**

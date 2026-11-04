@@ -13,7 +13,7 @@ reports or pull requests upstream. It covers the reproduction, the cause
 with links to the 1.12.0 source, the fix, its tests, and what to settle
 before a PR.
 
-Upstream fixed C1. The fork fixes C2 to C27 on branch `core-fixes`, each
+Upstream fixed C1. The fork fixes C2 to C28 on branch `core-fixes`, each
 in an upstream-style commit with its tests, so the project's tests no
 longer work around any of them.
 
@@ -61,8 +61,11 @@ checked against main at `e70a2efcd` and upstream's record. C26 and C27,
 which the conflict-encoding fuzz rounds found on 2026-10-25, were fixed
 that day; both reproduce on main at `97659351d4`, and both had been
 reported upstream, C26 with a fix the stale bot closed, C27 with a fix,
-in 2020, that missed the metastores' drop check. The Fork column is
-`atomicio`, which sits on `core-fixes`.
+in 2020, that missed the metastores' drop check. C28, which a review of
+JDBC's commit path found on 2026-11-03 (for catalog-bench's JDBC
+baseline), was fixed that day; upstream had it reported two days before,
+with a fix of its main case open. The Fork column is `atomicio`, which
+sits on `core-fixes`.
 
 | Issue | Fork | 1.12.0 | main | Upstream |
 |---|---|---|---|---|
@@ -93,6 +96,7 @@ in 2020, that missed the metastores' drop check. The Fork column is
 | C25. A rewrite with an older data sequence number drops a delete it still needs | fixed, `core-fixes` 0e0e9bb | yes | yes | [#10312](https://github.com/apache/iceberg/issues/10312), closed by the stale bot; PR [#10962](https://github.com/apache/iceberg/pull/10962), open, whose age-off half this takes (maintainers opposed the other half) |
 | C26. A row delta whose conflict filter misses a file commits a second DV for it | fixed, `core-fixes` 04a2388 | yes | yes | PR [#15966](https://github.com/apache/iceberg/pull/15966), closed by the stale bot unreviewed; [#17206](https://github.com/apache/iceberg/issues/17206), open, on the unreadable tables it leaves |
 | C27. A handle to a dropped table fails with an NPE once it has reported the drop | fixed, `core-fixes` 628063f | yes | yes | [#1513](https://github.com/apache/iceberg/issues/1513), closed by [#1553](https://github.com/apache/iceberg/pull/1553) (0.10.0), which missed the metastores' check of the cleared location |
+| C28. A JDBC commit whose UPDATE committed but whose reply was lost is reported as failed | fixed, `core-fixes` d69176a | yes (since 1.6.0) | yes | [#18743](https://github.com/apache/iceberg/issues/18743), open; PR [#18745](https://github.com/apache/iceberg/pull/18745), open, fixes the zero-row UPDATE as the fork does |
 
 "Not reported" means a search of apache/iceberg's issues, pull requests
 and PR branches, and of the issues@ and dev@ lists, found nothing for the
@@ -831,6 +835,35 @@ its next update fails with a NullPointerException. Views alike.
   own refresh (Bug 78), and keep it, so they work on stock Iceberg.
 - **Canary:** `aHandleToADroppedTableKeepsFailingWithNoSuchTable`, on
   table operations of its own that report a drop as Hive's and JDBC's do.
+
+### C28. A JDBC commit whose UPDATE committed but whose reply was lost is reported as failed
+
+Details: [iceberg-issues/C28.md](iceberg-issues/C28.md).
+
+`JdbcClientPool` runs a statement again after its connection fails (since
+#10140, 1.6.0, on SQLStates 08000/08003/08006/08007/40001). A commit's
+UPDATE that committed but whose reply was lost then matches no row, and
+JDBC reports a conflict: a CommitFailedException, cleanable, so once
+Iceberg's retries are spent the cleanup deletes the files of the commit
+the table now is; with retries left, the retry finds its own snapshot and
+may move the branch back over another writer's commit. A connection that
+fails on both runs, or a create whose INSERT reply was lost, fails with an
+UncheckedSQLException though it may have committed.
+
+- **Cause:** a conditional UPDATE is run again without knowing whether
+  the first run committed; JDBC never checked a commit's status.
+- **Found by:** a review of JDBC's commit path, 2026-11-03, for
+  catalog-bench's JDBC baseline. Reported upstream two days before,
+  #18743, with PR #18745 for the zero-row UPDATE.
+- **Fork:** fixed on `core-fixes` by d69176a, "Core: Check a JDBC commit's
+  status when its statement's outcome is unclear": a zero-row UPDATE
+  checks the commit's status strictly (as #18745), and a statement whose
+  connection fails on every run checks it as the metastores do (unknown
+  unless the table names the file). Its tests are four in
+  `TestJdbcCatalog`. Views, renames, drops and unregisters are left.
+- **No workaround** to remove: FileIOCatalog does not use JDBC.
+- **Canary:** `aJdbcCommitWhoseReplyIsLostCommits`, Iceberg's JdbcCatalog
+  on SQLite (test dependency `sqlite-jdbc`).
 
 ## Accepted Iceberg Behavior
 
