@@ -310,7 +310,8 @@ public final class AtomicFileLog implements SharedLog {
    * The object a read or probe found, bound to its version: storage conditions the next write on
    * it. A tail continues another if the object did not shrink: an append makes it longer, while a
    * replace (compaction) usually makes it shorter. A replace that makes it longer reads as an
-   * append, which costs a resend at most: the record is the same, and replay applies it once.
+   * append, which costs a resend at most: the record is the same, and replay applies it once, by
+   * its id or, once the replace took the id out of the committed set, by the floor.
    */
   private static final class FileTail implements LogTail {
     private final InputFile file;

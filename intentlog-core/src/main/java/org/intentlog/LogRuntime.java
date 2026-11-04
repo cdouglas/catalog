@@ -592,9 +592,12 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
               unresolved = e;
               raceBackoff(e);
             }
-            // Another writer appended first. The record is the same and replay applies it once
-            // (by its id), so append it again at the new tail without reading the log: only the
-            // tail is needed.
+            // Another writer appended first. The record is the same and replay applies it once,
+            // by its id: the committed set holds it, or it is at or below the floor, where replay
+            // admits nothing. A replace that made the log longer reads as growth, and it may have
+            // taken the id out of the set (GC, or paging: docs/COMMITTED_PAGING.md), so the floor
+            // is what rejects such a copy. Append it again at the new tail without reading the
+            // log: only the tail is needed.
             LogTail probed = probe();
             if (!probed.continues(tail)) {
               // The log was replaced (compacted). Read it, so that the next decision sees its
