@@ -19,6 +19,7 @@
 package org.apache.iceberg.io;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.util.Map;
 import org.apache.iceberg.DataFiles;
@@ -104,7 +105,7 @@ class TestInlineSnapshotReuse {
   }
 
   @Test
-  void aReplacedPoolEntryMakesTheListsAgain() {
+  void aPathAddedAgainKeepsItsEntryAndTheListsMadeFromIt() {
     LogCatalog catalog = catalog(LocalCatalogMode.APPEND_ML);
     catalog.createNamespace(Namespace.of("ns"));
     Table table = catalog.buildTable(TABLE, SCHEMA).withPartitionSpec(SPEC).create();
@@ -121,19 +122,32 @@ class TestInlineSnapshotReuse {
       assertThat(again.get(i)).isSameAs(first.get(i));
     }
 
-    // Another entry for a path the pool holds (here an equal copy): a list naming the path may
-    // resolve to another entry now, so every list is made again
+    // An equal entry for a path the pool holds keeps the pool's entry, so every list made from it
+    // still holds: a pooled path's entry never changes
     ManifestFile entry = state.manifestPool(tblId).values().iterator().next();
-    CatalogState replaced =
+    CatalogState readded =
         state.toBuilder()
             .addManifestToPool(tblId, org.apache.iceberg.GenericManifestFile.copyOf(entry).build())
             .build();
-    assertThat(replaced.poolReplacements(tblId)).isEqualTo(state.poolReplacements(tblId) + 1);
-    java.util.List<Snapshot> remade = made.wrap(replaced, tblId, parsed);
+    assertThat(readded.manifestPool(tblId).get(entry.path())).isSameAs(entry);
+    java.util.List<Snapshot> kept = made.wrap(readded, tblId, parsed);
     for (int i = 0; i < first.size(); i++) {
-      assertThat(remade.get(i)).isNotSameAs(first.get(i));
-      assertThat(remade.get(i).allManifests(null)).isEqualTo(first.get(i).allManifests(null));
+      assertThat(kept.get(i)).isSameAs(first.get(i));
     }
+
+    // Another entry for the path would change every list naming it: replay does not apply a record
+    // that sends one (TestPooledManifests), and under the replay check reaching the pool is a bug
+    ManifestFile other =
+        org.apache.iceberg.GenericManifestFile.copyOf(entry)
+            .withSnapshotId(entry.snapshotId() + 1)
+            .build();
+    assertThat(state.toBuilder().restatesPooledManifest(tblId, entry.path(), () -> other))
+        .isTrue();
+    assertThat(state.toBuilder().restatesPooledManifest(tblId, entry.path(), () -> entry))
+        .isFalse();
+    assertThatThrownBy(() -> state.toBuilder().addManifestToPool(tblId, other))
+        .isInstanceOf(AssertionError.class)
+        .hasMessageContaining("restates pooled manifest " + entry.path());
   }
 
   @ParameterizedTest

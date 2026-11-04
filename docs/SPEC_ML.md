@@ -144,13 +144,18 @@ snapshot, and a manifest with no id says so (`no_added_snapshot_id`). A delta
 that adds several states every id. A new snapshot's list starts as its parent's
 inline list (empty for none). On apply:
 
-- `AddManifestDelta` adds `manifest` to the table's pool, replacing an
-  entry for the same path (entries for one path could differ only in
-  first row id, which the restate rule below keeps from changing, and
-  which a delta merged on a later version may not change: SPEC_TM.md
-  §"Late-bound fields"), and
+- `AddManifestDelta` adds `manifest` to the table's pool, and
   inserts the path in the snapshot's list at `position`, or at the end
-  if it is absent. Writers always set it.
+  if it is absent. Writers always set it. A pooled path's entry never
+  changes: every list that names the path shares it. A path the pool
+  holds must come with an entry equal to the pool's in every field,
+  which the pool keeps; an update (a delta, or the manifest updates a
+  full update carries) that adds one with another entry does not apply
+  (`pool: restates a pooled manifest`). Writers never send one: an
+  entry Iceberg would restate, a first row id the first v3 commit gives
+  a kept manifest, evicts the table instead (the restate rule below),
+  and a delta merged on a later version adds no path the table holds
+  (SPEC_TM.md §"Late-bound fields").
 - `RemoveManifestDelta` removes the path from the snapshot's reference
   list, or the paths at `parent_indices` in its parent's list: the list of
   the snapshot its `AddSnapshot` names as parent, which the writer read

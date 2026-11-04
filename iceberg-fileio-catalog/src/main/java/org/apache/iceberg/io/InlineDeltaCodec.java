@@ -795,6 +795,11 @@ public class InlineDeltaCodec {
     }
   }
 
+  /** The path {@link #resolve} gives {@code manifest}, without copying it. */
+  static String resolvedPath(ManifestFile manifest, String prefix) {
+    return relative(manifest) ? (prefix != null ? prefix : "") + manifest.path() : manifest.path();
+  }
+
   /** Whether {@code manifest}, decoded from a delta, is a name its table's prefix resolves. */
   private static boolean relative(ManifestFile manifest) {
     return manifest instanceof ProtoCodec.DecodedManifestFile

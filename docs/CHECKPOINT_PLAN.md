@@ -237,18 +237,18 @@ catalog-bench docs/DESIGN.md).
    (`TestConflictAttribution.aRecordOnATableEvictedBeforeItLandsDoesNotApply`).
 2. **Page GC**: one-way sealing with a floor, or a grace-period sweep. Open;
    COMMITTED_PAGING.md is under review (2026-11-03).
-3. **The inline-ML pool is a pure dedup dictionary** (decided 2026-11-03):
-   once a path is pooled its entry never changes, and replay enforces it (a
-   record that re-adds a pooled path with another entry does not apply). This
-   lets blocks copy the entries their lists name and encode drop the ones no
-   list names. Today writers keep it (an entry that would change, the row ids
-   the first v3 commit gives kept manifests, evicts the table:
-   `restatesAManifest`), but replay replaces a re-added path's entry without
-   comparing (`CatalogState.Builder.addManifestToPool`), and
-   `poolReplacements` counts replacements by identity, equal entries
-   included. First an experiment: under the replay check,
-   `addManifestToPool` asserts every replacement is field-equal. The unit
-   suite (2,524 tests, 2026-11-03) never broke it; longer fuzzer runs come
-   before replay enforces it.
+3. **The inline-ML pool is a pure dedup dictionary** (decided 2026-11-03,
+   enforced): once a path is pooled its entry never changes. Replay does not
+   apply an update that adds a pooled path with another entry
+   (`pool: restates a pooled manifest`, `TestPooledManifests`), and a path
+   added again with an equal entry keeps the pool's object, so
+   `poolReplacements` is gone. This lets blocks copy the entries their
+   lists name and encode drop the ones no list names. Writers already kept
+   it (an entry that would change, the row ids the first v3 commit gives
+   kept manifests, evicts the table: `restatesAManifest`). Before replay
+   enforced it, an assertion under the replay check never fired in the unit
+   suite (2,524 tests) or in a tenth of a fuzz round's tries of the fault,
+   differential, delta, rebase and multi-writer properties (2026-11-03);
+   it stays as a backstop in `CatalogState.Builder.addManifestToPool`.
 
 Decided (2026-11-02): R0 now, with a switch for each change.

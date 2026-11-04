@@ -71,10 +71,6 @@ public class CatalogState {
   private final Map<Integer, Map<String, ManifestFile>> manifestPool;
   // tblId -> (snapshotId -> list of manifest paths in the pool)
   private final Map<Integer, Map<Long, List<String>>> snapshotManifests;
-  // tblId -> how many times a pool entry was replaced by another for the same path: not state
-  // (no checkpoint holds it), but what tells a load that a list it resolved before may resolve to
-  // other entries now (LogCatalog.InlineSnapshots)
-  private final Map<Integer, Long> poolReplacements;
 
   // The catalog's conflict encoding, null until its first record sets one (then Lamport), and
   // the encoding's state of each table that has one: tblId -> state.
@@ -93,7 +89,6 @@ public class CatalogState {
     this.tblManifestPrefix = ImmutableMap.copyOf(builder.tblManifestPrefix);
     this.manifestPool = ImmutableMap.copyOf(builder.manifestPool);
     this.snapshotManifests = ImmutableMap.copyOf(builder.snapshotManifests);
-    this.poolReplacements = ImmutableMap.copyOf(builder.poolReplacements);
     this.conflictEncoding = builder.conflictEncoding;
     // The builder no longer changes them once built (Builder#build)
     this.conflictStates = ImmutableMap.copyOf(builder.conflictStates);
@@ -126,7 +121,6 @@ public class CatalogState {
     builder.tblManifestPrefix.putAll(tblManifestPrefix);
     builder.manifestPool.putAll(manifestPool);
     builder.snapshotManifests.putAll(snapshotManifests);
-    builder.poolReplacements.putAll(poolReplacements);
     builder.conflictEncoding = conflictEncoding;
     builder.conflictStates.putAll(conflictStates);
     return builder;
@@ -346,15 +340,6 @@ public class CatalogState {
     return refs != null ? refs : ImmutableMap.of();
   }
 
-  /**
-   * How many times an entry of the table's manifest pool was replaced by another for the same path
-   * in the states this one descends from since it was decoded: while it is unchanged, a manifest
-   * path resolves to the entry it did.
-   */
-  long poolReplacements(int tblId) {
-    return poolReplacements.getOrDefault(tblId, 0L);
-  }
-
   /** Returns the full manifest pool map for checkpoint encoding. */
   Map<Integer, Map<String, ManifestFile>> allManifestPools() {
     return manifestPool;
@@ -441,7 +426,6 @@ public class CatalogState {
     // Each list is immutable.
     private final Map<Integer, Map<String, ManifestFile>> manifestPool = new HashMap<>();
     private final Map<Integer, Map<Long, List<String>>> snapshotManifests = new HashMap<>();
-    private final Map<Integer, Long> poolReplacements = new HashMap<>();
     private String conflictEncoding;
     // A table's encoding state: shared with the state this builder continues until the encoding
     // changes it here (conflictState), which copies it first (ownedStates)
@@ -688,7 +672,6 @@ public class CatalogState {
       tblManifestPrefix.remove(id);
       manifestPool.remove(id);
       snapshotManifests.remove(id);
-      poolReplacements.remove(id);
       return this;
     }
 
@@ -696,7 +679,52 @@ public class CatalogState {
 
     /** Whether two manifest list entries agree in every field. */
     static boolean samePoolEntry(ManifestFile a, ManifestFile b) {
-      return poolEntry(a).equals(poolEntry(b));
+      return a.path().equals(b.path())
+          && a.length() == b.length()
+          && a.partitionSpecId() == b.partitionSpecId()
+          && a.content() == b.content()
+          && a.sequenceNumber() == b.sequenceNumber()
+          && a.minSequenceNumber() == b.minSequenceNumber()
+          && java.util.Objects.equals(a.snapshotId(), b.snapshotId())
+          && java.util.Objects.equals(a.addedFilesCount(), b.addedFilesCount())
+          && java.util.Objects.equals(a.existingFilesCount(), b.existingFilesCount())
+          && java.util.Objects.equals(a.deletedFilesCount(), b.deletedFilesCount())
+          && java.util.Objects.equals(a.addedRowsCount(), b.addedRowsCount())
+          && java.util.Objects.equals(a.existingRowsCount(), b.existingRowsCount())
+          && java.util.Objects.equals(a.deletedRowsCount(), b.deletedRowsCount())
+          && samePartitions(a.partitions(), b.partitions())
+          && sameBytes(a.keyMetadata(), b.keyMetadata())
+          && java.util.Objects.equals(a.firstRowId(), b.firstRowId());
+    }
+
+    private static boolean samePartitions(
+        List<ManifestFile.PartitionFieldSummary> a, List<ManifestFile.PartitionFieldSummary> b) {
+      if (a == null || b == null) {
+        return a == b;
+      }
+      if (a.size() != b.size()) {
+        return false;
+      }
+      for (int i = 0; i < a.size(); i++) {
+        ManifestFile.PartitionFieldSummary x = a.get(i);
+        ManifestFile.PartitionFieldSummary y = b.get(i);
+        if (x.containsNull() != y.containsNull()
+            || !java.util.Objects.equals(x.containsNaN(), y.containsNaN())
+            || !sameBytes(x.lowerBound(), y.lowerBound())
+            || !sameBytes(x.upperBound(), y.upperBound())) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    private static boolean sameBytes(java.nio.ByteBuffer a, java.nio.ByteBuffer b) {
+      if (a == null || b == null) {
+        return a == b;
+      }
+      return java.util.Arrays.equals(
+          org.apache.iceberg.util.ByteBuffers.toByteArray(a),
+          org.apache.iceberg.util.ByteBuffers.toByteArray(b));
     }
 
     /** Every field of a manifest list entry. */
@@ -738,22 +766,41 @@ public class CatalogState {
       return lists != null ? PersistentMap.copyOf(lists) : PersistentMap.empty();
     }
 
-    /** Adds a ManifestFile to the table's pool. */
+    /**
+     * Adds a ManifestFile to the table's pool. A pooled path's entry never changes: the lists that
+     * name the path share it (SPEC_ML.md, AddManifestDelta), and a record that would change it
+     * does not apply ({@link #restatesPooledManifest}). A path added again with an equal entry
+     * keeps the entry the pool holds, the same object, so what was made from it stays valid.
+     */
     public Builder addManifestToPool(int tblId, ManifestFile manifest) {
-      PersistentMap<String, ManifestFile> pool = pool(tblId);
-      ManifestFile replaced = pool.get(manifest.path());
-      manifestPool.put(tblId, pool.plus(manifest.path(), manifest));
-      if (replaced != null && replaced != manifest) {
-        // A pooled path's entry never changes (docs/CHECKPOINT_PLAN.md decision 3): the lists
-        // that name it share it. Checked under the replay check until replay enforces it.
-        if (POOL_CHECK && !samePoolEntry(replaced, manifest)) {
+      Map<String, ManifestFile> current = manifestPool.get(tblId);
+      ManifestFile pooled = current != null ? current.get(manifest.path()) : null;
+      if (pooled != null) {
+        if (pooled == manifest || samePoolEntry(pooled, manifest)) {
+          return this;
+        }
+        // replay rejects such a record; under the replay check, reaching here is a bug
+        if (POOL_CHECK) {
           throw new AssertionError(String.format(
               "table %d restates pooled manifest %s: %s -> %s",
-              tblId, manifest.path(), poolEntry(replaced), poolEntry(manifest)));
+              tblId, manifest.path(), poolEntry(pooled), poolEntry(manifest)));
         }
-        poolReplacements.merge(tblId, 1L, Long::sum);
       }
+      manifestPool.put(tblId, pool(tblId).plus(manifest.path(), manifest));
       return this;
+    }
+
+    /**
+     * Whether a manifest update of table {@code tblId} names a path its pool holds with an entry
+     * that differs from {@code resolved} in some field: an update that would change the entry every
+     * list naming the path shares, which does not apply. {@code path} is the update's resolved path,
+     * computed without resolving the entry, so a path the pool lacks costs a lookup.
+     */
+    public boolean restatesPooledManifest(
+        int tblId, String path, java.util.function.Supplier<ManifestFile> resolved) {
+      Map<String, ManifestFile> current = manifestPool.get(tblId);
+      ManifestFile pooled = current != null ? current.get(path) : null;
+      return pooled != null && !samePoolEntry(pooled, resolved.get());
     }
 
     /** Sets the manifest list for a snapshot (list of manifest paths in the pool). */

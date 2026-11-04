@@ -1226,10 +1226,11 @@ public class LogCatalog extends BaseMetastoreCatalog
    *
    * <p>A committed snapshot's list never changes, and a state shares the lists that did not change
    * with the state before it (the same objects), so a load reuses the InlineSnapshot it made for a
-   * snapshot whose list is still the same object, unless an entry of the table's pool was replaced
-   * since ({@link CatalogState#poolReplacements}), when a path may resolve to another entry. It
-   * makes only the snapshots that are new since the last load, where it used to make every
-   * retained snapshot's list on each load (most of a writer's CPU under fast appends).
+   * snapshot whose list is still the same object: a pooled path's entry never changes, and a path
+   * added again keeps the pool's object (CatalogState.Builder#addManifestToPool), so while a list
+   * names a path the path resolves to the entry it did. It makes only the snapshots that are new
+   * since the last load, where it used to make every retained snapshot's list on each load (most of
+   * a writer's CPU under fast appends).
    */
   static final class InlineSnapshots {
     private final Map<Integer, TableSnapshots> tables =
@@ -1237,7 +1238,6 @@ public class LogCatalog extends BaseMetastoreCatalog
 
     /** What loads of one table made. */
     private static final class TableSnapshots {
-      private long poolReplacements = -1L;
       private final Map<Long, Made> made = new java.util.HashMap<>();
       // pool entry (by identity) -> its copy
       private final Map<ManifestFile, ManifestFile> copies = new java.util.IdentityHashMap<>();
@@ -1263,12 +1263,9 @@ public class LogCatalog extends BaseMetastoreCatalog
       Map<Long, List<String>> lists = state.snapshotManifests(tblId);
       Map<String, ManifestFile> pool = state.manifestPool(tblId);
       synchronized (table) {
-        long replacements = state.poolReplacements(tblId);
-        if (replacements != table.poolReplacements
-            || table.copies.size() > 2 * pool.size() + 64) {
+        if (table.copies.size() > 2 * pool.size() + 64) {
           table.made.clear();
           table.copies.clear();
-          table.poolReplacements = replacements;
         }
         List<Snapshot> snapshots = new java.util.ArrayList<>(parsed.size());
         java.util.Set<Long> loaded = new java.util.HashSet<>();

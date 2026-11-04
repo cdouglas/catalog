@@ -2279,6 +2279,9 @@ public class ProtoCodec {
    * - Pointer: evicts to external file (metadataLocation != null)
    * Exactly one of deltaBytes, fullMetadata, or metadataLocation should be non-null.
    */
+  /** Why a table update that would change a pooled manifest's entry does not apply. */
+  static final String POOL_RESTATED = "pool: restates a pooled manifest";
+
   public static class UpdateTableInlineAction implements Action {
     final int id;
     final int version;
@@ -2302,6 +2305,8 @@ public class ProtoCodec {
     final boolean pinned;
     // The update as the catalog's conflict encoding sees it: decoded once, for verify and apply.
     private TableAction table;
+    // The manifest updates a FULL update carries (mlDeltaBytes), decoded once for verify
+    private InlineDeltaCodec.DecodedDelta mlDelta;
 
     public UpdateTableInlineAction(
         int id, int version, byte[] deltaBytes, byte[] fullMetadata,
@@ -2380,13 +2385,55 @@ public class ProtoCodec {
     @Override
     public boolean verify(CatalogState.Builder builder) {
       // The table's version must be the one the update read, unless the catalog's conflict
-      // encoding admits a delta on a version that changed since, finalized where it lands.
-      return ConflictEncodings.admits(table(), builder);
+      // encoding admits a delta on a version that changed since, finalized where it lands; and
+      // its manifest updates must leave every pooled entry as it is.
+      return ConflictEncodings.admits(table(), builder) && !restatesPooledManifest(builder);
     }
 
     @Override
     public String explain(CatalogState.Builder builder) {
-      return ConflictEncodings.rejection(table(), builder);
+      String why = ConflictEncodings.rejection(table(), builder);
+      if (why != null) {
+        return why;
+      }
+      return restatesPooledManifest(builder) ? POOL_RESTATED : null;
+    }
+
+    /**
+     * Whether the update's manifest updates (a delta's, or those a FULL update carries) add a path
+     * the table's pool holds with an entry that differs from the pool's (SPEC_ML.md,
+     * AddManifestDelta). Every list that names a path shares its entry, so such an update would
+     * change lists that never change: it does not apply. Writers never send one (an update that
+     * would change a pooled entry evicts the table: LogCatalog's restatesAManifest). A delta
+     * admitted on a later version adds no pooled path ({@link Landing#unmergeable}), so the check
+     * meets only an update on the version it read, where its entries are as its writer sent them.
+     */
+    private boolean restatesPooledManifest(CatalogState.Builder builder) {
+      InlineDeltaCodec.DecodedDelta manifests;
+      if (deltaBytes != null) {
+        manifests = table().delta();
+      } else if (mlDeltaBytes != null && fullMetadata != null) {
+        if (mlDelta == null) {
+          mlDelta = InlineDeltaCodec.decodeDelta(mlDeltaBytes);
+        }
+        manifests = mlDelta;
+      } else {
+        return false;
+      }
+      if (manifests == null || !builder.isInlineTable(id)) {
+        return false;
+      }
+      String prefix = builder.manifestListPrefix(id);
+      for (InlineDeltaCodec.DeltaUpdate update : manifests.updates) {
+        if (update instanceof InlineDeltaCodec.AddManifestUpdate) {
+          ManifestFile manifest = ((InlineDeltaCodec.AddManifestUpdate) update).manifest;
+          if (builder.restatesPooledManifest(id, InlineDeltaCodec.resolvedPath(manifest, prefix),
+              () -> InlineDeltaCodec.resolve(manifest, prefix))) {
+            return true;
+          }
+        }
+      }
+      return false;
     }
 
     @Override
