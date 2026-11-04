@@ -446,10 +446,10 @@ message CommittedTransactions {
   fixed64 highest_dropped_timestamp_ms = 3;    // H, as now
   fixed64 floor_ms                     = 4;    // F; absent: H
   repeated CommittedPage.Ref pages     = 5;    // (H, F], oldest first
-  repeated Block blocks                = 6;    // above F, oldest first
+  repeated CommittedBlock blocks       = 6;    // above F, oldest first
 }
 
-message Block {
+message CommittedBlock {
   uint32 level          = 1;
   uint64 index          = 2;
   bytes  packed_entries = 3;   // newest first; the first gap from the node's top
@@ -616,6 +616,47 @@ replay.
     and counted as pages) measures the gain before the store side is built, as
     `committed = discard` did for the set.
   - Then a campaign with paging on, at 1,000 a second's steady state.
+
+## Order of work
+
+Each stage keeps every suite and fuzzer green, and lands on the branch
+`committed-paging`:
+
+1. **The set in blocks** (reader version 2; F is written but equals H, so
+   nothing pages yet): `CommittedSet` in blocks of runs, `CommittedSetCodec`
+   as the whole-set reference, minting after F from the runtime's clock, and
+   `TestCommittedSetBlocks` (walks at N from 1 to 2^16 with stamps drawn by
+   region, against the reference and the block rule, calibrated by mutants).
+   Every suite runs with N = 16 (surefire's `intentlog.committed.block.ids`),
+   so the catalog's fuzzers split and merge blocks throughout. The format
+   explorer decodes blocks. `CommittedSetBench` (JMH) compares decode, fold,
+   encode, GC and lookups with the one-blob set, as does `IngestFoldBench`.
+   No behaviour changes.
+
+   Measured on the dev box (2026-11-04, `CommittedSetBench`, sets of 180,000
+   and 1.8 million ids over 30 minutes, the one-blob set first): a lookup of an
+   old id 345 µs and 5.3 ms before, 76 and 7 µs after (its block, not the
+   whole set, is scanned); of an absent id 232 µs and 2.2 ms before, 6 and
+   62 µs after; a GC and the checkpoint after it 1.2 and 12.4 ms before, 0.9
+   and 4.7 ms after; a fold of 64 ids 6.6 and 6.4 µs before, 7.4 and 9.4 µs
+   after; the checkpoint after a fold 0.28 and 4.3 ms before, 0.30 and 4.7
+   ms after (within the run-to-run error); a decode 0.3 and 2.3 µs before,
+   0.6 and 4.5 µs after. A fold first scanned the decoded newest block to
+   count it (88-112 µs) until a block's bytes bounded its count (every entry
+   takes 11 bytes or more). `IngestFoldBench` (the i1 capture at 1,000
+   records a second, the set at its steady state) showed no difference
+   beyond the dev box's run-to-run spread, which reached 2x between runs of
+   one build.
+2. **TLA+.** The floor, PageOut, the page put and the sweep in
+   `SharedLogCommit.tla` and `CatalogCommit.tla`, with the bug switches
+   above.
+3. **Paging.** The PageOut record and its replay, page references, the
+   `PageStore` SPI and its providers, the runtime's policy (A, T), lookups
+   through pages, deletion after GC, and the sweep.
+4. **The fuzzers and the measurements.** The commit-protocol fuzzers' split
+   compaction, page faults and oracles; the catalog fuzzers with a small A;
+   the ingest benchmark's paging mode, then a campaign; a havoc fuzz round and
+   a calibration.
 
 ## Alternatives considered
 

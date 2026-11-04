@@ -124,6 +124,9 @@
               <!-- Every replay that folds records onto a replica is checked against a replay of
                    the whole view (LogRuntime). -->
               <intentlog.replay.check>true</intentlog.replay.check>
+              <!-- The committed set's blocks hold at most 2^16 ids in a log (a constant of the
+                   format); tests cut them at 16, so that blocks split and merge in every suite. -->
+              <intentlog.committed.block.ids>16</intentlog.committed.block.ids>
             </systemPropertyVariables>
           </configuration>
         </plugin>

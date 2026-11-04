@@ -56,7 +56,12 @@ public final class UuidV7 {
    * horizon, which replay rejects.
    */
   public static UUID newUuidV7After(long afterMs) {
-    return newUuidV7(Math.max(System.currentTimeMillis(), afterMs + 1), RANDOM);
+    return newUuidV7After(afterMs, System.currentTimeMillis());
+  }
+
+  /** {@link #newUuidV7After(long)} on a clock reading {@code nowMs}. */
+  public static UUID newUuidV7After(long afterMs, long nowMs) {
+    return newUuidV7(Math.max(nowMs, afterMs + 1), RANDOM);
   }
 
   /**

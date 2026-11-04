@@ -174,7 +174,7 @@ machine's bytes ride in `state` and `intention`.
 
 ```protobuf
 message LogCheckpoint {
-  int32  min_reader_version         = 1;   // LogEnvelope.SUPPORTED_READER_VERSION, now 1; required, first
+  int32  min_reader_version         = 1;   // LogEnvelope.SUPPORTED_READER_VERSION, now 2; required, first
   bytes  log_id                     = 2;   // UUIDv7, 16 bytes, minted when the log is created; required
   CommittedTransactions committed   = 3;   // absent when the set is empty with no horizon
   bytes  state                      = 4;   // the state machine's checkpoint; required
@@ -193,15 +193,24 @@ message AdvanceHorizon {
 }
 
 message CommittedTransactions {
-  // Largest timestamp in the set; 0 when the set is empty. Always written.
-  fixed64 max_timestamp_ms             = 1;
-  // Per entry, descending order, back-to-back inside one packed bytes
-  // field: varint delta_ms (gap from previous; the first is 0) || 10 random
-  // bytes (rand_a + rand_b + 6-bit zero pad).
-  bytes   packed_entries               = 2;
+  reserved 1, 2;                               // the one-blob set of reader version 1
   // GC horizon: the largest timestamp of any id a GC record dropped.
   // 0 (absent) until the first drop; ids at or below it are UNKNOWN.
   fixed64 highest_dropped_timestamp_ms = 3;
+  // The floor: replay admits no id at or below it. Absent when it equals the
+  // horizon (until ids are paged out: COMMITTED_PAGING.md).
+  fixed64 floor_ms                     = 4;
+  // 5: references to the pages of ids in (horizon, floor]; not yet written.
+  repeated CommittedBlock blocks       = 6;   // oldest first
+}
+
+message CommittedBlock {
+  uint32 level          = 1;   // node (level, index): ms [index * 2^level, (index + 1) * 2^level)
+  uint64 index          = 2;
+  // Per entry, newest first, back-to-back: varint delta_ms (gap from the
+  // entry before; the first from the node's top) || 10 random bytes
+  // (rand_a + rand_b + 6-bit zero pad).
+  bytes  packed_entries = 3;
 }
 ```
 
@@ -215,30 +224,41 @@ lacks it, the log id or the state; and on a `LogRecord` with no body, with
 two, or with an intention and no id.
 
 **The committed set's encoding.** `CommittedTransactions` exploits the
-structure of UUIDv7 to compress the set. Entries are sorted descending by UUID
-(= by timestamp), the largest timestamp is stored once as `max_timestamp_ms`,
-and each entry's varint gap from the previous one and its 10 bytes of random
-material (the 12-bit `rand_a` and 62-bit `rand_b`, with the fixed 4-bit
-version and 2-bit variant dropped on encode and restored on decode) are
-interleaved back to back in one `packed_entries` blob. For typical clustered
-commit traffic this saves about 30% per entry over a `repeated bytes` form
-([UUID_V7_BENCH_RESULTS.md](UUID_V7_BENCH_RESULTS.md)).
+structure of UUIDv7 to compress the set. Its ids are cut into blocks on a grid
+over their timestamps: node (k, a) is the aligned span [a·2^k, (a+1)·2^k) of
+milliseconds, and the blocks are the maximal nodes that hold at most N ids
+(2^16, a constant of the format; tests use 16), among the nodes that hold any;
+a millisecond is a block however many ids it holds. The blocks are a function
+of the ids alone, not of the order replay added them or where its builds fell,
+so every replica at a position writes the same bytes (I11), and they are the
+unit [COMMITTED_PAGING.md](COMMITTED_PAGING.md) pages. A block lists its
+entries newest first: each entry's varint gap from the one before (the first's
+from the node's top) and its 10 bytes of random material (the 12-bit `rand_a`
+and 62-bit `rand_b`, with the fixed 4-bit version and 2-bit variant dropped on
+encode and restored on decode), back to back in one `packed_entries` field.
+For typical clustered commit traffic this saves about 30% per entry over a
+`repeated bytes` form ([UUID_V7_BENCH_RESULTS.md](UUID_V7_BENCH_RESULTS.md)).
 
-In memory, `CommittedSet` keeps the packed entries in runs, newest first,
-each run's entries older than the run before it: ids newer than every entry
-(replay's almost always are) become a run of their own, the newest runs merge
-by concatenation up to 1 MiB, an older id merges only with the entries at or
-above it, and a GC drops the oldest runs and cuts the one its watermark falls
-in. So a build costs the ids it adds, not the set, and the bytes a checkpoint
-writes, the runs concatenated, are the ones above.
+In memory, `CommittedSet` keeps each block's packed entries in runs, newest
+first, each run's entries older than the run before it: ids newer than a
+block's every entry (replay's almost always are) become a run of their own,
+the newest runs merge by concatenation up to 1 MiB, and an older id merges
+only with the entries at or above it. An id outside every block opens the
+largest node that holds it and overlaps no block; a block that passes N ids
+splits into the maximal nodes inside it; a GC drops the oldest blocks, cuts
+the one its watermark falls in, and merges the oldest blocks with their
+neighbours once their common node holds N or fewer. So a build costs the ids
+it adds (and a split, now and then, a block), not the set, and a checkpoint
+copies each block's bytes: a block decoded and unchanged is a slice of the
+body it came from.
 
-The interleaved layout lets `CommittedSet.contains` walk the wire bytes in one
-linear pass without materializing the set. A read that applies no records
-keeps the checkpoint's bytes as they are; one that applies records merges
-their ids in, and a GC record filters them, both by
-`CommittedSetCodec.rewrite`: one linear walk of the descending entries. Every
-entry is a UUIDv7: `CommittedSet.Builder.add` refuses any other, and replay
-rejects a record whose id is not one.
+`CommittedSet.contains` finds an id's block by its node and walks that
+block's runs in place, without materializing the set.
+`CommittedSetCodec` encodes and decodes the whole set from scratch: the
+reference the incremental set must match byte for byte
+(`TestCommittedSetBlocks`). Every entry is a UUIDv7:
+`CommittedSet.Builder.add` refuses any other, and replay rejects a record
+whose id is not one.
 
 ## Replay
 
@@ -328,9 +348,10 @@ again, a request delayed in flight) changes nothing. A writer uses it to
 learn whether its record applied.
 
 **Ids approximate commit time.** A commit mints its id when it starts
-(`LogRuntime.commit`, with `UuidV7.newUuidV7After(base.committed().horizon())`),
-not when its transaction began: the id embeds the writer's clock, or the
-horizon of the log it read plus 1 ms if the clock has not passed it. A
+(`LogRuntime.commit`, with `UuidV7.newUuidV7After(base.committed().floor(),
+clock)`, the runtime's clock), not when its transaction began: the id embeds
+the writer's clock, or the floor of the log it read plus 1 ms if the clock has
+not passed it. A
 transaction that ran for a week has an id from the moment it commits. So a
 retention can be stated in wall-clock time without penalizing slow
 transactions.
@@ -338,7 +359,7 @@ transactions.
 **Horizon.** `highest_dropped_timestamp_ms` is the set's GC horizon: the
 largest timestamp of any id GC dropped. It is 0 until the first drop, never
 decreases, and can exceed the newest id kept: a GC that drops every entry
-writes a set with `max_timestamp_ms = 0` and a horizon.
+writes a set with no blocks and a horizon.
 
 **GC is a record.** Only a GC record (`LogRecord.advance_horizon`) drops ids
 or moves the horizon. Replay applies one wherever it lands: it drops every id

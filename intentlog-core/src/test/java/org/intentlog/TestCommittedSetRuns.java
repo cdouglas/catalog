@@ -188,7 +188,8 @@ class TestCommittedSetRuns {
 
   @Test
   void additionsOneAtATimeStayAFewRuns() {
-    // Each build of one newer id adds a run, and runs merge like a binary counter
+    // Each build of one newer id adds a run to the newest block, and a block's runs merge like a
+    // binary counter: a few per block, whatever the block size the suite runs with
     CommittedSet.Builder builder = CommittedSet.builder();
     Random random = new Random(7);
     long now = 1_700_000_000_000L;
@@ -198,7 +199,7 @@ class TestCommittedSetRuns {
       set = builder.build();
       builder = set.toBuilder();
     }
-    assertThat(set.runCount()).isLessThanOrEqualTo(16);
+    assertThat(set.runCount()).isLessThanOrEqualTo(16 * set.blockCount());
     assertThat(set.ids()).hasSize(20_000);
   }
 }

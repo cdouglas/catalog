@@ -403,7 +403,7 @@ The codecs use standard protobuf encoding:
 - **Field tag** = `(field_number << 3) | wire_type`
 - **Wire type 0** (varint): `int32`, `int64`, `bool`, enums, and `sint64`
 - **Wire type 1** (fixed64): snapshot IDs and the committed set's
-  timestamps (`max_timestamp_ms`, `highest_dropped_timestamp_ms`)
+  timestamps (`highest_dropped_timestamp_ms`, `floor_ms`)
 - **Wire type 2** (length-delimited): `string`, `bytes`, nested messages
 - **Wire type 5** (fixed32): never written; skipped on read
 

@@ -118,12 +118,13 @@ class TestCommittedTransactions {
   void truncatedPackedEntryThrows() throws IOException {
     // Hand-craft a payload whose packed_entries blob declares a delta but
     // doesn't include the expected 10 random bytes after it. Field tags:
-    //   field 1, fixed64 (wire 1):     tag 0x09
-    //   field 2, length-delim (wire 2): tag 0x12
+    //   CommittedTransactions field 6 (blocks), length-delim: tag 0x32
+    //   CommittedBlock field 3 (packed_entries), length-delim: tag 0x1a
+    // The block is node (0, 0): level and index are 0, so omitted.
     ByteArrayOutputStream out = new ByteArrayOutputStream();
-    out.write(0x09);
-    for (int i = 0; i < 8; i++) out.write(0);
-    out.write(0x12);
+    out.write(0x32);
+    out.write(6);
+    out.write(0x1a);
     // packed_entries length = 4: one delta varint (0x00 = 0), then only 3
     // random bytes — should be 10. Decode must reject.
     out.write(4);

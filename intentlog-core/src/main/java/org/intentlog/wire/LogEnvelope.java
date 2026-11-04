@@ -46,7 +46,7 @@ public final class LogEnvelope {
    * The envelope reader version this build supports, stamped on every checkpoint. A reader
    * refuses a checkpoint that needs more. Bump it only for a change an older reader cannot skip.
    */
-  public static final int SUPPORTED_READER_VERSION = 1;
+  public static final int SUPPORTED_READER_VERSION = 2;
 
   public static final int LOG_CHECKPOINT_MIN_READER_VERSION = 1;
   public static final int LOG_CHECKPOINT_LOG_ID = 2;

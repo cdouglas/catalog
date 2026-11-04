@@ -32,106 +32,132 @@ import org.intentlog.wire.CommittedSetCodec;
 import org.intentlog.wire.UuidV7;
 
 /**
- * The ids of the committed transactions a log's replay has applied, less those GC dropped, and
- * the GC horizon: the newest timestamp it dropped. Replay applies a record once by its id, and a
- * writer learns from the set whether its commit landed. See docs/LOG.md "The committed set and
- * GC".
+ * The ids of the committed transactions a log's replay has applied, less those GC dropped; the
+ * GC horizon H, the newest timestamp it dropped; and the floor F, at or above H, at or below
+ * which replay admits no record. Replay applies a record once by its id, and a writer learns from
+ * the set whether its commit landed. See docs/LOG.md "The committed set and GC" and
+ * docs/COMMITTED_PAGING.md.
  *
- * <p>The set is kept as the {@code CommittedTransactions} packed entries (newest first, each a
- * varint gap from the one before and 10 random bytes), in runs: slices of entries, newest run
- * first, every entry of a run older than every entry of the run before it. Queries scan the runs
- * in place. Adding ids that are newer than every entry, as replay's almost always are, makes them
- * a run of their own, and runs merge by concatenation up to {@link #RUN_BYTES}; ids older than
- * the newest entry merge only with the entries at or above them. A GC drops the oldest runs and
- * cuts the one it ends in. So building a set costs the ids added, not the set. {@link #bytes()}
- * concatenates the runs into the {@code CommittedTransactions} body, which depends only on the
- * ids and the horizon, however the set was built.
+ * <p>The ids are cut into blocks on a grid over their timestamps: the maximal aligned spans of
+ * 2^k ms that hold at most {@link CommittedSetCodec#BLOCK_IDS} ids (a millisecond is a block
+ * however many it holds). The blocks depend on the ids alone, not on the order replay added them
+ * or where its builds fell, so every replica at a position encodes the same bytes (I11). An id
+ * outside every block opens the largest span that holds it and overlaps no block; a block that
+ * passes N ids splits into the maximal spans inside it; a GC, which removes the oldest ids, merges
+ * the oldest blocks with their neighbours once their common span holds N or fewer.
+ *
+ * <p>A block keeps its entries (newest first, each a varint gap from the one before and 10
+ * random bytes) in runs: slices of packed entries, newest run first. Queries find the block by
+ * its span and scan its runs in place. Ids newer than a block's newest become a run of their own,
+ * and runs merge by concatenation up to {@link #RUN_BYTES}; an id older than the newest merges
+ * only with the entries at or above it. So building a set costs the ids added, not the set.
+ * {@link #bytes()} copies each block's bytes: a block decoded and unchanged keeps its slice of the
+ * body, so it matches {@link CommittedSetCodec}'s encoding of the same ids byte for byte.
  */
 public final class CommittedSet {
 
   /** The bytes of packed entries runs reach by merging, and the chunks a GC cuts a run into. */
   static final int RUN_BYTES = 1 << 20;
 
-  private static final int TAG_MAX_TIMESTAMP = 0x09; // field 1, fixed64
-  private static final int TAG_PACKED_ENTRIES = 0x12; // field 2, length-delimited
+  private static final int MAX_LEVEL = CommittedSetCodec.MAX_LEVEL;
+  private static final int RANDOM_BYTES = CommittedSetCodec.RANDOM_BYTES;
   private static final int TAG_HORIZON = 0x19; // field 3, fixed64
-  private static final int RANDOM_BYTES = 10;
+  private static final int TAG_FLOOR = 0x21; // field 4, fixed64
+  private static final int TAG_BLOCK = 0x32; // field 6, length-delimited
+  private static final int TAG_LEVEL = 0x08; // Block field 1, varint
+  private static final int TAG_INDEX = 0x10; // Block field 2, varint
+  private static final int TAG_PACKED = 0x1a; // Block field 3, length-delimited
 
-  public static final CommittedSet EMPTY = new CommittedSet(new Run[0], 0L, new byte[0]);
+  public static final CommittedSet EMPTY = empty(CommittedSetCodec.BLOCK_IDS);
 
-  private final Run[] runs;
+  private final Block[] blocks; // oldest first, disjoint
   private final long horizon;
+  private final long floor;
+  private final int blockIds;
   // The body this set was decoded from, while it is unchanged; else null
   private final byte[] encoded;
 
-  private CommittedSet(Run[] runs, long horizon, byte[] encoded) {
-    this.runs = runs;
+  private CommittedSet(Block[] blocks, long horizon, long floor, int blockIds, byte[] encoded) {
+    this.blocks = blocks;
     this.horizon = horizon;
+    this.floor = floor;
+    this.blockIds = blockIds;
     this.encoded = encoded;
+  }
+
+  static CommittedSet empty(int blockIds) {
+    return new CommittedSet(new Block[0], 0L, 0L, blockIds, new byte[0]);
   }
 
   /** The set encoded by a {@code CommittedTransactions} body; empty for null or no bytes. */
   public static CommittedSet of(byte[] bytes) {
+    return of(bytes, CommittedSetCodec.BLOCK_IDS);
+  }
+
+  /** {@link #of(byte[])}, with blocks of at most {@code blockIds} ids; for tests. */
+  static CommittedSet of(byte[] bytes, int blockIds) {
     if (bytes == null || bytes.length == 0) {
-      return EMPTY;
+      return empty(blockIds);
     }
-    long maxTs = 0L;
     long horizon = 0L;
-    int packedStart = -1;
-    int packedEnd = -1;
+    Long floor = null;
+    List<Block> blocks = new ArrayList<>();
     int[] at = {0};
     while (at[0] < bytes.length) {
       int tag = (int) readVarint(bytes, at, bytes.length);
       switch (tag) {
-        case TAG_MAX_TIMESTAMP:
-          maxTs = readFixed64(bytes, at);
-          break;
-        case TAG_PACKED_ENTRIES:
-          int len = (int) readVarint(bytes, at, bytes.length);
-          packedStart = at[0];
-          packedEnd = packedStart + len;
-          if (packedEnd > bytes.length) {
-            throw malformed("truncated packed entries");
-          }
-          at[0] = packedEnd;
-          break;
         case TAG_HORIZON:
           horizon = readFixed64(bytes, at);
+          break;
+        case TAG_FLOOR:
+          floor = readFixed64(bytes, at);
+          break;
+        case TAG_BLOCK:
+          int len = (int) readVarint(bytes, at, bytes.length);
+          int end = at[0] + len;
+          if (len <= 0 || end > bytes.length) {
+            throw malformed("truncated block");
+          }
+          Block block = Block.decode(bytes, at[0], end);
+          if (!blocks.isEmpty() && block.start() <= blocks.get(blocks.size() - 1).top()) {
+            throw malformed("blocks out of order or overlapping");
+          }
+          blocks.add(block);
+          at[0] = end;
           break;
         default:
           skipField(bytes, at, tag);
       }
     }
-    Run[] runs = packedStart < packedEnd
-        ? new Run[] {Run.slice(bytes, packedStart, packedEnd, maxTs)}
-        : new Run[0];
-    return new CommittedSet(runs, horizon, bytes);
+    long f = floor == null ? horizon : floor;
+    if (f < horizon) {
+      throw malformed("floor below horizon");
+    }
+    return new CommittedSet(blocks.toArray(new Block[0]), horizon, f, blockIds, bytes);
   }
 
-  /** The {@code CommittedTransactions} body; empty iff the set holds no id and no horizon. */
+  /** The {@code CommittedTransactions} body; empty iff the set holds no id, no horizon, no floor. */
   public byte[] bytes() {
     if (encoded != null) {
       return encoded;
     }
-    int packed = packedSize();
-    if (runs.length == 0 && horizon == 0L) {
+    if (blocks.length == 0 && horizon == 0L && floor == 0L) {
       return new byte[0];
     }
-    byte[] out = new byte[encodedSize(packed)];
+    byte[] out = new byte[checkedSize()];
     int at = 0;
-    out[at++] = TAG_MAX_TIMESTAMP;
-    at = writeFixed64(out, at, runs.length == 0 ? 0L : runs[0].maxTs);
-    out[at++] = TAG_PACKED_ENTRIES;
-    at = writeVarint(out, at, packed);
-    for (int i = 0; i < runs.length; i++) {
-      Run run = runs[i];
-      at = writeVarint(out, at, i == 0 ? 0L : runs[i - 1].minTs() - run.maxTs);
-      System.arraycopy(run.buf, run.bodyOff, out, at, run.end - run.bodyOff);
-      at += run.end - run.bodyOff;
-    }
     if (horizon != 0L) {
       out[at++] = TAG_HORIZON;
-      writeFixed64(out, at, horizon);
+      at = writeFixed64(out, at, horizon);
+    }
+    if (floor != horizon) {
+      out[at++] = TAG_FLOOR;
+      at = writeFixed64(out, at, floor);
+    }
+    for (Block block : blocks) {
+      out[at++] = TAG_BLOCK;
+      at = writeVarint(out, at, block.messageSize());
+      at = block.writeMessage(out, at);
     }
     return out;
   }
@@ -141,22 +167,23 @@ public final class CommittedSet {
     if (encoded != null) {
       return encoded.length;
     }
-    if (runs.length == 0 && horizon == 0L) {
+    return size();
+  }
+
+  private long size() {
+    if (blocks.length == 0 && horizon == 0L && floor == 0L) {
       return 0;
     }
-    return encodedSize(packedSize());
-  }
-
-  private int encodedSize(int packed) {
-    return 1 + 8 + 1 + varintSize(packed) + packed + (horizon != 0L ? 1 + 8 : 0);
-  }
-
-  private int packedSize() {
-    long size = 0;
-    for (int i = 0; i < runs.length; i++) {
-      Run run = runs[i];
-      size += varintSize(i == 0 ? 0L : runs[i - 1].minTs() - run.maxTs) + run.end - run.bodyOff;
+    long size = (horizon != 0L ? 9 : 0) + (floor != horizon ? 9 : 0);
+    for (Block block : blocks) {
+      int message = block.messageSize();
+      size += 1 + varintSize(message) + message;
     }
+    return size;
+  }
+
+  private int checkedSize() {
+    long size = size();
     if (size > Integer.MAX_VALUE - 32) {
       throw new IllegalStateException("A committed set of " + size + " bytes is too large");
     }
@@ -168,51 +195,46 @@ public final class CommittedSet {
     return horizon;
   }
 
+  /** The floor: replay admits no record whose id is at or below it. At or above the horizon. */
+  public long floor() {
+    return floor;
+  }
+
   /**
    * Whether {@code id} committed. True if the set holds it; false if it does not and the id is
-   * newer than the horizon, or not a UUIDv7; and if it does not and the id is at or below the
-   * horizon, the set cannot tell an aged-out commit from one that never landed, and this throws
+   * newer than the floor, or not a UUIDv7; and if it does not and the id is at or below the
+   * floor, the set cannot tell an aged-out commit from one that never landed, and this throws
    * {@link DedupHorizonExceededException}.
    */
   public boolean contains(UUID id) {
     if (holds(id)) {
       return true;
     }
-    checkAboveHorizon(id, horizon);
+    checkAboveFloor(id, floor);
     return false;
   }
 
   /**
    * Whether replay may apply the record of {@code id}: the set neither holds the id (the record
-   * is a retry of one already applied) nor dropped ids at or after its time. A record at or below
-   * the horizon may be a retry of a commit whose id aged out, so replay rejects it (Bug 64).
+   * is a retry of one already applied) nor is the id at or below the floor. A record at or below
+   * it may be a retry of a commit whose id aged out, so replay rejects it (Bug 64).
    */
   public boolean mayApply(UUID id) {
-    return !holds(id) && aboveHorizon(id, horizon);
+    return !holds(id) && aboveFloor(id, floor);
   }
 
   private boolean holds(UUID id) {
-    if (runs.length == 0 || !UuidV7.isV7(id)) {
+    if (blocks.length == 0 || !UuidV7.isV7(id)) {
       return false;
     }
     long ts = UuidV7.timestampMs(id);
-    byte[] rand = UuidV7.packRandomBits(id);
-    for (Run run : runs) {
-      if (ts > run.maxTs) {
-        // Newer than this run and older than the one before it
-        return false;
-      }
-      int found = run.find(ts, rand);
-      if (found != 0) {
-        return found > 0;
-      }
-    }
-    return false;
+    int b = blockFor(blocks, ts);
+    return b >= 0 && blocks[b].holds(ts, UuidV7.packRandomBits(id));
   }
 
   /** Decodes every id in the set, newest first. */
   public Set<UUID> ids() {
-    if (runs.length == 0) {
+    if (blocks.length == 0) {
       return Collections.emptySet();
     }
     try {
@@ -231,28 +253,352 @@ public final class CommittedSet {
     return new Builder(EMPTY);
   }
 
-  /** The number of runs; for tests. */
-  int runCount() {
-    return runs.length;
+  /** A builder of an empty set with blocks of at most {@code blockIds} ids; for tests. */
+  static Builder builder(int blockIds) {
+    return new Builder(empty(blockIds));
   }
 
-  /** This set with {@code added} too: the ids newer than every entry as a run of their own. */
+  /** The number of blocks; for tests. */
+  int blockCount() {
+    return blocks.length;
+  }
+
+  /** The number of runs in every block; for tests. */
+  int runCount() {
+    int runs = 0;
+    for (Block block : blocks) {
+      runs += block.runs.length;
+    }
+    return runs;
+  }
+
+  /** The block that holds {@code ts}'s span, or -1. */
+  private static int blockFor(Block[] blocks, long ts) {
+    int lo = 0;
+    int hi = blocks.length - 1;
+    while (lo <= hi) {
+      int mid = (lo + hi) >>> 1;
+      Block block = blocks[mid];
+      if (ts < block.start()) {
+        hi = mid - 1;
+      } else if (ts > block.top()) {
+        lo = mid + 1;
+      } else {
+        return mid;
+      }
+    }
+    return -1;
+  }
+
+  /** {@link #blockFor} over a list. */
+  private static int blockFor(List<Block> blocks, long ts) {
+    int lo = 0;
+    int hi = blocks.size() - 1;
+    while (lo <= hi) {
+      int mid = (lo + hi) >>> 1;
+      Block block = blocks.get(mid);
+      if (ts < block.start()) {
+        hi = mid - 1;
+      } else if (ts > block.top()) {
+        lo = mid + 1;
+      } else {
+        return mid;
+      }
+    }
+    return -(lo + 1);
+  }
+
+  /** This set with {@code added} too. */
   private CommittedSet with(Collection<UUID> added) {
     int n = added.size();
     long[] ts = new long[n];
     byte[][] rand = new byte[n][];
-    sortNewestFirst(added, ts, rand);
-    long oldest = ts[n - 1];
+    CommittedSetCodec.sortNewestFirst(added, ts, rand);
 
-    List<Run> next = new ArrayList<>(runs.length + 2);
-    int rest = 0;
-    if (runs.length == 0 || oldest > runs[0].maxTs) {
-      next.add(Run.of(ts, rand, 0, n));
-    } else {
+    // Each block's additions are a range of the sorted ids, since blocks are disjoint spans. An
+    // id outside every block opens the largest span that holds it and overlaps no block.
+    List<Block> list = new ArrayList<>(Arrays.asList(blocks));
+    List<Block> targets = new ArrayList<>();
+    List<int[]> ranges = new ArrayList<>();
+    int i = 0;
+    while (i < n) {
+      int b = blockFor(list, ts[i]);
+      Block target;
+      if (b >= 0) {
+        target = list.get(b);
+      } else {
+        int insert = -(b + 1);
+        target = Block.open(largestFreeNode(list, insert, ts[i]));
+        list.add(insert, target);
+      }
+      int j = i + 1;
+      while (j < n && ts[j] >= target.start()) {
+        j++;
+      }
+      targets.add(target);
+      ranges.add(new int[] {i, j});
+      i = j;
+    }
+    for (int t = 0; t < targets.size(); t++) {
+      Block target = targets.get(t);
+      int[] range = ranges.get(t);
+      Block grown = target.withAdds(ts, rand, range[0], range[1]);
+      int at = indexOf(list, target);
+      // A block decoded from a checkpoint has not counted its entries; its bytes bound them, so a
+      // fold scans one only when it may have passed N
+      if (grown.level > 0 && grown.countAtMost() > blockIds && grown.count() > blockIds) {
+        List<Block> split = grown.split(blockIds);
+        list.remove(at);
+        list.addAll(at, split);
+      } else {
+        list.set(at, grown);
+      }
+    }
+    return new CommittedSet(list.toArray(new Block[0]), horizon, floor, blockIds, null);
+  }
+
+  private static int indexOf(List<Block> list, Block block) {
+    int at = blockFor(list, block.start());
+    if (at < 0 || list.get(at) != block) {
+      throw new IllegalStateException("block not found");
+    }
+    return at;
+  }
+
+  /**
+   * The largest node holding {@code ts} that overlaps no block of {@code list}, where {@code
+   * insert} is where a block holding {@code ts} would go. A node holding {@code ts} overlaps a
+   * block only by containing it, since no block holds {@code ts}.
+   */
+  private static long[] largestFreeNode(List<Block> list, int insert, long ts) {
+    int level = 0;
+    long index = ts;
+    while (level < MAX_LEVEL) {
+      int parentLevel = level + 1;
+      long parentIndex = index >> 1;
+      long start = parentIndex << parentLevel;
+      long top = CommittedSetCodec.top(parentLevel, parentIndex);
+      boolean before = insert > 0 && list.get(insert - 1).top() >= start;
+      boolean after = insert < list.size() && list.get(insert).start() <= top;
+      if (before || after) {
+        break;
+      }
+      level = parentLevel;
+      index = parentIndex;
+    }
+    return new long[] {level, index};
+  }
+
+  /**
+   * Merges the oldest blocks with their neighbours while their common span holds at most N ids:
+   * after a GC or a page-out, which remove ids only at the old end, these are the only spans
+   * whose counts fell.
+   */
+  private static void mergeUp(List<Block> list, int blockIds) {
+    while (!list.isEmpty()) {
+      Block oldest = list.get(0);
+      if (oldest.level >= MAX_LEVEL) {
+        return;
+      }
+      int level = oldest.level + 1;
+      long index = oldest.index >> 1;
+      long top = CommittedSetCodec.top(level, index);
+      int inside = 0;
+      long count = 0;
+      while (inside < list.size() && list.get(inside).top() <= top) {
+        count += list.get(inside).count();
+        inside++;
+      }
+      if (count > blockIds) {
+        return;
+      }
+      List<Block> merged = new ArrayList<>(list.subList(0, inside));
+      list.subList(0, inside).clear();
+      list.add(0, Block.merge(level, index, merged, (int) count));
+    }
+  }
+
+  /** This set less every id at or below {@code watermarkMs}, the horizon raised to the newest. */
+  private CommittedSet dropThrough(long watermarkMs) {
+    long newestDropped = Long.MIN_VALUE;
+    int drop = 0;
+    while (drop < blocks.length && blocks[drop].maxTs() <= watermarkMs) {
+      newestDropped = Math.max(newestDropped, blocks[drop].maxTs());
+      drop++;
+    }
+    List<Block> list = new ArrayList<>(Arrays.asList(blocks).subList(drop, blocks.length));
+    if (!list.isEmpty()) {
+      Block.Cut cut = list.get(0).cutThrough(watermarkMs);
+      if (cut != null) {
+        list.set(0, cut.kept);
+        newestDropped = Math.max(newestDropped, cut.newestDropped);
+      }
+    }
+    if (newestDropped == Long.MIN_VALUE) {
+      return this;
+    }
+    mergeUp(list, blockIds);
+    long newHorizon = Math.max(horizon, newestDropped);
+    return new CommittedSet(
+        list.toArray(new Block[0]), newHorizon, Math.max(floor, newHorizon), blockIds, null);
+  }
+
+  private static boolean aboveFloor(UUID id, long floor) {
+    return !UuidV7.isV7(id) || floor == 0L || UuidV7.timestampMs(id) > floor;
+  }
+
+  private static void checkAboveFloor(UUID id, long floor) {
+    if (!aboveFloor(id, floor)) {
+      throw new DedupHorizonExceededException(id, floor);
+    }
+  }
+
+  /**
+   * A block: node {@code (level, index)}, the span {@code [index * 2^level, (index + 1) *
+   * 2^level)}, and its entries in runs, newest run first. Never changed once made.
+   */
+  private static final class Block {
+    final int level;
+    final long index;
+    final Run[] runs; // newest first; empty only for a block just opened
+    private volatile int count;
+    // The Block message's bytes: a slice of the body it was decoded from, or made on first use
+    private volatile byte[] messageBuf;
+    private volatile int messageOff;
+    private volatile int messageEnd;
+
+    private Block(int level, long index, Run[] runs, int count) {
+      this.level = level;
+      this.index = index;
+      this.runs = runs;
+      this.count = count;
+    }
+
+    static Block open(long[] node) {
+      return new Block((int) node[0], node[1], new Run[0], 0);
+    }
+
+    static Block decode(byte[] buf, int off, int end) {
+      int level = 0;
+      long index = 0L;
+      int packedStart = -1;
+      int packedEnd = -1;
+      int[] at = {off};
+      while (at[0] < end) {
+        int tag = (int) readVarint(buf, at, end);
+        switch (tag) {
+          case TAG_LEVEL:
+            level = (int) readVarint(buf, at, end);
+            break;
+          case TAG_INDEX:
+            index = readVarint(buf, at, end);
+            break;
+          case TAG_PACKED:
+            int len = (int) readVarint(buf, at, end);
+            packedStart = at[0];
+            packedEnd = packedStart + len;
+            if (len < 0 || packedEnd > end) {
+              throw malformed("truncated packed entries");
+            }
+            at[0] = packedEnd;
+            break;
+          default:
+            skipField(buf, at, tag);
+            if (at[0] > end) {
+              throw malformed("truncated block field");
+            }
+        }
+      }
+      if (level > MAX_LEVEL || index < 0
+          || (level == MAX_LEVEL ? index != 0L : index >= (1L << (MAX_LEVEL - level)))) {
+        throw malformed("block node (" + level + ", " + index + ")");
+      }
+      if (packedStart < 0 || packedStart == packedEnd) {
+        throw malformed("empty block");
+      }
+      long top = CommittedSetCodec.top(level, index);
+      int[] first = {packedStart};
+      long gap = readVarint(buf, first, packedEnd);
+      if (gap < 0 || gap > top - (index << level)) {
+        throw malformed("entry outside its block");
+      }
+      Block block = new Block(level, index,
+          new Run[] {Run.slice(buf, packedStart, packedEnd, top - gap)}, -1);
+      block.messageBuf = buf;
+      block.messageOff = off;
+      block.messageEnd = end;
+      return block;
+    }
+
+    long start() {
+      return index << level;
+    }
+
+    long top() {
+      return CommittedSetCodec.top(level, index);
+    }
+
+    long maxTs() {
+      return runs[0].maxTs;
+    }
+
+    int count() {
+      int c = count;
+      if (c < 0) {
+        c = 0;
+        for (Run run : runs) {
+          c += run.count();
+        }
+        count = c;
+      }
+      return c;
+    }
+
+    /** At least {@link #count()}, without scanning a run that has not counted its entries. */
+    int countAtMost() {
+      int c = count;
+      if (c >= 0) {
+        return c;
+      }
+      long most = 0;
+      for (Run run : runs) {
+        most += run.countAtMost();
+      }
+      return (int) Math.min(most, Integer.MAX_VALUE);
+    }
+
+    boolean holds(long ts, byte[] rand) {
+      for (Run run : runs) {
+        if (ts > run.maxTs) {
+          // Newer than this run and older than the one before it
+          return false;
+        }
+        int found = run.find(ts, rand);
+        if (found != 0) {
+          return found > 0;
+        }
+      }
+      return false;
+    }
+
+    /** This block with sorted ids {@code [from, to)} too, all within its span. */
+    Block withAdds(long[] ts, byte[][] rand, int from, int to) {
+      if (runs.length == 0) {
+        return new Block(level, index, new Run[] {Run.of(ts, rand, from, to)}, to - from);
+      }
+      long oldest = ts[to - 1];
+      List<Run> next = new ArrayList<>(runs.length + 2);
+      int known = count;
+      if (oldest > runs[0].maxTs) {
+        next.add(Run.of(ts, rand, from, to));
+        next.addAll(Arrays.asList(runs));
+        return new Block(level, index, mergeHead(next), known < 0 ? -1 : known + to - from);
+      }
       // Merge the ids with the entries at or above the oldest of them: whole runs, then the part
       // of the run the oldest falls in, whose entries below it stay a run
       List<Run> above = new ArrayList<>();
       Run below = null;
+      int rest = 0;
       while (rest < runs.length && runs[rest].maxTs >= oldest) {
         Run[] split = runs[rest++].splitBelow(oldest);
         above.add(split[0]);
@@ -261,15 +607,140 @@ public final class CommittedSet {
           break;
         }
       }
-      byte[] merged = CommittedSetCodec.rewrite(
-          new CommittedSet(above.toArray(new Run[0]), 0L, null).bytes(), added, 0L);
-      next.add(of(merged).runs[0]);
+      Entries merged = Entries.merge(Entries.of(above), ts, rand, from, to);
+      next.add(Run.of(merged.ts, merged.rand, 0, merged.size));
       if (below != null) {
         next.add(below);
       }
+      next.addAll(Arrays.asList(runs).subList(rest, runs.length));
+      int added = merged.size - merged.inherited;
+      return new Block(level, index, mergeHead(next), known < 0 ? -1 : known + added);
     }
-    next.addAll(Arrays.asList(runs).subList(rest, runs.length));
-    return new CommittedSet(mergeHead(next), horizon, null);
+
+    /** This block, past N ids, as the maximal nodes inside it that hold at most N. */
+    List<Block> split(int blockIds) {
+      Entries all = Entries.of(Arrays.asList(runs));
+      List<Block> out = new ArrayList<>();
+      partition(all, level, index, 0, all.size, blockIds, out);
+      return out;
+    }
+
+    private static void partition(
+        Entries all, int level, long index, int lo, int hi, int blockIds, List<Block> out) {
+      if (lo >= hi) {
+        return;
+      }
+      if (hi - lo <= blockIds || level == 0) {
+        out.add(new Block(level, index, new Run[] {Run.of(all.ts, all.rand, lo, hi)}, hi - lo));
+        return;
+      }
+      long mid = (2 * index + 1) << (level - 1);
+      int split = lo;
+      while (split < hi && all.ts[split] >= mid) {
+        split++;
+      }
+      partition(all, level - 1, 2 * index, split, hi, blockIds, out);
+      partition(all, level - 1, 2 * index + 1, lo, split, blockIds, out);
+    }
+
+    /** Blocks {@code inside} (oldest first) merged into node {@code (level, index)}. */
+    static Block merge(int level, long index, List<Block> inside, int count) {
+      List<Run> runs = new ArrayList<>();
+      for (int i = inside.size() - 1; i >= 0; i--) {
+        runs.addAll(Arrays.asList(inside.get(i).runs));
+      }
+      return new Block(level, index, mergeHead(runs), count);
+    }
+
+    /** What a GC keeps of a block, and the newest id it dropped. */
+    static final class Cut {
+      final Block kept;
+      final long newestDropped;
+
+      Cut(Block kept, long newestDropped) {
+        this.kept = kept;
+        this.newestDropped = newestDropped;
+      }
+    }
+
+    /**
+     * The entries above {@code watermarkMs}, if the block holds some at or below it and its newest
+     * is above it; else null.
+     */
+    Cut cutThrough(long watermarkMs) {
+      List<Run> kept = new ArrayList<>();
+      long newestDropped = Long.MIN_VALUE;
+      for (Run run : runs) {
+        if (run.maxTs <= watermarkMs) {
+          newestDropped = run.maxTs;
+          break;
+        }
+        Run.Cut cut = run.cutThrough(watermarkMs);
+        if (cut == null) {
+          kept.add(run);
+          continue;
+        }
+        kept.addAll(Arrays.asList(cut.chunks));
+        if (cut.newestDropped != Long.MIN_VALUE) {
+          newestDropped = cut.newestDropped;
+          break;
+        }
+      }
+      if (newestDropped == Long.MIN_VALUE) {
+        return null;
+      }
+      return new Cut(new Block(level, index, kept.toArray(new Run[0]), -1), newestDropped);
+    }
+
+    int messageSize() {
+      byte[] buf = messageBuf;
+      if (buf != null) {
+        return messageEnd - messageOff;
+      }
+      int packed = packedSize();
+      return (level != 0 ? 1 + varintSize(level) : 0) + (index != 0L ? 1 + varintSize(index) : 0)
+          + 1 + varintSize(packed) + packed;
+    }
+
+    private int packedSize() {
+      long size = varintSize(top() - runs[0].maxTs) + runs[0].end - runs[0].bodyOff;
+      for (int i = 1; i < runs.length; i++) {
+        Run run = runs[i];
+        size += varintSize(runs[i - 1].minTs() - run.maxTs) + run.end - run.bodyOff;
+      }
+      if (size > Integer.MAX_VALUE - 32) {
+        throw new IllegalStateException("A block of " + size + " bytes is too large");
+      }
+      return (int) size;
+    }
+
+    int writeMessage(byte[] out, int at) {
+      byte[] buf = messageBuf;
+      if (buf != null) {
+        int len = messageEnd - messageOff;
+        System.arraycopy(buf, messageOff, out, at, len);
+        return at + len;
+      }
+      // A block made in memory writes its runs: the same copy as a cached message would cost,
+      // without pinning the whole body a first write went into
+      if (level != 0) {
+        out[at++] = TAG_LEVEL;
+        at = writeVarint(out, at, level);
+      }
+      if (index != 0L) {
+        out[at++] = TAG_INDEX;
+        at = writeVarint(out, at, index);
+      }
+      out[at++] = TAG_PACKED;
+      at = writeVarint(out, at, packedSize());
+      for (int i = 0; i < runs.length; i++) {
+        Run run = runs[i];
+        at = writeVarint(out, at, (i == 0 ? top() : runs[i - 1].minTs()) - run.maxTs);
+        System.arraycopy(run.buf, run.bodyOff, out, at, run.end - run.bodyOff);
+        at += run.end - run.bodyOff;
+      }
+      return at;
+    }
   }
 
   /**
@@ -291,73 +762,90 @@ public final class CommittedSet {
     return runs.toArray(new Run[0]);
   }
 
-  /** This set less every id at or below {@code watermarkMs}, the horizon raised to the newest. */
-  private CommittedSet dropThrough(long watermarkMs) {
-    long newHorizon = horizon;
-    int keep = runs.length;
-    Run[] cut = null;
-    while (keep > 0) {
-      Run run = runs[keep - 1];
-      if (run.maxTs <= watermarkMs) {
-        // Its newest entry is its first
-        newHorizon = Math.max(newHorizon, run.maxTs);
-        keep--;
-        continue;
+  /** Entries decoded from runs, newest first. */
+  private static final class Entries {
+    final long[] ts;
+    final byte[][] rand;
+    final int size;
+    // How many of them were inherited (for a merge: the rest are additions)
+    final int inherited;
+
+    private Entries(long[] ts, byte[][] rand, int size, int inherited) {
+      this.ts = ts;
+      this.rand = rand;
+      this.size = size;
+      this.inherited = inherited;
+    }
+
+    static Entries of(List<Run> runs) {
+      int n = 0;
+      for (Run run : runs) {
+        n += run.count();
       }
-      Run.Cut kept = run.cutThrough(watermarkMs);
-      if (kept != null) {
-        newHorizon = Math.max(newHorizon, kept.newestDropped);
-        cut = kept.chunks;
+      long[] ts = new long[n];
+      byte[][] rand = new byte[n][];
+      int i = 0;
+      for (Run run : runs) {
+        long entryTs = run.maxTs;
+        int[] at = {run.bodyOff};
+        while (true) {
+          ts[i] = entryTs;
+          rand[i] = Arrays.copyOfRange(run.buf, at[0], at[0] + RANDOM_BYTES);
+          i++;
+          at[0] += RANDOM_BYTES;
+          if (at[0] >= run.end) {
+            break;
+          }
+          entryTs -= readVarint(run.buf, at, run.end);
+        }
       }
-      break;
+      return new Entries(ts, rand, n, n);
     }
-    if (keep == runs.length && cut == null) {
-      return this;
-    }
-    List<Run> next = new ArrayList<>(Arrays.asList(runs).subList(0, keep));
-    if (cut != null) {
-      next.remove(keep - 1);
-      next.addAll(Arrays.asList(cut));
-    }
-    return new CommittedSet(next.toArray(new Run[0]), newHorizon, null);
-  }
 
-  private static void sortNewestFirst(Collection<UUID> ids, long[] ts, byte[][] rand) {
-    UUID[] sorted = ids.toArray(new UUID[0]);
-    // UUID.compareTo is signed per half, so compare as v7 orders them: timestamp, then the random
-    // bits unsigned (UuidV7.packRandomBits keeps their order)
-    long[] keyTs = new long[sorted.length];
-    byte[][] keyRand = new byte[sorted.length][];
-    Integer[] order = new Integer[sorted.length];
-    for (int i = 0; i < sorted.length; i++) {
-      keyTs[i] = UuidV7.timestampMs(sorted[i]);
-      keyRand[i] = UuidV7.packRandomBits(sorted[i]);
-      order[i] = i;
-    }
-    Arrays.sort(order, (a, b) -> {
-      int c = Long.compare(keyTs[b], keyTs[a]);
-      return c != 0 ? c : Arrays.compareUnsigned(keyRand[b], keyRand[a]);
-    });
-    for (int i = 0; i < sorted.length; i++) {
-      ts[i] = keyTs[order[i]];
-      rand[i] = keyRand[order[i]];
-    }
-  }
-
-  private static boolean aboveHorizon(UUID id, long horizon) {
-    return !UuidV7.isV7(id) || horizon == 0L || UuidV7.timestampMs(id) > horizon;
-  }
-
-  private static void checkAboveHorizon(UUID id, long horizon) {
-    if (!aboveHorizon(id, horizon)) {
-      throw new DedupHorizonExceededException(id, horizon);
+    /** {@code inherited} and sorted ids {@code [from, to)} merged newest first, copies once. */
+    static Entries merge(Entries inherited, long[] ts, byte[][] rand, int from, int to) {
+      int n = inherited.size + to - from;
+      long[] outTs = new long[n];
+      byte[][] outRand = new byte[n][];
+      int a = 0;
+      int b = from;
+      int out = 0;
+      int kept = 0;
+      while (a < inherited.size || b < to) {
+        int c;
+        if (a >= inherited.size) {
+          c = 1;
+        } else if (b >= to) {
+          c = -1;
+        } else {
+          c = Long.compare(ts[b], inherited.ts[a]);
+          if (c == 0) {
+            c = Arrays.compareUnsigned(rand[b], inherited.rand[a]);
+          }
+        }
+        if (c < 0) {
+          outTs[out] = inherited.ts[a];
+          outRand[out++] = inherited.rand[a++];
+          kept++;
+        } else if (c > 0) {
+          outTs[out] = ts[b];
+          outRand[out++] = rand[b++];
+        } else {
+          // A copy of an id the block holds
+          outTs[out] = inherited.ts[a];
+          outRand[out++] = inherited.rand[a++];
+          kept++;
+          b++;
+        }
+      }
+      return new Entries(outTs, outRand, out, kept);
     }
   }
 
   /**
    * Packed entries {@code [off, end)} of a buffer, never changed once made. The first entry's
-   * timestamp is {@code maxTs}; its gap varint (at {@code off}) is from an entry before the run,
-   * if any, and is skipped: {@code bodyOff} is its random bytes.
+   * timestamp is {@code maxTs}; its gap varint (at {@code off}) is from an entry or node top
+   * before the run, if any, and is skipped: {@code bodyOff} is its random bytes.
    */
   private static final class Run {
     final byte[] buf;
@@ -365,11 +853,11 @@ public final class CommittedSet {
     final int bodyOff;
     final int end;
     final long maxTs;
-    // The oldest entry's timestamp, scanned on first use
+    // The oldest entry's timestamp and the entries, scanned on first use
     private volatile long minTs;
-    private volatile boolean scanned;
+    private volatile int count;
 
-    private Run(byte[] buf, int off, int end, long maxTs, long minTs, boolean scanned) {
+    private Run(byte[] buf, int off, int end, long maxTs, long minTs, int count) {
       this.buf = buf;
       this.off = off;
       this.end = end;
@@ -381,11 +869,11 @@ public final class CommittedSet {
         throw malformed("truncated entry");
       }
       this.minTs = minTs;
-      this.scanned = scanned;
+      this.count = count;
     }
 
     static Run slice(byte[] buf, int off, int end, long maxTs) {
-      return new Run(buf, off, end, maxTs, 0L, false);
+      return new Run(buf, off, end, maxTs, Long.MIN_VALUE, -1);
     }
 
     /** The entries {@code [from, to)} of sorted arrays, as a run of their own. */
@@ -401,7 +889,7 @@ public final class CommittedSet {
         System.arraycopy(rand[i], 0, buf, at, RANDOM_BYTES);
         at += RANDOM_BYTES;
       }
-      return new Run(buf, 0, size, ts[from], ts[to - 1], true);
+      return new Run(buf, 0, size, ts[from], ts[to - 1], to - from);
     }
 
     /** {@code newer} then {@code older}, whose entries are all older than {@code newer}'s. */
@@ -412,24 +900,49 @@ public final class CommittedSet {
       System.arraycopy(newer.buf, newer.off, buf, 0, newer.end - newer.off);
       int at = writeVarint(buf, newer.end - newer.off, gap);
       System.arraycopy(older.buf, older.bodyOff, buf, at, olderBody);
-      return new Run(buf, 0, buf.length, newer.maxTs, older.minTs(), true);
+      return new Run(buf, 0, buf.length, newer.maxTs, older.minTs(), newer.count() + older.count());
     }
 
     long minTs() {
-      if (!scanned) {
-        long ts = maxTs;
-        int[] at = {bodyOff + RANDOM_BYTES};
-        while (at[0] < end) {
-          ts -= readVarint(buf, at, end);
-          at[0] += RANDOM_BYTES;
-          if (at[0] > end) {
-            throw malformed("truncated entry");
-          }
-        }
-        minTs = ts;
-        scanned = true;
+      if (minTs == Long.MIN_VALUE) {
+        scan();
       }
       return minTs;
+    }
+
+    int count() {
+      if (count < 0) {
+        scan();
+      }
+      return count;
+    }
+
+    /**
+     * At least {@link #count()}: every entry after the first takes a gap varint and its random
+     * bytes, 11 bytes or more.
+     */
+    int countAtMost() {
+      int c = count;
+      if (c >= 0) {
+        return c;
+      }
+      return 1 + (end - bodyOff - RANDOM_BYTES) / (RANDOM_BYTES + 1);
+    }
+
+    private void scan() {
+      long ts = maxTs;
+      int n = 1;
+      int[] at = {bodyOff + RANDOM_BYTES};
+      while (at[0] < end) {
+        ts -= readVarint(buf, at, end);
+        at[0] += RANDOM_BYTES;
+        n++;
+        if (at[0] > end) {
+          throw malformed("truncated entry");
+        }
+      }
+      minTs = ts;
+      count = n;
     }
 
     /**
@@ -481,7 +994,7 @@ public final class CommittedSet {
      * the rest as a run (null if none).
      */
     Run[] splitBelow(long ts) {
-      if (scanned && minTs >= ts) {
+      if (minTs != Long.MIN_VALUE && minTs >= ts) {
         return new Run[] {this, null};
       }
       long entryTs = maxTs;
@@ -491,8 +1004,8 @@ public final class CommittedSet {
         long next = entryTs - readVarint(buf, at, end);
         if (next < ts) {
           return new Run[] {
-            new Run(buf, off, entry, maxTs, entryTs, true),
-            new Run(buf, entry, end, next, minTs, scanned)
+            new Run(buf, off, entry, maxTs, entryTs, -1),
+            new Run(buf, entry, end, next, minTs, -1)
           };
         }
         entryTs = next;
@@ -514,10 +1027,11 @@ public final class CommittedSet {
 
     /**
      * The entries above {@code watermarkMs}, in chunks of about {@link #RUN_BYTES}, and the newest
-     * dropped; null if the run drops nothing. A run's first entry is above the watermark.
+     * dropped (Long.MIN_VALUE if none); null if the run drops nothing and needs no chunking. A
+     * run's first entry is above the watermark.
      */
     Cut cutThrough(long watermarkMs) {
-      if (scanned && minTs > watermarkMs && end - off <= RUN_BYTES) {
+      if (minTs != Long.MIN_VALUE && minTs > watermarkMs && end - off <= RUN_BYTES) {
         return null;
       }
       List<Run> chunks = new ArrayList<>();
@@ -529,11 +1043,11 @@ public final class CommittedSet {
         int entry = at[0];
         long next = entryTs - readVarint(buf, at, end);
         if (next <= watermarkMs) {
-          chunks.add(new Run(buf, chunkStart, entry, chunkMax, entryTs, true));
+          chunks.add(new Run(buf, chunkStart, entry, chunkMax, entryTs, -1));
           return new Cut(chunks.toArray(new Run[0]), next);
         }
         if (entry - chunkStart >= RUN_BYTES) {
-          chunks.add(new Run(buf, chunkStart, entry, chunkMax, entryTs, true));
+          chunks.add(new Run(buf, chunkStart, entry, chunkMax, entryTs, -1));
           chunkStart = entry;
           chunkMax = next;
         }
@@ -543,11 +1057,10 @@ public final class CommittedSet {
       if (chunks.isEmpty()) {
         // Nothing dropped, and the run fits in one chunk: it stays as it is, now scanned
         minTs = entryTs;
-        scanned = true;
         return null;
       }
-      chunks.add(new Run(buf, chunkStart, end, chunkMax, entryTs, true));
-      // Nothing dropped, but the run is now in chunks; the horizon stays where it was
+      chunks.add(new Run(buf, chunkStart, end, chunkMax, entryTs, -1));
+      // Nothing dropped, but the run is now in chunks
       return new Cut(chunks.toArray(new Run[0]), Long.MIN_VALUE);
     }
   }
@@ -566,7 +1079,7 @@ public final class CommittedSet {
 
     /** Replaces the inherited set (a decoded checkpoint's); additions are kept. */
     public Builder inherit(byte[] bytes) {
-      this.base = of(bytes);
+      this.base = of(bytes, base.blockIds);
       return this;
     }
 
@@ -578,28 +1091,32 @@ public final class CommittedSet {
       return this;
     }
 
-    /** {@link CommittedSet#contains}, counting the ids added so far; the horizon is inherited. */
+    /** {@link CommittedSet#contains}, counting the ids added so far; the floor is inherited. */
     public boolean contains(UUID id) {
       if (added.contains(id) || base.holds(id)) {
         return true;
       }
-      checkAboveHorizon(id, base.horizon);
+      checkAboveFloor(id, base.floor);
       return false;
     }
 
     /** {@link CommittedSet#mayApply}, counting the ids added so far. */
     public boolean mayApply(UUID id) {
-      return !added.contains(id) && !base.holds(id) && aboveHorizon(id, base.horizon);
+      return !added.contains(id) && !base.holds(id) && aboveFloor(id, base.floor);
     }
 
     public long horizon() {
       return base.horizon;
     }
 
+    public long floor() {
+      return base.floor;
+    }
+
     /**
      * Applies a GC record ({@code AdvanceHorizon}): drops every id at or below {@code
-     * watermarkMs}, inherited or added, and raises the horizon to the newest one dropped. A
-     * watermark at or below the horizon drops nothing new.
+     * watermarkMs}, inherited or added, and raises the horizon to the newest one dropped, and the
+     * floor to the horizon. A watermark at or below the horizon drops nothing new.
      */
     public Builder advanceHorizon(long watermarkMs) {
       if (watermarkMs < 0L) {
@@ -616,7 +1133,10 @@ public final class CommittedSet {
       if (added.isEmpty()) {
         return base;
       }
-      return base.with(added);
+      CommittedSet built = base.with(added);
+      base = built;
+      added.clear();
+      return built;
     }
   }
 
@@ -628,7 +1148,7 @@ public final class CommittedSet {
     long value = 0;
     int shift = 0;
     while (true) {
-      if (at[0] >= end) {
+      if (at[0] >= end || shift > 63) {
         throw malformed("truncated varint");
       }
       int b = buf[at[0]++] & 0xFF;

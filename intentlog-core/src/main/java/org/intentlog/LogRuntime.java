@@ -462,8 +462,9 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     Commit(Replica<S> base, I intention) {
       this.base = base;
       this.intention = intention;
-      // After the horizon of the log this writer read, where replay rejects a record (Bug 64).
-      this.id = UuidV7.newUuidV7After(base.committed().horizon());
+      // After the floor of the log this writer read, at or below which replay rejects a record
+      // (Bug 64), on the runtime's clock (a test sets it to draw stamps).
+      this.id = UuidV7.newUuidV7After(base.committed().floor(), config.clockMs().getAsLong());
       this.record = LogEnvelope.encodeRecord(id, machine.encodeIntention(intention));
       this.oversized = caps.maxRecordBytes() > 0 && record.length > caps.maxRecordBytes();
       this.current = base;

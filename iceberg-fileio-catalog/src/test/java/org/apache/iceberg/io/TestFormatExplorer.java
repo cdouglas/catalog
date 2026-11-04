@@ -52,6 +52,10 @@ public class TestFormatExplorer {
   /** Each codec's constant prefixes, by the catalog.proto message or enum they number. */
   private static final Map<String, Map<String, String>> PREFIXES = new LinkedHashMap<>();
 
+  /** Int constants of the codecs that are not field numbers. */
+  private static final Set<String> NOT_FIELDS =
+      Set.of("SUPPORTED_READER_VERSION", "MAX_LEVEL", "RANDOM_BYTES");
+
   static {
     Map<String, String> codec = new LinkedHashMap<>();
     codec.put("CHECKPOINT_", "Checkpoint");
@@ -80,6 +84,7 @@ public class TestFormatExplorer {
 
     Map<String, String> committed = new LinkedHashMap<>();
     committed.put("COMMITTED_TXNS_", "CommittedTransactions");
+    committed.put("COMMITTED_BLOCK_", "CommittedBlock");
     PREFIXES.put("CommittedSetCodec", committed);
 
     Map<String, String> envelope = new LinkedHashMap<>();
@@ -157,7 +162,7 @@ public class TestFormatExplorer {
       while (m.find()) {
         String name = m.group(1);
         int number = Integer.parseInt(m.group(2));
-        if (name.startsWith("WIRE_") || name.equals("SUPPORTED_READER_VERSION")) {
+        if (name.startsWith("WIRE_") || NOT_FIELDS.contains(name)) {
           continue;
         }
         String prefix =

@@ -18,467 +18,443 @@
  */
 package org.intentlog.wire;
 
-import static org.intentlog.wire.ProtoWire.readFixed64;
-import static org.intentlog.wire.ProtoWire.readLengthDelimitedBytes;
-import static org.intentlog.wire.ProtoWire.readVarint;
-import static org.intentlog.wire.ProtoWire.skipField;
-import static org.intentlog.wire.ProtoWire.writeBytes;
-import static org.intentlog.wire.ProtoWire.writeFixed64;
-import static org.intentlog.wire.ProtoWire.writeRawVarint64;
-
-import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.UUID;
 
 /**
- * The {@code CommittedTransactions} message: a set of UUIDv7 transaction ids, sorted descending,
- * stored as a {@code max_timestamp_ms} and packed entries of (varint timestamp delta, 10 random
- * bytes), with the GC horizon {@code highest_dropped_timestamp_ms}. Queries scan the bytes in
- * place. See docs/LOG.md "The committed set and GC".
+ * The {@code CommittedTransactions} message, encoded and decoded whole: the reference that
+ * {@code CommittedSet}, which keeps the set incrementally, must match byte for byte. See
+ * docs/LOG.md "The committed set and GC" and docs/COMMITTED_PAGING.md "Blocks: the index".
+ *
+ * <p>The set's ids are cut into blocks on a grid over their timestamps: a node {@code (k, a)} is
+ * the aligned span {@code [a * 2^k, (a + 1) * 2^k)} of milliseconds, and the blocks are the
+ * maximal nodes that hold at most {@link #BLOCK_IDS} ids, among the nodes that hold any. A
+ * millisecond (level 0) is a block however many ids it holds. The blocks are a function of the ids
+ * alone. A block lists its entries newest first, each a varint gap in ms from the one before
+ * (the first from the node's top, {@code (a + 1) * 2^k - 1}) and the id's 10 random bytes.
+ *
+ * <p>Wire fields: {@code highest_dropped_timestamp_ms} (3, the horizon H), {@code floor_ms} (4,
+ * the floor F, absent when it equals H), {@code pages} (5, references to the ids paged out, none
+ * yet) and {@code blocks} (6, oldest first), each a {@code CommittedBlock}. Fields 1 and 2 held the one-blob set of reader
+ * version 1.
  */
 public final class CommittedSetCodec {
 
-  public static final int COMMITTED_TXNS_MAX_TIMESTAMP_MS = 1;
-  public static final int COMMITTED_TXNS_PACKED_ENTRIES = 2;
   public static final int COMMITTED_TXNS_HIGHEST_DROPPED_TIMESTAMP_MS = 3;
+  public static final int COMMITTED_TXNS_FLOOR_MS = 4;
+  // Field 5, pages: references to the ids paged out (COMMITTED_PAGING.md), not yet written
+  public static final int COMMITTED_TXNS_BLOCKS = 6;
+  public static final int COMMITTED_BLOCK_LEVEL = 1;
+  public static final int COMMITTED_BLOCK_INDEX = 2;
+  public static final int COMMITTED_BLOCK_PACKED_ENTRIES = 3;
+
+  /** The level of the grid's root: a UUIDv7's timestamp is 48 bits of ms. */
+  public static final int MAX_LEVEL = 48;
+
+  /** The random bytes an entry keeps of its id (the version and variant bits are implied). */
+  public static final int RANDOM_BYTES = 10;
+
+  /**
+   * N, the most ids a block holds above level 0: a constant of the format (2^16, about 720 KB a
+   * block). Every writer of a log must use the same N, or two replicas at one position could
+   * write different checkpoints (I11). Tests set it smaller ({@code
+   * intentlog.committed.block.ids}) so that blocks split and merge in every suite; the setting is
+   * read once, for the whole JVM.
+   */
+  public static final int BLOCK_IDS = Integer.getInteger("intentlog.committed.block.ids", 1 << 16);
+
+  private static final int TAG_HORIZON = (COMMITTED_TXNS_HIGHEST_DROPPED_TIMESTAMP_MS << 3) | 1;
+  private static final int TAG_FLOOR = (COMMITTED_TXNS_FLOOR_MS << 3) | 1;
+  private static final int TAG_BLOCK = (COMMITTED_TXNS_BLOCKS << 3) | 2;
+  private static final int TAG_LEVEL = COMMITTED_BLOCK_LEVEL << 3;
+  private static final int TAG_INDEX = COMMITTED_BLOCK_INDEX << 3;
+  private static final int TAG_PACKED = (COMMITTED_BLOCK_PACKED_ENTRIES << 3) | 2;
 
   private CommittedSetCodec() {}
 
-  /**
-   * Encodes a UUIDv7 set as a {@code CommittedTransactions} sub-message body
-   * with no GC horizon. See {@link #encode(Collection, long)}
-   * for the GC-aware variant.
-   */
-  public static byte[] encode(Collection<UUID> txns)
-      throws IOException {
+  /** A decoded body: the ids newest first, the horizon, the floor, and the blocks. */
+  public static final class Decoded {
+    public final List<UUID> ids;
+    public final long horizon;
+    public final long floor;
+    /** Each block, oldest first: {level, index, ids}. */
+    public final List<long[]> blocks;
+
+    Decoded(List<UUID> ids, long horizon, long floor, List<long[]> blocks) {
+      this.ids = ids;
+      this.horizon = horizon;
+      this.floor = floor;
+      this.blocks = blocks;
+    }
+  }
+
+  /** Encodes a set of UUIDv7s with no horizon. */
+  public static byte[] encode(Collection<UUID> txns) throws IOException {
     return encode(txns, 0L);
   }
 
-  /**
-   * Encodes a UUIDv7 set as a {@code CommittedTransactions} sub-message body.
-   * Sorts entries descending by UUID (= descending by timestamp for v7),
-   * emits {@code max_timestamp_ms}, then a single packed bytes field whose
-   * payload is the interleaved (varint delta + 10 random bytes) per entry,
-   * and optionally a {@code highest_dropped_timestamp_ms} field when the
-   * caller has performed a GC pass.
-   *
-   * <p>Caller is responsible for omitting the outer field when the set is empty
-   * AND the horizon is zero (i.e., no observable state to record).
-   */
-  public static byte[] encode(Collection<UUID> txns,
-                                             long highestDroppedTimestampMs)
+  /** Encodes a set of UUIDv7s with horizon {@code highestDroppedTimestampMs}, the floor there. */
+  public static byte[] encode(Collection<UUID> txns, long highestDroppedTimestampMs)
       throws IOException {
-    UUID[] sorted = txns.toArray(new UUID[0]);
-    Arrays.sort(sorted, (a, b) -> b.compareTo(a));
-    ByteArrayOutputStream out = new ByteArrayOutputStream();
-    long maxTs = sorted.length == 0 ? 0L : UuidV7.timestampMs(sorted[0]);
-    writeFixed64(out, COMMITTED_TXNS_MAX_TIMESTAMP_MS, maxTs);
+    return encode(txns, highestDroppedTimestampMs, highestDroppedTimestampMs, BLOCK_IDS);
+  }
 
-    ByteArrayOutputStream packed = new ByteArrayOutputStream(13 * sorted.length);
-    long prev = maxTs;
-    for (UUID u : sorted) {
-      long ts = UuidV7.timestampMs(u);
-      writeRawVarint64(packed, prev - ts);
-      prev = ts;
-      packed.write(UuidV7.packRandomBits(u));
+  /**
+   * Encodes a set of UUIDv7s, the horizon and the floor ({@code floorMs >= horizonMs}), cutting
+   * blocks of at most {@code blockIds} ids. Empty iff there are no ids and the horizon is 0.
+   */
+  public static byte[] encode(Collection<UUID> txns, long horizonMs, long floorMs, int blockIds) {
+    if (floorMs < horizonMs) {
+      throw new IllegalArgumentException("floor " + floorMs + " below horizon " + horizonMs);
     }
-    writeBytes(out, COMMITTED_TXNS_PACKED_ENTRIES, packed.toByteArray());
-    if (highestDroppedTimestampMs != 0L) {
-      writeFixed64(out, COMMITTED_TXNS_HIGHEST_DROPPED_TIMESTAMP_MS, highestDroppedTimestampMs);
+    int n = txns.size();
+    long[] ts = new long[n];
+    byte[][] rand = new byte[n][];
+    sortNewestFirst(txns, ts, rand);
+    return encodeSorted(ts, rand, n, horizonMs, floorMs, blockIds);
+  }
+
+  private static byte[] encodeSorted(
+      long[] ts, byte[][] rand, int n, long horizonMs, long floorMs, int blockIds) {
+    if (n == 0 && horizonMs == 0L && floorMs == 0L) {
+      return new byte[0];
+    }
+    ByteArrayOutputStream out = new ByteArrayOutputStream(16 + 12 * n);
+    if (horizonMs != 0L) {
+      out.write(TAG_HORIZON);
+      writeFixed64(out, horizonMs);
+    }
+    if (floorMs != horizonMs) {
+      out.write(TAG_FLOOR);
+      writeFixed64(out, floorMs);
+    }
+    List<long[]> blocks = new ArrayList<>();
+    partition(ts, MAX_LEVEL, 0L, 0, n, blockIds, blocks);
+    for (long[] block : blocks) {
+      byte[] message = blockMessage((int) block[0], block[1], ts, rand, (int) block[2],
+          (int) block[3]);
+      out.write(TAG_BLOCK);
+      writeVarint(out, message.length);
+      out.write(message, 0, message.length);
     }
     return out.toByteArray();
   }
 
   /**
-   * Single-pass rewrite of an inherited {@code CommittedTransactions} body.
-   * Streams the inherited entries in descending order, drops any whose
-   * {@code timestamp_ms <= dropBeforeTimestampMs} (updating
-   * {@code highest_dropped_timestamp_ms}), and merges in the supplied
-   * additions in descending order. Additions are emitted unconditionally —
-   * the caller's invariant is that they correspond to just-applied log
-   * transactions which must remain queryable regardless of the watermark.
-   *
-   * <p>An exact-duplicate addition (same UUID as an inherited entry) is
-   * deduped: the merged output emits a single copy.
-   *
-   * <p>Returns an empty byte array iff there are no entries to emit AND the
-   * resulting {@code highest_dropped_timestamp_ms} is zero (no observable
-   * state). Otherwise returns the encoded body — including a horizon-only
-   * body when every entry was dropped but the horizon is non-zero, so that
-   * monotonicity is preserved across subsequent compactions.
+   * The blocks of entries {@code [lo, hi)} (sorted newest first, all within node {@code (level,
+   * index)}), oldest first, as {@code {level, index, lo, hi}}.
+   */
+  private static void partition(
+      long[] ts, int level, long index, int lo, int hi, int blockIds, List<long[]> out) {
+    if (lo >= hi) {
+      return;
+    }
+    if (hi - lo <= blockIds || level == 0) {
+      out.add(new long[] {level, index, lo, hi});
+      return;
+    }
+    // The upper child holds the timestamps at or above its start: the first entries
+    long mid = (2 * index + 1) << (level - 1);
+    int split = lo;
+    while (split < hi && ts[split] >= mid) {
+      split++;
+    }
+    partition(ts, level - 1, 2 * index, split, hi, blockIds, out);
+    partition(ts, level - 1, 2 * index + 1, lo, split, blockIds, out);
+  }
+
+  private static byte[] blockMessage(
+      int level, long index, long[] ts, byte[][] rand, int lo, int hi) {
+    ByteArrayOutputStream packed = new ByteArrayOutputStream(12 * (hi - lo));
+    long prev = top(level, index);
+    for (int i = lo; i < hi; i++) {
+      writeVarint(packed, prev - ts[i]);
+      prev = ts[i];
+      packed.write(rand[i], 0, RANDOM_BYTES);
+    }
+    ByteArrayOutputStream message = new ByteArrayOutputStream(packed.size() + 16);
+    if (level != 0) {
+      message.write(TAG_LEVEL);
+      writeVarint(message, level);
+    }
+    if (index != 0L) {
+      message.write(TAG_INDEX);
+      writeVarint(message, index);
+    }
+    message.write(TAG_PACKED);
+    writeVarint(message, packed.size());
+    byte[] body = packed.toByteArray();
+    message.write(body, 0, body.length);
+    return message.toByteArray();
+  }
+
+  /** The newest timestamp node {@code (level, index)} spans. */
+  public static long top(int level, long index) {
+    return ((index + 1) << level) - 1;
+  }
+
+  /**
+   * {@code inheritedBytes} with {@code addUnconditionally} added (copies of ids it holds are
+   * kept once), then every inherited id at or below {@code dropBeforeTimestampMs} dropped (0
+   * drops nothing), the horizon raised to the newest dropped and the floor to the horizon. The
+   * additions are kept whatever their timestamps, as replay adds only ids it just applied.
    */
   public static byte[] rewrite(
-      byte[] inheritedBytes,
-      Collection<UUID> addUnconditionally,
-      long dropBeforeTimestampMs) {
-    UUID[] adds = addUnconditionally.toArray(new UUID[0]);
-    long[] addTs = new long[adds.length];
-    byte[][] addRand = new byte[adds.length][];
-    for (int i = 0; i < adds.length; i++) {
-      if (!UuidV7.isV7(adds[i])) {
-        throw new IllegalArgumentException(
-            "Committed transaction IDs must be UUIDv7; got " + adds[i]);
-      }
-      addTs[i] = UuidV7.timestampMs(adds[i]);
-      addRand[i] = UuidV7.packRandomBits(adds[i]);
-    }
-    // Sort additions descending: by ts desc, then by packed-random desc
-    // (lexicographic unsigned matches UUID.compareTo for v7 — see UuidV7).
-    Integer[] addIdx = new Integer[adds.length];
-    for (int i = 0; i < adds.length; i++) {
-      addIdx[i] = i;
-    }
-    Arrays.sort(addIdx, (a, b) -> {
-      int c = Long.compare(addTs[b], addTs[a]);
-      if (c != 0) return c;
-      for (int k = 0; k < 10; k++) {
-        int d = (addRand[b][k] & 0xFF) - (addRand[a][k] & 0xFF);
-        if (d != 0) return d;
-      }
-      return 0;
-    });
-    long[] sortedAddTs = new long[adds.length];
-    byte[][] sortedAddRand = new byte[adds.length][];
-    for (int i = 0; i < adds.length; i++) {
-      sortedAddTs[i] = addTs[addIdx[i]];
-      sortedAddRand[i] = addRand[addIdx[i]];
-    }
-
-    // Parse the inherited body's top-level fields.
-    long prevMaxTs = 0L;
-    int packedStart = -1;
-    int packedEnd = -1;
-    long prevHorizon = 0L;
-    if (inheritedBytes.length > 0) {
-      try {
-        ByteArrayInputStream in = new ByteArrayInputStream(inheritedBytes);
-        while (in.available() > 0) {
-          int tag = readVarint(in);
-          int fieldNumber = tag >>> 3;
-          int wireType = tag & 0x7;
-          switch (fieldNumber) {
-            case COMMITTED_TXNS_MAX_TIMESTAMP_MS:
-              prevMaxTs = readFixed64(in);
-              break;
-            case COMMITTED_TXNS_PACKED_ENTRIES:
-              int len = readVarint(in);
-              packedStart = inheritedBytes.length - in.available();
-              packedEnd = packedStart + len;
-              long skipped = in.skip(len);
-              if (skipped != len) {
-                throw new IOException(
-                    "Truncated CommittedTransactions: expected " + len
-                        + " packed bytes, got " + skipped);
-              }
-              break;
-            case COMMITTED_TXNS_HIGHEST_DROPPED_TIMESTAMP_MS:
-              prevHorizon = readFixed64(in);
-              break;
-            default:
-              skipField(in, wireType);
-          }
-        }
-      } catch (IOException e) {
-        throw new UncheckedIOException(e);
-      }
-    }
-
-    // Two-pointer merge of inherited entries (in descending order) against
-    // the sorted additions. Output is buffered in (ts, rand) parallel arrays
-    // because we don't know max_timestamp_ms until we've seen the first
-    // emitted entry.
-    int inheritedUpper = packedStart < 0 ? 0 : ((packedEnd - packedStart) / 11) + 1;
-    int capacity = inheritedUpper + adds.length;
-    long[] outTs = new long[capacity];
-    byte[][] outRand = new byte[capacity][];
-    int outCount = 0;
-    long newHorizon = prevHorizon;
-
-    long ts = prevMaxTs;
-    int off = packedStart < 0 ? 0 : packedStart;
-    int end = packedStart < 0 ? 0 : packedEnd;
-    int aPtr = 0;
-
-    while (off < end) {
-      // Decode next inherited entry: varint delta + 10 random bytes.
-      long delta = 0L;
-      int shift = 0;
-      while (true) {
-        if (off >= end) {
-          throw new UncheckedIOException(new IOException(
-              "Malformed CommittedTransactions: truncated varint"));
-        }
-        int b = inheritedBytes[off++] & 0xFF;
-        delta |= ((long) (b & 0x7F)) << shift;
-        if ((b & 0x80) == 0) break;
-        shift += 7;
-      }
-      ts -= delta;
-      if (off + 10 > end) {
-        throw new UncheckedIOException(new IOException(
-            "Malformed CommittedTransactions: truncated random bytes"));
-      }
-      int randOff = off;
-      off += 10;
-
-      // Emit any additions strictly greater than the inherited entry first.
-      while (aPtr < sortedAddTs.length
-          && compareTsRand(sortedAddTs[aPtr], sortedAddRand[aPtr],
-              ts, inheritedBytes, randOff) > 0) {
-        outTs[outCount] = sortedAddTs[aPtr];
-        outRand[outCount] = sortedAddRand[aPtr];
-        outCount++;
-        aPtr++;
-      }
-
-      if (ts <= dropBeforeTimestampMs) {
-        // Drop this inherited entry; the addition (if any) at the same key
-        // still stands and will be emitted from the addition stream.
-        if (ts > newHorizon) {
-          newHorizon = ts;
-        }
+      byte[] inheritedBytes, Collection<UUID> addUnconditionally, long dropBeforeTimestampMs) {
+    Decoded inherited = decodeBody(inheritedBytes);
+    LinkedHashSet<UUID> kept = new LinkedHashSet<>();
+    long horizon = inherited.horizon;
+    for (UUID id : inherited.ids) {
+      long ts = UuidV7.timestampMs(id);
+      if (dropBeforeTimestampMs > 0L && ts <= dropBeforeTimestampMs) {
+        horizon = Math.max(horizon, ts);
       } else {
-        // Dedup: an addition equal to this inherited entry collapses to one.
-        if (aPtr < sortedAddTs.length
-            && compareTsRand(sortedAddTs[aPtr], sortedAddRand[aPtr],
-                ts, inheritedBytes, randOff) == 0) {
-          aPtr++;
-        }
-        outTs[outCount] = ts;
-        byte[] copy = new byte[10];
-        System.arraycopy(inheritedBytes, randOff, copy, 0, 10);
-        outRand[outCount] = copy;
-        outCount++;
+        kept.add(id);
       }
     }
-
-    // Drain remaining additions (older than the smallest inherited entry, or
-    // older-than-watermark inherited that got dropped left holes in the
-    // descending stream — additions still survive unconditionally).
-    while (aPtr < sortedAddTs.length) {
-      outTs[outCount] = sortedAddTs[aPtr];
-      outRand[outCount] = sortedAddRand[aPtr];
-      outCount++;
-      aPtr++;
-    }
-
-    if (outCount == 0 && newHorizon == 0L) {
-      return new byte[0];
-    }
-
-    try {
-      ByteArrayOutputStream out = new ByteArrayOutputStream();
-      long maxTs = outCount > 0 ? outTs[0] : 0L;
-      writeFixed64(out, COMMITTED_TXNS_MAX_TIMESTAMP_MS, maxTs);
-
-      ByteArrayOutputStream packed = new ByteArrayOutputStream(13 * outCount);
-      long prev = maxTs;
-      for (int i = 0; i < outCount; i++) {
-        long entryTs = outTs[i];
-        writeRawVarint64(packed, prev - entryTs);
-        prev = entryTs;
-        packed.write(outRand[i]);
+    for (UUID id : addUnconditionally) {
+      if (!UuidV7.isV7(id)) {
+        throw new IllegalArgumentException("Committed transaction IDs must be UUIDv7; got " + id);
       }
-      writeBytes(out, COMMITTED_TXNS_PACKED_ENTRIES, packed.toByteArray());
-
-      if (newHorizon != 0L) {
-        writeFixed64(out, COMMITTED_TXNS_HIGHEST_DROPPED_TIMESTAMP_MS, newHorizon);
-      }
-      return out.toByteArray();
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
+      kept.add(id);
     }
+    return encode(kept, horizon, Math.max(inherited.floor, horizon), BLOCK_IDS);
   }
 
-  /**
-   * Compares an addition entry {@code (aTs, aRand)} against an inherited entry
-   * stored in {@code body[bOff..bOff+10)} with timestamp {@code bTs}. Negative
-   * iff a < b, zero iff equal, positive iff a > b.
-   */
-  private static int compareTsRand(long aTs, byte[] aRand, long bTs, byte[] body, int bOff) {
-    if (aTs != bTs) {
-      return Long.compare(aTs, bTs);
-    }
-    for (int i = 0; i < 10; i++) {
-      int cmp = (aRand[i] & 0xFF) - (body[bOff + i] & 0xFF);
-      if (cmp != 0) return cmp;
-    }
-    return 0;
-  }
-
-  /**
-   * Scans the inner {@code CommittedTransactions} body for a v7 UUID. Returns
-   * true iff the set contains the query. Walks the wire bytes linearly with
-   * no per-call allocation: tracks the running timestamp by summing varint
-   * deltas, compares the random-bits region of each entry against the
-   * query's packed bits in place, and exits early when the running timestamp
-   * passes the query's timestamp (descending order).
-   *
-   * <p>Returns false for non-v7 queries (the dedup set only stores v7 IDs).
-   */
+  /** Whether the set holds {@code query}; false for a non-v7 id. Ignores the horizon. */
   public static boolean contains(byte[] body, UUID query) {
     if (body.length == 0 || !UuidV7.isV7(query)) {
       return false;
     }
-    long queryTs = UuidV7.timestampMs(query);
-    byte[] queryRand = UuidV7.packRandomBits(query);
-    try {
-      ByteArrayInputStream in = new ByteArrayInputStream(body);
-      long maxTs = 0L;
-      int packedStart = -1;
-      int packedEnd = -1;
-      while (in.available() > 0) {
-        int tag = readVarint(in);
-        int fieldNumber = tag >>> 3;
-        int wireType = tag & 0x7;
-        switch (fieldNumber) {
-          case COMMITTED_TXNS_MAX_TIMESTAMP_MS:
-            maxTs = readFixed64(in);
-            break;
-          case COMMITTED_TXNS_PACKED_ENTRIES:
-            int len = readVarint(in);
-            packedStart = body.length - in.available();
-            packedEnd = packedStart + len;
-            in.skip(len);
-            break;
-          // COMMITTED_TXNS_HIGHEST_DROPPED_TIMESTAMP_MS: ignored here; the
-          // membership predicate doesn't consult the horizon. The horizon-aware
-          // tri-state result lives in CommittedSet#contains,
-          // which calls horizon on a miss.
-          default:
-            skipField(in, wireType);
-        }
-      }
-      if (packedStart < 0 || queryTs > maxTs) {
-        return false;
-      }
-      long ts = maxTs;
-      int off = packedStart;
-      while (off < packedEnd) {
-        // Inline varint read to avoid wrapping with InputStream.
-        long delta = 0;
-        int shift = 0;
-        while (true) {
-          int b = body[off++] & 0xFF;
-          delta |= ((long) (b & 0x7F)) << shift;
-          if ((b & 0x80) == 0) break;
-          shift += 7;
-        }
-        ts -= delta;
-        if (off + 10 > packedEnd) {
-          return false; // malformed; treat as not-contained
-        }
-        if (ts == queryTs && randomMatches(body, off, queryRand)) {
-          return true;
-        }
-        if (ts < queryTs) {
-          return false; // descending order: any further entries are older
-        }
-        off += 10;
-      }
-      return false;
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
-    }
+    return decodeBody(body).ids.contains(query);
   }
 
-  /**
-   * Reads the {@code highest_dropped_timestamp_ms} field from a committed-set
-   * body. Returns 0 when the body is empty, the field is absent, or no GC has
-   * ever fired on this set. Walks only the top-level fields and skips the
-   * (potentially large) {@code packed_entries} payload, so this is cheap.
-   */
+  /** The horizon H: 0 when the body is empty or no GC has run. */
   public static long horizon(byte[] body) {
-    if (body.length == 0) {
-      return 0L;
-    }
+    return decodeBody(body).horizon;
+  }
+
+  /** The floor F: the horizon when the field is absent. */
+  public static long floor(byte[] body) {
+    return decodeBody(body).floor;
+  }
+
+  /** The ids, newest first. */
+  public static LinkedHashSet<UUID> decode(byte[] body) throws IOException {
     try {
-      ByteArrayInputStream in = new ByteArrayInputStream(body);
-      long horizon = 0L;
-      while (in.available() > 0) {
-        int tag = readVarint(in);
-        int fieldNumber = tag >>> 3;
-        int wireType = tag & 0x7;
-        if (fieldNumber == COMMITTED_TXNS_HIGHEST_DROPPED_TIMESTAMP_MS) {
-          horizon = readFixed64(in);
-        } else {
-          skipField(in, wireType);
-        }
-      }
-      return horizon;
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
+      return new LinkedHashSet<>(decodeBody(body).ids);
+    } catch (UncheckedIOException e) {
+      throw e.getCause();
     }
   }
 
-  private static boolean randomMatches(byte[] body, int off, byte[] query) {
-    for (int i = 0; i < 10; i++) {
-      if (body[off + i] != query[i]) return false;
-    }
-    return true;
-  }
-
-  /**
-   * Decodes a {@code CommittedTransactions} body into the canonical {@code Set<UUID>}.
-   * Used by the {@code CommittedSet.ids()} bulk getter; not on the query hot path.
-   */
-  public static LinkedHashSet<UUID> decode(byte[] body)
-      throws IOException {
-    LinkedHashSet<UUID> out = new LinkedHashSet<>();
-    if (body.length == 0) {
-      return out;
-    }
-    ByteArrayInputStream in = new ByteArrayInputStream(body);
-    long maxTs = 0L;
-    byte[] packed = new byte[0];
-    while (in.available() > 0) {
-      int tag = readVarint(in);
-      int fieldNumber = tag >>> 3;
-      int wireType = tag & 0x7;
-      switch (fieldNumber) {
-        case COMMITTED_TXNS_MAX_TIMESTAMP_MS:
-          maxTs = readFixed64(in);
+  /** Decodes a whole body, checking its blocks: disjoint, oldest first, entries inside. */
+  public static Decoded decodeBody(byte[] body) {
+    long horizon = 0L;
+    Long floor = null;
+    List<List<UUID>> blocks = new ArrayList<>();
+    List<long[]> nodes = new ArrayList<>();
+    long prevTop = -1L;
+    int[] at = {0};
+    while (at[0] < body.length) {
+      int tag = (int) readVarint(body, at, body.length);
+      switch (tag) {
+        case TAG_HORIZON:
+          horizon = readFixed64(body, at);
           break;
-        case COMMITTED_TXNS_PACKED_ENTRIES:
-          packed = readLengthDelimitedBytes(in);
+        case TAG_FLOOR:
+          floor = readFixed64(body, at);
           break;
-        // COMMITTED_TXNS_HIGHEST_DROPPED_TIMESTAMP_MS: skipped — this bulk
-        // entrypoint surfaces only the entries, not the GC horizon. Callers
-        // that need the horizon use horizon (cheap) or peek at
-        // it during a single-pass merge in rewrite.
+        case TAG_BLOCK:
+          int len = (int) readVarint(body, at, body.length);
+          int end = at[0] + len;
+          if (len < 0 || end > body.length) {
+            throw malformed("truncated block");
+          }
+          long[] node = new long[2];
+          List<UUID> entries = decodeBlock(body, at[0], end, node);
+          long start = node[1] << node[0];
+          if (start <= prevTop) {
+            throw malformed("blocks out of order or overlapping");
+          }
+          prevTop = top((int) node[0], node[1]);
+          blocks.add(entries);
+          nodes.add(new long[] {node[0], node[1], entries.size()});
+          at[0] = end;
+          break;
         default:
-          skipField(in, wireType);
+          skipField(body, at, tag);
       }
     }
-    long ts = maxTs;
-    int off = 0;
-    while (off < packed.length) {
-      int start = off;
-      long delta = 0;
-      int shift = 0;
-      while (true) {
-        if (off >= packed.length) {
-          throw new IOException("Malformed CommittedTransactions: truncated varint at " + start);
-        }
-        int b = packed[off++] & 0xFF;
-        delta |= ((long) (b & 0x7F)) << shift;
-        if ((b & 0x80) == 0) break;
-        shift += 7;
+    // Blocks are oldest first; the ids are listed newest first
+    List<UUID> ids = new ArrayList<>();
+    for (int i = blocks.size() - 1; i >= 0; i--) {
+      ids.addAll(blocks.get(i));
+    }
+    long f = floor == null ? horizon : floor;
+    if (f < horizon) {
+      throw malformed("floor below horizon");
+    }
+    return new Decoded(ids, horizon, f, nodes);
+  }
+
+  /** A block's entries, newest first; {@code node} gets its level and index. */
+  private static List<UUID> decodeBlock(byte[] buf, int off, int end, long[] node) {
+    int level = 0;
+    long index = 0L;
+    int packedStart = -1;
+    int packedEnd = -1;
+    int[] at = {off};
+    while (at[0] < end) {
+      int tag = (int) readVarint(buf, at, end);
+      switch (tag) {
+        case TAG_LEVEL:
+          level = (int) readVarint(buf, at, end);
+          break;
+        case TAG_INDEX:
+          index = readVarint(buf, at, end);
+          break;
+        case TAG_PACKED:
+          int len = (int) readVarint(buf, at, end);
+          packedStart = at[0];
+          packedEnd = packedStart + len;
+          if (len < 0 || packedEnd > end) {
+            throw malformed("truncated packed entries");
+          }
+          at[0] = packedEnd;
+          break;
+        default:
+          skipField(buf, at, tag);
+          if (at[0] > end) {
+            throw malformed("truncated block field");
+          }
       }
-      ts -= delta;
-      if (off + 10 > packed.length) {
-        throw new IOException(
-            "Malformed CommittedTransactions: entry at offset " + start
-                + " missing 10 random bytes (have " + (packed.length - off) + ")");
+    }
+    if (level > MAX_LEVEL || index < 0 || (level < MAX_LEVEL && index >= (1L << (MAX_LEVEL - level)))
+        || (level == MAX_LEVEL && index != 0L)) {
+      throw malformed("block node (" + level + ", " + index + ")");
+    }
+    if (packedStart < 0 || packedStart == packedEnd) {
+      throw malformed("empty block");
+    }
+    node[0] = level;
+    node[1] = index;
+    long start = index << level;
+    List<UUID> out = new ArrayList<>();
+    long ts = top(level, index);
+    int[] p = {packedStart};
+    while (p[0] < packedEnd) {
+      long gap = readVarint(buf, p, packedEnd);
+      if (gap < 0 || gap > ts - start) {
+        throw malformed("entry outside its block");
       }
-      out.add(UuidV7.fromTimestampAndRandom(ts, packed, off));
-      off += 10;
+      ts -= gap;
+      if (p[0] + RANDOM_BYTES > packedEnd) {
+        throw malformed("truncated entry");
+      }
+      out.add(UuidV7.fromTimestampAndRandom(ts, buf, p[0]));
+      p[0] += RANDOM_BYTES;
     }
     return out;
+  }
+
+  /** Sorts v7 ids newest first, as their timestamps and then random bits order them. */
+  public static void sortNewestFirst(Collection<UUID> ids, long[] ts, byte[][] rand) {
+    UUID[] all = ids.toArray(new UUID[0]);
+    long[] keyTs = new long[all.length];
+    byte[][] keyRand = new byte[all.length][];
+    Integer[] order = new Integer[all.length];
+    for (int i = 0; i < all.length; i++) {
+      if (!UuidV7.isV7(all[i])) {
+        throw new IllegalArgumentException("Committed transaction IDs must be UUIDv7; got " + all[i]);
+      }
+      keyTs[i] = UuidV7.timestampMs(all[i]);
+      keyRand[i] = UuidV7.packRandomBits(all[i]);
+      order[i] = i;
+    }
+    Arrays.sort(order, (a, b) -> {
+      int c = Long.compare(keyTs[b], keyTs[a]);
+      return c != 0 ? c : Arrays.compareUnsigned(keyRand[b], keyRand[a]);
+    });
+    for (int i = 0; i < all.length; i++) {
+      ts[i] = keyTs[order[i]];
+      rand[i] = keyRand[order[i]];
+    }
+  }
+
+  private static UncheckedIOException malformed(String what) {
+    return new UncheckedIOException(new IOException("Malformed CommittedTransactions: " + what));
+  }
+
+  private static long readVarint(byte[] buf, int[] at, int end) {
+    long value = 0;
+    int shift = 0;
+    while (true) {
+      if (at[0] >= end || shift > 63) {
+        throw malformed("truncated varint");
+      }
+      int b = buf[at[0]++] & 0xFF;
+      value |= ((long) (b & 0x7F)) << shift;
+      if ((b & 0x80) == 0) {
+        return value;
+      }
+      shift += 7;
+    }
+  }
+
+  private static long readFixed64(byte[] buf, int[] at) {
+    if (at[0] + 8 > buf.length) {
+      throw malformed("truncated fixed64");
+    }
+    long value = 0;
+    for (int i = 7; i >= 0; i--) {
+      value = (value << 8) | (buf[at[0] + i] & 0xFF);
+    }
+    at[0] += 8;
+    return value;
+  }
+
+  private static void skipField(byte[] buf, int[] at, int tag) {
+    switch (tag & 0x7) {
+      case 0:
+        readVarint(buf, at, buf.length);
+        break;
+      case 1:
+        at[0] += 8;
+        break;
+      case 2:
+        at[0] += (int) readVarint(buf, at, buf.length);
+        break;
+      case 5:
+        at[0] += 4;
+        break;
+      default:
+        throw malformed("wire type " + (tag & 0x7));
+    }
+    if (at[0] > buf.length) {
+      throw malformed("truncated field");
+    }
+  }
+
+  private static void writeVarint(ByteArrayOutputStream out, long value) {
+    while ((value & ~0x7FL) != 0) {
+      out.write((int) ((value & 0x7F) | 0x80));
+      value >>>= 7;
+    }
+    out.write((int) value);
+  }
+
+  private static void writeFixed64(ByteArrayOutputStream out, long value) {
+    for (int i = 0; i < 8; i++) {
+      out.write((int) (value & 0xFF));
+      value >>>= 8;
+    }
   }
 }

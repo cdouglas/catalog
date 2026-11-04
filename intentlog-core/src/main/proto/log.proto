@@ -40,7 +40,7 @@ package intentlog;
 // continues from.
 message LogCheckpoint {
   // The envelope reader version this checkpoint needs (LogEnvelope
-  // SUPPORTED_READER_VERSION, now 1); a reader that supports less refuses it.
+  // SUPPORTED_READER_VERSION, now 2); a reader that supports less refuses it.
   // Written first, so a reader fails before it decodes the rest.
   int32 min_reader_version = 1;
 
@@ -55,39 +55,46 @@ message LogCheckpoint {
   bytes state = 4;
 }
 
-// Compressed UUIDv7 set. The encoder sorts entries descending by UUID
-// (= descending by timestamp, since v7's high bits are timestamp), records
-// the largest timestamp as `max_timestamp_ms`, and emits per-entry the gap
-// from the previous timestamp plus 10 bytes of random material (rand_a +
-// rand_b, with the fixed version and variant bits dropped). The decoder
-// reconstructs each UUID by reapplying the version (=0x7) and variant
-// (=0b10) bits.
-//
-// Entries are interleaved into a single packed bytes field so the codec
-// can walk them in one linear pass without allocating intermediate
-// arrays — `CommittedSet.contains` runs directly against the wire bytes
-// with zero per-call heap.
-//
-// Per-entry wire cost: 1-3 (delta varint) + 10 (random) ≈ 11-13 bytes,
-// vs 18 bytes (16 + tag + length) for a `repeated bytes` encoding. ~30%
-// reduction at typical sizes; see docs/UUID_V7_BENCH_RESULTS.md.
+// The committed set: the ids of the records replay applied, less those GC
+// dropped, the GC horizon, and the floor (docs/LOG.md "The committed set and
+// GC"; docs/COMMITTED_PAGING.md). The ids are cut into blocks on a grid over
+// their timestamps: node (k, a) is the aligned span [a * 2^k, (a + 1) * 2^k)
+// of ms, and the blocks are the maximal nodes holding at most N ids (2^16, a
+// constant of the format) among the nodes holding any; a millisecond (level
+// 0) is a block however many ids it holds. So the blocks are a function of the
+// ids alone, and a checkpoint copies each block's bytes.
 message CommittedTransactions {
-  // Largest (most recent) timestamp in ms; 0 when the set is empty. Always
-  // written.
-  fixed64 max_timestamp_ms = 1;
+  // max_timestamp_ms and packed_entries: the set as one blob (reader version 1).
+  reserved 1, 2;
 
-  // Per entry, in descending timestamp order, back-to-back:
-  //   varint delta_ms  -- gap from previous entry (first delta is 0)
-  //   10 bytes         -- 12 bits rand_a + 62 bits rand_b + 6 bits zero pad
-  // The number of entries is recovered by walking the buffer.
-  bytes packed_entries = 2;
-
-  // GC horizon: the largest timestamp_ms of any UUIDv7 that has been dropped
-  // from this set by a GC record. 0 (absent) means no GC has happened yet.
-  // Queries for UUIDs whose timestamp_ms <= this value are UNKNOWN — the entry
-  // may have been committed and aged out, or it may never have been committed.
-  // See docs/LOG.md "The committed set and GC".
+  // GC horizon H: the largest timestamp_ms of any UUIDv7 that has been
+  // dropped from this set by a GC record. 0 (absent) means no GC has happened
+  // yet. Queries for UUIDs whose timestamp_ms <= this value are UNKNOWN: the
+  // entry may have been committed and aged out, or it may never have been.
   fixed64 highest_dropped_timestamp_ms = 3;
+
+  // The floor F, at or above H: replay applies no record whose id's
+  // timestamp_ms is at or below it. Absent when it equals H.
+  fixed64 floor_ms = 4;
+
+  // 5: references to the pages that hold the ids in (H, F] (not yet written).
+
+  // The blocks, oldest first: the ids above F.
+  repeated CommittedBlock blocks = 6;
+}
+
+// One block of the committed set: node (level, index).
+message CommittedBlock {
+  uint32 level = 1;
+  uint64 index = 2;
+
+  // Per entry, newest first, back-to-back:
+  //   varint delta_ms  -- gap from the entry before; the first's from the
+  //                       node's top, (index + 1) * 2^level - 1
+  //   10 bytes         -- 12 bits rand_a + 62 bits rand_b + 6 bits zero pad
+  // The decoder reconstructs each UUID by reapplying the version (0x7) and
+  // variant (0b10) bits.
+  bytes packed_entries = 3;
 }
 
 // One entry of the log: an intention, which replay applies once, if its

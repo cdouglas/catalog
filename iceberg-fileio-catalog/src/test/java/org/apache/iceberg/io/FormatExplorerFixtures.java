@@ -1185,10 +1185,11 @@ public class FormatExplorerFixtures {
         "A CAS write: the checkpoint holds two nested namespaces, a pointer table and a "
             + "namespace property, then a GC record and the commit's record follow. The "
             + "checkpoint's committed set (LogCheckpoint.committed) is the dedup set: UUIDv7s "
-            + "sorted descending, each a varint gap from the previous timestamp plus 10 random "
-            + "bytes, in one packed_entries blob the catalog scans without allocating. Click it "
-            + "to see the UUIDs. The checkpoint holds the whole set the replay before it reached: "
-            + "a GC is a record in the log, never a filter on a checkpoint.",
+            + "cut into blocks on a grid over their timestamps, each block's entries newest first, "
+            + "a varint gap (the first from the block's top) plus 10 random bytes each, which the "
+            + "catalog scans without allocating. Click it to see the UUIDs. The checkpoint holds "
+            + "the whole set the replay before it reached: a GC is a record in the log, never a "
+            + "filter on a checkpoint.",
         List.of(),
         read -> {
           CatalogState state = read.state();
