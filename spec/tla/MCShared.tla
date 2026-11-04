@@ -100,4 +100,39 @@ Not_Throttled == \A w \in Writers : ws[w].pc # "throttled"
 Not_Exhausted == \A w \in Writers : ~(ws[w].pc = "send" /\ ws[w].att >= MaxAttempts)
 \* A commit resolving an ambiguous write after a read of it lagged the log.
 Not_LaggingRead == \A w \in Writers : ~(ws[w].lg /\ ws[w].pc = "resolve")
+
+\* Paging (COMMITTED_PAGING.md). A PageOut applied: the floor above the
+\* horizon. A PageOut that changed nothing (its block changed, or was sealed
+\* by another).
+Not_Floor == Full.F = Full.H
+Not_PageOutRefused == Full.rf = 0
+\* The same PageOut twice in the log.
+Not_DuplicatePageOut ==
+  \A i, j \in 1..Len(log) : (i # j /\ IsPo(log[i])) => log[i] # log[j]
+\* A commit about to judge its record whose id is paged.
+Not_PagedOwnId ==
+  \A w \in Writers : ~(ws[w].pc \in {"readback", "resolve"}
+                       /\ Full.H < ws[w].txn.id.ts /\ ws[w].txn.id.ts <= Full.F)
+\* A record that landed after a PageOut sealed its stamp, of a commit that
+\* failed; a copy of a record whose block a PageOut sealed between them.
+Not_FailedBelowFloor ==
+  \A e \in ended :
+    ~(e.out = "failed" /\ \E i, j \in 1..Len(log) :
+         i < j /\ IsPo(log[i]) /\ IsTxn(log[j]) /\ log[j].id = e.id
+         /\ e.id.ts <= Top(log[i]) /\ Full.H < e.id.ts)
+Not_CopyAfterPageOut ==
+  \A i, j, k \in 1..Len(log) :
+    ~(i < j /\ j < k /\ IsTxn(log[i]) /\ IsPo(log[j]) /\ IsTxn(log[k])
+      /\ log[k].id = log[i].id /\ log[i].id \in log[j].dg)
+\* An orphan page: in the store, referenced by no PageOut that applied.
+Not_Orphan == \A pg \in store : \E p \in Full.P : PageName(p) = pg
+\* A sweep deleted a page; a page that GC dropped.
+Not_Swept == comp.sw = 0
+PoApplied(i) ==
+  LET a == Fold(Acc(InitSt, InitSet, None), SubSeq(log, 1, i - 1)) IN PageOut(a, log[i]) # a
+Not_PageDropped ==
+  \A i \in 1..Len(log) : (IsPo(log[i]) /\ PoApplied(i)) => \E p \in Full.P : PageName(p) = log[i]
+\* Blocks: two inline blocks; a block of more than one id.
+Not_TwoBlocks == Cardinality(Blocks(Full.C)) < 2
+Not_WideBlock == \A b \in Blocks(Full.C) : b.lv = 0
 =============================================================================

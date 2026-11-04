@@ -144,4 +144,20 @@ Not_ResolveAfterGc ==
   \A w \in Writers :
     ~(ws[w].pc = "resolve" /\ ws[w].txn.id \in IdsOf(Hist) /\ ws[w].txn.id \notin LiveR.C)
 Not_Exhausted == \A w \in Writers : ~(ws[w].pc = "loop" /\ ws[w].att >= MaxAttempts)
+
+\* Paging (COMMITTED_PAGING.md). A CAS's PageOut applied: the floor above
+\* the horizon. A writer about to judge its record by a read whose id is
+\* paged. An orphan page; a sweep that deleted one; a CAS whose put failed.
+Not_Floor == LiveR.F = LiveR.H
+Not_PageOutInLog == \A i \in 1..Len(file.log) : ~IsPo(file.log[i])
+Not_PagedOwnId ==
+  \A w \in Writers :
+    ~(ws[w].pc \in {"rebase", "shrink", "resolve", "loop"} /\ ws[w].txn # None
+      /\ ws[w].txn.id # None /\ ws[w].txn.id \notin LiveR.C
+      /\ LiveR.H < ws[w].txn.id.ts /\ ws[w].txn.id.ts <= LiveR.F)
+Not_Orphan == \A pg \in store : \E p \in LiveR.P : PageName(p) = pg
+Not_Swept == nsw = 0
+\* Two pages referenced at once; a page GC dropped (H raised past a top).
+Not_TwoPages == Cardinality(LiveR.P) < 2
+Not_PageBelowHorizon == \A pg \in store : Top(pg) > LiveR.H
 =============================================================================

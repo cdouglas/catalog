@@ -15,13 +15,18 @@ Two models of the commit loop (`LogRuntime.commit`, formerly
   validates, to say what that Java must do; see
   [The shared-log model](#the-shared-log-model).
 
+Both models also page the committed set as `docs/COMMITTED_PAGING.md` designs it:
+the floor, PageOut records, page puts and sweeps. That part was written before
+its Java (stage 2 of the design's order of work); see
+[Paging the committed set](#paging-the-committed-set).
+
 The model reproduces the commit loop, not Iceberg. Table metadata (inline TM and
 ML, deltas, row lineage, DVs), byte encoding, SDK error mapping and performance
 are out of scope.
 
 | File | What it holds |
 |---|---|
-| `RSM.tla` | The state machine and replay (`Replay`, `CommittedSet`, `landed`'s verdict), and the serial execution the properties compare with |
+| `RSM.tla` | The state machine and replay (`Replay`; `CommittedSet` with its blocks, floor and pages; `landed`'s verdict and page lookups), and the serial execution the properties compare with |
 | `CatalogCommit.tla` | The protocol: storage, the commit loop, faults, GC, the bug switches, the properties |
 | `CatalogOracles.tla` | The three fuzzers' oracles, their tightened versions, and `Adequate` |
 | `MC.tla` | Scenarios (what each writer commits) and the coverage witnesses |
@@ -40,6 +45,7 @@ curl -L -o spec/tla/tools/tla2tools.jar \
 spec/tla/check.py               # every configuration; each must give its expected verdict
 spec/tla/check.py -k bug        # the configurations whose names contain "bug"
 spec/tla/check.py -k log-       # the shared-log model's
+spec/tla/check.py -n page,log-page  # exactly these configurations
 spec/tla/check.py --witnesses   # every branch and interleaving listed below is reached
 spec/tla/check.py --matrix      # the oracle matrices of both models (about 20 minutes)
 spec/tla/check.py --matrix --tight  # the tightened oracles on the same cells
@@ -56,9 +62,9 @@ java -cp tools/tla2tools.jar tlc2.TLC -workers 2 -config states/cfg/log-mix.cfg 
 
 `TLC_WORKERS` (default 2) and `TLC_HEAP` (default 2g) size the runs. Checked with
 TLC 2026.10.13.164326 (rev 210df3a), the version that jar reported. The whole
-table takes about 35 minutes. Most configurations take seconds; `mix`,
-`mix-lenient`, `skew` and `log-mix` take 3 to 6 minutes each, and `log-three`
-8 to 11.
+table takes about 40 minutes. Most configurations take seconds; `mix`,
+`mix-lenient`, `skew`, `log-mix` and `log-missingfail` take 3 to 6 minutes
+each, and `log-three` 8 to 11.
 
 ## The file model
 
@@ -422,7 +428,7 @@ Every configuration of the correct protocol passes:
 | `log-skew` | retention 1, a writer's clock behind by 2 and a compactor's ahead by 2 | 124,021 |
 | `log-gc-faults`, `log-blind-faults` | compaction and every fault | 286,486; 300,888 |
 | `log-mix` | compaction, every fault, lagging reads | 540,348 |
-| `log-three` | three writers, with compaction | 1,259,308 |
+| `log-three` | three writers, with compaction | 1,338,353 |
 | `log-concerns`, `log-concerns-faults` | a table's concerns as entities; with every fault | 890; 18,562 |
 | `log-blind-appends` | two blind appends, with compaction and every fault | 301,950 |
 | `log-validated` | three validated commits on partitions | 890 |
@@ -562,6 +568,259 @@ conditional write makes each of those mistakes harmless. MW misses `dup` and
 the protocol fuzzer schedules that. The schedules that break the three rules,
 `setonly`, `noverify` and `freshid` are also unit tests in
 `TestSharedLogRuntime`.
+
+## Paging the committed set
+
+`docs/COMMITTED_PAGING.md` moves the committed set's old ids out of
+checkpoints into immutable pages. This is its stage 2: the design in both
+models, written before its Java (stage 3), as the shared log was. With paging
+off (`Paging` FALSE on the file, `MaxPage` 0 on the shared log), the floor
+equals the horizon and there are no pages. Every earlier configuration then
+reaches the same states as before.
+
+### What is modelled
+
+**The set** (`RSM.tla`) is `[C, H, F, P]`:
+
+- `C`, the inline ids, all above the floor `F`;
+- `P`, references to pages, which hold the ids in `(H, F]`;
+- `H`, the horizon, at or below which nothing is known.
+
+Replay admits an id only above `F` (`MayApply`), so it never reads a page.
+Writers mint after `F`.
+
+**Blocks.** Stamps lie on a grid of `2^GridBits` ms (8 in every
+configuration). An id's block is the largest node that holds it and at most
+`BlockIds` (N) inline ids. The blocks are computed from `C`, not stored: that
+is the design's claim that any two replicas at one position agree. The oldest
+block is the oldest id's. The configurations use N = 1, and N = 2 in
+`log-page-n2`.
+
+**Records.**
+
+- `PageOut(node, digest)` seals the oldest block if it is still the block its
+  writer paged (the node, then the digest) and is not the newest. It raises
+  `F` to the block's top. Otherwise it changes nothing (`PageOut`, as in the
+  design's pseudo-code). The model's digest is the set of ids itself.
+- `AdvanceHorizon(w)` drops the pages whose top is at or below `w`, and the
+  inline ids at or below it. It raises `H` to the newest stamp it dropped (for
+  a page, its newest id), and `F` to at least `H`.
+
+**Lookups.** `landed()` on an id in `(H, F]` fetches the page that holds it
+from the page store (`Lookup`): the oldest reference whose top is at or above
+the id's stamp.
+
+- If the page holds the id, the commit is committed. If it lacks it, the
+  commit fails (`BEYOND_FLOOR`), since replay rejects the id from then on.
+- A get that fails (`pageFail`, a fault) is a failed read, under the usual
+  rules: in a read back the write is ambiguous; elsewhere the outcome is
+  unknown if a write may have landed, else an error.
+- A page that is not in the store was deleted after GC dropped it, so the read
+  was a stale replica's. The runtime reads again. In the model, that read
+  decides nothing: the step is not taken.
+- When no reference covers the stamp, see finding 1 below.
+
+**Pages.** The page store is a set of names. A name is the node and the
+digest, so a page is its name. A page is put before its PageOut is sent:
+
+- **On the shared log**, a compactor reads the log from any usable checkpoint
+  (with `Lag`, through any position). It takes the oldest block if that block
+  is sealable and its top is at or below the compactor's clock less
+  `Admission` (A). It puts the page (`PutPage`), and later appends the PageOut
+  (`SendPageOut`), or never does: a crash after the put. A put that fails
+  (`putFail`), or lands with its reply lost (`putLost`), leaves no PageOut to
+  send.
+- **On the file**, a CAS writes `[checkpoint][gc][page-outs][record]`. Its
+  PageOuts seal the oldest blocks of its view after its own GC, while their
+  tops are at or below `min(clock − A, own stamp − 1)`. `PrepCas` fixes the
+  payload and puts its pages, one step before the CAS (`Write`). After a put
+  fault, the CAS goes without its PageOuts.
+- **Sweeps.** `Sweep` (any compactor, on any read) deletes every page its read
+  does not reference whose node ends at or below its floor. Deleting the pages
+  a GC record dropped, once it has landed, is a sweep on a read through it, so
+  it is not a separate action.
+
+### Actions and code
+
+The Java is stage 3; the code column names the design's parts.
+
+| Action | Design (COMMITTED_PAGING.md) |
+|---|---|
+| `PageOut` (replay), `Gc` | "Paging out: the log record", "GC with pages": `CommittedSet.pageOut`, `dropThrough` |
+| `MayApply`, `Stage` (mint after `F`) | "Lookups and the commit loop": `mayApply`, minting |
+| `Lookup`, `Judge` | `landed` resolving `PagedOut` through `pages()` |
+| `PutPage`, `SendPageOut` (shared log); `PrepCas`, `Write` (file) | "Compaction: when and how to page": the policy, then the write |
+| `Sweep` | "Page objects": deletion after GC, orphans |
+| `pageFail`, `putFail`, `putLost` | `InMemorySharedLog`'s page-store hooks |
+
+### Properties
+
+Both models' `Safety` gains:
+
+| Property | Statement |
+|---|---|
+| `PagesExist` | every page the log references is in the store (the design's oracle 2: a landed PageOut's page exists until GC drops it) |
+| `PagesExact` | every referenced page holds exactly the ids that applied in its range |
+| `Shape` | `H ≤ F`; the inline ids lie above `F`; the pages' tops lie in `(H, F]` |
+| `OnGrid` | every stamp lies on the grid |
+
+`Deterministic` and `CheckpointIsReplay` now compare the floor and the pages
+too.
+
+### Results
+
+Every configuration of the correct design passes:
+
+| Config | What it adds | States |
+|---|---|---|
+| `page` | two transactions each, a tick, a CAS that pages, one sweep | 8,052 |
+| `page-cas` | CAS only, two ticks | 23,414 |
+| `page-gc` | retention 2, three ticks: pages that GC later drops, and the sweep that deletes them | 129,212 |
+| `page-faults` | every fault, page faults included, strict versions | 152,877 |
+| `page-skew` | a writer's clock ahead by 2: the other mints after a floor above its clock | 7,860 |
+| `log-page`, `log-page2` | two transactions each; one page put (its PageOut sent, or never) and one sweep; two pages | 10,211; 17,259 |
+| `log-page-n2` | blocks of two ids | 7,885 |
+| `log-page-gc` | one transaction each; a GC record, a checkpoint, a trim | 23,662 |
+| `log-page-faults` | one transaction each; every fault, page faults included | 10,686 |
+| `log-page-lag` | GC and lagging reads (stale PageOuts, the same PageOut twice) | 82,911 |
+| `log-page-skew` | GC at retention 1, a writer's and a compactor's clocks ahead by 2 | 60,060 |
+
+**Retention and paging.** A CAS pages the ids in
+`(clock − R, min(clock − A, own stamp − 1)]`: it pages the view after its own
+GC. With A = 0, a file-model CAS therefore pages nothing below a retention of
+2 ticks. `page-gc` first ran at retention 0 and paged nothing, with the same
+state count at retention 1. The witnesses below caught that.
+
+**Coverage.** `check.py --witnesses` reaches, in the passing paging
+configurations:
+
+- a floor above the horizon, a PageOut in the catalog file, two pages at once,
+  two blocks, a block of two ids;
+- a PageOut that changed nothing, and the same PageOut twice in the log;
+- a writer about to judge its record when its id is paged, and a commit that
+  failed because its record landed below the floor;
+- a copy of a record landing after a PageOut sealed its id;
+- an orphan page, a sweep that deleted a page, and a page that GC dropped.
+
+### Calibration
+
+Each switch is a mistake the design rules out. Each breaks a property:
+
+| Switch | What it does | Shared log | File |
+|---|---|---|---|
+| `floorgap` | replay admits ids above `H`, as before paging, not above `F` | `PagesExact`; with blind appends, `ExactlyOnce` | `HonestFailed` |
+| `absentpage` | a page that cannot be fetched reads as absent | `HonestFailed` | `HonestFailed` |
+| `nodigest` | PageOut checks the node only | `PagesExact` | unreachable (finding 5) |
+| `sweepabove` | the sweep deletes unreferenced pages above the floor too | `PagesExist` | `PagesExist` |
+| `mintH` | writers mint after `H`, not `F` | `SoloCommits` | `CasAppliesItsRecord` |
+| `pageown` | a CAS's PageOuts are not kept below its own record | | `CasAppliesItsRecord` |
+| `missingfail` | a page deleted since the read fails the lookup; the runtime does not read again | `UnknownExplained` (precision only, finding 2) | |
+
+What each counterexample is:
+
+- `floorgap`: on the shared log, W2's record is paged. W1's record, stamped in
+  the same ms but staged before the tick, then lands below the floor. It
+  applies, and the page lacks it, so a later lookup would answer ABSENT for a
+  commit that applied. With blind appends, which verify anywhere, a copy of a
+  paged record applies a second time. On the file, see finding 4.
+- `absentpage`: a commit whose record applied resolves a lost reply, the get
+  of its page fails, and the commit reports failed.
+- `nodigest`: a late id lands in the block between the put and the PageOut.
+  The PageOut still seals the block, under a page that lacks the id.
+- `sweepabove`: the sweep runs between a page's put and its PageOut (on the
+  file, between `PrepCas` and the CAS). The PageOut then names a deleted page.
+- `mintH`: a writer whose clock is behind mints below the floor, and its own
+  record is rejected although nothing raced it.
+- `pageown`: a CAS's PageOut raises the floor past its own record, which
+  follows it.
+
+### What the model found
+
+The design holds on every configuration. Where the model refines it:
+
+1. **A lookup can find no page.** GC raises `H` to a dropped page's newest
+   id, not to its top. An id stamped above that id and at or below the top is
+   in `(H, F]`, but no page holds it. Nothing applied there, and nothing can,
+   so the answer is ABSENT without a fetch. The design's `contains(q)` throws
+   `PagedOut(page holding q)` for every `q` in `(H, F]`; it needs this case.
+2. **A missing page means read again** (`missingfail`). A page is missing
+   only if GC dropped it and a sweep deleted it, so the read was a stale
+   replica's. The design says the runtime reads again and finds the id at or
+   below `H`. It may also find the id in the gap of finding 1, which is
+   ABSENT. A runtime that gives up instead reports UNKNOWN. That is never
+   wrong, so the switch breaks only `UnknownExplained`: in its counterexample,
+   a commit resolving on a lagging read finds its page deleted (GC dropped it,
+   a sweep deleted it). Reading again would also have found UNKNOWN, with the
+   id below the horizon; for an id in the gap it finds REJECTED. Reading again
+   is a gain in precision, not a safety rule.
+3. **The floor makes pages exact, not only exactly-once.** `floorgap` fails
+   first on `PagesExact`, through a late id rather than a copy. An id that
+   lands below the floor after its block was sealed must be rejected, or its
+   page lacks an id that applied.
+4. **On one object, a copy can land after its id was paged.**
+   `AtomicFileLog`'s tail `continues` another if the object did not shrink. A
+   CAS that makes the object longer therefore reads as an append, and a writer
+   whose append was reported as a lost race resends the same record without
+   reading ("replay applies it once"). With PageOuts, a CAS is longer more
+   often. If that CAS paged the record's id, the copy lands below the floor.
+   Only the floor keeps replay from applying or judging it: with `floorgap`,
+   replay judged the copy, which no longer verified, and the commit reported
+   failed although its first copy had applied. The rule holds; the resend's
+   comment in `LogRuntime` should say that the floor, not the inline set,
+   rejects such a copy.
+5. **On one object, the digest check never refuses a PageOut.** A CAS is
+   conditional, so its PageOuts land on the version they were computed on.
+   `nodigest` breaks nothing on the file, as the shared log's switches did not
+   on one object (`TestAtomicFileCommitProtocol` missed them). The check
+   matters for `compact()` on a shared log.
+6. **The catalog fuzzers cannot see a missing page** (the oracles, below).
+   Replay never reads a page, so a fuzzer that only reads the catalog misses
+   `sweepabove`. `OracleHolds2` adds `PagesOK` (`PagesExist /\ PagesExact`),
+   which `CheckpointRoundTrip` can check on every write in stage 4. With it,
+   both catalog fuzzers' tightened oracles catch the switch.
+
+### The oracles, with paging
+
+`check.py --matrix` has rows for the paging switches. The file model's rows
+run the catalog fuzzers' oracles, with what each fuzzer draws plus the page
+store's faults:
+
+| Switch | MW | fault | race / race1 |
+|---|---|---|---|
+| none | passes | passes | passes |
+| `floorgap`, `absentpage` | unreachable | unreachable | no page (below) |
+| `sweepabove` | **missed**; caught by `OracleHolds2` | **missed**; caught by `OracleHolds2` | no page |
+| `mintH` | **missed** (spurious rejections only); caught by `OracleMW2`'s solo rule | unreachable | no page |
+| `pageown` | **missed** | **missed** | no page |
+
+- The race schedules page nothing at these bounds. With one operation per
+  writer, no CAS finds a sealable block below its own record. In stage 4, the
+  race property needs schedules that page (a commit in an older block before
+  A), or it calibrates nothing about paging.
+- `pageown` is reachable on the MW and fault schedules: the matrix checks
+  invariants only, so it ran `CasAppliesItsRecord` apart. Both oracles miss
+  it, because the ids the CAS pages landed after its snapshot: the commit was
+  raced, so no solo rule applies. This is Bug 64b's pattern. The check that
+  caught 64b catches this too: `CheckpointRoundTrip`'s compacting commit's own
+  record applies if it holds on the checkpoint, on writes that carry
+  PageOuts.
+
+The shared log's rows run `now` and `drain`, each also checking `PagesOK`
+after every step: the harness owns the log and the page store.
+
+| Switch | `now` | `drain` |
+|---|---|---|
+| none | passes | passes |
+| `floorgap` (blind appends: a copy applies twice) | **missed** (the copy lands after its commit ended) | caught |
+| `nodigest`, `sweepabove` | caught (`PagesOK`) | caught |
+| `absentpage` | caught | caught |
+| `mintH` | **missed** | **missed** |
+
+`drain` is adequate on every row. Neither oracle asserts that a commit nothing
+raced succeeds, so `mintH`, which costs only spurious rejections, passes both.
+The shared log's fuzzers need the solo rule that `OracleMW2` gave the
+multi-writer test: a commit that no record raced, on a log that did not fail,
+commits.
 
 ## History
 

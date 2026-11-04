@@ -286,6 +286,16 @@ and q:
   ABSENT, which is final.
 - Ids in newer blocks are not affected.
 
+A copy of a record can also land after its id was paged, on one object too. A
+writer whose append lost a race probes the object, and a replace that made it
+longer reads as an append (`AtomicFileLog`: a tail continues another if the
+object did not shrink). The writer then resends the same record without
+reading. If that replace paged the record's id, the copy lands below the
+floor, where replay rejects it without looking, and the writer's lookup finds
+the original in the page. Only the floor keeps replay from judging the copy:
+the TLA+ switch `floorgap` (admission above H) reports such a commit failed
+although its first copy applied.
+
 So a page holds every id that applied in its range, and none that did not.
 
 The pages tile (H, F] in the order their records landed: page i holds the ids in (F_{i−1}, F_i].
@@ -302,15 +312,27 @@ The pages tile (H, F] in the order their records landed: page i holds the ids in
 A page that straddles w is kept whole, so the ids it holds below w stay known.
 Replay never rewrites a page.
 
+H rises to a dropped page's newest id, not to its top. An id stamped above
+that id and at or below the top lies in (H, F] but in no page: nothing applied
+there, and nothing can (below).
+
 ## Lookups and the commit loop
 
 ```
 contains(q):                         # tri-state, as today
     if q > F:           return inline.holds(q)
-    if q > H:           throw PagedOut(page holding q)    # the runtime fetches it
+    if q > H:
+        p = the oldest page whose top is at or above q
+        if p is None:   return false                      # above a dropped page's newest id
+        throw PagedOut(p)                                 # the runtime fetches it
     throw DedupHorizonExceeded
 mayApply(q) = q > F and not inline.holds(q)               # replay never fetches
 ```
+
+An id in (H, F] above every page lies above the newest id of a page GC
+dropped, at or below its top. No record with such an id applied, and none can,
+so the set answers absent without a page (found by the TLA+ model,
+spec/tla/README.md "Paging the committed set").
 
 - **Minting**, after the horizon a writer read (LOG.md), mints after F: `newUuidV7After(max(H, F))`.
   A writer whose clock is behind still commits.
@@ -318,15 +340,17 @@ mayApply(q) = q > F and not inline.holds(q)               # replay never fetches
   GC record is.
 - **`landed`** (Rule 4) catches `PagedOut`, fetches the page through the
   provider's page store, and answers from it. The runtime caches pages by name,
-  since they never change. A page that cannot be fetched fails the lookup; it is
-  never read as "absent". The lookup then falls under the failure rules as any
-  read does (LOG.md §"Failures"): unknown if a write may have landed, else
-  rethrown.
+  since they never change. A get that fails fails the lookup; it is never read
+  as "absent". The lookup then falls under the failure rules as any read does
+  (LOG.md §"Failures"): unknown if a write may have landed, else rethrown. A
+  page that does not exist is another case: GC dropped it and its compactor
+  deleted it, so the replica is stale, and the runtime reads again
+  (Deletion, below).
 - **Callers outside the commit loop** (the tri-state lookup, LOG.md) ask the
   runtime, which resolves pages the same way. `CommittedSet.contains` alone
   throws `PagedOut`, since the set holds references, not pages.
-- **Exceeding A.** An id at or below F whose record is not in its page is
-  REJECTED (`BEYOND_FLOOR`; the catalog throws `CommitFailedException`), since
+- **Exceeding A.** An id at or below F whose record is not in its page, or
+  that no page holds, is REJECTED (`BEYOND_FLOOR`; the catalog throws `CommitFailedException`), since
   replay rejects that record from then on.
 - **P3's caveat goes away within R.** P3 notes that a view whose checkpoint
   already holds the record cannot say whether it applied once GC drops the id.
@@ -349,7 +373,9 @@ instead: Flink keeps `flink.max-committed-checkpoint-id` and Kafka Connect
 Paging is a policy of the compactor, not a protocol rule: replay accepts any
 PageOut that passes its checks. Before it writes, a compactor:
 
-1. applies its own GC to its view, so it does not page ids about to be dropped;
+1. applies its own GC to its view, so it does not page ids about to be dropped.
+   It therefore pages only ids above now − R, and pages nothing unless the
+   retention exceeds the admission window (R > A);
 2. while the inline set exceeds T (1 MiB), takes the oldest block whose top is
    at or below its ceiling, min(now − A, timestamp(own id) − 1);
 3. for each block taken, writes the page (below), then adds the
@@ -391,8 +417,12 @@ The PageOuts go into the write as follows:
   - `floor_below` and the node give the range of ids it holds.
 - **Deletion.**
   - A page may be deleted once a GC record that drops it has landed. A reader
-    still holding an older replica then fails the lookup, reads again, and
-    finds the id at or below H: UNKNOWN, as it would have been.
+    still holding an older replica then finds the page missing, reads again,
+    and finds the id at or below H (UNKNOWN, as it would have been) or above
+    every page (absent, as in Lookups). In a correct log only a stale replica
+    names a missing page. Giving up instead would report UNKNOWN; that is not
+    wrong, but it is less than reading again finds for an id above the page's
+    newest (the TLA+ switch `missingfail` breaks only `UnknownExplained`).
   - The compactor whose write drops a page deletes it, best effort, after its
     write lands.
 - **Orphans.** These are pages whose PageOut was refused, never sent, or lost
@@ -562,8 +592,9 @@ are the norm. It checks:
 - admission and lookups (tri-state, with pages) agree with the reference.
 
 **The commit-protocol fuzzers** (`TestMemoryCommitProtocol`,
-`TestAtomicFileCommitProtocol`) gain compactors that page with A = 0 (as GC
-writers run with retention 0), writers whose stamps are drawn as above, and a
+`TestAtomicFileCommitProtocol`) gain compactors that page with A = 0 and a
+retention above it (a compactor at retention 0 pages nothing: its own GC drops
+what it would page; GC writers at retention 0 still cut blocks), writers whose stamps are drawn as above, and a
 compaction split around its PageOut. The compactor reads at a position p and
 puts its pages. The schedule then runs other steps before the PageOut lands
 at a later position q: commits with stamps drawn into the paged block, GC
@@ -594,19 +625,45 @@ misreported):
    orphan, from a refused PageOut, a split block, a GC cut or a crash after
    the put, is gone.
 
-**TLA+.** Write the floor into `SharedLogCommit.tla` and `CatalogCommit.tla`
-before the Java, as the shared log was. The floor is admission and the
-horizon is knowledge; PageOut is an action, and so are the page's put, which
-comes first, and the sweep. Bug switches each must break a property:
-- replay admits ids at or below F (a copy applies);
-- a missing page reads as absent (a misreport);
-- PageOut without the digest check (a page that lacks an id its record sealed:
-  a misreport);
-- the sweep deletes an unreferenced page whose node ends above the floor (a
-  PageOut in flight then names a missing page);
-- minting below F (spurious rejections, liveness).
+**TLA+** (done, stage 2). `SharedLogCommit.tla` and `CatalogCommit.tla` carry
+the floor, written before the Java, as the shared log was. The floor is
+admission and the horizon is knowledge. PageOut is an action, and so are the
+page's put, which comes first, and the sweep. Two properties are new:
+`PagesExist` (oracle 2's first half) and `PagesExact` (every page holds
+exactly the ids that applied in its range). Each bug switch breaks a property
+(spec/tla/README.md, "Paging the committed set"):
+- replay admits ids at or below F: on a shared log, a late id applies below
+  the floor and its page lacks it (`PagesExact`), and a copy of a blind append
+  applies twice (`ExactlyOnce`); on one object, a copy is judged instead of
+  being found in its page (`HonestFailed`);
+- a missing page reads as absent: a misreport (`HonestFailed`);
+- PageOut without the digest check: a page that lacks an id its record sealed
+  (`PagesExact`). On one object it cannot happen, since a CAS lands only on the
+  version its PageOuts were computed on;
+- the sweep deletes an unreferenced page whose node ends above the floor: a
+  PageOut in flight then names a missing page (`PagesExist`);
+- minting below F: spurious rejections (`SoloCommits`; on one object, a CAS
+  whose own record is rejected);
+- on one object, a CAS's PageOuts not kept below its own record: the CAS
+  rejects its own record (`CasAppliesItsRecord`).
 
-**The catalog fuzzers** run writers with a small A, as they run some with
+The model's oracle matrix (spec/tla/README.md, "The oracles, with paging")
+asks four things of the fuzzers in stage 4:
+- `CheckpointRoundTrip` checks on every write that each page the catalog
+  references exists and holds exactly the ids that applied in its range. Replay
+  never reads a page, so without it the catalog fuzzers miss a sweep that
+  deletes a page in use;
+- its rule that a compacting commit's own record applies if it holds also
+  covers writes that carry PageOuts. The catalog fuzzers' oracles miss a CAS
+  whose PageOuts pass its own record: the commit was raced, so no solo rule
+  applies;
+- the shared log's fuzzers assert that a commit nothing raced, on a log that
+  did not fail, commits. Without it, minting below the floor, which costs only
+  spurious rejections, passes them;
+- the race property gets schedules that page: with one operation per writer,
+  nothing pages.
+
+**The catalog fuzzers** run writers with a small A and a retention above it, as they run some with
 retention 0, and writers whose clocks are offset by amounts drawn from the
 same regions. `CheckpointRoundTrip` already checks that a checkpoint is the
 replay.
@@ -649,7 +706,12 @@ Each stage keeps every suite and fuzzer green, and lands on the branch
    one build.
 2. **TLA+.** The floor, PageOut, the page put and the sweep in
    `SharedLogCommit.tla` and `CatalogCommit.tla`, with the bug switches
-   above.
+   above. Done 2026-11-04. The model refined the design in four places, now in
+   the text: a lookup above a dropped page's newest id finds no page and is
+   absent; a page that does not exist means the replica is stale, so the
+   runtime reads again; a compactor pages nothing unless R > A, since it
+   applies its own GC first; and on one object a copy can land below the
+   floor, where only the floor rejects it.
 3. **Paging.** The PageOut record and its replay, page references, the
    `PageStore` SPI and its providers, the runtime's policy (A, T), lookups
    through pages, deletion after GC, and the sweep.

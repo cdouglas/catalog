@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Runs TLC on the model configurations and checks each verdict.
 
-Usage: spec/tla/check.py [-k SUBSTRING] [--list] [--keep] [--witnesses | --matrix [--tight]]
+Usage: spec/tla/check.py [-k SUBSTRING | -n NAME,...] [--list] [--keep]
+                         [--witnesses | --matrix [--tight]]
 
 Each configuration is a base (BASE for CatalogCommit, through MC; LOG_BASE for
 SharedLogCommit, through MCShared, for the configurations named log-*) with
@@ -36,18 +37,32 @@ BASE = {
     "ClientRetries": "2",
     "Strict": "FALSE",
     "Sched": '"free"',
-
+    "Paging": "FALSE",
+    "Admission": "0",
+    "MaxSweep": "0",
+    "BlockIds": "1",
+    "GridBits": "3",
     "Bugs": "{}",
 }
 
 SAFETY = ["Readable", "ExactlyOnce", "Serializable", "UniqueIds", "HonestCommitted",
-          "HonestFailed", "UnknownExplained", "SoloCommits", "StampsCount"]
+          "HonestFailed", "UnknownExplained", "SoloCommits", "StampsCount", "PagesExist",
+          "PagesExact", "Shape", "OnGrid"]
 ACTIONS = ["HistGrows", "CasAppliesItsRecord", "CheckpointIsReplay"]
 
 ALL_FAULTS = ('{"failBefore", "lostReply", "landedConflict", "throttled", '
               '"landedThrottled", "inflight", "readFail"}')
 FUZZER_FAULTS = ('{"failBefore", "lostReply", "landedConflict", "throttled", '
                  '"landedThrottled", "readFail"}')
+# Paging (COMMITTED_PAGING.md): every CAS pages what its ceiling allows (A = 0, N = 1, a grid
+# of 8), a tick so that ids land in two blocks, one sweep.
+FPAGE = {"Paging": "TRUE", "Shapes": "<- TwoEach", "MaxCount": "1", "MaxTime": "1",
+         "MaxSweep": "1"}
+FPAGE_FAULTS = ('{"failBefore", "lostReply", "landedConflict", "throttled", '
+                '"landedThrottled", "inflight", "readFail", "pageFail", "putFail", "putLost"}')
+# What the catalog fuzzers draw (no late landings), with the page store's faults.
+FUZZER_PAGE_FAULTS = ('{"failBefore", "lostReply", "landedConflict", "throttled", '
+                      '"landedThrottled", "readFail", "pageFail", "putFail", "putLost"}')
 
 # name -> (overrides, expect)
 CONFIGS = {
@@ -97,6 +112,15 @@ CONFIGS = {
                        "MaxFaults": "1", "FaultKinds": ALL_FAULTS}, "pass"),
     "validated": ({"Writers": "{1, 2, 3}", "Skew": "<- NoSkew3", "Entities": "<- PEnts",
                    "Shapes": "<- Validated", "MaxCount": "1"}, "pass"),
+    # Paging: a CAS pages blocks; with GC; CAS only; every fault; skewed clocks.
+    "page": ({**FPAGE}, "pass"),
+    "page-cas": ({**FPAGE, "MaxCount": "0", "MaxTime": "2"}, "pass"),
+    # A CAS pages the ids in (clock - R, min(clock - A, own stamp - 1)] (it pages the view after
+    # its own GC), so with A = 0 it pages nothing below R = 2.
+    "page-gc": ({**FPAGE, "Retention": "2", "MaxTime": "3"}, "pass"),
+    "page-faults": ({**FPAGE, "MaxFaults": "1", "FaultKinds": FPAGE_FAULTS, "Strict": "TRUE"},
+                    "pass"),
+    "page-skew": ({**FPAGE, "Skew": "<- Behind2"}, "pass"),
     # Calibration: each bug, put back, must break a property.
     "basever": ({"Entities": "<- CEnts", "Shapes": "<- Concerns2", "MaxCount": "1",
                  "Bugs": '{"basever"}'}, {"StampsCount", "HonestFailed", "Serializable"}),
@@ -126,6 +150,20 @@ CONFIGS = {
     # filtered at its writer's clock rather than a replay of the log.
     "ckgc": ({"Retention": "0", "MaxTime": "2", "Shapes": "<- TwoEach", "MaxCount": "1",
               "Bugs": '{"ckgc"}'}, {"CheckpointIsReplay"}),
+    # Paging's switches (COMMITTED_PAGING.md "Testing"), and one of the file's own: a CAS's
+    # PageOuts not kept below its own record.
+    "floorgap": ({**FPAGE, "MaxFaults": "1", "FaultKinds": FPAGE_FAULTS, "Bugs": '{"floorgap"}'},
+                 {"ExactlyOnce", "HonestFailed", "PagesExact"}),
+    # On one object a PageOut lands only on the version it was computed on (the CAS is
+    # conditional): the digest check never refuses one, and the switch breaks nothing.
+    "nodigest": ({**FPAGE, "MaxFaults": "1", "FaultKinds": FPAGE_FAULTS, "Bugs": '{"nodigest"}'},
+                 "pass"),
+    "absentpage": ({**FPAGE, "MaxFaults": "2", "FaultKinds": FPAGE_FAULTS,
+                    "Bugs": '{"absentpage"}'}, {"HonestFailed"}),
+    "sweepabove": ({**FPAGE, "Bugs": '{"sweepabove"}'}, {"PagesExist"}),
+    "mintH": ({**FPAGE, "Skew": "<- Behind2", "Bugs": '{"mintH"}'},
+              {"CasAppliesItsRecord", "SoloCommits"}),
+    "pageown": ({**FPAGE, "Bugs": '{"pageown"}'}, {"CasAppliesItsRecord"}),
 }
 
 
@@ -146,12 +184,18 @@ LOG_BASE = {
     "MaxFaults": "0",
     "FaultKinds": "{}",
     "Lag": "FALSE",
+    "Admission": "0",
+    "MaxPage": "0",
+    "MaxSweep": "0",
+    "BlockIds": "1",
+    "GridBits": "3",
     "Bugs": "{}",
 }
 
 LOG_SAFETY = ["StampsCount", "Readable", "Deterministic", "CheckpointIsReplay", "ExactlyOnce",
               "Serializable",
-              "UniqueIds", "HonestCommitted", "HonestFailed", "UnknownExplained", "SoloCommits"]
+              "UniqueIds", "HonestCommitted", "HonestFailed", "UnknownExplained", "SoloCommits",
+              "PagesExist", "PagesExact", "Shape", "OnGrid"]
 LOG_ACTIONS = ["HistGrows"]
 
 LOG_FAULTS = ('{"failBefore", "notSent", "lostReply", "throttled", "landedThrottled", '
@@ -159,6 +203,14 @@ LOG_FAULTS = ('{"failBefore", "notSent", "lostReply", "throttled", "landedThrott
 # Compaction: a GC record, checkpoints and a trim, with retention 0; with faults, one checkpoint.
 COMPACT = {"Retention": "0", "MaxTime": "1", "MaxGc": "1", "MaxCkpt": "2", "MaxTrim": "1"}
 COMPACT1 = {**COMPACT, "MaxCkpt": "1"}
+# Paging (COMMITTED_PAGING.md): a tick, so that ids land in two blocks; a page put (then its
+# PageOut sent, or never: a crash) and a sweep; A = 0, N = 1, stamps on a grid of 8.
+PAGE = {"Shapes": "<- TwoEach", "MaxTime": "1", "MaxPage": "1", "MaxSweep": "1"}
+# One transaction each still lands two ids in two blocks (a tick between them): for the larger
+# configurations.
+PAGE1 = {"MaxTime": "1", "MaxPage": "1", "MaxSweep": "1"}
+PAGE_FAULTS = ('{"failBefore", "notSent", "lostReply", "throttled", "landedThrottled", '
+               '"inflight", "readFail", "pageFail", "putFail", "putLost"}')
 
 LOG_CONFIGS = {
     "log-base": ({}, "pass"),
@@ -188,6 +240,16 @@ LOG_CONFIGS = {
                            "MaxFaults": "1", "FaultKinds": LOG_FAULTS}, "pass"),
     "log-validated": ({"Writers": "{1, 2, 3}", "Skew": "<- NoSkew3", "Entities": "<- PEnts",
                        "Shapes": "<- Validated"}, "pass"),
+    # Paging.
+    "log-page": ({**PAGE}, "pass"),
+    "log-page2": ({**PAGE, "MaxPage": "2"}, "pass"),
+    "log-page-n2": ({**PAGE, "BlockIds": "2"}, "pass"),
+    "log-page-gc": ({**COMPACT1, **PAGE1}, "pass"),
+    "log-page-faults": ({**PAGE1, "MaxCkpt": "1", "MaxFaults": "1", "FaultKinds": PAGE_FAULTS},
+                        "pass"),
+    "log-page-lag": ({**COMPACT1, **PAGE1, "Lag": "TRUE", "MaxPage": "2"}, "pass"),
+    "log-page-skew": ({**COMPACT1, **PAGE1, "Retention": "1", "Skew": "<- Behind2",
+                       "CompSkews": "{0, 2}"}, "pass"),
     # Calibration: each bug, put back, must break a property.
     "log-basever": ({"Entities": "<- CEnts", "Shapes": "<- Concerns2", "Bugs": '{"basever"}'},
                     {"StampsCount", "HonestFailed", "Serializable"}),
@@ -205,6 +267,20 @@ LOG_CONFIGS = {
                  "Bugs": '{"dup"}'}, {"HonestFailed"}),
     "log-lagread": ({"Lag": "TRUE", "MaxFaults": "1", "FaultKinds": LOG_FAULTS,
                      "Bugs": '{"lagread"}'}, {"HonestFailed"}),
+    # Paging's switches (COMMITTED_PAGING.md "Testing").
+    "log-floorgap": ({**PAGE, "MaxFaults": "1", "FaultKinds": LOG_FAULTS,
+                      "Bugs": '{"floorgap"}'}, {"ExactlyOnce", "PagesExact"}),
+    "log-nodigest": ({**PAGE, "Bugs": '{"nodigest"}'}, {"PagesExact"}),
+    "log-absentpage": ({**PAGE, "MaxCkpt": "1", "MaxFaults": "2", "FaultKinds": PAGE_FAULTS,
+                        "Bugs": '{"absentpage"}'}, {"HonestFailed"}),
+    "log-sweepabove": ({**PAGE, "Bugs": '{"sweepabove"}'}, {"PagesExist"}),
+    "log-mintH": ({**PAGE, "Skew": "<- Behind2", "CompSkews": "{2}", "Bugs": '{"mintH"}'},
+                  {"SoloCommits"}),
+    # Not in the plan: a lookup whose page was deleted since its read (GC dropped it) fails
+    # instead of reading again.
+    "log-missingfail": ({**COMPACT1, **PAGE1, "Lag": "TRUE", "MaxFaults": "1",
+                         "FaultKinds": LOG_FAULTS, "Bugs": '{"missingfail"}'},
+                        {"UnknownExplained"}),
 }
 
 MODELS = {"MC": (BASE, SAFETY, ACTIONS), "MCShared": (LOG_BASE, LOG_SAFETY, LOG_ACTIONS)}
@@ -237,6 +313,16 @@ WITNESSES = [
     ("log-base", "Not_FailedButLanded"), ("log-faults2", "Not_Unknown"),
     ("log-faults", "Not_Error"), ("log-faults", "Not_Throttled"),
     ("log-faults2", "Not_Exhausted"), ("log-lag", "Not_LaggingRead"),
+    # Paging.
+    ("page", "Not_Floor"), ("page", "Not_PageOutInLog"), ("page-faults", "Not_PagedOwnId"),
+    ("page-faults", "Not_Orphan"), ("page-gc", "Not_Swept"), ("page-cas", "Not_TwoPages"),
+    ("page-gc", "Not_PageBelowHorizon"), ("page-skew", "Not_Floor"),
+    ("log-page", "Not_Floor"), ("log-page", "Not_PageOutRefused"), ("log-page", "Not_Orphan"),
+    ("log-page-gc", "Not_Swept"), ("log-page2", "Not_Swept"), ("log-page", "Not_PagedOwnId"),
+    ("log-page", "Not_FailedBelowFloor"),
+    ("log-page", "Not_TwoBlocks"), ("log-page-n2", "Not_WideBlock"),
+    ("log-page-gc", "Not_PageDropped"), ("log-page-lag", "Not_DuplicatePageOut"),
+    ("log-page-faults", "Not_CopyAfterPageOut"),
 ]
 
 
@@ -268,6 +354,16 @@ BUG_KNOBS = {
     "64c": {**GC, "skew": True},
     "64d": {**GC, **F1},
     "66": {"SegLimit": "2", "MaxCount": "10"},
+    # Paging's switches (a CAS pages what its ceiling allows; one sweep).
+    "none-page": {"Paging": "TRUE", "MaxTime": "1", "MaxSweep": "1", "MaxCount": "1",
+                  "MaxFaults": "1", "FaultKinds": FUZZER_PAGE_FAULTS},
+    "floorgap": {"Paging": "TRUE", "MaxTime": "1", "MaxSweep": "1", "MaxCount": "1",
+                 "MaxFaults": "1", "FaultKinds": FUZZER_PAGE_FAULTS},
+    "absentpage": {"Paging": "TRUE", "MaxTime": "1", "MaxSweep": "1", "MaxCount": "1",
+                   "MaxFaults": "2", "FaultKinds": FUZZER_PAGE_FAULTS},
+    "sweepabove": {"Paging": "TRUE", "MaxTime": "1", "MaxSweep": "1", "MaxCount": "1"},
+    "mintH": {"Paging": "TRUE", "MaxTime": "1", "MaxSweep": "1", "MaxCount": "1", "skew": True},
+    "pageown": {"Paging": "TRUE", "MaxTime": "1", "MaxSweep": "1", "MaxCount": "1"},
 }
 CREATES = {"mw": "<- Creates", "fault": "<- Creates", "race": "<- RaceCreates",
            "race1": "<- RaceCreates1"}
@@ -288,6 +384,17 @@ LOG_BUG_KNOBS = {
     "p3": LOG_CONFIGS["log-p3"][0],
     "dup": LOG_CONFIGS["log-dup"][0],
     "lagread": LOG_CONFIGS["log-lagread"][0],
+    # Paging: one transaction each where the switch is reachable so (the oracle runs explore
+    # the whole space when they pass). floorgap needs a copy that verifies again (blind
+    # appends); nodigest a late id and mintH a writer staging after the floor rose, so two each.
+    "none-page": {**PAGE1, "MaxCkpt": "1", "MaxFaults": "1", "FaultKinds": PAGE_FAULTS},
+    "floorgap": {**PAGE1, "Entities": "<- CEnts", "Shapes": "<- BlindAppends", "MaxFaults": "1",
+                 "FaultKinds": LOG_FAULTS, "Bugs": '{"floorgap"}'},
+    "nodigest": LOG_CONFIGS["log-nodigest"][0],
+    "absentpage": {**PAGE1, "MaxCkpt": "1", "MaxFaults": "2", "FaultKinds": PAGE_FAULTS,
+                   "Bugs": '{"absentpage"}'},
+    "sweepabove": {**PAGE1, "Bugs": '{"sweepabove"}'},
+    "mintH": LOG_CONFIGS["log-mintH"][0],
 }
 SKEWED = {"mw": "<- Behind2", "fault": "<- Behind2", "race": "<- Behind3", "race1": "<- Behind2"}
 
@@ -396,6 +503,8 @@ ALL = {**CONFIGS, **LOG_CONFIGS}
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-k", default="")
+    ap.add_argument("-n", default="", help="exact names, comma-separated (configurations, "
+                    "witnesses as config.Not_X, matrix cells as oracle.bug)")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--witnesses", action="store_true", help="check the witnesses instead")
@@ -403,11 +512,15 @@ def main():
     ap.add_argument("--tight", action="store_true",
                     help="with --matrix: check the tightened oracles (OracleHolds2) only")
     args = ap.parse_args()
+    exact = set(filter(None, args.n.split(",")))
+
+    def wanted(name):
+        return name in exact if exact else args.k in name
     if args.matrix:
         for oracle in ORACLE_SHAPES:
             for bug in BUG_KNOBS:
                 name = f"{oracle}.{bug}"
-                if args.k not in name:
+                if not wanted(name):
                     continue
                 o = matrix_overrides(oracle, bug)
                 if args.tight:
@@ -427,7 +540,7 @@ def main():
         for oracle in LOG_ORACLES:
             for bug in LOG_BUG_KNOBS:
                 name = f"log-{oracle}.{bug}"
-                if args.k not in name:
+                if not wanted(name):
                     continue
                 o = dict(LOG_BUG_KNOBS[bug])
                 o["OracleAtEnd"] = "<- OracleNow"
@@ -443,12 +556,12 @@ def main():
         failed = []
         for cfg, inv in WITNESSES:
             name = f"{cfg}.{inv}"
-            if args.k in name and not run(name, ALL[cfg][0], inv, args.keep, [inv], []):
+            if wanted(name) and not run(name, ALL[cfg][0], inv, args.keep, [inv], []):
                 failed.append(name)
         if failed:
             print("unreached:", ", ".join(failed))
         return 1 if failed else 0
-    names = [n for n in ALL if args.k in n]
+    names = [n for n in ALL if wanted(n)]
     if args.list:
         for n in names:
             print(n, ALL[n])

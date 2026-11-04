@@ -7,8 +7,8 @@
 (* SharedLogCommit (Adequate), and which bugs each catches.                *)
 (*                                                                         *)
 (* The harness owns the log, so it can replay all of it, trimmed records   *)
-(* included, and it knows the faults it injected. It cannot see the        *)
-(* runtime's reads.                                                        *)
+(* included, and it knows the faults it injected and the page store's      *)
+(* contents. It cannot see the runtime's reads.                            *)
 (***************************************************************************)
 EXTENDS SharedLogCommit
 
@@ -41,18 +41,29 @@ OracleNow(w, s, out) ==
 (* the log through it (InMemorySharedLog.putCheckpoint), and the state     *)
 (* against the serial execution of what applied (EntityVersionsMachine).   *)
 
+\* Oracle 4 of COMMITTED_PAGING.md: orphans are collected. A final GC at
+\* the newest stamp (retention 0) raises the floor past every page in the
+\* store, so a sweep then empties it.
+NewestStamp == SetMax({Txns(log)[i].id.ts : i \in 1..Len(Txns(log))} \cup {0})
+OrphansCollected == \A pg \in store : Top(pg) <= Gc(Full, NewestStamp).F
+
 DrainPred ==
   /\ \A e \in ended : e.out = "committed" => e.c \in CommitsOf(Hist)
   /\ \A e \in ended : e.out \in {"failed", "error"} => e.c \notin CommitsOf(Hist)
   /\ ExactlyOnce
   /\ CheckpointIsReplay
   /\ Serializable
+  /\ OrphansCollected
 
 -----------------------------------------------------------------------------
-(* What each fuzzer asserts: every read of the log succeeds, and its       *)
-(* oracle. Where it passes on a whole run, the properties hold (Adequate). *)
+(* What each fuzzer asserts: every read of the log succeeds, its oracle,   *)
+(* and after every step oracle 2 of COMMITTED_PAGING.md: each page the log *)
+(* references is in the store and holds exactly the ids that applied in    *)
+(* its range (the harness replays the whole log and reads the store).      *)
+(* Where it passes on a whole run, the properties hold (Adequate).         *)
 
-OracleHoldsNow == Readable /\ (AllDone => ook)
+PagesOK == PagesExist /\ PagesExact
+OracleHoldsNow == Readable /\ PagesOK /\ (AllDone => ook)
 OracleHoldsDrain == OracleHoldsNow /\ (Quiet => DrainPred)
 
 AdequateNow == (Quiet /\ OracleHoldsNow) => Safety

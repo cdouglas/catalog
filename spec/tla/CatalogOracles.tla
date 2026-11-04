@@ -147,6 +147,13 @@ RacePred2 ==
        /\ sched.racers # {}
        /\ View(file) = ViewOf(SerialOf(InitSt, Writers)) => res[1] = "unknown"
 
+\* Paging (COMMITTED_PAGING.md, oracle 2), as CheckpointRoundTrip can check
+\* it on every write: each page the catalog references is in the store, and
+\* holds exactly the ids that applied in its range. Replay never reads a
+\* page, so a fuzzer that only reads the catalog cannot see a page go
+\* missing until a lookup needs it.
+PagesOK == PagesExist /\ PagesExact
+
 OracleOK2 == IF Sched = "race" THEN RacePred2 ELSE ook
-OracleHolds2 == Readable /\ (AllDone => OracleOK2)
+OracleHolds2 == Readable /\ PagesOK /\ (AllDone => OracleOK2)
 =============================================================================

@@ -10,6 +10,11 @@
 (* writers interleave between any two; the comments name the code branch.  *)
 (* The properties below are stated over RSM's ghost history, `hist`.       *)
 (*                                                                         *)
+(* With Paging, a CAS also pages the committed set as                      *)
+(* docs/COMMITTED_PAGING.md designs it: its write is [checkpoint][gc]      *)
+(* [page-outs][record], and it puts the pages first; sweeps delete pages   *)
+(* no PageOut can name.                                                    *)
+(*                                                                         *)
 (* Bug switches put back protocol bugs the fuzzers and reviews found       *)
 (* (Bug N in fileio-catalog's commit subjects), to calibrate the           *)
 (* properties and the oracles (CatalogOracles.tla). Sched restricts the    *)
@@ -35,6 +40,9 @@ CONSTANTS
   FaultKinds,       \* the faults it may inject (see Write and the reads)
   ClientRetries,    \* how many times an operation is restaged (Iceberg: 4)
   Strict,           \* a read pinned to a replaced version fails (GCS, S3/ADLS If-Match)
+  Paging,           \* a CAS pages the committed set's oldest blocks (COMMITTED_PAGING.md)
+  Admission,        \* A, in ticks: a CAS pages blocks whose top is A old
+  MaxSweep,         \* how many sweeps of the page store run
   Sched             \* "free": any interleaving. A fuzzer's schedules, where operations
                     \* run one at a time and others may run to completion inside one:
                     \* "mw" (TestMultiWriterProperties: one, before any request, on a
@@ -43,16 +51,20 @@ CONSTANTS
                     \* writer 1 runs A, and each other writer runs fresh just before
                     \* one of A's writes, in turn, or after A)
                     \* Bugs (RSM): protocol bugs put back, by number
+                    \* BlockIds, GridBits (RSM): the committed set's blocks
 
 WriteFaults == {"failBefore", "lostReply", "landedConflict", "throttled",
                 "landedThrottled", "inflight"}
-ReadFaults == {"readFail"}
+ReadFaults == {"readFail", "pageFail"}
+PutFaults == {"putFail", "putLost"}
 
-ASSUME /\ FaultKinds \subseteq WriteFaults \cup ReadFaults
+ASSUME /\ FaultKinds \subseteq WriteFaults \cup ReadFaults \cup PutFaults
        /\ MaxAttempts >= 1 /\ MaxThrottle >= 1
        /\ Sched \in {"free", "mw", "fault", "race"}
        /\ Bugs \subseteq {"10", "12", "16", "17", "18", "25", "26",
-                          "64a", "64b", "64c", "64d", "66", "ckgc", "basever"}
+                          "64a", "64b", "64c", "64d", "66", "ckgc", "basever",
+                          "floorgap", "nodigest", "absentpage", "sweepabove", "mintH",
+                          "pageown"}
 
 VARIABLES
   file,      \* the catalog object: [gen, chk: [st, C, H], log, segs]
@@ -63,24 +75,27 @@ VARIABLES
   ended,     \* the outcomes reported, per commit: [id, out, cf, cx, ci]
   res,       \* Writers -> the outcome of the writer's last operation, or None
   ook,       \* every oracle check so far passed (CatalogOracles)
-  sched      \* [active, nest: the operations running; pre: how many ran inside the
+  sched,     \* [active, nest: the operations running; pre: how many ran inside the
              \*  active one; racers: who ran inside one]
+  store,     \* the page store: the names of the pages in it
+  nsw        \* sweeps so far
 
-vars == <<file, inflight, now, nf, ws, ended, res, ook, sched>>
+vars == <<file, inflight, now, nf, ws, ended, res, ook, sched, store, nsw>>
+PageVars == <<store, nsw>>
 
 -----------------------------------------------------------------------------
 (* The catalog object, and reads of it *)
 
-InitFile == [gen |-> 1, chk |-> [st |-> InitSt, C |-> {}, H |-> 0],
+InitFile == [gen |-> 1, chk |-> [st |-> InitSt, C |-> {}, H |-> 0, F |-> 0, P |-> {}],
              log |-> << >>, segs |-> 1]
 
 \* A read: the replayed state, what replay did with the record of `watch`,
 \* the version read and its length (in records, the checkpoint counting
 \* one), and the intention-record count (intentionRecords).
 ReplayOf(f, watch) ==
-  LET a == Fold(Acc(f.chk.st, f.chk.C, f.chk.H, watch), f.log)
-  IN [st |-> a.st, C |-> a.C, H |-> a.H, err |-> a.err, out |-> a.out,
-      cnt |-> Len(Txns(f.log)), gen |-> f.gen, len |-> Len(f.log) + 1]
+  LET a == Fold(Acc(f.chk.st, f.chk, watch), f.log)
+  IN [st |-> a.st, C |-> a.C, H |-> a.H, F |-> a.F, P |-> a.P, err |-> a.err, out |-> a.out,
+      cnt |-> Len(Txns(f.log)), gen |-> f.gen, len |-> Len(f.log) + 1, rf |-> a.rf]
 
 Replay(f) == ReplayOf(f, None)
 
@@ -96,23 +111,39 @@ LiveOf(s) == ReplayOf(file, s.txn.id)
 
 Clock(w) == 1 + now + Skew[w]
 
+\* The PageOuts a compactor writes on view a: the oldest blocks, while one
+\* is sealable and its top at or below the ceiling (COMMITTED_PAGING.md
+\* "Compaction", with T = 0).
+RECURSIVE PageOuts(_, _)
+PageOuts(a, ceil) ==
+  IF Sealable(a.C) /\ Top(Oldest(a.C)) <= ceil
+    THEN << PoOf(a.C) >> \o PageOuts(PageOut(a, PoOf(a.C)), ceil)
+  ELSE << >>
+
 \* The file a CAS writes, but its generation (LogRuntime's replace and
 \* `records`): a checkpoint of `b`, a GC record at the watermark (none when GC
-\* is off), then the record.
+\* is off), with Paging its PageOuts, then the record.
 \* The checkpoint is the replay of the version the CAS replaces, whatever the
 \* clock says (I11). With Bug 64b the watermark is not capped below the
 \* record's own time. With "ckgc" the checkpoint itself is filtered at the
 \* watermark, as it was before GC records: a reader starting from another
 \* checkpoint of the same log would not see the same horizon.
+\* The PageOuts page the view after the CAS's own GC, up to a ceiling: the
+\* writer's clock less the admission window, and below its own record's
+\* stamp, as its GC record is (with "pageown", not below it).
 CasPayload(w, b, t) ==
   LET c    == Clock(w)
       wm0  == IF Retention < 0 \/ Retention >= c THEN 0 ELSE c - Retention
       wm   == IF Has("64b") THEN wm0 ELSE Max(0, Min(wm0, t.id.ts - 1))
-      ckgc == Gc([C |-> b.C, H |-> b.H], wm)
+      ceil == IF Has("pageown") THEN c - Admission ELSE Min(c - Admission, t.id.ts - 1)
+      pos  == IF Paging THEN PageOuts(Gc(b, wm), ceil) ELSE << >>
   IN IF Has("ckgc")
-       THEN [chk |-> [st |-> b.st, C |-> ckgc.C, H |-> ckgc.H], log |-> << t >>]
-       ELSE [chk |-> [st |-> b.st, C |-> b.C, H |-> b.H],
-             log |-> IF wm = 0 THEN << t >> ELSE << [wm |-> wm], t >>]
+       THEN [chk |-> Ck(Gc(b, wm)), log |-> << t >>]
+       ELSE [chk |-> Ck(b),
+             log |-> (IF wm = 0 THEN << >> ELSE << [wm |-> wm] >>) \o pos \o << t >>]
+
+\* The pages a CAS's PageOuts seal.
+CasPages(pl) == {PageName(pl.log[i]) : i \in {j \in 1..Len(pl.log) : IsPo(pl.log[j])}}
 
 \* Storage applies a write x = [strat, cond, payload] to f.
 Land(f, x) ==
@@ -131,11 +162,12 @@ SegOK(f, strat) == strat = "CAS" \/ SegLimit = 0 \/ f.segs + 1 <= SegLimit
 Idle(k, n) ==
   [pc |-> "idle", k |-> k, n |-> n, txn |-> None, snap |-> None, base |-> None,
    cur |-> None, stale |-> FALSE, amb |-> FALSE, unres |-> FALSE, full |-> FALSE,
-   att |-> 0, thr |-> 0, pend |-> None, written |-> None, rt |-> 0, nw |-> 0,
+   att |-> 0, thr |-> 0, pend |-> None, written |-> None, rt |-> 0, nw |-> 0, pay |-> None,
    cf |-> FALSE, cx |-> FALSE, ci |-> FALSE, cw |-> << >>, first |-> None, ocf |-> FALSE]
 \* pc: idle, staged, loop, cas, throttled, readback, rebase, refresh, shrink,
 \*   resolve, restage.
-\* rt: the times the operation was restaged; nw: its write requests.
+\* rt: the times the operation was restaged; nw: its write requests; pay:
+\*   with Paging, the CAS payload fixed when its pages were put (PrepCas).
 \* base: the parsed state of cur (current), unless stale (stale).
 \* cur: the version the next write is conditioned on [gen, len] (current).
 \* amb: a write's outcome was unknown (ambiguous); unres: a write failed its
@@ -205,29 +237,36 @@ End(w, s, out, landed) ==
 \* the commit may have landed, else the read's failure.
 Unreadable(w, s) == End(w, s, IF Earlier(s) THEN "unknown" ELSE "error", FALSE)
 
-\* landed(): what a read R (watching the commit's record) says of the
-\* commit's own record. Committed if replay applied it, or if R holds its
-\* id; at or below R's horizon, unknown if a write may have landed, else
-\* CommitFailedException (with Bug 64d the exception escaped raw);
-\* otherwise `then`. On one object, a GC record precedes every record of
-\* its version, so replay's judgment and the committed set agree.
-Judge(w, s, R, then) ==
-  LET c == Landed(R, s.txn.id) IN
-  CASE c = "yes" -> End(w, s, "committed", FALSE)
-    [] c = "unknown" -> End(w, s, IF Has("64d") THEN "error"
-                                 ELSE IF Earlier(s) THEN "unknown" ELSE "failed", FALSE)
-    [] OTHER -> then
-
-\* Rebase on a read R: base := R, current := its version.
-Rebased(s, R) ==
-  [s EXCEPT !.unres = FALSE, !.base = R, !.cur = [gen |-> R.gen, len |-> R.len],
-            !.stale = FALSE]
-
 \* catch (AmbiguousWrite): resolve by reading. With Bug 17 the commit
 \* reported a failure.
 Ambig(w, s, landed) ==
   IF Has("17") THEN End(w, s, "failed", landed)
   ELSE Go(w, [s EXCEPT !.amb = TRUE, !.pc = "resolve"], landed)
+
+\* landed(): what a read R (watching the commit's record) says of the
+\* commit's own record. Committed if replay applied it, or if R holds its
+\* id; at or below R's horizon, unknown if a write may have landed, else
+\* CommitFailedException (with Bug 64d the exception escaped raw);
+\* otherwise `then`. On one object, a GC record precedes every record of
+\* its version, so replay's judgment and the committed set agree. A paged
+\* id is looked up in its page (pf: the get fails): one its page lacks can
+\* never apply (BEYOND_FLOOR: CommitFailedException); a get that fails is a
+\* failed read, in a read back (rb) an ambiguous write; a page deleted since
+\* the read: the runtime reads again, so this read decides nothing.
+Judge(w, s, R, pf, rb, then) ==
+  LET c == LandedP(R, s.txn.id, store, pf) IN
+  CASE c = "yes" -> End(w, s, "committed", FALSE)
+    [] c = "unknown" -> End(w, s, IF Has("64d") THEN "error"
+                                 ELSE IF Earlier(s) THEN "unknown" ELSE "failed", FALSE)
+    [] c = "absent" -> End(w, s, "failed", FALSE)
+    [] c = "fail" -> IF rb THEN Ambig(w, s, FALSE) ELSE Unreadable(w, s)
+    [] c = "missing" -> FALSE
+    [] OTHER -> then
+
+\* Rebase on a read R: base := R, current := its version.
+Rebased(s, R) ==
+  [s EXCEPT !.unres = FALSE, !.base = R, !.cur = [gen |-> R.gen, len |-> R.len],
+            !.stale = FALSE, !.pay = None]
 
 \* A precondition failure (CASException, AppendException). A transport retry
 \* of a write that landed fails it too, so it stays unresolved; with Bug 18
@@ -240,25 +279,30 @@ MustCAS(s) ==
   s.full \/ ~AppendSupported \/ s.base.cnt >= MaxCount \/ s.cur.len + 1 > MaxSize
 
 \* The write w is about to send, or None: a throttled one again; the CAS
-\* after a fresh read; else as the loop decides (mustCAS).
+\* after a fresh read; else as the loop decides (mustCAS). With Paging, a
+\* CAS waits for its payload, fixed when its pages were put (PrepCas).
+CasDue(s) ==
+  \/ s.pc = "cas"
+  \/ s.pc = "loop" /\ s.att < MaxAttempts /\ MustCAS(s) /\ (~s.stale \/ Has("12"))
 NextWrite(w) ==
   LET s == ws[w]
       cas == [strat |-> "CAS", cond |-> s.cur.gen,
-              payload |-> CasPayload(w, IF Has("12") THEN s.snap ELSE s.base, s.txn)]
+              payload |-> IF Paging THEN s.pay
+                          ELSE CasPayload(w, IF Has("12") THEN s.snap ELSE s.base, s.txn)]
   IN CASE s.pc = "throttled" -> s.pend
-       [] s.pc = "cas" -> cas
-       [] s.pc = "loop" /\ s.att < MaxAttempts /\ MustCAS(s) /\ (~s.stale \/ Has("12")) -> cas
+       [] CasDue(s) /\ (~Paging \/ s.pay # None) -> cas
        [] s.pc = "loop" /\ s.att < MaxAttempts /\ ~MustCAS(s) ->
             [strat |-> "APPEND", cond |-> s.cur.gen, payload |-> s.txn]
        [] OTHER -> None
 
 \* The transaction staged for operation sh on a read R of the catalog
-\* (CatalogMutation), as w's n-th commit. Its id is minted after the horizon
-\* of R (UuidV7.newUuidV7After; not with Bug 64c). With Bug 16 the record
-\* carries the preconditions of the entities it writes, not of those it only
-\* reads.
+\* (CatalogMutation), as w's n-th commit. Its id is minted after the floor
+\* of R (UuidV7.newUuidV7After; not with Bug 64c; with "mintH", after its
+\* horizon, as before paging). With Bug 16 the record carries the
+\* preconditions of the entities it writes, not of those it only reads.
 Stage(w, sh, R, n) ==
-  LET ts  == IF Has("64c") THEN Clock(w) ELSE Max(Clock(w), R.H + 1)
+  LET ts  == IF Has("64c") THEN Clock(w)
+             ELSE Max(Clock(w), (IF Has("mintH") THEN R.H ELSE R.F) + 1)
       ird == [e \in sh.rd |-> R.st.ver[e]]
   IN [id |-> [w |-> w, n |-> n, ts |-> ts],
       rd |-> IF Has("16") THEN [e \in sh.wr |-> R.st.ver[e]] ELSE ird,
@@ -293,6 +337,7 @@ Begin(w) ==
   /\ ws' = [ws EXCEPT ![w] = [Staged(s, LiveR, Stage(w, Shapes[w][s.k], LiveR, s.n))
                                  EXCEPT !.pc = "staged"]]
   /\ UNCHANGED <<file, inflight, now, nf, ended, res, ook, sched>>
+  /\ UNCHANGED PageVars
 
 \* commit() starts: alone, or (mw, fault) on an earlier snapshot inside the
 \* active operation.
@@ -305,6 +350,7 @@ Start(w) ==
              /\ sched' = [sched EXCEPT !.nest = w, !.pre = @ + 1, !.racers = @ \cup {w}]
   /\ ws' = [ws EXCEPT ![w].pc = "loop"]
   /\ UNCHANGED <<file, inflight, now, nf, ended, res, ook>>
+  /\ UNCHANGED PageVars
 
 \* fault, race: an operation reads, stages and commits inside the active one.
 BeginNested(w) ==
@@ -316,15 +362,17 @@ BeginNested(w) ==
                                  EXCEPT !.pc = "loop"]]
   /\ sched' = [sched EXCEPT !.nest = w, !.pre = @ + 1, !.racers = @ \cup {w}]
   /\ UNCHANGED <<file, inflight, now, nf, ended, res, ook>>
+  /\ UNCHANGED PageVars
 
 \* FileIOCatalog restages an operation whose commit failed on a fresh read
 \* (commitOnAFreshRead; Iceberg's table commit retries likewise).
 Restage(w, fk) ==
   LET s == ws[w] IN
   /\ CanStep(w) /\ s.pc = "restage"
-  /\ fk \in RFaultsOf(w)
+  /\ fk \in RFaultsOf(w) \ {"pageFail"}
   /\ UseFault(fk)
   /\ UNCHANGED <<file, inflight, now>>
+  /\ UNCHANGED PageVars
   /\ IF fk = "readFail" \/ LiveR.err
        THEN End(w, [s EXCEPT !.txn = [id |-> None], !.cf = TRUE, !.ocf = TRUE], "error", FALSE)
      ELSE Go(w, [Staged(s, LiveR, Stage(w, Shapes[w][s.k], LiveR, s.n)) EXCEPT !.pc = "loop"],
@@ -349,7 +397,7 @@ Write(w, fk) ==
                       !.cf = @ \/ fk # "none", !.ocf = @ \/ fk # "none",
                       !.cw = IF lands THEN Append(@, [before |-> file, after |-> f2]) ELSE @,
                       !.first = IF @ = None THEN file ELSE @, !.nw = @ + 1,
-                      !.pend = None, !.thr = 0]
+                      !.pend = None, !.thr = 0, !.pay = None]
   IN /\ CanStep(w) /\ x # None
      \* race: racer k runs just before A's write k
      /\ Sched = "race" /\ w = sched.active => sched.pre > s.nw \/ s.nw >= NRacers
@@ -362,6 +410,7 @@ Write(w, fk) ==
                     ELSE inflight
      /\ UseFault(fk)
      /\ UNCHANGED now
+     /\ UNCHANGED PageVars
      /\ CASE fk = "none" /\ ok /\ seg ->
                Go(w, [s1 EXCEPT !.pc = "readback", !.written = f2], TRUE)
           [] fk = "none" /\ ok ->       \* SegmentLimitException: compact on a fresh read
@@ -384,20 +433,25 @@ ReadBack(w, fk) ==
       s1 == [Faulted(s, fk) EXCEPT !.written = None]
   IN /\ CanStep(w) /\ s.pc = "readback"
      /\ fk \in RFaultsOf(w)
+     /\ fk = "pageFail" => NeedsPage(R, s.txn.id)
      /\ UseFault(fk)
      /\ UNCHANGED <<file, inflight, now>>
+     /\ UNCHANGED PageVars
      /\ IF fk = "readFail" \/ (Strict /\ file.gen # s.written.gen) \/ R.err
           THEN Ambig(w, s1, FALSE)
-          ELSE Judge(w, [s1 EXCEPT !.cx = @ \/ Crossed(R, s.txn)], R,
+          ELSE Judge(w, [s1 EXCEPT !.cx = @ \/ Crossed(R, s.txn)], R, fk = "pageFail", TRUE,
                      End(w, s1, "failed", FALSE))   \* replay rejected the record: conflict
 
 \* A read of the live catalog by a commit, then `then(R)`; a failure is
-\* Unreadable.
+\* Unreadable. pageFail: the read succeeds, and the get of the page
+\* landed() asks fails.
 ReadLive(w, fk, s, pcs) ==
   /\ CanStep(w) /\ s.pc \in pcs
   /\ fk \in RFaultsOf(w)
+  /\ fk = "pageFail" => s.pc # "refresh" /\ NeedsPage(LiveOf(s), s.txn.id)
   /\ UseFault(fk)
   /\ UNCHANGED <<file, inflight, now>>
+  /\ UNCHANGED PageVars
 
 \* After a CAS conflict: rebase on a fresh read if the transaction still
 \* holds on it, else fail without writing (conflict()).
@@ -406,7 +460,7 @@ Rebase(w, fk) ==
       s1 == [Faulted(s, fk) EXCEPT !.cx = @ \/ Crossed(LiveR, s.txn)]
   IN /\ ReadLive(w, fk, s, {"rebase"})
      /\ IF fk = "readFail" \/ LiveR.err THEN Unreadable(w, Faulted(s, fk))
-        ELSE Judge(w, s1, LiveOf(s),
+        ELSE Judge(w, s1, LiveOf(s), fk = "pageFail", FALSE,
                IF Verify(LiveR.st, s.txn)
                  THEN Go(w, [Rebased(s1, LiveR) EXCEPT !.att = @ + 1, !.pc = "loop"], FALSE)
                  ELSE End(w, [s1 EXCEPT !.unres = FALSE], "failed", FALSE))
@@ -430,7 +484,7 @@ Shrink(w, fk) ==
       s1 == [Faulted(s, fk) EXCEPT !.cx = @ \/ Crossed(LiveR, s.txn)]
   IN /\ ReadLive(w, fk, s, {"shrink"})
      /\ IF fk = "readFail" \/ LiveR.err THEN Unreadable(w, Faulted(s, fk))
-        ELSE Judge(w, s1, LiveOf(s),
+        ELSE Judge(w, s1, LiveOf(s), fk = "pageFail", FALSE,
                Go(w, [Rebased(s1, LiveR) EXCEPT !.att = @ + 1, !.pc = "loop"], FALSE))
 
 \* The loop must CAS but base is stale: read the live version afresh, then
@@ -444,7 +498,8 @@ FreshForCAS(w, fk) ==
      /\ ReadLive(w, fk, s, {"loop"})
      /\ IF fk = "readFail" \/ LiveR.err \/ (Has("26") /\ Strict /\ file.gen # s.cur.gen)
           THEN Unreadable(w, Faulted(s, fk))
-        ELSE Judge(w, s1, LiveOf(s), Go(w, [Rebased(s1, LiveR) EXCEPT !.pc = "cas"], FALSE))
+        ELSE Judge(w, s1, LiveOf(s), fk = "pageFail", FALSE,
+                   Go(w, [Rebased(s1, LiveR) EXCEPT !.pc = "cas"], FALSE))
 
 \* catch (AmbiguousWrite): a fresh read decides. If the record is not there,
 \* retry on that read if the transaction holds on it, else fail. A failed
@@ -454,7 +509,7 @@ Resolve(w, fk) ==
       s1 == [Faulted(s, fk) EXCEPT !.cx = @ \/ Crossed(LiveR, s.txn)]
   IN /\ ReadLive(w, fk, s, {"resolve"})
      /\ IF fk = "readFail" \/ LiveR.err THEN Unreadable(w, Faulted(s, fk))
-        ELSE Judge(w, s1, LiveOf(s),
+        ELSE Judge(w, s1, LiveOf(s), fk = "pageFail", FALSE,
                IF Verify(LiveR.st, s.txn)
                  THEN Go(w, [Rebased(s1, LiveR) EXCEPT !.att = @ + 1, !.pc = "loop"], FALSE)
                  ELSE End(w, [s1 EXCEPT !.unres = FALSE], "failed", FALSE))
@@ -466,6 +521,7 @@ Exhaust(w) ==
   /\ CanStep(w) /\ s.pc = "loop" /\ s.att >= MaxAttempts
   /\ s.amb \/ ~s.unres
   /\ UNCHANGED <<file, inflight, now, nf>>
+  /\ UNCHANGED PageVars
   /\ End(w, s, IF s.amb THEN "unknown" ELSE "failed", FALSE)
 
 FinalRead(w, fk) ==
@@ -474,7 +530,7 @@ FinalRead(w, fk) ==
   IN /\ s.pc = "loop" /\ s.att >= MaxAttempts /\ ~s.amb /\ s.unres
      /\ ReadLive(w, fk, s, {"loop"})
      /\ IF fk = "readFail" \/ LiveR.err THEN Unreadable(w, Faulted(s, fk))
-        ELSE Judge(w, s1, LiveOf(s), End(w, s1, "failed", FALSE))
+        ELSE Judge(w, s1, LiveOf(s), fk = "pageFail", FALSE, End(w, s1, "failed", FALSE))
 
 \* A timed-out write lands after all, while its precondition holds.
 LandInflight(i) ==
@@ -486,11 +542,45 @@ LandInflight(i) ==
               IF ws[v].pc # "idle" /\ (v # i.w \/ ws[v].txn.id # i.id)
                 THEN [ws[v] EXCEPT !.ci = TRUE] ELSE ws[v]]
   /\ UNCHANGED <<now, nf, ended, res, ook, sched>>
+  /\ UNCHANGED PageVars
+
+\* With Paging, before a CAS: its payload is fixed (the GC watermark and
+\* PageOuts, at the writer's clock), and the pages its PageOuts seal are
+\* put, before the CAS is sent. A put that fails, or lands with its reply
+\* lost: the CAS goes without its PageOuts, and a page that landed is an
+\* orphan.
+PrepCas(w, fk) ==
+  LET s   == ws[w]
+      pl  == CasPayload(w, IF Has("12") THEN s.snap ELSE s.base, s.txn)
+      pgs == CasPages(pl)
+  IN /\ Paging /\ CanStep(w) /\ CasDue(s) /\ s.pay = None
+     /\ fk \in {"none"} \cup (IF CanFault(w) /\ pgs # {} THEN FaultKinds \cap PutFaults ELSE {})
+     /\ UseFault(fk)
+     /\ store' = IF fk = "putFail" THEN store ELSE store \cup pgs
+     /\ ws' = [ws EXCEPT ![w] =
+                 [Faulted(s, fk) EXCEPT
+                    !.pay = IF fk = "none" THEN pl
+                            ELSE [pl EXCEPT !.log = SelectSeq(@, LAMBDA r : ~IsPo(r))]]]
+     /\ UNCHANGED <<file, inflight, now, ended, res, ook, sched, nsw>>
+
+\* A sweep (any compactor) lists the page store and deletes every page the
+\* live catalog does not reference whose node ends at or below its floor:
+\* no PageOut can name it again. With "sweepabove", every page it does not
+\* reference. Deleting the pages a CAS's GC dropped, once it has landed, is
+\* such a sweep.
+Sweep ==
+  LET del == {pg \in store : (\A p \in LiveR.P : PageName(p) # pg)
+                             /\ (Has("sweepabove") \/ Top(pg) <= LiveR.F)}
+  IN /\ Paging /\ nsw < MaxSweep /\ del # {}
+     /\ store' = store \ del
+     /\ nsw' = nsw + 1
+     /\ UNCHANGED <<file, inflight, now, nf, ws, ended, res, ook, sched>>
 
 Tick ==
-  /\ Retention >= 0 /\ now < MaxTime
+  /\ (Retention >= 0 \/ Paging) /\ now < MaxTime
   /\ now' = now + 1
   /\ UNCHANGED <<file, inflight, nf, ws, ended, res, ook, sched>>
+  /\ UNCHANGED PageVars
 
 Done ==
   /\ \A w \in Writers : ws[w].pc = "idle" /\ ws[w].k > Len(Shapes[w])
@@ -506,6 +596,8 @@ Init ==
   /\ res = [w \in Writers |-> None]
   /\ ook = TRUE
   /\ sched = [active |-> None, nest |-> None, pre |-> 0, racers |-> {}]
+  /\ store = {}
+  /\ nsw = 0
 
 WriterNext(w) ==
   \/ Begin(w)
@@ -516,10 +608,12 @@ WriterNext(w) ==
        ReadBack(w, fk) \/ Rebase(w, fk) \/ Refresh(w, fk) \/ Shrink(w, fk)
          \/ FreshForCAS(w, fk) \/ Resolve(w, fk) \/ FinalRead(w, fk) \/ Restage(w, fk)
   \/ Exhaust(w)
+  \/ \E fk \in PutFaults \cup {"none"} : PrepCas(w, fk)
 
 Next ==
   \/ \E w \in Writers : WriterNext(w)
   \/ \E i \in inflight : LandInflight(i)
+  \/ Sweep
   \/ Tick
   \/ Done
 
@@ -584,12 +678,19 @@ CasAppliesItsRecord ==
 \* its records needs this, so that every reader, from whichever checkpoint,
 \* applies the same records.
 CheckpointIsReplay ==
-  [][(file'.gen # file.gen /\ file'.segs = 1) =>
-       LET R == Replay(file) IN file'.chk = [st |-> R.st, C |-> R.C, H |-> R.H]]_file
+  [][(file'.gen # file.gen /\ file'.segs = 1) => file'.chk = Ck(Replay(file))]_file
+
+\* Pages (COMMITTED_PAGING.md, oracle 2): every page the catalog references
+\* is in the store, and holds exactly the ids that applied in its range.
+\* The set keeps its shape; every stamp lies on the grid.
+PagesExist == PagesExistIn(LiveR, store)
+PagesExact == PagesExactIn(LiveR, Hist)
+Shape == SetShape(LiveR)
+OnGrid == OnGridIn(file.log)
 
 Safety ==
   Readable /\ ExactlyOnce /\ Serializable /\ UniqueIds
-    /\ HonestCommitted /\ HonestFailed /\ UnknownExplained
+    /\ HonestCommitted /\ HonestFailed /\ UnknownExplained /\ PagesExist /\ PagesExact
 
 \* Every writer finishes.
 Termination == <>[](\A w \in Writers : ws[w].pc = "idle" /\ ws[w].k > Len(Shapes[w]))
