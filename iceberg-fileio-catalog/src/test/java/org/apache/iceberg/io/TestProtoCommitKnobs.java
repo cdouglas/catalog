@@ -37,6 +37,7 @@ import org.apache.iceberg.inmemory.InMemoryInputFile;
 import org.intentlog.CompactionPolicy;
 import org.intentlog.DedupHorizonExceededException;
 import org.intentlog.Replica;
+import org.intentlog.RuntimeConfig;
 import org.intentlog.wire.UuidV7;
 import org.junit.jupiter.api.Test;
 
@@ -442,6 +443,23 @@ public class TestProtoCommitKnobs {
     props.put(LogCatalogProperties.COMMITTED_RETENTION_MS, "300000");
     assertThat(LogCatalogProperties.runtimeConfig(props).committedRetentionMs())
         .isEqualTo(300_000L);
+  }
+
+  @Test
+  void pagingConfigFromProperties() {
+    RuntimeConfig defaults = LogCatalogProperties.runtimeConfig(Map.of());
+    assertThat(defaults.admissionWindowMs()).isEqualTo(5L * 60 * 1000);
+    assertThat(defaults.pageThresholdBytes()).isEqualTo(1L << 20);
+    Map<String, String> props = new HashMap<>();
+    props.put(LogCatalogProperties.COMMITTED_ADMISSION_MS, "60000");
+    props.put(LogCatalogProperties.COMMITTED_PAGE_THRESHOLD, "4096");
+    RuntimeConfig config = LogCatalogProperties.runtimeConfig(props);
+    assertThat(config.admissionWindowMs()).isEqualTo(60_000L);
+    assertThat(config.pageThresholdBytes()).isEqualTo(4096L);
+    props.put(LogCatalogProperties.COMMITTED_ADMISSION_MS, "-1");
+    org.assertj.core.api.Assertions.assertThatThrownBy(
+        () -> LogCatalogProperties.runtimeConfig(props))
+        .isInstanceOf(IllegalArgumentException.class);
   }
 
   @Test

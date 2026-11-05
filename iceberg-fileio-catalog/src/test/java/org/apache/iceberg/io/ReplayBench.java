@@ -248,7 +248,7 @@ public class ReplayBench {
   public void decodeRecords(Records counter, Blackhole bh) {
     for (byte[] bytes : records) {
       LogEnvelope.Record record = LogEnvelope.decodeRecord(bytes);
-      if (!record.isAdvanceHorizon()) {
+      if (record.isIntention()) {
         bh.consume(CatalogStateMachine.INSTANCE.decodeIntention(record.intention()));
       }
     }

@@ -19,11 +19,14 @@
 package org.intentlog;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assumptions.assumeThat;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.UUID;
+import org.intentlog.wire.CommittedSetCodec;
 import org.intentlog.wire.LogEnvelope;
 import org.intentlog.wire.UuidV7;
 import org.junit.jupiter.api.Test;
@@ -96,6 +99,63 @@ class TestReplay {
     assertThat(result.committed().horizon()).isEqualTo(100);
     assertThat(result.outcome()).isEqualTo(Replay.Outcome.NOT_SEEN);
     assertThat(result.intentionRecords()).isEqualTo(3);
+  }
+
+  @Test
+  void aPageOutSealsTheOldestBlockWhereItLands() {
+    assumeThat(CommittedSetCodec.BLOCK_IDS).as("small blocks (surefire)").isLessThanOrEqualTo(64);
+    List<byte[]> log = new ArrayList<>();
+    List<UUID> ids = new ArrayList<>();
+    for (int i = 0; i < 3 * CommittedSetCodec.BLOCK_IDS; i++) {
+      UUID id = id(1_000_000L + 7L * i);
+      ids.add(id);
+      log.add(record(id, "k" + i, 0));
+    }
+    CommittedSet before = Replay.replay(MACHINE, null, log, null).committed().build();
+    CommittedSet.Seal seal = before.sealable(Long.MAX_VALUE);
+    assertThat(seal).isNotNull();
+    byte[] pageOut = LogEnvelope.encodePageOut(seal.record());
+    // A late id inside the sealed block (the oldest id's ms), and a copy of a sealed record
+    UUID late = id(UuidV7.timestampMs(ids.get(0)));
+
+    List<byte[]> sealedFirst = new ArrayList<>(log);
+    sealedFirst.add(pageOut);
+    sealedFirst.add(record(late, "late", 0));
+    sealedFirst.add(log.get(0));
+    Replay.Result<ToyMachine.Versions> result = Replay.replay(MACHINE, null, sealedFirst, late);
+    CommittedSet set = result.committed().build();
+    assertThat(set.floor()).isEqualTo(seal.record().top());
+    assertThat(set.pages()).containsExactly(seal.ref());
+    // Below the floor: neither the late id nor the copy is judged
+    assertThat(result.builder().build()).doesNotContainKey("late").containsEntry("k0", 1);
+    assertThat(result.outcome()).isEqualTo(Replay.Outcome.NOT_SEEN);
+    assertThat(result.seen()).isTrue();
+    assertThat(result.intentionRecords()).isEqualTo(log.size() + 2); // the PageOut not counted
+
+    // The late id lands first: the block is not the one the PageOut sealed, which changes nothing
+    List<byte[]> lateFirst = new ArrayList<>(log);
+    lateFirst.add(record(late, "late", 0));
+    CommittedSet unsealed = Replay.replay(MACHINE, null, lateFirst, null).committed().build();
+    lateFirst.add(pageOut);
+    Replay.Result<ToyMachine.Versions> refused = Replay.replay(MACHINE, null, lateFirst, null);
+    assertThat(refused.builder().build()).containsEntry("late", 1);
+    assertThat(refused.committed().build().bytes()).isEqualTo(unsealed.bytes());
+
+    // Twice: the second changes nothing
+    List<byte[]> twice = new ArrayList<>(log);
+    twice.add(pageOut);
+    CommittedSet once = Replay.replay(MACHINE, null, twice, null).committed().build();
+    twice.add(pageOut);
+    assertThat(Replay.replay(MACHINE, null, twice, null).committed().build().bytes())
+        .isEqualTo(once.bytes());
+
+    // From a checkpoint of the sealed set, replay goes on the same
+    byte[] checkpoint = LogEnvelope.encodeCheckpoint(id(1), once.bytes(),
+        MACHINE.encodeCheckpoint(Replay.replay(MACHINE, null, twice, null).builder().build()));
+    Replay.Result<ToyMachine.Versions> resumed =
+        Replay.replay(MACHINE, checkpoint, List.of(record(late, "late", 0)), late);
+    assertThat(resumed.outcome()).isEqualTo(Replay.Outcome.NOT_SEEN);
+    assertThat(resumed.committed().build().bytes()).isEqualTo(once.bytes());
   }
 
   @Test

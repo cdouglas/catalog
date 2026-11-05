@@ -100,6 +100,14 @@ enum LocalCatalogMode {
     return io.attachment(SHARED_LOG + location, key -> new InMemorySharedLog(location));
   }
 
+  /**
+   * With {@code -Dintentlog.test.paging=true}, every catalog pages its committed set at an
+   * admission window and threshold of 0 (docs/COMMITTED_PAGING.md): with the suites' blocks of 16
+   * ids, a compaction seals every block below its own id but the newest, so the suites run their
+   * catalogs paged and {@code CheckpointRoundTrip} checks the writes that page.
+   */
+  static final boolean PAGING = Boolean.getBoolean("intentlog.test.paging");
+
   /** This mode's table metadata storage, on a shared log. */
   LocalCatalogMode onSharedLog() {
     return inlineML ? MEMLOG_ML : inlineTM ? MEMLOG_TM : MEMLOG;
@@ -135,6 +143,11 @@ enum LocalCatalogMode {
     properties.put(CatalogProperties.TABLE_DEFAULT_PREFIX + "override-key3", "catalog-default-key3");
     properties.put(CatalogProperties.TABLE_OVERRIDE_PREFIX + "override-key3", "catalog-override-key3");
     properties.put(CatalogProperties.TABLE_OVERRIDE_PREFIX + "override-key4", "catalog-override-key4");
+    if (PAGING) {
+      // Page the committed set whenever a block below the writer's own id can be sealed
+      properties.put(LogCatalogProperties.COMMITTED_ADMISSION_MS, "0");
+      properties.put(LogCatalogProperties.COMMITTED_PAGE_THRESHOLD, "0");
+    }
     properties.putAll(extra);
     String location = warehouse + "/catalog-" + name;
     LogCatalog catalog = sharedLog

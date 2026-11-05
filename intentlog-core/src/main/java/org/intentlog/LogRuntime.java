@@ -21,12 +21,20 @@ package org.intentlog;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Supplier;
+import org.intentlog.wire.CommittedSetCodec;
 import org.intentlog.wire.LogEnvelope;
+import org.intentlog.wire.PageRef;
 import org.intentlog.wire.UuidV7;
 
 /**
@@ -39,6 +47,14 @@ import org.intentlog.wire.UuidV7;
  * of the commit's writes may have landed is rethrown as it is. A commit is reported rejected only
  * before any write, or after a read of the log that shows its record rejected or absent with no
  * write of it still able to land (I10).
+ *
+ * <p>A log with a {@link PageStore} pages its committed set (docs/COMMITTED_PAGING.md): a
+ * compaction seals the oldest blocks older than the admission window into pages, while the inline
+ * set is larger than the threshold ({@link RuntimeConfig#admissionWindowMs}, {@link
+ * RuntimeConfig#pageThresholdBytes}). It puts each page before the {@code PageOut} record that
+ * names it, deletes the pages its GC record dropped once the record has landed, and sweeps the
+ * orphans, pages no PageOut references whose node the floor has passed. A lookup of an id between
+ * the horizon and the floor reads its page.
  */
 public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends Intention<B>> {
 
@@ -50,9 +66,32 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
    */
   static final boolean CHECK = Boolean.getBoolean("intentlog.replay.check");
 
+  /** How many times a lookup reads the log again when a page it names is gone. */
+  private static final int MAX_PAGE_REREADS = 2;
+
+  /** The pages a runtime keeps (their verified entries): they never change. */
+  private static final int PAGE_CACHE = 4;
+
   private final SharedLog log;
   private final StateMachine<S, B, I> machine;
   private final RuntimeConfig config;
+  // Pages read, by name: their entries, checked against the reference that named them
+  private final Map<String, byte[]> pageCache =
+      Collections.synchronizedMap(new LinkedHashMap<>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, byte[]> eldest) {
+          return size() > PAGE_CACHE;
+        }
+      });
+  // Pages this runtime put. A name's bytes never change, and a name is deleted only once the
+  // floor has passed its node, after which no compactor proposes it again: so a put once is put.
+  private final Set<String> pagesPut =
+      Collections.newSetFromMap(Collections.synchronizedMap(new LinkedHashMap<>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, Boolean> eldest) {
+          return size() > 64;
+        }
+      }));
 
   public LogRuntime(SharedLog log, StateMachine<S, B, I> machine, RuntimeConfig config) {
     this.log = log;
@@ -119,18 +158,22 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
   /**
    * Compacts a log that keeps its checkpoints apart from its records ({@link
    * Capabilities#separateCheckpoints}): appends a GC record at the clock less the retention (none
-   * when GC is off), reads through it, stores the replay there as a checkpoint, and trims the
-   * records it holds. Any compactor may run it at any time, and each step is safe to repeat or
-   * to abandon: a GC record that lands twice drops nothing new, a checkpoint is the replay of the
-   * log through its position whoever writes it (I11), and the trim follows a durable checkpoint
-   * (P5). Returns the replica it checkpointed.
+   * when GC is off), reads through it; pages the oldest blocks of the committed set there, as the
+   * policy says, by putting each page and appending its PageOut, and reads through the last; stores
+   * the replay there as a checkpoint, and trims the records it holds. Then it deletes the pages a
+   * GC record dropped, and sweeps the orphans. Any compactor may run it at any time, and each step
+   * is safe to repeat or to abandon: a GC record that lands twice drops nothing new, a PageOut that
+   * lands twice (or after its block changed) changes nothing, a checkpoint is the replay of the log
+   * through its position whoever writes it (I11), and the trim follows a durable checkpoint (P5).
+   * Returns the replica it checkpointed.
    */
   public Replica<S> compact() {
     if (!log.capabilities().separateCheckpoints()) {
       throw new UnsupportedOperationException(
           "A log that replaces itself compacts as it commits: " + log);
     }
-    long watermark = watermark(Long.MAX_VALUE);
+    long now = config.clockMs().getAsLong();
+    long watermark = watermark(now, Long.MAX_VALUE);
     LogView view;
     if (watermark > 0L) {
       byte[] gc = LogEnvelope.encodeAdvanceHorizon(watermark);
@@ -138,22 +181,222 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     } else {
       view = log.read();
     }
+    LogView first = view;
     Replica<S> through = replay(view, null).replica();
+    List<CommittedSet.Seal> seals =
+        page(through.committed(), pageCeiling(now, Long.MAX_VALUE), through.logId());
+    if (!seals.isEmpty()) {
+      Receipt last = null;
+      for (CommittedSet.Seal seal : seals) {
+        byte[] pageOut = LogEnvelope.encodePageOut(seal.record());
+        last = sendThrottled(() -> log.append(pageOut, null));
+      }
+      view = log.readThrough(last, config.visibilityWait());
+      through = replay(view, null, null, through).replica();
+    }
     log.putCheckpoint(view.tail(), checkpoint(through));
     log.trim(view.tail());
+    if (log.pages() != null) {
+      // A page leaves the set only by a GC record, so one the first view's checkpoint names and the
+      // replica does not was dropped by one that has landed
+      List<PageRef> before = first.checkpoint()
+          .map(c -> CommittedSet.of(LogEnvelope.decodeCheckpoint(c).committed()).pages())
+          .orElse(List.of());
+      tidyPages(dropped(before, through.committed()), !seals.isEmpty(), through.committed());
+    }
     return through;
   }
 
   /**
-   * The GC watermark a compaction writes now: the clock less the retention, at most {@code
-   * ceiling}; 0 (no GC record) when the retention reaches back past the epoch ({@code
+   * The GC watermark a compaction writes at {@code now}: the clock less the retention, at most
+   * {@code ceiling}; 0 (no GC record) when the retention reaches back past the epoch ({@code
    * Long.MAX_VALUE} disables GC).
    */
-  private long watermark(long ceiling) {
-    long now = config.clockMs().getAsLong();
+  private long watermark(long now, long ceiling) {
     long retention = config.committedRetentionMs();
     long watermark = retention >= now ? 0L : now - retention;
     return Math.max(0L, Math.min(watermark, ceiling));
+  }
+
+  /**
+   * The newest top a compaction at {@code now} may seal: the clock less the admission window, at
+   * most {@code ceiling}; -1 (nothing) when the window reaches back past the epoch.
+   */
+  private long pageCeiling(long now, long ceiling) {
+    long window = config.admissionWindowMs();
+    return Math.min(window >= now ? -1L : now - window, ceiling);
+  }
+
+  // ============================================================
+  // Pages
+  // ============================================================
+
+  /**
+   * The pages a compaction seals of {@code set}, its view of the committed set after its own GC
+   * (so that it pages no id about to be dropped), each put before it is returned: while the inline
+   * blocks are larger than the threshold, the oldest block if its top is at or below {@code
+   * ceilingMs} and it is not the newest. Each is computed on the set after the ones before it.
+   * Stops at a put that fails: its PageOut is not sent, nor any after it. None if the log stores no
+   * pages.
+   */
+  private List<CommittedSet.Seal> page(CommittedSet set, long ceilingMs, UUID logId) {
+    PageStore store = log.pages();
+    if (store == null || ceilingMs < 0L) {
+      return List.of();
+    }
+    List<CommittedSet.Seal> seals = new ArrayList<>();
+    while (set.inlineBytes() > config.pageThresholdBytes()) {
+      CommittedSet.Seal seal = set.sealable(ceilingMs);
+      if (seal == null) {
+        break;
+      }
+      if (!pagesPut.contains(seal.name())) {
+        try {
+          store.put(seal.name(), seal.page(logId));
+        } catch (RuntimeException e) {
+          LOG.log(System.Logger.Level.WARNING,
+              "Putting page " + seal.name() + " of " + log + " failed; not paging it", e);
+          break;
+        }
+        pagesPut.add(seal.name());
+      }
+      seals.add(seal);
+      set = set.pagedOut(seal.record());
+    }
+    return seals;
+  }
+
+  /** The pages {@code before} names (oldest first) that {@code after}, a later set, does not. */
+  private static List<PageRef> dropped(List<PageRef> before, CommittedSet after) {
+    if (before.isEmpty()) {
+      return List.of();
+    }
+    Set<PageRef> kept = new HashSet<>(after.pages());
+    List<PageRef> dropped = new ArrayList<>();
+    for (PageRef page : before) {
+      if (!kept.contains(page)) {
+        dropped.add(page);
+      }
+    }
+    return dropped;
+  }
+
+  /**
+   * After a write landed: deletes {@code dropped}, pages a GC record that landed dropped, and, if
+   * the write dropped or sealed any page, sweeps the orphans against {@code landed}, the set it
+   * landed in. Best effort: a page left behind costs storage, and a later sweep finds it.
+   */
+  private void tidyPages(List<PageRef> dropped, boolean sealed, CommittedSet landed) {
+    PageStore store = log.pages();
+    if (store == null || (dropped.isEmpty() && !sealed)) {
+      return;
+    }
+    try {
+      for (PageRef page : dropped) {
+        store.delete(page.name());
+      }
+      sweep(store, landed);
+    } catch (RuntimeException e) {
+      LOG.log(System.Logger.Level.WARNING, "Deleting dropped or orphaned pages of " + log
+          + " failed", e);
+    }
+  }
+
+  /**
+   * Deletes every page {@code set} does not reference whose node ends at or below its floor
+   * (docs/COMMITTED_PAGING.md "Orphans"). Such a page can never become referenced, since a PageOut
+   * names the oldest block above the floor and the floor only rises; a page whose PageOut may still
+   * land is above it. A store that cannot list its pages is not swept.
+   */
+  private static void sweep(PageStore store, CommittedSet set) {
+    List<String> names;
+    try {
+      names = store.list();
+    } catch (UnsupportedOperationException e) {
+      return;
+    }
+    Set<String> referenced = new HashSet<>();
+    for (PageRef page : set.pages()) {
+      referenced.add(page.name());
+    }
+    for (String name : names) {
+      long top = CommittedSetCodec.pageTop(name);
+      if (top >= 0L && top <= set.floor() && !referenced.contains(name)) {
+        store.delete(name);
+      }
+    }
+  }
+
+  /** A page a reference names that the page store does not hold: GC dropped it since. */
+  private static final class MissingPage extends RuntimeException {
+    MissingPage(PageRef page) {
+      super("Page " + page.name() + " does not exist", null, false, false);
+    }
+  }
+
+  /**
+   * Whether the page {@code ref} names holds {@code id}. Reads the page through the log's page
+   * store, once (pages never change), and checks it is the one the reference names: the log's, its
+   * node, its digest; a page that is not fails the lookup.
+   *
+   * @throws MissingPage if the store holds no such page: GC dropped it, and its compactor deleted
+   *     it, since the replica that names it was read
+   * @throws RuntimeException if the page could not be read: never read as "absent"
+   */
+  private boolean pageHolds(PageRef ref, UUID logId, UUID id) {
+    byte[] packed = pageCache.get(ref.name());
+    if (packed == null) {
+      PageStore store = log.pages();
+      if (store == null) {
+        throw new IllegalStateException(
+            log + " names page " + ref.name() + " but stores no pages");
+      }
+      Optional<byte[]> body = store.get(ref.name());
+      if (body.isEmpty()) {
+        throw new MissingPage(ref);
+      }
+      LogEnvelope.Page page = LogEnvelope.decodePage(body.get());
+      if (logId != null && !logId.equals(page.logId())) {
+        throw new IllegalStateException(
+            "Page " + ref.name() + " belongs to log " + page.logId() + ", not " + logId);
+      }
+      if (page.level() != ref.level() || page.index() != ref.index()
+          || !ref.hasDigest(page.digest())) {
+        throw new IllegalStateException(
+            "Page " + ref.name() + " does not hold the block its reference names");
+      }
+      packed = page.packedEntries();
+      pageCache.put(ref.name(), packed);
+    }
+    return CommittedSetCodec.holds(ref.level(), ref.index(), packed, id);
+  }
+
+  /**
+   * Whether the record of {@code id} applied, in the log as {@code replica} holds it (docs/LOG.md,
+   * the tri-state lookup): from the inline set above the floor; from the page that holds it in
+   * (H, F], read through the log's page store (a page GC has dropped since the replica was read
+   * sends the lookup to a fresh read, as at most {@link #MAX_PAGE_REREADS} times); false where no
+   * page can hold it.
+   *
+   * @throws DedupHorizonExceededException if the id is at or below the horizon
+   * @throws RuntimeException if a page could not be read, or a read failed
+   */
+  public boolean committed(Replica<S> replica, UUID id) {
+    for (int rereads = 0; ; rereads++) {
+      try {
+        return replica.committed().contains(id);
+      } catch (PagedOutException e) {
+        try {
+          return pageHolds(e.page(), replica.logId(), id);
+        } catch (MissingPage missing) {
+          if (rereads >= MAX_PAGE_REREADS) {
+            throw new IllegalStateException(
+                "Page " + e.page().name() + " of " + log + " is gone on every read", missing);
+          }
+          replica = read(replica);
+        }
+      }
+    }
   }
 
   /** The checkpoint of {@code replica}: exactly its log id, committed set and state. */
@@ -291,6 +534,11 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
       return result.builder();
     }
 
+    /** The log's id, from the replayed checkpoint, else the one given. */
+    UUID logId() {
+      return result.logId() != null ? result.logId() : logId;
+    }
+
     Replica<S> replica() {
       if (replica == null) {
         replica =
@@ -365,7 +613,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
       }
       if (watch != null) {
         LogEnvelope.Record decoded = LogEnvelope.decodeRecord(record);
-        if (!decoded.isAdvanceHorizon() && decoded.id().equals(watch)) {
+        if (decoded.isIntention() && decoded.id().equals(watch)) {
           return -1;
         }
       }
@@ -416,6 +664,24 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
 
     RuntimeException failure() {
       return (RuntimeException) getCause();
+    }
+  }
+
+  /**
+   * A replace's payload: the checkpoint and the records after it, the pages its GC record drops,
+   * and whether its PageOuts seal any.
+   */
+  private static final class Prepared {
+    final byte[] checkpoint;
+    final List<byte[]> records;
+    final List<PageRef> dropped;
+    final boolean sealed;
+
+    Prepared(byte[] checkpoint, List<byte[]> records, List<PageRef> dropped, boolean sealed) {
+      this.checkpoint = checkpoint;
+      this.records = records;
+      this.dropped = dropped;
+      this.sealed = sealed;
     }
   }
 
@@ -503,8 +769,10 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
       if (!tail.exists() && !caps.fusedReplace()) {
         create();
       } else if (!tail.exists()) {
+        Prepared creation = prepare(base);
         try {
-          return validate(write(() -> log.replace(tail, checkpoint(base), records(base)), false));
+          return validate(
+              write(() -> log.replace(tail, creation.checkpoint, creation.records), false));
         } catch (AmbiguousWrite | LogConflictException e) {
           // The creation may have landed: its reply was lost, reading it back failed, or it failed
           // its condition, as a transport retry of a creation that landed does.
@@ -551,10 +819,14 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
               adopt(fresh);
             }
             full = false;
+            // The payload, its pages put: before the write, whose failures leave it ambiguous
+            Prepared replace = prepare(current);
             try {
-              Replica<S> on = current;
               LogTail at = tail;
-              return validate(write(() -> log.replace(at, checkpoint(on), records(on)), false));
+              Replayed written =
+                  write(() -> log.replace(at, replace.checkpoint, replace.records), false);
+              tidyPages(replace.dropped, replace.sealed, written.result.committed().build());
+              return validate(written);
             } catch (LogConflictException e) {
               unresolved = e;
               raceBackoff(e);
@@ -730,22 +1002,39 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     }
 
     /**
-     * The records a replace writes after its checkpoint: a GC record, then this commit's. GC of
-     * the committed set is a record, never a filter on the checkpoint, so every checkpoint is a
-     * replay of the log before it (I11). The watermark is now less the retention, clamped to 0
-     * (a retention of {@code Long.MAX_VALUE} disables GC, and no record is written), and stays
-     * below this commit's own time: the horizon must not reach the record that follows, or replay
-     * rejects it (Bug 64). A short retention would otherwise drop the id of a commit this one
-     * rebased on, minted after it.
+     * What a replace of the log at {@code on} writes: the checkpoint of {@code on}, then a GC
+     * record, the PageOuts, and this commit's record. GC of the committed set is a record, never a
+     * filter on the checkpoint, so every checkpoint is a replay of the log before it (I11). The
+     * watermark is now less the retention, clamped to 0 (a retention of {@code Long.MAX_VALUE}
+     * disables GC, and no record is written), and stays below this commit's own time: the horizon
+     * must not reach the record that follows, or replay rejects it (Bug 64). A short retention would
+     * otherwise drop the id of a commit this one rebased on, minted after it. The PageOuts seal the
+     * oldest blocks of the set after that GC, as the policy says ({@link #page}), with tops below
+     * this commit's own time too, so the floor stays below its record; their pages are put here.
      */
-    private List<byte[]> records(Replica<S> on) {
-      long watermark = watermark(UuidV7.timestampMs(id) - 1);
-      List<byte[]> records = new ArrayList<>(2);
+    private Prepared prepare(Replica<S> on) {
+      long now = config.clockMs().getAsLong();
+      long own = UuidV7.timestampMs(id) - 1;
+      long watermark = watermark(now, own);
+      List<byte[]> records = new ArrayList<>(3);
+      CommittedSet set = on.committed();
       if (watermark > 0L) {
         records.add(LogEnvelope.encodeAdvanceHorizon(watermark));
       }
+      List<PageRef> dropped = List.of();
+      List<CommittedSet.Seal> seals = List.of();
+      if (log.pages() != null) {
+        if (watermark > 0L) {
+          set = set.toBuilder().advanceHorizon(watermark).build();
+        }
+        dropped = dropped(on.committed().pages(), set);
+        seals = page(set, pageCeiling(now, own), on.logId());
+        for (CommittedSet.Seal seal : seals) {
+          records.add(LogEnvelope.encodePageOut(seal.record()));
+        }
+      }
       records.add(record);
-      return records;
+      return new Prepared(checkpoint(on), records, dropped, !seals.isEmpty());
     }
 
     /**
@@ -868,11 +1157,21 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
      * Whether {@code fresh} holds this commit's record. Replay's judgment of the record where it
      * landed comes first: on a log with checkpoints apart from its records, another writer's GC
      * record can land between this record and the read, and drop the id of a record that applied.
-     * Else the committed set: if the id is at or below its horizon, the set cannot say, and replay
-     * rejects the record from now on (Bug 64): the commit failed, unless {@code earlier}, a write
-     * of it that may have landed, did, before its id aged out.
+     * Else the committed set. If the id is at or below its floor, replay rejects the record from
+     * now on, so the answer is final: the page that holds the ids there says whether it applied
+     * before the floor passed it (COMMITTED, or the commit is rejected, {@code BEYOND_FLOOR}). If
+     * it is at or below the horizon, the set cannot say (Bug 64): the commit failed, unless {@code
+     * earlier}, a write of it that may have landed, did, before its id aged out.
+     *
+     * <p>A page that cannot be read is a failed read, never "absent": the outcome is unknown if
+     * {@code earlier} may have landed, else this throws {@link UnreadableLog}. A page GC has
+     * dropped since {@code fresh} was read sends the lookup to a fresh read.
      */
     private boolean landed(Replayed fresh, Throwable earlier) {
+      return landed(fresh, earlier, 0);
+    }
+
+    private boolean landed(Replayed fresh, Throwable earlier, int rereads) {
       switch (fresh.result.outcome()) {
         case APPLIED:
           return true;
@@ -881,8 +1180,13 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
         default:
           break;
       }
+      CommittedSet.Builder set = fresh.result.committed();
       try {
-        return fresh.result.committed().contains(id);
+        if (set.contains(id)) {
+          return true;
+        }
+      } catch (PagedOutException e) {
+        return paged(fresh, e.page(), earlier, rereads);
       } catch (DedupHorizonExceededException e) {
         if (earlier != null) {
           earlier.addSuppressed(e);
@@ -895,11 +1199,74 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
                 id),
             e);
       }
+      if (UuidV7.timestampMs(id) <= set.floor()) {
+        // In (H, F] where no page can hold it: nothing applied there, and nothing can
+        throw beyondFloor();
+      }
+      return false;
     }
 
-    /** The replica of {@code result}, if it holds this commit's record; else a conflict. */
+    /** {@link #landed} for an id that the page {@code page} holds if its record applied. */
+    private boolean paged(Replayed fresh, PageRef page, Throwable earlier, int rereads) {
+      boolean holds;
+      try {
+        holds = pageHolds(page, fresh.logId(), id);
+      } catch (MissingPage missing) {
+        // GC dropped the page and its compactor deleted it since fresh was read: read again. The
+        // id is then at or below the horizon, or where no page can hold it (TLA+: missingfail)
+        if (rereads >= MAX_PAGE_REREADS) {
+          return unreadablePage(missing, earlier);
+        }
+        Replayed again;
+        try {
+          again = read();
+        } catch (UnreadableLog e) {
+          if (earlier != null) {
+            earlier.addSuppressed(e.failure());
+            throw new CommitOutcomeUnknownException(earlier);
+          }
+          throw e;
+        }
+        return landed(again, earlier, rereads + 1);
+      } catch (RuntimeException e) {
+        return unreadablePage(e, earlier);
+      }
+      if (holds) {
+        return true; // applied before its id was paged: this is a copy, or a late lookup
+      }
+      throw beyondFloor();
+    }
+
+    /** A page that could not be read: unknown if {@code earlier} may have landed, else a failed read. */
+    private boolean unreadablePage(RuntimeException failure, Throwable earlier) {
+      if (earlier != null) {
+        earlier.addSuppressed(failure);
+        throw new CommitOutcomeUnknownException(earlier);
+      }
+      throw new UnreadableLog(failure);
+    }
+
+    private CommitRejectedException beyondFloor() {
+      return new CommitRejectedException(
+          CommitRejectedException.Reason.BEYOND_FLOOR, null,
+          String.format("Cannot commit: transaction %s is at or below the log's committed-set"
+              + " floor, and its record did not apply before the floor passed it", id),
+          null);
+    }
+
+    /**
+     * The replica of {@code result}, a read through a write of this commit, if it holds this
+     * commit's record; else a conflict. A page the lookup needs that cannot be read leaves the
+     * write ambiguous.
+     */
     private Replica<S> validate(Replayed result) {
-      if (!landed(result, earlier())) {
+      boolean landed;
+      try {
+        landed = landed(result, earlier());
+      } catch (UnreadableLog e) {
+        throw new AmbiguousWrite(e.failure());
+      }
+      if (!landed) {
         // The record landed, but replay rejected it: a concurrent commit changed what it depends on.
         throw conflict(result, "Cannot commit: a concurrent commit invalidated this one",
             result.result.rejection());

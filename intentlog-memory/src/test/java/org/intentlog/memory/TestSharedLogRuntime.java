@@ -493,7 +493,7 @@ class TestSharedLogRuntime {
 
   private static String tagOf(byte[] record) {
     LogEnvelope.Record r = LogEnvelope.decodeRecord(record);
-    return r.isAdvanceHorizon() ? "" : MACHINE.decodeIntention(r.intention()).tag();
+    return !r.isIntention() ? "" : MACHINE.decodeIntention(r.intention()).tag();
   }
 
   private byte[] recordOf(String tag) {

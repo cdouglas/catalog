@@ -56,9 +56,12 @@ import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.types.Types;
 import org.intentlog.CommittedSet;
 import org.intentlog.DedupHorizonExceededException;
+import org.intentlog.PagedOutException;
 import org.intentlog.Replica;
 import org.intentlog.fileio.AtomicFileLog;
+import org.intentlog.wire.CommittedSetCodec;
 import org.intentlog.wire.LogEnvelope;
+import org.intentlog.wire.PageOut;
 import org.intentlog.wire.UuidV7;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
@@ -133,6 +136,7 @@ public class FormatExplorerFixtures {
             renameTableAcrossNamespaces(),
             inlineManifestList(),
             compactionWithCommittedSetGc(),
+            compactionPagesCommittedSet(),
             concurrentAppendsMerged(),
             concurrentAppendRefused(),
             new Day().scenario());
@@ -1205,6 +1209,68 @@ public class FormatExplorerFixtures {
         });
   }
 
+  /**
+   * A CAS write whose checkpoint names a page of the committed set (an earlier PageOut sealed its
+   * oldest block) and whose records seal the next block before the commit's own record.
+   */
+  private static Scenario compactionPagesCommittedSet() {
+    Log history = Log.of(emptyCatalog());
+    history.append(txn(100), mut -> mut.createNamespace(WAREHOUSE), null);
+    for (int i = 1; i < 48; i++) {
+      int n = i;
+      history.append(txn(100 + i),
+          mut -> mut.updateProperties(WAREHOUSE, Map.of("batch", String.valueOf(n))), null);
+    }
+    PageOut first = seal(history.state(), "the history");
+    history.pageOut(first, null);
+    Replica<CatalogState> base = history.state();
+    PageOut second = seal(base, "the history after one page");
+    Log log = Log.checkpoint(base)
+        .pageOut(second,
+            "PageOut(level, index, count, digest): seals the oldest inline block of the committed "
+                + "set into its page, an object beside the catalog's (<catalog>.committed/<level>-"
+                + "<index>-<digest>) that the compacting writer put before this write, and raises "
+                + "the floor to the block's top. Replay applies it only if the oldest block is "
+                + "still the one its writer paged (node, count, digest); it never reads the page.")
+        .append(base, txn(200),
+            mut -> mut.updateProperties(WAREHOUSE, Map.of("batch", "last")),
+            "The compacting commit's own record. Its id is above the floor the PageOut raised, "
+                + "since a compactor seals only blocks whose top is below its own id.");
+    long floor = second.top();
+    return log.scenario(
+        "compaction-pages-committed-set",
+        "A CAS write that pages the committed set (docs/COMMITTED_PAGING.md). The checkpoint's "
+            + "committed set has a horizon of 0, a floor (floor_ms: replay admits no record at or "
+            + "below it), one page reference (CommittedPageRef: the sealed block's node, its ids, "
+            + "its newest id, and the digest that names the page) and the inline blocks above the "
+            + "floor. The records seal the next block, then the commit's own record follows. The "
+            + "blocks here hold at most 16 ids, as every test suite cuts them "
+            + "(intentlog.committed.block.ids); the format's N is 65,536.",
+        List.of(),
+        read -> {
+          expect(read.committed().floor(), floor, "floor");
+          expect(read.committed().pages().size(), 2, "pages");
+          expect(read.committed().contains(txn(200)), true, "the compacting commit");
+          try {
+            read.committed().contains(txn(100));
+            throw new AssertionError("expected a paged id to need its page");
+          } catch (PagedOutException expected) {
+            expect(expected.page(), read.committed().pages().get(0), "the page of a paged id");
+          }
+        });
+  }
+
+  /** The PageOut that seals the oldest block of {@code state}'s committed set. */
+  private static PageOut seal(Replica<CatalogState> state, String what) {
+    CommittedSet.Seal seal = state.committed().sealable(Long.MAX_VALUE);
+    if (seal == null) {
+      throw new AssertionError("the committed set of " + what + " has one block (N = "
+          + CommittedSetCodec.BLOCK_IDS + "): the fixtures run with intentlog.committed.block.ids"
+          + " = 16");
+    }
+    return seal.record();
+  }
+
   // ============================================================
   // Building catalog files
   // ============================================================
@@ -1243,6 +1309,11 @@ public class FormatExplorerFixtures {
     /** Appends a GC record that drops the committed ids at or below {@code watermark}. */
     Log gc(long watermark, String note) {
       return appendRecord(LogEnvelope.encodeAdvanceHorizon(watermark), note);
+    }
+
+    /** Appends a PageOut record. */
+    Log pageOut(PageOut record, String note) {
+      return appendRecord(LogEnvelope.encodePageOut(record), note);
     }
 
     /** Appends the record of a writer that read the current state. */

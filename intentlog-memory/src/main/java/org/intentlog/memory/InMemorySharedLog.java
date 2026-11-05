@@ -36,6 +36,7 @@ import org.intentlog.LogNotSentException;
 import org.intentlog.LogTail;
 import org.intentlog.LogThrottledException;
 import org.intentlog.LogView;
+import org.intentlog.PageStore;
 import org.intentlog.Receipt;
 import org.intentlog.SharedLog;
 import org.intentlog.TrimmedException;
@@ -59,6 +60,12 @@ import org.intentlog.TrimmedException;
  * #deliverDelayed}), fail a read, serve a read from an older checkpoint, or lag one behind the
  * tail as a replica would. The log keeps every record ever appended, trimmed ones included, for
  * oracles to replay ({@link #records}).
+ *
+ * <p>The log keeps the pages of its committed set in a map ({@link #pages}), unless built without
+ * ({@link #withoutPages}). Two puts of one name must be the same bytes (a page's name is its
+ * digest): one that differs is refused and recorded ({@link #violations}). Hooks see each page
+ * request too ({@link Interceptor#beforePage}): a put or delete can fail without effect, or land
+ * with its reply lost; a get can fail, or find no page.
  */
 public final class InMemorySharedLog implements SharedLog {
 
@@ -93,7 +100,23 @@ public final class InMemorySharedLog implements SharedLog {
     READ,
     READ_THROUGH,
     READ_AFTER,
-    PROBE
+    PROBE,
+    PUT_PAGE,
+    GET_PAGE,
+    DELETE_PAGE,
+    LIST_PAGES
+  }
+
+  /** What happens to a page request. */
+  public enum PageFault {
+    /** It is served. */
+    NONE,
+    /** It fails without effect: a put or delete does not land, a get or list reads nothing. */
+    FAIL,
+    /** A put or delete lands, and its reply is lost; a get or list fails. */
+    LOST_REPLY,
+    /** A get finds no page, as if it had been deleted; another request fails. */
+    MISSING
   }
 
   /**
@@ -148,6 +171,11 @@ public final class InMemorySharedLog implements SharedLog {
     default ReadShape beforeRead(Request request) {
       return ReadShape.NORMAL;
     }
+
+    /** What happens to a page request: a put, get or delete of {@code name}, or a list (null). */
+    default PageFault beforePage(Request request, String name) {
+      return PageFault.NONE;
+    }
   }
 
   /** A write that landed, in the order they landed. */
@@ -166,12 +194,15 @@ public final class InMemorySharedLog implements SharedLog {
       return request;
     }
 
-    /** The record's position (an append), or the position checkpointed or trimmed through. */
+    /**
+     * The record's position (an append), the position checkpointed or trimmed through, or the
+     * log's length when a page was put or deleted.
+     */
     public long position() {
       return position;
     }
 
-    /** The record or checkpoint written; null for a trim. */
+    /** The record, checkpoint or page written; null for a trim; a page's name for a delete. */
     public byte[] payload() {
       return payload;
     }
@@ -192,6 +223,9 @@ public final class InMemorySharedLog implements SharedLog {
   private long trimmed = 0;
   private volatile long recordLimit = 0;
   private Interceptor interceptor = new Interceptor() {};
+  private final NavigableMap<String, byte[]> pageObjects = new TreeMap<>();
+  private final PageStore pageStore = new MemoryPages();
+  private volatile boolean storesPages = true;
 
   /**
    * A log with unconditional appends. Its reads see every append acknowledged, unless a hook lags
@@ -214,6 +248,12 @@ public final class InMemorySharedLog implements SharedLog {
    */
   public synchronized InMemorySharedLog limitRecordBytes(long limit) {
     this.recordLimit = limit;
+    return this;
+  }
+
+  /** Keeps no pages: {@link #pages} is null, so the runtime never pages this log. */
+  public synchronized InMemorySharedLog withoutPages() {
+    this.storesPages = false;
     return this;
   }
 
@@ -482,8 +522,93 @@ public final class InMemorySharedLog implements SharedLog {
   }
 
   // ============================================================
+  // Pages
+  // ============================================================
+
+  @Override
+  public PageStore pages() {
+    return storesPages ? pageStore : null;
+  }
+
+  /** The pages of the committed set, in a map, as hooks let them be. */
+  private final class MemoryPages implements PageStore {
+    @Override
+    public void put(String name, byte[] page) {
+      synchronized (InMemorySharedLog.this) {
+        PageFault fault = interceptor.beforePage(Request.PUT_PAGE, name);
+        failPage(fault, Request.PUT_PAGE, name, false);
+        byte[] existing = pageObjects.get(name);
+        if (existing != null && !Arrays.equals(existing, page)) {
+          String violation = "two puts of page " + name + " of " + InMemorySharedLog.this.name
+              + " differ";
+          violations.add(violation);
+          throw new IllegalStateException(violation);
+        }
+        pageObjects.put(name, page.clone());
+        history.add(new Write(Request.PUT_PAGE, records.size(), page.clone()));
+        failPage(fault, Request.PUT_PAGE, name, true);
+      }
+    }
+
+    @Override
+    public Optional<byte[]> get(String name) {
+      synchronized (InMemorySharedLog.this) {
+        PageFault fault = interceptor.beforePage(Request.GET_PAGE, name);
+        if (fault == PageFault.MISSING) {
+          return Optional.empty();
+        }
+        failPage(fault == PageFault.LOST_REPLY ? PageFault.FAIL : fault, Request.GET_PAGE, name,
+            false);
+        byte[] page = pageObjects.get(name);
+        return page == null ? Optional.empty() : Optional.of(page.clone());
+      }
+    }
+
+    @Override
+    public void delete(String name) {
+      synchronized (InMemorySharedLog.this) {
+        PageFault fault = interceptor.beforePage(Request.DELETE_PAGE, name);
+        failPage(fault, Request.DELETE_PAGE, name, false);
+        if (pageObjects.remove(name) != null) {
+          history.add(new Write(Request.DELETE_PAGE, records.size(),
+              name.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        }
+        failPage(fault, Request.DELETE_PAGE, name, true);
+      }
+    }
+
+    @Override
+    public List<String> list() {
+      synchronized (InMemorySharedLog.this) {
+        PageFault fault = interceptor.beforePage(Request.LIST_PAGES, null);
+        failPage(fault == PageFault.NONE ? fault : PageFault.FAIL, Request.LIST_PAGES, null,
+            false);
+        return new ArrayList<>(pageObjects.keySet());
+      }
+    }
+  }
+
+  /**
+   * Throws as {@code fault} says, {@code landed} or not yet: FAIL (and MISSING, for a request other
+   * than a get) before, LOST_REPLY after.
+   */
+  private void failPage(PageFault fault, Request request, String page, boolean landed) {
+    boolean before = fault == PageFault.FAIL || fault == PageFault.MISSING;
+    if (landed ? fault == PageFault.LOST_REPLY : before) {
+      throw new UncheckedIOException(new IOException(
+          (landed ? "The reply to a " : "A ") + request + (page != null ? " of " + page : "")
+              + " of " + name + (landed ? " was lost" : " failed")));
+    }
+  }
+
+  // ============================================================
   // What oracles see
   // ============================================================
+
+  /** The pages stored now, by name. */
+  public synchronized Map<String, byte[]> storedPages() {
+    return Collections.unmodifiableMap(new TreeMap<>(pageObjects));
+  }
 
   /** Every record ever appended, trimmed ones included, in log order. */
   public synchronized List<byte[]> records() {
@@ -505,7 +630,7 @@ public final class InMemorySharedLog implements SharedLog {
     return List.copyOf(history);
   }
 
-  /** The I11 violations refused: two different checkpoints at one position. */
+  /** The violations refused: two different checkpoints at one position (I11), or pages of one name. */
   public synchronized List<String> violations() {
     return List.copyOf(violations);
   }

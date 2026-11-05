@@ -437,8 +437,9 @@
       "CommittedTransactions": {
         "fields": [
           {"number": 3, "name": "highest_dropped_timestamp_ms", "type": "fixed64", "repeated": false, "packed": false, "oneof": null, "comment": "GC horizon H: the largest timestamp_ms of any UUIDv7 that has been dropped from this set by a GC record. 0 (absent) means no GC has happened yet. Queries for UUIDs whose timestamp_ms \u003c= this value are UNKNOWN: the entry may have been committed and aged out, or it may never have been."},
-          {"number": 4, "name": "floor_ms", "type": "fixed64", "repeated": false, "packed": false, "oneof": null, "comment": "The floor F, at or above H: replay applies no record whose id's timestamp_ms is at or below it. Absent when it equals H."},
-          {"number": 6, "name": "blocks", "type": "CommittedBlock", "repeated": true, "packed": true, "oneof": null, "comment": "5: references to the pages that hold the ids in (H, F] (not yet written). The blocks, oldest first: the ids above F."}
+          {"number": 4, "name": "floor_ms", "type": "fixed64", "repeated": false, "packed": false, "oneof": null, "comment": "The floor F, at or above H: replay applies no record whose id's timestamp_ms is at or below it, so it never needs a page. Absent when it equals H."},
+          {"number": 5, "name": "pages", "type": "CommittedPageRef", "repeated": true, "packed": true, "oneof": null, "comment": "The pages that hold the ids in (H, F], oldest first: page i holds the ids in (top of page i - 1, top of page i], every one that applied there."},
+          {"number": 6, "name": "blocks", "type": "CommittedBlock", "repeated": true, "packed": true, "oneof": null, "comment": "The blocks, oldest first: the ids above F."}
         ]
       },
       "CommittedBlock": {
@@ -448,16 +449,43 @@
           {"number": 3, "name": "packed_entries", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": "Per entry, newest first, back-to-back: varint delta_ms  -- gap from the entry before; the first's from the node's top, (index + 1) * 2^level - 1 10 bytes         -- 12 bits rand_a + 62 bits rand_b + 6 bits zero pad The decoder reconstructs each UUID by reapplying the version (0x7) and variant (0b10) bits."}
         ]
       },
+      "CommittedPageRef": {
+        "fields": [
+          {"number": 1, "name": "level", "type": "uint32", "repeated": false, "packed": false, "oneof": null, "comment": "The sealed block's node; its top, (index + 1) * 2^level - 1, is the floor the page raised."},
+          {"number": 2, "name": "index", "type": "uint64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 3, "name": "count", "type": "uint32", "repeated": false, "packed": false, "oneof": null, "comment": "The ids the page holds."},
+          {"number": 4, "name": "max_timestamp_ms", "type": "fixed64", "repeated": false, "packed": false, "oneof": null, "comment": "Its newest id's timestamp_ms: the horizon when GC drops the page. No id above it and at or below the top applied."},
+          {"number": 5, "name": "digest", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": "The first 16 bytes of the SHA-256 of the sealed block's CommittedBlock message (node and entries), as CommittedSetCodec writes it."}
+        ]
+      },
+      "CommittedPage": {
+        "fields": [
+          {"number": 1, "name": "min_reader_version", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": "The envelope reader version the page needs, as a checkpoint's."},
+          {"number": 2, "name": "log_id", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": "The log's id: a reader checks it, the node and the digest."},
+          {"number": 3, "name": "level", "type": "uint32", "repeated": false, "packed": false, "oneof": null, "comment": "The sealed block's node."},
+          {"number": 4, "name": "index", "type": "uint64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 5, "name": "packed_entries", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": "The block's packed entries, verbatim (CommittedBlock.packed_entries)."}
+        ]
+      },
       "LogRecord": {
         "fields": [
-          {"number": 1, "name": "id", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": "An intention's UUIDv7 (16 bytes): replay applies a record whose id the committed set does not hold, and a writer learns from the set whether its record did. Required with an intention; a GC record has none."},
+          {"number": 1, "name": "id", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": "An intention's UUIDv7 (16 bytes): replay applies a record whose id the committed set does not hold, and a writer learns from the set whether its record did. Required with an intention; GC and PageOut records have none."},
           {"number": 2, "name": "intention", "type": "Intention", "repeated": false, "packed": false, "oneof": "body", "comment": "The state machine's intention (the catalog: iceberg.catalog.Intention)."},
-          {"number": 3, "name": "advance_horizon", "type": "AdvanceHorizon", "repeated": false, "packed": false, "oneof": "body", "comment": "A GC of the committed set. Only these move the horizon, so every checkpoint is a replay of the log before it, whatever clock wrote it."}
+          {"number": 3, "name": "advance_horizon", "type": "AdvanceHorizon", "repeated": false, "packed": false, "oneof": "body", "comment": "A GC of the committed set. Only these move the horizon, so every checkpoint is a replay of the log before it, whatever clock wrote it."},
+          {"number": 4, "name": "page_out", "type": "PageOut", "repeated": false, "packed": false, "oneof": "body", "comment": "Seals the oldest inline block into its page and raises the floor."}
         ]
       },
       "AdvanceHorizon": {
         "fields": [
           {"number": 1, "name": "watermark_ms", "type": "fixed64", "repeated": false, "packed": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "PageOut": {
+        "fields": [
+          {"number": 1, "name": "level", "type": "uint32", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "index", "type": "uint64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 3, "name": "count", "type": "uint32", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 4, "name": "digest", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": "As CommittedPageRef.digest."}
         ]
       },
       "Checkpoint": {
@@ -1094,6 +1122,15 @@
       "notes": [
         {"start": 251, "end": 263, "label": "GC: AdvanceHorizon drops the committed ids at or below its watermark (now - fileio.catalog.committed.retention.ms, 30 minutes by default, kept below the commit's own id) and records the largest dropped timestamp as highest_dropped_timestamp_ms. A lookup of an id at or below it is unknown (DedupHorizonExceededException), not 'absent': the commit may have landed and aged out."},
         {"start": 263, "end": 344, "label": "The compacting commit's own record, UpdateTableLocation(events, version = 2). Its id joins the committed set when replay applies it."}
+      ]
+    },
+    {
+      "name": "compaction-pages-committed-set",
+      "description": "A CAS write that pages the committed set (docs/COMMITTED_PAGING.md). The checkpoint's committed set has a horizon of 0, a floor (floor_ms: replay admits no record at or below it), one page reference (CommittedPageRef: the sealed block's node, its ids, its newest id, and the digest that names the page) and the inline blocks above the floor. The records seal the next block, then the commit's own record follows. The blocks here hold at most 16 ids, as every test suite cuts them (intentlog.committed.block.ids); the format's N is 65,536.",
+      "hex": "4c43415400000002880508021210019000000000700080000000000000011abd0421ff7f9da4960100002a24080f10ba92b519180821f87d9da4960100002a10e4df615141d155e912030f8c35992e1832ca01080e10f6a4ea321ac0018707df186e65412f0f346300e807ad09ee7d6e373df71240e8073345ae7566deb1af0480e80701272e4d5426e071f3c0e80716de6e45758f8a7f2000e807e4cfee5d6297f901cf80e8077afb6e555b7f6cb9c180e80748ecee6d48479bbcb0c0e8074e942e6569f0454a1d40e8071c85ae7d56f8b40c8c80e807b2b16e754fa027c4bec0e80780a2ee4d7ce816876e00e807b87b2e053b4b67beb1c0e807866cae1d285396416140e8071c982e15213b09f91340e807ea89ae2d0e0378fbc2803274080d10eec9d4651a6b5ffafe2f6f6bec1e2c5700e8070095afa74d550839c340e807de86efbf7a5d36fcb280e80764b2afb77304aab4a4c0e80732a42f8f604cd9775400e807a762ae450cce5429a600e80775542e5d79d642ec5540e8070b8fae1532bdf6644780e807d9712e6d1f86256736c03269080d10efc9d4651a609f028b726f6f432ae7d6dd00e8078129ef67649391e44940e8075f1b2f7f519bc0a73880e807f546ef774a43745f2ac0e807c3386f4f778b63219a00e807c8efaf4759344cef0640e80796c12f9f463cbbb1f580e8072d0caf577ee3ef69e7c0325e081110cfa4ad061a55c7cb07ef8cefa79ed7f4a53780e807bd7e6fbf8be02367a6c0e80743aa2fb78487971f9900e807119baf8fb1cf85e24840e8075963ef477072d6998c40e80727556f5f5d7b055c7b80e807bd80ef575622b9146dc02232200110021801520808001001180022005211080110301800220977617265686f757365620d0801120562617463681a0234371d221b080e10f6a4ea3218102210dc6202e097f6d237ca140b68d68873e0290a100196a49ee9407278a9bc3ac600c4d52512151a131a11080110301a05626174636822046c617374",
+      "notes": [
+        {"start": 658, "end": 688, "label": "PageOut(level, index, count, digest): seals the oldest inline block of the committed set into its page, an object beside the catalog's (\u003ccatalog>.committed/\u003clevel>-\u003cindex>-\u003cdigest>) that the compacting writer put before this write, and raises the floor to the block's top. Replay applies it only if the oldest block is still the one its writer paged (node, count, digest); it never reads the page."},
+        {"start": 688, "end": 730, "label": "The compacting commit's own record. Its id is above the floor the PageOut raised, since a compactor seals only blocks whose top is below its own id."}
       ]
     },
     {

@@ -57,12 +57,14 @@ message LogCheckpoint {
 
 // The committed set: the ids of the records replay applied, less those GC
 // dropped, the GC horizon, and the floor (docs/LOG.md "The committed set and
-// GC"; docs/COMMITTED_PAGING.md). The ids are cut into blocks on a grid over
-// their timestamps: node (k, a) is the aligned span [a * 2^k, (a + 1) * 2^k)
-// of ms, and the blocks are the maximal nodes holding at most N ids (2^16, a
-// constant of the format) among the nodes holding any; a millisecond (level
-// 0) is a block however many ids it holds. So the blocks are a function of the
-// ids alone, and a checkpoint copies each block's bytes.
+// GC"; docs/COMMITTED_PAGING.md). The ids above the floor are inline, cut into
+// blocks on a grid over their timestamps: node (k, a) is the aligned span
+// [a * 2^k, (a + 1) * 2^k) of ms, and the blocks are the maximal nodes holding
+// at most N inline ids (2^16, a constant of the format) among the nodes
+// holding any; a millisecond (level 0) is a block however many ids it holds.
+// So the blocks are a function of the inline ids alone, and a checkpoint
+// copies each block's bytes. The ids in (H, F] are in pages, immutable objects
+// apart from the log (CommittedPage), which the set names by reference.
 message CommittedTransactions {
   // max_timestamp_ms and packed_entries: the set as one blob (reader version 1).
   reserved 1, 2;
@@ -74,10 +76,13 @@ message CommittedTransactions {
   fixed64 highest_dropped_timestamp_ms = 3;
 
   // The floor F, at or above H: replay applies no record whose id's
-  // timestamp_ms is at or below it. Absent when it equals H.
+  // timestamp_ms is at or below it, so it never needs a page. Absent when it
+  // equals H.
   fixed64 floor_ms = 4;
 
-  // 5: references to the pages that hold the ids in (H, F] (not yet written).
+  // The pages that hold the ids in (H, F], oldest first: page i holds the ids
+  // in (top of page i - 1, top of page i], every one that applied there.
+  repeated CommittedPageRef pages = 5;
 
   // The blocks, oldest first: the ids above F.
   repeated CommittedBlock blocks = 6;
@@ -97,12 +102,47 @@ message CommittedBlock {
   bytes packed_entries = 3;
 }
 
+// A reference to a page: the block a PageOut sealed. Its node and digest name
+// the page object, which the log's provider places (docs/COMMITTED_PAGING.md
+// "Page objects"): `<level>-<index>-<digest as hex>`.
+message CommittedPageRef {
+  // The sealed block's node; its top, (index + 1) * 2^level - 1, is the floor
+  // the page raised.
+  uint32 level = 1;
+  uint64 index = 2;
+  // The ids the page holds.
+  uint32 count = 3;
+  // Its newest id's timestamp_ms: the horizon when GC drops the page. No id
+  // above it and at or below the top applied.
+  fixed64 max_timestamp_ms = 4;
+  // The first 16 bytes of the SHA-256 of the sealed block's CommittedBlock
+  // message (node and entries), as CommittedSetCodec writes it.
+  bytes digest = 5;
+}
+
+// A page: the object a PageOut's writer puts before it sends the record. Never
+// changed once written; deleted once a GC record drops its reference, or as an
+// orphan once the floor passes its node unreferenced. Replay never reads one.
+// Its bytes are a function of the log and the block alone, so every writer that
+// seals a block puts the same bytes under its name, whatever the floor below it.
+message CommittedPage {
+  // The envelope reader version the page needs, as a checkpoint's.
+  int32 min_reader_version = 1;
+  // The log's id: a reader checks it, the node and the digest.
+  bytes log_id = 2;
+  // The sealed block's node.
+  uint32 level = 3;
+  uint64 index = 4;
+  // The block's packed entries, verbatim (CommittedBlock.packed_entries).
+  bytes packed_entries = 5;
+}
+
 // One entry of the log: an intention, which replay applies once, if its
-// preconditions hold where it lands, or a GC of the committed set.
+// preconditions hold where it lands; a GC of the committed set; or a PageOut.
 message LogRecord {
   // An intention's UUIDv7 (16 bytes): replay applies a record whose id the
   // committed set does not hold, and a writer learns from the set whether its
-  // record did. Required with an intention; a GC record has none.
+  // record did. Required with an intention; GC and PageOut records have none.
   bytes id = 1;
 
   oneof body {
@@ -111,13 +151,32 @@ message LogRecord {
     // A GC of the committed set. Only these move the horizon, so every
     // checkpoint is a replay of the log before it, whatever clock wrote it.
     AdvanceHorizon advance_horizon = 3;
+    // Seals the oldest inline block into its page and raises the floor.
+    PageOut page_out = 4;
   }
 }
 
-// Drops the committed ids at or below watermark_ms, and raises the horizon to
-// the newest it drops. Replay applies it wherever it lands, and applying it
-// twice changes nothing. Its writer picks the watermark (now less its
-// retention), below the id of any record it writes after it.
+// Drops the pages whose top is at or below watermark_ms and the committed ids
+// at or below it, raises the horizon to the newest id it drops (a page's
+// max_timestamp_ms), and the floor to at least the horizon. A page that
+// straddles the watermark is kept whole. Replay applies it wherever it lands,
+// and applying it twice changes nothing. Its writer picks the watermark (now
+// less its retention), below the id of any record it writes after it.
 message AdvanceHorizon {
   fixed64 watermark_ms = 1;
+}
+
+// Seals the oldest inline block into its page, which its writer put before
+// this record, and raises the floor to the block's top. Replay applies it only
+// if the oldest block is still the one its writer paged (the node, the count
+// and the digest) and is not the newest block; otherwise it changes nothing (a
+// late id or a GC changed the block, or another PageOut sealed it), and its
+// page is an orphan. Applying it twice changes nothing. Its writer keeps the
+// block's top below the id of any record it writes after it.
+message PageOut {
+  uint32 level = 1;
+  uint64 index = 2;
+  uint32 count = 3;
+  // As CommittedPageRef.digest.
+  bytes digest = 4;
 }

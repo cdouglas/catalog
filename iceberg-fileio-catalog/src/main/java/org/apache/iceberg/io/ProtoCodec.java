@@ -792,7 +792,7 @@ public class ProtoCodec {
   public static Transaction decodeTransaction(byte[] bytes) {
     LogEnvelope.Record record = LogEnvelope.decodeRecord(bytes);
     Preconditions.checkArgument(
-        !record.isAdvanceHorizon(), "The record is a GC record, not a transaction");
+        record.isIntention(), "The record is a GC or PageOut record, not a transaction");
     return decodeTransaction(record.id(), record.intention());
   }
 
@@ -1716,12 +1716,13 @@ public class ProtoCodec {
     }
 
     /**
-     * The transaction of {@code mutation}'s intention, with an id after the horizon of the log its
-     * writer read, where replay rejects a record (Bug 64): the record a commit of it appends.
+     * The transaction of {@code mutation}'s intention, with an id after the floor of the log its
+     * writer read, at or below which replay rejects a record (Bug 64): the record a commit of it
+     * appends.
      */
     public static Transaction from(CatalogMutation mutation) {
       return new Transaction(
-          UuidV7.newUuidV7After(mutation.base().committed().horizon()), mutation.intention());
+          UuidV7.newUuidV7After(mutation.base().committed().floor()), mutation.intention());
     }
 
     public UUID id() {

@@ -29,6 +29,9 @@ import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import org.intentlog.wire.CommittedSetCodec;
+import org.intentlog.wire.LogEnvelope;
+import org.intentlog.wire.PageOut;
+import org.intentlog.wire.PageRef;
 import org.intentlog.wire.UuidV7;
 
 /**
@@ -37,6 +40,13 @@ import org.intentlog.wire.UuidV7;
  * which replay admits no record. Replay applies a record once by its id, and a writer learns from
  * the set whether its commit landed. See docs/LOG.md "The committed set and GC" and
  * docs/COMMITTED_PAGING.md.
+ *
+ * <p>The ids above F are inline, in blocks. The ids in (H, F] are in pages, immutable objects
+ * apart from the log that the set names by reference ({@link PageRef}): a {@code PageOut} record
+ * ({@link Builder#pageOut}) seals the oldest block into its page and raises F to its top, and a GC
+ * record drops the pages whose top it passes. Replay never reads a page, since it admits only ids
+ * above F; a lookup of an id in (H, F] throws {@link PagedOutException}, naming the page that
+ * holds it if it committed.
  *
  * <p>The ids are cut into blocks on a grid over their timestamps: the maximal aligned spans of
  * 2^k ms that hold at most {@link CommittedSetCodec#BLOCK_IDS} ids (a millisecond is a block
@@ -63,30 +73,37 @@ public final class CommittedSet {
   private static final int RANDOM_BYTES = CommittedSetCodec.RANDOM_BYTES;
   private static final int TAG_HORIZON = 0x19; // field 3, fixed64
   private static final int TAG_FLOOR = 0x21; // field 4, fixed64
+  private static final int TAG_PAGE = 0x2a; // field 5, length-delimited
   private static final int TAG_BLOCK = 0x32; // field 6, length-delimited
   private static final int TAG_LEVEL = 0x08; // Block field 1, varint
   private static final int TAG_INDEX = 0x10; // Block field 2, varint
   private static final int TAG_PACKED = 0x1a; // Block field 3, length-delimited
+
+  // Before EMPTY, which needs it
+  private static final PageRef[] NO_PAGES = new PageRef[0];
 
   public static final CommittedSet EMPTY = empty(CommittedSetCodec.BLOCK_IDS);
 
   private final Block[] blocks; // oldest first, disjoint
   private final long horizon;
   private final long floor;
+  private final PageRef[] pages; // oldest first: page i holds (top of page i - 1, its top]
   private final int blockIds;
   // The body this set was decoded from, while it is unchanged; else null
   private final byte[] encoded;
 
-  private CommittedSet(Block[] blocks, long horizon, long floor, int blockIds, byte[] encoded) {
+  private CommittedSet(
+      Block[] blocks, long horizon, long floor, PageRef[] pages, int blockIds, byte[] encoded) {
     this.blocks = blocks;
     this.horizon = horizon;
     this.floor = floor;
+    this.pages = pages;
     this.blockIds = blockIds;
     this.encoded = encoded;
   }
 
   static CommittedSet empty(int blockIds) {
-    return new CommittedSet(new Block[0], 0L, 0L, blockIds, new byte[0]);
+    return new CommittedSet(new Block[0], 0L, 0L, NO_PAGES, blockIds, new byte[0]);
   }
 
   /** The set encoded by a {@code CommittedTransactions} body; empty for null or no bytes. */
@@ -101,6 +118,7 @@ public final class CommittedSet {
     }
     long horizon = 0L;
     Long floor = null;
+    List<PageRef> pages = new ArrayList<>();
     List<Block> blocks = new ArrayList<>();
     int[] at = {0};
     while (at[0] < bytes.length) {
@@ -111,6 +129,15 @@ public final class CommittedSet {
           break;
         case TAG_FLOOR:
           floor = readFixed64(bytes, at);
+          break;
+        case TAG_PAGE:
+          int refLen = (int) readVarint(bytes, at, bytes.length);
+          int refEnd = at[0] + refLen;
+          if (refLen <= 0 || refEnd > bytes.length) {
+            throw malformed("truncated page reference");
+          }
+          pages.add(CommittedSetCodec.decodePageRef(bytes, at[0], refEnd));
+          at[0] = refEnd;
           break;
         case TAG_BLOCK:
           int len = (int) readVarint(bytes, at, bytes.length);
@@ -133,15 +160,26 @@ public final class CommittedSet {
     if (f < horizon) {
       throw malformed("floor below horizon");
     }
-    return new CommittedSet(blocks.toArray(new Block[0]), horizon, f, blockIds, bytes);
+    long prevTop = horizon;
+    for (PageRef page : pages) {
+      if (page.top() <= prevTop || page.top() > f) {
+        throw malformed("pages out of order, or outside (horizon, floor]");
+      }
+      prevTop = page.top();
+    }
+    return new CommittedSet(blocks.toArray(new Block[0]), horizon, f,
+        pages.toArray(new PageRef[0]), blockIds, bytes);
   }
 
-  /** The {@code CommittedTransactions} body; empty iff the set holds no id, no horizon, no floor. */
+  /**
+   * The {@code CommittedTransactions} body; empty iff the set holds no id, no page, no horizon and
+   * no floor.
+   */
   public byte[] bytes() {
     if (encoded != null) {
       return encoded;
     }
-    if (blocks.length == 0 && horizon == 0L && floor == 0L) {
+    if (blocks.length == 0 && pages.length == 0 && horizon == 0L && floor == 0L) {
       return new byte[0];
     }
     byte[] out = new byte[checkedSize()];
@@ -153,6 +191,11 @@ public final class CommittedSet {
     if (floor != horizon) {
       out[at++] = TAG_FLOOR;
       at = writeFixed64(out, at, floor);
+    }
+    for (PageRef page : pages) {
+      out[at++] = TAG_PAGE;
+      at = writeVarint(out, at, CommittedSetCodec.pageRefSize(page));
+      at = CommittedSetCodec.writePageRef(out, at, page);
     }
     for (Block block : blocks) {
       out[at++] = TAG_BLOCK;
@@ -171,10 +214,20 @@ public final class CommittedSet {
   }
 
   private long size() {
-    if (blocks.length == 0 && horizon == 0L && floor == 0L) {
+    if (blocks.length == 0 && pages.length == 0 && horizon == 0L && floor == 0L) {
       return 0;
     }
     long size = (horizon != 0L ? 9 : 0) + (floor != horizon ? 9 : 0);
+    for (PageRef page : pages) {
+      int message = CommittedSetCodec.pageRefSize(page);
+      size += 1 + varintSize(message) + message;
+    }
+    return size + inlineBytes();
+  }
+
+  /** The bytes of the inline blocks in {@link #bytes()}: what paging bounds. */
+  public long inlineBytes() {
+    long size = 0;
     for (Block block : blocks) {
       int message = block.messageSize();
       size += 1 + varintSize(message) + message;
@@ -200,18 +253,61 @@ public final class CommittedSet {
     return floor;
   }
 
+  /** The pages, oldest first: they hold the ids in (horizon, floor]. */
+  public List<PageRef> pages() {
+    return List.of(pages);
+  }
+
   /**
-   * Whether {@code id} committed. True if the set holds it; false if it does not and the id is
-   * newer than the floor, or not a UUIDv7; and if it does not and the id is at or below the
-   * floor, the set cannot tell an aged-out commit from one that never landed, and this throws
-   * {@link DedupHorizonExceededException}.
+   * Whether {@code id} committed (LOG.md, the tri-state lookup):
+   *
+   * <ul>
+   *   <li>above the floor, or not a UUIDv7: whether the inline blocks hold it;
+   *   <li>in (H, F]: if a page may hold it, this throws {@link PagedOutException} naming the
+   *       page, which says; false if none can (no page's range holds it, or it is above its
+   *       page's newest id). Either way its record never applies again;
+   *   <li>at or below the horizon: the set cannot tell an aged-out commit from one that never
+   *       landed, and this throws {@link DedupHorizonExceededException}.
+   * </ul>
    */
   public boolean contains(UUID id) {
-    if (holds(id)) {
-      return true;
+    return holds(id) || notInline(id);
+  }
+
+  /**
+   * Whether an id the inline blocks do not hold committed: false above the floor; in (H, F], false
+   * or {@link PagedOutException}; at or below H, {@link DedupHorizonExceededException}.
+   */
+  private boolean notInline(UUID id) {
+    if (aboveFloor(id, floor)) {
+      return false;
     }
-    checkAboveFloor(id, floor);
-    return false;
+    long ts = UuidV7.timestampMs(id);
+    if (horizon != 0L && ts <= horizon) {
+      throw new DedupHorizonExceededException(id, horizon);
+    }
+    PageRef page = pageFor(ts);
+    if (page == null || ts > page.maxTimestampMs()) {
+      // Above the newest id of a page GC dropped, or of the page whose range holds it: no id
+      // applied there, and none can (COMMITTED_PAGING.md "Lookups")
+      return false;
+    }
+    throw new PagedOutException(id, page);
+  }
+
+  /** The oldest page whose top is at or above {@code ts}, or null. */
+  private PageRef pageFor(long ts) {
+    int lo = 0;
+    int hi = pages.length;
+    while (lo < hi) {
+      int mid = (lo + hi) >>> 1;
+      if (pages[mid].top() < ts) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo < pages.length ? pages[lo] : null;
   }
 
   /**
@@ -232,7 +328,7 @@ public final class CommittedSet {
     return b >= 0 && blocks[b].holds(ts, UuidV7.packRandomBits(id));
   }
 
-  /** Decodes every id in the set, newest first. */
+  /** Decodes every inline id in the set (those above the floor), newest first. */
   public Set<UUID> ids() {
     if (blocks.length == 0) {
       return Collections.emptySet();
@@ -354,7 +450,7 @@ public final class CommittedSet {
         list.set(at, grown);
       }
     }
-    return new CommittedSet(list.toArray(new Block[0]), horizon, floor, blockIds, null);
+    return new CommittedSet(list.toArray(new Block[0]), horizon, floor, pages, blockIds, null);
   }
 
   private static int indexOf(List<Block> list, Block block) {
@@ -418,9 +514,19 @@ public final class CommittedSet {
     }
   }
 
-  /** This set less every id at or below {@code watermarkMs}, the horizon raised to the newest. */
+  /**
+   * This set less every page whose top is at or below {@code watermarkMs} and every inline id at
+   * or below it, the horizon raised to the newest id dropped (a page's newest), and the floor to at
+   * least the horizon. A page that straddles the watermark is kept whole, so the ids it holds below
+   * the watermark stay known.
+   */
   private CommittedSet dropThrough(long watermarkMs) {
     long newestDropped = Long.MIN_VALUE;
+    int dropPages = 0;
+    while (dropPages < pages.length && pages[dropPages].top() <= watermarkMs) {
+      newestDropped = Math.max(newestDropped, pages[dropPages].maxTimestampMs());
+      dropPages++;
+    }
     int drop = 0;
     while (drop < blocks.length && blocks[drop].maxTs() <= watermarkMs) {
       newestDropped = Math.max(newestDropped, blocks[drop].maxTs());
@@ -439,18 +545,97 @@ public final class CommittedSet {
     }
     mergeUp(list, blockIds);
     long newHorizon = Math.max(horizon, newestDropped);
-    return new CommittedSet(
-        list.toArray(new Block[0]), newHorizon, Math.max(floor, newHorizon), blockIds, null);
+    return new CommittedSet(list.toArray(new Block[0]), newHorizon, Math.max(floor, newHorizon),
+        Arrays.copyOfRange(pages, dropPages, pages.length), blockIds, null);
+  }
+
+  /**
+   * The page a compactor would write of the oldest block, if it may seal it under {@code
+   * ceilingMs}: the oldest block is not the newest, and its top is at or below the ceiling. Else
+   * null.
+   */
+  public Seal sealable(long ceilingMs) {
+    if (blocks.length < 2 || blocks[0].top() > ceilingMs) {
+      return null;
+    }
+    Block oldest = blocks[0];
+    return new Seal(new PageOut(oldest.level, oldest.index, oldest.count(), oldest.digest()),
+        oldest.maxTs(), oldest.packed());
+  }
+
+  /**
+   * This set after a {@code PageOut} record (docs/COMMITTED_PAGING.md "Paging out: the log
+   * record"): if the oldest block is the one the record sealed (its node, count and digest) and is
+   * not the newest block, the block's ids leave the set into a page reference, the blocks merge as
+   * the rule says, and the floor rises to the block's top. Otherwise (a late id or a GC changed
+   * the block since its writer read it, another PageOut sealed it, or it is the newest) this set,
+   * unchanged. The checks read only this set, so every replica at a position agrees (I11).
+   */
+  public CommittedSet pagedOut(PageOut record) {
+    if (blocks.length < 2) {
+      return this;
+    }
+    Block oldest = blocks[0];
+    if (oldest.level != record.level() || oldest.index != record.index()
+        || oldest.count() != record.count() || !record.hasDigest(oldest.digest())) {
+      return this;
+    }
+    List<Block> list = new ArrayList<>(Arrays.asList(blocks).subList(1, blocks.length));
+    mergeUp(list, blockIds);
+    PageRef[] next = Arrays.copyOf(pages, pages.length + 1);
+    next[pages.length] =
+        new PageRef(oldest.level, oldest.index, oldest.count(), oldest.maxTs(), oldest.digest());
+    return new CommittedSet(list.toArray(new Block[0]), horizon, oldest.top(), next, blockIds,
+        null);
+  }
+
+  /**
+   * The page of the oldest block a compactor may seal ({@link #sealable}): the {@code PageOut} to
+   * send, and the page to put before it.
+   */
+  public static final class Seal {
+    private final PageOut record;
+    private final long maxTimestampMs;
+    private final byte[] packedEntries;
+
+    Seal(PageOut record, long maxTimestampMs, byte[] packedEntries) {
+      this.record = record;
+      this.maxTimestampMs = maxTimestampMs;
+      this.packedEntries = packedEntries;
+    }
+
+    /** The record that seals the block. */
+    public PageOut record() {
+      return record;
+    }
+
+    /** The reference the set gains when the record applies. */
+    public PageRef ref() {
+      return new PageRef(record.level(), record.index(), record.count(), maxTimestampMs,
+          record.digest());
+    }
+
+    /** The page's name. */
+    public String name() {
+      return record.name();
+    }
+
+    /**
+     * The page's body ({@code CommittedPage}) for the log {@code logId}: a function of the log and
+     * the block alone, so every compactor that seals the block puts the same bytes.
+     */
+    public byte[] page(UUID logId) {
+      return LogEnvelope.encodePage(logId, record.level(), record.index(), packedEntries);
+    }
+
+    @Override
+    public String toString() {
+      return record.toString();
+    }
   }
 
   private static boolean aboveFloor(UUID id, long floor) {
     return !UuidV7.isV7(id) || floor == 0L || UuidV7.timestampMs(id) > floor;
-  }
-
-  private static void checkAboveFloor(UUID id, long floor) {
-    if (!aboveFloor(id, floor)) {
-      throw new DedupHorizonExceededException(id, floor);
-    }
   }
 
   /**
@@ -462,6 +647,8 @@ public final class CommittedSet {
     final long index;
     final Run[] runs; // newest first; empty only for a block just opened
     private volatile int count;
+    // The page digest of the block, made on first use
+    private volatile byte[] digest;
     // The Block message's bytes: a slice of the body it was decoded from, or made on first use
     private volatile byte[] messageBuf;
     private volatile int messageOff;
@@ -692,6 +879,24 @@ public final class CommittedSet {
       return new Cut(new Block(level, index, kept.toArray(new Run[0]), -1), newestDropped);
     }
 
+    /** The digest a page of this block carries ({@link CommittedSetCodec#digest}). */
+    byte[] digest() {
+      byte[] d = digest;
+      if (d == null) {
+        byte[] packed = packed();
+        d = CommittedSetCodec.digest(level, index, packed, 0, packed.length);
+        digest = d;
+      }
+      return d;
+    }
+
+    /** The packed entries, as {@code CommittedBlock.packed_entries} carries them. */
+    byte[] packed() {
+      byte[] out = new byte[packedSize()];
+      writePacked(out, 0);
+      return out;
+    }
+
     int messageSize() {
       byte[] buf = messageBuf;
       if (buf != null) {
@@ -733,6 +938,10 @@ public final class CommittedSet {
       }
       out[at++] = TAG_PACKED;
       at = writeVarint(out, at, packedSize());
+      return writePacked(out, at);
+    }
+
+    private int writePacked(byte[] out, int at) {
       for (int i = 0; i < runs.length; i++) {
         Run run = runs[i];
         at = writeVarint(out, at, (i == 0 ? top() : runs[i - 1].minTs()) - run.maxTs);
@@ -1093,11 +1302,7 @@ public final class CommittedSet {
 
     /** {@link CommittedSet#contains}, counting the ids added so far; the floor is inherited. */
     public boolean contains(UUID id) {
-      if (added.contains(id) || base.holds(id)) {
-        return true;
-      }
-      checkAboveFloor(id, base.floor);
-      return false;
+      return added.contains(id) || base.holds(id) || base.notInline(id);
     }
 
     /** {@link CommittedSet#mayApply}, counting the ids added so far. */
@@ -1113,10 +1318,25 @@ public final class CommittedSet {
       return base.floor;
     }
 
+    /** The pages, oldest first. */
+    public List<PageRef> pages() {
+      return base.pages();
+    }
+
     /**
-     * Applies a GC record ({@code AdvanceHorizon}): drops every id at or below {@code
-     * watermarkMs}, inherited or added, and raises the horizon to the newest one dropped, and the
-     * floor to the horizon. A watermark at or below the horizon drops nothing new.
+     * Applies a {@code PageOut} record ({@link CommittedSet#pagedOut}): seals the oldest block, if
+     * it is still the one the record names, counting the ids added so far.
+     */
+    public Builder pageOut(PageOut record) {
+      this.base = build().pagedOut(record);
+      return this;
+    }
+
+    /**
+     * Applies a GC record ({@code AdvanceHorizon}): drops every page whose top is at or below
+     * {@code watermarkMs} and every id at or below it, inherited or added, and raises the horizon
+     * to the newest one dropped, and the floor to at least the horizon. A watermark at or below the
+     * horizon drops nothing new.
      */
     public Builder advanceHorizon(long watermarkMs) {
       if (watermarkMs < 0L) {

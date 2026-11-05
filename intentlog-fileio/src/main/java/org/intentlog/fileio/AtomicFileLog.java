@@ -29,11 +29,15 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import org.apache.iceberg.exceptions.NotFoundException;
 import org.apache.iceberg.io.AtomicOutputFile;
 import org.apache.iceberg.io.CAS;
+import org.apache.iceberg.io.FileInfo;
 import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.io.PositionOutputStream;
 import org.apache.iceberg.io.SeekableInputStream;
 import org.apache.iceberg.io.SupportsAtomicOperations;
+import org.apache.iceberg.io.SupportsPrefixOperations;
 import org.intentlog.Capabilities;
 import org.intentlog.LogConflictException;
 import org.intentlog.LogFullException;
@@ -41,6 +45,7 @@ import org.intentlog.LogNotSentException;
 import org.intentlog.LogTail;
 import org.intentlog.LogThrottledException;
 import org.intentlog.LogView;
+import org.intentlog.PageStore;
 import org.intentlog.Receipt;
 import org.intentlog.SharedLog;
 import org.intentlog.wire.ProtoWire;
@@ -70,6 +75,10 @@ import org.intentlog.wire.ProtoWire;
  * which no write since can have left in place (each write lands a record with an id of its own, so
  * no version recurs); a read of the object between the lookup that bound it and the append read
  * that version. An append from a tail that only {@link #probe} found reads the object back.
+ *
+ * <p>The pages of the committed set ({@link #pages}) are objects beside the log's, under {@code
+ * <location>.committed/<name>}: a log that moves takes them along under the same names. Listing
+ * them, for the sweep, needs a store that lists by prefix ({@link SupportsPrefixOperations}).
  */
 public final class AtomicFileLog implements SharedLog {
 
@@ -80,6 +89,7 @@ public final class AtomicFileLog implements SharedLog {
   private final SupportsAtomicOperations io;
   private final String location;
   private final long maxRecordBytes;
+  private final PageStore pages;
 
   public AtomicFileLog(SupportsAtomicOperations io, String location) {
     this.io = io;
@@ -88,6 +98,12 @@ public final class AtomicFileLog implements SharedLog {
     long maxAppend = io.maxAppendBytes(location);
     int prefix = ProtoWire.varintSize((int) Math.min(maxAppend, Integer.MAX_VALUE));
     this.maxRecordBytes = maxAppend > 0 ? Math.max(1L, maxAppend - prefix) : 0L;
+    this.pages = new FilePages(location + ".committed/");
+  }
+
+  @Override
+  public PageStore pages() {
+    return pages;
   }
 
   /** The object's location. */
@@ -281,6 +297,64 @@ public final class AtomicFileLog implements SharedLog {
       return new FileView(tail, checkpoint, Collections.unmodifiableList(records));
     } catch (IOException e) {
       throw new UncheckedIOException(e);
+    }
+  }
+
+  /** The pages of the committed set, as objects under {@code prefix}. */
+  private final class FilePages implements PageStore {
+    private final String prefix;
+
+    FilePages(String prefix) {
+      this.prefix = prefix;
+    }
+
+    @Override
+    public void put(String name, byte[] page) {
+      try (PositionOutputStream out = io.newOutputFile(prefix + name).createOrOverwrite()) {
+        out.write(page);
+      } catch (IOException e) {
+        throw new UncheckedIOException(e);
+      }
+    }
+
+    @Override
+    public Optional<byte[]> get(String name) {
+      InputFile file = io.newInputFile(prefix + name);
+      try (SeekableInputStream in = file.newStream()) {
+        return Optional.of(readFully(in, (int) file.getLength()));
+      } catch (NotFoundException e) {
+        return Optional.empty();
+      } catch (IOException | RuntimeException e) {
+        // Each store reports a missing object its own way: a page does not exist if a lookup finds
+        // none; else it could not be read
+        if (!io.newInputFile(prefix + name).exists()) {
+          return Optional.empty();
+        }
+        throw e instanceof IOException ? new UncheckedIOException((IOException) e)
+            : (RuntimeException) e;
+      }
+    }
+
+    @Override
+    public void delete(String name) {
+      io.deleteFile(prefix + name);
+    }
+
+    @Override
+    public List<String> list() {
+      if (!(io instanceof SupportsPrefixOperations)) {
+        throw new UnsupportedOperationException(io + " cannot list " + prefix);
+      }
+      List<String> names = new ArrayList<>();
+      for (FileInfo file : ((SupportsPrefixOperations) io).listPrefix(prefix)) {
+        String found = file.location();
+        int at = found.lastIndexOf('/');
+        String name = found.substring(at + 1);
+        if (found.equals(prefix + name)) {
+          names.add(name);
+        }
+      }
+      return names;
     }
   }
 

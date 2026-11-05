@@ -113,6 +113,27 @@ public final class LogCatalogProperties {
   public static final long DEFAULT_COMMITTED_RETENTION_MS = 30L * 60 * 1000;
 
   /**
+   * The committed set's admission window A, in milliseconds: a compaction pages out (into objects
+   * beside the catalog's, {@code <catalog>.committed/}) only the blocks of committed ids older than
+   * this, and replay admits no record whose id is at or below the floor that paging raises. A
+   * commit slower than A is rejected and retried with a new id ({@code CommitFailedException});
+   * a writer still learns exactly whether a commit landed for the whole retention, from the pages.
+   * Paging needs a retention above it. Default: 5 minutes (provisional). See {@code
+   * docs/COMMITTED_PAGING.md}.
+   */
+  public static final String COMMITTED_ADMISSION_MS = "fileio.catalog.committed.admission.ms";
+  public static final long DEFAULT_COMMITTED_ADMISSION_MS =
+      RuntimeConfig.DEFAULT_ADMISSION_WINDOW_MS;
+
+  /**
+   * The committed set's page threshold T, in bytes: a compaction pages out the oldest blocks while
+   * the ids kept in the checkpoint take more. Default: 1 MiB. {@code Long.MAX_VALUE}: never page.
+   */
+  public static final String COMMITTED_PAGE_THRESHOLD = "fileio.catalog.committed.page.threshold";
+  public static final long DEFAULT_COMMITTED_PAGE_THRESHOLD =
+      RuntimeConfig.DEFAULT_PAGE_THRESHOLD_BYTES;
+
+  /**
    * First wait before retrying a write that storage throttled; each later wait doubles, up to 5 s.
    */
   public static final String THROTTLE_MIN_WAIT_MS = "fileio.catalog.throttle.retry.min-wait-ms";
@@ -163,13 +184,22 @@ public final class LogCatalogProperties {
 
   /** The runtime configuration {@code properties} set; the defaults for those they do not. */
   public static RuntimeConfig runtimeConfig(Map<String, String> properties) {
+    long admissionMs =
+        longProperty(properties, COMMITTED_ADMISSION_MS, DEFAULT_COMMITTED_ADMISSION_MS);
+    long threshold =
+        longProperty(properties, COMMITTED_PAGE_THRESHOLD, DEFAULT_COMMITTED_PAGE_THRESHOLD);
+    Preconditions.checkArgument(admissionMs >= 0,
+        "%s must be >= 0, got %s", COMMITTED_ADMISSION_MS, admissionMs);
+    Preconditions.checkArgument(threshold >= 0,
+        "%s must be >= 0, got %s", COMMITTED_PAGE_THRESHOLD, threshold);
     return runtimeConfig(
         intProperty(properties, MAX_APPEND_COUNT, DEFAULT_MAX_APPEND_COUNT),
         longProperty(properties, MAX_APPEND_SIZE, DEFAULT_MAX_APPEND_SIZE),
         sizeBasis(properties),
         longProperty(properties, COMMITTED_RETENTION_MS, DEFAULT_COMMITTED_RETENTION_MS),
         longProperty(properties, THROTTLE_MIN_WAIT_MS, DEFAULT_THROTTLE_MIN_WAIT_MS),
-        longProperty(properties, RACE_MIN_WAIT_MS, DEFAULT_RACE_MIN_WAIT_MS));
+        longProperty(properties, RACE_MIN_WAIT_MS, DEFAULT_RACE_MIN_WAIT_MS))
+        .withPaging(admissionMs, threshold);
   }
 
   /**

@@ -626,7 +626,7 @@ final class LogTrace {
     /** Why {@code record} would not apply at the tail; null if it would. */
     String rejection(byte[] record) {
       LogEnvelope.Record decoded = LogEnvelope.decodeRecord(record);
-      if (decoded.isAdvanceHorizon()) {
+      if (!decoded.isIntention()) {
         return null;
       } else if (!UuidV7.isV7(decoded.id())) {
         return Replay.NOT_V7;

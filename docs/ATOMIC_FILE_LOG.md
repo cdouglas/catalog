@@ -138,12 +138,25 @@ it can, and replaces the object when it must:
   records after the checkpoint past `max.append.size` bytes (the whole object,
   with `max.append.size.basis` `object`).
 
-A replace is a compaction. It writes `[header][checkpoint][gc][record]`: the
-checkpoint of the state the writer read (after a lost race, one it read
-again), a GC record at its watermark (none when GC is off), and its own
+A replace is a compaction. It writes
+`[header][checkpoint][gc][page-outs][record]`: the checkpoint of the state the
+writer read (after a lost race, one it read again), a GC record at its
+watermark (none when GC is off), the PageOuts that seal the committed set's
+oldest blocks (none until the set outgrows the page threshold), and its own
 record, which replay verifies against the checkpoint and applies as it would
 an append ([LOG.md](LOG.md) §"The committed set and GC"). Afterwards the
 object holds one intention record.
+
+**Pages.** The committed set's pages are objects beside the catalog's, at
+`<catalog location>.committed/<level>-<index>-<digest hex>`
+([COMMITTED_PAGING.md](COMMITTED_PAGING.md)). A replace puts the pages its
+PageOuts name before it writes; the checkpoint it writes is the replay of the
+version it replaces, so it still holds those blocks, and the next replace's
+checkpoint holds their references instead. The replace whose GC record drops a
+page deletes it once the write lands, and then sweeps the orphans (pages no
+PageOut references whose node the floor has passed), which needs a store that
+lists by prefix. Replay never reads a page; a writer reads one only to learn
+whether a commit whose id the floor has passed applied.
 
 | Property | Default | Purpose |
 |---|---|---|
@@ -154,6 +167,8 @@ object holds one intention record.
 | `fileio.catalog.throttle.retry.min-wait-ms` | 200 | First wait before sending again a write that storage throttled ([LOG.md](LOG.md) §"The commit loop") |
 | `fileio.catalog.race.retry.min-wait-ms` | 100 | Bound of the random wait after a lost race, before the writer reads or probes the object again ([LOG.md](LOG.md) §"The commit loop") |
 | `fileio.catalog.committed.retention.ms` | 1800000 (30 min) | How long the committed set keeps an id ([LOG.md](LOG.md) §"The committed set and GC") |
+| `fileio.catalog.committed.admission.ms` | 300000 (5 min, provisional) | The admission window A: a replace pages only blocks of ids older than this, and a commit slower than it is rejected and retried ([COMMITTED_PAGING.md](COMMITTED_PAGING.md)) |
+| `fileio.catalog.committed.page.threshold` | 1048576 (1 MiB) | The threshold T: a replace pages the oldest blocks while the inline set is larger |
 
 **CAS-only mode.** A store that replaces conditionally but cannot append
 needs every commit to replace. On GCS (a generation precondition) the log

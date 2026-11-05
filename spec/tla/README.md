@@ -642,7 +642,9 @@ digest, so a page is its name. A page is put before its PageOut is sent:
 
 ### Actions and code
 
-The Java is stage 3; the code column names the design's parts.
+The Java is stage 3 (built 2026-11-04 on branch `committed-paging`); the code
+column names the design's parts, which the Java names alike (`PageOut` replays
+as `CommittedSet.pagedOut`, the policy is `LogRuntime.page`).
 
 | Action | Design (COMMITTED_PAGING.md) |
 |---|---|

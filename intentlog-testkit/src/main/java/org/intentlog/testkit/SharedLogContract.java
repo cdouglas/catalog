@@ -31,6 +31,7 @@ import org.intentlog.Capabilities;
 import org.intentlog.LogConflictException;
 import org.intentlog.LogTail;
 import org.intentlog.LogView;
+import org.intentlog.PageStore;
 import org.intentlog.Receipt;
 import org.intentlog.SharedLog;
 import org.intentlog.TrimmedException;
@@ -101,6 +102,35 @@ public abstract class SharedLogContract {
   private void assumeSeparateCheckpoints() {
     assumeThat(log.capabilities().separateCheckpoints())
         .as("the log keeps checkpoints apart").isTrue();
+  }
+
+  /**
+   * The page store, if the log keeps one: a page put is read back, by name; a name never put, or
+   * deleted, reads as none; the list names the pages stored; a second put of the same bytes is
+   * the same page.
+   */
+  @Test
+  void pagesAreStoredByName() {
+    PageStore pages = log.pages();
+    assumeThat(pages).as("the log keeps pages").isNotNull();
+    create(checkpoint(0));
+    String a = "4-12345-" + "0a".repeat(16);
+    String b = "0-99-" + "0b".repeat(16);
+    byte[] pageA = "page a".getBytes(StandardCharsets.UTF_8);
+    assertThat(pages.get(a)).isEmpty();
+    pages.put(a, pageA);
+    pages.put(a, pageA);
+    pages.put(b, "page b".getBytes(StandardCharsets.UTF_8));
+    assertThat(pages.get(a)).hasValueSatisfying(p -> assertThat(p).isEqualTo(pageA));
+    try {
+      assertThat(pages.list()).containsExactlyInAnyOrder(a, b);
+    } catch (UnsupportedOperationException e) {
+      // a store that cannot list is not swept
+    }
+    pages.delete(b);
+    pages.delete(b);
+    assertThat(pages.get(b)).isEmpty();
+    assertThat(pages.get(a)).isPresent();
   }
 
   @Test

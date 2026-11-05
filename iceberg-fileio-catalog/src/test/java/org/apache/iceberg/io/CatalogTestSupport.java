@@ -113,11 +113,11 @@ public final class CatalogTestSupport {
         envelope.logId());
   }
 
-  /** The transaction records of a catalog file, in log order, without its GC records. */
+  /** The transaction records of a catalog file, in log order, without its GC and PageOut records. */
   public static List<ProtoCodec.Transaction> decodeRecords(byte[] file) {
     List<ProtoCodec.Transaction> records = new ArrayList<>();
     for (LogEnvelope.Record record : decodeLogRecords(file)) {
-      if (!record.isAdvanceHorizon()) {
+      if (record.isIntention()) {
         records.add(ProtoCodec.decodeTransaction(record.id(), record.intention()));
       }
     }

@@ -22,6 +22,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -62,7 +63,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
  * {@link #injectReadFaults} makes reads fail: a request for an object's metadata or content throws,
  * or its content stream breaks part way through.
  */
-public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
+public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsPrefixOperations {
 
   /** How a conditional write fails, if it does. */
   public enum Fault {
@@ -273,6 +274,23 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations {
   @Override
   public synchronized void deleteFile(String location) {
     objects.remove(location);
+  }
+
+  /** The objects whose locations start with {@code prefix}, as a listing finds them now. */
+  @Override
+  public synchronized Iterable<FileInfo> listPrefix(String prefix) {
+    List<FileInfo> found = new ArrayList<>();
+    for (Map.Entry<String, Version> entry : new java.util.TreeMap<>(objects).entrySet()) {
+      if (entry.getKey().startsWith(prefix)) {
+        found.add(new FileInfo(entry.getKey(), entry.getValue().bytes.length, 0L));
+      }
+    }
+    return found;
+  }
+
+  @Override
+  public synchronized void deletePrefix(String prefix) {
+    objects.keySet().removeIf(location -> location.startsWith(prefix));
   }
 
   /** Fails conditional writes as {@code plan} chooses; {@link Fault#NONE} for all by default. */

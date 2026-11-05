@@ -370,7 +370,7 @@ public class TestInlineManifestEndToEnd {
       int txnLen = readVarintFromStream(in);
       org.intentlog.wire.LogEnvelope.Record record =
           org.intentlog.wire.LogEnvelope.decodeRecord(in.readNBytes(txnLen));
-      if (!record.isAdvanceHorizon()) { // a CAS's GC record precedes its transaction
+      if (record.isIntention()) { // a CAS's GC and PageOut records precede its transaction
         last = ProtoCodec.decodeTransaction(record.id(), record.intention());
       }
     }

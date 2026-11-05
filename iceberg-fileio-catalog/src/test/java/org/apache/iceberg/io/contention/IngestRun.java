@@ -452,7 +452,7 @@ final class IngestRun {
     long start = -1;
     for (byte[] bytes : original) {
       LogEnvelope.Record record = LogEnvelope.decodeRecord(bytes);
-      if (record.isAdvanceHorizon()) {
+      if (!record.isIntention()) {
         continue;
       }
       if (rate <= 0) {

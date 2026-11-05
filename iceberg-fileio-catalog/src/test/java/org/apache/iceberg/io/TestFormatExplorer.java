@@ -54,7 +54,7 @@ public class TestFormatExplorer {
 
   /** Int constants of the codecs that are not field numbers. */
   private static final Set<String> NOT_FIELDS =
-      Set.of("SUPPORTED_READER_VERSION", "MAX_LEVEL", "RANDOM_BYTES");
+      Set.of("SUPPORTED_READER_VERSION", "MAX_LEVEL", "RANDOM_BYTES", "DIGEST_BYTES");
 
   static {
     Map<String, String> codec = new LinkedHashMap<>();
@@ -85,12 +85,15 @@ public class TestFormatExplorer {
     Map<String, String> committed = new LinkedHashMap<>();
     committed.put("COMMITTED_TXNS_", "CommittedTransactions");
     committed.put("COMMITTED_BLOCK_", "CommittedBlock");
+    committed.put("COMMITTED_PAGE_REF_", "CommittedPageRef");
     PREFIXES.put("CommittedSetCodec", committed);
 
     Map<String, String> envelope = new LinkedHashMap<>();
     envelope.put("LOG_CHECKPOINT_", "LogCheckpoint");
     envelope.put("LOG_RECORD_", "LogRecord");
     envelope.put("ADVANCE_HORIZON_", "AdvanceHorizon");
+    envelope.put("PAGE_OUT_", "PageOut");
+    envelope.put("COMMITTED_PAGE_", "CommittedPage");
     PREFIXES.put("LogEnvelope", envelope);
 
     Map<String, String> delta = new LinkedHashMap<>();

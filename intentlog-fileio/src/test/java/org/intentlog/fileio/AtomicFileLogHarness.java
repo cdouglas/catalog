@@ -105,7 +105,7 @@ public final class AtomicFileLogHarness implements LogHarness {
     Set<ByteBuffer> seen = new LinkedHashSet<>();
     for (InMemoryAtomicFileIO.Write write : io.history()) {
       for (byte[] record : AtomicFileLog.decode(write.after()).records()) {
-        if (!LogEnvelope.decodeRecord(record).isAdvanceHorizon()) {
+        if (LogEnvelope.decodeRecord(record).isIntention()) {
           seen.add(ByteBuffer.wrap(record));
         }
       }

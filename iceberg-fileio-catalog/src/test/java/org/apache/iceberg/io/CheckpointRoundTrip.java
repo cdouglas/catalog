@@ -41,6 +41,7 @@ import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.intentlog.CommittedSet;
 import org.intentlog.DedupHorizonExceededException;
+import org.intentlog.PagedOutException;
 import org.intentlog.Replica;
 import org.intentlog.fileio.AtomicFileLog;
 import org.intentlog.memory.InMemorySharedLog;
@@ -263,8 +264,8 @@ public final class CheckpointRoundTrip {
 
   /**
    * Why replay rejects the first intention record after the checkpoint of {@code catalogFile}
-   * (past the compaction's GC record) though it holds on the checkpoint, or null if it does not:
-   * the record is at or below the committed set's horizon.
+   * (past the compaction's GC and PageOut records) though it holds on the checkpoint, or null if it
+   * does not: the record is at or below the committed set's floor (Bug 64; TLA+ pageown).
    */
   static String compactionRecordRejected(byte[] catalogFile) {
     CatalogState.Builder checkpoint = CatalogTestSupport.decodeCheckpoint(catalogFile);
@@ -273,11 +274,14 @@ public final class CheckpointRoundTrip {
             .inherit(CatalogTestSupport.decodeCheckpointEnvelope(catalogFile).committed());
     ProtoCodec.Transaction own = null;
     for (LogEnvelope.Record record : CatalogTestSupport.decodeLogRecords(catalogFile)) {
-      if (!record.isAdvanceHorizon()) {
+      if (record.isIntention()) {
         own = ProtoCodec.decodeTransaction(record.id(), record.intention());
         break;
+      } else if (record.isPageOut()) {
+        committed.pageOut(record.pageOut());
+      } else {
+        committed.advanceHorizon(record.watermarkMs());
       }
-      committed.advanceHorizon(record.watermarkMs());
     }
     if (own == null) {
       return null;
@@ -289,13 +293,14 @@ public final class CheckpointRoundTrip {
       if (committed.contains(own.id())) {
         return null; // the checkpoint holds it already
       }
-    } catch (DedupHorizonExceededException e) {
-      // at or below the horizon: below
+    } catch (DedupHorizonExceededException | PagedOutException e) {
+      // at or below the floor: below
     }
     return String.format(
         "the record that follows the checkpoint, %s, holds on it, but replay rejects it: it is at "
-            + "or below the committed set's horizon (%d)",
+            + "or below the committed set's floor (%d; horizon %d)",
         own.id(),
+        committed.floor(),
         committed.horizon());
   }
 

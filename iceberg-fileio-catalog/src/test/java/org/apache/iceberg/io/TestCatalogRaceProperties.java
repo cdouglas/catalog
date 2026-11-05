@@ -158,7 +158,7 @@ class TestCatalogRaceProperties {
         public InMemorySharedLog.WriteFault beforeWrite(
             InMemorySharedLog.Request request, byte[] payload) {
           if (!nested[0] && request == InMemorySharedLog.Request.APPEND
-              && !LogEnvelope.decodeRecord(payload).isAdvanceHorizon()) {
+              && LogEnvelope.decodeRecord(payload).isIntention()) {
             beforeAWrite.run();
           }
           return InMemorySharedLog.WriteFault.NONE;

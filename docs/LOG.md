@@ -185,11 +185,19 @@ message LogRecord {
   oneof body {
     bytes          intention       = 2;    // the state machine's intention
     AdvanceHorizon advance_horizon = 3;    // a GC of the committed set; has no id
+    PageOut        page_out        = 4;    // seals the oldest block into a page; has no id
   }
 }
 
 message AdvanceHorizon {
   fixed64 watermark_ms = 1;
+}
+
+message PageOut {                          // COMMITTED_PAGING.md "Paging out: the log record"
+  uint32 level  = 1;                       // the oldest block's node
+  uint64 index  = 2;
+  uint32 count  = 3;                       // its ids
+  bytes  digest = 4;                       // SHA-256 of its CommittedBlock message, 16 bytes
 }
 
 message CommittedTransactions {
@@ -198,10 +206,26 @@ message CommittedTransactions {
   // 0 (absent) until the first drop; ids at or below it are UNKNOWN.
   fixed64 highest_dropped_timestamp_ms = 3;
   // The floor: replay admits no id at or below it. Absent when it equals the
-  // horizon (until ids are paged out: COMMITTED_PAGING.md).
+  // horizon; a PageOut raises it (COMMITTED_PAGING.md).
   fixed64 floor_ms                     = 4;
-  // 5: references to the pages of ids in (horizon, floor]; not yet written.
-  repeated CommittedBlock blocks       = 6;   // oldest first
+  repeated CommittedPageRef pages      = 5;   // the pages of the ids in (horizon, floor], oldest first
+  repeated CommittedBlock blocks       = 6;   // the ids above the floor, oldest first
+}
+
+message CommittedPageRef {     // a sealed block: its page is named <level>-<index>-<digest hex>
+  uint32  level            = 1;
+  uint64  index            = 2;
+  uint32  count            = 3;
+  fixed64 max_timestamp_ms = 4;   // its newest id: the horizon once GC drops the page
+  bytes   digest           = 5;
+}
+
+message CommittedPage {        // a page's body: an object apart from the log, never changed
+  int32  min_reader_version = 1;
+  bytes  log_id             = 2;
+  uint32 level              = 3;
+  uint64 index              = 4;
+  bytes  packed_entries     = 5;  // the sealed block's, verbatim
 }
 
 message CommittedBlock {
@@ -222,6 +246,14 @@ the checkpoint fails before decoding the rest. A reader fails on a
 `LogCheckpoint` whose `min_reader_version` exceeds what it supports, or that
 lacks it, the log id or the state; and on a `LogRecord` with no body, with
 two, or with an intention and no id.
+
+**Pages.** The ids between the horizon and the floor live in pages: immutable
+objects the provider keeps apart from the log (`SharedLog.pages()`, a
+`PageStore`; `AtomicFileLog` beside its object, under
+`<location>.committed/<name>`). A compaction seals the oldest blocks older
+than the admission window into pages, putting each page before the `PageOut`
+record that names it; replay never reads a page, since it admits no id at or
+below the floor. [COMMITTED_PAGING.md](COMMITTED_PAGING.md) is the design.
 
 **The committed set's encoding.** `CommittedTransactions` exploits the
 structure of UUIDv7 to compress the set. Its ids are cut into blocks on a grid
@@ -277,10 +309,13 @@ function replay(machine, checkpoint, records, watch):
         if r is AdvanceHorizon(w):
             set.advanceHorizon(w)             # GC: see below
             continue
+        if r is PageOut(p):
+            set.pageOut(p)                    # seals the oldest block if it is still p's
+            continue
         n += 1                                # intention records: what the count threshold compares
         seen |= (r.id == watch)
         if not set.mayApply(r.id):
-            continue                          # a copy of one applied, or at or below the horizon
+            continue                          # a copy of one applied, or at or below the floor
         i = isV7(r.id) ? machine.decodeIntention(r.intention) : none
         if i and i.verify(b):
             i.apply(b)
@@ -386,33 +421,45 @@ function advanceHorizon(set, w):                   # replay of AdvanceHorizon(w)
 Two writes carry a GC record:
 
 - **A replace** (a compaction on a log that replaces itself) writes
-  `[checkpoint][gc][record]`: the checkpoint of the state it replaces, a GC
-  record at `watermark(timestamp(id) - 1)`, and its own record. The ceiling
-  keeps the horizon below the record that follows, which replay would
-  otherwise reject (Bug 64), and so below every id minted after this one's,
-  such as a commit's this one rebased on.
+  `[checkpoint][gc][page-outs][record]`: the checkpoint of the state it
+  replaces, a GC record at `watermark(timestamp(id) - 1)`, the PageOuts of a
+  log that keeps pages, and its own record. The ceiling keeps the horizon
+  below the record that follows, which replay would otherwise reject (Bug 64),
+  and so below every id minted after this one's, such as a commit's this one
+  rebased on. The PageOuts keep the floor below it the same way.
 - **`compact()`** on a log with separate checkpoints appends a GC record at
   `watermark(∞)` before it checkpoints ([Compaction](#compaction)).
 
 An append of an intention never carries one.
 
-**Lookup is tri-state.** `CommittedSet.contains(q)`, with entries `P` and
-horizon `H`:
+A GC record also drops the pages whose top is at or below its watermark,
+raising the horizon to each one's newest id, and the floor to at least the
+horizon; a page that straddles the watermark is kept whole. The writer whose
+GC record dropped a page deletes it once the record has landed: a reader that
+still holds an older replica then finds the page missing, and reads again.
+
+**Lookup is tri-state.** `CommittedSet.contains(q)`, with inline entries `P`,
+floor `F` and horizon `H` (`F = H` until ids are paged):
 
 | Outcome | Condition | Result | Meaning |
 |---|---|---|---|
 | `COMMITTED` | `q ∈ P` | `true` | the record applied |
-| `ABSENT` | `q ∉ P` and (`H = 0` or `timestamp(q) > H`) | `false` | the record has not applied: the set would hold it |
+| `ABSENT` | `q ∉ P` and (`F = 0` or `timestamp(q) > F`) | `false` | the record has not applied: the set would hold it |
+| from the page | `H < timestamp(q) <= F` | throws `PagedOutException` naming the page | the page holds `q` exactly if its record applied; either way it never applies again |
+| `ABSENT` | `H < timestamp(q) <= F`, and no page's range holds `q` or `q` is above its page's newest id | `false` | nothing applied there, and nothing can |
 | `UNKNOWN` | `q ∉ P`, `0 < H` and `timestamp(q) <= H` | throws `DedupHorizonExceededException` | its id may have aged out; the set cannot tell |
 
-A non-v7 `q` returns `false` without consulting the horizon.
+A non-v7 `q` returns `false` without consulting the floor.
+`LogRuntime.committed(replica, q)` answers the same, reading a page through
+the log's page store (a page GC has dropped since the replica was read sends
+it to a fresh read).
 
-**Replay rejects a record at or below the horizon.** Replay asks
+**Replay rejects a record at or below the floor.** Replay asks
 `CommittedSet.Builder.mayApply`, not `contains`, which would throw for such a
 record and so fail every read of the log (Bug 64). `mayApply` admits a record
 only if the set does not hold its id (else it is a copy of one applied) and
-its timestamp is above the horizon (else it may be a copy of one whose id aged
-out). Such records are reachable: a writer whose clock is behind another's by
+its timestamp is above the floor (else it may be a copy of one whose id was
+paged or aged out; replay never reads a page). Such records are reachable: a writer whose clock is behind another's by
 more than the retention, one that stalls that long between minting its id and
 writing, or a race under a short retention. The commit loop maps each to an
 outcome ([The commit loop](#the-commit-loop)).
@@ -501,16 +548,22 @@ one without appends unconditionally.
 ```
 # landed(view, earlier): whether view holds this commit's record. Replay's
 # judgment of the record comes first (APPLIED: yes; REJECTED: no); if replay
-# judged none, the committed set says. If the id is at or below the set's
-# horizon, the set cannot say, and replay rejects the record from then on: the
-# commit is unknown if earlier (a write of it that may have landed) is set,
-# else rejected (BEYOND_HORIZON).
-# validate(view) returns view if landed(view, earlier()), else rejects (CONFLICT).
+# judged none, the committed set says. If the id is in (H, F], replay rejects
+# the record from then on, and the page that holds the ids there says whether
+# it applied before the floor passed it: committed, or rejected (BEYOND_FLOOR);
+# a page that cannot be read is a failed read (unknown if earlier is set). If
+# the id is at or below the set's horizon, the set cannot say: the commit is
+# unknown if earlier (a write of it that may have landed) is set, else
+# rejected (BEYOND_HORIZON).
+# validate(view) returns view if landed(view, earlier()), else rejects (CONFLICT);
+# a page it cannot read leaves the write ambiguous.
 # earlier() = ambiguous, else unresolved, else duplicate.
-# gc() = [AdvanceHorizon(watermark(timestamp(id) - 1))], or [] when GC is off.
+# gc() = [AdvanceHorizon(watermark(timestamp(id) - 1))], or [] when GC is off,
+# then the PageOuts of the set after it, sealing blocks with tops at or below
+# min(now - A, timestamp(id) - 1), their pages put first (COMMITTED_PAGING.md).
 
 function COMMIT(log, base, intention):
-    id      = newUuidV7After(base.committed.horizon)
+    id      = newUuidV7After(base.committed.floor)
     record  = LogRecord{ id, intention = encode(intention) }
     caps    = log.capabilities()
     current = base;  tail = base.tail;  stale = false
@@ -744,13 +797,20 @@ write is conditional.
 1. append a GC record at `watermark(∞)`, sent again while the log throttles it
    (none when GC is off);
 2. `readThrough` it, and replay the view;
-3. `putCheckpoint` the replay at the view's tail;
-4. `trim` through that tail.
+3. if the log keeps pages, seal the oldest blocks older than the admission
+   window while the inline set exceeds the threshold: put each page, append
+   its `PageOut`, and `readThrough` the last ([COMMITTED_PAGING.md](COMMITTED_PAGING.md));
+4. `putCheckpoint` the replay at the view's tail;
+5. `trim` through that tail;
+6. delete the pages a GC record dropped, and, if it dropped or sealed any,
+   sweep the orphans (unreferenced pages whose node ends at or below the
+   floor).
 
 Any compactor may run it at any time, and each step is safe to repeat or to
-abandon: a GC record that lands twice drops nothing new, a checkpoint is the
-replay of the log through its position whoever writes it (I11), and the trim
-follows a durable checkpoint (P5). A writer whose commit landed compacts, best
+abandon: a GC record that lands twice drops nothing new, a PageOut that lands
+twice or after its block changed changes nothing, a checkpoint is the replay
+of the log through its position whoever writes it (I11), and the trim follows
+a durable checkpoint (P5). A writer whose commit landed compacts, best
 effort, when the policy says the log it landed in is due
 (`policy.due(intentionRecords, tail.bytes, 0)`); a failure is logged and the
 commit stands. A background compactor, or a queue's archiver, can call
@@ -765,7 +825,7 @@ it does not.
 
 | Provider | append | conditional | fused replace | checkpoints / trim | `readThrough` (P3) | receipt |
 |---|---|---|---|---|---|---|
-| `AtomicFileLog`, store with append (S3 Express, ADLS) | at an offset | yes | `[chk][gc][rec]` by CAS | in the object | the object the write left: known from the write, or read | the version written |
+| `AtomicFileLog`, store with append (S3 Express, ADLS) | at an offset | yes | `[chk][gc][page-outs][rec]` by CAS | in the object | the object the write left: known from the write, or read | the version written |
 | `AtomicFileLog`, CAS only (GCS, S3 standard) | no | – | the same | in the object | what the replace wrote | the version written |
 | `InMemorySharedLog` | yes | optional | no | a store apart, and a trim point | from a checkpoint before the record | a position |
 | Kafka (one partition) and an object store | idempotent produce | no | no | `chk/<offset>` objects; `deleteRecords` | wait for the high watermark | an offset |

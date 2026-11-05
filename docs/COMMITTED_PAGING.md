@@ -1,6 +1,8 @@
 # Paging the committed set (design)
 
-Status: proposed 2026-10-28, revised 2026-11-04 after review; not built.
+Status: proposed 2026-10-28, revised 2026-11-04 after review; stages 1-3
+built on branch `committed-paging` (2026-11-04), stage 4 (the fuzzers and the
+measurements) open.
 Errata D16 tracks the problem, and D21 the stamps it leaves unbounded.
 
 ## Context
@@ -323,7 +325,8 @@ contains(q):                         # tri-state, as today
     if q > F:           return inline.holds(q)
     if q > H:
         p = the oldest page whose top is at or above q
-        if p is None:   return false                      # above a dropped page's newest id
+        if p is None or q > p.maxTs:
+            return false                                  # above a page's newest id
         throw PagedOut(p)                                 # the runtime fetches it
     throw DedupHorizonExceeded
 mayApply(q) = q > F and not inline.holds(q)               # replay never fetches
@@ -332,7 +335,11 @@ mayApply(q) = q > F and not inline.holds(q)               # replay never fetches
 An id in (H, F] above every page lies above the newest id of a page GC
 dropped, at or below its top. No record with such an id applied, and none can,
 so the set answers absent without a page (found by the TLA+ model,
-spec/tla/README.md "Paging the committed set").
+spec/tla/README.md "Paging the committed set"). The same holds for an id above
+the newest id of the page whose range holds it, which the reference carries
+(`max_timestamp_ms`): the set answers absent without fetching it. So a page
+that is missing when a lookup fetches it was dropped by a GC that raised H
+past the id, and reading again finds the id unknown.
 
 - **Minting**, after the horizon a writer read (LOG.md), mints after F: `newUuidV7After(max(H, F))`.
   A writer whose clock is behind still commits.
@@ -406,15 +413,21 @@ The PageOuts go into the write as follows:
   provider's page store places a name, `AtomicFileLog` at
   `<log location>.committed/<name>`, so a log that moves takes its pages along
   under the same names.
-  - Every compactor that reads the same position writes the same bytes to the
-    same name, so racing compactors' PUTs agree.
+  - Every compactor that seals the same block writes the same bytes to the
+    same name, whatever position it read, so racing compactors' PUTs agree.
+    The body is therefore a function of the log and the block alone: one
+    block can be sealed from two floors (a PageOut of the block before it
+    raises F to that block's top, a GC that drops the block before it raises F
+    only to its newest id), so a body that recorded the floor below it would
+    differ under one name (found by `TestCommittedSetBlocks` in stage 3).
   - Different contents never share a name, so a page cannot be overwritten
     with bytes its record does not describe.
 - **Body.**
-  `CommittedPage { min_reader_version, log_id, level, index, floor_below, packed_entries }`.
+  `CommittedPage { min_reader_version, log_id, level, index, packed_entries }`.
   - A reader checks the log id, the node and the digest, and fails the lookup
     on a mismatch.
-  - `floor_below` and the node give the range of ids it holds.
+  - The references give the range of ids it holds: from the top of the page
+    before it to its own top.
 - **Deletion.**
   - A page may be deleted once a GC record that drops it has landed. A reader
     still holding an older replica then finds the page missing, reads again,
@@ -475,7 +488,7 @@ message CommittedTransactions {
   reserved 1, 2;                               // max_timestamp_ms, packed_entries: one blob before
   fixed64 highest_dropped_timestamp_ms = 3;    // H, as now
   fixed64 floor_ms                     = 4;    // F; absent: H
-  repeated CommittedPage.Ref pages     = 5;    // (H, F], oldest first
+  repeated CommittedPageRef pages      = 5;    // (H, F], oldest first
   repeated CommittedBlock blocks       = 6;    // above F, oldest first
 }
 
@@ -485,20 +498,20 @@ message CommittedBlock {
   bytes  packed_entries = 3;   // newest first; the first gap from the node's top
 }
 
-message CommittedPage {
-  message Ref {
-    uint32  level            = 1;   // the sealed block's node: its top is the floor
-    uint64  index            = 2;   //   the page raised, the newest timestamp it holds
-    uint32  count            = 3;
-    fixed64 max_timestamp_ms = 4;   // its newest id's: the horizon when GC drops it
-    bytes   digest           = 5;   // with the node, the page's name
-  }
+message CommittedPageRef {
+  uint32  level            = 1;   // the sealed block's node: its top is the floor
+  uint64  index            = 2;   //   the page raised, the newest timestamp it holds
+  uint32  count            = 3;
+  fixed64 max_timestamp_ms = 4;   // its newest id's: the horizon when GC drops it
+  bytes   digest           = 5;   // with the node, the page's name
+}
+
+message CommittedPage {           // a function of the log and the block alone
   int32   min_reader_version = 1;
   bytes   log_id             = 2;
   uint32  level              = 3;
   uint64  index              = 4;
-  fixed64 floor_below        = 5;
-  bytes   packed_entries     = 6;
+  bytes   packed_entries     = 5;
 }
 ```
 
@@ -714,7 +727,44 @@ Each stage keeps every suite and fuzzer green, and lands on the branch
    floor, where only the floor rejects it.
 3. **Paging.** The PageOut record and its replay, page references, the
    `PageStore` SPI and its providers, the runtime's policy (A, T), lookups
-   through pages, deletion after GC, and the sweep.
+   through pages, deletion after GC, and the sweep. Done 2026-11-04:
+   - `CommittedSet` holds the references, F and H; `pagedOut` (replay of a
+     PageOut) and `sealable` (the page a compactor would write of the oldest
+     block); `contains` throws `PagedOutException`.
+   - `PageStore` (`SharedLog.pages()`): `AtomicFileLog` on its FileIO beside
+     the object (listing needs `SupportsPrefixOperations`; the contention
+     benchmark's `LatencyFileIO` lists nothing yet, so its sweeps do nothing),
+     `InMemorySharedLog` on a map with page-fault hooks (`PageFault`).
+   - `LogRuntime`: the policy in both compactions; a replace computes its
+     payload and puts its pages before the write, whose failures are
+     ambiguous; `landed` reads pages (`BEYOND_FLOOR` for an id its page lacks,
+     a failed get unknown or a failed read, a missing page a fresh read);
+     `committed(replica, id)` for lookups outside the commit loop. The writer
+     whose GC record dropped pages deletes them once it lands, and sweeps the
+     orphans whenever its write dropped or sealed a page: so a sweep follows
+     every page written or dropped, at most one a minute at 1,000 commits a
+     second. Pages read are cached by name (4), and pages put are remembered
+     (64), since a name's bytes never change.
+   - `RuntimeConfig.admissionWindowMs`, `pageThresholdBytes`; the catalog's
+     `fileio.catalog.committed.admission.ms`, `.page.threshold`.
+   - Tests: `TestCommittedSetBlocks` (walks with stale PageOuts against a
+     reference with pages; every page referenced exists and holds exactly the
+     ids that applied in its range), `TestReplay`, `TestSharedLogPaging`,
+     `TestAtomicFileLogPaging`, the page store in `SharedLogContract`, and a
+     format explorer scenario. Calibrated by 14 mutants, each caught: the
+     TLA+ switches (`floorgap` in the set and in its builder, `absentpage`,
+     `nodigest`, `sweepabove`, `mintH`, `pageown`, `missingfail`), and
+     sealing the newest block, no merge after a PageOut, GC keeping pages, a
+     paged id read as absent, no deletion after GC, and a ceiling without A.
+     Sealing the newest block was missed until `theNewestBlockIsNeverSealed`
+     (no compactor proposes it, so only a forged PageOut reaches the check).
+   - The catalog suites run paged with `-Dintentlog.test.paging=true` (A = 0,
+     T = 0, in `LocalCatalogMode`): `TestLocalCatalog*` and the fault and race
+     fuzzers pass, but page little (15 and 44 writes carried PageOuts), since
+     most of their catalogs hold fewer than two blocks of ids. Stage 4 makes
+     them page.
+   - Found: the page body's `floor_below` made it depend on the floor it was
+     sealed from, not only on its block (Page objects, above); it is gone.
 4. **The fuzzers and the measurements.** The commit-protocol fuzzers' split
    compaction, page faults and oracles; the catalog fuzzers with a small A;
    the ingest benchmark's paging mode, then a campaign; a havoc fuzz round and
@@ -760,8 +810,9 @@ Each stage keeps every suite and fuzzer green, and lands on the branch
 - **Where pages live per provider.** Beside the catalog object for
   `AtomicFileLog`; for Kafka, SQS or a ledger, in the archiver's object store
   (LOG.md §"Providers").
-- **The sweep's cadence**, and whether a page store should list by prefix or
-  the runtime should track the orphans it made.
+- **The sweep's cadence.** Stage 3 sweeps after every compaction that
+  writes or drops a page. Whether a page store should list by prefix or the
+  runtime should track the orphans it made is open.
 - **How snapshots page** (errata D18): a design of its own,
   [SNAPSHOT_PAGING.md](SNAPSHOT_PAGING.md), under the same rule that replay
   never reads a page. It needs no PageOut: a table's blocks seal by its

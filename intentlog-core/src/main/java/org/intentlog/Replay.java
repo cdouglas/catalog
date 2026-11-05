@@ -25,11 +25,14 @@ import org.intentlog.wire.UuidV7;
 /**
  * Replay of a log: a checkpoint, and the records after it folded into its state in log order.
  *
- * <p>A GC record ({@code AdvanceHorizon}) drops the committed ids at or below its watermark. An
- * intention record applies once: replay skips one whose id the committed set holds (a retry of
- * one applied) or that is at or below the set's horizon (it may be a retry of one whose id aged
- * out), and one whose id is not a UUIDv7; it applies one whose preconditions hold where it lands,
- * and adds its id to the set; it skips one whose preconditions do not hold.
+ * <p>A GC record ({@code AdvanceHorizon}) drops the committed ids and pages at or below its
+ * watermark, and a {@code PageOut} seals the set's oldest block into a page if it is still the
+ * block its writer paged (docs/COMMITTED_PAGING.md); neither carries an id, and both apply wherever
+ * they land. An intention record applies once: replay skips one whose id the committed set holds
+ * (a retry of one applied) or that is at or below the set's floor (it may be a retry of one whose
+ * id was paged or aged out; replay never reads a page), and one whose id is not a UUIDv7; it
+ * applies one whose preconditions hold where it lands, and adds its id to the set; it skips one
+ * whose preconditions do not hold.
  */
 public final class Replay {
 
@@ -37,7 +40,7 @@ public final class Replay {
 
   /** What replay did with the first record of a watched id. */
   public enum Outcome {
-    /** The replay held no record of the id it could judge (none, or one at or below the horizon). */
+    /** The replay held no record of the id it could judge (none, or one at or below the floor). */
     NOT_SEEN,
     /** Replay applied the record. */
     APPLIED,
@@ -95,7 +98,7 @@ public final class Replay {
       return logId;
     }
 
-    /** The number of intention records after the checkpoint (GC records not counted). */
+    /** The number of intention records after the checkpoint (GC and PageOut records not counted). */
     public long intentionRecords() {
       return intentionRecords;
     }
@@ -115,8 +118,8 @@ public final class Replay {
 
     /**
      * Whether a record of the watched id was among the records replayed, judged or skipped (a
-     * retry of one applied, or at or below the horizon). A read through a write whose record is
-     * not among them cannot settle the write's outcome.
+     * retry of one applied, or at or below the floor). A read through a write whose record is not
+     * among them cannot settle the write's outcome.
      */
     public boolean seen() {
       return seen;
@@ -182,12 +185,17 @@ public final class Replay {
         committed.advanceHorizon(record.watermarkMs());
         continue;
       }
+      if (record.isPageOut()) {
+        committed.pageOut(record.pageOut());
+        continue;
+      }
       intentionRecords++;
       UUID id = record.id();
       seen |= id.equals(watch);
       if (!committed.mayApply(id)) {
-        // Already applied (a retry), or its id is at or below the committed set's GC horizon,
-        // where the set cannot tell a retry of an aged-out commit from a new one.
+        // Already applied (a retry), or its id is at or below the committed set's floor, where
+        // the set holds pages or nothing and cannot tell a retry of a paged or aged-out commit
+        // from a new one without reading a page, which replay never does.
         continue;
       }
       boolean watched = id.equals(watch) && outcome == Outcome.NOT_SEEN;

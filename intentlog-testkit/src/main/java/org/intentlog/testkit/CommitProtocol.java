@@ -551,8 +551,8 @@ public final class CommitProtocol {
       if (live.committed().ids().contains(id)) {
         return "applied, " + where + ", id kept";
       }
-      if (UuidV7.timestampMs(id) <= live.committed().horizon()) {
-        return "applied or not, " + where + ", id past the horizon";
+      if (UuidV7.timestampMs(id) <= live.committed().floor()) {
+        return "applied or not, " + where + ", id paged or past the horizon";
       }
       return "rejected, " + where;
     }

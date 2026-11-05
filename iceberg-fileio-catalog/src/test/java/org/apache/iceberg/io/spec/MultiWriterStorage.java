@@ -151,8 +151,9 @@ abstract class MultiWriterStorage {
     return CheckpointRoundTrip.difference(write.replace(), write.before, write.after);
   }
 
+  /** Whether {@code record} is one of the committed set's (GC or PageOut), not an intention. */
   private static boolean isGc(byte[] record) {
-    return LogEnvelope.decodeRecord(record).isAdvanceHorizon();
+    return !LogEnvelope.decodeRecord(record).isIntention();
   }
 
   // ============================================================

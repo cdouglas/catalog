@@ -30,6 +30,13 @@ public class CommitRejectedException extends RuntimeException {
     CONFLICT,
     /** Its id is at or below the committed set's horizon, so replay rejects its record. */
     BEYOND_HORIZON,
+    /**
+     * Its id is at or below the committed set's floor, and its record did not apply before the
+     * floor passed it (the page that holds the ids there lacks it, or none can hold it): replay
+     * rejects its record from then on. A commit slower than the admission window
+     * (docs/COMMITTED_PAGING.md).
+     */
+    BEYOND_FLOOR,
     /** It would create the log, and another writer created it first. */
     CREATE_LOST,
     /** It ran out of attempts, with no write that may have landed. */

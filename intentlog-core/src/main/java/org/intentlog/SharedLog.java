@@ -107,4 +107,12 @@ public interface SharedLog {
   default LogView readAfter(LogTail since) {
     return read();
   }
+
+  /**
+   * Where the log keeps the pages of its committed set (docs/COMMITTED_PAGING.md), or null if it
+   * keeps none: the runtime then never pages.
+   */
+  default PageStore pages() {
+    return null;
+  }
 }

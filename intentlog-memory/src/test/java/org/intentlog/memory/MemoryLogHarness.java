@@ -96,7 +96,7 @@ public final class MemoryLogHarness implements LogHarness {
   public List<byte[]> landedRecords() {
     List<byte[]> intentions = new ArrayList<>();
     for (byte[] record : log.records()) {
-      if (!LogEnvelope.decodeRecord(record).isAdvanceHorizon()) {
+      if (LogEnvelope.decodeRecord(record).isIntention()) {
         intentions.add(record);
       }
     }
