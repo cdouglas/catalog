@@ -859,6 +859,21 @@ Each stage keeps every suite and fuzzer green, and lands on the branch
    - The ingest benchmark's `committed` = `page` pages as the runtime does after
      each compaction's GC (`admission_s`, `page_threshold_bytes`); campaign
      `i11-paging` (keep, page, discard at 1,000 a second's steady state).
+     Measured 2026-11-05 (the `cap-i1` capture's 139,135 records at 1,000 a
+     second, the set prefilled to its 30-minute steady state of 1.8 million
+     ids, a compaction every 100 records; one run each on the dev box, lab
+     `compactions` and `windows`): at A = 5 min and T = 1 MiB, paging holds the
+     inline set at the ids inside A, 3.4 MB at the median compaction (keep:
+     19.8 MB), and the checkpoint at 4.1 MB (keep 20.4 MB; discard, no set at
+     all, 0.65 MB). A compaction encodes in 16 ms (keep 21.6, discard 14.4; p99
+     30, 32 and 25) and its checkpoint decodes in 4.4 ms (6.6, 3.8). The first
+     compaction sealed the prefill's 35 pages in 80 ms, the run's slowest; then
+     one page every 33,000 records or so (a block at this rate spans 33-65 s),
+     37 referenced at the end. Ingest with its compactions ran at 5,331
+     records a second (keep 4,158, discard 5,971); folding alone at 44k (keep
+     49k, discard 50k; one run each, within the dev box's spread). Every run
+     reached the state of the log as captured: the floor rejected nothing a
+     5-minute window admits.
 
 ## Alternatives considered
 

@@ -109,6 +109,14 @@ select = ["i10-format-*"]
 select = "i10-format-*"
 note = "ran on a laptop that slept during the campaign (cap-s-fast's 10-minute capture took 37): record bytes and checkpoint breakdowns compare, timings do not; h1-shapes on havoc times the builds"
 
+[campaigns.i11-paging]
+title = "the committed set kept, paged (A 5 min, T 1 MiB) or discarded, cap-i1 at 1,000 records/s, prefilled to its 30-minute steady state, a compaction every 100 records (branch committed-paging, f07aca1)"
+select = ["i11-paging-*"]
+
+[[annotate]]
+select = "i11-paging-*"
+note = "git_dirty only for docs/SNAPSHOT_PAGING.md review comments; the code is f07aca1's. One run per arm"
+
 [campaigns.h1-shapes]
 title = "i8-shapes' seven workloads on havoc, three builds side by side (i8 1e86cf5, i9 343f37b, i10 03ab333), each on its own captures: tell the builds apart by git_sha"
 select = ["h1-shapes-*"]

@@ -151,6 +151,14 @@ to tables of one `FileIOCatalog` over an in-memory store whose requests take a p
   commit loop verifies on its fresh read and writes nothing, so none land. Attempts that failed a
   client-side check (`txn_failures` other than `catalog:`) never reach the log either. View
   `ingest_rejections`.
+- `committed` (summary, param): `keep` (the set as the catalog keeps it), `discard` (no ids: what
+  the set costs), or `page` (since 2026-11-05, branch `committed-paging`): each compaction also
+  pages, after its GC, the oldest blocks older than `admission_s` while the inline set exceeds
+  `page_threshold_bytes`, as the runtime does (docs/COMMITTED_PAGING.md). Its compactions carry
+  `pages_sealed` (by this compaction), `pages` (referenced after it), `page_bytes` (the bodies it
+  encoded and discarded) and `inline_ids_bytes`. The first compaction of a prefilled run seals the
+  prefill's blocks older than A at once (35 at 1,000/s: its encode is the run's slowest). Campaign
+  `i11-paging`.
 - `i1-ingest` and `i2-compaction` ran before the pass checked `max_ingest_s` per batch: it checked
   at the end of a window (2,000 records), so their slowest runs overran it (1,000 records/s
   prefilled, batch 1: 1,729 s for one window). Their windows are measured alike.
