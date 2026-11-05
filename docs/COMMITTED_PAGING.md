@@ -1,8 +1,9 @@
 # Paging the committed set (design)
 
-Status: proposed 2026-10-28, revised 2026-11-04 after review; stages 1-3
-built on branch `committed-paging` (2026-11-04), stage 4's fuzzers built
-(2026-11-04); its measurements, havoc round and calibration open.
+Status: proposed 2026-10-28, revised 2026-11-04 after review; stages 1-4
+built (2026-11-04), measured (i11-paging) and fuzzed and calibrated on havoc
+(2026-11-05). Open: the questions at the end, A's and R's defaults among
+them.
 Errata D16 tracks the problem, and D21 the stamps it leaves unbounded.
 
 ## Context
@@ -854,8 +855,10 @@ Each stage keeps every suite and fuzzer green, and lands on the branch
      runs them far longer.
    - `LatencyFileIO` lists (a LIST at a read's latency, counted as catalog-bench
      bench-core's `Requests.lists`), so the contention benchmark sweeps.
-     catalog-bench's `TieredFileIO` does not classify pages: a FileIOCatalog
-     there fails each page put, logs it, and never pages.
+     catalog-bench's `TieredFileIO` classifies pages (class `page`, at the
+     store tier, catalog-bench ce484bc) and lists their directory to sweep, so
+     a FileIOCatalog there pages; before, it failed each page put, logged it,
+     and never paged.
    - The ingest benchmark's `committed` = `page` pages as the runtime does after
      each compaction's GC (`admission_s`, `page_threshold_bytes`); campaign
      `i11-paging` (keep, page, discard at 1,000 a second's steady state).
@@ -874,6 +877,21 @@ Each stage keeps every suite and fuzzer green, and lands on the branch
      49k, discard 50k; one run each, within the dev box's spread). Every run
      reached the state of the log as captured: the floor rejected nothing a
      5-minute window admits.
+   - On havoc (2026-11-05, fork build p4f, at d15036e): round `cp4-r0`'s ten
+     jobs passed, but its race job tested nothing. jqwik (1.9) multiplies its
+     parameters' exhaustive counts unchecked; the race property's new
+     parameters (clock offsets, paging, filler) took the product to 3e20,
+     which wraps negative, below the round's 200,000 tries, so jqwik
+     enumerated the first combinations in order: every try one failing
+     namespace create, in 174 s. The property now always generates randomly,
+     as every fuzz job does (`ce-fuzz`), and the rerun (`cp4-race`, 200,000
+     tries in 2,862 s, 13% writing a PageOut) passed. Calibration `cp4-calib`
+     (`fuzz/mutants/paging.sh`; both commit-protocol fuzzers at 300,000 tries
+     each): the unmutated run clean, and all 13 reachable mutants caught,
+     12 by the shared log's fuzzer within seconds (`gckeepspages` by the set's
+     decoder: its pages outside (H, F]) and `pageown` by the file log's alone,
+     which the shared log's passes at 300,000 tries. `newest` and `floorgap`
+     are not run (unreachable, above).
 
 ## Alternatives considered
 

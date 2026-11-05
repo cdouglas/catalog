@@ -39,7 +39,8 @@ test class; for a calibration, each mutant `caught` or `NOT CAUGHT`, and `none`,
 oracles, which must be `clean`), and `run.txt` (the fork, commit, host). Copy `out/<name>/` back
 to keep it. `JOBS` limits the jobs at once (default all), `HEAP` each test JVM's heap (default
 4g; a job's resident size is up to two gigabytes more, with Maven's). A round wants ten cores
-and about 62 GB; a calibration, a core and 6 GB per mutant.
+and about 62 GB; a calibration, a core and 6 GB per mutant. `ROUND_JOBS` runs some of a round's
+jobs (`ROUND_JOBS=race ./run.sh round ...` reruns one; the memory limit counts only those).
 
 ## Memory on a shared host
 
@@ -76,7 +77,10 @@ On rootful Docker the results are root's. Rootless Docker: the daemon is a user 
 `ce-fuzz` (the image's entrypoint) clones the bundle, checks out a worktree per job at the
 commit, sets each property's tries (as the phase-exit rounds do: `ce-fuzz` with no arguments
 lists them), and runs `mvn -o test -Dtest=...` in each, against `/opt/m2/forks/<fork>` chained
-to `/opt/m2/base` (Maven 3.9's `maven.repo.local.tail`). A calibration set
+to `/opt/m2/base` (Maven 3.9's `maven.repo.local.tail`). Generation is random
+(`jqwik.generation.default`) unless a property asks otherwise: jqwik multiplies its parameters'
+exhaustive counts unchecked, and at a job's tries a large space whose product wraps negative was
+enumerated in order (round cp4-r0's race job ran 200,000 copies of one failing namespace create). A calibration set
 (`mutants/<set>.sh`) names its mutants, its oracles and their tries; each mutant is a code
 change, put back by an exact-text replacement anchored in the code as the set's last commit
 left it (a calibration of an older commit needs the set as it was then), and must fail an

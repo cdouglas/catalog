@@ -22,7 +22,7 @@
 # shrink shrinks it); SHRINK_HEAP (default 16g) and SHRINK_SECONDS (default 1800), a shrink's heap
 # and how long jqwik shrinks; JOB_TIMEOUT, a limit on each job's time (as timeout(1) takes it;
 # default none, a shrink's twice SHRINK_SECONDS and an hour); SMOKE=1 sets every property's
-# tries to 3 (to check the image, not the code).
+# tries to 3 (to check the image, not the code); ROUND_JOBS, a round's jobs (default all ten).
 #
 # A round's jobs (tries per @Property, in the order the class declares them):
 #   faultA1-2  TestCatalogFaultProperties.catalogMatchesModel, 30,000
@@ -87,6 +87,9 @@ PY
 
 # job <dir> <log> <tests>: one offline test run in <dir>, waiting for a free slot of JOBS. Its
 # test JVM has HEAP, and jqwik's shrinking is SHRINKING (for SHRINK_SECONDS when bounded).
+# Generation is random unless a property asks otherwise: jqwik (1.9) multiplies its parameters'
+# exhaustive counts unchecked, so at a job's tries a large space whose product wraps negative is
+# enumerated in order, only its last parameters varying (round cp4-r0's race job).
 job() {
   while [ "$(jobs -rp | wc -l)" -ge "${JOBS:-64}" ]; do wait -n; done
   (
@@ -96,7 +99,7 @@ job() {
       "shrinking=$SHRINKING timeout=${JOB_TIMEOUT:-none}" > "$2"
     # shellcheck disable=SC2046
     MAVEN_OPTS=-Xmx512m ${JOB_TIMEOUT:+timeout -k 120 $JOB_TIMEOUT} mvn -o -B $(repo $FORK) test \
-      "-DargLine=-Xmx$HEAP -Djqwik.shrinking.default=$SHRINKING
+      "-DargLine=-Xmx$HEAP -Djqwik.shrinking.default=$SHRINKING -Djqwik.generation.default=RANDOMIZED
         -Djqwik.shrinking.bounded.seconds=${SHRINK_SECONDS:-1800}" \
       -Dsurefire.failIfNoSpecifiedTests=false -Dtest="$3" >> "$2" 2>&1
     echo "exit=$? elapsed=$(( $(date +%s) - start ))s" >> "$2"
@@ -125,8 +128,8 @@ status() {
   done
 }
 
-# A round's jobs
-ROUND_JOBS="faultA1 faultB1 faultA2 faultB2 race mw proto rebase contract diff"
+# A round's jobs (ROUND_JOBS: some of them, to rerun)
+ROUND_JOBS=${ROUND_JOBS:-"faultA1 faultB1 faultA2 faultB2 race mw proto rebase contract diff"}
 
 # tests_of <job>: the tests a round's job (or a test job) runs; a test job's are its own
 tests_of() {
@@ -164,6 +167,7 @@ setup() {
 
 round() {
   for j in $ROUND_JOBS; do
+    tests_of $j > /dev/null
     worktree $W/$j $COMMIT && setup $j $W/$j
   done
   for j in $ROUND_JOBS; do

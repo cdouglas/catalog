@@ -28,7 +28,9 @@ import net.jqwik.api.Arbitraries;
 import net.jqwik.api.Arbitrary;
 import net.jqwik.api.Combinators;
 import net.jqwik.api.ForAll;
+import net.jqwik.api.GenerationMode;
 import net.jqwik.api.Property;
+import net.jqwik.api.PropertyDefaults;
 import net.jqwik.api.Provide;
 import net.jqwik.api.statistics.Statistics;
 import org.apache.iceberg.Schema;
@@ -68,7 +70,14 @@ import org.intentlog.wire.LogEnvelope;
  * writer has its own catalog mode. A result is a return value or an exception's class; the
  * catalog's state is its namespaces with their properties and its tables with theirs (a table
  * created carries its creator's name) and their live data files.
+ *
+ * <p>Generation is random, never exhaustive: jqwik (1.9) multiplies its parameters' exhaustive
+ * counts unchecked, and this product (3e20) wraps to a negative count, below any tries, so at
+ * tries of 3,072 or more (each parameter's count is below that) it would enumerate the first
+ * combinations in order, only the last parameters varying (havoc round cp4-r0's race job: 200,000
+ * failing namespace creates).
  */
+@PropertyDefaults(generation = GenerationMode.RANDOMIZED)
 class TestCatalogRaceProperties {
 
   private static final String WAREHOUSE = "mem:///warehouse";

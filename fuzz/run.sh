@@ -2,7 +2,7 @@
 # Runs fileio-catalog's fuzz image on a host with Docker (rootless is fine). See README.md.
 #
 #   run.sh build                                  build the image from ./ctx (pulls the base image)
-#   run.sh round <fork> <commit> <name>           a phase-exit round (ten jobs), detached
+#   run.sh round <fork> <commit> <name>           a phase-exit round (ten jobs, or ROUND_JOBS), detached
 #   run.sh calib <fork> <commit> <name> <set>     a calibration (mutants/<set>.sh), detached
 #   run.sh test <fork> <commit> <name> <tests>    one test job, detached
 #   run.sh shrink <fork> <commit> <name> <run>/<job>
@@ -18,13 +18,14 @@
 # its jobs at once times their heap and 2g, and 2g); passed to the container: JOBS (jobs at once,
 # default all; a shrink's 1), HEAP (each test JVM's heap, default 4g), SHRINKING (default OFF),
 # SHRINK_HEAP (default 16g), SHRINK_SECONDS (default 1800), JOB_TIMEOUT, SMOKE=1 (3 tries per
-# property: checks the image, not the code), REBASE_TRIES.
+# property: checks the image, not the code), REBASE_TRIES, ROUND_JOBS (a round's jobs, to rerun
+# some: "race", "faultA1 faultB1").
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OUT=${OUT:-$HERE/out}
 BUNDLE=${BUNDLE:-$HERE/fileio.bundle}
 IMAGE=${IMAGE:-ce-fuzz:latest}
-usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 # gigabytes <size>: a JVM heap size (4g, 512m) in whole gigabytes, rounded up
 gigabytes() {
@@ -36,13 +37,13 @@ gigabytes() {
 }
 
 # limit <cmd> <args...>: the container's memory limit, unless MEM sets it: each job it runs at
-# once (JOBS, else a round's ten, a calibration's mutants and its unmutated run, one test or
-# shrink) with its heap and 2g for the JVM's other memory and Maven's, and 2g
+# once (JOBS, else a round's ten or ROUND_JOBS, a calibration's mutants and its unmutated run,
+# one test or shrink) with its heap and 2g for the JVM's other memory and Maven's, and 2g
 limit() {
   if [ -n "${MEM:-}" ]; then echo "$MEM"; return; fi
   local cmd=$1 slots heap=${HEAP:-4g}
   case $cmd in
-    round) slots=10 ;;
+    round) slots=$(echo ${ROUND_JOBS:-1 2 3 4 5 6 7 8 9 10} | wc -w) ;;
     calib) slots=$(( $(cd "$HERE/ctx" && bash -c '. mutants/'"$5"'.sh && echo $MUTANTS' | wc -w) + 1 )) ;;
     shrink) slots=1; heap=${SHRINK_HEAP:-16g} ;;
     *) slots=1 ;;
@@ -72,7 +73,7 @@ case $cmd in
       --memory "$mem" --memory-swap "$mem" --oom-score-adj 1000 \
       -v "$OUT:/out" -v "$(readlink -f "$BUNDLE"):/in/fileio.bundle:ro" \
       -e JOBS -e HEAP -e SHRINKING -e SHRINK_HEAP -e SHRINK_SECONDS -e JOB_TIMEOUT \
-      -e SMOKE -e REBASE_TRIES \
+      -e SMOKE -e REBASE_TRIES -e ROUND_JOBS \
       "$IMAGE" "$cmd" "$@"
     held=$(docker exec "ce-fuzz-$name" cat /sys/fs/cgroup/memory.max 2>/dev/null || true)
     if [ -z "$held" ] || [ "$held" = max ]; then
