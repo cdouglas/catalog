@@ -1,12 +1,13 @@
 # Paging a table's snapshots (design)
 
-Status: proposed 2026-11-04; not built. Errata D18 (ML lists stored whole)
-tracks the problem; D17 (expiry starves) and D19 (whole-object compaction
-trigger) are what it costs. It is R2.1 and part of R2.2 in
-[CHECKPOINT_PLAN.md](CHECKPOINT_PLAN.md), under its decisions: replay never
-reads a page (1), page GC (2), and the pool as a dedup dictionary (3). The
-committed set pages apart ([COMMITTED_PAGING.md](COMMITTED_PAGING.md)), since
-its ids differ from snapshots in lifetime and key.
+Status: proposed 2026-11-04, revised 2026-11-05 after review; not built.
+Errata D18 (ML lists stored whole) tracks the problem; D17 (expiry starves)
+and D19 (whole-object compaction trigger) are what it costs. It is R2.1 and
+part of R2.2 in [CHECKPOINT_PLAN.md](CHECKPOINT_PLAN.md), under its
+decisions: replay never reads a page (1), page GC (2), and the pool as a
+dedup dictionary (3). The committed set pages apart
+([COMMITTED_PAGING.md](COMMITTED_PAGING.md)), since its ids differ from
+snapshots in lifetime and key.
 
 ## Context
 
@@ -31,8 +32,27 @@ So the checkpoint grows with every snapshot a table keeps:
 | an ML table, merge appends | about 330 B: 2.4 MB at 7,200 | catalog-bench E3 (D19) |
 
 Every compaction writes all of it and every fresh read fetches it (D15, D19).
-A load builds every snapshot and every snapshot's list (664 ms and 533 MB
-allocated at 3,000 fast-append snapshots).
+Replay leaves a table it does not touch as bytes, but a load decodes the
+table's whole snapshot block and builds every snapshot and every snapshot's
+list: 664 ms and 533 MB allocated at 3,000 fast-append snapshots, whose lists
+hold 4.5 million entries (later loads reuse what the first made,
+`LogCatalog.InlineSnapshots`).
+
+Iceberg is eager in snapshots and lazy in lists. Reading a metadata file
+parses every snapshot in it, on every commit and load, and on a worker too:
+`SerializableTable` ships the file's location and parses the file on first
+use, even for the current snapshot. Only REST's
+`snapshot-loading-mode=refs` sends just the refs' snapshots and loads the
+rest on demand ([Loads](#loads)). A snapshot's manifest list, though, is
+read only when something asks for its manifests, one snapshot at a time.
+The lists are where this catalog is eager beyond Iceberg:
+`InlineTableMetadata.create` takes every snapshot, and each `InlineSnapshot`
+holds its list resolved. The fork's `SerializableTable` is eager too: for an
+inline table it ships the whole metadata as JSON and a copy of every
+snapshot's manifests. None of this needs pages to fix ([Order of
+work](#order-of-work), step 3): lists resolved when first asked for, as
+Iceberg reads list files; snapshots through a supplier, decoded by block;
+and a `SerializableTable` that ships the head.
 
 Most of it is history that replay never needs. A commit lands on its branch's
 head, and its conflict window reaches back over the commits on that branch it
@@ -228,6 +248,19 @@ anywhere later.
 
 ## Expiry
 
+Expiry is maintenance an operator runs, not a side effect of commits:
+Iceberg expires nothing on its own. A job (Spark's `expire_snapshots`, a
+scheduled service) commits a removal by the table's retention, by default
+the snapshots older than 5 days (`history.expire.max-snapshot-age-ms`) past
+the newest of each branch (`history.expire.min-snapshots-to-keep`, 1), then
+deletes the files only the removed snapshots reached. It is a writer's
+change, not a hint: once it lands, no reader may load those snapshots, and
+their files may be gone. How the catalog keeps the removed metadata is its
+own affair. Here a removed snapshot leaves the table at once (the root's
+live ids), and its bytes stay in its page, which nothing reads for it, until
+every snapshot of its block is gone and the page is collected. Expiry is by
+snapshot; reclamation is by block.
+
 Expiry applies natively (decision 1). A `RemoveSnapshots` record:
 
 1. removes each id from the inline snapshots, or from its block's live ids;
@@ -272,9 +305,10 @@ a table, the blocks it needs, whether they sit in the root or in pages.
   supplier decodes the table's other blocks, from the root's bytes or from
   pages, and keeps the snapshots the live ids name. Pages are cached by name,
   since they never change. `InlineSnapshot`s are made as their blocks are
-  decoded. A reader that plans a scan of the current snapshot or of a ref
-  decodes the head and the blocks its refs' targets are in, and reads no
-  page.
+  decoded, each resolving its list only when asked for its manifests, as
+  Iceberg reads a list file. A reader that plans a scan of the current
+  snapshot or of a ref decodes the head and the blocks its refs' targets are
+  in, and reads no page.
 
 What triggers the supplier, as Iceberg stands:
 
@@ -309,28 +343,50 @@ S1's:
   run (it decodes blocks and reads pages through the table's FileIO), not
   the whole table.
 
+Decided in review (2026-11-05): the fork takes both, behind one switch for
+ablation, `fileio.catalog.load.lazy` (default true; false loads every
+snapshot and list and ships the whole table, as today). Both sit in Iceberg
+core and in the catalog's load path, above the shared log, so every
+provider gains alike. #18073 changes core and helps any client that loads
+snapshots lazily (REST's refs mode), so it goes on the baselines' `perf`
+branch too (catalog-bench DESIGN.md, "Baseline clients").
+
 ## Page GC
 
-Pages are one-way (decision 2 for the state's pages). A table's page is
-garbage once:
+Pages are one-way (decision 2 for the state's pages). A page a compactor
+sealed is garbage once:
 
 - its block is behind the sealing line ((k+1)·B + W at or below the last
-  sequence number) and the root has no entry for it: every one of its
-  snapshots expired; or
+  sequence number) and the root has no entry for it: every one of the
+  block's snapshots expired; or
+
 - its table is gone (dropped, or evicted to a pointer), its id below the
   catalog's table counter and absent from the root.
 
-Neither can be undone. Sequence numbers only rise, snapshots never come back,
-and table ids are not reused. So a sweep needs no clock and no grace period.
-Any compactor may sweep: list the page store and delete the garbage the root
-shows. A page whose block is not yet sealed in the root (one a compactor
-ahead wrote) is not garbage.
+An import page ([Re-inlining](#re-inlining)) is garbage once the root's
+version of its table has passed the version the page was staged on, and the
+root does not name it.
+
+None of these can be undone. Sequence numbers and table versions only rise,
+snapshots never come back, and table ids are not reused. So a sweep needs no
+clock and no grace period. Any compactor may sweep: list the page store and
+delete the garbage the root shows. A page whose block is not yet sealed in
+the root (one a compactor ahead wrote) is not garbage.
 
 - On a shared log with checkpoints apart, the sweep counts every checkpoint
   the provider may still serve, not only the newest.
 - A reader holding metadata from before a block emptied cannot load the
   snapshots it held. Iceberg's readers fail the same way once an expiry
   deletes a manifest list.
+
+A table outlives its blocks. Its head is never sealed (a ref's target stays
+inline, [Blocks](#blocks)), and Iceberg's expiry never removes it: main is
+always retained, each retained branch keeps its newest
+`min-snapshots-to-keep` snapshots (at least 1), and a snapshot a retained
+ref targets cannot be expired (`RemoveSnapshots`). A table whose old blocks
+have all emptied keeps its head and its last snapshots inline. It ends only
+by a drop, and leaves inline storage only by eviction ([Whole
+tables](#whole-tables)).
 
 ## Whole tables
 
@@ -340,8 +396,59 @@ metadata file and manifest list files). Eviction is a record
 does not apply; the policy is the writer's: which tables, after how long.
 The evicting writer reads the table's pages to write the old snapshots' list
 files. Paging makes eviction matter less: an idle inline table costs the root
-its head, its last W snapshots and its sealed ids. Re-inlining a table is out
-of scope, as it is today (SPEC_TM.md).
+its head, its last W snapshots and its sealed ids.
+
+Re-inlining works as SPEC_TM.md has it: an inline writer's next commit to a
+pointer table re-inlines it in full mode when the whole metadata fits in a
+record; otherwise the table stays a pointer table and the commit writes
+another metadata file. The snapshots keep the manifest list files they
+have. A deep table's metadata does not fit in a record; with pages it comes
+back at any depth ([Re-inlining](#re-inlining)). Only a policy that
+re-inlines on its own (a compaction, or a reader moving a cold pointer table
+back) is out of scope, as today.
+
+## Re-inlining
+
+Paging bounds what an inline table costs the root, whatever its depth: its
+head, its last W snapshots and about 18 B a sealed snapshot. So a pointer
+table of any depth can come back inline, as long as its history goes to
+pages rather than into the record.
+
+**Import pages.** The re-inlining writer has the pointer table's metadata
+(its commit loaded it). It cuts the snapshots behind the sealing line into
+blocks on the table's grid and puts each as a page before it sends its
+record, as a compactor puts a page before its root. An import page is a
+`SnapshotPage` whose snapshots keep the manifest list files they have (a
+snapshot's list in a page is a list file's location or a list of the
+pool's ordinals). The record is FULL, on the table's version: the head, the
+inline snapshots, and for each block its index, live ids, Merkle root and
+page name. That is about 18 B a snapshot and 50 B a block, 0.8 MB at
+43,200 snapshots, within one record. Replay installs the blocks as sealed
+and reads no page.
+
+- *The writer's word.* Replay cannot check an import page against the ids
+  and Merkle root its record carries, just as it cannot check a pointer
+  table's metadata file against the location a record names. A compactor's
+  page is a function of the replayed state; an import page is the writer's,
+  named by its digest. A later record that brings one of its snapshots back
+  is checked against the importer's Merkle root, so loads and bring-backs
+  agree.
+- *Garbage.* An import page is named for the table version its record was
+  staged on, `t<table id>/v<version>-<block>-<digest>`. The record applies
+  only at that version, so once the table's version has passed it and the
+  root does not name the page, nothing ever will ([Page GC](#page-gc)). A
+  crashed import's pages wait for the table's next commit; no clock is
+  read.
+- *Policy.* As today, an inline writer re-inlines a pointer table on its
+  next commit to it (SPEC_TM.md); with import pages this holds at any depth.
+  A table a writer evicted as idle comes back when it is written again. A
+  maintenance call on `FileIOCatalog` re-inlines a table without a data
+  commit. A compaction never re-inlines: it writes no table records.
+- *Tables evicted for good today.* A table upgraded to v3 lists its kept
+  manifests with row ids that the pool's entries lack (errata D22). Once its
+  upgrade is W behind the head, the snapshots before it sit in import pages
+  with their own pools, and the root's pool holds only the upgraded entries.
+  Whether that brings such a table back is open until step 5.
 
 ## Sizes
 
@@ -376,7 +483,11 @@ only a merge can.
   head's metadata with a snapshots supplier, and a page cache.
 - **Writers** (`LogCatalog.stageUpdate`): the leaf and proof when a ref moves
   onto a sealed snapshot.
-- **The fork**: a lazy `Builder(base)` and `SerializableTable`.
+- **The fork**: a lazy `Builder(base)` and `SerializableTable`, and an
+  `InlineSnapshot` that resolves its list on first use.
+- **Re-inlining** (`LogCatalog`'s full mode, `FileIOCatalog`): import pages
+  put before a FULL record that names them, their GC, and a maintenance
+  call.
 
 ## Testing
 
@@ -418,7 +529,11 @@ schedules, the differential and rebase properties) gain the small B and W,
 and operations aimed at the line: rollbacks and tags on old snapshots,
 fast-forward cherry-picks of old staged snapshots, branches that keep their
 own ancestors past expiry (holes in blocks), expiries whose cutoff falls
-inside a block, and stale writers whose base is behind the line.
+inside a block, and stale writers whose base is behind the line. They
+already move tables out of inline storage and back (a small inline update
+limit); at the small B and W the tables they bring back are deep, so a
+re-inline imports pages, and page faults reach its puts. A re-inlined table
+must load as its pointer form did.
 
 **Pages.** `CheckpointRoundTrip` checks that every page a root names exists,
 decodes, hashes to its name, and holds what the reference's snapshots are; and
@@ -428,7 +543,8 @@ at any step. Oracles:
 
 1. A load or an expiry's read never takes a missing page for empty: it fails.
 2. A sweep deletes only pages the root shows are garbage, and never one that
-   a root a provider may serve names.
+   a root a provider may serve names, nor an import page whose record may
+   still apply.
 3. At the drain, after every table is dropped or expires every snapshot, a
    sweep leaves no page.
 4. A load that asks for no history reads no page (requests counted, as
@@ -449,17 +565,23 @@ Each step stands alone and is measured before the next:
 
 1. **Replay without whole-table history.** The split of deltas (native
    snapshot updates, the builder on a head without snapshots), native expiry,
-   and FULL carrying the head. There is no format change; the replay check and
-   the fuzzers cover it.
+   and FULL carrying the head. The first two change no format; the third
+   does: a FULL record on an inline table carries the head, the snapshots
+   its base lacks and the ids of those it drops. The replay check and the
+   fuzzers cover all three.
 2. **Lists by ordinal and as deltas** (R2.1). A format change, no pages. This
    alone fixes fast appends' square growth (D18).
-3. **Lazy loads.** Blocks as the unit of decoding, loads through the
-   supplier, and the fork following #18073 and changing `SerializableTable`,
-   with tests in the fork. Readers that load only what they access gain from
-   this without any page.
+3. **Lazy loads.** Blocks as the unit of decoding, lists resolved on first
+   use, loads through the supplier, and the fork following #18073 and
+   changing `SerializableTable`, with tests in the fork; behind
+   `fileio.catalog.load.lazy`. Readers that load only what they access gain
+   from this without any page.
 4. **Sealing and pages.** The root's sealed blocks, the page store (shared
    with the committed set), refs moved back with proofs, and page GC.
-5. **Cold tables evicted** by a writer's policy, if the measurements still
+5. **Re-inlining at any depth.** Import pages, the FULL record that names
+   them, their GC, and a maintenance call that re-inlines a pointer table
+   without a data commit.
+6. **Cold tables evicted** by a writer's policy, if the measurements still
    call for it.
 
 ## Alternatives considered
@@ -479,8 +601,8 @@ Each step stands alone and is measured before the next:
   of absence it works, see [Open questions](#open-questions)). A false positive
   rejects a valid snapshot id, and `SnapshotProducer` keeps its id across
   retries, so the commit would fail every time it retried.
-- **Lazy `InlineSnapshot`s only** (a D18 option). It cuts load cost, not the
-  checkpoint. Paging gives it anyway, for paged snapshots.
+- **Lazy `InlineSnapshot`s only** (a D18 option). It cuts a load's cost, not
+  the checkpoint's: step 3 takes it, and the checkpoint still needs pages.
 - **Evict by size** (a D18 option). The table leaves inline storage whole and
   loses its single-write commits.
 - **References in a tree.** Each block costs the root one reference (about
@@ -513,6 +635,20 @@ Each step stands alone and is measured before the next:
   it (each block's ids in a Merkle tree sorted by id). A lazy snapshot log
   would remove the entries entirely, but Iceberg validates the log whole at
   construction, so it is a fork change.
+
+  Nesting is the general form (review, 2026-11-05): the root's per-block
+  entries (the live ids, and the log entries) would move into pages of their
+  own, the root keeping one reference per group of blocks, nested again as
+  tables deepen, as [References in a tree](#alternatives-considered) does for
+  the blocks' references. It meets the same two obstacles: replay checks a
+  new id against every sealed id, so the ids leave the root only with the
+  filter and its proofs, and Iceberg needs the whole log, so the log entries
+  leave it only with the fork change. It is deferred with them, until a
+  workload calls for it. A table that keeps tens of thousands of snapshots
+  may be misconfigured: Iceberg itself rewrites a metadata file holding every
+  kept snapshot (hundreds of bytes of JSON each) on every commit.
+
 - **A table upgraded to v3** gives row ids to the manifests it keeps, which
-  evicts an inline-ML table today, for good (errata D22). Paging changes
-  nothing there.
+  evicts an inline-ML table today, for good (errata D22). Paging alone changes
+  nothing there; re-inlining may bring it back
+  ([Re-inlining](#re-inlining)), once its upgrade is W behind the head.
