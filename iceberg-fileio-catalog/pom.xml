@@ -289,6 +289,10 @@
             <!-- Every replay of a delta on a table's fields is checked against Iceberg's
                  builder (NativeDelta). -->
             <fileio.catalog.replay.check>true</fileio.catalog.replay.check>
+            <!-- The committed set's blocks hold at most 4 ids here (16 in the other modules): a
+                 catalog in a test holds a few dozen ids, so its writers that page find blocks to
+                 seal (docs/COMMITTED_PAGING.md, "Testing"). -->
+            <intentlog.committed.block.ids>4</intentlog.committed.block.ids>
           </systemPropertyVariables>
           <excludes>
             <exclude>**/aws/**</exclude>

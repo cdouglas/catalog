@@ -802,9 +802,11 @@ write is conditional.
    its `PageOut`, and `readThrough` the last ([COMMITTED_PAGING.md](COMMITTED_PAGING.md));
 4. `putCheckpoint` the replay at the view's tail;
 5. `trim` through that tail;
-6. delete the pages a GC record dropped, and, if it dropped or sealed any,
-   sweep the orphans (unreferenced pages whose node ends at or below the
-   floor).
+6. delete the pages the GC records its replays folded dropped, its own record
+   and any other in its view, whether the checkpoint named them or a PageOut
+   after it did (replay's set builder lists them, `droppedPages`), and, if it
+   dropped or sealed any, sweep the orphans (unreferenced pages whose node ends
+   at or below the floor).
 
 Any compactor may run it at any time, and each step is safe to repeat or to
 abandon: a GC record that lands twice drops nothing new, a PageOut that lands

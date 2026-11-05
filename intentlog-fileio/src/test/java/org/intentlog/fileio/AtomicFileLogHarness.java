@@ -23,8 +23,11 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import org.apache.iceberg.io.AtomicOutputFile;
+import org.apache.iceberg.io.FileInfo;
 import org.apache.iceberg.io.InMemoryAtomicFileIO;
 import org.intentlog.CommittedSet;
 import org.intentlog.Intention;
@@ -41,12 +44,14 @@ import org.intentlog.wire.LogEnvelope;
  * as none. A copy of a record is appended at the object's offset, or, on a store without append,
  * by a CAS of the object with the copy after its records (another writer's write either way).
  * Every other CAS must write the replay of the version it replaced (I11), checked with {@code
- * machine}.
+ * machine}. The pages of the committed set are the store's objects under {@code <location>
+ * .committed/}: their requests meet page faults, a page that is missing acting as a failure.
  */
 public final class AtomicFileLogHarness implements LogHarness {
 
   private final InMemoryAtomicFileIO io;
   private final AtomicFileLog log;
+  private final String pages;
   private final StateMachine<?, ?, ?> machine;
   private Hooks hooks = null;
 
@@ -54,12 +59,36 @@ public final class AtomicFileLogHarness implements LogHarness {
       StateMachine<?, ?, ?> machine) {
     this.io = io;
     this.log = new AtomicFileLog(io, location);
+    this.pages = location + ".committed/";
     this.machine = machine;
     io.injectFaults((loc, strategy) -> hooks == null ? InMemoryAtomicFileIO.Fault.NONE
         : fault(hooks.beforeWrite()));
-    io.injectReadFaults(loc -> hooks == null ? InMemoryAtomicFileIO.ReadFault.NONE
-        : hooks.beforeRead() == ReadFault.FAIL
-            ? InMemoryAtomicFileIO.ReadFault.FAIL : InMemoryAtomicFileIO.ReadFault.NONE);
+    io.injectReadFaults(loc -> {
+      if (hooks == null) {
+        return InMemoryAtomicFileIO.ReadFault.NONE;
+      }
+      boolean fails = loc.startsWith(pages)
+          ? hooks.beforePage(PageRequest.GET, loc.substring(pages.length())) != PageFault.NONE
+          : hooks.beforeRead() == ReadFault.FAIL;
+      return fails ? InMemoryAtomicFileIO.ReadFault.FAIL : InMemoryAtomicFileIO.ReadFault.NONE;
+    });
+    io.injectPlainFaults((request, loc) -> {
+      if (hooks == null || !loc.startsWith(pages)) {
+        return InMemoryAtomicFileIO.Fault.NONE;
+      }
+      PageRequest page = request == InMemoryAtomicFileIO.PlainRequest.PUT ? PageRequest.PUT
+          : request == InMemoryAtomicFileIO.PlainRequest.DELETE ? PageRequest.DELETE
+          : PageRequest.LIST;
+      switch (hooks.beforePage(page, page == PageRequest.LIST ? null
+          : loc.substring(pages.length()))) {
+        case NONE:
+          return InMemoryAtomicFileIO.Fault.NONE;
+        case LOST_REPLY:
+          return InMemoryAtomicFileIO.Fault.LOST_REPLY;
+        default:
+          return InMemoryAtomicFileIO.Fault.FAIL_BEFORE;
+      }
+    });
   }
 
   private static InMemoryAtomicFileIO.Fault fault(WriteFault fault) {
@@ -105,9 +134,7 @@ public final class AtomicFileLogHarness implements LogHarness {
     Set<ByteBuffer> seen = new LinkedHashSet<>();
     for (InMemoryAtomicFileIO.Write write : io.history()) {
       for (byte[] record : AtomicFileLog.decode(write.after()).records()) {
-        if (LogEnvelope.decodeRecord(record).isIntention()) {
-          seen.add(ByteBuffer.wrap(record));
-        }
+        seen.add(ByteBuffer.wrap(record));
       }
     }
     List<byte[]> records = new ArrayList<>();
@@ -136,6 +163,24 @@ public final class AtomicFileLogHarness implements LogHarness {
   @Override
   public int deliverDelayed() {
     return 0;
+  }
+
+  @Override
+  public Map<String, byte[]> storedPages() {
+    Hooks was = hooks;
+    hooks = null;
+    try {
+      Map<String, byte[]> stored = new TreeMap<>();
+      for (FileInfo file : io.listPrefix(pages)) {
+        byte[] page = io.bytes(file.location());
+        if (page != null) {
+          stored.put(file.location().substring(pages.length()), page);
+        }
+      }
+      return stored;
+    } finally {
+      hooks = was;
+    }
   }
 
   @Override

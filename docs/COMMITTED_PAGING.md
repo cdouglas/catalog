@@ -1,8 +1,8 @@
 # Paging the committed set (design)
 
 Status: proposed 2026-10-28, revised 2026-11-04 after review; stages 1-3
-built on branch `committed-paging` (2026-11-04), stage 4 (the fuzzers and the
-measurements) open.
+built on branch `committed-paging` (2026-11-04), stage 4's fuzzers built
+(2026-11-04); its measurements, havoc round and calibration open.
 Errata D16 tracks the problem, and D21 the stamps it leaves unbounded.
 
 ## Context
@@ -305,7 +305,7 @@ The pages tile (H, F] in the order their records landed: page i holds the ids in
 ## GC with pages
 
 `AdvanceHorizon(w)`:
-1. drops every page whose floor is at or below w, raising H to each one's `maxTs`;
+1. drops every page whose top is at or below w, raising H to each one's `maxTs`;
 2. drops or cuts the inline blocks at w, as today, then merges as the rule
    says. This is only reached when w ≥ F, for example with a retention below A,
    as the fuzzers' retention-0 writers have;
@@ -768,7 +768,97 @@ Each stage keeps every suite and fuzzer green, and lands on the branch
 4. **The fuzzers and the measurements.** The commit-protocol fuzzers' split
    compaction, page faults and oracles; the catalog fuzzers with a small A;
    the ingest benchmark's paging mode, then a campaign; a havoc fuzz round and
-   a calibration.
+   a calibration. The fuzzers were built 2026-11-04:
+   - `CommitProtocol` (`TestMemoryCommitProtocol`,
+     `TestAtomicFileCommitProtocol`, 5,000 tries each, about 6 s): time is the
+     schedule's, each step advancing a clock by an amount drawn, and each
+     commit's stamp is drawn by region against the marks of the log as it
+     starts (the table above, plus `OLDEST`: just above the floor). A log may
+     be prefilled with 24 or 48 records stamped over the 100-200 ms before, so
+     its set spans blocks of 16. Runs that page do so at A of 0 or 100 ms and
+     T = 0. New steps: `SPLIT` (a compactor reads, puts the pages it would
+     seal) and `LAND` (its PageOuts land later, or it crashes after some or
+     none of them); `SWEEP` (`LogRuntime.sweep`, from a writer's replica,
+     however stale, or a fresh one); `LOOKUP` (`LogRuntime.committed` of any
+     id that landed, through such a replica). A commit's, compaction's, split's
+     and lookup's page requests meet faults: a put fails or lands with its
+     reply lost, a get fails or finds no page once or always, deletes and
+     listings fail (`LogHarness.PageFault`; on `AtomicFileLog`,
+     `InMemoryAtomicFileIO`'s new plain-request faults on `.committed/`). In
+     runs that page, a quarter of the commits have their read back preempted
+     by a whole compaction (on one object, by the next writer's commit), their
+     stamp in the oldest block and its page reads faulted more often (a quarter
+     fail, a quarter find no page), so a commit's id is paged after it applied
+     and before it learns so, and its lookup may not read the page.
+   - Its oracles, beside today's: a PageOut (a split's, or a copy) seals its
+     block if the block is still the oldest and not the newest, and changes
+     nothing else, else nothing at all (1); after every step the set is the
+     history's (2): the inline ids exactly those applied above F, the pages in
+     order in (H, F], each existing, holding the block its reference names and
+     exactly the ids applied above the floor it was sealed at (the page before
+     it's top, or H) through its top, every id applied in (H, F] in a page, and
+     the set's bytes those `CommittedSetCodec` encodes of its ids, marks and
+     pages; a sweep deletes exactly the unreferenced pages at or below the
+     floor of the replica it acted on (3), and a compaction the pages its GC
+     record dropped; at the drain a GC at the newest id applied and a sweep
+     leave no page (4); a lookup finds an id only if it applied, misses it
+     only if the replica had not applied it (nor ever will, at or below its
+     floor), and fails only after a page fault; the solo rule, already there;
+     and a commit is rejected `BEYOND_FLOOR` only if its stamp is A older than
+     some clock that compacted.
+   - Found: a page's node may reach below the floor it was sealed at, into
+     the nodes of the pages before it (after a PageOut the remaining blocks
+     merge into a parent): a page holds the ids above the page before it, not
+     every id in its node, as TLA+'s `(lo, top]` says. And `compact()` deleted
+     only the dropped pages that its first view's checkpoint named: a page a
+     PageOut after the checkpoint referenced, which the compaction's own GC
+     record dropped, stayed, an orphan below the floor until some later write
+     sealed or dropped a page and swept. The set's builder now lists the pages
+     the GC records it applies drop (`droppedPages`), and `compact()` deletes
+     those of both its replays (`TestSharedLogPaging`'s
+     `aCompactionDeletesAPageItsGcDropsThoughOnlyARecordNamesIt`).
+   - Calibrated by the stage-3 mutants and one more (`compact()` deleting only
+     the checkpoint's dropped pages): 13 of 15 caught. `newest` is unreachable
+     (no compactor proposes the newest block; `TestCommittedSetBlocks` forges
+     one), as is `floorgap` in the built set (replay admits through the set's
+     builder, where `floorgapB` is caught). `mintH` is caught by the solo rule
+     the TLA+ matrix asked of the shared log's fuzzers, `absentpage` only once
+     read backs were preempted and their page reads faulted as above, and
+     `noadmission` only at A = 100 ms with the `BEYOND_FLOOR` rule (at 30 ms no
+     block but the newest has its top within A). `nodigest` is caught on one
+     object too, as the fuzzer lands PageOuts as records there (a split's, or a
+     copy), which the protocol does not.
+   - The catalog fuzzers: blocks hold at most 4 ids in the catalog module
+     (surefire; 16 elsewhere), since a catalog in a test holds a few dozen.
+     `CheckpointRoundTrip` checks the newest version of each catalog file and
+     every shared log for the pages its set references (`assertPagesExist`,
+     `pagesProblem`: each exists, belongs to the log, holds the block its
+     reference names, its ids in order in (H, F]). `TestCatalogFaultProperties`
+     draws writers that page (A = 0, T = 0) and writers' clocks off by -300 to
+     +300 ms or 100 s ahead (`LogCatalog.clock`, package-private), and its read
+     faults reach page reads; `TestCatalogRaceProperties` draws paging (with GC:
+     the racers page and A drops their pages) and clock offsets, its setup's
+     clock a minute behind and filler commits, so a racer seals the setup's
+     blocks before A writes. Runs that wrote a PageOut: 14-22% of the fault
+     fuzzer's (1% at blocks of 16, 19-29% at blocks of 2, which slows it by half:
+     a run pages only when a writer that pages, keeps ids and compacts commits)
+     and 12% of the race's (2.5% before the setup's clock and filler). At the
+     suite's tries (100 per fault property, 1,000 races) the catalog fuzzers
+     catch `mintH` (`CheckpointRoundTrip`: a CAS by a writer whose clock is
+     behind, its own record minted at or below the floor of the version it read,
+     holds on its checkpoint and is rejected, Bug 64's check), and miss
+     `sweepabove`,
+     `pageown`, `absentpage`, `missingfail`, `nodelete`, `nodroppedreplay` and
+     `nodigest`, which need two writers that page racing, or a commit's lookup
+     through a page; the commit-protocol fuzzers catch each. The havoc round
+     runs them far longer.
+   - `LatencyFileIO` lists (a LIST at a read's latency, counted as catalog-bench
+     bench-core's `Requests.lists`), so the contention benchmark sweeps.
+     catalog-bench's `TieredFileIO` does not classify pages: a FileIOCatalog
+     there fails each page put, logs it, and never pages.
+   - The ingest benchmark's `committed` = `page` pages as the runtime does after
+     each compaction's GC (`admission_s`, `page_threshold_bytes`); campaign
+     `i11-paging` (keep, page, discard at 1,000 a second's steady state).
 
 ## Alternatives considered
 

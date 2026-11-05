@@ -1281,6 +1281,8 @@ public final class CommittedSet {
   public static final class Builder {
     private CommittedSet base;
     private final Set<UUID> added = new HashSet<>();
+    // The pages GC records applied to this builder dropped, oldest first
+    private List<PageRef> dropped = List.of();
 
     private Builder(CommittedSet base) {
       this.base = base;
@@ -1343,10 +1345,25 @@ public final class CommittedSet {
         throw new IllegalArgumentException("watermarkMs must be >= 0, got " + watermarkMs);
       }
       if (watermarkMs > 0L) {
-        this.base = build().dropThrough(watermarkMs);
+        CommittedSet before = build();
+        this.base = before.dropThrough(watermarkMs);
         added.clear();
+        int gone = before.pages.length - base.pages.length;
+        if (gone > 0) {
+          List<PageRef> more = new ArrayList<>(dropped);
+          more.addAll(Arrays.asList(before.pages).subList(0, gone));
+          dropped = more;
+        }
       }
       return this;
+    }
+
+    /**
+     * The pages that the GC records applied to this builder ({@link #advanceHorizon}) dropped,
+     * oldest first: those a compactor that read them deletes.
+     */
+    public List<PageRef> droppedPages() {
+      return Collections.unmodifiableList(dropped);
     }
 
     public CommittedSet build() {

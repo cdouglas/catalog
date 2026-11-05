@@ -33,7 +33,7 @@ import org.intentlog.testkit.EntityVersionsMachine;
  */
 class TestMemoryCommitProtocol {
 
-  @Property(tries = 2000)
+  @Property(tries = 5000)
   void commitsAreHonestAndCopiesNeverApply(
       @ForAll boolean conditional,
       @ForAll("settings") CommitProtocol.Settings settings,

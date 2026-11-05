@@ -18,10 +18,13 @@
  */
 package org.intentlog.memory;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.intentlog.CommittedSet;
 import org.intentlog.Intention;
 import org.intentlog.Replay;
@@ -70,6 +73,29 @@ public final class MemoryLogHarness implements LogHarness {
             return ReadShape.NORMAL;
         }
       }
+
+      @Override
+      public InMemorySharedLog.PageFault beforePage(Request request, String name) {
+        if (hooks == null) {
+          return InMemorySharedLog.PageFault.NONE;
+        }
+        PageRequest page;
+        switch (request) {
+          case PUT_PAGE:
+            page = PageRequest.PUT;
+            break;
+          case GET_PAGE:
+            page = PageRequest.GET;
+            break;
+          case DELETE_PAGE:
+            page = PageRequest.DELETE;
+            break;
+          default:
+            page = PageRequest.LIST;
+            break;
+        }
+        return InMemorySharedLog.PageFault.valueOf(hooks.beforePage(page, name).name());
+      }
     });
   }
 
@@ -94,13 +120,13 @@ public final class MemoryLogHarness implements LogHarness {
 
   @Override
   public List<byte[]> landedRecords() {
-    List<byte[]> intentions = new ArrayList<>();
+    Set<ByteBuffer> seen = new LinkedHashSet<>();
     for (byte[] record : log.records()) {
-      if (LogEnvelope.decodeRecord(record).isIntention()) {
-        intentions.add(record);
-      }
+      seen.add(ByteBuffer.wrap(record));
     }
-    return intentions;
+    List<byte[]> records = new ArrayList<>();
+    seen.forEach(b -> records.add(b.array()));
+    return records;
   }
 
   @Override
@@ -112,6 +138,11 @@ public final class MemoryLogHarness implements LogHarness {
     } finally {
       hooks = was;
     }
+  }
+
+  @Override
+  public Map<String, byte[]> storedPages() {
+    return log.storedPages();
   }
 
   @Override

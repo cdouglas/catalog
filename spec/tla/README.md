@@ -824,6 +824,18 @@ The shared log's fuzzers need the solo rule that `OracleMW2` gave the
 multi-writer test: a commit that no record raced, on a log that did not fail,
 commits.
 
+In Java (stage 4, 2026-11-04; docs/COMMITTED_PAGING.md "Order of work"):
+`CommitProtocol` checks `PagesOK` and more after every step, against the
+history (the set's inline ids, its pages' contents, and its bytes); it already
+had the solo rule, which catches `mintH` on both providers once stamps are
+drawn below the floor. It catches `nodigest` on one object too, since it lands
+a split's PageOuts and copies of PageOuts as records there, which the protocol
+does not. The catalog fuzzers check `PagesExist` (and each page's shape, not
+`PagesExact`, which needs the history) on the newest catalog file and shared
+log (`CheckpointRoundTrip.assertPagesExist`), and the race property's
+schedules page: its setup's ids are older, in blocks a racer seals before A
+writes.
+
 ## History
 
 This replaces `FileIOCatalog.tla` (PR #1; last changed 2026-10-14 for Bug 10). It

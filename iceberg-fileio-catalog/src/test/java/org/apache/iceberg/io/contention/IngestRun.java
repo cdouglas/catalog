@@ -60,6 +60,12 @@ import org.intentlog.wire.UuidV7;
  * retention_s}, then the checkpoint encoded, measured and discarded; every {@code decode_every}-th
  * one is also decoded, as a reader that starts from it would (timed apart from the ingest).
  *
+ * <p>With {@code committed} = {@code page}, each compaction also pages the committed set, after its
+ * GC record, as the runtime does (docs/COMMITTED_PAGING.md): the oldest blocks older than {@code
+ * admission_s} before its last record, while the inline set is larger than {@code
+ * page_threshold_bytes}; their pages are encoded and discarded (no store), and replay rejects ids
+ * at or below the floor they raise.
+ *
  * <p>With {@code prefill}, the committed set starts as it is at steady state for the rate: {@code
  * rate} x {@code retention_s} ids, spread over the retention window before the log's first record,
  * which the run's GC records then age out. The measured pass stops after {@code max_ingest_s} of
@@ -111,8 +117,14 @@ final class IngestRun {
           + "\"prefill\": false,"
           // keep: the committed set as the catalog keeps it; discard: no ids kept (replay dedups
           // within a batch only) and checkpoints carry none, what the set costs: a bound for
-          // keeping it out of the checkpoint and the replica
+          // keeping it out of the checkpoint and the replica; page: as kept, each compaction
+          // paging its oldest blocks older than admission_s while the inline set is larger than
+          // page_threshold_bytes (docs/COMMITTED_PAGING.md), the pages encoded and discarded
           + "\"committed\": \"keep\","
+          // the admission window A (fileio.catalog.committed.admission.ms: 5 min) and threshold T
+          // (fileio.catalog.committed.page.threshold: 1 MiB) of committed = page
+          + "\"admission_s\": 300,"
+          + "\"page_threshold_bytes\": 1048576,"
           // stop the measured pass after this much ingest time (the windows say how far it got)
           + "\"max_ingest_s\": 300"
           + "}";
@@ -186,10 +198,14 @@ final class IngestRun {
 
   private boolean discard() {
     String committed = config.string("committed");
-    if (!committed.equals("keep") && !committed.equals("discard")) {
-      throw new IllegalArgumentException("committed is keep or discard, not " + committed);
+    if (!committed.equals("keep") && !committed.equals("discard") && !committed.equals("page")) {
+      throw new IllegalArgumentException("committed is keep, discard or page, not " + committed);
     }
     return committed.equals("discard");
+  }
+
+  private boolean paging() {
+    return !discard() && config.string("committed").equals("page");
   }
 
   /**
@@ -332,6 +348,9 @@ final class IngestRun {
     int window = config.integer("window");
     int decodeEvery = config.integer("decode_every");
     long retentionMs = 1000L * config.longValue("retention_s");
+    boolean paging = paging();
+    long admissionMs = (long) (1000 * config.number("admission_s"));
+    long threshold = config.longValue("page_threshold_bytes");
 
     LogEnvelope.Checkpoint envelope = LogEnvelope.decodeCheckpoint(checkpoint);
     UUID logId = envelope.logId();
@@ -381,10 +400,23 @@ final class IngestRun {
 
       if (compactEvery > 0 && sinceCompaction >= compactEvery) {
         long c0 = System.nanoTime();
-        long watermark =
-            UuidV7.timestampMs(LogEnvelope.decodeRecord(records.get(end - 1)).id()) - retentionMs;
+        long last = UuidV7.timestampMs(LogEnvelope.decodeRecord(records.get(end - 1)).id());
+        long watermark = last - retentionMs;
         if (watermark > 0 && !discard) {
           committed = committed.toBuilder().advanceHorizon(watermark).build();
+        }
+        // As a compactor pages after its GC: the oldest blocks older than A, while the inline set
+        // is larger than T, each page's body encoded (a compactor puts it) and discarded
+        int sealed = 0;
+        long pageBytes = 0;
+        while (paging && committed.inlineBytes() > threshold) {
+          CommittedSet.Seal seal = committed.sealable(last - admissionMs);
+          if (seal == null) {
+            break;
+          }
+          pageBytes += seal.page(logId).length;
+          committed = committed.pagedOut(seal.record());
+          sealed++;
         }
         byte[] stateBytes = machine.encodeCheckpoint(state);
         byte[] encoded = LogEnvelope.encodeCheckpoint(logId, committed.bytes(), stateBytes);
@@ -396,6 +428,12 @@ final class IngestRun {
           row.put("position", end);
           row.put("checkpoint_bytes", encoded.length);
           row.put("committed_bytes", committed.encodedSize());
+          if (paging) {
+            row.put("pages_sealed", sealed);
+            row.put("page_bytes", pageBytes);
+            row.put("pages", committed.pages().size());
+            row.put("inline_ids_bytes", committed.inlineBytes());
+          }
           row.put("state_bytes", stateBytes.length);
           ContentionAccess.checkpointSizes(stateBytes).forEach(row::put);
           row.put("tail_records", sinceCompaction);

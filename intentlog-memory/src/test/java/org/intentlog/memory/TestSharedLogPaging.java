@@ -379,6 +379,29 @@ class TestSharedLogPaging {
         .isInstanceOf(DedupHorizonExceededException.class);
   }
 
+  /**
+   * A page that only a PageOut after the checkpoint references (another compactor's, which has not
+   * checkpointed yet) is deleted by the compaction whose GC record drops it: the pages it deletes
+   * are those its replay saw a GC record drop, not those its checkpoint named (found by
+   * CommitProtocol's oracle that a compaction deletes the pages its GC record dropped).
+   */
+  @Test
+  void aCompactionDeletesAPageItsGcDropsThoughOnlyARecordNamesIt() {
+    commits(T0, 40, "t");
+    Replica<State> before = writer.read();
+    CommittedSet.Seal seal = before.committed().sealable(T0 + 10_000L);
+    assertThat(seal).isNotNull();
+    // Another compactor's first half: the page put, its PageOut appended, no checkpoint yet
+    log.pages().put(seal.name(), seal.page(before.logId()));
+    log.append(LogEnvelope.encodePageOut(seal.record()), null);
+    assertThat(writer.read().committed().pages()).containsExactly(seal.ref());
+    assertThat(LogEnvelope.decodeCheckpoint(log.checkpoints().get(0L)).committed())
+        .as("the checkpoint names no page").isEqualTo(CommittedSet.EMPTY.bytes());
+    Replica<State> gc = compactAt(T0 + 10_000L + HOUR, HOUR);
+    assertThat(gc.committed().pages()).isEmpty();
+    assertThat(log.storedPages()).isEmpty();
+  }
+
   @Test
   void aGcRecordKeepsAPageThatStraddlesItsWatermark() {
     Replica<State> r = paged();

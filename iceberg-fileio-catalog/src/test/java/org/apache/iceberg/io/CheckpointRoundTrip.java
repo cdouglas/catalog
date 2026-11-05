@@ -33,7 +33,9 @@ import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 import java.util.zip.CRC32;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.Snapshot;
@@ -45,7 +47,10 @@ import org.intentlog.PagedOutException;
 import org.intentlog.Replica;
 import org.intentlog.fileio.AtomicFileLog;
 import org.intentlog.memory.InMemorySharedLog;
+import org.intentlog.wire.CommittedSetCodec;
 import org.intentlog.wire.LogEnvelope;
+import org.intentlog.wire.PageRef;
+import org.intentlog.wire.UuidV7;
 
 /**
  * The checkpoint round trip: the state a reader replays from a catalog file is the state it
@@ -65,6 +70,10 @@ import org.intentlog.wire.LogEnvelope;
  * on the checkpoint, replay applies it. A compaction keeps its GC record's watermark below its
  * own record; Bug 64 was a compaction whose horizon reached its record, so replay rejected the
  * commit it had just written.
+ *
+ * <p>And the pages the newest catalog file's committed set references are in its page store, as
+ * the set says ({@link #pagesProblem}): replay never reads a page, so nothing else sees one that a
+ * sweep deleted while in use (spec/tla/README.md, "The oracles, with paging").
  */
 public final class CheckpointRoundTrip {
   private static final int MAX_REPORTED = 4;
@@ -76,7 +85,8 @@ public final class CheckpointRoundTrip {
 
   /**
    * Fails if a catalog file written to {@code io} differs from a checkpoint of it, or a
-   * compaction's checkpoint differs from a replay of the version it replaced.
+   * compaction's checkpoint differs from a replay of the version it replaced, or the newest
+   * references a page its page store lacks ({@link #assertPagesExist}).
    */
   public static void assertEveryWrite(InMemoryAtomicFileIO io) {
     List<InMemoryAtomicFileIO.Write> history = io.history();
@@ -90,11 +100,75 @@ public final class CheckpointRoundTrip {
                 i, write.strategy(), write.location(), difference));
       }
     }
+    assertPagesExist(io);
+  }
+
+  /**
+   * Fails if the newest version of a catalog file in {@code io} references a page that its page
+   * store ({@code <location>.committed/}) lacks, or that is not as the reference says ({@link
+   * #pagesProblem}). Only the newest: a GC record drops a page from the set before its compactor
+   * deletes it, so older versions may name pages that are rightly gone.
+   */
+  public static void assertPagesExist(InMemoryAtomicFileIO io) {
+    for (String location : io.conditionalWrites().keySet()) {
+      byte[] file = io.bytes(location);
+      if (file == null) {
+        continue;
+      }
+      String problem = pagesProblem(CatalogTestSupport.replay(file),
+          name -> io.bytes(location + ".committed/" + name));
+      if (problem != null) {
+        throw new AssertionError("the committed set of " + location + ": " + problem);
+      }
+    }
+  }
+
+  /**
+   * Why the pages the committed set of {@code replica} references are not as it says, or null if
+   * they are: each exists ({@code pages} by name; TLA+ PagesExist), belongs to the replica's log,
+   * holds the block its reference names (its node, count and digest), and holds only ids above the
+   * floor it was sealed at (the page before it's top, or the horizon) and at or below its top, in
+   * (H, F] (the shape of PagesExact, which needs the history to check whole).
+   */
+  static String pagesProblem(Replica<CatalogState> replica, Function<String, byte[]> pages) {
+    CommittedSet set = replica.committed();
+    long below = set.horizon();
+    for (PageRef ref : set.pages()) {
+      String name = ref.name();
+      if (ref.top() <= below || ref.top() > set.floor()) {
+        return String.format("page %s ends outside (%d, %d], after the pages before it and at or"
+            + " below the floor", name, below, set.floor());
+      }
+      byte[] body = pages.apply(name);
+      if (body == null) {
+        return "page " + name + ", which the committed set references, does not exist";
+      }
+      LogEnvelope.Page page = LogEnvelope.decodePage(body);
+      if (!page.logId().equals(replica.logId()) || page.level() != ref.level()
+          || page.index() != ref.index() || !ref.hasDigest(page.digest())) {
+        return "page " + name + " does not hold the block its reference names";
+      }
+      List<UUID> entries =
+          CommittedSetCodec.decodeEntries(ref.level(), ref.index(), page.packedEntries());
+      if (entries.size() != ref.count()) {
+        return String.format("page %s holds %d ids, its reference %d", name, entries.size(),
+            ref.count());
+      }
+      for (UUID id : entries) {
+        long ts = UuidV7.timestampMs(id);
+        if (ts <= below || ts > ref.top()) {
+          return String.format("page %s holds %s, outside (%d, %d]", name, id, below, ref.top());
+        }
+      }
+      below = ref.top();
+    }
+    return null;
   }
 
   /**
    * Fails if a checkpoint {@code log} stores is not the replay of the log through its position
-   * (I11), or the log, as a catalog file, differs from a checkpoint of it.
+   * (I11), or the log, as a catalog file, differs from a checkpoint of it, or references a page
+   * the log's page store lacks ({@link #pagesProblem}).
    */
   public static void assertEveryCheckpoint(InMemorySharedLog log) {
     if (log.checkpoints().isEmpty()) {
@@ -106,6 +180,12 @@ public final class CheckpointRoundTrip {
     String whole = difference(AtomicFileLog.encode(first, records));
     if (whole != null) {
       violations.add("the log: " + whole);
+    }
+    Map<String, byte[]> stored = log.storedPages();
+    String pages = pagesProblem(
+        CatalogTestSupport.replay(AtomicFileLog.encode(first, records)), stored::get);
+    if (pages != null) {
+      violations.add("the log's committed set: " + pages);
     }
     for (Map.Entry<Long, byte[]> c : log.checkpoints().entrySet()) {
       if (c.getKey() > 0L) {

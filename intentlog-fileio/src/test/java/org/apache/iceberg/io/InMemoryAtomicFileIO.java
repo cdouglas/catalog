@@ -94,6 +94,25 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
     Fault next(String location, AtomicOutputFile.Strategy strategy);
   }
 
+  /** A request that is not conditional, as plain-request faults see it. */
+  public enum PlainRequest {
+    /** The write of an object through {@link #newOutputFile(String)}, as its stream closes. */
+    PUT,
+    DELETE,
+    LIST
+  }
+
+  /**
+   * Chooses the fault of each plain request: {@link Fault#FAIL_BEFORE} fails it without effect,
+   * and {@link Fault#LOST_REPLY} lets a put or delete land and then fails it (a listing fails);
+   * other faults act as {@link Fault#NONE}. It is called as the request is issued, and holds no
+   * lock.
+   */
+  @FunctionalInterface
+  public interface PlainFaults {
+    Fault next(PlainRequest request, String location);
+  }
+
   /** How a read request fails, if it does. */
   public enum ReadFault {
     NONE,
@@ -173,6 +192,7 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
   private volatile Faults faults = (location, strategy) -> Fault.NONE;
   private final Map<Fault, Integer> injected = Maps.newEnumMap(Fault.class);
   private volatile ReadFaults readFaults = location -> ReadFault.NONE;
+  private volatile PlainFaults plainFaults = (request, location) -> Fault.NONE;
   private volatile boolean failSupersededReads = false;
   private volatile int maxSegments = 0;
   private volatile Supplier<RuntimeException> segmentLimitError = null;
@@ -272,20 +292,41 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
   }
 
   @Override
-  public synchronized void deleteFile(String location) {
-    objects.remove(location);
+  public void deleteFile(String location) {
+    Fault fault = plainFaults.next(PlainRequest.DELETE, location);
+    failPlain(fault == Fault.LOST_REPLY ? Fault.NONE : fault, PlainRequest.DELETE, location);
+    synchronized (this) {
+      objects.remove(location);
+    }
+    failPlain(fault == Fault.LOST_REPLY ? fault : Fault.NONE, PlainRequest.DELETE, location);
   }
 
   /** The objects whose locations start with {@code prefix}, as a listing finds them now. */
   @Override
-  public synchronized Iterable<FileInfo> listPrefix(String prefix) {
+  public Iterable<FileInfo> listPrefix(String prefix) {
+    Fault fault = plainFaults.next(PlainRequest.LIST, prefix);
+    failPlain(fault == Fault.LOST_REPLY ? Fault.FAIL_BEFORE : fault, PlainRequest.LIST, prefix);
     List<FileInfo> found = new ArrayList<>();
-    for (Map.Entry<String, Version> entry : new java.util.TreeMap<>(objects).entrySet()) {
-      if (entry.getKey().startsWith(prefix)) {
-        found.add(new FileInfo(entry.getKey(), entry.getValue().bytes.length, 0L));
+    synchronized (this) {
+      for (Map.Entry<String, Version> entry : new java.util.TreeMap<>(objects).entrySet()) {
+        if (entry.getKey().startsWith(prefix)) {
+          found.add(new FileInfo(entry.getKey(), entry.getValue().bytes.length, 0L));
+        }
       }
     }
     return found;
+  }
+
+  /** Throws for a plain request that {@code fault} fails now: before it lands, or after. */
+  private void failPlain(Fault fault, PlainRequest request, String location) {
+    if (fault != Fault.FAIL_BEFORE && fault != Fault.LOST_REPLY) {
+      return;
+    }
+    synchronized (this) {
+      injected.merge(fault, 1, Integer::sum);
+    }
+    throw new UncheckedIOException(new IOException("injected: " + request + " of " + location
+        + (fault == Fault.LOST_REPLY ? " landed; its reply was lost" : " failed")));
   }
 
   @Override
@@ -347,6 +388,11 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
     return appendByteLimit;
   }
 
+  /** Fails plain requests as {@code plan} chooses; {@link Fault#NONE} for all by default. */
+  public void injectPlainFaults(PlainFaults plan) {
+    this.plainFaults = plan;
+  }
+
   /** Fails read requests as {@code plan} chooses; {@link ReadFault#NONE} for all by default. */
   public void injectReadFaults(ReadFaults plan) {
     this.readFaults = plan;
@@ -370,6 +416,15 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
 
   private static UncheckedIOException readFailure(String location) {
     return new UncheckedIOException(new IOException("injected: read of " + location + " failed"));
+  }
+
+  /**
+   * The bytes the object at {@code location} holds now, or null if there is none: for oracles,
+   * read without a request, so no fault or hook sees it.
+   */
+  public byte[] bytes(String location) {
+    Version v = objects.get(location);
+    return v == null ? null : v.bytes.clone();
   }
 
   /** Number of objects currently stored. */
@@ -777,7 +832,14 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
       if (!closed) {
         closed = true;
         super.close();
+        Fault fault = plainFaults.next(PlainRequest.PUT, location);
+        if (fault == Fault.FAIL_BEFORE) {
+          failPlain(fault, PlainRequest.PUT, location);
+        }
         put(location, buf.toByteArray());
+        if (fault == Fault.LOST_REPLY) {
+          failPlain(fault, PlainRequest.PUT, location);
+        }
       }
     }
   }

@@ -24,6 +24,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -181,8 +182,12 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     } else {
       view = log.read();
     }
-    LogView first = view;
-    Replica<S> through = replay(view, null).replica();
+    // The pages the GC records this compactor folds drop, its own among them: whether the
+    // checkpoint names them or a PageOut after it does, they leave the set there for good
+    Set<PageRef> dropped = new LinkedHashSet<>();
+    Replayed replayed = replay(view, null);
+    dropped.addAll(replayed.result.committed().droppedPages());
+    Replica<S> through = replayed.replica();
     List<CommittedSet.Seal> seals =
         page(through.committed(), pageCeiling(now, Long.MAX_VALUE), through.logId());
     if (!seals.isEmpty()) {
@@ -192,18 +197,13 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
         last = sendThrottled(() -> log.append(pageOut, null));
       }
       view = log.readThrough(last, config.visibilityWait());
-      through = replay(view, null, null, through).replica();
+      replayed = replay(view, null, null, through);
+      dropped.addAll(replayed.result.committed().droppedPages());
+      through = replayed.replica();
     }
     log.putCheckpoint(view.tail(), checkpoint(through));
     log.trim(view.tail());
-    if (log.pages() != null) {
-      // A page leaves the set only by a GC record, so one the first view's checkpoint names and the
-      // replica does not was dropped by one that has landed
-      List<PageRef> before = first.checkpoint()
-          .map(c -> CommittedSet.of(LogEnvelope.decodeCheckpoint(c).committed()).pages())
-          .orElse(List.of());
-      tidyPages(dropped(before, through.committed()), !seals.isEmpty(), through.committed());
-    }
+    tidyPages(new ArrayList<>(dropped), !seals.isEmpty(), through.committed());
     return through;
   }
 
@@ -396,6 +396,24 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
           replica = read(replica);
         }
       }
+    }
+  }
+
+  /**
+   * Deletes the orphaned pages of the log as {@code replica} holds it: each page in the log's page
+   * store that its committed set does not reference and whose node ends at or below its floor
+   * (docs/COMMITTED_PAGING.md "Orphans"). Safe from any replica, however stale: a PageOut that
+   * lands later seals a block above the floor where it lands, so its page ends above the floor of
+   * every replica before it. The runtime sweeps after each write that sealed or dropped a page;
+   * this is for a maintenance job, or a test. Does nothing if the log stores no pages, or its
+   * store cannot list them.
+   *
+   * @throws RuntimeException if listing or deleting a page failed
+   */
+  public void sweep(Replica<S> replica) {
+    PageStore store = log.pages();
+    if (store != null) {
+      sweep(store, replica.committed());
     }
   }
 

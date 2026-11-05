@@ -27,12 +27,14 @@ import java.util.concurrent.locks.LockSupport;
 import java.util.function.Supplier;
 import org.apache.iceberg.io.AtomicOutputFile;
 import org.apache.iceberg.io.CAS;
+import org.apache.iceberg.io.FileInfo;
 import org.apache.iceberg.io.InMemoryAtomicFileIO;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.io.PositionOutputStream;
 import org.apache.iceberg.io.SeekableInputStream;
 import org.apache.iceberg.io.SupportsAtomicOperations;
+import org.apache.iceberg.io.SupportsPrefixOperations;
 
 /**
  * An {@link InMemoryAtomicFileIO} whose requests take a store's latency ({@link StoreProfile}),
@@ -40,12 +42,14 @@ import org.apache.iceberg.io.SupportsAtomicOperations;
  *
  * <p>A request is: binding an input file (a HEAD: {@code exists} or {@code getLength} of an unbound
  * file), each {@code newStream} (a GET of the whole object), each plain write (a PUT, on close),
- * each conditional write, and each delete. A GET and a conditional write take effect halfway
+ * each conditional write, each delete, and each listing of a prefix (a LIST, at a read's latency:
+ * endive's profiles have none of their own; fileio-catalog lists only to sweep its committed set's
+ * orphaned pages). A GET and a conditional write take effect halfway
  * through their latency, as endive's simulator splits them: the request reaches the store, the
  * store reads its state or checks the condition, and the reply comes back. A conditional append
  * that loses its race takes the store's failure latency in all.
  */
-public final class LatencyFileIO implements SupportsAtomicOperations {
+public final class LatencyFileIO implements SupportsAtomicOperations, SupportsPrefixOperations {
 
   private final InMemoryAtomicFileIO store;
   private final StoreProfile profile;
@@ -121,6 +125,22 @@ public final class LatencyFileIO implements SupportsAtomicOperations {
     Requests.mine().deletes++;
     await(profile.writeMs(0, random()));
     store.deleteFile(location);
+  }
+
+  /** One LIST request, at the latency of a read of nothing. */
+  @Override
+  public Iterable<FileInfo> listPrefix(String prefix) {
+    Requests.mine().lists++;
+    await(profile.readMs(0, random()));
+    return store.listPrefix(prefix);
+  }
+
+  /** A listing, then a delete of each object it found. */
+  @Override
+  public void deletePrefix(String prefix) {
+    for (FileInfo file : listPrefix(prefix)) {
+      deleteFile(file.location());
+    }
   }
 
   private final class TimedInputFile implements InputFile {

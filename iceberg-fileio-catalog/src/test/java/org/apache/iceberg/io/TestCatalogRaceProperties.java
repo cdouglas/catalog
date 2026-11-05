@@ -37,6 +37,7 @@ import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
 import org.apache.iceberg.types.Types;
+import org.intentlog.fileio.AtomicFileLog;
 import org.intentlog.memory.InMemorySharedLog;
 import org.intentlog.wire.LogEnvelope;
 
@@ -99,6 +100,8 @@ class TestCatalogRaceProperties {
       @ForAll("ops") Op b,
       @ForAll("maybeOps") Op c,
       @ForAll boolean gc,
+      @ForAll boolean paging,
+      @ForAll("clockOffsets") List<Long> clockOffsets,
       @ForAll("encodings") String encoding) {
     // The writers' modes on one catalog object, or on a shared log with the same table metadata
     // storage.
@@ -109,20 +112,43 @@ class TestCatalogRaceProperties {
     Statistics.label("log").collect(sharedLog ? "shared log" : "one object");
     List<Op> racers = c.kind == null ? List.of(b) : List.of(b, c);
     List<LocalCatalogMode> racerModes = List.of(modeB, modeC);
-    // With gc, each CAS drops every committed transaction id older than its own (Bug 64).
-    Map<String, String> props =
-        gc ? Map.of(LogCatalogProperties.COMMITTED_RETENTION_MS, "0") : Map.of();
+    // With gc, each CAS drops every committed transaction id older than its own (Bug 64). With
+    // paging, each compaction pages every block of the committed set below its own id but the
+    // newest (an admission window and threshold of 0). A writer at a retention of 0 drops all it
+    // would page, so with both the racers page and A drops their pages.
+    Map<String, String> props = new java.util.HashMap<>();
+    Map<String, String> propsA = new java.util.HashMap<>();
+    if (gc) {
+      propsA.put(LogCatalogProperties.COMMITTED_RETENTION_MS, "0");
+      if (!paging) {
+        props.put(LogCatalogProperties.COMMITTED_RETENTION_MS, "0");
+      }
+    }
+    if (paging) {
+      props.put(LogCatalogProperties.COMMITTED_ADMISSION_MS, "0");
+      props.put(LogCatalogProperties.COMMITTED_PAGE_THRESHOLD, "0");
+      if (!gc) {
+        propsA.putAll(props);
+      }
+    }
     Statistics.label("gc").collect(gc);
+    Statistics.label("paging").collect(paging);
+    Statistics.label("clocks off").collect(clockOffsets.stream().anyMatch(o -> o != 0));
 
     // The race: the k-th racer runs just before A's k-th write to the catalog.
     InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
-    // The setup creates the catalog, with the encoding its log keeps.
-    setup.apply(
-        base.catalog(io, WAREHOUSE, "c", Map.of(LogCatalogProperties.CONFLICT_ENCODING, encoding)));
+    // The setup creates the catalog, with the encoding its log keeps. Its clock reads a minute
+    // ago, 5 ms later at each reading: its ids are older than the race's, in blocks of their own
+    // that a writer that pages seals in the race.
+    long[] past = {System.currentTimeMillis() - 60_000L};
+    setup.apply(base.catalog(io, WAREHOUSE, "c",
+        Map.of(LogCatalogProperties.CONFLICT_ENCODING, encoding), () -> past[0] += 5));
     Statistics.label("encoding").collect(encoding);
-    LogCatalog writerA = modeA.catalog(io, WAREHOUSE, "c", props);
+    // In the race, each writer's clock is off as drawn: its commits may be retried, but end alike
+    LogCatalog writerA = modeA.catalog(io, WAREHOUSE, "c", propsA, clock(clockOffsets.get(0)));
     List<LogCatalog> writers = List.of(
-        modeB.catalog(io, WAREHOUSE, "c", props), modeC.catalog(io, WAREHOUSE, "c", props));
+        modeB.catalog(io, WAREHOUSE, "c", props, clock(clockOffsets.get(1))),
+        modeC.catalog(io, WAREHOUSE, "c", props, clock(clockOffsets.get(2))));
     String[] results = new String[racers.size()];
     int[] writes = {0};
     boolean[] nested = {false};
@@ -238,7 +264,8 @@ class TestCatalogRaceProperties {
     Statistics.label("racers before A's writes").collect(before + " of " + racers.size());
     Statistics.label("A").collect(a.kind + " " + (raceA.startsWith("ok") ? "ok" : "fails"));
     StringBuilder context = new StringBuilder(
-        String.format("%nsetup %s%s%nA (%s): %s", setup, gc ? ", gc" : "", modeA, a));
+        String.format("%nsetup %s%s%s, clocks off by %s ms%nA (%s): %s", setup, gc ? ", gc" : "",
+            paging ? ", paging" : "", clockOffsets, modeA, a));
     for (int k = 0; k < racers.size(); k++) {
       context.append(String.format("%n%s (%s): %s, %s", name(k), racerModes.get(k),
           racers.get(k), k < before ? "just before A's write #" + k : "after A"));
@@ -260,6 +287,38 @@ class TestCatalogRaceProperties {
     if (log != null) {
       CheckpointRoundTrip.assertEveryCheckpoint(log);
     }
+    Statistics.label("PageOut records").collect(pageOuts(io, log) > 0);
+  }
+
+  /** A clock off the system's by {@code offsetMs}; null (the system's) if it is not off. */
+  private static java.util.function.LongSupplier clock(long offsetMs) {
+    return offsetMs == 0 ? null : () -> System.currentTimeMillis() + offsetMs;
+  }
+
+  /**
+   * How far each writer's clock is off, in ms: mostly not at all; a few ms or a few hundred behind
+   * or ahead, so its ids land in older blocks or below a floor others raised; or far ahead of
+   * every clock (errata D21).
+   */
+  @Provide
+  Arbitrary<List<Long>> clockOffsets() {
+    return Arbitraries.of(0L, 0L, 0L, 0L, -3L, -300L, 3L, 300L, 100_000L).list().ofSize(3);
+  }
+
+  /** The PageOut records the catalog's log ever held. */
+  private static long pageOuts(InMemoryAtomicFileIO io, InMemorySharedLog log) {
+    List<byte[]> records = new java.util.ArrayList<>();
+    if (log != null) {
+      records.addAll(log.records());
+    } else {
+      for (InMemoryAtomicFileIO.Write write : io.history()) {
+        if (write.location().equals(CATALOG)) {
+          records.addAll(AtomicFileLog.decode(write.after()).records());
+        }
+      }
+    }
+    return records.stream().map(java.nio.ByteBuffer::wrap).distinct()
+        .filter(b -> LogEnvelope.decodeRecord(b.array()).isPageOut()).count();
   }
 
   /**
@@ -303,7 +362,8 @@ class TestCatalogRaceProperties {
     return Combinators.combine(
             Arbitraries.integers().between(0, 7),
             Arbitraries.integers().between(0, 7),
-            Arbitraries.integers().between(0, 15))
+            Arbitraries.integers().between(0, 15),
+            Arbitraries.of(2, 4, 6))
         .as(Setup::new);
   }
 
@@ -322,19 +382,30 @@ class TestCatalogRaceProperties {
     return Arbitraries.oneOf(ops(), Arbitraries.just(new Op(null, 0, 0)));
   }
 
-  /** The namespaces in bitmask {@code namespaces}, those in {@code props} with k1, and tables. */
+  /**
+   * The namespaces in bitmask {@code namespaces}, those in {@code props} with k1, and tables; after
+   * {@code filler} commits that leave nothing (a namespace outside the operations' names created
+   * and dropped), so that the committed set holds enough ids for blocks to seal.
+   */
   static final class Setup {
     final int namespaces;
     final int props;
     final int tables;
+    final int filler;
 
-    Setup(int namespaces, int props, int tables) {
+    Setup(int namespaces, int props, int tables, int filler) {
       this.namespaces = namespaces;
       this.props = props;
       this.tables = tables;
+      this.filler = filler;
     }
 
     void apply(LogCatalog catalog) {
+      for (int i = 0; i < filler / 2; i++) {
+        Namespace scratch = Namespace.of("filler" + i);
+        catalog.createNamespace(scratch);
+        catalog.dropNamespace(scratch);
+      }
       for (int i = 0; i < NAMESPACES.size(); i++) {
         Namespace ns = NAMESPACES.get(i);
         if ((namespaces >> i & 1) == 1 && !catalog.namespaceExists(ns)) {

@@ -34,7 +34,7 @@ import org.intentlog.testkit.EntityVersionsMachine;
  */
 class TestAtomicFileCommitProtocol {
 
-  @Property(tries = 2000)
+  @Property(tries = 5000)
   void commitsAreHonestAndCopiesNeverApply(
       @ForAll boolean append,
       @ForAll("settings") CommitProtocol.Settings settings,

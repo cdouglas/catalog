@@ -23,6 +23,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.function.LongSupplier;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.io.AtomicOutputFile.Strategy;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
@@ -129,9 +130,18 @@ enum LocalCatalogMode {
    * the caller types it). The table-default / table-override properties are the ones {@code
    * CatalogTests} expects of {@code catalog()}; {@code extra} is applied last.
    */
-  @SuppressWarnings("unchecked")
   <C extends LogCatalog> C catalog(
       InMemoryAtomicFileIO io, String warehouse, String name, Map<String, String> extra) {
+    return catalog(io, warehouse, name, extra, null);
+  }
+
+  /**
+   * As {@link #catalog(InMemoryAtomicFileIO, String, String, Map)}, with the catalog's commits
+   * minting their ids from {@code clockMs} (null for the system's clock).
+   */
+  @SuppressWarnings("unchecked")
+  <C extends LogCatalog> C catalog(InMemoryAtomicFileIO io, String warehouse, String name,
+      Map<String, String> extra, LongSupplier clockMs) {
     Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouse);
     properties.put(LogCatalogProperties.MAX_APPEND_COUNT, String.valueOf(maxAppendCount));
@@ -153,6 +163,9 @@ enum LocalCatalogMode {
     LogCatalog catalog = sharedLog
         ? new LogCatalog(name, sharedLog(io, location), io, Maps.newHashMap())
         : new FileIOCatalog(name, location, io, Maps.newHashMap());
+    if (clockMs != null) {
+      catalog.clock(clockMs);
+    }
     catalog.initialize(name, properties);
     return (C) catalog;
   }

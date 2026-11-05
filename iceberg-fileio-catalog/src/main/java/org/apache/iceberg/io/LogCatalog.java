@@ -26,6 +26,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 import java.util.stream.Collectors;
 import org.apache.iceberg.ManifestListSink;
 import org.apache.iceberg.ManifestListSink.ManifestListDelta;
@@ -59,6 +60,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.util.LocationUtil;
 import org.apache.iceberg.util.PropertyUtil;
 import org.intentlog.Replica;
+import org.intentlog.RuntimeConfig;
 import org.intentlog.SharedLog;
 
 /**
@@ -118,6 +120,8 @@ public class LogCatalog extends BaseMetastoreCatalog
   private boolean pinsCommitOnce = true;
   // The InlineSnapshots this catalog's loads of inline tables made, for later loads to reuse
   private final InlineSnapshots inlineSnapshots = new InlineSnapshots();
+  // The clock the catalog's commits mint their ids from, and compact by; null for the system's
+  private LongSupplier clock = null;
 
   /** A catalog whose subclass opens its log and FileIO when it is initialized ({@link #openLog}). */
   protected LogCatalog(String catalogName, Map<String, String> catalogProperties) {
@@ -133,6 +137,16 @@ public class LogCatalog extends BaseMetastoreCatalog
       String catalogName, SharedLog log, FileIO io, Map<String, String> catalogProperties) {
     this(catalogName, catalogProperties);
     open(log, io);
+  }
+
+  /**
+   * Makes the catalog mint its commits' ids from {@code clockMs}, and compact by it, instead of the
+   * system's clock: for tests of writers whose clocks disagree. Call it before {@link #initialize}.
+   */
+  LogCatalog clock(LongSupplier clockMs) {
+    Preconditions.checkState(log == null, "The catalog's clock is set before it is initialized");
+    this.clock = clockMs;
+    return this;
   }
 
   @Override
@@ -154,7 +168,8 @@ public class LogCatalog extends BaseMetastoreCatalog
     }
     Preconditions.checkState(
         sharedLog != null && io != null, "%s opened no log", getClass().getSimpleName());
-    log = new CatalogLog(sharedLog, LogCatalogProperties.runtimeConfig(catalogProperties),
+    RuntimeConfig config = LogCatalogProperties.runtimeConfig(catalogProperties);
+    log = new CatalogLog(sharedLog, clock != null ? config.withClock(clock) : config,
         LogCatalogProperties.checkpointMemoize(catalogProperties));
     // Another catalog may create the log at once (two processes starting on a new warehouse):
     // either way, this one uses it.

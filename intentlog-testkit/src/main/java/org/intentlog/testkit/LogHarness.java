@@ -19,6 +19,7 @@
 package org.intentlog.testkit;
 
 import java.util.List;
+import java.util.Map;
 import org.intentlog.SharedLog;
 
 /**
@@ -62,11 +63,35 @@ public interface LogHarness {
     PAST_RECORD
   }
 
+  /** A request of the log's page store ({@link SharedLog#pages}). */
+  enum PageRequest {
+    PUT,
+    GET,
+    DELETE,
+    LIST
+  }
+
+  /** A fault a page request meets. A provider that cannot produce one acts as the nearest it can. */
+  enum PageFault {
+    NONE,
+    /** The request fails without effect: a put or delete does not land, a get or list reads nothing. */
+    FAIL,
+    /** A put or delete lands, and its reply is lost; a get or list fails. */
+    LOST_REPLY,
+    /** A get finds no page, as if GC had dropped it and its compactor deleted it; else FAIL. */
+    MISSING
+  }
+
   /** What the fuzzer decides of each request the log serves, before it serves it. */
   interface Hooks {
     WriteFault beforeWrite();
 
     ReadFault beforeRead();
+
+    /** A request of the page store, of the page {@code name} (null for a listing). */
+    default PageFault beforePage(PageRequest request, String name) {
+      return PageFault.NONE;
+    }
   }
 
   /** The log the runtime commits to. */
@@ -81,11 +106,20 @@ public interface LogHarness {
    */
   long landedWrites();
 
-  /** Every intention record that has landed, in order, including those a trim or replace hid. */
+  /**
+   * Every record that has landed (intentions, GC records, PageOuts), in order, including those a
+   * trim or replace hid; each once.
+   */
   List<byte[]> landedRecords();
 
-  /** Appends a copy of {@code record} at the tail, as a writer's stray retry would, unfaulted. */
+  /**
+   * Appends {@code record} at the tail, unfaulted: a copy of a record, as a writer's stray retry
+   * would, or a record the fuzzer writes as a compactor would (a PageOut, a GC record).
+   */
   void appendCopy(byte[] record);
+
+  /** The pages the log's page store holds now, by name, read without faults; empty if none. */
+  Map<String, byte[]> storedPages();
 
   /** Lands the appends delayed so far; returns how many. */
   int deliverDelayed();

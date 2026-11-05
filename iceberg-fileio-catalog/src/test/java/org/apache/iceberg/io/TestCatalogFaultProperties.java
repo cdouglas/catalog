@@ -76,7 +76,9 @@ import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.ReadFault;
 import org.apache.iceberg.types.Types;
+import org.intentlog.fileio.AtomicFileLog;
 import org.intentlog.memory.InMemorySharedLog;
+import org.intentlog.wire.LogEnvelope;
 
 /**
  * Multi-writer fuzzer for {@link FileIOCatalog} (or a {@link LogCatalog} on a shared log, which a
@@ -127,7 +129,8 @@ import org.intentlog.memory.InMemorySharedLog;
  *       table's last and no other snapshot's; its manifests' are at most its own, and those it
  *       wrote have its own. In v3, snapshots' row-id ranges are apart and below the next row id.
  *   <li>Every version of the catalog file that a writer wrote reads the same as a checkpoint of
- *       it, which the next compaction would write (see {@link CheckpointRoundTrip}).
+ *       it, which the next compaction would write (see {@link CheckpointRoundTrip}); and every page
+ *       of the committed set the newest version references exists, as its reference says.
  *   <li>Row lineage, in a v3 table: once a snapshot has row ids, every live data file has them; the
  *       files' ranges are disjoint and below the table's next row id; a file's first row id never
  *       changes along main's lineage, nor do a snapshot's first row id and added rows.
@@ -195,11 +198,13 @@ class TestCatalogFaultProperties {
       @ForAll boolean strictVersions,
       @ForAll @IntRange(min = 0, max = 7) int gzipWriters,
       @ForAll @IntRange(min = 0, max = 7) int gcWriters,
+      @ForAll @IntRange(min = 0, max = 7) int pagingWriters,
+      @ForAll("clockOffsets") List<Long> clockOffsets,
       @ForAll("segmentLimits") int segmentLimit,
       @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
     new Run(onLog(sharedLog, modes.subList(0, writers)), maxUpdateSize, false, strictVersions,
-        gzipWriters, gcWriters, segmentLimit, encoding)
+        gzipWriters, gcWriters, pagingWriters, clockOffsets, segmentLimit, encoding)
         .execute(schedule);
   }
 
@@ -212,11 +217,13 @@ class TestCatalogFaultProperties {
       @ForAll boolean strictVersions,
       @ForAll @IntRange(min = 0, max = 7) int gzipWriters,
       @ForAll @IntRange(min = 0, max = 7) int gcWriters,
+      @ForAll @IntRange(min = 0, max = 7) int pagingWriters,
+      @ForAll("clockOffsets") List<Long> clockOffsets,
       @ForAll("segmentLimits") int segmentLimit,
       @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
     new Run(onLog(sharedLog, modes.subList(0, writers)), maxUpdateSize, true, strictVersions,
-        gzipWriters, gcWriters, segmentLimit, encoding)
+        gzipWriters, gcWriters, pagingWriters, clockOffsets, segmentLimit, encoding)
         .execute(schedule);
   }
 
@@ -240,6 +247,17 @@ class TestCatalogFaultProperties {
     return Arbitraries.frequencyOf(
         Tuple.of(1, mode.map(m -> List.of(m, m, m))),
         Tuple.of(3, mode.list().ofSize(3)));
+  }
+
+  /**
+   * How far each writer's clock is off, in ms: mostly not at all; a few ms or a few hundred behind
+   * or ahead, so its ids land in the blocks of others' older ids, or below a floor others raised;
+   * or far ahead of every clock (errata D21). A writer mints after the floor it read whatever its
+   * clock says (docs/COMMITTED_PAGING.md, "Testing").
+   */
+  @Provide
+  Arbitrary<List<Long>> clockOffsets() {
+    return Arbitraries.of(0L, 0L, 0L, 0L, -3L, -300L, 3L, 300L, 100_000L).list().ofSize(3);
   }
 
   /**
@@ -770,11 +788,15 @@ class TestCatalogFaultProperties {
      * gzipWriters} is set, else the structural one: a delta keeps its base's codec, and a full
      * update writes the writer's. Writer {@code i} keeps no committed transaction ids older than
      * its own commit's when it compacts (a retention of 0) if bit {@code i} of {@code gcWriters}
-     * is set, else the default 30 minutes, which no run reaches. With a {@code segmentLimit}, the
-     * catalog object holds at most that many writes, and an append past it fails (Bug 66).
+     * is set, else the default 30 minutes, which no run reaches. Writer {@code i} pages the
+     * committed set as it compacts, at an admission window and threshold of 0 (every block below
+     * its own id but the newest), if bit {@code i} of {@code pagingWriters} is set, and its clock is
+     * off by {@code clockOffsets.get(i)} ms. With a {@code segmentLimit}, the catalog object holds
+     * at most that many writes, and an append past it fails (Bug 66).
      */
     Run(List<LocalCatalogMode> modes, int maxUpdateSize, boolean faults, boolean strictVersions,
-        int gzipWriters, int gcWriters, int segmentLimit, String encoding) {
+        int gzipWriters, int gcWriters, int pagingWriters, List<Long> clockOffsets,
+        int segmentLimit, String encoding) {
       this.maxUpdateSize = maxUpdateSize;
       this.faults = faults;
       this.gc = (gcWriters & ((1 << modes.size()) - 1)) != 0;
@@ -796,8 +818,13 @@ class TestCatalogFaultProperties {
         if ((gcWriters >> i & 1) == 1) {
           writerProperties.put(LogCatalogProperties.COMMITTED_RETENTION_MS, "0");
         }
-        this.writers[i] =
-            new Writer(i, modes.get(i).catalog(io, WAREHOUSE, CATALOG_NAME, writerProperties));
+        if ((pagingWriters >> i & 1) == 1) {
+          writerProperties.put(LogCatalogProperties.COMMITTED_ADMISSION_MS, "0");
+          writerProperties.put(LogCatalogProperties.COMMITTED_PAGE_THRESHOLD, "0");
+        }
+        long offset = clockOffsets.get(i);
+        this.writers[i] = new Writer(i, modes.get(i).catalog(io, WAREHOUSE, CATALOG_NAME,
+            writerProperties, offset == 0 ? null : () -> System.currentTimeMillis() + offset));
       }
       // Reading does not depend on a catalog's mode, only on its log.
       this.checker = LocalCatalogMode.readerFor(io, CATALOG_LOCATION)
@@ -811,13 +838,18 @@ class TestCatalogFaultProperties {
       create(seed, TABLES.get(1), 2).newFastAppend().appendFile(newFile()).commit();
       this.model = actual();
       trace.append(String.format(
-          "modes %s, max update size %d%s, gzip writers %s, gc writers %s, segment limit %d%n"
-              + "seed: %s%n",
+          "modes %s, max update size %d%s, gzip writers %s, gc writers %s, paging writers %s,"
+              + " clocks off by %s ms, segment limit %d%nseed: %s%n",
           modes, maxUpdateSize, strictVersions ? ", strict versions" : "",
-          Integer.toBinaryString(gzipWriters), Integer.toBinaryString(gcWriters), segmentLimit,
-          model));
+          Integer.toBinaryString(gzipWriters), Integer.toBinaryString(gcWriters),
+          Integer.toBinaryString(pagingWriters), clockOffsets.subList(0, modes.size()),
+          segmentLimit, model));
       Statistics.label("gc writers")
           .collect(Integer.bitCount(gcWriters & ((1 << modes.size()) - 1)));
+      Statistics.label("paging writers")
+          .collect(Integer.bitCount(pagingWriters & ((1 << modes.size()) - 1)));
+      Statistics.label("clocks off")
+          .collect(clockOffsets.subList(0, modes.size()).stream().anyMatch(o -> o != 0));
       Statistics.label("modes").collect(new TreeSet<>(modes).size() == 1 ? "one" : "mixed");
       Statistics.label("log").collect(sharedLog != null ? "shared log" : "one object");
       io.injectFaults(this::onWrite);
@@ -865,6 +897,25 @@ class TestCatalogFaultProperties {
         }
       }
       checkCheckpoints();
+      long pageOuts = pageOuts();
+      Statistics.label("PageOut records").collect(
+          pageOuts == 0 ? "none" : pageOuts < 4 ? "1-3" : "4 or more");
+    }
+
+    /** The PageOut records the catalog's log ever held: the committed set's pages sealed. */
+    private long pageOuts() {
+      List<byte[]> records = new ArrayList<>();
+      if (sharedLog != null) {
+        records.addAll(sharedLog.records());
+      } else {
+        for (InMemoryAtomicFileIO.Write write : io.history()) {
+          if (write.location().equals(CATALOG_LOCATION)) {
+            records.addAll(AtomicFileLog.decode(write.after()).records());
+          }
+        }
+      }
+      return records.stream().map(java.nio.ByteBuffer::wrap).distinct()
+          .filter(b -> LogEnvelope.decodeRecord(b.array()).isPageOut()).count();
     }
 
     private Writer writer(Cmd cmd) {
@@ -1962,6 +2013,11 @@ class TestCatalogFaultProperties {
               "a checkpoint of catalog write #%d (%s) differs from it: %s",
               checkedWrites, write.strategy(), difference);
         }
+      }
+      try {
+        CheckpointRoundTrip.assertPagesExist(io);
+      } catch (AssertionError e) {
+        throw fail("%s", e.getMessage());
       }
     }
 
