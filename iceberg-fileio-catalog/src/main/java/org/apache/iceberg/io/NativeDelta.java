@@ -40,27 +40,44 @@ import org.apache.iceberg.TableMetadataParser;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.io.InlineDeltaCodec.AddManifestUpdate;
+import org.apache.iceberg.io.InlineDeltaCodec.AddPartitionSpecUpdate;
+import org.apache.iceberg.io.InlineDeltaCodec.AddSchemaUpdate;
 import org.apache.iceberg.io.InlineDeltaCodec.AddSnapshotUpdate;
+import org.apache.iceberg.io.InlineDeltaCodec.AddSortOrderUpdate;
 import org.apache.iceberg.io.InlineDeltaCodec.DecodedDelta;
 import org.apache.iceberg.io.InlineDeltaCodec.DeltaUpdate;
 import org.apache.iceberg.io.InlineDeltaCodec.RemoveManifestUpdate;
+import org.apache.iceberg.io.InlineDeltaCodec.RemovePartitionSpecsUpdate;
+import org.apache.iceberg.io.InlineDeltaCodec.RemoveSchemasUpdate;
+import org.apache.iceberg.io.InlineDeltaCodec.RemoveSnapshotsUpdate;
+import org.apache.iceberg.io.InlineDeltaCodec.SetCurrentSchemaUpdate;
+import org.apache.iceberg.io.InlineDeltaCodec.SetDefaultSortOrderUpdate;
+import org.apache.iceberg.io.InlineDeltaCodec.SetDefaultSpecUpdate;
+import org.apache.iceberg.io.InlineDeltaCodec.SetLocationUpdate;
 import org.apache.iceberg.io.InlineDeltaCodec.SetPropertiesUpdate;
 import org.apache.iceberg.io.InlineDeltaCodec.SetSnapshotRefUpdate;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.util.PropertyUtil;
 
 /**
- * Replay of a table update's delta on {@link TableFields}, without Iceberg's metadata builder:
- * the common records, which add snapshots, move refs and set properties, before their manifest
- * updates. {@link InlineDeltaCodec#applyDelta} replays every delta on a {@link TableMetadata}
- * through {@code TableMetadata.Builder}; for these, this computes the same fields, field for field
- * (the builder's checks and its snapshot and metadata logs included), and shares what they leave.
- * Any other delta, schema, spec, sort order, location, removals, takes the builder's path.
+ * Replay of a table update's delta on {@link TableFields}, never on the whole table through
+ * Iceberg's metadata builder. The snapshot updates (snapshots added and removed, refs set), the
+ * properties, the snapshot and metadata logs and the statistics apply here, field for field as
+ * {@code TableMetadata.Builder} computes them (its checks included), sharing what they leave. The
+ * head updates (location, schemas, specs, sort orders, and the removal of schemas and specs) go
+ * through the builder on the table's head ({@link TableFields#head}): its metadata without
+ * snapshots, refs, logs or statistics, none of which they read. So no replay of a record needs a
+ * table's history beyond its snapshot ids, its refs' targets and its logs (SNAPSHOT_PAGING.md, step
+ * 1).
  *
- * <p>With {@code -Dfileio.catalog.replay.check=true} (the test suites set it), each replay here is
- * also run through the builder, and the two must make the same metadata.
+ * <p>A delta's table updates apply in passes, as {@link InlineDeltaCodec#applyDelta} builds them:
+ * the updates between two of its manifest updates, each pass one build of the table. That replay,
+ * the builder on the whole table, is the reference: with {@code -Dfileio.catalog.replay.check=true}
+ * (the test suites set it) each replay here is also run there, and the two must make the same
+ * metadata, or both reject the record.
  */
 final class NativeDelta {
   private NativeDelta() {}
@@ -71,33 +88,57 @@ final class NativeDelta {
   static final boolean CHECK = Boolean.getBoolean("fileio.catalog.replay.check");
 
   /**
-   * Whether {@code delta} replays here: its table updates add snapshots, set refs and set or
-   * remove properties, and all of them precede its manifest updates.
-   */
-  static boolean applies(DecodedDelta delta) {
-    boolean manifests = false;
-    for (DeltaUpdate update : delta.updates) {
-      if (update instanceof AddManifestUpdate || update instanceof RemoveManifestUpdate) {
-        manifests = true;
-      } else if (manifests) {
-        return false;
-      } else if (!(update instanceof AddSnapshotUpdate)
-          && !(update instanceof SetSnapshotRefUpdate)
-          && !(update instanceof SetPropertiesUpdate)) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  /**
-   * Applies {@code delta} ({@link #applies}) to {@code base}, the table where its record lands,
-   * which has changed since the delta's base if {@code stale}, and returns the table after it; its
-   * manifest updates go to {@code builder}'s lists of {@code tableId}, as {@link
-   * InlineDeltaCodec#applyDelta} routes them. {@code baseLocation} is the base's metadata
-   * location, which the metadata log records.
+   * Applies {@code delta} to {@code base}, the table where its record lands, which has changed
+   * since the delta's base if {@code stale}, and returns the table after it; its manifest updates
+   * go to {@code builder}'s lists of {@code tableId}, as {@link InlineDeltaCodec#applyDelta} routes
+   * them. {@code baseLocation} is the base's metadata location, which the metadata log records.
    */
   static TableFields apply(
+      TableFields base,
+      DecodedDelta delta,
+      CatalogState.Builder builder,
+      int tableId,
+      boolean stale,
+      String baseLocation) {
+    if (!CHECK) {
+      return replay(base, delta, builder, tableId, stale, baseLocation);
+    }
+    // The builder's replay first: it touches no catalog state, and a rejection there must be one
+    // here
+    String expected;
+    RuntimeException rejected = null;
+    try {
+      TableMetadata from = base.toMetadata(baseLocation);
+      Landing landing = Landing.of(delta, MetadataView.of(from), stale);
+      expected = TableMetadataParser.toJson(reference(from, delta, landing));
+    } catch (RuntimeException e) {
+      expected = null;
+      rejected = e;
+    }
+    TableFields applied;
+    try {
+      applied = replay(base, delta, builder, tableId, stale, baseLocation);
+    } catch (RuntimeException e) {
+      if (rejected == null) {
+        throw new IllegalStateException(
+            "Native replay rejects a delta the builder applies: " + e, e);
+      }
+      throw e;
+    }
+    if (rejected != null) {
+      throw new IllegalStateException(
+          "Native replay applies a delta the builder rejects: " + rejected, rejected);
+    }
+    String actual = TableMetadataParser.toJson(applied.toMetadata(null));
+    if (!expected.equals(actual)) {
+      throw new IllegalStateException(
+          "Native replay differs from the builder's:\n  builder: " + expected + "\n  native:  "
+              + actual);
+    }
+    return applied;
+  }
+
+  private static TableFields replay(
       TableFields base,
       DecodedDelta delta,
       CatalogState.Builder builder,
@@ -109,24 +150,31 @@ final class NativeDelta {
     if (prefix == null) {
       prefix = "";
     }
-    // A delta writes manifest lists' paths whole; its manifests' names resolve under the prefix
-    TableFields current = applyTable(base, delta, landing, "", baseLocation);
-
-    // The manifest updates, as InlineDeltaCodec.applyDelta replays them: each new inline-ML
-    // snapshot's list starts as its parent's, then takes the manifests the delta adds and removes
+    // Each new inline-ML snapshot's list starts as its parent's, then takes the manifests the
+    // delta adds and removes; the lists of the snapshots it removes go once those are settled
     InlineDeltaCodec.NewSnapshotManifests newSnapshots =
         new InlineDeltaCodec.NewSnapshotManifests(builder, tableId, delta);
     Set<Long> added = new HashSet<>();
+    List<Long> removed = new ArrayList<>();
+    TableFields current = base;
+    // A delta writes manifest lists' paths whole; its manifests' names resolve under the prefix.
+    // Only a pass that changes the table logs the base's location: the table it builds has none.
+    String location = baseLocation;
+    List<DeltaUpdate> pass = new ArrayList<>();
     for (DeltaUpdate update : delta.updates) {
-      if (update instanceof AddSnapshotUpdate) {
-        AddSnapshotUpdate add = (AddSnapshotUpdate) update;
-        added.add(add.snapshotId);
-        if (add.manifestListSuffix.isEmpty()) {
-          newSnapshots.add(add.snapshotId, landing.parent(add));
-        }
+      if (!(update instanceof AddManifestUpdate) && !(update instanceof RemoveManifestUpdate)) {
+        pass.add(update);
+        continue;
       }
-    }
-    for (DeltaUpdate update : delta.updates) {
+      if (!pass.isEmpty()) {
+        TableFields next =
+            applyPass(current, pass, delta, landing, location, newSnapshots, added, removed);
+        if (next != current) {
+          location = null;
+        }
+        current = next;
+        pass.clear();
+      }
       if (update instanceof AddManifestUpdate) {
         AddManifestUpdate add = (AddManifestUpdate) update;
         if (current.snapshot(add.snapshotId) == null && !added.contains(add.snapshotId)) {
@@ -137,20 +185,75 @@ final class NativeDelta {
         ManifestFile resolved = landing.manifest(InlineDeltaCodec.resolve(add.manifest, prefix));
         builder.addManifestToPool(tableId, resolved);
         newSnapshots.addManifest(current, add.snapshotId, resolved.path(), add.position);
-      } else if (update instanceof RemoveManifestUpdate) {
+      } else {
         newSnapshots.removeManifest(current, (RemoveManifestUpdate) update);
       }
     }
+    if (!pass.isEmpty()) {
+      current = applyPass(current, pass, delta, landing, location, newSnapshots, added, removed);
+    }
     newSnapshots.finish();
+    if (!removed.isEmpty()) {
+      builder.removeSnapshotManifests(tableId, removed);
+    }
     return current;
   }
 
   /**
-   * The table after the delta's table updates: one pass of {@code TableMetadata.Builder} from
-   * {@code base}, pinned to the landing's last-updated-ms, then {@code build()}.
+   * The table after a FULL update of an inline table: {@code record}, the table's head with only the
+   * snapshots {@code base} (the version it read, where it lands) lacks and the ones its refs target,
+   * with {@code base}'s other snapshots, minus {@code removed}, in their order, then the record's new
+   * ones in its order. A writer's builder only appends snapshots to its base's and removes some, so
+   * this is the writer's metadata (LogCatalog checks so under {@link #CHECK}).
    */
-  private static TableFields applyTable(
-      TableFields base, DecodedDelta delta, Landing landing, String prefix, String baseLocation) {
+  static TableFields full(TableFields base, TableMetadata record, long[] removed) {
+    Set<Long> drop = new HashSet<>();
+    for (long id : removed) {
+      drop.add(id);
+    }
+    List<Snapshot> snapshots = new ArrayList<>(base.snapshots.size() + record.snapshots().size());
+    for (Snapshot snapshot : base.snapshots) {
+      if (!drop.contains(snapshot.snapshotId())) {
+        snapshots.add(snapshot);
+      }
+    }
+    for (Snapshot snapshot : record.snapshots()) {
+      if (base.snapshots.byKey(snapshot.snapshotId()) == null) {
+        snapshots.add(snapshot);
+      }
+    }
+    return TableFields.of(record).withSnapshots(snapshots);
+  }
+
+  /** Whether {@code update} changes only the table's head, which the builder applies. */
+  private static boolean headUpdate(DeltaUpdate update) {
+    return update instanceof SetLocationUpdate
+        || update instanceof AddSchemaUpdate
+        || update instanceof SetCurrentSchemaUpdate
+        || update instanceof AddPartitionSpecUpdate
+        || update instanceof SetDefaultSpecUpdate
+        || update instanceof AddSortOrderUpdate
+        || update instanceof SetDefaultSortOrderUpdate
+        || update instanceof RemoveSchemasUpdate
+        || update instanceof RemovePartitionSpecsUpdate;
+  }
+
+  /**
+   * The table after one pass of the delta's table updates ({@code pass}): one {@code
+   * TableMetadata.Builder} from {@code base}, pinned to the landing's last-updated-ms, then {@code
+   * build()}. Registers the pass's new snapshots with {@code newSnapshots} and in {@code addedIds},
+   * and the ids it removes in {@code removedIds}.
+   */
+  @SuppressWarnings("MethodLength")
+  private static TableFields applyPass(
+      TableFields base,
+      List<DeltaUpdate> pass,
+      DecodedDelta delta,
+      Landing landing,
+      String baseLocation,
+      InlineDeltaCodec.NewSnapshotManifests newSnapshots,
+      Set<Long> addedIds,
+      List<Long> removedIds) {
     long writerLastUpdatedMillis = delta.lastUpdatedMillis;
     long lastUpdatedMillis = landing.lastUpdatedMillis(writerLastUpdatedMillis);
     int formatVersion = base.formatVersion;
@@ -161,18 +264,24 @@ final class NativeDelta {
     Chain<HistoryEntry> snapshotLog = base.snapshotLog;
     Map<String, SnapshotRef> refs = null; // copied on the first change
     Map<String, String> properties = null; // likewise
+    // The builder's statistics, by snapshot, as it indexes them: made on the first removal
+    Map<Long, List<StatisticsFile>> statistics = null;
+    Map<Long, List<PartitionStatisticsFile>> partitionStatistics = null;
     boolean changed = false;
-    Set<Long> addedIds = new LinkedHashSet<>();
+    boolean removedAny = false;
+    // The snapshots this pass added: main moved to one logs it at the snapshot's own timestamp
+    Set<Long> addedHere = new LinkedHashSet<>();
     // Snapshots this pass added and moved main to, in order: intermediate ones leave the log
     List<Long> mainMoves = new ArrayList<>();
+    List<DeltaUpdate> headUpdates = new ArrayList<>();
 
-    for (DeltaUpdate update : delta.updates) {
+    for (DeltaUpdate update : pass) {
       if (update instanceof AddSnapshotUpdate) {
         AddSnapshotUpdate add = (AddSnapshotUpdate) update;
         long sequenceNumber = formatVersion >= 2 ? lastSequenceNumber + 1 : 0L;
         Snapshot snapshot =
             add.snapshot(
-                sequenceNumber, base.currentSchemaId, prefix, writerLastUpdatedMillis, landing);
+                sequenceNumber, base.currentSchemaId, "", writerLastUpdatedMillis, landing);
         // TableMetadata.Builder.addSnapshot
         ValidationException.check(
             snapshots.byKey(snapshot.snapshotId()) == null,
@@ -197,7 +306,11 @@ final class NativeDelta {
               nextRowId);
           nextRowId += snapshot.addedRows();
         }
-        addedIds.add(snapshot.snapshotId());
+        addedHere.add(snapshot.snapshotId());
+        addedIds.add(add.snapshotId);
+        if (add.manifestListSuffix.isEmpty()) {
+          newSnapshots.add(add.snapshotId, landing.parent(add));
+        }
         changed = true;
       } else if (update instanceof SetSnapshotRefUpdate) {
         SetSnapshotRefUpdate set = landing.ref((SetSnapshotRefUpdate) update);
@@ -218,12 +331,12 @@ final class NativeDelta {
             SnapshotRef.MAIN_BRANCH);
         if (SnapshotRef.MAIN_BRANCH.equals(set.refName)) {
           currentSnapshotId = ref.snapshotId();
-          boolean addedHere = addedIds.contains(ref.snapshotId());
-          long timeOfChange = addedHere ? snapshot.timestampMillis() : lastUpdatedMillis;
+          boolean added = addedHere.contains(ref.snapshotId());
+          long timeOfChange = added ? snapshot.timestampMillis() : lastUpdatedMillis;
           snapshotLog =
               snapshotLog.append(InlineTableMetadata.snapshotLogEntry(timeOfChange,
                   ref.snapshotId()));
-          if (addedHere) {
+          if (added) {
             mainMoves.add(ref.snapshotId());
           }
         }
@@ -242,6 +355,73 @@ final class NativeDelta {
           set.removed.forEach(properties::remove);
           changed = true;
         }
+      } else if (update instanceof RemoveSnapshotsUpdate) {
+        // TableMetadata.Builder.removeSnapshots: the snapshots with their statistics, then every
+        // ref left dangling (main's leaves no current snapshot)
+        List<Long> ids = ((RemoveSnapshotsUpdate) update).snapshotIds;
+        removedIds.addAll(ids);
+        Set<Long> toRemove = new HashSet<>(ids);
+        List<Snapshot> retained = new ArrayList<>(snapshots.size());
+        boolean removedHere = false;
+        for (Snapshot snapshot : snapshots) {
+          if (toRemove.contains(snapshot.snapshotId())) {
+            removedHere = true;
+            if (statistics == null) {
+              statistics = indexStatistics(base.statisticsFiles);
+              partitionStatistics = indexPartitionStatistics(base.partitionStatisticsFiles);
+            }
+            statistics.remove(snapshot.snapshotId());
+            partitionStatistics.remove(snapshot.snapshotId());
+          } else {
+            retained.add(snapshot);
+          }
+        }
+        if (removedHere) {
+          snapshots = Chain.of(retained, Snapshot::snapshotId);
+          removedAny = true;
+          changed = true;
+        }
+        Map<String, SnapshotRef> current = refs != null ? refs : base.refs;
+        List<String> dangling = new ArrayList<>();
+        for (Map.Entry<String, SnapshotRef> ref : current.entrySet()) {
+          if (snapshots.byKey(ref.getValue().snapshotId()) == null) {
+            dangling.add(ref.getKey());
+          }
+        }
+        if (!dangling.isEmpty()) {
+          if (refs == null) {
+            refs = new HashMap<>(base.refs);
+          }
+          for (String name : dangling) {
+            if (SnapshotRef.MAIN_BRANCH.equals(name)) {
+              currentSnapshotId = -1L;
+            }
+            refs.remove(name);
+          }
+          changed = true;
+        }
+      } else if (headUpdate(update)) {
+        headUpdates.add(update);
+      } else {
+        throw new IllegalStateException(
+            "No native replay of " + update.getClass().getSimpleName());
+      }
+    }
+
+    // The head's updates, on a builder that sees no snapshot, ref, log or statistics: a build
+    // without changes returns its base
+    TableMetadata head = null;
+    if (!headUpdates.isEmpty()) {
+      TableMetadata from = base.head();
+      TableMetadata.Builder builder = TableMetadata.buildFrom(from);
+      builder.setLastUpdatedMillis(lastUpdatedMillis);
+      for (DeltaUpdate update : headUpdates) {
+        update.applyTo(builder);
+      }
+      TableMetadata built = builder.discardChanges().build();
+      if (built != from) {
+        head = built;
+        changed = true;
       }
     }
     if (!changed) {
@@ -255,15 +435,15 @@ final class NativeDelta {
     Map<String, SnapshotRef> newRefs =
         ImmutableMap.copyOf(refs != null ? refs : new HashMap<>(base.refs));
     List<StatisticsFile> statisticsFiles =
-        base.statisticsFiles.stream()
-            .collect(Collectors.groupingBy(StatisticsFile::snapshotId))
+        (statistics != null ? statistics : indexStatistics(base.statisticsFiles))
             .values()
             .stream()
             .flatMap(List::stream)
             .collect(Collectors.toList());
     List<PartitionStatisticsFile> partitionStatisticsFiles =
-        base.partitionStatisticsFiles.stream()
-            .collect(Collectors.groupingBy(PartitionStatisticsFile::snapshotId))
+        (partitionStatistics != null
+                ? partitionStatistics
+                : indexPartitionStatistics(base.partitionStatisticsFiles))
             .values()
             .stream()
             .flatMap(List::stream)
@@ -276,18 +456,23 @@ final class NativeDelta {
         intermediate.add(moved);
       }
     }
-    if (!intermediate.isEmpty()) {
-      // updateSnapshotLog: copy the entries that are still valid, of snapshots the table has
+    boolean rebuiltLog = !intermediate.isEmpty() || removedAny;
+    if (rebuiltLog) {
+      // TableMetadata.Builder.updateSnapshotLog: copy the entries that are still valid, of
+      // snapshots the table has; an entry whose snapshot was removed clears the history before it
       List<HistoryEntry> kept = new ArrayList<>();
       for (HistoryEntry entry : snapshotLog) {
-        if (snapshots.byKey(entry.snapshotId()) != null
-            && !intermediate.contains(entry.snapshotId())) {
-          kept.add(entry);
+        if (snapshots.byKey(entry.snapshotId()) != null) {
+          if (!intermediate.contains(entry.snapshotId())) {
+            kept.add(entry);
+          }
+        } else if (removedAny) {
+          kept.clear();
         }
       }
       if (snapshots.byKey(currentSnapshotId) != null) {
         ValidationException.check(
-            !kept.isEmpty() && kept.get(kept.size() - 1).snapshotId() == currentSnapshotId,
+            Iterables.getLast(kept).snapshotId() == currentSnapshotId,
             "Cannot set invalid snapshot log: latest entry is not the current snapshot");
       }
       snapshotLog = Chain.of(kept);
@@ -295,7 +480,7 @@ final class NativeDelta {
 
     // The checks of TableMetadata's constructor that the pass could break: a log it rebuilt has
     // new neighbours throughout
-    int checkFrom = intermediate.isEmpty() ? Math.max(1, base.snapshotLog.size()) : 1;
+    int checkFrom = rebuiltLog ? 1 : Math.max(1, base.snapshotLog.size());
     for (int i = checkFrom; i < snapshotLog.size(); i++) {
       Preconditions.checkArgument(
           snapshotLog.get(i).timestampMillis() - snapshotLog.get(i - 1).timestampMillis()
@@ -325,18 +510,30 @@ final class NativeDelta {
           last.timestampMillis());
     }
 
-    return base.with(
-        lastSequenceNumber,
-        lastUpdatedMillis,
-        newProperties,
-        currentSnapshotId,
-        snapshots,
-        snapshotLog,
-        previousFiles,
-        newRefs,
-        ImmutableList.copyOf(statisticsFiles),
-        ImmutableList.copyOf(partitionStatisticsFiles),
-        nextRowId);
+    TableFields after =
+        base.with(
+            lastSequenceNumber,
+            lastUpdatedMillis,
+            newProperties,
+            currentSnapshotId,
+            snapshots,
+            snapshotLog,
+            previousFiles,
+            newRefs,
+            ImmutableList.copyOf(statisticsFiles),
+            ImmutableList.copyOf(partitionStatisticsFiles),
+            nextRowId);
+    return head != null ? after.withHead(head) : after;
+  }
+
+  /** The builder's index of statistics files by snapshot, as {@code Builder(base)} makes it. */
+  private static Map<Long, List<StatisticsFile>> indexStatistics(List<StatisticsFile> files) {
+    return files.stream().collect(Collectors.groupingBy(StatisticsFile::snapshotId));
+  }
+
+  private static Map<Long, List<PartitionStatisticsFile>> indexPartitionStatistics(
+      List<PartitionStatisticsFile> files) {
+    return files.stream().collect(Collectors.groupingBy(PartitionStatisticsFile::snapshotId));
   }
 
   /** {@code TableMetadata.Builder.addPreviousFile}: the metadata log after one more build. */
@@ -366,44 +563,33 @@ final class NativeDelta {
   }
 
   /**
-   * Checks the replay of {@code delta} here, {@code applied}, against the builder's replay of it
-   * on {@code base} at {@code baseLocation} ({@link #CHECK}): they must make the same metadata.
+   * The table updates of {@code delta} on {@code base} through the builder, as {@link
+   * InlineDeltaCodec#applyDelta} replays them: a pass per run of table updates between manifest
+   * updates, each one build.
    */
-  static void check(
-      TableFields base, String baseLocation, DecodedDelta delta, boolean stale, String prefix,
-      TableFields applied) {
-    TableMetadata from = base.toMetadata(baseLocation);
-    Landing landing = Landing.of(delta, MetadataView.of(from), stale);
-    TableMetadata reference = reference(from, delta, landing, prefix != null ? prefix : "");
-    String expected = TableMetadataParser.toJson(reference);
-    String actual = TableMetadataParser.toJson(applied.toMetadata(null));
-    if (!expected.equals(actual)) {
-      throw new IllegalStateException(
-          "Native replay differs from the builder's:\n  builder: " + expected + "\n  native:  "
-              + actual);
-    }
-  }
-
-  /** The table updates of {@code delta} on {@code base}, through the builder, as applyDelta does. */
-  private static TableMetadata reference(
-      TableMetadata base, DecodedDelta delta, Landing landing, String prefix) {
+  private static TableMetadata reference(TableMetadata base, DecodedDelta delta, Landing landing) {
     long writerLastUpdatedMillis = delta.lastUpdatedMillis;
+    TableMetadata current = base;
     TableMetadata.Builder pending = null;
     long lastSequenceNumber = 0L;
     for (DeltaUpdate update : delta.updates) {
       if (update instanceof AddManifestUpdate || update instanceof RemoveManifestUpdate) {
+        if (pending != null) {
+          current = pending.discardChanges().build();
+          pending = null;
+        }
         continue;
       }
       if (pending == null) {
-        pending = TableMetadata.buildFrom(base);
+        pending = TableMetadata.buildFrom(current);
         pending.setLastUpdatedMillis(landing.lastUpdatedMillis(writerLastUpdatedMillis));
-        lastSequenceNumber = base.lastSequenceNumber();
+        lastSequenceNumber = current.lastSequenceNumber();
       }
       if (update instanceof AddSnapshotUpdate) {
-        long sequenceNumber = base.formatVersion() >= 2 ? ++lastSequenceNumber : 0L;
+        long sequenceNumber = current.formatVersion() >= 2 ? ++lastSequenceNumber : 0L;
         pending.addSnapshot(
             ((AddSnapshotUpdate) update).snapshot(
-                sequenceNumber, base.currentSchemaId(), prefix, writerLastUpdatedMillis,
+                sequenceNumber, current.currentSchemaId(), "", writerLastUpdatedMillis,
                 landing));
       } else if (update instanceof SetSnapshotRefUpdate) {
         landing.ref((SetSnapshotRefUpdate) update).applyTo(pending);
@@ -411,6 +597,6 @@ final class NativeDelta {
         update.applyTo(pending);
       }
     }
-    return pending != null ? pending.discardChanges().build() : base;
+    return pending != null ? pending.discardChanges().build() : current;
   }
 }

@@ -132,19 +132,32 @@ that a record extends each in place rather than copying it. Landing,
 `TableChange` and the encodings read a table through `MetadataView`,
 which `TableFields` implements, and which adapts a `TableMetadata` too.
 
-- A delta of snapshots, refs and properties (`AddSnapshot`,
-  `SetSnapshotRef`, `SetProperties`, then its manifest-list updates)
-  applies to the fields (`NativeDelta`). It reproduces
-  `TableMetadata.Builder` exactly: the sequence-number and row-id
-  checks, the next row id, the snapshot log with intermediate snapshots
-  suppressed, one metadata-log entry per record (trimmed to
-  `write.metadata.previous-versions-max`) and last-updated-ms. Any other
-  delta goes through the builder on the table's metadata
-  (`InlineDeltaCodec.applyDelta`), and full metadata replaces the bytes.
+- Every delta applies to the fields (`NativeDelta`), in passes as the
+  writer's builders ran: the table updates between two manifest updates
+  are one build. The snapshot updates (`AddSnapshot`, `SetSnapshotRef`,
+  `RemoveSnapshots`), properties, statistics and both logs apply to the
+  fields, reproducing `TableMetadata.Builder` exactly: the sequence-number
+  and row-id checks, the next row id, the refs a removal leaves dangling,
+  the snapshot log with intermediate snapshots suppressed and the history
+  before a removed snapshot cleared, one metadata-log entry per record
+  (trimmed to `write.metadata.previous-versions-max`) and last-updated-ms.
+  The head updates (location, schemas, specs, sort orders, and the
+  removal of schemas and specs) go through the builder on the table's
+  head, its metadata without snapshots, refs, logs or statistics, none of
+  which they read. So no record's replay builds the whole table
+  (SNAPSHOT_PAGING.md step 1).
+- A full update of an inline table is head only (`head_only`): the
+  table's head with only the snapshots its base lacks and its refs'
+  targets, and the ids of the base's snapshots it drops
+  (`removed_snapshot_ids`); replay keeps the base's other snapshots, in
+  their order, and appends the new ones (`NativeDelta.full`), when the
+  table is next read, so a table no record or load needs is never
+  decoded. Full metadata without `head_only` is the whole table, which
+  replaces the table's (a pointer table returning to inline storage).
 - Iceberg's objects are made on demand, not per record: a
   `TableMetadata` when a table is loaded (built directly by
   `InlineTableMetadata.create` and kept per version), the encoded bytes
-  when a checkpoint is written, a builder only on the slow path above.
+  when a checkpoint is written, a builder only on a table's head.
   That the catalog can produce every object a v3 table would have stored
   (metadata, manifest lists) is the compatibility it keeps; producing
   them is not replay's job.
@@ -157,9 +170,11 @@ which `TableFields` implements, and which adapts a `TableMetadata` too.
   fold costs its records, not the catalog. A load reuses the
   `InlineSnapshot`s earlier loads made (`LogCatalog.InlineSnapshots`).
 - In the test suites (surefire sets `-Dfileio.catalog.replay.check=true`),
-  every native apply also runs through the builder and must give the
-  same metadata, and every encode of an inline table must round-trip
-  exactly (I11).
+  every native apply also runs through the builder on the whole table
+  (`InlineDeltaCodec.applyDelta`) and must give the same metadata, or
+  both reject the record; every full update a writer sends must replay to
+  the metadata it commits (`LogCatalog.checkFullUpdate`); and every encode
+  of an inline table must round-trip exactly (I11).
 
 Replay went from about 200 records/s on a 300-snapshot table to over
 100,000 ([REPLAY_BENCH_RESULTS.md](REPLAY_BENCH_RESULTS.md), the JMH
@@ -761,11 +776,12 @@ the log it landed in, and compacts after the commit
    same metadata from repeated replays of the same delta (I4).
 7. If the new update type interacts with manifest-pool state, also extend
    the routing in `applyDeltaWithManifests` (see SPEC_TM.md and SPEC_ML.md).
-8. A delta holding the new update replays through the builder
-   (`NativeDelta.applies` is false), which is correct but slower. To
-   replay it on the table's fields, extend `NativeDelta` to reproduce
-   what the builder does with it; the suites' replay check compares the
-   two on every apply (§"Replay State").
+8. Replay applies every delta on the table's fields (`NativeDelta`), which
+   fails on an update it does not know. Extend it: a head update (one
+   that reads no snapshot, ref, log or statistics) joins those it runs
+   through the builder on the table's head; any other is reproduced on
+   the fields, as the builder does it. The suites' replay check compares
+   each apply with the builder's on the whole table (§"Replay State").
 9. Name the concern it changes in `TableChange.of`, which the conflict
    encodings read and stamp by; or set `commitOnce` for it, which gives
    its record the Lamport witness (I12). `TableChange.of` has no default

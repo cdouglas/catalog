@@ -34,6 +34,8 @@ final class InlineTable {
   private final byte codec;
   private volatile byte[] bytes;
   private volatile TableFields fields;
+  // A head-only full update not yet merged onto the version before it ({@link #ofHeadOnly})
+  private volatile HeadOnly pending;
   private volatile TableMetadata metadata;
   private volatile TableMetadata loaded;
 
@@ -47,6 +49,30 @@ final class InlineTable {
   /** The table encoded as {@code bytes} by codec {@code codec}. */
   static InlineTable ofBytes(byte[] bytes, byte codec) {
     return new InlineTable(codec, Objects.requireNonNull(bytes, "bytes"), null, null);
+  }
+
+  /**
+   * The table after a head-only full update on {@code base}: {@code head} (encoded by codec {@code
+   * codec}) holds the table's head with only the snapshots {@code base} lacks and its refs' targets,
+   * dropping {@code removed} of {@code base}'s ({@link NativeDelta#full}). Merged when first asked
+   * for, so replay decodes it only if a record or a load needs the table.
+   */
+  static InlineTable ofHeadOnly(InlineTable base, byte[] head, byte codec, long[] removed) {
+    InlineTable table = new InlineTable(codec, null, null, null);
+    table.pending = new HeadOnly(Objects.requireNonNull(base, "base"), head, removed);
+    return table;
+  }
+
+  private static final class HeadOnly {
+    private final InlineTable base;
+    private final byte[] head;
+    private final long[] removed;
+
+    private HeadOnly(InlineTable base, byte[] head, long[] removed) {
+      this.base = base;
+      this.head = head;
+      this.removed = removed;
+    }
   }
 
   /** The table as {@code fields}, to encode with codec {@code codec}. */
@@ -88,9 +114,22 @@ final class InlineTable {
     return encoded;
   }
 
-  /** The table's fields; decoded once, when first asked for. */
+  /** The table's fields; decoded (or merged, {@link #ofHeadOnly}) once, when first asked for. */
   TableFields fields() {
     TableFields decoded = fields;
+    if (decoded != null) {
+      return decoded;
+    }
+    HeadOnly merge = pending;
+    if (merge != null) {
+      decoded = NativeDelta.full(
+          merge.base.fields(), InlineMetadataCodecs.byTag(codec).decodeFull(merge.head, null),
+          merge.removed);
+      fields = decoded;
+      pending = null; // so a version does not hold every version before it
+      return decoded;
+    }
+    decoded = fields; // a merge that cleared pending set it first
     if (decoded == null) {
       TableMetadata made = metadata;
       decoded = TableFields.of(made != null ? made : decode("inline://decode"));
@@ -110,8 +149,8 @@ final class InlineTable {
     }
     if (made != null) {
       made = TableFields.of(made).toMetadata(location);
-    } else if (fields != null) {
-      made = fields.toMetadata(location);
+    } else if (fields != null || bytes == null) {
+      made = fields().toMetadata(location);
     } else {
       made = decode(location != null ? location : "inline://decode");
     }

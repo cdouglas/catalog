@@ -113,6 +113,15 @@ public class ReplayBench {
   @Param({"0"})
   public int expire;
 
+  /**
+   * One more commit after the appends, to t0, whose record ends the log (with {@code fresh} 1,
+   * {@link #fold} replays it): {@code none}; {@code expire}, of its oldest snapshot; {@code
+   * schema}, a column added; {@code stats}, a statistics file for its current snapshot. Replay
+   * built the whole table for the last three until SNAPSHOT_PAGING.md step 1.
+   */
+  @Param({"none"})
+  public String last;
+
   @Param({"1"})
   public int tables;
 
@@ -288,8 +297,8 @@ public class ReplayBench {
   private byte[] capturedLog() {
     Path cache =
         Path.of("target", "replay-bench",
-            String.format("%s-%s-%s-c%d-e%d-t%d-f%d-p%d.log", mode, encoding, op, commits, expire,
-                tables, files, partitions));
+            String.format("%s-%s-%s-c%d-e%d-t%d-f%d-p%d%s.log", mode, encoding, op, commits, expire,
+                tables, files, partitions, last.equals("none") ? "" : "-" + last));
     try {
       if (Files.exists(cache)) {
         return Files.readAllBytes(cache);
@@ -362,6 +371,29 @@ public class ReplayBench {
         table.expireSnapshots().retainLast(expire).expireOlderThan(System.currentTimeMillis())
             .commit();
       }
+    }
+    Table t0 = handles.get(0);
+    switch (last) {
+      case "none":
+        break;
+      case "expire":
+        t0.expireSnapshots()
+            .expireSnapshotId(Iterables.getFirst(t0.snapshots(), null).snapshotId())
+            .cleanExpiredFiles(false)
+            .commit();
+        break;
+      case "schema":
+        t0.updateSchema().addColumn("added", Types.IntegerType.get()).commit();
+        break;
+      case "stats":
+        long current = t0.currentSnapshot().snapshotId();
+        t0.updateStatistics()
+            .setStatistics(new org.apache.iceberg.GenericStatisticsFile(
+                current, "mem:///stats/" + current + ".puffin", 100, 10, List.of()))
+            .commit();
+        break;
+      default:
+        throw new IllegalArgumentException("Unknown last: " + last);
     }
     return read(io);
   }

@@ -120,7 +120,7 @@ for framing):
 | Mode        | Payload                            | When used                                   |
 |-------------|------------------------------------|---------------------------------------------|
 | **Delta**   | Structured `TableMetadataDelta`    | The table is inline (common path for data commits and DDL) |
-| **Full**    | Complete encoded `TableMetadata`   | No delta: the table is a pointer table (re-inlining), the delta does not fit, or `computeDelta` returns none: it finds no update, or cannot express the change (a format-version upgrade, a removed ref, a change to the encryption keys, a statistics change, an id collision, a new schema or spec that replay would number otherwise, a new sort order or spec that does not bind to the commit's schema, a last column or partition id other than the larger of the base's and the highest field id in the commit's new schemas or specs, new snapshot-log entries other than replay's: none if main did not move, else one, last, for main's new snapshot at the snapshot's own timestamp if the commit added it and at last-updated-ms otherwise (a rollback), new snapshots whose sequence numbers or row ids do not follow the base's) |
+| **Full**    | Encoded `TableMetadata`: on an inline table, head only (`head_only`): its head with only the snapshots the version it read lacks and its refs' targets, with the ids of that version's snapshots it drops (replay keeps the others, in their order, then appends the new ones); on a pointer table, the whole table, which replaces it | No delta: the table is a pointer table (re-inlining), the delta does not fit, or `computeDelta` returns none: it finds no update, or cannot express the change (a format-version upgrade, a removed ref, a change to the encryption keys, a statistics change, an id collision, a new schema or spec that replay would number otherwise, a new sort order or spec that does not bind to the commit's schema, a last column or partition id other than the larger of the base's and the highest field id in the commit's new schemas or specs, new snapshot-log entries other than replay's: none if main did not move, else one, last, for main's new snapshot at the snapshot's own timestamp if the commit added it and at last-updated-ms otherwise (a rollback), new snapshots whose sequence numbers or row ids do not follow the base's) |
 | **Pointer** | Metadata file location (`UpdateTableLocation`) | Neither fits, or a new inline-ML snapshot restates a pooled manifest (see [SPEC_ML.md](SPEC_ML.md)): the table leaves inline storage (eviction) |
 
 Manifest updates of new inline-ML snapshots count toward the payload
@@ -180,6 +180,13 @@ message UpdateTableInline {
                                                 //   (see SPEC_ML.md)
   bool                pinned              = 8;  // applies only on `version`,
                                                 //   whatever the encoding
+  repeated int64      removed_snapshot_ids = 9; // with head_only: the snapshots
+                                                //   of `version` it drops
+  bool                head_only           = 10; // full_metadata holds the head
+                                                //   and only the snapshots
+                                                //   `version` lacks (and its
+                                                //   refs' targets); only on an
+                                                //   inline table
 }
 ```
 
@@ -545,8 +552,9 @@ content. Delta encoding can't express an in-place id swap — Builder's
 `addSortOrderInternal` short-circuits on existing ids, and there's no
 public `removeSortOrders` / `replaceSortOrder`. `computeDelta` detects
 this at the top of the diff and returns `null`, which the commit
-routes to **full mode**. Full mode serializes the new TM verbatim, so
-the collision resolves naturally on the next read.
+routes to **full mode**. Full mode serializes the new TM (on an inline
+table, without the snapshots its base already holds), so the collision
+resolves naturally on the next read.
 
 For an **inline-ML** table, full mode carries the new snapshots' manifest-list
 updates in its `ml_delta` payload, with the list of any inline snapshot

@@ -234,6 +234,70 @@ final class TableFields implements MetadataView {
         encryptionKeys);
   }
 
+  /**
+   * The table's head as metadata: these fields without snapshots, refs, logs or statistics, for the
+   * builder to apply the updates that read none of them (location, schemas, specs, sort orders;
+   * {@link NativeDelta}). No metadata location, so a build of it logs none.
+   */
+  TableMetadata head() {
+    return InlineTableMetadata.create(
+        null,
+        formatVersion,
+        uuid,
+        location,
+        lastSequenceNumber,
+        lastUpdatedMillis,
+        lastColumnId,
+        currentSchemaId,
+        schemas,
+        defaultSpecId,
+        specs,
+        lastAssignedPartitionId,
+        defaultSortOrderId,
+        sortOrders,
+        properties,
+        -1L,
+        List.of(),
+        List.of(),
+        List.of(),
+        Map.of(),
+        List.of(),
+        List.of(),
+        nextRowId,
+        encryptionKeys);
+  }
+
+  /** These fields with the head of {@code head} ({@link #head}, after the builder's updates). */
+  TableFields withHead(TableMetadata head) {
+    return new TableFields(
+        formatVersion,
+        uuid,
+        head.location(),
+        lastSequenceNumber,
+        lastUpdatedMillis,
+        head.lastColumnId(),
+        head.currentSchemaId(),
+        head.schemas(),
+        head.schemasById(),
+        head.defaultSpecId(),
+        head.specs(),
+        head.specsById(),
+        head.lastAssignedPartitionId(),
+        head.defaultSortOrderId(),
+        head.sortOrders(),
+        head.sortOrdersById(),
+        properties,
+        currentSnapshotId,
+        snapshots,
+        snapshotLog,
+        previousFiles,
+        refs,
+        statisticsFiles,
+        partitionStatisticsFiles,
+        nextRowId,
+        encryptionKeys);
+  }
+
   /** These fields with {@code newSnapshots}, the same snapshots by id, in their place. */
   TableFields withSnapshots(List<Snapshot> newSnapshots) {
     return new TableFields(

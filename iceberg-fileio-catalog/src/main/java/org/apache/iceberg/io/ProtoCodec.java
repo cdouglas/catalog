@@ -249,6 +249,10 @@ public class ProtoCodec {
   // The update applies only on the version it names, whatever the catalog's conflict encoding: a
   // table a catalog transaction writes.
   private static final int UPDATE_INLINE_PINNED = 8;
+  // With HEAD_ONLY: the snapshots of its base the update drops (packed)
+  private static final int UPDATE_INLINE_REMOVED_SNAPSHOT_IDS = 9;
+  // FULL on an inline table: full_metadata holds the head and only the snapshots its base lacks
+  private static final int UPDATE_INLINE_HEAD_ONLY = 10;
 
   // CreateTableInline field numbers
   private static final int CREATE_INLINE_TBL_ID = 1;
@@ -903,6 +907,16 @@ public class ProtoCodec {
         if (a.mlDeltaBytes != null) {
           writeBytes(inner, UPDATE_INLINE_ML_DELTA, a.mlDeltaBytes);
         }
+        if (a.headOnly) {
+          writeVarint(inner, UPDATE_INLINE_HEAD_ONLY, 1);
+        }
+        if (a.removedSnapshotIds.length > 0) {
+          ByteArrayOutputStream packed = new BytesOut();
+          for (long removed : a.removedSnapshotIds) {
+            org.intentlog.wire.ProtoWire.writeRawVarint64(packed, removed);
+          }
+          writeLengthDelimited(inner, UPDATE_INLINE_REMOVED_SNAPSHOT_IDS, packed.toByteArray());
+        }
       } else if (a.metadataLocation != null) {
         writeString(inner, UPDATE_INLINE_METADATA_LOCATION, a.metadataLocation);
       }
@@ -1239,6 +1253,8 @@ public class ProtoCodec {
     Byte fullMetadataCodec = null;
     byte[] mlDeltaBytes = null;
     boolean pinned = false;
+    List<Long> removed = new ArrayList<>();
+    boolean headOnly = false;
 
     while (in.available() > 0) {
       int tag = readVarint(in);
@@ -1268,6 +1284,19 @@ public class ProtoCodec {
         case UPDATE_INLINE_PINNED:
           pinned = readVarint(in) != 0;
           break;
+        case UPDATE_INLINE_HEAD_ONLY:
+          headOnly = readVarint(in) != 0;
+          break;
+        case UPDATE_INLINE_REMOVED_SNAPSHOT_IDS:
+          if ((tag & 0x7) == org.intentlog.wire.ProtoWire.WIRE_LENGTH_DELIMITED) {
+            ByteArrayInputStream packed = new ByteArrayInputStream(readLengthDelimitedBytes(in));
+            while (packed.available() > 0) {
+              removed.add(readVarint64(packed));
+            }
+          } else {
+            removed.add(readVarint64(in));
+          }
+          break;
         default:
           skipField(in, tag & 0x7);
       }
@@ -1279,7 +1308,8 @@ public class ProtoCodec {
     return new UpdateTableInlineAction(
         id, version, deltaBytes, fullMetadata,
         fullMetadataCodec != null ? fullMetadataCodec : InlineMetadataCodecs.TAG_JSON_GZIP,
-        metadataLocation, mlDeltaBytes, pinned);
+        metadataLocation, mlDeltaBytes, pinned, headOnly,
+        removed.stream().mapToLong(Long::longValue).toArray());
   }
 
   private static SetConflictEncodingAction decodeSetConflictEncoding(byte[] bytes)
@@ -2299,6 +2329,15 @@ public class ProtoCodec {
      */
     final byte[] mlDeltaBytes;
     /**
+     * With FULL on an inline table: {@link #fullMetadata} holds the table's head with only the
+     * snapshots the version it read lacks and its refs' targets, and replay keeps that version's
+     * others, minus {@link #removedSnapshotIds} ({@link NativeDelta#full}). Without it, the full
+     * metadata is the whole table.
+     */
+    final boolean headOnly;
+    /** With {@link #headOnly}, the snapshots of the version it read that the update drops. */
+    final long[] removedSnapshotIds;
+    /**
      * Whether the update applies only on the version it names, whatever the catalog's conflict
      * encoding: a table a catalog transaction writes must be at the version the transaction first
      * read (errata D12).
@@ -2325,6 +2364,16 @@ public class ProtoCodec {
     public UpdateTableInlineAction(
         int id, int version, byte[] deltaBytes, byte[] fullMetadata,
         byte fullMetadataCodec, String metadataLocation, byte[] mlDeltaBytes, boolean pinned) {
+      this(id, version, deltaBytes, fullMetadata, fullMetadataCodec, metadataLocation,
+          mlDeltaBytes, pinned, false, new long[0]);
+    }
+
+    public UpdateTableInlineAction(
+        int id, int version, byte[] deltaBytes, byte[] fullMetadata,
+        byte fullMetadataCodec, String metadataLocation, byte[] mlDeltaBytes, boolean pinned,
+        boolean headOnly, long[] removedSnapshotIds) {
+      this.headOnly = headOnly;
+      this.removedSnapshotIds = removedSnapshotIds != null ? removedSnapshotIds : new long[0];
       this.id = id;
       this.version = version;
       this.deltaBytes = deltaBytes;
@@ -2339,7 +2388,18 @@ public class ProtoCodec {
     public UpdateTableInlineAction pin() {
       return new UpdateTableInlineAction(
           id, version, deltaBytes, fullMetadata, fullMetadataCodec, metadataLocation, mlDeltaBytes,
-          true);
+          true, headOnly, removedSnapshotIds);
+    }
+
+    /**
+     * This FULL update of an inline table as head only ({@link #headOnly}): its metadata holds only
+     * the snapshots its base lacks and its refs' targets, and it drops {@code removed} of its
+     * base's.
+     */
+    public UpdateTableInlineAction headOnly(long[] removed) {
+      return new UpdateTableInlineAction(
+          id, version, deltaBytes, fullMetadata, fullMetadataCodec, metadataLocation, mlDeltaBytes,
+          pinned, true, removed);
     }
 
     /** Creates an UpdateTableInlineAction in DELTA mode (codec inherited from base). */
@@ -2388,7 +2448,17 @@ public class ProtoCodec {
       // The table's version must be the one the update read, unless the catalog's conflict
       // encoding admits a delta on a version that changed since, finalized where it lands; and
       // its manifest updates must leave every pooled entry as it is.
-      return ConflictEncodings.admits(table(), builder) && !restatesPooledManifest(builder);
+      return ConflictEncodings.admits(table(), builder) && !restatesPooledManifest(builder)
+          && !headOnlyOnAPointerTable(builder);
+    }
+
+    /**
+     * Whether this is a head-only full update ({@link #headOnly}) of a table that is not inline,
+     * which holds no snapshots to keep: it does not apply. Writers send one only for an inline
+     * table, at the version they read, where it lands (a full update is pinned).
+     */
+    private boolean headOnlyOnAPointerTable(CatalogState.Builder builder) {
+      return headOnly && fullMetadata != null && !builder.isInlineTable(id);
     }
 
     @Override
@@ -2397,7 +2467,10 @@ public class ProtoCodec {
       if (why != null) {
         return why;
       }
-      return restatesPooledManifest(builder) ? POOL_RESTATED : null;
+      if (restatesPooledManifest(builder)) {
+        return POOL_RESTATED;
+      }
+      return headOnlyOnAPointerTable(builder) ? "full: head only on a pointer table" : null;
     }
 
     /**
@@ -2447,73 +2520,48 @@ public class ProtoCodec {
         // DELTA mode: apply structured changes to current inline metadata, which keeps its codec
         // (codec changes only happen via FULL re-inline). The ML updates go to the builder's
         // manifest pool; on a version later than the one the update read, the delta's late-bound
-        // fields are finalized there (Landing). A delta of snapshots, refs and properties replays
-        // on the table's fields (NativeDelta); any other, on its metadata through Iceberg's
-        // builder.
+        // fields are finalized there (Landing). Every delta replays on the table's fields
+        // (NativeDelta), which build no metadata of the whole table.
         InlineTable current = builder.inlineTable(id);
         if (current != null && builder.tableEntry(id) != null) {
           boolean stale = next - 1 != version;
           String location = builder.inlineLocation(id);
           InlineDeltaCodec.DecodedDelta delta = table().delta();
-          InlineTable updated;
-          if (NativeDelta.applies(delta)) {
-            TableFields base = current.fields();
-            TableFields applied = NativeDelta.apply(base, delta, builder, id, stale, location);
-            if (NativeDelta.CHECK) {
-              NativeDelta.check(
-                  base, location, delta, stale, "", applied);
-            }
-            updated = InlineTable.ofFields(applied, current.codec());
-          } else {
-            updated = InlineTable.ofMetadata(
-                InlineDeltaCodec.applyDelta(current.metadata(location), delta, builder, id, stale),
-                current.codec());
-          }
-          builder.updateInlineTable(id, next, updated);
+          TableFields applied =
+              NativeDelta.apply(current.fields(), delta, builder, id, stale, location);
+          builder.updateInlineTable(id, next, InlineTable.ofFields(applied, current.codec()));
         }
       } else if (fullMetadata != null) {
-        // FULL mode: replace inline metadata bytes in place, preserving the
-        // manifest pool. `removeInlineMetadata` (used by the POINTER branch
-        // below) also clears the pool — that's the correct behavior for
-        // pointer-mode eviction, but would silently corrupt an ML-populated
-        // table on a non-ML commit (schema evolution, etc.).
+        // FULL mode. On an inline table the record holds the table's head with only the snapshots
+        // the version it read lacks, and its refs' targets, and names those of that version's it
+        // drops: replay keeps the others (NativeDelta.full), never building the whole table from
+        // the record. On a pointer table it holds the whole table, which returns to inline storage.
+        // Either way the manifest pool is kept (removeInlineMetadata, the POINTER branch below,
+        // clears it, as an eviction must), and the bundled manifest updates (if any) land the new
+        // snapshots' lists with the metadata: a full-mode commit carries them whenever it adds an
+        // inline-ML snapshot or names one the table has no list for (Bug 62).
         CatalogState.TblEntry old = builder.tableEntry(id);
         if (old != null) {
-          builder.updateInlineMetadata(id, next, fullMetadata, fullMetadataCodec);
-          // Apply bundled ML pool delta first (if any), so any AddManifest
-          // entries for new snapshots populate the pool before we reconcile
-          // refs against the new TM. A full-mode commit carries one whenever it
-          // adds an inline-ML snapshot or names one the table has no list for,
-          // so the lists land atomically with the TM replacement.
-          // applyManifestsOnly finds each snapshot's parent in the new TM bytes
-          // and ignores any table metadata update, which the new TM holds.
+          InlineTable current = builder.inlineTable(id);
+          // A head-only update merges when its table is first read (verify admits one only on an
+          // inline table): replay decodes no table's metadata that it does not need
+          InlineTable after = headOnly && current != null
+              ? InlineTable.ofHeadOnly(current, fullMetadata, fullMetadataCodec, removedSnapshotIds)
+              : InlineTable.ofBytes(fullMetadata, fullMetadataCodec);
+          builder.updateInlineTable(id, next, after);
           if (mlDeltaBytes != null) {
-            InlineMetadataCodec codec = InlineMetadataCodecs.byTag(fullMetadataCodec);
-            InlineDeltaCodec.applyManifestsOnly(mlDeltaBytes, builder, id, codec, fullMetadata);
+            InlineDeltaCodec.applyManifestsOnly(mlDeltaBytes, builder, id, after.fields());
           }
-          // Reconcile snapshot manifest refs (and orphan'd pool entries)
-          // against the snapshots present in the new TM. Delta-mode replay
-          // handles this via RemoveSnapshotsUpdate (in InlineDeltaCodec
-          // applyDeltaWithManifests); full-mode replay swaps the entire TM bytes in one
-          // shot, so we re-derive the live snapshot set from the new bytes
-          // and prune anything that's no longer referenced. Without this,
-          // a full-mode commit that drops a snapshot (e.g. expireSnapshots
-          // co-committed with a statistics change that flips computeDelta
-          // to null) leaves orphan refs that bloat the catalog file and
-          // reference storage paths storage GC may later delete.
-          //
-          // Only ML-populated tables have refs to reconcile; skip the decode
-          // for TM-only inline tables (no pool entries to prune anyway).
+          // The lists of the snapshots the table no longer has, and the pool entries no list
+          // names any more: a delta drops them with its RemoveSnapshotsUpdate (applyDelta); a full
+          // update may drop snapshots too (an expiry co-committed with a statistics change, which
+          // a delta cannot carry), and orphaned lists would name files storage GC may delete. Only
+          // a table with inline lists has any, so a table without decodes nothing here.
           Set<Long> existingRefs = builder.snapshotManifestKeys(id);
           if (!existingRefs.isEmpty()) {
-            InlineMetadataCodec codec = InlineMetadataCodecs.byTag(fullMetadataCodec);
-            TableMetadata newMeta = codec.decodeFull(fullMetadata, "inline://reconcile");
-            Set<Long> liveSnapIds = new HashSet<>();
-            for (Snapshot s : newMeta.snapshots()) {
-              liveSnapIds.add(s.snapshotId());
-            }
+            TableFields fields = after.fields();
             for (Long staleId : existingRefs) {
-              if (!liveSnapIds.contains(staleId)) {
+              if (fields.snapshot(staleId) == null) {
                 builder.removeSnapshotManifests(id, staleId);
               }
             }

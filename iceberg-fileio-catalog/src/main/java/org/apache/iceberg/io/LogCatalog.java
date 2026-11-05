@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.io;
 
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -38,8 +39,10 @@ import org.apache.iceberg.InlineSnapshot;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Snapshot;
+import org.apache.iceberg.SnapshotRef;
 import org.apache.iceberg.CatalogUtil;
 import org.apache.iceberg.TableMetadata;
+import org.apache.iceberg.TableMetadataParser;
 import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.Transaction;
 import org.apache.iceberg.catalog.BaseCatalogTransaction;
@@ -947,7 +950,16 @@ public class LogCatalog extends BaseMetastoreCatalog
           mut.updateTable(tableId, writeUpdateMetadata(false, metadata));
           return;
         }
-        byte[] fullBytes = inline.codec.encode(rewriteInlineSnapshotsForFullEncode(metadata));
+        // On an inline table, the metadata goes with only the snapshots the version read lacks
+        // and its refs' targets, naming those of that version's it drops: replay keeps the rest
+        // (NativeDelta.full). A pointer table returns to inline storage whole.
+        TableFields held = isInline ? proto.inlineTable(tblId).fields() : null;
+        TableMetadata sent = held != null ? withNewSnapshots(held, metadata) : metadata;
+        byte[] fullBytes = inline.codec.encode(rewriteInlineSnapshotsForFullEncode(sent));
+        long[] removed = held != null ? removedSnapshots(held, metadata) : null;
+        if (held != null && NativeDelta.CHECK) {
+          checkFullUpdate(held, metadata, fullBytes, removed);
+        }
         byte[] manifestBytes =
             manifests == null
                 ? null
@@ -960,10 +972,67 @@ public class LogCatalog extends BaseMetastoreCatalog
           } else {
             mut.updateTableInline(tableId, fullBytes, inline.codec.tag());
           }
+          if (removed != null) {
+            mut.removingSnapshots(tableId, removed);
+          }
           return;
         }
       }
       mut.updateTable(tableId, writeUpdateMetadata(false, metadata));
+    }
+
+    /**
+     * {@code metadata} with only the snapshots {@code held} (the table as the update's version holds
+     * it) lacks, and those its refs target, which a {@code TableMetadata} must hold: what a full
+     * update of an inline table sends.
+     */
+    private static TableMetadata withNewSnapshots(TableFields held, TableMetadata metadata) {
+      Set<Long> targets = new HashSet<>();
+      for (SnapshotRef ref : metadata.refs().values()) {
+        targets.add(ref.snapshotId());
+      }
+      List<Snapshot> sent = new ArrayList<>();
+      for (Snapshot snapshot : metadata.snapshots()) {
+        if (held.snapshot(snapshot.snapshotId()) == null
+            || targets.contains(snapshot.snapshotId())) {
+          sent.add(snapshot);
+        }
+      }
+      if (sent.size() == metadata.snapshots().size()) {
+        return metadata;
+      }
+      return TableFields.of(metadata).withSnapshots(sent)
+          .toMetadata(metadata.metadataFileLocation());
+    }
+
+    /** The ids of {@code held}'s snapshots that {@code metadata} drops, in their order. */
+    private static long[] removedSnapshots(TableFields held, TableMetadata metadata) {
+      List<Long> removed = new ArrayList<>();
+      for (Snapshot snapshot : held.snapshots) {
+        if (metadata.snapshot(snapshot.snapshotId()) == null) {
+          removed.add(snapshot.snapshotId());
+        }
+      }
+      return removed.stream().mapToLong(Long::longValue).toArray();
+    }
+
+    /**
+     * Checks ({@link NativeDelta#CHECK}) that replay of the full update ({@code fullBytes} and
+     * {@code removed} on {@code held}) makes the metadata the whole of {@code metadata} would.
+     */
+    private void checkFullUpdate(
+        TableFields held, TableMetadata metadata, byte[] fullBytes, long[] removed) {
+      TableMetadata whole = inline.codec.decodeFull(
+          inline.codec.encode(rewriteInlineSnapshotsForFullEncode(metadata)), null);
+      TableFields replayed =
+          NativeDelta.full(held, inline.codec.decodeFull(fullBytes, null), removed);
+      String expected = TableMetadataParser.toJson(whole);
+      String actual = TableMetadataParser.toJson(replayed.toMetadata(null));
+      if (!expected.equals(actual)) {
+        throw new IllegalStateException(
+            "A full update's replay differs from its metadata:\n  metadata: " + expected
+                + "\n  replay:   " + actual);
+      }
     }
 
     /**

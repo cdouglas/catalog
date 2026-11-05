@@ -72,6 +72,9 @@ public class CatalogMutation {
   // staged manifest-list updates that must land atomically with the TM
   // replacement.
   private final Map<TableIdentifier, byte[]> inlineTableUpdateMlDeltas;
+  // Companion to {@link #inlineTableUpdates} for an inline table: the snapshots of the version
+  // read that the update drops, its metadata holding only those that version lacks
+  private final Map<TableIdentifier, long[]> inlineTableUpdateRemovals;
   // Codec tags parallel to inlineTables / inlineTableUpdates.
   private final Map<TableIdentifier, Byte> inlineTableCodecs;
   private final Map<TableIdentifier, Byte> inlineTableUpdateCodecs;
@@ -96,6 +99,7 @@ public class CatalogMutation {
     this.inlineTableDeltaUpdates = Maps.newHashMap();
     this.inlineTableCreateDeltas = Maps.newHashMap();
     this.inlineTableUpdateMlDeltas = Maps.newHashMap();
+    this.inlineTableUpdateRemovals = Maps.newHashMap();
     this.inlineTableCodecs = Maps.newHashMap();
     this.inlineTableUpdateCodecs = Maps.newHashMap();
     this.tableRenames = Maps.newHashMap();
@@ -309,6 +313,7 @@ public class CatalogMutation {
     inlineTableUpdates.remove(tableId);
     inlineTableUpdateCodecs.remove(tableId);
     inlineTableUpdateMlDeltas.remove(tableId);
+    inlineTableUpdateRemovals.remove(tableId);
     inlineTableDeltaUpdates.remove(tableId);
     tables.put(tableId, null);
     return this;
@@ -371,6 +376,16 @@ public class CatalogMutation {
       TableIdentifier table, byte[] metadata, byte codecTag, byte[] mlDeltaBytes) {
     updateTableInline(table, metadata, codecTag);
     inlineTableUpdateMlDeltas.put(table, mlDeltaBytes);
+    return this;
+  }
+
+  /**
+   * Makes the full update of {@code table}, an inline table ({@link #updateTableInline}), one whose
+   * metadata holds only the snapshots the version this transaction read lacks, and its refs'
+   * targets, dropping {@code removed} of that version's snapshots (SNAPSHOT_PAGING.md step 1).
+   */
+  public CatalogMutation removingSnapshots(TableIdentifier table, long[] removed) {
+    inlineTableUpdateRemovals.put(table, removed);
     return this;
   }
 
@@ -608,6 +623,10 @@ public class CatalogMutation {
         ProtoCodec.UpdateTableInlineAction update = mlDelta != null
             ? ProtoCodec.UpdateTableInlineAction.full(tblId, version, metadata, codec, mlDelta)
             : ProtoCodec.UpdateTableInlineAction.full(tblId, version, metadata, codec);
+        long[] removed = inlineTableUpdateRemovals.get(ident);
+        if (removed != null) {
+          update = update.headOnly(removed);
+        }
         actions.add(pinned.contains(ident) ? update.pin() : update);
       }
     }

@@ -657,6 +657,24 @@ public class InlineDeltaCodec {
   public static void applyManifestsOnly(
       byte[] deltaBytes, CatalogState.Builder catalogBuilder, int tableId,
       InlineMetadataCodec newMetadataCodec, byte[] newMetadataBytes) {
+    TableMetadata current =
+        newMetadataCodec.decodeFull(newMetadataBytes, "inline://manifests-only");
+    applyManifestsOnly(
+        deltaBytes, catalogBuilder, tableId, current.snapshots(), MetadataView.of(current));
+  }
+
+  /**
+   * As {@link #applyManifestsOnly(byte[], CatalogState.Builder, int, InlineMetadataCodec, byte[])},
+   * with the table after the update as replay keeps it.
+   */
+  static void applyManifestsOnly(
+      byte[] deltaBytes, CatalogState.Builder catalogBuilder, int tableId, TableFields table) {
+    applyManifestsOnly(deltaBytes, catalogBuilder, tableId, table.snapshots, table);
+  }
+
+  private static void applyManifestsOnly(
+      byte[] deltaBytes, CatalogState.Builder catalogBuilder, int tableId,
+      Iterable<Snapshot> snapshots, MetadataView current) {
     String prefix = catalogBuilder.manifestListPrefix(tableId);
     if (prefix == null) {
       prefix = "";
@@ -667,19 +685,17 @@ public class InlineDeltaCodec {
     String unresolved = decoded.unresolvedNames(prefix);
     Preconditions.checkState(unresolved == null, "Manifest updates of table %s: %s", tableId,
         unresolved);
-    TableMetadata current =
-        newMetadataCodec.decodeFull(newMetadataBytes, "inline://manifests-only");
     NewSnapshotManifests newSnapshots = new NewSnapshotManifests(catalogBuilder, tableId);
     List<Long> removedSnapshots = new ArrayList<>();
     // Register the new TM's inline snapshots that have no list yet (the ones this update adds),
     // parents first, so the invariant sentinel => pool entry holds even for a snapshot that changes
     // no manifests and so has no updates here.
     Set<Long> listed = catalogBuilder.snapshotManifestKeys(tableId);
-    for (Snapshot snap : current.snapshots()) {
+    for (Snapshot snap : snapshots) {
       String location = snap.manifestListLocation();
       if (location != null && location.startsWith("inline://")
           && !listed.contains(snap.snapshotId())) {
-        newSnapshots.add(MetadataView.of(current), snap.snapshotId());
+        newSnapshots.add(current, snap.snapshotId());
       }
     }
     for (DeltaUpdate update : decoded.updates) {
@@ -688,16 +704,16 @@ public class InlineDeltaCodec {
         // Register sentinel snapshots so applyDeltaWithManifests's invariant
         // (sentinel ⇒ pool entry) holds even without manifest updates.
         if (addSnap.manifestListSuffix.isEmpty()) {
-          newSnapshots.add(MetadataView.of(current), addSnap.snapshotId);
+          newSnapshots.add(current, addSnap.snapshotId);
         }
       } else if (update instanceof AddManifestUpdate) {
         AddManifestUpdate add = (AddManifestUpdate) update;
         ManifestFile resolved = resolve(add.manifest, prefix);
         catalogBuilder.addManifestToPool(tableId, resolved);
         newSnapshots.addManifest(
-            MetadataView.of(current), add.snapshotId, resolved.path(), add.position);
+            current, add.snapshotId, resolved.path(), add.position);
       } else if (update instanceof RemoveManifestUpdate) {
-        newSnapshots.removeManifest(MetadataView.of(current), (RemoveManifestUpdate) update);
+        newSnapshots.removeManifest(current, (RemoveManifestUpdate) update);
       } else if (update instanceof RemoveSnapshotsUpdate) {
         removedSnapshots.addAll(((RemoveSnapshotsUpdate) update).snapshotIds);
       }

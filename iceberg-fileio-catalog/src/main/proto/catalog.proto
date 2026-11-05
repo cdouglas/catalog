@@ -323,6 +323,17 @@ message UpdateTableInline {
   // Absent: a delta may apply on a later version if the encoding admits it
   // there, finalized where it lands (SPEC_TM.md "Late-bound fields").
   bool pinned = 8;
+  // With head_only: the ids of the snapshots of the version the update read
+  // that it drops.
+  repeated int64 removed_snapshot_ids = 9;
+  // With full_metadata on an inline table: full_metadata holds the table's
+  // head with only the snapshots the version it read lacks, and the ones its
+  // refs target. Replay keeps that version's other snapshots, minus
+  // removed_snapshot_ids, in their order, and appends the new ones
+  // (SNAPSHOT_PAGING.md step 1), never building the whole table from the
+  // record. Absent, full_metadata holds the whole table (as on a pointer
+  // table returning to inline storage), which replaces the table's.
+  bool head_only = 10;
 }
 
 // ============================================================
