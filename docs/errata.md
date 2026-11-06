@@ -188,7 +188,8 @@ position (or a truncated digest), about 3% of a 330-byte record.
 
 **Trigger to revisit:** a dedicated task, before relying on S3 in production,
 before tail reads (D15), or before a production shared log (S4). It takes over
-the format half of D15 and the checks S4 and T6 ask for.
+the format half of D15 and the checks S4 and T6 ask for. The one-object half is
+planned in [TAIL_READS.md](TAIL_READS.md) (proposed 2026-11-06); S4 stays open.
 
 ## Deferred Functionality
 
@@ -417,6 +418,7 @@ prices a GET by its bytes.
 catalog-bench's `s3x-2026-11` profile (measured, 7 ms a MiB read) now prices
 it, and a commit paid it four times (D20); twice since D20's fix (its load and
 the refresh before it applies), which ranged reads would make once.
+Plan: [TAIL_READS.md](TAIL_READS.md) (proposed 2026-11-06), with S5's format half.
 
 ### D16. Replay rewrites the whole committed set, and every checkpoint carries it
 
@@ -949,6 +951,8 @@ What remains:
 
 **Trigger to revisit:** before tail reads (D15), before relying on S3 or GCS
 in production, or when `InMemoryAtomicFileIO` binds a file at its lookup.
+The fuzzer read modes (a store that breaks its contract) are step 2 of
+[TAIL_READS.md](TAIL_READS.md).
 
 ## Known Unknowns
 
