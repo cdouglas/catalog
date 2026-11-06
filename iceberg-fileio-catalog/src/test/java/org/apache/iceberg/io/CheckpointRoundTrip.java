@@ -473,6 +473,15 @@ public final class CheckpointRoundTrip {
                 pool.forEach(
                     (path, manifest) ->
                         items.put("table " + id + " manifest " + path, describe(manifest))));
+    file.allPoolOrdinals()
+        .forEach(
+            (id, ordinals) ->
+                ordinals.forEach(
+                    (path, ordinal) ->
+                        items.put("table " + id + " manifest " + path + " ordinal",
+                            String.valueOf(ordinal))));
+    file.allNextOrdinals()
+        .forEach((id, next) -> items.put("table " + id + " next ordinal", String.valueOf(next)));
     file.allSnapshotManifests()
         .forEach(
             (id, refs) ->

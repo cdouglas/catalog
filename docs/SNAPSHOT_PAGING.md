@@ -1,7 +1,7 @@
 # Paging a table's snapshots (design)
 
-Status: proposed 2026-11-04, revised 2026-11-05 after review; step 1 built
-(2026-11-05, measured in REPLAY_BENCH_RESULTS.md); steps 2-6 not built.
+Status: proposed 2026-11-04, revised 2026-11-05 after review; steps 1 and 2
+built (2026-11-05, measured in REPLAY_BENCH_RESULTS.md); steps 3-6 not built.
 Errata D18 (ML lists stored whole) tracks the problem; D17 (expiry starves)
 and D19 (whole-object compaction trigger) are what it costs. It is R2.1 and
 part of R2.2 in [CHECKPOINT_PLAN.md](CHECKPOINT_PLAN.md), under its
@@ -20,8 +20,9 @@ An inline table lives whole in the checkpoint (`InlineTable`, catalog.proto):
   `write.metadata.previous-versions-max`. The snapshot block cannot be decoded
   one snapshot at a time.
 - **Its manifest lists (ML).** The pool holds each manifest's entry once; each
-  snapshot's list is written whole, as indices into the pool sorted by path,
-  so one new manifest renumbers every list that names a later path.
+  snapshot's list was written whole, as indices into the pool sorted by path,
+  so one new manifest renumbered every list that named a later path (until
+  step 2, below).
 
 So the checkpoint grows with every snapshot a table keeps:
 
@@ -580,7 +581,16 @@ Each step stands alone and is measured before the next:
    size at 3,000 snapshots and replays 2.6-5.3 times faster, and an expiry
    costs what it did (REPLAY_BENCH_RESULTS.md).
 2. **Lists by ordinal and as deltas** (R2.1). A format change, no pages. This
-   alone fixes fast appends' square growth (D18).
+   alone fixes fast appends' square growth (D18). Built 2026-11-05: a pooled
+   manifest's ordinal comes from the table's counter (`next_ordinal`) when
+   the table first pools it, and the checkpoint writes the pool in ordinal
+   order (`pool_ordinals`); a list goes whole (`ordinals`) or as a change of
+   its parent's (`base`, the entry that many before it; `removed`; `added`),
+   whichever is smaller, and whole every 64 along a chain (`ManifestLists`:
+   a change keeps the longest run of the parent's manifests the list holds
+   in the parent's order). Lists go in the table's snapshot order, so a
+   parent's precedes its children's. A table whose metadata does not decode
+   (tests' placeholders) has its lists written whole.
 3. **Lazy loads.** Blocks as the unit of decoding, lists resolved on first
    use, loads through the supplier, and the fork following #18073 and
    changing `SerializableTable`, with tests in the fork; behind

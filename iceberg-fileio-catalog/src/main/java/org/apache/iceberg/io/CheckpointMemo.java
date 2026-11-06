@@ -61,18 +61,23 @@ final class CheckpointMemo {
     private final String prefix;
     private final Map<String, ManifestFile> pool;
     private final Map<Long, List<String>> lists;
+    private final Map<String, Integer> ordinals;
+    private final int nextOrdinal;
     private final EncodingState conflict;
     private final EncodingState.Codec codec;
 
     Inputs(
         CatalogState.TblEntry row, InlineTable metadata, String prefix,
-        Map<String, ManifestFile> pool, Map<Long, List<String>> lists, EncodingState conflict,
+        Map<String, ManifestFile> pool, Map<Long, List<String>> lists,
+        Map<String, Integer> ordinals, int nextOrdinal, EncodingState conflict,
         EncodingState.Codec codec) {
       this.row = row;
       this.metadata = metadata;
       this.prefix = prefix;
       this.pool = pool;
       this.lists = lists;
+      this.ordinals = ordinals;
+      this.nextOrdinal = nextOrdinal;
       this.conflict = conflict;
       this.codec = codec;
     }
@@ -83,6 +88,8 @@ final class CheckpointMemo {
           && prefix.equals(other.prefix)
           && pool == other.pool
           && lists == other.lists
+          && ordinals == other.ordinals
+          && nextOrdinal == other.nextOrdinal
           && conflict == other.conflict
           && codec == other.codec;
     }
@@ -98,7 +105,7 @@ final class CheckpointMemo {
       this.id = id;
       // Without the row, which would keep the entry alive
       this.inputs = new Inputs(null, inputs.metadata, inputs.prefix, inputs.pool, inputs.lists,
-          inputs.conflict, inputs.codec);
+          inputs.ordinals, inputs.nextOrdinal, inputs.conflict, inputs.codec);
       this.bytes = bytes;
     }
   }

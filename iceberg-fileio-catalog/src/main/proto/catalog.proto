@@ -163,10 +163,20 @@ message InlineTable {
   // write.metadata.path, or its location's metadata folder): the dictionary
   // entry its manifests' names are under (ManifestFileEntry).
   string manifest_prefix      = 6;
-  repeated ManifestFileEntry manifest_pool       = 7;  // unique manifests for this table, by path
-  repeated SnapshotManifestRefs snapshot_refs    = 8;  // per-snapshot index lists into pool, by snapshot id
+  // The table's pooled manifests, each once, in the order of their ordinals
+  // (pool_ordinals).
+  repeated ManifestFileEntry manifest_pool       = 7;
+  // Each snapshot's manifest list, whole or as a change of its parent's, a
+  // parent's before its children's (SnapshotManifestRefs).
+  repeated SnapshotManifestRefs snapshot_refs    = 8;
   InlineMetadataCodec metadata_codec             = 9;  // codec for `metadata`
   bytes  conflict_state                          = 10; // as Table.conflict_state
+  // The ordinal the table's next newly pooled manifest takes: a pooled
+  // manifest's ordinal is assigned once, when the table first pools it, so a
+  // new manifest renumbers nothing (SNAPSHOT_PAGING.md "Lists").
+  uint32 next_ordinal                            = 11;
+  // The ordinal of each manifest_pool entry, in its order.
+  repeated uint32 pool_ordinals                  = 12;
 }
 
 // ============================================================
@@ -687,6 +697,15 @@ message PartitionFieldSummaryEntry {
 }
 
 message SnapshotManifestRefs {
-  fixed64        snapshot_id  = 1;
-  repeated int32 pool_indices = 2 [packed = false];
+  fixed64         snapshot_id = 1;
+  // A whole list: its manifests' ordinals, in the list's order.
+  repeated uint32 ordinals    = 2;
+  // A list as a change of another (its parent's): the entry `base` places
+  // before this one in snapshot_refs, less its manifests at `removed` (its
+  // positions, ascending), with manifests inserted by `added`: pairs of a
+  // position in this list and an ordinal, by ascending position. A whole list
+  // starts every chain of 64. Absent (0): the list is whole.
+  uint32          base        = 3;
+  repeated uint32 removed     = 4;
+  repeated uint32 added       = 5;
 }

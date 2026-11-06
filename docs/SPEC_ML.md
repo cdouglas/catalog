@@ -101,15 +101,27 @@ message PartitionFieldSummaryEntry {
 }
 
 message SnapshotManifestRefs {
-  fixed64        snapshot_id  = 1;
-  repeated int32 pool_indices = 2 [packed = false];  // positions in manifest_pool
+  fixed64         snapshot_id = 1;
+  repeated uint32 ordinals    = 2;  // a whole list: its manifests' ordinals
+  uint32          base        = 3;  // a change: the entry `base` places before
+  repeated uint32 removed     = 4;  //   less its manifests at these positions
+  repeated uint32 added       = 5;  //   with (position, ordinal) pairs inserted
 }
 ```
 
-Wire encoding uses positional indices into `manifest_pool` so the on-disk
-representation is compact. The path-keyed map is reconstructed on decode.
-A checkpoint writes `manifest_pool` in order of path and `snapshot_refs` in
-order of snapshot id, so that it is a function of the state (I11, Bug 80).
+Each pooled manifest has an ordinal, assigned once, when the table first
+pools it, from a counter the table keeps (`InlineTable.next_ordinal`); the
+checkpoint writes `manifest_pool` in ordinal order with each entry's ordinal
+(`pool_ordinals`). A list names ordinals, so a new manifest renumbers
+nothing. A list is written whole, or as a change of its parent's list where
+that is smaller (`ManifestLists`): the parent's list less the manifests at
+`removed`, with `added` inserted, keeping the longest run of the parent's
+manifests the list holds in the parent's order; a whole list starts every
+chain of 64. The lists go in the table's snapshot order, a parent's before
+its children's. So the checkpoint grows with the snapshots plus the
+manifests, not their product (errata D18), and it is a function of the
+state (I11, Bug 80): the ordinals and the counter are state, and the choice
+of whole or change reads only the lists and the snapshots' parents.
 A checkpoint writes a `SnapshotManifestRefs` for every snapshot with an
 inline list, even an empty one and even when the pool is empty: the
 snapshot's `inline://` manifest-list location resolves through it.
@@ -194,7 +206,8 @@ The two manifest updates cover every `SnapshotProducer` subclass in Iceberg —
 | `RewriteManifests` | full replacement (large delta)             |
 
 Carried-forward manifests cost **zero bytes** per commit. They live in the
-pool already; the new snapshot's `pool_indices` array references them.
+pool already; the new snapshot's list names them by ordinal, or, as a change
+of its parent's, not at all.
 
 ## Sink Integration
 

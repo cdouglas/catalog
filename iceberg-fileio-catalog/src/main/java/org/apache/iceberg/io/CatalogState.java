@@ -71,6 +71,12 @@ public class CatalogState {
   private final Map<Integer, Map<String, ManifestFile>> manifestPool;
   // tblId -> (snapshotId -> list of manifest paths in the pool)
   private final Map<Integer, Map<Long, List<String>>> snapshotManifests;
+  // tblId -> (manifest path -> its ordinal): each pooled manifest's number, assigned once, when
+  // the table first pools it, from the table's counter, so that a list names manifests by numbers
+  // a new manifest never changes (SNAPSHOT_PAGING.md, "Lists"); keys are the pool's
+  private final Map<Integer, Map<String, Integer>> poolOrdinals;
+  // tblId -> the ordinal the table's next newly pooled manifest takes
+  private final Map<Integer, Integer> nextOrdinal;
 
   // The catalog's conflict encoding, null until its first record sets one (then Lamport), and
   // the encoding's state of each table that has one: tblId -> state.
@@ -89,6 +95,8 @@ public class CatalogState {
     this.tblManifestPrefix = ImmutableMap.copyOf(builder.tblManifestPrefix);
     this.manifestPool = ImmutableMap.copyOf(builder.manifestPool);
     this.snapshotManifests = ImmutableMap.copyOf(builder.snapshotManifests);
+    this.poolOrdinals = ImmutableMap.copyOf(builder.poolOrdinals);
+    this.nextOrdinal = ImmutableMap.copyOf(builder.nextOrdinal);
     this.conflictEncoding = builder.conflictEncoding;
     // The builder no longer changes them once built (Builder#build)
     this.conflictStates = ImmutableMap.copyOf(builder.conflictStates);
@@ -121,6 +129,8 @@ public class CatalogState {
     builder.tblManifestPrefix.putAll(tblManifestPrefix);
     builder.manifestPool.putAll(manifestPool);
     builder.snapshotManifests.putAll(snapshotManifests);
+    builder.poolOrdinals.putAll(poolOrdinals);
+    builder.nextOrdinal.putAll(nextOrdinal);
     builder.conflictEncoding = conflictEncoding;
     builder.conflictStates.putAll(conflictStates);
     return builder;
@@ -340,6 +350,27 @@ public class CatalogState {
     return refs != null ? refs : ImmutableMap.of();
   }
 
+  /** The ordinals of the table's pooled manifests, by path, or an empty map. */
+  Map<String, Integer> poolOrdinals(int tblId) {
+    Map<String, Integer> ordinals = poolOrdinals.get(tblId);
+    return ordinals != null ? ordinals : ImmutableMap.of();
+  }
+
+  /** The ordinal the table's next newly pooled manifest takes. */
+  int nextOrdinal(int tblId) {
+    return nextOrdinal.getOrDefault(tblId, 0);
+  }
+
+  /** Every table's pooled manifests' ordinals. */
+  Map<Integer, Map<String, Integer>> allPoolOrdinals() {
+    return poolOrdinals;
+  }
+
+  /** Every table's next ordinal. */
+  Map<Integer, Integer> allNextOrdinals() {
+    return nextOrdinal;
+  }
+
   /** Returns the full manifest pool map for checkpoint encoding. */
   Map<Integer, Map<String, ManifestFile>> allManifestPools() {
     return manifestPool;
@@ -372,8 +403,8 @@ public class CatalogState {
   CheckpointMemo.Inputs inlineInputs(int id) {
     return new CheckpointMemo.Inputs(
         tableById.get(id), tblInlineMetadata.get(id), tblManifestPrefix.getOrDefault(id, ""),
-        manifestPool(id), snapshotManifests(id), conflictStates.get(id),
-        conflictEncoding().stateCodec());
+        manifestPool(id), snapshotManifests(id), poolOrdinals(id), nextOrdinal(id),
+        conflictStates.get(id), conflictEncoding().stateCodec());
   }
 
   // ============================================================
@@ -426,6 +457,9 @@ public class CatalogState {
     // Each list is immutable.
     private final Map<Integer, Map<String, ManifestFile>> manifestPool = new HashMap<>();
     private final Map<Integer, Map<Long, List<String>>> snapshotManifests = new HashMap<>();
+    // The pooled manifests' ordinals (persistent maps, as the pool) and each table's counter
+    private final Map<Integer, Map<String, Integer>> poolOrdinals = new HashMap<>();
+    private final Map<Integer, Integer> nextOrdinal = new HashMap<>();
     private String conflictEncoding;
     // A table's encoding state: shared with the state this builder continues until the encoding
     // changes it here (conflictState), which copies it first (ownedStates)
@@ -672,6 +706,8 @@ public class CatalogState {
       tblManifestPrefix.remove(id);
       manifestPool.remove(id);
       snapshotManifests.remove(id);
+      poolOrdinals.remove(id);
+      nextOrdinal.remove(id);
       return this;
     }
 
@@ -787,7 +823,46 @@ public class CatalogState {
         }
       }
       manifestPool.put(tblId, pool(tblId).plus(manifest.path(), manifest));
+      if (pooled == null) {
+        int ordinal = nextOrdinal.getOrDefault(tblId, 0);
+        poolOrdinals.put(tblId, ordinals(tblId).plus(manifest.path(), ordinal));
+        nextOrdinal.put(tblId, ordinal + 1);
+      }
       return this;
+    }
+
+    /**
+     * Adds {@code manifest} to the table's pool with the ordinal a checkpoint gave it; the table's
+     * counter is set apart ({@link #setNextOrdinal}).
+     */
+    Builder addManifestToPool(int tblId, ManifestFile manifest, int ordinal) {
+      manifestPool.put(tblId, pool(tblId).plus(manifest.path(), manifest));
+      poolOrdinals.put(tblId, ordinals(tblId).plus(manifest.path(), ordinal));
+      return this;
+    }
+
+    /** Sets the ordinal the table's next newly pooled manifest takes, as a checkpoint holds it. */
+    Builder setNextOrdinal(int tblId, int ordinal) {
+      nextOrdinal.put(tblId, ordinal);
+      return this;
+    }
+
+    /** The table's pooled manifests' ordinals, which a change replaces. */
+    private PersistentMap<String, Integer> ordinals(int tblId) {
+      Map<String, Integer> ordinals = poolOrdinals.get(tblId);
+      return ordinals != null ? PersistentMap.copyOf(ordinals) : PersistentMap.empty();
+    }
+
+    /** Drops {@code paths} from the table's pool and their ordinals. */
+    private void dropPooled(int tblId, java.util.Collection<String> paths) {
+      PersistentMap<String, ManifestFile> pool = pool(tblId);
+      PersistentMap<String, Integer> ordinals = ordinals(tblId);
+      for (String path : paths) {
+        pool = pool.minus(path);
+        ordinals = ordinals.minus(path);
+      }
+      manifestPool.put(tblId, pool);
+      poolOrdinals.put(tblId, ordinals);
     }
 
     /**
@@ -901,13 +976,13 @@ public class CatalogState {
         for (List<String> snapRefs : refs.values()) {
           kept.addAll(snapRefs);
         }
-        PersistentMap<String, ManifestFile> pool = pool(tblId);
+        List<String> unnamed = new ArrayList<>();
         for (String path : held.keySet()) {
           if (!kept.contains(path)) {
-            pool = pool.minus(path);
+            unnamed.add(path);
           }
         }
-        manifestPool.put(tblId, pool);
+        dropPooled(tblId, unnamed);
         return this;
       }
       Set<String> dropped = new HashSet<>();
@@ -924,11 +999,7 @@ public class CatalogState {
         }
       }
       if (manifestPool.containsKey(tblId)) {
-        PersistentMap<String, ManifestFile> pool = pool(tblId);
-        for (String path : dropped) {
-          pool = pool.minus(path);
-        }
-        manifestPool.put(tblId, pool);
+        dropPooled(tblId, dropped);
       }
       return this;
     }
@@ -1079,9 +1150,11 @@ public class CatalogState {
     CheckpointMemo.Inputs inlineInputs(int id) {
       Map<String, ManifestFile> pool = manifestPool.get(id);
       Map<Long, List<String>> lists = snapshotManifests.get(id);
+      Map<String, Integer> ordinals = poolOrdinals.get(id);
       return new CheckpointMemo.Inputs(
           tableById.get(id), tblInlineMetadata.get(id), tblManifestPrefix.getOrDefault(id, ""),
           pool != null ? pool : ImmutableMap.of(), lists != null ? lists : ImmutableMap.of(),
+          ordinals != null ? ordinals : ImmutableMap.of(), nextOrdinal.getOrDefault(id, 0),
           conflictStates.get(id), conflictEncoding().stateCodec());
     }
 

@@ -653,9 +653,10 @@ public class FormatExplorerFixtures {
             + "naming what the state holds by reference: manifests by name under the table's "
             + "prefix, removals by index in the parent's list, summary entries by the parent's.",
         List.of(
-            "snapshot_refs.pool_indices is a repeated int32 the codec writes unpacked, one "
-                + "varint each: catalog.proto declares it [packed = false]. "
-                + "RemoveManifestDelta.parent_indices is packed."),
+            "snapshot_refs name manifests by ordinal (pool_ordinals, assigned when a manifest "
+                + "is first pooled); a list is whole (ordinals) or a change of its parent's: base, "
+                + "the entry that many before it, less removed positions, with added "
+                + "(position, ordinal) pairs. RemoveManifestDelta.parent_indices is packed."),
         List.of(gzipView(metadata, meta)),
         read -> {
           CatalogState state = read.state();

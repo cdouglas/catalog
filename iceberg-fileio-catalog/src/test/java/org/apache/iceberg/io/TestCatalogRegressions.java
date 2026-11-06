@@ -4917,7 +4917,9 @@ public class TestCatalogRegressions {
    * different bytes. A catalog object never compared two writers' checkpoints, but every
    * checkpoint at one position must be the same (I11), as a shared log's compactors need; the
    * runtime's check of each fold of a read onto a replica against a replay of the whole view found
-   * it. A checkpoint now writes everything it holds in maps in the order of the keys (ProtoCodec).
+   * it. A checkpoint now writes everything it holds in maps in an order of the state, not of the
+   * maps (ProtoCodec): by key, and a table's pool by its manifests' ordinals and its lists in the
+   * table's snapshot order (since SNAPSHOT_PAGING.md step 2).
    */
   @Nested
   class CheckpointOrderOfMaps {
@@ -4943,18 +4945,22 @@ public class TestCatalogRegressions {
       Map<Long, List<String>> lists = state.snapshotManifests(tblId);
       assertThat(lists).hasSizeGreaterThan(20);
 
-      // The same state, its table's pool and lists put back in the reverse order
+      // The same state, its table's pool (with each manifest's ordinal) and lists put back in the
+      // reverse order
+      Map<String, Integer> ordinals = state.poolOrdinals(tblId);
       CatalogState.Builder reordered = CatalogStateMachine.INSTANCE.toBuilder(state);
       reordered.removeSnapshotManifests(tblId, lists.keySet());
       List<String> paths = new ArrayList<>(pool.keySet());
       Collections.reverse(paths);
-      paths.forEach(path -> reordered.addManifestToPool(tblId, pool.get(path)));
+      paths.forEach(path -> reordered.addManifestToPool(tblId, pool.get(path), ordinals.get(path)));
+      reordered.setNextOrdinal(tblId, state.nextOrdinal(tblId));
       List<Long> snapshots = new ArrayList<>(lists.keySet());
       Collections.reverse(snapshots);
       snapshots.forEach(id -> reordered.setSnapshotManifests(tblId, id, lists.get(id)));
       CatalogState other = reordered.build();
 
       assertThat(other.manifestPool(tblId)).isEqualTo(pool);
+      assertThat(other.poolOrdinals(tblId)).isEqualTo(ordinals);
       assertThat(other.snapshotManifests(tblId)).isEqualTo(lists);
       assertThat(CatalogStateMachine.INSTANCE.encodeCheckpoint(other))
           .isEqualTo(CatalogStateMachine.INSTANCE.encodeCheckpoint(state));

@@ -34,6 +34,7 @@ import static org.intentlog.wire.ProtoWire.writeVarint64;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -139,6 +140,8 @@ public class ProtoCodec {
   static final int INLINE_TBL_SNAPSHOT_REFS = 8;
   private static final int INLINE_TBL_METADATA_CODEC = 9;
   static final int INLINE_TBL_CONFLICT_STATE = 10;
+  private static final int INLINE_TBL_NEXT_ORDINAL = 11;
+  private static final int INLINE_TBL_POOL_ORDINALS = 12;
 
   // ManifestFileEntry field numbers
   private static final int MF_PATH = 1;
@@ -170,7 +173,10 @@ public class ProtoCodec {
 
   // SnapshotManifestRefs field numbers
   private static final int SMR_SNAPSHOT_ID = 1;
-  private static final int SMR_POOL_INDICES = 2;
+  private static final int SMR_ORDINALS = 2;
+  private static final int SMR_BASE = 3;
+  private static final int SMR_REMOVED = 4;
+  private static final int SMR_ADDED = 5;
 
   // Transaction field numbers
   private static final int INTENTION_ACTIONS = 3;
@@ -356,8 +362,8 @@ public class ProtoCodec {
           byte[] inlineBytes = memo != null ? memo.get(tblId, inputs) : null;
           if (inlineBytes == null || CheckpointMemo.CHECK) {
             byte[] encoded = encodeInlineTable(
-                tblId, tblEntry, table.bytes(), table.codec(), prefix, pool, snapRefs,
-                conflictState(original, stateCodec, tblId));
+                tblId, tblEntry, table, prefix, pool, snapRefs, original.poolOrdinals(tblId),
+                original.nextOrdinal(tblId), conflictState(original, stateCodec, tblId));
             Preconditions.checkState(
                 inlineBytes == null || java.util.Arrays.equals(inlineBytes, encoded),
                 "The memoized encoding of inline table %s differs from its encoding", tblId);
@@ -594,51 +600,94 @@ public class ProtoCodec {
   }
 
   private static byte[] encodeInlineTable(
-      int id, CatalogState.TblEntry entry, byte[] metadata, byte metadataCodec,
-      String manifestPrefix,
-      Map<String, ManifestFile> pool, Map<Long, List<String>> snapRefs, byte[] conflictState)
+      int id, CatalogState.TblEntry entry, InlineTable table, String manifestPrefix,
+      Map<String, ManifestFile> pool, Map<Long, List<String>> snapRefs,
+      Map<String, Integer> ordinals, int nextOrdinal, byte[] conflictState)
       throws IOException {
     ByteArrayOutputStream out = new BytesOut();
     writeVarint(out, INLINE_TBL_ID, id);
     writeVarint(out, INLINE_TBL_VERSION, entry.version);
     writeVarint(out, INLINE_TBL_NAMESPACE_ID, entry.namespaceId);
     writeString(out, INLINE_TBL_NAME, entry.name);
-    writeBytes(out, INLINE_TBL_METADATA, metadata);
+    writeBytes(out, INLINE_TBL_METADATA, table.bytes());
     writeString(out, INLINE_TBL_MANIFEST_PREFIX, manifestPrefix);
-    writeVarint(out, INLINE_TBL_METADATA_CODEC, metadataCodec & 0xFF);
+    writeVarint(out, INLINE_TBL_METADATA_CODEC, table.codec() & 0xFF);
     if (conflictState.length > 0) {
       writeBytes(out, INLINE_TBL_CONFLICT_STATE, conflictState);
     }
 
-    // Manifest pool (field 7): encode each unique ManifestFile entry, in the order of their paths,
-    // and build the positional index for snapshot refs
-    Map<String, Integer> pathToIndex =
-        new java.util.HashMap<>(pool != null ? 2 * pool.size() : 16);
-    if (pool != null) {
-      String[] poolOrder = pool.keySet().toArray(new String[0]);
-      java.util.Arrays.sort(poolOrder);
-      for (int i = 0; i < poolOrder.length; i++) {
-        pathToIndex.put(poolOrder[i], i);
-        ManifestFile mf = pool.get(poolOrder[i]);
-        byte[] mfBytes = encodeManifestFileEntry(mf, manifestPrefix);
-        writeLengthDelimited(out, INLINE_TBL_MANIFEST_POOL, mfBytes);
+    // Manifest pool (field 7): each pooled manifest, in the order of their ordinals (field 12)
+    if (pool != null && !pool.isEmpty()) {
+      String[] byOrdinal = pool.keySet().toArray(new String[0]);
+      java.util.Arrays.sort(byOrdinal, java.util.Comparator.comparingInt(path -> ordinal(
+          ordinals, path, id)));
+      ByteArrayOutputStream packed = new BytesOut();
+      for (String path : byOrdinal) {
+        writeLengthDelimited(
+            out, INLINE_TBL_MANIFEST_POOL, encodeManifestFileEntry(pool.get(path), manifestPrefix));
+        org.intentlog.wire.ProtoWire.writeRawVarint(packed, ordinal(ordinals, path, id));
       }
+      writeLengthDelimited(out, INLINE_TBL_POOL_ORDINALS, packed.toByteArray());
+    }
+    if (nextOrdinal > 0) {
+      writeVarint(out, INLINE_TBL_NEXT_ORDINAL, nextOrdinal);
     }
 
-    // Snapshot refs (field 8): per-snapshot index arrays, in the order of the snapshots' ids. A
-    // snapshot without manifests (a delete that matched nothing) has an empty array but still
-    // needs its entry, even when the pool is empty: its inline:// manifest-list location resolves
-    // through it.
-    if (snapRefs != null) {
-      long[] snapshotIds = new long[snapRefs.size()];
-      int n = 0;
-      for (long snapshotId : snapRefs.keySet()) {
-        snapshotIds[n++] = snapshotId;
+    // Snapshot refs (field 8): each snapshot's list, whole or as a change of its parent's list,
+    // in the table's snapshot order, a parent's before its children's. A snapshot without
+    // manifests (a delete that matched nothing) has an empty list but still needs its entry, even
+    // when the pool is empty: its inline:// manifest-list location resolves through it.
+    if (snapRefs != null && !snapRefs.isEmpty()) {
+      Map<Long, Long> parents = new java.util.HashMap<>(2 * snapRefs.size());
+      List<Long> order = new ArrayList<>(snapRefs.size());
+      TableFields fields;
+      try {
+        fields = table.fields();
+      } catch (RuntimeException e) {
+        // A checkpoint never fails on a table's metadata, which only a load reads: lists of a
+        // table whose metadata does not decode go whole, by snapshot id, as on every replica
+        fields = null;
       }
-      java.util.Arrays.sort(snapshotIds);
-      for (long snapshotId : snapshotIds) {
-        byte[] refBytes =
-            encodeSnapshotManifestRefs(snapshotId, snapRefs.get(snapshotId), pathToIndex);
+      for (Snapshot snapshot : fields != null ? fields.snapshots : List.<Snapshot>of()) {
+        if (snapRefs.containsKey(snapshot.snapshotId())) {
+          order.add(snapshot.snapshotId());
+          if (snapshot.parentId() != null) {
+            parents.put(snapshot.snapshotId(), snapshot.parentId());
+          }
+        }
+      }
+      if (order.size() < snapRefs.size()) {
+        // lists of snapshots the table no longer has, which a full update's reconcile drops: by id
+        Set<Long> inOrder = new HashSet<>(order);
+        long[] rest = snapRefs.keySet().stream()
+            .filter(snapshotId -> !inOrder.contains(snapshotId))
+            .mapToLong(Long::longValue).sorted().toArray();
+        for (long snapshotId : rest) {
+          order.add(snapshotId);
+        }
+      }
+      Map<Long, Integer> encodedAt = new java.util.HashMap<>(2 * order.size());
+      int[] depth = new int[order.size()];
+      for (int i = 0; i < order.size(); i++) {
+        long snapshotId = order.get(i);
+        List<String> list = snapRefs.get(snapshotId);
+        Long parent = parents.get(snapshotId);
+        Integer base = parent != null ? encodedAt.get(parent) : null;
+        ManifestLists.Change change = null;
+        if (base != null && depth[base] + 1 < ManifestLists.CHAIN) {
+          change = ManifestLists.diff(snapRefs.get(parent), list);
+          if (change.cost() >= list.size()) {
+            change = null;
+          }
+        }
+        byte[] refBytes;
+        if (change != null) {
+          refBytes = encodeListChange(snapshotId, i - base, change, list, ordinals, id);
+          depth[i] = depth[base] + 1;
+        } else {
+          refBytes = encodeWholeList(snapshotId, list, ordinals, id);
+        }
+        encodedAt.put(snapshotId, i);
         writeLengthDelimited(out, INLINE_TBL_SNAPSHOT_REFS, refBytes);
       }
     }
@@ -646,16 +695,50 @@ public class ProtoCodec {
     return out.toByteArray();
   }
 
-  private static byte[] encodeSnapshotManifestRefs(
-      long snapshotId, List<String> paths, Map<String, Integer> pathToIndex)
+  /** The ordinal of {@code path}, which every manifest a list names has (it is pooled). */
+  private static int ordinal(Map<String, Integer> ordinals, String path, int tableId) {
+    Integer ordinal = ordinals.get(path);
+    Preconditions.checkState(
+        ordinal != null, "Table %s lists a manifest it has not pooled: %s", tableId, path);
+    return ordinal;
+  }
+
+  private static byte[] encodeWholeList(
+      long snapshotId, List<String> paths, Map<String, Integer> ordinals, int tableId)
       throws IOException {
     ByteArrayOutputStream out = new BytesOut();
     writeFixed64(out, SMR_SNAPSHOT_ID, snapshotId);
-    for (String path : paths) {
-      Integer idx = pathToIndex.get(path);
-      if (idx != null) {
-        writeVarint(out, SMR_POOL_INDICES, idx);
+    if (!paths.isEmpty()) {
+      ByteArrayOutputStream packed = new BytesOut();
+      for (String path : paths) {
+        org.intentlog.wire.ProtoWire.writeRawVarint(packed, ordinal(ordinals, path, tableId));
       }
+      writeLengthDelimited(out, SMR_ORDINALS, packed.toByteArray());
+    }
+    return out.toByteArray();
+  }
+
+  private static byte[] encodeListChange(
+      long snapshotId, int base, ManifestLists.Change change, List<String> paths,
+      Map<String, Integer> ordinals, int tableId) throws IOException {
+    ByteArrayOutputStream out = new BytesOut();
+    writeFixed64(out, SMR_SNAPSHOT_ID, snapshotId);
+    writeVarint(out, SMR_BASE, base);
+    if (change.removed.length > 0) {
+      ByteArrayOutputStream packed = new BytesOut();
+      for (int position : change.removed) {
+        org.intentlog.wire.ProtoWire.writeRawVarint(packed, position);
+      }
+      writeLengthDelimited(out, SMR_REMOVED, packed.toByteArray());
+    }
+    if (change.added.length > 0) {
+      ByteArrayOutputStream packed = new BytesOut();
+      for (int position : change.added) {
+        org.intentlog.wire.ProtoWire.writeRawVarint(packed, position);
+        org.intentlog.wire.ProtoWire.writeRawVarint(
+            packed, ordinal(ordinals, paths.get(position), tableId));
+      }
+      writeLengthDelimited(out, SMR_ADDED, packed.toByteArray());
     }
     return out.toByteArray();
   }
@@ -665,11 +748,12 @@ public class ProtoCodec {
       byte[] bytes, CatalogState.Builder builder, Map<Integer, byte[]> conflictStates)
       throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
-    int id = 0, version = 0, nsId = 0;
+    int id = 0, version = 0, nsId = 0, nextOrdinal = 0;
     String name = "", manifestPrefix = "";
     byte[] metadata = new byte[0];
     Byte metadataCodec = null;
     List<byte[]> poolEntryBytes = new ArrayList<>();
+    List<Integer> poolOrdinals = new ArrayList<>();
     List<byte[]> snapRefBytes = new ArrayList<>();
     byte[] conflictState = null;
 
@@ -707,6 +791,12 @@ public class ProtoCodec {
         case INLINE_TBL_CONFLICT_STATE:
           conflictState = readLengthDelimitedBytes(in);
           break;
+        case INLINE_TBL_NEXT_ORDINAL:
+          nextOrdinal = readVarint(in);
+          break;
+        case INLINE_TBL_POOL_ORDINALS:
+          readPacked(in, tag, poolOrdinals);
+          break;
         default:
           skipField(in, tag & 0x7);
       }
@@ -714,57 +804,111 @@ public class ProtoCodec {
     Preconditions.checkState(
         metadataCodec != null,
         "Inline table %s record missing required codec tag", id);
+    Preconditions.checkState(
+        poolOrdinals.size() == poolEntryBytes.size(),
+        "Inline table %s has %s pooled manifests and %s ordinals", id, poolEntryBytes.size(),
+        poolOrdinals.size());
     builder.addInlineTable(id, nsId, name, version, metadata, metadataCodec, manifestPrefix);
     if (conflictState != null) {
       conflictStates.put(id, conflictState);
     }
 
-    // Decode manifest pool (positional array) -> path-keyed map
-    List<ManifestFile> poolList = new ArrayList<>(poolEntryBytes.size());
-    for (byte[] entryBytes : poolEntryBytes) {
-      poolList.add(decodeManifestFileEntry(entryBytes, manifestPrefix));
+    // The pool, by ordinal
+    Map<Integer, String> byOrdinal = new java.util.HashMap<>(2 * poolEntryBytes.size());
+    for (int i = 0; i < poolEntryBytes.size(); i++) {
+      ManifestFile manifest = decodeManifestFileEntry(poolEntryBytes.get(i), manifestPrefix);
+      builder.addManifestToPool(id, manifest, poolOrdinals.get(i));
+      byOrdinal.put(poolOrdinals.get(i), manifest.path());
     }
-    for (ManifestFile mf : poolList) {
-      builder.addManifestToPool(id, mf);
+    if (nextOrdinal > 0) {
+      builder.setNextOrdinal(id, nextOrdinal);
     }
 
-    // Decode snapshot refs (index arrays) -> path lists; a ref may be empty (see encode)
+    // The lists, each whole or a change of one before it; a list may be empty (see encode)
+    List<List<String>> lists = new ArrayList<>(snapRefBytes.size());
     for (byte[] refBytes : snapRefBytes) {
-      decodeSnapshotManifestRefs(refBytes, id, poolList, builder);
+      lists.add(decodeSnapshotManifestRefs(refBytes, id, byOrdinal, lists, builder));
     }
     return id;
   }
 
-  private static void decodeSnapshotManifestRefs(
-      byte[] bytes, int tblId, List<ManifestFile> poolList,
+  /** Reads a packed repeated uint32 field (or one unpacked value) into {@code values}. */
+  private static void readPacked(InputStream in, int tag, List<Integer> values)
+      throws IOException {
+    if ((tag & 0x7) == org.intentlog.wire.ProtoWire.WIRE_LENGTH_DELIMITED) {
+      ByteArrayInputStream packed = new ByteArrayInputStream(readLengthDelimitedBytes(in));
+      while (packed.available() > 0) {
+        values.add(readVarint(packed));
+      }
+    } else {
+      values.add(readVarint(in));
+    }
+  }
+
+  private static List<String> decodeSnapshotManifestRefs(
+      byte[] bytes, int tblId, Map<Integer, String> byOrdinal, List<List<String>> before,
       CatalogState.Builder builder) throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
     long snapshotId = 0;
-    List<Integer> indices = new ArrayList<>();
+    int base = 0;
+    List<Integer> ordinals = new ArrayList<>();
+    List<Integer> removed = new ArrayList<>();
+    List<Integer> added = new ArrayList<>();
 
     while (in.available() > 0) {
       int tag = readVarint(in);
       int fieldNumber = tag >>> 3;
-      int wireType = tag & 0x7;
       switch (fieldNumber) {
         case SMR_SNAPSHOT_ID:
           snapshotId = readFixed64(in);
           break;
-        case SMR_POOL_INDICES:
-          indices.add(readVarint(in));
+        case SMR_ORDINALS:
+          readPacked(in, tag, ordinals);
+          break;
+        case SMR_BASE:
+          base = readVarint(in);
+          break;
+        case SMR_REMOVED:
+          readPacked(in, tag, removed);
+          break;
+        case SMR_ADDED:
+          readPacked(in, tag, added);
           break;
         default:
-          skipField(in, wireType);
+          skipField(in, tag & 0x7);
       }
     }
 
-    List<String> paths = new ArrayList<>(indices.size());
-    for (int idx : indices) {
-      if (idx >= 0 && idx < poolList.size()) {
-        paths.add(poolList.get(idx).path());
+    List<String> paths;
+    if (base == 0) {
+      paths = new ArrayList<>(ordinals.size());
+      for (int ordinal : ordinals) {
+        paths.add(pooled(byOrdinal, ordinal, tblId));
       }
+    } else {
+      Preconditions.checkState(
+          base <= before.size() && added.size() % 2 == 0,
+          "Table %s: a malformed manifest list change for snapshot %s", tblId, snapshotId);
+      int[] positions = new int[added.size() / 2];
+      List<String> addedPaths = new ArrayList<>(positions.length);
+      for (int i = 0; i < positions.length; i++) {
+        positions[i] = added.get(2 * i);
+        addedPaths.add(pooled(byOrdinal, added.get(2 * i + 1), tblId));
+      }
+      paths = ManifestLists.apply(
+          before.get(before.size() - base), removed.stream().mapToInt(Integer::intValue).toArray(),
+          positions, addedPaths);
     }
     builder.setSnapshotManifests(tblId, snapshotId, paths);
+    return paths;
+  }
+
+  /** The pooled manifest with {@code ordinal}. */
+  private static String pooled(Map<Integer, String> byOrdinal, int ordinal, int tableId) {
+    String path = byOrdinal.get(ordinal);
+    Preconditions.checkState(
+        path != null, "Table %s lists ordinal %s, which it has not pooled", tableId, ordinal);
+    return path;
   }
 
   // ============================================================
