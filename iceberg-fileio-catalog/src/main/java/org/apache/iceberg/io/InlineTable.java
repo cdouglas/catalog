@@ -52,6 +52,13 @@ final class InlineTable {
     return new InlineTable(codec, Objects.requireNonNull(bytes, "bytes"), null, null);
   }
 
+  /** The table encoded as {@code bytes} by codec {@code codec}, already decoded as {@code fields}. */
+  static InlineTable ofDecoded(byte[] bytes, byte codec, TableFields fields) {
+    return new InlineTable(
+        codec, Objects.requireNonNull(bytes, "bytes"), Objects.requireNonNull(fields, "fields"),
+        null);
+  }
+
   /**
    * The table after a head-only full update on {@code base}: {@code head} (encoded by codec {@code
    * codec}) holds the table's head with only the snapshots {@code base} lacks and its refs' targets,

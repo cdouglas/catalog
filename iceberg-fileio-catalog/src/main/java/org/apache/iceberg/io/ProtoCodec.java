@@ -2798,6 +2798,8 @@ public class ProtoCodec {
     // A re-inlined pointer table's blocks whose pages its writer put (SNAPSHOT_PAGING.md,
     // "Re-inlining"), installed as sealed
     List<SnapshotPages.SealedBlock> imported = List.of();
+    // The head of a full update with imported blocks, as their check decoded it
+    private volatile TableFields importedHead;
 
     /** This full update of a pointer table, installing {@code blocks} as its sealed blocks. */
     public UpdateTableInlineAction importing(List<SnapshotPages.SealedBlock> blocks) {
@@ -3015,8 +3017,13 @@ public class ProtoCodec {
         }
       }
       // Replay never reads the pages: it takes their snapshots on the writer's word, but they
-      // must be apart from the head's, and no ref may target one (a ref's target is inline)
-      TableFields head = InlineMetadataCodecs.byTag(fullMetadataCodec).decodeFields(fullMetadata);
+      // must be apart from the head's, and no ref may target one (a ref's target is inline).
+      // The head decoded here is the one apply installs.
+      TableFields head = importedHead;
+      if (head == null) {
+        head = InlineMetadataCodecs.byTag(fullMetadataCodec).decodeFields(fullMetadata);
+        importedHead = head;
+      }
       for (int i = 0; i < head.snapshots.size(); i++) {
         if (ids.contains(head.snapshots.keyAt(i))) {
           return "import: snapshot " + head.snapshots.keyAt(i) + " both imported and inline";
@@ -3070,9 +3077,12 @@ public class ProtoCodec {
           InlineTable current = builder.inlineTable(id);
           // A head-only update merges when its table is first read (verify admits one only on an
           // inline table): replay decodes no table's metadata that it does not need
+          TableFields head = importedHead;
           InlineTable after = headOnly && current != null
               ? InlineTable.ofHeadOnly(current, fullMetadata, fullMetadataCodec, removedSnapshotIds)
-              : InlineTable.ofBytes(fullMetadata, fullMetadataCodec);
+              : head != null && !imported.isEmpty()
+                  ? InlineTable.ofDecoded(fullMetadata, fullMetadataCodec, head)
+                  : InlineTable.ofBytes(fullMetadata, fullMetadataCodec);
           builder.updateInlineTable(id, next, after);
           // A re-inlined table's history, as its writer put it in import pages
           for (SnapshotPages.SealedBlock block : imported) {

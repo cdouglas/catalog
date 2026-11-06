@@ -55,7 +55,9 @@ class TestSnapshotPages {
 
   @BeforeEach
   void table() {
-    LogCatalog catalog = LocalCatalogMode.APPEND_ML.catalog(io, "mem:///wh", "pages", Map.of());
+    // Unpaged, whatever the suite's paging: the table keeps its snapshots inline
+    LogCatalog catalog = LocalCatalogMode.APPEND_ML.catalog(
+        io, "mem:///wh", "pages", Map.of(LogCatalogProperties.SNAPSHOT_BLOCK, "0"));
     catalog.createNamespace(Namespace.of("ns"));
     Table table = catalog.buildTable(TABLE, SCHEMA).withPartitionSpec(SPEC).create();
     for (int i = 0; i < 7; i++) {

@@ -277,6 +277,36 @@ roots. Merge appends (a list stays small), lazy loads, d567855 with paging off (
 - Decoding a TM root first ran at half the speed with paging (the sealed blocks' live ids were
   boxed one by one); decoded into arrays, it runs as fast as without.
 
+## Re-inlining (SNAPSHOT_PAGING.md step 5)
+
+Step 5 (2026-11-06, d9fa251 and the commit after it) brings a pointer table back inline with
+its history behind the sealing line in import pages. `ReplayBench` with `last=reinline`: a
+pointer catalog commits merge appends to t0 (its tables delete old metadata files), then an
+inline catalog's `LogCatalog.reinline(t0)` writes the last record, which `fold` replays onto the
+reader's replica; paging off (block 0: the whole table in the record) and on (256, 1,024),
+ops/s and bytes allocated per record (`-prof gc`), one fork each, the dev box:
+
+| snapshots | | off | on |
+|---|---|---|---|
+| 1,000 | record | 51,847 B | 51,881 B |
+| | `fold` | 1,654 | 1,682 |
+| 3,000 | record | 146,164 B | 107,046 B (7 import blocks) |
+| | root after | 146,208 B | 107,098 B |
+| | `fold` | 594 | 446 |
+| | allocated | 6.0 MB | 7.6 MB |
+
+- At 1,000 snapshots nothing is behind the line (1,000 - 1,024 < 0): the two records are the
+  same. At 3,000, blocks 0-6 (sequence numbers below 1,792) go to import pages and the record
+  holds the head with 1,209 snapshots, the whole snapshot log and 8 B per imported live id:
+  27% smaller. Beyond the window a snapshot costs the record its live id (8 B) and its
+  snapshot-log entry, where in full it costs about 49 B (146,164 B / 3,000), so the depth a
+  4 MiB record can bring back grows by that ratio, and the head's size is bounded by the window.
+- Replaying the import record costs 25% more than the full one: replay decodes the head once
+  (the import's checks need its snapshot ids and refs, and the sealing pass its sequence
+  numbers), where the full record stays bytes until a later record or load decodes all 3,000
+  snapshots. Before the checks' decoded head was kept for apply, it decoded twice (296 ops/s,
+  11.1 MB a record).
+
 ## What remains
 
 A read's cost is now its checkpoint's columns and the tail's replay: since step 3 a read makes

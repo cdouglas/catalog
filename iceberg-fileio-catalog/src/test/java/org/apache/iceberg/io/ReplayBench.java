@@ -117,7 +117,10 @@ public class ReplayBench {
    * One more commit after the appends, to t0, whose record ends the log (with {@code fresh} 1,
    * {@link #fold} replays it): {@code none}; {@code expire}, of its oldest snapshot; {@code
    * schema}, a column added; {@code stats}, a statistics file for its current snapshot. Replay
-   * built the whole table for the last three until SNAPSHOT_PAGING.md step 1.
+   * built the whole table for the last three until SNAPSHOT_PAGING.md step 1. {@code reinline}
+   * (with {@code mode} pointer): an inline catalog's {@link LogCatalog#reinline}, which brings t0
+   * back in full, or with {@code block} above 0, its history behind the line in import pages
+   * (step 5); its tables delete old metadata files, so a deep capture fits in the heap.
    */
   @Param({"none"})
   public String last;
@@ -214,12 +217,18 @@ public class ReplayBench {
     CatalogStateMachine.INSTANCE.pages(beforeState).forEach(
         (name, page) -> tailIO.seed(CATALOG + ".committed/" + name, page));
 
-    Table table = catalog().loadTable(TableIdentifier.of("ns", "t0"));
+    // A pointer table's metadata file was in the capture's store, which is gone
+    Table table = mode.equals("pointer")
+        ? null
+        : catalog().loadTable(TableIdentifier.of("ns", "t0"));
+    Integer t0 = finalState.tableId(TableIdentifier.of("ns", "t0"));
     System.out.printf(
         "ReplayBench sizes: checkpoint %d B, tail %d records %d B, fresh %d records %d B;"
+            + " final checkpoint %d B, t0 %d sealed blocks;"
             + " t0 %d snapshots, %d manifests in its current list%n",
         tailCheckpoint.length, tailRecords.size(), bytes(tailRecords), freshRecords.size(),
-        bytes(freshRecords), Iterables.size(table.snapshots()),
+        bytes(freshRecords), finalCheckpoint.length, finalState.sealedBlocks(t0).size(),
+        table != null ? Iterables.size(table.snapshots()) : -1,
         // Only inline lists are at hand: the capture's store, which held the files, is gone
         mode.equals("ml") ? table.currentSnapshot().allManifests(table.io()).size() : -1);
   }
@@ -364,7 +373,13 @@ public class ReplayBench {
             Types.NestedField.optional(2, "cat", Types.IntegerType.get()));
     PartitionSpec spec = PartitionSpec.builderFor(schema).identity("cat").build();
     for (int t = 0; t < tables; t++) {
-      setup.buildTable(TableIdentifier.of("ns", "t" + t), schema).withPartitionSpec(spec).create();
+      org.apache.iceberg.catalog.Catalog.TableBuilder builder =
+          setup.buildTable(TableIdentifier.of("ns", "t" + t), schema).withPartitionSpec(spec);
+      if (last.equals("reinline")) {
+        builder.withProperty(
+            org.apache.iceberg.TableProperties.METADATA_DELETE_AFTER_COMMIT_ENABLED, "true");
+      }
+      builder.create();
     }
 
     props.put(LogCatalogProperties.MAX_APPEND_COUNT, String.valueOf(Integer.MAX_VALUE));
@@ -413,6 +428,16 @@ public class ReplayBench {
             .setStatistics(new org.apache.iceberg.GenericStatisticsFile(
                 current, "mem:///stats/" + current + ".puffin", 100, 10, List.of()))
             .commit();
+        break;
+      case "reinline":
+        Map<String, String> inlineProps = new HashMap<>(props);
+        inlineProps.put("fileio.catalog.inline", "true");
+        inlineProps.put("fileio.catalog.inline.manifests", "true");
+        FileIOCatalog inline = new FileIOCatalog("c", CATALOG, io, new HashMap<>());
+        inline.initialize("c", inlineProps);
+        if (!inline.reinline(TableIdentifier.of("ns", "t0"))) {
+          throw new IllegalStateException("t0 does not fit inline");
+        }
         break;
       default:
         throw new IllegalArgumentException("Unknown last: " + last);

@@ -523,7 +523,7 @@ class TestSnapshotPaging {
   @org.junit.jupiter.params.provider.ValueSource(ints = {0, 4})
   void aTableUpgradedToV3ComesBackInline(int block) throws Exception {
     LogCatalog writer = LocalCatalogMode.CAS_ML.catalog(
-        io, WAREHOUSE, "v3-" + block, block > 0 ? paging(block, 8) : Map.of());
+        io, WAREHOUSE, "v3-" + block, paging(block, 8));
     writer.createNamespace(Namespace.of("ns"));
     Table table = writer.buildTable(TABLE, SCHEMA).withPartitionSpec(SPEC)
         .withProperty(org.apache.iceberg.TableProperties.FORMAT_VERSION, "2").create();
