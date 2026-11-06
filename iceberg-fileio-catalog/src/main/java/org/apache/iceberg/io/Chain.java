@@ -53,14 +53,41 @@ final class Chain<T> extends AbstractList<T> implements RandomAccess {
     // The first elements, made on first use ({@link #lazy}); the lists of a buffer, and the
     // buffers copied from it, share them (every such list holds them all)
     private final Lazy lazy;
+    // The buffer this one copied its first parentLength elements from, whose index finds them (a
+    // copy indexes only the elements after), and how many copies deep that is
+    private final Buffer parent;
+    private final int parentLength;
+    private final int depth;
 
     Buffer(Object[] items, int length, boolean keyed, Lazy lazy) {
+      this(items, length, keyed, lazy, null, 0);
+    }
+
+    Buffer(Object[] items, int length, boolean keyed, Lazy lazy, Buffer parent, int parentLength) {
       this.items = items;
       this.length = new AtomicInteger(length);
       this.index = keyed ? new ConcurrentHashMap<>() : null;
       this.lazy = lazy;
+      this.parent = parent;
+      this.parentLength = parentLength;
+      this.depth = parent != null ? parent.depth + 1 : 0;
+    }
+
+    /** The position of the element whose key is {@code k} in this buffer, or null. */
+    Integer lookup(long k) {
+      Integer at = index.get(k);
+      if (at == null && parent != null) {
+        at = parent.lookup(k);
+        if (at != null && at >= parentLength) {
+          at = null; // the parent's, past what this buffer copied
+        }
+      }
+      return at;
     }
   }
+
+  /** Copies deep before a copy indexes every element again, so a lookup stays short. */
+  private static final int MAX_DEPTH = 8;
 
   /** Elements made on first use, each once: their keys, a maker, and what it made. */
   private static final class Lazy {
@@ -152,8 +179,16 @@ final class Chain<T> extends AbstractList<T> implements RandomAccess {
     // ones, which every list of the buffer holds
     Object[] items = Arrays.copyOf(buffer.items, Math.max(MIN_CAPACITY, (at + 1) * 2));
     items[at] = element;
-    Buffer copy = new Buffer(items, at + 1, key != null, buffer.lazy);
-    if (key != null) {
+    if (key == null) {
+      return new Chain<>(new Buffer(items, at + 1, false, buffer.lazy), at + 1, key);
+    }
+    Buffer copy;
+    if (buffer.depth < MAX_DEPTH) {
+      // The first `at` elements are this buffer's, which finds them by its index
+      copy = new Buffer(items, at + 1, true, buffer.lazy, buffer, at);
+      copy.index.put(key.applyAsLong(element), at);
+    } else {
+      copy = new Buffer(items, at + 1, true, buffer.lazy);
       for (int i = 0; i <= at; i++) {
         copy.index.put(keyAt(copy, i), i);
       }
@@ -163,7 +198,7 @@ final class Chain<T> extends AbstractList<T> implements RandomAccess {
 
   /** The element whose key is {@code k}, or null; for a keyed list only. */
   T byKey(long k) {
-    Integer at = buffer.index.get(k);
+    Integer at = buffer.lookup(k);
     if (at == null || at >= size) {
       return null;
     }
@@ -172,7 +207,7 @@ final class Chain<T> extends AbstractList<T> implements RandomAccess {
 
   /** Whether the list holds an element whose key is {@code k}, without making it. */
   boolean containsKey(long k) {
-    Integer at = buffer.index.get(k);
+    Integer at = buffer.lookup(k);
     return at != null && at < size;
   }
 

@@ -133,4 +133,47 @@ class TestChain {
       assertThat(element).isSameAs(seen[0]);
     }
   }
+
+  /**
+   * Lists that diverge again and again (a replica a writer folds others' records onto after its
+   * own landed elsewhere) each find exactly their own elements by key, whether a copy looks the
+   * shared ones up in the buffer it copied or, deep enough, indexes them all again.
+   */
+  @Test
+  void divergingListsFindOnlyTheirOwnElements() {
+    Chain<Element> base = Chain.of(List.of(new Element(1), new Element(2)), e -> e.key);
+    List<Chain<Element>> lists = new ArrayList<>();
+    List<List<Long>> expected = new ArrayList<>();
+    Chain<Element> current = base;
+    List<Long> keys = new ArrayList<>(List.of(1L, 2L));
+    for (int level = 0; level < 20; level++) {
+      // A sibling extends the buffer first, so the next append copies
+      Chain<Element> sibling = current.append(new Element(1000 + level));
+      List<Long> siblingKeys = new ArrayList<>(keys);
+      siblingKeys.add(1000L + level);
+      lists.add(sibling);
+      expected.add(siblingKeys);
+      current = current.append(new Element(10 + level));
+      keys = new ArrayList<>(keys);
+      keys.add(10L + level);
+      lists.add(current);
+      expected.add(keys);
+    }
+    for (int i = 0; i < lists.size(); i++) {
+      Chain<Element> list = lists.get(i);
+      List<Long> own = expected.get(i);
+      for (long k : own) {
+        assertThat(list.containsKey(k)).as("list %s holds %s", i, k).isTrue();
+        assertThat(list.byKey(k).key).isEqualTo(k);
+      }
+      for (int level = 0; level < 20; level++) {
+        for (long k : new long[] {1000 + level, 10 + level}) {
+          if (!own.contains(k)) {
+            assertThat(list.containsKey(k)).as("list %s lacks %s", i, k).isFalse();
+            assertThat(list.byKey(k)).isNull();
+          }
+        }
+      }
+    }
+  }
 }
