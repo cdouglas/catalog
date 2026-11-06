@@ -40,14 +40,14 @@ final class SnapshotSealing {
   private SnapshotSealing() {}
 
   /**
-   * Seals the blocks of inline table {@code tblId} that its last sequence number passed since it
-   * was {@code beforeLast}: its snapshots {@code fields} holds with sequence numbers in such a
+   * Seals the blocks of inline table {@code tblId}, at the record that makes it version {@code
+   * version}, that its last sequence number passed since it was {@code beforeLast}: its snapshots {@code fields} holds with sequence numbers in such a
    * block, but those a ref targets, which stay inline, go to the block's page, and their lists out
    * of the table's inline lists (with the pool entries no inline list names). Returns the fields
    * without them, or {@code fields} if nothing sealed.
    */
   static TableFields seal(
-      CatalogState.Builder builder, int tblId, TableFields fields, long beforeLast) {
+      CatalogState.Builder builder, int tblId, int version, TableFields fields, long beforeLast) {
     int block = builder.snapshotBlock();
     if (block == 0 || fields.formatVersion < 2) {
       return fields;
@@ -84,7 +84,7 @@ final class SnapshotSealing {
     List<Long> sealedIds = new ArrayList<>();
     for (Map.Entry<Long, List<Snapshot>> entry : byBlock.entrySet()) {
       builder.setSealedBlock(tblId, SnapshotPages.seal(
-          fields.uuid, tblId, entry.getKey(), entry.getValue(), lists, pool,
+          fields.uuid, tblId, version, entry.getKey(), entry.getValue(), lists, pool,
           prefix != null ? prefix : ""));
       for (Snapshot snapshot : entry.getValue()) {
         if (lists.containsKey(snapshot.snapshotId())) {

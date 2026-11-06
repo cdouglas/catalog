@@ -80,6 +80,9 @@ public class CatalogState {
   // tblId -> (block -> its entry): the table's sealed snapshot blocks, whose snapshots, lists and
   // the entries only they name are in pages (SNAPSHOT_PAGING.md); each map immutable
   private final Map<Integer, java.util.SortedMap<Long, SnapshotPages.SealedBlock>> sealedBlocks;
+  // The pages this state's records dropped (an emptied block, a table out of inline storage) that
+  // no compactor has deleted yet: not encoded, as a state decoded from a checkpoint has none
+  private final List<DroppedPage> droppedPages;
 
   // The catalog's conflict encoding, null until its first record sets one (then Lamport), and
   // the encoding's state of each table that has one: tblId -> state.
@@ -104,6 +107,13 @@ public class CatalogState {
     this.poolOrdinals = ImmutableMap.copyOf(builder.poolOrdinals);
     this.nextOrdinal = ImmutableMap.copyOf(builder.nextOrdinal);
     this.sealedBlocks = ImmutableMap.copyOf(builder.sealedBlocks);
+    List<DroppedPage> dropped = new ArrayList<>();
+    for (DroppedPage page : builder.droppedPages) {
+      if (!page.deleted) {
+        dropped.add(page);
+      }
+    }
+    this.droppedPages = List.copyOf(dropped);
     this.conflictEncoding = builder.conflictEncoding;
     this.snapshotBlock = builder.snapshotBlock;
     this.snapshotWindow = builder.snapshotWindow;
@@ -141,6 +151,7 @@ public class CatalogState {
     builder.poolOrdinals.putAll(poolOrdinals);
     builder.nextOrdinal.putAll(nextOrdinal);
     builder.sealedBlocks.putAll(sealedBlocks);
+    builder.droppedPages.addAll(droppedPages);
     builder.conflictEncoding = conflictEncoding;
     builder.snapshotBlock = snapshotBlock;
     builder.snapshotWindow = snapshotWindow;
@@ -394,6 +405,21 @@ public class CatalogState {
     return sealedBlocks;
   }
 
+  /** A page a record dropped, until a compactor deletes it. */
+  static final class DroppedPage {
+    final String name;
+    volatile boolean deleted;
+
+    DroppedPage(String name) {
+      this.name = name;
+    }
+  }
+
+  /** The pages this state's records dropped that no compactor has deleted. */
+  List<DroppedPage> droppedPages() {
+    return droppedPages;
+  }
+
   /** The sealed block whose live ids hold {@code snapshotId}, or null. */
   SnapshotPages.SealedBlock sealedBlockOf(int tblId, long snapshotId) {
     for (SnapshotPages.SealedBlock block : sealedBlocks(tblId).values()) {
@@ -508,6 +534,7 @@ public class CatalogState {
     private final Map<Integer, Integer> nextOrdinal = new HashMap<>();
     private final Map<Integer, java.util.SortedMap<Long, SnapshotPages.SealedBlock>> sealedBlocks =
         new HashMap<>();
+    private final List<DroppedPage> droppedPages = new ArrayList<>();
     private String conflictEncoding;
     private int snapshotBlock;
     private int snapshotWindow;
@@ -758,7 +785,12 @@ public class CatalogState {
       snapshotManifests.remove(id);
       poolOrdinals.remove(id);
       nextOrdinal.remove(id);
-      sealedBlocks.remove(id);
+      java.util.SortedMap<Long, SnapshotPages.SealedBlock> sealed = sealedBlocks.remove(id);
+      if (sealed != null) {
+        for (SnapshotPages.SealedBlock block : sealed.values()) {
+          droppedPages.add(new DroppedPage(block.pageName(id)));
+        }
+      }
       return this;
     }
 
@@ -778,7 +810,11 @@ public class CatalogState {
       java.util.TreeMap<Long, SnapshotPages.SealedBlock> blocks =
           new java.util.TreeMap<>(sealedBlocks(tblId));
       if (block.liveIds.length == 0) {
-        blocks.remove(block.block);
+        // Its last snapshot expired or came back: its page is garbage once a root drops it
+        SnapshotPages.SealedBlock gone = blocks.remove(block.block);
+        if (gone != null) {
+          droppedPages.add(new DroppedPage(gone.pageName(tblId)));
+        }
       } else {
         blocks.put(block.block, block);
       }

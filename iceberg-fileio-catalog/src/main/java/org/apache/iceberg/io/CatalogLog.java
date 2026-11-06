@@ -79,6 +79,15 @@ public final class CatalogLog {
     return replica;
   }
 
+  /**
+   * Deletes the log's orphaned pages as {@code read} holds the catalog: the committed set's, and
+   * sealed snapshot blocks' pages that are garbage under its state (LogRuntime.sweep). For a
+   * maintenance job, or a test.
+   */
+  public void sweep(Replica<CatalogState> read) {
+    runtime.sweep(read);
+  }
+
   /** The log's page store, where sealed snapshot blocks' pages are; null if it has none. */
   org.intentlog.PageStore pages() {
     return log.pages();

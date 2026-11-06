@@ -204,6 +204,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     log.putCheckpoint(view.tail(), checkpoint(through));
     log.trim(view.tail());
     tidyPages(new ArrayList<>(dropped), !seals.isEmpty(), through.committed());
+    deleteDroppedStatePages(through.state());
     return through;
   }
 
@@ -414,6 +415,36 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     PageStore store = log.pages();
     if (store != null) {
       sweep(store, replica.committed());
+      List<String> names;
+      try {
+        names = store.list();
+      } catch (UnsupportedOperationException e) {
+        return;
+      }
+      for (String name : machine.garbagePages(replica.state(), names)) {
+        store.delete(name);
+      }
+    }
+  }
+
+  /**
+   * After a checkpoint of {@code state} landed: deletes the pages its records dropped
+   * ({@link StateMachine#droppedPages}), garbage under it and every checkpoint after. Best effort:
+   * a page left behind costs storage, and a sweep finds it.
+   */
+  private void deleteDroppedStatePages(S state) {
+    java.util.Collection<String> dropped = machine.droppedPages(state);
+    PageStore store = log.pages();
+    if (dropped.isEmpty() || store == null) {
+      return;
+    }
+    try {
+      for (String name : dropped) {
+        store.delete(name);
+      }
+      machine.pagesDeleted(state, dropped);
+    } catch (RuntimeException e) {
+      LOG.log(System.Logger.Level.WARNING, "Deleting dropped pages of " + log + " failed", e);
     }
   }
 
@@ -439,11 +470,9 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
       throw new IllegalStateException(
           log + " stores no pages, but its state names " + pages.keySet());
     }
+    // The machine offers a page until it is stored, so each is put once
     for (Map.Entry<String, byte[]> page : pages.entrySet()) {
-      if (!pagesPut.contains(page.getKey())) {
-        store.put(page.getKey(), page.getValue());
-        pagesPut.add(page.getKey());
-      }
+      store.put(page.getKey(), page.getValue());
     }
     machine.pagesPut(state, pages.keySet());
   }
@@ -719,12 +748,17 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     final List<byte[]> records;
     final List<PageRef> dropped;
     final boolean sealed;
+    // The state the checkpoint holds: once it lands, the pages its records dropped are garbage
+    final Object state;
 
-    Prepared(byte[] checkpoint, List<byte[]> records, List<PageRef> dropped, boolean sealed) {
+    Prepared(
+        byte[] checkpoint, List<byte[]> records, List<PageRef> dropped, boolean sealed,
+        Object state) {
       this.checkpoint = checkpoint;
       this.records = records;
       this.dropped = dropped;
       this.sealed = sealed;
+      this.state = state;
     }
   }
 
@@ -869,6 +903,9 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
               Replayed written =
                   write(() -> log.replace(at, replace.checkpoint, replace.records), false);
               tidyPages(replace.dropped, replace.sealed, written.result.committed().build());
+              @SuppressWarnings("unchecked")
+              S checkpointed = (S) replace.state;
+              deleteDroppedStatePages(checkpointed);
               return validate(written);
             } catch (LogConflictException e) {
               unresolved = e;
@@ -1077,7 +1114,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
         }
       }
       records.add(record);
-      return new Prepared(checkpoint(on), records, dropped, !seals.isEmpty());
+      return new Prepared(checkpoint(on), records, dropped, !seals.isEmpty(), on.state());
     }
 
     /**

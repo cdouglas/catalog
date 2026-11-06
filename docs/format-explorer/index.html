@@ -555,7 +555,8 @@
           {"number": 2, "name": "digest", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": "the page's: SHA-256, truncated to 16 bytes"},
           {"number": 3, "name": "merkle_root", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": "of its snapshots' leaves, in order"},
           {"number": 4, "name": "live_ids", "type": "fixed64", "repeated": true, "packed": true, "oneof": null, "comment": "its snapshots that have not expired, ascending"},
-          {"number": 5, "name": "leaves", "type": "uint32", "repeated": false, "packed": false, "oneof": null, "comment": "how many it sealed: the leaves under merkle_root"}
+          {"number": 5, "name": "leaves", "type": "uint32", "repeated": false, "packed": false, "oneof": null, "comment": "how many it sealed: the leaves under merkle_root"},
+          {"number": 6, "name": "table_version", "type": "uint32", "repeated": false, "packed": false, "oneof": null, "comment": "the table's at the record that sealed it"}
         ]
       },
       "BroughtBack": {
@@ -575,7 +576,8 @@
           {"number": 4, "name": "block", "type": "uint64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
           {"number": 5, "name": "snapshots", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": "StructuralInlineMetadataCodec's snapshot block of them, gzipped, in the table's order"},
           {"number": 6, "name": "pool", "type": "ManifestFileEntry", "repeated": true, "packed": true, "oneof": null, "comment": "The entries their lists name, each once, in the order first named"},
-          {"number": 7, "name": "lists", "type": "SnapshotManifestRefs", "repeated": true, "packed": true, "oneof": null, "comment": "Each inline list, whole or as a change of its parent's in the page, by index in `pool`, in the page's order"}
+          {"number": 7, "name": "lists", "type": "SnapshotManifestRefs", "repeated": true, "packed": true, "oneof": null, "comment": "Each inline list, whole or as a change of its parent's in the page, by index in `pool`, in the page's order"},
+          {"number": 8, "name": "table_version", "type": "uint32", "repeated": false, "packed": false, "oneof": null, "comment": "The table's version at the record that sealed it: a table that leaves inline storage and comes back seals its blocks under new names, so a page dropped once is garbage for good"}
         ]
       },
       "Intention": {

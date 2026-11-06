@@ -198,13 +198,14 @@ message InlineTable {
 }
 
 // A sealed block of a table's snapshots as the root keeps it: its page is
-// snap.<table id>.<block>.<digest hex> in the log's page store.
+// snap.<table id>.<table_version>.<block>.<digest hex> in the log's page store.
 message SealedBlock {
   uint64 block                = 1;   // k: sequence numbers [k * B, (k + 1) * B)
   bytes  digest               = 2;   // the page's: SHA-256, truncated to 16 bytes
   bytes  merkle_root          = 3;   // of its snapshots' leaves, in order
   repeated fixed64 live_ids   = 4;   // its snapshots that have not expired, ascending
   uint32 leaves               = 5;   // how many it sealed: the leaves under merkle_root
+  uint32 table_version        = 6;   // the table's at the record that sealed it
 }
 
 // A sealed snapshot an inline update brings back inline before it applies
@@ -238,6 +239,10 @@ message SnapshotPage {
   // Each inline list, whole or as a change of its parent's in the page, by
   // index in `pool`, in the page's order
   repeated SnapshotManifestRefs lists = 7;
+  // The table's version at the record that sealed it: a table that leaves
+  // inline storage and comes back seals its blocks under new names, so a page
+  // dropped once is garbage for good
+  uint32 table_version        = 8;
 }
 
 // ============================================================

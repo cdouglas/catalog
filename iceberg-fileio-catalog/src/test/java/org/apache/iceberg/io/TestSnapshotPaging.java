@@ -88,7 +88,7 @@ class TestSnapshotPaging {
   /** A catalog that pages nothing records nothing, and a later record cannot set its paging. */
   @Test
   void pagingIsSetOnlyOnANewCatalog() {
-    LogCatalog unpaged = catalog(Map.of());
+    LogCatalog unpaged = catalog(Map.of(LogCatalogProperties.SNAPSHOT_BLOCK, "0"));
     assertThat(unpaged.log().read().state().snapshotBlock()).isZero();
     unpaged.createNamespace(Namespace.of("ns"));
     unpaged.createTable(TABLE, SCHEMA);
@@ -238,5 +238,75 @@ class TestSnapshotPaging {
     assertThat(new SnapshotPages.BroughtBack(
             live, block.block, proof.index, forged, proof.proof).proves(block, prefix))
         .isFalse();
+  }
+
+  /**
+   * An expiry that empties sealed blocks drops their pages, which the compaction that writes the
+   * root without them deletes; the other blocks' pages stay, and the table reads its remaining
+   * snapshots. A sweep deletes an orphan page of a version the root has reached, and keeps one of a
+   * later version (a compactor ahead may write a root that names it).
+   */
+  @ParameterizedTest
+  @EnumSource(names = {"CAS_ML", "CAS_TM"})
+  void anExpiryThatEmptiesBlocksDropsTheirPages(LocalCatalogMode mode) throws Exception {
+    LogCatalog writer = mode.catalog(io, WAREHOUSE, "gc", paging(4, 8));
+    writer.createNamespace(Namespace.of("ns"));
+    Table table = writer.buildTable(TABLE, SCHEMA).withPartitionSpec(SPEC).create();
+    List<Long> ids = new ArrayList<>();
+    for (int i = 0; i < 40; i++) {
+      append(table, i);
+      ids.add(table.currentSnapshot().snapshotId());
+    }
+    int tblId = writer.log().read().state().tableId(TABLE);
+    // The root a commit writes is the state before its own record: compare with roots
+    java.util.SortedMap<Long, SnapshotPages.SealedBlock> before = root("gc").sealedBlocks(tblId);
+    assertThat(before.size()).isGreaterThan(2);
+    org.intentlog.PageStore pages = writer.log().pages();
+    for (SnapshotPages.SealedBlock block : before.values()) {
+      assertThat(pages.list()).contains(block.pageName(tblId));
+    }
+
+    // Expire the first twelve snapshots: the oldest blocks empty
+    long cutoff = table.snapshot(ids.get(12)).timestampMillis();
+    table.expireSnapshots().expireOlderThan(cutoff).retainLast(1).cleanExpiredFiles(false)
+        .commit();
+    append(table, 40); // a compaction after the expiry (CAS: every commit)
+
+    CatalogState state = root("gc");
+    java.util.SortedMap<Long, SnapshotPages.SealedBlock> after = state.sealedBlocks(tblId);
+    List<String> stored = pages.list();
+    for (SnapshotPages.SealedBlock block : before.values()) {
+      SnapshotPages.SealedBlock kept = after.get(block.block);
+      if (kept == null) {
+        assertThat(stored).doesNotContain(block.pageName(tblId));
+      } else {
+        assertThat(stored).contains(kept.pageName(tblId));
+      }
+    }
+    assertThat(after.size()).isLessThan(before.size());
+    Table fresh = mode.catalog(io, WAREHOUSE, "gc", paging(4, 8)).loadTable(TABLE);
+    List<Long> remaining = current(fresh).snapshots().stream()
+        .map(Snapshot::snapshotId).collect(Collectors.toList());
+    assertThat(remaining).doesNotContainAnyElementsOf(ids.subList(0, 12));
+    assertThat(remaining).containsAll(ids.subList(13, 40));
+
+    // Orphans: one sealed at a version the root has reached, one at a later version
+    int version = state.tableVersion(tblId);
+    byte[] digest = new byte[SnapshotPages.DIGEST_BYTES];
+    String old = SnapshotPages.pageName(tblId, version - 1, 0, digest);
+    String ahead = SnapshotPages.pageName(tblId, version + 5, 99, digest);
+    pages.put(old, new byte[] {1});
+    pages.put(ahead, new byte[] {2});
+    writer.log().sweep(writer.log().read());
+    after = writer.log().read().state().sealedBlocks(tblId);
+    for (SnapshotPages.SealedBlock block : root("gc").sealedBlocks(tblId).values()) {
+      assertThat(pages.list()).contains(block.pageName(tblId));
+    }
+    assertThat(pages.list()).doesNotContain(old).contains(ahead);
+  }
+
+  /** The state the catalog file's checkpoint holds: the root its last compaction wrote. */
+  private CatalogState root(String name) {
+    return CatalogTestSupport.decodeCheckpoint(io.bytes(WAREHOUSE + "/catalog-" + name)).build();
   }
 }

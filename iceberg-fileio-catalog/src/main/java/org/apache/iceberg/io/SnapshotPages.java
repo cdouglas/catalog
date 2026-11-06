@@ -60,6 +60,7 @@ final class SnapshotPages {
   static final int PAGE_SNAPSHOTS = 5;
   static final int PAGE_POOL = 6;
   static final int PAGE_LISTS = 7;
+  static final int PAGE_TABLE_VERSION = 8;
 
   // SnapshotManifestRefs field numbers, as ProtoCodec's (a page's lists name its pool by index)
   private static final int SMR_SNAPSHOT_ID = 1;
@@ -71,6 +72,8 @@ final class SnapshotPages {
   /** A sealed block as the root keeps it. Immutable but for its pending page's bytes. */
   static final class SealedBlock {
     final long block;
+    /** The table's version at the record that sealed it. */
+    final int version;
     final byte[] digest;
     final byte[] merkleRoot;
     /** How many snapshots it sealed: the leaves under its Merkle root. */
@@ -81,12 +84,13 @@ final class SnapshotPages {
     final Pending pending;
 
     SealedBlock(
-        long block, byte[] digest, byte[] merkleRoot, int leaves, long[] liveIds,
+        long block, int version, byte[] digest, byte[] merkleRoot, int leaves, long[] liveIds,
         Pending pending) {
       Preconditions.checkArgument(digest.length == DIGEST_BYTES, "Invalid digest");
       Preconditions.checkArgument(merkleRoot.length == DIGEST_BYTES, "Invalid Merkle root");
       Preconditions.checkArgument(liveIds.length <= leaves, "More live ids than leaves");
       this.block = block;
+      this.version = version;
       this.digest = digest;
       this.merkleRoot = merkleRoot;
       this.leaves = leaves;
@@ -96,7 +100,7 @@ final class SnapshotPages {
 
     /** The page's name in the log's page store. */
     String pageName(int tableId) {
-      return SnapshotPages.pageName(tableId, block, digest);
+      return SnapshotPages.pageName(tableId, version, block, digest);
     }
 
     boolean isLive(long snapshotId) {
@@ -112,12 +116,13 @@ final class SnapshotPages {
       long[] kept = new long[liveIds.length - 1];
       System.arraycopy(liveIds, 0, kept, 0, at);
       System.arraycopy(liveIds, at + 1, kept, at, liveIds.length - at - 1);
-      return new SealedBlock(block, digest, merkleRoot, leaves, kept, pending);
+      return new SealedBlock(block, version, digest, merkleRoot, leaves, kept, pending);
     }
 
     /** As the root encodes it: whether {@code other} names the same page and live ids. */
     boolean sameEntry(SealedBlock other) {
-      return block == other.block && Arrays.equals(digest, other.digest)
+      return block == other.block && version == other.version
+          && Arrays.equals(digest, other.digest)
           && Arrays.equals(merkleRoot, other.merkleRoot) && leaves == other.leaves
           && Arrays.equals(liveIds, other.liveIds);
     }
@@ -214,9 +219,29 @@ final class SnapshotPages {
     return decode(name, tableId, block.block, bytes, prefix);
   }
 
-  /** {@code snap.<table id>.<block>.<digest>}: no committed-set page parses so (pageTop). */
-  static String pageName(int tableId, long block, byte[] digest) {
-    return "snap." + tableId + "." + block + "." + java.util.HexFormat.of().formatHex(digest);
+  /**
+   * {@code snap.<table id>.<version>.<block>.<digest>}, the version the table's at the record that
+   * sealed it: no committed-set page parses so (pageTop).
+   */
+  static String pageName(int tableId, int version, long block, byte[] digest) {
+    return "snap." + tableId + "." + version + "." + block + "."
+        + java.util.HexFormat.of().formatHex(digest);
+  }
+
+  /** A page name's table id, version and block, or null if it names no snapshot page. */
+  static long[] parseName(String name) {
+    String[] parts = name.split("\\.", -1);
+    if (parts.length != 5 || !parts[0].equals("snap")
+        || parts[4].length() != 2 * DIGEST_BYTES) {
+      return null;
+    }
+    try {
+      java.util.HexFormat.of().parseHex(parts[4]);
+      return new long[] {
+          Integer.parseInt(parts[1]), Integer.parseInt(parts[2]), Long.parseLong(parts[3])};
+    } catch (IllegalArgumentException e) {
+      return null;
+    }
   }
 
   /** The block a sequence number falls in: blocks of {@code block} sequence numbers. */
@@ -234,13 +259,16 @@ final class SnapshotPages {
   }
 
   /**
-   * Seals block {@code block} of table {@code tableId}: {@code snapshots}, in the table's order,
+   * Seals block {@code block} of table {@code tableId} at the record that makes it version {@code
+   * tableVersion} (which the page holds, so a table that leaves inline storage and comes back
+   * seals its blocks under new names): {@code snapshots}, in the table's order,
    * each with its list in {@code lists} (paths, if it has an inline one) of entries in {@code
    * pool}, whose paths are under {@code prefix}. The entry holds the page, pending.
    */
   static SealedBlock seal(
       String tableUuid,
       int tableId,
+      int tableVersion,
       long block,
       List<Snapshot> snapshots,
       Map<Long, List<String>> lists,
@@ -263,6 +291,7 @@ final class SnapshotPages {
       ProtoWire.writeVarint(out, PAGE_MIN_READER_VERSION, READER_VERSION);
       ProtoWire.writeString(out, PAGE_TABLE_UUID, tableUuid);
       ProtoWire.writeVarint(out, PAGE_TABLE_ID, tableId);
+      ProtoWire.writeVarint(out, PAGE_TABLE_VERSION, tableVersion);
       ProtoWire.writeVarint64(out, PAGE_BLOCK, block);
       ProtoWire.writeBytes(out, PAGE_SNAPSHOTS,
           InlineMetadataIO.gzip(StructuralInlineMetadataCodec.encodeSnapshotsBlock(snapshots)));
@@ -305,8 +334,8 @@ final class SnapshotPages {
       for (Snapshot snapshot : snapshots) {
         leaves.add(leafHash(leaf(snapshot, resolve(lists.get(snapshot.snapshotId()), pool), prefix)));
       }
-      return new SealedBlock(
-          block, digest(page), merkleRoot(leaves), snapshots.size(), live, new Pending(page));
+      return new SealedBlock(block, tableVersion, digest(page), merkleRoot(leaves),
+          snapshots.size(), live, new Pending(page));
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
@@ -366,7 +395,9 @@ final class SnapshotPages {
    * @throws IllegalStateException if it is not
    */
   static Page decode(String name, int tableId, long block, byte[] bytes, String prefix) {
-    Preconditions.checkState(pageName(tableId, block, digest(bytes)).equals(name),
+    long[] named = parseName(name);
+    Preconditions.checkState(named != null
+            && pageName(tableId, (int) named[1], block, digest(bytes)).equals(name),
         "Page %s holds other bytes (table %s, block %s)", name, tableId, block);
     try {
       ByteArrayInputStream in = new ByteArrayInputStream(bytes);

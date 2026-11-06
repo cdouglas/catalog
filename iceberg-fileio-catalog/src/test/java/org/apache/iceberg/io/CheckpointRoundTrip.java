@@ -120,7 +120,57 @@ public final class CheckpointRoundTrip {
       if (problem != null) {
         throw new AssertionError("the committed set of " + location + ": " + problem);
       }
+      String snapshots = snapshotPagesProblem(CatalogTestSupport.decodeCheckpoint(file).build(),
+          name -> io.bytes(location + ".committed/" + name));
+      if (snapshots != null) {
+        throw new AssertionError("the root of " + location + ": " + snapshots);
+      }
     }
+  }
+
+  /**
+   * Why the snapshot pages the root {@code state} (a checkpoint's) names are not as it says, or
+   * null if they are (SNAPSHOT_PAGING.md, "Testing"): each sealed block's page exists ({@code
+   * pages} by name: a compactor puts a root's pages before the root), decodes as the page its
+   * name names, of the block's table and block, holds the block's live snapshots, and its leaves
+   * hash to the block's Merkle root.
+   */
+  static String snapshotPagesProblem(CatalogState state, Function<String, byte[]> pages) {
+    for (Map.Entry<Integer, java.util.SortedMap<Long, SnapshotPages.SealedBlock>> table :
+        state.allSealedBlocks().entrySet()) {
+      int tblId = table.getKey();
+      String prefix = state.allManifestPrefixes().getOrDefault(tblId, "");
+      for (SnapshotPages.SealedBlock block : table.getValue().values()) {
+        String name = block.pageName(tblId);
+        byte[] body = pages.apply(name);
+        if (body == null) {
+          return "page " + name + ", which the root names, does not exist";
+        }
+        SnapshotPages.Page page;
+        try {
+          page = SnapshotPages.decode(name, tblId, block.block, body, prefix);
+        } catch (RuntimeException e) {
+          return "page " + name + " does not decode as its name says: " + e.getMessage();
+        }
+        java.util.Set<Long> held = new java.util.HashSet<>();
+        List<byte[]> leaves = new ArrayList<>();
+        for (org.apache.iceberg.Snapshot snapshot : page.snapshots) {
+          held.add(snapshot.snapshotId());
+          leaves.add(SnapshotPages.leafHash(SnapshotPages.leaf(
+              snapshot, page.lists.get(snapshot.snapshotId()), prefix)));
+        }
+        for (long live : block.liveIds) {
+          if (!held.contains(live)) {
+            return "page " + name + " lacks live snapshot " + live;
+          }
+        }
+        if (leaves.size() != block.leaves
+            || !java.util.Arrays.equals(SnapshotPages.merkleRoot(leaves), block.merkleRoot)) {
+          return "page " + name + "'s snapshots do not hash to its block's Merkle root";
+        }
+      }
+    }
+    return null;
   }
 
   /**
@@ -186,6 +236,13 @@ public final class CheckpointRoundTrip {
         CatalogTestSupport.replay(AtomicFileLog.encode(first, records)), stored::get);
     if (pages != null) {
       violations.add("the log's committed set: " + pages);
+    }
+    byte[] newest = new java.util.TreeMap<>(log.checkpoints()).lastEntry().getValue();
+    String snapshots = snapshotPagesProblem(
+        CatalogTestSupport.decodeCheckpoint(AtomicFileLog.encode(newest, List.of())).build(),
+        stored::get);
+    if (snapshots != null) {
+      violations.add("the newest checkpoint's root: " + snapshots);
     }
     for (Map.Entry<Long, byte[]> c : log.checkpoints().entrySet()) {
       if (c.getKey() > 0L) {

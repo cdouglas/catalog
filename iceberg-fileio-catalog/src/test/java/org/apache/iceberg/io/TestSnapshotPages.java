@@ -76,7 +76,8 @@ class TestSnapshotPages {
 
   private SnapshotPages.SealedBlock seal(List<Snapshot> sealed) {
     return SnapshotPages.seal(
-        "uuid", tblId, 0, sealed, state.snapshotManifests(tblId), state.manifestPool(tblId), prefix);
+        "uuid", tblId, 9, 0, sealed, state.snapshotManifests(tblId), state.manifestPool(tblId),
+        prefix);
   }
 
   @Test

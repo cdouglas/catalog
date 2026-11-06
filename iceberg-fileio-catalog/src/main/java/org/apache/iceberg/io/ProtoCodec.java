@@ -151,6 +151,7 @@ public class ProtoCodec {
   private static final int SEALED_BLOCK_MERKLE_ROOT = 3;
   private static final int SEALED_BLOCK_LIVE_IDS = 4;
   private static final int SEALED_BLOCK_LEAVES = 5;
+  private static final int SEALED_BLOCK_TABLE_VERSION = 6;
 
   // ManifestFileEntry field numbers
   private static final int MF_PATH = 1;
@@ -911,12 +912,14 @@ public class ProtoCodec {
     }
     writeLengthDelimited(out, SEALED_BLOCK_LIVE_IDS, ids.toByteArray());
     writeVarint(out, SEALED_BLOCK_LEAVES, block.leaves);
+    writeVarint(out, SEALED_BLOCK_TABLE_VERSION, block.version);
     return out.toByteArray();
   }
 
   private static SnapshotPages.SealedBlock decodeSealedBlock(byte[] bytes) throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
     long block = 0;
+    int version = 0;
     int leaves = 0;
     byte[] digest = new byte[0];
     byte[] merkleRoot = new byte[0];
@@ -935,6 +938,9 @@ public class ProtoCodec {
           break;
         case SEALED_BLOCK_LEAVES:
           leaves = readVarint(in);
+          break;
+        case SEALED_BLOCK_TABLE_VERSION:
+          version = readVarint(in);
           break;
         case SEALED_BLOCK_LIVE_IDS:
           if ((tag & 0x7) == 2) {
@@ -960,7 +966,8 @@ public class ProtoCodec {
       Preconditions.checkState(liveIds[i - 1] < liveIds[i], "Sealed block %s live ids unsorted",
           block);
     }
-    return new SnapshotPages.SealedBlock(block, digest, merkleRoot, leaves, liveIds, null);
+    return new SnapshotPages.SealedBlock(
+        block, version, digest, merkleRoot, leaves, liveIds, null);
   }
 
   /** Reads a packed repeated uint32 field (or one unpacked value) into {@code values}. */
@@ -2966,7 +2973,7 @@ public class ProtoCodec {
           TableFields applied =
               NativeDelta.apply(current.fields(), delta, builder, id, stale, location);
           applied = SnapshotSealing.seal(
-              builder, id, applied, current.fields().lastSequenceNumber);
+              builder, id, next, applied, current.fields().lastSequenceNumber);
           builder.updateInlineTable(id, next, InlineTable.ofFields(applied, current.codec()));
         }
       } else if (fullMetadata != null) {
@@ -3016,7 +3023,8 @@ public class ProtoCodec {
           if (builder.snapshotBlock() > 0) {
             TableFields fields = after.fields();
             long beforeLast = current != null ? current.fields().lastSequenceNumber : -1L;
-            TableFields sealedFields = SnapshotSealing.seal(builder, id, fields, beforeLast);
+            TableFields sealedFields =
+                SnapshotSealing.seal(builder, id, next, fields, beforeLast);
             if (sealedFields != fields) {
               builder.updateInlineTable(id, next, InlineTable.ofFields(sealedFields, after.codec()));
             }

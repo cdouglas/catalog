@@ -4956,7 +4956,9 @@ public class TestCatalogRegressions {
     @Test
     void theOrderAStatesMapsWereBuiltInLeavesItsCheckpoint() {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
-      LogCatalog catalog = LocalCatalogMode.APPEND_ML.catalog(io, "mem:///wh", "bug80", Map.of());
+      // Unpaged whatever the suite's paging: the test needs every snapshot's list inline
+      LogCatalog catalog = LocalCatalogMode.APPEND_ML.catalog(io, "mem:///wh", "bug80",
+          Map.of(LogCatalogProperties.SNAPSHOT_BLOCK, "0"));
       catalog.createNamespace(Namespace.of("ns"));
       Schema schema = new Schema(Types.NestedField.required(1, "id", Types.LongType.get()));
       Table table = catalog.createTable(TableIdentifier.of("ns", "t"), schema);

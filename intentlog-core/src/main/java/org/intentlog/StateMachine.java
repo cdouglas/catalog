@@ -79,6 +79,26 @@ public interface StateMachine<S, B extends StateMachine.Builder<S>, I extends In
   /** That {@code names}, pages {@link #pages} gave of {@code state}, are stored. */
   default void pagesPut(S state, java.util.Collection<String> names) {}
 
+  /**
+   * The pages {@code state}'s own records dropped, that no checkpoint after it names: once a
+   * checkpoint of it has landed, they are garbage (a page a machine drops never comes back).
+   */
+  default java.util.Collection<String> droppedPages(S state) {
+    return java.util.List.of();
+  }
+
+  /** That {@code names}, pages {@link #droppedPages} gave of {@code state}, are deleted. */
+  default void pagesDeleted(S state, java.util.Collection<String> names) {}
+
+  /**
+   * Of {@code names}, pages a log's store holds, those of this machine that are garbage under
+   * {@code state}, and under any state after it: what a sweep of orphans may delete (pages put for a
+   * checkpoint that lost its race, or that a dropped page's delete missed).
+   */
+  default java.util.Set<String> garbagePages(S state, java.util.Collection<String> names) {
+    return java.util.Set.of();
+  }
+
   /** What replay mutates; {@link #build} freezes it into a state. */
   interface Builder<S> {
     S build();

@@ -103,6 +103,63 @@ final class CatalogStateMachine
     return pages;
   }
 
+  @Override
+  public java.util.Collection<String> droppedPages(CatalogState state) {
+    java.util.List<String> names = new java.util.ArrayList<>();
+    for (CatalogState.DroppedPage page : state.droppedPages()) {
+      if (!page.deleted) {
+        names.add(page.name);
+      }
+    }
+    return names;
+  }
+
+  @Override
+  public void pagesDeleted(CatalogState state, java.util.Collection<String> names) {
+    java.util.Set<String> deleted = new java.util.HashSet<>(names);
+    for (CatalogState.DroppedPage page : state.droppedPages()) {
+      if (deleted.contains(page.name)) {
+        page.deleted = true;
+      }
+    }
+  }
+
+  /**
+   * The snapshot pages among {@code names} that are garbage under {@code state} and any state after
+   * it (SNAPSHOT_PAGING.md, "Page GC"): of a table it dropped, or sealed at a version of the table
+   * it has reached and not among its sealed blocks (the block emptied, or the table left inline
+   * storage, whose blocks seal under new names if it comes back). A page of a table it does not
+   * know yet, or sealed at a later version than its own, is not.
+   */
+  @Override
+  public java.util.Set<String> garbagePages(
+      CatalogState state, java.util.Collection<String> names) {
+    java.util.Set<String> garbage = new java.util.HashSet<>();
+    for (String name : names) {
+      long[] page = SnapshotPages.parseName(name);
+      if (page == null) {
+        continue;
+      }
+      int tblId = (int) page[0];
+      if (tblId >= state.nextTableId()) {
+        continue; // a table created after this state
+      }
+      CatalogState.TblEntry table = state.tableById().get(tblId);
+      if (table == null) {
+        garbage.add(name); // dropped: ids are not reused
+        continue;
+      }
+      if (page[1] > table.version) {
+        continue; // sealed by a record after this state
+      }
+      SnapshotPages.SealedBlock block = state.sealedBlocks(tblId).get(page[2]);
+      if (block == null || !block.pageName(tblId).equals(name)) {
+        garbage.add(name);
+      }
+    }
+    return garbage;
+  }
+
   /** Drops the stored pages' bytes: every later state shares the entries that hold them. */
   @Override
   public void pagesPut(CatalogState state, java.util.Collection<String> names) {
