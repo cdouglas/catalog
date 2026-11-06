@@ -147,6 +147,43 @@ lists pay (the lists are quadratic, which Iceberg's merging appends avoid), and 
 and the fold grow linearly, so the slope extrapolates (errata D18, which retired U2's request for
 10,000; a capture of that many commits takes about half an hour under merge appends).
 
+## Records that built the whole table (SNAPSHOT_PAGING.md step 1)
+
+Until step 1 (2026-11-05, 7d3d0da), replay applied a delta of snapshots, refs and properties to
+the table's fields, but any other record through Iceberg's builder on the whole table: an expiry,
+a schema, spec, sort order or location change, and a full update, whose record held the whole
+table. Now every delta applies to the fields (the head updates through the builder on the table
+without its snapshots), and a full update of an inline table carries its head and only the
+snapshots its base lacks.
+
+`fold` of one such record (`last`: an expiry of the oldest snapshot, a column added, a statistics
+file set, which takes full mode), at 300 snapshots (fast appends, inline TM) and 3,000 (merge
+appends, inline TM, and TM+ML), on main (d02adc1) and on 7d3d0da, ops/s, one fork each, the dev
+box; the size of the record in parentheses where it changed:
+
+| | expiry | schema change | statistics change (full) |
+|---|---|---|---|
+| TM, 300, before | 53,134 | 48,538 | 195,533 (16,436 B) |
+| TM, 300, after | 45,516 | 93,534 | 382,033 (6,331 B) |
+| TM, 3,000, before | 4,112 | 6,130 | 27,784 (149,808 B) |
+| TM, 3,000, after | 3,966 | 93,224 | 72,909 (50,781 B) |
+| TM+ML, 3,000, before | 3,485 | | 161 (129,673 B) |
+| TM+ML, 3,000, after | 3,166 | | 848 (50,648 B) |
+
+- A schema change no longer depends on the table's depth (93,000 a second at 300 and 3,000
+  snapshots); it fell from 48,500 to 6,100 with depth before.
+- A full update's record is a third of what it was at 3,000 snapshots, and replays 2.6 times
+  (TM) to 5.3 times (TM+ML, which decoded the whole record to reconcile the lists) faster. What
+  remains of it is the head, chiefly the whole snapshot log (3,000 entries), which stays inline
+  (SNAPSHOT_PAGING.md, "The root").
+- An expiry costs about what it did, 4-14% less throughput: it removes snapshots from the
+  fields in O(snapshots) (a new indexed `Chain`), as the builder did. The "before" figures
+  flatter the builder: `fold` folds onto the same replica each time, so the whole table's
+  metadata, which replay built for the builder, was built once and kept; in replay each version
+  is new.
+- The TM fast-append capture of 3,000 snapshots does not fit in 6 GB (each snapshot's manifest
+  list is a file in the in-memory store, holding every manifest), so 3,000 is merge appends.
+
 ## What remains
 
 A read's cost is now its checkpoint: decoding the table's structural metadata (snapshots go

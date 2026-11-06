@@ -1,6 +1,7 @@
 # Paging a table's snapshots (design)
 
-Status: proposed 2026-11-04, revised 2026-11-05 after review; not built.
+Status: proposed 2026-11-04, revised 2026-11-05 after review; step 1 built
+(2026-11-05, measured in REPLAY_BENCH_RESULTS.md); steps 2-6 not built.
 Errata D18 (ML lists stored whole) tracks the problem; D17 (expiry starves)
 and D19 (whole-object compaction trigger) are what it costs. It is R2.1 and
 part of R2.2 in [CHECKPOINT_PLAN.md](CHECKPOINT_PLAN.md), under its
@@ -568,7 +569,16 @@ Each step stands alone and is measured before the next:
    and FULL carrying the head. The first two change no format; the third
    does: a FULL record on an inline table carries the head, the snapshots
    its base lacks and the ids of those it drops. The replay check and the
-   fuzzers cover all three.
+   fuzzers cover all three. Built 2026-11-05 (7d3d0da): every delta applies
+   to the fields in passes split at manifest updates (`NativeDelta`), the
+   replay check now also requires the builder and the fields to reject the
+   same records, and a full update of an inline table is `head_only`,
+   merged lazily (`NativeDelta.full`, `InlineTable.ofHeadOnly`; a head-only
+   update of a pointer table does not apply). Measured with `ReplayBench`'s
+   `last`: a schema change replays at 93,000 a second whatever the depth (it
+   was 6,100 at 3,000 snapshots), a statistics change's record is a third the
+   size at 3,000 snapshots and replays 2.6-5.3 times faster, and an expiry
+   costs what it did (REPLAY_BENCH_RESULTS.md).
 2. **Lists by ordinal and as deltas** (R2.1). A format change, no pages. This
    alone fixes fast appends' square growth (D18).
 3. **Lazy loads.** Blocks as the unit of decoding, lists resolved on first
