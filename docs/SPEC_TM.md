@@ -49,6 +49,9 @@ message InlineTable {
                                            //   "Inline-TM codecs")
   bytes  conflict_state       = 10; // the conflict encoding's state of the
                                     //   table (SPEC.md "Conflict Encodings")
+  uint32 next_ordinal         = 11; // see SPEC_ML.md
+  repeated uint32 pool_ordinals = 12;  // see SPEC_ML.md
+  repeated SealedBlock sealed_blocks = 13;  // "Sealed snapshot blocks"
 }
 ```
 
@@ -187,6 +190,9 @@ message UpdateTableInline {
                                                 //   `version` lacks (and its
                                                 //   refs' targets); only on an
                                                 //   inline table
+  repeated BroughtBack brought_back       = 11; // sealed snapshots it brings
+                                                //   back inline first ("Sealed
+                                                //   snapshot blocks")
 }
 ```
 
@@ -737,6 +743,52 @@ on apply it bumps the source and destination namespaces' children-set
 versions, exactly like `DropTable` + `CreateTable` would have. Conflict
 semantics fall out of the design.md operation × operation matrix without
 new fields — see entry **RT'** there.
+
+## Sealed snapshot blocks
+
+A catalog with snapshot paging (`SetSnapshotPaging`; docs/SNAPSHOT_PAGING.md)
+cuts each inline table's snapshots into blocks of B sequence numbers. After a
+record that applies to a table, replay seals each block its last sequence
+number passed ((k + 1) * B + W): the block's snapshots that no ref targets
+leave `metadata`, their lists `snapshot_refs`, and the entries only they name
+`manifest_pool`; the table keeps an entry for the block:
+
+```protobuf
+message SealedBlock {
+  uint64 block = 1;  bytes digest = 2;  bytes merkle_root = 3;
+  repeated fixed64 live_ids = 4;  uint32 leaves = 5;  uint32 table_version = 6;
+}
+```
+
+Its page (`SnapshotPage`: the table's uuid, id and version at the sealing
+record, the block, its snapshots in the structural codec's snapshot block,
+their lists by index into the entries they name) is named
+`snap.<table>.<table_version>.<block>.<digest>` in the log's page store, and
+every replica that seals the block makes the same bytes. Replay never reads a
+page; a compactor puts a root's pages before the root. A table's
+`TableMetadata` is its `metadata` and the live snapshots of its pages, in
+sequence order.
+
+Sealed live ids are the table's: a new snapshot may not take one, the
+snapshot log keeps naming them, and an expiry removes them from `live_ids`
+(a block left with none drops, and its page is garbage). A record that needs a
+sealed snapshot's content without carrying it does not apply, with reason
+`sealed: ...`: a delta whose parent is sealed, a ref moved onto a sealed
+snapshot, a branch's history back to a delta's parent that reaches one, a
+head-only full update that holds one. A record may bring a sealed snapshot
+back inline first (a rollback, a tag on an old snapshot):
+
+```protobuf
+message BroughtBack {
+  fixed64 snapshot_id = 1;  uint64 block = 2;  uint32 index = 3;
+  bytes leaf = 4;           // the snapshot alone, and its list's entries
+  repeated bytes proof = 5; // sibling hashes up to the block's merkle_root
+}
+```
+
+Replay checks the proof against `merkle_root` (the id live, the leaf naming
+it), moves the snapshot inline with its list and entries, and removes it from
+`live_ids`; without a valid proof the record does not apply.
 
 ## Inline ↔ Pointer Transitions
 

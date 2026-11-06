@@ -72,6 +72,10 @@ message Checkpoint {
   // The catalog's conflict encoding; absent until a record sets one
   // (SetConflictEncoding), and then replay judges by "lamport".
   string conflict_encoding         = 5;
+  // How the catalog pages its inline tables' old snapshots; absent until a
+  // record sets it (SetSnapshotPaging), and then nothing is paged
+  // (SNAPSHOT_PAGING.md, SPEC_TM.md "Sealed snapshot blocks").
+  SnapshotPaging snapshot_paging   = 6;
   repeated Namespace          namespaces             = 10;
   repeated Table              tables                 = 11;  // pointer-mode tables
   repeated NamespaceProperty  namespace_properties   = 12;
@@ -156,6 +160,7 @@ message Action {
     CreateTableInline       create_table_inline       = 10;  // see SPEC_TM
     RenameTable             rename_table              = 11;
     SetConflictEncoding     set_conflict_encoding     = 12;
+    SetSnapshotPaging       set_snapshot_paging       = 13;
   }
 }
 ```
@@ -242,6 +247,14 @@ message RenameTable {
 // table, so no record is judged under one encoding and then another.
 message SetConflictEncoding {
   string name = 1;
+}
+
+// Sets the catalog's snapshot paging: blocks of `block` sequence numbers,
+// each sealed once a table's last sequence number reaches (k + 1) * block +
+// window. As SetConflictEncoding, only on a catalog without paging that has
+// never had a table, so every replica seals the same blocks.
+message SetSnapshotPaging {
+  SnapshotPaging paging = 1;   // { uint32 block = 1; uint32 window = 2; }
 }
 ```
 
