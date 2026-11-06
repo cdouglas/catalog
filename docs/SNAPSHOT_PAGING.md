@@ -1,7 +1,8 @@
 # Paging a table's snapshots (design)
 
-Status: proposed 2026-11-04, revised 2026-11-05 after review; steps 1 and 2
-built (2026-11-05, measured in REPLAY_BENCH_RESULTS.md); steps 3-6 not built.
+Status: proposed 2026-11-04, revised 2026-11-05 after review; steps 1-3
+built (2026-11-05, measured in REPLAY_BENCH_RESULTS.md; step 3's worker copies
+move to step 4); steps 4-6 not built.
 Errata D18 (ML lists stored whole) tracks the problem; D17 (expiry starves)
 and D19 (whole-object compaction trigger) are what it costs. It is R2.1 and
 part of R2.2 in [CHECKPOINT_PLAN.md](CHECKPOINT_PLAN.md), under its
@@ -599,9 +600,41 @@ Each step stands alone and is measured before the next:
    use, loads through the supplier, and the fork following #18073 and
    changing `SerializableTable`, with tests in the fork; behind
    `fileio.catalog.load.lazy`. Readers that load only what they access gain
-   from this without any page.
+   from this without any page. Built 2026-11-05, with two clarifications
+   below:
+   - The fork: #18073 ported to 1.12.0 (atomicio af097dcda2, and the
+     baselines' perf a18e9c3f50: 1.12.0's REST table operations carry the
+     snapshot mode beside their read parameters), and an `InlineSnapshot`
+     that makes its list on first use (96970062e3).
+   - Lists on first use: a load's `InlineSnapshot`s make their lists when
+     asked for (e7a9a23), and a checkpoint's decode keeps each list as a
+     change of its parent's, applied on first use (0d0020a). An expiry's
+     pool GC and a checkpoint's encode still make every list.
+   - Snapshots on first use (672763e): the structural codec decodes a
+     table's columns at once and makes each snapshot from them when first
+     read, as the parser would (`Chain.lazy`); replay reads only what it
+     needs (ids by the chain's index). This is "blocks as the unit of
+     decoding" without blocks in the root: the work a read skipped was
+     making snapshots, not reading their columns, so the root keeps its
+     inline snapshots in one block as before, and the grid's blocks are
+     written only as pages (step 4, by `encodeSnapshotsBlock` on a block's
+     snapshots). Whether the root should also cut its inline snapshots by
+     block (to reuse unchanged blocks' bytes in a checkpoint) is measured
+     with step 4.
+   - Loads through the supplier (c5f0ee5): a load holds the snapshots its
+     refs target and a supplier of all of them (`LazySnapshots`), which
+     Iceberg calls for history, time travel, expiry and a commit's delta.
+   - `SerializableTable` moves to step 4: before pages, a worker's supplier
+     could read only the whole catalog object, whose newer versions may
+     have expired the shipped version's snapshots; pages are immutable and
+     named. Until then a copy ships every snapshot, as before.
+   - Still made whole: an expiry, a full update, a checkpoint's encode, a
+     copy for workers, and a commit's delta (`computeDelta` compares the
+     two versions' snapshots).
 4. **Sealing and pages.** The root's sealed blocks, the page store (shared
-   with the committed set), refs moved back with proofs, and page GC.
+   with the committed set), refs moved back with proofs, and page GC; and
+   `SerializableTable` shipping the head and a supplier that reads pages
+   (from step 3).
 5. **Re-inlining at any depth.** Import pages, the FULL record that names
    them, their GC, and a maintenance call that re-inlines a pointer table
    without a data commit.

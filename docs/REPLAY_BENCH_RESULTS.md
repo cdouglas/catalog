@@ -214,12 +214,42 @@ Inline TM+ML, fast appends (each list holds every manifest), a 100-record tail; 
   chiefly building the table's metadata and an `InlineSnapshot` per snapshot, which step 3 (lazy
   loads) takes on.
 
+## Lazy loads (SNAPSHOT_PAGING.md step 3)
+
+Step 3 (2026-11-05, e7a9a23 to c5f0ee5) makes what a read and a load hold only as it is used: a
+checkpoint's lists stay changes of their parents' until read; the structural codec makes each
+snapshot from its decoded columns when first read; and a load (`fileio.catalog.load.lazy`, the
+default) holds the snapshots its refs target and a supplier of the rest, each `InlineSnapshot`
+making its list on first use. Replay's lazy decode is not behind the switch, so a read gains with
+either setting; `lazy=false` makes everything at the load, as before.
+
+Fast appends, 952119c (step 2, before) and c5f0ee5 (after), ops/s, one fork each, the dev box
+(another session's tests ran at times: the intervals are wide):
+
+| | before | after | after, `lazy=false` |
+|---|---|---|---|
+| load, TM+ML, 300 | 165 | 583 | 195 |
+| load, TM+ML, 1,000 | 35 | 261 | 34 |
+| load, TM, 300 | 331 | 1,057 | 344 |
+| load, TM, 1,000 | 97 | 465 | 130 |
+| read, TM+ML, 1,000 | 118 | 319 | 307 |
+| read, TM, 1,000 | 327 | 930 | 885 |
+| fold, TM+ML, 1,000 | 12,134 | 16,246 | 13,362 |
+
+- A load of a 1,000-snapshot TM+ML table takes 3.8 ms (28 before), about what the read under it
+  takes; TM, 2.2 ms (10). Until something asks for history, a load makes the current snapshot,
+  the refs' targets and their lists only.
+- A read of a 1,000-snapshot table runs 2.7 times as fast in both modes: making every list and
+  every snapshot (through JSON) was most of it.
+- `fold` of one record still slows with depth (16,000 a second at 1,000 snapshots, 44,000 at
+  300): replay still does O(snapshots) per record somewhere, which is next to find.
+
 ## What remains
 
-A read's cost is now its checkpoint: decoding the table's structural metadata (snapshots go
-through JSON); since step 2 the lists cost the snapshots plus the manifests, not their product. A
-load still makes an `InlineSnapshot` list per snapshot. Candidates: decoding snapshots without
-JSON, and loads that decode only what they use, with lists the fork's `InlineSnapshot` resolves
-lazily (SNAPSHOT_PAGING.md step 3). Replay now folds a read onto the replica
+A read's cost is now its checkpoint's columns and the tail's replay: since step 3 a read makes
+only the snapshots and lists replay reads, and a load only its refs' targets. What still makes
+every snapshot: an expiry, a full update, a checkpoint's encode, a copy for workers
+(`SerializableTable`, until pages), and a commit's delta (`computeDelta` compares the two
+versions' snapshots). Replay's per-record cost still grows with depth (`fold`, above). Replay now folds a read onto the replica
 it continues, which removes the checkpoint from a reader's refresh between compactions, but the
 read still transfers the whole object (errata D15), and a fold copies the touched table's maps.
