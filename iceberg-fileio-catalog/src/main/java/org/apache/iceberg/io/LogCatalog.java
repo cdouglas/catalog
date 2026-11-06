@@ -952,13 +952,18 @@ public class LogCatalog extends BaseMetastoreCatalog
         }
         // On an inline table, the metadata goes with only the snapshots the version read lacks
         // and its refs' targets, naming those of that version's it drops: replay keeps the rest
-        // (NativeDelta.full). A pointer table returns to inline storage whole.
+        // (NativeDelta.full). A pointer table returns to inline storage whole. The head is cut from
+        // the metadata as the whole of it would be encoded (its inline snapshots' lists named by
+        // sentinel, through the builder), so the two encode the same head: the builder rebuilds
+        // the properties in a hash map sized for them all, whose order the writer's map, sized
+        // before the update added some, need not have (round sp1-r0).
+        TableMetadata encoded = rewriteInlineSnapshotsForFullEncode(metadata);
         TableFields held = isInline ? proto.inlineTable(tblId).fields() : null;
-        TableMetadata sent = held != null ? withNewSnapshots(held, metadata) : metadata;
-        byte[] fullBytes = inline.codec.encode(rewriteInlineSnapshotsForFullEncode(sent));
+        TableMetadata sent = held != null ? withNewSnapshots(held, encoded) : encoded;
+        byte[] fullBytes = inline.codec.encode(sent);
         long[] removed = held != null ? removedSnapshots(held, metadata) : null;
         if (held != null && NativeDelta.CHECK) {
-          checkFullUpdate(held, metadata, fullBytes, removed);
+          checkFullUpdate(held, encoded, fullBytes, removed);
         }
         byte[] manifestBytes =
             manifests == null
@@ -1018,12 +1023,12 @@ public class LogCatalog extends BaseMetastoreCatalog
 
     /**
      * Checks ({@link NativeDelta#CHECK}) that replay of the full update ({@code fullBytes} and
-     * {@code removed} on {@code held}) makes the metadata the whole of {@code metadata} would.
+     * {@code removed} on {@code held}) makes the metadata the whole of {@code metadata} (as it is
+     * encoded) would.
      */
     private void checkFullUpdate(
         TableFields held, TableMetadata metadata, byte[] fullBytes, long[] removed) {
-      TableMetadata whole = inline.codec.decodeFull(
-          inline.codec.encode(rewriteInlineSnapshotsForFullEncode(metadata)), null);
+      TableMetadata whole = inline.codec.decodeFull(inline.codec.encode(metadata), null);
       TableFields replayed =
           NativeDelta.full(held, inline.codec.decodeFull(fullBytes, null), removed);
       String expected = TableMetadataParser.toJson(whole);

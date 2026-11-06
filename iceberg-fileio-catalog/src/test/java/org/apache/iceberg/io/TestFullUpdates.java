@@ -171,6 +171,56 @@ class TestFullUpdates {
     }
   }
 
+  /**
+   * A full update that adds a property, of a table whose inline snapshots it does not send (their
+   * lists are inline, its head's a file, as a writer that does not inline lists leaves it): its
+   * head goes as the whole table's would, properties in the order the whole table's encoding gives
+   * them. Round sp1-r0 (a staged snapshot, which no ref targets): the whole table's encoding names
+   * inline lists by sentinel through Iceberg's builder, which rebuilds the properties in a hash map
+   * sized for them all; the head-only record, with no inline snapshot, kept the writer's map,
+   * sized for the 11 it copied (16 buckets, against 32 for 12). For these keys (the round's) the
+   * two orders differ, and so did the replays.
+   */
+  @ParameterizedTest
+  @EnumSource(names = {"APPEND_ML", "MEMLOG_ML"})
+  void aFullUpdateAddingAPropertyKeepsTheWholeTablesOrder(LocalCatalogMode mode) {
+    LogCatalog ml = catalog(mode);
+    ml.createNamespace(Namespace.of("ns"));
+    Table table = ml.buildTable(TABLE, SCHEMA).withPartitionSpec(SPEC).create();
+    for (int i = 0; i < 2; i++) {
+      append(table);
+    }
+    Table tm = catalog(mode.sharedLog ? LocalCatalogMode.MEMLOG_TM : LocalCatalogMode.APPEND_TM)
+        .loadTable(TABLE);
+    append(tm);
+    tm.updateProperties()
+        .set("commit.retry.max-wait-ms", "1")
+        .set("commit.retry.min-wait-ms", "1")
+        .set("write.metadata.delete-after-commit.enabled", "true")
+        .set("write.metadata.previous-versions-max", "2")
+        .set("commit.manifest.min-count-to-merge", "2")
+        .set("fz.k2", "v4")
+        .commit();
+    assertThat(current(tm).properties()).hasSize(11);
+    // A statistics change takes full mode; the property comes last, so the writer's builder adds
+    // it to a map sized for the others
+    Table again = ml.loadTable(TABLE);
+    long head = again.currentSnapshot().snapshotId();
+    Transaction txn = again.newTransaction();
+    txn.updateStatistics().setStatistics(statistics(head)).commit();
+    txn.updateProperties().set("fz.big", "v").commit();
+    txn.commitTransaction();
+
+    TableMetadata loaded = current(catalog(mode).loadTable(TABLE));
+    assertThat(loaded.snapshots()).hasSize(3);
+    assertThat(loaded.properties()).hasSize(12);
+    assertThat(loaded.statisticsFiles()).hasSize(1);
+    readsAsAFreshCatalog(ml, mode);
+    if (!mode.sharedLog) {
+      assertThat(fullUpdates()).last().satisfies(update -> assertThat(update.headOnly).isTrue());
+    }
+  }
+
   @org.junit.jupiter.api.Test
   void aHeadOnlyUpdateOfAPointerTableDoesNotApply() {
     LogCatalog pointer = catalog(LocalCatalogMode.APPEND);
