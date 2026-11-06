@@ -18,11 +18,13 @@
  */
 package org.apache.iceberg.io;
 
+import java.util.AbstractList;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.RandomAccess;
 
 /**
  * A snapshot's inline manifest list as a checkpoint writes it: whole, or as a change of its
@@ -200,5 +202,109 @@ final class ManifestLists {
       list.add(base.get(fromBase++));
     }
     return list;
+  }
+
+  /**
+   * Whether {@code removed} and {@code added} are a change of a list of {@code baseSize}: each
+   * strictly ascending, the removed positions in the base and the added ones in the list made.
+   */
+  static boolean isChange(int baseSize, int[] removed, int[] added) {
+    return ascendingBelow(removed, baseSize)
+        && ascendingBelow(added, baseSize - removed.length + added.length);
+  }
+
+  private static boolean ascendingBelow(int[] positions, int bound) {
+    int previous = -1;
+    for (int position : positions) {
+      if (position <= previous || position >= bound) {
+        return false;
+      }
+      previous = position;
+    }
+    return true;
+  }
+
+  /**
+   * A list as the state holds it, immutable: {@link CatalogState.Builder#setSnapshotManifests}
+   * keeps it without a copy.
+   */
+  abstract static class Stored extends AbstractList<String> implements RandomAccess {}
+
+  /** A whole list of {@code paths}, which it keeps. */
+  static List<String> whole(String[] paths) {
+    return new Whole(paths);
+  }
+
+  /**
+   * The list a change makes of {@code base} (as {@link #apply}), made on first use: a checkpoint
+   * decodes its lists without making them, and replay and loads make the few they read.
+   */
+  static List<String> changed(
+      List<String> base, int[] removed, int[] added, List<String> addedPaths) {
+    return new Changed(base, removed, added, addedPaths);
+  }
+
+  private static final class Whole extends Stored {
+    private final String[] paths;
+
+    private Whole(String[] paths) {
+      this.paths = paths;
+    }
+
+    @Override
+    public String get(int index) {
+      return paths[index];
+    }
+
+    @Override
+    public int size() {
+      return paths.length;
+    }
+  }
+
+  private static final class Changed extends Stored {
+    private final int size;
+    // the change, until the list is made; then null, so that the base can be collected
+    private List<String> base;
+    private int[] removed;
+    private int[] added;
+    private List<String> addedPaths;
+    private volatile String[] paths;
+
+    private Changed(List<String> base, int[] removed, int[] added, List<String> addedPaths) {
+      this.size = base.size() - removed.length + added.length;
+      this.base = base;
+      this.removed = removed;
+      this.added = added;
+      this.addedPaths = addedPaths;
+    }
+
+    private String[] paths() {
+      String[] made = paths;
+      if (made == null) {
+        synchronized (this) {
+          made = paths;
+          if (made == null) {
+            made = apply(base, removed, added, addedPaths).toArray(new String[0]);
+            this.paths = made;
+            this.base = null;
+            this.removed = null;
+            this.added = null;
+            this.addedPaths = null;
+          }
+        }
+      }
+      return made;
+    }
+
+    @Override
+    public String get(int index) {
+      return paths()[index];
+    }
+
+    @Override
+    public int size() {
+      return size;
+    }
   }
 }

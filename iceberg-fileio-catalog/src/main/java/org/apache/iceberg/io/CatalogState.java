@@ -880,7 +880,8 @@ public class CatalogState {
 
     /** Sets the manifest list for a snapshot (list of manifest paths in the pool). */
     public Builder setSnapshotManifests(int tblId, long snapshotId, List<String> paths) {
-      snapshotManifests.put(tblId, lists(tblId).plus(snapshotId, List.copyOf(paths)));
+      List<String> stored = paths instanceof ManifestLists.Stored ? paths : List.copyOf(paths);
+      snapshotManifests.put(tblId, lists(tblId).plus(snapshotId, stored));
       return this;
     }
 

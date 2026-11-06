@@ -54,6 +54,23 @@ class TestManifestLists {
     }
     assertThat(ManifestLists.apply(base, change.removed, change.added, addedPaths))
         .isEqualTo(list);
+    assertThat(ManifestLists.isChange(base.size(), change.removed, change.added)).isTrue();
+    // Made on first use, of a base itself made on first use
+    List<String> stored = ManifestLists.whole(base.toArray(new String[0]));
+    List<String> made = ManifestLists.changed(stored, change.removed, change.added, addedPaths);
+    assertThat(made).hasSize(list.size());
+    assertThat(made).isEqualTo(list);
+  }
+
+  @Example
+  void aMalformedChangeIsNotOne() {
+    assertThat(ManifestLists.isChange(3, new int[] {0, 2}, new int[] {0})).isTrue();
+    assertThat(ManifestLists.isChange(3, new int[] {2, 0}, new int[0])).isFalse();
+    assertThat(ManifestLists.isChange(3, new int[] {3}, new int[0])).isFalse();
+    assertThat(ManifestLists.isChange(3, new int[] {1, 1}, new int[0])).isFalse();
+    assertThat(ManifestLists.isChange(3, new int[0], new int[] {4})).isFalse();
+    assertThat(ManifestLists.isChange(3, new int[0], new int[] {3})).isTrue();
+    assertThat(ManifestLists.isChange(3, new int[] {0}, new int[] {-1})).isFalse();
   }
 
   @Example

@@ -896,10 +896,11 @@ public class ProtoCodec {
 
     List<String> paths;
     if (base == 0) {
-      paths = new ArrayList<>(ordinals.size());
-      for (int ordinal : ordinals) {
-        paths.add(pooled(byOrdinal, ordinal, tblId));
+      String[] whole = new String[ordinals.size()];
+      for (int i = 0; i < whole.length; i++) {
+        whole[i] = pooled(byOrdinal, ordinals.get(i), tblId);
       }
+      paths = ManifestLists.whole(whole);
     } else {
       Preconditions.checkState(
           base <= before.size() && added.size() % 2 == 0,
@@ -910,9 +911,13 @@ public class ProtoCodec {
         positions[i] = added.get(2 * i);
         addedPaths.add(pooled(byOrdinal, added.get(2 * i + 1), tblId));
       }
-      paths = ManifestLists.apply(
-          before.get(before.size() - base), removed.stream().mapToInt(Integer::intValue).toArray(),
-          positions, addedPaths);
+      List<String> baseList = before.get(before.size() - base);
+      int[] removedPositions = removed.stream().mapToInt(Integer::intValue).toArray();
+      // The list is made on first use: whether the change makes one is checked now
+      Preconditions.checkState(
+          ManifestLists.isChange(baseList.size(), removedPositions, positions),
+          "Table %s: a malformed manifest list change for snapshot %s", tblId, snapshotId);
+      paths = ManifestLists.changed(baseList, removedPositions, positions, addedPaths);
     }
     builder.setSnapshotManifests(tblId, snapshotId, paths);
     return paths;
