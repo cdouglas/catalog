@@ -657,6 +657,21 @@ Each step stands alone and is measured before the next:
    - Loads through the supplier (c5f0ee5): a load holds the snapshots its
      refs target and a supplier of all of them (`LazySnapshots`), which
      Iceberg calls for history, time travel, expiry and a commit's delta.
+   - The supplier holds only its version (Bug 83, fixed 2026-11-06). The
+     metadata a lazy load makes is kept on the version's `InlineTable`,
+     which later states share while the table is unchanged. Its supplier
+     called the loading operations' methods and, from 7fba41f on, used the
+     read's state, so it held both. The operations held their last read: a
+     replica, which is the catalog object's bytes and its state. That
+     state's other tables kept metadata holding older reads in turn.
+     catalog-bench's e3-sp campaign found it. At 1,000 snapshots, live heap
+     was 1.5-3x e3-d20's. Mid-run, 8 clients held 95 replicas where 8 were
+     needed. At 7,200 snapshots unpaged, where a read is about 30 MB, a run
+     ran out of memory in a 12 GB heap. The supplier is now made by a static
+     method (`allSnapshots`) from what it needs. In a local run of e3's
+     1,000-snapshot ML configuration on S3 Express (150 s measured), live
+     heap at the end fell from 0.92 GB to 0.50 GB; e3-d20's 300 s runs on
+     havoc ended at 0.73 GB. e3-sp is rerun with the fix.
    - `SerializableTable` moves to step 4: before pages, a worker's supplier
      could read only the whole catalog object, whose newer versions may
      have expired the shipped version's snapshots; pages are immutable and

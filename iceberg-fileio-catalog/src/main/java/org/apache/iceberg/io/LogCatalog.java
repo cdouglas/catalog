@@ -731,6 +731,11 @@ public class LogCatalog extends BaseMetastoreCatalog
       loadFrom(read.state());
     }
 
+    /** The read these operations last loaded the table from (tests). */
+    Replica<CatalogState> lastRead() {
+      return lastRead;
+    }
+
     /**
      * Writes {@code metadata} to a new metadata file and returns its location. A metadata file can
      * name only manifest list files, so first each inline-ML snapshot's list, which the catalog
@@ -1119,16 +1124,25 @@ public class LogCatalog extends BaseMetastoreCatalog
      * commit fails as stale); else lost, which is never right ({@code e}).
      */
     private RuntimeException missing(SnapshotPages.MissingPage e, CatalogState read) {
+      return missing(log, tableId, read.tableVersion(e.tableId), e);
+    }
+
+    /**
+     * {@link #missing(SnapshotPages.MissingPage, CatalogState)} of a read in which the table was at
+     * version {@code readVersion}: what a lazy load's supplier keeps of its read.
+     */
+    private static RuntimeException missing(
+        CatalogLog log, TableIdentifier tableId, int readVersion, SnapshotPages.MissingPage e) {
       CatalogState now = log.read().state();
       int version = now.tableVersion(e.tableId);
-      boolean moved = version == -1 || version > read.tableVersion(e.tableId);
+      boolean moved = version == -1 || version > readVersion;
       if (moved) {
         boolean named = false;
         for (SnapshotPages.SealedBlock block : now.sealedBlocks(e.tableId).values()) {
           named |= block.pageName(e.tableId).equals(e.name);
         }
         if (!named) {
-          return new PageCollectedException(e, tableId, read.tableVersion(e.tableId), version);
+          return new PageCollectedException(e, tableId, readVersion, version);
         }
       }
       return e;
@@ -1520,6 +1534,12 @@ public class LogCatalog extends BaseMetastoreCatalog
      */
     private boolean checkInlineSnapshots(
         Map<Long, List<String>> lists, List<Snapshot> snapshots, boolean inlineKnown) {
+      return checkInlineSnapshots(inline, tableId, lists, snapshots, inlineKnown);
+    }
+
+    private static boolean checkInlineSnapshots(
+        InlineSettings inline, TableIdentifier tableId,
+        Map<Long, List<String>> lists, List<Snapshot> snapshots, boolean inlineKnown) {
       boolean hasInline = inlineKnown;
       boolean hasPointer = false;
       for (Snapshot s : snapshots) {
@@ -1556,7 +1576,8 @@ public class LogCatalog extends BaseMetastoreCatalog
      * and a supplier of all of them, which Iceberg calls when something asks for another snapshot
      * or for every one (history, time travel, expiry, a commit's builder). The checks a whole load
      * makes read the snapshots without a list here, and the rest in the supplier; the supplier
-     * holds the version's fields, lists and pool, not the catalog's state.
+     * holds the version's fields, lists and pool, not the catalog's state nor these operations
+     * ({@link #allSnapshots}).
      */
     private TableMetadata lazyMetadata(
         CatalogState state, int tblId, TableFields fields, String location) {
@@ -1601,11 +1622,36 @@ public class LogCatalog extends BaseMetastoreCatalog
           shipped = sealed.isEmpty() ? null
               : () -> PagedSnapshots.of(fields.uuid, tblId, prefix, List.copyOf(snapshots), lists,
                   pool, sealed, store, pagesIO);
-      LazySnapshots all = new LazySnapshots(() -> {
+      LazySnapshots all = new LazySnapshots(
+          allSnapshots(log, tableId, pagesIO, inline, made, tblId, state.tableVersion(tblId),
+              snapshots, listed, lists, pool, lazy, sealed, store, prefix),
+          shipped);
+      return fields.toMetadata(location, wrapped, all);
+    }
+
+    /**
+     * The supplier of every snapshot that a lazy load's metadata holds. It is static so that it
+     * holds only what it is given: the version's snapshots, lists, pool and sealed blocks, the
+     * table's version in the read, and the client's log, FileIO, settings and InlineSnapshots. It
+     * never holds the read's state or these operations, whose last read is a replica: the catalog
+     * object's bytes and its state. The metadata is kept on the version's {@link InlineTable},
+     * which later states share while the table is unchanged, so whatever the supplier held of the
+     * read would be held as long. Through that read's other tables it would hold their loads' reads
+     * in turn: 95 replicas held by 8 clients in catalog-bench's e3-sp, an OutOfMemoryError at
+     * 7,200 snapshots unpaged (Bug 83).
+     */
+    @SuppressWarnings("checkstyle:ParameterNumber")
+    private static java.util.function.Supplier<List<Snapshot>> allSnapshots(
+        CatalogLog log, TableIdentifier tableId, FileIO io, InlineSettings inline,
+        InlineSnapshots made, int tblId, int readVersion, Chain<Snapshot> snapshots,
+        boolean listed, Map<Long, List<String>> lists, Map<String, ManifestFile> pool,
+        boolean lazy, Map<Long, SnapshotPages.SealedBlock> sealed,
+        org.intentlog.PageStore store, String prefix) {
+      return () -> {
         List<Snapshot> every = List.copyOf(snapshots);
         List<Snapshot> inlined;
         if (!listed) {
-          checkInlineSnapshots(lists, every, false);
+          checkInlineSnapshots(inline, tableId, lists, every, false);
           inlined = every;
         } else {
           inlined = made.wrap(tblId, lists, pool, every, lazy, true);
@@ -1616,14 +1662,14 @@ public class LogCatalog extends BaseMetastoreCatalog
         try {
           return withSealed(inlined, made.pages(store, tblId, sealed, prefix), sealed);
         } catch (SnapshotPages.MissingPage e) {
-          RuntimeException failure = missing(e, state);
+          RuntimeException failure = missing(log, tableId, readVersion, e);
           if (failure instanceof PageCollectedException) {
-            return asNow(inlined, sealed, tblId, (PageCollectedException) failure);
+            return asNow(log, io, inline, made, inlined, sealed, tblId,
+                (PageCollectedException) failure);
           }
           throw failure;
         }
-      }, shipped);
-      return fields.toMetadata(location, wrapped, all);
+      };
     }
 
     /**
@@ -1635,7 +1681,8 @@ public class LogCatalog extends BaseMetastoreCatalog
      * (TableMetadata keeps what the supplier gives of the snapshots it inherited). If the table is
      * gone, so are they ({@code collected}).
      */
-    private List<Snapshot> asNow(
+    private static List<Snapshot> asNow(
+        CatalogLog log, FileIO io, InlineSettings inline, InlineSnapshots inlineSnapshots,
         List<Snapshot> inlined, Map<Long, SnapshotPages.SealedBlock> sealed, int tblId,
         PageCollectedException collected) {
       Replica<CatalogState> now = log.read();
@@ -1651,7 +1698,7 @@ public class LogCatalog extends BaseMetastoreCatalog
       }
       Map<Long, Snapshot> current = new HashMap<>();
       FileIOTableOperations ops = new FileIOTableOperations(
-          named, log, tableIO.delegate(), inline, inlineSnapshots, now);
+          named, log, io, inline, inlineSnapshots, now);
       for (Snapshot snapshot : ops.current().snapshots()) {
         current.put(snapshot.snapshotId(), snapshot);
       }

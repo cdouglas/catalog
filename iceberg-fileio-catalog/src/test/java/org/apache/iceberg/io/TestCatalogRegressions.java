@@ -5133,4 +5133,68 @@ public class TestCatalogRegressions {
       assertThat(CheckpointRoundTrip.malformedLists(state)).as(mode.name()).isNull();
     }
   }
+
+  /**
+   * Bug 83: a lazy load's metadata held the read it was made from. The supplier of every snapshot
+   * (LogCatalog's lazy loads, snapshot paging step 3) called the loading operations' methods and,
+   * since 7fba41f, the read's state, so it held both, and the operations held their last read: a
+   * replica, the catalog object's bytes and state. The metadata is kept on the version's
+   * InlineTable, which later states share while the table is unchanged, so an unchanged table's
+   * metadata held an old read, whose other tables' kept metadata held older ones in turn.
+   * catalog-bench's e3-sp found it: 95 replicas live in 8 clients at 1,000 snapshots, live heap
+   * 1.5-3x before step 3's, and an OutOfMemoryError at 7,200 unpaged snapshots, where a read is
+   * about 30 MB. The supplier is now made by a static method from what it needs.
+   */
+  @Nested
+  class LazyLoadsHoldNoRead {
+    private final TableIdentifier a = TableIdentifier.of("ns", "a");
+    private final TableIdentifier b = TableIdentifier.of("ns", "b");
+
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND_TM", "APPEND_ML", "COMPACT_TM", "COMPACT_ML"})
+    void anUnchangedTableHoldsNeitherTheReadNorTheOperationsThatLoadedIt(LocalCatalogMode mode)
+        throws InterruptedException {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog writer = mode.catalog(io, "mem:///w", "c", Map.of());
+      writer.createNamespace(Namespace.of("ns"));
+      writer.createTable(a, intSchema).newFastAppend().appendFile(file("a0")).commit();
+      writer.createTable(b, intSchema).newFastAppend().appendFile(file("b0")).commit();
+      // Two snapshots, so that a load holds the current one and a supplier of both
+      writer.loadTable(b).newFastAppend().appendFile(file("b1")).commit();
+
+      // The reader's load is the first of b's version in its catalog: the metadata it makes is
+      // kept on the version
+      LogCatalog reader = mode.catalog(io, "mem:///w", "c", Map.of());
+      List<java.lang.ref.WeakReference<Object>> loadedBy = load(reader);
+      // The writer commits to a, and the reader reads past those commits, its later states
+      // sharing b's version (in an append mode, where a read folds the new records onto the last)
+      for (int i = 1; i <= 3; i++) {
+        writer.loadTable(a).newFastAppend().appendFile(file("a" + i)).commit();
+        assertThat(reader.loadTable(a).currentSnapshot()).isNotNull();
+      }
+      // A load of b's version reuses the kept metadata (asking it for every snapshot, which
+      // spends its supplier, would hide what the supplier holds)
+      Table again = reader.loadTable(b);
+      assertThat(again.currentSnapshot()).isNotNull();
+
+      for (int i = 0; i < 50 && loadedBy.stream().anyMatch(ref -> ref.get() != null); i++) {
+        System.gc();
+        Thread.sleep(20);
+      }
+      assertThat(loadedBy).as(mode.name()).allMatch(ref -> ref.get() == null);
+    }
+
+    /** Loads b, and returns weakly the operations that loaded it, their read and its state. */
+    private List<java.lang.ref.WeakReference<Object>> load(LogCatalog catalog) {
+      Table table = catalog.loadTable(b);
+      assertThat(table.currentSnapshot()).isNotNull();
+      LogCatalog.FileIOTableOperations ops = (LogCatalog.FileIOTableOperations)
+          ((org.apache.iceberg.HasTableOperations) table).operations();
+      Replica<CatalogState> read = ops.lastRead();
+      return List.of(
+          new java.lang.ref.WeakReference<>(ops),
+          new java.lang.ref.WeakReference<>(read),
+          new java.lang.ref.WeakReference<>(read.state()));
+    }
+  }
 }
