@@ -146,6 +146,14 @@ public class ReplayBench {
   @Param({"true"})
   public boolean lazy;
 
+  /** The catalog's snapshot blocks ({@code fileio.catalog.snapshot.block}): 0 pages nothing. */
+  @Param({"0"})
+  public int block;
+
+  /** The window behind a table's last sequence number a block seals at. */
+  @Param({"1024"})
+  public int window;
+
   private byte[] checkpoint;
   private List<byte[]> records;
   private CatalogState finalState;
@@ -185,10 +193,11 @@ public class ReplayBench {
             CatalogStateMachine.INSTANCE.decodeCheckpoint(envelope.state()),
             CommittedSet.of(envelope.committed()).toBuilder(), envelope.logId(), 0,
             records.subList(0, at), null);
+    CatalogState beforeState = before.builder().build();
     tailCheckpoint =
         LogEnvelope.encodeCheckpoint(
             envelope.logId(), before.committed().build().bytes(),
-            CatalogStateMachine.INSTANCE.encodeCheckpoint(before.builder().build()));
+            CatalogStateMachine.INSTANCE.encodeCheckpoint(beforeState));
     tailRecords = new ArrayList<>(records.subList(at, end));
     freshRecords = new ArrayList<>(records.subList(end, records.size()));
     allRecords = new ArrayList<>(records.subList(at, records.size()));
@@ -200,6 +209,10 @@ public class ReplayBench {
     tailIO = new InMemoryAtomicFileIO();
     tailIO.recordHistory(false);
     tailIO.seed(CATALOG, AtomicFileLog.encode(tailCheckpoint, tailRecords));
+    // The checkpoint here is encoded, not written by a compactor: store the pages it names, as
+    // one would have before writing it
+    CatalogStateMachine.INSTANCE.pages(beforeState).forEach(
+        (name, page) -> tailIO.seed(CATALOG + ".committed/" + name, page));
 
     Table table = catalog().loadTable(TableIdentifier.of("ns", "t0"));
     System.out.printf(
@@ -302,8 +315,9 @@ public class ReplayBench {
   private byte[] capturedLog() {
     Path cache =
         Path.of("target", "replay-bench",
-            String.format("%s-%s-%s-c%d-e%d-t%d-f%d-p%d%s.log", mode, encoding, op, commits, expire,
-                tables, files, partitions, last.equals("none") ? "" : "-" + last));
+            String.format("%s-%s-%s-c%d-e%d-t%d-f%d-p%d%s%s.log", mode, encoding, op, commits,
+                expire, tables, files, partitions, last.equals("none") ? "" : "-" + last,
+                block > 0 ? "-b" + block + "w" + window : ""));
     try {
       if (Files.exists(cache)) {
         return Files.readAllBytes(cache);
@@ -339,6 +353,8 @@ public class ReplayBench {
     props.put(LogCatalogProperties.MAX_APPEND_COUNT, "0");
     props.put(LogCatalogProperties.CONFLICT_ENCODING, encoding);
     props.put(LogCatalogProperties.RACE_MIN_WAIT_MS, "0");
+    props.put(LogCatalogProperties.SNAPSHOT_BLOCK, String.valueOf(block));
+    props.put(LogCatalogProperties.SNAPSHOT_WINDOW, String.valueOf(window));
     FileIOCatalog setup = new FileIOCatalog("c", CATALOG, io, new HashMap<>());
     setup.initialize("c", props);
     setup.createNamespace(Namespace.of("ns"));

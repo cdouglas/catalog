@@ -2,7 +2,8 @@
 
 Status: proposed 2026-11-04, revised 2026-11-05 after review; steps 1-3
 built (2026-11-05, measured in REPLAY_BENCH_RESULTS.md; step 3's worker copies
-move to step 4); steps 4-6 not built.
+move to step 4); step 4 built but for worker copies, off by default until
+fuzzed and measured; steps 5-6 not built.
 Errata D18 (ML lists stored whole) tracks the problem; D17 (expiry starves)
 and D19 (whole-object compaction trigger) are what it costs. It is R2.1 and
 part of R2.2 in [CHECKPOINT_PLAN.md](CHECKPOINT_PLAN.md), under its
@@ -634,7 +635,37 @@ Each step stands alone and is measured before the next:
 4. **Sealing and pages.** The root's sealed blocks, the page store (shared
    with the committed set), refs moved back with proofs, and page GC; and
    `SerializableTable` shipping the head and a supplier that reads pages
-   (from step 3).
+   (from step 3). Built 2026-11-05 but for `SerializableTable` (a copy still
+   ships every snapshot, which its supplier reads from the pages on the
+   driver), behind `fileio.catalog.snapshot.block` (0 until it is fuzzed and
+   measured; then 256) and `.window` (1,024), which the catalog's first
+   record fixes (`SetSnapshotPaging`, 28f8248). As built:
+   - Replay seals (`SnapshotSealing`, d896226) after a delta or full update,
+     the blocks the table's last sequence number passed, keeping refs'
+     targets inline. A sealed block's entry (`SealedBlock`) holds its digest,
+     Merkle root, leaf count, live ids and the table version of the record
+     that sealed it; the page holds that version and the table's uuid (the
+     log id the sketch above names is not known to replay), so a table that
+     leaves inline storage and comes back seals under new names and a
+     dropped page is garbage for good (a5c8aaf). Pages are named
+     `snap.<table>.<version>.<block>.<digest>`.
+   - Until a compactor stores a page, it exists only in the replicas that
+     replayed its seal (`Pending`): a load reads those bytes first, then the
+     page store. The runtime puts a state's pending pages before any
+     checkpoint it writes (`StateMachine.pages`; a5c75ae), so no root precedes
+     its pages.
+   - Records that need a sealed snapshot without carrying it do not apply,
+     with reason `sealed: ...`; a writer brings back each sealed snapshot its
+     refs target with its leaf and proof (`BroughtBack`, 3b9d2d0), which
+     replay checks against the root's Merkle root.
+   - Expiry removes sealed ids from their blocks' live ids; replay records
+     the pages its records drop, and the runtime deletes them once a root
+     without them lands; `LogRuntime.sweep` deletes orphans
+     (`StateMachine.garbagePages`; a5c8aaf).
+   - Testing: `TestSnapshotPages`, `TestSnapshotPaging`, the suites with
+     `-Dfileio.catalog.test.snapshot.block=4` (window 8) in the test JVM, and
+     rounds with `SNAPSHOT_BLOCK=4` (fuzz/ce-fuzz). `CheckpointRoundTrip`
+     checks every root's pages. The TLA+ models do not have pages yet.
 5. **Re-inlining at any depth.** Import pages, the FULL record that names
    them, their GC, and a maintenance call that re-inlines a pointer table
    without a data commit.
