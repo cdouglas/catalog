@@ -308,6 +308,7 @@ class TestCatalogFaultProperties {
             Tuple.of(2, Kind.EXPIRE_SNAPSHOTS),
             Tuple.of(1, Kind.SET_RETENTION),
             Tuple.of(1, Kind.REWRITE_MANIFESTS),
+            Tuple.of(1, Kind.REINLINE),
             Tuple.of(1, Kind.CREATE_NAMESPACE),
             Tuple.of(1, Kind.DROP_NAMESPACE),
             Tuple.of(2, Kind.SET_NAMESPACE_PROPERTY),
@@ -407,6 +408,12 @@ class TestCatalogFaultProperties {
      */
     SET_RETENTION,
     REWRITE_MANIFESTS,
+    /**
+     * Brings a pointer table back inline ({@link LogCatalog#reinline}), its history behind the
+     * sealing line in import pages when the catalog pages snapshots; it changes nothing a reader
+     * sees, and in a writer that does not inline it does nothing.
+     */
+    REINLINE,
     /** Creates ns or ns2, as {@code b} picks, with a property when {@code b} is odd. */
     CREATE_NAMESPACE,
     /** Drops ns or ns2, as {@code b} picks, which fails unless it is empty. */
@@ -1697,6 +1704,11 @@ class TestCatalogFaultProperties {
           return new Op(
               "rewriteManifests(" + id + ")",
               () -> handle(w, id, cmd.fresh).rewriteManifests().clusterBy(f -> "all").commit(),
+              (m, actual) -> existing(m, id));
+        case REINLINE:
+          return new Op(
+              "reinline(" + id + ")",
+              () -> w.catalog.reinline(id),
               (m, actual) -> existing(m, id));
         case CREATE_NAMESPACE:
         case DROP_NAMESPACE:

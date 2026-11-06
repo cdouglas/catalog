@@ -420,6 +420,11 @@ message UpdateTableInline {
   bool head_only = 10;
   // Sealed snapshots it brings back inline first, each with its proof
   repeated BroughtBack brought_back = 11;
+  // With full_metadata on a pointer table (re-inlining), the blocks of its
+  // history its writer put as import pages before sending it: replay installs
+  // them as sealed, on the writer's word, and reads no page
+  // (SNAPSHOT_PAGING.md, "Re-inlining")
+  repeated SealedBlock imported_blocks = 12;
 }
 
 // ============================================================

@@ -200,12 +200,28 @@ final class SnapshotPages {
   }
 
   /**
+   * A page a sealed block names that the store does not hold: lost, if the table still names it,
+   * or collected since the state that named it was read (SNAPSHOT_PAGING.md, "Page GC"), which
+   * the catalog tells apart.
+   */
+  static final class MissingPage extends IllegalStateException {
+    final String name;
+    final int tableId;
+
+    MissingPage(String name, int tableId) {
+      super("Page " + name + " of a sealed block with live snapshots does not exist");
+      this.name = name;
+      this.tableId = tableId;
+    }
+  }
+
+  /**
    * Reads and decodes the page of {@code block}, sealed block of table {@code tableId}: the bytes
    * this replica sealed it with, if no compactor has stored them yet (until the next root, a
    * page exists only in the replicas that replayed its seal), else from {@code store}. A page the
    * store lacks is never taken for empty: its block's snapshots are live, and a load needs them.
    *
-   * @throws IllegalStateException if the store holds no such page
+   * @throws MissingPage if the store holds no such page
    */
   static Page read(
       org.intentlog.PageStore store, int tableId, SealedBlock block, String prefix) {
@@ -213,8 +229,7 @@ final class SnapshotPages {
     byte[] bytes = block.pending != null ? block.pending.bytes() : null;
     if (bytes == null) {
       Preconditions.checkState(store != null, "No page store holds page %s", name);
-      bytes = store.get(name).orElseThrow(() -> new IllegalStateException(
-          "Page " + name + " of a sealed block with live snapshots does not exist"));
+      bytes = store.get(name).orElseThrow(() -> new MissingPage(name, tableId));
     }
     return decode(name, tableId, block.block, bytes, prefix);
   }

@@ -67,9 +67,13 @@ final class SnapshotSealing {
     }
     Map<Long, List<Snapshot>> byBlock = new TreeMap<>();
     List<Snapshot> kept = new ArrayList<>(fields.snapshots.size());
+    // A block that has an entry already (a re-inlined table's import) is sealed: what of it is
+    // inline stays
+    java.util.Set<Long> entered = builder.sealedBlocks(tblId).keySet();
     for (Snapshot snapshot : fields.snapshots) {
       long k = SnapshotPages.blockOf(snapshot.sequenceNumber(), block);
-      if (k > from && k <= through && !targets.contains(snapshot.snapshotId())) {
+      if (k > from && k <= through && !targets.contains(snapshot.snapshotId())
+          && !entered.contains(k)) {
         byBlock.computeIfAbsent(k, b -> new ArrayList<>()).add(snapshot);
       } else {
         kept.add(snapshot);

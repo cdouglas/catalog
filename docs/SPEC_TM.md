@@ -193,6 +193,11 @@ message UpdateTableInline {
   repeated BroughtBack brought_back       = 11; // sealed snapshots it brings
                                                 //   back inline first ("Sealed
                                                 //   snapshot blocks")
+  repeated SealedBlock imported_blocks    = 12; // with a full update of a
+                                                //   pointer table in a catalog
+                                                //   that pages: its history in
+                                                //   import pages ("Pointer →
+                                                //   Inline")
 }
 ```
 
@@ -816,7 +821,26 @@ An inline writer's next update to a pointer table is full mode if the
 full metadata (with any manifest updates) fits; otherwise the table
 stays a pointer table and the update writes another metadata file. The
 snapshots that have manifest list files keep them. Compaction does not
-re-inline tables.
+re-inline tables; `LogCatalog.reinline` does, without a data commit (the
+table's current metadata, unchanged).
+
+In a catalog that pages snapshots, the full update of a pointer table
+cuts the snapshots behind the sealing line (as replay would seal them at
+the table's last sequence number), but refs' targets and snapshots whose
+lists the update sends inline, into blocks, and puts each block's page
+before it sends the record: an *import page*, a `SnapshotPage` of the
+version the record makes (its snapshots keep their list files, so it has
+no pool or lists). The record holds the head with the rest of the
+snapshots, and an entry per block in `imported_blocks`. Replay never reads
+the pages: it takes them on the writer's word, as it takes a pointer
+table's metadata file, and checks what the record shows. The blocks must
+be of the version the update makes, ascending, each with live ids, none
+in two blocks or in the head, and no ref may target one (else `import:
+...`); a head-only update or one on an inline table carries none. It
+installs them as the table's sealed blocks. A later bring-back is checked
+against the importer's Merkle root, so loads and bring-backs agree. An
+import whose record never lands leaves pages of a version the table
+passes with its next commit, which a sweep then deletes.
 
 ### Mixed-Mode Catalogs
 

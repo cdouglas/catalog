@@ -2,8 +2,8 @@
 
 Status: proposed 2026-11-04, revised 2026-11-05 after review; steps 1-3
 built (2026-11-05, measured in REPLAY_BENCH_RESULTS.md; step 3's worker copies
-move to step 4); step 4 built and measured, off by default until fuzzed; steps 5-6 not
-built.
+move to step 4); step 4 built and measured, off by default until fuzzed; step 5
+built (2026-11-06); step 6 not built.
 Errata D18 (ML lists stored whole) tracks the problem; D17 (expiry starves)
 and D19 (whole-object compaction trigger) are what it costs. It is R2.1 and
 part of R2.2 in [CHECKPOINT_PLAN.md](CHECKPOINT_PLAN.md), under its
@@ -379,9 +379,17 @@ the root (one a compactor ahead wrote) is not garbage.
 
 - On a shared log with checkpoints apart, the sweep counts every checkpoint
   the provider may still serve, not only the newest.
-- A reader holding metadata from before a block emptied cannot load the
-  snapshots it held. Iceberg's readers fail the same way once an expiry
-  deletes a manifest list.
+- A reader holding metadata from before a block emptied, or from before its
+  table was evicted or dropped, cannot load the snapshots it held. Iceberg's
+  readers fail the same way once an expiry deletes a manifest list. As built
+  (found by a fault round at B = 2, W = 1, where a stale handle's schema
+  update staged on such metadata): a load whose page is missing reads the
+  catalog again, and if the table has moved past the version it read (or is
+  gone) and no longer names the page, fails as not found
+  (`LogCatalog.PageCollectedException`, a `NotFoundException`), and a commit
+  staged on that read fails as stale (`CommitFailedException`), which
+  Iceberg's retry cures with a refresh. A missing page the table still names
+  is a loss, never taken for collected (`SnapshotPages.MissingPage`).
 
 A table outlives its blocks. Its head is never sealed (a ref's target stays
 inline, [Blocks](#blocks)), and Iceberg's expiry never removes it: main is
@@ -423,10 +431,11 @@ pages rather than into the record.
 blocks on the table's grid and puts each as a page before it sends its
 record, as a compactor puts a page before its root. An import page is a
 `SnapshotPage` whose snapshots keep the manifest list files they have (a
-snapshot's list in a page is a list file's location or a list of the
-pool's ordinals). The record is FULL, on the table's version: the head, the
-inline snapshots, and for each block its index, live ids, Merkle root and
-page name. That is about 18 B a snapshot and 50 B a block, 0.8 MB at
+snapshot's list location is part of the snapshot; the page has no pool or
+lists). The record is FULL, on the table's version: the head, the inline
+snapshots, and for each block its entry (`imported_blocks`: index, live
+ids, Merkle root, digest, leaf count, version), from which the page's name
+follows. That is about 18 B a snapshot and 50 B a block, 0.8 MB at
 43,200 snapshots, within one record. Replay installs the blocks as sealed
 and reads no page.
 
@@ -437,10 +446,11 @@ and reads no page.
   named by its digest. A later record that brings one of its snapshots back
   is checked against the importer's Merkle root, so loads and bring-backs
   agree.
-- *Garbage.* An import page is named for the table version its record was
-  staged on, `t<table id>/v<version>-<block>-<digest>`. The record applies
-  only at that version, so once the table's version has passed it and the
-  root does not name the page, nothing ever will ([Page GC](#page-gc)). A
+- *Garbage.* An import page is named, as a sealed page is, for the table
+  version the record makes (one past the version it was staged on):
+  `snap.<table>.<version>.<block>.<digest>`. The record applies only on the
+  version it read, so once the table's version has reached the page's and
+  the root does not name the page, nothing ever will ([Page GC](#page-gc)). A
   crashed import's pages wait for the table's next commit; no clock is
   read.
 - *Policy.* As today, an inline writer re-inlines a pointer table on its
@@ -448,11 +458,12 @@ and reads no page.
   A table a writer evicted as idle comes back when it is written again. A
   maintenance call on `FileIOCatalog` re-inlines a table without a data
   commit. A compaction never re-inlines: it writes no table records.
-- *Tables evicted for good today.* A table upgraded to v3 lists its kept
-  manifests with row ids that the pool's entries lack (errata D22). Once its
-  upgrade is W behind the head, the snapshots before it sit in import pages
-  with their own pools, and the root's pool holds only the upgraded entries.
-  Whether that brings such a table back is open until step 5.
+- *A table upgraded to v3.* Its first commit after the upgrade lists its kept
+  manifests with row ids that the pool's entries lack, which evicts it
+  (errata D22). It was thought evicted for good; step 5's test showed its
+  next commit re-inlines it, with or without paging: a pointer table has no
+  pool, so the lists start a new one with the upgraded entries, and the old
+  snapshots keep their list files (in import pages, when paged).
 
 ## Sizes
 
@@ -676,7 +687,36 @@ Each step stands alone and is measured before the next:
      `StatePagesExist`; the shared-log model does not have them yet.
 5. **Re-inlining at any depth.** Import pages, the FULL record that names
    them, their GC, and a maintenance call that re-inlines a pointer table
-   without a data commit.
+   without a data commit. Built 2026-11-06:
+   - A full update of a pointer table in a catalog that pages
+     (`LogCatalog.stageUpdate`, `importBlocks`) cuts the snapshots behind
+     the sealing line at the table's last sequence number into blocks,
+     keeping inline its refs' targets and any snapshot whose list the update
+     sends inline, and puts each block's page while staging, before the
+     record is sent. The record carries the head and an entry per block
+     (`imported_blocks`, field 12 of `UpdateTableInline`), which replay
+     installs as sealed blocks (`ProtoCodec.UpdateTableInlineAction.imports`).
+   - Replay checks what the record shows (reason `import: ...`): blocks of
+     the version the update makes, ascending, nonempty, apart from each
+     other and from the head, no ref on one, only on a full, not head-only,
+     update of a pointer table. The rest is the writer's word.
+   - `LogCatalog.reinline(TableIdentifier)` re-inlines a pointer table
+     without a data commit (its current metadata, unchanged), retrying a
+     conflict on a fresh read; it returns whether the table is inline,
+     false when the head does not fit or the catalog does not inline.
+   - Testing: `TestSnapshotPaging` (a 40-snapshot pointer table at B = 4,
+     W = 8 comes back with 8 import blocks and 9 inline snapshots; loads,
+     time travel and a rollback into an imported block; an import whose
+     record does not land is rejected and its pages swept; the checks; a
+     v3-upgraded table back after its eviction, errata D22; a stale handle
+     whose pages were collected), and a `REINLINE` operation in
+     `TestCatalogFaultProperties`, whose other re-inlining commits also
+     import when the suite pages. At B = 4, W = 8 its 40-operation schedules
+     reach no import (a probe counted none in 200 tries); at B = 2, W = 1,
+     30 in 200, so rounds for this step run at B = 2, W = 1. The file model
+     (`spec/tla`) does not have import pages: their order (pages, then the
+     record) is the compactor's (pages, then the root), and their sweep is
+     the same rule by version.
 6. **Cold tables evicted** by a writer's policy, if the measurements still
    call for it.
 
@@ -745,6 +785,6 @@ Each step stands alone and is measured before the next:
   kept snapshot (hundreds of bytes of JSON each) on every commit.
 
 - **A table upgraded to v3** gives row ids to the manifests it keeps, which
-  evicts an inline-ML table today, for good (errata D22). Paging alone changes
-  nothing there; re-inlining may bring it back
-  ([Re-inlining](#re-inlining)), once its upgrade is W behind the head.
+  evicts an inline-ML table once (errata D22); its next commit brings it
+  back ([Re-inlining](#re-inlining)). Whether to avoid the eviction (restating
+  the pool's entries in one record) is open, for deep tables.

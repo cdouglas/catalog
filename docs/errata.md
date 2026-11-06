@@ -750,7 +750,7 @@ Fixes, not built:
 **Trigger to revisit:** writers whose clocks one operator does not control, or
 COMMITTED_PAGING.md built.
 
-### D22. A format upgrade to v3 evicts an inline-ML table for good
+### D22. A format upgrade to v3 evicts an inline-ML table
 
 A v3 table gives every data row an id (row lineage). The first commit after
 an upgrade gives each data manifest it keeps, and that had none, a first row
@@ -758,19 +758,26 @@ id (`SnapshotProducer`), so the new snapshot lists that manifest's path with
 an entry that differs from the one the table's pool holds. A pooled path's
 entry never changes (SPEC_ML.md; CHECKPOINT_PLAN.md decision 3), so the
 writer evicts the table instead (`LogCatalog.restatesAManifest`): it writes
-a metadata file and a list file per snapshot, and the table is a pointer from
-then on. Nothing brings a table back inline (SPEC_TM.md). An inline-TM table
-is not affected: its lists are files.
+a metadata file and a list file per snapshot. An inline-TM table is not
+affected: its lists are files.
+
+Corrected 2026-11-06: the eviction is not for good. The table's next commit
+through an inline writer re-inlines it (SPEC_TM.md, "Pointer → Inline"): a
+pointer table has no pool, so its new lists start one with the upgraded
+entries, and the old snapshots keep the list files the eviction wrote; with
+snapshot paging, a table of any depth comes back, its history in import pages
+(SNAPSHOT_PAGING.md step 5). `TestSnapshotPaging.aTableUpgradedToV3ComesBackInline`
+checks both. What the upgrade costs is the one eviction: a list file for
+every inline-ML snapshot (read from its pages, if sealed) and a metadata
+file.
 
 Keeping the table inline would mean restating the pool's entries for the
 kept manifests in one record, and either rewriting the old snapshots' lists
 or letting an entry differ between a snapshot and its successors.
-SNAPSHOT_PAGING.md (not built) changes nothing here: a paged table is evicted
-the same way.
+A paged table is evicted the same way.
 
-**Trigger to revisit:** v3 upgrades of inline-ML tables in a workload the
-paper measures, or re-inlining tables (a compaction that moves a pointer
-table back).
+**Trigger to revisit:** v3 upgrades of deep inline-ML tables in a workload
+the paper measures, where the eviction's writes matter.
 
 ### D8. Typed-protobuf encoding for Iceberg structural types (skip JSON serde)
 

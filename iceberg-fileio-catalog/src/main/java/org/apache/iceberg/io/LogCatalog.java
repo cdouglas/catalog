@@ -305,6 +305,42 @@ public class LogCatalog extends BaseMetastoreCatalog
   }
 
   /**
+   * Brings pointer table {@code identifier} back into inline storage, as a maintenance call
+   * (docs/SNAPSHOT_PAGING.md, "Re-inlining"): a full update of its current metadata, unchanged,
+   * whose history behind the sealing line goes to import pages in a catalog that pages, so a
+   * table of any depth fits. Returns whether the table is inline afterwards: false in a catalog
+   * that does not inline, or when its head does not fit in {@code
+   * fileio.catalog.inline.max.update.size}, which leaves it as it was. Retries a conflict with a
+   * concurrent commit to the table on a fresh read, as many times as Iceberg retries a commit.
+   */
+  public boolean reinline(TableIdentifier identifier) {
+    for (int attempt = 1; ; attempt++) {
+      Replica<CatalogState> read = log.read();
+      Integer tblId = read.state().tableId(identifier);
+      if (tblId == null) {
+        throw new NoSuchTableException("Table does not exist: %s", identifier);
+      }
+      if (read.state().isInlineTable(tblId)) {
+        return true;
+      }
+      FileIOTableOperations ops = newTableOps(identifier, read);
+      TableMetadata current = ops.current();
+      CatalogMutation mut = new CatalogMutation(read);
+      try {
+        if (!ops.stageUpdate(mut, current, current, false)) {
+          return false;
+        }
+        mut.commit(log);
+        return true;
+      } catch (CommitFailedException e) {
+        if (attempt >= org.apache.iceberg.TableProperties.COMMIT_NUM_RETRIES_DEFAULT + 1) {
+          throw e;
+        }
+      }
+    }
+  }
+
+  /**
    * Commits what {@code stage} stages on a fresh read of the catalog, and on another if it
    * conflicts with a concurrent change. A catalog operation does not depend on what its caller
    * read, but its record names the versions it read: of its namespace, or of the parent of one it
@@ -393,6 +429,20 @@ public class LogCatalog extends BaseMetastoreCatalog
             catalogProperties.getOrDefault(
                 INLINE_MAX_UPDATE_SIZE, String.valueOf(InlineDeltaCodec.APPEND_LIMIT))),
         Boolean.parseBoolean(catalogProperties.getOrDefault(LOAD_LAZY, "true")));
+  }
+
+  /**
+   * A table's snapshots as a read of the catalog held them, which a page holds that has been
+   * collected since: the table has moved past that version, or is gone (SNAPSHOT_PAGING.md, "Page
+   * GC"). A reader holding metadata from before then cannot load them, as Iceberg's readers
+   * cannot once an expiry deletes a manifest list; a commit staged on that read fails as stale.
+   */
+  static final class PageCollectedException extends org.apache.iceberg.exceptions.NotFoundException {
+    PageCollectedException(
+        SnapshotPages.MissingPage cause, TableIdentifier table, int read, int now) {
+      super(cause, "The snapshots of %s at version %s are gone (page %s; the table is %s)",
+          table, read, cause.name, now == -1 ? "gone" : "at version " + now);
+    }
   }
 
   /** How a catalog stores table metadata: in the catalog file (inline) or in metadata files. */
@@ -944,6 +994,26 @@ public class LogCatalog extends BaseMetastoreCatalog
      * which evicts the table from inline storage.
      */
     void stageUpdate(CatalogMutation mut, TableMetadata base, TableMetadata metadata) {
+      stageUpdate(mut, base, metadata, true);
+    }
+
+    /**
+     * As {@link #stageUpdate(CatalogMutation, TableMetadata, TableMetadata)}; with {@code
+     * orFile} false, an update that does not fit inline stages nothing (a re-inlining that
+     * cannot). Returns whether it staged an inline update.
+     */
+    boolean stageUpdate(
+        CatalogMutation mut, TableMetadata base, TableMetadata metadata, boolean orFile) {
+      try {
+        return stageOn(mut, base, metadata, orFile);
+      } catch (PageCollectedException e) {
+        // The version it read is gone: a refresh reads the table as it is
+        throw new CommitFailedException(e, "Cannot commit %s: %s", tableId, e.getMessage());
+      }
+    }
+
+    private boolean stageOn(
+        CatalogMutation mut, TableMetadata base, TableMetadata metadata, boolean orFile) {
       if (inline.metadata) {
         CatalogState proto = lastRead.state();
         Integer tblId = proto.tableId(tableId);
@@ -955,8 +1025,7 @@ public class LogCatalog extends BaseMetastoreCatalog
             manifestUpdates(isInline ? proto : null, base, metadata, prefix, false);
         if (manifests != null
             && restatesAManifest(isInline ? proto : null, base, metadata, false)) {
-          mut.updateTable(tableId, writeUpdateMetadata(false, metadata));
-          return;
+          return toFile(mut, metadata, orFile);
         }
         if (isInline) {
           // Null if delta encoding cannot express the change (a statistics change, errata D9; a
@@ -976,7 +1045,7 @@ public class LogCatalog extends BaseMetastoreCatalog
             if (deltaBytes.length <= inline.maxUpdateSize) {
               mut.updateTableInlineDelta(tableId, deltaBytes);
               mut.bringingBack(tableId, broughtBack(proto, tblId, metadata));
-              return;
+              return true;
             }
           }
         }
@@ -987,8 +1056,7 @@ public class LogCatalog extends BaseMetastoreCatalog
         manifests = manifestUpdates(isInline ? proto : null, base, metadata, prefix, true);
         if (manifests != null
             && restatesAManifest(isInline ? proto : null, base, metadata, true)) {
-          mut.updateTable(tableId, writeUpdateMetadata(false, metadata));
-          return;
+          return toFile(mut, metadata, orFile);
         }
         // On an inline table, the metadata goes with only the snapshots the version read lacks
         // and its refs' targets, naming those of that version's it drops: replay keeps the rest
@@ -1004,6 +1072,11 @@ public class LogCatalog extends BaseMetastoreCatalog
             ? id -> proto.sealedBlockOf(tblId, id) != null
             : id -> false;
         TableMetadata sent = held != null ? withNewSnapshots(held, encoded, sealed) : encoded;
+        // A pointer table comes back inline with its history in import pages, at any depth
+        Import imported = held == null ? importBlocks(proto, tblId, encoded) : null;
+        if (imported != null) {
+          sent = imported.head;
+        }
         byte[] fullBytes = inline.codec.encode(sent);
         long[] removed =
             held != null ? removedSnapshots(held, proto.sealedBlocks(tblId), metadata) : null;
@@ -1029,10 +1102,114 @@ public class LogCatalog extends BaseMetastoreCatalog
           if (held != null) {
             mut.bringingBack(tableId, broughtBack(proto, tblId, metadata));
           }
-          return;
+          if (imported != null) {
+            mut.importingBlocks(tableId, imported.put(log.pages(), tblId));
+          }
+          return true;
         }
       }
-      mut.updateTable(tableId, writeUpdateMetadata(false, metadata));
+      return toFile(mut, metadata, orFile);
+    }
+
+    /**
+     * What a page missing from the store means for the table's snapshots as {@code read} holds
+     * them (SNAPSHOT_PAGING.md, "Page GC"): collected, if the table has since moved past that
+     * version or is gone, and the catalog no longer names the page, as Iceberg's readers find a
+     * manifest list an expiry deleted ({@link PageCollectedException}); else lost, which is never
+     * right ({@code e}).
+     */
+    private RuntimeException missing(SnapshotPages.MissingPage e, CatalogState read) {
+      CatalogState now = log.read().state();
+      int version = now.tableVersion(e.tableId);
+      boolean moved = version == -1 || version > read.tableVersion(e.tableId);
+      if (moved) {
+        boolean named = false;
+        for (SnapshotPages.SealedBlock block : now.sealedBlocks(e.tableId).values()) {
+          named |= block.pageName(e.tableId).equals(e.name);
+        }
+        if (!named) {
+          return new PageCollectedException(e, tableId, read.tableVersion(e.tableId), version);
+        }
+      }
+      return e;
+    }
+
+    /** Stages the update as a metadata file, if {@code orFile}; it is not inline either way. */
+    private boolean toFile(CatalogMutation mut, TableMetadata metadata, boolean orFile) {
+      if (orFile) {
+        mut.updateTable(tableId, writeUpdateMetadata(false, metadata));
+      }
+      return false;
+    }
+
+    /** A pointer table's head, and the blocks of its history in import pages. */
+    private static final class Import {
+      private final TableMetadata head;
+      private final List<SnapshotPages.SealedBlock> blocks;
+
+      Import(TableMetadata head, List<SnapshotPages.SealedBlock> blocks) {
+        this.head = head;
+        this.blocks = blocks;
+      }
+
+      /** Puts the pages, before the record that names them is sent; returns their entries. */
+      List<SnapshotPages.SealedBlock> put(org.intentlog.PageStore store, int tblId) {
+        List<SnapshotPages.SealedBlock> entries = new ArrayList<>(blocks.size());
+        for (SnapshotPages.SealedBlock block : blocks) {
+          store.put(block.pageName(tblId), block.pending.bytes());
+          entries.add(new SnapshotPages.SealedBlock(block.block, block.version, block.digest,
+              block.merkleRoot, block.leaves, block.liveIds, null));
+        }
+        return entries;
+      }
+    }
+
+    /**
+     * The import of pointer table {@code tblId}'s history as it comes back inline
+     * (SNAPSHOT_PAGING.md, "Re-inlining"), or null: in a catalog that pages, the snapshots of
+     * {@code metadata} in the blocks behind its sealing line go to import pages, sealed at the
+     * version the full update makes, but those a ref targets and those without a list file (a
+     * snapshot whose list the update sends inline), which stay inline. The record then holds the
+     * head with the rest.
+     */
+    private Import importBlocks(CatalogState proto, Integer tblId, TableMetadata metadata) {
+      int block = proto.snapshotBlock();
+      if (tblId == null || block == 0 || metadata.formatVersion() < 2 || log.pages() == null) {
+        return null;
+      }
+      long through = SnapshotPages.sealedThrough(
+          metadata.lastSequenceNumber(), block, proto.snapshotWindow());
+      if (through < 0) {
+        return null;
+      }
+      Set<Long> targets = new HashSet<>();
+      for (SnapshotRef ref : metadata.refs().values()) {
+        targets.add(ref.snapshotId());
+      }
+      java.util.TreeMap<Long, List<Snapshot>> byBlock = new java.util.TreeMap<>();
+      List<Snapshot> kept = new ArrayList<>();
+      for (Snapshot snapshot : metadata.snapshots()) {
+        long k = SnapshotPages.blockOf(snapshot.sequenceNumber(), block);
+        String list = snapshot.manifestListLocation();
+        if (k <= through && !targets.contains(snapshot.snapshotId()) && list != null
+            && !list.startsWith("inline://")) {
+          byBlock.computeIfAbsent(k, b -> new ArrayList<>()).add(snapshot);
+        } else {
+          kept.add(snapshot);
+        }
+      }
+      if (byBlock.isEmpty()) {
+        return null;
+      }
+      int version = proto.tableVersion(tblId) + 1;
+      List<SnapshotPages.SealedBlock> blocks = new ArrayList<>(byBlock.size());
+      for (Map.Entry<Long, List<Snapshot>> entry : byBlock.entrySet()) {
+        blocks.add(SnapshotPages.seal(metadata.uuid(), tblId, version, entry.getKey(),
+            entry.getValue(), Map.of(), Map.of(), ""));
+      }
+      TableMetadata head =
+          TableFields.of(metadata).withSnapshots(kept).toMetadata(metadata.metadataFileLocation());
+      return new Import(head, blocks);
     }
 
     /**
@@ -1053,9 +1230,14 @@ public class LogCatalog extends BaseMetastoreCatalog
         long id = ref.snapshotId();
         SnapshotPages.SealedBlock block = proto.sealedBlockOf(tblId, id);
         if (block != null && seen.add(id)) {
-          SnapshotPages.Page page = inlineSnapshots
-              .pages(log.pages(), tblId, Map.of(block.block, block), prefix)
-              .get(0);
+          SnapshotPages.Page page;
+          try {
+            page = inlineSnapshots
+                .pages(log.pages(), tblId, Map.of(block.block, block), prefix)
+                .get(0);
+          } catch (SnapshotPages.MissingPage e) {
+            throw missing(e, proto);
+          }
           back.add(SnapshotPages.bringBack(page, id, prefix));
         }
       }
@@ -1428,9 +1610,14 @@ public class LogCatalog extends BaseMetastoreCatalog
         } else {
           inlined = made.wrap(tblId, lists, pool, every, lazy, true);
         }
-        return sealed.isEmpty()
-            ? inlined
-            : withSealed(inlined, made.pages(store, tblId, sealed, prefix), sealed);
+        if (sealed.isEmpty()) {
+          return inlined;
+        }
+        try {
+          return withSealed(inlined, made.pages(store, tblId, sealed, prefix), sealed);
+        } catch (SnapshotPages.MissingPage e) {
+          throw missing(e, state);
+        }
       }, shipped);
       return fields.toMetadata(location, wrapped, all);
     }

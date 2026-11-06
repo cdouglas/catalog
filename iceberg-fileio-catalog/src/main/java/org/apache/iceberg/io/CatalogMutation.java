@@ -77,6 +77,8 @@ public class CatalogMutation {
   private final Map<TableIdentifier, long[]> inlineTableUpdateRemovals;
   // The sealed snapshots an inline update brings back, with their proofs (SNAPSHOT_PAGING.md)
   private final Map<TableIdentifier, List<SnapshotPages.BroughtBack>> inlineTableBroughtBack;
+  // A re-inlined pointer table's imported blocks, whose pages its writer put
+  private final Map<TableIdentifier, List<SnapshotPages.SealedBlock>> inlineTableImports;
   // Codec tags parallel to inlineTables / inlineTableUpdates.
   private final Map<TableIdentifier, Byte> inlineTableCodecs;
   private final Map<TableIdentifier, Byte> inlineTableUpdateCodecs;
@@ -103,6 +105,7 @@ public class CatalogMutation {
     this.inlineTableUpdateMlDeltas = Maps.newHashMap();
     this.inlineTableUpdateRemovals = Maps.newHashMap();
     this.inlineTableBroughtBack = Maps.newHashMap();
+    this.inlineTableImports = Maps.newHashMap();
     this.inlineTableCodecs = Maps.newHashMap();
     this.inlineTableUpdateCodecs = Maps.newHashMap();
     this.tableRenames = Maps.newHashMap();
@@ -318,6 +321,7 @@ public class CatalogMutation {
     inlineTableUpdateMlDeltas.remove(tableId);
     inlineTableUpdateRemovals.remove(tableId);
     inlineTableBroughtBack.remove(tableId);
+    inlineTableImports.remove(tableId);
     inlineTableDeltaUpdates.remove(tableId);
     tables.put(tableId, null);
     return this;
@@ -404,6 +408,21 @@ public class CatalogMutation {
       inlineTableBroughtBack.remove(table);
     } else {
       inlineTableBroughtBack.put(table, back);
+    }
+    return this;
+  }
+
+  /**
+   * Makes the full update of {@code table}, a pointer table coming back inline, install {@code
+   * blocks} as its sealed blocks: its history, which its writer put as import pages before this
+   * commit (SNAPSHOT_PAGING.md, "Re-inlining").
+   */
+  public CatalogMutation importingBlocks(
+      TableIdentifier table, List<SnapshotPages.SealedBlock> blocks) {
+    if (blocks.isEmpty()) {
+      inlineTableImports.remove(table);
+    } else {
+      inlineTableImports.put(table, blocks);
     }
     return this;
   }
@@ -646,7 +665,8 @@ public class CatalogMutation {
         if (removed != null) {
           update = update.headOnly(removed);
         }
-        update = update.bringingBack(inlineTableBroughtBack.getOrDefault(ident, List.of()));
+        update = update.bringingBack(inlineTableBroughtBack.getOrDefault(ident, List.of()))
+            .importing(inlineTableImports.getOrDefault(ident, List.of()));
         actions.add(pinned.contains(ident) ? update.pin() : update);
       }
     }

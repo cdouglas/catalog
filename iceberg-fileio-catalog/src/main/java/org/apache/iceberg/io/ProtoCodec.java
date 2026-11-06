@@ -272,6 +272,8 @@ public class ProtoCodec {
   private static final int UPDATE_INLINE_HEAD_ONLY = 10;
   // The sealed snapshots the update brings back inline, each with its proof (BroughtBack)
   private static final int UPDATE_INLINE_BROUGHT_BACK = 11;
+  // A re-inlined pointer table's imported blocks (SealedBlock), whose pages its writer put
+  private static final int UPDATE_INLINE_IMPORTED_BLOCKS = 12;
 
   // BroughtBack field numbers
   private static final int BROUGHT_BACK_SNAPSHOT_ID = 1;
@@ -1231,6 +1233,9 @@ public class ProtoCodec {
         }
         writeLengthDelimited(inner, UPDATE_INLINE_BROUGHT_BACK, brought.toByteArray());
       }
+      for (SnapshotPages.SealedBlock block : a.imported) {
+        writeLengthDelimited(inner, UPDATE_INLINE_IMPORTED_BLOCKS, encodeSealedBlock(block));
+      }
       writeLengthDelimited(out, ACTION_UPDATE_TABLE_INLINE, inner.toByteArray());
     } else if (action instanceof CreateTableInlineAction) {
       CreateTableInlineAction a = (CreateTableInlineAction) action;
@@ -1612,6 +1617,7 @@ public class ProtoCodec {
     boolean pinned = false;
     List<Long> removed = new ArrayList<>();
     List<SnapshotPages.BroughtBack> broughtBack = new ArrayList<>();
+    List<SnapshotPages.SealedBlock> imported = new ArrayList<>();
     boolean headOnly = false;
 
     while (in.available() > 0) {
@@ -1648,6 +1654,9 @@ public class ProtoCodec {
         case UPDATE_INLINE_BROUGHT_BACK:
           broughtBack.add(decodeBroughtBack(readLengthDelimitedBytes(in)));
           break;
+        case UPDATE_INLINE_IMPORTED_BLOCKS:
+          imported.add(decodeSealedBlock(readLengthDelimitedBytes(in)));
+          break;
         case UPDATE_INLINE_REMOVED_SNAPSHOT_IDS:
           if ((tag & 0x7) == org.intentlog.wire.ProtoWire.WIRE_LENGTH_DELIMITED) {
             ByteArrayInputStream packed = new ByteArrayInputStream(readLengthDelimitedBytes(in));
@@ -1671,7 +1680,8 @@ public class ProtoCodec {
         fullMetadataCodec != null ? fullMetadataCodec : InlineMetadataCodecs.TAG_JSON_GZIP,
         metadataLocation, mlDeltaBytes, pinned, headOnly,
         removed.stream().mapToLong(Long::longValue).toArray())
-        .bringingBack(broughtBack);
+        .bringingBack(broughtBack)
+        .importing(imported);
   }
 
   private static SnapshotPages.BroughtBack decodeBroughtBack(byte[] bytes) throws IOException {
@@ -2782,7 +2792,17 @@ public class ProtoCodec {
     public UpdateTableInlineAction pin() {
       return new UpdateTableInlineAction(
           id, version, deltaBytes, fullMetadata, fullMetadataCodec, metadataLocation, mlDeltaBytes,
-          true, headOnly, removedSnapshotIds).bringingBack(broughtBack);
+          true, headOnly, removedSnapshotIds).bringingBack(broughtBack).importing(imported);
+    }
+
+    // A re-inlined pointer table's blocks whose pages its writer put (SNAPSHOT_PAGING.md,
+    // "Re-inlining"), installed as sealed
+    List<SnapshotPages.SealedBlock> imported = List.of();
+
+    /** This full update of a pointer table, installing {@code blocks} as its sealed blocks. */
+    public UpdateTableInlineAction importing(List<SnapshotPages.SealedBlock> blocks) {
+      this.imported = List.copyOf(blocks);
+      return this;
     }
 
     // The sealed snapshots the update brings back inline before it applies, each with its proof
@@ -2812,7 +2832,7 @@ public class ProtoCodec {
     public UpdateTableInlineAction headOnly(long[] removed) {
       return new UpdateTableInlineAction(
           id, version, deltaBytes, fullMetadata, fullMetadataCodec, metadataLocation, mlDeltaBytes,
-          pinned, true, removed).bringingBack(broughtBack);
+          pinned, true, removed).bringingBack(broughtBack).importing(imported);
     }
 
     /** Creates an UpdateTableInlineAction in DELTA mode (codec inherited from base). */
@@ -2873,6 +2893,10 @@ public class ProtoCodec {
      * comes back only with its proof).
      */
     private String sealed(CatalogState.Builder builder) {
+      String imports = imports(builder);
+      if (imports != null) {
+        return imports;
+      }
       if (!builder.isInlineTable(id) || builder.sealedBlocks(id).isEmpty()) {
         return broughtBack.isEmpty() ? null : "sealed: brings back a snapshot of no sealed block";
       }
@@ -2960,6 +2984,52 @@ public class ProtoCodec {
       return false;
     }
 
+    /**
+     * Why its imported blocks do not apply, or null: only a full update of a pointer table (it
+     * comes back inline) in a catalog that pages imports blocks, each sealed at the version the
+     * update makes (its pages are named for it, so a crashed import's pages are garbage once the
+     * table passes it), in ascending order.
+     */
+    private String imports(CatalogState.Builder builder) {
+      if (imported.isEmpty()) {
+        return null;
+      }
+      if (fullMetadata == null || headOnly || builder.isInlineTable(id)
+          || builder.snapshotBlock() == 0) {
+        return "import: blocks with no pointer table's full update in a paged catalog";
+      }
+      long last = -1;
+      Set<Long> ids = new HashSet<>();
+      for (SnapshotPages.SealedBlock block : imported) {
+        if (block.version != version + 1) {
+          return "import: block " + block.block + " is not of version " + (version + 1);
+        }
+        if (block.block <= last || block.liveIds.length == 0) {
+          return "import: block " + block.block + " out of order or empty";
+        }
+        last = block.block;
+        for (long id : block.liveIds) {
+          if (!ids.add(id)) {
+            return "import: snapshot " + id + " in two blocks";
+          }
+        }
+      }
+      // Replay never reads the pages: it takes their snapshots on the writer's word, but they
+      // must be apart from the head's, and no ref may target one (a ref's target is inline)
+      TableFields head = InlineMetadataCodecs.byTag(fullMetadataCodec).decodeFields(fullMetadata);
+      for (int i = 0; i < head.snapshots.size(); i++) {
+        if (ids.contains(head.snapshots.keyAt(i))) {
+          return "import: snapshot " + head.snapshots.keyAt(i) + " both imported and inline";
+        }
+      }
+      for (Map.Entry<String, org.apache.iceberg.SnapshotRef> ref : head.refs.entrySet()) {
+        if (ids.contains(ref.getValue().snapshotId())) {
+          return "import: ref " + ref.getKey() + " targets an imported snapshot";
+        }
+      }
+      return null;
+    }
+
     @Override
     public void apply(CatalogState.Builder builder) {
       if (!broughtBack.isEmpty()) {
@@ -3004,6 +3074,10 @@ public class ProtoCodec {
               ? InlineTable.ofHeadOnly(current, fullMetadata, fullMetadataCodec, removedSnapshotIds)
               : InlineTable.ofBytes(fullMetadata, fullMetadataCodec);
           builder.updateInlineTable(id, next, after);
+          // A re-inlined table's history, as its writer put it in import pages
+          for (SnapshotPages.SealedBlock block : imported) {
+            builder.setSealedBlock(id, block);
+          }
           if (mlDeltaBytes != null) {
             InlineDeltaCodec.applyManifestsOnly(mlDeltaBytes, builder, id, after.fields());
           }
