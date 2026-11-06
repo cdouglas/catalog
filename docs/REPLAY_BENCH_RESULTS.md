@@ -250,6 +250,33 @@ Fast appends, 952119c (step 2, before) and c5f0ee5 (after), ops/s, one fork each
   inline lists, is copying the parent's list (every manifest, under fast appends) into each new
   snapshot's.
 
+## Sealing and pages (SNAPSHOT_PAGING.md step 4)
+
+Step 4 (2026-11-05/06, 28f8248 to d567855) seals a table's old snapshot blocks into pages: with
+B = 256 and W = 1,024, a table of 3,000 snapshots keeps its newest 1,024 to 1,280 inline and the
+rest in sealed blocks, whose entries in the root hold only their live ids, digests and Merkle
+roots. Merge appends (a list stays small), lazy loads, d567855 with paging off (block 0) and on
+(256, 1,024), ops/s, one fork each, the dev box; the checkpoint's size where it changed:
+
+| | TM, off | TM, on | TM+ML, off | TM+ML, on |
+|---|---|---|---|---|
+| checkpoint | 176,286 B | 134,066 B | 392,547 B | 216,281 B |
+| `decodeCheckpoint` | 49,030 | 50,955 | 350 | 912 |
+| `encodeCheckpoint` | 16,140 | 15,844 | 231 | 602 |
+| `read` | 476 | 609 | 171 | 317 |
+| `load` | 222 | 350 | 154 | 285 |
+| `fold` | 115,534 | 129,793 | 96,821 | 106,250 |
+
+- The root of a 3,000-snapshot table is 45% smaller with inline lists and 24% for TM: what stays
+  is the inline window (snapshots, lists and the entries they name), 8 B per sealed live id, and
+  the whole snapshot log (about 10 B per snapshot main ever pointed to), which Iceberg cannot
+  load lazily.
+- Reading and loading such a table is 1.3 to 1.9 times as fast; a load that asks for history
+  reads the pages (cached by name in the catalog), from the store, or from the bytes the
+  replica sealed them with until a compactor stores them.
+- Decoding a TM root first ran at half the speed with paging (the sealed blocks' live ids were
+  boxed one by one); decoded into arrays, it runs as fast as without.
+
 ## What remains
 
 A read's cost is now its checkpoint's columns and the tail's replay: since step 3 a read makes

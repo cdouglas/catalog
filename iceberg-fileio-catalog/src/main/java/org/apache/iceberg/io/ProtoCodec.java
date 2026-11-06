@@ -923,7 +923,8 @@ public class ProtoCodec {
     int leaves = 0;
     byte[] digest = new byte[0];
     byte[] merkleRoot = new byte[0];
-    List<Long> live = new ArrayList<>();
+    long[] liveIds = new long[0];
+    int live = 0;
     while (in.available() > 0) {
       int tag = readVarint(in);
       switch (tag >>> 3) {
@@ -944,24 +945,33 @@ public class ProtoCodec {
           break;
         case SEALED_BLOCK_LIVE_IDS:
           if ((tag & 0x7) == 2) {
-            byte[] packed = readLengthDelimitedBytes(in);
-            Preconditions.checkState(packed.length % 8 == 0, "Malformed sealed block live ids");
-            for (int at = 0; at < packed.length; at += 8) {
-              long value = 0;
-              for (int i = 7; i >= 0; i--) {
-                value = (value << 8) | (packed[at + i] & 0xFFL);
-              }
-              live.add(value);
+            // Packed fixed64, little-endian: straight into the array
+            java.nio.ByteBuffer packed =
+                java.nio.ByteBuffer.wrap(readLengthDelimitedBytes(in))
+                    .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            Preconditions.checkState(packed.remaining() % 8 == 0,
+                "Malformed sealed block live ids");
+            int count = packed.remaining() / 8;
+            if (live + count > liveIds.length) {
+              liveIds = java.util.Arrays.copyOf(liveIds, live + count);
+            }
+            for (int i = 0; i < count; i++) {
+              liveIds[live++] = packed.getLong();
             }
           } else {
-            live.add(readFixed64(in));
+            if (live == liveIds.length) {
+              liveIds = java.util.Arrays.copyOf(liveIds, Math.max(8, 2 * live));
+            }
+            liveIds[live++] = readFixed64(in);
           }
           break;
         default:
           skipField(in, tag & 0x7);
       }
     }
-    long[] liveIds = live.stream().mapToLong(Long::longValue).toArray();
+    if (live != liveIds.length) {
+      liveIds = java.util.Arrays.copyOf(liveIds, live);
+    }
     for (int i = 1; i < liveIds.length; i++) {
       Preconditions.checkState(liveIds[i - 1] < liveIds[i], "Sealed block %s live ids unsorted",
           block);
