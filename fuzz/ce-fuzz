@@ -22,7 +22,10 @@
 # shrink shrinks it); SHRINK_HEAP (default 16g) and SHRINK_SECONDS (default 1800), a shrink's heap
 # and how long jqwik shrinks; JOB_TIMEOUT, a limit on each job's time (as timeout(1) takes it;
 # default none, a shrink's twice SHRINK_SECONDS and an hour); SMOKE=1 sets every property's
-# tries to 3 (to check the image, not the code); ROUND_JOBS, a round's jobs (default all ten).
+# tries to 3 (to check the image, not the code); ROUND_JOBS, a round's jobs (default all ten);
+# SNAPSHOT_BLOCK and SNAPSHOT_WINDOW, the snapshot paging every catalog the tests make is created
+# with (docs/SNAPSHOT_PAGING.md; LocalCatalogMode; default 0, none; window 8): 4 seals a table's
+# blocks every few commits.
 #
 # A round's jobs (tries per @Property, in the order the class declares them):
 #   faultA1-2  TestCatalogFaultProperties.catalogMatchesModel, 30,000
@@ -96,11 +99,14 @@ job() {
     cd "$1" || exit 2
     start=$(date +%s)
     echo "start $(date -Is) $(git rev-parse --short HEAD) fork=$FORK heap=$HEAP" \
-      "shrinking=$SHRINKING timeout=${JOB_TIMEOUT:-none}" > "$2"
+      "shrinking=$SHRINKING timeout=${JOB_TIMEOUT:-none}" \
+      "snapshot_block=${SNAPSHOT_BLOCK:-0} snapshot_window=${SNAPSHOT_WINDOW:-8}" > "$2"
     # shellcheck disable=SC2046
     MAVEN_OPTS=-Xmx512m ${JOB_TIMEOUT:+timeout -k 120 $JOB_TIMEOUT} mvn -o -B $(repo $FORK) test \
       "-DargLine=-Xmx$HEAP -Djqwik.shrinking.default=$SHRINKING -Djqwik.generation.default=RANDOMIZED
-        -Djqwik.shrinking.bounded.seconds=${SHRINK_SECONDS:-1800}" \
+        -Djqwik.shrinking.bounded.seconds=${SHRINK_SECONDS:-1800}
+        -Dfileio.catalog.test.snapshot.block=${SNAPSHOT_BLOCK:-0}
+        -Dfileio.catalog.test.snapshot.window=${SNAPSHOT_WINDOW:-8}" \
       -Dsurefire.failIfNoSpecifiedTests=false -Dtest="$3" >> "$2" 2>&1
     echo "exit=$? elapsed=$(( $(date +%s) - start ))s" >> "$2"
   ) &

@@ -19,7 +19,8 @@
 # default all; a shrink's 1), HEAP (each test JVM's heap, default 4g), SHRINKING (default OFF),
 # SHRINK_HEAP (default 16g), SHRINK_SECONDS (default 1800), JOB_TIMEOUT, SMOKE=1 (3 tries per
 # property: checks the image, not the code), REBASE_TRIES, ROUND_JOBS (a round's jobs, to rerun
-# some: "race", "faultA1 faultB1").
+# some: "race", "faultA1 faultB1"), SNAPSHOT_BLOCK and SNAPSHOT_WINDOW (the snapshot paging the
+# tests' catalogs are created with; 4 and 8 page constantly).
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OUT=${OUT:-$HERE/out}
@@ -73,7 +74,7 @@ case $cmd in
       --memory "$mem" --memory-swap "$mem" --oom-score-adj 1000 \
       -v "$OUT:/out" -v "$(readlink -f "$BUNDLE"):/in/fileio.bundle:ro" \
       -e JOBS -e HEAP -e SHRINKING -e SHRINK_HEAP -e SHRINK_SECONDS -e JOB_TIMEOUT \
-      -e SMOKE -e REBASE_TRIES -e ROUND_JOBS \
+      -e SMOKE -e REBASE_TRIES -e ROUND_JOBS -e SNAPSHOT_BLOCK -e SNAPSHOT_WINDOW \
       "$IMAGE" "$cmd" "$@"
     held=$(docker exec "ce-fuzz-$name" cat /sys/fs/cgroup/memory.max 2>/dev/null || true)
     if [ -z "$held" ] || [ "$held" = max ]; then
