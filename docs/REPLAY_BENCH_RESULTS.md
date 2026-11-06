@@ -241,8 +241,14 @@ Fast appends, 952119c (step 2, before) and c5f0ee5 (after), ops/s, one fork each
   the refs' targets and their lists only.
 - A read of a 1,000-snapshot table runs 2.7 times as fast in both modes: making every list and
   every snapshot (through JSON) was most of it.
-- `fold` of one record still slows with depth (16,000 a second at 1,000 snapshots, 44,000 at
-  300): replay still does O(snapshots) per record somewhere, which is next to find.
+- `fold` of one record slowed with depth (16,000 a second at 1,000 snapshots, 44,000 at 300):
+  `fold` folds onto one replica again and again, so each append to its snapshots copied a buffer
+  another fold had extended and hashed every id into the copy's index, as a writer folding
+  others' records onto the replica its lost commit extended does. A copy now finds the shared
+  ids in the buffer it copied (d62b33a): at 1,000 snapshots `fold` runs 73,000 a second with
+  inline lists and 171,000 for TM (114,000 and 214,000 at 300). What still grows with depth, with
+  inline lists, is copying the parent's list (every manifest, under fast appends) into each new
+  snapshot's.
 
 ## What remains
 
@@ -250,6 +256,7 @@ A read's cost is now its checkpoint's columns and the tail's replay: since step 
 only the snapshots and lists replay reads, and a load only its refs' targets. What still makes
 every snapshot: an expiry, a full update, a checkpoint's encode, a copy for workers
 (`SerializableTable`, until pages), and a commit's delta (`computeDelta` compares the two
-versions' snapshots). Replay's per-record cost still grows with depth (`fold`, above). Replay now folds a read onto the replica
+versions' snapshots). Replay's per-record cost grows with depth only by a new snapshot's list,
+copied whole from its parent's (`fold`, above). Replay now folds a read onto the replica
 it continues, which removes the checkpoint from a reader's refresh between compactions, but the
 read still transfers the whole object (errata D15), and a fold copies the touched table's maps.
