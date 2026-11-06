@@ -80,6 +80,8 @@ public class TestFormatExplorer {
     codec.put("CREATE_INLINE_TBL_", "CreateTableInline");
     codec.put("RENAME_TBL_", "RenameTable");
     codec.put("SET_CONFLICT_ENCODING_", "SetConflictEncoding");
+    codec.put("SNAPSHOT_PAGING_", "SnapshotPaging");
+    codec.put("SET_SNAPSHOT_PAGING_", "SetSnapshotPaging");
     PREFIXES.put("ProtoCodec", codec);
 
     Map<String, String> committed = new LinkedHashMap<>();

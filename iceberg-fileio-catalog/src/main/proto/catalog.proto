@@ -101,6 +101,11 @@ message Checkpoint {
   // not know the encoding refuses the checkpoint.
   string conflict_encoding = 5;
 
+  // How the catalog pages its inline tables' old snapshots
+  // (docs/SNAPSHOT_PAGING.md): absent until a record sets it
+  // (SetSnapshotPaging), and then no snapshot is paged.
+  SnapshotPaging snapshot_paging = 6;
+
   // Catalog contents, each in order of its key (id; namespace id and then key
   // for properties), so that a checkpoint is a function of the state (I11)
   repeated Namespace namespaces = 10;
@@ -109,6 +114,15 @@ message Checkpoint {
 
   // Inline table metadata (tables with metadata stored in the catalog)
   repeated InlineTable inline_tables = 13;
+}
+
+// A table's snapshots are cut into blocks of `block` sequence numbers; block k
+// seals once the table's last sequence number reaches (k + 1) * block +
+// window (docs/SNAPSHOT_PAGING.md, "Blocks"). Fixed by the catalog's first
+// record, as the conflict encoding is.
+message SnapshotPaging {
+  uint32 block = 1;
+  uint32 window = 2;
 }
 
 // Every checkpoint holds the root namespace as a row: id 0, parent 0, empty
@@ -204,6 +218,7 @@ message Action {
     CreateTableInline  create_table_inline  = 10;
     RenameTable        rename_table         = 11;
     SetConflictEncoding set_conflict_encoding = 12;
+    SetSnapshotPaging  set_snapshot_paging  = 13;
   }
 }
 
@@ -288,6 +303,13 @@ message RenameTable {
 // the encoding fails the read.
 message SetConflictEncoding {
   string name = 1;
+}
+
+// Sets the catalog's snapshot paging (Checkpoint.snapshot_paging). Applies
+// only to a catalog that has no paging and has never had a table, as
+// SetConflictEncoding.
+message SetSnapshotPaging {
+  SnapshotPaging paging = 1;
 }
 
 // ============================================================

@@ -100,6 +100,7 @@ public class ProtoCodec {
   private static final int CHECKPOINT_MIN_READER_VERSION = 4;
   /** The catalog's conflict encoding; absent until a record sets one. */
   private static final int CHECKPOINT_CONFLICT_ENCODING = 5;
+  private static final int CHECKPOINT_SNAPSHOT_PAGING = 6;
   static final int CHECKPOINT_NAMESPACES = 10;
   static final int CHECKPOINT_TABLES = 11;
   static final int CHECKPOINT_NAMESPACE_PROPERTIES = 12;
@@ -194,6 +195,7 @@ public class ProtoCodec {
   private static final int ACTION_CREATE_TABLE_INLINE = 10;
   private static final int ACTION_RENAME_TABLE = 11;
   private static final int ACTION_SET_CONFLICT_ENCODING = 12;
+  private static final int ACTION_SET_SNAPSHOT_PAGING = 13;
 
   // CreateNamespace field numbers
   private static final int CREATE_NS_ID = 1;
@@ -282,6 +284,11 @@ public class ProtoCodec {
   // SetConflictEncoding field numbers
   private static final int SET_CONFLICT_ENCODING_NAME = 1;
 
+  // SnapshotPaging and SetSnapshotPaging field numbers
+  private static final int SNAPSHOT_PAGING_BLOCK = 1;
+  private static final int SNAPSHOT_PAGING_WINDOW = 2;
+  private static final int SET_SNAPSHOT_PAGING_PAGING = 1;
+
   // ============================================================
   // Checkpoint encoding/decoding
   // ============================================================
@@ -318,6 +325,10 @@ public class ProtoCodec {
       writeVarint(out, CHECKPOINT_NEXT_TABLE_ID, original.nextTableId());
       if (original.conflictEncodingName() != null) {
         writeString(out, CHECKPOINT_CONFLICT_ENCODING, original.conflictEncodingName());
+      }
+      if (original.snapshotBlock() > 0) {
+        writeLengthDelimited(out, CHECKPOINT_SNAPSHOT_PAGING,
+            encodeSnapshotPaging(original.snapshotBlock(), original.snapshotWindow()));
       }
       EncodingState.Codec stateCodec = original.conflictEncoding().stateCodec();
 
@@ -439,6 +450,11 @@ public class ProtoCodec {
           case CHECKPOINT_CONFLICT_ENCODING:
             builder.setConflictEncoding(readString(in));
             break;
+          case CHECKPOINT_SNAPSHOT_PAGING: {
+            int[] paging = decodeSnapshotPaging(readLengthDelimitedBytes(in));
+            builder.setSnapshotPaging(paging[0], paging[1]);
+            break;
+          }
           case CHECKPOINT_NAMESPACES:
             decodeNamespace(readLengthDelimitedBytes(in), builder);
             break;
@@ -1115,8 +1131,55 @@ public class ProtoCodec {
       ByteArrayOutputStream inner = new BytesOut();
       writeString(inner, SET_CONFLICT_ENCODING_NAME, ((SetConflictEncodingAction) action).name);
       writeLengthDelimited(out, ACTION_SET_CONFLICT_ENCODING, inner.toByteArray());
+    } else if (action instanceof SetSnapshotPagingAction) {
+      SetSnapshotPagingAction a = (SetSnapshotPagingAction) action;
+      ByteArrayOutputStream inner = new BytesOut();
+      writeLengthDelimited(inner, SET_SNAPSHOT_PAGING_PAGING, encodeSnapshotPaging(a.block, a.window));
+      writeLengthDelimited(out, ACTION_SET_SNAPSHOT_PAGING, inner.toByteArray());
     }
     return out.toByteArray();
+  }
+
+  private static byte[] encodeSnapshotPaging(int block, int window) throws IOException {
+    ByteArrayOutputStream out = new BytesOut();
+    writeVarint(out, SNAPSHOT_PAGING_BLOCK, block);
+    writeVarint(out, SNAPSHOT_PAGING_WINDOW, window);
+    return out.toByteArray();
+  }
+
+  /** A SnapshotPaging message's block and window. */
+  private static int[] decodeSnapshotPaging(byte[] bytes) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    int block = 0;
+    int window = 0;
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      switch (tag >>> 3) {
+        case SNAPSHOT_PAGING_BLOCK:
+          block = readVarint(in);
+          break;
+        case SNAPSHOT_PAGING_WINDOW:
+          window = readVarint(in);
+          break;
+        default:
+          skipField(in, tag & 0x7);
+      }
+    }
+    return new int[] {block, window};
+  }
+
+  private static SetSnapshotPagingAction decodeSetSnapshotPaging(byte[] bytes) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    int[] paging = {0, 0};
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      if (tag >>> 3 == SET_SNAPSHOT_PAGING_PAGING) {
+        paging = decodeSnapshotPaging(readLengthDelimitedBytes(in));
+      } else {
+        skipField(in, tag & 0x7);
+      }
+    }
+    return new SetSnapshotPagingAction(paging[0], paging[1]);
   }
 
   private static Action decodeAction(byte[] bytes) throws IOException {
@@ -1150,6 +1213,8 @@ public class ProtoCodec {
         return decodeRenameTable(actionBytes);
       case ACTION_SET_CONFLICT_ENCODING:
         return decodeSetConflictEncoding(actionBytes);
+      case ACTION_SET_SNAPSHOT_PAGING:
+        return decodeSetSnapshotPaging(actionBytes);
       default:
         return new UnknownAction(actionType, actionBytes);
     }
@@ -2925,6 +2990,33 @@ public class ProtoCodec {
     @Override
     public void apply(CatalogState.Builder builder) {
       builder.setConflictEncoding(name);
+    }
+  }
+
+  /**
+   * Sets the catalog's snapshot paging (docs/SNAPSHOT_PAGING.md): its blocks of {@code block}
+   * sequence numbers, sealed {@code window} behind a table's last. As {@link
+   * SetConflictEncodingAction}, it applies only to a catalog that has no paging and has never had a
+   * table, so every replica seals the same blocks at the same records.
+   */
+  public static class SetSnapshotPagingAction implements Action {
+    final int block;
+    final int window;
+
+    public SetSnapshotPagingAction(int block, int window) {
+      this.block = block;
+      this.window = window;
+    }
+
+    @Override
+    public boolean verify(CatalogState.Builder builder) {
+      return block > 0 && window >= 0 && builder.snapshotBlock() == 0
+          && builder.nextTableId() == 1;
+    }
+
+    @Override
+    public void apply(CatalogState.Builder builder) {
+      builder.setSnapshotPaging(block, window);
     }
   }
 

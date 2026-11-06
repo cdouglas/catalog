@@ -182,6 +182,35 @@ public final class LogCatalogProperties {
     return name;
   }
 
+  /**
+   * The sequence numbers in each block of a table's snapshots, for a catalog to create
+   * (docs/SNAPSHOT_PAGING.md, "Blocks"): a block seals {@link #SNAPSHOT_WINDOW} behind the table's
+   * last sequence number, and its snapshots go to a page. Fixed by the catalog's first record, as
+   * the conflict encoding is: a catalog that opens an existing log uses that log's. 0 pages
+   * nothing. Default 0 while paging is built (step 4); the design's is 256, provisional.
+   */
+  public static final String SNAPSHOT_BLOCK = "fileio.catalog.snapshot.block";
+  public static final int DEFAULT_SNAPSHOT_BLOCK = 0;
+
+  /**
+   * How many sequence numbers behind a table's last a block seals: the snapshots a stale commit
+   * may still build on or merge past. Default 1,024 (manifest-window's merges reach 1,000 commits
+   * back), provisional.
+   */
+  public static final String SNAPSHOT_WINDOW = "fileio.catalog.snapshot.window";
+  public static final int DEFAULT_SNAPSHOT_WINDOW = 1024;
+
+  /** The block and window {@code properties} set for a catalog to create. */
+  public static int[] snapshotPaging(Map<String, String> properties) {
+    long block = longProperty(properties, SNAPSHOT_BLOCK, DEFAULT_SNAPSHOT_BLOCK);
+    long window = longProperty(properties, SNAPSHOT_WINDOW, DEFAULT_SNAPSHOT_WINDOW);
+    Preconditions.checkArgument(
+        block >= 0 && block <= Integer.MAX_VALUE, "Invalid %s: %s", SNAPSHOT_BLOCK, block);
+    Preconditions.checkArgument(
+        window >= 0 && window <= Integer.MAX_VALUE, "Invalid %s: %s", SNAPSHOT_WINDOW, window);
+    return new int[] {(int) block, (int) window};
+  }
+
   /** The runtime configuration {@code properties} set; the defaults for those they do not. */
   public static RuntimeConfig runtimeConfig(Map<String, String> properties) {
     long admissionMs =

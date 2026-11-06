@@ -494,10 +494,17 @@
           {"number": 3, "name": "next_table_id", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": ""},
           {"number": 4, "name": "min_reader_version", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": "The reader version this checkpoint needs (ProtoCodec SUPPORTED_READER_VERSION, now 1); a reader that supports less refuses it."},
           {"number": 5, "name": "conflict_encoding", "type": "string", "repeated": false, "packed": false, "oneof": null, "comment": "The catalog's conflict encoding (ConflictEncoding): how replay decides whether a table update conflicts with what landed since its writer read the table. Absent until a record sets one (SetConflictEncoding), and then replay judges by the Lamport clock, \"lamport\". A reader that does not know the encoding refuses the checkpoint."},
+          {"number": 6, "name": "snapshot_paging", "type": "SnapshotPaging", "repeated": false, "packed": false, "oneof": null, "comment": "How the catalog pages its inline tables' old snapshots (docs/SNAPSHOT_PAGING.md): absent until a record sets it (SetSnapshotPaging), and then no snapshot is paged."},
           {"number": 10, "name": "namespaces", "type": "Namespace", "repeated": true, "packed": true, "oneof": null, "comment": "Catalog contents, each in order of its key (id; namespace id and then key for properties), so that a checkpoint is a function of the state (I11)"},
           {"number": 11, "name": "tables", "type": "Table", "repeated": true, "packed": true, "oneof": null, "comment": ""},
           {"number": 12, "name": "namespace_properties", "type": "NamespaceProperty", "repeated": true, "packed": true, "oneof": null, "comment": ""},
           {"number": 13, "name": "inline_tables", "type": "InlineTable", "repeated": true, "packed": true, "oneof": null, "comment": "Inline table metadata (tables with metadata stored in the catalog)"}
+        ]
+      },
+      "SnapshotPaging": {
+        "fields": [
+          {"number": 1, "name": "block", "type": "uint32", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "window", "type": "uint32", "repeated": false, "packed": false, "oneof": null, "comment": ""}
         ]
       },
       "Namespace": {
@@ -559,7 +566,8 @@
           {"number": 9, "name": "update_table_inline", "type": "UpdateTableInline", "repeated": false, "packed": false, "oneof": "action", "comment": ""},
           {"number": 10, "name": "create_table_inline", "type": "CreateTableInline", "repeated": false, "packed": false, "oneof": "action", "comment": ""},
           {"number": 11, "name": "rename_table", "type": "RenameTable", "repeated": false, "packed": false, "oneof": "action", "comment": ""},
-          {"number": 12, "name": "set_conflict_encoding", "type": "SetConflictEncoding", "repeated": false, "packed": false, "oneof": "action", "comment": ""}
+          {"number": 12, "name": "set_conflict_encoding", "type": "SetConflictEncoding", "repeated": false, "packed": false, "oneof": "action", "comment": ""},
+          {"number": 13, "name": "set_snapshot_paging", "type": "SetSnapshotPaging", "repeated": false, "packed": false, "oneof": "action", "comment": ""}
         ]
       },
       "CreateNamespace": {
@@ -633,6 +641,11 @@
       "SetConflictEncoding": {
         "fields": [
           {"number": 1, "name": "name", "type": "string", "repeated": false, "packed": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "SetSnapshotPaging": {
+        "fields": [
+          {"number": 1, "name": "paging", "type": "SnapshotPaging", "repeated": false, "packed": false, "oneof": null, "comment": ""}
         ]
       },
       "CreateTableInline": {

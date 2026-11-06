@@ -168,6 +168,7 @@ public class LogCatalog extends BaseMetastoreCatalog
 
     inlineSettings(); // validates the inline properties
     String conflictEncoding = LogCatalogProperties.conflictEncoding(catalogProperties);
+    LogCatalogProperties.snapshotPaging(catalogProperties); // validates them
 
     warehouseLocation = properties.get(CatalogProperties.WAREHOUSE_LOCATION);
     if (sharedLog == null) {
@@ -180,7 +181,8 @@ public class LogCatalog extends BaseMetastoreCatalog
         LogCatalogProperties.checkpointMemoize(catalogProperties));
     // Another catalog may create the log at once (two processes starting on a new warehouse):
     // either way, this one uses it.
-    log.bootstrap(conflictEncoding);
+    int[] paging = LogCatalogProperties.snapshotPaging(catalogProperties);
+    log.bootstrap(conflictEncoding, paging[0], paging[1]);
   }
 
   /**

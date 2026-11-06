@@ -94,10 +94,21 @@ public final class CatalogLog {
    * {@code conflictEncoding} ({@link ConflictEncoding}), unless it exists.
    */
   public void bootstrap(String conflictEncoding) {
+    bootstrap(conflictEncoding, 0, 0);
+  }
+
+  /**
+   * As {@link #bootstrap(String)}, paging its inline tables' snapshots in blocks of {@code
+   * snapshotBlock} sequence numbers sealed {@code snapshotWindow} behind a table's last (0: none).
+   */
+  public void bootstrap(String conflictEncoding, int snapshotBlock, int snapshotWindow) {
+    List<ProtoCodec.Action> actions = new java.util.ArrayList<>();
+    actions.add(new ProtoCodec.SetConflictEncodingAction(conflictEncoding));
+    if (snapshotBlock > 0) {
+      actions.add(new ProtoCodec.SetSnapshotPagingAction(snapshotBlock, snapshotWindow));
+    }
     try {
-      runtime.bootstrap(
-          new ProtoCodec.CatalogIntention(
-              List.of(new ProtoCodec.SetConflictEncodingAction(conflictEncoding))));
+      runtime.bootstrap(new ProtoCodec.CatalogIntention(actions));
     } catch (CommitRejectedException e) {
       throw new CommitFailedException(e, "Cannot create the catalog at %s: %s", log, e.getMessage());
     } catch (CommitOutcomeUnknownException e) {

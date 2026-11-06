@@ -81,6 +81,9 @@ public class CatalogState {
   // The catalog's conflict encoding, null until its first record sets one (then Lamport), and
   // the encoding's state of each table that has one: tblId -> state.
   private final String conflictEncoding;
+  // Snapshot paging (SetSnapshotPaging): block 0 pages nothing
+  private final int snapshotBlock;
+  private final int snapshotWindow;
   private final Map<Integer, EncodingState> conflictStates;
 
   private CatalogState(Builder builder) {
@@ -98,6 +101,8 @@ public class CatalogState {
     this.poolOrdinals = ImmutableMap.copyOf(builder.poolOrdinals);
     this.nextOrdinal = ImmutableMap.copyOf(builder.nextOrdinal);
     this.conflictEncoding = builder.conflictEncoding;
+    this.snapshotBlock = builder.snapshotBlock;
+    this.snapshotWindow = builder.snapshotWindow;
     // The builder no longer changes them once built (Builder#build)
     this.conflictStates = ImmutableMap.copyOf(builder.conflictStates);
   }
@@ -132,6 +137,8 @@ public class CatalogState {
     builder.poolOrdinals.putAll(poolOrdinals);
     builder.nextOrdinal.putAll(nextOrdinal);
     builder.conflictEncoding = conflictEncoding;
+    builder.snapshotBlock = snapshotBlock;
+    builder.snapshotWindow = snapshotWindow;
     builder.conflictStates.putAll(conflictStates);
     return builder;
   }
@@ -389,6 +396,19 @@ public class CatalogState {
     return conflictEncoding;
   }
 
+  /**
+   * The sequence numbers in each block of a table's snapshots, or 0 if the catalog pages none
+   * (docs/SNAPSHOT_PAGING.md, "Blocks").
+   */
+  public int snapshotBlock() {
+    return snapshotBlock;
+  }
+
+  /** How far behind a table's last sequence number a block seals. */
+  public int snapshotWindow() {
+    return snapshotWindow;
+  }
+
   /** The catalog's conflict encoding. */
   ConflictEncoding<Object> conflictEncoding() {
     return ConflictEncodings.byName(conflictEncoding != null ? conflictEncoding : LamportEncoding.NAME);
@@ -461,6 +481,8 @@ public class CatalogState {
     private final Map<Integer, Map<String, Integer>> poolOrdinals = new HashMap<>();
     private final Map<Integer, Integer> nextOrdinal = new HashMap<>();
     private String conflictEncoding;
+    private int snapshotBlock;
+    private int snapshotWindow;
     // A table's encoding state: shared with the state this builder continues until the encoding
     // changes it here (conflictState), which copies it first (ownedStates)
     private final Map<Integer, EncodingState> conflictStates = new HashMap<>();
@@ -1095,6 +1117,21 @@ public class CatalogState {
 
     public boolean namespaceExists(Namespace ns) {
       return namespaceLookup.containsKey(ns);
+    }
+
+    /** Sets the catalog's snapshot paging ({@link CatalogState#snapshotBlock}). */
+    public Builder setSnapshotPaging(int block, int window) {
+      this.snapshotBlock = block;
+      this.snapshotWindow = window;
+      return this;
+    }
+
+    public int snapshotBlock() {
+      return snapshotBlock;
+    }
+
+    public int snapshotWindow() {
+      return snapshotWindow;
     }
 
     /** Sets the catalog's conflict encoding ({@link CatalogState#conflictEncodingName}). */
