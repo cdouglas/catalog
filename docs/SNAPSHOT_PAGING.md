@@ -590,7 +590,11 @@ Each step stands alone and is measured before the next:
    a change keeps the longest run of the parent's manifests the list holds
    in the parent's order). Lists go in the table's snapshot order, so a
    parent's precedes its children's. A table whose metadata does not decode
-   (tests' placeholders) has its lists written whole.
+   (tests' placeholders) has its lists written whole. Measured with
+   `ReplayBench` on fast appends (each list holding every manifest): the
+   checkpoint of a 1,000-snapshot table is 134 KB (1.27 MB before), and
+   encoding, decoding, a read and a load are all faster
+   (REPLAY_BENCH_RESULTS.md).
 3. **Lazy loads.** Blocks as the unit of decoding, lists resolved on first
    use, loads through the supplier, and the fork following #18073 and
    changing `SerializableTable`, with tests in the fork; behind

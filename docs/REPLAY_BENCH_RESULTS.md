@@ -184,12 +184,42 @@ box; the size of the record in parentheses where it changed:
 - The TM fast-append capture of 3,000 snapshots does not fit in 6 GB (each snapshot's manifest
   list is a file in the in-memory store, holding every manifest), so 3,000 is merge appends.
 
+## Lists by ordinal and as changes (SNAPSHOT_PAGING.md step 2)
+
+Until step 2 (2026-11-05, b892245 and 0f5105e), a checkpoint wrote each snapshot's inline
+manifest list whole, as indices into the pool sorted by path. Under fast appends each list holds
+every manifest the table had when it was made, so the lists grew with snapshots x manifests
+(errata D18). Now a pooled manifest keeps the ordinal it was given when first pooled, and a list
+goes as a change of its parent's list (or whole, every 64 along a chain, or where that is
+smaller).
+
+Inline TM+ML, fast appends (each list holds every manifest), a 100-record tail; on 7d3d0da
+(before) and 0f5105e (after), ops/s, one fork each, the dev box:
+
+| | 300, before | 300, after | 1,000, before | 1,000, after |
+|---|---|---|---|---|
+| checkpoint | 72,624 B | 26,860 B | 1,268,395 B | 133,631 B |
+| `encodeCheckpoint` | 1,438 | 2,110 | 167 | 278 |
+| `decodeCheckpoint` | 1,489 | 1,809 | 156 | 238 |
+| `read` | 674 | 733 | 107 | 164 |
+| `load` | 259 | 275 | 37.9 | 47.4 |
+
+- The checkpoint is 9.5 times smaller at 1,000 snapshots (2.7 times at 300), and now grows with
+  the snapshots plus the manifests: what remains is each snapshot's structural metadata, the
+  pool's entries, and the head's own list, which names every manifest as its file would.
+- Encoding first ran 2.4 times slower (69 a second at 1,000 snapshots): diffing each list against
+  its parent's hashed every path into a new map per snapshot. Diffing ordinals through a scratch
+  array, and recognizing a fast append's list by its suffix, made it faster than before.
+- A read at 1,000 snapshots takes 6.1 ms (9.4 before), a load 21 ms (26). A load's cost is now
+  chiefly building the table's metadata and an `InlineSnapshot` per snapshot, which step 3 (lazy
+  loads) takes on.
+
 ## What remains
 
 A read's cost is now its checkpoint: decoding the table's structural metadata (snapshots go
-through JSON) and, with inline manifest lists, every snapshot's list of indices (O(snapshots x
-manifests) on the wire). A load still makes an `InlineSnapshot` list per snapshot. Candidates:
-decoding snapshots without JSON, delta-encoding snapshot lists on the wire, and lists the fork's
-`InlineSnapshot` resolves lazily (a load's cost above). Replay now folds a read onto the replica
+through JSON); since step 2 the lists cost the snapshots plus the manifests, not their product. A
+load still makes an `InlineSnapshot` list per snapshot. Candidates: decoding snapshots without
+JSON, and loads that decode only what they use, with lists the fork's `InlineSnapshot` resolves
+lazily (SNAPSHOT_PAGING.md step 3). Replay now folds a read onto the replica
 it continues, which removes the checkpoint from a reader's refresh between compactions, but the
 read still transfers the whole object (errata D15), and a fold copies the touched table's maps.
