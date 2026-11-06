@@ -77,6 +77,9 @@ public class CatalogState {
   private final Map<Integer, Map<String, Integer>> poolOrdinals;
   // tblId -> the ordinal the table's next newly pooled manifest takes
   private final Map<Integer, Integer> nextOrdinal;
+  // tblId -> (block -> its entry): the table's sealed snapshot blocks, whose snapshots, lists and
+  // the entries only they name are in pages (SNAPSHOT_PAGING.md); each map immutable
+  private final Map<Integer, java.util.SortedMap<Long, SnapshotPages.SealedBlock>> sealedBlocks;
 
   // The catalog's conflict encoding, null until its first record sets one (then Lamport), and
   // the encoding's state of each table that has one: tblId -> state.
@@ -100,6 +103,7 @@ public class CatalogState {
     this.snapshotManifests = ImmutableMap.copyOf(builder.snapshotManifests);
     this.poolOrdinals = ImmutableMap.copyOf(builder.poolOrdinals);
     this.nextOrdinal = ImmutableMap.copyOf(builder.nextOrdinal);
+    this.sealedBlocks = ImmutableMap.copyOf(builder.sealedBlocks);
     this.conflictEncoding = builder.conflictEncoding;
     this.snapshotBlock = builder.snapshotBlock;
     this.snapshotWindow = builder.snapshotWindow;
@@ -136,6 +140,7 @@ public class CatalogState {
     builder.snapshotManifests.putAll(snapshotManifests);
     builder.poolOrdinals.putAll(poolOrdinals);
     builder.nextOrdinal.putAll(nextOrdinal);
+    builder.sealedBlocks.putAll(sealedBlocks);
     builder.conflictEncoding = conflictEncoding;
     builder.snapshotBlock = snapshotBlock;
     builder.snapshotWindow = snapshotWindow;
@@ -378,6 +383,17 @@ public class CatalogState {
     return nextOrdinal;
   }
 
+  /** The table's sealed snapshot blocks, by block. */
+  java.util.SortedMap<Long, SnapshotPages.SealedBlock> sealedBlocks(int tblId) {
+    java.util.SortedMap<Long, SnapshotPages.SealedBlock> blocks = sealedBlocks.get(tblId);
+    return blocks != null ? blocks : java.util.Collections.emptySortedMap();
+  }
+
+  /** Every table's sealed snapshot blocks. */
+  Map<Integer, java.util.SortedMap<Long, SnapshotPages.SealedBlock>> allSealedBlocks() {
+    return sealedBlocks;
+  }
+
   /** Returns the full manifest pool map for checkpoint encoding. */
   Map<Integer, Map<String, ManifestFile>> allManifestPools() {
     return manifestPool;
@@ -424,7 +440,7 @@ public class CatalogState {
     return new CheckpointMemo.Inputs(
         tableById.get(id), tblInlineMetadata.get(id), tblManifestPrefix.getOrDefault(id, ""),
         manifestPool(id), snapshotManifests(id), poolOrdinals(id), nextOrdinal(id),
-        conflictStates.get(id), conflictEncoding().stateCodec());
+        conflictStates.get(id), conflictEncoding().stateCodec(), sealedBlocks(id));
   }
 
   // ============================================================
@@ -480,6 +496,8 @@ public class CatalogState {
     // The pooled manifests' ordinals (persistent maps, as the pool) and each table's counter
     private final Map<Integer, Map<String, Integer>> poolOrdinals = new HashMap<>();
     private final Map<Integer, Integer> nextOrdinal = new HashMap<>();
+    private final Map<Integer, java.util.SortedMap<Long, SnapshotPages.SealedBlock>> sealedBlocks =
+        new HashMap<>();
     private String conflictEncoding;
     private int snapshotBlock;
     private int snapshotWindow;
@@ -730,7 +748,41 @@ public class CatalogState {
       snapshotManifests.remove(id);
       poolOrdinals.remove(id);
       nextOrdinal.remove(id);
+      sealedBlocks.remove(id);
       return this;
+    }
+
+    /** The table's sealed snapshot blocks, by block. */
+    java.util.SortedMap<Long, SnapshotPages.SealedBlock> sealedBlocks(int tblId) {
+      java.util.SortedMap<Long, SnapshotPages.SealedBlock> blocks = sealedBlocks.get(tblId);
+      return blocks != null ? blocks : java.util.Collections.emptySortedMap();
+    }
+
+    /** Sets (or replaces) a sealed block of the table; one with no live id is dropped. */
+    Builder setSealedBlock(int tblId, SnapshotPages.SealedBlock block) {
+      java.util.TreeMap<Long, SnapshotPages.SealedBlock> blocks =
+          new java.util.TreeMap<>(sealedBlocks(tblId));
+      if (block.liveIds.length == 0) {
+        blocks.remove(block.block);
+      } else {
+        blocks.put(block.block, block);
+      }
+      if (blocks.isEmpty()) {
+        sealedBlocks.remove(tblId);
+      } else {
+        sealedBlocks.put(tblId, java.util.Collections.unmodifiableSortedMap(blocks));
+      }
+      return this;
+    }
+
+    /** The sealed block whose live ids hold {@code snapshotId}, or null. */
+    SnapshotPages.SealedBlock sealedBlockOf(int tblId, long snapshotId) {
+      for (SnapshotPages.SealedBlock block : sealedBlocks(tblId).values()) {
+        if (block.isLive(snapshotId)) {
+          return block;
+        }
+      }
+      return null;
     }
 
     private static final boolean POOL_CHECK = Boolean.getBoolean("fileio.catalog.replay.check");
@@ -1193,7 +1245,7 @@ public class CatalogState {
           tableById.get(id), tblInlineMetadata.get(id), tblManifestPrefix.getOrDefault(id, ""),
           pool != null ? pool : ImmutableMap.of(), lists != null ? lists : ImmutableMap.of(),
           ordinals != null ? ordinals : ImmutableMap.of(), nextOrdinal.getOrDefault(id, 0),
-          conflictStates.get(id), conflictEncoding().stateCodec());
+          conflictStates.get(id), conflictEncoding().stateCodec(), sealedBlocks(id));
     }
 
     /** Sets the encoding's state of table {@code tblId}, as a checkpoint holds it. */

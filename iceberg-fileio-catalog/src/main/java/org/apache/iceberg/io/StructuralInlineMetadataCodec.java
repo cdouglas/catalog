@@ -944,12 +944,17 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
 
     int snapBlockLen = c.readVarint32();
     int blockEnd = c.pos + snapBlockLen;
+    readSnapshotsBlock(c, d);
+    c.pos = blockEnd;
+    readMdlogBlock(c, d, lazyOnly);
+    return d;
+  }
 
+  /** Reads a snapshot block ({@link #encodeSnapshotsBlock}) at the cursor into {@code d}. */
+  private static void readSnapshotsBlock(Cursor c, Decoded d) {
     d.snapshotCount = c.readVarint32();
     if (d.snapshotCount == 0) {
-      c.pos = blockEnd;
-      readMdlogBlock(c, d, lazyOnly);
-      return d;
+      return;
     }
 
     d.pathMode = c.buf[c.pos++] & 0xFF;
@@ -1067,8 +1072,21 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
       d.operations[i] = c.readString();
     }
 
-    readMdlogBlock(c, d, lazyOnly);
-    return d;
+  }
+
+  /**
+   * The snapshots of a block {@link #encodeSnapshotsBlock} wrote, in its order, each as the parser
+   * makes it: a sealed block's page holds its snapshots so (SnapshotPages).
+   */
+  static List<Snapshot> decodeSnapshotsBlock(byte[] block) {
+    Cursor c = new Cursor(block);
+    Decoded d = new Decoded();
+    readSnapshotsBlock(c, d);
+    List<Snapshot> snapshots = new ArrayList<>(d.snapshotCount);
+    for (int i = 0; i < d.snapshotCount; i++) {
+      snapshots.add(snapshotOf(d, i));
+    }
+    return snapshots;
   }
 
   private static void readMdlogBlock(Cursor c, Decoded d, boolean lazyOnly) {

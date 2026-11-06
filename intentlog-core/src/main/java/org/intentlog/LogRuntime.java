@@ -417,10 +417,35 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     }
   }
 
-  /** The checkpoint of {@code replica}: exactly its log id, committed set and state. */
+  /**
+   * The checkpoint of {@code replica}: exactly its log id, committed set and state. The pages the
+   * state names that its records made are put first ({@link StateMachine#pages}): a checkpoint is
+   * never written before a page it names. A put that fails fails the checkpoint, before anything
+   * is sent.
+   */
   private byte[] checkpoint(Replica<S> replica) {
+    putStatePages(replica.state());
     return LogEnvelope.encodeCheckpoint(
         replica.logId(), replica.committed().bytes(), machine.encodeCheckpoint(replica.state()));
+  }
+
+  private void putStatePages(S state) {
+    Map<String, byte[]> pages = machine.pages(state);
+    if (pages.isEmpty()) {
+      return;
+    }
+    PageStore store = log.pages();
+    if (store == null) {
+      throw new IllegalStateException(
+          log + " stores no pages, but its state names " + pages.keySet());
+    }
+    for (Map.Entry<String, byte[]> page : pages.entrySet()) {
+      if (!pagesPut.contains(page.getKey())) {
+        store.put(page.getKey(), page.getValue());
+        pagesPut.add(page.getKey());
+      }
+    }
+    machine.pagesPut(state, pages.keySet());
   }
 
   /** Sends a write again while the log throttles it, with the commit loop's backoff. */

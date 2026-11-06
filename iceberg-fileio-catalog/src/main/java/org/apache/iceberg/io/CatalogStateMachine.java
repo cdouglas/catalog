@@ -84,4 +84,35 @@ final class CatalogStateMachine
   public byte[] encodeIntention(ProtoCodec.CatalogIntention intention) {
     return ProtoCodec.encodeIntention(intention);
   }
+
+  /**
+   * The pages of the blocks this state's records sealed that no compactor has stored yet: a
+   * checkpoint of it names them (SNAPSHOT_PAGING.md, "The root and the pages").
+   */
+  @Override
+  public java.util.Map<String, byte[]> pages(CatalogState state) {
+    java.util.Map<String, byte[]> pages = new java.util.LinkedHashMap<>();
+    state.allSealedBlocks().forEach((tblId, blocks) -> {
+      for (SnapshotPages.SealedBlock block : blocks.values()) {
+        byte[] bytes = block.pending != null ? block.pending.bytes() : null;
+        if (bytes != null) {
+          pages.put(block.pageName(tblId), bytes);
+        }
+      }
+    });
+    return pages;
+  }
+
+  /** Drops the stored pages' bytes: every later state shares the entries that hold them. */
+  @Override
+  public void pagesPut(CatalogState state, java.util.Collection<String> names) {
+    java.util.Set<String> stored = new java.util.HashSet<>(names);
+    state.allSealedBlocks().forEach((tblId, blocks) -> {
+      for (SnapshotPages.SealedBlock block : blocks.values()) {
+        if (block.pending != null && stored.contains(block.pageName(tblId))) {
+          block.pending.stored();
+        }
+      }
+    });
+  }
 }

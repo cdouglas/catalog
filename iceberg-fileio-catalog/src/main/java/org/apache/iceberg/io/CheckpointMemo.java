@@ -65,12 +65,13 @@ final class CheckpointMemo {
     private final int nextOrdinal;
     private final EncodingState conflict;
     private final EncodingState.Codec codec;
+    private final Map<Long, SnapshotPages.SealedBlock> sealed;
 
     Inputs(
         CatalogState.TblEntry row, InlineTable metadata, String prefix,
         Map<String, ManifestFile> pool, Map<Long, List<String>> lists,
         Map<String, Integer> ordinals, int nextOrdinal, EncodingState conflict,
-        EncodingState.Codec codec) {
+        EncodingState.Codec codec, Map<Long, SnapshotPages.SealedBlock> sealed) {
       this.row = row;
       this.metadata = metadata;
       this.prefix = prefix;
@@ -80,6 +81,7 @@ final class CheckpointMemo {
       this.nextOrdinal = nextOrdinal;
       this.conflict = conflict;
       this.codec = codec;
+      this.sealed = sealed;
     }
 
     /** Whether these are the very objects {@code other} holds, but for the row. */
@@ -91,7 +93,8 @@ final class CheckpointMemo {
           && ordinals == other.ordinals
           && nextOrdinal == other.nextOrdinal
           && conflict == other.conflict
-          && codec == other.codec;
+          && codec == other.codec
+          && sealed == other.sealed;
     }
   }
 
@@ -105,7 +108,7 @@ final class CheckpointMemo {
       this.id = id;
       // Without the row, which would keep the entry alive
       this.inputs = new Inputs(null, inputs.metadata, inputs.prefix, inputs.pool, inputs.lists,
-          inputs.ordinals, inputs.nextOrdinal, inputs.conflict, inputs.codec);
+          inputs.ordinals, inputs.nextOrdinal, inputs.conflict, inputs.codec, inputs.sealed);
       this.bytes = bytes;
     }
   }

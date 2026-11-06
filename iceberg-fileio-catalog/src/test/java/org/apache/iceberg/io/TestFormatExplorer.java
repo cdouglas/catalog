@@ -54,7 +54,8 @@ public class TestFormatExplorer {
 
   /** Int constants of the codecs that are not field numbers. */
   private static final Set<String> NOT_FIELDS =
-      Set.of("SUPPORTED_READER_VERSION", "MAX_LEVEL", "RANDOM_BYTES", "DIGEST_BYTES");
+      Set.of("SUPPORTED_READER_VERSION", "MAX_LEVEL", "RANDOM_BYTES", "DIGEST_BYTES",
+          "READER_VERSION");
 
   static {
     Map<String, String> codec = new LinkedHashMap<>();
@@ -82,7 +83,13 @@ public class TestFormatExplorer {
     codec.put("SET_CONFLICT_ENCODING_", "SetConflictEncoding");
     codec.put("SNAPSHOT_PAGING_", "SnapshotPaging");
     codec.put("SET_SNAPSHOT_PAGING_", "SetSnapshotPaging");
+    codec.put("SEALED_BLOCK_", "SealedBlock");
     PREFIXES.put("ProtoCodec", codec);
+
+    Map<String, String> pages = new LinkedHashMap<>();
+    pages.put("PAGE_", "SnapshotPage");
+    pages.put("SMR_", "SnapshotManifestRefs");
+    PREFIXES.put("SnapshotPages", pages);
 
     Map<String, String> committed = new LinkedHashMap<>();
     committed.put("COMMITTED_TXNS_", "CommittedTransactions");

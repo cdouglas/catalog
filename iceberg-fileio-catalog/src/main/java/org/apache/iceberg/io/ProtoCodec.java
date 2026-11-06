@@ -143,6 +143,13 @@ public class ProtoCodec {
   static final int INLINE_TBL_CONFLICT_STATE = 10;
   private static final int INLINE_TBL_NEXT_ORDINAL = 11;
   private static final int INLINE_TBL_POOL_ORDINALS = 12;
+  private static final int INLINE_TBL_SEALED_BLOCKS = 13;
+
+  // SealedBlock field numbers
+  private static final int SEALED_BLOCK_BLOCK = 1;
+  private static final int SEALED_BLOCK_DIGEST = 2;
+  private static final int SEALED_BLOCK_MERKLE_ROOT = 3;
+  private static final int SEALED_BLOCK_LIVE_IDS = 4;
 
   // ManifestFileEntry field numbers
   private static final int MF_PATH = 1;
@@ -374,7 +381,8 @@ public class ProtoCodec {
           if (inlineBytes == null || CheckpointMemo.CHECK) {
             byte[] encoded = encodeInlineTable(
                 tblId, tblEntry, table, prefix, pool, snapRefs, original.poolOrdinals(tblId),
-                original.nextOrdinal(tblId), conflictState(original, stateCodec, tblId));
+                original.nextOrdinal(tblId), conflictState(original, stateCodec, tblId),
+                original.sealedBlocks(tblId));
             Preconditions.checkState(
                 inlineBytes == null || java.util.Arrays.equals(inlineBytes, encoded),
                 "The memoized encoding of inline table %s differs from its encoding", tblId);
@@ -618,7 +626,8 @@ public class ProtoCodec {
   private static byte[] encodeInlineTable(
       int id, CatalogState.TblEntry entry, InlineTable table, String manifestPrefix,
       Map<String, ManifestFile> pool, Map<Long, List<String>> snapRefs,
-      Map<String, Integer> ordinals, int nextOrdinal, byte[] conflictState)
+      Map<String, Integer> ordinals, int nextOrdinal, byte[] conflictState,
+      Map<Long, SnapshotPages.SealedBlock> sealed)
       throws IOException {
     ByteArrayOutputStream out = new BytesOut();
     writeVarint(out, INLINE_TBL_ID, id);
@@ -718,6 +727,11 @@ public class ProtoCodec {
       }
     }
 
+    // Sealed blocks (field 13), by block
+    for (SnapshotPages.SealedBlock block : sealed.values()) {
+      writeLengthDelimited(out, INLINE_TBL_SEALED_BLOCKS, encodeSealedBlock(block));
+    }
+
     return out.toByteArray();
   }
 
@@ -786,6 +800,7 @@ public class ProtoCodec {
     List<byte[]> poolEntryBytes = new ArrayList<>();
     List<Integer> poolOrdinals = new ArrayList<>();
     List<byte[]> snapRefBytes = new ArrayList<>();
+    List<SnapshotPages.SealedBlock> sealedBlocks = new ArrayList<>();
     byte[] conflictState = null;
 
     while (in.available() > 0) {
@@ -828,6 +843,9 @@ public class ProtoCodec {
         case INLINE_TBL_POOL_ORDINALS:
           readPacked(in, tag, poolOrdinals);
           break;
+        case INLINE_TBL_SEALED_BLOCKS:
+          sealedBlocks.add(decodeSealedBlock(readLengthDelimitedBytes(in)));
+          break;
         default:
           skipField(in, tag & 0x7);
       }
@@ -860,7 +878,74 @@ public class ProtoCodec {
     for (byte[] refBytes : snapRefBytes) {
       lists.add(decodeSnapshotManifestRefs(refBytes, id, byOrdinal, lists, builder));
     }
+    long lastBlock = -1;
+    for (SnapshotPages.SealedBlock block : sealedBlocks) {
+      Preconditions.checkState(block.block > lastBlock && block.liveIds.length > 0,
+          "Inline table %s has sealed blocks out of order or without live snapshots", id);
+      lastBlock = block.block;
+      builder.setSealedBlock(id, block);
+    }
     return id;
+  }
+
+  private static byte[] encodeSealedBlock(SnapshotPages.SealedBlock block) throws IOException {
+    ByteArrayOutputStream out = new BytesOut();
+    writeVarint64(out, SEALED_BLOCK_BLOCK, block.block);
+    writeBytes(out, SEALED_BLOCK_DIGEST, block.digest);
+    writeBytes(out, SEALED_BLOCK_MERKLE_ROOT, block.merkleRoot);
+    ByteArrayOutputStream ids = new BytesOut();
+    for (long liveId : block.liveIds) {
+      for (int i = 0; i < 8; i++) {
+        ids.write((int) (liveId >>> (8 * i)) & 0xFF);
+      }
+    }
+    writeLengthDelimited(out, SEALED_BLOCK_LIVE_IDS, ids.toByteArray());
+    return out.toByteArray();
+  }
+
+  private static SnapshotPages.SealedBlock decodeSealedBlock(byte[] bytes) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    long block = 0;
+    byte[] digest = new byte[0];
+    byte[] merkleRoot = new byte[0];
+    List<Long> live = new ArrayList<>();
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      switch (tag >>> 3) {
+        case SEALED_BLOCK_BLOCK:
+          block = readVarint64(in);
+          break;
+        case SEALED_BLOCK_DIGEST:
+          digest = readLengthDelimitedBytes(in);
+          break;
+        case SEALED_BLOCK_MERKLE_ROOT:
+          merkleRoot = readLengthDelimitedBytes(in);
+          break;
+        case SEALED_BLOCK_LIVE_IDS:
+          if ((tag & 0x7) == 2) {
+            byte[] packed = readLengthDelimitedBytes(in);
+            Preconditions.checkState(packed.length % 8 == 0, "Malformed sealed block live ids");
+            for (int at = 0; at < packed.length; at += 8) {
+              long value = 0;
+              for (int i = 7; i >= 0; i--) {
+                value = (value << 8) | (packed[at + i] & 0xFFL);
+              }
+              live.add(value);
+            }
+          } else {
+            live.add(readFixed64(in));
+          }
+          break;
+        default:
+          skipField(in, tag & 0x7);
+      }
+    }
+    long[] liveIds = live.stream().mapToLong(Long::longValue).toArray();
+    for (int i = 1; i < liveIds.length; i++) {
+      Preconditions.checkState(liveIds[i - 1] < liveIds[i], "Sealed block %s live ids unsorted",
+          block);
+    }
+    return new SnapshotPages.SealedBlock(block, digest, merkleRoot, liveIds, null);
   }
 
   /** Reads a packed repeated uint32 field (or one unpacked value) into {@code values}. */

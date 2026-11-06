@@ -65,6 +65,20 @@ public interface StateMachine<S, B extends StateMachine.Builder<S>, I extends In
     return decodeCheckpoint(encodeCheckpoint(state));
   }
 
+  /**
+   * The pages, by name, that a checkpoint of {@code state} names and its compactor must put before
+   * writing it: those the state's own records made (a machine that pages part of its state; the
+   * catalog's sealed snapshot blocks). A state decoded from a checkpoint names only pages that
+   * exist, so it returns those its records made since. A name's bytes never change, so a put may
+   * be repeated. Replay never reads a page.
+   */
+  default java.util.Map<String, byte[]> pages(S state) {
+    return java.util.Map.of();
+  }
+
+  /** That {@code names}, pages {@link #pages} gave of {@code state}, are stored. */
+  default void pagesPut(S state, java.util.Collection<String> names) {}
+
   /** What replay mutates; {@link #build} freezes it into a state. */
   interface Builder<S> {
     S build();

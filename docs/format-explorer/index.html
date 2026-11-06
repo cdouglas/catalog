@@ -545,7 +545,27 @@
           {"number": 9, "name": "metadata_codec", "type": "InlineMetadataCodec", "repeated": false, "packed": false, "oneof": null, "comment": "codec for `metadata`"},
           {"number": 10, "name": "conflict_state", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": "as Table.conflict_state"},
           {"number": 11, "name": "next_ordinal", "type": "uint32", "repeated": false, "packed": false, "oneof": null, "comment": "The ordinal the table's next newly pooled manifest takes: a pooled manifest's ordinal is assigned once, when the table first pools it, so a new manifest renumbers nothing (SNAPSHOT_PAGING.md \"Lists\")."},
-          {"number": 12, "name": "pool_ordinals", "type": "uint32", "repeated": true, "packed": true, "oneof": null, "comment": "The ordinal of each manifest_pool entry, in its order."}
+          {"number": 12, "name": "pool_ordinals", "type": "uint32", "repeated": true, "packed": true, "oneof": null, "comment": "The ordinal of each manifest_pool entry, in its order."},
+          {"number": 13, "name": "sealed_blocks", "type": "SealedBlock", "repeated": true, "packed": true, "oneof": null, "comment": "The table's sealed snapshot blocks, by block (docs/SNAPSHOT_PAGING.md): their snapshots are in pages, not in `metadata`, nor their lists in snapshot_refs, nor the entries only they name in manifest_pool."}
+        ]
+      },
+      "SealedBlock": {
+        "fields": [
+          {"number": 1, "name": "block", "type": "uint64", "repeated": false, "packed": false, "oneof": null, "comment": "k: sequence numbers [k * B, (k + 1) * B)"},
+          {"number": 2, "name": "digest", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": "the page's: SHA-256, truncated to 16 bytes"},
+          {"number": 3, "name": "merkle_root", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": "of its snapshots' leaves, in order"},
+          {"number": 4, "name": "live_ids", "type": "fixed64", "repeated": true, "packed": true, "oneof": null, "comment": "its snapshots that have not expired, ascending"}
+        ]
+      },
+      "SnapshotPage": {
+        "fields": [
+          {"number": 1, "name": "min_reader_version", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": "SnapshotPages.READER_VERSION, now 1"},
+          {"number": 2, "name": "table_uuid", "type": "string", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 3, "name": "table_id", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 4, "name": "block", "type": "uint64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 5, "name": "snapshots", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": "StructuralInlineMetadataCodec's snapshot block of them, gzipped, in the table's order"},
+          {"number": 6, "name": "pool", "type": "ManifestFileEntry", "repeated": true, "packed": true, "oneof": null, "comment": "The entries their lists name, each once, in the order first named"},
+          {"number": 7, "name": "lists", "type": "SnapshotManifestRefs", "repeated": true, "packed": true, "oneof": null, "comment": "Each inline list, whole or as a change of its parent's in the page, by index in `pool`, in the page's order"}
         ]
       },
       "Intention": {

@@ -191,6 +191,37 @@ message InlineTable {
   uint32 next_ordinal                            = 11;
   // The ordinal of each manifest_pool entry, in its order.
   repeated uint32 pool_ordinals                  = 12;
+  // The table's sealed snapshot blocks, by block (docs/SNAPSHOT_PAGING.md):
+  // their snapshots are in pages, not in `metadata`, nor their lists in
+  // snapshot_refs, nor the entries only they name in manifest_pool.
+  repeated SealedBlock sealed_blocks             = 13;
+}
+
+// A sealed block of a table's snapshots as the root keeps it: its page is
+// snap.<table id>.<block>.<digest hex> in the log's page store.
+message SealedBlock {
+  uint64 block                = 1;   // k: sequence numbers [k * B, (k + 1) * B)
+  bytes  digest               = 2;   // the page's: SHA-256, truncated to 16 bytes
+  bytes  merkle_root          = 3;   // of its snapshots' leaves, in order
+  repeated fixed64 live_ids   = 4;   // its snapshots that have not expired, ascending
+}
+
+// A sealed block's page: written once, before the root that names it, and
+// never changed. A function of the block's snapshots, lists and entries, so
+// every compactor that seals it writes the same bytes under the same name.
+message SnapshotPage {
+  int32  min_reader_version   = 1;   // SnapshotPages.READER_VERSION, now 1
+  string table_uuid           = 2;
+  int32  table_id             = 3;
+  uint64 block                = 4;
+  // StructuralInlineMetadataCodec's snapshot block of them, gzipped, in the
+  // table's order
+  bytes  snapshots            = 5;
+  // The entries their lists name, each once, in the order first named
+  repeated ManifestFileEntry pool = 6;
+  // Each inline list, whole or as a change of its parent's in the page, by
+  // index in `pool`, in the page's order
+  repeated SnapshotManifestRefs lists = 7;
 }
 
 // ============================================================
