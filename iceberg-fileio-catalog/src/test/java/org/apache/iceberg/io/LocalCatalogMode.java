@@ -112,9 +112,10 @@ enum LocalCatalogMode {
   /**
    * The snapshot paging every catalog the modes make is created with (docs/SNAPSHOT_PAGING.md):
    * {@code fileio.catalog.test.snapshot.block} and {@code .window} (blocks of 4 and a window of
-   * 8 seal a table's blocks every few commits); 0 pages no snapshot.
+   * 8 seal a table's blocks every few commits); 0 pages no snapshot; unset, the catalog's
+   * default.
    */
-  static final int SNAPSHOT_BLOCK = Integer.getInteger("fileio.catalog.test.snapshot.block", 0);
+  static final Integer SNAPSHOT_BLOCK = Integer.getInteger("fileio.catalog.test.snapshot.block");
 
   static final int SNAPSHOT_WINDOW = Integer.getInteger("fileio.catalog.test.snapshot.window", 8);
 
@@ -167,7 +168,7 @@ enum LocalCatalogMode {
       properties.put(LogCatalogProperties.COMMITTED_ADMISSION_MS, "0");
       properties.put(LogCatalogProperties.COMMITTED_PAGE_THRESHOLD, "0");
     }
-    if (SNAPSHOT_BLOCK > 0) {
+    if (SNAPSHOT_BLOCK != null) {
       properties.put(LogCatalogProperties.SNAPSHOT_BLOCK, String.valueOf(SNAPSHOT_BLOCK));
       properties.put(LogCatalogProperties.SNAPSHOT_WINDOW, String.valueOf(SNAPSHOT_WINDOW));
     }

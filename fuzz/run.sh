@@ -20,7 +20,8 @@
 # SHRINK_HEAP (default 16g), SHRINK_SECONDS (default 1800), JOB_TIMEOUT, SMOKE=1 (3 tries per
 # property: checks the image, not the code), REBASE_TRIES, ROUND_JOBS (a round's jobs, to rerun
 # some: "race", "faultA1 faultB1"), SNAPSHOT_BLOCK and SNAPSHOT_WINDOW (the snapshot paging the
-# tests' catalogs are created with; 4 and 8 page constantly).
+# tests' catalogs are created with; unset, the catalog's default; 0, none; 4 and 8 page
+# constantly, 2 and 1 reach re-inlining's import pages).
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OUT=${OUT:-$HERE/out}

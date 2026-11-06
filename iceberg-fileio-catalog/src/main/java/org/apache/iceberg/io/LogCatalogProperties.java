@@ -187,10 +187,11 @@ public final class LogCatalogProperties {
    * (docs/SNAPSHOT_PAGING.md, "Blocks"): a block seals {@link #SNAPSHOT_WINDOW} behind the table's
    * last sequence number, and its snapshots go to a page. Fixed by the catalog's first record, as
    * the conflict encoding is: a catalog that opens an existing log uses that log's. 0 pages
-   * nothing. Default 0 while paging is built (step 4); the design's is 256, provisional.
+   * nothing. Default 256 (since step 5), provisional: what an idle table costs the root
+   * grows with the window, not the block (SNAPSHOT_PAGING.md, "Open questions").
    */
   public static final String SNAPSHOT_BLOCK = "fileio.catalog.snapshot.block";
-  public static final int DEFAULT_SNAPSHOT_BLOCK = 0;
+  public static final int DEFAULT_SNAPSHOT_BLOCK = 256;
 
   /**
    * How many sequence numbers behind a table's last a block seals: the snapshots a stale commit

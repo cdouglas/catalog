@@ -2,8 +2,9 @@
 
 Status: proposed 2026-11-04, revised 2026-11-05 after review; steps 1-3
 built (2026-11-05, measured in REPLAY_BENCH_RESULTS.md; step 3's worker copies
-move to step 4); step 4 built and measured, off by default until fuzzed; step 5
-built (2026-11-06); step 6 deferred (2026-11-06).
+move to step 4); step 4 built and measured; step 5 built (2026-11-06), with
+which paging is on by default (block 256, window 1,024); step 6 deferred
+(2026-11-06).
 Errata D18 (ML lists stored whole) tracks the problem; D17 (expiry starves)
 and D19 (whole-object compaction trigger) are what it costs. It is R2.1 and
 part of R2.2 in [CHECKPOINT_PLAN.md](CHECKPOINT_PLAN.md), under its
@@ -667,7 +668,7 @@ Each step stands alone and is measured before the next:
    with the committed set), refs moved back with proofs, and page GC; and
    `SerializableTable` shipping the head and a supplier that reads pages
    (from step 3). Built 2026-11-05/06, behind `fileio.catalog.snapshot.block`
-   (0 until it is fuzzed; then 256) and `.window` (1,024), which the catalog's first
+   (256 since step 5, 0 before) and `.window` (1,024), which the catalog's first
    record fixes (`SetSnapshotPaging`, 28f8248). As built:
    - Replay seals (`SnapshotSealing`, d896226) after a delta or full update,
      the blocks the table's last sequence number passed, keeping refs'
@@ -700,7 +701,9 @@ Each step stands alone and is measured before the next:
      not files (`PageStore.location`) ships every snapshot, as before.
    - Testing: `TestSnapshotPages`, `TestSnapshotPaging`, the suites with
      `-Dfileio.catalog.test.snapshot.block=4` (window 8) in the test JVM, and
-     rounds with `SNAPSHOT_BLOCK=4` (fuzz/ce-fuzz). `CheckpointRoundTrip`
+     rounds with `SNAPSHOT_BLOCK=4` (fuzz/ce-fuzz). Unset, the suites and
+     rounds take the catalog's default, which seals nothing in their short
+     schedules; `0` turns paging off. `CheckpointRoundTrip`
      checks every root's pages. The file model (`spec/tla`) has the state's
      pages: puts before the root, sweeps from any view, and two bug switches
      (a root before its pages; a sweep that ignores versions) that break
