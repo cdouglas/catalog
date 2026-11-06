@@ -32,14 +32,21 @@ import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import org.apache.iceberg.DataOperations;
 import org.apache.iceberg.InlineDeltaSnapshots;
 import org.apache.iceberg.Snapshot;
+import org.apache.iceberg.SnapshotParser;
+import org.apache.iceberg.SnapshotRef;
+import org.apache.iceberg.SnapshotRefParser;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableMetadata.MetadataLogEntry;
 import org.apache.iceberg.TableMetadataParser;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 
 /**
  * "Structural Snapshot Stream" — a purpose-built columnar encoding that
@@ -709,6 +716,114 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
     }
 
     return TableMetadataParser.fromJson(metadataLocation, root);
+  }
+
+  /**
+   * The table's fields, each snapshot made from its columns when first read: the head is the
+   * stripped JSON parsed as {@link #decodeFull} parses it, without refs and with no current
+   * snapshot, which are restored as the parser reads them, and each snapshot is what the parser
+   * makes of {@link #buildSnapshotJson} ({@link #snapshotOf}). A load or a checkpoint of the table
+   * makes every snapshot; replay makes those its records read.
+   */
+  @Override
+  public TableFields decodeFields(byte[] encoded) {
+    Decoded d = decode(encoded, /* lazyOnly */ false);
+    ObjectNode root;
+    try {
+      root = (ObjectNode) MAPPER.readTree(d.strippedJson);
+    } catch (IOException e) {
+      throw new UncheckedIOException("decodeFields: parse stripped JSON failed", e);
+    }
+    if (d.mdlogCount > 0) {
+      ArrayNode mdArr = MAPPER.createArrayNode();
+      for (int i = 0; i < d.mdlogCount; i++) {
+        ObjectNode entry = MAPPER.createObjectNode();
+        entry.put("timestamp-ms", d.mdlogTimestamps[i]);
+        entry.put("metadata-file", reconstructMdlogPath(d, i));
+        mdArr.add(entry);
+      }
+      root.set("metadata-log", mdArr);
+    }
+    // TableMetadataParser: a current snapshot of -1 if none, the refs given, or main at the
+    // current snapshot if none are
+    JsonNode current = root.get("current-snapshot-id");
+    long currentSnapshotId = current == null || current.isNull() ? -1L : current.asLong();
+    JsonNode refsNode = root.remove("refs");
+    Map<String, SnapshotRef> refs;
+    if (refsNode != null) {
+      Preconditions.checkArgument(
+          refsNode.isObject(), "Cannot parse refs from non-object: %s", refsNode);
+      ImmutableMap.Builder<String, SnapshotRef> builder = ImmutableMap.builder();
+      Iterator<Map.Entry<String, JsonNode>> fields = refsNode.fields();
+      while (fields.hasNext()) {
+        Map.Entry<String, JsonNode> ref = fields.next();
+        Preconditions.checkArgument(
+            ref.getValue().isObject(), "Cannot parse ref %s from non-object: %s", ref.getKey(),
+            refsNode);
+        builder.put(ref.getKey(), SnapshotRefParser.fromJson(ref.getValue()));
+      }
+      refs = builder.build();
+    } else if (currentSnapshotId != -1L) {
+      refs = ImmutableMap.of(
+          SnapshotRef.MAIN_BRANCH, SnapshotRef.branchBuilder(currentSnapshotId).build());
+    } else {
+      refs = ImmutableMap.of();
+    }
+    root.put("current-snapshot-id", -1L);
+    TableMetadata head = TableMetadataParser.fromJson("inline://decode", root);
+    Chain<Snapshot> snapshots =
+        Chain.lazy(
+            d.snapshotCount > 0 ? java.util.Arrays.copyOf(d.snapshotIds, d.snapshotCount)
+                : new long[0],
+            i -> snapshotOf(d, i), Snapshot::snapshotId);
+    return TableFields.of(head, currentSnapshotId, refs, snapshots);
+  }
+
+  /** The snapshot the parser makes of {@link #buildSnapshotJson}, made without the JSON. */
+  private static Snapshot snapshotOf(Decoded d, int i) {
+    String path = reconstructPath(d, i);
+    if (path.isEmpty()) {
+      // No manifest list: the parser's other form (an embedded list), as the JSON gives it
+      try {
+        return SnapshotParser.fromJson(MAPPER.writeValueAsString(buildSnapshotJson(d, i)));
+      } catch (IOException e) {
+        throw new UncheckedIOException("snapshot JSON failed", e);
+      }
+    }
+    // The summary object as buildSnapshotJson writes it: the operation first, then the rest
+    Map<String, String> recon = reconstructSummary(d, i);
+    String operation = recon.get("operation");
+    if (operation == null && d.operations[i] != null && !d.operations[i].isEmpty()) {
+      operation = d.operations[i];
+    }
+    boolean empty = operation == null && recon.isEmpty();
+    Map<String, String> summary = null;
+    if (!empty) {
+      ImmutableMap.Builder<String, String> rest = ImmutableMap.builder();
+      for (Map.Entry<String, String> entry : recon.entrySet()) {
+        if (!"operation".equals(entry.getKey())) {
+          rest.put(entry.getKey(), entry.getValue());
+        }
+      }
+      summary = rest.build();
+      if (operation == null) {
+        // the parser's default for a summary without one
+        operation = DataOperations.OVERWRITE;
+      }
+    }
+    int sid = d.schemaIds[i];
+    return InlineDeltaSnapshots.parsed(
+        d.sequenceDeltas[i],
+        d.snapshotIds[i],
+        resolveParent(d, i),
+        d.timestampDeltas[i],
+        operation,
+        summary,
+        sid >= 0 ? sid : null,
+        path,
+        d.firstRowIds[i],
+        d.addedRowsArr[i],
+        d.keyIds[i]);
   }
 
   private static String reconstructMdlogPath(Decoded d, int i) {

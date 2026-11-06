@@ -20,6 +20,7 @@ package org.apache.iceberg.io;
 
 import java.util.Objects;
 import org.apache.iceberg.TableMetadata;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 
 /**
  * One version of an inline table's metadata as the catalog's state holds it: encoded (as a
@@ -132,8 +133,25 @@ final class InlineTable {
     decoded = fields; // a merge that cleared pending set it first
     if (decoded == null) {
       TableMetadata made = metadata;
-      decoded = TableFields.of(made != null ? made : decode("inline://decode"));
+      decoded = made != null ? TableFields.of(made) : decodeFields();
       fields = decoded;
+    }
+    return decoded;
+  }
+
+  /** The fields of the bytes, as the codec makes them (lazily, in the structural codec). */
+  private TableFields decodeFields() {
+    InlineMetadataCodec decoder = InlineMetadataCodecs.byTag(codec);
+    TableFields decoded = decoder.decodeFields(bytes);
+    if (NativeDelta.CHECK) {
+      // Another decode, made whole, against the whole decode: the fields returned stay lazy
+      String lazy =
+          org.apache.iceberg.TableMetadataParser.toJson(decoder.decodeFields(bytes).toMetadata(null));
+      String whole = org.apache.iceberg.TableMetadataParser.toJson(
+          TableFields.of(decoder.decodeFull(bytes, null)).toMetadata(null));
+      Preconditions.checkState(
+          lazy.equals(whole), "The table's fields decode otherwise than its metadata:%n  fields:"
+              + "   %s%n  metadata: %s", lazy, whole);
     }
     return decoded;
   }

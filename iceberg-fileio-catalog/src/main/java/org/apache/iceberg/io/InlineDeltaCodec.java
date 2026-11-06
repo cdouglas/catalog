@@ -669,7 +669,17 @@ public class InlineDeltaCodec {
    */
   static void applyManifestsOnly(
       byte[] deltaBytes, CatalogState.Builder catalogBuilder, int tableId, TableFields table) {
-    applyManifestsOnly(deltaBytes, catalogBuilder, tableId, table.snapshots, table);
+    // Only the snapshots without a list can be ones the update adds: made from their ids, so a
+    // table decoded lazily makes no other (Chain#lazy)
+    Set<Long> listed = catalogBuilder.snapshotManifestKeys(tableId);
+    Chain<Snapshot> snapshots = table.snapshots;
+    List<Snapshot> unlisted = new ArrayList<>();
+    for (int i = 0; i < snapshots.size(); i++) {
+      if (!listed.contains(snapshots.keyAt(i))) {
+        unlisted.add(snapshots.get(i));
+      }
+    }
+    applyManifestsOnly(deltaBytes, catalogBuilder, tableId, unlisted, table);
   }
 
   private static void applyManifestsOnly(

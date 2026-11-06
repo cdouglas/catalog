@@ -67,6 +67,14 @@ public interface InlineMetadataCodec {
   TableMetadata decodeFull(byte[] encoded, String metadataLocation);
 
   /**
+   * The table's fields, as replay keeps them: those of {@link #decodeFull}, which a codec may make
+   * lazily (the structural codec makes each snapshot from its columns when first read).
+   */
+  default TableFields decodeFields(byte[] encoded) {
+    return TableFields.of(decodeFull(encoded, "inline://decode"));
+  }
+
+  /**
    * Return only the snapshot referenced by {@code current-snapshot-id} in the
    * encoded blob, or {@code null} if the table has no current snapshot.
    * Implementations should avoid materialising other snapshots when the wire

@@ -157,6 +157,46 @@ final class TableFields implements MetadataView {
   }
 
   /**
+   * The fields of a table whose {@code head} is its metadata parsed without its snapshots and refs
+   * (and no current snapshot), with these: what the structural codec decodes, its snapshots made
+   * from their columns when first read ({@link Chain#lazy}).
+   */
+  static TableFields of(
+      TableMetadata head,
+      long currentSnapshotId,
+      Map<String, SnapshotRef> refs,
+      Chain<Snapshot> snapshots) {
+    TableFields fields = of(head);
+    return new TableFields(
+        fields.formatVersion,
+        fields.uuid,
+        fields.location,
+        fields.lastSequenceNumber,
+        fields.lastUpdatedMillis,
+        fields.lastColumnId,
+        fields.currentSchemaId,
+        fields.schemas,
+        fields.schemasById,
+        fields.defaultSpecId,
+        fields.specs,
+        fields.specsById,
+        fields.lastAssignedPartitionId,
+        fields.defaultSortOrderId,
+        fields.sortOrders,
+        fields.sortOrdersById,
+        fields.properties,
+        currentSnapshotId,
+        snapshots,
+        fields.snapshotLog,
+        fields.previousFiles,
+        refs,
+        fields.statisticsFiles,
+        fields.partitionStatisticsFiles,
+        fields.nextRowId,
+        fields.encryptionKeys);
+  }
+
+  /**
    * The metadata these fields make, at {@code metadataFileLocation} (null: none). Builds it whole,
    * so call it where a whole one is needed, not per record.
    */
@@ -351,7 +391,7 @@ final class TableFields implements MetadataView {
 
   @Override
   public Long currentSnapshotId() {
-    return currentSnapshotId >= 0 && snapshots.byKey(currentSnapshotId) != null
+    return currentSnapshotId >= 0 && snapshots.containsKey(currentSnapshotId)
         ? currentSnapshotId
         : null;
   }

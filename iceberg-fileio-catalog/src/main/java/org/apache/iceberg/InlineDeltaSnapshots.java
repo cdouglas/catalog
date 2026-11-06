@@ -78,4 +78,34 @@ public final class InlineDeltaSnapshots {
         addedRows,
         keyId);
   }
+
+  /**
+   * The snapshot {@link SnapshotParser} makes of these fields: its operation and summary as the
+   * parser reads them from a summary object (both null if it is empty), and a manifest list.
+   */
+  public static Snapshot parsed(
+      long sequenceNumber,
+      long snapshotId,
+      Long parentId,
+      long timestampMillis,
+      String operation,
+      Map<String, String> summary,
+      Integer schemaId,
+      String manifestList,
+      Long firstRowId,
+      Long addedRows,
+      String keyId) {
+    return new BaseSnapshot(
+        sequenceNumber,
+        snapshotId,
+        parentId,
+        timestampMillis,
+        operation,
+        summary,
+        schemaId,
+        manifestList,
+        firstRowId,
+        addedRows,
+        keyId);
+  }
 }

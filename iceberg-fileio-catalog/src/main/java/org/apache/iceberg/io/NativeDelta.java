@@ -218,7 +218,7 @@ final class NativeDelta {
       }
     }
     for (Snapshot snapshot : record.snapshots()) {
-      if (base.snapshots.byKey(snapshot.snapshotId()) == null) {
+      if (!base.snapshots.containsKey(snapshot.snapshotId())) {
         snapshots.add(snapshot);
       }
     }
@@ -284,7 +284,7 @@ final class NativeDelta {
                 sequenceNumber, base.currentSchemaId, "", writerLastUpdatedMillis, landing);
         // TableMetadata.Builder.addSnapshot
         ValidationException.check(
-            snapshots.byKey(snapshot.snapshotId()) == null,
+            !snapshots.containsKey(snapshot.snapshotId()),
             "Snapshot already exists for id: %s",
             snapshot.snapshotId());
         RetryableValidationException.check(
@@ -384,7 +384,7 @@ final class NativeDelta {
         Map<String, SnapshotRef> current = refs != null ? refs : base.refs;
         List<String> dangling = new ArrayList<>();
         for (Map.Entry<String, SnapshotRef> ref : current.entrySet()) {
-          if (snapshots.byKey(ref.getValue().snapshotId()) == null) {
+          if (!snapshots.containsKey(ref.getValue().snapshotId())) {
             dangling.add(ref.getKey());
           }
         }
@@ -462,7 +462,7 @@ final class NativeDelta {
       // snapshots the table has; an entry whose snapshot was removed clears the history before it
       List<HistoryEntry> kept = new ArrayList<>();
       for (HistoryEntry entry : snapshotLog) {
-        if (snapshots.byKey(entry.snapshotId()) != null) {
+        if (snapshots.containsKey(entry.snapshotId())) {
           if (!intermediate.contains(entry.snapshotId())) {
             kept.add(entry);
           }
@@ -470,7 +470,7 @@ final class NativeDelta {
           kept.clear();
         }
       }
-      if (snapshots.byKey(currentSnapshotId) != null) {
+      if (snapshots.containsKey(currentSnapshotId)) {
         ValidationException.check(
             Iterables.getLast(kept).snapshotId() == currentSnapshotId,
             "Cannot set invalid snapshot log: latest entry is not the current snapshot");

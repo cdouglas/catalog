@@ -22,9 +22,11 @@ import java.util.AbstractList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.RandomAccess;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.IntFunction;
 import java.util.function.ToLongFunction;
 
 /**
@@ -48,11 +50,42 @@ final class Chain<T> extends AbstractList<T> implements RandomAccess {
     private final AtomicInteger length;
     // Each element's index by key, if keyed; an element is in a list only below its size
     private final Map<Long, Integer> index;
+    // The first elements, made on first use ({@link #lazy}); the lists of a buffer, and the
+    // buffers copied from it, share them (every such list holds them all)
+    private final Lazy lazy;
 
-    Buffer(Object[] items, int length, boolean keyed) {
+    Buffer(Object[] items, int length, boolean keyed, Lazy lazy) {
       this.items = items;
       this.length = new AtomicInteger(length);
       this.index = keyed ? new ConcurrentHashMap<>() : null;
+      this.lazy = lazy;
+    }
+  }
+
+  /** Elements made on first use, each once: their keys, a maker, and what it made. */
+  private static final class Lazy {
+    private final long[] keys;
+    private final IntFunction<?> make;
+    private final Object[] made;
+
+    Lazy(long[] keys, IntFunction<?> make) {
+      this.keys = keys;
+      this.make = make;
+      this.made = new Object[keys.length];
+    }
+
+    Object get(int i) {
+      Object item = made[i];
+      if (item == null) {
+        synchronized (this) {
+          item = made[i];
+          if (item == null) {
+            item = Objects.requireNonNull(make.apply(i), "made element");
+            made[i] = item;
+          }
+        }
+      }
+      return item;
     }
   }
 
@@ -71,10 +104,27 @@ final class Chain<T> extends AbstractList<T> implements RandomAccess {
     return of(elements, null);
   }
 
+  /**
+   * A keyed list of {@code keys.length} elements, the i-th made by {@code make} the first time it
+   * is read and kept: keys are known at once, an element only when needed (a table's snapshots,
+   * decoded from columns). {@code key} must give each made element its key.
+   */
+  static <T> Chain<T> lazy(
+      long[] keys, IntFunction<? extends T> make, ToLongFunction<? super T> key) {
+    Objects.requireNonNull(key, "key");
+    Buffer buffer =
+        new Buffer(new Object[Math.max(MIN_CAPACITY, keys.length)], keys.length, true,
+            new Lazy(keys, make));
+    for (int i = 0; i < keys.length; i++) {
+      buffer.index.put(keys[i], i);
+    }
+    return new Chain<>(buffer, keys.length, key);
+  }
+
   /** A list of {@code elements}, indexed by {@code key} if it is not null. */
   static <T> Chain<T> of(List<? extends T> elements, ToLongFunction<? super T> key) {
     Object[] items = elements.toArray(new Object[Math.max(MIN_CAPACITY, elements.size())]);
-    Buffer buffer = new Buffer(items, elements.size(), key != null);
+    Buffer buffer = new Buffer(items, elements.size(), key != null, null);
     if (key != null) {
       for (int i = 0; i < elements.size(); i++) {
         buffer.index.put(key.applyAsLong(elements.get(i)), i);
@@ -98,15 +148,14 @@ final class Chain<T> extends AbstractList<T> implements RandomAccess {
       }
       return new Chain<>(buffer, at + 1, key);
     }
-    // Another list extends this buffer past this one: copy this one's elements
+    // Another list extends this buffer past this one: copy this one's elements, sharing the lazy
+    // ones, which every list of the buffer holds
     Object[] items = Arrays.copyOf(buffer.items, Math.max(MIN_CAPACITY, (at + 1) * 2));
     items[at] = element;
-    Buffer copy = new Buffer(items, at + 1, key != null);
+    Buffer copy = new Buffer(items, at + 1, key != null, buffer.lazy);
     if (key != null) {
       for (int i = 0; i <= at; i++) {
-        @SuppressWarnings("unchecked")
-        T item = (T) items[i];
-        copy.index.put(key.applyAsLong(item), i);
+        copy.index.put(keyAt(copy, i), i);
       }
     }
     return new Chain<>(copy, at + 1, key);
@@ -118,9 +167,36 @@ final class Chain<T> extends AbstractList<T> implements RandomAccess {
     if (at == null || at >= size) {
       return null;
     }
-    @SuppressWarnings("unchecked")
-    T item = (T) buffer.items[at];
-    return item;
+    return item(buffer, at);
+  }
+
+  /** Whether the list holds an element whose key is {@code k}, without making it. */
+  boolean containsKey(long k) {
+    Integer at = buffer.index.get(k);
+    return at != null && at < size;
+  }
+
+  /** The key of the element at {@code i}, made or not; for a keyed list only. */
+  long keyAt(int i) {
+    if (i < 0 || i >= size) {
+      throw new IndexOutOfBoundsException("Index " + i + " out of bounds for length " + size);
+    }
+    return keyAt(buffer, i);
+  }
+
+  private long keyAt(Buffer from, int i) {
+    if (from.lazy != null && i < from.lazy.keys.length) {
+      return from.lazy.keys[i];
+    }
+    return key.applyAsLong(item(from, i));
+  }
+
+  @SuppressWarnings("unchecked")
+  private T item(Buffer from, int i) {
+    if (from.lazy != null && i < from.lazy.keys.length) {
+      return (T) from.lazy.get(i);
+    }
+    return (T) from.items[i];
   }
 
   /** The last element, or null if the list is empty. */
@@ -133,9 +209,7 @@ final class Chain<T> extends AbstractList<T> implements RandomAccess {
     if (i < 0 || i >= size) {
       throw new IndexOutOfBoundsException("Index " + i + " out of bounds for length " + size);
     }
-    @SuppressWarnings("unchecked")
-    T item = (T) buffer.items[i];
-    return item;
+    return item(buffer, i);
   }
 
   @Override
