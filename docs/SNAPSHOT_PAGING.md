@@ -3,7 +3,7 @@
 Status: proposed 2026-11-04, revised 2026-11-05 after review; steps 1-3
 built (2026-11-05, measured in REPLAY_BENCH_RESULTS.md; step 3's worker copies
 move to step 4); step 4 built and measured, off by default until fuzzed; step 5
-built (2026-11-06); step 6 not built.
+built (2026-11-06); step 6 deferred (2026-11-06).
 Errata D18 (ML lists stored whole) tracks the problem; D17 (expiry starves)
 and D19 (whole-object compaction trigger) are what it costs. It is R2.1 and
 part of R2.2 in [CHECKPOINT_PLAN.md](CHECKPOINT_PLAN.md), under its
@@ -427,7 +427,8 @@ metadata file and manifest list files). Eviction is a record
 does not apply; the policy is the writer's: which tables, after how long.
 The evicting writer reads the table's pages to write the old snapshots' list
 files. Paging makes eviction matter less: an idle inline table costs the root
-its head, its last W snapshots and its sealed ids.
+its head, its last W snapshots and its sealed ids. The policy is deferred
+([Order of work](#order-of-work), step 6).
 
 Re-inlining works as SPEC_TM.md has it: an inline writer's next commit to a
 pointer table re-inlines it in full mode when the whole metadata fits in a
@@ -738,7 +739,20 @@ Each step stands alone and is measured before the next:
      record) is the compactor's (pages, then the root), and their sweep is
      the same rule by version.
 6. **Cold tables evicted** by a writer's policy, if the measurements still
-   call for it.
+   call for it. Deferred (2026-11-06): they do not yet. An idle table of
+   3,000 snapshots costs the root 134 KB with inline table metadata and
+   216 KB with inline manifest lists too (176 KB and 393 KB unpaged; step
+   4's `ReplayBench`, B = 256, W = 1,024); one of 7,200 costs an estimated
+   190-270 KB, so 100 such tables add 13-27 MB to every read of the
+   catalog. Evicting one leaves a pointer entry, but costs, once, a
+   metadata file of its whole history and, with inline lists, a list file
+   per snapshot (3,000 writes at that depth); its next write brings it back
+   (step 5). A smaller window for idle tables would leave the sealed
+   residual, about 18 B a snapshot (130 KB at 7,200), so it barely helps
+   the deepest. And Iceberg's default expiry (5 days, at least 1 snapshot
+   kept) shrinks an idle table to its last snapshot within 5 days where
+   maintenance runs: the cost stays only for deep tables nobody expires.
+   Revisit when a catalog-bench workload has many idle tables.
 
 ## Alternatives considered
 
