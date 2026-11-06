@@ -79,6 +79,11 @@ public final class CatalogLog {
     return replica;
   }
 
+  /** The log's page store, where sealed snapshot blocks' pages are; null if it has none. */
+  org.intentlog.PageStore pages() {
+    return log.pages();
+  }
+
   /**
    * The catalog before its log exists: a transaction staged on it creates the log, and fails if
    * another writer created it first.

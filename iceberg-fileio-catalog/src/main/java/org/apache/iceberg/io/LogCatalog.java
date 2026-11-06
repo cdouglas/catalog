@@ -182,7 +182,8 @@ public class LogCatalog extends BaseMetastoreCatalog
     // Another catalog may create the log at once (two processes starting on a new warehouse):
     // either way, this one uses it.
     int[] paging = LogCatalogProperties.snapshotPaging(catalogProperties);
-    log.bootstrap(conflictEncoding, paging[0], paging[1]);
+    // A log without a page store pages nothing: a compaction must put a sealed block's page
+    log.bootstrap(conflictEncoding, log.pages() != null ? paging[0] : 0, paging[1]);
   }
 
   /**
@@ -646,10 +647,18 @@ public class LogCatalog extends BaseMetastoreCatalog
         InlineTable inlineTable = state.inlineTable(state.tableId(tableId));
         String syntheticLoc = metadataLocation(state, tableId);
         int tblId = state.tableId(tableId);
+        // A table with sealed blocks loads through the supplier, which reads their pages; an
+        // eager load asks it for every snapshot at once
+        boolean sealed = !state.sealedBlocks(tblId).isEmpty();
         refreshFromMetadataLocation(syntheticLoc, null, 0,
-            loc -> inline.lazyLoads
-                ? inlineTable.loadedAs(
-                    loc, at -> lazyMetadata(state, tblId, inlineTable.fields(), at))
+            loc -> inline.lazyLoads || sealed
+                ? inlineTable.loadedAs(loc, at -> {
+                    TableMetadata made = lazyMetadata(state, tblId, inlineTable.fields(), at);
+                    if (!inline.lazyLoads) {
+                      made.snapshots();
+                    }
+                    return made;
+                  })
                 : inlineTable.loaded(loc, parsed -> wrapInlineManifests(parsed, state)));
       } else if (loaded || currentMetadataLocation() != null) {
         // Table used to exist but is now missing
@@ -989,10 +998,16 @@ public class LogCatalog extends BaseMetastoreCatalog
         // before the update added some, need not have (round sp1-r0).
         TableMetadata encoded = rewriteInlineSnapshotsForFullEncode(metadata);
         TableFields held = isInline ? proto.inlineTable(tblId).fields() : null;
-        TableMetadata sent = held != null ? withNewSnapshots(held, encoded) : encoded;
+        // A sealed snapshot the version holds counts as held: replay keeps it in its block
+        java.util.function.LongPredicate sealed = held != null
+            ? id -> proto.sealedBlockOf(tblId, id) != null
+            : id -> false;
+        TableMetadata sent = held != null ? withNewSnapshots(held, encoded, sealed) : encoded;
         byte[] fullBytes = inline.codec.encode(sent);
-        long[] removed = held != null ? removedSnapshots(held, metadata) : null;
-        if (held != null && NativeDelta.CHECK) {
+        long[] removed =
+            held != null ? removedSnapshots(held, proto.sealedBlocks(tblId), metadata) : null;
+        // The check rebuilds the whole table from its fields: one with sealed blocks has part
+        if (held != null && NativeDelta.CHECK && proto.sealedBlocks(tblId).isEmpty()) {
           checkFullUpdate(held, encoded, fullBytes, removed);
         }
         byte[] manifestBytes =
@@ -1021,14 +1036,15 @@ public class LogCatalog extends BaseMetastoreCatalog
      * it) lacks, and those its refs target, which a {@code TableMetadata} must hold: what a full
      * update of an inline table sends.
      */
-    private static TableMetadata withNewSnapshots(TableFields held, TableMetadata metadata) {
+    private static TableMetadata withNewSnapshots(
+        TableFields held, TableMetadata metadata, java.util.function.LongPredicate sealed) {
       Set<Long> targets = new HashSet<>();
       for (SnapshotRef ref : metadata.refs().values()) {
         targets.add(ref.snapshotId());
       }
       List<Snapshot> sent = new ArrayList<>();
       for (Snapshot snapshot : metadata.snapshots()) {
-        if (held.snapshot(snapshot.snapshotId()) == null
+        if ((held.snapshot(snapshot.snapshotId()) == null && !sealed.test(snapshot.snapshotId()))
             || targets.contains(snapshot.snapshotId())) {
           sent.add(snapshot);
         }
@@ -1040,12 +1056,23 @@ public class LogCatalog extends BaseMetastoreCatalog
           .toMetadata(metadata.metadataFileLocation());
     }
 
-    /** The ids of {@code held}'s snapshots that {@code metadata} drops, in their order. */
-    private static long[] removedSnapshots(TableFields held, TableMetadata metadata) {
+    /**
+     * The ids of {@code held}'s snapshots that {@code metadata} drops, in their order, then those of
+     * the version's sealed blocks it drops, by block.
+     */
+    private static long[] removedSnapshots(
+        TableFields held, Map<Long, SnapshotPages.SealedBlock> sealed, TableMetadata metadata) {
       List<Long> removed = new ArrayList<>();
       for (Snapshot snapshot : held.snapshots) {
         if (metadata.snapshot(snapshot.snapshotId()) == null) {
           removed.add(snapshot.snapshotId());
+        }
+      }
+      for (SnapshotPages.SealedBlock block : sealed.values()) {
+        for (long id : block.liveIds) {
+          if (metadata.snapshot(id) == null) {
+            removed.add(id);
+          }
         }
       }
       return removed.stream().mapToLong(Long::longValue).toArray();
@@ -1230,7 +1257,10 @@ public class LogCatalog extends BaseMetastoreCatalog
         return false;
       }
       Integer tblId = proto != null ? proto.tableId(tableId) : null;
-      return tblId == null || !proto.hasInlineManifests(tblId, snapshot.snapshotId());
+      // A sealed snapshot's list is in its page, which replay keeps
+      return tblId == null
+          || (!proto.hasInlineManifests(tblId, snapshot.snapshotId())
+              && proto.sealedBlockOf(tblId, snapshot.snapshotId()) == null);
     }
 
     /** Whether {@code snapshot} is an inline-ML snapshot that a commit on {@code base} adds. */
@@ -1266,21 +1296,22 @@ public class LogCatalog extends BaseMetastoreCatalog
 
     /**
      * Checks {@code snapshots} of inline table {@code tblId} against the lists {@code proto} holds,
-     * and returns whether any has one ({@code inlineKnown}: some snapshot not among these has). Any snapshot with an inline:// sentinel manifest-list
-     * location must have a list: the sentinel is only written when the sink path is active, and
-     * the pool and sentinel are committed atomically. A sentinel without one means the pool was
+     * and returns whether any has one ({@code inlineKnown}: some snapshot not among these has).
+     * Any snapshot with an inline:// sentinel manifest-list location must have a list: the
+     * sentinel is only written when the sink path is active, and the pool and sentinel are
+     * committed atomically. A sentinel without one means the pool was
      * lost (a format bug), and loading the snapshot as-is would fail with FileNotFound when
      * allManifests() reads {@code inline://<id>}: fail loudly instead. A table with both inline and
      * file lists (mixed mode, §2.7) is logged, or rejected in strict mode
      * (fileio.catalog.inline.strict=true): rejection would break tables mid-migration.
      */
     private boolean checkInlineSnapshots(
-        CatalogState proto, int tblId, List<Snapshot> snapshots, boolean inlineKnown) {
+        Map<Long, List<String>> lists, List<Snapshot> snapshots, boolean inlineKnown) {
       boolean hasInline = inlineKnown;
       boolean hasPointer = false;
       for (Snapshot s : snapshots) {
         String loc = s.manifestListLocation();
-        if (proto.hasInlineManifests(tblId, s.snapshotId())) {
+        if (lists.containsKey(s.snapshotId())) {
           hasInline = true;
         } else if (loc != null && loc.startsWith("inline://")) {
           throw new IllegalStateException(
@@ -1340,22 +1371,51 @@ public class LogCatalog extends BaseMetastoreCatalog
       // A table with no list has nothing to wrap: its snapshots' checks wait for the supplier
       boolean listed = !lists.isEmpty();
       if (listed) {
-        checkInlineSnapshots(state, tblId, unlisted, true);
+        checkInlineSnapshots(lists, unlisted, true);
       } else {
-        checkInlineSnapshots(state, tblId, held, false);
+        checkInlineSnapshots(lists, held, false);
       }
       boolean lazy = inline.lazyLoads;
       InlineSnapshots made = inlineSnapshots;
       List<Snapshot> wrapped = listed ? made.wrap(tblId, lists, pool, held, lazy, false) : held;
+      // A sealed block's snapshots are in its page (SNAPSHOT_PAGING.md, "Loads")
+      Map<Long, SnapshotPages.SealedBlock> sealed = state.sealedBlocks(tblId);
+      String prefix = state.allManifestPrefixes().getOrDefault(tblId, "");
+      org.intentlog.PageStore store = sealed.isEmpty() ? null : log.pages();
       LazySnapshots all = new LazySnapshots(() -> {
         List<Snapshot> every = List.copyOf(snapshots);
+        List<Snapshot> inlined;
         if (!listed) {
-          checkInlineSnapshots(state, tblId, every, false);
-          return every;
+          checkInlineSnapshots(lists, every, false);
+          inlined = every;
+        } else {
+          inlined = made.wrap(tblId, lists, pool, every, lazy, true);
         }
-        return made.wrap(tblId, lists, pool, every, lazy, true);
+        return sealed.isEmpty()
+            ? inlined
+            : withSealed(inlined, made.pages(store, tblId, sealed, prefix), sealed);
       });
       return fields.toMetadata(location, wrapped, all);
+    }
+
+    /**
+     * {@code inlined} and the live snapshots of the sealed blocks' {@code pages}, in the table's
+     * order: by sequence number (a format 2 table's snapshots are in the order of theirs).
+     */
+    private static List<Snapshot> withSealed(
+        List<Snapshot> inlined, List<SnapshotPages.Page> pages,
+        Map<Long, SnapshotPages.SealedBlock> sealed) {
+      List<Snapshot> every = new ArrayList<>(inlined);
+      for (SnapshotPages.Page page : pages) {
+        SnapshotPages.SealedBlock block = sealed.get(page.block);
+        for (Snapshot snapshot : page.loaded()) {
+          if (block.isLive(snapshot.snapshotId())) {
+            every.add(snapshot);
+          }
+        }
+      }
+      every.sort(java.util.Comparator.comparingLong(Snapshot::sequenceNumber));
+      return every;
     }
 
     /**
@@ -1368,7 +1428,8 @@ public class LogCatalog extends BaseMetastoreCatalog
         return parsed;
       }
 
-      boolean hasAny = checkInlineSnapshots(proto, tblId, parsed.snapshots(), false);
+      boolean hasAny =
+          checkInlineSnapshots(proto.snapshotManifests(tblId), parsed.snapshots(), false);
       if (!hasAny) {
         return parsed;
       }
@@ -1431,6 +1492,31 @@ public class LogCatalog extends BaseMetastoreCatalog
   static final class InlineSnapshots {
     private final Map<Integer, TableSnapshots> tables =
         new java.util.concurrent.ConcurrentHashMap<>();
+    // Pages read, by name: a page never changes. The most recently used, up to a bound
+    private final Map<String, SnapshotPages.Page> pages =
+        java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>(16, 0.75f, true) {
+          @Override
+          protected boolean removeEldestEntry(Map.Entry<String, SnapshotPages.Page> eldest) {
+            return size() > 256;
+          }
+        });
+
+    /** The pages of {@code sealed}, blocks of table {@code tblId}, read once each. */
+    List<SnapshotPages.Page> pages(
+        org.intentlog.PageStore store, int tblId, Map<Long, SnapshotPages.SealedBlock> sealed,
+        String prefix) {
+      List<SnapshotPages.Page> read = new ArrayList<>(sealed.size());
+      for (SnapshotPages.SealedBlock block : sealed.values()) {
+        String name = block.pageName(tblId);
+        SnapshotPages.Page page = pages.get(name);
+        if (page == null) {
+          page = SnapshotPages.read(store, tblId, block, prefix);
+          pages.put(name, page);
+        }
+        read.add(page);
+      }
+      return read;
+    }
 
     /** What loads of one table made. */
     private static final class TableSnapshots {

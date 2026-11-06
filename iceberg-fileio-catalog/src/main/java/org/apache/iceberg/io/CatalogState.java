@@ -394,6 +394,16 @@ public class CatalogState {
     return sealedBlocks;
   }
 
+  /** The sealed block whose live ids hold {@code snapshotId}, or null. */
+  SnapshotPages.SealedBlock sealedBlockOf(int tblId, long snapshotId) {
+    for (SnapshotPages.SealedBlock block : sealedBlocks(tblId).values()) {
+      if (block.isLive(snapshotId)) {
+        return block;
+      }
+    }
+    return null;
+  }
+
   /** Returns the full manifest pool map for checkpoint encoding. */
   Map<Integer, Map<String, ManifestFile>> allManifestPools() {
     return manifestPool;
@@ -750,6 +760,11 @@ public class CatalogState {
       nextOrdinal.remove(id);
       sealedBlocks.remove(id);
       return this;
+    }
+
+    /** The table's inline manifest lists, by snapshot. */
+    Map<Long, List<String>> snapshotManifests(int tblId) {
+      return lists(tblId);
     }
 
     /** The table's sealed snapshot blocks, by block. */

@@ -100,7 +100,8 @@ final class NativeDelta {
       int tableId,
       boolean stale,
       String baseLocation) {
-    if (!CHECK) {
+    // The builder's replay needs the whole table: a table with sealed blocks has part of it inline
+    if (!CHECK || !builder.sealedBlocks(tableId).isEmpty()) {
       return replay(base, delta, builder, tableId, stale, baseLocation);
     }
     // The builder's replay first: it touches no catalog state, and a rejection there must be one
@@ -156,6 +157,11 @@ final class NativeDelta {
         new InlineDeltaCodec.NewSnapshotManifests(builder, tableId, delta);
     Set<Long> added = new HashSet<>();
     List<Long> removed = new ArrayList<>();
+    // The table's snapshots in sealed blocks: theirs too are ids a new snapshot may not take, and
+    // that the snapshot log names (SNAPSHOT_PAGING.md, "Expiry")
+    java.util.function.LongPredicate sealed = builder.sealedBlocks(tableId).isEmpty()
+        ? id -> false
+        : id -> builder.sealedBlockOf(tableId, id) != null;
     TableFields current = base;
     // A delta writes manifest lists' paths whole; its manifests' names resolve under the prefix.
     // Only a pass that changes the table logs the base's location: the table it builds has none.
@@ -167,8 +173,8 @@ final class NativeDelta {
         continue;
       }
       if (!pass.isEmpty()) {
-        TableFields next =
-            applyPass(current, pass, delta, landing, location, newSnapshots, added, removed);
+        TableFields next = applyPass(
+            current, pass, delta, landing, location, newSnapshots, added, removed, sealed);
         if (next != current) {
           location = null;
         }
@@ -190,11 +196,13 @@ final class NativeDelta {
       }
     }
     if (!pass.isEmpty()) {
-      current = applyPass(current, pass, delta, landing, location, newSnapshots, added, removed);
+      current = applyPass(
+          current, pass, delta, landing, location, newSnapshots, added, removed, sealed);
     }
     newSnapshots.finish();
     if (!removed.isEmpty()) {
       builder.removeSnapshotManifests(tableId, removed);
+      SnapshotSealing.expire(builder, tableId, removed);
     }
     return current;
   }
@@ -253,7 +261,8 @@ final class NativeDelta {
       String baseLocation,
       InlineDeltaCodec.NewSnapshotManifests newSnapshots,
       Set<Long> addedIds,
-      List<Long> removedIds) {
+      List<Long> removedIds,
+      java.util.function.LongPredicate sealed) {
     long writerLastUpdatedMillis = delta.lastUpdatedMillis;
     long lastUpdatedMillis = landing.lastUpdatedMillis(writerLastUpdatedMillis);
     int formatVersion = base.formatVersion;
@@ -284,7 +293,7 @@ final class NativeDelta {
                 sequenceNumber, base.currentSchemaId, "", writerLastUpdatedMillis, landing);
         // TableMetadata.Builder.addSnapshot
         ValidationException.check(
-            !snapshots.containsKey(snapshot.snapshotId()),
+            !snapshots.containsKey(snapshot.snapshotId()) && !sealed.test(snapshot.snapshotId()),
             "Snapshot already exists for id: %s",
             snapshot.snapshotId());
         RetryableValidationException.check(
@@ -376,6 +385,18 @@ final class NativeDelta {
             retained.add(snapshot);
           }
         }
+        // Sealed snapshots leave their blocks' live ids (after the passes): as removed here
+        for (long id : ids) {
+          if (sealed.test(id) && !snapshots.containsKey(id)) {
+            removedHere = true;
+            if (statistics == null) {
+              statistics = indexStatistics(base.statisticsFiles);
+              partitionStatistics = indexPartitionStatistics(base.partitionStatisticsFiles);
+            }
+            statistics.remove(id);
+            partitionStatistics.remove(id);
+          }
+        }
         if (removedHere) {
           snapshots = Chain.of(retained, Snapshot::snapshotId);
           removedAny = true;
@@ -461,8 +482,10 @@ final class NativeDelta {
       // TableMetadata.Builder.updateSnapshotLog: copy the entries that are still valid, of
       // snapshots the table has; an entry whose snapshot was removed clears the history before it
       List<HistoryEntry> kept = new ArrayList<>();
+      Set<Long> gone = new HashSet<>(removedIds);
       for (HistoryEntry entry : snapshotLog) {
-        if (snapshots.containsKey(entry.snapshotId())) {
+        long logged = entry.snapshotId();
+        if (snapshots.containsKey(logged) || (sealed.test(logged) && !gone.contains(logged))) {
           if (!intermediate.contains(entry.snapshotId())) {
             kept.add(entry);
           }

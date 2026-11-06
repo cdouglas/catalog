@@ -144,6 +144,9 @@ final class SnapshotPages {
     /** Each snapshot's manifest list, if it has an inline one. */
     final Map<Long, List<ManifestFile>> lists;
 
+    // Its snapshots as a load holds them, made once
+    private List<Snapshot> loaded;
+
     Page(String tableUuid, int tableId, long block, List<Snapshot> snapshots,
         Map<Long, List<ManifestFile>> lists) {
       this.tableUuid = tableUuid;
@@ -152,6 +155,56 @@ final class SnapshotPages {
       this.snapshots = snapshots;
       this.lists = lists;
     }
+
+    /**
+     * Its snapshots as a load holds them: each with a list as an InlineSnapshot holding
+     * GenericManifestFile copies of its entries (Iceberg compares manifests by path), one copy
+     * per entry; the others as they are.
+     */
+    synchronized List<Snapshot> loaded() {
+      if (loaded == null) {
+        Map<ManifestFile, ManifestFile> copies = new java.util.IdentityHashMap<>();
+        List<Snapshot> made = new ArrayList<>(snapshots.size());
+        for (Snapshot s : snapshots) {
+          List<ManifestFile> list = lists.get(s.snapshotId());
+          if (list == null) {
+            made.add(s);
+            continue;
+          }
+          List<ManifestFile> manifests = new ArrayList<>(list.size());
+          for (ManifestFile entry : list) {
+            manifests.add(copies.computeIfAbsent(
+                entry, m -> org.apache.iceberg.GenericManifestFile.copyOf(m).build()));
+          }
+          made.add(new org.apache.iceberg.InlineSnapshot(
+              s.sequenceNumber(), s.snapshotId(), s.parentId(), s.timestampMillis(),
+              s.operation(), s.summary(), s.schemaId(), s.firstRowId(), s.addedRows(), s.keyId(),
+              manifests));
+        }
+        loaded = List.copyOf(made);
+      }
+      return loaded;
+    }
+  }
+
+  /**
+   * Reads and decodes the page of {@code block}, sealed block of table {@code tableId}: the bytes
+   * this replica sealed it with, if no compactor has stored them yet (until the next root, a
+   * page exists only in the replicas that replayed its seal), else from {@code store}. A page the
+   * store lacks is never taken for empty: its block's snapshots are live, and a load needs them.
+   *
+   * @throws IllegalStateException if the store holds no such page
+   */
+  static Page read(
+      org.intentlog.PageStore store, int tableId, SealedBlock block, String prefix) {
+    String name = block.pageName(tableId);
+    byte[] bytes = block.pending != null ? block.pending.bytes() : null;
+    if (bytes == null) {
+      Preconditions.checkState(store != null, "No page store holds page %s", name);
+      bytes = store.get(name).orElseThrow(() -> new IllegalStateException(
+          "Page " + name + " of a sealed block with live snapshots does not exist"));
+    }
+    return decode(name, tableId, block.block, bytes, prefix);
   }
 
   /** {@code snap.<table id>.<block>.<digest>}: no committed-set page parses so (pageTop). */

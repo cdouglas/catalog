@@ -2763,7 +2763,34 @@ public class ProtoCodec {
       // encoding admits a delta on a version that changed since, finalized where it lands; and
       // its manifest updates must leave every pooled entry as it is.
       return ConflictEncodings.admits(table(), builder) && !restatesPooledManifest(builder)
-          && !headOnlyOnAPointerTable(builder);
+          && !headOnlyOnAPointerTable(builder) && sealed(builder) == null;
+    }
+
+    /**
+     * Why the update needs a sealed snapshot's content without carrying it, or null
+     * (SNAPSHOT_PAGING.md, "Bringing a sealed snapshot back"): a delta's parent, ref target or
+     * window ({@link SnapshotSealing#reason}); a head-only full update that holds a snapshot the
+     * table keeps sealed (its writer sends only the snapshots its base lacks, and a sealed one
+     * comes back only with its proof).
+     */
+    private String sealed(CatalogState.Builder builder) {
+      if (!builder.isInlineTable(id) || builder.sealedBlocks(id).isEmpty()) {
+        return null;
+      }
+      if (deltaBytes != null) {
+        return SnapshotSealing.reason(table().delta(), ReplayView.of(builder, id).table(), builder,
+            id);
+      }
+      if (fullMetadata != null && headOnly) {
+        Chain<Snapshot> sent =
+            InlineMetadataCodecs.byTag(fullMetadataCodec).decodeFields(fullMetadata).snapshots;
+        for (int i = 0; i < sent.size(); i++) {
+          if (builder.sealedBlockOf(id, sent.keyAt(i)) != null) {
+            return "sealed: a full update holds sealed snapshot " + sent.keyAt(i);
+          }
+        }
+      }
+      return null;
     }
 
     /**
@@ -2784,7 +2811,10 @@ public class ProtoCodec {
       if (restatesPooledManifest(builder)) {
         return POOL_RESTATED;
       }
-      return headOnlyOnAPointerTable(builder) ? "full: head only on a pointer table" : null;
+      if (headOnlyOnAPointerTable(builder)) {
+        return "full: head only on a pointer table";
+      }
+      return sealed(builder);
     }
 
     /**
@@ -2843,6 +2873,8 @@ public class ProtoCodec {
           InlineDeltaCodec.DecodedDelta delta = table().delta();
           TableFields applied =
               NativeDelta.apply(current.fields(), delta, builder, id, stale, location);
+          applied = SnapshotSealing.seal(
+              builder, id, applied, current.fields().lastSequenceNumber);
           builder.updateInlineTable(id, next, InlineTable.ofFields(applied, current.codec()));
         }
       } else if (fullMetadata != null) {
@@ -2878,6 +2910,23 @@ public class ProtoCodec {
               if (fields.snapshot(staleId) == null) {
                 builder.removeSnapshotManifests(id, staleId);
               }
+            }
+          }
+          // The sealed snapshots it drops leave their blocks; then the blocks its last sequence
+          // number passed seal (SNAPSHOT_PAGING.md)
+          if (headOnly && removedSnapshotIds != null) {
+            List<Long> removed = new ArrayList<>(removedSnapshotIds.length);
+            for (long removedId : removedSnapshotIds) {
+              removed.add(removedId);
+            }
+            SnapshotSealing.expire(builder, id, removed);
+          }
+          if (builder.snapshotBlock() > 0) {
+            TableFields fields = after.fields();
+            long beforeLast = current != null ? current.fields().lastSequenceNumber : -1L;
+            TableFields sealedFields = SnapshotSealing.seal(builder, id, fields, beforeLast);
+            if (sealedFields != fields) {
+              builder.updateInlineTable(id, next, InlineTable.ofFields(sealedFields, after.codec()));
             }
           }
         }
