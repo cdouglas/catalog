@@ -58,15 +58,47 @@ final class ManifestLists {
 
   /** The change that makes {@code list} of {@code base}. */
   static Change diff(List<String> base, List<String> list) {
-    Map<String, Integer> at = new HashMap<>(2 * base.size());
-    for (int i = 0; i < base.size(); i++) {
-      at.put(base.get(i), i);
+    Map<String, Integer> ids = new HashMap<>();
+    int[] baseIds = ids(base, ids);
+    int[] listIds = ids(list, ids);
+    return diff(baseIds, listIds, new int[ids.size()]);
+  }
+
+  private static int[] ids(List<String> paths, Map<String, Integer> ids) {
+    int[] out = new int[paths.size()];
+    for (int i = 0; i < out.length; i++) {
+      out[i] = ids.computeIfAbsent(paths.get(i), path -> ids.size());
     }
-    int n = list.size();
+    return out;
+  }
+
+  /**
+   * The change that makes {@code list} of {@code base}, each a list of manifests' ordinals. {@code
+   * at} is scratch indexed by ordinal, larger than any of the lists', all zeros; it is left so.
+   */
+  static Change diff(int[] base, int[] list, int[] at) {
+    // A fast append's list: its new manifests, then the base's whole list
+    int extra = list.length - base.length;
+    if (extra >= 0
+        && Arrays.equals(list, extra, list.length, base, 0, base.length)
+        && distinct(list, extra, at)) {
+      int[] added = new int[extra];
+      for (int i = 0; i < extra; i++) {
+        added[i] = i;
+      }
+      return new Change(new int[0], added);
+    }
+    // at[ordinal] is the ordinal's position in the base, plus one
+    for (int i = 0; i < base.length; i++) {
+      at[base[i]] = i + 1;
+    }
+    int n = list.length;
     int[] inBase = new int[n];
     for (int i = 0; i < n; i++) {
-      Integer position = at.get(list.get(i));
-      inBase[i] = position != null ? position : -1;
+      inBase[i] = at[list[i]] - 1;
+    }
+    for (int ordinal : base) {
+      at[ordinal] = 0;
     }
     // The longest subsequence of the list whose base positions strictly increase (patience
     // sorting): ends[k] is the list position ending the best run of length k + 1 found so far
@@ -79,12 +111,17 @@ final class ManifestLists {
       }
       int low = 0;
       int high = length;
-      while (low < high) {
-        int mid = (low + high) >>> 1;
-        if (inBase[ends[mid]] < inBase[i]) {
-          low = mid + 1;
-        } else {
-          high = mid;
+      // A list that keeps the base's order extends the longest run at each step
+      if (length > 0 && inBase[ends[length - 1]] < inBase[i]) {
+        low = length;
+      } else {
+        while (low < high) {
+          int mid = (low + high) >>> 1;
+          if (inBase[ends[mid]] < inBase[i]) {
+            low = mid + 1;
+          } else {
+            high = mid;
+          }
         }
       }
       previous[i] = low > 0 ? ends[low - 1] : -1;
@@ -94,14 +131,14 @@ final class ManifestLists {
       }
     }
     boolean[] keptInList = new boolean[n];
-    boolean[] keptInBase = new boolean[base.size()];
+    boolean[] keptInBase = new boolean[base.length];
     for (int i = length > 0 ? ends[length - 1] : -1; i >= 0; i = previous[i]) {
       keptInList[i] = true;
       keptInBase[inBase[i]] = true;
     }
-    int[] removed = new int[base.size()];
+    int[] removed = new int[base.length];
     int removedCount = 0;
-    for (int i = 0; i < base.size(); i++) {
+    for (int i = 0; i < base.length; i++) {
       if (!keptInBase[i]) {
         removed[removedCount++] = i;
       }
@@ -114,6 +151,28 @@ final class ManifestLists {
       }
     }
     return new Change(Arrays.copyOf(removed, removedCount), Arrays.copyOf(added, addedCount));
+  }
+
+  /**
+   * Whether {@code list}'s first {@code count} ordinals are distinct from each other and from the
+   * rest of it, the base: else the general diff decides what the base keeps. {@code at} is left
+   * zero.
+   */
+  private static boolean distinct(int[] list, int count, int[] at) {
+    if (count == 0) {
+      return true;
+    }
+    boolean distinct = true;
+    for (int i = 0; i < list.length && distinct; i++) {
+      if (at[list[i]] != 0) {
+        distinct = false;
+      }
+      at[list[i]] = 1;
+    }
+    for (int ordinal : list) {
+      at[ordinal] = 0;
+    }
+    return distinct;
   }
 
   /**

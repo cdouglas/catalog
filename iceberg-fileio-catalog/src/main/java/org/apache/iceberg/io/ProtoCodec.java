@@ -668,24 +668,34 @@ public class ProtoCodec {
       }
       Map<Long, Integer> encodedAt = new java.util.HashMap<>(2 * order.size());
       int[] depth = new int[order.size()];
+      // Each list as its manifests' ordinals, made once: a list is its children's base. The
+      // lists name the pool's manifests over and over, so look them up in a hash map
+      Map<String, Integer> index = new java.util.HashMap<>(ordinals);
+      int[][] listOrdinals = new int[order.size()][];
+      int[] at = new int[ordinalBound(ordinals, nextOrdinal)];
       for (int i = 0; i < order.size(); i++) {
         long snapshotId = order.get(i);
         List<String> list = snapRefs.get(snapshotId);
+        int[] listed = new int[list.size()];
+        for (int k = 0; k < listed.length; k++) {
+          listed[k] = ordinal(index, list.get(k), id);
+        }
+        listOrdinals[i] = listed;
         Long parent = parents.get(snapshotId);
         Integer base = parent != null ? encodedAt.get(parent) : null;
         ManifestLists.Change change = null;
         if (base != null && depth[base] + 1 < ManifestLists.CHAIN) {
-          change = ManifestLists.diff(snapRefs.get(parent), list);
-          if (change.cost() >= list.size()) {
+          change = ManifestLists.diff(listOrdinals[base], listed, at);
+          if (change.cost() >= listed.length) {
             change = null;
           }
         }
         byte[] refBytes;
         if (change != null) {
-          refBytes = encodeListChange(snapshotId, i - base, change, list, ordinals, id);
+          refBytes = encodeListChange(snapshotId, i - base, change, listed);
           depth[i] = depth[base] + 1;
         } else {
-          refBytes = encodeWholeList(snapshotId, list, ordinals, id);
+          refBytes = encodeWholeList(snapshotId, listed);
         }
         encodedAt.put(snapshotId, i);
         writeLengthDelimited(out, INLINE_TBL_SNAPSHOT_REFS, refBytes);
@@ -703,15 +713,22 @@ public class ProtoCodec {
     return ordinal;
   }
 
-  private static byte[] encodeWholeList(
-      long snapshotId, List<String> paths, Map<String, Integer> ordinals, int tableId)
-      throws IOException {
+  /** More than any ordinal the table has given: the counter, or past the largest pooled. */
+  private static int ordinalBound(Map<String, Integer> ordinals, int nextOrdinal) {
+    int bound = nextOrdinal;
+    for (int ordinal : ordinals.values()) {
+      bound = Math.max(bound, ordinal + 1);
+    }
+    return bound;
+  }
+
+  private static byte[] encodeWholeList(long snapshotId, int[] ordinals) throws IOException {
     ByteArrayOutputStream out = new BytesOut();
     writeFixed64(out, SMR_SNAPSHOT_ID, snapshotId);
-    if (!paths.isEmpty()) {
+    if (ordinals.length > 0) {
       ByteArrayOutputStream packed = new BytesOut();
-      for (String path : paths) {
-        org.intentlog.wire.ProtoWire.writeRawVarint(packed, ordinal(ordinals, path, tableId));
+      for (int ordinal : ordinals) {
+        org.intentlog.wire.ProtoWire.writeRawVarint(packed, ordinal);
       }
       writeLengthDelimited(out, SMR_ORDINALS, packed.toByteArray());
     }
@@ -719,8 +736,7 @@ public class ProtoCodec {
   }
 
   private static byte[] encodeListChange(
-      long snapshotId, int base, ManifestLists.Change change, List<String> paths,
-      Map<String, Integer> ordinals, int tableId) throws IOException {
+      long snapshotId, int base, ManifestLists.Change change, int[] ordinals) throws IOException {
     ByteArrayOutputStream out = new BytesOut();
     writeFixed64(out, SMR_SNAPSHOT_ID, snapshotId);
     writeVarint(out, SMR_BASE, base);
@@ -735,8 +751,7 @@ public class ProtoCodec {
       ByteArrayOutputStream packed = new BytesOut();
       for (int position : change.added) {
         org.intentlog.wire.ProtoWire.writeRawVarint(packed, position);
-        org.intentlog.wire.ProtoWire.writeRawVarint(
-            packed, ordinal(ordinals, paths.get(position), tableId));
+        org.intentlog.wire.ProtoWire.writeRawVarint(packed, ordinals[position]);
       }
       writeLengthDelimited(out, SMR_ADDED, packed.toByteArray());
     }
