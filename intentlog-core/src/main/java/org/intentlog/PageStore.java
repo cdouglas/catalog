@@ -47,4 +47,12 @@ public interface PageStore {
 
   /** The names of every page stored. */
   List<String> list();
+
+  /**
+   * Where the page {@code name} is, for a reader that reads it as a file (a copy of a table on a
+   * worker, through the table's FileIO); null if the store's pages are not files.
+   */
+  default String location(String name) {
+    return null;
+  }
 }

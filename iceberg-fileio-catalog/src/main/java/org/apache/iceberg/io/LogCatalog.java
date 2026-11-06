@@ -1413,6 +1413,12 @@ public class LogCatalog extends BaseMetastoreCatalog
       Map<Long, SnapshotPages.SealedBlock> sealed = state.sealedBlocks(tblId);
       String prefix = state.allManifestPrefixes().getOrDefault(tblId, "");
       org.intentlog.PageStore store = sealed.isEmpty() ? null : log.pages();
+      // A copy for a worker ships the inline snapshots and where the pages are, if they are files
+      FileIO pagesIO = tableIO.delegate();
+      java.util.function.Supplier<org.apache.iceberg.util.SerializableSupplier<List<Snapshot>>>
+          shipped = sealed.isEmpty() ? null
+              : () -> PagedSnapshots.of(fields.uuid, tblId, prefix, List.copyOf(snapshots), lists,
+                  pool, sealed, store, pagesIO);
       LazySnapshots all = new LazySnapshots(() -> {
         List<Snapshot> every = List.copyOf(snapshots);
         List<Snapshot> inlined;
@@ -1425,7 +1431,7 @@ public class LogCatalog extends BaseMetastoreCatalog
         return sealed.isEmpty()
             ? inlined
             : withSealed(inlined, made.pages(store, tblId, sealed, prefix), sealed);
-      });
+      }, shipped);
       return fields.toMetadata(location, wrapped, all);
     }
 
@@ -1479,12 +1485,28 @@ public class LogCatalog extends BaseMetastoreCatalog
    * drops what it made them from. A copy serialized with the metadata (Java serialization) holds
    * the snapshots, made then.
    */
-  static final class LazySnapshots implements org.apache.iceberg.util.SerializableSupplier<List<Snapshot>> {
+  static final class LazySnapshots implements org.apache.iceberg.ShippableSnapshots {
     private transient java.util.function.Supplier<List<Snapshot>> make;
+    // The form a copy of the table ships to a worker, made when asked; null: none (it ships all)
+    private transient java.util.function.Supplier<
+            org.apache.iceberg.util.SerializableSupplier<List<Snapshot>>> shipped;
     private List<Snapshot> made;
 
     LazySnapshots(java.util.function.Supplier<List<Snapshot>> make) {
+      this(make, null);
+    }
+
+    LazySnapshots(
+        java.util.function.Supplier<List<Snapshot>> make,
+        java.util.function.Supplier<org.apache.iceberg.util.SerializableSupplier<List<Snapshot>>>
+            shipped) {
       this.make = make;
+      this.shipped = shipped;
+    }
+
+    @Override
+    public synchronized org.apache.iceberg.util.SerializableSupplier<List<Snapshot>> shippable() {
+      return made == null && shipped != null ? shipped.get() : null;
     }
 
     @Override
@@ -1492,6 +1514,7 @@ public class LogCatalog extends BaseMetastoreCatalog
       if (made == null) {
         made = List.copyOf(make.get());
         make = null;
+        shipped = null;
       }
       return made;
     }

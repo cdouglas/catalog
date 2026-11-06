@@ -2,8 +2,8 @@
 
 Status: proposed 2026-11-04, revised 2026-11-05 after review; steps 1-3
 built (2026-11-05, measured in REPLAY_BENCH_RESULTS.md; step 3's worker copies
-move to step 4); step 4 built but for worker copies, off by default until
-fuzzed and measured; steps 5-6 not built.
+move to step 4); step 4 built and measured, off by default until fuzzed; steps 5-6 not
+built.
 Errata D18 (ML lists stored whole) tracks the problem; D17 (expiry starves)
 and D19 (whole-object compaction trigger) are what it costs. It is R2.1 and
 part of R2.2 in [CHECKPOINT_PLAN.md](CHECKPOINT_PLAN.md), under its
@@ -635,10 +635,8 @@ Each step stands alone and is measured before the next:
 4. **Sealing and pages.** The root's sealed blocks, the page store (shared
    with the committed set), refs moved back with proofs, and page GC; and
    `SerializableTable` shipping the head and a supplier that reads pages
-   (from step 3). Built 2026-11-05 but for `SerializableTable` (a copy still
-   ships every snapshot, which its supplier reads from the pages on the
-   driver), behind `fileio.catalog.snapshot.block` (0 until it is fuzzed and
-   measured; then 256) and `.window` (1,024), which the catalog's first
+   (from step 3). Built 2026-11-05/06, behind `fileio.catalog.snapshot.block`
+   (0 until it is fuzzed; then 256) and `.window` (1,024), which the catalog's first
    record fixes (`SetSnapshotPaging`, 28f8248). As built:
    - Replay seals (`SnapshotSealing`, d896226) after a delta or full update,
      the blocks the table's last sequence number passed, keeping refs'
@@ -662,6 +660,13 @@ Each step stands alone and is measured before the next:
      the pages its records drop, and the runtime deletes them once a root
      without them lands; `LogRuntime.sweep` deletes orphans
      (`StateMachine.garbagePages`; a5c8aaf).
+   - A copy for workers (`SerializableTable`) of a table whose history is
+     not loaded ships the snapshots its load holds and a supplier a worker
+     calls (the fork's `ShippableSnapshots`, atomicio 29e0a930c2): the inline
+     snapshots and their lists as a page, and where each sealed block's page
+     is, read through the table's FileIO (`PagedSnapshots`); a block no
+     compactor has stored goes with its page's bytes. A log whose pages are
+     not files (`PageStore.location`) ships every snapshot, as before.
    - Testing: `TestSnapshotPages`, `TestSnapshotPaging`, the suites with
      `-Dfileio.catalog.test.snapshot.block=4` (window 8) in the test JVM, and
      rounds with `SNAPSHOT_BLOCK=4` (fuzz/ce-fuzz). `CheckpointRoundTrip`

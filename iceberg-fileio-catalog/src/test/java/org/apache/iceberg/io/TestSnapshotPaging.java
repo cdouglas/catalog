@@ -309,4 +309,49 @@ class TestSnapshotPaging {
   private CatalogState root(String name) {
     return CatalogTestSupport.decodeCheckpoint(io.bytes(WAREHOUSE + "/catalog-" + name)).build();
   }
+
+  /**
+   * A copy of a paged table for a worker (SerializableTable, by Java serialization and by Kryo)
+   * ships the snapshots its load holds and where the sealed blocks' pages are (with the bytes of
+   * those no compactor has stored yet): the copy reads every snapshot from them, plans the files,
+   * time-travels to a sealed snapshot, and the original's history stays unloaded.
+   */
+  @ParameterizedTest
+  @EnumSource(names = {"APPEND_ML", "CAS_ML", "CAS_TM"})
+  void aCopyForAWorkerReadsTheHistoryFromThePages(LocalCatalogMode mode) throws Exception {
+    LogCatalog writer = mode.catalog(io, WAREHOUSE, "copies", paging(4, 8));
+    writer.createNamespace(Namespace.of("ns"));
+    Table table = writer.buildTable(TABLE, SCHEMA).withPartitionSpec(SPEC).create();
+    List<Long> ids = new ArrayList<>();
+    for (int i = 0; i < 40; i++) {
+      append(table, i);
+      ids.add(table.currentSnapshot().snapshotId());
+    }
+    Table loaded = mode.catalog(io, WAREHOUSE, "copies", paging(4, 8)).loadTable(TABLE);
+    TableMetadata lazy = current(loaded);
+
+    List<Table> copies = List.of(
+        org.apache.iceberg.TestHelpers.roundTripSerialize(
+            org.apache.iceberg.SerializableTable.copyOf(loaded)),
+        TestSerializableInlineTable.kryoRoundTrip(
+            org.apache.iceberg.SerializableTable.copyOf(loaded)));
+    assertThat(lazy).extracting("snapshotsLoaded").isEqualTo(false);
+    for (Table copy : copies) {
+      TableMetadata metadata = current(copy);
+      assertThat(metadata)
+          .extracting("snapshots")
+          .asInstanceOf(org.assertj.core.api.InstanceOfAssertFactories.list(Snapshot.class))
+          .hasSizeLessThan(ids.size());
+      assertThat(metadata.snapshots()).extracting(Snapshot::snapshotId)
+          .containsExactlyElementsOf(ids);
+      try (CloseableIterable<FileScanTask> tasks = copy.newScan().planFiles()) {
+        assertThat(Iterables.size(tasks)).isEqualTo(40);
+      }
+      try (CloseableIterable<FileScanTask> tasks =
+          copy.newScan().useSnapshot(ids.get(2)).planFiles()) {
+        assertThat(Iterables.size(tasks)).isEqualTo(3);
+      }
+    }
+    assertThat(lazy).extracting("snapshotsLoaded").isEqualTo(false);
+  }
 }

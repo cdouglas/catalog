@@ -341,6 +341,11 @@ public final class AtomicFileLog implements SharedLog {
     }
 
     @Override
+    public String location(String name) {
+      return prefix + name;
+    }
+
+    @Override
     public List<String> list() {
       if (!(io instanceof SupportsPrefixOperations)) {
         throw new UnsupportedOperationException(io + " cannot list " + prefix);
