@@ -670,7 +670,10 @@ Each step stands alone and is measured before the next:
    - Testing: `TestSnapshotPages`, `TestSnapshotPaging`, the suites with
      `-Dfileio.catalog.test.snapshot.block=4` (window 8) in the test JVM, and
      rounds with `SNAPSHOT_BLOCK=4` (fuzz/ce-fuzz). `CheckpointRoundTrip`
-     checks every root's pages. The TLA+ models do not have pages yet.
+     checks every root's pages. The file model (`spec/tla`) has the state's
+     pages: puts before the root, sweeps from any view, and two bug switches
+     (a root before its pages; a sweep that ignores versions) that break
+     `StatePagesExist`; the shared-log model does not have them yet.
 5. **Re-inlining at any depth.** Import pages, the FULL record that names
    them, their GC, and a maintenance call that re-inlines a pointer table
    without a data commit.

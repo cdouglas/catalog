@@ -42,12 +42,13 @@ BASE = {
     "MaxSweep": "0",
     "BlockIds": "1",
     "GridBits": "3",
+    "SealEvery": "0",
     "Bugs": "{}",
 }
 
 SAFETY = ["Readable", "ExactlyOnce", "Serializable", "UniqueIds", "HonestCommitted",
           "HonestFailed", "UnknownExplained", "SoloCommits", "StampsCount", "PagesExist",
-          "PagesExact", "Shape", "OnGrid"]
+          "PagesExact", "Shape", "OnGrid", "StatePagesExist"]
 ACTIONS = ["HistGrows", "CasAppliesItsRecord", "CheckpointIsReplay"]
 
 ALL_FAULTS = ('{"failBefore", "lostReply", "landedConflict", "throttled", '
@@ -58,6 +59,8 @@ FUZZER_FAULTS = ('{"failBefore", "lostReply", "landedConflict", "throttled", '
 # of 8), a tick so that ids land in two blocks, one sweep.
 FPAGE = {"Paging": "TRUE", "Shapes": "<- TwoEach", "MaxCount": "1", "MaxTime": "1",
          "MaxSweep": "1"}
+SPAGE = {"Paging": "TRUE", "Shapes": "<- Long", "MaxCount": "1", "MaxTime": "1",
+         "MaxSweep": "2", "SealEvery": "1"}
 FPAGE_FAULTS = ('{"failBefore", "lostReply", "landedConflict", "throttled", '
                 '"landedThrottled", "inflight", "readFail", "pageFail", "putFail", "putLost"}')
 # What the catalog fuzzers draw (no late landings), with the page store's faults.
@@ -164,6 +167,13 @@ CONFIGS = {
     "mintH": ({**FPAGE, "Skew": "<- Behind2", "Bugs": '{"mintH"}'},
               {"CasAppliesItsRecord", "SoloCommits"}),
     "pageown": ({**FPAGE, "Bugs": '{"pageown"}'}, {"CasAppliesItsRecord"}),
+    # The state's pages (SNAPSHOT_PAGING.md "Testing"): an entity's history seals into a page
+    # at each version and drops one behind (SealEvery 1); writer 1 writes "a" three times.
+    "statepages": (SPAGE, "pass"),
+    # A root written before its pages are put.
+    "rootfirst": ({**SPAGE, "Bugs": '{"rootfirst"}'}, {"StatePagesExist"}),
+    # A sweep from a stale view that deletes every page it does not name, whatever version.
+    "sweepstale": ({**SPAGE, "Bugs": '{"sweepstale"}'}, {"StatePagesExist"}),
 }
 
 
@@ -189,6 +199,7 @@ LOG_BASE = {
     "MaxSweep": "0",
     "BlockIds": "1",
     "GridBits": "3",
+    "SealEvery": "0",
     "Bugs": "{}",
 }
 

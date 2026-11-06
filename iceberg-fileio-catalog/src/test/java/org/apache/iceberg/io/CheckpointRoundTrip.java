@@ -121,7 +121,7 @@ public final class CheckpointRoundTrip {
         throw new AssertionError("the committed set of " + location + ": " + problem);
       }
       String snapshots = snapshotPagesProblem(CatalogTestSupport.decodeCheckpoint(file).build(),
-          name -> io.bytes(location + ".committed/" + name));
+          CatalogTestSupport.replay(file).state(), name -> io.bytes(location + ".committed/" + name));
       if (snapshots != null) {
         throw new AssertionError("the root of " + location + ": " + snapshots);
       }
@@ -129,19 +129,28 @@ public final class CheckpointRoundTrip {
   }
 
   /**
-   * Why the snapshot pages the root {@code state} (a checkpoint's) names are not as it says, or
-   * null if they are (SNAPSHOT_PAGING.md, "Testing"): each sealed block's page exists ({@code
-   * pages} by name: a compactor puts a root's pages before the root), decodes as the page its
-   * name names, of the block's table and block, holds the block's live snapshots, and its leaves
-   * hash to the block's Merkle root.
+   * Why the snapshot pages the root {@code state} (a checkpoint's) names, and the log replayed
+   * through its tail ({@code replayed}) still names, are not as they say, or null if they are
+   * (SNAPSHOT_PAGING.md, "Testing"; TLA+ StatePagesExist): each such sealed block's page exists
+   * ({@code pages} by name: a compactor puts a root's pages before the root), decodes as the page
+   * its name names, of the block's table and block, holds the block's live snapshots, and its
+   * leaves hash to the block's Merkle root. A page a record after the root dropped is garbage
+   * once that record is in the log, which a reader replays before it loads.
    */
-  static String snapshotPagesProblem(CatalogState state, Function<String, byte[]> pages) {
+  static String snapshotPagesProblem(
+      CatalogState state, CatalogState replayed, Function<String, byte[]> pages) {
+    java.util.Set<String> named = new java.util.HashSet<>();
+    replayed.allSealedBlocks().forEach((tblId, blocks) ->
+        blocks.values().forEach(block -> named.add(block.pageName(tblId))));
     for (Map.Entry<Integer, java.util.SortedMap<Long, SnapshotPages.SealedBlock>> table :
         state.allSealedBlocks().entrySet()) {
       int tblId = table.getKey();
       String prefix = state.allManifestPrefixes().getOrDefault(tblId, "");
       for (SnapshotPages.SealedBlock block : table.getValue().values()) {
         String name = block.pageName(tblId);
+        if (!named.contains(name)) {
+          continue;
+        }
         byte[] body = pages.apply(name);
         if (body == null) {
           return "page " + name + ", which the root names, does not exist";
@@ -240,7 +249,7 @@ public final class CheckpointRoundTrip {
     byte[] newest = new java.util.TreeMap<>(log.checkpoints()).lastEntry().getValue();
     String snapshots = snapshotPagesProblem(
         CatalogTestSupport.decodeCheckpoint(AtomicFileLog.encode(newest, List.of())).build(),
-        stored::get);
+        CatalogTestSupport.replay(AtomicFileLog.encode(first, records)).state(), stored::get);
     if (snapshots != null) {
       violations.add("the newest checkpoint's root: " + snapshots);
     }

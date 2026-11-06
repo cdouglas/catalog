@@ -64,7 +64,7 @@ ASSUME /\ FaultKinds \subseteq WriteFaults \cup ReadFaults \cup PutFaults
        /\ Bugs \subseteq {"10", "12", "16", "17", "18", "25", "26",
                           "64a", "64b", "64c", "64d", "66", "ckgc", "basever",
                           "floorgap", "nodigest", "absentpage", "sweepabove", "mintH",
-                          "pageown"}
+                          "pageown", "rootfirst", "sweepstale"}
 
 VARIABLES
   file,      \* the catalog object: [gen, chk: [st, C, H], log, segs]
@@ -78,10 +78,11 @@ VARIABLES
   sched,     \* [active, nest: the operations running; pre: how many ran inside the
              \*  active one; racers: who ran inside one]
   store,     \* the page store: the names of the pages in it
-  nsw        \* sweeps so far
+  nsw,       \* sweeps so far
+  spages     \* the state's pages stored (SNAPSHOT_PAGING.md): [e, v] names
 
-vars == <<file, inflight, now, nf, ws, ended, res, ook, sched, store, nsw>>
-PageVars == <<store, nsw>>
+vars == <<file, inflight, now, nf, ws, ended, res, ook, sched, store, nsw, spages>>
+PageVars == <<store, nsw, spages>>
 
 -----------------------------------------------------------------------------
 (* The catalog object, and reads of it *)
@@ -557,11 +558,30 @@ PrepCas(w, fk) ==
      /\ fk \in {"none"} \cup (IF CanFault(w) /\ pgs # {} THEN FaultKinds \cap PutFaults ELSE {})
      /\ UseFault(fk)
      /\ store' = IF fk = "putFail" THEN store ELSE store \cup pgs
+     \* The state's pages the checkpoint names are put first (LogRuntime.checkpoint);
+     \* with "rootfirst", a root goes without them
+     /\ spages' = IF Has("rootfirst") THEN spages ELSE spages \cup pl.chk.st.sealed
      /\ ws' = [ws EXCEPT ![w] =
                  [Faulted(s, fk) EXCEPT
                     !.pay = IF fk = "none" THEN pl
                             ELSE [pl EXCEPT !.log = SelectSeq(@, LAMBDA r : ~IsPo(r))]]]
      /\ UNCHANGED <<file, inflight, now, ended, res, ook, sched, nsw>>
+
+\* The state's pages garbage under view a (CatalogStateMachine.garbagePages): sealed
+\* at a version a has reached and not named by it. A page sealed after a, or
+\* named by it, stays. With "sweepstale", every page a does not name.
+StateGarbage(a) ==
+  {p \in spages : p \notin a.st.sealed /\ (Has("sweepstale") \/ p.v <= a.st.ver[p.e])}
+
+\* A sweep of the state's pages from a writer's view, however stale (its
+\* snapshot): LogRuntime.sweep(replica).
+SweepState(w) ==
+  LET a == ws[w].snap
+      del == IF a = None THEN {} ELSE StateGarbage(a)
+  IN /\ SealEvery > 0 /\ nsw < MaxSweep /\ del # {}
+     /\ spages' = spages \ del
+     /\ nsw' = nsw + 1
+     /\ UNCHANGED <<file, inflight, now, nf, ws, ended, res, ook, sched, store>>
 
 \* A sweep (any compactor) lists the page store and deletes every page the
 \* live catalog does not reference whose node ends at or below its floor:
@@ -574,7 +594,7 @@ Sweep ==
   IN /\ Paging /\ nsw < MaxSweep /\ del # {}
      /\ store' = store \ del
      /\ nsw' = nsw + 1
-     /\ UNCHANGED <<file, inflight, now, nf, ws, ended, res, ook, sched>>
+     /\ UNCHANGED <<file, inflight, now, nf, ws, ended, res, ook, sched, spages>>
 
 Tick ==
   /\ (Retention >= 0 \/ Paging) /\ now < MaxTime
@@ -598,6 +618,7 @@ Init ==
   /\ sched = [active |-> None, nest |-> None, pre |-> 0, racers |-> {}]
   /\ store = {}
   /\ nsw = 0
+  /\ spages = {}
 
 WriterNext(w) ==
   \/ Begin(w)
@@ -609,6 +630,7 @@ WriterNext(w) ==
          \/ FreshForCAS(w, fk) \/ Resolve(w, fk) \/ FinalRead(w, fk) \/ Restage(w, fk)
   \/ Exhaust(w)
   \/ \E fk \in PutFaults \cup {"none"} : PrepCas(w, fk)
+  \/ SweepState(w)
 
 Next ==
   \/ \E w \in Writers : WriterNext(w)
@@ -684,6 +706,16 @@ CheckpointIsReplay ==
 \* is in the store, and holds exactly the ids that applied in its range.
 \* The set keeps its shape; every stamp lies on the grid.
 PagesExist == PagesExistIn(LiveR, store)
+
+\* The state's pages (SNAPSHOT_PAGING.md "Testing", oracle 1): every page the
+\* catalog object's root names, and the catalog still names, is in the store: a
+\* compactor puts a root's pages before writing it, and a sweep deletes none a
+\* reader of the object may need. A page a record after the root dropped (an
+\* expiry that emptied its block) is garbage once that record is in the log: a
+\* reader replays it before it loads; one that loaded before fails, as Iceberg's
+\* readers do once an expiry deletes a manifest list. A page the catalog names
+\* that the root does not is pending: the next root's compactor puts it.
+StatePagesExist == \A p \in file.chk.st.sealed \cap LiveR.st.sealed : p \in spages
 PagesExact == PagesExactIn(LiveR, Hist)
 Shape == SetShape(LiveR)
 OnGrid == OnGridIn(file.log)
@@ -691,6 +723,7 @@ OnGrid == OnGridIn(file.log)
 Safety ==
   Readable /\ ExactlyOnce /\ Serializable /\ UniqueIds
     /\ HonestCommitted /\ HonestFailed /\ UnknownExplained /\ PagesExist /\ PagesExact
+    /\ StatePagesExist
 
 \* Every writer finishes.
 Termination == <>[](\A w \in Writers : ws[w].pc = "idle" /\ ws[w].k > Len(Shapes[w]))

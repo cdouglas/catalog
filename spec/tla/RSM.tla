@@ -23,7 +23,9 @@ CONSTANTS
   None,      \* no value
   Bugs,      \* bugs put back, by name (strings); each model says which it has
   BlockIds,  \* N: the most inline ids a block holds (a level-0 block may hold more)
-  GridBits   \* the grid's height: stamps lie in 0 .. 2^GridBits - 1
+  GridBits,  \* the grid's height: stamps lie in 0 .. 2^GridBits - 1
+  SealEvery  \* the state's pages (SNAPSHOT_PAGING.md): an entity's history seals into a page at
+             \* each multiple of SealEvery of its version; 0 pages nothing
 
 Has(b) == b \in Bugs
 Max(a, b) == IF a > b THEN a ELSE b
@@ -32,8 +34,20 @@ SetMax(S) == CHOOSE x \in S : \A y \in S : y <= x
 
 \* The state a checkpoint holds. `made` holds the entities creates added:
 \* [id, p] for an entity with id `id` under `p`. `next` is the next id
-\* replay binds (Checkpoint.next_table_id). `hist` is a ghost.
-InitSt == [ver |-> [e \in Entities |-> 1], made |-> {}, next |-> 1, hist |-> << >>]
+\* replay binds (Checkpoint.next_table_id). `hist` is a ghost. `sealed` names
+\* the state's pages ([e, v]: entity e's history sealed at its version v), as a
+\* root names its sealed snapshot blocks.
+InitSt == [ver |-> [e \in Entities |-> 1], made |-> {}, next |-> 1, hist |-> << >>,
+           sealed |-> {}]
+
+\* The pages a record that moves the entities `wr` to versions `nv` seals, and
+\* those it drops (an expiry that empties an older block: the one sealed
+\* SealEvery before, at each multiple of 2 * SealEvery). A function of the
+\* log alone, so every replica names the same pages (SnapshotSealing).
+Sealed(old, wr, nv) ==
+  IF SealEvery = 0 THEN old
+  ELSE (old \ {[e |-> e, v |-> nv[e] - SealEvery] : e \in {x \in wr : nv[x] % (2 * SealEvery) = 0}})
+       \cup {[e |-> e, v |-> nv[e]] : e \in {x \in wr : nv[x] % SealEvery = 0}}
 
 \* Intention.verify: the record's reads hold.
 Verify(st, r) == \A e \in DOMAIN r.rd : st.ver[e] = r.rd[e]
@@ -49,14 +63,17 @@ BindId(st, r) == IF r.cid > 0 THEN r.cid ELSE st.next
 \* base + 1 does, which a conflict encoding that admits a record on a later
 \* version makes go back.
 Apply(st, r) ==
-  LET id == BindId(st, r) IN
-  [ver  |-> [e \in Entities |->
+  LET id == BindId(st, r)
+      nv == [e \in Entities |->
                IF e \in r.wr THEN (IF Has("basever") THEN r.wv[e] ELSE st.ver[e]) + 1
-               ELSE st.ver[e]],
+               ELSE st.ver[e]]
+  IN
+  [ver  |-> nv,
    made |-> IF r.cr = None THEN st.made
             ELSE {m \in st.made : m.id # id} \cup {[id |-> id, p |-> r.cr]},
    next |-> IF r.cr = None THEN st.next ELSE Max(st.next, id + 1),
-   hist |-> Append(st.hist, r)]
+   hist |-> Append(st.hist, r),
+   sealed |-> Sealed(st.sealed, r.wr, nv)]
 
 -----------------------------------------------------------------------------
 (* The committed set (CommittedSet), paged as docs/COMMITTED_PAGING.md

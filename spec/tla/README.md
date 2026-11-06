@@ -836,6 +836,40 @@ log (`CheckpointRoundTrip.assertPagesExist`), and the race property's
 schedules page: its setup's ids are older, in blocks a racer seals before A
 writes.
 
+## The state's pages
+
+`docs/SNAPSHOT_PAGING.md` step 4 pages a table's old snapshots out of the root:
+the state machine itself names pages, which a compactor puts before the root
+that names them. The file model has them (the shared log does not yet:
+`SealEvery` is 0 in every `log-*` configuration).
+
+- **The state** (`RSM.tla`) holds `sealed`, the names of its pages: `[e, v]`,
+  entity `e`'s history sealed at its version `v`. A record that moves `e` to a
+  multiple of `SealEvery` seals one; one that moves it to a multiple of
+  `2 * SealEvery` drops the one before (an expiry that empties a block). A
+  function of the log, so every replica names the same pages.
+- **Puts.** `PrepCas` puts the pages of the root a CAS writes before the CAS
+  (`LogRuntime.checkpoint`). A page a record seals after the root is pending:
+  the next root's compactor puts it. Put faults touch only the committed set's
+  pages here; the Java fails the checkpoint on a failed state put.
+- **Sweeps.** `SweepState(w)` deletes from writer `w`'s snapshot, however
+  stale, the pages garbage under it (`CatalogStateMachine.garbagePages`):
+  sealed at a version it has reached and not named by it.
+- **`StatePagesExist`**: every page the root names that the catalog still
+  names is in the store. A page a record after the root dropped is garbage
+  once that record is in the log: a reader replays it before it loads (one
+  that loaded before fails, as Iceberg's readers do once an expiry deletes a
+  manifest list). The first version required every page the root names, and
+  TLC found a sweep from the live state deleting a page a later record had
+  dropped: the property was too strong, not the protocol.
+  `CheckpointRoundTrip.snapshotPagesProblem` checks the same in Java.
+
+| Configuration | Expect | What |
+|---|---|---|
+| `statepages` | pass | writer 1 writes `a` three times (`SealEvery` 1: seals at each version, drops one behind), CAS every commit, sweeps |
+| `rootfirst` | `StatePagesExist` | a root written before its pages are put |
+| `sweepstale` | `StatePagesExist` | a sweep that deletes every page its (stale) view does not name, whatever version |
+
 ## History
 
 This replaces `FileIOCatalog.tla` (PR #1; last changed 2026-10-14 for Bug 10). It
