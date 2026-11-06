@@ -312,20 +312,25 @@ class TestSnapshotPaging {
   }
 
   /**
-   * A handle loaded before its table's pages were collected (here, the table was evicted to a
-   * pointer and a root without its blocks landed) cannot load the history it held, as Iceberg's
-   * readers cannot once an expiry deletes a manifest list: its reads fail as not found, and a
-   * commit staged on it fails as stale, which a refresh cures (fault round, B = 2, W = 1). A page
-   * the table still names that the store lost is never taken for collected.
+   * A handle loaded before its table's pages were collected reads its version's snapshots from
+   * the table as it is now (SNAPSHOT_PAGING.md, "Page GC"), as a REST catalog's lazy load does:
+   * all of them after the table was evicted to a pointer and its pages went (fault round, B = 2,
+   * W = 1, where a stale handle's schema update staged on such metadata), those not expired since
+   * after an expiry emptied their blocks (round sp5-r0: a stale handle's history, before an expiry
+   * and before any command of the differential test's), and none, as not found, once the table is
+   * dropped. A commit staged on it fails as stale, which a refresh cures. A page the table still
+   * names that the store lost is never taken for collected.
    */
   @ParameterizedTest
   @EnumSource(names = {"CAS_TM", "CAS_ML"})
-  void aStaleHandleFindsCollectedPagesGone(LocalCatalogMode mode) throws Exception {
+  void aStaleHandleReadsCollectedPagesAsTheTableIsNow(LocalCatalogMode mode) throws Exception {
     LogCatalog writer = mode.catalog(io, WAREHOUSE, "stale", paging(2, 1));
     writer.createNamespace(Namespace.of("ns"));
     Table table = writer.buildTable(TABLE, SCHEMA).withPartitionSpec(SPEC).create();
+    List<Long> ids = new ArrayList<>();
     for (int i = 0; i < 12; i++) {
       append(table, i);
+      ids.add(table.currentSnapshot().snapshotId());
     }
     Table stale = mode.catalog(io, WAREHOUSE, "stale", paging(2, 1)).loadTable(TABLE);
     int tblId = writer.log().read().state().tableId(TABLE);
@@ -340,20 +345,38 @@ class TestSnapshotPaging {
     append(pointer.loadTable(TABLE), 13); // a root without its blocks: their pages go
     assertThat(writer.log().pages().list()).doesNotContainAnyElementsOf(named);
 
-    assertThatThrownBy(() -> current(stale).snapshots())
-        .isInstanceOf(org.apache.iceberg.exceptions.NotFoundException.class)
-        .hasMessageContaining("are gone");
+    assertThat(ids(current(stale).snapshots())).containsExactlyElementsOf(ids);
     // A schema update commits on the metadata it was made from (a properties update refreshes)
     assertThatThrownBy(
             () -> stale.updateSchema().addColumn("c", Types.IntegerType.get()).commit())
-        .isInstanceOf(org.apache.iceberg.exceptions.CommitFailedException.class)
-        .hasMessageContaining("are gone");
+        .isInstanceOf(org.apache.iceberg.exceptions.CommitFailedException.class);
     stale.refresh();
     stale.updateSchema().addColumn("c", Types.IntegerType.get()).commit();
     assertThat(writer.loadTable(TABLE).schema().findField("c")).isNotNull();
     assertThat(Iterables.size(writer.loadTable(TABLE).snapshots())).isEqualTo(14);
 
-    // Lost, not collected: the table still names the page (the re-inlining's import pages)
+    // An expiry that empties blocks: their snapshots are gone, the others read as they are now
+    for (int i = 14; i < 20; i++) {
+      append(writer.loadTable(TABLE), i);
+    }
+    Table before = mode.catalog(io, WAREHOUSE, "stale", paging(2, 1)).loadTable(TABLE);
+    List<Long> held = ids(writer.loadTable(TABLE).snapshots());
+    List<String> sealedThen = new ArrayList<>();
+    for (SnapshotPages.SealedBlock block : root("stale").sealedBlocks(tblId).values()) {
+      sealedThen.add(block.pageName(tblId));
+    }
+    Table expiring = writer.loadTable(TABLE);
+    expiring.expireSnapshots().expireOlderThan(expiring.snapshot(held.get(6)).timestampMillis())
+        .retainLast(1).cleanExpiredFiles(false).commit();
+    append(writer.loadTable(TABLE), 20); // a root after the expiry (CAS: every commit)
+    assertThat(writer.log().pages().list()).doesNotContainAnyElementsOf(sealedThen.subList(0, 1));
+    List<Long> left = ids(writer.loadTable(TABLE).snapshots());
+    assertThat(ids(current(before).snapshots()))
+        .containsExactlyElementsOf(held.stream().filter(left::contains)
+            .collect(Collectors.toList()))
+        .doesNotContainAnyElementsOf(held.subList(0, 6));
+
+    // Lost, not collected: the table still names the page
     CatalogState state = writer.log().read().state();
     assertThat(state.sealedBlocks(tblId)).isNotEmpty();
     Table loaded = mode.catalog(io, WAREHOUSE, "stale", paging(2, 1)).loadTable(TABLE);
@@ -364,6 +387,21 @@ class TestSnapshotPaging {
     }
     assertThatThrownBy(() -> current(loaded).snapshots())
         .isInstanceOf(SnapshotPages.MissingPage.class);
+
+    // A dropped table's are gone
+    Table dropped = mode.catalog(io, WAREHOUSE, "stale", paging(2, 1)).loadTable(TABLE);
+    writer.dropTable(TABLE, false);
+    append(writer.buildTable(TableIdentifier.of("ns", "other"), SCHEMA)
+        .withPartitionSpec(SPEC).create(), 0); // a root without the table
+    assertThatThrownBy(() -> current(dropped).snapshots())
+        .isInstanceOf(org.apache.iceberg.exceptions.NotFoundException.class)
+        .hasMessageContaining("are gone");
+  }
+
+  private static List<Long> ids(Iterable<Snapshot> snapshots) {
+    List<Long> ids = new ArrayList<>();
+    snapshots.forEach(snapshot -> ids.add(snapshot.snapshotId()));
+    return ids;
   }
 
   /**

@@ -434,8 +434,8 @@ public class LogCatalog extends BaseMetastoreCatalog
   /**
    * A table's snapshots as a read of the catalog held them, which a page holds that has been
    * collected since: the table has moved past that version, or is gone (SNAPSHOT_PAGING.md, "Page
-   * GC"). A reader holding metadata from before then cannot load them, as Iceberg's readers
-   * cannot once an expiry deletes a manifest list; a commit staged on that read fails as stale.
+   * GC"). A load holding that read reads them from the table as it is now, and finds them gone
+   * only with the table; a commit staged on that read fails as stale.
    */
   static final class PageCollectedException extends org.apache.iceberg.exceptions.NotFoundException {
     PageCollectedException(
@@ -1114,9 +1114,9 @@ public class LogCatalog extends BaseMetastoreCatalog
     /**
      * What a page missing from the store means for the table's snapshots as {@code read} holds
      * them (SNAPSHOT_PAGING.md, "Page GC"): collected, if the table has since moved past that
-     * version or is gone, and the catalog no longer names the page, as Iceberg's readers find a
-     * manifest list an expiry deleted ({@link PageCollectedException}); else lost, which is never
-     * right ({@code e}).
+     * version or is gone, and the catalog no longer names the page ({@link
+     * PageCollectedException}: a load then reads the snapshots from the table as it is now, and a
+     * commit fails as stale); else lost, which is never right ({@code e}).
      */
     private RuntimeException missing(SnapshotPages.MissingPage e, CatalogState read) {
       CatalogState now = log.read().state();
@@ -1616,10 +1616,56 @@ public class LogCatalog extends BaseMetastoreCatalog
         try {
           return withSealed(inlined, made.pages(store, tblId, sealed, prefix), sealed);
         } catch (SnapshotPages.MissingPage e) {
-          throw missing(e, state);
+          RuntimeException failure = missing(e, state);
+          if (failure instanceof PageCollectedException) {
+            return asNow(inlined, sealed, tblId, (PageCollectedException) failure);
+          }
+          throw failure;
         }
       }, shipped);
       return fields.toMetadata(location, wrapped, all);
+    }
+
+    /**
+     * The snapshots of a version whose pages were collected since its load (SNAPSHOT_PAGING.md,
+     * "Page GC"): {@code inlined}, and those of its sealed blocks' live snapshots that the table
+     * still has, from a load of the table as it is now (a snapshot never changes, wherever the
+     * table keeps it: inline, in a page, in a metadata file). Those expired since are gone, as they
+     * are from a REST catalog's lazy load, whose supplier loads the table as it is when asked
+     * (TableMetadata keeps what the supplier gives of the snapshots it inherited). If the table is
+     * gone, so are they ({@code collected}).
+     */
+    private List<Snapshot> asNow(
+        List<Snapshot> inlined, Map<Long, SnapshotPages.SealedBlock> sealed, int tblId,
+        PageCollectedException collected) {
+      Replica<CatalogState> now = log.read();
+      TableIdentifier named = null;
+      for (TableIdentifier ident : now.state().tables()) {
+        if (Integer.valueOf(tblId).equals(now.state().tableId(ident))) {
+          named = ident;
+          break;
+        }
+      }
+      if (named == null) {
+        throw collected;
+      }
+      Map<Long, Snapshot> current = new HashMap<>();
+      FileIOTableOperations ops = new FileIOTableOperations(
+          named, log, tableIO.delegate(), inline, inlineSnapshots, now);
+      for (Snapshot snapshot : ops.current().snapshots()) {
+        current.put(snapshot.snapshotId(), snapshot);
+      }
+      List<Snapshot> every = new ArrayList<>(inlined);
+      for (SnapshotPages.SealedBlock block : sealed.values()) {
+        for (long id : block.liveIds) {
+          Snapshot snapshot = current.get(id);
+          if (snapshot != null) {
+            every.add(snapshot);
+          }
+        }
+      }
+      every.sort(Comparator.comparingLong(Snapshot::sequenceNumber));
+      return every;
     }
 
     /**

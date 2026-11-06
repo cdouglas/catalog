@@ -22,8 +22,10 @@ import static org.apache.iceberg.types.Types.NestedField.optional;
 import static org.apache.iceberg.types.Types.NestedField.required;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import net.jqwik.api.Arbitraries;
 import net.jqwik.api.Arbitrary;
 import net.jqwik.api.Combinators;
@@ -316,7 +318,12 @@ final class TableScript {
           if (member == null || member.kind == Kind.REPLACE) {
             throw new IllegalStateException("no command for the stale handle");
           }
-          run(member, handle);
+          // A stale handle's history is its version's, less what expired since: a paging catalog's
+          // lazy load reads collected pages as the table is now, as REST's does (SNAPSHOT_PAGING.md,
+          // "Page GC"), where a pointer handle holds them all. Both pick among those it still has
+          Set<Long> still = new HashSet<>();
+          other.loadTable(ID).snapshots().forEach(s -> still.add(s.snapshotId()));
+          run(member, handle, still);
         } catch (RuntimeException e) {
           trace.append("  skipped: ").append(e).append('\n');
           return e;
@@ -387,8 +394,16 @@ final class TableScript {
     }
 
     private void run(Cmd cmd, Table target) {
+      run(cmd, target, null);
+    }
+
+    /** Runs {@code cmd} on {@code target}, picking among its snapshots in {@code still}, if any. */
+    private void run(Cmd cmd, Table target, Set<Long> still) {
       List<Snapshot> snapshots = new ArrayList<>();
       target.snapshots().forEach(snapshots::add);
+      if (still != null) {
+        snapshots.removeIf(s -> !still.contains(s.snapshotId()));
+      }
       switch (cmd.kind) {
         case FAST_APPEND:
           target.newFastAppend().appendFile(newFile(target, cmd.c)).commit();

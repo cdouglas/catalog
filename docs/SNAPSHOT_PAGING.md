@@ -380,16 +380,33 @@ the root (one a compactor ahead wrote) is not garbage.
 - On a shared log with checkpoints apart, the sweep counts every checkpoint
   the provider may still serve, not only the newest.
 - A reader holding metadata from before a block emptied, or from before its
-  table was evicted or dropped, cannot load the snapshots it held. Iceberg's
-  readers fail the same way once an expiry deletes a manifest list. As built
-  (found by a fault round at B = 2, W = 1, where a stale handle's schema
-  update staged on such metadata): a load whose page is missing reads the
-  catalog again, and if the table has moved past the version it read (or is
-  gone) and no longer names the page, fails as not found
-  (`LogCatalog.PageCollectedException`, a `NotFoundException`), and a commit
-  staged on that read fails as stale (`CommitFailedException`), which
-  Iceberg's retry cures with a refresh. A missing page the table still names
-  is a loss, never taken for collected (`SnapshotPages.MissingPage`).
+  table was evicted, reads the snapshots it held from the table as it is
+  now, less those expired since. That is a REST catalog's lazy load: its
+  supplier loads the table as it is when asked, and Iceberg's
+  `TableMetadata` keeps what the supplier gives of the snapshots it
+  inherited and drops those past its last sequence number. A pointer
+  handle holds them all. As built: a load whose page is missing reads the
+  catalog again. If the table has moved past the version it read and no
+  longer names the page, the page was collected, and the load answers with
+  its version's inline snapshots and those of its sealed blocks' live ids
+  that a load of the table now has (a snapshot never changes, wherever the
+  table keeps it). Only a dropped table's are gone
+  (`LogCatalog.PageCollectedException`, a `NotFoundException`). A commit
+  staged on such a read fails as stale (`CommitFailedException`), which
+  Iceberg's retry cures with a refresh. A missing page the table still
+  names is a loss, never taken for collected (`SnapshotPages.MissingPage`).
+  Found by fault rounds at B = 2, W = 1: a stale handle's schema update
+  staged on such metadata (step 5, which first failed the load as not
+  found), then, in round sp5-r0, stale handles' histories, which Iceberg
+  and its callers read outside the commit retry (an expiry's choice of
+  snapshot, every command of the differential test's): not found there
+  was a failure where a pointer catalog succeeds. The differential test's
+  stale steps pick among the snapshots the table still has, where both
+  catalogs agree.
+- A copy shipped to a worker reads its version's pages through the table's
+  FileIO and has no catalog to ask: a page collected since fails there, as
+  a lost one does. That takes a job outliving its table's move past the
+  version it shipped, and a compaction after (open).
 
 A table outlives its blocks. Its head is never sealed (a ref's target stays
 inline, [Blocks](#blocks)), and Iceberg's expiry never removes it: main is
@@ -709,7 +726,8 @@ Each step stands alone and is measured before the next:
      time travel and a rollback into an imported block; an import whose
      record does not land is rejected and its pages swept; the checks; a
      v3-upgraded table back after its eviction, errata D22; a stale handle
-     whose pages were collected), and a `REINLINE` operation in
+     whose pages were collected, read as the table is now: "Page GC"), and a
+     `REINLINE` operation in
      `TestCatalogFaultProperties`, whose other re-inlining commits also
      import when the suite pages. At B = 4, W = 8 its 40-operation schedules
      reach no import (a probe counted none in 200 tries); at B = 2, W = 1,
