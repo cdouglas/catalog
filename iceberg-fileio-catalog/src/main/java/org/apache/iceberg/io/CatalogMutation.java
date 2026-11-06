@@ -75,6 +75,8 @@ public class CatalogMutation {
   // Companion to {@link #inlineTableUpdates} for an inline table: the snapshots of the version
   // read that the update drops, its metadata holding only those that version lacks
   private final Map<TableIdentifier, long[]> inlineTableUpdateRemovals;
+  // The sealed snapshots an inline update brings back, with their proofs (SNAPSHOT_PAGING.md)
+  private final Map<TableIdentifier, List<SnapshotPages.BroughtBack>> inlineTableBroughtBack;
   // Codec tags parallel to inlineTables / inlineTableUpdates.
   private final Map<TableIdentifier, Byte> inlineTableCodecs;
   private final Map<TableIdentifier, Byte> inlineTableUpdateCodecs;
@@ -100,6 +102,7 @@ public class CatalogMutation {
     this.inlineTableCreateDeltas = Maps.newHashMap();
     this.inlineTableUpdateMlDeltas = Maps.newHashMap();
     this.inlineTableUpdateRemovals = Maps.newHashMap();
+    this.inlineTableBroughtBack = Maps.newHashMap();
     this.inlineTableCodecs = Maps.newHashMap();
     this.inlineTableUpdateCodecs = Maps.newHashMap();
     this.tableRenames = Maps.newHashMap();
@@ -314,6 +317,7 @@ public class CatalogMutation {
     inlineTableUpdateCodecs.remove(tableId);
     inlineTableUpdateMlDeltas.remove(tableId);
     inlineTableUpdateRemovals.remove(tableId);
+    inlineTableBroughtBack.remove(tableId);
     inlineTableDeltaUpdates.remove(tableId);
     tables.put(tableId, null);
     return this;
@@ -386,6 +390,21 @@ public class CatalogMutation {
    */
   public CatalogMutation removingSnapshots(TableIdentifier table, long[] removed) {
     inlineTableUpdateRemovals.put(table, removed);
+    return this;
+  }
+
+  /**
+   * Makes the inline update of {@code table} (delta or full) bring {@code back} inline first:
+   * sealed snapshots its refs move onto, each with the proof replay checks against the root
+   * (SNAPSHOT_PAGING.md, "Bringing a sealed snapshot back").
+   */
+  public CatalogMutation bringingBack(
+      TableIdentifier table, List<SnapshotPages.BroughtBack> back) {
+    if (back.isEmpty()) {
+      inlineTableBroughtBack.remove(table);
+    } else {
+      inlineTableBroughtBack.put(table, back);
+    }
     return this;
   }
 
@@ -627,6 +646,7 @@ public class CatalogMutation {
         if (removed != null) {
           update = update.headOnly(removed);
         }
+        update = update.bringingBack(inlineTableBroughtBack.getOrDefault(ident, List.of()));
         actions.add(pinned.contains(ident) ? update.pin() : update);
       }
     }
@@ -639,7 +659,8 @@ public class CatalogMutation {
       if (tblId != null) {
         int version = original.tableVersion(tblId);
         ProtoCodec.UpdateTableInlineAction update =
-            ProtoCodec.UpdateTableInlineAction.delta(tblId, version, deltaBytes);
+            ProtoCodec.UpdateTableInlineAction.delta(tblId, version, deltaBytes)
+                .bringingBack(inlineTableBroughtBack.getOrDefault(ident, List.of()));
         actions.add(pinned.contains(ident) ? update.pin() : update);
       }
     }

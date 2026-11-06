@@ -204,6 +204,22 @@ message SealedBlock {
   bytes  digest               = 2;   // the page's: SHA-256, truncated to 16 bytes
   bytes  merkle_root          = 3;   // of its snapshots' leaves, in order
   repeated fixed64 live_ids   = 4;   // its snapshots that have not expired, ascending
+  uint32 leaves               = 5;   // how many it sealed: the leaves under merkle_root
+}
+
+// A sealed snapshot an inline update brings back inline before it applies
+// (a ref moved onto it): replay checks it against the root, never reading the
+// page, and the update does not apply ("sealed: ...") unless it proves the
+// snapshot is in its block, live (docs/SNAPSHOT_PAGING.md, "Bringing a sealed
+// snapshot back").
+message BroughtBack {
+  fixed64 snapshot_id         = 1;
+  uint64  block               = 2;
+  uint32  index               = 3;   // its place among the block's leaves
+  // Its canonical encoding: a snapshot block of it alone (1), its list's
+  // length (2) and entries (3), if it had an inline list
+  bytes   leaf                = 4;
+  repeated bytes proof        = 5;   // sibling hashes, bottom up
 }
 
 // A sealed block's page: written once, before the root that names it, and
@@ -397,6 +413,8 @@ message UpdateTableInline {
   // record. Absent, full_metadata holds the whole table (as on a pointer
   // table returning to inline storage), which replaces the table's.
   bool head_only = 10;
+  // Sealed snapshots it brings back inline first, each with its proof
+  repeated BroughtBack brought_back = 11;
 }
 
 // ============================================================

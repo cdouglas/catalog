@@ -975,6 +975,7 @@ public class LogCatalog extends BaseMetastoreCatalog
                 InlineDeltaCodec.encodeDelta(delta, metadata.lastUpdatedMillis(), base);
             if (deltaBytes.length <= inline.maxUpdateSize) {
               mut.updateTableInlineDelta(tableId, deltaBytes);
+              mut.bringingBack(tableId, broughtBack(proto, tblId, metadata));
               return;
             }
           }
@@ -1025,10 +1026,40 @@ public class LogCatalog extends BaseMetastoreCatalog
           if (removed != null) {
             mut.removingSnapshots(tableId, removed);
           }
+          if (held != null) {
+            mut.bringingBack(tableId, broughtBack(proto, tblId, metadata));
+          }
           return;
         }
       }
       mut.updateTable(tableId, writeUpdateMetadata(false, metadata));
+    }
+
+    /**
+     * The sealed snapshots of the table, as {@code proto} holds it, that {@code metadata}'s refs
+     * target, each with the proof replay checks it by (SNAPSHOT_PAGING.md, "Bringing a sealed
+     * snapshot back"): a ref moved onto one (a rollback, a tag or branch on an old snapshot, a
+     * fast-forward) needs it inline. Read from its block's page.
+     */
+    private List<SnapshotPages.BroughtBack> broughtBack(
+        CatalogState proto, Integer tblId, TableMetadata metadata) {
+      if (tblId == null || proto.sealedBlocks(tblId).isEmpty()) {
+        return List.of();
+      }
+      String prefix = proto.allManifestPrefixes().getOrDefault(tblId, "");
+      List<SnapshotPages.BroughtBack> back = new ArrayList<>();
+      Set<Long> seen = new HashSet<>();
+      for (SnapshotRef ref : metadata.refs().values()) {
+        long id = ref.snapshotId();
+        SnapshotPages.SealedBlock block = proto.sealedBlockOf(tblId, id);
+        if (block != null && seen.add(id)) {
+          SnapshotPages.Page page = inlineSnapshots
+              .pages(log.pages(), tblId, Map.of(block.block, block), prefix)
+              .get(0);
+          back.add(SnapshotPages.bringBack(page, id, prefix));
+        }
+      }
+      return back;
     }
 
     /**

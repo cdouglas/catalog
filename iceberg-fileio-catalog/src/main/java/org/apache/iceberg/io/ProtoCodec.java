@@ -150,6 +150,7 @@ public class ProtoCodec {
   private static final int SEALED_BLOCK_DIGEST = 2;
   private static final int SEALED_BLOCK_MERKLE_ROOT = 3;
   private static final int SEALED_BLOCK_LIVE_IDS = 4;
+  private static final int SEALED_BLOCK_LEAVES = 5;
 
   // ManifestFileEntry field numbers
   private static final int MF_PATH = 1;
@@ -268,6 +269,15 @@ public class ProtoCodec {
   private static final int UPDATE_INLINE_REMOVED_SNAPSHOT_IDS = 9;
   // FULL on an inline table: full_metadata holds the head and only the snapshots its base lacks
   private static final int UPDATE_INLINE_HEAD_ONLY = 10;
+  // The sealed snapshots the update brings back inline, each with its proof (BroughtBack)
+  private static final int UPDATE_INLINE_BROUGHT_BACK = 11;
+
+  // BroughtBack field numbers
+  private static final int BROUGHT_BACK_SNAPSHOT_ID = 1;
+  private static final int BROUGHT_BACK_BLOCK = 2;
+  private static final int BROUGHT_BACK_INDEX = 3;
+  private static final int BROUGHT_BACK_LEAF = 4;
+  private static final int BROUGHT_BACK_PROOF = 5;
 
   // CreateTableInline field numbers
   private static final int CREATE_INLINE_TBL_ID = 1;
@@ -900,12 +910,14 @@ public class ProtoCodec {
       }
     }
     writeLengthDelimited(out, SEALED_BLOCK_LIVE_IDS, ids.toByteArray());
+    writeVarint(out, SEALED_BLOCK_LEAVES, block.leaves);
     return out.toByteArray();
   }
 
   private static SnapshotPages.SealedBlock decodeSealedBlock(byte[] bytes) throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
     long block = 0;
+    int leaves = 0;
     byte[] digest = new byte[0];
     byte[] merkleRoot = new byte[0];
     List<Long> live = new ArrayList<>();
@@ -920,6 +932,9 @@ public class ProtoCodec {
           break;
         case SEALED_BLOCK_MERKLE_ROOT:
           merkleRoot = readLengthDelimitedBytes(in);
+          break;
+        case SEALED_BLOCK_LEAVES:
+          leaves = readVarint(in);
           break;
         case SEALED_BLOCK_LIVE_IDS:
           if ((tag & 0x7) == 2) {
@@ -945,7 +960,7 @@ public class ProtoCodec {
       Preconditions.checkState(liveIds[i - 1] < liveIds[i], "Sealed block %s live ids unsorted",
           block);
     }
-    return new SnapshotPages.SealedBlock(block, digest, merkleRoot, liveIds, null);
+    return new SnapshotPages.SealedBlock(block, digest, merkleRoot, leaves, liveIds, null);
   }
 
   /** Reads a packed repeated uint32 field (or one unpacked value) into {@code values}. */
@@ -1187,6 +1202,17 @@ public class ProtoCodec {
       }
       if (a.pinned) {
         writeVarint(inner, UPDATE_INLINE_PINNED, 1);
+      }
+      for (SnapshotPages.BroughtBack back : a.broughtBack) {
+        ByteArrayOutputStream brought = new BytesOut();
+        writeFixed64(brought, BROUGHT_BACK_SNAPSHOT_ID, back.snapshotId);
+        writeVarint64(brought, BROUGHT_BACK_BLOCK, back.block);
+        writeVarint(brought, BROUGHT_BACK_INDEX, back.index);
+        writeBytes(brought, BROUGHT_BACK_LEAF, back.leaf);
+        for (byte[] sibling : back.proof) {
+          writeBytes(brought, BROUGHT_BACK_PROOF, sibling);
+        }
+        writeLengthDelimited(inner, UPDATE_INLINE_BROUGHT_BACK, brought.toByteArray());
       }
       writeLengthDelimited(out, ACTION_UPDATE_TABLE_INLINE, inner.toByteArray());
     } else if (action instanceof CreateTableInlineAction) {
@@ -1568,6 +1594,7 @@ public class ProtoCodec {
     byte[] mlDeltaBytes = null;
     boolean pinned = false;
     List<Long> removed = new ArrayList<>();
+    List<SnapshotPages.BroughtBack> broughtBack = new ArrayList<>();
     boolean headOnly = false;
 
     while (in.available() > 0) {
@@ -1601,6 +1628,9 @@ public class ProtoCodec {
         case UPDATE_INLINE_HEAD_ONLY:
           headOnly = readVarint(in) != 0;
           break;
+        case UPDATE_INLINE_BROUGHT_BACK:
+          broughtBack.add(decodeBroughtBack(readLengthDelimitedBytes(in)));
+          break;
         case UPDATE_INLINE_REMOVED_SNAPSHOT_IDS:
           if ((tag & 0x7) == org.intentlog.wire.ProtoWire.WIRE_LENGTH_DELIMITED) {
             ByteArrayInputStream packed = new ByteArrayInputStream(readLengthDelimitedBytes(in));
@@ -1623,7 +1653,40 @@ public class ProtoCodec {
         id, version, deltaBytes, fullMetadata,
         fullMetadataCodec != null ? fullMetadataCodec : InlineMetadataCodecs.TAG_JSON_GZIP,
         metadataLocation, mlDeltaBytes, pinned, headOnly,
-        removed.stream().mapToLong(Long::longValue).toArray());
+        removed.stream().mapToLong(Long::longValue).toArray())
+        .bringingBack(broughtBack);
+  }
+
+  private static SnapshotPages.BroughtBack decodeBroughtBack(byte[] bytes) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    long snapshotId = 0;
+    long block = 0;
+    int index = 0;
+    byte[] leaf = new byte[0];
+    List<byte[]> proof = new ArrayList<>();
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      switch (tag >>> 3) {
+        case BROUGHT_BACK_SNAPSHOT_ID:
+          snapshotId = readFixed64(in);
+          break;
+        case BROUGHT_BACK_BLOCK:
+          block = readVarint64(in);
+          break;
+        case BROUGHT_BACK_INDEX:
+          index = readVarint(in);
+          break;
+        case BROUGHT_BACK_LEAF:
+          leaf = readLengthDelimitedBytes(in);
+          break;
+        case BROUGHT_BACK_PROOF:
+          proof.add(readLengthDelimitedBytes(in));
+          break;
+        default:
+          skipField(in, tag & 0x7);
+      }
+    }
+    return new SnapshotPages.BroughtBack(snapshotId, block, index, leaf, proof);
   }
 
   private static SetConflictEncodingAction decodeSetConflictEncoding(byte[] bytes)
@@ -2702,7 +2765,26 @@ public class ProtoCodec {
     public UpdateTableInlineAction pin() {
       return new UpdateTableInlineAction(
           id, version, deltaBytes, fullMetadata, fullMetadataCodec, metadataLocation, mlDeltaBytes,
-          true, headOnly, removedSnapshotIds);
+          true, headOnly, removedSnapshotIds).bringingBack(broughtBack);
+    }
+
+    // The sealed snapshots the update brings back inline before it applies, each with its proof
+    // (SNAPSHOT_PAGING.md, "Bringing a sealed snapshot back")
+    List<SnapshotPages.BroughtBack> broughtBack = List.of();
+
+    /** This update, bringing {@code back} inline first. */
+    public UpdateTableInlineAction bringingBack(List<SnapshotPages.BroughtBack> back) {
+      this.broughtBack = List.copyOf(back);
+      return this;
+    }
+
+    /** The ids it brings back. */
+    private Set<Long> broughtBackIds() {
+      Set<Long> ids = new HashSet<>();
+      for (SnapshotPages.BroughtBack back : broughtBack) {
+        ids.add(back.snapshotId);
+      }
+      return ids;
     }
 
     /**
@@ -2713,7 +2795,7 @@ public class ProtoCodec {
     public UpdateTableInlineAction headOnly(long[] removed) {
       return new UpdateTableInlineAction(
           id, version, deltaBytes, fullMetadata, fullMetadataCodec, metadataLocation, mlDeltaBytes,
-          pinned, true, removed);
+          pinned, true, removed).bringingBack(broughtBack);
     }
 
     /** Creates an UpdateTableInlineAction in DELTA mode (codec inherited from base). */
@@ -2775,17 +2857,24 @@ public class ProtoCodec {
      */
     private String sealed(CatalogState.Builder builder) {
       if (!builder.isInlineTable(id) || builder.sealedBlocks(id).isEmpty()) {
-        return null;
+        return broughtBack.isEmpty() ? null : "sealed: brings back a snapshot of no sealed block";
       }
+      String prefix = builder.manifestListPrefix(id);
+      for (SnapshotPages.BroughtBack back : broughtBack) {
+        if (!back.proves(builder.sealedBlockOf(id, back.snapshotId), prefix != null ? prefix : "")) {
+          return "sealed: no proof of snapshot " + back.snapshotId;
+        }
+      }
+      Set<Long> back = broughtBackIds();
       if (deltaBytes != null) {
-        return SnapshotSealing.reason(table().delta(), ReplayView.of(builder, id).table(), builder,
-            id);
+        return SnapshotSealing.reason(
+            table().delta(), ReplayView.of(builder, id).table(), builder, id, back);
       }
       if (fullMetadata != null && headOnly) {
         Chain<Snapshot> sent =
             InlineMetadataCodecs.byTag(fullMetadataCodec).decodeFields(fullMetadata).snapshots;
         for (int i = 0; i < sent.size(); i++) {
-          if (builder.sealedBlockOf(id, sent.keyAt(i)) != null) {
+          if (!back.contains(sent.keyAt(i)) && builder.sealedBlockOf(id, sent.keyAt(i)) != null) {
             return "sealed: a full update holds sealed snapshot " + sent.keyAt(i);
           }
         }
@@ -2856,6 +2945,9 @@ public class ProtoCodec {
 
     @Override
     public void apply(CatalogState.Builder builder) {
+      if (!broughtBack.isEmpty()) {
+        SnapshotSealing.bringBack(builder, id, broughtBack);
+      }
       ReplayView before = ReplayView.of(builder, id);
       // The table's next version: its version where the record lands, which is the one the update
       // read unless a conflict encoding admitted it on a later one.

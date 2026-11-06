@@ -121,11 +121,12 @@ final class SnapshotSealing {
    */
   static String reason(
       InlineDeltaCodec.DecodedDelta delta, MetadataView table, CatalogState.Builder builder,
-      int tblId) {
+      int tblId, Set<Long> broughtBack) {
     if (delta == null || builder.sealedBlocks(tblId).isEmpty()) {
       return null;
     }
-    Set<Long> added = new HashSet<>();
+    // What the record brings back with its proof is inline where the delta applies
+    Set<Long> added = new HashSet<>(broughtBack);
     for (InlineDeltaCodec.DeltaUpdate update : delta.updates) {
       if (update instanceof AddSnapshotUpdate) {
         added.add(((AddSnapshotUpdate) update).snapshotId);
@@ -151,6 +152,37 @@ final class SnapshotSealing {
       }
     }
     return null;
+  }
+
+  /**
+   * Brings {@code back} inline, as a record carrying them applies (each proven against its block's
+   * Merkle root by verify): each snapshot joins the inline snapshots in sequence order, with its
+   * list and the pool entries it names (a pooled path's entry never changes, so an entry the pool
+   * holds is the leaf's), and leaves its block's live ids.
+   */
+  static void bringBack(
+      CatalogState.Builder builder, int tblId, List<SnapshotPages.BroughtBack> back) {
+    String prefix = builder.manifestListPrefix(tblId);
+    InlineTable table = builder.inlineTable(tblId);
+    TableFields fields = table.fields();
+    List<Snapshot> snapshots = new ArrayList<>(fields.snapshots);
+    for (SnapshotPages.BroughtBack brought : back) {
+      SnapshotPages.SealedBlock block = builder.sealedBlockOf(tblId, brought.snapshotId);
+      SnapshotPages.Leaf leaf = SnapshotPages.decodeLeaf(brought.leaf, prefix != null ? prefix : "");
+      snapshots.add(leaf.snapshot);
+      if (leaf.manifests != null) {
+        List<String> paths = new ArrayList<>(leaf.manifests.size());
+        for (org.apache.iceberg.ManifestFile manifest : leaf.manifests) {
+          builder.addManifestToPool(tblId, manifest);
+          paths.add(manifest.path());
+        }
+        builder.setSnapshotManifests(tblId, brought.snapshotId, paths);
+      }
+      builder.setSealedBlock(tblId, block.without(brought.snapshotId));
+    }
+    snapshots.sort(java.util.Comparator.comparingLong(Snapshot::sequenceNumber));
+    builder.updateInlineTable(tblId, builder.tableVersion(tblId),
+        InlineTable.ofFields(fields.withSnapshots(snapshots), table.codec()));
   }
 
   /** Whether {@code id} is a sealed snapshot of the table, live, and not inline. */

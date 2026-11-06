@@ -177,4 +177,66 @@ class TestSnapshotPaging {
       }
     }
   }
+
+  /**
+   * A rollback to a sealed snapshot, and a tag on one, bring it back inline with its proof: the
+   * table then reads as its writer committed it, through a fresh catalog, and the snapshot leaves
+   * its block's live ids. A proof for another place, or a forged leaf, proves nothing.
+   */
+  @ParameterizedTest
+  @EnumSource(names = {"APPEND_ML", "COMPACT_ML", "CAS_TM", "MEMLOG_ML"})
+  void aRefMovedOntoASealedSnapshotBringsItBack(LocalCatalogMode mode) throws Exception {
+    LogCatalog writer = mode.catalog(io, WAREHOUSE, "back", paging(4, 8));
+    writer.createNamespace(Namespace.of("ns"));
+    Table table = writer.buildTable(TABLE, SCHEMA).withPartitionSpec(SPEC).create();
+    List<Long> ids = new ArrayList<>();
+    for (int i = 0; i < 30; i++) {
+      append(table, i);
+      ids.add(table.currentSnapshot().snapshotId());
+    }
+    CatalogState state = writer.log().read().state();
+    int tblId = state.tableId(TABLE);
+    long tagged = ids.get(1);
+    long rolledBack = ids.get(5);
+    assertThat(state.sealedBlockOf(tblId, tagged)).isNotNull();
+    assertThat(state.sealedBlockOf(tblId, rolledBack)).isNotNull();
+
+    table.manageSnapshots().createTag("old", tagged).commit();
+    table.manageSnapshots().rollbackTo(rolledBack).commit();
+
+    state = writer.log().read().state();
+    assertThat(state.sealedBlockOf(tblId, tagged)).isNull();
+    assertThat(state.sealedBlockOf(tblId, rolledBack)).isNull();
+    assertThat(state.inlineTable(tblId).fields().snapshot(rolledBack)).isNotNull();
+    Table fresh = mode.catalog(io, WAREHOUSE, "back", paging(4, 8)).loadTable(TABLE);
+    assertThat(fresh.currentSnapshot().snapshotId()).isEqualTo(rolledBack);
+    assertThat(fresh.refs().get("old").snapshotId()).isEqualTo(tagged);
+    assertThat(current(fresh).snapshots()).extracting(Snapshot::snapshotId)
+        .containsExactlyElementsOf(ids);
+    try (CloseableIterable<FileScanTask> tasks = fresh.newScan().planFiles()) {
+      assertThat(Iterables.size(tasks)).isEqualTo(6);
+    }
+    // The next commit on main builds on the brought-back snapshot's list
+    append(table, 100);
+    Table again = mode.catalog(io, WAREHOUSE, "back", paging(4, 8)).loadTable(TABLE);
+    try (CloseableIterable<FileScanTask> tasks = again.newScan().planFiles()) {
+      assertThat(Iterables.size(tasks)).isEqualTo(7);
+    }
+
+    // A proof proves only its own leaf at its own place
+    SnapshotPages.SealedBlock block = state.sealedBlocks(tblId).values().iterator().next();
+    long live = block.liveIds[0];
+    String prefix = state.allManifestPrefixes().getOrDefault(tblId, "");
+    SnapshotPages.Page page = SnapshotPages.read(writer.log().pages(), tblId, block, prefix);
+    SnapshotPages.BroughtBack proof = SnapshotPages.bringBack(page, live, prefix);
+    assertThat(proof.proves(block, prefix)).isTrue();
+    assertThat(new SnapshotPages.BroughtBack(
+            live, block.block, proof.index ^ 1, proof.leaf, proof.proof).proves(block, prefix))
+        .isFalse();
+    byte[] forged = proof.leaf.clone();
+    forged[forged.length - 1] ^= 1;
+    assertThat(new SnapshotPages.BroughtBack(
+            live, block.block, proof.index, forged, proof.proof).proves(block, prefix))
+        .isFalse();
+  }
 }

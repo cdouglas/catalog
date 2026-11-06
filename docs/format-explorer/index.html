@@ -554,7 +554,17 @@
           {"number": 1, "name": "block", "type": "uint64", "repeated": false, "packed": false, "oneof": null, "comment": "k: sequence numbers [k * B, (k + 1) * B)"},
           {"number": 2, "name": "digest", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": "the page's: SHA-256, truncated to 16 bytes"},
           {"number": 3, "name": "merkle_root", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": "of its snapshots' leaves, in order"},
-          {"number": 4, "name": "live_ids", "type": "fixed64", "repeated": true, "packed": true, "oneof": null, "comment": "its snapshots that have not expired, ascending"}
+          {"number": 4, "name": "live_ids", "type": "fixed64", "repeated": true, "packed": true, "oneof": null, "comment": "its snapshots that have not expired, ascending"},
+          {"number": 5, "name": "leaves", "type": "uint32", "repeated": false, "packed": false, "oneof": null, "comment": "how many it sealed: the leaves under merkle_root"}
+        ]
+      },
+      "BroughtBack": {
+        "fields": [
+          {"number": 1, "name": "snapshot_id", "type": "fixed64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "block", "type": "uint64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 3, "name": "index", "type": "uint32", "repeated": false, "packed": false, "oneof": null, "comment": "its place among the block's leaves"},
+          {"number": 4, "name": "leaf", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": "Its canonical encoding: a snapshot block of it alone (1), its list's length (2) and entries (3), if it had an inline list"},
+          {"number": 5, "name": "proof", "type": "bytes", "repeated": true, "packed": true, "oneof": null, "comment": "sibling hashes, bottom up"}
         ]
       },
       "SnapshotPage": {
@@ -691,7 +701,8 @@
           {"number": 7, "name": "ml_delta", "type": "TableMetadataDelta", "repeated": false, "packed": false, "oneof": null, "comment": "Optional, with full_metadata only: manifest updates for the lists of the inline-ML snapshots the commit adds, and of any inline snapshot the table holds no list for (Bug 62), so they land with the metadata."},
           {"number": 8, "name": "pinned", "type": "bool", "repeated": false, "packed": false, "oneof": null, "comment": "True when the update applies only on the version it names, whatever the catalog's conflict encoding: a table a catalog transaction writes, which must be at the version the transaction first read (errata D12), or an update Iceberg commits once (a schema or spec update, a ref change through manageSnapshots). Absent: a delta may apply on a later version if the encoding admits it there, finalized where it lands (SPEC_TM.md \"Late-bound fields\")."},
           {"number": 9, "name": "removed_snapshot_ids", "type": "int64", "repeated": true, "packed": true, "oneof": null, "comment": "With head_only: the ids of the snapshots of the version the update read that it drops."},
-          {"number": 10, "name": "head_only", "type": "bool", "repeated": false, "packed": false, "oneof": null, "comment": "With full_metadata on an inline table: full_metadata holds the table's head with only the snapshots the version it read lacks, and the ones its refs target. Replay keeps that version's other snapshots, minus removed_snapshot_ids, in their order, and appends the new ones (SNAPSHOT_PAGING.md step 1), never building the whole table from the record. Absent, full_metadata holds the whole table (as on a pointer table returning to inline storage), which replaces the table's."}
+          {"number": 10, "name": "head_only", "type": "bool", "repeated": false, "packed": false, "oneof": null, "comment": "With full_metadata on an inline table: full_metadata holds the table's head with only the snapshots the version it read lacks, and the ones its refs target. Replay keeps that version's other snapshots, minus removed_snapshot_ids, in their order, and appends the new ones (SNAPSHOT_PAGING.md step 1), never building the whole table from the record. Absent, full_metadata holds the whole table (as on a pointer table returning to inline storage), which replaces the table's."},
+          {"number": 11, "name": "brought_back", "type": "BroughtBack", "repeated": true, "packed": true, "oneof": null, "comment": "Sealed snapshots it brings back inline first, each with its proof"}
         ]
       },
       "TableMetadataDelta": {

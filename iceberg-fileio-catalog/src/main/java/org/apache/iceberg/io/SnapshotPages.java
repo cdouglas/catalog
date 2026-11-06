@@ -73,17 +73,23 @@ final class SnapshotPages {
     final long block;
     final byte[] digest;
     final byte[] merkleRoot;
+    /** How many snapshots it sealed: the leaves under its Merkle root. */
+    final int leaves;
     /** The ids of its snapshots that have not expired, ascending. */
     final long[] liveIds;
     /** The page, if this replica sealed the block and no compactor has stored it yet. */
     final Pending pending;
 
-    SealedBlock(long block, byte[] digest, byte[] merkleRoot, long[] liveIds, Pending pending) {
+    SealedBlock(
+        long block, byte[] digest, byte[] merkleRoot, int leaves, long[] liveIds,
+        Pending pending) {
       Preconditions.checkArgument(digest.length == DIGEST_BYTES, "Invalid digest");
       Preconditions.checkArgument(merkleRoot.length == DIGEST_BYTES, "Invalid Merkle root");
+      Preconditions.checkArgument(liveIds.length <= leaves, "More live ids than leaves");
       this.block = block;
       this.digest = digest;
       this.merkleRoot = merkleRoot;
+      this.leaves = leaves;
       this.liveIds = liveIds;
       this.pending = pending;
     }
@@ -106,13 +112,14 @@ final class SnapshotPages {
       long[] kept = new long[liveIds.length - 1];
       System.arraycopy(liveIds, 0, kept, 0, at);
       System.arraycopy(liveIds, at + 1, kept, at, liveIds.length - at - 1);
-      return new SealedBlock(block, digest, merkleRoot, kept, pending);
+      return new SealedBlock(block, digest, merkleRoot, leaves, kept, pending);
     }
 
     /** As the root encodes it: whether {@code other} names the same page and live ids. */
     boolean sameEntry(SealedBlock other) {
       return block == other.block && Arrays.equals(digest, other.digest)
-          && Arrays.equals(merkleRoot, other.merkleRoot) && Arrays.equals(liveIds, other.liveIds);
+          && Arrays.equals(merkleRoot, other.merkleRoot) && leaves == other.leaves
+          && Arrays.equals(liveIds, other.liveIds);
     }
   }
 
@@ -298,7 +305,8 @@ final class SnapshotPages {
       for (Snapshot snapshot : snapshots) {
         leaves.add(leafHash(leaf(snapshot, resolve(lists.get(snapshot.snapshotId()), pool), prefix)));
       }
-      return new SealedBlock(block, digest(page), merkleRoot(leaves), live, new Pending(page));
+      return new SealedBlock(
+          block, digest(page), merkleRoot(leaves), snapshots.size(), live, new Pending(page));
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
@@ -496,6 +504,107 @@ final class SnapshotPages {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
     while (in.available() > 0) {
       values.add(ProtoWire.readVarint(in));
+    }
+  }
+
+  /**
+   * A sealed snapshot a record brings back inline ("Bringing a sealed snapshot back"): its leaf,
+   * its place among its block's leaves, and the sibling hashes up to the block's Merkle root, so
+   * replay checks it against the root without reading the page.
+   */
+  static final class BroughtBack {
+    final long snapshotId;
+    final long block;
+    final int index;
+    final byte[] leaf;
+    final List<byte[]> proof;
+
+    BroughtBack(long snapshotId, long block, int index, byte[] leaf, List<byte[]> proof) {
+      this.snapshotId = snapshotId;
+      this.block = block;
+      this.index = index;
+      this.leaf = leaf;
+      this.proof = List.copyOf(proof);
+    }
+
+    /**
+     * Whether this proves its snapshot is in {@code sealed}, live: the leaf names the snapshot,
+     * and hashes up to the block's root from its place.
+     */
+    boolean proves(SealedBlock sealed, String prefix) {
+      if (sealed == null || sealed.block != block || !sealed.isLive(snapshotId)
+          || !verify(leaf, index, sealed.leaves, proof, sealed.merkleRoot)) {
+        return false;
+      }
+      try {
+        return decodeLeaf(leaf, prefix).snapshot.snapshotId() == snapshotId;
+      } catch (RuntimeException e) {
+        return false;
+      }
+    }
+  }
+
+  /** What a leaf holds: a snapshot, and its list (null if it had no inline one). */
+  static final class Leaf {
+    final Snapshot snapshot;
+    final List<ManifestFile> manifests;
+
+    Leaf(Snapshot snapshot, List<ManifestFile> manifests) {
+      this.snapshot = snapshot;
+      this.manifests = manifests;
+    }
+  }
+
+  /** The proof a writer sends to bring back snapshot {@code snapshotId} of {@code page}. */
+  static BroughtBack bringBack(Page page, long snapshotId, String prefix) {
+    List<byte[]> leaves = new ArrayList<>(page.snapshots.size());
+    int index = -1;
+    for (int i = 0; i < page.snapshots.size(); i++) {
+      Snapshot snapshot = page.snapshots.get(i);
+      byte[] leaf = leaf(snapshot, page.lists.get(snapshot.snapshotId()), prefix);
+      leaves.add(leafHash(leaf));
+      if (snapshot.snapshotId() == snapshotId) {
+        index = i;
+      }
+    }
+    Preconditions.checkArgument(index >= 0, "Page of block %s lacks snapshot %s", page.block,
+        snapshotId);
+    Snapshot snapshot = page.snapshots.get(index);
+    return new BroughtBack(snapshotId, page.block, index,
+        leaf(snapshot, page.lists.get(snapshotId), prefix), proof(leaves, index));
+  }
+
+  /** The snapshot and list a leaf holds, paths under {@code prefix}. */
+  static Leaf decodeLeaf(byte[] leaf, String prefix) {
+    try {
+      ByteArrayInputStream in = new ByteArrayInputStream(leaf);
+      Snapshot snapshot = null;
+      List<ManifestFile> manifests = null;
+      while (in.available() > 0) {
+        int tag = ProtoWire.readVarint(in);
+        switch (tag >>> 3) {
+          case 1:
+            List<Snapshot> block = StructuralInlineMetadataCodec.decodeSnapshotsBlock(
+                ProtoWire.readLengthDelimitedBytes(in));
+            Preconditions.checkState(block.size() == 1, "A leaf holds %s snapshots", block.size());
+            snapshot = block.get(0);
+            break;
+          case 2:
+            manifests = new ArrayList<>(ProtoWire.readVarint(in));
+            break;
+          case 3:
+            Preconditions.checkState(manifests != null, "A leaf's entry before its count");
+            manifests.add(ProtoCodec.decodeManifestFileEntry(
+                ProtoWire.readLengthDelimitedBytes(in), prefix));
+            break;
+          default:
+            ProtoWire.skipField(in, tag & 0x7);
+        }
+      }
+      Preconditions.checkState(snapshot != null, "A leaf without a snapshot");
+      return new Leaf(snapshot, manifests);
+    } catch (IOException e) {
+      throw new UncheckedIOException("A leaf does not decode", e);
     }
   }
 

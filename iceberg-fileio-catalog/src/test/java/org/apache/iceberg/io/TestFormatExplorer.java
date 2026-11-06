@@ -84,6 +84,7 @@ public class TestFormatExplorer {
     codec.put("SNAPSHOT_PAGING_", "SnapshotPaging");
     codec.put("SET_SNAPSHOT_PAGING_", "SetSnapshotPaging");
     codec.put("SEALED_BLOCK_", "SealedBlock");
+    codec.put("BROUGHT_BACK_", "BroughtBack");
     PREFIXES.put("ProtoCodec", codec);
 
     Map<String, String> pages = new LinkedHashMap<>();
