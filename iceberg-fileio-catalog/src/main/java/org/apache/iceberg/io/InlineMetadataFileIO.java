@@ -18,8 +18,11 @@
  */
 package org.apache.iceberg.io;
 
+import java.io.IOException;
+import java.io.ObjectOutputStream;
 import java.io.Serializable;
 import java.util.Map;
+import java.util.function.LongSupplier;
 
 /**
  * The FileIO of a {@link FileIOCatalog} table: its catalog's, except that the synthetic location
@@ -33,14 +36,43 @@ import java.util.Map;
  */
 class InlineMetadataFileIO implements FileIO {
 
-  /** A table's inline metadata: its synthetic location and stored length. */
+  /**
+   * A table's inline metadata: its synthetic location and stored length. The length may be made on
+   * first use: a load of a table that replay holds only as fields need not encode it. A copy made
+   * by Java serialization holds the length; one made otherwise (Kryo) before anything asked for it
+   * reports 0, which Iceberg reads only as a metadata table's task size.
+   */
   static final class Metadata implements Serializable {
     private final String location;
-    private final long length;
+    // the length, or -1 until the supplier below makes it
+    private volatile long length;
+    private transient LongSupplier lengthSupplier;
 
     Metadata(String location, long length) {
       this.location = location;
       this.length = length;
+    }
+
+    Metadata(String location, LongSupplier length) {
+      this.location = location;
+      this.length = -1;
+      this.lengthSupplier = length;
+    }
+
+    long length() {
+      long known = length;
+      if (known < 0) {
+        LongSupplier supplier = lengthSupplier;
+        known = supplier != null ? supplier.getAsLong() : 0;
+        this.length = known;
+        this.lengthSupplier = null;
+      }
+      return known;
+    }
+
+    private void writeObject(ObjectOutputStream out) throws IOException {
+      length();
+      out.defaultWriteObject();
     }
   }
 
@@ -70,7 +102,7 @@ class InlineMetadataFileIO implements FileIO {
   public InputFile newInputFile(String path) {
     Metadata metadata = path.startsWith("inline://") ? current : null;
     return metadata != null && metadata.location.equals(path)
-        ? new InlineMetadataFile(path, metadata.length)
+        ? new InlineMetadataFile(path, metadata.length())
         : io.newInputFile(path);
   }
 

@@ -3587,6 +3587,36 @@ public class TestCatalogRegressions {
     }
 
     /**
+     * A lazy load's metadata length is made only when asked for (encoding a table that replay holds
+     * as fields), once, and a Java-serialized copy holds it.
+     */
+    @Test
+    void aLazyLengthIsMadeOnFirstUse() throws Exception {
+      String location = "inline://ns.t#1.2";
+      java.util.concurrent.atomic.AtomicInteger made = new java.util.concurrent.atomic.AtomicInteger();
+      InlineMetadataFileIO io = InlineMetadataFileIO.of(new CasFileIO());
+      io.current(new InlineMetadataFileIO.Metadata(location, () -> {
+        made.incrementAndGet();
+        return 42L;
+      }));
+      assertThat(made).hasValue(0);
+
+      ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+      try (java.io.ObjectOutputStream out = new java.io.ObjectOutputStream(bytes)) {
+        out.writeObject(io);
+      }
+      assertThat(made).hasValue(1);
+      FileIO copy;
+      try (java.io.ObjectInputStream in =
+          new java.io.ObjectInputStream(new java.io.ByteArrayInputStream(bytes.toByteArray()))) {
+        copy = (FileIO) in.readObject();
+      }
+      assertThat(copy.newInputFile(location).getLength()).isEqualTo(42L);
+      assertThat(io.newInputFile(location).getLength()).isEqualTo(42L);
+      assertThat(made).hasValue(1);
+    }
+
+    /**
      * Each metadata table's rows, as text, after three appends and a property change: snapshot
      * ids, timestamps and file names, which differ between catalogs, are left out. {@code clock}
      * looks at the wall clock after each commit.

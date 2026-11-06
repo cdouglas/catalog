@@ -89,6 +89,10 @@ public class LogCatalog extends BaseMetastoreCatalog
   // pointer-mode snapshots instead of warning. Default is the lenient warn path
   // because rejection breaks tables mid-migration.
   private static final String INLINE_STRICT = "fileio.catalog.inline.strict";
+  // When true (the default), a load of an inline table makes what it holds only as it is used:
+  // each snapshot's manifest list on first use (docs/SNAPSHOT_PAGING.md, "Loads"). False makes
+  // every list at the load, as before, for ablation.
+  static final String LOAD_LAZY = "fileio.catalog.load.lazy";
 
   /**
    * Selects the codec used to encode full inline {@link TableMetadata} bytes
@@ -384,7 +388,8 @@ public class LogCatalog extends BaseMetastoreCatalog
         configuredInlineCodec(),
         Integer.parseInt(
             catalogProperties.getOrDefault(
-                INLINE_MAX_UPDATE_SIZE, String.valueOf(InlineDeltaCodec.APPEND_LIMIT))));
+                INLINE_MAX_UPDATE_SIZE, String.valueOf(InlineDeltaCodec.APPEND_LIMIT))),
+        Boolean.parseBoolean(catalogProperties.getOrDefault(LOAD_LAZY, "true")));
   }
 
   /** How a catalog stores table metadata: in the catalog file (inline) or in metadata files. */
@@ -399,6 +404,8 @@ public class LogCatalog extends BaseMetastoreCatalog
     final InlineMetadataCodec codec;
     /** The largest inline table update, in bytes; a larger one writes a metadata file. */
     final int maxUpdateSize;
+    /** A load makes what it holds as it is used ({@code fileio.catalog.load.lazy}). */
+    final boolean lazyLoads;
 
     InlineSettings(
         boolean metadata,
@@ -406,6 +413,16 @@ public class LogCatalog extends BaseMetastoreCatalog
         boolean strict,
         InlineMetadataCodec codec,
         int maxUpdateSize) {
+      this(metadata, manifests, strict, codec, maxUpdateSize, true);
+    }
+
+    InlineSettings(
+        boolean metadata,
+        boolean manifests,
+        boolean strict,
+        InlineMetadataCodec codec,
+        int maxUpdateSize,
+        boolean lazyLoads) {
       Preconditions.checkArgument(
           !manifests || metadata,
           "fileio.catalog.inline.manifests=true requires fileio.catalog.inline=true");
@@ -416,6 +433,7 @@ public class LogCatalog extends BaseMetastoreCatalog
       this.strict = strict;
       this.codec = codec;
       this.maxUpdateSize = maxUpdateSize;
+      this.lazyLoads = lazyLoads;
     }
   }
 
@@ -586,10 +604,16 @@ public class LogCatalog extends BaseMetastoreCatalog
 
     /** This table's inline metadata in {@code state}, its location and stored length, or null. */
     private InlineMetadataFileIO.Metadata inlineMetadata(CatalogState state) {
-      return state.isInlineTable(tableId)
-          ? new InlineMetadataFileIO.Metadata(
-              metadataLocation(state, tableId), state.inlineMetadata(tableId).length)
-          : null;
+      if (!state.isInlineTable(tableId)) {
+        return null;
+      }
+      String location = metadataLocation(state, tableId);
+      if (!inline.lazyLoads) {
+        return new InlineMetadataFileIO.Metadata(location, state.inlineMetadata(tableId).length);
+      }
+      // A table that replay holds as fields is encoded only if something asks for the length
+      InlineTable table = state.inlineTable(state.tableId(tableId));
+      return new InlineMetadataFileIO.Metadata(location, () -> table.bytes().length);
     }
 
     /**
@@ -1296,7 +1320,8 @@ public class LogCatalog extends BaseMetastoreCatalog
         return parsed;
       }
 
-      List<Snapshot> snapshots = inlineSnapshots.wrap(proto, tblId, parsed.snapshots());
+      List<Snapshot> snapshots =
+          inlineSnapshots.wrap(proto, tblId, parsed.snapshots(), inline.lazyLoads);
 
       // The same metadata, at the same location (BaseCatalogTransaction.validateSerializableIsolation
       // compares it), with these snapshots in place of the others
@@ -1307,7 +1332,8 @@ public class LogCatalog extends BaseMetastoreCatalog
   /**
    * The {@link InlineSnapshot}s a catalog's loads of inline tables made, which later loads reuse.
    * A load makes every snapshot with an inline list an InlineSnapshot holding it, of
-   * GenericManifestFile copies: Iceberg compares manifests by equality, which for
+   * GenericManifestFile copies, which a lazy load ({@code fileio.catalog.load.lazy}) makes only
+   * when the snapshot's manifests are first asked for: Iceberg compares manifests by equality, which for
    * GenericManifestFile is by path. Expiry's ReachableFileCleanup finds the manifests that retained
    * snapshots still use that way; the catalog's own entries, equal only to themselves, were never
    * found in use, and their files were deleted. One copy per pool entry, which every list naming
@@ -1330,6 +1356,20 @@ public class LogCatalog extends BaseMetastoreCatalog
       private final Map<Long, Made> made = new java.util.HashMap<>();
       // pool entry (by identity) -> its copy
       private final Map<ManifestFile, ManifestFile> copies = new java.util.IdentityHashMap<>();
+
+      /** The list of {@code paths}, as copies of {@code pool}'s entries, one copy per entry. */
+      synchronized List<ManifestFile> manifests(
+          List<String> paths, Map<String, ManifestFile> pool) {
+        List<ManifestFile> manifests = new java.util.ArrayList<>(paths.size());
+        for (String path : paths) {
+          ManifestFile entry = pool.get(path);
+          if (entry != null) {
+            manifests.add(copies.computeIfAbsent(
+                entry, m -> org.apache.iceberg.GenericManifestFile.copyOf(m).build()));
+          }
+        }
+        return manifests;
+      }
     }
 
     /** An InlineSnapshot, and the list of manifest paths it was made from. */
@@ -1345,9 +1385,9 @@ public class LogCatalog extends BaseMetastoreCatalog
 
     /**
      * {@code parsed}, a load of inline table {@code tblId} in {@code state}, with each snapshot that
-     * has an inline list as an InlineSnapshot holding it.
+     * has an inline list as an InlineSnapshot holding it: made on first use if {@code lazy}.
      */
-    List<Snapshot> wrap(CatalogState state, int tblId, List<Snapshot> parsed) {
+    List<Snapshot> wrap(CatalogState state, int tblId, List<Snapshot> parsed, boolean lazy) {
       TableSnapshots table = tables.computeIfAbsent(tblId, id -> new TableSnapshots());
       Map<Long, List<String>> lists = state.snapshotManifests(tblId);
       Map<String, ManifestFile> pool = state.manifestPool(tblId);
@@ -1367,19 +1407,18 @@ public class LogCatalog extends BaseMetastoreCatalog
           loaded.add(s.snapshotId());
           Made made = table.made.get(s.snapshotId());
           if (made == null || made.paths != paths || !sameSnapshot(made.snapshot, s)) {
-            List<ManifestFile> manifests = new java.util.ArrayList<>(paths.size());
-            for (String path : paths) {
-              ManifestFile entry = pool.get(path);
-              if (entry != null) {
-                manifests.add(table.copies.computeIfAbsent(
-                    entry, m -> org.apache.iceberg.GenericManifestFile.copyOf(m).build()));
-              }
-            }
-            made = new Made(paths, new InlineSnapshot(
-                s.sequenceNumber(), s.snapshotId(), s.parentId(),
-                s.timestampMillis(), s.operation(), s.summary(),
-                s.schemaId(), s.firstRowId(), s.addedRows(), s.keyId(),
-                manifests));
+            InlineSnapshot snapshot = lazy
+                ? new InlineSnapshot(
+                    s.sequenceNumber(), s.snapshotId(), s.parentId(),
+                    s.timestampMillis(), s.operation(), s.summary(),
+                    s.schemaId(), s.firstRowId(), s.addedRows(), s.keyId(),
+                    () -> table.manifests(paths, pool))
+                : new InlineSnapshot(
+                    s.sequenceNumber(), s.snapshotId(), s.parentId(),
+                    s.timestampMillis(), s.operation(), s.summary(),
+                    s.schemaId(), s.firstRowId(), s.addedRows(), s.keyId(),
+                    table.manifests(paths, pool));
+            made = new Made(paths, snapshot);
             table.made.put(s.snapshotId(), made);
           }
           snapshots.add(made.snapshot);

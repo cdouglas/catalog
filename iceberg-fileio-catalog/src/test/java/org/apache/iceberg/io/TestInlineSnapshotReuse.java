@@ -104,6 +104,34 @@ class TestInlineSnapshotReuse {
     readsAsAFreshCatalog(catalog, LocalCatalogMode.APPEND_ML);
   }
 
+  /**
+   * A lazy load ({@code fileio.catalog.load.lazy}, the default) makes a snapshot's list only when
+   * its manifests are asked for, and reads as a load that makes them all.
+   */
+  @Test
+  void aLazyLoadMakesAListOnlyWhenAskedFor() {
+    LogCatalog catalog = catalog(LocalCatalogMode.APPEND_ML);
+    catalog.createNamespace(Namespace.of("ns"));
+    Table table = catalog.buildTable(TABLE, SCHEMA).withPartitionSpec(SPEC).create();
+    for (int i = 0; i < 4; i++) {
+      append(table);
+    }
+    Table loaded = catalog(LocalCatalogMode.APPEND_ML).loadTable(TABLE);
+    Snapshot oldest = current(loaded).snapshots().get(0);
+    assertThat(oldest).isInstanceOf(InlineSnapshot.class);
+    assertThat(oldest.toString()).contains("not yet made");
+    assertThat(oldest.allManifests(loaded.io())).hasSize(1);
+    assertThat(oldest.toString()).doesNotContain("not yet made");
+
+    LogCatalog eager =
+        LocalCatalogMode.APPEND_ML.catalog(
+            io, "mem:///wh", "reuse", Map.of(LogCatalog.LOAD_LAZY, "false"));
+    Snapshot made = current(eager.loadTable(TABLE)).snapshots().get(0);
+    assertThat(made.toString()).doesNotContain("not yet made");
+    assertThat(TableViews.physical(eager.loadTable(TABLE), true))
+        .isEqualTo(TableViews.physical(catalog(LocalCatalogMode.APPEND_ML).loadTable(TABLE), true));
+  }
+
   @Test
   void aPathAddedAgainKeepsItsEntryAndTheListsMadeFromIt() {
     LogCatalog catalog = catalog(LocalCatalogMode.APPEND_ML);
@@ -116,8 +144,8 @@ class TestInlineSnapshotReuse {
     int tblId = state.tableId(TABLE);
     java.util.List<Snapshot> parsed = current(catalog.loadTable(TABLE)).snapshots();
     LogCatalog.InlineSnapshots made = new LogCatalog.InlineSnapshots();
-    java.util.List<Snapshot> first = made.wrap(state, tblId, parsed);
-    java.util.List<Snapshot> again = made.wrap(state, tblId, parsed);
+    java.util.List<Snapshot> first = made.wrap(state, tblId, parsed, true);
+    java.util.List<Snapshot> again = made.wrap(state, tblId, parsed, true);
     for (int i = 0; i < first.size(); i++) {
       assertThat(again.get(i)).isSameAs(first.get(i));
     }
@@ -130,7 +158,7 @@ class TestInlineSnapshotReuse {
             .addManifestToPool(tblId, org.apache.iceberg.GenericManifestFile.copyOf(entry).build())
             .build();
     assertThat(readded.manifestPool(tblId).get(entry.path())).isSameAs(entry);
-    java.util.List<Snapshot> kept = made.wrap(readded, tblId, parsed);
+    java.util.List<Snapshot> kept = made.wrap(readded, tblId, parsed, true);
     for (int i = 0; i < first.size(); i++) {
       assertThat(kept.get(i)).isSameAs(first.get(i));
     }

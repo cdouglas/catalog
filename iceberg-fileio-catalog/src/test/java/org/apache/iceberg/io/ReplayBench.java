@@ -142,6 +142,10 @@ public class ReplayBench {
   @Param({"1"})
   public int fresh;
 
+  /** {@code fileio.catalog.load.lazy} for {@link #load}: false makes everything a load holds. */
+  @Param({"true"})
+  public boolean lazy;
+
   private byte[] checkpoint;
   private List<byte[]> records;
   private CatalogState finalState;
@@ -248,6 +252,7 @@ public class ReplayBench {
     props.put(CatalogProperties.WAREHOUSE_LOCATION, "mem:///wh");
     props.put("fileio.catalog.inline", String.valueOf(!mode.equals("pointer")));
     props.put("fileio.catalog.inline.manifests", String.valueOf(mode.equals("ml")));
+    props.put(LogCatalog.LOAD_LAZY, String.valueOf(lazy));
     FileIOCatalog catalog = new FileIOCatalog("c", CATALOG, tailIO, new HashMap<>());
     catalog.initialize("c", props);
     return catalog;
@@ -330,6 +335,7 @@ public class ReplayBench {
     props.put(CatalogProperties.WAREHOUSE_LOCATION, "mem:///wh");
     props.put("fileio.catalog.inline", String.valueOf(!mode.equals("pointer")));
     props.put("fileio.catalog.inline.manifests", String.valueOf(mode.equals("ml")));
+    props.put(LogCatalog.LOAD_LAZY, String.valueOf(lazy));
     props.put(LogCatalogProperties.MAX_APPEND_COUNT, "0");
     props.put(LogCatalogProperties.CONFLICT_ENCODING, encoding);
     props.put(LogCatalogProperties.RACE_MIN_WAIT_MS, "0");
