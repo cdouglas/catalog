@@ -21,6 +21,7 @@ package org.apache.iceberg.io;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.HasTableOperations;
@@ -130,6 +131,56 @@ class TestInlineSnapshotReuse {
     assertThat(made.toString()).doesNotContain("not yet made");
     assertThat(TableViews.physical(eager.loadTable(TABLE), true))
         .isEqualTo(TableViews.physical(catalog(LocalCatalogMode.APPEND_ML).loadTable(TABLE), true));
+  }
+
+  /**
+   * A lazy load holds the snapshots its refs target until something asks for another, and then
+   * every one, as a whole load holds them; the supplier serializes what it made.
+   */
+  @ParameterizedTest
+  @EnumSource(names = {"APPEND_TM", "APPEND_ML"})
+  void aLazyLoadHoldsItsRefsTargetsUntilAskedForMore(LocalCatalogMode mode) throws Exception {
+    LogCatalog catalog = catalog(mode);
+    catalog.createNamespace(Namespace.of("ns"));
+    Table table = catalog.buildTable(TABLE, SCHEMA).withPartitionSpec(SPEC).create();
+    for (int i = 0; i < 5; i++) {
+      append(table);
+    }
+    long tagged = current(table).snapshots().get(1).snapshotId();
+    table.manageSnapshots().createTag("t", tagged).commit();
+
+    TableMetadata lazy = current(catalog(mode).loadTable(TABLE));
+    assertThat(lazy)
+        .extracting("snapshots")
+        .asInstanceOf(org.assertj.core.api.InstanceOfAssertFactories.list(Snapshot.class))
+        .extracting(Snapshot::snapshotId)
+        .containsExactly(tagged, lazy.currentSnapshot().snapshotId());
+
+    // The supplier (TableMetadata itself does not serialize): a copy holds what it made
+    Object unserializable = new Object();
+    LogCatalog.LazySnapshots supplier = new LogCatalog.LazySnapshots(() -> {
+      assertThat(unserializable).isNotNull();
+      return List.of(lazy.currentSnapshot());
+    });
+    java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+    try (java.io.ObjectOutputStream out = new java.io.ObjectOutputStream(bytes)) {
+      out.writeObject(supplier);
+    }
+    Object copy;
+    try (java.io.ObjectInputStream in = new java.io.ObjectInputStream(
+        new java.io.ByteArrayInputStream(bytes.toByteArray()))) {
+      copy = in.readObject();
+    }
+    assertThat(((LogCatalog.LazySnapshots) copy).get())
+        .extracting(Snapshot::snapshotId)
+        .containsExactly(lazy.currentSnapshot().snapshotId());
+
+    TableMetadata whole = current(LocalCatalogMode.valueOf(mode.name())
+        .catalog(io, "mem:///wh", "reuse", Map.of(LogCatalog.LOAD_LAZY, "false"))
+        .loadTable(TABLE));
+    assertThat(lazy.snapshots()).hasSize(5);
+    assertThat(org.apache.iceberg.TableMetadataParser.toJson(lazy))
+        .isEqualTo(org.apache.iceberg.TableMetadataParser.toJson(whole));
   }
 
   @Test

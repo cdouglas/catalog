@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.encryption.EncryptedKey;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+import org.apache.iceberg.util.SerializableSupplier;
 
 /**
  * Builds {@link TableMetadata} from its fields, for the catalog's inline tables: replay keeps a
@@ -80,6 +81,67 @@ public final class InlineTableMetadata {
         currentSnapshotId,
         snapshots,
         null,
+        snapshotLog,
+        previousFiles,
+        refs,
+        statisticsFiles,
+        partitionStatisticsFiles,
+        nextRowId,
+        encryptionKeys,
+        ImmutableList.of());
+  }
+
+  /**
+   * As {@link #create}, holding only {@code snapshots} (which must include every ref's target) until
+   * something asks for the others, when it takes them all from {@code snapshotsSupplier} (as REST's
+   * refs mode loads a table).
+   */
+  @SuppressWarnings("checkstyle:ParameterNumber")
+  public static TableMetadata createLazy(
+      String metadataFileLocation,
+      int formatVersion,
+      String uuid,
+      String location,
+      long lastSequenceNumber,
+      long lastUpdatedMillis,
+      int lastColumnId,
+      int currentSchemaId,
+      List<Schema> schemas,
+      int defaultSpecId,
+      List<PartitionSpec> specs,
+      int lastAssignedPartitionId,
+      int defaultSortOrderId,
+      List<SortOrder> sortOrders,
+      Map<String, String> properties,
+      long currentSnapshotId,
+      List<Snapshot> snapshots,
+      SerializableSupplier<List<Snapshot>> snapshotsSupplier,
+      List<HistoryEntry> snapshotLog,
+      List<TableMetadata.MetadataLogEntry> previousFiles,
+      Map<String, SnapshotRef> refs,
+      List<StatisticsFile> statisticsFiles,
+      List<PartitionStatisticsFile> partitionStatisticsFiles,
+      long nextRowId,
+      List<EncryptedKey> encryptionKeys) {
+    return new TableMetadata(
+        metadataFileLocation,
+        formatVersion,
+        uuid,
+        location,
+        lastSequenceNumber,
+        lastUpdatedMillis,
+        lastColumnId,
+        currentSchemaId,
+        schemas,
+        defaultSpecId,
+        specs,
+        lastAssignedPartitionId,
+        defaultSortOrderId,
+        sortOrders,
+        properties,
+        currentSnapshotId,
+        snapshots,
+        snapshotsSupplier,
         snapshotLog,
         previousFiles,
         refs,

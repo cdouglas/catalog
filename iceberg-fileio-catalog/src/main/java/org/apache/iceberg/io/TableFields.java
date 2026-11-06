@@ -31,6 +31,7 @@ import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.StatisticsFile;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.encryption.EncryptedKey;
+import org.apache.iceberg.util.SerializableSupplier;
 
 /**
  * An inline table's metadata as replay holds it: the fields of a {@link TableMetadata}, without
@@ -219,6 +220,42 @@ final class TableFields implements MetadataView {
         properties,
         currentSnapshotId,
         List.copyOf(snapshots),
+        List.copyOf(snapshotLog),
+        List.copyOf(previousFiles),
+        refs,
+        statisticsFiles,
+        partitionStatisticsFiles,
+        nextRowId,
+        encryptionKeys);
+  }
+
+  /**
+   * The metadata these fields make at {@code metadataFileLocation}, holding only {@code held} (each
+   * ref's target, at least) until something asks for the others, which {@code supplier} gives.
+   */
+  TableMetadata toMetadata(
+      String metadataFileLocation,
+      List<Snapshot> held,
+      SerializableSupplier<List<Snapshot>> supplier) {
+    return InlineTableMetadata.createLazy(
+        metadataFileLocation,
+        formatVersion,
+        uuid,
+        location,
+        lastSequenceNumber,
+        lastUpdatedMillis,
+        lastColumnId,
+        currentSchemaId,
+        schemas,
+        defaultSpecId,
+        specs,
+        lastAssignedPartitionId,
+        defaultSortOrderId,
+        sortOrders,
+        properties,
+        currentSnapshotId,
+        held,
+        supplier,
         List.copyOf(snapshotLog),
         List.copyOf(previousFiles),
         refs,

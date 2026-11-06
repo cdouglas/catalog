@@ -180,6 +180,19 @@ final class InlineTable {
    * The metadata a client's load makes of this version at {@code location}: {@code load} applied
    * to its {@link #metadata}, once per location.
    */
+  /**
+   * The metadata a load of the table at {@code location} made, kept for that location: made by
+   * {@code make} from the location otherwise (a lazy load, which makes it from the fields).
+   */
+  TableMetadata loadedAs(String location, java.util.function.Function<String, TableMetadata> make) {
+    TableMetadata made = loaded;
+    if (made == null || !java.util.Objects.equals(location, made.metadataFileLocation())) {
+      made = make.apply(location);
+      loaded = made;
+    }
+    return made;
+  }
+
   TableMetadata loaded(String location, java.util.function.UnaryOperator<TableMetadata> load) {
     TableMetadata made = loaded;
     if (made == null || !java.util.Objects.equals(location, made.metadataFileLocation())) {

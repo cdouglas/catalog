@@ -643,8 +643,12 @@ public class LogCatalog extends BaseMetastoreCatalog
         loaded = true;
         InlineTable inlineTable = state.inlineTable(state.tableId(tableId));
         String syntheticLoc = metadataLocation(state, tableId);
+        int tblId = state.tableId(tableId);
         refreshFromMetadataLocation(syntheticLoc, null, 0,
-            loc -> inlineTable.loaded(loc, parsed -> wrapInlineManifests(parsed, state)));
+            loc -> inline.lazyLoads
+                ? inlineTable.loadedAs(
+                    loc, at -> lazyMetadata(state, tblId, inlineTable.fields(), at))
+                : inlineTable.loaded(loc, parsed -> wrapInlineManifests(parsed, state)));
       } else if (loaded || currentMetadataLocation() != null) {
         // Table used to exist but is now missing
         throw new NoSuchTableException("Table %s was deleted", tableId);
@@ -1259,51 +1263,32 @@ public class LogCatalog extends BaseMetastoreCatalog
     }
 
     /**
-     * Replaces snapshots with InlineSnapshot when the catalog has inline manifest list data.
-     * Snapshots without inline ML data keep their original manifestListLocation (Avro pointer).
+     * Checks {@code snapshots} of inline table {@code tblId} against the lists {@code proto} holds,
+     * and returns whether any has one ({@code inlineKnown}: some snapshot not among these has). Any snapshot with an inline:// sentinel manifest-list
+     * location must have a list: the sentinel is only written when the sink path is active, and
+     * the pool and sentinel are committed atomically. A sentinel without one means the pool was
+     * lost (a format bug), and loading the snapshot as-is would fail with FileNotFound when
+     * allManifests() reads {@code inline://<id>}: fail loudly instead. A table with both inline and
+     * file lists (mixed mode, §2.7) is logged, or rejected in strict mode
+     * (fileio.catalog.inline.strict=true): rejection would break tables mid-migration.
      */
-    private TableMetadata wrapInlineManifests(TableMetadata parsed, CatalogState proto) {
-      Integer tblId = proto.tableId(tableId);
-      if (tblId == null) {
-        return parsed;
-      }
-
-      // Any snapshot with an inline:// sentinel manifest-list location MUST
-      // have a pool entry — the sentinel is only written when the sink path is
-      // active, and the pool and sentinel must be committed atomically. A
-      // sentinel without a pool entry means the pool was lost (a format bug),
-      // and loading the BaseSnapshot as-is would result in
-      // FileNotFound when allManifests() tries to read `inline://<id>`. Fail
-      // loudly instead of silently corrupting the read.
-      for (Snapshot s : parsed.snapshots()) {
+    private boolean checkInlineSnapshots(
+        CatalogState proto, int tblId, List<Snapshot> snapshots, boolean inlineKnown) {
+      boolean hasInline = inlineKnown;
+      boolean hasPointer = false;
+      for (Snapshot s : snapshots) {
         String loc = s.manifestListLocation();
-        if (loc != null && loc.startsWith("inline://")
-            && !proto.hasInlineManifests(tblId, s.snapshotId())) {
+        if (proto.hasInlineManifests(tblId, s.snapshotId())) {
+          hasInline = true;
+        } else if (loc != null && loc.startsWith("inline://")) {
           throw new IllegalStateException(
               "Inline snapshot " + s.snapshotId() + " has sentinel manifest-list "
                   + "location '" + loc + "' but no pool entry — catalog state corrupt");
-        }
-      }
-
-      // Check if any snapshot has inline manifests, and detect mixed mode
-      // (some inline, some pointer-mode in the same table).
-      boolean hasAny = false;
-      boolean hasInline = false;
-      boolean hasPointer = false;
-      for (Snapshot s : parsed.snapshots()) {
-        if (proto.hasInlineManifests(tblId, s.snapshotId())) {
-          hasAny = true;
-          hasInline = true;
-        } else if (s.manifestListLocation() != null
-            && !s.manifestListLocation().startsWith("inline://")) {
+        } else if (loc != null) {
           hasPointer = true;
         }
       }
       if (hasInline && hasPointer) {
-        // §2.7: mixed-mode table. Default behavior is warn-and-proceed because
-        // rejection would break tables mid-migration. Production deployments
-        // can opt into hard rejection via fileio.catalog.inline.strict=true,
-        // which throws ValidationException here.
         if (inline.strict) {
           throw new ValidationException(
               "Table %s is in mixed mode: has both inline and pointer-mode "
@@ -1316,6 +1301,72 @@ public class LogCatalog extends BaseMetastoreCatalog
                 + "Reload is supported but migration utilities may misbehave.",
             tableId);
       }
+      return hasInline;
+    }
+
+    /**
+     * A lazy load of inline table {@code tblId} ({@code fileio.catalog.load.lazy}): metadata at
+     * {@code location} holding only the snapshots its refs target (TableMetadata must hold them),
+     * and a supplier of all of them, which Iceberg calls when something asks for another snapshot
+     * or for every one (history, time travel, expiry, a commit's builder). The checks a whole load
+     * makes read the snapshots without a list here, and the rest in the supplier; the supplier
+     * holds the version's fields, lists and pool, not the catalog's state.
+     */
+    private TableMetadata lazyMetadata(
+        CatalogState state, int tblId, TableFields fields, String location) {
+      Map<Long, List<String>> lists = state.snapshotManifests(tblId);
+      Map<String, ManifestFile> pool = state.manifestPool(tblId);
+      Set<Long> targets = new HashSet<>();
+      if (fields.currentSnapshotId >= 0) {
+        targets.add(fields.currentSnapshotId);
+      }
+      for (SnapshotRef ref : fields.refs.values()) {
+        targets.add(ref.snapshotId());
+      }
+      Chain<Snapshot> snapshots = fields.snapshots;
+      List<Snapshot> held = new ArrayList<>(targets.size());
+      List<Snapshot> unlisted = new ArrayList<>();
+      for (int i = 0; i < snapshots.size(); i++) {
+        long id = snapshots.keyAt(i);
+        if (targets.contains(id)) {
+          held.add(snapshots.get(i));
+        }
+        if (!lists.containsKey(id)) {
+          unlisted.add(snapshots.get(i));
+        }
+      }
+      // A table with no list has nothing to wrap: its snapshots' checks wait for the supplier
+      boolean listed = !lists.isEmpty();
+      if (listed) {
+        checkInlineSnapshots(state, tblId, unlisted, true);
+      } else {
+        checkInlineSnapshots(state, tblId, held, false);
+      }
+      boolean lazy = inline.lazyLoads;
+      InlineSnapshots made = inlineSnapshots;
+      List<Snapshot> wrapped = listed ? made.wrap(tblId, lists, pool, held, lazy, false) : held;
+      LazySnapshots all = new LazySnapshots(() -> {
+        List<Snapshot> every = List.copyOf(snapshots);
+        if (!listed) {
+          checkInlineSnapshots(state, tblId, every, false);
+          return every;
+        }
+        return made.wrap(tblId, lists, pool, every, lazy, true);
+      });
+      return fields.toMetadata(location, wrapped, all);
+    }
+
+    /**
+     * Replaces snapshots with InlineSnapshot when the catalog has inline manifest list data.
+     * Snapshots without inline ML data keep their original manifestListLocation (Avro pointer).
+     */
+    private TableMetadata wrapInlineManifests(TableMetadata parsed, CatalogState proto) {
+      Integer tblId = proto.tableId(tableId);
+      if (tblId == null) {
+        return parsed;
+      }
+
+      boolean hasAny = checkInlineSnapshots(proto, tblId, parsed.snapshots(), false);
       if (!hasAny) {
         return parsed;
       }
@@ -1330,10 +1381,38 @@ public class LogCatalog extends BaseMetastoreCatalog
   }
 
   /**
+   * A lazy load's supplier of a table's snapshots: makes them once, when first asked for, and
+   * drops what it made them from. A copy serialized with the metadata (Java serialization) holds
+   * the snapshots, made then.
+   */
+  static final class LazySnapshots implements org.apache.iceberg.util.SerializableSupplier<List<Snapshot>> {
+    private transient java.util.function.Supplier<List<Snapshot>> make;
+    private List<Snapshot> made;
+
+    LazySnapshots(java.util.function.Supplier<List<Snapshot>> make) {
+      this.make = make;
+    }
+
+    @Override
+    public synchronized List<Snapshot> get() {
+      if (made == null) {
+        made = List.copyOf(make.get());
+        make = null;
+      }
+      return made;
+    }
+
+    private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
+      get();
+      out.defaultWriteObject();
+    }
+  }
+
+  /**
    * The {@link InlineSnapshot}s a catalog's loads of inline tables made, which later loads reuse.
    * A load makes every snapshot with an inline list an InlineSnapshot holding it, of
-   * GenericManifestFile copies, which a lazy load ({@code fileio.catalog.load.lazy}) makes only
-   * when the snapshot's manifests are first asked for: Iceberg compares manifests by equality, which for
+   * GenericManifestFile copies (made when the snapshot's manifests are first asked for, in a lazy
+   * load: {@code fileio.catalog.load.lazy}): Iceberg compares manifests by equality, which for
    * GenericManifestFile is by path. Expiry's ReachableFileCleanup finds the manifests that retained
    * snapshots still use that way; the catalog's own entries, equal only to themselves, were never
    * found in use, and their files were deleted. One copy per pool entry, which every list naming
@@ -1388,9 +1467,24 @@ public class LogCatalog extends BaseMetastoreCatalog
      * has an inline list as an InlineSnapshot holding it: made on first use if {@code lazy}.
      */
     List<Snapshot> wrap(CatalogState state, int tblId, List<Snapshot> parsed, boolean lazy) {
+      return wrap(
+          tblId, state.snapshotManifests(tblId), state.manifestPool(tblId), parsed, lazy, true);
+    }
+
+    /**
+     * {@code parsed}, snapshots of inline table {@code tblId} whose lists and pool are these, each
+     * that has a list as an InlineSnapshot holding it. {@code all}: these are all of the table's
+     * snapshots, so the InlineSnapshots made for others are dropped; else (a lazy load's refs'
+     * targets) they are kept.
+     */
+    List<Snapshot> wrap(
+        int tblId,
+        Map<Long, List<String>> lists,
+        Map<String, ManifestFile> pool,
+        List<Snapshot> parsed,
+        boolean lazy,
+        boolean all) {
       TableSnapshots table = tables.computeIfAbsent(tblId, id -> new TableSnapshots());
-      Map<Long, List<String>> lists = state.snapshotManifests(tblId);
-      Map<String, ManifestFile> pool = state.manifestPool(tblId);
       synchronized (table) {
         if (table.copies.size() > 2 * pool.size() + 64) {
           table.made.clear();
@@ -1423,7 +1517,9 @@ public class LogCatalog extends BaseMetastoreCatalog
           }
           snapshots.add(made.snapshot);
         }
-        table.made.keySet().retainAll(loaded);
+        if (all) {
+          table.made.keySet().retainAll(loaded);
+        }
         return snapshots;
       }
     }
