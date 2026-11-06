@@ -385,7 +385,9 @@ the root (one a compactor ahead wrote) is not garbage.
   supplier loads the table as it is when asked, and Iceberg's
   `TableMetadata` keeps what the supplier gives of the snapshots it
   inherited and drops those past its last sequence number. A pointer
-  handle holds them all. As built: a load whose page is missing reads the
+  handle holds them all; matching it would take a grace period, a clock in
+  the sweep, and REST's semantics are enough (settled 2026-11-06). As
+  built: a load whose page is missing reads the
   catalog again. If the table has moved past the version it read and no
   longer names the page, the page was collected, and the load answers with
   its version's inline snapshots and those of its sealed blocks' live ids
