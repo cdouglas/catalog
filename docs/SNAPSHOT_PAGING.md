@@ -548,9 +548,35 @@ commit latency (p50 / p99) and the catalog bytes it read:
   - S3 Express: 2.90, 3.26 and 5.17 GB.
   - Setup alone leaves 0.85 GB: the aged tables' files in the in-memory
     store.
-  - What holds the rest at this depth has not been attributed. At 1,000
-    snapshots, where no block seals, the run ends at 0.33-0.49 GB, against
-    e3-d20's 0.68-1.07.
+  - At 1,000 snapshots, where no block seals, the run ends at 0.33-0.49
+    GB, against e3-d20's 0.68-1.07.
+  - The rest at 7,200 is the tables' whole history, decoded once per
+    client: 10 tables of 7,200 snapshots in each of the run's 8 clients
+    (2026-11-07, attributed locally: the S3 Express configuration run from
+    havoc's pack ended at 2.91 GB, as on havoc).
+    - Its live heap grew 2.0 GB from the warmup's start. That growth holds
+      589,000 `InlineSnapshot`s, 559,000 `BaseSnapshot`s and 587,000
+      summary maps: 8 × 72,000. That is about 3.7 KB a snapshot, or 250 MB a
+      client.
+    - Most of it is the summaries, a fresh map of strings per snapshot parsed
+      from its JSON, and the manifest entries of the pages' lists.
+    - Every merge append decodes it. `stageOn` asks for the snapshots of the
+      commit's metadata, and that resolves the base's snapshot supplier. It
+      does so in `manifestUpdates`, to find the snapshots the commit adds,
+      and in `computeDelta`, which compares the two versions' ids. The
+      supplier reads every sealed block's page.
+    - Two holders keep the history. The catalog's page cache
+      (`InlineSnapshots.pages`) is bounded at 256 pages, not by bytes, and
+      E3 has 240, so every client keeps every page, and with it the 85% of
+      snapshots behind the line. The resolved supplier of each table
+      version's metadata holds an `InlineSnapshot` over each of them for as
+      long as the client's replica holds that version. The replica's
+      chains hold the inline window.
+    - One process per client, as in production, would hold one copy. The
+      benchmark's driver hosts all 8 (catalog-bench DESIGN.md, caveats 7
+      and 8).
+    - A commit that resolved nothing would hold none of this ([Open
+      questions](#open-questions)).
 
 ## What changes in the code
 
@@ -751,7 +777,10 @@ Each step stands alone and is measured before the next:
      named. Until then a copy ships every snapshot, as before.
    - Still made whole: an expiry, a full update, a checkpoint's encode, a
      copy for workers, and a commit's delta (`computeDelta` compares the
-     two versions' snapshots).
+     two versions' snapshots, and `manifestUpdates` looks through them for
+     the new ones). Paged, the commit's delta reads every page; at E3's
+     7,200 snapshots each client keeps the whole history this way
+     ([Sizes](#sizes)).
 4. **Sealing and pages.** The root's sealed blocks, the page store (shared
    with the committed set), refs moved back with proofs, and page GC; and
    `SerializableTable` shipping the head and a supplier that reads pages
@@ -873,6 +902,21 @@ Each step stands alone and is measured before the next:
 ## Open questions
 
 - **W and B**: their defaults, swept in experiments.
+- **A commit makes every snapshot** (measured 2026-11-07, [Sizes](#sizes)).
+  - The cost: a commit to a paged table resolves its snapshot supplier, so
+    every merge append decodes the table's history and reads any page its
+    client has not cached. At E3's 7,200 snapshots that is about 250 MB of
+    live heap per client, kept by the page cache. It is also the merge
+    append's page GET (0.8-1.6) and part of its CPU.
+  - Proposed: compute the commit's snapshot changes without asking for
+    `snapshots()`. One way is from `metadata.changes()` (added snapshots,
+    removed ids, ref updates), as Iceberg's REST client builds its commit
+    request. Another is to compare ids from the state's sealed blocks and
+    the metadata's loaded snapshots.
+  - To be checked before choosing: replace transactions, full mode, and a
+    transaction's metadata built over several builders.
+  - Separately, the page cache's bound is in pages; a bound in bytes would
+    hold for deep fast-append tables, whose pages are larger.
 - **The sealed ids and log entries.** A sealed snapshot still costs the root
   about 18 B: its id (8 B) and its snapshot-log entry (about 10 B). A table's
   depth is the snapshots it keeps, its commit rate times its retention;
