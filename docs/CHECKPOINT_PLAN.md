@@ -193,7 +193,8 @@ D20 (four reads per commit) cost goes with it.
      heap at the end was 2.3-3.9 GB, against e3-d20's 1.1-1.3 GB (e3-d20 had
      the memo too, with less per table). The same configuration run locally
      held 1,885 entries for 80 live rows. The entry is now a field of the row
-     (`TblEntry.encoded`) and goes with it.
+     (`TblEntry.encoded`) and goes with it. Rerun with the fix (e3-sp3), the
+     same configuration ended at 0.33 GB.
 3. One checkpoint step from a replica, memoized per replica, for create, replace
    and `compact()`: where every paging change will land, and no encode per
    throttled resend.

@@ -488,19 +488,69 @@ and reads no page.
 
 ## Sizes
 
-Estimates, to be measured (ReplayBench, catalog-bench E3):
+A table's part of the root, measured after step 5 (2026-11-07):
 
-| Table | Today | Lists as deltas only | Paged, W = 1,024 |
-|---|---|---|---|
-| ML, merge appends, 7,200 snapshots (E3) | 2.4 MB | about 1.2 MB | about 0.25-0.45 MB |
-| ML, fast appends, 3,000 snapshots | 12.8 MB | about 0.4 MB | about 0.3 MB |
-| TM only, 7,200 snapshots | about 0.5 MB | the same | about 0.2 MB |
+- **E3** (catalog-bench): 10 tables of mix A (merge appends), as their
+  catalog object's median size over a run's measured window, divided by
+  10. Before step 2 is e3-d20 (fileio e505a0f), lists as deltas only is
+  e3-sp3's ablation (paging off), and paged is e3-sp3 (fileio ebb621e).
+- **ReplayBench**: one table's checkpoint (REPLAY_BENCH_RESULTS.md).
+  Before step 2 is the capture before it; the other two are step 4's off
+  and on.
+
+The fast-append row is still estimates past its first column, because the
+TM capture of fast appends at 3,000 does not fit the dev box:
+
+| Table | Before step 2 | Lists as deltas only | Paged, W = 1,024 | Its pages |
+|---|---|---|---|---|
+| ML, merge appends, 7,200 snapshots (E3) | 2.38 MB | 1.30 MB | 0.36 MB | 1.07 MB in 24 |
+| ML, merge appends, 3,000 snapshots (ReplayBench) | 927 KB | 393 KB | 216 KB | |
+| ML, fast appends, 3,000 snapshots | 12.8 MB | about 0.4 MB | about 0.3 MB | |
+| TM only, 7,200 snapshots (E3) | 0.46 MB | the same | 0.23 MB | 0.32 MB in 24 |
+| TM only, 3,000 snapshots (ReplayBench) | 176 KB | the same | 134 KB | |
+
+The estimates for E3 were about 1.2 MB and 0.25-0.45 MB for an ML table,
+and about 0.2 MB paged for TM.
 
 The paged root still costs about 18 B a sealed snapshot (its id and log
 entry), about 110 KB at 7,200, and a catalog of many such tables adds them
 up ([Open questions](#open-questions)). A fast-append
 table's head list names every manifest it has: paging cannot shrink that, and
 only a merge can.
+
+**What it buys a commit.** E3 at 7,200 snapshots, from catalog-bench
+e3-d20 and e3-sp3 (medians of 3 runs). Each cell is a merge append's
+commit latency (p50 / p99) and the catalog bytes it read:
+
+| Store, mode | e3-d20 | Paging off | Paged |
+|---|---|---|---|
+| S3 Standard, ML | 9,179 / 99,786 ms, 158 MiB | 5,242 / 59,507 ms, 80 MiB | 547 / 3,235 ms, 8.7 MiB |
+| S3 Standard, TM | 824 / 9,328 ms, 13.5 MiB | 990 / 5,049 ms, 13.6 MiB | 502 / 1,942 ms, 5.2 MiB |
+| S3 Express, ML | 904 / 5,447 ms, 56 MiB | 381 / 4,259 ms, 29 MiB | 130 / 647 ms, 7.4 MiB |
+| S3 Express, TM | 358 / 1,425 ms, 9.6 MiB | 218 / 1,597 ms, 9.8 MiB | 127 / 516 ms, 4.9 MiB |
+
+- **ML on S3 Standard.** Every commit there is a CAS of the whole object.
+  With paging off, the driver saturated: its CPU, its GC (25% of the run)
+  and its writer pool. It finished 163 of the schedule's 500 merge appends.
+  Paged, it ran all 500 with GC at 3.2%, against e3-d20's 44.5%.
+- **Pages read.** A paged merge append reads about one page (0.8-1.6
+  GETs).
+- **Pointer tables** are unchanged: 810 and 434 ms p50 against e3-d20's 807
+  and 441.
+- **TM and pointer on S3 Standard** flag the driver's writer pool in every
+  arm. Their hourly expiry reads every snapshot's list file, 7,211 GETs, and
+  takes 260 s; the table's merge appends queue behind it. ML's lists are
+  inline, so its expiry takes 0.9 s.
+- **Live heap at the end of a run** (after a full GC) at 7,200 ML
+  snapshots:
+  - S3 Standard: 2.67 GB paged, 2.05 GB with paging off (which ran a third
+    of the commits), 6.85 GB for e3-d20.
+  - S3 Express: 2.90, 3.26 and 5.17 GB.
+  - Setup alone leaves 0.85 GB: the aged tables' files in the in-memory
+    store.
+  - What holds the rest at this depth has not been attributed. At 1,000
+    snapshots, where no block seals, the run ends at 0.33-0.49 GB, against
+    e3-d20's 0.68-1.07.
 
 ## What changes in the code
 
@@ -691,7 +741,10 @@ Each step stands alone and is measured before the next:
      state's tables were kept between cycles: 1,885 entries for 80 live rows.
      With both fixed, the local run ended at 0.33 GB (from 3.21), its GC time
      2.3 s (from 5.1) and its CPU 97 s (from 131). e3-d20 had the memo too,
-     so its live heap is high by some of the same. e3-sp is rerun again.
+     so its live heap is high by some of the same. e3-sp3, the second rerun,
+     ended at 0.33 GB on S3 Standard and 0.49 GB on S3 Express at 1,000 ML
+     snapshots (e3-d20: 1.07 and 0.68 GB), with GC at 1.1% of the run
+     (e3-d20: 5.5%); its bytes and requests are e3-sp2's ([Sizes](#sizes)).
    - `SerializableTable` moves to step 4: before pages, a worker's supplier
      could read only the whole catalog object, whose newer versions may
      have expired the shipped version's snapshots; pages are immutable and
