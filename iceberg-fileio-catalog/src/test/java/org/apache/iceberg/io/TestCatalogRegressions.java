@@ -5262,4 +5262,55 @@ public class TestCatalogRegressions {
       return new java.lang.ref.WeakReference<>(state.manifestPool(state.tableId(a)));
     }
   }
+
+  /**
+   * Bug 85: the checkpoint memo kept a table's decode past its row. The memo (CheckpointMemo, R0.2)
+   * was a WeakHashMap keyed by a table's row, whose value held what the encoding is a function of:
+   * the table's InlineTable, pool and lists. A weak key in the old generation is cleared only by an
+   * old-generation collection, which still marks the value live, and the entry goes only at the
+   * map's next access: so each row's InlineTable, pool and lists outlived the row by an
+   * old-generation cycle or more, and every collection between counted them live. In a CAS mode,
+   * where every commit encodes the catalog and every read decodes it anew, so that every state has
+   * rows of its own, every state's tables were kept for as long.
+   * catalog-bench's e3-sp2 found it: live heap at a run's end 2-4x e3-d20's at 1,000 snapshots on
+   * S3 Standard (CAS only) in a 12 GB heap; its configuration run locally held 1,885 memo entries
+   * for 80 live rows. An entry is now kept on its row, and goes with it.
+   */
+  @Nested
+  class MemoGoesWithItsRow {
+    private final TableIdentifier a = TableIdentifier.of("ns", "a");
+
+    @ParameterizedTest
+    @EnumSource(names = {"CAS_TM", "CAS_ML"})
+    void anEncodedTableIsCollectedWithTheStateThatHeldIt(LocalCatalogMode mode)
+        throws InterruptedException {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog writer = mode.catalog(io, "mem:///w", "c", Map.of());
+      writer.createNamespace(Namespace.of("ns"));
+      writer.createTable(a, intSchema);
+      // Each commit writes a checkpoint, whose encode records a's encoding beside its row
+      java.lang.ref.WeakReference<Object> encoded = commit(writer, "a0");
+      // The next commit makes a new version of a, with a new row: the last the memo sees
+      assertThat(commit(writer, "a1").get()).isNotNull();
+
+      for (int i = 0; i < 50 && encoded.get() != null; i++) {
+        System.gc();
+        Thread.sleep(20);
+      }
+      assertThat(encoded.get()).as(mode.name()).isNull();
+    }
+
+    /** Appends to a, and returns weakly its InlineTable in the state the commit landed. */
+    private java.lang.ref.WeakReference<Object> commit(LogCatalog catalog, String file) {
+      Table table = catalog.loadTable(a);
+      table.newFastAppend().appendFile(file(file)).commit();
+      LogCatalog.FileIOTableOperations ops = (LogCatalog.FileIOTableOperations)
+          ((org.apache.iceberg.HasTableOperations) table).operations();
+      CatalogState state = ops.lastRead().state();
+      InlineTable inline = state.inlineTable(state.tableId(a));
+      assertThat(inline).isNotNull();
+      assertThat(catalog.log().checkpointMemo().misses()).isPositive();
+      return new java.lang.ref.WeakReference<>(inline);
+    }
+  }
 }

@@ -18,10 +18,8 @@
  */
 package org.apache.iceberg.io;
 
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.WeakHashMap;
 import java.util.concurrent.atomic.LongAdder;
 import org.apache.iceberg.ManifestFile;
 
@@ -35,19 +33,25 @@ import org.apache.iceberg.ManifestFile;
  * same objects encode to the same bytes (I11): the memo matches them by identity, never by
  * content. One memo serves one catalog's state machine, whose threads share it.
  *
- * <p>An entry is keyed by the table's row, which no other table holds, by identity ({@code
- * TblEntry} does not override {@code equals}), and lives as long as some state holds the row: each
- * line of states folded from one decode keeps its tables' encodings, whether it is a writer's or
- * a replay of the whole log beside it (the runtime's check makes one per fold), and a line no
- * state continues takes its entries with it. With {@code -Dfileio.catalog.replay.check=true} (the
+ * <p>An entry is kept on the table's row ({@code TblEntry#encoded}), which no other table holds and
+ * a table's next version replaces, and lives as long as some state holds the row: each line of
+ * states folded from one decode keeps its tables' encodings, whether it is a writer's or a replay
+ * of the whole log beside it (the runtime's check makes one per fold), and a line no state
+ * continues takes its entries with it, in the same collection. It was a WeakHashMap keyed by the
+ * row (Bug 85): a weak key in the old generation is cleared only by an old-generation collection,
+ * which still marks the value live, and the entry went only at the map's next access, so each
+ * row's table, pool and lists outlived it by an old-generation cycle or more. In a CAS mode, where
+ * every commit encodes and every read decodes, so every state has rows of its own, that kept every
+ * state's tables between cycles (catalog-bench's e3-sp2 at 1,000 snapshots on S3 Standard; its
+ * configuration run locally in a 12 GB heap held 1,885 entries for 80 live rows). A hit
+ * needs the very objects the entry was made from, so an entry is good whichever machine reads it;
+ * the counts are this memo's. With {@code -Dfileio.catalog.replay.check=true} (the
  * test suites set it) each reuse is checked against a fresh encoding.
  */
 final class CheckpointMemo {
 
   static final boolean CHECK = Boolean.getBoolean("fileio.catalog.replay.check");
 
-  private final Map<CatalogState.TblEntry, Encoded> tables =
-      Collections.synchronizedMap(new WeakHashMap<>());
   private final LongAdder hits = new LongAdder();
   private final LongAdder misses = new LongAdder();
 
@@ -98,15 +102,15 @@ final class CheckpointMemo {
     }
   }
 
-  /** A table's encoding, with what it is a function of but the row (the key: see above). */
-  private static final class Encoded {
+  /** A table's encoding, with what it is a function of but the row, which holds it. */
+  static final class Encoded {
     private final int id;
     private final Inputs inputs;
     private final byte[] bytes;
 
     Encoded(int id, Inputs inputs, byte[] bytes) {
       this.id = id;
-      // Without the row, which would keep the entry alive
+      // Without the row, which holds it
       this.inputs = new Inputs(null, inputs.metadata, inputs.prefix, inputs.pool, inputs.lists,
           inputs.ordinals, inputs.nextOrdinal, inputs.conflict, inputs.codec, inputs.sealed);
       this.bytes = bytes;
@@ -115,7 +119,7 @@ final class CheckpointMemo {
 
   /** The bytes table {@code id} encoded to when it held {@code inputs}, or null. */
   byte[] get(int id, Inputs inputs) {
-    Encoded encoded = inputs.row != null ? tables.get(inputs.row) : null;
+    Encoded encoded = inputs.row != null ? inputs.row.encoded : null;
     if (encoded != null && encoded.id == id && encoded.inputs.sameContent(inputs)) {
       hits.increment();
       return encoded.bytes;
@@ -127,7 +131,7 @@ final class CheckpointMemo {
   /** Records that table {@code id}, holding {@code inputs}, encodes to {@code bytes}. */
   void put(int id, Inputs inputs, byte[] bytes) {
     if (inputs.row != null) {
-      tables.put(inputs.row, new Encoded(id, inputs, bytes));
+      inputs.row.encoded = new Encoded(id, inputs, bytes);
     }
   }
 

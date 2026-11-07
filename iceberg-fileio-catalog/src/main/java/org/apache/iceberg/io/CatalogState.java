@@ -500,6 +500,9 @@ public class CatalogState {
     public final String name;
     public final int version;
     public final String metadataLocation;
+    // This version's encoding in a checkpoint, if a decode or an encode recorded it, which goes
+    // with the row (CheckpointMemo)
+    volatile CheckpointMemo.Encoded encoded;
 
     public TblEntry(int namespaceId, String name, int version, String metadataLocation) {
       this.namespaceId = namespaceId;

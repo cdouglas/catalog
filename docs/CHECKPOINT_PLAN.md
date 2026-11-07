@@ -175,12 +175,25 @@ D20 (four reads per commit) cost goes with it.
    (decoding records each table's bytes as it decodes them). Under
    `fileio.catalog.replay.check` each reuse is checked against a fresh encode.
    Switch: `fileio.catalog.checkpoint.memoize` = `true` (default) or `false`.
-   Done: `CheckpointMemo`, one per catalog's state machine, keyed weakly by
+   Done: `CheckpointMemo`, one per catalog's state machine, keyed by
    each table's row (by identity), so that every line of states folded from
    one decode keeps its tables' encodings, the runtime check's whole replays
    beside a fold included, and a line no state continues drops them;
    `TestCheckpointMemo`. It holds the encoded bytes of the inline tables of
    each live line, about the inline part of a checkpoint per line.
+   - The entry lives on the row (Bug 85, fixed 2026-11-07). A `WeakHashMap`
+     keyed by the row kept each entry's value, which holds the table's
+     `InlineTable`, pool and lists, for an old-generation cycle or more after
+     the row died. A weak key in the old generation is cleared only by an
+     old-generation collection, which still marks the value live, and the
+     entry went only at the map's next access. In a CAS mode every commit
+     encodes and every read decodes, so every state has rows of its own, and
+     every state's tables were kept between cycles. catalog-bench's e3-sp2
+     found it on S3 Standard, in a 12 GB heap: at 1,000 ML snapshots, live
+     heap at the end was 2.3-3.9 GB, against e3-d20's 1.1-1.3 GB (e3-d20 had
+     the memo too, with less per table). The same configuration run locally
+     held 1,885 entries for 80 live rows. The entry is now a field of the row
+     (`TblEntry.encoded`) and goes with it.
 3. One checkpoint step from a replica, memoized per replica, for create, replace
    and `compact()`: where every paging change will land, and no encode per
    throttled resend.

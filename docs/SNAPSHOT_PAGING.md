@@ -672,6 +672,26 @@ Each step stands alone and is measured before the next:
      1,000-snapshot ML configuration on S3 Express (150 s measured), live
      heap at the end fell from 0.92 GB to 0.50 GB; e3-d20's 300 s runs on
      havoc ended at 0.73 GB. e3-sp is rerun with the fix.
+   - Unused lists hold their state's pool only (Bug 84) and the checkpoint
+     memo goes with its row (Bug 85, CHECKPOINT_PLAN.md R0.2), both fixed
+     2026-11-07. e3-sp2, the rerun, still ended at 2.3-3.9 GB of live heap at
+     1,000 ML snapshots on S3 Standard, where every commit is a CAS, against
+     e3-d20's 1.1-1.3 GB; S3 Express, which appends, matched e3-d20. Run
+     locally in havoc's 12 GB heap, the configuration ended at 3.21 GB. Two
+     things kept old decodes. First, a catalog keeps the `InlineSnapshot`s
+     its loads made, per table, for later loads to reuse. One made lazily
+     held the pool of its load's state until its list was first used, which
+     for an old snapshot is seldom. A lazy load wraps only its refs' targets,
+     so nothing dropped the rest: in a CAS mode, where a read decodes anew,
+     each held a whole decode's pool. A load of new lists now drops what was
+     made from lists its state does not hold and moves the unused rest onto
+     its state's pool. Second, and most of it, the memo's `WeakHashMap` kept
+     each entry's table, pool and lists for an old-generation cycle after
+     its row died. In a CAS mode every state has rows of its own, so every
+     state's tables were kept between cycles: 1,885 entries for 80 live rows.
+     With both fixed, the local run ended at 0.33 GB (from 3.21), its GC time
+     2.3 s (from 5.1) and its CPU 97 s (from 131). e3-d20 had the memo too,
+     so its live heap is high by some of the same. e3-sp is rerun again.
    - `SerializableTable` moves to step 4: before pages, a worker's supplier
      could read only the whole catalog object, whose newer versions may
      have expired the shipped version's snapshots; pages are immutable and
