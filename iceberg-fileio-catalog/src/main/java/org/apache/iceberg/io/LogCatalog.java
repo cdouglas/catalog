@@ -1857,6 +1857,15 @@ public class LogCatalog extends BaseMetastoreCatalog
       private final Map<Long, Made> made = new java.util.HashMap<>();
       // pool entry (by identity) -> its copy
       private final Map<ManifestFile, ManifestFile> copies = new java.util.IdentityHashMap<>();
+      // the lists of the state the last load was of (by identity), which made's entries hold
+      private Map<Long, List<String>> lists;
+
+      /** The list {@code made} was made lazily with, of its pool's entries; then it holds none. */
+      synchronized List<ManifestFile> manifests(Made made) {
+        List<ManifestFile> manifests = manifests(made.paths, made.pool);
+        made.pool = null;
+        return manifests;
+      }
 
       /** The list of {@code paths}, as copies of {@code pool}'s entries, one copy per entry. */
       synchronized List<ManifestFile> manifests(
@@ -1873,14 +1882,19 @@ public class LogCatalog extends BaseMetastoreCatalog
       }
     }
 
-    /** An InlineSnapshot, and the list of manifest paths it was made from. */
+    /**
+     * An InlineSnapshot, the list of manifest paths it was made from, and, until its list is made
+     * (made lazily), the pool to make it of: that of a state holding the list (Bug 84). Guarded by
+     * its TableSnapshots.
+     */
     private static final class Made {
       private final List<String> paths;
-      private final InlineSnapshot snapshot;
+      private InlineSnapshot snapshot;
+      private Map<String, ManifestFile> pool;
 
-      Made(List<String> paths, InlineSnapshot snapshot) {
+      Made(List<String> paths, Map<String, ManifestFile> pool) {
         this.paths = paths;
-        this.snapshot = snapshot;
+        this.pool = pool;
       }
     }
 
@@ -1912,6 +1926,20 @@ public class LogCatalog extends BaseMetastoreCatalog
           table.made.clear();
           table.copies.clear();
         }
+        if (table.lists != lists) {
+          // What loads made from lists this state does not hold is never reused, and one not yet
+          // asked for its list holds the pool it would make it of (Bug 84: in a CAS mode, where a
+          // read decodes anew, a whole pool per decode; a lazy load wraps only its refs' targets,
+          // so nothing else drops them). Drop those; move the rest onto this state's pool, which
+          // resolves a list it holds to the same entries
+          table.made.entrySet().removeIf(e -> lists.get(e.getKey()) != e.getValue().paths);
+          for (Made made : table.made.values()) {
+            if (made.pool != null) {
+              made.pool = pool;
+            }
+          }
+          table.lists = lists;
+        }
         List<Snapshot> snapshots = new java.util.ArrayList<>(parsed.size());
         java.util.Set<Long> loaded = new java.util.HashSet<>();
         for (Snapshot s : parsed) {
@@ -1923,18 +1951,19 @@ public class LogCatalog extends BaseMetastoreCatalog
           loaded.add(s.snapshotId());
           Made made = table.made.get(s.snapshotId());
           if (made == null || made.paths != paths || !sameSnapshot(made.snapshot, s)) {
-            InlineSnapshot snapshot = lazy
+            Made making = new Made(paths, lazy ? pool : null);
+            making.snapshot = lazy
                 ? new InlineSnapshot(
                     s.sequenceNumber(), s.snapshotId(), s.parentId(),
                     s.timestampMillis(), s.operation(), s.summary(),
                     s.schemaId(), s.firstRowId(), s.addedRows(), s.keyId(),
-                    () -> table.manifests(paths, pool))
+                    () -> table.manifests(making))
                 : new InlineSnapshot(
                     s.sequenceNumber(), s.snapshotId(), s.parentId(),
                     s.timestampMillis(), s.operation(), s.summary(),
                     s.schemaId(), s.firstRowId(), s.addedRows(), s.keyId(),
                     table.manifests(paths, pool));
-            made = new Made(paths, snapshot);
+            made = making;
             table.made.put(s.snapshotId(), made);
           }
           snapshots.add(made.snapshot);

@@ -5197,4 +5197,69 @@ public class TestCatalogRegressions {
           new java.lang.ref.WeakReference<>(read.state()));
     }
   }
+
+  /**
+   * Bug 84: a lazy InlineSnapshot held its load's manifest pool until its list was first used. A
+   * catalog keeps the InlineSnapshots its loads made, per table, for later loads to reuse; one
+   * made lazily (snapshot paging step 3) made its list from the pool of the state it was loaded
+   * from, which it held until then, and an old snapshot's list is seldom used. A lazy load wraps
+   * only its refs' targets, so nothing dropped the rest: in a CAS mode, where a read decodes the
+   * catalog anew, each kept InlineSnapshot held the whole pool of the decode that made it, and in
+   * an append mode an older version of the pool. catalog-bench's e3-sp2 found it: live heap 2-4x
+   * e3-d20's at 1,000 snapshots on S3 Standard (CAS only), 613k decoded manifests live in 8
+   * clients of 10 tables. A load now drops what earlier loads made from lists its state no longer
+   * holds, and moves the unused rest onto its state's pool; a made list holds no pool.
+   */
+  @Nested
+  class LazyListsHoldOnlyTheirStatesPool {
+    private final TableIdentifier a = TableIdentifier.of("ns", "a");
+
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND_ML", "CAS_ML", "COMPACT_ML", "MEMLOG_ML"})
+    void aLaterLoadReleasesThePoolOfUnusedLists(LocalCatalogMode mode)
+        throws InterruptedException {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog writer = mode.catalog(io, "mem:///w", "c", Map.of());
+      writer.createNamespace(Namespace.of("ns"));
+      writer.createTable(a, intSchema).newFastAppend().appendFile(file("a0")).commit();
+      for (int i = 1; i <= 3; i++) {
+        writer.loadTable(a).newFastAppend().appendFile(file("a" + i)).commit();
+      }
+
+      // The reader asks for every snapshot, as a commit's delta does: its catalog keeps an
+      // InlineSnapshot for each, their lists not made
+      LogCatalog reader = mode.catalog(io, "mem:///w", "c", Map.of());
+      java.lang.ref.WeakReference<Object> pool = everySnapshot(reader);
+      // Later versions of the table, which the reader loads: each load wraps only the current
+      // snapshot
+      for (int i = 4; i <= 6; i++) {
+        writer.loadTable(a).newFastAppend().appendFile(file("a" + i)).commit();
+        assertThat(reader.loadTable(a).currentSnapshot()).isNotNull();
+      }
+
+      for (int i = 0; i < 50 && pool.get() != null; i++) {
+        System.gc();
+        Thread.sleep(20);
+      }
+      assertThat(pool.get()).as(mode.name()).isNull();
+      // The InlineSnapshots kept from the first load still read their lists
+      Table table = reader.loadTable(a);
+      assertThat(table.snapshots()).hasSize(7);
+      for (org.apache.iceberg.Snapshot snapshot : table.snapshots()) {
+        assertThat(snapshot.allManifests(table.io()))
+            .as(mode.name())
+            .hasSize((int) (snapshot.sequenceNumber()));
+      }
+    }
+
+    /** Loads every snapshot of a, and returns weakly the pool of the state they were made from. */
+    private java.lang.ref.WeakReference<Object> everySnapshot(LogCatalog catalog) {
+      Table table = catalog.loadTable(a);
+      assertThat(table.snapshots()).hasSize(4);
+      LogCatalog.FileIOTableOperations ops = (LogCatalog.FileIOTableOperations)
+          ((org.apache.iceberg.HasTableOperations) table).operations();
+      CatalogState state = ops.lastRead().state();
+      return new java.lang.ref.WeakReference<>(state.manifestPool(state.tableId(a)));
+    }
+  }
 }
