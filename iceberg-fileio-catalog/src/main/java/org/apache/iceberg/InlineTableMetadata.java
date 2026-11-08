@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.encryption.EncryptedKey;
@@ -160,5 +161,59 @@ public final class InlineTableMetadata {
   /** A metadata-log entry: {@code file} was the table's metadata until {@code timestampMillis}. */
   public static TableMetadata.MetadataLogEntry metadataLogEntry(long timestampMillis, String file) {
     return new TableMetadata.MetadataLogEntry(timestampMillis, file);
+  }
+
+  /** Whether {@code metadata} has made all its snapshots: no supplier is left to call. */
+  public static boolean snapshotsLoaded(TableMetadata metadata) {
+    return metadata.snapshotsLoaded();
+  }
+
+  /**
+   * The snapshots that {@code metadata}, built on {@code base}, adds to it, in the order it added
+   * them, if that is known without making the snapshots either has not made; else null.
+   *
+   * <p>It is known when {@code metadata} is a lazy load's {@code base} carried through builders
+   * that made no snapshot: both hold the same supplier, and neither has called it. A builder that
+   * removes a snapshot, or moves a ref onto one it has not made, makes them all first, so such a
+   * {@code metadata} holds every snapshot of {@code base} (the supplier's, and those {@code base}
+   * added) and those its own changes past {@code base}'s add. Each of those is numbered past
+   * {@code base}'s last sequence number ({@code Builder.addSnapshot}, format 2 and later), which
+   * every snapshot of {@code base} is not, so none was in {@code base}. Format 1 numbers nothing,
+   * so there it is not known.
+   */
+  public static List<Snapshot> addedSnapshots(TableMetadata base, TableMetadata metadata) {
+    if (base == null
+        || metadata.formatVersion() < 2
+        || base.snapshotsLoaded()
+        || metadata.snapshotsLoaded()
+        || metadata.snapshotsSupplier() != base.snapshotsSupplier()) {
+      return null;
+    }
+    List<MetadataUpdate> before = base.changes();
+    List<MetadataUpdate> changes = metadata.changes();
+    if (changes.size() < before.size()) {
+      return null;
+    }
+    for (int i = 0; i < before.size(); i++) {
+      if (changes.get(i) != before.get(i)) {
+        return null;
+      }
+    }
+    List<Snapshot> added = new ArrayList<>();
+    for (MetadataUpdate change : changes.subList(before.size(), changes.size())) {
+      if (change instanceof MetadataUpdate.RemoveSnapshots) {
+        return null;
+      }
+      if (change instanceof MetadataUpdate.AddSnapshot) {
+        long id = ((MetadataUpdate.AddSnapshot) change).snapshot().snapshotId();
+        // The snapshot as metadata holds it, which its snapshots() would give
+        Snapshot held = metadata.snapshotIfKnown(id);
+        if (held == null || held.sequenceNumber() <= base.lastSequenceNumber()) {
+          return null;
+        }
+        added.add(held);
+      }
+    }
+    return added;
   }
 }

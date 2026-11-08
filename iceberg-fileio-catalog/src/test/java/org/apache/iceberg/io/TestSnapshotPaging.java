@@ -29,6 +29,7 @@ import java.util.stream.Collectors;
 import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.HasTableOperations;
+import org.apache.iceberg.InlineTableMetadata;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
@@ -176,6 +177,101 @@ class TestSnapshotPaging {
           loaded.newScan().useSnapshot(ids.get(2)).planFiles()) {
         assertThat(Iterables.size(tasks)).isEqualTo(3);
       }
+    }
+  }
+
+  private static org.apache.iceberg.DataFile file(int i) {
+    return DataFiles.builder(SPEC)
+        .withPath("mem:///data/f" + i + ".parquet")
+        .withFileSizeInBytes(10)
+        .withRecordCount(1)
+        .withPartitionPath("cat=" + (i % 4))
+        .build();
+  }
+
+  /**
+   * A commit to a lazily loaded table makes no snapshot it does not add: neither the metadata it
+   * was staged on nor the metadata it adopts calls its snapshots supplier, which would read every
+   * sealed block's page (SNAPSHOT_PAGING.md, "Sizes": every merge append made the whole history,
+   * and each client kept it). Merge and fast appends, an append to a branch, and a staged append,
+   * whose producer then looks for its snapshot, which no ref targets, in the version it adopted. A
+   * transaction is Iceberg's to make whole ({@code BaseTransaction} notes the snapshots it started
+   * with, to clean up after a failure), so a branch's creation and transactions of two appends (on
+   * the branch, where the second's parent is the first, which the base lacks, and on main) are
+   * checked only for what they commit: a fresh catalog reads every snapshot each commit added, and
+   * every file.
+   */
+  @ParameterizedTest
+  @EnumSource(names = {"APPEND_ML", "COMPACT_ML", "CAS_ML", "CAS_TM", "MEMLOG_ML"})
+  void aCommitMakesNoSnapshotItDoesNotAdd(LocalCatalogMode mode) throws Exception {
+    LogCatalog writer = mode.catalog(io, WAREHOUSE, "commit", paging(4, 8));
+    writer.createNamespace(Namespace.of("ns"));
+    Table table = writer.buildTable(TABLE, SCHEMA).withPartitionSpec(SPEC).create();
+    List<Long> ids = new ArrayList<>();
+    for (int i = 0; i < 40; i++) {
+      append(table, i);
+      ids.add(table.currentSnapshot().snapshotId());
+    }
+    CatalogState state = writer.log().read().state();
+    assertThat(state.sealedBlocks(state.tableId(TABLE))).isNotEmpty();
+
+    Table loaded = mode.catalog(io, WAREHOUSE, "commit", paging(4, 8)).loadTable(TABLE);
+    List<Runnable> commits = List.of(
+        () -> loaded.newAppend().appendFile(file(100)).commit(),
+        () -> loaded.newFastAppend().appendFile(file(101)).commit(),
+        () -> loaded.manageSnapshots()
+            .createBranch("b", loaded.currentSnapshot().snapshotId())
+            .commit(),
+        () -> loaded.newAppend().appendFile(file(102)).toBranch("b").commit(),
+        () -> loaded.newFastAppend().appendFile(file(103)).stageOnly().commit(),
+        () -> {
+          org.apache.iceberg.Transaction txn = loaded.newTransaction();
+          txn.newFastAppend().appendFile(file(104)).toBranch("b").commit();
+          txn.newAppend().appendFile(file(105)).toBranch("b").commit();
+          txn.commitTransaction();
+        },
+        () -> {
+          org.apache.iceberg.Transaction txn = loaded.newTransaction();
+          txn.newFastAppend().appendFile(file(106)).commit();
+          txn.newAppend().appendFile(file(107)).commit();
+          txn.commitTransaction();
+        });
+    int[] adds = {1, 1, 0, 1, 1, 2, 2};
+    boolean[] lazy = {true, true, false, true, true, false, false};
+    boolean[] adoptedLazy = {true, true, false, true, false, false, false};
+    int expected = ids.size();
+    for (int i = 0; i < commits.size(); i++) {
+      TableMetadata base = current(loaded);
+      if (lazy[i]) {
+        assertThat(InlineTableMetadata.snapshotsLoaded(base)).as("commit %s's base", i).isFalse();
+      }
+      commits.get(i).run();
+      expected += adds[i];
+      if (lazy[i]) {
+        assertThat(InlineTableMetadata.snapshotsLoaded(base))
+            .as("commit %s made its base's snapshots", i)
+            .isFalse();
+      }
+      if (adoptedLazy[i]) {
+        assertThat(InlineTableMetadata.snapshotsLoaded(current(loaded)))
+            .as("commit %s made the snapshots of the version it adopted", i)
+            .isFalse();
+      }
+    }
+
+    Table fresh = mode.catalog(io, WAREHOUSE, "commit", paging(4, 8)).loadTable(TABLE);
+    List<Snapshot> snapshots = current(fresh).snapshots();
+    assertThat(snapshots).hasSize(expected);
+    assertThat(snapshots.subList(0, ids.size())).extracting(Snapshot::snapshotId)
+        .containsExactlyElementsOf(ids);
+    assertThat(snapshots).extracting(Snapshot::snapshotId)
+        .containsExactlyInAnyOrderElementsOf(current(loaded).snapshots().stream()
+            .map(Snapshot::snapshotId).collect(Collectors.toList()));
+    try (CloseableIterable<FileScanTask> tasks = fresh.newScan().planFiles()) {
+      assertThat(Iterables.size(tasks)).isEqualTo(44); // 40, two appends, a transaction's two
+    }
+    try (CloseableIterable<FileScanTask> tasks = fresh.newScan().useRef("b").planFiles()) {
+      assertThat(Iterables.size(tasks)).isEqualTo(45); // main's 42 when branched, and its three
     }
   }
 

@@ -865,8 +865,14 @@ public class InlineDeltaCodec {
         }
       }
       Long only = onlyNewSnapshot(updates);
+      Set<Long> adds = new HashSet<>();
       for (DeltaUpdate update : updates) {
-        byte[] updateBytes = encodeUpdate(update, base, only);
+        if (update instanceof AddSnapshotUpdate) {
+          adds.add(((AddSnapshotUpdate) update).snapshotId);
+        }
+      }
+      for (DeltaUpdate update : updates) {
+        byte[] updateBytes = encodeUpdate(update, base, only, adds);
         writeLengthDelimited(out, DELTA_UPDATES, updateBytes);
       }
       String prefix = namesUnder(updates);
@@ -956,6 +962,20 @@ public class InlineDeltaCodec {
    */
   public static List<DeltaUpdate> computeDelta(
       TableMetadata oldMeta, TableMetadata newMeta, String manifestListPrefix) {
+    return computeDelta(
+        oldMeta, newMeta, manifestListPrefix, SnapshotChange.of(oldMeta, newMeta));
+  }
+
+  /**
+   * As {@link #computeDelta(TableMetadata, TableMetadata, String)}, with what the commit does to
+   * the table's snapshots, {@code change}: the only snapshots it reads, so that a commit to a
+   * lazily loaded table makes no other.
+   */
+  static List<DeltaUpdate> computeDelta(
+      TableMetadata oldMeta,
+      TableMetadata newMeta,
+      String manifestListPrefix,
+      SnapshotChange change) {
     // Concurrent-replace collision: if a schema, partition spec, or sort order
     // appears in both old and new metadata under the same id but with different
     // content, delta encoding can't express the in-place swap (Builder rejects
@@ -984,7 +1004,7 @@ public class InlineDeltaCodec {
     // Replay numbers the commit's new snapshots after the base's last sequence number, in order,
     // and advances next-row-id by their added rows. A transaction that also expired a snapshot it
     // added left a gap, which only full mode carries.
-    if (!sequenceAndRowIdsFollow(oldMeta, newMeta)) {
+    if (!sequenceAndRowIdsFollow(oldMeta, newMeta, change)) {
       return null;
     }
     // Replay adds the commit's new schemas and specs to the base's before it removes any, and
@@ -1013,77 +1033,61 @@ public class InlineDeltaCodec {
     // transaction that rolled main back and then changed something else (a branch) logged main at
     // the earlier time, and one that moved main and back (append, roll back) logged main again:
     // only full mode carries those.
-    if (!replayLogsAsTheWriterDid(oldMeta, newMeta)) {
+    if (!replayLogsAsTheWriterDid(oldMeta, newMeta, change)) {
       return null;
     }
     List<DeltaUpdate> updates = new ArrayList<>();
 
     // New snapshots (most common path: data commits)
-    Set<Long> oldSnapIds = new HashSet<>();
-    for (org.apache.iceberg.Snapshot s : oldMeta.snapshots()) {
-      oldSnapIds.add(s.snapshotId());
-    }
-    for (org.apache.iceberg.Snapshot snap : newMeta.snapshots()) {
-      if (!oldSnapIds.contains(snap.snapshotId())) {
-        // InlineSnapshot has null manifestListLocation (no Avro file written);
-        // use empty suffix — the actual ML data is in AddManifestUpdate entries.
-        String manifestList = snap.manifestListLocation();
-        String suffix = "";
-        if (manifestList != null) {
-          suffix = manifestList;
-          if (manifestListPrefix != null && !manifestListPrefix.isEmpty()
-              && manifestList.startsWith(manifestListPrefix)) {
-            suffix = manifestList.substring(manifestListPrefix.length());
-          }
+    for (org.apache.iceberg.Snapshot snap : change.added) {
+      // InlineSnapshot has null manifestListLocation (no Avro file written);
+      // use empty suffix — the actual ML data is in AddManifestUpdate entries.
+      String manifestList = snap.manifestListLocation();
+      String suffix = "";
+      if (manifestList != null) {
+        suffix = manifestList;
+        if (manifestListPrefix != null && !manifestListPrefix.isEmpty()
+            && manifestList.startsWith(manifestListPrefix)) {
+          suffix = manifestList.substring(manifestListPrefix.length());
         }
-        // Relative to the commit's last-updated-ms, which the delta carries: replay finds it the
-        // same on whatever version of the table the delta lands.
-        long timestampDelta = snap.timestampMillis() - newMeta.lastUpdatedMillis();
-        // Absent when it is the base's current schema, which replay falls back to.
-        Integer schemaId = snap.schemaId() != null
-            && snap.schemaId() != oldMeta.currentSchemaId()
-            ? snap.schemaId() : null;
-        // Always carry parent snapshot ID explicitly. This is required for
-        // stage-only, branch, cherry-pick; reconstructing from base.currentSnapshot
-        // on replay is wrong in those cases.
-        Long parentId = snap.parentId();
-        Long firstRowId = snap.firstRowId();
-        String keyId = snap.keyId();
-        // Ensure the operation name is carried in the summary. snap.operation()
-        // is the authoritative source; snap.summary() may or may not include
-        // the "operation" key depending on the producer, and encoding relies on
-        // the summary map's entry.
-        Map<String, String> summary = snap.summary() != null
-            ? new HashMap<>(snap.summary()) : new HashMap<>();
-        if (snap.operation() != null && !summary.containsKey("operation")) {
-          summary.put("operation", snap.operation());
-        }
-        // The producer's footprint, which only an inline snapshot carries.
-        Footprint footprint =
-            snap instanceof org.apache.iceberg.InlineSnapshot
-                ? Footprint.of(
-                    ((org.apache.iceberg.InlineSnapshot) snap).footprint(), newMeta.specsById())
-                : null;
-        updates.add(new AddSnapshotUpdate(
-            snap.snapshotId(), suffix, summary,
-            timestampDelta, schemaId, snap.addedRows(),
-            parentId, firstRowId, keyId, footprint));
       }
+      // Relative to the commit's last-updated-ms, which the delta carries: replay finds it the
+      // same on whatever version of the table the delta lands.
+      long timestampDelta = snap.timestampMillis() - newMeta.lastUpdatedMillis();
+      // Absent when it is the base's current schema, which replay falls back to.
+      Integer schemaId = snap.schemaId() != null
+          && snap.schemaId() != oldMeta.currentSchemaId()
+          ? snap.schemaId() : null;
+      // Always carry parent snapshot ID explicitly. This is required for
+      // stage-only, branch, cherry-pick; reconstructing from base.currentSnapshot
+      // on replay is wrong in those cases.
+      Long parentId = snap.parentId();
+      Long firstRowId = snap.firstRowId();
+      String keyId = snap.keyId();
+      // Ensure the operation name is carried in the summary. snap.operation()
+      // is the authoritative source; snap.summary() may or may not include
+      // the "operation" key depending on the producer, and encoding relies on
+      // the summary map's entry.
+      Map<String, String> summary = snap.summary() != null
+          ? new HashMap<>(snap.summary()) : new HashMap<>();
+      if (snap.operation() != null && !summary.containsKey("operation")) {
+        summary.put("operation", snap.operation());
+      }
+      // The producer's footprint, which only an inline snapshot carries.
+      Footprint footprint =
+          snap instanceof org.apache.iceberg.InlineSnapshot
+              ? Footprint.of(
+                  ((org.apache.iceberg.InlineSnapshot) snap).footprint(), newMeta.specsById())
+              : null;
+      updates.add(new AddSnapshotUpdate(
+          snap.snapshotId(), suffix, summary,
+          timestampDelta, schemaId, snap.addedRows(),
+          parentId, firstRowId, keyId, footprint));
     }
 
     // Removed snapshots
-    Set<Long> newSnapIds = new HashSet<>();
-    for (org.apache.iceberg.Snapshot s : newMeta.snapshots()) {
-      newSnapIds.add(s.snapshotId());
-    }
-    List<Long> removedSnaps = new ArrayList<>();
-    for (long id : oldSnapIds) {
-      if (!newSnapIds.contains(id)) {
-        removedSnaps.add(id);
-      }
-    }
-    if (!removedSnaps.isEmpty()) {
-      updates.add(new RemoveSnapshotsUpdate(removedSnaps));
+    if (!change.removed.isEmpty()) {
+      updates.add(new RemoveSnapshotsUpdate(new ArrayList<>(change.removed)));
     }
 
     // Ref changes
@@ -1220,7 +1224,8 @@ public class InlineDeltaCodec {
    * moves main in one builder, which logs a snapshot it added at the snapshot's timestamp and one
    * it did not (a rollback) at the commit's last-updated-ms.
    */
-  private static boolean replayLogsAsTheWriterDid(TableMetadata oldMeta, TableMetadata newMeta) {
+  private static boolean replayLogsAsTheWriterDid(
+      TableMetadata oldMeta, TableMetadata newMeta, SnapshotChange change) {
     Set<org.apache.iceberg.HistoryEntry> old = new HashSet<>(oldMeta.snapshotLog());
     List<org.apache.iceberg.HistoryEntry> log = newMeta.snapshotLog();
     List<org.apache.iceberg.HistoryEntry> added = new ArrayList<>();
@@ -1235,7 +1240,7 @@ public class InlineDeltaCodec {
       return added.isEmpty();
     }
     long loggedAt =
-        oldMeta.snapshot(main.snapshotId()) == null
+        change.inBase(oldMeta, main.snapshotId()) == null
             ? main.timestampMillis()
             : newMeta.lastUpdatedMillis();
     return added.size() == 1
@@ -1416,13 +1421,11 @@ public class InlineDeltaCodec {
    * number and (v3) its next row id from {@code oldMeta}: each new snapshot numbered one after the
    * one before, from the base's last sequence number, and row ids advanced by their added rows.
    */
-  private static boolean sequenceAndRowIdsFollow(TableMetadata oldMeta, TableMetadata newMeta) {
+  private static boolean sequenceAndRowIdsFollow(
+      TableMetadata oldMeta, TableMetadata newMeta, SnapshotChange change) {
     long sequenceNumber = oldMeta.lastSequenceNumber();
     long nextRowId = oldMeta.nextRowId();
-    for (org.apache.iceberg.Snapshot s : newMeta.snapshots()) {
-      if (oldMeta.snapshot(s.snapshotId()) != null) {
-        continue;
-      }
+    for (org.apache.iceberg.Snapshot s : change.added) {
       if (newMeta.formatVersion() >= 2 && s.sequenceNumber() != ++sequenceNumber) {
         return false;
       }
@@ -2207,10 +2210,11 @@ public class InlineDeltaCodec {
    * which lands with full metadata) that adds the one snapshot {@code only} (null: none or
    * several). A new snapshot whose parent is in {@code base} states only the summary entries that
    * differ from its parent's, where that is shorter, and a snapshot id that is {@code only} is left
-   * out of a manifest update, a ref and an added manifest that names it.
+   * out of a manifest update, a ref and an added manifest that names it. {@code adds} are the
+   * snapshots the delta adds, which {@code base} lacks.
    */
-  private static byte[] encodeUpdate(DeltaUpdate update, TableMetadata base, Long only)
-      throws IOException {
+  private static byte[] encodeUpdate(
+      DeltaUpdate update, TableMetadata base, Long only, Set<Long> adds) throws IOException {
     ByteArrayOutputStream out = new ByteArrayOutputStream();
 
     if (update instanceof SetPropertiesUpdate) {
@@ -2324,7 +2328,7 @@ public class InlineDeltaCodec {
       DecodedSummary summary =
           u.inheritsParentExtra
               ? new DecodedSummary(u.summary, true, u.droppedExtra)
-              : stated(u.summary, parentSummary(base, u.parentSnapshotId));
+              : stated(u.summary, parentSummary(base, u.parentSnapshotId, adds));
       writeLengthDelimited(inner, SNAP_SUMMARY, encodeCompactSummary(summary));
       writeSVarint64(inner, SNAP_TIMESTAMP_DELTA, u.timestampDeltaMs);
       if (u.schemaId != null) {
@@ -3067,9 +3071,17 @@ public class InlineDeltaCodec {
     return new DecodedSummary(stated, true, dropped);
   }
 
-  /** The summary of snapshot {@code parentId} in {@code base}; null if either is null or lacks it. */
-  private static Map<String, String> parentSummary(TableMetadata base, Long parentId) {
-    Snapshot parent = base != null && parentId != null ? base.snapshot(parentId) : null;
+  /**
+   * The summary of snapshot {@code parentId} in {@code base}; null if either is null or lacks it. A
+   * parent the delta {@code adds} is not in {@code base}: it is not looked up, which in a lazily
+   * loaded base would make every snapshot.
+   */
+  private static Map<String, String> parentSummary(
+      TableMetadata base, Long parentId, Set<Long> adds) {
+    Snapshot parent =
+        base != null && parentId != null && !adds.contains(parentId)
+            ? base.snapshot(parentId)
+            : null;
     if (parent == null) {
       return null;
     }

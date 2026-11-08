@@ -575,8 +575,9 @@ commit latency (p50 / p99) and the catalog bytes it read:
     - One process per client, as in production, would hold one copy. The
       benchmark's driver hosts all 8 (catalog-bench DESIGN.md, caveats 7
       and 8).
-    - A commit that resolved nothing would hold none of this ([Open
-      questions](#open-questions)).
+    - Since 2026-11-08 a commit reads only the snapshots it adds (step 3,
+      "Still made whole"), so it holds none of this. e3-sp4 measures the
+      result.
 
 ## What changes in the code
 
@@ -775,12 +776,26 @@ Each step stands alone and is measured before the next:
      could read only the whole catalog object, whose newer versions may
      have expired the shipped version's snapshots; pages are immutable and
      named. Until then a copy ships every snapshot, as before.
-   - Still made whole: an expiry, a full update, a checkpoint's encode, a
-     copy for workers, and a commit's delta (`computeDelta` compares the
-     two versions' snapshots, and `manifestUpdates` looks through them for
-     the new ones). Paged, the commit's delta reads every page; at E3's
-     7,200 snapshots each client keeps the whole history this way
+   - Still made whole: an expiry, a full update, a checkpoint's encode, and
+     a copy for workers.
+   - A commit's delta was made whole too until 2026-11-08. `computeDelta`
+     compared the two versions' snapshots, and `manifestUpdates` looked
+     through them for the new ones. Paged, that read every page, and at
+     E3's 7,200 snapshots each client kept the whole history
      ([Sizes](#sizes)).
+   - A delta now reads only the snapshots the commit adds (`SnapshotChange`).
+     When the commit's metadata still holds its base's supplier, uncalled,
+     those are the snapshots its changes past the base's add
+     (`InlineTableMetadata.addedSnapshots`). A builder that removes a
+     snapshot, or moves a ref onto one it has not made, makes them all
+     first, so such metadata removes none. Each added snapshot is numbered
+     past the base's last sequence number, so the base cannot hold it.
+     Otherwise, as on format 1, the two versions are compared as before.
+     `TestSnapshotPaging.aCommitMakesNoSnapshotItDoesNotAdd` checks
+     merge and fast appends, an append to a branch, and a staged append.
+   - Iceberg still makes every snapshot in three cases ([Open
+     questions](#open-questions)): a transaction, a transaction that moves
+     main twice, and a staged snapshot's producer after its commit.
 4. **Sealing and pages.** The root's sealed blocks, the page store (shared
    with the committed set), refs moved back with proofs, and page GC; and
    `SerializableTable` shipping the head and a supplier that reads pages
@@ -902,21 +917,25 @@ Each step stands alone and is measured before the next:
 ## Open questions
 
 - **W and B**: their defaults, swept in experiments.
-- **A commit makes every snapshot** (measured 2026-11-07, [Sizes](#sizes)).
-  - The cost: a commit to a paged table resolves its snapshot supplier, so
-    every merge append decodes the table's history and reads any page its
-    client has not cached. At E3's 7,200 snapshots that is about 250 MB of
-    live heap per client, kept by the page cache. It is also the merge
-    append's page GET (0.8-1.6) and part of its CPU.
-  - Proposed: compute the commit's snapshot changes without asking for
-    `snapshots()`. One way is from `metadata.changes()` (added snapshots,
-    removed ids, ref updates), as Iceberg's REST client builds its commit
-    request. Another is to compare ids from the state's sealed blocks and
-    the metadata's loaded snapshots.
-  - To be checked before choosing: replace transactions, full mode, and a
-    transaction's metadata built over several builders.
-  - Separately, the page cache's bound is in pages; a bound in bytes would
-    hold for deep fast-append tables, whose pages are larger.
+- **Commits that Iceberg makes whole.** The catalog's own commit path reads
+  only the snapshots a commit adds (2026-11-08; step 3). Iceberg's still
+  makes every snapshot of a lazily loaded table in three cases, each of
+  which would read every page of a deep paged table:
+  - **A transaction.** `BaseTransaction.commitSimpleTransaction` notes the
+    ids of the snapshots it started with, to clean up after a failure.
+    `manageSnapshots()` commits through one.
+  - **A transaction that moves main twice.** The builder rewrites the
+    snapshot log without the intermediate snapshot and checks it against
+    every snapshot.
+  - **A staged snapshot.** Its producer looks for it, after the commit, in
+    the version the operations adopted, which holds only its refs' targets.
+
+  Each is a fork change, upstreamable with the lazy loads it completes.
+  None is on E3's path: its merge appends and compactions are single
+  producers, and an expiry makes every snapshot anyway.
+- **The page cache's bound** is in pages: 256 a catalog, all of E3's 240.
+  A bound in bytes would hold for deep fast-append tables, whose pages are
+  larger.
 - **The sealed ids and log entries.** A sealed snapshot still costs the root
   about 18 B: its id (8 B) and its snapshot-log entry (about 10 B). A table's
   depth is the snapshots it keeps, its commit rate times its retention;

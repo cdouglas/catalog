@@ -969,8 +969,9 @@ public class LogCatalog extends BaseMetastoreCatalog
         //      CreateTableInlineAction.apply feeds through
         //      InlineDeltaCodec.applyManifestsOnly — the same hook a full-mode
         //      update uses.
+        SnapshotChange all = SnapshotChange.of(null, metadata);
         List<InlineDeltaCodec.DeltaUpdate> manifests =
-            manifestUpdates(null, null, metadata, "", true);
+            manifestUpdates(null, null, metadata, "", true, all);
         byte[] manifestBytes =
             manifests == null
                 ? null
@@ -978,7 +979,7 @@ public class LogCatalog extends BaseMetastoreCatalog
         byte[] metadataBytes = inline.codec.encode(rewriteInlineSnapshotsForFullEncode(metadata));
         if (metadataBytes.length + (manifestBytes != null ? manifestBytes.length : 0)
                 <= inline.maxUpdateSize
-            && !restatesAManifest(null, null, metadata, true)) {
+            && !restatesAManifest(null, null, metadata, true, all)) {
           if (manifestBytes != null) {
             return mut -> mut.createTableInlineWithManifests(
                 tableId, metadataBytes, inline.codec.tag(), manifestBytes);
@@ -1026,10 +1027,14 @@ public class LogCatalog extends BaseMetastoreCatalog
         String prefix = isInline && proto.manifestListPrefix(tblId) != null
             ? proto.manifestListPrefix(tblId)
             : "";
+        // What the commit does to the table's snapshots, learned without making those of a lazy
+        // load that it does not touch, which a paged table holds in pages (SNAPSHOT_PAGING.md,
+        // "Sizes"): a delta reads only these
+        SnapshotChange change = SnapshotChange.of(base, metadata);
         List<InlineDeltaCodec.DeltaUpdate> manifests =
-            manifestUpdates(isInline ? proto : null, base, metadata, prefix, false);
+            manifestUpdates(isInline ? proto : null, base, metadata, prefix, false, change);
         if (manifests != null
-            && restatesAManifest(isInline ? proto : null, base, metadata, false)) {
+            && restatesAManifest(isInline ? proto : null, base, metadata, false, change)) {
           return toFile(mut, metadata, orFile);
         }
         if (isInline) {
@@ -1037,7 +1042,7 @@ public class LogCatalog extends BaseMetastoreCatalog
           // concurrent replace's id collision, SPEC_TM.md): full mode then.
           // Manifest lists' paths whole: the table's prefix is its manifests' (manifestUpdates)
           List<InlineDeltaCodec.DeltaUpdate> delta =
-              InlineDeltaCodec.computeDelta(base, metadata, "");
+              InlineDeltaCodec.computeDelta(base, metadata, "", change);
           if (delta != null) {
             if (replaces) {
               restateReplacement(delta, metadata);
@@ -1058,9 +1063,9 @@ public class LogCatalog extends BaseMetastoreCatalog
         // metadata: the replay registers each new inline snapshot on its parent's list, even one
         // with no updates of its own. It also sends the list of any inline snapshot the table
         // holds no list for, which the full metadata names by its sentinel (Bug 62).
-        manifests = manifestUpdates(isInline ? proto : null, base, metadata, prefix, true);
+        manifests = manifestUpdates(isInline ? proto : null, base, metadata, prefix, true, change);
         if (manifests != null
-            && restatesAManifest(isInline ? proto : null, base, metadata, true)) {
+            && restatesAManifest(isInline ? proto : null, base, metadata, true, change)) {
           return toFile(mut, metadata, orFile);
         }
         // On an inline table, the metadata goes with only the snapshots the version read lacks
@@ -1379,17 +1384,19 @@ public class LogCatalog extends BaseMetastoreCatalog
         TableMetadata base,
         TableMetadata metadata,
         String prefix,
-        boolean full) {
+        boolean full,
+        SnapshotChange change) {
       List<InlineDeltaCodec.DeltaUpdate> updates = null;
-      for (Snapshot snapshot : metadata.snapshots()) {
-        if (!sendsList(snapshot, proto, base, full)) {
+      for (Snapshot snapshot : sendCandidates(metadata, full, change)) {
+        if (!sendsList(snapshot, proto, base, full, change)) {
           continue;
         }
         if (updates == null) {
           updates = new java.util.ArrayList<>();
         }
         List<ManifestFile> manifests = snapshot.allManifests(io());
-        List<ManifestFile> parent = parentList(proto, base, metadata, snapshot.parentId(), full);
+        List<ManifestFile> parent =
+            parentList(proto, base, metadata, snapshot.parentId(), full, change);
         Set<String> paths = manifests.stream().map(ManifestFile::path).collect(Collectors.toSet());
         // The list is rebuilt in order: the parent's, less what the snapshot removes, with what it
         // adds at the positions it has. If the manifests it keeps are not in the parent's order,
@@ -1445,14 +1452,18 @@ public class LogCatalog extends BaseMetastoreCatalog
      * I3a), so the commit writes a metadata file, which holds each snapshot's list as it is.
      */
     private boolean restatesAManifest(
-        CatalogState proto, TableMetadata base, TableMetadata metadata, boolean full) {
+        CatalogState proto,
+        TableMetadata base,
+        TableMetadata metadata,
+        boolean full,
+        SnapshotChange change) {
       Integer tblId = proto != null ? proto.tableId(tableId) : null;
       Map<String, Long> firstRowIds = new HashMap<>();
       if (tblId != null) {
         proto.manifestPool(tblId).forEach((path, m) -> firstRowIds.put(path, m.firstRowId()));
       }
-      for (Snapshot snapshot : metadata.snapshots()) {
-        if (!sendsList(snapshot, proto, base, full)) {
+      for (Snapshot snapshot : sendCandidates(metadata, full, change)) {
+        if (!sendsList(snapshot, proto, base, full, change)) {
           continue;
         }
         for (ManifestFile m : snapshot.allManifests(io())) {
@@ -1476,8 +1487,12 @@ public class LogCatalog extends BaseMetastoreCatalog
      * snapshots it loaded). A delta keeps each snapshot in {@code base} as the table has it.
      */
     private boolean sendsList(
-        Snapshot snapshot, CatalogState proto, TableMetadata base, boolean full) {
-      if (isNew(snapshot, base)) {
+        Snapshot snapshot,
+        CatalogState proto,
+        TableMetadata base,
+        boolean full,
+        SnapshotChange change) {
+      if (isNew(snapshot, base, change)) {
         return true;
       }
       if (!full || !(snapshot instanceof InlineSnapshot)) {
@@ -1491,9 +1506,19 @@ public class LogCatalog extends BaseMetastoreCatalog
     }
 
     /** Whether {@code snapshot} is an inline-ML snapshot that a commit on {@code base} adds. */
-    private static boolean isNew(Snapshot snapshot, TableMetadata base) {
+    private static boolean isNew(Snapshot snapshot, TableMetadata base, SnapshotChange change) {
       return snapshot instanceof InlineSnapshot
-          && (base == null || base.snapshot(snapshot.snapshotId()) == null);
+          && change.inBase(base, snapshot.snapshotId()) == null;
+    }
+
+    /**
+     * The snapshots of {@code metadata} whose lists a commit may send, in its order: with {@code
+     * full}, every one (a full update can send the list of a snapshot the table has lost); else
+     * those the commit adds, the only ones a delta sends, so that a delta makes no other.
+     */
+    private static List<Snapshot> sendCandidates(
+        TableMetadata metadata, boolean full, SnapshotChange change) {
+      return full ? metadata.snapshots() : change.added;
     }
 
     /**
@@ -1507,12 +1532,13 @@ public class LogCatalog extends BaseMetastoreCatalog
         TableMetadata base,
         TableMetadata metadata,
         Long parentId,
-        boolean full) {
+        boolean full,
+        SnapshotChange change) {
       if (parentId == null) {
         return List.of();
       }
       Snapshot parent = metadata.snapshot(parentId);
-      if (parent != null && sendsList(parent, proto, base, full)) {
+      if (parent != null && sendsList(parent, proto, base, full, change)) {
         return parent.allManifests(io());
       }
       Integer tblId = proto != null ? proto.tableId(tableId) : null;
