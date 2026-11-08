@@ -493,7 +493,7 @@ A table's part of the root, measured after step 5 (2026-11-07):
 - **E3** (catalog-bench): 10 tables of mix A (merge appends), as their
   catalog object's median size over a run's measured window, divided by
   10. Before step 2 is e3-d20 (fileio e505a0f), lists as deltas only is
-  e3-sp3's ablation (paging off), and paged is e3-sp3 (fileio ebb621e).
+  e3-sp4's ablation (paging off), and paged is e3-sp4 (fileio 4aca81c).
 - **ReplayBench**: one table's checkpoint (REPLAY_BENCH_RESULTS.md).
   Before step 2 is the capture before it; the other two are step 4's off
   and on.
@@ -503,7 +503,7 @@ TM capture of fast appends at 3,000 does not fit the dev box:
 
 | Table | Before step 2 | Lists as deltas only | Paged, W = 1,024 | Its pages |
 |---|---|---|---|---|
-| ML, merge appends, 7,200 snapshots (E3) | 2.38 MB | 1.30 MB | 0.36 MB | 1.07 MB in 24 |
+| ML, merge appends, 7,200 snapshots (E3) | 2.38 MB | 1.28 MB | 0.36 MB | 1.07 MB in 24 |
 | ML, merge appends, 3,000 snapshots (ReplayBench) | 927 KB | 393 KB | 216 KB | |
 | ML, fast appends, 3,000 snapshots | 12.8 MB | about 0.4 MB | about 0.3 MB | |
 | TM only, 7,200 snapshots (E3) | 0.46 MB | the same | 0.23 MB | 0.32 MB in 24 |
@@ -519,23 +519,25 @@ table's head list names every manifest it has: paging cannot shrink that, and
 only a merge can.
 
 **What it buys a commit.** E3 at 7,200 snapshots, from catalog-bench
-e3-d20 and e3-sp3 (medians of 3 runs). Each cell is a merge append's
+e3-d20 and e3-sp4 (medians of 3 runs). Each cell is a merge append's
 commit latency (p50 / p99) and the catalog bytes it read:
 
 | Store, mode | e3-d20 | Paging off | Paged |
 |---|---|---|---|
-| S3 Standard, ML | 9,179 / 99,786 ms, 158 MiB | 5,242 / 59,507 ms, 80 MiB | 547 / 3,235 ms, 8.7 MiB |
-| S3 Standard, TM | 824 / 9,328 ms, 13.5 MiB | 990 / 5,049 ms, 13.6 MiB | 502 / 1,942 ms, 5.2 MiB |
-| S3 Express, ML | 904 / 5,447 ms, 56 MiB | 381 / 4,259 ms, 29 MiB | 130 / 647 ms, 7.4 MiB |
-| S3 Express, TM | 358 / 1,425 ms, 9.6 MiB | 218 / 1,597 ms, 9.8 MiB | 127 / 516 ms, 4.9 MiB |
+| S3 Standard, ML | 9,179 / 99,786 ms, 158 MiB | 2,811 / 48,911 ms, 74 MiB | 485 / 2,099 ms, 8.1 MiB |
+| S3 Standard, TM | 824 / 9,328 ms, 13.5 MiB | 838 / 6,046 ms, 12.9 MiB | 475 / 1,301 ms, 5.1 MiB |
+| S3 Express, ML | 904 / 5,447 ms, 56 MiB | 346 / 4,642 ms, 28 MiB | 109 / 723 ms, 7.2 MiB |
+| S3 Express, TM | 358 / 1,425 ms, 9.6 MiB | 199 / 1,655 ms, 9.4 MiB | 117 / 403 ms, 4.6 MiB |
 
 - **ML on S3 Standard.** Every commit there is a CAS of the whole object.
-  With paging off, the driver saturated: its CPU, its GC (25% of the run)
-  and its writer pool. It finished 163 of the schedule's 500 merge appends.
-  Paged, it ran all 500 with GC at 3.2%, against e3-d20's 44.5%.
-- **Pages read.** A paged merge append reads about one page (0.8-1.6
-  GETs).
-- **Pointer tables** are unchanged: 810 and 434 ms p50 against e3-d20's 807
+  With paging off, the driver saturated: its CPU, its GC (24% of the run)
+  and its writer pool. It finished 174 of the schedule's 500 merge appends.
+  Paged, it ran all 500 with GC at 2.3%, against e3-d20's 44.5%.
+- **Pages read.** A paged merge append reads none. Before a commit read
+  only the snapshots it adds (e3-sp3, fileio ebb621e), it read about one
+  (0.8-1.6 GETs), and its p50 was 547 ms on S3 Standard and 130 ms on S3
+  Express.
+- **Pointer tables** are unchanged: 778 and 431 ms p50 against e3-d20's 807
   and 441.
 - **TM and pointer on S3 Standard** flag the driver's writer pool in every
   arm. Their hourly expiry reads every snapshot's list file, 7,211 GETs, and
@@ -543,41 +545,49 @@ commit latency (p50 / p99) and the catalog bytes it read:
   inline, so its expiry takes 0.9 s.
 - **Live heap at the end of a run** (after a full GC) at 7,200 ML
   snapshots:
-  - S3 Standard: 2.67 GB paged, 2.05 GB with paging off (which ran a third
+  - S3 Standard: 1.47 GB paged, 2.04 GB with paging off (which ran a third
     of the commits), 6.85 GB for e3-d20.
-  - S3 Express: 2.90, 3.26 and 5.17 GB.
+  - S3 Express: 1.52, 2.36 and 5.17 GB.
   - Setup alone leaves 0.85 GB: the aged tables' files in the in-memory
     store.
-  - At 1,000 snapshots, where no block seals, the run ends at 0.33-0.49
+  - At 1,000 snapshots, where no block seals, the run ends at 0.33-0.35
     GB, against e3-d20's 0.68-1.07.
-  - The rest at 7,200 is the tables' whole history, decoded once per
-    client: 10 tables of 7,200 snapshots in each of the run's 8 clients
-    (2026-11-07, attributed locally: the S3 Express configuration run from
-    havoc's pack ended at 2.91 GB, as on havoc).
+  - The rest at 7,200, about 75 MB a client, is each of the run's 8
+    clients' replica: the catalog object, each table's inline window, and
+    Iceberg's snapshot log, which a table's metadata holds whole (7,200
+    entries a table).
+  - Before a commit read only the snapshots it adds (e3-sp3), the paged
+    runs ended at 2.67 and 2.90 GB, with 1.8 and 1.5 times the CPU. The
+    difference was the tables' whole history, decoded once per client: 10
+    tables of 7,200 snapshots in each of the 8 clients (2026-11-07,
+    attributed locally: the S3 Express configuration run from havoc's pack
+    ended at 2.91 GB, as on havoc).
     - Its live heap grew 2.0 GB from the warmup's start. That growth holds
       589,000 `InlineSnapshot`s, 559,000 `BaseSnapshot`s and 587,000
       summary maps: 8 × 72,000. That is about 3.7 KB a snapshot, or 250 MB a
       client.
     - Most of it is the summaries, a fresh map of strings per snapshot parsed
       from its JSON, and the manifest entries of the pages' lists.
-    - Every merge append decodes it. `stageOn` asks for the snapshots of the
-      commit's metadata, and that resolves the base's snapshot supplier. It
-      does so in `manifestUpdates`, to find the snapshots the commit adds,
-      and in `computeDelta`, which compares the two versions' ids. The
+    - Every merge append decoded it. `stageOn` asked for the snapshots of the
+      commit's metadata, and that resolved the base's snapshot supplier. It
+      did so in `manifestUpdates`, to find the snapshots the commit adds,
+      and in `computeDelta`, which compared the two versions' ids. The
       supplier reads every sealed block's page.
-    - Two holders keep the history. The catalog's page cache
+    - Two holders kept the history. The catalog's page cache
       (`InlineSnapshots.pages`) is bounded at 256 pages, not by bytes, and
-      E3 has 240, so every client keeps every page, and with it the 85% of
+      E3 has 240, so every client kept every page, and with it the 85% of
       snapshots behind the line. The resolved supplier of each table
-      version's metadata holds an `InlineSnapshot` over each of them for as
-      long as the client's replica holds that version. The replica's
+      version's metadata held an `InlineSnapshot` over each of them for as
+      long as the client's replica held that version. The replica's
       chains hold the inline window.
     - One process per client, as in production, would hold one copy. The
       benchmark's driver hosts all 8 (catalog-bench DESIGN.md, caveats 7
       and 8).
     - Since 2026-11-08 a commit reads only the snapshots it adds (step 3,
-      "Still made whole"), so it holds none of this. e3-sp4 measures the
-      result.
+      "Still made whole"), so it holds none of this; e3-sp4 measured the
+      numbers above it. A load that asks for history, an expiry or a
+      transaction still reads every page, and the page cache, bounded in
+      pages, keeps them ([Open questions](#open-questions)).
 
 ## What changes in the code
 
@@ -796,6 +806,10 @@ Each step stands alone and is measured before the next:
    - Iceberg still makes every snapshot in three cases ([Open
      questions](#open-questions)): a transaction, a transaction that moves
      main twice, and a staged snapshot's producer after its commit.
+   - Measured by catalog-bench e3-sp4 ([Sizes](#sizes)): at E3's 7,200
+     snapshots a paged merge append reads no pages (about one before), and
+     a run ends at 1.5 GB live (2.7-2.9 before), with 0.56-0.66 times the
+     CPU.
 4. **Sealing and pages.** The root's sealed blocks, the page store (shared
    with the committed set), refs moved back with proofs, and page GC; and
    `SerializableTable` shipping the head and a supplier that reads pages
