@@ -201,51 +201,10 @@ trailer = incarnation:fixed64 offset:fixed64 crc:fixed32
   it); an append writes the incarnation of the object its condition names.
   No two objects share one, so a frame naming X was written into X.
 
-  The trailer is the writer's statement, and three links make it true:
-
-  1. *The condition binds an append to one version.* An append is sent
-     under `If-Match` on a version V at V's length, and lands on V or
-     nowhere (`appendPinnedToAVersionReplacedAtTheSameLengthFails`).
-  2. *A pinned read binds V to its incarnation.* The writer frames the
-     append from the tail its condition names, and that tail is a read of V:
-     since step 0 its bytes are V's, and their frames name an incarnation X
-     (checked as they are read).
-  3. *An incarnation names one checkpoint.* The replace that drew X wrote
-     its checkpoint at X's head, and appends never touch the head.
-
-  By induction every frame names the object it is in. A replace's frames
-  name the incarnation it drew. An append's frame names the incarnation of
-  the bytes it read from V, which are V's own, and it lands only on V. So a
-  reader that finds X's trailer at N − 20 of a GET pinned to V knows that V
-  is X, extended past N, with X's checkpoint.
-
-  The commit loop's retry, in those terms. A writer holds a tail (X, x),
-  the object of checkpoint C_k at length x, and sends its record framed
-  (X, x) under `If-Match` V_x. It loses the race. It does not take a new
-  offset from a HEAD, which gives a version V_y and a length y but not
-  whose they are (the loop does that today, and format 3 drops it: "A
-  probe", below). It tail-reads from (X, x) instead: the HEAD finds V_y and
-  y, and a GET of [x − 20, y) pinned to V_y returns their bytes.
-
-  - If the first 20 bytes are the trailer it holds, V_y is X: the frames in
-    [x, y) are the records that beat it, after C_k. It frames the same
-    record (X, y) and sends it under `If-Match` V_y.
-  - If they are not, the object was replaced: it reads V_y whole, learns its
-    incarnation Z and checkpoint C_{k+1}, and frames the record (Z, y′)
-    against that (or replaces, as the loop decides).
-
-  The proof that C_k is still the checkpoint is the condition: the append
-  lands only on V_y, and V_y's checkpoint is C_k (links 2 and 3). It holds
-  at the moment the append lands, the only moment that matters: if another
-  writer replaces C_k first, the append fails and the loop reads again. The
-  record's bytes are the same on every send, since replay judges them where
-  they land; the frame is built for each send.
-
-  A transport retry resends the same request under the same condition, so
-  it lands on V_x or nowhere. Each replace attempt draws its incarnation as
-  it builds the object. What is left to chance is two replaces drawing the
-  same 64-bit incarnation, or the 20 bytes at N − 20 of a replace matching
-  the held trailer by accident.
+  The trailer is the writer's statement, and the writer can only make it
+  truly: [Why a tail read is sound](#why-a-tail-read-is-sound) proves, by
+  induction over the store's writes, that every frame names the object it
+  is in, and walks two writers' retries through a replace.
 - **offset**: the byte offset at which the frame starts. An append is
   conditioned on the exact version and length it extends (ATOMIC_FILE_LOG.md
   "Tails"), so within one incarnation the frames are contiguous and each
@@ -334,6 +293,85 @@ becomes: the same incarnation, and no shorter. A replace never continues a
 tail, so the commit loop's "a replace that made the log longer reads as
 growth" case goes, though the floor still rejects a duplicate a write in
 flight lands.
+
+## Why a tail read is sound
+
+The claim: a replica holds the first N bytes of an object of incarnation X,
+and the last 20 of them are the trailer t of its last frame. If a tail read's
+GET, pinned to a version V at least N long, finds t at N − 20, then V's first
+N bytes are the replica's, and folding V's frames after N onto the replica
+replays V ([Replaying a suffix](#replaying-a-suffix)). It rests on six
+assumptions:
+
+- **A1, the append condition.** An append lands on exactly the version it
+  names, at that version's length, or nowhere
+  (`appendPinnedToAVersionReplacedAtTheSameLengthFails`, every store).
+- **A2, pinned reads** (step 0). A read of a version returns that version's
+  bytes or fails (the contract's read cases, every store).
+- **A3, fresh incarnations.** Each replace attempt draws its incarnation at
+  random (64 bits), so no two objects share one.
+- **A4, frames from reads.** `AtomicFileLog` frames an append only from the
+  tail its condition names, and only if that tail has a view: bytes it read,
+  pinned, from that version. No append from a probe (["A probe"](#reads)).
+- **A5, no rewrites.** A version changes only by an append, which extends it,
+  or by a replace, which starts a new incarnation.
+- **A6, no forgery by accident.** The 20 bytes at N − 20 of an object of
+  another incarnation are not t: they would have to hold X's 64 random bits
+  at that offset.
+
+**The invariant.** In every version V the store holds, every frame names
+V's incarnation and its own offset; and of two versions with one
+incarnation, the shorter is a prefix of the longer.
+
+**By induction on the store's writes:**
+
+- *A replace* writes a new object. Its frames name the incarnation it drew,
+  by construction, and no earlier version has that incarnation (A3), so the
+  prefix half holds trivially.
+- *An append* to V writes V's bytes and a frame f. By A4 its writer read V,
+  and by A2 what it read is V's bytes, whose frames name V's incarnation
+  (the induction); it gives f that incarnation and V's length as f's offset.
+  By A1 the append lands only on V, so the new version extends V, keeps its
+  incarnation, and f names both truly. A transport retry of the append
+  resends the same request under the same condition: it lands on V or
+  nowhere.
+- Nothing else changes a version (A5).
+
+**The claim follows.** t names X. If V's incarnation is X, V and the version
+the replica read share an incarnation, so the shorter is a prefix of the
+longer (the invariant); both are at least N long, so their first N bytes
+agree. If V's incarnation is not X, every frame of V names another
+incarnation (the invariant), so V does not hold t at N − 20 (A6): the check
+fails, and the reader reads V whole.
+
+**Two writers through a replace.** X = C_k l_1 … l_n, of length a, read by
+writers T_i and T_j, each preparing a record. A compaction replaces X with
+Y = C_{k+1} l_{n+1} … l_m, of length b.
+
+1. T_i sends l_i framed (X, a) under X's version at a. It fails: the object
+   is no longer that version (A1). T_i tail-reads from (X, a): the bytes at
+   a − 20 of Y are Y's, not l_n's trailer, so it reads Y whole, replays it,
+   frames l_i (Y, b) and sends it under Y's version at b. It lands.
+2. T_j sends l_j framed (X, a). It fails too, and so does its tail read from
+   (X, a), for the same reason. So T_j reads Y whole, l_i included, and
+   replays it: it knows whether l_i applied before it sends anything. It
+   frames l_j (Y, b + |l_i|) and sends it under the version that holds l_i.
+3. Had T_j read Y before l_i landed, its tail read from that point would have
+   found its own trailer and returned l_i, and its fold would have replayed
+   it.
+
+A writer cannot land a record after one it has not read, because its
+condition names the version it read (A1, A4). Whether l_i applied is
+replay's verdict on those bytes, the same for every reader, and l_j is
+judged on the state l_i left, applied or not. What the writer prepared
+against does not enter: the proof is about which bytes are the log, and
+replay decides what they do.
+
+Today's loop breaks A4. Its resend after a probe frames from no read, which
+is harmless only because format 2's frames name nothing. Step 4 states the
+invariant in `CatalogCommit.tla` with incarnations, and its bug switches
+(a check of the length only, no trailer check, a resend after a probe, which
+drops A4) must each break it.
 
 ## Replaying a suffix
 
