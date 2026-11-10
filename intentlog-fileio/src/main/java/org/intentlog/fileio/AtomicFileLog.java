@@ -76,6 +76,11 @@ import org.intentlog.wire.ProtoWire;
  * no version recurs); a read of the object between the lookup that bound it and the append read
  * that version. An append from a tail that only {@link #probe} found reads the object back.
  *
+ * <p>A read is of one version (SupportsAtomicOperations): the lookup that binds it chooses the
+ * version, and the GET asks for it. A write that lands between them fails the GET as stale ({@link
+ * SupportsAtomicOperations.StaleReadException}) rather than return part of another object (errata
+ * T6), and the log reads again.
+ *
  * <p>The pages of the committed set ({@link #pages}) are objects beside the log's, under {@code
  * <location>.committed/<name>}: a log that moves takes them along under the same names. Listing
  * them, for the sweep, needs a store that lists by prefix ({@link SupportsPrefixOperations}).
@@ -85,6 +90,13 @@ public final class AtomicFileLog implements SharedLog {
   public static final byte[] MAGIC = "LCAT".getBytes(StandardCharsets.US_ASCII);
   public static final int FORMAT_VERSION = 2;
   public static final int HEADER_SIZE = 8; // magic (4) + version (4)
+
+  /**
+   * How many times a read reads again when it fails as stale. Each failure is a write that landed in
+   * the round trip between the read's lookup and its GET, so a run of them is a store serving no
+   * version it reports, not contention.
+   */
+  static final int READ_ATTEMPTS = 10;
 
   private final SupportsAtomicOperations io;
   private final String location;
@@ -129,13 +141,33 @@ public final class AtomicFileLog implements SharedLog {
 
   @Override
   public LogView read() {
-    return parse(io.newInputFile(location));
+    for (int attempt = 1; ; attempt += 1) {
+      try {
+        return parse(io.newInputFile(location));
+      } catch (SupportsAtomicOperations.StaleReadException e) {
+        if (attempt >= READ_ATTEMPTS) {
+          throw e;
+        }
+      }
+    }
   }
 
+  /**
+   * The view the write left, if it says what the object holds; else the version it wrote, or, if a
+   * later write superseded that (as a store that serves only the live version reports), the live
+   * object, whose records hold the write's unless a replace folded them into a checkpoint (P3).
+   */
   @Override
   public LogView readThrough(Receipt receipt, Duration wait) {
     FileReceipt written = (FileReceipt) receipt;
-    return written.view != null ? written.view : parse(written.written);
+    if (written.view != null) {
+      return written.view;
+    }
+    try {
+      return parse(written.written);
+    } catch (SupportsAtomicOperations.StaleReadException e) {
+      return read();
+    }
   }
 
   @Override
@@ -251,13 +283,13 @@ public final class AtomicFileLog implements SharedLog {
   }
 
   private LogView parse(InputFile file) {
-    // The bytes read must be no older than the version the tail binds, as a replace from the view
-    // already needs: InMemoryAtomicFileIO binds the version as it opens the stream and reads its
-    // bytes; S3's stream opens lazily, after the lookup (getLength) binds the version, and reads
-    // it or a later one (errata T6). An append conditioned on the version lands only if no write
-    // came after the lookup, so the bytes read were the version's, and the view the append's
-    // receipt holds is the object (D20). (Looking up before opening would make a store that reads
-    // by version fail a read a write raced, where opening first reads the version it binds.)
+    // The bytes read must be the version the tail binds, as a replace from the view needs:
+    // InMemoryAtomicFileIO binds the version as it opens the stream and reads its bytes; S3's and
+    // ADLS's streams open lazily, after the lookup (getLength) binds the version, and ask for it
+    // (If-Match), as GCS's do (if-generation-match): a write after the lookup fails the read as
+    // stale. So the view an append's receipt holds is the object (D20). (Looking up before opening
+    // would make a store that reads by version fail a read a write raced, where opening first reads
+    // the version it binds.)
     byte[] bytes;
     try (SeekableInputStream in = file.newStream()) {
       bytes = readFully(in, (int) file.getLength());

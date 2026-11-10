@@ -28,6 +28,7 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.iceberg.io.AtomicOutputFile;
 import org.apache.iceberg.io.InMemoryAtomicFileIO;
+import org.apache.iceberg.io.SupportsAtomicOperations;
 import org.intentlog.LogConflictException;
 import org.intentlog.LogFullException;
 import org.intentlog.LogTail;
@@ -153,6 +154,53 @@ class TestAtomicFileLog {
     create();
     io.injectReadFaults(location -> InMemoryAtomicFileIO.ReadFault.FAIL);
     assertThatThrownBy(log::probe).isInstanceOf(UncheckedIOException.class);
+  }
+
+  /**
+   * A read whose GET fails as stale (a write landed between the lookup that chose the version and
+   * the GET) reads again, and finds the version that write made.
+   */
+  @Test
+  void aReadThatFailsAsStaleReadsAgain() { // T6
+    LogView created = create();
+    log.append(bytes("r2"), created.tail());
+    AtomicInteger stale = new AtomicInteger(2);
+    io.injectReadFaults(location -> stale.getAndDecrement() > 0
+        ? InMemoryAtomicFileIO.ReadFault.STALE
+        : InMemoryAtomicFileIO.ReadFault.NONE);
+
+    assertThat(log.read().records()).extracting(TestAtomicFileLog::string)
+        .containsExactly("r1", "r2");
+    assertThat(io.injected(InMemoryAtomicFileIO.ReadFault.STALE)).isEqualTo(2);
+  }
+
+  /** A store that never serves the version it reports fails the read, after a bounded number. */
+  @Test
+  void aReadThatIsAlwaysStaleFails() { // T6
+    create();
+    io.injectReadFaults(location -> InMemoryAtomicFileIO.ReadFault.STALE);
+
+    assertThatThrownBy(log::read).isInstanceOf(SupportsAtomicOperations.StaleReadException.class);
+    assertThat(io.injected(InMemoryAtomicFileIO.ReadFault.STALE))
+        .isEqualTo(AtomicFileLog.READ_ATTEMPTS);
+  }
+
+  /**
+   * A read through an append from a probed tail reads the version the append wrote; if a later
+   * write superseded it, on a store that serves only the live version, it reads the live object,
+   * whose records hold the append's.
+   */
+  @Test
+  void aReadThroughAWriteALaterWriteSupersededReadsTheObject() { // T6, D20
+    io.failSupersededReads(true);
+    create();
+    Receipt receipt = log.append(bytes("r2"), log.probe());
+    log.append(bytes("r3"), log.read().tail());
+
+    LogView through = log.readThrough(receipt, Duration.ZERO);
+    assertThat(through.records()).extracting(TestAtomicFileLog::string)
+        .containsExactly("r1", "r2", "r3");
+    assertSameView(through, log.read());
   }
 
   @Test

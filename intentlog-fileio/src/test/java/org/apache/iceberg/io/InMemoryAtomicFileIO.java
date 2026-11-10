@@ -43,7 +43,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
  * or {@code newStream}) and keeps reading those bytes afterwards. A conditional write expects the
  * version its snapshot has seen ({@link SupportsAtomicOperations#newOutputFile(InputFile)}): one
  * a write returned, or one a lookup ({@code exists}, {@code getLength}) found. A read alone sees
- * none, as on S3, the store whose reads record the least. {@link AtomicOutputFile.Strategy#CAS}
+ * none, as on GCS, whose reads record no version (S3's and ADLS's record the one they find, so a
+ * CAS after a read alone fails here where they could land). {@link AtomicOutputFile.Strategy#CAS}
  * replaces the object only if the live generation is the one seen, or, from a snapshot that has
  * seen none, creates it only if it does not exist. {@link AtomicOutputFile.Strategy#APPEND} adds
  * the bytes at the end under the same condition, as S3 Express does with {@code ifMatch} plus
@@ -122,7 +123,13 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
      * A content request throws {@link IOException} from its stream halfway through the object. A
      * metadata request fails as {@link #FAIL} does.
      */
-    FAIL_MID_STREAM
+    FAIL_MID_STREAM,
+    /**
+     * A content request fails as {@link SupportsAtomicOperations.StaleReadException}, as on S3 when
+     * a write lands between the lookup that chose the version a read asks for and its GET; the
+     * input file stays unbound. A metadata request fails as {@link #FAIL} does.
+     */
+    STALE
   }
 
   /**
@@ -346,9 +353,9 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
 
   /**
    * Whether reading a bound generation that a later write replaced fails ({@link
-   * NotFoundException}), as on real storage, instead of returning the replaced bytes; and whether
-   * {@code exists()} of such a file is false, as GCS answers a lookup of a generation (the input
-   * file a GCS write returns names the generation it wrote).
+   * SupportsAtomicOperations.StaleReadException}), as on real storage, instead of returning the
+   * replaced bytes; and whether {@code exists()} of such a file is false, as GCS answers a lookup
+   * of a generation (the input file a GCS write returns names the generation it wrote).
    */
   public void failSupersededReads(boolean fail) {
     this.failSupersededReads = fail;
@@ -573,6 +580,10 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
       if (fault == ReadFault.FAIL) {
         throw readFailure(location);
       }
+      if (fault == ReadFault.STALE) {
+        throw new SupportsAtomicOperations.StaleReadException(
+            "The version a read of " + location + " asks for was replaced", null);
+      }
       Version v;
       boolean wasBound;
       synchronized (this) {
@@ -586,7 +597,8 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
         throw new NotFoundException("File does not exist: %s", location);
       }
       if (wasBound && failSupersededReads && objects.get(location) != v) {
-        throw new NotFoundException("Generation %d of %s was replaced", v.generation, location);
+        throw new SupportsAtomicOperations.StaleReadException(
+            "Generation " + v.generation + " of " + location + " was replaced", null);
       }
       SeekableInputStream stream = new InMemoryInputFile(location, v.bytes).newStream();
       return fault == ReadFault.FAIL_MID_STREAM

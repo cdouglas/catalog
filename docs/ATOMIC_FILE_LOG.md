@@ -83,7 +83,7 @@ object's bytes and back, for tests and tools.
 | `probe()` | the object's version and length, without reading it; a tail that does not exist if the object does not |
 | `append(record, tail)` | appends `[varint length][record]` at the tail's length, conditioned on its version (`Strategy.APPEND`). An unconditional append is refused |
 | `replace(tail, checkpoint, records)` | writes `[header][checkpoint][records]` as the whole object, conditioned on the tail's version, or on the object's absence if the tail does not exist (`Strategy.CAS`) |
-| `readThrough(receipt)` | the object the write left, so its record is among the records (P3): without a read when the write says what it holds (a replace holds what it wrote; an append conditioned on a tail whose bytes this log read or wrote holds those bytes and the record), else by reading the version the write wrote |
+| `readThrough(receipt)` | the object the write left, so its record is among the records (P3): without a read when the write says what it holds (a replace holds what it wrote; an append conditioned on a tail whose bytes this log read or wrote holds those bytes and the record), else by reading the version the write wrote, or the live object if a later write superseded it |
 | `putCheckpoint`, `trim`, `readAfter` | not supported (a replace checkpoints), or the default (a fresh read) |
 
 **Tails.** A tail is the object's version (an ETag or generation) and length.
@@ -109,6 +109,17 @@ with the write offset, an Azure Append Blob's `If-Match` with the append
 position). A read through such an append, from a tail whose bytes the log read
 or wrote, rests on it: the object is those bytes and the record, known without a
 read (errata D20).
+
+**Reads.** A read is of one version: the lookup that binds its tail chooses
+it, and the GET asks for it (S3's and ADLS's `If-Match`, GCS's
+`if-generation-match`): the fork's read contract (`SupportsAtomicOperations`,
+whose contract suite has read cases). A write that lands between the lookup
+and the GET fails the GET as stale (`StaleReadException`) rather than return
+part of another object, and `read()` reads again (up to `READ_ATTEMPTS`). A
+read through an append from a probed tail, whose version a later write
+superseded, reads the live object, which holds the append's record unless a
+replace folded it into a checkpoint (then the commit is ambiguous, P3). Before
+2026-11-09, S3 and GCS reads asked for no version (errata T6).
 
 **Signals.** Each write is prepared (`AtomicOutputFile.prepare`, which
 computes the checksum the store checks) and then sent (`writeAtomic`). The

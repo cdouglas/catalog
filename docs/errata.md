@@ -136,19 +136,21 @@ The log's invariant is one total order of records with no gaps: a read is a
 checkpoint and a prefix of the records after it (P1, LOG.md). The runtime
 relies on the provider for it and checks nothing. No record says what it
 follows, and no checkpoint says where it ends (S4). The providers give it
-physically only while each read sees one version of the log. ADLS and GCS
-read by version, and the in-memory providers do; the fork's S3 reads do not
-(T6). An S3 read is a ranged GET with no `If-Match`, reopened mid-stream by
-another, so a read that races a replace can return the start of one object
-and the rest of another.
+physically only while each read sees one version of the log. Since
+2026-11-09 the fork's stores all do, on their word (T6): a read asks for the
+version its lookup found (S3's and ADLS's `If-Match`, GCS's
+`if-generation-match`) and fails as stale once a write supersedes it. Before,
+S3 and GCS reads asked for none, so a read that raced a replace could return
+the start of one object and the rest of another.
 
-Commits are safe regardless. Every write is conditioned on the version its
+Commits were safe regardless. Every write is conditioned on the version its
 read bound to (P4), so a commit staged on such a view fails. But a reader that
 never writes (a load, a scan's planning) takes the view for the log. A splice
 at a frame boundary decodes: an old checkpoint followed by records written
-after a newer one, a state the log never held. Pinning S3's reads to the ETag
-the probe saw restores the invariant for whole reads, but not for the reads
-the format should allow:
+after a newer one, a state the log never held. Pinned reads restore the
+invariant for whole reads, on the store's word; a store that breaks its read
+contract still splices undetected. And pinning cannot give the invariant to
+the reads the format should allow:
 
 - **A tail read** (D15). An append changes the object's ETag, so a read pinned
   to the ETag a reader holds fails after any append. One pinned to the new
@@ -904,36 +906,49 @@ bytes)` API on `FileIOCatalog` to re-inline them. Two options:
 **Trigger to revisit:** when a real workload needs catalog
 re-registration of a previously-dropped inline table.
 
-### T6. The fuzzers pin reads, and S3 does not
+### T6. Pinned reads are tested on the in-memory store, not on the real ones
 
-`InMemoryAtomicFileIO` binds an `InputFile` to the generation it first
-observes and keeps reading those bytes, as a read conditioned on the version
-would. The fork's S3 reads are not conditioned: `S3InputStream` sends a
-ranged GET with no `If-Match`, and on a read error reopens the stream at its
-position with another. So an `AtomicFileLog` read on S3 (`getLength`, a
-HEAD, then the bytes) can return the first bytes of a newer object than the
-one its tail is bound to, or, after a reopen, the start of one object and
-the rest of another. ADLS and GCS read by version.
+Until 2026-11-09 the fork's S3 and GCS reads asked for no version.
+`S3InputStream` sent each ranged GET with no `If-Match` and reopened the
+stream mid-read with another; `GCSInputStream` read the live generation, not
+the one the file's lookup found. So an `AtomicFileLog` read (a lookup, then
+the bytes) could return the first bytes of a newer object than the one its
+tail is bound to, or the start of one object and the rest of another, while
+the fuzzers' `InMemoryAtomicFileIO` pinned every read. ADLS already asked for
+one version.
 
-That this is safe is argued, not tested. A read cut inside a frame fails to
-decode, and the read fails. A frame-aligned prefix of a newer object is a
-state the log held, and its tail is still bound to the version the HEAD
-saw, so a write conditioned on it fails. A fold compares bytes, so it
-replays such a view whole. And a read through a write must include the
-write's record (`seen`), or the commit is ambiguous. A spliced view is the
-case the argument covers least: its bytes come from two objects, and only
-decoding stands between them and replay. D15's incarnation id in each frame
-would reject one.
+Now every read asks for one version (fork 5f14343338): a file reads the version
+it has seen, by `If-Match` (S3, ADLS) or `if-generation-match` (GCS), and on S3
+and ADLS a file whose first request was a read has seen the version it found.
+A read of a version a write superseded fails as
+`SupportsAtomicOperations.StaleReadException`; `AtomicFileLog` reads again,
+and a read through a superseded write reads the live object (ATOMIC_FILE_LOG.md
+"Reads"). `SupportsAtomicOperationsContractTest` has three read cases: a file
+that looked the object up reads that version after a replace (a longer one,
+whose start would pass for the old version and appends) and after an append;
+and a file whose first request was a read reads that version by a reopened
+stream, a range read and a new stream, keeps its length, and fails a CAS
+rather than replace a version it did not read (stores whose reads record
+their version: not GCS, whose client library reports none).
 
-A fuzzer mode would test it: an `InMemoryAtomicFileIO` option whose bound
-read returns the first bytes of the live generation, or splices two at a
-random offset. `InMemoryAtomicFileIO`'s doc also says S3 reads with
-`If-Match` (the `failSupersededReads` paragraph), which the fork's S3 reads
-do not.
+What remains:
 
-**Trigger to revisit:** before relying on S3 (general purpose or Express)
-in production, or when D15's ranged reads are built. S5 is the fix: the format
-detects a spliced or gapped read, whatever the store returns.
+- The read cases have run on the in-memory store only. A real-cloud run of
+  the contract says whether each store honours its read precondition; S3
+  Express and `If-Match` on a GET is the one in doubt.
+- The fuzzers never put a write between a read's lookup and its GET:
+  `InMemoryAtomicFileIO` binds a file as a stream opens, where S3, ADLS and
+  GCS bind at the lookup before it. Its `STALE` read fault and
+  `failSupersededReads` test the retry in `TestAtomicFileLog`, not under the
+  catalog fuzzers.
+- The accelerated read paths (S3's analytics accelerator, GCS's analytics
+  core; both off by default) read whatever is live: a catalog's FileIO must
+  leave them off.
+- A store that breaks its read contract still splices undetected: S5 is the
+  format's check.
+
+**Trigger to revisit:** the next real-cloud run (the contract's read cases),
+before tail reads (D15), or before relying on S3 or GCS in production.
 
 ## Known Unknowns
 
