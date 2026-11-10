@@ -1,6 +1,8 @@
 # Reading the log's tail (design)
 
-Status: proposed 2026-11-06, revised 2026-11-09 after review; nothing built.
+Status: proposed 2026-11-06, revised 2026-11-09 after two reviews. Step 0
+(reads of one version on every store) is built, pending a real-cloud run of
+its contract cases; the rest awaits approval.
 It answers errata D15 (whole-object reads) and S5 (a read's continuity is the
 store's word): on one object by a format change, with T6 (the fuzzers pin
 reads) as its test, and on any log by positions in the SPI, which close S4
@@ -49,7 +51,8 @@ reader knows that what a read returned is the log (P1, LOG.md). It needs
 three things, whatever the deployment:
 
 1. **One prefix.** The view's checkpoint and records are one prefix of the
-   log, not pieces of two versions of it (on S3 today, T6).
+   log, not pieces of two versions of it (on S3 and GCS before step 0, T6;
+   since, on the store's word).
 2. **The joint.** The records start where the checkpoint ends, with none
    missing between (S4: a log that stores its checkpoints apart, such as
    checkpoints in S3 and records in Kafka).
@@ -143,28 +146,34 @@ today:
   starts with (below).
 - A version does not. An append changes the ETag or generation, and no store
   says whether one version extends another.
-- A read pinned to a version (S3's `If-Match`, which the fork does not send;
-  ADLS's ETag and GCS's generation, which it does) shows that the bytes come
-  from one object, not that the object extends the prefix the reader holds.
+- A read pinned to a version (S3's and ADLS's `If-Match`, GCS's
+  `if-generation-match`, since step 0) shows that the bytes come from one
+  object, not that the object extends the prefix the reader holds.
+- A precondition on the GET cannot say it either. A ranged GET can carry
+  `If-Match`, and is then served from that version or not at all. But the
+  version the reader holds is the one before the appends it wants, so
+  `If-Match` on it fails exactly when there is something new to read; what
+  the reader needs is "the same incarnation, extended", and no store offers
+  that condition (each append changes the ETag or generation). So whatever
+  names the object must come back with the bytes, in the same response: in
+  the bytes themselves (the trailer, inside the range the read needs anyway)
+  or in the response's headers (an incarnation in object metadata, which a
+  GET returns; [Alternatives](#alternatives-considered)).
 
-And on S3 a read is not pinned at all (T6): a GET that races a replace, or a
-stream the SDK reopens mid-read, can return the start of one object and the
-rest of another. A splice at a frame boundary decodes today (S5).
-
-The fork's S3 reads send no `If-Match`. `S3InputStream.openStream` and
-`readRange` ask for the bucket, the key and a range; `S3InputFile`'s ETag
-conditions writes alone. The contract suite
-(`SupportsAtomicOperationsContractTest`) does not notice, because it tests
-writes: its 16 cases are creates, CAS, appends, their races and the segment
-limit, and none reads across a write. A read is unpinned only between its
-HEAD and its GET, or across a reopen after a read error, and nothing opens
-that window: the catalog suites' races are writes, and a read that raced
-one fails at its reader's next write, which is conditioned on the HEAD's
-version (P4). Under the fuzzers, `InMemoryAtomicFileIO` pins every read
-(T6). A contract case would open it: bind a file to a version, replace the
-object, then read the file. It must return the old version's bytes or fail.
-It would fail on S3 today, and it would say whether S3 Express honours
-`If-Match` on a GET.
+Before step 0, S3 and GCS reads were not pinned at all (T6): a GET that
+raced a replace, or a stream reopened mid-read, could return the start of
+one object and the rest of another. `S3InputStream` sent no `If-Match`, and
+`GCSInputStream` read the live generation, not the one the file's lookup
+found; only ADLS asked for one version. The contract suite did not notice,
+because its 16 cases were writes. Step 0 (fork 5f14343338) pins every read to
+the version its file has seen, fails a read of a superseded version as
+`StaleReadException`, and adds three read cases to the suite: a file that
+looked reads that version after a replace and after an append, and on a store
+whose reads record their version (S3, ADLS), a file whose first request was a
+read reads that version by a reopened stream, a range read and a new stream,
+keeps its length, and fails a CAS rather than replace a version it did not
+read. `AtomicFileLog` reads again after a stale read. A splice at a frame
+boundary still decodes if a store breaks its contract (S5).
 
 So the format carries what a tail read checks, as S5 proposes: each frame
 names the object it belongs to and where it starts, with a checksum over
@@ -189,6 +198,22 @@ trailer = incarnation:fixed64 offset:fixed64 crc:fixed32
   it writes, in every frame it writes (the checkpoint and the records after
   it); an append writes the incarnation of the object its condition names.
   No two objects share one, so a frame naming X was written into X.
+
+  The trailer is the writer's statement, which the write's condition makes
+  true: an append carries the trailer of the version it is conditioned on
+  (that version's incarnation, its length as the offset), and the store
+  lands it on that version or nowhere
+  (`appendPinnedToAVersionReplacedAtTheSameLengthFails`). A retry cannot move
+  a frame. A transport retry of a lost reply resends the same request under
+  the same condition, so it fails if the first attempt landed or a replace
+  came between; the commit loop's own resend after a lost race is framed
+  afresh, against the version its tail read found. So a record retried into
+  a replace, even at the offset where the reader's tail ends, names the
+  replace's incarnation, and the reader reads whole. Each replace attempt
+  draws its incarnation as it builds the object; its transport retries send
+  the same bytes under the same condition. What is left to chance is two
+  replaces drawing the same 64-bit incarnation, or the 20 bytes at N − 20 of
+  a replace matching the held trailer by accident.
 - **offset**: the byte offset at which the frame starts. An append is
   conditioned on the exact version and length it extends (ATOMIC_FILE_LOG.md
   "Tails"), so within one incarnation the frames are contiguous and each
@@ -228,12 +253,11 @@ wrote (incarnation X, length N):
 4. The view: the replica's checkpoint and records (the same arrays) and the
    new records, at a tail bound to V and L.
 
-On S3 the GET is not pinned to V, but it follows the HEAD, and S3's reads
-are strongly consistent: the GET serves V or a later version. X's versions all come before
-any replace of X, and no later object is X. So a GET whose bytes at N − 20
-are X's trailer read a version of X at or after V, and V is X's too; up to L
-its bytes are V's, since appends only extend. A GET that spliced a replace in
-fails a check. ADLS and GCS read the version the HEAD found, as now.
+The GET asks for V (step 0), so its bytes are V's or it fails as stale and
+the read starts again. A GET whose bytes at N − 20 are X's trailer read V,
+and V is X extended: within one incarnation every write is an append, so V's
+bytes up to N are the replica's. The trailer stands in for the byte
+comparison a whole read's fold makes ([Replaying a suffix](#replaying-a-suffix)).
 
 The view a tail read returns continues the replica's view byte for byte, so
 the runtime folds the new records onto the replica (LOG.md "Replay") and the
@@ -257,6 +281,32 @@ becomes: the same incarnation, and no shorter. A replace never continues a
 tail, so the commit loop's "a replace that made the log longer reads as
 growth" case goes, though the floor still rejects a duplicate a write in
 flight lands.
+
+## Replaying a suffix
+
+A tail read hands replay only the records after the replica's tail, never
+the checkpoint they follow. That is already how most reads replay. Replay is
+a deterministic left fold over the records (LOG.md "Replay"), so the state a
+replica holds, folded with the records after it, is the state a replay of
+the checkpoint and every record reaches. `LogRuntime` folds whenever a new
+view continues the one a replica was replayed from (`continued`): every read
+with a floor, and since D20 a commit's read through its own write. What the
+checkpoint fixes (the floor, the committed set's horizon, the conflict
+encoding, snapshot paging) is in the replica's state, and changes only by a
+record (a GC record, a `PageOut`), which a fold applies as a replay does. In
+the test suites `-Dintentlog.replay.check=true` checks every fold against a
+replay of the whole view: the state's checkpoint bytes, the committed set's
+bytes, the record count and the outcome.
+
+So a suffix cannot be read differently from the whole; it can only be the
+wrong suffix: records that do not follow the replica's tail (a gap or a
+splice; an overlap applies once). Today `continued` rules that out by
+comparing the bytes the replica holds with the new view's. A tail read does
+not have them, and the trailer at N − 20 stands in: the object is still X,
+whose bytes before N cannot change. Under the check flag a tail read is also
+checked the old way: the test reads the whole object at the version the
+tail read found and replays it, and the fold must match. That makes the
+trailer's argument the thing the suites test.
 
 ## The runtime and the catalog
 
@@ -305,9 +355,10 @@ its time is `LatencyFileIO`'s.
   (a whole view's joint; a fold only onto the tail a view starts after).
   `InMemorySharedLog` encodes its positions; `AtomicFileLog`'s joint is its
   trailers. LOG.md's P1 says what a provider must check, not only provide.
-- The fork's S3 reads pinned by `If-Match` to the version the file is bound
-  to, across reopens (`S3InputStream`), and the contract case for a read
-  across a write (`SupportsAtomicOperationsContractTest`).
+- Done in step 0: the fork's reads pinned to the version the file has seen
+  (S3's `If-Match`, across reopens; GCS's `if-generation-match`; ADLS's 412s
+  mapped), `StaleReadException`, the contract's read cases, and
+  `AtomicFileLog` reading again after a stale read.
 - The ablation switch `fileio.catalog.read.tail` (default true; false reads
   whole, as before), since the paper reports it (CHECKPOINT_PLAN.md
   "Ablation switches"). The format's checks have no switch.
@@ -330,6 +381,9 @@ its time is `LatencyFileIO`'s.
   history (the commit protocol fuzzer's committed-set oracles, the fault
   fuzzer's loads through a fresh reader); they gain one: no replica holds a
   state the log never held.
+- Under `intentlog.replay.check`, each tail read's fold checked against a
+  replay of the whole object at the version the tail read found
+  ([Replaying a suffix](#replaying-a-suffix)).
 - `AtomicFileLog` unit tests: a replace longer than the tail, a replace of the
   same length, a splice at and inside a frame, a tail read with nothing new,
   a tail read whose GET finds the object shorter than its HEAD did.
@@ -337,8 +391,8 @@ its time is `LatencyFileIO`'s.
 - Gaps on a shared log (S4): a `MemoryLogHarness` mode that serves a
   checkpoint and records with a gap between them, or trims past its newest
   checkpoint, and a `SharedLogContract` case; every such read must fail.
-- The contract case for a read across a write, on every store (real cloud),
-  before and after S3's reads are pinned.
+- The contract's read cases on every store (real cloud), step 0's open
+  item.
 - Mutants (`fuzz/mutants`): a tail read that checks the length only, no
   checksum, a resend after a probe framed with its old tail's incarnation.
   Each must break a fuzzer.
@@ -355,12 +409,18 @@ its time is `LatencyFileIO`'s.
 
 Each step stands alone and is measured before the next:
 
-0. **Pin S3's reads** (a fork change), with the contract case for a read
-   across a write. It closes T6's whole-read half on the store's word, at
-   no cost, and turns a read that raced a replace into a 412 instead of a
-   transfer that fails the format's checks later. If S3 Express does not
-   honour `If-Match` on a GET, the case says so, and step 2 is its only
-   check.
+0. **Reads of one version** (built 2026-11-09: fork 5f14343338, fileio
+   b4a9061). Every store's reads ask for the version their file has seen,
+   a read of a superseded one fails as stale, and `AtomicFileLog` reads
+   again; the contract suite has read cases. It closes T6's whole-read half
+   on the store's word, at no cost, and turns a read that raced a replace
+   into a 412 instead of a transfer that fails the format's checks later.
+   Open: a real-cloud run of the read cases. If S3 Express does not honour
+   `If-Match` on a GET, the case says so, and step 2 is its only check.
+   - **0b. Probe the metadata alternative** on the real stores, in the same
+     run: small cases, as `GcsRapidCanaries` probes Rapid buckets, of the
+     three behaviours the alternative rests on ([Alternatives](#alternatives-considered)).
+     Their results choose between the trailer and metadata for step 2.
 1. **Pricing.** Ranged reads priced by their bytes in `LatencyFileIO` and
    catalog-bench. No behaviour changes; catalog-bench's numbers must not
    move.
@@ -394,16 +454,32 @@ Then R2.3, with a read's cost known.
   read splicing, but not a tail read misreading a replace that grew
   (above), and they are each store's guarantee rather than the format's.
 - **The incarnation in the object's metadata** (S3's `x-amz-meta-*`, ADLS's
-  metadata), which a replace sets, an append keeps, and the HEAD returns.
-  With pinned reads, a tail read would be a HEAD (version, length,
-  incarnation) and a GET pinned to that version, with no change to the
-  format, and a probe would learn the incarnation, so the commit loop could
-  resend after one. Each check would rest on three behaviours of each store
-  (a pinned GET, across reopens; metadata kept by an append; metadata in a
-  HEAD), each a contract case on real cloud, where the trailer rests on
-  none, is tested by the fuzzers' read modes alone, and leaves the bytes
+  metadata), which a replace sets, an append keeps, and a lookup and a GET
+  return. With pinned reads, a tail read would be one ranged GET from N
+  whose response names the version, the length and the incarnation (the
+  headers), with no change to the format, and a probe would learn the
+  incarnation, so the commit loop could resend after one. Each check would
+  rest on three behaviours of each store, where the trailer rests on none,
+  is tested by the fuzzers' read modes alone, and leaves the bytes
   self-describing for tools (the format explorer) and copies. A smaller
   change, if the user prefers a store's word per deployment.
+
+  It would fit `SupportsAtomicOperations` as one more thing a file reports:
+  an incarnation that a CAS draws and sets with the object it writes, that
+  an append keeps, and that a lookup and each GET report for the version
+  they found (a fork interface beside `InputFile`). GCS needs none: the
+  fork's GCS writes are replaces only (Rapid buckets too: nothing appends to
+  a catalog's live object, `GcsRapidCanaries`), so a tail read never
+  applies. Step 0b's probes, on S3 Express and ADLS:
+
+  - a replace sets the metadata, in the same request as its bytes (S3's
+    conditional `PutObject`; ADLS's staged Append Blob, then the rename that
+    replaces the live object: does the metadata move with it?);
+  - an append keeps it (S3 Express's `PutObject` at a write offset, which
+    may not take metadata of its own; ADLS's `AppendBlock`);
+  - a ranged GET and a HEAD report it, for the version that served them,
+    and a GET pinned to a superseded version reports nothing of the new
+    one.
 - **The incarnation in the header or the checkpoint only**, read by a
   second ranged GET. S3 serves one range a GET, so a tail read would take
   three requests, and a whole read spliced after the checkpoint would still
