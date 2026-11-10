@@ -314,7 +314,7 @@ final class ContentionRun {
       // The log as one catalog object that was never compacted: the first checkpoint and every
       // record after it
       store.onWrite(null);
-      Files.write(dir.resolve("log.bin"), AtomicFileLog.encode(firstCheckpoint, captured));
+      Files.write(dir.resolve("log.bin"), AtomicFileLog.encode(0L, firstCheckpoint, captured));
       summary.put("captured_records", captured.size());
       summary.put("captured_record_bytes", capturedBytes);
     }

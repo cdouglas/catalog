@@ -23,6 +23,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -249,31 +250,20 @@ public class TestProtoCatalogFormat {
 
   @Test
   public void testFileStructureReadWrite() throws IOException {
-    // Test the full file structure: header + checkpoint + transactions
-    ByteArrayOutputStream out = new ByteArrayOutputStream();
-
-    // Write header
-    out.write(AtomicFileLog.MAGIC);
-    writeInt(out, AtomicFileLog.FORMAT_VERSION);
-
-    // Write empty checkpoint
+    // Test the full file structure: header + checkpoint + transactions, each framed
     CatalogState empty = CatalogState.empty();
     byte[] checkpointBytes =
         CatalogTestSupport.checkpoint(CatalogTestSupport.LOG_ID, CommittedSet.EMPTY, empty);
-    writeVarint(out, checkpointBytes.length);
-    out.write(checkpointBytes);
-
-    // Write a transaction
     List<ProtoCodec.Action> actions = List.of(
         new ProtoCodec.CreateNamespaceAction(-1, 1, 0, -1, "testns")
     );
     ProtoCodec.Transaction txn = new ProtoCodec.Transaction(UuidV7.newUuidV7(), actions);
     byte[] txnBytes = ProtoCodec.encodeTransaction(txn);
-    writeVarint(out, txnBytes.length);
-    out.write(txnBytes);
+    byte[] fileBytes = AtomicFileLog.encode(checkpointBytes, List.of(txnBytes));
+    assertThat(Arrays.copyOf(fileBytes, 4)).isEqualTo(AtomicFileLog.MAGIC);
+    assertThat(ByteBuffer.wrap(fileBytes, 4, 4).getInt()).isEqualTo(AtomicFileLog.FORMAT_VERSION);
 
     // Read it back
-    byte[] fileBytes = out.toByteArray();
     Replica<CatalogState> result = CatalogTestSupport.replay(fileBytes);
 
     // Verify the transaction was applied
@@ -585,41 +575,17 @@ public class TestProtoCatalogFormat {
         LogEnvelope.decodeCheckpoint(checkpoint).state());
   }
 
-  private byte[] toTransactionRecord(ProtoCodec.Transaction txn) throws IOException {
-    byte[] txnBytes = ProtoCodec.encodeTransaction(txn);
-    return toTransactionRecordRaw(txnBytes);
+  /** The record of {@code txn}: its body, which {@link #appendBytes} frames. */
+  private byte[] toTransactionRecord(ProtoCodec.Transaction txn) {
+    return ProtoCodec.encodeTransaction(txn);
   }
 
-  private byte[] toTransactionRecordRaw(byte[] txnBytes) throws IOException {
-    ByteArrayOutputStream out = new ByteArrayOutputStream();
-    writeVarint(out, txnBytes.length);
-    out.write(txnBytes);
-    return out.toByteArray();
-  }
-
-  private static byte[] appendBytes(byte[] orig, byte[]... append) {
-    int totalLen = orig.length + Arrays.stream(append).mapToInt(a -> a.length).sum();
-    byte[] result = Arrays.copyOf(orig, totalLen);
-    int offset = orig.length;
-    for (byte[] a : append) {
-      System.arraycopy(a, 0, result, offset, a.length);
-      offset += a.length;
+  /** {@code orig} with each record appended, framed as an append writes it. */
+  private static byte[] appendBytes(byte[] orig, byte[]... records) {
+    byte[] result = orig;
+    for (byte[] record : records) {
+      result = AtomicFileLog.extend(result, record);
     }
     return result;
-  }
-
-  private static void writeInt(ByteArrayOutputStream out, int value) throws IOException {
-    out.write((value >> 24) & 0xFF);
-    out.write((value >> 16) & 0xFF);
-    out.write((value >> 8) & 0xFF);
-    out.write(value & 0xFF);
-  }
-
-  private static void writeVarint(ByteArrayOutputStream out, int value) throws IOException {
-    while ((value & ~0x7F) != 0) {
-      out.write((value & 0x7F) | 0x80);
-      value >>>= 7;
-    }
-    out.write(value);
   }
 }

@@ -224,7 +224,8 @@ final class LogTrace {
       }
       ops.close();
     }
-    Files.write(dir.resolve("log.bin"), AtomicFileLog.encode(checkpoint, entries));
+    // incarnation 0: a trace's bytes depend on its configuration and seed alone
+    Files.write(dir.resolve("log.bin"), AtomicFileLog.encode(0L, checkpoint, entries));
 
     Map<String, Object> summary = new LinkedHashMap<>();
     summary.put("entries", entries.size());

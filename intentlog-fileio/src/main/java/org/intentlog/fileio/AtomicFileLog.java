@@ -20,15 +20,20 @@ package org.intentlog.fileio;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.LongSupplier;
+import java.util.zip.CRC32C;
 import org.apache.iceberg.exceptions.NotFoundException;
 import org.apache.iceberg.io.AtomicOutputFile;
 import org.apache.iceberg.io.CAS;
@@ -56,10 +61,20 @@ import org.intentlog.wire.ProtoWire;
  * records appended after it.
  *
  * <pre>
- * [Magic: 4 bytes "LCAT"][Version: 4 bytes, big-endian int]
- * [Checkpoint length: varint][Checkpoint: a log.proto LogCheckpoint]
- * [Record length: varint][Record: a log.proto LogRecord] ...
+ * [Magic: 4 bytes "LCAT"][Version: 4 bytes, big-endian int, 3]
+ * [Checkpoint length: varint][Checkpoint: a log.proto LogCheckpoint][Trailer: 20 bytes]
+ * [Record length: varint][Record: a log.proto LogRecord][Trailer: 20 bytes] ...
+ *
+ * Trailer: [Incarnation: fixed64][Offset: fixed64][CRC32C: fixed32], little-endian
  * </pre>
+ *
+ * <p>Each frame's trailer names the object it was written into and where it starts (docs
+ * TAIL_READS.md, "The format"): the incarnation, a random number each replace draws for the object
+ * it writes and every frame in it, which an append copies from the version its condition names; the
+ * offset of the frame's first byte; and a CRC32C of the frame's length, body, incarnation and
+ * offset. A read checks every frame: one incarnation throughout, each offset where the frame before
+ * ended, each checksum. A read that fails a check was torn by a write that raced it, or served
+ * wrong by the store; it fails as {@link FrameCheckException}, and the log reads again.
  *
  * <p>An append is conditioned on the object's length and version (S3 Express's write offset, an
  * Azure Append Blob's position); a replace writes a new object conditioned on the version it
@@ -67,7 +82,7 @@ import org.intentlog.wire.ProtoWire;
  * records after it in one write, so each record follows exactly one checkpoint. A store without
  * append (GCS, or a store whose {@code supportsAppend()} is false) commits by replace only, and a
  * record too large for one append to the store ({@code maxAppendBytes}, less the record's length
- * prefix: {@link Capabilities#maxRecordBytes}) goes in a replace.
+ * prefix and trailer: {@link Capabilities#maxRecordBytes}) goes in a replace.
  *
  * <p>A read through a write reads nothing when the write says what the object holds: a replace
  * holds what it wrote, and an append conditioned on a tail whose bytes this log read or wrote holds
@@ -79,7 +94,13 @@ import org.intentlog.wire.ProtoWire;
  * <p>A read is of one version (SupportsAtomicOperations): the lookup that binds it chooses the
  * version, and the GET asks for it. A write that lands between them fails the GET as stale ({@link
  * SupportsAtomicOperations.StaleReadException}) rather than return part of another object (errata
- * T6), and the log reads again.
+ * T6), and the log reads again. A store that breaks that contract (S5) serves bytes the frames'
+ * checks reject.
+ *
+ * <p>An append frames its record from the version its condition names: from the view of it this
+ * log read or wrote, or, for a tail only a {@link #probe} found, from that version's last trailer,
+ * read pinned to it. So every frame names the object it is in (TAIL_READS.md, "Why a tail read is
+ * sound").
  *
  * <p>The pages of the committed set ({@link #pages}) are objects beside the log's, under {@code
  * <location>.committed/<name>}: a log that moves takes them along under the same names. Listing
@@ -88,13 +109,17 @@ import org.intentlog.wire.ProtoWire;
 public final class AtomicFileLog implements SharedLog {
 
   public static final byte[] MAGIC = "LCAT".getBytes(StandardCharsets.US_ASCII);
-  public static final int FORMAT_VERSION = 2;
+  public static final int FORMAT_VERSION = 3;
+  /** Format 2: frames without trailers, which {@link #decode(byte[])} still reads, for tools. */
+  public static final int UNCHECKED_FORMAT_VERSION = 2;
   public static final int HEADER_SIZE = 8; // magic (4) + version (4)
+  /** A frame's trailer: incarnation (8), offset (8), CRC32C (4). */
+  public static final int TRAILER_SIZE = 20;
 
   /**
-   * How many times a read reads again when it fails as stale. Each failure is a write that landed in
-   * the round trip between the read's lookup and its GET, so a run of them is a store serving no
-   * version it reports, not contention.
+   * How many times a read reads again when it fails as stale or fails the frames' checks. Each
+   * failure is a write that landed in the round trip between the read's lookup and its GET, so a
+   * run of them is a store serving no version it reports, not contention.
    */
   static final int READ_ATTEMPTS = 10;
 
@@ -102,14 +127,22 @@ public final class AtomicFileLog implements SharedLog {
   private final String location;
   private final long maxRecordBytes;
   private final PageStore pages;
+  private final LongSupplier incarnations;
 
   public AtomicFileLog(SupportsAtomicOperations io, String location) {
+    this(io, location, () -> ThreadLocalRandom.current().nextLong());
+  }
+
+  /** A log whose replaces draw their incarnations from {@code incarnations} (tests: a seed). */
+  public AtomicFileLog(SupportsAtomicOperations io, String location, LongSupplier incarnations) {
     this.io = io;
     this.location = location;
-    // An append writes the record after its length, a varint no longer than the store's limit's
+    this.incarnations = incarnations;
+    // An append writes the record after its length, a varint no longer than the store's limit's,
+    // and before its trailer
     long maxAppend = io.maxAppendBytes(location);
     int prefix = ProtoWire.varintSize((int) Math.min(maxAppend, Integer.MAX_VALUE));
-    this.maxRecordBytes = maxAppend > 0 ? Math.max(1L, maxAppend - prefix) : 0L;
+    this.maxRecordBytes = maxAppend > 0 ? Math.max(1L, maxAppend - prefix - TRAILER_SIZE) : 0L;
     this.pages = new FilePages(location + ".committed/");
   }
 
@@ -144,7 +177,7 @@ public final class AtomicFileLog implements SharedLog {
     for (int attempt = 1; ; attempt += 1) {
       try {
         return parse(io.newInputFile(location));
-      } catch (SupportsAtomicOperations.StaleReadException e) {
+      } catch (SupportsAtomicOperations.StaleReadException | FrameCheckException e) {
         if (attempt >= READ_ATTEMPTS) {
           throw e;
         }
@@ -154,8 +187,9 @@ public final class AtomicFileLog implements SharedLog {
 
   /**
    * The view the write left, if it says what the object holds; else the version it wrote, or, if a
-   * later write superseded that (as a store that serves only the live version reports), the live
-   * object, whose records hold the write's unless a replace folded them into a checkpoint (P3).
+   * later write superseded that (as a store that serves only the live version reports, or one whose
+   * read of it fails the frames' checks), the live object, whose records hold the write's unless a
+   * replace folded them into a checkpoint (P3).
    */
   @Override
   public LogView readThrough(Receipt receipt, Duration wait) {
@@ -165,7 +199,7 @@ public final class AtomicFileLog implements SharedLog {
     }
     try {
       return parse(written.written);
-    } catch (SupportsAtomicOperations.StaleReadException e) {
+    } catch (SupportsAtomicOperations.StaleReadException | FrameCheckException e) {
       return read();
     }
   }
@@ -185,70 +219,131 @@ public final class AtomicFileLog implements SharedLog {
     return tail;
   }
 
+  /**
+   * Appends {@code record} at {@code expected}, framed as part of the version it names: with the
+   * incarnation of the view this log read or wrote at that tail, or else (a tail a probe found) of
+   * that version's last trailer, read pinned to it. A version that a write has superseded since
+   * cannot take the append: its trailer's read fails as a lost race, the append unsent.
+   */
   @Override
   public Receipt append(byte[] record, LogTail expected) {
     if (expected == null) {
       throw new IllegalArgumentException("An object store appends only at an expected offset");
     }
-    ByteArrayOutputStream out = new ByteArrayOutputStream(record.length + 5);
-    frame(out, record);
-    byte[] frame = out.toByteArray();
     FileTail at = (FileTail) expected;
-    InputFile written = write(at.file, frame, AtomicOutputFile.Strategy.APPEND);
     FileView before = at.view;
+    long offset = at.bytes();
+    long incarnation = before != null ? before.incarnation : incarnationAt(at);
+    byte[] frame = frame(record, incarnation, offset);
+    InputFile written = write(at.file, frame, AtomicOutputFile.Strategy.APPEND);
     if (before == null) {
       return new FileReceipt(written, null); // the bytes at the tail are unknown: read them back
     }
     List<byte[]> records = new ArrayList<>(before.records.size() + 1);
     records.addAll(before.records);
     records.add(record);
-    long length = at.length + frame.length;
-    return new FileReceipt(
-        written, view(written, length, before.checkpoint, Collections.unmodifiableList(records)));
+    return new FileReceipt(written, view(written, offset + frame.length, before.checkpoint,
+        Collections.unmodifiableList(records), incarnation, trailerOf(frame)));
   }
 
   /**
-   * Replaces the object. The log keeps {@code checkpoint} and {@code records} as the view a read
-   * through the write returns: the caller must not change them.
+   * The incarnation of the version {@code at} is bound to, from its last frame's trailer: a ranged
+   * read of its last {@link #TRAILER_SIZE} bytes, pinned to that version (step 0), as the append's
+   * condition is. A read that fails as stale, or that the store serves from another version, finds
+   * the version gone, and so would the append: it fails as a lost race, unsent.
+   */
+  private long incarnationAt(FileTail at) {
+    long length = at.bytes();
+    if (length < HEADER_SIZE + 1 + TRAILER_SIZE) {
+      throw new IllegalStateException(
+          "Cannot append to " + location + ": " + length + " bytes hold no frame");
+    }
+    byte[] trailer;
+    try (SeekableInputStream in = at.file.newStream()) {
+      in.seek(length - TRAILER_SIZE);
+      trailer = readFully(in, TRAILER_SIZE);
+    } catch (SupportsAtomicOperations.StaleReadException | EOFException e) {
+      throw new LogConflictException(
+          "APPEND write to " + location + " lost a race: the version a probe found is gone", e);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+    return getLong(trailer, 0);
+  }
+
+  /**
+   * Replaces the object, as an object of an incarnation drawn for this write. The log keeps {@code
+   * checkpoint} and {@code records} as the view a read through the write returns: the caller must
+   * not change them.
    */
   @Override
   public Receipt replace(LogTail expected, byte[] checkpoint, List<byte[]> records) {
-    byte[] bytes = encode(checkpoint, records);
+    long incarnation = incarnations.getAsLong();
+    byte[] bytes = encode(incarnation, checkpoint, records);
     InputFile written = write(fileOf(expected), bytes, AtomicOutputFile.Strategy.CAS);
-    return new FileReceipt(written, view(written, bytes.length, checkpoint, List.copyOf(records)));
+    return new FileReceipt(written, view(written, bytes.length, checkpoint, List.copyOf(records),
+        incarnation, Arrays.copyOfRange(bytes, bytes.length - TRAILER_SIZE, bytes.length)));
   }
 
-  /** The view of {@code file}: {@code length} bytes, holding {@code checkpoint} and {@code records}. */
-  private static FileView view(
-      InputFile file, long length, byte[] checkpoint, List<byte[]> records) {
+  /**
+   * The view of {@code file}: {@code length} bytes, holding {@code checkpoint} and {@code records},
+   * of {@code incarnation}, ending in {@code trailer}.
+   */
+  private static FileView view(InputFile file, long length, byte[] checkpoint,
+      List<byte[]> records, long incarnation, byte[] trailer) {
     FileTail tail = new FileTail(file);
     tail.length = length;
-    FileView view = new FileView(tail, checkpoint, records);
+    FileView view = new FileView(tail, checkpoint, records, incarnation, trailer);
     tail.view = view;
     return view;
   }
 
-  /** The object a replace writes: the header, {@code checkpoint}, and {@code records} after it. */
+  /**
+   * The object a replace writes, as an object of a fresh incarnation: the header, {@code
+   * checkpoint}, and {@code records} after it.
+   */
   public static byte[] encode(byte[] checkpoint, List<byte[]> records) {
+    return encode(ThreadLocalRandom.current().nextLong(), checkpoint, records);
+  }
+
+  /** The object a replace writes, as an object of {@code incarnation}. */
+  public static byte[] encode(long incarnation, byte[] checkpoint, List<byte[]> records) {
     ByteArrayOutputStream out = new ByteArrayOutputStream();
     out.writeBytes(MAGIC);
     out.write((FORMAT_VERSION >>> 24) & 0xFF);
     out.write((FORMAT_VERSION >>> 16) & 0xFF);
     out.write((FORMAT_VERSION >>> 8) & 0xFF);
     out.write(FORMAT_VERSION & 0xFF);
-    frame(out, checkpoint);
+    out.writeBytes(frame(checkpoint, incarnation, out.size()));
     for (byte[] record : records) {
-      frame(out, record);
+      out.writeBytes(frame(record, incarnation, out.size()));
     }
     return out.toByteArray();
   }
 
   /**
+   * The object an append of {@code record} to {@code object} writes: its bytes and a frame of the
+   * record, of its incarnation (its last trailer's), at its end. For tests and tools.
+   */
+  public static byte[] extend(byte[] object, byte[] record) {
+    if (object.length < HEADER_SIZE + 1 + TRAILER_SIZE) {
+      throw new IllegalArgumentException(object.length + " bytes hold no frame");
+    }
+    long incarnation = getLong(object, object.length - TRAILER_SIZE);
+    byte[] frame = frame(record, incarnation, object.length);
+    byte[] extended = Arrays.copyOf(object, object.length + frame.length);
+    System.arraycopy(frame, 0, extended, object.length, frame.length);
+    return extended;
+  }
+
+  /**
    * The checkpoint and records of an object's bytes, which an append may have extended past what
-   * {@link #encode} wrote. The view's tail is the bytes' length, bound to no object.
+   * {@link #encode} wrote, its frames checked; format 2's, unchecked, for tools that read captured
+   * logs. The view's tail is the bytes' length, bound to no object. Bytes that fail a check throw
+   * {@link FrameCheckException}.
    */
   public static LogView decode(byte[] bytes) {
-    return decode(bytes, new BytesTail(bytes.length));
+    return decode(bytes, new BytesTail(bytes.length), true);
   }
 
   /**
@@ -290,35 +385,59 @@ public final class AtomicFileLog implements SharedLog {
     // stale. So the view an append's receipt holds is the object (D20). (Looking up before opening
     // would make a store that reads by version fail a read a write raced, where opening first reads
     // the version it binds.)
+    // A version shorter than the lookup found is a store serving another version: a torn read.
     byte[] bytes;
     try (SeekableInputStream in = file.newStream()) {
       bytes = readFully(in, (int) file.getLength());
+    } catch (EOFException e) {
+      throw new FrameCheckException(location + ": " + e.getMessage());
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
     FileTail tail = new FileTail(file);
     tail.length = bytes.length;
-    FileView view = decode(bytes, tail);
+    FileView view = decode(bytes, tail, false);
     tail.view = view;
     return view;
   }
 
-  private static FileView decode(byte[] bytes, LogTail tail) {
+  /**
+   * The view of {@code bytes}, every frame checked: format 3's, or, if {@code unchecked} allows
+   * it, format 2's (no trailers; the view's incarnation 0 and its trailer empty).
+   */
+  private static FileView decode(byte[] bytes, LogTail tail, boolean unchecked) {
     if (bytes.length < HEADER_SIZE) {
-      throw new IllegalStateException("A catalog file of " + bytes.length + " bytes has no header");
+      throw new FrameCheckException("A catalog file of " + bytes.length + " bytes has no header");
     }
     for (int i = 0; i < MAGIC.length; i++) {
       if (bytes[i] != MAGIC[i]) {
-        throw new IllegalStateException("Invalid magic bytes");
+        throw new FrameCheckException("Invalid magic bytes");
       }
     }
     int version =
         ((bytes[4] & 0xFF) << 24) | ((bytes[5] & 0xFF) << 16) | ((bytes[6] & 0xFF) << 8)
             | (bytes[7] & 0xFF);
+    if (unchecked && version == UNCHECKED_FORMAT_VERSION) {
+      return decodeUnchecked(bytes, tail);
+    }
     if (version != FORMAT_VERSION) {
       throw new IllegalStateException(
           "Unsupported format version: " + version + ", expected: " + FORMAT_VERSION);
     }
+    int pos = HEADER_SIZE;
+    int end = frameEnd(bytes, pos, null);
+    long incarnation = getLong(bytes, end - TRAILER_SIZE);
+    byte[] checkpoint = body(bytes, pos, end);
+    List<byte[]> records = new ArrayList<>();
+    for (pos = end; pos < bytes.length; pos = end) {
+      end = frameEnd(bytes, pos, incarnation);
+      records.add(body(bytes, pos, end));
+    }
+    return new FileView(tail, checkpoint, Collections.unmodifiableList(records), incarnation,
+        Arrays.copyOfRange(bytes, end - TRAILER_SIZE, end));
+  }
+
+  private static FileView decodeUnchecked(byte[] bytes, LogTail tail) {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes, HEADER_SIZE, bytes.length);
     try {
       byte[] checkpoint = ProtoWire.readLengthDelimitedBytes(in);
@@ -326,9 +445,122 @@ public final class AtomicFileLog implements SharedLog {
       while (in.available() > 0) {
         records.add(ProtoWire.readLengthDelimitedBytes(in));
       }
-      return new FileView(tail, checkpoint, Collections.unmodifiableList(records));
+      return new FileView(tail, checkpoint, Collections.unmodifiableList(records), 0L,
+          new byte[0]);
     } catch (IOException e) {
       throw new UncheckedIOException(e);
+    }
+  }
+
+  /**
+   * The end of the frame at {@code pos} in {@code bytes}, after checking it: it lies within the
+   * bytes, its trailer's offset is {@code pos}, its checksum holds, and its incarnation is {@code
+   * incarnation} (any, if null).
+   */
+  private static int frameEnd(byte[] bytes, int pos, Long incarnation) {
+    long length = 0;
+    int at = pos;
+    for (int shift = 0; ; shift += 7) {
+      if (at >= bytes.length || shift > 28) {
+        throw new FrameCheckException("The frame at " + pos + " has no length");
+      }
+      byte b = bytes[at++];
+      length |= (long) (b & 0x7F) << shift;
+      if (b >= 0) {
+        break;
+      }
+    }
+    long end = at + length + TRAILER_SIZE;
+    if (end > bytes.length) {
+      throw new FrameCheckException(
+          "The frame at " + pos + " runs past the object's end, " + bytes.length);
+    }
+    int trailer = (int) end - TRAILER_SIZE;
+    CRC32C crc = new CRC32C();
+    crc.update(bytes, pos, trailer + 16 - pos);
+    if ((int) crc.getValue() != getInt(bytes, trailer + 16)) {
+      throw new FrameCheckException("The frame at " + pos + " fails its checksum");
+    }
+    long offset = getLong(bytes, trailer + 8);
+    if (offset != pos) {
+      throw new FrameCheckException("The frame at " + pos + " says it starts at " + offset);
+    }
+    long named = getLong(bytes, trailer);
+    if (incarnation != null && named != incarnation) {
+      throw new FrameCheckException("The frame at " + pos + " is of incarnation "
+          + Long.toHexString(named) + ", the object's " + Long.toHexString(incarnation));
+    }
+    return (int) end;
+  }
+
+  /** The body of the checked frame from {@code pos} to {@code end}. */
+  private static byte[] body(byte[] bytes, int pos, int end) {
+    int at = pos;
+    while (bytes[at] < 0) {
+      at++;
+    }
+    return Arrays.copyOfRange(bytes, at + 1, end - TRAILER_SIZE);
+  }
+
+  /**
+   * {@code body} framed: its length, the body, and its trailer (the incarnation, {@code offset},
+   * where the frame starts in its object, and the checksum).
+   */
+  private static byte[] frame(byte[] body, long incarnation, long offset) {
+    ByteArrayOutputStream out = new ByteArrayOutputStream(body.length + 5 + TRAILER_SIZE);
+    try {
+      ProtoWire.writeRawVarint(out, body.length);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+    out.writeBytes(body);
+    byte[] frame = Arrays.copyOf(out.toByteArray(), out.size() + TRAILER_SIZE);
+    int trailer = frame.length - TRAILER_SIZE;
+    putLong(frame, trailer, incarnation);
+    putLong(frame, trailer + 8, offset);
+    CRC32C crc = new CRC32C();
+    crc.update(frame, 0, trailer + 16);
+    putInt(frame, trailer + 16, (int) crc.getValue());
+    return frame;
+  }
+
+  private static byte[] trailerOf(byte[] frame) {
+    return Arrays.copyOfRange(frame, frame.length - TRAILER_SIZE, frame.length);
+  }
+
+  private static long getLong(byte[] bytes, int at) {
+    long value = 0;
+    for (int i = 7; i >= 0; i--) {
+      value = (value << 8) | (bytes[at + i] & 0xFFL);
+    }
+    return value;
+  }
+
+  private static int getInt(byte[] bytes, int at) {
+    return (bytes[at] & 0xFF) | (bytes[at + 1] & 0xFF) << 8 | (bytes[at + 2] & 0xFF) << 16
+        | (bytes[at + 3] & 0xFF) << 24;
+  }
+
+  private static void putLong(byte[] bytes, int at, long value) {
+    for (int i = 0; i < 8; i++) {
+      bytes[at + i] = (byte) (value >>> (8 * i));
+    }
+  }
+
+  private static void putInt(byte[] bytes, int at, int value) {
+    for (int i = 0; i < 4; i++) {
+      bytes[at + i] = (byte) (value >>> (8 * i));
+    }
+  }
+
+  /**
+   * A read whose bytes fail the format's checks (a frame that runs past the end, a checksum, an
+   * offset or an incarnation): torn by a write that raced it, or served wrong by the store. The
+   * log reads again ({@link #READ_ATTEMPTS}).
+   */
+  public static final class FrameCheckException extends IllegalStateException {
+    public FrameCheckException(String message) {
+      super(message);
     }
   }
 
@@ -401,20 +633,11 @@ public final class AtomicFileLog implements SharedLog {
     while (read < length) {
       int n = in.read(bytes, read, length - read);
       if (n < 0) {
-        throw new IOException("Unexpected end of stream: read " + read + " of " + length);
+        throw new EOFException("Unexpected end of stream: read " + read + " of " + length);
       }
       read += n;
     }
     return bytes;
-  }
-
-  private static void frame(ByteArrayOutputStream out, byte[] message) {
-    try {
-      ProtoWire.writeRawVarint(out, message.length);
-      out.write(message);
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
-    }
   }
 
   /**
@@ -486,11 +709,18 @@ public final class AtomicFileLog implements SharedLog {
     private final LogTail tail;
     private final byte[] checkpoint;
     private final List<byte[]> records;
+    // The object's incarnation, and its last frame's trailer: the bytes a tail read from this
+    // view's end finds first, if the object is still this one
+    private final long incarnation;
+    private final byte[] trailer;
 
-    FileView(LogTail tail, byte[] checkpoint, List<byte[]> records) {
+    FileView(LogTail tail, byte[] checkpoint, List<byte[]> records, long incarnation,
+        byte[] trailer) {
       this.tail = tail;
       this.checkpoint = checkpoint;
       this.records = records;
+      this.incarnation = incarnation;
+      this.trailer = trailer;
     }
 
     @Override

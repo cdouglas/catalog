@@ -379,10 +379,20 @@ final class CatalogProto {
       }
       pos = AtomicFileLog.HEADER_SIZE;
       message("LogCheckpoint", "checkpoint", frame("checkpoint"));
+      trailer("checkpoint");
       for (int record = 0; pos < bytes.length; record++) {
         String path = "record " + record;
         message("LogRecord", path, frame(path));
+        trailer(path);
       }
+    }
+
+    /** Skips a frame's trailer, which AtomicFileLog's decode checks: the walk checks the bodies. */
+    private void trailer(String path) {
+      if (bytes.length - pos < AtomicFileLog.TRAILER_SIZE) {
+        throw new Violation(path + ": no trailer after it");
+      }
+      pos += AtomicFileLog.TRAILER_SIZE;
     }
 
     /** Reads a record's length prefix; returns the end of the record. */

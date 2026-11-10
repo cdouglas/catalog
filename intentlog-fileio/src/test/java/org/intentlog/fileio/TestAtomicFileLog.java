@@ -21,11 +21,16 @@ package org.intentlog.fileio;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.io.ByteArrayOutputStream;
 import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.zip.CRC32C;
 import org.apache.iceberg.io.AtomicOutputFile;
 import org.apache.iceberg.io.InMemoryAtomicFileIO;
 import org.apache.iceberg.io.SupportsAtomicOperations;
@@ -42,8 +47,10 @@ class TestAtomicFileLog {
 
   private static final String LOCATION = "mem:///warehouse/catalog";
 
+  private static final long INCARNATION = 0x0123456789ABCDEFL;
+
   private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
-  private final AtomicFileLog log = new AtomicFileLog(io, LOCATION);
+  private final AtomicFileLog log = new AtomicFileLog(io, LOCATION, () -> INCARNATION);
 
   private static byte[] bytes(String s) {
     return s.getBytes(StandardCharsets.UTF_8);
@@ -125,17 +132,17 @@ class TestAtomicFileLog {
   }
 
   @Test
-  void theLargestRecordIsTheStoresAppendLimitLessItsLengthPrefix() { // (Bug 71)
+  void theLargestRecordIsTheStoresAppendLimitLessItsLengthPrefixAndTrailer() { // (Bug 71)
     assertThat(log.capabilities().maxRecordBytes()).isZero();
     io.limitAppendBytes(300);
     AtomicFileLog limited = new AtomicFileLog(io, LOCATION);
-    assertThat(limited.capabilities().maxRecordBytes()).isEqualTo(298); // a 2-byte varint
+    assertThat(limited.capabilities().maxRecordBytes()).isEqualTo(278); // a 2-byte varint, 20
     LogView created = create();
 
     LogView appended =
-        limited.readThrough(limited.append(new byte[298], created.tail()), Duration.ZERO);
+        limited.readThrough(limited.append(new byte[278], created.tail()), Duration.ZERO);
     assertThat(appended.records()).hasSize(2);
-    assertThatThrownBy(() -> limited.append(new byte[299], appended.tail()))
+    assertThatThrownBy(() -> limited.append(new byte[279], appended.tail()))
         .isInstanceOf(UncheckedIOException.class);
   }
 
@@ -212,8 +219,226 @@ class TestAtomicFileLog {
     assertThat(string(decoded.checkpoint().orElseThrow())).isEqualTo("chk");
     assertThat(decoded.records()).extracting(TestAtomicFileLog::string).containsExactly("r1", "r2");
     assertThat(decoded.tail().bytes()).isEqualTo(object.length);
-    assertThat(AtomicFileLog.encode(bytes("chk"), List.of(bytes("r1"))))
-        .isEqualTo(io.history().get(0).after());
+    byte[] replaced = AtomicFileLog.encode(INCARNATION, bytes("chk"), List.of(bytes("r1")));
+    assertThat(replaced).isEqualTo(io.history().get(0).after());
+    assertThat(AtomicFileLog.extend(replaced, bytes("r2"))).isEqualTo(object);
+  }
+
+  /** Format 3, byte for byte: each frame's length, body and trailer. */
+  @Test
+  void eachFrameEndsInATrailerNamingItsObjectAndOffset() {
+    byte[] object = AtomicFileLog.encode(INCARNATION, bytes("chk"), List.of(bytes("r1")));
+    ByteBuffer in = ByteBuffer.wrap(object).order(ByteOrder.LITTLE_ENDIAN);
+    assertThat(Arrays.copyOf(object, 4)).isEqualTo(AtomicFileLog.MAGIC);
+    assertThat(ByteBuffer.wrap(object, 4, 4).getInt()).isEqualTo(3);
+    // the checkpoint's frame at 8: length 3, "chk", then its trailer
+    assertThat(object[8]).isEqualTo((byte) 3);
+    assertThat(string(Arrays.copyOfRange(object, 9, 12))).isEqualTo("chk");
+    assertThat(in.getLong(12)).isEqualTo(INCARNATION);
+    assertThat(in.getLong(20)).isEqualTo(8);
+    CRC32C crc = new CRC32C();
+    crc.update(object, 8, 20);
+    assertThat(in.getInt(28)).isEqualTo((int) crc.getValue());
+    // the record's frame at 32
+    assertThat(object[32]).isEqualTo((byte) 2);
+    assertThat(in.getLong(35)).isEqualTo(INCARNATION);
+    assertThat(in.getLong(43)).isEqualTo(32);
+    assertThat(object).hasSize(55);
+  }
+
+  /** Two objects of one log: a replace's, then another replace's of a different incarnation. */
+  private static byte[][] twoIncarnations() {
+    byte[] x = AtomicFileLog.encode(1L, bytes("chk"), List.of(bytes("r1"), bytes("r2")));
+    byte[] y =
+        AtomicFileLog.encode(2L, bytes("c2!"), List.of(bytes("r3"), bytes("r4"), bytes("r5")));
+    return new byte[][] {x, y};
+  }
+
+  /** {@code a}'s first {@code at} bytes, then {@code b}'s from {@code at}, to {@code length}. */
+  private static byte[] splice(byte[] a, byte[] b, int at, int length) {
+    byte[] spliced = Arrays.copyOf(a, length);
+    System.arraycopy(b, at, spliced, at, length - at);
+    return spliced;
+  }
+
+  @Test
+  void aSpliceAtAFrameBoundaryFailsTheIncarnationCheck() { // S5
+    byte[][] objects = twoIncarnations();
+    int boundary = 32; // the checkpoints' frames are the same length: the first records start here
+    byte[] spliced = splice(objects[0], objects[1], boundary, objects[1].length);
+    assertThatThrownBy(() -> AtomicFileLog.decode(spliced))
+        .isInstanceOf(AtomicFileLog.FrameCheckException.class)
+        .hasMessageContaining("incarnation");
+    // Format 2's frames named nothing: the same splice decoded
+    assertThat(Arrays.copyOfRange(objects[0], 0, boundary))
+        .isNotEqualTo(Arrays.copyOfRange(objects[1], 0, boundary));
+  }
+
+  /**
+   * Whatever a splice of two objects at any byte decodes to is a state the log held: a prefix of
+   * one of them, ending at one of its frames' ends. Every other splice fails a check.
+   */
+  @Test
+  void aSpliceAnywhereDecodesOnlyToAPrefixOfOneObject() { // S5
+    byte[][] objects = twoIncarnations();
+    int checked = 0;
+    for (int at = AtomicFileLog.HEADER_SIZE; at < objects[0].length; at++) {
+      for (int length = at + 1; length <= objects[1].length; length++) {
+        byte[] spliced = splice(objects[0], objects[1], at, length);
+        LogView view;
+        try {
+          view = AtomicFileLog.decode(spliced);
+        } catch (AtomicFileLog.FrameCheckException e) {
+          checked++;
+          continue;
+        }
+        assertThat(isPrefixOf(view, objects[0]) || isPrefixOf(view, objects[1]))
+            .as("splice at %d, %d bytes", at, length).isTrue();
+      }
+    }
+    assertThat(checked).isPositive();
+  }
+
+  private static boolean isPrefixOf(LogView view, byte[] object) {
+    LogView whole = AtomicFileLog.decode(object);
+    if (!Arrays.equals(view.checkpoint().orElseThrow(), whole.checkpoint().orElseThrow())
+        || view.records().size() > whole.records().size()) {
+      return false;
+    }
+    for (int i = 0; i < view.records().size(); i++) {
+      if (!Arrays.equals(view.records().get(i), whole.records().get(i))) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  @Test
+  void aTruncatedObjectFailsTheChecks() {
+    byte[] object = twoIncarnations()[0];
+    for (int length = AtomicFileLog.HEADER_SIZE; length < object.length; length++) {
+      byte[] truncated = Arrays.copyOf(object, length);
+      boolean boundary = length == 32 || length == 55;
+      if (boundary) {
+        assertThat(AtomicFileLog.decode(truncated).records()).hasSize(length == 32 ? 0 : 1);
+      } else {
+        assertThatThrownBy(() -> AtomicFileLog.decode(truncated))
+            .as("truncated to %d", length)
+            .isInstanceOf(AtomicFileLog.FrameCheckException.class);
+      }
+    }
+  }
+
+  @Test
+  void aFrameMovedFromWhereItWasWrittenFailsTheOffsetCheck() {
+    // The same object's first record, framed for offset 32, copied in again at its end
+    byte[] object = twoIncarnations()[0];
+    byte[] moved = Arrays.copyOf(object, object.length + 23);
+    System.arraycopy(object, 32, moved, object.length, 23);
+    assertThatThrownBy(() -> AtomicFileLog.decode(moved))
+        .isInstanceOf(AtomicFileLog.FrameCheckException.class)
+        .hasMessageContaining("says it starts at 32");
+  }
+
+  @Test
+  void formatTwoStillDecodesForTools() {
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    out.writeBytes(AtomicFileLog.MAGIC);
+    out.writeBytes(new byte[] {0, 0, 0, 2, 3, 'c', 'h', 'k', 2, 'r', '1'});
+    LogView decoded = AtomicFileLog.decode(out.toByteArray());
+    assertThat(string(decoded.checkpoint().orElseThrow())).isEqualTo("chk");
+    assertThat(decoded.records()).extracting(TestAtomicFileLog::string).containsExactly("r1");
+  }
+
+  /**
+   * A read torn by a write that landed between its lookup and its GET, on a store that does not pin
+   * reads, fails the frames' checks; the log reads again and finds the write's object.
+   */
+  @Test
+  void aReadThatFailsTheChecksReadsAgain() { // T6, S5
+    for (InMemoryAtomicFileIO.ReadMode mode : List.of(
+        InMemoryAtomicFileIO.ReadMode.LIVE, InMemoryAtomicFileIO.ReadMode.SPLICE)) {
+      InMemoryAtomicFileIO store = new InMemoryAtomicFileIO();
+      AtomicInteger next = new AtomicInteger();
+      AtomicFileLog writer = new AtomicFileLog(store, LOCATION, () -> next.incrementAndGet());
+      LogView created = writer.readThrough(writer.replace(AtomicFileLog.tailOf(
+          store.newInputFile(LOCATION)), bytes("checkpoint"), List.of(bytes("r1"), bytes("r2"))),
+          Duration.ZERO);
+      store.readMode(mode);
+      store.spliceAt((bound, live) -> 20); // inside the checkpoint's frame
+      // Each read's GET (its second request) first replaces the object with a shorter checkpoint
+      // and more records, as long, until two have
+      AtomicInteger requests = new AtomicInteger();
+      AtomicInteger replaces = new AtomicInteger(2);
+      LogView[] last = {created};
+      store.injectReadFaults(location -> {
+        if (requests.incrementAndGet() % 2 == 0 && replaces.getAndDecrement() > 0) {
+          store.injectReadFaults(l -> InMemoryAtomicFileIO.ReadFault.NONE);
+          last[0] = writer.readThrough(writer.replace(last[0].tail(), bytes("cp"),
+              List.of(bytes("r1"), bytes("r2"), bytes("r3x"))), Duration.ZERO);
+          store.injectReadFaults(this::noFault);
+        }
+        return InMemoryAtomicFileIO.ReadFault.NONE;
+      });
+      LogView read = writer.read();
+      assertThat(store.served(mode)).as(mode.name()).isPositive();
+      assertSameView(read, last[0]);
+    }
+  }
+
+  private InMemoryAtomicFileIO.ReadFault noFault(String location) {
+    return InMemoryAtomicFileIO.ReadFault.NONE;
+  }
+
+  /** A store that serves every read torn fails the read, after a bounded number. */
+  @Test
+  void aReadThatAlwaysFailsTheChecksFails() { // T6, S5
+    create();
+    io.readMode(InMemoryAtomicFileIO.ReadMode.SPLICE);
+    io.spliceAt((bound, live) -> 20); // in the checkpoint's trailer
+    AtomicInteger requests = new AtomicInteger();
+    io.injectReadFaults(location -> {
+      if (requests.incrementAndGet() % 2 == 0) {
+        // between the lookup and the GET, a replace by another writer, of the same length
+        io.seed(LOCATION, AtomicFileLog.encode(requests.get(), bytes("chk"), List.of(bytes("r9"))));
+      }
+      return InMemoryAtomicFileIO.ReadFault.NONE;
+    });
+
+    assertThatThrownBy(log::read).isInstanceOf(AtomicFileLog.FrameCheckException.class);
+    assertThat(requests.get()).isEqualTo(2 * AtomicFileLog.READ_ATTEMPTS);
+  }
+
+  /**
+   * An append from a probed tail frames its record as part of the version the probe found, whose
+   * incarnation its last trailer gives: a replace since the log's own read made that another.
+   */
+  @Test
+  void anAppendFromAProbedTailNamesTheVersionItExtends() {
+    create();
+    AtomicFileLog other = new AtomicFileLog(io, LOCATION, () -> 7L);
+    other.replace(log.read().tail(), bytes("c2"), List.of(bytes("r2"), bytes("r3")));
+
+    log.append(bytes("r4"), log.probe());
+    byte[] object = io.bytes(LOCATION);
+    assertThat(AtomicFileLog.decode(object).records()).extracting(TestAtomicFileLog::string)
+        .containsExactly("r2", "r3", "r4");
+    assertThat(ByteBuffer.wrap(object, object.length - 20, 8).order(ByteOrder.LITTLE_ENDIAN)
+        .getLong()).isEqualTo(7L);
+  }
+
+  /** A probed version superseded before the append reads its trailer cannot take it: unsent. */
+  @Test
+  void anAppendFromAProbedTailThatIsGoneLosesTheRaceUnsent() {
+    io.failSupersededReads(true);
+    LogView created = create();
+    LogTail probed = log.probe();
+    log.append(bytes("r2"), created.tail());
+    int writes = io.history().size();
+
+    assertThatThrownBy(() -> log.append(bytes("r3"), probed))
+        .isInstanceOf(LogConflictException.class);
+    assertThat(io.history()).hasSize(writes);
   }
 
   /** Counts the read requests that reach the store from now on. */

@@ -19,19 +19,25 @@
 package org.intentlog.fileio;
 
 import java.nio.ByteBuffer;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.SplittableRandom;
 import java.util.TreeMap;
 import org.apache.iceberg.io.AtomicOutputFile;
 import org.apache.iceberg.io.FileInfo;
 import org.apache.iceberg.io.InMemoryAtomicFileIO;
+import org.intentlog.Capabilities;
 import org.intentlog.CommittedSet;
 import org.intentlog.Intention;
+import org.intentlog.LogTail;
 import org.intentlog.LogView;
+import org.intentlog.PageStore;
+import org.intentlog.Receipt;
 import org.intentlog.Replay;
 import org.intentlog.SharedLog;
 import org.intentlog.StateMachine;
@@ -41,7 +47,11 @@ import org.intentlog.wire.LogEnvelope;
 /**
  * An {@link AtomicFileLog} over an {@link InMemoryAtomicFileIO}, dressed for fuzzing. The store
  * cannot delay a write or serve a stale read, so those faults act as a failure before the write and
- * as none. A copy of a record is appended at the object's offset, or, on a store without append,
+ * as none. It reads in a mode drawn per run ({@link InMemoryAtomicFileIO.ReadMode}): in all but
+ * {@code OPEN} a write can land between a read's lookup and its GET, which a pinned store fails as
+ * stale and an unpinned one serves live or spliced (at a frame's end half the time), as S3 before
+ * step 0 could (TAIL_READS.md, errata T6). Every view a read returns must be a state the log held:
+ * a version's checkpoint and a prefix of its records ({@link #checkpointViolations}). A copy of a record is appended at the object's offset, or, on a store without append,
  * by a CAS of the object with the copy after its records (another writer's write either way).
  * Every other CAS must write the replay of the version it replaced (I11), checked with {@code
  * machine}. The pages of the committed set are the store's objects under {@code <location>
@@ -53,14 +63,33 @@ public final class AtomicFileLogHarness implements LogHarness {
   private final AtomicFileLog log;
   private final String pages;
   private final StateMachine<?, ?, ?> machine;
+  private final HeldReads reads;
+  private final List<String> readViolations = new ArrayList<>();
+  private final Map<byte[], LogView> decoded = new java.util.IdentityHashMap<>();
   private Hooks hooks = null;
 
   public AtomicFileLogHarness(InMemoryAtomicFileIO io, String location,
       StateMachine<?, ?, ?> machine) {
+    this(io, location, machine, InMemoryAtomicFileIO.ReadMode.OPEN, 0L);
+  }
+
+  /** A harness whose store reads in {@code mode}, splicing where {@code seed} draws. */
+  public AtomicFileLogHarness(InMemoryAtomicFileIO io, String location,
+      StateMachine<?, ?, ?> machine, InMemoryAtomicFileIO.ReadMode mode, long seed) {
     this.io = io;
-    this.log = new AtomicFileLog(io, location);
+    SplittableRandom random = new SplittableRandom(seed);
+    this.log = new AtomicFileLog(io, location, random.split()::nextLong);
+    this.reads = new HeldReads(log, location);
     this.pages = location + ".committed/";
     this.machine = machine;
+    io.readMode(mode);
+    SplittableRandom splices = random.split();
+    io.spliceAt((bound, live) -> {
+      List<Integer> ends = frameEnds(bound);
+      return splices.nextBoolean() && !ends.isEmpty()
+          ? ends.get(splices.nextInt(ends.size()))
+          : splices.nextInt(bound.length + 1);
+    });
     io.injectFaults((loc, strategy) -> hooks == null ? InMemoryAtomicFileIO.Fault.NONE
         : fault(hooks.beforeWrite()));
     io.injectReadFaults(loc -> {
@@ -116,7 +145,7 @@ public final class AtomicFileLogHarness implements LogHarness {
 
   @Override
   public SharedLog log() {
-    return log;
+    return reads;
   }
 
   @Override
@@ -185,7 +214,136 @@ public final class AtomicFileLogHarness implements LogHarness {
 
   @Override
   public List<String> checkpointViolations() {
-    return violations(machine);
+    List<String> violations = new ArrayList<>(readViolations);
+    violations.addAll(violations(machine));
+    return violations;
+  }
+
+  /**
+   * The ends of the frames of a format-3 object, after its header: where a splice that format 2
+   * would have decoded falls. Empty for bytes that are not one.
+   */
+  static List<Integer> frameEnds(byte[] object) {
+    List<Integer> ends = new ArrayList<>();
+    int pos = AtomicFileLog.HEADER_SIZE;
+    while (pos < object.length) {
+      long length = 0;
+      int at = pos;
+      for (int shift = 0; ; shift += 7) {
+        if (at >= object.length || shift > 28) {
+          return ends;
+        }
+        byte b = object[at++];
+        length |= (long) (b & 0x7F) << shift;
+        if (b >= 0) {
+          break;
+        }
+      }
+      long end = at + length + AtomicFileLog.TRAILER_SIZE;
+      if (end > object.length) {
+        return ends;
+      }
+      pos = (int) end;
+      ends.add(pos);
+    }
+    return ends;
+  }
+
+  /**
+   * Whether {@code view} is a state the log held: some version's checkpoint, and a prefix of its
+   * records (a read may return any prefix, P1). Every version the store held is in its history.
+   */
+  private boolean held(LogView view, String location) {
+    List<byte[]> versions = new ArrayList<>();
+    for (InMemoryAtomicFileIO.Write write : io.history()) {
+      if (write.location().equals(location)) {
+        if (write.before() != null) {
+          versions.add(write.before());
+        }
+        versions.add(write.after());
+      }
+    }
+    byte[] checkpoint = view.checkpoint().orElseThrow();
+    for (byte[] version : versions) {
+      LogView whole = decoded.computeIfAbsent(version, AtomicFileLog::decode);
+      if (Arrays.equals(checkpoint, whole.checkpoint().orElseThrow())
+          && startsWith(whole.records(), view.records())) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** The log, each view its reads return checked against what the store held. */
+  private final class HeldReads implements SharedLog {
+    private final AtomicFileLog log;
+    private final String location;
+
+    HeldReads(AtomicFileLog log, String location) {
+      this.log = log;
+      this.location = location;
+    }
+
+    private LogView checked(LogView view, String how) {
+      Hooks was = hooks;
+      hooks = null;
+      try {
+        if (!held(view, location)) {
+          readViolations.add(how + " returned a state the log never held: "
+              + view.records().size() + " records after a checkpoint of "
+              + view.checkpoint().orElseThrow().length + " bytes");
+        }
+      } finally {
+        hooks = was;
+      }
+      return view;
+    }
+
+    @Override
+    public Capabilities capabilities() {
+      return log.capabilities();
+    }
+
+    @Override
+    public LogView read() {
+      return checked(log.read(), "a read");
+    }
+
+    @Override
+    public LogView readThrough(Receipt receipt, Duration wait) {
+      return checked(log.readThrough(receipt, wait), "a read through a write");
+    }
+
+    @Override
+    public LogTail probe() {
+      return log.probe();
+    }
+
+    @Override
+    public Receipt append(byte[] record, LogTail expected) {
+      return log.append(record, expected);
+    }
+
+    @Override
+    public Receipt replace(LogTail expected, byte[] checkpoint, List<byte[]> records) {
+      return log.replace(expected, checkpoint, records);
+    }
+
+    @Override
+    public LogView readAfter(LogTail since) {
+      LogView view = log.readAfter(since);
+      return view.checkpoint().isPresent() ? checked(view, "a read after a tail") : view;
+    }
+
+    @Override
+    public PageStore pages() {
+      return log.pages();
+    }
+
+    @Override
+    public String toString() {
+      return log.toString();
+    }
   }
 
   private <S, B extends StateMachine.Builder<S>, I extends Intention<B>> List<String> violations(

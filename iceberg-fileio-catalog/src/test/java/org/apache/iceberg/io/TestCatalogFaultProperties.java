@@ -196,6 +196,7 @@ class TestCatalogFaultProperties {
       @ForAll @IntRange(min = 2, max = 3) int writers,
       @ForAll("maxUpdateSizes") int maxUpdateSize,
       @ForAll boolean strictVersions,
+      @ForAll InMemoryAtomicFileIO.ReadMode reads,
       @ForAll @IntRange(min = 0, max = 7) int gzipWriters,
       @ForAll @IntRange(min = 0, max = 7) int gcWriters,
       @ForAll @IntRange(min = 0, max = 7) int pagingWriters,
@@ -204,7 +205,7 @@ class TestCatalogFaultProperties {
       @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
     new Run(onLog(sharedLog, modes.subList(0, writers)), maxUpdateSize, false, strictVersions,
-        gzipWriters, gcWriters, pagingWriters, clockOffsets, segmentLimit, encoding)
+        reads, gzipWriters, gcWriters, pagingWriters, clockOffsets, segmentLimit, encoding)
         .execute(schedule);
   }
 
@@ -215,6 +216,7 @@ class TestCatalogFaultProperties {
       @ForAll @IntRange(min = 2, max = 3) int writers,
       @ForAll("maxUpdateSizes") int maxUpdateSize,
       @ForAll boolean strictVersions,
+      @ForAll InMemoryAtomicFileIO.ReadMode reads,
       @ForAll @IntRange(min = 0, max = 7) int gzipWriters,
       @ForAll @IntRange(min = 0, max = 7) int gcWriters,
       @ForAll @IntRange(min = 0, max = 7) int pagingWriters,
@@ -223,7 +225,7 @@ class TestCatalogFaultProperties {
       @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
     new Run(onLog(sharedLog, modes.subList(0, writers)), maxUpdateSize, true, strictVersions,
-        gzipWriters, gcWriters, pagingWriters, clockOffsets, segmentLimit, encoding)
+        reads, gzipWriters, gcWriters, pagingWriters, clockOffsets, segmentLimit, encoding)
         .execute(schedule);
   }
 
@@ -802,12 +804,16 @@ class TestCatalogFaultProperties {
      * at most that many writes, and an append past it fails (Bug 66).
      */
     Run(List<LocalCatalogMode> modes, int maxUpdateSize, boolean faults, boolean strictVersions,
-        int gzipWriters, int gcWriters, int pagingWriters, List<Long> clockOffsets,
-        int segmentLimit, String encoding) {
+        InMemoryAtomicFileIO.ReadMode reads, int gzipWriters, int gcWriters, int pagingWriters,
+        List<Long> clockOffsets, int segmentLimit, String encoding) {
       this.maxUpdateSize = maxUpdateSize;
       this.faults = faults;
       this.gc = (gcWriters & ((1 << modes.size()) - 1)) != 0;
       io.failSupersededReads(strictVersions);
+      // Reads bind at the open, or are pinned, live or spliced after a lookup that a preempting
+      // command can follow (TAIL_READS.md, errata T6)
+      io.readMode(reads);
+      Statistics.label("reads").collect(reads);
       if (segmentLimit > 0) {
         io.limitSegments(segmentLimit);
       }
@@ -845,9 +851,9 @@ class TestCatalogFaultProperties {
       create(seed, TABLES.get(1), 2).newFastAppend().appendFile(newFile()).commit();
       this.model = actual();
       trace.append(String.format(
-          "modes %s, max update size %d%s, gzip writers %s, gc writers %s, paging writers %s,"
-              + " clocks off by %s ms, segment limit %d%nseed: %s%n",
-          modes, maxUpdateSize, strictVersions ? ", strict versions" : "",
+          "modes %s, max update size %d%s, reads %s, gzip writers %s, gc writers %s,"
+              + " paging writers %s, clocks off by %s ms, segment limit %d%nseed: %s%n",
+          modes, maxUpdateSize, strictVersions ? ", strict versions" : "", reads,
           Integer.toBinaryString(gzipWriters), Integer.toBinaryString(gcWriters),
           Integer.toBinaryString(pagingWriters), clockOffsets.subList(0, modes.size()),
           segmentLimit, model));

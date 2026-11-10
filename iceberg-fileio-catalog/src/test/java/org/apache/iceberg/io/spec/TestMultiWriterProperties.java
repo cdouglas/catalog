@@ -145,12 +145,13 @@ class TestMultiWriterProperties {
       @ForAll("maxAppendCounts") int maxAppendCount,
       @ForAll("appendHeadrooms") long appendHeadroom,
       @ForAll boolean strictVersions,
+      @ForAll InMemoryAtomicFileIO.ReadMode reads,
       @ForAll boolean gc,
       @ForAll("segmentLimits") int segmentLimit,
       @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(new MultiWriterStorage.File(strictVersions, segmentLimit), writers, maxAppendCount,
-        appendHeadroom, false, gc, encoding).execute(schedule);
+    new Run(new MultiWriterStorage.File(strictVersions, reads, segmentLimit), writers,
+        maxAppendCount, appendHeadroom, false, gc, encoding).execute(schedule);
   }
 
   @Property(tries = 300)
@@ -159,12 +160,13 @@ class TestMultiWriterProperties {
       @ForAll("maxAppendCounts") int maxAppendCount,
       @ForAll("appendHeadrooms") long appendHeadroom,
       @ForAll boolean strictVersions,
+      @ForAll InMemoryAtomicFileIO.ReadMode reads,
       @ForAll boolean gc,
       @ForAll("segmentLimits") int segmentLimit,
       @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(new MultiWriterStorage.File(strictVersions, segmentLimit), writers, maxAppendCount,
-        appendHeadroom, true, gc, encoding).execute(schedule);
+    new Run(new MultiWriterStorage.File(strictVersions, reads, segmentLimit), writers,
+        maxAppendCount, appendHeadroom, true, gc, encoding).execute(schedule);
   }
 
   @Property(tries = 300)

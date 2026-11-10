@@ -188,12 +188,24 @@ that serves a gap.
 The cost is a few bytes a frame: an 8-byte incarnation id and a varint
 position (or a truncated digest), about 3% of a 330-byte record.
 
-**Trigger to revisit:** a dedicated task, before relying on S3 in production,
-before tail reads (D15), or before a production shared log (S4). It takes over
-the format half of D15 and the checks S4 and T6 ask for. Both halves are
-planned in [TAIL_READS.md](TAIL_READS.md) (proposed 2026-11-06, revised
-2026-11-09): the one-object half by a frame trailer, the shared-log half by
-positions in the SPI ("Positions").
+**Done on one object** (TAIL_READS.md step 2, 2026-11-10): format 3 frames
+every checkpoint and record with a trailer naming the object's incarnation and
+the frame's offset, with a CRC32C over both and the frame (ATOMIC_FILE_LOG.md
+"Layout"). Every read checks every frame, and a read that fails a check reads
+again: a splice at a frame boundary fails the incarnation or the offset, one
+inside a frame the checksum. `InMemoryAtomicFileIO`'s read modes serve the
+splices S3 could (T6), and the commit-protocol fuzzer's oracle checks that no
+read returns a state the log never held; a mutant that skips the checks fails
+it.
+
+**Remaining:** the shared-log half (positions in the SPI: a checkpoint names
+the position it covers, a view of records alone where it starts; step 3, which
+closes S4 for providers that pass the contract) and the models (step 4: reads
+that splice or skip, the same oracle, a bug switch per check).
+
+**Trigger to revisit:** steps 3 and 4 of [TAIL_READS.md](TAIL_READS.md)
+(approved 2026-11-10), before tail reads (D15) or a production shared log
+(S4).
 
 ## Deferred Functionality
 
@@ -940,23 +952,29 @@ every store on 2026-11-09 (fork 7a5d42de5e, `cloud-runs/2026-11-09-contract-b`:
 S3 Express, S3 Standard, ADLS, GCS, GCS Rapid, each case its store
 supports); S3 Express honours `If-Match` on a GET.
 
+Since TAIL_READS.md step 2 (2026-11-10) the fuzzers race them too.
+`InMemoryAtomicFileIO`'s read modes open a stream as S3's does, with no
+request, and make its first read the GET, a request of its own that a fuzzer's
+preemption can precede: the store then serves the bound version (`PINNED`, as
+a GET with `If-Match`; superseded, it fails as stale under
+`failSupersededReads`), the live one (`LIVE`, as an unpinned GET), or the bound
+one's bytes up to an offset and the live one's after (`SPLICE`, as a stream
+that reopened without pinning). `OPEN`, the default, binds as the stream opens,
+as before. `TestAtomicFileCommitProtocol` (whose splices fall at a frame's end
+half the time), `TestCatalogFaultProperties`, `TestMultiWriterProperties` and
+`TestCatalogRaceProperties` draw the mode per try, and format 3's checks (S5)
+reject what an unpinned store serves torn.
+
 What remains:
 
-- The fuzzers never put a write between a read's lookup and its GET:
-  `InMemoryAtomicFileIO` binds a file as a stream opens, where S3, ADLS and
-  GCS bind at the lookup before it. Its `STALE` read fault and
-  `failSupersededReads` test the retry in `TestAtomicFileLog`, not under the
-  catalog fuzzers.
 - The accelerated read paths (S3's analytics accelerator, GCS's analytics
   core; both off by default) read whatever is live: a catalog's FileIO must
-  leave them off.
-- A store that breaks its read contract still splices undetected: S5 is the
-  format's check.
+  leave them off. Format 3 would reject a torn read of either, but a tail read
+  (D15) through one would also lose step 0's guarantee that its bytes are the
+  version its HEAD found.
 
-**Trigger to revisit:** before tail reads (D15), before relying on S3 or GCS
-in production, or when `InMemoryAtomicFileIO` binds a file at its lookup.
-The fuzzer read modes (a store that breaks its contract) are step 2 of
-[TAIL_READS.md](TAIL_READS.md), whose step 0 this was.
+**Trigger to revisit:** when a catalog's FileIO enables an accelerated read
+path.
 
 ## Known Unknowns
 

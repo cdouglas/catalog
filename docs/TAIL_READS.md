@@ -423,13 +423,31 @@ whole; a replica shared by location across a process's catalogs is open.
 ## Pricing
 
 The latency model must price a ranged GET by its bytes. `LatencyFileIO`
-(fileio-catalog's tests, and catalog-bench's `sut-fileio`) charges each
-`newStream` the latency and the bytes of the whole object (`Requests`). It
-should charge a stream's GET when it first reads, by the range it reads (a
-`RangeReadable.readFully`, or from the position a seek left to the end), so a
-tail read costs a HEAD and a GET of its bytes. catalog-bench's tiered FileIO
-already counts a GET per stream and the bytes a stream returns (`IoStats`);
-its time is `LatencyFileIO`'s.
+(fileio-catalog's tests, and catalog-bench's `sut-fileio`) charged each
+`newStream` the latency and the bytes of the whole object (`Requests`). Since
+step 1 it charges a stream's GET when it first reads, by the bytes from the
+position a seek left to the end, and a seek the open GET cannot read through
+(backward, or forward past S3FileIO's 1 MiB skip size) starts another, as
+`S3InputStream` does. catalog-bench's tiered FileIO already counts a GET per
+stream and the bytes a stream returns (`IoStats`); its time is
+`LatencyFileIO`'s.
+
+**The HEAD.** Step 1 found that the model charges no HEAD for a whole read.
+Opening a stream binds its file in the model (and in catalog-bench's
+`ModelStore`, for every client), as a GET's response reports a version and a
+length, so `AtomicFileLog`'s lookup after the open (`getLength`) costs nothing.
+On S3, ADLS and GCS that read is a HEAD, then a GET: the lookup binds the
+version the GET asks for, an order GCS needs, whose reads record no
+generation. A tail read takes the same order (open, look up, read from
+N − 20), so in the model it is one ranged GET, as a whole read is one whole
+GET, and on the stores each is a HEAD and a GET: steps 5 and 6 compare like
+with like. Step 7's question, whether the HEAD matters, is the one the model
+cannot answer as it stands. Charging the lookup after an open moves every
+FileIOCatalog number by a HEAD a read (on `s3x-2026-11` about 6 ms, on S3
+Standard about 27 ms, two or more a commit), and the baselines' too where
+Iceberg looks a file up after opening it (an Avro manifest list without a
+length). That is a change to the benchmark's model for every client, so it
+waits for step 6's numbers and a decision.
 
 ## What changes in the code
 
@@ -523,6 +541,15 @@ Each step stands alone and is measured before the next:
    failed check, the explorer, the read modes in `InMemoryAtomicFileIO`, and
    fuzz rounds in each mode. This alone closes T6 and the one-object half of
    S5: whole reads detect a splice, whatever the store returns.
+   Built 2026-11-10 (ATOMIC_FILE_LOG.md "Layout"). Until step 5 the commit
+   loop still resends after a probe; the resend frames its record with the
+   probed version's incarnation, which it reads from that version's last
+   trailer (a pinned 20-byte GET), so A4 holds: every frame comes from a
+   pinned read of the version its condition names. `InMemoryAtomicFileIO`
+   keeps binding a stream as it opens by default (`OPEN`); the fuzzers draw
+   `OPEN`, `PINNED`, `LIVE` or `SPLICE` per try, and the commit-protocol
+   fuzzer checks that no read returns a state the log never held (a mutant
+   that skips the checks fails it within a few hundred tries).
 3. **Positions in the SPI** (S4). The checkpoint's `through`, the joint's
    check, views of records that say where they start, and the gap-serving
    harness and contract case, on `InMemorySharedLog`. It closes S5's

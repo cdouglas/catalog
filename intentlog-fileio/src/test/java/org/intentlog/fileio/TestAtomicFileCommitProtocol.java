@@ -30,17 +30,20 @@ import org.intentlog.testkit.EntityVersionsMachine;
 /**
  * The commit-protocol fuzzer ({@link CommitProtocol}) on one object of a store, with offset
  * appends or CAS only, its writers compacting by the record count drawn, and duplicates of records
- * that compaction folded into a checkpoint, or GC'd.
+ * that compaction folded into a checkpoint, or GC'd. The store reads in a mode drawn per try:
+ * binding at the open, or pinned, live or spliced after a lookup (TAIL_READS.md, errata T6).
  */
 class TestAtomicFileCommitProtocol {
 
   @Property(tries = 5000)
   void commitsAreHonestAndCopiesNeverApply(
       @ForAll boolean append,
+      @ForAll InMemoryAtomicFileIO.ReadMode reads,
+      @ForAll long seed,
       @ForAll("settings") CommitProtocol.Settings settings,
       @ForAll("schedules") List<CommitProtocol.Cmd> schedule) {
     CommitProtocol.run(new AtomicFileLogHarness(new InMemoryAtomicFileIO(append), "mem:///log",
-        EntityVersionsMachine.INSTANCE), settings, schedule);
+        EntityVersionsMachine.INSTANCE, reads, seed), settings, schedule);
   }
 
   @Provide

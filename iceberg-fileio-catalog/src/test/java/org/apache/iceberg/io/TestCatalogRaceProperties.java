@@ -111,7 +111,8 @@ class TestCatalogRaceProperties {
       @ForAll boolean gc,
       @ForAll boolean paging,
       @ForAll("clockOffsets") List<Long> clockOffsets,
-      @ForAll("encodings") String encoding) {
+      @ForAll("encodings") String encoding,
+      @ForAll InMemoryAtomicFileIO.ReadMode reads) {
     // The writers' modes on one catalog object, or on a shared log with the same table metadata
     // storage.
     LocalCatalogMode modeA = sharedLog ? fileModeA.onSharedLog() : fileModeA;
@@ -146,6 +147,9 @@ class TestCatalogRaceProperties {
 
     // The race: the k-th racer runs just before A's k-th write to the catalog.
     InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+    // Reads bind at the open, or are pinned, live or spliced after a lookup (TAIL_READS.md)
+    io.readMode(reads);
+    Statistics.label("reads").collect(reads);
     // The setup creates the catalog, with the encoding its log keeps. Its clock reads a minute
     // ago, 5 ms later at each reading: its ids are older than the race's, in blocks of their own
     // that a writer that pages seals in the race.

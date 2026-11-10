@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // Decodes catalog files with the format explorer's own decoder, headless, and
-// reports what it could not decode: a decode error, a field catalog.proto
-// lacks, a wire type its declaration does not allow, an unknown enum value, a
-// structural payload of another layout version, or bytes no node covers.
+// reports what it could not decode: a decode error, a frame that fails its
+// trailer's checks (format 3), a field catalog.proto lacks, a wire type its
+// declaration does not allow, an unknown enum value, a structural payload of
+// another layout version, or bytes no node covers.
 //
 // Usage (from fileio-catalog/):
 //   node docs/format-explorer/check.mjs                 # the embedded scenarios
@@ -54,6 +55,7 @@ function problems(bytes) {
   for (const node of decoded.nodes) {
     if (node.kind === 'msg' && node.messageType) seen.add(node.messageType);
     if (node.drift) found.push(`${node.schemaPath || node.label} @${node.byteStart}: ${node.drift}`);
+    if (node.checkFailed) found.push(`${node.label} @${node.byteStart}: check failed: ${node.checkFailed}`);
     else if (node.quirk && node.quirkNote && node.quirkNote.startsWith('SCHEMA DRIFT')) {
       found.push(`${node.schemaPath || node.label} @${node.byteStart}: ${node.quirkNote}`);
     }

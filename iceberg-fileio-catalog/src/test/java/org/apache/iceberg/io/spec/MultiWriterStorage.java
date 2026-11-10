@@ -179,13 +179,19 @@ abstract class MultiWriterStorage {
     private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
     private final String described;
 
-    File(boolean strictVersions, int segmentLimit) {
+    /**
+     * One object, its reads binding at the open, or pinned, live or spliced after a lookup that
+     * another writer's preemption can follow ({@code reads}; TAIL_READS.md, errata T6).
+     */
+    File(boolean strictVersions, InMemoryAtomicFileIO.ReadMode reads, int segmentLimit) {
       this.described = "one object" + (strictVersions ? ", strict versions" : "")
+          + ", reads " + reads
           + (segmentLimit > 0 ? ", " + segmentLimit + " writes at most" : "");
       if (segmentLimit > 0) {
         io.limitSegments(segmentLimit);
       }
       io.failSupersededReads(strictVersions);
+      io.readMode(reads);
       io.injectFaults((location, strategy) -> hooks == null
           ? InMemoryAtomicFileIO.Fault.NONE
           : InMemoryAtomicFileIO.Fault.valueOf(hooks.beforeWrite(null).name()));

@@ -1281,6 +1281,9 @@ public class FormatExplorerFixtures {
    * transaction a writer makes for a change to the snapshot it read.
    */
   private static final class Log {
+    /** Every fixture file's incarnation, so that the fixtures stay the same when regenerated. */
+    private static final long INCARNATION = 0x1CA7A106F11E5EEDL;
+
     private byte[] file;
     private final List<Note> notes = new ArrayList<>();
 
@@ -1290,7 +1293,7 @@ public class FormatExplorerFixtures {
 
     /** A file of a checkpoint of {@code state} and no records. */
     static Log checkpoint(Replica<CatalogState> state) {
-      return new Log(AtomicFileLog.encode(checkpointBytes(state), List.of()));
+      return new Log(AtomicFileLog.encode(INCARNATION, checkpointBytes(state), List.of()));
     }
 
     /** A file of a checkpoint of {@code state}, to build a later state with records. */
@@ -1332,14 +1335,11 @@ public class FormatExplorerFixtures {
     }
 
     private Log appendRecord(byte[] body, String note) {
-      ByteArrayOutputStream out = new ByteArrayOutputStream();
-      out.writeBytes(file);
-      writeVarint(out, body.length);
-      out.writeBytes(body);
+      byte[] extended = AtomicFileLog.extend(file, body);
       if (note != null) {
-        notes.add(new Note(file.length, out.size(), note));
+        notes.add(new Note(file.length, extended.length, note));
       }
-      file = out.toByteArray();
+      file = extended;
       return this;
     }
 
@@ -1369,14 +1369,6 @@ public class FormatExplorerFixtures {
 
   private static byte[] checkpointBytes(Replica<CatalogState> state) {
     return CatalogTestSupport.checkpoint(state.logId(), state.committed(), state.state());
-  }
-
-  private static void writeVarint(ByteArrayOutputStream out, int value) {
-    while ((value & ~0x7F) != 0) {
-      out.write((value & 0x7F) | 0x80);
-      value >>>= 7;
-    }
-    out.write(value);
   }
 
   private static Replica<CatalogState> emptyCatalog() {

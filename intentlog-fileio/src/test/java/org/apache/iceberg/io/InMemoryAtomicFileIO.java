@@ -23,6 +23,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -53,6 +54,14 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
  * #failSupersededReads}, reading a bound generation that a later write replaced fails instead of
  * returning its bytes, as on real storage: GCS reads by generation, and S3 and ADLS with If-Match;
  * and looking it up ({@code exists}) finds nothing, as GCS's lookup of a generation does.
+ *
+ * <p>{@link #readMode} chooses how a stream reads (TAIL_READS.md "Testing", errata T6). By default
+ * ({@link ReadMode#OPEN}) a stream binds its file's version as it opens, one request, so no write
+ * lands between a lookup and the bytes it reads. In the other modes a stream opens as S3's does,
+ * with no request; its first read is the GET, a request of its own, after which the store serves
+ * the bound version ({@link ReadMode#PINNED}, as a GET with If-Match), the live one ({@link
+ * ReadMode#LIVE}, as an unpinned GET), or the bound one's bytes up to an offset and the live one's
+ * after ({@link ReadMode#SPLICE}, as a stream that reopened mid-read without pinning).
  *
  * <p>Plain {@link OutputFile} writes are unconditional, as for table metadata and data files.
  *
@@ -134,13 +143,38 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
 
   /**
    * Chooses the fault for each read request, in order. A request is what reaches storage: binding
-   * an input file ({@code exists} or {@code getLength} of an unbound file) and every {@code
-   * newStream}. It is called as the request is issued and holds no lock: it may run other writers
-   * first.
+   * an input file ({@code exists} or {@code getLength} of an unbound file) and every GET (each
+   * {@code newStream} in {@link ReadMode#OPEN}, else a stream's first read). It is called as the
+   * request is issued and holds no lock: it may run other writers first.
    */
   @FunctionalInterface
   public interface ReadFaults {
     ReadFault next(String location);
+  }
+
+  /** How a stream reads its file's version (the class comment). */
+  public enum ReadMode {
+    /** The stream binds the version as it opens, one request (the default). */
+    OPEN,
+    /**
+     * The stream's first read is the GET, of the version a lookup bound or else the live one,
+     * which it binds; a version a write superseded reads as {@link #failSupersededReads} says.
+     */
+    PINNED,
+    /** As {@link #PINNED}, but the GET of a superseded version returns the live one's bytes. */
+    LIVE,
+    /**
+     * As {@link #PINNED}, but the GET of a superseded version returns its bytes up to an offset
+     * ({@link #spliceAt}) and the live one's from there.
+     */
+    SPLICE
+  }
+
+  /** Where a spliced read turns from the bound version's bytes to the live one's. */
+  @FunctionalInterface
+  public interface SpliceAt {
+    /** An offset in {@code [0, bound.length]}. */
+    int offset(byte[] bound, byte[] live);
   }
 
   /** One version of an object; a new instance per write. */
@@ -201,6 +235,14 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
   private volatile ReadFaults readFaults = location -> ReadFault.NONE;
   private volatile PlainFaults plainFaults = (request, location) -> Fault.NONE;
   private volatile boolean failSupersededReads = false;
+  private volatile ReadMode readMode = ReadMode.OPEN;
+  private final java.util.SplittableRandom spliceRandom = new java.util.SplittableRandom(0);
+  private volatile SpliceAt spliceAt = (bound, live) -> {
+    synchronized (spliceRandom) {
+      return spliceRandom.nextInt(bound.length + 1);
+    }
+  };
+  private final Map<ReadMode, Integer> servedReads = Maps.newEnumMap(ReadMode.class);
   private volatile int maxSegments = 0;
   private volatile Supplier<RuntimeException> segmentLimitError = null;
   private volatile int appendByteLimit = 0;
@@ -359,6 +401,21 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
    */
   public void failSupersededReads(boolean fail) {
     this.failSupersededReads = fail;
+  }
+
+  /** Reads streams as {@code mode} says, from now on ({@link ReadMode#OPEN} by default). */
+  public void readMode(ReadMode mode) {
+    this.readMode = mode;
+  }
+
+  /** Where {@link ReadMode#SPLICE} splices a read (by default, a draw of a seeded random). */
+  public void spliceAt(SpliceAt at) {
+    this.spliceAt = at;
+  }
+
+  /** Number of reads served spliced or live since the store was made, by mode. */
+  public synchronized int served(ReadMode mode) {
+    return servedReads.getOrDefault(mode, 0);
   }
 
   /**
@@ -576,6 +633,15 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
 
     @Override
     public SeekableInputStream newStream() {
+      ReadMode mode = readMode;
+      return mode == ReadMode.OPEN ? get(mode) : new LazyStream(() -> get(mode));
+    }
+
+    /**
+     * The GET: a request, of the bound version (binding the live one if none), served as {@code
+     * mode} says.
+     */
+    private SeekableInputStream get(ReadMode mode) {
       ReadFault fault = readFault(location);
       if (fault == ReadFault.FAIL) {
         throw readFailure(location);
@@ -596,13 +662,22 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
       if (v == null) {
         throw new NotFoundException("File does not exist: %s", location);
       }
-      if (wasBound && failSupersededReads && objects.get(location) != v) {
-        throw new SupportsAtomicOperations.StaleReadException(
-            "Generation " + v.generation + " of " + location + " was replaced", null);
+      byte[] bytes = v.bytes;
+      Version live = objects.get(location);
+      if (wasBound && live != v) {
+        if (live != null && (mode == ReadMode.LIVE || mode == ReadMode.SPLICE)) {
+          bytes = mode == ReadMode.LIVE ? live.bytes : splice(v.bytes, live.bytes);
+          synchronized (InMemoryAtomicFileIO.this) {
+            servedReads.merge(mode, 1, Integer::sum);
+          }
+        } else if (failSupersededReads) {
+          throw new SupportsAtomicOperations.StaleReadException(
+              "Generation " + v.generation + " of " + location + " was replaced", null);
+        }
       }
-      SeekableInputStream stream = new InMemoryInputFile(location, v.bytes).newStream();
+      SeekableInputStream stream = new InMemoryInputFile(location, bytes).newStream();
       return fault == ReadFault.FAIL_MID_STREAM
-          ? new BreakingInputStream(stream, location, v.bytes.length / 2)
+          ? new BreakingInputStream(stream, location, bytes.length / 2)
           : stream;
     }
 
@@ -769,6 +844,66 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
   }
 
   /** Throws {@link IOException} once a read reaches {@code breakAt}. */
+  /** {@code bound}'s bytes up to {@link #spliceAt}'s offset, then {@code live}'s from there. */
+  private byte[] splice(byte[] bound, byte[] live) {
+    int at = Math.max(0, Math.min(bound.length, spliceAt.offset(bound, live)));
+    byte[] spliced = Arrays.copyOf(bound, Math.max(at, live.length));
+    if (live.length > at) {
+      System.arraycopy(live, at, spliced, at, live.length - at);
+    }
+    return spliced;
+  }
+
+  /** A stream that sends its GET at its first read, from the position a seek left, as S3's does. */
+  private static final class LazyStream extends SeekableInputStream {
+    private final Supplier<SeekableInputStream> get;
+    private SeekableInputStream in = null;
+    private long pos = 0;
+
+    LazyStream(Supplier<SeekableInputStream> get) {
+      this.get = get;
+    }
+
+    private SeekableInputStream in() throws IOException {
+      if (in == null) {
+        in = get.get();
+        in.seek(pos);
+      }
+      return in;
+    }
+
+    @Override
+    public long getPos() throws IOException {
+      return in == null ? pos : in.getPos();
+    }
+
+    @Override
+    public void seek(long newPos) throws IOException {
+      if (in == null) {
+        pos = newPos;
+      } else {
+        in.seek(newPos);
+      }
+    }
+
+    @Override
+    public int read() throws IOException {
+      return in().read();
+    }
+
+    @Override
+    public int read(byte[] b, int off, int len) throws IOException {
+      return in().read(b, off, len);
+    }
+
+    @Override
+    public void close() throws IOException {
+      if (in != null) {
+        in.close();
+      }
+    }
+  }
+
   private static class BreakingInputStream extends SeekableInputStream {
     private final SeekableInputStream in;
     private final String location;

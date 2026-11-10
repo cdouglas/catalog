@@ -16,47 +16,56 @@ the checkpoint and of each record is the log's
 
 ## Layout
 
-A fixed 8-byte header, a length-prefixed checkpoint, then the length-prefixed
-records appended after it:
+A fixed 8-byte header, a framed checkpoint, then the framed records appended
+after it. Each frame is a varint length, the message, and a 20-byte trailer
+(format 3, since 2026-11-10; [TAIL_READS.md](TAIL_READS.md) step 2):
 
-<!-- RFC frame generated with luismartingarcia/protocol:
-protocol "Magic = LCAT:32,Format Version = 2:32,Checkpoint Length (varint):16,LogCheckpoint (protobuf - variable):48,Record Length (varint):16,LogRecord (protobuf - variable):48" -->
+<!-- RFC frame generated with luismartingarcia/protocol, then trailers added by hand:
+protocol "Magic = LCAT:32,Format Version = 3:32,Checkpoint Length (varint):16,LogCheckpoint (protobuf - variable):48,Trailer (20 bytes):32,Record Length (varint):16,LogRecord (protobuf - variable):48,Trailer (20 bytes):32" -->
 ```
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                          Magic = LCAT                         |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                       Format Version = 2                      |
+|                       Format Version = 3                      |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |   Checkpoint Length (varint)  |                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
 |              LogCheckpoint (protobuf - variable)              |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                       Trailer (20 bytes)                      |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |     Record Length (varint)    |                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
 |                LogRecord (protobuf - variable)                |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                       Trailer (20 bytes)                      |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
-As a grammar (`framed` = a varint byte length followed by the bytes of that
-protobuf message):
+As a grammar (a `frame` is a varint byte length, the bytes of that protobuf
+message, and its trailer):
 
 ```abnf
-log-file   = header checkpoint *record
-header     = magic version
-magic      = %x4C.43.41.54        ; "LCAT"
-version    = u32                  ; big-endian, currently 2
-checkpoint = framed               ; protobuf LogCheckpoint (log.proto)
-record     = framed               ; protobuf LogRecord (log.proto): an intention or a GC record
-framed     = varint *OCTET        ; varint length L, then L octets
+log-file    = header checkpoint *record
+header      = magic version
+magic       = %x4C.43.41.54        ; "LCAT"
+version     = u32                  ; big-endian, currently 3
+checkpoint  = frame                ; protobuf LogCheckpoint (log.proto)
+record      = frame                ; protobuf LogRecord (log.proto): an intention or a GC record
+frame       = varint *OCTET trailer ; varint length L, then L octets, then the trailer
+trailer     = incarnation offset crc
+incarnation = u64le                ; the object's: the same in every frame of it
+offset      = u64le                ; where the frame starts in the object (its varint)
+crc         = u32le                ; CRC32C of the varint, the body, incarnation and offset
 ```
 
 ```
 Offset  Size   Field             Description
 ------  ----   -----             -----------
   0       4    magic             "LCAT" (0x4C 0x43 0x41 0x54)
-  4       4    formatVersion     Big-endian int32, must be 2 (AtomicFileLog.FORMAT_VERSION)
+  4       4    formatVersion     Big-endian int32, must be 3 (AtomicFileLog.FORMAT_VERSION)
                           Total: 8 bytes
 ```
 
@@ -67,12 +76,30 @@ applies to the frames in [SPEC.md](SPEC.md) §"Worked examples"). Each object
 has exactly one checkpoint, and every record in it follows that checkpoint:
 a record is never written without the checkpoint it replays onto.
 
+**Trailers.** Each frame names the object it was written into and where it
+starts. The incarnation is a random 64-bit number that each replace draws for
+the object it writes (every attempt its own), in every frame it writes; an
+append copies it from the version its condition names. The offset is that of
+the frame's varint. The checksum (CRC32C, `java.util.zip.CRC32C`) covers the
+varint, the body, the incarnation and the offset, so it catches a splice inside
+a frame, which the other two cannot. The trailer comes last, so that a reader
+can check the frame that ends at any length N from the 20 bytes before N
+(a tail read, [TAIL_READS.md](TAIL_READS.md)). It costs 20 bytes a frame.
+Why every frame names its object truly, by induction over the store's writes,
+is TAIL_READS.md §"Why a tail read is sound".
+
 A read (`AtomicFileLog.read`) reads the whole object, checks the magic and
-the version, and splits the rest into the checkpoint and the records; it fails
-on a file shorter than the header, another magic, another version, or a
-truncated frame. Replay is the log's ([LOG.md](LOG.md) §"Replay").
-`AtomicFileLog.encode` and `decode` turn a checkpoint and records into an
-object's bytes and back, for tests and tools.
+the version, and splits the rest into the checkpoint and the records, checking
+every frame: it lies within the object, its checksum holds, its offset is where
+the frame before ended, and its incarnation is the checkpoint's. A read that
+fails a check, or whose object ends before the length its lookup found, was
+torn by a write that raced it or served wrong by the store
+(`FrameCheckException`), and `read()` reads again (below). Before format 3 a
+splice at a frame boundary decoded (errata S5). Replay is the log's
+([LOG.md](LOG.md) §"Replay"). `AtomicFileLog.encode` (with or without an
+incarnation), `extend` (an append's bytes) and `decode` turn a checkpoint and
+records into an object's bytes and back, for tests and tools; `decode` also
+reads format 2, unchecked, for captured logs.
 
 ## Operations
 
@@ -81,8 +108,8 @@ object's bytes and back, for tests and tools.
 | `capabilities()` | appends if the FileIO does (`supportsAppend()`), conditionally; replaces (fused); no separate checkpoints; reads its own writes |
 | `read()` | the whole object, bound to the version it found |
 | `probe()` | the object's version and length, without reading it; a tail that does not exist if the object does not |
-| `append(record, tail)` | appends `[varint length][record]` at the tail's length, conditioned on its version (`Strategy.APPEND`). An unconditional append is refused |
-| `replace(tail, checkpoint, records)` | writes `[header][checkpoint][records]` as the whole object, conditioned on the tail's version, or on the object's absence if the tail does not exist (`Strategy.CAS`) |
+| `append(record, tail)` | appends the record's frame at the tail's length, conditioned on its version (`Strategy.APPEND`), naming that version's incarnation: from the view this log read or wrote at the tail, or, for a tail a probe found, from that version's last trailer, read pinned to it (a version superseded since fails as a lost race, unsent). An unconditional append is refused |
+| `replace(tail, checkpoint, records)` | writes `[header][checkpoint][records]`, framed with an incarnation drawn for the write, as the whole object, conditioned on the tail's version, or on the object's absence if the tail does not exist (`Strategy.CAS`) |
 | `readThrough(receipt)` | the object the write left, so its record is among the records (P3): without a read when the write says what it holds (a replace holds what it wrote; an append conditioned on a tail whose bytes this log read or wrote holds those bytes and the record), else by reading the version the write wrote, or the live object if a later write superseded it |
 | `putCheckpoint`, `trim`, `readAfter` | not supported (a replace checkpoints), or the default (a fresh read) |
 
@@ -116,10 +143,14 @@ it, and the GET asks for it (S3's and ADLS's `If-Match`, GCS's
 whose contract suite has read cases). A write that lands between the lookup
 and the GET fails the GET as stale (`StaleReadException`) rather than return
 part of another object, and `read()` reads again (up to `READ_ATTEMPTS`). A
-read through an append from a probed tail, whose version a later write
-superseded, reads the live object, which holds the append's record unless a
-replace folded it into a checkpoint (then the commit is ambiguous, P3). Before
-2026-11-09, S3 and GCS reads asked for no version (errata T6).
+store that breaks that contract, serving the live version or the rest of one
+from a reopened stream, serves bytes the frames' checks reject (unless the
+object it served is the same incarnation, whose bytes up to the length read are
+the same), and `read()` reads again too. A read through an append from a probed
+tail, whose version a later write superseded, reads the live object, which
+holds the append's record unless a replace folded it into a checkpoint (then
+the commit is ambiguous, P3). Before 2026-11-09, S3 and GCS reads asked for no
+version (errata T6).
 
 **Signals.** Each write is prepared (`AtomicOutputFile.prepare`, which
 computes the checksum the store checks) and then sent (`writeAtomic`). The
@@ -209,9 +240,11 @@ bootstrap at once: one creates the object, and the others find it created.
 
 ## Schema evolution
 
-The header's `formatVersion` must equal `AtomicFileLog.FORMAT_VERSION` (2).
+The header's `formatVersion` must equal `AtomicFileLog.FORMAT_VERSION` (3).
 Version 1 was the layout before the envelope, with the catalog's checkpoint
-and transactions framed directly; a version-2 reader refuses it. Changes
+and transactions framed directly; version 2 framed the envelope with no
+trailers. A log refuses any other version; `AtomicFileLog.decode`, for tools,
+also reads version 2 unchecked (captured logs). Changes
 inside the envelope are gated by `LogCheckpoint.min_reader_version`
 ([LOG.md](LOG.md) §"The envelope"), and changes to the catalog's messages by
 `Checkpoint.min_reader_version` ([SPEC.md](SPEC.md) §"Schema Evolution").
@@ -221,6 +254,6 @@ inside the envelope are gated by `LogCheckpoint.min_reader_version`
 | File | Purpose |
 |------|---------|
 | `intentlog-fileio/src/main/java/org/intentlog/fileio/AtomicFileLog.java` | The layout; reads, appends and replaces through `SupportsAtomicOperations` |
-| `intentlog-fileio/src/test/java/org/apache/iceberg/io/InMemoryAtomicFileIO.java` | An in-memory store that enforces conditional appends and replaces, with faults, segment limits and append size limits, for tests |
+| `intentlog-fileio/src/test/java/org/apache/iceberg/io/InMemoryAtomicFileIO.java` | An in-memory store that enforces conditional appends and replaces, with faults, segment limits, append size limits and read modes (a stream that binds at its open, or a lazy GET pinned, live or spliced, as S3 before step 0 could serve one), for tests |
 | `intentlog-core/src/main/java/org/intentlog/LogRuntime.java` | The commit loop |
 | `intentlog-core/src/main/proto/log.proto` | The envelope |
