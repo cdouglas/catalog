@@ -906,7 +906,7 @@ bytes)` API on `FileIOCatalog` to re-inline them. Two options:
 **Trigger to revisit:** when a real workload needs catalog
 re-registration of a previously-dropped inline table.
 
-### T6. Pinned reads are tested on the in-memory store, not on the real ones
+### T6. The fuzzers do not race a write between a read's lookup and its GET
 
 Until 2026-11-09 the fork's S3 and GCS reads asked for no version.
 `S3InputStream` sent each ranged GET with no `If-Match` and reopened the
@@ -929,13 +929,13 @@ whose start would pass for the old version and appends) and after an append;
 and a file whose first request was a read reads that version by a reopened
 stream, a range read and a new stream, keeps its length, and fails a CAS
 rather than replace a version it did not read (stores whose reads record
-their version: not GCS, whose client library reports none).
+their version: not GCS, whose client library reports none). They passed on
+every store on 2026-11-09 (fork 7a5d42de5e, `cloud-runs/2026-11-09-contract-b`:
+S3 Express, S3 Standard, ADLS, GCS, GCS Rapid, each case its store
+supports); S3 Express honours `If-Match` on a GET.
 
 What remains:
 
-- The read cases have run on the in-memory store only. A real-cloud run of
-  the contract says whether each store honours its read precondition; S3
-  Express and `If-Match` on a GET is the one in doubt.
 - The fuzzers never put a write between a read's lookup and its GET:
   `InMemoryAtomicFileIO` binds a file as a stream opens, where S3, ADLS and
   GCS bind at the lookup before it. Its `STALE` read fault and
@@ -947,8 +947,8 @@ What remains:
 - A store that breaks its read contract still splices undetected: S5 is the
   format's check.
 
-**Trigger to revisit:** the next real-cloud run (the contract's read cases),
-before tail reads (D15), or before relying on S3 or GCS in production.
+**Trigger to revisit:** before tail reads (D15), before relying on S3 or GCS
+in production, or when `InMemoryAtomicFileIO` binds a file at its lookup.
 
 ## Known Unknowns
 
