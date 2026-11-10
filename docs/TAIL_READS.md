@@ -529,7 +529,8 @@ Each step stands alone and is measured before the next:
    into a 412 instead of a transfer that fails the format's checks later.
    The read cases passed on every store (fork 7a5d42de5e, `cloud-runs/`
    2026-11-09-contract-b): S3 Express, S3 Standard, ADLS, GCS and GCS Rapid,
-   each case its store supports. S3 Express honours `If-Match` on a GET.
+   each case its store supports. S3 Express honours `If-Match` on a GET. A
+   havoc round at fileio 69fdfdd (`sr0-r0`, 2026-11-10) was clean.
    - **0b. Probe the metadata alternative** (fork 18c87db437,
      `S3ExpressMetadataProbes`, `AdlsMetadataProbes`, in the same run): small
      cases, as `GcsRapidCanaries` probes Rapid buckets, of the three
@@ -625,7 +626,11 @@ Each step stands alone and is measured before the next:
    oracles clean, every mutant caught (`lengthonly`, `notrailer` and
    `probeinc` by the file commit-protocol fuzzer and `TestAtomicFileLog`,
    `nochecksum` by `TestAtomicFileLog` alone, `nojoint` by the memory
-   commit-protocol fuzzer).
+   commit-protocol fuzzer). The round at 409bbad (`tr5b-r0`) was clean but
+   for the fault and multi-writer jobs, both the harnesses' (the fault
+   fuzzer's model and the tail-read check under unpinned reads, above);
+   rerun at their fixes, the fault jobs at 61ff771 (`tr5c-fault2`) and the
+   multi-writer job at b6abb0c (`tr5d-mw`) were clean.
 6. **Measure.** catalog-bench E1 at 300 and 1,000 tables on S3 Express, inline
    ML and TM, tail reads on and off; and E3's deep tables, whose sizes after
    paging campaign `e3f-sp4` gives.
