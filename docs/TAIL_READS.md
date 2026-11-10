@@ -201,21 +201,51 @@ trailer = incarnation:fixed64 offset:fixed64 crc:fixed32
   it); an append writes the incarnation of the object its condition names.
   No two objects share one, so a frame naming X was written into X.
 
-  The trailer is the writer's statement, which the write's condition makes
-  true: an append carries the trailer of the version it is conditioned on
-  (that version's incarnation, its length as the offset), and the store
-  lands it on that version or nowhere
-  (`appendPinnedToAVersionReplacedAtTheSameLengthFails`). A retry cannot move
-  a frame. A transport retry of a lost reply resends the same request under
-  the same condition, so it fails if the first attempt landed or a replace
-  came between; the commit loop's own resend after a lost race is framed
-  afresh, against the version its tail read found. So a record retried into
-  a replace, even at the offset where the reader's tail ends, names the
-  replace's incarnation, and the reader reads whole. Each replace attempt
-  draws its incarnation as it builds the object; its transport retries send
-  the same bytes under the same condition. What is left to chance is two
-  replaces drawing the same 64-bit incarnation, or the 20 bytes at N − 20 of
-  a replace matching the held trailer by accident.
+  The trailer is the writer's statement, and three links make it true:
+
+  1. *The condition binds an append to one version.* An append is sent
+     under `If-Match` on a version V at V's length, and lands on V or
+     nowhere (`appendPinnedToAVersionReplacedAtTheSameLengthFails`).
+  2. *A pinned read binds V to its incarnation.* The writer frames the
+     append from the tail its condition names, and that tail is a read of V:
+     since step 0 its bytes are V's, and their frames name an incarnation X
+     (checked as they are read).
+  3. *An incarnation names one checkpoint.* The replace that drew X wrote
+     its checkpoint at X's head, and appends never touch the head.
+
+  By induction every frame names the object it is in. A replace's frames
+  name the incarnation it drew. An append's frame names the incarnation of
+  the bytes it read from V, which are V's own, and it lands only on V. So a
+  reader that finds X's trailer at N − 20 of a GET pinned to V knows that V
+  is X, extended past N, with X's checkpoint.
+
+  The commit loop's retry, in those terms. A writer holds a tail (X, x),
+  the object of checkpoint C_k at length x, and sends its record framed
+  (X, x) under `If-Match` V_x. It loses the race. It does not take a new
+  offset from a HEAD, which gives a version V_y and a length y but not
+  whose they are (the loop does that today, and format 3 drops it: "A
+  probe", below). It tail-reads from (X, x) instead: the HEAD finds V_y and
+  y, and a GET of [x − 20, y) pinned to V_y returns their bytes.
+
+  - If the first 20 bytes are the trailer it holds, V_y is X: the frames in
+    [x, y) are the records that beat it, after C_k. It frames the same
+    record (X, y) and sends it under `If-Match` V_y.
+  - If they are not, the object was replaced: it reads V_y whole, learns its
+    incarnation Z and checkpoint C_{k+1}, and frames the record (Z, y′)
+    against that (or replaces, as the loop decides).
+
+  The proof that C_k is still the checkpoint is the condition: the append
+  lands only on V_y, and V_y's checkpoint is C_k (links 2 and 3). It holds
+  at the moment the append lands, the only moment that matters: if another
+  writer replaces C_k first, the append fails and the loop reads again. The
+  record's bytes are the same on every send, since replay judges them where
+  they land; the frame is built for each send.
+
+  A transport retry resends the same request under the same condition, so
+  it lands on V_x or nowhere. Each replace attempt draws its incarnation as
+  it builds the object. What is left to chance is two replaces drawing the
+  same 64-bit incarnation, or the 20 bytes at N − 20 of a replace matching
+  the held trailer by accident.
 - **offset**: the byte offset at which the frame starts. An append is
   conditioned on the exact version and length it extends (ATOMIC_FILE_LOG.md
   "Tails"), so within one incarnation the frames are contiguous and each
