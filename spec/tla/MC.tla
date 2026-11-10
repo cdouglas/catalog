@@ -145,6 +145,15 @@ Not_ResolveAfterGc ==
     ~(ws[w].pc = "resolve" /\ ws[w].txn.id \in IdsOf(Hist) /\ ws[w].txn.id \notin LiveR.C)
 Not_Exhausted == \A w \in Writers : ~(ws[w].pc = "loop" /\ ws[w].att >= MaxAttempts)
 
+\* Compaction after the commit (CompactAfter): one landed (its incarnation's
+\* third part is 0); one lost its race (the object changed since the
+\* commit's record landed); an append lost its race to one.
+CompactionInc == file.inc[1] # 0 /\ file.inc[3] = 0
+Not_CompactionLanded == ~CompactionInc
+Not_CompactionLost == \A w \in Writers : ~(ws[w].pc = "compact" /\ file.gen # ws[w].lr.gen)
+Not_LostToCompaction ==
+  \A w \in Writers : ~(ws[w].pc \in {"tailread", "refresh"} /\ CompactionInc)
+
 \* Paging (COMMITTED_PAGING.md). A CAS's PageOut applied: the floor above
 \* the horizon. A writer about to judge its record by a read whose id is
 \* paged. An orphan page; a sweep that deleted one; a CAS whose put failed.

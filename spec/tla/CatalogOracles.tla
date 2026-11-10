@@ -25,7 +25,8 @@ AllDone == \A w \in Writers : ws[w].pc = "idle" /\ ws[w].k > Len(Shapes[w])
 -----------------------------------------------------------------------------
 (* TestMultiWriterProperties.Run.commit: each commit, on its own writes that
    landed (`writes`), those that changed the state (`effective`), its outcome,
-   and whether a fault was injected into it (ctx.faulted()). *)
+   and whether a fault was injected into it (ctx.faulted()); and the
+   compaction after it, apart. *)
 
 Effective(cw) == SelectSeq(cw, LAMBDA x : View(x.after) # View(x.before))
 
@@ -49,6 +50,9 @@ OracleMW(w, s, out, final) ==
      /\ out = "unknown" => s.cf \/ Retention >= 0
      \* "one commit made %d conditional writes", on storage that does not fail
      /\ MaxFaults = 0 => Len(s.cw) <= 1
+     \* "a compaction after a commit changed the state" (and its checkpoint is a
+     \* replay: CheckpointRoundTrip, which a state the compaction kept implies here)
+     /\ \A i \in DOMAIN s.cc : View(s.cc[i].after) = View(s.cc[i].before)
 
 -----------------------------------------------------------------------------
 (* TestCatalogFaultProperties.Run.resolve: after each operation, the catalog

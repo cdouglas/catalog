@@ -41,6 +41,7 @@ BASE = {
     "Admission": "0",
     "MaxSweep": "0",
     "TailReads": "TRUE",
+    "CompactAfter": "FALSE",
     "BlockIds": "1",
     "GridBits": "3",
     "SealEvery": "0",
@@ -67,6 +68,13 @@ FPAGE_FAULTS = ('{"failBefore", "lostReply", "landedConflict", "throttled", '
 # What the catalog fuzzers draw (no late landings), with the page store's faults.
 FUZZER_PAGE_FAULTS = ('{"failBefore", "lostReply", "landedConflict", "throttled", '
                       '"landedThrottled", "readFail", "pageFail", "putFail", "putLost"}')
+
+# Compaction after the commit (TAIL_READS.md "Compaction after the commit"): past the limits a
+# commit appends, and its writer may compact the version its record landed in (or not: the model
+# takes both, as the drawn points do). Every configuration above runs with compaction fused with
+# the commit (the ablation, and the path of a full object), as before; the after-* family runs the
+# same kinds of schedule with compaction after it. Its count is 1, so that each commit may compact.
+AFTER = {"CompactAfter": "TRUE", "MaxCount": "1"}
 
 # name -> (overrides, expect)
 CONFIGS = {
@@ -189,6 +197,61 @@ CONFIGS = {
     "mintH": ({**FPAGE, "Skew": "<- Behind2", "Bugs": '{"mintH"}'},
               {"CasAppliesItsRecord", "SoloCommits"}),
     "pageown": ({**FPAGE, "Bugs": '{"pageown"}'}, {"CasAppliesItsRecord"}),
+    # Compaction after the commit.
+    "after-base": ({**AFTER}, "pass"),
+    "after-cas-only": ({**AFTER, "MaxCount": "0"}, "pass"),
+    "after-gcs": ({**AFTER, "AppendSupported": "FALSE"}, "pass"),
+    "after-size": ({**AFTER, "MaxCount": "100", "MaxSize": "3", "Shapes": "<- TwoEach"}, "pass"),
+    "after-two-each": ({**AFTER, "Shapes": "<- TwoEach"}, "pass"),
+    "after-long": ({**AFTER, "Shapes": "<- Long", "MaxCount": "2", "MaxAttempts": "4"}, "pass"),
+    "after-faults": ({**AFTER, "MaxFaults": "1", "FaultKinds": ALL_FAULTS}, "pass"),
+    "after-faults-strict": ({**AFTER, "MaxFaults": "1", "FaultKinds": ALL_FAULTS,
+                             "Strict": "TRUE"}, "pass"),
+    "after-faults2": ({**AFTER, "Shapes": "<- TwoEach", "MaxFaults": "2", "FaultKinds": ALL_FAULTS,
+                       "Strict": "TRUE"}, "pass"),
+    "after-gc0": ({**AFTER, "Retention": "0", "MaxTime": "2", "Shapes": "<- TwoEach"}, "pass"),
+    "after-skew": ({**AFTER, "Shapes": "<- TwoEach", "Retention": "1", "MaxTime": "3",
+                    "Skew": "<- Behind2", "MaxFaults": "1", "FaultKinds": FUZZER_FAULTS}, "pass"),
+    # A segment cap: a full object makes the commit replace it with its record (fused), and
+    # compactions after commits reset the cap too.
+    "after-seg": ({**AFTER, "Shapes": "<- TwoEach", "MaxCount": "2", "SegLimit": "2"}, "pass"),
+    "after-long-faults": ({**AFTER, "Shapes": "<- Long", "MaxCount": "2", "MaxAttempts": "4",
+                           "MaxFaults": "1", "FaultKinds": ALL_FAULTS, "Strict": "TRUE",
+                           "Retention": "0", "MaxTime": "1"}, "pass"),
+    "after-three": ({**AFTER, "Writers": "{1, 2, 3}", "Shapes": "<- Three", "Skew": "<- NoSkew3",
+                     "MaxFaults": "1", "FaultKinds": ALL_FAULTS, "Strict": "TRUE"}, "pass"),
+    "after-probe": ({**AFTER, "Shapes": "<- TwoEach", "Retention": "0", "MaxTime": "2",
+                     "TailReads": "FALSE"}, "pass"),
+    "after-probe-faults": ({**AFTER, "MaxFaults": "1", "FaultKinds": ALL_FAULTS, "Strict": "TRUE",
+                            "TailReads": "FALSE"}, "pass"),
+    "after-sched-mw": ({**AFTER, "Sched": '"mw"', "Shapes": "<- TwoEach", "Strict": "TRUE",
+                        "MaxFaults": "1", "FaultKinds": FUZZER_FAULTS}, "pass"),
+    "after-sched-fault": ({**AFTER, "Sched": '"fault"', "Shapes": "<- OpsAndTxn",
+                           "Strict": "TRUE", "MaxFaults": "1", "FaultKinds": FUZZER_FAULTS}, "pass"),
+    "after-sched-race": ({**AFTER, "Sched": '"race"', "Writers": "{1, 2, 3}",
+                          "Skew": "<- NoSkew3", "Shapes": "<- RaceTxn", "Strict": "TRUE"}, "pass"),
+    "after-sched-race-op": ({**AFTER, "Sched": '"race"', "Writers": "{1, 2, 3}",
+                             "Skew": "<- NoSkew3", "Shapes": "<- RaceOp"}, "pass"),
+    "after-concerns-faults": ({**AFTER, "Entities": "<- CEnts", "Shapes": "<- Concerns2",
+                               "MaxFaults": "1", "FaultKinds": ALL_FAULTS, "Strict": "TRUE"},
+                              "pass"),
+    "after-blind-appends": ({**AFTER, "Entities": "<- CEnts", "Shapes": "<- BlindAppends",
+                             "MaxFaults": "1", "FaultKinds": ALL_FAULTS}, "pass"),
+    "after-page": ({**FPAGE, **AFTER}, "pass"),
+    "after-page-gc": ({**FPAGE, **AFTER, "Retention": "2", "MaxTime": "3"}, "pass"),
+    "after-page-faults": ({**FPAGE, **AFTER, "MaxFaults": "1", "FaultKinds": FPAGE_FAULTS,
+                           "Strict": "TRUE"}, "pass"),
+    "after-page-skew": ({**FPAGE, **AFTER, "Skew": "<- Behind2"}, "pass"),
+    "after-statepages": ({**SPAGE, **AFTER}, "pass"),
+    # Its switches: a compaction that checkpoints the replica the commit staged on, before its
+    # record; one that is resent on the object as it is after losing its race (as if the records
+    # that beat it were in its checkpoint); one whose loss fails the commit.
+    "compactbase": ({**AFTER, "Shapes": "<- TwoEach", "Bugs": '{"compactbase"}'},
+                    {"CheckpointIsReplay", "HistGrows", "HonestCommitted"}),
+    "compactresend": ({**AFTER, "Shapes": "<- TwoEach", "Bugs": '{"compactresend"}'},
+                      {"CheckpointIsReplay", "HistGrows", "HonestCommitted"}),
+    "compactfail": ({**AFTER, "Shapes": "<- TwoEach", "Bugs": '{"compactfail"}'},
+                    {"HonestFailed"}),
     # The state's pages (SNAPSHOT_PAGING.md "Testing"): an entity's history seals into a page
     # at each version and drops one behind (SealEvery 1); writer 1 writes "a" three times.
     "statepages": (SPAGE, "pass"),
@@ -360,6 +423,11 @@ WITNESSES = [
     ("log-page", "Not_TwoBlocks"), ("log-page-n2", "Not_WideBlock"),
     ("log-page-gc", "Not_PageDropped"), ("log-page-lag", "Not_DuplicatePageOut"),
     ("log-page-faults", "Not_CopyAfterPageOut"),
+    # Compaction after the commit.
+    ("after-two-each", "Not_CompactionLanded"), ("after-two-each", "Not_CompactionLost"),
+    ("after-long", "Not_LostToCompaction"), ("after-seg", "Not_Full"),
+    ("after-sched-mw", "Not_CompactionLanded"), ("after-sched-race", "Not_CompactionLanded"),
+    ("after-page", "Not_PageOutInLog"), ("after-faults", "Not_LateLanding"),
 ]
 
 
@@ -401,6 +469,11 @@ BUG_KNOBS = {
     "sweepabove": {"Paging": "TRUE", "MaxTime": "1", "MaxSweep": "1", "MaxCount": "1"},
     "mintH": {"Paging": "TRUE", "MaxTime": "1", "MaxSweep": "1", "MaxCount": "1", "skew": True},
     "pageown": {"Paging": "TRUE", "MaxTime": "1", "MaxSweep": "1", "MaxCount": "1"},
+    # Compaction after the commit, and its switches.
+    "none-after": {**AFTER, "Strict": "TRUE", **F1},
+    "compactbase": {**AFTER},
+    "compactresend": {**AFTER},
+    "compactfail": {**AFTER},
 }
 CREATES = {"mw": "<- Creates", "fault": "<- Creates", "race": "<- RaceCreates",
            "race1": "<- RaceCreates1"}

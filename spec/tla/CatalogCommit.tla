@@ -23,6 +23,14 @@
 (* the replica it holds (TailReads): the records after it if the object is *)
 (* still its incarnation and no shorter, else the whole object.           *)
 (*                                                                         *)
+(* With CompactAfter, the count and size limits no longer make a commit    *)
+(* replace the object: it appends, and once its record has landed its      *)
+(* writer may compact (Compact): a replace of the version it holds with a  *)
+(* checkpoint of it, a GC record and PageOuts, and no record of its own.   *)
+(* Whatever becomes of that write, the commit stands. A commit still       *)
+(* replaces when no append can carry it (the store's cap, no append, CAS   *)
+(* only).                                                                  *)
+(*                                                                         *)
 (* Bug switches put back protocol bugs the fuzzers and reviews found       *)
 (* (Bug N in fileio-catalog's commit subjects), to calibrate the           *)
 (* properties and the oracles (CatalogOracles.tla). Sched restricts the    *)
@@ -54,6 +62,9 @@ CONSTANTS
   TailReads,        \* fileio.catalog.read.tail: after a lost append race, a tail read
                     \* (TRUE), or a probe and a resend framed from the probed version's
                     \* last trailer (FALSE)
+  CompactAfter,     \* compaction after the commit (TRUE): past the limits a commit appends,
+                    \* and its writer may then compact; or fused with it (FALSE): past them
+                    \* the commit replaces the object with a checkpoint and its record
   Sched             \* "free": any interleaving. A fuzzer's schedules, where operations
                     \* run one at a time and others may run to completion inside one:
                     \* "mw" (TestMultiWriterProperties: one, before any request, on a
@@ -76,8 +87,10 @@ ASSUME /\ FaultKinds \subseteq WriteFaults \cup ReadFaults \cup PutFaults
                           "64a", "64b", "64c", "64d", "66", "ckgc", "basever",
                           "floorgap", "nodigest", "absentpage", "sweepabove", "mintH",
                           "pageown", "rootfirst", "sweepstale",
-                          "lengthonly", "notrailer", "probeinc"}
+                          "lengthonly", "notrailer", "probeinc",
+                          "compactbase", "compactresend", "compactfail"}
        /\ TailReads \in BOOLEAN
+       /\ CompactAfter \in BOOLEAN
 
 VARIABLES
   file,      \* the catalog object: [gen, chk: [st, C, H], log, segs]
@@ -199,6 +212,20 @@ CasPayload(w, b, t) ==
        ELSE [chk |-> Ck(b),
              log |-> (IF wm = 0 THEN << >> ELSE << [wm |-> wm] >>) \o pos \o << t >>]
 
+\* The file a compaction after a commit writes on the replica R its record
+\* landed in (LogRuntime's compaction of a log that replaces itself): a
+\* checkpoint of R, a GC record at the watermark and the PageOuts of the view
+\* after it, and no record: nothing of its own follows, so neither the
+\* watermark nor the ceiling is kept below a record. With "compactbase", a
+\* checkpoint of the replica the commit staged or rebased on, before its
+\* record.
+CompactPayload(w, s) ==
+  LET R    == IF Has("compactbase") THEN s.base ELSE s.lr
+      c    == Clock(w)
+      wm   == IF Retention < 0 \/ Retention >= c THEN 0 ELSE c - Retention
+      pos  == IF Paging THEN PageOuts(Gc(R, wm), c - Admission) ELSE << >>
+  IN [chk |-> Ck(R), log |-> (IF wm = 0 THEN << >> ELSE << [wm |-> wm] >>) \o pos]
+
 \* The pages a CAS's PageOuts seal.
 CasPages(pl) == {PageName(pl.log[i]) : i \in {j \in 1..Len(pl.log) : IsPo(pl.log[j])}}
 
@@ -227,11 +254,15 @@ Idle(k, n) ==
   [pc |-> "idle", k |-> k, n |-> n, txn |-> None, snap |-> None, base |-> None,
    cur |-> None, stale |-> FALSE, amb |-> FALSE, unres |-> FALSE, full |-> FALSE,
    att |-> 0, thr |-> 0, pend |-> None, written |-> None, rt |-> 0, nw |-> 0, pay |-> None,
-   cf |-> FALSE, cx |-> FALSE, ci |-> FALSE, cw |-> << >>, first |-> None, ocf |-> FALSE]
+   cf |-> FALSE, cx |-> FALSE, ci |-> FALSE, cw |-> << >>, first |-> None, ocf |-> FALSE,
+   lr |-> None, cre |-> FALSE, cc |-> << >>]
 \* pc: idle, staged, loop, cas, throttled, readback, rebase, refresh, shrink,
-\*   resolve, restage.
+\*   resolve, restage, compact.
 \* rt: the times the operation was restaged; nw: its write requests; pay:
 \*   with Paging, the CAS payload fixed when its pages were put (PrepCas).
+\* lr: the replica the commit's record landed in, which its compaction
+\*   replaces (compact); cre: with "compactresend", the compaction was resent.
+\*   Ghost: cc, its compaction's writes that landed, [before, after].
 \* base: the parsed state of cur (current), unless stale (stale).
 \* cur: the version the next write is conditioned on [gen, len, inc]
 \*   (current): inc is the incarnation an append from it frames its record
@@ -309,6 +340,26 @@ Ambig(w, s, landed) ==
   IF Has("17") THEN End(w, s, "failed", landed)
   ELSE Go(w, [s EXCEPT !.amb = TRUE, !.pc = "resolve"], landed)
 
+\* The policy is due on a log with no records after its checkpoint, and one
+\* more: CAS only (max.append.count 0), or a size limit no record fits under.
+\* Every commit replaces the object then, and none is compacted after.
+DueEmpty == MaxCount = 0 \/ 1 + 1 > MaxSize
+
+\* With CompactAfter: whether the writer of a commit whose record landed in
+\* R may compact it, as the policy says of R (the limits past which a fused
+\* commit replaces). It may also not: the policy draws (jitter), and the
+\* model takes both.
+CompactDue(R) ==
+  /\ CompactAfter /\ AppendSupported /\ ~DueEmpty
+  /\ R.cnt >= MaxCount \/ R.len + 1 > MaxSize
+
+\* The commit's record landed in R: it is committed, after a compaction of R
+\* if its writer compacts.
+Committed(w, s, R) ==
+  \/ End(w, s, "committed", FALSE)
+  \/ /\ CompactDue(R)
+     /\ Go(w, [s EXCEPT !.pc = "compact", !.lr = R, !.pay = None], FALSE)
+
 \* landed(): what a read R (watching the commit's record) says of the
 \* commit's own record. Committed if replay applied it, or if R holds its
 \* id; at or below R's horizon, unknown if a write may have landed, else
@@ -321,7 +372,7 @@ Ambig(w, s, landed) ==
 \* the read: the runtime reads again, so this read decides nothing.
 Judge(w, s, R, pf, rb, then) ==
   LET c == LandedP(R, s.txn.id, store, pf) IN
-  CASE c = "yes" -> End(w, s, "committed", FALSE)
+  CASE c = "yes" -> Committed(w, s, R)
     [] c = "unknown" -> End(w, s, IF Has("64d") THEN "error"
                                  ELSE IF Earlier(s) THEN "unknown" ELSE "failed", FALSE)
     [] c = "absent" -> End(w, s, "failed", FALSE)
@@ -342,8 +393,13 @@ Conflict(w, s, strat, landed) ==
                   !.pc = IF strat = "CAS" THEN "rebase"
                          ELSE IF TailReads THEN "tailread" ELSE "refresh"], landed)
 
+\* Whether the commit replaces the object (mustReplace): the store refused an
+\* append, it has none, or CAS only; and, without CompactAfter, past the
+\* limits.
 MustCAS(s) ==
-  s.full \/ ~AppendSupported \/ s.base.cnt >= MaxCount \/ s.cur.len + 1 > MaxSize
+  \/ s.full \/ ~AppendSupported
+  \/ IF CompactAfter THEN DueEmpty
+     ELSE s.base.cnt >= MaxCount \/ s.cur.len + 1 > MaxSize
 
 \* The write w is about to send, or None: a throttled one again; the CAS
 \* after a fresh read; else as the loop decides (mustCAS). With Paging, a
@@ -619,6 +675,39 @@ FinalRead(w, fk) ==
      /\ IF fk = "readFail" \/ LiveR.err THEN Unreadable(w, Faulted(s, fk))
         ELSE Judge(w, s1, LiveOf(s), fk = "pageFail", FALSE, End(w, s1, "failed", FALSE))
 
+\* With CompactAfter, the compaction of the replica the commit's record
+\* landed in: one conditional replace of that version (with Paging, its pages
+\* put first, PrepCas). A replace that fails its condition, fails, or is
+\* throttled is dropped (one in flight may still land, LandInflight); either
+\* way the commit is committed. With "compactresend", a compaction that lost
+\* its race is sent again, once, on the version the object is now, as if the
+\* records that beat it were in its checkpoint. With "compactfail", one that
+\* lost reports the commit failed. A compaction is not one of the commit's
+\* writes (cw, nw), and no racer runs before it (Sched "race").
+Compact(w, fk) ==
+  LET s  == ws[w]
+      x  == [strat |-> "CAS", cond |-> s.lr.gen, inc |-> <<w, s.n, 0>>,
+             payload |-> IF Paging THEN s.pay ELSE CompactPayload(w, s)]
+      ok == file.gen = x.cond
+      lands == ok /\ fk \in {"none", "lostReply", "landedConflict", "landedThrottled"}
+      s1 == [Faulted(s, fk) EXCEPT !.pay = None,
+               !.cc = IF lands THEN Append(@, [before |-> file, after |-> Land(file, x)]) ELSE @]
+  IN /\ CanStep(w) /\ s.pc = "compact" /\ (~Paging \/ s.pay # None)
+     /\ fk \in WFaultsOf(w)
+     /\ fk \in {"lostReply", "landedConflict", "landedThrottled", "inflight"} => ok
+     /\ file' = IF lands THEN Land(file, x) ELSE file
+     /\ inflight' = IF lands THEN {}
+                    ELSE IF fk = "inflight" THEN inflight \cup {[w |-> w, id |-> None, x |-> x]}
+                    ELSE inflight
+     /\ UseFault(fk)
+     /\ UNCHANGED now
+     /\ UNCHANGED PageVars
+     /\ IF fk = "none" /\ ~ok /\ Has("compactresend") /\ ~s.cre
+          THEN Go(w, [s1 EXCEPT !.lr = [@ EXCEPT !.gen = file.gen], !.cre = TRUE,
+                                !.pay = s.pay], FALSE)
+        ELSE End(w, s1, IF fk = "none" /\ ~ok /\ Has("compactfail") THEN "failed" ELSE "committed",
+                 lands)
+
 \* A timed-out write lands after all, while its precondition holds.
 LandInflight(i) ==
   /\ i \in inflight
@@ -631,16 +720,17 @@ LandInflight(i) ==
   /\ UNCHANGED <<now, nf, ended, res, ook, sched>>
   /\ UNCHANGED PageVars
 
-\* With Paging, before a CAS: its payload is fixed (the GC watermark and
-\* PageOuts, at the writer's clock), and the pages its PageOuts seal are
-\* put, before the CAS is sent. A put that fails, or lands with its reply
-\* lost: the CAS goes without its PageOuts, and a page that landed is an
-\* orphan.
+\* With Paging, before a CAS or a compaction: its payload is fixed (the GC
+\* watermark and PageOuts, at the writer's clock), and the pages its
+\* PageOuts seal are put, before the CAS is sent. A put that fails, or lands
+\* with its reply lost: the CAS goes without its PageOuts, and a page that
+\* landed is an orphan.
 PrepCas(w, fk) ==
   LET s   == ws[w]
-      pl  == CasPayload(w, IF Has("12") THEN s.snap ELSE s.base, s.txn)
+      pl  == IF s.pc = "compact" THEN CompactPayload(w, s)
+             ELSE CasPayload(w, IF Has("12") THEN s.snap ELSE s.base, s.txn)
       pgs == CasPages(pl)
-  IN /\ Paging /\ CanStep(w) /\ CasDue(s) /\ s.pay = None
+  IN /\ Paging /\ CanStep(w) /\ (CasDue(s) \/ s.pc = "compact") /\ s.pay = None
      /\ fk \in {"none"} \cup (IF CanFault(w) /\ pgs # {} THEN FaultKinds \cap PutFaults ELSE {})
      /\ UseFault(fk)
      /\ store' = IF fk = "putFail" THEN store ELSE store \cup pgs
@@ -715,6 +805,7 @@ WriterNext(w) ==
        ReadBack(w, fk) \/ Rebase(w, fk) \/ Refresh(w, fk) \/ Shrink(w, fk) \/ TailRead(w, fk)
          \/ FreshForCAS(w, fk) \/ Resolve(w, fk) \/ FinalRead(w, fk) \/ Restage(w, fk)
   \/ Exhaust(w)
+  \/ \E fk \in WriteFaults \cup {"none"} : Compact(w, fk)
   \/ \E fk \in PutFaults \cup {"none"} : PrepCas(w, fk)
   \/ SweepState(w)
 

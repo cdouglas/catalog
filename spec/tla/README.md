@@ -919,6 +919,89 @@ need a resend after a probe without a read, so their calibrations run on the
 probe path: with tail reads the loop reads before it resends, and a read that
 puts the commit's id at or below the horizon ends it.
 
+## Compaction after the commit
+
+[TAIL_READS.md](../../docs/TAIL_READS.md) "Compaction after the commit",
+written ahead of its Java (2026-11-10).
+
+**The file model.** With `CompactAfter`, the count and size limits no longer
+make a commit replace the object: `MustCAS` holds only for a full object, a
+store without append, or a policy due on a log with no records (`DueEmpty`:
+max.append.count 0, or a size no record fits under). A commit that a read
+finds landed (`Judge`, on every path) may, if `CompactDue` holds of that read
+`R`, move to `compact` instead of ending (`Committed`): the model takes both
+choices, as the writers' drawn points and backoff may give either. `Compact`
+is one conditional replace of `R`'s version with `CompactPayload`: a
+checkpoint of `R`, a GC record at the writer's clock less the retention, and
+with `Paging` the PageOuts of the view after it up to the clock less `A`
+(`PrepCas` puts their pages first), and no record, so neither is kept below
+one. Every write fault applies (`inflight` lands later, on the same version
+only). Whatever it does, the commit ends committed. A compaction is not one
+of the commit's writes (`cw`, `nw`), and no racer runs just before it in the
+race schedules: TestCatalogRaceProperties tells it apart by A's trace
+(`CommitTrace.Kind.COMPACT`), TestMultiWriterProperties by its write, a
+replace with no intention record.
+
+Every configuration above runs with `CompactAfter` FALSE: the fused
+compaction, which `fileio.catalog.compact.after.commit` false puts back, and
+whose replace a full object still takes. Their states are as before. The
+`after-*` family runs the same kinds of schedule with compaction after the
+commit, at a count of 1 so that every commit may compact:
+
+| Config | What it adds | States |
+|---|---|---|
+| `after-base`, `after-cas-only`, `after-gcs` | two writers contending; CAS only (every commit replaces, none compacts after); no append support | 165; 55; 55 |
+| `after-size` | compaction by size (`MaxSize` 3) | 3,943 |
+| `after-two-each`, `after-long` | compactions racing appends; the shrink path | 10,106; 1,986 |
+| `after-faults`, `after-faults-strict`, `after-faults2` | every fault, late landings included (a compaction's too); strict versions; two faults | 1,602; 1,989; 1,598,676 |
+| `after-gc0`, `after-skew` | retention 0 (a compaction's GC record, with no record of its own to stay below); a clock behind by more than the retention | 155,123; 9,709,917 |
+| `after-seg` | a segment cap: a full object makes the commit replace it with its record | 3,316 |
+| `after-long-faults`, `after-three` | faults with the shrink path; three writers | 224,325; 356,165 |
+| `after-probe`, `after-probe-faults` | tail reads off, with GC; with every fault | 206,799; 3,424 |
+| `after-sched-mw`, `after-sched-fault`, `after-sched-race`, `after-sched-race-op` | each fuzzer's schedules | 44,767; 4,028; 73; 111 |
+| `after-concerns-faults`, `after-blind-appends` | conflict encodings with every fault; blind appends | 244,175; 1,765 |
+| `after-page`, `after-page-gc`, `after-page-faults`, `after-page-skew` | paging: a compaction pages up to its clock less `A`; with GC; with every fault and the page store's; skewed clocks | 86,665; 1,500,377; 2,267,807; 78,087 |
+| `after-statepages` | the state's pages, put before a compaction's root | 62,324 |
+
+Every one passes. Its switches:
+
+| Switch | Puts back | Breaks |
+|---|---|---|
+| `compactbase` | a compaction that checkpoints the replica the commit staged or rebased on, before its record, conditioned on the version its record landed in | `HonestCommitted` |
+| `compactresend` | a compaction that lost its race sent again on the object as it now is, as if the records that beat it were in its checkpoint | `HistGrows` |
+| `compactfail` | a compaction that lost its race fails the commit | `HonestFailed` |
+
+Writing the Java found one rule the model did not have: with CAS only, every
+commit replaced the object and its writer then compacted it again (a second
+replace, which also raced the next commit). `DueEmpty` keeps a writer from
+compacting after a commit the policy would have replace on any log.
+
+Witnesses (`--witnesses`): a compaction landed, one lost its race, an append
+lost its race to one (`Not_CompactionLanded`, `Not_CompactionLost`,
+`Not_LostToCompaction`), a full object with compaction after the commit, and
+a compaction on the multi-writer and race schedules.
+
+The oracle matrix (`--matrix`) adds `none-after` and the three switches on
+each fuzzer's schedules:
+
+| Bug | `mw` | `fault` | `race`, `race1` |
+|---|---|---|---|
+| `none-after` | passes | passes | passes |
+| `compactbase` | caught | caught | caught |
+| `compactresend` | caught | unreachable | unreachable |
+| `compactfail` | caught | unreachable | unreachable |
+
+Every cell is adequate. The fault schedules run nothing between a commit's
+first write and its end, and the race schedules no racer before a
+compaction, so neither loses a compaction race. The multi-writer oracle
+first missed `compactbase` and `compactresend`: it judged a commit on its own
+writes, and the damage is in the compaction's. It now also asks of each
+compaction that it change no state (`OracleMW`'s `cc`), as
+TestMultiWriterProperties does, which catches both. In Java, the one-object
+commit-protocol fuzzer (5,000 tries) and the multi-writer fuzzer (300 tries)
+each catch all three as mutants (`fuzz/mutants/compaction.sh`, where
+`compactresend` is a compaction conditioned on a probe of the object).
+
 ## History
 
 This replaces `FileIOCatalog.tla` (PR #1; last changed 2026-10-14 for Bug 10). It
