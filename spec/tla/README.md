@@ -870,6 +870,55 @@ that names them. The file model has them (the shared log does not yet:
 | `rootfirst` | `StatePagesExist` | a root written before its pages are put |
 | `sweepstale` | `StatePagesExist` | a sweep that deletes every page its (stale) view does not name, whatever version |
 
+## Tail reads
+
+[TAIL_READS.md](../../docs/TAIL_READS.md) step 4, written ahead of step 5's Java
+(2026-11-10).
+
+**The file model.** The object carries its incarnation (`inc`) and each record
+the incarnation its frame names (`fi`): a CAS draws a fresh one (`<<w, n, nw>>`,
+unique per attempt) for every frame it writes, and an append frames its record
+with the incarnation of the version its condition names, `cur.inc`, which a
+writer takes from the read it staged or rebased on. `Readable` now also asks
+that every frame name the object (`FramesTrue`): a checked read of an object
+holding another's frame fails, forever. A new invariant, `NoUnheldState`, asks
+that every writer's replica be a state the object held (each read marks its
+view `held`).
+
+After an append loses its race the loop tail-reads (`TailRead`, with
+`TailReads` TRUE, the default): if the object is still the incarnation of the
+writer's replica and no shorter (`Continues`), the records after it are folded
+onto the replica (`Folded`); else the whole object is read. Either way the
+commit judges its own record on the read, as `landed` does, and appends again
+from the fresh replica. With `TailReads` FALSE the loop probes (`Refresh`) and
+resends, its frame naming the probed version's incarnation (the last trailer's,
+read pinned to it).
+
+| Switch | Puts back | Breaks |
+|---|---|---|
+| `lengthonly` | a tail read that compares lengths only (`FileTail.continues` before step 5): a longer replace reads as growth, and its records are folded onto a replica of another incarnation | `NoUnheldState` |
+| `notrailer` | whole reads whose frames are not checked (format 2): a read torn by a write between its lookup and its GET (`Spliced`: the bound version's checkpoint and first records, the live version's after them) is replayed | `NoUnheldState` |
+| `probeinc` | a resend after a probe framed with the incarnation the writer last read (A4 broken) | `Readable` |
+
+**The shared-log model.** A compactor's read may be served with a gap after its
+checkpoint (`ReadFromGap`); the runtime refuses it (LOG.md "Positions"), so
+without the switch the compactor reads again. `nojoint` replays it, and the
+checkpoint it stores is not the replay of the log through its position
+(`Deterministic`, `CheckpointIsReplay`).
+
+| Config | What it adds |
+|---|---|
+| `probe`, `probe-gc`, `probe-faults` | the probe path (`TailReads` FALSE): base, with GC (a replace can grow the object past a writer's version), with every fault |
+| `tail-long` | tail reads with the shrink path and GC |
+| `lengthonly`, `notrailer`, `probeinc` | the switches above, on `gc0`'s bounds (`probeinc` on the probe path) |
+| `log-nojoint` | the shared log's switch, with compaction |
+
+Every other configuration runs with tail reads (the state counts in "Results"
+above predate them: `gc0`, for one, now has 21,777 states). Bugs 26, 64a and `floorgap`
+need a resend after a probe without a read, so their calibrations run on the
+probe path: with tail reads the loop reads before it resends, and a read that
+puts the commit's id at or below the horizon ends it.
+
 ## History
 
 This replaces `FileIOCatalog.tla` (PR #1; last changed 2026-10-14 for Bug 10). It

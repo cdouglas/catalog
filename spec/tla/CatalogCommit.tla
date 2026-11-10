@@ -15,6 +15,14 @@
 (* [page-outs][record], and it puts the pages first; sweeps delete pages   *)
 (* no PageOut can name.                                                    *)
 (*                                                                         *)
+(* The object's frames name it (format 3, docs/TAIL_READS.md): each CAS    *)
+(* draws an incarnation for the object it writes, and an append frames its *)
+(* record with the incarnation of the version its condition names, from   *)
+(* the read it was staged on or, after a probe, from the probed version's *)
+(* last trailer. After an append loses its race, the loop tail-reads from  *)
+(* the replica it holds (TailReads): the records after it if the object is *)
+(* still its incarnation and no shorter, else the whole object.           *)
+(*                                                                         *)
 (* Bug switches put back protocol bugs the fuzzers and reviews found       *)
 (* (Bug N in fileio-catalog's commit subjects), to calibrate the           *)
 (* properties and the oracles (CatalogOracles.tla). Sched restricts the    *)
@@ -43,6 +51,9 @@ CONSTANTS
   Paging,           \* a CAS pages the committed set's oldest blocks (COMMITTED_PAGING.md)
   Admission,        \* A, in ticks: a CAS pages blocks whose top is A old
   MaxSweep,         \* how many sweeps of the page store run
+  TailReads,        \* fileio.catalog.read.tail: after a lost append race, a tail read
+                    \* (TRUE), or a probe and a resend framed from the probed version's
+                    \* last trailer (FALSE)
   Sched             \* "free": any interleaving. A fuzzer's schedules, where operations
                     \* run one at a time and others may run to completion inside one:
                     \* "mw" (TestMultiWriterProperties: one, before any request, on a
@@ -64,7 +75,9 @@ ASSUME /\ FaultKinds \subseteq WriteFaults \cup ReadFaults \cup PutFaults
        /\ Bugs \subseteq {"10", "12", "16", "17", "18", "25", "26",
                           "64a", "64b", "64c", "64d", "66", "ckgc", "basever",
                           "floorgap", "nodigest", "absentpage", "sweepabove", "mintH",
-                          "pageown", "rootfirst", "sweepstale"}
+                          "pageown", "rootfirst", "sweepstale",
+                          "lengthonly", "notrailer", "probeinc"}
+       /\ TailReads \in BOOLEAN
 
 VARIABLES
   file,      \* the catalog object: [gen, chk: [st, C, H], log, segs]
@@ -87,16 +100,22 @@ PageVars == <<store, nsw, spages>>
 -----------------------------------------------------------------------------
 (* The catalog object, and reads of it *)
 
+\* inc: the object's incarnation; fi: the incarnation each record's frame
+\* names (the checkpoint's is inc, as the CAS that wrote it drew); prev: with
+\* "notrailer", the version before the last write, which a torn read splices.
 InitFile == [gen |-> 1, chk |-> [st |-> InitSt, C |-> {}, H |-> 0, F |-> 0, P |-> {}],
-             log |-> << >>, segs |-> 1]
+             log |-> << >>, segs |-> 1, inc |-> <<0, 0, 0>>, fi |-> << >>, prev |-> None]
 
 \* A read: the replayed state, what replay did with the record of `watch`,
 \* the version read and its length (in records, the checkpoint counting
-\* one), and the intention-record count (intentionRecords).
+\* one), the intention-record count (intentionRecords), the incarnation, and
+\* whether the view is a state the object held (held: the oracle that no
+\* replica holds a state the log never held).
 ReplayOf(f, watch) ==
   LET a == Fold(Acc(f.chk.st, f.chk, watch), f.log)
   IN [st |-> a.st, C |-> a.C, H |-> a.H, F |-> a.F, P |-> a.P, err |-> a.err, out |-> a.out,
-      cnt |-> Len(Txns(f.log)), gen |-> f.gen, len |-> Len(f.log) + 1, rf |-> a.rf]
+      cnt |-> Len(Txns(f.log)), gen |-> f.gen, len |-> Len(f.log) + 1, rf |-> a.rf,
+      inc |-> f.inc, held |-> TRUE]
 
 Replay(f) == ReplayOf(f, None)
 
@@ -106,6 +125,43 @@ LiveR == Replay(file)
 
 \* A commit's read of the live catalog, watching its own record.
 LiveOf(s) == ReplayOf(file, s.txn.id)
+
+\* Every frame names the object it is in (TAIL_READS.md "Why a tail read is
+\* sound"): a checked read of an object with a frame of another fails.
+FramesTrue == \A i \in DOMAIN file.fi : file.fi[i] = file.inc
+
+\* A read torn by a write that landed between its lookup and its GET, on a
+\* store that does not pin reads: the bound version's checkpoint and first k
+\* records (k short of all of them) and the live version's after them, to the
+\* bound version's length. Format 3's
+\* checks reject one of two incarnations; with "notrailer" it is replayed.
+Spliced(k, watch) ==
+  LET b == file.prev
+      lg == SubSeq(b.log, 1, k) \o SubSeq(file.log, k + 1, Len(b.log))
+      R == ReplayOf([gen |-> b.gen, chk |-> b.chk, log |-> lg, inc |-> b.inc], watch)
+  IN [R EXCEPT !.held = (b.inc = file.inc)]
+
+\* The reads a whole read may return: the live object, and with "notrailer"
+\* a splice of it and the version before (the checks are off).
+WholeReads(watch) ==
+  {ReplayOf(file, watch)}
+    \cup (IF Has("notrailer") /\ file.prev # None /\ file.prev.inc # file.inc
+           /\ Len(file.prev.log) <= Len(file.log)
+            THEN {Spliced(k, watch) : k \in 0..(Len(file.prev.log) - 1)} ELSE {})
+
+\* A tail read from a replica R at version cur (readAfter): if the object is
+\* still cur's incarnation and no shorter, R with the records after cur folded
+\* onto it; else the whole object (WholeReads). With "lengthonly" it compares
+\* lengths only, as FileTail.continues did: a longer replace reads as growth.
+Continues(cur) == (Has("lengthonly") \/ file.inc = cur.inc) /\ FileLen(file) >= cur.len
+Folded(R, cur, watch) ==
+  LET rest == SubSeq(file.log, cur.len, Len(file.log))
+      a == Fold([Acc(R.st, R, watch) EXCEPT !.out = R.out], rest)
+  IN [st |-> a.st, C |-> a.C, H |-> a.H, F |-> a.F, P |-> a.P, err |-> a.err, out |-> a.out,
+      cnt |-> R.cnt + Len(Txns(rest)), gen |-> file.gen, len |-> FileLen(file), rf |-> a.rf,
+      inc |-> R.inc, held |-> R.held /\ file.inc = R.inc]
+TailViews(R, cur, watch) ==
+  IF Continues(cur) THEN {Folded(R, cur, watch)} ELSE WholeReads(watch)
 
 -----------------------------------------------------------------------------
 (* Writes *)
@@ -147,10 +203,17 @@ CasPayload(w, b, t) ==
 CasPages(pl) == {PageName(pl.log[i]) : i \in {j \in 1..Len(pl.log) : IsPo(pl.log[j])}}
 
 \* Storage applies a write x = [strat, cond, payload] to f.
+\* A CAS writes an object of the incarnation it drew, every frame naming it;
+\* an append's frame names the incarnation its writer took for the version
+\* its condition names (x.inc).
 Land(f, x) ==
-  IF x.strat = "CAS"
-    THEN [gen |-> f.gen + 1, chk |-> x.payload.chk, log |-> x.payload.log, segs |-> 1]
-    ELSE [f EXCEPT !.gen = @ + 1, !.log = Append(@, x.payload), !.segs = @ + 1]
+  LET pv == IF Has("notrailer") THEN [gen |-> f.gen, chk |-> f.chk, log |-> f.log, inc |-> f.inc]
+            ELSE None
+  IN IF x.strat = "CAS"
+       THEN [gen |-> f.gen + 1, chk |-> x.payload.chk, log |-> x.payload.log, segs |-> 1,
+             inc |-> x.inc, fi |-> [i \in 1..Len(x.payload.log) |-> x.inc], prev |-> pv]
+     ELSE [f EXCEPT !.gen = @ + 1, !.log = Append(@, x.payload), !.segs = @ + 1,
+                    !.fi = Append(@, x.inc), !.prev = pv]
 
 \* The store accepts another write to the object (S3 Express: 10,000 parts;
 \* an Azure Append Blob: 50,000 blocks). A CAS replaces it.
@@ -170,7 +233,9 @@ Idle(k, n) ==
 \* rt: the times the operation was restaged; nw: its write requests; pay:
 \*   with Paging, the CAS payload fixed when its pages were put (PrepCas).
 \* base: the parsed state of cur (current), unless stale (stale).
-\* cur: the version the next write is conditioned on [gen, len] (current).
+\* cur: the version the next write is conditioned on [gen, len, inc]
+\*   (current): inc is the incarnation an append from it frames its record
+\*   with.
 \* amb: a write's outcome was unknown (ambiguous); unres: a write failed its
 \*   precondition and no read has ruled out that it landed (unresolved);
 \*   full: storage refused an append past its cap (full).
@@ -266,7 +331,7 @@ Judge(w, s, R, pf, rb, then) ==
 
 \* Rebase on a read R: base := R, current := its version.
 Rebased(s, R) ==
-  [s EXCEPT !.unres = FALSE, !.base = R, !.cur = [gen |-> R.gen, len |-> R.len],
+  [s EXCEPT !.unres = FALSE, !.base = R, !.cur = [gen |-> R.gen, len |-> R.len, inc |-> R.inc],
             !.stale = FALSE, !.pay = None]
 
 \* A precondition failure (CASException, AppendException). A transport retry
@@ -274,7 +339,8 @@ Rebased(s, R) ==
 \* it was taken as proof that the write had not landed.
 Conflict(w, s, strat, landed) ==
   Go(w, [s EXCEPT !.unres = IF Has("18") THEN @ ELSE TRUE,
-                  !.pc = IF strat = "CAS" THEN "rebase" ELSE "refresh"], landed)
+                  !.pc = IF strat = "CAS" THEN "rebase"
+                         ELSE IF TailReads THEN "tailread" ELSE "refresh"], landed)
 
 MustCAS(s) ==
   s.full \/ ~AppendSupported \/ s.base.cnt >= MaxCount \/ s.cur.len + 1 > MaxSize
@@ -287,13 +353,13 @@ CasDue(s) ==
   \/ s.pc = "loop" /\ s.att < MaxAttempts /\ MustCAS(s) /\ (~s.stale \/ Has("12"))
 NextWrite(w) ==
   LET s == ws[w]
-      cas == [strat |-> "CAS", cond |-> s.cur.gen,
+      cas == [strat |-> "CAS", cond |-> s.cur.gen, inc |-> <<w, s.n, s.nw + 1>>,
               payload |-> IF Paging THEN s.pay
                           ELSE CasPayload(w, IF Has("12") THEN s.snap ELSE s.base, s.txn)]
   IN CASE s.pc = "throttled" -> s.pend
        [] CasDue(s) /\ (~Paging \/ s.pay # None) -> cas
        [] s.pc = "loop" /\ s.att < MaxAttempts /\ ~MustCAS(s) ->
-            [strat |-> "APPEND", cond |-> s.cur.gen, payload |-> s.txn]
+            [strat |-> "APPEND", cond |-> s.cur.gen, inc |-> s.cur.inc, payload |-> s.txn]
        [] OTHER -> None
 
 \* The transaction staged for operation sh on a read R of the catalog
@@ -311,7 +377,8 @@ Stage(w, sh, R, n) ==
       cid |-> IF Has("10") /\ sh.cr # None THEN R.st.next ELSE 0]
 
 Staged(s, R, r) ==
-  [s EXCEPT !.txn = r, !.snap = R, !.base = R, !.cur = [gen |-> R.gen, len |-> R.len]]
+  [s EXCEPT !.txn = r, !.snap = R, !.base = R,
+            !.cur = [gen |-> R.gen, len |-> R.len, inc |-> R.inc]]
 
 NRacers == Cardinality(Writers) - 1
 
@@ -334,9 +401,10 @@ Begin(w) ==
   /\ s.pc = "idle" /\ s.k <= Len(Shapes[w])
   /\ Sched = "free" \/ sched.active = None
   /\ Sched = "race" => (w = 1 \/ ws[1].k > Len(Shapes[1]))
-  /\ ~LiveR.err
-  /\ ws' = [ws EXCEPT ![w] = [Staged(s, LiveR, Stage(w, Shapes[w][s.k], LiveR, s.n))
-                                 EXCEPT !.pc = "staged"]]
+  /\ \E R \in WholeReads(None) :
+       /\ ~R.err
+       /\ ws' = [ws EXCEPT ![w] = [Staged(s, R, Stage(w, Shapes[w][s.k], R, s.n))
+                                      EXCEPT !.pc = "staged"]]
   /\ UNCHANGED <<file, inflight, now, nf, ended, res, ook, sched>>
   /\ UNCHANGED PageVars
 
@@ -466,18 +534,36 @@ Rebase(w, fk) ==
                  THEN Go(w, [Rebased(s1, LiveR) EXCEPT !.att = @ + 1, !.pc = "loop"], FALSE)
                  ELSE End(w, [s1 EXCEPT !.unres = FALSE], "failed", FALSE))
 
-\* After an append lost its race: a metadata request for the new length.
-\* Shrank (compacted): re-read. Grew: retry the same record at the new
-\* version without reading it (base goes stale).
+\* After an append lost its race, without tail reads: a metadata request for
+\* the new length. Shrank (compacted): re-read. Grew: retry the same record
+\* at the new version without reading it (base goes stale), framed with the
+\* incarnation of the probed version's last trailer, read pinned to it (with
+\* "probeinc", with the incarnation the writer last read: A4 broken).
 Refresh(w, fk) ==
   LET s == ws[w]
       s1 == Faulted(s, fk)
-      cur2 == [gen |-> file.gen, len |-> FileLen(file)]
+      cur2 == [gen |-> file.gen, len |-> FileLen(file),
+               inc |-> IF Has("probeinc") THEN s.cur.inc ELSE file.inc]
   IN /\ ReadLive(w, fk, s, {"refresh"})
      /\ IF fk = "readFail" THEN Unreadable(w, s1)
         ELSE IF FileLen(file) < s.cur.len
           THEN Go(w, [s1 EXCEPT !.cur = cur2, !.pc = "shrink"], FALSE)
         ELSE Go(w, [s1 EXCEPT !.cur = cur2, !.stale = TRUE, !.att = @ + 1, !.pc = "loop"], FALSE)
+
+\* After an append lost its race, with tail reads (LogRuntime's commit loop,
+\* readAfter from the replica it holds): the records after its version if the
+\* object continues it, else the whole object; then the loop, on a fresh base.
+\* A record of the commit's that landed after all decides it, as a fresh
+\* read's would.
+TailRead(w, fk) ==
+  LET s == ws[w] IN
+  /\ ReadLive(w, fk, s, {"tailread"})
+  /\ IF fk = "readFail" THEN Unreadable(w, Faulted(s, fk))
+     ELSE \E R \in TailViews(s.base, s.cur, s.txn.id) :
+            LET s1 == [Faulted(s, fk) EXCEPT !.cx = @ \/ Crossed(R, s.txn)] IN
+            IF R.err THEN Unreadable(w, Faulted(s, fk))
+            ELSE Judge(w, s1, R, fk = "pageFail", FALSE,
+                   Go(w, [Rebased(s1, R) EXCEPT !.att = @ + 1, !.pc = "loop"], FALSE))
 
 \* The file shrank: read it afresh.
 Shrink(w, fk) ==
@@ -626,7 +712,7 @@ WriterNext(w) ==
   \/ BeginNested(w)
   \/ \E fk \in WriteFaults \cup {"none"} : Write(w, fk)
   \/ \E fk \in ReadFaults \cup {"none"} :
-       ReadBack(w, fk) \/ Rebase(w, fk) \/ Refresh(w, fk) \/ Shrink(w, fk)
+       ReadBack(w, fk) \/ Rebase(w, fk) \/ Refresh(w, fk) \/ Shrink(w, fk) \/ TailRead(w, fk)
          \/ FreshForCAS(w, fk) \/ Resolve(w, fk) \/ FinalRead(w, fk) \/ Restage(w, fk)
   \/ Exhaust(w)
   \/ \E fk \in PutFaults \cup {"none"} : PrepCas(w, fk)
@@ -650,8 +736,13 @@ FairSpec == Spec /\ \A w \in Writers : WF_vars(WriterNext(w))
 Hist == LiveR.st.hist
 
 \* Every version of the catalog replays (Bug 64: one record at the horizon
-\* failed every read).
-Readable == ~LiveR.err
+\* failed every read), and its frames pass a read's checks: each names the
+\* object (format 3; "probeinc" and "lengthonly" frame one with another's).
+Readable == ~LiveR.err /\ FramesTrue
+
+\* No writer holds a replica of a state the object never held: a torn read
+\* ("notrailer") or a fold of another incarnation's records ("lengthonly").
+NoUnheldState == \A w \in Writers : ws[w].base # None => ws[w].base.held
 
 \* No transaction applies twice.
 ExactlyOnce == \A i, j \in 1..Len(Hist) : i # j => Hist[i].id # Hist[j].id
@@ -721,7 +812,7 @@ Shape == SetShape(LiveR)
 OnGrid == OnGridIn(file.log)
 
 Safety ==
-  Readable /\ ExactlyOnce /\ Serializable /\ UniqueIds
+  Readable /\ NoUnheldState /\ ExactlyOnce /\ Serializable /\ UniqueIds
     /\ HonestCommitted /\ HonestFailed /\ UnknownExplained /\ PagesExist /\ PagesExact
     /\ StatePagesExist
 

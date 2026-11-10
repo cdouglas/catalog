@@ -53,7 +53,7 @@ ASSUME /\ FaultKinds \subseteq WriteFaults \cup ReadFaults \cup PutFaults
        /\ Bugs \subseteq {"ckclock", "setonly", "trimearly", "noverify", "freshid", "p3",
                           "dup", "lagread", "basever",
                           "floorgap", "nodigest", "absentpage", "sweepabove", "mintH",
-                          "missingfail"}
+                          "missingfail", "nojoint"}
 
 VARIABLES
   log,       \* every record appended, in order (the trimmed ones too)
@@ -86,6 +86,17 @@ Usable == {c \in ckpts : c.pos >= trimmed}
 ReadFrom(c, q, watch) ==
   LET a == Fold(Acc(c.st, c, watch), SubSeq(log, c.pos + 1, q))
   IN [st |-> a.st, C |-> a.C, H |-> a.H, F |-> a.F, P |-> a.P, out |-> a.out, q |-> q]
+
+\* A read from c served with a gap of g records after it (a log that trimmed
+\* past its checkpoint, or lost records). The view says where its records
+\* start (LogView.start), c.pos + g, and the checkpoint names c.pos
+\* (LogCheckpoint.through): the runtime fails the read unless g = 0 (S4). With
+\* "nojoint" it replays it.
+ReadFromGap(c, q, watch, g) ==
+  LET a == Fold(Acc(c.st, c, watch), SubSeq(log, c.pos + 1 + g, q))
+  IN [st |-> a.st, C |-> a.C, H |-> a.H, F |-> a.F, P |-> a.P, out |-> a.out, q |-> q]
+\* The gaps a read from c through q may be served with and still be used.
+Gaps(c, q) == IF Has("nojoint") /\ c.pos + 1 < q THEN {0, 1} ELSE {0}
 
 \* Where a read from c may end: the tail, or with Lag any position after c.
 Ends(c) == IF Lag THEN c.pos..Len(log) ELSE {Len(log)}
@@ -321,15 +332,17 @@ AppendGc(sk) ==
   /\ UNCHANGED PageVars
 
 \* putCheckpoint(p): the replay of the log through p, read from a usable
-\* checkpoint before it. With "ckclock", the checkpoint drops the ids its
-\* compactor's clock says are past the retention, as the file's checkpoint
-\* did before GC records: no record says so.
-PutCheckpoint(p, c, sk) ==
-  LET R == ReadFrom(c, p, None)
+\* checkpoint before it (a read with a gap fails, and the compactor reads
+\* again; with "nojoint" it checkpoints the gapped replay). With "ckclock", the
+\* checkpoint drops the ids its compactor's clock says are past the retention,
+\* as the file's checkpoint did before GC records: no record says so.
+PutCheckpoint(p, c, sk, gap) ==
+  LET R == ReadFromGap(c, p, None, gap)
       g == IF Has("ckclock") /\ Retention >= 0 THEN Gc(R, Max(0, 1 + now + sk - Retention))
            ELSE R
   IN /\ comp.ck < MaxCkpt
      /\ c \in Usable /\ c.pos < p /\ p <= Len(log)
+     /\ gap \in Gaps(c, p)
      /\ \A d \in ckpts : d.pos # p
      /\ ckpts' = ckpts \cup {[pos |-> p, st |-> g.st, C |-> g.C, H |-> g.H, F |-> g.F,
                              P |-> g.P]}
@@ -421,7 +434,8 @@ WriterNext(w) ==
 
 CompactorNext ==
   \/ \E sk \in CompSkews : AppendGc(sk)
-  \/ \E p \in 1..Len(log), c \in ckpts, sk \in CompSkews : PutCheckpoint(p, c, sk)
+  \/ \E p \in 1..Len(log), c \in ckpts, sk \in CompSkews, gap \in {0, 1} :
+       PutCheckpoint(p, c, sk, gap)
   \/ \E p \in 1..Len(log) : Trim(p)
   \/ \E c \in Usable, sk \in CompSkews, fk \in PutFaults \cup {"none"} :
        \E q \in Ends(c) : PutPage(c, q, sk, fk)

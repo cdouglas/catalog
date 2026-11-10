@@ -40,15 +40,16 @@ BASE = {
     "Paging": "FALSE",
     "Admission": "0",
     "MaxSweep": "0",
+    "TailReads": "TRUE",
     "BlockIds": "1",
     "GridBits": "3",
     "SealEvery": "0",
     "Bugs": "{}",
 }
 
-SAFETY = ["Readable", "ExactlyOnce", "Serializable", "UniqueIds", "HonestCommitted",
-          "HonestFailed", "UnknownExplained", "SoloCommits", "StampsCount", "PagesExist",
-          "PagesExact", "Shape", "OnGrid", "StatePagesExist"]
+SAFETY = ["Readable", "NoUnheldState", "ExactlyOnce", "Serializable", "UniqueIds",
+          "HonestCommitted", "HonestFailed", "UnknownExplained", "SoloCommits", "StampsCount",
+          "PagesExist", "PagesExact", "Shape", "OnGrid", "StatePagesExist"]
 ACTIONS = ["HistGrows", "CasAppliesItsRecord", "CheckpointIsReplay"]
 
 ALL_FAULTS = ('{"failBefore", "lostReply", "landedConflict", "throttled", '
@@ -124,7 +125,28 @@ CONFIGS = {
     "page-faults": ({**FPAGE, "MaxFaults": "1", "FaultKinds": FPAGE_FAULTS, "Strict": "TRUE"},
                     "pass"),
     "page-skew": ({**FPAGE, "Skew": "<- Behind2"}, "pass"),
-    # Calibration: each bug, put back, must break a property.
+    # Tail reads (TAIL_READS.md): after a lost append race the loop tail-reads (TailReads, the
+    # default) or probes and resends framed from the probed version's last trailer; with GC a
+    # replace can make the object longer than the version a writer read.
+    "probe": ({"TailReads": "FALSE"}, "pass"),
+    "probe-gc": ({"Retention": "0", "MaxTime": "2", "Shapes": "<- TwoEach", "MaxCount": "1",
+                  "TailReads": "FALSE"}, "pass"),
+    "probe-faults": ({"MaxFaults": "1", "FaultKinds": ALL_FAULTS, "Strict": "TRUE",
+                      "TailReads": "FALSE"}, "pass"),
+    "tail-long": ({"Shapes": "<- Long", "MaxCount": "2", "MaxAttempts": "4", "Retention": "0",
+                   "MaxTime": "1"}, "pass"),
+    # Their switches: a tail read that compares lengths only (FileTail.continues before step 5),
+    # a whole read whose frames are not checked (format 2: a splice decodes), a resend after a
+    # probe framed with the incarnation the writer last read.
+    "lengthonly": ({"Retention": "0", "MaxTime": "2", "Shapes": "<- TwoEach", "MaxCount": "1",
+                    "Bugs": '{"lengthonly"}'}, {"NoUnheldState", "Readable"}),
+    "notrailer": ({"Retention": "0", "MaxTime": "2", "Shapes": "<- TwoEach", "MaxCount": "1",
+                   "Bugs": '{"notrailer"}'}, {"NoUnheldState"}),
+    "probeinc": ({"Retention": "0", "MaxTime": "2", "Shapes": "<- TwoEach", "MaxCount": "1",
+                  "TailReads": "FALSE", "Bugs": '{"probeinc"}'}, {"Readable"}),
+    # Calibration: each bug, put back, must break a property. Bugs 26, 64a and floorgap need a
+    # resend after a probe, without a read (TailReads FALSE): with tail reads the loop reads, and
+    # judges the record, before it resends.
     "basever": ({"Entities": "<- CEnts", "Shapes": "<- Concerns2", "MaxCount": "1",
                  "Bugs": '{"basever"}'}, {"StampsCount", "HonestFailed", "Serializable"}),
     "bug10": ({"Shapes": "<- Creates", "Bugs": '{"10"}'}, {"UniqueIds", "Serializable"}),
@@ -136,10 +158,10 @@ CONFIGS = {
               {"HonestFailed"}),
     "bug25": ({"MaxFaults": "1", "MaxThrottle": "1", "FaultKinds": ALL_FAULTS, "Bugs": '{"25"}'},
               {"HonestFailed"}),
-    "bug26": ({"Strict": "TRUE", "MaxSize": "2", "Shapes": "<- TwoEach", "Bugs": '{"26"}'},
-              {"UnknownExplained"}),
-    "bug64a": ({"Retention": "0", "MaxTime": "2", "Shapes": "<- TwoEach", "MaxCount": "1",
-                "Bugs": '{"64a"}'}, {"Readable"}),
+    "bug26": ({"TailReads": "FALSE", "Strict": "TRUE", "MaxSize": "2", "Shapes": "<- TwoEach",
+               "Bugs": '{"26"}'}, {"UnknownExplained"}),
+    "bug64a": ({"TailReads": "FALSE", "Retention": "0", "MaxTime": "2", "Shapes": "<- TwoEach",
+                "MaxCount": "1", "Bugs": '{"64a"}'}, {"Readable"}),
     "bug64b": ({"Retention": "0", "MaxTime": "2", "Shapes": "<- TwoEach", "MaxCount": "1",
                 "Bugs": '{"64b"}'}, {"CasAppliesItsRecord"}),
     "bug64c": ({"Retention": "0", "MaxTime": "2", "Shapes": "<- TwoEach", "MaxCount": "1",
@@ -155,8 +177,8 @@ CONFIGS = {
               "Bugs": '{"ckgc"}'}, {"CheckpointIsReplay"}),
     # Paging's switches (COMMITTED_PAGING.md "Testing"), and one of the file's own: a CAS's
     # PageOuts not kept below its own record.
-    "floorgap": ({**FPAGE, "MaxFaults": "1", "FaultKinds": FPAGE_FAULTS, "Bugs": '{"floorgap"}'},
-                 {"ExactlyOnce", "HonestFailed", "PagesExact"}),
+    "floorgap": ({"TailReads": "FALSE", **FPAGE, "MaxFaults": "1", "FaultKinds": FPAGE_FAULTS,
+                  "Bugs": '{"floorgap"}'}, {"ExactlyOnce", "HonestFailed", "PagesExact"}),
     # On one object a PageOut lands only on the version it was computed on (the CAS is
     # conditional): the digest check never refuses one, and the switch breaks nothing.
     "nodigest": ({**FPAGE, "MaxFaults": "1", "FaultKinds": FPAGE_FAULTS, "Bugs": '{"nodigest"}'},
@@ -233,6 +255,10 @@ LOG_CONFIGS = {
                      "MaxAttempts": "2"}, "pass"),
     "log-ckpt": ({"MaxCkpt": "2", "MaxTrim": "2"}, "pass"),
     "log-gc": ({**COMPACT}, "pass"),
+    # A compactor's read served with a gap after its checkpoint (S4): the runtime refuses it
+    # (TAIL_READS.md step 3); with "nojoint" it checkpoints a state the log never held.
+    "log-nojoint": ({**COMPACT, "Shapes": "<- TwoEach", "Bugs": '{"nojoint"}'},
+                    {"CheckpointIsReplay", "Deterministic"}),
     "log-lag": ({**COMPACT, "Lag": "TRUE"}, "pass"),
     "log-skew": ({**COMPACT, "Retention": "1", "MaxTime": "2", "Skew": "<- Behind2",
                   "CompSkews": "{0, 2}"}, "pass"),
