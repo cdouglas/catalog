@@ -59,7 +59,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
  * ({@link ReadMode#OPEN}) a stream binds its file's version as it opens, one request, so no write
  * lands between a lookup and the bytes it reads. In the other modes a stream opens as S3's does,
  * with no request; its first read is the GET, a request of its own, after which the store serves
- * the bound version ({@link ReadMode#PINNED}, as a GET with If-Match), the live one ({@link
+ * the bound version or fails as stale ({@link ReadMode#PINNED}, as a GET with If-Match), the live
+ * one ({@link
  * ReadMode#LIVE}, as an unpinned GET), or the bound one's bytes up to an offset and the live one's
  * after ({@link ReadMode#SPLICE}, as a stream that reopened mid-read without pinning).
  *
@@ -158,7 +159,8 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
     OPEN,
     /**
      * The stream's first read is the GET, of the version a lookup bound or else the live one,
-     * which it binds; a version a write superseded reads as {@link #failSupersededReads} says.
+     * which it binds; a GET of a version a write superseded fails as stale, as S3's and ADLS's
+     * {@code If-Match} and GCS's {@code if-generation-match} do (step 0).
      */
     PINNED,
     /** As {@link #PINNED}, but the GET of a superseded version returns the live one's bytes. */
@@ -670,7 +672,7 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
           synchronized (InMemoryAtomicFileIO.this) {
             servedReads.merge(mode, 1, Integer::sum);
           }
-        } else if (failSupersededReads) {
+        } else if (failSupersededReads || mode == ReadMode.PINNED) {
           throw new SupportsAtomicOperations.StaleReadException(
               "Generation " + v.generation + " of " + location + " was replaced", null);
         }

@@ -985,15 +985,20 @@ supports); S3 Express honours `If-Match` on a GET.
 Since TAIL_READS.md step 2 (2026-11-10) the fuzzers race them too.
 `InMemoryAtomicFileIO`'s read modes open a stream as S3's does, with no
 request, and make its first read the GET, a request of its own that a fuzzer's
-preemption can precede: the store then serves the bound version (`PINNED`, as
-a GET with `If-Match`; superseded, it fails as stale under
-`failSupersededReads`), the live one (`LIVE`, as an unpinned GET), or the bound
-one's bytes up to an offset and the live one's after (`SPLICE`, as a stream
-that reopened without pinning). `OPEN`, the default, binds as the stream opens,
-as before. `TestAtomicFileCommitProtocol` (whose splices fall at a frame's end
-half the time), `TestCatalogFaultProperties`, `TestMultiWriterProperties` and
+preemption can precede: the store then serves the bound version, or fails as
+stale if a write superseded it (`PINNED`, as a GET with `If-Match`), the live
+one (`LIVE`, as an unpinned GET), or the bound one's bytes up to an offset and
+the live one's after (`SPLICE`, as a stream that reopened without pinning).
+`OPEN`, the default, binds as the stream opens, as before.
+`TestAtomicFileCommitProtocol` (a third of whose splices fall at a frame's end,
+a third inside the checkpoint's frame), `TestMultiWriterProperties` and
 `TestCatalogRaceProperties` draw the mode per try, and format 3's checks (S5)
-reject what an unpinned store serves torn.
+reject what an unpinned store serves torn. `TestCatalogFaultProperties` draws
+`OPEN` or `PINNED` only: its model runs a preempting operation first, which a
+read served from the version before the preemption breaks without the catalog
+being wrong (a read that lags by whole records is a prefix, P1); round
+`tr5b-r0` failed its fault jobs so, until `PINNED` failed every read of a
+superseded version and the fault fuzzer drew no other.
 
 What remains:
 

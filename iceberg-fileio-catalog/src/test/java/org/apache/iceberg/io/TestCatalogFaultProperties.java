@@ -196,7 +196,7 @@ class TestCatalogFaultProperties {
       @ForAll @IntRange(min = 2, max = 3) int writers,
       @ForAll("maxUpdateSizes") int maxUpdateSize,
       @ForAll boolean strictVersions,
-      @ForAll InMemoryAtomicFileIO.ReadMode reads,
+      @ForAll("readModes") InMemoryAtomicFileIO.ReadMode reads,
       @ForAll @IntRange(min = 0, max = 7) int gzipWriters,
       @ForAll @IntRange(min = 0, max = 7) int gcWriters,
       @ForAll @IntRange(min = 0, max = 7) int pagingWriters,
@@ -218,7 +218,7 @@ class TestCatalogFaultProperties {
       @ForAll @IntRange(min = 2, max = 3) int writers,
       @ForAll("maxUpdateSizes") int maxUpdateSize,
       @ForAll boolean strictVersions,
-      @ForAll InMemoryAtomicFileIO.ReadMode reads,
+      @ForAll("readModes") InMemoryAtomicFileIO.ReadMode reads,
       @ForAll @IntRange(min = 0, max = 7) int gzipWriters,
       @ForAll @IntRange(min = 0, max = 7) int gcWriters,
       @ForAll @IntRange(min = 0, max = 7) int pagingWriters,
@@ -231,6 +231,19 @@ class TestCatalogFaultProperties {
         reads, gzipWriters, gcWriters, pagingWriters, wholeReaders, clockOffsets, segmentLimit,
         encoding)
         .execute(schedule);
+  }
+
+  /**
+   * How the store reads (TAIL_READS.md, errata T6): binding at the open, or pinned after a lookup,
+   * a read of a superseded version failing as stale. Not live or spliced: this fuzzer runs a
+   * preempting operation first in its model, which holds only while every request after the
+   * preemption sees its effects, and a read served from the version before it (live bytes cut to
+   * the length the lookup found are that version's when a write appended) is a legal prefix (P1)
+   * that orders the preempted operation first. The other fuzzers draw those modes.
+   */
+  @Provide
+  Arbitrary<InMemoryAtomicFileIO.ReadMode> readModes() {
+    return Arbitraries.of(InMemoryAtomicFileIO.ReadMode.OPEN, InMemoryAtomicFileIO.ReadMode.PINNED);
   }
 
   /**
@@ -899,7 +912,27 @@ class TestCatalogFaultProperties {
       }
     }
 
+    /**
+     * Runs {@code schedule}, without the suites' check of each tail read against a whole read
+     * (AtomicFileLog.CHECK_TAIL_READS): its read is a request after the tail read's, where a
+     * preemption would land after the operation read the catalog, which this fuzzer's model
+     * orders after the preempting one (the check's own oracle is the commit-protocol fuzzer's).
+     */
     void execute(List<Cmd> schedule) {
+      String check = System.getProperty(org.intentlog.fileio.AtomicFileLog.CHECK_TAIL_READS);
+      System.setProperty(org.intentlog.fileio.AtomicFileLog.CHECK_TAIL_READS, "false");
+      try {
+        executeUnchecked(schedule);
+      } finally {
+        if (check == null) {
+          System.clearProperty(org.intentlog.fileio.AtomicFileLog.CHECK_TAIL_READS);
+        } else {
+          System.setProperty(org.intentlog.fileio.AtomicFileLog.CHECK_TAIL_READS, check);
+        }
+      }
+    }
+
+    private void executeUnchecked(List<Cmd> schedule) {
       this.owner = Thread.currentThread();
       for (int i = 0; i < schedule.size(); i++) {
         Cmd cmd = schedule.get(i);

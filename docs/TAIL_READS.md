@@ -557,7 +557,8 @@ Each step stands alone and is measured before the next:
    trailer (a pinned 20-byte GET), so A4 holds: every frame comes from a
    pinned read of the version its condition names. `InMemoryAtomicFileIO`
    keeps binding a stream as it opens by default (`OPEN`); the fuzzers draw
-   `OPEN`, `PINNED`, `LIVE` or `SPLICE` per try, and the commit-protocol
+   `OPEN`, `PINNED`, `LIVE` or `SPLICE` per try (the fault fuzzer `OPEN` or
+   `PINNED`, errata T6), and the commit-protocol
    fuzzer checks that no read returns a state the log never held (a mutant
    that skips the checks fails it within a few hundred tries).
 3. **Positions in the SPI** (S4). The checkpoint's `through`, the joint's
@@ -616,9 +617,33 @@ Each step stands alone and is measured before the next:
    model's `lagread`, which `SharedLogCommit.tla` states for whole reads; it
    does not model reads after a tail on a shared log). Fixed, with
    `TestSharedLogRuntime.aWholeReadAfterAFoldReadsUpToTheCommitsFloor`.
+   Calibrated again at the fix (`tr5b-calib`, 409bbad): the unmutated
+   oracles clean, every mutant caught (`lengthonly`, `notrailer` and
+   `probeinc` by the file commit-protocol fuzzer and `TestAtomicFileLog`,
+   `nochecksum` by `TestAtomicFileLog` alone, `nojoint` by the memory
+   commit-protocol fuzzer).
 6. **Measure.** catalog-bench E1 at 300 and 1,000 tables on S3 Express, inline
    ML and TM, tail reads on and off; and E3's deep tables, whose sizes after
    paging campaign `e3f-sp4` gives.
+   Run 2026-11-10 on havoc (catalog-bench campaign `tr6`: 5ca116a, fileio
+   66cee32, whose FileIOCatalog paths 409bbad does not change; three runs a
+   point, 300 s measured; `s3x-2026-11`). A merge append, tail reads off and
+   on:
+
+   | Point | Mode | p50 | p90 | p99 | catalog MiB read | catalog GETs | lost appends |
+   | ----- | ---- | --- | --- | --- | ---------------- | ------------ | ------------ |
+   | E1, 300 tables | inline ML | 265.6 → 74.9 ms | 508 → 365 | 1,136 → 929 | 12.5 → 1.55 | 2.81 → 2.22 | 0.42 → 0.17 |
+   |                | inline TM | 136.8 → 94.2 ms | 278 → 188 | 592 → 673 | 6.26 → 0.80 | 2.64 → 2.25 | 0.32 → 0.23 |
+   E1_1000_ROWS
+   E3_ROWS
+
+   Every merge append committed in both arms. TM's p99 rose in every run
+   (612-703 ms, against 549-631): in its slowest 1% a commit's catalog
+   requests took less time with tail reads (129 against 190 ms) but it lost
+   more append races (1.64 against 1.38), since a tail read after a lost race
+   (a lookup and a GET) leaves a wider window before the resend than a probe
+   (a lookup). The model charges neither read its lookup (errata D23).
+   STEP6_MORE
 7. **One request a read** (if step 6 shows the HEAD): a ranged GET that
    reports the version and length it read (S3's `ETag` and `Content-Range`,
    ADLS's and GCS's equivalents), so a tail read is one request. A fork
