@@ -58,6 +58,7 @@ import org.apache.iceberg.io.spec.MultiWriterStorage.ReadFault;
 import org.apache.iceberg.io.spec.MultiWriterStorage.WriteFault;
 import org.intentlog.Replica;
 import org.intentlog.RuntimeConfig;
+import org.intentlog.fileio.AtomicFileLog;
 
 /**
  * Multi-writer fuzzer for the commit protocol, at the catalog-format layer.
@@ -851,8 +852,28 @@ class TestMultiWriterProperties {
       return writers[cmd.writer % writers.length];
     }
 
+    /**
+     * Runs {@code schedule}, without the suites' check of each tail read against a whole read
+     * (AtomicFileLog.CHECK_TAIL_READS): its read is a request after the tail read's, where a
+     * preemption lands, and under reads that do not pin a version (LIVE, SPLICE) it reads what the
+     * preempting commit wrote (the check's own oracles are the commit-protocol fuzzer's and
+     * TestAtomicFileLog's).
+     */
     void execute(List<Cmd> schedule) {
+      String check = System.getProperty(AtomicFileLog.CHECK_TAIL_READS);
+      System.setProperty(AtomicFileLog.CHECK_TAIL_READS, "false");
+      try {
+        executeUnchecked(schedule);
+      } finally {
+        if (check == null) {
+          System.clearProperty(AtomicFileLog.CHECK_TAIL_READS);
+        } else {
+          System.setProperty(AtomicFileLog.CHECK_TAIL_READS, check);
+        }
+      }
+    }
 
+    private void executeUnchecked(List<Cmd> schedule) {
       for (Cmd cmd : schedule) {
         Writer w = writer(cmd);
         switch (cmd.step) {

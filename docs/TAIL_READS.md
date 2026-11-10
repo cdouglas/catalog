@@ -606,7 +606,11 @@ Each step stands alone and is measured before the next:
    own. The switch is `fileio.catalog.read.tail` (`RuntimeConfig.tailReads`);
    off, the loop probes and resends as in step 2. Under
    `intentlog.fileio.tail.check` (the suites) every tail read is compared
-   with a whole read of the version it found. The fuzzers draw the switch
+   with a whole read of the version it found, except in the fuzzers that
+   preempt a commit at a request (the fault and multi-writer fuzzers): the
+   check's read is a request of its own, and under reads that do not pin a
+   version it reads what the preempting commit wrote (round `tr5b-r0`'s
+   multi-writer job failed so, on a replace). The fuzzers draw the switch
    (the protocol fuzzer from its seed, the fault fuzzer per writer, the
    others per run); the mutant set `fuzz/mutants/tailreads.sh` holds the
    model's switches and a read without checksums. Its first calibration on
