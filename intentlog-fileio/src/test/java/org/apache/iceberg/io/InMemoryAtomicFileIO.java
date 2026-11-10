@@ -854,11 +854,16 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
     return spliced;
   }
 
-  /** A stream that sends its GET at its first read, from the position a seek left, as S3's does. */
+  /**
+   * A stream that sends its GET at its first read, from the position a seek left, as S3's does. A
+   * GET from past the end of the bytes served (a live version shorter than the bound one) reads
+   * nothing, as a short body would.
+   */
   private static final class LazyStream extends SeekableInputStream {
     private final Supplier<SeekableInputStream> get;
     private SeekableInputStream in = null;
     private long pos = 0;
+    private boolean past = false;
 
     LazyStream(Supplier<SeekableInputStream> get) {
       this.get = get;
@@ -867,7 +872,11 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
     private SeekableInputStream in() throws IOException {
       if (in == null) {
         in = get.get();
-        in.seek(pos);
+        try {
+          in.seek(pos);
+        } catch (IllegalStateException e) { // past the end of what was served
+          past = true;
+        }
       }
       return in;
     }
@@ -888,12 +897,14 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
 
     @Override
     public int read() throws IOException {
-      return in().read();
+      SeekableInputStream stream = in();
+      return past ? -1 : stream.read();
     }
 
     @Override
     public int read(byte[] b, int off, int len) throws IOException {
-      return in().read(b, off, len);
+      SeekableInputStream stream = in();
+      return past ? -1 : stream.read(b, off, len);
     }
 
     @Override

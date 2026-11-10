@@ -647,8 +647,15 @@ function COMMIT(log, base, intention):
                 full = true;  stale = true;  continue       # replace on a fresh read (Bug 66)
             catch Conflict as e:
                 unresolved = e;  raceBackoff()      # interrupted: unknown
-            # Another writer appended first. The record is the same, and replay applies
-            # it once, so only the new tail is needed.
+            # Another writer appended first. With tail reads, on a log that replaces
+            # itself, read what followed current (or the whole log, if replaced) and
+            # append again at that tail, knowing what the log holds there.
+            if config.tailReads and caps.fusedReplace:
+                fresh = READ()                    # a read after current's tail
+                if landed(fresh, earlier()): return fresh
+                unresolved = none;  adopt(fresh);  continue
+            # Else the record is the same, and replay applies it once, so only the new
+            # tail is needed.
             probed = log.probe()
             if not probed.continues(tail):        # replaced (compacted): read the new log
                 fresh = READ()
@@ -699,11 +706,19 @@ function WRITE(send):                             # one write, read back
     throw Ambiguous(throttled out)                # a throttled send may have landed
 
 function READ():                                  # any failure: Unreadable
-    view = log.read()
+    view = FETCH()
     while floor and not view.tail.continues(floor):
         if read maxThrottleAttempts times: throw Unreadable(LogLagException)
-        sleep(visibilityWait / maxThrottleAttempts);  view = log.read()
+        sleep(visibilityWait / maxThrottleAttempts);  view = FETCH()
+    if config.tailReads and current:              # fold what continues current's
+        return replayAfter(view, current, watch = id)   # records alone: only onto its tail
     return replay(view, watch = id)
+
+function FETCH():                                 # with tail reads, what follows current
+    if config.tailReads and current:
+        try: return log.readAfter(current.tail)
+        catch Trimmed: return log.read()
+    return log.read()
 
 function adopt(fresh):
     current = fresh;  tail = fresh.tail;  stale = false

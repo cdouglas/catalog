@@ -360,16 +360,10 @@ public class TestInlineManifestEndToEnd {
     if (bytes == null) {
       throw new IllegalStateException("catalog file not present");
     }
-    java.io.ByteArrayInputStream in = new java.io.ByteArrayInputStream(bytes);
-    in.skip(8); // magic + version
-    int chkLen = readVarintFromStream(in);
-    in.skip(chkLen);
-
     ProtoCodec.Transaction last = null;
-    while (in.available() > 0) {
-      int txnLen = readVarintFromStream(in);
+    for (byte[] body : org.intentlog.fileio.AtomicFileLog.decode(bytes).records()) {
       org.intentlog.wire.LogEnvelope.Record record =
-          org.intentlog.wire.LogEnvelope.decodeRecord(in.readNBytes(txnLen));
+          org.intentlog.wire.LogEnvelope.decodeRecord(body);
       if (record.isIntention()) { // a CAS's GC and PageOut records precede its transaction
         last = ProtoCodec.decodeTransaction(record.id(), record.intention());
       }
@@ -387,21 +381,6 @@ public class TestInlineManifestEndToEnd {
           "expected UpdateTableInlineAction, got " + a.getClass().getSimpleName());
     }
     return (ProtoCodec.UpdateTableInlineAction) a;
-  }
-
-  private static int readVarintFromStream(java.io.InputStream in) throws IOException {
-    int result = 0;
-    int shift = 0;
-    int b;
-    do {
-      b = in.read();
-      if (b < 0) {
-        throw new IOException("EOF reading varint");
-      }
-      result |= (b & 0x7F) << shift;
-      shift += 7;
-    } while ((b & 0x80) != 0);
-    return result;
   }
 
   @Nested

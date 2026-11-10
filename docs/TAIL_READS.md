@@ -287,12 +287,15 @@ from that frame on, until a replace. So:
 - with the records that beat it in hand, the resend's read through needs no
   read: today that read is a whole GET.
 
-So an append from a tail whose bytes the log does not know is refused
-(`IllegalArgumentException`); the runtime never sends one. `FileTail.continues`
-becomes: the same incarnation, and no shorter. A replace never continues a
-tail, so the commit loop's "a replace that made the log longer reads as
-growth" case goes, though the floor still rejects a duplicate a write in
-flight lands.
+So an append from a tail whose bytes the log does not know frames its record
+from that version's last trailer, read pinned to it (a 20-byte GET; built in
+step 2), rather than from an older read: every frame then comes from a pinned
+read of the version its condition names (A4). With tail reads (step 5) the
+commit loop sends none on one object; with them off (the ablation switch) it
+still probes and resends this way, which the model checks (`probe-*`) and the
+`probeinc` switch breaks. `FileTail.continues` becomes: the same incarnation,
+and no shorter, where the log read or wrote the bytes at both tails; a probed
+tail is compared by length, and its resend's frame is still true.
 
 ## Why a tail read is sound
 
@@ -576,8 +579,36 @@ Each step stands alone and is measured before the next:
    `CatalogCommit.tla`, and gaps in `SharedLogCommit.tla`, with the
    switches, before the Java that relies on them (as for
    COMMITTED_PAGING.md's stage 2).
+   Built 2026-11-10 (spec/tla/README.md "Tail reads"): every configuration
+   passes with tail reads on, and the probe path (`probe-*`) too; the
+   switches `lengthonly` and `notrailer` break the new invariant
+   `NoUnheldState`, `probeinc` breaks `Readable` (which now asks that every
+   frame name its object), and the shared log's `nojoint` breaks
+   `Deterministic`. Bugs 26, 64a and `floorgap` reach their violations only
+   through a resend after a probe, so their calibrations run with tail reads
+   off.
 5. **Tail reads.** `readAfter`, `read(floor)`, the commit loop, the switch,
    the mutants, havoc rounds.
+   Built 2026-11-10. `AtomicFileLog.readAfter` is the tail read of
+   [Reads](#reads), its view the replica's arrays and the new frames, which
+   `LogRuntime` folds (`continued`). `LogRuntime.read(floor)` reads after the
+   floor's tail, so every load and refresh through `CatalogLog` is a tail
+   read once the catalog has read the object; the commit loop's reads (after
+   a CAS conflict, an ambiguous write, a stale base, an exhausted loop) read
+   after the replica it holds. After a lost append race the loop tail-reads
+   and appends from the fresh replica, with no read back, on a log that
+   replaces itself; on a shared log, whose reads may lag its appends, a read
+   need not show the commit's own record (the memory fuzzer found a commit
+   reported rejected that had applied), so there it still resends and its
+   read through the resend settles it (P3). The joint's check (step 3)
+   applies to logs that store checkpoints apart: a one-object log checks its
+   own. The switch is `fileio.catalog.read.tail` (`RuntimeConfig.tailReads`);
+   off, the loop probes and resends as in step 2. Under
+   `intentlog.fileio.tail.check` (the suites) every tail read is compared
+   with a whole read of the version it found. The fuzzers draw the switch
+   (the protocol fuzzer from its seed, the fault fuzzer per writer, the
+   others per run); the mutant set `fuzz/mutants/tailreads.sh` holds the
+   model's switches and a read without checksums.
 6. **Measure.** catalog-bench E1 at 300 and 1,000 tables on S3 Express, inline
    ML and TM, tail reads on and off; and E3's deep tables, whose sizes after
    paging campaign `e3f-sp4` gives.

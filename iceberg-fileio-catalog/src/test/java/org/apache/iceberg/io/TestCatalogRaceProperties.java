@@ -112,7 +112,8 @@ class TestCatalogRaceProperties {
       @ForAll boolean paging,
       @ForAll("clockOffsets") List<Long> clockOffsets,
       @ForAll("encodings") String encoding,
-      @ForAll InMemoryAtomicFileIO.ReadMode reads) {
+      @ForAll InMemoryAtomicFileIO.ReadMode reads,
+      @ForAll boolean tailReads) {
     // The writers' modes on one catalog object, or on a shared log with the same table metadata
     // storage.
     LocalCatalogMode modeA = sharedLog ? fileModeA.onSharedLog() : fileModeA;
@@ -141,6 +142,11 @@ class TestCatalogRaceProperties {
         propsA.putAll(props);
       }
     }
+    if (!tailReads) { // every writer reads the log whole (TAIL_READS.md step 5)
+      props.put(LogCatalogProperties.READ_TAIL, "false");
+      propsA.put(LogCatalogProperties.READ_TAIL, "false");
+    }
+    Statistics.label("tail reads").collect(tailReads);
     Statistics.label("gc").collect(gc);
     Statistics.label("paging").collect(paging);
     Statistics.label("clocks off").collect(clockOffsets.stream().anyMatch(o -> o != 0));

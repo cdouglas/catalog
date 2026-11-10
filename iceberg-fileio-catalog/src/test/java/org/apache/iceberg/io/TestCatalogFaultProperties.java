@@ -200,12 +200,14 @@ class TestCatalogFaultProperties {
       @ForAll @IntRange(min = 0, max = 7) int gzipWriters,
       @ForAll @IntRange(min = 0, max = 7) int gcWriters,
       @ForAll @IntRange(min = 0, max = 7) int pagingWriters,
+      @ForAll @IntRange(min = 0, max = 7) int wholeReaders,
       @ForAll("clockOffsets") List<Long> clockOffsets,
       @ForAll("segmentLimits") int segmentLimit,
       @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
     new Run(onLog(sharedLog, modes.subList(0, writers)), maxUpdateSize, false, strictVersions,
-        reads, gzipWriters, gcWriters, pagingWriters, clockOffsets, segmentLimit, encoding)
+        reads, gzipWriters, gcWriters, pagingWriters, wholeReaders, clockOffsets, segmentLimit,
+        encoding)
         .execute(schedule);
   }
 
@@ -220,12 +222,14 @@ class TestCatalogFaultProperties {
       @ForAll @IntRange(min = 0, max = 7) int gzipWriters,
       @ForAll @IntRange(min = 0, max = 7) int gcWriters,
       @ForAll @IntRange(min = 0, max = 7) int pagingWriters,
+      @ForAll @IntRange(min = 0, max = 7) int wholeReaders,
       @ForAll("clockOffsets") List<Long> clockOffsets,
       @ForAll("segmentLimits") int segmentLimit,
       @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
     new Run(onLog(sharedLog, modes.subList(0, writers)), maxUpdateSize, true, strictVersions,
-        reads, gzipWriters, gcWriters, pagingWriters, clockOffsets, segmentLimit, encoding)
+        reads, gzipWriters, gcWriters, pagingWriters, wholeReaders, clockOffsets, segmentLimit,
+        encoding)
         .execute(schedule);
   }
 
@@ -805,7 +809,7 @@ class TestCatalogFaultProperties {
      */
     Run(List<LocalCatalogMode> modes, int maxUpdateSize, boolean faults, boolean strictVersions,
         InMemoryAtomicFileIO.ReadMode reads, int gzipWriters, int gcWriters, int pagingWriters,
-        List<Long> clockOffsets, int segmentLimit, String encoding) {
+        int wholeReaders, List<Long> clockOffsets, int segmentLimit, String encoding) {
       this.maxUpdateSize = maxUpdateSize;
       this.faults = faults;
       this.gc = (gcWriters & ((1 << modes.size()) - 1)) != 0;
@@ -835,6 +839,9 @@ class TestCatalogFaultProperties {
           writerProperties.put(LogCatalogProperties.COMMITTED_ADMISSION_MS, "0");
           writerProperties.put(LogCatalogProperties.COMMITTED_PAGE_THRESHOLD, "0");
         }
+        if ((wholeReaders >> i & 1) == 1) { // tail reads off (TAIL_READS.md step 5)
+          writerProperties.put(LogCatalogProperties.READ_TAIL, "false");
+        }
         long offset = clockOffsets.get(i);
         this.writers[i] = new Writer(i, modes.get(i).catalog(io, WAREHOUSE, CATALOG_NAME,
             writerProperties, offset == 0 ? null : () -> System.currentTimeMillis() + offset));
@@ -859,6 +866,8 @@ class TestCatalogFaultProperties {
           segmentLimit, model));
       Statistics.label("gc writers")
           .collect(Integer.bitCount(gcWriters & ((1 << modes.size()) - 1)));
+      Statistics.label("whole readers")
+          .collect(Integer.bitCount(wholeReaders & ((1 << modes.size()) - 1)));
       Statistics.label("paging writers")
           .collect(Integer.bitCount(pagingWriters & ((1 << modes.size()) - 1)));
       Statistics.label("clocks off")

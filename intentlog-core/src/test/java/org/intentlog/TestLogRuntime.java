@@ -57,6 +57,11 @@ class TestLogRuntime {
     return new LogRuntime<>(log, ToyMachine.INSTANCE, config(maxRecords, retentionMs));
   }
 
+  /** The runtime reading the log whole, and probing after a lost append race (tail reads off). */
+  private void readWhole() {
+    runtime = new LogRuntime<>(log, ToyMachine.INSTANCE, config(10, NO_GC).withTailReads(false));
+  }
+
   private Replica<Map<String, Integer>> bump(Replica<Map<String, Integer>> base, String key) {
     return runtime.commit(base, ToyMachine.Bump.of(base.state(), key));
   }
@@ -181,7 +186,9 @@ class TestLogRuntime {
   @Test
   void aReadOntoAReplicaHoldingItsOwnRecordReplaysWhole() {
     // A commit adopts a read that holds its own record, rejected where it landed; a fold onto that
-    // read would not see the record, and could not say what replay did with it.
+    // read would not see the record, and could not say what replay did with it. (The probe
+    // path: a tail read would read the resend's landing before the replace.)
+    readWhole();
     log.limitSegments(3);
     Replica<Map<String, Integer>> base = created();
     int[] writes = {0};
@@ -207,6 +214,7 @@ class TestLogRuntime {
 
   @Test
   void aLostAppendRaceToAnAppendResendsWithoutReading() { // [Refresh]
+    readWhole();
     Replica<Map<String, Integer>> base = created();
     log.beforeNextWrite(() -> otherWriterBumps("other"));
     log.calls.clear();
@@ -218,7 +226,8 @@ class TestLogRuntime {
 
   @Test
   void aLostRaceBacksOffBeforeItProbes() {
-    runtime = new LogRuntime<>(log, ToyMachine.INSTANCE, config(10, NO_GC, 5L));
+    runtime = new LogRuntime<>(log, ToyMachine.INSTANCE,
+        config(10, NO_GC, 5L).withTailReads(false));
     Replica<Map<String, Integer>> base = created();
     log.beforeNextWrite(() -> otherWriterBumps("other"));
     log.calls.clear();
@@ -247,6 +256,7 @@ class TestLogRuntime {
 
   @Test
   void aLostAppendRaceToAReplaceReadsAgain() { // [Shrink]
+    readWhole();
     Replica<Map<String, Integer>> base = created();
     log.beforeNextWrite(() -> {
       Replica<Map<String, Integer>> live = runtime.read();
@@ -267,7 +277,8 @@ class TestLogRuntime {
     Replica<Map<String, Integer>> r = bump(bump(created(), "a"), "b");
     assertThat(r.state()).containsEntry("a", 1).containsEntry("b", 1);
     assertThat(r.intentionRecords()).isEqualTo(1); // compacted: only its own record follows
-    assertThat(log.calls).containsSubsequence("append", "read", "replace", "readThrough");
+    // the fresh read reads what followed the replica the commit holds (a tail read)
+    assertThat(log.calls).containsSubsequence("append", "readAfter", "replace", "readThrough");
   }
 
   @Test
@@ -358,11 +369,51 @@ class TestLogRuntime {
 
   @Test
   void aLandedWriteReportedAsAConflictIsFoundByTheResend() { // [Write landedConflict]
+    readWhole();
     Replica<Map<String, Integer>> base = created();
     log.faults(Fault.LANDED_CONFLICT);
     Replica<Map<String, Integer>> r = bump(base, "k");
     assertThat(r.state()).containsEntry("k", 1); // applied once, though written twice
     assertThat(r.intentionRecords()).isEqualTo(3);
+  }
+
+  // Tail reads (docs/TAIL_READS.md step 5): after a lost append race the loop reads what
+  // followed the replica it holds, and appends at that tail knowing what the log holds there.
+
+  @Test
+  void aLostAppendRaceToAnAppendReadsTheTailAndResends() { // [TailRead]
+    Replica<Map<String, Integer>> base = created();
+    log.beforeNextWrite(() -> otherWriterBumps("other"));
+    log.calls.clear();
+    Replica<Map<String, Integer>> r = bump(base, "mine");
+    assertThat(r.state()).containsEntry("other", 1).containsEntry("mine", 1);
+    assertThat(log.calls).containsExactly("append", "read", "readAfter", "append", "readThrough");
+    assertThat(log.calls).doesNotContain("probe");
+  }
+
+  @Test
+  void aLostAppendRaceToAReplaceReadsTheReplaceWhole() { // [TailRead, replaced]
+    Replica<Map<String, Integer>> base = created();
+    log.beforeNextWrite(() -> {
+      Replica<Map<String, Integer>> live = runtime.read();
+      log.replaceDirectly(
+          LogEnvelope.encodeCheckpoint(live.logId(), live.committed().bytes(),
+              ToyMachine.INSTANCE.encodeCheckpoint(Map.of("init", 1, "compacted", 1))),
+          List.of());
+    });
+    log.calls.clear();
+    Replica<Map<String, Integer>> r = bump(base, "mine");
+    assertThat(r.state()).containsEntry("compacted", 1).containsEntry("mine", 1);
+    assertThat(log.calls).containsSubsequence("append", "readAfter", "append", "readThrough");
+  }
+
+  @Test
+  void aLandedWriteReportedAsAConflictIsFoundByTheTailRead() { // [Write landedConflict]
+    Replica<Map<String, Integer>> base = created();
+    log.faults(Fault.LANDED_CONFLICT);
+    Replica<Map<String, Integer>> r = bump(base, "k");
+    assertThat(r.state()).containsEntry("k", 1);
+    assertThat(r.intentionRecords()).as("written once: the read found it").isEqualTo(2);
   }
 
   @Test

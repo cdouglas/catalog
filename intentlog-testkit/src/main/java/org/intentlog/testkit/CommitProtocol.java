@@ -316,6 +316,12 @@ public final class CommitProtocol {
     /** How many records the log is prefilled with, stamped over the recent past. */
     final int prefill;
     final long seed;
+    /**
+     * Whether the runtimes read the log's tail ({@link RuntimeConfig#tailReads}), or read it whole
+     * and probe after a lost append race: drawn from the seed's high bit, which the prefill's
+     * random never sees alone.
+     */
+    final boolean tailReads;
 
     /** {@code admissionMs} is the admission window of a run that pages; -1 if it does not. */
     public Settings(int writers, boolean faults, long retentionMs, long compactorAheadMs,
@@ -332,28 +338,32 @@ public final class CommitProtocol {
       this.admissionMs = Math.max(0L, admissionMs);
       this.prefill = prefill;
       this.seed = seed;
+      this.tailReads = seed >= 0;
     }
 
     /** A runtime's configuration in this run, at {@code retentionMs}, on {@code clock}. */
     RuntimeConfig config(long retention, LongSupplier clock) {
       RuntimeConfig config =
-          new RuntimeConfig(4, 3, 0L, 0L, retention, policy, Duration.ZERO, clock);
+          new RuntimeConfig(4, 3, 0L, 0L, retention, policy, Duration.ZERO, clock)
+              .withTailReads(tailReads);
       return paging ? config.withPaging(admissionMs, 0L) : config;
     }
 
     @Override
     public String toString() {
       return String.format(
-          "writers=%d faults=%s retention=%s compactor ahead %d ms, compact %s%s%s",
+          "writers=%d faults=%s retention=%s compactor ahead %d ms, compact %s%s, %s%s",
           writers, faults, retentionMs == NO_GC ? "none" : retentionMs + " ms", compactorAheadMs,
           policyName, paging ? ", paging (A = " + admissionMs + " ms, T = 0)" : "",
+          tailReads ? "tail reads" : "whole reads",
           prefill > 0 ? ", prefilled with " + prefill + " records (seed " + seed + ")" : "");
     }
   }
 
   /**
    * Settings drawn: 2 or 3 writers, GC off or at retention 0, 50 or 200 ms, compaction policies,
-   * paging or not (at an admission window of 0, or of 100 ms), and a log prefilled or not.
+   * paging or not (at an admission window of 0, or of 100 ms), a log prefilled or not, and tail
+   * reads or whole ones.
    */
   public static Arbitrary<Settings> settings() {
     return Combinators.combine(

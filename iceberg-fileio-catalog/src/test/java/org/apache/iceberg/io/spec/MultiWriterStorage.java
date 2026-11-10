@@ -109,6 +109,9 @@ abstract class MultiWriterStorage {
 
   abstract String describe();
 
+  /** Whether the writers read the log's tail (RuntimeConfig.tailReads), or read it whole. */
+  abstract boolean tailReads();
+
   abstract CatalogLog log(RuntimeConfig config);
 
   /** The live log, as catalog-file bytes: what a commit compares with its snapshot. */
@@ -178,14 +181,22 @@ abstract class MultiWriterStorage {
 
     private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
     private final String described;
+    private final boolean tailReads;
+
+    @Override
+    boolean tailReads() {
+      return tailReads;
+    }
 
     /**
      * One object, its reads binding at the open, or pinned, live or spliced after a lookup that
      * another writer's preemption can follow ({@code reads}; TAIL_READS.md, errata T6).
      */
-    File(boolean strictVersions, InMemoryAtomicFileIO.ReadMode reads, int segmentLimit) {
+    File(boolean strictVersions, InMemoryAtomicFileIO.ReadMode reads, int segmentLimit,
+        boolean tailReads) {
+      this.tailReads = tailReads;
       this.described = "one object" + (strictVersions ? ", strict versions" : "")
-          + ", reads " + reads
+          + ", reads " + reads + (tailReads ? ", tail reads" : ", whole reads")
           + (segmentLimit > 0 ? ", " + segmentLimit + " writes at most" : "");
       if (segmentLimit > 0) {
         io.limitSegments(segmentLimit);
@@ -335,7 +346,15 @@ abstract class MultiWriterStorage {
     private final InMemorySharedLog log;
     private CatalogLog compactor = null;
 
-    Memory(boolean conditional) {
+    private final boolean tailReads;
+
+    @Override
+    boolean tailReads() {
+      return tailReads;
+    }
+
+    Memory(boolean conditional, boolean tailReads) {
+      this.tailReads = tailReads;
       this.log = new InMemorySharedLog(CATALOG, conditional);
       log.intercept(new InMemorySharedLog.Interceptor() {
         @Override
@@ -369,7 +388,8 @@ abstract class MultiWriterStorage {
 
     @Override
     String describe() {
-      return "a shared log" + (log.capabilities().conditionalAppend() ? ", conditional" : "");
+      return "a shared log" + (log.capabilities().conditionalAppend() ? ", conditional" : "")
+          + (tailReads ? ", tail reads" : ", whole reads");
     }
 
     @Override

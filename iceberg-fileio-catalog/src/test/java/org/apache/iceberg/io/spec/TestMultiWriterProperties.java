@@ -146,11 +146,12 @@ class TestMultiWriterProperties {
       @ForAll("appendHeadrooms") long appendHeadroom,
       @ForAll boolean strictVersions,
       @ForAll InMemoryAtomicFileIO.ReadMode reads,
+      @ForAll boolean tailReads,
       @ForAll boolean gc,
       @ForAll("segmentLimits") int segmentLimit,
       @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(new MultiWriterStorage.File(strictVersions, reads, segmentLimit), writers,
+    new Run(new MultiWriterStorage.File(strictVersions, reads, segmentLimit, tailReads), writers,
         maxAppendCount, appendHeadroom, false, gc, encoding).execute(schedule);
   }
 
@@ -161,11 +162,12 @@ class TestMultiWriterProperties {
       @ForAll("appendHeadrooms") long appendHeadroom,
       @ForAll boolean strictVersions,
       @ForAll InMemoryAtomicFileIO.ReadMode reads,
+      @ForAll boolean tailReads,
       @ForAll boolean gc,
       @ForAll("segmentLimits") int segmentLimit,
       @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(new MultiWriterStorage.File(strictVersions, reads, segmentLimit), writers,
+    new Run(new MultiWriterStorage.File(strictVersions, reads, segmentLimit, tailReads), writers,
         maxAppendCount, appendHeadroom, true, gc, encoding).execute(schedule);
   }
 
@@ -175,10 +177,12 @@ class TestMultiWriterProperties {
       @ForAll("maxAppendCounts") int maxAppendCount,
       @ForAll("appendHeadrooms") long appendHeadroom,
       @ForAll boolean conditional,
+      @ForAll boolean tailReads,
       @ForAll boolean gc,
       @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(new MultiWriterStorage.Memory(conditional), writers, maxAppendCount, appendHeadroom,
+    new Run(new MultiWriterStorage.Memory(conditional, tailReads), writers, maxAppendCount,
+        appendHeadroom,
         false, gc, encoding).execute(schedule);
   }
 
@@ -188,10 +192,12 @@ class TestMultiWriterProperties {
       @ForAll("maxAppendCounts") int maxAppendCount,
       @ForAll("appendHeadrooms") long appendHeadroom,
       @ForAll boolean conditional,
+      @ForAll boolean tailReads,
       @ForAll boolean gc,
       @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(new MultiWriterStorage.Memory(conditional), writers, maxAppendCount, appendHeadroom,
+    new Run(new MultiWriterStorage.Memory(conditional, tailReads), writers, maxAppendCount,
+        appendHeadroom,
         true, gc, encoding).execute(schedule);
   }
 
@@ -760,7 +766,8 @@ class TestMultiWriterProperties {
               maxAppendSize,
               gc ? 0L : LogCatalogProperties.DEFAULT_COMMITTED_RETENTION_MS,
               0, // retry throttled writes without sleeping
-              0); // and lost races
+              0) // and lost races
+              .withTailReads(storage.tailReads());
       this.log = storage.log(config);
       if (storage instanceof MultiWriterStorage.Memory) {
         // A compactor a second ahead of the writers, with their retention.

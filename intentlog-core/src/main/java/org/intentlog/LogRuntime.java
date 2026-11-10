@@ -110,10 +110,59 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
    * committed in, so a read of the log too (P1 lets a read return any prefix). A reader that
    * passes the newest replica it has seen never sees the log go back, past its own commit
    * included (Bug 72). A null floor is no floor. A read that continues the one {@code floor} was
-   * replayed from replays only the records after it.
+   * replayed from replays only the records after it. With tail reads ({@link
+   * RuntimeConfig#tailReads}) it reads only what follows {@code floor}'s tail ({@link
+   * SharedLog#readAfter}), when the log still continues it.
    */
   public Replica<S> read(Replica<S> floor) {
+    if (floor != null && config.tailReads()) {
+      return newer(floor, readAfter(floor, null, floor.logId()).replica());
+    }
     return newer(floor, replay(log.read(), null, null, floor).replica());
+  }
+
+  /**
+   * A read of what follows {@code prior}'s tail (docs/TAIL_READS.md): a view that continues
+   * prior's, whose new records are folded onto it; a view of records alone, folded onto prior if
+   * they follow its tail ({@link LogGapException} if not); or a whole view, replayed. A whole read
+   * if the log trimmed the records since, or if a fold could not say what replay did with the
+   * record of {@code watch}, which prior's view does not show.
+   */
+  private Replayed readAfter(Replica<S> prior, UUID watch, UUID logId) {
+    LogView view;
+    try {
+      view = log.readAfter(prior.tail());
+    } catch (TrimmedException e) {
+      return replay(log.read(), watch, logId, prior);
+    }
+    return replayAfter(view, prior, watch, logId);
+  }
+
+  /** {@code view}, a read after {@code prior}'s tail, replayed onto prior (as {@link #readAfter}). */
+  private Replayed replayAfter(LogView view, Replica<S> prior, UUID watch, UUID logId) {
+    if (view.checkpoint().isPresent()) {
+      return replay(view, watch, logId, prior);
+    }
+    checkFollows(view, prior.tail());
+    if (watch != null && (prior.view() == null || holds(prior.view(), watch))) {
+      return replay(log.read(), watch, logId, prior);
+    }
+    Replay.Result<B> result =
+        Replay.replayOnto(machine, machine.toBuilder(prior.state()), prior.committed().toBuilder(),
+            prior.logId(), prior.intentionRecords(), view.records(), watch);
+    return new Replayed(null, view.tail(), prior.checkpointBytes(), result,
+        logId != null ? logId : prior.logId());
+  }
+
+  /** Whether {@code view} holds a record of {@code watch}. */
+  private static boolean holds(LogView view, UUID watch) {
+    for (byte[] record : view.records()) {
+      LogEnvelope.Record decoded = LogEnvelope.decodeRecord(record);
+      if (decoded.isIntention() && decoded.id().equals(watch)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -473,12 +522,16 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
   }
 
   /**
-   * Fails unless {@code view}'s records start where its checkpoint ends: the position the
-   * checkpoint covers, if it names one, is the one the provider says the records follow (P1, S4).
-   * A view whose checkpoint names none was written with its records in one write, and its provider
-   * checks the joint.
+   * Fails unless {@code view}'s records start where its checkpoint ends: on a log that stores its
+   * checkpoints apart from its records, the position the checkpoint covers, if it names one, is
+   * the one the provider says the records follow (P1, S4). A log that writes a checkpoint with its
+   * records in one write checks the joint itself (one object: the trailers), whatever position a
+   * checkpoint copied from another log names.
    */
-  private static void checkJoint(LogView view) {
+  private void checkJoint(LogView view) {
+    if (!log.capabilities().separateCheckpoints()) {
+      return;
+    }
     byte[] checkpoint = view.checkpoint().orElse(null);
     byte[] through = checkpoint == null ? null : LogEnvelope.checkpointThrough(checkpoint);
     if (through == null) {
@@ -1000,12 +1053,28 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
               unresolved = e;
               raceBackoff(e);
             }
-            // Another writer appended first. The record is the same and replay applies it once,
-            // by its id: the committed set holds it, or it is at or below the floor, where replay
-            // admits nothing. A replace that made the log longer reads as growth, and it may have
-            // taken the id out of the set (GC, or paging: docs/COMMITTED_PAGING.md), so the floor
-            // is what rejects such a copy. Append it again at the new tail without reading the
-            // log: only the tail is needed.
+            // Another writer appended first. With tail reads, on a log that replaces itself (one
+            // object), read what followed the replica this commit holds (the records that beat
+            // it, or the whole log if it was replaced since), and append again at that tail,
+            // knowing what the log holds there: a read through the append needs no read
+            // (docs/TAIL_READS.md). Such a read is of the object as it is, so a record of this
+            // commit's that landed is in it. A log whose reads may lag its appends could hide
+            // one: there the resend's read through it settles it (P3), as below.
+            if (config.tailReads() && caps.fusedReplace()) {
+              Replayed fresh = read();
+              if (landed(fresh, earlier())) {
+                return fresh.replica(); // an append reported as a lost race landed
+              }
+              unresolved = null;
+              adopt(fresh);
+              continue;
+            }
+            // Without, the record is the same and replay applies it once, by its id: the
+            // committed set holds it, or it is at or below the floor, where replay admits
+            // nothing. A replace that made the log longer reads as growth, and it may have taken
+            // the id out of the set (GC, or paging: docs/COMMITTED_PAGING.md), so the floor is
+            // what rejects such a copy. Append it again at the new tail without reading the log:
+            // only the tail is needed.
             LogTail probed = probe();
             if (!probed.continues(tail)) {
               // The log was replaced (compacted). Read it, so that the next decision sees its
@@ -1235,27 +1304,43 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     }
 
     /**
-     * A fresh read; any failure becomes {@link UnreadableLog}. On a log that cannot replace itself,
-     * a read that lags behind {@link #floor} is read again, waiting up to the visibility wait in
-     * all, and then fails ({@link LogLagException}).
+     * A fresh read; any failure becomes {@link UnreadableLog}. With tail reads, a read of what
+     * follows the replica the commit holds ({@link #current}), which replays only the records
+     * after it, or the whole log if it no longer continues it (docs/TAIL_READS.md). On a log that
+     * cannot replace itself, a read that lags behind {@link #floor} is read again, waiting up to
+     * the visibility wait in all, and then fails ({@link LogLagException}).
      */
     private Replayed read() {
       try {
-        LogView view = log.read();
+        LogView view = fetch();
         for (int attempt = 1; floor != null && !view.tail().continues(floor); attempt++) {
           if (attempt >= config.maxThrottleAttempts()) {
             throw new LogLagException("A read of " + log + " lags behind one this commit made");
           }
           sleep(config.visibilityWait().toMillis() / config.maxThrottleAttempts(),
               new LogLagException("Interrupted waiting for " + log));
-          view = log.read();
+          view = fetch();
         }
-        return replay(view, id, base.logId(), current);
+        return config.tailReads() && current != null
+            ? replayAfter(view, current, id, base.logId())
+            : replay(view, id, base.logId(), current);
       } catch (CommitOutcomeUnknownException e) {
         throw new UnreadableLog((RuntimeException) e.getCause()); // interrupted waiting
       } catch (RuntimeException e) {
         throw new UnreadableLog(e);
       }
+    }
+
+    /** A read of the log: of what follows {@link #current}, with tail reads; else whole. */
+    private LogView fetch() {
+      if (config.tailReads() && current != null) {
+        try {
+          return log.readAfter(current.tail());
+        } catch (TrimmedException e) {
+          return log.read();
+        }
+      }
+      return log.read();
     }
 
     /** The log's tail; a failure to probe it becomes {@link UnreadableLog}. */

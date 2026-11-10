@@ -56,7 +56,8 @@ public record RuntimeConfig(
     Duration visibilityWait,
     LongSupplier clockMs,
     long admissionWindowMs,
-    long pageThresholdBytes) {
+    long pageThresholdBytes,
+    boolean tailReads) {
 
   public static final int DEFAULT_MAX_ATTEMPTS = 10;
   public static final int DEFAULT_MAX_THROTTLE_ATTEMPTS = 8;
@@ -88,17 +89,38 @@ public record RuntimeConfig(
         DEFAULT_PAGE_THRESHOLD_BYTES);
   }
 
+  /** The configuration with tail reads ({@link #tailReads}, the default). */
+  public RuntimeConfig(
+      int maxAttempts, int maxThrottleAttempts, long throttleMinWaitMs, long raceMinWaitMs,
+      long committedRetentionMs, CompactionPolicy compaction, Duration visibilityWait,
+      LongSupplier clockMs, long admissionWindowMs, long pageThresholdBytes) {
+    this(maxAttempts, maxThrottleAttempts, throttleMinWaitMs, raceMinWaitMs, committedRetentionMs,
+        compaction, visibilityWait, clockMs, admissionWindowMs, pageThresholdBytes, true);
+  }
+
   /** This configuration, paging at admission window {@code admissionMs} and threshold {@code bytes}. */
   public RuntimeConfig withPaging(long admissionMs, long bytes) {
     return new RuntimeConfig(maxAttempts, maxThrottleAttempts, throttleMinWaitMs, raceMinWaitMs,
-        committedRetentionMs, compaction, visibilityWait, clockMs, admissionMs, bytes);
+        committedRetentionMs, compaction, visibilityWait, clockMs, admissionMs, bytes, tailReads);
   }
 
   /** This configuration, on clock {@code clock}. */
   public RuntimeConfig withClock(LongSupplier clock) {
     return new RuntimeConfig(maxAttempts, maxThrottleAttempts, throttleMinWaitMs, raceMinWaitMs,
         committedRetentionMs, compaction, visibilityWait, clock, admissionWindowMs,
-        pageThresholdBytes);
+        pageThresholdBytes, tailReads);
+  }
+
+  /**
+   * This configuration, reading the log's tail ({@code true}: a read from a replica, and the commit
+   * loop's reads after a lost race, an ambiguous write or a conflict, read only what follows the
+   * replica's tail, {@link SharedLog#readAfter}) or reading it whole ({@code false}, as before
+   * docs/TAIL_READS.md step 5: the commit loop probes after a lost append race and resends).
+   */
+  public RuntimeConfig withTailReads(boolean tail) {
+    return new RuntimeConfig(maxAttempts, maxThrottleAttempts, throttleMinWaitMs, raceMinWaitMs,
+        committedRetentionMs, compaction, visibilityWait, clockMs, admissionWindowMs,
+        pageThresholdBytes, tail);
   }
 
   /** The defaults, with the given compaction policy, retention, and throttle and race backoffs. */

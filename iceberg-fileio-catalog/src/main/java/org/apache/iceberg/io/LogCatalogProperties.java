@@ -65,6 +65,17 @@ public final class LogCatalogProperties {
    * before (for ablation). Default: {@code true}.
    */
   public static final String CHECKPOINT_MEMOIZE = "fileio.catalog.checkpoint.memoize";
+
+  /**
+   * Whether a catalog reads only the log's tail after a replica it holds (docs/TAIL_READS.md):
+   * its loads and refreshes, and its commit loop's reads after a lost race, an ambiguous write or
+   * a conflict, read the records after the replica's tail when the log still continues it (one
+   * object: a HEAD and a ranged GET from the last 20 bytes the replica read), and the whole log
+   * otherwise. {@code false} reads the whole log every time, and the commit loop probes after a
+   * lost append race and resends, as before (for ablation). Default: {@code true}.
+   */
+  public static final String READ_TAIL = "fileio.catalog.read.tail";
+  public static final boolean DEFAULT_READ_TAIL = true;
   public static final boolean DEFAULT_CHECKPOINT_MEMOIZE = true;
 
   /** Whether {@code properties} ask a catalog to memoize its checkpoints' table encodings. */
@@ -229,7 +240,9 @@ public final class LogCatalogProperties {
         longProperty(properties, COMMITTED_RETENTION_MS, DEFAULT_COMMITTED_RETENTION_MS),
         longProperty(properties, THROTTLE_MIN_WAIT_MS, DEFAULT_THROTTLE_MIN_WAIT_MS),
         longProperty(properties, RACE_MIN_WAIT_MS, DEFAULT_RACE_MIN_WAIT_MS))
-        .withPaging(admissionMs, threshold);
+        .withPaging(admissionMs, threshold)
+        .withTailReads(properties == null || properties.get(READ_TAIL) == null
+            ? DEFAULT_READ_TAIL : Boolean.parseBoolean(properties.get(READ_TAIL)));
   }
 
   /**

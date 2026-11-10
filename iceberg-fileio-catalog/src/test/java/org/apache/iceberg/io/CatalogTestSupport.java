@@ -56,9 +56,15 @@ public final class CatalogTestSupport {
     return encodeFullFile(replica.logId(), replica.committed(), replica.state());
   }
 
+  /**
+   * The incarnation of the catalog files tests encode from a state: fixed, so that a file is a
+   * function of its state, as its checkpoint is (a live log's replaces draw theirs at random).
+   */
+  public static final long FILE_INCARNATION = 0x7E57F11EL;
+
   /** A catalog file holding only a checkpoint of {@code state}, with this log id and ids. */
   public static byte[] encodeFullFile(UUID logId, CommittedSet committed, CatalogState state) {
-    return AtomicFileLog.encode(checkpoint(logId, committed, state), List.of());
+    return AtomicFileLog.encode(FILE_INCARNATION, checkpoint(logId, committed, state), List.of());
   }
 
   /** A checkpoint (log.proto LogCheckpoint) of {@code state}, with this log id and ids. */

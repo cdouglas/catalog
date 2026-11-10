@@ -209,6 +209,17 @@ final class ScriptedLog implements SharedLog {
     return view(live);
   }
 
+  /** A whole read, recorded as a read after a tail: the runtime folds what continues it. */
+  @Override
+  public LogView readAfter(LogTail since) {
+    calls.add("readAfter");
+    if (failReads > 0) {
+      failReads--;
+      throw new UncheckedIOException(new IOException("read failed"));
+    }
+    return view(live);
+  }
+
   @Override
   public LogView readThrough(Receipt receipt, Duration wait) {
     calls.add("readThrough");

@@ -204,6 +204,107 @@ public final class AtomicFileLog implements SharedLog {
     }
   }
 
+  /**
+   * The log after {@code since} (docs/TAIL_READS.md "Reads"): if this log read or wrote the bytes
+   * at {@code since} (incarnation X, length N), a lookup of the object's version V and length L,
+   * and a ranged GET of V's bytes from N - 20. If those 20 bytes are the trailer of the frame
+   * {@code since} ends with, V is X extended (every frame names its object, and an append extends
+   * only the version its condition names), and the view is {@code since}'s checkpoint and
+   * records, the same arrays, and the frames after N, each checked: the runtime folds only those.
+   * Else the object was replaced, and the view is V's, read whole. A tail a probe found, or bytes
+   * that fail a check or a read that fails as stale, are read whole or again as {@link #read}
+   * does.
+   *
+   * <p>Under {@code intentlog.fileio.tail.check} (the test suites), each tail read is checked
+   * against a whole read of the version it found: the trailer stands in for a comparison of the
+   * bytes before N, and this makes its argument the thing the suites test.
+   */
+  @Override
+  public LogView readAfter(LogTail since) {
+    FileTail from = (FileTail) since;
+    if (from.view == null || from.view.trailer.length != TRAILER_SIZE) {
+      return read();
+    }
+    for (int attempt = 1; ; attempt += 1) {
+      try {
+        FileView view = tailRead(from);
+        if (Boolean.getBoolean(CHECK_TAIL_READS)) {
+          checkAgainstWhole(view);
+        }
+        return view;
+      } catch (SupportsAtomicOperations.StaleReadException | FrameCheckException e) {
+        if (attempt >= READ_ATTEMPTS) {
+          throw e;
+        }
+      }
+    }
+  }
+
+  /** The system property that checks each tail read against a whole read (tests). */
+  public static final String CHECK_TAIL_READS = "intentlog.fileio.tail.check";
+
+  /** One tail read from {@code from} (see {@link #readAfter}). */
+  private FileView tailRead(FileTail from) {
+    FileView held = from.view;
+    long n = from.length;
+    InputFile file = io.newInputFile(location);
+    byte[] bytes;
+    // Open, then look up, then read, as a whole read does: the lookup binds the version the GET
+    // asks for (step 0)
+    try (SeekableInputStream in = file.newStream()) {
+      long length = file.getLength();
+      if (length < n) {
+        return (FileView) parse(file); // shorter: replaced
+      }
+      in.seek(n - TRAILER_SIZE);
+      bytes = readFully(in, (int) (length - n + TRAILER_SIZE));
+    } catch (EOFException e) {
+      throw new FrameCheckException(location + ": " + e.getMessage());
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+    if (!Arrays.equals(bytes, 0, TRAILER_SIZE, held.trailer, 0, TRAILER_SIZE)) {
+      return (FileView) parse(file); // not X's bytes at N: replaced
+    }
+    List<byte[]> records = new ArrayList<>(held.records);
+    int end = TRAILER_SIZE;
+    for (int pos = TRAILER_SIZE; pos < bytes.length; pos = end) {
+      end = frameEnd(bytes, pos, n - TRAILER_SIZE, held.incarnation);
+      records.add(body(bytes, pos, end));
+    }
+    FileTail tail = new FileTail(file);
+    tail.length = n - TRAILER_SIZE + bytes.length;
+    FileView view = new FileView(tail, held.checkpoint, Collections.unmodifiableList(records),
+        held.incarnation, Arrays.copyOfRange(bytes, end - TRAILER_SIZE, end));
+    tail.view = view;
+    return view;
+  }
+
+  /**
+   * Fails unless {@code view}, a tail read's, is what a whole read of the version it found holds:
+   * the same checkpoint and records. A whole read that fails (the version was superseded since, or
+   * a store that does not pin reads tore it) cannot say, and checks nothing.
+   */
+  private void checkAgainstWhole(FileView view) {
+    LogView whole;
+    try {
+      whole = parse(fileOf(view.tail));
+    } catch (SupportsAtomicOperations.StaleReadException | FrameCheckException
+        | UncheckedIOException e) {
+      return;
+    }
+    boolean same = Arrays.equals(whole.checkpoint().orElseThrow(), view.checkpoint)
+        && whole.records().size() == view.records.size();
+    for (int i = 0; same && i < view.records.size(); i++) {
+      same = Arrays.equals(whole.records().get(i), view.records.get(i));
+    }
+    if (!same) {
+      throw new IllegalStateException("A tail read of " + location + " disagrees with a whole read"
+          + " of the version it found: " + view.records.size() + " records, against "
+          + whole.records().size());
+    }
+  }
+
   @Override
   public LogTail probe() {
     FileTail tail = new FileTail(io.newInputFile(location));
@@ -458,11 +559,19 @@ public final class AtomicFileLog implements SharedLog {
    * incarnation} (any, if null).
    */
   private static int frameEnd(byte[] bytes, int pos, Long incarnation) {
+    return frameEnd(bytes, pos, 0L, incarnation);
+  }
+
+  /**
+   * As {@link #frameEnd(byte[], int, Long)}, for {@code bytes} that start at offset {@code base}
+   * of the object: a frame at {@code pos} must say it starts at {@code base + pos}.
+   */
+  private static int frameEnd(byte[] bytes, int pos, long base, Long incarnation) {
     long length = 0;
     int at = pos;
     for (int shift = 0; ; shift += 7) {
       if (at >= bytes.length || shift > 28) {
-        throw new FrameCheckException("The frame at " + pos + " has no length");
+        throw new FrameCheckException("The frame at " + (base + pos) + " has no length");
       }
       byte b = bytes[at++];
       length |= (long) (b & 0x7F) << shift;
@@ -472,22 +581,23 @@ public final class AtomicFileLog implements SharedLog {
     }
     long end = at + length + TRAILER_SIZE;
     if (end > bytes.length) {
-      throw new FrameCheckException(
-          "The frame at " + pos + " runs past the object's end, " + bytes.length);
+      throw new FrameCheckException("The frame at " + (base + pos) + " runs past the object's end, "
+          + (base + bytes.length));
     }
     int trailer = (int) end - TRAILER_SIZE;
     CRC32C crc = new CRC32C();
     crc.update(bytes, pos, trailer + 16 - pos);
     if ((int) crc.getValue() != getInt(bytes, trailer + 16)) {
-      throw new FrameCheckException("The frame at " + pos + " fails its checksum");
+      throw new FrameCheckException("The frame at " + (base + pos) + " fails its checksum");
     }
     long offset = getLong(bytes, trailer + 8);
-    if (offset != pos) {
-      throw new FrameCheckException("The frame at " + pos + " says it starts at " + offset);
+    if (offset != base + pos) {
+      throw new FrameCheckException(
+          "The frame at " + (base + pos) + " says it starts at " + offset);
     }
     long named = getLong(bytes, trailer);
     if (incarnation != null && named != incarnation) {
-      throw new FrameCheckException("The frame at " + pos + " is of incarnation "
+      throw new FrameCheckException("The frame at " + (base + pos) + " is of incarnation "
           + Long.toHexString(named) + ", the object's " + Long.toHexString(incarnation));
     }
     return (int) end;
@@ -675,8 +785,18 @@ public final class AtomicFileLog implements SharedLog {
       return length;
     }
 
+    /**
+     * Whether the object at this tail continues the one at {@code earlier}: no shorter, and, where
+     * this log read or wrote the bytes at both, the same incarnation (a replace that made the
+     * object longer does not continue it). A tail a probe found is compared by length: a resend
+     * from it frames its record from the probed version's last trailer.
+     */
     @Override
     public boolean continues(LogTail earlier) {
+      if (earlier instanceof FileTail && view != null && ((FileTail) earlier).view != null
+          && view.incarnation != ((FileTail) earlier).view.incarnation) {
+        return false;
+      }
       return bytes() >= earlier.bytes();
     }
 

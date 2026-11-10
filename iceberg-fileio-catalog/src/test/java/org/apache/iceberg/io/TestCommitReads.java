@@ -30,6 +30,7 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.types.Types;
+import org.intentlog.fileio.AtomicFileLog;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
@@ -56,7 +57,9 @@ class TestCommitReads {
 
   /**
    * Requests that reach the catalog object while {@code action} runs: a read is one (a GET, which
-   * binds the version it reads), and so is a lookup.
+   * binds the version it reads), and so is a lookup. The suites' check of each tail read against a
+   * whole read (AtomicFileLog.CHECK_TAIL_READS) is off meanwhile: its reads are the test's, not
+   * the commit's.
    */
   private static int catalogRequests(InMemoryAtomicFileIO io, String catalog, Runnable action) {
     AtomicInteger requests = new AtomicInteger();
@@ -66,10 +69,17 @@ class TestCommitReads {
       }
       return InMemoryAtomicFileIO.ReadFault.NONE;
     });
+    String check = System.getProperty(AtomicFileLog.CHECK_TAIL_READS);
+    System.setProperty(AtomicFileLog.CHECK_TAIL_READS, "false");
     try {
       action.run();
     } finally {
       io.injectReadFaults(location -> InMemoryAtomicFileIO.ReadFault.NONE);
+      if (check == null) {
+        System.clearProperty(AtomicFileLog.CHECK_TAIL_READS);
+      } else {
+        System.setProperty(AtomicFileLog.CHECK_TAIL_READS, check);
+      }
     }
     return requests.get();
   }

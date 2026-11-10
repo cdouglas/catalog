@@ -96,16 +96,13 @@ public class TestProtoCommitKnobs {
           } else if (strategy == AtomicOutputFile.Strategy.APPEND) {
             if (injectAppendFailures > 0) {
               injectAppendFailures--;
-              // Simulate a concurrent writer's append that won the offset race:
-              // grow the file with dummy bytes so length increases.
+              // Simulate a concurrent writer's append that won the offset race: its own
+              // record (an empty transaction), framed as an append to this object frames it
               byte[] existing = content.get();
               if (existing != null) {
-                byte[] grown = new byte[existing.length + written.length];
-                System.arraycopy(existing, 0, grown, 0, existing.length);
-                // Fill with the concurrent writer's data (we just use our bytes
-                // as a stand-in; content doesn't matter for offset-conflict tests)
-                System.arraycopy(written, 0, grown, existing.length, written.length);
-                content.set(grown);
+                content.set(org.intentlog.fileio.AtomicFileLog.extend(existing,
+                    ProtoCodec.encodeTransaction(new ProtoCodec.Transaction(
+                        org.intentlog.wire.UuidV7.newUuidV7(), java.util.List.of()))));
               }
               throw new SupportsAtomicOperations.AppendException(
                   "injected offset conflict", new IOException("offset mismatch"));
@@ -216,7 +213,8 @@ public class TestProtoCommitKnobs {
     InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
     FileIOCatalog catalog = LocalCatalogMode.APPEND.catalog(io, "mem:///wh", "c",
         Map.of(LogCatalogProperties.MAX_APPEND_COUNT, "100",
-            LogCatalogProperties.MAX_APPEND_SIZE, "1024",
+            // room for one large record and three small ones, with their trailers
+            LogCatalogProperties.MAX_APPEND_SIZE, "1200",
             LogCatalogProperties.MAX_APPEND_SIZE_BASIS, basis));
     // Records whose state outgrows the bound: their tail compacts it into the checkpoint
     for (int i = 0; i < 5; i++) {
@@ -568,46 +566,74 @@ public class TestProtoCommitKnobs {
   // Append retry: no catalog read between offset-conflict retries
   // ============================================================
 
+  /**
+   * Three lost append races, then one that lands, with tail reads (the default): each loss reads
+   * what followed the replica the commit holds (one request: the object is still its incarnation,
+   * extended by the winner's record), and the append that lands needs no read back, since the
+   * commit knows what the object holds (TAIL_READS.md step 5).
+   */
   @Test
-  void appendRetry_doesNotReadCatalogOnOffsetConflict() {
-    // Unlimited limits so we stay in the append path.
+  void appendRetry_readsTheTailAfterEachLostRace() {
     MockIO io = new MockIO();
     CatalogLog log = log(io, Integer.MAX_VALUE, Long.MAX_VALUE);
-
-    // Initial commit (CAS, creates the file)
-    CatalogMutation mut0 = new CatalogMutation(log.empty());
-    mut0.createNamespace(Namespace.of("seed"));
-    mut0.commit(log);
-    // Reset counters after initial setup
-    int readsAfterInit = io.readCount;
-    io.casCount = 0;
+    new CatalogMutation(log.empty()).createNamespace(Namespace.of("seed")).commit(log);
     io.appendCount = 0;
-
-    // Now: inject 3 consecutive append failures (offset conflicts),
-    // then the 4th attempt succeeds.
     io.injectAppendFailures = 3;
-
     Replica<CatalogState> current = log.read();
-    int readsAfterLoad = io.readCount;
 
-    CatalogMutation mut = new CatalogMutation(current);
-    mut.createNamespace(Namespace.of("test_ns"));
-    Replica<CatalogState> result = mut.commit(log);
+    int[] reads = new int[1];
+    Replica<CatalogState> result = uncheckedTailReads(() -> {
+      int before = io.readCount;
+      Replica<CatalogState> landed =
+          new CatalogMutation(current).createNamespace(Namespace.of("test_ns")).commit(log);
+      reads[0] = io.readCount - before;
+      return landed;
+    });
 
-    // The commit should have succeeded
     assertThat(result.state().containsNamespace(Namespace.of("test_ns"))).isTrue();
+    assertThat(io.appendCount).isEqualTo(1);
+    assertThat(reads[0]).as("a tail read per lost race, none after the append that lands")
+        .isEqualTo(3);
+  }
 
-    // 3 failed appends + 1 successful append
-    assertThat(io.appendCount).isEqualTo(1);  // only the successful one counts
+  /**
+   * The same with tail reads off: each loss probes the object's length and resends, reading only
+   * the probed version's last trailer (a 20-byte GET) for the incarnation its frame names; the
+   * append that lands is read back (D20).
+   */
+  @Test
+  void appendRetry_withWholeReadsReadsOnlyTheProbedTrailer() {
+    MockIO io = new MockIO();
+    CatalogLog log = CatalogTestSupport.log(io.fileIO, CATALOG_LOC,
+        Map.of(LogCatalogProperties.READ_TAIL, "false"));
+    new CatalogMutation(log.empty()).createNamespace(Namespace.of("seed")).commit(log);
+    io.appendCount = 0;
+    io.injectAppendFailures = 3;
+    Replica<CatalogState> current = log.read();
 
-    // Key assertion: no catalog reads between append retries.
-    // The only reads should be from:
-    //   1. The successful append's read-back (tryAppend reads after write)
-    // The 3 failed attempts should NOT have triggered reads.
-    int readsDuringCommit = io.readCount - readsAfterLoad;
-    assertThat(readsDuringCommit)
-        .as("should only read once (post-success validation), not on each retry")
-        .isEqualTo(1);
+    int before = io.readCount;
+    Replica<CatalogState> result =
+        new CatalogMutation(current).createNamespace(Namespace.of("test_ns")).commit(log);
+
+    assertThat(result.state().containsNamespace(Namespace.of("test_ns"))).isTrue();
+    assertThat(io.appendCount).isEqualTo(1);
+    assertThat(io.readCount - before).as("three trailer reads, and the read back")
+        .isEqualTo(4);
+  }
+
+  /** {@code action}, without the suites' check of each tail read against a whole read. */
+  private static <T> T uncheckedTailReads(Supplier<T> action) {
+    String check = System.getProperty(org.intentlog.fileio.AtomicFileLog.CHECK_TAIL_READS);
+    System.setProperty(org.intentlog.fileio.AtomicFileLog.CHECK_TAIL_READS, "false");
+    try {
+      return action.get();
+    } finally {
+      if (check == null) {
+        System.clearProperty(org.intentlog.fileio.AtomicFileLog.CHECK_TAIL_READS);
+      } else {
+        System.setProperty(org.intentlog.fileio.AtomicFileLog.CHECK_TAIL_READS, check);
+      }
+    }
   }
 
   @Test

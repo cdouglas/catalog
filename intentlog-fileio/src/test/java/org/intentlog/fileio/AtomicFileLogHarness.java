@@ -49,8 +49,8 @@ import org.intentlog.wire.LogEnvelope;
  * cannot delay a write or serve a stale read, so those faults act as a failure before the write and
  * as none. It reads in a mode drawn per run ({@link InMemoryAtomicFileIO.ReadMode}): in all but
  * {@code OPEN} a write can land between a read's lookup and its GET, which a pinned store fails as
- * stale and an unpinned one serves live or spliced (at a frame's end half the time), as S3 before
- * step 0 could (TAIL_READS.md, errata T6). Every view a read returns must be a state the log held:
+ * stale and an unpinned one serves live or spliced (a third of the time at a frame's end, a third
+ * inside the checkpoint's frame), as S3 before step 0 could (TAIL_READS.md, errata T6). Every view a read returns must be a state the log held:
  * a version's checkpoint and a prefix of its records ({@link #checkpointViolations}). A copy of a record is appended at the object's offset, or, on a store without append,
  * by a CAS of the object with the copy after its records (another writer's write either way).
  * Every other CAS must write the replay of the version it replaced (I11), checked with {@code
@@ -84,11 +84,18 @@ public final class AtomicFileLogHarness implements LogHarness {
     this.machine = machine;
     io.readMode(mode);
     SplittableRandom splices = random.split();
+    // A third at a frame's end (format 2 would decode it), a third inside the checkpoint's frame
+    // (only the checksum sees one whose new object has a checkpoint as long), a third anywhere
     io.spliceAt((bound, live) -> {
       List<Integer> ends = frameEnds(bound);
-      return splices.nextBoolean() && !ends.isEmpty()
-          ? ends.get(splices.nextInt(ends.size()))
-          : splices.nextInt(bound.length + 1);
+      int pick = splices.nextInt(3);
+      if (pick == 0 && !ends.isEmpty()) {
+        return ends.get(splices.nextInt(ends.size()));
+      }
+      if (pick == 1 && !ends.isEmpty()) {
+        return AtomicFileLog.HEADER_SIZE + splices.nextInt(ends.get(0) - AtomicFileLog.HEADER_SIZE);
+      }
+      return splices.nextInt(bound.length + 1);
     });
     io.injectFaults((loc, strategy) -> hooks == null ? InMemoryAtomicFileIO.Fault.NONE
         : fault(hooks.beforeWrite()));

@@ -111,7 +111,8 @@ reads format 2, unchecked, for captured logs.
 | `append(record, tail)` | appends the record's frame at the tail's length, conditioned on its version (`Strategy.APPEND`), naming that version's incarnation: from the view this log read or wrote at the tail, or, for a tail a probe found, from that version's last trailer, read pinned to it (a version superseded since fails as a lost race, unsent). An unconditional append is refused |
 | `replace(tail, checkpoint, records)` | writes `[header][checkpoint][records]`, framed with an incarnation drawn for the write, as the whole object, conditioned on the tail's version, or on the object's absence if the tail does not exist (`Strategy.CAS`) |
 | `readThrough(receipt)` | the object the write left, so its record is among the records (P3): without a read when the write says what it holds (a replace holds what it wrote; an append conditioned on a tail whose bytes this log read or wrote holds those bytes and the record), else by reading the version the write wrote, or the live object if a later write superseded it |
-| `putCheckpoint`, `trim`, `readAfter` | not supported (a replace checkpoints), or the default (a fresh read) |
+| `readAfter(tail)` | from a tail whose bytes this log read or wrote (incarnation X, length N): a lookup of the object's version V and length L, then a GET of V's bytes from N - 20 (pinned, step 0). If those 20 bytes are the trailer of the frame the tail ends with, V is X extended, and the view is the tail's checkpoint and records (the same arrays) and the frames after N, each checked; else (another incarnation, or a shorter object) V read whole. From a tail a probe found, a whole read ([TAIL_READS.md](TAIL_READS.md) "Reads") |
+| `putCheckpoint`, `trim` | not supported (a replace checkpoints) |
 
 **Tails.** A tail is the object's version (an ETag or generation) and length.
 The next conditional write names that version: an append at that offset (S3
@@ -122,11 +123,13 @@ write names (`getLength()`), which pins the version it saw on every store. The
 fork's atomic writes take a snapshot that has seen no version to name an absent
 object (a CAS from it creates the object only if none exists, with no lookup),
 so a tail that had not looked would turn a replace into a failed create. A tail
-continues an earlier one
-if the object did not shrink: an append makes it longer, while a replace
-usually makes it shorter. A replace that makes it longer reads as an append,
-which costs a resend at most: the record is the same, and replay applies it
-once.
+continues an earlier one if the object did not shrink and, where the log read
+or wrote the bytes at both, it is the same incarnation: a replace that made
+the object longer does not continue it. A tail a probe found is compared by
+length; the commit loop with tail reads off resends from it, framed from the
+probed version's last trailer, which costs a resend at most: the record is the
+same, and replay applies it once. A tail has a position (its incarnation and
+length, LOG.md "Positions") where the log read or wrote its bytes.
 
 An append conditioned on a tail must fail unless the object is exactly the
 version the tail is bound to, not merely as long: a provider requirement the

@@ -52,6 +52,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.ReadFault;
+import org.intentlog.fileio.AtomicFileLog;
 import org.intentlog.CommittedSet;
 import org.intentlog.DedupHorizonExceededException;
 import org.intentlog.Replica;
@@ -1048,19 +1049,11 @@ public class TestCatalogRegressions {
                   new ProtoCodec.DropNamespaceAction(b, version),
                   new ProtoCodec.CreateNamespaceAction(-1, 1, b, version, "x")));
       byte[] record = ProtoCodec.encodeTransaction(txn);
-      ByteArrayOutputStream file = new ByteArrayOutputStream();
+      byte[] file;
       try (InputStream in = io.newInputFile(RACE_LOC).newStream()) {
-        file.write(in.readAllBytes());
+        file = in.readAllBytes();
       }
-      for (int v = record.length; ; v >>>= 7) {
-        if ((v & ~0x7F) == 0) {
-          file.write(v);
-          break;
-        }
-        file.write((v & 0x7F) | 0x80);
-      }
-      file.write(record);
-      io.seed(RACE_LOC, file.toByteArray());
+      io.seed(RACE_LOC, AtomicFileLog.extend(file, record)); // appended, as an append frames it
 
       Replica<CatalogState> result = log.read();
       assertThat(result.committed().contains(txn.id())).isFalse();
@@ -1542,8 +1535,9 @@ public class TestCatalogRegressions {
               @Override
               public org.intentlog.memory.InMemorySharedLog.ReadShape beforeRead(
                   org.intentlog.memory.InMemorySharedLog.Request request) {
-                if (request == org.intentlog.memory.InMemorySharedLog.Request.READ) {
-                  race.run();
+                if (request == org.intentlog.memory.InMemorySharedLog.Request.READ
+                    || request == org.intentlog.memory.InMemorySharedLog.Request.READ_AFTER) {
+                  race.run(); // a read of the log, whole or after a replica's tail
                 }
                 return org.intentlog.memory.InMemorySharedLog.ReadShape.NORMAL;
               }
@@ -4398,18 +4392,11 @@ public class TestCatalogRegressions {
                   compacted.state().namespaceVersion(compacted.state().namespaceId(Namespace.of("y"))),
                   "late", "v")));
       byte[] record = ProtoCodec.encodeTransaction(late);
-      ByteArrayOutputStream file = new ByteArrayOutputStream();
+      byte[] file;
       try (InputStream in = io.newInputFile(location).newStream()) {
-        file.write(in.readAllBytes());
+        file = in.readAllBytes();
       }
-      int length = record.length;
-      while ((length & ~0x7F) != 0) {
-        file.write((length & 0x7F) | 0x80);
-        length >>>= 7;
-      }
-      file.write(length);
-      file.write(record);
-      io.seed(location, file.toByteArray());
+      io.seed(location, AtomicFileLog.extend(file, record)); // appended, as an append frames it
 
       Replica<CatalogState> after = read();
       assertThat(after.state().namespaceProperties(Namespace.of("y"))).doesNotContainKey("late");

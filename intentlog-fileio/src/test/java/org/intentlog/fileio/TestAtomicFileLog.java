@@ -527,4 +527,127 @@ class TestAtomicFileLog {
     assertThat(log.capabilities().append()).isTrue();
     assertThat(log.capabilities().fusedReplace()).isTrue();
   }
+
+  // ============================================================
+  // Tail reads (docs/TAIL_READS.md "Reads")
+  // ============================================================
+
+  /** Another writer's log over the same store, its replaces of incarnation {@code incarnation}. */
+  private AtomicFileLog other(long incarnation) {
+    return new AtomicFileLog(io, LOCATION, () -> incarnation);
+  }
+
+  @Test
+  void aTailReadReadsTheRecordsAfterTheReplicaAndKeepsItsArrays() {
+    LogView held = create();
+    other(INCARNATION).append(bytes("r2"), log.read().tail());
+    other(INCARNATION).append(bytes("r3"), log.read().tail());
+
+    AtomicInteger reads = countReads();
+    LogView after = log.readAfter(held.tail());
+    assertThat(after.records()).extracting(TestAtomicFileLog::string)
+        .containsExactly("r1", "r2", "r3");
+    assertThat(after.checkpoint().orElseThrow()).isSameAs(held.checkpoint().orElseThrow());
+    assertThat(after.records().get(0)).isSameAs(held.records().get(0));
+    assertSameView(after, log.read());
+    assertThat(after.tail().continues(held.tail())).isTrue();
+    // the view's tail conditions an append, which needs no read back
+    LogView appended = log.readThrough(log.append(bytes("r4"), after.tail()), Duration.ZERO);
+    assertSameView(appended, log.read());
+    assertThat(reads.get()).as("lookups and GETs, the checks' whole reads aside").isPositive();
+  }
+
+  @Test
+  void aTailReadWithNothingNewIsTheReplica() {
+    LogView held = create();
+    LogView after = log.readAfter(held.tail());
+    assertThat(after.records()).extracting(TestAtomicFileLog::string).containsExactly("r1");
+    assertThat(after.tail().bytes()).isEqualTo(held.tail().bytes());
+  }
+
+  /**
+   * A replace that made the object longer than the replica's tail, with a frame boundary at the
+   * tail or not, is not the replica's object: the 20 bytes before the tail are not its trailer,
+   * and the tail read reads the new object whole.
+   */
+  @Test
+  void aReplaceLongerThanTheTailIsReadWhole() {
+    LogView held = create();
+    other(7L).replace(log.read().tail(), bytes("chk"),
+        List.of(bytes("r1"), bytes("r2"), bytes("r3")));
+
+    LogView after = log.readAfter(held.tail());
+    assertSameView(after, log.read());
+    assertThat(after.records()).extracting(TestAtomicFileLog::string)
+        .containsExactly("r1", "r2", "r3");
+    assertThat(after.tail().continues(held.tail())).as("another incarnation").isFalse();
+  }
+
+  @Test
+  void aReplaceOfTheSameLengthIsReadWhole() {
+    LogView held = create();
+    other(7L).replace(log.read().tail(), bytes("chk"), List.of(bytes("r9")));
+    assertThat(io.bytes(LOCATION)).hasSize((int) held.tail().bytes());
+
+    LogView after = log.readAfter(held.tail());
+    assertThat(after.records()).extracting(TestAtomicFileLog::string).containsExactly("r9");
+  }
+
+  @Test
+  void aReplaceShorterThanTheTailIsReadWhole() {
+    LogView held = create();
+    other(INCARNATION).append(bytes("r2"), log.read().tail());
+    LogView longer = log.read();
+    other(7L).replace(longer.tail(), bytes("c"), List.of());
+
+    LogView after = log.readAfter(longer.tail());
+    assertThat(string(after.checkpoint().orElseThrow())).isEqualTo("c");
+    assertThat(after.records()).isEmpty();
+  }
+
+  /** A tail a probe found holds no bytes this log read: a read after it reads whole. */
+  @Test
+  void aReadAfterAProbedTailIsWhole() {
+    create();
+    LogTail probed = log.probe();
+    other(INCARNATION).append(bytes("r2"), log.read().tail());
+    assertSameView(log.readAfter(probed), log.read());
+  }
+
+  /**
+   * A tail read torn by a replace that landed between its lookup and its GET, on a store that
+   * does not pin reads: spliced inside the replica's last frame or after it, or served short of
+   * the length its lookup found. Each fails a check, and the read is read again, whole.
+   */
+  @Test
+  void aTornTailReadReadsAgain() {
+    for (InMemoryAtomicFileIO.ReadMode mode : List.of(InMemoryAtomicFileIO.ReadMode.LIVE,
+        InMemoryAtomicFileIO.ReadMode.SPLICE)) {
+      for (int shorter = 0; shorter <= 1; shorter++) {
+        InMemoryAtomicFileIO store = new InMemoryAtomicFileIO();
+        AtomicFileLog reader = new AtomicFileLog(store, LOCATION, () -> 1L);
+        AtomicFileLog writer = new AtomicFileLog(store, LOCATION, () -> 2L);
+        LogView held = reader.readThrough(reader.replace(AtomicFileLog.tailOf(
+            store.newInputFile(LOCATION)), bytes("checkpoint"), List.of(bytes("r1"))),
+            Duration.ZERO);
+        writer.append(bytes("r2"), writer.read().tail());
+        store.readMode(mode);
+        long at = held.tail().bytes() - 10; // inside the replica's last trailer
+        store.spliceAt((bound, live) -> (int) at);
+        List<byte[]> replacement = shorter == 1 ? List.of() : List.of(bytes("x1"), bytes("x2"));
+        AtomicInteger requests = new AtomicInteger();
+        store.injectReadFaults(location -> {
+          if (requests.incrementAndGet() == 2) { // the first tail read's GET
+            store.injectReadFaults(l -> InMemoryAtomicFileIO.ReadFault.NONE);
+            writer.replace(writer.read().tail(), bytes("cp"), replacement);
+          }
+          return InMemoryAtomicFileIO.ReadFault.NONE;
+        });
+        LogView after = reader.readAfter(held.tail());
+        assertThat(string(after.checkpoint().orElseThrow())).as("%s, shorter %d", mode, shorter)
+            .isEqualTo("cp");
+        assertThat(after.records()).hasSize(replacement.size());
+      }
+    }
+  }
 }

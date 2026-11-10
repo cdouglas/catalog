@@ -262,7 +262,8 @@ class TestSharedLogRuntime {
 
       @Override
       public ReadShape beforeRead(Request request) {
-        if (!raced && request == Request.READ && script.active) {
+        if (!raced && (request == Request.READ || request == Request.READ_AFTER)
+            && script.active) {
           raced = true;
           other("o", Set.of(), Set.of("a"));
         }
@@ -373,6 +374,29 @@ class TestSharedLogRuntime {
 
   @Test
   void aCommitWhoseReadsKeepLaggingIsUnknownNotFailed() { // [lagread]
+    // Whole reads, which can lag behind the commit's base (a read after its tail cannot)
+    LogRuntime<State, EntityVersionsMachine.Builder, Txn> whole =
+        new LogRuntime<>(log, MACHINE, config(NO_GC, NEVER).withTailReads(false));
+    created();
+    other("o", Set.of(), Set.of("a"));
+    Replica<State> base = whole.read();
+    script.appends.add(WriteFault.LOST_REPLY);
+    for (int i = 0; i < 10; i++) {
+      script.reads.add(ReadShape.of(0, 3));
+    }
+    assertThatThrownBy(() -> whole.commit(base, txn(base, "t", Set.of("a"), Set.of("b"))))
+        .isInstanceOf(CommitOutcomeUnknownException.class);
+    script.reads.clear();
+    assertAppliedOnce("t");
+  }
+
+  /**
+   * With tail reads, a read that resolves a lost reply starts at the commit's base, so it cannot
+   * lag behind it: one that lags behind the record finds the transaction still holds, sends it
+   * again, and the read through the resend settles it (P3).
+   */
+  @Test
+  void aCommitWhoseTailReadsLagIsSettledByTheResend() { // [lagread]
     created();
     other("o", Set.of(), Set.of("a"));
     Replica<State> base = writer.read();
@@ -380,8 +404,8 @@ class TestSharedLogRuntime {
     for (int i = 0; i < 10; i++) {
       script.reads.add(ReadShape.of(0, 3));
     }
-    assertThatThrownBy(() -> writer.commit(base, txn(base, "t", Set.of("a"), Set.of("b"))))
-        .isInstanceOf(CommitOutcomeUnknownException.class);
+    Replica<State> r = writer.commit(base, txn(base, "t", Set.of("a"), Set.of("b")));
+    assertThat(r.state().history()).containsExactly("init", "o", "t");
     script.reads.clear();
     assertAppliedOnce("t");
   }
