@@ -41,15 +41,24 @@ import org.apache.iceberg.io.SupportsPrefixOperations;
  * spent in the calling thread, which also counts them ({@link Requests}).
  *
  * <p>A request is: binding an input file (a HEAD: {@code exists} or {@code getLength} of an unbound
- * file), each {@code newStream} (a GET of the whole object), each plain write (a PUT, on close),
- * each conditional write, each delete, and each listing of a prefix (a LIST, at a read's latency:
- * endive's profiles have none of their own; fileio-catalog lists only to sweep its committed set's
- * orphaned pages). A GET and a conditional write take effect halfway
- * through their latency, as endive's simulator splits them: the request reaches the store, the
- * store reads its state or checks the condition, and the reply comes back. A conditional append
- * that loses its race takes the store's failure latency in all.
+ * file), each GET (below), each plain write (a PUT, on close), each conditional write, each
+ * delete, and each listing of a prefix (a LIST, at a read's latency: endive's profiles have none of
+ * their own; fileio-catalog lists only to sweep its committed set's orphaned pages). A conditional
+ * write takes effect halfway through its latency, as endive's simulator splits it: the request
+ * reaches the store, the store checks the condition, and the reply comes back. A conditional
+ * append that loses its race takes the store's failure latency in all.
+ *
+ * <p>A stream opened ({@code newStream}) binds its file's version at once, as the store reads it,
+ * and costs nothing until it reads: a GET is a read that starts where no GET is open, of the bytes
+ * from there to the object's end, as S3's stream opens a ranged GET at its first read
+ * (TAIL_READS.md "Pricing"). A seek the open GET cannot read through (backward, or forward past
+ * {@link #READ_THROUGH} bytes, as {@code S3InputStream} skips a short one) ends it, and the next
+ * read is a GET from there. A whole read is one GET of every byte, as before ranges were priced;
+ * a tail read, a GET of the bytes it asks for.
  */
 public final class LatencyFileIO implements SupportsAtomicOperations, SupportsPrefixOperations {
+  /** The longest forward seek an open GET reads through, as S3FileIO's default skip size. */
+  static final long READ_THROUGH = 1024 * 1024;
 
   private final InMemoryAtomicFileIO store;
   private final StoreProfile profile;
@@ -179,25 +188,97 @@ public final class LatencyFileIO implements SupportsAtomicOperations, SupportsPr
 
     @Override
     public SeekableInputStream newStream() {
-      Requests requests = Requests.mine();
-      requests.gets++;
-      SplittableRandom r = random();
-      double half = profile.readMs(0, r) / 2;
-      await(half);
       SeekableInputStream stream = file.newStream();
       bound = true;
-      long length = file.getLength();
-      requests.bytesRead += length;
-      if (file.location().equals(catalogLocation)) {
-        requests.catalogBytesRead += length;
-      }
-      await(Math.max(0, profile.readMs(length, r) - half));
-      return stream;
+      return new TimedInputStream(stream, file.getLength(), file.location().equals(catalogLocation));
     }
 
     @Override
     public String location() {
       return file.location();
+    }
+  }
+
+  /** A stream of one version, its GETs priced by the bytes each asks for (the class comment). */
+  private final class TimedInputStream extends SeekableInputStream {
+    private final SeekableInputStream in;
+    private final long length;
+    private final boolean catalog;
+    private long pos = 0;
+    private boolean open = false;
+
+    TimedInputStream(SeekableInputStream in, long length, boolean catalog) {
+      this.in = in;
+      this.length = length;
+      this.catalog = catalog;
+    }
+
+    /**
+     * A GET of the bytes from the position to the end, unless one is open: its latency drawn as
+     * a whole read's was (half a request, then the rest of one of its bytes).
+     */
+    private void get() {
+      if (open) {
+        return;
+      }
+      open = true;
+      long bytes = Math.max(0, length - pos);
+      Requests requests = Requests.mine();
+      requests.gets++;
+      requests.bytesRead += bytes;
+      if (catalog) {
+        requests.catalogBytesRead += bytes;
+      }
+      SplittableRandom r = random();
+      double half = profile.readMs(0, r) / 2;
+      await(half + Math.max(0, profile.readMs(bytes, r) - half));
+    }
+
+    @Override
+    public long getPos() {
+      return pos;
+    }
+
+    @Override
+    public void seek(long newPos) throws IOException {
+      if (open && (newPos < pos || newPos - pos > READ_THROUGH)) {
+        open = false;
+      }
+      in.seek(newPos);
+      pos = newPos;
+    }
+
+    @Override
+    public int read() throws IOException {
+      get();
+      int b = in.read();
+      if (b >= 0) {
+        pos += 1;
+      }
+      return b;
+    }
+
+    @Override
+    public int read(byte[] b, int off, int len) throws IOException {
+      if (len == 0) {
+        return 0;
+      }
+      get();
+      int n = in.read(b, off, len);
+      if (n > 0) {
+        pos += n;
+      }
+      return n;
+    }
+
+    @Override
+    public int available() throws IOException {
+      return in.available();
+    }
+
+    @Override
+    public void close() throws IOException {
+      in.close();
     }
   }
 
