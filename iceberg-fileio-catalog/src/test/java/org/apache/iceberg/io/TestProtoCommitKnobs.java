@@ -268,6 +268,17 @@ public class TestProtoCommitKnobs {
   }
 
   @Test
+  void compactionAfterTheCommitIsTheDefaultAndCanBeFused() {
+    assertThat(LogCatalogProperties.runtimeConfig(Map.of()).compactAfterCommit()).isTrue();
+    assertThat(LogCatalogProperties.runtimeConfig(
+        Map.of(LogCatalogProperties.COMPACT_AFTER_COMMIT, "false")).compactAfterCommit()).isFalse();
+    org.assertj.core.api.Assertions.assertThatThrownBy(() -> LogCatalogProperties.runtimeConfig(
+        Map.of(LogCatalogProperties.COMPACT_AFTER_COMMIT, "yes")))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining(LogCatalogProperties.COMPACT_AFTER_COMMIT);
+  }
+
+  @Test
   void casOnlyMode_zeroAppendCount() {
     // maxAppendCount=0 forces every commit through CAS
     MockIO io = new MockIO();
@@ -294,7 +305,28 @@ public class TestProtoCommitKnobs {
   }
 
   @Test
-  void appendCountLimitTriggersCAS() {
+  void appendCountLimitTriggersCompactionAfterTheCommit() {
+    // maxAppendCount=3: once a commit lands the log at 3 records, its writer compacts it (at the
+    // limit itself: CatalogTestSupport's logs draw no point past it).
+    // Commit 1: initial CAS -> file has 1 txn. count=1.
+    // Commit 2: append. count=2.
+    // Commit 3: append. count=3: compaction, a CAS. count=0.
+    // Commit 4: append. count=1.
+    // Commit 5: append. count=2.
+    // Commit 6: append. count=3: compaction. count=0.
+    MockIO io = new MockIO();
+    CatalogLog log = log(io, 3, Long.MAX_VALUE);
+
+    commitN(log, 6);
+
+    // 3 CASes (commit 1, the compactions after commits 3 and 6), 5 appends
+    assertThat(io.casCount).isEqualTo(3);
+    assertThat(io.appendCount).isEqualTo(5);
+    assertThat(log.read().intentionRecords()).isZero();
+  }
+
+  @Test
+  void appendCountLimitTriggersCASWhenCompactionIsFused() {
     // maxAppendCount=3 means we allow up to 3 log records before CAS.
     // Commit 1: initial CAS -> file has 1 txn. count=1.
     // Commit 2: count(1) < 3, append. count=2.
@@ -303,7 +335,9 @@ public class TestProtoCommitKnobs {
     // Commit 5: count(1) < 3, append. count=2.
     // Commit 6: count(2) < 3, append. count=3.
     MockIO io = new MockIO();
-    CatalogLog log = log(io, 3, Long.MAX_VALUE);
+    CatalogLog log = CatalogTestSupport.log(io.fileIO, CATALOG_LOC, Map.of(
+        LogCatalogProperties.MAX_APPEND_COUNT, "3",
+        LogCatalogProperties.COMPACT_AFTER_COMMIT, "false"));
 
     commitN(log, 6);
 
@@ -339,7 +373,8 @@ public class TestProtoCommitKnobs {
     MockIO io = new MockIO();
     CatalogLog log = log(io, 3, Long.MAX_VALUE);
 
-    // With limit=3, the 4th commit CASes. After CAS, count=1 (just the new txn).
+    // With limit=3, the 3rd commit's writer compacts after it. After it, count=1 (just the 4th
+    // commit's record).
     Replica<CatalogState> cat = commitN(log, 4);
     assertThat(cat.intentionRecords()).isEqualTo(1);
   }

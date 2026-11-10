@@ -856,11 +856,21 @@ public class TestCatalogRegressions {
   // a compaction had shrunk the file and the re-read count reached
   // max.append.count), tryCAS wrote a checkpoint of the writer's original
   // snapshot conditioned on the refreshed version: the CAS succeeded and
-  // erased every record committed in between.
+  // erased every record committed in between. The commit replaces the file past
+  // the knobs only with compaction fused with it (fileio.catalog.compact.after.commit
+  // false), so these run so; after the commit, such a replace follows a full file.
   // ============================================================
 
   @Nested
   class AppendRetry {
+
+    /** The catalog at RACE_LOC with these knobs, compacting with the commit. */
+    private CatalogLog fusedLog(InMemoryAtomicFileIO io, int maxAppendCount, long maxAppendSize) {
+      return CatalogTestSupport.log(io, RACE_LOC, Map.of(
+          LogCatalogProperties.MAX_APPEND_COUNT, String.valueOf(maxAppendCount),
+          LogCatalogProperties.MAX_APPEND_SIZE, String.valueOf(maxAppendSize),
+          LogCatalogProperties.COMPACT_AFTER_COMMIT, "false"));
+    }
 
     @Test
     void compactionAfterLostAppendRaceKeepsTheWinner() {
@@ -868,7 +878,7 @@ public class TestCatalogRegressions {
       Replica<CatalogState> snap = seed(log(io, APPEND), "a", "b");
       // A small transaction fits under the size limit; the winner's large one
       // does not, so the loser's retry sees a file that must be compacted.
-      CatalogLog log = CatalogTestSupport.log(io, RACE_LOC, APPEND, snap.tail().bytes() + 1_000);
+      CatalogLog log = fusedLog(io, APPEND, snap.tail().bytes() + 1_000);
       TableIdentifier winner = TableIdentifier.of("a", "t1");
       TableIdentifier loser = TableIdentifier.of("b", "t2");
       String winnerLocation = "mem:///a/t1/" + "x".repeat(4_000) + ".metadata.json";
@@ -889,7 +899,7 @@ public class TestCatalogRegressions {
       // compacted away, so the loser's retry finds a shorter file: it re-reads
       // the record count, which forces a CAS.
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
-      CatalogLog log = log(io, 3);
+      CatalogLog log = fusedLog(io, 3, LogCatalogProperties.DEFAULT_MAX_APPEND_SIZE);
       seed(log, "a", "b");
       new CatalogMutation(log.read())
           .createNamespace(Namespace.of("big"), Map.of("k", "x".repeat(4_000)))
@@ -4080,7 +4090,9 @@ public class TestCatalogRegressions {
     void anAppendThatLosesARaceToTheLimitCompacts() {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       io.limitSegments(5);
-      Map<String, String> atTheLimit = Map.of(LogCatalogProperties.MAX_APPEND_COUNT, "5");
+      // A count just past the cap, so that only the cap makes a commit replace the object: at a
+      // count of 5, B's writer would compact after its commit, before A resends
+      Map<String, String> atTheLimit = Map.of(LogCatalogProperties.MAX_APPEND_COUNT, "6");
       FileIOCatalog a = LocalCatalogMode.APPEND.catalog(io, WAREHOUSE, "c", atTheLimit);
       FileIOCatalog b = LocalCatalogMode.APPEND.catalog(io, WAREHOUSE, "c", atTheLimit);
       for (int i = 0; i < 3; i++) {

@@ -280,10 +280,12 @@ public final class CheckpointRoundTrip {
   /**
    * {@link #difference(byte[])} of the catalog file {@code after}, a write wrote over {@code
    * before}; for a compaction ({@code replace}), also how its checkpoint and a replay of {@code
-   * before} differ.
+   * before} differ. Only a replace's own record, written with its checkpoint, must apply where
+   * it holds: an append's record may follow a compaction after a commit, whose GC record (no
+   * record of its own to stay below) passed the record's id ({@link #compactionRecordRejected}).
    */
   public static String difference(boolean replace, byte[] before, byte[] after) {
-    String difference = difference(after);
+    String difference = difference(after, replace);
     if (difference == null && replace) {
       difference = checkpointIsReplay(before, after);
     }
@@ -324,12 +326,20 @@ public final class CheckpointRoundTrip {
    * everything a suite writes keeps the schema of record in step with the codecs.
    */
   public static String difference(byte[] catalogFile) {
+    return difference(catalogFile, true);
+  }
+
+  /**
+   * As {@link #difference(byte[])}; with {@code replaced} false (the file's last write was an
+   * append), without asking that the first record after the checkpoint apply where it holds.
+   */
+  private static String difference(byte[] catalogFile, boolean replaced) {
     dump(catalogFile);
     String violation = CatalogProto.violation(catalogFile);
     if (violation != null) {
       return "the file does not conform to catalog.proto: " + violation;
     }
-    String rejected = compactionRecordRejected(catalogFile);
+    String rejected = replaced ? compactionRecordRejected(catalogFile) : null;
     if (rejected != null) {
       return rejected;
     }
@@ -411,7 +421,8 @@ public final class CheckpointRoundTrip {
   /**
    * Why replay rejects the first intention record after the checkpoint of {@code catalogFile}
    * (past the compaction's GC and PageOut records) though it holds on the checkpoint, or null if it
-   * does not: the record is at or below the committed set's floor (Bug 64; TLA+ pageown).
+   * does not: the record is at or below the committed set's floor (Bug 64; TLA+ pageown). Asked of
+   * a file a replace wrote, whose own record that is (a compaction after a commit writes none).
    */
   static String compactionRecordRejected(byte[] catalogFile) {
     CatalogState.Builder checkpoint = CatalogTestSupport.decodeCheckpoint(catalogFile);

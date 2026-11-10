@@ -169,7 +169,15 @@ public final class CatalogTestSupport {
       SupportsAtomicOperations io, String location, Map<String, String> properties) {
     Map<String, String> withRaces = new java.util.HashMap<>(properties);
     withRaces.putIfAbsent(LogCatalogProperties.RACE_MIN_WAIT_MS, "0");
-    return log(io, location, LogCatalogProperties.runtimeConfig(withRaces));
+    return log(io, location, atTheLimits(LogCatalogProperties.runtimeConfig(withRaces)));
+  }
+
+  /**
+   * {@code config}, its writer compacting after a commit at the limits themselves, not at a point
+   * past them it draws: so that tests repeat.
+   */
+  public static RuntimeConfig atTheLimits(RuntimeConfig config) {
+    return config.withCompaction(config.compaction().withDraws(() -> 0.0));
   }
 
   /** The catalog in the object at {@code location} of {@code io}, with these commit knobs. */
@@ -191,8 +199,8 @@ public final class CatalogTestSupport {
   public static CatalogLog log(
       SupportsAtomicOperations io, String location, int maxAppendCount, long maxAppendSize,
       long committedRetentionMs, long throttleMinWaitMs) {
-    return log(io, location, LogCatalogProperties.runtimeConfig(
-        maxAppendCount, maxAppendSize, committedRetentionMs, throttleMinWaitMs, 0L));
+    return log(io, location, atTheLimits(LogCatalogProperties.runtimeConfig(
+        maxAppendCount, maxAppendSize, committedRetentionMs, throttleMinWaitMs, 0L)));
   }
 
   /** The catalog in the object at {@code location} of {@code io}, committing by {@code config}. */

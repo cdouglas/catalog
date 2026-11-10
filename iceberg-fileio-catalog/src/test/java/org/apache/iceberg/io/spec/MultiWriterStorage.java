@@ -29,6 +29,7 @@ import java.util.Map;
 import java.util.Set;
 import org.apache.iceberg.io.AtomicOutputFile;
 import org.apache.iceberg.io.CatalogLog;
+import org.apache.iceberg.io.CatalogTestSupport;
 import org.apache.iceberg.io.CheckpointRoundTrip;
 import org.apache.iceberg.io.InMemoryAtomicFileIO;
 import org.intentlog.LogFullException;
@@ -92,12 +93,15 @@ abstract class MultiWriterStorage {
 
     /** A compaction of the log: a replace, whose checkpoint must be a replay of before. */
     boolean replace() {
-      return kind.equals("CAS");
+      return kind.equals("CAS") || kind.equals("COMPACT");
     }
 
-    /** A compactor's GC record, which no commit wrote. */
+    /**
+     * A write of the log's upkeep, which no commit wrote: a compactor's GC record (a shared log),
+     * or a compaction after a commit landed (one object: a replace with no intention record).
+     */
     boolean gc() {
-      return kind.equals("GC");
+      return kind.equals("GC") || kind.equals("COMPACT");
     }
   }
 
@@ -240,7 +244,11 @@ abstract class MultiWriterStorage {
       List<InMemoryAtomicFileIO.Write> history = io.history();
       List<Write> writes = new ArrayList<>();
       for (InMemoryAtomicFileIO.Write w : history.subList(from, history.size())) {
-        writes.add(new Write(w.strategy().name(), w.before(), w.after(), null));
+        // A replace that holds no intention record is a compaction after a commit landed
+        boolean compaction = w.strategy() == AtomicOutputFile.Strategy.CAS && w.before() != null
+            && CatalogTestSupport.decodeRecords(w.after()).isEmpty();
+        writes.add(new Write(compaction ? "COMPACT" : w.strategy().name(), w.before(), w.after(),
+            null));
       }
       return writes;
     }

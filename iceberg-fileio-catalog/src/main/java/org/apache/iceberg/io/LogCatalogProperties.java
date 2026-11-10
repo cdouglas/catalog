@@ -29,16 +29,21 @@ public final class LogCatalogProperties {
   private LogCatalogProperties() {}
 
   /**
-   * Maximum number of transaction records in the log portion before a new commit
-   * must CAS (compact) instead of append. Default: 100, the best of 0, 100 and 1000 in the
-   * contention benchmark on S3 Express (docs/design.md, "Choosing append vs CAS"): a reader
-   * replays every record after the checkpoint, and a compaction races the others' appends. Set to
-   * 0 to force CAS on every commit (for storage providers that don't support conditional append).
+   * Number of transaction records after the catalog's checkpoint past which the catalog is
+   * compacted: by the writer of a commit that landed past it, at a point it draws ({@link
+   * #COMPACT_AFTER_COMMIT}), or by the next commit, which then replaces the catalog instead of
+   * appending. Default: 1,000 (docs/TAIL_READS.md, "Compaction after the commit"; provisional,
+   * errata D14). It was 100 until 2026-11-10, the best of 0, 100 and 1000 in the contention
+   * benchmark on S3 Express before tail reads (docs/design.md, "Choosing append vs CAS"), when
+   * every read replayed every record after the checkpoint; a reader that folds only the records
+   * after its replica pays for them once. Set to 0 to force CAS on every commit (for storage
+   * providers that don't support conditional append).
    *
-   * <p>Provider hard limits: S3 Express ~10000, Azure AppendBlob 50000.
+   * <p>Provider hard limits: S3 Express ~10000, Azure AppendBlob 50000. An append the store
+   * refuses past them makes the commit replace the catalog.
    */
   public static final String MAX_APPEND_COUNT = "fileio.catalog.max.append.count";
-  public static final int DEFAULT_MAX_APPEND_COUNT = 100;
+  public static final int DEFAULT_MAX_APPEND_COUNT = 1000;
 
   /**
    * Maximum size in bytes of the records after the catalog's checkpoint (or, with {@link
@@ -76,6 +81,20 @@ public final class LogCatalogProperties {
    */
   public static final String READ_TAIL = "fileio.catalog.read.tail";
   public static final boolean DEFAULT_READ_TAIL = true;
+
+  /**
+   * Whether a catalog in one object is compacted after a commit: past {@link #MAX_APPEND_COUNT} or
+   * {@link #MAX_APPEND_SIZE} a commit still appends, and once its record has landed its writer may
+   * replace the catalog with a checkpoint of the version it landed in, at a point past the limits
+   * it draws, so that writers seldom compact at once; a compaction that loses its race to an
+   * append is dropped, and the commit stands. {@code false} has the commit past the limits replace
+   * the catalog with a checkpoint and its record instead of appending, as before (for ablation).
+   * Either way a commit replaces the catalog when the store refuses an append (its cap on writes
+   * to one object) or has none. Default: {@code true} (docs/TAIL_READS.md, "Compaction after the
+   * commit").
+   */
+  public static final String COMPACT_AFTER_COMMIT = "fileio.catalog.compact.after.commit";
+  public static final boolean DEFAULT_COMPACT_AFTER_COMMIT = true;
   public static final boolean DEFAULT_CHECKPOINT_MEMOIZE = true;
 
   /** Whether {@code properties} ask a catalog to memoize its checkpoints' table encodings. */
@@ -241,8 +260,9 @@ public final class LogCatalogProperties {
         longProperty(properties, THROTTLE_MIN_WAIT_MS, DEFAULT_THROTTLE_MIN_WAIT_MS),
         longProperty(properties, RACE_MIN_WAIT_MS, DEFAULT_RACE_MIN_WAIT_MS))
         .withPaging(admissionMs, threshold)
-        .withTailReads(properties == null || properties.get(READ_TAIL) == null
-            ? DEFAULT_READ_TAIL : Boolean.parseBoolean(properties.get(READ_TAIL)));
+        .withTailReads(booleanProperty(properties, READ_TAIL, DEFAULT_READ_TAIL))
+        .withCompactionAfterCommit(
+            booleanProperty(properties, COMPACT_AFTER_COMMIT, DEFAULT_COMPACT_AFTER_COMMIT));
   }
 
   /**
@@ -285,6 +305,17 @@ public final class LogCatalogProperties {
   private static int intProperty(Map<String, String> properties, String key, int dflt) {
     String val = properties == null ? null : properties.get(key);
     return val != null ? Integer.parseInt(val) : dflt;
+  }
+
+  private static boolean booleanProperty(
+      Map<String, String> properties, String key, boolean dflt) {
+    String val = properties == null ? null : properties.get(key);
+    if (val == null) {
+      return dflt;
+    }
+    Preconditions.checkArgument(val.equals("true") || val.equals("false"),
+        "%s must be true or false, got %s", key, val);
+    return Boolean.parseBoolean(val);
   }
 
   private static long longProperty(Map<String, String> properties, String key, long dflt) {

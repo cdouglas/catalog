@@ -322,6 +322,12 @@ public final class CommitProtocol {
      * random never sees alone.
      */
     final boolean tailReads;
+    /**
+     * Whether a log that replaces itself is compacted after a commit ({@link
+     * RuntimeConfig#compactAfterCommit}), at points drawn from the seed, or by the commit past the
+     * limits: drawn from the seed's next bit.
+     */
+    final boolean compactAfter;
 
     /** {@code admissionMs} is the admission window of a run that pages; -1 if it does not. */
     public Settings(int writers, boolean faults, long retentionMs, long compactorAheadMs,
@@ -339,22 +345,27 @@ public final class CommitProtocol {
       this.prefill = prefill;
       this.seed = seed;
       this.tailReads = seed >= 0;
+      this.compactAfter = (seed & (1L << 62)) == 0;
     }
 
     /** A runtime's configuration in this run, at {@code retentionMs}, on {@code clock}. */
     RuntimeConfig config(long retention, LongSupplier clock) {
+      Random draws = new Random(seed ^ 0x2545F4914F6CDD1DL);
       RuntimeConfig config =
-          new RuntimeConfig(4, 3, 0L, 0L, retention, policy, Duration.ZERO, clock)
-              .withTailReads(tailReads);
+          new RuntimeConfig(4, 3, 0L, 0L, retention, policy.withDraws(draws::nextDouble),
+              Duration.ZERO, clock)
+              .withTailReads(tailReads)
+              .withCompactionAfterCommit(compactAfter);
       return paging ? config.withPaging(admissionMs, 0L) : config;
     }
 
     @Override
     public String toString() {
       return String.format(
-          "writers=%d faults=%s retention=%s compactor ahead %d ms, compact %s%s, %s%s",
+          "writers=%d faults=%s retention=%s compactor ahead %d ms, compact %s %s%s, %s%s",
           writers, faults, retentionMs == NO_GC ? "none" : retentionMs + " ms", compactorAheadMs,
-          policyName, paging ? ", paging (A = " + admissionMs + " ms, T = 0)" : "",
+          policyName, compactAfter ? "after commits" : "with them",
+          paging ? ", paging (A = " + admissionMs + " ms, T = 0)" : "",
           tailReads ? "tail reads" : "whole reads",
           prefill > 0 ? ", prefilled with " + prefill + " records (seed " + seed + ")" : "");
     }
@@ -879,8 +890,15 @@ public final class CommitProtocol {
       Statistics.label("stamps").collect(region + " " + outcome
           + (outcome == Outcome.REJECTED ? reason : ""));
 
-      List<String> applied = runtime.read().state().history();
+      Replica<State> live = runtime.read();
+      List<String> applied = live.state().history();
       long times = applied.stream().filter(txn.tag()::equals).count();
+      if (settings.compactAfter && outcome == Outcome.COMMITTED
+          && harness.log().capabilities().fusedReplace()) {
+        // a log with no records after its checkpoint: a compaction after the commit landed
+        Statistics.label("compaction after a commit")
+            .collect(live.intentionRecords() == 0 ? "landed" : "none, or lost its race");
+      }
       switch (outcome) {
         case COMMITTED:
           check(times == 1, "%s was reported committed and applied %d times", txn.tag(), times);

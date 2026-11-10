@@ -170,7 +170,7 @@ fork's exceptions map onto the log's ([LOG.md](LOG.md) §"Failures"):
 ## Commits on one object
 
 The commit loop ([LOG.md](LOG.md) §"The commit loop") appends a record when
-it can, and replaces the object when it must:
+it can, and replaces the object with its record when no append can carry it:
 
 - the FileIO cannot append (`supportsAppend()` is false: `GCSFileIO`);
 - an append was refused as full (`SegmentLimitException`): the object holds as
@@ -178,19 +178,30 @@ it can, and replaces the object when it must:
 - the record is larger than one append to the store writes
   (`maxAppendBytes`, less the record's length prefix; ADLS's `AppendBlock`
   limit), whatever the thresholds say (Bug 71);
-- or the compaction policy says the object is due: the read it staged on holds
-  at least `max.append.count` intention records, or its record would take the
-  records after the checkpoint past `max.append.size` bytes (the whole object,
-  with `max.append.size.basis` `object`).
+- or the compaction policy is due even on an object with no records after its
+  checkpoint (`max.append.count` 0, CAS only); with
+  `fileio.catalog.compact.after.commit` false (fused, for ablation), whenever it
+  says the object is due: the read it staged on holds at least
+  `max.append.count` intention records, or its record would take the records
+  after the checkpoint past `max.append.size` bytes (the whole object, with
+  `max.append.size.basis` `object`).
 
-A replace is a compaction. It writes
-`[header][checkpoint][gc][page-outs][record]`: the checkpoint of the state the
-writer read (after a lost race, one it read again), a GC record at its
-watermark (none when GC is off), the PageOuts that seal the committed set's
-oldest blocks (none until the set outgrows the page threshold), and its own
-record, which replay verifies against the checkpoint and applies as it would
-an append ([LOG.md](LOG.md) §"The committed set and GC"). Afterwards the
-object holds one intention record.
+Such a replace writes `[header][checkpoint][gc][page-outs][record]`: the
+checkpoint of the state the writer read (after a lost race, one it read
+again), a GC record at its watermark (none when GC is off), the PageOuts that
+seal the committed set's oldest blocks (none until the set outgrows the page
+threshold), and its own record, which replay verifies against the checkpoint
+and applies as it would an append ([LOG.md](LOG.md) §"The committed set and
+GC"). Afterwards the object holds one intention record.
+
+Otherwise a writer compacts after its commit (the default): once its record
+has landed in an object past the policy's limits, at a point past them it
+draws, it replaces the version its record landed in with
+`[header][checkpoint][gc][page-outs]`, a checkpoint of that version and no
+record, conditioned on that version; one that loses its race to an append is
+dropped, and the commit stands ([LOG.md](LOG.md) §"Compaction",
+[TAIL_READS.md](TAIL_READS.md) "Compaction after the commit"). Afterwards the
+object holds no intention record.
 
 **Pages.** The committed set's pages are objects beside the catalog's, at
 `<catalog location>.committed/<level>-<index>-<digest hex>`
@@ -205,7 +216,8 @@ whether a commit whose id the floor has passed applied.
 
 | Property | Default | Purpose |
 |---|---|---|
-| `fileio.catalog.max.append.count` | 100 | Soft limit on intention records (GC records not counted): a writer that reads at least this many replaces instead of appending. Writers retrying a lost append race do not read the count again, so the log can run a few records past it. The stores bound it (S3 Express 10,000 parts, Azure Append Blob 50,000 blocks): an append past one is refused, and the writer compacts instead, so a count above the store's limit costs a refused append, not a stuck catalog. Measured best of 0, 100 and 1000 on S3 Express (design.md §"Choosing append vs CAS"). **0 replaces on every commit**, which an S3 general-purpose bucket needs |
+| `fileio.catalog.max.append.count` | 1000 | Soft limit on intention records (GC records not counted): past it, a writer whose commit landed compacts after it, at a point it draws (fused: a writer that reads at least this many replaces instead of appending). The log can run past it: compactions lose races to appends. The stores bound it (S3 Express 10,000 parts, Azure Append Blob 50,000 blocks): an append past one is refused, and the writer replaces the object with its record instead, so a count above the store's limit costs a refused append, not a stuck catalog. It was 100 until 2026-11-10, the best of 0, 100 and 1000 on S3 Express before tail reads (design.md §"Choosing append vs CAS"); 1,000 is provisional (errata D14). **0 replaces on every commit**, which an S3 general-purpose bucket needs |
+| `fileio.catalog.compact.after.commit` | `true` | Whether a writer compacts after its commit (`true`) or the commit past the limits replaces the object with its record (`false`, for ablation) |
 | `fileio.catalog.max.append.size` | 16777216 | Soft target for the records after the checkpoint (a reader replays them, a compaction rewrites them) |
 | `fileio.catalog.max.append.size.basis` | `tail` | What `max.append.size` bounds: `tail`, the records after the checkpoint, or `object`, the whole object (before errata D19's stopgap; for ablation) |
 | `fileio.catalog.checkpoint.memoize` | `true` | Whether a checkpoint writes an inline table unchanged since a decode or an earlier encode as the bytes it had (docs/CHECKPOINT_PLAN.md R0.2); `false` encodes every table (for ablation) |
@@ -224,14 +236,13 @@ Express directory buckets accept. A replace that loses a race rebases on a
 fresh read, so concurrent commits whose preconditions do not overlap all
 succeed, as they would by append.
 
-**Races.** No hint in the object says when to compact: either writer in a
-race decides from the length of the live object and the record count of the
-version it last read. After a lost append race the loop probes the object's
-length without reading it. If the object grew (another append), it resends
-the same record at the new length, and its record count is a lower bound,
-which is fine for a soft limit. If it shrank (a replace), it reads the new
-version. Writers configured with different thresholds disagree on when to
-compact, but cannot corrupt the catalog: every write is conditional (P4).
+**Races.** No hint in the object says when to compact: each writer decides
+from the record count of the version its commit landed in (fused: the version
+it last read). After a lost append race the loop reads what followed its
+replica (tail reads; with them off, it probes the object's length, and if the
+object grew it resends at the new length, its count a lower bound). Writers
+configured with different thresholds disagree on when to compact, but cannot
+corrupt the catalog: every write is conditional (P4).
 
 **Creating the object.** `FileIOCatalog.initialize` calls
 `CatalogLog.bootstrap`, which commits an intention setting the catalog's

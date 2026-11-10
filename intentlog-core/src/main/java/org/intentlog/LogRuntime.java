@@ -94,6 +94,13 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
         }
       }));
 
+  // Compaction after a commit, on a log that replaces itself: the policy's progress at which this
+  // runtime's writer compacts next (NaN: not drawn yet), the progress it saw last, and how many of
+  // its compactions in a row lost their race since the log was last compacted. Guarded by `this`.
+  private double compactAt = Double.NaN;
+  private double progressSeen = 0.0;
+  private int compactionsLost = 0;
+
   public LogRuntime(SharedLog log, StateMachine<S, B, I> machine, RuntimeConfig config) {
     this.log = log;
     this.machine = machine;
@@ -679,7 +686,9 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
 
   /**
    * Commits {@code intention}, built from {@code base}, and returns the replica of the log its
-   * record landed in.
+   * record landed in. Then, as the policy says of that replica, its writer may compact the log
+   * ({@link #compact} on a log that keeps its checkpoints apart, {@code compactAfter} on one that
+   * replaces itself); the commit stands whatever becomes of that.
    *
    * @throws CommitRejectedException if it did not take effect, and never will
    * @throws CommitOutcomeUnknownException if it may or may not have
@@ -698,8 +707,103 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
       } catch (RuntimeException e) {
         LOG.log(System.Logger.Level.WARNING, "Compaction after a commit failed: " + log, e);
       }
+    } else if (caps.fusedReplace() && caps.append() && config.compactAfterCommit()) {
+      compactAfter(landed);
     }
     return landed;
+  }
+
+  /**
+   * Compacts a log that replaces itself (one object) after a commit landed in it, as {@code
+   * landed}: if the policy says the log is due, and its progress past the limits has reached the
+   * point this writer drew ({@link #drawn}), replaces the version the commit landed in with a
+   * checkpoint of it, a GC record at the clock less the retention and the PageOuts the policy calls
+   * for, and no record. Conditioned on that version, the replace lands only if no write landed
+   * since, and then holds the state the log held (I11); one that loses its race, fails or stays
+   * throttled is dropped, with what it wrote if it landed after all, since a replace that lands
+   * late lands on the same version. Whatever becomes of it, the commit stands. After it lands, it
+   * deletes the pages its GC record dropped and sweeps. Docs: LOG.md "Compaction".
+   */
+  private void compactAfter(Replica<S> landed) {
+    CompactionPolicy policy = config.compaction();
+    CompactionPolicy.Input input;
+    try {
+      input = new CompactionPolicy.Input(landed.intentionRecords(), landed.checkpointBytes(),
+          landed.tail().bytes(), 0);
+    } catch (RuntimeException e) {
+      return; // the log's size is unknown: the next commit decides
+    }
+    double progress = policy.progress(input);
+    if (!policy.due(input) || replacesEveryCommit(policy, landed) || !drawn(progress, policy)) {
+      return;
+    }
+    CommitTrace.event(CommitTrace.Kind.COMPACT, landed.intentionRecords(), input.logBytes());
+    boolean lands = false;
+    try {
+      Prepared replace = prepare(landed, null, Long.MAX_VALUE);
+      CommitTrace.event(CommitTrace.Kind.PREPARED, replace.checkpoint.length, 0);
+      CommitTrace.event(CommitTrace.Kind.SEND, 2, 0);
+      sendThrottled(() -> log.replace(landed.tail(), replace.checkpoint, replace.records));
+      CommitTrace.event(CommitTrace.Kind.LANDED);
+      lands = true;
+      // The set the replace landed in: the GC record and PageOuts it wrote, after the checkpoint
+      Replay.Result<B> after = Replay.replayOnto(machine, machine.toBuilder(landed.state()),
+          landed.committed().toBuilder(), landed.logId(), 0, replace.records, null);
+      tidyPages(replace.dropped, replace.sealed, after.committed().build());
+      @SuppressWarnings("unchecked")
+      S checkpointed = (S) replace.state;
+      deleteDroppedStatePages(checkpointed);
+    } catch (LogConflictException e) {
+      CommitTrace.event(CommitTrace.Kind.LOST, 0, 0);
+    } catch (CommitOutcomeUnknownException e) {
+      // interrupted in a backoff: the commit stands, and the interrupt is kept
+      CommitTrace.event(CommitTrace.Kind.AMBIGUOUS);
+    } catch (RuntimeException e) {
+      CommitTrace.event(CommitTrace.Kind.AMBIGUOUS);
+      LOG.log(System.Logger.Level.WARNING, "Compaction after a commit failed: " + log, e);
+    } finally {
+      tried(progress, lands, policy);
+    }
+  }
+
+  /**
+   * Whether {@code policy} has every commit to the log at {@code replica} replace it: it is due on
+   * the log with no records after its checkpoint and one more of a byte (CAS only, or a size limit
+   * of 0). Such a commit wrote a checkpoint, and needs no compaction after it.
+   */
+  private static boolean replacesEveryCommit(CompactionPolicy policy, Replica<?> replica) {
+    return policy.due(new CompactionPolicy.Input(
+        0, replica.checkpointBytes(), replica.checkpointBytes(), 1));
+  }
+
+  /**
+   * Whether this runtime's writer compacts a log at {@code progress} toward compaction (1 or more:
+   * due): once it reaches a point this writer drew, in [1, 2) after the log was last compacted
+   * (a progress below the last one seen says it was), and after each compaction it tried, as
+   * {@link #tried} moved it. Writers draw apart, so that past the limits they seldom compact at
+   * once.
+   */
+  private synchronized boolean drawn(double progress, CompactionPolicy policy) {
+    if (Double.isNaN(compactAt) || progress < progressSeen) {
+      compactAt = 1.0 + policy.draw();
+      compactionsLost = 0;
+    }
+    progressSeen = progress;
+    return progress >= compactAt;
+  }
+
+  /**
+   * After this runtime's writer tried a compaction at {@code progress}: its next point is the
+   * progress then plus a draw in [0, 1), doubled for each compaction in a row that did not land
+   * (up to 2^10). A compaction lands only if no append lands while it is encoded and sent; one that
+   * loses says the log is busier than that, and its writer waits for the log to grow by twice as
+   * much before it tries again, so that writers past the limits of a log they keep busy try ever
+   * more seldom (and a store's cap on writes to one object makes the commit that meets it replace
+   * the log with its record).
+   */
+  private synchronized void tried(double progress, boolean landed, CompactionPolicy policy) {
+    compactionsLost = landed ? 0 : compactionsLost + 1;
+    compactAt = progress + policy.draw() * (1 << Math.min(compactionsLost, 10));
   }
 
   private static final System.Logger LOG = System.getLogger(LogRuntime.class.getName());
@@ -902,6 +1006,44 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     }
   }
 
+  /**
+   * What a replace of the log at {@code on} writes: the checkpoint of {@code on}, then a GC record,
+   * the PageOuts, and {@code record}, a commit's (none for a compaction after a commit). GC of the
+   * committed set is a record, never a filter on the checkpoint, so every checkpoint is a replay of
+   * the log before it (I11). The watermark is now less the retention, clamped to 0 (a retention of
+   * {@code Long.MAX_VALUE} disables GC, and no record is written), and at most {@code ownMs}, below
+   * the commit's own time: the horizon must not reach the record that follows, or replay rejects it
+   * (Bug 64). A short retention would otherwise drop the id of a commit this one rebased on, minted
+   * after it. The PageOuts seal the oldest blocks of the set after that GC, as the policy says
+   * ({@link #page}), with tops at most {@code ownMs} too, so the floor stays below the record; their
+   * pages are put here. A compaction, with no record after it, passes {@code Long.MAX_VALUE}.
+   */
+  private Prepared prepare(Replica<S> on, byte[] record, long ownMs) {
+    long now = config.clockMs().getAsLong();
+    long watermark = watermark(now, ownMs);
+    List<byte[]> records = new ArrayList<>(3);
+    CommittedSet set = on.committed();
+    if (watermark > 0L) {
+      records.add(LogEnvelope.encodeAdvanceHorizon(watermark));
+    }
+    List<PageRef> dropped = List.of();
+    List<CommittedSet.Seal> seals = List.of();
+    if (log.pages() != null) {
+      if (watermark > 0L) {
+        set = set.toBuilder().advanceHorizon(watermark).build();
+      }
+      dropped = dropped(on.committed().pages(), set);
+      seals = page(set, pageCeiling(now, ownMs), on.logId());
+      for (CommittedSet.Seal seal : seals) {
+        records.add(LogEnvelope.encodePageOut(seal.record()));
+      }
+    }
+    if (record != null) {
+      records.add(record);
+    }
+    return new Prepared(checkpoint(on), records, dropped, !seals.isEmpty(), on.state());
+  }
+
   private final class Commit {
     private final Replica<S> base;
     private final I intention;
@@ -1030,15 +1172,20 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
         try {
           // Replace (compact) or append, by what the log can do and what the policy says of its
           // observable state. A log without append replaces on every commit, and a record larger
-          // than an append stores goes in a replace.
+          // than an append stores goes in a replace. Past the policy's limits a commit replaces
+          // only if compaction is fused with it; else it appends, and its writer may compact the
+          // log after (compactAfter), unless the policy is due even on a log with no records (CAS
+          // only, or a record larger than the size limit).
           boolean mustReplace =
               caps.fusedReplace()
                   && (full
                       || oversized
                       || !caps.append()
-                      || config.compaction().due(new CompactionPolicy.Input(
-                          current.intentionRecords(), current.checkpointBytes(), bytes(tail),
-                          record.length)));
+                      || config.compaction().due(config.compactAfterCommit()
+                          ? new CompactionPolicy.Input(0, current.checkpointBytes(),
+                              current.checkpointBytes(), record.length)
+                          : new CompactionPolicy.Input(current.intentionRecords(),
+                              current.checkpointBytes(), bytes(tail), record.length)));
           CommitTrace.event(CommitTrace.Kind.ATTEMPT, attempt, mustReplace ? 1 : 0);
 
           if (mustReplace) {
@@ -1270,40 +1417,9 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
       adopt(fresh);
     }
 
-    /**
-     * What a replace of the log at {@code on} writes: the checkpoint of {@code on}, then a GC
-     * record, the PageOuts, and this commit's record. GC of the committed set is a record, never a
-     * filter on the checkpoint, so every checkpoint is a replay of the log before it (I11). The
-     * watermark is now less the retention, clamped to 0 (a retention of {@code Long.MAX_VALUE}
-     * disables GC, and no record is written), and stays below this commit's own time: the horizon
-     * must not reach the record that follows, or replay rejects it (Bug 64). A short retention would
-     * otherwise drop the id of a commit this one rebased on, minted after it. The PageOuts seal the
-     * oldest blocks of the set after that GC, as the policy says ({@link #page}), with tops below
-     * this commit's own time too, so the floor stays below its record; their pages are put here.
-     */
+    /** What a replace of the log at {@code on} with this commit's record writes ({@link #prepare}). */
     private Prepared prepare(Replica<S> on) {
-      long now = config.clockMs().getAsLong();
-      long own = UuidV7.timestampMs(id) - 1;
-      long watermark = watermark(now, own);
-      List<byte[]> records = new ArrayList<>(3);
-      CommittedSet set = on.committed();
-      if (watermark > 0L) {
-        records.add(LogEnvelope.encodeAdvanceHorizon(watermark));
-      }
-      List<PageRef> dropped = List.of();
-      List<CommittedSet.Seal> seals = List.of();
-      if (log.pages() != null) {
-        if (watermark > 0L) {
-          set = set.toBuilder().advanceHorizon(watermark).build();
-        }
-        dropped = dropped(on.committed().pages(), set);
-        seals = page(set, pageCeiling(now, own), on.logId());
-        for (CommittedSet.Seal seal : seals) {
-          records.add(LogEnvelope.encodePageOut(seal.record()));
-        }
-      }
-      records.add(record);
-      return new Prepared(checkpoint(on), records, dropped, !seals.isEmpty(), on.state());
+      return LogRuntime.this.prepare(on, record, UuidV7.timestampMs(id) - 1);
     }
 
     /**

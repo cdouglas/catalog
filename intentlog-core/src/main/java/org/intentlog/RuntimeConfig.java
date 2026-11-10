@@ -45,6 +45,9 @@ import java.util.function.LongSupplier;
  * @param pageThresholdBytes the threshold T: a compaction pages the oldest blocks while the inline
  *     set is larger ({@code Long.MAX_VALUE}: never page). A log without a {@link PageStore} never
  *     pages
+ * @param tailReads whether reads after a replica read only what follows it ({@link #withTailReads})
+ * @param compactAfterCommit whether a log that replaces itself is compacted after a commit
+ *     ({@link #withCompactionAfterCommit})
  */
 public record RuntimeConfig(
     int maxAttempts,
@@ -57,7 +60,8 @@ public record RuntimeConfig(
     LongSupplier clockMs,
     long admissionWindowMs,
     long pageThresholdBytes,
-    boolean tailReads) {
+    boolean tailReads,
+    boolean compactAfterCommit) {
 
   public static final int DEFAULT_MAX_ATTEMPTS = 10;
   public static final int DEFAULT_MAX_THROTTLE_ATTEMPTS = 8;
@@ -89,26 +93,30 @@ public record RuntimeConfig(
         DEFAULT_PAGE_THRESHOLD_BYTES);
   }
 
-  /** The configuration with tail reads ({@link #tailReads}, the default). */
+  /**
+   * The configuration with tail reads ({@link #tailReads}) and compaction after the commit ({@link
+   * #compactAfterCommit}), the defaults.
+   */
   public RuntimeConfig(
       int maxAttempts, int maxThrottleAttempts, long throttleMinWaitMs, long raceMinWaitMs,
       long committedRetentionMs, CompactionPolicy compaction, Duration visibilityWait,
       LongSupplier clockMs, long admissionWindowMs, long pageThresholdBytes) {
     this(maxAttempts, maxThrottleAttempts, throttleMinWaitMs, raceMinWaitMs, committedRetentionMs,
-        compaction, visibilityWait, clockMs, admissionWindowMs, pageThresholdBytes, true);
+        compaction, visibilityWait, clockMs, admissionWindowMs, pageThresholdBytes, true, true);
   }
 
   /** This configuration, paging at admission window {@code admissionMs} and threshold {@code bytes}. */
   public RuntimeConfig withPaging(long admissionMs, long bytes) {
     return new RuntimeConfig(maxAttempts, maxThrottleAttempts, throttleMinWaitMs, raceMinWaitMs,
-        committedRetentionMs, compaction, visibilityWait, clockMs, admissionMs, bytes, tailReads);
+        committedRetentionMs, compaction, visibilityWait, clockMs, admissionMs, bytes, tailReads,
+        compactAfterCommit);
   }
 
   /** This configuration, on clock {@code clock}. */
   public RuntimeConfig withClock(LongSupplier clock) {
     return new RuntimeConfig(maxAttempts, maxThrottleAttempts, throttleMinWaitMs, raceMinWaitMs,
         committedRetentionMs, compaction, visibilityWait, clock, admissionWindowMs,
-        pageThresholdBytes, tailReads);
+        pageThresholdBytes, tailReads, compactAfterCommit);
   }
 
   /**
@@ -120,7 +128,32 @@ public record RuntimeConfig(
   public RuntimeConfig withTailReads(boolean tail) {
     return new RuntimeConfig(maxAttempts, maxThrottleAttempts, throttleMinWaitMs, raceMinWaitMs,
         committedRetentionMs, compaction, visibilityWait, clockMs, admissionWindowMs,
-        pageThresholdBytes, tail);
+        pageThresholdBytes, tail, compactAfterCommit);
+  }
+
+  /** This configuration, compacting by {@code policy}. */
+  public RuntimeConfig withCompaction(CompactionPolicy policy) {
+    return new RuntimeConfig(maxAttempts, maxThrottleAttempts, throttleMinWaitMs, raceMinWaitMs,
+        committedRetentionMs, policy, visibilityWait, clockMs, admissionWindowMs,
+        pageThresholdBytes, tailReads, compactAfterCommit);
+  }
+
+  /**
+   * This configuration, compacting a log that replaces itself (one object) after a commit ({@code
+   * true}) or with it ({@code false}, as before: for ablation). After: past the {@link #compaction}
+   * policy's limits a commit still appends, and once its record has landed its writer may compact
+   * the log it landed in, with a replace of that version that holds no record of its own; the
+   * commit stands whatever becomes of it. Each writer compacts at a point past the limits it draws
+   * (CompactionPolicy#progress), not at the limits, so writers seldom compact at once. With: past
+   * the limits the commit replaces the log with a checkpoint and its record. Either way a commit
+   * replaces when no append can carry it (the store refused one, it has none, the policy is due on
+   * a log with no records, or the record is larger than one append stores). Docs: LOG.md
+   * "Compaction".
+   */
+  public RuntimeConfig withCompactionAfterCommit(boolean after) {
+    return new RuntimeConfig(maxAttempts, maxThrottleAttempts, throttleMinWaitMs, raceMinWaitMs,
+        committedRetentionMs, compaction, visibilityWait, clockMs, admissionWindowMs,
+        pageThresholdBytes, tailReads, after);
   }
 
   /** The defaults, with the given compaction policy, retention, and throttle and race backoffs. */

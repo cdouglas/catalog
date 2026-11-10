@@ -57,6 +57,18 @@ class TestLogRuntime {
     return new LogRuntime<>(log, ToyMachine.INSTANCE, config(maxRecords, retentionMs));
   }
 
+  /**
+   * The runtime compacting at {@code maxRecords}: after a commit at the points {@code draws} give
+   * (the last repeated), or fused with the commit.
+   */
+  private void compactingAt(int maxRecords, boolean after, double... draws) {
+    int[] next = {0};
+    CompactionPolicy policy = CompactionPolicy.limits(maxRecords, 1 << 20)
+        .withDraws(() -> draws[Math.min(next[0]++, draws.length - 1)]);
+    runtime = new LogRuntime<>(log, ToyMachine.INSTANCE,
+        config(maxRecords, NO_GC).withCompaction(policy).withCompactionAfterCommit(after));
+  }
+
   /** The runtime reading the log whole, and probing after a lost append race (tail reads off). */
   private void readWhole() {
     runtime = new LogRuntime<>(log, ToyMachine.INSTANCE, config(10, NO_GC).withTailReads(false));
@@ -540,5 +552,98 @@ class TestLogRuntime {
     assertThat(r.committed().horizon()).isPositive();
     UUID own = r.committed().ids().iterator().next();
     assertThat(r.committed().horizon()).isLessThan(UuidV7.timestampMs(own));
+  }
+
+  @Test
+  void pastTheLimitsACommitAppendsAndItsWriterCompacts() { // [Committed, Compact]
+    compactingAt(2, true, 0.0);
+    Replica<Map<String, Integer>> base = created();
+    log.calls.clear();
+    Replica<Map<String, Integer>> r = bump(base, "a");
+    // the replica the commit landed in, which the compaction replaced with a checkpoint of it
+    assertThat(r.intentionRecords()).isEqualTo(2);
+    assertThat(log.calls).containsExactly("append", "readThrough", "replace");
+    Replica<Map<String, Integer>> live = runtime.read();
+    assertThat(live.state()).isEqualTo(r.state());
+    assertThat(live.intentionRecords()).isZero();
+    assertThat(live.committed().ids()).isEqualTo(r.committed().ids());
+  }
+
+  @Test
+  void aCompactionThatLosesItsRaceIsDroppedAndTheCommitStands() { // [Compact, lost]
+    compactingAt(2, true, 0.0);
+    Replica<Map<String, Integer>> base = created();
+    log.afterNextWrite(() -> otherWriterBumps("other")); // lands before the compaction
+    log.calls.clear();
+    Replica<Map<String, Integer>> r = bump(base, "a");
+    assertThat(r.state()).containsEntry("a", 1);
+    assertThat(log.calls).containsSubsequence("append", "readThrough", "replace");
+    Replica<Map<String, Integer>> live = runtime.read();
+    assertThat(live.state()).containsEntry("a", 1).containsEntry("other", 1);
+    assertThat(live.intentionRecords()).isEqualTo(3); // not compacted
+  }
+
+  @Test
+  void aWriterCompactsAtThePointItDrawsAndAfterALossWaitsTwiceAsLong() { // [CompactDue]
+    compactingAt(4, true, 0.0, 0.75, 0.25);
+    Replica<Map<String, Integer>> r = bump(bump(created(), "a"), "b"); // 3 records: not due
+    assertThat(log.calls.stream().filter("replace"::equals).count()).isEqualTo(1); // the create
+    log.afterNextWrite(() -> otherWriterBumps("other"));
+    r = bump(r, "c"); // 4 records: its first point, 1.0; its compaction loses to the other's
+    assertThat(runtime.read().intentionRecords()).isEqualTo(5);
+    log.calls.clear();
+    for (String key : List.of("d", "e", "f", "g")) { // up to 9 records, 2.25
+      r = bump(r, key);
+    }
+    // short of its next point: 1.0 + 0.75, doubled for the loss
+    assertThat(log.calls).doesNotContain("replace");
+    r = bump(r, "h"); // 10 records, 2.5: at it
+    assertThat(log.calls).containsSubsequence("append", "readThrough", "replace");
+    assertThat(runtime.read().intentionRecords()).isZero();
+    // compacted since: the point is drawn afresh at the next due commit, 1.0 + 0.25
+    r = runtime.read();
+    for (String key : List.of("i", "j", "k", "l")) {
+      r = bump(r, key);
+    }
+    assertThat(runtime.read().intentionRecords()).isEqualTo(4);
+    bump(r, "m"); // 5 records, 1.25
+    assertThat(runtime.read().intentionRecords()).isZero();
+    assertThat(runtime.read().state()).containsKeys("a", "c", "h", "m", "other");
+  }
+
+  @Test
+  void fusedPastTheLimitsACommitReplacesTheLogWithItsRecord() { // [Write(CAS)]
+    compactingAt(2, false);
+    Replica<Map<String, Integer>> r = bump(created(), "a");
+    log.calls.clear();
+    r = bump(r, "b");
+    assertThat(log.calls).containsExactly("replace", "readThrough");
+    assertThat(r.intentionRecords()).isEqualTo(1); // its own record follows the checkpoint
+  }
+
+  @Test
+  void aPolicyDueOnALogWithNoRecordsReplacesOnEveryCommit() { // [MustCAS] (CAS only)
+    compactingAt(0, true, 0.0);
+    Replica<Map<String, Integer>> r = bump(created(), "a");
+    log.calls.clear();
+    r = bump(r, "b");
+    assertThat(log.calls).containsExactly("replace", "readThrough");
+    assertThat(r.intentionRecords()).isEqualTo(1);
+  }
+
+  @Test
+  void aTracedCompactionFollowsItsCommit() {
+    compactingAt(2, true, 0.0);
+    Replica<Map<String, Integer>> base = created();
+    CommitTrace.open();
+    try {
+      bump(base, "a");
+      List<CommitTrace.Kind> kinds =
+          CommitTrace.drain().stream().map(CommitTrace.Event::kind).toList();
+      assertThat(kinds).containsSubsequence(CommitTrace.Kind.END, CommitTrace.Kind.COMPACT,
+          CommitTrace.Kind.PREPARED, CommitTrace.Kind.SEND, CommitTrace.Kind.LANDED);
+    } finally {
+      CommitTrace.close();
+    }
   }
 }

@@ -27,6 +27,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.DoubleSupplier;
 import java.util.function.LongSupplier;
 import java.util.stream.Collectors;
 import org.apache.iceberg.ManifestListSink;
@@ -129,6 +130,7 @@ public class LogCatalog extends BaseMetastoreCatalog
   private final InlineSnapshots inlineSnapshots = new InlineSnapshots();
   // The clock the catalog's commits mint their ids from, and compact by; null for the system's
   private LongSupplier clock = null;
+  private DoubleSupplier compactionDraws = null;
 
   /** A catalog whose subclass opens its log and FileIO when it is initialized ({@link #openLog}). */
   protected LogCatalog(String catalogName, Map<String, String> catalogProperties) {
@@ -156,6 +158,17 @@ public class LogCatalog extends BaseMetastoreCatalog
     return this;
   }
 
+  /**
+   * Makes the catalog draw where past the commit knobs it compacts after a commit from {@code
+   * draws} (each in [0, 1)) instead of at random: for tests whose runs must repeat. Call it before
+   * {@link #initialize}.
+   */
+  LogCatalog compactionDraws(DoubleSupplier draws) {
+    Preconditions.checkState(log == null, "The catalog's draws are set before it is initialized");
+    this.compactionDraws = draws;
+    return this;
+  }
+
   @Override
   public void initialize(String name, Map<String, String> properties) {
     super.initialize(name, properties);
@@ -177,7 +190,13 @@ public class LogCatalog extends BaseMetastoreCatalog
     Preconditions.checkState(
         sharedLog != null && io != null, "%s opened no log", getClass().getSimpleName());
     RuntimeConfig config = LogCatalogProperties.runtimeConfig(catalogProperties);
-    log = new CatalogLog(sharedLog, clock != null ? config.withClock(clock) : config,
+    if (clock != null) {
+      config = config.withClock(clock);
+    }
+    if (compactionDraws != null) {
+      config = config.withCompaction(config.compaction().withDraws(compactionDraws));
+    }
+    log = new CatalogLog(sharedLog, config,
         LogCatalogProperties.checkpointMemoize(catalogProperties));
     // Another catalog may create the log at once (two processes starting on a new warehouse):
     // either way, this one uses it.

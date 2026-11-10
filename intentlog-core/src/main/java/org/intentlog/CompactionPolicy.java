@@ -18,12 +18,65 @@
  */
 package org.intentlog;
 
-/** When a commit to a log that can replace itself writes a checkpoint instead of appending. */
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.DoubleSupplier;
+
+/**
+ * When a log that can replace itself is compacted: by the commit that would extend it, which writes
+ * a checkpoint and its record instead of appending ({@link RuntimeConfig#compactAfterCommit} off),
+ * or after a commit landed in it, by the commit's writer ({@link
+ * RuntimeConfig#compactAfterCommit}, the default). A log that keeps its checkpoints apart is
+ * compacted after a commit too ({@link LogRuntime#compact}).
+ */
 @FunctionalInterface
 public interface CompactionPolicy {
 
-  /** Whether the next commit compacts the log it would extend. */
+  /** Whether the log is due for compaction: the next commit compacts it, or the last one's writer. */
   boolean due(Input log);
+
+  /**
+   * How far the log has come toward compaction: 1 or more once it is due, by how far it is past
+   * the limits. A writer that compacts after its commit compacts at a progress it draws in [1, 2),
+   * so that writers do not all compact at the same point (LogRuntime's compaction after a commit).
+   * A policy that says only whether it is due is at 1 once it is, else 0.
+   */
+  default double progress(Input log) {
+    return due(log) ? 1.0 : 0.0;
+  }
+
+  /**
+   * A draw in [0, 1): where past the limits a writer compacts after its commit, as a fraction of
+   * the limits. Uniform; a test passes its own draws ({@link #withDraws}).
+   */
+  default double draw() {
+    return ThreadLocalRandom.current().nextDouble();
+  }
+
+  /** This policy, with its draws taken from {@code draws} (each in [0, 1)). */
+  default CompactionPolicy withDraws(DoubleSupplier draws) {
+    CompactionPolicy policy = this;
+    return new CompactionPolicy() {
+      @Override
+      public boolean due(Input log) {
+        return policy.due(log);
+      }
+
+      @Override
+      public double progress(Input log) {
+        return policy.progress(log);
+      }
+
+      @Override
+      public double draw() {
+        return draws.getAsDouble();
+      }
+
+      @Override
+      public String toString() {
+        return policy + " with drawn points";
+      }
+    };
+  }
 
   /**
    * What a policy sees of the log a commit would extend: the intention records after its
@@ -65,9 +118,31 @@ public interface CompactionPolicy {
    * lose an append race resend without reading the count again.
    */
   static CompactionPolicy limits(int maxRecords, long maxBytes, SizeBasis basis) {
-    return log -> {
-      long bytes = basis == SizeBasis.TAIL ? log.tailBytes() : log.logBytes();
-      return log.intentionRecords() >= maxRecords || bytes + log.recordBytes() > maxBytes;
+    return new CompactionPolicy() {
+      @Override
+      public boolean due(Input log) {
+        return log.intentionRecords() >= maxRecords || bytes(log) + log.recordBytes() > maxBytes;
+      }
+
+      /** The larger of the record count's and the size's fraction of their limits. */
+      @Override
+      public double progress(Input log) {
+        double records = maxRecords == 0 ? Double.POSITIVE_INFINITY
+            : (double) log.intentionRecords() / maxRecords;
+        double bytes = maxBytes == 0 ? Double.POSITIVE_INFINITY
+            : (double) (bytes(log) + log.recordBytes()) / maxBytes;
+        return due(log) ? Math.max(1.0, Math.max(records, bytes)) : Math.max(records, bytes);
+      }
+
+      private long bytes(Input log) {
+        return basis == SizeBasis.TAIL ? log.tailBytes() : log.logBytes();
+      }
+
+      @Override
+      public String toString() {
+        return String.format("limits(%d records, %d bytes of the %s)", maxRecords, maxBytes,
+            basis == SizeBasis.TAIL ? "tail" : "object");
+      }
     };
   }
 }

@@ -565,9 +565,10 @@ if a pending create or a rename's destination now collides,
 `CommitFailedException`), the other rejections to `CommitFailedException`,
 and an unknown outcome to `CommitStateUnknownException`.
 
-The loop has one branch per capability: a log that replaces itself compacts by
-a fused replace; one with conditional appends appends at the tail it read;
-one without appends unconditionally.
+The loop has one branch per capability: a log that replaces itself replaces
+itself with the commit's record when no append can carry it, and is compacted
+after the commit otherwise ([Compaction](#compaction)); one with conditional
+appends appends at the tail it read; one without appends unconditionally.
 
 ```
 # landed(view, earlier): whether view holds this commit's record. Replay's
@@ -614,8 +615,13 @@ function COMMIT(log, base, intention):
     full = false                                  # the log refused an append: it is full
     for attempt in 1..maxAttempts (10):
       try:
-        mustReplace = caps.fusedReplace and (full or oversized or not caps.append
-                          or policy.due(current.intentionRecords, tail.bytes, len(record)))
+        # compaction after the commit (the default): past the policy's limits the commit
+        # appends, and its writer compacts after it (COMMIT's caller, below); the policy
+        # makes it replace only if due on a log with no records (CAS only). Fused: past them.
+        due = config.compactAfterCommit
+              ? policy.due(0, current.checkpointBytes, len(record))
+              : policy.due(current.intentionRecords, tail.bytes, len(record))
+        mustReplace = caps.fusedReplace and (full or oversized or not caps.append or due)
         if mustReplace:
             if stale:
                 # The replace supersedes the log at its tail, so its checkpoint must hold
@@ -819,7 +825,9 @@ replace), a replace's payload ready, each write sent and how it ended
 read in three steps: begun (after a tail or whole), its view arrived (with a
 checkpoint or records alone, and how many), and replayed (folded onto the
 replica, or replayed from its checkpoint, and how many records); then the
-replica adopted (its state built). On one object a tail read's view holds
+replica adopted (its state built). A compaction after the commit follows its
+end: begun (the records it landed among, the log's bytes), its payload ready,
+sent and how it ended. On one object a tail read's view holds
 the replica's checkpoint and records and the frames after them, so whether a
 read found the object extended or replaced is the replay's fold. A client's
 reads (`read`, `read(floor)`: loads and refreshes) report the same steps,
@@ -832,23 +840,52 @@ TAIL_READS.md's question of tail reads past the commit knee.
 
 Compaction bounds what a reader replays, and with GC, the committed set.
 
-**On a log that replaces itself** (`fusedReplace`: `AtomicFileLog`), a commit
-compacts. It replaces the log with a checkpoint of the state it read, a GC
-record and its own record, when the log cannot append, an append was refused
-as full, the record is larger than an append stores (`maxRecordBytes`), or the
-compaction policy says the log is due:
-`CompactionPolicy.limits(maxRecords, maxBytes, basis)` compacts once the log
+**On a log that replaces itself** (`fusedReplace`: `AtomicFileLog`), the
+writer of a commit compacts the log after the commit landed
+(`RuntimeConfig.compactAfterCommit`, the default since 2026-11-10;
+[TAIL_READS.md](TAIL_READS.md) "Compaction after the commit"), or the commit
+compacts as it lands, fused (for ablation). The compaction policy says when the
+log is due: `CompactionPolicy.limits(maxRecords, maxBytes, basis)` once the log
 holds `maxRecords` intention records (0: every commit), or the record would take
 what `basis` counts past `maxBytes`: the records after the checkpoint (`TAIL`,
 the default), or the whole log (`OBJECT`, as before errata D19's stopgap, under
 which a checkpoint past the bound compacts on every commit). The policy sees
 the replica's record count, its checkpoint's size and the log's
 (`CompactionPolicy.Input`); the catalog's knobs are
-`fileio.catalog.max.append.count`, `max.append.size` and
-`max.append.size.basis`. Both limits are soft: a writer that loses an append race
-resends at the new tail without reading the count again. Writers configured
-differently disagree on when to compact, but cannot corrupt the log: every
-write is conditional.
+`fileio.catalog.max.append.count`, `max.append.size`,
+`max.append.size.basis` and `compact.after.commit`. Both limits are soft. Writers
+configured differently disagree on when to compact, but cannot corrupt the log:
+every write is conditional.
+
+A commit replaces the log with a checkpoint of the state it read, a GC record
+and its own record (`[chk][gc][page-outs][rec]`) when no append can carry the
+record: the log cannot append, an append was refused as full (a store's cap on
+writes to one object), the record is larger than an append stores
+(`maxRecordBytes`), or the policy is due even on a log with no records after
+its checkpoint (CAS only, or a record past the size limit); fused, also when
+the policy says the log is due.
+
+After the commit, once its record landed in a replica `R`, if the policy says
+`R` is due (and is not due on every commit) and `R`'s progress
+(`CompactionPolicy.progress`: the larger of its count's and size's fractions of
+the limits) has reached the point the writer drew, the writer replaces `R`'s
+version with a checkpoint of `R`, a GC record at `watermark(∞)` and the
+PageOuts the policy calls for, sealing blocks with tops at or below `now - A`,
+their pages put first: `[chk][gc][page-outs]`, no record of its own, so neither
+is kept below one. Conditioned on `R`'s version, it lands only if no write
+landed since, and then holds the state the log held (I11); one that loses its
+race, fails or stays throttled is dropped (one that lands late lands on the
+same version), and the commit stands whatever becomes of it. After it lands,
+the pages its GC record dropped are deleted and the orphans swept. Each writer
+(each runtime) draws its point: in [1, 2) of the limits after the log was last
+compacted (a progress below the last one it saw says so), and after each
+compaction it tried, the progress then plus a draw in [0, 1), doubled for each
+compaction in a row that lost (up to 2^10): writers seldom compact at once, and
+writers that keep a log busy try ever more seldom (the policy's `draw`; a test
+passes its own, `withDraws`). A compaction lands only between appends: under
+sustained load past what one compaction's encode and PUT allow, the log grows
+until the store refuses an append, and the commit that meets the cap replaces
+it with its record.
 
 **On a log with separate checkpoints** (`separateCheckpoints`:
 `InMemorySharedLog`, Kafka, SQS, a ledger), `LogRuntime.compact()` compacts:

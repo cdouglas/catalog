@@ -41,9 +41,9 @@ public final class CommitTrace {
     ATTEMPT,
     /** A replace's payload is ready (its checkpoint encoded): a = the checkpoint's bytes. */
     PREPARED,
-    /** A write is sent: a = 1 for a replace, 0 for an append. */
+    /** A write is sent: a = 1 for a commit's replace, 0 for an append, 2 for a compaction's. */
     SEND,
-    /** The write landed and was read through. */
+    /** The write landed and was read through (a compaction's: landed). */
     LANDED,
     /** The write failed its condition: another writer's landed first. */
     LOST,
@@ -79,7 +79,13 @@ public final class CommitTrace {
      * The commit ended: a = 0 landed, 1 rejected, 2 unknown, 3 out of attempts, 4 failed otherwise
      * (a read failed); b = the races it lost.
      */
-    END
+    END,
+    /**
+     * After the commit landed, its writer compacts the log (a log that replaces itself): a = the
+     * records it landed among, b = the log's bytes. A {@link #PREPARED}, a {@link #SEND} (a = 2)
+     * and its outcome follow: {@link #LANDED}, {@link #LOST} or {@link #AMBIGUOUS} (dropped).
+     */
+    COMPACT
   }
 
   private static final ThreadLocal<CommitTrace> CURRENT = new ThreadLocal<>();

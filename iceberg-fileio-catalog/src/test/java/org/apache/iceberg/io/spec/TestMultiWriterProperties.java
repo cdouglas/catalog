@@ -148,12 +148,13 @@ class TestMultiWriterProperties {
       @ForAll boolean strictVersions,
       @ForAll InMemoryAtomicFileIO.ReadMode reads,
       @ForAll boolean tailReads,
+      @ForAll boolean compactAfter,
       @ForAll boolean gc,
       @ForAll("segmentLimits") int segmentLimit,
       @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
     new Run(new MultiWriterStorage.File(strictVersions, reads, segmentLimit, tailReads), writers,
-        maxAppendCount, appendHeadroom, false, gc, encoding).execute(schedule);
+        maxAppendCount, appendHeadroom, false, gc, encoding, compactAfter).execute(schedule);
   }
 
   @Property(tries = 300)
@@ -164,12 +165,13 @@ class TestMultiWriterProperties {
       @ForAll boolean strictVersions,
       @ForAll InMemoryAtomicFileIO.ReadMode reads,
       @ForAll boolean tailReads,
+      @ForAll boolean compactAfter,
       @ForAll boolean gc,
       @ForAll("segmentLimits") int segmentLimit,
       @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
     new Run(new MultiWriterStorage.File(strictVersions, reads, segmentLimit, tailReads), writers,
-        maxAppendCount, appendHeadroom, true, gc, encoding).execute(schedule);
+        maxAppendCount, appendHeadroom, true, gc, encoding, compactAfter).execute(schedule);
   }
 
   @Property(tries = 300)
@@ -184,7 +186,7 @@ class TestMultiWriterProperties {
       @ForAll("schedules") List<Cmd> schedule) {
     new Run(new MultiWriterStorage.Memory(conditional, tailReads), writers, maxAppendCount,
         appendHeadroom,
-        false, gc, encoding).execute(schedule);
+        false, gc, encoding, true).execute(schedule);
   }
 
   @Property(tries = 300)
@@ -199,7 +201,7 @@ class TestMultiWriterProperties {
       @ForAll("schedules") List<Cmd> schedule) {
     new Run(new MultiWriterStorage.Memory(conditional, tailReads), writers, maxAppendCount,
         appendHeadroom,
-        true, gc, encoding).execute(schedule);
+        true, gc, encoding, true).execute(schedule);
   }
 
   /**
@@ -739,7 +741,7 @@ class TestMultiWriterProperties {
      * compacts, and its outcome is never unknown for it.
      */
     Run(MultiWriterStorage storage, int writers, int maxAppendCount, long appendHeadroom,
-        boolean faults, boolean gc, String encoding) {
+        boolean faults, boolean gc, String encoding, boolean compactAfter) {
       this.storage = storage;
       this.faults = faults;
       this.gc = gc;
@@ -761,14 +763,21 @@ class TestMultiWriterProperties {
           appendHeadroom < 0
               ? LogCatalogProperties.DEFAULT_MAX_APPEND_SIZE
               : seedLength + appendHeadroom;
-      this.config =
+      RuntimeConfig base =
           LogCatalogProperties.runtimeConfig(
               maxAppendCount,
               maxAppendSize,
               gc ? 0L : LogCatalogProperties.DEFAULT_COMMITTED_RETENTION_MS,
               0, // retry throttled writes without sleeping
               0) // and lost races
-              .withTailReads(storage.tailReads());
+              .withTailReads(storage.tailReads())
+              .withCompactionAfterCommit(compactAfter);
+      // On one object, past the limits a commit appends and its writer compacts after it
+      // (compactAfter), at points past the limits alternately at them and half of them on; or
+      // the commit replaces the catalog
+      int[] draws = {0};
+      this.config = base.withCompaction(
+          base.compaction().withDraws(() -> (draws[0]++ % 2) * 0.5));
       this.log = storage.log(config);
       if (storage instanceof MultiWriterStorage.Memory) {
         // A compactor a second ahead of the writers, with their retention.
@@ -783,9 +792,10 @@ class TestMultiWriterProperties {
         this.writers[i] = new Writer(i);
       }
       trace.append(String.format(
-          "log: %s, maxAppendCount=%d maxAppendSize=%d (seed %d bytes)%s%n",
+          "log: %s, maxAppendCount=%d maxAppendSize=%d (seed %d bytes)%s, compaction %s%n",
           storage.describe(), maxAppendCount, maxAppendSize, seedLength,
-          gc ? ", retention 0" : ""));
+          gc ? ", retention 0" : "", compactAfter ? "after commits" : "with them"));
+      Statistics.label("compaction").collect(compactAfter ? "after commits" : "with them");
       Statistics.label("gc").collect(gc);
       trace.append("seed: ").append(View.of(read().state())).append('\n');
       storage.hook(new MultiWriterStorage.Hooks() {
@@ -1101,13 +1111,25 @@ class TestMultiWriterProperties {
         running = null;
       }
       // This commit's writes: those since it started, less those of the commit that preempted it,
-      // and less the GC records a compaction appended once it landed.
+      // and less the GC records a compaction appended once it landed (a shared log), or the
+      // compaction after it landed (one object), whose checkpoint must be a replay too.
       List<MultiWriterStorage.Write> writes = new ArrayList<>();
       List<MultiWriterStorage.Write> history = storage.writes(mark);
       for (int i = 0; i < history.size(); i++) {
         final int at = mark + i;
-        if (!history.get(i).gc() && ctx.nested.stream().noneMatch(r -> at >= r[0] && at < r[1])) {
-          writes.add(history.get(i));
+        if (ctx.nested.stream().anyMatch(r -> at >= r[0] && at < r[1])) {
+          continue;
+        }
+        MultiWriterStorage.Write wr = history.get(i);
+        if (!wr.gc()) {
+          writes.add(wr);
+        } else if (wr.replace()) {
+          check(View.of(parse(wr.after)).equals(View.of(parse(wr.before))),
+              "a compaction after a commit changed the state");
+          String difference = storage.difference(wr);
+          check(difference == null, "a checkpoint of the compaction differs from it: %s",
+              difference);
+          Statistics.label("compaction after a commit").collect("landed");
         }
       }
       List<MultiWriterStorage.Write> effective = new ArrayList<>();

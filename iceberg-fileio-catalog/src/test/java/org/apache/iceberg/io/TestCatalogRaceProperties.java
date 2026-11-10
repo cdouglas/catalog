@@ -39,6 +39,7 @@ import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
 import org.apache.iceberg.types.Types;
+import org.intentlog.CommitTrace;
 import org.intentlog.fileio.AtomicFileLog;
 import org.intentlog.memory.InMemorySharedLog;
 import org.intentlog.wire.LogEnvelope;
@@ -113,7 +114,8 @@ class TestCatalogRaceProperties {
       @ForAll("clockOffsets") List<Long> clockOffsets,
       @ForAll("encodings") String encoding,
       @ForAll InMemoryAtomicFileIO.ReadMode reads,
-      @ForAll boolean tailReads) {
+      @ForAll boolean tailReads,
+      @ForAll boolean compactAfter) {
     // The writers' modes on one catalog object, or on a shared log with the same table metadata
     // storage.
     LocalCatalogMode modeA = sharedLog ? fileModeA.onSharedLog() : fileModeA;
@@ -146,7 +148,12 @@ class TestCatalogRaceProperties {
       props.put(LogCatalogProperties.READ_TAIL, "false");
       propsA.put(LogCatalogProperties.READ_TAIL, "false");
     }
+    if (!compactAfter) { // a commit past the limits replaces the catalog (TAIL_READS.md)
+      props.put(LogCatalogProperties.COMPACT_AFTER_COMMIT, "false");
+      propsA.put(LogCatalogProperties.COMPACT_AFTER_COMMIT, "false");
+    }
     Statistics.label("tail reads").collect(tailReads);
+    Statistics.label("compaction").collect(compactAfter ? "after the commit" : "with it");
     Statistics.label("gc").collect(gc);
     Statistics.label("paging").collect(paging);
     Statistics.label("clocks off").collect(clockOffsets.stream().anyMatch(o -> o != 0));
@@ -174,6 +181,10 @@ class TestCatalogRaceProperties {
     boolean[] changedItsReads = {false}; // whether a racer changed what A, a transaction, read
     boolean[] changedItsTable = {false}; // whether a racer changed the table A appends to at all
     List<Map<TableIdentifier, String>> loaded = new java.util.ArrayList<>(); // as A loaded them
+    // On one object, whether A's write is a compaction after its commit landed, which is not one
+    // of its commit's writes: A's trace says, its last commit or compaction begun
+    boolean[] compacting = {false};
+    CommitTrace.open();
     Runnable beforeAWrite = () -> {
       int k = writes[0]++;
       if (k < racers.size()) {
@@ -191,6 +202,7 @@ class TestCatalogRaceProperties {
           }
         } finally {
           nested[0] = false;
+          CommitTrace.drain(); // the racer's, on this thread
         }
       }
     };
@@ -212,12 +224,26 @@ class TestCatalogRaceProperties {
     } else {
       io.injectFaults((location, strategy) -> {
         if (!nested[0] && location.equals(CATALOG)) {
-          beforeAWrite.run();
+          for (CommitTrace.Event event : CommitTrace.drain()) {
+            if (event.kind() == CommitTrace.Kind.COMMIT) {
+              compacting[0] = false;
+            } else if (event.kind() == CommitTrace.Kind.COMPACT) {
+              compacting[0] = true;
+            }
+          }
+          if (!compacting[0]) {
+            beforeAWrite.run();
+          }
         }
         return Fault.NONE;
       });
     }
-    String raceA = a.run(writerA, "A");
+    String raceA;
+    try {
+      raceA = a.run(writerA, "A");
+    } finally {
+      CommitTrace.close();
+    }
     io.injectFaults((location, strategy) -> Fault.NONE);
     if (log != null) {
       log.intercept(null);

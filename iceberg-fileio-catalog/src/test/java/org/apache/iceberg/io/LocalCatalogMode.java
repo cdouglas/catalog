@@ -23,6 +23,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.function.DoubleSupplier;
 import java.util.function.LongSupplier;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.io.AtomicOutputFile.Strategy;
@@ -37,9 +38,10 @@ import org.intentlog.memory.InMemorySharedLog;
  * <ul>
  *   <li>{@code APPEND*}: every commit after the first appends (max.append.count = 10000).
  *   <li>{@code CAS*}: every commit rewrites the file (max.append.count = 0).
- *   <li>{@code COMPACT*}: a CAS compaction after every two appends (max.append.count = 3: the
- *       record written by a CAS counts toward the limit), so compaction interleaves with the
- *       append log throughout each test.
+ *   <li>{@code COMPACT*}: a compaction after the commit that takes the log to 3 records (max.append.count
+ *       = 3: the creation's record counts toward the limit, and the writer's drawn point is the
+ *       limit itself unless a test draws others), so compaction interleaves with the append log
+ *       throughout each test.
  *   <li>{@code MEMLOG*}: a {@link LogCatalog} whose log is an {@link InMemorySharedLog} (the data
  *       stays in the store): every commit appends, and the writer whose commit takes the log to 3
  *       records past its checkpoint compacts it (a GC record, a checkpoint, a trim).
@@ -149,9 +151,19 @@ enum LocalCatalogMode {
    * As {@link #catalog(InMemoryAtomicFileIO, String, String, Map)}, with the catalog's commits
    * minting their ids from {@code clockMs} (null for the system's clock).
    */
-  @SuppressWarnings("unchecked")
   <C extends LogCatalog> C catalog(InMemoryAtomicFileIO io, String warehouse, String name,
       Map<String, String> extra, LongSupplier clockMs) {
+    return catalog(io, warehouse, name, extra, clockMs, () -> 0.0);
+  }
+
+  /**
+   * As {@link #catalog(InMemoryAtomicFileIO, String, String, Map, LongSupplier)}, with the
+   * writer's points past the limits at which it compacts after its commits drawn from {@code
+   * draws} (each in [0, 1); otherwise 0: at the limits, so that suites repeat).
+   */
+  @SuppressWarnings("unchecked")
+  <C extends LogCatalog> C catalog(InMemoryAtomicFileIO io, String warehouse, String name,
+      Map<String, String> extra, LongSupplier clockMs, DoubleSupplier draws) {
     Map<String, String> properties = Maps.newHashMap();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouse);
     properties.put(LogCatalogProperties.MAX_APPEND_COUNT, String.valueOf(maxAppendCount));
@@ -180,6 +192,7 @@ enum LocalCatalogMode {
     if (clockMs != null) {
       catalog.clock(clockMs);
     }
+    catalog.compactionDraws(draws);
     catalog.initialize(name, properties);
     return (C) catalog;
   }
@@ -187,11 +200,12 @@ enum LocalCatalogMode {
   /**
    * Asserts that every catalog file in {@code io} was written under this mode's commit policy, so
    * a misspelled property cannot silently run the default policy. The first write creates the
-   * file by CAS; each CAS leaves one transaction record in the log and each append adds one. A
-   * later CAS (compaction) is legal only once the log holds {@code maxAppendCount} records: the
-   * writer decided from the record count of the version it read, and the CAS took effect only
-   * because that version was still live. The limit is soft for appends: a writer that lost an
-   * append race retries without re-reading the count, so the log may run past it.
+   * file by CAS, leaving its record in the log, and each append adds one. A later CAS is a
+   * compaction after a commit, which leaves no record, or in CAS-only mode a commit's, which
+   * leaves its own; a compaction is legal only once the log holds {@code maxAppendCount} records:
+   * the writer decided from the record count of the version its commit landed in, and the CAS
+   * took effect only because that version was still live. The limit is soft for appends: a writer
+   * past it appends, so the log may run past it.
    */
   void assertCommitPolicy(InMemoryAtomicFileIO io) {
     if (sharedLog) {
@@ -213,7 +227,7 @@ enum LocalCatalogMode {
                   assertThat(records)
                       .as("records before compaction #%d of %s: %s", i, location, writes)
                       .isGreaterThanOrEqualTo(maxAppendCount);
-                  records = 1;
+                  records = maxAppendCount == 0 ? 1 : 0;
                 }
               }
             });

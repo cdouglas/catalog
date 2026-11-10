@@ -382,6 +382,20 @@ compaction changes the checkpoint, and every writer then decodes the new
 one. That shifts the trade toward compacting less often than the campaign's
 100, which was chosen before the fold.
 
+Since 2026-11-10 (TAIL_READS.md "Compaction after the commit") the count's
+default is 1,000, and a writer compacts after its commit at a point past the
+limits it draws, backing off as its compactions lose, instead of the next
+commit replacing the object: at E1's 1,000 tables, writers that compacted at
+the count all at once lost to each other, and a compaction's PUT outlasts the
+gap between appends many times over. 1,000 is provisional too: a reader
+that folds pays for a record once, and a record is about 200 bytes, so the
+count now bounds a cold reader's whole read and how often every writer
+decodes a new checkpoint; the rule above still stands. The draws are not
+derived from the store either: a compaction lands only if no append lands
+while it is encoded and sent, which a writer could estimate from the rate its
+log grows and its last compaction's time, and skip compactions that cannot
+land.
+
 A compaction writes the committed set whole (D16), and at the default
 retention and a steady commit rate the set is most of the checkpoint: 25 MB
 at 100 commits a second and 238 MB at 1,000, while the ingest benchmark's

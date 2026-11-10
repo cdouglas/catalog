@@ -201,13 +201,14 @@ class TestCatalogFaultProperties {
       @ForAll @IntRange(min = 0, max = 7) int gcWriters,
       @ForAll @IntRange(min = 0, max = 7) int pagingWriters,
       @ForAll @IntRange(min = 0, max = 7) int wholeReaders,
+      @ForAll @IntRange(min = 0, max = 7) int fusedWriters,
       @ForAll("clockOffsets") List<Long> clockOffsets,
       @ForAll("segmentLimits") int segmentLimit,
       @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
     new Run(onLog(sharedLog, modes.subList(0, writers)), maxUpdateSize, false, strictVersions,
-        reads, gzipWriters, gcWriters, pagingWriters, wholeReaders, clockOffsets, segmentLimit,
-        encoding)
+        reads, gzipWriters, gcWriters, pagingWriters, wholeReaders, fusedWriters, clockOffsets,
+        segmentLimit, encoding)
         .execute(schedule);
   }
 
@@ -223,13 +224,14 @@ class TestCatalogFaultProperties {
       @ForAll @IntRange(min = 0, max = 7) int gcWriters,
       @ForAll @IntRange(min = 0, max = 7) int pagingWriters,
       @ForAll @IntRange(min = 0, max = 7) int wholeReaders,
+      @ForAll @IntRange(min = 0, max = 7) int fusedWriters,
       @ForAll("clockOffsets") List<Long> clockOffsets,
       @ForAll("segmentLimits") int segmentLimit,
       @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
     new Run(onLog(sharedLog, modes.subList(0, writers)), maxUpdateSize, true, strictVersions,
-        reads, gzipWriters, gcWriters, pagingWriters, wholeReaders, clockOffsets, segmentLimit,
-        encoding)
+        reads, gzipWriters, gcWriters, pagingWriters, wholeReaders, fusedWriters, clockOffsets,
+        segmentLimit, encoding)
         .execute(schedule);
   }
 
@@ -817,12 +819,16 @@ class TestCatalogFaultProperties {
      * is set, else the default 30 minutes, which no run reaches. Writer {@code i} pages the
      * committed set as it compacts, at an admission window and threshold of 0 (every block below
      * its own id but the newest), if bit {@code i} of {@code pagingWriters} is set, and its clock is
-     * off by {@code clockOffsets.get(i)} ms. With a {@code segmentLimit}, the catalog object holds
+     * off by {@code clockOffsets.get(i)} ms. Writer {@code i} compacts with its commits past the
+     * commit knobs, replacing the catalog instead of appending, if bit {@code i} of {@code
+     * fusedWriters} is set, else after them, at its own point past the knobs. With a {@code
+     * segmentLimit}, the catalog object holds
      * at most that many writes, and an append past it fails (Bug 66).
      */
     Run(List<LocalCatalogMode> modes, int maxUpdateSize, boolean faults, boolean strictVersions,
         InMemoryAtomicFileIO.ReadMode reads, int gzipWriters, int gcWriters, int pagingWriters,
-        int wholeReaders, List<Long> clockOffsets, int segmentLimit, String encoding) {
+        int wholeReaders, int fusedWriters, List<Long> clockOffsets, int segmentLimit,
+        String encoding) {
       this.maxUpdateSize = maxUpdateSize;
       this.faults = faults;
       this.gc = (gcWriters & ((1 << modes.size()) - 1)) != 0;
@@ -855,9 +861,16 @@ class TestCatalogFaultProperties {
         if ((wholeReaders >> i & 1) == 1) { // tail reads off (TAIL_READS.md step 5)
           writerProperties.put(LogCatalogProperties.READ_TAIL, "false");
         }
+        if ((fusedWriters >> i & 1) == 1) { // a commit past the limits replaces the catalog
+          writerProperties.put(LogCatalogProperties.COMPACT_AFTER_COMMIT, "false");
+        }
         long offset = clockOffsets.get(i);
+        // Each writer compacts after its commits at its own point past the limits: writer 0 at
+        // them, the others 0.4 and 0.8 of the limits further on
+        double draw = (i * 0.4) % 1.0;
         this.writers[i] = new Writer(i, modes.get(i).catalog(io, WAREHOUSE, CATALOG_NAME,
-            writerProperties, offset == 0 ? null : () -> System.currentTimeMillis() + offset));
+            writerProperties, offset == 0 ? null : () -> System.currentTimeMillis() + offset,
+            () -> draw));
       }
       // Reading does not depend on a catalog's mode, only on its log.
       this.checker = LocalCatalogMode.readerFor(io, CATALOG_LOCATION)
@@ -881,6 +894,8 @@ class TestCatalogFaultProperties {
           .collect(Integer.bitCount(gcWriters & ((1 << modes.size()) - 1)));
       Statistics.label("whole readers")
           .collect(Integer.bitCount(wholeReaders & ((1 << modes.size()) - 1)));
+      Statistics.label("fused writers")
+          .collect(Integer.bitCount(fusedWriters & ((1 << modes.size()) - 1)));
       Statistics.label("paging writers")
           .collect(Integer.bitCount(pagingWriters & ((1 << modes.size()) - 1)));
       Statistics.label("clocks off")

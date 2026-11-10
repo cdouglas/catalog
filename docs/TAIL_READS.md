@@ -681,6 +681,9 @@ Each step stands alone and is measured before the next:
    same picture, and the table gives the rerun (catalog-bench's lab marks the
    first runs superseded). The 300-table and E3 runs overlapped the rounds
    too, each point's arms side by side.
+6b. **Compaction after the commit** (2026-11-10, before step 7: the user's
+   call on the knee). Traced, then modelled, built and measured: [Compaction
+   after the commit](#compaction-after-the-commit).
 7. **One request a read**: a ranged GET that
    reports the version and length it read (S3's `ETag` and `Content-Range`,
    ADLS's and GCS's equivalents), so a tail read is one request. A fork
@@ -690,6 +693,123 @@ Each step stands alone and is measured before the next:
    past the knee.
 
 Then R2.3, with a read's cost known.
+
+## Compaction after the commit
+
+**What the traces showed.** Step 6's failures at E1's 1,000 tables were
+traced (intentlog's `CommitTrace`, catalog-bench's `trace_commits`; campaign
+`tr6t`, one run an arm). With tail reads every writer learns the log's exact
+record count, so at 100 records they all turn to compaction together: about
+55 writers encoded a checkpoint for each compaction that landed (inline TM:
+2,549 compactions lost, 46 landed; ML: 771 and 14), and every one that lost
+lost to another writer's compaction. While they compacted, nobody appended;
+then everybody did, and appends in the burst after a compaction lost 91-94%
+of their races, against 59-71% otherwise. With tail reads off, writers learn
+the count late and keep appending, and compactions lose to appends instead
+(TM: 31 of about 4,073 landed; ML: 10 of 1,022). Either way a compaction
+cannot beat concurrent appends: its checkpoint (8.5 MiB TM, 16.6 MiB ML at
+1,000 tables) takes about 2 s (TM) or 5.5 s (ML) to encode (550-650 ms of CPU
+on a saturated driver) and 0.5-1.8 s to PUT, while appends land about every
+65 ms at 15 a second. A commit that failed spent its ten attempts losing
+appends as the count climbed, one compaction of 2-6 s that lost, and more lost
+appends in the burst after; Iceberg retried it five times, each the same way.
+A resend after a tail read was not slower than one after a probe (6-13 ms of
+think time against a probe's extra request): the herd was the cause, not the
+read.
+
+**The design.** On one object the commit no longer compacts:
+
+- Past the policy's limits a commit still appends. Once its record has landed
+  in a replica `R`, its writer may compact: it replaces `R`'s version with a
+  checkpoint of `R`, a GC record and PageOuts, and no record of its own. The
+  replace is conditioned on `R`'s version, so it lands only if no write landed
+  since, and then holds exactly the state the log held (I11). One that loses
+  its race, fails or stays throttled is dropped; the commit stands whatever
+  becomes of it, as a compaction after a commit already did on a shared log
+  (LOG.md "Compaction").
+- A writer compacts once the log's progress past the limits (the larger of
+  its count's and size's fractions) reaches a point it draws in [1, 2) of the
+  limits, so that writers do not all compact at the same record. After each
+  compaction it tried, its next point is the progress then plus a draw in
+  [0, 1), doubled for each loss in a row: a loss says the log is busier than
+  one compaction's encode and PUT, and writers that keep it busy try ever
+  more seldom. A log compacted since (its progress fell) resets both.
+- A commit still replaces the object with its record when no append can
+  carry it: the store refused an append (its cap on writes to one object:
+  10,000 on S3 Express, 50,000 for an Azure append blob), it has no append,
+  the record is larger than an append stores, or the policy is due even on a
+  log with no records (CAS only). Then nobody compacts after it.
+- `fileio.catalog.max.append.count` goes from 100 to 1,000 (provisional,
+  errata D14): a reader that folds pays for a record once, and a record is
+  about 200-230 bytes, so 1,000 add 0.2 MB to a checkpoint of 8.5-16.6 MB;
+  the count bounds a cold reader's whole read and how often every writer
+  decodes a new checkpoint.
+- `fileio.catalog.compact.after.commit` (`RuntimeConfig.compactAfterCommit`,
+  default true) puts back the fused compaction, for ablation.
+
+**Its limit.** A compaction lands only between appends. Under load that
+keeps every gap shorter than one compaction's encode and PUT, none lands,
+and the log grows until the store refuses an append; then every writer's
+commit replaces the object with its record, one wins, and the rest append
+to its short log: the herd once a cap, not once a hundred records. A small
+checkpoint is the structural fix: paged checkpoints
+([CHECKPOINT_PLAN.md](CHECKPOINT_PLAN.md)) would make a compaction short
+enough to land between appends. catalog-bench models no cap on writes to one
+object, so its runs show the growth and not the cap.
+
+**The model.** `CatalogCommit.tla` (written first): `CompactAfter`; past the
+limits `MustCAS` holds only when the policy is due on an empty log
+(`DueEmpty`); a commit judged committed (`Judge`'s `Committed`, on any path:
+read back, rebase, tail read, resolve, final read) may move to `compact`
+(`CompactDue`; the model takes both choices, as any draws give); `Compact` is
+one conditional replace of `R`'s version, `[chk][gc][page-outs]`, with every
+write fault, after `PrepCas` put its pages with Paging; the commit ends
+committed whatever it does. A compaction is not one of the commit's writes
+for the fuzzers' oracles, and no racer runs before it in the race schedules
+(the race fuzzer can tell: below). Its switches each break a property:
+`compactbase` (a checkpoint of the replica the commit staged on, conditioned
+on the version its record landed in: `HonestCommitted`), `compactresend`
+(one that lost resent on the object as it is, as if the records that beat it
+were in its checkpoint: `HistGrows`) and `compactfail` (a loss fails the
+commit: `HonestFailed`). Writing the Java found one rule the model then took:
+CAS only, every commit replaced and then compacted again (`DueEmpty`). The
+existing configurations keep the fused compaction (their states as before);
+the `after-*` family runs the same kinds of schedule with compaction after
+the commit, and every one passes, up to 9.7 million states (`after-skew`;
+spec/tla/README.md "Compaction after the commit"). The oracle matrix found
+the multi-writer oracle blind to `compactbase` and `compactresend`: it judged
+a commit by its own writes, and the damage is in the compaction's. It now
+checks each compaction apart (it changes no state), in the model and in
+TestMultiWriterProperties, and catches all three.
+
+**The code.** `LogRuntime.commit` calls `compactAfter(landed)` on a log that
+replaces itself; `prepare(on, record, ownMs)` builds a commit's replace and a
+compaction's (no record, nothing kept below); `drawn`/`tried` keep a
+runtime's point; `CompactionPolicy.progress`, `draw` and `withDraws`;
+`RuntimeConfig.compactAfterCommit`; `LogCatalogProperties.COMPACT_AFTER_COMMIT`;
+`CommitTrace.Kind.COMPACT`. Tests: `TestLogRuntime` (a commit past the limits
+appends and its writer compacts; a compaction that loses is dropped; the drawn
+points and the backoff; fused; CAS only; a traced compaction),
+`TestProtoCommitKnobs`.
+
+**The fuzzers** draw it: the protocol fuzzer from its seed (and its points
+from the seed), the fault fuzzer per writer (each writer's points fixed:
+0, 0.4 and 0.8 of the limits past them), the race fuzzer and the multi-writer
+fuzzer per run. The race fuzzer on one object counts A's writes from its
+trace, which tells a compaction after A's commit from A's commit's writes; the
+multi-writer fuzzer checks a compaction apart from the commit before it (it
+changes no state, and its checkpoint is a replay). `CatalogTestSupport`'s logs
+and `LocalCatalogMode`'s catalogs compact at the limits themselves, so suites
+repeat. The mutant set `fuzz/mutants/compaction.sh` holds the model's
+switches (`compactresend` as a compaction conditioned on a probe of the
+object); the one-object protocol fuzzer catches each in 5,000 tries, and the
+multi-writer fuzzer in 300. Two tests changed meaning: `CheckpointRoundTrip`
+asked of every catalog file that the first record after its checkpoint apply
+where it holds (Bug 64: a replace's own record), which after a compaction is
+some later append, which a compaction's GC record at a retention of 0 may
+pass, as on a shared log; it now asks it of a replace's file. And Bug 66's
+race to the store's cap now sets the count past the cap, so that the cap,
+not a compaction after the racer's commit, makes the commit replace.
 
 ## Alternatives considered
 
@@ -760,15 +880,11 @@ Then R2.3, with a read's cost known.
   in-memory one, whose positions are dense.
 - **S3 Express and `If-Match` on a GET**: answered by step 0's run; directory
   buckets honour it.
-- **Tail reads past the commit knee** (step 6, E1 at 1,000 tables). Commits
-  that lose a compaction race lose about twice the append races with tail
-  reads, and 0.3-2.6% of merge appends exhaust their retries. Unverified
-  candidates: a resend after a lost race waits for the fold of what beat it,
-  CPU on a saturated driver, where a resend after a probe waits for two small
-  requests (the fold could follow the resend: the GET gives the tail, its
-  frames the incarnation, the record count and whether the commit's own
-  record landed); and a writer that tail-reads knows the log's exact count,
-  so writers may turn to compaction together. Separately, the probe path
-  (tail reads off) is slower there than the catalog before format 3: its
-  resend's trailer read, or another change since fileio e505a0f. A trace of
-  each commit's attempts in the driver would tell them apart.
+- **Tail reads past the commit knee** (step 6, E1 at 1,000 tables): answered
+  by the traces. Writers that learned the exact count compacted together, and
+  lost to each other ([Compaction after the
+  commit](#compaction-after-the-commit)). Still open: the probe path (tail
+  reads off) is slower there than the catalog before format 3, its resend's
+  trailer read or another change since fileio e505a0f; and whether a writer
+  should estimate a compaction's chance to land (its log's growth rate
+  against its last compaction's time) and skip one that cannot (errata D14).
