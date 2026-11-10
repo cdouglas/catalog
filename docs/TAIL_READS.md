@@ -1,8 +1,10 @@
 # Reading the log's tail (design)
 
 Status: proposed 2026-11-06, revised 2026-11-09 after two reviews. Step 0
-(reads of one version on every store) is built, pending a real-cloud run of
-its contract cases; the rest awaits approval.
+(reads of one version on every store) is built and passed its real-cloud
+run, and step 0b's probes of the metadata alternative passed on S3 Express
+and ADLS (2026-11-09); the rest awaits approval, and step 2 a choice between
+the trailer and metadata.
 It answers errata D15 (whole-object reads) and S5 (a read's continuity is the
 store's word): on one object by a format change, with T6 (the fuzzers pin
 reads) as its test, and on any log by positions in the SPI, which close S4
@@ -267,11 +269,32 @@ no read (D20).
 
 **A probe** (`probe()`, a HEAD) stays for what only needs existence and length
 (`LogRuntime.empty`, `bootstrap`). The commit loop stops probing after a lost
-append race and tail-reads instead, for two reasons:
+append race and tail-reads instead.
+
+Today the loop resends the same record onto whatever base a probe finds.
+After a lost append race it takes a HEAD (the ETag and the length) and, if
+the object is no shorter, appends the record again conditioned on that ETag,
+without reading what it now follows. That includes a replace that made the
+object longer: `continues` compares lengths, so a new checkpoint reads as
+growth, and the record lands after a checkpoint its writer never read. That
+is safe for the record. Its bytes name no base, replay checks its
+preconditions where it lands, and a copy of a record that already landed
+applies once (by its id in the committed set, or the floor). The writer only
+learns nothing about what it appended after, so its read through the write
+reads the object back (D20).
+
+In format 3 the record's bytes stay the same on every send, but its frame does
+not. `append` builds each frame from the tail the send is conditioned on: the
+incarnation from that tail's view, the offset from its length, and the
+condition from its version, all from one pinned read. A probe's tail has a
+version and no view, so a frame for it would take its incarnation from an
+older read. Appended under the probe's ETag, it would carry the old object's
+incarnation into the new one, and every check of the new object would fail
+from that frame on, until a replace. So:
 
 - the resend must name the incarnation of the object it lands in, and a HEAD
-  does not say it (a resend framed with an old incarnation into a replace
-  would make the object unreadable);
+  does not say it (with the incarnation in metadata, a HEAD would: see
+  [Alternatives](#alternatives-considered));
 - with the records that beat it in hand, the resend's read through needs no
   read: today that read is a whole GET.
 
@@ -415,12 +438,15 @@ Each step stands alone and is measured before the next:
    again; the contract suite has read cases. It closes T6's whole-read half
    on the store's word, at no cost, and turns a read that raced a replace
    into a 412 instead of a transfer that fails the format's checks later.
-   Open: a real-cloud run of the read cases. If S3 Express does not honour
-   `If-Match` on a GET, the case says so, and step 2 is its only check.
-   - **0b. Probe the metadata alternative** on the real stores, in the same
-     run: small cases, as `GcsRapidCanaries` probes Rapid buckets, of the
-     three behaviours the alternative rests on ([Alternatives](#alternatives-considered)).
-     Their results choose between the trailer and metadata for step 2.
+   The read cases passed on every store (fork 7a5d42de5e, `cloud-runs/`
+   2026-11-09-contract-b): S3 Express, S3 Standard, ADLS, GCS and GCS Rapid,
+   each case its store supports. S3 Express honours `If-Match` on a GET.
+   - **0b. Probe the metadata alternative** (fork 18c87db437,
+     `S3ExpressMetadataProbes`, `AdlsMetadataProbes`, in the same run): small
+     cases, as `GcsRapidCanaries` probes Rapid buckets, of the three
+     behaviours the alternative rests on. All three hold on S3 Express and
+     ADLS ([Alternatives](#alternatives-considered)). Their results choose
+     between the trailer and metadata for step 2.
 1. **Pricing.** Ranged reads priced by their bytes in `LatencyFileIO` and
    catalog-bench. No behaviour changes; catalog-bench's numbers must not
    move.
@@ -459,10 +485,13 @@ Then R2.3, with a read's cost known.
   whose response names the version, the length and the incarnation (the
   headers), with no change to the format, and a probe would learn the
   incarnation, so the commit loop could resend after one. Each check would
-  rest on three behaviours of each store, where the trailer rests on none,
-  is tested by the fuzzers' read modes alone, and leaves the bytes
-  self-describing for tools (the format explorer) and copies. A smaller
-  change, if the user prefers a store's word per deployment.
+  rest on three behaviours of each store, which step 0b found on S3 Express
+  and ADLS (below), and which a store could change: the probes would run
+  with the contract, as canaries. The trailer rests on none, is tested by
+  the fuzzers' read modes alone, catches a store that breaks its read
+  contract (S5), and leaves the bytes self-describing for tools (the format
+  explorer) and copies. Metadata is the smaller change, if the user prefers
+  a store's word per deployment.
 
   It would fit `SupportsAtomicOperations` as one more thing a file reports:
   an incarnation that a CAS draws and sets with the object it writes, that
@@ -470,16 +499,20 @@ Then R2.3, with a read's cost known.
   they found (a fork interface beside `InputFile`). GCS needs none: the
   fork's GCS writes are replaces only (Rapid buckets too: nothing appends to
   a catalog's live object, `GcsRapidCanaries`), so a tail read never
-  applies. Step 0b's probes, on S3 Express and ADLS:
+  applies. Step 0b's probes, on S3 Express and ADLS, all passed
+  (2026-11-09):
 
-  - a replace sets the metadata, in the same request as its bytes (S3's
-    conditional `PutObject`; ADLS's staged Append Blob, then the rename that
-    replaces the live object: does the metadata move with it?);
-  - an append keeps it (S3 Express's `PutObject` at a write offset, which
-    may not take metadata of its own; ADLS's `AppendBlock`);
-  - a ranged GET and a HEAD report it, for the version that served them,
-    and a GET pinned to a superseded version reports nothing of the new
-    one.
+  - A replace sets the metadata with its bytes: S3's conditional
+    `PutObject`, and on ADLS the staged Append Blob's metadata, which the
+    rename that replaces the live object carries onto it.
+  - An append keeps it: S3 Express's `PutObject` at a write offset, ADLS's
+    `AppendBlock`. Neither can change it: ADLS's `AppendBlock` takes no
+    metadata, and S3 Express refuses an append that names some (400
+    `InvalidArgument`, "Cannot specify both a write offset value and
+    user-defined object metadata for existing objects").
+  - A ranged read reports it, with the version and the object's length
+    (`Content-Range`), for the version that served it, in one response; a
+    read pinned to a version an append or a replace superseded gets a 412.
 - **The incarnation in the header or the checkpoint only**, read by a
   second ranged GET. S3 serves one range a GET, so a tail read would take
   three requests, and a whole read spliced after the checkpoint would still
@@ -507,5 +540,5 @@ Then R2.3, with a read's cost known.
   markers take offsets: its provider's rule for one record following
   another. No production shared log exists; step 3 builds positions on the
   in-memory one, whose positions are dense.
-- **S3 Express and `If-Match` on a GET**: step 0's contract case says
-  whether directory buckets honour it.
+- **S3 Express and `If-Match` on a GET**: answered by step 0's run; directory
+  buckets honour it.
