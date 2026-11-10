@@ -808,6 +808,22 @@ attempts (`LogCatalog.commitOnAFreshRead`, `dropTable`,
 A catalog transaction is not restaged: it conflicts on the whole version of
 each table it pins ([errata.md](errata.md) §D12).
 
+### Tracing
+
+A thread that opens a `CommitTrace` gets the runtime's events on it, each
+with the time and the thread's CPU time it came at, until it drains them; a
+thread without one costs a thread-local lookup per event. A commit reports
+its start and end (how it ended, the races it lost), each attempt (append or
+replace), a replace's payload ready, each write sent and how it ended
+(landed, lost, ambiguous), each wait after a lost race, each probe, and each
+read in three steps: begun (after a tail or whole), its view arrived (whole
+or records alone, and how many), and replayed; then the replica adopted (its
+state built). A client's reads (`read(floor)`: loads and refreshes) report
+the same steps. So the time a step took is the gap to the next event, and its
+CPU the gap in CPU time: a read's I/O is begun to arrived, its replay arrived
+to replayed. catalog-bench records each job's trace (`trace_commits`), for
+TAIL_READS.md's question of tail reads past the commit knee.
+
 ## Compaction
 
 Compaction bounds what a reader replays, and with GC, the committed set.

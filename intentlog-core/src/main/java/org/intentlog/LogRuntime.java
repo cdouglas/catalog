@@ -115,10 +115,13 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
    * SharedLog#readAfter}), when the log still continues it.
    */
   public Replica<S> read(Replica<S> floor) {
-    if (floor != null && config.tailReads()) {
-      return newer(floor, readAfter(floor, null, floor.logId()).replica());
-    }
-    return newer(floor, replay(log.read(), null, null, floor).replica());
+    boolean after = floor != null && config.tailReads();
+    CommitTrace.event(CommitTrace.Kind.READ, after ? 1 : 0, 0);
+    Replica<S> read = after
+        ? readAfter(floor, null, floor.logId()).replica()
+        : replay(viewed(log.read()), null, null, floor).replica();
+    CommitTrace.event(CommitTrace.Kind.REPLAYED);
+    return newer(floor, read);
   }
 
   /**
@@ -131,9 +134,9 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
   private Replayed readAfter(Replica<S> prior, UUID watch, UUID logId) {
     LogView view;
     try {
-      view = log.readAfter(prior.tail());
+      view = viewed(log.readAfter(prior.tail()));
     } catch (TrimmedException e) {
-      return replay(log.read(), watch, logId, prior);
+      return replay(viewed(log.read()), watch, logId, prior);
     }
     return replayAfter(view, prior, watch, logId);
   }
@@ -141,7 +144,14 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
   /** {@code view}, a read after {@code prior}'s tail, replayed onto prior (as {@link #readAfter}). */
   private Replayed replayAfter(LogView view, Replica<S> prior, UUID watch, UUID logId) {
     Replayed folded = foldAfter(view, prior, watch, logId);
-    return folded != null ? folded : replay(log.read(), watch, logId, prior);
+    return folded != null ? folded : replay(viewed(log.read()), watch, logId, prior);
+  }
+
+  /** {@code view}, reported to the thread's trace as it arrives ({@link CommitTrace}). */
+  private static LogView viewed(LogView view) {
+    CommitTrace.event(CommitTrace.Kind.VIEW, view.checkpoint().isPresent() ? 1 : 0,
+        view.records().size());
+    return view;
   }
 
   /**
@@ -935,6 +945,25 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     }
 
     Replica<S> run() {
+      CommitTrace.event(CommitTrace.Kind.COMMIT, base.intentionRecords(), record.length);
+      try {
+        Replica<S> landed = attempts();
+        CommitTrace.event(CommitTrace.Kind.END, 0, lostRaces);
+        return landed;
+      } catch (CommitRejectedException e) {
+        CommitTrace.event(CommitTrace.Kind.END,
+            e.reason() == CommitRejectedException.Reason.EXHAUSTED ? 3 : 1, lostRaces);
+        throw e;
+      } catch (CommitOutcomeUnknownException e) {
+        CommitTrace.event(CommitTrace.Kind.END, 2, lostRaces);
+        throw e;
+      } catch (RuntimeException e) {
+        CommitTrace.event(CommitTrace.Kind.END, 4, lostRaces);
+        throw e;
+      }
+    }
+
+    private Replica<S> attempts() {
       try {
         return loop();
       } catch (LogNotSentException e) {
@@ -999,6 +1028,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
                       || config.compaction().due(new CompactionPolicy.Input(
                           current.intentionRecords(), current.checkpointBytes(), bytes(tail),
                           record.length)));
+          CommitTrace.event(CommitTrace.Kind.ATTEMPT, attempt, mustReplace ? 1 : 0);
 
           if (mustReplace) {
             if (stale) {
@@ -1017,8 +1047,10 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
             full = false;
             // The payload, its pages put: before the write, whose failures leave it ambiguous
             Prepared replace = prepare(current);
+            CommitTrace.event(CommitTrace.Kind.PREPARED, replace.checkpoint.length, 0);
             try {
               LogTail at = tail;
+              CommitTrace.event(CommitTrace.Kind.SEND, 1, 0);
               Replayed written =
                   write(() -> log.replace(at, replace.checkpoint, replace.records), false);
               tidyPages(replace.dropped, replace.sealed, written.result.committed().build());
@@ -1027,6 +1059,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
               deleteDroppedStatePages(checkpointed);
               return validate(written);
             } catch (LogConflictException e) {
+              CommitTrace.event(CommitTrace.Kind.LOST, 0, 0);
               unresolved = e;
               raceBackoff(e);
             }
@@ -1050,9 +1083,11 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
             try {
               LogTail at = tail;
               boolean conditional = caps.conditionalAppend();
+              CommitTrace.event(CommitTrace.Kind.SEND, 0, 0);
               return validate(
                   write(() -> log.append(record, conditional ? at : null), !conditional));
             } catch (LogFullException e) {
+              CommitTrace.event(CommitTrace.Kind.LOST, 1, 0);
               // Nothing landed, and no append to this log can: replace it, on a fresh read.
               // Without this the commit took the append for ambiguous, and with a count above the
               // store's limit no writer ever compacted (Bug 66).
@@ -1060,6 +1095,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
               stale = true;
               continue;
             } catch (LogConflictException e) {
+              CommitTrace.event(CommitTrace.Kind.LOST, 0, 0);
               unresolved = e;
               raceBackoff(e);
             }
@@ -1085,8 +1121,11 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
             // the id out of the set (GC, or paging: docs/COMMITTED_PAGING.md), so the floor is
             // what rejects such a copy. Append it again at the new tail without reading the log:
             // only the tail is needed.
+            CommitTrace.event(CommitTrace.Kind.PROBE);
             LogTail probed = probe();
-            if (!probed.continues(tail)) {
+            boolean continues = probed.continues(tail);
+            CommitTrace.event(CommitTrace.Kind.PROBED, continues ? 1 : 0, 0);
+            if (!continues) {
               // The log was replaced (compacted). Read it, so that the next decision sees its
               // record count; afresh, as above, since the version may be replaced by now.
               Replayed fresh = read();
@@ -1104,6 +1143,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
             }
           }
         } catch (AmbiguousWrite e) {
+          CommitTrace.event(CommitTrace.Kind.AMBIGUOUS);
           // The write may have landed: its reply was lost, or reading back what it wrote failed.
           // Its record carries this intention's id, so a fresh read says which. If it has not
           // landed, retry from the fresh state: a write still in flight carries the same record
@@ -1169,11 +1209,14 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
         return;
       }
       long bound = Math.min(base << Math.min(lostRaces - 1, 20), Math.max(1_000L, base));
-      sleep(ThreadLocalRandom.current().nextLong(bound + 1), lost);
+      long wait = ThreadLocalRandom.current().nextLong(bound + 1);
+      CommitTrace.event(CommitTrace.Kind.BACKOFF, wait, 0);
+      sleep(wait, lost);
     }
 
     private void adopt(Replayed fresh) {
       current = fresh.replica();
+      CommitTrace.event(CommitTrace.Kind.ADOPTED);
       tail = current.tail();
       stale = false;
       if (!caps.fusedReplace()) {
@@ -1287,6 +1330,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
         } catch (RuntimeException e) {
           throw new AmbiguousWrite(e);
         }
+        CommitTrace.event(CommitTrace.Kind.LANDED);
         if (unconditional && lastThrottle != null) {
           // The throttled send may have landed beside this one, and a view through this one may
           // start from a checkpoint that holds the other (dup in SharedLogCommit.tla).
@@ -1296,6 +1340,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
         try {
           written =
               replay(log.readThrough(receipt, config.visibilityWait()), id, base.logId(), current);
+          CommitTrace.event(CommitTrace.Kind.REPLAYED);
         } catch (RuntimeException e) {
           throw new AmbiguousWrite(e);
         }
@@ -1323,15 +1368,20 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     private Replayed read() {
       try {
         boolean after = config.tailReads() && current != null;
-        LogView view = upToFloor(after ? this::fetch : log::read);
+        CommitTrace.event(CommitTrace.Kind.READ, after ? 1 : 0, 1);
+        LogView view = viewed(upToFloor(after ? this::fetch : log::read));
         if (after) {
           Replayed folded = foldAfter(view, current, id, base.logId());
           if (folded != null) {
+            CommitTrace.event(CommitTrace.Kind.REPLAYED);
             return folded;
           }
-          view = upToFloor(log::read); // records alone it cannot fold: read whole, as below
+          // records alone it cannot fold: read whole, as below
+          view = viewed(upToFloor(log::read));
         }
-        return replay(view, id, base.logId(), current);
+        Replayed replayed = replay(view, id, base.logId(), current);
+        CommitTrace.event(CommitTrace.Kind.REPLAYED);
+        return replayed;
       } catch (CommitOutcomeUnknownException e) {
         throw new UnreadableLog((RuntimeException) e.getCause()); // interrupted waiting
       } catch (RuntimeException e) {

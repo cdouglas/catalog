@@ -392,6 +392,40 @@ class TestLogRuntime {
   }
 
   @Test
+  void aTracedCommitReportsEachAttemptItsWritesAndReads() {
+    Replica<Map<String, Integer>> base = created();
+    log.beforeNextWrite(() -> otherWriterBumps("other"));
+    CommitTrace.open();
+    try {
+      bump(base, "mine");
+      List<CommitTrace.Event> events = CommitTrace.drain();
+      assertThat(events).extracting(CommitTrace.Event::kind).containsExactly(
+          CommitTrace.Kind.COMMIT,
+          CommitTrace.Kind.ATTEMPT, CommitTrace.Kind.SEND, CommitTrace.Kind.LOST,
+          CommitTrace.Kind.READ, CommitTrace.Kind.VIEW, CommitTrace.Kind.REPLAYED,
+          CommitTrace.Kind.ADOPTED,
+          CommitTrace.Kind.ATTEMPT, CommitTrace.Kind.SEND, CommitTrace.Kind.LANDED,
+          CommitTrace.Kind.REPLAYED,
+          CommitTrace.Kind.END);
+      // the second attempt appends; the scripted log's read after a tail is the whole log (the
+      // creation's record and the other writer's); one race lost
+      assertThat(events.get(8).a()).isEqualTo(1);
+      assertThat(events.get(8).b()).isZero();
+      assertThat(events.get(5).a()).isEqualTo(1);
+      assertThat(events.get(5).b()).isEqualTo(2);
+      assertThat(events.get(12).a()).isZero();
+      assertThat(events.get(12).b()).isEqualTo(1);
+      assertThat(events).isSortedAccordingTo(
+          java.util.Comparator.comparingLong(CommitTrace.Event::nanos));
+      assertThat(CommitTrace.drain()).isEmpty();
+    } finally {
+      CommitTrace.close();
+    }
+    bump(base, "untraced");
+    assertThat(CommitTrace.drain()).isEmpty();
+  }
+
+  @Test
   void aLostAppendRaceToAReplaceReadsTheReplaceWhole() { // [TailRead, replaced]
     Replica<Map<String, Integer>> base = created();
     log.beforeNextWrite(() -> {
