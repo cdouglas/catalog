@@ -1,10 +1,10 @@
 # Reading the log's tail (design)
 
-Status: proposed 2026-11-06, revised 2026-11-09 after two reviews. Step 0
-(reads of one version on every store) is built and passed its real-cloud
-run, and step 0b's probes of the metadata alternative passed on S3 Express
-and ADLS (2026-11-09); the rest awaits approval, and step 2 a choice between
-the trailer and metadata.
+Status: proposed 2026-11-06, revised 2026-11-09 after two reviews, approved
+2026-11-10: steps 1-7 with the trailer (not the incarnation in metadata),
+step 3 included. Step 0 (reads of one version on every store) is built and
+passed its real-cloud run, and step 0b's probes of the metadata alternative
+passed on S3 Express and ADLS (2026-11-09).
 It answers errata D15 (whole-object reads) and S5 (a read's continuity is the
 store's word): on one object by a format change, with T6 (the fuzzers pin
 reads) as its test, and on any log by positions in the SPI, which close S4
@@ -513,8 +513,9 @@ Each step stands alone and is measured before the next:
      `S3ExpressMetadataProbes`, `AdlsMetadataProbes`, in the same run): small
      cases, as `GcsRapidCanaries` probes Rapid buckets, of the three
      behaviours the alternative rests on. All three hold on S3 Express and
-     ADLS ([Alternatives](#alternatives-considered)). Their results choose
-     between the trailer and metadata for step 2.
+     ADLS ([Alternatives](#alternatives-considered)). With both possible,
+     step 2 takes the trailer (decided 2026-11-10), which rests on no store
+     behaviour.
 1. **Pricing.** Ranged reads priced by their bytes in `LatencyFileIO` and
    catalog-bench. No behaviour changes; catalog-bench's numbers must not
    move.
@@ -558,8 +559,9 @@ Then R2.3, with a read's cost known.
   with the contract, as canaries. The trailer rests on none, is tested by
   the fuzzers' read modes alone, catches a store that breaks its read
   contract (S5), and leaves the bytes self-describing for tools (the format
-  explorer) and copies. Metadata is the smaller change, if the user prefers
-  a store's word per deployment.
+  explorer) and copies. Metadata is the smaller change, for a deployment
+  that prefers a store's word; not chosen (2026-11-10), and the probes stay
+  as a record of what the stores do.
 
   It would fit `SupportsAtomicOperations` as one more thing a file reports:
   an incarnation that a CAS draws and sets with the object it writes, that
