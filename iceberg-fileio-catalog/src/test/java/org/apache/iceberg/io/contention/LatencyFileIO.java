@@ -190,7 +190,8 @@ public final class LatencyFileIO implements SupportsAtomicOperations, SupportsPr
     public SeekableInputStream newStream() {
       SeekableInputStream stream = file.newStream();
       bound = true;
-      return new TimedInputStream(stream, file.getLength(), file.location().equals(catalogLocation));
+      boolean catalog = file.location().equals(catalogLocation);
+      return new TimedInputStream(stream, file.getLength(), catalog);
     }
 
     @Override

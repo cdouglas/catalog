@@ -536,7 +536,14 @@ Each step stands alone and is measured before the next:
      behaviour.
 1. **Pricing.** Ranged reads priced by their bytes in `LatencyFileIO` and
    catalog-bench. No behaviour changes; catalog-bench's numbers must not
-   move.
+   move. Built 2026-11-10 (fileio 1b3314e), and they did not: catalog-bench
+   campaign `tr1-pricing` (E1 at 300 tables on `s3x-2026-11`, 32 workers,
+   two runs each, 120 s measured) on fileio 69fdfdd and 1b3314e gave a
+   merge append's p50 of 154.8 and 153.5 ms inline ML, 108.7 and 109.5 ms
+   inline TM; 2.29 and 2.32 catalog GETs a commit (ML), 2.28 and 2.29 (TM);
+   11.7 and 11.9 MiB read (ML), 6.04 and 6.08 (TM). Its HEADs are only the
+   probes after lost appends: the model charges a whole read none
+   ([Pricing](#pricing), "The HEAD").
 2. **Format 3 and checked reads.** Trailers, the checks, a read again on a
    failed check, the explorer, the read modes in `InMemoryAtomicFileIO`, and
    fuzz rounds in each mode. This alone closes T6 and the one-object half of

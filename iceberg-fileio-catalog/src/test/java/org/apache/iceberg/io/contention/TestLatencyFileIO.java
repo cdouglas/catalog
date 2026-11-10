@@ -28,7 +28,7 @@ import org.apache.iceberg.io.SeekableInputStream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-/** The latency model's reads: a GET is priced by the bytes it asks for (TAIL_READS.md "Pricing"). */
+/** The latency model's reads: a GET is priced by the bytes it asks for (TAIL_READS.md). */
 class TestLatencyFileIO {
   private static final String CATALOG = "mem:///wh/catalog";
   private static final int SIZE = 3 * 1024 * 1024;
