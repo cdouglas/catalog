@@ -1,10 +1,12 @@
 # Reading the log's tail (design)
 
-Status: proposed 2026-11-06; nothing built. It answers errata D15 (whole-object
-reads) and the one-object half of S5 (a read's continuity is the store's
-word), with T6 (the fuzzers pin reads) as its test; S4 (shared logs' checkpoint
-joints) stays open. It comes before R2.3 of [CHECKPOINT_PLAN.md](CHECKPOINT_PLAN.md)
-(a cost-based compaction policy), whose costs it changes.
+Status: proposed 2026-11-06, revised 2026-11-09 after review; nothing built.
+It answers errata D15 (whole-object reads) and S5 (a read's continuity is the
+store's word): on one object by a format change, with T6 (the fuzzers pin
+reads) as its test, and on any log by positions in the SPI, which close S4
+(shared logs' checkpoint joints). It comes before R2.3 of
+[CHECKPOINT_PLAN.md](CHECKPOINT_PLAN.md) (a cost-based compaction policy),
+whose costs it changes.
 
 ## Context
 
@@ -20,15 +22,15 @@ the resend has no bytes to extend and reads the object back.
 catalog-bench measured it (campaign `e1-d20`, S3 Express `s3x-2026-11`, which
 prices a read at 7 ms a MiB; the lowest offered load, three runs each):
 
-| Mode | Tables | MiB a GET | GETs a merge append | MiB read a merge append | p50 |
-|---|---|---|---|---|---|
-| inline ML | 100 | 2.5 | 2.1 | 5.1 | 149 ms |
-| | 300 | 7.5 | 2.4 | 18.3 | 350 ms |
-| | 1,000 | 24.3 | 4.1 | 99.3 | 8,528 ms (saturated) |
-| inline TM | 100 | 0.8 | 2.1 | 1.7 | 128 ms |
-| | 300 | 2.5 | 2.3 | 5.7 | 163 ms |
-| | 1,000 | 8.2 | 3.1 | 25.4 | 558 ms |
-| pointer | 3,000 | 1.1 | 3.2 | 3.5 | 242 ms |
+| Mode      | Tables | MiB a GET | GETs a merge append | MiB read a merge append | p50                  |
+| --------- | ------ | --------- | ------------------- | ----------------------- | -------------------- |
+| inline ML | 100    | 2.5       | 2.1                 | 5.1                     | 149 ms               |
+|           | 300    | 7.5       | 2.4                 | 18.3                    | 350 ms               |
+|           | 1,000  | 24.3      | 4.1                 | 99.3                    | 8,528 ms (saturated) |
+| inline TM | 100    | 0.8       | 2.1                 | 1.7                     | 128 ms               |
+|           | 300    | 2.5       | 2.3                 | 5.7                     | 163 ms               |
+|           | 1,000  | 8.2       | 3.1                 | 25.4                    | 558 ms               |
+| pointer   | 3,000  | 1.1       | 3.2                 | 3.5                     | 242 ms               |
 
 Every one of these commits appended. E1's tables are shallow, so snapshot
 paging (SNAPSHOT_PAGING.md) does not shrink them: the object grows with the
@@ -39,6 +41,83 @@ a merge append made four.
 Only a store that appends gains: S3 Express and ADLS. On S3 general-purpose
 buckets and GCS every commit replaces the object, so a read after another
 writer's commit reads a new object, whole, as now.
+
+## Positions: what every log's reads must show
+
+Tail reads are one object's case of a question every log answers: how a
+reader knows that what a read returned is the log (P1, LOG.md). It needs
+three things, whatever the deployment:
+
+1. **One prefix.** The view's checkpoint and records are one prefix of the
+   log, not pieces of two versions of it (on S3 today, T6).
+2. **The joint.** The records start where the checkpoint ends, with none
+   missing between (S4: a log that stores its checkpoints apart, such as
+   checkpoints in S3 and records in Kafka).
+3. **A suffix continues.** The records a read returns after a tail the
+   reader holds (`SharedLog.readAfter`) follow that tail, and are not those
+   of a log that replaced it (D15).
+
+Each is a statement about positions. Every record has one in the log's
+order, and every checkpoint covers the log through one; a read is right if
+each record's position follows the one before it, starting at the
+checkpoint's or at the held tail's. An overlap is harmless: a record that a
+checkpoint holds, read again after it, does not apply twice (replay drops it
+by its id in the committed set, or by the floor; the commit-protocol
+fuzzer's DUPLICATE steps). A gap or a splice is not: the missing records'
+effects are lost, and a spliced view is a state the log never held.
+
+What prepared a record does not matter here. A record written against
+checkpoint C_k that lands after C_{k+1} is judged where it lands: replay
+checks its preconditions there. The reader needs only to know truly where
+each record landed.
+
+Who knows the positions depends on the log:
+
+- **A log that assigns them** (CORFU's sequencer, Kafka's offsets,
+  `InMemorySharedLog`'s 1, 2, ...) returns each record with its position, so
+  its reads are already positions. What it lacks is the joint. The SPI hands
+  a provider the position a checkpoint covers (`putCheckpoint(LogTail
+  through, ...)`), and `InMemorySharedLog` keys its checkpoints by it, but
+  the checkpoint's bytes do not carry it, and no read checks it. With
+  checkpoints in S3 and records in Kafka, Kafka's retention deletes records
+  whatever the checkpoints say, and a consumer whose reset policy is
+  `earliest` skips the gap silently.
+- **One object** (`AtomicFileLog`) has none to return: a byte store returns
+  bytes. Its writer knows each record's position exactly, though, since its
+  append is conditioned on the exact version and length it extends; so it
+  writes the position into the frame. That is the trailer below: the
+  object's incarnation and the frame's offset are the record's position,
+  and the checksum binds them to the frame's bytes. A replace writes the
+  checkpoint and its records in one write, so the trailers check the joint
+  too.
+
+Writes need none of this. A write is conditioned on the tail its writer
+read (P4), so it lands only where the writer expected. `AtomicFileLog`'s
+receipt for an append from a view it read or wrote holds that view and the
+new record (`append`), contiguous by the store's condition, not by a check.
+Only reads rest on the store's word.
+
+So, for every log:
+
+- A checkpoint names the position it covers: `LogCheckpoint.through`,
+  opaque bytes the provider encodes from the tail the compaction read. A
+  read checks that its records start there.
+- A view of records alone (`readAfter`) states the position they start
+  after, and the runtime folds them onto a replica only if that is the
+  replica's tail. `LogRuntime.refresh` folds them unchecked today; the
+  catalog does not call it (only tests do), but tail reads would. A whole
+  view's fold already compares bytes (`LogRuntime.continued`).
+- Each provider checks its records' chain by its own rule: dense for a
+  sequencer, the trailers for one object, and its own for a log whose
+  positions skip (Kafka's transaction markers take offsets).
+
+Resyncing on a suffix is then an optimization a log offers or not. From a
+tail the reader holds, the provider returns what follows it, or a whole view,
+or fails (`TrimmedException`), and the runtime reads whole. The hazard is a
+suffix read that should fail and does not. A Kafka fetch at a trimmed offset
+fails if the consumer's reset policy is `none`. An S3 GET cannot be
+conditioned on "still the object I read" (an append changes the ETag), so on
+one object the check is on the bytes that come back.
 
 ## What a tail read must show
 
@@ -54,7 +133,14 @@ today:
   bytes at N then fall anywhere in it. `FileTail.continues` compares lengths
   and so reads such a replace as growth; the commit loop survives it (a
   resend of the same record applies once), but a reader that took the bytes
-  at N for records would replay a state the log never held.
+  at N for records would replay a state the log never held. The worst case
+  is a frame boundary at N in the new object: the compaction that wrote
+  C_{k+1} kept records whose frames happen to end there. The frames from N
+  decode, and the reader would replay them after its own, missing whatever
+  C_{k+1} holds before N. Only the position tells N in C_{k+1}'s object from
+  N in C_k's. The reader need not reread the header to see it: the frame
+  that ends at N names its object, in the 20 bytes the tail read's GET
+  starts with (below).
 - A version does not. An append changes the ETag or generation, and no store
   says whether one version extends another.
 - A read pinned to a version (S3's `If-Match`, which the fork does not send;
@@ -65,9 +151,29 @@ And on S3 a read is not pinned at all (T6): a GET that races a replace, or a
 stream the SDK reopens mid-read, can return the start of one object and the
 rest of another. A splice at a frame boundary decodes today (S5).
 
+The fork's S3 reads send no `If-Match`. `S3InputStream.openStream` and
+`readRange` ask for the bucket, the key and a range; `S3InputFile`'s ETag
+conditions writes alone. The contract suite
+(`SupportsAtomicOperationsContractTest`) does not notice, because it tests
+writes: its 16 cases are creates, CAS, appends, their races and the segment
+limit, and none reads across a write. A read is unpinned only between its
+HEAD and its GET, or across a reopen after a read error, and nothing opens
+that window: the catalog suites' races are writes, and a read that raced
+one fails at its reader's next write, which is conditioned on the HEAD's
+version (P4). Under the fuzzers, `InMemoryAtomicFileIO` pins every read
+(T6). A contract case would open it: bind a file to a version, replace the
+object, then read the file. It must return the old version's bytes or fail.
+It would fail on S3 today, and it would say whether S3 Express honours
+`If-Match` on a GET.
+
 So the format carries what a tail read checks, as S5 proposes: each frame
 names the object it belongs to and where it starts, with a checksum over
-both and its bytes.
+both and its bytes. A nonce in the checkpoint alone, which a provider of
+separate checkpoints needs ([Positions](#positions-what-every-logs-reads-must-show)),
+is not enough on one object: the checkpoint is at the object's head, so a
+tail read would need another request to see it, and a whole read spliced
+after the checkpoint would still decode, since the frames after it would
+name nothing.
 
 ## The format (version 3)
 
@@ -193,6 +299,15 @@ its time is `LatencyFileIO`'s.
   tools.
 - `LogRuntime`: `read(floor)` and the commit loop's reads through
   `readAfter`; no probe after a lost append race.
+- Positions in the SPI (intentlog-core): `LogCheckpoint.through` (the
+  provider's encoding of the tail a compaction read), a view of records
+  alone stating the tail it starts after, and the runtime's checks of both
+  (a whole view's joint; a fold only onto the tail a view starts after).
+  `InMemorySharedLog` encodes its positions; `AtomicFileLog`'s joint is its
+  trailers. LOG.md's P1 says what a provider must check, not only provide.
+- The fork's S3 reads pinned by `If-Match` to the version the file is bound
+  to, across reopens (`S3InputStream`), and the contract case for a read
+  across a write (`SupportsAtomicOperationsContractTest`).
 - The ablation switch `fileio.catalog.read.tail` (default true; false reads
   whole, as before), since the paper reports it (CHECKPOINT_PLAN.md
   "Ablation switches"). The format's checks have no switch.
@@ -219,6 +334,11 @@ its time is `LatencyFileIO`'s.
   same length, a splice at and inside a frame, a tail read with nothing new,
   a tail read whose GET finds the object shorter than its HEAD did.
   `SharedLogContract`'s `readAfter` case on `AtomicFileLog`.
+- Gaps on a shared log (S4): a `MemoryLogHarness` mode that serves a
+  checkpoint and records with a gap between them, or trims past its newest
+  checkpoint, and a `SharedLogContract` case; every such read must fail.
+- The contract case for a read across a write, on every store (real cloud),
+  before and after S3's reads are pinned.
 - Mutants (`fuzz/mutants`): a tail read that checks the length only, no
   checksum, a resend after a probe framed with its old tail's incarnation.
   Each must break a fuzzer.
@@ -226,14 +346,21 @@ its time is `LatencyFileIO`'s.
   incarnation and each record its frame; readers hold replicas and tail-read;
   a read may return a later version or splice two (S3); the oracle that no
   replica holds a state the log never held; bug switches for continues by
-  length, no trailer check, and a resend after a probe. The
-  shared-log model is unchanged (S4).
+  length, no trailer check, and a resend after a probe. The shared-log
+  model (`SharedLogCommit.tla`) gains a provider that serves a gap, the
+  same oracle, and a switch for an unchecked joint (S4).
 - Havoc rounds in each read mode, as for the earlier steps.
 
 ## Order of work
 
 Each step stands alone and is measured before the next:
 
+0. **Pin S3's reads** (a fork change), with the contract case for a read
+   across a write. It closes T6's whole-read half on the store's word, at
+   no cost, and turns a read that raced a replace into a 412 instead of a
+   transfer that fails the format's checks later. If S3 Express does not
+   honour `If-Match` on a GET, the case says so, and step 2 is its only
+   check.
 1. **Pricing.** Ranged reads priced by their bytes in `LatencyFileIO` and
    catalog-bench. No behaviour changes; catalog-bench's numbers must not
    move.
@@ -241,15 +368,20 @@ Each step stands alone and is measured before the next:
    failed check, the explorer, the read modes in `InMemoryAtomicFileIO`, and
    fuzz rounds in each mode. This alone closes T6 and the one-object half of
    S5: whole reads detect a splice, whatever the store returns.
-3. **The model.** Incarnations, splices and tail reads in
-   `CatalogCommit.tla`, with the switches, before the Java that relies on
-   them (as for COMMITTED_PAGING.md's stage 2).
-4. **Tail reads.** `readAfter`, `read(floor)`, the commit loop, the switch,
+3. **Positions in the SPI** (S4). The checkpoint's `through`, the joint's
+   check, views of records that say where they start, and the gap-serving
+   harness and contract case, on `InMemorySharedLog`. It closes S5's
+   shared-log half for providers that pass the contract.
+4. **The model.** Incarnations, splices and tail reads in
+   `CatalogCommit.tla`, and gaps in `SharedLogCommit.tla`, with the
+   switches, before the Java that relies on them (as for
+   COMMITTED_PAGING.md's stage 2).
+5. **Tail reads.** `readAfter`, `read(floor)`, the commit loop, the switch,
    the mutants, havoc rounds.
-5. **Measure.** catalog-bench E1 at 300 and 1,000 tables on S3 Express, inline
+6. **Measure.** catalog-bench E1 at 300 and 1,000 tables on S3 Express, inline
    ML and TM, tail reads on and off; and E3's deep tables, whose sizes after
-   paging campaign `e3f-sp` gives.
-6. **One request a read** (if step 5 shows the HEAD): a ranged GET that
+   paging campaign `e3f-sp4` gives.
+7. **One request a read** (if step 6 shows the HEAD): a ranged GET that
    reports the version and length it read (S3's `ETag` and `Content-Range`,
    ADLS's and GCS's equivalents), so a tail read is one request. A fork
    change to the input files.
@@ -258,21 +390,32 @@ Then R2.3, with a read's cost known.
 
 ## Alternatives considered
 
-- **Pin S3's reads by `If-Match`** (the fork's `S3InputStream`). It stops a
-  whole read splicing, but not a tail read misreading a replace that grew
-  (above), and it is S3's guarantee rather than the format's. Worth adding
-  later as a cheaper failure (a 412 instead of a transfer that fails its
-  checks), if S3 Express honours it on GET.
-- **The incarnation in the header only**, read by a second ranged GET. S3
-  serves one range a GET, so a tail read would take three requests; the
-  trailer puts the check in the range the read needs anyway.
+- **Pinned reads alone** (step 0, without format 3). They stop a whole
+  read splicing, but not a tail read misreading a replace that grew
+  (above), and they are each store's guarantee rather than the format's.
+- **The incarnation in the object's metadata** (S3's `x-amz-meta-*`, ADLS's
+  metadata), which a replace sets, an append keeps, and the HEAD returns.
+  With pinned reads, a tail read would be a HEAD (version, length,
+  incarnation) and a GET pinned to that version, with no change to the
+  format, and a probe would learn the incarnation, so the commit loop could
+  resend after one. Each check would rest on three behaviours of each store
+  (a pinned GET, across reopens; metadata kept by an append; metadata in a
+  HEAD), each a contract case on real cloud, where the trailer rests on
+  none, is tested by the fuzzers' read modes alone, and leaves the bytes
+  self-describing for tools (the format explorer) and copies. A smaller
+  change, if the user prefers a store's word per deployment.
+- **The incarnation in the header or the checkpoint only**, read by a
+  second ranged GET. S3 serves one range a GET, so a tail read would take
+  three requests, and a whole read spliced after the checkpoint would still
+  decode; the trailer puts the check in the range the read needs anyway.
 - **A digest chain** (each frame naming its predecessor's digest). It detects
   what offsets and checksums do, at the cost of a digest the writer must hold
   for the frame before; the offset is checkable from the trailer alone.
 - **The trailer at the frame's head.** A reader would have to read from the
   start of the frame that ends at N, which may be the checkpoint.
 - **Records in a separate object** (a tail object beside a checkpoint object).
-  A different provider, with the joint S4 describes; out of scope.
+  A different provider, whose joint the checkpoint's `through` checks
+  ([Positions](#positions-what-every-logs-reads-must-show)); out of scope.
 
 ## Open questions
 
@@ -284,6 +427,9 @@ Then R2.3, with a read's cost known.
   to stop early is a commit-loop change, measured with step 4.
 - **A replica shared across a process's catalogs**, for engines that make a
   catalog per query.
-- **S4**: a shared log's checkpoint naming the last record it covers. No
-  production shared log exists, and `SharedLogContract` checks P1 and P5 on
-  the in-memory one; S4's trigger stands.
+- **A log whose positions skip**, such as Kafka's, where transaction
+  markers take offsets: its provider's rule for one record following
+  another. No production shared log exists; step 3 builds positions on the
+  in-memory one, whose positions are dense.
+- **S3 Express and `If-Match` on a GET**: step 0's contract case says
+  whether directory buckets honour it.

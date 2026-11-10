@@ -128,7 +128,9 @@ checkpoint that named the last record it holds (its position, or its id)
 would let a read check that the records after it start where it ends.
 
 **Trigger to revisit:** a provider that `SharedLogContract` does not cover,
-or a production shared log. S5 makes the format check the joint.
+or a production shared log. S5 makes the format check the joint: a checkpoint
+names the position it covers ([TAIL_READS.md](TAIL_READS.md) "Positions", step
+3).
 
 ### S5. A read's continuity is the store's word, not the format's
 
@@ -188,8 +190,10 @@ position (or a truncated digest), about 3% of a 330-byte record.
 
 **Trigger to revisit:** a dedicated task, before relying on S3 in production,
 before tail reads (D15), or before a production shared log (S4). It takes over
-the format half of D15 and the checks S4 and T6 ask for. The one-object half is
-planned in [TAIL_READS.md](TAIL_READS.md) (proposed 2026-11-06); S4 stays open.
+the format half of D15 and the checks S4 and T6 ask for. Both halves are
+planned in [TAIL_READS.md](TAIL_READS.md) (proposed 2026-11-06, revised
+2026-11-09): the one-object half by a frame trailer, the shared-log half by
+positions in the SPI ("Positions").
 
 ## Deferred Functionality
 
@@ -952,7 +956,7 @@ What remains:
 **Trigger to revisit:** before tail reads (D15), before relying on S3 or GCS
 in production, or when `InMemoryAtomicFileIO` binds a file at its lookup.
 The fuzzer read modes (a store that breaks its contract) are step 2 of
-[TAIL_READS.md](TAIL_READS.md).
+[TAIL_READS.md](TAIL_READS.md), whose step 0 this was.
 
 ## Known Unknowns
 
