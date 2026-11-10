@@ -450,7 +450,7 @@ FileIOCatalog number by a HEAD a read (on `s3x-2026-11` about 6 ms, on S3
 Standard about 27 ms, two or more a commit), and the baselines' too where
 Iceberg looks a file up after opening it (an Avro manifest list without a
 length). That is a change to the benchmark's model for every client, so it
-waits for step 6's numbers and a decision.
+waits for step 6's numbers and a decision (errata D23).
 
 ## What changes in the code
 
@@ -608,7 +608,14 @@ Each step stands alone and is measured before the next:
    with a whole read of the version it found. The fuzzers draw the switch
    (the protocol fuzzer from its seed, the fault fuzzer per writer, the
    others per run); the mutant set `fuzz/mutants/tailreads.sh` holds the
-   model's switches and a read without checksums.
+   model's switches and a read without checksums. Its first calibration on
+   havoc (`tr5-calib`, 300,000 tries) failed unmutated: on a shared log a
+   commit's read after a fold (whose replica keeps no view) of records it
+   could not fold read the log whole without the commit's floor, and a read
+   lagging behind the base rejected a commit whose resend had landed (the
+   model's `lagread`, which `SharedLogCommit.tla` states for whole reads; it
+   does not model reads after a tail on a shared log). Fixed, with
+   `TestSharedLogRuntime.aWholeReadAfterAFoldReadsUpToTheCommitsFloor`.
 6. **Measure.** catalog-bench E1 at 300 and 1,000 tables on S3 Express, inline
    ML and TM, tail reads on and off; and E3's deep tables, whose sizes after
    paging campaign `e3f-sp4` gives.

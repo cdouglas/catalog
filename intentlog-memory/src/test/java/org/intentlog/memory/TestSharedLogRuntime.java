@@ -410,6 +410,30 @@ class TestSharedLogRuntime {
     assertAppliedOnce("t");
   }
 
+  /**
+   * With tail reads, a commit's read after a fold (whose replica keeps no view) that cannot fold
+   * records alone reads the log whole, and that read must reach the commit's floor too: one from
+   * an older checkpoint that lags behind the base finds the transaction not holding yet, and
+   * rejected a commit whose resend had landed (TestMemoryCommitProtocol, round tr5-calib).
+   */
+  @Test
+  void aWholeReadAfterAFoldReadsUpToTheCommitsFloor() { // [lagread]
+    created();
+    runtime(NO_GC, NEVER).compact(); // the checkpoint a lagging read starts from
+    other("o", Set.of(), Set.of("a")); // after it: a is at version 1 from here on
+    Replica<State> base = writer.read();
+    script.appends.add(WriteFault.DELAYED); // the first send stays in flight
+    script.appends.add(WriteFault.LOST_REPLY); // the second lands, its reply lost
+    script.reads.add(ReadShape.NORMAL); // after the first: records after the base, folded
+    script.reads.add(ReadShape.NORMAL); // after the second: records alone, after a fold
+    script.reads.add(ReadShape.of(0, 3)); // so read whole, lagging to the checkpoint: a at 0
+    Replica<State> r = writer.commit(base, txn(base, "t", Set.of("a"), Set.of("b")));
+    assertThat(r.state().history()).containsExactly("init", "o", "t");
+    script.reads.clear();
+    log.deliverDelayed();
+    assertAppliedOnce("t");
+  }
+
   /** The log under test, but a read through a write answers from its newest checkpoint. */
   private final class LooseReadThrough implements SharedLog {
     @Override

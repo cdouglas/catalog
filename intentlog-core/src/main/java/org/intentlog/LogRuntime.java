@@ -140,12 +140,22 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
 
   /** {@code view}, a read after {@code prior}'s tail, replayed onto prior (as {@link #readAfter}). */
   private Replayed replayAfter(LogView view, Replica<S> prior, UUID watch, UUID logId) {
+    Replayed folded = foldAfter(view, prior, watch, logId);
+    return folded != null ? folded : replay(log.read(), watch, logId, prior);
+  }
+
+  /**
+   * {@code view}, a read after {@code prior}'s tail, replayed onto prior; or null if it is records
+   * alone that a fold could not judge {@code watch}'s record in (prior's view does not show it):
+   * the caller reads the log whole, as its reads must (a commit's, up to its floor).
+   */
+  private Replayed foldAfter(LogView view, Replica<S> prior, UUID watch, UUID logId) {
     if (view.checkpoint().isPresent()) {
       return replay(view, watch, logId, prior);
     }
     checkFollows(view, prior.tail());
     if (watch != null && (prior.view() == null || holds(prior.view(), watch))) {
-      return replay(log.read(), watch, logId, prior);
+      return null;
     }
     Replay.Result<B> result =
         Replay.replayOnto(machine, machine.toBuilder(prior.state()), prior.committed().toBuilder(),
@@ -1312,23 +1322,40 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
      */
     private Replayed read() {
       try {
-        LogView view = fetch();
-        for (int attempt = 1; floor != null && !view.tail().continues(floor); attempt++) {
-          if (attempt >= config.maxThrottleAttempts()) {
-            throw new LogLagException("A read of " + log + " lags behind one this commit made");
+        boolean after = config.tailReads() && current != null;
+        LogView view = upToFloor(after ? this::fetch : log::read);
+        if (after) {
+          Replayed folded = foldAfter(view, current, id, base.logId());
+          if (folded != null) {
+            return folded;
           }
-          sleep(config.visibilityWait().toMillis() / config.maxThrottleAttempts(),
-              new LogLagException("Interrupted waiting for " + log));
-          view = fetch();
+          view = upToFloor(log::read); // records alone it cannot fold: read whole, as below
         }
-        return config.tailReads() && current != null
-            ? replayAfter(view, current, id, base.logId())
-            : replay(view, id, base.logId(), current);
+        return replay(view, id, base.logId(), current);
       } catch (CommitOutcomeUnknownException e) {
         throw new UnreadableLog((RuntimeException) e.getCause()); // interrupted waiting
       } catch (RuntimeException e) {
         throw new UnreadableLog(e);
       }
+    }
+
+    /**
+     * A view {@code reader} reads, read again while it lags behind {@link #floor} (a log that
+     * cannot replace itself), waiting up to the visibility wait in all ({@link LogLagException}
+     * after): a read behind the replica the commit staged on could find the intention not holding
+     * yet, and reject a commit whose copy has landed ([lagread]).
+     */
+    private LogView upToFloor(Supplier<LogView> reader) {
+      LogView view = reader.get();
+      for (int attempt = 1; floor != null && !view.tail().continues(floor); attempt++) {
+        if (attempt >= config.maxThrottleAttempts()) {
+          throw new LogLagException("A read of " + log + " lags behind one this commit made");
+        }
+        sleep(config.visibilityWait().toMillis() / config.maxThrottleAttempts(),
+            new LogLagException("Interrupted waiting for " + log));
+        view = reader.get();
+      }
+      return view;
     }
 
     /** A read of the log: of what follows {@link #current}, with tail reads; else whole. */

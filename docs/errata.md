@@ -850,6 +850,28 @@ elsewhere and a typed encoder removes it from the wire format
 altogether. PartitionSpec is the cheaper of the two to lift next if a
 workload motivates it independently.
 
+### D23. The latency model charges no HEAD for a lookup after an open
+
+The benchmarks' latency model (`LatencyFileIO` for FileIOCatalog,
+catalog-bench's `ModelStore` for every client) takes a stream's open as
+binding its file, as a GET's response reports a version and a length, so a
+lookup after the open (`getLength`) costs nothing. On S3, ADLS and GCS
+`AtomicFileLog`'s read is a HEAD, then a GET: it opens, looks up (binding the
+version the GET asks for, an order GCS needs, whose reads record no
+generation), then reads. Its tail read takes the same order. So the model
+charges every FileIOCatalog read one request less than a store does (on
+`s3x-2026-11` about 6 ms, on S3 Standard about 27 ms; two or more reads a
+commit), and every client's read of a file whose length Iceberg looks up
+after opening it (an Avro manifest list without a length). Tail reads
+(TAIL_READS.md step 6) are measured against whole reads under the same
+model, so their comparison stands; what the model cannot show is the HEAD's
+own cost, step 7's question (one request a read, where a store's GET reports
+the version and length it read: S3's and ADLS's do, step 0 pins the file to
+them; GCS's do not).
+
+**Trigger to revisit:** a decision to charge lookups after an open in the
+model, for every client (re-measuring the campaigns), or step 7.
+
 ## Test Coverage Gaps
 
 ### T3. Cloud integration tests rely on emulators for some behaviour
