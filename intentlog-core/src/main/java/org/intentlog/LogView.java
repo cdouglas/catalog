@@ -36,4 +36,19 @@ public interface LogView {
 
   /** The records after the checkpoint (log.proto LogRecords), in log order. */
   List<byte[]> records();
+
+  /**
+   * The position the view's records follow, as the provider found it ({@link LogTail#position}):
+   * for a view with a checkpoint, where the provider joined the checkpoint to the records, which
+   * the runtime checks against the position the checkpoint covers ({@code LogCheckpoint.through});
+   * for a view of records alone ({@link SharedLog#readAfter}), the tail they continue, which the
+   * runtime checks is the replica's it folds them onto. A provider that serves a gap (records
+   * missing after the checkpoint or the tail) says so here, and the read fails ({@link
+   * LogGapException}). Null for a view whose checkpoint and records the provider wrote in one
+   * write and checks itself (one object: its frames' trailers), which therefore names no {@code
+   * through}.
+   */
+  default byte[] start() {
+    return null;
+  }
 }

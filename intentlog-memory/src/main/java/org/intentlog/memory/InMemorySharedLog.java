@@ -124,33 +124,45 @@ public final class InMemorySharedLog implements SharedLog {
    * {@code olderCheckpoints}), ending {@code lag} records before the tail (but never before its
    * checkpoint, nor, for {@link #readThrough}, before the record it reads through). {@link
    * #PAST_RECORD} breaks P3: a read through a write starts from the newest checkpoint, which may
-   * hold the record already.
+   * hold the record already. A {@link #gap} leaves out the first records after the checkpoint (or
+   * the tail a {@link #readAfter} follows), as a log that trimmed past its newest checkpoint or
+   * lost records would serve them; the view says where its records start ({@link LogView#start}),
+   * and the read fails (S4).
    */
   public static final class ReadShape {
-    public static final ReadShape NORMAL = new ReadShape(false, 0, 0, false);
-    public static final ReadShape FAIL = new ReadShape(true, 0, 0, false);
-    public static final ReadShape PAST_RECORD = new ReadShape(false, 0, 0, true);
+    public static final ReadShape NORMAL = new ReadShape(false, 0, 0, false, 0);
+    public static final ReadShape FAIL = new ReadShape(true, 0, 0, false, 0);
+    public static final ReadShape PAST_RECORD = new ReadShape(false, 0, 0, true, 0);
 
     private final boolean fail;
     private final int olderCheckpoints;
     private final int lag;
     private final boolean pastRecord;
+    private final int gap;
 
-    private ReadShape(boolean fail, int olderCheckpoints, int lag, boolean pastRecord) {
+    private ReadShape(boolean fail, int olderCheckpoints, int lag, boolean pastRecord, int gap) {
       this.fail = fail;
       this.olderCheckpoints = olderCheckpoints;
       this.lag = lag;
       this.pastRecord = pastRecord;
+      this.gap = gap;
     }
 
     public static ReadShape of(int olderCheckpoints, int lag) {
-      return new ReadShape(false, Math.max(0, olderCheckpoints), Math.max(0, lag), false);
+      return new ReadShape(false, Math.max(0, olderCheckpoints), Math.max(0, lag), false, 0);
+    }
+
+    /** Served without the first {@code records} records after the checkpoint or tail. */
+    public static ReadShape gap(int records) {
+      return new ReadShape(false, 0, 0, false, Math.max(1, records));
     }
 
     @Override
     public String toString() {
       return fail ? "FAIL"
-          : pastRecord ? "PAST_RECORD" : "older " + olderCheckpoints + ", lag " + lag;
+          : pastRecord ? "PAST_RECORD"
+          : gap > 0 ? "gap " + gap
+          : "older " + olderCheckpoints + ", lag " + lag;
     }
   }
 
@@ -420,7 +432,7 @@ public final class InMemorySharedLog implements SharedLog {
     ReadShape shape = beforeRead(Request.READ);
     checkExists();
     long checkpoint = choose(usable(records.size()), shape);
-    return view(checkpoint, Math.max(checkpoint, records.size() - shape.lag), true);
+    return view(checkpoint, Math.max(checkpoint, records.size() - shape.lag), true, shape.gap);
   }
 
   @Override
@@ -435,7 +447,7 @@ public final class InMemorySharedLog implements SharedLog {
       throw new TrimmedException(name + " trimmed the record at position " + position);
     }
     long checkpoint = choose(before, shape);
-    return view(checkpoint, Math.max(position, records.size() - shape.lag), true);
+    return view(checkpoint, Math.max(position, records.size() - shape.lag), true, shape.gap);
   }
 
   @Override
@@ -446,7 +458,7 @@ public final class InMemorySharedLog implements SharedLog {
     if (position < trimmed) {
       throw new TrimmedException(name + " trimmed the records after position " + position);
     }
-    return view(position, Math.max(position, records.size() - shape.lag), false);
+    return view(position, Math.max(position, records.size() - shape.lag), false, shape.gap);
   }
 
   @Override
@@ -476,11 +488,18 @@ public final class InMemorySharedLog implements SharedLog {
     return usable.get(Math.max(0, usable.size() - 1 - shape.olderCheckpoints));
   }
 
-  private LogView view(long from, long to, boolean withCheckpoint) {
-    List<byte[]> after = List.copyOf(records.subList((int) from, (int) to));
+  /**
+   * The view of the checkpoint at {@code from} (if {@code withCheckpoint}) and the records after
+   * it through {@code to}, less the first {@code gap}: its records start after position {@code
+   * from + gap}, or at the tail if that is past it.
+   */
+  private LogView view(long from, long to, boolean withCheckpoint, int gap) {
+    long start = Math.min(from + gap, to);
+    List<byte[]> after = List.copyOf(records.subList((int) start, (int) to));
     Optional<byte[]> checkpoint =
         withCheckpoint ? Optional.of(checkpoints.get(from)) : Optional.empty();
     Tail tail = new Tail(to, true, bytes(checkpoints.floorKey(to), to));
+    byte[] follows = encodePosition(start);
     return new LogView() {
       @Override
       public LogTail tail() {
@@ -496,7 +515,20 @@ public final class InMemorySharedLog implements SharedLog {
       public List<byte[]> records() {
         return after;
       }
+
+      @Override
+      public byte[] start() {
+        return follows.clone();
+      }
     };
+  }
+
+  /**
+   * A position as this log encodes it ({@link LogTail#position}, {@code LogCheckpoint.through}):
+   * the number of records through it, a big-endian int64.
+   */
+  public static byte[] encodePosition(long position) {
+    return java.nio.ByteBuffer.allocate(8).putLong(position).array();
   }
 
   /** The size of a read from the checkpoint at {@code from} through position {@code to}. */
@@ -679,6 +711,11 @@ public final class InMemorySharedLog implements SharedLog {
       return earlier instanceof Tail
           && ((Tail) earlier).log() == InMemorySharedLog.this
           && position >= ((Tail) earlier).position;
+    }
+
+    @Override
+    public byte[] position() {
+      return encodePosition(position);
     }
 
     @Override

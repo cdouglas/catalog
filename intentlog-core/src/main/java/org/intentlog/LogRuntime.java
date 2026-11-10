@@ -147,6 +147,8 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     if (view.checkpoint().isPresent()) {
       return newer(prior, replay(view, null, prior.logId(), prior).replica());
     }
+    // Records alone: fold them only onto the tail they follow
+    checkFollows(view, prior.tail());
     Replay.Result<B> result =
         Replay.replayOnto(machine, machine.toBuilder(prior.state()), prior.committed().toBuilder(),
             prior.logId(), prior.intentionRecords(), view.records(), null);
@@ -201,7 +203,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
       dropped.addAll(replayed.result.committed().droppedPages());
       through = replayed.replica();
     }
-    log.putCheckpoint(view.tail(), checkpoint(through));
+    log.putCheckpoint(view.tail(), checkpoint(through, view.tail()));
     log.trim(view.tail());
     tidyPages(new ArrayList<>(dropped), !seals.isEmpty(), through.committed());
     deleteDroppedStatePages(through.state());
@@ -460,6 +462,58 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
         replica.logId(), replica.committed().bytes(), machine.encodeCheckpoint(replica.state()));
   }
 
+  /**
+   * A checkpoint of {@code replica} to store apart from the records, naming the position it covers,
+   * {@code through}'s: a read checks that the records after it start there (S4).
+   */
+  private byte[] checkpoint(Replica<S> replica, LogTail through) {
+    putStatePages(replica.state());
+    return LogEnvelope.encodeCheckpoint(replica.logId(), replica.committed().bytes(),
+        machine.encodeCheckpoint(replica.state()), through.position());
+  }
+
+  /**
+   * Fails unless {@code view}'s records start where its checkpoint ends: the position the
+   * checkpoint covers, if it names one, is the one the provider says the records follow (P1, S4).
+   * A view whose checkpoint names none was written with its records in one write, and its provider
+   * checks the joint.
+   */
+  private static void checkJoint(LogView view) {
+    byte[] checkpoint = view.checkpoint().orElse(null);
+    byte[] through = checkpoint == null ? null : LogEnvelope.checkpointThrough(checkpoint);
+    if (through == null) {
+      return;
+    }
+    byte[] start = view.start();
+    if (start == null) {
+      throw new LogGapException("A view of a checkpoint that covers a position says nothing of"
+          + " where its records start");
+    }
+    if (!Arrays.equals(through, start)) {
+      throw new LogGapException("A checkpoint covers " + hex(through) + ", and the records after"
+          + " it follow " + hex(start));
+    }
+  }
+
+  /** Fails unless the records of {@code view}, a view of records alone, follow {@code after}. */
+  private static void checkFollows(LogView view, LogTail after) {
+    byte[] expected = after.position();
+    byte[] start = view.start();
+    if (expected == null || start == null || !Arrays.equals(expected, start)) {
+      throw new LogGapException("Records read after " + after + " follow "
+          + (start == null ? "an unknown position" : hex(start)) + ", not "
+          + (expected == null ? "an unknown position" : hex(expected)));
+    }
+  }
+
+  private static String hex(byte[] bytes) {
+    StringBuilder s = new StringBuilder(bytes.length * 2);
+    for (byte b : bytes) {
+      s.append(String.format("%02x", b));
+    }
+    return s.toString();
+  }
+
   private void putStatePages(S state) {
     Map<String, byte[]> pages = machine.pages(state);
     if (pages.isEmpty()) {
@@ -632,6 +686,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
   }
 
   private Replayed replay(LogView view, UUID watch, UUID logId) {
+    checkJoint(view);
     return new Replayed(
         view, Replay.replay(machine, view.checkpoint().orElse(null), view.records(), watch), logId);
   }
@@ -646,6 +701,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
    * leave the fold unable to say what replay did with it, so then the view is replayed whole.
    */
   private Replayed replay(LogView view, UUID watch, UUID logId, Replica<S> prior) {
+    checkJoint(view);
     int from = prior == null ? -1 : continued(prior.view(), view, watch);
     if (from < 0) {
       return replay(view, watch, logId);
@@ -1060,7 +1116,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     private void create() {
       RuntimeException failure = null;
       try {
-        log.putCheckpoint(tail, checkpoint(base));
+        log.putCheckpoint(tail, checkpoint(base, tail));
       } catch (RuntimeException e) {
         failure = e; // another writer's create, or one of ours that may have landed
       }

@@ -249,6 +249,17 @@ public final class AtomicFileLogHarness implements LogHarness {
     return ends;
   }
 
+  @Override
+  public boolean held(LogView view) {
+    Hooks was = hooks;
+    hooks = null;
+    try {
+      return held(view, reads.location);
+    } finally {
+      hooks = was;
+    }
+  }
+
   /**
    * Whether {@code view} is a state the log held: some version's checkpoint, and a prefix of its
    * records (a read may return any prefix, P1). Every version the store held is in its history.

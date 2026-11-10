@@ -55,6 +55,7 @@ public final class LogEnvelope {
   public static final int LOG_CHECKPOINT_LOG_ID = 2;
   public static final int LOG_CHECKPOINT_COMMITTED = 3;
   public static final int LOG_CHECKPOINT_STATE = 4;
+  public static final int LOG_CHECKPOINT_THROUGH = 5;
 
   public static final int LOG_RECORD_ID = 1;
   public static final int LOG_RECORD_INTENTION = 2;
@@ -81,11 +82,25 @@ public final class LogEnvelope {
     private final UUID logId;
     private final byte[] committed;
     private final byte[] state;
+    private final byte[] through;
 
     public Checkpoint(UUID logId, byte[] committed, byte[] state) {
+      this(logId, committed, state, null);
+    }
+
+    public Checkpoint(UUID logId, byte[] committed, byte[] state, byte[] through) {
       this.logId = logId;
       this.committed = committed;
       this.state = state;
+      this.through = through;
+    }
+
+    /**
+     * The position the checkpoint covers, as its log's provider encodes it ({@code
+     * LogTail.position}); null for a checkpoint written with its records in one write.
+     */
+    public byte[] through() {
+      return through;
     }
 
     public UUID logId() {
@@ -206,10 +221,23 @@ public final class LogEnvelope {
    * (no ids and no horizon).
    */
   public static byte[] encodeCheckpoint(UUID logId, byte[] committed, byte[] state) {
+    return encodeCheckpoint(logId, committed, state, null);
+  }
+
+  /**
+   * Encodes a {@code LogCheckpoint} that covers the position {@code through} (none if null), which
+   * it writes before the committed set and the state, so that {@link #checkpointThrough} finds it
+   * without reading them.
+   */
+  public static byte[] encodeCheckpoint(
+      UUID logId, byte[] committed, byte[] state, byte[] through) {
     try {
-      ByteArrayOutputStream out = new ByteArrayOutputStream(state.length + committed.length + 32);
+      ByteArrayOutputStream out = new ByteArrayOutputStream(state.length + committed.length + 48);
       writeVarint(out, LOG_CHECKPOINT_MIN_READER_VERSION, SUPPORTED_READER_VERSION);
       writeBytes(out, LOG_CHECKPOINT_LOG_ID, uuidToBytes(logId));
+      if (through != null) {
+        writeBytes(out, LOG_CHECKPOINT_THROUGH, through);
+      }
       if (committed.length > 0) {
         writeBytes(out, LOG_CHECKPOINT_COMMITTED, committed);
       }
@@ -231,9 +259,13 @@ public final class LogEnvelope {
       UUID logId = null;
       byte[] committed = new byte[0];
       byte[] state = null;
+      byte[] through = null;
       while (in.available() > 0) {
         int tag = readVarint(in);
         switch (tag >>> 3) {
+          case LOG_CHECKPOINT_THROUGH:
+            through = readLengthDelimitedBytes(in);
+            break;
           case LOG_CHECKPOINT_MIN_READER_VERSION:
             int minReaderVersion = readVarint(in);
             if (minReaderVersion > SUPPORTED_READER_VERSION) {
@@ -262,7 +294,27 @@ public final class LogEnvelope {
       check(sawMinReaderVersion, "Checkpoint missing required min_reader_version field");
       check(logId != null, "Checkpoint missing required log_id field");
       check(state != null, "Checkpoint missing required state field");
-      return new Checkpoint(logId, committed, state);
+      return new Checkpoint(logId, committed, state, through);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
+  /**
+   * The position a {@code LogCheckpoint} covers ({@code through}), or null if it names none: a
+   * scan of its fields that skips the committed set and the state.
+   */
+  public static byte[] checkpointThrough(byte[] bytes) {
+    try {
+      ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+      while (in.available() > 0) {
+        int tag = readVarint(in);
+        if (tag >>> 3 == LOG_CHECKPOINT_THROUGH) {
+          return readLengthDelimitedBytes(in);
+        }
+        skipField(in, tag & 0x7);
+      }
+      return null;
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }

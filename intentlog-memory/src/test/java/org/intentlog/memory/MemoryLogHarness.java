@@ -27,6 +27,7 @@ import java.util.Map;
 import java.util.Set;
 import org.intentlog.CommittedSet;
 import org.intentlog.Intention;
+import org.intentlog.LogView;
 import org.intentlog.Replay;
 import org.intentlog.SharedLog;
 import org.intentlog.StateMachine;
@@ -69,6 +70,8 @@ public final class MemoryLogHarness implements LogHarness {
             return ReadShape.of(1, 2);
           case PAST_RECORD:
             return request == Request.READ_THROUGH ? ReadShape.PAST_RECORD : ReadShape.NORMAL;
+          case GAP:
+            return ReadShape.gap(1);
           default:
             return ReadShape.NORMAL;
         }
@@ -161,10 +164,10 @@ public final class MemoryLogHarness implements LogHarness {
     Map<Long, byte[]> checkpoints = log.checkpoints();
     List<byte[]> records = log.records();
     byte[] first = checkpoints.get(0L);
-    // Every checkpoint is the replay of the log through its position (I11).
+    // Every checkpoint is the replay of the log through its position (I11), and names it.
     for (Map.Entry<Long, byte[]> c : checkpoints.entrySet()) {
       byte[] replayed = checkpoint(sm, Replay.replay(sm, first,
-          records.subList(0, c.getKey().intValue()), null));
+          records.subList(0, c.getKey().intValue()), null), c.getKey());
       if (!Arrays.equals(replayed, c.getValue())) {
         violations.add(
             "the checkpoint at position " + c.getKey() + " is not the replay through it");
@@ -189,5 +192,44 @@ public final class MemoryLogHarness implements LogHarness {
     CommittedSet committed = result.committed().build();
     return LogEnvelope.encodeCheckpoint(
         result.logId(), committed.bytes(), sm.encodeCheckpoint(result.builder().build()));
+  }
+
+  /** The checkpoint of {@code result} at {@code position}, naming it as the runtime does. */
+  private static <S, B extends StateMachine.Builder<S>, I extends Intention<B>> byte[] checkpoint(
+      StateMachine<S, B, I> sm, Replay.Result<B> result, long position) {
+    CommittedSet committed = result.committed().build();
+    return LogEnvelope.encodeCheckpoint(result.logId(), committed.bytes(),
+        sm.encodeCheckpoint(result.builder().build()), InMemorySharedLog.encodePosition(position));
+  }
+
+  /**
+   * A view is a state the log held if its checkpoint is the one the log stored at the position the
+   * checkpoint names, and its records are the log's after that position, in order, none missing.
+   */
+  @Override
+  public boolean held(LogView view) {
+    byte[] checkpoint = view.checkpoint().orElse(null);
+    if (checkpoint == null) {
+      return true;
+    }
+    byte[] through = LogEnvelope.checkpointThrough(checkpoint);
+    if (through == null) {
+      return false;
+    }
+    long position = ByteBuffer.wrap(through).getLong();
+    if (!Arrays.equals(checkpoint, log.checkpoints().get(position))) {
+      return false;
+    }
+    List<byte[]> records = log.records();
+    List<byte[]> after = view.records();
+    if (position + after.size() > records.size()) {
+      return false;
+    }
+    for (int i = 0; i < after.size(); i++) {
+      if (!Arrays.equals(after.get(i), records.get((int) position + i))) {
+        return false;
+      }
+    }
+    return true;
   }
 }

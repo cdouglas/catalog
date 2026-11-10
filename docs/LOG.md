@@ -97,8 +97,10 @@ interface SharedLog {
 record Capabilities(boolean append, boolean conditionalAppend, boolean fusedReplace,
                     boolean separateCheckpoints, long maxRecordBytes) {}
 
-interface LogView { LogTail tail(); Optional<byte[]> checkpoint(); List<byte[]> records(); }
-interface LogTail { boolean exists(); long bytes(); boolean continues(LogTail earlier); }
+interface LogView { LogTail tail(); Optional<byte[]> checkpoint(); List<byte[]> records();
+                   default byte[] start(); }       // the position the records follow
+interface LogTail { boolean exists(); long bytes(); boolean continues(LogTail earlier);
+                   default byte[] position(); }    // the provider's encoding; opaque
 interface Receipt {}                                  // what readThrough reads through
 ```
 
@@ -122,6 +124,24 @@ records after `since` as a view without a checkpoint, for `refresh` to fold
 onto the replica read at `since`, or a whole view to replay afresh; it may
 throw `TrimmedException`.
 
+**Positions** ([TAIL_READS.md](TAIL_READS.md) "Positions", 2026-11-10). A
+read is right only if each record follows the one before it, starting where
+its checkpoint ends (or, for records alone, at the tail they continue). A log
+says so in positions, opaque bytes the runtime compares only for equality:
+`LogTail.position()` (a sequencer's offset; one object's incarnation and
+length; null if the provider cannot say, a tail a probe found on one object),
+`LogView.start()`, the position the view's records follow as the provider
+found them, and `LogCheckpoint.through` (log.proto), the position a
+checkpoint covers, which the runtime writes from the tail it checkpoints at
+(`putCheckpoint`; a replace, which writes the checkpoint and its records in one
+write, names none, and its provider checks the joint: one object's trailers).
+The runtime fails a whole view whose checkpoint covers one position and whose
+records follow another, and folds a view of records alone only onto the tail
+they follow (`LogGapException`): a gap (a log that trimmed past its checkpoint,
+or lost records) or a splice would replay a state the log never held. Each
+provider checks its own chain by its own rule: dense positions for a
+sequencer, the trailers for one object.
+
 Any log's reads may lag its appends (P1), and its capabilities do not say
 whether they do. A writer reads its own write through its receipt (P3), and a
 commit keeps its reads from falling behind the one it staged on (the floor, in
@@ -139,7 +159,7 @@ commit.
 
 | | Obligation |
 |---|---|
-| P1 | One total order of records; every read returns a checkpoint and a prefix of the records after it |
+| P1 | One total order of records; every read returns a checkpoint and a prefix of the records after it, and says truly where its records start (`LogView.start`), so that the runtime can refuse a gap or a splice |
 | P2 | An acknowledged write (append, replace, checkpoint) is durable |
 | P3 | `readThrough(r)` returns a view whose records, after its checkpoint, include `r`'s record, or fails. A view whose checkpoint already holds the record cannot say whether it applied once GC drops its id |
 | P4 | Of several conditional writes on the same tail, at most one lands |
@@ -147,8 +167,11 @@ commit.
 | P6 | `LogFullException` and `LogNotSentException` mean nothing landed |
 
 P1 allows a read to return any prefix: a replica that lags behind the log's
-appends is a legal provider. P4 binds only a log with conditional writes.
-`SharedLogContract` (intentlog-testkit) checks P1, P3, P4 and P5 (and I11,
+appends is a legal provider. It does not allow one with a hole: a provider
+need not prevent one (Kafka's retention trims whatever the checkpoints say),
+but must report its records' positions truly, and the runtime refuses the read
+(S4). P4 binds only a log with conditional writes. `SharedLogContract`
+(intentlog-testkit) checks P1 (positions included), P3, P4 and P5 (and I11,
 below) as far as a provider's capabilities allow.
 
 ### Failures
@@ -160,6 +183,7 @@ below) as far as a provider's capabilities allow.
 | `LogFullException` | an append | the log holds as many writes as its store allows (S3 Express: 10,000 parts; an Azure Append Blob: 50,000 blocks). Nothing landed, and no append can | replaces, on a fresh read (Bug 66) |
 | `LogNotSentException` | a write | preparing it failed: nothing was sent | rejects (`NOT_SENT`), unless an earlier write of the commit may have landed |
 | `TrimmedException` | `readThrough`, `readAfter` | the records asked for are gone | `readThrough`: the outcome is unknown, and a fresh read settles it; `readAfter`: a fresh read |
+| `LogGapException` | the runtime, on a view | the records do not start where the checkpoint ends, or do not follow the tail a fold needs: a gap or a splice | the read fails (the log is unreadable; unknown if a write may have landed) |
 | `LogLagException` | `readThrough` after its wait; a commit's read that stays behind the commit's floor | a replica of the log lags its appends | `readThrough`: the write is ambiguous, and a fresh read settles it; a lagging read: the log is unreadable |
 | any other exception | a write | the outcome is unknown | a fresh read settles it |
 | any other exception | a read or probe | the log could not be read | unknown if a write may have landed; else rethrown |
@@ -860,10 +884,12 @@ checkpoint that covers the trim point; `readThrough` starts from one before
 the receipt's record (P3) and throws `TrimmedException` if every checkpoint it
 keeps is past it. A trim needs a checkpoint at or past it (P5), and two
 checkpoints at one position must be the same bytes (I11): one that differs is
-refused and recorded (`violations()`). Its hooks see every request: they fail a
-write before or after it lands, throttle it, delay it (it lands later, at
-`deliverDelayed`), fail a read, serve one from an older checkpoint or past the
-record, or lag one behind the tail. It keeps every record ever appended,
+refused and recorded (`violations()`). Its positions are record counts (a
+big-endian int64), and each view says where its records start. Its hooks see
+every request: they fail a write before or after it lands, throttle it, delay
+it (it lands later, at `deliverDelayed`), fail a read, serve one from an older
+checkpoint or past the record, lag one behind the tail, or serve one with a
+gap after its checkpoint or tail (which the runtime must refuse). It keeps every record ever appended,
 trimmed ones included, for oracles to replay.
 
 **Kafka, SQS and ledgers** are mapped on paper only. What each must provide:
@@ -889,19 +915,23 @@ trimmed ones included, for oracles to replay.
 ## Testing a provider
 
 - `SharedLogContract` (intentlog-testkit) holds a provider to P1, P3, P4, P5
-  and I11, to creating a log once, and to `readAfter`, as far as its
-  capabilities make them testable. `TestAtomicFileLogContract` and
+  and I11, to creating a log once, to `readAfter`, and to positions (a tail
+  names where the log ends; a read says where its records start, after the
+  position its checkpoint covers; records read after a tail say they follow
+  it), as far as its capabilities make them testable. `TestAtomicFileLogContract` and
   `TestInMemorySharedLogContract` run it.
 - `CommitProtocol` (intentlog-testkit) fuzzes the commit loop on a
   `LogHarness`, over `EntityVersionsMachine`, with the TLA+ models' schedules:
   writers whose requests meet faults (failures, lost replies, throttles,
-  delayed appends, failed and stale reads, reads that break P3) and inside
+  delayed appends, failed and stale reads, reads that break P3, reads with a
+  gap) and inside
   whose commits other writers commit, compactors and GC records inside
   commits, and copies of any record that ever landed, which must never apply.
   It judges each commit as it ends, the state after each copy, and, once
   every delayed append has landed, the whole run: each outcome again, no
   commit applied twice, the state as the serial execution of what applied,
-  and every checkpoint as the replay of the log through it.
+  and every checkpoint as the replay of the log through it; and every replica
+  a read or a commit returns as a state the log held (`LogHarness.held`).
   `TestMemoryCommitProtocol` and `TestAtomicFileCommitProtocol` run it. Each
   of the shared-log model's bug switches, put back in `LogRuntime`, fails it
   on the memory log.

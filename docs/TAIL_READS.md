@@ -109,8 +109,8 @@ So, for every log:
   read checks that its records start there.
 - A view of records alone (`readAfter`) states the position they start
   after, and the runtime folds them onto a replica only if that is the
-  replica's tail. `LogRuntime.refresh` folds them unchecked today; the
-  catalog does not call it (only tests do), but tail reads would. A whole
+  replica's tail. `LogRuntime.refresh` folded them unchecked before step 3;
+  the catalog does not call it (only tests do), but tail reads would. A whole
   view's fold already compares bytes (`LogRuntime.continued`).
 - Each provider checks its records' chain by its own rule: dense for a
   sequencer, the trailers for one object, and its own for a log whose
@@ -554,6 +554,17 @@ Each step stands alone and is measured before the next:
    check, views of records that say where they start, and the gap-serving
    harness and contract case, on `InMemorySharedLog`. It closes S5's
    shared-log half for providers that pass the contract.
+   Built 2026-11-10 (LOG.md "Positions"). `LogTail.position()` and
+   `LogView.start()` are opaque bytes the runtime compares for equality;
+   `LogCheckpoint.through` (log.proto field 5) is written only by
+   `putCheckpoint`, since a replace's checkpoint and records are one write
+   whose provider checks the joint (on one object, the trailers), so
+   `AtomicFileLog`'s views say nothing of their start and its checkpoints
+   are unchanged. `AtomicFileLog`'s tails have positions (incarnation and
+   length) when the log read or wrote their bytes, for step 5's folds. The
+   testkit's gap reads (`ReadFault.GAP`) and its oracle that every replica a
+   read or commit returns is a state the log held (`LogHarness.held`) catch
+   a runtime that skips the joint's check in seconds.
 4. **The model.** Incarnations, splices and tail reads in
    `CatalogCommit.tla`, and gaps in `SharedLogCommit.tla`, with the
    switches, before the Java that relies on them (as for

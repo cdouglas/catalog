@@ -46,6 +46,7 @@ import org.intentlog.CommittedSet;
 import org.intentlog.CompactionPolicy;
 import org.intentlog.DedupHorizonExceededException;
 import org.intentlog.LogRuntime;
+import org.intentlog.LogView;
 import org.intentlog.PageStore;
 import org.intentlog.PagedOutException;
 import org.intentlog.Replica;
@@ -763,6 +764,7 @@ public final class CommitProtocol {
 
     private void begin(Writer w, Cmd cmd) {
       w.snapshot = runtime.read();
+      checkHeld(w.snapshot, "a read");
       w.snapshotWrites = harness.landedWrites();
       String tag = "w" + w.id + "." + w.commits++;
       w.txn = Txn.on(w.snapshot.state(), tag, subset(cmd.a), subset(cmd.b));
@@ -808,11 +810,12 @@ public final class CommitProtocol {
           ? Region.OLDEST : Region.of(cmd.e);
       int pick = cmd.e >> 8;
       if (settings.faults) {
-        // c: no read fault (0-4); fail, stale or break P3 on one of the first three reads
-        // (5-13); stale every read (14-15).
+        // c: no read fault (0-4); fail, stale, break P3 or serve a gap on one of the first three
+        // reads (5-13); stale every read (14-15).
         ReadFault readFault = cmd.c < 5 ? ReadFault.NONE
             : cmd.c >= 14 ? ReadFault.STALE
-            : List.of(ReadFault.FAIL, ReadFault.STALE, ReadFault.PAST_RECORD).get(cmd.c % 3);
+            : List.of(ReadFault.FAIL, ReadFault.STALE, ReadFault.PAST_RECORD, ReadFault.GAP)
+                .get(cmd.c % 4);
         commit(w, region, pick, new Context(
             List.of(FIRST_WRITE_FAULTS.get(cmd.a), SECOND_WRITE_FAULTS.get(cmd.b)),
             (cmd.c - 5) / 3, readFault, cmd.c >= 14,
@@ -838,7 +841,7 @@ public final class CommitProtocol {
       boolean beyondFloor = false;
       try {
         ctx.active = true;
-        runtime.commit(w.snapshot, txn);
+        checkHeld(runtime.commit(w.snapshot, txn), "a commit");
         outcome = Outcome.COMMITTED;
       } catch (CommitRejectedException e) {
         outcome = Outcome.REJECTED;
@@ -1407,6 +1410,17 @@ public final class CommitProtocol {
       check(left.isEmpty(), "pages outlived a GC record at the newest id and a sweep: %s",
           left.keySet());
       checkSet("after the GC at the newest id");
+    }
+
+    /**
+     * The oracle that no replica holds a state the log never held (docs/TAIL_READS.md "Testing"):
+     * the view {@code replica} was replayed from, if it keeps one, is a checkpoint the log stored
+     * and the records after its position, none missing and none another log's.
+     */
+    private void checkHeld(Replica<State> replica, String what) {
+      LogView view = replica.view();
+      check(view == null || harness.held(view), "%s returned a replica of a state the log never"
+          + " held: %d records after a checkpoint", what, view == null ? 0 : view.records().size());
     }
 
     private void check(boolean condition, String format, Object... args) {

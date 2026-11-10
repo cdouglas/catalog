@@ -87,8 +87,11 @@ public final class Replica<S> {
     return checkpointBytes;
   }
 
-  /** The whole view this is the replay of, or null. */
-  LogView view() {
+  /**
+   * The whole view this is the replay of, or null (a fold of records alone onto another replica):
+   * what a later read compares, and what oracles check the log held.
+   */
+  public LogView view() {
     return view;
   }
 }

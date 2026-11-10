@@ -679,6 +679,23 @@ public final class AtomicFileLog implements SharedLog {
     public boolean continues(LogTail earlier) {
       return bytes() >= earlier.bytes();
     }
+
+    /**
+     * The incarnation and the length, 16 bytes little-endian, if this log read or wrote the bytes
+     * at this tail; null for a tail a probe found, whose incarnation is in bytes no read has seen.
+     * A checkpoint here names none: a replace writes it with its records in one write, whose
+     * trailers check the joint.
+     */
+    @Override
+    public byte[] position() {
+      if (view == null) {
+        return null;
+      }
+      byte[] position = new byte[16];
+      putLong(position, 0, view.incarnation);
+      putLong(position, 8, length);
+      return position;
+    }
   }
 
   /** The tail of bytes that {@link #decode} read, bound to no object. */

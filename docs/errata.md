@@ -127,10 +127,18 @@ would lose the records in the gap and the runtime would not notice.
 checkpoint that named the last record it holds (its position, or its id)
 would let a read check that the records after it start where it ends.
 
-**Trigger to revisit:** a provider that `SharedLogContract` does not cover,
-or a production shared log. S5 makes the format check the joint: a checkpoint
-names the position it covers ([TAIL_READS.md](TAIL_READS.md) "Positions", step
-3).
+**Resolved 2026-11-10** ([TAIL_READS.md](TAIL_READS.md) step 3; LOG.md
+"Positions"). A checkpoint stored apart names the position it covers
+(`LogCheckpoint.through`, the provider's encoding of the tail the compaction
+read), every view says where its records start (`LogView.start`), and the
+runtime fails a view whose records do not start where its checkpoint ends, and
+folds records read after a tail only onto that tail (`LogGapException`).
+`InMemorySharedLog` encodes positions as record counts and can serve a gap;
+the commit-protocol fuzzer draws gap reads and checks that no replica holds a
+state the log never held (`LogHarness.held`), and a runtime that skips the
+check fails it; `SharedLogContract` holds a provider to positions. What stays
+the provider's word is that its positions are true: a provider whose records'
+positions lie passes the runtime's check.
 
 ### S5. A read's continuity is the store's word, not the format's
 
@@ -198,14 +206,14 @@ splices S3 could (T6), and the commit-protocol fuzzer's oracle checks that no
 read returns a state the log never held; a mutant that skips the checks fails
 it.
 
-**Remaining:** the shared-log half (positions in the SPI: a checkpoint names
-the position it covers, a view of records alone where it starts; step 3, which
-closes S4 for providers that pass the contract) and the models (step 4: reads
-that splice or skip, the same oracle, a bug switch per check).
+**Done on shared logs** (step 3, 2026-11-10): positions in the SPI (S4,
+resolved).
 
-**Trigger to revisit:** steps 3 and 4 of [TAIL_READS.md](TAIL_READS.md)
-(approved 2026-11-10), before tail reads (D15) or a production shared log
-(S4).
+**Remaining:** the models (step 4: reads that splice or skip, the same oracle,
+a bug switch per check).
+
+**Trigger to revisit:** step 4 of [TAIL_READS.md](TAIL_READS.md) (approved
+2026-11-10), before tail reads (D15).
 
 ## Deferred Functionality
 

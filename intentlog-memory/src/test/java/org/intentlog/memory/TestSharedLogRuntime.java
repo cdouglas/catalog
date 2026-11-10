@@ -31,6 +31,7 @@ import org.intentlog.Capabilities;
 import org.intentlog.CommitOutcomeUnknownException;
 import org.intentlog.CommitRejectedException;
 import org.intentlog.CompactionPolicy;
+import org.intentlog.LogGapException;
 import org.intentlog.LogRuntime;
 import org.intentlog.LogTail;
 import org.intentlog.LogView;
@@ -84,8 +85,8 @@ class TestSharedLogRuntime {
 
     @Override
     public ReadShape beforeRead(Request request) {
-      return active && (request == Request.READ || request == Request.READ_THROUGH)
-          && !reads.isEmpty() ? reads.poll() : ReadShape.NORMAL;
+      return active && (request == Request.READ || request == Request.READ_THROUGH
+          || request == Request.READ_AFTER) && !reads.isEmpty() ? reads.poll() : ReadShape.NORMAL;
     }
 
     /** Runs other writers' requests, which the script does not fault. */
@@ -487,6 +488,53 @@ class TestSharedLogRuntime {
     runtime(NO_GC, NEVER).compact();
     other("p", Set.of(), Set.of("b"));
     assertThat(writer.refresh(base).state()).isEqualTo(writer.read().state()); // trimmed: afresh
+  }
+
+  // ============================================================
+  // Positions (S4, docs/TAIL_READS.md "Positions")
+  // ============================================================
+
+  @Test
+  void aCheckpointNamesThePositionItCovers() {
+    Replica<State> base = created();
+    assertThat(LogEnvelope.decodeCheckpoint(log.checkpoints().get(0L)).through())
+        .isEqualTo(InMemorySharedLog.encodePosition(0));
+    writer.commit(base, txn(base, "t", Set.of(), Set.of("a")));
+    runtime(NO_GC, NEVER).compact();
+    long through = log.trimmedThrough();
+    assertThat(LogEnvelope.decodeCheckpoint(log.checkpoints().get(through)).through())
+        .isEqualTo(InMemorySharedLog.encodePosition(through));
+  }
+
+  /**
+   * A read served without the records after its checkpoint (a log that trimmed past it, or lost
+   * them) fails: replayed, it would hold a state the log never held.
+   */
+  @Test
+  void aReadWhoseRecordsDoNotStartWhereItsCheckpointEndsFails() {
+    Replica<State> base = created();
+    writer.commit(base, txn(base, "t1", Set.of(), Set.of("a")));
+    Replica<State> next = writer.read();
+    writer.commit(next, txn(next, "t2", Set.of(), Set.of("b")));
+    script.reads.add(ReadShape.gap(1));
+    assertThatThrownBy(writer::read).isInstanceOf(LogGapException.class)
+        .hasMessageContaining("follow");
+    runtime(NO_GC, NEVER).compact();
+    other("t3", Set.of(), Set.of("c"));
+    script.reads.add(ReadShape.gap(1));
+    assertThatThrownBy(writer::read).isInstanceOf(LogGapException.class);
+    assertThat(writer.read().state().history()).containsExactly("init", "t1", "t2", "t3");
+  }
+
+  /** Records read after a tail are folded onto it only if they follow it. */
+  @Test
+  void aRefreshWhoseRecordsDoNotFollowItsTailFails() {
+    Replica<State> base = created();
+    other("o", Set.of(), Set.of("a"));
+    other("p", Set.of(), Set.of("b"));
+    script.reads.add(ReadShape.gap(1));
+    assertThatThrownBy(() -> writer.refresh(base)).isInstanceOf(LogGapException.class);
+    assertThat(writer.refresh(base).state().history()).containsExactly("init", "o", "p");
   }
 
   // ============================================================

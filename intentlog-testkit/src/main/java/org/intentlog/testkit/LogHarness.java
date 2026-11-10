@@ -20,6 +20,7 @@ package org.intentlog.testkit;
 
 import java.util.List;
 import java.util.Map;
+import org.intentlog.LogView;
 import org.intentlog.SharedLog;
 
 /**
@@ -60,7 +61,15 @@ public interface LogHarness {
      * that breaks P3, which the runtime must survive. Other reads, and providers that cannot, serve
      * it as {@link #NONE}.
      */
-    PAST_RECORD
+    PAST_RECORD,
+    /**
+     * The read is served with records missing after its checkpoint, or after the tail it reads
+     * from, as a log that trimmed past its newest checkpoint or lost records would serve it; the
+     * view says where its records start, and the runtime must fail the read (S4). Providers that
+     * cannot serve one (one object, whose checkpoint and records are one write) serve it as {@link
+     * #NONE}.
+     */
+    GAP
   }
 
   /** A request of the log's page store ({@link SharedLog#pages}). */
@@ -129,4 +138,14 @@ public interface LogHarness {
    * readers that would disagree; empty if none.
    */
   List<String> checkpointViolations();
+
+  /**
+   * Whether {@code view}, one a replica was replayed from, is a state the log held: a checkpoint
+   * the log stored and the records after its position, none missing and none another's (P1; the
+   * oracle that no replica holds a state the log never held, docs/TAIL_READS.md "Testing"). Read
+   * without faults. True by default, for a harness that cannot tell.
+   */
+  default boolean held(LogView view) {
+    return true;
+  }
 }

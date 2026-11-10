@@ -297,4 +297,62 @@ public abstract class SharedLogContract {
       // the records after since are gone
     }
   }
+
+  /**
+   * Positions (docs/TAIL_READS.md "Positions"): two tails at one position have equal positions,
+   * and a tail after an append another; a tail a read returns has one.
+   */
+  @Test
+  void aTailsPositionNamesWhereTheLogEnds() {
+    assumeAppends();
+    create(checkpoint(0));
+    append(record());
+    LogTail first = log.read().tail();
+    LogTail again = log.read().tail();
+    assertThat(first.position()).as("a read's tail has a position").isNotNull();
+    assertThat(again.position()).isEqualTo(first.position());
+    append(record());
+    assertThat(log.read().tail().position()).isNotEqualTo(first.position());
+  }
+
+  /**
+   * A read says where its records start: after the position its checkpoint covers, whatever
+   * checkpoint and trim it starts from (S4). A log whose checkpoint and records are one write says
+   * nothing, and its checkpoints name no position.
+   */
+  @Test
+  void aReadsRecordsStartWhereItsCheckpointEnds() { // P1, S4
+    assumeAppends();
+    LogTail absent = log.probe();
+    create(checkpoint(0));
+    append(record());
+    LogView before = log.read();
+    if (!log.capabilities().separateCheckpoints()) {
+      assertThat(before.start()).as("one write's joint is its provider's").isNull();
+      return;
+    }
+    assertThat(before.start()).as("after the first checkpoint, where the log was created")
+        .isEqualTo(absent.position());
+    LogTail through = before.tail();
+    log.putCheckpoint(through, checkpoint(1));
+    log.trim(through);
+    append(record());
+    LogView after = log.read();
+    assertThat(after.checkpoint().orElseThrow()).isEqualTo(checkpoint(1));
+    assertThat(after.start()).isEqualTo(through.position());
+  }
+
+  /** Records read after a tail say they follow it: the runtime folds them only onto it. */
+  @Test
+  void aReadAfterATailSaysItFollowsIt() {
+    assumeAppends();
+    create(checkpoint(0));
+    append(record());
+    LogTail since = log.read().tail();
+    append(record());
+    LogView after = log.readAfter(since);
+    if (after.checkpoint().isEmpty()) {
+      assertThat(after.start()).isEqualTo(since.position());
+    }
+  }
 }

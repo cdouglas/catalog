@@ -38,4 +38,16 @@ public interface LogTail {
    * not, the log was replaced (compacted) since.
    */
   boolean continues(LogTail earlier);
+
+  /**
+   * The log's position at this tail, as the provider encodes it, or null if the provider cannot
+   * say (a tail a probe found on a log whose positions need the log's bytes). Opaque to the
+   * runtime, which compares positions only for equality: a checkpoint names the one it covers
+   * ({@code LogCheckpoint.through}), and a view of records alone the one they follow ({@link
+   * LogView#start}). Two tails of one log at one position have equal positions, and two at
+   * different positions do not (docs/TAIL_READS.md "Positions").
+   */
+  default byte[] position() {
+    return null;
+  }
 }
