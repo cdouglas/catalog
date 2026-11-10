@@ -444,6 +444,17 @@ it, and a commit paid it four times (D20); twice since D20's fix (its load and
 the refresh before it applies), which ranged reads would make once.
 Plan: [TAIL_READS.md](TAIL_READS.md) (proposed 2026-11-06), with S5's format half.
 
+**Resolved 2026-11-10** ([TAIL_READS.md](TAIL_READS.md) steps 2 and 5, branch
+`tail-reads`). The design above, with the incarnation in a trailer that ends
+every frame (format 3) rather than in a header, and checksums: a tail read is
+a lookup and a GET from 20 bytes before the end, and a client's loads,
+refreshes and commit-loop reads read only what follows its replica. Measured
+(step 6, catalog-bench `tr6`, `s3x-2026-11`): a merge append's p50 fell
+48-72% inline ML and 16-37% inline TM across E1 at 300 tables and E3 at 1,000
+and 7,200 snapshots, and the catalog bytes it reads fell 8-32x. Open: at E1's
+1,000 tables, past the knee, 0.3-2.6% of merge appends exhaust their retries
+with tail reads (TAIL_READS.md "Open questions").
+
 ### D16. Replay rewrites the whole committed set, and every checkpoint carries it
 
 The committed set holds every id within the retention

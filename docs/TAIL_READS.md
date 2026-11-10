@@ -634,20 +634,51 @@ Each step stands alone and is measured before the next:
    | ----- | ---- | --- | --- | --- | ---------------- | ------------ | ------------ |
    | E1, 300 tables | inline ML | 265.6 → 74.9 ms | 508 → 365 | 1,136 → 929 | 12.5 → 1.55 | 2.81 → 2.22 | 0.42 → 0.17 |
    |                | inline TM | 136.8 → 94.2 ms | 278 → 188 | 592 → 673 | 6.26 → 0.80 | 2.64 → 2.25 | 0.32 → 0.23 |
-   E1_1000_ROWS
-   E3_ROWS
+   | E1, 1,000 tables | inline ML | 7,642 → 2,366 ms | 33,227 → 40,491 | 65,474 → 66,243 | 73.2 → 15.2 | 11.3 → 12.7 | 7.16 → 9.14 |
+   |                  | inline TM | 2,439 → 594 ms | 10,481 → 12,015 | 23,478 → 26,191 | 33.1 → 7.27 | 8.28 → 9.07 | 4.23 → 5.88 |
+   | E3, 1,000 snapshots | inline ML | 69.0 → 35.9 ms | 157 → 122 | 378 → 341 | 3.67 → 0.12 | 2.11 → 2.03 | 0.053 → 0.029 |
+   |                     | inline TM | 79.1 → 66.6 ms | 131 → 112 | 247 → 229 | 1.50 → 0.05 | 2.15 → 2.06 | 0.075 → 0.058 |
+   | E3, 7,200 snapshots | inline ML | 113.5 → 43.9 ms | 235 → 159 | 682 → 720 | 7.55 → 0.24 | 2.18 → 2.05 | 0.088 → 0.044 |
+   |                     | inline TM | 117.0 → 74.1 ms | 211 → 156 | 431 → 411 | 4.85 → 0.16 | 2.20 → 2.07 | 0.100 → 0.063 |
 
-   Every merge append committed in both arms. TM's p99 rose in every run
-   (612-703 ms, against 549-631): in its slowest 1% a commit's catalog
-   requests took less time with tail reads (129 against 190 ms) but it lost
-   more append races (1.64 against 1.38), since a tail read after a lost race
-   (a lookup and a GET) leaves a wider window before the resend than a probe
-   (a lookup). The model charges neither read its lookup (errata D23).
-   STEP6_MORE
-7. **One request a read** (if step 6 shows the HEAD): a ranged GET that
+   At 300 tables and in E3 every merge append committed in both arms. TM's
+   p99 at 300 tables rose in every run (612-703 ms, against 549-631): in its
+   slowest 1% a commit's catalog requests took less time with tail reads (129
+   against 190 ms) but it lost more append races (1.64 against 1.38), though
+   by requests a tail read after a lost race leaves the narrower window before
+   the resend (a GET, against a probe's HEAD and its GET of the probed
+   version's trailer; the model charges no lookup after an open, errata D23):
+   the question 1,000 tables asks louder.
+   At 1,000 tables (16.7 merge appends a second offered) the driver is the
+   limit in both arms, as it was in campaign `e1` (CPU 66-94% of its 16, GC
+   17-38%: `run_flags.saturated`), and with tail reads not every merge append
+   committed: 105 of 4,003 inline ML and 42 of 13,582 inline TM failed
+   (Iceberg's last try out of attempts, after 44-46 lost append races), against
+   4 and 1 off. The commits that lost no compaction (CAS) race, 61-65% of them, do
+   better with tail reads: a p50 of 564 against 2,356 ms (ML) and 276 against
+   840 (TM), and fewer lost appends (3.1 against 4.5, 2.3 against 3.5). The
+   rest lose about twice the append races with tail reads (20.8 against 10.7,
+   12.9 against 5.4) and take more of Iceberg's tries (2.58 against 1.77, 1.98
+   against 1.31), and every failure is among them. Why is open
+   ([Open questions](#open-questions)). Nor is the off arm the catalog before
+   format 3, whose resend after a probe read no trailer: at this point fileio
+   e505a0f (campaign `e1`, 2026-11-02, the same configuration) committed
+   inline TM at a p50 of 558 ms, 16.7 a second, with no failures, 1.35 lost
+   appends and 0.18 lost CASes a commit, against 4.23 and 0.95 off here (2,439
+   ms, 13.2 a second) and 5.88 and 0.54 on (594 ms, 15.0 a second); inline ML
+   was as saturated then (8,528 ms, 3.9 a second).
+   The first runs of this point overlapped about 24 fuzz jobs on havoc (the
+   rounds of steps 0 and 5); rerun on a quieter havoc (`tr6q`), they gave the
+   same picture, and the table gives the rerun (catalog-bench's lab marks the
+   first runs superseded). The 300-table and E3 runs overlapped the rounds
+   too, each point's arms side by side.
+7. **One request a read**: a ranged GET that
    reports the version and length it read (S3's `ETag` and `Content-Range`,
    ADLS's and GCS's equivalents), so a tail read is one request. A fork
-   change to the input files.
+   change to the input files. Planned if step 6 showed the HEAD, which it
+   cannot: the model charges a lookup after an open nothing (errata D23), so
+   building it waits on that decision, and on the open question of tail reads
+   past the knee.
 
 Then R2.3, with a read's cost known.
 
@@ -720,3 +751,15 @@ Then R2.3, with a read's cost known.
   in-memory one, whose positions are dense.
 - **S3 Express and `If-Match` on a GET**: answered by step 0's run; directory
   buckets honour it.
+- **Tail reads past the commit knee** (step 6, E1 at 1,000 tables). Commits
+  that lose a compaction race lose about twice the append races with tail
+  reads, and 0.3-2.6% of merge appends exhaust their retries. Unverified
+  candidates: a resend after a lost race waits for the fold of what beat it,
+  CPU on a saturated driver, where a resend after a probe waits for two small
+  requests (the fold could follow the resend: the GET gives the tail, its
+  frames the incarnation, the record count and whether the commit's own
+  record landed); and a writer that tail-reads knows the log's exact count,
+  so writers may turn to compaction together. Separately, the probe path
+  (tail reads off) is slower there than the catalog before format 3: its
+  resend's trailer read, or another change since fileio e505a0f. A trace of
+  each commit's attempts in the driver would tell them apart.
