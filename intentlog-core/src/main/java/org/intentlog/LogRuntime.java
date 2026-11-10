@@ -102,7 +102,10 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
 
   /** A replica of the log as a fresh read finds it. A read failure is thrown as it is. */
   public Replica<S> read() {
-    return replay(log.read(), null).replica();
+    CommitTrace.event(CommitTrace.Kind.READ, 0, 0);
+    Replica<S> read = replay(viewed(log.read()), null).replica();
+    CommitTrace.event(CommitTrace.Kind.BUILT);
+    return read;
   }
 
   /**
@@ -120,7 +123,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     Replica<S> read = after
         ? readAfter(floor, null, floor.logId()).replica()
         : replay(viewed(log.read()), null, null, floor).replica();
-    CommitTrace.event(CommitTrace.Kind.REPLAYED);
+    CommitTrace.event(CommitTrace.Kind.BUILT);
     return newer(floor, read);
   }
 
@@ -170,6 +173,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     Replay.Result<B> result =
         Replay.replayOnto(machine, machine.toBuilder(prior.state()), prior.committed().toBuilder(),
             prior.logId(), prior.intentionRecords(), view.records(), watch);
+    CommitTrace.event(CommitTrace.Kind.REPLAYED, 1, view.records().size());
     return new Replayed(null, view.tail(), prior.checkpointBytes(), result,
         logId != null ? logId : prior.logId());
   }
@@ -759,6 +763,12 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
   }
 
   private Replayed replay(LogView view, UUID watch, UUID logId) {
+    Replayed whole = replayWhole(view, watch, logId);
+    CommitTrace.event(CommitTrace.Kind.REPLAYED, 0, view.records().size());
+    return whole;
+  }
+
+  private Replayed replayWhole(LogView view, UUID watch, UUID logId) {
     checkJoint(view);
     return new Replayed(
         view, Replay.replay(machine, view.checkpoint().orElse(null), view.records(), watch), logId);
@@ -784,8 +794,9 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
         Replay.replayOnto(machine, machine.toBuilder(prior.state()), prior.committed().toBuilder(),
             prior.logId(), prior.intentionRecords(), records.subList(from, records.size()), watch);
     Replayed result = new Replayed(view, folded, logId);
+    CommitTrace.event(CommitTrace.Kind.REPLAYED, 1, records.size() - from);
     if (CHECK) {
-      check(result, replay(view, watch, logId));
+      check(result, replayWhole(view, watch, logId));
     }
     return result;
   }
@@ -1340,7 +1351,6 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
         try {
           written =
               replay(log.readThrough(receipt, config.visibilityWait()), id, base.logId(), current);
-          CommitTrace.event(CommitTrace.Kind.REPLAYED);
         } catch (RuntimeException e) {
           throw new AmbiguousWrite(e);
         }
@@ -1373,15 +1383,12 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
         if (after) {
           Replayed folded = foldAfter(view, current, id, base.logId());
           if (folded != null) {
-            CommitTrace.event(CommitTrace.Kind.REPLAYED);
             return folded;
           }
           // records alone it cannot fold: read whole, as below
           view = viewed(upToFloor(log::read));
         }
-        Replayed replayed = replay(view, id, base.logId(), current);
-        CommitTrace.event(CommitTrace.Kind.REPLAYED);
-        return replayed;
+        return replay(view, id, base.logId(), current);
       } catch (CommitOutcomeUnknownException e) {
         throw new UnreadableLog((RuntimeException) e.getCause()); // interrupted waiting
       } catch (RuntimeException e) {

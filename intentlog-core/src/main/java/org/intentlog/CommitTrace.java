@@ -57,12 +57,18 @@ public final class CommitTrace {
      */
     READ,
     /**
-     * A read's view arrived: a = 1 if it is the whole log (a checkpoint and its records), 0 if
-     * records that follow a replica; b = its records.
+     * A read's view arrived: a = 1 if it holds a checkpoint, 0 if records alone; b = its records.
+     * On one object a tail read's view holds the replica's checkpoint and records and the frames
+     * after them, so only {@link #REPLAYED} says whether it was folded.
      */
     VIEW,
-    /** A view was replayed (its records decoded and applied; the state not yet built). */
+    /**
+     * A view was replayed, its state not yet built: a = 1 if its records after a replica's were
+     * folded onto it, 0 if it was replayed from its checkpoint; b = the records replayed.
+     */
     REPLAYED,
+    /** A client's read is built into a replica (its state built). */
+    BUILT,
     /** The commit took a fresh read as the replica it continues from (its state built). */
     ADOPTED,
     /** A probe of the log's tail began. */

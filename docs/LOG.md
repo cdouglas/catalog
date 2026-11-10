@@ -816,10 +816,14 @@ thread without one costs a thread-local lookup per event. A commit reports
 its start and end (how it ended, the races it lost), each attempt (append or
 replace), a replace's payload ready, each write sent and how it ended
 (landed, lost, ambiguous), each wait after a lost race, each probe, and each
-read in three steps: begun (after a tail or whole), its view arrived (whole
-or records alone, and how many), and replayed; then the replica adopted (its
-state built). A client's reads (`read(floor)`: loads and refreshes) report
-the same steps. So the time a step took is the gap to the next event, and its
+read in three steps: begun (after a tail or whole), its view arrived (with a
+checkpoint or records alone, and how many), and replayed (folded onto the
+replica, or replayed from its checkpoint, and how many records); then the
+replica adopted (its state built). On one object a tail read's view holds
+the replica's checkpoint and records and the frames after them, so whether a
+read found the object extended or replaced is the replay's fold. A client's
+reads (`read`, `read(floor)`: loads and refreshes) report the same steps,
+ending built. So the time a step took is the gap to the next event, and its
 CPU the gap in CPU time: a read's I/O is begun to arrived, its replay arrived
 to replayed. catalog-bench records each job's trace (`trace_commits`), for
 TAIL_READS.md's question of tail reads past the commit knee.

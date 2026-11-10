@@ -394,7 +394,10 @@ class TestLogRuntime {
   @Test
   void aTracedCommitReportsEachAttemptItsWritesAndReads() {
     Replica<Map<String, Integer>> base = created();
-    log.beforeNextWrite(() -> otherWriterBumps("other"));
+    // the other writer's record, staged now so that its read is not in this thread's trace
+    byte[] other = LogEnvelope.encodeRecord(UuidV7.newUuidV7(),
+        ToyMachine.INSTANCE.encodeIntention(ToyMachine.Bump.of(base.state(), "other")));
+    log.beforeNextWrite(() -> log.appendDirectly(other));
     CommitTrace.open();
     try {
       bump(base, "mine");
@@ -408,11 +411,14 @@ class TestLogRuntime {
           CommitTrace.Kind.REPLAYED,
           CommitTrace.Kind.END);
       // the second attempt appends; the scripted log's read after a tail is the whole log (the
-      // creation's record and the other writer's); one race lost
+      // creation's record and the other writer's), whose record after the replica's is folded;
+      // one race lost
       assertThat(events.get(8).a()).isEqualTo(1);
       assertThat(events.get(8).b()).isZero();
       assertThat(events.get(5).a()).isEqualTo(1);
       assertThat(events.get(5).b()).isEqualTo(2);
+      assertThat(events.get(6).a()).isEqualTo(1);
+      assertThat(events.get(6).b()).isEqualTo(1);
       assertThat(events.get(12).a()).isZero();
       assertThat(events.get(12).b()).isEqualTo(1);
       assertThat(events).isSortedAccordingTo(
