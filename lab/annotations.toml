@@ -117,7 +117,7 @@ select = ["g1-witness-*", "jmh/j-g1*"]
 # expiry's pool GC takes the cheaper side). Local laptop, 1 fork: errors +-5-20%.
 
 [campaigns.i12-count]
-select = ["i12-count-*"]
+select = ["i12-count-*", "i12-retention-*"]
 [[annotate]]
 select = "where:label = 'pilot-mix' AND started_at < TIMESTAMP '2026-10-27 05:45:00'"
 mark = "superseded"
@@ -172,3 +172,6 @@ note = "p5: 4-CPU shards (CPU-bound at 16+ writers), no backoff after a lost rac
 [[annotate]]
 select = "i12-count-*"
 note = "Ingest at fileio main (1adba2b, capture format 4: i11's workload captured anew), compacting every 100 or 1,000 records (max.append.count's old and new defaults), committed set paged or kept whole at its steady state"
+[[annotate]]
+select = "i12-retention-*"
+note = "i12-count at a committed set of 6 hours (retention_s 21,600: i4's and i6's), the same capture"
