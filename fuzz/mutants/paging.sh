@@ -1,7 +1,8 @@
 # Calibration of paging the committed set (docs/COMMITTED_PAGING.md stage 4; anchors as of
-# d15036e): each mutant of intentlog-core must fail a commit-protocol fuzzer, on the shared log or
-# on one object. The TLA+ switches are floorgapB, absentpage, nodigest, sweepabove, mintH, pageown
-# and missingfail; the rest are mistakes the Java could make that the model has no switch for.
+# d15036e, pageown's as of bc5d500, which renamed its variable): each mutant of intentlog-core
+# must fail a commit-protocol fuzzer, on the shared log or on one object. The TLA+ switches are
+# floorgapB, absentpage, nodigest, sweepabove, mintH, pageown and missingfail; the rest are
+# mistakes the Java could make that the model has no switch for.
 MUTANTS="nodroppedreplay nodigest nomerge floorgapB pagedabsent gckeepspages absentpage sweepabove
   pageown mintH nodelete noadmission missingfail"
 # Unreachable from the fuzzers, so no oracle can catch them. newest: no compactor proposes the
@@ -53,7 +54,7 @@ mutant() { # name main-dir test-dir (the catalog's; these mutants are intentlog-
     # TLA+ sweepabove: a sweep deletes unreferenced pages above the floor too
     sweepabove) mutate $RT "      if (top >= 0L && top <= set.floor() && !referenced.contains(name)) {" "      if (top >= 0L && !referenced.contains(name)) {" ;;
     # TLA+ pageown: a compaction pages the block holding its own record's id
-    pageown) mutate $RT "        seals = page(set, pageCeiling(now, own), on.logId());" "        seals = page(set, pageCeiling(now, Long.MAX_VALUE), on.logId());" ;;
+    pageown) mutate $RT "      seals = page(set, pageCeiling(now, ownMs), on.logId());" "      seals = page(set, pageCeiling(now, Long.MAX_VALUE), on.logId());" ;;
     # TLA+ mintH: a writer mints its id above H, not above F
     mintH) mutate $RT "      this.id = UuidV7.newUuidV7After(base.committed().floor(), config.clockMs().getAsLong());" "      this.id = UuidV7.newUuidV7After(base.committed().horizon(), config.clockMs().getAsLong());" ;;
     # a compaction deletes no page
