@@ -51,8 +51,11 @@ OracleMW(w, s, out, final) ==
      \* "one commit made %d conditional writes", on storage that does not fail
      /\ MaxFaults = 0 => Len(s.cw) <= 1
      \* "a compaction after a commit changed the state" (and its checkpoint is a
-     \* replay: CheckpointRoundTrip, which a state the compaction kept implies here)
-     /\ \A i \in DOMAIN s.cc : View(s.cc[i].after) = View(s.cc[i].before)
+     \* replay: CheckpointRoundTrip, which a state the compaction kept implies here).
+     \* The state whole, which commits made it (hist), as the test compares the
+     \* catalog's content: a resend that dropped a record could let one rejected
+     \* before apply in its place, to the same versions
+     /\ \A i \in DOMAIN s.cc : Replay(s.cc[i].after).st = Replay(s.cc[i].before).st
 
 -----------------------------------------------------------------------------
 (* TestCatalogFaultProperties.Run.resolve: after each operation, the catalog

@@ -712,7 +712,7 @@ Each switch is a mistake the design rules out. Each breaks a property:
 |---|---|---|---|
 | `floorgap` | replay admits ids above `H`, as before paging, not above `F` | `PagesExact`; with blind appends, `ExactlyOnce` | `HonestFailed` |
 | `absentpage` | a page that cannot be fetched reads as absent | `HonestFailed` | `HonestFailed` |
-| `nodigest` | PageOut checks the node only | `PagesExact` | unreachable (finding 5) |
+| `nodigest` | PageOut checks the node only | `PagesExact` | unreachable; with resent compactions, `PagesExact` (finding 5) |
 | `sweepabove` | the sweep deletes unreferenced pages above the floor too | `PagesExist` | `PagesExist` |
 | `mintH` | writers mint after `H`, not `F` | `SoloCommits` | `CasAppliesItsRecord` |
 | `pageown` | a CAS's PageOuts are not kept below its own record | | `CasAppliesItsRecord` |
@@ -774,7 +774,10 @@ The design holds on every configuration. Where the model refines it:
    conditional, so its PageOuts land on the version they were computed on.
    `nodigest` breaks nothing on the file, as the shared log's switches did not
    on one object (`TestAtomicFileCommitProtocol` missed them). The check
-   matters for `compact()` on a shared log.
+   matters for `compact()` on a shared log. Since a compaction after the
+   commit that lost to appends is sent again with the records that beat it
+   (2026-11-10), it matters on one object too: the resend's PageOuts were
+   computed before those records, and `after-nodigest` breaks `PagesExact`.
 6. **The catalog fuzzers cannot see a missing page** (the oracles, below).
    Replay never reads a page, so a fuzzer that only reads the catalog misses
    `sweepabove`. `OracleHolds2` adds `PagesOK` (`PagesExist /\ PagesExact`),
@@ -962,14 +965,32 @@ commit, at a count of 1 so that every commit may compact:
 | `after-concerns-faults`, `after-blind-appends` | conflict encodings with every fault; blind appends | 244,175; 1,765 |
 | `after-page`, `after-page-gc`, `after-page-faults`, `after-page-skew` | paging: a compaction pages up to its clock less `A`; with GC; with every fault and the page store's; skewed clocks | 86,665; 1,500,377; 2,267,807; 78,087 |
 | `after-statepages` | the state's pages, put before a compaction's root | 62,324 |
+| `after-resend`, `after-resend-three` | a compaction that lost to appends sent again, twice at most; three writers | 15,491; 24,425 |
+| `after-resend-faults`, `after-resend-gc`, `after-resend-page` | with every fault; GC at retention 0 and a clock behind; paging, a clock behind | 371,882; 341,470; 126,240 |
 
-Every one passes. Its switches:
+Every one passes. A compaction that lost its race to appends may be sent again
+(`CompactRead`, `CompactResends` times: 1 in every `after-*` configuration, 2
+in the `after-resend*` ones): a tail read after the version it was
+conditioned on; if the object is that incarnation and no shorter, `compact`
+again, conditioned on the version read, with the records after the lost
+version (`cp`) copied in front of its GC record and PageOuts, and a fresh
+incarnation; else the compaction is dropped. The model takes both choices
+where the runtime's rule decides. `CheckpointIsReplay` now says that a CAS's
+checkpoint is the replay of a prefix of the version it replaces, and its log
+begins with the rest of that version (the whole version, for every CAS but a
+resend). A resend's PageOuts were computed before the records it copies, so
+on one object the digest check now refuses some: `after-nodigest` (paging,
+resends, a clock behind, `nodigest`) breaks `PagesExact`.
+
+Its switches:
 
 | Switch | Puts back | Breaks |
 |---|---|---|
 | `compactbase` | a compaction that checkpoints the replica the commit staged or rebased on, before its record, conditioned on the version its record landed in | `HonestCommitted` |
 | `compactresend` | a compaction that lost its race sent again on the object as it now is, as if the records that beat it were in its checkpoint | `HistGrows` |
 | `compactfail` | a compaction that lost its race fails the commit | `HonestFailed` |
+| `compactcopyafter` | a resend with the records that beat it after its GC record and PageOuts, where a GC at retention 0 drops their ids | `CheckpointIsReplay` (the matrix: `HonestCommitted`) |
+| `compactreplaced` | a resend that takes a replace as long as the version it lost on for growth | `HonestCommitted` |
 
 Writing the Java found one rule the model did not have: with CAS only, every
 commit replaced the object and its writer then compacted it again (a second
@@ -978,8 +999,10 @@ compacting after a commit the policy would have replace on any log.
 
 Witnesses (`--witnesses`): a compaction landed, one lost its race, an append
 lost its race to one (`Not_CompactionLanded`, `Not_CompactionLost`,
-`Not_LostToCompaction`), a full object with compaction after the commit, and
-a compaction on the multi-writer and race schedules.
+`Not_LostToCompaction`), a full object with compaction after the commit, a
+compaction on the multi-writer and race schedules, a resent compaction landed
+(`Not_CompactionResent`, with GC and with paging), and one whose PageOut its
+copied records made replay refuse (`Not_ResentPageOutRefused`).
 
 The oracle matrix (`--matrix`) adds `none-after` and the three switches on
 each fuzzer's schedules:
@@ -990,6 +1013,8 @@ each fuzzer's schedules:
 | `compactbase` | caught | caught | caught |
 | `compactresend` | caught | unreachable | unreachable |
 | `compactfail` | caught | unreachable | unreachable |
+| `compactcopyafter` | caught | unreachable | unreachable |
+| `compactreplaced` | unreachable | unreachable | unreachable |
 
 Every cell is adequate. The fault schedules run nothing between a commit's
 first write and its end, and the race schedules no racer before a
@@ -997,10 +1022,19 @@ compaction, so neither loses a compaction race. The multi-writer oracle
 first missed `compactbase` and `compactresend`: it judged a commit on its own
 writes, and the damage is in the compaction's. It now also asks of each
 compaction that it change no state (`OracleMW`'s `cc`), as
-TestMultiWriterProperties does, which catches both. In Java, the one-object
+TestMultiWriterProperties does, which catches both. With resends it compared
+too little: the entity versions (`View`). A `compactbase` resend dropped
+writer 1's second record, which let writer 2's, rejected in the original
+log, apply in its place, to the same versions; `Adequate` failed. The check
+now compares the replayed state whole, which commits made it included, as
+TestMultiWriterProperties compares a compaction's catalog: its namespaces and
+each table's whole metadata (it compared locations and a few properties,
+blind to an inline table's snapshots). In Java, the one-object
 commit-protocol fuzzer (5,000 tries) and the multi-writer fuzzer (300 tries)
 each catch all three as mutants (`fuzz/mutants/compaction.sh`, where
-`compactresend` is a compaction conditioned on a probe of the object).
+`compactresend` is a compaction conditioned on a probe of the object); the
+resend's (`compactnocopy`, `compactcopyafter`, `compactreplaced`) and the
+three before, the protocol fuzzer at 50,000 tries.
 
 ## History
 

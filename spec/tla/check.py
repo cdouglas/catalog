@@ -42,6 +42,7 @@ BASE = {
     "MaxSweep": "0",
     "TailReads": "TRUE",
     "CompactAfter": "FALSE",
+    "CompactResends": "1",
     "BlockIds": "1",
     "GridBits": "3",
     "SealEvery": "0",
@@ -74,6 +75,8 @@ FUZZER_PAGE_FAULTS = ('{"failBefore", "lostReply", "landedConflict", "throttled"
 # takes both, as the drawn points do). Every configuration above runs with compaction fused with
 # the commit (the ablation, and the path of a full object), as before; the after-* family runs the
 # same kinds of schedule with compaction after it. Its count is 1, so that each commit may compact.
+# A compaction that lost to appends may be sent again with the records that beat it in front of
+# its GC record and PageOuts, once (CompactResends; after-resend* twice).
 AFTER = {"CompactAfter": "TRUE", "MaxCount": "1"}
 
 # name -> (overrides, expect)
@@ -187,8 +190,9 @@ CONFIGS = {
     # PageOuts not kept below its own record.
     "floorgap": ({"TailReads": "FALSE", **FPAGE, "MaxFaults": "1", "FaultKinds": FPAGE_FAULTS,
                   "Bugs": '{"floorgap"}'}, {"ExactlyOnce", "HonestFailed", "PagesExact"}),
-    # On one object a PageOut lands only on the version it was computed on (the CAS is
-    # conditional): the digest check never refuses one, and the switch breaks nothing.
+    # On one object a fused CAS's PageOuts land only on the version they were computed on (the
+    # CAS is conditional): the digest check never refuses one, and the switch breaks nothing. A
+    # resent compaction's do not (after-nodigest).
     "nodigest": ({**FPAGE, "MaxFaults": "1", "FaultKinds": FPAGE_FAULTS, "Bugs": '{"nodigest"}'},
                  "pass"),
     "absentpage": ({**FPAGE, "MaxFaults": "2", "FaultKinds": FPAGE_FAULTS,
@@ -243,6 +247,15 @@ CONFIGS = {
                            "Strict": "TRUE"}, "pass"),
     "after-page-skew": ({**FPAGE, **AFTER, "Skew": "<- Behind2"}, "pass"),
     "after-statepages": ({**SPAGE, **AFTER}, "pass"),
+    # Resends: twice, on two and three writers, with faults, GC, a skewed clock and paging.
+    "after-resend": ({**AFTER, "Shapes": "<- TwoEach", "CompactResends": "2"}, "pass"),
+    "after-resend-three": ({**AFTER, "Writers": "{1, 2, 3}", "Shapes": "<- Three",
+                            "Skew": "<- NoSkew3", "CompactResends": "2"}, "pass"),
+    "after-resend-faults": ({**AFTER, "Shapes": "<- TwoEach", "CompactResends": "2",
+                             "MaxFaults": "1", "FaultKinds": ALL_FAULTS, "Strict": "TRUE"}, "pass"),
+    "after-resend-gc": ({**AFTER, "Shapes": "<- TwoEach", "CompactResends": "2", "Retention": "0",
+                         "MaxTime": "2", "Skew": "<- Behind2"}, "pass"),
+    "after-resend-page": ({**FPAGE, **AFTER, "CompactResends": "2", "Skew": "<- Behind2"}, "pass"),
     # Its switches: a compaction that checkpoints the replica the commit staged on, before its
     # record; one that is resent on the object as it is after losing its race (as if the records
     # that beat it were in its checkpoint); one whose loss fails the commit.
@@ -252,6 +265,18 @@ CONFIGS = {
                       {"CheckpointIsReplay", "HistGrows", "HonestCommitted"}),
     "compactfail": ({**AFTER, "Shapes": "<- TwoEach", "Bugs": '{"compactfail"}'},
                     {"HonestFailed"}),
+    # A resend whose copied records follow its GC record and PageOuts (judged on a view that
+    # dropped or paged ids they were judged without); one that takes a replace as long as the
+    # version it lost on for growth.
+    "compactcopyafter": ({**AFTER, "Shapes": "<- TwoEach", "Retention": "0", "MaxTime": "2",
+                          "Skew": "<- Behind2", "Bugs": '{"compactcopyafter"}'},
+                         {"CheckpointIsReplay", "HistGrows", "HonestCommitted"}),
+    "compactreplaced": ({**AFTER, "Shapes": "<- TwoEach", "Bugs": '{"compactreplaced"}'},
+                        {"CheckpointIsReplay", "HistGrows", "HonestCommitted"}),
+    # A resend's PageOuts were computed before the records it copies: one whose block they changed
+    # must be refused (the digest check), which on one object only a resend needs.
+    "after-nodigest": ({**FPAGE, **AFTER, "CompactResends": "2", "Skew": "<- Behind2",
+                        "Bugs": '{"nodigest"}'}, {"PagesExact"}),
     # The state's pages (SNAPSHOT_PAGING.md "Testing"): an entity's history seals into a page
     # at each version and drops one behind (SealEvery 1); writer 1 writes "a" three times.
     "statepages": (SPAGE, "pass"),
@@ -427,6 +452,8 @@ WITNESSES = [
     ("after-two-each", "Not_CompactionLanded"), ("after-two-each", "Not_CompactionLost"),
     ("after-long", "Not_LostToCompaction"), ("after-seg", "Not_Full"),
     ("after-sched-mw", "Not_CompactionLanded"), ("after-sched-race", "Not_CompactionLanded"),
+    ("after-resend", "Not_CompactionResent"), ("after-resend-gc", "Not_CompactionResent"),
+    ("after-resend-page", "Not_CompactionResent"), ("after-resend-page", "Not_ResentPageOutRefused"),
     ("after-page", "Not_PageOutInLog"), ("after-faults", "Not_LateLanding"),
 ]
 
@@ -474,6 +501,8 @@ BUG_KNOBS = {
     "compactbase": {**AFTER},
     "compactresend": {**AFTER},
     "compactfail": {**AFTER},
+    "compactcopyafter": {**AFTER, **GC, "skew": True},
+    "compactreplaced": {**AFTER},
 }
 CREATES = {"mw": "<- Creates", "fault": "<- Creates", "race": "<- RaceCreates",
            "race1": "<- RaceCreates1"}

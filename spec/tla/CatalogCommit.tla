@@ -27,9 +27,11 @@
 (* replace the object: it appends, and once its record has landed its      *)
 (* writer may compact (Compact): a replace of the version it holds with a  *)
 (* checkpoint of it, a GC record and PageOuts, and no record of its own.   *)
-(* Whatever becomes of that write, the commit stands. A commit still       *)
-(* replaces when no append can carry it (the store's cap, no append, CAS   *)
-(* only).                                                                  *)
+(* Whatever becomes of that write, the commit stands. A compaction that    *)
+(* lost to appends may be sent again, conditioned on the object as it      *)
+(* grew, with the records that beat it copied in front of its GC record    *)
+(* and PageOuts (CompactRead). A commit still replaces when no append can  *)
+(* carry it (the store's cap, no append, CAS only).                        *)
 (*                                                                         *)
 (* Bug switches put back protocol bugs the fuzzers and reviews found       *)
 (* (Bug N in fileio-catalog's commit subjects), to calibrate the           *)
@@ -65,6 +67,7 @@ CONSTANTS
   CompactAfter,     \* compaction after the commit (TRUE): past the limits a commit appends,
                     \* and its writer may then compact; or fused with it (FALSE): past them
                     \* the commit replaces the object with a checkpoint and its record
+  CompactResends,   \* how many times a compaction that lost to appends may be sent again
   Sched             \* "free": any interleaving. A fuzzer's schedules, where operations
                     \* run one at a time and others may run to completion inside one:
                     \* "mw" (TestMultiWriterProperties: one, before any request, on a
@@ -88,9 +91,11 @@ ASSUME /\ FaultKinds \subseteq WriteFaults \cup ReadFaults \cup PutFaults
                           "floorgap", "nodigest", "absentpage", "sweepabove", "mintH",
                           "pageown", "rootfirst", "sweepstale",
                           "lengthonly", "notrailer", "probeinc",
-                          "compactbase", "compactresend", "compactfail"}
+                          "compactbase", "compactresend", "compactfail",
+                          "compactcopyafter", "compactreplaced"}
        /\ TailReads \in BOOLEAN
        /\ CompactAfter \in BOOLEAN
+       /\ CompactResends \in Nat
 
 VARIABLES
   file,      \* the catalog object: [gen, chk: [st, C, H], log, segs]
@@ -255,13 +260,16 @@ Idle(k, n) ==
    cur |-> None, stale |-> FALSE, amb |-> FALSE, unres |-> FALSE, full |-> FALSE,
    att |-> 0, thr |-> 0, pend |-> None, written |-> None, rt |-> 0, nw |-> 0, pay |-> None,
    cf |-> FALSE, cx |-> FALSE, ci |-> FALSE, cw |-> << >>, first |-> None, ocf |-> FALSE,
-   lr |-> None, cre |-> FALSE, cc |-> << >>]
+   lr |-> None, cre |-> FALSE, cv |-> None, cp |-> << >>, crs |-> 0, cc |-> << >>]
 \* pc: idle, staged, loop, cas, throttled, readback, rebase, refresh, shrink,
-\*   resolve, restage, compact.
+\*   resolve, restage, compact, compactread.
 \* rt: the times the operation was restaged; nw: its write requests; pay:
 \*   with Paging, the CAS payload fixed when its pages were put (PrepCas).
 \* lr: the replica the commit's record landed in, which its compaction
 \*   replaces (compact); cre: with "compactresend", the compaction was resent.
+\*   cv: the version [gen, len, inc] a resent compaction is conditioned on
+\*   (None: lr's); cp: the records it copies in front of its GC record and
+\*   PageOuts; crs: how many times it was sent again (compactread).
 \*   Ghost: cc, its compaction's writes that landed, [before, after].
 \* base: the parsed state of cur (current), unless stale (stale).
 \* cur: the version the next write is conditioned on [gen, len, inc]
@@ -679,17 +687,28 @@ FinalRead(w, fk) ==
 \* landed in: one conditional replace of that version (with Paging, its pages
 \* put first, PrepCas). A replace that fails its condition, fails, or is
 \* throttled is dropped (one in flight may still land, LandInflight); either
-\* way the commit is committed. With "compactresend", a compaction that lost
-\* its race is sent again, once, on the version the object is now, as if the
-\* records that beat it were in its checkpoint. With "compactfail", one that
-\* lost reports the commit failed. A compaction is not one of the commit's
-\* writes (cw, nw), and no racer runs before it (Sched "race").
+\* way the commit is committed. One that lost its race may be sent again
+\* (CompactRead), conditioned on the version the writer read then (cv), with
+\* the records that beat it (cp) in front of its GC record and PageOuts, and
+\* a fresh incarnation. With "compactcopyafter", the records go after them.
+\* With "compactresend", a compaction that lost its race is sent again,
+\* once, on the version the object is now, as if the records that beat it
+\* were in its checkpoint. With "compactfail", one that lost reports the
+\* commit failed. A compaction is not one of the commit's writes (cw, nw),
+\* and no racer runs before it (Sched "race").
+CompactCond(s) ==
+  IF s.cv = None THEN [gen |-> s.lr.gen, len |-> s.lr.len, inc |-> s.lr.inc] ELSE s.cv
 Compact(w, fk) ==
   LET s  == ws[w]
-      x  == [strat |-> "CAS", cond |-> s.lr.gen, inc |-> <<w, s.n, 0>>,
-             payload |-> IF Paging THEN s.pay ELSE CompactPayload(w, s)]
+      cv == CompactCond(s)
+      pl == IF s.pay # None THEN s.pay ELSE CompactPayload(w, s)
+      x  == [strat |-> "CAS", cond |-> cv.gen,
+             inc |-> IF s.crs = 0 THEN <<w, s.n, 0>> ELSE <<w, s.n, 0, s.crs>>,
+             payload |-> [pl EXCEPT !.log = IF Has("compactcopyafter") THEN @ \o s.cp
+                                            ELSE s.cp \o @]]
       ok == file.gen = x.cond
       lands == ok /\ fk \in {"none", "lostReply", "landedConflict", "landedThrottled"}
+      lost == fk = "none" /\ ~ok
       s1 == [Faulted(s, fk) EXCEPT !.pay = None,
                !.cc = IF lands THEN Append(@, [before |-> file, after |-> Land(file, x)]) ELSE @]
   IN /\ CanStep(w) /\ s.pc = "compact" /\ (~Paging \/ s.pay # None)
@@ -702,11 +721,42 @@ Compact(w, fk) ==
      /\ UseFault(fk)
      /\ UNCHANGED now
      /\ UNCHANGED PageVars
-     /\ IF fk = "none" /\ ~ok /\ Has("compactresend") /\ ~s.cre
+     /\ IF lost /\ Has("compactresend") /\ ~s.cre
           THEN Go(w, [s1 EXCEPT !.lr = [@ EXCEPT !.gen = file.gen], !.cre = TRUE,
                                 !.pay = s.pay], FALSE)
-        ELSE End(w, s1, IF fk = "none" /\ ~ok /\ Has("compactfail") THEN "failed" ELSE "committed",
-                 lands)
+        ELSE IF lost /\ Has("compactfail") THEN End(w, s1, "failed", FALSE)
+        ELSE IF lost /\ s.crs < CompactResends
+          THEN Go(w, [s1 EXCEPT !.pc = "compactread", !.pay = pl, !.cv = cv], FALSE)
+        ELSE End(w, s1, "committed", lands)
+
+\* After its compaction lost its race, the writer reads the object after the
+\* version the compaction was conditioned on (a tail read): if it is still
+\* that incarnation and no shorter, appends beat the compaction, and the
+\* writer may send it again (or not: the runtime's rule, which the model
+\* takes both ways), conditioned on the version it read, with the records
+\* that beat it copied in front of its GC record and PageOuts. They replay on
+\* its checkpoint as they did on the version it checkpointed, and the GC and
+\* PageOuts follow them (a PageOut whose block they changed is refused, its
+\* page an orphan). If the object was replaced, or the read fails, the
+\* compaction is dropped and the commit is committed. With
+\* "compactreplaced", the read does not check the incarnation: a replace as
+\* long reads as growth.
+CompactRead(w, fk) ==
+  LET s == ws[w]
+      grown == (Has("compactreplaced") \/ file.inc = s.cv.inc) /\ FileLen(file) >= s.cv.len
+      rest == SubSeq(file.log, s.cv.len, Len(file.log))
+      s1 == [Faulted(s, fk) EXCEPT !.pay = None]
+  IN /\ CanStep(w) /\ s.pc = "compactread"
+     /\ fk \in {"none"} \cup (IF CanFault(w) THEN FaultKinds \cap {"readFail"} ELSE {})
+     /\ UseFault(fk)
+     /\ UNCHANGED <<file, inflight, now>>
+     /\ UNCHANGED PageVars
+     /\ IF fk = "none" /\ grown
+          THEN \/ Go(w, [s EXCEPT !.pc = "compact", !.crs = @ + 1, !.cp = @ \o rest,
+                                  !.cv = [gen |-> file.gen, len |-> FileLen(file),
+                                          inc |-> file.inc]], FALSE)
+               \/ End(w, s1, "committed", FALSE)
+        ELSE End(w, s1, "committed", FALSE)
 
 \* A timed-out write lands after all, while its precondition holds.
 LandInflight(i) ==
@@ -806,6 +856,7 @@ WriterNext(w) ==
          \/ FreshForCAS(w, fk) \/ Resolve(w, fk) \/ FinalRead(w, fk) \/ Restage(w, fk)
   \/ Exhaust(w)
   \/ \E fk \in WriteFaults \cup {"none"} : Compact(w, fk)
+  \/ \E fk \in ReadFaults \cup {"none"} : CompactRead(w, fk)
   \/ \E fk \in PutFaults \cup {"none"} : PrepCas(w, fk)
   \/ SweepState(w)
 
@@ -880,9 +931,14 @@ CasAppliesItsRecord ==
 \* A CAS's checkpoint is the replay of the version it replaces: a function of
 \* the log, not of the writer's clock (I11). A log with checkpoints apart from
 \* its records needs this, so that every reader, from whichever checkpoint,
-\* applies the same records.
+\* applies the same records. A compaction sent again checkpoints a prefix of
+\* that version (the one it lost on), and its log begins with the rest.
 CheckpointIsReplay ==
-  [][(file'.gen # file.gen /\ file'.segs = 1) => file'.chk = Ck(Replay(file))]_file
+  [][(file'.gen # file.gen /\ file'.segs = 1) =>
+       \E k \in 0..Len(file.log) :
+         /\ file'.chk = Ck(Replay([file EXCEPT !.log = SubSeq(@, 1, k)]))
+         /\ Len(file'.log) >= Len(file.log) - k
+         /\ SubSeq(file'.log, 1, Len(file.log) - k) = SubSeq(file.log, k + 1, Len(file.log))]_file
 
 \* Pages (COMMITTED_PAGING.md, oracle 2): every page the catalog references
 \* is in the store, and holds exactly the ids that applied in its range.

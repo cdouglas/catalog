@@ -153,6 +153,13 @@ Not_CompactionLanded == ~CompactionInc
 Not_CompactionLost == \A w \in Writers : ~(ws[w].pc = "compact" /\ file.gen # ws[w].lr.gen)
 Not_LostToCompaction ==
   \A w \in Writers : ~(ws[w].pc \in {"tailread", "refresh"} /\ CompactionInc)
+\* A compaction sent again, with the records that beat it, landed (its
+\* incarnation has a fourth part); and one whose PageOut replay refused, as
+\* a record it copied changed the block (a page put that no PageOut names).
+Not_CompactionResent == Len(file.inc) # 4
+Not_ResentPageOutRefused ==
+  ~(Len(file.inc) = 4 /\ \E i \in DOMAIN file.log : IsPo(file.log[i])
+                        /\ \A p \in LiveR.P : PageName(p) # PageName(file.log[i]))
 
 \* Paging (COMMITTED_PAGING.md). A CAS's PageOut applied: the floor above
 \* the horizon. A writer about to judge its record by a read whose id is
