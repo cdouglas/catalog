@@ -253,8 +253,10 @@ public final class AtomicFileLog implements SharedLog {
     // asks for (step 0)
     try (SeekableInputStream in = file.newStream()) {
       long length = file.getLength();
-      if (length < n) {
-        return (FileView) parse(file); // shorter: replaced
+      if (length < n || (length > n && !io.supportsAppend())) {
+        // shorter, or longer on a store without appends, where every change is a replace: read
+        // whole, not the 20 bytes before the tail first
+        return (FileView) parse(file);
       }
       in.seek(n - TRAILER_SIZE);
       bytes = readFully(in, (int) (length - n + TRAILER_SIZE));

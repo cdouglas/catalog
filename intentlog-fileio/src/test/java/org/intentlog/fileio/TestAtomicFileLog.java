@@ -28,7 +28,9 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.CRC32C;
 import org.apache.iceberg.io.AtomicOutputFile;
@@ -443,8 +445,12 @@ class TestAtomicFileLog {
 
   /** Counts the read requests that reach the store from now on. */
   private AtomicInteger countReads() {
+    return countReads(io);
+  }
+
+  private static AtomicInteger countReads(InMemoryAtomicFileIO store) {
     AtomicInteger reads = new AtomicInteger();
-    io.injectReadFaults(location -> {
+    store.injectReadFaults(location -> {
       reads.incrementAndGet();
       return InMemoryAtomicFileIO.ReadFault.NONE;
     });
@@ -581,6 +587,34 @@ class TestAtomicFileLog {
     assertThat(after.records()).extracting(TestAtomicFileLog::string)
         .containsExactly("r1", "r2", "r3");
     assertThat(after.tail().continues(held.tail())).as("another incarnation").isFalse();
+  }
+
+  /**
+   * On a store without appends (S3 Standard, GCS) every change is a replace, so an object longer
+   * than the replica's tail is read whole at once: a lookup and a GET, as a whole read. On a store
+   * with appends the tail read first GETs the bytes from 20 before the tail, which a replace fails:
+   * a GET more (each count here also holds the surefire check's read, intentlog.fileio.tail.check).
+   */
+  @Test
+  void aLongerObjectOnAStoreWithoutAppendsIsReadWholeAtOnce() {
+    Map<Boolean, Integer> requests = new HashMap<>();
+    for (boolean appends : new boolean[] {true, false}) {
+      InMemoryAtomicFileIO store = new InMemoryAtomicFileIO(appends);
+      store.readMode(InMemoryAtomicFileIO.ReadMode.PINNED); // a lookup, then a GET, as S3's
+      AtomicFileLog mine = new AtomicFileLog(store, LOCATION, () -> INCARNATION);
+      LogTail absent = AtomicFileLog.tailOf(store.newInputFile(LOCATION));
+      LogView held = mine.readThrough(
+          mine.replace(absent, bytes("chk"), List.of(bytes("r1"))), Duration.ZERO);
+      new AtomicFileLog(store, LOCATION, () -> 7L).replace(mine.read().tail(), bytes("chk"),
+          List.of(bytes("r1"), bytes("r2"), bytes("r3")));
+
+      AtomicInteger reads = countReads(store);
+      LogView after = mine.readAfter(held.tail());
+      requests.put(appends, reads.get());
+      assertSameView(after, mine.read());
+    }
+    assertThat(requests.get(false)).as("read requests without appends")
+        .isEqualTo(requests.get(true) - 1);
   }
 
   @Test

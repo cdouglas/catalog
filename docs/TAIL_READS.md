@@ -234,7 +234,14 @@ checked as above. A view records its incarnation and its frames' offsets.
 wrote (incarnation X, length N):
 
 1. A HEAD: the version V and its length L. If L < N, the object was replaced:
-   a whole read (a GET of V's bytes).
+   a whole read (a GET of V's bytes). On a store without appends
+   (`supportsAppend()` false: S3 Standard, GCS) every change is a replace, so
+   L > N is a whole read too: step 2's GET would only find a trailer that is
+   not X's, and the whole read after it would cost a GET more (campaign `p4r`
+   on S3 Standard: about one GET a commit, and more lost CAS races; see
+   [Measured on S3 Standard](#measured-on-s3-standard)). L = N goes on to
+   step 2, whose 20 bytes tell an unchanged object from a replace of the same
+   length.
 2. A ranged GET of [N − 20, L): the trailer of the frame that ends at N, then
    the frames after it.
 3. If those 20 bytes are not the trailer the replica holds, the object was
@@ -296,6 +303,53 @@ still probes and resends this way, which the model checks (`probe-*`) and the
 `probeinc` switch breaks. `FileTail.continues` becomes: the same incarnation,
 and no shorter, where the log read or wrote the bytes at both tails; a probed
 tail is compared by length, and its resend's frame is still true.
+
+### Measured on S3 Standard
+
+The step 6 campaigns (`tr6`, `tr6k`, `tr6m`) ran S3 Express only. Campaign
+`p4r` (catalog-bench, 2026-11-11: P4's E1 and E3 at fileio main after step
+6b) was the first on S3 Standard, a store without appends, and every one of
+its S3 Standard points was slower than before. Where every commit replaces
+the object, a tail read of a changed object no shorter than the replica's
+GETs the bytes from N − 20, finds a trailer that is not X's, and reads the
+object again whole: a GET more a read. Campaign `tr6s` ran p4r's S3 Standard
+points with tail reads on and off (catalog-bench f03ea57, fileio c015f5d,
+havoc, two runs an arm). E1 at 300 tables, a merge append's latency and its
+catalog requests:
+
+| Mode | Workers (offered a second) | Tail reads | committed a second | p50 | p99 | GETs | CAS lost |
+| ---- | -------------------------- | ---------- | ------------------ | --- | --- | ---- | -------- |
+| pointer | 32 (5.1) | on | 5.1 | 823 ms | 4.7 s | 7.7 | 2.1 |
+|         |          | off | 5.1 | 640 ms | 2.9 s | 3.5 | 1.5 |
+|         | 64 (15.3) | on | 9.8 | 4,034 ms | 25.8 s | 26.6 | 10.8 |
+|         |           | off | 13.6 | 2,859 ms | 21.3 s | 11.4 | 8.9 |
+|         | 128 (51.6) | on | 11.2 | 6,243 ms | 27.8 s | 34.5 | 14.4 |
+|         |            | off | 15.3 | 4,484 ms | 25.2 s | 15.2 | 12.4 |
+| inline TM | 32 (5.1) | on | 5.1 | 1,565 ms | 13.3 s | 12.7 | 4.5 |
+|           |          | off | 5.1 | 847 ms | 6.5 s | 4.6 | 2.6 |
+|           | 64 (15.3) | on | 6.2 | 6,796 ms | 31.5 s | 31.9 | 13.6 |
+|           |           | off | 7.8 | 5,113 ms | 29.3 s | 15.1 | 12.3 |
+|           | 128 (51.6) | on | 6.1 | 9,980 ms | 39.7 s | 40.7 | 17.5 |
+|           |            | off | 7.7 | 8,231 ms | 33.6 s | 19.2 | 16.0 |
+
+- The GET is the whole difference: tail reads on took 2.2-2.5 GETs an
+  attempt, off 1.1-1.4, as `e1-d20` (whole reads, before format 3: 1.1-1.5).
+  It lengthens each attempt's window between its read and its CAS, so more
+  attempts lose, and each lost one reads again.
+- In E3 (10 tables, 8 workers, depths 6,000 s and 60,000 s) tail reads on
+  took 1.2-1.7 GETs a merge append more, and its median was 7-24% longer
+  (pointer at 6,000 s: 511 ms against 459).
+- With tail reads off, pointer at 64 and 128 workers still committed below
+  `e1-d20` (13.6 and 15.3 a second against 15.3 and 19.0), losing more races
+  a commit at the same GETs an attempt; inline TM matched or passed it. Not
+  explained yet.
+
+So on a store without appends a tail read of a longer object reads it whole
+at once (step 1 above: `TestAtomicFileLog`'s
+`aLongerObjectOnAStoreWithoutAppendsIsReadWholeAtOnce`): as a whole read
+where the object changed, and still a lookup and a 20-byte GET where it did
+not. A whole read is always a read the model allows, so the protocol is
+unchanged.
 
 ## Why a tail read is sound
 
