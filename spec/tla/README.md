@@ -171,23 +171,25 @@ goes in a replace, `oversized` in `mustReplace`: Bug 71, covered by
 
 ## Results
 
-Every configuration passes:
+Every configuration passes. The state counts in this file's tables are from
+`check.py`'s full run at 4c685a3 (2026-11-11: 138 configurations, about six
+hours on the dev box):
 
 | Config | What it adds | States |
 |---|---|---|
 | `base` | two writers contending; append, then compaction by count | 61 |
 | `cas-only`, `gcs`, `size` | max.append.count 0; no append support; compaction by size | 55, 55, 61 |
-| `two-each`, `long` | several transactions per writer: compaction racing appends, the shrink path | 958, 538 |
+| `two-each`, `long` | several transactions per writer: compaction racing appends, the shrink path | 953, 542 |
 | `creates` | creates in different namespaces | 61 |
-| `faults`, `faults-strict`, `faults2` | every fault, late landings included; strict versions; two faults | 1,021; 1,183; 160,075 |
-| `gc0`, `skew` | retention 0; a writer's clock behind by more than the retention | 22,049; 768,774 |
+| `faults`, `faults-strict`, `faults2` | every fault, late landings included; strict versions; two faults | 558; 639; 104,218 |
+| `gc0`, `skew` | retention 0; a writer's clock behind by more than the retention | 21,777; 603,529 |
 | `seg` | a segment cap below max.append.count | 77 |
-| `mix`, `mix-lenient` | everything at once | 401,396; 620,919 |
-| `long-faults`, `three` | faults with the shrink path; three writers | 100,928; 106,249 |
-| `sched-*` | each fuzzer's schedules | 33 to 7,636 |
-| `concerns`, `concerns-faults` | conflict encodings: a table's concerns as entities (below); with every fault | 2,097; 14,587 |
-| `blind-appends` | two blind appends, with every fault | 1,009 |
-| `validated` | three validated commits on partitions (below) | 2,133 |
+| `mix`, `mix-lenient` | everything at once | 349,273; 584,711 |
+| `long-faults`, `three` | faults with the shrink path; three writers | 53,032; 43,118 |
+| `sched-*` | each fuzzer's schedules | 23 to 6,882 |
+| `concerns`, `concerns-faults` | conflict encodings: a table's concerns as entities (below); with every fault | 1,995; 11,071 |
+| `blind-appends` | two blind appends, with every fault | 577 |
+| `validated` | three validated commits on partitions (below) | 2,079 |
 
 **Conflict encodings.** A conflict encoding (fileio-catalog's
 `ConflictEncoding`) versions a table by its concerns. In the model the
@@ -675,11 +677,11 @@ Every configuration of the correct design passes:
 
 | Config | What it adds | States |
 |---|---|---|
-| `page` | two transactions each, a tick, a CAS that pages, one sweep | 8,052 |
-| `page-cas` | CAS only, two ticks | 23,414 |
-| `page-gc` | retention 2, three ticks: pages that GC later drops, and the sweep that deletes them | 129,212 |
-| `page-faults` | every fault, page faults included, strict versions | 152,877 |
-| `page-skew` | a writer's clock ahead by 2: the other mints after a floor above its clock | 7,860 |
+| `page` | two transactions each, a tick, a CAS that pages, one sweep | 8,185 |
+| `page-cas` | CAS only, two ticks | 23,654 |
+| `page-gc` | retention 2, three ticks: pages that GC later drops, and the sweep that deletes them | 138,132 |
+| `page-faults` | every fault, page faults included, strict versions | 126,770 |
+| `page-skew` | a writer's clock ahead by 2: the other mints after a floor above its clock | 7,995 |
 | `log-page`, `log-page2` | two transactions each; one page put (its PageOut sent, or never) and one sweep; two pages | 10,211; 17,259 |
 | `log-page-n2` | blocks of two ids | 7,885 |
 | `log-page-gc` | one transaction each; a GC record, a checkpoint, a trim | 23,662 |
@@ -953,18 +955,18 @@ commit, at a count of 1 so that every commit may compact:
 
 | Config | What it adds | States |
 |---|---|---|
-| `after-base`, `after-cas-only`, `after-gcs` | two writers contending; CAS only (every commit replaces, none compacts after); no append support | 165; 55; 55 |
-| `after-size` | compaction by size (`MaxSize` 3) | 3,943 |
-| `after-two-each`, `after-long` | compactions racing appends; the shrink path | 10,106; 1,986 |
-| `after-faults`, `after-faults-strict`, `after-faults2` | every fault, late landings included (a compaction's too); strict versions; two faults | 1,602; 1,989; 1,598,676 |
-| `after-gc0`, `after-skew` | retention 0 (a compaction's GC record, with no record of its own to stay below); a clock behind by more than the retention | 155,123; 9,709,917 |
-| `after-seg` | a segment cap: a full object makes the commit replace it with its record | 3,316 |
-| `after-long-faults`, `after-three` | faults with the shrink path; three writers | 224,325; 356,165 |
-| `after-probe`, `after-probe-faults` | tail reads off, with GC; with every fault | 206,799; 3,424 |
-| `after-sched-mw`, `after-sched-fault`, `after-sched-race`, `after-sched-race-op` | each fuzzer's schedules | 44,767; 4,028; 73; 111 |
-| `after-concerns-faults`, `after-blind-appends` | conflict encodings with every fault; blind appends | 244,175; 1,765 |
-| `after-page`, `after-page-gc`, `after-page-faults`, `after-page-skew` | paging: a compaction pages up to its clock less `A`; with GC; with every fault and the page store's; skewed clocks | 86,665; 1,500,377; 2,267,807; 78,087 |
-| `after-statepages` | the state's pages, put before a compaction's root | 62,324 |
+| `after-base`, `after-cas-only`, `after-gcs` | two writers contending; CAS only (every commit replaces, none compacts after); no append support | 208; 55; 55 |
+| `after-size` | compaction by size (`MaxSize` 3) | 4,908 |
+| `after-two-each`, `after-long` | compactions racing appends; the shrink path | 14,985; 2,617 |
+| `after-faults`, `after-faults-strict`, `after-faults2` | every fault, late landings included (a compaction's too); strict versions; two faults | 2,167; 2,650; 2,621,932 |
+| `after-gc0`, `after-skew` | retention 0 (a compaction's GC record, with no record of its own to stay below); a clock behind by more than the retention | 267,011; 17,469,599 |
+| `after-seg` | a segment cap: a full object makes the commit replace it with its record | 3,415 |
+| `after-long-faults`, `after-three` | faults with the shrink path; three writers | 352,926; 765,928 |
+| `after-probe`, `after-probe-faults` | tail reads off, with GC; with every fault | 339,513; 4,596 |
+| `after-sched-mw`, `after-sched-fault`, `after-sched-race`, `after-sched-race-op` | each fuzzer's schedules | 48,458; 4,028; 73; 111 |
+| `after-concerns-faults`, `after-blind-appends` | conflict encodings with every fault; blind appends | 393,824; 2,415 |
+| `after-page`, `after-page-gc`, `after-page-faults`, `after-page-skew` | paging: a compaction pages up to its clock less `A`; with GC; with every fault and the page store's; skewed clocks | 128,712; 2,563,427; 3,600,508; 122,051 |
+| `after-statepages` | the state's pages, put before a compaction's root | 87,734 |
 | `after-resend`, `after-resend-three` | a compaction that lost to appends sent again, twice at most; three writers | 15,491; 24,425 |
 | `after-resend-faults`, `after-resend-gc`, `after-resend-page` | with every fault; GC at retention 0 and a clock behind; paging, a clock behind | 371,882; 341,470; 126,240 |
 
