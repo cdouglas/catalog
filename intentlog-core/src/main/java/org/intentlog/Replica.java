@@ -30,6 +30,9 @@ public final class Replica<S> {
   private final CommittedSet committed;
   private final LogTail tail;
   private final long intentionRecords;
+  // The intention records and their bytes since the checkpoint or the last GC record after it
+  private final long recordsSinceGc;
+  private final long bytesSinceGc;
   private final UUID logId;
   // The size of the checkpoint the records follow (0 for a log not yet created)
   private final long checkpointBytes;
@@ -46,10 +49,19 @@ public final class Replica<S> {
   Replica(
       S state, CommittedSet committed, LogTail tail, long intentionRecords, UUID logId,
       long checkpointBytes, LogView view) {
+    this(state, committed, tail, intentionRecords, intentionRecords, 0L, logId, checkpointBytes,
+        view);
+  }
+
+  Replica(
+      S state, CommittedSet committed, LogTail tail, long intentionRecords, long recordsSinceGc,
+      long bytesSinceGc, UUID logId, long checkpointBytes, LogView view) {
     this.state = state;
     this.committed = committed;
     this.tail = tail;
     this.intentionRecords = intentionRecords;
+    this.recordsSinceGc = recordsSinceGc;
+    this.bytesSinceGc = bytesSinceGc;
     this.logId = logId;
     this.checkpointBytes = checkpointBytes;
     this.view = view;
@@ -72,6 +84,20 @@ public final class Replica<S> {
   /** The intention records after the checkpoint: what the count knob compares. */
   public long intentionRecords() {
     return intentionRecords;
+  }
+
+  /**
+   * The intention records after the checkpoint, or after the last GC record that follows it,
+   * where a compaction began ({@link Replay.Result#recordsSinceGc}): what a log that keeps its
+   * checkpoints apart compacts by, since its writers read only what follows their own tails.
+   */
+  public long recordsSinceGc() {
+    return recordsSinceGc;
+  }
+
+  /** The bytes of the records {@link #recordsSinceGc} counts. */
+  public long bytesSinceGc() {
+    return bytesSinceGc;
   }
 
   /** The log's id, which its checkpoints carry. */

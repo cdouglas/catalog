@@ -3,15 +3,22 @@
 # in AppendBlobLog, and must fail an oracle: the commit-protocol fuzzer on the in-memory store,
 # whose writers are one to three instances of the log (stale cached heads), or TestAppendBlobLog.
 # The fuzzer preempts commits, never compactions, so no rotation lands between a compaction's read
-# and its trim: trimearly only TestAppendBlobLog kills.
-MUTANTS="casbeforeclose nolimit createonmissing noclosedlength sweepnamed trimearly sdkretry"
-# offsetfromlength is masked: readThrough checks the receipt's CRC against the frame at its
-# offset, and the runtime judges a commit by its id in a read through to the tail, so a wrong
-# offset makes an outcome ambiguous, never dishonest. It is kept as a mutant of the model only.
-EQUIVALENT="offsetfromlength"
-ORACLES=TestAzureCommitProtocol,TestAppendBlobLog
+# and its trim: trimearly only TestAppendBlobLog kills. Two more are the Java's own (2026-11-10):
+# skipread, a read through a write that skips the read when records landed before it too
+# (AZURE_LOG.md "Reading through a write"), and compactbycheckpoint, writers counting toward
+# compaction from the checkpoint each last read rather than the last GC record ("When to
+# compact"), which only TestAzureCompaction sees: it makes compactions many, not wrong.
+# offsetfromlength was masked until the read through a write trusted the reply's offset to skip
+# its read (2026-11-10): readThrough checked the receipt's CRC against the frame at its offset,
+# so a wrong offset made an outcome ambiguous, never dishonest. Now an offset that names the kept
+# tail while another record landed first returns a view without that record, which the fuzzer's
+# oracle of held states and TestAppendBlobLog catch, as the model's AckedAtReceipt does.
+MUTANTS="casbeforeclose nolimit createonmissing noclosedlength sweepnamed trimearly sdkretry skipread compactbycheckpoint offsetfromlength"
+EQUIVALENT=""
+ORACLES=TestAzureCommitProtocol,TestAppendBlobLog,TestAzureCompaction
 
 AL=intentlog-azure/src/main/java/org/intentlog/azure/AppendBlobLog.java
+LR=intentlog-core/src/main/java/org/intentlog/LogRuntime.java
 
 prepare() {
   tries $1/intentlog-azure/src/test/java/org/intentlog/azure/TestAzureCommitProtocol.java 100000
@@ -57,5 +64,11 @@ mutant() { # name main-dir test-dir (the catalog's; these mutants are intentlog'
         long offset = store.appendBlock(seg.name(), frame, seg.writerLimit(),
             at == null ? -1 : at.position - seg.base());
         offset = before == null ? offset : before.length();" ;;
+    # a read through a write reads nothing when the record landed at or after the kept tail
+    skipread) mutate $AL "      if (!fresh && r.record != null && kept.tail.position == r.position()) {" "      if (!fresh && r.record != null && kept.tail.position <= r.position()) {" ;;
+    # writers count toward compaction from the checkpoint each last read
+    compactbycheckpoint) mutate $LR "    CompactionPolicy.Input input = new CompactionPolicy.Input(landed.recordsSinceGc(),
+        landed.checkpointBytes(), landed.checkpointBytes() + landed.bytesSinceGc(), 0);" "    CompactionPolicy.Input input = new CompactionPolicy.Input(landed.intentionRecords(),
+        landed.checkpointBytes(), landed.tail().bytes(), 0);" ;;
   esac
 }

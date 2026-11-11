@@ -194,4 +194,32 @@ class TestReplay {
     assertThat(rest.committed().build().bytes()).isEqualTo(whole.committed().build().bytes());
     assertThat(rest.intentionRecords()).isEqualTo(whole.intentionRecords());
   }
+
+  /**
+   * The records and bytes since the last GC record start again at each one, where a compaction
+   * began, and continue from a replica's counts in a fold; the intention records after the
+   * checkpoint do not start again.
+   */
+  @Test
+  void countsSinceTheLastGcRecordStartAgainThere() {
+    byte[] after = record(id(103), "j", 1);
+    List<byte[]> log = List.of(record(id(100), "k", 0), record(id(101), "j", 0),
+        LogEnvelope.encodeAdvanceHorizon(100), record(id(102), "k", 1), after);
+    Replay.Result<ToyMachine.Versions> whole = Replay.replay(MACHINE, null, log, null);
+    assertThat(whole.intentionRecords()).isEqualTo(4);
+    assertThat(whole.recordsSinceGc()).isEqualTo(2);
+    assertThat(whole.bytesSinceGc()).isEqualTo(log.get(3).length + after.length);
+
+    Replay.Result<ToyMachine.Versions> first =
+        Replay.replay(MACHINE, null, log.subList(0, 4), null);
+    Replay.Result<ToyMachine.Versions> rest = Replay.replayOnto(MACHINE,
+        MACHINE.toBuilder(first.builder().build()), first.committed().build().toBuilder(), null,
+        first.intentionRecords(), first.recordsSinceGc(), first.bytesSinceGc(),
+        log.subList(4, 5), null, null);
+    assertThat(rest.recordsSinceGc()).isEqualTo(whole.recordsSinceGc());
+    assertThat(rest.bytesSinceGc()).isEqualTo(whole.bytesSinceGc());
+
+    Replay.Result<ToyMachine.Versions> none = Replay.replay(MACHINE, null, log.subList(0, 2), null);
+    assertThat(none.recordsSinceGc()).as("no GC record: since the checkpoint").isEqualTo(2);
+  }
 }

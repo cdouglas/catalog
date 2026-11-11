@@ -67,17 +67,21 @@ public final class Replay {
     private final CommittedSet.Builder committed;
     private final UUID logId;
     private final long intentionRecords;
+    private final long recordsSinceGc;
+    private final long bytesSinceGc;
     private final Outcome outcome;
     private final String rejection;
     private final boolean seen;
 
     private Result(
         B builder, CommittedSet.Builder committed, UUID logId, long intentionRecords,
-        Outcome outcome, String rejection, boolean seen) {
+        long recordsSinceGc, long bytesSinceGc, Outcome outcome, String rejection, boolean seen) {
       this.builder = builder;
       this.committed = committed;
       this.logId = logId;
       this.intentionRecords = intentionRecords;
+      this.recordsSinceGc = recordsSinceGc;
+      this.bytesSinceGc = bytesSinceGc;
       this.outcome = outcome;
       this.rejection = rejection;
       this.seen = seen;
@@ -101,6 +105,21 @@ public final class Replay {
     /** The number of intention records after the checkpoint (GC and PageOut records not counted). */
     public long intentionRecords() {
       return intentionRecords;
+    }
+
+    /**
+     * The intention records after the checkpoint, or after the last GC record among them if one
+     * is: a GC record is where a compaction began, and the checkpoint it puts covers it. On a log
+     * that keeps its checkpoints apart, a writer that reads only what follows its own tail never
+     * sees another writer's checkpoint, but replays its GC record.
+     */
+    public long recordsSinceGc() {
+      return recordsSinceGc;
+    }
+
+    /** The bytes of the records {@link #recordsSinceGc} counts. */
+    public long bytesSinceGc() {
+      return bytesSinceGc;
     }
 
     /** What replay did with the first record of the watched id. */
@@ -176,6 +195,20 @@ public final class Replay {
   public static <S, B extends StateMachine.Builder<S>, I extends Intention<B>> Result<B> replayOnto(
       StateMachine<S, B, I> machine, B builder, CommittedSet.Builder committed, UUID logId,
       long intentionRecords, Iterable<byte[]> records, UUID watch, Rejections rejections) {
+    return replayOnto(machine, builder, committed, logId, intentionRecords, intentionRecords, 0L,
+        records, watch, rejections);
+  }
+
+  /**
+   * As {@link #replayOnto(StateMachine, StateMachine.Builder, CommittedSet.Builder, UUID, long,
+   * Iterable, UUID, Rejections)}, continuing the counts since the last GC record ({@link
+   * Result#recordsSinceGc}, {@link Result#bytesSinceGc}) from those of the replica the records
+   * follow.
+   */
+  public static <S, B extends StateMachine.Builder<S>, I extends Intention<B>> Result<B> replayOnto(
+      StateMachine<S, B, I> machine, B builder, CommittedSet.Builder committed, UUID logId,
+      long intentionRecords, long recordsSinceGc, long bytesSinceGc, Iterable<byte[]> records,
+      UUID watch, Rejections rejections) {
     Outcome outcome = Outcome.NOT_SEEN;
     String rejection = null;
     boolean seen = false;
@@ -183,6 +216,8 @@ public final class Replay {
       LogEnvelope.Record record = LogEnvelope.decodeRecord(bytes);
       if (record.isAdvanceHorizon()) {
         committed.advanceHorizon(record.watermarkMs());
+        recordsSinceGc = 0;
+        bytesSinceGc = 0;
         continue;
       }
       if (record.isPageOut()) {
@@ -190,6 +225,8 @@ public final class Replay {
         continue;
       }
       intentionRecords++;
+      recordsSinceGc++;
+      bytesSinceGc += bytes.length;
       UUID id = record.id();
       seen |= id.equals(watch);
       if (!committed.mayApply(id)) {
@@ -221,7 +258,8 @@ public final class Replay {
         }
       }
     }
-    return new Result<>(builder, committed, logId, intentionRecords, outcome, rejection, seen);
+    return new Result<>(builder, committed, logId, intentionRecords, recordsSinceGc, bytesSinceGc,
+        outcome, rejection, seen);
   }
 
   /** Why {@code intention} does not verify on {@code builder}; null if it cannot say. */

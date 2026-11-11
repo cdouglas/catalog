@@ -268,9 +268,27 @@ public final class LogCatalogProperties {
   public static final String LOG_SEGMENT_MAX_BYTES = "fileio.catalog.log.segment.max.bytes";
 
   /**
-   * Records after the checkpoint before a committer compacts the Azure log (default 10,000,
-   * provisional); it takes {@link #MAX_APPEND_COUNT}'s place there, as the one-object log's
-   * count was measured for appends that race for the object's end.
+   * The Azure log compacts once the records after its checkpoint (or after the last GC record,
+   * where another writer's compaction began) reach this share of the checkpoint's size (default
+   * 1.0: a cold read is at most two checkpoints, and checkpoints cost at most a byte for each byte
+   * of records), within {@link #LOG_CHECKPOINT_MIN_BYTES} and {@link #MAX_APPEND_SIZE}, or {@link
+   * #LOG_CHECKPOINT_RECORDS} records (CompactionPolicy#share; docs/AZURE_LOG.md "When to
+   * compact"). Each writer compacts at a point it draws past that, so that writers seldom compact
+   * at once.
+   */
+  public static final String LOG_CHECKPOINT_SHARE = "fileio.catalog.log.checkpoint.share";
+
+  public static final double DEFAULT_LOG_CHECKPOINT_SHARE = 1.0;
+
+  /** The records' bytes below which the Azure log never compacts by size (default 1 MiB). */
+  public static final String LOG_CHECKPOINT_MIN_BYTES = "fileio.catalog.log.checkpoint.min.bytes";
+
+  public static final long DEFAULT_LOG_CHECKPOINT_MIN_BYTES = 1L << 20;
+
+  /**
+   * The records after the checkpoint at which the Azure log compacts whatever their bytes
+   * (default 10,000, provisional); it takes {@link #MAX_APPEND_COUNT}'s place there, as the
+   * one-object log's count was measured for appends that race for the object's end.
    */
   public static final String LOG_CHECKPOINT_RECORDS = "fileio.catalog.log.checkpoint.records";
 
@@ -303,10 +321,11 @@ public final class LogCatalogProperties {
         "%s must be >= 0, got %s", COMMITTED_ADMISSION_MS, admissionMs);
     Preconditions.checkArgument(threshold >= 0,
         "%s must be >= 0, got %s", COMMITTED_PAGE_THRESHOLD, threshold);
-    int count = log(properties).equals(LOG_AZURE_APPEND)
+    boolean azure = log(properties).equals(LOG_AZURE_APPEND);
+    int count = azure
         ? intProperty(properties, LOG_CHECKPOINT_RECORDS, DEFAULT_LOG_CHECKPOINT_RECORDS)
         : intProperty(properties, MAX_APPEND_COUNT, DEFAULT_MAX_APPEND_COUNT);
-    return runtimeConfig(
+    RuntimeConfig config = runtimeConfig(
         count,
         longProperty(properties, MAX_APPEND_SIZE, DEFAULT_MAX_APPEND_SIZE),
         sizeBasis(properties),
@@ -317,6 +336,15 @@ public final class LogCatalogProperties {
         .withTailReads(booleanProperty(properties, READ_TAIL, DEFAULT_READ_TAIL))
         .withCompactionAfterCommit(
             booleanProperty(properties, COMPACT_AFTER_COMMIT, DEFAULT_COMPACT_AFTER_COMMIT));
+    if (azure) {
+      // the records after its checkpoint bound no store's cap there: compact by a share of the
+      // checkpoint's size, within the size and count bounds
+      config = config.withCompaction(CompactionPolicy.share(
+          doubleProperty(properties, LOG_CHECKPOINT_SHARE, DEFAULT_LOG_CHECKPOINT_SHARE),
+          longProperty(properties, LOG_CHECKPOINT_MIN_BYTES, DEFAULT_LOG_CHECKPOINT_MIN_BYTES),
+          longProperty(properties, MAX_APPEND_SIZE, DEFAULT_MAX_APPEND_SIZE), count));
+    }
+    return config;
   }
 
   /**
@@ -370,6 +398,11 @@ public final class LogCatalogProperties {
     Preconditions.checkArgument(val.equals("true") || val.equals("false"),
         "%s must be true or false, got %s", key, val);
     return Boolean.parseBoolean(val);
+  }
+
+  private static double doubleProperty(Map<String, String> properties, String key, double dflt) {
+    String val = properties == null ? null : properties.get(key);
+    return val != null ? Double.parseDouble(val) : dflt;
   }
 
   private static long longProperty(Map<String, String> properties, String key, long dflt) {

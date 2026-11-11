@@ -916,10 +916,17 @@ abandon: a GC record that lands twice drops nothing new, a PageOut that lands
 twice or after its block changed changes nothing, a checkpoint is the replay
 of the log through its position whoever writes it (I11), and the trim follows
 a durable checkpoint (P5). A writer whose commit landed compacts, best
-effort, when the policy says the log it landed in is due
-(`policy.due(intentionRecords, tail.bytes, 0)`); a failure is logged and the
-commit stands. A background compactor, or a queue's archiver, can call
-`compact()` (the catalog's `CatalogLog.compact()`) as well or instead.
+effort, when the policy says the log it landed in is due and its progress has
+reached a point the writer drew past the limits (`LogRuntime.compactApart`); a
+failure is logged, the commit stands, and the writer's next point is twice as
+far on. The policy counts the records and bytes since the checkpoint or since
+the last GC record after it (`Replica.recordsSinceGc`, `bytesSinceGc`): a
+writer that reads only what follows its own tail never sees another writer's
+checkpoint, but replays the GC record its compaction began with, and counts
+again from there. Counting from the checkpoint each writer last read, every
+writer compacted at every threshold (AZURE_LOG.md "When to compact"). A
+background compactor, or a queue's archiver, can call `compact()` (the
+catalog's `CatalogLog.compact()`) as well or instead.
 
 A compactor's GC record has no commit of its own to stay below: its watermark
 can pass the id of a record still in flight, which replay then rejects, as a

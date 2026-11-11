@@ -19,7 +19,7 @@ and its implementation on the same branch:
   history (`AzureLogHistory`).
 - **Not done:**
   - step 4's fuzzers: `TestCatalogFaultProperties` and `TestCatalogRaceProperties` drawing
-    this log;
+    this log (the compaction rule is built: [When to compact](#when-to-compact));
   - the measurements (catalog-bench docs/DESIGN.md, "The paper's configurations").
 
 `AppendBlobLog` is a `SharedLog` ([LOG.md](LOG.md)) kept in Azure Blob Storage, and its
@@ -439,30 +439,44 @@ The provider adds three things:
 A committer compacts, best effort, when the policy says the log is due, as on any log with
 checkpoints apart. At thousands of commits a second, compacting every 1,000 records (the
 default `max.append.count`, which was measured for the one-object log on S3 Express) would
-put several checkpoints a second. This log therefore has its own threshold
-(`fileio.catalog.log.checkpoint.records`, below), which takes `max.append.count`'s place in the
-policy (`LogCatalogProperties.runtimeConfig`). A dedicated compactor (`CatalogLog.compact()`
+put several checkpoints a second. This log therefore has its own rule ([When to
+compact](#when-to-compact)), in `max.append.count`'s place (`LogCatalogProperties.runtimeConfig`).
+A dedicated compactor (`CatalogLog.compact()`
 on a timer) is optional. Correctness never depends on who compacts: a checkpoint at a
 position is the same whoever writes it (I11).
 
-**When to compact is still open.** Nothing about the store bounds the records after the
-checkpoint here: segments move on at their limit, and a checkpoint never races an append. What
-the threshold trades is a cold reader's cost (the checkpoint and every record after it) against
-the checkpoints' cost (each encodes the whole catalog). A count does that badly across modes:
-pointer records are about a KB and inline ML's tens of KB, and the checkpoint grows with the
-catalog. Two changes, to measure first (catalog-bench docs/DESIGN.md, the compaction rule's
-ablation):
-- **Compact when the records' bytes reach a share of the checkpoint's.** A cold read then
-  costs at most (1 + share) checkpoints, and a checkpoint's bytes per record byte are at most
-  1 / share; a floor and a ceiling of records keep it sane at the ends. The policy's input
-  already holds both sizes (`CompactionPolicy.Input`).
-- **Draw a point past the threshold,** as the one-object log's compaction after the commit
-  does, so that writers past it don't all compact at once. Today every writer whose commit
-  lands past the threshold compacts. In a scratch run in catalog-bench (pointer mode, 50
-  tables, 16 writers, 25 commits a second on `azure-2026-11`, a checkpoint every 200 records)
-  all 16 writers compacted at each of the four thresholds crossed with blind appends, and 3 or 4
-  with conditional ones, whose writers land one at a time. Each compaction encodes the whole
-  catalog, so on an inline catalog this matters before any measurement of this log.
+### When to compact
+
+Nothing about the store bounds the records after the checkpoint here: segments move on at
+their limit, and a checkpoint never races an append. What the threshold trades is a cold
+reader's cost (the checkpoint and every record after it) against the checkpoints' cost (each
+encodes the whole catalog). A count does that badly across modes: pointer records are about a
+KB and inline ML's tens of KB, and the checkpoint grows with the catalog. So this log compacts
+by a share of its checkpoint (`CompactionPolicy.share`, since 2026-11-10):
+
+- **When the records reach a share of the checkpoint.** Once the bytes of the records since
+  the checkpoint reach `checkpoint.share` (1.0) of the checkpoint's, but not before
+  `checkpoint.min.bytes` (1 MiB) of them; and at `max.append.size` (16 MiB) or
+  `checkpoint.records` (10,000) records whatever the checkpoint's size. A cold read then costs
+  at most (1 + share) checkpoints (or a checkpoint and the floor), and a checkpoint's bytes per
+  byte of records are at most 1 / share.
+- **Counted from the last GC record.** A writer that reads only what follows its own tail
+  never sees another writer's checkpoint, so counting from the checkpoint it last read made
+  every writer compact at every threshold. But every compaction begins with a GC record, which
+  every writer replays, so replay also counts the records and bytes since the last GC record
+  (`Replay.Result.recordsSinceGc`, `Replica.recordsSinceGc`), and the policy counts those.
+- **At a point each writer draws.** Past the threshold, a writer compacts once the log's
+  progress reaches a point it drew in [1, 2) times the threshold (`LogRuntime.compactApart`,
+  as the one-object log's compaction after the commit draws), and after a compaction that
+  failed, twice as far on. The first writer to reach its point compacts, and the rest replay
+  its GC record before they reach theirs.
+
+Before, in a scratch run in catalog-bench (pointer mode, 50 tables, 16 writers, 25 commits a
+second on `azure-2026-11`, a checkpoint every 200 records), all 16 writers compacted at each of
+the four thresholds crossed with blind appends, and 3 or 4 with conditional ones, whose writers
+land one at a time. `TestAzureCompaction` has 8 writers take turns for 1,600 commits past a
+threshold of 100 records: they must compact 7 to 17 times between them; counting from their own
+checkpoints, they compacted 77 times.
 
 ## Failures
 
@@ -536,7 +550,9 @@ The catalog opens this log when `fileio.catalog.log` is `azure-append`. The defa
 | `fileio.catalog.log.location` | `<warehouse>/catalog.log` | the log's root |
 | `fileio.catalog.log.append` | `blind` | `blind`, or `conditional` (the ablation: the same objects and frames, appends conditioned on the tail; `conditionalAppend` true) |
 | `fileio.catalog.log.segment.max.bytes` | 64 MiB (provisional) | a new segment's limit *L*. It must exceed the largest record by the frame's overhead plus 32 bytes. Small values make rotations frequent, for tests |
-| `fileio.catalog.log.checkpoint.records` | 10,000 (provisional) | records after the checkpoint before a committer compacts; to be measured, as `max.append.count` was |
+| `fileio.catalog.log.checkpoint.share` | 1.0 | compact once the records since the checkpoint reach this share of its bytes ([When to compact](#when-to-compact)) |
+| `fileio.catalog.log.checkpoint.min.bytes` | 1 MiB | the records' bytes below which the log never compacts by size |
+| `fileio.catalog.log.checkpoint.records` | 10,000 (provisional) | the records at which it compacts whatever their bytes (`max.append.size` bounds their bytes); in place of `max.append.count` |
 | `fileio.catalog.log.checkpoint.keep` | 2 | checkpoints kept besides the head's |
 | `fileio.catalog.log.trim.grace.ms` | 60,000 | how long a segment out of the head stays before the sweep deletes it |
 
@@ -632,8 +648,15 @@ As every provider is tested (LOG.md "Testing a provider"), plus a model:
      unreadable rather than wrong.
    - `trimearly` only `TestAppendBlobLog` catches, since the fuzzer never preempts a
      compaction.
-   - `offsetfromlength` is equivalent in Java: `readThrough` checks the receipt's CRC, and
-     the runtime judges a commit by its id.
+   - `offsetfromlength` was equivalent in Java while `readThrough` always read: it checked the
+     receipt's CRC, and the runtime judges a commit by its id. Since a read through a write
+     trusts the reply's offset to skip its read ([Reading through a write](#reading-through-a-write)),
+     a wrong offset returns a state the log never held, and the fuzzer and `TestAppendBlobLog`
+     kill it (2026-11-10), as the model's `AckedAtReceipt` does.
+   - Two mutants of the Java alone (2026-11-10): `skipread` (the read skipped when records
+     landed before the write too), killed by `TestAppendBlobLog` and the fuzzer; and
+     `compactbycheckpoint` (writers counting toward compaction from their own checkpoints),
+     killed by `TestAzureCompaction` only, since it makes compactions many, not wrong.
 
 4. **The catalog, in part.** `TestLocalCatalog` and `TestLocalCatalogTransaction` pass in
    `AZLOG`, `AZLOG_TM` and `AZLOG_ML` (112 and 34 tests each, the same skips as every other

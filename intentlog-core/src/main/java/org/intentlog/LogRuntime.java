@@ -181,7 +181,8 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     }
     Replay.Result<B> result =
         Replay.replayOnto(machine, machine.toBuilder(prior.state()), prior.committed().toBuilder(),
-            prior.logId(), prior.intentionRecords(), view.records(), watch);
+            prior.logId(), prior.intentionRecords(), prior.recordsSinceGc(), prior.bytesSinceGc(),
+            view.records(), watch, null);
     CommitTrace.event(CommitTrace.Kind.REPLAYED, 1, view.records().size());
     return new Replayed(null, view.tail(), prior.checkpointBytes(), result,
         logId != null ? logId : prior.logId());
@@ -233,7 +234,8 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     checkFollows(view, prior.tail());
     Replay.Result<B> result =
         Replay.replayOnto(machine, machine.toBuilder(prior.state()), prior.committed().toBuilder(),
-            prior.logId(), prior.intentionRecords(), view.records(), null);
+            prior.logId(), prior.intentionRecords(), prior.recordsSinceGc(), prior.bytesSinceGc(),
+            view.records(), null, null);
     // The view holds only the records after prior's, so the replica is the replay of no view;
     // they follow prior's checkpoint
     return new Replayed(null, view.tail(), prior.checkpointBytes(), result, prior.logId())
@@ -699,20 +701,44 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     Replica<S> landed = new Commit(base, intention).run();
     Capabilities caps = log.capabilities();
     if (caps.separateCheckpoints() && !caps.fusedReplace()) {
-      // The writer whose commit landed compacts, as the policy says of the log it read; the commit
-      // stands whatever becomes of the compaction.
-      try {
-        if (config.compaction().due(new CompactionPolicy.Input(landed.intentionRecords(),
-            landed.checkpointBytes(), landed.tail().bytes(), 0))) {
-          compact();
-        }
-      } catch (RuntimeException e) {
-        LOG.log(System.Logger.Level.WARNING, "Compaction after a commit failed: " + log, e);
-      }
+      compactApart(landed);
     } else if (caps.fusedReplace() && caps.append() && config.compactAfterCommit()) {
       compactAfter(landed);
     }
     return landed;
+  }
+
+  /**
+   * Compacts a log that keeps its checkpoints apart after a commit landed in it, as {@code
+   * landed}: if the policy says the log is due, by the records since its checkpoint or since the
+   * last GC record after it ({@link Replica#recordsSinceGc}, {@link Replica#bytesSinceGc}), and
+   * the progress past the limits has reached the point this writer drew ({@link #drawn}). Every
+   * compaction begins with a GC record that every writer replays, so a writer that sees another's
+   * compaction begin counts again from there; and writers draw their points apart, so that the
+   * first to reach its point compacts and the rest see its GC record before they reach theirs.
+   * Before (2026-11-10), every writer whose commit landed past the limits compacted: a writer
+   * reading only what follows its own tail never saw another's checkpoint, and on the Azure log
+   * all 16 writers of a scratch run compacted at each threshold. The commit stands whatever
+   * becomes of the compaction.
+   */
+  private void compactApart(Replica<S> landed) {
+    CompactionPolicy policy = config.compaction();
+    CompactionPolicy.Input input = new CompactionPolicy.Input(landed.recordsSinceGc(),
+        landed.checkpointBytes(), landed.checkpointBytes() + landed.bytesSinceGc(), 0);
+    double progress = policy.progress(input);
+    if (!policy.due(input) || !drawn(progress, policy)) {
+      return;
+    }
+    CommitTrace.event(CommitTrace.Kind.COMPACT, landed.recordsSinceGc(), input.logBytes());
+    boolean compacted = false;
+    try {
+      compact();
+      compacted = true;
+    } catch (RuntimeException e) {
+      LOG.log(System.Logger.Level.WARNING, "Compaction after a commit failed: " + log, e);
+    } finally {
+      tried(progress, compacted, policy);
+    }
   }
 
   /**
@@ -938,6 +964,8 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
                 result.committed().build(),
                 tail,
                 result.intentionRecords(),
+                result.recordsSinceGc(),
+                result.bytesSinceGc(),
                 result.logId() != null ? result.logId() : logId,
                 checkpointBytes,
                 view);
@@ -980,7 +1008,8 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     List<byte[]> records = view.records();
     Replay.Result<B> folded =
         Replay.replayOnto(machine, machine.toBuilder(prior.state()), prior.committed().toBuilder(),
-            prior.logId(), prior.intentionRecords(), records.subList(from, records.size()), watch);
+            prior.logId(), prior.intentionRecords(), prior.recordsSinceGc(), prior.bytesSinceGc(),
+            records.subList(from, records.size()), watch, null);
     Replayed result = new Replayed(view, folded, logId);
     CommitTrace.event(CommitTrace.Kind.REPLAYED, 1, records.size() - from);
     if (CHECK) {

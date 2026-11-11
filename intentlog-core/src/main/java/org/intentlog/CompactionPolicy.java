@@ -169,4 +169,58 @@ public interface CompactionPolicy {
       }
     };
   }
+
+  /**
+   * For a log that keeps its checkpoints apart, where the store bounds nothing about the records
+   * after the checkpoint: compacts once those records' bytes reach {@code share} of the
+   * checkpoint's size, but not before {@code minBytes} of them, and once they reach {@code
+   * maxBytes} or {@code maxRecords} records whatever the checkpoint's size. A reader that starts
+   * cold then reads at most (1 + share) checkpoints (or a checkpoint and {@code minBytes}), and
+   * the checkpoints written cost at most 1 / share of a byte for each byte of records; a count
+   * alone does that badly, since records are a KB in one catalog and tens of KB in another, and
+   * the checkpoint grows with the catalog.
+   *
+   * @param share the records' bytes, as a share of the checkpoint's, at which the log compacts
+   * @param minBytes the records' bytes below which it never compacts by size
+   * @param maxBytes the records' bytes at which it compacts, whatever the checkpoint's size
+   * @param maxRecords the records at which it compacts (0: every commit)
+   */
+  static CompactionPolicy share(double share, long minBytes, long maxBytes, int maxRecords) {
+    if (!(share > 0) || minBytes < 0 || maxBytes < 0 || maxRecords < 0) {
+      throw new IllegalArgumentException(String.format(
+          "share(%s, %d, %d, %d): a share above 0, and no negative limit", share, minBytes,
+          maxBytes, maxRecords));
+    }
+    return new CompactionPolicy() {
+      /** The records' bytes at which the log compacts, given its checkpoint's size. */
+      private double target(Input log) {
+        return Math.min((double) maxBytes,
+            Math.max((double) minBytes, share * log.checkpointBytes()));
+      }
+
+      @Override
+      public boolean due(Input log) {
+        return log.intentionRecords() >= maxRecords
+            || log.tailBytes() + log.recordBytes() >= target(log);
+      }
+
+      /** The larger of the record count's and the bytes' fraction of their limits. */
+      @Override
+      public double progress(Input log) {
+        double records = maxRecords == 0 ? Double.POSITIVE_INFINITY
+            : (double) log.intentionRecords() / maxRecords;
+        double target = target(log);
+        double bytes = target <= 0 ? Double.POSITIVE_INFINITY
+            : (log.tailBytes() + log.recordBytes()) / target;
+        double progress = Math.max(records, bytes);
+        return due(log) ? Math.max(1.0, progress) : progress;
+      }
+
+      @Override
+      public String toString() {
+        return String.format("share(%s of the checkpoint, %d to %d bytes, %d records)", share,
+            minBytes, maxBytes, maxRecords);
+      }
+    };
+  }
 }
