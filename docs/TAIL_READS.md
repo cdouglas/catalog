@@ -872,7 +872,14 @@ runtime a preempting commit compacted too, so compactions lost to
 compactions), and runs that compact after the commit also preempt the first
 request after a commit's first write (its compaction's replace, on one
 object). Its statistics count compactions sent, sent again, lost and landed,
-from the runtime's trace. Two tests changed meaning: `CheckpointRoundTrip`
+from the runtime's trace. Its checkpoint oracle on one object
+(`AtomicFileLogHarness`) says what the model's `CheckpointIsReplay` says: a
+replace's checkpoint is the replay of a prefix of the version it replaced,
+and the replace's records begin with the rest of that version's. The first
+calibration (`tr6c-calib`) found the oracle still asking for the whole
+version. Its unmutated run failed at about try 51,650 of 300,000, on a resend
+that copied a record that had applied: the fuzzer reaches one about once in
+50,000 tries. Two tests changed meaning: `CheckpointRoundTrip`
 asked of every catalog file that the first record after its checkpoint apply
 where it holds (Bug 64: a replace's own record), which after a compaction is
 some later append, which a compaction's GC record at a retention of 0 may

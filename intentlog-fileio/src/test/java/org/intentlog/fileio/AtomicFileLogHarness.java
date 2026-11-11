@@ -379,17 +379,37 @@ public final class AtomicFileLogHarness implements LogHarness {
           && startsWith(after.records(), before.records())) {
         continue; // an append by CAS (a copy appended on a store without append): no checkpoint
       }
-      Replay.Result<B> replayed =
-          Replay.replay(sm, before.checkpoint().orElse(null), before.records(), null);
-      CommittedSet committed = replayed.committed().build();
-      byte[] expected = LogEnvelope.encodeCheckpoint(replayed.logId(), committed.bytes(),
-          sm.encodeCheckpoint(replayed.builder().build()));
-      byte[] written = after.checkpoint().orElseThrow();
-      if (!Arrays.equals(expected, written)) {
+      if (!replaysAPrefix(sm, before, after)) {
         violations.add("CAS #" + i + " did not checkpoint the replay of the version it replaced");
       }
     }
     return violations;
+  }
+
+  /**
+   * Whether {@code after}'s checkpoint is the replay of a prefix of the version it replaced, and its
+   * records begin with the rest of that version's: the whole version, for every replace but a
+   * compaction sent again with the records that beat it (TAIL_READS.md "Compaction after the
+   * commit"; CatalogCommit.tla's CheckpointIsReplay).
+   */
+  private static <S, B extends StateMachine.Builder<S>, I extends Intention<B>> boolean
+      replaysAPrefix(StateMachine<S, B, I> sm, LogView before, LogView after) {
+    byte[] written = after.checkpoint().orElseThrow();
+    List<byte[]> records = before.records();
+    for (int k = records.size(); k >= 0; k--) {
+      if (!startsWith(after.records(), records.subList(k, records.size()))) {
+        continue;
+      }
+      Replay.Result<B> replayed =
+          Replay.replay(sm, before.checkpoint().orElse(null), records.subList(0, k), null);
+      CommittedSet committed = replayed.committed().build();
+      byte[] expected = LogEnvelope.encodeCheckpoint(replayed.logId(), committed.bytes(),
+          sm.encodeCheckpoint(replayed.builder().build()));
+      if (Arrays.equals(expected, written)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private static boolean startsWith(List<byte[]> records, List<byte[]> prefix) {
