@@ -112,9 +112,10 @@ public final class IngestBench {
   /**
    * The format of the records this build writes ({@code capture_format}): raise it with a change
    * to the records' format, so that a run captures its log anew rather than reading one an earlier
-   * format wrote.
+   * format wrote. 4: committed paging's PageOut records and snapshot paging's (the first record
+   * fixes a catalog's paging), since 3 (2026-10-28).
    */
-  static final int CAPTURE_FORMAT = 3;
+  static final int CAPTURE_FORMAT = 4;
 
   /** Whether the run ingests a generated trace ({@link LogTrace}) rather than a captured log. */
   private static boolean generated(BenchConfig config) {
