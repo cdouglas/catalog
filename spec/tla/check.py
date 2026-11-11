@@ -408,10 +408,68 @@ LOG_CONFIGS = {
                         {"UnknownExplained"}),
 }
 
-MODELS = {"MC": (BASE, SAFETY, ACTIONS), "MCShared": (LOG_BASE, LOG_SAFETY, LOG_ACTIONS)}
+# The Azure log (AzureLog, through MCAzure; docs/AZURE_LOG.md), configurations az-*: two writers
+# with one record each, a segment of one record (W = 1, L = 2), one rotation.
+AZ_BASE = {
+    "Writers": "{1, 2}",
+    "Recs": "<- OneEach",
+    "WLimit": "1",
+    "MaxBlocks": "5",
+    "MaxOrd": "1",
+    "MaxSends": "2",
+    "MaxFaults": "0",
+    "FaultKinds": "{}",
+    "MaxCkpt": "0",
+    "MaxTrim": "0",
+    "MaxSweep": "0",
+    "Readers": "{1}",
+    "MaxReads": "1",
+    "Bugs": "{}",
+    "Pad": "Pad",
+}
+AZ_SAFETY = ["ClosedSegments", "NothingPastClose", "ReadsAreSlices", "AckedAtReceipt",
+             "NamedExist", "Readable", "CheckpointsStable", "CopiesKnown"]
+AZ_ACTIONS = ["AbstractGrows"]
+AZ_FAULTS = '{"lostReply", "notSent", "inflight", "shortRead"}'
+# A checkpoint, a trim and two sweeps, over two rotations.
+AZ_COMPACT = {"MaxOrd": "2", "MaxCkpt": "1", "MaxTrim": "1", "MaxSweep": "2"}
+
+AZ_CONFIGS = {
+    "az-base": ({}, "pass"),
+    "az-two-each": ({"Recs": "<- TwoEach", "MaxOrd": "2"}, "pass"),
+    "az-w2": ({"Recs": "<- TwoEach", "WLimit": "2", "MaxOrd": "1"}, "pass"),
+    "az-blocks": ({"Recs": "<- TwoEach", "WLimit": "3", "MaxBlocks": "2"}, "pass"),
+    "az-three": ({"Writers": "{1, 2, 3}", "Recs": "<- Three"}, "pass"),
+    "az-compact": ({**AZ_COMPACT, "Recs": "<- TwoOne", "MaxReads": "2"}, "pass"),
+    "az-faults": ({"MaxFaults": "1", "FaultKinds": AZ_FAULTS, "MaxReads": "2"}, "pass"),
+    "az-faults-compact": ({"MaxCkpt": "1", "MaxTrim": "1", "MaxSweep": "1", "MaxFaults": "1",
+                           "FaultKinds": AZ_FAULTS}, "pass"),
+    # The mistakes (AZURE_LOG.md "Mistakes the model must catch"): each must break a property.
+    "az-casbeforeclose": ({"Bugs": '{"casbeforeclose"}'},
+                          {"NothingPastClose", "AckedAtReceipt", "ClosedSegments",
+                           "ReadsAreSlices", "AbstractGrows"}),
+    "az-nolimit": ({"Recs": "<- TwoEach", "MaxReads": "0", "Bugs": '{"nolimit"}'},
+                   {"NothingPastClose", "AckedAtReceipt", "ClosedSegments"}),
+    "az-createonmissing": ({"Recs": "<- TwoOne", "MaxCkpt": "1", "MaxTrim": "1",
+                            "MaxSweep": "1", "MaxReads": "0", "Bugs": '{"createonmissing"}'},
+                           {"NothingPastClose", "AckedAtReceipt", "AbstractGrows",
+                            "CheckpointsStable"}),
+    "az-noclosedlength": ({"MaxFaults": "1", "FaultKinds": '{"shortRead"}',
+                           "Bugs": '{"noclosedlength"}'}, {"ReadsAreSlices"}),
+    "az-sweepnamed": ({"MaxSweep": "1", "Bugs": '{"sweepnamed"}'}, {"NamedExist"}),
+    "az-trimearly": ({"MaxCkpt": "1", "MaxTrim": "1", "Bugs": '{"trimearly"}'}, {"Readable"}),
+    "az-sdkretry": ({"WLimit": "2", "MaxFaults": "1", "Bugs": '{"sdkretry"}'}, {"CopiesKnown"}),
+    "az-offsetfromlength": ({"WLimit": "2", "MaxReads": "0", "Bugs": '{"offsetfromlength"}'},
+                            {"AckedAtReceipt"}),
+}
+
+MODELS = {"MC": (BASE, SAFETY, ACTIONS), "MCShared": (LOG_BASE, LOG_SAFETY, LOG_ACTIONS),
+          "MCAzure": (AZ_BASE, AZ_SAFETY, AZ_ACTIONS)}
 
 
 def model_of(name):
+    if name.startswith("az-"):
+        return "MCAzure"
     return "MCShared" if name.startswith("log-") else "MC"
 
 
@@ -455,6 +513,12 @@ WITNESSES = [
     ("after-resend", "Not_CompactionResent"), ("after-resend-gc", "Not_CompactionResent"),
     ("after-resend-page", "Not_CompactionResent"), ("after-resend-page", "Not_ResentPageOutRefused"),
     ("after-page", "Not_PageOutInLog"), ("after-faults", "Not_LateLanding"),
+    # The Azure log.
+    ("az-base", "Not_Rotated"), ("az-two-each", "Not_TwoRotations"), ("az-base", "Not_Pad"),
+    ("az-two-each", "Not_CasLost"), ("az-blocks", "Not_BlockClosed"), ("az-base", "Not_ReadNext"),
+    ("az-compact", "Not_CheckpointInHead"), ("az-compact", "Not_Trimmed"),
+    ("az-compact", "Not_Swept"), ("az-compact", "Not_Writer404"),
+    ("az-compact", "Not_Reader404"), ("az-faults", "Not_LateLanding"), ("az-faults", "Not_Copy"),
 ]
 
 
@@ -636,7 +700,7 @@ def run_quiet(name, overrides, invariants, properties, model="MC"):
     return "ERROR: " + (err.group(1) if err else "see output")
 
 
-ALL = {**CONFIGS, **LOG_CONFIGS}
+ALL = {**CONFIGS, **LOG_CONFIGS, **AZ_CONFIGS}
 
 
 def main():

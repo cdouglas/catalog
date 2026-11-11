@@ -1038,6 +1038,90 @@ each catch all three as mutants (`fuzz/mutants/compaction.sh`, where
 resend's (`compactnocopy`, `compactcopyafter`, `compactreplaced`) and the
 three before, the protocol fuzzer at 50,000 tries.
 
+## The Azure log
+
+`AzureLog.tla` models docs/AZURE_LOG.md's log on Azure Append Blobs: the provider below the SPI
+that `SharedLogCommit.tla` takes as one log. Like that model, it was written before the Java
+(`intentlog-azure`'s `AppendBlobLog`). Its configurations are `az-*`, through `MCAzure.tla`.
+
+**What is modelled.** Sizes are in units: a record's frame is 1, and a pad is whatever reaches
+the segment's limit L = W + 1.
+- **Writers** append their records blind, each append carrying the writer limit W. Faults: a
+  lost reply, nothing sent, and an append still in flight that lands later under the
+  conditions it was sent with.
+- **Rotation.** A writer that finds the last segment full reads the head, and if it still
+  names that segment last, closes it. The close finds it closed (at L, or at the block limit),
+  or pads it to L at the length it read. Then the writer creates a candidate and CASes the
+  head.
+- **Compactors** put a checkpoint at a record boundary of a live segment and CAS the head to
+  name it, trim (a CAS that drops the segments before the checkpoint's) and sweep (deleting a
+  segment the head doesn't name, at or below its last ordinal).
+- **Readers** read from the head they hold, however stale. A closed segment must read to its
+  recorded length. A closed last segment sends the reader to the head again for its successor.
+  A read may come back short, as a fault.
+- **Crashes** need no action: a writer that stops is a behaviour TLC already explores.
+
+**The log the provider presents** (`Abstract`, a ghost) is the records of the segments every
+head has named, in ordinal order, each up to its closed length (the last up to its size), pads
+left out.
+
+| Property | Statement |
+|---|---|
+| `AbstractGrows` (action) | the log only grows: every record keeps its place (P1) |
+| `ClosedSegments` | AZ1: every segment the head names but the last is closed, at the length it records |
+| `NothingPastClose` | AZ1 on the ghost: nothing lies past a closed length |
+| `ReadsAreSlices` | AZ2: every read was a slice of the log from its checkpoint |
+| `AckedAtReceipt` | AZ3: every acknowledged append is in the log at its receipt |
+| `NamedExist` | AZ5: every segment the head names exists |
+| `Readable` | P5: the head's checkpoint lies in a live segment |
+| `CheckpointsStable` | a checkpoint keeps its place in the log |
+| `CopiesKnown` | no copy of a record is in the log that its writer doesn't know may have landed (the shared-log model's `dup`) |
+
+**Results** (2026-11-10). Every passing configuration holds:
+
+| Configuration | What it adds | Distinct states |
+|---|---|---:|
+| `az-base` | two writers, one record each, a segment of one record | 102 |
+| `az-two-each` | two records each, three segments | 31,296 |
+| `az-w2` | two records a segment | 2,230 |
+| `az-blocks` | segments closed by the block limit, not a pad | 1,248 |
+| `az-three` | three writers | 5,721 |
+| `az-compact` | a checkpoint, a trim and two sweeps, over two rotations; two reads | 334,744 |
+| `az-faults` | one fault: lost reply, not sent, in flight, short read | 17,922 |
+| `az-faults-compact` | a fault, with a checkpoint, a trim and a sweep | 331,898 |
+
+Each bug switch (AZURE_LOG.md "Mistakes the model must catch") breaks a property:
+
+| Switch | Breaks |
+|---|---|
+| `casbeforeclose` | `ClosedSegments` |
+| `nolimit` (writer 1's appends carry no limit) | `ClosedSegments` |
+| `createonmissing` | `NothingPastClose` |
+| `noclosedlength` | `ReadsAreSlices` |
+| `sweepnamed` | `NamedExist` |
+| `trimearly` | `Readable` |
+| `sdkretry` | `CopiesKnown` |
+| `offsetfromlength` | `AckedAtReceipt` |
+
+`nolimit` first dropped the limit from every writer's appends, and broke nothing: with no
+writer stopping short of L, no pad is ever needed and segments close only at the block limit.
+The mistake is a code path that forgets the limit while others keep it, so the switch drops it
+from writer 1's appends only.
+
+The witnesses (`check.py --witnesses -k az-`) are each reached:
+- writes: a rotation, two rotations, a pad, a block-limit close, a lost CAS, a late landing,
+  and a record in the log twice;
+- compaction: a checkpoint named by the head, a trim and a sweep;
+- reads: a reader stepping past a closed last segment, and a 404 for a stale writer and for a
+  stale reader.
+
+**In Java** (`intentlog-azure`), the switches are mutants (`fuzz/mutants/azurelog.sh`), and each
+fails `TestAzureCommitProtocol` or `TestAppendBlobLog`. `offsetfromlength` is equivalent there:
+the receipt carries the frame's CRC, which a read through it checks, and the runtime judges a
+commit by its id. Positions in Java are global offsets (each segment's base in the head), so
+the end of a closed segment and the start of the next are one position. The model's (ordinal,
+offset) pairs are the same places.
+
 ## History
 
 This replaces `FileIOCatalog.tla` (PR #1; last changed 2026-10-14 for Bug 10). It
