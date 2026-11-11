@@ -52,7 +52,26 @@ public interface CompactionPolicy {
     return ThreadLocalRandom.current().nextDouble();
   }
 
-  /** This policy, with its draws taken from {@code draws} (each in [0, 1)). */
+  /**
+   * Whether a compaction after a commit that lost its race to {@code beat} appends is sent again,
+   * conditioned on the log as it grew, with their records copied in front of its own (LogRuntime's
+   * compaction after a commit, a few times at most): if, at the rate they landed over the {@code
+   * windowNs} it was open to them (from the version it was conditioned on, through its encoding,
+   * or its read, and its send), less than one append is expected over the {@code exposureNs} a
+   * resend is (a read of the log after it, and its send). Appends arriving at that rate, the resend
+   * lands with probability above 1/e. Its checkpoint is encoded already, so a resend costs a read
+   * and a send where a compaction from scratch would encode again; at the knee of a log whose
+   * checkpoint takes longer to send than the gap between appends, it is not sent again.
+   */
+  default boolean resend(int beat, long windowNs, long exposureNs) {
+    return beat > 0 && windowNs > 0L && beat * (double) exposureNs / windowNs < 1.0;
+  }
+
+  /**
+   * This policy, with its random choices taken from {@code draws} (each in [0, 1)) for tests: the
+   * points past the limits writers compact at ({@link #draw}), and whether a compaction that lost
+   * is sent again ({@link #resend}: a draw below 1/2), not the rate of appends a writer saw.
+   */
   default CompactionPolicy withDraws(DoubleSupplier draws) {
     CompactionPolicy policy = this;
     return new CompactionPolicy() {
@@ -69,6 +88,11 @@ public interface CompactionPolicy {
       @Override
       public double draw() {
         return draws.getAsDouble();
+      }
+
+      @Override
+      public boolean resend(int beat, long windowNs, long exposureNs) {
+        return draws.getAsDouble() < 0.5;
       }
 
       @Override

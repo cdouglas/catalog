@@ -59,7 +59,8 @@ class TestLogRuntime {
 
   /**
    * The runtime compacting at {@code maxRecords}: after a commit at the points {@code draws} give
-   * (the last repeated), or fused with the commit.
+   * (the last repeated), sending a compaction that lost to appends again on a draw below 1/2; or
+   * fused with the commit.
    */
   private void compactingAt(int maxRecords, boolean after, double... draws) {
     int[] next = {0};
@@ -571,21 +572,91 @@ class TestLogRuntime {
 
   @Test
   void aCompactionThatLosesItsRaceIsDroppedAndTheCommitStands() { // [Compact, lost]
-    compactingAt(2, true, 0.0);
+    compactingAt(2, true, 0.0, 0.75); // its point 1.0; not sent again
     Replica<Map<String, Integer>> base = created();
     log.afterNextWrite(() -> otherWriterBumps("other")); // lands before the compaction
     log.calls.clear();
     Replica<Map<String, Integer>> r = bump(base, "a");
     assertThat(r.state()).containsEntry("a", 1);
-    assertThat(log.calls).containsSubsequence("append", "readThrough", "replace");
+    assertThat(log.calls).containsSubsequence("append", "readThrough", "replace", "readAfter");
+    assertThat(log.calls.stream().filter("replace"::equals).count()).isEqualTo(1);
     Replica<Map<String, Integer>> live = runtime.read();
     assertThat(live.state()).containsEntry("a", 1).containsEntry("other", 1);
     assertThat(live.intentionRecords()).isEqualTo(3); // not compacted
   }
 
   @Test
+  void aCompactionThatLosesToAnAppendIsSentAgainWithItsRecord() { // [Compact, CompactRead]
+    compactingAt(2, true, 0.0);
+    Replica<Map<String, Integer>> base = created();
+    log.afterNextWrite(() -> otherWriterBumps("other")); // lands before the compaction
+    log.calls.clear();
+    Replica<Map<String, Integer>> r = bump(base, "a");
+    assertThat(r.intentionRecords()).isEqualTo(2);
+    assertThat(log.calls).containsSubsequence(
+        "append", "readThrough", "replace", "readAfter", "replace");
+    // The checkpoint of the version the commit landed in, then the record that beat the
+    // compaction, as it was written
+    LogView view = log.read();
+    assertThat(view.records()).hasSize(1);
+    LogEnvelope.Record copied = LogEnvelope.decodeRecord(view.records().get(0));
+    assertThat(copied.isIntention()).isTrue();
+    Replica<Map<String, Integer>> live = runtime.read();
+    assertThat(live.state()).containsEntry("a", 1).containsEntry("other", 1);
+    assertThat(live.intentionRecords()).isEqualTo(1);
+    assertThat(live.committed().ids()).contains(copied.id()).containsAll(r.committed().ids());
+  }
+
+  @Test
+  void aCompactionThatLosesToAReplaceIsDropped() { // [CompactRead: replaced]
+    compactingAt(2, true, 0.0);
+    LogRuntime<Map<String, Integer>, ToyMachine.Versions, ToyMachine.Bump> fused =
+        new LogRuntime<>(log, ToyMachine.INSTANCE,
+            config(1, NO_GC).withCompactionAfterCommit(false));
+    Replica<Map<String, Integer>> base = created();
+    log.afterNextWrite(() -> { // another writer's commit replaces the log with its record
+      Replica<Map<String, Integer>> live = fused.read();
+      fused.commit(live, ToyMachine.Bump.of(live.state(), "other"));
+    });
+    log.calls.clear();
+    bump(base, "a");
+    assertThat(log.calls.get(log.calls.size() - 1)).isEqualTo("readAfter");
+    Replica<Map<String, Integer>> live = runtime.read();
+    assertThat(live.state()).containsEntry("a", 1).containsEntry("other", 1);
+    assertThat(live.intentionRecords()).isEqualTo(1); // the other's record, after its checkpoint
+  }
+
+  @Test
+  void aCompactionIsSentAgainAtMostFourTimes() { // [CompactResends]
+    compactingAt(2, true, 0.0);
+    Replica<Map<String, Integer>> base = created();
+    int[] others = {0};
+    // Once the commit landed, another append beats every write
+    log.afterNextWrite(() -> log.beforeEveryWrite(() -> otherWriterBumps("other" + others[0]++)));
+    log.calls.clear();
+    bump(base, "a");
+    assertThat(log.calls.stream().filter("replace"::equals).count())
+        .isEqualTo(1 + LogRuntime.MAX_COMPACTION_RESENDS);
+    Replica<Map<String, Integer>> live = runtime.read();
+    assertThat(live.intentionRecords()).isEqualTo(2 + others[0]);
+    assertThat(live.state()).containsKeys("a", "other0", "other" + (others[0] - 1));
+  }
+
+  @Test
+  void aCompactionIsSentAgainWhenLessThanOneAppendIsExpected() { // CompactionPolicy.resend
+    CompactionPolicy policy = CompactionPolicy.limits(100, 1 << 20);
+    // 3 appends in 600 ms, at 5 a second: 0.5 expected over a 100 ms resend, 1.25 over 250 ms
+    assertThat(policy.resend(3, 600_000_000L, 100_000_000L)).isTrue();
+    assertThat(policy.resend(3, 600_000_000L, 250_000_000L)).isFalse();
+    // At a knee: 50 appends over 3 s, against a 1 s send
+    assertThat(policy.resend(50, 3_000_000_000L, 1_000_000_000L)).isFalse();
+    assertThat(policy.resend(0, 600_000_000L, 1L)).isFalse();
+    assertThat(policy.resend(1, 0L, 1L)).isFalse();
+  }
+
+  @Test
   void aWriterCompactsAtThePointItDrawsAndAfterALossWaitsTwiceAsLong() { // [CompactDue]
-    compactingAt(4, true, 0.0, 0.75, 0.25);
+    compactingAt(4, true, 0.0, 0.75, 0.75, 0.25); // a point, no resend, the next, a point
     Replica<Map<String, Integer>> r = bump(bump(created(), "a"), "b"); // 3 records: not due
     assertThat(log.calls.stream().filter("replace"::equals).count()).isEqualTo(1); // the create
     log.afterNextWrite(() -> otherWriterBumps("other"));

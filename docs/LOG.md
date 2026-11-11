@@ -873,9 +873,16 @@ version with a checkpoint of `R`, a GC record at `watermark(∞)` and the
 PageOuts the policy calls for, sealing blocks with tops at or below `now - A`,
 their pages put first: `[chk][gc][page-outs]`, no record of its own, so neither
 is kept below one. Conditioned on `R`'s version, it lands only if no write
-landed since, and then holds the state the log held (I11); one that loses its
-race, fails or stays throttled is dropped (one that lands late lands on the
-same version), and the commit stands whatever becomes of it. After it lands,
+landed since, and then holds the state the log held (I11). One that loses its
+race to appends may be sent again: a tail read after `R`'s version finds the
+records that beat it, and if `CompactionPolicy.resend` says one is likely to
+land (fewer than one append expected over a read and a send, at the rate they
+beat it; at most 4 times), the same checkpoint goes again, conditioned on the
+version read, with those records copied in front of its GC record and PageOuts:
+`[chk][records][gc][page-outs]`, which replays them on the checkpoint as they
+were replayed on `R`. One that loses to a replace, fails or stays throttled is
+dropped (one that lands late lands on the version it was conditioned on), and
+the commit stands whatever becomes of it. After it lands,
 the pages its GC record dropped are deleted and the orphans swept. Each writer
 (each runtime) draws its point: in [1, 2) of the limits after the log was last
 compacted (a progress below the last one it saw says so), and after each

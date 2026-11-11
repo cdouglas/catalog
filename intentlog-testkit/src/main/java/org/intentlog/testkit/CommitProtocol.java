@@ -42,6 +42,7 @@ import net.jqwik.api.Tuple;
 import net.jqwik.api.statistics.Statistics;
 import org.intentlog.CommitOutcomeUnknownException;
 import org.intentlog.CommitRejectedException;
+import org.intentlog.CommitTrace;
 import org.intentlog.CommittedSet;
 import org.intentlog.CompactionPolicy;
 import org.intentlog.DedupHorizonExceededException;
@@ -553,6 +554,10 @@ public final class CommitProtocol {
     private final Settings settings;
     private final LogRuntime<State, Builder, Txn> runtime;
     private final LogRuntime<State, Builder, Txn> compactor;
+    // The runtime of a commit that preempts another, as another process: its compaction after the
+    // commit is drawn apart from the writers' (whose drawn point the preempted one has passed), so
+    // the preempted commit's compaction may lose to its append alone and be sent again
+    private final LogRuntime<State, Builder, Txn> racer;
     private final Writer[] writers;
     private final Deque<Context> commits = new ArrayDeque<>();
     private final Map<String, Txn> txns = new HashMap<>();
@@ -579,6 +584,8 @@ public final class CommitProtocol {
           settings.config(settings.retentionMs, () -> writerClock));
       this.compactor = new LogRuntime<>(harness.log(), EntityVersionsMachine.INSTANCE,
           settings.config(settings.retentionMs, () -> now + settings.compactorAheadMs));
+      this.racer = new LogRuntime<>(harness.log(), EntityVersionsMachine.INSTANCE,
+          settings.config(settings.retentionMs, () -> writerClock));
       this.writers = new Writer[settings.writers];
       for (int i = 0; i < writers.length; i++) {
         writers[i] = new Writer(i);
@@ -809,8 +816,10 @@ public final class CommitProtocol {
       // only its GC record, as a + b is odd or even. In a run that pages, d of 0-3 preempts the
       // first request after the commit's first write, its read back, with a whole compaction, or on
       // a log that compacts as it commits the next writer's commit: so a commit's id may be paged
-      // after it applied and before it learns so, and its lookup reads the page.
-      boolean afterWrite = settings.paging && cmd.d < 4;
+      // after it applied and before it learns so, and its lookup reads the page. So too in a run
+      // whose writers compact after their commits: on one object, that request is the compaction's
+      // replace, which the next writer's append makes lose (and be sent again with its record).
+      boolean afterWrite = (settings.paging || settings.compactAfter) && cmd.d < 4;
       int preemptAt = afterWrite ? -1 : cmd.d < 8 ? -1 : (cmd.d - 8) % 4;
       boolean compacts = harness.log().capabilities().separateCheckpoints();
       Writer other = null;
@@ -827,7 +836,7 @@ public final class CommitProtocol {
       }
       // A commit whose read back a compaction preempts is stamped in the oldest block, not at the
       // clock: in the newest block it would never be paged
-      Region region = afterWrite && Region.of(cmd.e) == Region.NOW
+      Region region = afterWrite && settings.paging && Region.of(cmd.e) == Region.NOW
           ? Region.OLDEST : Region.of(cmd.e);
       int pick = cmd.e >> 8;
       if (settings.faults) {
@@ -856,13 +865,17 @@ public final class CommitProtocol {
       writerClock = stamp;
       sealingClock = Math.max(sealingClock, stamp);
       trace.append(String.format("w%d commit %s, stamp %s %d%n", w.id, txn.tag(), region, stamp));
+      boolean top = commits.isEmpty();
+      if (top) {
+        CommitTrace.open(); // the runtime's events, for the compactions' statistics
+      }
       commits.push(ctx);
       Outcome outcome;
       String reason = "";
       boolean beyondFloor = false;
       try {
         ctx.active = true;
-        checkHeld(runtime.commit(w.snapshot, txn), "a commit");
+        checkHeld((top ? runtime : racer).commit(w.snapshot, txn), "a commit");
         outcome = Outcome.COMMITTED;
       } catch (CommitRejectedException e) {
         outcome = Outcome.REJECTED;
@@ -893,11 +906,28 @@ public final class CommitProtocol {
       Replica<State> live = runtime.read();
       List<String> applied = live.state().history();
       long times = applied.stream().filter(txn.tag()::equals).count();
-      if (settings.compactAfter && outcome == Outcome.COMMITTED
-          && harness.log().capabilities().fusedReplace()) {
-        // a log with no records after its checkpoint: a compaction after the commit landed
-        Statistics.label("compaction after a commit")
-            .collect(live.intentionRecords() == 0 ? "landed" : "none, or lost its race");
+      if (top) {
+        // The compactions after this commit, and after the racers' run inside it: each sent,
+        // sent again with the records that beat it, and landed
+        boolean compaction = false;
+        int resend = 0;
+        for (CommitTrace.Event e : CommitTrace.drain()) {
+          if (e.kind() == CommitTrace.Kind.SEND) {
+            compaction = e.a() == 2;
+            resend = (int) e.b();
+            if (compaction) {
+              Statistics.label("compaction after a commit")
+                  .collect(resend == 0 ? "sent" : "sent again");
+            }
+          } else if (e.kind() == CommitTrace.Kind.LANDED && compaction) {
+            Statistics.label("compaction after a commit")
+                .collect(resend == 0 ? "landed" : "landed when sent again");
+          } else if (e.kind() == CommitTrace.Kind.LOST && compaction) {
+            Statistics.label("compaction after a commit")
+                .collect(resend == 0 ? "lost" : "lost when sent again");
+          }
+        }
+        CommitTrace.close();
       }
       switch (outcome) {
         case COMMITTED:

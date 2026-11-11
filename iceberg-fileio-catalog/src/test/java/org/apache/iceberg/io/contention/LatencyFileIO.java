@@ -394,6 +394,10 @@ public final class LatencyFileIO implements SupportsAtomicOperations, SupportsPr
       } catch (SupportsAtomicOperations.StorageThrottleException e) {
         await(landed - half);
         throw e;
+      } catch (SupportsAtomicOperations.SegmentLimitException e) {
+        // the store refused an append to a full object (its cap): the round trip of a refusal
+        await(Math.max(0, profile.appendFailureMs(r) - half));
+        throw e;
       } catch (SupportsAtomicOperations.AppendException | SupportsAtomicOperations.CASException e) {
         double lost = append ? profile.appendFailureMs(r) : landed;
         if (append) {

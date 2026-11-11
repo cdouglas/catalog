@@ -69,6 +69,8 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
 
   /** How many times a lookup reads the log again when a page it names is gone. */
   private static final int MAX_PAGE_REREADS = 2;
+  /** How many times a compaction after a commit that lost to appends is sent again, at most. */
+  static final int MAX_COMPACTION_RESENDS = 4;
 
   /** The pages a runtime keeps (their verified entries): they never change. */
   private static final int PAGE_CACHE = 4;
@@ -719,10 +721,15 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
    * point this writer drew ({@link #drawn}), replaces the version the commit landed in with a
    * checkpoint of it, a GC record at the clock less the retention and the PageOuts the policy calls
    * for, and no record. Conditioned on that version, the replace lands only if no write landed
-   * since, and then holds the state the log held (I11); one that loses its race, fails or stays
-   * throttled is dropped, with what it wrote if it landed after all, since a replace that lands
-   * late lands on the same version. Whatever becomes of it, the commit stands. After it lands, it
-   * deletes the pages its GC record dropped and sweeps. Docs: LOG.md "Compaction".
+   * since, and then holds the state the log held (I11). One that loses its race to appends may be
+   * sent again ({@link CompactionPolicy#resend}, at most {@link #MAX_COMPACTION_RESENDS} times):
+   * conditioned on the log as a tail read finds it, with the records that beat it copied in front
+   * of its GC record and PageOuts, so that they replay on its checkpoint as they did on the version
+   * it checkpointed (a PageOut whose block they changed is refused, and its page swept later). One
+   * that loses to a replace, fails or stays throttled is dropped, with what it wrote if it landed
+   * after all, since a replace that lands late lands on the version it was conditioned on.
+   * Whatever becomes of it, the commit stands. After it lands, it deletes the pages its GC record
+   * dropped and sweeps. Docs: LOG.md "Compaction".
    */
   private void compactAfter(Replica<S> landed) {
     CompactionPolicy policy = config.compaction();
@@ -740,21 +747,48 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     CommitTrace.event(CommitTrace.Kind.COMPACT, landed.intentionRecords(), input.logBytes());
     boolean lands = false;
     try {
+      long since = System.nanoTime();
       Prepared replace = prepare(landed, null, Long.MAX_VALUE);
       CommitTrace.event(CommitTrace.Kind.PREPARED, replace.checkpoint.length, 0);
-      CommitTrace.event(CommitTrace.Kind.SEND, 2, 0);
-      sendThrottled(() -> log.replace(landed.tail(), replace.checkpoint, replace.records));
-      CommitTrace.event(CommitTrace.Kind.LANDED);
-      lands = true;
-      // The set the replace landed in: the GC record and PageOuts it wrote, after the checkpoint
-      Replay.Result<B> after = Replay.replayOnto(machine, machine.toBuilder(landed.state()),
-          landed.committed().toBuilder(), landed.logId(), 0, replace.records, null);
-      tidyPages(replace.dropped, replace.sealed, after.committed().build());
-      @SuppressWarnings("unchecked")
-      S checkpointed = (S) replace.state;
-      deleteDroppedStatePages(checkpointed);
-    } catch (LogConflictException e) {
-      CommitTrace.event(CommitTrace.Kind.LOST, 0, 0);
+      // The version the replace is conditioned on, and the records after `landed` it copies
+      Replica<S> on = landed;
+      List<byte[]> copied = new ArrayList<>();
+      for (int resends = 0; ; resends++) {
+        Replica<S> target = on;
+        List<byte[]> records = copied.isEmpty() ? replace.records : concat(copied, replace.records);
+        CommitTrace.event(CommitTrace.Kind.SEND, 2, resends);
+        long sent = System.nanoTime();
+        try {
+          sendThrottled(() -> log.replace(target.tail(), replace.checkpoint, records));
+        } catch (LogConflictException e) {
+          CommitTrace.event(CommitTrace.Kind.LOST, 0, 0);
+          if (resends >= MAX_COMPACTION_RESENDS) {
+            return;
+          }
+          long lost = System.nanoTime();
+          Grown<S> grown = grown(target);
+          if (grown == null || !policy.resend(grown.records.size(), lost - since,
+              (lost - sent) + (System.nanoTime() - lost))) {
+            return;
+          }
+          // Only appends beat it: the records after the version it lost on, as they were written
+          copied.addAll(grown.records);
+          on = grown.replica;
+          since = lost;
+          continue;
+        }
+        CommitTrace.event(CommitTrace.Kind.LANDED);
+        lands = true;
+        // The set the replace landed in: the GC record and PageOuts it wrote, after the records
+        // it copied
+        Replay.Result<B> after = Replay.replayOnto(machine, machine.toBuilder(target.state()),
+            target.committed().toBuilder(), target.logId(), 0, replace.records, null);
+        tidyPages(replace.dropped, replace.sealed, after.committed().build());
+        @SuppressWarnings("unchecked")
+        S checkpointed = (S) replace.state;
+        deleteDroppedStatePages(checkpointed);
+        return;
+      }
     } catch (CommitOutcomeUnknownException e) {
       // interrupted in a backoff: the commit stands, and the interrupt is kept
       CommitTrace.event(CommitTrace.Kind.AMBIGUOUS);
@@ -764,6 +798,55 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     } finally {
       tried(progress, lands, policy);
     }
+  }
+
+  /** A tail read after a compaction lost to appends: the records, folded onto its version. */
+  private static final class Grown<T> {
+    final Replica<T> replica;
+    final List<byte[]> records;
+
+    Grown(Replica<T> replica, List<byte[]> records) {
+      this.replica = replica;
+      this.records = records;
+    }
+  }
+
+  /**
+   * The log after a compaction conditioned on {@code lost} lost its race, if appends alone beat
+   * it: the records a tail read finds after lost's tail (or a whole read, past lost's view, if it
+   * continues that view byte for byte), folded onto it. Null if the log was replaced since
+   * (another writer compacted, or a commit replaced it), or trimmed.
+   */
+  private Grown<S> grown(Replica<S> lost) {
+    CommitTrace.event(CommitTrace.Kind.READ, 1, 0);
+    LogView view;
+    try {
+      view = viewed(log.readAfter(lost.tail()));
+    } catch (TrimmedException e) {
+      return null;
+    }
+    List<byte[]> records;
+    Replica<S> replica;
+    if (view.checkpoint().isPresent()) {
+      int from = continued(lost.view(), view, null);
+      if (from < 0) {
+        return null;
+      }
+      records = view.records().subList(from, view.records().size());
+      replica = replay(view, null, lost.logId(), lost).replica();
+    } else {
+      records = view.records();
+      replica = foldAfter(view, lost, null, lost.logId()).replica();
+    }
+    CommitTrace.event(CommitTrace.Kind.BUILT);
+    return records.isEmpty() ? null : new Grown<>(replica, List.copyOf(records));
+  }
+
+  private static <T> List<T> concat(List<T> first, List<T> second) {
+    List<T> both = new ArrayList<>(first.size() + second.size());
+    both.addAll(first);
+    both.addAll(second);
+    return both;
   }
 
   /**
@@ -795,11 +878,12 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
   /**
    * After this runtime's writer tried a compaction at {@code progress}: its next point is the
    * progress then plus a draw in [0, 1), doubled for each compaction in a row that did not land
-   * (up to 2^10). A compaction lands only if no append lands while it is encoded and sent; one that
-   * loses says the log is busier than that, and its writer waits for the log to grow by twice as
-   * much before it tries again, so that writers past the limits of a log they keep busy try ever
-   * more seldom (and a store's cap on writes to one object makes the commit that meets it replace
-   * the log with its record).
+   * (up to 2^10). A compaction lands only if no append lands while it is encoded and sent, or
+   * while it is read and sent again ({@link CompactionPolicy#resend}); one that did not land says
+   * the log is busier than that, and its writer waits for the log to grow by twice as much before
+   * it tries again, so that writers past the limits of a log they keep busy try ever more seldom
+   * (and a store's cap on writes to one object makes the commit that meets it replace the log with
+   * its record).
    */
   private synchronized void tried(double progress, boolean landed, CompactionPolicy policy) {
     compactionsLost = landed ? 0 : compactionsLost + 1;

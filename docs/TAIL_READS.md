@@ -754,8 +754,44 @@ commit replaces the object with its record, one wins, and the rest append
 to its short log: the herd once a cap, not once a hundred records. A small
 checkpoint is the structural fix: paged checkpoints
 ([CHECKPOINT_PLAN.md](CHECKPOINT_PLAN.md)) would make a compaction short
-enough to land between appends. catalog-bench models no cap on writes to one
-object, so its runs show the growth and not the cap.
+enough to land between appends. Until catalog-bench f5b9237 the bench
+modelled no cap on writes to one object, so its runs showed the growth and not
+the cap; it now refuses an append past the store's (`StoreProfile.maxAppends`).
+
+**Resending a compaction that lost to appends.** The first measurement
+(campaign `tr6k`, E1 at 300 tables on `s3x-2026-11`, one run an arm) found
+compactions after the commit seldom landing at about 5 commits a second, far
+below the knee. In inline ML, 9 of 126 landed at a count of 100 (7%), and none
+of 33 at 1,000. A compaction's window was mostly its encode (a median of
+500 ms of the 600 ms a lost one took at a count of 100, 750 of 900 at 1,000),
+against an append every 200 ms. A writer whose compaction lost dropped it, and
+its next point was twice as far, so a log that fell behind stayed behind: the
+1,000 arm ran its whole measurement 31,000-32,300 records past its checkpoint.
+That was its pack's: setup clients compacted by size alone, so aged packs ended
+far past their checkpoints, and the fused arms replaced them at their first
+commit. A fused commit's replace gets through because the commit retries it
+until it lands. So now a compaction that lost to appends is sent again:
+
+- Its writer reads the log after the version it lost on (a tail read). If the
+  object is that version, grown, it sends the checkpoint it already encoded,
+  conditioned on the version it read, with the records that beat it copied in
+  front of its GC record and PageOuts: `[checkpoint][records that beat
+  it][gc][page-outs]`. They replay on its checkpoint as they did on the version
+  it checkpointed, and its GC and PageOuts follow them; a PageOut whose block
+  they changed is refused, and its page swept later. A resend costs a tail read
+  and a PUT, not an encode.
+- It is sent again if, at the rate the appends that beat it landed over its
+  window, less than one is expected while it is read and sent again, so that it
+  lands with probability above 1/e (`CompactionPolicy.resend`); at most 4 times
+  (`LogRuntime.MAX_COMPACTION_RESENDS`). At 300 tables (a PUT of about 90 ms,
+  3 appends in a 600 ms window) that says yes; at the 1,000-table knee (a PUT
+  of 0.5-1.8 s, an append every 65 ms) it says no, and the limit above stands.
+- One that lost to a replace (another writer's compaction, or a commit that
+  replaced the object) is dropped, as before.
+
+And the bench's setup clients now compact every 1,000 records (fused, whatever
+the arm), so a pack ends fewer than 1,000 records past its checkpoint, as a
+catalog compacting at the default count would.
 
 **The model.** `CatalogCommit.tla` (written first): `CompactAfter`; past the
 limits `MustCAS` holds only when the policy is due on an empty log
@@ -771,7 +807,24 @@ for the fuzzers' oracles, and no racer runs before it in the race schedules
 on the version its record landed in: `HonestCommitted`), `compactresend`
 (one that lost resent on the object as it is, as if the records that beat it
 were in its checkpoint: `HistGrows`) and `compactfail` (a loss fails the
-commit: `HonestFailed`). Writing the Java found one rule the model then took:
+commit: `HonestFailed`). The resend is `CompactRead` (`CompactResends`
+times, 1 in every `after-*` configuration and 2 in the `after-resend*`
+ones): after a loss a tail read, and if the object grew, `compact` again,
+conditioned on the version read, with the records after the lost version
+(`cp`) in front of its payload's. `CheckpointIsReplay` now says that a CAS's
+checkpoint is the replay of a prefix of the version it replaces and its log
+begins with the rest (the prefix whole, for every CAS but a resend). Its
+switches: `compactcopyafter` (the records after the GC and PageOuts:
+`CheckpointIsReplay`) and `compactreplaced` (a replace as long as the lost
+version taken for growth: `HonestCommitted`). Its matrix found the
+multi-writer oracle comparing a compaction's state too coarsely: a
+`compactbase` resend dropped a record, which let one rejected before apply in
+its place, to the same entity versions. The model's oracle now compares the
+replayed state whole, and TestMultiWriterProperties each table's whole
+metadata (it compared locations and a few properties, blind to an inline
+table's snapshots). On one object the digest check of a PageOut now matters:
+a resend's PageOuts were computed before the records it copies
+(`after-nodigest` breaks `PagesExact`). Writing the Java found one rule the model then took:
 CAS only, every commit replaced and then compacted again (`DueEmpty`). The
 existing configurations keep the fused compaction (their states as before);
 the `after-*` family runs the same kinds of schedule with compaction after
@@ -787,9 +840,13 @@ replaces itself; `prepare(on, record, ownMs)` builds a commit's replace and a
 compaction's (no record, nothing kept below); `drawn`/`tried` keep a
 runtime's point; `CompactionPolicy.progress`, `draw` and `withDraws`;
 `RuntimeConfig.compactAfterCommit`; `LogCatalogProperties.COMPACT_AFTER_COMMIT`;
-`CommitTrace.Kind.COMPACT`. Tests: `TestLogRuntime` (a commit past the limits
-appends and its writer compacts; a compaction that loses is dropped; the drawn
-points and the backoff; fused; CAS only; a traced compaction),
+`CommitTrace.Kind.COMPACT`. The resend: `compactAfter`'s loop, `grown` (the
+tail read, or a whole read that continues the lost version byte for byte),
+`CompactionPolicy.resend` (`withDraws` draws it too, for tests). Tests:
+`TestLogRuntime` (a commit past the limits appends and its writer compacts; a
+compaction that loses is dropped, or sent again with the record that beat it;
+one that loses to a replace is dropped; at most 4 resends; the rule; the
+drawn points and the backoff; fused; CAS only; a traced compaction),
 `TestProtoCommitKnobs`.
 
 **The fuzzers** draw it: the protocol fuzzer from its seed (and its points
@@ -803,7 +860,16 @@ and `LocalCatalogMode`'s catalogs compact at the limits themselves, so suites
 repeat. The mutant set `fuzz/mutants/compaction.sh` holds the model's
 switches (`compactresend` as a compaction conditioned on a probe of the
 object); the one-object protocol fuzzer catches each in 5,000 tries, and the
-multi-writer fuzzer in 300. Two tests changed meaning: `CheckpointRoundTrip`
+multi-writer fuzzer in 300. The resend added three: `compactnocopy` (sent again
+without the records that beat it), `compactcopyafter` and `compactreplaced`
+(the model's). The protocol fuzzer reaches resends only where a commit's
+compaction loses to an append: its preempting commits now run on a runtime of
+their own (another process, with its own drawn point; on the writers' shared
+runtime a preempting commit compacted too, so compactions lost to
+compactions), and runs that compact after the commit also preempt the first
+request after a commit's first write (its compaction's replace, on one
+object). Its statistics count compactions sent, sent again, lost and landed,
+from the runtime's trace. Two tests changed meaning: `CheckpointRoundTrip`
 asked of every catalog file that the first record after its checkpoint apply
 where it holds (Bug 64: a replace's own record), which after a compaction is
 some later append, which a compaction's GC record at a retention of 0 may

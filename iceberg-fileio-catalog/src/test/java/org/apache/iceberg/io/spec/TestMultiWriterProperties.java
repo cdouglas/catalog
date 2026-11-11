@@ -590,6 +590,23 @@ class TestMultiWriterProperties {
       return view;
     }
 
+    /**
+     * Everything {@code state} holds, as text: namespaces and their properties, and each table's
+     * metadata location, or an inline table's whole metadata (which snapshots, which commits).
+     */
+    static Map<String, String> contents(CatalogState state) {
+      Map<String, String> contents = new TreeMap<>();
+      for (Namespace ns : state.namespaces()) {
+        contents.put("namespace " + ns, new TreeMap<>(state.namespaceProperties(ns)).toString());
+      }
+      for (TableIdentifier t : state.tables()) {
+        org.apache.iceberg.TableMetadata inline = CatalogTestSupport.inlineMetadata(state, t);
+        contents.put("table " + t, inline != null
+            ? org.apache.iceberg.TableMetadataParser.toJson(inline) : state.location(t));
+      }
+      return contents;
+    }
+
     View copy() {
       View view = new View();
       namespaces.forEach((ns, props) -> view.namespaces.put(ns, new TreeMap<>(props)));
@@ -1124,7 +1141,9 @@ class TestMultiWriterProperties {
         if (!wr.gc()) {
           writes.add(wr);
         } else if (wr.replace()) {
-          check(View.of(parse(wr.after)).equals(View.of(parse(wr.before))),
+          // The state whole: a resend that dropped a record could let one rejected before apply
+          // in its place, to the same view (CatalogCommit.tla's OracleMW)
+          check(View.contents(parse(wr.after)).equals(View.contents(parse(wr.before))),
               "a compaction after a commit changed the state");
           String difference = storage.difference(wr);
           check(difference == null, "a checkpoint of the compaction differs from it: %s",
