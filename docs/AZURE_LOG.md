@@ -12,9 +12,15 @@ and its implementation on the same branch:
   - the contract;
   - the commit-protocol fuzzer, calibrated by mutants;
   - both again on the spike's account.
+- **Step 4, in part** (2026-11-10): `fileio.catalog.log` and the log's properties
+  (`LogCatalogProperties`, `AzureLogs`; `FileIOCatalog` opens it on a real account with an
+  account key), and the `AZLOG` modes of `TestLocalCatalog` and `TestLocalCatalogTransaction`:
+  Iceberg's catalog suites on this log, every checkpoint checked against a replay of the log's
+  history (`AzureLogHistory`).
 - **Not done:**
-  - step 4, the catalog opening this log (`fileio.catalog.log`) and its `AZLOG` modes;
-  - the measurements.
+  - step 4's fuzzers: `TestCatalogFaultProperties` and `TestCatalogRaceProperties` drawing
+    this log;
+  - the measurements (catalog-bench docs/DESIGN.md, "The paper's configurations").
 
 `AppendBlobLog` is a `SharedLog` ([LOG.md](LOG.md)) kept in Azure Blob Storage, and its
 checkpoints are stored apart from its records. Writers append their records to an Append
@@ -289,7 +295,7 @@ compares positions only for equality, and two tails at one place in the log must
 | `capabilities()` | `append` true; `conditionalAppend` false (true in the conditional ablation, below); `fusedReplace` false; `separateCheckpoints` true; `maxRecordBytes` the smaller of the service version's Append Block limit (4 MiB before 2022-11-02, 100 MiB since) and the writer limit of an empty segment, less the frame's overhead |
 | `read()` | GET the head; GET its checkpoint; GET each live segment from the checkpoint's position on (a ranged GET of the first, from its offset). Each closed segment must read exactly to its `closed_length`, and the last segment to the length its GET returned. Any 404 means a trim raced the read: read again from a fresh head, up to `maxThrottleAttempts` times, after which the log could not be read |
 | `readAfter(since)` | A ranged GET of `since`'s segment from its offset. If the GET shows the segment open (its last frame isn't a pad and it has fewer than 50,000 blocks, from `x-ms-blob-committed-block-count`), the view is those frames: one request. If it is closed, GET the head and continue with the segments after it. If the head no longer names it, it was trimmed: `TrimmedException`, and the runtime reads whole |
-| `readThrough(r, wait)` | The newest view this log has returned or built that ends at or before `r`, extended by a ranged GET from its tail through `r`'s frame (and across segments as in `readAfter`). Without such a view, a whole `read()`. The view must hold `r`'s frame at `r`'s offset (P3). A GET that ends before it is read again within `wait`, then `LogLagException`. Azure's reads are strongly consistent, so that is not expected (an open question below) |
+| `readThrough(r, wait)` | If the reply put `r` at the tail of the newest view this log holds, that view and `r`'s record, with no request ([Reading through a write](#reading-through-a-write)). Else the newest view this log has returned or built that ends at or before `r`, extended by a ranged GET from its tail through `r`'s frame (and across segments as in `readAfter`). Without such a view, a whole `read()`. The view must hold `r`'s frame at `r`'s offset (P3). A GET that ends before it is read again within `wait`, then `LogLagException`. Azure's reads are strongly consistent, so that is not expected (an open question below) |
 | `probe()` | GET the head and Get Blob Properties of its last segment: the tail without its records. Used only in the conditional ablation |
 | `append(record, null)` | Append Block to the head's last segment, with no position condition and with `x-ms-blob-condition-maxsize` at the segment's writer limit. If the segment is full or closed (P6: nothing landed), read the head: if it names a later segment, send there; if not, move the log on ([Rotation](#rotation)) and send to the new last segment. After `maxRotations` (4) moves, `LogFullException`. A 404 (a stale head: the segment was trimmed) re-reads the head and sends again. The receipt is the segment, the reply's `x-ms-blob-append-offset`, and the frame's length |
 | `append(record, tail)` | The conditional ablation only: Append Block with `x-ms-blob-condition-appendpos` set to `tail`'s length, and the writer limit, to `tail`'s segment. A segment other than the head's last fails as a conflict |
@@ -297,14 +303,32 @@ compares positions only for equality, and two tails at one place in the log must
 | `trim(through)` | CAS the head to drop the segments before `through`'s ordinal. P5: only if the head's checkpoint, or the one just put, is at or after `through`. The blobs are deleted later, by the sweep |
 | `pages()` | [Pages](#pages) |
 
-The provider keeps the newest view it has returned, so a commit's read back usually costs
-one ranged GET. `AtomicFileLog` does the same for appends from a view it holds (LOG.md
-"Providers"). With tail reads on (`fileio.catalog.read.tail`), a catalog's refresh is also
-one ranged GET of the last segment while it doesn't change.
+### Reading through a write
 
-A commit's cost, then, is one Append Block and one ranged GET (about 10 ms each on the
-spike's account), plus a move to a new segment now and then. It never pays for a lost
-race.
+A writer learns whether its commit applied by replaying the records that landed between the
+state it read and its own record. On any log that is the read through its write; what differs
+is when it costs a request:
+
+- **Nothing landed between.** The reply's offset puts the record at the tail of the view the
+  log holds, so the view through it is that view and the record, with no request. This is the
+  case of a conditional append that won its race, which `AtomicFileLog` reads nothing for
+  either (errata D20).
+- **Something landed between.** One ranged GET from the view's tail through the record. A
+  conditional append in the same case lost its race: it reads the tail, sends its record
+  again, and may lose again.
+
+So blind appends add no reads: they remove the lost appends and the resends. The receipt
+carries its record for the first case (`AzReceipt.record`), and `TestAppendBlobLog` checks
+both (`aReadThroughAWriteReadsOnlyWhatLandedBetween`). With tail reads on
+(`fileio.catalog.read.tail`), a catalog's refresh is also one ranged GET of the last segment
+while it doesn't change.
+
+A commit's cost, then, is one Append Block (about 10 ms on the spike's account), one ranged
+GET when other records landed while it was in flight, and a move to a new segment now and
+then. It never pays for a lost race.
+
+Rejected records are no different from the one-object log's: a record whose writer's read
+was stale lands, replay rejects it, and it stays in the log until a compaction drops it.
 
 **Every read goes to the primary endpoint.** Reads there are strongly consistent, and
 AZ2 and `readThrough` depend on that. On an account that can read its geo-secondary
@@ -413,12 +437,32 @@ The provider adds three things:
   - checkpoints and segments of other log ids.
 
 A committer compacts, best effort, when the policy says the log is due, as on any log with
-checkpoints apart. At thousands of commits a second, compacting every 100 records (the
+checkpoints apart. At thousands of commits a second, compacting every 1,000 records (the
 default `max.append.count`, which was measured for the one-object log on S3 Express) would
 put several checkpoints a second. This log therefore has its own threshold
-(`fileio.catalog.log.checkpoint.records`, below). A dedicated compactor (`CatalogLog.compact()`
+(`fileio.catalog.log.checkpoint.records`, below), which takes `max.append.count`'s place in the
+policy (`LogCatalogProperties.runtimeConfig`). A dedicated compactor (`CatalogLog.compact()`
 on a timer) is optional. Correctness never depends on who compacts: a checkpoint at a
 position is the same whoever writes it (I11).
+
+**When to compact is still open.** Nothing about the store bounds the records after the
+checkpoint here: segments move on at their limit, and a checkpoint never races an append. What
+the threshold trades is a cold reader's cost (the checkpoint and every record after it) against
+the checkpoints' cost (each encodes the whole catalog). A count does that badly across modes:
+pointer records are about a KB and inline ML's tens of KB, and the checkpoint grows with the
+catalog. Two changes, to measure first (catalog-bench docs/DESIGN.md, the compaction rule's
+ablation):
+- **Compact when the records' bytes reach a share of the checkpoint's.** A cold read then
+  costs at most (1 + share) checkpoints, and a checkpoint's bytes per record byte are at most
+  1 / share; a floor and a ceiling of records keep it sane at the ends. The policy's input
+  already holds both sizes (`CompactionPolicy.Input`).
+- **Draw a point past the threshold,** as the one-object log's compaction after the commit
+  does, so that writers past it don't all compact at once. Today every writer whose commit
+  lands past the threshold compacts. In a scratch run in catalog-bench (pointer mode, 50
+  tables, 16 writers, 25 commits a second on `azure-2026-11`, a checkpoint every 200 records)
+  all 16 writers compacted at each of the four thresholds crossed with blind appends, and 3 or 4
+  with conditional ones, whose writers land one at a time. Each compaction encodes the whole
+  catalog, so on an inline catalog this matters before any measurement of this log.
 
 ## Failures
 
@@ -554,7 +598,7 @@ As every provider is tested (LOG.md "Testing a provider"), plus a model:
 5. **The cloud.** An integration test on a real account (`AzureAppendBlobLogIT`): the
    contract, and a run of the fuzzer's schedules with real requests.
 
-**Where it stands (2026-11-10): steps 1–3 and 5 are done.**
+**Where it stands (2026-11-10): steps 1–3 and 5 are done, and step 4 in part.**
 
 1. **The model** (`spec/tla/README.md` "The Azure log") holds in eight configurations, the
    largest at 335,000 states:
@@ -590,6 +634,14 @@ As every provider is tested (LOG.md "Testing a provider"), plus a model:
      compaction.
    - `offsetfromlength` is equivalent in Java: `readThrough` checks the receipt's CRC, and
      the runtime judges a commit by its id.
+
+4. **The catalog, in part.** `TestLocalCatalog` and `TestLocalCatalogTransaction` pass in
+   `AZLOG`, `AZLOG_TM` and `AZLOG_ML` (112 and 34 tests each, the same skips as every other
+   mode): each catalog an `AppendBlobLog` of its own over one in-memory store whose segments
+   hold 8 blocks, so the log moves on every few commits, and a compaction every 3 records.
+   After each test, every checkpoint ever put must be the replay of the records before it
+   (`CheckpointRoundTrip.assertEveryCheckpoint` over `AzureLogHistory`). The fault and race
+   fuzzers don't draw this log yet.
 
 5. **The cloud** (2026-11-11 UTC, from the laptop, on the spike's account: a hierarchical
    namespace, westus). Both pass:

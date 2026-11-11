@@ -45,6 +45,7 @@ import org.intentlog.CommittedSet;
 import org.intentlog.DedupHorizonExceededException;
 import org.intentlog.PagedOutException;
 import org.intentlog.Replica;
+import org.intentlog.azure.AzureLogHistory;
 import org.intentlog.fileio.AtomicFileLog;
 import org.intentlog.memory.InMemorySharedLog;
 import org.intentlog.wire.CommittedSetCodec;
@@ -233,38 +234,68 @@ public final class CheckpointRoundTrip {
     if (log.checkpoints().isEmpty()) {
       return;
     }
+    Map<Integer, byte[]> byCount = new java.util.TreeMap<>();
+    log.checkpoints().forEach((records, checkpoint) -> byCount.put(records.intValue(), checkpoint));
+    assertEveryCheckpoint(log.toString(), new ArrayList<>(log.violations()), log.records(),
+        byCount, log.storedPages());
+  }
+
+  /**
+   * As {@link #assertEveryCheckpoint(InMemorySharedLog)}, for a log on Append Blobs in memory
+   * whose store kept its history ({@link AzureLogHistory}): its checkpoints are by position, each
+   * covering the records that landed before it.
+   */
+  public static void assertEveryCheckpoint(AzureLogHistory log, String what) {
+    if (log.checkpoints().isEmpty()) {
+      return;
+    }
     List<String> violations = new ArrayList<>(log.violations());
-    byte[] first = log.checkpoints().get(0L);
-    List<byte[]> records = log.records();
+    if (!log.checkpoints().containsKey(0L)) {
+      throw new AssertionError("checkpoints of " + what + ": none at position 0");
+    }
+    Map<Integer, byte[]> byCount = new java.util.TreeMap<>();
+    log.checkpoints().forEach((position, checkpoint) ->
+        byCount.put(position == 0L ? 0 : log.recordsBefore(position), checkpoint));
+    List<byte[]> records = log.records().stream().map(AzureLogHistory.Landed::record).toList();
+    assertEveryCheckpoint(what, violations, records, byCount, log.pages());
+  }
+
+  /**
+   * The checks of both: the log as a whole, its committed set's pages, the newest checkpoint's
+   * snapshot pages, and each checkpoint (by the count of records it covers) against a replay of
+   * the first and the records before it.
+   */
+  private static void assertEveryCheckpoint(String what, List<String> violations,
+      List<byte[]> records, Map<Integer, byte[]> checkpoints, Map<String, byte[]> stored) {
+    byte[] first = checkpoints.get(0);
     String whole = difference(AtomicFileLog.encode(first, records));
     if (whole != null) {
       violations.add("the log: " + whole);
     }
-    Map<String, byte[]> stored = log.storedPages();
     String pages = pagesProblem(
         CatalogTestSupport.replay(AtomicFileLog.encode(first, records)), stored::get);
     if (pages != null) {
       violations.add("the log's committed set: " + pages);
     }
-    byte[] newest = new java.util.TreeMap<>(log.checkpoints()).lastEntry().getValue();
+    byte[] newest = new java.util.TreeMap<>(checkpoints).lastEntry().getValue();
     String snapshots = snapshotPagesProblem(
         CatalogTestSupport.decodeCheckpoint(AtomicFileLog.encode(newest, List.of())).build(),
         CatalogTestSupport.replay(AtomicFileLog.encode(first, records)).state(), stored::get);
     if (snapshots != null) {
       violations.add("the newest checkpoint's root: " + snapshots);
     }
-    for (Map.Entry<Long, byte[]> c : log.checkpoints().entrySet()) {
-      if (c.getKey() > 0L) {
+    for (Map.Entry<Integer, byte[]> c : checkpoints.entrySet()) {
+      if (c.getKey() > 0) {
         String difference = checkpointIsReplay(
-            AtomicFileLog.encode(first, records.subList(0, c.getKey().intValue())),
+            AtomicFileLog.encode(first, records.subList(0, c.getKey())),
             AtomicFileLog.encode(c.getValue(), List.of()));
         if (difference != null) {
-          violations.add("the checkpoint at position " + c.getKey() + ": " + difference);
+          violations.add("the checkpoint after record " + c.getKey() + ": " + difference);
         }
       }
     }
     if (!violations.isEmpty()) {
-      throw new AssertionError("checkpoints of " + log + ": " + violations);
+      throw new AssertionError("checkpoints of " + what + ": " + violations);
     }
   }
 

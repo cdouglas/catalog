@@ -1552,6 +1552,14 @@ public class TestCatalogRegressions {
                 return org.intentlog.memory.InMemorySharedLog.ReadShape.NORMAL;
               }
             });
+      } else if (mode.azureLog) {
+        LocalCatalogMode.azureStore(io, "mem:///w/catalog-c").intercept((op, name) -> {
+          if (op == org.intentlog.azure.InMemoryAppendBlobStore.Op.READ
+              && name.contains("/seg/")) {
+            race.run(); // a read of the log's records, whole or after a replica's tail
+          }
+          return org.intentlog.azure.InMemoryAppendBlobStore.Fault.NONE;
+        });
       } else {
         io.injectReadFaults(
             location -> {
@@ -1566,6 +1574,9 @@ public class TestCatalogRegressions {
       io.injectReadFaults(location -> ReadFault.NONE);
       if (mode.sharedLog) {
         LocalCatalogMode.sharedLog(io, "mem:///w/catalog-c").intercept(null);
+      }
+      if (mode.azureLog) {
+        LocalCatalogMode.azureStore(io, "mem:///w/catalog-c").intercept(null);
       }
 
       assertThat(first.loadTable(written).currentSnapshot()).isNull();

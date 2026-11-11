@@ -45,6 +45,14 @@
       <artifactId>intentlog-fileio</artifactId>
       <version>${project.version}</version>
     </dependency>
+    <!-- The log on Azure Append Blobs (fileio.catalog.log azure-append, AzureLogs), optional: a
+         catalog that keeps another log needs none of it, and a deployment that uses it adds it. -->
+    <dependency>
+      <groupId>org.intentlog</groupId>
+      <artifactId>intentlog-azure</artifactId>
+      <version>${project.version}</version>
+      <optional>true</optional>
+    </dependency>
     <dependency>
       <!-- The contention driver's shared parts (StoreProfile, Requests, BenchConfig, Operations,
            Draws, TxnSupport), from catalog-bench (../../catalog-bench: mvn -pl bench-core

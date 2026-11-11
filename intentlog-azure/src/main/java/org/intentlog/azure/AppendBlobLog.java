@@ -258,7 +258,7 @@ public final class AppendBlobLog implements SharedLog {
         long offset = store.appendBlock(seg.name(), frame, seg.writerLimit(),
             at == null ? -1 : at.position - seg.base());
         return new AzReceipt(h.head().logId(), seg.ordinal(), seg.name(), seg.base(), offset,
-            frame.length, Frames.crcOf(frame));
+            frame.length, Frames.crcOf(frame), record);
       } catch (AppendBlobStore.Full e) {
         // nothing landed (P6): the segment is full, or closed
         Head fresh = existing();
@@ -681,6 +681,16 @@ public final class AppendBlobLog implements SharedLog {
     View kept = newest;
     if (kept != null && kept.checkpoint != null && kept.tail.logId.equals(r.logId)
         && kept.through == h.head().checkpoint().through()) {
+      if (!fresh && r.record != null && kept.tail.position == r.position()) {
+        // The reply put the record at the tail of the view this log kept: nothing landed between,
+        // so the view through it is that view and the record, with no read (as a conditional
+        // append that won its race; AZURE_LOG.md "Reading through a write")
+        View own = new View(
+            new Tail(root, r.logId, true, r.position() + r.length, kept.tail.bytes + r.length,
+                r.ordinal),
+            null, -1, List.of(r.record), new long[] {r.position()}, kept.tail.position);
+        return kept.extend(own);
+      }
       LogView more = readAfter(kept.tail);
       if (more instanceof View m && m.checkpoint == null) {
         return kept.extend(m);
@@ -867,11 +877,20 @@ public final class AppendBlobLog implements SharedLog {
     }
   }
 
-  /** An append's receipt: its segment, the offset the reply named, and its frame. */
+  /**
+   * An append's receipt: its segment, the offset the reply named, its frame's length and check,
+   * and its record (for a read through it that finds nothing landed between).
+   */
   record AzReceipt(UUID logId, long ordinal, String segment, long base, long offset, int length,
-      int crc) implements Receipt {
+      int crc, byte[] record) implements Receipt {
     long position() {
       return base + offset;
+    }
+
+    @Override
+    public String toString() {
+      return "AzReceipt[logId=" + logId + ", ordinal=" + ordinal + ", segment=" + segment
+          + ", base=" + base + ", offset=" + offset + ", length=" + length + ", crc=" + crc + "]";
     }
   }
 

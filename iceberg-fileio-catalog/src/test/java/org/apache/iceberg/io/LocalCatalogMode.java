@@ -28,6 +28,9 @@ import java.util.function.LongSupplier;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.io.AtomicOutputFile.Strategy;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.intentlog.azure.AppendBlobLog;
+import org.intentlog.azure.AzureLogHistory;
+import org.intentlog.azure.InMemoryAppendBlobStore;
 import org.intentlog.memory.InMemorySharedLog;
 
 /**
@@ -45,6 +48,11 @@ import org.intentlog.memory.InMemorySharedLog;
  *   <li>{@code MEMLOG*}: a {@link LogCatalog} whose log is an {@link InMemorySharedLog} (the data
  *       stays in the store): every commit appends, and the writer whose commit takes the log to 3
  *       records past its checkpoint compacts it (a GC record, a checkpoint, a trim).
+ *   <li>{@code AZLOG*}: a {@link LogCatalog} whose log is an {@link AppendBlobLog} on an {@link
+ *       InMemoryAppendBlobStore} (docs/AZURE_LOG.md; the data stays in the store), each catalog
+ *       an instance of its own: every commit appends blind, the writer whose commit takes the log
+ *       to 3 records past its checkpoint compacts it, and a segment holds at most {@link
+ *       #AZURE_BLOCKS} blocks, so the log moves to a new segment every few commits.
  * </ul>
  *
  * <p>The suffix selects table metadata storage: none for metadata.json pointers, {@code _TM} for
@@ -62,19 +70,34 @@ enum LocalCatalogMode {
   COMPACT_ML(3, true, true, false),
   MEMLOG(3, false, false, true),
   MEMLOG_TM(3, true, false, true),
-  MEMLOG_ML(3, true, true, true);
+  MEMLOG_ML(3, true, true, true),
+  AZLOG(3, false, false, false, true),
+  AZLOG_TM(3, true, false, false, true),
+  AZLOG_ML(3, true, true, false, true);
 
   final int maxAppendCount;
   final boolean inlineTM;
   final boolean inlineML;
+  /** The catalog's log is an {@link InMemorySharedLog}. */
   final boolean sharedLog;
+  /** The catalog's log is an {@link AppendBlobLog} on Append Blobs in memory. */
+  final boolean azureLog;
 
   LocalCatalogMode(int maxAppendCount, boolean inlineTM, boolean inlineML, boolean sharedLog) {
+    this(maxAppendCount, inlineTM, inlineML, sharedLog, false);
+  }
+
+  LocalCatalogMode(int maxAppendCount, boolean inlineTM, boolean inlineML, boolean sharedLog,
+      boolean azureLog) {
     this.maxAppendCount = maxAppendCount;
     this.inlineTM = inlineTM;
     this.inlineML = inlineML;
     this.sharedLog = sharedLog;
+    this.azureLog = azureLog;
   }
+
+  /** The blocks a segment of the {@code AZLOG*} modes' store holds. */
+  static final int AZURE_BLOCKS = 8;
 
   /** The conflict encodings a catalog can be created with, which fuzzers draw from. */
   static final List<String> ENCODINGS =
@@ -84,7 +107,12 @@ enum LocalCatalogMode {
 
   /** The modes whose catalog is one object of the store. */
   static List<LocalCatalogMode> fileModes() {
-    return Arrays.stream(values()).filter(m -> !m.sharedLog).toList();
+    return Arrays.stream(values()).filter(m -> !m.sharedLog && !m.azureLog).toList();
+  }
+
+  /** The modes whose catalog is a log on Append Blobs. */
+  static List<LocalCatalogMode> azureLogModes() {
+    return Arrays.stream(values()).filter(m -> m.azureLog).toList();
   }
 
   /** The modes whose catalog is a shared log. */
@@ -101,6 +129,26 @@ enum LocalCatalogMode {
   /** The shared log of the catalog at {@code location} over {@code io}. */
   static InMemorySharedLog sharedLog(InMemoryAtomicFileIO io, String location) {
     return io.attachment(SHARED_LOG + location, key -> new InMemorySharedLog(location));
+  }
+
+  /** The key of the Append Blob store of the catalog at a location over a store, as above. */
+  private static final String AZURE_STORE = "azure store ";
+
+  /** A catalog's Append Blob store, with the location that is its log's root. */
+  record AzureStore(String location, InMemoryAppendBlobStore store) {}
+
+  /**
+   * The Append Blob store of the catalog at {@code location} over {@code io}, which keeps its
+   * history for the checks ({@link AzureLogHistory}); the log's root in it is the location.
+   */
+  static InMemoryAppendBlobStore azureStore(InMemoryAtomicFileIO io, String location) {
+    return io.<AzureStore>attachment(AZURE_STORE + location,
+        key -> new AzureStore(location, new InMemoryAppendBlobStore(AZURE_BLOCKS))).store();
+  }
+
+  /** The Append Blob stores of catalogs over {@code io}. */
+  static List<AzureStore> azureStores(InMemoryAtomicFileIO io) {
+    return io.attachments(AZURE_STORE, AzureStore.class);
   }
 
   /**
@@ -128,7 +176,8 @@ enum LocalCatalogMode {
 
   /** A mode to read the catalog at {@code location} over {@code io} with, whichever log it has. */
   static LocalCatalogMode readerFor(InMemoryAtomicFileIO io, String location) {
-    return io.hasAttachment(SHARED_LOG + location) ? MEMLOG : APPEND;
+    return io.hasAttachment(SHARED_LOG + location) ? MEMLOG
+        : io.hasAttachment(AZURE_STORE + location) ? AZLOG : APPEND;
   }
 
   /** The shared logs of catalogs over {@code io}. */
@@ -184,11 +233,19 @@ enum LocalCatalogMode {
       properties.put(LogCatalogProperties.SNAPSHOT_BLOCK, String.valueOf(SNAPSHOT_BLOCK));
       properties.put(LogCatalogProperties.SNAPSHOT_WINDOW, String.valueOf(SNAPSHOT_WINDOW));
     }
+    if (azureLog) {
+      properties.put(LogCatalogProperties.LOG, LogCatalogProperties.LOG_AZURE_APPEND);
+      properties.put(LogCatalogProperties.LOG_CHECKPOINT_RECORDS, String.valueOf(maxAppendCount));
+      properties.put(LogCatalogProperties.LOG_SEGMENT_MAX_BYTES, String.valueOf(1 << 20));
+    }
     properties.putAll(extra);
     String location = warehouse + "/catalog-" + name;
     LogCatalog catalog = sharedLog
         ? new LogCatalog(name, sharedLog(io, location), io, Maps.newHashMap())
-        : new FileIOCatalog(name, location, io, Maps.newHashMap());
+        : azureLog
+            ? new LogCatalog(name, AzureLogs.open(azureStore(io, location), location, properties),
+                io, Maps.newHashMap())
+            : new FileIOCatalog(name, location, io, Maps.newHashMap());
     if (clockMs != null) {
       catalog.clock(clockMs);
     }
@@ -212,6 +269,12 @@ enum LocalCatalogMode {
       // The catalog wrote no object; its shared logs' checkpoints must be replays of them.
       assertThat(io.conditionalWrites()).as("conditional writes to the store").isEmpty();
       sharedLogs(io).forEach(CheckpointRoundTrip::assertEveryCheckpoint);
+      return;
+    }
+    if (azureLog) {
+      assertThat(io.conditionalWrites()).as("conditional writes to the store").isEmpty();
+      azureStores(io).forEach(a -> CheckpointRoundTrip.assertEveryCheckpoint(
+          AzureLogHistory.of(a.store(), a.location()), "the Azure log at " + a.location()));
       return;
     }
     io.conditionalWrites()

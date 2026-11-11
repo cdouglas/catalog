@@ -18,6 +18,8 @@
  */
 package org.intentlog.azure;
 
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.time.Instant;
@@ -40,7 +42,9 @@ import java.util.function.LongSupplier;
  * append) time out still in flight and land later ({@link #deliverDelayed}), under the conditions
  * it was sent with; a read can fail, or be served short of the blob's last block, as a reader that
  * lagged would see it. The store keeps every append that landed and every version of every blob
- * put, deleted ones included, for oracles ({@link #appends}, {@link #versions}).
+ * put, deleted ones included, for oracles ({@link #appends}, {@link #versions}), unless told not
+ * to ({@link #recordHistory}, for a benchmark's long runs). Its contents can be saved and loaded
+ * again ({@link #writeTo}, {@link #readFrom}), as a benchmark's aged packs are.
  */
 public final class InMemoryAppendBlobStore implements AppendBlobStore {
 
@@ -88,7 +92,10 @@ public final class InMemoryAppendBlobStore implements AppendBlobStore {
 
   private static final class Stored {
     final boolean append;
+    // the blob is bytes[0, length): an Append Blob's buffer grows by doubling, so that appends
+    // to a segment of many blocks take linear time in all
     byte[] bytes = new byte[0];
+    int length = 0;
     final List<Long> blockEnds = new ArrayList<>();
     final Map<String, String> metadata;
     String etag;
@@ -100,7 +107,19 @@ public final class InMemoryAppendBlobStore implements AppendBlobStore {
     }
 
     long length() {
-      return bytes.length;
+      return length;
+    }
+
+    void append(byte[] block) {
+      if (length + block.length > bytes.length) {
+        bytes = Arrays.copyOf(bytes, Math.max(length + block.length, 2 * bytes.length));
+      }
+      System.arraycopy(block, 0, bytes, length, block.length);
+      length += block.length;
+    }
+
+    byte[] copy(int from, int to) {
+      return Arrays.copyOfRange(bytes, from, to);
     }
   }
 
@@ -113,6 +132,7 @@ public final class InMemoryAppendBlobStore implements AppendBlobStore {
   private final int maxBlocks;
   private final LongSupplier clockMs;
   private long etags = 0;
+  private boolean history = true;
   private Interceptor interceptor = (op, name) -> Fault.NONE;
 
   /** A store whose Append Blobs hold at most {@code maxBlocks} blocks, on the system clock. */
@@ -135,6 +155,20 @@ public final class InMemoryAppendBlobStore implements AppendBlobStore {
     return this;
   }
 
+  /**
+   * Whether the store keeps every append and every version put ({@link #appends}, {@link
+   * #versions}; true at first): a benchmark's long runs turn it off, and the oracles then see
+   * nothing.
+   */
+  public synchronized InMemoryAppendBlobStore recordHistory(boolean record) {
+    this.history = record;
+    if (!record) {
+      appends.clear();
+      versions.clear();
+    }
+    return this;
+  }
+
   @Override
   public int maxBlocks() {
     return maxBlocks;
@@ -153,7 +187,9 @@ public final class InMemoryAppendBlobStore implements AppendBlobStore {
     Stored s = new Stored(true, metadata);
     touch(s);
     blobs.put(name, s);
-    versions.computeIfAbsent(name, k -> new ArrayList<>()).add(new byte[0]);
+    if (history) {
+      versions.computeIfAbsent(name, k -> new ArrayList<>()).add(new byte[0]);
+    }
     after(fault, Op.CREATE_APPEND, name);
     return true;
   }
@@ -186,12 +222,12 @@ public final class InMemoryAppendBlobStore implements AppendBlobStore {
       throw new Full("MaxBlobSizeConditionNotMet: " + name + " is " + s.length() + " bytes");
     }
     long offset = s.length();
-    byte[] grown = Arrays.copyOf(s.bytes, s.bytes.length + block.length);
-    System.arraycopy(block, 0, grown, s.bytes.length, block.length);
-    s.bytes = grown;
-    s.blockEnds.add((long) grown.length);
+    s.append(block);
+    s.blockEnds.add(s.length());
     touch(s);
-    appends.add(new Appended(name, offset, block.clone()));
+    if (history) {
+      appends.add(new Appended(name, offset, block.clone()));
+    }
     return offset;
   }
 
@@ -255,9 +291,12 @@ public final class InMemoryAppendBlobStore implements AppendBlobStore {
   private Stored putBlock(String name, byte[] bytes) {
     Stored s = new Stored(false, Map.of());
     s.bytes = bytes.clone();
+    s.length = bytes.length;
     touch(s);
     blobs.put(name, s);
-    versions.computeIfAbsent(name, k -> new ArrayList<>()).add(bytes.clone());
+    if (history) {
+      versions.computeIfAbsent(name, k -> new ArrayList<>()).add(bytes.clone());
+    }
     return s;
   }
 
@@ -291,7 +330,7 @@ public final class InMemoryAppendBlobStore implements AppendBlobStore {
       blocks--;
       end = blocks == 0 ? 0 : s.blockEnds.get(blocks - 1);
     }
-    byte[] bytes = from >= end ? new byte[0] : Arrays.copyOfRange(s.bytes, (int) from, (int) end);
+    byte[] bytes = from >= end ? new byte[0] : s.copy((int) from, (int) end);
     return new Blob(bytes, end, blocks, s.metadata, s.etag);
   }
 
@@ -391,11 +430,82 @@ public final class InMemoryAppendBlobStore implements AppendBlobStore {
   /** The blob's bytes now, read without hooks; null if it does not exist. */
   public synchronized byte[] peek(String name) {
     Stored s = blobs.get(name);
-    return s == null ? null : s.bytes.clone();
+    return s == null ? null : s.copy(0, s.length);
   }
 
   /** The names of the blobs that exist now. */
   public synchronized List<String> names() {
     return new ArrayList<>(blobs.keySet());
+  }
+
+  /** The bytes the blobs that exist now hold, in all. */
+  public synchronized long bytes() {
+    long total = 0;
+    for (Stored s : blobs.values()) {
+      total += s.length;
+    }
+    return total;
+  }
+
+  // ============================================================
+  // Saving and loading
+  // ============================================================
+
+  private static final int DUMP_VERSION = 1;
+
+  /**
+   * Writes the blobs that exist now (each one's kind, metadata, blocks or bytes), without hooks
+   * or history, for {@link #readFrom}.
+   */
+  public synchronized void writeTo(DataOutputStream out) throws IOException {
+    out.writeInt(DUMP_VERSION);
+    out.writeInt(blobs.size());
+    for (Map.Entry<String, Stored> e : blobs.entrySet()) {
+      Stored s = e.getValue();
+      out.writeUTF(e.getKey());
+      out.writeBoolean(s.append);
+      out.writeInt(s.metadata.size());
+      for (Map.Entry<String, String> m : new TreeMap<>(s.metadata).entrySet()) {
+        out.writeUTF(m.getKey());
+        out.writeUTF(m.getValue());
+      }
+      out.writeInt(s.blockEnds.size());
+      for (long end : s.blockEnds) {
+        out.writeLong(end);
+      }
+      out.writeInt(s.length);
+      out.write(s.bytes, 0, s.length);
+    }
+  }
+
+  /**
+   * Adds the blobs {@link #writeTo} wrote, as they were (an Append Blob's blocks kept), replacing
+   * any of the same names: new ETags, modified now, no history.
+   */
+  public synchronized void readFrom(DataInputStream in) throws IOException {
+    int version = in.readInt();
+    if (version != DUMP_VERSION) {
+      throw new IOException("Not a dump of this store: version " + version);
+    }
+    int count = in.readInt();
+    for (int i = 0; i < count; i++) {
+      String name = in.readUTF();
+      boolean append = in.readBoolean();
+      Map<String, String> metadata = new TreeMap<>();
+      int pairs = in.readInt();
+      for (int j = 0; j < pairs; j++) {
+        metadata.put(in.readUTF(), in.readUTF());
+      }
+      Stored s = new Stored(append, metadata);
+      int blocks = in.readInt();
+      for (int j = 0; j < blocks; j++) {
+        s.blockEnds.add(in.readLong());
+      }
+      s.length = in.readInt();
+      s.bytes = new byte[s.length];
+      in.readFully(s.bytes);
+      touch(s);
+      blobs.put(name, s);
+    }
   }
 }

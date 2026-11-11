@@ -158,4 +158,28 @@ public class TestLocalCatalogTransaction {
       return LocalCatalogMode.MEMLOG_ML;
     }
   }
+
+  @Nested
+  class AzureLog extends Suite {
+    @Override
+    LocalCatalogMode mode() {
+      return LocalCatalogMode.AZLOG;
+    }
+  }
+
+  @Nested
+  class AzureLogInlineTM extends Suite {
+    @Override
+    LocalCatalogMode mode() {
+      return LocalCatalogMode.AZLOG_TM;
+    }
+  }
+
+  @Nested
+  class AzureLogInlineML extends Suite {
+    @Override
+    LocalCatalogMode mode() {
+      return LocalCatalogMode.AZLOG_ML;
+    }
+  }
 }

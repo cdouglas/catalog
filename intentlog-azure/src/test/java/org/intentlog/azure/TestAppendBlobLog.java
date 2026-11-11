@@ -173,4 +173,35 @@ class TestAppendBlobLog {
     assertThat(store.names()).as("never created again").doesNotContain(first);
     assertThat(stale.readThrough(receipt, WAIT).records()).contains(r);
   }
+
+  /**
+   * A read through a write reads nothing when the reply put the record at the tail of the view
+   * the log kept, and reads what landed between when something did (AZURE_LOG.md "Reading
+   * through a write").
+   */
+  @Test
+  void aReadThroughAWriteReadsOnlyWhatLandedBetween() {
+    AppendBlobLog log = log(1 << 20);
+    AppendBlobLog other = log(1 << 20);
+    create(log);
+    log.read();
+    List<Op> requests = new ArrayList<>();
+    store.intercept((op, name) -> {
+      requests.add(op);
+      return Fault.NONE;
+    });
+    byte[] mine = record();
+    LogView view = log.readThrough(log.append(mine, null), WAIT);
+    assertThat(requests).as("an append, and no read").containsExactly(Op.APPEND);
+    assertThat(view.records()).containsExactly(mine);
+
+    byte[] theirs = record();
+    other.append(theirs, null);
+    requests.clear();
+    byte[] next = record();
+    view = log.readThrough(log.append(next, null), WAIT);
+    assertThat(requests).as("an append, and a read of what landed before it")
+        .containsExactly(Op.APPEND, Op.READ);
+    assertThat(view.records()).containsExactly(mine, theirs, next);
+  }
 }

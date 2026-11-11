@@ -242,6 +242,57 @@ public final class LogCatalogProperties {
     return new int[] {(int) block, (int) window};
   }
 
+  /**
+   * Which log the catalog keeps: {@link #LOG_ATOMIC_FILE}, one object of its FileIO's store (the
+   * default, {@code FileIOCatalog}'s), or {@link #LOG_AZURE_APPEND}, Append Blobs written by
+   * appends without a position condition, with checkpoints apart (docs/AZURE_LOG.md).
+   */
+  public static final String LOG = "fileio.catalog.log";
+
+  public static final String LOG_ATOMIC_FILE = "atomic-file";
+  public static final String LOG_AZURE_APPEND = "azure-append";
+
+  /**
+   * Where the Azure log is: {@code https://<account>.blob.core.windows.net/<container>/<path>}
+   * (default: the warehouse's {@code catalog.log}, given as such a URL).
+   */
+  public static final String LOG_LOCATION = "fileio.catalog.log.location";
+
+  /**
+   * How the Azure log appends: {@code blind} (the default; the service picks where a record
+   * lands) or {@code conditional} (at the tail the writer read, the ablation).
+   */
+  public static final String LOG_APPEND = "fileio.catalog.log.append";
+
+  /** A new segment's limit, in bytes (default 64 MiB, provisional). */
+  public static final String LOG_SEGMENT_MAX_BYTES = "fileio.catalog.log.segment.max.bytes";
+
+  /**
+   * Records after the checkpoint before a committer compacts the Azure log (default 10,000,
+   * provisional); it takes {@link #MAX_APPEND_COUNT}'s place there, as the one-object log's
+   * count was measured for appends that race for the object's end.
+   */
+  public static final String LOG_CHECKPOINT_RECORDS = "fileio.catalog.log.checkpoint.records";
+
+  public static final int DEFAULT_LOG_CHECKPOINT_RECORDS = 10_000;
+
+  /** Checkpoints the sweep keeps besides the head's (default 2). */
+  public static final String LOG_CHECKPOINT_KEEP = "fileio.catalog.log.checkpoint.keep";
+
+  /** How long a segment out of the head stays before the sweep deletes it (default 60 s). */
+  public static final String LOG_TRIM_GRACE_MS = "fileio.catalog.log.trim.grace.ms";
+
+  /** The log {@code properties} name: {@link #LOG_ATOMIC_FILE} unless they name another. */
+  public static String log(Map<String, String> properties) {
+    String log = properties == null ? null : properties.get(LOG);
+    if (log == null) {
+      return LOG_ATOMIC_FILE;
+    }
+    Preconditions.checkArgument(log.equals(LOG_ATOMIC_FILE) || log.equals(LOG_AZURE_APPEND),
+        "%s must be %s or %s, got %s", LOG, LOG_ATOMIC_FILE, LOG_AZURE_APPEND, log);
+    return log;
+  }
+
   /** The runtime configuration {@code properties} set; the defaults for those they do not. */
   public static RuntimeConfig runtimeConfig(Map<String, String> properties) {
     long admissionMs =
@@ -252,8 +303,11 @@ public final class LogCatalogProperties {
         "%s must be >= 0, got %s", COMMITTED_ADMISSION_MS, admissionMs);
     Preconditions.checkArgument(threshold >= 0,
         "%s must be >= 0, got %s", COMMITTED_PAGE_THRESHOLD, threshold);
+    int count = log(properties).equals(LOG_AZURE_APPEND)
+        ? intProperty(properties, LOG_CHECKPOINT_RECORDS, DEFAULT_LOG_CHECKPOINT_RECORDS)
+        : intProperty(properties, MAX_APPEND_COUNT, DEFAULT_MAX_APPEND_COUNT);
     return runtimeConfig(
-        intProperty(properties, MAX_APPEND_COUNT, DEFAULT_MAX_APPEND_COUNT),
+        count,
         longProperty(properties, MAX_APPEND_SIZE, DEFAULT_MAX_APPEND_SIZE),
         sizeBasis(properties),
         longProperty(properties, COMMITTED_RETENTION_MS, DEFAULT_COMMITTED_RETENTION_MS),
