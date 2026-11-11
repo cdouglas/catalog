@@ -394,7 +394,12 @@ decodes a new checkpoint; the rule above still stands. The draws are not
 derived from the store either: a compaction lands only if no append lands
 while it is encoded and sent, which a writer could estimate from the rate its
 log grows and its last compaction's time, and skip compactions that cannot
-land.
+land. A compaction that lost to appends is sent again by that estimate
+(`CompactionPolicy.resend`), but the first one is not skipped. Measured on
+S3 Express (TAIL_READS.md "Compaction after the commit", campaigns `tr6k` and
+`tr6m`): 1,000 beat 100 at every point but one where one run an arm is
+noise. At E1's 1,000-table knee, writers began 2,680 compactions in four
+runs and 2 landed; the store's cap of 10,000 appends bounded the log.
 
 A compaction writes the committed set whole (D16), and at the default
 retention and a steady commit rate the set is most of the checkpoint: 25 MB

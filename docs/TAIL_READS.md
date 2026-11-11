@@ -683,7 +683,10 @@ Each step stands alone and is measured before the next:
    too, each point's arms side by side.
 6b. **Compaction after the commit** (2026-11-10, before step 7: the user's
    call on the knee). Traced, then modelled, built and measured: [Compaction
-   after the commit](#compaction-after-the-commit).
+   after the commit](#compaction-after-the-commit). At 300 tables a compaction
+   after the commit lands, sent again with the records that beat it. At the
+   1,000-table knee none lands and the store's cap bounds the log, yet it is
+   the best arm there too (campaign `tr6m`).
 7. **One request a read**: a ranged GET that
    reports the version and length it read (S3's `ETag` and `Content-Range`,
    ADLS's and GCS's equivalents), so a tail read is one request. A fork
@@ -876,6 +879,67 @@ some later append, which a compaction's GC record at a retention of 0 may
 pass, as on a shared log; it now asks it of a replace's file. And Bug 66's
 race to the store's cap now sets the count past the cap, so that the cap,
 not a compaction after the racer's commit, makes the commit replace.
+
+**Measured** (catalog-bench campaign `tr6m`, 2026-11-11: catalog-bench
+bdd280c, fileio 3765a17; `s3x-2026-11` with its cap of 10,000 appends; packs
+fewer than 1,000 records past a checkpoint; havoc, with the 300- and
+1,000-table runs side by side and a load of 16-33 from other users). E1 with
+tail reads, merge appends, fused or after the commit at a count of 100 or
+1,000. At 300 tables (5 a second offered), two runs an arm of 900 s, every
+merge append committed:
+
+| Mode | Arm | p50 | p90 | p99 | compactions landed (after a resend) / begun |
+| ---- | --- | --- | --- | --- | -------------------------------------------- |
+| inline ML | fused, 100 | 75.4 ms | 358 | 994 | |
+|           | fused, 1,000 | 51.8 ms | 133 | 606 | |
+|           | after, 100 | 69.5 ms | 323 | 706 | 77 (65) / 124 |
+|           | after, 1,000 | 44.9 ms | 122 | 413 | 10 (10) / 14 |
+| inline TM | fused, 100 | 89.5 ms | 181 | 540 | |
+|           | fused, 1,000 | 69.5 ms | 146 | 365 | |
+|           | after, 100 | 88.6 ms | 172 | 452 | 78 (52) / 116 |
+|           | after, 1,000 | 67.2 ms | 140 | 285 | 10 (10) / 11 |
+
+At 1,000 tables (16.7 a second offered), one run an arm of 1,200 s:
+
+| Mode | Arm | p50 | p99 | committed a second | failed | compactions landed / begun | records past the checkpoint (median, max) |
+| ---- | --- | --- | --- | ------------------ | ------ | -------------------------- | ----------------------------------------- |
+| inline ML | fused, 100 | 1,767 ms | 102.6 s | 3.05 | 108 of 3,762 | | 46, 100 |
+|           | fused, 1,000 | 918 ms | 76.9 s | 8.91 | 67 of 10,763 | | 502, 1,000 |
+|           | after, 100 | 1,282 ms | 24.3 s | 14.57 | 63 of 17,550 | 0 / 752 | 4,552, 9,999 |
+|           | after, 1,000 | 1,460 ms | 25.1 s | 13.89 | 56 of 16,718 | 0 / 406 | 4,955, 10,000 |
+| inline TM | fused, 100 | 272 ms | 5.0 s | 16.66 | 0 of 19,995 | | 53, 100 |
+|           | fused, 1,000 | 410 ms | 30.5 s | 16.32 | 20 of 19,608 | | 485, 1,000 |
+|           | after, 100 | 179 ms | 9.4 s | 16.66 | 1 of 19,995 | 0 / 914 | 4,849, 10,000 |
+|           | after, 1,000 | 172 ms | 3.2 s | 16.67 | 0 of 19,998 | 2 / 608 | 2,932, 10,007 |
+
+- At 300 tables the resend is what lands compactions: at a count of 1,000,
+  20 of 25 landed, every one sent again, against none of 33
+  without it (`tr6k`, whose packs started 31,000 records behind), and the
+  logs stayed within 1,102 records of a checkpoint. After the commit at
+  1,000 is the best arm in both modes at every percentile: its p99 is 32%
+  (ML) and 22% (TM) below the fused arm's at 1,000.
+- At 1,000 tables, as [its limit](#compaction-after-the-commit) says, a
+  compaction after the commit does not land: 2 of 2,680 begun in the four
+  runs. The resend's rule declined almost every resend (1.0 sends a
+  compaction). The logs grew to the store's cap, and there commits replaced
+  the object (7-80 a run, one or two landing) and the log began again.
+  Even so it is the best arm. Inline TM committed every merge append at the
+  offered rate with a p99 of 3.2 s, against 20 failures and 30.5 s fused at
+  1,000. Inline ML, bound by the driver's CPU in every arm (65-94% busy,
+  `run_flags.saturated`) and losing 7-8 appends a merge append in each,
+  committed 13.9-14.6 a second against 8.9 fused at 1,000. Writers that
+  hold a replica read only the log's tail (0.09-0.12 MiB a merge append).
+- The count: 1,000 beat 100 at 300 tables in every arm, and in E3 (`tr6k`,
+  10 tables at depths 1,000 and 7,200: the p99 28-74% lower, fused or
+  after). At 1,000 tables, fused ML committed 8.9 a second at
+  1,000 against 3.05 at 100 (`tr6k`: 9.65 against 3.27). Fused TM at the
+  knee is noise at one run an arm: `tr6k` failed 15 at 100 and 2 at 1,000,
+  `tr6m` 0 and 20. The default stays 1,000 (still provisional, errata D14).
+- What the knee still costs: a log at the cap makes a cold reader read up
+  to 10,000 records whole, and every writer still encodes compactions that
+  cannot land. A writer could skip them by the resend's rule, estimating
+  the window from its last compaction (errata D14). Paged checkpoints
+  remain the structural fix.
 
 ## Alternatives considered
 
