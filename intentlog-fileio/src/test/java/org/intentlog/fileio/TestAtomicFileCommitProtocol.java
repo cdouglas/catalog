@@ -31,7 +31,8 @@ import org.intentlog.testkit.EntityVersionsMachine;
  * The commit-protocol fuzzer ({@link CommitProtocol}) on one object of a store, with offset
  * appends or CAS only, its writers compacting by the record count drawn, and duplicates of records
  * that compaction folded into a checkpoint, or GC'd. The store reads in a mode drawn per try:
- * binding at the open, or pinned, live or spliced after a lookup (TAIL_READS.md, errata T6).
+ * binding at the open, or pinned, live or spliced after a lookup (TAIL_READS.md, errata T6); the
+ * check of each tail read against a whole read runs under the first two.
  */
 class TestAtomicFileCommitProtocol {
 
@@ -42,8 +43,39 @@ class TestAtomicFileCommitProtocol {
       @ForAll long seed,
       @ForAll("settings") CommitProtocol.Settings settings,
       @ForAll("schedules") List<CommitProtocol.Cmd> schedule) {
-    CommitProtocol.run(new AtomicFileLogHarness(new InMemoryAtomicFileIO(append), "mem:///log",
-        EntityVersionsMachine.INSTANCE, reads, seed), settings, schedule);
+    boolean pinned = reads == InMemoryAtomicFileIO.ReadMode.OPEN
+        || reads == InMemoryAtomicFileIO.ReadMode.PINNED;
+    withTailReadCheck(pinned, () -> CommitProtocol.run(new AtomicFileLogHarness(
+        new InMemoryAtomicFileIO(append), "mem:///log", EntityVersionsMachine.INSTANCE, reads,
+        seed), settings, schedule));
+  }
+
+  /**
+   * Runs {@code run} with the suites' check of each tail read against a whole read of the version
+   * it found (AtomicFileLog.CHECK_TAIL_READS) on only if {@code on}. The check's read is a request
+   * of its own, where this fuzzer may preempt the commit. A store that binds the version as the
+   * stream opens serves that version, and one that pins the GET to it fails the read as stale,
+   * where the check says nothing; one that serves the live version (LIVE, SPLICE) serves what the
+   * preempting commit wrote, and a replace of the same length reads as a disagreement, the
+   * commit's outcome unknown (seed 5557352659504107710 at 0a00685, whose whole read of a longer object on a store
+   * without appends is a request fewer and moved the preemption onto the check's read; the view
+   * the tail read returned was the version's). There the oracle of held states still checks every
+   * view a read returns, as in the fault and multi-writer fuzzers, which run without the check.
+   */
+  private static void withTailReadCheck(boolean on, Runnable run) {
+    String check = System.getProperty(AtomicFileLog.CHECK_TAIL_READS);
+    if (!on) {
+      System.setProperty(AtomicFileLog.CHECK_TAIL_READS, "false");
+    }
+    try {
+      run.run();
+    } finally {
+      if (check == null) {
+        System.clearProperty(AtomicFileLog.CHECK_TAIL_READS);
+      } else {
+        System.setProperty(AtomicFileLog.CHECK_TAIL_READS, check);
+      }
+    }
   }
 
   @Provide
