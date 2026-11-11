@@ -14,11 +14,6 @@
 
 [campaigns.pilot]
 select = ["pilot-mix-*", "pilot-fa-*"]
-[[annotate]]
-select = "where:label = 'pilot-mix' AND started_at < TIMESTAMP '2026-10-27 05:45:00'"
-mark = "superseded"
-note = "runtime applied to fast appends too (per-kind runtimes since)"
-
 [campaigns.c1-fa-scaling]
 title = "Fast appends as writers scale, per encoding, on s3x (append) and s3 (CAS only)"
 select = ["c1-fa-scaling-*"]
@@ -42,11 +37,6 @@ select = ["c5-tables-*"]
 [campaigns.c6-openloop]
 title = "Open load at endive's arrival rates, and endive's predictions for it"
 select = ["c6-openloop-*", "source:endive"]
-
-[[annotate]]
-select = ["c1-fa-scaling-5483b5ea1a71/20261027T065040Z", "c1-fa-scaling-362491b9b86e/20261027T065204Z"]
-mark = "excluded"
-note = "two runs (repetitions 0 and 1) started in the same second and wrote one directory; their ops interleave (fixed: a run's directory names its repetition)"
 
 [campaigns.c2r-expiry]
 title = "c2's compaction and overwrite mixes keeping 30 s of history, so expiry fails no job"
@@ -88,34 +78,17 @@ select = ["i7-retention-*"]
 title = "Ingest of seven workload shapes' logs: cap-i1's, one table, skewed tables, fast appends only, eager merges, YCSB-like and four-table catalog transactions"
 select = ["i8-shapes-*"]
 
-[[annotate]]
-select = ["i8-shapes-2779642ff8da/*", "i8-shapes-1ca9bda95d85/*"]
-note = "capture cap-s-fast: 3 of its 16 writers died of OutOfMemoryError at 240 s (one 3 GB heap for 16 writers' InlineSnapshot lists, which fast appends grow without bound); the log is real records, from 13 writers after 240 s"
-
 [campaigns.i9-format]
 title = "i8-shapes' seven workloads captured anew in the record format of 2026-10-29: removals by index in the parent's list, summaries that keep their parent's entries"
 select = ["i9-format-*"]
-
-[[annotate]]
-select = "where:label = 'i9-format' AND git_sha LIKE 'dd84699%'"
-mark = "superseded"
-note = "replay resolved a summary's parent entries three times per snapshot (fold ~12% slower); rerun on a8bde7b with the same captures"
 
 [campaigns.i10-format]
 title = "i8-shapes' seven workloads captured anew in the record format of 2026-10-29 (later that day): snapshot ids implied by a delta's one new snapshot, manifests named by UUID and number under the table's prefix"
 select = ["i10-format-*"]
 
-[[annotate]]
-select = "i10-format-*"
-note = "ran on a laptop that slept during the campaign (cap-s-fast's 10-minute capture took 37): record bytes and checkpoint breakdowns compare, timings do not; h1-shapes on havoc times the builds"
-
 [campaigns.i11-paging]
 title = "the committed set kept, paged (A 5 min, T 1 MiB) or discarded, cap-i1 at 1,000 records/s, prefilled to its 30-minute steady state, a compaction every 100 records (branch committed-paging, f07aca1)"
 select = ["i11-paging-*"]
-
-[[annotate]]
-select = "i11-paging-*"
-note = "git_dirty only for docs/SNAPSHOT_PAGING.md review comments; the code is f07aca1's. One run per arm"
 
 [campaigns.h1-shapes]
 title = "i8-shapes' seven workloads on havoc, three builds side by side (i8 1e86cf5, i9 343f37b, i10 03ab333), each on its own captures: tell the builds apart by git_sha"
@@ -142,6 +115,36 @@ select = ["g1-witness-*", "jmh/j-g1*"]
 # same code, j-g1?-proto the replay-cost fixes before their commit (9446029, the same code: MW's
 # window skips a blind v2 append's walk, Landing skips the list a blind v2 append never reads,
 # expiry's pool GC takes the cheaper side). Local laptop, 1 fork: errors +-5-20%.
+
+[campaigns.i12-count]
+select = ["i12-count-*"]
+[[annotate]]
+select = "where:label = 'pilot-mix' AND started_at < TIMESTAMP '2026-10-27 05:45:00'"
+mark = "superseded"
+note = "runtime applied to fast appends too (per-kind runtimes since)"
+
+[[annotate]]
+select = ["c1-fa-scaling-5483b5ea1a71/20261027T065040Z", "c1-fa-scaling-362491b9b86e/20261027T065204Z"]
+mark = "excluded"
+note = "two runs (repetitions 0 and 1) started in the same second and wrote one directory; their ops interleave (fixed: a run's directory names its repetition)"
+
+[[annotate]]
+select = ["i8-shapes-2779642ff8da/*", "i8-shapes-1ca9bda95d85/*"]
+note = "capture cap-s-fast: 3 of its 16 writers died of OutOfMemoryError at 240 s (one 3 GB heap for 16 writers' InlineSnapshot lists, which fast appends grow without bound); the log is real records, from 13 writers after 240 s"
+
+[[annotate]]
+select = "where:label = 'i9-format' AND git_sha LIKE 'dd84699%'"
+mark = "superseded"
+note = "replay resolved a summary's parent entries three times per snapshot (fold ~12% slower); rerun on a8bde7b with the same captures"
+
+[[annotate]]
+select = "i10-format-*"
+note = "ran on a laptop that slept during the campaign (cap-s-fast's 10-minute capture took 37): record bytes and checkpoint breakdowns compare, timings do not; h1-shapes on havoc times the builds"
+
+[[annotate]]
+select = "i11-paging-*"
+note = "git_dirty only for docs/SNAPSHOT_PAGING.md review comments; the code is f07aca1's. One run per arm"
+
 [[annotate]]
 select = "g1-witness-*"
 note = "8d9277a on havoc, 9 shards of 3 CPUs; one ingest pass per trace (noisy rates; see jmh/j-g1*)"
@@ -166,3 +169,6 @@ note = "157e3bf + uncommitted conflict attribution, the same code as 6c1e353; ha
 select = "where:git_sha LIKE '2afeb46%' AND regexp_matches(label, '^c[1-6]-')"
 mark = "superseded"
 note = "p5: 4-CPU shards (CPU-bound at 16+ writers), no backoff after a lost race; rerun as p6 at 8636dda"
+[[annotate]]
+select = "i12-count-*"
+note = "Ingest at fileio main (1adba2b, capture format 4: i11's workload captured anew), compacting every 100 or 1,000 records (max.append.count's old and new defaults), committed set paged or kept whole at its steady state"
