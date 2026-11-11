@@ -54,14 +54,16 @@ of an Azure Append Blob. Append Block's position condition (`x-ms-blob-condition
 is optional, and its reply names the offset where the block landed
 (`x-ms-blob-append-offset`).
 
-rmow-bench's `AzureAppendSpike` measured both kinds of append on 2026-11-10:
+`AzureAppendSpike` (catalog-bench's `spikes` module, docs/AZURE_APPENDS.md; written in rmow-bench,
+whose VM it ran on) measured both kinds of append on 2026-11-10:
 - **Setup:** one D8as_v6 VM in westus, beside an account with a hierarchical namespace;
   4 KiB blocks; a new blob for each level; each level 2 s of warm-up and then 20 s measured.
 - **Retries and connections:** the SDK's retries were off and every writer had its own
   connection.
 - **The check:** after each level the blob was read back. Every acknowledged block had to be
   intact (CRC32C), appear once, and sit at the offset its reply named.
-- **Where:** the run is rmow-bench's `results/spike/azure-appends-20261110T192545Z`, built
+- **Where:** the run is catalog-bench's `results/spike/azure-appends-20261110T192545Z` (moved
+  from rmow-bench on 2026-11-11), built
   at ee7f046.
 
 | Writers | Blind appends landed/s | Conditional appends landed/s | Conditional appends that lost |
@@ -77,7 +79,7 @@ rmow-bench's `AzureAppendSpike` measured both kinds of append on 2026-11-10:
 The 64-writer blind level filled its blob: it reached the 50,000-block limit 14.1 s into
 its 20 s window. Its rate here is over the 14.1 s it ran. The spike's own `levels.jsonl`
 says 2,199, because it divided by the full 20 s; that's fixed for later runs. The table is
-computed from the run's requests in rmow-bench's lab (`append_requests`).
+computed from the run's requests in catalog-bench's lab (`append_requests`).
 
 What the run showed:
 - **Conditional appends** land at about one writer's rate (a 10 ms median append), however
@@ -102,9 +104,9 @@ The limits of that run, which the spikes in [Open questions](#open-questions) ad
 ### Closing a segment: Seal and leases don't work, filling does
 
 A log of several blobs must be able to close one: once the head names the next segment, no
-append may land in the one before it. rmow-bench's `AzureSealProbe` tried three ways on
-2026-11-10. It ran from the laptop against the same account, and against Azurite 3.37.0
-(rmow-bench's `results/spike/azure-seal-20261110T224335Z`, `azure-lease-20261110T224617Z`,
+append may land in the one before it. `AzureSealProbe` (catalog-bench's `spikes` module) tried
+three ways on 2026-11-10. It ran from the laptop against the same account, and against Azurite
+3.37.0 (catalog-bench's `results/spike/azure-seal-20261110T224335Z`, `azure-lease-20261110T224617Z`,
 `azure-fill-20261110T224935Z` and `azure-fill-paced-20261110T225107Z`):
 
 | Fence | Azurite 3.37.0 | The account (hierarchical namespace) |
@@ -695,7 +697,8 @@ as the S3 Express spikes became `s3x-2026-11`.
 ## Open questions
 
 Each needs a spike before the code depends on it. The cloud ones can run together, as
-`AzureAppendSpike` modes on the rmow-bench deploy:
+`AzureAppendSpike` modes run by catalog-bench's `bin/azure-spike.sh`, on a VM of the rmow-bench
+deploy:
 
 | | Question | How to answer it |
 |---|---|---|
