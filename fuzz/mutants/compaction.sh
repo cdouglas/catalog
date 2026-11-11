@@ -1,8 +1,10 @@
 # Calibration of the compaction after the commit on one object (docs/TAIL_READS.md "Compaction
 # after the commit"; anchors as of its commit): each mutant must fail the one-object commit-protocol
-# fuzzer, whose writers compact after their commits in the runs whose seeds draw it, and the
-# multi-writer fuzzer, which checks a compaction apart from the commit before it (each caught in
-# 5,000 and 300 tries on the dev box; the model's oracle matrix says the fault and race fuzzers
+# fuzzer, whose writers compact after their commits in the runs whose seeds draw it. The
+# multi-writer fuzzer, which checks a compaction apart from the commit before it, runs only on
+# mutants the protocol fuzzer misses (the build stops at the first failing module); alone, it
+# catches compactbase, compactprobe and compactfail in the 3,000 tries prepare sets, and rarely
+# reaches a resend (TAIL_READS.md; the model's oracle matrix says the fault and race fuzzers
 # reach compactbase alone). They are the TLA+ switches of CatalogCommit: compactbase (a checkpoint
 # of the replica the commit staged on, before its record, conditioned on the version its record
 # landed in), compactresend (here twice: compactprobe, a compaction conditioned on the object as a

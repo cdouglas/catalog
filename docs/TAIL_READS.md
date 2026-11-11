@@ -889,7 +889,20 @@ multi-writer and fault fuzzers run on every write, compared a replace's
 checkpoint with a replay of the whole version it replaced, and took the
 first intention record after it for the replace's own. It now recognises a
 resend (`copied`: the replace's records begin with the version's last ones,
-and its checkpoint is the replay of the rest), and asks neither of it. Two tests changed meaning: `CheckpointRoundTrip`
+and its checkpoint is the replay of the rest), and asks neither of it.
+Calibrated again with both fixes (`tr6f-calib`), the protocol fuzzer caught
+all six mutants. A calibration's build stops at the first module that fails,
+so it runs the multi-writer fuzzer only on mutants the protocol fuzzer
+misses. Run alone on each (3,000 tries, on the dev box), the multi-writer
+fuzzer catches `compactbase`, `compactprobe` and `compactfail`, and none of
+the resend's three. It reaches a resend about 18 times in 300,000 tries, each
+after one record that replay rejected, so a resend that drops that record
+(`compactnocopy`) changes nothing it sees. Over the 300,000 tries of a seed
+that reaches them, it catches `compactcopyafter` (at try 87,001: the copied
+record, after the GC record, is below its floor) and not `compactnocopy`.
+Resends that copy a record that applied are the protocol fuzzer's.
+
+Two tests changed meaning: `CheckpointRoundTrip`
 asked of every catalog file that the first record after its checkpoint apply
 where it holds (Bug 64: a replace's own record), which after a compaction is
 some later append, which a compaction's GC record at a retention of 0 may
