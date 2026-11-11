@@ -879,7 +879,17 @@ and the replace's records begin with the rest of that version's. The first
 calibration (`tr6c-calib`) found the oracle still asking for the whole
 version. Its unmutated run failed at about try 51,650 of 300,000, on a resend
 that copied a record that had applied: the fuzzer reaches one about once in
-50,000 tries. Two tests changed meaning: `CheckpointRoundTrip`
+50,000 tries. Round `tr6c-r0` found the catalog's oracles making the same
+assumption. The multi-writer fuzzer took a compaction to be a replace with no
+intention record, so it counted a resend, which holds the records it copied,
+as a second write of the commit before it ("one commit made 2 conditional
+writes"). It now takes a replace whose intention records are the last ones of
+the version it replaced for a compaction. `CheckpointRoundTrip`, which the
+multi-writer and fault fuzzers run on every write, compared a replace's
+checkpoint with a replay of the whole version it replaced, and took the
+first intention record after it for the replace's own. It now recognises a
+resend (`copied`: the replace's records begin with the version's last ones,
+and its checkpoint is the replay of the rest), and asks neither of it. Two tests changed meaning: `CheckpointRoundTrip`
 asked of every catalog file that the first record after its checkpoint apply
 where it holds (Bug 64: a replace's own record), which after a compaction is
 some later append, which a compaction's GC record at a retention of 0 may

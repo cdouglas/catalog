@@ -285,11 +285,60 @@ public final class CheckpointRoundTrip {
    * record of its own to stay below) passed the record's id ({@link #compactionRecordRejected}).
    */
   public static String difference(boolean replace, byte[] before, byte[] after) {
-    String difference = difference(after, replace);
-    if (difference == null && replace) {
+    // A compaction sent again checkpoints a prefix of before and copies the rest; it has no
+    // record of its own (CatalogCommit.tla's CheckpointIsReplay)
+    boolean resent = replace && copied(before, after) > 0;
+    String difference = difference(after, replace && !resent);
+    if (difference == null && replace && !resent) {
       difference = checkpointIsReplay(before, after);
     }
     return difference;
+  }
+
+  /**
+   * How many records a compaction sent again copied from the end of {@code before}, the version it
+   * replaced, in front of its GC record and PageOuts (the records that beat it: TAIL_READS.md
+   * "Compaction after the commit"): the most {@code m} for which {@code after}'s records begin with
+   * {@code before}'s last {@code m}, an intention among them, and {@code after}'s checkpoint is the
+   * replay of the records of {@code before} before them. 0 for any other write: a replace
+   * checkpoints the version it replaces whole.
+   */
+  public static int copied(byte[] before, byte[] after) {
+    if (before == null || before.length == 0) {
+      return 0;
+    }
+    org.intentlog.LogView was = AtomicFileLog.decode(before);
+    List<byte[]> had = was.records();
+    List<byte[]> has = AtomicFileLog.decode(after).records();
+    SortedMap<String, String> actual = null;
+    for (int m = Math.min(had.size(), has.size()); m >= 1; m--) {
+      List<byte[]> rest = had.subList(had.size() - m, had.size());
+      if (!startsWith(has, rest)
+          || rest.stream().noneMatch(r -> LogEnvelope.decodeRecord(r).isIntention())) {
+        continue;
+      }
+      if (actual == null) {
+        actual = contents(CatalogTestSupport.checkpointOf(after));
+      }
+      byte[] prefix =
+          AtomicFileLog.encode(was.checkpoint().orElseThrow(), had.subList(0, had.size() - m));
+      if (contents(CatalogTestSupport.replay(prefix)).equals(actual)) {
+        return m;
+      }
+    }
+    return 0;
+  }
+
+  private static boolean startsWith(List<byte[]> records, List<byte[]> prefix) {
+    if (records.size() < prefix.size()) {
+      return false;
+    }
+    for (int i = 0; i < prefix.size(); i++) {
+      if (!java.util.Arrays.equals(records.get(i), prefix.get(i))) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /**

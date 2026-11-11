@@ -239,14 +239,38 @@ abstract class MultiWriterStorage {
       return io.history().size();
     }
 
+    /**
+     * Whether the intention records of {@code after} are the last ones of {@code before}, in order:
+     * none, or those a compaction sent again copied, the records that beat it (TAIL_READS.md
+     * "Compaction after the commit"). A commit's replace holds its own record, which the version
+     * it replaced does not.
+     */
+    private static boolean copiesOnly(byte[] before, byte[] after) {
+      List<java.util.UUID> had = intentionIds(before);
+      List<java.util.UUID> has = intentionIds(after);
+      return has.size() <= had.size()
+          && has.equals(had.subList(had.size() - has.size(), had.size()));
+    }
+
+    private static List<java.util.UUID> intentionIds(byte[] file) {
+      List<java.util.UUID> ids = new ArrayList<>();
+      for (LogEnvelope.Record record : CatalogTestSupport.decodeLogRecords(file)) {
+        if (record.isIntention()) {
+          ids.add(record.id());
+        }
+      }
+      return ids;
+    }
+
     @Override
     List<Write> writes(int from) {
       List<InMemoryAtomicFileIO.Write> history = io.history();
       List<Write> writes = new ArrayList<>();
       for (InMemoryAtomicFileIO.Write w : history.subList(from, history.size())) {
-        // A replace that holds no intention record is a compaction after a commit landed
+        // A replace that holds no intention record of its own is a compaction after a commit
+        // landed: none, or only the ones a resend copied from the version it replaced
         boolean compaction = w.strategy() == AtomicOutputFile.Strategy.CAS && w.before() != null
-            && CatalogTestSupport.decodeRecords(w.after()).isEmpty();
+            && copiesOnly(w.before(), w.after());
         writes.add(new Write(compaction ? "COMPACT" : w.strategy().name(), w.before(), w.after(),
             null));
       }
