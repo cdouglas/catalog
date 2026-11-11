@@ -54,7 +54,8 @@ class TestAzureCommitProtocol {
               .withSegmentLimit(segmentLimit).withTrimGraceMs(0).withClock(() -> 0L)));
     }
     CommitProtocol.run(
-        new AzureLogHarness(store, logs, "catalog.log", EntityVersionsMachine.INSTANCE),
+        new AzureLogHarness(ObservedStore.of(store), logs, "catalog.log",
+            EntityVersionsMachine.INSTANCE),
         settings, schedule);
   }
 

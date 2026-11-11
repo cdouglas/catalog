@@ -6,14 +6,14 @@ and its implementation on the same branch:
   with a hierarchical namespace, and that a lease doesn't stop appends there. So a segment is
   closed by filling it to its size limit instead
   ([Closing a segment](#closing-a-segment-seal-and-leases-dont-work-filling-does)).
-- **Done** ([Testing](#testing), steps 1–3):
+- **Done** ([Testing](#testing), steps 1–3 and 5):
   - the model, `spec/tla/AzureLog.tla`;
   - the module `intentlog-azure`: `AppendBlobLog`, the in-memory store and `AzureAppendBlobStore`;
   - the contract;
-  - the commit-protocol fuzzer, calibrated by mutants.
+  - the commit-protocol fuzzer, calibrated by mutants;
+  - both again on the spike's account.
 - **Not done:**
   - step 4, the catalog opening this log (`fileio.catalog.log`) and its `AZLOG` modes;
-  - step 5, a test on a real account;
   - the measurements.
 
 `AppendBlobLog` is a `SharedLog` ([LOG.md](LOG.md)) kept in Azure Blob Storage, and its
@@ -554,7 +554,7 @@ As every provider is tested (LOG.md "Testing a provider"), plus a model:
 5. **The cloud.** An integration test on a real account (`AzureAppendBlobLogIT`): the
    contract, and a run of the fuzzer's schedules with real requests.
 
-**Where it stands (2026-11-10): steps 1–3 are done.**
+**Where it stands (2026-11-10): steps 1–3 and 5 are done.**
 
 1. **The model** (`spec/tla/README.md` "The Azure log") holds in eight configurations, the
    largest at 335,000 states:
@@ -590,6 +590,19 @@ As every provider is tested (LOG.md "Testing a provider"), plus a model:
      compaction.
    - `offsetfromlength` is equivalent in Java: `readThrough` checks the receipt's CRC, and
      the runtime judges a commit by its id.
+
+5. **The cloud** (2026-11-11 UTC, from the laptop, on the spike's account: a hierarchical
+   namespace, westus). Both pass:
+   - `AzureAppendBlobLogIT`: the contract in its three variants, 43 tests run (5 skipped for
+     capabilities the log lacks).
+   - `AzureCommitProtocolIT`: 25 tries of the fuzzer, twice, with real requests through
+     `RecordingStore`. It injects the in-memory store's faults around real requests, and
+     records what landed for the oracles. In the second run, 14 tries moved the log on (35
+     real pads, up to 5 segments), with one to three instances of the log.
+
+   Each run writes under `intentlog-it/<UTC>-<random>` and deletes it afterwards. They run only
+   when asked (`-Dtest='AzureAppendBlobLogIT*,AzureCommitProtocolIT'`), with
+   `AZURE_LOG_IT_CONTAINER_URL` and `AZURE_STORAGE_KEY` set.
 
 ## Measurements
 

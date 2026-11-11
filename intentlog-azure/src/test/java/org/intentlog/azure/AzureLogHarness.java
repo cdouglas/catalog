@@ -48,7 +48,7 @@ import org.intentlog.wire.LogEnvelope;
  */
 final class AzureLogHarness implements LogHarness {
 
-  private final InMemoryAppendBlobStore store;
+  private final ObservedStore store;
   private final SharedLog log;
   private final String root;
   private final StateMachine<?, ?, ?> machine;
@@ -58,7 +58,7 @@ final class AzureLogHarness implements LogHarness {
    * A harness over {@code logs}, logs of one root on {@code store}: each request goes to the next
    * in turn, as requests from several processes would, each with its own cached head and views.
    */
-  AzureLogHarness(InMemoryAppendBlobStore store, List<AppendBlobLog> logs, String root,
+  AzureLogHarness(ObservedStore store, List<AppendBlobLog> logs, String root,
       StateMachine<?, ?, ?> machine) {
     this.store = store;
     this.log = new RoundRobin(logs);
@@ -185,10 +185,6 @@ final class AzureLogHarness implements LogHarness {
   @Override
   public void hook(Hooks newHooks) {
     this.hooks = newHooks;
-  }
-
-  InMemoryAppendBlobStore store() {
-    return store;
   }
 
   /** A record frame landed (not a pad), as the store holds it: its position and its record. */
