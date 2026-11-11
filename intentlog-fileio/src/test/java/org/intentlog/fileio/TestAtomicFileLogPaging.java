@@ -72,8 +72,9 @@ class TestAtomicFileLogPaging {
   private void open(boolean appends) {
     io = new InMemoryAtomicFileIO(appends);
     log = new AtomicFileLog(io, LOCATION);
-    // With appends, a replace every 8 records
-    CompactionPolicy policy = CompactionPolicy.limits(8, Long.MAX_VALUE);
+    // With appends, a compaction after the commit that takes the log to 8 records (the point a
+    // writer draws in [1, 2) of the limits fixed at 1: drawn, the GC below may not come in time)
+    CompactionPolicy policy = CompactionPolicy.limits(8, Long.MAX_VALUE).withDraws(() -> 0.0);
     writer = new LogRuntime<>(log, MACHINE,
         new RuntimeConfig(4, 3, 0L, 0L, HOUR, policy, Duration.ZERO, clock::get, A, 0L));
     writer.bootstrap(new Txn("init", Map.of(), Set.of()));
@@ -202,7 +203,8 @@ class TestAtomicFileLogPaging {
     long[] reads = {0};
     clock.set(T0 + 5_000L);
     LogRuntime<State, EntityVersionsMachine.Builder, Txn> slow = new LogRuntime<>(log, MACHINE,
-        new RuntimeConfig(4, 3, 0L, 0L, 2 * HOUR, CompactionPolicy.limits(8, Long.MAX_VALUE),
+        new RuntimeConfig(4, 3, 0L, 0L, 2 * HOUR,
+            CompactionPolicy.limits(8, Long.MAX_VALUE).withDraws(() -> 0.0),
             Duration.ZERO, () -> reads[0]++ == 0 ? T0 + 5_000L : T0 + HOUR, A, 0L));
     Replica<State> landed =
         slow.commit(base, Txn.on(base.state(), "slow", Set.of(), Set.of("slow")));
