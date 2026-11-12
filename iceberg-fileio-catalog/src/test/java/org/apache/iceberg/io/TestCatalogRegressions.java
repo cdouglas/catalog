@@ -5312,4 +5312,111 @@ public class TestCatalogRegressions {
       return new java.lang.ref.WeakReference<>(inline);
     }
   }
+
+  /** A store that runs what {@link #before} holds, once, before the next read of a metadata file. */
+  static class BeforeMetadataRead extends InMemoryAtomicFileIO {
+    final java.util.concurrent.atomic.AtomicReference<Runnable> before =
+        new java.util.concurrent.atomic.AtomicReference<>();
+
+    @Override
+    public org.apache.iceberg.io.InputFile newInputFile(String location) {
+      if (location.endsWith(".metadata.json")) {
+        Runnable run = before.getAndSet(null);
+        if (run != null) {
+          run.run();
+        }
+      }
+      return super.newInputFile(location);
+    }
+  }
+
+  /**
+   * Bug 86: a load that read the catalog before a drop with purge reported the drop as a missing
+   * file. The load read the catalog, which named the table's metadata file; a drop with purge then
+   * landed and deleted the table's files; the load's read of the file threw NotFoundException,
+   * which Iceberg's operations do not retry, and the caller got a lost file for a dropped table. A
+   * commit that deletes old metadata files (write.metadata.delete-after-commit.enabled) does the
+   * same to a load that read the catalog before it. The fault fuzzer found it in round az-r0: with
+   * reads bound at open, a reader preempted between opening the catalog and reading it reads the
+   * version before the drop. A load whose pointer's metadata file is missing now reads the catalog
+   * again: a table dropped is NoSuchTableException, a pointer moved on loads the file it names, and
+   * only a file the catalog still names is NotFoundException. Iceberg's metastore operations (JDBC,
+   * Hive) still report the race as NotFoundException.
+   */
+  @Nested
+  class LoadRacingAPurge {
+    private final TableIdentifier t = TableIdentifier.of("ns", "t");
+    private final BeforeMetadataRead io = new BeforeMetadataRead();
+    private final java.util.concurrent.atomic.AtomicReference<Runnable> beforeMetadataRead =
+        io.before;
+
+    private LogCatalog catalog(LocalCatalogMode mode) {
+      return mode.catalog(io, "mem:///warehouse", "c", Map.of());
+    }
+
+    private void create(LocalCatalogMode mode, Map<String, String> properties) {
+      LogCatalog writer = catalog(mode);
+      writer.createNamespace(Namespace.of("ns"));
+      writer.buildTable(t, intSchema).withProperties(properties).create();
+    }
+
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "CAS", "COMPACT", "MEMLOG"})
+    void aLoadFindsTheTableDropped(LocalCatalogMode mode) {
+      create(mode, Map.of());
+      LogCatalog reader = catalog(mode);
+      beforeMetadataRead.set(() -> catalog(mode).dropTable(t, true));
+
+      assertThatThrownBy(() -> reader.loadTable(t)).isInstanceOf(NoSuchTableException.class);
+      assertThat(beforeMetadataRead.get()).isNull();
+    }
+
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "CAS", "COMPACT", "MEMLOG"})
+    void aRefreshFindsTheTableDropped(LocalCatalogMode mode) {
+      create(mode, Map.of());
+      Table handle = catalog(mode).loadTable(t);
+      catalog(mode).loadTable(t).newFastAppend().appendFile(file("a")).commit();
+      beforeMetadataRead.set(() -> catalog(mode).dropTable(t, true));
+
+      assertThatThrownBy(handle::refresh).isInstanceOf(NoSuchTableException.class);
+      assertThat(beforeMetadataRead.get()).isNull();
+    }
+
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "CAS", "COMPACT", "MEMLOG"})
+    void aLoadFollowsThePointerOn(LocalCatalogMode mode) {
+      create(mode, Map.of(
+          org.apache.iceberg.TableProperties.METADATA_DELETE_AFTER_COMMIT_ENABLED, "true",
+          org.apache.iceberg.TableProperties.METADATA_PREVIOUS_VERSIONS_MAX, "1"));
+      LogCatalog reader = catalog(mode);
+      // Two commits: the second deletes the file the reader's read names
+      beforeMetadataRead.set(() -> {
+        LogCatalog writer = catalog(mode);
+        writer.loadTable(t).newFastAppend().appendFile(file("a")).commit();
+        writer.loadTable(t).newFastAppend().appendFile(file("b")).commit();
+      });
+
+      Table table = reader.loadTable(t);
+      assertThat(beforeMetadataRead.get()).isNull();
+      assertThat(table.snapshots()).hasSize(2);
+      assertThat(((org.apache.iceberg.HasTableOperations) table).operations().current()
+              .metadataFileLocation())
+          .isEqualTo(((org.apache.iceberg.HasTableOperations) catalog(mode).loadTable(t))
+              .operations().current().metadataFileLocation());
+    }
+
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "CAS", "COMPACT", "MEMLOG"})
+    void aFileTheCatalogStillNamesIsLost(LocalCatalogMode mode) {
+      create(mode, Map.of());
+      String file = ((org.apache.iceberg.HasTableOperations) catalog(mode).loadTable(t))
+          .operations().current().metadataFileLocation();
+      io.deleteFile(file);
+
+      assertThatThrownBy(() -> catalog(mode).loadTable(t))
+          .isInstanceOf(org.apache.iceberg.exceptions.NotFoundException.class)
+          .hasMessageContaining(file);
+    }
+  }
 }

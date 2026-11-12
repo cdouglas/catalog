@@ -593,6 +593,16 @@ default number of attempts (`LogCatalog.commitOnAFreshRead`, `dropTable`,
 catalog transaction conflicts on the whole version of each table it pins, a
 table it writes from when it first read it ([errata.md](errata.md) §D12).
 
+A load reads the catalog, then a pointer table's metadata file, and a drop
+with purge or a commit that deletes old metadata files
+(`write.metadata.delete-after-commit.enabled`) may land between the two and
+delete the file. A load or refresh whose pointer's file is missing reads the
+catalog again (`FileIOTableOperations.readPastMissing`, Bug 86 (load racing a
+purge)): a table dropped is `NoSuchTableException`, a pointer moved on loads
+the file it names, and only a file the catalog still names is
+`NotFoundException`, a lost file. Iceberg's metastore operations (JDBC, Hive)
+report the race as the missing file.
+
 The catalog's log properties (`LogCatalogProperties`) configure the commit
 loop: `fileio.catalog.max.append.count` and `max.append.size` set when it
 compacts ([ATOMIC_FILE_LOG.md](ATOMIC_FILE_LOG.md) §"Commits on one object"),

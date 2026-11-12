@@ -745,9 +745,39 @@ public class LogCatalog extends BaseMetastoreCatalog
 
     @Override
     protected void doRefresh() {
-      final Replica<CatalogState> read = log.read();
-      lastRead = read;
-      loadFrom(read.state());
+      Replica<CatalogState> read = log.read();
+      while (true) {
+        lastRead = read;
+        try {
+          loadFrom(read.state());
+          return;
+        } catch (org.apache.iceberg.exceptions.NotFoundException e) {
+          read = readPastMissing(read, e);
+        }
+      }
+    }
+
+    /**
+     * A fresh read of the catalog, for a load from {@code read} whose pointer names a metadata file
+     * that is gone: a drop with purge, or a commit deleting old metadata files
+     * ({@code write.metadata.delete-after-commit.enabled}), landed after {@code read} and deleted
+     * it (Bug 86). The load goes on from the fresh read: the table dropped is NoSuchTableException,
+     * a pointer moved on loads the file it names. Throws {@code missing} if the fresh read names
+     * the same file, which is lost, not superseded. Iceberg's metastore operations (JDBC, Hive)
+     * report such a race as the missing file.
+     */
+    private Replica<CatalogState> readPastMissing(
+        Replica<CatalogState> read, org.apache.iceberg.exceptions.NotFoundException missing) {
+      String file = read.state().location(tableId);
+      if (file == null) {
+        // Not a pointer's metadata file: an inline table's (a collected snapshot page's)
+        throw missing;
+      }
+      Replica<CatalogState> again = log.read();
+      if (file.equals(again.state().location(tableId))) {
+        throw missing;
+      }
+      return again;
     }
 
     /** The read these operations last loaded the table from (tests). */
