@@ -33,12 +33,13 @@ class TestLatencyFileIO {
   private static final String CATALOG = "mem:///wh/catalog";
   private static final int SIZE = 3 * 1024 * 1024;
 
+  private InMemoryAtomicFileIO store;
   private LatencyFileIO io;
   private Requests before;
 
   @BeforeEach
   void before() throws IOException {
-    InMemoryAtomicFileIO store = new InMemoryAtomicFileIO(true);
+    store = new InMemoryAtomicFileIO(true);
     try (PositionOutputStream out = store.newOutputFile(CATALOG).create()) {
       out.write(new byte[SIZE]);
     }
@@ -57,8 +58,9 @@ class TestLatencyFileIO {
     }
   }
 
+  /** Opening a stream binds nothing: a lookup before its first read is a HEAD (errata D23). */
   @Test
-  void aWholeReadIsOneGetOfEveryByteAndBindsTheFile() throws IOException {
+  void aLookupAfterAnOpenIsAHeadAndAWholeReadOneGetOfEveryByte() throws IOException {
     InputFile file = io.newInputFile(CATALOG);
     try (SeekableInputStream in = file.newStream()) {
       assertThat(file.getLength()).isEqualTo(SIZE);
@@ -66,10 +68,59 @@ class TestLatencyFileIO {
     }
 
     Requests r = requests();
-    assertThat(r.heads).as("the open bound the file").isZero();
+    assertThat(r.heads).isEqualTo(1);
     assertThat(r.gets).isEqualTo(1);
     assertThat(r.bytesRead).isEqualTo(SIZE);
     assertThat(r.catalogBytesRead).isEqualTo(SIZE);
+  }
+
+  /**
+   * Where the store's reads record their version, a GET binds its file: a lookup after it sends
+   * nothing (TAIL_READS.md step 7). Where they do not (GCS), the lookup is a HEAD.
+   */
+  @Test
+  void aGetBindsItsFileWhereTheStoresReadsRecordTheirVersion() throws IOException {
+    for (boolean records : new boolean[] {true, false}) {
+      store.setReadsRecordVersion(records);
+      assertThat(io.readsRecordVersion()).isEqualTo(records);
+      Requests start = Requests.mine().copy();
+      InputFile file = io.newInputFile(CATALOG);
+      try (SeekableInputStream in = file.newStream()) {
+        in.seek(SIZE - 100);
+        readToEnd(in);
+      }
+      assertThat(file.getLength()).isEqualTo(SIZE);
+
+      Requests r = Requests.mine().minus(start);
+      assertThat(r.gets).isEqualTo(1);
+      assertThat(r.bytesRead).isEqualTo(100);
+      assertThat(r.heads).as("reads record their version: " + records).isEqualTo(records ? 0 : 1);
+    }
+  }
+
+  /** A file made with its length sends no lookup, as a client's file given a length does. */
+  @Test
+  void aFileGivenItsLengthSendsNoLookup() throws IOException {
+    InputFile file = io.newInputFile(CATALOG, SIZE);
+    assertThat(file.getLength()).isEqualTo(SIZE);
+    try (SeekableInputStream in = file.newStream()) {
+      readToEnd(in);
+    }
+
+    assertThat(requests().heads).isZero();
+    assertThat(requests().gets).isEqualTo(1);
+  }
+
+  /** A GET from the object's end or past it is a request that reads nothing. */
+  @Test
+  void aGetFromPastTheEndIsARequestOfNoBytes() throws IOException {
+    try (SeekableInputStream in = io.newInputFile(CATALOG).newStream()) {
+      in.seek(SIZE + 20);
+      assertThat(in.read()).isEqualTo(-1);
+    }
+
+    assertThat(requests().gets).isEqualTo(1);
+    assertThat(requests().bytesRead).isZero();
   }
 
   @Test

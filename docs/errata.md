@@ -482,9 +482,10 @@ Also measured on S3 Standard, where a longer object is now read whole at once
 (0a00685; TAIL_READS.md "Measured on S3 Standard").
 
 Still open:
-- Every read is a lookup (a HEAD) and a GET on S3, ADLS and GCS, which the
-  latency model does not charge (D23); step 7 makes it one GET where the
-  store's reply reports the version and length it read.
+- One request a read (step 7, branch `one-request-reads`): a read is one GET
+  on S3 and ADLS, whose replies report the version and length they read, and
+  the model now charges the lookup it saves (D23). Its effect is not measured
+  yet.
 - Lost races at high load (TAIL_READS.md "Open questions"). Catalog-bench's
   campaign `p4r` (fileio main after step 6b) committed fewer merge appends a
   second than `e1-d20` (fileio e505a0f) at E1's largest pointer points on S3
@@ -813,8 +814,8 @@ catalog holds (`LogRuntime.read(floor)`). So a merge append's two reads, its
 load and the refresh in `apply`, fetch the records since, not the object. At
 E1's 300 inline-ML tables on S3 Express (catalog-bench `tr6`) a merge append
 read 1.55 MiB of the catalog, against 12.5 with whole reads, in 2.2 GETs. The
-two reads stay: Iceberg's refresh contract asks for both. Each is still a
-HEAD and a GET on a real store (D23; TAIL_READS.md step 7).
+two reads stay: Iceberg's refresh contract asks for both. Each is one GET on
+S3 and ADLS since step 7, a HEAD and a GET on GCS (D23).
 
 ### D21. A commit id's timestamp has no upper bound
 
@@ -931,27 +932,32 @@ elsewhere and a typed encoder removes it from the wire format
 altogether. PartitionSpec is the cheaper of the two to lift next if a
 workload motivates it independently.
 
-### D23. The latency model charges no HEAD for a lookup after an open
+### D23. The latency model charged no HEAD for a lookup after an open
 
 The benchmarks' latency model (`LatencyFileIO` for FileIOCatalog,
-catalog-bench's `ModelStore` for every client) takes a stream's open as
-binding its file, as a GET's response reports a version and a length, so a
-lookup after the open (`getLength`) costs nothing. On S3, ADLS and GCS
-`AtomicFileLog`'s read is a HEAD, then a GET: it opens, looks up (binding the
-version the GET asks for, an order GCS needs, whose reads record no
-generation), then reads. Its tail read takes the same order. So the model
-charges every FileIOCatalog read one request less than a store does (on
-`s3x-2026-11` about 6 ms, on S3 Standard about 27 ms; two or more reads a
-commit), and every client's read of a file whose length Iceberg looks up
-after opening it (an Avro manifest list without a length). Tail reads
-(TAIL_READS.md step 6) are measured against whole reads under the same
-model, so their comparison stands; what the model cannot show is the HEAD's
-own cost, step 7's question (one request a read, where a store's GET reports
-the version and length it read: S3's and ADLS's do, step 0 pins the file to
-them; GCS's do not).
+catalog-bench's `ModelStore` for every client) took a stream's open as
+binding its file, so a lookup after the open (`getLength`) cost nothing. On
+S3, ADLS and GCS a stream sends nothing until it reads, and a lookup before
+its first read is a HEAD. So the model charged every FileIOCatalog read
+(open, look up, read) one request less than a store does (on `s3x-2026-11`
+about 6 ms, on S3 Standard about 27 ms; two or more reads a commit), and
+every client's read of a file whose length Iceberg looks up after opening it
+(an Avro manifest list: `AvroIterable` opens a stream, then asks the
+length).
 
-**Trigger to revisit:** a decision to charge lookups after an open in the
-model, for every client (re-measuring the campaigns), or step 7.
+**Resolved 2026-11-11** (TAIL_READS.md step 7, branch `one-request-reads`):
+the model charges a lookup of a file nothing bound as a HEAD, and opening a
+stream binds nothing; a GET binds its file only where the store's reads record
+their version and the client keeps it (the fork's S3 and ADLS FileIOs; not a
+stock client's, nor GCS's). And `AtomicFileLog` reads first where reads
+record their version, one request a read. What stays: every campaign before
+the merge ran under the old model. Comparisons within a campaign stand (each
+arm's reads alike short), and absolute numbers are a HEAD a read low; the
+paper's runs are taken under the new model. A stock client's manifest-list
+read is a HEAD and a GET, as on S3, for JDBC, Polaris and FileIOCatalog's
+pointer and inline-TM modes alike; a client fix (Avro's length asked lazily,
+and a file that keeps the length its GET reported) would save it for every
+client, and is not made (`core-perf` has none).
 
 ## Test Coverage Gaps
 

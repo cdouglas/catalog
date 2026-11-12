@@ -227,11 +227,19 @@ boundary, decoded.
 
 ## Reads
 
-**A whole read** (`read()`) is as now, a HEAD then a GET of every byte,
-checked as above. A view records its incarnation and its frames' offsets.
+**A whole read** (`read()`) is one GET of every byte where the store's GET
+reports the version and length it read (`readsRecordVersion()`: S3, ADLS;
+step 7), and a HEAD then a GET elsewhere (GCS), checked as above. A view
+records its incarnation and its frames' offsets.
 
 **A tail read** (`readAfter(since)`), from a tail whose bytes this log read or
-wrote (incarnation X, length N):
+wrote (incarnation X, length N). Where the store's reads record their
+version, it is one GET of [N − 20, end) of the version V it finds, which
+reports V and its length L, and then steps 3 and 4; if those bytes are not
+X's trailer, the rest of V, [0, N − 20), is a second GET of V, and a GET
+that found nothing (V ends before N − 20: a 416, which the stream reports as
+its end) is followed by V read whole. Elsewhere (GCS, or `fileio.catalog.read.
+lookup`):
 
 1. A HEAD: the version V and its length L. If L < N, the object was replaced:
    a whole read (a GET of V's bytes). On a store without appends
@@ -349,7 +357,10 @@ at once (step 1 above: `TestAtomicFileLog`'s
 `aLongerObjectOnAStoreWithoutAppendsIsReadWholeAtOnce`): as a whole read
 where the object changed, and still a lookup and a 20-byte GET where it did
 not. A whole read is always a read the model allows, so the protocol is
-unchanged.
+unchanged. Since step 7 S3 Standard's reads record their version, and its
+tail read is a GET from N − 20 and, where the object changed, a GET of the
+bytes before: as many requests as a lookup and a whole read, the same bytes,
+and one GET of 20 bytes where it did not change.
 
 ## Why a tail read is sound
 
@@ -489,22 +500,26 @@ position a seek left to the end, and a seek the open GET cannot read through
 stream and the bytes a stream returns (`IoStats`); its time is
 `LatencyFileIO`'s.
 
-**The HEAD.** Step 1 found that the model charges no HEAD for a whole read.
-Opening a stream binds its file in the model (and in catalog-bench's
-`ModelStore`, for every client), as a GET's response reports a version and a
-length, so `AtomicFileLog`'s lookup after the open (`getLength`) costs nothing.
-On S3, ADLS and GCS that read is a HEAD, then a GET: the lookup binds the
-version the GET asks for, an order GCS needs, whose reads record no
-generation. A tail read takes the same order (open, look up, read from
-N − 20), so in the model it is one ranged GET, as a whole read is one whole
-GET, and on the stores each is a HEAD and a GET: steps 5 and 6 compare like
-with like. Step 7's question, whether the HEAD matters, is the one the model
-cannot answer as it stands. Charging the lookup after an open moves every
-FileIOCatalog number by a HEAD a read (on `s3x-2026-11` about 6 ms, on S3
-Standard about 27 ms, two or more a commit), and the baselines' too where
-Iceberg looks a file up after opening it (an Avro manifest list without a
-length). That is a change to the benchmark's model for every client, so it
-waits for step 6's numbers and a decision (errata D23).
+**The HEAD.** A lookup of a file that no request has bound is a HEAD, in
+the model as on the stores, and opening a stream binds nothing: its first
+read is the GET. A GET binds its file only where the store's response
+reports the version and the object's length and the client keeps them: the
+fork's S3 and ADLS FileIOs (`readsRecordVersion()`), and in the model
+`LatencyFileIO` on a profile whose store does (`StoreProfile.
+readsRecordVersion`: every profile but `gcp`). A stock client's GET binds
+nothing (Iceberg's `S3InputFile` looks a length up with a HEAD whatever its
+streams read), so in catalog-bench's `ModelStore` a manifest list's read is a
+HEAD and a GET (`AvroIterable` opens a stream, then asks the file's length),
+as on S3, for every client. So `AtomicFileLog`'s read is one GET on S3 and
+ADLS (step 7), and a HEAD and a GET on GCS, whose reads record no
+generation, so that the lookup must bind the version the GET asks for.
+
+Before step 7 the model took a stream's open as binding its file, so a lookup
+after the open cost nothing: every client's read one request short where it
+looked a file up after opening it (errata D23). Steps 1-6b were measured that
+way, and compare like with like (each arm's reads alike short); their
+absolute numbers are a HEAD a read low (on `s3x-2026-11` about 6 ms, on S3
+Standard about 27 ms, two or more a commit).
 
 ## What changes in the code
 
@@ -714,7 +729,7 @@ Each step stands alone and is measured before the next:
    against 190 ms) but it lost more append races (1.64 against 1.38), though
    by requests a tail read after a lost race leaves the narrower window before
    the resend (a GET, against a probe's HEAD and its GET of the probed
-   version's trailer; the model charges no lookup after an open, errata D23):
+   version's trailer; the model then charged no lookup after an open, D23):
    the question 1,000 tables asks louder.
    At 1,000 tables (16.7 merge appends a second offered) the driver is the
    limit in both arms, as it was in campaign `e1` (CPU 66-94% of its 16, GC
@@ -745,13 +760,32 @@ Each step stands alone and is measured before the next:
    after the commit lands, sent again with the records that beat it. At the
    1,000-table knee none lands and the store's cap bounds the log, yet it is
    the best arm there too (campaign `tr6m`).
-7. **One request a read**: a ranged GET that
-   reports the version and length it read (S3's `ETag` and `Content-Range`,
-   ADLS's and GCS's equivalents), so a tail read is one request. A fork
-   change to the input files. Planned if step 6 showed the HEAD, which it
-   cannot: the model charges a lookup after an open nothing (errata D23), so
-   building it waits on that decision, and on the open question of tail reads
-   past the knee.
+7. **One request a read** (2026-11-11, built; measurement pending). A GET's
+   response reports the version and length it read (S3's `ETag` and
+   `Content-Range`, ADLS's equivalents), and the fork's S3 and ADLS files
+   keep them (fork b343396246, step 0's), so a read needs no lookup before
+   it. The fork declares which stores' reads do
+   (`SupportsAtomicOperations.readsRecordVersion()`: S3 unless the analytics
+   accelerator is on, ADLS; not GCS, whose client library reports no
+   generation a read found), and reports a GET from an object's end or past
+   it, which those services answer with 416, as the stream's end (fork
+   b542ec1c6c). `AtomicFileLog` then reads first on such stores: a whole read
+   is one GET, a tail read one GET from N − 20 (two where the object was
+   replaced: the rest of the version, or the version whole after a GET that
+   found nothing), and a page of the log one GET on any store (a page is
+   written once). `fileio.catalog.read.lookup` puts the lookup back, for
+   ablation. The model charges a lookup after an open, for every client
+   (errata D23, above): catalog-bench's `ModelStore` and `TieredFileIO`, and
+   `LatencyFileIO`, whose GET binds its file only where the store's reads
+   record their version. Tested: the contract's two new read cases (a first
+   read from an offset, a read from the end or past it) on the in-memory store
+   recording versions, bound at the open and pinned, and on the clouds (real
+   cloud pending); `TestS3PinnedReads`, `TestADLSInputStream`;
+   `TestLatencyFileIO`, catalog-bench's `TestTieredFileIO` and
+   `TestModelStore` (a manifest list's read is a HEAD and a GET); and the
+   fuzzers (commit protocol, fault, race, multi-writer) draw whether the
+   store's reads record their version. The commit-protocol fuzzer catches a
+   tail read that skips its trailer check on a store that records.
 
 Then R2.3, with a read's cost known.
 

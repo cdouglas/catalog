@@ -189,6 +189,7 @@ final class ContentionRun {
     this.dir = dir;
     StoreProfile profile = StoreProfile.named(config.string("store"));
     this.store = new InMemoryAtomicFileIO(profile.supportsAppend);
+    store.setReadsRecordVersion(profile.readsRecordVersion);
     store.recordHistory(false);
     if (config.bool("capture_log")) {
       store.onWrite(this::capture);

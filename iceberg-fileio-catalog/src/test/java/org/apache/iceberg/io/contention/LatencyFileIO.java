@@ -40,21 +40,26 @@ import org.apache.iceberg.io.SupportsPrefixOperations;
  * An {@link InMemoryAtomicFileIO} whose requests take a store's latency ({@link StoreProfile}),
  * spent in the calling thread, which also counts them ({@link Requests}).
  *
- * <p>A request is: binding an input file (a HEAD: {@code exists} or {@code getLength} of an unbound
- * file), each GET (below), each plain write (a PUT, on close), each conditional write, each
+ * <p>A request is: a lookup of an unbound input file (a HEAD: {@code exists} or {@code getLength}),
+ * each GET (below), each plain write (a PUT, on close), each conditional write, each
  * delete, and each listing of a prefix (a LIST, at a read's latency: endive's profiles have none of
  * their own; fileio-catalog lists only to sweep its committed set's orphaned pages). A conditional
  * write takes effect halfway through its latency, as endive's simulator splits it: the request
  * reaches the store, the store checks the condition, and the reply comes back. A conditional
  * append that loses its race takes the store's failure latency in all.
  *
- * <p>A stream opened ({@code newStream}) binds its file's version at once, as the store reads it,
- * and costs nothing until it reads: a GET is a read that starts where no GET is open, of the bytes
- * from there to the object's end, as S3's stream opens a ranged GET at its first read
- * (TAIL_READS.md "Pricing"). A seek the open GET cannot read through (backward, or forward past
- * {@link #READ_THROUGH} bytes, as {@code S3InputStream} skips a short one) ends it, and the next
- * read is a GET from there. A whole read is one GET of every byte, as before ranges were priced;
- * a tail read, a GET of the bytes it asks for.
+ * <p>A stream opened ({@code newStream}) costs nothing and binds nothing until it reads: a GET is a
+ * read that starts where no GET is open, of the bytes from there to the end of the version it
+ * served, as S3's stream opens a ranged GET at its first read (TAIL_READS.md "Pricing"). A seek
+ * the open GET cannot read through (backward, or forward past {@link #READ_THROUGH} bytes, as
+ * {@code S3InputStream} skips a short one) ends it, and the next read is a GET from there. A GET
+ * that fails (a version gone, no object) takes a request's round trip. So a lookup after an open
+ * and before the first read is a HEAD, as on S3 (errata D23). A file is bound by a lookup, by a
+ * write that returned it, and by its first GET where the store's reads record their version
+ * ({@link #readsRecordVersion}: the profile's, S3's and Azure's, and the store's): then a lookup
+ * after the GET sends nothing, as the fork's S3 and ADLS files keep what a GET reported. A file
+ * made with its length (a manifest's) is bound from the start, as a client's file given a length
+ * sends no lookup.
  */
 public final class LatencyFileIO implements SupportsAtomicOperations, SupportsPrefixOperations {
   /** The longest forward seek an open GET reads through, as S3FileIO's default skip size. */
@@ -113,9 +118,21 @@ public final class LatencyFileIO implements SupportsAtomicOperations, SupportsPr
     return store.maxAppendBytes(location);
   }
 
+  /** The profile's and the store's: a GET binds its file only where both say reads record. */
+  @Override
+  public boolean readsRecordVersion() {
+    return profile.readsRecordVersion && store.readsRecordVersion();
+  }
+
   @Override
   public InputFile newInputFile(String location) {
     return new TimedInputFile(store.newInputFile(location));
+  }
+
+  /** A file whose length its caller knows (a manifest's): bound, so its lookup sends nothing. */
+  @Override
+  public InputFile newInputFile(String location, long length) {
+    return new TimedInputFile(store.newInputFile(location), true);
   }
 
   @Override
@@ -188,10 +205,16 @@ public final class LatencyFileIO implements SupportsAtomicOperations, SupportsPr
 
     @Override
     public SeekableInputStream newStream() {
-      SeekableInputStream stream = file.newStream();
-      bound = true;
+      SeekableInputStream stream;
+      try {
+        stream = file.newStream(); // the GET, in the store's OPEN mode
+      } catch (RuntimeException e) {
+        Requests.mine().gets++;
+        await(profile.readMs(0, random()));
+        throw e;
+      }
       boolean catalog = file.location().equals(catalogLocation);
-      return new TimedInputStream(stream, file.getLength(), catalog);
+      return new TimedInputStream(this, stream, catalog);
     }
 
     @Override
@@ -202,35 +225,46 @@ public final class LatencyFileIO implements SupportsAtomicOperations, SupportsPr
 
   /** A stream of one version, its GETs priced by the bytes each asks for (the class comment). */
   private final class TimedInputStream extends SeekableInputStream {
+    private final TimedInputFile file;
     private final SeekableInputStream in;
-    private final long length;
     private final boolean catalog;
     private long pos = 0;
     private boolean open = false;
 
-    TimedInputStream(SeekableInputStream in, long length, boolean catalog) {
+    TimedInputStream(TimedInputFile file, SeekableInputStream in, boolean catalog) {
+      this.file = file;
       this.in = in;
-      this.length = length;
       this.catalog = catalog;
     }
 
     /**
-     * A GET of the bytes from the position to the end, unless one is open: its latency drawn as
-     * a whole read's was (half a request, then the rest of one of its bytes).
+     * A GET of the bytes from the position to the end of the version it serves, unless one is
+     * open: its latency drawn as a whole read's was (half a request, then the rest of one of its
+     * bytes). It binds the file where the store's reads record their version.
      */
-    private void get() {
+    private void get() throws IOException {
       if (open) {
         return;
       }
       open = true;
-      long bytes = Math.max(0, length - pos);
       Requests requests = Requests.mine();
       requests.gets++;
+      SplittableRandom r = random();
+      long served;
+      try {
+        served = ((InMemoryAtomicFileIO.Served) in).servedLength();
+      } catch (IOException | RuntimeException e) {
+        await(profile.readMs(0, r));
+        throw e;
+      }
+      if (readsRecordVersion()) {
+        file.bound = true;
+      }
+      long bytes = Math.max(0, served - pos);
       requests.bytesRead += bytes;
       if (catalog) {
         requests.catalogBytesRead += bytes;
       }
-      SplittableRandom r = random();
       double half = profile.readMs(0, r) / 2;
       await(half + Math.max(0, profile.readMs(bytes, r) - half));
     }
