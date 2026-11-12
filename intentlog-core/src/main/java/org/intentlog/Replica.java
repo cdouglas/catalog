@@ -40,6 +40,9 @@ public final class Replica<S> {
   // runtime replayed it from one: a later read whose view continues it byte for byte replays only
   // the records after it (LogRuntime#replay).
   private final LogView view;
+  // The ids of the view's intention records, as replay decoded them, if a runtime replayed it: what
+  // a later fold looks a commit's record up in (LogRuntime#continued); null if unknown
+  private final IntentionIds intentionIds;
 
   public Replica(
       S state, CommittedSet committed, LogTail tail, long intentionRecords, UUID logId) {
@@ -56,6 +59,14 @@ public final class Replica<S> {
   Replica(
       S state, CommittedSet committed, LogTail tail, long intentionRecords, long recordsSinceGc,
       long bytesSinceGc, UUID logId, long checkpointBytes, LogView view) {
+    this(state, committed, tail, intentionRecords, recordsSinceGc, bytesSinceGc, logId,
+        checkpointBytes, view, null);
+  }
+
+  Replica(
+      S state, CommittedSet committed, LogTail tail, long intentionRecords, long recordsSinceGc,
+      long bytesSinceGc, UUID logId, long checkpointBytes, LogView view,
+      IntentionIds intentionIds) {
     this.state = state;
     this.committed = committed;
     this.tail = tail;
@@ -65,6 +76,7 @@ public final class Replica<S> {
     this.logId = logId;
     this.checkpointBytes = checkpointBytes;
     this.view = view;
+    this.intentionIds = intentionIds;
   }
 
   public S state() {
@@ -119,5 +131,10 @@ public final class Replica<S> {
    */
   public LogView view() {
     return view;
+  }
+
+  /** The ids of {@link #view}'s intention records, in log order; null if unknown. */
+  IntentionIds intentionIds() {
+    return intentionIds;
   }
 }

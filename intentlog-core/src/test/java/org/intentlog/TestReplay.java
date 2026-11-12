@@ -67,6 +67,35 @@ class TestReplay {
         .isEqualTo(Replay.Outcome.NOT_SEEN);
   }
 
+  /**
+   * Replay reports the ids of the intention records it replays, in log order, applied, rejected
+   * or skipped alike, and a fold's continue them: what a later fold looks a commit's record up in
+   * (errata D25).
+   */
+  @Test
+  void reportsTheIdsOfTheIntentionRecordsItReplays() {
+    UUID a = id(100);
+    UUID b = id(101);
+    UUID c = id(102);
+    UUID d = id(103);
+    List<byte[]> log = List.of(record(a, "k", 0), record(b, "k", 0),
+        LogEnvelope.encodeAdvanceHorizon(50), record(a, "k", 0), record(c, "j", 0));
+    Replay.Result<ToyMachine.Versions> result = Replay.replay(MACHINE, null, log, null);
+    IntentionIds ids = result.ids();
+    assertThat(ids.size()).isEqualTo(4).isEqualTo(result.intentionRecords());
+    assertThat(ids.contains(a)).isTrue();
+    assertThat(ids.contains(b)).as("rejected").isTrue();
+    assertThat(ids.contains(c)).isTrue();
+    assertThat(ids.contains(d)).isFalse();
+
+    List<byte[]> more = List.of(record(d, "i", 0));
+    Replay.Result<ToyMachine.Versions> folded = Replay.replayOnto(MACHINE, result.builder(),
+        result.committed(), null, result.intentionRecords(), more, null);
+    List<byte[]> whole = new ArrayList<>(log);
+    whole.addAll(more);
+    assertThat(ids.plus(folded.ids())).isEqualTo(Replay.replay(MACHINE, null, whole, null).ids());
+  }
+
   @Test
   void continuesFromACheckpoint() {
     UUID logId = id(1);

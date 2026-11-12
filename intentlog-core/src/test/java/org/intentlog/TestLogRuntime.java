@@ -180,6 +180,22 @@ class TestLogRuntime {
     assertThat(r.tail().continues(floor.tail())).isTrue();
   }
 
+  /**
+   * A fold's replica holds the ids of its view's intention records, as a whole replay of the view
+   * finds them (errata D25).
+   */
+  @Test
+  void aFoldKnowsTheIdsOfTheRecordsItsViewHolds() {
+    Replica<Map<String, Integer>> floor = created();
+    otherWriterBumps("a");
+    otherWriterBumps("b");
+    Replica<Map<String, Integer>> folded = runtime.read(floor);
+    Replica<Map<String, Integer>> whole = runtime.read();
+    assertThat(folded.view()).isNotNull();
+    assertThat(folded.intentionIds()).isNotNull().isEqualTo(whole.intentionIds());
+    assertThat(folded.intentionIds().size()).isEqualTo(folded.intentionRecords());
+  }
+
   @Test
   void aReadOfALogReplacedSinceTheFloorReplaysItWhole() {
     Replica<Map<String, Integer>> floor = created();

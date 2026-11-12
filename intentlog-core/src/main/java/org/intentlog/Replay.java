@@ -72,10 +72,12 @@ public final class Replay {
     private final Outcome outcome;
     private final String rejection;
     private final boolean seen;
+    private final IntentionIds ids;
 
     private Result(
         B builder, CommittedSet.Builder committed, UUID logId, long intentionRecords,
-        long recordsSinceGc, long bytesSinceGc, Outcome outcome, String rejection, boolean seen) {
+        long recordsSinceGc, long bytesSinceGc, Outcome outcome, String rejection, boolean seen,
+        IntentionIds ids) {
       this.builder = builder;
       this.committed = committed;
       this.logId = logId;
@@ -85,6 +87,15 @@ public final class Replay {
       this.outcome = outcome;
       this.rejection = rejection;
       this.seen = seen;
+      this.ids = ids;
+    }
+
+    /**
+     * The ids of the intention records replayed, in log order: applied, rejected or skipped (GC
+     * and PageOut records have none).
+     */
+    IntentionIds ids() {
+      return ids;
     }
 
     /** The state machine's builder, the records applied. */
@@ -212,6 +223,7 @@ public final class Replay {
     Outcome outcome = Outcome.NOT_SEEN;
     String rejection = null;
     boolean seen = false;
+    IntentionIds.Builder ids = new IntentionIds.Builder();
     for (byte[] bytes : records) {
       LogEnvelope.Record record = LogEnvelope.decodeRecord(bytes);
       if (record.isAdvanceHorizon()) {
@@ -228,6 +240,7 @@ public final class Replay {
       recordsSinceGc++;
       bytesSinceGc += bytes.length;
       UUID id = record.id();
+      ids.add(id);
       seen |= id.equals(watch);
       if (!committed.mayApply(id)) {
         // Already applied (a retry), or its id is at or below the committed set's floor, where
@@ -259,7 +272,7 @@ public final class Replay {
       }
     }
     return new Result<>(builder, committed, logId, intentionRecords, recordsSinceGc, bytesSinceGc,
-        outcome, rejection, seen);
+        outcome, rejection, seen, ids.build());
   }
 
   /** Why {@code intention} does not verify on {@code builder}; null if it cannot say. */

@@ -176,7 +176,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
       return replay(view, watch, logId, prior);
     }
     checkFollows(view, prior.tail());
-    if (watch != null && (prior.view() == null || holds(prior.view(), watch))) {
+    if (watch != null && (prior.view() == null || holds(prior, watch))) {
       return null;
     }
     Replay.Result<B> result =
@@ -854,7 +854,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     List<byte[]> records;
     Replica<S> replica;
     if (view.checkpoint().isPresent()) {
-      int from = continued(lost.view(), view, null);
+      int from = continued(lost, view, null);
       if (from < 0) {
         return null;
       }
@@ -931,20 +931,36 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     private final UUID logId;
     // The size of the checkpoint the replayed records follow
     private final long checkpointBytes;
+    // The ids of the view's intention records, or null if unknown (no view, or a fold onto a
+    // replica that has none)
+    private final IntentionIds ids;
     private Replica<S> replica;
 
+    /** The replay of the whole view {@code view}. */
     Replayed(LogView view, Replay.Result<B> result, UUID logId) {
+      this(view, result, logId, result.ids());
+    }
+
+    /** The replay of view {@code view}, whose intention records have ids {@code ids}. */
+    Replayed(LogView view, Replay.Result<B> result, UUID logId, IntentionIds ids) {
       this(view, view.tail(), view.checkpoint().map(c -> (long) c.length).orElse(0L), result,
-          logId);
+          logId, ids);
     }
 
     Replayed(
         LogView view, LogTail tail, long checkpointBytes, Replay.Result<B> result, UUID logId) {
+      this(view, tail, checkpointBytes, result, logId, null);
+    }
+
+    private Replayed(
+        LogView view, LogTail tail, long checkpointBytes, Replay.Result<B> result, UUID logId,
+        IntentionIds ids) {
       this.view = view;
       this.tail = tail;
       this.checkpointBytes = checkpointBytes;
       this.result = result;
       this.logId = logId;
+      this.ids = view != null ? ids : null;
     }
 
     B builder() {
@@ -968,7 +984,8 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
                 result.bytesSinceGc(),
                 result.logId() != null ? result.logId() : logId,
                 checkpointBytes,
-                view);
+                view,
+                ids);
       }
       return replica;
     }
@@ -1001,7 +1018,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
    */
   private Replayed replay(LogView view, UUID watch, UUID logId, Replica<S> prior) {
     checkJoint(view);
-    int from = prior == null ? -1 : continued(prior.view(), view, watch);
+    int from = prior == null ? -1 : continued(prior, view, watch);
     if (from < 0) {
       return replay(view, watch, logId);
     }
@@ -1010,7 +1027,9 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
         Replay.replayOnto(machine, machine.toBuilder(prior.state()), prior.committed().toBuilder(),
             prior.logId(), prior.intentionRecords(), prior.recordsSinceGc(), prior.bytesSinceGc(),
             records.subList(from, records.size()), watch, null);
-    Replayed result = new Replayed(view, folded, logId);
+    IntentionIds held = prior.intentionIds();
+    Replayed result =
+        new Replayed(view, folded, logId, held != null ? held.plus(folded.ids()) : null);
     CommitTrace.event(CommitTrace.Kind.REPLAYED, 1, records.size() - from);
     if (CHECK) {
       check(result, replayWhole(view, watch, logId));
@@ -1019,10 +1038,12 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
   }
 
   /**
-   * The number of records of {@code view} that {@code before} holds, if {@code view} continues it
-   * byte for byte and none of them is a record of {@code watch}; else -1.
+   * The number of records of {@code view} that {@code prior}'s view holds, if {@code view}
+   * continues it byte for byte and none of them is a record of {@code watch}; else -1. Whether one
+   * is, from the ids replay decoded where prior has them (errata D25), else by decoding each.
    */
-  private static int continued(LogView before, LogView view, UUID watch) {
+  private static int continued(Replica<?> prior, LogView view, UUID watch) {
+    LogView before = prior.view();
     if (before == null) {
       return -1;
     }
@@ -1036,18 +1057,29 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
       return -1;
     }
     for (int i = 0; i < held.size(); i++) {
-      byte[] record = held.get(i);
-      if (!Arrays.equals(record, records.get(i))) {
+      if (!Arrays.equals(held.get(i), records.get(i))) {
         return -1;
       }
-      if (watch != null) {
-        LogEnvelope.Record decoded = LogEnvelope.decodeRecord(record);
-        if (decoded.isIntention() && decoded.id().equals(watch)) {
-          return -1;
-        }
-      }
+    }
+    if (watch != null && holds(prior, watch)) {
+      return -1;
     }
     return held.size();
+  }
+
+  /** Whether {@code prior}'s view holds a record of {@code watch}. */
+  private static boolean holds(Replica<?> prior, UUID watch) {
+    IntentionIds ids = prior.intentionIds();
+    if (ids == null) {
+      return holds(prior.view(), watch);
+    }
+    boolean holds = ids.contains(watch);
+    if (CHECK && holds != holds(prior.view(), watch)) {
+      throw new IllegalStateException(
+          "A replica's intention ids say it holds a record of " + watch + ": " + holds
+              + ", its view's records say " + !holds);
+    }
+    return holds;
   }
 
   /** Fails unless a fold replayed what the replay of the whole view did. */
@@ -1063,6 +1095,9 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     }
     if (a.intentionRecords() != b.intentionRecords()) {
       differ.add("records");
+    }
+    if (a.intentionIds() != null && !a.intentionIds().equals(b.intentionIds())) {
+      differ.add("intention ids");
     }
     if (folded.result.outcome() != whole.result.outcome()
         || folded.result.seen() != whole.result.seen()) {
