@@ -39,13 +39,16 @@ gigabytes() {
 }
 
 # limit <cmd> <args...>: the container's memory limit, unless MEM sets it: each job it runs at
-# once (JOBS, else a round's eleven or ROUND_JOBS, a calibration's mutants and its unmutated run,
-# one test or shrink) with its heap and 2g for the JVM's other memory and Maven's, and 2g
+# once (JOBS, else a round's jobs (ROUND_JOBS, or all of ce-fuzz's), a calibration's mutants
+# and its unmutated run, one test or shrink) with its heap and 2g for the JVM's other memory
+# and Maven's, and 2g
 limit() {
   if [ -n "${MEM:-}" ]; then echo "$MEM"; return; fi
   local cmd=$1 slots heap=${HEAP:-4g}
   case $cmd in
-    round) slots=$(echo ${ROUND_JOBS:-1 2 3 4 5 6 7 8 9 10} | wc -w) ;;
+    # a round's jobs as the image's driver lists them, so the limit counts a job it adds
+    round) slots=$(echo ${ROUND_JOBS:-$(grep -m1 '^ROUND_JOBS=' "$HERE/ctx/ce-fuzz" | cut -d'"' -f2)} \
+      | wc -w) ;;
     calib) slots=$(( $(cd "$HERE/ctx" && bash -c '. mutants/'"$5"'.sh && echo $MUTANTS' | wc -w) + 1 )) ;;
     shrink) slots=1; heap=${SHRINK_HEAP:-16g} ;;
     *) slots=1 ;;
