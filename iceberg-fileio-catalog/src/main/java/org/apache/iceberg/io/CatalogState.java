@@ -545,6 +545,11 @@ public class CatalogState {
     // changes it here (conflictState), which copies it first (ownedStates)
     private final Map<Integer, EncodingState> conflictStates = new HashMap<>();
     private final Set<Integer> ownedStates = new HashSet<>();
+    // Whether the lookups may not match the entries. Every change keeps them but addNamespace's (a
+    // checkpoint's namespaces arrive in any order, so their paths cannot be known as they do), so
+    // build rebuilds them only after one: a builder continuing a state does not rebuild every
+    // table's identifier for each record it replays
+    private boolean lookupsStale = false;
 
     Builder() {
       // The root namespace is an ordinary row with id 0, so it is versioned
@@ -577,6 +582,7 @@ public class CatalogState {
       // Lookup is built by rebuildLookups() after all entries are loaded.
       // During checkpoint decoding, namespaces may arrive in arbitrary order
       // (HashMap iteration), so the full ancestor chain may not be available yet.
+      lookupsStale = true;
       return this;
     }
 
@@ -586,17 +592,41 @@ public class CatalogState {
      */
     public Builder rebuildLookups() {
       namespaceLookup.clear();
+      namespaceLookup.putAll(namespaceLookupOfEntries());
+      tableLookup.clear();
+      tableLookup.putAll(tableLookupOfEntries());
+      lookupsStale = false;
+      return this;
+    }
+
+    private Map<Namespace, Integer> namespaceLookupOfEntries() {
+      Map<Namespace, Integer> lookup = new HashMap<>();
       for (Integer id : namespaceById.keySet()) {
         if (id != ROOT_ID) {  // the root is not a namespace callers can name
-          namespaceLookup.put(buildNamespace(id), id);
+          lookup.put(buildNamespace(id), id);
         }
       }
-      tableLookup.clear();
+      return lookup;
+    }
+
+    private Map<TableIdentifier, Integer> tableLookupOfEntries() {
+      Map<TableIdentifier, Integer> lookup = new HashMap<>();
       for (Map.Entry<Integer, TblEntry> entry : tableById.entrySet()) {
         Namespace ns = buildNamespace(entry.getValue().namespaceId);
-        tableLookup.put(TableIdentifier.of(ns, entry.getValue().name), entry.getKey());
+        lookup.put(TableIdentifier.of(ns, entry.getValue().name), entry.getKey());
       }
-      return this;
+      return lookup;
+    }
+
+    /** Fails unless the lookups this builder kept are those its entries make. */
+    private void checkLookups() {
+      if (!namespaceLookup.equals(namespaceLookupOfEntries())
+          || !tableLookup.equals(tableLookupOfEntries())) {
+        throw new AssertionError(String.format(
+            "The lookups a builder kept differ from its entries': namespaces %s, expected %s;"
+                + " tables %s, expected %s",
+            namespaceLookup, namespaceLookupOfEntries(), tableLookup, tableLookupOfEntries()));
+      }
     }
 
     public Builder removeNamespace(int id) {
@@ -839,6 +869,8 @@ public class CatalogState {
       return null;
     }
 
+    // The replay check (fileio.catalog.replay.check, which surefire sets): a pool entry restated,
+    // and lookups a builder kept that its entries would not make, fail
     private static final boolean POOL_CHECK = Boolean.getBoolean("fileio.catalog.replay.check");
 
     /** Whether two manifest list entries agree in every field. */
@@ -1333,8 +1365,11 @@ public class CatalogState {
 
     @Override
     public CatalogState build() {
-      // Ensure all lookups are complete before building immutable file
-      rebuildLookups();
+      if (lookupsStale) {
+        rebuildLookups();
+      } else if (POOL_CHECK) {
+        checkLookups();
+      }
       CatalogState state = new CatalogState(this);
       // The states built now share the encoding states: a later change copies them again
       ownedStates.clear();
