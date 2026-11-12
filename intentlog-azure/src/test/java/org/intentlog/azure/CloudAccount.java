@@ -18,6 +18,7 @@
  */
 package org.intentlog.azure;
 
+import com.azure.core.http.policy.HttpPipelinePolicy;
 import com.azure.storage.blob.BlobContainerClient;
 import com.azure.storage.blob.BlobContainerClientBuilder;
 import com.azure.storage.blob.BlobUrlParts;
@@ -25,6 +26,9 @@ import com.azure.storage.blob.models.BlobItem;
 import com.azure.storage.blob.models.BlobListDetails;
 import com.azure.storage.blob.models.ListBlobsOptions;
 import com.azure.storage.common.StorageSharedKeyCredential;
+import com.azure.storage.common.policy.RequestRetryOptions;
+import com.azure.storage.common.policy.RetryPolicyType;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
@@ -58,6 +62,18 @@ final class CloudAccount {
 
   private static StorageSharedKeyCredential credential() {
     return new StorageSharedKeyCredential(BlobUrlParts.parse(URL).getAccountName(), KEY);
+  }
+
+  /** A client of the account's container, one try per request, through {@code policies}. */
+  static BlobContainerClient container(HttpPipelinePolicy... policies) {
+    BlobContainerClientBuilder builder = new BlobContainerClientBuilder().endpoint(URL)
+        .credential(credential())
+        .retryOptions(
+            new RequestRetryOptions(RetryPolicyType.FIXED, 1, (Duration) null, null, null, null));
+    for (HttpPipelinePolicy policy : policies) {
+      builder.addPolicy(policy);
+    }
+    return builder.buildClient();
   }
 
   /** The store on the account: one try per request. */

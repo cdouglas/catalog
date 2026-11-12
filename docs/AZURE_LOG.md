@@ -681,16 +681,19 @@ As every provider is tested (LOG.md "Testing a provider"), plus a model:
    fuzzers don't draw this log yet.
 
 5. **The cloud** (2026-11-11 UTC, from the laptop, on the spike's account: a hierarchical
-   namespace, westus). Both pass:
+   namespace, westus). All pass:
    - `AzureAppendBlobLogIT`: the contract in its three variants, 43 tests run (5 skipped for
      capabilities the log lacks).
    - `AzureCommitProtocolIT`: 25 tries of the fuzzer, twice, with real requests through
      `RecordingStore`. It injects the in-memory store's faults around real requests, and
      records what landed for the oracles. In the second run, 14 tries moved the log on (35
      real pads, up to 5 segments), with one to three instances of the log.
+   - `AzureAppendBlobStoreIT` (2026-11-12): a GET from a blob's length is `416`
+     `InvalidRange` there (Azurite: `206`, no bytes), from the byte before a `206` of one byte,
+     and the store's read from a blob's end one request.
 
    Each run writes under `intentlog-it/<UTC>-<random>` and deletes it afterwards. They run only
-   when asked (`-Dtest='AzureAppendBlobLogIT*,AzureCommitProtocolIT'`), with
+   when asked (`-Dtest='AzureAppendBlobLogIT*,AzureCommitProtocolIT,AzureAppendBlobStoreIT'`), with
    `AZURE_LOG_IT_CONTAINER_URL` and `AZURE_STORAGE_KEY` set.
 
 ## Measurements
@@ -719,7 +722,7 @@ deploy:
 | Q3 | How long do appends stall during a rotation at 32–64 writers, and does the fill fence hold there? It was probed from the laptop, with 16 writers and 1 KiB blocks | the spike with a small segment limit and the rotation protocol, from the VM |
 | Q4 | Where does a blob's rate stop growing? Blind appends had not stopped at 64 writers (3,113 landed/s, the client's CPU share 7.4%) | the spike at 128 and 256 writers, from two VMs, with rotation (Q3) so that no level fills its blob |
 | Q5 | Do the rates hold at 64 KiB and across repeated runs, and on an account without a hierarchical namespace? | `--bytes 4096,65536 --reps 3`; a second account |
-| Q6 | Does Azurite support Seal and `x-ms-blob-condition-maxsize`? **Answered 2026-11-10: yes, both**, but it is no model of an account with a hierarchical namespace: it seals, and its leases stop appends. It also answers a read that starts exactly at a blob's length with `206` and no bytes, where Azure answers `416` (`AzureAppendBlobStore` handles both) | `AzureSealProbe` on Azurite 3.37.0; `TestAzureAppendBlobStore` |
+| Q6 | Does Azurite support Seal and `x-ms-blob-condition-maxsize`? **Answered 2026-11-10: yes, both**, but it is no model of an account with a hierarchical namespace: it seals, and its leases stop appends. It also answers a read that starts exactly at a blob's length with `206` and no bytes, where Azure answers `416` `InvalidRange` (`AzureAppendBlobStore` handles both, and reads from the byte before, so a read from the end is one request on either) | `AzureSealProbe` on Azurite 3.37.0; `TestAzureAppendBlobStore`; on the account, `AzureAppendBlobStoreIT` (2026-11-12) |
 
 ## Later
 
