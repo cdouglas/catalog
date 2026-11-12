@@ -268,9 +268,10 @@ public class LogCatalog extends BaseMetastoreCatalog
       if (!read.state().containsTable(identifier)) {
         return false;
       }
-      // The metadata a purge deletes the files of: the version this drop removes.
-      TableMetadata dropped = purge ? newTableOps(identifier, read).current() : null;
+      TableMetadata dropped;
       try {
+        // The metadata a purge deletes the files of: the version this drop removes.
+        dropped = purge ? tableOpsAsRead(identifier, read).current() : null;
         new CatalogMutation(read).dropTable(identifier).commit(log);
       } catch (NoSuchTableException e) {
         return false;
@@ -342,10 +343,10 @@ public class LogCatalog extends BaseMetastoreCatalog
       if (read.state().isInlineTable(tblId)) {
         return true;
       }
-      FileIOTableOperations ops = newTableOps(identifier, read);
-      TableMetadata current = ops.current();
       CatalogMutation mut = new CatalogMutation(read);
       try {
+        FileIOTableOperations ops = tableOpsAsRead(identifier, read);
+        TableMetadata current = ops.current();
         if (!ops.stageUpdate(mut, current, current, false)) {
           return false;
         }
@@ -425,6 +426,36 @@ public class LogCatalog extends BaseMetastoreCatalog
             : new FileIOTableOperations(tableIdentifier, log, io, inline, inlineSnapshots, read);
     ops.pinsCommitOnce = pinsCommitOnce;
     return ops;
+  }
+
+  /**
+   * Operations on {@code identifier} as {@code read} holds it, for an operation staged on {@code
+   * read}. If the metadata file {@code read}'s pointer names is gone, deleted by a drop with purge
+   * or a commit that deletes old metadata files landing since {@code read} (Bug 87), the table has
+   * changed since the read, as a conflict of the operation's record would say:
+   * NoSuchTableException if a fresh read finds it dropped, else CommitFailedException. Throws the
+   * NotFoundException if the fresh read names the same file, which is lost.
+   */
+  private FileIOTableOperations tableOpsAsRead(
+      TableIdentifier identifier, Replica<CatalogState> read) {
+    try {
+      return newTableOps(identifier, read);
+    } catch (org.apache.iceberg.exceptions.NotFoundException missing) {
+      String file = read.state().location(identifier);
+      if (file == null) {
+        // Not a pointer's metadata file: an inline table's (a collected snapshot page's)
+        throw missing;
+      }
+      CatalogState now = log.read().state();
+      if (!now.containsTable(identifier)) {
+        throw new NoSuchTableException("Table does not exist: %s", identifier);
+      }
+      if (file.equals(now.location(identifier))) {
+        throw missing;
+      }
+      throw new CommitFailedException(
+          "Cannot commit: table %s changed since it was read", identifier);
+    }
   }
 
   /**
@@ -2164,7 +2195,7 @@ public class LogCatalog extends BaseMetastoreCatalog
         written.put(readTable, read.getValue());
         continue;
       }
-      TableMetadata now = newTableOps(readTable, current).current();
+      TableMetadata now = tableOpsAsRead(readTable, current).current();
       if (!BaseCatalogTransaction.unchangedSinceRead(ref, read.getValue(), now)) {
         throw new ValidationException(
             "SERIALIZABLE isolation violation: Found table metadata updates to table '%s' after it was read on branch '%s'",
@@ -2175,7 +2206,7 @@ public class LogCatalog extends BaseMetastoreCatalog
     for (TableCommit commit : commits) {
       final TableIdentifier tableId = commit.identifier();
       // use fixed catalog snapshot for validation
-      FileIOTableOperations ops = newTableOps(tableId, current);
+      FileIOTableOperations ops = tableOpsAsRead(tableId, current);
       final TableMetadata currentMetadata = ops.current();
       if (currentMetadata == null) {
         throw new NoSuchTableException("Table does not exist: %s", tableId);

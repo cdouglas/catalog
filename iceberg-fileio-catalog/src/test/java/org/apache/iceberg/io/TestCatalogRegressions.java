@@ -5419,4 +5419,67 @@ public class TestCatalogRegressions {
           .hasMessageContaining(file);
     }
   }
+
+  /**
+   * Bug 87: an operation that loads a table from the read it stages on reported a drop with purge
+   * that landed after the read as a missing file. A drop with purge loads the version it drops, a
+   * reinline the table it restates, and a catalog transaction's commit each table it validates, all
+   * from the read the record is staged on; a drop with purge landing between the read and the load
+   * deleted the metadata file the read named, and the operation threw NotFoundException. Each now
+   * tells a superseded file from a lost one as a load does (Bug 86) and goes on as for any change
+   * since its read: the drop and the reinline read again, and the transaction fails.
+   */
+  @Nested
+  class StagedReadRacingAPurge {
+    private final TableIdentifier t = TableIdentifier.of("ns", "t");
+    private final BeforeMetadataRead io = new BeforeMetadataRead();
+
+    private LogCatalog catalog(LocalCatalogMode mode) {
+      return mode.catalog(io, "mem:///warehouse", "c", Map.of());
+    }
+
+    private void create(LocalCatalogMode mode) {
+      LogCatalog writer = catalog(mode);
+      writer.createNamespace(Namespace.of("ns"));
+      writer.createTable(t, intSchema).newFastAppend().appendFile(file("a")).commit();
+    }
+
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "CAS", "COMPACT", "MEMLOG"})
+    void aPurgeFindsTheTableDropped(LocalCatalogMode mode) {
+      create(mode);
+      LogCatalog dropper = catalog(mode);
+      io.before.set(() -> assertThat(catalog(mode).dropTable(t, true)).isTrue());
+
+      assertThat(dropper.dropTable(t, true)).isFalse();
+      assertThat(io.before.get()).isNull();
+    }
+
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND_TM", "CAS_TM", "COMPACT_TM", "MEMLOG_TM"})
+    void aReinlineFindsTheTableDropped(LocalCatalogMode mode) {
+      LogCatalog writer = mode.catalog(io, "mem:///warehouse", "c",
+          Map.of("fileio.catalog.inline.max.update.size", "1"));
+      writer.createNamespace(Namespace.of("ns"));
+      writer.createTable(t, intSchema);
+      LogCatalog reinliner = catalog(mode);
+      io.before.set(() -> assertThat(catalog(mode).dropTable(t, true)).isTrue());
+
+      assertThatThrownBy(() -> reinliner.reinline(t)).isInstanceOf(NoSuchTableException.class);
+      assertThat(io.before.get()).isNull();
+    }
+
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "CAS", "COMPACT", "MEMLOG"})
+    void aTransactionFindsTheTableDropped(LocalCatalogMode mode) {
+      create(mode);
+      org.apache.iceberg.catalog.CatalogTransaction txn = catalog(mode).createTransaction(
+          org.apache.iceberg.catalog.CatalogTransaction.IsolationLevel.SNAPSHOT);
+      txn.asCatalog().loadTable(t).newFastAppend().appendFile(file("b")).commit();
+      io.before.set(() -> assertThat(catalog(mode).dropTable(t, true)).isTrue());
+
+      assertThatThrownBy(txn::commitTransaction).isInstanceOf(NoSuchTableException.class);
+      assertThat(io.before.get()).isNull();
+    }
+  }
 }
