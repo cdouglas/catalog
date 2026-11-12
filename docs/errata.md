@@ -209,11 +209,15 @@ it.
 **Done on shared logs** (step 3, 2026-11-10): positions in the SPI (S4,
 resolved).
 
-**Remaining:** the models (step 4: reads that splice or skip, the same oracle,
-a bug switch per check).
+**Done in the models** (step 4, 2026-11-10; spec/tla/README.md "Tail
+reads"): incarnations, splices and tail reads in `CatalogCommit.tla` and gaps
+in `SharedLogCommit.tla`, under the invariant `NoUnheldState`, with a switch
+per check (`lengthonly`, `notrailer`, `probeinc`, `nojoint`), each breaking a
+property.
 
-**Trigger to revisit:** step 4 of [TAIL_READS.md](TAIL_READS.md) (approved
-2026-11-10), before tail reads (D15).
+**Resolved 2026-11-10.** What stays the store's or the provider's word: that a
+shared log's positions are true (S4), and that a catalog's FileIO leaves the
+stores' accelerated read paths off (T6).
 
 ## Deferred Functionality
 
@@ -347,8 +351,8 @@ chosen encoding.
 
 ### D14. `max.append.count` and the race backoff are fixed numbers, not per store
 
-`fileio.catalog.max.append.count` defaults to 100 and
-`fileio.catalog.race.retry.min-wait-ms` to 100 ms, both from one store's
+`fileio.catalog.max.append.count` defaulted to 100 (1,000 since 2026-11-10,
+below) and `fileio.catalog.race.retry.min-wait-ms` to 100 ms, both from one store's
 latencies as the contention benchmark injects them (endive's S3 Express
 profile: a conditional append takes about 21 ms to land and 23 ms to lose;
 design.md §"Choosing append vs CAS"). The best values depend on the
@@ -470,9 +474,26 @@ a lookup and a GET from 20 bytes before the end, and a client's loads,
 refreshes and commit-loop reads read only what follows its replica. Measured
 (step 6, catalog-bench `tr6`, `s3x-2026-11`): a merge append's p50 fell
 48-72% inline ML and 16-37% inline TM across E1 at 300 tables and E3 at 1,000
-and 7,200 snapshots, and the catalog bytes it reads fell 8-32x. Open: at E1's
-1,000 tables, past the knee, 0.3-2.6% of merge appends exhaust their retries
-with tail reads (TAIL_READS.md "Open questions").
+and 7,200 snapshots, and the catalog bytes it reads fell 8-32x. At E1's 1,000
+tables, past the knee, 0.3-2.6% of merge appends exhausted their retries with
+tail reads: writers that learned the exact record count compacted together
+and lost to each other, which compaction after the commit (step 6b) answered.
+Also measured on S3 Standard, where a longer object is now read whole at once
+(0a00685; TAIL_READS.md "Measured on S3 Standard").
+
+Still open:
+- Every read is a lookup (a HEAD) and a GET on S3, ADLS and GCS, which the
+  latency model does not charge (D23); step 7 makes it one GET where the
+  store's reply reports the version and length it read.
+- Lost races at high load (TAIL_READS.md "Open questions"). Catalog-bench's
+  campaign `p4r` (fileio main after step 6b) committed fewer merge appends a
+  second than `e1-d20` (fileio e505a0f) at E1's largest pointer points on S3
+  Express. At those points it lost several times the appends a commit, from the
+  run's first minute, and landed almost none of the compactions its writers
+  began. With tail reads off, S3 Standard's pointer points at 64 and 128
+  workers stay below `e1-d20` too (campaign `tr6s`). The cause is open: the
+  next measurement is an A/B of `read_tail` and `compact.after.commit` on S3
+  Express.
 
 ### D16. Replay rewrites the whole committed set, and every checkpoint carries it
 
@@ -521,8 +542,9 @@ a record applied that was not, and drop it. The fixes, in order:
   records/s in batches of 64 and 19,968 one record at a time (campaign
   `i5-fold`, lab page `ingest-ladder`), against 30,143 with the ids
   discarded. The checkpoint still carries the whole set.
-- **Page out the old ids** (designed in
-  [COMMITTED_PAGING.md](COMMITTED_PAGING.md), not built). The horizon splits in
+- **Page out the old ids** (done: [COMMITTED_PAGING.md](COMMITTED_PAGING.md)
+  stages 1-4, built 2026-11-04, on main and calibrated on havoc 2026-11-05,
+  admission window A 5 minutes and page threshold T 1 MiB by default). The horizon splits in
   two: a floor below which replay admits no record, and the horizon below which
   lookups are unknown. The ids between them move to immutable pages, which the
   checkpoint names by node and digest. A `PageOut` record seals the oldest block of the set
@@ -541,9 +563,13 @@ a record applied that was not, and drop it. The fixes, in order:
   answers past the horizon. With paging, only the admission window sizes the
   checkpoint, and the retention could grow again cheaply.
 
-**Trigger to revisit:** a commit rate past about 50 a second at the default
-retention (the set passes 1 MB there, and grows linearly with the rate), or the
-ingest and materialization service.
+**Resolved 2026-11-05** by the first two fixes. At 1,000 records a second's
+30-minute steady state (ingest campaign `i11-paging`, a compaction every 100
+records), paging holds the inline set at the ids inside A: 3.4 MB at the
+median compaction against 19.8 MB kept whole, and the checkpoint at 4.1 MB
+against 20.4 MB. Still open: deriving the retention and A per store (the third
+fix; COMMITTED_PAGING.md "Open questions"), and the stamps D21 leaves
+unbounded.
 
 ### D17. A snapshot expiry never merges, so it starves under contention
 
@@ -600,17 +626,24 @@ The options:
   older ones, with their lists, in immutable objects the checkpoint points
   to, as D16 proposes for the committed set. A load fetches them only for
   history or time travel.
-- **Designed** in [SNAPSHOT_PAGING.md](SNAPSHOT_PAGING.md) (not built):
-  replay applies snapshot updates and expiry natively on a head without
-  history, lists by ordinal and as deltas, and old snapshots sealed into pages
-  by sequence number, which replay never reads.
+- **Built** as [SNAPSHOT_PAGING.md](SNAPSHOT_PAGING.md) steps 1-5
+  (2026-11-05/06, on main; on by default since step 5, block 256 and window
+  1,024): replay applies snapshot updates and expiry natively on a head without
+  history, lists by ordinal and as deltas, lazy lists (fork), and old
+  snapshots sealed into pages by sequence number, which replay never reads.
 - **Evict by size**: eviction is by update size only
   (`fileio.catalog.inline.max.update.size`), so a table whose deltas fit
   stays inline however large its lists grow. A per-table checkpoint-size
-  threshold would evict it to pointer mode.
+  threshold would evict it to pointer mode. Deferred (SNAPSHOT_PAGING.md
+  step 6, cold-table eviction).
 
-**Trigger to revisit:** a table that keeps thousands of snapshots without
-merging manifests, or whose expiries starve (D17).
+**Resolved 2026-11-06** by the first four options (SNAPSHOT_PAGING.md
+"Sizes"). An ML table of merge appends at E3's 7,200 snapshots holds 0.36 MB
+in the root, against 2.38 MB before, and 1.07 MB in 24 pages. On S3 Express a
+merge append's p50 went from 904 to 109 ms (catalog-bench e3-d20 against
+e3-sp4), and it reads no pages. Still open: a fast-append table's head list
+names every manifest it has, which only a merge shrinks; and the paged root
+keeps about 18 B a sealed snapshot.
 
 ### D19. Compaction is due by the whole object's size, so a large checkpoint compacts on every commit
 
@@ -667,8 +700,13 @@ bytes it had (R0.2, `fileio.catalog.checkpoint.memoize`). The checkpoint is
 still unbounded, and every compaction and fresh read still moves it whole:
 paging (R2) is the fix.
 
-**Trigger to revisit:** R2 of docs/CHECKPOINT_PLAN.md (paging), and D14's
-cost-based policy.
+**Resolved 2026-11-10.** The checkpoint is bounded by paging: the committed
+set's (D16) and old snapshots' (D18). At E3's 7,200 snapshots a table's root
+is 0.36 MB, against 2.38 MB before. A warm reader reads only the records after
+its replica (D15, tail reads). A compaction runs after its writer's commit, at
+a point it draws past the limits, instead of the next commit replacing the
+object (TAIL_READS.md "Compaction after the commit"). What remains is D14's
+cost-based policy: the limits are still fixed numbers.
 
 ### D20. A commit reads the whole catalog object four times (perf bug)
 
@@ -763,7 +801,14 @@ whole (D15's ranged `readAfter`, or a conditional GET the FileIO API does
 not have), and 1 reads the whole object even for a client that holds a
 replica.
 
-**Trigger to revisit:** D15 (2 and a warm client's 1).
+**Resolved 2026-11-10** (2 and a warm client's 1, by D15's tail reads). Every
+load and refresh through `CatalogLog` reads only what follows the replica its
+catalog holds (`LogRuntime.read(floor)`). So a merge append's two reads, its
+load and the refresh in `apply`, fetch the records since, not the object. At
+E1's 300 inline-ML tables on S3 Express (catalog-bench `tr6`) a merge append
+read 1.55 MiB of the catalog, against 12.5 with whole reads, in 2.2 GETs. The
+two reads stay: Iceberg's refresh contract asks for both. Each is still a
+HEAD and a GET on a real store (D23; TAIL_READS.md step 7).
 
 ### D21. A commit id's timestamp has no upper bound
 
