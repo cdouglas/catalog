@@ -756,7 +756,10 @@ public final class AppendBlobLog implements SharedLog {
         }
       }
       long end = b.length();
-      boolean closed = seg.closed() || padded || b.blocks() >= store.maxBlocks();
+      // a segment at its limit is closed though a read from its end sees no pad: only a pad
+      // reaches the limit, since every writer's block stops at the writer limit
+      boolean closed = seg.closed() || padded || end >= seg.limit()
+          || b.blocks() >= store.maxBlocks();
       if (!closed) {
         return walked(records, positions, seg.base() + end, seg.ordinal(), bytes);
       }

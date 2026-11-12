@@ -156,6 +156,30 @@ class TestAppendBlobLog {
     assertThat(view.records()).containsExactlyElementsOf(after);
   }
 
+  /**
+   * A reader whose tail is the end of a segment a pad closed, read before the head named a
+   * successor, reads the records the successor took once one does: the segment is closed at its
+   * limit, which no writer's block reaches, though the read from its end sees no pad.
+   */
+  @Test
+  void aReadFromTheEndOfAPaddedSegmentFollowsTheLogOn() { // AZ2
+    AppendBlobLog writer = log(300);
+    AppendBlobLog reader = log(300);
+    create(writer);
+    writer.append(record(), null);
+    // a writer closed segment 0 with a pad and stopped before it named a successor
+    Segment first = head().first();
+    long length = store.properties(first.name()).length();
+    store.appendBlock(first.name(), Frames.pad(first.limit() - length, first.ordinal()),
+        first.limit(), length);
+    LogView read = reader.read();
+    assertThat(head().segments()).as("no successor yet").hasSize(1);
+    byte[] next = record();
+    writer.append(next, null);
+    assertThat(head().segments()).as("the writer moved the log on").hasSize(2);
+    assertThat(reader.readAfter(read.tail()).records()).containsExactly(next);
+  }
+
   @Test
   void aWriterWhoseSegmentWasSweptNeverCreatesItAgain() { // AZ4
     AppendBlobLog stale = log(300);
