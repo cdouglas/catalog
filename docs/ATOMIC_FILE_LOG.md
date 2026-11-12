@@ -106,12 +106,12 @@ reads format 2, unchecked, for captured logs.
 | `SharedLog` | On the object |
 |---|---|
 | `capabilities()` | appends if the FileIO does (`supportsAppend()`), conditionally; replaces (fused); no separate checkpoints; reads its own writes |
-| `read()` | the whole object, bound to the version it found |
+| `read()` | the whole object, bound to the version it found: one GET where the store's reads record their version (`readsRecordVersion()`: S3, ADLS), else a lookup and a GET (GCS) |
 | `probe()` | the object's version and length, without reading it; a tail that does not exist if the object does not |
 | `append(record, tail)` | appends the record's frame at the tail's length, conditioned on its version (`Strategy.APPEND`), naming that version's incarnation: from the view this log read or wrote at the tail, or, for a tail a probe found, from that version's last trailer, read pinned to it (a version superseded since fails as a lost race, unsent). An unconditional append is refused |
 | `replace(tail, checkpoint, records)` | writes `[header][checkpoint][records]`, framed with an incarnation drawn for the write, as the whole object, conditioned on the tail's version, or on the object's absence if the tail does not exist (`Strategy.CAS`) |
 | `readThrough(receipt)` | the object the write left, so its record is among the records (P3): without a read when the write says what it holds (a replace holds what it wrote; an append conditioned on a tail whose bytes this log read or wrote holds those bytes and the record), else by reading the version the write wrote, or the live object if a later write superseded it |
-| `readAfter(tail)` | from a tail whose bytes this log read or wrote (incarnation X, length N): a lookup of the object's version V and length L, then a GET of V's bytes from N - 20 (pinned, step 0). If those 20 bytes are the trailer of the frame the tail ends with, V is X extended, and the view is the tail's checkpoint and records (the same arrays) and the frames after N, each checked; else (another incarnation, or a shorter object) V read whole. From a tail a probe found, a whole read ([TAIL_READS.md](TAIL_READS.md) "Reads") |
+| `readAfter(tail)` | from a tail whose bytes this log read or wrote (incarnation X, length N): a GET of the bytes of the object's version V from N - 20 to its end, as one request where the store's reads record their version, else after a lookup of V and its length L (pinned, step 0). If those 20 bytes are the trailer of the frame the tail ends with, V is X extended, and the view is the tail's checkpoint and records (the same arrays) and the frames after N, each checked; else (another incarnation, or a shorter object) V whole: its bytes before N - 20 and those the GET read, or V read whole if the GET found none. From a tail a probe found, a whole read ([TAIL_READS.md](TAIL_READS.md) "Reads") |
 | `putCheckpoint`, `trim` | not supported (a replace checkpoints) |
 
 **Tails.** A tail is the object's version (an ETag or generation) and length.
@@ -140,12 +140,18 @@ position). A read through such an append, from a tail whose bytes the log read
 or wrote, rests on it: the object is those bytes and the record, known without a
 read (errata D20).
 
-**Reads.** A read is of one version: the lookup that binds its tail chooses
-it, and the GET asks for it (S3's and ADLS's `If-Match`, GCS's
-`if-generation-match`): the fork's read contract (`SupportsAtomicOperations`,
-whose contract suite has read cases). A write that lands between the lookup
-and the GET fails the GET as stale (`StaleReadException`) rather than return
-part of another object, and `read()` reads again (up to `READ_ATTEMPTS`). A
+**Reads.** A read is of one version: the fork's read contract
+(`SupportsAtomicOperations`, whose contract suite has read cases). Where the
+store's reads record the version they find (`readsRecordVersion()`: S3,
+ADLS), the read is first: one GET, whose response reports the version and the
+object's length, which the file keeps, and every later request of the read
+asks for that version (`If-Match`). Elsewhere (GCS, whose reads record none,
+or `fileio.catalog.read.lookup`) the lookup that binds its tail chooses the
+version, and the GET asks for it (GCS's `if-generation-match`). A write that
+lands between two requests of a read fails the later one as stale
+(`StaleReadException`) rather than return part of another object, and
+`read()` reads again (up to `READ_ATTEMPTS`). A page of the log is written
+once, so its read is one GET on any store. A
 store that breaks that contract, serving the live version or the rest of one
 from a reopened stream, serves bytes the frames' checks reject (unless the
 object it served is the same incarnation, whose bytes up to the length read are

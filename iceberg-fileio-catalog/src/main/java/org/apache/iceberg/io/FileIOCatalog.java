@@ -91,6 +91,7 @@ public class FileIOCatalog extends LogCatalog {
       open(AzureLogs.open(properties), fileIO);
       return;
     }
-    open(new AtomicFileLog(fileIO, catalogLocation), fileIO);
+    open(new AtomicFileLog(fileIO, catalogLocation, LogCatalogProperties.readLookup(properties)),
+        fileIO);
   }
 }

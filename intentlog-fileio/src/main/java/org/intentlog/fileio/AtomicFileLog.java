@@ -91,8 +91,13 @@ import org.intentlog.wire.ProtoWire;
  * no version recurs); a read of the object between the lookup that bound it and the append read
  * that version. An append from a tail that only {@link #probe} found reads the object back.
  *
- * <p>A read is of one version (SupportsAtomicOperations): the lookup that binds it chooses the
- * version, and the GET asks for it. A write that lands between them fails the GET as stale ({@link
+ * <p>A read is of one version (SupportsAtomicOperations). On a store whose reads record the version
+ * they found ({@link SupportsAtomicOperations#readsRecordVersion()}: S3, ADLS), a read is one GET,
+ * with no lookup before it: the GET reports the version it read and the object's length, and the
+ * file keeps them, for the reads after it and for a write from it (docs/TAIL_READS.md step 7).
+ * Elsewhere (GCS), or with lookups asked for ({@code lookupFirst}, for ablation), the lookup that
+ * binds the version comes first, and the GET asks for it: a HEAD and a GET. Either way, a write that
+ * lands between two requests of one read fails the later one as stale ({@link
  * SupportsAtomicOperations.StaleReadException}) rather than return part of another object (errata
  * T6), and the log reads again. A store that breaks that contract (S5) serves bytes the frames'
  * checks reject.
@@ -128,16 +133,38 @@ public final class AtomicFileLog implements SharedLog {
   private final long maxRecordBytes;
   private final PageStore pages;
   private final LongSupplier incarnations;
+  // Whether a read of the log's object is one GET, with no lookup before it (the class comment)
+  private final boolean readFirst;
+  // Whether a read of a page is one GET: a page is written once, so any read of it reads its one
+  // version, on any store
+  private final boolean readPagesFirst;
 
   public AtomicFileLog(SupportsAtomicOperations io, String location) {
-    this(io, location, () -> ThreadLocalRandom.current().nextLong());
+    this(io, location, false);
+  }
+
+  /**
+   * A log whose reads look its object up before they read it if {@code lookupFirst}, a HEAD and a
+   * GET a read, as before one request a read (for ablation); else only on a store whose reads do
+   * not record their version.
+   */
+  public AtomicFileLog(SupportsAtomicOperations io, String location, boolean lookupFirst) {
+    this(io, location, () -> ThreadLocalRandom.current().nextLong(), lookupFirst);
   }
 
   /** A log whose replaces draw their incarnations from {@code incarnations} (tests: a seed). */
   public AtomicFileLog(SupportsAtomicOperations io, String location, LongSupplier incarnations) {
+    this(io, location, incarnations, false);
+  }
+
+  public AtomicFileLog(
+      SupportsAtomicOperations io, String location, LongSupplier incarnations,
+      boolean lookupFirst) {
     this.io = io;
     this.location = location;
     this.incarnations = incarnations;
+    this.readFirst = !lookupFirst && io.readsRecordVersion();
+    this.readPagesFirst = !lookupFirst;
     // An append writes the record after its length, a varint no longer than the store's limit's,
     // and before its trailer
     long maxAppend = io.maxAppendBytes(location);
@@ -206,14 +233,15 @@ public final class AtomicFileLog implements SharedLog {
 
   /**
    * The log after {@code since} (docs/TAIL_READS.md "Reads"): if this log read or wrote the bytes
-   * at {@code since} (incarnation X, length N), a lookup of the object's version V and length L,
-   * and a ranged GET of V's bytes from N - 20. If those 20 bytes are the trailer of the frame
-   * {@code since} ends with, V is X extended (every frame names its object, and an append extends
-   * only the version its condition names), and the view is {@code since}'s checkpoint and
-   * records, the same arrays, and the frames after N, each checked: the runtime folds only those.
-   * Else the object was replaced, and the view is V's, read whole. A tail a probe found, or bytes
-   * that fail a check or a read that fails as stale, are read whole or again as {@link #read}
-   * does.
+   * at {@code since} (incarnation X, length N), a GET of the object's bytes from N - 20 to its end,
+   * of the version V it finds, as one request where the store's reads record their version, else
+   * after a lookup of V and its length L. If those 20 bytes are the trailer of the frame {@code
+   * since} ends with, V is X extended (every frame names its object, and an append extends only the
+   * version its condition names), and the view is {@code since}'s checkpoint and records, the same
+   * arrays, and the frames after N, each checked: the runtime folds only those. Else the object was
+   * replaced, and the view is V's: its bytes before N - 20 and those the GET read, or V read whole
+   * if the GET found none. A tail a probe found, or bytes that fail a check or a read that fails as
+   * stale, are read whole or again as {@link #read} does.
    *
    * <p>Under {@code intentlog.fileio.tail.check} (the test suites), each tail read is checked
    * against a whole read of the version it found: the trailer stands in for a comparison of the
@@ -245,6 +273,48 @@ public final class AtomicFileLog implements SharedLog {
 
   /** One tail read from {@code from} (see {@link #readAfter}). */
   private FileView tailRead(FileTail from) {
+    return readFirst ? tailReadFirst(from) : tailReadAfterLookup(from);
+  }
+
+  /**
+   * One tail read as one GET, from N - 20 to the end of the version it finds, which the file keeps
+   * (step 7). A GET from past the object's end reads nothing: the object is shorter than N - 20, and
+   * was replaced.
+   */
+  private FileView tailReadFirst(FileTail from) {
+    FileView held = from.view;
+    long n = from.length;
+    InputFile file = io.newInputFile(location);
+    byte[] bytes;
+    try (SeekableInputStream in = file.newStream()) {
+      in.seek(n - TRAILER_SIZE);
+      bytes = in.readAllBytes();
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+    if (bytes.length >= TRAILER_SIZE
+        && Arrays.equals(bytes, 0, TRAILER_SIZE, held.trailer, 0, TRAILER_SIZE)) {
+      return extended(held, file, n, bytes);
+    }
+    if (bytes.length == 0) {
+      return (FileView) parse(file); // nothing at N - 20: replaced by a shorter object
+    }
+    // Not X's bytes at N: replaced. The rest of the version the GET read is before N - 20, which
+    // the file reads of that version
+    byte[] whole = new byte[(int) (n - TRAILER_SIZE + bytes.length)];
+    try (SeekableInputStream in = file.newStream()) {
+      readFully(in, whole, (int) (n - TRAILER_SIZE));
+    } catch (EOFException e) {
+      throw new FrameCheckException(location + ": " + e.getMessage());
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+    System.arraycopy(bytes, 0, whole, (int) (n - TRAILER_SIZE), bytes.length);
+    return viewOf(file, whole);
+  }
+
+  /** One tail read after a lookup (see {@link #readAfter}). */
+  private FileView tailReadAfterLookup(FileTail from) {
     FileView held = from.view;
     long n = from.length;
     InputFile file = io.newInputFile(location);
@@ -268,6 +338,15 @@ public final class AtomicFileLog implements SharedLog {
     if (!Arrays.equals(bytes, 0, TRAILER_SIZE, held.trailer, 0, TRAILER_SIZE)) {
       return (FileView) parse(file); // not X's bytes at N: replaced
     }
+    return extended(held, file, n, bytes);
+  }
+
+  /**
+   * The view of {@code held}'s object extended: {@code bytes} are the object's from N - 20 (N,
+   * {@code n}, where {@code held} ends), their first 20 {@code held}'s last trailer, and the rest
+   * frames of {@code held}'s incarnation, each checked.
+   */
+  private static FileView extended(FileView held, InputFile file, long n, byte[] bytes) {
     List<byte[]> records = new ArrayList<>(held.records);
     int end = TRAILER_SIZE;
     for (int pos = TRAILER_SIZE; pos < bytes.length; pos = end) {
@@ -481,22 +560,27 @@ public final class AtomicFileLog implements SharedLog {
   }
 
   private LogView parse(InputFile file) {
-    // The bytes read must be the version the tail binds, as a replace from the view needs:
-    // InMemoryAtomicFileIO binds the version as it opens the stream and reads its bytes; S3's and
-    // ADLS's streams open lazily, after the lookup (getLength) binds the version, and ask for it
-    // (If-Match), as GCS's do (if-generation-match): a write after the lookup fails the read as
-    // stale. So the view an append's receipt holds is the object (D20). (Looking up before opening
-    // would make a store that reads by version fail a read a write raced, where opening first reads
-    // the version it binds.)
+    // The bytes read must be the version the tail binds, as a replace from the view needs. Where
+    // reads record their version (S3, ADLS), the read is first: one GET to the end of the version
+    // it finds, which the file keeps (step 7). Elsewhere (GCS) the stream opens lazily, after the
+    // lookup (getLength) binds the version, and asks for it (if-generation-match): a write after
+    // the lookup fails the read as stale. So the view an append's receipt holds is the object
+    // (D20). (Looking up before opening would make a store that reads by version fail a read a
+    // write raced, where opening first reads the version it binds: InMemoryAtomicFileIO's OPEN.)
     // A version shorter than the lookup found is a store serving another version: a torn read.
     byte[] bytes;
     try (SeekableInputStream in = file.newStream()) {
-      bytes = readFully(in, (int) file.getLength());
+      bytes = readFirst ? in.readAllBytes() : readFully(in, (int) file.getLength());
     } catch (EOFException e) {
       throw new FrameCheckException(location + ": " + e.getMessage());
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
+    return viewOf(file, bytes);
+  }
+
+  /** The view of {@code bytes}, the whole of the version {@code file} read, every frame checked. */
+  private static FileView viewOf(InputFile file, byte[] bytes) {
     FileTail tail = new FileTail(file);
     tail.length = bytes.length;
     FileView view = decode(bytes, tail, false);
@@ -693,11 +777,13 @@ public final class AtomicFileLog implements SharedLog {
       }
     }
 
+    /** A page is written once: one GET reads it whole, with no lookup, on any store. */
     @Override
     public Optional<byte[]> get(String name) {
       InputFile file = io.newInputFile(prefix + name);
       try (SeekableInputStream in = file.newStream()) {
-        return Optional.of(readFully(in, (int) file.getLength()));
+        return Optional.of(
+            readPagesFirst ? in.readAllBytes() : readFully(in, (int) file.getLength()));
       } catch (NotFoundException e) {
         return Optional.empty();
       } catch (IOException | RuntimeException e) {
@@ -741,6 +827,12 @@ public final class AtomicFileLog implements SharedLog {
 
   private static byte[] readFully(InputStream in, int length) throws IOException {
     byte[] bytes = new byte[length];
+    readFully(in, bytes, length);
+    return bytes;
+  }
+
+  /** Reads {@code length} bytes from {@code in} into the start of {@code bytes}. */
+  private static void readFully(InputStream in, byte[] bytes, int length) throws IOException {
     int read = 0;
     while (read < length) {
       int n = in.read(bytes, read, length - read);
@@ -749,7 +841,6 @@ public final class AtomicFileLog implements SharedLog {
       }
       read += n;
     }
-    return bytes;
   }
 
   /**

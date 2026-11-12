@@ -75,12 +75,28 @@ public final class LogCatalogProperties {
    * Whether a catalog reads only the log's tail after a replica it holds (docs/TAIL_READS.md):
    * its loads and refreshes, and its commit loop's reads after a lost race, an ambiguous write or
    * a conflict, read the records after the replica's tail when the log still continues it (one
-   * object: a HEAD and a ranged GET from the last 20 bytes the replica read), and the whole log
-   * otherwise. {@code false} reads the whole log every time, and the commit loop probes after a
-   * lost append race and resends, as before (for ablation). Default: {@code true}.
+   * object: a ranged GET from the last 20 bytes the replica read, see {@link #READ_LOOKUP}), and
+   * the whole log otherwise. {@code false} reads the whole log every time, and the commit loop
+   * probes after a lost append race and resends, as before (for ablation). Default: {@code true}.
    */
   public static final String READ_TAIL = "fileio.catalog.read.tail";
   public static final boolean DEFAULT_READ_TAIL = true;
+
+  /**
+   * Whether a catalog in one object looks the object up (a HEAD) before each read of it. {@code
+   * false}: on a store whose reads record the version they found (S3, ADLS), a read is one GET,
+   * whose response reports the version and the object's length, and a page of the log is one GET
+   * on any store; on GCS, whose reads record none, a read of the catalog object still looks it up
+   * first (docs/TAIL_READS.md step 7). {@code true}: a HEAD and a GET a read, as before (for
+   * ablation). Default: {@code false}.
+   */
+  public static final String READ_LOOKUP = "fileio.catalog.read.lookup";
+  public static final boolean DEFAULT_READ_LOOKUP = false;
+
+  /** Whether {@code properties} ask a catalog in one object to look it up before each read. */
+  public static boolean readLookup(Map<String, String> properties) {
+    return booleanProperty(properties, READ_LOOKUP, DEFAULT_READ_LOOKUP);
+  }
 
   /**
    * Whether a catalog in one object is compacted after a commit: past {@link #MAX_APPEND_COUNT} or

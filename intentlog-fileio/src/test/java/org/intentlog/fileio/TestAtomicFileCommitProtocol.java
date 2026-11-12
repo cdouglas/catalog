@@ -32,7 +32,10 @@ import org.intentlog.testkit.EntityVersionsMachine;
  * appends or CAS only, its writers compacting by the record count drawn, and duplicates of records
  * that compaction folded into a checkpoint, or GC'd. The store reads in a mode drawn per try:
  * binding at the open, or pinned, live or spliced after a lookup (TAIL_READS.md, errata T6); the
- * check of each tail read against a whole read runs under the first two.
+ * check of each tail read against a whole read runs under the first two. Whether its reads record
+ * the version they find is drawn too: if they do (S3, ADLS), a read is one GET with no lookup
+ * before it, and a tail read that finds the object replaced reads the rest of the version it found
+ * by a second GET, which the modes after the first may serve live or spliced (step 7).
  */
 class TestAtomicFileCommitProtocol {
 
@@ -40,14 +43,16 @@ class TestAtomicFileCommitProtocol {
   void commitsAreHonestAndCopiesNeverApply(
       @ForAll boolean append,
       @ForAll InMemoryAtomicFileIO.ReadMode reads,
+      @ForAll boolean recordingReads,
       @ForAll long seed,
       @ForAll("settings") CommitProtocol.Settings settings,
       @ForAll("schedules") List<CommitProtocol.Cmd> schedule) {
     boolean pinned = reads == InMemoryAtomicFileIO.ReadMode.OPEN
         || reads == InMemoryAtomicFileIO.ReadMode.PINNED;
+    InMemoryAtomicFileIO io = new InMemoryAtomicFileIO(append);
+    io.setReadsRecordVersion(recordingReads);
     withTailReadCheck(pinned, () -> CommitProtocol.run(new AtomicFileLogHarness(
-        new InMemoryAtomicFileIO(append), "mem:///log", EntityVersionsMachine.INSTANCE, reads,
-        seed), settings, schedule));
+        io, "mem:///log", EntityVersionsMachine.INSTANCE, reads, seed), settings, schedule));
   }
 
   /**

@@ -194,19 +194,23 @@ abstract class MultiWriterStorage {
 
     /**
      * One object, its reads binding at the open, or pinned, live or spliced after a lookup that
-     * another writer's preemption can follow ({@code reads}; TAIL_READS.md, errata T6).
+     * another writer's preemption can follow ({@code reads}; TAIL_READS.md, errata T6); its reads
+     * recording the version they find, one GET a read with no lookup, if {@code recordingReads}
+     * (S3, ADLS; TAIL_READS.md step 7).
      */
-    File(boolean strictVersions, InMemoryAtomicFileIO.ReadMode reads, int segmentLimit,
-        boolean tailReads) {
+    File(boolean strictVersions, InMemoryAtomicFileIO.ReadMode reads, boolean recordingReads,
+        int segmentLimit, boolean tailReads) {
       this.tailReads = tailReads;
       this.described = "one object" + (strictVersions ? ", strict versions" : "")
-          + ", reads " + reads + (tailReads ? ", tail reads" : ", whole reads")
+          + ", reads " + reads + (recordingReads ? " recording versions" : "")
+          + (tailReads ? ", tail reads" : ", whole reads")
           + (segmentLimit > 0 ? ", " + segmentLimit + " writes at most" : "");
       if (segmentLimit > 0) {
         io.limitSegments(segmentLimit);
       }
       io.failSupersededReads(strictVersions);
       io.readMode(reads);
+      io.setReadsRecordVersion(recordingReads);
       io.injectFaults((location, strategy) -> hooks == null
           ? InMemoryAtomicFileIO.Fault.NONE
           : InMemoryAtomicFileIO.Fault.valueOf(hooks.beforeWrite(null).name()));

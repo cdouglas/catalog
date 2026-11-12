@@ -617,6 +617,92 @@ class TestAtomicFileLog {
         .isEqualTo(requests.get(true) - 1);
   }
 
+  /**
+   * Where the store's reads record the version they find (S3, ADLS), a read is one GET with no
+   * lookup before it (TAIL_READS.md step 7): a whole read, and a tail read of the object extended;
+   * a tail read of an object replaced by a longer one reads the rest of the version it found by a
+   * second GET, and one replaced by an object shorter than the tail less 20 reads it whole after a
+   * GET that found nothing. Elsewhere (GCS) a read looks the object up first. Without the suites'
+   * check of each tail read against a whole read, whose read would count.
+   */
+  @Test
+  void aReadIsOneRequestWhereTheStoresReadsRecordTheirVersion() {
+    withoutTailReadCheck(() -> {
+      for (boolean recording : new boolean[] {true, false}) {
+        InMemoryAtomicFileIO store = new InMemoryAtomicFileIO();
+        store.setReadsRecordVersion(recording);
+        store.readMode(InMemoryAtomicFileIO.ReadMode.PINNED); // a stream's GET at its first read
+        AtomicFileLog mine = new AtomicFileLog(store, LOCATION, () -> INCARNATION);
+        AtomicFileLog other = new AtomicFileLog(store, LOCATION, () -> 7L);
+        LogTail absent = AtomicFileLog.tailOf(store.newInputFile(LOCATION));
+        LogView held = mine.readThrough(
+            mine.replace(absent, bytes("chk"), List.of(bytes("r1"))), Duration.ZERO);
+        other.append(bytes("r2"), mine.read().tail());
+        String as = recording ? "reads recording their version" : "a lookup first";
+
+        AtomicInteger reads = countReads(store);
+        LogView whole = mine.read();
+        assertThat(reads.getAndSet(0)).as("a whole read, " + as).isEqualTo(recording ? 1 : 2);
+        LogView extended = mine.readAfter(held.tail());
+        assertThat(reads.getAndSet(0)).as("a tail read, " + as).isEqualTo(recording ? 1 : 2);
+        assertSameView(extended, whole);
+        // a CAS from the view the tail read returned replaces the version it read
+        LogView compacted = mine.readThrough(
+            mine.replace(extended.tail(), bytes("chk2"), List.of()), Duration.ZERO);
+        assertSameView(compacted, mine.read());
+
+        LogView before = mine.read();
+        other.replace(before.tail(), bytes("a longer checkpoint"),
+            List.of(bytes("r3"), bytes("r4")));
+        reads.set(0);
+        LogView longer = mine.readAfter(before.tail());
+        assertThat(reads.getAndSet(0)).as("a replace longer, " + as).isEqualTo(recording ? 2 : 3);
+        assertSameView(longer, mine.read());
+        assertThat(longer.records()).extracting(TestAtomicFileLog::string)
+            .containsExactly("r3", "r4");
+
+        LogView full = mine.read();
+        other.replace(full.tail(), bytes("c"), List.of());
+        reads.set(0);
+        LogView shorter = mine.readAfter(full.tail());
+        assertThat(reads.getAndSet(0)).as("a replace shorter, " + as).isEqualTo(2);
+        assertThat(string(shorter.checkpoint().orElseThrow())).isEqualTo("c");
+        assertThat(shorter.records()).isEmpty();
+      }
+    });
+  }
+
+  /** A page is written once: its read is one GET on any store, unless lookups are asked for. */
+  @Test
+  void aPageReadIsOneGet() {
+    for (boolean lookupFirst : new boolean[] {false, true}) {
+      InMemoryAtomicFileIO store = new InMemoryAtomicFileIO();
+      store.readMode(InMemoryAtomicFileIO.ReadMode.PINNED);
+      AtomicFileLog mine = new AtomicFileLog(store, LOCATION, lookupFirst);
+      mine.pages().put("p0", bytes("page"));
+      AtomicInteger reads = countReads(store);
+      assertThat(mine.pages().get("p0")).hasValueSatisfying(
+          page -> assertThat(string(page)).isEqualTo("page"));
+      assertThat(reads.get()).as("lookup first: " + lookupFirst).isEqualTo(lookupFirst ? 2 : 1);
+      assertThat(mine.pages().get("p1")).isEmpty();
+    }
+  }
+
+  /** Runs {@code run} without the suites' check of each tail read against a whole read. */
+  private static void withoutTailReadCheck(Runnable run) {
+    String check = System.getProperty(AtomicFileLog.CHECK_TAIL_READS);
+    System.setProperty(AtomicFileLog.CHECK_TAIL_READS, "false");
+    try {
+      run.run();
+    } finally {
+      if (check == null) {
+        System.clearProperty(AtomicFileLog.CHECK_TAIL_READS);
+      } else {
+        System.setProperty(AtomicFileLog.CHECK_TAIL_READS, check);
+      }
+    }
+  }
+
   @Test
   void aReplaceOfTheSameLengthIsReadWhole() {
     LogView held = create();

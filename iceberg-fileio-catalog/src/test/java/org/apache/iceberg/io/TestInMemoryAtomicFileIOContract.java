@@ -18,13 +18,56 @@
  */
 package org.apache.iceberg.io;
 
+import org.junit.jupiter.api.Nested;
+
 /**
  * The in-memory store the fuzzers run on, against the atomic-operations contract the cloud stores
  * pass: what it lets a writer do, they must too. Each FileIO a test makes is the same store, as a
- * cloud store's clients share one bucket.
+ * cloud store's clients share one bucket. As GCS's, its reads record no version by default; the
+ * nested suites run it as S3's and ADLS's, whose reads record the version they find, binding the
+ * version as a stream opens and at its first read.
  */
 class TestInMemoryAtomicFileIOContract extends SupportsAtomicOperationsContractTest {
   private final InMemoryAtomicFileIO store = new InMemoryAtomicFileIO();
+
+  @Nested
+  class RecordingReads extends SupportsAtomicOperationsContractTest {
+    private final InMemoryAtomicFileIO store = new InMemoryAtomicFileIO();
+
+    RecordingReads() {
+      store.setReadsRecordVersion(true);
+    }
+
+    @Override
+    protected SupportsAtomicOperations newFileIO() {
+      return store;
+    }
+
+    @Override
+    protected String randomLocation(String slug) {
+      return "mem:///contract/" + randomSlug(slug);
+    }
+  }
+
+  @Nested
+  class RecordingPinnedReads extends SupportsAtomicOperationsContractTest {
+    private final InMemoryAtomicFileIO store = new InMemoryAtomicFileIO();
+
+    RecordingPinnedReads() {
+      store.setReadsRecordVersion(true);
+      store.readMode(InMemoryAtomicFileIO.ReadMode.PINNED);
+    }
+
+    @Override
+    protected SupportsAtomicOperations newFileIO() {
+      return store;
+    }
+
+    @Override
+    protected String randomLocation(String slug) {
+      return "mem:///contract/" + randomSlug(slug);
+    }
+  }
 
   @Override
   protected SupportsAtomicOperations newFileIO() {

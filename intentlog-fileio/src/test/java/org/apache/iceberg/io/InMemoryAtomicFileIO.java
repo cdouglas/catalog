@@ -30,7 +30,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 import org.apache.iceberg.exceptions.NotFoundException;
-import org.apache.iceberg.inmemory.InMemoryInputFile;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -44,8 +43,9 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
  * or {@code newStream}) and keeps reading those bytes afterwards. A conditional write expects the
  * version its snapshot has seen ({@link SupportsAtomicOperations#newOutputFile(InputFile)}): one
  * a write returned, or one a lookup ({@code exists}, {@code getLength}) found. A read alone sees
- * none, as on GCS, whose reads record no version (S3's and ADLS's record the one they find, so a
- * CAS after a read alone fails here where they could land). {@link AtomicOutputFile.Strategy#CAS}
+ * none, as on GCS, whose reads record no version, unless {@link #setReadsRecordVersion} says the
+ * store's reads record the one they find, as S3's and ADLS's do: then a file's first GET has seen
+ * the version it bound. {@link AtomicOutputFile.Strategy#CAS}
  * replaces the object only if the live generation is the one seen, or, from a snapshot that has
  * seen none, creates it only if it does not exist. {@link AtomicOutputFile.Strategy#APPEND} adds
  * the bytes at the end under the same condition, as S3 Express does with {@code ifMatch} plus
@@ -62,7 +62,10 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
  * the bound version or fails as stale ({@link ReadMode#PINNED}, as a GET with If-Match), the live
  * one ({@link
  * ReadMode#LIVE}, as an unpinned GET), or the bound one's bytes up to an offset and the live one's
- * after ({@link ReadMode#SPLICE}, as a stream that reopened mid-read without pinning).
+ * after ({@link ReadMode#SPLICE}, as a stream that reopened mid-read without pinning). A stream
+ * may seek past the end of the bytes it serves: a read there returns -1, as S3's and ADLS's streams
+ * report a GET from past an object's end ({@link SupportsAtomicOperations}). Each stream tells how
+ * long a version its GET served ({@link Served}), so a latency model can price the GET by it.
  *
  * <p>Plain {@link OutputFile} writes are unconditional, as for table metadata and data files.
  *
@@ -172,6 +175,14 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
     SPLICE
   }
 
+  /**
+   * A stream of this store: the length of the bytes its GET served, sending the GET if it has not
+   * yet (the first read would). A latency model prices the GET by it, without a lookup.
+   */
+  public interface Served {
+    long servedLength() throws IOException;
+  }
+
   /** Where a spliced read turns from the bound version's bytes to the live one's. */
   @FunctionalInterface
   public interface SpliceAt {
@@ -238,6 +249,7 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
   private volatile PlainFaults plainFaults = (request, location) -> Fault.NONE;
   private volatile boolean failSupersededReads = false;
   private volatile ReadMode readMode = ReadMode.OPEN;
+  private volatile boolean readsRecordVersion = false;
   private final java.util.SplittableRandom spliceRandom = new java.util.SplittableRandom(0);
   private volatile SpliceAt spliceAt = (bound, live) -> {
     synchronized (spliceRandom) {
@@ -403,6 +415,19 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
    */
   public void failSupersededReads(boolean fail) {
     this.failSupersededReads = fail;
+  }
+
+  /**
+   * Whether a file's first GET has seen the version it bound, as S3's and ADLS's record the version
+   * a read found; by default it has not, as on GCS (the class comment). Set it before reading.
+   */
+  public void setReadsRecordVersion(boolean records) {
+    this.readsRecordVersion = records;
+  }
+
+  @Override
+  public boolean readsRecordVersion() {
+    return readsRecordVersion;
   }
 
   /** Reads streams as {@code mode} says, from now on ({@link ReadMode#OPEN} by default). */
@@ -659,6 +684,9 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
         if (!bound) {
           bind();
         }
+        if (readsRecordVersion) {
+          seen = true; // the response reported the version and its length
+        }
         v = version;
       }
       if (v == null) {
@@ -677,7 +705,7 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
               "Generation " + v.generation + " of " + location + " was replaced", null);
         }
       }
-      SeekableInputStream stream = new InMemoryInputFile(location, bytes).newStream();
+      ServedStream stream = new ServedStream(bytes);
       return fault == ReadFault.FAIL_MID_STREAM
           ? new BreakingInputStream(stream, location, bytes.length / 2)
           : stream;
@@ -857,15 +885,69 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
   }
 
   /**
-   * A stream that sends its GET at its first read, from the position a seek left, as S3's does. A
-   * GET from past the end of the bytes served (a live version shorter than the bound one) reads
-   * nothing, as a short body would.
+   * The bytes a GET served: a stream that may seek past their end, where a read returns -1, as S3's
+   * and ADLS's streams report a GET from past an object's end.
    */
-  private static final class LazyStream extends SeekableInputStream {
+  private static final class ServedStream extends SeekableInputStream implements Served {
+    private final byte[] bytes;
+    private long pos = 0;
+
+    ServedStream(byte[] bytes) {
+      this.bytes = bytes;
+    }
+
+    @Override
+    public long servedLength() {
+      return bytes.length;
+    }
+
+    @Override
+    public long getPos() {
+      return pos;
+    }
+
+    @Override
+    public void seek(long newPos) throws IOException {
+      if (newPos < 0) {
+        throw new IOException("Cannot seek to " + newPos);
+      }
+      pos = newPos;
+    }
+
+    @Override
+    public int read() {
+      return pos < bytes.length ? bytes[(int) pos++] & 0xFF : -1;
+    }
+
+    @Override
+    public int read(byte[] b, int off, int len) {
+      if (len == 0) {
+        return 0;
+      }
+      if (pos >= bytes.length) {
+        return -1;
+      }
+      int n = (int) Math.min(len, bytes.length - pos);
+      System.arraycopy(bytes, (int) pos, b, off, n);
+      pos += n;
+      return n;
+    }
+
+    @Override
+    public int available() {
+      return (int) Math.max(0, bytes.length - pos);
+    }
+  }
+
+  /**
+   * A stream that sends its GET at its first read, from the position a seek left, as S3's does. A
+   * GET from past the end of the bytes served (a live version shorter than the bound one, or a read
+   * from past the object's end) reads nothing.
+   */
+  private static final class LazyStream extends SeekableInputStream implements Served {
     private final Supplier<SeekableInputStream> get;
     private SeekableInputStream in = null;
     private long pos = 0;
-    private boolean past = false;
 
     LazyStream(Supplier<SeekableInputStream> get) {
       this.get = get;
@@ -874,13 +956,14 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
     private SeekableInputStream in() throws IOException {
       if (in == null) {
         in = get.get();
-        try {
-          in.seek(pos);
-        } catch (IllegalStateException e) { // past the end of what was served
-          past = true;
-        }
+        in.seek(pos);
       }
       return in;
+    }
+
+    @Override
+    public long servedLength() throws IOException {
+      return ((Served) in()).servedLength();
     }
 
     @Override
@@ -899,14 +982,12 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
 
     @Override
     public int read() throws IOException {
-      SeekableInputStream stream = in();
-      return past ? -1 : stream.read();
+      return in().read();
     }
 
     @Override
     public int read(byte[] b, int off, int len) throws IOException {
-      SeekableInputStream stream = in();
-      return past ? -1 : stream.read(b, off, len);
+      return in().read(b, off, len);
     }
 
     @Override
@@ -917,15 +998,20 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
     }
   }
 
-  private static class BreakingInputStream extends SeekableInputStream {
-    private final SeekableInputStream in;
+  private static class BreakingInputStream extends SeekableInputStream implements Served {
+    private final ServedStream in;
     private final String location;
     private final long breakAt;
 
-    BreakingInputStream(SeekableInputStream in, String location, long breakAt) {
+    BreakingInputStream(ServedStream in, String location, long breakAt) {
       this.in = in;
       this.location = location;
       this.breakAt = breakAt;
+    }
+
+    @Override
+    public long servedLength() {
+      return in.servedLength();
     }
 
     private void check(long pos) throws IOException {

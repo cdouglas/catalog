@@ -147,13 +147,15 @@ class TestMultiWriterProperties {
       @ForAll("appendHeadrooms") long appendHeadroom,
       @ForAll boolean strictVersions,
       @ForAll InMemoryAtomicFileIO.ReadMode reads,
+      @ForAll boolean recordingReads,
       @ForAll boolean tailReads,
       @ForAll boolean compactAfter,
       @ForAll boolean gc,
       @ForAll("segmentLimits") int segmentLimit,
       @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(new MultiWriterStorage.File(strictVersions, reads, segmentLimit, tailReads), writers,
+    new Run(new MultiWriterStorage.File(
+        strictVersions, reads, recordingReads, segmentLimit, tailReads), writers,
         maxAppendCount, appendHeadroom, false, gc, encoding, compactAfter).execute(schedule);
   }
 
@@ -164,13 +166,15 @@ class TestMultiWriterProperties {
       @ForAll("appendHeadrooms") long appendHeadroom,
       @ForAll boolean strictVersions,
       @ForAll InMemoryAtomicFileIO.ReadMode reads,
+      @ForAll boolean recordingReads,
       @ForAll boolean tailReads,
       @ForAll boolean compactAfter,
       @ForAll boolean gc,
       @ForAll("segmentLimits") int segmentLimit,
       @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
-    new Run(new MultiWriterStorage.File(strictVersions, reads, segmentLimit, tailReads), writers,
+    new Run(new MultiWriterStorage.File(
+        strictVersions, reads, recordingReads, segmentLimit, tailReads), writers,
         maxAppendCount, appendHeadroom, true, gc, encoding, compactAfter).execute(schedule);
   }
 

@@ -197,6 +197,7 @@ class TestCatalogFaultProperties {
       @ForAll("maxUpdateSizes") int maxUpdateSize,
       @ForAll boolean strictVersions,
       @ForAll("readModes") InMemoryAtomicFileIO.ReadMode reads,
+      @ForAll boolean recordingReads,
       @ForAll @IntRange(min = 0, max = 7) int gzipWriters,
       @ForAll @IntRange(min = 0, max = 7) int gcWriters,
       @ForAll @IntRange(min = 0, max = 7) int pagingWriters,
@@ -207,7 +208,8 @@ class TestCatalogFaultProperties {
       @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
     new Run(onLog(sharedLog, modes.subList(0, writers)), maxUpdateSize, false, strictVersions,
-        reads, gzipWriters, gcWriters, pagingWriters, wholeReaders, fusedWriters, clockOffsets,
+        reads, recordingReads, gzipWriters, gcWriters, pagingWriters, wholeReaders, fusedWriters,
+        clockOffsets,
         segmentLimit, encoding)
         .execute(schedule);
   }
@@ -220,6 +222,7 @@ class TestCatalogFaultProperties {
       @ForAll("maxUpdateSizes") int maxUpdateSize,
       @ForAll boolean strictVersions,
       @ForAll("readModes") InMemoryAtomicFileIO.ReadMode reads,
+      @ForAll boolean recordingReads,
       @ForAll @IntRange(min = 0, max = 7) int gzipWriters,
       @ForAll @IntRange(min = 0, max = 7) int gcWriters,
       @ForAll @IntRange(min = 0, max = 7) int pagingWriters,
@@ -230,7 +233,8 @@ class TestCatalogFaultProperties {
       @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
     new Run(onLog(sharedLog, modes.subList(0, writers)), maxUpdateSize, true, strictVersions,
-        reads, gzipWriters, gcWriters, pagingWriters, wholeReaders, fusedWriters, clockOffsets,
+        reads, recordingReads, gzipWriters, gcWriters, pagingWriters, wholeReaders, fusedWriters,
+        clockOffsets,
         segmentLimit, encoding)
         .execute(schedule);
   }
@@ -826,7 +830,8 @@ class TestCatalogFaultProperties {
      * at most that many writes, and an append past it fails (Bug 66).
      */
     Run(List<LocalCatalogMode> modes, int maxUpdateSize, boolean faults, boolean strictVersions,
-        InMemoryAtomicFileIO.ReadMode reads, int gzipWriters, int gcWriters, int pagingWriters,
+        InMemoryAtomicFileIO.ReadMode reads, boolean recordingReads, int gzipWriters,
+        int gcWriters, int pagingWriters,
         int wholeReaders, int fusedWriters, List<Long> clockOffsets, int segmentLimit,
         String encoding) {
       this.maxUpdateSize = maxUpdateSize;
@@ -837,6 +842,9 @@ class TestCatalogFaultProperties {
       // command can follow (TAIL_READS.md, errata T6)
       io.readMode(reads);
       Statistics.label("reads").collect(reads);
+      // and record the version they find, one GET a read with no lookup, or not (step 7)
+      io.setReadsRecordVersion(recordingReads);
+      Statistics.label("reads record their version").collect(recordingReads);
       if (segmentLimit > 0) {
         io.limitSegments(segmentLimit);
       }
