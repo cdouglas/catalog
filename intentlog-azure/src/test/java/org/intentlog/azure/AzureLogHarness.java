@@ -29,10 +29,12 @@ import java.util.Set;
 import java.util.TreeMap;
 import org.intentlog.CommittedSet;
 import org.intentlog.Intention;
+import org.intentlog.LogTail;
 import org.intentlog.LogView;
 import org.intentlog.Replay;
 import org.intentlog.SharedLog;
 import org.intentlog.StateMachine;
+import org.intentlog.TrimmedException;
 import org.intentlog.azure.AzureLogHead.Segment;
 import org.intentlog.azure.InMemoryAppendBlobStore.Fault;
 import org.intentlog.azure.InMemoryAppendBlobStore.Op;
@@ -44,12 +46,15 @@ import org.intentlog.wire.LogEnvelope;
  * store meets the fuzzer's faults: a write may fail, be refused, be throttled before or after it
  * lands, lose its reply, or (an append) land later; a read may fail, or (a segment's) be served
  * short of its last block. The oracles see the log the store holds: every record frame that landed,
- * at its segment's base (from every head ever written) plus its offset.
+ * at its segment's base (from every head ever written) plus its offset. And at the drain, every read
+ * the instances served must read on from its tail to the end of the log the store holds, with the
+ * head its instance held after it (reads are strongly consistent: AZURE_LOG.md "Operations", {@code
+ * readAfter}).
  */
 final class AzureLogHarness implements LogHarness {
 
   private final ObservedStore store;
-  private final SharedLog log;
+  private final RoundRobin log;
   private final String root;
   private final StateMachine<?, ?, ?> machine;
   private Hooks hooks = null;
@@ -123,6 +128,14 @@ final class AzureLogHarness implements LogHarness {
     private final List<AppendBlobLog> logs;
     private int next = 0;
 
+    /** Each read served: a copy of its instance as the read left it, and the tail it returned. */
+    private final List<Map.Entry<AppendBlobLog, LogTail>> reads = new ArrayList<>();
+
+    private LogView seen(AppendBlobLog by, LogView view) {
+      reads.add(Map.entry(by.copy(), view.tail()));
+      return view;
+    }
+
     RoundRobin(List<AppendBlobLog> logs) {
       this.logs = List.copyOf(logs);
     }
@@ -138,12 +151,14 @@ final class AzureLogHarness implements LogHarness {
 
     @Override
     public LogView read() {
-      return pick().read();
+      AppendBlobLog by = pick();
+      return seen(by, by.read());
     }
 
     @Override
     public LogView readThrough(org.intentlog.Receipt receipt, java.time.Duration wait) {
-      return pick().readThrough(receipt, wait);
+      AppendBlobLog by = pick();
+      return seen(by, by.readThrough(receipt, wait));
     }
 
     @Override
@@ -168,7 +183,8 @@ final class AzureLogHarness implements LogHarness {
 
     @Override
     public LogView readAfter(org.intentlog.LogTail since) {
-      return pick().readAfter(since);
+      AppendBlobLog by = pick();
+      return seen(by, by.readAfter(since));
     }
 
     @Override
@@ -292,7 +308,46 @@ final class AzureLogHarness implements LogHarness {
 
   @Override
   public List<String> checkpointViolations() {
-    return violations(machine);
+    List<String> violations = violations(machine);
+    violations.addAll(staleReaders());
+    return violations;
+  }
+
+  /**
+   * Reads that, from their tail and the head their instance held after them, read on short of the
+   * end of the log the store holds: a process that read there and has read nothing since would
+   * stay behind. Each reads as a copy of its instance taken after the read (so the oracle's reads
+   * leave the instances' caches as the run left them), without faults.
+   */
+  private List<String> staleReaders() {
+    List<String> stale = new ArrayList<>();
+    byte[] bytes = store.peek(root + "/head");
+    if (bytes == null) {
+      return stale;
+    }
+    Segment last = AzureLogHead.decode(bytes).last();
+    byte[] segment = store.peek(last.name());
+    long end = last.base() + (segment == null ? 0 : segment.length);
+    Hooks was = hooks;
+    hooks = null;
+    try {
+      for (Map.Entry<AppendBlobLog, LogTail> e : log.reads) {
+        LogView view;
+        try {
+          view = e.getKey().copy().readAfter(e.getValue());
+        } catch (TrimmedException trimmed) {
+          view = e.getKey().copy().read();
+        }
+        long reached = AzureLogHead.position(view.tail().position());
+        if (reached != end) {
+          stale.add("a read after " + e.getValue() + " reached " + reached
+              + ", not the log's end at " + end);
+        }
+      }
+    } finally {
+      hooks = was;
+    }
+    return stale;
   }
 
   private <S, B extends StateMachine.Builder<S>, I extends Intention<B>> List<String> violations(

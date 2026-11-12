@@ -159,6 +159,17 @@ public final class AppendBlobLog implements SharedLog {
     return "azure log " + root;
   }
 
+  /**
+   * This log as another process holding what it holds: its cached head and the view it kept, for
+   * a test's oracle to read with while this log's caches stay as they are.
+   */
+  AppendBlobLog copy() {
+    AppendBlobLog c = new AppendBlobLog(store, root, options);
+    c.cached = cached;
+    c.newest = newest;
+    return c;
+  }
+
   @Override
   public Capabilities capabilities() {
     long writer = options.segmentLimit() - Frames.RESERVE;

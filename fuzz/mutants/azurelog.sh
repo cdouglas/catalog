@@ -13,7 +13,13 @@
 # so a wrong offset made an outcome ambiguous, never dishonest. Now an offset that names the kept
 # tail while another record landed first returns a view without that record, which the fuzzer's
 # oracle of held states and TestAppendBlobLog catch, as the model's AckedAtReceipt does.
-MUTANTS="casbeforeclose nolimit createonmissing noclosedlength sweepnamed trimearly sdkretry skipread compactbycheckpoint offsetfromlength"
+# padunseen (2026-11-11, a review's find): a read from the end of a segment a pad closed, before
+# the head named its successor, takes the segment for open, so a reader holding that head reads
+# nothing new however much the successor takes. TestAppendBlobLog kills it; the fuzzer's oracle of
+# stale readers (every read reads on to the log's end at the drain) did not in 2,000 local tries:
+# the state needs a rotation that failed between its pad and its CAS, then a read before another
+# writer's append repairs it, and no trim of the segment before the drain.
+MUTANTS="casbeforeclose nolimit createonmissing noclosedlength sweepnamed trimearly sdkretry skipread compactbycheckpoint offsetfromlength padunseen"
 EQUIVALENT=""
 ORACLES=TestAzureCommitProtocol,TestAppendBlobLog,TestAzureCompaction
 
@@ -66,6 +72,8 @@ mutant() { # name main-dir test-dir (the catalog's; these mutants are intentlog'
         offset = before == null ? offset : before.length();" ;;
     # a read through a write reads nothing when the record landed at or after the kept tail
     skipread) mutate $AL "      if (!fresh && r.record != null && kept.tail.position == r.position()) {" "      if (!fresh && r.record != null && kept.tail.position <= r.position()) {" ;;
+    # a read from the end of a padded segment takes it for open (it sees no pad there)
+    padunseen) mutate $AL "      boolean closed = seg.closed() || padded || end >= seg.limit()" "      boolean closed = seg.closed() || padded" ;;
     # writers count toward compaction from the checkpoint each last read
     compactbycheckpoint) mutate $LR "    CompactionPolicy.Input input = new CompactionPolicy.Input(landed.recordsSinceGc(),
         landed.checkpointBytes(), landed.checkpointBytes() + landed.bytesSinceGc(), 0);" "    CompactionPolicy.Input input = new CompactionPolicy.Input(landed.intentionRecords(),
