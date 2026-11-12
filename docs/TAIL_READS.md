@@ -763,13 +763,13 @@ Each step stands alone and is measured before the next:
 7. **One request a read** (2026-11-11, built; measurement pending). A GET's
    response reports the version and length it read (S3's `ETag` and
    `Content-Range`, ADLS's equivalents), and the fork's S3 and ADLS files
-   keep them (fork b343396246, step 0's), so a read needs no lookup before
+   keep them (fork 7b948d51ce, step 0's), so a read needs no lookup before
    it. The fork declares which stores' reads do
    (`SupportsAtomicOperations.readsRecordVersion()`: S3 unless the analytics
    accelerator is on, ADLS; not GCS, whose client library reports no
    generation a read found), and reports a GET from an object's end or past
    it, which those services answer with 416, as the stream's end (fork
-   b542ec1c6c). `AtomicFileLog` then reads first on such stores: a whole read
+   fbd1036bf9). `AtomicFileLog` then reads first on such stores: a whole read
    is one GET, a tail read one GET from N − 20 (two where the object was
    replaced: the rest of the version, or the version whole after a GET that
    found nothing), and a page of the log one GET on any store (a page is
