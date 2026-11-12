@@ -997,6 +997,43 @@ catalog-bench's `ModelStore` answers a HEAD at its end too (its GET halfway);
 the objects it serves are written once (metadata files, manifest lists), so no
 read can tell, and it is left as it is.
 
+### D25. A fold rebuilt the whole catalog state (perf bug)
+
+Folding records onto a replica (a commit's read after a lost race, its read
+through its own write, a client's refresh) rebuilt the catalog's whole state,
+whatever the records changed. `CatalogState.toBuilder` copied each of the
+state's maps keyed by table and namespace (about fifteen); `build` rebuilt the
+namespace and table lookups from the entries and copied every map again; and
+`LogRuntime.continued` decoded every record the replica held, to make sure none
+was the commit's own. At E1's 3,000 pointer tables that was 6.7 ms of CPU per
+resend in campaign tr6y (fold 3.4, build 3.3; tr7y 4.8 and 3.4 on a busier
+host), in a commit loop whose window from knowing the log's tail to the append
+taking effect is 15 to 20 ms: once the model's reads were answered halfway
+(D24), most of what tail reads still cost against probes (tr7y: 47.5 merge
+appends a second with tail reads, 49.8 without).
+
+`FoldProfile` (test scope: two writers taking turns committing from a replica
+the other just made stale, on 3,000 pointer tables with 5,000 records after the
+checkpoint) reproduces it, and JFR places it: a fold's CPU was 70% `toBuilder`
+and 29% `continued`; a build's 57% copying maps and 42% rebuilding lookups. A
+build grew with tables (0.24 ms at 300, 0.82 at 1,000, 1.85 at 3,000).
+
+**Resolved 2026-11-12** (branch `one-request-reads`): a builder rebuilds its
+lookups only after adding a namespace, whose path a checkpoint's arbitrary order
+may not yet know (every other change keeps them; under the replay check each
+build compares them with a rebuild); it shares the state's maps until it changes
+them, and hands a state the maps it changed read only, copying them again before
+a later change (`TestCatalogStateBuilder`); and a replica keeps the ids of its
+view's intention records as replay decoded them, which `continued` scans
+(`TestReplay`, `TestLogRuntime`; under the replay check each scan is compared
+with a decode). At 3,000 tables and 5,000 records `FoldProfile`'s fold now takes
+0.49 ms (2.9), its build about nothing (1.85), and a whole commit 0.87 ms of CPU
+(7.3); at 300 tables, 0.19, 0.01 and 0.42. What stays: a record still copies
+each table-keyed map it changes, so a fold grows with tables, about a tenth as
+fast (persistent maps would make it logarithmic); and every campaign before the
+fix ran with the copies, so FileIOCatalog's CPU per commit grew with the
+catalog's tables in them.
+
 ## Test Coverage Gaps
 
 ### T3. Cloud integration tests rely on emulators for some behaviour
