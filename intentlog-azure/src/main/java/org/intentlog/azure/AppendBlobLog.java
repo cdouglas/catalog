@@ -352,7 +352,9 @@ public final class AppendBlobLog implements SharedLog {
   /**
    * Closes {@code seg} so that no append lands in it again: finds it closed (at its limit, or at
    * the block limit), or appends a pad that fills it to its limit. Returns its final length; -1
-   * if it no longer exists.
+   * if it no longer exists. A throttled pad, which may have landed, is the runtime's to send again
+   * after its backoff ({@link AppendBlobStore.Throttled}): its next append finds the segment full
+   * and closes it from a fresh look.
    */
   private long close(Segment seg) {
     while (true) {
@@ -367,9 +369,8 @@ public final class AppendBlobLog implements SharedLog {
         store.appendBlock(seg.name(), Frames.pad(seg.limit() - p.length(), seg.ordinal()),
             seg.limit(), p.length());
         return seg.limit();
-      } catch (AppendBlobStore.PositionMismatch | AppendBlobStore.Full
-          | AppendBlobStore.Throttled e) {
-        // the segment grew, met the block limit, or the pad may have landed: look again
+      } catch (AppendBlobStore.PositionMismatch | AppendBlobStore.Full e) {
+        // the segment grew, or met the block limit: look again
       } catch (AppendBlobStore.NotFound e) {
         return -1;
       }

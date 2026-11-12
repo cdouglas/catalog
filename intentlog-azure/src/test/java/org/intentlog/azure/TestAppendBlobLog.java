@@ -21,6 +21,8 @@ package org.intentlog.azure;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
+
 import java.io.UncheckedIOException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -32,6 +34,7 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicBoolean;
+import org.intentlog.LogThrottledException;
 import org.intentlog.LogTail;
 import org.intentlog.LogView;
 import org.intentlog.Receipt;
@@ -229,6 +232,28 @@ class TestAppendBlobLog {
     assertThat(store.names()).contains(head().last().name());
     appended.addAll(appendUntil(log, 3));
     assertThat(log.read().records()).containsExactlyElementsOf(appended);
+  }
+
+  /**
+   * A pad the store throttles fails the append that found its segment full as throttled, for the
+   * runtime to send again after its backoff, rather than being sent again at once, forever.
+   */
+  @Test
+  void aThrottledPadIsTheRuntimesToSendAgain() { // AZ1
+    AtomicBoolean busy = new AtomicBoolean(true);
+    AppendBlobLog log = around(300, (method, args, through) -> {
+      boolean pad = method.getName().equals("appendBlock") && ((byte[]) args[1])[0] == 0;
+      if (pad && busy.get()) {
+        throw new AppendBlobStore.Throttled("busy", null);
+      }
+      return through.call();
+    });
+    create(log);
+    assertTimeoutPreemptively(Duration.ofSeconds(10), () ->
+        assertThatThrownBy(() -> appendUntil(log, 2)).isInstanceOf(LogThrottledException.class));
+    busy.set(false);
+    appendUntil(log, 3);
+    assertThat(head().first().closedLength()).isEqualTo(head().first().limit());
   }
 
   @Test
