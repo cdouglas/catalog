@@ -22,11 +22,16 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.UncheckedIOException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.Callable;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.intentlog.LogTail;
 import org.intentlog.LogView;
 import org.intentlog.Receipt;
@@ -54,6 +59,29 @@ class TestAppendBlobLog {
   private AppendBlobLog log(long limit) {
     return new AppendBlobLog(store, ROOT, AppendBlobLog.Options.defaults().withSegmentLimit(limit)
         .withTrimGraceMs(0).withClock(() -> 0L));
+  }
+
+  /** What a store around {@link #store} does with a request: calls {@code through} or not. */
+  private interface Around {
+    Object call(Method method, Object[] args, Callable<Object> through) throws Exception;
+  }
+
+  /** {@link #store} with {@code around} deciding each request, under a log of segment limit L. */
+  private AppendBlobLog around(long limit, Around around) {
+    AppendBlobStore wrapped = (AppendBlobStore) Proxy.newProxyInstance(
+        AppendBlobStore.class.getClassLoader(), new Class<?>[] {AppendBlobStore.class},
+        (proxy, method, args) -> around.call(method, args, () -> {
+          try {
+            return method.invoke(store, args);
+          } catch (InvocationTargetException e) {
+            if (e.getCause() instanceof RuntimeException r) {
+              throw r;
+            }
+            throw new AssertionError(e);
+          }
+        }));
+    return new AppendBlobLog(wrapped, ROOT, AppendBlobLog.Options.defaults()
+        .withSegmentLimit(limit).withTrimGraceMs(0).withClock(() -> 0L));
   }
 
   private static byte[] checkpoint(int i, LogTail through) {
@@ -178,6 +206,29 @@ class TestAppendBlobLog {
     writer.append(next, null);
     assertThat(head().segments()).as("the writer moved the log on").hasSize(2);
     assertThat(reader.readAfter(read.tail()).records()).containsExactly(next);
+  }
+
+  /**
+   * A writer whose CAS of the head landed though its reply said it lost (a transport's resend,
+   * failing its If-Match) finds its own candidate named, and keeps it: deleting it as another
+   * writer's loser would leave the head naming a segment that does not exist (AZ5).
+   */
+  @Test
+  void aRotationWhoseCasLandedUnseenKeepsItsSegment() { // AZ4, AZ5
+    AtomicBoolean lose = new AtomicBoolean();
+    AppendBlobLog log = around(300, (method, args, through) -> {
+      Object result = through.call();
+      boolean lost = method.getName().equals("putIfMatch") && result != null
+          && lose.getAndSet(false);
+      return lost ? null : result;
+    });
+    create(log);
+    lose.set(true);
+    List<byte[]> appended = appendUntil(log, 2);
+    assertThat(lose).as("the rotation's CAS was reported lost").isFalse();
+    assertThat(store.names()).contains(head().last().name());
+    appended.addAll(appendUntil(log, 3));
+    assertThat(log.read().records()).containsExactlyElementsOf(appended);
   }
 
   @Test

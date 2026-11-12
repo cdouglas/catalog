@@ -339,6 +339,9 @@ public final class AppendBlobLog implements SharedLog {
       }
       h = existing();
       Segment last = h.head().last();
+      if (last.name().equals(next.name())) {
+        return h; // this CAS landed, though its reply said it lost (a resend that failed its If-Match)
+      }
       if (last.ordinal() != full.ordinal()) {
         deleteQuietly(next.name()); // another writer moved the log on; the sweep would too
         return h;
