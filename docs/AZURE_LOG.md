@@ -1,7 +1,6 @@
 # The Azure append-blob log
 
-**Status:** a specification, written on 2026-11-10 on branch `azure-log` (from `tail-reads`),
-and its implementation on the same branch:
+**Status:** a specification, written on 2026-11-10, and its implementation:
 - **The fence.** The same day, probes found that Append Blob Seal doesn't exist on an account
   with a hierarchical namespace, and that a lease doesn't stop appends there. So a segment is
   closed by filling it to its size limit instead
@@ -296,7 +295,7 @@ compares positions only for equality, and two tails at one place in the log must
 |---|---|
 | `capabilities()` | `append` true; `conditionalAppend` false (true in the conditional ablation, below); `fusedReplace` false; `separateCheckpoints` true; `maxRecordBytes` the smaller of the service version's Append Block limit (4 MiB before 2022-11-02, 100 MiB since) and the writer limit of an empty segment, less the frame's overhead |
 | `read()` | GET the head; GET its checkpoint; GET each live segment from the checkpoint's position on (a ranged GET of the first, from its offset). Each closed segment must read exactly to its `closed_length`, and the last segment to the length its GET returned. Any 404 means a trim raced the read: read again from a fresh head, up to `maxThrottleAttempts` times, after which the log could not be read |
-| `readAfter(since)` | A ranged GET of `since`'s segment from its offset. If the GET shows the segment open (its last frame isn't a pad and it has fewer than 50,000 blocks, from `x-ms-blob-committed-block-count`), the view is those frames: one request. If it is closed, GET the head and continue with the segments after it. If the head no longer names it, it was trimmed: `TrimmedException`, and the runtime reads whole |
+| `readAfter(since)` | A ranged GET of `since`'s segment from its offset (from the byte before it, dropped, so that a read at the segment's end is answered by a 206 rather than a 416 and a Get Blob Properties). If the GET shows the segment open (its last frame isn't a pad, it is short of its limit, and it has fewer than 50,000 blocks, from `x-ms-blob-committed-block-count`), the view is those frames: one request. A segment at its limit is closed though a read from its end sees no pad: only a pad reaches the limit. If it is closed, GET the head and continue with the segments after it. If the head no longer names it, it was trimmed: `TrimmedException`, and the runtime reads whole |
 | `readThrough(r, wait)` | If the reply put `r` at the tail of the newest view this log holds, that view and `r`'s record, with no request ([Reading through a write](#reading-through-a-write)). Else the newest view this log has returned or built that ends at or before `r`, extended by a ranged GET from its tail through `r`'s frame (and across segments as in `readAfter`). Without such a view, a whole `read()`. The view must hold `r`'s frame at `r`'s offset (P3). A GET that ends before it is read again within `wait`, then `LogLagException`. Azure's reads are strongly consistent, so that is not expected (an open question below) |
 | `probe()` | GET the head and Get Blob Properties of its last segment: the tail without its records. Used only in the conditional ablation |
 | `append(record, null)` | Append Block to the head's last segment, with no position condition and with `x-ms-blob-condition-maxsize` at the segment's writer limit. If the segment is full or closed (P6: nothing landed), read the head: if it names a later segment, send there; if not, move the log on ([Rotation](#rotation)) and send to the new last segment. After `maxRotations` (4) moves, `LogFullException`. A 404 (a stale head: the segment was trimmed) re-reads the head and sends again. The receipt is the segment, the reply's `x-ms-blob-append-offset`, and the frame's length |
@@ -496,15 +495,18 @@ Azure's responses, mapped onto the SPI's signals (LOG.md "Failures"):
 | a timeout, a reset connection, any other exception | a write | unknown outcome (the exception itself) |
 | any failure | a read | the log could not be read |
 
-**The Azure SDK's own retries must be off** for appends: `RequestRetryOptions` with
-`maxTries` 1, as in the spike. An SDK that sends a timed-out Append Block again can land the
-record twice and report only the second copy. The runtime would never know about the first,
-which is exactly the bug that `SharedLogCommit.tla`'s `dup` switch puts back: a throttled
-send that isn't counted as a write that may have landed. The runtime's `WRITE` does the
-retries and keeps count. The pad goes without the SDK's retries too: the close loop reads
-the length again after any failure. Reads, Put Blob with `If-None-Match` and the head's CAS
-may use the SDK's retries: a resent read is harmless, and a resent conditional create or CAS
-that already landed fails its condition, which the provider resolves by reading.
+**The Azure SDK's own retries are off**: `RequestRetryOptions` with `maxTries` 1, as in the
+spike, for every request (`AzureAppendBlobStore.create`; a client given to its constructor
+must be built the same way, which it cannot check). An SDK that sends a timed-out Append Block
+again can land the record twice and report only the second copy. The runtime would never know
+about the first, which is exactly the bug that `SharedLogCommit.tla`'s `dup` switch puts back:
+a throttled send that isn't counted as a write that may have landed. The runtime's `WRITE`
+does the retries and keeps count. A pad the store throttles fails the append that found the
+segment full as throttled (`LogThrottledException`), and the runtime's next send closes the
+segment from a fresh look at its length. Conditional writes resent below the provider would
+be safe only in part: a resent CAS of the head that already landed fails its condition, and a
+rotation that then reads the head and finds its own candidate named keeps it; but a resent
+create of a candidate finds its name taken and fails the rotation.
 
 ## Invariants
 
@@ -549,7 +551,7 @@ The catalog opens this log when `fileio.catalog.log` is `azure-append`. The defa
 | Property | Default | Meaning |
 |---|---|---|
 | `fileio.catalog.log` | `atomic-file` | which log the catalog keeps |
-| `fileio.catalog.log.location` | `<warehouse>/catalog.log` | the log's root |
+| `fileio.catalog.log.location` | none: required | the log's root, a Blob URL: `https://<account>.blob.core.windows.net/<container>/<path>` |
 | `fileio.catalog.log.append` | `blind` | `blind`, or `conditional` (the ablation: the same objects and frames, appends conditioned on the tail; `conditionalAppend` true) |
 | `fileio.catalog.log.segment.max.bytes` | 64 MiB (provisional) | a new segment's limit *L*. It must exceed the largest record by the frame's overhead plus 32 bytes. Small values make rotations frequent, for tests |
 | `fileio.catalog.log.checkpoint.share` | 1.0 | compact once the records since the checkpoint reach this share of its bytes ([When to compact](#when-to-compact)) |
@@ -558,9 +560,12 @@ The catalog opens this log when `fileio.catalog.log` is `azure-append`. The defa
 | `fileio.catalog.log.checkpoint.keep` | 2 | checkpoints kept besides the head's |
 | `fileio.catalog.log.trim.grace.ms` | 60,000 | how long a segment out of the head stays before the sweep deletes it |
 
-The credentials and the client are the fork's ADLS FileIO's (`AzureProperties`: a SAS, a
-connection string, or the default credential), built into a Blob client on the primary
-endpoint, with the SDK's retries off for appends and no secondary host for reads.
+The credentials are an account key, given as the fork's ADLS FileIO names it
+(`adls.auth.shared-key.account.name` and `.key`, `AzureProperties`), built into a Blob
+client on the primary endpoint (`AzureLogs.open`), with the SDK's retries off and no
+secondary host. The FileIO's other credentials (a SAS, a connection string, the default
+credential) are [Later](#later): `AzureAppendBlobStore.create` already takes an Entra ID
+`TokenCredential`.
 
 ## Modules
 
@@ -582,8 +587,9 @@ endpoint, with the SDK's retries off for appends and no secondary host for reads
   (which the log doesn't use) wouldn't stop appends.
 
   The module depends on `intentlog-core` and the Azure SDK only, not on Iceberg.
-- **`iceberg-fileio-catalog`**: opening the log from the catalog's properties
-  (`LogCatalog.openLog`), with the client built from `AzureProperties`.
+- **`iceberg-fileio-catalog`**: opening the log from the catalog's properties (`AzureLogs`,
+  which `FileIOCatalog` calls for `fileio.catalog.log` `azure-append`; the module depends on
+  `intentlog-azure` optionally).
 
 ## Testing
 
@@ -717,6 +723,8 @@ deploy:
 - **One elected compactor**, by a lease on the head, so committers stop duplicating
   checkpoints at high rates. A lease would put a lease id on the head's CAS. Only if the
   measurements show duplicate checkpoints costing something.
+- **The FileIO's other credentials** for the log (a SAS, a connection string, the default
+  credential), beside the account key: the store takes a `TokenCredential` already.
 - **Other stores.** S3 Express has no append without an offset, and GCS's appendable objects
   admit one writer at a time. On those stores the catalog keeps conditional appends
   (`AtomicFileLog`) or a log in another service. The catalog keeps one SPI, with a provider
