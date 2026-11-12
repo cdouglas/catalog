@@ -43,17 +43,20 @@ import org.apache.iceberg.io.SupportsPrefixOperations;
  * <p>A request is: a lookup of an unbound input file (a HEAD: {@code exists} or {@code getLength}),
  * each GET (below), each plain write (a PUT, on close), each conditional write, each
  * delete, and each listing of a prefix (a LIST, at a read's latency: endive's profiles have none of
- * their own; fileio-catalog lists only to sweep its committed set's orphaned pages). A conditional
- * write takes effect halfway through its latency, as endive's simulator splits it: the request
- * reaches the store, the store checks the condition, and the reply comes back. A conditional
- * append that loses its race takes the store's failure latency in all.
+ * their own; fileio-catalog lists only to sweep its committed set's orphaned pages). The store acts
+ * on a lookup, a GET and a conditional write halfway through its latency, as endive's simulator
+ * splits a write: the request reaches the store, the store answers it (a lookup sees the object as
+ * it is then, a GET serves the version it holds then, a write's condition is checked and the write
+ * takes effect then), and the reply comes back (errata D24). A conditional append that loses its
+ * race takes the store's failure latency in all.
  *
  * <p>A stream opened ({@code newStream}) costs nothing and binds nothing until it reads: a GET is a
  * read that starts where no GET is open, of the bytes from there to the end of the version it
  * served, as S3's stream opens a ranged GET at its first read (TAIL_READS.md "Pricing"). A seek
  * the open GET cannot read through (backward, or forward past {@link #READ_THROUGH} bytes, as
- * {@code S3InputStream} skips a short one) ends it, and the next read is a GET from there. A GET
- * that fails (a version gone, no object) takes a request's round trip. So a lookup after an open
+ * {@code S3InputStream} skips a short one) ends it, and the next read is a GET from there, of the
+ * version the first served. A GET that fails (a version gone, no object) takes a request's round
+ * trip, and so does a lookup of no object. So a lookup after an open
  * and before the first read is a HEAD, as on S3 (errata D23). A file is bound by a lookup, by a
  * write that returned it, and by its first GET where the store's reads record their version
  * ({@link #readsRecordVersion}: the profile's, S3's and Azure's, and the store's): then a lookup
@@ -71,6 +74,12 @@ public final class LatencyFileIO implements SupportsAtomicOperations, SupportsPr
   private final double timeScale;
   private final SplittableRandom root;
   private final ThreadLocal<SplittableRandom> random;
+  private final Clock clock;
+
+  /** How a request's time passes: the calling thread parks (a test's clock runs instead). */
+  interface Clock {
+    void await(long nanos);
+  }
 
   /**
    * {@code store} with {@code profile}'s latencies, scaled by {@code timeScale} (1: as measured),
@@ -79,12 +88,19 @@ public final class LatencyFileIO implements SupportsAtomicOperations, SupportsPr
   public LatencyFileIO(
       InMemoryAtomicFileIO store, StoreProfile profile, String catalogLocation, double timeScale,
       long seed) {
+    this(store, profile, catalogLocation, timeScale, seed, LatencyFileIO::park);
+  }
+
+  LatencyFileIO(
+      InMemoryAtomicFileIO store, StoreProfile profile, String catalogLocation, double timeScale,
+      long seed, Clock clock) {
     this.store = store;
     this.profile = profile;
     this.catalogLocation = catalogLocation;
     this.timeScale = timeScale;
     this.root = new SplittableRandom(seed);
     this.random = ThreadLocal.withInitial(this::split);
+    this.clock = clock;
   }
 
   private synchronized SplittableRandom split() {
@@ -102,6 +118,10 @@ public final class LatencyFileIO implements SupportsAtomicOperations, SupportsPr
       return;
     }
     Requests.mine().waitedNanos += nanos;
+    clock.await(nanos);
+  }
+
+  private static void park(long nanos) {
     long deadline = System.nanoTime() + nanos;
     for (long left = nanos; left > 0; left = deadline - System.nanoTime()) {
       LockSupport.parkNanos(left);
@@ -182,39 +202,36 @@ public final class LatencyFileIO implements SupportsAtomicOperations, SupportsPr
       this.bound = bound;
     }
 
-    /** A HEAD, unless this file is bound. */
-    private void head() {
-      if (!bound) {
-        Requests.mine().heads++;
-        await(profile.readMs(0, random()));
+    /** A HEAD, unless this file is bound: the store answers it halfway through its latency. */
+    private <T> T lookup(Supplier<T> answer) {
+      if (bound) {
+        return answer.get();
+      }
+      Requests.mine().heads++;
+      double ms = profile.readMs(0, random());
+      double half = ms / 2;
+      await(half);
+      try {
+        return answer.get();
+      } finally {
         bound = true;
+        await(ms - half);
       }
     }
 
     @Override
     public long getLength() {
-      head();
-      return file.getLength();
+      return lookup(file::getLength);
     }
 
     @Override
     public boolean exists() {
-      head();
-      return file.exists();
+      return lookup(file::exists);
     }
 
     @Override
     public SeekableInputStream newStream() {
-      SeekableInputStream stream;
-      try {
-        stream = file.newStream(); // the GET, in the store's OPEN mode
-      } catch (RuntimeException e) {
-        Requests.mine().gets++;
-        await(profile.readMs(0, random()));
-        throw e;
-      }
-      boolean catalog = file.location().equals(catalogLocation);
-      return new TimedInputStream(this, stream, catalog);
+      return new TimedInputStream(this, file.location().equals(catalogLocation));
     }
 
     @Override
@@ -223,24 +240,28 @@ public final class LatencyFileIO implements SupportsAtomicOperations, SupportsPr
     }
   }
 
-  /** A stream of one version, its GETs priced by the bytes each asks for (the class comment). */
+  /**
+   * A stream of one version, its GETs priced by the bytes each asks for (the class comment): the
+   * store's stream, which binds the version it serves, is opened by the first GET, halfway through
+   * it.
+   */
   private final class TimedInputStream extends SeekableInputStream {
     private final TimedInputFile file;
-    private final SeekableInputStream in;
     private final boolean catalog;
+    private SeekableInputStream in = null;
     private long pos = 0;
     private boolean open = false;
 
-    TimedInputStream(TimedInputFile file, SeekableInputStream in, boolean catalog) {
+    TimedInputStream(TimedInputFile file, boolean catalog) {
       this.file = file;
-      this.in = in;
       this.catalog = catalog;
     }
 
     /**
      * A GET of the bytes from the position to the end of the version it serves, unless one is
      * open: its latency drawn as a whole read's was (half a request, then the rest of one of its
-     * bytes). It binds the file where the store's reads record their version.
+     * bytes), the version served when the request reaches the store. It binds the file where the
+     * store's reads record their version.
      */
     private void get() throws IOException {
       if (open) {
@@ -250,11 +271,17 @@ public final class LatencyFileIO implements SupportsAtomicOperations, SupportsPr
       Requests requests = Requests.mine();
       requests.gets++;
       SplittableRandom r = random();
+      double half = profile.readMs(0, r) / 2;
+      await(half);
       long served;
       try {
+        if (in == null) {
+          in = file.file.newStream(); // the store's GET, in its OPEN mode: binds the version now
+          in.seek(pos);
+        }
         served = ((InMemoryAtomicFileIO.Served) in).servedLength();
       } catch (IOException | RuntimeException e) {
-        await(profile.readMs(0, r));
+        await(half);
         throw e;
       }
       if (readsRecordVersion()) {
@@ -265,8 +292,7 @@ public final class LatencyFileIO implements SupportsAtomicOperations, SupportsPr
       if (catalog) {
         requests.catalogBytesRead += bytes;
       }
-      double half = profile.readMs(0, r) / 2;
-      await(half + Math.max(0, profile.readMs(bytes, r) - half));
+      await(Math.max(0, profile.readMs(bytes, r) - half));
     }
 
     @Override
@@ -279,7 +305,9 @@ public final class LatencyFileIO implements SupportsAtomicOperations, SupportsPr
       if (open && (newPos < pos || newPos - pos > READ_THROUGH)) {
         open = false;
       }
-      in.seek(newPos);
+      if (in != null) {
+        in.seek(newPos);
+      }
       pos = newPos;
     }
 
@@ -308,12 +336,14 @@ public final class LatencyFileIO implements SupportsAtomicOperations, SupportsPr
 
     @Override
     public int available() throws IOException {
-      return in.available();
+      return in != null ? in.available() : 0;
     }
 
     @Override
     public void close() throws IOException {
-      in.close();
+      if (in != null) {
+        in.close();
+      }
     }
   }
 

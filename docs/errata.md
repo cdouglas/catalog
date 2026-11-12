@@ -959,6 +959,44 @@ pointer and inline-TM modes alike; a client fix (Avro's length asked lazily,
 and a file that keeps the length its GET reported) would save it for every
 client, and is not made (`core-perf` has none).
 
+### D24. The latency model's reads saw the store at their ends and starts
+
+`LatencyFileIO` (FileIOCatalog's latency model) took a conditional write as
+acting halfway through its latency (endive's split), but a lookup (a HEAD) as
+seeing the object at the end of its latency, and a GET as serving the version
+the store held at its start. A store answers a request at one point while it is
+in flight, about halfway for all three. The difference decides races: what a
+writer knows when it sends is as old as the time since the store answered the
+read it learned it from. A writer resending after a probe knew the object as of
+the probe's reply, half a request fresher than a store would have told it; one
+resending after a tail read knew it as of the GET's start, half a request
+staler. On `s3x-2026-11` that is about 6.7 ms per resend against tail reads
+(half a HEAD and half a GET).
+
+It decides throughput where landings come as close together as a resend's
+window. Campaign tr6y (commit traces at E1's 3,000 tables and 128 workers on
+`s3x-2026-11`, pointer, tail reads on and off; catalog-bench lab campaign
+`tr6y`) measured each resend's window, from the instant the model's store last
+answered the writer's read to its append taking effect: 12.8 ms after a probe
+(a pinned read of the probed version's last trailer, 8 ms, then half an
+append), 18.9 ms after a tail read (the GET, 7.4 ms; folding the records and
+building the replica, 6.7 ms of CPU; half an append). Landings came 17.8 ms
+apart at the median with probes and 22.4 ms with tail reads, which sat at
+capacity: 107 of 128 writers in the commit loop and 87% of resends lost, against
+57 and 75%. With both reads answered halfway the windows are about 15.8 and
+15.2 ms.
+
+**Resolved 2026-11-12** (branch `one-request-reads`): the model's store acts on
+a lookup, a GET and a conditional write halfway through its latency
+(`TestLatencyFileIO`: a write landing in a request's first half is seen, one in
+its second half is not). What stays: every campaign before it ran under the old
+model. Its comparisons of tail reads against probes and whole reads favour the
+probes wherever the commit loop sets the limit (D15's at E1's 3,000 tables:
+p4r against e1-d20, tr6x, tr6y); comparisons whose arms read alike stand.
+catalog-bench's `ModelStore` answers a HEAD at its end too (its GET halfway);
+the objects it serves are written once (metadata files, manifest lists), so no
+read can tell, and it is left as it is.
+
 ## Test Coverage Gaps
 
 ### T3. Cloud integration tests rely on emulators for some behaviour

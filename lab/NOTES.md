@@ -12,8 +12,10 @@ to tables of one `FileIOCatalog` over an in-memory store whose requests take a p
   0: a large catalog read costs no more than a small one, which flatters big catalogs). A CAS is
   no faster than a PUT of its bytes. A conditional append has a landing latency and, when it loses
   its race, a failure latency (Azure's is about 2 s).
-- A GET and a conditional write take effect halfway through their latency (endive's split), so
-  writers race for the catalog object as they would over a network.
+- The store answers a lookup (a HEAD), a GET and a conditional write halfway through its latency
+  (endive's split), so writers race for the catalog object as they would over a network. Until
+  errata D24's fix (branch `one-request-reads`) a lookup saw the store at its end and a GET at its
+  start, which favoured probes over tail reads wherever the commit loop set the limit.
 - `s3` and `gcp` have no conditional append: the catalog compacts (CASes the whole object) on every
   commit there.
 - `time_scale` scales every latency (1 = as measured).

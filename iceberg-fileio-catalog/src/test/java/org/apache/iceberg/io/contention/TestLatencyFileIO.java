@@ -19,12 +19,21 @@
 package org.apache.iceberg.io.contention;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.util.Map;
+import java.util.NavigableMap;
+import java.util.TreeMap;
+import org.apache.iceberg.io.AtomicOutputFile;
+import org.apache.iceberg.io.CAS;
 import org.apache.iceberg.io.InMemoryAtomicFileIO;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.PositionOutputStream;
 import org.apache.iceberg.io.SeekableInputStream;
+import org.apache.iceberg.io.SupportsAtomicOperations;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -166,5 +175,115 @@ class TestLatencyFileIO {
 
     assertThat(requests().gets).isZero();
     assertThat(requests().bytesRead).isZero();
+  }
+
+  /**
+   * A clock that spends no time: each wait moves it on, running the actions due by then first, so
+   * a test lands a write at a point of a request's latency.
+   */
+  private static final class VirtualClock implements LatencyFileIO.Clock {
+    private final NavigableMap<Long, Runnable> due = new TreeMap<>();
+    private long now = 0;
+
+    /** Runs {@code action} {@code ms} from now. */
+    void after(double ms, Runnable action) {
+      due.put(now + (long) (ms * 1e6), action);
+    }
+
+    @Override
+    public void await(long nanos) {
+      long end = now + nanos;
+      for (Map.Entry<Long, Runnable> next = due.pollFirstEntry();
+          next != null;
+          next = due.pollFirstEntry()) {
+        if (next.getKey() > end) {
+          due.put(next.getKey(), next.getValue());
+          break;
+        }
+        now = next.getKey();
+        next.getValue().run();
+      }
+      now = end;
+    }
+  }
+
+  /** The catalog object replaced, as another writer would, by {@code length} bytes. */
+  private void replaceWith(int length) {
+    try (PositionOutputStream out = store.newOutputFile(CATALOG).createOrOverwrite()) {
+      out.write(new byte[length]);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
+  /**
+   * The store acts on a request halfway through its latency, a read as a conditional write: a
+   * lookup sees the object as it is then (errata D24). On the "instant" profile every request takes
+   * 1 to about 1.4 ms, so a write 0.2 ms in lands in its first half, and one 0.8 ms in, its second.
+   */
+  @Test
+  void aLookupSeesTheObjectHalfwayThroughItsRequest() {
+    VirtualClock clock = new VirtualClock();
+    LatencyFileIO timed =
+        new LatencyFileIO(store, StoreProfile.named("instant"), CATALOG, 1, 1, clock);
+    clock.after(0.2, () -> replaceWith(SIZE + 1));
+    clock.after(0.8, () -> replaceWith(SIZE + 2));
+
+    assertThat(timed.newInputFile(CATALOG).getLength()).isEqualTo(SIZE + 1);
+  }
+
+  /** A GET serves the version the store holds halfway through the request (errata D24). */
+  @Test
+  void aGetServesTheVersionHeldHalfwayThroughIt() throws IOException {
+    VirtualClock clock = new VirtualClock();
+    LatencyFileIO timed =
+        new LatencyFileIO(store, StoreProfile.named("instant"), CATALOG, 1, 1, clock);
+    InputFile file = timed.newInputFile(CATALOG);
+    clock.after(0.2, () -> replaceWith(SIZE + 1));
+    clock.after(0.8, () -> replaceWith(SIZE + 2));
+
+    long read = 0;
+    try (SeekableInputStream in = file.newStream()) {
+      byte[] buffer = new byte[8192];
+      for (int n = in.read(buffer); n >= 0; n = in.read(buffer)) {
+        read += n;
+      }
+    }
+    assertThat(read).isEqualTo(SIZE + 1);
+    assertThat(file.getLength())
+        .as("the GET bound the file to the version it read")
+        .isEqualTo(SIZE + 1);
+  }
+
+  /**
+   * A conditional write takes effect halfway through its latency: a write landing in its first
+   * half beats it, and one in its second half comes after it.
+   */
+  @Test
+  void aConditionalWriteTakesEffectHalfwayThroughIt() throws IOException {
+    VirtualClock clock = new VirtualClock();
+    LatencyFileIO timed =
+        new LatencyFileIO(store, StoreProfile.named("instant"), CATALOG, 1, 1, clock);
+    byte[] record = new byte[16];
+
+    InputFile file = timed.newInputFile(CATALOG);
+    assertThat(file.getLength()).isEqualTo(SIZE);
+    AtomicOutputFile late = timed.newOutputFile(file);
+    CAS token =
+        late.prepare(() -> new ByteArrayInputStream(record), AtomicOutputFile.Strategy.APPEND);
+    clock.after(0.8, () -> replaceWith(SIZE + 2));
+    late.writeAtomic(token, () -> new ByteArrayInputStream(record));
+    assertThat(store.newInputFile(CATALOG).getLength())
+        .as("replaced after the append")
+        .isEqualTo(SIZE + 2);
+
+    InputFile again = timed.newInputFile(CATALOG);
+    assertThat(again.getLength()).isEqualTo(SIZE + 2);
+    AtomicOutputFile early = timed.newOutputFile(again);
+    CAS second =
+        early.prepare(() -> new ByteArrayInputStream(record), AtomicOutputFile.Strategy.APPEND);
+    clock.after(0.2, () -> replaceWith(SIZE + 3));
+    assertThatThrownBy(() -> early.writeAtomic(second, () -> new ByteArrayInputStream(record)))
+        .isInstanceOf(SupportsAtomicOperations.AppendException.class);
   }
 }
