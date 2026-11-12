@@ -23,7 +23,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.util.SplittableRandom;
-import java.util.concurrent.locks.LockSupport;
 import java.util.function.Supplier;
 import org.apache.iceberg.io.AtomicOutputFile;
 import org.apache.iceberg.io.CAS;
@@ -76,7 +75,11 @@ public final class LatencyFileIO implements SupportsAtomicOperations, SupportsPr
   private final ThreadLocal<SplittableRandom> random;
   private final Clock clock;
 
-  /** How a request's time passes: the calling thread parks (a test's clock runs instead). */
+  /**
+   * How a request's time passes: the calling thread waits through catalog-bench's {@link
+   * org.catalogbench.metrics.Waits}, so that how late it woke counts as the driver's delay ({@code
+   * late_ms}), as every model wait of the benchmark's does (a test's clock runs instead).
+   */
   interface Clock {
     void await(long nanos);
   }
@@ -88,7 +91,7 @@ public final class LatencyFileIO implements SupportsAtomicOperations, SupportsPr
   public LatencyFileIO(
       InMemoryAtomicFileIO store, StoreProfile profile, String catalogLocation, double timeScale,
       long seed) {
-    this(store, profile, catalogLocation, timeScale, seed, LatencyFileIO::park);
+    this(store, profile, catalogLocation, timeScale, seed, org.catalogbench.metrics.Waits::await);
   }
 
   LatencyFileIO(
@@ -119,13 +122,6 @@ public final class LatencyFileIO implements SupportsAtomicOperations, SupportsPr
     }
     Requests.mine().waitedNanos += nanos;
     clock.await(nanos);
-  }
-
-  private static void park(long nanos) {
-    long deadline = System.nanoTime() + nanos;
-    for (long left = nanos; left > 0; left = deadline - System.nanoTime()) {
-      LockSupport.parkNanos(left);
-    }
   }
 
   @Override
