@@ -5493,4 +5493,34 @@ public class TestCatalogRegressions {
       assertThat(io.before.get()).isNull();
     }
   }
+
+  /**
+   * Bug 88: a drop with purge of a table whose metadata file is lost failed with
+   * NotFoundException, and the table could not be dropped. Iceberg's metastores (JDBC, Hive, Glue,
+   * DynamoDB) drop such a table without purging it, on purpose (apache/iceberg#5510, after users
+   * could not drop one: #7258, #12016); LogCatalog's drop loaded the version it purges and threw.
+   * Found by a search of upstream's record for Bug 86 (load racing a purge). A drop with purge
+   * whose table's file is lost now drops the table, and leaves its files.
+   */
+  @Nested
+  class PurgeOfATableWithALostMetadataFile {
+    private final TableIdentifier t = TableIdentifier.of("ns", "t");
+
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "CAS", "COMPACT", "MEMLOG"})
+    void dropsTheTableWithoutPurgingIt(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = mode.catalog(io, "mem:///warehouse", "c", Map.of());
+      catalog.createNamespace(Namespace.of("ns"));
+      Table table = catalog.createTable(t, intSchema);
+      table.newFastAppend().appendFile(file("a")).commit();
+      String lost = ((org.apache.iceberg.HasTableOperations) catalog.loadTable(t))
+          .operations().current().metadataFileLocation();
+      io.deleteFile(lost);
+
+      assertThat(catalog.dropTable(t, true)).isTrue();
+      assertThat(catalog.tableExists(t)).isFalse();
+      assertThat(catalog.dropTable(t, true)).isFalse();
+    }
+  }
 }

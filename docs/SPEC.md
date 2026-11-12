@@ -608,6 +608,9 @@ dropped, else `CommitFailedException`, which the drop and the reinline retry
 on a fresh read. Iceberg's own refresh reported the race as the missing file
 too: C29 (load racing a purge) in [ICEBERG_ISSUES.md](ICEBERG_ISSUES.md),
 fixed on the fork's `core-fixes`; the catalog does not depend on that fix.
+A drop with purge whose table's metadata file is lost (a fresh read still
+names it) drops the table and leaves its files, as Iceberg's metastores do
+(apache/iceberg#5510; Bug 88 (purge of a lost file)).
 
 The catalog's log properties (`LogCatalogProperties`) configure the commit
 loop: `fileio.catalog.max.append.count` and `max.append.size` set when it

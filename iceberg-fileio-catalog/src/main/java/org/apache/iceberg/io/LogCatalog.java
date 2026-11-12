@@ -270,8 +270,7 @@ public class LogCatalog extends BaseMetastoreCatalog
       }
       TableMetadata dropped;
       try {
-        // The metadata a purge deletes the files of: the version this drop removes.
-        dropped = purge ? tableOpsAsRead(identifier, read).current() : null;
+        dropped = purge ? purgedVersion(identifier, read) : null;
         new CatalogMutation(read).dropTable(identifier).commit(log);
       } catch (NoSuchTableException e) {
         return false;
@@ -291,6 +290,22 @@ public class LogCatalog extends BaseMetastoreCatalog
         }
       }
       return true;
+    }
+  }
+
+  /**
+   * The metadata a drop with purge deletes the files of: the version of {@code identifier} that
+   * {@code read} holds, which the drop removes. Null if its metadata file is lost: the drop goes on
+   * and leaves the table's files, as Iceberg's metastores drop such a table (apache/iceberg#5510;
+   * Bug 88). A file gone because the table changed since {@code read} is that change (Bug 87).
+   */
+  private TableMetadata purgedVersion(TableIdentifier identifier, Replica<CatalogState> read) {
+    try {
+      return tableOpsAsRead(identifier, read).current();
+    } catch (org.apache.iceberg.exceptions.NotFoundException e) {
+      LOG.warn("Cannot load the metadata of {}: dropping it without purging its files",
+          identifier, e);
+      return null;
     }
   }
 
