@@ -13,7 +13,7 @@ reports or pull requests upstream. It covers the reproduction, the cause
 with links to the 1.12.0 source, the fix, its tests, and what to settle
 before a PR.
 
-Upstream fixed C1. The fork fixes C2 to C28 on branch `core-fixes`, each
+Upstream fixed C1. The fork fixes C2 to C29 on branch `core-fixes`, each
 in an upstream-style commit with its tests, so the project's tests no
 longer work around any of them.
 
@@ -64,8 +64,11 @@ reported upstream, C26 with a fix the stale bot closed, C27 with a fix,
 in 2020, that missed the metastores' drop check. C28, which a review of
 JDBC's commit path found on 2026-11-03 (for catalog-bench's JDBC
 baseline), was fixed that day; upstream had it reported two days before,
-with a fix of its main case open. The Fork column is `atomicio`, which
-sits on `core-fixes`.
+with a fix of its main case open. C29, which a search of upstream's
+record for fileio-catalog's Bug 86 (load racing a purge) found on
+2026-11-12, was fixed that day; it reproduces on main at `e70a2efcd0`,
+and upstream has no report of it. The Fork column is `atomicio`, which
+sits on `core-perf`, on `core-fixes`.
 
 | Issue | Fork | 1.12.0 | main | Upstream |
 |---|---|---|---|---|
@@ -97,6 +100,7 @@ sits on `core-fixes`.
 | C26. A row delta whose conflict filter misses a file commits a second DV for it | fixed, `core-fixes` 04a2388 | yes | yes | PR [#15966](https://github.com/apache/iceberg/pull/15966), closed by the stale bot unreviewed; [#17206](https://github.com/apache/iceberg/issues/17206), open, on the unreadable tables it leaves |
 | C27. A handle to a dropped table fails with an NPE once it has reported the drop | fixed, `core-fixes` 628063f | yes | yes | [#1513](https://github.com/apache/iceberg/issues/1513), closed by [#1553](https://github.com/apache/iceberg/pull/1553) (0.10.0), which missed the metastores' check of the cleared location |
 | C28. A JDBC commit whose UPDATE committed but whose reply was lost is reported as failed | fixed, `core-fixes` d69176a | yes (since 1.6.0) | yes | [#18743](https://github.com/apache/iceberg/issues/18743), open; PR [#18745](https://github.com/apache/iceberg/pull/18745), open, fixes the zero-row UPDATE as the fork does |
+| C29. A load racing a drop with purge reports a missing metadata file | fixed, `core-fixes` 207fce3 | yes | yes | not reported (2026-11-12); upstream reports a file the catalog still names as missing on purpose (`CatalogTests.testLoadTableWithMissingMetadataFile`), which the fix keeps |
 
 "Not reported" means a search of apache/iceberg's issues, pull requests
 and PR branches, and of the issues@ and dev@ lists, found nothing for the
@@ -864,6 +868,43 @@ UncheckedSQLException though it may have committed.
 - **No workaround** to remove: FileIOCatalog does not use JDBC.
 - **Canary:** `aJdbcCommitWhoseReplyIsLostCommits`, Iceberg's JdbcCatalog
   on SQLite (test dependency `sqlite-jdbc`).
+
+### C29. A load racing a drop with purge reports a missing metadata file
+
+Details: [iceberg-issues/C29.md](iceberg-issues/C29.md).
+
+A metastore's refresh reads the table's metadata location from the
+catalog, then the file. A drop with purge, or a commit that deletes old
+metadata files (`write.metadata.delete-after-commit.enabled`), can land
+between the two and delete the file; the refresh then throws
+NotFoundException, which `refreshFromMetadataLocation` doesn't retry.
+The caller gets a lost metadata file for a table that was dropped, or
+that moved on and is there. Views alike, whose JDBC drop deletes their
+files (`gc.enabled`).
+
+- **Cause:** `BaseMetastoreTableOperations.refresh` (and
+  `BaseViewOperations.refresh`) take a missing file for a lost one,
+  though the catalog may no longer name it. Upstream means
+  NotFoundException for a file the catalog still names
+  (`CatalogTests.testLoadTableWithMissingMetadataFile`).
+- **Found by:** `TestCatalogFaultProperties` found the race in
+  fileio-catalog's own catalog (havoc round az-r0, 2026-11-12: Bug 86
+  (load racing a purge), and Bug 87 (staged read racing a purge)
+  beside it); a search of upstream's record that day showed Iceberg's
+  metastores have it too.
+- **Fork:** fixed on `core-fixes` by 207fce3, "Core: Read a table's
+  location again when its metadata file is missing": a refresh whose
+  file is missing calls `doRefresh` once more, which finds the table
+  dropped or loads the file the catalog names now; a file still named
+  stays NotFoundException. Its tests are three in `TestJdbcCatalog` and
+  one in `TestJdbcViewCatalog`, interleaved through the catalog's
+  FileIO.
+- **No workaround** to remove: `LogCatalog`'s table operations read the
+  catalog again themselves (Bug 86), and load a table from a read they
+  stage on through `tableOpsAsRead` (Bug 87), so they work on stock
+  Iceberg.
+- **Canary:** `aRefreshRacingADropWithPurgeFindsTheTableDropped`, on the
+  table operations of C27's canary.
 
 ## Accepted Iceberg Behavior
 

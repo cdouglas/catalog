@@ -5351,8 +5351,8 @@ public class TestCatalogRegressions {
    * reads bound at open, a reader preempted between opening the catalog and reading it reads the
    * version before the drop. A load whose pointer's metadata file is missing now reads the catalog
    * again: a table dropped is NoSuchTableException, a pointer moved on loads the file it names, and
-   * only a file the catalog still names is NotFoundException. Iceberg's metastore operations (JDBC,
-   * Hive) still report the race as NotFoundException.
+   * only a file the catalog still names is NotFoundException. Iceberg's own refresh did the same:
+   * C29 (load racing a purge), fixed on the fork's core-fixes.
    */
   @Nested
   class LoadRacingAPurge {

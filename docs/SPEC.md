@@ -605,8 +605,9 @@ read it stages on (a drop with purge, `reinline`, `commitTransaction`) takes
 the file gone as a change since its read (`LogCatalog.tableOpsAsRead`, Bug 87
 (staged read racing a purge)): `NoSuchTableException` if the table was
 dropped, else `CommitFailedException`, which the drop and the reinline retry
-on a fresh read. Iceberg's metastore operations (JDBC, Hive) report the race
-as the missing file.
+on a fresh read. Iceberg's own refresh reported the race as the missing file
+too: C29 (load racing a purge) in [ICEBERG_ISSUES.md](ICEBERG_ISSUES.md),
+fixed on the fork's `core-fixes`; the catalog does not depend on that fix.
 
 The catalog's log properties (`LogCatalogProperties`) configure the commit
 loop: `fileio.catalog.max.append.count` and `max.append.size` set when it

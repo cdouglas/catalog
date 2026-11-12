@@ -794,8 +794,9 @@ public class LogCatalog extends BaseMetastoreCatalog
      * ({@code write.metadata.delete-after-commit.enabled}), landed after {@code read} and deleted
      * it (Bug 86). The load goes on from the fresh read: the table dropped is NoSuchTableException,
      * a pointer moved on loads the file it names. Throws {@code missing} if the fresh read names
-     * the same file, which is lost, not superseded. Iceberg's metastore operations (JDBC, Hive)
-     * report such a race as the missing file.
+     * the same file, which is lost, not superseded. Iceberg's own refresh reported such a race as
+     * the missing file (C29 (load racing a purge), fixed on the fork's core-fixes); this does not
+     * depend on that fix.
      */
     private Replica<CatalogState> readPastMissing(
         Replica<CatalogState> read, org.apache.iceberg.exceptions.NotFoundException missing) {

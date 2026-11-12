@@ -25,7 +25,10 @@ and C13, and C18 and C20 after C11; C23 after C3, C9 and C15. C24, added
 2026-10-24, onto `e70a2efcd` on its own. C26 and C27, added 2026-10-25,
 were written on 1.12.0; their files are unchanged on `main` at
 `97659351d4`. C28, added 2026-11-03, was written on 1.12.0, after C27;
-its file is unchanged on `main` at `e70a2efcd0`.
+its file is unchanged on `main` at `e70a2efcd0`. C29, added 2026-11-12,
+was written on 1.12.0 after C27, whose lines in both `refresh` methods it
+sits beside; on `main` at `e70a2efcd0`, which lacks C27, it needs C27
+first or a one-line merge.
 
 | Issue | Fix | Before a PR |
 |---|---|---|
@@ -57,3 +60,4 @@ its file is unchanged on `main` at `e70a2efcd0`.
 | [C26. A row delta whose conflict filter misses a file commits a second deletion vector for it](C26.md) | [`04a2388`](https://github.com/cdouglas/iceberg/commit/04a2388943f6a7186b75808519e2a4c000af6eaa) | revive PR #15966 with the partition-scoped check, which keeps #15653's pruning; cite #17206 |
 | [C27. A handle to a dropped table fails with an NPE once it has reported the drop](C27.md) | [`628063f`](https://github.com/cdouglas/iceberg/commit/628063f534100322f00dea99f6e78ac530b77ae5) | ready; cite #1513 and #1553, which this completes; run the Hive and Glue tests |
 | [C28. A JDBC commit whose UPDATE committed but whose reply was lost is reported as failed](C28.md) | `d69176a` | don't file: #18743 reports it and PR #18745 fixes the zero-row UPDATE; offer the other cases and tests there |
+| [C29. A load racing a drop with purge reports a missing metadata file](C29.md) | [`207fce3`](https://github.com/cdouglas/iceberg/commit/207fce372c220471a6950a688fc21a40701dc595) | ready; frame it by `CatalogTests.testLoadTableWithMissingMetadataFile` (a file still named is lost) and #5510 (drops tolerate a lost file); run the Hive and Glue tests |

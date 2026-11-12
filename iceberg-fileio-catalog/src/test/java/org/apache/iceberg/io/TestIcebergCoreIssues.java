@@ -69,7 +69,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
- * Canaries for the Iceberg core bugs this project's fuzzers and reviews found, C1 to C28 in
+ * Canaries for the Iceberg core bugs this project's fuzzers and reviews found, C1 to C29 in
  * docs/ICEBERG_ISSUES.md: one test each, on Iceberg's own InMemoryCatalog, that asserts the bug is
  * absent. Upstream fixed C1, and the fork's core-fixes branch fixes the others, so every test
  * passes against the fork. A test that fails means its bug is back: a rebase dropped the fork's
@@ -932,6 +932,47 @@ class TestIcebergCoreIssues {
         throw (Error) e.getCause();
       }
     }
+  }
+
+  /**
+   * C29. A load whose metadata file a drop with purge deleted after the load read its location must
+   * report the table dropped: metastore operations read the location, then the file, and reported
+   * the file the catalog no longer names as missing (NotFoundException).
+   */
+  @Test
+  void aRefreshRacingADropWithPurgeFindsTheTableDropped() {
+    Map<String, String> metastore = new java.util.HashMap<>();
+    java.util.concurrent.atomic.AtomicReference<Runnable> beforeMetadataRead =
+        new java.util.concurrent.atomic.AtomicReference<>();
+    org.apache.iceberg.io.FileIO io =
+        new org.apache.iceberg.inmemory.InMemoryFileIO() {
+          @Override
+          public org.apache.iceberg.io.InputFile newInputFile(String path) {
+            Runnable before = beforeMetadataRead.getAndSet(null);
+            if (before != null) {
+              before.run();
+            }
+            return super.newInputFile(path);
+          }
+        };
+    String location = "mem:///" + UUID.randomUUID() + "/t";
+    new MetastoreOperations(metastore, io)
+        .commit(
+            null,
+            TableMetadata.newTableMetadata(
+                SCHEMA, PartitionSpec.unpartitioned(), location, Map.of()));
+    Table handle = new BaseTable(new MetastoreOperations(metastore, io), "t");
+    handle.refresh();
+    new BaseTable(new MetastoreOperations(metastore, io), "t")
+        .updateProperties()
+        .set("k", "v")
+        .commit();
+    // another process drops the table with purge between the handle's read of its new location and
+    // its read of the file there
+    beforeMetadataRead.set(() -> io.deleteFile(metastore.remove("t")));
+
+    assertThatThrownBy(handle::refresh).as(BACK, "C29").isInstanceOf(NoSuchTableException.class);
+    assertThat(beforeMetadataRead.get()).isNull();
   }
 
   /**
