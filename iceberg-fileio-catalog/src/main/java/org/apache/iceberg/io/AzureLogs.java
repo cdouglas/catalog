@@ -72,6 +72,22 @@ public final class AzureLogs {
   }
 
   /**
+   * The URL of the container a log's location names: its scheme, host (or, on an emulator, host
+   * and account) and container, without the path in it.
+   *
+   * @throws IllegalArgumentException if it names no container and path
+   */
+  static String containerUrl(String location) {
+    BlobUrlParts parts = BlobUrlParts.parse(location);
+    Preconditions.checkArgument(
+        !Strings.isNullOrEmpty(parts.getBlobContainerName())
+            && !Strings.isNullOrEmpty(parts.getBlobName()),
+        "%s names no container and path: %s", LogCatalogProperties.LOG_LOCATION, location);
+    String url = parts.setBlobName(null).setSnapshot(null).setVersionId(null).toUrl().toString();
+    return url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
+  }
+
+  /**
    * The log {@code properties} locate ({@code fileio.catalog.log.location}, an {@code https} Blob
    * URL of a container and a path in it), signed with the account key they give.
    *
@@ -83,16 +99,13 @@ public final class AzureLogs {
         "A catalog on an Azure log needs %s: https://<account>.blob.core.windows.net/<container>/"
             + "<path>", LogCatalogProperties.LOG_LOCATION);
     BlobUrlParts parts = BlobUrlParts.parse(location);
-    String container = parts.getBlobContainerName();
     String path = parts.getBlobName();
-    Preconditions.checkArgument(!Strings.isNullOrEmpty(container) && !Strings.isNullOrEmpty(path),
-        "%s names no container and path: %s", LogCatalogProperties.LOG_LOCATION, location);
+    String containerUrl = containerUrl(location);
     String account = properties.get(SHARED_KEY_ACCOUNT_NAME);
     String key = properties.get(SHARED_KEY_ACCOUNT_KEY);
     Preconditions.checkArgument(account != null && key != null,
         "A catalog on an Azure log needs an account key (%s and %s)", SHARED_KEY_ACCOUNT_NAME,
         SHARED_KEY_ACCOUNT_KEY);
-    String containerUrl = location.substring(0, location.indexOf(container) + container.length());
     AzureAppendBlobStore store =
         AzureAppendBlobStore.create(containerUrl, new StorageSharedKeyCredential(account, key));
     return open(store, path, properties);
