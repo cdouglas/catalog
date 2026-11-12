@@ -95,18 +95,18 @@ public class CatalogState {
   private CatalogState(Builder builder) {
     this.nextNamespaceId = builder.nextNamespaceId;
     this.nextTableId = builder.nextTableId;
-    this.namespaceById = ImmutableMap.copyOf(builder.namespaceById);
-    this.namespaceLookup = ImmutableMap.copyOf(builder.namespaceLookup);
-    this.tableById = ImmutableMap.copyOf(builder.tableById);
-    this.tableLookup = ImmutableMap.copyOf(builder.tableLookup);
-    this.nsProperties = deepCopyProperties(builder.nsProperties);
-    this.tblInlineMetadata = ImmutableMap.copyOf(builder.tblInlineMetadata);
-    this.tblManifestPrefix = ImmutableMap.copyOf(builder.tblManifestPrefix);
-    this.manifestPool = ImmutableMap.copyOf(builder.manifestPool);
-    this.snapshotManifests = ImmutableMap.copyOf(builder.snapshotManifests);
-    this.poolOrdinals = ImmutableMap.copyOf(builder.poolOrdinals);
-    this.nextOrdinal = ImmutableMap.copyOf(builder.nextOrdinal);
-    this.sealedBlocks = ImmutableMap.copyOf(builder.sealedBlocks);
+    this.namespaceById = builder.namespaceById.built();
+    this.namespaceLookup = builder.namespaceLookup.built();
+    this.tableById = builder.tableById.built();
+    this.tableLookup = builder.tableLookup.built();
+    this.nsProperties = builder.nsProperties.built();
+    this.tblInlineMetadata = builder.tblInlineMetadata.built();
+    this.tblManifestPrefix = builder.tblManifestPrefix.built();
+    this.manifestPool = builder.manifestPool.built();
+    this.snapshotManifests = builder.snapshotManifests.built();
+    this.poolOrdinals = builder.poolOrdinals.built();
+    this.nextOrdinal = builder.nextOrdinal.built();
+    this.sealedBlocks = builder.sealedBlocks.built();
     List<DroppedPage> dropped = new ArrayList<>();
     for (DroppedPage page : builder.droppedPages) {
       if (!page.deleted) {
@@ -118,45 +118,142 @@ public class CatalogState {
     this.snapshotBlock = builder.snapshotBlock;
     this.snapshotWindow = builder.snapshotWindow;
     // The builder no longer changes them once built (Builder#build)
-    this.conflictStates = ImmutableMap.copyOf(builder.conflictStates);
-  }
-
-  private static Map<Integer, Map<String, String>> deepCopyProperties(
-      Map<Integer, Map<String, String>> props) {
-    ImmutableMap.Builder<Integer, Map<String, String>> builder = ImmutableMap.builder();
-    for (Map.Entry<Integer, Map<String, String>> entry : props.entrySet()) {
-      builder.put(entry.getKey(), ImmutableMap.copyOf(entry.getValue()));
-    }
-    return builder.build();
+    this.conflictStates = builder.conflictStates.built();
   }
 
   /**
-   * A builder that continues from this state, sharing what it holds: a table's manifest lists are
-   * copied on the builder's first change to them, and inline metadata is immutable.
+   * A builder that continues from this state, sharing what it holds: each of its maps until the
+   * builder's first change to it ({@link SharedMap}), a table's manifest lists and a namespace's
+   * properties until the builder's first change to them, and inline metadata, which is immutable.
+   * A record changes a few of a catalog's maps, so a fold or a commit that replays it onto this
+   * state copies only those (errata D25).
    */
   Builder toBuilder() {
     Builder builder = new Builder();
     builder.nextNamespaceId = nextNamespaceId;
     builder.nextTableId = nextTableId;
-    builder.namespaceById.clear();
-    builder.namespaceById.putAll(namespaceById);
-    builder.namespaceLookup.putAll(namespaceLookup);
-    builder.tableById.putAll(tableById);
-    builder.tableLookup.putAll(tableLookup);
-    nsProperties.forEach((id, props) -> builder.nsProperties.put(id, new HashMap<>(props)));
-    builder.tblInlineMetadata.putAll(tblInlineMetadata);
-    builder.tblManifestPrefix.putAll(tblManifestPrefix);
-    builder.manifestPool.putAll(manifestPool);
-    builder.snapshotManifests.putAll(snapshotManifests);
-    builder.poolOrdinals.putAll(poolOrdinals);
-    builder.nextOrdinal.putAll(nextOrdinal);
-    builder.sealedBlocks.putAll(sealedBlocks);
+    builder.namespaceById.share(namespaceById);
+    builder.namespaceLookup.share(namespaceLookup);
+    builder.tableById.share(tableById);
+    builder.tableLookup.share(tableLookup);
+    builder.nsProperties.share(nsProperties);
+    builder.tblInlineMetadata.share(tblInlineMetadata);
+    builder.tblManifestPrefix.share(tblManifestPrefix);
+    builder.manifestPool.share(manifestPool);
+    builder.snapshotManifests.share(snapshotManifests);
+    builder.poolOrdinals.share(poolOrdinals);
+    builder.nextOrdinal.share(nextOrdinal);
+    builder.sealedBlocks.share(sealedBlocks);
     builder.droppedPages.addAll(droppedPages);
     builder.conflictEncoding = conflictEncoding;
     builder.snapshotBlock = snapshotBlock;
     builder.snapshotWindow = snapshotWindow;
-    builder.conflictStates.putAll(conflictStates);
+    builder.conflictStates.share(conflictStates);
     return builder;
+  }
+
+  /**
+   * A builder's map: the map of the state the builder continues, shared until the builder's first
+   * change to it, which copies it. A state takes the map as built: the shared one if unchanged,
+   * else the builder's copy, read only, which the builder copies again before any later change.
+   * Its views are read only: a change goes through the map.
+   */
+  private static final class SharedMap<K, V> extends java.util.AbstractMap<K, V> {
+    private Map<K, V> map = new HashMap<>();
+    private boolean owned = true;
+
+    /** Shares {@code shared}, a state's map, which nothing changes. */
+    void share(Map<K, V> shared) {
+      this.map = shared;
+      this.owned = false;
+    }
+
+    private Map<K, V> writable() {
+      if (!owned) {
+        map = new HashMap<>(map);
+        owned = true;
+      }
+      return map;
+    }
+
+    /** The map as a state holds it, which this builder no longer changes. */
+    Map<K, V> built() {
+      if (owned) {
+        map = Collections.unmodifiableMap(map);
+        owned = false;
+      }
+      return map;
+    }
+
+    @Override
+    public int size() {
+      return map.size();
+    }
+
+    @Override
+    public boolean isEmpty() {
+      return map.isEmpty();
+    }
+
+    @Override
+    public boolean containsKey(Object key) {
+      return map.containsKey(key);
+    }
+
+    @Override
+    public boolean containsValue(Object value) {
+      return map.containsValue(value);
+    }
+
+    @Override
+    public V get(Object key) {
+      return map.get(key);
+    }
+
+    @Override
+    public V getOrDefault(Object key, V defaultValue) {
+      return map.getOrDefault(key, defaultValue);
+    }
+
+    @Override
+    public V put(K key, V value) {
+      return writable().put(key, value);
+    }
+
+    @Override
+    public V remove(Object key) {
+      return map.containsKey(key) ? writable().remove(key) : null;
+    }
+
+    @Override
+    public void putAll(Map<? extends K, ? extends V> other) {
+      if (!other.isEmpty()) {
+        writable().putAll(other);
+      }
+    }
+
+    @Override
+    public void clear() {
+      if (!map.isEmpty()) {
+        map = new HashMap<>();
+        owned = true;
+      }
+    }
+
+    @Override
+    public Set<K> keySet() {
+      return Collections.unmodifiableSet(map.keySet());
+    }
+
+    @Override
+    public java.util.Collection<V> values() {
+      return Collections.unmodifiableCollection(map.values());
+    }
+
+    @Override
+    public Set<Map.Entry<K, V>> entrySet() {
+      return Collections.unmodifiableMap(map).entrySet();
+    }
   }
 
   /** The state of a catalog with no namespaces or tables: a log before its first record. */
@@ -520,30 +617,36 @@ public class CatalogState {
     private int nextNamespaceId = 1;
     private int nextTableId = 1;
 
-    private final Map<Integer, NsEntry> namespaceById = new HashMap<>();
-    private final Map<Namespace, Integer> namespaceLookup = new HashMap<>();
-    private final Map<Integer, TblEntry> tableById = new HashMap<>();
-    private final Map<TableIdentifier, Integer> tableLookup = new HashMap<>();
-    private final Map<Integer, Map<String, String>> nsProperties = new HashMap<>();
-    private final Map<Integer, InlineTable> tblInlineMetadata = new HashMap<>();
-    private final Map<Integer, String> tblManifestPrefix = new HashMap<>();
+    // Each map is shared with the state this builder continues until its first change here
+    // (SharedMap)
+    private final SharedMap<Integer, NsEntry> namespaceById = new SharedMap<>();
+    private final SharedMap<Namespace, Integer> namespaceLookup = new SharedMap<>();
+    private final SharedMap<Integer, TblEntry> tableById = new SharedMap<>();
+    private final SharedMap<TableIdentifier, Integer> tableLookup = new SharedMap<>();
+    // A namespace's properties: shared with the state this builder continues until a change here,
+    // which copies them first (ownedProperties)
+    private final SharedMap<Integer, Map<String, String>> nsProperties = new SharedMap<>();
+    private final Set<Integer> ownedProperties = new HashSet<>();
+    private final SharedMap<Integer, InlineTable> tblInlineMetadata = new SharedMap<>();
+    private final SharedMap<Integer, String> tblManifestPrefix = new SharedMap<>();
     // A table's manifest pool and lists: persistent maps, shared with the state this builder
     // continues; a change replaces the table's map with one sharing all but the changed path.
     // Each list is immutable.
-    private final Map<Integer, Map<String, ManifestFile>> manifestPool = new HashMap<>();
-    private final Map<Integer, Map<Long, List<String>>> snapshotManifests = new HashMap<>();
+    private final SharedMap<Integer, Map<String, ManifestFile>> manifestPool = new SharedMap<>();
+    private final SharedMap<Integer, Map<Long, List<String>>> snapshotManifests =
+        new SharedMap<>();
     // The pooled manifests' ordinals (persistent maps, as the pool) and each table's counter
-    private final Map<Integer, Map<String, Integer>> poolOrdinals = new HashMap<>();
-    private final Map<Integer, Integer> nextOrdinal = new HashMap<>();
-    private final Map<Integer, java.util.SortedMap<Long, SnapshotPages.SealedBlock>> sealedBlocks =
-        new HashMap<>();
+    private final SharedMap<Integer, Map<String, Integer>> poolOrdinals = new SharedMap<>();
+    private final SharedMap<Integer, Integer> nextOrdinal = new SharedMap<>();
+    private final SharedMap<Integer, java.util.SortedMap<Long, SnapshotPages.SealedBlock>>
+        sealedBlocks = new SharedMap<>();
     private final List<DroppedPage> droppedPages = new ArrayList<>();
     private String conflictEncoding;
     private int snapshotBlock;
     private int snapshotWindow;
     // A table's encoding state: shared with the state this builder continues until the encoding
     // changes it here (conflictState), which copies it first (ownedStates)
-    private final Map<Integer, EncodingState> conflictStates = new HashMap<>();
+    private final SharedMap<Integer, EncodingState> conflictStates = new SharedMap<>();
     private final Set<Integer> ownedStates = new HashSet<>();
     // Whether the lookups may not match the entries. Every change keeps them but addNamespace's (a
     // checkpoint's namespaces arrive in any order, so their paths cannot be known as they do), so
@@ -637,6 +740,7 @@ public class CatalogState {
         removeLookup(namespaceLookup, pathOrNull(id), id);
         namespaceById.remove(id);
         nsProperties.remove(id);
+        ownedProperties.remove(id);
       }
       return this;
     }
@@ -663,8 +767,13 @@ public class CatalogState {
     private static <K> void removeLookup(Map<K, Integer> lookup, K key, int id) {
       if (key != null) {
         lookup.remove(key);
-      } else {
-        lookup.values().remove(id);
+        return;
+      }
+      for (Map.Entry<K, Integer> entry : lookup.entrySet()) {
+        if (entry.getValue() == id) {
+          lookup.remove(entry.getKey());
+          return;
+        }
       }
     }
 
@@ -1207,16 +1316,27 @@ public class CatalogState {
     }
 
     public Builder setNamespaceProperty(int namespaceId, String key, String value) {
-      nsProperties.computeIfAbsent(namespaceId, k -> new HashMap<>()).put(key, value);
+      properties(namespaceId).put(key, value);
       return this;
     }
 
     public Builder removeNamespaceProperty(int namespaceId, String key) {
       Map<String, String> props = nsProperties.get(namespaceId);
-      if (props != null) {
-        props.remove(key);
+      if (props != null && props.containsKey(key)) {
+        properties(namespaceId).remove(key);
       }
       return this;
+    }
+
+    /** The namespace's properties, to change: copied first if a state shares them. */
+    private Map<String, String> properties(int namespaceId) {
+      Map<String, String> props = nsProperties.get(namespaceId);
+      if (props == null || !ownedProperties.contains(namespaceId)) {
+        props = props == null ? new HashMap<>() : new HashMap<>(props);
+        nsProperties.put(namespaceId, props);
+        ownedProperties.add(namespaceId);
+      }
+      return props;
     }
 
     public Integer namespaceId(Namespace ns) {
@@ -1370,9 +1490,14 @@ public class CatalogState {
       } else if (POOL_CHECK) {
         checkLookups();
       }
+      for (Integer id : ownedProperties) {
+        nsProperties.put(id, Collections.unmodifiableMap(nsProperties.get(id)));
+      }
       CatalogState state = new CatalogState(this);
-      // The states built now share the encoding states: a later change copies them again
+      // The states built now share the encoding states and properties: a later change copies them
+      // again
       ownedStates.clear();
+      ownedProperties.clear();
       return state;
     }
   }
