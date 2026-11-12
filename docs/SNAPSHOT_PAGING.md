@@ -353,8 +353,9 @@ ablation, `fileio.catalog.load.lazy` (default true; false loads every
 snapshot and list and ships the whole table, as today). Both sit in Iceberg
 core and in the catalog's load path, above the shared log, so every
 provider gains alike. #18073 changes core and helps any client that loads
-snapshots lazily (REST's refs mode), so it goes on the baselines' `perf`
-branch too (catalog-bench DESIGN.md, "Baseline clients").
+snapshots lazily (REST's refs mode), so it goes on the fork's `core-perf`
+branch, below `atomicio`, which the baselines run too (catalog-bench
+DESIGN.md, "Baseline clients").
 
 ## Page GC
 
@@ -722,10 +723,13 @@ Each step stands alone and is measured before the next:
    `fileio.catalog.load.lazy`. Readers that load only what they access gain
    from this without any page. Built 2026-11-05, with two clarifications
    below:
-   - The fork: #18073 ported to 1.12.0 (atomicio af097dcda2, and the
-     baselines' perf a18e9c3f50: 1.12.0's REST table operations carry the
-     snapshot mode beside their read parameters), and an `InlineSnapshot`
-     that makes its list on first use (96970062e3).
+   - The fork: #18073 ported to 1.12.0 (core-perf d9d1398415, below
+     atomicio, which the baselines run too: 1.12.0's REST table operations
+     carry the snapshot mode beside their read parameters, in refs mode
+     only, 58b564f637; and a producer that commits again finds its
+     snapshot among those loaded, a19d59379b: two 1.12.0 tests newer than
+     the PR), and an `InlineSnapshot` that makes its list on first use
+     (atomicio 9a248a04e1).
    - Lists on first use: a load's `InlineSnapshot`s make their lists when
      asked for (e7a9a23), and a checkpoint's decode keeps each list as a
      change of its parent's, applied on first use (0d0020a). An expiry's
@@ -840,7 +844,7 @@ Each step stands alone and is measured before the next:
      (`StateMachine.garbagePages`; a5c8aaf).
    - A copy for workers (`SerializableTable`) of a table whose history is
      not loaded ships the snapshots its load holds and a supplier a worker
-     calls (the fork's `ShippableSnapshots`, atomicio 29e0a930c2): the inline
+     calls (the fork's `ShippableSnapshots`, atomicio e14cb918ad): the inline
      snapshots and their lists as a page, and where each sealed block's page
      is, read through the table's FileIO (`PagedSnapshots`); a block no
      compactor has stored goes with its page's bytes. A log whose pages are

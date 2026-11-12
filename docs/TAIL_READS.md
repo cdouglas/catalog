@@ -167,7 +167,7 @@ raced a replace, or a stream reopened mid-read, could return the start of
 one object and the rest of another. `S3InputStream` sent no `If-Match`, and
 `GCSInputStream` read the live generation, not the one the file's lookup
 found; only ADLS asked for one version. The contract suite did not notice,
-because its 16 cases were writes. Step 0 (fork 5f14343338) pins every read to
+because its 16 cases were writes. Step 0 (fork b343396246) pins every read to
 the version its file has seen, fails a read of a superseded version as
 `StaleReadException`, and adds three read cases to the suite: a file that
 looked reads that version after a replace and after an append, and on a store
@@ -575,7 +575,7 @@ waits for step 6's numbers and a decision (errata D23).
 
 Each step stands alone and is measured before the next:
 
-0. **Reads of one version** (built 2026-11-09: fork 5f14343338, fileio
+0. **Reads of one version** (built 2026-11-09: fork b343396246, fileio
    b4a9061). Every store's reads ask for the version their file has seen,
    a read of a superseded one fails as stale, and `AtomicFileLog` reads
    again; the contract suite has read cases. It closes T6's whole-read half
@@ -585,7 +585,7 @@ Each step stands alone and is measured before the next:
    2026-11-09-contract-b): S3 Express, S3 Standard, ADLS, GCS and GCS Rapid,
    each case its store supports. S3 Express honours `If-Match` on a GET. A
    havoc round at fileio 69fdfdd (`sr0-r0`, 2026-11-10) was clean.
-   - **0b. Probe the metadata alternative** (fork 18c87db437,
+   - **0b. Probe the metadata alternative** (fork 897251f912,
      `S3ExpressMetadataProbes`, `AdlsMetadataProbes`, in the same run): small
      cases, as `GcsRapidCanaries` probes Rapid buckets, of the three
      behaviours the alternative rests on. All three hold on S3 Express and
