@@ -1106,3 +1106,32 @@ At 1,000 tables (16.7 a second offered), one run an arm of 1,200 s:
   trailer read or another change since fileio e505a0f; and whether a writer
   should estimate a compaction's chance to land (its log's growth rate
   against its last compaction's time) and skip one that cannot (errata D14).
+- **Tail reads at E1's largest pointer point** (errata D15). Campaign `tr6x`
+  (catalog-bench f03ea57, fileio c015f5d, main after step 6b; 2026-11-12;
+  config `tr6x-e1.json`, catalog-bench 39eb3c4): `read_tail` and
+  `compact.after.commit` on and off, pointer on `s3x-2026-11`, two runs an
+  arm, under the model before step 7 (a tail read one GET, a probe one HEAD,
+  as step 7 makes them on S3). At 3,000 tables and 128 workers:
+
+  | read_tail | compact after | merge appends/s | lost appends/op | p50 ms | CPU ms/merge append | compactions landed |
+  |---|---|---|---|---|---|---|
+  | off | off | 49.9 | 2.6 | 338 | 40 | 15 |
+  | off | on | 49.9 | 3.3 | 442 | 55 | 3 |
+  | on | off | 43.4 | 7.3 | 1,450 | 95 | 13 |
+  | on | on | 36.0 | 8.4 | 1,876 | 143 | 2 |
+  | `e1-d20` (count 100) | fused | 49.9 | 1.4 | 242 | 51 | 139 |
+
+  With tail reads off the offered rate was met (as `e1-d20` met it); with
+  them on a writer lost two and a half to three times the appends, its commits
+  took four to six times as long, and the queue behind them flagged the runs (the
+  pool's wait, p99 52-85 s, and GC 5.6-6.6%; CPU 31-38% busy): a consequence
+  of slow commits, not a driver at its limit. Compaction after the commit
+  costs throughput only with tail reads on. A writer that loses a race reads
+  and folds the records that beat it before it resends, where with tail reads
+  off it probes and resends at once: the CPU a merge append spends more than
+  doubles, which may widen the window in which the next append lands. Not yet
+  shown: commit traces at this point, tail reads on and off, would say where
+  the time between a lost race and its resend goes. At 300 tables and 256
+  workers every arm, `e1-d20` too, is at the driver pool's limit (wait p99
+  1.2-2.6 s, CPU 14-28%), at 65.5-71.7 merge appends a second against
+  `e1-d20`'s 118.4 (count 100), and the switches do not explain the gap.

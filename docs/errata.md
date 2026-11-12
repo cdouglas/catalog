@@ -491,9 +491,15 @@ Still open:
   Express. At those points it lost several times the appends a commit, from the
   run's first minute, and landed almost none of the compactions its writers
   began. With tail reads off, S3 Standard's pointer points at 64 and 128
-  workers stay below `e1-d20` too (campaign `tr6s`). The cause is open: the
-  next measurement is an A/B of `read_tail` and `compact.after.commit` on S3
-  Express.
+  workers stay below `e1-d20` too (campaign `tr6s`). The A/B of `read_tail`
+  and `compact.after.commit` on S3 Express (campaign `tr6x`, 2026-11-12;
+  TAIL_READS.md "Open questions") puts the 3,000-table loss on tail reads:
+  with them off, either compaction met `e1-d20`'s 49.9 merge appends a
+  second; with them on, 43.4, and 36.0 with compaction after the commit too
+  (`p4r`'s 37.8). The 300-table point is the driver's pool's limit in every
+  arm, `e1-d20` too, and does not tell the arms apart. Why tail reads lose
+  more races there is open: next, commit traces at 3,000 tables with tail
+  reads on and off.
 
 ### D16. Replay rewrites the whole committed set, and every checkpoint carries it
 
