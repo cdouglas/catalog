@@ -469,38 +469,48 @@ Plan: [TAIL_READS.md](TAIL_READS.md) (proposed 2026-11-06), with S5's format hal
 
 **Resolved 2026-11-10** ([TAIL_READS.md](TAIL_READS.md) steps 2 and 5, branch
 `tail-reads`). The design above, with the incarnation in a trailer that ends
-every frame (format 3) rather than in a header, and checksums: a tail read is
-a lookup and a GET from 20 bytes before the end, and a client's loads,
-refreshes and commit-loop reads read only what follows its replica. Measured
-(step 6, catalog-bench `tr6`, `s3x-2026-11`): a merge append's p50 fell
+every frame (format 3) rather than in a header, and checksums: a tail read is a
+GET from 20 bytes before the end (after a lookup, until step 7), and a client's
+loads, refreshes and commit-loop reads read only what follows its replica.
+Measured (step 6, catalog-bench `tr6`, `s3x-2026-11`): a merge append's p50 fell
 48-72% inline ML and 16-37% inline TM across E1 at 300 tables and E3 at 1,000
 and 7,200 snapshots, and the catalog bytes it reads fell 8-32x. At E1's 1,000
 tables, past the knee, 0.3-2.6% of merge appends exhausted their retries with
-tail reads: writers that learned the exact record count compacted together
-and lost to each other, which compaction after the commit (step 6b) answered.
-Also measured on S3 Standard, where a longer object is now read whole at once
+tail reads: writers that learned the exact record count compacted together and
+lost to each other, which compaction after the commit (step 6b) answered. Also
+measured on S3 Standard, where a longer object is now read whole at once
 (0a00685; TAIL_READS.md "Measured on S3 Standard").
 
-Still open:
-- One request a read (step 7, branch `one-request-reads`): a read is one GET
-  on S3 and ADLS, whose replies report the version and length they read, and
-  the model now charges the lookup it saves (D23). Its effect is not measured
-  yet.
-- Lost races at high load (TAIL_READS.md "Open questions"). Catalog-bench's
-  campaign `p4r` (fileio main after step 6b) committed fewer merge appends a
-  second than `e1-d20` (fileio e505a0f) at E1's largest pointer points on S3
-  Express. At those points it lost several times the appends a commit, from the
-  run's first minute, and landed almost none of the compactions its writers
-  began. With tail reads off, S3 Standard's pointer points at 64 and 128
-  workers stay below `e1-d20` too (campaign `tr6s`). The A/B of `read_tail`
-  and `compact.after.commit` on S3 Express (campaign `tr6x`, 2026-11-12;
-  TAIL_READS.md "Open questions") puts the 3,000-table loss on tail reads:
-  with them off, either compaction met `e1-d20`'s 49.9 merge appends a
-  second; with them on, 43.4, and 36.0 with compaction after the commit too
-  (`p4r`'s 37.8). The 300-table point is the driver's pool's limit in every
-  arm, `e1-d20` too, and does not tell the arms apart. Why tail reads lose
-  more races there is open: next, commit traces at 3,000 tables with tail
-  reads on and off.
+One request a read (step 7, merged 2026-11-12: fileio 3b6c71c, fork
+fbd1036bf9): a read is one GET on S3 and ADLS, whose replies report the
+version and length they read, and the model charges the lookup it saves
+(D23). Still to run: its real-cloud contract run, and `read_lookup` on and
+off (the lookup's own cost).
+
+**Lost races at high load: resolved 2026-11-12** (TAIL_READS.md "Measured
+at E1's largest pointer point"). Catalog-bench's campaign `p4r` (fileio main
+after step 6b) committed fewer merge appends a second than `e1-d20` (fileio
+e505a0f) at E1's 3,000 pointer tables and 128 workers on S3 Express (37.8
+against 49.9), losing several times the append races a commit from the run's
+first minute. Campaign `tr6x` (`read_tail` and `compact.after.commit` on and
+off) put the loss on tail reads: 49.9 with them off, 43.4 with them on and
+36.0 with compaction after the commit too. Commit traces (`tr6y`) put it on
+the resend's window, from the store's answer to the read a writer resends
+from to its append taking effect, which bounds how close together landings
+come: 12.8 ms after a probe and 18.9 after a tail read, against 19.6 ms
+between the commits offered. Two causes, neither in tail reads: the model's
+reads (D24), which favoured probes by 6.7 ms of window, and a fold that
+rebuilt the whole catalog state (D25), 6.7-8.2 ms of CPU a resend at 3,000
+tables. Fixed in turn (campaigns `tr7y` and `tr8y`), tail reads went to 47.5
+and then 49.8 merge appends a second, the offered rate, and beat the probes:
+a p50 of 222 ms against 767 (p99 2,971 against 9,656), 2.0 lost appends a
+commit against 5.1, 16 writers in the commit loop against 77, and 19 ms of
+CPU a merge append against 37. The probes, slower than `e1-d20`, read a
+trailer inside their window, which the catalog before format 3 did not.
+
+Not measured again: E1's 300 tables at 256 workers, the driver pool's limit
+in every arm of `tr6x`, `p4r` and `e1-d20`, which did not tell the arms
+apart; it runs again on the merged mains.
 
 ### D16. Replay rewrites the whole committed set, and every checkpoint carries it
 
@@ -945,19 +955,19 @@ every client's read of a file whose length Iceberg looks up after opening it
 (an Avro manifest list: `AvroIterable` opens a stream, then asks the
 length).
 
-**Resolved 2026-11-11** (TAIL_READS.md step 7, branch `one-request-reads`):
-the model charges a lookup of a file nothing bound as a HEAD, and opening a
-stream binds nothing; a GET binds its file only where the store's reads record
-their version and the client keeps it (the fork's S3 and ADLS FileIOs; not a
-stock client's, nor GCS's). And `AtomicFileLog` reads first where reads
-record their version, one request a read. What stays: every campaign before
-the merge ran under the old model. Comparisons within a campaign stand (each
-arm's reads alike short), and absolute numbers are a HEAD a read low; the
-paper's runs are taken under the new model. A stock client's manifest-list
-read is a HEAD and a GET, as on S3, for JDBC, Polaris and FileIOCatalog's
-pointer and inline-TM modes alike; a client fix (Avro's length asked lazily,
-and a file that keeps the length its GET reported) would save it for every
-client, and is not made (`core-perf` has none).
+**Resolved 2026-11-11** (TAIL_READS.md step 7; fileio c2c1ea3, merged
+2026-11-12): the model charges a lookup of a file nothing bound as a HEAD, and
+opening a stream binds nothing; a GET binds its file only where the store's
+reads record their version and the client keeps it (the fork's S3 and ADLS
+FileIOs; not a stock client's, nor GCS's). And `AtomicFileLog` reads first where
+reads record their version, one request a read. What stays: every campaign
+before the merge ran under the old model. Comparisons within a campaign stand
+(each arm's reads alike short), and absolute numbers are a HEAD a read low; the
+paper's runs are taken under the new model. A stock client's manifest-list read
+is a HEAD and a GET, as on S3, for JDBC, Polaris and FileIOCatalog's pointer and
+inline-TM modes alike; a client fix (Avro's length asked lazily, and a file that
+keeps the length its GET reported) would save it for every client, and is not
+made (`core-perf` has none).
 
 ### D24. The latency model's reads saw the store at their ends and starts
 
@@ -986,16 +996,18 @@ capacity: 107 of 128 writers in the commit loop and 87% of resends lost, against
 57 and 75%. With both reads answered halfway the windows are about 15.8 and
 15.2 ms.
 
-**Resolved 2026-11-12** (branch `one-request-reads`): the model's store acts on
-a lookup, a GET and a conditional write halfway through its latency
-(`TestLatencyFileIO`: a write landing in a request's first half is seen, one in
-its second half is not). What stays: every campaign before it ran under the old
-model. Its comparisons of tail reads against probes and whole reads favour the
-probes wherever the commit loop sets the limit (D15's at E1's 3,000 tables:
-p4r against e1-d20, tr6x, tr6y); comparisons whose arms read alike stand.
-catalog-bench's `ModelStore` answers a HEAD at its end too (its GET halfway);
-the objects it serves are written once (metadata files, manifest lists), so no
-read can tell, and it is left as it is.
+**Resolved 2026-11-12** (fileio 5a577d7): the model's store acts on a lookup, a
+GET and a conditional write halfway through its latency (`TestLatencyFileIO`: a
+write landing in a request's first half is seen, one in its second half is not).
+With it (and step 7, which changed no request at this point), tail reads at E1's
+3,000 tables went from 40.9 to 47.5 merge appends a second (campaign tr7y; D15).
+What stays: every campaign before it ran under the old model. Its comparisons of
+tail reads against probes and whole reads favour the probes wherever the commit
+loop sets the limit (D15's at E1's 3,000 tables: p4r against e1-d20, tr6x,
+tr6y); comparisons whose arms read alike stand. catalog-bench's `ModelStore`
+answers a HEAD at its end too (its GET halfway); the objects it serves are
+written once (metadata files, manifest lists), so no read can tell, and it is
+left as it is.
 
 ### D25. A fold rebuilt the whole catalog state (perf bug)
 
@@ -1018,21 +1030,23 @@ checkpoint) reproduces it, and JFR places it: a fold's CPU was 70% `toBuilder`
 and 29% `continued`; a build's 57% copying maps and 42% rebuilding lookups. A
 build grew with tables (0.24 ms at 300, 0.82 at 1,000, 1.85 at 3,000).
 
-**Resolved 2026-11-12** (branch `one-request-reads`): a builder rebuilds its
-lookups only after adding a namespace, whose path a checkpoint's arbitrary order
-may not yet know (every other change keeps them; under the replay check each
-build compares them with a rebuild); it shares the state's maps until it changes
-them, and hands a state the maps it changed read only, copying them again before
-a later change (`TestCatalogStateBuilder`); and a replica keeps the ids of its
-view's intention records as replay decoded them, which `continued` scans
-(`TestReplay`, `TestLogRuntime`; under the replay check each scan is compared
-with a decode). At 3,000 tables and 5,000 records `FoldProfile`'s fold now takes
-0.49 ms (2.9), its build about nothing (1.85), and a whole commit 0.87 ms of CPU
-(7.3); at 300 tables, 0.19, 0.01 and 0.42. What stays: a record still copies
-each table-keyed map it changes, so a fold grows with tables, about a tenth as
-fast (persistent maps would make it logarithmic); and every campaign before the
-fix ran with the copies, so FileIOCatalog's CPU per commit grew with the
-catalog's tables in them.
+**Resolved 2026-11-12** (fileio 2b9b5c6, 9a417d3, e0aceaf): a builder rebuilds
+its lookups only after adding a namespace, whose path a checkpoint's arbitrary
+order may not yet know (every other change keeps them; under the replay check
+each build compares them with a rebuild); it shares the state's maps until it
+changes them, and hands a state the maps it changed read only, copying them
+again before a later change (`TestCatalogStateBuilder`); and a replica keeps the
+ids of its view's intention records as replay decoded them, which `continued`
+scans (`TestReplay`, `TestLogRuntime`; under the replay check each scan is
+compared with a decode). At 3,000 tables and 5,000 records `FoldProfile`'s fold
+now takes 0.49 ms (2.9), its build about nothing (1.85), and a whole commit 0.87
+ms of CPU (7.3); at 300 tables, 0.19, 0.01 and 0.42. In the benchmark (campaign
+tr8y, E1's 3,000 tables) a fold took 1.0 ms and a build 0.02 (tr7y 4.8 and 3.4),
+and tail reads beat probes there (D15). What stays: a record still copies each
+table-keyed map it changes, so a fold grows with tables, about a tenth as fast
+(persistent maps would make it logarithmic); and every campaign before the fix
+ran with the copies, so FileIOCatalog's CPU per commit grew with the catalog's
+tables in them.
 
 ## Test Coverage Gaps
 

@@ -362,6 +362,99 @@ tail read is a GET from N − 20 and, where the object changed, a GET of the
 bytes before: as many requests as a lookup and a whole read, the same bytes,
 and one GET of 20 bytes where it did not change.
 
+### Measured at E1's largest pointer point
+
+Campaign `p4r` (fileio main after step 6b) committed fewer merge appends a
+second than `e1-d20` (fileio e505a0f, before format 3) at E1's 3,000 pointer
+tables and 128 workers on `s3x-2026-11`: 37.8 against 49.9, losing 8.2 append
+races a commit against 1.4 (errata D15). Four campaigns at that point found
+why and removed it (catalog-bench lab campaigns `tr6x`, two runs an arm;
+`tr6y`, `tr7y` and `tr8y`, one run an arm with every commit traced,
+`trace_commits`; 300 s measured). A merge append, compaction after the commit
+on:
+
+| Campaign | Tail reads | merge appends/s | p50 ms | p99 ms | lost appends/op | CPU ms/op |
+| -------- | ---------- | --------------- | ------ | ------ | --------------- | --------- |
+| `tr6x`: step 6b, the model's reads at their ends and starts | off | 49.9 | 442 | 6,129 | 3.3 | 55 |
+|  | on | 36.0 | 1,876 | 16,597 | 8.4 | 143 |
+| `tr6y`: the same, traced | off | 49.8 | 556 | 7,828 | 4.0 | 65 |
+|  | on | 40.9 | 1,602 | 15,397 | 7.7 | 114 |
+| `tr7y`: step 7, reads answered halfway (D24) | off | 49.8 | 878 | 10,610 | 5.4 | 54 |
+|  | on | 47.5 | 1,250 | 13,721 | 6.7 | 101 |
+| `tr8y`: and a fold that copies only what it changes (D25) | off | 49.9 | 767 | 9,656 | 5.1 | 37 |
+|  | on | 49.8 | 222 | 2,971 | 2.0 | 19 |
+| `e1-d20`: before format 3 (count 100, compaction fused) | off | 49.9 | 242 | 1,693 | 1.4 | 51 |
+
+The point offers 51 commits a second, 49.9 of them merge appends (configs
+`tr6x-e1.json`, `tr6y-e1.json`, `tr7y-e1.json` and `tr8y-e1.json` in
+catalog-bench). Builds: `tr6x` and `tr6y` catalog-bench f03ea57 and fileio
+c015f5d (main after step 6b); `tr7y` step 7 with errata D23 and D24 (fileio
+5a577d7 as merged); `tr8y` with D25 too (fileio 4366211 as merged). `tr6x`
+also ran compaction after the commit off: 49.9 merge appends a second with
+tail reads off, 43.4 with them on.
+
+**The landing chain.** At this point the catalog object is a chain of
+appends, each conditioned on the version before it, and a writer that lost a
+race appends again conditioned on what it then read. Its resend lands only if
+no other append takes effect between the store's answer to that read and its
+own append taking effect: the resend's window. Landings come no closer
+together than the windows of the resends that make them, and 51 commits a
+second offer one every 19.6 ms. The traces of `tr6y` measured the windows
+under the model of the time: 12.8 ms after a probe (the HEAD; a pinned GET of
+the probed version's last trailer, 8 ms; half an append) and 18.9 ms after a
+tail read (the GET, 7.4 ms; folding the records that beat it and building the
+replica, 6.7 ms of CPU; half an append). With probes, landings came 17.8 ms
+apart at the median, with 57 of the 128 writers in the commit loop and 75%
+of resends lost; with tail reads 22.4 ms apart, with 107 writers in the loop
+and 87% lost. The commits queued (the pool's wait, p99 64 s, flagged the run),
+and a commit's CPU grew with its losses, at a third of the driver's CPU: slow
+commits, not a driver at its limit.
+
+**Two causes, neither in tail reads.**
+
+- The model (errata D24, reads seen at their ends and starts):
+  `LatencyFileIO` answered a HEAD at its end and a GET at its start, and acted
+  on a conditional write halfway. A writer resending after a probe knew the
+  object half a HEAD fresher than a store would tell it, and one after a tail
+  read half a GET staler: 6.7 ms of window against tail reads. `tr7y` ran
+  with the store answering all three halfway, on step 7, whose reads cost
+  what `tr6x`'s model charged them (a tail read one GET, a probe one HEAD:
+  errata D23 changed neither). Tail reads committed 47.5 merge appends a
+  second, their window about 16 ms against the probe's 14.5 (12.8 in
+  `tr6y`).
+- The fold (errata D25, fold rebuilt whole state): a fold onto the replica
+  copied each of the catalog state's table-keyed maps and rebuilt its
+  lookups, 8.2 ms of CPU a resend at 3,000 tables in `tr7y` (fold 4.8, build
+  3.4), all of it inside the window; a resend after a probe folds nothing.
+  `tr8y` ran with the fix: a fold took 1.0 ms and a build 0.02, and the tail
+  read's window was about 9 ms against the probe's 14.5.
+
+**Tail reads win there now.** In `tr8y` both arms met the offered rate, and
+tail reads took under a third of the probes' time: a p50 of 222 ms against
+767 and a p99 of 2,971 ms against 9,656, with 2.0 lost appends a commit
+against 5.1, half the resends lost against 80%, 16 writers in the commit loop
+against 77, landings 10.0 ms apart at the tenth percentile against 14.3, and
+19 ms of CPU a merge append against 37. Iceberg retried almost no merge
+append (1.003 attempts each, against 1.155), and every one committed in both
+arms.
+
+The probes are slower than `e1-d20`'s, before format 3 (a p50 of 767 against
+242 ms): their resend reads the probed version's last trailer inside its window
+(a resend's write took 16.3 ms in `tr8y`'s traces, a first write 9.6), which
+`e1-d20`'s did not, and `e1-d20` ran under the old model, which answered its
+probes at their ends. Tail reads come within `e1-d20`'s median
+(222 against 242 ms) with a longer tail (p99 2,971 against 1,693 ms), at a
+count of 1,000 and compaction after the commit (7 compactions landed in the
+run) against a count of 100 fused (139); the campaigns differ in the model
+and the configuration, so they are not compared further, and the paper's
+runs are taken on the merged mains.
+
+Not measured again: E1's 300 tables at 256 workers, where every arm of
+`tr6x`, `p4r` and `e1-d20` ran at the driver pool's limit (65.5-71.7 merge
+appends a second against `e1-d20`'s 118.4; the pool's wait p99 1.2-2.6 s, CPU
+14-28%), so the switches did not tell its arms apart. It runs again on the
+merged mains, with `read_lookup` on and off.
+
 ## Why a tail read is sound
 
 The claim: a replica holds the first N bytes of an object of incarnation X,
@@ -760,11 +853,11 @@ Each step stands alone and is measured before the next:
    after the commit lands, sent again with the records that beat it. At the
    1,000-table knee none lands and the store's cap bounds the log, yet it is
    the best arm there too (campaign `tr6m`).
-7. **One request a read** (2026-11-11, built; measurement pending). A GET's
-   response reports the version and length it read (S3's `ETag` and
-   `Content-Range`, ADLS's equivalents), and the fork's S3 and ADLS files
-   keep them (fork 7b948d51ce, step 0's), so a read needs no lookup before
-   it. The fork declares which stores' reads do
+7. **One request a read** (built 2026-11-11; merged 2026-11-12, fileio
+   3b6c71c and fork fbd1036bf9). A GET's response reports the version and
+   length it read (S3's `ETag` and `Content-Range`, ADLS's equivalents), and
+   the fork's S3 and ADLS files keep them (fork 7b948d51ce, step 0's), so a
+   read needs no lookup before it. The fork declares which stores' reads do
    (`SupportsAtomicOperations.readsRecordVersion()`: S3 unless the analytics
    accelerator is on, ADLS; not GCS, whose client library reports no
    generation a read found), and reports a GET from an object's end or past
@@ -786,6 +879,12 @@ Each step stands alone and is measured before the next:
    fuzzers (commit protocol, fault, race, multi-writer) draw whether the
    store's reads record their version. The commit-protocol fuzzer catches a
    tail read that skips its trailer check on a store that records.
+   Measured with tail reads on and off at E1's 3,000 tables, with the
+   model's reads answered halfway (D24) and a fold that copies only what its
+   records change (D25): tail reads now beat probes there ([Measured at E1's
+   largest pointer point](#measured-at-e1s-largest-pointer-point)). Still to
+   run: the real-cloud contract run, and `read_lookup` on and off (the
+   lookup's own cost).
 
 Then R2.3, with a read's cost known.
 
@@ -1135,37 +1234,17 @@ At 1,000 tables (16.7 a second offered), one run an arm of 1,200 s:
 - **Tail reads past the commit knee** (step 6, E1 at 1,000 tables): answered
   by the traces. Writers that learned the exact count compacted together, and
   lost to each other ([Compaction after the
-  commit](#compaction-after-the-commit)). Still open: the probe path (tail
-  reads off) is slower there than the catalog before format 3, its resend's
-  trailer read or another change since fileio e505a0f; and whether a writer
-  should estimate a compaction's chance to land (its log's growth rate
-  against its last compaction's time) and skip one that cannot (errata D14).
-- **Tail reads at E1's largest pointer point** (errata D15). Campaign `tr6x`
-  (catalog-bench f03ea57, fileio c015f5d, main after step 6b; 2026-11-12;
-  config `tr6x-e1.json`, catalog-bench 39eb3c4): `read_tail` and
-  `compact.after.commit` on and off, pointer on `s3x-2026-11`, two runs an
-  arm, under the model before step 7 (a tail read one GET, a probe one HEAD,
-  as step 7 makes them on S3). At 3,000 tables and 128 workers:
-
-  | read_tail | compact after | merge appends/s | lost appends/op | p50 ms | CPU ms/merge append | compactions landed |
-  |---|---|---|---|---|---|---|
-  | off | off | 49.9 | 2.6 | 338 | 40 | 15 |
-  | off | on | 49.9 | 3.3 | 442 | 55 | 3 |
-  | on | off | 43.4 | 7.3 | 1,450 | 95 | 13 |
-  | on | on | 36.0 | 8.4 | 1,876 | 143 | 2 |
-  | `e1-d20` (count 100) | fused | 49.9 | 1.4 | 242 | 51 | 139 |
-
-  With tail reads off the offered rate was met (as `e1-d20` met it); with
-  them on a writer lost two and a half to three times the appends, its commits
-  took four to six times as long, and the queue behind them flagged the runs (the
-  pool's wait, p99 52-85 s, and GC 5.6-6.6%; CPU 31-38% busy): a consequence
-  of slow commits, not a driver at its limit. Compaction after the commit
-  costs throughput only with tail reads on. A writer that loses a race reads
-  and folds the records that beat it before it resends, where with tail reads
-  off it probes and resends at once: the CPU a merge append spends more than
-  doubles, which may widen the window in which the next append lands. Not yet
-  shown: commit traces at this point, tail reads on and off, would say where
-  the time between a lost race and its resend goes. At 300 tables and 256
-  workers every arm, `e1-d20` too, is at the driver pool's limit (wait p99
-  1.2-2.6 s, CPU 14-28%), at 65.5-71.7 merge appends a second against
-  `e1-d20`'s 118.4 (count 100), and the switches do not explain the gap.
+  commit](#compaction-after-the-commit)). The probe path (tail reads off) is
+  slower there than the catalog before format 3: its resend reads the probed
+  version's last trailer inside its window (6.8 ms at E1's 3,000 tables,
+  [Measured at E1's largest pointer
+  point](#measured-at-e1s-largest-pointer-point); not traced at 1,000).
+  Still open: whether a writer should estimate a compaction's chance to land
+  (its log's growth rate against its last compaction's time) and skip one
+  that cannot (errata D14).
+- **Tail reads at E1's largest pointer point** (errata D15): answered by
+  commit traces. A resend's window was longer after a tail read than after a
+  probe, for two reasons outside tail reads, the model's reads (errata D24)
+  and a fold that rebuilt the whole state (D25); with both fixed, tail reads
+  beat probes there ([Measured at E1's largest pointer
+  point](#measured-at-e1s-largest-pointer-point)).
