@@ -2,8 +2,10 @@
 # the commit that adds intentlog-azure): each mutant puts back one of AzureLog.tla's bug switches
 # in AppendBlobLog, and must fail an oracle: the commit-protocol fuzzer on the in-memory store,
 # whose writers are one to three instances of the log (stale cached heads), or TestAppendBlobLog.
-# The fuzzer preempts commits, never compactions, so no rotation lands between a compaction's read
-# and its trim: trimearly only TestAppendBlobLog kills. Two more are the Java's own (2026-11-10):
+# The fuzzer preempts commits, never compactions, so a rotation rarely lands between a
+# compaction's read and its trim: TestAppendBlobLog kills trimearly, and the fuzzer did only at a
+# calibration's 100,000 tries (havoc, 2026-11-12: the log unreadable). Two more are the Java's own
+# (2026-11-10):
 # skipread, a read through a write that skips the read when records landed before it too
 # (AZURE_LOG.md "Reading through a write"), and compactbycheckpoint, writers counting toward
 # compaction from the checkpoint each last read rather than the last GC record ("When to
@@ -15,10 +17,11 @@
 # oracle of held states and TestAppendBlobLog catch, as the model's AckedAtReceipt does.
 # padunseen (2026-11-11, a review's find): a read from the end of a segment a pad closed, before
 # the head named its successor, takes the segment for open, so a reader holding that head reads
-# nothing new however much the successor takes. TestAppendBlobLog kills it; the fuzzer's oracle of
-# stale readers (every read reads on to the log's end at the drain) did not in 2,000 local tries:
-# the state needs a rotation that failed between its pad and its CAS, then a read before another
-# writer's append repairs it, and no trim of the segment before the drain.
+# nothing new however much the successor takes. TestAppendBlobLog kills it, and the fuzzer's oracle
+# of stale readers (every read reads on to the log's end at the drain) at a calibration's 100,000
+# tries (havoc, 2026-11-12), not in 2,000 local ones: the state needs a rotation that failed
+# between its pad and its CAS, then a read before another writer's append repairs it, and no trim
+# of the segment before the drain.
 MUTANTS="casbeforeclose nolimit createonmissing noclosedlength sweepnamed trimearly sdkretry skipread compactbycheckpoint offsetfromlength padunseen"
 EQUIVALENT=""
 ORACLES=TestAzureCommitProtocol,TestAppendBlobLog,TestAzureCompaction

@@ -642,20 +642,22 @@ As every provider is tested (LOG.md "Testing a provider"), plus a model:
    - segment limits of 300 bytes to 1 MiB and blobs of 2, 4 or 50,000 blocks;
    - every fault on every store request;
    - one to three instances of the log taking requests in turn, as processes with stale
-     cached heads.
+     cached heads;
+   - at the drain, every replica a read returned must read on to the log's end (stale
+     readers).
 
    `TestAppendBlobLog` adds what the fuzzer can't reach: closes by a pad and by the block
    limit, an append that arrives after a close, a trim after the log moved on, and a writer
    whose segment was swept.
 
-   **Calibration** (`fuzz/mutants/azurelog.sh`, run locally): seven of the switches, put back
-   in `AppendBlobLog`, each fail an oracle.
+   **Calibration** (`fuzz/mutants/azurelog.sh`; on havoc 2026-11-12, `az-calib` at 9ab6c80,
+   the fuzzer at 100,000 tries): every mutant fails an oracle, and the unmutated run passes.
    - `createonmissing`, `noclosedlength` and `sdkretry` fail the fuzzer's oracles.
    - `casbeforeclose`, `nolimit` and `sweepnamed` are caught first by the log's own checks:
      a closed segment of the wrong length, or a named segment missing, makes the log
      unreadable rather than wrong.
-   - `trimearly` only `TestAppendBlobLog` catches, since the fuzzer never preempts a
-     compaction.
+   - `trimearly`: `TestAppendBlobLog` catches it. The fuzzer never preempts a compaction, so
+     it caught it only at the calibration's 100,000 tries, with the log unreadable.
    - `offsetfromlength` was equivalent in Java while `readThrough` always read: it checked the
      receipt's CRC, and the runtime judges a commit by its id. Since a read through a write
      trusts the reply's offset to skip its read ([Reading through a write](#reading-through-a-write)),
@@ -665,6 +667,10 @@ As every provider is tested (LOG.md "Testing a provider"), plus a model:
      landed before the write too), killed by `TestAppendBlobLog` and the fuzzer; and
      `compactbycheckpoint` (writers counting toward compaction from their own checkpoints),
      killed by `TestAzureCompaction` only, since it makes compactions many, not wrong.
+   - `padunseen` (2026-11-11, from a review): a read from the end of a segment a pad closed,
+     before the head named its successor, takes the segment for open. `TestAppendBlobLog`
+     kills it, and the fuzzer's stale-readers oracle does at the calibration's 100,000 tries
+     (not in 2,000 local ones).
 
 4. **The catalog, in part.** `TestLocalCatalog` and `TestLocalCatalogTransaction` pass in
    `AZLOG`, `AZLOG_TM` and `AZLOG_ML` (112 and 34 tests each, the same skips as every other
