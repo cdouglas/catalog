@@ -2,7 +2,7 @@
 # Runs fileio-catalog's fuzz image on a host with Docker (rootless is fine). See README.md.
 #
 #   run.sh build                                  build the image from ./ctx (pulls the base image)
-#   run.sh round <fork> <commit> <name>           a phase-exit round (ten jobs, or ROUND_JOBS), detached
+#   run.sh round <fork> <commit> <name>           a phase-exit round (eleven jobs, or ROUND_JOBS), detached
 #   run.sh calib <fork> <commit> <name> <set>     a calibration (mutants/<set>.sh), detached
 #   run.sh test <fork> <commit> <name> <tests>    one test job, detached
 #   run.sh shrink <fork> <commit> <name> <run>/<job>
@@ -39,7 +39,7 @@ gigabytes() {
 }
 
 # limit <cmd> <args...>: the container's memory limit, unless MEM sets it: each job it runs at
-# once (JOBS, else a round's ten or ROUND_JOBS, a calibration's mutants and its unmutated run,
+# once (JOBS, else a round's eleven or ROUND_JOBS, a calibration's mutants and its unmutated run,
 # one test or shrink) with its heap and 2g for the JVM's other memory and Maven's, and 2g
 limit() {
   if [ -n "${MEM:-}" ]; then echo "$MEM"; return; fi

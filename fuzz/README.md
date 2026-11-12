@@ -1,7 +1,7 @@
 # Fuzz rounds in a container
 
-A phase-exit fuzz round runs ten long jqwik jobs (the fault, race, multi-writer and
-commit-protocol fuzzers, the rebase oracle, the conflict-encoding contracts, the inline
+A phase-exit fuzz round runs eleven long jqwik jobs (the fault, race, multi-writer and
+commit-protocol fuzzers, the last on the Azure log too, the rebase oracle, the conflict-encoding contracts, the inline
 differential and delta properties), and a calibration
 runs the oracles once per mutant. On a laptop they saturate the CPU for hours and need capped
 heaps to stay clear of the OOM killer. This image runs them on a bigger host, all at once,
@@ -38,14 +38,14 @@ Results go to `./out/<name>/`: a log per job, `summary.txt` (each job's exit and
 test class; for a calibration, each mutant `caught` or `NOT CAUGHT`, and `none`, the unmutated
 oracles, which must be `clean`), and `run.txt` (the fork, commit, host). Copy `out/<name>/` back
 to keep it. `JOBS` limits the jobs at once (default all), `HEAP` each test JVM's heap (default
-4g; a job's resident size is up to two gigabytes more, with Maven's). A round wants ten cores
-and about 62 GB; a calibration, a core and 6 GB per mutant. `ROUND_JOBS` runs some of a round's
+4g; a job's resident size is up to two gigabytes more, with Maven's). A round wants eleven cores
+and about 68 GB; a calibration, a core and 6 GB per mutant. `ROUND_JOBS` runs some of a round's
 jobs (`ROUND_JOBS=race ./run.sh round ...` reruns one; the memory limit counts only those).
 
 ## Memory on a shared host
 
 Each run's container has a hard memory limit, without swap (`MEM`; by default its jobs at once
-times their heap and 2 GB, and 2 GB: 62 GB for a round), and the highest OOM score. A run that
+times their heap and 2 GB, and 2 GB: 68 GB for a round), and the highest OOM score. A run that
 outgrows its limit loses one of its own JVMs to the kernel's OOM killer (the job fails, exit 137
 in its log), never another user's process; and should the host itself run short, the kernel
 kills this run first. `run.sh` warns if the limit did not take: rootless Docker applies it only
