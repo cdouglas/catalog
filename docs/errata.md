@@ -1046,7 +1046,7 @@ tail is bound to, or the start of one object and the rest of another, while
 the fuzzers' `InMemoryAtomicFileIO` pinned every read. ADLS already asked for
 one version.
 
-Now every read asks for one version (fork b343396246): a file reads the version
+Now every read asks for one version (fork 7b948d51ce): a file reads the version
 it has seen, by `If-Match` (S3, ADLS) or `if-generation-match` (GCS), and on S3
 and ADLS a file whose first request was a read has seen the version it found.
 A read of a version a write superseded fails as
