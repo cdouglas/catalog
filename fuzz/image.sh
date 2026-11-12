@@ -57,8 +57,10 @@ mkdir -p "$CTX/base/org" && cp -r "$lastrepo/org/catalogbench" "$CTX/base/org/"
 echo "bench-core: $(sha256sum "$lastrepo"/org/catalogbench/bench-core/*/bench-core-*[^s].jar | cut -c1-16), from $lastrepo" \
   | tee -a "$CTX/provenance.txt"
 git -C "$ROOT" archive HEAD | tar -x -C "$CTX/seed"
-# as the invoking user, so that rootful Docker leaves no root-owned files behind
+# as the invoking user, so that rootful Docker leaves no root-owned files behind; with a hard
+# memory limit and Maven's heap capped, as the dev box is shared (SEED_MEM, default 5g)
 docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e MAVEN_CONFIG=/tmp/.m2 \
+  --memory "${SEED_MEM:-5g}" --memory-swap "${SEED_MEM:-5g}" -e MAVEN_OPTS=-Xmx1g \
   -v "$CTX/base:/m2" -v "$CTX/seed:/src" -w /src "$BASE_IMAGE" \
   mvn -B -q -Dmaven.repo.local=/m2 test -DargLine=-Xmx1g -Dsurefire.failIfNoSpecifiedTests=false \
     -Dtest='TestFootprints,TestInMemorySharedLogContract*'
