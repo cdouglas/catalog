@@ -21,15 +21,24 @@ package org.intentlog.azure;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.azure.core.http.HttpPipelineCallContext;
+import com.azure.core.http.HttpPipelineNextPolicy;
+import com.azure.core.http.HttpPipelineNextSyncPolicy;
+import com.azure.core.http.HttpResponse;
+import com.azure.core.http.policy.HttpPipelinePolicy;
 import com.azure.storage.blob.BlobContainerClient;
 import com.azure.storage.blob.BlobContainerClientBuilder;
 import com.azure.storage.common.StorageSharedKeyCredential;
+import com.azure.storage.common.policy.RequestRetryOptions;
+import com.azure.storage.common.policy.RetryPolicyType;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Arrays;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.intentlog.azure.AppendBlobStore.Blob;
 import org.intentlog.azure.AppendBlobStore.Entry;
 import org.intentlog.azure.AppendBlobStore.Full;
@@ -41,6 +50,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import reactor.core.publisher.Mono;
 
 /**
  * {@link AzureAppendBlobStore} against Azurite, in a fresh container per test. It runs when
@@ -228,6 +238,51 @@ class TestAzureAppendBlobStore {
       assertThat(tail.metadata()).as("from %s", from).isEqualTo(Map.of("k", "v"));
       assertThat(tail.etag()).as("from %s", from).isEqualTo(etag);
     }
+  }
+
+  /**
+   * A read from a blob's end, as a tail read that finds nothing new is, takes one request (one
+   * byte before the end, dropped), not a 416 and a Get Blob Properties; past the end it is empty
+   * and says the length.
+   */
+  @Test
+  void aReadFromTheEndIsOneRequest() {
+    azurite();
+    AtomicInteger requests = new AtomicInteger();
+    HttpPipelinePolicy counting = new HttpPipelinePolicy() {
+      @Override
+      public Mono<HttpResponse> process(HttpPipelineCallContext context, HttpPipelineNextPolicy next) {
+        requests.incrementAndGet();
+        return next.process();
+      }
+
+      @Override
+      public HttpResponse processSync(
+          HttpPipelineCallContext context, HttpPipelineNextSyncPolicy next) {
+        requests.incrementAndGet();
+        return next.processSync();
+      }
+    };
+    AppendBlobStore counted = new AzureAppendBlobStore(
+        new BlobContainerClientBuilder().endpoint(container.getBlobContainerUrl())
+            .credential(CREDENTIAL)
+            .retryOptions(new RequestRetryOptions(RetryPolicyType.FIXED, 1, (Duration) null, null, null, null))
+            .addPolicy(counting)
+            .buildClient());
+    counted.createAppendBlob("seg", Map.of("k", "v"));
+    counted.appendBlock("seg", block('a'), 0, -1);
+
+    requests.set(0);
+    Blob end = counted.read("seg", N);
+    assertThat(requests).hasValue(1);
+    assertThat(end.bytes()).isEmpty();
+    assertThat(end.length()).isEqualTo(N);
+    assertThat(end.blocks()).isEqualTo(1);
+    assertThat(end.metadata()).isEqualTo(Map.of("k", "v"));
+
+    Blob past = counted.read("seg", N + 5);
+    assertThat(past.bytes()).isEmpty();
+    assertThat(past.length()).isEqualTo(N);
   }
 
   @Test

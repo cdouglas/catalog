@@ -217,6 +217,9 @@ public final class AzureAppendBlobStore implements AppendBlobStore {
       throw new IllegalArgumentException("Negative offset " + from + " in " + name);
     }
     BlobClient blob = container.getBlobClient(name);
+    // from the byte before {@code from}: a read from a blob's end (a tail read that finds nothing
+    // new) is then one 206 of a byte, not a 416 and a Get Blob Properties
+    long start = from > 0 ? from - 1 : 0;
     for (int reread = 0; ; reread++) {
       ByteArrayOutputStream body = new ByteArrayOutputStream();
       BlobDownloadResponse response;
@@ -224,7 +227,7 @@ public final class AzureAppendBlobStore implements AppendBlobStore {
         // from 0 the SDK sends no range: a whole Get Blob, which an empty blob answers with 200
         response =
             blob.downloadStreamWithResponse(
-                body, new BlobRange(from), NO_DOWNLOAD_RETRIES, null, false, null, Context.NONE);
+                body, new BlobRange(start), NO_DOWNLOAD_RETRIES, null, false, null, Context.NONE);
       } catch (BlobStorageException e) {
         if (e.getStatusCode() == 404) {
           return null;
@@ -248,7 +251,15 @@ public final class AzureAppendBlobStore implements AppendBlobStore {
         }
         continue; // it grew after the Get Blob: read again
       }
-      return blob(name, from, body.toByteArray(), response.getDeserializedHeaders());
+      Blob read = blob(name, start, body.toByteArray(), response.getDeserializedHeaders());
+      if (start == from) {
+        return read;
+      }
+      byte[] bytes = read.bytes();
+      int skip = (int) Math.min(from - start, bytes.length);
+      return new Blob(
+          Arrays.copyOfRange(bytes, skip, bytes.length), read.length(), read.blocks(),
+          read.metadata(), read.etag());
     }
   }
 
