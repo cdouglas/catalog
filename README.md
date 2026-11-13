@@ -270,7 +270,7 @@ suites skip; see [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
 | `fileio.catalog.inline.tm.codec`  | `structural`  | Codec for newly-written inline `TableMetadata` bytes: `structural` (binary, columnar; default) or `gzip` (Iceberg-style gzipped JSON). Decode follows the on-wire codec tag, so writers can change this setting freely |
 | `fileio.catalog.max.append.count` | `100`         | Soft limit on log records before CAS compaction. `0` forces CAS-only mode (S3 standard, GCS) |
 | `fileio.catalog.max.append.size`  | `16777216`    | Soft target for the records after the checkpoint before compaction |
-| `fileio.catalog.max.append.size.basis` | `tail` | What `max.append.size` bounds: `tail` (the records after the checkpoint) or `object` (the whole file, before errata D19's stopgap; for ablation) |
+| `fileio.catalog.max.append.size.basis` | `tail` | What `max.append.size` bounds: `tail` (the records after the checkpoint) or `object` (the whole file; for ablation) |
 | `fileio.catalog.checkpoint.memoize` | `true` | Write each inline table unchanged since a decode or an earlier encode as the bytes it had; `false` re-encodes every table (for ablation) |
 | `fileio.catalog.committed.retention.ms` | `1800000` (30 min) | Minimum age before a committed-txn UUID becomes eligible for GC at compaction. `Long.MAX_VALUE` disables; `0` GCs aggressively (not recommended) |
 | `fileio.catalog.throttle.retry.min-wait-ms` | `200` | First wait before retrying a write that storage throttled; each later wait doubles, up to 5 s |

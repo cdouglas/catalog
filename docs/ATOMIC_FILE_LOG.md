@@ -94,8 +94,7 @@ every frame: it lies within the object, its checksum holds, its offset is where
 the frame before ended, and its incarnation is the checkpoint's. A read that
 fails a check, or whose object ends before the length its lookup found, was
 torn by a write that raced it or served wrong by the store
-(`FrameCheckException`), and `read()` reads again (below). Before format 3 a
-splice at a frame boundary decoded (errata S5). Replay is the log's
+(`FrameCheckException`), and `read()` reads again (below). Replay is the log's
 ([LOG.md](LOG.md) §"Replay"). `AtomicFileLog.encode` (with or without an
 incarnation), `extend` (an append's bytes) and `decode` turn a checkpoint and
 records into an object's bytes and back, for tests and tools; `decode` also
@@ -138,7 +137,7 @@ fork's `SupportsAtomicOperationsContractTest` checks
 with the write offset, an Azure Append Blob's `If-Match` with the append
 position). A read through such an append, from a tail whose bytes the log read
 or wrote, rests on it: the object is those bytes and the record, known without a
-read (errata D20).
+read.
 
 **Reads.** A read is of one version: the fork's read contract
 (`SupportsAtomicOperations`, whose contract suite has read cases). Where the
@@ -158,8 +157,9 @@ object it served is the same incarnation, whose bytes up to the length read are
 the same), and `read()` reads again too. A read through an append from a probed
 tail, whose version a later write superseded, reads the live object, which
 holds the append's record unless a replace folded it into a checkpoint (then
-the commit is ambiguous, P3). Before 2026-11-09, S3 and GCS reads asked for no
-version (errata T6).
+the commit is ambiguous, P3). A store's accelerated read path (S3's analytics
+accelerator, GCS's analytics core) reads the live object, and a catalog's
+FileIO must leave it off (errata T6).
 
 **Signals.** Each write is prepared (`AtomicOutputFile.prepare`, which
 computes the checksum the store checks) and then sent (`writeAtomic`). The
@@ -225,7 +225,7 @@ whether a commit whose id the floor has passed applied.
 | `fileio.catalog.max.append.count` | 1000 | Soft limit on intention records (GC records not counted): past it, a writer whose commit landed compacts after it, at a point it draws (fused: a writer that reads at least this many replaces instead of appending). The log can run past it: compactions lose races to appends. The stores bound it (S3 Express 10,000 parts, Azure Append Blob 50,000 blocks): an append past one is refused, and the writer replaces the object with its record instead, so a count above the store's limit costs a refused append, not a stuck catalog. It was 100 until 2026-11-10, the best of 0, 100 and 1000 on S3 Express before tail reads (design.md §"Choosing append vs CAS"); 1,000 is provisional (errata D14). **0 replaces on every commit**, which an S3 general-purpose bucket needs |
 | `fileio.catalog.compact.after.commit` | `true` | Whether a writer compacts after its commit (`true`) or the commit past the limits replaces the object with its record (`false`, for ablation) |
 | `fileio.catalog.max.append.size` | 16777216 | Soft target for the records after the checkpoint (a reader replays them, a compaction rewrites them) |
-| `fileio.catalog.max.append.size.basis` | `tail` | What `max.append.size` bounds: `tail`, the records after the checkpoint, or `object`, the whole object (before errata D19's stopgap; for ablation) |
+| `fileio.catalog.max.append.size.basis` | `tail` | What `max.append.size` bounds: `tail`, the records after the checkpoint, or `object`, the whole object (for ablation) |
 | `fileio.catalog.checkpoint.memoize` | `true` | Whether a checkpoint writes an inline table unchanged since a decode or an earlier encode as the bytes it had (docs/CHECKPOINT_PLAN.md R0.2); `false` encodes every table (for ablation) |
 | `fileio.catalog.throttle.retry.min-wait-ms` | 200 | First wait before sending again a write that storage throttled ([LOG.md](LOG.md) §"The commit loop") |
 | `fileio.catalog.race.retry.min-wait-ms` | 100 | Bound of the random wait after a lost race, before the writer reads or probes the object again ([LOG.md](LOG.md) §"The commit loop") |

@@ -99,7 +99,7 @@ five stores: 91 tests, 0 failures, 24 skipped; the GCS Rapid canaries and
 the ADLS vended-credentials test pass too). b58500c8f3 added a case: an
 append to a version that a CAS replaced with an object of the same length
 fails, which S3 Express and ADLS pass (first on 2026-10-27) and the stores
-without append skip (errata D15 relies on it). Earlier: 2026-10-27 at
+without append skip (tail reads rely on it, ATOMIC_FILE_LOG.md). Earlier: 2026-10-27 at
 b58500c8f3, the same counts; 2026-10-26, GCS and ADLS at af875ccfd1 and S3
 just before it. See the fork's README, "Testing on
 real cloud storage".

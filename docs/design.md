@@ -704,9 +704,9 @@ crosses either threshold (`CompactionPolicy.limits`):
 - the read the commit staged on holds at least `max.append.count`
   intention records after its checkpoint (GC records not counted), or
 - the record would take the records after the checkpoint past
-  `max.append.size` bytes (with `max.append.size.basis` `object`, the
-  whole log, as before errata D19's stopgap: a checkpoint past it then
-  compacts on every commit).
+  `max.append.size` bytes (with `max.append.size.basis` `object`, for
+  ablation, the whole log: a checkpoint past it then compacts on every
+  commit).
 
 No on-disk hint is needed. Atomic append + atomic CAS at the storage
 layer are sufficient to linearize commits, and either writer in a race

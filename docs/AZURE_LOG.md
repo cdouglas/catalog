@@ -313,7 +313,7 @@ is when it costs a request:
 - **Nothing landed between.** The reply's offset puts the record at the tail of the view the
   log holds, so the view through it is that view and the record, with no request. This is the
   case of a conditional append that won its race, which `AtomicFileLog` reads nothing for
-  either (errata D20).
+  either (ATOMIC_FILE_LOG.md).
 - **Something landed between.** One ranged GET from the view's tail through the record. A
   conditional append in the same case lost its race: it reads the tail, sends its record
   again, and may lose again.

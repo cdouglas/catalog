@@ -16,8 +16,8 @@ listed below are the specs of record; this page restates only enough to name the
 | Inline manifest lists | [SPEC_ML.md](SPEC_ML.md) | The manifest pool and per-snapshot lists, and how writers in different modes interoperate |
 | Invariants and conflict matrices | [design.md](design.md) | I1–I12 (I11: a checkpoint is the replay of the log; I12: an encoding admits only what Iceberg's retry commits); pairs of operations under each encoding |
 | Bytes | [format-explorer/](format-explorer/index.html) | A decoder of catalog files in the browser, with scenarios generated from the codecs |
-| Proposed | [COMMITTED_PAGING.md](COMMITTED_PAGING.md) | Paging the committed set out of checkpoints |
-| Known costs and shortcuts | [errata.md](errata.md) D14–D18, [REPLAY_BENCH_RESULTS.md](REPLAY_BENCH_RESULTS.md), the lab's ingest pages | Compaction policy, whole-object reads, the committed set, expiry starvation, inline lists stored whole |
+| Paging | [COMMITTED_PAGING.md](COMMITTED_PAGING.md), [SNAPSHOT_PAGING.md](SNAPSHOT_PAGING.md) | The committed set's old ids and tables' old snapshots paged out of checkpoints |
+| Known costs and shortcuts | [errata.md](errata.md), [REPLAY_BENCH_RESULTS.md](REPLAY_BENCH_RESULTS.md), the lab's ingest pages | Fixed commit knobs and windows, expiry starvation, inline-ML growth, unbounded stamps, the latency models |
 
 ## The parts
 

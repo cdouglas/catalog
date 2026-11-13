@@ -140,7 +140,8 @@ records follow another, and folds a view of records alone only onto the tail
 they follow (`LogGapException`): a gap (a log that trimmed past its checkpoint,
 or lost records) or a splice would replay a state the log never held. Each
 provider checks its own chain by its own rule: dense positions for a
-sequencer, the trailers for one object.
+sequencer, the trailers for one object. That a provider's positions are true
+is its own word: one whose records' positions lie passes the runtime's check.
 
 Any log's reads may lag its appends (P1), and its capabilities do not say
 whether they do. A writer reads its own write through its receipt (P3), and a
@@ -868,7 +869,7 @@ compacts as it lands, fused (for ablation). The compaction policy says when the
 log is due: `CompactionPolicy.limits(maxRecords, maxBytes, basis)` once the log
 holds `maxRecords` intention records (0: every commit), or the record would take
 what `basis` counts past `maxBytes`: the records after the checkpoint (`TAIL`,
-the default), or the whole log (`OBJECT`, as before errata D19's stopgap, under
+the default), or the whole log (`OBJECT`, for ablation, under
 which a checkpoint past the bound compacts on every commit). The policy sees
 the replica's record count, its checkpoint's size and the log's
 (`CompactionPolicy.Input`); the catalog's knobs are
@@ -973,7 +974,7 @@ trivially; it reads nothing when the write says what that is (a replace holds
 what it wrote, and an append conditioned on a tail whose bytes the log read or
 wrote holds those bytes and the record: the condition names the version, which
 no later write leaves in place), and reads the version written after an append
-at a tail a probe found (errata D20). It maps the
+at a tail a probe found. It maps the
 fork's exceptions onto the SPI's: `StorageThrottleException` to throttled
 (before `CASException`, its superclass), `SegmentLimitException` to full,
 `CASException` and `AppendException` to conflict, and a failure to prepare a
