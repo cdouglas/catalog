@@ -195,38 +195,24 @@ either witness holds: both are stable, so their disjunction is.
 to other branches (write-audit-publish) where `partition-vector` is the
 chosen encoding.
 
-### D14. `max.append.count` and the race backoff are fixed numbers, not per store
+### D14. `max.append.count` and compaction's draws are fixed numbers, not per store
 
-`fileio.catalog.max.append.count` defaults to 1,000 and
-`fileio.catalog.race.retry.min-wait-ms` to 100 ms, both provisional and both
-chosen on one store's latencies as the benchmarks inject them (S3 Express:
-endive's profile, where a conditional append takes about 21 ms to land and 23
-ms to lose, and catalog-bench's measured `s3x-2026-11`; design.md §"Choosing
-append vs CAS"). The best values depend on the store's latencies as a writer
-sees them, which differ by store and by where the writer runs: from a cloud VM
-in the bucket's zone, S3 Express took about 11 ms an append (90 a second), so
-100 ms is about nine appends there and five in the benchmark; an Azure append
-that loses its race takes about 2 s to say so, so 100 ms is too short there;
-an S3 general-purpose bucket only replaces. They also depend on the catalog. A
-reader that holds a replica reads and folds only the records appended since
-(LOG.md "Replay"), and a record is about 200 bytes, so the count bounds a cold
-reader's whole read and how often every writer decodes a new checkpoint; a
-compaction's cost is the checkpoint's size and its race with the others'
-appends.
+`fileio.catalog.max.append.count` defaults to 1,000, provisional, chosen on one
+store's latencies as the benchmarks inject them (S3 Express: endive's profile,
+where a conditional append takes about 21 ms to land and 23 ms to lose, and
+catalog-bench's measured `s3x-2026-11`; design.md §"Choosing append vs CAS").
+The best value depends on the store and on the catalog. A reader that holds a
+replica reads and folds only the records appended since (LOG.md "Replay"), and
+a record is about 200 bytes, so the count bounds a cold reader's whole read and
+how often every writer decodes a new checkpoint; a compaction's cost is the
+checkpoint's size and its race with the others' appends. The wait after a lost
+race follows the writes' latency as the writer observes it (LOG.md "The commit
+loop"), so it needs no per-store setting.
 
-A principled rule:
-
-- **Backoff by observed latency.** The commit loop times each write it
-  sends. After a lost race, wait a time drawn below a bound of a few times
-  the latency of the write that lost (or a moving average of the loop's
-  writes), doubled with each race the commit loses, with the property as a
-  floor and a cap of a few hundred writes' worth. The writers who lost to
-  one winner then spread over a few write slots, whatever the store and
-  however far the writer is from it.
-- **Compact by cost.** Compact when the records after the checkpoint cost a
-  reader more than a compaction, amortized over the commits until the next
-  one, costs a writer: bytes or replay time of the tail against the
-  checkpoint's.
+A principled rule: **compact by cost.** Compact when the records after the
+checkpoint cost a reader more than a compaction, amortized over the commits
+until the next one, costs a writer: bytes or replay time of the tail against
+the checkpoint's.
 
 A writer compacts after its commit, at a point past the limits it draws,
 backing off as its compactions lose (TAIL_READS.md "Compaction after the
@@ -247,12 +233,6 @@ campaign `i11-paging`), while the ingest benchmark's captured catalog state is
 under 1 MB. So a cost rule must count the set. The ingest benchmark
 (`IngestBench`, campaign `i2-compaction`, lab page `ingest`) measures a
 compaction's encode and decode as the catalog grows.
-
-The backoff matters most where every commit replaces the object: on `s3`
-under overload, `partition-vector` commits less than `lamport` (lab page
-`c6-endive`), since each lost race is another read of the whole object, while
-`lamport`'s conflicts go back to Iceberg's retry, whose longer backoff
-throttles the writers.
 
 **Trigger to revisit:** a deployment on a store other than S3 Express, or
 the contention benchmark's Azure and GCS profiles.
@@ -678,5 +658,12 @@ measured at E1's and E3's points on `s3x-2026-11`. Still to take:
   commit grows with the catalog's tables. catalog-bench's JDBC reruns on
   `core-perf` (`e1j-cp`, `e3j-cp`, `p4rj-cp`) predate the new model and run
   again.
+
+- **The race backoff by latency against the fixed bound**
+  (`fileio.catalog.race.retry.basis` `latency` and `fixed`): at E1's knee,
+  and on `s3`, where every commit replaces the object and each lost race is
+  another read of it (there `partition-vector` committed less than `lamport`
+  under overload, lab page `c6-endive`, as `lamport`'s conflicts went back to
+  Iceberg's retry, whose longer backoff throttled the writers).
 
 **Trigger:** before the paper's cloud runs.

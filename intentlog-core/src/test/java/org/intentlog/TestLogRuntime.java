@@ -265,10 +265,71 @@ class TestLogRuntime {
     assertThat(log.calls).containsExactly("append", "read", "probe", "append", "readThrough");
   }
 
+  /**
+   * By latency (errata D14), a lost race's wait is drawn below 4 of the writes' observed latency,
+   * doubled with each race the commit lost, up to 64 of them; with the fixed basis, below
+   * raceMinWaitMs, doubled up to 1 s. raceMinWaitMs 0 waits for neither.
+   */
+  @Test
+  void aLostRaceWaitsByTheWritesLatency() {
+    long ms = 1_000_000L;
+    RuntimeConfig byLatency = config(10, NO_GC, 100L);
+    RuntimeConfig fixed = byLatency.withRaceByLatency(false);
+    long[] latency = new long[6];
+    long[] constant = new long[6];
+    for (int lost = 1; lost <= 6; lost++) {
+      latency[lost - 1] = LogRuntime.raceBoundNanos(byLatency, 22 * ms, lost) / ms;
+      constant[lost - 1] = LogRuntime.raceBoundNanos(fixed, 22 * ms, lost) / ms;
+    }
+    assertThat(latency).containsExactly(88, 176, 352, 704, 1408, 1408);
+    assertThat(constant).containsExactly(100, 200, 400, 800, 1000, 1000);
+    // an append that loses in 2 s (Azure's conditional append): 8 s first, at most 128 s
+    assertThat(LogRuntime.raceBoundNanos(byLatency, 2_000 * ms, 1) / ms).isEqualTo(8_000);
+    assertThat(LogRuntime.raceBoundNanos(byLatency, 2_000 * ms, 9) / ms).isEqualTo(128_000);
+    assertThat(LogRuntime.raceBoundNanos(config(10, NO_GC, 0L), 22 * ms, 1)).isZero();
+    assertThat(LogRuntime.raceBoundNanos(config(10, NO_GC, 0L).withRaceByLatency(false),
+        22 * ms, 1)).isZero();
+  }
+
+  /**
+   * The runtime times each write it sends, landed or lost, and the wait after a lost race follows:
+   * an append that takes 30 ms to lose bounds the wait at 4 times as long or more.
+   */
+  @Test
+  void aSlowStoresLostRaceWaitsLonger() {
+    runtime = new LogRuntime<>(log, ToyMachine.INSTANCE, config(10, NO_GC, 5L));
+    Replica<Map<String, Integer>> base = created();
+    long before = runtime.writeLatencyNanos();
+    byte[] other = LogEnvelope.encodeRecord(UuidV7.newUuidV7(),
+        ToyMachine.INSTANCE.encodeIntention(ToyMachine.Bump.of(base.state(), "other")));
+    log.beforeNextWrite(() -> {
+      try {
+        Thread.sleep(30);
+      } catch (InterruptedException e) {
+        throw new IllegalStateException(e);
+      }
+      log.appendDirectly(other);
+    });
+    CommitTrace.open();
+    try {
+      bump(base, "mine");
+      CommitTrace.Event backoff = CommitTrace.drain().stream()
+          .filter(e -> e.kind() == CommitTrace.Kind.BACKOFF).findFirst().orElseThrow();
+      // the creation's write and the lost append, averaged 1/8 when the race was lost: at least
+      // 30 ms / 8 + 7/8 of the first; the bound is 4 of them, the wait below it
+      long average = before + (30_000_000L - before) / 8;
+      assertThat(backoff.b()).isGreaterThanOrEqualTo(4 * average / 1_000_000L);
+      assertThat(backoff.a()).isLessThanOrEqualTo(backoff.b());
+    } finally {
+      CommitTrace.close();
+    }
+  }
+
   @Test
   void anInterruptWhileBackingOffLeavesTheCommitUnknown() {
-    // a bound of 10^6 ms: the wait drawn below it is 0 (no sleep) once in a million
-    runtime = new LogRuntime<>(log, ToyMachine.INSTANCE, config(10, NO_GC, 1_000_000L));
+    // a fixed bound of 10^6 ms: the wait drawn below it is 0 (no sleep) once in a million
+    runtime = new LogRuntime<>(log, ToyMachine.INSTANCE,
+        config(10, NO_GC, 1_000_000L).withRaceByLatency(false));
     Replica<Map<String, Integer>> base = created();
     log.beforeNextWrite(() -> {
       otherWriterBumps("other");

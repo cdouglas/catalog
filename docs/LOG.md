@@ -745,13 +745,22 @@ function CREATE():                                # a log with separate checkpoi
 `fileio.catalog.throttle.retry.min-wait-ms`, default 200 ms) at first, then
 twice the previous wait up to the larger of 5 s and that value, each plus up
 to 50% random jitter. `raceBackoff()` waits a time drawn uniformly below a
-bound (full jitter): `RuntimeConfig.raceMinWaitMs` (the catalog's
-`fileio.catalog.race.retry.min-wait-ms`, default 100 ms; 0: no wait) after the
-commit's first lost race, doubled for each later one, up to the larger of
-1 s and that value. The writers who lost to one winner would otherwise all
-read and resend at once, and on a log that only replaces itself most of them
-lose again, each loss costing a read of the whole log (the contention
-benchmark: 13.7 lost races per committed operation at 32 writers on an S3
+bound (full jitter) that follows the latency of the commit loop's writes as
+the runtime observes them (`RuntimeConfig.raceByLatency`, the catalog's
+`fileio.catalog.race.retry.basis` `latency`): the runtime keeps a moving
+average (weight 1/8) of each send's time from request to answer, landed or
+lost its race, and the bound is 4 of it after the commit's first lost race,
+doubled for each later one, up to 64 of it. The writers who lost to one
+winner then spread over a few write slots, then over as many as there are of
+them, whatever the store and wherever the writer runs (errata D14); on S3
+Express as the benchmarks model it (an append ~22 ms) that is ~88 ms first and
+~1.4 s at most. The ablation, basis `fixed`, starts the bound at
+`RuntimeConfig.raceMinWaitMs` (`fileio.catalog.race.retry.min-wait-ms`, default
+100 ms) and doubles it up to the larger of 1 s and that value; 0 waits for
+neither. The writers who lost to one winner would otherwise all read and
+resend at once, and on a log that only replaces itself most of them lose
+again, each loss costing a read of the whole log (the contention benchmark:
+13.7 lost races per committed operation at 32 writers on an S3
 general-purpose bucket). A wait changes when a write is sent, never what
 it says, so the protocol (and its TLA+ models, which have no time) is
 unchanged. `checkpoint(r)` is exactly `r`'s log id, committed set

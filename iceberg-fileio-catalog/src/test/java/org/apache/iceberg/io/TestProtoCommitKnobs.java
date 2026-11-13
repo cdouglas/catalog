@@ -278,6 +278,18 @@ public class TestProtoCommitKnobs {
         .hasMessageContaining(LogCatalogProperties.COMPACT_AFTER_COMMIT);
   }
 
+  /** The wait after a lost race follows the writes' latency by default (errata D14). */
+  @Test
+  void aLostRaceWaitsByLatencyByDefaultAndCanBeFixed() {
+    assertThat(LogCatalogProperties.runtimeConfig(Map.of()).raceByLatency()).isTrue();
+    assertThat(LogCatalogProperties.runtimeConfig(
+        Map.of(LogCatalogProperties.RACE_BASIS, "fixed")).raceByLatency()).isFalse();
+    org.assertj.core.api.Assertions.assertThatThrownBy(() -> LogCatalogProperties.runtimeConfig(
+        Map.of(LogCatalogProperties.RACE_BASIS, "observed")))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining(LogCatalogProperties.RACE_BASIS);
+  }
+
   @Test
   void casOnlyMode_zeroAppendCount() {
     // maxAppendCount=0 forces every commit through CAS

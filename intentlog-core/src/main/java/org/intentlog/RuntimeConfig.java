@@ -28,10 +28,11 @@ import java.util.function.LongSupplier;
  * @param maxThrottleAttempts the times a write is sent while storage throttles it (8)
  * @param throttleMinWaitMs the first backoff after a throttled write; later ones double, up to the
  *     larger of 5 s and this, each plus up to 50% jitter
- * @param raceMinWaitMs the bound of the first wait after a lost race (a conditional write that
- *     failed its condition), before the commit reads or probes the log again; each later lost race
- *     of the commit doubles it, up to the larger of 1 s and this. The wait is drawn uniformly below
- *     the bound (full jitter), so that writers who lost to one winner spread out (0: none)
+ * @param raceMinWaitMs with {@link #raceByLatency} false, the bound of the first wait after a lost
+ *     race (a conditional write that failed its condition), before the commit reads or probes the
+ *     log again; each later lost race of the commit doubles it, up to the larger of 1 s and this.
+ *     The wait is drawn uniformly below the bound (full jitter), so that writers who lost to one
+ *     winner spread out. 0: no wait after a lost race, whatever the basis
  * @param committedRetentionMs how long the committed set keeps an id (R): a compaction's GC record
  *     drops those older ({@code Long.MAX_VALUE}: never). Within it, a writer learns whether its
  *     record applied exactly, from the inline set or a page
@@ -48,6 +49,9 @@ import java.util.function.LongSupplier;
  * @param tailReads whether reads after a replica read only what follows it ({@link #withTailReads})
  * @param compactAfterCommit whether a log that replaces itself is compacted after a commit
  *     ({@link #withCompactionAfterCommit})
+ * @param raceByLatency whether the wait after a lost race follows the latency of the commit
+ *     loop's writes as this runtime observes them ({@link #withRaceByLatency}), rather than {@code
+ *     raceMinWaitMs}
  */
 public record RuntimeConfig(
     int maxAttempts,
@@ -61,10 +65,17 @@ public record RuntimeConfig(
     long admissionWindowMs,
     long pageThresholdBytes,
     boolean tailReads,
-    boolean compactAfterCommit) {
+    boolean compactAfterCommit,
+    boolean raceByLatency) {
 
   public static final int DEFAULT_MAX_ATTEMPTS = 10;
   public static final int DEFAULT_MAX_THROTTLE_ATTEMPTS = 8;
+
+  /** By latency, the first wait's bound after a lost race, in observed write latencies. */
+  public static final int RACE_FIRST_WRITES = 4;
+
+  /** By latency, the largest bound of a wait after a lost race, in observed write latencies. */
+  public static final int RACE_MAX_WRITES = 64;
 
   /** A, 5 minutes: provisional, until the experiments sweep it (COMMITTED_PAGING.md). */
   public static final long DEFAULT_ADMISSION_WINDOW_MS = 5L * 60 * 1000;
@@ -94,29 +105,31 @@ public record RuntimeConfig(
   }
 
   /**
-   * The configuration with tail reads ({@link #tailReads}) and compaction after the commit ({@link
-   * #compactAfterCommit}), the defaults.
+   * The configuration with tail reads ({@link #tailReads}), compaction after the commit ({@link
+   * #compactAfterCommit}) and a race backoff by observed latency ({@link #raceByLatency}), the
+   * defaults.
    */
   public RuntimeConfig(
       int maxAttempts, int maxThrottleAttempts, long throttleMinWaitMs, long raceMinWaitMs,
       long committedRetentionMs, CompactionPolicy compaction, Duration visibilityWait,
       LongSupplier clockMs, long admissionWindowMs, long pageThresholdBytes) {
     this(maxAttempts, maxThrottleAttempts, throttleMinWaitMs, raceMinWaitMs, committedRetentionMs,
-        compaction, visibilityWait, clockMs, admissionWindowMs, pageThresholdBytes, true, true);
+        compaction, visibilityWait, clockMs, admissionWindowMs, pageThresholdBytes, true, true,
+        true);
   }
 
   /** This configuration, paging at admission window {@code admissionMs} and threshold {@code bytes}. */
   public RuntimeConfig withPaging(long admissionMs, long bytes) {
     return new RuntimeConfig(maxAttempts, maxThrottleAttempts, throttleMinWaitMs, raceMinWaitMs,
         committedRetentionMs, compaction, visibilityWait, clockMs, admissionMs, bytes, tailReads,
-        compactAfterCommit);
+        compactAfterCommit, raceByLatency);
   }
 
   /** This configuration, on clock {@code clock}. */
   public RuntimeConfig withClock(LongSupplier clock) {
     return new RuntimeConfig(maxAttempts, maxThrottleAttempts, throttleMinWaitMs, raceMinWaitMs,
         committedRetentionMs, compaction, visibilityWait, clock, admissionWindowMs,
-        pageThresholdBytes, tailReads, compactAfterCommit);
+        pageThresholdBytes, tailReads, compactAfterCommit, raceByLatency);
   }
 
   /**
@@ -128,14 +141,14 @@ public record RuntimeConfig(
   public RuntimeConfig withTailReads(boolean tail) {
     return new RuntimeConfig(maxAttempts, maxThrottleAttempts, throttleMinWaitMs, raceMinWaitMs,
         committedRetentionMs, compaction, visibilityWait, clockMs, admissionWindowMs,
-        pageThresholdBytes, tail, compactAfterCommit);
+        pageThresholdBytes, tail, compactAfterCommit, raceByLatency);
   }
 
   /** This configuration, compacting by {@code policy}. */
   public RuntimeConfig withCompaction(CompactionPolicy policy) {
     return new RuntimeConfig(maxAttempts, maxThrottleAttempts, throttleMinWaitMs, raceMinWaitMs,
         committedRetentionMs, policy, visibilityWait, clockMs, admissionWindowMs,
-        pageThresholdBytes, tailReads, compactAfterCommit);
+        pageThresholdBytes, tailReads, compactAfterCommit, raceByLatency);
   }
 
   /**
@@ -153,7 +166,24 @@ public record RuntimeConfig(
   public RuntimeConfig withCompactionAfterCommit(boolean after) {
     return new RuntimeConfig(maxAttempts, maxThrottleAttempts, throttleMinWaitMs, raceMinWaitMs,
         committedRetentionMs, compaction, visibilityWait, clockMs, admissionWindowMs,
-        pageThresholdBytes, tailReads, after);
+        pageThresholdBytes, tailReads, after, raceByLatency);
+  }
+
+  /**
+   * This configuration, waiting after a lost race by the latency of the commit loop's writes
+   * ({@code true}, the default) or by {@link #raceMinWaitMs} ({@code false}, as before: for
+   * ablation). By latency: the first wait is drawn below {@link #RACE_FIRST_WRITES} times the
+   * runtime's moving average of its writes' latency (each send, landed or lost), each later lost
+   * race of the commit doubles the bound, up to {@link #RACE_MAX_WRITES} times it; so the writers
+   * who lost to one winner spread over a few write slots, then over as many as there are of them,
+   * on whatever store and from wherever the writer is (fileio-catalog errata D14). On the store the
+   * fixed bound was tuned on (S3 Express, a conditional append ~22 ms), the two agree within a
+   * fifth (88 ms against 100 ms first, 1.4 s against 1 s at most).
+   */
+  public RuntimeConfig withRaceByLatency(boolean byLatency) {
+    return new RuntimeConfig(maxAttempts, maxThrottleAttempts, throttleMinWaitMs, raceMinWaitMs,
+        committedRetentionMs, compaction, visibilityWait, clockMs, admissionWindowMs,
+        pageThresholdBytes, tailReads, compactAfterCommit, byLatency);
   }
 
   /** The defaults, with the given compaction policy, retention, and throttle and race backoffs. */

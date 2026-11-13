@@ -644,8 +644,8 @@ compacts ([ATOMIC_FILE_LOG.md](ATOMIC_FILE_LOG.md) §"Commits on one object"),
 `fileio.catalog.committed.retention.ms` how long the committed set keeps an id
 ([LOG.md](LOG.md) §"The committed set and GC"), and
 `fileio.catalog.throttle.retry.min-wait-ms` the backoff after a throttled
-write, and `fileio.catalog.race.retry.min-wait-ms` the backoff after a lost
-race.
+write, and `fileio.catalog.race.retry.basis` (with `race.retry.min-wait-ms`)
+the backoff after a lost race.
 
 ## Late-Binding
 

@@ -32,6 +32,8 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 import org.intentlog.wire.CommittedSetCodec;
 import org.intentlog.wire.LogEnvelope;
@@ -86,6 +88,10 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
           return size() > PAGE_CACHE;
         }
       });
+  // The latency of the commit loop's writes as this runtime sees them: a moving average (weight
+  // 1/8, as TCP's smoothed round trip) of each send that landed or lost its race, in nanoseconds;
+  // 0 before the first. The wait after a lost race follows it (RuntimeConfig#raceByLatency).
+  private final AtomicLong writeLatencyNanos = new AtomicLong();
   // Pages this runtime put. A name's bytes never change, and a name is deleted only once the
   // floor has passed its node, after which no compactor proposes it again: so a put once is put.
   private final Set<String> pagesPut =
@@ -636,12 +642,51 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
   }
 
   /** Sleeps; an interrupt stops the caller, with {@code cause} (its outcome unknown) thrown. */
+  /**
+   * The bound, in nanoseconds, of the wait after a commit's {@code lostRaces}-th lost race (0: no
+   * wait). By latency ({@link RuntimeConfig#raceByLatency}): {@link RuntimeConfig#RACE_FIRST_WRITES}
+   * times {@code latencyNanos}, the writes' observed latency, doubled for each race the commit lost
+   * before, up to {@link RuntimeConfig#RACE_MAX_WRITES} times it. Otherwise {@code raceMinWaitMs},
+   * doubled likewise, up to the larger of 1 s and it. {@code raceMinWaitMs} 0 waits for neither.
+   */
+  static long raceBoundNanos(RuntimeConfig config, long latencyNanos, int lostRaces) {
+    long base = config.raceMinWaitMs();
+    if (base <= 0L) {
+      return 0L;
+    }
+    if (config.raceByLatency()) {
+      long cap = RuntimeConfig.RACE_MAX_WRITES * latencyNanos;
+      long bound = RuntimeConfig.RACE_FIRST_WRITES * latencyNanos;
+      for (int lost = 1; lost < lostRaces && bound < cap; lost++) {
+        bound <<= 1;
+      }
+      return Math.min(bound, cap);
+    }
+    long boundMs = Math.min(base << Math.min(lostRaces - 1, 20), Math.max(1_000L, base));
+    return TimeUnit.MILLISECONDS.toNanos(boundMs);
+  }
+
+  /** The latency of the commit loop's writes as this runtime has seen them (0: none yet). */
+  long writeLatencyNanos() {
+    return writeLatencyNanos.get();
+  }
+
+  /** Adds a send's latency, from its request to its answer, to the moving average. */
+  private void observeWrite(long nanos) {
+    long sample = Math.max(1L, nanos);
+    writeLatencyNanos.accumulateAndGet(sample, (avg, s) -> avg == 0L ? s : avg + (s - avg) / 8);
+  }
+
   private static void sleep(long ms, RuntimeException cause) {
-    if (ms <= 0L) {
+    sleepNanos(TimeUnit.MILLISECONDS.toNanos(ms), cause);
+  }
+
+  private static void sleepNanos(long nanos, RuntimeException cause) {
+    if (nanos <= 0L) {
       return;
     }
     try {
-      Thread.sleep(ms);
+      TimeUnit.NANOSECONDS.sleep(nanos);
     } catch (InterruptedException ie) {
       Thread.currentThread().interrupt();
       cause.addSuppressed(ie);
@@ -1512,22 +1557,22 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
 
     /**
      * Waits after a lost race, before the commit reads or probes the log again: a time drawn
-     * uniformly below a bound that starts at {@code raceMinWaitMs} and doubles with each race the
-     * commit lost, up to the larger of 1 s and that (full jitter). The writers who lost to one
-     * winner would otherwise all read and resend at once, and on a log that only replaces itself
-     * most of them lose again: each loss costs a read of the whole log. An interrupt stops the
-     * commit, its outcome unknown (the write that lost may have landed).
+     * uniformly below a bound that doubles with each race the commit lost (full jitter), starting
+     * from a few of the writes' observed latency ({@link #raceBoundNanos}). The writers who lost to
+     * one winner would otherwise all read and resend at once, and on a log that only replaces
+     * itself most of them lose again: each loss costs a read of the whole log. An interrupt stops
+     * the commit, its outcome unknown (the write that lost may have landed).
      */
     private void raceBackoff(RuntimeException lost) {
       lostRaces += 1;
-      long base = config.raceMinWaitMs();
-      if (base <= 0L) {
+      long bound = raceBoundNanos(config, writeLatencyNanos.get(), lostRaces);
+      if (bound <= 0L) {
         return;
       }
-      long bound = Math.min(base << Math.min(lostRaces - 1, 20), Math.max(1_000L, base));
       long wait = ThreadLocalRandom.current().nextLong(bound + 1);
-      CommitTrace.event(CommitTrace.Kind.BACKOFF, wait, 0);
-      sleep(wait, lost);
+      CommitTrace.event(CommitTrace.Kind.BACKOFF, TimeUnit.NANOSECONDS.toMillis(wait),
+          TimeUnit.NANOSECONDS.toMillis(bound));
+      sleepNanos(wait, lost);
     }
 
     private void adopt(Replayed fresh) {
@@ -1629,6 +1674,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
       LogThrottledException lastThrottle = null;
       for (int attempt = 0; attempt < config.maxThrottleAttempts(); attempt++) {
         Receipt receipt;
+        long sent = System.nanoTime();
         try {
           receipt = send.get();
         } catch (LogThrottledException e) {
@@ -1643,11 +1689,15 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
           }
           e.addSuppressed(lastThrottle);
           throw new AmbiguousWrite(e);
-        } catch (LogConflictException | LogFullException e) {
+        } catch (LogConflictException e) {
+          observeWrite(System.nanoTime() - sent);
+          throw e;
+        } catch (LogFullException e) {
           throw e;
         } catch (RuntimeException e) {
           throw new AmbiguousWrite(e);
         }
+        observeWrite(System.nanoTime() - sent);
         CommitTrace.event(CommitTrace.Kind.LANDED);
         if (unconditional && lastThrottle != null) {
           // The throttled send may have landed beside this one, and a view through this one may

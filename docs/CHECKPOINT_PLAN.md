@@ -11,7 +11,7 @@ that cannot fold onto a replica it holds. Several errata come back to that:
 
 | Erratum | In short | What it costs |
 |---|---|---|
-| D14 | commit knobs fixed, not per store | `max.append.count` and the race backoff are constants measured on one store |
+| D14 | commit knobs fixed, not per store | `max.append.count` and compaction's draws are constants measured on one store |
 | D15 | a read reads everything | every read GETs the whole object |
 | D16 | replay rewrites committed set | every checkpoint carries the whole committed set |
 | D18 | ML lists stored whole | each inline-ML snapshot's manifest list is stored in full |

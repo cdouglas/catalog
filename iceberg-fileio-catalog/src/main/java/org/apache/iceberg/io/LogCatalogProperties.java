@@ -202,13 +202,36 @@ public final class LogCatalogProperties {
   public static final long DEFAULT_THROTTLE_MIN_WAIT_MS = 200L;
 
   /**
-   * The bound of the first wait after a commit loses a race for the catalog (another writer's
-   * append or replace landed first), before it reads the catalog again and resends; each later
-   * lost race of the commit doubles it, up to 1 s, and the wait is drawn below it at random, so
-   * that the writers who lost spread out instead of racing again at once. 0: resend at once.
+   * With {@link #RACE_BASIS} {@code fixed}, the bound of the first wait after a commit loses a
+   * race for the catalog (another writer's append or replace landed first), before it reads the
+   * catalog again and resends; each later lost race of the commit doubles it, up to 1 s, and the
+   * wait is drawn below it at random, so that the writers who lost spread out instead of racing
+   * again at once. 0: resend at once, whatever the basis.
    */
   public static final String RACE_MIN_WAIT_MS = "fileio.catalog.race.retry.min-wait-ms";
   public static final long DEFAULT_RACE_MIN_WAIT_MS = 100L;
+
+  /**
+   * What bounds the wait after a lost race. {@code latency}: the commit loop's writes as the
+   * catalog sees them (a moving average of each append or replace it sent, landed or lost); the
+   * first wait is drawn below 4 of them, each later lost race of the commit doubles the bound, up
+   * to 64 of them, so the writers who lost spread over a few write slots, then over as many as
+   * there are of them, on any store and from wherever the writer runs (errata D14). On S3
+   * Express as the benchmarks model it (a conditional append ~22 ms) that is ~88 ms first and
+   * ~1.4 s at most. {@code fixed}: {@link #RACE_MIN_WAIT_MS}, doubling up to 1 s, as before (for
+   * ablation). Default: {@code latency}.
+   */
+  public static final String RACE_BASIS = "fileio.catalog.race.retry.basis";
+  public static final String DEFAULT_RACE_BASIS = "latency";
+
+  /** Whether {@code properties} bound the wait after a lost race by observed write latency. */
+  static boolean raceByLatency(Map<String, String> properties) {
+    String val = properties == null ? null : properties.get(RACE_BASIS);
+    String basis = val != null ? val : DEFAULT_RACE_BASIS;
+    Preconditions.checkArgument(basis.equals("latency") || basis.equals("fixed"),
+        "%s must be latency or fixed, got %s", RACE_BASIS, basis);
+    return basis.equals("latency");
+  }
 
   /**
    * The conflict encoding of a catalog this one creates, by name: how replay decides whether a
@@ -367,7 +390,8 @@ public final class LogCatalogProperties {
         .withPaging(admissionMs, threshold)
         .withTailReads(booleanProperty(properties, READ_TAIL, DEFAULT_READ_TAIL))
         .withCompactionAfterCommit(
-            booleanProperty(properties, COMPACT_AFTER_COMMIT, DEFAULT_COMPACT_AFTER_COMMIT));
+            booleanProperty(properties, COMPACT_AFTER_COMMIT, DEFAULT_COMPACT_AFTER_COMMIT))
+        .withRaceByLatency(raceByLatency(properties));
     if (azure) {
       // the records after its checkpoint bound no store's cap there: compact by a share of the
       // checkpoint's size, within the size and count bounds

@@ -57,8 +57,9 @@ on it and commits them atomically:
    after a lost append race it resends the same record at the new tail;
    it resends a throttled write after a backoff
    (`fileio.catalog.throttle.retry.min-wait-ms`); it waits a random,
-   growing time after each lost race before it reads again
-   (`fileio.catalog.race.retry.min-wait-ms`); and it settles a write
+   growing time after each lost race before it reads again, a few of
+   its writes' observed latency at first
+   (`fileio.catalog.race.retry.basis`); and it settles a write
    whose outcome it did not learn by reading the log for the
    transaction's record, or throws `CommitStateUnknownException` (I10). A
    record whose preconditions fail goes back to the caller: the catalog
@@ -819,9 +820,14 @@ conditional append, set `max.append.count = 0` to force CAS-only mode.
 
 A writer that loses a race for the object (another writer's append or
 replace landed first) waits before it reads again and resends: a time
-drawn below a bound that starts at `fileio.catalog.race.retry.min-wait-ms`
-(default 100 ms, the best of none, 20 and 100 ms in the contention benchmark's
-`c7-backoff` under `manifest-window`) and doubles with each race the commit loses, up to 1 s.
+drawn below a bound that starts at 4 of its writes' observed latency and
+doubles with each race the commit loses, up to 64 of them
+(`fileio.catalog.race.retry.basis` `latency`; LOG.md §"The commit loop").
+On S3 Express as the benchmarks model it, that is within a fifth of the
+fixed bound measured there, which `fixed` keeps for ablation: from
+`fileio.catalog.race.retry.min-wait-ms` (100 ms, the best of none, 20 and
+100 ms in the contention benchmark's `c7-backoff` under `manifest-window`),
+doubling up to 1 s.
 Without it the writers who lost to one winner all read and resend at
 once, and on a store that only replaces, most lose again, each loss a
 read of the whole object: at 32 writers on an S3 general-purpose bucket,

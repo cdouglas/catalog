@@ -94,7 +94,7 @@ Two windows follow:
   ids inline. A commit slower than A has its record rejected and retries with
   a new id: a spurious failure, never a wrong answer. The commit loop bounds a
   commit's sends: 10 attempts, each with at most 8 throttled sends backing off
-  up to 5 s, and a race backoff up to 1 s. A therefore needs to cover realistic commits,
+  up to 5 s, and a race backoff up to 64 write latencies (~1.4 s on S3 Express). A therefore needs to cover realistic commits,
   not the pathological worst case. Proposed default: 5 minutes (provisional).
   Since overrunning it costs only a retry, A may also follow the commit
   durations the runtime observes (errata D14).

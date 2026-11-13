@@ -49,7 +49,7 @@ public final class CommitTrace {
     LOST,
     /** The write's outcome is unknown (its reply lost, or reading it back failed). */
     AMBIGUOUS,
-    /** A wait after a lost race: a = its length in ms. */
+    /** A wait after a lost race: a = its length in ms, b = the bound it was drawn below in ms. */
     BACKOFF,
     /**
      * A read began: a = 1 if it reads what follows a replica, 0 if whole; b = 1 if a commit's,

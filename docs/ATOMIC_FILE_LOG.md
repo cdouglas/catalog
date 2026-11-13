@@ -228,7 +228,8 @@ whether a commit whose id the floor has passed applied.
 | `fileio.catalog.max.append.size.basis` | `tail` | What `max.append.size` bounds: `tail`, the records after the checkpoint, or `object`, the whole object (for ablation) |
 | `fileio.catalog.checkpoint.memoize` | `true` | Whether a checkpoint writes an inline table unchanged since a decode or an earlier encode as the bytes it had (docs/CHECKPOINT_PLAN.md R0.2); `false` encodes every table (for ablation) |
 | `fileio.catalog.throttle.retry.min-wait-ms` | 200 | First wait before sending again a write that storage throttled ([LOG.md](LOG.md) §"The commit loop") |
-| `fileio.catalog.race.retry.min-wait-ms` | 100 | Bound of the random wait after a lost race, before the writer reads or probes the object again ([LOG.md](LOG.md) §"The commit loop") |
+| `fileio.catalog.race.retry.basis` | `latency` | What bounds the random wait after a lost race, before the writer reads or probes the object again: `latency`, 4 of its writes' observed latency, doubling per lost race up to 64; `fixed`, `race.retry.min-wait-ms` ([LOG.md](LOG.md) §"The commit loop") |
+| `fileio.catalog.race.retry.min-wait-ms` | 100 | With `race.retry.basis` `fixed`, the first bound of the wait after a lost race, doubling up to 1 s; 0: no wait, either basis |
 | `fileio.catalog.committed.retention.ms` | 1800000 (30 min) | How long the committed set keeps an id ([LOG.md](LOG.md) §"The committed set and GC") |
 | `fileio.catalog.committed.admission.ms` | 300000 (5 min, provisional) | The admission window A: a replace pages only blocks of ids older than this, and a commit slower than it is rejected and retried ([COMMITTED_PAGING.md](COMMITTED_PAGING.md)) |
 | `fileio.catalog.committed.page.threshold` | 1048576 (1 MiB) | The threshold T: a replace pages the oldest blocks while the inline set is larger |

@@ -50,6 +50,7 @@ import org.apache.iceberg.io.AtomicOutputFile;
 import org.apache.iceberg.io.CatalogLog;
 import org.apache.iceberg.io.ContentionAccess;
 import org.apache.iceberg.io.FileIOCatalog;
+import org.apache.iceberg.io.LogCatalogProperties;
 import org.apache.iceberg.io.InMemoryAtomicFileIO;
 import org.apache.iceberg.io.SeekableInputStream;
 import org.intentlog.LogView;
@@ -141,7 +142,9 @@ final class ContentionRun {
           + "\"expire_every_s\": 5,"
           + "\"expire_retain\": 50,"
           + "\"expire_older_than_s\": 0,"
-          // the catalog's backoff after a lost race (fileio.catalog.race.retry.min-wait-ms)
+          // the catalog's backoff after a lost race: by its writes' observed latency, or (fixed)
+          // from race_min_wait_ms (fileio.catalog.race.retry.basis, .min-wait-ms; errata D14)
+          + "\"race_basis\": \"latency\","
           + "\"race_min_wait_ms\": 100,"
           // sampling of the catalog object
           + "\"sample_every_ms\": 1000,"
@@ -158,14 +161,15 @@ final class ContentionRun {
 
   /**
    * Keys added after the first campaign (p5, 2026-10-27), with the value the runs that recorded no
-   * such key ran (race_min_wait_ms: p6's, the catalog's default then): one at that value is left
+   * such key ran (race_min_wait_ms: p6's, the catalog's default then; race_basis: fixed, the only
+   * basis before 2026-11-13): one at that value is left
    * out of the hash, so a configuration keeps the hash its earlier runs recorded. Every driver of
    * this package's configurations hashes with them.
    */
   static final Map<String, String> LATER_KEYS =
       Map.of("expire_older_than_s", "0", "race_min_wait_ms", "20", "expire_retry_num", "-1",
           "capture_log", "false", "capture_format", "1", "txn_isolation", "serializable",
-          "generate", "");
+          "generate", "", "race_basis", "fixed");
 
   private final BenchConfig config;
   private final Path dir;
@@ -211,6 +215,7 @@ final class ContentionRun {
     props.put("fileio.catalog.max.append.size", config.string("max_append_size"));
     props.put("fileio.catalog.conflict.encoding", config.string("encoding"));
     props.put("fileio.catalog.race.retry.min-wait-ms", config.string("race_min_wait_ms"));
+    props.put(LogCatalogProperties.RACE_BASIS, config.string("race_basis"));
     String prefix = CatalogProperties.TABLE_DEFAULT_PREFIX;
     props.put(prefix + TableProperties.COMMIT_NUM_RETRIES, config.string("retry_num"));
     props.put(prefix + TableProperties.COMMIT_MIN_RETRY_WAIT_MS, config.string("retry_min_wait_ms"));

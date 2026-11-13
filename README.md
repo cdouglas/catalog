@@ -279,7 +279,8 @@ suites skip; see [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
 | `fileio.catalog.checkpoint.memoize` | `true` | Write each inline table unchanged since a decode or an earlier encode as the bytes it had; `false` re-encodes every table (for ablation) |
 | `fileio.catalog.committed.retention.ms` | `1800000` (30 min) | Minimum age before a committed-txn UUID becomes eligible for GC at compaction. `Long.MAX_VALUE` disables; `0` GCs aggressively (not recommended) |
 | `fileio.catalog.throttle.retry.min-wait-ms` | `200` | First wait before retrying a write that storage throttled; each later wait doubles, up to 5 s |
-| `fileio.catalog.race.retry.min-wait-ms` | `100` | Bound of the random wait after a commit loses a race for the catalog, before it reads again; each later loss doubles it, up to 1 s. `0` resends at once |
+| `fileio.catalog.race.retry.basis` | `latency` | What bounds the random wait after a commit loses a race for the catalog: `latency`, 4 of its writes' observed latency (a moving average), doubling with each loss up to 64; `fixed`, `race.retry.min-wait-ms` (for ablation) |
+| `fileio.catalog.race.retry.min-wait-ms` | `100` | With `race.retry.basis` `fixed`, the first bound of the random wait after a lost race, before the writer reads again; each later loss doubles it, up to 1 s. `0` resends at once, either basis |
 | `fileio.catalog.txn.read.witness` | `true` | A serializable catalog transaction's record names the branches it read of each table, which the conflict encoding judges by what changed of them; `false` holds each table it read to its version (for ablation) |
 | `fileio.catalog.conflict.encoding` | `manifest-window` | How replay decides whether a table update conflicts with what landed since its writer read the table; fixed when the catalog is created ([docs/SPEC.md](docs/SPEC.md) "Conflict Encodings") |
 
