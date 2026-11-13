@@ -32,6 +32,7 @@ import net.jqwik.api.GenerationMode;
 import net.jqwik.api.Property;
 import net.jqwik.api.PropertyDefaults;
 import net.jqwik.api.Provide;
+import net.jqwik.api.constraints.IntRange;
 import net.jqwik.api.statistics.Statistics;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
@@ -106,6 +107,7 @@ class TestCatalogRaceProperties {
       @ForAll("modes") LocalCatalogMode fileModeA,
       @ForAll("modes") LocalCatalogMode fileModeB,
       @ForAll("modes") LocalCatalogMode fileModeC,
+      @ForAll("setupStorage") LocalCatalogMode setupStorage,
       @ForAll("logs") LocalCatalogMode.Log catalogLog,
       @ForAll("states") Setup setup,
       @ForAll("ops") Op a,
@@ -124,7 +126,11 @@ class TestCatalogRaceProperties {
     LocalCatalogMode modeA = fileModeA.on(catalogLog);
     LocalCatalogMode modeB = fileModeB.on(catalogLog);
     LocalCatalogMode modeC = fileModeC.on(catalogLog);
-    LocalCatalogMode base = LocalCatalogMode.base(catalogLog);
+    // The setup's tables are pointer tables, or inline: a transaction then stages its append as a
+    // delta, which the encoding judges where it lands (errata D12)
+    LocalCatalogMode base = setupStorage.on(catalogLog);
+    Statistics.label("setup's tables").collect(
+        setupStorage.inlineML ? "inline ML" : setupStorage.inlineTM ? "inline TM" : "pointer");
     Statistics.label("log").collect(catalogLog);
     List<Op> racers = c.kind == null ? List.of(b) : List.of(b, c);
     List<LocalCatalogMode> racerModes = List.of(modeB, modeC);
@@ -317,14 +323,14 @@ class TestCatalogRaceProperties {
     boolean lost = gc && before > 0 && (raceA.equals("CommitFailedException")
         || raceA.equals("CommitStateUnknownException"));
     String[] serial = new String[racers.size()];
-    String[] first = serialRun(setup, replaced || lost ? null : a, modeA, racers, racerModes,
+    String[] first = serialRun(setup, base, replaced || lost ? null : a, modeA, racers, racerModes,
         before, props, serial);
     String serialA = replaced || lost ? raceA : first[0];
     String serialState = first[1];
     boolean tookEffect = false; // A lost its outcome, but the race ends as the serial run with A
     if (lost && !raceState.equals(serialState)) {
       String[] withA = new String[racers.size()];
-      String[] landed = serialRun(setup, a, modeA, racers, racerModes, before, props, withA);
+      String[] landed = serialRun(setup, base, a, modeA, racers, racerModes, before, props, withA);
       if (raceState.equals(landed[1])) {
         serial = withA;
         serialState = landed[1];
@@ -407,11 +413,11 @@ class TestCatalogRaceProperties {
    * it is null, then the rest. Fills {@code results} with the racers' results; returns A's result
    * and the catalog's state.
    */
-  private static String[] serialRun(Setup setup, Op a, LocalCatalogMode modeA, List<Op> racers,
-      List<LocalCatalogMode> racerModes, int before, Map<String, String> props,
-      String[] results) {
+  private static String[] serialRun(Setup setup, LocalCatalogMode base, Op a,
+      LocalCatalogMode modeA, List<Op> racers, List<LocalCatalogMode> racerModes, int before,
+      Map<String, String> props, String[] results) {
     InMemoryAtomicFileIO serialIo = new InMemoryAtomicFileIO();
-    setup.apply(LocalCatalogMode.base(modeA.log()).catalog(serialIo, WAREHOUSE, "c", Map.of()));
+    setup.apply(base.catalog(serialIo, WAREHOUSE, "c", Map.of()));
     for (int k = 0; k < before; k++) {
       results[k] = racers.get(k).run(
           racerModes.get(k).catalog(serialIo, WAREHOUSE, "c", props), name(k));
@@ -430,6 +436,57 @@ class TestCatalogRaceProperties {
 
   /** What Iceberg reports for a handle to a table that was dropped and created again. */
   private static final String REPLACED = "IllegalStateException: Table UUID does not match";
+
+  /**
+   * The race above with A a catalog transaction and its racers writing the tables it appends to
+   * and reads, on tables that each hold a snapshot, stored as A's mode stores them: where a
+   * transaction's appends to an inline table are judged where its record lands, and commit where
+   * a retry of them would (errata D12). Racer B writes A's table, and C, if any, the other table A
+   * loads. It must end as a serial run, as above.
+   */
+  @Property(tries = 200)
+  void aTransactionRaceEndsAsASerialRun(
+      @ForAll("modes") LocalCatalogMode fileModeA,
+      @ForAll("modes") LocalCatalogMode fileModeB,
+      @ForAll("modes") LocalCatalogMode fileModeC,
+      @ForAll("logs") LocalCatalogMode.Log catalogLog,
+      @ForAll @IntRange(min = 0, max = 11) int x,
+      @ForAll @IntRange(min = 0, max = 11) int y,
+      @ForAll("tableRacers") Kind racerB,
+      @ForAll("tableRacers") Kind racerC,
+      @ForAll boolean twoRacers,
+      @ForAll boolean gc,
+      @ForAll boolean paging,
+      @ForAll("clockOffsets") List<Long> clockOffsets,
+      @ForAll("encodings") String encoding,
+      @ForAll InMemoryAtomicFileIO.ReadMode reads,
+      @ForAll boolean recordingReads,
+      @ForAll boolean tailReads,
+      @ForAll boolean compactAfter) {
+    LocalCatalogMode storage = fileModeA.inlineML ? LocalCatalogMode.APPEND_ML
+        : fileModeA.inlineTM ? LocalCatalogMode.APPEND_TM : LocalCatalogMode.APPEND;
+    // every namespace and table, each table with a snapshot
+    Setup setup = new Setup(7, 0, 15, 2, 15);
+    Op a = new Op(Kind.CATALOG_TXN, x, y);
+    Op b = new Op(racerB, x, x + y);
+    Op c = twoRacers ? new Op(racerC, y, x) : new Op(null, 0, 0);
+    aRaceEndsAsASerialRun(fileModeA, fileModeB, fileModeC, storage, catalogLog, setup, a, b, c,
+        gc, paging, clockOffsets, encoding, reads, recordingReads, tailReads, compactAfter);
+  }
+
+  /** What a racer does to a table a transaction writes or reads. */
+  @Provide
+  Arbitrary<Kind> tableRacers() {
+    return Arbitraries.of(
+        Kind.FAST_APPEND, Kind.SET_TABLE_PROPERTY, Kind.DELETE_ALL, Kind.CATALOG_TXN);
+  }
+
+  /** The setup's tables: pointer tables, or inline TM or ML, on one object. */
+  @Provide
+  Arbitrary<LocalCatalogMode> setupStorage() {
+    return Arbitraries.of(
+        LocalCatalogMode.APPEND, LocalCatalogMode.APPEND_TM, LocalCatalogMode.APPEND_ML);
+  }
 
   @Provide
   Arbitrary<LocalCatalogMode> modes() {
@@ -452,7 +509,8 @@ class TestCatalogRaceProperties {
             Arbitraries.integers().between(0, 7),
             Arbitraries.integers().between(0, 7),
             Arbitraries.integers().between(0, 15),
-            Arbitraries.of(2, 4, 6))
+            Arbitraries.of(2, 4, 6),
+            Arbitraries.integers().between(0, 15))
         .as(Setup::new);
   }
 
@@ -481,12 +539,15 @@ class TestCatalogRaceProperties {
     final int props;
     final int tables;
     final int filler;
+    /** The tables that hold a snapshot (a file appended) before the race. */
+    final int seeded;
 
-    Setup(int namespaces, int props, int tables, int filler) {
+    Setup(int namespaces, int props, int tables, int filler, int seeded) {
       this.namespaces = namespaces;
       this.props = props;
       this.tables = tables;
       this.filler = filler;
+      this.seeded = seeded;
     }
 
     void apply(LogCatalog catalog) {
@@ -504,7 +565,19 @@ class TestCatalogRaceProperties {
       for (int i = 0; i < TABLES.size(); i++) {
         TableIdentifier id = TABLES.get(i);
         if ((tables >> i & 1) == 1 && catalog.namespaceExists(id.namespace())) {
-          catalog.buildTable(id, SCHEMA).withProperty("origin", "setup").create();
+          Table table = catalog.buildTable(id, SCHEMA).withProperty("origin", "setup").create();
+          // A table with a snapshot: an append to it in the race extends main's history, which
+          // a merging encoding can land on a head another writer moved; a first snapshot starts
+          // a history, which it cannot (Bug 73)
+          if ((seeded >> i & 1) == 1) {
+            table.newFastAppend()
+                .appendFile(org.apache.iceberg.DataFiles.builder(table.spec())
+                    .withPath("mem:///data/setup-" + i + ".parquet")
+                    .withFileSizeInBytes(10)
+                    .withRecordCount(1)
+                    .build())
+                .commit();
+          }
         }
       }
     }
@@ -570,7 +643,7 @@ class TestCatalogRaceProperties {
       return KEYS.get(y % KEYS.size());
     }
 
-    private boolean serializable() {
+    boolean serializable() {
       return x / 4 % 2 == 0;
     }
 
@@ -619,6 +692,9 @@ class TestCatalogRaceProperties {
         }
         if (n.length == 1 || !t[0].equals(n[0])) {
           return false; // missing now, or another table
+        }
+        if (!serializable()) {
+          continue; // snapshot isolation checks nothing it read (errata D12)
         }
         boolean snapshots = !t[1].equals("-") && !n[1].equals("-");
         if (snapshots ? !t[1].equals(n[1])
