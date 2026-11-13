@@ -39,10 +39,16 @@ public class TestLocalCatalogTransaction {
 
     abstract LocalCatalogMode mode();
 
+    /** As {@link TestLocalCatalog.Suite#logProperties}. */
+    Map<String, String> logProperties(String warehouse, String name) {
+      return Map.of();
+    }
+
     @BeforeEach
     public void before() {
       io = new InMemoryAtomicFileIO();
-      catalog = mode().catalog(io, "mem:///warehouse-" + UUID.randomUUID(), "test", Map.of());
+      String warehouse = "mem:///warehouse-" + UUID.randomUUID();
+      catalog = mode().catalog(io, warehouse, "test", logProperties(warehouse, "test"));
     }
 
     @AfterEach

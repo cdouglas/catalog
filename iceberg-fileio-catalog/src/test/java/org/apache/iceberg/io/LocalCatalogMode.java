@@ -52,7 +52,10 @@ import org.intentlog.memory.InMemorySharedLog;
  *       InMemoryAppendBlobStore} (docs/AZURE_LOG.md; the data stays in the store), each catalog
  *       an instance of its own: every commit appends blind, the writer whose commit takes the log
  *       to 3 records past its checkpoint compacts it, and a segment holds at most {@link
- *       #AZURE_BLOCKS} blocks, so the log moves to a new segment every few commits.
+ *       #AZURE_BLOCKS} blocks, so the log moves to a new segment every few commits. Given {@code
+ *       fileio.catalog.log.location} and an account key, the catalog is instead a {@link
+ *       FileIOCatalog} that opens its log on that account from its properties, as a deployment's
+ *       does ({@link AzureLogCatalogIT}).
  * </ul>
  *
  * <p>The suffix selects table metadata storage: none for metadata.json pointers, {@code _TM} for
@@ -289,9 +292,11 @@ enum LocalCatalogMode {
     }
     properties.putAll(extra);
     String location = warehouse + "/catalog-" + name;
+    // On a real account, the catalog opens its log from its properties, as a deployment's does
+    boolean onAccount = azureLog && properties.containsKey(LogCatalogProperties.LOG_LOCATION);
     LogCatalog catalog = sharedLog
         ? new LogCatalog(name, sharedLog(io, location), io, Maps.newHashMap())
-        : azureLog
+        : azureLog && !onAccount
             ? new LogCatalog(name, AzureLogs.open(azureStore(io, location), location, properties),
                 io, Maps.newHashMap())
             : new FileIOCatalog(name, location, io, Maps.newHashMap());

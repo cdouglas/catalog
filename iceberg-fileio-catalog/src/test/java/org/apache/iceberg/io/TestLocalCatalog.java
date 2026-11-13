@@ -47,11 +47,20 @@ public class TestLocalCatalog {
 
     abstract LocalCatalogMode mode();
 
+    /**
+     * Properties of the log of the catalog {@code name} in {@code warehouse}, beyond the mode's:
+     * none here; a suite on a real account names the log's location there ({@link
+     * AzureLogCatalogIT}).
+     */
+    Map<String, String> logProperties(String warehouse, String name) {
+      return Map.of();
+    }
+
     @BeforeEach
     public void before() {
       io = new InMemoryAtomicFileIO();
       warehouse = "mem:///warehouse-" + UUID.randomUUID();
-      catalog = mode().catalog(io, warehouse, "test", Map.of());
+      catalog = mode().catalog(io, warehouse, "test", logProperties(warehouse, "test"));
     }
 
     @AfterEach
@@ -67,7 +76,9 @@ public class TestLocalCatalog {
 
     @Override
     protected LogCatalog initCatalog(String name, Map<String, String> additionalProperties) {
-      return mode().catalog(io, warehouse, name, additionalProperties);
+      Map<String, String> properties = new java.util.HashMap<>(logProperties(warehouse, name));
+      properties.putAll(additionalProperties);
+      return mode().catalog(io, warehouse, name, properties);
     }
 
     @Override

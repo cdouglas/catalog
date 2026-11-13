@@ -706,10 +706,18 @@ As every provider is tested (LOG.md "Testing a provider"), plus a model:
    - `AzureAppendBlobStoreIT` (2026-11-12): a GET from a blob's length is `416`
      `InvalidRange` there (Azurite: `206`, no bytes), from the byte before a `206` of one byte,
      and the store's read from a blob's end one request.
+   - `AzureLogCatalogIT` (2026-11-13, from the laptop, on the rmow-bench account, westus):
+     Iceberg's catalog and catalog-transaction suites through a `FileIOCatalog` that opens its
+     log from its properties (`azure-append`, blind appends, an account key), in the three table
+     metadata storages, the tables' files in memory. 438 tests run (40 skipped, as in memory).
+     With segments of 1 KiB (2 KiB for inline tables) and a trim grace of 0, 46 of the 444 logs
+     moved on, 57 times, and sweeps deleted segments as they left the head.
 
-   Each run writes under `intentlog-it/<UTC>-<random>` and deletes it afterwards. They run only
-   when asked (`-Dtest='AzureAppendBlobLogIT*,AzureCommitProtocolIT,AzureAppendBlobStoreIT'`), with
-   `AZURE_LOG_IT_CONTAINER_URL` and `AZURE_STORAGE_KEY` set.
+   Each run writes under `intentlog-it/<UTC>-<random>` (`AzureLogCatalogIT`:
+   `catalog-it/<UTC>-<random>`) and deletes it afterwards. They run only when asked
+   (`-Dtest='AzureAppendBlobLogIT*,AzureCommitProtocolIT,AzureAppendBlobStoreIT'`;
+   `-pl iceberg-fileio-catalog -Dtest='AzureLogCatalogIT*'`), with `AZURE_LOG_IT_CONTAINER_URL` and
+   `AZURE_STORAGE_KEY` set.
 
 ## Measurements
 
