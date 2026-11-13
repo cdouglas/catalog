@@ -465,27 +465,20 @@ elsewhere and a typed encoder removes it from the wire format
 altogether. PartitionSpec is the cheaper of the two to lift next if a
 workload motivates it independently.
 
-### D23. The latency models price a lookup as a GET of no bytes
+### D23. A stock client looks a manifest list up before it reads it
 
-The benchmarks' latency models (`LatencyFileIO` for FileIOCatalog,
-catalog-bench's `ModelStore` for every client) charge a lookup of a file
-nothing bound (a HEAD) as a GET of no bytes (`readMs(0)`), not as the
-profile's measured HEAD (`StoreProfile.headMs`). Only `azure-2026-11` measures
-a HEAD: 5.85 ms against a GET's 9.84 base, so on that profile every lookup
-costs about 4 ms too much. That is FileIOCatalog's lookups (its probes with
-tail reads off, and every read under `fileio.catalog.read.lookup`) and every
-client's lookup of a manifest list's length (`AvroIterable` opens a stream,
-then asks the length). The fix is small: both models charge `headMs` where
-the profile has one.
+A stock Iceberg client reads an Avro manifest list with a HEAD and a GET:
+`AvroIterable` opens a stream, then asks the file's length, and Iceberg's S3
+and ADLS input files look the length up with a HEAD whatever their streams
+read. So JDBC, Polaris and FileIOCatalog's pointer and inline-TM modes pay a
+HEAD a manifest-list read, on the stores and in the latency models alike
+(catalog-bench's `ModelStore`, fileio-catalog's `LatencyFileIO`, which charge
+a HEAD at the profile's HEAD latency). Avro's length asked lazily, and a file
+that keeps the length its GET reported, would save it for every client.
+`core-perf` does not make the fix.
 
-That manifest-list lookup is itself a deferred client fix. A stock client
-reads a manifest list with a HEAD and a GET, on S3 as in the models, for JDBC,
-Polaris and FileIOCatalog's pointer and inline-TM modes alike; Avro's length
-asked lazily, and a file that keeps the length its GET reported, would save
-the HEAD for every client. `core-perf` does not make it.
-
-**Trigger to revisit:** a campaign on `azure-2026-11` (fix the models first),
-or a paper comparison whose clients' manifest-list reads differ.
+**Trigger to revisit:** a paper comparison whose clients' manifest-list reads
+differ, or a performance fix for every client on `core-perf`.
 
 ### D25. A fold copies each table-keyed map a record changes (perf)
 
@@ -702,7 +695,9 @@ measured at E1's and E3's points on `s3x-2026-11`. Still to take:
 - **Reruns under today's latency model.** Campaigns run on code from before
   2026-11-12 had a latency model that charged no HEAD for a lookup after an
   open and saw a lookup at the end of its latency and a GET at its start, and a
-  fold that rebuilt the whole catalog state. Comparisons whose arms read alike stand;
+  fold that rebuilt the whole catalog state; until 2026-11-13 both models
+  priced a HEAD as a GET of nothing, which only `azure-2026-11` tells apart
+  (5.85 ms against 9.84). Comparisons whose arms read alike stand;
   absolute numbers are a HEAD a read low; tail reads against probes, where the
   commit loop sets the limit, favour the probes; and FileIOCatalog's CPU per
   commit grows with the catalog's tables. catalog-bench's JDBC reruns on

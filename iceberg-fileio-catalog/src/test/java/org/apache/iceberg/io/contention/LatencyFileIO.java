@@ -39,7 +39,8 @@ import org.apache.iceberg.io.SupportsPrefixOperations;
  * An {@link InMemoryAtomicFileIO} whose requests take a store's latency ({@link StoreProfile}),
  * spent in the calling thread, which also counts them ({@link Requests}).
  *
- * <p>A request is: a lookup of an unbound input file (a HEAD: {@code exists} or {@code getLength}),
+ * <p>A request is: a lookup of an unbound input file (a HEAD: {@code exists} or {@code getLength},
+ * at the profile's HEAD latency, {@link StoreProfile#headMs}),
  * each GET (below), each plain write (a PUT, on close), each conditional write, each
  * delete, and each listing of a prefix (a LIST, at a read's latency: endive's profiles have none of
  * their own; fileio-catalog lists only to sweep its committed set's orphaned pages). The store acts
@@ -204,7 +205,7 @@ public final class LatencyFileIO implements SupportsAtomicOperations, SupportsPr
         return answer.get();
       }
       Requests.mine().heads++;
-      double ms = profile.readMs(0, random());
+      double ms = profile.headMs(random());
       double half = ms / 2;
       await(half);
       try {

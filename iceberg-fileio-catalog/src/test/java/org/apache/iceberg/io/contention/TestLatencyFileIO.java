@@ -84,6 +84,25 @@ class TestLatencyFileIO {
   }
 
   /**
+   * A lookup takes the profile's HEAD where it measures one (errata D23): azure-2026-11's Get
+   * Properties, 5.85 ms at the median, not a GET of nothing, 9.84 ms.
+   */
+  @Test
+  void aLookupTakesTheProfilesHead() {
+    LatencyFileIO timed =
+        new LatencyFileIO(
+            store, StoreProfile.named("azure-2026-11"), CATALOG, 1, 1, new VirtualClock());
+    int lookups = 200;
+    for (int i = 0; i < lookups; i++) {
+      assertThat(timed.newInputFile(CATALOG).getLength()).isEqualTo(SIZE);
+    }
+
+    Requests r = requests();
+    assertThat(r.heads).isEqualTo(lookups);
+    assertThat(r.waitedNanos / 1e6 / lookups).isBetween(5.0, 7.0);
+  }
+
+  /**
    * Where the store's reads record their version, a GET binds its file: a lookup after it sends
    * nothing (TAIL_READS.md step 7). Where they do not (GCS), the lookup is a HEAD.
    */
