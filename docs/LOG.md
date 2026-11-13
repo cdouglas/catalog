@@ -630,7 +630,7 @@ function COMMIT(log, base, intention):
                 # version another writer has replaced since (Bug 26).
                 fresh = READ()
                 if landed(fresh, earlier()): return fresh   # an append reported lost landed
-                unresolved = none;  adopt(fresh)
+                settle(fresh);  adopt(fresh)
             full = false
             try:
                 return validate(WRITE(log.replace(tail, checkpoint(current), gc() + [record])))
@@ -642,7 +642,7 @@ function COMMIT(log, base, intention):
             # serial commit would be.
             fresh = READ()
             if landed(fresh, earlier()): return fresh       # an earlier attempt landed
-            unresolved = none
+            settle(fresh)
             holds = intention.verify(fresh);  adopt(fresh)
             if not holds: reject CONFLICT
         else:
@@ -652,21 +652,22 @@ function COMMIT(log, base, intention):
             catch Full:
                 full = true;  stale = true;  continue       # replace on a fresh read (Bug 66)
             catch Conflict as e:
-                unresolved = e;  raceBackoff()      # interrupted: unknown
+                unresolved = e;  lostAt(expected)   # a shared log: the furthest such tail
+                raceBackoff()                       # interrupted: unknown
             # Another writer appended first. With tail reads, on a log that replaces
             # itself, read what followed current (or the whole log, if replaced) and
             # append again at that tail, knowing what the log holds there.
             if config.tailReads and caps.fusedReplace:
                 fresh = READ()                    # a read after current's tail
                 if landed(fresh, earlier()): return fresh
-                unresolved = none;  adopt(fresh);  continue
+                settle(fresh);  adopt(fresh);  continue
             # Else the record is the same, and replay applies it once, so only the new
             # tail is needed.
             probed = log.probe()
             if not probed.continues(tail):        # replaced (compacted): read the new log
                 fresh = READ()
                 if landed(fresh, earlier()): return fresh
-                unresolved = none;  adopt(fresh)
+                settle(fresh);  adopt(fresh)
             else:                                 # it grew: resend at the new tail
                 tail = probed;  stale = true      # current's record count is a lower bound
       catch Ambiguous as e:
@@ -677,7 +678,7 @@ function COMMIT(log, base, intention):
         ambiguous = e
         fresh = READ()                            # failure: unknown
         if landed(fresh, e): return fresh
-        unresolved = none
+        settle(fresh)
         holds = intention.verify(fresh);  adopt(fresh)
         if not holds: reject CONFLICT
       catch Unreadable as e:
@@ -687,6 +688,7 @@ function COMMIT(log, base, intention):
     if unresolved:                                # the last append lost a race, which
         fresh = READ()                            # its own landing also reports
         if landed(fresh, unresolved): return fresh          # failure: unknown
+        if not settles(fresh): unknown            # it lags behind where the write would be (Bug 90)
     reject EXHAUSTED
 
 # A LogNotSentException out of the loop: unknown if earlier(), else reject NOT_SENT.
@@ -765,7 +767,8 @@ landed:
   failure: the write may still be in flight.
 - `unresolved`: a write that failed its condition. A transport retry of a
   write that landed fails its condition, so the failure is no proof; but that
-  write landed before the reply, so a read without it rules it out.
+  write landed before the reply, so a read without it rules it out, if the
+  read reaches where the write would be (`settle`, below).
 - `duplicate`: on a log without conditional appends, a send the log throttled
   before the one it acknowledged. Both may have landed (below).
 
@@ -804,6 +807,23 @@ shared-log model"):
    checkpoint already holds the record cannot tell an applied record whose id
    GC dropped from one that never applied. Such a view leaves the write
    ambiguous, and a fresh read settles it.
+
+**Conditional appends on a log that cannot replace itself** (the Azure log's
+`conditional` ablation, `InMemorySharedLog`'s conditional mode). A lost
+append is resent at the probed tail, and the read through the resend settles
+an earlier copy (P3). A commit that runs out of attempts with every send lost
+has only a plain read to settle the last loss, and such a read may lag (P1).
+If the append landed, its record follows the tail it named, so a read settles
+the loss only if its view is past the furthest tail a lost send named
+(`lostAt`, `settle`). On a read that lags behind it, the commit's outcome is
+unknown (Bug 90 (lagging read hid the record)). Without the check, a commit
+whose sends had landed with replies saying they lost was rejected
+(`EXHAUSTED`). The rule needs a provider's conflict to mean that the log moved
+past the tail the append named, so that a read that does not lag settles the
+loss: the Azure log conditions an append on its position, not its segment
+(Bug 89 (moved on, same position)). A read of one object is of the object as
+it is, so there any read settles a loss. `SharedLogCommit.tla` models
+unconditional appends only.
 
 **Restaging is the caller's.** The loop rejects an intention that no longer
 holds on the state it lost to (`CONFLICT`); staging it again on a fresh read

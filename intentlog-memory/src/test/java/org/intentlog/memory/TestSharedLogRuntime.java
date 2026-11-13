@@ -66,10 +66,15 @@ class TestSharedLogRuntime {
     final Deque<WriteFault> appends = new ArrayDeque<>();
     final Deque<ReadShape> reads = new ArrayDeque<>();
     Runnable afterNextAppend = null;
+    // Other writers' requests before each append (a race the append loses), if any
+    Runnable beforeEachAppend = null;
     boolean active = true;
 
     @Override
     public WriteFault beforeWrite(Request request, byte[] payload) {
+      if (active && request == Request.APPEND && beforeEachAppend != null) {
+        others(beforeEachAppend);
+      }
       return active && request == Request.APPEND && !appends.isEmpty()
           ? appends.poll() : WriteFault.NONE;
     }
@@ -229,6 +234,56 @@ class TestSharedLogRuntime {
     rt.commit(fresh, Txn.on(fresh.state(), "o", Set.of(), Set.of("b")));
     Replica<State> r = rt.commit(base, Txn.on(base.state(), "t", Set.of("a"), Set.of("a")));
     assertThat(r.state().history()).containsExactly("init", "o", "t");
+  }
+
+  /** A runtime on a new log of conditional appends, which the script faults, created. */
+  private LogRuntime<State, EntityVersionsMachine.Builder, Txn> conditionalCreated() {
+    InMemorySharedLog conditional = new InMemorySharedLog("log", true);
+    conditional.intercept(script);
+    LogRuntime<State, EntityVersionsMachine.Builder, Txn> rt =
+        new LogRuntime<>(conditional, MACHINE, config(NO_GC, NEVER));
+    rt.bootstrap(new Txn("init", java.util.Map.of(), Set.of()));
+    return rt;
+  }
+
+  /**
+   * Each send of a conditional append lands while its reply says it lost (a transport retry of a
+   * landed write fails its condition), until the commit runs out of attempts. The read that would
+   * settle the last loss lags behind the tail that send named, which its record follows if it
+   * landed, so it cannot rule out that one did (P1): the outcome is unknown. The commit was
+   * rejected (EXHAUSTED) with its record applied (round p7-r0: the Azure log, every read of a
+   * segment short).
+   */
+  @Test
+  void aCommitOutOfAttemptsWhoseReadLagsBehindItsLostAppendsIsUnknown() { // (Bug 90)
+    LogRuntime<State, EntityVersionsMachine.Builder, Txn> rt = conditionalCreated();
+    Replica<State> base = rt.read();
+    for (int i = 0; i < 4; i++) {
+      script.appends.add(WriteFault.LANDED_AS_CONFLICT);
+    }
+    script.reads.add(ReadShape.of(0, 4));
+    assertThatThrownBy(() -> rt.commit(base, txn(base, "t", Set.of(), Set.of("a"))))
+        .isInstanceOf(CommitOutcomeUnknownException.class);
+    assertThat(rt.read().state().history()).containsExactly("init", "t");
+  }
+
+  /**
+   * A conditional append that loses every race to other writers runs out of attempts, and the
+   * read that settles the last loss reaches past the tail it named: the commit failed.
+   */
+  @Test
+  void aCommitOutOfAttemptsAfterRacesItLostIsRejected() { // (Bug 90)
+    LogRuntime<State, EntityVersionsMachine.Builder, Txn> rt = conditionalCreated();
+    Replica<State> base = rt.read();
+    script.beforeEachAppend = () -> {
+      Replica<State> fresh = rt.read();
+      rt.commit(fresh, txn(fresh, "o", Set.of(), Set.of("b")));
+    };
+    assertThatThrownBy(() -> rt.commit(base, txn(base, "t", Set.of(), Set.of("a"))))
+        .isInstanceOfSatisfying(CommitRejectedException.class, e ->
+            assertThat(e.reason()).isEqualTo(CommitRejectedException.Reason.EXHAUSTED));
+    script.beforeEachAppend = null;
+    assertThat(rt.read().state().history()).contains("o").doesNotContain("t");
   }
 
   // ============================================================

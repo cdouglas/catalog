@@ -1208,10 +1208,15 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     // it wrote failed. It may still be in flight, so once one has happened, running out of
     // attempts no longer means the commit failed.
     private AmbiguousWrite ambiguous = null;
-    // The last write that failed its condition, until a read of the log rules out that it landed.
-    // A transport retry of a write that landed fails its condition, so the failure is no proof;
-    // but the write landed before the reply, so a read without it settles it.
+    // The last write that failed its condition, until a read of the log rules out that it landed
+    // (settles). A transport retry of a write that landed fails its condition, so the failure is
+    // no proof; but the write landed before the reply, so a read without it settles it, if the read
+    // reaches where it would be.
     private RuntimeException unresolved = null;
+    // On a log that cannot replace itself, the furthest tail a conditional append of this commit
+    // named and lost at, while one is unresolved: had it landed, its record follows that tail. Such
+    // a log's reads may lag its appends (P1), so only a view past it settles the loss (Bug 90).
+    private LogTail lostAt = null;
     // Whether storage refused an append because the log holds as many writes as it allows (S3
     // Express: 10,000 parts; an Azure Append Blob: 50,000 blocks): only a replace can commit
     // then, whatever the policy says.
@@ -1347,7 +1352,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
               if (landed(fresh, earlier())) {
                 return fresh.replica(); // an append reported as a lost race landed
               }
-              unresolved = null;
+              settle(fresh);
               adopt(fresh);
             }
             full = false;
@@ -1378,7 +1383,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
             if (landed(fresh, earlier())) {
               return fresh.replica(); // an earlier attempt landed
             }
-            unresolved = null;
+            settle(fresh);
             boolean holds = intention.verify(fresh.builder());
             String why = holds ? null : Replay.explain(intention, fresh.builder());
             adopt(fresh);
@@ -1386,8 +1391,8 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
               throw conflict(fresh, "Cannot commit: the log changed concurrently", why);
             }
           } else {
+            LogTail at = tail;
             try {
-              LogTail at = tail;
               boolean conditional = caps.conditionalAppend();
               CommitTrace.event(CommitTrace.Kind.SEND, 0, 0);
               return validate(
@@ -1403,6 +1408,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
             } catch (LogConflictException e) {
               CommitTrace.event(CommitTrace.Kind.LOST, 0, 0);
               unresolved = e;
+              lostAt(at);
               raceBackoff(e);
             }
             // Another writer appended first. With tail reads, on a log that replaces itself (one
@@ -1417,7 +1423,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
               if (landed(fresh, earlier())) {
                 return fresh.replica(); // an append reported as a lost race landed
               }
-              unresolved = null;
+              settle(fresh);
               adopt(fresh);
               continue;
             }
@@ -1438,7 +1444,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
               if (landed(fresh, earlier())) {
                 return fresh.replica(); // an append reported as a lost race landed
               }
-              unresolved = null;
+              settle(fresh);
               adopt(fresh);
             } else {
               // The log grew (a concurrent append). Resend the same record at the new tail; the
@@ -1465,7 +1471,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
           if (landed(fresh, e.getCause())) {
             return fresh.replica(); // the write landed
           }
-          unresolved = null;
+          settle(fresh);
           boolean holds = intention.verify(fresh.builder());
           String why = holds ? null : Replay.explain(intention, fresh.builder());
           adopt(fresh);
@@ -1494,6 +1500,10 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
         }
         if (landed(fresh, unresolved)) {
           return fresh.replica();
+        }
+        if (!settles(fresh)) {
+          // a read that lags behind where the append would be cannot say it did not land
+          throw new CommitOutcomeUnknownException(unresolved);
         }
       }
       throw new CommitRejectedException(
@@ -1533,6 +1543,39 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     /** The last write of this commit, but one acknowledged, that may have landed, or null. */
     private Throwable earlier() {
       return ambiguous != null ? ambiguous.getCause() : unresolved != null ? unresolved : duplicate;
+    }
+
+    /**
+     * Records that a conditional append at {@code at} lost: on a log that cannot replace itself,
+     * its record follows {@code at} if it landed. Only the furthest such tail is kept: a view past
+     * it is past every earlier one.
+     */
+    private void lostAt(LogTail at) {
+      if (!caps.fusedReplace() && at != null && (lostAt == null || at.continues(lostAt))) {
+        lostAt = at;
+      }
+    }
+
+    /**
+     * Whether {@code fresh}, a read that lacks this commit's record, rules out that the append
+     * {@link #unresolved} names landed. A read of one object is of the object as it is, so any
+     * does. A log that cannot replace itself may serve a read that lags its appends (P1): only a
+     * view past the tail the append named holds what follows that tail, where its record would be
+     * (Bug 90: every read of an Azure segment short, the commit was rejected with its record
+     * applied).
+     */
+    private boolean settles(Replayed fresh) {
+      return lostAt == null
+          || (fresh.tail.continues(lostAt)
+              && !Arrays.equals(fresh.tail.position(), lostAt.position()));
+    }
+
+    /** Drops {@link #unresolved} if {@code fresh}, which lacks this commit's record, settles it. */
+    private void settle(Replayed fresh) {
+      if (settles(fresh)) {
+        unresolved = null;
+        lostAt = null;
+      }
     }
 
     /**
