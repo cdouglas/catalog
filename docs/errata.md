@@ -969,6 +969,14 @@ inline-TM modes alike; a client fix (Avro's length asked lazily, and a file that
 keeps the length its GET reported) would save it for every client, and is not
 made (`core-perf` has none).
 
+Both models price a lookup as a GET of no bytes (`readMs(0)`), not as the
+profile's measured HEAD (`StoreProfile.headMs`, which only `azure-2026-11`
+measures: 5.85 ms against a GET's 9.84 base), so on that profile every lookup
+costs about 4 ms too much: FileIOCatalog's probes (tail reads off) and its
+lookups under `fileio.catalog.read.lookup`, and every client's manifest-list
+lookup above. Not fixed yet: `LatencyFileIO` and catalog-bench's `ModelStore`
+should charge `headMs`.
+
 ### D24. The latency model's reads saw the store at their ends and starts
 
 `LatencyFileIO` (FileIOCatalog's latency model) took a conditional write as
