@@ -879,8 +879,8 @@ classes handle this for you; manual codecs require it as a discipline.
 | `TestInlineManifestEndToEnd` | End-to-end commit→reload across BASELINE / TM_ONLY / TM_ML configs; per-`SnapshotProducer` operation coverage; codec-axis subclass parameterized over `gzip` / `structural` |
 | `CatalogTests`, `CatalogTransactionTests` | Abstract suites consumed from `iceberg-core-tests.jar` (commit `35076d6`) and run by the local and cloud subclasses |
 | `TestLocalCatalog`, `TestLocalCatalogTransaction` | Both abstract suites in every `LocalCatalogMode`: append / CAS / compact × pointer / inline TM / inline ML over `InMemoryAtomicFileIO`, and the `MEMLOG*` modes on an `InMemorySharedLog` |
-| `TestCatalogFaultProperties` | jqwik: several writers run Iceberg operations through the catalog on faulty storage, in mixed modes, on one object or a shared log; the catalog must match a model after every operation (I3a, I6, I10, I11) |
-| `TestCatalogRaceProperties` | jqwik: a catalog operation raced by others must end as a serial run (I9), on one object or a shared log |
+| `TestCatalogFaultProperties` | jqwik: several writers run Iceberg operations through the catalog on faulty storage, in mixed modes, on one object, a shared log or Append Blobs; the catalog must match a model after every operation (I3a, I6, I10, I11) |
+| `TestCatalogRaceProperties` | jqwik: a catalog operation raced by others must end as a serial run (I9), on one object, a shared log or Append Blobs |
 | `TestInlineDeltaProperties` | jqwik: each commit's delta replays to the committed metadata, and each codec stores every version exactly (I7) |
 | `TestInlineDifferentialProperties` | jqwik: the same schedule on a pointer catalog and an inline one commits alike and reads the same (I8) |
 | `Test*Encoding` (`ConflictEncodingContract`), `TestRebaseProperties`, `TestConflictMatrix` | The conflict encodings: each one's contract, the oracle against Iceberg's retry, and the per-encoding matrix (I12) |

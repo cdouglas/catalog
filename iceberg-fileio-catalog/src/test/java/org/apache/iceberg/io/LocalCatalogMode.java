@@ -99,6 +99,45 @@ enum LocalCatalogMode {
   /** The blocks a segment of the {@code AZLOG*} modes' store holds. */
   static final int AZURE_BLOCKS = 8;
 
+  /**
+   * The log a catalog keeps, which the fuzzers draw: one object of the store ({@code
+   * AtomicFileLog}), a shared log in memory, or Append Blobs in memory.
+   */
+  enum Log {
+    OBJECT,
+    SHARED,
+    AZURE
+  }
+
+  /** The log this mode's catalog keeps. */
+  Log log() {
+    return sharedLog ? Log.SHARED : azureLog ? Log.AZURE : Log.OBJECT;
+  }
+
+  /** The mode a fuzzer's setup creates a catalog on {@code log} with: appends, pointer tables. */
+  static LocalCatalogMode base(Log log) {
+    switch (log) {
+      case SHARED:
+        return MEMLOG;
+      case AZURE:
+        return AZLOG;
+      default:
+        return APPEND;
+    }
+  }
+
+  /** This mode's table metadata storage on {@code log}; on one object, this mode itself. */
+  LocalCatalogMode on(Log log) {
+    switch (log) {
+      case SHARED:
+        return onSharedLog();
+      case AZURE:
+        return inlineML ? AZLOG_ML : inlineTM ? AZLOG_TM : AZLOG;
+      default:
+        return this;
+    }
+  }
+
   /** The conflict encodings a catalog can be created with, which fuzzers draw from. */
   static final List<String> ENCODINGS =
       List.of(
@@ -142,8 +181,18 @@ enum LocalCatalogMode {
    * history for the checks ({@link AzureLogHistory}); the log's root in it is the location.
    */
   static InMemoryAppendBlobStore azureStore(InMemoryAtomicFileIO io, String location) {
+    return azureStore(io, location, AZURE_BLOCKS);
+  }
+
+  /**
+   * As {@link #azureStore(InMemoryAtomicFileIO, String)}, its blobs holding at most {@code
+   * maxBlocks} blocks if this call makes it: a fuzzer draws the block limit before its catalogs
+   * open the log.
+   */
+  static InMemoryAppendBlobStore azureStore(
+      InMemoryAtomicFileIO io, String location, int maxBlocks) {
     return io.<AzureStore>attachment(AZURE_STORE + location,
-        key -> new AzureStore(location, new InMemoryAppendBlobStore(AZURE_BLOCKS))).store();
+        key -> new AzureStore(location, new InMemoryAppendBlobStore(maxBlocks))).store();
   }
 
   /** The Append Blob stores of catalogs over {@code io}. */

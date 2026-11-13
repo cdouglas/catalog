@@ -622,7 +622,7 @@ As every provider is tested (LOG.md "Testing a provider"), plus a model:
 5. **The cloud.** An integration test on a real account (`AzureAppendBlobLogIT`): the
    contract, and a run of the fuzzer's schedules with real requests.
 
-**Where it stands (2026-11-10): steps 1–3 and 5 are done, and step 4 in part.**
+**Where it stands (2026-11-13): all five steps are done.**
 
 1. **The model** (`spec/tla/README.md` "The Azure log") holds in eight configurations, the
    largest at 335,000 states:
@@ -672,13 +672,28 @@ As every provider is tested (LOG.md "Testing a provider"), plus a model:
      kills it, and the fuzzer's stale-readers oracle does at the calibration's 100,000 tries
      (not in 2,000 local ones).
 
-4. **The catalog, in part.** `TestLocalCatalog` and `TestLocalCatalogTransaction` pass in
-   `AZLOG`, `AZLOG_TM` and `AZLOG_ML` (112 and 34 tests each, the same skips as every other
-   mode): each catalog an `AppendBlobLog` of its own over one in-memory store whose segments
-   hold 8 blocks, so the log moves on every few commits, and a compaction every 3 records.
-   After each test, every checkpoint ever put must be the replay of the records before it
-   (`CheckpointRoundTrip.assertEveryCheckpoint` over `AzureLogHistory`). The fault and race
-   fuzzers don't draw this log yet.
+4. **The catalog.** `TestLocalCatalog` and `TestLocalCatalogTransaction` pass in `AZLOG`,
+   `AZLOG_TM` and `AZLOG_ML` (112 and 34 tests each, the same skips as every other mode): each
+   catalog an `AppendBlobLog` of its own over one in-memory store whose segments hold 8
+   blocks, so the log moves on every few commits, and a compaction every 3 records. After each
+   test, every checkpoint ever put must be the replay of the records before it
+   (`CheckpointRoundTrip.assertEveryCheckpoint` over `AzureLogHistory`).
+
+   The fault and race fuzzers draw this log a quarter of the time, as they draw the shared log
+   in memory (`LocalCatalogMode.Log`; 2026-11-13). After each run, every checkpoint must replay
+   the log before it.
+   - `TestCatalogFaultProperties`: every write of the log meets the command's planned faults (a
+     record, the moves that make room for it, a compaction's record, checkpoint and head), and
+     every read of the head, a checkpoint or a segment its planned read fault. A blind append
+     has no conflict to report, so a write planned to land as a conflict lands with its reply
+     lost. A preempting command runs before a read of the log or the first write, as on one
+     object; a read after it sees its effects, since a walk goes on past a segment closed under
+     it. Segments hold 3 or 7 blocks in 64 KiB, closing by the block limit, or 50,000 in 2 KiB,
+     closing by a pad (about half of those runs land one; a record a segment can't hold is
+     rejected before it is sent, `TOO_LARGE`).
+   - `TestCatalogRaceProperties`: each racer runs just before one of A's commit's appends (a
+     `SEND` in its commit trace), as before its writes on the other logs; a compaction's appends
+     are not its writes.
 
 5. **The cloud** (2026-11-11 UTC, from the laptop, on the spike's account: a hierarchical
    namespace, westus). All pass:

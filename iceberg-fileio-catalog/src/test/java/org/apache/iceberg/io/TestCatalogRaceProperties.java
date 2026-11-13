@@ -40,6 +40,8 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
 import org.apache.iceberg.types.Types;
 import org.intentlog.CommitTrace;
+import org.intentlog.azure.AzureLogHistory;
+import org.intentlog.azure.InMemoryAppendBlobStore;
 import org.intentlog.fileio.AtomicFileLog;
 import org.intentlog.memory.InMemorySharedLog;
 import org.intentlog.wire.LogEnvelope;
@@ -104,7 +106,7 @@ class TestCatalogRaceProperties {
       @ForAll("modes") LocalCatalogMode fileModeA,
       @ForAll("modes") LocalCatalogMode fileModeB,
       @ForAll("modes") LocalCatalogMode fileModeC,
-      @ForAll boolean sharedLog,
+      @ForAll("logs") LocalCatalogMode.Log catalogLog,
       @ForAll("states") Setup setup,
       @ForAll("ops") Op a,
       @ForAll("ops") Op b,
@@ -117,13 +119,13 @@ class TestCatalogRaceProperties {
       @ForAll boolean recordingReads,
       @ForAll boolean tailReads,
       @ForAll boolean compactAfter) {
-    // The writers' modes on one catalog object, or on a shared log with the same table metadata
-    // storage.
-    LocalCatalogMode modeA = sharedLog ? fileModeA.onSharedLog() : fileModeA;
-    LocalCatalogMode modeB = sharedLog ? fileModeB.onSharedLog() : fileModeB;
-    LocalCatalogMode modeC = sharedLog ? fileModeC.onSharedLog() : fileModeC;
-    LocalCatalogMode base = sharedLog ? LocalCatalogMode.MEMLOG : LocalCatalogMode.APPEND;
-    Statistics.label("log").collect(sharedLog ? "shared log" : "one object");
+    // The writers' modes on one catalog object, or on a shared log or Append Blobs with the same
+    // table metadata storage.
+    LocalCatalogMode modeA = fileModeA.on(catalogLog);
+    LocalCatalogMode modeB = fileModeB.on(catalogLog);
+    LocalCatalogMode modeC = fileModeC.on(catalogLog);
+    LocalCatalogMode base = LocalCatalogMode.base(catalogLog);
+    Statistics.label("log").collect(catalogLog);
     List<Op> racers = c.kind == null ? List.of(b) : List.of(b, c);
     List<LocalCatalogMode> racerModes = List.of(modeB, modeC);
     // With gc, each CAS drops every committed transaction id older than its own (Bug 64). With
@@ -210,8 +212,32 @@ class TestCatalogRaceProperties {
         }
       }
     };
-    InMemorySharedLog log = sharedLog ? LocalCatalogMode.sharedLog(io, CATALOG) : null;
-    if (log != null) {
+    InMemorySharedLog log = catalogLog == LocalCatalogMode.Log.SHARED
+        ? LocalCatalogMode.sharedLog(io, CATALOG) : null;
+    InMemoryAppendBlobStore blobs = catalogLog == LocalCatalogMode.Log.AZURE
+        ? LocalCatalogMode.azureStore(io, CATALOG) : null;
+    if (blobs != null) {
+      // A's writes are its commits' sends (the trace's SEND), each just before its first append,
+      // which may find its segment full and move the log on before it lands. A compaction's
+      // appends (its GC record, PageOuts) are no commit's sends.
+      boolean[] sending = {false};
+      blobs.intercept((op, name) -> {
+        if (!nested[0]) {
+          for (CommitTrace.Event event : CommitTrace.drain()) {
+            if (event.kind() == CommitTrace.Kind.SEND) {
+              sending[0] = event.a() != 2;
+            } else if (event.kind() == CommitTrace.Kind.COMPACT) {
+              sending[0] = false;
+            }
+          }
+          if (sending[0] && op == InMemoryAppendBlobStore.Op.APPEND) {
+            sending[0] = false;
+            beforeAWrite.run();
+          }
+        }
+        return InMemoryAppendBlobStore.Fault.NONE;
+      });
+    } else if (log != null) {
       // A's writes are its intention records: the GC record of a compaction after its commit
       // landed is not one.
       log.intercept(new InMemorySharedLog.Interceptor() {
@@ -251,6 +277,9 @@ class TestCatalogRaceProperties {
     io.injectFaults((location, strategy) -> Fault.NONE);
     if (log != null) {
       log.intercept(null);
+    }
+    if (blobs != null) {
+      blobs.intercept(null);
     }
     int before = Math.min(writes[0], racers.size()); // racers that ran before one of A's writes
     for (int k = before; k < racers.size(); k++) {
@@ -310,7 +339,8 @@ class TestCatalogRaceProperties {
     Statistics.label("A failed as it may").collect(replaced);
     Statistics.label("A lost its outcome to gc").collect(lost);
 
-    Statistics.label("racers before A's writes").collect(before + " of " + racers.size());
+    Statistics.label("racers before A's writes")
+        .collect(catalogLog + ": " + before + " of " + racers.size());
     Statistics.label("A").collect(a.kind + " " + (raceA.startsWith("ok") ? "ok" : "fails"));
     StringBuilder context = new StringBuilder(
         String.format("%nsetup %s%s%s, clocks off by %s ms%nA (%s): %s", setup, gc ? ", gc" : "",
@@ -336,7 +366,11 @@ class TestCatalogRaceProperties {
     if (log != null) {
       CheckpointRoundTrip.assertEveryCheckpoint(log);
     }
-    Statistics.label("PageOut records").collect(pageOuts(io, log) > 0);
+    if (blobs != null) {
+      CheckpointRoundTrip.assertEveryCheckpoint(
+          AzureLogHistory.of(blobs, CATALOG), "the Azure log" + context);
+    }
+    Statistics.label("PageOut records").collect(pageOuts(io, log, blobs) > 0);
   }
 
   /** A clock off the system's by {@code offsetMs}; null (the system's) if it is not off. */
@@ -355,10 +389,13 @@ class TestCatalogRaceProperties {
   }
 
   /** The PageOut records the catalog's log ever held. */
-  private static long pageOuts(InMemoryAtomicFileIO io, InMemorySharedLog log) {
+  private static long pageOuts(InMemoryAtomicFileIO io, InMemorySharedLog log,
+      InMemoryAppendBlobStore blobs) {
     List<byte[]> records = new java.util.ArrayList<>();
     if (log != null) {
       records.addAll(log.records());
+    } else if (blobs != null) {
+      AzureLogHistory.of(blobs, CATALOG).records().forEach(landed -> records.add(landed.record()));
     } else {
       for (InMemoryAtomicFileIO.Write write : io.history()) {
         if (write.location().equals(CATALOG)) {
@@ -379,8 +416,7 @@ class TestCatalogRaceProperties {
       List<LocalCatalogMode> racerModes, int before, Map<String, String> props,
       String[] results) {
     InMemoryAtomicFileIO serialIo = new InMemoryAtomicFileIO();
-    setup.apply((modeA.sharedLog ? LocalCatalogMode.MEMLOG : LocalCatalogMode.APPEND)
-        .catalog(serialIo, WAREHOUSE, "c", Map.of()));
+    setup.apply(LocalCatalogMode.base(modeA.log()).catalog(serialIo, WAREHOUSE, "c", Map.of()));
     for (int k = 0; k < before; k++) {
       results[k] = racers.get(k).run(
           racerModes.get(k).catalog(serialIo, WAREHOUSE, "c", props), name(k));
@@ -403,6 +439,15 @@ class TestCatalogRaceProperties {
   @Provide
   Arbitrary<LocalCatalogMode> modes() {
     return Arbitraries.of(LocalCatalogMode.fileModes());
+  }
+
+  /** The catalog's log: one object half the time, a shared log or Append Blobs a quarter each. */
+  @Provide
+  Arbitrary<LocalCatalogMode.Log> logs() {
+    return Arbitraries.frequency(
+        net.jqwik.api.Tuple.of(2, LocalCatalogMode.Log.OBJECT),
+        net.jqwik.api.Tuple.of(1, LocalCatalogMode.Log.SHARED),
+        net.jqwik.api.Tuple.of(1, LocalCatalogMode.Log.AZURE));
   }
 
   /** A catalog state: some namespaces, with properties, and some tables in them. */
