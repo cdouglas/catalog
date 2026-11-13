@@ -62,10 +62,11 @@ import org.intentlog.wire.LogEnvelope;
  * A catalog transaction (it loads one table or two and appends to the first) is not serial that
  * way either: it must fail, and leave the catalog as the others alone do, if an operation that
  * ran before its writes changed what it read -- under serializable isolation the main branch of
- * each table it loaded (or the table, if main had no snapshot), under snapshot isolation that of
- * the table it appended to. It must also fail when another commit changed the table it writes in
- * any other way, a property change included: a catalog transaction conflicts on the whole version
- * of each table it writes, from when it first read the table (errata D12).
+ * each table it loaded (or the table, if main had no snapshot), under snapshot isolation only
+ * which table it appended to (dropped, or another under its name). Otherwise it may commit or fail: an inline table's append is judged
+ * where the record lands, and a serializable transaction's reads by the branches it read (a read
+ * witness), so a racer's change that leaves those alone may land first (errata D12); a commit
+ * must end as the serial run.
  *
  * <p>The operations are namespace creates (of nested namespaces too, which create their parents),
  * drops and property changes; table creates, drops, renames and property changes; and appends and
