@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.io;
 
+import java.util.List;
 import org.apache.iceberg.SnapshotRef;
 
 /**
@@ -95,6 +96,21 @@ class ConcernVectorEncoding extends ConcernEncoding {
     }
     if (change.concerns.contains(TableChange.Concern.SORT)) {
       witness.concern(TableChange.Concern.SORT).concern(TableChange.Concern.SCHEMA);
+    }
+    return witness;
+  }
+
+  /**
+   * A read witness reads every change to the snapshot of each ref it read: a commit to it, and any
+   * other move (a rollback, a fast-forward, its removal); a dropped manifest comes with a commit.
+   * What it does not read (properties, an expiry that leaves the ref alone, another ref, retention)
+   * leaves what the transaction read as it was.
+   */
+  @Override
+  Witness readWitness(int base, List<String> refs) {
+    Witness witness = Witness.of(base);
+    for (String ref : refs) {
+      witness.ref(ref, ConcernStamps.Ref.ADVANCE, ConcernStamps.Ref.RESET);
     }
     return witness;
   }

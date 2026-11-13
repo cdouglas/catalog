@@ -155,7 +155,7 @@ message Action {
     CreateTable             create_table              = 5;
     DropTable               drop_table                = 6;
     UpdateTableLocation     update_table_location     = 7;
-    ReadTable               read_table                = 8;   // pins a version read
+    ReadTable               read_table                = 8;   // what a txn read
     UpdateTableInline       update_table_inline       = 9;   // see SPEC_TM
     CreateTableInline       create_table_inline       = 10;  // see SPEC_TM
     RenameTable             rename_table              = 11;
@@ -224,8 +224,9 @@ message UpdateTableLocation {
 }
 
 message ReadTable {
-  int32 id      = 1;
-  int32 version = 2;            // version that was read
+  int32 id             = 1;
+  int32 version        = 2;     // version that was read
+  repeated string refs = 3;     // a read witness, in name order; none: a read pin
 }
 
 // Renames a table in place — the int32 table id is stable, only
@@ -485,10 +486,18 @@ first.
 - Whatever the encoding, an action applies on a version of its table other
   than the one its writer read only if it is an unpinned inline delta
   whose late-bound fields can be finalized there ([SPEC_TM.md](SPEC_TM.md)
-  §"Late-bound fields"). A metadata location, full metadata, a read pin
+  §"Late-bound fields"), or a read witness, which changes nothing
+  ([Commits](#commits)). A metadata location, full metadata, a read pin
   and a pinned update (one Iceberg commits once, or a catalog transaction's
   update of a table that is not an inline delta, errata D12) apply only on
   that version.
+- A read witness reads the stamps of every change to the refs it read: a
+  commit to one, and any other move (`ref: advanced`, `ref: reset`), under
+  `concern-vector` and the encodings built on it; anything but a property
+  change under `lamport-minus-properties`, which stamps no refs; the
+  version under `lamport`. A change an encoding does not see into (a
+  pointer table's, an eviction, a rename) stamps everything, so a witness
+  holds over it only where the version does.
 - The table's version becomes its version where the record lands, plus
   one.
 - An encoding is deterministic (S1), stable (S2: a rejection stays a
@@ -595,8 +604,20 @@ catalog transaction sends its update of an inline table that adds snapshots
 and moves branches to them as a delta from the version it first read, which
 the encoding judges where the record lands and the commit loop carries over
 lost races, so its rejection is a real conflict; it pins any other update of
-a table it writes, at the version it first read, and under serializable
-isolation each table it reads ([errata.md](errata.md) §D12).
+a table it writes, at the version it first read ([errata.md](errata.md)
+§D12).
+
+Under serializable isolation the record also says what the transaction read
+of each table, as its commit checked it on the state it builds on: a
+`ReadTable` at that version whose refs are the branches and tags it read (a
+read witness). The encoding judges it by what changed of those refs since, as
+it judges a table update ([Conflict Encodings](#conflict-encodings)), so
+another writer's change landing first that leaves them alone (a property, an
+expiry, another branch) need not fail it, and a rejection stays one (S2). A
+branch it read that had no snapshot holds the table's version, as
+`BaseCatalogTransaction.unchangedSinceRead` does: a `ReadTable` without refs (a
+read pin). `fileio.catalog.txn.read.witness` `false` sends every read as a pin
+(for ablation).
 
 A load reads the catalog, then a pointer table's metadata file, and a drop
 with purge or a commit that deletes old metadata files
@@ -748,7 +769,7 @@ the id is a UUIDv7, and `CatalogIntention.verify` accepts it.
 | CreateTable              | namespace version matches (skipped if -1)                 |
 | DropTable                | table version matches                                     |
 | UpdateTableLocation      | the conflict encoding admits it: the table version matches |
-| ReadTable                | the conflict encoding admits it: the table version matches |
+| ReadTable                | the conflict encoding admits it: a read pin's table version matches; a read witness's refs are unchanged since its version |
 | CreateTableInline        | namespace version matches (skipped if -1)                 |
 | UpdateTableInline        | the conflict encoding admits it ([Conflict Encodings](#conflict-encodings)): under `lamport`, the table version matches |
 | RenameTable              | table version matches; destination namespace version matches (skipped if -1) |

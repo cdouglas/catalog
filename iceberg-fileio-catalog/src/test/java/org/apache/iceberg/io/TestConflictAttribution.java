@@ -54,15 +54,20 @@ class TestConflictAttribution {
   private static final String WAREHOUSE = "mem:///w";
   private static final String CATALOG = WAREHOUSE + "/catalog-c";
   private static final TableIdentifier ID = TableIdentifier.of("ns", "t");
+  private static final TableIdentifier OTHER = TableIdentifier.of("ns", "u");
   private static final Schema SCHEMA =
       new Schema(Types.NestedField.required(1, "id", Types.IntegerType.get()));
 
   private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
 
   private LogCatalog writer(String encoding, Map<String, String> props) {
+    return writer(LocalCatalogMode.APPEND_ML, encoding, props);
+  }
+
+  private LogCatalog writer(LocalCatalogMode mode, String encoding, Map<String, String> props) {
     Map<String, String> all = new TreeMap<>(props);
     all.put(LogCatalogProperties.CONFLICT_ENCODING, encoding);
-    return LocalCatalogMode.APPEND_ML.catalog(io, WAREHOUSE, "c", all);
+    return mode.catalog(io, WAREHOUSE, "c", all);
   }
 
   /** A's and B's catalogs, under {@code encoding}, and the table with two snapshots. */
@@ -71,12 +76,17 @@ class TestConflictAttribution {
   }
 
   private LogCatalog[] writers(String encoding, Map<String, String> props) {
-    LogCatalog a = writer(encoding, props);
+    return writers(LocalCatalogMode.APPEND_ML, encoding, props);
+  }
+
+  private LogCatalog[] writers(
+      LocalCatalogMode mode, String encoding, Map<String, String> props) {
+    LogCatalog a = writer(mode, encoding, props);
     a.createNamespace(Namespace.of("ns"));
     Table table = a.createTable(ID, SCHEMA);
     table.newFastAppend().appendFile(file("f1")).commit();
     table.newFastAppend().appendFile(file("f2")).commit();
-    return new LogCatalog[] {a, writer(encoding, props)};
+    return new LogCatalog[] {a, writer(mode, encoding, props)};
   }
 
   private static DataFile file(String name) {
@@ -210,6 +220,131 @@ class TestConflictAttribution {
         Map.entry("whole: commit once: a schema change", 1L));
     assertThat(rejectedInTheLog()).containsExactly(
         Map.entry("whole: commit once: a schema change", 1L));
+  }
+
+  /**
+   * A serializable catalog transaction that reads table t and appends to table u, committing:
+   * {@code b} runs as its record is written, after its checks.
+   */
+  private static void readTAppendU(LogCatalog a, Runnable b) {
+    CatalogTransaction txn = a.createTransaction(CatalogTransaction.IsolationLevel.SERIALIZABLE);
+    txn.asCatalog().loadTable(ID);
+    txn.asCatalog().loadTable(OTHER).newFastAppend().appendFile(file("a")).commit();
+    b.run();
+    txn.commitTransaction();
+  }
+
+  /** A change to {@code table} that leaves its main branch on the snapshot it names. */
+  private static void leaveMain(Table table, String change) {
+    switch (change) {
+      case "property":
+        table.updateProperties().set("k", "b").commit();
+        break;
+      case "expiry":
+        table.expireSnapshots().expireOlderThan(Long.MAX_VALUE).retainLast(1)
+            .cleanExpiredFiles(false).commit();
+        break;
+      case "branch":
+        table.manageSnapshots().createBranch("b").commit();
+        table.newFastAppend().appendFile(file("b")).toBranch("b").commit();
+        break;
+      default:
+        throw new IllegalArgumentException(change);
+    }
+  }
+
+  /**
+   * A serializable catalog transaction's record names the refs it read of each table (a read
+   * witness, errata D12), which the encoding judges by what changed of them: another writer's
+   * change to a table it read that leaves main alone, landing as the transaction writes its
+   * record, is no conflict.
+   */
+  @ParameterizedTest
+  @ValueSource(strings = {"property", "expiry", "branch"})
+  void aSerializableReadHoldsWhileTheRefsItReadDo(String change) {
+    LogCatalog[] w = writers(ManifestWindowEncoding.NAME);
+    w[0].createTable(OTHER, SCHEMA);
+    readTAppendU(w[0], () -> beforeAsWrite(() -> leaveMain(w[1].loadTable(ID), change)));
+
+    assertThat(w[0].log().counts().conflicts()).isZero();
+    assertThat(rejectedInTheLog()).isEmpty();
+    assertThat(w[1].loadTable(OTHER).currentSnapshot()).isNotNull();
+  }
+
+  /** Another writer's append to main of a table the transaction read fails it. */
+  @Test
+  void aSerializableReadFailsWhenARefItReadMoves() {
+    LogCatalog[] w = writers(ManifestWindowEncoding.NAME);
+    w[0].createTable(OTHER, SCHEMA);
+    assertThatThrownBy(() -> readTAppendU(w[0], () -> beforeAsWrite(
+            () -> w[1].loadTable(ID).newFastAppend().appendFile(file("b")).commit())))
+        .isInstanceOf(CommitFailedException.class);
+
+    assertThat(reasons(w[0])).containsExactly(Map.entry("ref: advanced", 1L));
+    assertThat(rejectedInTheLog()).containsExactly(Map.entry("ref: advanced", 1L));
+    assertThat(w[1].loadTable(OTHER).currentSnapshot()).isNull();
+  }
+
+  /** Under {@code lamport} a read witness is the version: any change fails the transaction. */
+  @Test
+  void underLamportAReadWitnessIsTheVersion() {
+    LogCatalog[] w = writers(LamportEncoding.NAME);
+    w[0].createTable(OTHER, SCHEMA);
+    assertThatThrownBy(() -> readTAppendU(w[0],
+            () -> beforeAsWrite(() -> leaveMain(w[1].loadTable(ID), "property"))))
+        .isInstanceOf(CommitFailedException.class);
+
+    assertThat(reasons(w[0])).containsExactly(Map.entry("whole: lamport", 1L));
+  }
+
+  /**
+   * A transaction read a table by its name, as its commit's check finds it: another writer's
+   * rename of it fails the transaction, as the check would where the record lands. A rename is a
+   * change the encoding does not see into, which stamps everything, the first stamp it reads
+   * included.
+   */
+  @Test
+  void aSerializableReadFailsWhenItsTableIsRenamed() {
+    LogCatalog[] w = writers(ManifestWindowEncoding.NAME);
+    w[0].createTable(OTHER, SCHEMA);
+    assertThatThrownBy(() -> readTAppendU(w[0], () -> beforeAsWrite(
+            () -> w[1].renameTable(ID, TableIdentifier.of("ns", "x")))))
+        .isInstanceOf(CommitFailedException.class);
+
+    assertThat(reasons(w[0])).containsExactly(Map.entry("ref: advanced", 1L));
+  }
+
+  /** Replay sees no ref of a pointer table: there only the version read holds the read. */
+  @Test
+  void aSerializableReadOfAPointerTableHoldsItsVersion() {
+    LogCatalog[] w = writers(LocalCatalogMode.APPEND, ManifestWindowEncoding.NAME, Map.of());
+    w[0].createTable(OTHER, SCHEMA);
+    assertThatThrownBy(() -> readTAppendU(w[0],
+            () -> beforeAsWrite(() -> leaveMain(w[1].loadTable(ID), "property"))))
+        .isInstanceOf(CommitFailedException.class);
+
+    assertThat(reasons(w[0])).containsExactly(Map.entry("whole: a pointer table", 1L));
+  }
+
+  /**
+   * A read of a branch that had no snapshot holds the table's version, as {@code
+   * BaseCatalogTransaction.unchangedSinceRead} does; so does every read with the witness off.
+   */
+  @ParameterizedTest
+  @ValueSource(booleans = {true, false})
+  void aReadPinHoldsTheTablesVersion(boolean witness) {
+    LogCatalog[] w = writers(ManifestWindowEncoding.NAME,
+        Map.of(LogCatalogProperties.TXN_READ_WITNESS, String.valueOf(witness)));
+    w[0].createTable(OTHER, SCHEMA);
+    TableIdentifier read = witness ? OTHER : ID; // u has no snapshot yet
+    CatalogTransaction txn = w[0].createTransaction(CatalogTransaction.IsolationLevel.SERIALIZABLE);
+    txn.asCatalog().loadTable(read);
+    txn.asCatalog().loadTable(witness ? ID : OTHER).newFastAppend().appendFile(file("a"))
+        .commit();
+    beforeAsWrite(() -> w[1].loadTable(read).updateProperties().set("k", "b").commit());
+    assertThatThrownBy(txn::commitTransaction).isInstanceOf(CommitFailedException.class);
+
+    assertThat(reasons(w[0])).containsExactly(Map.entry("whole: a read pin", 1L));
   }
 
   @Test

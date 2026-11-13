@@ -598,7 +598,10 @@ What the matrix says:
    unrelated table ops, because those carry table-level preconditions
    that are more precise.
 4. `ReadTable` is the read side of optimistic concurrency — it conflicts
-   with any update to the same table, nothing else.
+   with any update to the same table, nothing else; with refs (a read
+   witness, a serializable transaction's read of a table's branches), only
+   with an update the encoding cannot tell leaves those refs alone (under
+   `lamport`, any).
 5. The root is a parent like any other: an ordinary namespace row with
    id 0, so top-level creates and drops serialize on its version. It
    cannot be named, created, or dropped (SPEC.md §State Model).
@@ -611,8 +614,9 @@ What the matrix says:
    that conflicts fails, for its caller to run again. Its deltas of inline
    tables are judged where they land, as a table commit's; any other update
    of a table it writes conflicts on the table's whole version as it first
-   read it, and so does a table it reads under serializable isolation
-   ([errata.md](errata.md) §D12).
+   read it ([errata.md](errata.md) §D12). A table it reads under
+   serializable isolation conflicts on the refs it read, as the encoding
+   judges them ([SPEC.md](SPEC.md) §"Commits").
 
 ### The same table, per conflict encoding
 

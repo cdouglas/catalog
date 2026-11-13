@@ -23,6 +23,7 @@ import java.util.EnumMap;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -135,6 +136,12 @@ abstract class ConcernEncoding implements ConflictEncoding<ConcernEncoding.Witne
   abstract void stamp(TableChange change, int version, ConcernStamps stamps);
 
   /**
+   * What a read witness reads, a serializable transaction's that read {@code refs} of the table at
+   * {@code base}: the stamps of every change to them that {@link #stamp} records (errata D12).
+   */
+  abstract Witness readWitness(int base, List<String> refs);
+
+  /**
    * Why {@code change} has the Lamport witness where {@link #reads} gives none (a constant), for
    * {@link #explain}.
    */
@@ -177,6 +184,10 @@ abstract class ConcernEncoding implements ConflictEncoding<ConcernEncoding.Witne
     int base = action.baseVersion();
     if (landing.version() == base) {
       return Witness.whole(base, "the version read");
+    } else if (action.readWitness()) {
+      // A pointer table's every change stamps everything; this says why
+      return landing.inline() ? readWitness(base, action.readRefs())
+          : Witness.whole(base, "a pointer table");
     } else if (action.coarse()) {
       return Witness.whole(base, action.kind() == TableAction.Kind.FULL ? "full metadata"
           : action.kind() == TableAction.Kind.READ ? "a read pin" : "a metadata location");

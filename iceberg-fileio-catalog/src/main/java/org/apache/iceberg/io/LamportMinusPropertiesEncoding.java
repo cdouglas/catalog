@@ -53,6 +53,12 @@ final class LamportMinusPropertiesEncoding extends ConcernEncoding {
     return Witness.of(base).concern(REST);
   }
 
+  /** A read witness reads every change but a property change: it stamps no refs. */
+  @Override
+  Witness readWitness(int base, java.util.List<String> refs) {
+    return Witness.of(base).concern(REST);
+  }
+
   @Override
   String unseparated(TableChange change) {
     return "touches properties";

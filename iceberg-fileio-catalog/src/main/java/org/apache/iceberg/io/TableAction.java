@@ -38,12 +38,14 @@ import org.apache.iceberg.io.InlineDeltaCodec.RemoveManifestUpdate;
  *   <li>{@link Kind#FULL}: full inline metadata;
  *   <li>{@link Kind#LOCATION}: a metadata file's location (a pointer table's update, or an
  *       eviction);
- *   <li>{@link Kind#READ}: a read pin of a catalog transaction;
+ *   <li>{@link Kind#READ}: a serializable catalog transaction's read of the table: a read pin,
+ *       or with refs, a read witness, which the encoding judges by what changed of them;
  *   <li>{@link Kind#RENAME}: a rename, which moves the table's version; observed only.
  * </ul>
  *
- * Only a delta can be finalized on a table that changed since its base; every other kind, and a
- * {@linkplain #pinned pinned} delta, has the Lamport witness.
+ * Only a delta can be finalized on a table that changed since its base, and only a delta and a
+ * read witness can apply there; every other kind, and a {@linkplain #pinned pinned} delta, has
+ * the Lamport witness.
  */
 final class TableAction {
 
@@ -60,22 +62,34 @@ final class TableAction {
   private final int baseVersion;
   private final boolean pinned;
   private final byte[] deltaBytes;
+  private final List<String> readRefs;
   private DecodedDelta delta;
 
-  private TableAction(Kind kind, int tableId, int baseVersion, boolean pinned, byte[] deltaBytes) {
+  private TableAction(Kind kind, int tableId, int baseVersion, boolean pinned, byte[] deltaBytes,
+      List<String> readRefs) {
     this.kind = kind;
     this.tableId = tableId;
     this.baseVersion = baseVersion;
     this.pinned = pinned;
     this.deltaBytes = deltaBytes;
+    this.readRefs = readRefs;
   }
 
   static TableAction delta(int tableId, int baseVersion, byte[] deltaBytes, boolean pinned) {
-    return new TableAction(Kind.DELTA, tableId, baseVersion, pinned, deltaBytes);
+    return new TableAction(Kind.DELTA, tableId, baseVersion, pinned, deltaBytes, List.of());
   }
 
   static TableAction of(Kind kind, int tableId, int baseVersion) {
-    return new TableAction(kind, tableId, baseVersion, true, null);
+    return new TableAction(kind, tableId, baseVersion, true, null, List.of());
+  }
+
+  /**
+   * A serializable catalog transaction's read of the table at {@code baseVersion}: with {@code
+   * refs}, the branches and tags it read there, a read witness (errata D12), which the encoding
+   * judges by whether they changed since; without, a read pin, which applies only there.
+   */
+  static TableAction read(int tableId, int baseVersion, List<String> refs) {
+    return new TableAction(Kind.READ, tableId, baseVersion, refs.isEmpty(), null, refs);
   }
 
   Kind kind() {
@@ -102,7 +116,17 @@ final class TableAction {
 
   /** Whether an encoding can see no more of the action than its table and base version. */
   boolean coarse() {
-    return kind != Kind.DELTA;
+    return kind != Kind.DELTA && !readWitness();
+  }
+
+  /** Whether the action is a read witness: a read that names the refs it read. */
+  boolean readWitness() {
+    return kind == Kind.READ && !readRefs.isEmpty();
+  }
+
+  /** The refs a read witness read, as its record names them; none for any other action. */
+  List<String> readRefs() {
+    return readRefs;
   }
 
   /** The delta, decoded once; null unless {@link Kind#DELTA}. */

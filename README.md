@@ -39,7 +39,9 @@ land and commit wherever a retry of them would, which Iceberg's REST
 requirements refuse after a concurrent commit to the branch; its other
 updates (a pointer table's, a schema, partition-spec or ref change) fail if
 the table changed after the transaction first read it, a property change
-included ([docs/errata.md](docs/errata.md) D12). On real S3 (general-purpose and
+included ([docs/errata.md](docs/errata.md) D12). Under the default conflict
+encoding, a serializable transaction's reads hold while the branches it read
+do. On real S3 (general-purpose and
 Express One Zone buckets), GCS (standard and zonal buckets) and ADLS
 Gen2, it passes Iceberg's `CatalogTests` and `CatalogTransactionTests` in
 every commit and inline mode each store supports
@@ -278,6 +280,7 @@ suites skip; see [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
 | `fileio.catalog.committed.retention.ms` | `1800000` (30 min) | Minimum age before a committed-txn UUID becomes eligible for GC at compaction. `Long.MAX_VALUE` disables; `0` GCs aggressively (not recommended) |
 | `fileio.catalog.throttle.retry.min-wait-ms` | `200` | First wait before retrying a write that storage throttled; each later wait doubles, up to 5 s |
 | `fileio.catalog.race.retry.min-wait-ms` | `100` | Bound of the random wait after a commit loses a race for the catalog, before it reads again; each later loss doubles it, up to 1 s. `0` resends at once |
+| `fileio.catalog.txn.read.witness` | `true` | A serializable catalog transaction's record names the branches it read of each table, which the conflict encoding judges by what changed of them; `false` holds each table it read to its version (for ablation) |
 | `fileio.catalog.conflict.encoding` | `manifest-window` | How replay decides whether a table update conflicts with what landed since its writer read the table; fixed when the catalog is created ([docs/SPEC.md](docs/SPEC.md) "Conflict Encodings") |
 
 See [docs/LOG.md](docs/LOG.md) for the commit protocol,

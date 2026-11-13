@@ -23,6 +23,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.UUID;
 import net.jqwik.api.Arbitraries;
 import net.jqwik.api.Arbitrary;
@@ -32,6 +33,8 @@ import net.jqwik.api.Provide;
 import net.jqwik.api.constraints.IntRange;
 import net.jqwik.api.statistics.Statistics;
 import org.apache.iceberg.CatalogProperties;
+import org.apache.iceberg.HasTableOperations;
+import org.apache.iceberg.SnapshotRef;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
@@ -66,6 +69,10 @@ import org.intentlog.wire.LogEnvelope;
  *       read pin, a pinned update) is admitted only on its base version (coarsens when blind).
  * </ul>
  *
+ * And a read witness, a serializable catalog transaction's read of a table's refs (errata D12),
+ * judged after each command of an extension, is admitted only where each ref it read names the
+ * snapshot it did, and once rejected stays rejected (S2).
+ *
  * Whether an admitted record is what its operation would commit is {@code TestRebaseProperties}'s
  * to check.
  */
@@ -77,6 +84,36 @@ abstract class ConflictEncodingContract {
 
   /** The name of the encoding under test. */
   abstract String encoding();
+
+  /** The catalogs and log of a try, after its prefix: R's writer, and the racer's. */
+  private final class Fixture {
+    final LogCatalog catalog;
+    final LogCatalog other;
+    final InMemorySharedLog log;
+    final TableScript.Runner writer;
+    final TableScript.Runner racer;
+
+    Fixture(int formatVersion, boolean partitioned, LocalCatalogMode mode,
+        boolean smallInlineUpdates, List<TableScript.Cmd> prefix, StringBuilder trace) {
+      Map<String, String> properties = new HashMap<>();
+      properties.put(LogCatalogProperties.CONFLICT_ENCODING, encoding());
+      properties.put(
+          CatalogProperties.TABLE_DEFAULT_PREFIX + TableProperties.COMMIT_MIN_RETRY_WAIT_MS, "0");
+      if (smallInlineUpdates) {
+        properties.put(LogCatalog.INLINE_MAX_UPDATE_SIZE, "2048");
+      }
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      this.catalog = mode.catalog(io, WAREHOUSE, "c", properties);
+      this.log = LocalCatalogMode.sharedLog(io, LOCATION);
+      catalog.createNamespace(Namespace.of("ns"));
+      this.writer = new TableScript.Runner(catalog, formatVersion, partitioned, trace);
+      for (List<TableScript.Cmd> step : TableScript.steps(prefix)) {
+        writer.run(step);
+      }
+      this.other = mode.catalog(io, WAREHOUSE, "c", properties);
+      this.racer = new TableScript.Runner(other, "w", trace);
+    }
+  }
 
   @Property(tries = 150)
   void anEncodingIsDeterministicStableAndTotal(
@@ -94,23 +131,12 @@ abstract class ConflictEncodingContract {
         encoding(), formatVersion, partitioned ? "partitioned" : "unpartitioned", mode,
         smallInlineUpdates ? ", small inline updates" : "", prefix, window, r, extension,
         renameAt));
-    Map<String, String> properties = new HashMap<>();
-    properties.put(LogCatalogProperties.CONFLICT_ENCODING, encoding());
-    properties.put(
-        CatalogProperties.TABLE_DEFAULT_PREFIX + TableProperties.COMMIT_MIN_RETRY_WAIT_MS, "0");
-    if (smallInlineUpdates) {
-      properties.put(LogCatalog.INLINE_MAX_UPDATE_SIZE, "2048");
-    }
-    InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
-    LogCatalog catalog = mode.catalog(io, WAREHOUSE, "c", properties);
-    InMemorySharedLog log = LocalCatalogMode.sharedLog(io, LOCATION);
-    catalog.createNamespace(Namespace.of("ns"));
-    TableScript.Runner writer = new TableScript.Runner(catalog, formatVersion, partitioned, trace);
-    for (List<TableScript.Cmd> step : TableScript.steps(prefix)) {
-      writer.run(step);
-    }
-    LogCatalog other = mode.catalog(io, WAREHOUSE, "c", properties);
-    TableScript.Runner racer = new TableScript.Runner(other, "w", trace);
+    Fixture fixture =
+        new Fixture(formatVersion, partitioned, mode, smallInlineUpdates, prefix, trace);
+    InMemorySharedLog log = fixture.log;
+    LogCatalog other = fixture.other;
+    TableScript.Runner writer = fixture.writer;
+    TableScript.Runner racer = fixture.racer;
 
     Capture capture = new Capture(log, racer, window, trace);
     log.intercept(capture);
@@ -187,6 +213,117 @@ abstract class ConflictEncodingContract {
   }
 
   /**
+   * A serializable catalog transaction read the table's refs after a generated schedule (a read
+   * witness of all of them, and one of each alone: the record's {@code ReadTable} at the version it
+   * read). After each command of an extension, which can take the table anywhere (renames away and
+   * back included), each witness is admitted only where the table is at that version or each ref
+   * it read names the snapshot it did then, and once rejected it stays rejected (S2).
+   */
+  @Property(tries = 200)
+  void aReadWitnessHoldsOnlyWhileItsRefsDo(
+      @ForAll @IntRange(min = 2, max = 3) int formatVersion,
+      @ForAll boolean partitioned,
+      @ForAll("modes") LocalCatalogMode mode,
+      @ForAll boolean smallInlineUpdates,
+      @ForAll("prefixes") List<TableScript.Cmd> prefix,
+      @ForAll("refExtensions") List<TableScript.Cmd> extension,
+      @ForAll @IntRange(min = -1, max = 5) int renameAt) {
+    StringBuilder trace = new StringBuilder(String.format(
+        "%s v%d %s, %s%s%nprefix %s%nextension %s, rename at %d%n", encoding(), formatVersion,
+        partitioned ? "partitioned" : "unpartitioned", mode,
+        smallInlineUpdates ? ", small inline updates" : "", prefix, extension, renameAt));
+    Fixture fixture =
+        new Fixture(formatVersion, partitioned, mode, smallInlineUpdates, prefix, trace);
+    CatalogState base = replay(fixture.log, fixture.log.records().size(), null).builder().build();
+    Integer tableId = base.tableId(TableScript.ID);
+    if (tableId == null) {
+      Statistics.label("read witness").collect("no table");
+      return;
+    }
+    Map<String, Long> read = new TreeMap<>();
+    ((HasTableOperations) fixture.catalog.loadTable(TableScript.ID)).operations().current().refs()
+        .forEach((name, ref) -> read.put(name, ref.snapshotId()));
+    if (read.isEmpty()) {
+      Statistics.label("read witness").collect("no refs");
+      return;
+    }
+    Witnesses witnesses = new Witnesses(tableId, base.tableVersion(tableId), read, trace);
+    for (int i = 0; i <= extension.size(); i++) {
+      if (i == renameAt) {
+        trace.append("rename away and back\n");
+        fixture.other.renameTable(TableScript.ID, AWAY);
+        fixture.other.renameTable(AWAY, TableScript.ID);
+        witnesses.judge(fixture.log);
+      }
+      if (i < extension.size()) {
+        fixture.racer.run(List.of(extension.get(i)));
+        witnesses.judge(fixture.log);
+      }
+    }
+  }
+
+  /** Read witnesses of a table's refs at one version, each judged at the tail of a log. */
+  private static final class Witnesses {
+    private final int tableId;
+    private final int version;
+    private final Map<String, Long> read;
+    private final List<List<String>> refs = new ArrayList<>();
+    private final boolean[] rejected;
+    private final StringBuilder trace;
+
+    Witnesses(int tableId, int version, Map<String, Long> read, StringBuilder trace) {
+      this.tableId = tableId;
+      this.version = version;
+      this.read = read;
+      this.trace = trace;
+      refs.add(List.copyOf(read.keySet()));
+      if (read.size() > 1) {
+        read.keySet().forEach(ref -> refs.add(List.of(ref)));
+      }
+      this.rejected = new boolean[refs.size()];
+    }
+
+    void judge(InMemorySharedLog log) {
+      CatalogState.Builder builder = replay(log, log.records().size(), null).builder();
+      ReplayView landing = ReplayView.of(builder, tableId);
+      for (int w = 0; w < refs.size(); w++) {
+        ProtoCodec.ReadTableAction witness =
+            new ProtoCodec.ReadTableAction(tableId, version, refs.get(w));
+        boolean admitted;
+        try {
+          admitted = witness.verify(builder);
+        } catch (RuntimeException e) {
+          throw new AssertionError("judging a read witness of " + refs.get(w) + " throws\n"
+              + trace, e);
+        }
+        if (!admitted) {
+          rejected[w] = true;
+          Statistics.label("read witness").collect("rejected");
+          continue;
+        } else if (rejected[w]) {
+          throw new AssertionError("a read witness of " + refs.get(w)
+              + ", rejected earlier, is admitted later (S2)\n" + trace);
+        } else if (landing.version() == version) {
+          Statistics.label("read witness").collect("admitted on its version");
+          continue;
+        } else if (!landing.inline()) {
+          throw new AssertionError("a read witness of " + refs.get(w)
+              + " is admitted on a pointer table at another version\n" + trace);
+        }
+        for (String ref : refs.get(w)) {
+          SnapshotRef now = landing.table().ref(ref);
+          if (now == null || now.snapshotId() != read.get(ref)) {
+            throw new AssertionError(String.format(
+                "a read witness of %s is admitted, but %s moved from %s to %s%n%s", refs.get(w),
+                ref, read.get(ref), now, trace));
+          }
+        }
+        Statistics.label("read witness").collect("admitted on a changed table");
+      }
+    }
+  }
+
+  /**
    * Judges a copy of {@code record} landing at the tail of {@code log}: rejected if the record
    * was ({@code admitted} false), and if admitted, applied without throwing.
    */
@@ -247,8 +384,7 @@ abstract class ConflictEncodingContract {
     } else if (action instanceof ProtoCodec.UpdateTableLocationAction) {
       return ((ProtoCodec.UpdateTableLocationAction) action).table();
     } else if (action instanceof ProtoCodec.ReadTableAction) {
-      ProtoCodec.ReadTableAction read = (ProtoCodec.ReadTableAction) action;
-      return TableAction.of(TableAction.Kind.READ, read.id, read.version);
+      return ((ProtoCodec.ReadTableAction) action).table();
     }
     return null;
   }
@@ -346,6 +482,22 @@ abstract class ConflictEncodingContract {
   @Provide
   Arbitrary<List<TableScript.Cmd>> extensions() {
     return TableScript.commands(ConflictEncodingContract::single).withoutEdgeCases()
+        .list().ofMinSize(1).ofMaxSize(6);
+  }
+
+  /** Commands that change a table's refs, or change it leaving them alone. */
+  private static final java.util.Set<TableScript.Kind> REF_CHANGES = java.util.EnumSet.of(
+      TableScript.Kind.BRANCH_APPEND, TableScript.Kind.CREATE_BRANCH, TableScript.Kind.CREATE_TAG,
+      TableScript.Kind.REMOVE_REF, TableScript.Kind.FAST_FORWARD, TableScript.Kind.ROLLBACK,
+      TableScript.Kind.CHERRY_PICK, TableScript.Kind.RETENTION, TableScript.Kind.EXPIRE_SNAPSHOTS,
+      TableScript.Kind.SET_PROPERTY);
+
+  /** Extensions for a read witness: half of their commands change refs or leave them alone. */
+  @Provide
+  Arbitrary<List<TableScript.Cmd>> refExtensions() {
+    return Arbitraries.oneOf(
+            TableScript.commands(ConflictEncodingContract::single).withoutEdgeCases(),
+            TableScript.commands(REF_CHANGES::contains).withoutEdgeCases())
         .list().ofMinSize(1).ofMaxSize(6);
   }
 

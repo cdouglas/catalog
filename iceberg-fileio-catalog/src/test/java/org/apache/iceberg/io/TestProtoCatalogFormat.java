@@ -210,6 +210,25 @@ public class TestProtoCatalogFormat {
     assertThat(rt.newName).isEqualTo("renamed_tbl");
   }
 
+  /** A read witness's refs round-trip in order; a read pin has none. */
+  @Test
+  public void testReadTableActionEncodeDecode() {
+    ProtoCodec.Transaction txn = new ProtoCodec.Transaction(UuidV7.newUuidV7(), List.of(
+        new ProtoCodec.ReadTableAction(3, 5, List.of("b", "main", "tag")),
+        new ProtoCodec.ReadTableAction(4, 2)));
+
+    ProtoCodec.Transaction decoded =
+        ProtoCodec.decodeTransaction(ProtoCodec.encodeTransaction(txn));
+
+    ProtoCodec.ReadTableAction witness = (ProtoCodec.ReadTableAction) decoded.actions().get(0);
+    assertThat(witness.id).isEqualTo(3);
+    assertThat(witness.version).isEqualTo(5);
+    assertThat(witness.refs).containsExactly("b", "main", "tag");
+    ProtoCodec.ReadTableAction pin = (ProtoCodec.ReadTableAction) decoded.actions().get(1);
+    assertThat(pin.id).isEqualTo(4);
+    assertThat(pin.refs).isEmpty();
+  }
+
   @Test
   public void testTransactionVerifyAndApply() {
     CatalogState.Builder builder = CatalogState.builder();

@@ -659,7 +659,8 @@
       "ReadTable": {
         "fields": [
           {"number": 1, "name": "id", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": ""},
-          {"number": 2, "name": "version", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": "version that was read"}
+          {"number": 2, "name": "version", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": "version that was read"},
+          {"number": 3, "name": "refs", "type": "string", "repeated": true, "packed": true, "oneof": null, "comment": "a read witness, in name order"}
         ]
       },
       "RenameTable": {

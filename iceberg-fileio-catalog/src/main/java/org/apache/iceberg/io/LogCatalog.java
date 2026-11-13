@@ -2200,9 +2200,13 @@ public class LogCatalog extends BaseMetastoreCatalog
     final CatalogMutation newCatalog = new CatalogMutation(current);
     // Each branch the transaction read must be as it read it, from then until the commit
     // lands. BaseCatalogTransaction checked that before calling, but a commit may have landed
-    // since; check again on the state this commit builds on, and readTable makes the commit
-    // fail if the table changes before it lands. Each table it writes (a null ref) comes with
-    // the version it first read, on which its updates were staged.
+    // since; check again on the state this commit builds on, and the record holds the commit to
+    // it until it lands: by the refs it read (a read witness, errata D12), which the encoding
+    // judges by what changed of them since, where each ref was there when read, else by the
+    // table's version (a read pin), as unchangedSinceRead does.
+    // Each table it writes (a null ref) comes with the version it first read, on which its
+    // updates were staged.
+    boolean witness = LogCatalogProperties.txnReadWitness(catalogProperties);
     Map<TableIdentifier, TableMetadata> written = new HashMap<>();
     for (Map.Entry<BaseCatalogTransaction.TableRef, TableMetadata> read : reads.entrySet()) {
       TableIdentifier readTable = read.getKey().identifier();
@@ -2217,7 +2221,12 @@ public class LogCatalog extends BaseMetastoreCatalog
             "SERIALIZABLE isolation violation: Found table metadata updates to table '%s' after it was read on branch '%s'",
             readTable, ref);
       }
-      newCatalog.readTable(readTable);
+      SnapshotRef then = read.getValue().ref(ref);
+      if (witness && then != null) {
+        newCatalog.readRef(readTable, ref);
+      } else {
+        newCatalog.readTable(readTable);
+      }
     }
     for (TableCommit commit : commits) {
       final TableIdentifier tableId = commit.identifier();

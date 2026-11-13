@@ -144,9 +144,10 @@ version it read. Applying those to a changed version, checked only by the
 requirements Iceberg derives, as its REST server does, loses what the change
 did (Bug 70): another writer's property change that a schema update's name
 mapping rewrote, or a tag on a snapshot the transaction expired. Under
-serializable isolation a table the transaction only reads is pinned too (a
-read pin), between the commit's read and its landing; what it read (the
-branch's head) `BaseCatalogTransaction` checks before.
+serializable isolation the record names the branches the transaction read of
+each table (a read witness, SPEC.md §"Commits"), which the encoding judges by
+what changed of them; a branch read with no snapshot holds the table's version
+(a read pin).
 
 So there the catalog is stricter than Iceberg's REST semantics: a concurrent
 property change, or a commit to another branch, fails a transaction whose
@@ -169,18 +170,13 @@ Deferred:
   what REST's requirements check, without Bug 70's losses (the properties
   concern catches the name mapping). The record would say an update is a
   transaction's, so a table commit's stays pinned as Iceberg commits it.
-- **A read witness.** The record names what a serializable transaction read
-  of each table (the branches and their heads: `BaseCatalogTransaction`'s
-  read set), and replay checks that rather than the table's version: a
-  format change.
 - **The rebase oracle for transactions.** `TestRebaseProperties` lands table
   commits after a window of commits they did not see; a transaction's deltas
   are checked only by the race fuzzer's serial run and the fault fuzzer's
   model, both of whose transactions append.
 
 **Trigger to revisit:** a workload whose transactions change refs, schemas or
-partition specs, or read under serializable isolation, while other commits
-race them.
+partition specs while other commits race them.
 
 ### D13. `partition-vector` retries a validated commit that `concern-vector` merges
 

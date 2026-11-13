@@ -333,9 +333,17 @@ message UpdateTableLocation {
   string metadata_location = 3;
 }
 
+// A table a serializable catalog transaction read. Without refs, a read
+// pin: it applies only where the table is at `version`. With refs (a read
+// witness, errata D12), the branches and tags it read, each naming at
+// `version` the snapshot its commit checked: the catalog's conflict encoding
+// judges it by what changed of them since, as it does a table update, so a
+// change that leaves them alone (a property, an expiry, another branch)
+// need not fail it; under lamport, it is the version alone.
 message ReadTable {
   int32 id = 1;
   int32 version = 2;                // version that was read
+  repeated string refs = 3;         // a read witness, in name order
 }
 
 // Moves a table to a new name, in its namespace or another. Apply bumps the

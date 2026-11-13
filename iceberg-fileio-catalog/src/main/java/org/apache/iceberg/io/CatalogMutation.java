@@ -51,7 +51,9 @@ public class CatalogMutation {
 
   private final Replica<CatalogState> base;
   private final CatalogState original;
-  private final Set<TableIdentifier> readTables;
+  // Tables a serializable transaction read: the refs it read (a read witness), or none, a read of
+  // the whole version (a read pin)
+  private final Map<TableIdentifier, java.util.SortedSet<String>> readTables;
   private final Map<TableIdentifier, String> tables;
   private final Map<TableIdentifier, String> tableUpdates;
   private final Map<Namespace, Boolean> namespaces;
@@ -96,7 +98,7 @@ public class CatalogMutation {
     this.base = base;
     this.original = base.state();
     this.tables = Maps.newHashMap();
-    this.readTables = Sets.newHashSet();
+    this.readTables = Maps.newHashMap();
     this.tableUpdates = Maps.newHashMap();
     this.namespaces = Maps.newHashMap();
     this.namespaceProperties = Maps.newHashMap();
@@ -251,14 +253,40 @@ public class CatalogMutation {
     return this;
   }
 
+  /**
+   * Makes the commit apply only where {@code table} is at the version this mutation read: a read
+   * pin, of a serializable transaction that read the whole table.
+   */
   public CatalogMutation readTable(TableIdentifier table) {
+    checkReadable(table);
+    readTables.put(table, new java.util.TreeSet<>());
+    return this;
+  }
+
+  /**
+   * Makes the commit apply only where {@code ref} of {@code table} names the snapshot it does in
+   * this mutation's read, as a serializable transaction read it: a read witness (errata D12),
+   * which the catalog's conflict encoding judges by what changed of the refs read since that
+   * version (under {@code lamport}, any change). A read pin of the table ({@link #readTable})
+   * holds it to its version instead.
+   */
+  public CatalogMutation readRef(TableIdentifier table, String ref) {
+    checkReadable(table);
+    java.util.SortedSet<String> refs = readTables.get(table);
+    if (refs == null) {
+      readTables.put(table, new java.util.TreeSet<>(Set.of(ref)));
+    } else if (!refs.isEmpty()) {
+      refs.add(ref);
+    }
+    return this;
+  }
+
+  private void checkReadable(TableIdentifier table) {
     if (markedForDrop(table)) {
       // TODO eh... this should be legal.
       throw new IllegalArgumentException(
           "Cannot include read dependency on table marked for deletion: " + table);
     }
-    readTables.add(table);
-    return this;
   }
 
   public CatalogMutation updateTable(TableIdentifier table, String location) {
@@ -648,11 +676,11 @@ public class CatalogMutation {
     }
 
     // Process read tables (for optimistic concurrency)
-    for (TableIdentifier ident : readTables) {
-      Integer tblId = original.tableId(ident);
+    for (Map.Entry<TableIdentifier, java.util.SortedSet<String>> read : readTables.entrySet()) {
+      Integer tblId = original.tableId(read.getKey());
       if (tblId != null) {
         int version = original.tableVersion(tblId);
-        actions.add(new ProtoCodec.ReadTableAction(tblId, version));
+        actions.add(new ProtoCodec.ReadTableAction(tblId, version, List.copyOf(read.getValue())));
       }
     }
 

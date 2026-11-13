@@ -102,7 +102,8 @@ final class ConflictEncodings {
       String why = encoding.explain(witness, landing, state);
       return why != null ? why : "whole: " + encoding.name();
     }
-    if (landing.version() != action.baseVersion()) {
+    // A read witness the encoding admits changes nothing, so nothing of it merges
+    if (landing.version() != action.baseVersion() && !action.readWitness()) {
       if (action.pinned()) {
         return "merge: pinned";
       }

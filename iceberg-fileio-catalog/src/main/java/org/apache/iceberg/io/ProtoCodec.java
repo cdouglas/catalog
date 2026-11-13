@@ -248,6 +248,7 @@ public class ProtoCodec {
   // ReadTable field numbers
   private static final int READ_TBL_ID = 1;
   private static final int READ_TBL_VERSION = 2;
+  private static final int READ_TBL_REFS = 3;
 
   // UpdateTableInline field numbers
   private static final int UPDATE_INLINE_TBL_ID = 1;
@@ -1192,6 +1193,9 @@ public class ProtoCodec {
       ByteArrayOutputStream inner = new BytesOut();
       writeVarint(inner, READ_TBL_ID, a.id);
       writeVarint(inner, READ_TBL_VERSION, a.version);
+      for (String ref : a.refs) {
+        writeString(inner, READ_TBL_REFS, ref);
+      }
       writeLengthDelimited(out, ACTION_READ_TABLE, inner.toByteArray());
     } else if (action instanceof UpdateTableInlineAction) {
       UpdateTableInlineAction a = (UpdateTableInlineAction) action;
@@ -1541,6 +1545,7 @@ public class ProtoCodec {
   private static ReadTableAction decodeReadTable(byte[] bytes) throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
     int id = 0, version = 0;
+    List<String> refs = new ArrayList<>();
 
     while (in.available() > 0) {
       int tag = readVarint(in);
@@ -1552,11 +1557,14 @@ public class ProtoCodec {
         case READ_TBL_VERSION:
           version = readVarint(in);
           break;
+        case READ_TBL_REFS:
+          refs.add(readString(in));
+          break;
         default:
           skipField(in, tag & 0x7);
       }
     }
-    return new ReadTableAction(id, version);
+    return new ReadTableAction(id, version, refs);
   }
 
   private static CreateTableInlineAction decodeCreateTableInline(byte[] bytes) throws IOException {
@@ -2679,26 +2687,42 @@ public class ProtoCodec {
     }
   }
 
+  /**
+   * A table a serializable catalog transaction read. Without refs, a read pin: it applies only on
+   * the version read, whatever the encoding. With refs, a read witness (errata D12): the branches
+   * and tags it read, which named on that version the snapshots its commit checked; the
+   * catalog's encoding judges it by what changed since, as a table update's (a stable judgment,
+   * S2), so a change that leaves them alone (a property, an expiry, another branch) need not fail
+   * it. Under {@code lamport} it is the version alone.
+   */
   public static class ReadTableAction implements Action {
     final int id;
     final int version;
+    /** The refs a read witness read, in the writer's (name) order; empty for a read pin. */
+    final List<String> refs;
 
     public ReadTableAction(int id, int version) {
+      this(id, version, List.of());
+    }
+
+    public ReadTableAction(int id, int version, List<String> refs) {
       this.id = id;
       this.version = version;
+      this.refs = List.copyOf(refs);
+    }
+
+    TableAction table() {
+      return TableAction.read(id, version, refs);
     }
 
     @Override
     public boolean verify(CatalogState.Builder builder) {
-      // Fails if the table changed since the transaction read it (a serializable read): a read pin
-      // applies only on the version read, whatever the encoding.
-      return ConflictEncodings.admits(TableAction.of(TableAction.Kind.READ, id, version), builder);
+      return ConflictEncodings.admits(table(), builder);
     }
 
     @Override
     public String explain(CatalogState.Builder builder) {
-      return ConflictEncodings.rejection(
-          TableAction.of(TableAction.Kind.READ, id, version), builder);
+      return ConflictEncodings.rejection(table(), builder);
     }
 
     @Override

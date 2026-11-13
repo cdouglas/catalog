@@ -99,6 +99,22 @@ public final class LogCatalogProperties {
   }
 
   /**
+   * Whether a serializable catalog transaction's record names what it read of each table: the
+   * branches and tags it read and the snapshot each named (a read witness, errata D12). Replay then
+   * holds the transaction to those where it sees them, on an inline table, rather than to the
+   * table's version, so a change landing as it commits that leaves them alone (a property, an
+   * expiry, another branch) doesn't fail it. {@code false} pins each table it read to the version
+   * its commit checked (for ablation). Default: {@code true}.
+   */
+  public static final String TXN_READ_WITNESS = "fileio.catalog.txn.read.witness";
+  public static final boolean DEFAULT_TXN_READ_WITNESS = true;
+
+  /** Whether {@code properties} have a serializable transaction's record witness its reads. */
+  public static boolean txnReadWitness(Map<String, String> properties) {
+    return booleanProperty(properties, TXN_READ_WITNESS, DEFAULT_TXN_READ_WITNESS);
+  }
+
+  /**
    * Whether a catalog in one object is compacted after a commit: past {@link #MAX_APPEND_COUNT} or
    * {@link #MAX_APPEND_SIZE} a commit still appends, and once its record has landed its writer may
    * replace the catalog with a checkpoint of the version it landed in, at a point past the limits
