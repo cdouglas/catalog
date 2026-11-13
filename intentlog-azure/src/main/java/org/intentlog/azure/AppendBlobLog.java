@@ -258,9 +258,17 @@ public final class AppendBlobLog implements SharedLog {
       throw new IllegalStateException(this + " does not exist");
     }
     Tail at = expected == null ? null : tailOf(expected);
+    boolean reread = false;
     for (int rotations = 0; ; ) {
       Segment seg = h.head().last();
-      if (at != null && (at.ordinal != seg.ordinal() || !at.logId.equals(h.head().logId()))) {
+      if (at != null && !reread && at.logId.equals(h.head().logId())
+          && at.ordinal > seg.ordinal()) {
+        // the tail was read through a newer head than this instance holds
+        h = existing();
+        reread = true;
+        continue;
+      }
+      if (at != null && !holdsPosition(at, h.head(), seg)) {
         throw new LogConflictException("An append to " + this + " expected " + at
             + ", and the log moved on", null);
       }
@@ -286,10 +294,7 @@ public final class AppendBlobLog implements SharedLog {
             throw new LogThrottledException(this + " failed to move on from " + seg.name(), e2);
           }
         }
-        if (at != null) {
-          throw new LogConflictException("An append to " + this + " found its segment full", e);
-        }
-        h = fresh;
+        h = fresh; // a conditional append lands in the next segment only if the log is at its tail
       } catch (AppendBlobStore.NotFound e) {
         // a stale head: the segment was trimmed and swept. Never create it (AZ4).
         Head fresh = existing();
@@ -297,9 +302,6 @@ public final class AppendBlobLog implements SharedLog {
             && fresh.head().byOrdinal(seg.ordinal()).name().equals(seg.name())) {
           throw new IllegalStateException("AZ5: the head names " + seg.name()
               + ", which does not exist", e);
-        }
-        if (at != null) {
-          throw new LogConflictException("An append to " + this + " found its segment gone", e);
         }
         h = fresh;
       } catch (AppendBlobStore.PositionMismatch e) {
@@ -311,6 +313,19 @@ public final class AppendBlobLog implements SharedLog {
         throw new LogNotSentException("The store refused an append to " + this, e);
       }
     }
+  }
+
+  /**
+   * Whether a conditional append at {@code at} may land in {@code seg}, the last segment of {@code
+   * head}, as the log is still at {@code at}'s position: in {@code at}'s own segment, at the offset
+   * the store checks (appendpos), or in a later one that starts at that position, the segments
+   * between closed where the log ended (a close that needed no pad, or a trim). A position, not a
+   * segment, is what the append is conditioned on (Bug 89).
+   */
+  private static boolean holdsPosition(Tail at, AzureLogHead head, Segment seg) {
+    return at.logId.equals(head.logId())
+        && (at.ordinal == seg.ordinal()
+            || (at.ordinal < seg.ordinal() && seg.base() == at.position));
   }
 
   /**

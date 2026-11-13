@@ -34,6 +34,7 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicBoolean;
+import org.intentlog.LogConflictException;
 import org.intentlog.LogThrottledException;
 import org.intentlog.LogTail;
 import org.intentlog.LogView;
@@ -303,5 +304,66 @@ class TestAppendBlobLog {
     assertThat(requests).as("an append, and a read of what landed before it")
         .containsExactly(Op.APPEND, Op.READ);
     assertThat(view.records()).containsExactly(mine, theirs, next);
+  }
+
+  // ============================================================
+  // Conditional appends (the ablation)
+  // ============================================================
+
+  /** A log of conditional appends on {@code on}, of segment limit {@code limit}. */
+  private static AppendBlobLog conditional(InMemoryAppendBlobStore on, long limit) {
+    return new AppendBlobLog(on, ROOT, AppendBlobLog.Options.defaults().withConditional(true)
+        .withSegmentLimit(limit).withTrimGraceMs(0).withClock(() -> 0L));
+  }
+
+  /**
+   * A conditional append is conditioned on the log's position. One whose segment is full at that
+   * position (Append Blobs of two blocks: the close needs no pad) moves the log on, and lands at
+   * offset 0 of the segment that starts there. It conflicted ("found its segment full") with
+   * nothing past its tail, and a resend through an instance with the older head conflicted too,
+   * until a commit ran out of attempts (round p7-r0, TestAzureCommitProtocol).
+   */
+  @Test
+  void aConditionalAppendToAFullSegmentLandsWhereTheNextStarts() { // (Bug 89)
+    InMemoryAppendBlobStore twoBlocks = new InMemoryAppendBlobStore(2, () -> 0L);
+    AppendBlobLog log = conditional(twoBlocks, 1L << 20);
+    create(log);
+    byte[] first = record();
+    byte[] second = record();
+    log.append(first, log.probe());
+    log.append(second, log.probe());
+    LogTail tail = log.probe();
+    byte[] third = record();
+    log.append(third, tail);
+    AzureLogHead head = AzureLogHead.decode(twoBlocks.peek(ROOT + "/head"));
+    assertThat(head.segments()).hasSize(2);
+    assertThat(head.last().base()).as("the next segment starts at the tail")
+        .isEqualTo(head.segments().get(0).closedLength());
+    assertThat(log.read().records()).containsExactly(first, second, third);
+  }
+
+  /**
+   * An instance whose head is older than the tail it is given reads the head again, and appends
+   * at the tail. It conflicted ("the log moved on") on every resend, never reading the head.
+   */
+  @Test
+  void aConditionalAppendThroughAnOlderHeadReadsTheHeadAgain() { // (Bug 89)
+    InMemoryAppendBlobStore twoBlocks = new InMemoryAppendBlobStore(2, () -> 0L);
+    AppendBlobLog a = conditional(twoBlocks, 1L << 20);
+    AppendBlobLog b = conditional(twoBlocks, 1L << 20);
+    create(a);
+    byte[] first = record();
+    b.append(first, b.probe()); // b holds the head that names segment 0
+    byte[] second = record();
+    a.append(second, a.probe());
+    byte[] third = record();
+    a.append(third, null); // segment 0 is full: a moves the log on, and lands in segment 1
+    LogTail tail = a.probe();
+    byte[] fourth = record();
+    b.append(fourth, tail);
+    assertThat(a.read().records()).containsExactly(first, second, third, fourth);
+    assertThatThrownBy(() -> b.append(record(), tail))
+        .as("the log moved past the tail")
+        .isInstanceOf(LogConflictException.class);
   }
 }
