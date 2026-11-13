@@ -400,10 +400,11 @@ no other append takes effect between the store's answer to that read and its
 own append taking effect: the resend's window. Landings come no closer
 together than the windows of the resends that make them, and 51 commits a
 second offer one every 19.6 ms. The traces of `tr6y` measured the windows
-under the model of the time: 12.8 ms after a probe (the HEAD; a pinned GET of
-the probed version's last trailer, 8 ms; half an append) and 18.9 ms after a
+under the model of the time (catalog-bench's lab page `commit-traces`, from
+the medians of each part): 12.8 ms after a probe (the HEAD; a pinned GET of
+the probed version's last trailer, 8 ms; half an append) and 19.1 ms after a
 tail read (the GET, 7.4 ms; folding the records that beat it and building the
-replica, 6.7 ms of CPU; half an append). With probes, landings came 17.8 ms
+replica, 6.8 ms of CPU; half an append). With probes, landings came 17.8 ms
 apart at the median, with 57 of the 128 writers in the commit loop and 75%
 of resends lost; with tail reads 22.4 ms apart, with 107 writers in the loop
 and 87% lost. The commits queued (the pool's wait, p99 64 s, flagged the run),
@@ -420,14 +421,13 @@ commits, not a driver at its limit.
   with the store answering all three halfway, on step 7, whose reads cost
   what `tr6x`'s model charged them (a tail read one GET, a probe one HEAD:
   errata D23 changed neither). Tail reads committed 47.5 merge appends a
-  second, their window about 16 ms against the probe's 14.5 (12.8 in
-  `tr6y`).
+  second, their window 16.6 ms against the probe's 14.5 (12.8 in `tr6y`).
 - The fold (errata D25, fold rebuilt whole state): a fold onto the replica
   copied each of the catalog state's table-keyed maps and rebuilt its
   lookups, 8.2 ms of CPU a resend at 3,000 tables in `tr7y` (fold 4.8, build
   3.4), all of it inside the window; a resend after a probe folds nothing.
   `tr8y` ran with the fix: a fold took 1.0 ms and a build 0.02, and the tail
-  read's window was about 9 ms against the probe's 14.5.
+  read's window was 9.3 ms against the probe's 14.5.
 
 **Tail reads win there now.** In `tr8y` both arms met the offered rate, and
 tail reads took under a third of the probes' time: a p50 of 222 ms against
@@ -440,7 +440,7 @@ arms.
 
 The probes are slower than `e1-d20`'s, before format 3 (a p50 of 767 against
 242 ms): their resend reads the probed version's last trailer inside its window
-(a resend's write took 16.3 ms in `tr8y`'s traces, a first write 9.6), which
+(a resend's write took 16.2 ms in `tr8y`'s traces, a first write 9.6), which
 `e1-d20`'s did not, and `e1-d20` ran under the old model, which answered its
 probes at their ends. Tail reads come within `e1-d20`'s median
 (222 against 242 ms) with a longer tail (p99 2,971 against 1,693 ms), at a
@@ -1236,7 +1236,7 @@ At 1,000 tables (16.7 a second offered), one run an arm of 1,200 s:
   lost to each other ([Compaction after the
   commit](#compaction-after-the-commit)). The probe path (tail reads off) is
   slower there than the catalog before format 3: its resend reads the probed
-  version's last trailer inside its window (6.8 ms at E1's 3,000 tables,
+  version's last trailer inside its window (6.7 ms at E1's 3,000 tables,
   [Measured at E1's largest pointer
   point](#measured-at-e1s-largest-pointer-point); not traced at 1,000).
   Still open: whether a writer should estimate a compaction's chance to land

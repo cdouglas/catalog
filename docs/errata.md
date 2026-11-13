@@ -497,7 +497,7 @@ off) put the loss on tail reads: 49.9 with them off, 43.4 with them on and
 36.0 with compaction after the commit too. Commit traces (`tr6y`) put it on
 the resend's window, from the store's answer to the read a writer resends
 from to its append taking effect, which bounds how close together landings
-come: 12.8 ms after a probe and 18.9 after a tail read, against 19.6 ms
+come: 12.8 ms after a probe and 19.1 after a tail read, against 19.6 ms
 between the commits offered. Two causes, neither in tail reads: the model's
 reads (D24), which favoured probes by 6.7 ms of window, and a fold that
 rebuilt the whole catalog state (D25), 6.7-8.2 ms of CPU a resend at 3,000
@@ -989,12 +989,13 @@ window. Campaign tr6y (commit traces at E1's 3,000 tables and 128 workers on
 `tr6y`) measured each resend's window, from the instant the model's store last
 answered the writer's read to its append taking effect: 12.8 ms after a probe
 (a pinned read of the probed version's last trailer, 8 ms, then half an
-append), 18.9 ms after a tail read (the GET, 7.4 ms; folding the records and
-building the replica, 6.7 ms of CPU; half an append). Landings came 17.8 ms
+append), 19.1 ms after a tail read (the GET, 7.4 ms; folding the records and
+building the replica, 6.8 ms of CPU; half an append; catalog-bench's lab page
+`commit-traces`). Landings came 17.8 ms
 apart at the median with probes and 22.4 ms with tail reads, which sat at
 capacity: 107 of 128 writers in the commit loop and 87% of resends lost, against
 57 and 75%. With both reads answered halfway the windows are about 15.8 and
-15.2 ms.
+15.4 ms.
 
 **Resolved 2026-11-12** (fileio 5a577d7): the model's store acts on a lookup, a
 GET and a conditional write halfway through its latency (`TestLatencyFileIO`: a
