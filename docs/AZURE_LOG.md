@@ -622,7 +622,8 @@ As every provider is tested (LOG.md "Testing a provider"), plus a model:
 5. **The cloud.** An integration test on a real account (`AzureAppendBlobLogIT`): the
    contract, and a run of the fuzzer's schedules with real requests.
 
-**Where it stands (2026-11-13): all five steps are done.**
+**Where it stands (2026-11-13): all five steps are done.** The format and protocol are
+specified, for review, in [AZURE_LOG_FORMAT.md](AZURE_LOG_FORMAT.md).
 
 1. **The model** (`spec/tla/README.md` "The Azure log") holds in eight configurations, the
    largest at 335,000 states:
