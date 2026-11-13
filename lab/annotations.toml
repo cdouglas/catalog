@@ -106,6 +106,10 @@ select = ["c8-fold-*"]
 title = "Catalog transactions racing fast appends to their tables: width, table skew, isolation, encoding; conflicts by reason"
 select = ["c9-txn-*"]
 
+[campaigns.c9l]
+title = "c9-txn's 32 cells, repetition 0, rerun on the dev box at fileio 1ce30cf (D12: inline appends judged where they land, the read witness): the contention bench checked against c9-txn, cell by cell (same config hashes)"
+select = ["c9l-*"]
+
 [campaigns.g1-witness]
 title = "Generated log traces (LogTrace): fast appends, a mix, catalog transactions; 6 encodings x contended/oracle x 4/16 writers; and the fold (JMH) over them"
 select = ["g1-witness-*", "jmh/j-g1*"]
@@ -175,3 +179,6 @@ note = "Ingest at fileio main (1adba2b, capture format 4: i11's workload capture
 [[annotate]]
 select = "i12-retention-*"
 note = "i12-count at a committed set of 6 hours (retention_s 21,600: i4's and i6's), the same capture"
+[[annotate]]
+select = "c9l-*"
+note = "fileio 1ce30cf on the dev box (16 CPUs, one run at a time, 19:35-20:35 UTC; builds on the box, a fuzz image, lab pages and test runs, overlapped the runs from 19:43 to 20:05). Against c9-txn (157e3bf, havoc): manifest-window snapshot transactions commit 100% at every width (32-44% at width 8 then), 5x the commits a second at width 8; lamport and serializable cells commit as often or more"
