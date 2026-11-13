@@ -18,12 +18,27 @@
  */
 package org.apache.iceberg.io;
 
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+import java.io.IOException;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.UUID;
+import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.catalog.CatalogTransaction;
 import org.apache.iceberg.catalog.CatalogTransactionTests;
+import org.apache.iceberg.catalog.Namespace;
+import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.exceptions.CommitFailedException;
+import org.apache.iceberg.exceptions.ValidationException;
+import org.apache.iceberg.io.CloseableIterable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 /**
  * Runs Iceberg's {@link CatalogTransactionTests} against {@link LogCatalog} in every {@link
@@ -59,8 +74,66 @@ public class TestLocalCatalogTransaction {
 
     @Override
     protected boolean conflictsOnTableVersions() {
-      // a transaction conflicts on the whole version of each table it writes (errata D12)
+      // an inline table's snapshot changes are judged where they land; a pointer table's update
+      // applies only on the version the transaction first read (errata D12)
+      return !mode().inlineTM;
+    }
+
+    @Override
+    protected boolean conflictsOnTableVersionsForCommitOnceUpdates() {
+      // a ref, schema or partition-spec change applies only on the version first read (errata D12)
       return true;
+    }
+
+    /**
+     * A transaction's snapshot changes to an inline table are judged where its record lands
+     * (errata D12): a snapshot isolation transaction's appends to two inline-ML tables, one of
+     * which another writer appended to first, commit together, as a retry of them would. Iceberg's
+     * REST server fails the transaction on the raced table's requirements. Here it fails where the
+     * append cannot move onto the branch's new head: an inline-TM table's manifest list is a file
+     * built on the old one (the encoding's {@code ref: advanced}), a pointer table's update applies
+     * only on the version the transaction first read, and a serializable transaction read the
+     * branch that moved. Then neither table changes.
+     */
+    @ParameterizedTest
+    @EnumSource(CatalogTransaction.IsolationLevel.class)
+    public void aRacedAppendCommitsWhereARetryWould(CatalogTransaction.IsolationLevel isolation) {
+      TableIdentifier raced = TableIdentifier.of("ns", "raced");
+      TableIdentifier other = TableIdentifier.of("ns", "other");
+      catalog.createNamespace(Namespace.of("ns"));
+      catalog.buildTable(raced, SCHEMA).withPartitionSpec(SPEC).create()
+          .newFastAppend().appendFile(FILE_A).commit();
+      catalog.buildTable(other, SCHEMA).withPartitionSpec(SPEC).create();
+
+      CatalogTransaction txn = catalog.createTransaction(isolation);
+      txn.asCatalog().loadTable(raced).newFastAppend().appendFile(FILE_B).commit();
+      txn.asCatalog().loadTable(other).newFastAppend().appendFile(FILE_D).commit();
+      // another writer appends to the first table, moving its main branch
+      catalog.loadTable(raced).newFastAppend().appendFile(FILE_C).commit();
+
+      if (mode().inlineML && isolation == CatalogTransaction.IsolationLevel.SNAPSHOT) {
+        txn.commitTransaction();
+        assertThat(files(raced))
+            .containsExactlyInAnyOrder(FILE_A.location(), FILE_B.location(), FILE_C.location());
+        assertThat(files(other)).containsExactly(FILE_D.location());
+      } else {
+        assertThatThrownBy(txn::commitTransaction)
+            .isInstanceOfAny(CommitFailedException.class, ValidationException.class);
+        assertThat(files(raced))
+            .containsExactlyInAnyOrder(FILE_A.location(), FILE_C.location());
+        assertThat(files(other)).isEmpty();
+      }
+    }
+
+    private Set<String> files(TableIdentifier table) {
+      Set<String> files = new TreeSet<>();
+      try (CloseableIterable<FileScanTask> tasks =
+          catalog.loadTable(table).newScan().planFiles()) {
+        tasks.forEach(task -> files.add(task.file().location()));
+      } catch (IOException e) {
+        throw new java.io.UncheckedIOException(e);
+      }
+      return files;
     }
 
     @Override

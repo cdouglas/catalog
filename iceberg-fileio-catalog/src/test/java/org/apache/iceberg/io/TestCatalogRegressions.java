@@ -4580,8 +4580,9 @@ public class TestCatalogRegressions {
 
     /**
      * An append staged on the table as it is now, committed as a table commit with no read set,
-     * which applies its updates to the table's current metadata. A catalog transaction would fail
-     * on any change to the table since (Bug 70).
+     * which applies its updates to the table's current metadata. A catalog transaction passes the
+     * version it first read, and its update applies only there or where a retry of it would
+     * commit the same (Bug 70, errata D12).
      */
     private org.apache.iceberg.catalog.TableCommit stagedAppend(FileIOCatalog catalog) {
       catalog.createNamespace(mixedNs);
@@ -4635,8 +4636,9 @@ public class TestCatalogRegressions {
    * derives from its commit, between its first read of the table and the commit. A change those
    * requirements don't name went through and was lost or broke the table: another writer's
    * property change (a name mapping a schema update rewrote), a commit to another branch of it,
-   * or a tag on a snapshot the transaction expired. A transaction now conflicts on any change to
-   * a table it writes since it first read it (errata D12).
+   * or a tag on a snapshot the transaction expired. A transaction's update of a table it writes
+   * now applies only on the version it first read, unless it is an inline delta, which the
+   * catalog's conflict encoding judges where it lands (errata D12): a pointer table's here.
    */
   @Nested
   class WrittenTableChangedSinceRead {

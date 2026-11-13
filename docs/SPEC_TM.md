@@ -207,8 +207,10 @@ the catalog's conflict encoding, like `UpdateTableLocation` (SPEC.md
 §"Conflict Encodings"): under `lamport`, on the table version. A delta the
 encoding admits on a later version is finalized there ("Late-bound
 fields" below). `pinned` holds an update to its version under every
-encoding: `LogCatalog.commitTransaction` pins each table it writes, which
-must be at the version the transaction first read (errata D12), and a
+encoding: `LogCatalog.commitTransaction` sends a transaction's delta of
+snapshots and their branches' moves unpinned, from the version it first read,
+and pins any other update of a table it writes, which must be at that version
+(errata D12), and a
 table commit pins an update Iceberg commits once (a schema or spec update,
 a ref change through `manageSnapshots`: `LogCatalog.commitsOnce`; a
 replace).

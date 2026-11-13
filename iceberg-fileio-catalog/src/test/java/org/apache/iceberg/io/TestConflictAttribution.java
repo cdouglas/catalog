@@ -172,20 +172,44 @@ class TestConflictAttribution {
         Map.entry("whole: commit once: a schema change", 1L));
   }
 
+  /**
+   * A catalog transaction's append to an inline table is judged where its record lands, as a
+   * table commit's is (errata D12): another writer's append, landing as the transaction writes its
+   * record, is no conflict.
+   */
   @Test
-  void aCatalogTransactionPinsTheTablesItWrites() {
+  void aCatalogTransactionsAppendMerges() {
     LogCatalog[] w = writers(ManifestWindowEncoding.NAME);
     CatalogTransaction txn =
         w[0].createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
     txn.asCatalog().loadTable(ID).newFastAppend().appendFile(file("a")).commit();
     // B's append lands as A's transaction writes its record, after its checks
     beforeAsWrite(() -> w[1].loadTable(ID).newFastAppend().appendFile(file("b")).commit());
+    txn.commitTransaction();
+
+    assertThat(w[0].log().counts().conflicts()).isZero();
+    assertThat(reasons(w[0])).isEmpty();
+    assertThat(rejectedInTheLog()).isEmpty();
+  }
+
+  /**
+   * A catalog transaction's schema change is pinned to the version its commit checked, as a table
+   * commit's is: another writer's append, landing as the transaction writes its record, fails it,
+   * attributed to the change Iceberg commits once.
+   */
+  @Test
+  void aCatalogTransactionsSchemaChangeIsCommittedOnce() {
+    LogCatalog[] w = writers(ManifestWindowEncoding.NAME);
+    CatalogTransaction txn =
+        w[0].createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+    txn.asCatalog().loadTable(ID).updateSchema().addColumn("c", Types.IntegerType.get()).commit();
+    beforeAsWrite(() -> w[1].loadTable(ID).newFastAppend().appendFile(file("b")).commit());
     assertThatThrownBy(txn::commitTransaction).isInstanceOf(CommitFailedException.class);
 
     assertThat(reasons(w[0])).containsExactly(
-        Map.entry("whole: pinned (a catalog transaction's table)", 1L));
+        Map.entry("whole: commit once: a schema change", 1L));
     assertThat(rejectedInTheLog()).containsExactly(
-        Map.entry("whole: pinned (a catalog transaction's table)", 1L));
+        Map.entry("whole: commit once: a schema change", 1L));
   }
 
   @Test

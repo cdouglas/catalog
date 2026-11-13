@@ -123,85 +123,64 @@ JSON parsers are already in upstream Iceberg.
 **Trigger to revisit:** when a stats-maintaining workload shows up where
 the full-mode size penalty matters.
 
-### D12. A catalog transaction conflicts on each table's whole version
+### D12. A transaction's other updates conflict on the table's whole version
 
-A catalog transaction's record pins the version of each table it writes
-and, under serializable isolation, of each table it read. A commit that
-lands first on one of those tables bumps its version, and the
-transaction fails with `CommitFailedException` (design.md, conflict
-matrix). Any change counts, a property change included. The version a
-written table must still have is the one the transaction first read,
-not the one current when it commits: `BaseCatalogTransaction` passes it
-in the read set (with a null ref, under either isolation level), and
-`commitTransaction` fails if the table changed since, after checking the
-commit's requirements, which say more specifically what changed (Bug 70).
-This is the catalog's semantics, and it's stricter than Iceberg's:
-- The requirements `UpdateRequirements` derives for a table commit name
-  only the table's UUID, the heads of the branches it moves, and the
-  schema, spec and sort order it changes.
-- Iceberg's REST server retries a table commit whose requirements still
-  hold (`CatalogHandlers.commit`), so it lets a concurrent property
-  change through.
-- Iceberg's spec doesn't say whether a commit depends on the table's
-  properties.
+A catalog transaction's update of an inline table that adds snapshots and
+moves branches to them goes as a delta from the version the transaction first
+read, unpinned, and the catalog's conflict encoding judges it where the record
+lands, as it does a table commit's: it commits where a retry of the update
+would commit the same. An append to an inline-ML table merges onto a branch
+another writer moved; an inline-TM table's manifest list is a file built on
+the branch's old head, so there it merges only past changes that leave the
+branch alone (`TestLocalCatalogTransaction.aRacedAppendCommitsWhereARetryWould`).
+Iceberg's REST server fails such a transaction on the raced table's
+requirements.
 
-A table commit outside a catalog transaction need not conflict on the
-table's whole version: under the conflict encodings beyond `lamport`
-(SPEC.md §"Conflict Encodings"; design.md §"The same table, per conflict
-encoding", I12), replay merges its record onto a changed table where
-Iceberg's retry would commit the same, with no restaging: the record is an
-inline delta whose late-bound fields replay finalizes where it lands
-(SPEC_TM.md §"Late-bound fields"). A catalog transaction pins every table
-it writes (`UpdateTableInline.pinned`), so under every encoding it
-conflicts as this section says.
+Every other update of a table a transaction writes is pinned and applies only
+on the version the transaction first read: a pointer table's, one that goes as
+full metadata (a statistics change, D9; one past the inline size), and a
+schema, partition-spec or ref change, which Iceberg commits only on the
+version it read. Applying those to a changed version, checked only by the
+requirements Iceberg derives, as its REST server does, loses what the change
+did (Bug 70): another writer's property change that a schema update's name
+mapping rewrote, or a tag on a snapshot the transaction expired. Under
+serializable isolation a table the transaction only reads is pinned too (a
+read pin), between the commit's read and its landing; what it read (the
+branch's head) `BaseCatalogTransaction` checks before.
 
-A commit to any other table doesn't fail the transaction: the format's
-commit loop rebases a record whose actions still hold. Nothing above the
-catalog retries. `BaseCatalogTransaction` doesn't (its "TODO: should
-this be retryable?"), so a caller whose transaction failed runs it
-again.
+So there the catalog is stricter than Iceberg's REST semantics: a concurrent
+property change, or a commit to another branch, fails a transaction whose
+requirements still hold. The fork's `CatalogTransactionTests` names those
+cases (`conflictsOnTableVersions`: a pointer table's; and
+`conflictsOnTableVersionsForCommitOnceUpdates`: a branch the transaction
+creates, in every mode). Its failure cases race real conflicts, which every
+catalog rejects.
 
-The fork's `RESTCatalog` ignores the read set, written tables included:
-its server checks only the requirements.
+A transaction is not retried: `BaseCatalogTransaction` doesn't (its "TODO:
+should this be retryable?"), and a rejected delta is a real conflict. A
+caller whose transaction failed runs it again. The fork's `RESTCatalog`
+ignores the read set: its server checks only the requirements.
 
-`TestCatalogFaultProperties` checks that an acknowledged transaction's
-written tables are the versions it first read; with the check in
-`commitTransaction` disabled, it fails within about 1,200 tries.
-`TestCatalogRaceProperties` checks that a transaction whose table a
-racer changed fails (its racers run within the commit, so the
-commit loop's pin catches them too), and counts the transactions that
-fail although what Iceberg's isolation checks (the branches they read)
-held. In a 200,000-try run, 24 of the 8,469 racing transactions (0.28%)
-did.
+Deferred:
 
-**Deferred: a transaction's own witness.** Under a merging encoding, a
-transaction could conflict only where Iceberg's retry of it would fail,
-as a single-table commit does:
+- **Commit-once updates judged by what they change.** A ref change by the ref
+  and the snapshot it names, a schema change by the schema, through the
+  encodings' concern stamps (`TableChange`) rather than the whole version:
+  what REST's requirements check, without Bug 70's losses (the properties
+  concern catches the name mapping). The record would say an update is a
+  transaction's, so a table commit's stays pinned as Iceberg commits it.
+- **A read witness.** The record names what a serializable transaction read
+  of each table (the branches and their heads: `BaseCatalogTransaction`'s
+  read set), and replay checks that rather than the table's version: a
+  format change.
+- **The rebase oracle for transactions.** `TestRebaseProperties` lands table
+  commits after a window of commits they did not see; a transaction's deltas
+  are checked only by the race fuzzer's serial run and the fault fuzzer's
+  model, both of whose transactions append.
 
-- **The tables it writes:** its records go unpinned, as inline deltas
-  with their producers' footprints, which the catalog's encoding judges
-  where they land and `Landing` finalizes, as for a single-table commit.
-  A pointer-mode or full-mode write stays pinned.
-- **The tables it only read:** the record names what it read of each
-  (the branches and their heads: `BaseCatalogTransaction`'s read set,
-  which `unchangedSinceRead` checks), and replay checks that rather
-  than the table's version.
-
-That is a format change (the read set in the intention record), and the
-conflict-encoding oracle would need to cover it: `TestRebaseProperties`
-landing a transaction after a window of commits it did not see, against
-a reference that runs the transaction again. The alternative without a
-format change is to restage a failed transaction on a fresh read in
-`commitTransaction`, as `commitOnAFreshRead` and `CatalogHandlers.commit`
-do. Each attempt would check the read set, the commits' requirements
-(derived from the version the transaction read, Bug 23) and
-`TableMetadata.Builder`'s sequence-number and row-id checks again on its
-read, stop on a failed check, retry only a definite failure
-(`CommitStateUnknownException` propagates), and stage from scratch
-(`stageUpdate`, inline-ML lists included).
-
-**Trigger to revisit:** a workload whose multi-table transactions race
-other commits to their tables.
+**Trigger to revisit:** a workload whose transactions change refs, schemas or
+partition specs, or read under serializable isolation, while other commits
+race them.
 
 ### D13. `partition-vector` retries a validated commit that `concern-vector` merges
 

@@ -161,7 +161,14 @@ public class TestS3FileIOCatalogTransaction extends CatalogTransactionTests<File
 
   @Override
   protected boolean conflictsOnTableVersions() {
-    // a transaction conflicts on the whole version of each table it writes (errata D12)
+    // an inline table's snapshot changes are judged where they land; a pointer table's update
+    // applies only on the version the transaction first read (errata D12)
+    return !inlineTM();
+  }
+
+  @Override
+  protected boolean conflictsOnTableVersionsForCommitOnceUpdates() {
+    // a ref, schema or partition-spec change applies only on the version first read (errata D12)
     return true;
   }
 

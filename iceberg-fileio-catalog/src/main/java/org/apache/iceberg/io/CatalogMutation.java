@@ -88,6 +88,8 @@ public class CatalogMutation {
   // Tables whose inline update applies only on the version read, whatever the catalog's conflict
   // encoding (ProtoCodec.UpdateTableInlineAction.pinned).
   private final Set<TableIdentifier> pinned;
+  // The version a delta was built on, where not this mutation's read's (a catalog transaction's)
+  private final Map<TableIdentifier, Integer> deltaBases;
 
   /** A transaction staged on {@code base}, a read of the catalog's log. */
   public CatalogMutation(Replica<CatalogState> base) {
@@ -110,6 +112,7 @@ public class CatalogMutation {
     this.inlineTableUpdateCodecs = Maps.newHashMap();
     this.tableRenames = Maps.newHashMap();
     this.pinned = Sets.newHashSet();
+    this.deltaBases = Maps.newHashMap();
   }
 
   /** The read of the log this transaction is staged on, and commits on top of. */
@@ -442,13 +445,40 @@ public class CatalogMutation {
   }
 
   /**
-   * Makes the update of {@code table} apply only on the version this transaction read, whatever
-   * the catalog's conflict encoding: a catalog transaction may have read anything in a table it
-   * writes, which must be at the version it first read (errata D12). An update of a pointer table
-   * applies only there anyway.
+   * Makes the update of {@code table} apply only on the version this mutation read, whatever the
+   * catalog's conflict encoding: an update Iceberg commits only on the version it was built on (a
+   * schema, partition-spec or ref change), or a catalog transaction's update of a table that is
+   * not an inline delta, which must find the table as the transaction first read it (Bug 70). An
+   * update of a pointer table applies only there anyway.
    */
   public CatalogMutation pin(TableIdentifier table) {
     pinned.add(table);
+    return this;
+  }
+
+  /**
+   * Whether the update staged for {@code table} is an inline delta, which the catalog's conflict
+   * encoding judges where the record lands, rather than full metadata or a metadata file, which
+   * apply only on the version they were built on.
+   */
+  boolean stagedADelta(TableIdentifier table) {
+    return inlineTableDeltaUpdates.containsKey(table);
+  }
+
+  /**
+   * Makes the delta staged for {@code table} name {@code version} as the version it was built on,
+   * rather than the table's version in this mutation's read: a catalog transaction stages a table's
+   * updates on the version it first read, and the catalog's conflict encoding judges them from
+   * there. {@code version} is the table's at or before this mutation's read.
+   */
+  CatalogMutation builtOn(TableIdentifier table, int version) {
+    Preconditions.checkState(
+        inlineTableDeltaUpdates.containsKey(table), "No delta staged for %s", table);
+    Integer tblId = original.tableId(table);
+    Preconditions.checkArgument(
+        tblId != null && version <= original.tableVersion(tblId),
+        "Version %s of %s is not at or before the version read", version, table);
+    deltaBases.put(table, version);
     return this;
   }
 
@@ -677,7 +707,7 @@ public class CatalogMutation {
       byte[] deltaBytes = entry.getValue();
       Integer tblId = original.tableId(ident);
       if (tblId != null) {
-        int version = original.tableVersion(tblId);
+        int version = deltaBases.getOrDefault(ident, original.tableVersion(tblId));
         ProtoCodec.UpdateTableInlineAction update =
             ProtoCodec.UpdateTableInlineAction.delta(tblId, version, deltaBytes)
                 .bringingBack(inlineTableBroughtBack.getOrDefault(ident, List.of()));

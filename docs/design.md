@@ -527,9 +527,10 @@ many records conflict, never what a table holds:
    stamps that only grow.
 3. **Total**: it never throws; what it cannot decode, it coarsens.
 4. **Coarsens when blind**, to the Lamport witness, the version read: a
-   pointer table, full metadata, a read pin, a pinned update (a table a
-   catalog transaction writes, [errata.md](errata.md) §D12, or an update
-   Iceberg commits once), a record without the footprint it needs.
+   pointer table, full metadata, a read pin, a pinned update (a catalog
+   transaction's update of a table that is not an inline delta,
+   [errata.md](errata.md) §D12, or an update Iceberg commits once), a
+   record without the footprint it needs.
 5. **Merges exactly**: a record admitted on a changed table goes through
    `Landing`, which finalizes its late-bound fields as Iceberg's retry
    would ([SPEC_TM.md](SPEC_TM.md) §"Late-bound fields"), and an
@@ -606,10 +607,12 @@ What the matrix says:
    operation -- a namespace create, drop or property change, a table
    create, rename or drop -- which depends on nothing a concurrent change
    alters but existence, checked again on the fresh read (Bugs 47, 53,
-   54). A catalog transaction is the exception: it conflicts on the
-   whole version of each table it writes, as it first read it, or reads
-   under serializable isolation, and one that conflicts fails, for its
-   caller to run again ([errata.md](errata.md) §D12).
+   54). A catalog transaction is the exception: it is not restaged, so one
+   that conflicts fails, for its caller to run again. Its deltas of inline
+   tables are judged where they land, as a table commit's; any other update
+   of a table it writes conflicts on the table's whole version as it first
+   read it, and so does a table it reads under serializable isolation
+   ([errata.md](errata.md) §D12).
 
 ### The same table, per conflict encoding
 
@@ -667,8 +670,12 @@ What the per-encoding matrix says:
 4. Buckets can collide: ref names hash into 16 buckets and partitions
    into 64, so two branches or partitions that share a bucket conflict
    (a false positive, never a false merge).
-5. A catalog transaction pins every table it writes (D12), and conflicts
-   under every encoding as under `lamport`.
+5. A catalog transaction's update of an inline table that adds snapshots
+   and moves branches to them goes unpinned, as a delta from the version the
+   transaction first read, and each encoding judges it as a table commit's:
+   an append to an inline-ML table merges onto a moved branch. Any other
+   update of a table it writes is pinned (D12) and conflicts under every
+   encoding as under `lamport`.
 
 ## Late-Binding
 

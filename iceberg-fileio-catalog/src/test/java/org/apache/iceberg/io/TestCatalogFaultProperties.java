@@ -2031,12 +2031,14 @@ class TestCatalogFaultProperties {
             if (now == null || !now.uuid.equals(at.uuid)) {
               throw new IsolationViolation(level + ": " + id + " was replaced or dropped");
             }
-            // a table it wrote: any change since it first read it (errata D12); a table it only
-            // read, serializable: its main branch or, without one, its metadata
+            if (level == IsolationLevel.SNAPSHOT) {
+              // a table it wrote may have changed since: an inline table's appends are judged
+              // where the record lands (errata D12), and the model checks what they did
+              return;
+            }
+            // serializable: each table it loaded, its main branch or, without one, its metadata
             boolean unchanged =
-                at.appended
-                        || level == IsolationLevel.SERIALIZABLE
-                            && (at.snapshotId == null || now.snapshotId == null)
+                at.snapshotId == null || now.snapshotId == null
                     ? Objects.equals(at.metadataLocation, now.metadataLocation)
                     : Objects.equals(at.snapshotId, now.snapshotId);
             if (!unchanged) {

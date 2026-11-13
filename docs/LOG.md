@@ -832,8 +832,9 @@ is the caller's choice. The catalog restages namespace operations, renames,
 drops and table creates on a fresh read, up to Iceberg's default number of
 attempts (`LogCatalog.commitOnAFreshRead`, `dropTable`,
 `FileIOTableOperations.commitCreate`), and Iceberg re-applies a table commit.
-A catalog transaction is not restaged: it conflicts on the whole version of
-each table it pins ([errata.md](errata.md) §D12).
+A catalog transaction is not restaged: its deltas are judged where they land,
+and each table it pins conflicts on its whole version ([errata.md](errata.md)
+§D12).
 
 ### Tracing
 

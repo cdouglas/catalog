@@ -34,9 +34,12 @@ is implemented and tested, and the others are mapped on paper.
 
 A research prototype. The on-disk format can still change without a
 migration path. Catalog transactions are serializable across tables and
-namespaces, and stricter than Iceberg's: a transaction fails if any table
-it writes changed after it first read it, a property change included
-([docs/errata.md](docs/errata.md) D12). On real S3 (general-purpose and
+namespaces. A transaction's appends to inline tables are judged where they
+land and commit wherever a retry of them would, which Iceberg's REST
+requirements refuse after a concurrent commit to the branch; its other
+updates (a pointer table's, a schema, partition-spec or ref change) fail if
+the table changed after the transaction first read it, a property change
+included ([docs/errata.md](docs/errata.md) D12). On real S3 (general-purpose and
 Express One Zone buckets), GCS (standard and zonal buckets) and ADLS
 Gen2, it passes Iceberg's `CatalogTests` and `CatalogTransactionTests` in
 every commit and inline mode each store supports

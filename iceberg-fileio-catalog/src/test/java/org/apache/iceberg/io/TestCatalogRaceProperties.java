@@ -287,21 +287,16 @@ class TestCatalogRaceProperties {
     }
     String raceState = state(io);
 
-    // A transaction whose reads a racer changed must fail, and so must one whose table a racer
-    // changed in any way, a property change included: a transaction conflicts on the whole
-    // version of each table it writes (errata D12).
+    // A transaction whose reads a racer changed must fail. One whose table a racer changed may
+    // commit: an inline table's append is judged where the record lands, and commits where a
+    // retry of it would (errata D12), which the serial run below checks; a pointer table's update
+    // applies only on the version the transaction first read.
     boolean txnFailed = a.kind == Kind.CATALOG_TXN && before > 0 && !raceA.startsWith("ok");
     if (a.kind == Kind.CATALOG_TXN && before > 0) {
       Statistics.label("transaction racing")
           .collect((changedItsReads[0] ? "reads changed, " : "reads held, ")
               + (changedItsTable[0] ? "table changed, " : "table held, ")
               + (txnFailed ? "failed" : "committed"));
-      if (changedItsTable[0] && !txnFailed) {
-        throw new AssertionError(String.format(
-            "the transaction %s committed, but the racers before its writes changed the table it "
-                + "appends to: %s, %s%nsetup %s",
-            a, racers.get(0), before > 1 ? racers.get(1) : "", setup));
-      }
       if (changedItsReads[0] && !txnFailed) {
         throw new AssertionError(String.format(
             "the transaction %s committed, but the racers before its writes changed what it "

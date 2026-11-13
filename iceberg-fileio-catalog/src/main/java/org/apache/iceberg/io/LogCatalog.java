@@ -2201,8 +2201,8 @@ public class LogCatalog extends BaseMetastoreCatalog
     // Each branch the transaction read must be as it read it, from then until the commit
     // lands. BaseCatalogTransaction checked that before calling, but a commit may have landed
     // since; check again on the state this commit builds on, and readTable makes the commit
-    // fail if the table changes before it lands. Each table it writes (a null ref) must be the
-    // version it first read, checked with the table's commit below (errata D12).
+    // fail if the table changes before it lands. Each table it writes (a null ref) comes with
+    // the version it first read, on which its updates were staged.
     Map<TableIdentifier, TableMetadata> written = new HashMap<>();
     for (Map.Entry<BaseCatalogTransaction.TableRef, TableMetadata> read : reads.entrySet()) {
       TableIdentifier readTable = read.getKey().identifier();
@@ -2227,10 +2227,15 @@ public class LogCatalog extends BaseMetastoreCatalog
       if (currentMetadata == null) {
         throw new NoSuchTableException("Table does not exist: %s", tableId);
       }
-      commit.requirements().forEach(req -> req.validate(currentMetadata));
-      // after the requirements, which say more specifically what changed; stageUpdate pins the
-      // version until the commit lands
       TableMetadata firstRead = written.get(tableId);
+      if (firstRead != null && stageJudged(ops, newCatalog, current, firstRead, commit)) {
+        continue;
+      }
+      commit.requirements().forEach(req -> req.validate(currentMetadata));
+      // Any other update of a table the transaction wrote applies only on the version it first
+      // read: checked after the requirements, which say more specifically what changed, and
+      // pinned until the commit lands. Applying it to a version changed since, checked only by
+      // the requirements, lost what the change did (Bug 70).
       if (firstRead != null
           && !BaseCatalogTransaction.unchangedSinceRead(null, firstRead, currentMetadata)) {
         throw new CommitFailedException(
@@ -2246,12 +2251,80 @@ public class LogCatalog extends BaseMetastoreCatalog
       checkAddedSnapshots(tableId, currentMetadata, newMetadata, ops.io());
       // The table's new inline-ML snapshots hold their manifest lists.
       ops.stageUpdate(newCatalog, currentMetadata, newMetadata);
-      // Whatever the catalog's conflict encoding, the update applies only on the version it read.
       newCatalog.pin(tableId);
     }
-    // Not retried: a transaction conflicts on the whole version of each table it pins, so a
-    // conflict fails it (errata D12).
+    // Not retried: a pinned table's change, or a delta's real conflict, fails it (errata D12).
     newCatalog.commit(log);
+  }
+
+  /**
+   * Stages {@code commit}, the updates a transaction staged on {@code firstRead}, as an inline
+   * delta from that version, which the catalog's conflict encoding judges where the record lands:
+   * on a table changed since, it commits them only where a retry of them would commit the same,
+   * as it does a table commit's (errata D12). That takes an inline table and updates Iceberg
+   * would retry: snapshots and the moves of their branches. Returns false, staging nothing, for
+   * any other: a schema, partition-spec or ref change, which Iceberg commits only on the version
+   * it read, and an update that goes as full metadata or a metadata file, which applies only on
+   * the version it was built on.
+   */
+  private boolean stageJudged(
+      FileIOTableOperations ops,
+      CatalogMutation mut,
+      Replica<CatalogState> current,
+      TableMetadata firstRead,
+      TableCommit commit) {
+    if (FileIOTableOperations.commitsOnce(commit.updates())) {
+      return false;
+    }
+    if (!java.util.Objects.equals(ops.current().uuid(), firstRead.uuid())) {
+      throw new CommitFailedException(
+          "Cannot commit transaction: table %s was replaced since the transaction read it",
+          commit.identifier());
+    }
+    // The version it read, which the record names as its base: an inline table's
+    int[] read = inlineVersion(firstRead.metadataFileLocation());
+    Integer tblId = current.state().tableId(commit.identifier());
+    if (read == null || tblId == null || read[0] != tblId) {
+      return false;
+    }
+    TableMetadata.Builder builder = TableMetadata.buildFrom(firstRead);
+    commit.updates().forEach(update -> update.applyTo(builder));
+    TableMetadata intended = builder.build();
+    if (intended.changes().isEmpty()) {
+      return true;
+    }
+    // Staged once to learn the form it takes, with no file written
+    CatalogMutation trial = new CatalogMutation(current);
+    if (!ops.stageUpdate(trial, firstRead, intended, false)
+        || !trial.stagedADelta(commit.identifier())) {
+      return false;
+    }
+    ops.stageUpdate(mut, firstRead, intended);
+    mut.builtOn(commit.identifier(), read[1]);
+    return true;
+  }
+
+  /**
+   * The table id and version an inline table's metadata location names ({@code
+   * inline://<table>#<id>.<version>}); null for any other location, a metadata file's.
+   */
+  static int[] inlineVersion(String location) {
+    if (location == null || !location.startsWith("inline://")) {
+      return null;
+    }
+    int hash = location.lastIndexOf('#');
+    int dot = location.lastIndexOf('.');
+    if (hash < 0 || dot < hash) {
+      return null;
+    }
+    try {
+      return new int[] {
+        Integer.parseInt(location.substring(hash + 1, dot)),
+        Integer.parseInt(location.substring(dot + 1))
+      };
+    } catch (NumberFormatException e) {
+      return null;
+    }
   }
 
   /**

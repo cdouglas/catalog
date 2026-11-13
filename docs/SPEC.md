@@ -486,8 +486,9 @@ first.
   than the one its writer read only if it is an unpinned inline delta
   whose late-bound fields can be finalized there ([SPEC_TM.md](SPEC_TM.md)
   §"Late-bound fields"). A metadata location, full metadata, a read pin
-  and a pinned update (a table a catalog transaction writes, errata D12)
-  apply only on that version.
+  and a pinned update (one Iceberg commits once, or a catalog transaction's
+  update of a table that is not an inline delta, errata D12) apply only on
+  that version.
 - The table's version becomes its version where the record lands, plus
   one.
 - An encoding is deterministic (S1), stable (S2: a rejection stays a
@@ -589,9 +590,13 @@ landed commit any other way loses the files its snapshot references (I10).
 The catalog restages namespace operations, renames, drops and table creates
 on a fresh read and retries their `CommitFailedException`, up to Iceberg's
 default number of attempts (`LogCatalog.commitOnAFreshRead`, `dropTable`,
-`FileIOTableOperations.commitCreate`). `commitTransaction` does not retry: a
-catalog transaction conflicts on the whole version of each table it pins, a
-table it writes from when it first read it ([errata.md](errata.md) §D12).
+`FileIOTableOperations.commitCreate`). `commitTransaction` does not retry. A
+catalog transaction sends its update of an inline table that adds snapshots
+and moves branches to them as a delta from the version it first read, which
+the encoding judges where the record lands and the commit loop carries over
+lost races, so its rejection is a real conflict; it pins any other update of
+a table it writes, at the version it first read, and under serializable
+isolation each table it reads ([errata.md](errata.md) §D12).
 
 A load reads the catalog, then a pointer table's metadata file, and a drop
 with purge or a commit that deletes old metadata files
