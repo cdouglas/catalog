@@ -1078,15 +1078,14 @@ canary fails and the upgrader knows to delete the workaround.
 
 **Residual gaps guarded by canaries:**
 
-- **versitygw** (replaced MinIO, whose images stopped being published and
-  were removed from Docker Hub in 2026-09): no S3 directory-bucket
-  semantics; `writeOffsetBytes` is accepted and ignored (the object is
-  overwritten). APPEND-mode commits (`maxAppendCount > 0`) skip on
-  versitygw; `VersityGwEmulatorCanaries` asserts the gap, and positive
-  canaries check that `If-Match` / `If-None-Match: *` are enforced and that
-  concurrent conditional PUTs have exactly one winner. No S3 emulator
-  implements S3 Express append (checked 2026-10: versitygw, SeaweedFS and
-  LocalStack ignore or lack it; RustFS rejects it with 501).
+- **versitygw**: no S3 directory-bucket semantics; `writeOffsetBytes` is
+  accepted and ignored (the object is overwritten). APPEND-mode commits
+  (`maxAppendCount > 0`) skip on versitygw; `VersityGwEmulatorCanaries`
+  asserts the gap, and positive canaries check that `If-Match` /
+  `If-None-Match: *` are enforced and that concurrent conditional PUTs have
+  exactly one winner. No open-source S3 emulator implements S3 Express
+  append (checked 2026-10: versitygw, SeaweedFS and LocalStack ignore or lack
+  it; RustFS rejects it with 501); AWS's own does, below.
 - **Azurite** (3.37.0): no Data Lake endpoint. `ADLSFileIO` keeps the
   catalog file as an Append Blob: APPEND is one conditional
   `AppendBlock`, and CAS stages a temp Append Blob and renames it onto
@@ -1101,19 +1100,43 @@ canary fails and the upgrader knows to delete the workaround.
   (`AZURE_STORAGE_ACCOUNT` etc., see INTEGRATION_TESTING.md).
 - **fake-gcs-server** (1.56.1): standard-bucket CAS path works.
   `GCSFileIO` writes each CAS as one multipart upload (`storage.create`
-  with `ifGenerationMatch`), which fake-gcs-server has always enforced.
-  Before 1.55.0 it ignored `ifGenerationMatch` on resumable uploads
-  (`BlobWriteSession`, `WriteChannel`), the path `GCSFileIO` used until
-  iceberg `8f94c5100` (`e0bc582f7` before the 1.12.0 rebase, on tag
-  `atomicio-1.10.1`), so the six conflict tests in each `GCSCatalogTest*`
-  class failed on the emulator. `FakeGcsEmulatorCanaries` checks
-  `ifGenerationMatch` on both kinds of upload. Zonal (Rapid) buckets take
+  with `ifGenerationMatch`), which fake-gcs-server enforces;
+  `FakeGcsEmulatorCanaries` checks `ifGenerationMatch` on multipart and
+  resumable uploads. Zonal (Rapid) buckets take
   a single XML API PUT for CAS and an appendable upload for regular
   writes (manifests, data files), since they reject resumable uploads;
   fake-gcs-server has no zonal semantics, so those paths are covered by
   iceberg's `GcsRapidCanaries` and `GcsFileIOAtomicRapidTest` against a
   real Rapid bucket (`RAPID_BUCKET`), and by running these suites with
   `GCS_TEST_BUCKET` set to one.
+
+**The AWS Emulator, tried and not adopted.** AWS's own emulator
+(github.com/aws/aws-emulator, v1.0.338, tried 2026-11-12) implements
+directory buckets, S3 Express sessions and append (`writeOffsetBytes`,
+checked with `If-Match`), and ranged GETs pinned by `If-Match`. The fork's
+`S3ExpressFileIOAtomicTest` and `S3StandardFileIOAtomicTest` pass on it, and
+so do all twelve `TestS3*` suites, the APPEND ones included (876 tests, no
+failures; the 80 skips are the suites' own). It is not mature enough to
+adopt:
+
+- It is young (first released 2026-09, several releases a day), ships as a
+  1 GB native package with no container image, sends telemetry unless
+  started with `--telemetry off`, and makes a new TLS CA on every start, so a
+  JVM needs a trust store made after each start.
+- It caps what it holds (1,000 objects and 64 MiB a bucket, 128 MiB in all,
+  256 open S3 Express sessions; its own open issue 20261111T165323Z), so each
+  suite needs an emulator and bucket of its own, and the catalog suites, which
+  make a client per FileIO, need session auth off.
+- It answers writes one at a time, so it never returns 409
+  `ConditionalRequestConflict`, and it never refuses an append past 10,000
+  parts (`TooManyParts`): the S3 error paths the commit loop depends on stay
+  covered only by `InMemoryAtomicFileIO` and real cloud. The catalog's APPEND
+  logic already runs locally on `InMemoryAtomicFileIO` (`TestLocalCatalog`,
+  the fuzzers), so the suites it unskips add the S3 Express wire path alone.
+
+**Trigger to revisit:** a container image and its caps lifted; it could then
+replace versitygw for the S3 suites, and pre-check the fork's S3 contract
+before a real-cloud run.
 
 ### T4. `testRegisterTable` (inline) needs a register-from-bytes API
 
