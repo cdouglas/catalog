@@ -323,6 +323,10 @@ case $cmd in
     [ -e $W ] && die "$W exists: names are one run each in a container"
     [ -n "$(ls -A $O 2>/dev/null)" ] && die "$O holds an earlier run: choose another name"
     mkdir -p $W $O
+    # The worktrees, their builds and surefire's temporary files are the container's own layer
+    # (round p9-r0's: 12 GB of /work and 8 GB of /tmp, about 1.7 GB on havoc's compressed disk),
+    # kept with the exited container; what a run leaves is in /out, so it deletes them as it ends
+    trap 'rm -rf /work /tmp/surefire-*' EXIT
     echo "$cmd fork=$FORK commit=$(git -C $SRC rev-parse --short $COMMIT) jobs=${JOBS:-all} heap=$HEAP" \
       "shrinking=$SHRINKING smoke=${SMOKE:-0} cpus=$(nproc) mem=$(free -g | awk '/Mem:/ {print $2}')G" \
       "limit=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo unknown) $(date -Is)" > $O/run.txt

@@ -70,7 +70,8 @@ job.
 
 On rootful Docker the results are root's. Rootless Docker: the daemon is a user service, which stops at logout unless the user lingers
 (`loginctl enable-linger`); `run.sh` warns. Containers are kept after they exit (`run.sh stop
-<name>` removes one); a name is one run (an earlier run's results are never overwritten).
+<name>` removes one), but a run deletes its worktrees, their builds and surefire's temporary
+files as it ends, so an exited container holds little besides its image; a name is one run (an earlier run's results are never overwritten).
 
 ## What runs
 
