@@ -64,7 +64,7 @@ revisit:** any plan to drop the iceberg fork or upstream the changes.
 `FileIOCatalog` commits multi-table transactions through the fork's
 `SupportsCatalogTransactions` and `BaseCatalogTransaction`, a prototype
 of a catalog-transaction API that Apache Iceberg does not have, which the
-fork changes in three ways:
+fork changes in four ways:
 
 - `commitTransaction(Map<BaseCatalogTransaction.TableRef, TableMetadata>
   reads, List<TableCommit> commits)` takes, for serializable isolation,
@@ -83,11 +83,15 @@ fork changes in three ways:
   it removes the catalog's name wherever it occurs and splits the rest at
   dots, so it looks up the wrong identifier for a table whose namespace
   repeats the catalog's name, or has a dot in a level (Bug 59).
+- `BaseCatalogTransaction`'s tables stage partition statistics in the
+  transaction, as they do every other update. The prototype's commit
+  them at once, outside it, so a transaction that fails leaves them in
+  the table (Bug 91).
 
 So this catalog is not a drop-in replacement in an existing Iceberg
 deployment: anything that implements or calls `commitTransaction` must
 use the new signature, and a catalog transaction run against the
-prototype's `BaseCatalogTransaction` keeps all three bugs. `RESTCatalog`
+prototype's `BaseCatalogTransaction` keeps all four bugs. `RESTCatalog`
 accepts the read set but does not send it, so a REST server sees only the
 table commits' requirements and keeps the race Bug 21 closes here.
 

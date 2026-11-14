@@ -347,6 +347,7 @@ final class TableScript {
           Table target = txn != null ? txn.table() : catalogTxn.asCatalog().loadTable(ID);
           Table second = txn != null ? target : catalogTxn.asCatalog().loadTable(OTHER);
           int staged = 0;
+          long tried = commitsTried();
           inTransaction = true;
           try {
             for (int i = 0; i < group.size(); i++) {
@@ -364,6 +365,11 @@ final class TableScript {
             }
           } finally {
             inTransaction = false;
+          }
+          // A member's update is staged in the transaction, so it commits with it (Bug 91)
+          if (commitsTried() != tried) {
+            throw new AssertionError(
+                "a member of " + group + " committed outside its transaction\n" + trace);
           }
           if (staged == 0) {
             throw new IllegalStateException("no member staged");
@@ -391,6 +397,15 @@ final class TableScript {
         }
       }
       return null;
+    }
+
+    /** The commits this runner's catalog has tried, landed or not; 0 for a catalog not a log's. */
+    private long commitsTried() {
+      if (!(catalog instanceof LogCatalog)) {
+        return 0;
+      }
+      CatalogLog.CommitCounts counts = ((LogCatalog) catalog).log().counts();
+      return counts.committed() + counts.conflicts() + counts.rejected() + counts.unknown();
     }
 
     private void run(Cmd cmd, Table target) {
