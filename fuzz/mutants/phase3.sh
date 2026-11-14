@@ -12,8 +12,8 @@ EQUIVALENT="retention"
 ORACLES=TestRebaseProperties,TestLamportMinusPropertiesEncoding,TestConcernVectorEncoding,TestBlindAppendEncoding,TestMultiWriterProperties
 
 prepare() {
-  tries $1/$T/TestRebaseProperties.java 800
-  tries $1/$T/ConflictEncodingContract.java 400
+  tries $1/$T/TestRebaseProperties.java each 800
+  tries $1/$T/ConflictEncodingContract.java each 400
 }
 
 mutant() { # name main-dir test-dir

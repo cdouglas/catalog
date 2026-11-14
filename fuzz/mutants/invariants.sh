@@ -17,7 +17,7 @@ EQUIVALENT="reusestale"
 ORACLES=TestCatalogFaultProperties,TestInlineDifferentialProperties
 
 prepare() {
-  tries $1/$T/TestCatalogFaultProperties.java 1500
+  tries $1/$T/TestCatalogFaultProperties.java each 1500
   tries $1/$T/TestInlineDifferentialProperties.java 600
 }
 

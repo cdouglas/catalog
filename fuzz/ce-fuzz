@@ -31,7 +31,8 @@
 # A round's jobs (tries per @Property, in the order the class declares them):
 #   faultA1-2  TestCatalogFaultProperties.catalogMatchesModel, 30,000
 #   faultB1-2  TestCatalogFaultProperties.faultyStorageNeverMisreportsACommit, 30,000
-#   race       TestCatalogRaceProperties, 200,000
+#   race       TestCatalogRaceProperties: aRaceEndsAsASerialRun 200,000,
+#              aTransactionRaceEndsAsASerialRun 10,000
 #   mw         spec.TestMultiWriterProperties, 300,000 each
 #   proto      TestMemoryCommitProtocol and TestAtomicFileCommitProtocol, 300,000 each
 #   rebase     TestRebaseProperties, 3,000 each (REBASE_TRIES: each in turn)
@@ -44,7 +45,13 @@ T=iceberg-fileio-catalog/src/test/java/org/apache/iceberg/io
 HEAP=${HEAP:-4g}
 SHRINKING=${SHRINKING:-OFF}
 
-die() { echo "ce-fuzz: $*" >&2; exit 2; }
+# die <message>: to stderr, and to the run's summary once it has one (a container's log is
+# gone with the container)
+die() {
+  echo "ce-fuzz: $*" >&2
+  [ -n "${O:-}" ] && [ -d "$O" ] && echo "ce-fuzz: $*" >> "$O/summary.txt"
+  exit 2
+}
 
 clone() {
   [ -f $BUNDLE ] || die "no bundle at $BUNDLE (mount one: -v <file>:$BUNDLE:ro)"
@@ -64,17 +71,31 @@ worktree() {
   git -C $SRC worktree add -q --detach "$1" "$2" || die "cannot check out $2"
 }
 
-# tries <file> <tries...>: sets each @Property's tries, in order (one value: all of them)
+# tries <file> <tries...> | tries <file> each <tries>: sets each @Property's tries, in the order
+# the class declares them, or every one's to the same. The counts must match the file's
+# properties, one each, and every property must say @Property(tries = N): a property added to a
+# fuzzed class stops the run here until its job names its count, rather than inherit one sized
+# for another (round p8-r0's race job ran a 200-try property 200,000 times, for days)
 tries() {
-  [ "${SMOKE:-0}" = 1 ] && set -- "$1" 3
-  python3 - "$@" <<'PY'
-import sys, re
-f = sys.argv[1]; tries = sys.argv[2:]
-s = open(f).read(); n = [0]
-def sub(m):
-    t = tries[min(n[0], len(tries) - 1)]; n[0] += 1; return '@Property(tries = %s)' % t
-s = re.sub(r'@Property\(tries = \d+\)', sub, s); open(f, 'w').write(s)
+  [ "${SMOKE:-0}" = 1 ] && set -- "$1" each 3
+  local err
+  err=$(python3 - "$@" 2>&1 <<'PY'
+import re, sys
+f, args = sys.argv[1], sys.argv[2:]
+s = open(f).read()
+props = len(re.findall(r'@Property\b', s))
+found = len(re.findall(r'@Property\(tries = \d+\)', s))
+if found != props:
+    sys.exit('%s: %d of its %d properties say @Property(tries = N)' % (f, found, props))
+counts = [args[1]] * props if len(args) == 2 and args[0] == 'each' else args
+if len(counts) != props or not all(c.isdigit() for c in counts):
+    sys.exit('%s has %d properties; the job gives "%s": one count per property, in order, '
+             'or "each N"' % (f, props, ' '.join(args)))
+it = iter(counts)
+open(f, 'w').write(re.sub(r'@Property\(tries = \d+\)',
+                          lambda m: '@Property(tries = %s)' % next(it), s))
 PY
+  ) || die "tries: $err"
 }
 
 # mutate <file> <old> <new>: replaces the one occurrence of <old>
@@ -159,14 +180,17 @@ setup() {
   case $1 in
     faultA*) tries $2/$T/TestCatalogFaultProperties.java 30000 1 ;;
     faultB*) tries $2/$T/TestCatalogFaultProperties.java 1 30000 ;;
-    race) tries $2/$T/TestCatalogRaceProperties.java 200000 ;;
-    mw) tries $2/$T/spec/TestMultiWriterProperties.java 300000 ;;
+    race) tries $2/$T/TestCatalogRaceProperties.java 200000 10000 ;;
+    mw) tries $2/$T/spec/TestMultiWriterProperties.java each 300000 ;;
     proto)
       tries $2/intentlog-memory/src/test/java/org/intentlog/memory/TestMemoryCommitProtocol.java 300000
       tries $2/intentlog-fileio/src/test/java/org/intentlog/fileio/TestAtomicFileCommitProtocol.java 300000 ;;
     azure) tries $2/intentlog-azure/src/test/java/org/intentlog/azure/TestAzureCommitProtocol.java 1000000 ;;
-    rebase) tries $2/$T/TestRebaseProperties.java ${REBASE_TRIES:-3000} ;;
-    contract) tries $2/$T/ConflictEncodingContract.java 2000 ;;
+    rebase)
+      # shellcheck disable=SC2206
+      local r=(${REBASE_TRIES:-3000}); [ ${#r[@]} = 1 ] && r=(each "${r[0]}")
+      tries $2/$T/TestRebaseProperties.java "${r[@]}" ;;
+    contract) tries $2/$T/ConflictEncodingContract.java each 2000 ;;
     diff)
       tries $2/$T/TestInlineDifferentialProperties.java 3500
       tries $2/$T/TestInlineDeltaProperties.java 15000 ;;

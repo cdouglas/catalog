@@ -76,7 +76,9 @@ On rootful Docker the results are root's. Rootless Docker: the daemon is a user 
 
 `ce-fuzz` (the image's entrypoint) clones the bundle, checks out a worktree per job at the
 commit, sets each property's tries (as the phase-exit rounds do: `ce-fuzz` with no arguments
-lists them), and runs `mvn -o test -Dtest=...` in each, against `/opt/m2/forks/<fork>` chained
+lists them; a job names one count per property of its class, or `each N`, and a class whose
+properties don't match its job's counts stops the run at setup, so a property added to a fuzzed
+class never inherits a count sized for another), and runs `mvn -o test -Dtest=...` in each, against `/opt/m2/forks/<fork>` chained
 to `/opt/m2/base` (Maven 3.9's `maven.repo.local.tail`). Generation is random
 (`jqwik.generation.default`) unless a property asks otherwise: jqwik multiplies its parameters'
 exhaustive counts unchecked, and at a job's tries a large space whose product wraps negative was
