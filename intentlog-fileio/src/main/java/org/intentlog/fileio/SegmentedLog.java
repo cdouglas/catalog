@@ -704,7 +704,17 @@ public final class SegmentedLog implements SharedLog {
       } catch (RuntimeException e) {
         // lost (a conflict), or of unknown outcome: the catalog object says
         Cat fresh = existing();
-        if (fresh.seg(o) != null || fresh.last().ordinal() + 1 != o) {
+        Seg won = fresh.seg(o);
+        if (won != null && !won.name().equals(name)) {
+          // another's Install of o landed, so no Install can name this blob: delete it, rather
+          // than leave it to a sweep (one that cannot list leaves it for good)
+          try {
+            store.delete(path(name));
+          } catch (RuntimeException deleteFailed) {
+            // the sweep deletes it, once it can
+          }
+        }
+        if (won != null || fresh.last().ordinal() + 1 != o) {
           return fresh;
         }
         c = fresh; // a checkpoint changed the object: append again from it

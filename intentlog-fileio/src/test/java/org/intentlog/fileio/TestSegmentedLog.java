@@ -196,6 +196,24 @@ class TestSegmentedLog {
         "segs/seg-00000000000000000001-ffffffffffffffff");
   }
 
+  /**
+   * An installer whose Install lost to another's of the same ordinal deletes the blob it created:
+   * no Install can name it, and a sweep that cannot list would leave it.
+   */
+  @Test
+  void anInstallThatLostDeletesItsBlob() {
+    SegmentedLog writer = created(1);
+    SegmentedLog stale = log(1);
+    stale.read(); // knows segment 0 alone
+    writer.readThrough(writer.append(record(), null), Duration.ZERO); // ends 0, installs 1 ahead
+    stale.readThrough(stale.append(record(), null), Duration.ZERO); // void in 0; loses Install 1
+    LogView view = log(1).read();
+    SegmentedLog.Cat cat = SegmentedLog.parse(AtomicFileLog.decode(io.bytes(LOCATION)));
+    List<String> named = cat.segs().stream().map(seg -> "segs/" + seg.name()).toList();
+    assertThat(store.names()).containsExactlyInAnyOrderElementsOf(named);
+    assertThat(view.records()).hasSize(2);
+  }
+
   @Test
   void aLimitPastTheStoresBlocksIsRefused() {
     assertThatThrownBy(() -> log(9)).isInstanceOf(IllegalArgumentException.class)
