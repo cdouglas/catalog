@@ -679,7 +679,7 @@ class TestSharedLogRuntime {
       @Override
       public LogView readThrough(Receipt receipt, Duration wait) {
         if (receipt == null) {
-          throw new org.intentlog.LogConflictException("The append is void", null);
+          throw new org.intentlog.LogVoidException("The append is void", null);
         }
         return log.readThrough(receipt, wait);
       }
@@ -745,7 +745,7 @@ class TestSharedLogRuntime {
       @Override
       public LogView readThrough(Receipt receipt, Duration wait) {
         if (receipt == null) {
-          throw new org.intentlog.LogConflictException("The append is void", null);
+          throw new org.intentlog.LogVoidException("The append is void", null);
         }
         return log.readThrough(receipt, wait);
       }
@@ -777,5 +777,55 @@ class TestSharedLogRuntime {
     new LogRuntime<>(voiding, MACHINE, config(1_000L, NEVER)).compact();
     assertThat(voided[0]).isTrue();
     assertThat(log.checkpoints()).hasSize(2);
+  }
+
+  /**
+   * A commit whose every send lands void is rejected as exhausted, not left unknown: a void append
+   * is in no view of the log, now or later, so nothing is left to resolve.
+   */
+  @Test
+  void aCommitWhoseSendsAllLandVoidIsExhausted() {
+    Replica<State> base = created();
+    SharedLog voiding = new SharedLog() {
+      @Override
+      public Capabilities capabilities() {
+        return log.capabilities();
+      }
+
+      @Override
+      public LogView read() {
+        return log.read();
+      }
+
+      @Override
+      public LogView readAfter(LogTail since) {
+        return log.readAfter(since);
+      }
+
+      @Override
+      public LogView readThrough(Receipt receipt, Duration wait) {
+        throw new org.intentlog.LogVoidException("The append is void", null);
+      }
+
+      @Override
+      public LogTail probe() {
+        return log.probe();
+      }
+
+      @Override
+      public Receipt append(byte[] record, LogTail expected) {
+        return null;
+      }
+
+      @Override
+      public void putCheckpoint(LogTail through, byte[] checkpoint) {
+        log.putCheckpoint(through, checkpoint);
+      }
+    };
+    LogRuntime<State, EntityVersionsMachine.Builder, Txn> runtime =
+        new LogRuntime<>(voiding, MACHINE, config(NO_GC, NEVER));
+    assertThatThrownBy(() -> runtime.commit(base, txn(base, "a", Set.of(), Set.of("x"))))
+        .isInstanceOfSatisfying(CommitRejectedException.class, e ->
+            assertThat(e.reason()).isEqualTo(CommitRejectedException.Reason.EXHAUSTED));
   }
 }

@@ -635,13 +635,16 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
       Receipt receipt = sendThrottled(() -> log.append(record, null));
       try {
         return log.readThrough(receipt, config.visibilityWait());
-      } catch (LogConflictException e) {
-        if (attempt >= config.maxThrottleAttempts()) {
+      } catch (LogVoidException e) {
+        if (attempt >= MAX_VOID_SENDS) {
           throw e;
         }
       }
     }
   }
+
+  /** How many times a compaction sends a GC record or PageOut that lands void. */
+  static final int MAX_VOID_SENDS = 16;
 
   private Receipt sendThrottled(Supplier<Receipt> send) {
     long backoffMs = config.throttleMinWaitMs();
@@ -1469,8 +1472,11 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
               continue;
             } catch (LogConflictException e) {
               CommitTrace.event(CommitTrace.Kind.LOST, 0, 0);
-              unresolved = e;
-              lostAt(at);
+              if (!(e instanceof LogVoidException)) {
+                // a failed condition may follow a write that landed; a void append landed nowhere
+                unresolved = e;
+                lostAt(at);
+              }
               raceBackoff(e);
             }
             // Another writer appended first. With tail reads, on a log that replaces itself (one
@@ -1684,8 +1690,8 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
      * running out of retries leaves the outcome unknown in the same way, so it is an {@link
      * AmbiguousWrite}. An interrupt during the backoff stops the commit with its outcome unknown.
      * The protocol's conflict and full signals propagate, and so does a read back that finds the
-     * append void (a conflict: a segmented log's append past its segment's end); any other failure
-     * of the write, or of reading back what it wrote, is an {@link AmbiguousWrite}.
+     * append void ({@link LogVoidException}: a segmented log's append past its segment's end); any
+     * other failure of the write, or of reading back what it wrote, is an {@link AmbiguousWrite}.
      */
     private Replayed write(Supplier<Receipt> send, boolean unconditional) {
       long backoffMs = config.throttleMinWaitMs();
@@ -1726,9 +1732,14 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
         try {
           written =
               replay(log.readThrough(receipt, config.visibilityWait()), id, base.logId(), current);
-        } catch (LogConflictException e) {
+        } catch (LogVoidException e) {
           // The append is void: it landed past the end of the segment it went to, so it is not in
-          // the log and no later write can put it there (docs/LOG_SEGMENTS.md D4). A lost race.
+          // the log and no later write can put it there (docs/LOG_SEGMENTS.md D4). A lost race,
+          // unless a throttled send of it before may have landed where the log holds it.
+          if (lastThrottle != null) {
+            e.addSuppressed(lastThrottle);
+            throw new AmbiguousWrite(e);
+          }
           throw e;
         } catch (RuntimeException e) {
           throw new AmbiguousWrite(e);
