@@ -59,47 +59,35 @@ a parser-level hook: detect the
 pool entries, and construct `InlineSnapshot` directly. **Trigger to
 revisit:** any plan to drop the iceberg fork or upstream the changes.
 
-### S2. Catalog transactions use a forked `SupportsCatalogTransactions`
+### S2. Catalog transactions use an API Iceberg does not have
 
-`FileIOCatalog` commits multi-table transactions through the fork's
-`SupportsCatalogTransactions` and `BaseCatalogTransaction`, a prototype
-of a catalog-transaction API that Apache Iceberg does not have, which the
-fork changes in four ways:
+`FileIOCatalog` commits multi-table transactions through `SupportsCatalogTransactions`,
+`CatalogTransaction` and `BaseCatalogTransaction`, a catalog-transaction API that Apache Iceberg
+does not have, which `core-perf` (the Iceberg every catalog in catalog-bench runs) holds, so
+`JdbcCatalog` and `RESTCatalog` implement it too (docs/CATALOG_TRANSACTIONS.md). It grew from
+upstream's prototype (apache/iceberg#6948, closed unmerged) and differs from it:
 
-- `commitTransaction(Map<BaseCatalogTransaction.TableRef, TableMetadata>
-  reads, List<TableCommit> commits)` takes, for serializable isolation,
-  the metadata of every branch the transaction read, as it read it. The
-  catalog checks them again on the state its commit builds on
-  (`BaseCatalogTransaction.unchangedSinceRead`) and pins those tables in
-  the commit's record. The prototype takes only the table names, so a
-  change that lands between `BaseCatalogTransaction`'s own check and the
-  catalog's read goes unseen (Bug 21). `TableRef` is public for this.
-- `BaseCatalogTransaction` stages a table's updates on the version the
-  transaction read, not a refresh of it, so a write to a table that
-  changed after the transaction read it fails the commit's requirements
-  at either isolation level (Bug 23).
-- `BaseCatalogTransaction` knows a table by the identifier it was
-  loaded by. The prototype recovers the identifier from the table's name:
-  it removes the catalog's name wherever it occurs and splits the rest at
-  dots, so it looks up the wrong identifier for a table whose namespace
-  repeats the catalog's name, or has a dot in a level (Bug 59).
-- `BaseCatalogTransaction`'s tables stage partition statistics in the
-  transaction, as they do every other update. The prototype's commit
-  them at once, outside it, so a transaction that fails leaves them in
-  the table (Bug 91).
+- `commitTransaction(CatalogCommit)` takes the transaction's net effect on the catalog as it found
+  it (namespace changes; table updates staged on the version first read, renames and drops; tables
+  created) and, under serializable isolation, what it read. The prototype took only table commits
+  and a set of table names: drops and renames went straight to the catalog, each its own commit,
+  a table's `newTransaction()` committed directly, and a change landing between the client's check
+  of a read and the catalog's commit went unseen (Bug 21).
+- A serializable transaction reads what it scanned (a ref's rows under the scan's filter, as of
+  the snapshot it named) and what it declares (`declareRead`), not every table it loaded; a
+  read-only transaction's commit checks its reads.
+- `BaseCatalogTransaction` stages a table's updates on the version the transaction read (Bug 23),
+  knows a table by the identifier it was loaded by (Bug 59), and stages partition statistics with
+  the rest (Bug 91).
 
-So this catalog is not a drop-in replacement in an existing Iceberg
-deployment: anything that implements or calls `commitTransaction` must
-use the new signature, and a catalog transaction run against the
-prototype's `BaseCatalogTransaction` keeps all four bugs. `RESTCatalog`
-accepts the read set but does not send it, so a REST server sees only the
-table commits' requirements and keeps the race Bug 21 closes here.
+So this catalog is not a drop-in replacement in an existing Iceberg deployment: anything that
+implements or calls `commitTransaction` must use this API. `RESTCatalog` commits snapshot-isolation
+transactions of table updates only, each checked by its requirements, and refuses serializable
+ones and catalog changes: the REST protocol carries neither reads nor them.
 
-**Trigger to revisit:** any plan to drop the iceberg fork or upstream
-the changes. The read set could travel as requirement-only
-`TableCommit`s, which the REST protocol already carries, at the cost of
-checking a read branch's snapshot (`AssertRefSnapshotId`) rather than
-the whole table.
+**Trigger to revisit:** any plan to drop the iceberg fork or upstream the API. The read set could
+travel as requirement-only `TableCommit`s, which the REST protocol already carries, at the cost of
+checking a read branch's snapshot (`AssertRefSnapshotId`) rather than its rows.
 
 ## Deferred Functionality
 
@@ -148,10 +136,11 @@ version it read. Applying those to a changed version, checked only by the
 requirements Iceberg derives, as its REST server does, loses what the change
 did (Bug 70): another writer's property change that a schema update's name
 mapping rewrote, or a tag on a snapshot the transaction expired. Under
-serializable isolation the record names the branches the transaction read of
+serializable isolation the record names the branches the transaction scanned of
 each table (a read witness, SPEC.md §"Commits"), which the encoding judges by
-what changed of them; a branch read with no snapshot holds the table's version
-(a read pin).
+what changed of them; a branch read with no snapshot, and a declared read, hold
+the table's version (a read pin). A scan read is judged by its ref, not yet by
+its filter (below).
 
 So there the catalog is stricter than Iceberg's REST semantics: a concurrent
 property change, or a commit to another branch, fails a transaction whose
@@ -174,6 +163,12 @@ Deferred:
   what REST's requirements check, without Bug 70's losses (the properties
   concern catches the name mapping). The record would say an update is a
   transaction's, so a table commit's stays pinned as Iceberg commits it.
+- **Scan reads judged by their filter.** A scan read is unchanged where nothing
+  matching its filter was added to or removed from its ref; the encodings that
+  judge validated writes by their filters (`partition-vector`,
+  `manifest-window`) could judge it the same way, so an append to another
+  partition would not fail it. First the rebase oracle for reads: an admitted
+  read must see the same rows under its filter where it lands.
 - **The rebase oracle for transactions.** `TestRebaseProperties` lands table
   commits after a window of commits they did not see; a transaction's deltas
   are checked only by the race fuzzer's serial run and the fault fuzzer's

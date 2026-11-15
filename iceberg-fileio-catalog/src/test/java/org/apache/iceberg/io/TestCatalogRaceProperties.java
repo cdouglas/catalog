@@ -59,14 +59,14 @@ import org.intentlog.wire.LogEnvelope;
  * run after it.) One exception: an operation through a table handle (a property change, an
  * append, a delete) that Iceberg refuses because the table it loaded was dropped and another
  * created under its name since (its UUID changed) must leave the catalog as the others alone do.
- * A catalog transaction (it loads one table or two and appends to the first) is not serial that
- * way either: it must fail, and leave the catalog as the others alone do, if an operation that
- * ran before its writes changed what it read -- under serializable isolation the main branch of
- * each table it loaded (or the table, if main had no snapshot), under snapshot isolation only
- * which table it appended to (dropped, or another under its name). Otherwise it may commit or fail: an inline table's append is judged
- * where the record lands, and a serializable transaction's reads by the branches it read (a read
- * witness), so a racer's change that leaves those alone may land first (errata D12); a commit
- * must end as the serial run.
+ * A catalog transaction (it loads one table or two, scans them or not, and appends to the first)
+ * is not serial that way either: it must fail, and leave the catalog as the others alone do, if
+ * an operation that ran before its writes changed what it read -- under serializable isolation
+ * the main branch of each table it scanned (a load is not a read), and in any case which table
+ * it appended to (dropped, or another under its name). Otherwise it may commit or fail: an inline
+ * table's append is judged where the record lands, and a serializable transaction's reads by the
+ * branches it read (a read witness), so a racer's change that leaves those alone may land first
+ * (errata D12); a commit must end as the serial run.
  *
  * <p>The operations are namespace creates (of nested namespaces too, which create their parents),
  * drops and property changes; table creates, drops, renames and property changes; and appends and
@@ -605,8 +605,9 @@ class TestCatalogRaceProperties {
     /** Deletes every row: the files live when the delete applies, after any retry. */
     DELETE_ALL,
     /**
-     * Loads one table, or two (the second if it exists), in a catalog transaction, appends to the
-     * first and commits; serializable when {@code x / 4} is even, else snapshot isolation.
+     * Loads one table, or two (the second if it exists), in a catalog transaction, scans them when
+     * {@code y / 4} is even, appends to the first and commits; serializable when {@code x / 4} is
+     * even, else snapshot isolation.
      */
     CATALOG_TXN;
 
@@ -648,9 +649,17 @@ class TestCatalogRaceProperties {
       return x / 4 % 2 == 0;
     }
 
-    /** The tables a transaction reads: both it loads if serializable, else the appended one. */
+    /** Whether a transaction scans the tables it loads. */
+    boolean scans() {
+      return y / 4 % 2 == 0;
+    }
+
+    /**
+     * The tables whose isolation the transaction checks: the one it appends to, and the other it
+     * scans if it is serializable.
+     */
     private List<TableIdentifier> readTables() {
-      return serializable() && !other().equals(table()) ? List.of(table(), other())
+      return serializable() && scans() && !other().equals(table()) ? List.of(table(), other())
           : List.of(table());
     }
 
@@ -680,9 +689,9 @@ class TestCatalogRaceProperties {
     }
 
     /**
-     * Whether the tables are as the transaction read them: the same table, on the same main
-     * snapshot; or, under serializable isolation where main had or has no snapshot, the same
-     * metadata.
+     * Whether the tables are as the transaction read them: the same table and, under serializable
+     * isolation if it scanned them, main on the same snapshot (or on none, then and now: its rows
+     * are the same, none).
      */
     boolean unchanged(Map<TableIdentifier, String> then, Map<TableIdentifier, String> now) {
       for (TableIdentifier id : then.keySet()) {
@@ -694,12 +703,10 @@ class TestCatalogRaceProperties {
         if (n.length == 1 || !t[0].equals(n[0])) {
           return false; // missing now, or another table
         }
-        if (!serializable()) {
-          continue; // snapshot isolation checks nothing it read (errata D12)
+        if (!serializable() || !scans()) {
+          continue; // only a serializable transaction's scans are reads (errata D12)
         }
-        boolean snapshots = !t[1].equals("-") && !n[1].equals("-");
-        if (snapshots ? !t[1].equals(n[1])
-            : serializable() ? !t[2].equals(n[2]) : !t[1].equals(n[1])) {
+        if (!t[1].equals(n[1])) {
           return false;
         }
       }
@@ -751,8 +758,14 @@ class TestCatalogRaceProperties {
                     : org.apache.iceberg.catalog.CatalogTransaction.IsolationLevel.SNAPSHOT);
             org.apache.iceberg.catalog.Catalog txCatalog = txn.asCatalog();
             Table appended = txCatalog.loadTable(table());
+            if (scans()) {
+              appended.newScan().planFiles();
+            }
             if (!other().equals(table()) && catalog.tableExists(other())) {
-              txCatalog.loadTable(other());
+              Table read = txCatalog.loadTable(other());
+              if (scans()) {
+                read.newScan().planFiles();
+              }
             }
             appended.newFastAppend()
                 .appendFile(org.apache.iceberg.DataFiles.builder(appended.spec())
@@ -799,9 +812,10 @@ class TestCatalogRaceProperties {
         case DELETE_ALL:
           return "deleteAll(" + table() + ")";
         case CATALOG_TXN:
-          return String.format("catalogTxn(%s, append to %s%s)",
-              serializable() ? "serializable" : "snapshot", table(),
-              other().equals(table()) ? "" : ", read " + other());
+          return String.format("catalogTxn(%s, %s %s%s)",
+              serializable() ? "serializable" : "snapshot", scans() ? "scan and append to"
+                  : "append to", table(),
+              other().equals(table()) ? "" : (scans() ? ", scan " : ", load ") + other());
         default:
           return kind + "(" + table() + ")";
       }

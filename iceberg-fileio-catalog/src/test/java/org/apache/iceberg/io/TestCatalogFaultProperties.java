@@ -138,8 +138,7 @@ import org.intentlog.wire.LogEnvelope;
  *       changes along main's lineage, nor do a snapshot's first row id and added rows.
  *   <li>An acknowledged catalog transaction saw no concurrent change it must not miss: any change
  *       to a table it appended to, since it first loaded the table (errata D12); and, under
- *       serializable isolation, to the main branch (or, without one, the metadata) of any table it
- *       loaded.
+ *       serializable isolation, to the main branch of any table it scanned (a load is not a read).
  * </ul>
  */
 class TestCatalogFaultProperties {
@@ -773,6 +772,7 @@ class TestCatalogFaultProperties {
     final Long snapshotId;
     final String metadataLocation;
     boolean appended = false;
+    boolean scanned = false;
 
     Loaded(TableMetadata metadata) {
       this.uuid = metadata.uuid();
@@ -1914,6 +1914,9 @@ class TestCatalogFaultProperties {
                     table.newFastAppend().appendFile(inSpec(table, staged)).commit();
                     w.loaded.get(id).appended = true;
                     w.staged.add(Map.entry(id, staged.location()));
+                  } else {
+                    table.newScan().planFiles();
+                    w.loaded.get(id).scanned = true;
                   }
                 } catch (org.apache.iceberg.exceptions.NotFoundException e) {
                   // The transaction stages on the version it read; an expiry, or a drop with
@@ -2024,27 +2027,26 @@ class TestCatalogFaultProperties {
         Map<TableIdentifier, TableState> current) {
       loaded.forEach(
           (id, at) -> {
-            if (level == IsolationLevel.SNAPSHOT && !at.appended) {
-              return;
+            boolean read = level == IsolationLevel.SERIALIZABLE && at.scanned;
+            if (!at.appended && !read) {
+              return; // a load is not a read
             }
             TableState now = current.get(id);
             if (now == null || !now.uuid.equals(at.uuid)) {
               throw new IsolationViolation(level + ": " + id + " was replaced or dropped");
             }
-            if (level == IsolationLevel.SNAPSHOT) {
+            if (!read) {
               // a table it wrote may have changed since: an inline table's appends are judged
               // where the record lands (errata D12), and the model checks what they did
               return;
             }
-            // serializable: each table it loaded, its main branch or, without one, its metadata
-            boolean unchanged =
-                at.snapshotId == null || now.snapshotId == null
-                    ? Objects.equals(at.metadataLocation, now.metadataLocation)
-                    : Objects.equals(at.snapshotId, now.snapshotId);
+            // serializable: each table it scanned, its main branch (its rows: none, if it had
+            // no snapshot then and has none now)
+            boolean unchanged = Objects.equals(at.snapshotId, now.snapshotId);
             if (!unchanged) {
               throw new IsolationViolation(
                   String.format(
-                      "%s: %s changed after it was loaded (snapshot %s -> %s, metadata %s -> %s)",
+                      "%s: %s changed after it was scanned (snapshot %s -> %s, metadata %s -> %s)",
                       level, id, at.snapshotId, now.snapshotId, at.metadataLocation,
                       now.metadataLocation));
             }

@@ -223,12 +223,12 @@ class TestConflictAttribution {
   }
 
   /**
-   * A serializable catalog transaction that reads table t and appends to table u, committing:
+   * A serializable catalog transaction that scans table t and appends to table u, committing:
    * {@code b} runs as its record is written, after its checks.
    */
   private static void readTAppendU(LogCatalog a, Runnable b) {
     CatalogTransaction txn = a.createTransaction(CatalogTransaction.IsolationLevel.SERIALIZABLE);
-    txn.asCatalog().loadTable(ID);
+    txn.asCatalog().loadTable(ID).newScan().planFiles();
     txn.asCatalog().loadTable(OTHER).newFastAppend().appendFile(file("a")).commit();
     b.run();
     txn.commitTransaction();
@@ -328,7 +328,7 @@ class TestConflictAttribution {
 
   /**
    * A read of a branch that had no snapshot holds the table's version, as {@code
-   * BaseCatalogTransaction.unchangedSinceRead} does; so does every read with the witness off.
+   * TableRead.unchangedIn} does; so does every read with the witness off.
    */
   @ParameterizedTest
   @ValueSource(booleans = {true, false})
@@ -338,7 +338,7 @@ class TestConflictAttribution {
     w[0].createTable(OTHER, SCHEMA);
     TableIdentifier read = witness ? OTHER : ID; // u has no snapshot yet
     CatalogTransaction txn = w[0].createTransaction(CatalogTransaction.IsolationLevel.SERIALIZABLE);
-    txn.asCatalog().loadTable(read);
+    txn.asCatalog().loadTable(read).newScan().planFiles();
     txn.asCatalog().loadTable(witness ? ID : OTHER).newFastAppend().appendFile(file("a"))
         .commit();
     beforeAsWrite(() -> w[1].loadTable(read).updateProperties().set("k", "b").commit());

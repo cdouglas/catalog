@@ -85,15 +85,22 @@ public class TestLocalCatalogTransaction {
       return true;
     }
 
+    @Override
+    protected boolean judgesScanReadsByRef() {
+      // a scan read is a read witness, which the encoding judges by what changed of its ref
+      return true;
+    }
+
     /**
      * A transaction's snapshot changes to an inline table are judged where its record lands
      * (errata D12): a snapshot isolation transaction's appends to two inline-ML tables, one of
      * which another writer appended to first, commit together, as a retry of them would. Iceberg's
      * REST server fails the transaction on the raced table's requirements. Here it fails where the
      * append cannot move onto the branch's new head: an inline-TM table's manifest list is a file
-     * built on the old one (the encoding's {@code ref: advanced}), a pointer table's update applies
-     * only on the version the transaction first read, and a serializable transaction read the
-     * branch that moved. Then neither table changes.
+     * built on the old one (the encoding's {@code ref: advanced}), and a pointer table's update
+     * applies only on the version the transaction first read. Then neither table changes. A
+     * serializable transaction commits as a snapshot one: it loaded the tables but scanned
+     * nothing, and a load is not a read.
      */
     @ParameterizedTest
     @EnumSource(CatalogTransaction.IsolationLevel.class)
@@ -111,7 +118,7 @@ public class TestLocalCatalogTransaction {
       // another writer appends to the first table, moving its main branch
       catalog.loadTable(raced).newFastAppend().appendFile(FILE_C).commit();
 
-      if (mode().inlineML && isolation == CatalogTransaction.IsolationLevel.SNAPSHOT) {
+      if (mode().inlineML) {
         txn.commitTransaction();
         assertThat(files(raced))
             .containsExactlyInAnyOrder(FILE_A.location(), FILE_B.location(), FILE_C.location());

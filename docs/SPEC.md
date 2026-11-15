@@ -609,14 +609,14 @@ a table it writes, at the version it first read ([errata.md](errata.md)
 
 Under serializable isolation the record also says what the transaction read
 of each table, as its commit checked it on the state it builds on: a
-`ReadTable` at that version whose refs are the branches and tags it read (a
-read witness). The encoding judges it by what changed of those refs since, as
+`ReadTable` at that version whose refs are the branches and tags it scanned (a
+read witness; a load is not a read, docs/CATALOG_TRANSACTIONS.md). The encoding judges it by what changed of those refs since, as
 it judges a table update ([Conflict Encodings](#conflict-encodings)), so
 another writer's change landing first that leaves them alone (a property, an
 expiry, another branch) need not fail it, and a rejection stays one (S2). A
-branch it read that had no snapshot holds the table's version, as
-`BaseCatalogTransaction.unchangedSinceRead` does: a `ReadTable` without refs (a
-read pin). `fileio.catalog.txn.read.witness` `false` sends every read as a pin
+branch it read that had no snapshot, and a declared read of the whole table
+(`CatalogTransaction.declareRead`), hold the table's version: a `ReadTable`
+without refs (a read pin). `fileio.catalog.txn.read.witness` `false` sends every read as a pin
 (for ablation).
 
 A load reads the catalog, then a pointer table's metadata file, and a drop

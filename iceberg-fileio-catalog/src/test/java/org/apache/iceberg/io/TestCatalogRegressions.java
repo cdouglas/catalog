@@ -1488,13 +1488,12 @@ public class TestCatalogRegressions {
   // ============================================================
   // Bug 21: a serializable catalog transaction pinned the tables it read at
   // the versions FileIOCatalog.commitTransaction read, not the versions the
-  // transaction read. BaseCatalogTransaction validates the read tables just
-  // before calling it, so a change landing between that check and the
-  // commit's own read went unseen, and the transaction committed on a table
-  // that had changed under it (write skew). The transaction now passes the
-  // metadata of each branch it read; the commit checks them, by the rule
-  // BaseCatalogTransaction uses, on the state it builds on, and pins those
-  // tables. Found by TestCatalogFaultProperties.
+  // transaction read, so a change landing before the commit's own read went
+  // unseen, and the transaction committed on a table that had changed under
+  // it (write skew). The transaction passes what it read of each table, as
+  // it first read it; the commit checks it on the state it builds on, and the
+  // record holds it until it lands (a read witness), so a change landing
+  // after that read fails it too. Found by TestCatalogFaultProperties.
   // ============================================================
 
   @Nested
@@ -1510,7 +1509,7 @@ public class TestCatalogRegressions {
 
     @ParameterizedTest
     @org.junit.jupiter.params.provider.EnumSource(LocalCatalogMode.class)
-    void changeToAReadTableAfterValidationFailsTheCommit(LocalCatalogMode mode) {
+    void changeToAScannedTableBeforeTheRecordLandsFailsTheCommit(LocalCatalogMode mode) {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       LogCatalog first = mode.catalog(io, "mem:///w", "c", Map.of());
       LogCatalog second = mode.catalog(io, "mem:///w", "c", Map.of());
@@ -1526,16 +1525,16 @@ public class TestCatalogRegressions {
           first.createTransaction(
               org.apache.iceberg.catalog.CatalogTransaction.IsolationLevel.SERIALIZABLE);
       org.apache.iceberg.catalog.Catalog txc = txn.asCatalog();
-      txc.loadTable(read);
+      assertThat(txc.loadTable(read).newScan().planFiles()).hasSize(1);
       txc.loadTable(written).newFastAppend().appendFile(file("w1")).commit();
 
-      // The commit reads the catalog once per table to validate, then once to commit. Another
-      // writer changes the read table just before that last read: a read of the catalog object,
-      // or of the shared log.
-      int[] reads = {0};
+      // The commit reads the catalog, checks the read on it, then writes its record. Another
+      // writer changes the read table just before that write: of the catalog object, or an
+      // append to the shared log or to the Append Blob log.
+      int[] writes = {0};
       Thread committer = Thread.currentThread();
       Runnable race = () -> {
-        if (Thread.currentThread() == committer && reads[0]++ == 2) {
+        if (Thread.currentThread() == committer && writes[0]++ == 0) {
           second.loadTable(read).newFastAppend().appendFile(file("r1")).commit();
         }
       };
@@ -1543,35 +1542,33 @@ public class TestCatalogRegressions {
         LocalCatalogMode.sharedLog(io, "mem:///w/catalog-c").intercept(
             new org.intentlog.memory.InMemorySharedLog.Interceptor() {
               @Override
-              public org.intentlog.memory.InMemorySharedLog.ReadShape beforeRead(
-                  org.intentlog.memory.InMemorySharedLog.Request request) {
-                if (request == org.intentlog.memory.InMemorySharedLog.Request.READ
-                    || request == org.intentlog.memory.InMemorySharedLog.Request.READ_AFTER) {
-                  race.run(); // a read of the log, whole or after a replica's tail
+              public org.intentlog.memory.InMemorySharedLog.WriteFault beforeWrite(
+                  org.intentlog.memory.InMemorySharedLog.Request request, byte[] payload) {
+                if (request == org.intentlog.memory.InMemorySharedLog.Request.APPEND) {
+                  race.run();
                 }
-                return org.intentlog.memory.InMemorySharedLog.ReadShape.NORMAL;
+                return org.intentlog.memory.InMemorySharedLog.WriteFault.NONE;
               }
             });
       } else if (mode.azureLog) {
         LocalCatalogMode.azureStore(io, "mem:///w/catalog-c").intercept((op, name) -> {
-          if (op == org.intentlog.azure.InMemoryAppendBlobStore.Op.READ
-              && name.contains("/seg/")) {
-            race.run(); // a read of the log's records, whole or after a replica's tail
+          if (op == org.intentlog.azure.InMemoryAppendBlobStore.Op.APPEND) {
+            race.run();
           }
           return org.intentlog.azure.InMemoryAppendBlobStore.Fault.NONE;
         });
       } else {
-        io.injectReadFaults(
-            location -> {
+        io.injectFaults(
+            (location, strategy) -> {
               if (location.equals("mem:///w/catalog-c")) {
                 race.run();
               }
-              return ReadFault.NONE;
+              return Fault.NONE;
             });
       }
-      assertThatThrownBy(txn::commitTransaction)
-          .isInstanceOf(org.apache.iceberg.exceptions.ValidationException.class);
-      io.injectReadFaults(location -> ReadFault.NONE);
+      assertThatThrownBy(txn::commitTransaction).isInstanceOf(CommitFailedException.class);
+      assertThat(writes[0]).as("the race ran").isPositive();
+      io.injectFaults((location, strategy) -> Fault.NONE);
       if (mode.sharedLog) {
         LocalCatalogMode.sharedLog(io, "mem:///w/catalog-c").intercept(null);
       }
@@ -4579,26 +4576,36 @@ public class TestCatalogRegressions {
   class TransactionOverARemovedSpecOrSchema {
 
     /**
-     * An append staged on the table as it is now, committed as a table commit with no read set,
-     * which applies its updates to the table's current metadata. A catalog transaction passes the
-     * version it first read, and its update applies only there or where a retry of it would
-     * commit the same (Bug 70, errata D12).
+     * An append a catalog transaction staged on the table as it is now. Its update applies only on
+     * that version, or where a retry of it would commit the same (Bug 70, errata D12): not on a
+     * table that lost the partition spec its manifests name (Bug 69), and, for a pointer table,
+     * not on one that lost its schema either. An inline-ML append's snapshot takes the schema of
+     * the table it lands on, as a retry's does.
      */
-    private org.apache.iceberg.catalog.TableCommit stagedAppend(FileIOCatalog catalog) {
+    private org.apache.iceberg.catalog.CatalogCommit stagedAppend(FileIOCatalog catalog) {
       catalog.createNamespace(mixedNs);
       catalog.createTable(mixed, intSchema);
       org.apache.iceberg.BaseTransaction txn =
           (org.apache.iceberg.BaseTransaction) catalog.loadTable(mixed).newTransaction();
       txn.newFastAppend().appendFile(dataFile("a")).commit();
-      return org.apache.iceberg.catalog.TableCommit.create(
-          mixed, txn.startMetadata(), txn.currentMetadata());
+      return org.apache.iceberg.catalog.ImmutableCatalogCommit.builder()
+          .isolationLevel(org.apache.iceberg.catalog.CatalogTransaction.IsolationLevel.SNAPSHOT)
+          .addTableChanges(
+              org.apache.iceberg.catalog.ImmutableTableChange.builder()
+                  .identifier(mixed)
+                  .base(txn.startMetadata())
+                  .commit(
+                      org.apache.iceberg.catalog.TableCommit.create(
+                          mixed, txn.startMetadata(), txn.currentMetadata()))
+                  .build())
+          .build();
     }
 
     @ParameterizedTest
     @EnumSource(value = LocalCatalogMode.class, names = {"APPEND", "APPEND_ML"})
     void aRemovedSpecFailsTheCommit(LocalCatalogMode mode) {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
-      org.apache.iceberg.catalog.TableCommit commit = stagedAppend(catalog(io, mode));
+      org.apache.iceberg.catalog.CatalogCommit commit = stagedAppend(catalog(io, mode));
 
       // another writer partitions the table and expires its unpartitioned spec
       Table other = catalog(io, mode).loadTable(mixed);
@@ -4607,16 +4614,15 @@ public class TestCatalogRegressions {
       assertThat(other.specs()).doesNotContainKey(0);
 
       assertThatThrownBy(() -> catalog(io, mode).commitTransaction(commit))
-          .isInstanceOf(ValidationException.class)
-          .hasMessageEndingWith("its partition spec 0 was removed concurrently");
+          .isInstanceOfAny(CommitFailedException.class, ValidationException.class);
       assertThat(catalog(io, mode).loadTable(mixed).currentSnapshot()).isNull();
     }
 
     @ParameterizedTest
     @EnumSource(value = LocalCatalogMode.class, names = {"APPEND", "APPEND_ML"})
-    void aRemovedSchemaFailsTheCommit(LocalCatalogMode mode) {
+    void aRemovedSchemaFailsAPointerTablesCommit(LocalCatalogMode mode) {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
-      org.apache.iceberg.catalog.TableCommit commit = stagedAppend(catalog(io, mode));
+      org.apache.iceberg.catalog.CatalogCommit commit = stagedAppend(catalog(io, mode));
 
       // another writer adds a column and expires the schema before it
       Table other = catalog(io, mode).loadTable(mixed);
@@ -4624,10 +4630,17 @@ public class TestCatalogRegressions {
       other.expireSnapshots().cleanExpiredMetadata(true).commit();
       assertThat(other.schemas()).doesNotContainKey(0);
 
-      assertThatThrownBy(() -> catalog(io, mode).commitTransaction(commit))
-          .isInstanceOf(ValidationException.class)
-          .hasMessageEndingWith("its schema 0 was removed concurrently");
-      assertThat(catalog(io, mode).loadTable(mixed).currentSnapshot()).isNull();
+      if (mode.inlineML) {
+        // an inline-ML append's snapshot names no schema on the wire, and lands on the schema of
+        // the table it lands on (SPEC_TM.md), as Iceberg's retry builds it
+        catalog(io, mode).commitTransaction(commit);
+        Table table = catalog(io, mode).loadTable(mixed);
+        assertThat(table.currentSnapshot().schemaId()).isEqualTo(table.schema().schemaId());
+      } else {
+        assertThatThrownBy(() -> catalog(io, mode).commitTransaction(commit))
+            .isInstanceOfAny(CommitFailedException.class, ValidationException.class);
+        assertThat(catalog(io, mode).loadTable(mixed).currentSnapshot()).isNull();
+      }
     }
   }
 

@@ -210,6 +210,12 @@ public class GCSFileIOCatalogTransactionTests extends CatalogTransactionTests<Fi
   }
 
   @Override
+  protected boolean judgesScanReadsByRef() {
+    // a scan read is a read witness, which the encoding judges by what changed of its ref
+    return true;
+  }
+
+  @Override
   protected FileIOCatalog catalog() {
     return catalog;
   }

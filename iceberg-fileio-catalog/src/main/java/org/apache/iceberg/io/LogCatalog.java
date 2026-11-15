@@ -47,12 +47,16 @@ import org.apache.iceberg.TableMetadataParser;
 import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.Transaction;
 import org.apache.iceberg.catalog.BaseCatalogTransaction;
+import org.apache.iceberg.catalog.CatalogCommit;
 import org.apache.iceberg.catalog.CatalogTransaction;
 import org.apache.iceberg.catalog.Namespace;
+import org.apache.iceberg.catalog.NamespaceChange;
 import org.apache.iceberg.catalog.SupportsCatalogTransactions;
 import org.apache.iceberg.catalog.SupportsNamespaces;
+import org.apache.iceberg.catalog.TableChange;
 import org.apache.iceberg.catalog.TableCommit;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.catalog.TableRead;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
@@ -2191,79 +2195,146 @@ public class LogCatalog extends BaseMetastoreCatalog
 
   // SupportsCatalogTransaction
 
+  /**
+   * Commits a catalog transaction as one record, staged on a fresh read of the log: its namespace
+   * changes, table updates, renames and drops, created tables and reads, which replay applies all
+   * of where it lands, or none (docs/CATALOG_TRANSACTIONS.md).
+   *
+   * <p>Each table the transaction changed must be the table it read (its uuid) on this read. Its
+   * updates were staged on the version the transaction first read: those Iceberg would retry
+   * (snapshots and the moves of their branches) go as a delta from that version, which the
+   * conflict encoding judges where the record lands; any other is checked by its requirements and
+   * must find the table at that version, which the record pins (errata D12). A rename or drop
+   * applies to the table as this read has it. Each read must be unchanged from the version the
+   * transaction first read to this read ({@link TableRead#unchangedIn}), and the record holds it
+   * until it lands: a scan read by the refs it read (a read witness, which the encoding judges by
+   * what changed of them; under {@code lamport}, any change), a declared read by the table's
+   * version (a read pin). A commit with no changes checks its reads on this read and writes
+   * nothing. Not retried: a change it conflicts with is a real conflict.
+   */
   @Override
-  public void commitTransaction(
-      Map<BaseCatalogTransaction.TableRef, TableMetadata> reads, List<TableCommit> commits) {
-    // TableCommit validations check the table UUID and snapshot ref for each table
-    // if all validations pass on the current catalog, then commit them in one transaction
+  public void commitTransaction(CatalogCommit commit) {
     final Replica<CatalogState> current = log.read();
     final CatalogMutation newCatalog = new CatalogMutation(current);
-    // Each branch the transaction read must be as it read it, from then until the commit
-    // lands. BaseCatalogTransaction checked that before calling, but a commit may have landed
-    // since; check again on the state this commit builds on, and the record holds the commit to
-    // it until it lands: by the refs it read (a read witness, errata D12), which the encoding
-    // judges by what changed of them since, where each ref was there when read, else by the
-    // table's version (a read pin), as unchangedSinceRead does.
-    // Each table it writes (a null ref) comes with the version it first read, on which its
-    // updates were staged.
     boolean witness = LogCatalogProperties.txnReadWitness(catalogProperties);
-    Map<TableIdentifier, TableMetadata> written = new HashMap<>();
-    for (Map.Entry<BaseCatalogTransaction.TableRef, TableMetadata> read : reads.entrySet()) {
-      TableIdentifier readTable = read.getKey().identifier();
-      String ref = read.getKey().ref();
-      if (ref == null) {
-        written.put(readTable, read.getValue());
-        continue;
-      }
-      TableMetadata now = tableOpsAsRead(readTable, current).current();
-      if (!BaseCatalogTransaction.unchangedSinceRead(ref, read.getValue(), now)) {
-        throw new ValidationException(
-            "SERIALIZABLE isolation violation: Found table metadata updates to table '%s' after it was read on branch '%s'",
-            readTable, ref);
-      }
-      SnapshotRef then = read.getValue().ref(ref);
-      if (witness && then != null) {
-        newCatalog.readRef(readTable, ref);
-      } else {
-        newCatalog.readTable(readTable);
+
+    for (TableRead read : commit.reads()) {
+      TableMetadata now = currentMetadata(read.identifier(), current);
+      if (!read.unchangedIn(now)) {
+        throw new CommitFailedException(
+            "Cannot commit transaction: table %s changed since the transaction read it%s",
+            read.identifier(),
+            read.isScan() ? " on " + read.ref() : "");
       }
     }
-    for (TableCommit commit : commits) {
-      final TableIdentifier tableId = commit.identifier();
-      // use fixed catalog snapshot for validation
+    if (!commit.hasChanges()) {
+      return;
+    }
+
+    for (NamespaceChange change : commit.namespaceChanges()) {
+      switch (change.kind()) {
+        case CREATE:
+          newCatalog.createNamespace(change.namespace(), change.properties());
+          break;
+        case SET_PROPERTIES:
+          newCatalog.updateProperties(change.namespace(), change.properties());
+          break;
+        case REMOVE_PROPERTIES:
+          Map<String, String> removals = new HashMap<>();
+          change.removals().forEach(key -> removals.put(key, null));
+          newCatalog.updateProperties(change.namespace(), removals);
+          break;
+        case DROP:
+          break;
+      }
+    }
+
+    Map<TableIdentifier, FileIOTableOperations> purged = new HashMap<>();
+    for (TableChange change : commit.tableChanges()) {
+      TableIdentifier tableId = change.identifier();
       FileIOTableOperations ops = tableOpsAsRead(tableId, current);
-      final TableMetadata currentMetadata = ops.current();
+      TableMetadata currentMetadata = ops.current();
       if (currentMetadata == null) {
         throw new NoSuchTableException("Table does not exist: %s", tableId);
       }
-      TableMetadata firstRead = written.get(tableId);
-      if (firstRead != null && stageJudged(ops, newCatalog, current, firstRead, commit)) {
-        continue;
-      }
-      commit.requirements().forEach(req -> req.validate(currentMetadata));
-      // Any other update of a table the transaction wrote applies only on the version it first
-      // read: checked after the requirements, which say more specifically what changed, and
-      // pinned until the commit lands. Applying it to a version changed since, checked only by
-      // the requirements, lost what the change did (Bug 70).
-      if (firstRead != null
-          && !BaseCatalogTransaction.unchangedSinceRead(null, firstRead, currentMetadata)) {
+      if (!java.util.Objects.equals(currentMetadata.uuid(), change.base().uuid())) {
         throw new CommitFailedException(
-            "Cannot commit transaction: table %s changed since the transaction read it", tableId);
+            "Cannot commit transaction: table %s was replaced since the transaction read it",
+            tableId);
       }
 
-      TableMetadata.Builder newMetadataBuilder = TableMetadata.buildFrom(currentMetadata);
-      commit.updates().forEach(update -> update.applyTo(newMetadataBuilder));
-      final TableMetadata newMetadata = newMetadataBuilder.build();
-      if (newMetadata.changes().isEmpty()) {
+      if (change.dropped()) {
+        newCatalog.dropTable(tableId);
+        if (change.purge()) {
+          purged.put(tableId, ops);
+        }
         continue;
       }
-      checkAddedSnapshots(tableId, currentMetadata, newMetadata, ops.io());
-      // The table's new inline-ML snapshots hold their manifest lists.
-      ops.stageUpdate(newCatalog, currentMetadata, newMetadata);
-      newCatalog.pin(tableId);
+
+      TableCommit updates = change.commit();
+      if (updates != null && !stageJudged(ops, newCatalog, current, change.base(), updates)) {
+        updates.requirements().forEach(req -> req.validate(currentMetadata));
+        // Any other update applies only on the version the transaction first read: checked after
+        // the requirements, which say more specifically what changed, and pinned until the
+        // commit lands. Applying it to a version changed since, checked only by the
+        // requirements, lost what the change did (Bug 70).
+        if (!java.util.Objects.equals(
+            currentMetadata.metadataFileLocation(), change.base().metadataFileLocation())) {
+          throw new CommitFailedException(
+              "Cannot commit transaction: table %s changed since the transaction read it", tableId);
+        }
+
+        TableMetadata.Builder newMetadataBuilder = TableMetadata.buildFrom(currentMetadata);
+        updates.updates().forEach(update -> update.applyTo(newMetadataBuilder));
+        TableMetadata newMetadata = newMetadataBuilder.build();
+        if (!newMetadata.changes().isEmpty()) {
+          checkAddedSnapshots(tableId, currentMetadata, newMetadata, ops.io());
+          // The table's new inline-ML snapshots hold their manifest lists.
+          ops.stageUpdate(newCatalog, currentMetadata, newMetadata);
+          newCatalog.pin(tableId);
+        }
+      }
+
+      if (change.renamedTo() != null) {
+        newCatalog.renameTable(tableId, change.renamedTo());
+      }
     }
-    // Not retried: a pinned table's change, or a delta's real conflict, fails it (errata D12).
+
+    for (Map.Entry<TableIdentifier, TableMetadata> created : commit.createdTables().entrySet()) {
+      tableOpsAsRead(created.getKey(), current).stageCreate(created.getValue()).accept(newCatalog);
+    }
+
+    for (NamespaceChange change : commit.namespaceChanges()) {
+      if (change.kind() == NamespaceChange.Kind.DROP) {
+        newCatalog.dropNamespace(change.namespace());
+      }
+    }
+
+    for (TableRead read : commit.reads()) {
+      if (commit.tableChanges().stream()
+              .anyMatch(c -> c.dropped() && c.identifier().equals(read.identifier()))) {
+        // a drop holds the table to its version on this read
+        continue;
+      }
+      SnapshotRef then = read.isScan() ? read.metadata().ref(read.ref()) : null;
+      if (witness && then != null) {
+        newCatalog.readRef(read.identifier(), read.ref());
+      } else {
+        newCatalog.readTable(read.identifier());
+      }
+    }
+
     newCatalog.commit(log);
+
+    // The commit landed: a purge that cannot delete a file logs it.
+    purged.values().forEach(ops -> CatalogUtil.dropTableData(ops.io(), ops.current()));
+  }
+
+  private TableMetadata currentMetadata(TableIdentifier table, Replica<CatalogState> current) {
+    if (!current.state().containsTable(table)) {
+      return null;
+    }
+    return tableOpsAsRead(table, current).current();
   }
 
   /**

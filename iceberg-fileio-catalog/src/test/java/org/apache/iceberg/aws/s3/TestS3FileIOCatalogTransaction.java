@@ -173,6 +173,12 @@ public class TestS3FileIOCatalogTransaction extends CatalogTransactionTests<File
   }
 
   @Override
+  protected boolean judgesScanReadsByRef() {
+    // a scan read is a read witness, which the encoding judges by what changed of its ref
+    return true;
+  }
+
+  @Override
   protected FileIOCatalog catalog() {
     return catalog;
   }
