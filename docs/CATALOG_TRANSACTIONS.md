@@ -1,6 +1,7 @@
 # Catalog transactions through Iceberg's API
 
-Status (2026-11-15): implemented for FileIOCatalog and REST; JDBC in progress. FileIOCatalog
+Status (2026-11-15): implemented for FileIOCatalog, JDBC and REST (REST: SNAPSHOT table updates
+only, as its protocol allows). FileIOCatalog
 judges a scan read by its ref (a read witness), not yet by its filter (errata D12). It replaces
 errata S2's prototype API and narrows D12's serializable reads.
 
@@ -84,7 +85,7 @@ catalog does:
 
 | Change | Condition where the commit takes effect |
 |---|---|
-| create namespace (with properties) | absent; parent present |
+| create namespace (with properties) | absent (missing parents are created with it) |
 | drop namespace | present, holds no tables or namespaces |
 | set or remove namespace properties | present |
 | create table (`buildTable(...).create()`, `createTable`, `createTransaction()`) | absent; namespace present |
@@ -133,7 +134,7 @@ the catalog cannot do.
   none when one fails; the transaction's own view; drops with purge deleting files only after a
   commit; loads that are not reads; scan reads that conflict (rows the scan matched) and that do
   not (another partition, another branch, a property, a rewrite); read-only transactions checked at
-  commit. Run on JdbcCatalog (SQLite), on every FileIOCatalog mode, and on RESTCatalog (SNAPSHOT
+  commit. Run on JdbcCatalog (SQLite; Postgres by hand), on every FileIOCatalog mode, and on RESTCatalog (SNAPSHOT
   only; the rest throw).
 - No false negatives (fileio-catalog): the rebase oracle for reads
   (`TestRebaseProperties.anAdmittedReadSeesTheRowsItRead`). A serializable transaction scans a ref
@@ -141,8 +142,8 @@ the catalog cannot do.
   truncation), writes another table, the same one or nothing, and commits after a window of commits
   it did not see, before its commit's read, before its record, or both; if admitted, the rows of its
   ref under its filter where it took effect must be the rows at its snapshot (`TableViews.rows`:
-  rows a rewrite keeps, each with the delete files that delete from it). It judges reads judged by
-  filter as it does reads judged by ref; false positives are reported per encoding and table
+  rows a rewrite keeps, each with the delete files that delete from it). The oracle is the same
+  whether the catalog judges a read by its ref or by its filter; false positives are reported per encoding and table
   storage. `fuzz/mutants/reads.sh` calibrates it: a read unchecked at the commit, unheld by the
   record, a witness blind to its ref's advances, to its resets, or to everything, and a filter
   judged by the data files added alone.
