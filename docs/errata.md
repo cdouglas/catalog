@@ -182,7 +182,11 @@ Deferred:
   and the fault fuzzer's model, both of whose transactions append.
 
 **Trigger to revisit:** a workload whose transactions change refs, schemas or
-partition specs while other commits race them.
+partition specs while other commits race them. For scan reads judged by their
+filter: E6 (catalog-bench `configs/e6-*.json`, not yet run), whose arm that
+scans the last closed partition (`read_slot` 1) meets no real conflict, so
+every read its serializable FileIOCatalog runs reject is one judging by filter
+would commit.
 
 ### D13. `partition-vector` retries a validated commit that `concern-vector` merges
 
