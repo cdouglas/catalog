@@ -176,10 +176,14 @@ A writer installs the next segment ahead when its copy's index is within a margi
 K (provisional: the last 1%), so that a rotation doesn't wait for an Install. Installs
 needn't be scarce: a segment opened in excess is ended by a seal frame, below.
 
-**Ending a segment early.** A seal frame takes the rest of a segment's limit: the
-segment ends there, as if its remaining records had landed. A writer whose record is in
-a segment after `m` needs `m` ended to learn its outcome, so it appends a seal frame to
-`m` if `m` hasn't ended. That covers a crash after an Install, segments opened in
+**Ending a segment early.** The limit is an implicit seal at the Kth record. A seal
+frame closes a segment earlier, so that the next segment's records can count. It
+carries no count: it ends the segment where it lands, taking the rest of the limit. A
+seal that named a count from an earlier read could land after more records than that
+and void them, which is D1's problem inside the segment. Safety needs only the limit.
+Progress needs a seal frame whenever traffic leaves a segment short of K. A writer
+whose record is in a segment after `m` needs `m` ended to learn its outcome, so it
+appends a seal frame to `m` if `m` hasn't ended. That covers a crash after an Install, segments opened in
 excess, a limit that traffic hasn't reached, and writers that chose a later segment,
 with no owner: any writer that needs `m` ended ends it. A seal frame after the end is
 void and harmless. Since a record in a later segment costs the earlier ones their
@@ -342,6 +346,7 @@ The model's mistakes, each a switch that must break a property:
 |---|---|---|
 | `catalogseal` | a catalog record states a segment's end from an earlier read (the review's `SealSegment`) | SG3, P1 |
 | `limitatnext` | a segment's limit set by the next segment's Install | SG3 |
+| `sealcount` | a seal frame ends its segment at a count from an earlier read, not where it lands | SG3 |
 | `readahead` | a reader applies `m+1` before `m` has ended | SG1, SG2 |
 | `voidack` | `readThrough` accepts a frame past its segment's end | SG3, an honest outcome |
 | `overlimit` | an Install sets a limit above the store's block limit | SG8: a segment fills before its end, takes no seal frame, and the log stops |
