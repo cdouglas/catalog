@@ -717,4 +717,65 @@ class TestSharedLogRuntime {
       org.intentlog.CommitTrace.close();
     }
   }
+
+  /**
+   * A compaction's GC record that lands void (docs/LOG_SEGMENTS.md D4) is sent again: the
+   * compaction checkpoints through the second.
+   */
+  @Test
+  void aCompactionSendsAVoidGcRecordAgain() {
+    created();
+    boolean[] voided = {false};
+    SharedLog voiding = new SharedLog() {
+      @Override
+      public Capabilities capabilities() {
+        return log.capabilities();
+      }
+
+      @Override
+      public LogView read() {
+        return log.read();
+      }
+
+      @Override
+      public LogView readAfter(LogTail since) {
+        return log.readAfter(since);
+      }
+
+      @Override
+      public LogView readThrough(Receipt receipt, Duration wait) {
+        if (receipt == null) {
+          throw new org.intentlog.LogConflictException("The append is void", null);
+        }
+        return log.readThrough(receipt, wait);
+      }
+
+      @Override
+      public LogTail probe() {
+        return log.probe();
+      }
+
+      @Override
+      public Receipt append(byte[] record, LogTail expected) {
+        if (!voided[0]) {
+          voided[0] = true;
+          return null;
+        }
+        return log.append(record, expected);
+      }
+
+      @Override
+      public void putCheckpoint(LogTail through, byte[] checkpoint) {
+        log.putCheckpoint(through, checkpoint);
+      }
+
+      @Override
+      public void trim(LogTail through) {
+        log.trim(through);
+      }
+    };
+    new LogRuntime<>(voiding, MACHINE, config(1_000L, NEVER)).compact();
+    assertThat(voided[0]).isTrue();
+    assertThat(log.checkpoints()).hasSize(2);
+  }
 }

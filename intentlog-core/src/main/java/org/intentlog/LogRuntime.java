@@ -269,8 +269,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     long watermark = watermark(now, Long.MAX_VALUE);
     LogView view;
     if (watermark > 0L) {
-      byte[] gc = LogEnvelope.encodeAdvanceHorizon(watermark);
-      view = log.readThrough(sendThrottled(() -> log.append(gc, null)), config.visibilityWait());
+      view = appendThrough(LogEnvelope.encodeAdvanceHorizon(watermark));
     } else {
       view = log.read();
     }
@@ -283,12 +282,11 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     List<CommittedSet.Seal> seals =
         page(through.committed(), pageCeiling(now, Long.MAX_VALUE), through.logId());
     if (!seals.isEmpty()) {
-      Receipt last = null;
-      for (CommittedSet.Seal seal : seals) {
+      for (CommittedSet.Seal seal : seals.subList(0, seals.size() - 1)) {
         byte[] pageOut = LogEnvelope.encodePageOut(seal.record());
-        last = sendThrottled(() -> log.append(pageOut, null));
+        sendThrottled(() -> log.append(pageOut, null));
       }
-      view = log.readThrough(last, config.visibilityWait());
+      view = appendThrough(LogEnvelope.encodePageOut(seals.get(seals.size() - 1).record()));
       replayed = replay(view, null, null, through);
       dropped.addAll(replayed.result.committed().droppedPages());
       through = replayed.replica();
@@ -626,6 +624,25 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
   }
 
   /** Sends a write again while the log throttles it, with the commit loop's backoff. */
+  /**
+   * Appends a record of the committed set's (a GC record, a PageOut), blind, and reads through it.
+   * A send the read-through finds void (it landed past its segment's end: docs/LOG_SEGMENTS.md D4)
+   * is not in the log, and is sent again; either lands at most once in effect, as a GC record or
+   * a PageOut applied twice changes nothing.
+   */
+  private LogView appendThrough(byte[] record) {
+    for (int attempt = 1; ; attempt++) {
+      Receipt receipt = sendThrottled(() -> log.append(record, null));
+      try {
+        return log.readThrough(receipt, config.visibilityWait());
+      } catch (LogConflictException e) {
+        if (attempt >= config.maxThrottleAttempts()) {
+          throw e;
+        }
+      }
+    }
+  }
+
   private Receipt sendThrottled(Supplier<Receipt> send) {
     long backoffMs = config.throttleMinWaitMs();
     for (int attempt = 1; ; attempt++) {
