@@ -1541,7 +1541,9 @@
         kind: 'version', label: 'version', byteStart: 4, byteEnd: 8,
         decodedValue: String(version >>> 0),
         detail: 'Big-endian int32. Currently ' + state.formatVersion
-          + '; readers reject anything else. A checkpoint\'s min_reader_version '
+          + ', or 4 for a segmented log\'s catalog object (its records are its segments\' '
+          + 'Installs: docs/LOG_SEGMENTS.md); readers reject anything else. '
+          + 'A checkpoint\'s min_reader_version '
           + '(currently ' + state.readerVersion + ') gates readers separately.',
         children: []
       });

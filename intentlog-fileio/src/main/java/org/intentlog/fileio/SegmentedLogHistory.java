@@ -45,6 +45,7 @@ public final class SegmentedLogHistory {
   private final Map<SegmentPosition, byte[]> checkpoints = new TreeMap<>(
       (a, b) -> a.compareTo(b) != 0 ? a.compareTo(b) : Long.compare(a.offset(), b.offset()));
   private final List<String> violations = new ArrayList<>();
+  private final java.util.Set<String> names = new java.util.TreeSet<>();
   private final Map<String, byte[]> pages;
 
   /**
@@ -62,7 +63,9 @@ public final class SegmentedLogHistory {
       if (was != null && !Arrays.equals(was, c.checkpoint())) {
         violations.add("two checkpoints at " + c.ck() + " differ (I11)");
       }
+      c.retired().forEach(r -> names.add(r.name()));
       for (SegmentedLog.Seg s : c.segs()) {
+        names.add(s.name());
         SegmentedLog.Seg other = installed.putIfAbsent(s.ordinal(), s);
         if (other != null && !other.name().equals(s.name())) {
           violations.add("two Installs of segment " + s.ordinal() + " (SG4)");
@@ -120,6 +123,11 @@ public final class SegmentedLogHistory {
 
   public Map<String, byte[]> pages() {
     return pages;
+  }
+
+  /** The names (under the prefix) of every segment a version installed or retired. */
+  public java.util.Set<String> names() {
+    return names;
   }
 
   /** What the history itself breaks: two checkpoints at a position, two Installs of a segment. */

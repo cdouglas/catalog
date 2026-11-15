@@ -50,6 +50,11 @@ public class TestLocalCatalogTransaction {
 
   abstract static class Suite extends CatalogTransactionTests<LogCatalog> {
     private InMemoryAtomicFileIO io;
+
+    /** The store this test's catalogs are on. */
+    InMemoryAtomicFileIO io() {
+      return io;
+    }
     private LogCatalog catalog;
 
     abstract LocalCatalogMode mode();

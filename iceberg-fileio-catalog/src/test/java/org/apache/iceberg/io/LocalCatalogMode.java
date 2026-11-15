@@ -351,10 +351,11 @@ enum LocalCatalogMode {
       return;
     }
     if (azureLog) {
-      // The store took conditional writes only of the catalogs' objects, in format 4
-      List<String> objects = azureStores(io).stream().map(AzureStore::location).toList();
-      assertThat(objects).as("conditional writes to the store")
-          .containsAll(io.conditionalWrites().keySet());
+      // The store took conditional writes only of the catalogs' objects, in format 4 (a
+      // catalog on a real account has its segments there, and no store in memory)
+      io.conditionalWrites().keySet().forEach(location ->
+          assertThat(CheckpointRoundTrip.segmented(io.bytes(location)))
+              .as("%s, a conditional write's object, is a segmented log's", location).isTrue());
       azureStores(io).forEach(a -> CheckpointRoundTrip.assertEveryCheckpoint(
           azureHistory(io, a), "the segmented log at " + a.location()));
       return;

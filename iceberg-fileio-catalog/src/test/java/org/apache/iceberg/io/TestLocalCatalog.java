@@ -42,6 +42,11 @@ public class TestLocalCatalog {
 
   abstract static class Suite extends CatalogTests<LogCatalog> {
     private InMemoryAtomicFileIO io;
+
+    /** The store this test's catalogs are on. */
+    InMemoryAtomicFileIO io() {
+      return io;
+    }
     private String warehouse;
     private LogCatalog catalog;
 
