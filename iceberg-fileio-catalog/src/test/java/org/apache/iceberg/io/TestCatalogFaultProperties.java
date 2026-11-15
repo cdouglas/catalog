@@ -76,7 +76,7 @@ import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.ReadFault;
 import org.apache.iceberg.types.Types;
-import org.intentlog.azure.AzureLogHistory;
+import org.intentlog.fileio.SegmentedLogHistory;
 import org.intentlog.azure.InMemoryAppendBlobStore;
 import org.intentlog.fileio.AtomicFileLog;
 import org.intentlog.memory.InMemorySharedLog;
@@ -158,19 +158,10 @@ class TestCatalogFaultProperties {
   private static final String CATALOG_NAME = "fuzz";
   private static final String CATALOG_LOCATION = WAREHOUSE + "/catalog-" + CATALOG_NAME;
   /**
-   * A segment's limit on Append Blobs where segments hold few blocks: above the fuzzer's biggest
-   * record, a big property of up to 24 KiB (3 times 8 KiB) on a table kept inline, so that they
-   * close by the block limit.
+   * K, a segment's record limit on Append Blobs where no block limit is drawn: a few of the
+   * fuzzer's records (a run's are 10 to 60), so that the log moves on to a new segment often.
    */
-  private static final long AZURE_SEGMENT_BYTES = 64 << 10;
-
-  /**
-   * A segment's limit on Append Blobs where segments hold Azure's 50,000 blocks: a few of the
-   * fuzzer's records (mostly 100 to 600 bytes, 1 to 7 KiB a run), so that they close by a pad. A
-   * record bigger than a segment holds (a big property on a table kept inline) is rejected before
-   * it is sent (TOO_LARGE).
-   */
-  private static final long AZURE_SMALL_SEGMENT_BYTES = 2 << 10;
+  private static final int AZURE_SEGMENT_RECORDS = 4;
 
   // Retry commits, throttled writes and lost races without sleeping; merge manifests early, so
   // merge appends read them; keep two previous metadata files, so pointer-mode commits delete
@@ -862,9 +853,8 @@ class TestCatalogFaultProperties {
      * fusedWriters} is set, else after them, at its own point past the knobs. With a {@code
      * segmentLimit}, the catalog object holds
      * at most that many writes, and an append past it fails (Bug 66); on Append Blobs, each
-     * segment holds at most that many blocks and closes by its block limit ({@link
-     * #AZURE_SEGMENT_BYTES}), else Azure's 50,000, and closes by a pad ({@link
-     * #AZURE_SMALL_SEGMENT_BYTES}).
+     * segment holds at most that many blocks, its record limit K, else Azure's 50,000 with K
+     * {@link #AZURE_SEGMENT_RECORDS}.
      */
     Run(List<LocalCatalogMode> modes, int maxUpdateSize, boolean faults, boolean strictVersions,
         InMemoryAtomicFileIO.ReadMode reads, boolean recordingReads, int gzipWriters,
@@ -882,7 +872,8 @@ class TestCatalogFaultProperties {
       // and record the version they find, one GET a read with no lookup, or not (step 7)
       io.setReadsRecordVersion(recordingReads);
       Statistics.label("reads record their version").collect(recordingReads);
-      if (segmentLimit > 0) {
+      if (segmentLimit > 0 && !modes.get(0).azureLog) {
+        // the one object's appends (Bug 66); a segmented log's segments take the limit instead
         io.limitSegments(segmentLimit);
       }
       Statistics.label("segment limit").collect(segmentLimit);
@@ -895,8 +886,9 @@ class TestCatalogFaultProperties {
         // The store before the catalogs that open the log on it, with the block limit drawn
         this.azureBlocks = segmentLimit > 0 ? segmentLimit : 50_000;
         this.azure = LocalCatalogMode.azureStore(io, CATALOG_LOCATION, azureBlocks);
-        properties.put(LogCatalogProperties.LOG_SEGMENT_MAX_BYTES, String.valueOf(
-            segmentLimit > 0 ? AZURE_SEGMENT_BYTES : AZURE_SMALL_SEGMENT_BYTES));
+        // K: the block limit drawn, or segments of a few records, so that the log moves on
+        properties.put(LogCatalogProperties.LOG_SEGMENT_RECORDS,
+            String.valueOf(segmentLimit > 0 ? segmentLimit : AZURE_SEGMENT_RECORDS));
       } else {
         this.azure = null;
       }
@@ -1026,13 +1018,15 @@ class TestCatalogFaultProperties {
       }
       checkCheckpoints();
       if (azure != null) {
-        long segments = azure.versions().keySet().stream().filter(n -> n.contains("/seg/")).count();
-        long pads = azure.appends().stream().filter(a -> a.block()[0] == 0).count();
-        String limit = azureBlocks < 50_000 ? azureBlocks + " blocks" : "2 KiB";
+        long segments = azure.appends().stream().map(InMemoryAppendBlobStore.Appended::name)
+            .distinct().count();
+        long seals = azure.appends().stream().filter(a -> a.block()[0] == 0).count();
+        String limit = azureBlocks < 50_000 ? azureBlocks + " records" : AZURE_SEGMENT_RECORDS
+            + " records";
         Statistics.label("Append Blob segments").collect(
             limit + ": " + (segments < 2 ? "1" : segments < 4 ? "2-3" : "4 or more"));
-        Statistics.label("pads").collect(
-            limit + ": " + (pads == 0 ? "none" : pads < 3 ? "1-2" : "3 or more"));
+        Statistics.label("seal frames").collect(
+            limit + ": " + (seals == 0 ? "none" : seals < 3 ? "1-2" : "3 or more"));
       }
       long pageOuts = pageOuts();
       Statistics.label("PageOut records").collect(
@@ -1110,14 +1104,12 @@ class TestCatalogFaultProperties {
     }
 
     /**
-     * What a request of the log on Append Blobs meets: its reads of the head, the checkpoints and
-     * the segments are the catalog's reads, which a preempting command may run before, as before a
-     * read of the catalog object (a read after it sees its effects: a segment read short of a
-     * close goes on to the next segment, AZURE_LOG.md); the others' reads (pages) fail as reads
-     * of other files do. Every write is one of the plan's: the records' appends and the moves
-     * that make room for them (pads, new segments, the head's CAS), and a compaction's GC record,
-     * checkpoint, head and deletes. A blind append has no conflict to report, so a write that the
-     * plan has land as a conflict lands with its reply lost.
+     * What a request of the segmented log's segments meets (its catalog object's requests meet
+     * the store's faults as one object's do): its reads of the segments are the catalog's reads,
+     * which a preempting command may run before, as before a read of the catalog object. Every
+     * write is one of the plan's: the records' appends, seal frames, new segments, and the sweep's
+     * deletes. A blind append has no conflict to report, so a write that the plan has land as a
+     * conflict lands with its reply lost.
      */
     private InMemoryAppendBlobStore.Fault onAzure(InMemoryAppendBlobStore.Op op, String name) {
       switch (op) {
@@ -1125,8 +1117,7 @@ class TestCatalogFaultProperties {
           return InMemoryAppendBlobStore.Fault.NONE;
         case READ:
         case PROPERTIES:
-          boolean log = !name.startsWith(CATALOG_LOCATION + "/pages/");
-          return onRead(log ? CATALOG_LOCATION : name) == ReadFault.NONE
+          return onRead(CATALOG_LOCATION) == ReadFault.NONE
               ? InMemoryAppendBlobStore.Fault.NONE : InMemoryAppendBlobStore.Fault.FAIL_BEFORE;
         default:
           switch (onWrite(CATALOG_LOCATION, AtomicOutputFile.Strategy.APPEND)) {
@@ -1144,9 +1135,10 @@ class TestCatalogFaultProperties {
       }
     }
 
-    /** The log on Append Blobs as it holds now, every write it ever took included. */
-    private AzureLogHistory azureHistory() {
-      return AzureLogHistory.of(azure, CATALOG_LOCATION);
+    /** The segmented log as its stores hold it now, every write they ever took included. */
+    private SegmentedLogHistory azureHistory() {
+      return LocalCatalogMode.azureHistory(
+          io, new LocalCatalogMode.AzureStore(CATALOG_LOCATION, azure));
     }
 
     private void preemptAt(int request) {
@@ -2226,7 +2218,8 @@ class TestCatalogFaultProperties {
       CatalogState file = (sharedLog != null
           ? new CatalogLog(sharedLog, LogCatalogProperties.runtimeConfig(PROPERTIES))
           : azure != null
-              ? new CatalogLog(AzureLogs.open(azure, CATALOG_LOCATION, readerProperties),
+              ? new CatalogLog(
+                  AzureLogs.open(io, CATALOG_LOCATION, azure, CATALOG_LOCATION, readerProperties),
                   LogCatalogProperties.runtimeConfig(PROPERTIES))
               : CatalogTestSupport.log(io, CATALOG_LOCATION, PROPERTIES)).read().state();
       List<TableIdentifier> ids = new ArrayList<>();

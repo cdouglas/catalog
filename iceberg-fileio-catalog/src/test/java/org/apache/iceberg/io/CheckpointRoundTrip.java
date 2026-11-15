@@ -45,7 +45,8 @@ import org.intentlog.CommittedSet;
 import org.intentlog.DedupHorizonExceededException;
 import org.intentlog.PagedOutException;
 import org.intentlog.Replica;
-import org.intentlog.azure.AzureLogHistory;
+import org.intentlog.fileio.SegmentedLogHistory;
+import org.intentlog.segments.SegmentPosition;
 import org.intentlog.fileio.AtomicFileLog;
 import org.intentlog.memory.InMemorySharedLog;
 import org.intentlog.wire.CommittedSetCodec;
@@ -93,6 +94,9 @@ public final class CheckpointRoundTrip {
     List<InMemoryAtomicFileIO.Write> history = io.history();
     for (int i = 0; i < history.size(); i++) {
       InMemoryAtomicFileIO.Write write = history.get(i);
+      if (segmented(write.after())) {
+        continue; // a segmented log's catalog object: its log is checked whole (SegmentedLogHistory)
+      }
       String difference = difference(write);
       if (difference != null) {
         throw new AssertionError(
@@ -113,7 +117,7 @@ public final class CheckpointRoundTrip {
   public static void assertPagesExist(InMemoryAtomicFileIO io) {
     for (String location : io.conditionalWrites().keySet()) {
       byte[] file = io.bytes(location);
-      if (file == null) {
+      if (file == null || segmented(file)) {
         continue;
       }
       String problem = pagesProblem(CatalogTestSupport.replay(file),
@@ -240,23 +244,30 @@ public final class CheckpointRoundTrip {
         byCount, log.storedPages());
   }
 
+  /** Whether {@code object} is a segmented log's catalog object (format 4). */
+  static boolean segmented(byte[] object) {
+    return object != null && object.length >= AtomicFileLog.HEADER_SIZE
+        && java.nio.ByteBuffer.wrap(object, 4, 4).getInt()
+            == AtomicFileLog.SEGMENTED_FORMAT_VERSION;
+  }
+
   /**
-   * As {@link #assertEveryCheckpoint(InMemorySharedLog)}, for a log on Append Blobs in memory
-   * whose store kept its history ({@link AzureLogHistory}): its checkpoints are by position, each
-   * covering the records that landed before it.
+   * As {@link #assertEveryCheckpoint(InMemorySharedLog)}, for a segmented log whose stores kept
+   * their history ({@link SegmentedLogHistory}): its checkpoints are by position, each covering
+   * the records before it.
    */
-  public static void assertEveryCheckpoint(AzureLogHistory log, String what) {
+  public static void assertEveryCheckpoint(SegmentedLogHistory log, String what) {
     if (log.checkpoints().isEmpty()) {
       return;
     }
     List<String> violations = new ArrayList<>(log.violations());
-    if (!log.checkpoints().containsKey(0L)) {
-      throw new AssertionError("checkpoints of " + what + ": none at position 0");
+    if (!log.checkpoints().containsKey(SegmentPosition.START)) {
+      throw new AssertionError("checkpoints of " + what + ": none at the log's start");
     }
     Map<Integer, byte[]> byCount = new java.util.TreeMap<>();
-    log.checkpoints().forEach((position, checkpoint) ->
-        byCount.put(position == 0L ? 0 : log.recordsBefore(position), checkpoint));
-    List<byte[]> records = log.records().stream().map(AzureLogHistory.Landed::record).toList();
+    log.checkpoints().forEach((position, checkpoint) -> byCount.put(
+        position.equals(SegmentPosition.START) ? 0 : log.recordsBefore(position), checkpoint));
+    List<byte[]> records = log.records().stream().map(SegmentedLogHistory.Landed::record).toList();
     assertEveryCheckpoint(what, violations, records, byCount, log.pages());
   }
 

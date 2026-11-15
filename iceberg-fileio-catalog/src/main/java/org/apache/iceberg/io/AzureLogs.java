@@ -21,16 +21,21 @@ package org.apache.iceberg.io;
 import com.azure.storage.blob.BlobUrlParts;
 import com.azure.storage.common.StorageSharedKeyCredential;
 import java.util.Map;
+import java.util.concurrent.ThreadLocalRandom;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.base.Strings;
 import org.intentlog.SharedLog;
-import org.intentlog.azure.AppendBlobLog;
+import org.intentlog.azure.AppendBlobSegments;
 import org.intentlog.azure.AppendBlobStore;
 import org.intentlog.azure.AzureAppendBlobStore;
+import org.intentlog.fileio.AtomicFileLog;
+import org.intentlog.fileio.SegmentedLog;
 
 /**
- * Opens a catalog's log on Azure Append Blobs ({@code fileio.catalog.log} {@code azure-append},
- * docs/AZURE_LOG.md "Configuration") from its properties. The catalog's only use of {@code
+ * Opens a catalog's segmented log on Azure Append Blobs ({@code fileio.catalog.log} {@code
+ * azure-append}, docs/LOG_SEGMENTS.md and docs/AZURE_LOG.md "Configuration") from its properties:
+ * the catalog object at the catalog's location in its FileIO, in format 4, and the segments
+ * Append Blobs at {@code fileio.catalog.log.location}. The catalog's only use of {@code
  * intentlog-azure}, which it depends on optionally: a catalog that keeps another log loads none of
  * it.
  */
@@ -44,31 +49,29 @@ public final class AzureLogs {
   private AzureLogs() {}
 
   /** The log's options {@code properties} set (LogCatalogProperties' {@code fileio.catalog.log.*}). */
-  public static AppendBlobLog.Options options(Map<String, String> properties) {
-    AppendBlobLog.Options options = AppendBlobLog.Options.defaults();
-    String append = properties.getOrDefault(LogCatalogProperties.LOG_APPEND, "blind");
-    Preconditions.checkArgument(append.equals("blind") || append.equals("conditional"),
-        "%s must be blind or conditional, got %s", LogCatalogProperties.LOG_APPEND, append);
-    options = options.withConditional(append.equals("conditional"));
-    String limit = properties.get(LogCatalogProperties.LOG_SEGMENT_MAX_BYTES);
-    if (limit != null) {
-      options = options.withSegmentLimit(Long.parseLong(limit));
+  public static SegmentedLog.Options options(Map<String, String> properties) {
+    SegmentedLog.Options options = SegmentedLog.Options.defaults();
+    String records = properties.get(LogCatalogProperties.LOG_SEGMENT_RECORDS);
+    if (records != null) {
+      options = options.withLimit(Long.parseLong(records));
     }
-    String keep = properties.get(LogCatalogProperties.LOG_CHECKPOINT_KEEP);
-    if (keep != null) {
-      options = options.withCheckpointKeep(Integer.parseInt(keep));
+    String ttl = properties.get(LogCatalogProperties.LOG_RETIRE_TTL_MS);
+    if (ttl != null) {
+      options = options.withRetireTtlMs(Long.parseLong(ttl));
     }
-    String grace = properties.get(LogCatalogProperties.LOG_TRIM_GRACE_MS);
-    if (grace != null) {
-      options = options.withTrimGraceMs(Long.parseLong(grace));
-    }
-    return options;
+    return options.withCopies(
+        Boolean.parseBoolean(properties.getOrDefault(LogCatalogProperties.LOG_COPIES, "false")));
   }
 
-  /** The log at {@code root} of {@code store}, as {@code properties} configure it. */
-  public static AppendBlobLog open(
-      AppendBlobStore store, String root, Map<String, String> properties) {
-    return new AppendBlobLog(store, root, options(properties));
+  /**
+   * The segmented log whose catalog object is at {@code catalogLocation} in {@code io} and whose
+   * segments are named under {@code prefix} in {@code store}, as {@code properties} configure it.
+   */
+  public static SegmentedLog open(SupportsAtomicOperations io, String catalogLocation,
+      AppendBlobStore store, String prefix, Map<String, String> properties) {
+    AtomicFileLog catalog = AtomicFileLog.segmented(io, catalogLocation,
+        () -> ThreadLocalRandom.current().nextLong(), LogCatalogProperties.readLookup(properties));
+    return new SegmentedLog(catalog, new AppendBlobSegments(store), prefix, options(properties));
   }
 
   /**
@@ -88,12 +91,14 @@ public final class AzureLogs {
   }
 
   /**
-   * The log {@code properties} locate ({@code fileio.catalog.log.location}, an {@code https} Blob
-   * URL of a container and a path in it), signed with the account key they give.
+   * The log of the catalog at {@code catalogLocation} in {@code io}, its segments where {@code
+   * properties} locate them ({@code fileio.catalog.log.location}, an {@code https} Blob URL of a
+   * container and a path in it), signed with the account key they give.
    *
    * @throws IllegalArgumentException if they give no location or no account key
    */
-  static SharedLog open(Map<String, String> properties) {
+  static SharedLog open(
+      SupportsAtomicOperations io, String catalogLocation, Map<String, String> properties) {
     String location = properties.get(LogCatalogProperties.LOG_LOCATION);
     Preconditions.checkArgument(!Strings.isNullOrEmpty(location),
         "A catalog on an Azure log needs %s: https://<account>.blob.core.windows.net/<container>/"
@@ -108,6 +113,6 @@ public final class AzureLogs {
         SHARED_KEY_ACCOUNT_KEY);
     AzureAppendBlobStore store =
         AzureAppendBlobStore.create(containerUrl, new StorageSharedKeyCredential(account, key));
-    return open(store, path, properties);
+    return open(io, catalogLocation, store, path, properties);
   }
 }

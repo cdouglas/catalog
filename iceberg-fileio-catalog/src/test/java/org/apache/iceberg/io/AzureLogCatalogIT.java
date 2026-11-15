@@ -40,13 +40,12 @@ import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 
 /**
  * Iceberg's catalog and catalog-transaction suites ({@link TestLocalCatalog}, {@link
- * TestLocalCatalogTransaction}) on a catalog whose log is on Append Blobs of a real account
- * (docs/AZURE_LOG.md "Testing", steps 4 and 5): a {@link FileIOCatalog} that opens its log from its
+ * TestLocalCatalogTransaction}) on a catalog whose log's segments are Append Blobs of a real
+ * account (docs/LOG_SEGMENTS.md "Testing"): a {@link FileIOCatalog} that opens its log from its
  * properties ({@code fileio.catalog.log} {@code azure-append}, an account key), as a deployment's
- * does, with blind appends, in each table metadata storage. The tables' files stay in memory.
- * Segments of 1 KiB (2 KiB for inline tables) move the log on every few records, closing them with
- * real pads, and a trim grace of 0 lets a sweep delete trimmed segments that other instances'
- * cached heads still name.
+ * does, in each table metadata storage. The catalog object and the tables' files stay in memory.
+ * Segments of {@link #SEGMENT_RECORDS} records move the log on every few commits, and a retirement
+ * TTL of 0 lets a sweep delete retired segments that other instances' catalog objects still name.
  *
  * <p>Run explicitly, with {@code AZURE_LOG_IT_CONTAINER_URL} (a container's URL on the primary
  * endpoint) and {@code AZURE_STORAGE_KEY} (its account key) set: {@code mvn -o -pl
@@ -63,13 +62,8 @@ class AzureLogCatalogIT {
           .format(Instant.now())
       + "-" + Long.toHexString(ThreadLocalRandom.current().nextLong() >>> 16);
 
-  /**
-   * A segment's limit: a few of the suites' records, so that their logs move on. Records of
-   * inline tables are bigger; a record no segment holds would be rejected (TOO_LARGE).
-   */
-  private static long segmentBytes(LocalCatalogMode mode) {
-    return mode.inlineTM ? 2 << 10 : 1 << 10;
-  }
+  /** K: a few of the suites' records, so that their logs move on to new segments. */
+  private static final int SEGMENT_RECORDS = 4;
 
   /**
    * The log of the catalog {@code name} in {@code warehouse} on the account: under this run's
@@ -81,10 +75,8 @@ class AzureLogCatalogIT {
     Map<String, String> properties = new HashMap<>();
     properties.put(LogCatalogProperties.LOG, LogCatalogProperties.LOG_AZURE_APPEND);
     properties.put(LogCatalogProperties.LOG_LOCATION, trimSlash(URL) + "/" + root);
-    properties.put(LogCatalogProperties.LOG_APPEND, "blind");
-    properties.put(LogCatalogProperties.LOG_SEGMENT_MAX_BYTES,
-        String.valueOf(segmentBytes(mode)));
-    properties.put(LogCatalogProperties.LOG_TRIM_GRACE_MS, "0");
+    properties.put(LogCatalogProperties.LOG_SEGMENT_RECORDS, String.valueOf(SEGMENT_RECORDS));
+    properties.put(LogCatalogProperties.LOG_RETIRE_TTL_MS, "0");
     properties.put(AzureLogs.SHARED_KEY_ACCOUNT_NAME, BlobUrlParts.parse(URL).getAccountName());
     properties.put(AzureLogs.SHARED_KEY_ACCOUNT_KEY, KEY);
     return properties;
@@ -114,13 +106,13 @@ class AzureLogCatalogIT {
     // A log's newest segment outlives the sweeps: its ordinal is how often the log moved on
     Map<String, Long> last = new HashMap<>();
     for (String f : files) {
-      int seg = f.indexOf("/seg/");
+      int seg = f.indexOf("/seg-");
       if (seg >= 0) {
         long ordinal = Long.parseLong(f.substring(seg + 5, f.indexOf('-', seg + 5)));
         last.merge(f.substring(0, seg), ordinal, Math::max);
       }
     }
-    long logs = files.stream().filter(f -> f.endsWith("/head")).count();
+    long logs = last.size();
     long moved = last.values().stream().mapToLong(Long::longValue).sum();
     for (String f : files) {
       c.getBlobClient(f).deleteIfExists();

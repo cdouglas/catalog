@@ -41,7 +41,6 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
 import org.apache.iceberg.types.Types;
 import org.intentlog.CommitTrace;
-import org.intentlog.azure.AzureLogHistory;
 import org.intentlog.azure.InMemoryAppendBlobStore;
 import org.intentlog.fileio.AtomicFileLog;
 import org.intentlog.memory.InMemorySharedLog;
@@ -225,7 +224,7 @@ class TestCatalogRaceProperties {
         ? LocalCatalogMode.azureStore(io, CATALOG) : null;
     if (blobs != null) {
       // A's writes are its commits' sends (the trace's SEND), each just before its first append,
-      // which may find its segment full and move the log on before it lands. A compaction's
+      // which may find its segment ended and install the next before it lands. A compaction's
       // appends (its GC record, PageOuts) are no commit's sends.
       boolean[] sending = {false};
       blobs.intercept((op, name) -> {
@@ -369,8 +368,8 @@ class TestCatalogRaceProperties {
       CheckpointRoundTrip.assertEveryCheckpoint(log);
     }
     if (blobs != null) {
-      CheckpointRoundTrip.assertEveryCheckpoint(
-          AzureLogHistory.of(blobs, CATALOG), "the Azure log" + context);
+      CheckpointRoundTrip.assertEveryCheckpoint(LocalCatalogMode.azureHistory(
+          io, new LocalCatalogMode.AzureStore(CATALOG, blobs)), "the segmented log" + context);
     }
     Statistics.label("PageOut records").collect(pageOuts(io, log, blobs) > 0);
   }
@@ -397,7 +396,8 @@ class TestCatalogRaceProperties {
     if (log != null) {
       records.addAll(log.records());
     } else if (blobs != null) {
-      AzureLogHistory.of(blobs, CATALOG).records().forEach(landed -> records.add(landed.record()));
+      LocalCatalogMode.azureHistory(io, new LocalCatalogMode.AzureStore(CATALOG, blobs)).records()
+          .forEach(landed -> records.add(landed.record()));
     } else {
       for (InMemoryAtomicFileIO.Write write : io.history()) {
         if (write.location().equals(CATALOG)) {

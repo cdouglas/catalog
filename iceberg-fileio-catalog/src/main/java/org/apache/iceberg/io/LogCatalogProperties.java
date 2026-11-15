@@ -299,8 +299,9 @@ public final class LogCatalogProperties {
 
   /**
    * Which log the catalog keeps: {@link #LOG_ATOMIC_FILE}, one object of its FileIO's store (the
-   * default, {@code FileIOCatalog}'s), or {@link #LOG_AZURE_APPEND}, Append Blobs written by
-   * appends without a position condition, with checkpoints apart (docs/AZURE_LOG.md).
+   * default, {@code FileIOCatalog}'s), or {@link #LOG_AZURE_APPEND}, a segmented log: the catalog
+   * object, which holds the checkpoint and installs segments, and segments on Azure Append Blobs
+   * that writers append to blind (docs/LOG_SEGMENTS.md, docs/AZURE_LOG.md).
    */
   public static final String LOG = "fileio.catalog.log";
 
@@ -308,19 +309,22 @@ public final class LogCatalogProperties {
   public static final String LOG_AZURE_APPEND = "azure-append";
 
   /**
-   * Where the Azure log is: {@code https://<account>.blob.core.windows.net/<container>/<path>}
-   * (default: the warehouse's {@code catalog.log}, given as such a URL).
+   * Where the Azure log's segments are: {@code https://<account>.blob.core.windows.net/<container>
+   * /<path>}, the path their names' prefix. Required with {@link #LOG_AZURE_APPEND}.
    */
   public static final String LOG_LOCATION = "fileio.catalog.log.location";
 
   /**
-   * How the Azure log appends: {@code blind} (the default; the service picks where a record
-   * lands) or {@code conditional} (at the tail the writer read, the ablation).
+   * K, the record limit each Install sets for its segment (default: the store's block limit,
+   * 50,000 on Azure, provisional). At most the block limit.
    */
-  public static final String LOG_APPEND = "fileio.catalog.log.append";
+  public static final String LOG_SEGMENT_RECORDS = "fileio.catalog.log.segment.records";
 
-  /** A new segment's limit, in bytes (default 64 MiB, provisional). */
-  public static final String LOG_SEGMENT_MAX_BYTES = "fileio.catalog.log.segment.max.bytes";
+  /**
+   * Whether an append near its segment's limit also sends a copy to the next segment (default
+   * false; docs/LOG_SEGMENTS.md D11).
+   */
+  public static final String LOG_COPIES = "fileio.catalog.log.copies";
 
   /**
    * The Azure log compacts once the records after its checkpoint (or after the last GC record,
@@ -349,11 +353,8 @@ public final class LogCatalogProperties {
 
   public static final int DEFAULT_LOG_CHECKPOINT_RECORDS = 10_000;
 
-  /** Checkpoints the sweep keeps besides the head's (default 2). */
-  public static final String LOG_CHECKPOINT_KEEP = "fileio.catalog.log.checkpoint.keep";
-
-  /** How long a segment out of the head stays before the sweep deletes it (default 60 s). */
-  public static final String LOG_TRIM_GRACE_MS = "fileio.catalog.log.trim.grace.ms";
+  /** How long a retired segment stays before the sweep deletes it (default 60 s). */
+  public static final String LOG_RETIRE_TTL_MS = "fileio.catalog.log.retire.ttl.ms";
 
   /** The log {@code properties} name: {@link #LOG_ATOMIC_FILE} unless they name another. */
   public static String log(Map<String, String> properties) {

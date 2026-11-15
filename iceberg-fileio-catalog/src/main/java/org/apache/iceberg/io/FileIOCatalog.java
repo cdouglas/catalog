@@ -40,8 +40,9 @@ import org.intentlog.fileio.AtomicFileLog;
  *   <li>{@code fileio.catalog.inline.manifests}: inline manifest lists too (default false)
  *   <li>{@code fileio.catalog.inline.max.update.size}: the largest inline table update, in bytes
  *   <li>{@code fileio.catalog.log}: {@code atomic-file} (the default: the one object) or {@code
- *       azure-append}, a log on Azure Append Blobs at {@code fileio.catalog.log.location}
- *       (docs/AZURE_LOG.md "Configuration"; {@link AzureLogs})
+ *       azure-append}, a segmented log: the catalog object at {@code <warehouse>/catalog}, its
+ *       segments Azure Append Blobs at {@code fileio.catalog.log.location} (docs/LOG_SEGMENTS.md,
+ *       docs/AZURE_LOG.md "Configuration"; {@link AzureLogs})
  * </ul>
  */
 public class FileIOCatalog extends LogCatalog {
@@ -87,8 +88,9 @@ public class FileIOCatalog extends LogCatalog {
       fileIO = (SupportsAtomicOperations) CatalogUtil.loadFileIO(fileIOImpl, properties, null);
     }
     if (LogCatalogProperties.log(properties).equals(LogCatalogProperties.LOG_AZURE_APPEND)) {
-      // the log on Append Blobs (docs/AZURE_LOG.md); the tables' files stay in the FileIO
-      open(AzureLogs.open(properties), fileIO);
+      // a segmented log (docs/LOG_SEGMENTS.md): the catalog object here, its segments on Append
+      // Blobs; the tables' files stay in the FileIO
+      open(AzureLogs.open(fileIO, catalogLocation, properties), fileIO);
       return;
     }
     open(new AtomicFileLog(fileIO, catalogLocation, LogCatalogProperties.readLookup(properties)),

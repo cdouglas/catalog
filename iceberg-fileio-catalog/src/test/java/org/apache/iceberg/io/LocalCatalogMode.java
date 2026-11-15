@@ -28,9 +28,8 @@ import java.util.function.LongSupplier;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.io.AtomicOutputFile.Strategy;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
-import org.intentlog.azure.AppendBlobLog;
-import org.intentlog.azure.AzureLogHistory;
 import org.intentlog.azure.InMemoryAppendBlobStore;
+import org.intentlog.fileio.SegmentedLogHistory;
 import org.intentlog.memory.InMemorySharedLog;
 
 /**
@@ -48,11 +47,12 @@ import org.intentlog.memory.InMemorySharedLog;
  *   <li>{@code MEMLOG*}: a {@link LogCatalog} whose log is an {@link InMemorySharedLog} (the data
  *       stays in the store): every commit appends, and the writer whose commit takes the log to 3
  *       records past its checkpoint compacts it (a GC record, a checkpoint, a trim).
- *   <li>{@code AZLOG*}: a {@link LogCatalog} whose log is an {@link AppendBlobLog} on an {@link
- *       InMemoryAppendBlobStore} (docs/AZURE_LOG.md; the data stays in the store), each catalog
- *       an instance of its own: every commit appends blind, the writer whose commit takes the log
- *       to 3 records past its checkpoint compacts it, and a segment holds at most {@link
- *       #AZURE_BLOCKS} blocks, so the log moves to a new segment every few commits. Given {@code
+ *   <li>{@code AZLOG*}: a {@link LogCatalog} whose log is a segmented log (docs/LOG_SEGMENTS.md):
+ *       its catalog object at the catalog's location in the store, in format 4, its segments in
+ *       an {@link InMemoryAppendBlobStore} (the data stays in the store), each catalog an instance
+ *       of its own: every commit appends blind, the writer whose commit takes the log to 3 records
+ *       past its checkpoint compacts it, and a segment holds at most {@link #AZURE_BLOCKS}
+ *       records, so the log moves to a new segment every few commits. Given {@code
  *       fileio.catalog.log.location} and an account key, the catalog is instead a {@link
  *       FileIOCatalog} that opens its log on that account from its properties, as a deployment's
  *       does ({@link AzureLogCatalogIT}).
@@ -83,7 +83,7 @@ enum LocalCatalogMode {
   final boolean inlineML;
   /** The catalog's log is an {@link InMemorySharedLog}. */
   final boolean sharedLog;
-  /** The catalog's log is an {@link AppendBlobLog} on Append Blobs in memory. */
+  /** The catalog's log is a segmented log, its segments on Append Blobs in memory. */
   final boolean azureLog;
 
   LocalCatalogMode(int maxAppendCount, boolean inlineTM, boolean inlineML, boolean sharedLog) {
@@ -181,7 +181,7 @@ enum LocalCatalogMode {
 
   /**
    * The Append Blob store of the catalog at {@code location} over {@code io}, which keeps its
-   * history for the checks ({@link AzureLogHistory}); the log's root in it is the location.
+   * history for the checks ({@link #azureHistory}); its segments' names start with the location.
    */
   static InMemoryAppendBlobStore azureStore(InMemoryAtomicFileIO io, String location) {
     return azureStore(io, location, AZURE_BLOCKS);
@@ -201,6 +201,31 @@ enum LocalCatalogMode {
   /** The Append Blob stores of catalogs over {@code io}. */
   static List<AzureStore> azureStores(InMemoryAtomicFileIO io) {
     return io.attachments(AZURE_STORE, AzureStore.class);
+  }
+
+  /**
+   * The segmented log of the catalog at {@code a}'s location over {@code io}, as its stores held
+   * it: every version of its catalog object, every append to its segments, and its pages.
+   */
+  static SegmentedLogHistory azureHistory(InMemoryAtomicFileIO io, AzureStore a) {
+    List<byte[]> versions = new java.util.ArrayList<>();
+    for (InMemoryAtomicFileIO.Write w : io.history()) {
+      if (w.location().equals(a.location())) {
+        versions.add(w.after());
+      }
+    }
+    List<SegmentedLogHistory.Append> appends = new java.util.ArrayList<>();
+    a.store().appends().forEach(
+        x -> appends.add(new SegmentedLogHistory.Append(x.name(), x.offset(), x.block())));
+    Map<String, byte[]> pages = new java.util.TreeMap<>();
+    String prefix = a.location() + ".committed/";
+    for (FileInfo f : io.listPrefix(prefix)) {
+      byte[] page = io.bytes(f.location());
+      if (page != null) {
+        pages.put(f.location().substring(prefix.length()), page);
+      }
+    }
+    return new SegmentedLogHistory(versions, appends, a.location(), pages);
   }
 
   /**
@@ -288,7 +313,6 @@ enum LocalCatalogMode {
     if (azureLog) {
       properties.put(LogCatalogProperties.LOG, LogCatalogProperties.LOG_AZURE_APPEND);
       properties.put(LogCatalogProperties.LOG_CHECKPOINT_RECORDS, String.valueOf(maxAppendCount));
-      properties.put(LogCatalogProperties.LOG_SEGMENT_MAX_BYTES, String.valueOf(1 << 20));
     }
     properties.putAll(extra);
     String location = warehouse + "/catalog-" + name;
@@ -297,8 +321,9 @@ enum LocalCatalogMode {
     LogCatalog catalog = sharedLog
         ? new LogCatalog(name, sharedLog(io, location), io, Maps.newHashMap())
         : azureLog && !onAccount
-            ? new LogCatalog(name, AzureLogs.open(azureStore(io, location), location, properties),
-                io, Maps.newHashMap())
+            ? new LogCatalog(name,
+                AzureLogs.open(io, location, azureStore(io, location), location, properties), io,
+                Maps.newHashMap())
             : new FileIOCatalog(name, location, io, Maps.newHashMap());
     if (clockMs != null) {
       catalog.clock(clockMs);
@@ -326,9 +351,12 @@ enum LocalCatalogMode {
       return;
     }
     if (azureLog) {
-      assertThat(io.conditionalWrites()).as("conditional writes to the store").isEmpty();
+      // The store took conditional writes only of the catalogs' objects, in format 4
+      List<String> objects = azureStores(io).stream().map(AzureStore::location).toList();
+      assertThat(objects).as("conditional writes to the store")
+          .containsAll(io.conditionalWrites().keySet());
       azureStores(io).forEach(a -> CheckpointRoundTrip.assertEveryCheckpoint(
-          AzureLogHistory.of(a.store(), a.location()), "the Azure log at " + a.location()));
+          azureHistory(io, a), "the segmented log at " + a.location()));
       return;
     }
     io.conditionalWrites()
