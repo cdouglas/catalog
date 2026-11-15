@@ -463,13 +463,79 @@ AZ_CONFIGS = {
                             {"AckedAtReceipt"}),
 }
 
+# The segmented log (SegmentedLog, through MCSegments; docs/LOG_SEGMENTS.md), configurations
+# sg-*: two writers with one record each, segments of one record (K = 1) in blobs of two blocks,
+# one rotation.
+SG_BASE = {
+    "Writers": "{1, 2}",
+    "Recs": "<- OneEach",
+    "Limit": "1",
+    "MaxBlocks": "2",
+    "MaxOrd": "1",
+    "MaxSends": "2",
+    "MaxCopies": "1",
+    "AnySeg": "TRUE",
+    "Ahead": "TRUE",
+    "MaxFaults": "0",
+    "FaultKinds": "{}",
+    "MaxCkpt": "0",
+    "MaxSweep": "0",
+    "Readers": "{1}",
+    "MaxReads": "1",
+    "Bugs": "{}",
+    "Seal": "Seal",
+}
+SG_SAFETY = ["ReadsAreSlices", "AckedInLog", "NamedExist", "Readable", "CheckpointsStable",
+             "CanEnd", "CopiesKnown"]
+SG_ACTIONS = ["AbstractGrows"]
+SG_FAULTS = '{"lostReply", "notSent", "inflight", "shortRead"}'
+# Segments of two records in blobs of three blocks: room for a race inside a segment.
+SG_WIDE = {"Limit": "2", "MaxBlocks": "3"}
+# Writers send to the first segment they may and install only when they must: the larger
+# scenarios' state spaces stay small enough to check.
+SG_NARROW = {"AnySeg": "FALSE", "Ahead": "FALSE"}
+# A checkpoint and two sweeps, over two rotations.
+SG_COMPACT = {"MaxOrd": "2", "MaxCkpt": "1", "MaxSweep": "2"}
+# Every way a segment's end can be wrong breaks the log the same ways.
+SG_VOIDS = {"AbstractGrows", "AckedInLog", "ReadsAreSlices", "CheckpointsStable"}
+
+SG_CONFIGS = {
+    "sg-base": ({}, "pass"),
+    "sg-two-each": ({**SG_NARROW, "Recs": "<- TwoEach", "MaxOrd": "2"}, "pass"),
+    "sg-wide": ({**SG_WIDE, "Recs": "<- TwoEach"}, "pass"),
+    "sg-blocks": ({"Recs": "<- TwoEach", "Limit": "2", "MaxBlocks": "2"}, "pass"),
+    "sg-copies": ({**SG_WIDE, "MaxCopies": "2", "MaxSends": "3"}, "pass"),
+    "sg-three": ({**SG_NARROW, "Writers": "{1, 2, 3}", "Recs": "<- Three"}, "pass"),
+    "sg-compact": ({**SG_NARROW, **SG_COMPACT, "Recs": "<- TwoOne", "MaxReads": "2"}, "pass"),
+    "sg-faults": ({"MaxFaults": "1", "FaultKinds": SG_FAULTS, "MaxReads": "2"}, "pass"),
+    "sg-faults-compact": ({**SG_NARROW, "MaxCkpt": "1", "MaxSweep": "1", "MaxFaults": "1",
+                           "FaultKinds": SG_FAULTS}, "pass"),
+    # The mistakes (LOG_SEGMENTS.md "Invariants"): each must break a property.
+    "sg-catalogseal": ({**SG_WIDE, "Bugs": '{"catalogseal"}'}, SG_VOIDS),
+    "sg-limitatnext": ({**SG_WIDE, "Bugs": '{"limitatnext"}'}, SG_VOIDS),
+    "sg-sealcount": ({**SG_WIDE, "Bugs": '{"sealcount"}'}, SG_VOIDS),
+    "sg-readahead": ({"Bugs": '{"readahead"}'}, {"ReadsAreSlices"}),
+    "sg-voidack": ({**SG_WIDE, "MaxReads": "0", "Bugs": '{"voidack"}'}, {"AckedInLog"}),
+    "sg-createonmissing": ({**SG_COMPACT, "Recs": "<- TwoOne", "MaxReads": "0",
+                            "Bugs": '{"createonmissing"}'},
+                           {"AbstractGrows", "AckedInLog", "CheckpointsStable"}),
+    "sg-sweepearly": ({"MaxSweep": "1", "Bugs": '{"sweepearly"}'}, {"NamedExist", "Readable"}),
+    "sg-sweepinflight": ({"MaxSweep": "1", "Bugs": '{"sweepinflight"}'}, {"NamedExist"}),
+    "sg-sdkretry": ({**SG_WIDE, "MaxFaults": "1", "Bugs": '{"sdkretry"}'}, {"CopiesKnown"}),
+    "sg-overlimit": ({"Limit": "3", "MaxBlocks": "2", "MaxReads": "0", "Bugs": '{"overlimit"}'},
+                     {"CanEnd"}),
+}
+
 MODELS = {"MC": (BASE, SAFETY, ACTIONS), "MCShared": (LOG_BASE, LOG_SAFETY, LOG_ACTIONS),
-          "MCAzure": (AZ_BASE, AZ_SAFETY, AZ_ACTIONS)}
+          "MCAzure": (AZ_BASE, AZ_SAFETY, AZ_ACTIONS),
+          "MCSegments": (SG_BASE, SG_SAFETY, SG_ACTIONS)}
 
 
 def model_of(name):
     if name.startswith("az-"):
         return "MCAzure"
+    if name.startswith("sg-"):
+        return "MCSegments"
     return "MCShared" if name.startswith("log-") else "MC"
 
 
@@ -519,6 +585,15 @@ WITNESSES = [
     ("az-compact", "Not_CheckpointInHead"), ("az-compact", "Not_Trimmed"),
     ("az-compact", "Not_Swept"), ("az-compact", "Not_Writer404"),
     ("az-compact", "Not_Reader404"), ("az-faults", "Not_LateLanding"), ("az-faults", "Not_Copy"),
+    # The segmented log.
+    ("sg-base", "Not_Rotated"), ("sg-two-each", "Not_TwoRotations"), ("sg-base", "Not_TwoOpen"),
+    ("sg-base", "Not_RecordWaits"), ("sg-base", "Not_SealFrame"), ("sg-base", "Not_LimitEnded"),
+    ("sg-base", "Not_VoidByReply"), ("sg-wide", "Not_VoidRead"),
+    ("sg-copies", "Not_AckedSecondCopy"), ("sg-blocks", "Not_Full"),
+    ("sg-base", "Not_InstallLost"), ("sg-base", "Not_ReadNext"),
+    ("sg-compact", "Not_CheckpointMoved"), ("sg-compact", "Not_Retired"),
+    ("sg-compact", "Not_Swept"), ("sg-compact", "Not_Writer404"), ("sg-compact", "Not_Reader404"),
+    ("sg-faults", "Not_LateLanding"), ("sg-faults", "Not_Copy"),
 ]
 
 
@@ -700,7 +775,7 @@ def run_quiet(name, overrides, invariants, properties, model="MC"):
     return "ERROR: " + (err.group(1) if err else "see output")
 
 
-ALL = {**CONFIGS, **LOG_CONFIGS, **AZ_CONFIGS}
+ALL = {**CONFIGS, **LOG_CONFIGS, **AZ_CONFIGS, **SG_CONFIGS}
 
 
 def main():

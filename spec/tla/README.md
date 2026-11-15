@@ -33,7 +33,9 @@ are out of scope.
 | `SharedLogCommit.tla` | The shared-log protocol: the log, checkpoints and trims, writers, compactors, faults, the bug switches, the properties |
 | `SharedLogOracles.tla` | Oracles a fuzzer of the shared log can assert, and `Adequate` |
 | `MCShared.tla` | Its scenarios and coverage witnesses |
-| `check.py` | The configurations of both models (`log-*` for the shared log), and what TLC must report for each |
+| `AzureLog.tla`, `MCAzure.tla` | The Azure log on Append Blobs with a head blob (`az-*`) |
+| `SegmentedLog.tla`, `MCSegments.tla` | The segmented log (`sg-*`) |
+| `check.py` | The configurations of every model (`log-*` for the shared log, `az-*`, `sg-*`), and what TLC must report for each |
 
 ## Running
 
@@ -1123,6 +1125,96 @@ the receipt carries the frame's CRC, which a read through it checks, and the run
 commit by its id. Positions in Java are global offsets (each segment's base in the head), so
 the end of a closed segment and the start of the next are one position. The model's (ordinal,
 offset) pairs are the same places.
+
+## The segmented log
+
+`SegmentedLog.tla` models docs/LOG_SEGMENTS.md's log: a catalog object that installs segments
+and holds the checkpoint, and segments appended blind, below the SPI that `SharedLogCommit.tla`
+takes as one log. It was written before the Java (`intentlog-fileio`'s `SegmentedLog`), and
+replaces `AzureLog.tla` once the Java replaces `AppendBlobLog`. Its configurations are `sg-*`,
+through `MCSegments.tla`.
+
+**What is modelled.** Every frame is one block of its segment.
+- **The catalog object** changes only conditionally, from the version a writer read: an Install
+  (format 3's conditional append) and a checkpoint (a CAS replace) are each one step that lands
+  only if nothing changed the object since. Replay's rule that an Install takes only the next
+  ordinal is therefore never needed in the model.
+- **Writers** send a record to any segment they know (`AnySeg`; else the first they may), or
+  copies of it to later ones (`MaxCopies`), blind. The reply's block count is the frame's
+  index: past the segment's limit K, the copy is void with no read. Faults: a lost reply,
+  nothing sent, and an append in flight that lands later. A writer installs a segment
+  whenever it sends (`Ahead`; else only when no segment it knows takes the record): it
+  creates a blob under a fresh name, then appends the Install with limit K.
+- **The read-through** takes the copies in ordinal order. Each needs the segments before its
+  own ended: the writer reads each one it hasn't seen end, and appends a seal frame to one that
+  hasn't. A copy is acknowledged if its segment hadn't ended before it; else the next copy, or
+  a send to a later segment.
+- **Compactors** put a checkpoint at a record boundary in the log and CAS-replace the catalog
+  object with it, retiring the segments before its own. The sweep (at TTL 0) deletes a retired
+  segment, or an unnamed blob at or below the newest Install's ordinal.
+- **Readers** read from the catalog object they hold, however stale: each segment to its end,
+  then the next; an open segment ends the view, and an ended last one sends the reader to the
+  catalog object again. A read may come back short, as a fault.
+
+**The log the provider presents** (`Abstract`, a ghost) is the records of the installed
+segments in ordinal order, each up to its end (its Kth record or its first seal frame),
+through the first that hasn't ended.
+
+| Property | Statement |
+|---|---|
+| `AbstractGrows` (action) | the log only grows: every record keeps its place (P1, SG3) |
+| `ReadsAreSlices` | SG1, SG2: every read was a slice of the log from its checkpoint |
+| `AckedInLog` | P3: every copy a read-through accepted is in the log where it was read |
+| `NamedExist` | SG4, SG6: every segment the catalog object names exists |
+| `Readable` | P5: the checkpoint lies in a named segment |
+| `CheckpointsStable` | a checkpoint keeps its place in the log |
+| `CanEnd` | SG8: a segment that hasn't ended has room for a seal frame |
+| `CopiesKnown` | no copy of a record is in the log that its writer doesn't know may have landed (the shared-log model's `dup`) |
+
+**Results** (2026-11-15). Every passing configuration holds:
+
+| Configuration | What it adds | Distinct states |
+|---|---|---:|
+| `sg-base` | two writers, one record each, K = 1 in blobs of two blocks, one rotation; any segment, Installs ahead | 5,766 |
+| `sg-two-each` | two records each, three segments (first segment, Installs only when needed) | 36,242 |
+| `sg-wide` | K = 2 in blobs of three blocks: seal frames inside a segment's limit | 140,120 |
+| `sg-blocks` | K equal to the block limit | 86,182 |
+| `sg-copies` | two copies of a record, K = 2 | 36,902 |
+| `sg-three` | three writers | 11,844 |
+| `sg-compact` | a checkpoint and two sweeps, over two rotations; two reads | 308,175 |
+| `sg-faults` | one fault: lost reply, not sent, in flight, short read | 247,120 |
+| `sg-faults-compact` | a fault, with a checkpoint and a sweep | 154,842 |
+
+The larger scenarios narrow writers' choices (`AnySeg` and `Ahead` false): with both open,
+`sg-two-each` had not finished after 15 minutes.
+
+Each bug switch (LOG_SEGMENTS.md "Invariants") breaks a property:
+
+| Switch | Breaks |
+|---|---|
+| `catalogseal` (a catalog record sets a segment's end from a count read before) | `AbstractGrows` |
+| `limitatnext` (the next Install sets a segment's limit) | `AbstractGrows` |
+| `sealcount` (a seal frame ends its segment at a count read before) | `AbstractGrows` |
+| `readahead` (a reader reads on past a segment that hasn't ended) | `ReadsAreSlices` |
+| `voidack` (the read-through accepts a frame past its segment's end) | `AckedInLog` |
+| `createonmissing` (a writer creates a swept segment) | `AckedInLog` |
+| `sweepearly` (the sweep deletes a named segment) | `NamedExist` |
+| `sweepinflight` (the sweep deletes an unnamed blob of any ordinal) | `NamedExist` |
+| `sdkretry` (the SDK resends a timed-out append) | `CopiesKnown` |
+| `overlimit` (an Install sets a limit above the block limit) | `CanEnd` |
+
+`catalogseal`'s trace is D1's example: writer 1 installs segment 1 ahead, sends its record
+there, and reads segment 0 empty to end it; writer 2's record lands in segment 0 and is in the
+log; then writer 1's catalog record ends segment 0 at 0 records.
+
+The witnesses (`check.py --witnesses -k sg-`) are each reached:
+- writes: a rotation, two rotations, two segments open at once, a record waiting in a segment
+  after an open one, a seal frame, a segment ended by its limit, a copy void by its reply and
+  one void on a read, a record acknowledged at its second copy, a block-limit refusal, a lost
+  Install, a late landing, and a record in the log twice;
+- compaction: a checkpoint moved, a segment retired and one swept;
+- reads: a reader stepping past an ended last segment, and a 404 for a stale writer and for a
+  stale reader.
 
 ## History
 

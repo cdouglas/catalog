@@ -340,7 +340,8 @@ pages, and the catalog above the log.
 | SG8 | Every segment can end. Before its end it holds fewer than K frames, so a seal frame fits. | K is at most the store's block limit, and K − 1 of the largest frame and a seal frame fit its largest object, checked when the log opens. |
 | SG9 | A record applies at most once, at its first copy in the log. | The committed set skips a copy of a record that applied; S2 keeps a rejected one rejected. |
 
-The model's mistakes, each a switch that must break a property:
+The mistakes, each a switch that must break a property. The model (`SegmentedLog.tla`) has
+the first ten, and the Java has each as a mutant:
 
 | Switch | The mistake | Breaks |
 |---|---|---|
@@ -349,16 +350,22 @@ The model's mistakes, each a switch that must break a property:
 | `sealcount` | a seal frame ends its segment at a count from an earlier read, not where it lands | SG3 |
 | `readahead` | a reader applies `m+1` before `m` has ended | SG1, SG2 |
 | `voidack` | `readThrough` accepts a frame past its segment's end | SG3, an honest outcome |
-| `overlimit` | an Install sets a limit above the store's block limit | SG8: a segment fills before its end, takes no seal frame, and the log stops |
-| `lastcopy` | `readThrough` decides by a later copy while an earlier one is in the log | an honest outcome, when a compaction drops the id between them (LOG.md's `dup`) |
-| `createonmissing` | a writer that finds a segment missing creates it | SG4, then SG3 |
-| `ordinalgap` | replay takes an Install of any ordinal | SG1 |
-| `rootrecords` | replay applies record frames in the catalog object after an Install | SG5, P1 |
-| `nested` | replay of a segment takes an Install or a Retired entry in it | SG1, SG4 |
-| `sweepearly` | the sweep deletes a segment the checkpoint doesn't cover | P5 (`Readable`) |
+| `createonmissing` | a writer that finds a segment missing creates it | SG3 |
+| `sweepearly` | the sweep deletes a segment the catalog object names | SG4, P5 |
 | `sweepinflight` | the sweep deletes an unnamed blob of the next ordinal | SG4: a delayed Install names a deleted segment, and the log stops |
-| `offsetfromlength` | the receipt's offset is the length before the append, not the reply's | an honest outcome, as in v1 |
 | `sdkretry` | a timed-out append is resent below the runtime | the shared-log model's `dup` |
+| `overlimit` | an Install sets a limit above the store's block limit | SG8: a segment fills before its end, takes no seal frame, and the log stops |
+| `nested` | replay of a segment takes an Install or a Retired entry in it | SG1, SG4 |
+| `lastcopy` | `readThrough` decides by a later copy while an earlier one is in the log | an honest outcome, when a compaction drops the id between them (LOG.md's `dup`) |
+
+The last two are below the model's level: it has no frame bodies, and no committed set.
+Two mistakes can't happen here, and so have no switch. Replay taking an
+Install of any ordinal (`ordinalgap`) needs an Install that lands on a catalog object it
+didn't read, which the catalog object's condition refuses. Replay applying record frames in
+the catalog object (`rootrecords`) needs a writer that appends one, and no writer does:
+a client without a segment store refuses a format 4 object. Replay keeps both rules, each
+with a unit test. A receipt's offset taken from a length read before the append
+(`offsetfromlength`, v1's) is caught by the read-through's length and CRC check, as in v1.
 
 ## Testing
 
@@ -368,7 +375,7 @@ As LOG.md "Testing a provider", per stage:
   object has conditional appends and CAS replace. Segments have blind appends, a block
   limit, record limits and seal frames. The model also has Installs ahead, the Install
   race, copies, appends delayed past an end, readers holding older catalog objects,
-  compaction with positions, retirement with a TTL (as reader epochs), and the sweep. `check.py` holds every switch above to its verdict. `catalogseal`'s
+  compaction with positions, retirement with a TTL (as reader epochs), and the sweep. `check.py` holds each of the model's switches to its verdict. `catalogseal`'s
   trace is D1's example.
 - **`SharedLogContract`** on `SegmentedLog` (`TestSegmentedLogContract`), over both
   in-memory stores.
