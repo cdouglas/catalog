@@ -135,10 +135,16 @@ the catalog cannot do.
   not (another partition, another branch, a property, a rewrite); read-only transactions checked at
   commit. Run on JdbcCatalog (SQLite), on every FileIOCatalog mode, and on RESTCatalog (SNAPSHOT
   only; the rest throw).
-- No false negatives (fileio-catalog, before the encodings judge scan reads by filter): the rebase
-  oracle for reads (`TestRebaseProperties`). A scan read lands after a window of commits it did not
-  see; if admitted, the rows of its ref under its filter at the version it landed on must be the
-  rows at its snapshot (`TableViews.logical`, restricted to the filter). False positives are
-  reported per encoding. A mutant that ignores the filter must fail it.
+- No false negatives (fileio-catalog): the rebase oracle for reads
+  (`TestRebaseProperties.anAdmittedReadSeesTheRowsItRead`). A serializable transaction scans a ref
+  under a filter on the column partitioned tables partition by (by value, set, range, bucket or
+  truncation), writes another table, the same one or nothing, and commits after a window of commits
+  it did not see, before its commit's read, before its record, or both; if admitted, the rows of its
+  ref under its filter where it took effect must be the rows at its snapshot (`TableViews.rows`:
+  rows a rewrite keeps, each with the delete files that delete from it). It judges reads judged by
+  filter as it does reads judged by ref; false positives are reported per encoding and table
+  storage. `fuzz/mutants/reads.sh` calibrates it: a read unchecked at the commit, unheld by the
+  record, a witness blind to its ref's advances, to its resets, or to everything, and a filter
+  judged by the data files added alone.
 - The race fuzzer's catalog transactions draw scans and catalog changes, under its serial-run oracle;
   `TableScript`'s catalog transactions likewise.

@@ -44,11 +44,174 @@ import org.apache.iceberg.TableMetadata;
  * in different catalogs: snapshot ids, UUIDs, timestamps and manifest and metadata file names
  * differ between them, so snapshots appear by position and manifests by content. {@link #physical}
  * is what a reader sees, manifest lists entry by entry ({@link TestInlineDifferentialProperties});
- * {@link #logical} is what a table holds, whatever its manifests' layout.
+ * {@link #logical} is what a table holds, whatever its manifests' layout; {@link #rows} is what a
+ * scan of a ref under a row filter reads, whatever its files' layout.
  */
 final class TableViews {
 
   private TableViews() {}
+
+  /**
+   * The rows a scan of {@code ref} under {@code filter} reads in {@code table}, sorted: none if the
+   * ref names no snapshot (or there is no such ref). A row is a token, which {@code lineage} says
+   * which data file holds, and the delete files that delete from it; two scans read the same rows if
+   * they read the same tokens, each deleted from by the same delete files.
+   *
+   * <p>The model is {@link TableScript}'s data: every row of a data file has the {@code cat} its
+   * bounds give (each file's lower and upper bounds are equal), so a filter on {@code cat} (and its
+   * transforms) selects whole files, exactly, whatever the table's partition spec. A data file's
+   * rows are one token, its path, unless a rewrite (Iceberg's {@code REPLACE}) wrote it: then they
+   * are the rows of the files it replaced, each with the delete files that deleted from it there
+   * ({@link Lineage}), so a rewrite keeps the rows. A delete file deletes from every data file
+   * Iceberg's planning applies it to (by partition, sequence number and referenced file); what it
+   * deletes there is not modeled, so a delete file added where it applies to a row changes the row,
+   * and one that applies to none changes nothing.
+   */
+  static List<String> rows(
+      Table table, String ref, org.apache.iceberg.expressions.Expression filter,
+      boolean caseSensitive, Lineage lineage) {
+    Snapshot snapshot = table.snapshot(ref);
+    if (snapshot == null) {
+      return List.of();
+    }
+    org.apache.iceberg.expressions.Evaluator matches = new org.apache.iceberg.expressions.Evaluator(
+        TableScript.SCHEMA.asStruct(), filter, caseSensitive);
+    List<String> rows = new ArrayList<>();
+    for (FileScanTask task : plan(table, snapshot.snapshotId())) {
+      if (!matches.eval(new CatRow(cat(task.file())))) {
+        continue;
+      }
+      java.util.Set<String> deletes = paths(task.deletes());
+      lineage.rows(task.file().location()).forEach((token, deletedThere) -> {
+        java.util.Set<String> by = new java.util.TreeSet<>(deletedThere);
+        by.addAll(deletes);
+        rows.add(token + " deleted by " + by);
+      });
+    }
+    rows.sort(String::compareTo);
+    return rows;
+  }
+
+  /**
+   * Which rows each data file of a table holds ({@link #rows}): a file's own path, one token,
+   * unless a rewrite wrote it. A rewrite's snapshot must be observed before an expiry removes its
+   * parent: {@link #observe} after each commit.
+   */
+  static final class Lineage {
+    // the rows of each data file a rewrite wrote: token -> the delete files that deleted from it
+    private final Map<String, Map<String, java.util.Set<String>>> rewritten = new HashMap<>();
+    private final java.util.Set<Long> seen = new java.util.HashSet<>();
+
+    /** The rows {@code path} holds: token -> the delete files that deleted from it before. */
+    Map<String, java.util.Set<String>> rows(String path) {
+      Map<String, java.util.Set<String>> rows = rewritten.get(path);
+      return rows != null ? rows : Map.of(path, java.util.Set.of());
+    }
+
+    /**
+     * Records what each rewrite among {@code table}'s snapshots not observed before wrote: each file
+     * it added holds the rows of the files of the same {@code cat} it removed, each with the delete
+     * files that deleted from it in the rewrite's parent.
+     */
+    void observe(Table table) {
+      for (Snapshot s : table.snapshots()) {
+        if (!seen.add(s.snapshotId())
+            || !org.apache.iceberg.DataOperations.REPLACE.equals(s.operation())) {
+          continue;
+        }
+        if (s.parentId() == null || table.snapshot(s.parentId()) == null) {
+          throw new IllegalStateException(
+              "lineage: the parent of rewrite " + s.snapshotId() + " is gone");
+        }
+        java.util.Set<String> removed = new java.util.HashSet<>();
+        s.removedDataFiles(table.io()).forEach(f -> removed.add(f.location()));
+        java.util.Set<String> added = new java.util.HashSet<>();
+        s.addedDataFiles(table.io()).forEach(f -> added.add(f.location()));
+        // the rows each cat's replaced files held, with what deleted from them there
+        Map<Integer, Map<String, java.util.Set<String>>> replaced = new TreeMap<>();
+        for (FileScanTask task : plan(table, s.parentId())) {
+          if (!removed.remove(task.file().location())) {
+            continue;
+          }
+          java.util.Set<String> deletes = paths(task.deletes());
+          Map<String, java.util.Set<String>> rows =
+              replaced.computeIfAbsent(cat(task.file()), k -> new TreeMap<>());
+          rows(task.file().location()).forEach((token, before) -> {
+            java.util.Set<String> by = new java.util.TreeSet<>(before);
+            by.addAll(deletes);
+            rows.put(token, by);
+          });
+        }
+        if (!removed.isEmpty()) {
+          throw new IllegalStateException(
+              "lineage: rewrite " + s.snapshotId() + " removed files its parent lacks: " + removed);
+        }
+        for (FileScanTask task : plan(table, s.snapshotId())) {
+          if (added.remove(task.file().location())) {
+            // the first file a rewrite added in a cat holds the rows it replaced there
+            Map<String, java.util.Set<String>> rows = replaced.remove(cat(task.file()));
+            if (rows != null) {
+              rewritten.put(task.file().location(), rows);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /** The live data files of {@code snapshotId}, with their column bounds and delete files. */
+  private static List<FileScanTask> plan(Table table, long snapshotId) {
+    List<FileScanTask> planned = new ArrayList<>();
+    try (org.apache.iceberg.io.CloseableIterable<FileScanTask> tasks =
+        table.newScan().useSnapshot(snapshotId).includeColumnStats().planFiles()) {
+      tasks.forEach(planned::add);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+    return planned;
+  }
+
+  private static java.util.Set<String> paths(List<DeleteFile> deletes) {
+    java.util.Set<String> paths = new java.util.TreeSet<>();
+    deletes.forEach(d -> paths.add(d.location()));
+    return paths;
+  }
+
+  /** The {@code cat} of every row of {@code file}: its bounds, which {@link TableScript} sets. */
+  private static int cat(org.apache.iceberg.DataFile file) {
+    ByteBuffer lower = file.lowerBounds() == null ? null : file.lowerBounds().get(3);
+    ByteBuffer upper = file.upperBounds() == null ? null : file.upperBounds().get(3);
+    if (lower == null || !lower.equals(upper)) {
+      throw new IllegalStateException("rows: " + file.location() + " has no one cat");
+    }
+    return org.apache.iceberg.types.Conversions.<Integer>fromByteBuffer(
+        org.apache.iceberg.types.Types.IntegerType.get(), lower);
+  }
+
+  /** A row of {@link TableScript#SCHEMA} with only its {@code cat}, which filters read. */
+  private static final class CatRow implements org.apache.iceberg.StructLike {
+    private final Object[] values;
+
+    CatRow(int cat) {
+      this.values = new Object[TableScript.SCHEMA.columns().size()];
+      values[TableScript.SCHEMA.columns().indexOf(TableScript.SCHEMA.findField("cat"))] = cat;
+    }
+
+    @Override
+    public int size() {
+      return values.length;
+    }
+
+    @Override
+    public <T> T get(int pos, Class<T> javaClass) {
+      return javaClass.cast(values[pos]);
+    }
+
+    @Override
+    public <T> void set(int pos, T value) {
+      throw new UnsupportedOperationException("a row of the model is fixed");
+    }
+  }
 
   /**
    * What a reader sees of {@code table}, by item, with snapshots by position: its metadata, every

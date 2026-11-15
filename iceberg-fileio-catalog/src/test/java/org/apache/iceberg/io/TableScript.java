@@ -859,7 +859,7 @@ final class TableScript {
      * {@code index % 4 + 1}, with bounds that say so, and each partition field has the value of
      * that row ({@link #partitionPath}).
      */
-    private DataFile newFile(Table target, int index) {
+    DataFile newFile(Table target, int index) {
       int k = Math.floorMod(index, 4);
       return DataFiles.builder(target.spec())
           .withPath(names + "f" + nextFile++ + ".parquet")

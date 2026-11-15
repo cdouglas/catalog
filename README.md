@@ -216,7 +216,10 @@ suites skip; see [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
     `TestRebaseProperties` runs an operation after commits it did not
     see, under the encoding and under a reference that lets Iceberg
     retry: a record the encoding merges must be what the retry commits.
-    `TestConflictMatrix` pins the per-encoding matrix of design.md.
+    It also lands a serializable transaction's scan after commits it did
+    not see: an admitted read must read the same rows under its filter
+    where it takes effect. `TestConflictMatrix` pins the per-encoding
+    matrix of design.md.
 
   Each property's `tries` is in its `@Property` annotation; raise it for
   a longer run. Every bug the fuzzers or reviews found in this project

@@ -35,6 +35,8 @@ import org.apache.iceberg.HasTableOperations;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.catalog.Namespace;
+import org.apache.iceberg.expressions.Expression;
+import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
 
 /**
@@ -74,7 +76,19 @@ import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
  * removal of the files they read, and delete files their retries drop), and the guards all of
  * them read whatever a record checks.
  *
- * <p>Each was calibrated against mutants of what it guards (fuzz/mutants).
+ * <p>{@link #anAdmittedReadSeesTheRowsItRead} is the oracle of serializable reads
+ * (docs/CATALOG_TRANSACTIONS.md, "No false negatives"): R is a serializable catalog transaction
+ * that scans a ref of the table under a row filter and writes another table, the same one, or
+ * nothing, and the window commits on the table before R's commit reads the catalog, just before
+ * its record is written, or both. Its oracle needs no reference: if the catalog admits R, the
+ * rows of the ref under the filter where R took effect ({@link TableViews#rows}: tokens that a
+ * rewrite keeps, each with the delete files that delete from it) must be the rows R's scan read.
+ * It judges a catalog that judges reads by their filters as it does one that judges them by their
+ * refs; the statistics count, per encoding and table storage, the reads rejected whose rows had
+ * not changed (false positives), with their reasons.
+ *
+ * <p>Each was calibrated against mutants of what it guards (fuzz/mutants; the reads oracle,
+ * fuzz/mutants/reads.sh).
  */
 class TestRebaseProperties {
 
@@ -211,6 +225,242 @@ class TestRebaseProperties {
       @ForAll("removals") List<List<TableScript.Cmd>> sample) {
     check(encoding, formatVersion, true, mode, true, sample.get(0), sample.get(1),
         sample.get(2).get(0));
+  }
+
+  /**
+   * The oracle of serializable reads (docs/CATALOG_TRANSACTIONS.md, "No false negatives"): R, a
+   * serializable catalog transaction, scans a ref of table T (main, another branch or a tag) under
+   * a row filter on {@code cat}, then appends to table U, appends to T, or writes nothing. A window
+   * of one to four commands commits on T through another catalog after R read it: some before R's
+   * commit reads the catalog (which checks R's read), the rest just before R's record is written
+   * (where the conflict encoding judges its read witness or pin); a read-only R writes no record,
+   * so its whole window runs before its commit. If the catalog admits R, the rows of its ref under
+   * its filter where R took effect ({@link TableViews#rows}) must be the rows its scan read: no
+   * false negative. A catalog may reject more: the statistics count, per encoding and table
+   * storage, the reads it rejected whose rows had not changed (false positives), with their
+   * reasons.
+   */
+  @Property(tries = 500)
+  void anAdmittedReadSeesTheRowsItRead(
+      @ForAll("encodings") String encoding,
+      @ForAll @IntRange(min = 2, max = 3) int formatVersion,
+      @ForAll boolean partitioned,
+      @ForAll("modes") LocalCatalogMode mode,
+      @ForAll("readWitnesses") boolean witness,
+      @ForAll("readPrefixes") List<TableScript.Cmd> prefix,
+      @ForAll("readers") Reader r,
+      @ForAll("readWindows") List<TableScript.Cmd> window,
+      @ForAll("placements") Placement placement) {
+    String[] outcome = verifyRead(encoding, formatVersion, partitioned, mode, witness, prefix, r,
+        window, placement);
+    String storage = mode.inlineML ? "inline ML" : mode.inlineTM ? "inline TM" : "pointer";
+    if (outcome[1].startsWith(Writes.SAME_TABLE.name())) {
+      // a rejection may be its append's: a conflict of the delta, or of an update pinned
+      Statistics.label("R's read beside its append to T").collect(encoding, storage, outcome[0]);
+    } else {
+      Statistics.label("R's read, " + encoding).collect(storage, outcome[0]);
+    }
+    Statistics.label("R").collect(outcome[1]);
+    Statistics.label("rows R read").collect(outcome[2]);
+    Statistics.label("R's ref in the window").collect(outcome[4], outcome[0]);
+    if (outcome[3] != null) {
+      Statistics.label("false positives").collect(encoding, outcome[3]);
+    }
+  }
+
+  /**
+   * One try of {@link #anAdmittedReadSeesTheRowsItRead}: R's read of the table the prefix built,
+   * the window run where {@code placement} says (all of it before R's commit, if R writes
+   * nothing). Returns how R's read went (by its rows), what R wrote and where the window ran,
+   * whether R read rows, why a read whose rows had not changed was rejected (null if none was),
+   * and how the window moved R's ref.
+   */
+  static String[] verifyRead(
+      String encoding,
+      int formatVersion,
+      boolean partitioned,
+      LocalCatalogMode mode,
+      boolean witness,
+      List<TableScript.Cmd> prefix,
+      Reader r,
+      List<TableScript.Cmd> window,
+      Placement placement) {
+    StringBuilder trace = new StringBuilder(String.format(
+        "v%d %s, %s, %s%s%nprefix %s%nR %s%nwindow %s, %s%n", formatVersion,
+        partitioned ? "partitioned" : "unpartitioned", mode, encoding,
+        witness ? "" : ", reads pinned", prefix, r, window, placement));
+    InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+    Map<String, String> properties = new java.util.HashMap<>(PROPERTIES);
+    properties.put(LogCatalogProperties.CONFLICT_ENCODING, encoding);
+    properties.put(LogCatalogProperties.TXN_READ_WITNESS, String.valueOf(witness));
+    LogCatalog catalog = mode.catalog(io, WAREHOUSE, "c", properties);
+    catalog.createNamespace(Namespace.of("ns"));
+    TableScript.Runner writer =
+        new TableScript.Runner(catalog, formatVersion, partitioned, trace);
+    TableViews.Lineage lineage = new TableViews.Lineage();
+    for (List<TableScript.Cmd> step : TableScript.steps(prefix)) {
+      writer.run(step);
+      lineage.observe(Run.reader(io).loadTable(TableScript.ID));
+    }
+    TableScript.Runner racer =
+        new TableScript.Runner(mode.catalog(io, WAREHOUSE, "c", PROPERTIES), "w", trace);
+    TableScript.Runner files = new TableScript.Runner(catalog, "r", trace);
+
+    // R scans T, as the transaction first read it
+    org.apache.iceberg.catalog.CatalogTransaction txn = catalog.createTransaction(
+        org.apache.iceberg.catalog.CatalogTransaction.IsolationLevel.SERIALIZABLE);
+    org.apache.iceberg.Table t = txn.asCatalog().loadTable(TableScript.ID);
+    List<String> others = new ArrayList<>(t.refs().keySet());
+    others.remove(org.apache.iceberg.SnapshotRef.MAIN_BRANCH);
+    others.sort(String::compareTo);
+    String ref = r.ref < 4 || others.isEmpty() ? org.apache.iceberg.SnapshotRef.MAIN_BRANCH
+        : others.get(r.ref % others.size());
+    org.apache.iceberg.TableScan scan = t.newScan();
+    if (!ref.equals(org.apache.iceberg.SnapshotRef.MAIN_BRANCH)) {
+      scan = scan.useRef(ref);
+    }
+    scan = scan.filter(r.filter).caseSensitive(r.caseSensitive);
+    try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.FileScanTask> tasks =
+        scan.planFiles()) {
+      tasks.forEach(task -> { });
+    } catch (java.io.IOException e) {
+      throw new java.io.UncheckedIOException(e);
+    }
+    org.apache.iceberg.Table atRead = Run.reader(io).loadTable(TableScript.ID);
+    org.apache.iceberg.Snapshot scanned = t.snapshot(ref);
+    org.apache.iceberg.Snapshot there = atRead.snapshot(ref);
+    if (!java.util.Objects.equals(scanned == null ? null : scanned.snapshotId(),
+        there == null ? null : there.snapshotId())) {
+      throw new IllegalStateException("R read " + ref + " at another version than the table's");
+    }
+    List<String> read = TableViews.rows(atRead, ref, r.filter, r.caseSensitive, lineage);
+    String versionRead = Run.version(io);
+    trace.append(String.format("R scans %s (%s) under %s: %s%n", ref,
+        scanned == null ? "no snapshot" : "snapshot " + scanned.snapshotId(), r.filter, read));
+
+    Writes writes = r.writes;
+    try {
+      switch (writes) {
+        case OTHER_TABLE:
+          org.apache.iceberg.Table u = txn.asCatalog().loadTable(TableScript.OTHER);
+          u.newFastAppend().appendFile(files.newFile(u, r.partition)).commit();
+          break;
+        case SAME_TABLE:
+          t.newFastAppend().appendFile(files.newFile(t, r.partition)).commit();
+          break;
+        default:
+      }
+    } catch (RuntimeException e) {
+      // a file TableScript cannot write in the table's spec (as its runner skips the command)
+      trace.append("R's write skipped: ").append(e).append('\n');
+      writes = Writes.NOTHING;
+    }
+
+    List<List<TableScript.Cmd>> steps = TableScript.steps(window);
+    int before = writes == Writes.NOTHING || placement == Placement.BEFORE_THE_COMMIT
+        ? steps.size() : placement == Placement.BEFORE_THE_WRITE ? 0 : (steps.size() + 1) / 2;
+    trace.append("window, before R's commit:\n");
+    List<String> moves = new ArrayList<>();
+    window(racer, steps.subList(0, before), io, lineage, ref, "before the commit", moves);
+    // the table where R takes effect: after the window
+    String[] landed = {Run.version(io)};
+    List<List<String>> landedRows = new ArrayList<>(List.of(TableViews.rows(
+        Run.reader(io).loadTable(TableScript.ID), ref, r.filter, r.caseSensitive, lineage)));
+    boolean[] raced = {false};
+    io.injectFaults((location, strategy) -> {
+      if (!raced[0] && location.equals(CATALOG)) {
+        raced[0] = true;
+        trace.append("window, just before R's first write:\n");
+        window(racer, steps.subList(before, steps.size()), io, lineage, ref, "before the write",
+            moves);
+        landed[0] = Run.version(io);
+        landedRows.set(0, TableViews.rows(
+            Run.reader(io).loadTable(TableScript.ID), ref, r.filter, r.caseSensitive, lineage));
+      }
+      return Fault.NONE;
+    });
+    Map<String, Long> reasons = catalog.log().counts().conflictReasons();
+    RuntimeException failure = null;
+    try {
+      trace.append("R commits\n");
+      txn.commitTransaction();
+    } catch (org.apache.iceberg.exceptions.CommitFailedException
+        | org.apache.iceberg.exceptions.ValidationException e) {
+      failure = e;
+    } finally {
+      io.injectFaults((location, strategy) -> Fault.NONE);
+    }
+    List<String> rows = landedRows.get(0);
+    trace.append(String.format("R %s; where it took effect, %s under %s: %s%n",
+        failure == null ? "committed" : "failed (" + failure + ")", ref, r.filter, rows));
+
+    String outcome;
+    String why = null;
+    if (landed[0].equals(versionRead)) {
+      outcome = failure == null ? "table as read, admitted"
+          : "table as read, rejected (false positive)";
+    } else if (rows.equals(read)) {
+      outcome = failure == null ? "rows as read, admitted"
+          : "rows as read, rejected (false positive)";
+    } else if (failure != null) {
+      outcome = "rows changed, rejected";
+    } else {
+      List<String> gone = new ArrayList<>(read);
+      gone.removeAll(rows);
+      List<String> came = new ArrayList<>(rows);
+      came.removeAll(read);
+      throw new AssertionError(String.format(
+          "the catalog admitted R, but the rows it read changed: gone %s, new %s%n%s", gone, came,
+          trace));
+    }
+    if (failure != null && outcome.endsWith("(false positive)")) {
+      List<String> grown = new ArrayList<>();
+      catalog.log().counts().conflictReasons().forEach((reason, count) -> {
+        if (count > reasons.getOrDefault(reason, 0L)) {
+          grown.add(reason);
+        }
+      });
+      why = !grown.isEmpty() ? String.join(", ", grown)
+          : failure.getMessage().contains("since the transaction read it on ")
+              ? "the read, at the commit's read"
+              : failure.getMessage().contains("since the transaction read it")
+                  ? "a pinned update, at the commit's read"
+                  : failure.getMessage().replaceAll("[0-9]{4,}", "#");
+    }
+    CheckpointRoundTrip.assertEveryWrite(io);
+    String placed = before == steps.size() ? "window before the commit"
+        : before == 0 ? "window before its write" : "window split";
+    return new String[] {outcome,
+        (writes == r.writes ? writes : writes + " (" + r.writes + " skipped)") + ", " + placed,
+        read.isEmpty() ? "none" : "some", why,
+        moves.isEmpty() ? "none" : String.join(", ", new java.util.TreeSet<>(moves))};
+  }
+
+  /**
+   * Runs {@code steps} of a window, observing each rewrite ({@link TableViews.Lineage}), and adds
+   * to {@code moves} how each moved {@code ref}, {@code where} it ran: advanced (to a new
+   * snapshot), reset (to one the table had), removed or created.
+   */
+  private static void window(TableScript.Runner racer, List<List<TableScript.Cmd>> steps,
+      InMemoryAtomicFileIO io, TableViews.Lineage lineage, String ref, String where,
+      List<String> moves) {
+    org.apache.iceberg.Table table = Run.reader(io).loadTable(TableScript.ID);
+    for (List<TableScript.Cmd> step : steps) {
+      org.apache.iceberg.Snapshot was = table.snapshot(ref);
+      java.util.Set<Long> had = new java.util.HashSet<>();
+      table.snapshots().forEach(snapshot -> had.add(snapshot.snapshotId()));
+      racer.run(step);
+      table = Run.reader(io).loadTable(TableScript.ID);
+      lineage.observe(table);
+      org.apache.iceberg.Snapshot is = table.snapshot(ref);
+      if (was == null && is != null) {
+        moves.add(where + ": created");
+      } else if (was != null && is == null) {
+        moves.add(where + ": removed");
+      } else if (was != null && was.snapshotId() != is.snapshotId()) {
+        moves.add(where + (had.contains(is.snapshotId()) ? ": reset" : ": advanced"));
+      }
+    }
   }
 
   private static void check(
@@ -622,6 +872,174 @@ class TestRebaseProperties {
   @Provide
   Arbitrary<TableScript.Cmd> operations() {
     return TableScript.commands(TestRebaseProperties::single).withoutEdgeCases();
+  }
+
+  /** Whether a serializable transaction's catalog holds its reads by read witness: mostly. */
+  @Provide
+  Arbitrary<Boolean> readWitnesses() {
+    return Arbitraries.of(true, true, true, false).withoutEdgeCases();
+  }
+
+  /**
+   * Prefixes of single commands, half the time after appends to each partition, a branch and a
+   * tag; a third of the time each, they end as they are, with a snapshot staged on main's head
+   * (which a cherry-pick fast-forwards main to), or with a branch fast-forwarded to main's head
+   * (which an append to it lets main fast-forward to). A transaction or a stale handle's command is
+   * left out: a rewrite whose parent an expiry removed in the same commit would hide the rows it
+   * kept ({@link TableViews.Lineage}).
+   */
+  @Provide
+  Arbitrary<List<TableScript.Cmd>> readPrefixes() {
+    Arbitrary<Integer> small = Arbitraries.integers().between(0, 11);
+    Arbitrary<List<TableScript.Cmd>> any = TableScript.commands(TestRebaseProperties::single)
+        .withoutEdgeCases().list().ofMinSize(1).ofMaxSize(12);
+    Arbitrary<List<TableScript.Cmd>> seeded = Combinators.combine(small, small,
+            TableScript.commands(TestRebaseProperties::single).withoutEdgeCases().list()
+                .ofMaxSize(8))
+        .as((b, c, rest) -> {
+          List<TableScript.Cmd> all = new ArrayList<>();
+          for (int p = 0; p < 4; p++) {
+            all.add(new TableScript.Cmd(TableScript.Kind.FAST_APPEND, p, b, p));
+          }
+          all.add(new TableScript.Cmd(TableScript.Kind.CREATE_BRANCH, 0, b, c));
+          all.add(new TableScript.Cmd(TableScript.Kind.CREATE_TAG, 0, b, c));
+          all.addAll(rest);
+          return all;
+        });
+    Arbitrary<List<TableScript.Cmd>> staged = Combinators.combine(small, small, small)
+        .as((a, b, c) -> List.of(new TableScript.Cmd(TableScript.Kind.STAGED_APPEND, a, b, c)));
+    Arbitrary<List<TableScript.Cmd>> atTheHead = Combinators.combine(small, small, small, small)
+        .as((a, b, c, d) -> List.of(new TableScript.Cmd(TableScript.Kind.CREATE_BRANCH, a, b, c),
+            new TableScript.Cmd(TableScript.Kind.FAST_FORWARD, d, b, c * 2 + 1)));
+    return Combinators.combine(Arbitraries.oneOf(any, seeded),
+            Arbitraries.oneOf(Arbitraries.just(List.<TableScript.Cmd>of()), staged, atTheHead))
+        .as((prefix, end) -> {
+          List<TableScript.Cmd> all = new ArrayList<>(prefix);
+          all.addAll(end);
+          return all;
+        });
+  }
+
+  /**
+   * Windows of data commits (to main or a branch, in any partition), of the changes the guards
+   * read (resets, a ref's removal, expiries, spec and table changes), of resets (rollbacks,
+   * fast-forwards, cherry-picks), of a ref removed or created, of expiries of all but each
+   * branch's head, and of any single command.
+   */
+  @Provide
+  Arbitrary<List<TableScript.Cmd>> readWindows() {
+    Arbitrary<Integer> small = Arbitraries.integers().between(0, 11);
+    Arbitrary<TableScript.Cmd> headsOnly = Combinators.combine(small, small)
+        .as((a, c) -> new TableScript.Cmd(TableScript.Kind.EXPIRE_SNAPSHOTS, a, 0, c * 2 + 1));
+    return Arbitraries.frequencyOf(
+            Tuple.of(4, TableScript.commands(
+                kind -> VALIDATED.contains(kind) || APPEND_LIKE.contains(kind))),
+            Tuple.of(2, TableScript.commands(GUARDS::contains)),
+            Tuple.of(3, TableScript.commands(RESETS::contains)),
+            Tuple.of(1, TableScript.commands(REF_MOVES::contains)),
+            Tuple.of(1, headsOnly),
+            Tuple.of(3, TableScript.windowCommands(TestRebaseProperties::single)))
+        .withoutEdgeCases()
+        .list().ofMinSize(1).ofMaxSize(4);
+  }
+
+  /** Commands that move a ref to a snapshot the table has (or, a cherry-pick, to a new one). */
+  private static final java.util.Set<TableScript.Kind> RESETS =
+      java.util.EnumSet.of(TableScript.Kind.ROLLBACK, TableScript.Kind.FAST_FORWARD,
+          TableScript.Kind.CHERRY_PICK);
+
+  /** Commands that remove or create a ref. */
+  private static final java.util.Set<TableScript.Kind> REF_MOVES =
+      java.util.EnumSet.of(TableScript.Kind.REMOVE_REF, TableScript.Kind.CREATE_BRANCH,
+          TableScript.Kind.CREATE_TAG);
+
+  /**
+   * What R reads (a ref, a filter on {@code cat}, case sensitive or not) and what it writes: half
+   * the time an append to U, which leaves its read to the read witness where the record lands.
+   */
+  @Provide
+  Arbitrary<Reader> readers() {
+    Arbitrary<Writes> writes = Arbitraries.frequency(Tuple.of(1, Writes.NOTHING),
+        Tuple.of(2, Writes.OTHER_TABLE), Tuple.of(1, Writes.SAME_TABLE));
+    return Arbitraries.of(true, true, true, false).flatMap(caseSensitive -> Combinators.combine(
+            Arbitraries.integers().between(0, 7), catFilters(caseSensitive ? "cat" : "CAT"),
+            writes, Arbitraries.integers().between(0, 3))
+        .as((ref, filter, written, partition) ->
+            new Reader(ref, filter, caseSensitive, written, partition)))
+        .withoutEdgeCases();
+  }
+
+  /**
+   * Row filters on the column {@code name} names, {@code cat}: everything, one partition's rows or
+   * several's (by value, by a set, by a range, by a bucket or truncation of {@code cat}, which no
+   * spec partitions by), or none (a value no row has, null).
+   */
+  private static Arbitrary<Expression> catFilters(String name) {
+    Arbitrary<Integer> value = Arbitraries.integers().between(1, 5);
+    return Arbitraries.frequencyOf(
+        Tuple.of(2, Arbitraries.just(Expressions.alwaysTrue()).map(Expression.class::cast)),
+        Tuple.of(5, value.map(v -> (Expression) Expressions.equal(name, v))),
+        Tuple.of(2, Combinators.combine(value, value)
+            .as((v, w) -> (Expression) Expressions.in(name, v, w))),
+        Tuple.of(1, value.map(v -> (Expression) Expressions.notEqual(name, v))),
+        Tuple.of(1, value.map(v -> (Expression) Expressions.lessThan(name, v))),
+        Tuple.of(1, value.map(v -> (Expression) Expressions.greaterThanOrEqual(name, v))),
+        Tuple.of(2, Arbitraries.integers().between(0, 1)
+            .map(b -> (Expression) Expressions.equal(Expressions.<Integer>bucket(name, 2), b))),
+        Tuple.of(1, Arbitraries.of(0, 2, 4)
+            .map(w -> (Expression) Expressions.equal(Expressions.<Integer>truncate(name, 2), w))),
+        Tuple.of(1, Arbitraries.just(Expressions.isNull(name)).map(Expression.class::cast)));
+  }
+
+  /**
+   * Where the window runs, if R writes: before R's commit reads the catalog (which checks R's
+   * read), just before R's record is written (where replay judges its witness or pin), or its
+   * first half before the commit and the rest before the write.
+   */
+  enum Placement {
+    BEFORE_THE_COMMIT,
+    BEFORE_THE_WRITE,
+    SPLIT
+  }
+
+  /** Where the window runs: half the time, all of it just before R's record is written. */
+  @Provide
+  Arbitrary<Placement> placements() {
+    return Arbitraries.frequency(Tuple.of(1, Placement.BEFORE_THE_COMMIT),
+            Tuple.of(2, Placement.BEFORE_THE_WRITE), Tuple.of(1, Placement.SPLIT))
+        .withoutEdgeCases();
+  }
+
+  /** What R writes besides its read: nothing, an append to U, or an append to T's main. */
+  enum Writes {
+    NOTHING,
+    OTHER_TABLE,
+    SAME_TABLE
+  }
+
+  /** R of {@link #anAdmittedReadSeesTheRowsItRead}. */
+  static final class Reader {
+    final int ref; // main below 4 (or if T has no other ref), else the ref-th of the others
+    final Expression filter;
+    final boolean caseSensitive;
+    final Writes writes;
+    final int partition; // of the file R appends
+
+    Reader(int ref, Expression filter, boolean caseSensitive,
+        Writes writes, int partition) {
+      this.ref = ref;
+      this.filter = filter;
+      this.caseSensitive = caseSensitive;
+      this.writes = writes;
+      this.partition = partition;
+    }
+
+    @Override
+    public String toString() {
+      return String.format("scan(ref %d, %s%s), writes %s%s", ref, filter,
+          caseSensitive ? "" : ", case insensitive", writes,
+          writes == Writes.NOTHING ? "" : " in partition " + partition);
+    }
   }
 
   /** A kind that runs as one command, on a handle of its own. */

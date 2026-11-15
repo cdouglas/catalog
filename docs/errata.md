@@ -167,12 +167,19 @@ Deferred:
   matching its filter was added to or removed from its ref; the encodings that
   judge validated writes by their filters (`partition-vector`,
   `manifest-window`) could judge it the same way, so an append to another
-  partition would not fail it. First the rebase oracle for reads: an admitted
-  read must see the same rows under its filter where it lands.
+  partition would not fail it. The rebase oracle for reads judges that change
+  as it judges the ref's: a serializable transaction's scan lands after commits
+  it did not see, and if admitted must read the same rows under its filter
+  where it lands (`TestRebaseProperties.anAdmittedReadSeesTheRowsItRead`). Its
+  statistics count, per encoding, the reads rejected whose rows had not
+  changed: the false positives judging by filter would remove.
+  `fuzz/mutants/reads.sh` calibrates it, `readfilter` among its mutants: a
+  filter judged by the data files added alone, which misses delete files,
+  removals and resets.
 - **The rebase oracle for transactions.** `TestRebaseProperties` lands table
-  commits after a window of commits they did not see; a transaction's deltas
-  are checked only by the race fuzzer's serial run and the fault fuzzer's
-  model, both of whose transactions append.
+  commits, and transactions' scan reads, after a window of commits they did not
+  see; a transaction's deltas are checked only by the race fuzzer's serial run
+  and the fault fuzzer's model, both of whose transactions append.
 
 **Trigger to revisit:** a workload whose transactions change refs, schemas or
 partition specs while other commits race them.
