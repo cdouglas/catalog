@@ -15,9 +15,10 @@
 #                                               and its result lines
 #
 # <fork> names a build of the fork's jars (/opt/m2/forks/<fork>; `ls` it). <commit> is anything
-# git can resolve in /in/fileio.bundle. Logs go to /out/<name>/<job>.log, summaries to
-# /out/<name>/summary.txt. Env: JOBS, how many jobs run at once (default: all of them; a
-# shrink's, 1); HEAP, each test JVM's heap (default 4g); SHRINKING, jqwik's shrinking in rounds,
+# git can resolve in /in/fileio.bundle. A job's whole log goes to /out/<name>/<job>.log.gz (read
+# it with zcat or zgrep -a, which also read one cut short), its start and exit lines to
+# /out/<name>/<job>.log, and summaries to /out/<name>/summary.txt. Env: JOBS, how many jobs run
+# at once (default: all of them; a shrink's, 1); HEAP, each test JVM's heap (default 4g); SHRINKING, jqwik's shrinking in rounds,
 # calibrations and test jobs (default OFF: a failure reports its sample and seed at once, and
 # shrink shrinks it); SHRINK_HEAP (default 16g) and SHRINK_SECONDS (default 1800), a shrink's heap
 # and how long jqwik shrinks; JOB_TIMEOUT, a limit on each job's time (as timeout(1) takes it;
@@ -111,7 +112,10 @@ PY
 }
 
 # job <dir> <log> <tests>: one offline test run in <dir>, waiting for a free slot of JOBS. Its
-# test JVM has HEAP, and jqwik's shrinking is SHRINKING (for SHRINK_SECONDS when bounded).
+# test JVM has HEAP, and jqwik's shrinking is SHRINKING (for SHRINK_SECONDS when bounded). Its
+# start and exit lines go to <log>, and everything, those lines among it, to <log>.gz: gzip
+# makes a log about 40 times smaller (round p9-r0's race log, Iceberg's INFO lines mostly, is
+# 12 GB as text: havoc's disk compresses it 12 times, gzip's level 6 40 times).
 # Generation is random unless a property asks otherwise: jqwik (1.9) multiplies its parameters'
 # exhaustive counts unchecked, so at a job's tries a large space whose product wraps negative is
 # enumerated in order, only its last parameters varying (round cp4-r0's race job).
@@ -120,23 +124,35 @@ job() {
   (
     cd "$1" || exit 2
     start=$(date +%s)
-    echo "start $(date -Is) $(git rev-parse --short HEAD) fork=$FORK heap=$HEAP" \
-      "shrinking=$SHRINKING timeout=${JOB_TIMEOUT:-none}" \
-      "snapshot_block=${SNAPSHOT_BLOCK:-default} snapshot_window=${SNAPSHOT_BLOCK:+${SNAPSHOT_WINDOW:-8}}" > "$2"
-    # shellcheck disable=SC2046
-    MAVEN_OPTS=-Xmx512m ${JOB_TIMEOUT:+timeout -k 120 $JOB_TIMEOUT} mvn -o -B $(repo $FORK) test \
-      "-DargLine=-Xmx$HEAP -Djqwik.shrinking.default=$SHRINKING -Djqwik.generation.default=RANDOMIZED
-        -Djqwik.shrinking.bounded.seconds=${SHRINK_SECONDS:-1800}
-        ${SNAPSHOT_BLOCK:+-Dfileio.catalog.test.snapshot.block=$SNAPSHOT_BLOCK
-          -Dfileio.catalog.test.snapshot.window=${SNAPSHOT_WINDOW:-8}}" \
-      -Dsurefire.failIfNoSpecifiedTests=false -Dtest="$3" >> "$2" 2>&1
-    echo "exit=$? elapsed=$(( $(date +%s) - start ))s" >> "$2"
+    head="start $(date -Is) $(git rev-parse --short HEAD) fork=$FORK heap=$HEAP"
+    head+=" shrinking=$SHRINKING timeout=${JOB_TIMEOUT:-none}"
+    head+=" snapshot_block=${SNAPSHOT_BLOCK:-default} snapshot_window=${SNAPSHOT_BLOCK:+${SNAPSHOT_WINDOW:-8}}"
+    echo "$head" > "$2"
+    {
+      echo "$head"
+      # shellcheck disable=SC2046
+      MAVEN_OPTS=-Xmx512m ${JOB_TIMEOUT:+timeout -k 120 $JOB_TIMEOUT} mvn -o -B $(repo $FORK) test \
+        "-DargLine=-Xmx$HEAP -Djqwik.shrinking.default=$SHRINKING -Djqwik.generation.default=RANDOMIZED
+          -Djqwik.shrinking.bounded.seconds=${SHRINK_SECONDS:-1800}
+          ${SNAPSHOT_BLOCK:+-Dfileio.catalog.test.snapshot.block=$SNAPSHOT_BLOCK
+            -Dfileio.catalog.test.snapshot.window=${SNAPSHOT_WINDOW:-8}}" \
+        -Dsurefire.failIfNoSpecifiedTests=false -Dtest="$3" 2>&1
+      end="exit=$? elapsed=$(( $(date +%s) - start ))s"
+      echo "$end"
+      echo "$end" >> "$2"
+    } | gzip > "$2.gz"
   ) &
+}
+
+# joblog <log>: the whole log of the job whose start and exit lines are in <log>: <log>.gz, or
+# <log> itself if the job wrote no .gz (a driver from before 2026-11-15 wrote one plain log)
+joblog() {
+  if [ -f "$1.gz" ]; then gzip -dc "$1.gz" 2>/dev/null; else cat "$1"; fi
 }
 
 # the failures and errors per test class of <log>, as "f+e Class ..."
 classes() {
-  grep -ahE "Tests run:.*in org" "$1" \
+  joblog "$1" | grep -aE "Tests run:.*in org" \
     | sed -E 's/.*Failures: ([0-9]+), Errors: ([0-9]+).* in org\.[a-z.]*\.([A-Za-z$]+)$/\1+\2 \3/' \
     | tr '\n' ' '
 }
@@ -149,7 +165,10 @@ status() {
       [ -f "$f" ] || continue
       end=$(grep -ah '^exit=' "$f" | tail -1)
       echo "== $(basename $f .log): ${end:-running since $(head -1 $f | cut -d' ' -f2)}"
-      grep -ahE 'Tests run:.*in org|tries = |FAIL|original-sample|Property \[' "$f" \
+      # Only an ended job's log says anything (surefire and jqwik report at the end), and a
+      # running one's can be gigabytes to decompress
+      [ -n "$end" ] || continue
+      joblog "$f" | grep -aE 'Tests run:.*in org|tries = |FAIL|original-sample|Property \[' \
         | grep -v ' tries = 3 ' | head -8
     done
     [ -f "$d/summary.txt" ] && { echo "-- summary"; cat "$d/summary.txt"; }
@@ -213,27 +232,45 @@ round() {
 }
 
 # failed <log>: the properties that failed in a job's log, one "<class> <method> <seed>" each:
-# surefire names each failure, and jqwik's report of the property gives the seed it ran with
+# surefire names each failure, and jqwik's report of the property gives the seed it ran with (the
+# last report's, within 20,000 characters of its header). It streams the log, which can be
+# gigabytes, and reads one cut short as far as it goes.
 failed() {
   python3 - "$1" <<'PY'
-import re, sys
-text = open(sys.argv[1], errors='replace').read()
-seen = set()
-for m in re.finditer(r'^\[ERROR\] (?:[a-z]\w*\.)*([A-Z][\w$]*)\.(\w+) -- Time elapsed.*<<< (?:FAILURE|ERROR)!',
-                     text, re.M):
-    cls, method = m.group(1), m.group(2)
-    if (cls, method) in seen:
-        continue
-    seen.add((cls, method))
-    seed = None
-    header = r'^timestamp = [^,]*, ' + re.escape(cls) + ':' + re.escape(method) + r' = \s*$'
-    for r in re.finditer(header, text, re.M):
-        s = re.search(r'^seed = (-?\d+)', text[r.end():r.end() + 20000], re.M)
-        seed = s.group(1) if s else seed
-    if seed is None:
+import gzip, os, re, sys
+log = sys.argv[1]
+f = (gzip.open(log + '.gz', 'rt', errors='replace') if os.path.exists(log + '.gz')
+     else open(log, errors='replace'))
+failure = re.compile(r'^\[ERROR\] (?:[a-z]\w*\.)*([A-Z][\w$]*)\.(\w+) -- Time elapsed.*<<< (?:FAILURE|ERROR)!')
+header = re.compile(r'^timestamp = [^,]*, ([A-Z][\w$]*):(\w+) = \s*$')
+seed_line = re.compile(r'^seed = (-?\d+)')
+failures, seeds = [], {}
+report, budget = None, 0
+try:
+    for line in f:
+        m = failure.match(line)
+        if m and (m.group(1), m.group(2)) not in failures:
+            failures.append((m.group(1), m.group(2)))
+        h = header.match(line)
+        if h:
+            report, budget = (h.group(1), h.group(2)), 20000
+            continue
+        if report:
+            s = seed_line.match(line)
+            if s:
+                seeds[report] = s.group(1)
+                report = None
+            else:
+                budget -= len(line)
+                if budget <= 0:
+                    report = None
+except EOFError:
+    pass  # a log cut short (a container stopped while gzip wrote): what it holds
+for cls, method in failures:
+    if (cls, method) not in seeds:
         print('%s.%s: no seed in its report' % (cls, method), file=sys.stderr)
         continue
-    print(cls, method, seed)
+    print(cls, method, seeds[(cls, method)])
 PY
 }
 
@@ -276,7 +313,7 @@ shrink() {
   while read -r cls method seed; do
     [ -f $O/$cls.$method.log ] || continue
     echo "$cls.$method seed=$seed: $(grep -ah '^exit=' $O/$cls.$method.log | tail -1)" \
-      "| shrunk: $(grep -aE '^Shrunk Sample' $O/$cls.$method.log | head -1)" >> $O/summary.txt
+      "| shrunk: $(joblog $O/$cls.$method.log | grep -aE '^Shrunk Sample' | head -1)" >> $O/summary.txt
   done < $O/failed.txt
 }
 

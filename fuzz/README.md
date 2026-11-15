@@ -34,9 +34,11 @@ commits too), `run.sh` and this file. For new commits, only the bundle changes:
     ./run.sh mem                                  # each run's memory and CPU, and the host's
     ./run.sh shrink p4 ce-phase4 p4-rebase p4/rebase   # shrink what failed in p4's rebase job
 
-Results go to `./out/<name>/`: a log per job, `summary.txt` (each job's exit and failures per
-test class; for a calibration, each mutant `caught` or `NOT CAUGHT`, and `none`, the unmutated
-oracles, which must be `clean`), and `run.txt` (the fork, commit, host). Copy `out/<name>/` back
+Results go to `./out/<name>/`: a log per job, `<job>.log.gz` (gzip: `zcat` or `zgrep -a` it,
+which also read a log cut short), with its start and exit lines in `<job>.log`; `summary.txt`
+(each job's exit and failures per test class; for a calibration, each mutant `caught` or `NOT
+CAUGHT`, and `none`, the unmutated oracles, which must be `clean`), and `run.txt` (the fork,
+commit, host). Copy `out/<name>/` back
 to keep it. `JOBS` limits the jobs at once (default all), `HEAP` each test JVM's heap (default
 4g; a job's resident size is up to two gigabytes more, with Maven's). A round wants eleven cores
 and about 68 GB; a calibration, a core and 6 GB per mutant. `ROUND_JOBS` runs some of a round's
@@ -63,7 +65,7 @@ tries, so a long multi-writer sample could fill a small heap and thrash for hour
 time: a worktree set up as the job's was (its tries, which also size jqwik's generation), the
 property pinned to the seed it failed with, run alone in a JVM of `SHRINK_HEAP` (default 16g),
 shrinking for `SHRINK_SECONDS` (default 1800), with a timeout of twice that and an hour. Its log
-is `out/<name>/<Class>.<method>.log`; `summary.txt` gives each one's exit and its shrunk sample's
+is `out/<name>/<Class>.<method>.log.gz`; `summary.txt` gives each one's exit and its shrunk sample's
 steps. Use the commit the job ran at. A round with `SHRINKING=BOUNDED` shrinks in place, for
 `SHRINK_SECONDS` each, in its jobs' heaps; `JOB_TIMEOUT` (as `timeout` takes it, `12h`) bounds any
 job.
