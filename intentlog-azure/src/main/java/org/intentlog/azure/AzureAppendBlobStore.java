@@ -18,6 +18,7 @@
  */
 package org.intentlog.azure;
 
+import com.azure.core.credential.AzureSasCredential;
 import com.azure.core.credential.TokenCredential;
 import com.azure.core.http.HttpHeaderName;
 import com.azure.core.http.rest.Response;
@@ -126,6 +127,18 @@ public final class AzureAppendBlobStore implements AppendBlobStore {
    * @throws IllegalArgumentException if the URL names no container or a geo-secondary endpoint
    */
   public static AzureAppendBlobStore create(String containerUrl, TokenCredential credential) {
+    return new AzureAppendBlobStore(
+        builder(containerUrl).credential(Objects.requireNonNull(credential)).buildClient());
+  }
+
+  /**
+   * A store on the container at {@code containerUrl}, authorized by a shared access signature: it
+   * needs read, add, create, write and delete on objects, and list on the container for the
+   * sweep (without it, the sweep deletes nothing).
+   *
+   * @throws IllegalArgumentException if the URL names no container or a geo-secondary endpoint
+   */
+  public static AzureAppendBlobStore create(String containerUrl, AzureSasCredential credential) {
     return new AzureAppendBlobStore(
         builder(containerUrl).credential(Objects.requireNonNull(credential)).buildClient());
   }

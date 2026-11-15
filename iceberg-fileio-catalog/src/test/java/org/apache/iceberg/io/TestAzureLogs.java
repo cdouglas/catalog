@@ -21,6 +21,8 @@ package org.apache.iceberg.io;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.util.Map;
+
 import org.junit.jupiter.api.Test;
 
 /** Opening the catalog's Azure log from its properties ({@link AzureLogs}). */
@@ -44,5 +46,16 @@ class TestAzureLogs {
     assertThatThrownBy(() -> AzureLogs.containerUrl("https://acct.blob.core.windows.net/logs"))
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessageContaining("no container and path");
+  }
+
+  /** A signature for the account, by its host as the ADLS FileIO names it, or by its name. */
+  @Test
+  void aSignatureIsFoundByTheAccountsHostOrName() {
+    assertThat(AzureLogs.sas(Map.of("adls.sas-token.acct.dfs.core.windows.net", "?sv=1"), "acct"))
+        .isEqualTo("sv=1");
+    assertThat(AzureLogs.sas(Map.of("adls.sas-token.acct.blob.core.windows.net", "sv=2"), "acct"))
+        .isEqualTo("sv=2");
+    assertThat(AzureLogs.sas(Map.of("adls.sas-token.acct", "sv=3"), "acct")).isEqualTo("sv=3");
+    assertThat(AzureLogs.sas(Map.of("adls.sas-token.other", "sv=4"), "acct")).isNull();
   }
 }

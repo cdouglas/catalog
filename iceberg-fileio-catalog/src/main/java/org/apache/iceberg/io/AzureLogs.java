@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.io;
 
+import com.azure.core.credential.AzureSasCredential;
 import com.azure.storage.blob.BlobUrlParts;
 import com.azure.storage.common.StorageSharedKeyCredential;
 import java.util.Map;
@@ -45,6 +46,12 @@ public final class AzureLogs {
   static final String SHARED_KEY_ACCOUNT_NAME = "adls.auth.shared-key.account.name";
 
   static final String SHARED_KEY_ACCOUNT_KEY = "adls.auth.shared-key.account.key";
+
+  /**
+   * A shared access signature's property, as Iceberg's ADLS FileIO names it, followed by the
+   * account's host ({@code <account>.dfs.core.windows.net} or {@code .blob.}) or its name.
+   */
+  static final String SAS_TOKEN_PREFIX = "adls.sas-token.";
 
   private AzureLogs() {}
 
@@ -74,6 +81,18 @@ public final class AzureLogs {
     return new SegmentedLog(catalog, new AppendBlobSegments(store), prefix, options(properties));
   }
 
+  /** The shared access signature {@code properties} give for {@code account}, or null. */
+  static String sas(Map<String, String> properties, String account) {
+    for (String host : new String[] {account + ".dfs.core.windows.net",
+        account + ".blob.core.windows.net", account}) {
+      String sas = properties.get(SAS_TOKEN_PREFIX + host);
+      if (sas != null) {
+        return sas.startsWith("?") ? sas.substring(1) : sas;
+      }
+    }
+    return null;
+  }
+
   /**
    * The URL of the container a log's location names: its scheme, host (or, on an emulator, host
    * and account) and container, without the path in it.
@@ -93,9 +112,10 @@ public final class AzureLogs {
   /**
    * The log of the catalog at {@code catalogLocation} in {@code io}, its segments where {@code
    * properties} locate them ({@code fileio.catalog.log.location}, an {@code https} Blob URL of a
-   * container and a path in it), signed with the account key they give.
+   * container and a path in it), signed with the account key they give, or else authorized by a
+   * shared access signature they give for the account.
    *
-   * @throws IllegalArgumentException if they give no location or no account key
+   * @throws IllegalArgumentException if they give no location, and no account key or signature
    */
   static SharedLog open(
       SupportsAtomicOperations io, String catalogLocation, Map<String, String> properties) {
@@ -108,11 +128,14 @@ public final class AzureLogs {
     String containerUrl = containerUrl(location);
     String account = properties.get(SHARED_KEY_ACCOUNT_NAME);
     String key = properties.get(SHARED_KEY_ACCOUNT_KEY);
-    Preconditions.checkArgument(account != null && key != null,
-        "A catalog on an Azure log needs an account key (%s and %s)", SHARED_KEY_ACCOUNT_NAME,
-        SHARED_KEY_ACCOUNT_KEY);
-    AzureAppendBlobStore store =
-        AzureAppendBlobStore.create(containerUrl, new StorageSharedKeyCredential(account, key));
+    String sas = sas(properties, parts.getAccountName());
+    Preconditions.checkArgument((account != null && key != null) || sas != null,
+        "A catalog on an Azure log needs an account key (%s and %s) or a shared access "
+            + "signature (%s<account>)", SHARED_KEY_ACCOUNT_NAME, SHARED_KEY_ACCOUNT_KEY,
+        SAS_TOKEN_PREFIX);
+    AzureAppendBlobStore store = account != null && key != null
+        ? AzureAppendBlobStore.create(containerUrl, new StorageSharedKeyCredential(account, key))
+        : AzureAppendBlobStore.create(containerUrl, new AzureSasCredential(sas));
     return open(io, catalogLocation, store, path, properties);
   }
 }
