@@ -184,9 +184,11 @@ Deferred:
 **Trigger to revisit:** a workload whose transactions change refs, schemas or
 partition specs while other commits race them. For scan reads judged by their
 filter: E6 (catalog-bench `configs/e6-*.json`, not yet run), whose arm that
-scans the last closed partition (`read_slot` 1) meets no real conflict, so
-every read its serializable FileIOCatalog runs reject is one judging by filter
-would commit.
+scans the last closed partition (`read_slot` 1) meets no real conflict: every
+read its serializable FileIOCatalog runs reject is a false one, by an append to
+the current partition (which judging by filter would commit) or by a compaction
+of the scanned one (which it would commit only if it also judged a rewrite by
+the rows it keeps).
 
 ### D13. `partition-vector` retries a validated commit that `concern-vector` merges
 
