@@ -45,6 +45,12 @@ public interface AppendBlobStore {
   record Entry(String name, Instant lastModified) {}
 
   /**
+   * Where a block landed: its offset, and the blob's committed block count with it, the block's
+   * index ({@code x-ms-blob-committed-block-count}); 0 or less if the store can't say.
+   */
+  record Landed(long offset, long blocks) {}
+
+  /**
    * Creates an empty Append Blob with {@code metadata} (Put Blob, {@code If-None-Match: *}).
    * Returns false if a blob of that name exists.
    */
@@ -61,6 +67,15 @@ public interface AppendBlobStore {
    * @throws NotFound if the blob does not exist
    */
   long appendBlock(String name, byte[] block, long maxSize, long appendPosition);
+
+  /**
+   * Append Block with no condition, as {@link #appendBlock}, also saying the blob's block count
+   * with the block: a segmented log's index of it (docs/LOG_SEGMENTS.md "Writing"). By default
+   * the count is unknown, and a read says where the block is.
+   */
+  default Landed appendBlockCounted(String name, byte[] block) {
+    return new Landed(appendBlock(name, block, 0, -1), -1);
+  }
 
   /**
    * Get Blob from {@code from} to its end; null if the blob does not exist. A blob no longer than
@@ -97,6 +112,11 @@ public interface AppendBlobStore {
   /** The most blocks an Append Blob holds (Azure: 50,000). */
   default int maxBlocks() {
     return 50_000;
+  }
+
+  /** The most bytes an Append Blob holds (Azure: 50,000 blocks of 4 MiB, about 195 GiB). */
+  default long maxBlobBytes() {
+    return 50_000L * (4L << 20);
   }
 
   /** The largest block one Append Block takes (Azure: 4 MiB before 2022-11-02, 100 MiB since). */

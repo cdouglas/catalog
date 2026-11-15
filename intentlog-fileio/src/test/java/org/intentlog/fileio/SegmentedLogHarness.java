@@ -40,7 +40,11 @@ import org.intentlog.Replay;
 import org.intentlog.SharedLog;
 import org.intentlog.StateMachine;
 import org.intentlog.TrimmedException;
+import org.intentlog.azure.AppendBlobSegments;
+import org.intentlog.azure.AppendBlobStore;
+import org.intentlog.azure.InMemoryAppendBlobStore;
 import org.intentlog.memory.InMemorySegmentStore;
+import org.intentlog.segments.SegmentStore;
 import org.intentlog.segments.SegmentFrames;
 import org.intentlog.segments.SegmentPosition;
 import org.intentlog.testkit.LogHarness;
@@ -52,7 +56,8 @@ import org.intentlog.wire.LogEnvelope;
  * store meets the fuzzer's faults: a write may fail, be refused, be throttled before or after it
  * lands, lose its reply, or (a segment append) land later; a read may fail, or (a segment's) be
  * served short of its last block. One to three instances of the log, each with its own catalog
- * object and views, take requests in turn.
+ * object and views, take requests in turn, as processes would; an append's read-through goes to
+ * the instance that sent it, as a process reads through its own appends.
  *
  * <p>The oracles see the log the stores hold: the segments every catalog object ever installed,
  * in ordinal order, each up to its end (its limit-th record or its first seal frame), through the
@@ -63,8 +68,155 @@ import org.intentlog.wire.LogEnvelope;
  */
 final class SegmentedLogHarness implements LogHarness {
 
+  /** The segments' store as the harness sees it: its faults, and every append that landed. */
+  interface Segments {
+    enum Request { CREATE, APPEND, READ, DELETE, LIST, OTHER }
+
+    enum Fault { NONE, FAIL_BEFORE, REFUSED, THROTTLED, LANDED_THROTTLED, LOST_REPLY, DELAYED,
+      SHORT_READ }
+
+    record Landed(String name, long offset, byte[] block) {}
+
+    interface Hook {
+      Fault before(Request request, String name);
+    }
+
+    SegmentStore store();
+
+    void intercept(Hook hook);
+
+    List<Landed> appends();
+
+    int deliverDelayed();
+
+    static Segments of(InMemorySegmentStore s) {
+      return new Segments() {
+        @Override
+        public SegmentStore store() {
+          return s;
+        }
+
+        @Override
+        public void intercept(Hook hook) {
+          s.intercept((op, name) -> InMemorySegmentStore.Fault.valueOf(
+              hook.before(Request.valueOf(op.name()), name).name()));
+        }
+
+        @Override
+        public List<Landed> appends() {
+          List<Landed> out = new ArrayList<>();
+          s.appends().forEach(a -> out.add(new Landed(a.name(), a.offset(), a.block())));
+          return out;
+        }
+
+        @Override
+        public int deliverDelayed() {
+          return s.deliverDelayed();
+        }
+      };
+    }
+
+    /**
+     * Append Blobs, through {@link AppendBlobSegments}; with {@code counted} false, through a
+     * store whose appends don't say their block count (as one that wraps a store's requests may
+     * not), so a read says where each landed.
+     */
+    static Segments of(InMemoryAppendBlobStore s, boolean counted) {
+      AppendBlobStore through = counted ? s : uncounted(s);
+      AppendBlobSegments segments = new AppendBlobSegments(through);
+      return new Segments() {
+        @Override
+        public SegmentStore store() {
+          return segments;
+        }
+
+        @Override
+        public void intercept(Hook hook) {
+          s.intercept((op, name) -> {
+            Request r = switch (op) {
+              case CREATE_APPEND -> Request.CREATE;
+              case APPEND -> Request.APPEND;
+              case READ, PROPERTIES -> Request.READ;
+              case DELETE -> Request.DELETE;
+              case LIST -> Request.LIST;
+              default -> Request.OTHER;
+            };
+            return r == Request.OTHER ? InMemoryAppendBlobStore.Fault.NONE
+                : InMemoryAppendBlobStore.Fault.valueOf(hook.before(r, name).name());
+          });
+        }
+
+        @Override
+        public List<Landed> appends() {
+          List<Landed> out = new ArrayList<>();
+          s.appends().forEach(a -> out.add(new Landed(a.name(), a.offset(), a.block())));
+          return out;
+        }
+
+        @Override
+        public int deliverDelayed() {
+          return s.deliverDelayed();
+        }
+      };
+    }
+
+    private static AppendBlobStore uncounted(AppendBlobStore s) {
+      return new AppendBlobStore() {
+        @Override
+        public boolean createAppendBlob(String name, Map<String, String> metadata) {
+          return s.createAppendBlob(name, metadata);
+        }
+
+        @Override
+        public long appendBlock(String name, byte[] block, long maxSize, long appendPosition) {
+          return s.appendBlock(name, block, maxSize, appendPosition);
+        }
+
+        @Override
+        public Blob read(String name, long from) {
+          return s.read(name, from);
+        }
+
+        @Override
+        public Props properties(String name) {
+          return s.properties(name);
+        }
+
+        @Override
+        public boolean putIfAbsent(String name, byte[] bytes) {
+          return s.putIfAbsent(name, bytes);
+        }
+
+        @Override
+        public void put(String name, byte[] bytes) {
+          s.put(name, bytes);
+        }
+
+        @Override
+        public String putIfMatch(String name, byte[] bytes, String etag) {
+          return s.putIfMatch(name, bytes, etag);
+        }
+
+        @Override
+        public void delete(String name) {
+          s.delete(name);
+        }
+
+        @Override
+        public List<Entry> list(String prefix) {
+          return s.list(prefix);
+        }
+
+        @Override
+        public int maxBlocks() {
+          return s.maxBlocks();
+        }
+      };
+    }
+  }
+
   private final InMemoryAtomicFileIO io;
-  private final InMemorySegmentStore store;
+  private final Segments store;
   private final String location;
   private final String prefix;
   private final String pages;
@@ -73,7 +225,7 @@ final class SegmentedLogHarness implements LogHarness {
   private final List<String> readViolations = new ArrayList<>();
   private Hooks hooks = null;
 
-  SegmentedLogHarness(InMemoryAtomicFileIO io, InMemorySegmentStore store, String location,
+  SegmentedLogHarness(InMemoryAtomicFileIO io, Segments store, String location,
       String prefix, List<SegmentedLog> logs, StateMachine<?, ?, ?> machine) {
     this.io = io;
     this.store = store;
@@ -132,33 +284,33 @@ final class SegmentedLogHarness implements LogHarness {
     }
   }
 
-  private InMemorySegmentStore.Fault segmentFault(InMemorySegmentStore.Op op, String name) {
+  private Segments.Fault segmentFault(Segments.Request op, String name) {
     Hooks h = hooks;
     if (h == null) {
-      return InMemorySegmentStore.Fault.NONE;
+      return Segments.Fault.NONE;
     }
     switch (op) {
       case READ:
       case LIST: {
         ReadFault r = h.beforeRead();
         if (r == ReadFault.FAIL) {
-          return InMemorySegmentStore.Fault.FAIL_BEFORE;
+          return Segments.Fault.FAIL_BEFORE;
         }
-        if (r == ReadFault.STALE && op == InMemorySegmentStore.Op.READ) {
-          return InMemorySegmentStore.Fault.SHORT_READ;
+        if (r == ReadFault.STALE && op == Segments.Request.READ) {
+          return Segments.Fault.SHORT_READ;
         }
-        return InMemorySegmentStore.Fault.NONE;
+        return Segments.Fault.NONE;
       }
       default:
         return switch (h.beforeWrite()) {
-          case NONE -> InMemorySegmentStore.Fault.NONE;
-          case FAIL_BEFORE -> InMemorySegmentStore.Fault.FAIL_BEFORE;
-          case NOT_SENT -> InMemorySegmentStore.Fault.REFUSED;
-          case LOST_REPLY, LANDED_AS_CONFLICT -> InMemorySegmentStore.Fault.LOST_REPLY;
-          case THROTTLED -> InMemorySegmentStore.Fault.THROTTLED;
-          case LANDED_THROTTLED -> InMemorySegmentStore.Fault.LANDED_THROTTLED;
-          case DELAYED -> op == InMemorySegmentStore.Op.APPEND
-              ? InMemorySegmentStore.Fault.DELAYED : InMemorySegmentStore.Fault.FAIL_BEFORE;
+          case NONE -> Segments.Fault.NONE;
+          case FAIL_BEFORE -> Segments.Fault.FAIL_BEFORE;
+          case NOT_SENT -> Segments.Fault.REFUSED;
+          case LOST_REPLY, LANDED_AS_CONFLICT -> Segments.Fault.LOST_REPLY;
+          case THROTTLED -> Segments.Fault.THROTTLED;
+          case LANDED_THROTTLED -> Segments.Fault.LANDED_THROTTLED;
+          case DELAYED -> op == Segments.Request.APPEND
+              ? Segments.Fault.DELAYED : Segments.Fault.FAIL_BEFORE;
         };
     }
   }
@@ -180,6 +332,9 @@ final class SegmentedLogHarness implements LogHarness {
 
     /** Each read served: a copy of its instance as the read left it, and the tail it returned. */
     private final List<Map.Entry<SegmentedLog, LogTail>> reads = new ArrayList<>();
+
+    /** The instance each receipt came from: a process reads through its own appends. */
+    private final Map<Receipt, SegmentedLog> appended = new java.util.IdentityHashMap<>();
 
     RoundRobin(List<SegmentedLog> logs) {
       this.logs = List.copyOf(logs);
@@ -220,7 +375,7 @@ final class SegmentedLogHarness implements LogHarness {
 
     @Override
     public LogView readThrough(Receipt receipt, Duration wait) {
-      SegmentedLog by = pick();
+      SegmentedLog by = appended.getOrDefault(receipt, logs.get(0));
       return seen(by, by.readThrough(receipt, wait), "a read through a write");
     }
 
@@ -231,7 +386,10 @@ final class SegmentedLogHarness implements LogHarness {
 
     @Override
     public Receipt append(byte[] record, LogTail expected) {
-      return pick().append(record, expected);
+      SegmentedLog by = pick();
+      Receipt receipt = by.append(record, expected);
+      appended.put(receipt, by);
+      return receipt;
     }
 
     @Override
@@ -299,13 +457,13 @@ final class SegmentedLogHarness implements LogHarness {
       }
     }
     List<Landed> out = new ArrayList<>();
-    List<InMemorySegmentStore.Landed> appends = store.appends();
+    List<Segments.Landed> appends = store.appends();
     for (long o = 0; installed.containsKey(o); o++) {
       SegmentedLog.Seg seg = installed.get(o);
       String name = prefix + "/" + seg.name();
       long count = 0;
       boolean ended = false;
-      for (InMemorySegmentStore.Landed a : appends) {
+      for (Segments.Landed a : appends) {
         if (!a.name().equals(name)) {
           continue;
         }
@@ -332,7 +490,7 @@ final class SegmentedLogHarness implements LogHarness {
   @Override
   public long landedWrites() {
     long n = 0;
-    for (InMemorySegmentStore.Landed a : store.appends()) {
+    for (Segments.Landed a : store.appends()) {
       if (a.block().length > 0 && a.block()[0] != 0) {
         n++;
       }
@@ -351,12 +509,26 @@ final class SegmentedLogHarness implements LogHarness {
     return records;
   }
 
+  /**
+   * Appends {@code record} unfaulted, and reads through it as its writer would, so that it is in
+   * the log: sealing an earlier segment that hasn't ended, and sending it again if it landed void.
+   */
   @Override
   public void appendCopy(byte[] record) {
     Hooks was = hooks;
     hooks = null;
     try {
-      log.append(record, null);
+      for (int attempt = 0; ; attempt++) {
+        Receipt receipt = log.append(record, null);
+        try {
+          log.readThrough(receipt, Duration.ZERO);
+          return;
+        } catch (org.intentlog.LogVoidException e) {
+          if (attempt >= 16) {
+            throw e;
+          }
+        }
+      }
     } finally {
       hooks = was;
     }

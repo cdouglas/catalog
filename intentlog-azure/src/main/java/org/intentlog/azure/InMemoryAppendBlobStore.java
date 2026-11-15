@@ -210,6 +210,17 @@ public final class InMemoryAppendBlobStore implements AppendBlobStore {
     return offset;
   }
 
+  @Override
+  public synchronized Landed appendBlockCounted(String name, byte[] block) {
+    long offset = appendBlock(name, block, 0, -1);
+    Stored s = blobs.get(name);
+    int index = 0;
+    while (index < s.blockEnds.size() && s.blockEnds.get(index) <= offset) {
+      index++;
+    }
+    return new Landed(offset, index + 1);
+  }
+
   private long land(Stored s, String name, byte[] block, long maxSize, long appendPosition) {
     if (s.blockEnds.size() >= maxBlocks) {
       throw new Full("BlockCountExceedsLimit: " + name + " holds " + maxBlocks + " blocks");

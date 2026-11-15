@@ -7,9 +7,12 @@
 # replay's refusal of a provider record in a view (TestReplay). Two are the Java's own:
 # fastvoid, the read through an append that skips its read when the reply puts the copy at the
 # kept view's end, past its segment's limit; and lastcopy, the read through deciding by the last
-# copy the log holds rather than the first.
+# copy the log holds rather than the first. fastvoid is equivalent (2026-11-15, 2,000 tries
+# locally): an append whose reply puts it past the limit is void with no read and never in a
+# receipt, and a receipt whose store can't say the index has none for the fast path to match.
+# Locally at 2,000 tries the other eight are caught, voidack by TestSegmentedLog alone.
 MUTANTS="readahead voidack createonmissing sweepearly sweepinflight sdkretry overlimit fastvoid lastcopy"
-EQUIVALENT=""
+EQUIVALENT="fastvoid"
 ORACLES=TestSegmentedCommitProtocol,TestSegmentedLog
 
 SL=intentlog-fileio/src/main/java/org/intentlog/fileio/SegmentedLog.java

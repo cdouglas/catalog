@@ -27,13 +27,16 @@ import net.jqwik.api.ForAll;
 import net.jqwik.api.Property;
 import net.jqwik.api.Provide;
 import org.apache.iceberg.io.InMemoryAtomicFileIO;
+import org.intentlog.azure.InMemoryAppendBlobStore;
 import org.intentlog.memory.InMemorySegmentStore;
+import org.intentlog.segments.SegmentStore;
 import org.intentlog.testkit.CommitProtocol;
 import org.intentlog.testkit.EntityVersionsMachine;
 
 /**
  * The testkit's commit-protocol fuzzer on {@link SegmentedLog} (docs/LOG_SEGMENTS.md "Testing"):
- * faults on every request of both stores, small record limits and block limits (segments end by
+ * faults on every request of both stores (the segments' in memory, or Azure Append Blobs in memory
+ * through AppendBlobSegments), small record limits and block limits (segments end by
  * their limit, by seal frames and at the block limit), Installs ahead, copies near a segment's
  * end, appends delayed until after an end, one to three instances with stale catalog objects, and
  * sweeps at a retirement TTL of 0. At the drain, every read must read on to the log's end.
@@ -45,18 +48,24 @@ class TestSegmentedCommitProtocol {
       @ForAll("limits") long limit,
       @ForAll("blocks") long extraBlocks,
       @ForAll boolean copies,
+      @ForAll("stores") String stores,
       @ForAll("instances") int instances,
       @ForAll long seed,
       @ForAll("settings") CommitProtocol.Settings settings,
       @ForAll("schedules") List<CommitProtocol.Cmd> schedule) {
-    run(limit, extraBlocks, copies, instances, seed, settings, schedule);
+    run(limit, extraBlocks, copies, stores, instances, seed, settings, schedule);
   }
 
-  static void run(long limit, long extraBlocks, boolean copies, int instances, long seed,
-      CommitProtocol.Settings settings, List<CommitProtocol.Cmd> schedule) {
+  static void run(long limit, long extraBlocks, boolean copies, String stores, int instances,
+      long seed, CommitProtocol.Settings settings, List<CommitProtocol.Cmd> schedule) {
     InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
-    InMemorySegmentStore store =
-        new InMemorySegmentStore(limit + extraBlocks, 1L << 20, 64L << 20);
+    SegmentedLogHarness.Segments segments = stores.equals("segments")
+        ? SegmentedLogHarness.Segments.of(
+            new InMemorySegmentStore(limit + extraBlocks, 1L << 20, 64L << 20))
+        : SegmentedLogHarness.Segments.of(
+            new InMemoryAppendBlobStore((int) (limit + extraBlocks), () -> 0L),
+            stores.equals("blobs"));
+    SegmentStore store = segments.store();
     SplittableRandom random = new SplittableRandom(seed);
     List<SegmentedLog> logs = new ArrayList<>();
     for (int i = 0; i < instances; i++) {
@@ -66,8 +75,17 @@ class TestSegmentedCommitProtocol {
           SegmentedLog.Options.defaults().withLimit(limit).withRetireTtlMs(0)
               .withClock(() -> 0L).withCopies(copies)));
     }
-    CommitProtocol.run(new SegmentedLogHarness(io, store, "mem:///log", "segments", logs,
+    CommitProtocol.run(new SegmentedLogHarness(io, segments, "mem:///log", "segments", logs,
         EntityVersionsMachine.INSTANCE), settings, schedule);
+  }
+
+  /**
+   * The segments' store: in memory, or Azure Append Blobs in memory whose appends say their block
+   * count or don't.
+   */
+  @Provide
+  Arbitrary<String> stores() {
+    return Arbitraries.of("segments", "blobs", "uncounted-blobs");
   }
 
   /** K: segments of one record, a few, or many (the store's block limit is K or more). */

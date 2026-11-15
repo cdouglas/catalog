@@ -83,6 +83,8 @@ public final class AzureAppendBlobStore implements AppendBlobStore {
 
   private static final HttpHeaderName APPEND_OFFSET =
       HttpHeaderName.fromString("x-ms-blob-append-offset");
+  private static final HttpHeaderName COMMITTED_BLOCK_COUNT =
+      HttpHeaderName.fromString("x-ms-blob-committed-block-count");
   private static final DownloadRetryOptions NO_DOWNLOAD_RETRIES =
       new DownloadRetryOptions().setMaxRetryRequests(0);
   /** The metadata that marks a directory in a listing of a hierarchical namespace. */
@@ -179,6 +181,15 @@ public final class AzureAppendBlobStore implements AppendBlobStore {
 
   @Override
   public long appendBlock(String name, byte[] block, long maxSize, long appendPosition) {
+    return append(name, block, maxSize, appendPosition).offset();
+  }
+
+  @Override
+  public Landed appendBlockCounted(String name, byte[] block) {
+    return append(name, block, 0, -1);
+  }
+
+  private Landed append(String name, byte[] block, long maxSize, long appendPosition) {
     AppendBlobRequestConditions conditions = new AppendBlobRequestConditions();
     if (maxSize > 0) {
       conditions.setMaxSize(maxSize);
@@ -208,7 +219,12 @@ public final class AzureAppendBlobStore implements AppendBlobStore {
       throw failure("append block", name, e);
     }
     String offset = response.getHeaders().getValue(APPEND_OFFSET);
-    return Long.parseLong(offset != null ? offset : response.getValue().getBlobAppendOffset());
+    String count = response.getHeaders().getValue(COMMITTED_BLOCK_COUNT);
+    Integer blocks = count != null ? Integer.valueOf(count)
+        : response.getValue().getBlobCommittedBlockCount();
+    return new Landed(
+        Long.parseLong(offset != null ? offset : response.getValue().getBlobAppendOffset()),
+        blocks == null ? -1 : blocks);
   }
 
   @Override

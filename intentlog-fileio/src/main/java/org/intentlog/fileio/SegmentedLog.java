@@ -41,6 +41,7 @@ import org.intentlog.LogNotSentException;
 import org.intentlog.LogTail;
 import org.intentlog.LogThrottledException;
 import org.intentlog.LogView;
+import org.intentlog.LogVoidException;
 import org.intentlog.PageStore;
 import org.intentlog.Receipt;
 import org.intentlog.SharedLog;
@@ -148,6 +149,9 @@ public final class SegmentedLog implements SharedLog {
 
   /** Segments this log sends no more appends to (ended, or full), by name. */
   private final Set<String> skip = ConcurrentHashMap.newKeySet();
+
+  /** Whether a read through an append of this log found it void: the log is behind. */
+  private volatile boolean behind = false;
 
   /**
    * A segmented log whose catalog object is {@code catalog} (format 4) and whose segments are
@@ -564,7 +568,8 @@ public final class SegmentedLog implements SharedLog {
     }
     Cat c = held();
     long o = firstOpen(c);
-    int ended = 0;
+    int ended = behind ? 2 : 0;
+    behind = false;
     for (int attempt = 0; attempt < options.sendAttempts(); attempt++) {
       if (ended >= 2) {
         // this log is behind: past the segments it knew, go to the newest a fresh read installs
@@ -776,7 +781,8 @@ public final class SegmentedLog implements SharedLog {
         return v;
       }
     }
-    throw new LogConflictException("Every copy of an append to " + this
+    behind = true;
+    throw new LogVoidException("Every copy of an append to " + this
         + " landed past its segment's end", null);
   }
 
@@ -788,10 +794,11 @@ public final class SegmentedLog implements SharedLog {
    */
   private View viewThrough(Cat c, Copy cp, byte[] record) {
     View kept = newest;
+    SegmentPosition k = kept == null ? null : kept.tail.position;
     boolean usable = kept != null && kept.tail.logId.equals(c.logId())
         && kept.start.equals(c.ck())
-        && kept.tail.position.compareTo(new SegmentPosition(cp.ordinal, cp.index - 1, 0)) <= 0;
-    if (usable && record != null) {
+        && (k.ordinal() < cp.ordinal || (k.ordinal() == cp.ordinal && k.offset() <= cp.offset));
+    if (usable && record != null && cp.index > 0) {
       SegmentPosition t = kept.tail.position;
       Seg seg = c.seg(cp.ordinal);
       if (seg != null && t.ordinal() == cp.ordinal && t.offset() == cp.offset
@@ -1067,7 +1074,10 @@ public final class SegmentedLog implements SharedLog {
     }
   }
 
-  /** A copy of an append: its segment, where the reply put it, its index, length and check. */
+  /**
+   * A copy of an append: its segment, where the reply put it, its index (0 or less: the store
+   * can't say), length and check.
+   */
   record Copy(long ordinal, String name, long offset, long index, int length, int crc) {}
 
   /** An append's receipt: its copies, in ordinal order, and its record. */
