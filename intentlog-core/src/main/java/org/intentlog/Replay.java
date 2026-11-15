@@ -236,6 +236,10 @@ public final class Replay {
         committed.pageOut(record.pageOut());
         continue;
       }
+      if (record.isSegmentRecord()) {
+        // A segmented log keeps these in its catalog object and leaves them out of every view.
+        throw new IllegalStateException("A view carries a segmented log's provider record");
+      }
       intentionRecords++;
       recordsSinceGc++;
       bytesSinceGc += bytes.length;

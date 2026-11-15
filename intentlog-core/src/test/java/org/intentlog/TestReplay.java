@@ -27,6 +27,7 @@ import java.util.Map;
 import java.util.Random;
 import java.util.UUID;
 import org.intentlog.wire.CommittedSetCodec;
+import org.intentlog.wire.InstallSegment;
 import org.intentlog.wire.LogEnvelope;
 import org.intentlog.wire.UuidV7;
 import org.junit.jupiter.api.Test;
@@ -45,6 +46,15 @@ class TestReplay {
 
   private static byte[] record(UUID id, String key, int read) {
     return LogEnvelope.encodeRecord(id, MACHINE.encodeIntention(new ToyMachine.Bump(key, read)));
+  }
+
+  @Test
+  void replayRefusesASegmentRecordInAView() {
+    byte[] install = LogEnvelope.encodeInstallSegment(new InstallSegment(1, "s", "", 3));
+    org.assertj.core.api.Assertions.assertThatThrownBy(
+            () -> Replay.replay(MACHINE, null, List.of(install), null))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("provider record");
   }
 
   @Test

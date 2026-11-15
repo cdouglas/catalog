@@ -21,12 +21,14 @@ package org.intentlog.wire;
 import static org.intentlog.wire.ProtoWire.bytesToUuid;
 import static org.intentlog.wire.ProtoWire.readFixed64;
 import static org.intentlog.wire.ProtoWire.readLengthDelimitedBytes;
+import static org.intentlog.wire.ProtoWire.readString;
 import static org.intentlog.wire.ProtoWire.readVarint;
 import static org.intentlog.wire.ProtoWire.readVarint64;
 import static org.intentlog.wire.ProtoWire.skipField;
 import static org.intentlog.wire.ProtoWire.uuidToBytes;
 import static org.intentlog.wire.ProtoWire.writeBytes;
 import static org.intentlog.wire.ProtoWire.writeFixed64;
+import static org.intentlog.wire.ProtoWire.writeString;
 import static org.intentlog.wire.ProtoWire.writeVarint;
 import static org.intentlog.wire.ProtoWire.writeVarint64;
 
@@ -40,8 +42,10 @@ import java.util.UUID;
  * The envelope of a log's checkpoints and records (log.proto): {@code LogCheckpoint} carries the
  * log's id, the committed set and the state machine's checkpoint; {@code LogRecord} carries a
  * record's id and the state machine's intention, a GC of the committed set ({@code
- * AdvanceHorizon}), or a {@code PageOut} of its oldest block. {@code CommittedPage} is a page's
- * body, an object apart from the log. The state machine's bytes are opaque here.
+ * AdvanceHorizon}), a {@code PageOut} of its oldest block, or, in a segmented log's catalog
+ * object, a segment's {@code InstallSegment} or {@code RetiredSegment} (provider records, which
+ * no view carries). {@code CommittedPage} is a page's body, an object apart from the log. The
+ * state machine's bytes are opaque here.
  */
 public final class LogEnvelope {
 
@@ -61,6 +65,19 @@ public final class LogEnvelope {
   public static final int LOG_RECORD_INTENTION = 2;
   public static final int LOG_RECORD_ADVANCE_HORIZON = 3;
   public static final int LOG_RECORD_PAGE_OUT = 4;
+  public static final int LOG_RECORD_INSTALL_SEGMENT = 5;
+  public static final int LOG_RECORD_RETIRED_SEGMENT = 6;
+
+  public static final int INSTALL_SEGMENT_ORDINAL = 1;
+  public static final int INSTALL_SEGMENT_NAME = 2;
+  public static final int INSTALL_SEGMENT_LOCATION = 3;
+  public static final int INSTALL_SEGMENT_LIMIT = 4;
+
+  public static final int RETIRED_SEGMENT_ORDINAL = 1;
+  public static final int RETIRED_SEGMENT_NAME = 2;
+  public static final int RETIRED_SEGMENT_LOCATION = 3;
+  public static final int RETIRED_SEGMENT_END = 4;
+  public static final int RETIRED_SEGMENT_RETIRED_AT_MS = 5;
 
   public static final int ADVANCE_HORIZON_WATERMARK_MS = 1;
 
@@ -117,53 +134,80 @@ public final class LogEnvelope {
     }
   }
 
-  /** A decoded {@code LogRecord}: an intention with its id, a GC record, or a PageOut. */
+  /**
+   * A decoded {@code LogRecord}: an intention with its id, a GC record, a PageOut, or a segmented
+   * log's provider record (an Install or a Retired entry).
+   */
   public static final class Record {
+    private enum Kind {
+      INTENTION, ADVANCE_HORIZON, PAGE_OUT, INSTALL_SEGMENT, RETIRED_SEGMENT
+    }
+
+    private final Kind kind;
     private final UUID id;
     private final byte[] intention;
     private final long watermarkMs;
     private final PageOut pageOut;
+    private final InstallSegment installSegment;
+    private final RetiredSegment retiredSegment;
 
-    private Record(UUID id, byte[] intention, long watermarkMs, PageOut pageOut) {
+    private Record(Kind kind, UUID id, byte[] intention, long watermarkMs, PageOut pageOut,
+        InstallSegment installSegment, RetiredSegment retiredSegment) {
+      this.kind = kind;
       this.id = id;
       this.intention = intention;
       this.watermarkMs = watermarkMs;
       this.pageOut = pageOut;
+      this.installSegment = installSegment;
+      this.retiredSegment = retiredSegment;
     }
 
     public static Record intention(UUID id, byte[] intention) {
-      return new Record(id, intention, -1L, null);
+      return new Record(Kind.INTENTION, id, intention, -1L, null, null, null);
     }
 
     public static Record advanceHorizon(long watermarkMs) {
-      return new Record(null, null, watermarkMs, null);
+      return new Record(Kind.ADVANCE_HORIZON, null, null, watermarkMs, null, null, null);
     }
 
     public static Record pageOut(PageOut pageOut) {
-      return new Record(null, null, -1L, pageOut);
+      return new Record(Kind.PAGE_OUT, null, null, -1L, pageOut, null, null);
+    }
+
+    public static Record installSegment(InstallSegment install) {
+      return new Record(Kind.INSTALL_SEGMENT, null, null, -1L, null, install, null);
+    }
+
+    public static Record retiredSegment(RetiredSegment retired) {
+      return new Record(Kind.RETIRED_SEGMENT, null, null, -1L, null, null, retired);
     }
 
     /** Whether this is an intention, rather than a record of the committed set (GC, PageOut). */
     public boolean isIntention() {
-      return intention != null;
+      return kind == Kind.INTENTION;
     }
 
     /** Whether this is a GC record ({@code AdvanceHorizon}). */
     public boolean isAdvanceHorizon() {
-      return intention == null && pageOut == null;
+      return kind == Kind.ADVANCE_HORIZON;
     }
 
     /** Whether this is a {@code PageOut}. */
     public boolean isPageOut() {
-      return pageOut != null;
+      return kind == Kind.PAGE_OUT;
     }
 
-    /** The intention's id; null for a GC record or a PageOut. */
+    /** Whether this is a segmented log's provider record: an Install or a Retired entry. */
+    public boolean isSegmentRecord() {
+      return kind == Kind.INSTALL_SEGMENT || kind == Kind.RETIRED_SEGMENT;
+    }
+
+    /** The intention's id; null for any other record. */
     public UUID id() {
       return id;
     }
 
-    /** The intention; null for a GC record or a PageOut. */
+    /** The intention; null for any other record. */
     public byte[] intention() {
       return intention;
     }
@@ -176,6 +220,16 @@ public final class LogEnvelope {
     /** A PageOut's body; null for another record. */
     public PageOut pageOut() {
       return pageOut;
+    }
+
+    /** An Install's body; null for another record. */
+    public InstallSegment installSegment() {
+      return installSegment;
+    }
+
+    /** A Retired entry's body; null for another record. */
+    public RetiredSegment retiredSegment() {
+      return retiredSegment;
     }
   }
 
@@ -367,9 +421,58 @@ public final class LogEnvelope {
     }
   }
 
+  /** Encodes a {@code LogRecord} that carries a segmented log's {@code InstallSegment}. */
+  public static byte[] encodeInstallSegment(InstallSegment install) {
+    try {
+      ByteArrayOutputStream body = new ByteArrayOutputStream(64);
+      if (install.ordinal() != 0L) {
+        writeVarint64(body, INSTALL_SEGMENT_ORDINAL, install.ordinal());
+      }
+      if (!install.name().isEmpty()) {
+        writeString(body, INSTALL_SEGMENT_NAME, install.name());
+      }
+      if (!install.location().isEmpty()) {
+        writeString(body, INSTALL_SEGMENT_LOCATION, install.location());
+      }
+      writeVarint64(body, INSTALL_SEGMENT_LIMIT, install.limit());
+      ByteArrayOutputStream out = new ByteArrayOutputStream(body.size() + 2);
+      writeBytes(out, LOG_RECORD_INSTALL_SEGMENT, body.toByteArray());
+      return out.toByteArray();
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
+  /** Encodes a {@code LogRecord} that carries a segmented log's {@code RetiredSegment}. */
+  public static byte[] encodeRetiredSegment(RetiredSegment retired) {
+    try {
+      ByteArrayOutputStream body = new ByteArrayOutputStream(80);
+      if (retired.ordinal() != 0L) {
+        writeVarint64(body, RETIRED_SEGMENT_ORDINAL, retired.ordinal());
+      }
+      if (!retired.name().isEmpty()) {
+        writeString(body, RETIRED_SEGMENT_NAME, retired.name());
+      }
+      if (!retired.location().isEmpty()) {
+        writeString(body, RETIRED_SEGMENT_LOCATION, retired.location());
+      }
+      if (retired.end().length > 0) {
+        writeBytes(body, RETIRED_SEGMENT_END, retired.end());
+      }
+      if (retired.retiredAtMs() != 0L) {
+        writeFixed64(body, RETIRED_SEGMENT_RETIRED_AT_MS, retired.retiredAtMs());
+      }
+      ByteArrayOutputStream out = new ByteArrayOutputStream(body.size() + 2);
+      writeBytes(out, LOG_RECORD_RETIRED_SEGMENT, body.toByteArray());
+      return out.toByteArray();
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
   /**
    * Decodes a {@code LogRecord}. Fails if it has no body, or more than one, or an intention
-   * without an id.
+   * without an id, or a segment record with one.
    */
   public static Record decodeRecord(byte[] bytes) {
     try {
@@ -378,6 +481,8 @@ public final class LogEnvelope {
       byte[] intention = null;
       Long watermarkMs = null;
       PageOut pageOut = null;
+      InstallSegment install = null;
+      RetiredSegment retired = null;
       int bodies = 0;
       while (in.available() > 0) {
         int tag = readVarint(in);
@@ -397,6 +502,14 @@ public final class LogEnvelope {
             pageOut = decodePageOut(readLengthDelimitedBytes(in));
             bodies++;
             break;
+          case LOG_RECORD_INSTALL_SEGMENT:
+            install = decodeInstallSegment(readLengthDelimitedBytes(in));
+            bodies++;
+            break;
+          case LOG_RECORD_RETIRED_SEGMENT:
+            retired = decodeRetiredSegment(readLengthDelimitedBytes(in));
+            bodies++;
+            break;
           default:
             skipField(in, tag & 0x7);
         }
@@ -409,11 +522,78 @@ public final class LogEnvelope {
       if (pageOut != null) {
         return Record.pageOut(pageOut);
       }
+      if (install != null || retired != null) {
+        check(id == null, "A segment record carries an id");
+        return install != null ? Record.installSegment(install) : Record.retiredSegment(retired);
+      }
       check(id != null, "Record missing required id field");
       return Record.intention(id, intention);
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
+  }
+
+  private static InstallSegment decodeInstallSegment(byte[] bytes) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    long ordinal = 0L;
+    String name = "";
+    String location = "";
+    long limit = 0L;
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      switch (tag >>> 3) {
+        case INSTALL_SEGMENT_ORDINAL:
+          ordinal = readVarint64(in);
+          break;
+        case INSTALL_SEGMENT_NAME:
+          name = readString(in);
+          break;
+        case INSTALL_SEGMENT_LOCATION:
+          location = readString(in);
+          break;
+        case INSTALL_SEGMENT_LIMIT:
+          limit = readVarint64(in);
+          break;
+        default:
+          skipField(in, tag & 0x7);
+      }
+    }
+    check(limit >= 1, "An Install sets no record limit");
+    check(!name.isEmpty() || !location.isEmpty(), "An Install names no segment");
+    return new InstallSegment(ordinal, name, location, limit);
+  }
+
+  private static RetiredSegment decodeRetiredSegment(byte[] bytes) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    long ordinal = 0L;
+    String name = "";
+    String location = "";
+    byte[] end = new byte[0];
+    long retiredAtMs = 0L;
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      switch (tag >>> 3) {
+        case RETIRED_SEGMENT_ORDINAL:
+          ordinal = readVarint64(in);
+          break;
+        case RETIRED_SEGMENT_NAME:
+          name = readString(in);
+          break;
+        case RETIRED_SEGMENT_LOCATION:
+          location = readString(in);
+          break;
+        case RETIRED_SEGMENT_END:
+          end = readLengthDelimitedBytes(in);
+          break;
+        case RETIRED_SEGMENT_RETIRED_AT_MS:
+          retiredAtMs = readFixed64(in);
+          break;
+        default:
+          skipField(in, tag & 0x7);
+      }
+    }
+    check(!name.isEmpty() || !location.isEmpty(), "A Retired entry names no segment");
+    return new RetiredSegment(ordinal, name, location, end, retiredAtMs);
   }
 
   private static PageOut decodePageOut(byte[] bytes) throws IOException {

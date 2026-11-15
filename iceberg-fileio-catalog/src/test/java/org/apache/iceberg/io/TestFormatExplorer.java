@@ -104,6 +104,8 @@ public class TestFormatExplorer {
     envelope.put("ADVANCE_HORIZON_", "AdvanceHorizon");
     envelope.put("PAGE_OUT_", "PageOut");
     envelope.put("COMMITTED_PAGE_", "CommittedPage");
+    envelope.put("INSTALL_SEGMENT_", "InstallSegment");
+    envelope.put("RETIRED_SEGMENT_", "RetiredSegment");
     PREFIXES.put("LogEnvelope", envelope);
 
     Map<String, String> delta = new LinkedHashMap<>();

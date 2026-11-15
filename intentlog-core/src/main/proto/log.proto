@@ -146,7 +146,8 @@ message CommittedPage {
 }
 
 // One entry of the log: an intention, which replay applies once, if its
-// preconditions hold where it lands; a GC of the committed set; or a PageOut.
+// preconditions hold where it lands; a GC of the committed set; a PageOut; or,
+// in a segmented log's catalog object, a segment's Install or Retired entry.
 message LogRecord {
   // An intention's UUIDv7 (16 bytes): replay applies a record whose id the
   // committed set does not hold, and a writer learns from the set whether its
@@ -161,7 +162,41 @@ message LogRecord {
     AdvanceHorizon advance_horizon = 3;
     // Seals the oldest inline block into its page and raises the floor.
     PageOut page_out = 4;
+    // A segmented log's provider records (docs/LOG_SEGMENTS.md), in its
+    // catalog object only: the log reads them there and leaves them out of
+    // every view, so the runtime's replay never sees one. Neither carries an
+    // id. A segment holding one is malformed.
+    InstallSegment install_segment = 5;
+    RetiredSegment retired_segment = 6;
   }
+}
+
+// Installs segment `ordinal` after the last installed one. Replay of the
+// catalog object takes it only if `ordinal` is the last installed one plus 1,
+// or, as the first Install after a checkpoint, the ordinal of the
+// checkpoint's position.
+message InstallSegment {
+  uint64 ordinal = 1;
+  // The segment's name in the log's segment store, with its nonce.
+  string name = 2;
+  // Where the segment is, as a URL, in place of the store and name; empty
+  // for one in the log's store.
+  string location = 3;
+  // The segment ends at its limit-th record, or earlier at a seal frame.
+  // Set by the segment's own Install, before it takes any record.
+  uint64 limit = 4;
+}
+
+// A segment a checkpoint covers wholly, kept named until the sweep deletes it.
+message RetiredSegment {
+  uint64 ordinal = 1;
+  string name = 2;
+  string location = 3;
+  // The position after its last record (LogTail.position's encoding).
+  bytes end = 4;
+  // The compactor's clock when it retired the segment; the sweep deletes it
+  // once the retirement TTL has passed since.
+  fixed64 retired_at_ms = 5;
 }
 
 // Drops the pages whose top is at or below watermark_ms and the committed ids
