@@ -185,7 +185,7 @@ tests_of() {
     race) echo TestCatalogRaceProperties ;;
     mw) echo TestMultiWriterProperties ;;
     proto) echo TestMemoryCommitProtocol,TestAtomicFileCommitProtocol ;;
-    azure) echo TestAzureCommitProtocol ;;
+    azure) echo TestSegmentedCommitProtocol ;;
     rebase) echo TestRebaseProperties ;;
     contract) echo 'Test*Encoding' ;;
     diff) echo TestInlineDifferentialProperties,TestInlineDeltaProperties ;;
@@ -204,7 +204,7 @@ setup() {
     proto)
       tries $2/intentlog-memory/src/test/java/org/intentlog/memory/TestMemoryCommitProtocol.java 300000
       tries $2/intentlog-fileio/src/test/java/org/intentlog/fileio/TestAtomicFileCommitProtocol.java 300000 ;;
-    azure) tries $2/intentlog-azure/src/test/java/org/intentlog/azure/TestAzureCommitProtocol.java 1000000 ;;
+    azure) tries $2/intentlog-fileio/src/test/java/org/intentlog/fileio/TestSegmentedCommitProtocol.java 1000000 ;;
     rebase)
       # shellcheck disable=SC2206
       local r=(${REBASE_TRIES:-3000}); [ ${#r[@]} = 1 ] && r=(each "${r[0]}")
