@@ -22,8 +22,9 @@ import java.util.Arrays;
 
 /**
  * A segment a checkpoint covers wholly (log.proto {@code RetiredSegment}; docs/LOG_SEGMENTS.md):
- * kept named in the catalog object until the sweep deletes it, once the retirement TTL has passed
- * since {@code retiredAtMs}. {@code end} is the position after its last record.
+ * kept named in the catalog object until its segment is deleted, by this name, once the
+ * retirement TTL has passed since {@code retiredAtMs}. {@code end} is the position after its last
+ * record.
  */
 public record RetiredSegment(
     long ordinal, String name, String location, byte[] end, long retiredAtMs) {

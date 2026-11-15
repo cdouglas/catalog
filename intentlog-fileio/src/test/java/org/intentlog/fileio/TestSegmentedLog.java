@@ -23,8 +23,12 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
 import org.apache.iceberg.io.InMemoryAtomicFileIO;
 import org.intentlog.LogConflictException;
 import org.intentlog.LogTail;
@@ -184,6 +188,65 @@ class TestSegmentedLog {
         .isInstanceOf(TrimmedException.class);
     assertThatThrownBy(() -> log.putCheckpoint(through, checkpoint(2, through)))
         .isInstanceOf(IllegalStateException.class).hasMessageContaining("I11");
+  }
+
+  /**
+   * A retired segment is deleted by the name its Retired entry holds, and a checkpoint keeps the
+   * entry until its segment is gone: a store that cannot list (a SAS without container scope)
+   * still reclaims every segment a checkpoint retires, and a delete that failed is sent again.
+   */
+  @Test
+  void retiredSegmentsAreDeletedByNameWithoutAListing() {
+    AtomicLong now = new AtomicLong();
+    Set<String> failing = new HashSet<>();
+    store.intercept((op, name) -> op == InMemorySegmentStore.Op.LIST
+        || op == InMemorySegmentStore.Op.DELETE && failing.contains(name)
+        ? InMemorySegmentStore.Fault.FAIL_BEFORE : InMemorySegmentStore.Fault.NONE);
+    SegmentedLog log = new SegmentedLog(AtomicFileLog.segmented(io, LOCATION, () -> 7L, false),
+        store, "segs", SegmentedLog.Options.defaults().withLimit(1).withRetireTtlMs(1_000)
+            .withClock(now::get));
+    LogTail absent = log.probe();
+    log.putCheckpoint(absent, checkpoint(0, absent));
+    for (int i = 0; i < 3; i++) {
+      log.readThrough(log.append(record(), null), Duration.ZERO);
+    }
+    String zero = segment(0);
+    String one = segment(1);
+    LogTail first = log.read().tail(); // in segment 2
+    log.putCheckpoint(first, checkpoint(1, first)); // retires 0 and 1
+    log.trim(first); // within their TTL; the listing fails
+    assertThat(store.names()).contains(zero, one);
+
+    now.set(2_000); // past their TTL
+    failing.add(zero);
+    for (int i = 0; i < 2; i++) {
+      log.readThrough(log.append(record(), null), Duration.ZERO);
+    }
+    LogTail second = log.read().tail(); // in segment 4
+    log.putCheckpoint(second, checkpoint(2, second)); // deletes 1; 0's delete fails; retires 2, 3
+    assertThat(store.names()).contains(zero).doesNotContain(one);
+    assertThat(retired()).containsExactlyInAnyOrder(0L, 2L, 3L);
+
+    failing.clear();
+    log.trim(second); // the sweep deletes 0 by its name
+    assertThat(store.names()).doesNotContain(zero);
+
+    now.set(4_000);
+    log.readThrough(log.append(record(), null), Duration.ZERO);
+    LogTail third = log.read().tail(); // in segment 5
+    log.putCheckpoint(third, checkpoint(3, third)); // drops 0; deletes 2 and 3; retires 4
+    assertThat(retired()).containsExactly(4L);
+    SegmentedLog.Cat cat = SegmentedLog.parse(AtomicFileLog.decode(io.bytes(LOCATION)));
+    List<String> named = new ArrayList<>(
+        cat.segs().stream().map(seg -> "segs/" + seg.name()).toList());
+    named.add(segment(4));
+    assertThat(store.names()).containsExactlyInAnyOrderElementsOf(named);
+  }
+
+  /** The ordinals of the catalog object's Retired entries. */
+  private List<Long> retired() {
+    return SegmentedLog.parse(AtomicFileLog.decode(io.bytes(LOCATION))).retired().stream()
+        .map(r -> r.ordinal()).toList();
   }
 
   @Test

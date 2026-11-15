@@ -50,17 +50,17 @@ import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
  * properties ({@code fileio.catalog.log} {@code azure-append}, an account key or a shared access
  * signature), as a deployment's does, in each table metadata storage. The catalog object and the
  * tables' files stay in memory. Segments of {@link #SEGMENT_RECORDS} records move the log on every
- * few commits, and a retirement TTL of 0 lets a sweep delete retired segments that other
- * instances' catalog objects still name.
+ * few commits, and a retirement TTL of 0 lets the next checkpoint or sweep delete retired
+ * segments that other instances' catalog objects still name.
  *
  * <p>Run explicitly, with {@code AZURE_LOG_IT_CONTAINER_URL} (a container's URL on the primary
  * endpoint) and {@code AZURE_STORAGE_KEY} (its account key) or {@code AZURE_STORAGE_SAS} (a
  * signature for its objects) set: {@code mvn -o -pl iceberg-fileio-catalog test
  * -Dtest='AzureLogCatalogIT*'}. Each run writes under {@code catalog-it/<UTC>-<random>}, a log per
  * catalog of each test, and deletes it afterwards: by listing the prefix, or, with a signature
- * that cannot list, by the names every catalog object installed or retired (a sweep that cannot
- * list deletes nothing, so an installer's blob that lost its Install, which it deletes itself,
- * is all that could be left).
+ * that cannot list, by the names every catalog object installed or retired (retired segments are
+ * deleted by name, so only an unnamed blob, an installer's that lost its Install and failed to
+ * delete it, could be left).
  */
 @EnabledIfEnvironmentVariable(named = "AZURE_LOG_IT_CONTAINER_URL", matches = ".+")
 class AzureLogCatalogIT {

@@ -77,8 +77,10 @@ import org.intentlog.wire.RetiredSegment;
  *   <li>A read through an append takes its copies in order: each needs the segments before its own
  *       ended, and seals one that hasn't; the first copy the log holds is the record, and if none
  *       does, the append is void, a {@link LogConflictException} (D4).
- *   <li>The sweep ({@link #trim}) deletes a retired segment once its TTL has passed, and an unnamed
- *       blob whose ordinal is at most the newest Install's: no Install of it can land any more.
+ *   <li>A retired segment is deleted by the name its Retired entry holds once its TTL has passed,
+ *       by a checkpoint, which drops the entry only once the segment is gone, and by the sweep
+ *       ({@link #trim}). The sweep also lists the prefix for unnamed blobs, and deletes those whose
+ *       ordinal is at most the newest Install's: no Install of it can land any more.
  * </ul>
  *
  * <p>To the runtime this is a log of blind appends and separate checkpoints. The store sends each
@@ -92,7 +94,7 @@ public final class SegmentedLog implements SharedLog {
    * @param limit K, the record limit each Install sets (0: the store's block limit)
    * @param readAttempts how many times a read starts again before the log could not be read
    * @param sendAttempts how many segments one append, Install or checkpoint tries
-   * @param retireTtlMs how long a retired segment stays before the sweep deletes it
+   * @param retireTtlMs how long a retired segment stays before it is deleted
    * @param clockMs the clock a retirement is stamped with, and the TTL measured on
    * @param copies whether an append near its segment's limit also sends a copy to the next
    * @param aheadMargin how near the limit an append installs the next segment ahead (0: 1% of K)
@@ -884,6 +886,7 @@ public final class SegmentedLog implements SharedLog {
       create(checkpoint);
       return;
     }
+    Set<String> deleted = new HashSet<>();
     for (int attempt = 0; attempt < options.sendAttempts(); attempt++) {
       Cat c = existing();
       if (c.logId().equals(t.logId) && t.position.equals(c.ck())) {
@@ -906,7 +909,8 @@ public final class SegmentedLog implements SharedLog {
         }
       }
       for (RetiredSegment old : c.retired()) {
-        if (old.retiredAtMs() + options.retireTtlMs() > now) {
+        // an entry is the only reference to its segment: drop it only once the segment is gone
+        if (!expired(old, now) || !deleteRetired(old, deleted)) {
           records.add(LogEnvelope.encodeRetiredSegment(old));
         }
       }
@@ -983,10 +987,33 @@ public final class SegmentedLog implements SharedLog {
     }
   }
 
+  /** Whether {@code r}'s TTL has passed at {@code now}. */
+  private boolean expired(RetiredSegment r, long now) {
+    return r.retiredAtMs() + options.retireTtlMs() <= now;
+  }
+
+  /**
+   * Deletes the segment of {@code r}, unless {@code deleted} holds it already; whether it is gone.
+   * A delete that fails leaves it for the sweep or the next checkpoint.
+   */
+  private boolean deleteRetired(RetiredSegment r, Set<String> deleted) {
+    if (deleted.contains(r.name())) {
+      return true;
+    }
+    try {
+      store.delete(path(r.name()));
+    } catch (RuntimeException e) {
+      return false;
+    }
+    deleted.add(r.name());
+    return true;
+  }
+
   /**
    * The sweep (docs/LOG_SEGMENTS.md "Compaction, retirement and the sweep"): deletes each retired
-   * segment whose TTL has passed, and each unnamed blob under the prefix whose ordinal is at most
-   * the newest Install's. {@code through}'s checkpoint is the catalog object's or older.
+   * segment whose TTL has passed by its entry's name, then lists the prefix and deletes each
+   * unnamed blob whose ordinal is at most the newest Install's. {@code through}'s checkpoint is
+   * the catalog object's or older.
    */
   @Override
   public void trim(LogTail through) {
@@ -1005,18 +1032,20 @@ public final class SegmentedLog implements SharedLog {
   void sweep() {
     Cat c = existing();
     long now = options.clockMs().getAsLong();
-    Set<String> keep = new HashSet<>();
-    c.segs().forEach(s -> keep.add(s.name()));
+    Set<String> named = new HashSet<>();
+    c.segs().forEach(s -> named.add(s.name()));
+    Set<String> deleted = new HashSet<>();
     for (RetiredSegment r : c.retired()) {
-      if (r.retiredAtMs() + options.retireTtlMs() > now) {
-        keep.add(r.name());
+      named.add(r.name());
+      if (expired(r, now)) {
+        deleteRetired(r, deleted); // by name: no listing needed
       }
     }
     long newest = c.last().ordinal();
     for (String full : store.list(prefix + "/seg-")) {
       String name = full.substring(prefix.length() + 1);
       long ordinal = ordinalOf(name);
-      if (ordinal >= 0 && ordinal <= newest && !keep.contains(name)) {
+      if (ordinal >= 0 && ordinal <= newest && !named.contains(name)) {
         try {
           store.delete(full);
         } catch (RuntimeException e) {

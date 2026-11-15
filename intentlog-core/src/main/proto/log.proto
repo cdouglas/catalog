@@ -191,15 +191,15 @@ message InstallSegment {
   uint64 limit = 4;
 }
 
-// A segment a checkpoint covers wholly, kept named until the sweep deletes it.
+// A segment a checkpoint covers wholly, kept named until it is deleted.
 message RetiredSegment {
   uint64 ordinal = 1;
   string name = 2;
   string location = 3;
   // The position after its last record (LogTail.position's encoding).
   bytes end = 4;
-  // The compactor's clock when it retired the segment; the sweep deletes it
-  // once the retirement TTL has passed since.
+  // The compactor's clock when it retired the segment; it is deleted, by its
+  // name, once the retirement TTL has passed since.
   fixed64 retired_at_ms = 5;
 }
 

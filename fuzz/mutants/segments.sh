@@ -4,14 +4,16 @@
 # small limits, copies, sweeps at TTL 0) or the log's regressions (TestSegmentedLog). The model's
 # catalogseal, limitatnext and sealcount have no Java to mutate: no catalog record states an end,
 # an Install sets only its own segment's limit, and a seal frame carries no count. nested is
-# replay's refusal of a provider record in a view (TestReplay). Two are the Java's own:
+# replay's refusal of a provider record in a view (TestReplay). Three are the Java's own:
 # fastvoid, the read through an append that skips its read when the reply puts the copy at the
-# kept view's end, past its segment's limit; and lastcopy, the read through deciding by the last
-# copy the log holds rather than the first. fastvoid is equivalent (2026-11-15, 2,000 tries
-# locally): an append whose reply puts it past the limit is void with no read and never in a
-# receipt, and a receipt whose store can't say the index has none for the fast path to match.
-# Locally at 2,000 tries the other eight are caught, each by the fuzzer.
-MUTANTS="readahead voidack createonmissing sweepearly sweepinflight sdkretry overlimit fastvoid lastcopy"
+# kept view's end, past its segment's limit; lastcopy, the read through deciding by the last
+# copy the log holds rather than the first; and dropretired, a checkpoint dropping a Retired
+# entry past its TTL without deleting its segment (a leak where the sweep can't list; caught by
+# TestSegmentedLog). fastvoid is equivalent (2026-11-15, 2,000 tries locally): an append whose
+# reply puts it past the limit is void with no read and never in a receipt, and a receipt whose
+# store can't say the index has none for the fast path to match. Locally at 2,000 tries the
+# other nine are caught, dropretired by TestSegmentedLog and the rest by the fuzzer.
+MUTANTS="readahead voidack createonmissing sweepearly sweepinflight sdkretry overlimit fastvoid lastcopy dropretired"
 EQUIVALENT="fastvoid"
 ORACLES=TestSegmentedCommitProtocol,TestSegmentedLog
 
@@ -43,9 +45,11 @@ mutant() { # name main-dir test-dir (the catalog's; these mutants are intentlog'
           continue;
         }" ;;
     # TLA+ sweepearly: the sweep deletes segments the catalog object names
-    sweepearly) mutate $SL "      if (ordinal >= 0 && ordinal <= newest && !keep.contains(name)) {" "      if (ordinal >= 0 && ordinal <= newest) {" ;;
+    sweepearly) mutate $SL "      if (ordinal >= 0 && ordinal <= newest && !named.contains(name)) {" "      if (ordinal >= 0 && ordinal <= newest) {" ;;
     # TLA+ sweepinflight: the sweep deletes unnamed blobs of any ordinal, an Install's in flight
-    sweepinflight) mutate $SL "      if (ordinal >= 0 && ordinal <= newest && !keep.contains(name)) {" "      if (ordinal >= 0 && !keep.contains(name)) {" ;;
+    sweepinflight) mutate $SL "      if (ordinal >= 0 && ordinal <= newest && !named.contains(name)) {" "      if (ordinal >= 0 && !named.contains(name)) {" ;;
+    # a checkpoint drops a Retired entry past its TTL without deleting its segment
+    dropretired) mutate $SL "        if (!expired(old, now) || !deleteRetired(old, deleted)) {" "        if (!expired(old, now)) {" ;;
     # TLA+ sdkretry: an append whose reply was lost is sent again below the runtime
     sdkretry) mutate $SL "        a = store.append(path(seg.name()), frame);" "        try {
           a = store.append(path(seg.name()), frame);

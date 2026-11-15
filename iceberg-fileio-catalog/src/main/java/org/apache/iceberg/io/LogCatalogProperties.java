@@ -353,7 +353,7 @@ public final class LogCatalogProperties {
 
   public static final int DEFAULT_LOG_CHECKPOINT_RECORDS = 10_000;
 
-  /** How long a retired segment stays before the sweep deletes it (default 60 s). */
+  /** How long a retired segment stays before it is deleted (default 60 s). */
   public static final String LOG_RETIRE_TTL_MS = "fileio.catalog.log.retire.ttl.ms";
 
   /** The log {@code properties} name: {@link #LOG_ATOMIC_FILE} unless they name another. */

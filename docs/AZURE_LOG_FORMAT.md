@@ -88,8 +88,8 @@ each starts; `start()` is the checkpoint's position or the tail the records foll
 | `append` | Append Block; on a void reply or a full segment, the next segment's; an Install when none is next |
 | install | Put Blob (Append Blob) if absent; the catalog object's conditional append |
 | `readThrough` | none, if the reply put the copy at the kept view's end; else ranged GETs; a seal frame (Append Block) for each earlier segment that hasn't ended |
-| `putCheckpoint` | the catalog object (a GET), then its CAS replace |
-| `trim` (the sweep) | the catalog object (a GET); List Blobs under the prefix; Delete Blob for each retired segment past its TTL and each unnamed blob at or below the newest Install's ordinal |
+| `putCheckpoint` | the catalog object (a GET); Delete Blob for each Retired entry past its TTL; its CAS replace |
+| `trim` (the sweep) | the catalog object (a GET); Delete Blob for each Retired entry past its TTL; List Blobs under the prefix; Delete Blob for each unnamed blob at or below the newest Install's ordinal |
 
 ## 5. Algorithms
 
@@ -108,8 +108,10 @@ sweep" are the algorithms; the code follows them, with these particulars:
   if its segment hadn't ended before it (its length and CRC checked), else void. Every copy void
   is `LogVoidException`.
 - **A checkpoint** restates the Installs from its position's segment on and retires those
-  before, each with its end (as read, or read now), keeping older Retired entries within their
-  TTL. A checkpoint at the object's own position with other bytes is refused (I11).
+  before, each with its end (as read, or read now). It keeps the older Retired entries, but
+  those past their TTL whose segments it deleted (by the entry's name): an entry is dropped only
+  once its segment is gone. A checkpoint at the object's own position with other bytes is
+  refused (I11).
 - **A trim** first checks that the catalog object's checkpoint covers it (P5), then sweeps.
 - **Creation** creates segment 0, then the catalog object if absent: the checkpoint, position
   `(0, 0, 0)`, Install 0. A catalog object with the same checkpoint is this creation, retried;
@@ -146,4 +148,4 @@ AZURE_LOG.md "Failures".
 | OI-13 | **Only account-key credentials** reach the segments from a catalog. | `AzureLogs.open` |
 | OI-15 | **A catalog object that takes no more appends** (its store's append limit) takes no Install: once the newest segment has ended, appends fail unsent until a checkpoint replaces the object, which needs its GC record to land. Real stores' limits (ADLS: 50,000 appends) are far above an interval's Installs. | `SegmentedLog.install` |
 | OI-16 | **An instance's memory of segments grows**: the names it saw end, and their ends, are kept for the instance's life. | `SegmentedLog.skip`, `ends` |
-| OI-17 | **The sweep lists the prefix on every trim.** A SAS without container scope cannot list, and the sweep then deletes nothing. | `SegmentedLog.sweep` |
+| OI-17 | **Unnamed blobs need a listing.** The sweep lists the prefix on every trim to find the blobs no catalog object names: an installer's that lost and failed to delete it, an abandoned creation's. They are empty. A SAS without container scope cannot list, and they stay; retired segments are deleted by name regardless. | `SegmentedLog.sweep` |

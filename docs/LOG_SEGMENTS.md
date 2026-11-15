@@ -66,7 +66,7 @@ message InstallSegment {
   uint64 limit = 4;     // the segment ends at its limit-th record, or earlier at a seal (D2)
 }
 
-// A segment a checkpoint covers wholly, kept until the sweep deletes it.
+// A segment a checkpoint covers wholly, kept until its segment is deleted.
 message RetiredSegment {
   uint64 ordinal = 1;
   string name = 2;
@@ -174,7 +174,8 @@ its index: the reply's block count (Azure's `x-ms-blob-committed-block-count`).
 creates it under a fresh name, then appends `InstallSegment(m+1, K)` to the catalog
 object with format 3's condition (its version and offset as read; on a store without
 appends, a CAS replace). A loser reads again. If an `m+1` landed, it uses that one and
-leaves its own blob to the sweep. Replay rejects any ordinal but the next, so each
+deletes its own blob, which no Install can name; one whose delete fails leaves it to the
+sweep's listing. Replay rejects any ordinal but the next, so each
 Install adds exactly one segment. A checkpoint or another Install landing in between
 also makes an Install retry; that costs one read. Installing several in one write is
 [Later](#later).
@@ -274,22 +275,27 @@ GC record, read through it, PageOuts, `putCheckpoint`, `trim`.
     names them, each with its limit (open segments installed ahead among them);
   - a `RetiredSegment` for each segment before `through`'s ordinal that the object
     named: those newly retired, with now's time and their end, and the older entries
-    whose TTL has not passed.
+    but those it deleted. It deletes the segment of each older entry whose TTL has
+    passed, by the name the entry holds, before the replace drops the entry, and keeps
+    the entry of one whose delete failed: an entry is its segment's only reference that
+    needs no listing to follow.
 
   A CAS that loses (an Install landed) reads again and retries. The replace never
   carries records, so appends to segments never race a compaction.
 - **`trim(through)`** is the sweep. It deletes each retired segment whose TTL
-  (`fileio.catalog.log.retire.ttl.ms`) has passed since `retired_at_ms`. It also lists
-  the prefix and deletes unnamed blobs (losers' segments, creators' leftovers) whose
-  ordinal is at most the newest Install's. No Install of that ordinal can land any
-  more, since replay takes only the next ordinal, so no Install in flight names one.
-  The rule needs no clock, and so works with the catalog object and the segments on
-  different stores. Retired entries keep overridden locations, which a listing can't
-  find. An unnamed blob at an overridden location is leaked; only a migration makes
-  one.
+  (`fileio.catalog.log.retire.ttl.ms`) has passed since `retired_at_ms`, by the name
+  its entry holds. Then it lists the prefix and deletes unnamed blobs (those of
+  installers that lost and failed to delete them, creators' leftovers) whose ordinal is
+  at most the newest Install's. No Install of that ordinal can land any more, since
+  replay takes only the next ordinal, so no Install in flight names one. The rule needs
+  no clock, and so works with the catalog object and the segments on different stores.
+  Only unnamed blobs need the listing, and they are empty (no writer appends to a
+  segment no Install names): a credential that can't list (a SAS without container
+  scope) leaks those alone. An unnamed blob at an overridden location is leaked; only a
+  migration makes one.
 - A reader holding an older catalog object that finds a segment gone reads afresh. A
   writer holding one appends to an ended segment (void) or a gone one (NotFound), and
-  goes on from a fresh read. A clock ahead of the compactor's can only make the sweep
+  goes on from a fresh read. A clock ahead of the compactor's can only make a deletion
   early, which costs a reader a restart, never a record.
 
 **Creating the log** creates segment 0, then puts the catalog object if absent, with
@@ -342,7 +348,7 @@ pages, and the catalog above the log.
 | SG3 | No write voids a record a read has returned. | A seal frame lands after it; a limit is fixed before the segment takes records (D1, D2). |
 | SG4 | Ordinals are contiguous from the checkpoint's. Each Install names a segment its installer created under a fresh name before sending it. | The catalog object's condition, replay's ordinal rule, nonce names (D8). |
 | SG5 | After the first Install, no record frame in the catalog object is in the log. | Replay of the catalog object. |
-| SG6 | The sweep deletes a named segment only after a checkpoint covers it wholly and its TTL has passed since it was retired. It deletes an unnamed blob only once its ordinal is at most the newest Install's, so no Install in flight can name it. | Retirement happens only in `putCheckpoint`, for segments before the position's; replay takes an Install only of the next ordinal. |
+| SG6 | A named segment is deleted (by a checkpoint or the sweep) only after a checkpoint covers it wholly and its TTL has passed since it was retired, and its Retired entry is dropped only once it is deleted. The sweep deletes an unnamed blob only once its ordinal is at most the newest Install's, so no Install in flight can name it. | Retirement happens only in `putCheckpoint`, for segments before the position's; replay takes an Install only of the next ordinal. |
 | SG7 | P1–P6 as the log meets them. P4 is not claimed: appends are blind. | As stated. |
 | SG8 | Every segment can end. Before its end it holds fewer than K frames, so a seal frame fits. | K is at most the store's block limit, and K − 1 of the largest frame and a seal frame fit its largest object, checked when the log opens. |
 | SG9 | A record applies at most once, at its first copy in the log. | The committed set skips a copy of a record that applied; S2 keeps a rejected one rejected. |
@@ -400,7 +406,8 @@ As LOG.md "Testing a provider", per stage:
   `AppendBlobSegments` on `InMemoryAppendBlobStore`, whose replies say the block count or
   don't.
 - **Mutants** (`fuzz/mutants/segments.sh`): each switch above, put in the code, fails
-  the fuzzer.
+  the fuzzer; a checkpoint that drops an expired Retired entry without deleting its
+  segment (`dropretired`, a leak) fails `TestSegmentedLog`.
 - **Catalog suites**: `TestLocalCatalog*` in the `AZLOG*` modes. Also
   `TestCatalogFaultProperties` and `TestCatalogRaceProperties`, whose Append Blob draws
   open the new log.
@@ -428,7 +435,7 @@ Each stage is one or more commits on branch `log-segments`, each fix with its te
 | `fileio.catalog.log.segment.records` | the store's block limit (provisional) | K, the limit each Install sets. At most the store's block limit, and small enough that K − 1 of the largest frame fit an object (SG8) |
 | `fileio.catalog.log.copies` | false | whether an append near its segment's end also sends a copy to the next (D11) |
 | `fileio.catalog.log.checkpoint.share`, `.min.bytes`, `.records` | 1.0, 1 MiB, 10,000 | when to compact |
-| `fileio.catalog.log.retire.ttl.ms` | 60,000 | how long a retired segment stays before the sweep deletes it |
+| `fileio.catalog.log.retire.ttl.ms` | 60,000 | how long a retired segment stays before it is deleted |
 
 The conditional ablation on segments is [Later](#later).
 
@@ -449,10 +456,10 @@ The conditional ablation on segments is [Later](#later).
 
 Built on branch `log-segments` (2026-11-15): stages 0 to 4, stage 3 within stage 2.
 catalog-bench's `sut-fileio` opens the segmented log too (its branch `log-segments`). Locally,
-the fuzzer passes 2,000 tries on four seeds; of `fuzz/mutants/segments.sh` eight mutants are
+the fuzzer passes 2,000 tries on four seeds; of `fuzz/mutants/segments.sh` nine mutants are
 caught and `fastvoid` is equivalent; the catalog's suites (the `AZLOG` modes among them) and the
-fault and race properties pass. Stage 5 (the real account and a havoc round) is next, on the
-user's go.
+fault and race properties pass. `AzureLogCatalogIT` passed on the real account with a SAS that
+cannot list (450 tests). A havoc round is next.
 
 ## Open questions
 
