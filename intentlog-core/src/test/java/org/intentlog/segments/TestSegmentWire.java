@@ -100,6 +100,15 @@ class TestSegmentWire {
   }
 
   @Test
+  void aCheckpointPositionRoundTrips() {
+    byte[] at = new SegmentPosition(5, 2, 77).encode();
+    LogEnvelope.Record r = LogEnvelope.decodeRecord(LogEnvelope.encodeCheckpointThrough(at));
+    assertThat(r.isSegmentRecord()).isTrue();
+    assertThat(r.checkpointThrough()).isEqualTo(at);
+    assertThat(r.installSegment()).isNull();
+  }
+
+  @Test
   void anInstallNeedsALimitAndAName() {
     assertThatThrownBy(() -> new InstallSegment(1, "s", "", 0))
         .isInstanceOf(IllegalArgumentException.class);

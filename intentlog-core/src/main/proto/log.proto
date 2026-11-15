@@ -168,6 +168,10 @@ message LogRecord {
     // id. A segment holding one is malformed.
     InstallSegment install_segment = 5;
     RetiredSegment retired_segment = 6;
+    // The position the catalog object's checkpoint covers (LogTail.position's
+    // encoding), the frame right after the checkpoint: a checkpoint is opaque
+    // to its log, and the runtime checks the one it wrote against this.
+    bytes checkpoint_through = 7;
   }
 }
 

@@ -67,6 +67,7 @@ public final class LogEnvelope {
   public static final int LOG_RECORD_PAGE_OUT = 4;
   public static final int LOG_RECORD_INSTALL_SEGMENT = 5;
   public static final int LOG_RECORD_RETIRED_SEGMENT = 6;
+  public static final int LOG_RECORD_CHECKPOINT_THROUGH = 7;
 
   public static final int INSTALL_SEGMENT_ORDINAL = 1;
   public static final int INSTALL_SEGMENT_NAME = 2;
@@ -140,7 +141,7 @@ public final class LogEnvelope {
    */
   public static final class Record {
     private enum Kind {
-      INTENTION, ADVANCE_HORIZON, PAGE_OUT, INSTALL_SEGMENT, RETIRED_SEGMENT
+      INTENTION, ADVANCE_HORIZON, PAGE_OUT, INSTALL_SEGMENT, RETIRED_SEGMENT, CHECKPOINT_THROUGH
     }
 
     private final Kind kind;
@@ -150,6 +151,7 @@ public final class LogEnvelope {
     private final PageOut pageOut;
     private final InstallSegment installSegment;
     private final RetiredSegment retiredSegment;
+    private byte[] checkpointThrough = null;
 
     private Record(Kind kind, UUID id, byte[] intention, long watermarkMs, PageOut pageOut,
         InstallSegment installSegment, RetiredSegment retiredSegment) {
@@ -182,6 +184,12 @@ public final class LogEnvelope {
       return new Record(Kind.RETIRED_SEGMENT, null, null, -1L, null, null, retired);
     }
 
+    public static Record checkpointThrough(byte[] position) {
+      Record r = new Record(Kind.CHECKPOINT_THROUGH, null, null, -1L, null, null, null);
+      r.checkpointThrough = position;
+      return r;
+    }
+
     /** Whether this is an intention, rather than a record of the committed set (GC, PageOut). */
     public boolean isIntention() {
       return kind == Kind.INTENTION;
@@ -197,9 +205,13 @@ public final class LogEnvelope {
       return kind == Kind.PAGE_OUT;
     }
 
-    /** Whether this is a segmented log's provider record: an Install or a Retired entry. */
+    /**
+     * Whether this is a segmented log's provider record: an Install, a Retired entry, or its
+     * checkpoint's position.
+     */
     public boolean isSegmentRecord() {
-      return kind == Kind.INSTALL_SEGMENT || kind == Kind.RETIRED_SEGMENT;
+      return kind == Kind.INSTALL_SEGMENT || kind == Kind.RETIRED_SEGMENT
+          || kind == Kind.CHECKPOINT_THROUGH;
     }
 
     /** The intention's id; null for any other record. */
@@ -230,6 +242,11 @@ public final class LogEnvelope {
     /** A Retired entry's body; null for another record. */
     public RetiredSegment retiredSegment() {
       return retiredSegment;
+    }
+
+    /** The position a segmented log's checkpoint covers; null for another record. */
+    public byte[] checkpointThrough() {
+      return checkpointThrough;
     }
   }
 
@@ -470,6 +487,17 @@ public final class LogEnvelope {
     }
   }
 
+  /** Encodes a {@code LogRecord} that carries a segmented log's checkpoint position. */
+  public static byte[] encodeCheckpointThrough(byte[] position) {
+    try {
+      ByteArrayOutputStream out = new ByteArrayOutputStream(position.length + 2);
+      writeBytes(out, LOG_RECORD_CHECKPOINT_THROUGH, position);
+      return out.toByteArray();
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
   /**
    * Decodes a {@code LogRecord}. Fails if it has no body, or more than one, or an intention
    * without an id, or a segment record with one.
@@ -483,6 +511,7 @@ public final class LogEnvelope {
       PageOut pageOut = null;
       InstallSegment install = null;
       RetiredSegment retired = null;
+      byte[] through = null;
       int bodies = 0;
       while (in.available() > 0) {
         int tag = readVarint(in);
@@ -510,6 +539,10 @@ public final class LogEnvelope {
             retired = decodeRetiredSegment(readLengthDelimitedBytes(in));
             bodies++;
             break;
+          case LOG_RECORD_CHECKPOINT_THROUGH:
+            through = readLengthDelimitedBytes(in);
+            bodies++;
+            break;
           default:
             skipField(in, tag & 0x7);
         }
@@ -522,9 +555,10 @@ public final class LogEnvelope {
       if (pageOut != null) {
         return Record.pageOut(pageOut);
       }
-      if (install != null || retired != null) {
+      if (install != null || retired != null || through != null) {
         check(id == null, "A segment record carries an id");
-        return install != null ? Record.installSegment(install) : Record.retiredSegment(retired);
+        return install != null ? Record.installSegment(install)
+            : retired != null ? Record.retiredSegment(retired) : Record.checkpointThrough(through);
       }
       check(id != null, "Record missing required id field");
       return Record.intention(id, intention);

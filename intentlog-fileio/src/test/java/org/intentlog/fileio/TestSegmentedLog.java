@@ -1,0 +1,204 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.intentlog.fileio;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.List;
+import java.util.UUID;
+import org.apache.iceberg.io.InMemoryAtomicFileIO;
+import org.intentlog.LogConflictException;
+import org.intentlog.LogTail;
+import org.intentlog.LogView;
+import org.intentlog.Receipt;
+import org.intentlog.TrimmedException;
+import org.intentlog.memory.InMemorySegmentStore;
+import org.intentlog.segments.SegmentFrames;
+import org.intentlog.segments.SegmentPosition;
+import org.intentlog.segments.SegmentStore;
+import org.intentlog.wire.LogEnvelope;
+import org.intentlog.wire.UuidV7;
+import org.junit.jupiter.api.Test;
+
+/** {@link SegmentedLog}'s regressions: the cases docs/LOG_SEGMENTS.md names, one each. */
+class TestSegmentedLog {
+
+  private static final String LOCATION = "mem:///warehouse/catalog";
+  private static final UUID LOG_ID = UuidV7.newUuidV7();
+
+  private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+  private final InMemorySegmentStore store = new InMemorySegmentStore(8, 1 << 16, 1 << 22);
+  private int records = 0;
+
+  private SegmentedLog log(long limit) {
+    return log(limit, SegmentedLog.Options.defaults());
+  }
+
+  private SegmentedLog log(long limit, SegmentedLog.Options options) {
+    return new SegmentedLog(AtomicFileLog.segmented(io, LOCATION, () -> 7L, false), store,
+        "segs", options.withLimit(limit).withRetireTtlMs(0).withClock(() -> 0L));
+  }
+
+  private static byte[] checkpoint(int n, LogTail through) {
+    return LogEnvelope.encodeCheckpoint(LOG_ID, new byte[0],
+        ("state-" + n).getBytes(StandardCharsets.UTF_8), through.position());
+  }
+
+  private byte[] record() {
+    return LogEnvelope.encodeRecord(UuidV7.newUuidV7(),
+        ("r" + records++).getBytes(StandardCharsets.UTF_8));
+  }
+
+  private SegmentedLog created(long limit) {
+    SegmentedLog log = log(limit);
+    LogTail absent = log.probe();
+    log.putCheckpoint(absent, checkpoint(0, absent));
+    return log;
+  }
+
+  private String segment(long ordinal) {
+    return store.names().stream()
+        .filter(n -> SegmentedLog.ordinalOf(n.substring("segs/".length())) == ordinal)
+        .findFirst().orElseThrow();
+  }
+
+  @Test
+  void aSegmentEndsAtItsLimitAndTheNextTakesOver() {
+    SegmentedLog log = created(2);
+    byte[] a = record();
+    byte[] b = record();
+    byte[] c = record();
+    for (byte[] r : List.of(a, b, c)) {
+      log.readThrough(log.append(r, null), Duration.ZERO);
+    }
+    LogView view = log(2).read();
+    assertThat(view.records()).containsExactly(a, b, c);
+    SegmentPosition end = SegmentPosition.decode(view.tail().position());
+    assertThat(end.ordinal()).isEqualTo(1);
+    assertThat(end.records()).isEqualTo(1);
+    assertThat(view.start()).isEqualTo(SegmentPosition.START.encode());
+  }
+
+  @Test
+  void anAppendPastTheLimitIsVoidByItsReply() {
+    SegmentedLog writer = created(1);
+    SegmentedLog stale = log(1);
+    stale.read(); // knows segment 0 alone, open
+    byte[] a = record();
+    writer.readThrough(writer.append(a, null), Duration.ZERO); // segment 0 ends at it
+    byte[] b = record();
+    stale.readThrough(stale.append(b, null), Duration.ZERO); // void in 0, then in 1
+    assertThat(store.appends()).hasSize(3);
+    assertThat(log(1).read().records()).containsExactly(a, b);
+  }
+
+  /** D1: a frame after a seal frame is void, so no reader that read before the seal loses one. */
+  @Test
+  void aFrameAfterASealIsVoidAndItsAppendALostRace() {
+    SegmentedLog log = created(3);
+    byte[] a = record();
+    log.readThrough(log.append(a, null), Duration.ZERO);
+    LogView before = log(3).read();
+    store.append(segment(0), SegmentFrames.seal(0)); // another writer ends segment 0
+    byte[] b = record();
+    Receipt landed = log.append(b, null); // index 3, within the limit, but after the seal
+    assertThatThrownBy(() -> log.readThrough(landed, Duration.ZERO))
+        .isInstanceOf(LogConflictException.class);
+    assertThat(before.records()).containsExactly(a);
+    assertThat(log(3).read().records()).containsExactly(a);
+  }
+
+  /** A record in a later segment needs the earlier ones ended: the read through it seals them. */
+  @Test
+  void aReadThroughARecordInALaterSegmentSealsTheEarlierOne() {
+    SegmentedLog log = created(3);
+    byte[] a = record();
+    log.readThrough(log.append(a, null), Duration.ZERO);
+    SegmentedLog ahead = log(3, SegmentedLog.Options.defaults().withAheadMargin(3));
+    byte[] b = record();
+    ahead.readThrough(ahead.append(b, null), Duration.ZERO); // segment 0; installs 1 ahead
+    String one = segment(1);
+    byte[] c = record();
+    byte[] frame = SegmentFrames.record(c, 1);
+    SegmentStore.Appended at = store.append(one, frame);
+    Receipt later = new SegmentedLog.SegReceipt(LOG_ID, List.of(new SegmentedLog.Copy(1,
+        one.substring("segs/".length()), at.offset(), at.blocks(), frame.length,
+        SegmentFrames.crcOf(frame))), c);
+    assertThat(log(3).read().records()).containsExactly(a, b); // segment 1 waits
+    assertThat(log.readThrough(later, Duration.ZERO).records()).containsExactly(a, b, c);
+    assertThat(SegmentFrames.parse(store.peek(segment(0)), store.peek(segment(0)).length, 0, 0))
+        .extracting(SegmentFrames.Frame::seal).containsExactly(false, false, true);
+    assertThat(log(3).read().records()).containsExactly(a, b, c);
+  }
+
+  /** A copy in the next segment: the first copy the log holds is the record, once. */
+  @Test
+  void copiesNearTheEndAreReadThroughAtTheFirst() {
+    SegmentedLog log = log(2, SegmentedLog.Options.defaults().withCopies(true));
+    LogTail absent = log.probe();
+    log.putCheckpoint(absent, checkpoint(0, absent));
+    byte[] a = record();
+    LogView through = log.readThrough(log.append(a, null), Duration.ZERO);
+    assertThat(through.records()).containsExactly(a);
+    byte[] b = record();
+    log.readThrough(log.append(b, null), Duration.ZERO); // index 2: a copy goes to segment 1
+    assertThat(log(2).read().records()).containsExactly(a, b, b); // replay skips the copy by id
+  }
+
+  @Test
+  void aCheckpointRetiresTheSegmentsBeforeItsOwnAndTheSweepDeletesThem() {
+    SegmentedLog log = created(1);
+    byte[] a = record();
+    Receipt first = log.append(a, null);
+    log.readThrough(first, Duration.ZERO);
+    byte[] b = record();
+    log.readThrough(log.append(b, null), Duration.ZERO);
+    byte[] c = record();
+    log.readThrough(log.append(c, null), Duration.ZERO);
+    LogTail through = log.read().tail(); // in segment 2
+    log.putCheckpoint(through, checkpoint(1, through));
+    assertThat(store.names()).hasSize(4); // 0-2, and 3 installed ahead
+    log.trim(through);
+    assertThat(store.names()).hasSize(2);
+    assertThat(log(1).read().records()).isEmpty();
+    assertThatThrownBy(() -> log(1).readThrough(first, Duration.ZERO))
+        .isInstanceOf(TrimmedException.class);
+    assertThatThrownBy(() -> log.putCheckpoint(through, checkpoint(2, through)))
+        .isInstanceOf(IllegalStateException.class).hasMessageContaining("I11");
+  }
+
+  @Test
+  void aSweepKeepsANamedSegmentAndABlobOfAnOrdinalStillToCome() {
+    SegmentedLog log = created(4);
+    store.create("segs/seg-00000000000000000000-ffffffffffffffff"); // a creation's leftover
+    store.create("segs/seg-00000000000000000001-ffffffffffffffff"); // an Install in flight
+    log.sweep();
+    assertThat(store.names()).containsExactlyInAnyOrder(segment(0),
+        "segs/seg-00000000000000000001-ffffffffffffffff");
+  }
+
+  @Test
+  void aLimitPastTheStoresBlocksIsRefused() {
+    assertThatThrownBy(() -> log(9)).isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("past the store");
+  }
+}
