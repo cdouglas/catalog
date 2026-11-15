@@ -475,7 +475,8 @@
           {"number": 3, "name": "advance_horizon", "type": "AdvanceHorizon", "repeated": false, "packed": false, "oneof": "body", "comment": "A GC of the committed set. Only these move the horizon, so every checkpoint is a replay of the log before it, whatever clock wrote it."},
           {"number": 4, "name": "page_out", "type": "PageOut", "repeated": false, "packed": false, "oneof": "body", "comment": "Seals the oldest inline block into its page and raises the floor."},
           {"number": 5, "name": "install_segment", "type": "InstallSegment", "repeated": false, "packed": false, "oneof": "body", "comment": "A segmented log's provider records (docs/LOG_SEGMENTS.md), in its catalog object only: the log reads them there and leaves them out of every view, so the runtime's replay never sees one. Neither carries an id. A segment holding one is malformed."},
-          {"number": 6, "name": "retired_segment", "type": "RetiredSegment", "repeated": false, "packed": false, "oneof": "body", "comment": ""}
+          {"number": 6, "name": "retired_segment", "type": "RetiredSegment", "repeated": false, "packed": false, "oneof": "body", "comment": ""},
+          {"number": 7, "name": "checkpoint_through", "type": "bytes", "repeated": false, "packed": false, "oneof": "body", "comment": "The position the catalog object's checkpoint covers (LogTail.position's encoding), the frame right after the checkpoint: a checkpoint is opaque to its log, and the runtime checks the one it wrote against this."}
         ]
       },
       "InstallSegment": {

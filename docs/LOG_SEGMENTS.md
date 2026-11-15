@@ -51,9 +51,9 @@ writes format 3, as today.
 
 ## Records
 
-Two new bodies in `LogRecord`'s oneof (log.proto). Both are provider records:
-`SegmentedLog` reads them from the catalog object and leaves them out of every view, so
-the runtime's replay never sees one.
+Three new bodies in `LogRecord`'s oneof (log.proto). All are provider records:
+`SegmentedLog` reads them from the catalog object and leaves them out of every view, and
+replay refuses one in a view.
 
 ```proto
 // Installs segment `ordinal` after the last installed one. Replay of the catalog object takes
@@ -76,8 +76,14 @@ message RetiredSegment {
 }
 ```
 
-`LogRecord.body` gains `InstallSegment install_segment = 5` and
-`RetiredSegment retired_segment = 6`. Neither carries an id.
+`LogRecord.body` gains `InstallSegment install_segment = 5`,
+`RetiredSegment retired_segment = 6`, and `bytes checkpoint_through = 7`: the position
+the catalog object's checkpoint covers, the frame right after the checkpoint. None
+carries an id. A checkpoint is opaque to its log (the SharedLog contract writes them
+without a `through`), so the catalog object says where its checkpoint is, as v1's head
+did; the runtime checks the `through` it wrote against it. A catalog object is the
+header, the checkpoint frame, `checkpoint_through`, the Installs from the checkpoint's
+segment on, then Retired entries.
 
 **Segment frames** are v1's frames with the pad replaced by a seal frame:
 
@@ -107,8 +113,9 @@ position = ordinal records offset ; ordinal u64be, records u64be, then the store
 counts. `offset` is the store's
 encoding: a big-endian u64 byte offset on Azure. Only the provider reads a position.
 The runtime compares positions for equality, and the provider orders them by
-`(ordinal, records)`. `LogCheckpoint.through` carries the checkpoint's position (the
-review's "cursor"), so `LogCheckpoint` needs no new field. A position is never
+`(ordinal, records)`. The catalog object's `checkpoint_through` carries the checkpoint's
+position (the review's "cursor"), and the runtime's checkpoints name it in
+`LogCheckpoint.through` too, so `LogCheckpoint` needs no new field. A position is never
 normalized to the start of the next segment. Two tails at one place therefore have
 equal bytes, as TAIL_READS.md "Positions" requires.
 
@@ -300,8 +307,8 @@ it: "this catalog keeps segments". It never appends to it. That closes OI-1.
 | D1 | A segment's end is fixed in its own order: its Kth record or its first seal frame. There is no `SealSegment` record in the catalog object. The review's "seal frame as an optional hint" becomes the authority. | A catalog record of an end written after a read can void a record that a reader has already applied, and a writer may already have reported it as committed: [the example](#why-a-segments-end-is-in-the-segment). The store's order is the only one every reader of a segment sees alike. |
 | D2 | Every Install sets its own segment's record limit K, never the next one's. There is no byte bound: appends carry no condition, and K is bounded so that a seal frame always fits (SG8). | For the next Install's limit, the same example, with K = 3 set by `InstallSegment(m+1)`. A byte bound can't end a segment, since a smaller record fits after a refused one (v1 needed a pad), and some stores can't enforce one. A record count works on every store. |
 | D3 | A segment ends early at one seal frame, which takes the rest of its limit, not at no-op records. | One blind append instead of up to K. No record type is added. |
-| D4 | The log presents blind appends and separate checkpoints to the runtime, as `AppendBlobLog` does. `putCheckpoint` is the CAS replace; `trim` is the sweep. A void append is a `LogConflictException` from `readThrough`, which `LogRuntime.write` lets through as a lost race. | The runtime's separate-checkpoint path is built and fuzzed. Today `write` wraps every read-through failure as ambiguous; that path is still correct, but it costs a read and reports the wrong kind. |
-| D5 | Positions are `(ordinal, records, store offset)`, the end of the last record read, carried in `LogCheckpoint.through`. | The record count is what the limit counts, from a reader that starts mid-segment. Never normalizing positions keeps one encoding for one place. |
+| D4 | The log presents blind appends and separate checkpoints to the runtime, as `AppendBlobLog` does. `putCheckpoint` is the CAS replace; `trim` is the sweep. A void append is a `LogVoidException` (a `LogConflictException`) from `readThrough`, which `LogRuntime.write` lets through as a lost race that leaves nothing to resolve, unless a throttled send of the same write may have landed; a compaction sends a void GC record or PageOut again. | The runtime's separate-checkpoint path is built and fuzzed. Wrapping the read-through's failure as ambiguous is correct, but costs a read and reports the wrong kind; and a void append recorded as a possibly landed race left a commit whose sends all landed void unknown (the fuzzer found both). |
+| D5 | Positions are `(ordinal, records, store offset)`, the end of the last record read, carried in the catalog object's `checkpoint_through`. | The record count is what the limit counts, from a reader that starts mid-segment. Never normalizing positions keeps one encoding for one place. |
 | D6 | The checkpoint's segment table is records after the checkpoint frame, in the same replace: Installs from the position's segment on, then Retired entries. | The runtime's `LogCheckpoint` is unchanged, and replay of the catalog object has one rule for Installs. |
 | D7 | The code is a new `SharedLog`, `SegmentedLog` (intentlog-fileio), over an `AtomicFileLog` for the catalog object and a `SegmentStore` SPI (intentlog-core). intentlog-azure becomes a segment store. | The catalog object is format 3's object, so its code is reused, not copied. |
 | D8 | Segment names carry a nonce, and only an installer creates a segment, before its Install. | v1's AZ4. A stale writer can't bring back a swept segment, and a reader of an older catalog object can't read a newer blob under an old name. |
@@ -407,9 +414,8 @@ Each stage is one or more commits on branch `log-segments`, each fix with its te
 |---|---|---|
 | 0. Model | `SegmentedLog.tla` and its configurations | `check.py`: every configuration at its expected verdict; `catalogseal` and `limitatnext` fail SG3 |
 | 1. Wire and SPI | log.proto, `LogEnvelope` codecs, `SegmentStore`, segment frames with the seal frame, `InMemorySegmentStore`, the format explorer's decoder and fixtures | codec round trips, `TestFormatExplorer`; `mvn install` green with nothing else changed |
-| 2. `SegmentedLog` | reads, appends with limits, rotation past the end, the Install race, seal frames, `readThrough` with void appends, creation, `putCheckpoint`, the sweep; the runtime's lost-race change (its own commit and test) | contract, regressions, `TestSegmentedCommitProtocol` at 2,000 tries, every mutant caught |
-| 3. Open segments and copies | Installs ahead, sends to later segments, copies and their receipts; the fuzzer draws them | as stage 2 |
-| 4. Azure and the catalog | `AppendBlobSegments`, `TestAzureCommitProtocol`, `AzureLogs`, format 4 refusal, the `AZLOG*` modes, catalog fuzzers' draws; v1's head, checkpoint blobs and pad removed; docs describe the new log | `mvn install` (every suite), fault and race properties locally, mutants; then merge to main |
+| 2. `SegmentedLog` | reads, appends with limits, rotation past the end, the Install race, seal frames, `readThrough` with void appends, creation, `putCheckpoint`, the sweep; the runtime's lost-race change (its own commit and test); and stage 3's Installs ahead and copies, which it needed | contract, regressions, `TestSegmentedCommitProtocol` at 2,000 tries, every mutant caught |
+| 4. Azure and the catalog | `AppendBlobSegments` (the fuzzer draws Append Blobs, with and without block counts in replies), `AzureLogs`, format 4 refusal, the `AZLOG*` modes, catalog fuzzers' draws; v1's head, checkpoint blobs and pad removed; docs describe the new log | `mvn install` (every suite), fault and race properties locally, mutants; then merge to main |
 | 5. Cloud and havoc | `AzureLogCatalogIT` on the real account; a havoc round (`azure` at 1,000,000 tries; fault and race) | the user's go for each; failures fixed forward |
 
 ## Configuration
@@ -438,6 +444,14 @@ Each stage is one or more commits on branch `log-segments`, each fix with its te
 - Sealing a segment early by its bytes or age, if retention needs it.
 - Copies by default near a segment's end, if measurement favors them.
 
+## Progress
+
+Stages 0 to 2 are done on branch `log-segments`, stage 3 within stage 2. Of stage 4,
+`AppendBlobSegments` and the fuzzer on Append Blobs are done; the catalog's part and
+v1's removal wait on open question 3. Locally the fuzzer passes 2,000 tries on four
+seeds, and of `fuzz/mutants/segments.sh` eight mutants are caught and `fastvoid` is
+equivalent.
+
 ## Open questions
 
 1. K's default. The store's block limit makes the fewest rotations. A smaller K bounds
@@ -446,3 +460,9 @@ Each stage is one or more commits on branch `log-segments`, each fix with its te
 2. `AzureLogHistory` checks each checkpoint against a replay of the log's history.
    Does its replacement keep every segment's frames in memory in the `AZLOG*` modes,
    as now, or sample them?
+3. catalog-bench's `sut-fileio` builds v1 itself: `AzureLogs.open(store, root,
+   properties)` with no catalog object on a FileIO, v1's properties (segment bytes,
+   checkpoint keep), a timed `AppendBlobStore`, and packs of the blobs alone; campaigns
+   `e1-fileio-azure`, `e4-fileio`, `abl-ckpt` and `smoke-e2` run it. Removing v1 breaks
+   it. Migrate it to the segmented log (its Azure runs then measure v2), or keep v1 in
+   intentlog-azure for it while the catalog's `azure-append` opens v2?

@@ -10,7 +10,7 @@
 # copy the log holds rather than the first. fastvoid is equivalent (2026-11-15, 2,000 tries
 # locally): an append whose reply puts it past the limit is void with no read and never in a
 # receipt, and a receipt whose store can't say the index has none for the fast path to match.
-# Locally at 2,000 tries the other eight are caught, voidack by TestSegmentedLog alone.
+# Locally at 2,000 tries the other eight are caught, each by the fuzzer.
 MUTANTS="readahead voidack createonmissing sweepearly sweepinflight sdkretry overlimit fastvoid lastcopy"
 EQUIVALENT="fastvoid"
 ORACLES=TestSegmentedCommitProtocol,TestSegmentedLog
