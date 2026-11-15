@@ -1,10 +1,10 @@
 # Catalog log segments (design)
 
-Status: proposed 2026-11-14, from the review of the Azure log's format
-(2026-11-13 to 11-14), for review. When built, it replaces the Azure log's head and
-checkpoint blobs ([AZURE_LOG.md](AZURE_LOG.md), [AZURE_LOG_FORMAT.md](AZURE_LOG_FORMAT.md)).
-It makes one correction to the reviewed design. A segment's end is fixed in the
-segment's own append order, not by a record in the catalog object. The reason is under
+Status: designed 2026-11-14 from the review of the log v1's format (2026-11-13 to 11-14),
+and built 2026-11-15 ([Progress](#progress)): the catalog's log on Azure
+([AZURE_LOG.md](AZURE_LOG.md); the format, for review, [AZURE_LOG_FORMAT.md](AZURE_LOG_FORMAT.md)).
+It made one correction to the reviewed design. A segment's end is fixed in the segment's own
+append order, not by a record in the catalog object. The reason is under
 [Decisions beyond the review](#decisions-beyond-the-review), D1.
 
 ## Summary
@@ -25,12 +25,12 @@ Append Blobs first), which writers append to blind.
 - **Compaction.** One CAS replace of the catalog object writes a checkpoint whose
   position says where in the segments replay resumes.
 
-The head blob, the separate checkpoint blobs and the pad go away. So do OI-1 (nothing
-records which log), OI-3 (head unvalidated), OI-6 (unbounded append loop) and the head's
-and checkpoints' missing checksums. For a named segment the sweep's grace counts from
-its retirement, which answers half of OI-5 (grace from last-modified).
+There is no head blob, no checkpoint blob and no pad. The catalog object says which log
+a catalog keeps (format 4, which a client without a segment store refuses); every frame,
+the catalog object's and the segments', is checked; an append tries a bounded number of
+segments; and a named segment's TTL counts from its retirement.
 
-To the runtime this log looks like `AppendBlobLog` today: blind appends and separate
+To the runtime this log looks like the log v1 did: blind appends and separate
 checkpoints (`Capabilities(true, false, false, true, max)`). So the commit loop,
 compaction, GC and paging run unchanged. The one runtime change is that a void append
 counts as a lost race (D4).
@@ -168,7 +168,7 @@ its index: the reply's block count (Azure's `x-ms-blob-committed-block-count`).
 - **NotFound** (the segment was swept) re-reads the catalog object and sends to its
   first open segment.
 - The loop is bounded by attempts. Past the bound it fails with `LogNotSentException`,
-  since nothing landed. That fixes v1's OI-6.
+  since nothing landed.
 
 **Installing.** To install segment `m+1` (with `m` the last installed), a writer
 creates it under a fresh name, then appends `InstallSegment(m+1, K)` to the catalog
@@ -298,7 +298,7 @@ loses finds the log exists (`LogConflictException`); its segment is the sweep's.
 
 **Finding the log.** A client finds the catalog at `<warehouse>/catalog`, as with
 format 3. A client opened without a segment store that finds a format 4 object refuses
-it: "this catalog keeps segments". It never appends to it. That closes OI-1.
+it: "this catalog keeps segments". It never appends to it.
 
 ## Decisions beyond the review
 
@@ -323,7 +323,7 @@ it: "this catalog keeps segments". It never appends to it. That closes OI-1.
 | intentlog-core | `SegmentStore` SPI: create a segment under a name if absent; append a frame blind (returns the offset and the block count); read from an offset (bytes, length, blocks); delete; list; the limits (blocks, the largest object, the largest frame). Segment frames move here from intentlog-azure's `Frames`, with the seal frame in place of the pad. log.proto and `LogEnvelope` gain `InstallSegment` and `RetiredSegment`. `LogRuntime.write` lets a read-through's `LogConflictException` through as a lost race. |
 | intentlog-fileio | `SegmentedLog`: the catalog object as an `AtomicFileLog` writing format 4, the merged view, positions and tails, appends and rotation, `readThrough`, creation, `putCheckpoint`, `trim`. `AtomicFileLog` reads format 4 when it has a segment store, and refuses it otherwise. |
 | intentlog-memory | `InMemorySegmentStore`: limits in blocks and bytes, and the fault hooks of `InMemorySharedLog`. |
-| intentlog-azure | `AppendBlobSegments`: a `SegmentStore` on `AppendBlobStore` (Append Block with no condition, nonce names). `AppendBlobLog`, `AzureLogHead` and the checkpoint blobs are removed. So are `AppendBlobStore`'s block-blob requests, if nothing else uses them. `AzureLogHistory` becomes a check of each checkpoint against a replay of the segments' history. |
+| intentlog-azure | `AppendBlobSegments`: a `SegmentStore` on `AppendBlobStore` (Append Block with no condition; `appendBlockCounted`, the reply's block count). The log v1 (`AppendBlobLog`, `AzureLogHead`, its checkpoint blobs and pad) is removed; `AppendBlobStore` keeps its block-blob requests, which catalog-bench's timed store implements. intentlog-fileio's `SegmentedLogHistory` checks each checkpoint against a replay of the log's history. |
 | iceberg-fileio-catalog | `AzureLogs` opens a `SegmentedLog`: the catalog object on the catalog's FileIO, segments at `fileio.catalog.log.location`. `LocalCatalogMode`'s `AZLOG*` modes run it over `InMemoryAtomicFileIO` and the in-memory Azure store. |
 | spec/tla | `SegmentedLog.tla` and its configurations in `check.py`, in place of `AzureLog.tla`. |
 | fuzz | `fuzz/mutants/segments.sh`. ce-fuzz's `azure` job runs the new fuzzer. |
@@ -396,8 +396,9 @@ As LOG.md "Testing a provider", per stage:
   - sweeps at TTL 0.
 
   At the drain, every replica a read returned must read on to the end (as
-  `staleReaders` does today). `TestAzureCommitProtocol` runs the same fuzzer over
-  `AppendBlobSegments` on `InMemoryAppendBlobStore`.
+  `staleReaders` did for the log v1). It draws the segments' store: in memory, or
+  `AppendBlobSegments` on `InMemoryAppendBlobStore`, whose replies say the block count or
+  don't.
 - **Mutants** (`fuzz/mutants/segments.sh`): each switch above, put in the code, fails
   the fuzzer.
 - **Catalog suites**: `TestLocalCatalog*` in the `AZLOG*` modes. Also
@@ -425,11 +426,11 @@ Each stage is one or more commits on branch `log-segments`, each fix with its te
 | `fileio.catalog.log` | `atomic-file` | `azure-append`: a segmented log on Azure Append Blobs |
 | `fileio.catalog.log.location` | none: required | the segments' prefix, a Blob URL |
 | `fileio.catalog.log.segment.records` | the store's block limit (provisional) | K, the limit each Install sets. At most the store's block limit, and small enough that K − 1 of the largest frame fit an object (SG8) |
-| `fileio.catalog.log.checkpoint.share`, `.min.bytes`, `.records` | as today | when to compact |
-| `fileio.catalog.log.retire.ttl.ms` | 60,000 | how long a retired segment stays before the sweep deletes it. It replaces `trim.grace.ms` |
+| `fileio.catalog.log.copies` | false | whether an append near its segment's end also sends a copy to the next (D11) |
+| `fileio.catalog.log.checkpoint.share`, `.min.bytes`, `.records` | 1.0, 1 MiB, 10,000 | when to compact |
+| `fileio.catalog.log.retire.ttl.ms` | 60,000 | how long a retired segment stays before the sweep deletes it |
 
-`fileio.catalog.log.checkpoint.keep` goes: checkpoints live in the catalog object.
-`fileio.catalog.log.append` `conditional` (the ablation) is [Later](#later).
+The conditional ablation on segments is [Later](#later).
 
 ## Later
 
@@ -446,23 +447,18 @@ Each stage is one or more commits on branch `log-segments`, each fix with its te
 
 ## Progress
 
-Stages 0 to 2 are done on branch `log-segments`, stage 3 within stage 2. Of stage 4,
-`AppendBlobSegments` and the fuzzer on Append Blobs are done; the catalog's part and
-v1's removal wait on open question 3. Locally the fuzzer passes 2,000 tries on four
-seeds, and of `fuzz/mutants/segments.sh` eight mutants are caught and `fastvoid` is
-equivalent.
+Built on branch `log-segments` (2026-11-15): stages 0 to 4, stage 3 within stage 2.
+catalog-bench's `sut-fileio` opens the segmented log too (its branch `log-segments`). Locally,
+the fuzzer passes 2,000 tries on four seeds; of `fuzz/mutants/segments.sh` eight mutants are
+caught and `fastvoid` is equivalent; the catalog's suites (the `AZLOG` modes among them) and the
+fault and race properties pass. Stage 5 (the real account and a havoc round) is next, on the
+user's go.
 
 ## Open questions
 
 1. K's default. The store's block limit makes the fewest rotations. A smaller K bounds
    how much a segment holds until a checkpoint passes its end. Should K come from
    recent commit rates or a service instead?
-2. `AzureLogHistory` checks each checkpoint against a replay of the log's history.
-   Does its replacement keep every segment's frames in memory in the `AZLOG*` modes,
-   as now, or sample them?
-3. catalog-bench's `sut-fileio` builds v1 itself: `AzureLogs.open(store, root,
-   properties)` with no catalog object on a FileIO, v1's properties (segment bytes,
-   checkpoint keep), a timed `AppendBlobStore`, and packs of the blobs alone; campaigns
-   `e1-fileio-azure`, `e4-fileio`, `abl-ckpt` and `smoke-e2` run it. Removing v1 breaks
-   it. Migrate it to the segmented log (its Azure runs then measure v2), or keep v1 in
-   intentlog-azure for it while the catalog's `azure-append` opens v2?
+2. `SegmentedLogHistory` checks each checkpoint against a replay of the log's history,
+   every segment's frames in memory, as the `AZLOG*` modes did before. Sample them
+   instead, for long runs?

@@ -1,7 +1,7 @@
 # Fuzz rounds in a container
 
 A phase-exit fuzz round runs eleven long jqwik jobs (the fault, race, multi-writer and
-commit-protocol fuzzers, the last on the Azure log too, the rebase oracle, the conflict-encoding contracts, the inline
+commit-protocol fuzzers, the last also on the segmented log as job `azure`, the rebase oracle, the conflict-encoding contracts, the inline
 differential and delta properties), and a calibration
 runs the oracles once per mutant. On a laptop they saturate the CPU for hours and need capped
 heaps to stay clear of the OOM killer. This image runs them on a bigger host, all at once,

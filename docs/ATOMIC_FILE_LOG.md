@@ -261,11 +261,17 @@ bootstrap at once: one creates the object, and the others find it created.
 
 ## Schema evolution
 
-The header's `formatVersion` must equal `AtomicFileLog.FORMAT_VERSION` (3).
+The header's `formatVersion` must equal `AtomicFileLog.FORMAT_VERSION` (3), or,
+for a segmented log's catalog object, `SEGMENTED_FORMAT_VERSION` (4): the same
+frames, holding the checkpoint, the position it covers and the segments'
+Installs and Retired entries ([LOG_SEGMENTS.md](LOG_SEGMENTS.md),
+[AZURE_LOG_FORMAT.md](AZURE_LOG_FORMAT.md) §3.1). A log opened for one refuses
+the other, so a client without a segment store never appends to a segmented
+log's catalog object.
 Version 1 was the layout before the envelope, with the catalog's checkpoint
 and transactions framed directly; version 2 framed the envelope with no
 trailers. A log refuses any other version; `AtomicFileLog.decode`, for tools,
-also reads version 2 unchecked (captured logs). Changes
+reads 3 and 4, and version 2 unchecked (captured logs). Changes
 inside the envelope are gated by `LogCheckpoint.min_reader_version`
 ([LOG.md](LOG.md) §"The envelope"), and changes to the catalog's messages by
 `Checkpoint.min_reader_version` ([SPEC.md](SPEC.md) §"Schema Evolution").

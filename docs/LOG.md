@@ -25,8 +25,9 @@ replay, the committed set and its GC, the commit loop, and compaction.
 | Module | Holds |
 |---|---|
 | `intentlog-core` | The SPIs (`StateMachine`, `Intention`, `SharedLog`), replay (`Replay`), the committed set (`CommittedSet`), the commit loop (`LogRuntime`), and the envelope (`src/main/proto/log.proto`, encoded by `org.intentlog.wire`). JDK only: the enforcer bans Iceberg, Hadoop and Guava |
-| `intentlog-fileio` | `AtomicFileLog`, over the Iceberg fork's `SupportsAtomicOperations` |
-| `intentlog-memory` | `InMemorySharedLog`, with fault, lag and delay hooks |
+| `intentlog-fileio` | `AtomicFileLog`, over the Iceberg fork's `SupportsAtomicOperations`; `SegmentedLog`, a catalog object (`AtomicFileLog` in format 4) and segments in a `SegmentStore` ([LOG_SEGMENTS.md](LOG_SEGMENTS.md)) |
+| `intentlog-memory` | `InMemorySharedLog`, with fault, lag and delay hooks; `InMemorySegmentStore` |
+| `intentlog-azure` | `AppendBlobSegments`: a segmented log's segments on Azure Append Blobs ([AZURE_LOG.md](AZURE_LOG.md)) |
 | `intentlog-testkit` | `SharedLogContract`, `EntityVersionsMachine`, `LogHarness` and the `CommitProtocol` fuzzer, for providers' tests |
 
 ## State machines
@@ -818,8 +819,8 @@ shared-log model"):
    GC dropped from one that never applied. Such a view leaves the write
    ambiguous, and a fresh read settles it.
 
-**Conditional appends on a log that cannot replace itself** (the Azure log's
-`conditional` ablation, `InMemorySharedLog`'s conditional mode). A lost
+**Conditional appends on a log that cannot replace itself**
+(`InMemorySharedLog`'s conditional mode). A lost
 append is resent at the probed tail, and the read through the resend settles
 an earlier copy (P3). A commit that runs out of attempts with every send lost
 has only a plain read to settle the last loss, and such a read may lag (P1).
@@ -830,8 +831,8 @@ unknown (Bug 90 (lagging read hid the record)). Without the check, a commit
 whose sends had landed with replies saying they lost was rejected
 (`EXHAUSTED`). The rule needs a provider's conflict to mean that the log moved
 past the tail the append named, so that a read that does not lag settles the
-loss: the Azure log conditions an append on its position, not its segment
-(Bug 89 (moved on, same position)). A read of one object is of the object as
+loss: the log v1 on Azure conditioned an append on its position, not its
+segment, for that reason (Bug 89 (moved on, same position)). A read of one object is of the object as
 it is, so there any read settles a loss. `SharedLogCommit.tla` models
 unconditional appends only.
 
@@ -971,6 +972,7 @@ it does not.
 | `AtomicFileLog`, store with append (S3 Express, ADLS) | at an offset | yes | `[chk][gc][page-outs][rec]` by CAS | in the object | the object the write left: known from the write, or read | the version written |
 | `AtomicFileLog`, CAS only (GCS, S3 standard) | no | – | the same | in the object | what the replace wrote | the version written |
 | `InMemorySharedLog` | yes | optional | no | a store apart, and a trim point | from a checkpoint before the record | a position |
+| `SegmentedLog` (Azure Append Blobs, in memory) | blind | no | no | in the catalog object, by CAS; the sweep deletes retired segments | from the checkpoint, sealing earlier segments; void past a segment's end (`LogVoidException`) | each copy's segment, offset and index |
 | Kafka (one partition) and an object store | idempotent produce | no | no | `chk/<offset>` objects; `deleteRecords` | wait for the high watermark | an offset |
 | SQS FIFO and an archiver | `SendMessage`, deduplication id = record id | no | no | the archiver's: it appends GC records, checkpoints and trims | poll the archive | a sequence number |
 | A ledger (BookKeeper, Pulsar, a confidential ledger) | append | no | no | external, or in the ledger | wait for commit | an entry id |
