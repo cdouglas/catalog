@@ -115,6 +115,12 @@ public final class AtomicFileLog implements SharedLog {
 
   public static final byte[] MAGIC = "LCAT".getBytes(StandardCharsets.US_ASCII);
   public static final int FORMAT_VERSION = 3;
+  /**
+   * Format 4: format 3's object as a segmented log's catalog object, holding segment records after
+   * its checkpoint (docs/LOG_SEGMENTS.md). A log opened as one ({@link #segmented}) reads and writes
+   * only it; any other refuses it, and never appends to it.
+   */
+  public static final int SEGMENTED_FORMAT_VERSION = 4;
   /** Format 2: frames without trailers, which {@link #decode(byte[])} still reads, for tools. */
   public static final int UNCHECKED_FORMAT_VERSION = 2;
   public static final int HEADER_SIZE = 8; // magic (4) + version (4)
@@ -138,6 +144,8 @@ public final class AtomicFileLog implements SharedLog {
   // Whether a read of a page is one GET: a page is written once, so any read of it reads its one
   // version, on any store
   private final boolean readPagesFirst;
+  // The format this log reads and writes: 3, or 4 as a segmented log's catalog object
+  private final int format;
 
   public AtomicFileLog(SupportsAtomicOperations io, String location) {
     this(io, location, false);
@@ -160,6 +168,23 @@ public final class AtomicFileLog implements SharedLog {
   public AtomicFileLog(
       SupportsAtomicOperations io, String location, LongSupplier incarnations,
       boolean lookupFirst) {
+    this(io, location, incarnations, lookupFirst, FORMAT_VERSION);
+  }
+
+  /**
+   * A segmented log's catalog object at {@code location}: format 4's object, which this log reads
+   * and writes, refusing format 3's.
+   */
+  public static AtomicFileLog segmented(
+      SupportsAtomicOperations io, String location, LongSupplier incarnations,
+      boolean lookupFirst) {
+    return new AtomicFileLog(io, location, incarnations, lookupFirst, SEGMENTED_FORMAT_VERSION);
+  }
+
+  private AtomicFileLog(
+      SupportsAtomicOperations io, String location, LongSupplier incarnations,
+      boolean lookupFirst, int format) {
+    this.format = format;
     this.io = io;
     this.location = location;
     this.incarnations = incarnations;
@@ -461,7 +486,7 @@ public final class AtomicFileLog implements SharedLog {
   @Override
   public Receipt replace(LogTail expected, byte[] checkpoint, List<byte[]> records) {
     long incarnation = incarnations.getAsLong();
-    byte[] bytes = encode(incarnation, checkpoint, records);
+    byte[] bytes = encode(format, incarnation, checkpoint, records);
     InputFile written = write(fileOf(expected), bytes, AtomicOutputFile.Strategy.CAS);
     return new FileReceipt(written, view(written, bytes.length, checkpoint, List.copyOf(records),
         incarnation, Arrays.copyOfRange(bytes, bytes.length - TRAILER_SIZE, bytes.length)));
@@ -490,12 +515,18 @@ public final class AtomicFileLog implements SharedLog {
 
   /** The object a replace writes, as an object of {@code incarnation}. */
   public static byte[] encode(long incarnation, byte[] checkpoint, List<byte[]> records) {
+    return encode(FORMAT_VERSION, incarnation, checkpoint, records);
+  }
+
+  /** The object a replace writes in {@code format} (3, or 4: a segmented log's). */
+  public static byte[] encode(
+      int format, long incarnation, byte[] checkpoint, List<byte[]> records) {
     ByteArrayOutputStream out = new ByteArrayOutputStream();
     out.writeBytes(MAGIC);
-    out.write((FORMAT_VERSION >>> 24) & 0xFF);
-    out.write((FORMAT_VERSION >>> 16) & 0xFF);
-    out.write((FORMAT_VERSION >>> 8) & 0xFF);
-    out.write(FORMAT_VERSION & 0xFF);
+    out.write((format >>> 24) & 0xFF);
+    out.write((format >>> 16) & 0xFF);
+    out.write((format >>> 8) & 0xFF);
+    out.write(format & 0xFF);
     out.writeBytes(frame(checkpoint, incarnation, out.size()));
     for (byte[] record : records) {
       out.writeBytes(frame(record, incarnation, out.size()));
@@ -520,12 +551,12 @@ public final class AtomicFileLog implements SharedLog {
 
   /**
    * The checkpoint and records of an object's bytes, which an append may have extended past what
-   * {@link #encode} wrote, its frames checked; format 2's, unchecked, for tools that read captured
-   * logs. The view's tail is the bytes' length, bound to no object. Bytes that fail a check throw
-   * {@link FrameCheckException}.
+   * {@link #encode} wrote, its frames checked, in format 3 or 4; format 2's, unchecked, for tools
+   * that read captured logs. The view's tail is the bytes' length, bound to no object. Bytes that
+   * fail a check throw {@link FrameCheckException}.
    */
   public static LogView decode(byte[] bytes) {
-    return decode(bytes, new BytesTail(bytes.length), true);
+    return decode(bytes, new BytesTail(bytes.length), true, 0);
   }
 
   /**
@@ -580,19 +611,21 @@ public final class AtomicFileLog implements SharedLog {
   }
 
   /** The view of {@code bytes}, the whole of the version {@code file} read, every frame checked. */
-  private static FileView viewOf(InputFile file, byte[] bytes) {
+  private FileView viewOf(InputFile file, byte[] bytes) {
     FileTail tail = new FileTail(file);
     tail.length = bytes.length;
-    FileView view = decode(bytes, tail, false);
+    FileView view = decode(bytes, tail, false, format);
     tail.view = view;
     return view;
   }
 
   /**
-   * The view of {@code bytes}, every frame checked: format 3's, or, if {@code unchecked} allows
-   * it, format 2's (no trailers; the view's incarnation 0 and its trailer empty).
+   * The view of {@code bytes}, every frame checked: format {@code format}'s (0: 3's or 4's), or, if
+   * {@code unchecked} allows it, format 2's (no trailers; the view's incarnation 0 and its trailer
+   * empty). A log of one of formats 3 and 4 refuses the other: a client that keeps no segments
+   * never appends to a segmented log's catalog object, nor reads it as its log.
    */
-  private static FileView decode(byte[] bytes, LogTail tail, boolean unchecked) {
+  private static FileView decode(byte[] bytes, LogTail tail, boolean unchecked, int format) {
     if (bytes.length < HEADER_SIZE) {
       throw new FrameCheckException("A catalog file of " + bytes.length + " bytes has no header");
     }
@@ -607,9 +640,18 @@ public final class AtomicFileLog implements SharedLog {
     if (unchecked && version == UNCHECKED_FORMAT_VERSION) {
       return decodeUnchecked(bytes, tail);
     }
-    if (version != FORMAT_VERSION) {
-      throw new IllegalStateException(
-          "Unsupported format version: " + version + ", expected: " + FORMAT_VERSION);
+    if (format == FORMAT_VERSION && version == SEGMENTED_FORMAT_VERSION) {
+      throw new IllegalStateException("This catalog keeps segments (format 4): open it with its"
+          + " segment store (fileio.catalog.log)");
+    }
+    if (format == SEGMENTED_FORMAT_VERSION && version == FORMAT_VERSION) {
+      throw new IllegalStateException("This catalog keeps no segments (format 3): open it without"
+          + " a segment store");
+    }
+    if (format == 0 ? version != FORMAT_VERSION && version != SEGMENTED_FORMAT_VERSION
+        : version != format) {
+      throw new IllegalStateException("Unsupported format version: " + version + ", expected: "
+          + (format == 0 ? FORMAT_VERSION : format));
     }
     int pos = HEADER_SIZE;
     int end = frameEnd(bytes, pos, null);

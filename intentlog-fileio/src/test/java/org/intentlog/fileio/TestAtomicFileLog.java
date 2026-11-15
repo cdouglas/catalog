@@ -74,6 +74,35 @@ class TestAtomicFileLog {
     return log.readThrough(r, Duration.ZERO);
   }
 
+  /**
+   * A segmented log's catalog object is format 4 (docs/LOG_SEGMENTS.md "Finding the log"): a log
+   * that keeps no segments refuses it, so it never appends to it (OI-1 (nothing records which
+   * log)); and a segmented log's refuses format 3's object.
+   */
+  @Test
+  void formatsThreeAndFourRefuseEachOther() {
+    AtomicFileLog segmented = AtomicFileLog.segmented(io, LOCATION, () -> INCARNATION, false);
+    LogView created = segmented.readThrough(
+        segmented.replace(absent(), bytes("chk"), List.of(bytes("install"))), Duration.ZERO);
+    assertThat(string(created.checkpoint().orElseThrow())).isEqualTo("chk");
+    byte[] object = io.bytes(LOCATION);
+    assertThat(ByteBuffer.wrap(object, 4, 4).getInt())
+        .isEqualTo(AtomicFileLog.SEGMENTED_FORMAT_VERSION);
+    assertThat(segmented.read().records()).extracting(TestAtomicFileLog::string)
+        .containsExactly("install");
+    assertThat(AtomicFileLog.decode(object).records()).hasSize(1);
+
+    assertThatThrownBy(log::read).isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("keeps segments");
+    assertThat(io.bytes(LOCATION)).isEqualTo(object);
+
+    InMemoryAtomicFileIO plain = new InMemoryAtomicFileIO();
+    AtomicFileLog three = new AtomicFileLog(plain, LOCATION, () -> INCARNATION);
+    three.replace(AtomicFileLog.tailOf(plain.newInputFile(LOCATION)), bytes("chk"), List.of());
+    assertThatThrownBy(AtomicFileLog.segmented(plain, LOCATION, () -> INCARNATION, false)::read)
+        .isInstanceOf(IllegalStateException.class).hasMessageContaining("keeps no segments");
+  }
+
   @Test
   void aReplaceCreatesTheObjectAndAppendsFollowIt() {
     LogView created = create();
