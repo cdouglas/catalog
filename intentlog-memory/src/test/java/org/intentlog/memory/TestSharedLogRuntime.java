@@ -650,4 +650,71 @@ class TestSharedLogRuntime {
   private byte[] recordOf(String tag) {
     return log.records().stream().filter(r -> tagOf(r).equals(tag)).findFirst().orElseThrow();
   }
+
+  /**
+   * A void append (docs/LOG_SEGMENTS.md D4): the send landed nowhere the log holds, which the read
+   * through it says by a LogConflictException. That is a lost race, not an unknown outcome: the
+   * commit sends again with no read to resolve it.
+   */
+  @Test
+  void aVoidAppendIsALostRace() {
+    Replica<State> base = created();
+    boolean[] voided = {false};
+    SharedLog voiding = new SharedLog() {
+      @Override
+      public Capabilities capabilities() {
+        return log.capabilities();
+      }
+
+      @Override
+      public LogView read() {
+        return log.read();
+      }
+
+      @Override
+      public LogView readAfter(LogTail since) {
+        return log.readAfter(since);
+      }
+
+      @Override
+      public LogView readThrough(Receipt receipt, Duration wait) {
+        if (receipt == null) {
+          throw new org.intentlog.LogConflictException("The append is void", null);
+        }
+        return log.readThrough(receipt, wait);
+      }
+
+      @Override
+      public LogTail probe() {
+        return log.probe();
+      }
+
+      @Override
+      public Receipt append(byte[] record, LogTail expected) {
+        if (!voided[0]) {
+          voided[0] = true;
+          return null; // landed past its segment's end: in no view of the log
+        }
+        return log.append(record, expected);
+      }
+
+      @Override
+      public void putCheckpoint(LogTail through, byte[] checkpoint) {
+        log.putCheckpoint(through, checkpoint);
+      }
+    };
+    LogRuntime<State, EntityVersionsMachine.Builder, Txn> runtime =
+        new LogRuntime<>(voiding, MACHINE, config(NO_GC, NEVER));
+    org.intentlog.CommitTrace.open();
+    try {
+      Replica<State> landed = runtime.commit(base, txn(base, "a", Set.of(), Set.of("x")));
+      assertThat(landed.state().versions()).containsKey("x");
+      List<org.intentlog.CommitTrace.Kind> kinds = org.intentlog.CommitTrace.drain().stream()
+          .map(org.intentlog.CommitTrace.Event::kind).toList();
+      assertThat(kinds).contains(org.intentlog.CommitTrace.Kind.LOST)
+          .doesNotContain(org.intentlog.CommitTrace.Kind.AMBIGUOUS);
+    } finally {
+      org.intentlog.CommitTrace.close();
+    }
+  }
 }

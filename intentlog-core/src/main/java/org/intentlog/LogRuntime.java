@@ -1666,8 +1666,9 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
      * write that landed fails its condition, which the commit loop resolves by reading the log;
      * running out of retries leaves the outcome unknown in the same way, so it is an {@link
      * AmbiguousWrite}. An interrupt during the backoff stops the commit with its outcome unknown.
-     * The protocol's conflict and full signals propagate; any other failure of the write, or of
-     * reading back what it wrote, is an {@link AmbiguousWrite}.
+     * The protocol's conflict and full signals propagate, and so does a read back that finds the
+     * append void (a conflict: a segmented log's append past its segment's end); any other failure
+     * of the write, or of reading back what it wrote, is an {@link AmbiguousWrite}.
      */
     private Replayed write(Supplier<Receipt> send, boolean unconditional) {
       long backoffMs = config.throttleMinWaitMs();
@@ -1708,6 +1709,10 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
         try {
           written =
               replay(log.readThrough(receipt, config.visibilityWait()), id, base.logId(), current);
+        } catch (LogConflictException e) {
+          // The append is void: it landed past the end of the segment it went to, so it is not in
+          // the log and no later write can put it there (docs/LOG_SEGMENTS.md D4). A lost race.
+          throw e;
         } catch (RuntimeException e) {
           throw new AmbiguousWrite(e);
         }
