@@ -693,6 +693,9 @@ public class LogCatalog extends BaseMetastoreCatalog
     private volatile Replica<CatalogState> lastRead = null;
     // The replica the last commit through these operations landed in, until commit() adopts it
     private Replica<CatalogState> landed = null;
+    // The metadata file this commit wrote, as TableMetadataParser.read returns it: adoptLanded
+    // takes it where the landed catalog names that file instead of reading it back (errata D26)
+    private TableMetadata written = null;
     // Whether a read found the table: once one has, a read that does not finds it dropped
     private boolean loaded = false;
     // Whether a commit of what Iceberg commits once pins it (LogCatalog.leavingCommitOnceUnpinned)
@@ -747,12 +750,24 @@ public class LogCatalog extends BaseMetastoreCatalog
      * (Bug 78: an update read a null base) and whose commit creates it.
      */
     private synchronized void loadFrom(CatalogState state) {
+      loadFrom(state, null);
+    }
+
+    /**
+     * As {@link #loadFrom(CatalogState)}, taking {@code written} (the metadata of a file this
+     * table's operations wrote) as the pointer table's metadata where {@code state} names its file.
+     */
+    private synchronized void loadFrom(CatalogState state, TableMetadata written) {
       tableIO.current(inlineMetadata(state));
       String metadataFile = state.location(tableId);
       if (metadataFile != null) {
         loaded = true;
-        // Pointer table: load metadata from external file
-        refreshFromMetadataLocation(metadataFile);
+        // Pointer table: load metadata from external file, or hold the one this commit wrote
+        if (written != null && metadataFile.equals(written.metadataFileLocation())) {
+          refreshFromMetadataLocation(metadataFile, null, 0, location -> written);
+        } else {
+          refreshFromMetadataLocation(metadataFile);
+        }
       } else if (state.isInlineTable(tableId)) {
         // Inline table: load metadata from catalog bytes.
         // The synthetic location is the cache key for
@@ -844,7 +859,15 @@ public class LogCatalog extends BaseMetastoreCatalog
      * a writer that does not inline is committing to it.
      */
     String writeUpdateMetadata(boolean isCreate, TableMetadata metadata) {
-      return writeNewMetadataIfRequired(isCreate, withManifestListFiles(metadata));
+      TableMetadata file = withManifestListFiles(metadata);
+      String location = writeNewMetadataIfRequired(isCreate, file);
+      // what TableMetadataParser.read returns for the file just written, as core-perf's
+      // JdbcTableOperations builds it, before the commit stages it
+      written = TableMetadata.buildFrom(file)
+          .withMetadataLocation(location)
+          .discardChanges()
+          .build();
+      return location;
     }
 
     /**
@@ -923,6 +946,7 @@ public class LogCatalog extends BaseMetastoreCatalog
         return;
       }
       landed = null;
+      written = null;
       doCommit(base, metadata);
       deleteRemovedRealMetadataFiles(base, metadata);
       adoptLanded();
@@ -932,16 +956,21 @@ public class LogCatalog extends BaseMetastoreCatalog
      * Takes the replica the commit just landed in as the table's current state, as Iceberg's REST
      * operations take the metadata a commit returns, so a look at the table after the commit reads
      * nothing (errata D20; {@code SnapshotProducer} finds its snapshot in {@link #current()}). A
-     * {@link #refresh} still reads the log. The commit has landed whatever happens here: if the
-     * table cannot be loaded from the replica (a pointer table's metadata file unreadable), the
-     * next {@link #current()} refreshes instead.
+     * pointer table whose landed catalog names the metadata file this commit wrote holds that
+     * file's metadata rather than reading it back, as JDBC's operations on core-perf hold the table
+     * their commit wrote (errata D26); one that names another file reads it. A {@link #refresh}
+     * still reads the log. The commit has landed whatever happens here: if the table cannot be
+     * loaded from the replica (a pointer table's metadata file unreadable), the next {@link
+     * #current()} refreshes instead.
      */
     private void adoptLanded() {
       Replica<CatalogState> committed = landed;
+      TableMetadata wrote = written;
       landed = null;
+      written = null;
       if (committed != null) {
         try {
-          loadFrom(committed.state());
+          loadFrom(committed.state(), wrote);
           lastRead = committed;
           return;
         } catch (RuntimeException e) {

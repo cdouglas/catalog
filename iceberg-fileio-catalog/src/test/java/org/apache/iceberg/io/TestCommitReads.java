@@ -24,9 +24,12 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
+import org.apache.iceberg.HasTableOperations;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.TableMetadataParser;
+import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.types.Types;
@@ -112,6 +115,59 @@ class TestCommitReads {
     assertThat(mode.<FileIOCatalog>catalog(io, WAREHOUSE, "c", Map.of()).loadTable(TABLE)
             .currentSnapshot().snapshotId())
         .isEqualTo(table[0].currentSnapshot().snapshotId());
+  }
+
+  /** GETs of metadata files while {@code action} runs. */
+  private static int metadataReads(InMemoryAtomicFileIO io, Runnable action) {
+    AtomicInteger reads = new AtomicInteger();
+    io.injectReadFaults(location -> {
+      if (location.endsWith(".metadata.json")) {
+        reads.incrementAndGet();
+      }
+      return InMemoryAtomicFileIO.ReadFault.NONE;
+    });
+    try {
+      action.run();
+    } finally {
+      io.injectReadFaults(location -> InMemoryAtomicFileIO.ReadFault.NONE);
+    }
+    return reads.get();
+  }
+
+  /**
+   * A pointer table's operations hold the metadata file their commit wrote, as JDBC's on core-perf
+   * do and REST's hold a commit's response (errata D26): a commit reads no metadata file back, nor
+   * does a look at the table after it, and a create's table is the file it wrote.
+   */
+  @ParameterizedTest
+  @EnumSource(value = LocalCatalogMode.class, names = {"APPEND", "CAS"})
+  void aPointerCommitReadsNoMetadataFileBack(LocalCatalogMode mode) {
+    InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+    FileIOCatalog catalog = mode.catalog(io, WAREHOUSE, "c", Map.of());
+    catalog.createNamespace(Namespace.of("db"));
+    Table[] table = new Table[1];
+    assertThat(metadataReads(io, () -> {
+      table[0] = catalog.createTable(TABLE, SCHEMA);
+      table[0].currentSnapshot();
+    })).as("a create holds the file it wrote").isZero();
+    for (int i = 0; i < 3; i++) {
+      DataFile added = file(i);
+      assertThat(metadataReads(io, () -> {
+        table[0].newAppend().appendFile(added).commit();
+        table[0].currentSnapshot();
+      })).as("merge append %d reads no metadata file", i).isZero();
+      assertThat(table[0].currentSnapshot().addedDataFiles(table[0].io()))
+          .extracting(f -> f.location())
+          .containsExactly(added.location());
+    }
+
+    // What it holds is the file the catalog names, exactly as a fresh reader parses it
+    Table fresh = mode.<FileIOCatalog>catalog(io, WAREHOUSE, "c", Map.of()).loadTable(TABLE);
+    TableMetadata held = ((HasTableOperations) table[0]).operations().current();
+    TableMetadata parsed = ((HasTableOperations) fresh).operations().current();
+    assertThat(held.metadataFileLocation()).isEqualTo(parsed.metadataFileLocation());
+    assertThat(TableMetadataParser.toJson(held)).isEqualTo(TableMetadataParser.toJson(parsed));
+    assertThat(held.changes()).isEmpty();
   }
 
   /**

@@ -461,22 +461,6 @@ tables on `s3x-2026-11`) a fold took 1.0 ms, inside a resend's window of 15 to
 **Trigger to revisit:** catalogs of tens of thousands of tables, or a fold's
 CPU again a large part of a resend's window.
 
-### D26. A pointer table reads back the metadata file its commit wrote (perf)
-
-After a commit lands, `FileIOTableOperations.commit` adopts the replica it
-landed in (`adoptLanded`, `loadFrom`). For a pointer table that calls
-`refreshFromMetadataLocation` with the location in that state, which is the
-file the commit just wrote, so the table GETs the metadata it already holds.
-JDBC on `core-perf` holds the table its commit wrote (`JdbcTableOperations`,
-c9aef87de1), as REST's operations hold a commit's response. In catalog-bench's
-W1 runs (2026-11-15; 300 tables, 5 merge appends a second, 3 runs per store) a
-pointer merge append made 2 metadata GETs and 1 PUT where JDBC made 1 and 1,
-about 6 ms more a commit on S3 Express (catalog-bench errata C7). Inline tables
-are unaffected. Fix: when the landed state names the location `doCommit` wrote,
-take the committed metadata, with that location, as current.
-
-**Trigger to revisit:** before the pointer-table points of the paper's runs.
-
 ## Test Coverage Gaps
 
 ### T3. Cloud integration tests rely on emulators for some behaviour
