@@ -477,7 +477,36 @@ message TableMetadataUpdate {
     RemoveManifestDelta     remove_manifest           = 13;
     RemoveSchemas           remove_schemas            = 14;
     RemovePartitionSpecs    remove_partition_specs    = 15;
+    SetStatistics           set_statistics            = 16;
+    RemoveStatistics        remove_statistics         = 17;
+    SetPartitionStatistics  set_partition_statistics  = 18;
+    RemovePartitionStatistics remove_partition_statistics = 19;
   }
+}
+
+// A snapshot's statistics file, which replaces any it had
+// (TableMetadata.Builder.setStatistics): Iceberg's JSON of it, as a metadata
+// file holds it (StatisticsFileParser; it names its snapshot), gzipped.
+message SetStatistics {
+  bytes statistics_json = 1;
+}
+
+// The snapshot's statistics file removed, if it has one
+// (TableMetadata.Builder.removeStatistics). A delta that removes a snapshot
+// removes its statistics with it, and names none here.
+message RemoveStatistics {
+  fixed64 snapshot_id = 1;
+}
+
+// As SetStatistics, of a partition statistics file
+// (PartitionStatisticsFileParser).
+message SetPartitionStatistics {
+  bytes partition_statistics_json = 1;
+}
+
+// As RemoveStatistics, of a partition statistics file.
+message RemovePartitionStatistics {
+  fixed64 snapshot_id = 1;
 }
 
 // A snapshot id a delta's update leaves out (AddManifestDelta,

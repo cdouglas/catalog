@@ -187,6 +187,11 @@ final class TableChange {
       }
       if (update instanceof InlineDeltaCodec.SetPropertiesUpdate) {
         concerns.add(Concern.PROPERTIES);
+      } else if (update instanceof InlineDeltaCodec.SetStatisticsUpdate
+          || update instanceof InlineDeltaCodec.RemoveStatisticsUpdate
+          || update instanceof InlineDeltaCodec.SetPartitionStatisticsUpdate
+          || update instanceof InlineDeltaCodec.RemovePartitionStatisticsUpdate) {
+        concerns.add(Concern.STATISTICS);
       } else if (update instanceof InlineDeltaCodec.SetLocationUpdate) {
         concerns.add(Concern.TABLE);
       } else if (update instanceof InlineDeltaCodec.AddSchemaUpdate
@@ -263,8 +268,8 @@ final class TableChange {
 
   /**
    * What changed from {@code before} to {@code after}, two versions of a table, if it is only
-   * their properties or statistics (a statistics change goes as full metadata); null for any other
-   * change, which an encoding cannot see into.
+   * their properties or statistics (a full update of a pointer table, or one a delta cannot
+   * express); null for any other change, which an encoding cannot see into.
    */
   static TableChange diff(TableMetadata before, TableMetadata after) {
     com.fasterxml.jackson.databind.node.ObjectNode was = json(before);

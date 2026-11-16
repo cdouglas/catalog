@@ -3117,8 +3117,8 @@ public class ProtoCodec {
           }
           // The lists of the snapshots the table no longer has, and the pool entries no list
           // names any more: a delta drops them with its RemoveSnapshotsUpdate (applyDelta); a full
-          // update may drop snapshots too (an expiry co-committed with a statistics change, which
-          // a delta cannot carry), and orphaned lists would name files storage GC may delete. Only
+          // update may drop snapshots too (one a delta cannot express), and orphaned lists would
+          // name files storage GC may delete. Only
           // a table with inline lists has any, so a table without decodes nothing here.
           Set<Long> existingRefs = builder.snapshotManifestKeys(id);
           if (!existingRefs.isEmpty()) {

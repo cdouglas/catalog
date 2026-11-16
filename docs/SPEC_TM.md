@@ -123,7 +123,7 @@ for framing):
 | Mode        | Payload                            | When used                                   |
 |-------------|------------------------------------|---------------------------------------------|
 | **Delta**   | Structured `TableMetadataDelta`    | The table is inline (common path for data commits and DDL) |
-| **Full**    | Encoded `TableMetadata`: on an inline table, head only (`head_only`): its head with only the snapshots the version it read lacks and its refs' targets, with the ids of that version's snapshots it drops (replay keeps the others, in their order, then appends the new ones); on a pointer table, the whole table, which replaces it | No delta: the table is a pointer table (re-inlining), the delta does not fit, or `computeDelta` returns none: it finds no update, or cannot express the change (a format-version upgrade, a removed ref, a change to the encryption keys, a statistics change, an id collision, a new schema or spec that replay would number otherwise, a new sort order or spec that does not bind to the commit's schema, a last column or partition id other than the larger of the base's and the highest field id in the commit's new schemas or specs, new snapshot-log entries other than replay's: none if main did not move, else one, last, for main's new snapshot at the snapshot's own timestamp if the commit added it and at last-updated-ms otherwise (a rollback), new snapshots whose sequence numbers or row ids do not follow the base's) |
+| **Full**    | Encoded `TableMetadata`: on an inline table, head only (`head_only`): its head with only the snapshots the version it read lacks and its refs' targets, with the ids of that version's snapshots it drops (replay keeps the others, in their order, then appends the new ones); on a pointer table, the whole table, which replaces it | No delta: the table is a pointer table (re-inlining), the delta does not fit, or `computeDelta` returns none: it finds no update, or cannot express the change (a format-version upgrade, a removed ref, a change to the encryption keys, an id collision, a new schema or spec that replay would number otherwise, a new sort order or spec that does not bind to the commit's schema, a last column or partition id other than the larger of the base's and the highest field id in the commit's new schemas or specs, new snapshot-log entries other than replay's: none if main did not move, else one, last, for main's new snapshot at the snapshot's own timestamp if the commit added it and at last-updated-ms otherwise (a rollback), new snapshots whose sequence numbers or row ids do not follow the base's) |
 | **Pointer** | Metadata file location (`UpdateTableLocation`) | Neither fits, or a new inline-ML snapshot restates a pooled manifest (see [SPEC_ML.md](SPEC_ML.md)): the table leaves inline storage (eviction) |
 
 Manifest updates of new inline-ML snapshots count toward the payload
@@ -260,6 +260,10 @@ message TableMetadataUpdate {
     RemoveManifestDelta     remove_manifest            = 13;  // SPEC_ML
     RemoveSchemas           remove_schemas             = 14;
     RemovePartitionSpecs    remove_partition_specs     = 15;
+    SetStatistics           set_statistics             = 16;
+    RemoveStatistics        remove_statistics          = 17;
+    SetPartitionStatistics  set_partition_statistics   = 18;
+    RemovePartitionStatistics remove_partition_statistics = 19;
   }
 }
 ```
@@ -440,6 +444,10 @@ message SetTableProperties      { map<string,string> updated = 1; repeated strin
 message SetTableLocation        { string location = 1; }
 message RemoveSchemas           { repeated int32 schema_ids = 1 [packed = false]; }
 message RemovePartitionSpecs    { repeated int32 spec_ids   = 1 [packed = false]; }
+message SetStatistics           { bytes statistics_json = 1; }            // gzip
+message RemoveStatistics        { fixed64 snapshot_id = 1; }
+message SetPartitionStatistics  { bytes partition_statistics_json = 1; }  // gzip
+message RemovePartitionStatistics { fixed64 snapshot_id = 1; }
 ```
 
 Replay ignores the ids `AddSchema`, `AddPartitionSpec` and `AddSortOrder`
@@ -478,6 +486,21 @@ synthesizes the canonical Iceberg JSON form and hands it to
 without an intermediate JSON blob on disk. A round-trip property test
 exercises every transform kind to catch upstream Iceberg adding new
 fields to `SortField`.
+
+Statistics and partition statistics files go as Iceberg's JSON of each
+(`StatisticsFileParser`, `PartitionStatisticsFileParser`: what a metadata
+file holds, naming its snapshot), gzipped as schemas are. `computeDelta`
+sends each file the commit's metadata has that its base lacks or has
+otherwise, in the order the commit's metadata lists them (the order its
+builder's map gave them, which replay's builder gives them by setting them
+in that order), then a removal for each snapshot whose file the commit
+dropped, unless the delta removes the snapshot, which takes its statistics
+with it (`TableMetadata.Builder.removeSnapshots`). Replay applies them as
+the builder's `setStatistics` (replacing the snapshot's file),
+`removeStatistics` (nothing if the snapshot has none) and their partition
+counterparts, natively on the table's fields (`NativeDelta`). A conflict
+encoding takes a record with any of them as a statistics change (concern
+`statistics`), as it takes a full update that changes only statistics.
 
 `RemoveSchemas` / `RemovePartitionSpecs` are emitted by `computeDelta`
 when `expireSnapshots().cleanExpiredMetadata(true)` (or a replace

@@ -616,6 +616,69 @@ public class TestInlineDelta {
   }
 
   // ============================================================
+  // Statistics files
+  // ============================================================
+
+  @Nested
+  class StatisticsTests {
+
+    private org.apache.iceberg.StatisticsFile stats(long snapshotId, String path, int blobs) {
+      List<org.apache.iceberg.BlobMetadata> metadata = new java.util.ArrayList<>();
+      for (int field = 1; field <= blobs; field++) {
+        metadata.add(new org.apache.iceberg.GenericBlobMetadata(
+            "apache-datasketches-theta-v1", snapshotId, 7, List.of(field),
+            Map.of("ndv", String.valueOf(1000 + field))));
+      }
+      return new org.apache.iceberg.GenericStatisticsFile(
+          snapshotId, "s3://bucket/table/metadata/" + path + ".stats", 512L * blobs,
+          128L * blobs, metadata);
+    }
+
+    private org.apache.iceberg.PartitionStatisticsFile partitionStats(long snapshotId) {
+      return org.apache.iceberg.ImmutableGenericPartitionStatisticsFile.builder()
+          .snapshotId(snapshotId)
+          .path("s3://bucket/table/metadata/partition-stats-" + snapshotId + ".parquet")
+          .fileSizeInBytes(4096)
+          .build();
+    }
+
+    /**
+     * Statistics files set, replaced and removed, and partition statistics files too, are a delta
+     * that replays to the writer's files, in the writer's order (errata D9 until 2026-11-16: the
+     * commit went as full metadata).
+     */
+    @Test
+    void setReplacedAndRemovedStatisticsRoundTrip() {
+      TableMetadata oldMeta = TableMetadata.buildFrom(baseMetadata())
+          .setStatistics(stats(1L, "a", 2))
+          .setStatistics(stats(2L, "b", 1))
+          .setPartitionStatistics(partitionStats(2L))
+          .discardChanges().build();
+      TableMetadata newMeta = TableMetadata.buildFrom(oldMeta)
+          .setStatistics(stats(1L, "a2", 3))
+          .removeStatistics(2L)
+          .setStatistics(stats(3L, "c", 1))
+          .removePartitionStatistics(2L)
+          .setPartitionStatistics(partitionStats(3L))
+          .discardChanges().build();
+
+      List<InlineDeltaCodec.DeltaUpdate> delta =
+          InlineDeltaCodec.computeDelta(oldMeta, newMeta, "");
+      assertThat(delta).extracting(u -> u.getClass().getSimpleName()).containsExactlyInAnyOrder(
+          "SetStatisticsUpdate", "SetStatisticsUpdate", "SetPartitionStatisticsUpdate",
+          "RemoveStatisticsUpdate", "RemovePartitionStatisticsUpdate");
+      byte[] encoded = InlineDeltaCodec.encodeDelta(delta, TestInlineDelta.TEST_TS);
+      TableMetadata applied =
+          InlineDeltaCodec.applyUpdates(oldMeta, InlineDeltaCodec.decodeDelta(encoded).updates);
+
+      assertThat(applied.statisticsFiles()).containsExactlyElementsOf(newMeta.statisticsFiles());
+      assertThat(applied.partitionStatisticsFiles())
+          .containsExactlyElementsOf(newMeta.partitionStatisticsFiles());
+      assertThat(InlineDeltaCodec.computeDelta(newMeta, applied, "")).isNull();
+    }
+  }
+
+  // ============================================================
   // InlineManifestTableOperations tests
   // ============================================================
 

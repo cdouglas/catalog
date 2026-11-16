@@ -755,7 +755,31 @@
           {"number": 12, "name": "add_manifest", "type": "AddManifestDelta", "repeated": false, "packed": false, "oneof": "update", "comment": ""},
           {"number": 13, "name": "remove_manifest", "type": "RemoveManifestDelta", "repeated": false, "packed": false, "oneof": "update", "comment": ""},
           {"number": 14, "name": "remove_schemas", "type": "RemoveSchemas", "repeated": false, "packed": false, "oneof": "update", "comment": ""},
-          {"number": 15, "name": "remove_partition_specs", "type": "RemovePartitionSpecs", "repeated": false, "packed": false, "oneof": "update", "comment": ""}
+          {"number": 15, "name": "remove_partition_specs", "type": "RemovePartitionSpecs", "repeated": false, "packed": false, "oneof": "update", "comment": ""},
+          {"number": 16, "name": "set_statistics", "type": "SetStatistics", "repeated": false, "packed": false, "oneof": "update", "comment": ""},
+          {"number": 17, "name": "remove_statistics", "type": "RemoveStatistics", "repeated": false, "packed": false, "oneof": "update", "comment": ""},
+          {"number": 18, "name": "set_partition_statistics", "type": "SetPartitionStatistics", "repeated": false, "packed": false, "oneof": "update", "comment": ""},
+          {"number": 19, "name": "remove_partition_statistics", "type": "RemovePartitionStatistics", "repeated": false, "packed": false, "oneof": "update", "comment": ""}
+        ]
+      },
+      "SetStatistics": {
+        "fields": [
+          {"number": 1, "name": "statistics_json", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "RemoveStatistics": {
+        "fields": [
+          {"number": 1, "name": "snapshot_id", "type": "fixed64", "repeated": false, "packed": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "SetPartitionStatistics": {
+        "fields": [
+          {"number": 1, "name": "partition_statistics_json", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "RemovePartitionStatistics": {
+        "fields": [
+          {"number": 1, "name": "snapshot_id", "type": "fixed64", "repeated": false, "packed": false, "oneof": null, "comment": ""}
         ]
       },
       "AddManifestDelta": {

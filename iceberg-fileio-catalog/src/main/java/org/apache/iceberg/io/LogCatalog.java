@@ -1168,8 +1168,8 @@ public class LogCatalog extends BaseMetastoreCatalog
           return toFile(mut, metadata, orFile);
         }
         if (isInline) {
-          // Null if delta encoding cannot express the change (a statistics change, errata D9; a
-          // concurrent replace's id collision, SPEC_TM.md): full mode then.
+          // Null if delta encoding cannot express the change (a concurrent replace's id
+          // collision, SPEC_TM.md): full mode then.
           // Manifest lists' paths whole: the table's prefix is its manifests' (manifestUpdates)
           List<InlineDeltaCodec.DeltaUpdate> delta =
               InlineDeltaCodec.computeDelta(base, metadata, "", change);

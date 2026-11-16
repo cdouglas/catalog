@@ -15,7 +15,7 @@ none of them. `TestIcebergCoreIssues` asserts each is absent; on stock Iceberg
 1.12.0 C2-C29 come back.
 
 An entry's ID is not reused: a finished entry is deleted and its ID retired.
-Retired: S3-S5, D1-D3, D5-D7, D10, D11, D15, D19, D20, D24, T1, T2, T5, U2, U3
+Retired: S3-S5, D1-D3, D5-D7, D9, D10, D11, D15, D19, D20, D23, D24, D26, T1, T2, T5, U2, U3
 (`git log -p docs/errata.md` has each; the plans in TAIL_READS.md,
 CHECKPOINT_PLAN.md and SNAPSHOT_PAGING.md cite them by ID and summary). Five
 IDs (S2, D9, D10, T4, T5) were reused before this rule, so an older code
@@ -103,18 +103,6 @@ does), which writes its manifest lists to files. The fork's
 manifest list location, in both `replacePaths` and
 `rewriteManifestList`.
 
-### D9. Statistics-file changes force full mode (perf, not correctness)
-
-`InlineDeltaCodec.computeDelta` returns `null` whenever a stats file
-changed (its `statisticsChanged` check). Any commit that
-runs `setStatistics` in addition to a real change pays full-mode bytes,
-defeating the delta-mode benefit on tables that maintain stats. Adding
-`AddStatistics` / `RemoveStatistics` delta types is straightforward; the
-JSON parsers are already in upstream Iceberg.
-
-**Trigger to revisit:** when a stats-maintaining workload shows up where
-the full-mode size penalty matters.
-
 ### D12. A transaction's other updates conflict on the table's whole version
 
 A catalog transaction's update of an inline table that adds snapshots and
@@ -130,7 +118,7 @@ requirements.
 
 Every other update of a table a transaction writes is pinned and applies only
 on the version the transaction first read: a pointer table's, one that goes as
-full metadata (a statistics change, D9; one past the inline size), and a
+full metadata (one past the inline size), and a
 schema, partition-spec or ref change, which Iceberg commits only on the
 version it read. Applying those to a changed version, checked only by the
 requirements Iceberg derives, as its REST server does, loses what the change

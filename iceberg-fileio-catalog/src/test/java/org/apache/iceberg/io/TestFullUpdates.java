@@ -28,11 +28,13 @@ import java.util.stream.Collectors;
 import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.GenericStatisticsFile;
 import org.apache.iceberg.HasTableOperations;
+import org.apache.iceberg.ImmutableGenericPartitionStatisticsFile;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableMetadata;
+import org.apache.iceberg.TableMetadataParser;
 import org.apache.iceberg.Transaction;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
@@ -41,8 +43,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
 /**
- * A full update of an inline table (one a delta cannot express, such as a statistics change)
- * carries the table's head with only the snapshots the version it read lacks and its refs'
+ * A full update of an inline table (one a delta cannot express, such as a removed ref) carries the table's head with only the snapshots the version it read lacks and its refs'
  * targets, and names the snapshots of that version it drops; replay keeps the rest
  * (SNAPSHOT_PAGING.md step 1, {@code NativeDelta.full}). A pointer table returning to inline
  * storage is sent whole.
@@ -110,9 +111,54 @@ class TestFullUpdates {
         .isEqualTo(TableViews.physical(catalog(mode).loadTable(TABLE), true));
   }
 
+  /**
+   * A statistics change is a delta (errata D9 until 2026-11-16: it went as full metadata): set,
+   * replaced, and removed, with a partition statistics file, and an expiry that takes a snapshot's
+   * statistics with it.
+   */
   @ParameterizedTest
   @EnumSource(names = {"APPEND_TM", "APPEND_ML", "MEMLOG_ML"})
-  void aStatisticsChangeSendsOnlyTheSnapshotsItsRefsTarget(LocalCatalogMode mode) {
+  void aStatisticsChangeIsADelta(LocalCatalogMode mode) {
+    LogCatalog catalog = catalog(mode);
+    catalog.createNamespace(Namespace.of("ns"));
+    Table table = catalog.buildTable(TABLE, SCHEMA).withPartitionSpec(SPEC).create();
+    for (int i = 0; i < 4; i++) {
+      append(table);
+    }
+    List<Long> ids =
+        current(table).snapshots().stream().map(Snapshot::snapshotId).collect(Collectors.toList());
+    long head = table.currentSnapshot().snapshotId();
+    table.updateStatistics().setStatistics(statistics(ids.get(0))).commit();
+    table.updateStatistics().setStatistics(statistics(head)).commit();
+    table.updatePartitionStatistics()
+        .setPartitionStatistics(ImmutableGenericPartitionStatisticsFile.builder()
+            .snapshotId(head).path("mem:///stats/p" + head + ".parquet").fileSizeInBytes(42)
+            .build())
+        .commit();
+    table.updateStatistics()
+        .setStatistics(new GenericStatisticsFile(
+            head, "mem:///stats/" + head + "-2.puffin", 200, 20, List.of()))
+        .commit();
+    Transaction txn = table.newTransaction();
+    txn.expireSnapshots().expireSnapshotId(ids.get(0)).cleanExpiredFiles(false).commit();
+    txn.updatePartitionStatistics().removePartitionStatistics(head).commit();
+    txn.commitTransaction();
+
+    TableMetadata loaded = current(catalog(mode).loadTable(TABLE));
+    assertThat(loaded.statisticsFiles()).singleElement()
+        .satisfies(f -> assertThat(f.path()).isEqualTo("mem:///stats/" + head + "-2.puffin"));
+    assertThat(loaded.partitionStatisticsFiles()).isEmpty();
+    assertThat(TableMetadataParser.toJson(loaded))
+        .isEqualTo(TableMetadataParser.toJson(current(table)));
+    readsAsAFreshCatalog(catalog, mode);
+    if (!mode.sharedLog) {
+      assertThat(fullUpdates()).isEmpty();
+    }
+  }
+
+  @ParameterizedTest
+  @EnumSource(names = {"APPEND_TM", "APPEND_ML", "MEMLOG_ML"})
+  void aRemovedRefSendsOnlyTheSnapshotsItsRefsTarget(LocalCatalogMode mode) {
     LogCatalog catalog = catalog(mode);
     catalog.createNamespace(Namespace.of("ns"));
     Table table = catalog.buildTable(TABLE, SCHEMA).withPartitionSpec(SPEC).create();
@@ -120,11 +166,12 @@ class TestFullUpdates {
       append(table);
     }
     long head = table.currentSnapshot().snapshotId();
-    table.updateStatistics().setStatistics(statistics(head)).commit();
+    table.manageSnapshots().createTag("t", head).commit();
+    table.manageSnapshots().removeTag("t").commit();
 
     TableMetadata loaded = current(catalog(mode).loadTable(TABLE));
     assertThat(loaded.snapshots()).hasSize(8);
-    assertThat(loaded.statisticsFiles()).extracting(f -> f.snapshotId()).containsExactly(head);
+    assertThat(loaded.refs()).containsOnlyKeys("main");
     readsAsAFreshCatalog(catalog, mode);
     if (!mode.sharedLog) {
       List<ProtoCodec.UpdateTableInlineAction> full = fullUpdates();
@@ -137,7 +184,7 @@ class TestFullUpdates {
 
   @ParameterizedTest
   @EnumSource(names = {"APPEND_TM", "APPEND_ML", "MEMLOG_ML"})
-  void anExpiryWithAStatisticsChangeNamesWhatItDrops(LocalCatalogMode mode) {
+  void anExpiryWithARemovedRefNamesWhatItDrops(LocalCatalogMode mode) {
     LogCatalog catalog = catalog(mode);
     catalog.createNamespace(Namespace.of("ns"));
     Table table = catalog.buildTable(TABLE, SCHEMA).withPartitionSpec(SPEC).create();
@@ -147,10 +194,11 @@ class TestFullUpdates {
     List<Long> ids =
         current(table).snapshots().stream().map(Snapshot::snapshotId).collect(Collectors.toList());
     long head = table.currentSnapshot().snapshotId();
+    table.manageSnapshots().createTag("t", head).commit();
     Transaction txn = table.newTransaction();
     txn.expireSnapshots().expireSnapshotId(ids.get(0)).expireSnapshotId(ids.get(1))
         .cleanExpiredFiles(false).commit();
-    txn.updateStatistics().setStatistics(statistics(head)).commit();
+    txn.manageSnapshots().removeTag("t").commit();
     txn.commitTransaction();
 
     TableMetadata loaded = current(catalog(mode).loadTable(TABLE));
@@ -202,19 +250,20 @@ class TestFullUpdates {
         .set("fz.k2", "v4")
         .commit();
     assertThat(current(tm).properties()).hasSize(11);
-    // A statistics change takes full mode; the property comes last, so the writer's builder adds
-    // it to a map sized for the others
+    // A removed ref takes full mode; the property comes last, so the writer's builder adds it to a
+    // map sized for the others
     Table again = ml.loadTable(TABLE);
     long head = again.currentSnapshot().snapshotId();
+    again.manageSnapshots().createTag("t", head).commit();
     Transaction txn = again.newTransaction();
-    txn.updateStatistics().setStatistics(statistics(head)).commit();
+    txn.manageSnapshots().removeTag("t").commit();
     txn.updateProperties().set("fz.big", "v").commit();
     txn.commitTransaction();
 
     TableMetadata loaded = current(catalog(mode).loadTable(TABLE));
     assertThat(loaded.snapshots()).hasSize(3);
     assertThat(loaded.properties()).hasSize(12);
-    assertThat(loaded.statisticsFiles()).hasSize(1);
+    assertThat(loaded.refs()).containsOnlyKeys("main");
     readsAsAFreshCatalog(ml, mode);
     if (!mode.sharedLog) {
       assertThat(fullUpdates()).last().satisfies(update -> assertThat(update.headOnly).isTrue());

@@ -113,6 +113,16 @@ public class InlineDeltaCodec {
   private static final int REMOVE_SCHEMA_IDS = 1;
   private static final int REMOVE_SPEC_IDS = 1;
 
+  // Statistics files set and removed, by snapshot (TableMetadata.Builder's)
+  private static final int UPDATE_SET_STATISTICS = 16;
+  private static final int UPDATE_REMOVE_STATISTICS = 17;
+  private static final int UPDATE_SET_PARTITION_STATISTICS = 18;
+  private static final int UPDATE_REMOVE_PARTITION_STATISTICS = 19;
+  private static final int SET_STATS_JSON = 1;
+  private static final int REMOVE_STATS_SNAPSHOT_ID = 1;
+  private static final int SET_PART_STATS_JSON = 1;
+  private static final int REMOVE_PART_STATS_SNAPSHOT_ID = 1;
+
   // SetTableProperties field numbers
   private static final int SET_PROPS_UPDATED = 1;
   private static final int SET_PROPS_REMOVED = 2;
@@ -1206,14 +1216,8 @@ public class InlineDeltaCodec {
       updates.add(new SetLocationUpdate(newMeta.location()));
     }
 
-    // Statistics-file changes have no DeltaUpdate type yet. If they differ,
-    // fall back to "full" mode by returning null; full-mode serializes the
-    // entire TableMetadata (including stats), so the change survives.
-    // Mixed commits (stats + a delta-representable change) lose the size
-    // benefit of delta mode but never lose the stats themselves.
-    if (statisticsChanged(oldMeta, newMeta)) {
-      return null;
-    }
+    // Statistics files, last: replay removes a snapshot's with the snapshot
+    statisticsUpdates(oldMeta, newMeta, change.removed, updates);
 
     return updates.isEmpty() ? null : updates;
   }
@@ -1409,11 +1413,51 @@ public class InlineDeltaCodec {
     return false;
   }
 
-  private static boolean statisticsChanged(TableMetadata oldMeta, TableMetadata newMeta) {
-    return !new java.util.HashSet<>(oldMeta.statisticsFiles())
-            .equals(new java.util.HashSet<>(newMeta.statisticsFiles()))
-        || !new java.util.HashSet<>(oldMeta.partitionStatisticsFiles())
-            .equals(new java.util.HashSet<>(newMeta.partitionStatisticsFiles()));
+  /**
+   * Adds to {@code updates} the statistics and partition statistics files {@code newMeta} sets
+   * that {@code oldMeta} lacks or has otherwise, in {@code newMeta}'s order (the order its builder
+   * gave them, which replay's builder gives them by setting them in it), then those it removes of
+   * snapshots it keeps: a snapshot the delta removes ({@code removed}) takes its statistics with
+   * it, as {@code TableMetadata.Builder.removeSnapshots} drops them.
+   */
+  private static void statisticsUpdates(
+      TableMetadata oldMeta,
+      TableMetadata newMeta,
+      java.util.Collection<Long> removed,
+      List<DeltaUpdate> updates) {
+    Map<Long, org.apache.iceberg.StatisticsFile> was = new HashMap<>();
+    for (org.apache.iceberg.StatisticsFile file : oldMeta.statisticsFiles()) {
+      was.put(file.snapshotId(), file);
+    }
+    Set<Long> kept = new HashSet<>();
+    for (org.apache.iceberg.StatisticsFile file : newMeta.statisticsFiles()) {
+      kept.add(file.snapshotId());
+      if (!file.equals(was.get(file.snapshotId()))) {
+        updates.add(new SetStatisticsUpdate(file));
+      }
+    }
+    Map<Long, org.apache.iceberg.PartitionStatisticsFile> wasPartition = new HashMap<>();
+    for (org.apache.iceberg.PartitionStatisticsFile file : oldMeta.partitionStatisticsFiles()) {
+      wasPartition.put(file.snapshotId(), file);
+    }
+    Set<Long> keptPartition = new HashSet<>();
+    for (org.apache.iceberg.PartitionStatisticsFile file : newMeta.partitionStatisticsFiles()) {
+      keptPartition.add(file.snapshotId());
+      if (!file.equals(wasPartition.get(file.snapshotId()))) {
+        updates.add(new SetPartitionStatisticsUpdate(file));
+      }
+    }
+    Set<Long> gone = new HashSet<>(removed);
+    for (Long snapshotId : was.keySet()) {
+      if (!kept.contains(snapshotId) && !gone.contains(snapshotId)) {
+        updates.add(new RemoveStatisticsUpdate(snapshotId));
+      }
+    }
+    for (Long snapshotId : wasPartition.keySet()) {
+      if (!keptPartition.contains(snapshotId) && !gone.contains(snapshotId)) {
+        updates.add(new RemovePartitionStatisticsUpdate(snapshotId));
+      }
+    }
   }
 
   /**
@@ -1799,6 +1843,62 @@ public class InlineDeltaCodec {
     public void applyTo(TableMetadata.Builder builder) {
       new org.apache.iceberg.MetadataUpdate.RemovePartitionSpecs(new HashSet<>(specIds))
           .applyTo(builder);
+    }
+  }
+
+  /** A snapshot's statistics file, which replaces any it had. */
+  public static class SetStatisticsUpdate implements DeltaUpdate {
+    public final org.apache.iceberg.StatisticsFile file;
+
+    public SetStatisticsUpdate(org.apache.iceberg.StatisticsFile file) {
+      this.file = file;
+    }
+
+    @Override
+    public void applyTo(TableMetadata.Builder builder) {
+      builder.setStatistics(file);
+    }
+  }
+
+  /** The snapshot's statistics file removed, if it has one. */
+  public static class RemoveStatisticsUpdate implements DeltaUpdate {
+    public final long snapshotId;
+
+    public RemoveStatisticsUpdate(long snapshotId) {
+      this.snapshotId = snapshotId;
+    }
+
+    @Override
+    public void applyTo(TableMetadata.Builder builder) {
+      builder.removeStatistics(snapshotId);
+    }
+  }
+
+  /** A snapshot's partition statistics file, which replaces any it had. */
+  public static class SetPartitionStatisticsUpdate implements DeltaUpdate {
+    public final org.apache.iceberg.PartitionStatisticsFile file;
+
+    public SetPartitionStatisticsUpdate(org.apache.iceberg.PartitionStatisticsFile file) {
+      this.file = file;
+    }
+
+    @Override
+    public void applyTo(TableMetadata.Builder builder) {
+      builder.setPartitionStatistics(file);
+    }
+  }
+
+  /** The snapshot's partition statistics file removed, if it has one. */
+  public static class RemovePartitionStatisticsUpdate implements DeltaUpdate {
+    public final long snapshotId;
+
+    public RemovePartitionStatisticsUpdate(long snapshotId) {
+      this.snapshotId = snapshotId;
+    }
+
+    @Override
+    public void applyTo(TableMetadata.Builder builder) {
+      builder.removePartitionStatistics(snapshotId);
     }
   }
 
@@ -2320,6 +2420,34 @@ public class InlineDeltaCodec {
       }
       writeLengthDelimited(out, UPDATE_REMOVE_PARTITION_SPECS, inner.toByteArray());
 
+    } else if (update instanceof SetStatisticsUpdate) {
+      SetStatisticsUpdate u = (SetStatisticsUpdate) update;
+      ByteArrayOutputStream inner = new ByteArrayOutputStream();
+      writeBytes(inner, SET_STATS_JSON, InlineMetadataIO.gzip(
+          org.apache.iceberg.InlineStatisticsParser.toJson(u.file)
+              .getBytes(StandardCharsets.UTF_8)));
+      writeLengthDelimited(out, UPDATE_SET_STATISTICS, inner.toByteArray());
+
+    } else if (update instanceof RemoveStatisticsUpdate) {
+      RemoveStatisticsUpdate u = (RemoveStatisticsUpdate) update;
+      ByteArrayOutputStream inner = new ByteArrayOutputStream();
+      writeFixed64(inner, REMOVE_STATS_SNAPSHOT_ID, u.snapshotId);
+      writeLengthDelimited(out, UPDATE_REMOVE_STATISTICS, inner.toByteArray());
+
+    } else if (update instanceof SetPartitionStatisticsUpdate) {
+      SetPartitionStatisticsUpdate u = (SetPartitionStatisticsUpdate) update;
+      ByteArrayOutputStream inner = new ByteArrayOutputStream();
+      writeBytes(inner, SET_PART_STATS_JSON, InlineMetadataIO.gzip(
+          org.apache.iceberg.InlineStatisticsParser.toJson(u.file)
+              .getBytes(StandardCharsets.UTF_8)));
+      writeLengthDelimited(out, UPDATE_SET_PARTITION_STATISTICS, inner.toByteArray());
+
+    } else if (update instanceof RemovePartitionStatisticsUpdate) {
+      RemovePartitionStatisticsUpdate u = (RemovePartitionStatisticsUpdate) update;
+      ByteArrayOutputStream inner = new ByteArrayOutputStream();
+      writeFixed64(inner, REMOVE_PART_STATS_SNAPSHOT_ID, u.snapshotId);
+      writeLengthDelimited(out, UPDATE_REMOVE_PARTITION_STATISTICS, inner.toByteArray());
+
     } else if (update instanceof AddSnapshotUpdate) {
       AddSnapshotUpdate u = (AddSnapshotUpdate) update;
       ByteArrayOutputStream inner = new ByteArrayOutputStream();
@@ -2431,6 +2559,19 @@ public class InlineDeltaCodec {
         return decodeRemoveSchemas(updateBytes);
       case UPDATE_REMOVE_PARTITION_SPECS:
         return decodeRemovePartitionSpecs(updateBytes);
+      case UPDATE_SET_STATISTICS:
+        return new SetStatisticsUpdate(org.apache.iceberg.InlineStatisticsParser.statisticsFromJson(
+            decodeJsonField(updateBytes, SET_STATS_JSON)));
+      case UPDATE_REMOVE_STATISTICS:
+        return new RemoveStatisticsUpdate(decodeSnapshotIdField(
+            updateBytes, REMOVE_STATS_SNAPSHOT_ID));
+      case UPDATE_SET_PARTITION_STATISTICS:
+        return new SetPartitionStatisticsUpdate(
+            org.apache.iceberg.InlineStatisticsParser.partitionStatisticsFromJson(
+                decodeJsonField(updateBytes, SET_PART_STATS_JSON)));
+      case UPDATE_REMOVE_PARTITION_STATISTICS:
+        return new RemovePartitionStatisticsUpdate(decodeSnapshotIdField(
+            updateBytes, REMOVE_PART_STATS_SNAPSHOT_ID));
       case UPDATE_ADD_SNAPSHOT:
         return decodeAddSnapshot(updateBytes);
       case UPDATE_ADD_MANIFEST:
@@ -2732,6 +2873,43 @@ public class InlineDeltaCodec {
       else { skipField(in, tag & 0x7); }
     }
     return new RemoveSchemasUpdate(ids);
+  }
+
+  /** The gzipped JSON of field {@code field} of an update's message. */
+  private static String decodeJsonField(byte[] bytes, int field) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    String json = null;
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      if ((tag >>> 3) == field) {
+        json = new String(
+            InlineMetadataIO.gunzip(readLengthDelimitedBytes(in)), StandardCharsets.UTF_8);
+      } else {
+        skipField(in, tag & 0x7);
+      }
+    }
+    if (json == null) {
+      throw new IOException("A statistics update without its file");
+    }
+    return json;
+  }
+
+  /** The fixed64 snapshot id of field {@code field} of an update's message. */
+  private static long decodeSnapshotIdField(byte[] bytes, int field) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    Long snapshotId = null;
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      if ((tag >>> 3) == field) {
+        snapshotId = readFixed64(in);
+      } else {
+        skipField(in, tag & 0x7);
+      }
+    }
+    if (snapshotId == null) {
+      throw new IOException("A statistics removal without its snapshot");
+    }
+    return snapshotId;
   }
 
   private static RemovePartitionSpecsUpdate decodeRemovePartitionSpecs(byte[] bytes)

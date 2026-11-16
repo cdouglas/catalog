@@ -115,6 +115,10 @@ public class TestFormatExplorer {
     delta.put("REMOVE_MF_", "RemoveManifestDelta");
     delta.put("REMOVE_SCHEMA_", "RemoveSchemas");
     delta.put("REMOVE_SPEC_", "RemovePartitionSpecs");
+    delta.put("SET_STATS_", "SetStatistics");
+    delta.put("REMOVE_STATS_", "RemoveStatistics");
+    delta.put("SET_PART_STATS_", "SetPartitionStatistics");
+    delta.put("REMOVE_PART_STATS_", "RemovePartitionStatistics");
     delta.put("SET_PROPS_", "SetTableProperties");
     delta.put("SET_LOC_", "SetTableLocation");
     delta.put("ADD_SCHEMA_", "AddSchema");

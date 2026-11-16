@@ -48,14 +48,18 @@ import org.apache.iceberg.io.InlineDeltaCodec.DecodedDelta;
 import org.apache.iceberg.io.InlineDeltaCodec.DeltaUpdate;
 import org.apache.iceberg.io.InlineDeltaCodec.RemoveManifestUpdate;
 import org.apache.iceberg.io.InlineDeltaCodec.RemovePartitionSpecsUpdate;
+import org.apache.iceberg.io.InlineDeltaCodec.RemovePartitionStatisticsUpdate;
 import org.apache.iceberg.io.InlineDeltaCodec.RemoveSchemasUpdate;
 import org.apache.iceberg.io.InlineDeltaCodec.RemoveSnapshotsUpdate;
+import org.apache.iceberg.io.InlineDeltaCodec.RemoveStatisticsUpdate;
 import org.apache.iceberg.io.InlineDeltaCodec.SetCurrentSchemaUpdate;
 import org.apache.iceberg.io.InlineDeltaCodec.SetDefaultSortOrderUpdate;
 import org.apache.iceberg.io.InlineDeltaCodec.SetDefaultSpecUpdate;
 import org.apache.iceberg.io.InlineDeltaCodec.SetLocationUpdate;
+import org.apache.iceberg.io.InlineDeltaCodec.SetPartitionStatisticsUpdate;
 import org.apache.iceberg.io.InlineDeltaCodec.SetPropertiesUpdate;
 import org.apache.iceberg.io.InlineDeltaCodec.SetSnapshotRefUpdate;
+import org.apache.iceberg.io.InlineDeltaCodec.SetStatisticsUpdate;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
@@ -273,7 +277,7 @@ final class NativeDelta {
     Chain<HistoryEntry> snapshotLog = base.snapshotLog;
     Map<String, SnapshotRef> refs = null; // copied on the first change
     Map<String, String> properties = null; // likewise
-    // The builder's statistics, by snapshot, as it indexes them: made on the first removal
+    // The builder's statistics, by snapshot, as it indexes them: made on the first change
     Map<Long, List<StatisticsFile>> statistics = null;
     Map<Long, List<PartitionStatisticsFile>> partitionStatistics = null;
     boolean changed = false;
@@ -420,6 +424,38 @@ final class NativeDelta {
             refs.remove(name);
           }
           changed = true;
+        }
+      } else if (update instanceof SetStatisticsUpdate) {
+        // TableMetadata.Builder.setStatistics: the snapshot's file, replacing any it had
+        StatisticsFile file = ((SetStatisticsUpdate) update).file;
+        if (statistics == null) {
+          statistics = indexStatistics(base.statisticsFiles);
+          partitionStatistics = indexPartitionStatistics(base.partitionStatisticsFiles);
+        }
+        statistics.put(file.snapshotId(), ImmutableList.of(file));
+        changed = true;
+      } else if (update instanceof SetPartitionStatisticsUpdate) {
+        // TableMetadata.Builder.setPartitionStatistics
+        PartitionStatisticsFile file = ((SetPartitionStatisticsUpdate) update).file;
+        if (statistics == null) {
+          statistics = indexStatistics(base.statisticsFiles);
+          partitionStatistics = indexPartitionStatistics(base.partitionStatisticsFiles);
+        }
+        partitionStatistics.put(file.snapshotId(), ImmutableList.of(file));
+        changed = true;
+      } else if (update instanceof RemoveStatisticsUpdate
+          || update instanceof RemovePartitionStatisticsUpdate) {
+        // TableMetadata.Builder.removeStatistics and removePartitionStatistics: no change where
+        // the snapshot has none
+        if (statistics == null) {
+          statistics = indexStatistics(base.statisticsFiles);
+          partitionStatistics = indexPartitionStatistics(base.partitionStatisticsFiles);
+        }
+        if (update instanceof RemoveStatisticsUpdate) {
+          changed |= statistics.remove(((RemoveStatisticsUpdate) update).snapshotId) != null;
+        } else {
+          changed |= partitionStatistics.remove(
+              ((RemovePartitionStatisticsUpdate) update).snapshotId) != null;
         }
       } else if (headUpdate(update)) {
         headUpdates.add(update);
