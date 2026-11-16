@@ -21,7 +21,7 @@ RT=intentlog-core/src/main/java/org/intentlog/LogRuntime.java
 
 prepare() {
   tries $1/intentlog-fileio/src/test/java/org/intentlog/fileio/TestAtomicFileCommitProtocol.java 300000
-  tries $1/iceberg-fileio-catalog/src/test/java/org/apache/iceberg/io/spec/TestMultiWriterProperties.java 3000
+  tries $1/iceberg-fileio-catalog/src/test/java/org/apache/iceberg/io/spec/TestMultiWriterProperties.java each 3000
 }
 
 mutant() { # name main-dir test-dir (the catalog's; these mutants are intentlog's)
