@@ -57,7 +57,7 @@ import org.apache.iceberg.io.SupportsPrefixOperations;
  * {@code S3InputStream} skips a short one) ends it, and the next read is a GET from there, of the
  * version the first served. A GET that fails (a version gone, no object) takes a request's round
  * trip, and so does a lookup of no object. So a lookup after an open
- * and before the first read is a HEAD, as on S3 (errata D23). A file is bound by a lookup, by a
+ * and before the first read is a HEAD, as on S3. A file is bound by a lookup, by a
  * write that returned it, and by its first GET where the store's reads record their version
  * ({@link #readsRecordVersion}: the profile's, S3's and Azure's, and the store's): then a lookup
  * after the GET sends nothing, as the fork's S3 and ADLS files keep what a GET reported. A file

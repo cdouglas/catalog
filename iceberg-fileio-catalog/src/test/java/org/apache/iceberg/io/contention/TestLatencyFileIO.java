@@ -67,7 +67,7 @@ class TestLatencyFileIO {
     }
   }
 
-  /** Opening a stream binds nothing: a lookup before its first read is a HEAD (errata D23). */
+  /** Opening a stream binds nothing: a lookup before its first read is a HEAD. */
   @Test
   void aLookupAfterAnOpenIsAHeadAndAWholeReadOneGetOfEveryByte() throws IOException {
     InputFile file = io.newInputFile(CATALOG);
@@ -84,7 +84,7 @@ class TestLatencyFileIO {
   }
 
   /**
-   * A lookup takes the profile's HEAD where it measures one (errata D23): azure-2026-11's Get
+   * A lookup takes the profile's HEAD where it measures one: azure-2026-11's Get
    * Properties, 5.85 ms at the median, not a GET of nothing, 9.84 ms.
    */
   @Test

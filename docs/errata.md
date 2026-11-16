@@ -432,21 +432,6 @@ elsewhere and a typed encoder removes it from the wire format
 altogether. PartitionSpec is the cheaper of the two to lift next if a
 workload motivates it independently.
 
-### D23. A stock client looks a manifest list up before it reads it
-
-A stock Iceberg client reads an Avro manifest list with a HEAD and a GET:
-`AvroIterable` opens a stream, then asks the file's length, and Iceberg's S3
-and ADLS input files look the length up with a HEAD whatever their streams
-read. So JDBC, Polaris and FileIOCatalog's pointer and inline-TM modes pay a
-HEAD a manifest-list read, on the stores and in the latency models alike
-(catalog-bench's `ModelStore`, fileio-catalog's `LatencyFileIO`, which charge
-a HEAD at the profile's HEAD latency). Avro's length asked lazily, and a file
-that keeps the length its GET reported, would save it for every client.
-`core-perf` does not make the fix.
-
-**Trigger to revisit:** a paper comparison whose clients' manifest-list reads
-differ, or a performance fix for every client on `core-perf`.
-
 ### D25. A fold copies each table-keyed map a record changes (perf)
 
 A fold onto a replica copies only what its records change (a builder shares
