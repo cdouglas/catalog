@@ -218,6 +218,27 @@ public final class SegmentedLog implements SharedLog {
     return prefix + "/" + name;
   }
 
+  /** Where an Install's segment is: at the location it names, else under the prefix. */
+  private String path(Seg seg) {
+    return path(seg.name(), seg.location());
+  }
+
+  /**
+   * Where segment {@code name} is: at {@code location}, a URL in the store, if one is given (a
+   * segment a migration left at another prefix keeps its place), else under the log's prefix.
+   */
+  private String path(String name, String location) {
+    if (location.isEmpty()) {
+      return path(name);
+    }
+    try {
+      return store.nameAt(location);
+    } catch (IllegalArgumentException e) {
+      throw new IllegalStateException(this + "'s catalog object names segment " + name + " at "
+          + location + ", which its store cannot reach", e);
+    }
+  }
+
   private static String segmentName(long ordinal) {
     return String.format("seg-%020d-%016x", ordinal, ThreadLocalRandom.current().nextLong());
   }
@@ -410,7 +431,7 @@ public final class SegmentedLog implements SharedLog {
       boolean ended = count >= seg.limit();
       SegmentPosition segEnd = new SegmentPosition(o, count, offset);
       if (!ended) {
-        SegmentStore.Segment s = store.read(path(seg.name()), offset);
+        SegmentStore.Segment s = store.read(path(seg), offset);
         if (s == null || s.length() < offset) {
           return null;
         }
@@ -430,7 +451,7 @@ public final class SegmentedLog implements SharedLog {
         }
         ended |= count >= seg.limit();
         if (!ended && s.blocks() >= store.maxBlocks()) {
-          throw new IllegalStateException("SG8: " + path(seg.name()) + " holds " + s.blocks()
+          throw new IllegalStateException("SG8: " + path(seg) + " holds " + s.blocks()
               + " blocks, " + count + " of them records, and has not ended");
         }
       }
@@ -598,7 +619,7 @@ public final class SegmentedLog implements SharedLog {
       byte[] frame = SegmentFrames.record(record, o);
       SegmentStore.Appended a;
       try {
-        a = store.append(path(seg.name()), frame);
+        a = store.append(path(seg), frame);
       } catch (SegmentStore.Full e) {
         skip.add(seg.name()); // nothing landed; the segment ends without this record
         o++;
@@ -609,7 +630,7 @@ public final class SegmentedLog implements SharedLog {
         Cat fresh = existing();
         Seg again = fresh.seg(o);
         if (again != null && again.name().equals(seg.name())) {
-          throw new IllegalStateException("SG4: the catalog object names " + path(seg.name())
+          throw new IllegalStateException("SG4: the catalog object names " + path(seg)
               + ", which does not exist", e);
         }
         c = fresh;
@@ -660,7 +681,7 @@ public final class SegmentedLog implements SharedLog {
   private Copy sendCopy(Seg seg, byte[] record) {
     byte[] frame = SegmentFrames.record(record, seg.ordinal());
     try {
-      SegmentStore.Appended a = store.append(path(seg.name()), frame);
+      SegmentStore.Appended a = store.append(path(seg), frame);
       return a.blocks() > seg.limit() ? null : new Copy(seg.ordinal(), seg.name(), a.offset(),
           a.blocks(), frame.length, SegmentFrames.crcOf(frame));
     } catch (SegmentStore.Full | SegmentStore.NotFound | SegmentStore.Refused e) {
@@ -728,7 +749,7 @@ public final class SegmentedLog implements SharedLog {
   /** Appends a seal frame to {@code seg}: it ends there, if it hasn't. */
   private void seal(Seg seg) {
     try {
-      store.append(path(seg.name()), SegmentFrames.seal(seg.ordinal()));
+      store.append(path(seg), SegmentFrames.seal(seg.ordinal()));
     } catch (RuntimeException e) {
       // full (ended), gone (retired), or of unknown outcome: the next walk says
     }
@@ -1001,7 +1022,7 @@ public final class SegmentedLog implements SharedLog {
       return true;
     }
     try {
-      store.delete(path(r.name()));
+      store.delete(path(r.name(), r.location()));
     } catch (RuntimeException e) {
       return false;
     }

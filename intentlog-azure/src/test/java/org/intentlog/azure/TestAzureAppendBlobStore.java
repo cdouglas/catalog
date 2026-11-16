@@ -139,6 +139,24 @@ class TestAzureAppendBlobStore {
     assertThat(primary.maxBlockBytes()).isEqualTo(100L << 20);
   }
 
+  /** A location names its blob back, its name decoded; another container's names none. */
+  @Test
+  void aLocationNamesItsBlob() {
+    AppendBlobStore primary =
+        AzureAppendBlobStore.create("https://acct.blob.core.windows.net/logs", CREDENTIAL);
+    String name = "old prefix/seg-00000000000000000001-00000000000000ff";
+    assertThat(primary.location(name)).contains("old%20prefix/seg-");
+    assertThat(primary.nameAt(primary.location(name))).isEqualTo(name);
+    assertThatThrownBy(() -> primary.nameAt("https://acct.blob.core.windows.net/other/seg"))
+        .isInstanceOf(IllegalArgumentException.class);
+    assertThatThrownBy(() -> primary.nameAt("https://acct.blob.core.windows.net/logs/"))
+        .isInstanceOf(IllegalArgumentException.class);
+    InMemoryAppendBlobStore memory = new InMemoryAppendBlobStore();
+    assertThat(memory.nameAt(memory.location(name))).isEqualTo(name);
+    assertThatThrownBy(() -> memory.nameAt(primary.location(name)))
+        .isInstanceOf(IllegalArgumentException.class);
+  }
+
   @Test
   void createsAnAppendBlobOnceWithItsMetadata() {
     azurite();

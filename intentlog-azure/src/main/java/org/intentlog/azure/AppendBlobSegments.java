@@ -92,6 +92,11 @@ public final class AppendBlobSegments implements SegmentStore {
   }
 
   @Override
+  public String nameAt(String location) {
+    return store.nameAt(location);
+  }
+
+  @Override
   public long maxBlocks() {
     return store.maxBlocks();
   }

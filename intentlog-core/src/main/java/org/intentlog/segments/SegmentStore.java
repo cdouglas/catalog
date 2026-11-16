@@ -67,6 +67,16 @@ public interface SegmentStore {
     return null;
   }
 
+  /**
+   * The name of the segment at {@code location}, a URL as {@link #location} gives one: where an
+   * entry that names a location in place of a name under the log's prefix finds its segment.
+   *
+   * @throws IllegalArgumentException if the location is not one of this store's
+   */
+  default String nameAt(String location) {
+    throw new IllegalArgumentException("This store names no locations: " + location);
+  }
+
   /** The most blocks a segment holds (Azure: 50,000). */
   long maxBlocks();
 

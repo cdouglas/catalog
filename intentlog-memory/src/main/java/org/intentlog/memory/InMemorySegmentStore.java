@@ -254,6 +254,14 @@ public final class InMemorySegmentStore implements SegmentStore {
     return "memory:/" + name;
   }
 
+  @Override
+  public String nameAt(String location) {
+    if (!location.startsWith("memory:/")) {
+      throw new IllegalArgumentException("Not a location in memory: " + location);
+    }
+    return location.substring("memory:/".length());
+  }
+
   // ============================================================
   // Faults
   // ============================================================

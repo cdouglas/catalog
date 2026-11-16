@@ -43,8 +43,12 @@ counts as a lost race (D4).
 | Segment | `<prefix>/<name>`, or the location its Install names | segment frames (below) | blind appends through the segment store |
 | Page | `<warehouse>/catalog.committed/` | unchanged | unchanged |
 
-`<prefix>` is `fileio.catalog.log.location`. A segment's name is
-`seg-<ordinal>-<nonce>`, with a fresh nonce, as in v1 (AZ4). Only an installer creates a segment, and only before it sends the
+`<prefix>` is `fileio.catalog.log.location`. An entry that names a location (a URL in the
+segment store, `SegmentStore.nameAt`) finds its segment there, not under the prefix: a log never
+writes one, but a migration that moves the prefix writes them for the segments it leaves at the
+old one, so they are read, appended to, sealed and deleted where they are. A location the store
+can't reach (another container's) fails the read rather than read under the prefix. A
+segment's name is `seg-<ordinal>-<nonce>`, with a fresh nonce, as in v1 (AZ4). Only an installer creates a segment, and only before it sends the
 Install. A writer that finds a segment missing never creates it. A catalog object
 holds segment records only when the log keeps segments. A log without a segment store
 writes format 3, as today.
@@ -70,11 +74,16 @@ message InstallSegment {
 message RetiredSegment {
   uint64 ordinal = 1;
   string name = 2;
-  string location = 3;
+  string location = 3;  // its Install's: the only reference to it once the Install is gone
   bytes end = 4;              // the position after its last record
   fixed64 retired_at_ms = 5;  // the compactor's clock when it retired it
 }
 ```
+
+A Retired entry keeps its Install's name and location because a checkpoint drops the
+Install: from then on the entry is the only thing that says where the segment is, and the one
+reference a deletion can follow without listing, while a listing of the prefix can't find a
+segment at another location at all.
 
 `LogRecord.body` gains `InstallSegment install_segment = 5`,
 `RetiredSegment retired_segment = 6`, and `bytes checkpoint_through = 7`: the position
@@ -276,15 +285,15 @@ GC record, read through it, PageOuts, `putCheckpoint`, `trim`.
   - a `RetiredSegment` for each segment before `through`'s ordinal that the object
     named: those newly retired, with now's time and their end, and the older entries
     but those it deleted. It deletes the segment of each older entry whose TTL has
-    passed, by the name the entry holds, before the replace drops the entry, and keeps
+    passed, where the entry locates it, before the replace drops the entry, and keeps
     the entry of one whose delete failed: an entry is its segment's only reference that
     needs no listing to follow.
 
   A CAS that loses (an Install landed) reads again and retries. The replace never
   carries records, so appends to segments never race a compaction.
 - **`trim(through)`** is the sweep. It deletes each retired segment whose TTL
-  (`fileio.catalog.log.retire.ttl.ms`) has passed since `retired_at_ms`, by the name
-  its entry holds. Then it lists the prefix and deletes unnamed blobs (those of
+  (`fileio.catalog.log.retire.ttl.ms`) has passed since `retired_at_ms`, where its
+  entry locates it. Then it lists the prefix and deletes unnamed blobs (those of
   installers that lost and failed to delete them, creators' leftovers) whose ordinal is
   at most the newest Install's. No Install of that ordinal can land any more, since
   replay takes only the next ordinal, so no Install in flight names one. The rule needs
@@ -407,7 +416,8 @@ As LOG.md "Testing a provider", per stage:
   don't.
 - **Mutants** (`fuzz/mutants/segments.sh`): each switch above, put in the code, fails
   the fuzzer; a checkpoint that drops an expired Retired entry without deleting its
-  segment (`dropretired`, a leak) fails `TestSegmentedLog`.
+  segment (`dropretired`, a leak) and a log that ignores an entry's location
+  (`nolocation`) fail `TestSegmentedLog`.
 - **Catalog suites**: `TestLocalCatalog*` in the `AZLOG*` modes. Also
   `TestCatalogFaultProperties` and `TestCatalogRaceProperties`, whose Append Blob draws
   open the new log.
@@ -456,7 +466,7 @@ The conditional ablation on segments is [Later](#later).
 
 Built on branch `log-segments` (2026-11-15): stages 0 to 4, stage 3 within stage 2.
 catalog-bench's `sut-fileio` opens the segmented log too (its branch `log-segments`). Locally,
-the fuzzer passes 2,000 tries on four seeds; of `fuzz/mutants/segments.sh` nine mutants are
+the fuzzer passes 2,000 tries on four seeds; of `fuzz/mutants/segments.sh` ten mutants are
 caught and `fastvoid` is equivalent; the catalog's suites (the `AZLOG` modes among them) and the
 fault and race properties pass. `AzureLogCatalogIT` passed on the real account with a SAS that
 cannot list (450 tests). A havoc round is next.

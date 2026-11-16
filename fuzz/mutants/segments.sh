@@ -7,13 +7,14 @@
 # replay's refusal of a provider record in a view (TestReplay). Three are the Java's own:
 # fastvoid, the read through an append that skips its read when the reply puts the copy at the
 # kept view's end, past its segment's limit; lastcopy, the read through deciding by the last
-# copy the log holds rather than the first; and dropretired, a checkpoint dropping a Retired
-# entry past its TTL without deleting its segment (a leak where the sweep can't list; caught by
-# TestSegmentedLog). fastvoid is equivalent (2026-11-15, 2,000 tries locally): an append whose
-# reply puts it past the limit is void with no read and never in a receipt, and a receipt whose
-# store can't say the index has none for the fast path to match. Locally at 2,000 tries the
-# other nine are caught, dropretired by TestSegmentedLog and the rest by the fuzzer.
-MUTANTS="readahead voidack createonmissing sweepearly sweepinflight sdkretry overlimit fastvoid lastcopy dropretired"
+# copy the log holds rather than the first; dropretired, a checkpoint dropping a Retired entry
+# past its TTL without deleting its segment (a leak where the sweep can't list); and nolocation,
+# an entry's location ignored for a name under the prefix (only a migration writes one).
+# fastvoid is equivalent (2026-11-15, 2,000 tries locally): an append whose reply puts it past
+# the limit is void with no read and never in a receipt, and a receipt whose store can't say the
+# index has none for the fast path to match. Locally at 2,000 tries the other ten are caught,
+# dropretired and nolocation by TestSegmentedLog and the rest by the fuzzer.
+MUTANTS="readahead voidack createonmissing sweepearly sweepinflight sdkretry overlimit fastvoid lastcopy dropretired nolocation"
 EQUIVALENT="fastvoid"
 ORACLES=TestSegmentedCommitProtocol,TestSegmentedLog
 
@@ -40,7 +41,7 @@ mutant() { # name main-dir test-dir (the catalog's; these mutants are intentlog'
     voidack) mutate $SL "        return VOID; // its segment ended before it" "        return acc.extend(new View(acc.tail, null, acc.tail.position, List.of(record),
             new long[] {cp.ordinal}, new long[] {cp.offset}));" ;;
     # TLA+ createonmissing: a writer that finds its segment gone creates it and sends again
-    createonmissing) mutate $SL "        // a stale catalog object: the segment was retired and swept. Never create it (SG4)." "        store.create(path(seg.name()));
+    createonmissing) mutate $SL "        // a stale catalog object: the segment was retired and swept. Never create it (SG4)." "        store.create(path(seg));
         if (Boolean.TRUE) {
           continue;
         }" ;;
@@ -50,11 +51,15 @@ mutant() { # name main-dir test-dir (the catalog's; these mutants are intentlog'
     sweepinflight) mutate $SL "      if (ordinal >= 0 && ordinal <= newest && !named.contains(name)) {" "      if (ordinal >= 0 && !named.contains(name)) {" ;;
     # a checkpoint drops a Retired entry past its TTL without deleting its segment
     dropretired) mutate $SL "        if (!expired(old, now) || !deleteRetired(old, deleted)) {" "        if (!expired(old, now)) {" ;;
+    # an entry's location ignored: the segment is looked for under the prefix
+    nolocation) mutate $SL "    if (location.isEmpty()) {
+      return path(name);" "    if (true) {
+      return path(name);" ;;
     # TLA+ sdkretry: an append whose reply was lost is sent again below the runtime
-    sdkretry) mutate $SL "        a = store.append(path(seg.name()), frame);" "        try {
-          a = store.append(path(seg.name()), frame);
+    sdkretry) mutate $SL "        a = store.append(path(seg), frame);" "        try {
+          a = store.append(path(seg), frame);
         } catch (UncheckedIOException | SegmentStore.Throttled retried) {
-          a = store.append(path(seg.name()), frame);
+          a = store.append(path(seg), frame);
         }" ;;
     # TLA+ overlimit: Installs set a limit one past the store's block limit
     overlimit) mutate $SL "    this.limit = options.limit() > 0 ? options.limit() : store.maxBlocks();

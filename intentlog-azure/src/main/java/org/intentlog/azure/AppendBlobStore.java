@@ -109,6 +109,19 @@ public interface AppendBlobStore {
     return null;
   }
 
+  /**
+   * The name of the blob at {@code location}, a URL as {@link #location} gives one.
+   *
+   * @throws IllegalArgumentException if the location is not in this store (another container's)
+   */
+  default String nameAt(String location) {
+    String base = location("");
+    if (base == null || !location.startsWith(base) || location.length() == base.length()) {
+      throw new IllegalArgumentException("Not a location in " + this + ": " + location);
+    }
+    return location.substring(base.length());
+  }
+
   /** The most blocks an Append Blob holds (Azure: 50,000). */
   default int maxBlocks() {
     return 50_000;

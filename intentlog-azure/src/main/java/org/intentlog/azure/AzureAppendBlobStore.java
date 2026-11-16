@@ -445,6 +445,16 @@ public final class AzureAppendBlobStore implements AppendBlobStore {
     return container.getBlobContainerUrl() + "/" + Utility.urlEncode(name).replace("%2F", "/");
   }
 
+  /** The blob's name, decoded, if {@code location} is in this container. */
+  @Override
+  public String nameAt(String location) {
+    String base = container.getBlobContainerUrl() + "/";
+    if (!location.startsWith(base) || location.length() == base.length()) {
+      throw new IllegalArgumentException("Not a location in " + base + ": " + location);
+    }
+    return Utility.urlDecode(location.substring(base.length()));
+  }
+
   /** 4 MiB for a client pinned to a service version before 2022-11-02, 100 MiB since. */
   @Override
   public long maxBlockBytes() {

@@ -29,6 +29,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
 import org.apache.iceberg.io.InMemoryAtomicFileIO;
 import org.intentlog.LogConflictException;
 import org.intentlog.LogTail;
@@ -275,6 +276,92 @@ class TestSegmentedLog {
     List<String> named = cat.segs().stream().map(seg -> "segs/" + seg.name()).toList();
     assertThat(store.names()).containsExactlyInAnyOrderElementsOf(named);
     assertThat(view.records()).hasSize(2);
+  }
+
+  /**
+   * A segment whose entry names a location is read, appended to, sealed and deleted there, not
+   * under the log's prefix: a log moved to a new prefix keeps the segments its catalog object
+   * locates at the old one, installs new ones under the new, and deletes the old ones by the
+   * locations their Retired entries keep, which the sweep's listing of the new prefix never sees.
+   */
+  @Test
+  void aSegmentIsWhereItsEntryLocatesIt() {
+    SegmentedLog old = log("old", 2, 2); // installs the next ahead at every append
+    LogTail absent = old.probe();
+    old.putCheckpoint(absent, checkpoint(0, absent));
+    byte[] a = record();
+    byte[] b = record();
+    byte[] c = record();
+    for (byte[] r : List.of(a, b, c)) {
+      old.readThrough(old.append(r, null), Duration.ZERO); // 0: a, b; 1: c; 2 installed
+    }
+    relocate(seg -> store.location("old/" + seg.name())); // the move to prefix segs
+
+    SegmentedLog moved = log("segs", 2, 2);
+    assertThat(moved.read().records()).containsExactly(a, b, c);
+    byte[] d = record();
+    moved.readThrough(moved.append(d, null), Duration.ZERO); // ends 1, at old
+    byte[] e = record();
+    moved.readThrough(moved.append(e, null), Duration.ZERO); // 2, at old; installs 3 at segs
+    assertThat(store.names()).filteredOn(n -> n.startsWith("segs/")).hasSize(1);
+    String three = segmentIn("segs", 3);
+    byte[] f = record();
+    byte[] frame = SegmentFrames.record(f, 3);
+    SegmentStore.Appended at = store.append(three, frame);
+    Receipt later = new SegmentedLog.SegReceipt(LOG_ID, List.of(new SegmentedLog.Copy(3,
+        three.substring("segs/".length()), at.offset(), at.blocks(), frame.length,
+        SegmentFrames.crcOf(frame))), f);
+    assertThat(moved.readThrough(later, Duration.ZERO).records())
+        .containsExactly(a, b, c, d, e, f); // seals 2, at old
+    byte[] two = store.peek(segmentIn("old", 2));
+    assertThat(SegmentFrames.parse(two, two.length, 0, 2))
+        .extracting(SegmentFrames.Frame::seal).containsExactly(false, true);
+    assertThat(log("segs", 2, 0).read().records()).containsExactly(a, b, c, d, e, f);
+
+    LogTail through = moved.read().tail(); // in 3
+    moved.putCheckpoint(through, checkpoint(1, through)); // retires 0-2, keeping their locations
+    assertThat(SegmentedLog.parse(AtomicFileLog.decode(io.bytes(LOCATION))).retired())
+        .extracting(r -> r.location())
+        .allSatisfy(location -> assertThat(location).startsWith(store.location("old/")));
+    moved.trim(through); // past their TTL (0): deleted where they are
+    assertThat(store.names()).noneMatch(n -> n.startsWith("old/"));
+    assertThat(log("segs", 2, 0).read().records()).isEmpty();
+  }
+
+  /** A location the store cannot reach fails the read: it is never read under the prefix. */
+  @Test
+  void aSegmentAtALocationTheStoreCannotReachFailsTheRead() {
+    SegmentedLog log = created(2);
+    log.readThrough(log.append(record(), null), Duration.ZERO);
+    relocate(seg -> "https://elsewhere.example/logs/" + seg.name());
+    assertThatThrownBy(() -> log(2).read()).hasStackTraceContaining("cannot reach");
+  }
+
+  /** Replaces the catalog object's Installs with ones naming the locations {@code where} gives. */
+  private void relocate(Function<SegmentedLog.Seg, String> where) {
+    AtomicFileLog catalog = AtomicFileLog.segmented(io, LOCATION, () -> 7L, false);
+    LogView v = catalog.read();
+    SegmentedLog.Cat cat = SegmentedLog.parse(v);
+    List<byte[]> records = new ArrayList<>();
+    records.add(LogEnvelope.encodeCheckpointThrough(cat.ck().encode()));
+    for (SegmentedLog.Seg seg : cat.segs()) {
+      records.add(new SegmentedLog.Seg(seg.ordinal(), seg.name(), where.apply(seg), seg.limit())
+          .install());
+    }
+    catalog.replace(v.tail(), cat.checkpoint(), records);
+  }
+
+  private SegmentedLog log(String prefix, long limit, long aheadMargin) {
+    return new SegmentedLog(AtomicFileLog.segmented(io, LOCATION, () -> 7L, false), store, prefix,
+        SegmentedLog.Options.defaults().withLimit(limit).withAheadMargin(aheadMargin)
+            .withRetireTtlMs(0).withClock(() -> 0L));
+  }
+
+  private String segmentIn(String prefix, long ordinal) {
+    return store.names().stream()
+        .filter(n -> n.startsWith(prefix + "/"))
+        .filter(n -> SegmentedLog.ordinalOf(n.substring(prefix.length() + 1)) == ordinal)
+        .findFirst().orElseThrow();
   }
 
   @Test
