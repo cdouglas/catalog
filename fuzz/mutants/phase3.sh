@@ -38,7 +38,11 @@ mutant() { # name main-dir test-dir
     # a merged manifest keeps its writer's sequence numbers and row ids
     noshift) mutate $M/Landing.java "    if (sequenceShift == 0 && rowShift == 0) {" "    if (true) {" ;;
     # lamport-minus-properties reads nothing but properties
-    norest) mutate $M/LamportMinusPropertiesEncoding.java "    return Witness.of(base).concern(REST);" "    return Witness.of(base);" ;;
+    norest) mutate $M/LamportMinusPropertiesEncoding.java "      return null; // a record that touches properties conflicts with any change
+    }
+    return Witness.of(base).concern(REST);" "      return null; // a record that touches properties conflicts with any change
+    }
+    return Witness.of(base);" ;;
     # every producer is blind
     blindall) mutate $M/TableChange.java "      blind &= kind == Footprint.Kind.BLIND;" "" ;;
     # a merged snapshot keeps its writer's parent

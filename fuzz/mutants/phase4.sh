@@ -35,12 +35,12 @@ mutant() { # name main-dir test-dir
     # a manifest that spans partitions is stamped in its lower bound's bucket only
     pvlower) mutate $M/PartitionKey.java "      if (field.containsNull() || lower == null || !lower.equals(upper)" "      if (field.containsNull() || lower == null" ;;
     # manifest-window admits whatever its window holds
-    mwnowindow) mutate $M/ManifestWindowEncoding.java "      TableMetadata table = landing.metadata();
-      SnapshotRef ref = table.ref(branch);" "      if (landing != null) {
-        return true;
+    mwnowindow) mutate $M/ManifestWindowEncoding.java "    private String judge(ReplayView landing) {
+      MetadataView table = landing.table();" "    private String judge(ReplayView landing) {
+      if (landing != null) {
+        return null;
       }
-      TableMetadata table = landing.metadata();
-      SnapshotRef ref = table.ref(branch);" ;;
+      MetadataView table = landing.table();" ;;
     # manifest-window skips the window's newest snapshot (the head)
     mwskiphead) mutate $M/ManifestWindowEncoding.java "      for (Snapshot snapshot : window) {" "      for (Snapshot snapshot : window.subList(Math.min(1, window.size()), window.size())) {" ;;
     # manifest-window reads only data added

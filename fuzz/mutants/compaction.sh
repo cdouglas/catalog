@@ -45,7 +45,7 @@ mutant() { # name main-dir test-dir (the catalog's; these mutants are intentlog'
     } catch (CommitOutcomeUnknownException e) {
       // interrupted in a backoff" ;;
     compactcopyafter) mutate $RT "copied.isEmpty() ? replace.records : concat(copied, replace.records);" "copied.isEmpty() ? replace.records : concat(replace.records, copied);" ;;
-    compactreplaced) mutate $RT "      int from = continued(lost.view(), view, null);
+    compactreplaced) mutate $RT "      int from = continued(lost, view, null);
       if (from < 0) {
         return null;
       }" "      int from = lost.view() == null ? 0
