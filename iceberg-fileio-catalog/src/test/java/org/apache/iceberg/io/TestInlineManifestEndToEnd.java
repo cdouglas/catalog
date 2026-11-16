@@ -419,11 +419,11 @@ public class TestInlineManifestEndToEnd {
     }
 
     /**
-     * Errata D1: a transaction that mixes a delta-representable update
-     * (setProperties) with statistics — currently not representable as a
-     * delta — must not silently drop the statistics. The bug was: the
-     * presence of a non-stats change made computeDelta return a non-empty
-     * list, the commit picked delta mode, and stats were never encoded.
+     * Errata D1: a transaction that mixes a property update with statistics
+     * must not silently drop the statistics. The bug was: the presence of a
+     * non-stats change made computeDelta return a non-empty list, the commit
+     * picked delta mode, and stats were never encoded (a delta then had no
+     * statistics updates; since errata D9's fix it carries them).
      */
     @Test
     void transactionWithStatisticsAndPropertiesSurvivesReload() {
@@ -451,16 +451,14 @@ public class TestInlineManifestEndToEnd {
     }
 
     /**
-     * Full-mode trigger A: a stats-only commit produces no
-     * delta-representable updates (computeDelta returns null), so
-     * {@code stageUpdate} writes full mode and the wire action carries
-     * full_metadata. Sharper than {@link
+     * A stats-only commit is a delta of one SetStatistics update (errata D9
+     * until 2026-11-16: it went as full_metadata). Sharper than {@link
      * #transactionWithStatisticsAndPropertiesSurvivesReload} (which only
      * checks the round-trip outcome): this test cracks open the appended
      * transaction and asserts on the action's payload variant.
      */
     @Test
-    void statsOnlyCommitEmitsFullModeAction() throws IOException {
+    void statsOnlyCommitEmitsADelta() throws IOException {
       createNamespaceAndTable();
       Table tbl = catalog.loadTable(TBL);
       tbl.newFastAppend().appendFile(FILE_A).commit();
@@ -471,11 +469,14 @@ public class TestInlineManifestEndToEnd {
       tbl.updateStatistics().setStatistics(stat).commit();
 
       ProtoCodec.UpdateTableInlineAction action = lastInlineUpdateAction(io);
-      assertThat(action.fullMetadata)
-          .as("stats-only commit (no representable delta) must emit full_metadata")
-          .isNotNull();
-      assertThat(action.deltaBytes).isNull();
+      assertThat(action.fullMetadata).isNull();
       assertThat(action.metadataLocation).isNull();
+      assertThat(action.deltaBytes).as("a stats-only commit is a delta").isNotNull();
+      assertThat(InlineDeltaCodec.decodeDelta(action.deltaBytes).updates)
+          .singleElement()
+          .isInstanceOfSatisfying(InlineDeltaCodec.SetStatisticsUpdate.class,
+              update -> assertThat(update.file).isEqualTo(stat));
+      assertThat(reloadCatalog().loadTable(TBL).statisticsFiles()).containsExactly(stat);
     }
 
     /**
