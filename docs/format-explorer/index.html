@@ -493,7 +493,7 @@
           {"number": 2, "name": "name", "type": "string", "repeated": false, "packed": false, "oneof": null, "comment": ""},
           {"number": 3, "name": "location", "type": "string", "repeated": false, "packed": false, "oneof": null, "comment": ""},
           {"number": 4, "name": "end", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": "The position after its last record (LogTail.position's encoding)."},
-          {"number": 5, "name": "retired_at_ms", "type": "fixed64", "repeated": false, "packed": false, "oneof": null, "comment": "The compactor's clock when it retired the segment; the sweep deletes it once the retirement TTL has passed since."}
+          {"number": 5, "name": "retired_at_ms", "type": "fixed64", "repeated": false, "packed": false, "oneof": null, "comment": "The compactor's clock when it retired the segment; it is deleted, by its name, once the retirement TTL has passed since."}
         ]
       },
       "AdvanceHorizon": {
