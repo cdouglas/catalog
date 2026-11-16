@@ -83,16 +83,22 @@ to tables of one `FileIOCatalog` over an in-memory store whose requests take a p
   its checks' scope`), why its witness was the table's whole version (`whole: lamport`, `whole:
   removes snapshots`, `whole: commit once: a schema change`, `whole: pinned (a catalog
   transaction's table)`, `whole: a read pin`, `whole: full metadata`, `whole: a pointer table`), or
-  why a record the encoding admitted could not merge (`merge: <Landing's reason>`). View
+  why a record the encoding admitted could not merge (`merge: <Landing's reason>`), or, for a
+  catalog transaction, what changed of a table it read, which its commit's read check found on a
+  fresh read before writing anything (`read: advanced by append`, `read: advanced by replace`,
+  `read: advanced by append+replace`: the operations of the snapshots its ref advanced by;
+  `read: reset`, `read: removed`, `read: dropped`, `read: replaced`, `read: version`; since
+  2026-11-16, before which the check counted no conflict). View
   `conflict_reasons`, one row per operation and reason. Encoding-specific: under `lamport` every
   conflict is `whole: lamport`.
 - `txn_failures` (catalog transactions, since 2026-10-30): why each attempt failed. `catalog: its
-  record conflicted` (its reason is in `conflict_reasons`), or a check before the catalog wrote
-  anything, which no encoding sees: `isolation: a table it read changed` (serializable: the
-  transaction's read set, `BaseCatalogTransaction` and `LogCatalog.commitTransaction`),
-  `requirement: ...` (the commits' requirements, e.g. `branch main has changed`), `pin: a table it
-  writes changed (D12)`. View `txn_failures`. `txn_isolation` (default serializable) sets the
-  isolation level.
+  record conflicted` (its reason is in `conflict_reasons`), `read: a table it read changed`
+  (serializable: `LogCatalog.commitTransaction`'s read check, before anything is written; its
+  reason, `read: ...`, is in `conflict_reasons`), or another check before the catalog wrote
+  anything, which no encoding sees: `requirement: ...` (the commits' requirements, e.g. `branch
+  main has changed`). Runs before 2026-11-16 name the read check `isolation: a table it read
+  changed` or `pin: a table it writes changed (D12)`, with no reason. View `txn_failures`.
+  `txn_isolation` (default serializable) sets the isolation level.
 - `cpu_ms`: the writer thread's CPU for the operation. Iceberg's worker pool (manifest writes) is
   not in it.
 - Requests the writer thread made:

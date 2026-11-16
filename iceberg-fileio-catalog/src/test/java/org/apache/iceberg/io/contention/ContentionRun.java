@@ -688,8 +688,8 @@ final class ContentionRun {
   /**
    * Counts into {@code failures} why each attempt of a catalog transaction failed: its record
    * conflicted where it landed (the reason is the op's {@code conflict_reasons}), or a check before
-   * the catalog wrote it failed: the transaction's serializable read set, the commits'
-   * requirements, or a written table's version (errata D12); or, in a log generator's oracle trace
+   * the catalog wrote it failed: a table the transaction read changed (also a conflict, by its
+   * reason, {@code read: ...}), or the commits' requirements; or, in a log generator's oracle trace
    * ({@link LogTrace}), its entry was refused as one that would not apply.
    */
   static java.util.function.Consumer<RuntimeException> failedAttempt(
@@ -698,16 +698,15 @@ final class ContentionRun {
     return e -> {
       long now = counts.conflicts();
       String cause;
-      if (now > conflicts[0]) {
+      String message = String.valueOf(e.getMessage());
+      if (message.contains("changed since the transaction read it")) {
+        // the read check, before any record: a conflict too, by its reason (read: ...)
+        cause = "read: a table it read changed";
+      } else if (now > conflicts[0]) {
         cause = "catalog: its record conflicted";
       } else {
-        String message = String.valueOf(e.getMessage());
         if (message.contains(LogTrace.REFUSED)) {
           cause = "oracle: its entry would not apply where it landed";
-        } else if (message.contains("isolation violation")) {
-          cause = "isolation: a table it read changed";
-        } else if (message.contains("changed since the transaction read it")) {
-          cause = "pin: a table it writes changed (D12)";
         } else if (message.startsWith("Requirement failed")) {
           cause = "requirement: " + normalized(message);
         } else {

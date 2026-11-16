@@ -25,6 +25,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.DoubleSupplier;
@@ -2221,10 +2222,13 @@ public class LogCatalog extends BaseMetastoreCatalog
     for (TableRead read : commit.reads()) {
       TableMetadata now = currentMetadata(read.identifier(), current);
       if (!read.unchangedIn(now)) {
+        String reason = readChange(read, now);
+        log.readChanged(reason);
         throw new CommitFailedException(
-            "Cannot commit transaction: table %s changed since the transaction read it%s",
+            "Cannot commit transaction: table %s changed since the transaction read it%s (%s)",
             read.identifier(),
-            read.isScan() ? " on " + read.ref() : "");
+            read.isScan() ? " on " + read.ref() : "",
+            reason);
       }
     }
     if (!commit.hasChanges()) {
@@ -2328,6 +2332,43 @@ public class LogCatalog extends BaseMetastoreCatalog
 
     // The commit landed: a purge that cannot delete a file logs it.
     purged.values().forEach(ops -> CatalogUtil.dropTableData(ops.io(), ops.current()));
+  }
+
+  /**
+   * What changed of a table a catalog transaction read, which {@link #commitTransaction} found on
+   * the read it staged on, as the conflict's reason: the table dropped, or replaced by another of
+   * its name; a declared read's version; or a scan's ref removed, reset (onto a snapshot that does
+   * not descend from the one the scan read), or advanced, by the operations of the snapshots it
+   * advanced by ({@code read: advanced by append+replace}: an append to any partition, and a
+   * rewrite, which a read judged by its filter would tell apart; errata D12).
+   */
+  static String readChange(TableRead read, TableMetadata now) {
+    if (now == null) {
+      return "read: dropped";
+    }
+    if (!java.util.Objects.equals(now.uuid(), read.metadata().uuid())) {
+      return "read: replaced";
+    }
+    if (!read.isScan()) {
+      return "read: version";
+    }
+    SnapshotRef ref = now.ref(read.ref());
+    if (ref == null) {
+      return "read: removed";
+    }
+    Set<String> operations = new TreeSet<>();
+    Long id = ref.snapshotId();
+    while (id != null && !id.equals(read.snapshotId())) {
+      Snapshot snapshot = now.snapshot(id);
+      if (snapshot == null) {
+        return "read: reset";
+      }
+      operations.add(snapshot.operation() != null ? snapshot.operation() : "unknown");
+      id = snapshot.parentId();
+    }
+    return java.util.Objects.equals(id, read.snapshotId())
+        ? "read: advanced by " + String.join("+", operations)
+        : "read: reset";
   }
 
   private TableMetadata currentMetadata(TableIdentifier table, Replica<CatalogState> current) {

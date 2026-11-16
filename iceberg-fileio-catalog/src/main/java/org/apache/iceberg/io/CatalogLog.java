@@ -171,6 +171,16 @@ public final class CatalogLog {
     return machine.memo();
   }
 
+  /**
+   * Counts a conflict found before a record was written: a catalog transaction whose read changed
+   * between the transaction's read and the read its commit staged on, which fails it with nothing
+   * written ({@link LogCatalog#commitTransaction}).
+   */
+  void readChanged(String reason) {
+    counts.conflicts.increment();
+    counts.conflicted(reason);
+  }
+
   /** How this catalog's commits ended, since it opened its log. */
   public CommitCounts counts() {
     return counts;
@@ -179,8 +189,11 @@ public final class CatalogLog {
   /**
    * Counts of a catalog's commits by outcome: each commit of a transaction ends committed, in
    * conflict (its record did not apply where it landed, and Iceberg may retry the operation on a
-   * fresh read), rejected otherwise, or unknown; and conflicts by their reason, as replay or the
-   * commit loop explained them ({@link CatalogMutation}'s intention's {@code explain}).
+   * fresh read; or a catalog transaction found a table it read changed on the read its commit
+   * staged on, and wrote nothing), rejected otherwise, or unknown; and conflicts by their reason,
+   * as replay or the commit loop explained them ({@link CatalogMutation}'s intention's {@code
+   * explain}), or as the transaction's read check did ({@code read: ...}, {@link
+   * LogCatalog#readChange}).
    */
   public static final class CommitCounts {
     /** The reason of a conflict that has none. */

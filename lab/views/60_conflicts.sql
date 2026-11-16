@@ -19,9 +19,10 @@ FROM r, json_each(r.reasons) j
 WHERE r.reasons IS NOT NULL;
 
 -- One row per (catalog transaction, cause): why its attempts failed. "catalog: its record
--- conflicted" (the reason is in conflict_reasons), or a check before the catalog wrote it:
--- "isolation: ..." (its serializable read set), "pin: ..." (a written table's version, errata
--- D12), "requirement: ..." (the commits' requirements).
+-- conflicted" (the reason is in conflict_reasons), "read: a table it read changed" (the read
+-- check before anything is written; its reason, "read: ...", is in conflict_reasons), or another
+-- check before the catalog wrote it: "requirement: ..." (the commits' requirements). Runs before
+-- 2026-11-16 name the read check "isolation: ..." or "pin: ...", with no reason (lab/NOTES.md).
 CREATE OR REPLACE VIEW txn_failures AS
 WITH r AS (
   SELECT run_id, op_id, outcome, measured,

@@ -42,6 +42,7 @@ import org.intentlog.Replay;
 import org.intentlog.fileio.AtomicFileLog;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
@@ -283,6 +284,63 @@ class TestConflictAttribution {
     assertThat(reasons(w[0])).containsExactly(Map.entry("ref: advanced", 1L));
     assertThat(rejectedInTheLog()).containsExactly(Map.entry("ref: advanced", 1L));
     assertThat(w[1].loadTable(OTHER).currentSnapshot()).isNull();
+  }
+
+  /**
+   * A change to the table a serializable transaction scanned, between its scan and its commit: the
+   * commit finds it on the read it stages on, writes nothing, and counts the conflict by what
+   * changed (errata D12: an append to any partition and a rewrite, which a read judged by its
+   * filter would tell apart; a reset; the table dropped or replaced).
+   */
+  @ParameterizedTest
+  @CsvSource({
+    "append, read: advanced by append",
+    "rewrite, read: advanced by replace",
+    "append and rewrite, read: advanced by append+replace",
+    "rollback, read: reset",
+    "drop, read: dropped",
+    "replace, read: replaced"
+  })
+  void aReadChangedBeforeItsRecordIsCountedByWhatChanged(String change, String reason) {
+    LogCatalog[] w = writers(ManifestWindowEncoding.NAME);
+    w[0].createTable(OTHER, SCHEMA);
+    assertThatThrownBy(() -> readTAppendU(w[0], () -> changeT(w[1], change)))
+        .isInstanceOf(CommitFailedException.class)
+        .hasMessageContaining(reason);
+
+    assertThat(reasons(w[0])).containsExactly(Map.entry(reason, 1L));
+    assertThat(w[0].log().counts().conflicts()).isEqualTo(1);
+    assertThat(rejectedInTheLog()).as("nothing written").isEmpty();
+    assertThat(w[1].loadTable(OTHER).currentSnapshot()).isNull();
+  }
+
+  /** A change to table t, which {@link #writers} made with two appends (files f1 and f2). */
+  private static void changeT(LogCatalog catalog, String change) {
+    Table table = catalog.loadTable(ID);
+    switch (change) {
+      case "append":
+        table.newFastAppend().appendFile(file("b")).commit();
+        break;
+      case "rewrite":
+        table.newRewrite().deleteFile(file("f1")).addFile(file("g1")).commit();
+        break;
+      case "append and rewrite":
+        table.newFastAppend().appendFile(file("b")).commit();
+        table.newRewrite().deleteFile(file("f1")).addFile(file("g1")).commit();
+        break;
+      case "rollback":
+        table.manageSnapshots().rollbackTo(table.currentSnapshot().parentId()).commit();
+        break;
+      case "drop":
+        catalog.dropTable(ID, false);
+        break;
+      case "replace":
+        catalog.dropTable(ID, false);
+        catalog.createTable(ID, SCHEMA);
+        break;
+      default:
+        throw new IllegalArgumentException(change);
+    }
   }
 
   /** Under {@code lamport} a read witness is the version: any change fails the transaction. */
