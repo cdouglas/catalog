@@ -20,6 +20,7 @@ package org.intentlog.fileio;
 
 import java.util.List;
 import net.jqwik.api.Arbitrary;
+import net.jqwik.api.Example;
 import net.jqwik.api.ForAll;
 import net.jqwik.api.Property;
 import net.jqwik.api.Provide;
@@ -53,6 +54,38 @@ class TestAtomicFileCommitProtocol {
     io.setReadsRecordVersion(recordingReads);
     withTailReadCheck(pinned, () -> CommitProtocol.run(new AtomicFileLogHarness(
         io, "mem:///log", EntityVersionsMachine.INSTANCE, reads, seed), settings, schedule));
+  }
+
+  /**
+   * A compaction after a commit, which lost its race to a writer that replaced the log since, is
+   * sent again only if the log continues the version it lost to; else it is dropped, and the
+   * commits stand. Sent with the records past the count the lost version held (calibration mutant
+   * compactreplaced, fuzz/mutants/compaction.sh), it left out a commit that had landed in between
+   * ("w1.1 was committed and is not applied"). The fuzzer reached that at try 581,722 of 1,000,000
+   * (probe p11-reach-creplaced, 2026-11-17), past the calibration's 300,000; this is its shrunk
+   * sample (p11-shrink-creplaced, seed -8760416109953422105).
+   */
+  @Example
+  void aCompactionLostToAReplaceIsNotSentAgainWithTheRecordsPastItsCount() {
+    CommitProtocol.Settings settings =
+        new CommitProtocol.Settings(2, true, CommitProtocol.NO_GC, 0L, 2, 0L, 48, 0L);
+    List<CommitProtocol.Cmd> schedule = List.of(
+        begin(0), commit(0), begin(0), begin(1), duplicate(0), commit(0), begin(0), begin(1),
+        commit(0));
+    commitsAreHonestAndCopiesNeverApply(
+        true, InMemoryAtomicFileIO.ReadMode.OPEN, true, 0L, settings, schedule);
+  }
+
+  private static CommitProtocol.Cmd begin(int writer) {
+    return new CommitProtocol.Cmd(CommitProtocol.Step.BEGIN, writer, 0, 0, 0, 0, 0, 0);
+  }
+
+  private static CommitProtocol.Cmd commit(int writer) {
+    return new CommitProtocol.Cmd(CommitProtocol.Step.COMMIT, writer, 0, 0, 0, 0, 0, 0);
+  }
+
+  private static CommitProtocol.Cmd duplicate(int record) {
+    return new CommitProtocol.Cmd(CommitProtocol.Step.DUPLICATE, 0, 0, 0, 0, 0, record, 0);
   }
 
   /**

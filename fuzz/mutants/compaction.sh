@@ -12,7 +12,9 @@
 # as it grew without the records that beat it), compactfail (a lost compaction fails the commit),
 # compactcopyafter (one sent again with those records after its GC record and PageOuts) and
 # compactreplaced (one sent again on a log that was replaced since, read whole, its records past
-# the count the lost version had taken for growth).
+# the count the lost version had taken for growth). The fuzzer reaches compactreplaced rarely (try
+# 581,722 of 1,000,000, probe p11-reach-creplaced, 2026-11-17): TestAtomicFileCommitProtocol's
+# aCompactionLostToAReplaceIsNotSentAgainWithTheRecordsPastItsCount, its shrunk sample, fails it.
 MUTANTS="compactbase compactprobe compactnocopy compactfail compactcopyafter compactreplaced"
 EQUIVALENT=""
 ORACLES=TestAtomicFileCommitProtocol,TestMultiWriterProperties
