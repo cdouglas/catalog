@@ -6048,4 +6048,83 @@ public class TestCatalogRegressions {
       assertThat(catalog.loadTable(u).currentSnapshot()).isNotNull();
     }
   }
+
+  /**
+   * Bug 97 (list-file writers stamp no partition): partition-vector judges a validated commit by
+   * stamps of the partitions each landed commit changed, taken from the manifests its delta sends.
+   * A writer that does not inline manifest lists (inline TM only, on a table others write with
+   * inline lists) sends a snapshot whose list is a file, and no manifests: its commit stamped no
+   * partition. A serializable overwrite of a partition, staged before that writer appended to the
+   * partition, then merged past the append (an inline-ML writer's commit after it gave the branch
+   * an inline head list again), where Iceberg's retry fails it: the overwrite left the append's
+   * file live. A snapshot with a list file now stamps every partition. Found by the 2026-11-17
+   * design review (two reviewers independently); the retry oracle runs one writer mode at a time.
+   */
+  @Nested
+  class AValidatedOverwritePastAListFileWritersAppend {
+    private final TableIdentifier t = TableIdentifier.of("ns", "t");
+    private final Schema schema = new Schema(
+        Types.NestedField.required(1, "id", Types.IntegerType.get()),
+        Types.NestedField.required(2, "cat", Types.StringType.get()));
+    private final org.apache.iceberg.PartitionSpec spec =
+        org.apache.iceberg.PartitionSpec.builderFor(schema).identity("cat").build();
+
+    private org.apache.iceberg.DataFile file(String name, String cat) {
+      return org.apache.iceberg.DataFiles.builder(spec)
+          .withPath("mem:///data/" + name + ".parquet")
+          .withFileSizeInBytes(10)
+          .withRecordCount(1)
+          .withPartitionPath("cat=" + cat)
+          .build();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"partition-vector", "blind-append", "manifest-window", "concern-vector"})
+    void failsAsIcebergsRetryDoes(String encoding) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      Map<String, String> props = Map.of(LogCatalogProperties.CONFLICT_ENCODING, encoding);
+      LogCatalog writer = LocalCatalogMode.MEMLOG_ML.catalog(io, "mem:///warehouse", "c", props);
+      writer.createNamespace(Namespace.of("ns"));
+      Table table = writer.buildTable(t, schema).withPartitionSpec(spec)
+          .withProperty("format-version", "2").create();
+      table.newFastAppend().appendFile(file("p0", "p")).appendFile(file("q0", "q")).commit();
+      long read = table.currentSnapshot().snapshotId();
+      LogCatalog listFiles =
+          LocalCatalogMode.MEMLOG_TM.catalog(io, "mem:///warehouse", "c", props);
+      LogCatalog inlineLists =
+          LocalCatalogMode.MEMLOG_ML.catalog(io, "mem:///warehouse", "c", props);
+      org.intentlog.memory.InMemorySharedLog log =
+          LocalCatalogMode.sharedLog(io, "mem:///warehouse/catalog-c");
+      boolean[] raced = {false};
+      log.intercept(new org.intentlog.memory.InMemorySharedLog.Interceptor() {
+        @Override
+        public org.intentlog.memory.InMemorySharedLog.WriteFault beforeWrite(
+            org.intentlog.memory.InMemorySharedLog.Request request, byte[] payload) {
+          if (request == org.intentlog.memory.InMemorySharedLog.Request.APPEND && !raced[0]) {
+            raced[0] = true;
+            listFiles.loadTable(t).newFastAppend().appendFile(file("w-p", "p")).commit();
+            inlineLists.loadTable(t).newFastAppend().appendFile(file("w-q", "q")).commit();
+          }
+          return org.intentlog.memory.InMemorySharedLog.WriteFault.NONE;
+        }
+      });
+      org.apache.iceberg.expressions.Expression inP =
+          org.apache.iceberg.expressions.Expressions.equal("cat", "p");
+      try {
+        assertThatThrownBy(() -> table.newOverwrite()
+                .overwriteByRowFilter(inP)
+                .addFile(file("r-p", "p"))
+                .validateFromSnapshot(read)
+                .conflictDetectionFilter(inP)
+                .validateNoConflictingData()
+                .validateNoConflictingDeletes()
+                .commit())
+            .isInstanceOf(ValidationException.class)
+            .hasMessageContaining("w-p");
+      } finally {
+        log.intercept(null);
+      }
+      assertThat(raced[0]).isTrue();
+    }
+  }
 }

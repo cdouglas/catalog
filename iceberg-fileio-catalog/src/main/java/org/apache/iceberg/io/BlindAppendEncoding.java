@@ -112,11 +112,20 @@ class BlindAppendEncoding extends ConcernVectorEncoding {
    * Stamps, in the bucket of each manifest the change's snapshots wrote, what its files did: data
    * files added or removed, delete files added. A manifest with neither (a merged or rewritten
    * one's existing files) changes no partition; delete files removed are not a change any check
-   * reads.
+   * reads. A snapshot whose manifest list is a file (a writer that does not inline lists) sends no
+   * manifests in its delta, so what it changed is unseen: it stamps every bucket (Bug 97).
    */
   @Override
   void stamp(TableChange change, int version, ConcernStamps stamps) {
     super.stamp(change, version, stamps);
+    for (InlineDeltaCodec.AddSnapshotUpdate add : change.snapshots) {
+      if (!add.manifestListSuffix.isEmpty()) {
+        for (ConcernStamps.Partition kind : ConcernStamps.Partition.values()) {
+          stamps.stampPartition(kind, PartitionKey.ALL, version);
+        }
+        return;
+      }
+    }
     for (ManifestFile manifest : change.written) {
       int bucket = PartitionKey.bucket(manifest, buckets());
       if (manifest.content() == ManifestContent.DELETES) {

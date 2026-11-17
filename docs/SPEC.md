@@ -570,7 +570,10 @@ Iceberg's validations skip some operations (a compaction's new files are
 not data added), so both admit fewer than Iceberg's retry would, never more.
 `partition-vector` stamps a manifest's files in the bucket of its partition
 summaries (a partition's spec and values, hashed), or in every bucket if it
-spans partitions or holds an unpartitioned spec's delete files, and reads,
+spans partitions or holds an unpartitioned spec's delete files; a commit
+whose snapshot has a manifest-list file (a writer that does not inline
+lists) sends no manifests, and stamps every bucket (Bug 97 (list-file
+writers stamp no partition)). It reads,
 for a filter, the buckets of the partitions its inclusive projection onto
 each spec names by equality (every bucket for a range). `manifest-window`
 keeps no partition stamps: it walks its branch from the head where it
