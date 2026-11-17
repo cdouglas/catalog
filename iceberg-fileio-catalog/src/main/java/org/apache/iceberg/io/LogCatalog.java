@@ -295,15 +295,7 @@ public class LogCatalog extends BaseMetastoreCatalog
         LOG.info("Dropped inline table {}: register {} to bring it back", identifier,
             kept.get(0));
       }
-      if (dropped != null) {
-        // The drop has landed: a file the purge cannot read or delete is left behind, not
-        // reported as a failed drop.
-        try {
-          CatalogUtil.dropTableData(skippingInlinePaths(io), dropped);
-        } catch (RuntimeException e) {
-          LOG.warn("Dropped table {}, but could not delete all of its files", identifier, e);
-        }
-      }
+      purge(identifier, dropped);
       return true;
     }
   }
@@ -343,14 +335,37 @@ public class LogCatalog extends BaseMetastoreCatalog
    * {@code read} is that change (Bug 87).
    */
   private TableMetadata purgedVersion(TableIdentifier identifier, Replica<CatalogState> read) {
+    return purgedVersion(identifier, () -> tableOpsAsRead(identifier, read).current());
+  }
+
+  /** As {@link #purgedVersion(TableIdentifier, Replica)}, of the version {@code load} loads. */
+  private static TableMetadata purgedVersion(
+      TableIdentifier identifier, java.util.function.Supplier<TableMetadata> load) {
     try {
-      TableMetadata version = tableOpsAsRead(identifier, read).current();
+      TableMetadata version = load.get();
       version.snapshots(); // now, while the catalog names their pages
       return version;
     } catch (org.apache.iceberg.exceptions.NotFoundException | SnapshotPages.MissingPage e) {
       LOG.warn("Cannot load the metadata or history of {}: dropping it without purging its files",
           identifier, e);
       return null;
+    }
+  }
+
+  /**
+   * Deletes the files of {@code version}, the version of {@code identifier} that a drop which has
+   * landed removed ({@link #purgedVersion}, read before the drop landed); nothing if null. A file
+   * the purge cannot read or delete is left behind and logged, not reported: the drop has landed,
+   * and work after a commit lands does not change its outcome (design.md I10; Bug 96).
+   */
+  private void purge(TableIdentifier identifier, TableMetadata version) {
+    if (version == null) {
+      return;
+    }
+    try {
+      CatalogUtil.dropTableData(skippingInlinePaths(io), version);
+    } catch (RuntimeException e) {
+      LOG.warn("Dropped table {}, but could not delete all of its files", identifier, e);
     }
   }
 
@@ -2405,7 +2420,8 @@ public class LogCatalog extends BaseMetastoreCatalog
       }
     }
 
-    Map<TableIdentifier, FileIOTableOperations> purged = new HashMap<>();
+    // The tables dropped with purge, each with the version it drops and its history (Bug 96)
+    Map<TableIdentifier, TableMetadata> purged = new HashMap<>();
     // The tables dropped keeping their files, which are written once the record is staged
     List<TableIdentifier> keeping = new ArrayList<>();
     for (TableChange change : commit.tableChanges()) {
@@ -2424,7 +2440,7 @@ public class LogCatalog extends BaseMetastoreCatalog
       if (change.dropped()) {
         newCatalog.dropTable(tableId);
         if (change.purge()) {
-          purged.put(tableId, ops);
+          purged.put(tableId, purgedVersion(tableId, ops::current));
         } else {
           keeping.add(tableId);
         }
@@ -2497,8 +2513,8 @@ public class LogCatalog extends BaseMetastoreCatalog
       throw e;
     }
 
-    // The commit landed: a purge that cannot delete a file logs it.
-    purged.values().forEach(ops -> CatalogUtil.dropTableData(ops.io(), ops.current()));
+    // The commit landed: a purge that cannot read or delete a file logs it (Bug 96)
+    purged.forEach(this::purge);
   }
 
   /**

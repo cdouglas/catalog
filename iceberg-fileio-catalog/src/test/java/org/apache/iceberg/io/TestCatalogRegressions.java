@@ -5957,4 +5957,95 @@ public class TestCatalogRegressions {
       assertThat(now.schema().findField("c")).isNull();
     }
   }
+
+  /**
+   * Bug 96 (transaction purge fails its commit): a catalog transaction that drops a table with
+   * purge deleted the table's files after its record landed, reading the table's history only
+   * then and with nothing to catch a failure. A compaction that landed after the record (its
+   * writer's, compacting after the commit, or another writer's) collected the table's pages, so
+   * the read failed (as Bug 94's did in dropTable), and the failure came out of the landed
+   * transaction: BaseCatalogTransaction reported it failed, though its changes had all landed,
+   * and the purge left every file. An unreadable manifest list of a pointer table did the same.
+   * The transaction now reads the history before it commits, and a purge after the commit logs
+   * what it cannot do, as dropTable's does (design.md I10). Found by the 2026-11-17 design review
+   * (three reviewers).
+   */
+  @Nested
+  class ATransactionThatPurgesATable {
+    private final TableIdentifier t = TableIdentifier.of("ns", "t");
+    private final TableIdentifier u = TableIdentifier.of("ns", "u");
+
+    @ParameterizedTest
+    @EnumSource(names = {"MEMLOG_TM", "MEMLOG_ML"})
+    void commitsWhenACompactionCollectsItsPagesFirst(LocalCatalogMode mode) throws IOException {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = mode.catalog(io, "mem:///warehouse", "c", PAGED);
+      pagedTable(catalog, t);
+      catalog.createTable(u, intSchema);
+      Set<String> files = new HashSet<>();
+      for (org.apache.iceberg.Snapshot snapshot : catalog.loadTable(t).snapshots()) {
+        String list = snapshot.manifestListLocation();
+        if (list != null && !list.startsWith("inline://")) {
+          files.add(list);
+        }
+        for (ManifestFile manifest : snapshot.allManifests(io)) {
+          files.add(manifest.path());
+        }
+      }
+      assertThat(files).isNotEmpty();
+
+      // A writer that has not read t's history drops it and appends to u in one transaction; another
+      // compacts just after the record lands
+      LogCatalog dropping = mode.catalog(io, "mem:///warehouse", "c", PAGED);
+      LogCatalog other = mode.catalog(io, "mem:///warehouse", "c", PAGED);
+      CatalogTransaction txn = dropping.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      txn.asCatalog().dropTable(t, true);
+      txn.asCatalog().loadTable(u).newFastAppend().appendFile(file("u1")).commit();
+      org.intentlog.memory.InMemorySharedLog log =
+          LocalCatalogMode.sharedLog(io, "mem:///warehouse/catalog-c");
+      boolean[] compacted = {false};
+      log.intercept(new org.intentlog.memory.InMemorySharedLog.Interceptor() {
+        @Override
+        public org.intentlog.memory.InMemorySharedLog.ReadShape beforeRead(
+            org.intentlog.memory.InMemorySharedLog.Request request) {
+          if (request == org.intentlog.memory.InMemorySharedLog.Request.READ_THROUGH
+              && !compacted[0]) {
+            compacted[0] = true;
+            other.log().compact();
+          }
+          return org.intentlog.memory.InMemorySharedLog.ReadShape.NORMAL;
+        }
+      });
+      try {
+        txn.commitTransaction();
+      } finally {
+        log.intercept(null);
+      }
+      assertThat(compacted[0]).as("a compaction landed just after the record").isTrue();
+      LogCatalog reader = mode.catalog(io, "mem:///warehouse", "c", PAGED);
+      assertThat(reader.tableExists(t)).isFalse();
+      assertThat(reader.loadTable(u).currentSnapshot()).isNotNull();
+      assertThat(files).noneMatch(file -> io.newInputFile(file).exists());
+    }
+
+    @ParameterizedTest
+    @EnumSource(names = {"CAS", "MEMLOG"})
+    void commitsWhenAManifestListIsUnreadable(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = mode.catalog(io, "mem:///warehouse", "c", Map.of());
+      catalog.createNamespace(Namespace.of("ns"));
+      Table table = catalog.createTable(t, intSchema);
+      table.newFastAppend().appendFile(file("t1")).commit();
+      table.newFastAppend().appendFile(file("t2")).commit();
+      catalog.createTable(u, intSchema);
+      io.deleteFile(catalog.loadTable(t).currentSnapshot().manifestListLocation());
+
+      CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      txn.asCatalog().dropTable(t, true);
+      txn.asCatalog().loadTable(u).newFastAppend().appendFile(file("u1")).commit();
+      txn.commitTransaction();
+      assertThat(catalog.tableExists(t)).isFalse();
+      assertThat(catalog.loadTable(u).currentSnapshot()).isNotNull();
+    }
+  }
 }

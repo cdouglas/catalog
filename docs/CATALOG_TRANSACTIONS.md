@@ -98,8 +98,9 @@ new name only, a created one loads and takes updates, listings include them. The
 transaction's net effect against the catalog as the transaction found it, which is what
 `CatalogMutation` records: tables created (with their final metadata), tables updated (by their
 names at the start, with the version first read), renamed (start name to final name) and dropped,
-and namespaces created, changed and dropped. A purge deletes the table's files after the commit
-lands. Replace transactions, `registerTable` and views stay unsupported in a catalog transaction
+and namespaces created, changed and dropped. A purge reads the dropped version's history before
+the commit and deletes the table's files after it lands; a file it cannot read or delete then is
+left and logged, and the transaction still reports its commit (Bug 96). Replace transactions, `registerTable` and views stay unsupported in a catalog transaction
 and throw.
 
 ## The SPI
