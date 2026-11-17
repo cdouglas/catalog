@@ -150,6 +150,10 @@ final class ContentionRun {
           + "\"sample_every_ms\": 1000,"
           // the maintenance client's retries (-1: retry_num), so expiry can keep up with appends
           + "\"expire_retry_num\": -1,"
+          // an expiry lands on a table changed since its read, removing what it chose on its base
+          // (fileio.catalog.expiry.merge; false pins it to the version it read, as replay held
+          // every expiry before errata D17's fix)
+          + "\"expiry_merge\": true,"
           // write every record the catalog's writes landed, in order, to log.bin (IngestBench)
           + "\"capture_log\": false,"
           // the format of the records a captured log holds (IngestBench sets the current one), so
@@ -162,14 +166,15 @@ final class ContentionRun {
   /**
    * Keys added after the first campaign (p5, 2026-10-27), with the value the runs that recorded no
    * such key ran (race_min_wait_ms: p6's, the catalog's default then; race_basis: fixed, the only
-   * basis before 2026-11-13): one at that value is left
+   * basis before 2026-11-13; expiry_merge: false, as no expiry merged before 2026-11-17, errata
+   * D17's fix): one at that value is left
    * out of the hash, so a configuration keeps the hash its earlier runs recorded. Every driver of
    * this package's configurations hashes with them.
    */
   static final Map<String, String> LATER_KEYS =
       Map.of("expire_older_than_s", "0", "race_min_wait_ms", "20", "expire_retry_num", "-1",
           "capture_log", "false", "capture_format", "1", "txn_isolation", "serializable",
-          "generate", "", "race_basis", "fixed");
+          "generate", "", "race_basis", "fixed", "expiry_merge", "false");
 
   private final BenchConfig config;
   private final Path dir;
@@ -216,6 +221,7 @@ final class ContentionRun {
     props.put("fileio.catalog.conflict.encoding", config.string("encoding"));
     props.put("fileio.catalog.race.retry.min-wait-ms", config.string("race_min_wait_ms"));
     props.put(LogCatalogProperties.RACE_BASIS, config.string("race_basis"));
+    props.put(LogCatalogProperties.EXPIRY_MERGE, config.string("expiry_merge"));
     String prefix = CatalogProperties.TABLE_DEFAULT_PREFIX;
     props.put(prefix + TableProperties.COMMIT_NUM_RETRIES, config.string("retry_num"));
     props.put(prefix + TableProperties.COMMIT_MIN_RETRY_WAIT_MS, config.string("retry_min_wait_ms"));

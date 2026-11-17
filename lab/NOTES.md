@@ -54,6 +54,11 @@ to tables of one `FileIOCatalog` over an in-memory store whose requests take a p
   A validated operation whose starting snapshot expires during its job fails Iceberg's validation
   ("Cannot determine history"): with 50 snapshots kept, at 10+ commits/s the history is shorter
   than a 5 s compaction.
+- `expiry_merge` (added 2026-11-17 with errata D17's fix; default true): an expiry lands on a table
+  changed since its read, removing what it chose on its base, under `concern-vector` and the
+  encodings built on it; false holds it to the version it read, as replay held every expiry in
+  the runs before (the key's earlier value, so those runs keep their hashes; a configuration that
+  leaves it at true hashes anew). Campaign `d17-expiry` is the A/B.
 
 ## `ops` (one row per operation)
 
