@@ -12,7 +12,9 @@ EQUIVALENT="retention"
 ORACLES=TestRebaseProperties,TestLamportMinusPropertiesEncoding,TestConcernVectorEncoding,TestBlindAppendEncoding,TestMultiWriterProperties
 
 prepare() {
-  tries $1/$T/TestRebaseProperties.java each 800
+  # 3,000: blindnoreset fails a rebase property at try 425 of 3,000 (probe p10-reach-bnr,
+  # 2026-11-17); at 800 the p10 calibration missed it
+  tries $1/$T/TestRebaseProperties.java each 3000
   tries $1/$T/ConflictEncodingContract.java each 400
 }
 
