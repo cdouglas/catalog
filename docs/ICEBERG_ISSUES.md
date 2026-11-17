@@ -13,7 +13,7 @@ reports or pull requests upstream. It covers the reproduction, the cause
 with links to the 1.12.0 source, the fix, its tests, and what to settle
 before a PR.
 
-Upstream fixed C1. The fork fixes C2 to C29 on branch `core-fixes`, each
+Upstream fixed C1. The fork fixes C2 to C30 on branch `core-fixes`, each
 in an upstream-style commit with its tests, so the project's tests no
 longer work around any of them.
 
@@ -67,8 +67,10 @@ baseline), was fixed that day; upstream had it reported two days before,
 with a fix of its main case open. C29, which a search of upstream's
 record for fileio-catalog's Bug 86 (load racing a purge) found on
 2026-11-12, was fixed that day; it reproduces on main at `e70a2efcd0`,
-and upstream has no report of it. The Fork column is `atomicio`, which
-sits on `core-perf`, on `core-fixes`.
+and upstream has no report of it. C30, which fileio-catalog's encoding
+contract found on 2026-11-17 with errata D17's fix, was fixed that day; it
+reproduces on main at `a6bc1f95e3`, and upstream has no report of it. The
+Fork column is `atomicio`, which sits on `core-perf`, on `core-fixes`.
 
 | Issue | Fork | 1.12.0 | main | Upstream |
 |---|---|---|---|---|
@@ -101,6 +103,7 @@ sits on `core-perf`, on `core-fixes`.
 | C27. A handle to a dropped table fails with an NPE once it has reported the drop | fixed, `core-fixes` 628063f | yes | yes | [#1513](https://github.com/apache/iceberg/issues/1513), closed by [#1553](https://github.com/apache/iceberg/pull/1553) (0.10.0), which missed the metastores' check of the cleared location |
 | C28. A JDBC commit whose UPDATE committed but whose reply was lost is reported as failed | fixed, `core-fixes` d69176a | yes (since 1.6.0) | yes | [#18743](https://github.com/apache/iceberg/issues/18743), open; PR [#18745](https://github.com/apache/iceberg/pull/18745), open, fixes the zero-row UPDATE as the fork does |
 | C29. A load racing a drop with purge reports a missing metadata file | fixed, `core-fixes` 207fce3 | yes | yes | not reported (2026-11-12); upstream reports a file the catalog still names as missing on purpose (`CatalogTests.testLoadTableWithMissingMetadataFile`), which the fix keeps |
+| C30. A removal of more snapshots than a table has fails with IllegalArgumentException | fixed, `core-fixes` e1853ce | yes | yes | not reported (2026-11-17); Java's client sends one update per snapshot since 1.9.1 (#13100, #13647), which meets it only on a table with no snapshots |
 
 "Not reported" means a search of apache/iceberg's issues, pull requests
 and PR branches, and of the issues@ and dev@ lists, found nothing for the
@@ -905,6 +908,38 @@ files (`gc.enabled`).
   Iceberg.
 - **Canary:** `aRefreshRacingADropWithPurgeFindsTheTableDropped`, on the
   table operations of C27's canary.
+
+### C30. A removal of more snapshots than a table has fails with IllegalArgumentException
+
+Details: [iceberg-issues/C30.md](iceberg-issues/C30.md).
+
+`TableMetadata.Builder.removeSnapshots` sizes the snapshots it keeps as
+those it has less the ids it removes. A REST server applies a client's
+`remove-snapshots` update to the table's current metadata; after another
+expiry removed most of the same snapshots, an update with every id names
+more than the table has, and the builder throws IllegalArgumentException
+("arraySize cannot be negative"), a bad request, where removing what is
+gone changes nothing.
+
+- **Cause:** the sizing assumes every id is the table's
+  (`rewriteSnapshotsInternal`), which holds only on the metadata the
+  removal was computed on.
+- **Reach:** Iceberg's Java client has sent one update per snapshot since
+  1.9.1 (#13100, #13647, reverting #12670's bulk update, which users ask
+  back), so from it only on a table with no snapshots left; a client that
+  sends one update with every id meets it whenever its removal names more
+  snapshots than remain.
+- **Found by:** fileio-catalog's `ConflictEncodingContract` with errata
+  D17's fix (2026-11-17): a merged expiry's record names every id, and the
+  replay check applies it through the builder.
+- **Fork:** fixed on `core-fixes` by e1853ce, "Core: Remove the snapshots
+  a table has when a removal names more": the size is at least zero. Its
+  test is `TestTableMetadata.testRemovingMoreSnapshotsThanTheTableHas`.
+- **Workaround** in fileio-catalog, which can stay: the replay check
+  (`NativeDelta.reference`) removes only the snapshots the table has, as
+  native replay does.
+- **Canary:** `aRemovalOfMoreSnapshotsThanTheTableHasApplies`, a bulk
+  update applied as a REST server does (`CatalogHandlers.updateTable`).
 
 ## Accepted Iceberg Behavior
 

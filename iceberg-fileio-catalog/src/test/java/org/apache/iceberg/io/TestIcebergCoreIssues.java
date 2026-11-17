@@ -976,6 +976,44 @@ class TestIcebergCoreIssues {
   }
 
   /**
+   * C30. A removal of several snapshots applied to a table's newer metadata, as a REST server
+   * applies a client's remove-snapshots update (one with every id, as Iceberg 1.9.0's client and
+   * other clients send it), must remove what the table still has of them: after another expiry
+   * removed most of the same snapshots it names more than the table has, and Iceberg's builder,
+   * which sized the snapshots it keeps as those it has less those it removes, threw
+   * IllegalArgumentException ("arraySize cannot be negative").
+   */
+  @Test
+  void aRemovalOfMoreSnapshotsThanTheTableHasApplies() {
+    InMemoryCatalog catalog = catalog();
+    Table table = catalog.createTable(ID, SCHEMA);
+    for (String name : List.of("a", "b", "c")) {
+      table.newFastAppend().appendFile(file(name)).commit();
+    }
+    TableMetadata base = ((HasTableOperations) table).operations().current();
+    long head = base.currentSnapshot().snapshotId();
+    Set<Long> older = new java.util.HashSet<>();
+    base.snapshots().forEach(s -> older.add(s.snapshotId()));
+    older.remove(head);
+
+    // another writer's expiry removes them first; then this one's update reaches the server
+    catalog.loadTable(ID).expireSnapshots().expireOlderThan(Long.MAX_VALUE).retainLast(1)
+        .cleanExpiredFiles(false).commit();
+    assertThatCode(
+            () ->
+                applyAsRestServer(
+                    catalog,
+                    base,
+                    List.of(new org.apache.iceberg.MetadataUpdate.RemoveSnapshots(older))))
+        .as(BACK, "C30")
+        .doesNotThrowAnyException();
+
+    Table reloaded = catalog.loadTable(ID);
+    assertThat(reloaded.snapshots()).hasSize(1);
+    assertThat(reloaded.currentSnapshot().snapshotId()).isEqualTo(head);
+  }
+
+  /**
    * A metastore's table operations, over a map of table names to metadata locations, that report a
    * dropped table as Hive's and JDBC's do: a refresh that finds no table throws
    * NoSuchTableException if the operations have a current metadata location, and otherwise takes

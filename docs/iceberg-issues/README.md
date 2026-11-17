@@ -28,7 +28,8 @@ were written on 1.12.0; their files are unchanged on `main` at
 its file is unchanged on `main` at `e70a2efcd0`. C29, added 2026-11-12,
 was written on 1.12.0 after C27, whose lines in both `refresh` methods it
 sits beside; on `main` at `e70a2efcd0`, which lacks C27, it needs C27
-first or a one-line merge.
+first or a one-line merge. C30, added 2026-11-17, was written on 1.12.0; the method it changes is
+unchanged on `main` at `a6bc1f95e3`, and it applies there on its own.
 
 | Issue | Fix | Before a PR |
 |---|---|---|
@@ -61,3 +62,4 @@ first or a one-line merge.
 | [C27. A handle to a dropped table fails with an NPE once it has reported the drop](C27.md) | [`628063f`](https://github.com/cdouglas/iceberg/commit/628063f534100322f00dea99f6e78ac530b77ae5) | ready; cite #1513 and #1553, which this completes; run the Hive and Glue tests |
 | [C28. A JDBC commit whose UPDATE committed but whose reply was lost is reported as failed](C28.md) | `d69176a` | don't file: #18743 reports it and PR #18745 fixes the zero-row UPDATE; offer the other cases and tests there |
 | [C29. A load racing a drop with purge reports a missing metadata file](C29.md) | [`207fce3`](https://github.com/cdouglas/iceberg/commit/207fce372c220471a6950a688fc21a40701dc595) | ready; frame it by `CatalogTests.testLoadTableWithMissingMetadataFile` (a file still named is lost) and #5510 (drops tolerate a lost file); run the Hive and Glue tests |
+| [C30. A removal of more snapshots than a table has fails with IllegalArgumentException](C30.md) | [`e1853ce`](https://github.com/cdouglas/iceberg/commit/e1853cec0b601e887340ad6b681a055e4dad212d) | ready; one line: settle with reviewers that a removal of snapshots already gone is a no-op, not a conflict; #13647's thread expects bulk updates back, which makes it reachable from Java's client |
