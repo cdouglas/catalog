@@ -101,12 +101,21 @@ public class TestLocalCatalog {
       return true;
     }
 
+    /**
+     * CatalogTests registers the metadata location the table had before its drop, which for an
+     * inline table is the catalog's own ({@code inline://}) and names no file: an inline table's
+     * runs {@link InlineCompatAssertions#runRegisterTableAfterDrop}.
+     */
     @Override
     @Test
     public void testRegisterTable() {
-      Assumptions.assumeFalse(
-          mode().inlineTM, "inline TM has no metadata.json to re-register; errata T4");
-      super.testRegisterTable();
+      if (!mode().inlineTM) {
+        super.testRegisterTable();
+        return;
+      }
+      InlineCompatAssertions.runRegisterTableAfterDrop(
+          catalog(), TABLE, SCHEMA, SPEC, WRITE_ORDER, java.util.List.of(FILE_A, FILE_B, FILE_C),
+          requiresNamespaceCreate());
     }
 
     // CatalogTests moves the metadata file on the local file system.

@@ -115,6 +115,23 @@ public final class LogCatalogProperties {
   }
 
   /**
+   * Whether a drop of an inline table that does not purge it first writes the table to its
+   * metadata directory as a pointer table's is (a metadata file, and a manifest list file for each
+   * snapshot whose list the catalog holds inline), so that {@code registerTable} with that file
+   * brings it back, as it brings back a table any Iceberg catalog dropped without purging. A drop
+   * that loses its race deletes what it wrote, and writes again from its next read. {@code false}
+   * drops the table's metadata with its record: the table's data files stay, with nothing that
+   * names them once the log is compacted. Default: {@code true}.
+   */
+  public static final String DROP_MATERIALIZE = "fileio.catalog.drop.materialize";
+  public static final boolean DEFAULT_DROP_MATERIALIZE = true;
+
+  /** Whether {@code properties} have a drop that keeps an inline table's files write them first. */
+  public static boolean dropMaterialize(Map<String, String> properties) {
+    return booleanProperty(properties, DROP_MATERIALIZE, DEFAULT_DROP_MATERIALIZE);
+  }
+
+  /**
    * Whether a catalog in one object is compacted after a commit: past {@link #MAX_APPEND_COUNT} or
    * {@link #MAX_APPEND_SIZE} a commit still appends, and once its record has landed its writer may
    * replace the catalog with a checkpoint of the version it landed in, at a point past the limits

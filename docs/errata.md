@@ -15,7 +15,8 @@ none of them. `TestIcebergCoreIssues` asserts each is absent; on stock Iceberg
 1.12.0 C2-C29 come back.
 
 An entry's ID is not reused: a finished entry is deleted and its ID retired.
-Retired: S3-S5, D1-D3, D5-D7, D9, D10, D11, D15, D19, D20, D23, D24, D26, T1, T2, T5, U2, U3
+Retired: S3-S5, D1-D3, D5-D7, D9, D10, D11, D15, D19, D20, D23, D24, D26, T1, T2, T4, T5, U2,
+U3
 (`git log -p docs/errata.md` has each; the plans in TAIL_READS.md,
 CHECKPOINT_PLAN.md and SNAPSHOT_PAGING.md cite them by ID and summary). Five
 IDs (S2, D9, D10, T4, T5) were reused before this rule, so an older code
@@ -514,30 +515,6 @@ adopt:
 **Trigger to revisit:** a container image and its caps lifted; it could then
 replace versitygw for the S3 suites, and pre-check the fork's S3 contract
 before a real-cloud run.
-
-### T4. `testRegisterTable` (inline) needs a register-from-bytes API
-
-The inline-TM catalog suites (`TestS3CatalogInlineTM`,
-`TestS3CatalogCASInlineTM`, `GCSCatalogTestInlineTM`,
-`ADLSCatalogTestInlineTM`, `ADLSCatalogTestCASInlineTM`, and the
-`*InlineML` suites that extend them) keep a single `@Disabled` override
-on `testRegisterTable`, and `TestLocalCatalog` assumes it away in its
-inline-TM modes. The upstream test
-calls `catalog.dropTable(t)` then `catalog.registerTable(t, oldLoc)`
-with the previously-loaded metadata location string. After drop, the
-inline metadata bytes are gone, and there is no `registerTable(name,
-bytes)` API on `FileIOCatalog` to re-inline them. Two options:
-
-1. Add a `registerInlineTable(TableIdentifier, byte[])` overload
-   surfaced through `FileIOCatalog`. The upstream `Catalog` interface
-   only exposes the location-string variant, so callers would need to
-   downcast — acceptable for inline-aware tools.
-2. Stash a side copy of the dropped inline bytes in `FileIOCatalog`
-   keyed by metadata location, so the register-by-location path can
-   look them up. Smells like a leak waiting to happen; (1) is cleaner.
-
-**Trigger to revisit:** when a real workload needs catalog
-re-registration of a previously-dropped inline table.
 
 ### T6. No test reads the catalog through a store's accelerated read path
 

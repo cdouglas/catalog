@@ -28,9 +28,11 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 import org.apache.iceberg.CatalogProperties;
@@ -48,6 +50,7 @@ import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.inmemory.InMemoryInputFile;
+import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
@@ -3068,6 +3071,168 @@ public class TestCatalogRegressions {
       assertThat(catalog.dropTable(mixed, true)).isTrue();
 
       assertThat(files).noneMatch(f -> io.newInputFile(f).exists());
+    }
+  }
+
+  // ============================================================
+  // Errata T4 (2026-11-17): a drop that keeps a table's files (purge false, Spark's DROP TABLE,
+  // REST's default) leaves a pointer table's metadata file, which registerTable brings back, as any
+  // Iceberg catalog's dropped table comes back. An inline table's metadata was only in the log, so
+  // its drop left its data files with nothing to name them. Such a drop now first writes the table
+  // to its metadata directory, as a pointer table's is (LogCatalogProperties.DROP_MATERIALIZE).
+  // ============================================================
+
+  @Nested
+  class DropKeepingItsFiles {
+
+    /** The metadata files under {@code location}'s metadata directory. */
+    private List<String> metadataFiles(InMemoryAtomicFileIO io, String location) {
+      List<String> files = Lists.newArrayList();
+      io.listPrefix(location + "/metadata/").forEach(info -> {
+        if (info.location().endsWith(".metadata.json")) {
+          files.add(info.location());
+        }
+      });
+      return files;
+    }
+
+    /** The manifest list files under {@code location}'s metadata directory. */
+    private Set<String> listFiles(InMemoryAtomicFileIO io, String location) {
+      Set<String> files = new HashSet<>();
+      io.listPrefix(location + "/metadata/").forEach(info -> {
+        if (info.location().contains("/snap-")) {
+          files.add(info.location());
+        }
+      });
+      return files;
+    }
+
+    private Table populated(LogCatalog catalog) {
+      catalog.createNamespace(mixedNs);
+      Table table = catalog.createTable(mixed, intSchema);
+      table.newFastAppend().appendFile(dataFile("a")).commit();
+      table.newFastAppend().appendFile(dataFile("b")).commit();
+      table.newDelete().deleteFile(dataFile("a")).commit();
+      table.newFastAppend().appendFile(dataFile("c")).commit();
+      return catalog.loadTable(mixed);
+    }
+
+    /** What registers from {@code file} is the table as it was dropped, every list a file. */
+    private void registersAsDropped(
+        LogCatalog catalog, InMemoryAtomicFileIO io, Table dropped, String file) {
+      Table registered = catalog.registerTable(mixed, file);
+      assertThat(registered.schema().asStruct()).isEqualTo(dropped.schema().asStruct());
+      assertThat(registered.currentSnapshot().snapshotId())
+          .isEqualTo(dropped.currentSnapshot().snapshotId());
+      assertThat(registered.snapshots()).extracting(org.apache.iceberg.Snapshot::snapshotId)
+          .containsExactlyElementsOf(Lists.newArrayList(
+              Iterables.transform(dropped.snapshots(), org.apache.iceberg.Snapshot::snapshotId)));
+      assertThat(registered.history()).isEqualTo(dropped.history());
+      assertThat(dataFiles(registered)).isEqualTo(dataFiles(dropped));
+      Set<String> lists = new HashSet<>();
+      for (org.apache.iceberg.Snapshot s : registered.snapshots()) {
+        assertThat(s.manifestListLocation()).doesNotStartWith("inline:");
+        assertThat(io.newInputFile(s.manifestListLocation()).exists()).isTrue();
+        lists.add(s.manifestListLocation());
+      }
+      assertThat(listFiles(io, dropped.location())).isEqualTo(lists);
+      registered.newFastAppend().appendFile(dataFile("d")).commit();
+      assertThat(dataFiles(catalog.loadTable(mixed))).contains("mem:///data/d.parquet");
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND_TM", "APPEND_ML", "CAS_ML", "MEMLOG_ML"})
+    void writesTheTableToAFileThatRegisters(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = catalog(io, mode);
+      Table table = populated(catalog);
+      assertThat(metadataFiles(io, table.location())).isEmpty();
+
+      assertThat(catalog.dropTable(mixed, false)).isTrue();
+
+      assertThat(catalog.tableExists(mixed)).isFalse();
+      List<String> written = metadataFiles(io, table.location());
+      assertThat(written).hasSize(1);
+      assertThat(dataFiles(table)).allMatch(path -> !path.isEmpty());
+      registersAsDropped(catalog, io, table, written.get(0));
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND_TM", "APPEND_ML"})
+    void aPurgeOrTheOptionOffWritesNothing(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = catalog(io, mode);
+      Table table = populated(catalog);
+      assertThat(catalog.dropTable(mixed, true)).isTrue();
+      assertThat(metadataFiles(io, table.location())).isEmpty();
+
+      LogCatalog off = mode.catalog(io, WAREHOUSE, "c",
+          Map.of(LogCatalogProperties.DROP_MATERIALIZE, "false"));
+      Table again = off.createTable(mixed, intSchema);
+      again.newFastAppend().appendFile(dataFile("a")).commit();
+      Set<String> lists = listFiles(io, again.location());
+      assertThat(off.dropTable(mixed, false)).isTrue();
+      assertThat(metadataFiles(io, again.location())).isEmpty();
+      assertThat(listFiles(io, again.location())).isEqualTo(lists);
+    }
+
+    /**
+     * A drop whose record loses to a commit to the table deletes what it wrote, and writes the
+     * table as its next read has it: one metadata file, which names the racing commit's snapshot.
+     */
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND_TM", "APPEND_ML"})
+    void aDropThatLosesItsRaceDeletesWhatItWrote(LocalCatalogMode mode) {
+      java.util.concurrent.atomic.AtomicReference<Runnable> racer =
+          new java.util.concurrent.atomic.AtomicReference<>();
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO() {
+        @Override
+        public org.apache.iceberg.io.OutputFile newOutputFile(String path) {
+          Runnable race = path.endsWith(".metadata.json") ? racer.getAndSet(null) : null;
+          if (race != null) {
+            race.run();
+          }
+          return super.newOutputFile(path);
+        }
+      };
+      LogCatalog catalog = catalog(io, mode);
+      String location = populated(catalog).location();
+      LogCatalog rival = catalog(io, mode);
+      racer.set(() ->
+          rival.loadTable(mixed).newFastAppend().appendFile(dataFile("r")).commit());
+
+      assertThat(catalog.dropTable(mixed, false)).isTrue();
+
+      assertThat(racer.get()).as("the rival raced the drop").isNull();
+      List<String> written = metadataFiles(io, location);
+      assertThat(written).hasSize(1);
+      Table registered = catalog.registerTable(mixed, written.get(0));
+      assertThat(dataFiles(registered)).contains("mem:///data/r.parquet");
+      Set<String> lists = new HashSet<>();
+      registered.snapshots().forEach(s -> lists.add(s.manifestListLocation()));
+      assertThat(listFiles(io, location)).isEqualTo(lists);
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(
+        value = LocalCatalogMode.class, names = {"APPEND_TM", "APPEND_ML"})
+    void aCatalogTransactionsDropWritesTheTableToo(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = catalog(io, mode);
+      Table table = populated(catalog);
+      org.apache.iceberg.catalog.CatalogTransaction txn =
+          catalog.createTransaction(
+              org.apache.iceberg.catalog.CatalogTransaction.IsolationLevel.SNAPSHOT);
+      txn.asCatalog().dropTable(mixed, false);
+      txn.commitTransaction();
+
+      assertThat(catalog.tableExists(mixed)).isFalse();
+      List<String> written = metadataFiles(io, table.location());
+      assertThat(written).hasSize(1);
+      registersAsDropped(catalog, io, table, written.get(0));
     }
   }
 

@@ -274,16 +274,26 @@ public class LogCatalog extends BaseMetastoreCatalog
         return false;
       }
       TableMetadata dropped;
+      List<String> kept = List.of();
       try {
         dropped = purge ? purgedVersion(identifier, read) : null;
+        if (!purge) {
+          kept = keptFiles(identifier, read);
+        }
         new CatalogMutation(read).dropTable(identifier).commit(log);
       } catch (NoSuchTableException e) {
+        deleteQuietly(kept);
         return false;
       } catch (CommitFailedException e) {
+        deleteQuietly(kept);
         if (attempt >= org.apache.iceberg.TableProperties.COMMIT_NUM_RETRIES_DEFAULT + 1) {
           throw e;
         }
         continue;
+      }
+      if (!kept.isEmpty()) {
+        LOG.info("Dropped inline table {}: register {} to bring it back", identifier,
+            kept.get(0));
       }
       if (dropped != null) {
         // The drop has landed: a file the purge cannot read or delete is left behind, not
@@ -295,6 +305,32 @@ public class LogCatalog extends BaseMetastoreCatalog
         }
       }
       return true;
+    }
+  }
+
+  /**
+   * The files a drop of {@code identifier} that keeps its files writes first, its metadata file
+   * first: none for a pointer table, whose metadata file and lists are in storage, or where {@link
+   * LogCatalogProperties#DROP_MATERIALIZE} is off; for an inline table, the version {@code read}
+   * holds, which the drop removes, written as a pointer table's (errata T4 until 2026-11-17: the
+   * drop kept nothing, and its data files stayed with nothing to name them).
+   */
+  private List<String> keptFiles(TableIdentifier identifier, Replica<CatalogState> read) {
+    if (!LogCatalogProperties.dropMaterialize(catalogProperties)
+        || !read.state().isInlineTable(identifier)) {
+      return List.of();
+    }
+    return tableOpsAsRead(identifier, read).materialize();
+  }
+
+  /** Deletes what a drop that did not land wrote, logging what it cannot. */
+  private void deleteQuietly(List<String> files) {
+    for (String file : files) {
+      try {
+        io.deleteFile(file);
+      } catch (RuntimeException e) {
+        LOG.warn("Cannot delete {}, which a drop that did not land wrote", file, e);
+      }
     }
   }
 
@@ -868,6 +904,31 @@ public class LogCatalog extends BaseMetastoreCatalog
           .discardChanges()
           .build();
       return location;
+    }
+
+    /**
+     * Writes the table as these operations hold it to its metadata directory as a pointer table's
+     * is: each inline-ML snapshot's list to a file, then a metadata file naming them. Returns the
+     * files written, the metadata file first. For a drop that keeps the table's files.
+     */
+    List<String> materialize() {
+      TableMetadata metadata = current();
+      Set<Long> inline = new HashSet<>();
+      for (Snapshot s : metadata.snapshots()) {
+        if (s instanceof InlineSnapshot) {
+          inline.add(s.snapshotId());
+        }
+      }
+      String location = writeUpdateMetadata(false, metadata);
+      List<String> files = new ArrayList<>();
+      files.add(location);
+      for (Snapshot s : written.snapshots()) {
+        if (inline.contains(s.snapshotId())) {
+          files.add(s.manifestListLocation());
+        }
+      }
+      written = null;
+      return files;
     }
 
     /**
@@ -2283,6 +2344,8 @@ public class LogCatalog extends BaseMetastoreCatalog
     }
 
     Map<TableIdentifier, FileIOTableOperations> purged = new HashMap<>();
+    // The tables dropped keeping their files, which are written once the record is staged
+    List<TableIdentifier> keeping = new ArrayList<>();
     for (TableChange change : commit.tableChanges()) {
       TableIdentifier tableId = change.identifier();
       FileIOTableOperations ops = tableOpsAsRead(tableId, current);
@@ -2300,6 +2363,8 @@ public class LogCatalog extends BaseMetastoreCatalog
         newCatalog.dropTable(tableId);
         if (change.purge()) {
           purged.put(tableId, ops);
+        } else {
+          keeping.add(tableId);
         }
         continue;
       }
@@ -2357,7 +2422,18 @@ public class LogCatalog extends BaseMetastoreCatalog
       }
     }
 
-    newCatalog.commit(log);
+    // Each inline table dropped keeping its files is written first; a commit that fails deletes
+    // what they wrote
+    List<String> kept = new ArrayList<>();
+    try {
+      for (TableIdentifier tableId : keeping) {
+        kept.addAll(keptFiles(tableId, current));
+      }
+      newCatalog.commit(log);
+    } catch (CommitFailedException | NoSuchTableException e) {
+      deleteQuietly(kept);
+      throw e;
+    }
 
     // The commit landed: a purge that cannot delete a file logs it.
     purged.values().forEach(ops -> CatalogUtil.dropTableData(ops.io(), ops.current()));

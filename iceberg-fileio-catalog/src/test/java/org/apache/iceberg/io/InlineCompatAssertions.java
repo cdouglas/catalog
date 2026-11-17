@@ -120,6 +120,74 @@ public final class InlineCompatAssertions {
    * Iceberg's {@code TestInMemoryCatalog} does, and puts it back after. An inline table has no
    * metadata file to lose.
    */
+  /**
+   * CatalogTests' testRegisterTable for an inline table, whose metadata location before its drop is
+   * the catalog's own ({@code inline://}) and names no file: a drop that keeps an inline table's
+   * files writes it to a metadata file first ({@link LogCatalogProperties#DROP_MATERIALIZE}), the
+   * newest in its metadata directory, which is what a user registers to bring back any Iceberg
+   * catalog's dropped table. The registered table must be the dropped one, every manifest list a
+   * file, and take commits.
+   */
+  public static void runRegisterTableAfterDrop(
+      LogCatalog catalog,
+      TableIdentifier tableId,
+      Schema schema,
+      org.apache.iceberg.PartitionSpec spec,
+      org.apache.iceberg.SortOrder order,
+      java.util.List<org.apache.iceberg.DataFile> files,
+      boolean createNamespace) {
+    if (createNamespace) {
+      catalog.createNamespace(tableId.namespace());
+    }
+    java.util.Map<String, String> properties =
+        java.util.Map.of("user", "someone", "created-at", "2023-01-15T00:00:01");
+    catalog.buildTable(tableId, schema).withPartitionSpec(spec).withSortOrder(order)
+        .withProperties(properties).create();
+    Table original = catalog.loadTable(tableId);
+    original.newFastAppend().appendFile(files.get(0)).commit();
+    original.newFastAppend().appendFile(files.get(1)).commit();
+    original.newDelete().deleteFile(files.get(0)).commit();
+    original.newFastAppend().appendFile(files.get(2)).commit();
+    original = catalog.loadTable(tableId);
+    assertThat(((BaseTable) original).operations().current().metadataFileLocation())
+        .startsWith("inline:");
+
+    catalog.dropTable(tableId, false /* do not purge */);
+
+    String newest = null;
+    long newestAt = Long.MIN_VALUE;
+    for (FileInfo info : ((SupportsPrefixOperations) catalog.io())
+        .listPrefix(original.location() + "/metadata/")) {
+      if (info.location().endsWith(".metadata.json") && info.createdAtMillis() >= newestAt) {
+        newest = info.location();
+        newestAt = info.createdAtMillis();
+      }
+    }
+    assertThat(newest).as("the drop wrote the table to a metadata file").isNotNull();
+    Table registered = catalog.registerTable(tableId, newest);
+
+    assertThat(catalog.tableExists(tableId)).isTrue();
+    assertThat(registered.properties()).containsAllEntriesOf(properties);
+    assertThat(registered.schema().asStruct()).isEqualTo(original.schema().asStruct());
+    assertThat(registered.specs()).isEqualTo(original.specs());
+    assertThat(registered.sortOrders()).isEqualTo(original.sortOrders());
+    assertThat(registered.currentSnapshot().snapshotId())
+        .isEqualTo(original.currentSnapshot().snapshotId());
+    java.util.List<Long> registeredIds = new java.util.ArrayList<>();
+    registered.snapshots().forEach(s -> registeredIds.add(s.snapshotId()));
+    java.util.List<Long> originalIds = new java.util.ArrayList<>();
+    original.snapshots().forEach(s -> originalIds.add(s.snapshotId()));
+    assertThat(registeredIds).isEqualTo(originalIds);
+    assertThat(registered.history()).isEqualTo(original.history());
+    for (org.apache.iceberg.Snapshot s : registered.snapshots()) {
+      assertThat(s.manifestListLocation()).doesNotStartWith("inline:");
+      assertThat(catalog.io().newInputFile(s.manifestListLocation()).exists()).isTrue();
+    }
+    assertThat(TableViews.physical(registered, false)).isEqualTo(TableViews.physical(original, false));
+    registered.newFastAppend().appendFile(files.get(0)).commit();
+    assertThat(catalog.dropTable(tableId)).isTrue();
+  }
+
   public static void runLoadTableWithMissingMetadataFile(
       LogCatalog catalog, TableIdentifier tableId, Schema schema, boolean createNamespace)
       throws IOException {

@@ -19,7 +19,6 @@
 package org.apache.iceberg.azure.adlsv2;
 
 import org.apache.iceberg.io.InlineCompatAssertions;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 
@@ -41,10 +40,12 @@ public class ADLSCatalogTestCASInlineTM extends ADLSCatalogTestCAS {
         catalog(), TABLE, NS, SCHEMA, requiresNamespaceCreate());
   }
 
+  /** A dropped inline table registers from the metadata file its drop wrote. */
   @Override
   @Test
-  @Disabled(
-      "drop+registerTable requires register-from-bytes API for inline TM; "
-          + "no equivalent on-disk metadata.json exists after drop. See errata T4.")
-  public void testRegisterTable() {}
+  public void testRegisterTable() {
+    InlineCompatAssertions.runRegisterTableAfterDrop(
+        catalog(), TABLE, SCHEMA, SPEC, WRITE_ORDER, java.util.List.of(FILE_A, FILE_B, FILE_C),
+        requiresNamespaceCreate());
+  }
 }

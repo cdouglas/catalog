@@ -88,10 +88,12 @@ of 9446029:
 
 Each `CatalogTests` class skips 12 tests of features the suites don't
 declare (`supportsEmptyNamespace`, `supportsVariant`,
-`supportsServerSideRetry`); an inline one skips 2 more, which need a
+`supportsServerSideRetry`); an inline one skipped 2 more, which needed a
 `metadata.json` (`testLoadTableWithMissingMetadataFile`, and
-`testRegisterTable`, errata T4). The `CatalogTransactionTests` classes
-skip none.
+`testRegisterTable`). The `CatalogTransactionTests` classes skip none. Since
+2026-11-17 an inline suite's `testRegisterTable` registers the metadata file
+a drop that keeps the table's files writes (SPEC.md, "DropTable"); it has not
+run on these stores yet.
 
 The fork's `SupportsAtomicOperations` contract tests last passed on these
 stores on 2026-10-31, at atomicio 8bbeeeed83 (its contract classes on all

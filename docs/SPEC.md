@@ -214,7 +214,9 @@ message DropTable {
   int32 id      = 1;
   int32 version = 2; // must match current; FileIOCatalog.dropTable retries on a
                      // fresh read when another commit changed the table, and a
-                     // purge deletes the dropped version's files once it lands
+                     // purge deletes the dropped version's files once it lands;
+                     // a drop that keeps an inline table's files writes the
+                     // version first, as a pointer table's metadata file
 }
 
 message UpdateTableLocation {
@@ -637,6 +639,19 @@ fixed on the fork's `core-fixes`; the catalog does not depend on that fix.
 A drop with purge whose table's metadata file is lost (a fresh read still
 names it) drops the table and leaves its files, as Iceberg's metastores do
 (apache/iceberg#5510; Bug 88 (purge of a lost file)).
+
+A drop that keeps the table's files (`purge` false: Spark's `DROP TABLE`
+without `PURGE`, REST's drop) leaves a table any Iceberg catalog can bring
+back: a pointer table's metadata file is in storage, and `registerTable`
+with it restores the table. An inline table's metadata is in the log alone,
+so such a drop first writes the version it drops to the table's metadata
+directory as a pointer table's is: a manifest list file for each snapshot
+whose list the catalog holds inline (read from its pages where sealed), then
+a metadata file naming them (`fileio.catalog.drop.materialize`, default
+true). The drop record follows; one that loses its race deletes what it
+wrote and writes the table again from its next read. A catalog
+transaction's drop does the same, once its record is staged. The newest
+metadata file in the directory is the one to register.
 
 The catalog's log properties (`LogCatalogProperties`) configure the commit
 loop: `fileio.catalog.max.append.count` and `max.append.size` set when it
