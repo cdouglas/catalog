@@ -8,7 +8,9 @@
 # inline-ML snapshots' lists were written to files (what a table leaving inline storage, or a
 # writer that does not inline committing to an inline-ML table, names differs from its file).
 # TestCommitReads holds a case each mutant fails (anUpdateLandingJustAfterACommitIsHeldAndKept;
-# aTableLeavingInlineStorageHoldsItsFile, aWriterThatDoesNotInlineHoldsTheFileItWrote).
+# aTableLeavingInlineStorageHoldsItsFile, aWriterThatDoesNotInlineHoldsTheFileItWrote), and
+# TestCatalogRaceProperties' racer D, just after A's write lands, then A's second commit through
+# its handle, reaches adoptany (try 174 of 4,000 on the laptop, 2026-11-17).
 MUTANTS="adoptany adoptunlisted"
 EQUIVALENT=""
 ORACLES=TestCatalogFaultProperties,TestCatalogRaceProperties,TestInlineDifferentialProperties,TestCommitReads

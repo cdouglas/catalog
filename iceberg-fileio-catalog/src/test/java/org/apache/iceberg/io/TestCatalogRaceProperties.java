@@ -67,6 +67,16 @@ import org.intentlog.wire.LogEnvelope;
  * branches it read (a read witness), so a racer's change that leaves those alone may land first
  * (errata D12); a commit must end as the serial run.
  *
+ * <p>A fourth writer's operation on A's table, D's, if there is one, runs just after A's first
+ * write to the catalog lands, at A's next request of its log: a read through a write reads on to
+ * the log's end, so D's write may be in the catalog A's commit lands in, which A's table handle
+ * then holds (errata D20, D26). D runs after A if A makes no request after a write that landed, or
+ * lands none. Then A may commit once more through the handle its operation used (a table it
+ * loaded or created): an append, which must keep whatever D did. The race must end as a serial run
+ * with D after A, or, if D ran while A's operation did, before it: on a log of blind appends A's
+ * record may land, fail its check, and land again after D's. Once D ran, no racer runs before A's
+ * writes.
+ *
  * <p>The operations are namespace creates (of nested namespaces too, which create their parents),
  * drops and property changes; table creates, drops, renames and property changes; and appends and
  * deletes of every row, which Iceberg retries on a conflict as it does a property change (unlike
@@ -120,12 +130,18 @@ class TestCatalogRaceProperties {
       @ForAll InMemoryAtomicFileIO.ReadMode reads,
       @ForAll boolean recordingReads,
       @ForAll boolean tailReads,
-      @ForAll boolean compactAfter) {
+      @ForAll boolean compactAfter,
+      @ForAll("modes") LocalCatalogMode fileModeD,
+      @ForAll("afterOps") Op after,
+      @ForAll boolean again) {
     // The writers' modes on one catalog object, or on a shared log or Append Blobs with the same
     // table metadata storage.
     LocalCatalogMode modeA = fileModeA.on(catalogLog);
     LocalCatalogMode modeB = fileModeB.on(catalogLog);
     LocalCatalogMode modeC = fileModeC.on(catalogLog);
+    LocalCatalogMode modeD = fileModeD.on(catalogLog);
+    // D, if any, operates on A's table
+    Op d = after.kind == null ? after : new Op(after.kind, a.x, after.y);
     // The setup's tables are pointer tables, or inline: a transaction then stages its append as a
     // delta, which the encoding judges where it lands (errata D12)
     LocalCatalogMode base = setupStorage.on(catalogLog);
@@ -187,6 +203,7 @@ class TestCatalogRaceProperties {
     List<LogCatalog> writers = List.of(
         modeB.catalog(io, WAREHOUSE, "c", props, clock(clockOffsets.get(1))),
         modeC.catalog(io, WAREHOUSE, "c", props, clock(clockOffsets.get(2))));
+    LogCatalog writerD = modeD.catalog(io, WAREHOUSE, "c", props, clock(clockOffsets.get(3)));
     String[] results = new String[racers.size()];
     int[] writes = {0};
     boolean[] nested = {false};
@@ -196,8 +213,52 @@ class TestCatalogRaceProperties {
     // On one object, whether A's write is a compaction after its commit landed, which is not one
     // of its commit's writes: A's trace says, its last commit or compaction begun
     boolean[] compacting = {false};
+    // On Append Blobs, whether A's next append is a commit's send (the trace's SEND, a != 2)
+    boolean[] sending = {false};
+    boolean[] landedA = {false}; // whether a send of A's landed (the trace's LANDED)
+    String[] resultD = {null};
+    boolean[] dDuring = {false}; // whether D ran while A's operation did
+    // A's trace, drained by every hook: whether its write is a commit's or a compaction's, and
+    // whether one of its sends landed
+    java.util.function.Consumer<List<CommitTrace.Event>> observe = events -> {
+      for (CommitTrace.Event event : events) {
+        switch (event.kind()) {
+          case COMMIT:
+            compacting[0] = false;
+            break;
+          case COMPACT:
+            compacting[0] = true;
+            sending[0] = false;
+            break;
+          case SEND:
+            sending[0] = event.a() != 2;
+            break;
+          case LANDED:
+            landedA[0] = true;
+            break;
+          default:
+            break;
+        }
+      }
+    };
+    // D, once, at A's first request after a send of A's landed
+    Runnable afterALanded = () -> {
+      if (d.kind != null && resultD[0] == null && landedA[0]) {
+        nested[0] = true;
+        try {
+          resultD[0] = d.run(writerD, "D");
+          dDuring[0] = true;
+        } finally {
+          nested[0] = false;
+          CommitTrace.drain(); // D's, on this thread
+        }
+      }
+    };
     CommitTrace.open();
     Runnable beforeAWrite = () -> {
+      if (dDuring[0]) {
+        return; // after D, no racer: the serial runs put D after the racers before A's writes
+      }
       int k = writes[0]++;
       if (k < racers.size()) {
         nested[0] = true;
@@ -226,16 +287,10 @@ class TestCatalogRaceProperties {
       // A's writes are its commits' sends (the trace's SEND), each just before its first append,
       // which may find its segment ended and install the next before it lands. A compaction's
       // appends (its GC record, PageOuts) are no commit's sends.
-      boolean[] sending = {false};
       blobs.intercept((op, name) -> {
         if (!nested[0]) {
-          for (CommitTrace.Event event : CommitTrace.drain()) {
-            if (event.kind() == CommitTrace.Kind.SEND) {
-              sending[0] = event.a() != 2;
-            } else if (event.kind() == CommitTrace.Kind.COMPACT) {
-              sending[0] = false;
-            }
-          }
+          observe.accept(CommitTrace.drain());
+          afterALanded.run();
           if (sending[0] && op == InMemoryAppendBlobStore.Op.APPEND) {
             sending[0] = false;
             beforeAWrite.run();
@@ -250,43 +305,69 @@ class TestCatalogRaceProperties {
         @Override
         public InMemorySharedLog.WriteFault beforeWrite(
             InMemorySharedLog.Request request, byte[] payload) {
-          if (!nested[0] && request == InMemorySharedLog.Request.APPEND
-              && LogEnvelope.decodeRecord(payload).isIntention()) {
-            beforeAWrite.run();
+          if (!nested[0]) {
+            observe.accept(CommitTrace.drain());
+            afterALanded.run();
+            if (request == InMemorySharedLog.Request.APPEND
+                && LogEnvelope.decodeRecord(payload).isIntention()) {
+              beforeAWrite.run();
+            }
           }
           return InMemorySharedLog.WriteFault.NONE;
+        }
+
+        @Override
+        public InMemorySharedLog.ReadShape beforeRead(InMemorySharedLog.Request request) {
+          if (!nested[0]) {
+            observe.accept(CommitTrace.drain()); // a read through a send that landed: D
+            afterALanded.run();
+          }
+          return InMemorySharedLog.ReadShape.NORMAL;
         }
       });
     } else {
       io.injectFaults((location, strategy) -> {
         if (!nested[0] && location.equals(CATALOG)) {
-          for (CommitTrace.Event event : CommitTrace.drain()) {
-            if (event.kind() == CommitTrace.Kind.COMMIT) {
-              compacting[0] = false;
-            } else if (event.kind() == CommitTrace.Kind.COMPACT) {
-              compacting[0] = true;
-            }
-          }
+          observe.accept(CommitTrace.drain());
+          afterALanded.run();
           if (!compacting[0]) {
             beforeAWrite.run();
           }
         }
         return Fault.NONE;
       });
+      // a read through a write that does not say what the object holds reads it: D before
+      io.injectReadFaults(location -> {
+        if (!nested[0] && location.equals(CATALOG)) {
+          observe.accept(CommitTrace.drain());
+          afterALanded.run();
+        }
+        return InMemoryAtomicFileIO.ReadFault.NONE;
+      });
     }
     String raceA;
+    Table[] handle = {null}; // the table A's operation committed through
     try {
-      raceA = a.run(writerA, "A");
+      raceA = a.run(writerA, "A", handle);
     } finally {
       CommitTrace.close();
     }
     io.injectFaults((location, strategy) -> Fault.NONE);
+    io.injectReadFaults(location -> InMemoryAtomicFileIO.ReadFault.NONE);
     if (log != null) {
       log.intercept(null);
     }
     if (blobs != null) {
       blobs.intercept(null);
     }
+    if (d.kind != null && resultD[0] == null) {
+      resultD[0] = d.run(writerD, "D"); // no send of A's landed, or no request followed it
+    }
+    String heldAfterD = dDuring[0] && handle[0] != null && raceA.startsWith("ok")
+        ? holdsTheCatalogsVersion(handle[0], a.target(), io) : null;
+    // A's second commit, through the handle that holds what its first landed in
+    String raceAgain = again && handle[0] != null && raceA.startsWith("ok")
+        ? Op.again(handle[0], "A") : null;
     int before = Math.min(writes[0], racers.size()); // racers that ran before one of A's writes
     for (int k = before; k < racers.size(); k++) {
       results[k] = racers.get(k).run(writers.get(k), name(k));
@@ -322,19 +403,37 @@ class TestCatalogRaceProperties {
     // horizon below its record.
     boolean lost = gc && before > 0 && (raceA.equals("CommitFailedException")
         || raceA.equals("CommitStateUnknownException"));
-    String[] serial = new String[racers.size()];
-    String[] first = serialRun(setup, base, replaced || lost ? null : a, modeA, racers, racerModes,
-        before, props, serial);
-    String serialA = replaced || lost ? raceA : first[0];
-    String serialState = first[1];
+    // The serial runs the race may end as, the first that matches: D after A, or before it if D
+    // ran while A's operation did; without A if it failed as it may, or, if it lost its outcome
+    // to gc, with it too. A mismatch is reported against the first.
+    boolean excluded = replaced || lost;
+    String race = outcomes(raceA, results, d, resultD[0], raceAgain);
+    List<Op> aOrNone = new java.util.ArrayList<>();
+    aOrNone.add(excluded ? null : a);
+    if (lost) {
+      aOrNone.add(a);
+    }
+    String serialRun = null;
+    String serialState = null;
     boolean tookEffect = false; // A lost its outcome, but the race ends as the serial run with A
-    if (lost && !raceState.equals(serialState)) {
-      String[] withA = new String[racers.size()];
-      String[] landed = serialRun(setup, base, a, modeA, racers, racerModes, before, props, withA);
-      if (raceState.equals(landed[1])) {
-        serial = withA;
-        serialState = landed[1];
-        tookEffect = true;
+    boolean dBeforeA = false;
+    candidates:
+    for (Op serialOp : aOrNone) {
+      for (boolean dFirst : dDuring[0] ? new boolean[] {false, true} : new boolean[] {false}) {
+        String[] serial = new String[racers.size()];
+        String[] run = serialRun(setup, base, serialOp, modeA, racers, racerModes, before, props,
+            serial, d, modeD, dFirst, raceAgain != null);
+        String described = outcomes(excluded ? raceA : run[0], serial, d, run[2], run[3]);
+        boolean matches = race.equals(described) && raceState.equals(run[1]);
+        if (serialRun == null || matches) {
+          serialRun = described;
+          serialState = run[1];
+          tookEffect = excluded && serialOp != null;
+          dBeforeA = dFirst;
+        }
+        if (matches) {
+          break candidates;
+        }
       }
     }
     Statistics.label("A failed as it may").collect(replaced);
@@ -343,6 +442,13 @@ class TestCatalogRaceProperties {
     Statistics.label("racers before A's writes")
         .collect(catalogLog + ": " + before + " of " + racers.size());
     Statistics.label("A").collect(a.kind + " " + (raceA.startsWith("ok") ? "ok" : "fails"));
+    Statistics.label("D").collect(d.kind == null ? "none"
+        : (dDuring[0] ? "just after A's write landed" : "after A")
+            + (dBeforeA ? ", before A serially" : ""));
+    Statistics.label("A's handle after D")
+        .collect(heldAfterD == null ? "-" : heldAfterD);
+    Statistics.label("A again")
+        .collect(raceAgain == null ? "no" : raceAgain.startsWith("ok") ? "ok" : "fails");
     StringBuilder context = new StringBuilder(
         String.format("%nsetup %s%s%s, clocks off by %s ms%nA (%s): %s", setup, gc ? ", gc" : "",
             paging ? ", paging" : "", clockOffsets, modeA, a));
@@ -350,11 +456,16 @@ class TestCatalogRaceProperties {
       context.append(String.format("%n%s (%s): %s, %s", name(k), racerModes.get(k),
           racers.get(k), k < before ? "just before A's write #" + k : "after A"));
     }
+    if (d.kind != null) {
+      context.append(String.format("%nD (%s): %s, %s", modeD, d,
+          dDuring[0] ? "just after A's write landed" : "after A"));
+    }
+    if (raceAgain != null) {
+      context.append(String.format("%nA again: an append through A's handle"));
+    }
     if (tookEffect && !raceA.equals("CommitStateUnknownException")) {
       throw new AssertionError(String.format("A reported %s, but took effect%s", raceA, context));
     }
-    String race = "A=" + raceA + " " + java.util.Arrays.toString(results);
-    String serialRun = "A=" + serialA + " " + java.util.Arrays.toString(serial);
     if (!race.equals(serialRun)) {
       throw new AssertionError(String.format(
           "the race reported %s; the serial run %s%s", race, serialRun, context));
@@ -386,7 +497,7 @@ class TestCatalogRaceProperties {
    */
   @Provide
   Arbitrary<List<Long>> clockOffsets() {
-    return Arbitraries.of(0L, 0L, 0L, 0L, -3L, -300L, 3L, 300L, 100_000L).list().ofSize(3);
+    return Arbitraries.of(0L, 0L, 0L, 0L, -3L, -300L, 3L, 300L, 100_000L).list().ofSize(4);
   }
 
   /** The PageOut records the catalog's log ever held. */
@@ -411,24 +522,62 @@ class TestCatalogRaceProperties {
 
   /**
    * A serial run on a copy of {@code setup}: the racers that ran before A's writes, then A unless
-   * it is null, then the rest. Fills {@code results} with the racers' results; returns A's result
-   * and the catalog's state.
+   * it is null, with D, if any, just before it ({@code dFirst}) or just after, then A's second
+   * commit through its handle ({@code again}, if A's operation succeeded), then the rest. Fills
+   * {@code results} with the racers' results; returns A's result, the catalog's state, D's result
+   * and that of A's second commit.
    */
   private static String[] serialRun(Setup setup, LocalCatalogMode base, Op a,
       LocalCatalogMode modeA, List<Op> racers, List<LocalCatalogMode> racerModes, int before,
-      Map<String, String> props, String[] results) {
+      Map<String, String> props, String[] results, Op d, LocalCatalogMode modeD, boolean dFirst,
+      boolean again) {
     InMemoryAtomicFileIO serialIo = new InMemoryAtomicFileIO();
     setup.apply(base.catalog(serialIo, WAREHOUSE, "c", Map.of()));
     for (int k = 0; k < before; k++) {
       results[k] = racers.get(k).run(
           racerModes.get(k).catalog(serialIo, WAREHOUSE, "c", props), name(k));
     }
-    String resultA = a == null ? null : a.run(modeA.catalog(serialIo, WAREHOUSE, "c", props), "A");
+    String resultD = null;
+    if (d.kind != null && dFirst) {
+      resultD = d.run(modeD.catalog(serialIo, WAREHOUSE, "c", props), "D");
+    }
+    Table[] handle = {null};
+    String resultA = a == null ? null
+        : a.run(modeA.catalog(serialIo, WAREHOUSE, "c", props), "A", handle);
+    if (d.kind != null && !dFirst) {
+      resultD = d.run(modeD.catalog(serialIo, WAREHOUSE, "c", props), "D");
+    }
+    String resultAgain = again && handle[0] != null && resultA.startsWith("ok")
+        ? Op.again(handle[0], "A") : null;
     for (int k = before; k < racers.size(); k++) {
       results[k] = racers.get(k).run(
           racerModes.get(k).catalog(serialIo, WAREHOUSE, "c", props), name(k));
     }
-    return new String[] {resultA, state(serialIo)};
+    return new String[] {resultA, state(serialIo), resultD, resultAgain};
+  }
+
+  /** What a run reported: A's result, the racers', D's if it ran and A's second commit's. */
+  private static String outcomes(String a, String[] racers, Op d, String resultD, String again) {
+    return "A=" + a + " " + java.util.Arrays.toString(racers)
+        + (d.kind != null ? " D=" + resultD : "") + (again != null ? " again=" + again : "");
+  }
+
+  /**
+   * Whether the table {@code handle} holds is the version the catalog holds now, after D: a
+   * fresh reader's metadata location ("D's version"), or another ("an older version").
+   */
+  private static String holdsTheCatalogsVersion(
+      Table handle, TableIdentifier id, InMemoryAtomicFileIO io) {
+    LogCatalog reader =
+        LocalCatalogMode.readerFor(io, CATALOG).catalog(io, WAREHOUSE, "c", Map.of());
+    if (!reader.tableExists(id)) {
+      return "the table is gone";
+    }
+    String now = ((org.apache.iceberg.HasTableOperations) reader.loadTable(id)).operations()
+        .current().metadataFileLocation();
+    String held = ((org.apache.iceberg.HasTableOperations) handle).operations().current()
+        .metadataFileLocation();
+    return java.util.Objects.equals(now, held) ? "D's version" : "an older version";
   }
 
   private static String name(int racer) {
@@ -472,7 +621,8 @@ class TestCatalogRaceProperties {
     Op b = new Op(racerB, x, x + y);
     Op c = twoRacers ? new Op(racerC, y, x) : new Op(null, 0, 0);
     aRaceEndsAsASerialRun(fileModeA, fileModeB, fileModeC, storage, catalogLog, setup, a, b, c,
-        gc, paging, clockOffsets, encoding, reads, recordingReads, tailReads, compactAfter);
+        gc, paging, clockOffsets, encoding, reads, recordingReads, tailReads, compactAfter,
+        fileModeA, new Op(null, 0, 0), false);
   }
 
   /** What a racer does to a table a transaction writes or reads. */
@@ -522,6 +672,21 @@ class TestCatalogRaceProperties {
             Arbitraries.integers().between(0, 11),
             Arbitraries.integers().between(0, 11))
         .as(Op::new);
+  }
+
+  /**
+   * Racer D: half the time none, else an operation on A's table (its x is A's): a change through a
+   * handle, a drop, a rename or a catalog transaction appending to it.
+   */
+  @Provide
+  Arbitrary<Op> afterOps() {
+    return Arbitraries.oneOf(
+        Combinators.combine(
+                Arbitraries.of(Kind.SET_TABLE_PROPERTY, Kind.FAST_APPEND, Kind.DELETE_ALL,
+                    Kind.DROP_TABLE, Kind.RENAME_TABLE, Kind.CATALOG_TXN),
+                Arbitraries.integers().between(0, 11))
+            .as((kind, y) -> new Op(kind, 0, y)),
+        Arbitraries.just(new Op(null, 0, 0)));
   }
 
   /** An operation half the time, else none (an Op of no kind). */
@@ -637,6 +802,11 @@ class TestCatalogRaceProperties {
       return TABLES.get(x % TABLES.size());
     }
 
+    /** The table the operation loads, creates or changes. */
+    TableIdentifier target() {
+      return table();
+    }
+
     private TableIdentifier other() {
       return TABLES.get(y % TABLES.size());
     }
@@ -715,6 +885,14 @@ class TestCatalogRaceProperties {
 
     /** Runs the operation as {@code who}; returns "ok" and its result, or the exception's class. */
     String run(LogCatalog catalog, String who) {
+      return run(catalog, who, new Table[1]);
+    }
+
+    /**
+     * As {@link #run(LogCatalog, String)}; {@code handle} gets the table the operation committed
+     * through, one it loaded or created, if it did.
+     */
+    String run(LogCatalog catalog, String who, Table[] handle) {
       try {
         switch (kind) {
           case CREATE_NAMESPACE:
@@ -727,7 +905,7 @@ class TestCatalogRaceProperties {
           case REMOVE_NAMESPACE_PROPERTY:
             return "ok " + catalog.removeProperties(ns(), Set.of(key()));
           case CREATE_TABLE:
-            catalog.buildTable(table(), SCHEMA).withProperty("origin", who).create();
+            handle[0] = catalog.buildTable(table(), SCHEMA).withProperty("origin", who).create();
             return "ok";
           case CREATE_TABLE_TXN:
             catalog.buildTable(table(), SCHEMA).withProperty("origin", who)
@@ -739,10 +917,12 @@ class TestCatalogRaceProperties {
             catalog.renameTable(table(), other());
             return "ok";
           case SET_TABLE_PROPERTY:
-            catalog.loadTable(table()).updateProperties().set(key(), who).commit();
+            handle[0] = catalog.loadTable(table());
+            handle[0].updateProperties().set(key(), who).commit();
             return "ok";
           case FAST_APPEND:
             Table table = catalog.loadTable(table());
+            handle[0] = table;
             table.newFastAppend()
                 .appendFile(org.apache.iceberg.DataFiles.builder(table.spec())
                     .withPath("mem:///data/" + who + ".parquet")
@@ -777,18 +957,39 @@ class TestCatalogRaceProperties {
             txn.commitTransaction();
             return "ok";
           default:
-            catalog.loadTable(table()).newDelete()
+            handle[0] = catalog.loadTable(table());
+            handle[0].newDelete()
                 .deleteFromRowFilter(org.apache.iceberg.expressions.Expressions.alwaysTrue())
                 .commit();
             return "ok";
         }
       } catch (RuntimeException e) {
-        if (e instanceof IllegalStateException && e.getMessage() != null
-            && e.getMessage().startsWith("Table UUID does not match")) {
-          return REPLACED;
-        }
-        return e.getClass().getSimpleName();
+        return outcome(e);
       }
+    }
+
+    /** A second commit through {@code handle}: a file named for {@code who} appended. */
+    static String again(Table handle, String who) {
+      try {
+        handle.newFastAppend()
+            .appendFile(org.apache.iceberg.DataFiles.builder(handle.spec())
+                .withPath("mem:///data/" + who + "-again.parquet")
+                .withFileSizeInBytes(10)
+                .withRecordCount(1)
+                .build())
+            .commit();
+        return "ok";
+      } catch (RuntimeException e) {
+        return outcome(e);
+      }
+    }
+
+    private static String outcome(RuntimeException e) {
+      if (e instanceof IllegalStateException && e.getMessage() != null
+          && e.getMessage().startsWith("Table UUID does not match")) {
+        return REPLACED;
+      }
+      return e.getClass().getSimpleName();
     }
 
     @Override
