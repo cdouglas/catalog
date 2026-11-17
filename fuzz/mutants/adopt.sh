@@ -7,6 +7,8 @@
 # that writer's update); adoptunlisted holds the metadata as the commit staged it, before its
 # inline-ML snapshots' lists were written to files (what a table leaving inline storage, or a
 # writer that does not inline committing to an inline-ML table, names differs from its file).
+# TestCommitReads holds a case each mutant fails (anUpdateLandingJustAfterACommitIsHeldAndKept;
+# aTableLeavingInlineStorageHoldsItsFile, aWriterThatDoesNotInlineHoldsTheFileItWrote).
 MUTANTS="adoptany adoptunlisted"
 EQUIVALENT=""
 ORACLES=TestCatalogFaultProperties,TestCatalogRaceProperties,TestInlineDifferentialProperties,TestCommitReads
