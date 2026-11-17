@@ -1021,8 +1021,9 @@ public class LogCatalog extends BaseMetastoreCatalog
      * file's metadata rather than reading it back, as JDBC's operations on core-perf hold the table
      * their commit wrote (errata D26); one that names another file reads it. A {@link #refresh}
      * still reads the log. The commit has landed whatever happens here: if the table cannot be
-     * loaded from the replica (a pointer table's metadata file unreadable), the next {@link
-     * #current()} refreshes instead.
+     * loaded from the replica (a pointer table's metadata file unreadable, or the table dropped
+     * just after the commit, which a read through it can see), the next {@link #current()}
+     * refreshes instead.
      */
     private void adoptLanded() {
       Replica<CatalogState> committed = landed;
@@ -1030,10 +1031,15 @@ public class LogCatalog extends BaseMetastoreCatalog
       landed = null;
       written = null;
       if (committed != null) {
+        // The commit landed, so the table was there: one gone from the replica (a read through a
+        // write reads on to the log's end) was dropped since, not yet to be created (Bug 92)
+        loaded = true;
         try {
           loadFrom(committed.state(), wrote);
           lastRead = committed;
           return;
+        } catch (NoSuchTableException e) {
+          // dropped just after the commit landed: the refresh reports it
         } catch (RuntimeException e) {
           LOG.warn("Cannot load {} from the catalog its commit landed in; refreshing", tableId, e);
         }

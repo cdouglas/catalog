@@ -5703,4 +5703,54 @@ public class TestCatalogRegressions {
       assertThat(catalog.dropTable(t, true)).isFalse();
     }
   }
+
+  /**
+   * Bug 92 (create's handle lost a drop): a commit reads back the log through its write, and on a
+   * shared log (or the segmented log on Azure) that read goes on to the log's end. A create's
+   * table operations took the replica it landed in, and found the table missing from it, dropped
+   * by another writer just after the create landed: they took that for a table not yet created,
+   * held no metadata, and turned refreshes off, so every later use of the create's handle failed
+   * with a NullPointerException where a dropped table's is NoSuchTableException. Found by the race
+   * fuzzer's racer just after A's write landed (a drop of the table A created).
+   */
+  @Nested
+  class ATableDroppedJustAfterItsCreateLanded {
+    private final TableIdentifier t = TableIdentifier.of("ns", "t");
+
+    @ParameterizedTest
+    @EnumSource(names = {"MEMLOG", "MEMLOG_TM", "MEMLOG_ML"})
+    void isDroppedToTheCreatesHandle(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = mode.catalog(io, "mem:///warehouse", "c", Map.of());
+      catalog.createNamespace(Namespace.of("ns"));
+      LogCatalog other = mode.catalog(io, "mem:///warehouse", "c", Map.of());
+      org.intentlog.memory.InMemorySharedLog log =
+          LocalCatalogMode.sharedLog(io, "mem:///warehouse/catalog-c");
+      boolean[] raced = {false};
+      log.intercept(new org.intentlog.memory.InMemorySharedLog.Interceptor() {
+        @Override
+        public org.intentlog.memory.InMemorySharedLog.ReadShape beforeRead(
+            org.intentlog.memory.InMemorySharedLog.Request request) {
+          if (request == org.intentlog.memory.InMemorySharedLog.Request.READ_THROUGH
+              && !raced[0]) {
+            raced[0] = true;
+            assertThat(other.dropTable(t, false)).isTrue();
+          }
+          return org.intentlog.memory.InMemorySharedLog.ReadShape.NORMAL;
+        }
+      });
+      Table table;
+      try {
+        table = catalog.createTable(t, intSchema);
+      } finally {
+        log.intercept(null);
+      }
+      assertThat(raced[0]).as("the drop landed just after the create").isTrue();
+
+      assertThatThrownBy(() -> table.newFastAppend().appendFile(file("a")).commit())
+          .isInstanceOf(NoSuchTableException.class);
+      assertThatThrownBy(table::refresh).isInstanceOf(NoSuchTableException.class);
+      assertThat(catalog.tableExists(t)).isFalse();
+    }
+  }
 }
