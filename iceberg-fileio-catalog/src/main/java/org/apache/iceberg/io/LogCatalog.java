@@ -336,15 +336,19 @@ public class LogCatalog extends BaseMetastoreCatalog
 
   /**
    * The metadata a drop with purge deletes the files of: the version of {@code identifier} that
-   * {@code read} holds, which the drop removes. Null if its metadata file is lost: the drop goes on
-   * and leaves the table's files, as Iceberg's metastores drop such a table (apache/iceberg#5510;
-   * Bug 88). A file gone because the table changed since {@code read} is that change (Bug 87).
+   * {@code read} holds, which the drop removes, with its history: a compaction after the drop lands
+   * deletes the pages that hold its sealed snapshots (Bug 94). Null if its metadata file or a page
+   * of its history is lost: the drop goes on and leaves the table's files, as Iceberg's metastores
+   * drop such a table (apache/iceberg#5510; Bug 88). A file gone because the table changed since
+   * {@code read} is that change (Bug 87).
    */
   private TableMetadata purgedVersion(TableIdentifier identifier, Replica<CatalogState> read) {
     try {
-      return tableOpsAsRead(identifier, read).current();
-    } catch (org.apache.iceberg.exceptions.NotFoundException e) {
-      LOG.warn("Cannot load the metadata of {}: dropping it without purging its files",
+      TableMetadata version = tableOpsAsRead(identifier, read).current();
+      version.snapshots(); // now, while the catalog names their pages
+      return version;
+    } catch (org.apache.iceberg.exceptions.NotFoundException | SnapshotPages.MissingPage e) {
+      LOG.warn("Cannot load the metadata or history of {}: dropping it without purging its files",
           identifier, e);
       return null;
     }

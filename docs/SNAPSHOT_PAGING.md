@@ -411,6 +411,14 @@ the root (one a compactor ahead wrote) is not garbage.
   dropped, which failed as not found (Bug 93 (dropped table's history not
   found)). The differential test's stale steps pick among the snapshots
   the table still has, where both catalogs agree.
+- A drop that purges reads the history of the version it drops before the
+  drop lands, while the catalog names its pages: a compaction after the
+  drop (its writer's, compacting after the commit, or another writer's)
+  deletes them, and a purge that read them after found nothing to delete
+  and left every file of the table (Bug 94 (purge leaks a paged table),
+  found as warnings in rounds p11-r3p and p12-r0p). A page of that history
+  lost from the store fails nothing: the table is dropped and its files
+  left, as with a lost metadata file (Bug 88).
 - A copy shipped to a worker reads its version's pages through the table's
   FileIO and has no catalog to ask: a page collected since fails there, as
   a lost one does. That takes a job outliving its table's move past the

@@ -5820,4 +5820,66 @@ public class TestCatalogRegressions {
           .isInstanceOf(NoSuchTableException.class);
     }
   }
+
+  /**
+   * Bug 94 (purge leaks a paged table): a purge loaded the version it drops lazily, landed the
+   * drop, and only then read the version's history to delete its files. A compaction that lands
+   * after the drop (its own writer's, compacting after the commit, or another writer's) deletes the
+   * pages of the table's sealed blocks (SNAPSHOT_PAGING.md, "Page GC"), so that read failed, as Bug
+   * 93's did, and the purge deleted nothing: it logged that it could not delete all of the table's
+   * files and left every manifest and list. Found in the fault fuzzer's logs at B = 2, W = 1
+   * (rounds p11-r3p and p12-r0p, as warnings) while finding Bug 93.
+   */
+  @Nested
+  class APurgeOfAPagedTable {
+    private final TableIdentifier t = TableIdentifier.of("ns", "t");
+
+    @ParameterizedTest
+    @EnumSource(names = {"MEMLOG_TM", "MEMLOG_ML"})
+    void deletesTheFilesOfItsSealedSnapshots(LocalCatalogMode mode) throws IOException {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = mode.catalog(io, "mem:///warehouse", "c", PAGED);
+      int tblId = pagedTable(catalog, t);
+      Set<String> files = new HashSet<>();
+      for (org.apache.iceberg.Snapshot snapshot : catalog.loadTable(t).snapshots()) {
+        String list = snapshot.manifestListLocation();
+        if (list != null && !list.startsWith("inline://")) {
+          files.add(list);
+        }
+        for (ManifestFile manifest : snapshot.allManifests(io)) {
+          files.add(manifest.path());
+        }
+      }
+      assertThat(files).hasSizeGreaterThanOrEqualTo(12)
+          .allMatch(file -> io.newInputFile(file).exists());
+
+      // A writer that has not read the table's history drops it, and another compacts just after
+      // the drop lands, before the purge reads the history
+      LogCatalog dropping = mode.catalog(io, "mem:///warehouse", "c", PAGED);
+      LogCatalog other = mode.catalog(io, "mem:///warehouse", "c", PAGED);
+      org.intentlog.memory.InMemorySharedLog log =
+          LocalCatalogMode.sharedLog(io, "mem:///warehouse/catalog-c");
+      boolean[] compacted = {false};
+      log.intercept(new org.intentlog.memory.InMemorySharedLog.Interceptor() {
+        @Override
+        public org.intentlog.memory.InMemorySharedLog.ReadShape beforeRead(
+            org.intentlog.memory.InMemorySharedLog.Request request) {
+          if (request == org.intentlog.memory.InMemorySharedLog.Request.READ_THROUGH
+              && !compacted[0]) {
+            compacted[0] = true;
+            other.log().compact();
+          }
+          return org.intentlog.memory.InMemorySharedLog.ReadShape.NORMAL;
+        }
+      });
+      try {
+        assertThat(dropping.dropTable(t, true)).isTrue();
+      } finally {
+        log.intercept(null);
+      }
+      assertThat(compacted[0]).as("a compaction landed just after the drop").isTrue();
+      assertThat(snapshotPages(catalog, tblId)).isEmpty();
+      assertThat(files).noneMatch(file -> io.newInputFile(file).exists());
+    }
+  }
 }
