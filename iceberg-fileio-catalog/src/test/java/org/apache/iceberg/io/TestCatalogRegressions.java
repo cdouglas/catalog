@@ -5753,4 +5753,71 @@ public class TestCatalogRegressions {
       assertThat(catalog.tableExists(t)).isFalse();
     }
   }
+
+  /**
+   * A table of 12 fast appends in a catalog that pages at B = 2, W = 1, then compacted: its old
+   * snapshots are in sealed blocks, whose pages are stored. Returns its table id.
+   */
+  private int pagedTable(LogCatalog catalog, TableIdentifier t) {
+    catalog.createNamespace(t.namespace());
+    Table table = catalog.createTable(t, intSchema);
+    for (int i = 0; i < 12; i++) {
+      table.newFastAppend().appendFile(file("p" + i)).commit();
+    }
+    try {
+      catalog.log().compact(); // stores the pages
+    } catch (UnsupportedOperationException e) {
+      // a log that replaces itself compacted at each commit
+    }
+    int tblId = catalog.log().read().state().tableId(t);
+    assertThat(catalog.log().read().state().sealedBlocks(tblId)).isNotEmpty();
+    assertThat(snapshotPages(catalog, tblId)).isNotEmpty();
+    return tblId;
+  }
+
+  private static List<String> snapshotPages(LogCatalog catalog, int tblId) {
+    List<String> pages = new ArrayList<>();
+    for (String name : catalog.log().pages().list()) {
+      if (name.startsWith("snap." + tblId + ".")) {
+        pages.add(name);
+      }
+    }
+    return pages;
+  }
+
+  private static final Map<String, String> PAGED = Map.of(
+      LogCatalogProperties.SNAPSHOT_BLOCK, "2", LogCatalogProperties.SNAPSHOT_WINDOW, "1");
+
+  /**
+   * Bug 93 (dropped table's history not found): a load holds an inline table's snapshots lazily,
+   * those of its sealed blocks in pages, and once the table is dropped a compaction collects them
+   * (SNAPSHOT_PAGING.md, "Page GC"). A handle loaded before the drop that then read its history
+   * failed with the page's NotFoundException, where every other use of a dropped table's handle (a
+   * commit, a refresh: Bug 92) and a REST catalog's lazy load (its supplier loads the table again)
+   * fail with NoSuchTableException. Found by the fault fuzzer at B = 2, W = 1 (round p12-r0p): an
+   * expiry choosing its cutoff from its writer's handle to a table another writer had dropped.
+   */
+  @Nested
+  class AStaleHandleOfADroppedPagedTable {
+    private final TableIdentifier t = TableIdentifier.of("ns", "t");
+
+    @ParameterizedTest
+    @EnumSource(names = {"CAS_TM", "CAS_ML"})
+    void readsItsHistoryAsNoSuchTable(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = mode.catalog(io, "mem:///warehouse", "c", PAGED);
+      int tblId = pagedTable(catalog, t);
+      Table stale = mode.catalog(io, "mem:///warehouse", "c", PAGED).loadTable(t);
+      long oldest = Iterables.getFirst(catalog.loadTable(t).snapshots(), null).snapshotId();
+
+      assertThat(catalog.dropTable(t, false)).isTrue();
+      catalog.createTable(TableIdentifier.of("ns", "other"), intSchema); // a root without t
+      assertThat(snapshotPages(catalog, tblId)).isEmpty();
+
+      assertThatThrownBy(stale::snapshots).isInstanceOf(NoSuchTableException.class);
+      assertThatThrownBy(() -> stale.snapshot(oldest)).isInstanceOf(NoSuchTableException.class);
+      assertThatThrownBy(() -> stale.expireSnapshots().expireOlderThan(Long.MAX_VALUE).commit())
+          .isInstanceOf(NoSuchTableException.class);
+    }
+  }
 }

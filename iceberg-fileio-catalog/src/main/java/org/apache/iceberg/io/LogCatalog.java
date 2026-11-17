@@ -542,13 +542,29 @@ public class LogCatalog extends BaseMetastoreCatalog
    * A table's snapshots as a read of the catalog held them, which a page holds that has been
    * collected since: the table has moved past that version, or is gone (SNAPSHOT_PAGING.md, "Page
    * GC"). A load holding that read reads them from the table as it is now, and finds them gone
-   * only with the table; a commit staged on that read fails as stale.
+   * only with the table, which does not exist ({@link NoSuchTableException}, Bug 93); a commit
+   * staged on that read fails as stale.
    */
   static final class PageCollectedException extends org.apache.iceberg.exceptions.NotFoundException {
+    private final TableIdentifier table;
+    private final int read;
+
     PageCollectedException(
         SnapshotPages.MissingPage cause, TableIdentifier table, int read, int now) {
       super(cause, "The snapshots of %s at version %s are gone (page %s; the table is %s)",
           table, read, cause.name, now == -1 ? "gone" : "at version " + now);
+      this.table = table;
+      this.read = read;
+    }
+
+    /**
+     * The table that is gone, as Iceberg says so: a handle's snapshots, asked for once its table
+     * was dropped, are a dropped table's (a REST catalog's lazy load loads the table again, and
+     * finds none), as its commits and refreshes are.
+     */
+    NoSuchTableException asNoSuchTable() {
+      return new NoSuchTableException(
+          this, "Table does not exist: %s (dropped since a load of version %s)", table, read);
     }
   }
 
@@ -1916,7 +1932,7 @@ public class LogCatalog extends BaseMetastoreCatalog
      * table keeps it: inline, in a page, in a metadata file). Those expired since are gone, as they
      * are from a REST catalog's lazy load, whose supplier loads the table as it is when asked
      * (TableMetadata keeps what the supplier gives of the snapshots it inherited). If the table is
-     * gone, so are they ({@code collected}).
+     * gone, it does not exist, as it does not for that supplier (Bug 93).
      */
     private static List<Snapshot> asNow(
         CatalogLog log, FileIO io, InlineSettings inline, InlineSnapshots inlineSnapshots,
@@ -1931,7 +1947,7 @@ public class LogCatalog extends BaseMetastoreCatalog
         }
       }
       if (named == null) {
-        throw collected;
+        throw collected.asNoSuchTable();
       }
       Map<Long, Snapshot> current = new HashMap<>();
       FileIOTableOperations ops = new FileIOTableOperations(

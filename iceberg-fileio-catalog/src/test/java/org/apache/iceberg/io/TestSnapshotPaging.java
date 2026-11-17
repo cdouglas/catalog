@@ -413,9 +413,9 @@ class TestSnapshotPaging {
    * all of them after the table was evicted to a pointer and its pages went (fault round, B = 2,
    * W = 1, where a stale handle's schema update staged on such metadata), those not expired since
    * after an expiry emptied their blocks (round sp5-r0: a stale handle's history, before an expiry
-   * and before any command of the differential test's), and none, as not found, once the table is
-   * dropped. A commit staged on it fails as stale, which a refresh cures. A page the table still
-   * names that the store lost is never taken for collected.
+   * and before any command of the differential test's), and none once the table is dropped: the
+   * table does not exist (Bug 93). A commit staged on it fails as stale, which a refresh cures. A
+   * page the table still names that the store lost is never taken for collected.
    */
   @ParameterizedTest
   @EnumSource(names = {"CAS_TM", "CAS_ML"})
@@ -490,8 +490,8 @@ class TestSnapshotPaging {
     append(writer.buildTable(TableIdentifier.of("ns", "other"), SCHEMA)
         .withPartitionSpec(SPEC).create(), 0); // a root without the table
     assertThatThrownBy(() -> current(dropped).snapshots())
-        .isInstanceOf(org.apache.iceberg.exceptions.NotFoundException.class)
-        .hasMessageContaining("are gone");
+        .isInstanceOf(org.apache.iceberg.exceptions.NoSuchTableException.class)
+        .hasMessageContaining("Table does not exist: " + TABLE);
   }
 
   private static List<Long> ids(Iterable<Snapshot> snapshots) {

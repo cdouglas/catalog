@@ -395,9 +395,10 @@ the root (one a compactor ahead wrote) is not garbage.
   longer names the page, the page was collected, and the load answers with
   its version's inline snapshots and those of its sealed blocks' live ids
   that a load of the table now has (a snapshot never changes, wherever the
-  table keeps it). Only a dropped table's are gone
-  (`LogCatalog.PageCollectedException`, a `NotFoundException`). A commit
-  staged on such a read fails as stale (`CommitFailedException`), which
+  table keeps it). Only a dropped table's are gone, and the load answers
+  that the table does not exist (`NoSuchTableException`), as a REST
+  catalog's supplier does and as the handle's commits and refreshes do. A
+  commit staged on such a read fails as stale (`CommitFailedException`), which
   Iceberg's retry cures with a refresh. A missing page the table still
   names is a loss, never taken for collected (`SnapshotPages.MissingPage`).
   Found by fault rounds at B = 2, W = 1: a stale handle's schema update
@@ -405,9 +406,11 @@ the root (one a compactor ahead wrote) is not garbage.
   found), then, in round sp5-r0, stale handles' histories, which Iceberg
   and its callers read outside the commit retry (an expiry's choice of
   snapshot, every command of the differential test's): not found there
-  was a failure where a pointer catalog succeeds. The differential test's
-  stale steps pick among the snapshots the table still has, where both
-  catalogs agree.
+  was a failure where a pointer catalog succeeds; and in round p12-r0p, an
+  expiry choosing its cutoff on a handle to a table another writer had
+  dropped, which failed as not found (Bug 93 (dropped table's history not
+  found)). The differential test's stale steps pick among the snapshots
+  the table still has, where both catalogs agree.
 - A copy shipped to a worker reads its version's pages through the table's
   FileIO and has no catalog to ask: a page collected since fails there, as
   a lost one does. That takes a job outliving its table's move past the
