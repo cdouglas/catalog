@@ -87,6 +87,20 @@ class TestConflictMatrix {
             cmd(Kind.ADD_PARTITION_FIELD, 1, 0), cmd(Kind.FAST_APPEND, 0, 2)),
         row("snapshot expiry", "append", "RRRRRR",
             cmd(Kind.EXPIRE_SNAPSHOTS, 0, 1), cmd(Kind.FAST_APPEND, 0, 2)),
+        // an expiry lands after commits that add snapshots, removing what it chose (errata D17)
+        row("append", "snapshot expiry", "RRMMMM",
+            cmd(Kind.FAST_APPEND, 0, 2), cmd(Kind.EXPIRE_SNAPSHOTS, 0, 1)),
+        row("property change", "snapshot expiry", "RMMMMM",
+            cmd(Kind.SET_PROPERTY, 0, 0), cmd(Kind.EXPIRE_SNAPSHOTS, 0, 1)),
+        // ... but not once a ref names a snapshot it chose, where Iceberg's retry keeps it
+        row("tag on the snapshot it expires", "snapshot expiry", "RRRRRR",
+            cmd(Kind.CREATE_TAG, 0, 0), cmd(Kind.EXPIRE_SNAPSHOTS, 0, 1)),
+        row("rollback to the snapshot it expires", "snapshot expiry", "RRRRRR",
+            cmd(Kind.ROLLBACK, 0, 0), cmd(Kind.EXPIRE_SNAPSHOTS, 0, 1)),
+        // ... nor after a reset of a ref that names none of them: one may have come and gone, and
+        // a rejection must stay one on every later version (S2)
+        row("branch created on main's head", "snapshot expiry", "RRRRRR",
+            cmd(Kind.CREATE_BRANCH, 1, 1), cmd(Kind.EXPIRE_SNAPSHOTS, 0, 1)),
         row("rollback", "append", "RRRRRR",
             cmd(Kind.ROLLBACK, 0, 0), cmd(Kind.FAST_APPEND, 0, 2)),
         row("append", "schema change", "OOOOOO",

@@ -60,6 +60,13 @@ import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
  *   <li>otherwise both runs are Iceberg's retries, and must end alike.
  * </ul>
  *
+ * <p>An expiry is the exception: the subject's merge of one onto a changed table removes the
+ * snapshots it chose on the table it read (errata D17), where Iceberg's retry chooses again on the
+ * table the window left (a retained count counts the window's snapshots too). Its reference runs
+ * the window, then removes exactly the snapshots R removes after the prefix alone (matched by
+ * sequence number), as Iceberg's builder does: a merge that removes a snapshot a ref names, which
+ * the builder refuses, fails it ({@link #aMergedExpiryRemovesWhatItChoseOnItsBase}).
+ *
  * <p>The subject draws its encoding, and whether R's writer pins what Iceberg commits once (a
  * schema or spec update, a ref reset): replay must tell that from the delta too ({@link
  * TableChange#commitOnce}), as it must for a writer that does not pin. The statistics count, per
@@ -207,6 +214,27 @@ class TestRebaseProperties {
       @ForAll("expiredHistories") List<TableScript.Cmd> window,
       @ForAll("validatingFromTheHead") TableScript.Cmd r) {
     check(encoding, formatVersion, true, mode, true, prefix, window, r);
+  }
+
+  /**
+   * An expiry R racing a window of data commits (to main or a branch), resets (rollbacks,
+   * fast-forwards, cherry-picks), refs created on snapshots the table has or removed, other
+   * expiries, or any single command, on a table with branches and staged snapshots. An encoding
+   * that merges an expiry onto a changed table (errata D17) must do so only where no ref came to
+   * name a snapshot it chose, and leave the table as the window, then the removal of exactly those
+   * snapshots, would ({@link #verify}'s expiry reference); one it rejects, Iceberg's retry commits.
+   */
+  @Property(tries = 300)
+  void aMergedExpiryRemovesWhatItChoseOnItsBase(
+      @ForAll("encodings") String encoding,
+      @ForAll @IntRange(min = 2, max = 3) int formatVersion,
+      @ForAll boolean partitioned,
+      @ForAll("inlineModes") LocalCatalogMode mode,
+      @ForAll boolean pinned,
+      @ForAll("guardPrefixes") List<TableScript.Cmd> prefix,
+      @ForAll("expiryWindows") List<TableScript.Cmd> window,
+      @ForAll("expiries") TableScript.Cmd r) {
+    check(encoding, formatVersion, partitioned, mode, pinned, prefix, window, r);
   }
 
   /**
@@ -513,6 +541,11 @@ class TestRebaseProperties {
         Run.of(encoding, mode, formatVersion, partitioned, pinned, prefix, window, r, trace);
     Run reference = Run.of(LamportEncoding.NAME, mode, formatVersion, partitioned, true, prefix,
         window, r, new StringBuilder());
+    if (r.kind == TableScript.Kind.EXPIRE_SNAPSHOTS && subject.raced && subject.changed
+        && subject.conflicts == 0 && subject.failure == null) {
+      // merged where it landed: the window, then what R chose on the prefix's table, removed
+      reference = Run.expiryReference(mode, formatVersion, partitioned, prefix, window, r, trace);
+    }
 
     String outcome;
     if (!subject.raced) {
@@ -523,7 +556,9 @@ class TestRebaseProperties {
       outcome = "admitted on a changed table";
       if (reference.failure != null) {
         throw new AssertionError(String.format(
-            "the subject admitted R on a changed table, but Iceberg's retry fails it: %s%n%s",
+            "the subject admitted R on a changed table, but %s fails it: %s%n%s",
+            r.kind == TableScript.Kind.EXPIRE_SNAPSHOTS
+                ? "the removal of what it chose, after the window," : "Iceberg's retry",
             reference.failure, trace));
       }
     } else if (subject.conflicts > 0 && subject.failure == null) {
@@ -578,6 +613,44 @@ class TestRebaseProperties {
   Arbitrary<LocalCatalogMode> inlineManifestModes() {
     return Arbitraries.of(
         LocalCatalogMode.fileModes().stream().filter(m -> m.inlineML).toList());
+  }
+
+  /** The modes whose tables' updates are inline deltas (inline TM or ML), which can merge. */
+  @Provide
+  Arbitrary<LocalCatalogMode> inlineModes() {
+    return Arbitraries.of(
+        LocalCatalogMode.fileModes().stream().filter(m -> m.inlineTM || m.inlineML).toList());
+  }
+
+  /**
+   * Expiries: of all but each branch's last one to three snapshots and every snapshot no ref
+   * keeps, mostly with no unused schema or spec removed (which Iceberg retries, a record that
+   * removes them having the Lamport witness).
+   */
+  @Provide
+  Arbitrary<TableScript.Cmd> expiries() {
+    Arbitrary<Integer> small = Arbitraries.integers().between(0, 11);
+    return Combinators.combine(small, small, Arbitraries.integers().between(0, 3))
+        .as((a, b, c) -> new TableScript.Cmd(TableScript.Kind.EXPIRE_SNAPSHOTS, a, b,
+            c == 0 ? 0 : c * 2 + 1));
+  }
+
+  /**
+   * Windows of one to three commands that an expiry's witness reads or lets by: data commits, to
+   * main or a branch; resets; refs created (on a snapshot the table has) or removed; expiries; any
+   * single command.
+   */
+  @Provide
+  Arbitrary<List<TableScript.Cmd>> expiryWindows() {
+    return Arbitraries.frequencyOf(
+            Tuple.of(4, TableScript.commands(
+                kind -> VALIDATED.contains(kind) || APPEND_LIKE.contains(kind))),
+            Tuple.of(2, TableScript.commands(RESETS::contains)),
+            Tuple.of(2, TableScript.commands(REF_MOVES::contains)),
+            Tuple.of(1, TableScript.commands(kind -> kind == TableScript.Kind.EXPIRE_SNAPSHOTS)),
+            Tuple.of(2, TableScript.windowCommands(TestRebaseProperties::single)))
+        .withoutEdgeCases()
+        .list().ofMinSize(1).ofMaxSize(3);
   }
 
   /** Appends, and operations that add data as an append does but validate it. */
@@ -1119,6 +1192,85 @@ class TestRebaseProperties {
       return new Run(io, failure, raced[0], raced[0] && !before[0].equals(after[0]), conflicts,
           TableViews.logical(reader(io).loadTable(TableScript.ID),
               beforeR[0].snapshots().size(), beforeR[0].nextRowId()));
+    }
+
+    /**
+     * The reference for an expiry merged onto a changed table: the prefix and the window, run
+     * serially, then a removal of exactly the snapshots R removes when it runs right after the
+     * prefix (matched by sequence number, which the prefix numbers alike in every run), by
+     * Iceberg's builder, as R's record removes them where it lands. Fails where a ref names one
+     * of them, as applying Iceberg's remove-snapshots update does (C22's fix; the builder's
+     * removeSnapshots would drop the ref with it).
+     */
+    static Run expiryReference(LocalCatalogMode mode, int formatVersion, boolean partitioned,
+        List<TableScript.Cmd> prefix, List<TableScript.Cmd> window, TableScript.Cmd r,
+        StringBuilder trace) {
+      // What R chooses on the prefix's table
+      InMemoryAtomicFileIO scratch = new InMemoryAtomicFileIO();
+      LogCatalog chooser = mode.catalog(scratch, WAREHOUSE, "c", PROPERTIES);
+      chooser.createNamespace(Namespace.of("ns"));
+      TableScript.Runner chooses =
+          new TableScript.Runner(chooser, formatVersion, partitioned, new StringBuilder());
+      for (List<TableScript.Cmd> step : TableScript.steps(prefix)) {
+        chooses.run(step);
+      }
+      java.util.Set<Long> removed = sequenceNumbers(current(scratch));
+      chooses.run(List.of(r));
+      removed.removeAll(sequenceNumbers(current(scratch)));
+
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      Map<String, String> properties = new java.util.HashMap<>(PROPERTIES);
+      properties.put(LogCatalogProperties.CONFLICT_ENCODING, LamportEncoding.NAME);
+      LogCatalog catalog = mode.catalog(io, WAREHOUSE, "c", properties);
+      catalog.createNamespace(Namespace.of("ns"));
+      TableScript.Runner writer =
+          new TableScript.Runner(catalog, formatVersion, partitioned, new StringBuilder());
+      for (List<TableScript.Cmd> step : TableScript.steps(prefix)) {
+        writer.run(step);
+      }
+      TableScript.Runner racer =
+          new TableScript.Runner(mode.catalog(io, WAREHOUSE, "c", PROPERTIES), "w",
+              new StringBuilder());
+      for (List<TableScript.Cmd> step : TableScript.steps(window)) {
+        racer.run(step);
+      }
+      TableMetadata beforeR = current(io);
+      org.apache.iceberg.TableOperations ops =
+          ((HasTableOperations) catalog.loadTable(TableScript.ID)).operations();
+      TableMetadata base = ops.refresh();
+      List<Long> ids = new ArrayList<>();
+      base.snapshots().forEach(s -> {
+        if (removed.contains(s.sequenceNumber())) {
+          ids.add(s.snapshotId());
+        }
+      });
+      trace.append(String.format(
+          "expiry reference: R chose the snapshots of sequence numbers %s; after the window, %s%n",
+          new java.util.TreeSet<>(removed), ids.isEmpty() ? "none is left" : "removes " + ids));
+      RuntimeException failure = null;
+      for (Map.Entry<String, org.apache.iceberg.SnapshotRef> ref : base.refs().entrySet()) {
+        if (failure == null && ids.contains(ref.getValue().snapshotId())) {
+          failure = new IllegalStateException(String.format(
+              "ref %s names snapshot %s, which R chose", ref.getKey(),
+              ref.getValue().snapshotId()));
+        }
+      }
+      try {
+        if (failure == null && !ids.isEmpty()) {
+          ops.commit(base, TableMetadata.buildFrom(base).removeSnapshots(ids).build());
+        }
+      } catch (RuntimeException e) {
+        failure = e;
+      }
+      return new Run(io, failure, true, true, 0,
+          TableViews.logical(reader(io).loadTable(TableScript.ID),
+              beforeR.snapshots().size(), beforeR.nextRowId()));
+    }
+
+    private static java.util.Set<Long> sequenceNumbers(TableMetadata metadata) {
+      java.util.Set<Long> numbers = new java.util.HashSet<>();
+      metadata.snapshots().forEach(s -> numbers.add(s.sequenceNumber()));
+      return numbers;
     }
 
     /** The table's metadata location as a fresh reader finds it: another after any commit. */

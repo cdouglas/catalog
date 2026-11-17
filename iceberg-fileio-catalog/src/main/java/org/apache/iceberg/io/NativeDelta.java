@@ -631,6 +631,7 @@ final class NativeDelta {
     TableMetadata current = base;
     TableMetadata.Builder pending = null;
     long lastSequenceNumber = 0L;
+    Set<Long> added = new HashSet<>();
     for (DeltaUpdate update : delta.updates) {
       if (update instanceof AddManifestUpdate || update instanceof RemoveManifestUpdate) {
         if (pending != null) {
@@ -650,8 +651,20 @@ final class NativeDelta {
             ((AddSnapshotUpdate) update).snapshot(
                 sequenceNumber, current.currentSchemaId(), "", writerLastUpdatedMillis,
                 landing));
+        added.add(((AddSnapshotUpdate) update).snapshotId);
       } else if (update instanceof SetSnapshotRefUpdate) {
         landing.ref((SetSnapshotRefUpdate) update).applyTo(pending);
+      } else if (update instanceof RemoveSnapshotsUpdate) {
+        // Only the snapshots the table has, as native replay removes them: an expiry merged where
+        // another removed some of them (errata D17) names more than it has, and Iceberg's builder
+        // sizes what it keeps as the snapshots less those it removes, which fails below 0 (C30)
+        List<Long> present = new ArrayList<>();
+        for (long id : ((RemoveSnapshotsUpdate) update).snapshotIds) {
+          if (current.snapshot(id) != null || added.contains(id)) {
+            present.add(id);
+          }
+        }
+        pending.removeSnapshots(present);
       } else {
         update.applyTo(pending);
       }

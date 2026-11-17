@@ -107,6 +107,11 @@ final class ConcernStamps implements EncodingState {
     return Math.floorMod(ref.hashCode(), refs[0].length);
   }
 
+  /** The ref buckets. */
+  int refBuckets() {
+    return refs[0].length;
+  }
+
   int partitionBuckets() {
     return partitions.length > 0 ? partitions[0].length : 0;
   }

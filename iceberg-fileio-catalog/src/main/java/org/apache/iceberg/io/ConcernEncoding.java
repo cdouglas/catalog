@@ -50,6 +50,8 @@ abstract class ConcernEncoding implements ConflictEncoding<ConcernEncoding.Witne
     final BitSet concerns = new BitSet();
     /** The kinds of change to each ref it reads. */
     final Map<String, EnumSet<ConcernStamps.Ref>> refs = new HashMap<>();
+    /** The kinds of change to any ref it reads: every ref bucket's. */
+    final EnumSet<ConcernStamps.Ref> anyRef = EnumSet.noneOf(ConcernStamps.Ref.class);
     /** The partition buckets it reads, by kind of change; {@link PartitionKey#ALL} for every one. */
     final Map<ConcernStamps.Partition, Set<Integer>> partitions =
         new EnumMap<>(ConcernStamps.Partition.class);
@@ -90,6 +92,14 @@ abstract class ConcernEncoding implements ConflictEncoding<ConcernEncoding.Witne
       return this;
     }
 
+    /** Reads {@code kinds} of change to every ref. */
+    Witness anyRef(ConcernStamps.Ref... kinds) {
+      for (ConcernStamps.Ref kind : kinds) {
+        anyRef.add(kind);
+      }
+      return this;
+    }
+
     Witness partition(ConcernStamps.Partition kind, int bucket) {
       partitions.computeIfAbsent(kind, k -> new HashSet<>()).add(bucket);
       return this;
@@ -103,7 +113,8 @@ abstract class ConcernEncoding implements ConflictEncoding<ConcernEncoding.Witne
     @Override
     public String toString() {
       return whole ? "version " + base
-          : "concerns " + concerns + ", refs " + refs + ", partitions " + partitions
+          : "concerns " + concerns + ", refs " + refs
+              + (anyRef.isEmpty() ? "" : ", any ref " + anyRef) + ", partitions " + partitions
               + (window != null ? ", " + window : "") + " since " + base;
     }
   }
@@ -160,6 +171,8 @@ abstract class ConcernEncoding implements ConflictEncoding<ConcernEncoding.Witne
       TableChange change = TableChange.of(action, landing::table);
       if (change.commitOnce) {
         return commitOnce(change);
+      } else if (change.expiry()) {
+        return "pinned: an expiry (fileio.catalog.expiry.merge off)";
       }
     } catch (RuntimeException e) {
       // a pin it cannot see into is the writer's
@@ -243,6 +256,13 @@ abstract class ConcernEncoding implements ConflictEncoding<ConcernEncoding.Witne
       for (ConcernStamps.Ref kind : ref.getValue()) {
         if (stamps.ref(kind, bucket) > witness.base) {
           return "ref: " + kind.label;
+        }
+      }
+    }
+    for (ConcernStamps.Ref kind : witness.anyRef) {
+      for (int bucket = 0; bucket < stamps.refBuckets(); bucket++) {
+        if (stamps.ref(kind, bucket) > witness.base) {
+          return "ref: " + kind.label + " (any ref)";
         }
       }
     }

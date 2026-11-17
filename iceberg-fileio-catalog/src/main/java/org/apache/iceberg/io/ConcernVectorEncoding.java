@@ -38,8 +38,13 @@ import org.apache.iceberg.SnapshotRef;
  * </ul>
  *
  * So it admits a commit racing property, statistics and sort-order changes and commits and tags on
- * other refs (WAP). What Iceberg commits once (a schema or spec update, a ref reset or retention
- * change) and what it removes have the Lamport witness.
+ * other refs (WAP). An expiry (snapshots removed, and nothing else) reads every ref's resets, the
+ * table, the schemas and the specs: it lands after commits that only add snapshots and move
+ * branches to them, and removes the snapshots it chose on the table it read, none of which a ref
+ * has come to name, where Iceberg's retry would choose again (errata D17 until 2026-11-17;
+ * LogCatalogProperties.EXPIRY_MERGE). What Iceberg commits once (a schema or spec update, a ref
+ * reset or retention change) and other removals (of schemas or specs, or with other changes) have
+ * the Lamport witness.
  */
 class ConcernVectorEncoding extends ConcernEncoding {
 
@@ -66,6 +71,16 @@ class ConcernVectorEncoding extends ConcernEncoding {
 
   @Override
   Witness reads(int base, TableChange change, ReplayView landing) {
+    if (change.expiry()) {
+      // A ref reset since (a tag or branch created on a snapshot the table had, a rollback, a
+      // fast-forward, a ref's removal) may have come to name a snapshot it removes; commits that
+      // only add snapshots, on any branch, leave what it chose unreferenced
+      return Witness.of(base)
+          .concern(TableChange.Concern.TABLE)
+          .concern(TableChange.Concern.SCHEMA)
+          .concern(TableChange.Concern.SPECS)
+          .anyRef(ConcernStamps.Ref.RESET);
+    }
     if (change.concerns.contains(TableChange.Concern.REMOVAL)
         || change.concerns.contains(TableChange.Concern.SCHEMA)
         || change.concerns.contains(TableChange.Concern.SPECS)
@@ -117,7 +132,9 @@ class ConcernVectorEncoding extends ConcernEncoding {
 
   @Override
   String unseparated(TableChange change) {
-    if (change.concerns.contains(TableChange.Concern.REMOVAL)) {
+    if (change.concerns.contains(TableChange.Concern.REMOVAL) && !change.reset.isEmpty()) {
+      return "removes a snapshot a ref names";
+    } else if (change.concerns.contains(TableChange.Concern.REMOVAL)) {
       return "removes snapshots";
     } else if (change.concerns.contains(TableChange.Concern.SCHEMA)) {
       return "removes schemas";

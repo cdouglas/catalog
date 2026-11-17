@@ -5,8 +5,8 @@ built (2026-11-05, measured in REPLAY_BENCH_RESULTS.md; step 3's worker copies
 move to step 4); step 4 built and measured; step 5 built (2026-11-06), with
 which paging is on by default (block 256, window 1,024); step 6 deferred
 (2026-11-06).
-Errata D18 (ML lists stored whole) tracks the problem; D17 (expiry starves)
-and D19 (whole-object compaction trigger) are what it costs. It is R2.1 and
+Errata D18 (ML lists stored whole) tracks the problem; D19 (whole-object
+compaction trigger) is what it costs. It is R2.1 and
 part of R2.2 in [CHECKPOINT_PLAN.md](CHECKPOINT_PLAN.md), under its
 decisions: replay never reads a page (1), page GC (2), and the pool as a
 dedup dictionary (3). The committed set pages apart
@@ -286,8 +286,9 @@ inside the block) keeps its page, and the root keeps only those snapshots'
 ids. Rewriting a block to drop its dead snapshots would save bytes at rest,
 not in the root ([Alternatives](#alternatives-considered)).
 
-Admission is unchanged: an expiry applies only on its base version (Landing),
-which D17 is about. The writer still reads every page: Iceberg's expiry
+Admission is unchanged: an expiry lands on a changed table only after commits
+that add snapshots (SPEC.md "Conflict Encodings"), removing what it chose. The
+writer still reads every page: Iceberg's expiry
 reads all snapshots to choose what to remove and which files to delete.
 
 ## Loads

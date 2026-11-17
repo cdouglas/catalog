@@ -648,6 +648,10 @@ no data or deletes were added in it.
 | schema change, overwrite | ↻ | ↻ | ↻ | ↻ | ↻ | ↻ |
 | partition-spec change, append | ↻ | ↻ | ↻ | ↻ | ↻ | ↻ |
 | snapshot expiry, append | ↻ | ↻ | ↻ | ↻ | ↻ | ↻ |
+| append, snapshot expiry | ↻ | ↻ | ✓ | ✓ | ✓ | ✓ |
+| property change, snapshot expiry | ↻ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| tag on (or rollback to) a snapshot the expiry removes, snapshot expiry | ↻ | ↻ | ↻ | ↻ | ↻ | ↻ |
+| branch created on main's head, snapshot expiry | ↻ | ↻ | ↻ | ↻ | ↻ | ↻ |
 | rollback, append | ↻ | ↻ | ↻ | ↻ | ↻ | ↻ |
 | append, overwrite of its partition | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | append, schema change | once | once | once | once | once | once |
@@ -672,10 +676,17 @@ What the per-encoding matrix says:
 3. The guards stay whole-table under every encoding: a spec change, a
    snapshot expiry, a rollback, and (for a record that validates) a
    schema change.
-4. Buckets can collide: ref names hash into 16 buckets and partitions
+4. An expiry merges as a removal of what it chose on the table it read
+   (✓ where its retry would choose again: SPEC.md "Conflict Encodings"),
+   after commits that add snapshots, and after any change but a ref's
+   reset, the table's, a schema's or a spec's. It does not merge after a
+   reset of any ref, even one that names none of what it removes (the
+   last row): a reset's stamp is all an encoding keeps of it, and a
+   rejection must stay one (S2).
+5. Buckets can collide: ref names hash into 16 buckets and partitions
    into 64, so two branches or partitions that share a bucket conflict
    (a false positive, never a false merge).
-5. A catalog transaction's update of an inline table that adds snapshots
+6. A catalog transaction's update of an inline table that adds snapshots
    and moves branches to them goes unpinned, as a delta from the version the
    transaction first read, and each encoding judges it as a table commit's:
    an append to an inline-ML table merges onto a moved branch. Any other

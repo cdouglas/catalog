@@ -516,7 +516,7 @@ The encodings:
 |---|---|---|---|
 | `lamport` | the version read | none | nothing |
 | `lamport-minus-properties` | the version read, and whether the record touches properties | the version at which properties last changed, and at which anything else did | a record that does not touch properties, on a table whose properties alone changed |
-| `concern-vector` | the concerns the record reads, and the branches it advances | the version at which each concern last changed (properties, schema, specs, sort orders, the table itself, statistics, snapshot removal), and for 16 buckets of ref names, the version at which a ref in it last advanced, was last reset, and last dropped manifests | a commit racing property, statistics or sort-order changes, or commits and refs on other branches |
+| `concern-vector` | the concerns the record reads, and the branches it advances; for an expiry, every ref's resets | the version at which each concern last changed (properties, schema, specs, sort orders, the table itself, statistics, snapshot removal), and for 16 buckets of ref names, the version at which a ref in it last advanced, was last reset, and last dropped manifests | a commit racing property, statistics or sort-order changes, or commits and refs on other branches; an expiry racing commits that add snapshots |
 | `blind-append` | as `concern-vector`; for a blind record (every new snapshot's producer `BLIND`), no base version: its branch not reset (nor, if it merged manifests, dropping manifests), no snapshots removed, specs and the table unchanged, and in v3 no delete files added in its partitions | `concern-vector`'s, and for 64 partition buckets the version at which data files were last added, delete files added, and data files removed there | concurrent appends to one branch (streaming ingest), each merged onto the one before |
 | `partition-vector` | as `blind-append`; for a validated record (every new snapshot's producer `VALIDATED` or `BLIND`, on one branch), no base version: blind-append's guards and the schema, and for each of its checks, no change of the check's kind in the partition buckets its scope covers | `blind-append`'s | as `blind-append`, and overwrites, row deltas (MERGE, UPDATE, DELETE), deletes, rewrites (compaction) and dynamic overwrites racing commits in other partitions, or commits their checks do not read (a compaction racing appends) |
 | `manifest-window` | as `concern-vector`; for a blind or validated record of one snapshot on one branch: blind-append's guards (and the schema, if validated), and its checks, judged against each manifest written by the snapshots from its parent to its branch's head where it lands | `concern-vector`'s | as `partition-vector`, and a check whose scope buckets cannot name (a range filter), and commits on other branches |
@@ -533,7 +533,26 @@ fresh history: a replace).
 Under `concern-vector` a data commit (one that adds snapshots) reads the
 table, schema, specs and removal, and each branch it advances (main, for a
 snapshot it stages); a property change reads properties, a location change
-the table, a sort-order change the sort orders and schema. An applied delta
+the table, a sort-order change the sort orders and schema. An expiry (a
+delta that removes snapshots, none a ref names on the table it lands on,
+and changes nothing else) reads the table, schema and specs, and the reset
+stamp of every ref bucket: it lands after commits that only add snapshots
+and move branches to them, on any branch, and removes the snapshots it
+chose on the table it read (`Landing` skips those already gone). Iceberg's
+retry would choose again on the table it lands on (a retained count counts
+the new snapshots), so the merge is a different serialization of the same
+history: the expiry ran first, its record applied after the commits that
+beat it. A reset since (a ref created on a snapshot the table had, a
+rollback, a fast-forward, a ref's removal) may have named one of them, and
+a rejection must stay one on every later version (S2), so any reset fails
+it, whether or not the ref names one now. Its writer's file cleanup
+compares the table it read with a refresh after the commit, as Iceberg's
+`RemoveSnapshots` does after a REST server applied its removal to newer
+metadata: it reads the manifest lists of every snapshot there, the
+commits' since included, and cleans incrementally only if every snapshot
+it removed and every snapshot left is on main's history. Writers with
+`fileio.catalog.expiry.merge` off pin their expiries (an ablation). An
+applied delta
 stamps the concerns its updates change; full metadata stamps what changed
 if only properties or statistics did, and every stamp otherwise; a metadata
 location or a rename stamps every one. A stamp is a table version, so it
@@ -567,11 +586,13 @@ reads those in the partitions a record adds files to.
 
 A rejected table action explains itself (`ConflictEncodings.rejection`,
 called only on a rejection): `table: gone`; `whole: <why>` where the witness
-is the table's version (`lamport`, `removes snapshots`, `commit once: a schema
-change`, `pinned (a catalog transaction's table)`, `a read pin`, `full
+is the table's version (`lamport`, `removes snapshots`, `removes a snapshot a
+ref names`, `commit once: a schema change`, `pinned (a catalog transaction's
+table)`, `pinned: an expiry (fileio.catalog.expiry.merge off)`, `a read pin`, `full
 metadata`, `a pointer table`, ...); the first stamp it reads that moved
 (`concern: <concern>`, `ref: <advanced | reset | dropped manifests |
-retention>`, `partition: <kind>`); `window: <why>` for `manifest-window`'s
+retention>`, `ref: reset (any ref)` for an expiry, `partition: <kind>`);
+`window: <why>` for `manifest-window`'s
 walk; or `merge: <Landing's reason>` / `unresolved: <reason>` for a record the
 encoding admitted that cannot merge or name its parents. Other actions say
 `precondition: <action>`. Writers count their conflicts by reason

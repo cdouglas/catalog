@@ -115,6 +115,24 @@ public final class LogCatalogProperties {
   }
 
   /**
+   * Whether an expiry's record (snapshots removed, and nothing else) may land on a table that
+   * changed since its writer read it, where the conflict encoding reads a table's concerns apart
+   * (concern-vector, and the encodings built on it): if no ref was reset since (so none came to
+   * name a snapshot it removes) and the table, its schemas and its specs are as it read them, it
+   * removes the snapshots it chose on the table it read, after what landed first (errata D17 until
+   * 2026-11-17). {@code false} pins an expiry to the version its writer read, which Iceberg then
+   * retries on a fresh read, as it does any commit that conflicts (for ablation). Default: {@code
+   * true}.
+   */
+  public static final String EXPIRY_MERGE = "fileio.catalog.expiry.merge";
+  public static final boolean DEFAULT_EXPIRY_MERGE = true;
+
+  /** Whether {@code properties} let an expiry land on a changed table. */
+  public static boolean expiryMerge(Map<String, String> properties) {
+    return booleanProperty(properties, EXPIRY_MERGE, DEFAULT_EXPIRY_MERGE);
+  }
+
+  /**
    * Whether a drop of an inline table that does not purge it first writes the table to its
    * metadata directory as a pointer table's is (a metadata file, and a manifest list file for each
    * snapshot whose list the catalog holds inline), so that {@code registerTable} with that file

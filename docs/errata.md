@@ -15,8 +15,8 @@ none of them. `TestIcebergCoreIssues` asserts each is absent; on stock Iceberg
 1.12.0 C2-C29 come back.
 
 An entry's ID is not reused: a finished entry is deleted and its ID retired.
-Retired: S3-S5, D1-D3, D5-D7, D9, D10, D11, D15, D19, D20, D23, D24, D26, T1, T2, T4, T5, U2,
-U3
+Retired: S3-S5, D1-D3, D5-D7, D9, D10, D11, D15, D17, D19, D20, D23, D24, D26, T1, T2, T4, T5,
+U2, U3
 (`git log -p docs/errata.md` has each; the plans in TAIL_READS.md,
 CHECKPOINT_PLAN.md and SNAPSHOT_PAGING.md cite them by ID and summary). Five
 IDs (S2, D9, D10, T4, T5) were reused before this rule, so an older code
@@ -258,34 +258,6 @@ could grow cheaply.
 cover, or commits whose retries approach A. COMMITTED_PAGING.md "Open
 questions" has the rest, and D21 the stamps the set leaves unbounded.
 
-### D17. A snapshot expiry never merges, so it starves under contention
-
-An expiry's record removes the snapshots it found unused on its base, and
-replay merges no record that removes something (`Landing`: "it removes what
-it found unused on its base"). So under every encoding an expiry fails if
-anything changed its table since it read it. That is sound: the snapshots it
-removes were unreferenced on its base, not necessarily where it lands (a
-concurrent commit may have tagged, cherry-picked or rolled back to one). But
-under contention an expiry rarely lands. In a contention-benchmark run (`s3x`,
-`manifest-window`, 32 writers on fast appends), 9 of 10 expiries exhausted
-their retries, and the ingest benchmark's capture raises the maintenance
-client's retries to 100 (`expire_retry_num`) to keep its tables at their
-last 100 snapshots. A table whose expiries starve keeps every snapshot: in
-the 32-writer profile a table reached about 1,400. Its history goes to
-pages, but its root and its loads still grow with it (D18).
-
-A merge rule would admit an expiry onto a table changed since its base only
-by records that reference none of the snapshots it removes: no ref moved to
-one, no cherry-pick or rollback of one. It must also keep its writer's file
-cleanup safe. Iceberg picks the files to delete from the expiry's base and a
-refresh after its commit, and its incremental cleanup assumes the base is
-the version the commit replaced. Other commit-once records (schema and spec
-changes, ref changes) starve the same way, but they are rare; an expiry
-recurs, and bounds the table's growth.
-
-**Trigger to revisit:** a table with sustained concurrent commits whose
-expiries fail, or the ingest and materialization service.
-
 ### D18. An inline-ML table's root grows with its unmerged manifests and its history
 
 Snapshot paging ([SNAPSHOT_PAGING.md](SNAPSHOT_PAGING.md)) keeps an inline-ML
@@ -298,7 +270,7 @@ root holds 0.36 MB, and 1.07 MB lies in 24 pages (SNAPSHOT_PAGING.md
 - A fast-append table's head list names every manifest it has, which only a
   merge shrinks, and fast appends never merge.
 - The root keeps about 18 B a sealed snapshot, so it grows with the history
-  expiry leaves (D17).
+  expiry leaves.
 - Eviction is by update size only (`fileio.catalog.inline.max.update.size`),
   so a table whose deltas fit stays inline however large it grows. A per-table
   size threshold would evict it to pointer mode (SNAPSHOT_PAGING.md step 6,

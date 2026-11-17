@@ -281,8 +281,8 @@ final class Landing {
           || update instanceof InlineDeltaCodec.AddSortOrderUpdate) {
         return "it numbers a new schema, spec or sort order on its base";
       } else if (update instanceof InlineDeltaCodec.RemoveSchemasUpdate
-          || update instanceof InlineDeltaCodec.RemovePartitionSpecsUpdate
-          || update instanceof InlineDeltaCodec.RemoveSnapshotsUpdate) {
+          || update instanceof InlineDeltaCodec.RemovePartitionSpecsUpdate) {
+        // a commit since may use them (an expiry's snapshots its witness judged: errata D17)
         return "it removes what it found unused on its base";
       } else if (update instanceof InlineDeltaCodec.SetCurrentSchemaUpdate) {
         if (table.schema(((InlineDeltaCodec.SetCurrentSchemaUpdate) update).schemaId)

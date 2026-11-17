@@ -325,6 +325,18 @@ final class TableChange {
     return value != null ? value.longValue() : 0L;
   }
 
+  /**
+   * Whether it is an expiry: snapshots removed, none a ref names on the table it is judged on, and
+   * nothing else (no snapshots added, no ref moved, no schema or spec removed).
+   */
+  boolean expiry() {
+    return concerns.equals(EnumSet.of(Concern.REMOVAL))
+        && advanced.isEmpty()
+        && reset.isEmpty()
+        && retained.isEmpty()
+        && !addsSnapshots;
+  }
+
   /** Whether it changes nothing but properties. */
   boolean onlyProperties() {
     return concerns.equals(EnumSet.of(Concern.PROPERTIES))

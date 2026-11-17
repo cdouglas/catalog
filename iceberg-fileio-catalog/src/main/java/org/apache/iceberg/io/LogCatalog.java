@@ -481,6 +481,7 @@ public class LogCatalog extends BaseMetastoreCatalog
                 tableIdentifier, log, io, inline, inlineSnapshots, read)
             : new FileIOTableOperations(tableIdentifier, log, io, inline, inlineSnapshots, read);
     ops.pinsCommitOnce = pinsCommitOnce;
+    ops.pinsExpiries = !LogCatalogProperties.expiryMerge(catalogProperties);
     return ops;
   }
 
@@ -736,6 +737,8 @@ public class LogCatalog extends BaseMetastoreCatalog
     private boolean loaded = false;
     // Whether a commit of what Iceberg commits once pins it (LogCatalog.leavingCommitOnceUnpinned)
     private boolean pinsCommitOnce = true;
+    // Whether an expiry pins the version it read (fileio.catalog.expiry.merge false, an ablation)
+    private boolean pinsExpiries = false;
     // Whether these are a replace transaction's, whose commit restates the table (Bug 81)
     private boolean replaces = false;
 
@@ -1080,10 +1083,21 @@ public class LogCatalog extends BaseMetastoreCatalog
       }
       CatalogMutation mut = new CatalogMutation(lastRead);
       stageUpdate(mut, base, metadata);
-      if (pinsCommitOnce && (replaces || commitsOnce(metadata.changes()))) {
+      if ((pinsCommitOnce && (replaces || commitsOnce(metadata.changes())))
+          || (pinsExpiries && removesSnapshots(metadata.changes()))) {
         mut.pin(tableId);
       }
       landed = mut.commit(log);
+    }
+
+    /** Whether {@code changes}, a commit's, remove snapshots: an expiry's do. */
+    static boolean removesSnapshots(List<org.apache.iceberg.MetadataUpdate> changes) {
+      for (org.apache.iceberg.MetadataUpdate change : changes) {
+        if (change instanceof org.apache.iceberg.MetadataUpdate.RemoveSnapshots) {
+          return true;
+        }
+      }
+      return false;
     }
 
     /**

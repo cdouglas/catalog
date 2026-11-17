@@ -159,14 +159,99 @@ class TestConflictAttribution {
     assertThat(reasons(w[0])).containsExactly(Map.entry("concern: snapshot removal", 1L));
   }
 
-  @Test
-  void anExpiryAfterAnAppendHasTheWholeVersion() {
-    LogCatalog[] w = writers(ManifestWindowEncoding.NAME);
-    beforeAsWrite(() -> w[1].loadTable(ID).newFastAppend().appendFile(file("b")).commit());
-    w[0].loadTable(ID).expireSnapshots().expireOlderThan(Long.MAX_VALUE).retainLast(1)
+  /** The expiry A runs: all but main's last snapshot, which removes the table's first. */
+  private static void expire(LogCatalog a) {
+    a.loadTable(ID).expireSnapshots().expireOlderThan(Long.MAX_VALUE).retainLast(1)
         .cleanExpiredFiles(false).commit();
+  }
 
-    assertThat(reasons(w[0])).containsExactly(Map.entry("whole: removes snapshots", 1L));
+  /**
+   * An expiry lands after a commit that only added a snapshot, removing what it chose on the table
+   * it read (errata D17): the first snapshot, where Iceberg's retry would remove the second too.
+   */
+  @Test
+  void anExpiryAfterAnAppendLandsRemovingWhatItChose() {
+    LogCatalog[] w = writers(ManifestWindowEncoding.NAME);
+    long first = w[0].loadTable(ID).history().get(0).snapshotId();
+    long second = w[0].loadTable(ID).currentSnapshot().snapshotId();
+    beforeAsWrite(() -> w[1].loadTable(ID).newFastAppend().appendFile(file("b")).commit());
+    expire(w[0]);
+
+    assertThat(reasons(w[0])).isEmpty();
+    Table now = w[1].loadTable(ID);
+    assertThat(now.snapshot(first)).isNull();
+    assertThat(now.snapshot(second)).isNotNull();
+    assertThat(now.snapshots()).hasSize(2);
+  }
+
+  /** ... but not once a ref names a snapshot it removes: Iceberg's retry keeps that one. */
+  @Test
+  void anExpiryAfterATagOnASnapshotItRemovesHasTheWholeVersion() {
+    LogCatalog[] w = writers(ManifestWindowEncoding.NAME);
+    long first = w[0].loadTable(ID).history().get(0).snapshotId();
+    beforeAsWrite(() -> w[1].loadTable(ID).manageSnapshots().createTag("t", first).commit());
+    expire(w[0]);
+
+    assertThat(reasons(w[0]))
+        .containsExactly(Map.entry("whole: removes a snapshot a ref names", 1L));
+    assertThat(w[1].loadTable(ID).snapshot(first)).isNotNull();
+  }
+
+  /**
+   * ... nor after any ref's reset, though the ref names none of them: one may have named one and
+   * moved on, and the judgment must hold on every later version (S2).
+   */
+  @Test
+  void anExpiryAfterARefResetReadsEveryRefsResets() {
+    LogCatalog[] w = writers(ManifestWindowEncoding.NAME);
+    long second = w[0].loadTable(ID).currentSnapshot().snapshotId();
+    beforeAsWrite(() -> w[1].loadTable(ID).manageSnapshots().createBranch("b", second).commit());
+    expire(w[0]);
+
+    assertThat(reasons(w[0])).containsExactly(Map.entry("ref: reset (any ref)", 1L));
+  }
+
+  /**
+   * A merged expiry's writer cleans up files as Iceberg's RemoveSnapshots does, comparing the table
+   * it read with a refresh after its commit, which holds the window: it reads the manifest lists of
+   * every snapshot there, so it deletes nothing a commit since uses (here a merge append that
+   * rewrote the table's manifests), and the table still plans.
+   */
+  @Test
+  void aMergedExpiryCleansUpNothingTheWindowUses() {
+    LogCatalog[] w = writers(ManifestWindowEncoding.NAME);
+    w[0].loadTable(ID).updateProperties()
+        .set(org.apache.iceberg.TableProperties.MANIFEST_MIN_MERGE_COUNT, "2").commit();
+    beforeAsWrite(() -> w[1].loadTable(ID).newAppend().appendFile(file("b")).commit());
+    w[0].loadTable(ID).expireSnapshots().expireOlderThan(Long.MAX_VALUE).retainLast(1)
+        .cleanExpiredFiles(true).commit();
+
+    assertThat(reasons(w[0])).isEmpty();
+    Table now = writer(ManifestWindowEncoding.NAME, Map.of()).loadTable(ID);
+    assertThat(now.snapshots()).hasSize(2);
+    assertThat(now.currentSnapshot().allManifests(now.io())).as("the window merged them")
+        .hasSize(1);
+    java.util.Set<String> files = new java.util.TreeSet<>();
+    try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.FileScanTask> tasks =
+        now.newScan().planFiles()) {
+      tasks.forEach(task -> files.add(task.file().location()));
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+    assertThat(files).containsExactlyInAnyOrder(
+        file("f1").location(), file("f2").location(), file("b").location());
+  }
+
+  /** With fileio.catalog.expiry.merge off, an expiry pins the version it read (an ablation). */
+  @Test
+  void anExpiryPinnedForAblationHasTheWholeVersion() {
+    LogCatalog[] w = writers(ManifestWindowEncoding.NAME,
+        Map.of(LogCatalogProperties.EXPIRY_MERGE, "false"));
+    beforeAsWrite(() -> w[1].loadTable(ID).newFastAppend().appendFile(file("b")).commit());
+    expire(w[0]);
+
+    assertThat(reasons(w[0]))
+        .containsExactly(Map.entry("whole: pinned: an expiry (fileio.catalog.expiry.merge off)", 1L));
   }
 
   @Test
