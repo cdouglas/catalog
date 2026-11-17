@@ -872,9 +872,11 @@ public class LogCatalog extends BaseMetastoreCatalog
     protected void doRefresh() {
       Replica<CatalogState> read = log.read();
       while (true) {
-        lastRead = read;
         try {
           loadFrom(read.state());
+          // Only once the table is loaded from it: a commit stages on the read its base came
+          // from, and a load that fails leaves both as they were (Bug 95)
+          lastRead = read;
           return;
         } catch (org.apache.iceberg.exceptions.NotFoundException e) {
           read = readPastMissing(read, e);
@@ -1101,13 +1103,33 @@ public class LogCatalog extends BaseMetastoreCatalog
         commitCreate(metadata);
         return;
       }
-      CatalogMutation mut = new CatalogMutation(lastRead);
+      Replica<CatalogState> read = lastRead;
+      if (!holds(read, base)) {
+        // Built on metadata other than the version this handle last read: another thread's
+        // refresh moved the read on between the check of base and here (Bug 95)
+        throw new CommitFailedException(
+            "Cannot commit %s: stale table metadata (not the version last read)", tableId);
+      }
+      CatalogMutation mut = new CatalogMutation(read);
       stageUpdate(mut, base, metadata);
       if ((pinsCommitOnce && (replaces || commitsOnce(metadata.changes())))
           || (pinsExpiries && removesSnapshots(metadata.changes()))) {
         mut.pin(tableId);
       }
       landed = mut.commit(log);
+    }
+
+    /**
+     * Whether {@code read} holds {@code base}, the metadata a commit was built on: whether this
+     * table's metadata loads from {@code base}'s location there, which names the table's id and
+     * version. A commit stages its record on {@code read}, whose version of the table the record
+     * names; staged on any other, it would apply a change made from {@code base} to a version
+     * that has others' commits since, and lose them (Bug 95).
+     */
+    private boolean holds(Replica<CatalogState> read, TableMetadata base) {
+      String location = base.metadataFileLocation();
+      return read != null && location != null
+          && location.equals(metadataLocation(read.state(), tableId));
     }
 
     /** Whether {@code changes}, a commit's, remove snapshots: an expiry's do. */
@@ -1224,7 +1246,7 @@ public class LogCatalog extends BaseMetastoreCatalog
 
     /**
      * Stages on {@code mut} the commit of {@code metadata}, built on {@code base}, to this table as
-     * {@link #lastRead} holds it. In an inline catalog the update takes the first form that
+     * {@code mut}'s read holds it. In an inline catalog the update takes the first form that
      * fits in
      * {@code fileio.catalog.inline.max.update.size}: a delta, if the table is inline (the common
      * case); the full metadata, inline, which re-inlines a pointer table; else a metadata file,
@@ -1252,7 +1274,7 @@ public class LogCatalog extends BaseMetastoreCatalog
     private boolean stageOn(
         CatalogMutation mut, TableMetadata base, TableMetadata metadata, boolean orFile) {
       if (inline.metadata) {
-        CatalogState proto = lastRead.state();
+        CatalogState proto = mut.base().state();
         Integer tblId = proto.tableId(tableId);
         boolean isInline = tblId != null && proto.isInlineTable(tblId);
         String prefix = isInline && proto.manifestListPrefix(tblId) != null

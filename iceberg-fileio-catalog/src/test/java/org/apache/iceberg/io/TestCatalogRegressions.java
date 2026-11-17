@@ -5882,4 +5882,79 @@ public class TestCatalogRegressions {
       assertThat(files).noneMatch(file -> io.newInputFile(file).exists());
     }
   }
+
+  /**
+   * Bug 95 (failed refresh, then lost update): a table's operations stage a commit on the read
+   * they last loaded the table from. A refresh took a new read before loading the table from it,
+   * so one that failed in the load (the new metadata file unreadable; the table dropped and
+   * another created under its name, whose UUID does not match) left the handle's metadata at the
+   * old version and its read at the new one. A commit that does not refresh first (a schema
+   * update) was then staged on the new version with the old metadata, and landed: it dropped the
+   * other writer's commit, or replaced the new table with the old one's metadata. Another
+   * thread's refresh between a commit's check of its base and its staging did the same. Found by
+   * the 2026-11-17 design review.
+   */
+  @Nested
+  class ACommitAfterAFailedRefresh {
+    private final TableIdentifier t = TableIdentifier.of("ns", "t");
+
+    @ParameterizedTest
+    @EnumSource(names = {"CAS", "APPEND", "MEMLOG"})
+    void failsWhenTheRefreshCouldNotReadTheNewMetadata(LocalCatalogMode mode) throws IOException {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = mode.catalog(io, "mem:///warehouse", "c", Map.of());
+      catalog.createNamespace(Namespace.of("ns"));
+      catalog.createTable(t, intSchema);
+      Table stale = catalog.loadTable(t);
+      LogCatalog other = mode.catalog(io, "mem:///warehouse", "c", Map.of());
+      other.loadTable(t).updateProperties().set("k", "v").commit();
+      String newer = ((org.apache.iceberg.HasTableOperations) other.loadTable(t))
+          .operations().current().metadataFileLocation();
+      byte[] saved = io.bytes(newer);
+      io.deleteFile(newer);
+      assertThatThrownBy(stale::refresh)
+          .isInstanceOf(org.apache.iceberg.exceptions.NotFoundException.class);
+      try (PositionOutputStream out = io.newOutputFile(newer).createOrOverwrite()) {
+        out.write(saved);
+      }
+
+      assertThatThrownBy(
+              () -> stale.updateSchema().addColumn("c", Types.IntegerType.get()).commit())
+          .isInstanceOf(CommitFailedException.class);
+      Table now = mode.catalog(io, "mem:///warehouse", "c", Map.of()).loadTable(t);
+      assertThat(now.properties()).containsEntry("k", "v");
+      assertThat(now.schema().findField("c")).isNull();
+      stale.refresh();
+      stale.updateSchema().addColumn("c", Types.IntegerType.get()).commit();
+      now = mode.catalog(io, "mem:///warehouse", "c", Map.of()).loadTable(t);
+      assertThat(now.properties()).containsEntry("k", "v");
+      assertThat(now.schema().findField("c")).isNotNull();
+    }
+
+    @ParameterizedTest
+    @EnumSource(names = {"CAS", "CAS_TM", "MEMLOG_ML"})
+    void failsWhenTheTableWasReplacedByAnotherOfItsName(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = mode.catalog(io, "mem:///warehouse", "c", Map.of());
+      catalog.createNamespace(Namespace.of("ns"));
+      catalog.createTable(t, intSchema);
+      Table stale = catalog.loadTable(t);
+      LogCatalog other = mode.catalog(io, "mem:///warehouse", "c", Map.of());
+      assertThat(other.dropTable(t, false)).isTrue();
+      Table successor = other.createTable(t, intSchema);
+      successor.newFastAppend().appendFile(file("s")).commit();
+      String uuid = successor.uuid().toString();
+      assertThatThrownBy(stale::refresh)
+          .isInstanceOf(IllegalStateException.class)
+          .hasMessageContaining("Table UUID does not match");
+
+      assertThatThrownBy(
+              () -> stale.updateSchema().addColumn("c", Types.IntegerType.get()).commit())
+          .isInstanceOf(CommitFailedException.class);
+      Table now = mode.catalog(io, "mem:///warehouse", "c", Map.of()).loadTable(t);
+      assertThat(now.uuid().toString()).isEqualTo(uuid);
+      assertThat(now.currentSnapshot()).isNotNull();
+      assertThat(now.schema().findField("c")).isNull();
+    }
+  }
 }
