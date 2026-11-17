@@ -839,6 +839,8 @@ class TestCatalogFaultProperties {
     private ReadFault readFault;
     private int reads;
     private final List<String> fired = new ArrayList<>();
+    // The kinds of the commands that preempted the running one
+    private final List<Kind> preempting = new ArrayList<>();
 
     /**
      * Writer {@code i} writes inline metadata with the gzip codec if bit {@code i} of {@code
@@ -1061,6 +1063,7 @@ class TestCatalogFaultProperties {
       writes = 0;
       reads = 0;
       fired.clear();
+      preempting.clear();
       writePlan = faults ? cmd.writePlan() : List.of();
       failingRead = faults ? cmd.failingRead() : -1;
       readFault = cmd.readFaultKind();
@@ -1145,6 +1148,7 @@ class TestCatalogFaultProperties {
       if (pending != null && pending.preempt == request) {
         Cmd nested = pending;
         pending = null;
+        preempting.add(nested.kind);
         armed = false;
         try {
           trace.append(String.format("  preempted at request #%d by%n", request));
@@ -1231,6 +1235,58 @@ class TestCatalogFaultProperties {
           : tables.get(index % tables.size());
     }
 
+    /**
+     * The manifests and manifest list files of every snapshot of {@code id} as the checker reads it
+     * now, before a drop that purges it: what the purge deletes (CatalogUtil.dropTableData). None
+     * if the table cannot be read (it does not exist, and the drop is rejected).
+     */
+    private Set<String> purgeable(TableIdentifier id) {
+      Set<String> files = new TreeSet<>();
+      try {
+        Table table = checker.loadTable(id);
+        for (Snapshot snapshot : table.snapshots()) {
+          String list = snapshot.manifestListLocation();
+          if (list != null && !list.startsWith("inline://")) {
+            files.add(list);
+          }
+          for (ManifestFile manifest : snapshot.allManifests(table.io())) {
+            files.add(manifest.path());
+          }
+        }
+      } catch (RuntimeException e) {
+        return Set.of();
+      }
+      return files;
+    }
+
+    /**
+     * Checks that a purge of {@code id} that landed deleted {@code purgeable}, the manifests and
+     * lists its table had before the drop (Bug 94: a compaction after the drop collected the
+     * table's pages first, and the purge, reading its history after, deleted nothing). Not checked
+     * after an injected fault, which may fail a delete or the read of a list, nor after an expiry
+     * that ran first and kept the files of the snapshots it removed, which the purge then no longer
+     * names.
+     */
+    private void checkPurged(TableIdentifier id, Set<String> purgeable) {
+      if (!fired.isEmpty()) {
+        Statistics.label("purge").collect("not checked: a fault");
+        return;
+      }
+      if (preempting.contains(Kind.EXPIRE_SNAPSHOTS)) {
+        Statistics.label("purge").collect("not checked: an expiry ran first");
+        return;
+      }
+      List<String> left = new ArrayList<>();
+      for (String file : purgeable) {
+        if (io.newInputFile(file).exists()) {
+          left.add(file);
+        }
+      }
+      Statistics.label("purge").collect(purgeable.isEmpty() ? "checked: no files" : "checked");
+      check(left.isEmpty(), "the purge of %s left %s of its %s manifests and lists: %s", id,
+          left.size(), purgeable.size(), left);
+    }
+
     /** The snapshots of {@code table}, oldest first. */
     private static List<Snapshot> oldestFirst(Table table) {
       List<Snapshot> history = new ArrayList<>();
@@ -1273,18 +1329,25 @@ class TestCatalogFaultProperties {
                 m.put(created, new TableState(actual.get(created).uuid, version));
               });
         case DROP_TABLE:
-          // Purging half the time: its deletes must spare every other table's files.
+          // Purging half the time: its deletes must spare every other table's files, and leave
+          // none of the table's manifests and lists (Bug 94)
           boolean purge = cmd.b % 2 == 1;
+          Set<String> purgeable = purge ? purgeable(id) : Set.of();
+          boolean[] purged = {false};
           return new Op(
               "dropTable(" + id + (purge ? ", purge" : "") + ")",
               () -> {
                 if (!w.catalog.dropTable(id, purge)) {
                   throw new NoSuchTableException("dropTable returned false: %s", id);
                 }
+                purged[0] = purge;
               },
               (m, actual) -> {
                 existing(m, id);
                 m.remove(id);
+                if (purged[0]) {
+                  checkPurged(id, purgeable);
+                }
               });
         case RENAME_TABLE:
           TableIdentifier to = TABLES.get(cmd.b % TABLES.size());

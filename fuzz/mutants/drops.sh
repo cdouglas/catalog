@@ -1,8 +1,12 @@
-# Calibration of a drop that keeps an inline table's files (errata T4's fix; anchors as of its
-# commit): each mutant must fail an oracle. dropnowrite writes nothing first (the dropped table
-# cannot be registered); dropnodelete leaves what a drop that lost its race wrote (stray metadata
-# and list files beside the ones its retry writes).
-MUTANTS="dropnowrite dropnodelete"
+# Calibration of drops (anchors as of fileio 7da0e77): each mutant must fail an oracle.
+# dropnowrite writes nothing before a drop that keeps an inline table's files (errata T4: the
+# dropped table cannot be registered); dropnodelete leaves what a drop that lost its race wrote
+# (stray metadata and list files beside the ones its retry writes); purgeafter reads the history
+# of the version a purge drops only after the drop lands (Bug 94: a compaction after the drop
+# collects the table's pages, and the purge leaves every file). purgeafter needs sealed pages:
+# run the set at SNAPSHOT_BLOCK=2 SNAPSHOT_WINDOW=1, where the fault fuzzer's purge check, besides
+# the regression, should catch it.
+MUTANTS="dropnowrite dropnodelete purgeafter"
 EQUIVALENT=""
 ORACLES=TestCatalogRegressions,TestCatalogRaceProperties,TestCatalogFaultProperties
 
@@ -18,5 +22,8 @@ mutant() { # name main-dir test-dir
     dropnowrite) mutate $M/LogCatalog.java "    return tableOpsAsRead(identifier, read).materialize();" "    return List.of();" ;;
     # what a drop that did not land wrote stays
     dropnodelete) mutate $M/LogCatalog.java "        io.deleteFile(file);" "" ;;
+    # the purge reads the dropped version's history after the drop lands
+    purgeafter) mutate $M/LogCatalog.java \
+      "      version.snapshots(); // now, while the catalog names their pages" "" ;;
   esac
 }
