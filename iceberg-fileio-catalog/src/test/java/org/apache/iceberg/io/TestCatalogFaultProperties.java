@@ -2825,6 +2825,11 @@ class TestCatalogFaultProperties {
               && !(w.inlineLists && givesRowIds(at.metadata));
           judged &= at.updated || !at.changed && at.scans.isEmpty() && !at.declared
               || Objects.equals(now.metadataLocation, at.metadataLocation);
+          // A read of it (a scan, or a declared read), updated or not, is checked at the commit's
+          // read too (TableRead.unchangedIn: its ref and the schema it read with): on a table
+          // changed since, it may fail there, unsent
+          judged &= at.scans.isEmpty() && !at.declared
+              || Objects.equals(now.metadataLocation, at.metadataLocation);
         }
         if (unchanged || !(failure instanceof CommitFailedException)) {
           return unchanged ? "no other writer changed the tables it loaded since it loaded them"
