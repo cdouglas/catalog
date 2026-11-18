@@ -504,6 +504,18 @@ pattern, not the log's: the log keeps no index from an id to what its
 intention touched, and needs none, so the retention can be short without a
 writer losing the answer for good.
 
+The oracle answers yes, never no, while a write of the commit may still enter
+the log: a load that does not find the snapshot says only that the record has
+not applied yet. On the segmented log ([LOG_SEGMENTS.md](LOG_SEGMENTS.md)) a
+record appended to segment m+1 that its writer did not read through (it
+crashed, or the read failed and it reported the outcome unknown) enters the
+log only when segment m ends, at its Kth record or at a seal frame, which a
+read through any later append writes. So while the segment before the
+record's is open, a load that misses the snapshot cannot conclude that the
+record will not apply. Nor does the retention bound that wait: the horizon
+moves only at a compaction, so on a quiet log a record older than the
+retention can still apply once m ends.
+
 **Retention.** `RuntimeConfig.committedRetentionMs` (the catalog's
 `fileio.catalog.committed.retention.ms`, default 30 minutes): the minimum age
 before an id may be dropped. It should comfortably exceed the longest time a
