@@ -677,8 +677,12 @@ wrote and writes the table again from its next read. A write that fails
 (the table's storage refusing it) fails the drop, which deletes the files
 it wrote before the failure (best effort, logged). A catalog transaction's
 drop does the same, once its record is staged; a failure to write one of
-its tables deletes what it wrote for every table. The newest metadata file
-in the directory is the one to register.
+its tables deletes what it wrote for every table. With
+`fileio.catalog.drop.force` (default false) such a drop goes on and logs a
+warning: the table's files stay with no metadata file to register, for a
+GC by listing, as a purge whose writer fails after its drop landed leaves
+them (design.md I10). The newest metadata file in the directory is the
+one to register.
 
 The catalog's log properties (`LogCatalogProperties`) configure the commit
 loop: `fileio.catalog.max.append.count` and `max.append.size` set when it

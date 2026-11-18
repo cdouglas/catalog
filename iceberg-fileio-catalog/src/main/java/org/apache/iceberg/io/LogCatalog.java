@@ -194,6 +194,7 @@ public class LogCatalog extends BaseMetastoreCatalog
     }
 
     inlineSettings(); // validates the inline properties
+    LogCatalogProperties.dropForce(catalogProperties); // validates it
     String conflictEncoding = LogCatalogProperties.conflictEncoding(catalogProperties);
     LogCatalogProperties.snapshotPaging(catalogProperties); // validates them
 
@@ -338,15 +339,28 @@ public class LogCatalog extends BaseMetastoreCatalog
    * The files a drop of {@code identifier} that keeps its files writes first, its metadata file
    * first: none for a pointer table, whose metadata file and lists are in storage, or where {@link
    * LogCatalogProperties#DROP_MATERIALIZE} is off; for an inline table, the version {@code read}
-   * holds, which the drop removes, written as a pointer table's (errata T4 until 2026-11-17: the
-   * drop kept nothing, and its data files stayed with nothing to name them).
+   * holds, which the drop removes, written as a pointer table's. A write that fails deletes what
+   * was written, and fails the drop; with {@link LogCatalogProperties#DROP_FORCE}, the drop goes
+   * on with none, and leaves the table's files with no metadata file to register.
    */
   private List<String> keptFiles(TableIdentifier identifier, Replica<CatalogState> read) {
     if (!LogCatalogProperties.dropMaterialize(catalogProperties)
         || !read.state().isInlineTable(identifier)) {
       return List.of();
     }
-    return tableOpsAsRead(identifier, read).materialize();
+    try {
+      return tableOpsAsRead(identifier, read).materialize();
+    } catch (NoSuchTableException | CommitFailedException e) {
+      throw e; // the table changed since the read, which the drop reads again
+    } catch (RuntimeException e) {
+      if (!LogCatalogProperties.dropForce(catalogProperties)) {
+        throw e;
+      }
+      LOG.warn("Cannot write {} to its metadata directory: dropping it anyway ({}), which leaves "
+          + "its files with no metadata file to register", identifier,
+          LogCatalogProperties.DROP_FORCE, e);
+      return List.of();
+    }
   }
 
   /** Deletes what a drop that did not land wrote, logging what it cannot. */

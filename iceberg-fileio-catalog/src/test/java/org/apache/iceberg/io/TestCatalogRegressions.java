@@ -6437,4 +6437,71 @@ public class TestCatalogRegressions {
       assertThat(after).isEqualTo(before);
     }
   }
+
+  /**
+   * {@code fileio.catalog.drop.force}: a drop that keeps an inline table's files, which cannot
+   * write the table to its metadata directory (Bug 106 (failed drop left its lists)), drops it
+   * anyway, and logs a warning. The table's files stay, with no metadata file to register, for a GC
+   * by listing, as a purge whose writer fails after its drop landed leaves them. Without the option
+   * the drop fails, and the table stays.
+   */
+  @Nested
+  class AForcedDropOfATableItCannotWrite {
+    private final TableIdentifier u = TableIdentifier.of(mixedNs, "u");
+    private final Map<String, String> force = Map.of(LogCatalogProperties.DROP_FORCE, "true");
+
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND_TM", "APPEND_ML", "MEMLOG_ML"})
+    void dropsTheTable(LocalCatalogMode mode) {
+      RefusingMetadataWrites io = new RefusingMetadataWrites();
+      LogCatalog catalog = mode.catalog(io, WAREHOUSE, "c", force);
+      catalog.createNamespace(mixedNs);
+      String location = threeAppends(catalog, mixed).location();
+      Set<String> before = metadataDirectory(io, location);
+      io.allowed.set(mode.inlineML ? 1 : 0); // a list file and no more, or no metadata file
+
+      assertThat(catalog.dropTable(mixed, false)).isTrue();
+
+      assertThat(catalog.tableExists(mixed)).isFalse();
+      assertThat(metadataDirectory(io, location)).as("the table's files, as they were")
+          .isEqualTo(before);
+    }
+
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND_ML", "MEMLOG_ML"})
+    void aTransactionDropsItsTables(LocalCatalogMode mode) {
+      RefusingMetadataWrites io = new RefusingMetadataWrites();
+      LogCatalog catalog = mode.catalog(io, WAREHOUSE, "c", force);
+      catalog.createNamespace(mixedNs);
+      String t = threeAppends(catalog, mixed).location();
+      threeAppends(catalog, u);
+      io.under = t + "/";
+      io.allowed.set(0);
+
+      CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      txn.asCatalog().dropTable(mixed, false);
+      txn.asCatalog().loadTable(u).newFastAppend().appendFile(dataFile("ud")).commit();
+      txn.commitTransaction();
+
+      assertThat(catalog.tableExists(mixed)).isFalse();
+      assertThat(metadataDirectory(io, t)).noneMatch(f -> f.endsWith(".metadata.json"));
+      assertThat(dataFiles(catalog.loadTable(u))).contains("mem:///data/ud.parquet");
+    }
+
+    @Test
+    void withoutItTheDropFails() {
+      RefusingMetadataWrites io = new RefusingMetadataWrites();
+      LogCatalog catalog = catalog(io, LocalCatalogMode.APPEND_ML);
+      catalog.createNamespace(mixedNs);
+      threeAppends(catalog, mixed);
+      io.allowed.set(0);
+
+      assertThatThrownBy(() -> catalog.dropTable(mixed, false))
+          .hasStackTraceContaining("Write refused");
+      CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      txn.asCatalog().dropTable(mixed, false);
+      assertThatThrownBy(txn::commitTransaction).hasStackTraceContaining("Write refused");
+      assertThat(catalog.tableExists(mixed)).isTrue();
+    }
+  }
 }

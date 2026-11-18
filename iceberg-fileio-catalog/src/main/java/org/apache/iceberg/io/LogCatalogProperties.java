@@ -139,9 +139,10 @@ public final class LogCatalogProperties {
    * metadata directory as a pointer table's is (a metadata file, and a manifest list file for each
    * snapshot whose list the catalog holds inline), so that {@code registerTable} with that file
    * brings it back, as it brings back a table any Iceberg catalog dropped without purging. A drop
-   * that loses its race deletes what it wrote, and writes again from its next read. {@code false}
-   * drops the table's metadata with its record: the table's data files stay, with nothing that
-   * names them once the log is compacted. Default: {@code true}.
+   * that loses its race deletes what it wrote, and writes again from its next read; one that
+   * cannot write the table fails, and deletes what it wrote, unless {@link #DROP_FORCE}. {@code
+   * false} drops the table's metadata with its record: the table's data files stay, with nothing
+   * that names them once the log is compacted. Default: {@code true}.
    */
   public static final String DROP_MATERIALIZE = "fileio.catalog.drop.materialize";
   public static final boolean DEFAULT_DROP_MATERIALIZE = true;
@@ -149,6 +150,22 @@ public final class LogCatalogProperties {
   /** Whether {@code properties} have a drop that keeps an inline table's files write them first. */
   public static boolean dropMaterialize(Map<String, String> properties) {
     return booleanProperty(properties, DROP_MATERIALIZE, DEFAULT_DROP_MATERIALIZE);
+  }
+
+  /**
+   * Whether a drop that keeps an inline table's files drops the table even when it cannot write it
+   * to its metadata directory ({@link #DROP_MATERIALIZE}): the table's storage gone, or refusing
+   * writes. The drop deletes what it wrote, logs a warning, and goes on, in {@code dropTable} and
+   * in a catalog transaction. The table's files then stay with no metadata file to register, for a
+   * GC by listing, as a purge whose writer fails after its drop landed leaves them. {@code false}
+   * fails such a drop, and the table stays. Default: {@code false}.
+   */
+  public static final String DROP_FORCE = "fileio.catalog.drop.force";
+  public static final boolean DEFAULT_DROP_FORCE = false;
+
+  /** Whether {@code properties} have a drop that cannot write an inline table drop it anyway. */
+  public static boolean dropForce(Map<String, String> properties) {
+    return booleanProperty(properties, DROP_FORCE, DEFAULT_DROP_FORCE);
   }
 
   /**

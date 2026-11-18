@@ -473,7 +473,15 @@ than the log stores to `RecordTooLargeException`, also a
 to `CommitStateUnknownException`. Work after the commit lands
 does not change its outcome: the catalog deletes the metadata files that
 dropped out of a table's log through `CatalogUtil.deleteFiles`, which
-logs a failure instead of throwing it (Bug 61). `TestCatalogFaultProperties`,
+logs a failure instead of throwing it (Bug 61), and a drop with purge
+deletes the table's files once its record lands, logging a file it cannot
+read or delete (Bug 96 (transaction purge failed its commit)). A purge
+does not run again: a writer that fails after the drop landed leaves the
+table's files, which no catalog entry names any more, for a GC by listing
+the table's location. A drop that keeps an inline table's files, forced
+past a failure to write the table to its metadata directory
+(`fileio.catalog.drop.force`), leaves them the same way.
+`TestCatalogFaultProperties`,
 `TestMultiWriterProperties` and the `CommitProtocol` fuzzer check that an
 operation reported failed any way but unknown did not take effect, and the
 latter two check it again once every delayed write has landed.

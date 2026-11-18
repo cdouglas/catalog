@@ -100,7 +100,11 @@ transaction's net effect against the catalog as the transaction found it, which 
 names at the start, with the version first read), renamed (start name to final name) and dropped,
 and namespaces created, changed and dropped. A purge reads the dropped version's history before
 the commit and deletes the table's files after it lands; a file it cannot read or delete then is
-left and logged, and the transaction still reports its commit (Bug 96). Replace transactions, `registerTable` and views stay unsupported in a catalog transaction
+left and logged, and the transaction still reports its commit (Bug 96). A writer that fails after
+the commit leaves the files for a GC by listing. A drop that keeps an inline table's files writes
+the table to its metadata directory before the commit (SPEC.md, "Commits"); if it cannot,
+the transaction fails and deletes what it wrote, unless `fileio.catalog.drop.force`, which drops the table anyway and leaves
+its files as a purge interrupted after its commit does. Replace transactions, `registerTable` and views stay unsupported in a catalog transaction
 and throw.
 
 ## The SPI
