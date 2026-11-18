@@ -225,7 +225,9 @@ public class CatalogMutation {
     }
     missing.forEach(ancestor -> namespaces.put(ancestor, true));
     namespaces.put(namespace, true);
-    namespaceProperties.put(namespace, properties);
+    // a map of the transaction's own, which a later change of the namespace's properties merges
+    // into: the caller's may be immutable, or change under it
+    namespaceProperties.put(namespace, Maps.newHashMap(properties));
     return this;
   }
 

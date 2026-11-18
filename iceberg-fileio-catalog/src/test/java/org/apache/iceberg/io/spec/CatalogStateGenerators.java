@@ -461,9 +461,7 @@ final class CatalogStateGenerators {
     try {
       switch (op) {
         case CREATE_NAMESPACE:
-          // a map of its own: a later change of its properties in the transaction merges into it
-          mutation.createNamespace(
-              ns, rng.nextBoolean() ? new HashMap<>() : new HashMap<>(Map.of(key, value)));
+          mutation.createNamespace(ns, rng.nextBoolean() ? Map.of() : Map.of(key, value));
           bound.add(ns);
           return "createNamespace(" + ns + ")";
         case DROP_NAMESPACE:

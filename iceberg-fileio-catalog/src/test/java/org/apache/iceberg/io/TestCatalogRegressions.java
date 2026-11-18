@@ -7482,6 +7482,53 @@ public class TestCatalogRegressions {
     }
   }
 
+  /**
+   * Bug 109 (namespace properties map shared): a transaction that created a namespace kept the
+   * properties map it was given as the namespace's, and a later change of the namespace's
+   * properties in the transaction merged into that map: a catalog transaction that created a
+   * namespace and then set or removed its properties failed with UnsupportedOperationException
+   * (Iceberg's transaction hands the catalog immutable maps), and a caller's mutable map was
+   * changed under it.
+   */
+  @Nested
+  class PropertiesOfANamespaceATransactionCreates {
+    private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+    private final Namespace ns = Namespace.of("ns");
+
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "MEMLOG"})
+    void changeInACatalogTransaction(LocalCatalogMode mode) {
+      LogCatalog catalog = catalog(io, mode);
+      CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      org.apache.iceberg.catalog.SupportsNamespaces txc =
+          (org.apache.iceberg.catalog.SupportsNamespaces) txn.asCatalog();
+      txc.createNamespace(ns, Map.of("a", "1", "b", "2"));
+      txc.setProperties(ns, Map.of("c", "3"));
+      txc.removeProperties(ns, Set.of("a"));
+      txn.commitTransaction();
+
+      assertThat(catalog(io, mode).loadNamespaceMetadata(ns))
+          .isEqualTo(Map.of("b", "2", "c", "3"));
+    }
+
+    @Test
+    void leaveTheCallersMapAlone() {
+      CatalogLog log = log(io, APPEND);
+      Map<String, String> given = new HashMap<>(Map.of("a", "1"));
+      Map<String, String> removal = new HashMap<>();
+      removal.put("a", null);
+
+      CatalogMutation txn = new CatalogMutation(log.empty())
+          .createNamespace(ns, given)
+          .updateProperties(ns, new HashMap<>(Map.of("b", "2")))
+          .updateProperties(ns, removal);
+      txn.commit(log);
+
+      assertThat(given).isEqualTo(Map.of("a", "1"));
+      assertThat(log.read().state().namespaceProperties(ns)).isEqualTo(Map.of("b", "2"));
+    }
+  }
+
   /** Properties of a catalog whose creates bind names by the namespace's version. */
   private static final Map<String, String> BY_NAMESPACE =
       Map.of(LogCatalogProperties.CREATE_CONDITION, "namespace");
