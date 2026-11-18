@@ -649,8 +649,8 @@ What the matrix says:
 4. `ReadTable` is the read side of optimistic concurrency — it conflicts
    with any update to the same table, nothing else; with refs (a read
    witness, a serializable transaction's read of a table's branches), only
-   with an update the encoding cannot tell leaves those refs alone (under
-   `lamport`, any).
+   with an update the encoding cannot tell leaves those refs and the
+   schema alone (under `lamport`, any).
 5. The root is a parent like any other: an ordinary namespace row with
    id 0, so top-level creates bind their names, and drops serialize, on
    its version and removals. It cannot be named, created, or dropped

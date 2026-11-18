@@ -22,7 +22,7 @@ mutant() { # name main-dir test-dir
   local M=$2
   case $1 in
     # the commit's read does not check the reads
-    readunchecked) mutate $M/LogCatalog.java "      if (!read.unchangedIn(now)) {" "      if (false) {" ;;
+    readunchecked) mutate $M/LogCatalog.java "      if (!read.unchangedIn(now) || scanSchemaChanged(read, now)) {" "      if (false) {" ;;
     # the record holds no read where it lands
     readunheld) mutate $M/LogCatalog.java "      if (witness && then != null) {
         newCatalog.readRef(read.identifier(), read.ref());
@@ -39,7 +39,8 @@ mutant() { # name main-dir test-dir
     return Witness.of(base);" ;;
     # a scan read is unchanged at the commit's read where no data file added to its ref since its
     # snapshot might match its filter: delete files, removals and resets go unread
-    readfilter) mutate $M/LogCatalog.java "      if (!read.unchangedIn(now)) {" "      if (!read.unchangedIn(now) && !addsNoDataUnder(read, now)) {" \
+    readfilter) mutate $M/LogCatalog.java "      if (!read.unchangedIn(now) || scanSchemaChanged(read, now)) {" "      if ((!read.unchangedIn(now) && !addsNoDataUnder(read, now))
+          || scanSchemaChanged(read, now)) {" \
       && mutate $M/LogCatalog.java "  private TableMetadata currentMetadata(TableIdentifier table, Replica<CatalogState> current) {" "  private boolean addsNoDataUnder(TableRead read, TableMetadata now) {
     if (now == null || !read.isScan() || read.snapshotId() == null
         || !java.util.Objects.equals(now.uuid(), read.metadata().uuid())) {

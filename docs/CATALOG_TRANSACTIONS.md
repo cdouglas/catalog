@@ -1,9 +1,9 @@
 # Catalog transactions through Iceberg's API
 
-Status (2026-11-15): implemented for FileIOCatalog, JDBC and REST (REST: SNAPSHOT table updates
-only, as its protocol allows). FileIOCatalog
-judges a scan read by its ref (a read witness), not yet by its filter (errata D12). It replaces
-errata S2's prototype API and narrows D12's serializable reads.
+Status (2026-11-17): implemented for FileIOCatalog, JDBC and REST (REST: SNAPSHOT table updates
+only, as its protocol allows). FileIOCatalog judges a scan read by its ref and the schema it read
+with (a read witness), not yet by its filter (errata D12). It replaces errata S2's prototype API
+and narrows D12's serializable reads.
 
 A catalog transaction groups changes to several tables and to the catalog itself, and commits
 them all or none. FileIOCatalog has done that natively since the start: a `CatalogMutation`
@@ -52,19 +52,25 @@ between tables loaded at different times.)
 or deletes), a read is what the transaction scanned:
 
 - A *scan read*: the rows of a branch or tag under a row filter, as of the snapshot the scan read
-  (none, if the branch had none). `TableScan` and `BatchScan` planning record it: the ref
-  (`useRef`, else `main`), the snapshot, the filter and its case sensitivity. A scan of a fixed
-  snapshot (`useSnapshot`, `asOfTime`) records nothing: its rows cannot change. It is unchanged at
-  the commit if no data or delete file matching the filter was added to the ref since its snapshot,
-  no data file matching it was removed except by a rewrite that keeps the rows (Iceberg's
-  `REPLACE`), and the ref was not reset to a snapshot that does not descend from it.
+  (none, if the branch had none), read with the schema the scan resolved: a branch's scan with the
+  table's current schema, a tag's with its snapshot's. `TableScan` and `BatchScan` planning record
+  it: the ref (`useRef`, else `main`), the snapshot, the filter and its case sensitivity. A scan of
+  a fixed snapshot (`useSnapshot`, `asOfTime`) records nothing: its rows cannot change. It is
+  unchanged at the commit if no data or delete file matching the filter was added to the ref since
+  its snapshot, no data file matching it was removed except by a rewrite that keeps the rows
+  (Iceberg's `REPLACE`), the ref was not reset to a snapshot that does not descend from it, and the
+  schema it resolves is the one the scan read with: a rename, a drop and re-add or a type promotion
+  changes what a branch's scan reads without moving the branch (Bug 120 (schema change escaped
+  read witness)). `TableRead.unchangedIn`, the coarsest judgment the API gives, compares the
+  ref's snapshot alone; FileIOCatalog compares the schema beside it.
 - A *declared read*: `CatalogTransaction.declareRead(table)`, the whole version of a table as the
   transaction first read it, for engines that decide on a table's schema, properties or snapshots
   without scanning. Unchanged if the table's version is.
 
-A load is not a read. Neither is a listing (`listTables`, `listNamespaces`): a serializable
-transaction that acts on a listing is not protected against tables or namespaces appearing or
-disappearing (a gap, as in single-table Iceberg, where listings are never validated).
+A load is not a read. Neither is a listing (`listTables`, `listNamespaces`), a table's existence
+(`tableExists`, which loads it) or a namespace's (`namespaceExists`, `loadNamespaceMetadata`): a
+serializable transaction that acts on one is not protected against tables or namespaces appearing
+or disappearing (a gap, as in single-table Iceberg, where listings are never validated).
 
 A scan of a table the transaction has already written reads its own staged changes; its read is of
 the branch as the transaction first read it, plus those changes, so it is recorded against the
@@ -73,12 +79,21 @@ kept beside the append: the append stays blind (a `FastAppend` validates nothing
 judged on its own.
 
 **No false negatives.** A catalog may judge a read more coarsely than above, and reject more, but
-never admit a read whose rows changed. FileIOCatalog judges a scan read by the conflict encoding's
-code for validated writes (`partition-vector`, `manifest-window`: by the filter; `concern-vector`
-and its descendants: by the ref's advance and reset stamps; `lamport`: by the version). JDBC judges
-every read by the table's whole version. The client no longer checks reads before the commit (its
-check was not atomic with the commit, so it caught nothing the catalog's misses, and only added
-false rejections: 2,042 of E5w's failed attempts).
+never admit a read whose rows, or the schema it read them with, changed. FileIOCatalog judges a
+scan read twice. Its commit's read of the catalog compares the table with the version the
+transaction first read: the snapshot the ref names, and the schema the scan resolves (`read:
+schema`). Its record then holds the read until it lands, judged by the conflict encoding from the
+version the commit read: under `concern-vector` and every encoding built on it (`blind-append`,
+`partition-vector`, `manifest-window`), by the stamps of the refs it read (a commit to one, a
+reset, a removal) and the schema stamp (`concern: schema`); under `lamport-minus-properties`, by
+any change but a property's; under `lamport`, and on a pointer table under every encoding, by the
+version. No encoding judges a read by its filter yet (errata D12), so a commit to any partition of
+a branch read fails it. The schema stamp moves on any schema update, the removal of an old
+schema included, and on a tag's read too, whose scan reads its snapshot's schema: false
+positives the stamp cannot tell apart. JDBC judges every read by the table's whole version. The
+client no longer checks reads before the commit (its check was not atomic with the commit, so it
+caught nothing the catalog's misses, and only added false rejections: 2,042 of E5w's failed
+attempts).
 
 **Catalog changes.** `asCatalog()` stages them, and also implements `SupportsNamespaces` when the
 catalog does:

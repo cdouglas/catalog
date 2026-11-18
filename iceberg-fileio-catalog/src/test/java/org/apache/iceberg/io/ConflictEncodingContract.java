@@ -71,7 +71,8 @@ import org.intentlog.wire.LogEnvelope;
  *
  * And a read witness, a serializable catalog transaction's read of a table's refs (errata D12),
  * judged after each command of an extension, is admitted only where each ref it read names the
- * snapshot it did, and once rejected stays rejected (S2).
+ * snapshot it did and the table's schema, which a branch's scan reads with, is the one it read
+ * (Bug 120), and once rejected stays rejected (S2).
  *
  * Whether an admitted record is what its operation would commit is {@code TestRebaseProperties}'s
  * to check.
@@ -217,7 +218,9 @@ abstract class ConflictEncodingContract {
    * witness of all of them, and one of each alone: the record's {@code ReadTable} at the version it
    * read). After each command of an extension, which can take the table anywhere (renames away and
    * back included), each witness is admitted only where the table is at that version or each ref
-   * it read names the snapshot it did then, and once rejected it stays rejected (S2).
+   * it read names the snapshot it did then and the table's schema is the one a scan of a branch
+   * read with then (Bug 120 (schema change escaped read witness)), and once rejected it stays
+   * rejected (S2).
    */
   @Property(tries = 200)
   void aReadWitnessHoldsOnlyWhileItsRefsDo(
@@ -241,13 +244,15 @@ abstract class ConflictEncodingContract {
       return;
     }
     Map<String, Long> read = new TreeMap<>();
-    ((HasTableOperations) fixture.catalog.loadTable(TableScript.ID)).operations().current().refs()
-        .forEach((name, ref) -> read.put(name, ref.snapshotId()));
+    org.apache.iceberg.TableMetadata atRead =
+        ((HasTableOperations) fixture.catalog.loadTable(TableScript.ID)).operations().current();
+    atRead.refs().forEach((name, ref) -> read.put(name, ref.snapshotId()));
     if (read.isEmpty()) {
       Statistics.label("read witness").collect("no refs");
       return;
     }
-    Witnesses witnesses = new Witnesses(tableId, base.tableVersion(tableId), read, trace);
+    Witnesses witnesses = new Witnesses(
+        tableId, base.tableVersion(tableId), read, atRead.schema().asStruct(), trace);
     for (int i = 0; i <= extension.size(); i++) {
       if (i == renameAt) {
         trace.append("rename away and back\n");
@@ -267,14 +272,18 @@ abstract class ConflictEncodingContract {
     private final int tableId;
     private final int version;
     private final Map<String, Long> read;
+    /** The table's schema where they read: a branch's scan reads with it. */
+    private final org.apache.iceberg.types.Types.StructType schema;
     private final List<List<String>> refs = new ArrayList<>();
     private final boolean[] rejected;
     private final StringBuilder trace;
 
-    Witnesses(int tableId, int version, Map<String, Long> read, StringBuilder trace) {
+    Witnesses(int tableId, int version, Map<String, Long> read,
+        org.apache.iceberg.types.Types.StructType schema, StringBuilder trace) {
       this.tableId = tableId;
       this.version = version;
       this.read = read;
+      this.schema = schema;
       this.trace = trace;
       refs.add(List.copyOf(read.keySet()));
       if (read.size() > 1) {
@@ -317,6 +326,12 @@ abstract class ConflictEncodingContract {
                 "a read witness of %s is admitted, but %s moved from %s to %s%n%s", refs.get(w),
                 ref, read.get(ref), now, trace));
           }
+        }
+        org.apache.iceberg.types.Types.StructType now = landing.metadata().schema().asStruct();
+        if (!now.equals(schema)) {
+          throw new AssertionError(String.format(
+              "a read witness of %s is admitted, but the schema changed from %s to %s%n%s",
+              refs.get(w), schema, now, trace));
         }
         Statistics.label("read witness").collect("admitted on a changed table");
       }
@@ -485,14 +500,21 @@ abstract class ConflictEncodingContract {
         .list().ofMinSize(1).ofMaxSize(6);
   }
 
-  /** Commands that change a table's refs, or change it leaving them alone. */
+  /**
+   * Commands that change a table's refs or its schema (which a branch's scan reads with), or
+   * change it leaving them alone.
+   */
   private static final java.util.Set<TableScript.Kind> REF_CHANGES = java.util.EnumSet.of(
       TableScript.Kind.BRANCH_APPEND, TableScript.Kind.CREATE_BRANCH, TableScript.Kind.CREATE_TAG,
       TableScript.Kind.REMOVE_REF, TableScript.Kind.FAST_FORWARD, TableScript.Kind.ROLLBACK,
       TableScript.Kind.CHERRY_PICK, TableScript.Kind.RETENTION, TableScript.Kind.EXPIRE_SNAPSHOTS,
-      TableScript.Kind.SET_PROPERTY);
+      TableScript.Kind.SET_PROPERTY, TableScript.Kind.ADD_COLUMN, TableScript.Kind.RENAME_COLUMN,
+      TableScript.Kind.UPDATE_COLUMN);
 
-  /** Extensions for a read witness: half of their commands change refs or leave them alone. */
+  /**
+   * Extensions for a read witness: half of their commands change refs or the schema, or leave
+   * them alone.
+   */
   @Provide
   Arbitrary<List<TableScript.Cmd>> refExtensions() {
     return Arbitraries.oneOf(

@@ -65,6 +65,7 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
@@ -7809,6 +7810,108 @@ public class TestCatalogRegressions {
       }
     }
   }
+
+  /**
+   * Bug 120 (schema change escaped read witness): a serializable catalog transaction's scan of a
+   * branch reads with the table's current schema, but its read was judged by its ref alone: at
+   * its commit's read by the snapshot the ref names ({@code TableRead.unchangedIn}), and where its
+   * record lands by the ref's advance and reset stamps (the read witness of {@code
+   * concern-vector} and the encodings built on it). A schema change (a column renamed, dropped and
+   * added again, or promoted) changes what the scan read and leaves the ref where it was, so write
+   * skew went through the schema: R scans T and appends to U; W scans U and changes T's schema,
+   * and commits first; R was admitted too, though it read T before W changed it and W read U
+   * before R appended to it, a cycle no serial order has. A scan read now also reads the schema it
+   * resolved: the commit's read compares it ({@code read: schema}), and a read witness reads the
+   * schema concern ({@code concern: schema}). Found by the 2026-11-17 design review (C4).
+   */
+  @Nested
+  class ASchemaChangeToATableATransactionScanned {
+    private final TableIdentifier t = TableIdentifier.of("ns", "t");
+    private final TableIdentifier u = TableIdentifier.of("ns", "u");
+    private final Schema schema = new Schema(
+        Types.NestedField.required(1, "id", Types.IntegerType.get()),
+        Types.NestedField.optional(2, "data", Types.StringType.get()));
+    private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+
+    @ParameterizedTest(name = "{0}, W commits {1}, {2}")
+    @MethodSource("org.apache.iceberg.io.TestCatalogRegressions#schemaChangesToARead")
+    void failsTheTransaction(String encoding, String when, String change) {
+      Map<String, String> properties = Map.of(LogCatalogProperties.CONFLICT_ENCODING, encoding);
+      LogCatalog r = LocalCatalogMode.APPEND_ML.catalog(io, WAREHOUSE, "c", properties);
+      r.createNamespace(Namespace.of("ns"));
+      r.createTable(t, schema).newFastAppend().appendFile(file("t1")).commit();
+      r.createTable(u, schema).newFastAppend().appendFile(file("u1")).commit();
+      LogCatalog w = LocalCatalogMode.APPEND_ML.catalog(io, WAREHOUSE, "c", properties);
+
+      // R scans T and appends to U; W scans U and changes T's schema
+      CatalogTransaction rTxn =
+          r.createTransaction(CatalogTransaction.IsolationLevel.SERIALIZABLE);
+      rTxn.asCatalog().loadTable(t).newScan().planFiles();
+      rTxn.asCatalog().loadTable(u).newFastAppend().appendFile(file("r")).commit();
+      CatalogTransaction wTxn =
+          w.createTransaction(CatalogTransaction.IsolationLevel.SERIALIZABLE);
+      wTxn.asCatalog().loadTable(u).newScan().planFiles();
+      org.apache.iceberg.UpdateSchema update = wTxn.asCatalog().loadTable(t).updateSchema();
+      switch (change) {
+        case "rename":
+          update.renameColumn("data", "payload");
+          break;
+        case "drop and add":
+          update.deleteColumn("data").addColumn("data", Types.StringType.get());
+          break;
+        default:
+          update.updateColumn("id", Types.LongType.get());
+      }
+      update.commit();
+
+      Throwable failure;
+      if (when.equals("before R's commit")) {
+        wTxn.commitTransaction();
+        failure = org.assertj.core.api.Assertions.catchThrowable(rTxn::commitTransaction);
+      } else {
+        boolean[] raced = {false};
+        io.injectFaults((location, strategy) -> {
+          if (location.equals(CATALOG) && !raced[0]) {
+            raced[0] = true;
+            wTxn.commitTransaction();
+          }
+          return Fault.NONE;
+        });
+        try {
+          failure = org.assertj.core.api.Assertions.catchThrowable(rTxn::commitTransaction);
+        } finally {
+          io.injectFaults((location, strategy) -> Fault.NONE);
+        }
+        assertThat(raced[0]).isTrue();
+      }
+
+      LogCatalog reader = LocalCatalogMode.APPEND_ML.catalog(io, WAREHOUSE, "c", properties);
+      assertThat(reader.loadTable(t).schema().asStruct())
+          .as("W's schema change landed")
+          .isNotEqualTo(schema.asStruct());
+      assertThat(failure)
+          .as("R, whose scan of T's main read the schema W changed")
+          .isInstanceOf(CommitFailedException.class);
+      assertThat(reader.loadTable(u).snapshots()).as("U, without R's append").hasSize(1);
+    }
+  }
+
+  /** The encodings, the points W commits at, and W's schema changes of Bug 120's cycle. */
+  static java.util.stream.Stream<org.junit.jupiter.params.provider.Arguments>
+      schemaChangesToARead() {
+    List<org.junit.jupiter.params.provider.Arguments> cases = new ArrayList<>();
+    for (String encoding : List.of(LamportEncoding.NAME, LamportMinusPropertiesEncoding.NAME,
+        ConcernVectorEncoding.NAME, BlindAppendEncoding.NAME, PartitionVectorEncoding.NAME,
+        ManifestWindowEncoding.NAME)) {
+      for (String when : List.of("before R's commit", "as R's record is written")) {
+        for (String change : List.of("rename", "drop and add", "promote")) {
+          cases.add(org.junit.jupiter.params.provider.Arguments.of(encoding, when, change));
+        }
+      }
+    }
+    return cases.stream();
+  }
+
   /** Properties of a catalog whose creates bind names by the namespace's version. */
   private static final Map<String, String> BY_NAMESPACE =
       Map.of(LogCatalogProperties.CREATE_CONDITION, "namespace");

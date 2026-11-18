@@ -148,7 +148,8 @@ abstract class ConcernEncoding implements ConflictEncoding<ConcernEncoding.Witne
 
   /**
    * What a read witness reads, a serializable transaction's that read {@code refs} of the table at
-   * {@code base}: the stamps of every change to them that {@link #stamp} records (errata D12).
+   * {@code base}: the stamps of every change to them that {@link #stamp} records, and of every
+   * change to the schema a scan of them read with (errata D12; Bug 120).
    */
   abstract Witness readWitness(int base, List<String> refs);
 

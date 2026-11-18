@@ -393,7 +393,8 @@ class TestConflictAttribution {
    * A change to the table a serializable transaction scanned, between its scan and its commit: the
    * commit finds it on the read it stages on, writes nothing, and counts the conflict by what
    * changed (errata D12: an append to any partition and a rewrite, which a read judged by its
-   * filter would tell apart; a reset; the table dropped or replaced).
+   * filter would tell apart; a reset; the table dropped or replaced; the schema the scan read with,
+   * Bug 120 (schema change escaped read witness)).
    */
   @ParameterizedTest
   @CsvSource({
@@ -402,7 +403,9 @@ class TestConflictAttribution {
     "append and rewrite, read: advanced by append+replace",
     "rollback, read: reset",
     "drop, read: dropped",
-    "replace, read: replaced"
+    "replace, read: replaced",
+    "rename a column, read: schema",
+    "promote a column, read: schema"
   })
   void aReadChangedBeforeItsRecordIsCountedByWhatChanged(String change, String reason) {
     LogCatalog[] w = writers(ManifestWindowEncoding.NAME);
@@ -441,9 +444,43 @@ class TestConflictAttribution {
         catalog.dropTable(ID, false);
         catalog.createTable(ID, SCHEMA);
         break;
+      case "rename a column":
+        table.updateSchema().renameColumn("id", "key").commit();
+        break;
+      case "promote a column":
+        table.updateSchema().updateColumn("id", Types.LongType.get()).commit();
+        break;
       default:
         throw new IllegalArgumentException(change);
     }
+  }
+
+  /**
+   * A serializable scan of a branch reads with the table's current schema (Bug 120 (schema change
+   * escaped read witness)): another writer's schema change, which leaves the branch where it was,
+   * landing as the transaction writes its record, fails it: by the schema concern under {@code
+   * concern-vector} and the encodings built on it, as any change but a property's under {@code
+   * lamport-minus-properties} and any change under {@code lamport}.
+   */
+  @ParameterizedTest
+  @CsvSource({
+    "lamport, whole: lamport",
+    "lamport-minus-properties, concern: other than properties",
+    "concern-vector, concern: schema",
+    "blind-append, concern: schema",
+    "partition-vector, concern: schema",
+    "manifest-window, concern: schema"
+  })
+  void aSerializableReadFailsWhenTheSchemaItReadWithChanges(String encoding, String reason) {
+    LogCatalog[] w = writers(encoding);
+    w[0].createTable(OTHER, SCHEMA);
+    assertThatThrownBy(() -> readTAppendU(w[0], () -> beforeAsWrite(
+            () -> w[1].loadTable(ID).updateSchema().renameColumn("id", "key").commit())))
+        .isInstanceOf(CommitFailedException.class);
+
+    assertThat(reasons(w[0])).containsExactly(Map.entry(reason, 1L));
+    assertThat(rejectedInTheLog()).containsExactly(Map.entry(reason, 1L));
+    assertThat(w[1].loadTable(OTHER).currentSnapshot()).isNull();
   }
 
   /** Under {@code lamport} a read witness is the version: any change fails the transaction. */
@@ -462,7 +499,7 @@ class TestConflictAttribution {
    * A transaction read a table by its name, as its commit's check finds it: another writer's
    * rename of it fails the transaction, as the check would where the record lands. A rename is a
    * change the encoding does not see into, which stamps everything, the first stamp it reads
-   * included.
+   * included (the schema's).
    */
   @Test
   void aSerializableReadFailsWhenItsTableIsRenamed() {
@@ -472,7 +509,7 @@ class TestConflictAttribution {
             () -> w[1].renameTable(ID, TableIdentifier.of("ns", "x")))))
         .isInstanceOf(CommitFailedException.class);
 
-    assertThat(reasons(w[0])).containsExactly(Map.entry("ref: advanced", 1L));
+    assertThat(reasons(w[0])).containsExactly(Map.entry("concern: schema", 1L));
   }
 
   /** Replay sees no ref of a pointer table: there only the version read holds the read. */

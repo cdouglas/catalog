@@ -127,9 +127,9 @@ did (Bug 70): another writer's property change that a schema update's name
 mapping rewrote, or a tag on a snapshot the transaction expired. Under
 serializable isolation the record names the branches the transaction scanned of
 each table (a read witness, SPEC.md §"Commits"), which the encoding judges by
-what changed of them; a branch read with no snapshot, and a declared read, hold
-the table's version (a read pin). A scan read is judged by its ref, not yet by
-its filter (below).
+what changed of them and of the schema; a branch read with no snapshot, and a
+declared read, hold the table's version (a read pin). A scan read is judged by
+its ref and the schema it read with, not yet by its filter (below).
 
 So there the catalog is stricter than Iceberg's REST semantics: a concurrent
 property change, or a commit to another branch, fails a transaction whose

@@ -532,10 +532,13 @@ first.
   update of a table that is not an inline delta, errata D12) apply only on
   that version.
 - A read witness reads the stamps of every change to the refs it read: a
-  commit to one, and any other move (`ref: advanced`, `ref: reset`), under
-  `concern-vector` and the encodings built on it; anything but a property
-  change under `lamport-minus-properties`, which stamps no refs; the
-  version under `lamport`. A change an encoding does not see into (a
+  commit to one, and any other move (`ref: advanced`, `ref: reset`), and
+  of every schema change (`concern: schema`: a branch's scan reads with
+  the table's current schema, which a rename, a drop and re-add or a type
+  promotion changes without moving the branch), under `concern-vector`
+  and the encodings built on it; anything but a property change under
+  `lamport-minus-properties`, which stamps no refs; the version under
+  `lamport`. A change an encoding does not see into (a
   pointer table's, an eviction, a rename) stamps everything, so a witness
   holds over it only where the version does.
 - The table's version becomes its version where the record lands, plus
@@ -686,7 +689,7 @@ a table it writes, at the version it first read ([errata.md](errata.md)
 Under serializable isolation the record also says what the transaction read
 of each table, as its commit checked it on the state it builds on: a
 `ReadTable` at that version whose refs are the branches and tags it scanned (a
-read witness; a load is not a read, docs/CATALOG_TRANSACTIONS.md). The encoding judges it by what changed of those refs since, as
+read witness; a load is not a read, docs/CATALOG_TRANSACTIONS.md). The encoding judges it by what changed of those refs, and of the schema, since, as
 it judges a table update ([Conflict Encodings](#conflict-encodings)), so
 another writer's change landing first that leaves them alone (a property, an
 expiry, another branch) need not fail it, and a rejection stays one (S2). A
@@ -879,7 +882,7 @@ the id is a UUIDv7, and `CatalogIntention.verify` accepts it.
 | CreateTable              | the name binds in the namespace (below)                   |
 | DropTable                | table version matches                                     |
 | UpdateTableLocation      | the conflict encoding admits it: the table version matches |
-| ReadTable                | the conflict encoding admits it: a read pin's table version matches; a read witness's refs are unchanged since its version |
+| ReadTable                | the conflict encoding admits it: a read pin's table version matches; a read witness's refs and the table's schema are unchanged since its version |
 | CreateTableInline        | the name binds in the namespace (below)                   |
 | UpdateTableInline        | the conflict encoding admits it ([Conflict Encodings](#conflict-encodings)): under `lamport`, the table version matches |
 | RenameTable              | table version matches; the new name binds in the destination namespace (below) |

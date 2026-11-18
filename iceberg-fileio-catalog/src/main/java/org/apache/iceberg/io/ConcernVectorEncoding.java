@@ -38,14 +38,15 @@ import org.apache.iceberg.SnapshotRef;
  * </ul>
  *
  * So it admits a commit racing property, statistics and sort-order changes and commits and tags on
- * other refs (WAP). An expiry (snapshots removed, and nothing else) reads every ref's resets, the
- * table, the schemas, the specs and snapshot removal: it lands after commits that only add
- * snapshots and move branches to them, and removes the snapshots it chose on the table it read,
- * none of which a ref has come to name, where Iceberg's retry would choose again (errata D17 until
- * 2026-11-17; LogCatalogProperties.EXPIRY_MERGE); not after another removal, whose snapshots its
- * writer's cleanup, from the table it read, would take for its own (Bug 117). What Iceberg commits once (a schema or spec update, a ref
- * reset or retention change) and other removals (of schemas or specs, or with other changes) have
- * the Lamport witness.
+ * other refs (WAP). A serializable catalog transaction's read witness reads the refs it read and
+ * the schema ({@link #readWitness}). An expiry (snapshots removed, and nothing else) reads every
+ * ref's resets, the table, the schemas, the specs and snapshot removal: it lands after commits that
+ * only add snapshots and move branches to them, and removes the snapshots it chose on the table it
+ * read, none of which a ref has come to name, where Iceberg's retry would choose again (errata D17
+ * until 2026-11-17; LogCatalogProperties.EXPIRY_MERGE); not after another removal, whose snapshots
+ * its writer's cleanup, from the table it read, would take for its own (Bug 117). What Iceberg
+ * commits once (a schema or spec update, a ref reset or retention change) and other removals (of
+ * schemas or specs, or with other changes) have the Lamport witness.
  */
 class ConcernVectorEncoding extends ConcernEncoding {
 
@@ -123,12 +124,16 @@ class ConcernVectorEncoding extends ConcernEncoding {
   /**
    * A read witness reads every change to the snapshot of each ref it read: a commit to it, and any
    * other move (a rollback, a fast-forward, its removal); a dropped manifest comes with a commit.
-   * What it does not read (properties, an expiry that leaves the ref alone, another ref, retention)
-   * leaves what the transaction read as it was.
+   * It reads the schema too: a branch's scan reads with the table's current schema, which a
+   * rename, a drop and re-add or a type promotion changes without moving the ref (Bug 120). A
+   * tag's scan reads with its snapshot's schema, and a removal of old schemas changes neither, but
+   * the stamp does not tell them apart: those fail a read whose rows are as it read them. What it
+   * does not read (properties, an expiry that leaves the ref alone, another ref, retention) leaves
+   * what the transaction read as it was.
    */
   @Override
   Witness readWitness(int base, List<String> refs) {
-    Witness witness = Witness.of(base);
+    Witness witness = Witness.of(base).concern(TableChange.Concern.SCHEMA);
     for (String ref : refs) {
       witness.ref(ref, ConcernStamps.Ref.ADVANCE, ConcernStamps.Ref.RESET);
     }
