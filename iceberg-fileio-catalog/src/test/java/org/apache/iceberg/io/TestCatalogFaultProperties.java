@@ -142,6 +142,18 @@ import org.intentlog.wire.LogEnvelope;
  *   <li>An acknowledged catalog transaction saw no concurrent change it must not miss: any change
  *       to a table it appended to, since it first loaded the table (errata D12); and, under
  *       serializable isolation, to the main branch of any table it scanned (a load is not a read).
+ *   <li>Progress (the 2026-11-17 review's A5): an operation whose model effect applies, and no
+ *       fault was injected into, is not rejected as a conflict ({@link CommitFailedException}, or
+ *       {@code ServiceUnavailableException} once a catalog operation's attempts ran out) when
+ *       nothing raced it: no command preempted it, and its table handle, if it uses one, was
+ *       loaded fresh. Nor when its operation refreshes and applies itself again on a conflict
+ *       (Iceberg's snapshot producers, property updates, expiries and simple transactions; the
+ *       catalog's drops, renames and namespace operations), raced or stale: a command preempts
+ *       once, before the operation's first write, so its next attempt is unraced. Nor is a catalog
+ *       transaction, unpreempted, when no other writer changed a table it loaded since it loaded
+ *       it; nor, before it sends its record, one of a writer that inlines that only appends to
+ *       tables inline then and now, whose updates the conflict encoding judges where the record
+ *       lands (errata D12), not the client.
  * </ul>
  */
 class TestCatalogFaultProperties {
@@ -409,6 +421,65 @@ class TestCatalogFaultProperties {
         .ofMinSize(1)
         .ofMaxSize(40)
         .withSizeDistribution(RandomDistribution.uniform());
+  }
+
+  /**
+   * The kinds whose Iceberg operation, on a {@link CommitFailedException}, refreshes the table and
+   * applies itself again (SnapshotProducer, PropertiesUpdate, RemoveSnapshots, a simple
+   * BaseTransaction), and the catalog operations that stage themselves again on a fresh read
+   * (drops, renames, namespace operations; Bug 107): a race before its first write, or a stale
+   * handle, costs such an operation an attempt, never its commit. Not schema, partition-spec and
+   * ref changes, which Iceberg commits once on the version they read, nor replace transactions,
+   * which fail on a table changed since they began (Iceberg issue C23).
+   */
+  private static boolean retries(Cmd cmd) {
+    switch (cmd.kind) {
+      case FAST_APPEND:
+      case MERGE_APPEND:
+      case DELETE_FILE:
+      case ROW_DELTA:
+      case SET_PROPERTY:
+      case SET_BIG_PROPERTY:
+      case REMOVE_PROPERTY:
+      case UPGRADE_TABLE:
+      case BRANCH_APPEND:
+      case STAGE_APPEND:
+      case TABLE_TXN:
+      case EXPIRE_SNAPSHOTS:
+      case REWRITE_MANIFESTS:
+      case DROP_TABLE:
+      case RENAME_TABLE:
+      case CREATE_NAMESPACE:
+      case DROP_NAMESPACE:
+      case SET_NAMESPACE_PROPERTY:
+      case REMOVE_NAMESPACE_PROPERTY:
+        return true;
+      case SET_RETENTION:
+        return cmd.c % 4 == 3; // a table property; the others are ref changes
+      default:
+        return false;
+    }
+  }
+
+  /**
+   * The kinds that use no table handle: they read the catalog when they run, as a fresh handle
+   * does.
+   */
+  private static boolean handleFree(Kind kind) {
+    switch (kind) {
+      case CREATE_TABLE:
+      case DROP_TABLE:
+      case RENAME_TABLE:
+      case REPLACE_TABLE:
+      case REINLINE:
+      case CREATE_NAMESPACE:
+      case DROP_NAMESPACE:
+      case SET_NAMESPACE_PROPERTY:
+      case REMOVE_NAMESPACE_PROPERTY:
+        return true;
+      default:
+        return false;
+    }
   }
 
   // ============================================================
@@ -743,6 +814,8 @@ class TestCatalogFaultProperties {
     final String description;
     final Action action;
     final Effect effect;
+    // For a catalog transaction's commit: the tables it loaded, as it first loaded them
+    Map<TableIdentifier, Loaded> loaded = null;
 
     Op(String description, Action action, Effect effect) {
       this.description = description;
@@ -801,14 +874,18 @@ class TestCatalogFaultProperties {
   private static final class Writer {
     final int id;
     final LogCatalog catalog;
+    // Whether it writes table metadata inline: its updates go as deltas, which the conflict
+    // encoding can judge where they land
+    final boolean inline;
     final Map<TableIdentifier, Table> handles = new HashMap<>();
     CatalogTransaction txn = null;
     final Map<TableIdentifier, Loaded> loaded = new LinkedHashMap<>();
     final List<Map.Entry<TableIdentifier, String>> staged = new ArrayList<>();
 
-    Writer(int id, LogCatalog catalog) {
+    Writer(int id, LogCatalog catalog, boolean inline) {
       this.id = id;
       this.catalog = catalog;
+      this.inline = inline;
     }
 
     void closeTxn() {
@@ -959,7 +1036,7 @@ class TestCatalogFaultProperties {
         double draw = (i * 0.4) % 1.0;
         this.writers[i] = new Writer(i, modes.get(i).catalog(io, WAREHOUSE, CATALOG_NAME,
             writerProperties, offset == 0 ? null : () -> System.currentTimeMillis() + offset,
-            () -> draw));
+            () -> draw), modes.get(i).inlineTM || modes.get(i).inlineML);
       }
       // Reading does not depend on a catalog's mode, only on its log.
       this.checker = LocalCatalogMode.readerFor(io, CATALOG_LOCATION)
@@ -1079,6 +1156,15 @@ class TestCatalogFaultProperties {
         }
         Statistics.label("updates evicted for their records to fit").collect(
             evicted == 0 ? "none" : evicted < 3 ? "1-2" : "3 or more");
+      }
+      // Conflicts by their reason's kind (ConflictEncodings.rejection: whole, concern, ref, ...)
+      for (Writer w : writers) {
+        w.catalog.log().counts().conflictReasons().forEach((why, count) -> {
+          String kind = why.indexOf(':') > 0 ? why.substring(0, why.indexOf(':')) : why;
+          for (long i = 0; i < count; i++) {
+            Statistics.label("conflicts by reason").collect(kind);
+          }
+        });
       }
       long pageOuts = pageOuts();
       Statistics.label("PageOut records").collect(
@@ -2055,7 +2141,7 @@ class TestCatalogFaultProperties {
           Map<TableIdentifier, Loaded> loaded = new LinkedHashMap<>(w.loaded);
           List<Map.Entry<TableIdentifier, String>> appends = new ArrayList<>(w.staged);
           w.closeTxn();
-          return new Op(
+          Op commit = new Op(
               "txn.commit(" + txn.isolationLevel() + ", appends " + appends + ")",
               txn::commitTransaction,
               (m, actual) -> {
@@ -2064,6 +2150,8 @@ class TestCatalogFaultProperties {
                 }
                 appends.forEach(e -> existing(m, e.getKey()).files.add(e.getValue()));
               });
+          commit.loaded = loaded;
+          return commit;
         default:
           throw new IllegalStateException("Unknown kind " + cmd.kind);
       }
@@ -2178,6 +2266,8 @@ class TestCatalogFaultProperties {
       trace.append(String.format("%sw%d %s%n", indent, w.id, op));
       Outcome outcome;
       String reason = "";
+      // A rejection as a conflict, which may need to be justified (see mustCommit)
+      boolean conflict = false;
       if (topLevel) {
         armed = true;
       }
@@ -2194,6 +2284,8 @@ class TestCatalogFaultProperties {
         // (create conflict reported as exists))
         outcome = Outcome.REJECTED;
         reason = e.getClass().getSimpleName() + ": " + firstLine(e);
+        conflict = e instanceof CommitFailedException
+            || e instanceof org.apache.iceberg.exceptions.ServiceUnavailableException;
       } catch (NoSuchTableException e) {
         outcome = Outcome.REJECTED;
         reason = e.getClass().getSimpleName() + ": " + firstLine(e);
@@ -2232,11 +2324,67 @@ class TestCatalogFaultProperties {
       if (cmd.kind == Kind.TXN_BEGIN || cmd.kind == Kind.TXN_APPEND || cmd.kind == Kind.TXN_READ) {
         return; // no change to the catalog
       }
-      resolve(op, outcome, reason);
+      // A preempting command runs without faults, and nothing preempts it
+      String must = conflict && (!topLevel || fired.isEmpty())
+          ? mustCommit(cmd, w, op, topLevel && !preempting.isEmpty(), topLevel && writes == 0)
+          : null;
+      resolve(op, outcome, reason, must);
     }
 
-    /** Checks the catalog against the model, given what {@code op} reported. */
-    private void resolve(Op op, Outcome outcome, String reason) {
+    /**
+     * Why {@code op}, {@code w}'s, rejected as a conflict with no fault injected, must have
+     * committed if its model effect applies; null if it may conflict. {@code preempted}: a command
+     * ran inside it; {@code unsent}: it wrote nothing to the catalog's log.
+     */
+    private String mustCommit(Cmd cmd, Writer w, Op op, boolean preempted, boolean unsent) {
+      if (op.loaded != null) { // a catalog transaction's commit
+        if (preempted) {
+          return null;
+        }
+        boolean unchanged = true;
+        // A writer that inlines stages a delta, if it fits (a writer that does not, or an update
+        // over the inline limit, writes a metadata file, which applies only on the version it
+        // was built on)
+        boolean judged = unsent && w.inline;
+        for (Map.Entry<TableIdentifier, Loaded> e : op.loaded.entrySet()) {
+          TableState now = model.get(e.getKey());
+          Loaded at = e.getValue();
+          if (now == null || !now.uuid.equals(at.uuid)) {
+            return null; // the effect does not apply
+          }
+          unchanged &= Objects.equals(now.metadataLocation, at.metadataLocation);
+          // An append is judged where the record lands if the table was inline when the
+          // transaction loaded it and is the same inline table now (LogCatalog.stageJudged)
+          int[] then = LogCatalog.inlineVersion(at.metadataLocation);
+          int[] since = LogCatalog.inlineVersion(now.metadataLocation);
+          judged &= !at.appended || then != null && since != null && then[0] == since[0];
+          judged &= at.appended || !at.scanned
+              || Objects.equals(now.metadataLocation, at.metadataLocation);
+        }
+        if (unchanged) {
+          return "no other writer changed the tables it loaded since it loaded them";
+        }
+        return judged ? "it appended only to inline tables, whose appends the conflict encoding"
+            + " judges where the record lands, yet it sent no record" : null;
+      }
+      if (retries(cmd)) {
+        return preempted
+            ? "its operation applies itself again on a fresh read after a conflict, and the one"
+                + " command that raced it ran before its first write"
+            : "its operation applies itself again on a fresh read after a conflict, and nothing"
+                + " raced it";
+      }
+      if (!preempted && (cmd.fresh || handleFree(cmd.kind))) {
+        return "nothing raced it, and it read the table fresh";
+      }
+      return null;
+    }
+
+    /**
+     * Checks the catalog against the model, given what {@code op} reported; {@code must}, if not
+     * null, says why {@code op} must not have been rejected if its model effect applies.
+     */
+    private void resolve(Op op, Outcome outcome, String reason, String must) {
       Model actual = actual();
       Model with = copy(model);
       String applies = null;
@@ -2252,6 +2400,12 @@ class TestCatalogFaultProperties {
       }
       String withDiff = applies != null ? applies : diff(with, actual);
       String withoutDiff = diff(model, actual);
+      if (outcome == Outcome.REJECTED && must != null) {
+        Statistics.label("conflict that must not be").collect(applies == null
+            ? "effect applies" : "effect does not apply");
+        check(applies != null, "%s was rejected (%s), but %s, and its effect applies", op, reason,
+            must);
+      }
       switch (outcome) {
         case ACKNOWLEDGED:
           check(withDiff == null, "acknowledged %s, but %s", op, withDiff);

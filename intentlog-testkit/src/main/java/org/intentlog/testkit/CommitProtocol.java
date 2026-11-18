@@ -98,10 +98,14 @@ import org.intentlog.wire.UuidV7;
  *
  * <ul>
  *   <li>As each commit ends: a commit reported committed applied, once; one reported rejected (or
- *       any other error) did not; an error follows an injected fault; an unknown outcome follows
- *       a fault or GC; a commit nothing raced, on a log that did not fail, commits (the solo rule,
- *       which a writer minting at or below the floor breaks); and a commit is rejected beyond the
- *       floor only if its stamp is A older than some clock that compacted.
+ *       any other error) did not; an error follows an injected fault; a commit nothing raced, on a
+ *       log that did not fail, commits (the solo rule, which a writer minting at or below the
+ *       floor breaks); and a commit is rejected beyond the floor only if its stamp is A older than
+ *       some clock that compacted. Each rejection and unknown outcome is justified by the log as
+ *       it is after the commit (versions and marks only grow, so a justification at the moment of
+ *       rejection still holds there): a conflict only if the transaction's reads do not hold on
+ *       that state; beyond the horizon or the floor only if its id is at or below that mark; an
+ *       unknown outcome only after a fault, or for an id at or below the horizon.
  *   <li>A copy of an intention record never applies: the state, committed set and horizon after a
  *       duplicate equal those before it, whether the original is a record, in a checkpoint, paged
  *       or past the GC horizon, and whether it applied or was rejected.
@@ -873,6 +877,10 @@ public final class CommitProtocol {
       Outcome outcome;
       String reason = "";
       boolean beyondFloor = false;
+      CommitRejectedException.Reason rejected = null;
+      // The ms of the commit's id, which the runtime mints from its writer's clock just above the
+      // floor of the replica it commits on (UuidV7.newUuidV7After)
+      long idMs = Math.max(stamp, w.snapshot.committed().floor() + 1);
       try {
         ctx.active = true;
         checkHeld((top ? runtime : racer).commit(w.snapshot, txn), "a commit");
@@ -880,6 +888,7 @@ public final class CommitProtocol {
       } catch (CommitRejectedException e) {
         outcome = Outcome.REJECTED;
         reason = " (" + e.reason() + ")";
+        rejected = e.reason();
         beyondFloor = e.reason() == CommitRejectedException.Reason.BEYOND_FLOOR;
       } catch (CommitOutcomeUnknownException e) {
         outcome = Outcome.UNKNOWN;
@@ -942,8 +951,8 @@ public final class CommitProtocol {
           break;
       }
       check(outcome != Outcome.ERROR || ctx.faulted, "%s failed without a fault", txn.tag());
-      check(outcome != Outcome.UNKNOWN || ctx.faulted || settings.retentionMs != NO_GC,
-          "%s's outcome is unknown without a fault, and without GC%s", txn.tag(), reason);
+      // Rejections and unknown outcomes, justified by the log after the commit (the gap plan's B3)
+      justify(txn, outcome, rejected, idMs, live, ctx, reason, raced);
       // A commit nothing raced, on a log that did not fail, commits.
       check(outcome == Outcome.COMMITTED || raced || ctx.preempted || ctx.faulted,
           "%s, which nothing raced, was %s%s", txn.tag(), outcome, reason);
@@ -953,6 +962,49 @@ public final class CommitProtocol {
           "%s, stamped %d, was rejected beyond the floor, though no clock that compacted was A ="
               + " %d ms past it (the latest, %d)", txn.tag(), stamp, settings.admissionMs,
           sealingClock);
+    }
+
+    /**
+     * Checks that a commit's rejection or unknown outcome has a cause in {@code live}, the log
+     * read after the commit: entity versions, the horizon and the floor only grow, so what held
+     * where the commit was rejected holds there too. A conflict means the transaction's reads do
+     * not hold (replay verified its intention there and it failed, or a fresh read did); a
+     * rejection beyond the horizon or the floor, that its id ({@code idMs}) is at or below that
+     * mark; an unknown outcome, that a fault was injected or its id is at or below the horizon
+     * (Bug 64: the committed set cannot say there whether an earlier write of it landed).
+     */
+    private void justify(Txn txn, Outcome outcome, CommitRejectedException.Reason rejected,
+        long idMs, Replica<State> live, Context ctx, String reason, boolean raced) {
+      CommittedSet set = live.committed();
+      if (outcome == Outcome.REJECTED) {
+        Statistics.label("rejections").collect(rejected + (ctx.faulted ? " after a fault"
+            : ctx.preempted ? " when preempted" : raced ? " when raced" : ""));
+        switch (rejected) {
+          case CONFLICT:
+            check(!txn.holdsOn(live.state()),
+                "%s was rejected as a conflict, but its reads %s hold on the log after it: %s",
+                txn.tag(), txn.reads(), live.state());
+            break;
+          case BEYOND_HORIZON:
+            check(idMs <= set.horizon(),
+                "%s was rejected beyond the horizon, but its id's ms %d is above the horizon %d"
+                    + " after it", txn.tag(), idMs, set.horizon());
+            break;
+          case BEYOND_FLOOR:
+            check(idMs <= set.floor(),
+                "%s was rejected beyond the floor, but its id's ms %d is above the floor %d"
+                    + " after it", txn.tag(), idMs, set.floor());
+            break;
+          default:
+            break;
+        }
+      } else if (outcome == Outcome.UNKNOWN) {
+        Statistics.label("unknown outcomes").collect(
+            ctx.faulted ? "after a fault" : "at or below the horizon");
+        check(ctx.faulted || idMs <= set.horizon(),
+            "%s's outcome is unknown without a fault, and its id's ms %d is above the horizon %d"
+                + "%s", txn.tag(), idMs, set.horizon(), reason);
+      }
     }
 
     /** A stamp in {@code region} of the log as it is now; {@code pick} chooses within it. */
