@@ -175,11 +175,13 @@ that does not fit with none left.
   under a filter on the column partitioned tables partition by (by value, set, range, bucket or
   truncation), writes another table, the same one or nothing, and commits after a window of commits
   it did not see, before its commit's read, before its record, or both; if admitted, the rows of its
-  ref under its filter where it took effect must be the rows at its snapshot (`TableViews.rows`:
-  rows a rewrite keeps, each with the delete files that delete from it). The oracle is the same
-  whether the catalog judges a read by its ref or by its filter; false positives are reported per encoding and table
-  storage. `fuzz/mutants/reads.sh` calibrates it: a read unchecked at the commit, unheld by the
-  record, a witness blind to its ref's advances, to its resets, or to everything, and a filter
-  judged by the data files added alone.
+  ref under its filter where it took effect must be the rows at its snapshot, read with the same
+  schema (`TableViews.rows`: rows a rewrite keeps, each with the delete files that delete from it,
+  and the field ids, names and types of the schema the scan resolves). The oracle is the same
+  whether the catalog judges a read by its ref or by its filter; false positives are reported per
+  encoding and table storage. `fuzz/mutants/reads.sh` calibrates it: a read unchecked at the
+  commit, unheld by the record, a witness blind to its ref's advances, to its resets, to the
+  schema, or to everything, a commit's read blind to the schema, and a filter judged by the data
+  files added alone.
 - The race fuzzer's catalog transactions draw scans and catalog changes, under its serial-run oracle;
   `TableScript`'s catalog transactions likewise.

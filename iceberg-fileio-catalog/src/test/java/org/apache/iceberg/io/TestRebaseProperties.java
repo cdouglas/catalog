@@ -89,7 +89,8 @@ import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
  * nothing, and the window commits on the table before R's commit reads the catalog, just before
  * its record is written, or both. Its oracle needs no reference: if the catalog admits R, the
  * rows of the ref under the filter where R took effect ({@link TableViews#rows}: tokens that a
- * rewrite keeps, each with the delete files that delete from it) must be the rows R's scan read.
+ * rewrite keeps, each with the delete files that delete from it, and the schema the scan reads
+ * them with) must be the rows R's scan read, with the schema it read them with.
  * It judges a catalog that judges reads by their filters as it does one that judges them by their
  * refs; the statistics count, per encoding and table storage, the reads rejected whose rows had
  * not changed (false positives), with their reasons.
@@ -263,8 +264,8 @@ class TestRebaseProperties {
    * commit reads the catalog (which checks R's read), the rest just before R's record is written
    * (where the conflict encoding judges its read witness or pin); a read-only R writes no record,
    * so its whole window runs before its commit. If the catalog admits R, the rows of its ref under
-   * its filter where R took effect ({@link TableViews#rows}) must be the rows its scan read: no
-   * false negative. A catalog may reject more: the statistics count, per encoding and table
+   * its filter where R took effect ({@link TableViews#rows}) must be the rows its scan read, read
+   * with the same schema: no false negative. A catalog may reject more: the statistics count, per encoding and table
    * storage, the reads it rejected whose rows had not changed (false positives), with their
    * reasons.
    */
@@ -360,6 +361,10 @@ class TestRebaseProperties {
     if (!java.util.Objects.equals(scanned == null ? null : scanned.snapshotId(),
         there == null ? null : there.snapshotId())) {
       throw new IllegalStateException("R read " + ref + " at another version than the table's");
+    }
+    if (!TableViews.schemaRead(atRead, ref).equals("schema " + scan.schema().asStruct())) {
+      throw new IllegalStateException("R read " + ref + " with another schema than the view's: "
+          + scan.schema().asStruct());
     }
     List<String> read = TableViews.rows(atRead, ref, r.filter, r.caseSensitive, lineage);
     String versionRead = Run.version(io);
@@ -460,14 +465,15 @@ class TestRebaseProperties {
         : before == 0 ? "window before its write" : "window split";
     return new String[] {outcome,
         (writes == r.writes ? writes : writes + " (" + r.writes + " skipped)") + ", " + placed,
-        read.isEmpty() ? "none" : "some", why,
+        read.size() == 1 ? "none" : "some", why,
         moves.isEmpty() ? "none" : String.join(", ", new java.util.TreeSet<>(moves))};
   }
 
   /**
    * Runs {@code steps} of a window, observing each rewrite ({@link TableViews.Lineage}), and adds
    * to {@code moves} how each moved {@code ref}, {@code where} it ran: advanced (to a new
-   * snapshot), reset (to one the table had), removed or created.
+   * snapshot), reset (to one the table had), removed or created; and whether it changed the schema
+   * a scan of {@code ref} reads with.
    */
   private static void window(TableScript.Runner racer, List<List<TableScript.Cmd>> steps,
       InMemoryAtomicFileIO io, TableViews.Lineage lineage, String ref, String where,
@@ -475,11 +481,15 @@ class TestRebaseProperties {
     org.apache.iceberg.Table table = Run.reader(io).loadTable(TableScript.ID);
     for (List<TableScript.Cmd> step : steps) {
       org.apache.iceberg.Snapshot was = table.snapshot(ref);
+      String schema = TableViews.schemaRead(table, ref);
       java.util.Set<Long> had = new java.util.HashSet<>();
       table.snapshots().forEach(snapshot -> had.add(snapshot.snapshotId()));
       racer.run(step);
       table = Run.reader(io).loadTable(TableScript.ID);
       lineage.observe(table);
+      if (!schema.equals(TableViews.schemaRead(table, ref))) {
+        moves.add(where + ": schema changed");
+      }
       org.apache.iceberg.Snapshot is = table.snapshot(ref);
       if (was == null && is != null) {
         moves.add(where + ": created");
@@ -997,7 +1007,8 @@ class TestRebaseProperties {
    * Windows of data commits (to main or a branch, in any partition), of the changes the guards
    * read (resets, a ref's removal, expiries, spec and table changes), of resets (rollbacks,
    * fast-forwards, cherry-picks), of a ref removed or created, of expiries of all but each
-   * branch's head, and of any single command.
+   * branch's head, of schema changes (which change what a branch's scan reads, and leave the
+   * branch where it was), and of any single command.
    */
   @Provide
   Arbitrary<List<TableScript.Cmd>> readWindows() {
@@ -1011,10 +1022,16 @@ class TestRebaseProperties {
             Tuple.of(3, TableScript.commands(RESETS::contains)),
             Tuple.of(1, TableScript.commands(REF_MOVES::contains)),
             Tuple.of(1, headsOnly),
+            Tuple.of(1, TableScript.commands(SCHEMA_CHANGES::contains)),
             Tuple.of(3, TableScript.windowCommands(TestRebaseProperties::single)))
         .withoutEdgeCases()
         .list().ofMinSize(1).ofMaxSize(4);
   }
+
+  /** Commands that change a table's schema: a column added, dropped, renamed or promoted. */
+  private static final java.util.Set<TableScript.Kind> SCHEMA_CHANGES =
+      java.util.EnumSet.of(TableScript.Kind.ADD_COLUMN, TableScript.Kind.DELETE_COLUMN,
+          TableScript.Kind.RENAME_COLUMN, TableScript.Kind.UPDATE_COLUMN);
 
   /** Commands that move a ref to a snapshot the table has (or, a cherry-pick, to a new one). */
   private static final java.util.Set<TableScript.Kind> RESETS =

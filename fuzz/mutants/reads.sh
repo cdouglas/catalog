@@ -1,16 +1,19 @@
 # Calibration of the oracle of serializable reads (TestRebaseProperties
 # .anAdmittedReadSeesTheRowsItRead; docs/CATALOG_TRANSACTIONS.md "No false negatives"; anchors as
 # of its commit): each mutant admits reads whose rows changed, and must fail it. A read is checked
-# twice: at the commit's read of the catalog (TableRead.unchangedIn, from the version the
-# transaction first read), then where the record lands (a read witness, which the encoding judges,
-# or a read pin, from the commit's read). readunchecked skips the first; readunheld writes neither
-# witness nor pin; readnoadvance and readnoreset make concern-vector's witness (and its
-# descendants') read only a ref's resets or only its advances; lmpreadall makes
+# twice: at the commit's read of the catalog (TableRead.unchangedIn and the schema the scan read
+# with, from the version the transaction first read), then where the record lands (a read witness,
+# which the encoding judges, or a read pin, from the commit's read). readunchecked skips the first;
+# readschemaunchecked skips its schema; readunheld writes neither witness nor pin; readnoadvance
+# and readnoreset make concern-vector's witness (and its descendants') read only a ref's resets or
+# only its advances, readnoschema not the schema (Bug 120 (schema change escaped read witness):
+# the oracle's rows carry the schema a scan reads with; TestCatalogRegressions
+# $ASchemaChangeToATableATransactionScanned catches both schema mutants too); lmpreadall makes
 # lamport-minus-properties' witness read nothing. readfilter judges a scan read at the commit's
 # read by its filter, as the encodings are to judge it (errata D12), but reads only the data files
 # added to the ref, not its delete files, removals or resets: what the oracle must catch once the
 # encodings judge filters.
-MUTANTS="readunchecked readunheld readnoadvance readnoreset lmpreadall readfilter"
+MUTANTS="readunchecked readschemaunchecked readunheld readnoadvance readnoreset readnoschema lmpreadall readfilter"
 EQUIVALENT=""
 ORACLES=TestRebaseProperties#anAdmittedReadSeesTheRowsItRead
 
@@ -23,6 +26,8 @@ mutant() { # name main-dir test-dir
   case $1 in
     # the commit's read does not check the reads
     readunchecked) mutate $M/LogCatalog.java "      if (!read.unchangedIn(now) || scanSchemaChanged(read, now)) {" "      if (false) {" ;;
+    # the commit's read does not check the schema a scan read with
+    readschemaunchecked) mutate $M/LogCatalog.java "      if (!read.unchangedIn(now) || scanSchemaChanged(read, now)) {" "      if (!read.unchangedIn(now)) {" ;;
     # the record holds no read where it lands
     readunheld) mutate $M/LogCatalog.java "      if (witness && then != null) {
         newCatalog.readRef(read.identifier(), read.ref());
@@ -33,6 +38,8 @@ mutant() { # name main-dir test-dir
     readnoadvance) mutate $M/ConcernVectorEncoding.java "      witness.ref(ref, ConcernStamps.Ref.ADVANCE, ConcernStamps.Ref.RESET);" "      witness.ref(ref, ConcernStamps.Ref.RESET);" ;;
     # a read witness misses its refs' resets
     readnoreset) mutate $M/ConcernVectorEncoding.java "      witness.ref(ref, ConcernStamps.Ref.ADVANCE, ConcernStamps.Ref.RESET);" "      witness.ref(ref, ConcernStamps.Ref.ADVANCE);" ;;
+    # a read witness misses schema changes
+    readnoschema) mutate $M/ConcernVectorEncoding.java "    Witness witness = Witness.of(base).concern(TableChange.Concern.SCHEMA);" "    Witness witness = Witness.of(base);" ;;
     # lamport-minus-properties' read witness reads nothing
     lmpreadall) mutate $M/LamportMinusPropertiesEncoding.java "  Witness readWitness(int base, java.util.List<String> refs) {
     return Witness.of(base).concern(REST);" "  Witness readWitness(int base, java.util.List<String> refs) {

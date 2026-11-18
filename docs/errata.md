@@ -158,8 +158,9 @@ Deferred:
   `manifest-window`) could judge it the same way, so an append to another
   partition would not fail it. The rebase oracle for reads judges that change
   as it judges the ref's: a serializable transaction's scan lands after commits
-  it did not see, and if admitted must read the same rows under its filter
-  where it lands (`TestRebaseProperties.anAdmittedReadSeesTheRowsItRead`). Its
+  it did not see, and if admitted must read the same rows under its filter,
+  with the same schema, where it lands
+  (`TestRebaseProperties.anAdmittedReadSeesTheRowsItRead`). Its
   statistics count, per encoding, the reads rejected whose rows had not
   changed: the false positives judging by filter would remove.
   `fuzz/mutants/reads.sh` calibrates it, `readfilter` among its mutants: a

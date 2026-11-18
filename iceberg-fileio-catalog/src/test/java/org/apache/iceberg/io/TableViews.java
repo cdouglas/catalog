@@ -45,17 +45,22 @@ import org.apache.iceberg.TableMetadata;
  * differ between them, so snapshots appear by position and manifests by content. {@link #physical}
  * is what a reader sees, manifest lists entry by entry ({@link TestInlineDifferentialProperties});
  * {@link #logical} is what a table holds, whatever its manifests' layout; {@link #rows} is what a
- * scan of a ref under a row filter reads, whatever its files' layout.
+ * scan of a ref under a row filter reads, whatever its files' layout, and the schema it reads it
+ * with.
  */
 final class TableViews {
 
   private TableViews() {}
 
   /**
-   * The rows a scan of {@code ref} under {@code filter} reads in {@code table}, sorted: none if the
-   * ref names no snapshot (or there is no such ref). A row is a token, which {@code lineage} says
-   * which data file holds, and the delete files that delete from it; two scans read the same rows if
-   * they read the same tokens, each deleted from by the same delete files.
+   * What a scan of {@code ref} under {@code filter} reads in {@code table}: first the schema it
+   * reads with, the field ids, names and types of the one the scan resolves (a branch's, or no
+   * such ref's, the table's current schema; a tag's, its snapshot's), then its rows, sorted: none
+   * if the ref names no snapshot (or there is no such ref). A row is a token, which {@code lineage}
+   * says which data file holds, and the delete files that delete from it; two scans read the same
+   * if they read with the same schema the same tokens, each deleted from by the same delete files.
+   * A schema change that leaves the ref where it was (a rename, a drop and re-add, a type
+   * promotion) changes what its scan reads (Bug 120 (schema change escaped read witness)).
    *
    * <p>The model is {@link TableScript}'s data: every row of a data file has the {@code cat} its
    * bounds give (each file's lower and upper bounds are equal), so a filter on {@code cat} (and its
@@ -70,9 +75,10 @@ final class TableViews {
   static List<String> rows(
       Table table, String ref, org.apache.iceberg.expressions.Expression filter,
       boolean caseSensitive, Lineage lineage) {
+    String schema = schemaRead(table, ref);
     Snapshot snapshot = table.snapshot(ref);
     if (snapshot == null) {
-      return List.of();
+      return List.of(schema);
     }
     org.apache.iceberg.expressions.Evaluator matches = new org.apache.iceberg.expressions.Evaluator(
         TableScript.SCHEMA.asStruct(), filter, caseSensitive);
@@ -89,7 +95,16 @@ final class TableViews {
       });
     }
     rows.sort(String::compareTo);
+    rows.add(0, schema);
     return rows;
+  }
+
+  /**
+   * The schema a scan of {@code ref} reads {@code table} with, as {@link #rows} gives it first: its
+   * fields' ids, names and types.
+   */
+  static String schemaRead(Table table, String ref) {
+    return "schema " + org.apache.iceberg.util.SnapshotUtil.schemaFor(table, ref).asStruct();
   }
 
   /**
