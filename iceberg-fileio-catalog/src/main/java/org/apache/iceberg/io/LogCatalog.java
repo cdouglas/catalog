@@ -311,6 +311,9 @@ public class LogCatalog extends BaseMetastoreCatalog
       } catch (NoSuchTableException e) {
         deleteQuietly(kept);
         return false;
+      } catch (RecordTooLargeException e) {
+        deleteQuietly(kept);
+        throw e;
       } catch (CommitFailedException e) {
         deleteQuietly(kept);
         if (attempt >= org.apache.iceberg.TableProperties.COMMIT_NUM_RETRIES_DEFAULT + 1) {
@@ -2535,7 +2538,7 @@ public class LogCatalog extends BaseMetastoreCatalog
         kept.addAll(keptFiles(tableId, current));
       }
       newCatalog.commit(log);
-    } catch (CommitFailedException | NoSuchTableException e) {
+    } catch (CommitFailedException | NoSuchTableException | RecordTooLargeException e) {
       deleteQuietly(kept);
       throw e;
     }

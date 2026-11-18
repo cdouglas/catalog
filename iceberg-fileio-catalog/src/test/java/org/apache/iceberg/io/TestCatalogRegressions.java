@@ -6246,4 +6246,85 @@ public class TestCatalogRegressions {
       assertThat(catalog.properties()).containsKey(CatalogProperties.WAREHOUSE_LOCATION);
     }
   }
+
+  /** The objects under {@code location}'s metadata directory. */
+  private static Set<String> metadataDirectory(InMemoryAtomicFileIO io, String location) {
+    Set<String> files = new HashSet<>();
+    io.listPrefix(location + "/metadata/").forEach(info -> files.add(info.location()));
+    return files;
+  }
+
+  /**
+   * Bug 104 (oversized record retried as conflict): on a log that cannot replace itself (the
+   * segmented log on Append Blobs; a shared log with a record limit), the commit loop rejects a
+   * record larger than one append stores before sending it (TOO_LARGE, Bug 71 (append past
+   * store's size cap)). CatalogLog mapped that rejection, as every one but a conflict, to
+   * CommitFailedException, which Iceberg retries: a table update or a snapshot producer sent the
+   * same record four more times, with backoff, and the catalog's own drops, renames and namespace
+   * changes retried it as often. It now throws RecordTooLargeException, a CleanableFailure that is
+   * not a CommitFailedException: Iceberg does not retry it, and cleans up what the commit wrote.
+   * Found by the 2026-11-17 design review (API reviewer).
+   */
+  @Nested
+  class ARecordLargerThanTheLogStores {
+
+    @Test
+    void failsAtOnce() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = catalog(io, LocalCatalogMode.MEMLOG_TM);
+      catalog.createNamespace(mixedNs);
+      Table table = catalog.createTable(mixed, intSchema);
+      LocalCatalogMode.sharedLog(io, CATALOG).limitRecordBytes(4096);
+      long sent = catalog.log().counts().rejected();
+
+      assertThatThrownBy(() -> table.updateProperties().set("k", bigValue(8192)).commit())
+          .isInstanceOf(RecordTooLargeException.class)
+          .isInstanceOf(org.apache.iceberg.exceptions.CleanableFailure.class)
+          .isNotInstanceOf(CommitFailedException.class);
+
+      assertThat(catalog.log().counts().rejected() - sent).as("commits rejected").isEqualTo(1);
+      assertThat(catalog.loadTable(mixed).properties()).doesNotContainKey("k");
+    }
+
+    @Test
+    void aSnapshotProducerCleansUp() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = catalog(io, LocalCatalogMode.MEMLOG_ML);
+      catalog.createNamespace(mixedNs);
+      Table table = catalog.createTable(mixed, intSchema);
+      Set<String> before = metadataDirectory(io, table.location());
+      LocalCatalogMode.sharedLog(io, CATALOG).limitRecordBytes(64);
+      long sent = catalog.log().counts().rejected();
+
+      assertThatThrownBy(() -> table.newFastAppend().appendFile(dataFile("a")).commit())
+          .isInstanceOf(RecordTooLargeException.class);
+
+      assertThat(catalog.log().counts().rejected() - sent).as("commits rejected").isEqualTo(1);
+      assertThat(metadataDirectory(io, table.location())).as("its manifest deleted")
+          .isEqualTo(before);
+      assertThat(catalog.loadTable(mixed).currentSnapshot()).isNull();
+    }
+
+    @Test
+    void aTransactionDeletesTheFilesOfTheTablesItDrops() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = catalog(io, LocalCatalogMode.MEMLOG_ML);
+      TableIdentifier u = TableIdentifier.of(mixedNs, "u");
+      catalog.createNamespace(mixedNs);
+      Table table = catalog.createTable(mixed, intSchema);
+      table.newFastAppend().appendFile(dataFile("a")).commit();
+      catalog.createTable(u, intSchema);
+      Set<String> before = metadataDirectory(io, table.location());
+      LocalCatalogMode.sharedLog(io, CATALOG).limitRecordBytes(4096);
+
+      CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      txn.asCatalog().dropTable(mixed, false);
+      txn.asCatalog().loadTable(u).updateProperties().set("k", bigValue(8192)).commit();
+      assertThatThrownBy(txn::commitTransaction).isInstanceOf(RecordTooLargeException.class);
+
+      assertThat(catalog.tableExists(mixed)).isTrue();
+      assertThat(metadataDirectory(io, table.location())).as("what the drop wrote, deleted")
+          .isEqualTo(before);
+    }
+  }
 }

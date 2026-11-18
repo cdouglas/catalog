@@ -564,8 +564,11 @@ is. The catalog maps these in one place (`CatalogLog.commit`): `CONFLICT` to
 `CatalogMutation.explain` of the state it lost to (`AlreadyExistsException`
 if a pending create or a rename's destination now collides,
 `NoSuchTableException` if a rename's source is gone, else
-`CommitFailedException`), the other rejections to `CommitFailedException`,
-and an unknown outcome to `CommitStateUnknownException`.
+`CommitFailedException`), `TOO_LARGE` to `RecordTooLargeException` (a
+`CleanableFailure` that Iceberg does not retry, since the same record is as
+large), the other rejections to `CommitFailedException`, which Iceberg
+retries on a fresh read, and an unknown outcome to
+`CommitStateUnknownException`.
 
 The loop has one branch per capability: a log that replaces itself replaces
 itself with the commit's record when no append can carry it, and is compacted

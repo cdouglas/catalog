@@ -138,6 +138,8 @@ public final class CatalogLog {
    *     {@link org.apache.iceberg.exceptions.AlreadyExistsException} or {@link
    *     org.apache.iceberg.exceptions.NoSuchTableException}, as the state it lost to explains it
    *     ({@link CatalogMutation#explain})
+   * @throws RecordTooLargeException if its record is larger than the log stores, on a log that
+   *     cannot replace itself: it did not take effect, and a retry of it cannot
    * @throws CommitStateUnknownException if it may or may not have
    */
   public Replica<CatalogState> commit(CatalogMutation mutation) {
@@ -156,6 +158,10 @@ public final class CatalogLog {
         case CREATE_LOST:
           counts.rejected.increment();
           throw new CommitFailedException(e, "Catalog creation failed: %s exists", log);
+        case TOO_LARGE:
+          // the same record again is as large: not a CommitFailedException, which Iceberg retries
+          counts.rejected.increment();
+          throw new RecordTooLargeException(e, e.getMessage());
         default:
           counts.rejected.increment();
           throw new CommitFailedException(e, "%s", e.getMessage());
