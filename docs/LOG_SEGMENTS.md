@@ -436,12 +436,15 @@ with a unit test. A receipt's offset taken from a length read before the append
 
 As LOG.md "Testing a provider", per stage:
 
-- **The model first**, as with `SharedLogCommit.tla` and `AzureLog.tla`. The catalog
-  object has conditional appends and CAS replace. Segments have blind appends, a block
-  limit, record limits and seal frames. The model also has Installs ahead, the Install
-  race, copies, appends delayed past an end, readers holding older catalog objects,
-  compaction with positions, retirement with a TTL (as reader epochs), and the sweep. `check.py` holds each of the model's switches to its verdict. `catalogseal`'s
-  trace is D1's example.
+- **The model first**, as with `SharedLogCommit.tla`. The catalog object has
+  conditional appends and CAS replace. Segments have blind appends, a block limit,
+  record limits and seal frames. The model also has Installs ahead, the Install race,
+  copies, appends delayed past an end, readers holding older catalog objects,
+  compaction with positions, retirement, and the sweep. The sweep runs at TTL 0: it may
+  delete a retired segment as soon as a checkpoint retires it, and a reader that finds
+  its segment gone reads again, as the Java does. The TTL half of SG6 is not modelled.
+  `check.py` holds each of the model's switches to its verdict. `catalogseal`'s trace is
+  D1's example.
 - **`SharedLogContract`** on `SegmentedLog` (`TestSegmentedLogContract`), over both
   in-memory stores.
 - **`TestSegmentedCommitProtocol`** (intentlog-fileio): the testkit's `CommitProtocol`
