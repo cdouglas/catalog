@@ -351,6 +351,11 @@ public class LogCatalog extends BaseMetastoreCatalog
 
   /** Deletes what a drop that did not land wrote, logging what it cannot. */
   private void deleteQuietly(List<String> files) {
+    deleteQuietly(io, files);
+  }
+
+  /** Deletes from {@code io} what a drop that did not land wrote, logging what it cannot. */
+  private static void deleteQuietly(FileIO io, java.util.Collection<String> files) {
     for (String file : files) {
       try {
         io.deleteFile(file);
@@ -983,26 +988,23 @@ public class LogCatalog extends BaseMetastoreCatalog
     /**
      * Writes the table as these operations hold it to its metadata directory as a pointer table's
      * is: each inline-ML snapshot's list to a file, then a metadata file naming them. Returns the
-     * files written, the metadata file first. For a drop that keeps the table's files.
+     * files written, the metadata file first. For a drop that keeps the table's files. A write that
+     * fails deletes the files written before it (best effort, logged), and throws.
      */
     List<String> materialize() {
       TableMetadata metadata = current();
-      Set<Long> inline = new HashSet<>();
-      for (Snapshot s : metadata.snapshots()) {
-        if (s instanceof InlineSnapshot) {
-          inline.add(s.snapshotId());
-        }
+      java.util.Queue<String> lists = new java.util.concurrent.ConcurrentLinkedQueue<>();
+      try {
+        TableMetadata file = withManifestListFiles(metadata, lists::add);
+        String location = writeNewMetadataIfRequired(false, file);
+        List<String> files = new ArrayList<>();
+        files.add(location);
+        files.addAll(lists);
+        return files;
+      } catch (RuntimeException e) {
+        deleteQuietly(io(), lists);
+        throw e;
       }
-      String location = writeUpdateMetadata(false, metadata);
-      List<String> files = new ArrayList<>();
-      files.add(location);
-      for (Snapshot s : written.snapshots()) {
-        if (inline.contains(s.snapshotId())) {
-          files.add(s.manifestListLocation());
-        }
-      }
-      written = null;
-      return files;
     }
 
     /**
@@ -1019,6 +1021,14 @@ public class LogCatalog extends BaseMetastoreCatalog
     }
 
     private TableMetadata withManifestListFiles(TableMetadata metadata) {
+      return withManifestListFiles(metadata, file -> { });
+    }
+
+    /**
+     * {@code metadata} with each inline-ML snapshot's list written to a file, each of which is
+     * given to {@code opened} as it is opened.
+     */
+    private TableMetadata withManifestListFiles(TableMetadata metadata, Consumer<String> opened) {
       List<Snapshot> inlineSnapshots = Lists.newArrayList();
       for (Snapshot s : metadata.snapshots()) {
         if (s instanceof InlineSnapshot) {
@@ -1043,11 +1053,12 @@ public class LogCatalog extends BaseMetastoreCatalog
                 String name =
                     String.format("snap-%d-%s.avro", s.snapshotId(), java.util.UUID.randomUUID());
                 String file = metadataDirectoryFile(metadata, name);
+                OutputFile out = io().newOutputFile(file);
+                opened.accept(file);
                 replacements.put(
                     s.snapshotId(),
                     org.apache.iceberg.ManifestListFiles.write(
-                        metadata.formatVersion(), s, s.allManifests(io()),
-                        io().newOutputFile(file)));
+                        metadata.formatVersion(), s, s.allManifests(io()), out));
               });
       TableMetadata.Builder builder = TableMetadata.buildFrom(metadata);
       builder.replaceSnapshots(replacements);
@@ -2534,13 +2545,18 @@ public class LogCatalog extends BaseMetastoreCatalog
       }
     }
 
-    // Each inline table dropped keeping its files is written first; a commit that fails deletes
-    // what they wrote
+    // Each inline table dropped keeping its files is written first; a failure to write one, or a
+    // commit that fails, deletes what they wrote
     List<String> kept = new ArrayList<>();
     try {
       for (TableIdentifier tableId : keeping) {
         kept.addAll(keptFiles(tableId, current));
       }
+    } catch (RuntimeException e) {
+      deleteQuietly(kept);
+      throw e;
+    }
+    try {
       newCatalog.commit(log);
     } catch (CommitFailedException | NoSuchTableException | RecordTooLargeException e) {
       deleteQuietly(kept);

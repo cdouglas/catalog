@@ -673,9 +673,12 @@ directory as a pointer table's is: a manifest list file for each snapshot
 whose list the catalog holds inline (read from its pages where sealed), then
 a metadata file naming them (`fileio.catalog.drop.materialize`, default
 true). The drop record follows; one that loses its race deletes what it
-wrote and writes the table again from its next read. A catalog
-transaction's drop does the same, once its record is staged. The newest
-metadata file in the directory is the one to register.
+wrote and writes the table again from its next read. A write that fails
+(the table's storage refusing it) fails the drop, which deletes the files
+it wrote before the failure (best effort, logged). A catalog transaction's
+drop does the same, once its record is staged; a failure to write one of
+its tables deletes what it wrote for every table. The newest metadata file
+in the directory is the one to register.
 
 The catalog's log properties (`LogCatalogProperties`) configure the commit
 loop: `fileio.catalog.max.append.count` and `max.append.size` set when it

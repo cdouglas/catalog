@@ -6353,4 +6353,88 @@ public class TestCatalogRegressions {
       assertThat(io.bytes(WAREHOUSE + "/catalog")).as("the catalog object").isNotNull();
     }
   }
+
+  /**
+   * A store that refuses new files in the metadata directories under {@code under} once {@code
+   * allowed} of them have been opened, as a prefix that loses write permission does.
+   */
+  static final class RefusingMetadataWrites extends InMemoryAtomicFileIO {
+    final java.util.concurrent.atomic.AtomicInteger allowed =
+        new java.util.concurrent.atomic.AtomicInteger(Integer.MAX_VALUE);
+    volatile String under = "";
+
+    @Override
+    public OutputFile newOutputFile(String path) {
+      if (path.startsWith(under) && path.contains("/metadata/")
+          && allowed.getAndDecrement() <= 0) {
+        throw new java.io.UncheckedIOException(new IOException("Write refused: " + path));
+      }
+      return super.newOutputFile(path);
+    }
+  }
+
+  /** A table of three fast appends, whose lists an inline-ML catalog holds. */
+  private Table threeAppends(LogCatalog catalog, TableIdentifier id) {
+    Table table = catalog.createTable(id, intSchema);
+    for (String name : List.of("a", "b", "c")) {
+      table.newFastAppend().appendFile(dataFile(id.name() + name)).commit();
+    }
+    return table;
+  }
+
+  /**
+   * Bug 106 (failed drop left its lists): a drop that keeps an inline table's files first writes
+   * the table to its metadata directory: a manifest list file for each snapshot whose list the
+   * catalog holds, then a metadata file naming them. A write that failed partway (the table's
+   * storage refusing writes) failed the drop and left the list files written before it, which
+   * nothing names; in a catalog transaction, a failure to write one dropped table also left every
+   * file written for the tables before it. A drop now deletes what it wrote (best effort, logged)
+   * whenever it fails before its record lands. Found by the 2026-11-17 design review (API
+   * reviewer).
+   */
+  @Nested
+  class ADropKeepingFilesItCannotWrite {
+    private final TableIdentifier u = TableIdentifier.of(mixedNs, "u");
+
+    @ParameterizedTest
+    @ValueSource(ints = {1, 3}) // a list refused after the first; the metadata file, after three
+    void deletesWhatItWrote(int allowed) {
+      RefusingMetadataWrites io = new RefusingMetadataWrites();
+      LogCatalog catalog = catalog(io, LocalCatalogMode.APPEND_ML);
+      catalog.createNamespace(mixedNs);
+      String location = threeAppends(catalog, mixed).location();
+      Set<String> before = metadataDirectory(io, location);
+      io.allowed.set(allowed);
+
+      assertThatThrownBy(() -> catalog.dropTable(mixed, false))
+          .hasStackTraceContaining("Write refused");
+
+      assertThat(catalog.tableExists(mixed)).isTrue();
+      assertThat(metadataDirectory(io, location)).isEqualTo(before);
+    }
+
+    @Test
+    void aTransactionDeletesWhatItWroteForEveryTable() {
+      RefusingMetadataWrites io = new RefusingMetadataWrites();
+      LogCatalog catalog = catalog(io, LocalCatalogMode.APPEND_ML);
+      catalog.createNamespace(mixedNs);
+      String t = threeAppends(catalog, mixed).location();
+      String uLocation = threeAppends(catalog, u).location();
+      Set<String> before = new HashSet<>(metadataDirectory(io, t));
+      before.addAll(metadataDirectory(io, uLocation));
+      // The first table's three lists and metadata file are written; the other's are refused
+      io.allowed.set(4);
+
+      CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      txn.asCatalog().dropTable(mixed, false);
+      txn.asCatalog().dropTable(u, false);
+      assertThatThrownBy(txn::commitTransaction).hasStackTraceContaining("Write refused");
+
+      assertThat(catalog.tableExists(mixed)).isTrue();
+      assertThat(catalog.tableExists(u)).isTrue();
+      Set<String> after = new HashSet<>(metadataDirectory(io, t));
+      after.addAll(metadataDirectory(io, uLocation));
+      assertThat(after).isEqualTo(before);
+    }
+  }
 }
