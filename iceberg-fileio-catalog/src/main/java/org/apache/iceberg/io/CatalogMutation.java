@@ -174,7 +174,7 @@ public class CatalogMutation {
     this.inlineTableImports = Maps.newHashMap();
     this.inlineTableCodecs = Maps.newHashMap();
     this.inlineTableUpdateCodecs = Maps.newHashMap();
-    this.tableRenames = Maps.newHashMap();
+    this.tableRenames = Maps.newLinkedHashMap();
     this.pinned = Sets.newHashSet();
     this.deltaBases = Maps.newHashMap();
     this.evictions = Maps.newHashMap();
@@ -405,16 +405,31 @@ public class CatalogMutation {
     if (checkNamespaceExists(to.namespace())) {
       throw new NoSuchNamespaceException("Namespace does not exist: %s", to.namespace());
     }
-    // Destination must not already exist (in original or pending creates).
-    boolean destPendingCreate =
-        (tables.containsKey(to) && tables.get(to) != null)
-            || inlineTables.containsKey(to)
-            || tableRenames.containsValue(to);
-    if (original.containsTable(to) || destPendingCreate) {
+    // Destination must not already exist (in original or pending creates): a name this
+    // transaction frees, by a drop or a rename out of it staged before, is free (Bug 124)
+    if (holds(to)) {
       throw new AlreadyExistsException("Table already exists: %s", to);
     }
     tableRenames.put(from, to);
     return this;
+  }
+
+  /**
+   * Whether {@code name} names a table in this transaction's view: one its read holds and it does
+   * not free, or one it creates or renames in.
+   */
+  boolean holds(TableIdentifier name) {
+    return (original.containsTable(name) && !frees(name))
+        || tables.get(name) != null
+        || inlineTables.containsKey(name)
+        || tableRenames.containsValue(name);
+  }
+
+  /** Whether this transaction frees {@code name}, which its read holds: a drop, or a rename out. */
+  private boolean frees(TableIdentifier name) {
+    return original.containsTable(name)
+        && ((tables.containsKey(name) && tables.get(name) == null)
+            || tableRenames.containsKey(name));
   }
 
   public CatalogMutation dropTable(TableIdentifier tableId) {
@@ -999,15 +1014,23 @@ public class CatalogMutation {
       Namespace newNs = to.namespace();
       Integer newNsId = original.namespaceId(newNs);
       int newNsVersion;
+      boolean byName = byName();
       if (newNsId == null) {
         // Destination namespace was created in this same transaction.
         newNsId = nsIdMap.get(newNs);
         newNsVersion = -1;
+      } else if (original.containsTable(to)) {
+        // A name this transaction frees (renameTable), by a drop or a rename out that the record
+        // applies first, is taken where every action verifies, the state before the record: it
+        // binds by the namespace's version, which every change of the namespace's names moves
+        // (Bug 124)
+        byName = false;
+        newNsVersion = original.namespaceVersion(newNsId);
       } else {
         newNsVersion = bindingRead(newNsId);
       }
       actions.add(new ProtoCodec.RenameTableAction(
-          tblId, version, newNsId, byName(), newNsVersion, to.name()));
+          tblId, version, newNsId, byName, newNsVersion, to.name()));
     }
 
     // Namespace drops last, children before parents: a namespace this transaction drops is empty
@@ -1055,8 +1078,11 @@ public class CatalogMutation {
       if (!state.containsTable(rename.getKey())) {
         return new NoSuchTableException("Table does not exist: %s", rename.getKey());
       }
-      if (state.containsTable(rename.getValue())) {
-        return new AlreadyExistsException("Table already exists: %s", rename.getValue());
+      // A name this transaction frees is held by the table it frees until the record applies
+      TableIdentifier to = rename.getValue();
+      if (state.containsTable(to)
+          && !(frees(to) && java.util.Objects.equals(state.tableId(to), original.tableId(to)))) {
+        return new AlreadyExistsException("Table already exists: %s", to);
       }
     }
     return new CommitFailedException("%s", message);

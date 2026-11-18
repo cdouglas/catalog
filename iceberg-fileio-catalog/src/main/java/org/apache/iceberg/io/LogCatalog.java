@@ -2805,6 +2805,7 @@ public class LogCatalog extends BaseMetastoreCatalog
 
     // The tables dropped keeping their files, which are written once the record is staged
     List<TableIdentifier> keeping = new ArrayList<>();
+    List<TableChange> renames = new ArrayList<>();
     for (TableChange change : commit.tableChanges()) {
       TableIdentifier tableId = change.identifier();
       FileIOTableOperations ops = tableOpsAsRead(tableId, current);
@@ -2853,8 +2854,19 @@ public class LogCatalog extends BaseMetastoreCatalog
       }
 
       if (change.renamedTo() != null) {
-        newCatalog.renameTable(tableId, change.renamedTo());
+        renames.add(change);
       }
+    }
+    // Renames after every drop and update, and each out of a name before any into it, so a rename
+    // takes a name the transaction frees in whatever order it staged them (Bug 124); one into a
+    // name still held (a swap) fails as the catalog's renameTable would
+    while (!renames.isEmpty()) {
+      TableChange next = renames.stream()
+          .filter(c -> !newCatalog.holds(c.renamedTo()))
+          .findFirst()
+          .orElse(renames.get(0));
+      renames.remove(next);
+      newCatalog.renameTable(next.identifier(), next.renamedTo());
     }
 
     for (Map.Entry<TableIdentifier, TableMetadata> created : commit.createdTables().entrySet()) {

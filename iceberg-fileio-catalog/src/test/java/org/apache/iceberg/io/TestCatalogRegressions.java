@@ -7389,14 +7389,14 @@ public class TestCatalogRegressions {
       assertThat(txn.asCatalog().dropTable(t, true)).isTrue();
       assertThat(namespaces(txn).dropNamespace(ns)).isTrue();
       boolean[] raced = {false};
-      beforeTheNextWrite(mode, () -> {
+      beforeTheNextWrite(io, mode, () -> {
         raced[0] = true;
         sibling.createTable(u, SCHEMA);
       });
       try {
         assertThatThrownBy(txn::commitTransaction).isInstanceOf(CommitFailedException.class);
       } finally {
-        noHooks(mode);
+        noHooks(io, mode);
       }
 
       assertThat(raced[0]).as("the create landed just before the record").isTrue();
@@ -7436,56 +7436,6 @@ public class TestCatalogRegressions {
 
     private org.apache.iceberg.catalog.SupportsNamespaces namespaces(CatalogTransaction txn) {
       return (org.apache.iceberg.catalog.SupportsNamespaces) txn.asCatalog();
-    }
-
-    /**
-     * Runs {@code race}, another writer's, once, just before the next write to catalog "c"'s log:
-     * its object, its shared log, or its segments on Append Blobs.
-     */
-    private void beforeTheNextWrite(LocalCatalogMode mode, Runnable race) {
-      boolean[] ran = {false};
-      Runnable once = () -> {
-        if (!ran[0]) {
-          ran[0] = true;
-          race.run();
-        }
-      };
-      if (mode.sharedLog) {
-        LocalCatalogMode.sharedLog(io, CATALOG).intercept(new InMemorySharedLog.Interceptor() {
-          @Override
-          public InMemorySharedLog.WriteFault beforeWrite(
-              InMemorySharedLog.Request request, byte[] payload) {
-            if (request == InMemorySharedLog.Request.APPEND) {
-              once.run();
-            }
-            return InMemorySharedLog.WriteFault.NONE;
-          }
-        });
-      } else if (mode.azureLog) {
-        LocalCatalogMode.azureStore(io, CATALOG).intercept((op, name) -> {
-          if (op == org.intentlog.azure.InMemoryAppendBlobStore.Op.APPEND) {
-            once.run();
-          }
-          return org.intentlog.azure.InMemoryAppendBlobStore.Fault.NONE;
-        });
-      } else {
-        io.injectFaults((location, strategy) -> {
-          if (location.equals(CATALOG)) {
-            once.run();
-          }
-          return Fault.NONE;
-        });
-      }
-    }
-
-    private void noHooks(LocalCatalogMode mode) {
-      io.injectFaults((location, strategy) -> Fault.NONE);
-      if (mode.sharedLog) {
-        LocalCatalogMode.sharedLog(io, CATALOG).intercept(null);
-      }
-      if (mode.azureLog) {
-        LocalCatalogMode.azureStore(io, CATALOG).intercept(null);
-      }
     }
   }
 
@@ -8297,6 +8247,154 @@ public class TestCatalogRegressions {
     @Override
     public org.intentlog.PageStore pages() {
       return log.pages();
+    }
+  }
+
+  /**
+   * Runs {@code race}, another writer's, once, just before the next write to catalog "c"'s log:
+   * its object, its shared log, or its segments on Append Blobs.
+   */
+  private static void beforeTheNextWrite(
+      InMemoryAtomicFileIO io, LocalCatalogMode mode, Runnable race) {
+    boolean[] ran = {false};
+    Runnable once = () -> {
+      if (!ran[0]) {
+        ran[0] = true;
+        race.run();
+      }
+    };
+    if (mode.sharedLog) {
+      LocalCatalogMode.sharedLog(io, CATALOG).intercept(new InMemorySharedLog.Interceptor() {
+        @Override
+        public InMemorySharedLog.WriteFault beforeWrite(
+            InMemorySharedLog.Request request, byte[] payload) {
+          if (request == InMemorySharedLog.Request.APPEND) {
+            once.run();
+          }
+          return InMemorySharedLog.WriteFault.NONE;
+        }
+      });
+    } else if (mode.azureLog) {
+      LocalCatalogMode.azureStore(io, CATALOG).intercept((op, name) -> {
+        if (op == org.intentlog.azure.InMemoryAppendBlobStore.Op.APPEND) {
+          once.run();
+        }
+        return org.intentlog.azure.InMemoryAppendBlobStore.Fault.NONE;
+      });
+    } else {
+      io.injectFaults((location, strategy) -> {
+        if (location.equals(CATALOG)) {
+          once.run();
+        }
+        return Fault.NONE;
+      });
+    }
+  }
+
+  private static void noHooks(InMemoryAtomicFileIO io, LocalCatalogMode mode) {
+    io.injectFaults((location, strategy) -> Fault.NONE);
+    if (mode.sharedLog) {
+      LocalCatalogMode.sharedLog(io, CATALOG).intercept(null);
+    }
+    if (mode.azureLog) {
+      LocalCatalogMode.azureStore(io, CATALOG).intercept(null);
+    }
+  }
+
+  /**
+   * Bug 124 (rename into freed name fails): a catalog transaction that dropped a table, or renamed
+   * it out of its name, and renamed another into that name never committed: the commit refused the
+   * name its own transaction freed (AlreadyExistsException), and a record that sent the rename by
+   * name would have been rejected, since every action verifies on the state before the record,
+   * where the name is taken. Such a rename now binds by the namespace's version, and the record
+   * applies the drop or the rename out first. Found by TestCatalogFaultProperties' rejection
+   * oracle (calibration set history, p16).
+   */
+  @Nested
+  class ARenameIntoANameItsTransactionFrees {
+    private final Namespace ns = Namespace.of("ns");
+    private final TableIdentifier t = TableIdentifier.of(ns, "t");
+    private final TableIdentifier u = TableIdentifier.of(ns, "u");
+    private final TableIdentifier v = TableIdentifier.of(ns, "v");
+    private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+
+    private LogCatalog setUp(LocalCatalogMode mode) {
+      LogCatalog catalog = catalog(io, mode);
+      catalog.createNamespace(ns);
+      catalog.createTable(t, SCHEMA).newFastAppend().appendFile(dataFile("t1")).commit();
+      catalog.createTable(u, SCHEMA).newFastAppend().appendFile(dataFile("u1")).commit();
+      return catalog;
+    }
+
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "CAS", "APPEND_TM", "COMPACT_ML", "MEMLOG", "AZLOG_TM"})
+    void dropsATableAndRenamesAnotherToItsName(LocalCatalogMode mode) {
+      CatalogTransaction txn =
+          setUp(mode).createTransaction(CatalogTransaction.IsolationLevel.SERIALIZABLE);
+      assertThat(txn.asCatalog().dropTable(u, false)).isTrue();
+      txn.asCatalog().renameTable(t, u);
+      txn.commitTransaction();
+
+      LogCatalog reader = catalog(io, mode);
+      assertThat(reader.listTables(ns)).containsExactly(u);
+      assertThat(dataFiles(reader.loadTable(u))).containsExactly("mem:///data/t1.parquet");
+      mode.assertCommitPolicy(io);
+    }
+
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "CAS", "APPEND_TM", "COMPACT_ML", "MEMLOG", "AZLOG_TM"})
+    void renamesOneOutOfANameAndAnotherIntoIt(LocalCatalogMode mode) {
+      CatalogTransaction txn =
+          setUp(mode).createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      txn.asCatalog().renameTable(u, v);
+      txn.asCatalog().renameTable(t, u);
+      txn.commitTransaction();
+
+      LogCatalog reader = catalog(io, mode);
+      assertThat(reader.listTables(ns)).containsExactlyInAnyOrder(u, v);
+      assertThat(dataFiles(reader.loadTable(u))).containsExactly("mem:///data/t1.parquet");
+      assertThat(dataFiles(reader.loadTable(v))).containsExactly("mem:///data/u1.parquet");
+      mode.assertCommitPolicy(io);
+    }
+
+    /** A create elsewhere in the namespace as it commits moves the version it binds by. */
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "CAS", "COMPACT_ML", "MEMLOG", "AZLOG_TM"})
+    void failsAsAConflictWhenTheNamespaceChangesAsItCommits(LocalCatalogMode mode) {
+      CatalogTransaction txn =
+          setUp(mode).createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      assertThat(txn.asCatalog().dropTable(u, false)).isTrue();
+      txn.asCatalog().renameTable(t, u);
+      beforeTheNextWrite(io, mode, () -> catalog(io, mode).createTable(v, SCHEMA));
+
+      assertThatThrownBy(txn::commitTransaction)
+          .isInstanceOf(CommitFailedException.class)
+          .isNotInstanceOf(AlreadyExistsException.class);
+      noHooks(io, mode);
+      LogCatalog reader = catalog(io, mode);
+      assertThat(reader.listTables(ns)).containsExactlyInAnyOrder(t, u, v);
+      assertThat(dataFiles(reader.loadTable(u))).containsExactly("mem:///data/u1.parquet");
+    }
+
+    /** Another table that took the name as it commits is a name that exists. */
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "CAS", "COMPACT_ML", "MEMLOG", "AZLOG_TM"})
+    void failsAsExistingWhenAnotherTableTakesTheName(LocalCatalogMode mode) {
+      CatalogTransaction txn =
+          setUp(mode).createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      assertThat(txn.asCatalog().dropTable(u, false)).isTrue();
+      txn.asCatalog().renameTable(t, u);
+      beforeTheNextWrite(io, mode, () -> {
+        LogCatalog other = catalog(io, mode);
+        other.dropTable(u, false);
+        other.createTable(u, SCHEMA);
+      });
+
+      assertThatThrownBy(txn::commitTransaction).isInstanceOf(AlreadyExistsException.class);
+      noHooks(io, mode);
+      LogCatalog reader = catalog(io, mode);
+      assertThat(reader.listTables(ns)).containsExactlyInAnyOrder(t, u);
+      assertThat(dataFiles(reader.loadTable(u))).isEmpty();
     }
   }
 }

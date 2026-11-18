@@ -899,7 +899,10 @@ A name binds in a namespace by the condition the record names
 
 The name check is the one `CatalogMutation` makes as it stages: a table's
 name against the namespace's tables, a namespace's against its parent's
-children. A table and a namespace may share a name under either condition.
+children. Every action verifies on the state before the record, so a rename
+into a name its own record frees (a `DropTable` of the table there, or a
+`RenameTable` of it out, which the record applies first) goes by
+`*_version`: by `*_removals` the name would be taken (CATALOG_TRANSACTIONS.md). A table and a namespace may share a name under either condition.
 The `name` condition is stable (S2, [LOG.md](LOG.md) §"Unconditional
 appends"): namespace ids are never reused, removals only grow, and a taken
 name is freed only by an action that adds to them, so a record it rejects

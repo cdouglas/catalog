@@ -121,7 +121,7 @@ catalog does:
 | set or remove namespace properties | present |
 | create table (`buildTable(...).create()`, `createTable`, `createTransaction()`) | absent; namespace present |
 | drop table (purge or not) | present, and the same table (uuid) the transaction read, if it read it |
-| rename table | source present (same uuid, if read), target absent, target namespace present |
+| rename table | source present (same uuid, if read), target absent or freed by the transaction (a table it drops or renames out of that name), target namespace present |
 | `newTransaction()` of a transaction's table | stages into the catalog transaction |
 
 FileIOCatalog checks a name a change binds (a table create, a rename's target, a namespace create)
@@ -133,7 +133,11 @@ record never applies once the name is free again (SPEC.md, "Action Verification 
 transaction whose read a sibling's drop overtook fails, as one that conflicts does. By
 `namespace`, it checks that the namespace's version is the one that read held, which any change
 there moves (a sibling created or dropped, a property set): a stricter condition than the table
-states, under which creates in one namespace land one at a time.
+states, under which creates in one namespace land one at a time. A rename into a name the
+transaction frees binds by the namespace's version under either setting: the record drops or
+renames out the table that held the name before it renames another in, but replay verifies each
+action on the state before the record, where the name is still taken (Bug 124 (rename into freed
+name fails)).
 
 The transaction sees its own changes: a dropped table no longer loads, a renamed one loads under its
 new name only, a created one loads and takes updates, listings include them. The commit carries the
