@@ -93,7 +93,7 @@ fork does not fix it yet. The Fork column is `atomicio`, which sits on
 | C12. An expiry follows the GC and retention settings of when it was created | fixed, `core-fixes` 0824e0d | yes | yes | `gc.enabled`: PR [#17791](https://github.com/apache/iceberg/pull/17791), open; retention: not reported |
 | C13. An expiry that committed reports a failure when its cleanup fails | fixed, `core-fixes` 7f3708a | yes | yes | not reported |
 | C14. A cherry-pick of a snapshot expired since it was picked fails with an NPE | fixed, `core-fixes` b1f2e01 | yes | yes | not reported |
-| C15. An expiry in a transaction deletes files before the transaction commits | fixed, `core-fixes` 44fce44 | yes | yes | not reported; a regression from [#13631](https://github.com/apache/iceberg/pull/13631), in 1.10.0 |
+| C15. An expiry in a transaction deletes files before the transaction commits | fixed, `core-fixes` 44fce44 | yes | yes | reported: [#18737](https://github.com/apache/iceberg/issues/18737) (open, 2026-11-01); a regression from [#13631](https://github.com/apache/iceberg/pull/13631), in 1.10.0 |
 | C16. A rollback undoes another writer's rollback | fixed, `core-fixes` 14d869e | yes | yes | not reported |
 | C17. Location and partition statistics updates fail after one concurrent commit | fixed, `core-fixes` b0669b6 | yes | yes | partition statistics: PR [#18204](https://github.com/apache/iceberg/pull/18204), open; location: not reported |
 | C18. Replace, overwrite and merge paths fail with an NPE on a removed spec | fixed, `core-fixes` 4692c71 | yes | yes | not reported |
