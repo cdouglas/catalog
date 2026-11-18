@@ -36,7 +36,9 @@ import java.util.List;
  *   <li>P3: {@link #readThrough} returns a view whose records (after its checkpoint) include the
  *       receipt's record, or fails: a view whose checkpoint already holds the record cannot say
  *       whether it applied once the committed set's GC drops its id.
- *   <li>P4: of several conditional writes on the same tail, at most one lands.
+ *   <li>P4: a conditional write (an append or a replace naming a tail) lands only if the log's
+ *       tail is the one it names when it lands, whatever moved it since, an append or a replace:
+ *       of several conditional writes on one tail, at most one lands.
  *   <li>P5: no trim before a durable checkpoint covers the records trimmed.
  *   <li>P6: {@link LogFullException} and {@link LogNotSentException} mean nothing landed.
  * </ul>

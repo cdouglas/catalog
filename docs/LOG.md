@@ -182,9 +182,11 @@ appends is a legal provider. It does not allow one with a hole: a provider
 need not prevent one (Kafka's retention trims whatever the checkpoints say),
 but must report its records' positions truly, and the runtime refuses the read
 (S4). P4 binds only a log with conditional writes. `SharedLogContract`
-(intentlog-testkit) checks P1 (positions included), P3, P4 (two appends, or
-two replaces, on one tail) and P5 (and I11, below) as far as a provider's
-capabilities allow.
+(intentlog-testkit) checks P1 (positions included), P3, P4 (two appends or
+two replaces on one tail, and an append and a replace on one tail, either
+landing first: only a log with both, `AtomicFileLog` with appends; calibrated
+by `fuzz/mutants/contract.sh`) and P5 (and I11, below) as far as a
+provider's capabilities allow.
 
 ### Failures
 
@@ -1111,8 +1113,8 @@ trimmed ones included, for oracles to replay.
   and I11, to creating a log once, to `readAfter`, and to positions (a tail
   names where the log ends; a read says where its records start, after the
   position its checkpoint covers; records read after a tail say they follow
-  it), as far as its capabilities make them testable. `TestAtomicFileLogContract` and
-  `TestInMemorySharedLogContract` run it.
+  it), as far as its capabilities make them testable. `TestAtomicFileLogContract`,
+  `TestInMemorySharedLogContract` and `TestSegmentedLogContract` run it.
 - `CommitProtocol` (intentlog-testkit) fuzzes the commit loop on a
   `LogHarness`, over `EntityVersionsMachine`, with the TLA+ models' schedules:
   writers whose requests meet faults (failures, lost replies, throttles,

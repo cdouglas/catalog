@@ -39,6 +39,8 @@ import org.intentlog.wire.LogEnvelope;
 import org.intentlog.wire.UuidV7;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 /**
  * What every {@link SharedLog} provider must do (P1-P6, I11), through the SPI alone. A provider's
@@ -208,6 +210,70 @@ public abstract class SharedLogContract {
     assertThatThrownBy(() -> log.replace(tail, checkpoint(2), List.of()))
         .isInstanceOf(LogConflictException.class);
     assertThat(log.read().checkpoint().orElseThrow()).isEqualTo(checkpoint(1));
+  }
+
+  /** Where a conditional write's tail comes from: the ways the runtime finds one. */
+  private enum TailSource {
+    /** A probe, which reads no records. */
+    PROBE,
+    /** A read of the log. */
+    READ,
+    /** A read through the last write: the view a commit landed in, which compaction replaces. */
+    READ_THROUGH
+  }
+
+  /**
+   * A log of a checkpoint and one record, and its tail as {@code source} finds it: the tail an
+   * append and a replace race on.
+   */
+  private LogTail raceTail(TailSource source, byte[] first) {
+    assumeAppends();
+    assumeThat(log.capabilities().conditionalAppend()).as("conditional appends").isTrue();
+    assumeThat(log.capabilities().fusedReplace()).as("fused replace").isTrue();
+    create(checkpoint(0));
+    Receipt receipt = append(first);
+    return switch (source) {
+      case PROBE -> log.probe();
+      case READ -> log.read().tail();
+      case READ_THROUGH -> log.readThrough(receipt, WAIT).tail();
+    };
+  }
+
+  /**
+   * P4 across kinds of write: a replace lands only on the tail it names, so an append that landed
+   * there first moved it (as another writer's commit may, while compaction after the commit
+   * replaces the version its own commit landed in). The replace loses, and nothing of it is in the
+   * log.
+   */
+  @ParameterizedTest
+  @EnumSource(TailSource.class)
+  void aReplaceOfATailAnAppendMovedLoses(TailSource source) { // P4
+    byte[] first = record();
+    LogTail tail = raceTail(source, first);
+    byte[] appended = record();
+    log.append(appended, tail);
+    assertThatThrownBy(() -> log.replace(tail, checkpoint(1), List.of(record())))
+        .isInstanceOf(LogConflictException.class);
+    LogView view = log.read();
+    assertThat(view.checkpoint().orElseThrow()).isEqualTo(checkpoint(0));
+    assertThat(view.records()).containsExactly(first, appended);
+  }
+
+  /**
+   * P4 across kinds of write, the other way: an append lands only on the tail it names, so a
+   * replace that landed there first moved it. The append loses, and is not in the log.
+   */
+  @ParameterizedTest
+  @EnumSource(TailSource.class)
+  void anAppendToATailAReplaceMovedLoses(TailSource source) { // P4
+    LogTail tail = raceTail(source, record());
+    byte[] kept = record();
+    log.replace(tail, checkpoint(1), List.of(kept));
+    assertThatThrownBy(() -> log.append(record(), tail))
+        .isInstanceOf(LogConflictException.class);
+    LogView view = log.read();
+    assertThat(view.checkpoint().orElseThrow()).isEqualTo(checkpoint(1));
+    assertThat(view.records()).containsExactly(kept);
   }
 
   @Test
