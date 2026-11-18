@@ -703,6 +703,7 @@ no data or deletes were added in it.
 | snapshot expiry, append | ↻ | ↻ | ↻ | ↻ | ↻ | ↻ |
 | append, snapshot expiry | ↻ | ↻ | ✓ | ✓ | ✓ | ✓ |
 | property change, snapshot expiry | ↻ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| snapshot expiry, snapshot expiry | ↻ | ↻ | ↻ | ↻ | ↻ | ↻ |
 | tag on (or rollback to) a snapshot the expiry removes, snapshot expiry | ↻ | ↻ | ↻ | ↻ | ↻ | ↻ |
 | branch created on main's head, snapshot expiry | ↻ | ↻ | ↻ | ↻ | ↻ | ↻ |
 | rollback, append | ↻ | ↻ | ↻ | ↻ | ↻ | ↻ |
@@ -732,10 +733,12 @@ What the per-encoding matrix says:
 4. An expiry merges as a removal of what it chose on the table it read
    (✓ where its retry would choose again: SPEC.md "Conflict Encodings"),
    after commits that add snapshots, and after any change but a ref's
-   reset, the table's, a schema's or a spec's. It does not merge after a
-   reset of any ref, even one that names none of what it removes (the
-   last row): a reset's stamp is all an encoding keeps of it, and a
-   rejection must stay one (S2).
+   reset, another removal of snapshots, the table's, a schema's or a
+   spec's. It does not merge after another expiry: its writer cleans up
+   files from the table it read, and would delete those the other kept
+   (Bug 117). Nor after a reset of any ref, even one that names none of
+   what it removes (the expiry rows' last): a reset's stamp is all an
+   encoding keeps of it, and a rejection must stay one (S2).
 5. Buckets can collide: ref names hash into 16 buckets and partitions
    into 64, so two branches or partitions that share a bucket conflict
    (a false positive, never a false merge).

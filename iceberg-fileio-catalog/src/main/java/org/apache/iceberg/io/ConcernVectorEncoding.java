@@ -39,10 +39,11 @@ import org.apache.iceberg.SnapshotRef;
  *
  * So it admits a commit racing property, statistics and sort-order changes and commits and tags on
  * other refs (WAP). An expiry (snapshots removed, and nothing else) reads every ref's resets, the
- * table, the schemas and the specs: it lands after commits that only add snapshots and move
- * branches to them, and removes the snapshots it chose on the table it read, none of which a ref
- * has come to name, where Iceberg's retry would choose again (errata D17 until 2026-11-17;
- * LogCatalogProperties.EXPIRY_MERGE). What Iceberg commits once (a schema or spec update, a ref
+ * table, the schemas, the specs and snapshot removal: it lands after commits that only add
+ * snapshots and move branches to them, and removes the snapshots it chose on the table it read,
+ * none of which a ref has come to name, where Iceberg's retry would choose again (errata D17 until
+ * 2026-11-17; LogCatalogProperties.EXPIRY_MERGE); not after another removal, whose snapshots its
+ * writer's cleanup, from the table it read, would take for its own (Bug 117). What Iceberg commits once (a schema or spec update, a ref
  * reset or retention change) and other removals (of schemas or specs, or with other changes) have
  * the Lamport witness.
  */
@@ -73,12 +74,16 @@ class ConcernVectorEncoding extends ConcernEncoding {
   Witness reads(int base, TableChange change, ReplayView landing) {
     if (change.expiry()) {
       // A ref reset since (a tag or branch created on a snapshot the table had, a rollback, a
-      // fast-forward, a ref's removal) may have come to name a snapshot it removes; commits that
-      // only add snapshots, on any branch, leave what it chose unreferenced
+      // fast-forward, a ref's removal) may have come to name a snapshot it removes; another
+      // removal of snapshots since chose on a base of its own, and this one's writer would clean
+      // up from the table it read, taking the other's snapshots for its own and deleting the
+      // files it kept (Bug 117); commits that only add snapshots, on any branch, leave what it
+      // chose unreferenced
       return Witness.of(base)
           .concern(TableChange.Concern.TABLE)
           .concern(TableChange.Concern.SCHEMA)
           .concern(TableChange.Concern.SPECS)
+          .concern(TableChange.Concern.REMOVAL)
           .anyRef(ConcernStamps.Ref.RESET);
     }
     if (change.concerns.contains(TableChange.Concern.REMOVAL)

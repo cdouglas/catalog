@@ -4,8 +4,9 @@
 # that would not stay one, S2: a tag that came and went); expiryrefnamed also takes a record that
 # removes a snapshot a ref names on the table it lands on for an expiry, which then removes the
 # snapshot and the ref; expirynomerge refuses every removal where the record lands again, so no
-# expiry merges.
-MUTANTS="expirynoreset expiryrefnamed expirynomerge"
+# expiry merges; expiryafterremoval drops the witness's read of snapshot removal, so an expiry
+# merges after another, and its writer's cleanup deletes the files the other kept (Bug 117).
+MUTANTS="expirynoreset expiryrefnamed expirynomerge expiryafterremoval"
 EQUIVALENT=""
 ORACLES=TestConflictMatrix,TestConflictAttribution,TestRebaseProperties,TestConcernVectorEncoding,TestManifestWindowEncoding
 
@@ -18,11 +19,11 @@ mutant() { # name main-dir test-dir
   local M=$2
   case $1 in
     # an expiry reads no ref's resets
-    expirynoreset) mutate $M/ConcernVectorEncoding.java "          .concern(TableChange.Concern.SPECS)
-          .anyRef(ConcernStamps.Ref.RESET);" "          .concern(TableChange.Concern.SPECS);" ;;
+    expirynoreset) mutate $M/ConcernVectorEncoding.java "          .concern(TableChange.Concern.REMOVAL)
+          .anyRef(ConcernStamps.Ref.RESET);" "          .concern(TableChange.Concern.REMOVAL);" ;;
     # ... nor whether a ref names a snapshot it removes where it lands
-    expiryrefnamed) mutate $M/ConcernVectorEncoding.java "          .concern(TableChange.Concern.SPECS)
-          .anyRef(ConcernStamps.Ref.RESET);" "          .concern(TableChange.Concern.SPECS);" && mutate $M/TableChange.java "    return concerns.equals(EnumSet.of(Concern.REMOVAL))
+    expiryrefnamed) mutate $M/ConcernVectorEncoding.java "          .concern(TableChange.Concern.REMOVAL)
+          .anyRef(ConcernStamps.Ref.RESET);" "          .concern(TableChange.Concern.REMOVAL);" && mutate $M/TableChange.java "    return concerns.equals(EnumSet.of(Concern.REMOVAL))
         && advanced.isEmpty()
         && reset.isEmpty()" "    return concerns.equals(EnumSet.of(Concern.REMOVAL))
         && advanced.isEmpty()" ;;
@@ -31,5 +32,8 @@ mutant() { # name main-dir test-dir
           || update instanceof InlineDeltaCodec.RemovePartitionSpecsUpdate) {" "      } else if (update instanceof InlineDeltaCodec.RemoveSchemasUpdate
           || update instanceof InlineDeltaCodec.RemoveSnapshotsUpdate
           || update instanceof InlineDeltaCodec.RemovePartitionSpecsUpdate) {" ;;
+    # an expiry merges after another removal of snapshots
+    expiryafterremoval) mutate $M/ConcernVectorEncoding.java "          .concern(TableChange.Concern.REMOVAL)
+          .anyRef(ConcernStamps.Ref.RESET);" "          .anyRef(ConcernStamps.Ref.RESET);" ;;
   esac
 }

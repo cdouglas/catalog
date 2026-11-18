@@ -120,9 +120,10 @@ public final class LogCatalogProperties {
    * Whether an expiry's record (snapshots removed, and nothing else) may land on a table that
    * changed since its writer read it, where the conflict encoding reads a table's concerns apart
    * (concern-vector, and the encodings built on it): if no ref was reset since (so none came to
-   * name a snapshot it removes) and the table, its schemas and its specs are as it read them, it
-   * removes the snapshots it chose on the table it read, after what landed first (errata D17 until
-   * 2026-11-17). {@code false} pins an expiry to the version its writer read, which Iceberg then
+   * name a snapshot it removes), no snapshots were removed since (its writer cleans up files from
+   * the table it read, and would take another removal's snapshots for its own: Bug 117), and the
+   * table, its schemas and its specs are as it read them, it removes the snapshots it chose on the
+   * table it read, after what landed first (errata D17 until 2026-11-17). {@code false} pins an expiry to the version its writer read, which Iceberg then
    * retries on a fresh read, as it does any commit that conflicts (for ablation). Default: {@code
    * true}.
    */

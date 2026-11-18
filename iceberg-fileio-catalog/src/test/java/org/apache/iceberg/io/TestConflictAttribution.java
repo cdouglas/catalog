@@ -198,6 +198,24 @@ class TestConflictAttribution {
   }
 
   /**
+   * ... nor after another removal of snapshots: its writer's cleanup, from the table it read to
+   * the table after its commit, would take the other's snapshots for its own and delete the files
+   * that one kept (Bug 117).
+   */
+  @Test
+  void anExpiryAfterAnotherExpiryReadsSnapshotRemoval() {
+    LogCatalog[] w = writers(ManifestWindowEncoding.NAME);
+    long second = w[0].loadTable(ID).currentSnapshot().snapshotId();
+    w[0].loadTable(ID).newFastAppend().appendFile(file("b")).commit();
+    beforeAsWrite(() -> w[1].loadTable(ID).expireSnapshots().expireSnapshotId(second)
+        .cleanExpiredFiles(false).commit());
+    expire(w[0]);
+
+    assertThat(reasons(w[0])).containsExactly(Map.entry("concern: snapshot removal", 1L));
+    assertThat(w[1].loadTable(ID).snapshots()).hasSize(1);
+  }
+
+  /**
    * ... nor after any ref's reset, though the ref names none of them: one may have named one and
    * moved on, and the judgment must hold on every later version (S2).
    */

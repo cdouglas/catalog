@@ -92,6 +92,10 @@ class TestConflictMatrix {
             cmd(Kind.FAST_APPEND, 0, 2), cmd(Kind.EXPIRE_SNAPSHOTS, 0, 1)),
         row("property change", "snapshot expiry", "RMMMMM",
             cmd(Kind.SET_PROPERTY, 0, 0), cmd(Kind.EXPIRE_SNAPSHOTS, 0, 1)),
+        // ... but not after another removal of snapshots, whose snapshots its writer's cleanup,
+        // from the table it read, would take for its own (Bug 117)
+        row("snapshot expiry", "snapshot expiry", "RRRRRR",
+            cmd(Kind.EXPIRE_SNAPSHOTS, 0, 1), cmd(Kind.EXPIRE_SNAPSHOTS, 0, 1)),
         // ... but not once a ref names a snapshot it chose, where Iceberg's retry keeps it
         row("tag on the snapshot it expires", "snapshot expiry", "RRRRRR",
             cmd(Kind.CREATE_TAG, 0, 0), cmd(Kind.EXPIRE_SNAPSHOTS, 0, 1)),

@@ -7606,6 +7606,96 @@ public class TestCatalogRegressions {
     }
   }
 
+  /**
+   * Bug 117 (merged expiry cleans stale base): an expiry merged onto a table changed since its
+   * writer read it (errata D17's fix), and its writer then cleaned up files as Iceberg's
+   * RemoveSnapshots does, from the table it read to the table after its commit. If another
+   * writer's expiry had removed snapshots in between, keeping their files ({@code
+   * cleanExpiredFiles(false)}), the cleanup took those snapshots for its own and deleted their
+   * files: a manifest list, a manifest, a data file a later snapshot deleted. An expiry no longer
+   * merges past another removal of snapshots (it reads snapshot removal, {@code concern: snapshot
+   * removal}), and Iceberg's retry cleans up from a fresh read. It still merges past commits that
+   * add snapshots. Found by the 2026-11-17 design review's oracle gap plan (V1).
+   */
+  @Nested
+  class AnExpiryAfterAnotherExpiry {
+    private final TableIdentifier t = TableIdentifier.of("ns", "t");
+    private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+
+    /** A data file {@code name} that exists, so a cleanup's deletion of it shows. */
+    private org.apache.iceberg.DataFile written(String name) {
+      String path = "mem:///data/" + name + ".parquet";
+      try (PositionOutputStream out = io.newOutputFile(path).createOrOverwrite()) {
+        out.write(new byte[10]);
+      } catch (IOException e) {
+        throw new java.io.UncheckedIOException(e);
+      }
+      return org.apache.iceberg.DataFiles.builder(org.apache.iceberg.PartitionSpec.unpartitioned())
+          .withPath(path)
+          .withFileSizeInBytes(10)
+          .withRecordCount(1)
+          .build();
+    }
+
+    /**
+     * Y reads S1, S2 and S3; X expires S2 keeping its files, and lands; Y expires S1 cleaning up.
+     * S2's own files (its list, its manifest, the data file S3 deleted) must survive, as they do
+     * when Iceberg retries Y's expiry on a fresh read.
+     */
+    @ParameterizedTest(name = "expiry.merge={0}")
+    @ValueSource(booleans = {true, false})
+    void keepsTheFilesTheOtherKept(boolean merge) {
+      Map<String, String> properties =
+          Map.of(LogCatalogProperties.EXPIRY_MERGE, String.valueOf(merge));
+      LogCatalog x = LocalCatalogMode.APPEND_TM.catalog(io, WAREHOUSE, "c", properties);
+      x.createNamespace(Namespace.of("ns"));
+      Table table = x.createTable(t, SCHEMA);
+      org.apache.iceberg.DataFile f2 = written("f2");
+      table.newFastAppend().appendFile(written("f1")).commit();
+      long s1 = table.currentSnapshot().snapshotId();
+      table.newFastAppend().appendFile(f2).commit();
+      org.apache.iceberg.Snapshot s2 = table.currentSnapshot();
+      table.newDelete().deleteFile(f2).commit();
+      long s3 = table.currentSnapshot().snapshotId();
+      Set<String> s3Manifests = new HashSet<>();
+      table.currentSnapshot().allManifests(io).forEach(m -> s3Manifests.add(m.path()));
+      List<String> s2Own = new ArrayList<>();
+      s2Own.add(s2.manifestListLocation());
+      s2.allManifests(io).stream().map(ManifestFile::path)
+          .filter(path -> !s3Manifests.contains(path)).forEach(s2Own::add);
+      s2Own.add(f2.location());
+      assertThat(s2Own).hasSize(3).allMatch(file -> io.bytes(file) != null);
+
+      LogCatalog y = LocalCatalogMode.APPEND_TM.catalog(io, WAREHOUSE, "c", properties);
+      Table stale = y.loadTable(t);
+      boolean[] raced = {false};
+      io.injectFaults((location, strategy) -> {
+        if (location.equals(CATALOG) && !raced[0]) {
+          raced[0] = true;
+          x.loadTable(t).expireSnapshots().expireSnapshotId(s2.snapshotId())
+              .cleanExpiredFiles(false).commit();
+        }
+        return Fault.NONE;
+      });
+      try {
+        stale.expireSnapshots().expireSnapshotId(s1).commit();
+      } finally {
+        io.injectFaults((location, strategy) -> Fault.NONE);
+      }
+
+      assertThat(raced[0]).isTrue();
+      Table landed = LocalCatalogMode.APPEND_TM.catalog(io, WAREHOUSE, "c", properties)
+          .loadTable(t);
+      assertThat(landed.snapshots()).extracting(org.apache.iceberg.Snapshot::snapshotId)
+          .containsExactly(s3);
+      assertThat(s2Own).as("S2's own files, which X's expiry kept")
+          .allMatch(file -> io.bytes(file) != null);
+      if (merge) {
+        assertThat(y.log().counts().conflictReasons())
+            .containsExactly(Map.entry("concern: snapshot removal", 1L));
+      }
+    }
+  }
   /** Properties of a catalog whose creates bind names by the namespace's version. */
   private static final Map<String, String> BY_NAMESPACE =
       Map.of(LogCatalogProperties.CREATE_CONDITION, "namespace");
