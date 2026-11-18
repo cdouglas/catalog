@@ -112,9 +112,10 @@ class TestFullUpdates {
   }
 
   /**
-   * A statistics change is a delta (errata D9 until 2026-11-16: it went as full metadata): set,
-   * replaced, and removed, with a partition statistics file, and an expiry that takes a snapshot's
-   * statistics with it.
+   * A statistics change is a delta (until 2026-11-16 it went as full metadata: errata D9
+   * (statistics force full mode)): files set (a partition statistics file too) and replaced, a
+   * statistics file removed by a commit that changes nothing else, and a partition statistics file
+   * removed with an expiry that takes a snapshot's statistics with it.
    */
   @ParameterizedTest
   @EnumSource(names = {"APPEND_TM", "APPEND_ML", "MEMLOG_ML"})
@@ -139,6 +140,8 @@ class TestFullUpdates {
         .setStatistics(new GenericStatisticsFile(
             head, "mem:///stats/" + head + "-2.puffin", 200, 20, List.of()))
         .commit();
+    table.updateStatistics().setStatistics(statistics(ids.get(1))).commit();
+    table.updateStatistics().removeStatistics(ids.get(1)).commit();
     Transaction txn = table.newTransaction();
     txn.expireSnapshots().expireSnapshotId(ids.get(0)).cleanExpiredFiles(false).commit();
     txn.updatePartitionStatistics().removePartitionStatistics(head).commit();

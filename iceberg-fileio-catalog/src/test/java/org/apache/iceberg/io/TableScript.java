@@ -149,9 +149,13 @@ final class TableScript {
     OVERWRITE,
     /** Replaces the partitions of a new file (a dynamic overwrite). */
     REPLACE_PARTITIONS,
-    /** Sets a snapshot's statistics file, or removes one when {@code c} is odd. */
+    /**
+     * Sets a snapshot's statistics file; or, when {@code c} is odd and the table has one, removes
+     * one (of the {@code b}th snapshot with one) and, when {@code c % 4 == 3}, sets another
+     * snapshot's in the same commit, as a job that refreshes a table's statistics does.
+     */
     STATISTICS,
-    /** Sets a snapshot's partition statistics file, or removes one when {@code c} is odd. */
+    /** As {@link #STATISTICS}, with partition statistics files. */
     PARTITION_STATISTICS,
     /**
      * Overwrites partition {@code c % 4} (rows with that {@code cat}) with a new file, validating
@@ -831,32 +835,42 @@ final class TableScript {
           target.updateProperties().set("big", big.toString()).commit();
           break;
         case STATISTICS:
-          Snapshot measured = pick(snapshots, cmd.b);
-          if (cmd.c % 2 == 1) {
-            target.updateStatistics().removeStatistics(measured.snapshotId()).commit();
+          // A removal drops a file the table has (one of a snapshot with none commits nothing);
+          // with c % 4 == 3 another snapshot's is set in the same commit, so its delta has an
+          // update besides the removal (a delta that lost a lone removal would be empty: full mode)
+          Set<Long> measured = new HashSet<>();
+          target.statisticsFiles().forEach(file -> measured.add(file.snapshotId()));
+          Snapshot dropped = cmd.c % 2 == 1 ? pickAmong(snapshots, measured, cmd.b) : null;
+          if (dropped != null) {
+            org.apache.iceberg.UpdateStatistics update =
+                target.updateStatistics().removeStatistics(dropped.snapshotId());
+            Snapshot remeasured = cmd.c % 4 == 3 ? pickOther(snapshots, dropped, cmd.a) : null;
+            if (remeasured != null) {
+              update.setStatistics(statisticsFile(remeasured));
+            }
+            update.commit();
           } else {
-            target.updateStatistics()
-                .setStatistics(new org.apache.iceberg.GenericStatisticsFile(
-                    measured.snapshotId(), names + "stats-s" + nextFile++ + ".puffin", 100, 10,
-                    List.of(new org.apache.iceberg.GenericBlobMetadata(
-                        "apache-datasketches-theta-v1", measured.snapshotId(),
-                        measured.sequenceNumber(), List.of(1), Map.of("ndv", "3")))))
+            target.updateStatistics().setStatistics(statisticsFile(pick(snapshots, cmd.b)))
                 .commit();
           }
           break;
         case PARTITION_STATISTICS:
-          Snapshot partitioned = pick(snapshots, cmd.b);
-          if (cmd.c % 2 == 1) {
-            target.updatePartitionStatistics()
-                .removePartitionStatistics(partitioned.snapshotId()).commit();
+          Set<Long> partitioned = new HashSet<>();
+          target.partitionStatisticsFiles().forEach(file -> partitioned.add(file.snapshotId()));
+          Snapshot unpartitioned = cmd.c % 2 == 1 ? pickAmong(snapshots, partitioned, cmd.b) : null;
+          if (unpartitioned != null) {
+            org.apache.iceberg.UpdatePartitionStatistics update =
+                target.updatePartitionStatistics()
+                    .removePartitionStatistics(unpartitioned.snapshotId());
+            Snapshot repartitioned =
+                cmd.c % 4 == 3 ? pickOther(snapshots, unpartitioned, cmd.a) : null;
+            if (repartitioned != null) {
+              update.setPartitionStatistics(partitionStatisticsFile(repartitioned));
+            }
+            update.commit();
           } else {
             target.updatePartitionStatistics()
-                .setPartitionStatistics(
-                    org.apache.iceberg.ImmutableGenericPartitionStatisticsFile.builder()
-                        .snapshotId(partitioned.snapshotId())
-                        .path(names + "stats-p" + nextFile++ + ".parquet")
-                        .fileSizeInBytes(42)
-                        .build())
+                .setPartitionStatistics(partitionStatisticsFile(pick(snapshots, cmd.b)))
                 .commit();
           }
           break;
@@ -927,6 +941,41 @@ final class TableScript {
         throw new NotApplicable("no snapshot");
       }
       return snapshots.get(index % snapshots.size());
+    }
+
+    /** The {@code index}th of {@code snapshots} whose id is in {@code ids}, cyclically, or null. */
+    private static Snapshot pickAmong(List<Snapshot> snapshots, Set<Long> ids, int index) {
+      List<Snapshot> among = new ArrayList<>();
+      for (Snapshot s : snapshots) {
+        if (ids.contains(s.snapshotId())) {
+          among.add(s);
+        }
+      }
+      return among.isEmpty() ? null : among.get(index % among.size());
+    }
+
+    /** The {@code index}th of {@code snapshots} other than {@code not}, cyclically, or null. */
+    private static Snapshot pickOther(List<Snapshot> snapshots, Snapshot not, int index) {
+      List<Snapshot> others = new ArrayList<>(snapshots);
+      others.removeIf(s -> s.snapshotId() == not.snapshotId());
+      return others.isEmpty() ? null : others.get(index % others.size());
+    }
+
+    private org.apache.iceberg.StatisticsFile statisticsFile(Snapshot measured) {
+      return new org.apache.iceberg.GenericStatisticsFile(
+          measured.snapshotId(), names + "stats-s" + nextFile++ + ".puffin", 100, 10,
+          List.of(new org.apache.iceberg.GenericBlobMetadata(
+              "apache-datasketches-theta-v1", measured.snapshotId(),
+              measured.sequenceNumber(), List.of(1), Map.of("ndv", "3"))));
+    }
+
+    private org.apache.iceberg.PartitionStatisticsFile partitionStatisticsFile(
+        Snapshot partitioned) {
+      return org.apache.iceberg.ImmutableGenericPartitionStatisticsFile.builder()
+          .snapshotId(partitioned.snapshotId())
+          .path(names + "stats-p" + nextFile++ + ".parquet")
+          .fileSizeInBytes(42)
+          .build();
     }
 
     /**
