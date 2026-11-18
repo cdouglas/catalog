@@ -2,7 +2,8 @@
 
 Status: designed 2026-11-18 on branch `views` (from main 0c8bdf5), its open questions settled
 by the user the same day ([Decisions on the open questions](#decisions-on-the-open-questions)).
-Nothing is built. Stage 1 is views in the catalog (V1-V12). Stage 2 is views in catalog
+M1 is measured ([Sizes](#sizes)); the rest is being built. Stage 1 is views in the catalog
+(V1-V12). Stage 2 is views in catalog
 transactions ([Stage 2](#stage-2-views-in-catalog-transactions)).
 
 ## Summary
@@ -84,8 +85,8 @@ transactions ([Stage 2](#stage-2-views-in-catalog-transactions)).
 **V2. A view's version is whole.**
 - Every view commit carries the whole `ViewMetadata`, inline, or a pointer to a file holding
   it. A create, a replace (a new version) and a property change are all the same action.
-- No deltas. Whole metadata is 0.5-2 KB gzipped ([Sizes](#sizes)), and views are written
-  rarely.
+- No deltas. Whole metadata is 0.8-4.7 KB gzipped, 13 KB at most at 10 distinct versions of
+  10 KB of SQL ([Sizes](#sizes)), and views are written rarely.
 - So a view can move between pointer and inline on any commit, as its writers' modes differ.
   Tables, by contrast, return inline through import pages.
 
@@ -98,8 +99,9 @@ transactions ([Stage 2](#stage-2-views-in-catalog-transactions)).
   - on a log that bounds a record, the record budget evicts it. Its update registers as
     `evictable`, as an inline table update does.
 
-**V4. One inline codec.** The inline form is Iceberg's `ViewMetadataParser` JSON, gzipped,
-tagged `CODEC_JSON_GZIP`. The structural codec is a table codec, and a view refuses it.
+**V4. One inline codec.** The inline form is Iceberg's `ViewMetadataParser` JSON, gzipped at
+the default level (a view is encoded once, by its writer: [Sizes](#sizes)), tagged
+`CODEC_JSON_GZIP`. The structural codec is a table codec, and a view refuses it.
 
 **V5. Pointers are full strings.** That is how pointer tables store theirs. Compact pointers,
 for tables and views alike, are errata D28 (pointer locations are full strings).
@@ -238,25 +240,53 @@ message RenameView {
 
 ## Sizes
 
-These are estimates from a Python mock of Iceberg's view JSON, not kept. M1 replaces them with
-measurements from Iceberg's own parser.
+M1 measured these with Iceberg's own `ViewMetadataParser`, on views made through Iceberg's view
+API with the summary Iceberg puts on each version and the properties Spark's `CREATE VIEW` adds
+(`ViewMetadataSizeProbe`, test scope; its output prints every shape). A version's SQL is either
+distinct from the last version's (the worst case for gzip) or the last version's with one
+predicate changed (edited). gzip is at the default level, as a pointer view's file holds it
+(views default to gzip) and as the inline form does (V4).
 
-| View | JSON | gzip |
-|---|---|---|
-| 5 columns, 100 B of SQL, 1 version | 1.0 KB | 478 B |
-| 10 columns, 200 B, 1 version | 1.4 KB | 548 B |
-| 10 columns, 1 KB, 10 versions | 14 KB | 771 B |
-| 50 columns, 2 KB, 1 version | 5.7 KB | 895 B |
-| 50 columns, 10 KB, 10 versions, 3 schemas | 113 KB | 1.7 KB |
+| View | JSON | gzip | each version after the first, gzip |
+|---|---:|---:|---:|
+| 10 columns, 100 B of SQL, 1 version | 2.0 KB | 806 B | |
+| 10 columns, 1 KB, 1 version | 2.8 KB | 1.0 KB | |
+| 10 columns, 1 KB, 10 versions edited | 15.7 KB | 1.3 KB | 35 B |
+| 10 columns, 1 KB, 10 versions distinct | 15.4 KB | 2.5 KB | 167 B |
+| 10 columns, 10 KB, 10 versions edited | 105 KB | 3.5 KB | 127 B |
+| 10 columns, 10 KB, 10 versions distinct | 106 KB | 13.2 KB | 1.2 KB |
+| 50 columns, 1 KB, 1 version | 7.2 KB | 1.8 KB | |
+| 50 columns, 10 KB, 10 versions edited, 3 schemas | 132 KB | 4.7 KB | 166 B |
 
-- The mock's versions repeat one SQL text, so a history of distinct texts compresses less.
-- A full pointer is ~115 B (`s3://<bucket>/<warehouse>/<ns>/<view>/metadata/00003-<uuid>.gz.metadata.json`).
-  A compact one would be ~18 B: a 16-byte nonce and the version, under the view's location,
-  which is recorded once.
-- **Per checkpoint.** Polaris' default tree (24 views): inline ~15 KB, pointers 2.8 KB.
-  10,000 views: inline ~6 MB, full pointers 1.1 MB, compact ones 0.2 MB.
-- **Per commit.** Inline sends 0.5-2 KB in the record, with no PUT. A pointer view sends
-  ~115 B and makes a PUT, and every load of it makes a GET.
+- **Records.** A create sends the view's first version: 0.8-3.4 KB inline, 172 B by a full
+  pointer. A replace or a property change sends the whole view: 1.1-1.5 KB inline at 10 columns,
+  1 KB of SQL and 10 versions, and 13 KB at most (10 distinct versions of 10 KB). A pointer sends
+  145 B, and a compact one would send 29 B. That is far below the inline bound (~4 MiB) and
+  small beside a table commit's record, so V2 (no deltas) holds.
+- **The level.** gzip's fastest level, which tables' inline codec uses because a checkpoint
+  re-encodes changed tables, makes a view 5-130% larger (10 KB of SQL edited over 10 versions:
+  8.1 KB against 3.5 KB). A checkpoint never re-encodes a view, so a view is gzipped at
+  the default level, once, by its writer.
+- **Pointers.** A full pointer is 129 B here
+  (`s3://analytics-prod-lake/warehouse/sales_db/daily_revenue_v0/metadata/00003-<uuid>.gz.metadata.json`),
+  a checkpoint row 161 B. A compact one (errata D28) would be 17 B, a row 46 B.
+- **Per checkpoint.**
+
+  | Views | of | inline | full pointers | compact pointers |
+  |---:|---|---:|---:|---:|
+  | 24 (Polaris' default tree) | 10 columns, 1 KB, 1 version | 25 KB | 3.8 KB | 1.1 KB |
+  | 24 | 10 columns, 1 KB, 10 versions distinct | 60 KB | 3.8 KB | 1.1 KB |
+  | 10,000 | 10 columns, 1 KB, 1 version | 10.2 MB | 1.5 MB | 0.45 MB |
+  | 10,000 | 10 columns, 1 KB, 10 versions edited | 13.2 MB | 1.5 MB | 0.45 MB |
+  | 10,000 | 10 columns, 1 KB, 10 versions distinct | 24.4 MB | 1.5 MB | 0.45 MB |
+  | 10,000 | 50 columns, 10 KB, 10 versions edited, 3 schemas | 45.5 MB | 1.5 MB | 0.45 MB |
+
+  Inline views cost a checkpoint 7-30 times what pointers do: at 10,000 views, 10-45 MB that
+  every compaction writes again, as inline tables' metadata is. The design mock had estimated
+  6 MB. A catalog of many views and frequent compactions should keep its views as pointers
+  (`fileio.catalog.inline` false, which also keeps its tables as pointers, Q3).
+- **Per commit.** Inline sends the view in the record, with no PUT. A pointer view sends 145 B
+  and makes a PUT of its file, and every load of it makes a GET.
 
 ## Catalog API
 
@@ -375,14 +405,12 @@ and a view's metadata carries its own uuid. What Batavia could add, outside Iceb
 
 ## Measurement
 
-- **M1 (first, before the format is written).** Measured with `ViewMetadataParser`:
-  - **What:** bytes per record (create, replace, property change) and per checkpoint entry.
-  - **Encodings:** full pointers, compact pointers and inline JSON-gzip.
-  - **Views:** 5, 10 and 50 columns; 100 B to 10 KB of distinct SQL per version; 1 and 10
-    versions.
-  - **Checkpoints:** bytes at Polaris' default tree and at 10,000 views.
-
-  It checks V2 (no deltas), and gives D28 its numbers.
+- **M1** ([Sizes](#sizes)): `ViewMetadataSizeProbe` (test scope, `exec:java`) prints the bytes
+  of each view's metadata, of each record (create, replace, property change) and of each
+  checkpoint row, inline, by full pointer and by compact pointer, for 5, 10 and 50 columns, 100 B
+  to 10 KB of SQL per version, 1 and 10 versions, distinct or edited, and one or three schemas;
+  and a checkpoint's views at Polaris' default tree and at 10,000 views. It checked V2 (no
+  deltas), set V4's gzip level, and gives D28 its numbers.
 - **M2 (catalog-bench, with E7).**
   - **Driver operations:** `create_view`, `load_view`, `replace_view`, `set_view_properties`,
     `rename_view`, `drop_view`, on the tree (G5) at Polaris' read and update ratios.

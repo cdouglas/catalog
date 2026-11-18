@@ -393,16 +393,18 @@ resolved tables, or a claim about view integrity in the paper.
 A pointer table's or view's metadata location is a full string in every
 record that moves it and in every checkpoint: catalog.proto
 `Table.metadata_location`, `UpdateTableLocation`, `View.metadata_location`,
-about 115 bytes for `s3://<bucket>/<warehouse>/<ns>/<name>/metadata/00003-<uuid>.gz.metadata.json`.
+about 115-130 bytes for `s3://<bucket>/<warehouse>/<ns>/<name>/metadata/00003-<uuid>.gz.metadata.json`
+(129 in VIEWS.md's M1).
 
 A compact form would record the entity's location once, empty when it is the
 catalog's default for its identifier at create, and per version a 16-byte
-nonce and the version number, about 18 bytes. The writer would name its file
+nonce and the version number, 17 bytes. The writer would name its file
 `<metadata dir>/<version>-<nonce>.metadata.json`. `registerTable` and
 `registerView` adopt a file of any name, so they keep the full string as the
 oneof's other case. That saves about 100 bytes per pointer entity in every
 checkpoint, and per record that moves one: 0.3 MB of E1's 3,000-table pointer
-checkpoint; 0.2 MB against 1.1 MB at 10,000 views.
+checkpoint; at 10,000 views, 0.45 MB against 1.5 MB (M1: a checkpoint row of 46
+bytes against 161; a replace's record of 29 against 145).
 
 **Trigger to revisit:** checkpoint bytes of a pointer catalog with many tables
 or views mattering in a measured workload.
