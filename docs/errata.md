@@ -545,14 +545,7 @@ version, the stores' append limits). We have not exercised:
   new ETag without a HEAD that could see a later writer;
 - region-failover redirects mid-write;
 - conditional appends that succeed at the storage layer but return a
-  partial offset (does any provider do this?);
-- a GET pinned to a version (`If-Match`) that a shorter object replaced,
-  from an offset past the new object's end, as a stream reopened after a
-  connection reset sends one. RFC 9110 evaluates the precondition before the
-  range (412, a stale read); were S3 to answer 416, the fork's `S3InputStream`
-  would report the stream's end, mid-version. The fork's contract suite has
-  no case for it. `AtomicFileLog` reads exactly its version's length either
-  way (Bug 122 (spliced read went backwards)).
+  partial offset (does any provider do this?).
 
 **Trigger:** the first time a real workload sees an unexpected commit
 failure on a specific provider.

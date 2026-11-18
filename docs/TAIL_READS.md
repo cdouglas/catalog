@@ -873,7 +873,13 @@ Each step stands alone and is measured before the next:
    accelerator is on, ADLS; not GCS, whose client library reports no
    generation a read found), and reports a GET from an object's end or past
    it, which those services answer with 416, as the stream's end (fork
-   fbd1036bf9). `AtomicFileLog` then reads first on such stores: a whole read
+   fbd1036bf9). A GET pinned to a version (`If-Match`) from past the end of a
+   shorter object that replaced it gets a 412 on S3 Standard and ADLS, but a
+   416 on S3 Express, which checks the range first; the fork's S3 stream asks
+   a HEAD for the version after a pinned 416 and fails as stale if it is gone
+   (Bug 123 (pinned read cut short), fork 4b9ab3d722; the contract's
+   `aSeenVersionReadPastTheEndOfAShorterReplacementIsNotCutShort`, measured on
+   all four stores 2026-11-18). `AtomicFileLog` then reads first on such stores: a whole read
    is one GET, a tail read one GET from N − 20 (two where the object was
    replaced: the rest of the version, or the version whole after a GET that
    found nothing), and a page of the log one GET on any store (a page is
@@ -1212,7 +1218,9 @@ At 1,000 tables (16.7 a second offered), one run an arm of 1,200 s:
     user-defined object metadata for existing objects").
   - A ranged read reports it, with the version and the object's length
     (`Content-Range`), for the version that served it, in one response; a
-    read pinned to a version an append or a replace superseded gets a 412.
+    read pinned to a version an append or a replace superseded gets a 412
+    (on S3 Express, a range past a shorter replacement's end gets a 416:
+    Bug 123 (pinned read cut short)).
 - **The incarnation in the header or the checkpoint only**, read by a
   second ranged GET. S3 serves one range a GET, so a tail read would take
   three requests, and a whole read spliced after the checkpoint would still
