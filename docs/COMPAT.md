@@ -156,8 +156,8 @@ Iceberg 1.12.0, the ADLS Append Blob writes and the one-request GCS CAS.
 
 - **append · file** — `ADLSCatalogTest`,
   `ADLSFileIOCatalogTransactionTests`. The default catalog
-  configuration leaves `max.append.count` at its default (10 000 before
-  2026-10-27, 100 since). `ADLSFileIO` keeps
+  configuration leaves `max.append.count` at its default (1,000).
+  `ADLSFileIO` keeps
   the catalog file an Append Blob: `Strategy.APPEND` is one conditional
   `AppendBlock`, and CAS stages a temp Append Blob and renames it onto
   the catalog file.

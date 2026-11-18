@@ -36,8 +36,10 @@ public final class LogCatalogProperties {
    * errata D14). It was 100 until 2026-11-10, the best of 0, 100 and 1000 in the contention
    * benchmark on S3 Express before tail reads (docs/design.md, "Choosing append vs CAS"), when
    * every read replayed every record after the checkpoint; a reader that folds only the records
-   * after its replica pays for them once. Set to 0 to force CAS on every commit (for storage
-   * providers that don't support conditional append).
+   * after its replica pays for them once. Set to 0 to replace the catalog on every commit, which an
+   * S3 general-purpose bucket needs: {@code S3FileIO} reports appends, which only S3 Express
+   * directory buckets accept. On a store whose FileIO reports none ({@code GCSFileIO}) every
+   * commit replaces the catalog, whatever this says.
    *
    * <p>Provider hard limits: S3 Express ~10000, Azure AppendBlob 50000. An append the store
    * refuses past them makes the commit replace the catalog.

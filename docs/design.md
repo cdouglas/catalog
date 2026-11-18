@@ -813,18 +813,21 @@ the log it landed in, and compacts after the commit
 
 ### Choosing append vs CAS
 
-The default `max.append.count` is 100. A reader replays every record
-after the checkpoint, and every commit reads, so a long tail costs every
-writer; a compaction rewrites the checkpoint and races the others'
-appends, so a short one costs compactions. In the contention benchmark
-(fast appends on S3 Express, lab/ `c4-knobs`), 100 beat both a replace
-on every commit and 1000, under `lamport` and `blind-append`. It was
-10000, sized to the stores' append caps (S3 Express 10,000 parts, Azure
-Append Blob 50,000 blocks), which only bound it: a count above a store's
-cap costs a refused append, then a compaction (Bug 66). The best count
-depends on the store's latencies and the catalog's size, so it should be
-measured per store or set by a principled rule ([errata.md](errata.md)
-§D14). GCS has no append, and the format commits every write there by
+The default `max.append.count` is 1,000, provisional. Every commit
+reads, so a long tail costs every writer what its reads replay of it; a
+compaction rewrites the checkpoint and races the others' appends, so a
+short one costs compactions. A reader that folds only the records after
+the replica it holds (tail reads, [TAIL_READS.md](TAIL_READS.md)) pays
+for each record once. In the contention benchmark before tail reads,
+when every read replayed every record after the checkpoint (fast
+appends on S3 Express, lab/ `c4-knobs`), 100 beat both a replace on
+every commit and 1000, under `lamport` and `blind-append`. The stores'
+append caps (S3 Express 10,000 parts, Azure Append Blob 50,000 blocks)
+only bound the count: a count above a store's cap costs a refused
+append, then a compaction (Bug 66 (full object stopped commits)). The
+best count depends on the store's latencies and the catalog's size, so it
+should be measured per store or set by a principled rule
+([errata.md](errata.md) §D14 (knobs fixed, not per store)). GCS has no append, and the format commits every write there by
 CAS whatever the setting (`GCSFileIO.supportsAppend()` is false). For S3
 standard buckets, which support conditional full-object replace but not
 conditional append, set `max.append.count = 0` to force CAS-only mode.

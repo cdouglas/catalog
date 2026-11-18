@@ -276,7 +276,7 @@ suites skip; see [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
 | `fileio.catalog.inline.strict`    | `false`       | Reject loading a table with both inline and file manifest lists, instead of logging a warning |
 | `fileio.catalog.inline.max.update.size` | `4190208` | Largest inline table update (a delta, or full metadata); a table whose update does not fit gets a `metadata.json` and leaves inline storage until an update fits in full |
 | `fileio.catalog.inline.tm.codec`  | `structural`  | Codec for newly-written inline `TableMetadata` bytes: `structural` (binary, columnar; default) or `gzip` (Iceberg-style gzipped JSON). Decode follows the on-wire codec tag, so writers can change this setting freely |
-| `fileio.catalog.max.append.count` | `100`         | Soft limit on log records before CAS compaction. `0` forces CAS-only mode (S3 standard, GCS) |
+| `fileio.catalog.max.append.count` | `1000`        | Soft limit on the records after the catalog's checkpoint: past it, a writer whose commit landed compacts the catalog after it. `0` replaces the catalog on every commit, which an S3 general-purpose bucket needs (`S3FileIO` reports appends, which only S3 Express accepts); on GCS every commit replaces whatever this says (`GCSFileIO.supportsAppend()` is false) |
 | `fileio.catalog.max.append.size`  | `16777216`    | Soft target for the records after the checkpoint before compaction |
 | `fileio.catalog.max.append.size.basis` | `tail` | What `max.append.size` bounds: `tail` (the records after the checkpoint) or `object` (the whole file; for ablation) |
 | `fileio.catalog.checkpoint.memoize` | `true` | Write each inline table unchanged since a decode or an earlier encode as the bytes it had; `false` re-encodes every table (for ablation) |
