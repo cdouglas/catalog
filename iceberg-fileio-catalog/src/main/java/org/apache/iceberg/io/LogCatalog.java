@@ -197,7 +197,11 @@ public class LogCatalog extends BaseMetastoreCatalog
     String conflictEncoding = LogCatalogProperties.conflictEncoding(catalogProperties);
     LogCatalogProperties.snapshotPaging(catalogProperties); // validates them
 
-    warehouseLocation = properties.get(CatalogProperties.WAREHOUSE_LOCATION);
+    // Tables go under the warehouse without its trailing slash, as the catalog object does
+    String warehouse = properties.get(CatalogProperties.WAREHOUSE_LOCATION);
+    warehouseLocation = warehouse == null || warehouse.isEmpty()
+        ? warehouse
+        : LocationUtil.stripTrailingSlash(warehouse);
     if (sharedLog == null) {
       openLog(properties);
     }

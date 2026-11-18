@@ -6327,4 +6327,30 @@ public class TestCatalogRegressions {
           .isEqualTo(before);
     }
   }
+
+  /**
+   * Bug 105 (warehouse slash doubled in locations): a catalog took its tables' default locations
+   * from its warehouse property as given, so a warehouse with a trailing slash ({@code
+   * s3://bucket/wh/}) put each table under a path with an empty segment ({@code
+   * s3://bucket/wh//ns/t}): a prefix apart from the one the table has under the same warehouse
+   * written without the slash. The catalog object's location already dropped the slash, as
+   * JdbcCatalog and GlueCatalog drop it from their warehouse. The warehouse location now drops it
+   * too. Found by the 2026-11-17 design review (API reviewer).
+   */
+  @Nested
+  class AWarehouseWithATrailingSlash {
+
+    @Test
+    void placesTablesAsTheWarehouseWithoutIt() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog = new FileIOCatalog("c", null, io, new HashMap<>());
+      catalog.initialize("c", Map.of(
+          CatalogProperties.WAREHOUSE_LOCATION, WAREHOUSE + "/",
+          LogCatalogProperties.RACE_MIN_WAIT_MS, "0"));
+      catalog.createNamespace(mixedNs);
+
+      assertThat(catalog.createTable(mixed, intSchema).location()).isEqualTo(WAREHOUSE + "/ns/t");
+      assertThat(io.bytes(WAREHOUSE + "/catalog")).as("the catalog object").isNotNull();
+    }
+  }
 }
