@@ -126,6 +126,13 @@ import org.intentlog.wire.LogEnvelope;
  *   <li>An operation whose outcome is unknown took effect entirely or not at all, and a fault was
  *       injected into it, unless a writer compacts with a retention of 0 (which can put a commit
  *       in flight at or below the committed set's horizon).
+ *   <li>History (the 2026-11-17 review's A2): a table's snapshots leave it only across an
+ *       acknowledged or unknown expiry, and never come back; an acknowledged expiry that nothing
+ *       raced and no fault touched removes exactly the snapshots it chose; an operation rejected or
+ *       failed, that nothing preempted, leaves every table's metadata as it was (its JSON, less
+ *       the metadata log), whatever the model holds of it; a re-inlining changes no table's
+ *       metadata but its manifest lists' locations, its location and its metadata log; and a tag
+ *       or branch names the snapshot its operation read.
  *   <li>Every table is in a namespace; every table loads, and reads the same through a reader that
  *       has read nothing before; every snapshot has its manifest list, inline or in a file, and
  *       every manifest exists; a snapshot's manifest list never changes; no table is stored both
@@ -688,6 +695,11 @@ class TestCatalogFaultProperties {
     String metadataLocation = null;
     long lastSequenceNumber = 0;
     final Map<String, Long> sequenceNumbers = new HashMap<>();
+    // Observed at a check, for the history oracles: the table's metadata as JSON, its snapshots'
+    // ids, and the snapshot each ref names.
+    String json = null;
+    final Set<Long> snapshotIds = new TreeSet<>();
+    final Map<String, Long> refIds = new TreeMap<>();
 
     TableState(String uuid, int formatVersion) {
       this.uuid = uuid;
@@ -711,6 +723,9 @@ class TestCatalogFaultProperties {
       copy.metadataLocation = metadataLocation;
       copy.lastSequenceNumber = lastSequenceNumber;
       copy.sequenceNumbers.putAll(sequenceNumbers);
+      copy.json = json;
+      copy.snapshotIds.addAll(snapshotIds);
+      copy.refIds.putAll(refIds);
       return copy;
     }
 
@@ -816,6 +831,9 @@ class TestCatalogFaultProperties {
     final Effect effect;
     // For a catalog transaction's commit: the tables it loaded, as it first loaded them
     Map<TableIdentifier, Loaded> loaded = null;
+    // For an expiry: its table, and the snapshots it chose to expire just before it committed
+    TableIdentifier expiring = null;
+    Set<Long> chosen = null;
 
     Op(String description, Action action, Effect effect) {
       this.description = description;
@@ -911,6 +929,10 @@ class TestCatalogFaultProperties {
     private final InMemoryAppendBlobStore azure;
     private int azureBlocks;
     private Model model;
+    // The catalog as the last check read it, and the snapshots each table (by UUID) lost since it
+    // was created, which never come back
+    private Model lastActual;
+    private final Map<String, Set<Long>> goneSnapshots = new HashMap<>();
     private final StringBuilder trace = new StringBuilder();
     private int nextFile = 0;
     private int nextValue = 0;
@@ -1048,7 +1070,8 @@ class TestCatalogFaultProperties {
       seed.createNamespace(NS);
       create(seed, TABLES.get(0), 3);
       create(seed, TABLES.get(1), 2).newFastAppend().appendFile(newFile()).commit();
-      this.model = actual();
+      this.lastActual = actual();
+      this.model = copy(lastActual);
       trace.append(String.format(
           "modes %s, max update size %d%s, reads %s, gzip writers %s, gc writers %s,"
               + " paging writers %s, writers creating by namespace %s, clocks off by %s ms,"
@@ -1667,6 +1690,8 @@ class TestCatalogFaultProperties {
           String refName = (tag ? "t" : "b") + cmd.b % 2;
           // What the ref holds is observed: it names the current snapshot of the writer's handle
           // when the operation runs, which may be stale. A tag's content must never change after.
+          // The snapshot is the one the operation read (A2)
+          long[] named = {-1};
           return new Op(
               (tag ? "createTag(" : "createBranch(") + id + ", " + refName + ")",
               () -> {
@@ -1675,6 +1700,7 @@ class TestCatalogFaultProperties {
                   throw new ValidationException("%s has no snapshot", id);
                 }
                 long snapshotId = table.currentSnapshot().snapshotId();
+                named[0] = snapshotId;
                 try {
                   if (tag) {
                     table.manageSnapshots().createTag(refName, snapshotId).commit();
@@ -1691,6 +1717,10 @@ class TestCatalogFaultProperties {
                 if (state.branches.containsKey(refName) || state.tags.containsKey(refName)
                     || now == null || !(tag ? now.tags : now.branches).containsKey(refName)) {
                   throw new IllegalStateException("cannot create " + refName);
+                }
+                if (!Objects.equals(now.refIds.get(refName), named[0])) {
+                  throw new IllegalStateException(String.format("%s names snapshot %s, not %d,"
+                      + " which its operation read", refName, now.refIds.get(refName), named[0]));
                 }
                 if (tag) {
                   state.tags.put(refName, new TreeSet<>(now.tags.get(refName)));
@@ -1912,7 +1942,8 @@ class TestCatalogFaultProperties {
             default:
               expired = "by retention";
           }
-          return new Op(
+          Set<Long> chosen = new TreeSet<>();
+          Op expiring = new Op(
               "expireSnapshots(" + id + ", " + expired
                   + (cleanMetadata ? ", cleaning metadata" : "")
                   + (keepFiles ? ", keeping files" : "") + ")",
@@ -1932,6 +1963,9 @@ class TestCatalogFaultProperties {
                 }
                 Statistics.label("expiry").collect(expiry);
                 try {
+                  // What it expires on the table as it is now: what it removes, if nothing races
+                  // it (A2)
+                  expire.apply().forEach(s -> chosen.add(s.snapshotId()));
                   expire.commit();
                 } catch (IllegalArgumentException e) {
                   if (e.getMessage() == null || !e.getMessage().startsWith("Cannot expire ")) {
@@ -1955,6 +1989,9 @@ class TestCatalogFaultProperties {
                   state.ageOutRefs(actual.get(id));
                 }
               });
+          expiring.expiring = id;
+          expiring.chosen = chosen;
+          return expiring;
         case SET_RETENTION:
           // An age of 1 ms expires what it covers at the next expiry; a day, never in a run.
           int setting = cmd.c % 4;
@@ -2328,7 +2365,8 @@ class TestCatalogFaultProperties {
       String must = conflict && (!topLevel || fired.isEmpty())
           ? mustCommit(cmd, w, op, topLevel && !preempting.isEmpty(), topLevel && writes == 0)
           : null;
-      resolve(op, outcome, reason, must);
+      resolve(cmd, op, outcome, reason, must,
+          topLevel && !preempting.isEmpty(), !topLevel || fired.isEmpty());
     }
 
     /**
@@ -2384,7 +2422,8 @@ class TestCatalogFaultProperties {
      * Checks the catalog against the model, given what {@code op} reported; {@code must}, if not
      * null, says why {@code op} must not have been rejected if its model effect applies.
      */
-    private void resolve(Op op, Outcome outcome, String reason, String must) {
+    private void resolve(Cmd cmd, Op op, Outcome outcome, String reason, String must,
+        boolean preempted, boolean faultless) {
       Model actual = actual();
       Model with = copy(model);
       String applies = null;
@@ -2441,6 +2480,59 @@ class TestCatalogFaultProperties {
             state.sequenceNumbers.clear();
             state.sequenceNumbers.putAll(now.sequenceNumbers);
           });
+      checkHistory(cmd, op, outcome, preempted, faultless, actual);
+      lastActual = actual;
+    }
+
+    /**
+     * The history oracles (the 2026-11-17 review's A2), from the last check to {@code actual}:
+     * snapshots leave a table only across an acknowledged or unknown expiry, exactly those it chose
+     * if nothing raced it and no fault touched it, and never come back; an operation rejected or
+     * failed that nothing preempted leaves every table's metadata as it was; a re-inlining changes
+     * none but its manifest lists' locations, its location and its metadata log.
+     */
+    private void checkHistory(Cmd cmd, Op op, Outcome outcome, boolean preempted,
+        boolean faultless, Model actual) {
+      Map<String, TableState> before = new HashMap<>();
+      lastActual.values().forEach(state -> before.put(state.uuid, state));
+      boolean expiry = cmd.kind == Kind.EXPIRE_SNAPSHOTS
+          && (outcome == Outcome.ACKNOWLEDGED || outcome == Outcome.UNKNOWN);
+      for (Map.Entry<TableIdentifier, TableState> e : actual.entrySet()) {
+        TableState now = e.getValue();
+        Set<Long> gone = goneSnapshots.computeIfAbsent(now.uuid, k -> new TreeSet<>());
+        Set<Long> back = new TreeSet<>(now.snapshotIds);
+        back.retainAll(gone);
+        check(back.isEmpty(), "after %s, %s has snapshots %s again, which it lost before", op,
+            e.getKey(), back);
+        TableState was = before.get(now.uuid);
+        if (was == null) {
+          continue;
+        }
+        Set<Long> removed = new TreeSet<>(was.snapshotIds);
+        removed.removeAll(now.snapshotIds);
+        gone.addAll(removed);
+        check(removed.isEmpty() || expiry, "%s (%s) removed snapshots %s of %s, which only an"
+            + " expiry does", op, outcome, removed, e.getKey());
+        if (expiry && outcome == Outcome.ACKNOWLEDGED && !preempted && faultless
+            && e.getKey().equals(op.expiring)) {
+          check(removed.equals(op.chosen), "%s, which nothing raced, chose %s and removed %s",
+              op, op.chosen, removed);
+          Statistics.label("expiry removed what it chose").collect(
+              removed.isEmpty() ? "nothing" : "snapshots");
+        }
+        if ((outcome == Outcome.REJECTED || outcome == Outcome.FAILED) && !preempted) {
+          String then = metadataJson(was.json, false);
+          String nowJson = metadataJson(now.json, false);
+          check(then.equals(nowJson), "%s reported %s, but the metadata of %s changed:%n  %s%n  %s",
+              op, outcome, e.getKey(), then, nowJson);
+        }
+        if (cmd.kind == Kind.REINLINE) {
+          String then = metadataJson(was.json, true);
+          String nowJson = metadataJson(now.json, true);
+          check(then.equals(nowJson), "%s (%s) changed the metadata of %s:%n  %s%n  %s", op,
+              outcome, e.getKey(), then, nowJson);
+        }
+      }
     }
 
     /**
@@ -2534,6 +2626,11 @@ class TestCatalogFaultProperties {
           }
           checkNumbering(id, metadata);
           state = new TableState(metadata.uuid(), metadata.formatVersion());
+          state.json = TableMetadataParser.toJson(metadata);
+          for (Snapshot snapshot : metadata.snapshots()) {
+            state.snapshotIds.add(snapshot.snapshotId());
+          }
+          metadata.refs().forEach((name, ref) -> state.refIds.put(name, ref.snapshotId()));
           check(file.location(id) == null || !file.isInlineTable(id),
               "%s has both a metadata file and inline metadata", id);
           String stored = file.isInlineTable(id) ? "inline" : "metadata file";
@@ -2845,6 +2942,32 @@ class TestCatalogFaultProperties {
   private static final class IsolationViolation extends IllegalStateException {
     IsolationViolation(String message) {
       super(message);
+    }
+  }
+
+  /**
+   * A table's metadata as JSON ({@link TableMetadataParser#toJson}) less its metadata log, which a
+   * commit's storage moves; and with {@code storage} less the table's location and its snapshots'
+   * manifest lists' locations too, which a re-inlining moves (a list file's snapshot comes back
+   * inline).
+   */
+  private static String metadataJson(String json, boolean storage) {
+    try {
+      com.fasterxml.jackson.databind.node.ObjectNode node =
+          (com.fasterxml.jackson.databind.node.ObjectNode)
+              org.apache.iceberg.util.JsonUtil.mapper().readTree(json);
+      node.remove("metadata-log");
+      if (storage) {
+        node.remove("location");
+        if (node.has("snapshots")) {
+          for (com.fasterxml.jackson.databind.JsonNode snapshot : node.get("snapshots")) {
+            ((com.fasterxml.jackson.databind.node.ObjectNode) snapshot).remove("manifest-list");
+          }
+        }
+      }
+      return org.apache.iceberg.util.JsonUtil.mapper().writeValueAsString(node);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
     }
   }
 

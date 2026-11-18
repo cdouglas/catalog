@@ -393,10 +393,25 @@ public final class CheckpointRoundTrip {
     if (before == null || before.length == 0) {
       return null;
     }
-    SortedMap<String, String> expected = contents(CatalogTestSupport.replay(before));
+    Replica<CatalogState> replayed = CatalogTestSupport.replay(before);
+    SortedMap<String, String> expected = contents(replayed);
     SortedMap<String, String> actual = contents(CatalogTestSupport.checkpointOf(after));
     if (expected.equals(actual)) {
-      return null;
+      // and byte for byte: the checkpoint's state and committed set are the encodings of that
+      // replay's (I11, roots byte-equal; docs/SNAPSHOT_PAGING.md "Testing"), so no field outside
+      // contents differs either (a checkpoint stored apart names the position it covers too)
+      LogEnvelope.Checkpoint written =
+          LogEnvelope.decodeCheckpoint(AtomicFileLog.decode(after).checkpoint().orElseThrow());
+      byte[] state = CatalogStateMachine.INSTANCE.encodeCheckpoint(replayed.state());
+      byte[] committed = replayed.committed().bytes();
+      if (java.util.Arrays.equals(state, written.state())
+          && java.util.Arrays.equals(committed, written.committed())) {
+        return null;
+      }
+      return String.format("the compaction's checkpoint (state %s, committed set %s) is not the"
+          + " encoding of a replay of the version it replaced (state %s, committed set %s), though"
+          + " they hold the same", fingerprint(written.state()), fingerprint(written.committed()),
+          fingerprint(state), fingerprint(committed));
     }
     TreeSet<String> items = new TreeSet<>(expected.keySet());
     items.addAll(actual.keySet());
@@ -659,6 +674,21 @@ public final class CheckpointRoundTrip {
                         items.put(
                             "table " + id + " snapshot " + snapshot + " manifests",
                             paths.toString())));
+    // Snapshot paging (docs/SNAPSHOT_PAGING.md): B and W, and each table's sealed blocks as the
+    // root keeps them, outside its inline bytes
+    items.put("snapshot paging", file.snapshotBlock() + "/" + file.snapshotWindow());
+    file.allSealedBlocks()
+        .forEach(
+            (id, blocks) ->
+                blocks.forEach(
+                    (block, sealed) ->
+                        items.put(
+                            "table " + id + " sealed block " + block,
+                            String.format(
+                                "block=%d version=%d digest=%s merkle-root=%s leaves=%d live=%s",
+                                sealed.block, sealed.version, hex(ByteBuffer.wrap(sealed.digest)),
+                                hex(ByteBuffer.wrap(sealed.merkleRoot)), sealed.leaves,
+                                java.util.Arrays.toString(sealed.liveIds)))));
     items.put("conflict encoding", String.valueOf(file.conflictEncodingName()));
     EncodingState.Codec codec = file.conflictEncoding().stateCodec();
     file.conflictStates()
