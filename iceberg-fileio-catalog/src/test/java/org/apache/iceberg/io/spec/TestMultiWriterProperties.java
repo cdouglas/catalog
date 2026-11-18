@@ -48,6 +48,7 @@ import org.apache.iceberg.exceptions.CommitStateUnknownException;
 import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
+import org.apache.iceberg.exceptions.NoSuchViewException;
 import org.apache.iceberg.io.CatalogLog;
 import org.apache.iceberg.io.CatalogMutation;
 import org.apache.iceberg.io.CatalogTestSupport;
@@ -127,7 +128,8 @@ import org.intentlog.fileio.AtomicFileLog;
  * and freed (creates, drops and renames of a few names, namespace creates and drops), on a shared
  * log of blind appends, where a record that replay rejects still lands, and lands a copy of each
  * rejected create or rename again once its names are free: it must stay rejected (the ABA a
- * namespace's removals stop, SPEC.md "Action Verification Rules").
+ * namespace's removals stop, SPEC.md "Action Verification Rules"), whichever kind took the name
+ * and whichever freed it, a table or a view (docs/VIEWS.md V7).
  */
 class TestMultiWriterProperties {
 
@@ -162,8 +164,9 @@ class TestMultiWriterProperties {
   private static final Universe EVERY_NAME = new Universe(NAMESPACES, TABLE_NAMES);
   /**
    * The seed's two namespaces and a child namespace that starts absent, and one name to create in
-   * each (beside the seed's tables, {@code t}): a run binds and frees the same few names again and
-   * again, and writers that read before one landed create it together.
+   * each (beside the seed's tables, {@code t}), which the seed's view holds in the second: a run
+   * binds and frees the same few names again and again, as tables and views, and writers that read
+   * before one landed create it together.
    */
   private static final Universe FEW_NAMES = new Universe(
       List.of(Namespace.of("a"), Namespace.of("b"), Namespace.of("a", "x")), List.of("u"));
@@ -335,7 +338,8 @@ class TestMultiWriterProperties {
         Arbitraries.frequency(
             Tuple.of(3, OpKind.CREATE_TABLE), Tuple.of(2, OpKind.DROP_TABLE),
             Tuple.of(2, OpKind.RENAME_TABLE), Tuple.of(2, OpKind.CREATE_NAMESPACE),
-            Tuple.of(2, OpKind.DROP_NAMESPACE)));
+            Tuple.of(2, OpKind.DROP_NAMESPACE), Tuple.of(3, OpKind.CREATE_VIEW),
+            Tuple.of(2, OpKind.DROP_VIEW), Tuple.of(2, OpKind.RENAME_VIEW)));
   }
 
   private static Arbitrary<List<Cmd>> schedules(Arbitrary<Step> steps, Arbitrary<OpKind> ops) {
@@ -394,7 +398,13 @@ class TestMultiWriterProperties {
     /** Sets a property of an inline table, by a delta. */
     SET_TABLE_PROPERTY,
     /** Moves an inline table's location, by a delta. */
-    SET_TABLE_LOCATION
+    SET_TABLE_LOCATION,
+    /** Creates a view of a table name, its metadata in a file or inline (docs/VIEWS.md). */
+    CREATE_VIEW,
+    /** A view's whole next metadata, in a file or inline: it may change form. */
+    UPDATE_VIEW,
+    DROP_VIEW,
+    RENAME_VIEW
   }
 
   /**
@@ -509,6 +519,28 @@ class TestMultiWriterProperties {
       return new Op(OpKind.RENAME_TABLE, null, from, to, null, null, null, null);
     }
 
+    /**
+     * A view's create or update to {@code location}: a metadata file's, or with {@code inline} the
+     * location its inline metadata holds; for an update, {@code base} is the view as the writer
+     * read it ({@link View#viewValue}).
+     */
+    static Op view(OpKind kind, TableIdentifier view, String location, boolean inline,
+        String base) {
+      Op op = new Op(kind, null, view, null, null, inline ? View.INLINE + location : location,
+          base, null);
+      op.viewMetadata = inline
+          ? CatalogTestSupport.newInlineView(location, "select " + location)
+          : CatalogTestSupport.pointerView(location);
+      return op;
+    }
+
+    static Op viewOp(OpKind kind, TableIdentifier view, TableIdentifier to) {
+      return new Op(kind, null, view, to, null, null, null, null);
+    }
+
+    // A view's metadata, for a create or update
+    CatalogState.ViewMetadataRef viewMetadata = null;
+
     void stage(CatalogMutation mut) {
       switch (kind) {
         case CREATE_NAMESPACE:
@@ -549,6 +581,18 @@ class TestMultiWriterProperties {
           break;
         case READ_TABLE:
           mut.readTable(table);
+          break;
+        case CREATE_VIEW:
+          mut.createView(table, viewMetadata);
+          break;
+        case UPDATE_VIEW:
+          mut.updateView(table, viewMetadata);
+          break;
+        case DROP_VIEW:
+          mut.dropView(table);
+          break;
+        case RENAME_VIEW:
+          mut.renameView(table, to);
           break;
         default:
           throw new IllegalStateException("Unknown op " + kind);
@@ -610,13 +654,29 @@ class TestMultiWriterProperties {
           break;
         case READ_TABLE:
           break;
+        case CREATE_VIEW:
+        case UPDATE_VIEW:
+          view.views.put(table, value);
+          break;
+        case DROP_VIEW:
+          view.views.remove(table);
+          break;
+        case RENAME_VIEW:
+          view.views.put(to, view.views.remove(table));
+          break;
         default:
           throw new IllegalStateException("Unknown op " + kind);
       }
     }
 
-    /** Iceberg's base-metadata check: an update or read needs the table it saw. */
+    /**
+     * Iceberg's base-metadata check: an update or read needs the table it saw, a view's update the
+     * view.
+     */
     boolean baseHolds(CatalogState state) {
+      if (kind == OpKind.UPDATE_VIEW) {
+        return base.equals(View.viewValue(state, table));
+      }
       return base == null || base.equals(state.location(table));
     }
 
@@ -634,6 +694,14 @@ class TestMultiWriterProperties {
           return String.format("removeProperty(%s, %s)", namespace, key);
         case RENAME_TABLE:
           return String.format("renameTable(%s, %s)", table, to);
+        case RENAME_VIEW:
+          return String.format("renameView(%s, %s)", table, to);
+        case DROP_VIEW:
+          return String.format("dropView(%s)", table);
+        case CREATE_VIEW:
+        case UPDATE_VIEW:
+          return String.format("%s(%s, %s)", kind == OpKind.CREATE_VIEW ? "createView" : "updateView",
+              table, value);
         case SET_TABLE_PROPERTY:
           return String.format("setTableProperty(%s, %s=%s)", table, key, value);
         case CREATE_TABLE:
@@ -655,6 +723,19 @@ class TestMultiWriterProperties {
     final Map<TableIdentifier, String> tables = new TreeMap<>(TABLE_ORDER);
     // an inline table's properties, of KEYS
     final Map<TableIdentifier, Map<String, String>> tableProperties = new TreeMap<>(TABLE_ORDER);
+    // a view's metadata location, or INLINE and the location its inline metadata holds
+    final Map<TableIdentifier, String> views = new TreeMap<>(TABLE_ORDER);
+
+    /** A view of {@code state} as the model holds it; null if there is none. */
+    static String viewValue(CatalogState state, TableIdentifier view) {
+      CatalogState.ViewEntry entry = state.viewEntry(view);
+      if (entry == null) {
+        return null;
+      }
+      return entry.isInline()
+          ? INLINE + CatalogTestSupport.inlineViewLocation(state, view)
+          : entry.metadataLocation;
+    }
 
     static View of(CatalogState state) {
       View view = new View();
@@ -671,6 +752,9 @@ class TestMultiWriterProperties {
         } else {
           view.tables.put(t, state.location(t));
         }
+      }
+      for (TableIdentifier v : state.views()) {
+        view.views.put(v, viewValue(state, v));
       }
       return view;
     }
@@ -689,6 +773,11 @@ class TestMultiWriterProperties {
         contents.put("table " + t, inline != null
             ? org.apache.iceberg.TableMetadataParser.toJson(inline) : state.location(t));
       }
+      for (TableIdentifier v : state.views()) {
+        CatalogState.ViewEntry entry = state.viewEntry(v);
+        contents.put("view " + v, entry.version + " " + (entry.isInline()
+            ? Arrays.toString(entry.inlineMetadata()) : entry.metadataLocation));
+      }
       return contents;
     }
 
@@ -697,6 +786,7 @@ class TestMultiWriterProperties {
       namespaces.forEach((ns, props) -> view.namespaces.put(ns, new TreeMap<>(props)));
       view.tables.putAll(tables);
       tableProperties.forEach((t, props) -> view.tableProperties.put(t, new TreeMap<>(props)));
+      view.views.putAll(views);
       return view;
     }
 
@@ -713,6 +803,14 @@ class TestMultiWriterProperties {
           return "table " + t + " has no namespace";
         }
       }
+      for (TableIdentifier v : views.keySet()) {
+        if (!namespaces.containsKey(v.namespace())) {
+          return "view " + v + " has no namespace";
+        }
+        if (tables.containsKey(v)) {
+          return v + " is a table and a view";
+        }
+      }
       return null;
     }
 
@@ -721,18 +819,20 @@ class TestMultiWriterProperties {
       return o instanceof View
           && namespaces.equals(((View) o).namespaces)
           && tables.equals(((View) o).tables)
-          && tableProperties.equals(((View) o).tableProperties);
+          && tableProperties.equals(((View) o).tableProperties)
+          && views.equals(((View) o).views);
     }
 
     @Override
     public int hashCode() {
-      return Objects.hash(namespaces, tables, tableProperties);
+      return Objects.hash(namespaces, tables, tableProperties, views);
     }
 
     @Override
     public String toString() {
       return "namespaces=" + namespaces + " tables=" + tables
-          + (tableProperties.isEmpty() ? "" : " table properties=" + tableProperties);
+          + (tableProperties.isEmpty() ? "" : " table properties=" + tableProperties)
+          + (views.isEmpty() ? "" : " views=" + views);
     }
   }
 
@@ -887,6 +987,10 @@ class TestMultiWriterProperties {
       seed.createTableInline(TableIdentifier.of("b", "t"),
           CatalogTestSupport.newInlineTable("mem:///b/t/seed"),
           CatalogTestSupport.inlineTableCodec());
+      // A view, inline, of a name the writers create tables and views of (a writer's update may
+      // move it to a file)
+      seed.createView(TableIdentifier.of("b", "u"),
+          CatalogTestSupport.newInlineView("mem:///b.u/seed", "select seed"));
       seed.commit(seedLog);
       int seedLength = storage.liveBytes().length;
       long maxAppendSize =
@@ -1194,10 +1298,13 @@ class TestMultiWriterProperties {
         boolean free;
         switch (op.kind) {
           case CREATE_TABLE:
-            free = !state.containsTable(op.table) && state.containsNamespace(op.table.namespace());
+          case CREATE_VIEW:
+            // tables and views share a namespace's names
+            free = !state.nameTaken(op.table) && state.containsNamespace(op.table.namespace());
             break;
           case RENAME_TABLE:
-            free = !state.containsTable(op.to) && state.containsNamespace(op.to.namespace());
+          case RENAME_VIEW:
+            free = !state.nameTaken(op.to) && state.containsNamespace(op.to.namespace());
             break;
           case CREATE_NAMESPACE:
             Namespace parent = parentOf(op.namespace);
@@ -1214,10 +1321,14 @@ class TestMultiWriterProperties {
       return true;
     }
 
-    /** Whether {@code ops} bind a name: create a table or a namespace, or rename a table. */
+    /**
+     * Whether {@code ops} bind a name: create a table, a view or a namespace, or rename a table or
+     * a view.
+     */
     private static boolean bindsAName(List<Op> ops) {
       return ops.stream().anyMatch(op -> op.kind == OpKind.CREATE_TABLE
-          || op.kind == OpKind.CREATE_NAMESPACE || op.kind == OpKind.RENAME_TABLE);
+          || op.kind == OpKind.CREATE_NAMESPACE || op.kind == OpKind.RENAME_TABLE
+          || op.kind == OpKind.CREATE_VIEW || op.kind == OpKind.RENAME_VIEW);
     }
 
     /** Whether {@code op} updates a table: a metadata file, or a delta. */
@@ -1232,6 +1343,8 @@ class TestMultiWriterProperties {
       namespaces.sort(NS_ORDER);
       List<TableIdentifier> tables = new ArrayList<>(snap.tables());
       tables.sort(TABLE_ORDER);
+      List<TableIdentifier> views = new ArrayList<>(snap.views());
+      views.sort(TABLE_ORDER);
       String value = "v" + nextValue++;
       switch (cmd.op) {
         case CREATE_NAMESPACE:
@@ -1274,6 +1387,25 @@ class TestMultiWriterProperties {
           return Op.table(cmd.op, t, location, snap.location(t));
         case RENAME_TABLE:
           return Op.rename(pick(tables, universe.tables, cmd.a), pick(universe.tables, cmd.b));
+        case CREATE_VIEW: {
+          // a view of a table name: the two kinds share a namespace's names
+          TableIdentifier view = TableIdentifier.of(
+              pick(namespaces, universe.namespaces, cmd.a), pick(universe.tableNames, cmd.b));
+          return Op.view(cmd.op, view, "mem:///" + view + "/" + value, cmd.b / 2 % 2 == 1, null);
+        }
+        case UPDATE_VIEW: {
+          TableIdentifier view = pick(views, universe.tables, cmd.a);
+          String base = View.viewValue(snap, view);
+          if (base == null) {
+            return null; // Iceberg updates a view it loaded
+          }
+          return Op.view(cmd.op, view, "mem:///" + view + "/" + value, cmd.b % 2 == 1, base);
+        }
+        case DROP_VIEW:
+          return Op.viewOp(cmd.op, pick(views, universe.tables, cmd.a), null);
+        case RENAME_VIEW:
+          return Op.viewOp(
+              cmd.op, pick(views, universe.tables, cmd.a), pick(universe.tables, cmd.b));
         default:
           throw new IllegalStateException("Unknown op " + cmd.op);
       }
@@ -1304,7 +1436,8 @@ class TestMultiWriterProperties {
         ctx.active = true;
         mut(w.snapshot, ops, w.condition).commit(log);
         outcome = Outcome.ACKNOWLEDGED;
-      } catch (CommitFailedException | AlreadyExistsException | NoSuchTableException e) {
+      } catch (CommitFailedException | AlreadyExistsException | NoSuchTableException
+          | NoSuchViewException e) {
         outcome = Outcome.REJECTED;
         reason = " (" + e.getClass().getSimpleName() + ")";
       } catch (CommitStateUnknownException e) {
@@ -1501,6 +1634,7 @@ class TestMultiWriterProperties {
       } catch (AlreadyExistsException
           | NoSuchNamespaceException
           | NoSuchTableException
+          | NoSuchViewException
           | NamespaceNotEmptyException
           | IllegalArgumentException
           | IllegalStateException e) {

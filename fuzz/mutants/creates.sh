@@ -38,7 +38,7 @@ mutant() { # name main-dir test-dir
       return \"name: a name freed since\";
     }" "" ;;
     # a create by name holds whether or not its name is taken
-    noabsence) mutate $M/ProtoCodec.java "    if (table ? builder.tableNameTaken(nsId, name) : builder.namespaceNameTaken(nsId, name)) {
+    noabsence) mutate $M/ProtoCodec.java "    if (nameTaken(builder, nsId, kind, name)) {
       return \"name: taken\";
     }" "" ;;
     # a table's drop frees its name without counting it

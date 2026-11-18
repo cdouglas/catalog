@@ -1198,6 +1198,232 @@ public class TestCatalogRegressions {
   // CommitStateUnknownException when it cannot tell. Found by
   // TestMultiWriterProperties with fault injection.
   // ============================================================
+  // Views (docs/VIEWS.md "Testing")
+  // ============================================================
+
+  /**
+   * Views share a namespace's names with tables (V7), conflict on their version, bump the
+   * namespace a drop of it names (V8), move between a file and inline as their writers do (V2,
+   * V3), and leave a pointer view's file only where its drop's outcome is unknown (V9).
+   */
+  @Nested
+  class Views {
+    private final Namespace ns = Namespace.of("ns");
+    private final TableIdentifier v = TableIdentifier.of(ns, "v");
+    private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+
+    private org.apache.iceberg.view.View createView(LogCatalog catalog, TableIdentifier id,
+        String sql, Map<String, String> properties) {
+      return catalog.buildView(id)
+          .withSchema(SCHEMA)
+          .withDefaultNamespace(id.namespace())
+          .withQuery("spark", sql)
+          .withProperties(properties)
+          .create();
+    }
+
+    private org.apache.iceberg.view.ViewMetadata metadata(org.apache.iceberg.view.View view) {
+      return ((org.apache.iceberg.view.BaseView) view).operations().current();
+    }
+
+    /**
+     * A table create staged on a read, then another writer creates a view of its name: the
+     * table's record is rejected, with Iceberg's message for the kind that holds the name; and
+     * the other way around.
+     */
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "CAS", "MEMLOG", "AZLOG", "CAS_TM"})
+    void aTableAndAViewOfOneNameRacingLandOne(LocalCatalogMode mode) {
+      LogCatalog writer = mode.catalog(io, WAREHOUSE, "c", Map.of());
+      writer.createNamespace(ns);
+      LogCatalog other = mode.catalog(io, WAREHOUSE, "c", Map.of());
+      CatalogMutation table = new CatalogMutation(writer.log().read())
+          .createTable(v, WAREHOUSE + "/ns/v/metadata/staged.metadata.json");
+      createView(other, v, "select 1", Map.of());
+
+      assertThatThrownBy(() -> table.commit(writer.log()))
+          .isInstanceOf(AlreadyExistsException.class)
+          .hasMessage("View with same name already exists: ns.v");
+      assertThat(writer.tableExists(v)).isFalse();
+      assertThat(writer.viewExists(v)).isTrue();
+
+      TableIdentifier t = TableIdentifier.of(ns, "t");
+      CatalogMutation view = new CatalogMutation(writer.log().read())
+          .createView(t, CatalogState.ViewMetadataRef.location(WAREHOUSE + "/ns/t/v.json"));
+      other.createTable(t, SCHEMA);
+
+      assertThatThrownBy(() -> view.commit(writer.log()))
+          .isInstanceOf(AlreadyExistsException.class)
+          .hasMessage("Table with same name already exists: ns.t");
+      assertThat(writer.viewExists(t)).isFalse();
+      assertThat(writer.tableExists(t)).isTrue();
+      mode.assertCommitPolicy(io);
+    }
+
+    /**
+     * The cross-kind create ABA: a table create rejected because a view held its name, its record
+     * on a shared log, then the view dropped (its name free again), then a late copy of the
+     * rejected record: it changes nothing.
+     */
+    @Test
+    void aLateCopyOfATableCreateAfterTheViewIsDroppedChangesNothing() {
+      LogCatalog writer = LocalCatalogMode.MEMLOG.catalog(io, WAREHOUSE, "c", Map.of());
+      writer.createNamespace(ns);
+      CatalogMutation staged = new CatalogMutation(writer.log().read())
+          .createTable(v, WAREHOUSE + "/ns/v/metadata/staged.metadata.json");
+      createView(writer, v, "select 1", Map.of());
+      assertThatThrownBy(() -> staged.commit(writer.log()))
+          .isInstanceOf(AlreadyExistsException.class);
+      InMemorySharedLog shared = LocalCatalogMode.sharedLog(io, WAREHOUSE + "/catalog-c");
+      byte[] rejected = shared.records().get(shared.records().size() - 1);
+      assertThat(writer.dropView(v)).isTrue();
+
+      shared.append(rejected, null);
+
+      LogCatalog reader = LocalCatalogMode.MEMLOG.catalog(io, WAREHOUSE, "c", Map.of());
+      assertThat(reader.tableExists(v)).isFalse();
+      assertThat(reader.viewExists(v)).isFalse();
+    }
+
+    /**
+     * A namespace drop staged on a read of the empty namespace, then a view created in it: the
+     * view's create bumped the namespace's version, which the drop names, so it is rejected (V8);
+     * and the catalog's drop, on a fresh read, finds the namespace not empty.
+     */
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "CAS", "MEMLOG", "AZLOG"})
+    void aNamespaceDropRacingAViewCreateIsRejected(LocalCatalogMode mode) {
+      LogCatalog writer = mode.catalog(io, WAREHOUSE, "c", Map.of());
+      writer.createNamespace(ns);
+      CatalogMutation drop = new CatalogMutation(writer.log().read()).dropNamespace(ns);
+      createView(mode.catalog(io, WAREHOUSE, "c", Map.of()), v, "select 1", Map.of());
+
+      assertThatThrownBy(() -> drop.commit(writer.log()))
+          .isInstanceOf(CommitFailedException.class);
+      assertThat(writer.namespaceExists(ns)).isTrue();
+      assertThatThrownBy(() -> writer.dropNamespace(ns))
+          .isInstanceOf(NamespaceNotEmptyException.class);
+      assertThat(writer.viewExists(v)).isTrue();
+    }
+
+    /**
+     * One view written by an inline writer and a pointer writer in turn: each commit carries the
+     * whole view, in its writer's form (V2, V3), and both read every version alike.
+     */
+    @ParameterizedTest
+    @EnumSource(names = {"CAS", "APPEND", "MEMLOG", "AZLOG"})
+    void aViewMovesBetweenAFileAndInlineAsItsWritersDo(LocalCatalogMode pointerMode) {
+      LocalCatalogMode inlineMode = pointerMode == LocalCatalogMode.CAS ? LocalCatalogMode.CAS_TM
+          : pointerMode == LocalCatalogMode.APPEND ? LocalCatalogMode.APPEND_TM
+          : pointerMode == LocalCatalogMode.MEMLOG ? LocalCatalogMode.MEMLOG_TM
+          : LocalCatalogMode.AZLOG_TM;
+      LogCatalog inline = inlineMode.catalog(io, WAREHOUSE, "c", Map.of());
+      LogCatalog pointer = pointerMode.catalog(io, WAREHOUSE, "c", Map.of());
+      inline.createNamespace(ns);
+      createView(inline, v, "select 1", Map.of());
+      assertThat(stored(inline)).isEqualTo("inline");
+
+      pointer.loadView(v).replaceVersion()
+          .withSchema(SCHEMA).withDefaultNamespace(ns).withQuery("spark", "select 2").commit();
+      assertThat(stored(inline)).isEqualTo("file");
+      inline.loadView(v).updateProperties().set("k", "x").commit();
+      assertThat(stored(inline)).isEqualTo("inline");
+      pointer.loadView(v).replaceVersion()
+          .withSchema(SCHEMA).withDefaultNamespace(ns).withQuery("spark", "select 3").commit();
+      assertThat(stored(inline)).isEqualTo("file");
+
+      for (LogCatalog reader : List.of(inline, pointer)) {
+        org.apache.iceberg.view.View view = reader.loadView(v);
+        assertThat(view.sqlFor("spark").sql()).isEqualTo("select 3");
+        assertThat(view.currentVersion().versionId()).isEqualTo(3);
+        assertThat(view.versions()).hasSize(3);
+        assertThat(view.properties()).containsEntry("k", "x");
+        assertThat(view.history()).hasSize(3);
+      }
+      assertThat(inline.log().read().state().viewVersion(1)).isEqualTo(4);
+    }
+
+    private String stored(LogCatalog catalog) {
+      return catalog.log().read().state().viewEntry(v).isInline() ? "inline" : "file";
+    }
+
+    /**
+     * A pointer view's metadata file is deleted once its drop has landed ({@code gc.enabled}, by
+     * default), and kept when the drop's outcome is unknown: the drop may yet land, or not.
+     */
+    @Test
+    void aPointerViewsFileGoesWithAnAcknowledgedDropOnly() {
+      LogCatalog catalog = LocalCatalogMode.CAS.catalog(io, WAREHOUSE, "c", Map.of());
+      catalog.createNamespace(ns);
+      String file = metadata(createView(catalog, v, "select 1", Map.of())).metadataFileLocation();
+      assertThat(io.newInputFile(file).exists()).isTrue();
+
+      io.injectFaults((location, strategy) -> Fault.FAIL_BEFORE);
+      try {
+        assertThatThrownBy(() -> catalog.dropView(v))
+            .isInstanceOf(CommitStateUnknownException.class);
+      } finally {
+        io.injectFaults((location, strategy) -> Fault.NONE);
+      }
+      assertThat(catalog.viewExists(v)).as("FAIL_BEFORE lands nothing").isTrue();
+      assertThat(io.newInputFile(file).exists()).as("kept: the outcome was unknown").isTrue();
+
+      assertThat(catalog.dropView(v)).isTrue();
+      assertThat(io.newInputFile(file).exists()).as("deleted: the drop landed").isFalse();
+    }
+
+    /**
+     * An inline view dropped with {@code gc.enabled} false is written to a file first, which
+     * {@code registerView} brings back (V9); with gc enabled, nothing is written.
+     */
+    @Test
+    void anInlineViewKeptByItsDropIsRegisteredAgain() {
+      LogCatalog catalog = LocalCatalogMode.CAS_TM.catalog(io, WAREHOUSE, "c", Map.of());
+      catalog.createNamespace(ns);
+      org.apache.iceberg.view.View kept = createView(catalog, v, "select 1",
+          Map.of(org.apache.iceberg.TableProperties.GC_ENABLED, "false"));
+      TableIdentifier gone = TableIdentifier.of(ns, "gone");
+      org.apache.iceberg.view.View collected = createView(catalog, gone, "select 2", Map.of());
+
+      assertThat(catalog.dropView(gone)).isTrue();
+      assertThat(io.listPrefix(collected.location() + "/metadata/")).isEmpty();
+      assertThat(catalog.dropView(v)).isTrue();
+      List<String> files = new ArrayList<>();
+      io.listPrefix(kept.location() + "/metadata/").forEach(info -> files.add(info.location()));
+      assertThat(files).hasSize(1);
+
+      org.apache.iceberg.view.View registered = catalog.registerView(v, files.get(0));
+      assertThat(registered.sqlFor("spark").sql()).isEqualTo("select 1");
+      assertThat(registered.versions()).isEqualTo(kept.versions());
+      assertThat(stored(catalog)).isEqualTo("file");
+    }
+
+    /**
+     * Two replaces of one view staged on one read: the second is rejected at replay, whatever the
+     * catalog's conflict encoding (V6), and Iceberg's replace retries it on a fresh read.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"lamport", "concern-vector", "manifest-window"})
+    void aViewUpdateAppliesOnlyOnTheVersionItRead(String encoding) {
+      LogCatalog catalog = LocalCatalogMode.MEMLOG_TM.catalog(io, WAREHOUSE, "c",
+          Map.of(LogCatalogProperties.CONFLICT_ENCODING, encoding));
+      catalog.createNamespace(ns);
+      createView(catalog, v, "select 1", Map.of());
+      Replica<CatalogState> read = catalog.log().read();
+      CatalogMutation first = new CatalogMutation(read)
+          .updateView(v, CatalogState.ViewMetadataRef.location(WAREHOUSE + "/ns/v/a.json"));
+      CatalogMutation second = new CatalogMutation(read)
+          .updateView(v, CatalogState.ViewMetadataRef.location(WAREHOUSE + "/ns/v/b.json"));
+      first.commit(catalog.log());
+
+      assertThatThrownBy(() -> second.commit(catalog.log()))
+          .isInstanceOf(CommitFailedException.class);
+      assertThat(catalog.log().read().state().viewEntry(v).metadataLocation)
+          .isEqualTo(WAREHOUSE + "/ns/v/a.json");
+    }
+  }
+
+  // ============================================================
 
   @Nested
   class AmbiguousWrites {

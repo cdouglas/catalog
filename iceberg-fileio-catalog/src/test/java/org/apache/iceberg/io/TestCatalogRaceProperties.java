@@ -82,9 +82,11 @@ import org.intentlog.wire.LogEnvelope;
  * writes.
  *
  * <p>The operations are namespace creates (of nested namespaces too, which create their parents),
- * drops and property changes; table creates, drops, renames and property changes; and appends and
+ * drops and property changes; table creates, drops, renames and property changes; appends and
  * deletes of every row, which Iceberg retries on a conflict as it does a property change (unlike
- * a schema change). They run on a small universe of names, from a generated catalog state; each
+ * a schema change); and view creates (of the names tables take: the two kinds share a namespace's
+ * names, docs/VIEWS.md), drops, renames, property changes and replaces, which Iceberg's view
+ * updates retry on a conflict too. They run on a small universe of names, from a generated catalog state; each
  * writer has its own catalog mode, and binds the names it creates by name or by the namespace's
  * version, as drawn ({@code fileio.catalog.create.condition}); on Append Blobs, the race's
  * segments may take small blocks, so that some records are over the log's bound and their inline
@@ -113,6 +115,13 @@ class TestCatalogRaceProperties {
           TableIdentifier.of(Namespace.of("a"), "u"),
           TableIdentifier.of(Namespace.of("b"), "t"),
           TableIdentifier.of(Namespace.of("a", "c"), "t"));
+  /** The names views take: two of their own, and two of tables', which they collide with. */
+  private static final List<TableIdentifier> VIEW_NAMES =
+      List.of(
+          TableIdentifier.of(Namespace.of("a"), "v"),
+          TableIdentifier.of(Namespace.of("b"), "v"),
+          TableIdentifier.of(Namespace.of("a"), "t"),
+          TableIdentifier.of(Namespace.of("a"), "u"));
   private static final List<String> KEYS = List.of("k1", "k2");
 
   @Provide
@@ -131,7 +140,7 @@ class TestCatalogRaceProperties {
   void aTransactionThatDroppedATableNotYetCreatedSerializesBeforeTheCreate() {
     aRaceEndsAsASerialRun(LocalCatalogMode.COMPACT, LocalCatalogMode.COMPACT_TM,
         LocalCatalogMode.COMPACT_TM, LocalCatalogMode.APPEND, LocalCatalogMode.Log.OBJECT,
-        new Setup(5, 0, 10, 0, 8), new Op(Kind.CATALOG_TXN, 17, 0), new Op(Kind.CREATE_TABLE, 0, 0),
+        new Setup(5, 0, 10, 0, 8, 0), new Op(Kind.CATALOG_TXN, 17, 0), new Op(Kind.CREATE_TABLE, 0, 0),
         new Op(null, 0, 0), false, true, List.of(0L, 300L, 3L, 0L), "partition-vector",
         InMemoryAtomicFileIO.ReadMode.SPLICE, true, true, false, LocalCatalogMode.CAS,
         new Op(null, 0, 0), false, 13, 0);
@@ -390,6 +399,9 @@ class TestCatalogRaceProperties {
       raceA = a.run(writerA, "A", handle);
     } finally {
       CommitTrace.close();
+    }
+    if (a.kind.name().contains("VIEW")) {
+      Statistics.label("A's view operation").collect(a.kind + " " + raceA.split(" ")[0]);
     }
     io.injectFaults((location, strategy) -> Fault.NONE);
     io.injectReadFaults(location -> InMemoryAtomicFileIO.ReadFault.NONE);
@@ -703,7 +715,7 @@ class TestCatalogRaceProperties {
     LocalCatalogMode storage = fileModeA.inlineML ? LocalCatalogMode.APPEND_ML
         : fileModeA.inlineTM ? LocalCatalogMode.APPEND_TM : LocalCatalogMode.APPEND;
     // every namespace and table, each table with a snapshot
-    Setup setup = new Setup(7, 0, 15, 2, 15);
+    Setup setup = new Setup(7, 0, 15, 2, 15, 0);
     Op a = new Op(Kind.CATALOG_TXN, x, y);
     Op b = new Op(racerB, x, x + y);
     Op c = twoRacers ? new Op(racerC, y, x) : new Op(null, 0, 0);
@@ -759,7 +771,9 @@ class TestCatalogRaceProperties {
             Arbitraries.integers().between(0, 7),
             Arbitraries.integers().between(0, 15),
             Arbitraries.of(2, 4, 6),
-            Arbitraries.integers().between(0, 15))
+            Arbitraries.integers().between(0, 15),
+            // every view name half the time, so most view operations find a view
+            Arbitraries.oneOf(Arbitraries.just(15), Arbitraries.integers().between(0, 15)))
         .as(Setup::new);
   }
 
@@ -799,9 +813,10 @@ class TestCatalogRaceProperties {
   }
 
   /**
-   * The namespaces in bitmask {@code namespaces}, those in {@code props} with k1, and tables; after
-   * {@code filler} commits that leave nothing (a namespace outside the operations' names created
-   * and dropped), so that the committed set holds enough ids for blocks to seal.
+   * The namespaces in bitmask {@code namespaces}, those in {@code props} with k1, tables, and views
+   * of the names of {@link #VIEW_NAMES} in {@code views} that no table takes; after {@code filler} commits that leave nothing
+   * (a namespace outside the operations' names created and dropped), so that the committed set
+   * holds enough ids for blocks to seal.
    */
   static final class Setup {
     final int namespaces;
@@ -810,13 +825,15 @@ class TestCatalogRaceProperties {
     final int filler;
     /** The tables that hold a snapshot (a file appended) before the race. */
     final int seeded;
+    final int views;
 
-    Setup(int namespaces, int props, int tables, int filler, int seeded) {
+    Setup(int namespaces, int props, int tables, int filler, int seeded, int views) {
       this.namespaces = namespaces;
       this.props = props;
       this.tables = tables;
       this.filler = filler;
       this.seeded = seeded;
+      this.views = views;
     }
 
     void apply(LogCatalog catalog) {
@@ -849,12 +866,29 @@ class TestCatalogRaceProperties {
           }
         }
       }
+      for (int i = 0; i < VIEW_NAMES.size(); i++) {
+        TableIdentifier id = VIEW_NAMES.get(i);
+        if ((views >> i & 1) == 1 && catalog.namespaceExists(id.namespace())
+            && !catalog.tableExists(id)) {
+          buildView(catalog, id, "setup").create();
+        }
+      }
     }
 
     @Override
     public String toString() {
       return state(this);
     }
+  }
+
+  /** A view of {@code id} whose SQL and origin name {@code who}. */
+  private static org.apache.iceberg.view.ViewBuilder buildView(
+      LogCatalog catalog, TableIdentifier id, String who) {
+    return catalog.buildView(id)
+        .withSchema(SCHEMA)
+        .withDefaultNamespace(id.namespace())
+        .withQuery("spark", "select '" + who + "'")
+        .withProperty("origin", who);
   }
 
   enum Kind {
@@ -870,6 +904,15 @@ class TestCatalogRaceProperties {
     SET_TABLE_PROPERTY,
     /** Appends a file named for the writer. */
     FAST_APPEND,
+    /** Creates a view of a table name: tables and views share a namespace's names. */
+    CREATE_VIEW,
+    DROP_VIEW,
+    /** Renames a view to a table name, which a table may hold. */
+    RENAME_VIEW,
+    /** Sets a view's property through a handle, as Iceberg's update retries on a conflict. */
+    SET_VIEW_PROPERTY,
+    /** Replaces a view's version through a handle (SQL naming the writer); it retries too. */
+    REPLACE_VIEW,
     /** Deletes every row: the files live when the delete applies, after any retry. */
     DELETE_ALL,
     /**
@@ -909,9 +952,17 @@ class TestCatalogRaceProperties {
       return TABLES.get(x % TABLES.size());
     }
 
-    /** The table the operation loads, creates or changes. */
+    private TableIdentifier view() {
+      return VIEW_NAMES.get(x % VIEW_NAMES.size());
+    }
+
+    private TableIdentifier otherView() {
+      return VIEW_NAMES.get(y % VIEW_NAMES.size());
+    }
+
+    /** The table the operation loads, creates or changes (a view operation's view). */
     TableIdentifier target() {
-      return table();
+      return kind != null && kind.name().contains("VIEW") ? view() : table();
     }
 
     private TableIdentifier other() {
@@ -1051,6 +1102,24 @@ class TestCatalogRaceProperties {
           case SET_TABLE_PROPERTY:
             handle[0] = catalog.loadTable(table());
             handle[0].updateProperties().set(key(), who).commit();
+            return "ok";
+          case CREATE_VIEW:
+            buildView(catalog, view(), who).create();
+            return "ok";
+          case DROP_VIEW:
+            return "ok " + catalog.dropView(view());
+          case RENAME_VIEW:
+            catalog.renameView(view(), otherView());
+            return "ok";
+          case SET_VIEW_PROPERTY:
+            catalog.loadView(view()).updateProperties().set(key(), who).commit();
+            return "ok";
+          case REPLACE_VIEW:
+            catalog.loadView(view()).replaceVersion()
+                .withSchema(SCHEMA)
+                .withDefaultNamespace(view().namespace())
+                .withQuery("spark", "select '" + who + "'")
+                .commit();
             return "ok";
           case FAST_APPEND:
             Table table = catalog.loadTable(table());
@@ -1210,6 +1279,14 @@ class TestCatalogRaceProperties {
           return kind + "(" + ns() + (kind == Kind.DROP_NAMESPACE ? "" : ", " + key()) + ")";
         case RENAME_TABLE:
           return "renameTable(" + table() + ", " + other() + ")";
+        case RENAME_VIEW:
+          return "renameView(" + view() + ", " + otherView() + ")";
+        case SET_VIEW_PROPERTY:
+          return "setViewProperty(" + view() + ", " + key() + ")";
+        case CREATE_VIEW:
+        case DROP_VIEW:
+        case REPLACE_VIEW:
+          return kind + "(" + view() + ")";
         case SET_TABLE_PROPERTY:
           return "setTableProperty(" + table() + ", " + key() + ")";
         case FAST_APPEND:
@@ -1250,6 +1327,13 @@ class TestCatalogRaceProperties {
           throw new java.io.UncheckedIOException(e);
         }
         state.put("table " + id, props + " files " + files);
+      }
+      for (TableIdentifier id : reader.listViews(ns)) {
+        org.apache.iceberg.view.View view = reader.loadView(id);
+        Map<String, String> props = new TreeMap<>(view.properties());
+        props.keySet().removeIf(k -> !k.equals("origin") && !KEYS.contains(k));
+        state.put("view " + id, props + " " + view.sqlFor("spark").sql() + " versions "
+            + view.currentVersion().versionId());
       }
       pending.addAll(reader.listNamespaces(ns));
     }

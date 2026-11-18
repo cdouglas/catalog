@@ -723,12 +723,14 @@ public class CatalogState {
    * metadata inline, encoded by {@code codec}. Either may be null in a malformed record, which
    * never applies.
    */
-  record ViewMetadataRef(String location, byte[] inline, byte codec) {
-    static ViewMetadataRef location(String location) {
+  public record ViewMetadataRef(String location, byte[] inline, byte codec) {
+    /** A view's metadata in the file at {@code location}. */
+    public static ViewMetadataRef location(String location) {
       return new ViewMetadataRef(location, null, InlineMetadataCodecs.TAG_JSON_GZIP);
     }
 
-    static ViewMetadataRef inline(byte[] metadata, byte codec) {
+    /** A view's metadata inline, encoded by {@code codec}. */
+    public static ViewMetadataRef inline(byte[] metadata, byte codec) {
       return new ViewMetadataRef(null, metadata, codec);
     }
 
@@ -736,7 +738,7 @@ public class CatalogState {
      * Whether a view can hold this metadata: exactly one of the two, and inline metadata only by
      * the JSON codec (V4: the structural codec is a table codec).
      */
-    boolean wellFormed() {
+    public boolean wellFormed() {
       return (location == null) != (inline == null)
           && (inline == null || codec == InlineMetadataCodecs.TAG_JSON_GZIP);
     }
@@ -1028,14 +1030,6 @@ public class CatalogState {
     /** Whether a view of namespace {@code nsId}, which exists, is named {@code name}. */
     public boolean viewNameTaken(int nsId, String name) {
       return viewLookup.containsKey(TableIdentifier.of(buildNamespace(nsId), name));
-    }
-
-    /**
-     * Whether a table or a view of namespace {@code nsId}, which exists, is named {@code name}: the
-     * two kinds share one set of names (docs/VIEWS.md V1).
-     */
-    public boolean entityNameTaken(int nsId, String name) {
-      return tableNameTaken(nsId, name) || viewNameTaken(nsId, name);
     }
 
     public Builder updateNamespaceVersion(int id, int newVersion) {

@@ -116,14 +116,19 @@ class TestVerifyStabilityProperties {
       } else {
         Statistics.label("encoding").collect("none");
       }
-      // Namespaces and tables to start from: a pointer table and an inline one
+      // Namespaces, tables and views to start from: a pointer table and an inline one, and a view
+      // of each form, of the names tables take
       ProtoCodec.CatalogIntention seed = CatalogTestSupport.intention(builder.build(),
           mut -> mut.createNamespace(Namespace.of("a"))
               .createNamespace(Namespace.of("b"))
               .createTable(TableIdentifier.of("a", "t"), "mem:///a/t/seed")
               .createTableInline(TableIdentifier.of("b", "t"),
                   CatalogTestSupport.newInlineTable("mem:///b/t/seed"),
-                  CatalogTestSupport.inlineTableCodec()));
+                  CatalogTestSupport.inlineTableCodec())
+              .createView(TableIdentifier.of("a", "u"),
+                  CatalogTestSupport.pointerView("mem:///a/u/seed"))
+              .createView(TableIdentifier.of("b", "u"),
+                  CatalogTestSupport.newInlineView("mem:///b/u", "select seed")));
       check(seed.verify(builder), "the seed is rejected");
       seed.apply(builder);
       history.add(builder.build());

@@ -22,6 +22,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import org.apache.iceberg.catalog.TableIdentifier;
 import org.intentlog.CommittedSet;
 import org.intentlog.LogView;
 import org.intentlog.Replay;
@@ -221,6 +222,48 @@ public final class CatalogTestSupport {
     return InlineMetadataCodecs.STRUCTURAL.encode(
         org.apache.iceberg.TableMetadata.newTableMetadata(
             schema, org.apache.iceberg.PartitionSpec.unpartitioned(), location, Map.of()));
+  }
+
+  /**
+   * A view's metadata inline, as a writer that inlines sends it: one version of {@code sql}, its
+   * location {@code location} (docs/VIEWS.md V4).
+   */
+  public static CatalogState.ViewMetadataRef newInlineView(String location, String sql) {
+    return InlineViewMetadata.encode(viewMetadata(location, sql));
+  }
+
+  /** A view's metadata in the file at {@code metadataLocation}, as a pointer writer sends it. */
+  public static CatalogState.ViewMetadataRef pointerView(String metadataLocation) {
+    return CatalogState.ViewMetadataRef.location(metadataLocation);
+  }
+
+  /** The location an inline view's metadata holds ({@link #newInlineView}); null if pointer. */
+  public static String inlineViewLocation(CatalogState state, TableIdentifier view) {
+    CatalogState.ViewEntry entry = state.viewEntry(view);
+    if (entry == null || !entry.isInline()) {
+      return null;
+    }
+    return InlineViewMetadata.decode(entry.inlineMetadata(), entry.codec, null).location();
+  }
+
+  /** A view's metadata: one version of {@code sql} at {@code location}. */
+  public static org.apache.iceberg.view.ViewMetadata viewMetadata(String location, String sql) {
+    org.apache.iceberg.Schema schema = new org.apache.iceberg.Schema(
+        org.apache.iceberg.types.Types.NestedField.optional(
+            1, "x", org.apache.iceberg.types.Types.LongType.get()));
+    return org.apache.iceberg.view.ViewMetadata.builder()
+        .setLocation(location)
+        .setCurrentVersion(
+            org.apache.iceberg.view.ImmutableViewVersion.builder()
+                .versionId(1)
+                .schemaId(schema.schemaId())
+                .timestampMillis(System.currentTimeMillis())
+                .defaultNamespace(org.apache.iceberg.catalog.Namespace.of("ns"))
+                .addRepresentations(org.apache.iceberg.view.ImmutableSQLViewRepresentation
+                    .builder().dialect("spark").sql(sql).build())
+                .build(),
+            schema)
+        .build();
   }
 
   /** The codec tag of {@link #newInlineTable}'s metadata. */

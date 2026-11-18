@@ -368,39 +368,64 @@ and a view's metadata carries its own uuid. What Batavia could add, outside Iceb
 
 - **Acceptance.** `TestLocalViewCatalog` runs `ViewCatalogTests<LogCatalog>` in every
   `LocalCatalogMode`, the MEMLOG and AZLOG modes included, with `tableCatalog()` the same
-  catalog. `AzureLogCatalogIT` runs it on a real account later.
+  catalog: 50 tests a mode pass, and `listViewsInEmptyNamespace` skips, as the catalog has no
+  empty namespace. Four tests assume a view's metadata is a file; an inline view runs a variant
+  of each: `createViewWithCustomMetadataLocation` (a pointer writer's commit puts its file under
+  `write.metadata.path`), `registerView` (the file a kept view's drop writes, V9), and
+  `renameView` and `renameViewUsingDifferentNamespace` (the metadata is unchanged but for its
+  location, which names the view's version). `AzureLogCatalogIT` runs it on a real account
+  later.
+- **Actions** (`TestViewActions`): each action's preconditions and effects, the shared names
+  (V7) and the cross-kind create ABA, the codec, and staging with Iceberg's messages.
 - **Regressions** (`TestCatalogRegressions$Views`):
-  - a table create and a view create of one name racing: exactly one lands;
+  - a table create and a view create of one name racing: the second is rejected, with
+    Iceberg's message for the kind that holds the name;
   - a view drop, then a late copy of a table create of its name (the cross-kind create ABA);
   - a namespace drop racing a view create;
   - one view written by pointer and inline writers in turn;
-  - a pointer view's files are deleted after its drop, and kept on an unknown outcome.
+  - a pointer view's file is deleted after its drop, and kept on an unknown outcome;
+  - an inline view kept by its drop (`gc.enabled` false) is registered again;
+  - two updates of one view staged on one read, under three encodings: the second is rejected.
 - **Format properties** (`spec/`):
-  - N1 (`TestVerifyStabilityProperties`) generates the four new actions beside the table
-    actions.
-  - The multi-writer `aRejectedBindingStaysRejectedOnceItsNameIsFree` draws views and tables
-    for both the rejected binding and the action that frees its name.
-  - `WellFormed` checks the new invariant (no table and view share a name) after every apply.
+  - N1 (`TestVerifyStabilityProperties`) generates view creates (pointer and inline), updates,
+    drops and renames beside the table actions, of the names tables take, from a seed with a
+    view of each form.
+  - The multi-writer fuzzer models views (`CREATE_VIEW`, `UPDATE_VIEW`, `DROP_VIEW`,
+    `RENAME_VIEW`) in its serial re-execution, and
+    `aRejectedBindingStaysRejectedOnceItsNameIsFree` draws creates, drops and renames of both
+    kinds, so a rejected binding of either is copied once a drop or rename of either frees its
+    name.
+  - `WellFormed` checks I13 (no table and view share a name) after every apply.
 - **Checks on every catalog file.**
   - `CheckpointRoundTrip`'s contents hold views, and replay equals decode.
   - `CatalogProto` and `TestFormatExplorer` see the new fields.
-  - The explorer's fixtures are regenerated, and it decodes views.
+  - The explorer's fixtures are regenerated, with a views scenario, and it decodes views.
 - **Fault fuzzer** (`TestCatalogFaultProperties`):
   - kinds `CREATE_VIEW`, `REPLACE_VIEW`, `VIEW_PROPERTIES`, `RENAME_VIEW`, `DROP_VIEW`,
-    `REGISTER_VIEW`, against a model of each view (name, version, SQL, properties);
+    `REGISTER_VIEW`, against a model of each view (SQL, version id, properties, `gc.enabled`), of
+    the names tables take; each view loads alike through the checker and a fresh reader;
+  - an acknowledged drop of a kept view must leave a metadata file holding it, which
+    `REGISTER_VIEW` brings back;
   - writers' modes are drawn as now, so views move between forms.
-- **Race fuzzer** (`TestCatalogRaceProperties`): a view operation as the raced operation and
-  as a racer.
+- **Race fuzzer** (`TestCatalogRaceProperties`): view creates (of the names tables take),
+  drops, renames, property changes and replaces as the raced operation and as racers, from
+  setups with views; the state compared holds each view's properties, SQL and version.
 - **Calibration set `fuzz/mutants/views.sh`:**
-  - `viewnotable`: a view create ignores table names;
-  - `tablenoview`: a table create ignores view names;
+  - `viewnotable`: a view create or rename ignores table names;
+  - `tablenoview`: a table create or rename ignores view names;
   - `viewdropnoremovals`: a view drop does not bump removals (the ABA);
   - `viewnobump`: a view create does not bump its namespace's version (a namespace drop lands
     over it);
   - `viewstale`: an `UpdateView` applies on a stale version;
   - `viewdeletefirst`: a drop deletes the files before the drop lands.
-- **TLA+:** no change. `RSM.tla`'s actions are abstract, and verification stability (S2) is
-  N1's.
+
+  Locally, each oracle alone at its default tries, every mutant is caught: the regressions and
+  `TestViewActions` catch all but `viewdeletefirst`, which the regressions alone catch; N1 the
+  five format mutants (`viewstale` at try 159, the others within 13); the multi-writer fuzzer all
+  but `viewdeletefirst` (`viewdropnoremovals` only by the binding property, at try 321 of 3,000);
+  the fault and race fuzzers one each. The script's header has each oracle's tries.
+- **TLA+:** views are not in the models yet (errata T7 (TLA+ omits views)); the Java oracles
+  above check them, verification stability (S2) among them by N1.
 - **havoc:** one round with the view kinds, after the merge.
 
 ## Stage 2: views in catalog transactions

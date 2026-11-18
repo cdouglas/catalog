@@ -2864,8 +2864,8 @@ public class ProtoCodec {
   }
 
   /**
-   * Why an action that binds {@code name} in namespace {@code nsId} (a table's or a view's name,
-   * which share one set of names, or with {@code table} false a child namespace's) does not hold
+   * Why an action that binds {@code name} in namespace {@code nsId} for {@code kind} (a table's or
+   * a view's name, which share one set of names, or a child namespace's) does not hold
    * on {@code builder}, by the condition its writer sent (catalog.proto's oneof of the two, {@code
    * fileio.catalog.create.condition}), or null if it holds:
    *
@@ -2883,7 +2883,7 @@ public class ProtoCodec {
    * is malformed, and never holds: skipping the count would let a name freed later bind again.
    */
   static String bindingProblem(CatalogState.Builder builder, int nsId, boolean byName, int read,
-      boolean table, String name) {
+      Binds kind, String name) {
     if (!byName) {
       return read < 0 || builder.namespaceVersion(nsId) == read ? null : "namespace: version";
     }
@@ -2896,10 +2896,36 @@ public class ProtoCodec {
     if (builder.namespaceRemovals(nsId) != read) {
       return "name: a name freed since";
     }
-    if (table ? builder.entityNameTaken(nsId, name) : builder.namespaceNameTaken(nsId, name)) {
+    if (nameTaken(builder, nsId, kind, name)) {
       return "name: taken";
     }
     return null;
+  }
+
+  /** What an action binds a name for, which decides the names it may not take. */
+  enum Binds {
+    NAMESPACE,
+    TABLE,
+    VIEW
+  }
+
+  /**
+   * Whether {@code name} in namespace {@code nsId} is taken for an action that binds it for
+   * {@code kind}: a child namespace's by the namespace's children; a table's or a view's by the
+   * namespace's tables and views, which share one set of names (docs/VIEWS.md V7).
+   */
+  private static boolean nameTaken(
+      CatalogState.Builder builder, int nsId, Binds kind, String name) {
+    switch (kind) {
+      case NAMESPACE:
+        return builder.namespaceNameTaken(nsId, name);
+      case TABLE:
+        // a view holds a name a table may not take
+        return builder.tableNameTaken(nsId, name) || builder.viewNameTaken(nsId, name);
+      default:
+        // a table holds a name a view may not take
+        return builder.viewNameTaken(nsId, name) || builder.tableNameTaken(nsId, name);
+    }
   }
 
   /**
@@ -2946,13 +2972,13 @@ public class ProtoCodec {
         return false;  // the root row exists in every catalog; never replace it
       }
       // The root is a parent like any other
-      return bindingProblem(builder, parentId, byName, parentRead(), false, name) == null;
+      return bindingProblem(builder, parentId, byName, parentRead(), Binds.NAMESPACE, name) == null;
     }
 
     @Override
     public String explain(CatalogState.Builder builder) {
       String problem = id == CatalogState.ROOT_ID || !byName
-          ? null : bindingProblem(builder, parentId, true, parentRemovals, false, name);
+          ? null : bindingProblem(builder, parentId, true, parentRemovals, Binds.NAMESPACE, name);
       return problem != null ? problem : Action.super.explain(builder);
     }
 
@@ -3115,13 +3141,13 @@ public class ProtoCodec {
 
     @Override
     public boolean verify(CatalogState.Builder builder) {
-      return bindingProblem(builder, namespaceId, byName, namespaceRead(), true, name) == null;
+      return bindingProblem(builder, namespaceId, byName, namespaceRead(), Binds.TABLE, name) == null;
     }
 
     @Override
     public String explain(CatalogState.Builder builder) {
       String problem = byName
-          ? bindingProblem(builder, namespaceId, true, namespaceRemovals, true, name) : null;
+          ? bindingProblem(builder, namespaceId, true, namespaceRemovals, Binds.TABLE, name) : null;
       return problem != null ? problem : Action.super.explain(builder);
     }
 
@@ -3744,13 +3770,13 @@ public class ProtoCodec {
 
     @Override
     public boolean verify(CatalogState.Builder builder) {
-      return bindingProblem(builder, namespaceId, byName, namespaceRead(), true, name) == null;
+      return bindingProblem(builder, namespaceId, byName, namespaceRead(), Binds.TABLE, name) == null;
     }
 
     @Override
     public String explain(CatalogState.Builder builder) {
       String problem = byName
-          ? bindingProblem(builder, namespaceId, true, namespaceRemovals, true, name) : null;
+          ? bindingProblem(builder, namespaceId, true, namespaceRemovals, Binds.TABLE, name) : null;
       return problem != null ? problem : Action.super.explain(builder);
     }
 
@@ -3847,13 +3873,13 @@ public class ProtoCodec {
       // The new name binds as a create's: by the destination's version (any
       // CreateTable / DropTable / RenameTable there bumps it), or by name.
       return bindingProblem(
-          builder, newNamespaceId, byName, newNamespaceRead(), true, newName) == null;
+          builder, newNamespaceId, byName, newNamespaceRead(), Binds.TABLE, newName) == null;
     }
 
     @Override
     public String explain(CatalogState.Builder builder) {
       String problem = byName && builder.tableVersion(id) == version
-          ? bindingProblem(builder, newNamespaceId, true, newNamespaceRemovals, true, newName)
+          ? bindingProblem(builder, newNamespaceId, true, newNamespaceRemovals, Binds.TABLE, newName)
           : null;
       return problem != null ? problem : Action.super.explain(builder);
     }
@@ -3915,7 +3941,7 @@ public class ProtoCodec {
     @Override
     public boolean verify(CatalogState.Builder builder) {
       return metadata.wellFormed()
-          && bindingProblem(builder, namespaceId, byName, namespaceRead, true, name) == null;
+          && bindingProblem(builder, namespaceId, byName, namespaceRead, Binds.VIEW, name) == null;
     }
 
     @Override
@@ -3924,7 +3950,7 @@ public class ProtoCodec {
         return "view: malformed metadata";
       }
       String problem = byName
-          ? bindingProblem(builder, namespaceId, true, namespaceRead, true, name) : null;
+          ? bindingProblem(builder, namespaceId, true, namespaceRead, Binds.VIEW, name) : null;
       return problem != null ? problem : Action.super.explain(builder);
     }
 
@@ -4037,7 +4063,7 @@ public class ProtoCodec {
     @Override
     public boolean verify(CatalogState.Builder builder) {
       return builder.viewVersion(id) == version
-          && bindingProblem(builder, newNamespaceId, byName, newNamespaceRead, true, newName)
+          && bindingProblem(builder, newNamespaceId, byName, newNamespaceRead, Binds.VIEW, newName)
               == null;
     }
 
@@ -4047,7 +4073,7 @@ public class ProtoCodec {
         return "view: version";
       }
       String problem = byName
-          ? bindingProblem(builder, newNamespaceId, true, newNamespaceRead, true, newName) : null;
+          ? bindingProblem(builder, newNamespaceId, true, newNamespaceRead, Binds.VIEW, newName) : null;
       return problem != null ? problem : Action.super.explain(builder);
     }
 
@@ -4060,11 +4086,11 @@ public class ProtoCodec {
     @Override
     public void apply(CatalogState.Builder builder) {
       CatalogState.ViewEntry old = builder.viewEntry(id);
-      int oldNsId = old != null ? old.namespaceId : 0;
+      int fromNsId = old != null ? old.namespaceId : 0;
       builder.renameView(id, newNamespaceId, newName, version + 1);
-      builder.bumpNamespaceVersion(oldNsId);
-      builder.bumpNamespaceRemovals(oldNsId);
-      if (newNamespaceId != oldNsId) {
+      builder.bumpNamespaceVersion(fromNsId);
+      builder.bumpNamespaceRemovals(fromNsId);
+      if (newNamespaceId != fromNsId) {
         builder.bumpNamespaceVersion(newNamespaceId);
       }
     }

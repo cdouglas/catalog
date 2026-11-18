@@ -303,6 +303,13 @@ final class CatalogStateGenerators {
     UPDATE_INLINE_FULL,
     UPDATE_INLINE_DELTA,
     RENAME_TABLE,
+    /** A view of a table name: its metadata in a file, or inline (docs/VIEWS.md). */
+    CREATE_VIEW,
+    CREATE_VIEW_INLINE,
+    /** A view's whole next metadata, as a pointer or inline, as the rng picks. */
+    UPDATE_VIEW,
+    DROP_VIEW,
+    RENAME_VIEW,
     /** A bare SetConflictEncoding, as a catalog's first record carries. */
     SET_CONFLICT_ENCODING,
     /** A bare SetSnapshotPaging, as a catalog's first record may carry. */
@@ -325,6 +332,12 @@ final class CatalogStateGenerators {
         case DROP_TABLE:
         case RENAME_TABLE:
           weight = 4;
+          break;
+        case CREATE_VIEW:
+        case CREATE_VIEW_INLINE:
+        case DROP_VIEW:
+        case RENAME_VIEW:
+          weight = 3;
           break;
         case DROP_NAMESPACE:
           weight = 3;
@@ -350,7 +363,7 @@ final class CatalogStateGenerators {
 
   /**
    * A writer's transaction: its intention, the ops it staged, for a trace, and the names it binds
-   * (tables created or renamed to, and namespaces created).
+   * (tables and views created or renamed to, and namespaces created).
    */
   static final class Staged {
     final ProtoCodec.CatalogIntention intention;
@@ -363,10 +376,13 @@ final class CatalogStateGenerators {
       this.ops = ops;
     }
 
-    /** Whether one of the names it binds is free on {@code state}, in a namespace that exists. */
+    /**
+     * Whether one of the names it binds is free on {@code state} (of tables and views alike), in a
+     * namespace that exists.
+     */
     boolean aNameIsFree(CatalogState state) {
       for (TableIdentifier table : boundTables) {
-        if (!state.containsTable(table) && state.containsNamespace(table.namespace())) {
+        if (!state.nameTaken(table) && state.containsNamespace(table.namespace())) {
           return true;
         }
       }
@@ -456,6 +472,9 @@ final class CatalogStateGenerators {
     List<TableIdentifier> tables = new ArrayList<>(read.tables());
     tables.sort(java.util.Comparator.comparing(TableIdentifier::toString));
     TableIdentifier existing = tables.isEmpty() ? fresh : tables.get(rng.nextInt(tables.size()));
+    List<TableIdentifier> views = new ArrayList<>(read.views());
+    views.sort(java.util.Comparator.comparing(TableIdentifier::toString));
+    TableIdentifier view = views.isEmpty() ? fresh : views.get(rng.nextInt(views.size()));
     String key = KEYS.get(rng.nextInt(KEYS.size()));
     String value = "v" + rng.nextInt(1000);
     try {
@@ -524,12 +543,37 @@ final class CatalogStateGenerators {
           mutation.renameTable(existing, fresh);
           bound.add(fresh);
           return "renameTable(" + existing + ", " + fresh + ")";
+        case CREATE_VIEW:
+          mutation.createView(fresh, CatalogTestSupport.pointerView("mem:///" + fresh + "/" + value));
+          bound.add(fresh);
+          return "createView(" + fresh + ")";
+        case CREATE_VIEW_INLINE:
+          mutation.createView(fresh,
+              CatalogTestSupport.newInlineView("mem:///" + fresh, "select " + value));
+          bound.add(fresh);
+          return "createViewInline(" + fresh + ")";
+        case UPDATE_VIEW:
+          if (updated.put(view, true) != null) {
+            return null;
+          }
+          mutation.updateView(view, rng.nextBoolean()
+              ? CatalogTestSupport.pointerView("mem:///" + view + "/" + value)
+              : CatalogTestSupport.newInlineView("mem:///" + view, "select " + value));
+          return "updateView(" + view + ")";
+        case DROP_VIEW:
+          mutation.dropView(view);
+          return "dropView(" + view + ")";
+        case RENAME_VIEW:
+          mutation.renameView(view, fresh);
+          bound.add(fresh);
+          return "renameView(" + view + ", " + fresh + ")";
         default:
           throw new IllegalStateException("Not a staged op: " + op);
       }
     } catch (AlreadyExistsException
         | NoSuchNamespaceException
         | NoSuchTableException
+        | org.apache.iceberg.exceptions.NoSuchViewException
         | NamespaceNotEmptyException
         | IllegalArgumentException
         | IllegalStateException e) {

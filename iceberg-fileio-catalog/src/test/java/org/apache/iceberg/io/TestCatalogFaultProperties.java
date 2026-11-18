@@ -72,6 +72,7 @@ import org.apache.iceberg.exceptions.CommitStateUnknownException;
 import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
+import org.apache.iceberg.exceptions.NoSuchViewException;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.ReadFault;
@@ -178,6 +179,10 @@ class TestCatalogFaultProperties {
   private static final List<TableIdentifier> TABLES =
       List.of(TableIdentifier.of(NS, "t0"), TableIdentifier.of(NS, "t1"), TableIdentifier.of(NS, "t2"),
           TableIdentifier.of(NS2, "t0"));
+  // The names views take: the tables', which they collide with, and two of their own
+  private static final List<TableIdentifier> VIEW_NAMES = java.util.stream.Stream.concat(
+      TABLES.stream(), java.util.stream.Stream.of(
+          TableIdentifier.of(NS, "v0"), TableIdentifier.of(NS, "v1"))).toList();
   private static final Schema SCHEMA = new Schema(required(1, "id", Types.IntegerType.get()));
   private static final String KEY_PREFIX = "fz.";
   private static final List<String> KEYS = List.of("fz.k1", "fz.k2");
@@ -404,6 +409,12 @@ class TestCatalogFaultProperties {
             Tuple.of(1, Kind.DROP_NAMESPACE),
             Tuple.of(2, Kind.SET_NAMESPACE_PROPERTY),
             Tuple.of(1, Kind.REMOVE_NAMESPACE_PROPERTY),
+            Tuple.of(2, Kind.CREATE_VIEW),
+            Tuple.of(1, Kind.REPLACE_VIEW),
+            Tuple.of(1, Kind.VIEW_PROPERTIES),
+            Tuple.of(1, Kind.RENAME_VIEW),
+            Tuple.of(1, Kind.DROP_VIEW),
+            Tuple.of(1, Kind.REGISTER_VIEW),
             Tuple.of(3, Kind.TXN_BEGIN),
             Tuple.of(4, Kind.TXN_APPEND),
             Tuple.of(2, Kind.TXN_READ),
@@ -474,6 +485,14 @@ class TestCatalogFaultProperties {
       case DROP_NAMESPACE:
       case SET_NAMESPACE_PROPERTY:
       case REMOVE_NAMESPACE_PROPERTY:
+      // a view's catalog operations stage themselves again on a fresh read, and Iceberg's view
+      // updates refresh and apply themselves again
+      case CREATE_VIEW:
+      case REPLACE_VIEW:
+      case VIEW_PROPERTIES:
+      case RENAME_VIEW:
+      case DROP_VIEW:
+      case REGISTER_VIEW:
         return true;
       case SET_RETENTION:
         return cmd.c % 4 == 3; // a table property; the others are ref changes
@@ -497,6 +516,12 @@ class TestCatalogFaultProperties {
       case DROP_NAMESPACE:
       case SET_NAMESPACE_PROPERTY:
       case REMOVE_NAMESPACE_PROPERTY:
+      case CREATE_VIEW:
+      case REPLACE_VIEW:
+      case VIEW_PROPERTIES:
+      case RENAME_VIEW:
+      case DROP_VIEW:
+      case REGISTER_VIEW:
         return true;
       default:
         return false;
@@ -580,6 +605,22 @@ class TestCatalogFaultProperties {
     SET_NAMESPACE_PROPERTY,
     /** Removes fz.k1 or fz.k2 from ns or ns2, as {@code b} picks. */
     REMOVE_NAMESPACE_PROPERTY,
+    /**
+     * Creates a view of a table name (docs/VIEWS.md: the two kinds share a namespace's names),
+     * mostly one no table or view holds; with {@code gc.enabled} false when {@code b} is odd, so
+     * its drop keeps its metadata in a file. A writer that inlines stores it inline.
+     */
+    CREATE_VIEW,
+    /** Replaces a view's version (new SQL), as Iceberg's ReplaceViewVersion does. */
+    REPLACE_VIEW,
+    /** Sets fz.k1 or fz.k2 on a view, as {@code b} picks. */
+    VIEW_PROPERTIES,
+    /** Renames a view to a name {@code b} picks: mostly one no table or view holds. */
+    RENAME_VIEW,
+    /** Drops a view; one kept ({@code gc.enabled} false) leaves a metadata file to register. */
+    DROP_VIEW,
+    /** Registers, under a name {@code a} picks, a metadata file a kept view's drop left. */
+    REGISTER_VIEW,
     /** Opens a catalog transaction; {@code b} picks the isolation level. */
     TXN_BEGIN,
     /** Loads a table in the open catalog transaction and stages an append to it. */
@@ -697,6 +738,11 @@ class TestCatalogFaultProperties {
   static final class Model extends TreeMap<TableIdentifier, TableState> {
     final Map<Namespace, Map<String, String>> namespaces =
         new TreeMap<>(Comparator.comparing(Namespace::toString));
+    // Views, by name (docs/VIEWS.md)
+    final Map<TableIdentifier, ViewState> views = new TreeMap<>(BY_NAME);
+    // The metadata files kept views' drops left, each with the view it holds: what a register may
+    // bring back (not observed: the catalog does not name them)
+    final Map<String, ViewState> keptViews = new TreeMap<>();
 
     Model() {
       super(BY_NAME);
@@ -704,7 +750,48 @@ class TestCatalogFaultProperties {
 
     @Override
     public String toString() {
-      return "namespaces " + namespaces + ", tables " + super.toString();
+      return "namespaces " + namespaces + ", tables " + super.toString()
+          + (views.isEmpty() ? "" : ", views " + views);
+    }
+  }
+
+  /** What the model tracks of a view, and what it observed of it at the last check. */
+  static final class ViewState {
+    final String sql;
+    final int versionId;
+    final boolean kept; // gc.enabled false: its drop keeps its metadata in a file
+    final Map<String, String> props = new TreeMap<>();
+    // Observed, not modeled: its metadata's location (a file, or the catalog's sentinel), and the
+    // view's location, where its metadata files go
+    String metadataLocation = null;
+    String location = null;
+
+    ViewState(String sql, int versionId, boolean kept) {
+      this.sql = sql;
+      this.versionId = versionId;
+      this.kept = kept;
+    }
+
+    ViewState with(String newSql, int newVersionId) {
+      ViewState copy = new ViewState(newSql, newVersionId, kept);
+      copy.props.putAll(props);
+      copy.metadataLocation = metadataLocation;
+      copy.location = location;
+      return copy;
+    }
+
+    ViewState copy() {
+      return with(sql, versionId);
+    }
+
+    boolean sameAs(ViewState other) {
+      return sql.equals(other.sql) && versionId == other.versionId && kept == other.kept
+          && props.equals(other.props);
+    }
+
+    @Override
+    public String toString() {
+      return String.format("{%s v%d%s props=%s}", sql, versionId, kept ? " kept" : "", props);
     }
   }
 
@@ -814,6 +901,8 @@ class TestCatalogFaultProperties {
     Model copy = new Model();
     model.forEach((id, state) -> copy.put(id, state.copy()));
     model.namespaces.forEach((ns, props) -> copy.namespaces.put(ns, new TreeMap<>(props)));
+    model.views.forEach((id, state) -> copy.views.put(id, state.copy()));
+    model.keptViews.forEach((file, state) -> copy.keptViews.put(file, state.copy()));
     return copy;
   }
 
@@ -821,6 +910,15 @@ class TestCatalogFaultProperties {
   private static String diff(Model expected, Model actual) {
     if (!expected.namespaces.equals(actual.namespaces)) {
       return "namespaces " + expected.namespaces + " expected, found " + actual.namespaces;
+    }
+    if (!expected.views.keySet().equals(actual.views.keySet())) {
+      return "views " + expected.views.keySet() + " expected, found " + actual.views.keySet();
+    }
+    for (TableIdentifier id : expected.views.keySet()) {
+      if (!expected.views.get(id).sameAs(actual.views.get(id))) {
+        return "view " + id + ": expected " + expected.views.get(id) + ", found "
+            + actual.views.get(id);
+      }
     }
     if (!expected.keySet().equals(actual.keySet())) {
       return "tables " + expected.keySet() + " expected, found " + actual.keySet();
@@ -920,7 +1018,8 @@ class TestCatalogFaultProperties {
       TableIdentifier from = next.getKey();
       TableIdentifier to = next.getValue();
       TableState state = existing(m, from);
-      if (m.containsKey(to)) {
+      // a view holds a name a table may not take (VIEWS.md V7): no rename of tables frees it
+      if (m.containsKey(to) || m.views.containsKey(to)) {
         throw new IllegalStateException(to + " exists");
       }
       if (!m.namespaces.containsKey(to.namespace())) {
@@ -928,6 +1027,22 @@ class TestCatalogFaultProperties {
       }
       m.remove(from);
       m.put(to, state);
+    }
+  }
+
+  private static ViewState existingView(Model model, TableIdentifier id) {
+    ViewState state = model.views.get(id);
+    if (state == null) {
+      throw new IllegalStateException("view " + id + " does not exist");
+    }
+    return state;
+  }
+
+  /** Fails the effect unless {@code id} is a name no table or view holds, in a namespace. */
+  private static void checkBindable(Model model, TableIdentifier id) {
+    if (model.containsKey(id) || model.views.containsKey(id)
+        || !model.namespaces.containsKey(id.namespace())) {
+      throw new IllegalStateException("cannot bind " + id);
     }
   }
 
@@ -1217,6 +1332,13 @@ class TestCatalogFaultProperties {
       seed.createNamespace(NS);
       create(seed, TABLES.get(0), 3);
       create(seed, TABLES.get(1), 2).newFastAppend().appendFile(newFile()).commit();
+      // A view, kept (its drop leaves its metadata in a file to register), in the writer's form
+      seed.buildView(VIEW_NAMES.get(TABLES.size()))
+          .withSchema(SCHEMA)
+          .withDefaultNamespace(NS)
+          .withQuery("spark", "select 'seed'")
+          .withProperty(TableProperties.GC_ENABLED, "false")
+          .create();
       this.lastActual = actual();
       this.model = copy(lastActual);
       trace.append(String.format(
@@ -1638,7 +1760,8 @@ class TestCatalogFaultProperties {
               "createTable(" + created + ", v" + version + ")",
               () -> create(w.catalog, created, version),
               (m, actual) -> {
-                if (m.containsKey(created) || !actual.containsKey(created)
+                if (m.containsKey(created) || m.views.containsKey(created)
+                    || !actual.containsKey(created)
                     || !m.namespaces.containsKey(created.namespace())) {
                   throw new IllegalStateException("cannot create " + created);
                 }
@@ -1677,7 +1800,7 @@ class TestCatalogFaultProperties {
               () -> w.catalog.renameTable(id, to),
               (m, actual) -> {
                 TableState state = existing(m, id);
-                if (m.containsKey(to)) {
+                if (m.containsKey(to) || m.views.containsKey(to)) {
                   throw new IllegalStateException(to + " exists");
                 }
                 if (!m.namespaces.containsKey(to.namespace())) {
@@ -2274,6 +2397,13 @@ class TestCatalogFaultProperties {
         case SET_NAMESPACE_PROPERTY:
         case REMOVE_NAMESPACE_PROPERTY:
           return namespaceOp(cmd, w, NAMESPACES.get(cmd.b % NAMESPACES.size()));
+        case CREATE_VIEW:
+        case REPLACE_VIEW:
+        case VIEW_PROPERTIES:
+        case RENAME_VIEW:
+        case DROP_VIEW:
+        case REGISTER_VIEW:
+          return viewOp(cmd, w);
         case TXN_BEGIN:
           if (w.txn != null) {
             return null;
@@ -2381,7 +2511,7 @@ class TestCatalogFaultProperties {
             return new Staged("rename " + id + " to " + txnTo,
                 renameOf != null ? Staged.RENAMES : Staged.CREATES, (m, actual) -> {
               TableState state = existing(m, id);
-              if (m.containsKey(txnTo)) {
+              if (m.containsKey(txnTo) || m.views.containsKey(txnTo)) {
                 throw new IllegalStateException(txnTo + " exists");
               }
               if (!m.namespaces.containsKey(txnTo.namespace())) {
@@ -2407,7 +2537,8 @@ class TestCatalogFaultProperties {
                 .create();
             w.names.put(txnCreated, null);
             return new Staged("create " + txnCreated, Staged.CREATES, (m, actual) -> {
-              if (m.containsKey(txnCreated) || !m.namespaces.containsKey(txnCreated.namespace())) {
+              if (m.containsKey(txnCreated) || m.views.containsKey(txnCreated)
+                  || !m.namespaces.containsKey(txnCreated.namespace())) {
                 throw new IllegalStateException("cannot create " + txnCreated);
               }
               m.put(txnCreated, new TableState(placeholder, txnVersion));
@@ -2504,6 +2635,177 @@ class TestCatalogFaultProperties {
       }
     }
 
+    /**
+     * A name of {@link #VIEW_NAMES} no table or view holds, in a namespace that exists, mostly;
+     * else any, to collide with a table or a view, or to name a namespace that does not exist.
+     */
+    private TableIdentifier pickName(int index) {
+      List<TableIdentifier> free = new ArrayList<>(VIEW_NAMES);
+      free.removeAll(model.keySet());
+      free.removeAll(model.views.keySet());
+      free.removeIf(name -> !model.namespaces.containsKey(name.namespace()));
+      return index >= 8 || free.isEmpty()
+          ? VIEW_NAMES.get(index % VIEW_NAMES.size())
+          : free.get(index % free.size());
+    }
+
+    /** A view of the model, mostly; else any name, which may hold none. */
+    private TableIdentifier pickView(int index) {
+      List<TableIdentifier> views = new ArrayList<>(model.views.keySet());
+      return index >= 8 || views.isEmpty()
+          ? VIEW_NAMES.get(index % VIEW_NAMES.size())
+          : views.get(index % views.size());
+    }
+
+    /** A view operation (docs/VIEWS.md). */
+    private Op viewOp(Cmd cmd, Writer w) {
+      String value = "v" + nextValue++;
+      switch (cmd.kind) {
+        case CREATE_VIEW: {
+          TableIdentifier created = pickName(cmd.a);
+          boolean kept = cmd.b % 2 == 1;
+          String sql = "select '" + value + "'";
+          return new Op(
+              "createView(" + created + (kept ? ", kept" : "") + ")",
+              () -> {
+                org.apache.iceberg.view.ViewBuilder builder = w.catalog.buildView(created)
+                    .withSchema(SCHEMA)
+                    .withDefaultNamespace(created.namespace())
+                    .withQuery("spark", sql);
+                if (kept) {
+                  builder = builder.withProperty(TableProperties.GC_ENABLED, "false");
+                }
+                builder.create();
+              },
+              (m, actual) -> {
+                checkBindable(m, created);
+                m.views.put(created, new ViewState(sql, 1, kept));
+              });
+        }
+        case REPLACE_VIEW: {
+          TableIdentifier view = pickView(cmd.a);
+          String sql = "select '" + value + "'";
+          return new Op(
+              "replaceView(" + view + ")",
+              () -> w.catalog.loadView(view).replaceVersion()
+                  .withSchema(SCHEMA)
+                  .withDefaultNamespace(view.namespace())
+                  .withQuery("spark", sql)
+                  .commit(),
+              (m, actual) -> {
+                ViewState state = existingView(m, view);
+                m.views.put(view, state.with(sql, state.versionId + 1));
+              });
+        }
+        case VIEW_PROPERTIES: {
+          TableIdentifier view = pickView(cmd.a);
+          String key = KEYS.get(cmd.b % KEYS.size());
+          return new Op(
+              "setViewProperty(" + view + ", " + key + "=" + value + ")",
+              () -> w.catalog.loadView(view).updateProperties().set(key, value).commit(),
+              (m, actual) -> existingView(m, view).props.put(key, value));
+        }
+        case RENAME_VIEW: {
+          TableIdentifier view = pickView(cmd.a);
+          TableIdentifier to = pickName(cmd.b);
+          if (to.equals(view)) {
+            return null; // refused as it is staged, as a table's rename to its name is
+          }
+          return new Op(
+              "renameView(" + view + ", " + to + ")",
+              () -> w.catalog.renameView(view, to),
+              (m, actual) -> {
+                ViewState state = existingView(m, view);
+                checkBindable(m, to);
+                m.views.remove(view);
+                m.views.put(to, state);
+              });
+        }
+        case DROP_VIEW: {
+          TableIdentifier view = pickView(cmd.a);
+          return new Op(
+              "dropView(" + view + ")",
+              () -> {
+                if (!w.catalog.dropView(view)) {
+                  throw new NoSuchViewException("dropView returned false: %s", view);
+                }
+              },
+              (m, actual) -> {
+                ViewState state = existingView(m, view);
+                m.views.remove(view);
+                if (state.kept) {
+                  // Iceberg keeps the metadata of a view whose gc.enabled is false: a pointer
+                  // view's file, or the file an inline view's drop writes (VIEWS.md V9)
+                  m.keptViews.put(keptFile(view, state), state.copy());
+                }
+              });
+        }
+        default: {
+          if (model.keptViews.isEmpty()) {
+            return null;
+          }
+          List<String> files = new ArrayList<>(model.keptViews.keySet());
+          String file = files.get(cmd.b % files.size());
+          ViewState kept = model.keptViews.get(file).copy();
+          TableIdentifier registered = pickName(cmd.a);
+          return new Op(
+              "registerView(" + registered + ", " + file + ")",
+              () -> w.catalog.registerView(registered, file),
+              (m, actual) -> {
+                checkBindable(m, registered);
+                m.views.put(registered, kept);
+              });
+        }
+      }
+    }
+
+    /**
+     * The metadata file a drop of {@code view}, kept, left in its metadata directory, which holds
+     * {@code state}: a pointer view's own, or the one its drop wrote. Throws if there is none,
+     * which fails an acknowledged drop: the view could not be registered again.
+     */
+    private String keptFile(TableIdentifier view, ViewState state) {
+      if (state.metadataLocation != null && !state.metadataLocation.startsWith("inline-view://")
+          && holds(state.metadataLocation, state)) {
+        return state.metadataLocation;
+      }
+      for (org.apache.iceberg.io.FileInfo info : io.listPrefix(state.location + "/metadata/")) {
+        if (info.location().endsWith(".metadata.json") && holds(info.location(), state)) {
+          return info.location();
+        }
+      }
+      // an acknowledged drop's effect then fails the run; a rejected one's does not apply
+      throw new IllegalStateException(String.format(
+          "the drop of %s, kept (gc.enabled false), left no metadata file of %s", view, state));
+    }
+
+    /** Whether the view metadata file {@code file} holds {@code state}. */
+    private boolean holds(String file, ViewState state) {
+      try {
+        return viewState(org.apache.iceberg.view.ViewMetadataParser.read(io, file))
+            .sameAs(state);
+      } catch (RuntimeException e) {
+        return false;
+      }
+    }
+
+    /** A view as the model tracks it, from its metadata. */
+    private static ViewState viewState(org.apache.iceberg.view.ViewMetadata metadata) {
+      ViewState state = new ViewState(
+          ((org.apache.iceberg.view.SQLViewRepresentation)
+              metadata.currentVersion().representations().get(0)).sql(),
+          metadata.currentVersionId(),
+          "false".equals(metadata.properties().get(TableProperties.GC_ENABLED)));
+      metadata.properties().forEach((k, v) -> {
+        if (k.startsWith(KEY_PREFIX)) {
+          state.props.put(k, v);
+        }
+      });
+      state.metadataLocation = metadata.metadataFileLocation();
+      state.location = metadata.location();
+      return state;
+    }
+
     /** A namespace operation on {@code ns}. */
     private Op namespaceOp(Cmd cmd, Writer w, Namespace ns) {
       String key = KEYS.get(cmd.b / 2 % KEYS.size());
@@ -2531,7 +2833,8 @@ class TestCatalogFaultProperties {
                 if (!m.namespaces.containsKey(ns)) {
                   throw new IllegalStateException(ns + " does not exist");
                 }
-                if (m.keySet().stream().anyMatch(id -> id.namespace().equals(ns))) {
+                if (m.keySet().stream().anyMatch(id -> id.namespace().equals(ns))
+                    || m.views.keySet().stream().anyMatch(id -> id.namespace().equals(ns))) {
                   throw new IllegalStateException(ns + " is not empty");
                 }
                 m.namespaces.remove(ns);
@@ -2820,6 +3123,10 @@ class TestCatalogFaultProperties {
             || e instanceof org.apache.iceberg.exceptions.ServiceUnavailableException
             || cmd.kind == Kind.TXN_COMMIT && !(e instanceof ValidationException)
                 && !(e instanceof CommitRefusedException);
+      } catch (NoSuchViewException e) {
+        outcome = Outcome.REJECTED; // a view that is not there, or not any more
+        reason = e.getClass().getSimpleName() + ": " + firstLine(e);
+        failure = e;
       } catch (NoSuchTableException e) {
         outcome = Outcome.REJECTED;
         reason = e.getClass().getSimpleName() + ": " + firstLine(e);
@@ -2854,6 +3161,10 @@ class TestCatalogFaultProperties {
       trace.append(String.format("%s  -> %s%s%s%n", indent, outcome,
           reason.isEmpty() ? "" : " (" + reason + ")", faultsFired));
       Statistics.label("outcome").collect(cmd.kind + " " + outcome);
+      if (cmd.kind.name().contains("VIEW") && outcome == Outcome.REJECTED) {
+        Statistics.label("a view operation rejected")
+            .collect(cmd.kind + " " + reason.replaceAll(":.*", ""));
+      }
       if (!faultsFired.isEmpty()) {
         Statistics.label("outcome after a fault").collect(outcome);
       }
@@ -2988,7 +3299,13 @@ class TestCatalogFaultProperties {
           check(withoutDiff == null, "%s reported %s (%s), but %s", op, outcome, reason,
               withoutDiff);
       }
-      // Observe what the model cannot predict.
+      // Observe what the model cannot predict: a view's metadata location
+      model.views.forEach((id, state) -> {
+        ViewState now = actual.views.get(id);
+        state.metadataLocation = now.metadataLocation;
+        state.location = now.location;
+      });
+      // and a table's
       model.forEach(
           (id, state) -> {
             TableState now = actual.get(id);
@@ -3265,6 +3582,30 @@ class TestCatalogFaultProperties {
           throw fail("%s does not load: %s", id, e);
         }
         tables.put(id, state);
+      }
+      // Views (docs/VIEWS.md): each loads alike through the checker and a fresh reader
+      List<TableIdentifier> views = new ArrayList<>();
+      for (Namespace ns : tables.namespaces.keySet()) {
+        views.addAll(checker.listViews(ns));
+      }
+      check(file.views().size() == views.size(),
+          "the catalog has views %s, but its namespaces list %s", file.views(), views);
+      for (TableIdentifier id : views) {
+        try {
+          org.apache.iceberg.view.ViewMetadata metadata =
+              ((org.apache.iceberg.view.BaseView) checker.loadView(id)).operations().current();
+          org.apache.iceberg.view.ViewMetadata coldMetadata =
+              ((org.apache.iceberg.view.BaseView) cold.loadView(id)).operations().current();
+          check(org.apache.iceberg.view.ViewMetadataParser.toJson(metadata).equals(
+                  org.apache.iceberg.view.ViewMetadataParser.toJson(coldMetadata)),
+              "view %s loads differently through a fresh reader", id);
+          check(!tables.containsKey(id), "%s is a table and a view", id);
+          tables.views.put(id, viewState(metadata));
+          Statistics.label("views read").collect(
+              metadata.metadataFileLocation().startsWith("inline-view://") ? "inline" : "file");
+        } catch (RuntimeException e) {
+          throw fail("view %s does not load: %s", id, e);
+        }
       }
       return tables;
     }
