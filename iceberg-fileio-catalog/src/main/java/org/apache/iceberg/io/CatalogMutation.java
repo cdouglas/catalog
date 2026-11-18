@@ -138,6 +138,13 @@ public class CatalogMutation {
   private final Map<TableIdentifier, Eviction> evictions;
   // The files the evictions so far wrote, each with the eviction that deletes them
   private final List<Map.Entry<Eviction, List<String>>> evicted;
+  // The files written ahead of this transaction's record for the changes staged on it (a metadata
+  // file and its lists, a dropped table's version), which nothing names unless the record lands;
+  // written by the worker pool's threads too
+  private final java.util.Queue<String> writtenAhead =
+      new java.util.concurrent.ConcurrentLinkedQueue<>();
+  // Whether a commit of this transaction ended in a way that leaves its record possibly landed
+  private volatile boolean mayHaveLanded = false;
 
   /**
    * A transaction staged on {@code base}, a read of the catalog's log, whose names bind by {@link
@@ -593,11 +600,14 @@ public class CatalogMutation {
   interface Eviction {
     /**
      * Writes the table's metadata file and returns its location, adding each file it wrote to
-     * {@code written}. A write that fails deletes what was written before it, and throws.
+     * {@code written}. A write that fails has what was written before it deleted, and throws.
      */
     String write(List<String> written);
 
-    /** Deletes {@code files}, written for a record that did not land, logging what it cannot. */
+    /**
+     * Has the catalog's cleanup delete {@code files}, written for a record that did not land
+     * ({@link CommitCleanup}).
+     */
     void delete(List<String> files);
   }
 
@@ -664,8 +674,36 @@ public class CatalogMutation {
   }
 
   /**
-   * Deletes the files this transaction's evictions wrote ({@link #evictLargest}), for a record
-   * that did not land: none of them is named by the catalog.
+   * Records {@code file}, written ahead of this transaction's record for a change staged on it:
+   * garbage if the record never takes effect ({@link #abandonedFiles}).
+   */
+  void wroteAhead(String file) {
+    writtenAhead.add(file);
+  }
+
+  /**
+   * The files written ahead of this transaction's record ({@link #wroteAhead}), for the operation
+   * that staged it to hand to its catalog's cleanup once it failed: all of them, if no commit of
+   * the transaction may have landed (none was tried, or each definitely failed: {@link
+   * CommitCleanup#definitelyFailed}); none if one may have, since its record may name them. The
+   * files of the transaction's evictions are not among them: its commit deletes those itself
+   * ({@link CatalogLog#commit}).
+   */
+  List<String> abandonedFiles() {
+    return mayHaveLanded ? List.of() : List.copyOf(writtenAhead);
+  }
+
+  /**
+   * Whether a commit of this transaction may have landed: one ended in a way that does not say its
+   * record never takes effect ({@link CommitCleanup#definitelyFailed}), or returned.
+   */
+  boolean mayHaveLanded() {
+    return mayHaveLanded;
+  }
+
+  /**
+   * Has the catalog's cleanup delete the files this transaction's evictions wrote ({@link
+   * #evictLargest}), for a record that did not land: none of them is named by the catalog.
    */
   void deleteEvicted() {
     for (Map.Entry<Eviction, List<String>> e : evicted) {
@@ -1024,8 +1062,20 @@ public class CatalogMutation {
     return new CommitFailedException("%s", message);
   }
 
-  /** Commits this transaction to {@code log}: {@link CatalogLog#commit}. */
+  /**
+   * Commits this transaction to {@code log}: {@link CatalogLog#commit}. Notes an outcome that may
+   * have landed ({@link #mayHaveLanded}).
+   */
   public Replica<CatalogState> commit(CatalogLog log) {
-    return log.commit(this);
+    try {
+      Replica<CatalogState> landed = log.commit(this);
+      mayHaveLanded = true;
+      return landed;
+    } catch (RuntimeException e) {
+      if (!CommitCleanup.definitelyFailed(e)) {
+        mayHaveLanded = true;
+      }
+      throw e;
+    }
   }
 }

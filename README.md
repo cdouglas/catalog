@@ -310,6 +310,17 @@ catalog transaction), and a table without a location whose default
 location would be: a store with directories (ADLS with a hierarchical
 namespace) cannot hold a path as a file and a directory at once.
 
+A commit that definitely failed (its record never takes effect) leaves
+nothing it wrote ahead of its record: once its outcome is known, its
+operation hands the metadata file and manifest lists it wrote (an update
+or create that goes to a metadata file, a dropped inline table's version)
+to the catalog's cleanup, which deletes them off the operation's thread,
+on two daemon threads the JVM's catalogs share. A commit whose outcome
+is unknown keeps them, as its record may name them. Closing a catalog
+waits up to 2 s for its deletes, then drops the rest; those, a delete
+that fails, and deletes queued when the JVM exits leave their files for
+a GC by listing.
+
 See [docs/LOG.md](docs/LOG.md) for the commit protocol,
 [docs/ATOMIC_FILE_LOG.md](docs/ATOMIC_FILE_LOG.md) for how the catalog file
 commits, and [docs/design.md](docs/design.md) for guidance on choosing

@@ -150,6 +150,10 @@ public class LogCatalog extends BaseMetastoreCatalog
   private DoubleSupplier compactionDraws = null;
   // What the catalog opened itself, which it closes with it
   private final CloseableGroup closeables = new CloseableGroup();
+  // Where the files written for commits that definitely failed are deleted: null for the pool
+  // every catalog shares
+  private java.util.concurrent.Executor cleanupExecutor = null;
+  private CommitCleanup cleanup;
 
   /**
    * A catalog whose subclass opens its log and FileIO when it is initialized ({@link #openLog}).
@@ -193,6 +197,26 @@ public class LogCatalog extends BaseMetastoreCatalog
     return this;
   }
 
+  /**
+   * Makes the catalog delete the files written for its commits that definitely failed on {@code
+   * executor} ({@link CommitCleanup}) instead of the pool every catalog shares: a direct executor
+   * deletes them on the operation's thread once its outcome is known, for tests whose runs must
+   * repeat. Call it before {@link #initialize}.
+   */
+  LogCatalog cleanupExecutor(java.util.concurrent.Executor executor) {
+    Preconditions.checkState(log == null, "The catalog's cleanup is set before it is initialized");
+    this.cleanupExecutor = executor;
+    return this;
+  }
+
+  /**
+   * Waits up to {@code timeoutMs} for the deletes of files written for commits that definitely
+   * failed, handed over so far; returns whether they are done (tests).
+   */
+  boolean awaitCleanup(long timeoutMs) throws InterruptedException {
+    return cleanup.await(timeoutMs);
+  }
+
   @Override
   public void initialize(String name, Map<String, String> properties) {
     super.initialize(name, properties);
@@ -219,6 +243,7 @@ public class LogCatalog extends BaseMetastoreCatalog
     }
     Preconditions.checkState(
         sharedLog != null && io != null, "%s opened no log", getClass().getSimpleName());
+    cleanup = new CommitCleanup(io, cleanupExecutor);
     RuntimeConfig config = LogCatalogProperties.runtimeConfig(catalogProperties);
     if (clock != null) {
       config = config.withClock(clock);
@@ -258,10 +283,18 @@ public class LogCatalog extends BaseMetastoreCatalog
     closeables.addCloseable(resource);
   }
 
-  /** Closes what the catalog opened itself ({@link #closeWithCatalog}), and its metrics reporter. */
+  /**
+   * Closes what the catalog opened itself ({@link #closeWithCatalog}), and its metrics reporter;
+   * first, it waits a moment for the deletes of files written for its commits that definitely
+   * failed, and drops those still queued, leaving their files for a GC by listing ({@link
+   * CommitCleanup#close}).
+   */
   @Override
   public void close() throws java.io.IOException {
     try {
+      if (cleanup != null) {
+        cleanup.close();
+      }
       closeables.close();
     } finally {
       super.close();
@@ -310,7 +343,9 @@ public class LogCatalog extends BaseMetastoreCatalog
    * Drops {@code identifier}. A drop does not depend on the table's state, but its record names
    * the version it read, so one that conflicts with a concurrent commit to the table is staged
    * again on a fresh read, after the commit loop's wait after a lost race, up to {@link
-   * #OPERATION_ATTEMPTS} times. false means only that the table did not exist.
+   * #OPERATION_ATTEMPTS} times. false means only that the table did not exist. What an attempt
+   * that did not land wrote first (the version of an inline table it keeps the files of) goes to
+   * the catalog's cleanup ({@link CommitCleanup}), unless the attempt may have landed.
    *
    * @throws ServiceUnavailableException if every attempt conflicted: nothing was dropped
    */
@@ -321,30 +356,30 @@ public class LogCatalog extends BaseMetastoreCatalog
       if (!read.state().containsTable(identifier)) {
         return false;
       }
+      CatalogMutation mut = mutation(read);
       TableMetadata dropped;
-      List<String> kept = List.of();
+      String kept = null;
       try {
         dropped = purge ? purgedVersion(identifier, read) : null;
         if (!purge) {
-          kept = keptFiles(identifier, read);
+          kept = keptVersion(identifier, read, mut::wroteAhead);
         }
-        mutation(read).dropTable(identifier).commit(log);
-      } catch (NoSuchTableException e) {
-        deleteQuietly(kept);
-        return false;
-      } catch (RecordTooLargeException e) {
-        deleteQuietly(kept);
-        throw e;
-      } catch (CommitFailedException e) {
-        deleteQuietly(kept);
+        mut.dropTable(identifier).commit(log);
+      } catch (RuntimeException e) {
+        cleanup.delete(mut.abandonedFiles());
+        if (e instanceof NoSuchTableException) {
+          return false;
+        }
+        if (!(e instanceof CommitFailedException)) {
+          throw e;
+        }
         if (attempt >= OPERATION_ATTEMPTS || !log.waitBeforeRetry(attempt)) {
-          throw unavailable(e, attempt, "drop table " + identifier);
+          throw unavailable((CommitFailedException) e, attempt, "drop table " + identifier);
         }
         continue;
       }
-      if (!kept.isEmpty()) {
-        LOG.info("Dropped inline table {}: register {} to bring it back", identifier,
-            kept.get(0));
+      if (kept != null) {
+        LOG.info("Dropped inline table {}: register {} to bring it back", identifier, kept);
       }
       purge(identifier, dropped);
       return true;
@@ -352,20 +387,22 @@ public class LogCatalog extends BaseMetastoreCatalog
   }
 
   /**
-   * The files a drop of {@code identifier} that keeps its files writes first, its metadata file
-   * first: none for a pointer table, whose metadata file and lists are in storage, or where {@link
-   * LogCatalogProperties#DROP_MATERIALIZE} is off; for an inline table, the version {@code read}
-   * holds, which the drop removes, written as a pointer table's. A write that fails deletes what
-   * was written, and fails the drop; with {@link LogCatalogProperties#DROP_FORCE}, the drop goes
-   * on with none, and leaves the table's files with no metadata file to register.
+   * Writes the version of {@code identifier} that {@code read} holds, which a drop that keeps the
+   * table's files removes, to the table's metadata directory as a pointer table's is (its lists,
+   * then a metadata file), giving each file to {@code written}; returns the metadata file. Writes
+   * nothing, and returns null, for a pointer table, whose metadata file and lists are in storage,
+   * or where {@link LogCatalogProperties#DROP_MATERIALIZE} is off. A write that fails has what was
+   * written deleted, and fails the drop; with {@link LogCatalogProperties#DROP_FORCE}, the drop
+   * goes on with none, and leaves the table's files with no metadata file to register.
    */
-  private List<String> keptFiles(TableIdentifier identifier, Replica<CatalogState> read) {
+  private String keptVersion(
+      TableIdentifier identifier, Replica<CatalogState> read, Consumer<String> written) {
     if (!LogCatalogProperties.dropMaterialize(catalogProperties)
         || !read.state().isInlineTable(identifier)) {
-      return List.of();
+      return null;
     }
     try {
-      return tableOpsAsRead(identifier, read).materialize();
+      return tableOpsAsRead(identifier, read).materialize(written);
     } catch (NoSuchTableException | CommitFailedException e) {
       throw e; // the table changed since the read, which the drop reads again
     } catch (RuntimeException e) {
@@ -375,26 +412,7 @@ public class LogCatalog extends BaseMetastoreCatalog
       LOG.warn("Cannot write {} to its metadata directory: dropping it anyway ({}), which leaves "
           + "its files with no metadata file to register", identifier,
           LogCatalogProperties.DROP_FORCE, e);
-      return List.of();
-    }
-  }
-
-  /** Deletes what a drop that did not land wrote, logging what it cannot. */
-  private void deleteQuietly(List<String> files) {
-    deleteQuietly(io, files);
-  }
-
-  /**
-   * Deletes from {@code io} what a commit that did not land wrote (a drop's version of its table,
-   * an eviction's metadata), logging what it cannot.
-   */
-  private static void deleteQuietly(FileIO io, java.util.Collection<String> files) {
-    for (String file : files) {
-      try {
-        io.deleteFile(file);
-      } catch (RuntimeException e) {
-        LOG.warn("Cannot delete {}, which a commit that did not land wrote", file, e);
-      }
+      return null;
     }
   }
 
@@ -501,8 +519,12 @@ public class LogCatalog extends BaseMetastoreCatalog
         }
         mut.commit(log);
         return true;
-      } catch (CommitFailedException e) {
-        if (attempt >= org.apache.iceberg.TableProperties.COMMIT_NUM_RETRIES_DEFAULT + 1) {
+      } catch (RuntimeException e) {
+        // It writes no file ahead of its record (its import pages are pages, which only the sweep
+        // deletes), but any it did would go as every operation's do
+        cleanup.delete(mut.abandonedFiles());
+        if (!(e instanceof CommitFailedException)
+            || attempt >= org.apache.iceberg.TableProperties.COMMIT_NUM_RETRIES_DEFAULT + 1) {
           throw e;
         }
       }
@@ -600,8 +622,9 @@ public class LogCatalog extends BaseMetastoreCatalog
     FileIOTableOperations ops =
         inline.manifests
             ? new InlineManifestTableOperations(
-                tableIdentifier, log, io, inline, inlineSnapshots, read)
-            : new FileIOTableOperations(tableIdentifier, log, io, inline, inlineSnapshots, read);
+                tableIdentifier, log, io, inline, inlineSnapshots, read, cleanup)
+            : new FileIOTableOperations(
+                tableIdentifier, log, io, inline, inlineSnapshots, read, cleanup);
     ops.pinsCommitOnce = pinsCommitOnce;
     ops.pinsExpiries = !LogCatalogProperties.expiryMerge(catalogProperties);
     ops.createCondition = createCondition;
@@ -913,6 +936,8 @@ public class LogCatalog extends BaseMetastoreCatalog
     private final InlineMetadataFileIO tableIO;
     private final InlineSettings inline;
     private final InlineSnapshots inlineSnapshots;
+    // Where what a commit through these operations wrote goes once the commit definitely failed
+    private final CommitCleanup cleanup;
     private volatile Replica<CatalogState> lastRead = null;
     // The replica the last commit through these operations landed in, until commit() adopts it
     private Replica<CatalogState> landed = null;
@@ -930,18 +955,24 @@ public class LogCatalog extends BaseMetastoreCatalog
     // What a create through these operations requires of its namespace
     private CatalogMutation.CreateCondition createCondition = CatalogMutation.CreateCondition.NAME;
 
+    /**
+     * Operations on {@code tableId}, as {@link LogCatalog#newTableOps} makes them, handing what a
+     * commit that definitely failed wrote to {@code cleanup} (null for operations that only read).
+     */
     FileIOTableOperations(
         TableIdentifier tableId,
         CatalogLog log,
         FileIO io,
         InlineSettings inline,
         InlineSnapshots inlineSnapshots,
-        Replica<CatalogState> read) {
+        Replica<CatalogState> read,
+        CommitCleanup cleanup) {
       this.tableIO = InlineMetadataFileIO.of(io);
       this.log = log;
       this.tableId = tableId;
       this.inline = inline;
       this.inlineSnapshots = inlineSnapshots;
+      this.cleanup = cleanup;
       this.lastRead = read;
       if (read != null) {
         loadFrom(read.state());
@@ -1085,16 +1116,9 @@ public class LogCatalog extends BaseMetastoreCatalog
      * Writes {@code metadata} to a new metadata file and returns its location. A metadata file can
      * name only manifest list files, so first each inline-ML snapshot's list, which the catalog
      * held inline or a producer staged, is written to one: the table is leaving inline storage, or
-     * a writer that does not inline is committing to it.
-     */
-    String writeUpdateMetadata(boolean isCreate, TableMetadata metadata) {
-      return writeUpdateMetadata(isCreate, metadata, file -> { });
-    }
-
-    /**
-     * As {@link #writeUpdateMetadata(boolean, TableMetadata)}, giving each list file to {@code
-     * opened} as it is opened, and the metadata file once written: none for a create whose
-     * metadata names its file already (a registered table's), which exists.
+     * a writer that does not inline is committing to it. Gives each list file to {@code opened} as
+     * it is opened, and the metadata file once written: none for a create whose metadata names its
+     * file already (a registered table's), which exists. Each is under a name of its own.
      */
     private String writeUpdateMetadata(
         boolean isCreate, TableMetadata metadata, Consumer<String> opened) {
@@ -1116,30 +1140,31 @@ public class LogCatalog extends BaseMetastoreCatalog
     /**
      * Writes the table as these operations hold it to its metadata directory as a pointer table's
      * is: each inline-ML snapshot's list to a file, then a metadata file naming them. Returns the
-     * files written, the metadata file first. For a drop that keeps the table's files. A write that
-     * fails deletes the files written before it (best effort, logged), and throws.
+     * metadata file, and gives each file written to {@code written}. For a drop that keeps the
+     * table's files. A write that fails has the files written before it deleted ({@link
+     * CommitCleanup}), whatever the drop does next, and throws.
      */
-    List<String> materialize() {
+    String materialize(Consumer<String> written) {
       TableMetadata metadata = current();
       java.util.Queue<String> lists = new java.util.concurrent.ConcurrentLinkedQueue<>();
+      String location;
       try {
         TableMetadata file = withManifestListFiles(metadata, lists::add);
-        String location = writeNewMetadataIfRequired(false, file);
-        List<String> files = new ArrayList<>();
-        files.add(location);
-        files.addAll(lists);
-        return files;
+        location = writeNewMetadataIfRequired(false, file);
       } catch (RuntimeException e) {
-        deleteQuietly(io(), lists);
+        cleanup.delete(lists);
         throw e;
       }
+      written.accept(location);
+      lists.forEach(written);
+      return location;
     }
 
     /**
      * How the inline update or create of {@code metadata} that these operations stage goes to a
      * metadata file instead, if the record it is staged on is larger than the log stores ({@link
      * CatalogMutation#evictLargest}): written as {@link #writeUpdateMetadata} writes an update too
-     * large to inline, its files deleted if the record does not land.
+     * large to inline, its files deleted ({@link CommitCleanup}) if the record does not land.
      */
     private CatalogMutation.Eviction eviction(boolean isCreate, TableMetadata metadata) {
       return new CatalogMutation.Eviction() {
@@ -1151,14 +1176,14 @@ public class LogCatalog extends BaseMetastoreCatalog
             out.addAll(files);
             return location;
           } catch (RuntimeException e) {
-            deleteQuietly(io(), files);
+            cleanup.delete(files);
             throw e;
           }
         }
 
         @Override
         public void delete(List<String> files) {
-          deleteQuietly(io(), files);
+          cleanup.delete(files);
         }
       };
     }
@@ -1337,12 +1362,18 @@ public class LogCatalog extends BaseMetastoreCatalog
             "Cannot commit %s: stale table metadata (not the version last read)", tableId);
       }
       CatalogMutation mut = new CatalogMutation(read, createCondition);
-      stageUpdate(mut, base, metadata);
-      if ((pinsCommitOnce && (replaces || commitsOnce(metadata.changes())))
-          || (pinsExpiries && removesSnapshots(metadata.changes()))) {
-        mut.pin(tableId);
+      try {
+        stageUpdate(mut, base, metadata);
+        if ((pinsCommitOnce && (replaces || commitsOnce(metadata.changes())))
+            || (pinsExpiries && removesSnapshots(metadata.changes()))) {
+          mut.pin(tableId);
+        }
+        landed = mut.commit(log);
+      } catch (RuntimeException e) {
+        // What it wrote ahead of a record that never takes effect: Iceberg's retry writes anew
+        cleanup.delete(mut.abandonedFiles());
+        throw e;
       }
-      landed = mut.commit(log);
     }
 
     /**
@@ -1414,34 +1445,48 @@ public class LogCatalog extends BaseMetastoreCatalog
      * #OPERATION_ATTEMPTS} conflicts it reads the catalog again: if the table exists, it throws
      * the conflict, which Iceberg reports as the table created concurrently; if not, it throws
      * {@link ServiceUnavailableException}, which Iceberg passes on, so a table that does not exist
-     * is never reported as existing (Bug 107 (create conflict reported as exists)).
+     * is never reported as existing (Bug 107 (create conflict reported as exists)). A create that
+     * failed, unless its last attempt may have landed, has the metadata file it wrote for every
+     * attempt deleted ({@link CommitCleanup}).
      */
     private void commitCreate(TableMetadata metadata) {
-      Consumer<CatalogMutation> create = stageCreate(metadata);
-      Replica<CatalogState> read = lastRead;
-      for (int attempt = 1; ; attempt++) {
-        CatalogMutation mut = new CatalogMutation(read, createCondition);
-        create.accept(mut);
-        try {
-          landed = mut.commit(log);
-          return;
-        } catch (CommitFailedException e) {
-          if (attempt >= OPERATION_ATTEMPTS || !log.waitBeforeRetry(attempt)) {
-            if (log.read().state().containsTable(tableId)) {
-              throw e;
+      java.util.Queue<String> written = new java.util.concurrent.ConcurrentLinkedQueue<>();
+      CatalogMutation mut = null;
+      try {
+        Consumer<CatalogMutation> create = stageCreate(metadata, written::add);
+        Replica<CatalogState> read = lastRead;
+        for (int attempt = 1; ; attempt++) {
+          mut = new CatalogMutation(read, createCondition);
+          create.accept(mut);
+          try {
+            landed = mut.commit(log);
+            return;
+          } catch (CommitFailedException e) {
+            if (attempt >= OPERATION_ATTEMPTS || !log.waitBeforeRetry(attempt)) {
+              if (log.read().state().containsTable(tableId)) {
+                throw e;
+              }
+              throw unavailable(e, attempt, "create table " + tableId);
             }
-            throw unavailable(e, attempt, "create table " + tableId);
+            read = log.read();
           }
-          read = log.read();
         }
+      } catch (RuntimeException e) {
+        // Each attempt's record named the file; only the last may have landed
+        if (mut == null || !mut.mayHaveLanded()) {
+          cleanup.delete(written);
+        }
+        throw e;
       }
     }
 
     /**
      * Stages the creation of this table with {@code metadata}: inline, or in a metadata file that
-     * it writes now, so the step stages the same create on any read of the catalog.
+     * it writes now, giving each file it writes to {@code written}, so the step stages the same
+     * create on any read of the catalog.
      */
-    private Consumer<CatalogMutation> stageCreate(TableMetadata metadata) {
+    private Consumer<CatalogMutation> stageCreate(
+        TableMetadata metadata, Consumer<String> written) {
       if (inline.metadata) {
         // An inline-ML createTransaction with one or more
         // newFastAppend calls puts InlineSnapshots into `metadata`. Two things
@@ -1477,7 +1522,7 @@ public class LogCatalog extends BaseMetastoreCatalog
               .evictable(tableId, eviction(true, metadata));
         }
       }
-      String location = writeUpdateMetadata(true, metadata);
+      String location = writeUpdateMetadata(true, metadata, written);
       return mut -> mut.createTable(tableId, location);
     }
 
@@ -1658,10 +1703,13 @@ public class LogCatalog extends BaseMetastoreCatalog
       return e;
     }
 
-    /** Stages the update as a metadata file, if {@code orFile}; it is not inline either way. */
+    /**
+     * Stages the update as a metadata file, if {@code orFile}, written ahead of {@code mut}'s
+     * record ({@link CatalogMutation#wroteAhead}); it is not inline either way.
+     */
     private boolean toFile(CatalogMutation mut, TableMetadata metadata, boolean orFile) {
       if (orFile) {
-        mut.updateTable(tableId, writeUpdateMetadata(false, metadata));
+        mut.updateTable(tableId, writeUpdateMetadata(false, metadata, mut::wroteAhead));
       }
       return false;
     }
@@ -2228,8 +2276,9 @@ public class LogCatalog extends BaseMetastoreCatalog
         throw collected.asNoSuchTable();
       }
       Map<Long, Snapshot> current = new HashMap<>();
+      // it only reads: it commits nothing, so has nothing to clean up
       FileIOTableOperations ops = new FileIOTableOperations(
-          named, log, io, inline, inlineSnapshots, now);
+          named, log, io, inline, inlineSnapshots, now, null);
       for (Snapshot snapshot : ops.current().snapshots()) {
         current.put(snapshot.snapshotId(), snapshot);
       }
@@ -2537,8 +2586,9 @@ public class LogCatalog extends BaseMetastoreCatalog
         FileIO io,
         InlineSettings inline,
         InlineSnapshots inlineSnapshots,
-        Replica<CatalogState> read) {
-      super(tableId, log, io, inline, inlineSnapshots, read);
+        Replica<CatalogState> read,
+        CommitCleanup cleanup) {
+      super(tableId, log, io, inline, inlineSnapshots, read, cleanup);
     }
 
     @Override
@@ -2616,12 +2666,42 @@ public class LogCatalog extends BaseMetastoreCatalog
    * scan read by the refs it read (a read witness, which the encoding judges by what changed of
    * them and of the schema; under {@code lamport}, any change), a declared read by the table's
    * version (a read pin). A commit with no changes checks its reads on this read and writes
-   * nothing. Not retried: a change it conflicts with is a real conflict.
+   * nothing. Not retried: a change it conflicts with is a real conflict. A commit that fails,
+   * unless it may have landed, has what it wrote ahead of its record deleted ({@link
+   * CommitCleanup}): the metadata files of the updates and creates that do not go inline, and the
+   * versions of the inline tables it drops keeping their files.
    */
   @Override
   public void commitTransaction(CatalogCommit commit) {
     final Replica<CatalogState> current = log.read();
     final CatalogMutation newCatalog = mutation(current);
+    // The tables dropped with purge, each with the version it drops and its history (Bug 96)
+    Map<TableIdentifier, TableMetadata> purged = new HashMap<>();
+    try {
+      if (!stageTransaction(commit, current, newCatalog, purged)) {
+        return;
+      }
+      newCatalog.commit(log);
+    } catch (RuntimeException e) {
+      cleanup.delete(newCatalog.abandonedFiles());
+      throw e;
+    }
+
+    // The commit landed: a purge that cannot read or delete a file logs it (Bug 96)
+    purged.forEach(this::purge);
+  }
+
+  /**
+   * Stages {@code commit} on {@code newCatalog}, a transaction on {@code current}, as {@link
+   * #commitTransaction} commits it, writing ahead of its record what goes to files ({@link
+   * CatalogMutation#wroteAhead}); adds the tables it drops with purge to {@code purged}. Returns
+   * false, staging nothing, if it has no changes, once its reads are checked.
+   */
+  private boolean stageTransaction(
+      CatalogCommit commit,
+      Replica<CatalogState> current,
+      CatalogMutation newCatalog,
+      Map<TableIdentifier, TableMetadata> purged) {
     boolean witness = LogCatalogProperties.txnReadWitness(catalogProperties);
 
     for (TableRead read : commit.reads()) {
@@ -2637,7 +2717,7 @@ public class LogCatalog extends BaseMetastoreCatalog
       }
     }
     if (!commit.hasChanges()) {
-      return;
+      return false;
     }
 
     for (NamespaceChange change : commit.namespaceChanges()) {
@@ -2659,8 +2739,6 @@ public class LogCatalog extends BaseMetastoreCatalog
       }
     }
 
-    // The tables dropped with purge, each with the version it drops and its history (Bug 96)
-    Map<TableIdentifier, TableMetadata> purged = new HashMap<>();
     // The tables dropped keeping their files, which are written once the record is staged
     List<TableIdentifier> keeping = new ArrayList<>();
     for (TableChange change : commit.tableChanges()) {
@@ -2716,7 +2794,9 @@ public class LogCatalog extends BaseMetastoreCatalog
     }
 
     for (Map.Entry<TableIdentifier, TableMetadata> created : commit.createdTables().entrySet()) {
-      tableOpsAsRead(created.getKey(), current).stageCreate(created.getValue()).accept(newCatalog);
+      tableOpsAsRead(created.getKey(), current)
+          .stageCreate(created.getValue(), newCatalog::wroteAhead)
+          .accept(newCatalog);
     }
 
     for (NamespaceChange change : commit.namespaceChanges()) {
@@ -2739,26 +2819,11 @@ public class LogCatalog extends BaseMetastoreCatalog
       }
     }
 
-    // Each inline table dropped keeping its files is written first; a failure to write one, or a
-    // commit that fails, deletes what they wrote
-    List<String> kept = new ArrayList<>();
-    try {
-      for (TableIdentifier tableId : keeping) {
-        kept.addAll(keptFiles(tableId, current));
-      }
-    } catch (RuntimeException e) {
-      deleteQuietly(kept);
-      throw e;
+    // Each inline table dropped keeping its files is written last, once the record is staged
+    for (TableIdentifier tableId : keeping) {
+      keptVersion(tableId, current, newCatalog::wroteAhead);
     }
-    try {
-      newCatalog.commit(log);
-    } catch (CommitFailedException | NoSuchTableException | RecordTooLargeException e) {
-      deleteQuietly(kept);
-      throw e;
-    }
-
-    // The commit landed: a purge that cannot read or delete a file logs it (Bug 96)
-    purged.forEach(this::purge);
+    return true;
   }
 
   /**

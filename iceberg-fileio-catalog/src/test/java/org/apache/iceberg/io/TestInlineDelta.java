@@ -692,7 +692,7 @@ public class TestInlineDelta {
           null, null,
           new FileIOCatalog.InlineSettings(
               true, true, false, InlineMetadataCodecs.JSON_GZIP, InlineDeltaCodec.APPEND_LIMIT),
-          new LogCatalog.InlineSnapshots(), null);
+          new LogCatalog.InlineSnapshots(), null, null);
       assertThat(ops).isInstanceOf(org.apache.iceberg.ManifestListSink.class);
     }
 

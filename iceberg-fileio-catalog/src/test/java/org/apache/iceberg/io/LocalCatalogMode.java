@@ -329,6 +329,9 @@ enum LocalCatalogMode {
       catalog.clock(clockMs);
     }
     catalog.compactionDraws(draws);
+    // What a commit that failed wrote is deleted on its thread once its outcome is known, not on
+    // the shared pool, so that suites and fuzz runs repeat (their stores' faults are drawn in order)
+    catalog.cleanupExecutor(Runnable::run);
     catalog.initialize(name, properties);
     return (C) catalog;
   }

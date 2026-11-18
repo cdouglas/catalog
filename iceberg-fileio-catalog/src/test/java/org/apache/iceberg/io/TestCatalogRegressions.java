@@ -7912,6 +7912,221 @@ public class TestCatalogRegressions {
     return cases.stream();
   }
 
+  /**
+   * A store that runs {@code racer}, once, as the next metadata file is opened: another writer's
+   * commit landing between a commit's staging, which writes the file, and its record.
+   */
+  static class RacingMetadataWrites extends InMemoryAtomicFileIO {
+    volatile Runnable racer = null;
+
+    @Override
+    public OutputFile newOutputFile(String path) {
+      Runnable race = racer;
+      if (race != null && path.endsWith(".metadata.json")) {
+        racer = null;
+        race.run();
+      }
+      return super.newOutputFile(path);
+    }
+  }
+
+  /**
+   * Bug 119 (failed attempts leave metadata files): an update that goes to a metadata file (an
+   * inline table's that does not fit inline, evicting it; any commit to a pointer table) writes
+   * the file, and first a manifest list file for each snapshot whose list the catalog holds,
+   * before its record is sent. A record that lost its race left them, named by nothing, and
+   * Iceberg retried the commit up to four times, each attempt writing new ones; a catalog
+   * transaction's left them the same way. Each operation now hands what it wrote ahead of a commit
+   * that definitely failed (its record never takes effect) to the catalog's cleanup, which deletes
+   * it off the operation's thread (a direct executor in these suites); a commit whose outcome is
+   * unknown keeps them, since its record may name them. Found by the 2026-11-17 design review
+   * (F6).
+   */
+  @Nested
+  class FailedAttemptsLeaveNoFiles {
+
+    /** A table of ten fast appends, whose lists an inline-ML catalog holds. */
+    private Table tenAppends(LogCatalog catalog) {
+      catalog.createNamespace(mixedNs);
+      Table table = catalog.createTable(mixed, intSchema);
+      for (int i = 0; i < 10; i++) {
+        table.newFastAppend().appendFile(dataFile("f" + i)).commit();
+      }
+      assertThat(table.currentSnapshot().manifestListLocation()).as("inline").isNull();
+      return table;
+    }
+
+    /**
+     * The files of {@code table}'s metadata directory that its metadata does not name: not its
+     * metadata file, a file of its metadata log, nor a snapshot's list or manifest.
+     */
+    private Set<String> unnamed(InMemoryAtomicFileIO io, Table table) {
+      org.apache.iceberg.TableMetadata metadata =
+          ((org.apache.iceberg.HasTableOperations) table).operations().current();
+      Set<String> named = new HashSet<>();
+      named.add(metadata.metadataFileLocation());
+      metadata.previousFiles().forEach(entry -> named.add(entry.file()));
+      for (org.apache.iceberg.Snapshot snapshot : metadata.snapshots()) {
+        named.add(snapshot.manifestListLocation());
+        snapshot.allManifests(io).forEach(manifest -> named.add(manifest.path()));
+      }
+      Set<String> files = metadataDirectory(io, table.location());
+      files.removeAll(named);
+      return files;
+    }
+
+    /**
+     * The review's confirmation: two writers evict a table of ten inline-ML snapshots at once (the
+     * winner's lands as the loser writes its metadata file, after its refresh). The loser's
+     * eviction wrote ten lists and a metadata file for a record that lost, and Iceberg's retry, on
+     * the table the winner evicted, wrote another metadata file, which landed. The loser's first
+     * files are gone; the winner's lists and both landed metadata files remain.
+     */
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND_ML", "MEMLOG_ML", "AZLOG_ML"})
+    void aRacingEvictionThatLostDeletesWhatItWrote(LocalCatalogMode mode) {
+      RacingMetadataWrites io = new RacingMetadataWrites();
+      LogCatalog winner = small(io, mode);
+      LogCatalog loser = small(io, mode);
+      tenAppends(winner);
+      Table first = winner.loadTable(mixed);
+      io.racer = () -> first.updateProperties().set("a", bigValue(4096)).commit();
+
+      loser.loadTable(mixed).updateProperties().set("b", bigValue(4096)).commit();
+
+      assertThat(io.racer).as("raced").isNull();
+      assertThat(loser.log().counts().conflicts()).as("the loser's first attempt").isEqualTo(1);
+      Table read = small(io, mode).loadTable(mixed);
+      assertThat(read.properties()).containsKeys("a", "b");
+      assertThat(read.currentSnapshot().manifestListLocation()).as("evicted").isNotNull();
+      manifestLists(io, read); // each snapshot's list, the winner's, exists
+      assertThat(dataFiles(read)).hasSize(10);
+      assertThat(unnamed(io, read)).as("files no table names").isEmpty();
+    }
+
+    /** As a catalog transaction's eviction loses to a commit landing as it writes its files. */
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND_ML", "MEMLOG_ML"})
+    void aTransactionWhoseEvictionLostDeletesWhatItWrote(LocalCatalogMode mode) {
+      RacingMetadataWrites io = new RacingMetadataWrites();
+      LogCatalog other = small(io, mode);
+      LogCatalog catalog = small(io, mode);
+      tenAppends(other);
+      CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      txn.asCatalog().loadTable(mixed).updateProperties().set("b", bigValue(4096)).commit();
+      io.racer = () -> other.loadTable(mixed).newFastAppend().appendFile(dataFile("x")).commit();
+
+      assertThatThrownBy(txn::commitTransaction).isInstanceOf(CommitFailedException.class);
+
+      assertThat(io.racer).as("raced").isNull();
+      Table read = small(io, mode).loadTable(mixed);
+      assertThat(read.properties()).doesNotContainKey("b");
+      assertThat(dataFiles(read)).hasSize(11);
+      assertThat(unnamed(io, read)).as("files no table names").isEmpty();
+    }
+
+    /**
+     * A create whose every attempt conflicted wrote its metadata file once, and named it in each
+     * attempt's record: it goes once the create has failed (here a pointer create, which binds
+     * its name by the namespace's version, each attempt losing to a sibling's create).
+     */
+    @Test
+    void aCreateThatFailedDeletesItsMetadataFile() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      Map<String, String> properties = new HashMap<>(BY_NAMESPACE);
+      properties.put(LogCatalogProperties.MAX_APPEND_COUNT, "1000");
+      LogCatalog catalog = LocalCatalogMode.MEMLOG.catalog(io, WAREHOUSE, "c", properties);
+      LogCatalog other = LocalCatalogMode.MEMLOG.catalog(io, WAREHOUSE, "c", properties);
+      catalog.createNamespace(mixedNs);
+      String location = WAREHOUSE + "/created";
+      int[] sibling = {0};
+
+      Throwable failed = raced(io,
+          () -> other.createTable(TableIdentifier.of(mixedNs, "s" + sibling[0]++), intSchema),
+          () -> catalog.buildTable(mixed, intSchema).withLocation(location).create());
+
+      assertThat(failed)
+          .isInstanceOf(org.apache.iceberg.exceptions.ServiceUnavailableException.class);
+      assertThat(catalog.tableExists(mixed)).isFalse();
+      assertThat(metadataDirectory(io, location)).as("its metadata file").isEmpty();
+    }
+
+    /**
+     * A commit whose outcome is unknown keeps what it wrote: its record may name it. Here it
+     * landed, and the table loads from the metadata file and lists its eviction wrote.
+     */
+    @Test
+    void anEvictionWhoseOutcomeIsUnknownKeepsWhatItWrote() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = small(io, LocalCatalogMode.APPEND_ML);
+      Table table = tenAppends(catalog);
+      Set<String> before = metadataDirectory(io, table.location());
+
+      // The eviction lands, but its writer cannot read the catalog back to learn so
+      boolean[] landed = {false};
+      io.injectFaults((location, strategy) -> {
+        if (landed[0] || !location.equals(CATALOG)) {
+          return Fault.NONE;
+        }
+        landed[0] = true;
+        return Fault.LANDED_AS_CONFLICT;
+      });
+      io.injectReadFaults(
+          location -> landed[0] && location.equals(CATALOG) ? ReadFault.FAIL : ReadFault.NONE);
+      try {
+        assertThatThrownBy(() -> table.updateProperties().set("k", bigValue(4096)).commit())
+            .isInstanceOf(CommitStateUnknownException.class);
+      } finally {
+        io.injectFaults((location, strategy) -> Fault.NONE);
+        io.injectReadFaults(location -> ReadFault.NONE);
+      }
+
+      Table read = small(io, LocalCatalogMode.APPEND_ML).loadTable(mixed);
+      assertThat(read.properties()).containsKey("k");
+      manifestLists(io, read);
+      assertThat(metadataDirectory(io, table.location())).as("ten lists and a metadata file")
+          .containsAll(before).hasSize(before.size() + 11);
+      assertThat(unnamed(io, read)).isEmpty();
+    }
+
+    /**
+     * A catalog on the shared pool of daemon threads deletes off the operation's thread, once the
+     * outcome is known; {@code awaitCleanup} waits for it.
+     */
+    @Test
+    void theSharedPoolDeletesOffTheOperationsThread() throws Exception {
+      Set<Thread> deleters = ConcurrentHashMap.newKeySet();
+      RacingMetadataWrites io = new RacingMetadataWrites() {
+        @Override
+        public void deleteFile(String location) {
+          deleters.add(Thread.currentThread());
+          super.deleteFile(location);
+        }
+      };
+      Map<String, String> properties = Map.of(
+          CatalogProperties.WAREHOUSE_LOCATION, WAREHOUSE,
+          LogCatalogProperties.RACE_MIN_WAIT_MS, "0",
+          "fileio.catalog.inline", "true",
+          "fileio.catalog.inline.manifests", "true",
+          FileIOCatalog.INLINE_MAX_UPDATE_SIZE, "2048");
+      try (FileIOCatalog winner = new FileIOCatalog("c", CATALOG, io, new HashMap<>());
+          FileIOCatalog loser = new FileIOCatalog("c", CATALOG, io, new HashMap<>())) {
+        winner.initialize("c", properties);
+        loser.initialize("c", properties);
+        tenAppends(winner);
+        Table first = winner.loadTable(mixed);
+        io.racer = () -> first.updateProperties().set("a", bigValue(4096)).commit();
+
+        loser.loadTable(mixed).updateProperties().set("b", bigValue(4096)).commit();
+
+        assertThat(io.racer).as("raced").isNull();
+        assertThat(loser.awaitCleanup(30_000)).isTrue();
+        assertThat(deleters).isNotEmpty().doesNotContain(Thread.currentThread());
+        assertThat(unnamed(io, loser.loadTable(mixed))).isEmpty();
+      }
+    }
+  }
+
   /** Properties of a catalog whose creates bind names by the namespace's version. */
   private static final Map<String, String> BY_NAMESPACE =
       Map.of(LogCatalogProperties.CREATE_CONDITION, "namespace");

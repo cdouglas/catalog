@@ -847,6 +847,17 @@ A pointer writer's commit to an inline table is the same record and
 has the same effect. The table version check makes the step atomic
 with the commit it carries.
 
+The files an eviction writes (as any update or create that goes to a
+metadata file writes them) have names of their own, which only its
+record names. If the record never takes effect (a conflict, a rejection:
+a `CleanableFailure`, or `AlreadyExistsException`), the writer's
+operation hands them, once its outcome is known, to the catalog's
+cleanup (`CommitCleanup`), which deletes them off the operation's
+thread; Iceberg's retry writes new ones. A commit whose outcome is
+unknown keeps them, since its record may have landed; a file the
+cleanup could not delete is left for a GC by listing (Bug 119 (failed
+attempts leave metadata files)). The cleanup never deletes a page.
+
 ### Pointer → Inline (Re-inlining)
 
 An inline writer's next update to a pointer table is full mode if the
@@ -942,8 +953,8 @@ transaction as a conflict (`CommitFailedException`), as the
 transaction's updates that never fit inline fail on a changed table. A
 record still over the bound with nothing left inline is rejected
 (`RecordTooLargeException`, not retried). The files a record's
-evictions wrote are deleted if it does not land (a conflict, a
-rejection), and kept if its outcome is unknown.
+evictions wrote are deleted, by the catalog's cleanup, if it does not
+land (a conflict, a rejection), and kept if its outcome is unknown.
 `LogCatalog.reinline` returns false for a record over the bound and
 commits nothing. Evictions count in `CatalogLog.CommitCounts.evicted`.
 A record is never fragmented over several appends: that protocol waits

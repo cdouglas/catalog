@@ -483,7 +483,18 @@ does not run again: a writer that fails after the drop landed leaves the
 table's files, which no catalog entry names any more, for a GC by listing
 the table's location. A drop that keeps an inline table's files, forced
 past a failure to write the table to its metadata directory
-(`fileio.catalog.drop.force`), leaves them the same way.
+(`fileio.catalog.drop.force`), leaves them the same way. Before a commit,
+an operation may write files that only its record names, each under a
+name of its own: a metadata file and its manifest lists, for an update or
+create that goes to a metadata file, and the version of an inline table
+a drop keeps the files of. If the commit definitely failed (a
+`CleanableFailure`, or `AlreadyExistsException`), the operation hands
+them to the catalog's cleanup (`CommitCleanup`), which deletes them off
+its thread, on a small pool of daemon threads the JVM's catalogs share;
+after an unknown outcome they stay, as its record may name them, for a GC
+by listing (Bug 119 (failed attempts leave metadata files)). Pages are
+never among them: a page's name is its content's address, which another
+writer's record may name, and only a sweep deletes pages.
 `TestCatalogFaultProperties`,
 `TestMultiWriterProperties` and the `CommitProtocol` fuzzer check that an
 operation reported failed any way but unknown did not take effect, and the
