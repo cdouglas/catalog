@@ -1144,17 +1144,15 @@ public class TestInlineManifestEndToEnd {
               ((org.apache.iceberg.BaseTable) tbl).operations();
       org.apache.iceberg.TableMetadata current = ops.current();
 
-      // Build two TableMetadata variants that share the same sort-order id (1)
-      // with different content. setDefaultSortOrder via Builder assigns the
-      // next available id — starting from the same current state, both Builders
-      // independently pick id 1, exactly as concurrent replaceTransaction
-      // commits would.
-      org.apache.iceberg.SortOrder orderA =
-          org.apache.iceberg.SortOrder.builderFor(TEST_SCHEMA).asc("id").build();
+      // Two versions that give sort-order id 1 different content, as concurrent
+      // replaceTransaction commits do: another writer's sort order A lands as
+      // id 1, and this commit's metadata was built on the version before it,
+      // where order B took id 1. Its base is the version the operations last
+      // read (Bug 95 (failed refresh, then lost update)): the one A landed in.
+      tbl.replaceSortOrder().asc("id").commit();
+      org.apache.iceberg.TableMetadata baseWithA = ops.refresh();
       org.apache.iceberg.SortOrder orderB =
           org.apache.iceberg.SortOrder.builderFor(TEST_SCHEMA).desc("id").build();
-      org.apache.iceberg.TableMetadata baseWithA = org.apache.iceberg.TableMetadata
-          .buildFrom(current).setDefaultSortOrder(orderA).build();
       org.apache.iceberg.TableMetadata newWithB = org.apache.iceberg.TableMetadata
           .buildFrom(current).setDefaultSortOrder(orderB).build();
 
@@ -1202,12 +1200,11 @@ public class TestInlineManifestEndToEnd {
               ((org.apache.iceberg.BaseTable) tbl).operations();
       org.apache.iceberg.TableMetadata current = ops.current();
 
-      org.apache.iceberg.SortOrder orderA =
-          org.apache.iceberg.SortOrder.builderFor(TEST_SCHEMA).asc("id").build();
+      // As above: sort order A landed as id 1 after the version this commit built on
+      tbl.replaceSortOrder().asc("id").commit();
+      org.apache.iceberg.TableMetadata baseWithA = ops.refresh();
       org.apache.iceberg.SortOrder orderB =
           org.apache.iceberg.SortOrder.builderFor(TEST_SCHEMA).desc("id").build();
-      org.apache.iceberg.TableMetadata baseWithA = org.apache.iceberg.TableMetadata
-          .buildFrom(current).setDefaultSortOrder(orderA).build();
       org.apache.iceberg.TableMetadata newWithB = org.apache.iceberg.TableMetadata
           .buildFrom(current).setDefaultSortOrder(orderB).build();
 
