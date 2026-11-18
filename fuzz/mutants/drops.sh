@@ -1,4 +1,4 @@
-# Calibration of drops (anchors as of fileio 7da0e77): each mutant must fail an oracle.
+# Calibration of drops (anchors as of fileio 6a4c762): each mutant must fail an oracle.
 # dropnowrite writes nothing before a drop that keeps an inline table's files (errata T4: the
 # dropped table cannot be registered); dropnodelete leaves what a drop that lost its race wrote
 # (stray metadata and list files beside the ones its retry writes); purgeafter reads the history
@@ -19,9 +19,12 @@ mutant() { # name main-dir test-dir
   local M=$2
   case $1 in
     # the drop writes nothing before its record
-    dropnowrite) mutate $M/LogCatalog.java "    return tableOpsAsRead(identifier, read).materialize();" "    return List.of();" ;;
+    dropnowrite) mutate $M/LogCatalog.java "      return tableOpsAsRead(identifier, read).materialize(written);" "      return null;" ;;
     # what a drop that did not land wrote stays
-    dropnodelete) mutate $M/LogCatalog.java "        io.deleteFile(file);" "" ;;
+    dropnodelete) mutate $M/LogCatalog.java "      } catch (RuntimeException e) {
+        cleanup.delete(mut.abandonedFiles());
+        if (e instanceof NoSuchTableException) {" "      } catch (RuntimeException e) {
+        if (e instanceof NoSuchTableException) {" ;;
     # the purge reads the dropped version's history after the drop lands
     purgeafter) mutate $M/LogCatalog.java \
       "      version.snapshots(); // now, while the catalog names their pages" "" ;;

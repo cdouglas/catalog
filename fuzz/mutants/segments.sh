@@ -54,18 +54,18 @@ mutant() { # name main-dir test-dir (the catalog's; these mutants are intentlog'
     # TLA+ sweepinflight: the sweep deletes unnamed blobs of any ordinal, an Install's in flight
     sweepinflight) mutate $SL "      if (ordinal >= 0 && ordinal <= newest && !named.contains(name)) {" "      if (ordinal >= 0 && !named.contains(name)) {" ;;
     # a checkpoint drops a Retired entry past its TTL without deleting its segment
-    dropretired) mutate $SL "        if (!expired(old, now) || !deleteRetired(c.logId(), old, deleted)) {" "        if (!expired(old, now)) {" ;;
+    dropretired) mutate $SL "        if (!expired(old, now) || !deleteRetired(c, old, deleted)) {" "        if (!expired(old, now)) {" ;;
     # an entry's location ignored: the segment is looked for under the prefix
     nolocation) mutate $SL "    if (location.isEmpty()) {
-      return path(logId, name);" "    if (true) {
-      return path(logId, name);" ;;
+      return path(prefix, logId, name);" "    if (true) {
+      return path(prefix, logId, name);" ;;
     # TLA+ sweepothers, Bug 100 (sweep deleted another log's segments): the sweep lists the whole
     # prefix, every log's segments, and takes another log's for its own unnamed blobs
-    sweepothers) mutate $SL "    for (String full : store.list(path(c.logId(), \"seg-\"))) {
-      long ordinal = ordinalAt(prefix, c.logId(), full); // -1: none of this log's segments" "    for (String full : store.list(prefix + \"/\")) {
+    sweepothers) mutate $SL "    for (String full : store.list(path(c.prefix(), c.logId(), \"seg-\"))) {
+      long ordinal = ordinalAt(c.prefix(), c.logId(), full); // -1: none of this log's segments" "    for (String full : store.list(c.prefix() + \"/\")) {
       long ordinal = ordinalOf(full.substring(full.lastIndexOf('/') + 1));" ;;
     # a creation that found another writer's log keeps its segment 0, which no sweep lists
-    creationleak) mutate $SL "      abandon(logId, name);
+    creationleak) mutate $SL "      abandon(prefix, logId, name);
       created(checkpoint, e);" "      created(checkpoint, e);" ;;
     # TLA+ sdkretry: an append whose reply was lost is sent again below the runtime
     sdkretry) mutate $SL "        a = store.append(path(seg), frame);" "        try {

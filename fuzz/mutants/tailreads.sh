@@ -25,7 +25,8 @@ mutant() { # name main-dir test-dir (the catalog's; these mutants are intentlog'
   case $1 in
     # TLA+ lengthonly: a tail read takes an object no shorter than its tail for the same one,
     # neither comparing the trailer at N - 20 nor the incarnation of the frames after N
-    lengthonly) mutate $FL "    if (!Arrays.equals(bytes, 0, TRAILER_SIZE, held.trailer, 0, TRAILER_SIZE)) {" "    if (false) {" \
+    lengthonly) mutate $FL "      if (from != null && (size >= TRAILER_SIZE ? !Arrays.equals(
+          bytes, 0, TRAILER_SIZE, from.view.trailer, 0, TRAILER_SIZE) : !cut)) {" "      if (from != null && (size >= TRAILER_SIZE ? false : !cut)) {" \
       && mutate $FL "      end = frameEnd(bytes, pos, n - TRAILER_SIZE, held.incarnation);" "      end = frameEnd(bytes, pos, n - TRAILER_SIZE, null);" ;;
     # TLA+ notrailer: a read checks no trailer (format 2): a splice at a frame's end decodes
     notrailer) mutate $FL "    int trailer = (int) end - TRAILER_SIZE;
