@@ -6154,4 +6154,58 @@ public class TestCatalogRegressions {
           .hasMessage("Table does not exist: ns.t");
     }
   }
+
+  /** A store that counts its closes, which a catalog can load by name ({@code io-impl}). */
+  public static class CountingClosesFileIO extends InMemoryAtomicFileIO {
+    final java.util.concurrent.atomic.AtomicInteger closes =
+        new java.util.concurrent.atomic.AtomicInteger();
+
+    public CountingClosesFileIO() {}
+
+    @Override
+    public void close() {
+      closes.incrementAndGet();
+    }
+  }
+
+  /**
+   * Bug 102 (catalog never closed its FileIO): FileIOCatalog loads its FileIO from its properties
+   * ({@code io-impl}) when it is not given one, but LogCatalog did not override {@code close()}:
+   * closing the catalog closed only its metrics reporter, and the FileIO (an S3, GCS or ADLS
+   * client, with its connections and threads) stayed open. JdbcCatalog, HadoopCatalog,
+   * InMemoryCatalog and RESTCatalog close the FileIO they create. The catalog now closes what it
+   * opened itself, and leaves a FileIO or log it was given to its caller, who may share it with
+   * other catalogs. Found by the 2026-11-17 design review (API reviewer).
+   */
+  @Nested
+  class ClosingTheCatalog {
+
+    @Test
+    void closesTheFileIOItLoaded() throws IOException {
+      FileIOCatalog catalog = new FileIOCatalog();
+      catalog.initialize("c", Map.of(
+          CatalogProperties.WAREHOUSE_LOCATION, WAREHOUSE,
+          CatalogProperties.FILE_IO_IMPL, CountingClosesFileIO.class.getName()));
+      catalog.createNamespace(mixedNs);
+      CountingClosesFileIO io = (CountingClosesFileIO) catalog.io();
+      assertThat(io.closes).hasValue(0);
+
+      catalog.close();
+
+      assertThat(io.closes).hasValue(1);
+    }
+
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "MEMLOG", "AZLOG"})
+    void leavesWhatItWasGivenToItsCaller(LocalCatalogMode mode) throws IOException {
+      CountingClosesFileIO io = new CountingClosesFileIO();
+      LogCatalog catalog = catalog(io, mode);
+      catalog.createNamespace(mixedNs);
+
+      catalog.close();
+
+      assertThat(io.closes).hasValue(0);
+      assertThat(catalog(io, mode).namespaceExists(mixedNs)).isTrue();
+    }
+  }
 }

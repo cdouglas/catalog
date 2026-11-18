@@ -82,7 +82,9 @@ import org.intentlog.SharedLog;
  *
  * <p>A catalog is given its log and FileIO, or a subclass opens them from the catalog's
  * properties ({@link #openLog}): {@link FileIOCatalog} keeps the log in one object of a store
- * with conditional writes.
+ * with conditional writes. Closing the catalog closes what it opened itself ({@link
+ * #closeWithCatalog}); a log or FileIO it was given stays its caller's, who may share it with
+ * other catalogs.
  */
 public class LogCatalog extends BaseMetastoreCatalog
     implements SupportsNamespaces, SupportsCatalogTransactions {
@@ -136,6 +138,8 @@ public class LogCatalog extends BaseMetastoreCatalog
   // The clock the catalog's commits mint their ids from, and compact by; null for the system's
   private LongSupplier clock = null;
   private DoubleSupplier compactionDraws = null;
+  // What the catalog opened itself, which it closes with it
+  private final CloseableGroup closeables = new CloseableGroup();
 
   /** A catalog whose subclass opens its log and FileIO when it is initialized ({@link #openLog}). */
   protected LogCatalog(String catalogName, Map<String, String> catalogProperties) {
@@ -223,6 +227,24 @@ public class LogCatalog extends BaseMetastoreCatalog
   protected final void open(SharedLog log, FileIO tableIO) {
     this.sharedLog = log;
     this.io = tableIO;
+  }
+
+  /**
+   * Has {@link #close} close {@code resource}, which the catalog opened itself ({@link #openLog}):
+   * not what it was given, which stays its caller's.
+   */
+  protected final void closeWithCatalog(java.io.Closeable resource) {
+    closeables.addCloseable(resource);
+  }
+
+  /** Closes what the catalog opened itself ({@link #closeWithCatalog}), and its metrics reporter. */
+  @Override
+  public void close() throws java.io.IOException {
+    try {
+      closeables.close();
+    } finally {
+      super.close();
+    }
   }
 
   /** The catalog's log, as {@link #initialize} opened it. */

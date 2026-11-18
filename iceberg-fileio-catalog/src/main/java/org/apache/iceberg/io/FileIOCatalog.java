@@ -31,7 +31,8 @@ import org.intentlog.fileio.AtomicFileLog;
  * A catalog kept in one object of a store with conditional writes ({@link
  * SupportsAtomicOperations}: S3, S3 Express, GCS, ADLS), beside its tables' files: a {@link
  * LogCatalog} over an {@link AtomicFileLog}. The object is at {@code <warehouse>/catalog} unless
- * the catalog is given a location; the store is the catalog's FileIO ({@code io-impl}).
+ * the catalog is given a location; the store is the catalog's FileIO ({@code io-impl}), which the
+ * catalog closes when it is closed, unless it was given one.
  *
  * <p>Configuration (with {@link LogCatalogProperties} for how commits append and compact):
  *
@@ -86,6 +87,7 @@ public class FileIOCatalog extends LogCatalog {
 
       // TODO handle this more gracefully; use listings/HadoopCatalog?
       fileIO = (SupportsAtomicOperations) CatalogUtil.loadFileIO(fileIOImpl, properties, null);
+      closeWithCatalog(fileIO);
     }
     if (LogCatalogProperties.log(properties).equals(LogCatalogProperties.LOG_AZURE_APPEND)) {
       // a segmented log (docs/LOG_SEGMENTS.md): the catalog object here, its segments on Append
