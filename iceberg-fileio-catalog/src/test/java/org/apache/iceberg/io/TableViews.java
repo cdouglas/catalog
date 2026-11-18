@@ -138,10 +138,15 @@ final class TableViews {
           throw new IllegalStateException(
               "lineage: the parent of rewrite " + s.snapshotId() + " is gone");
         }
+        // Read with the table's specs: a manifest's own spec need not bind to the schema the
+        // manifest carries (a rewrite, after a replace dropped the source column of an older
+        // spec, of a file in that spec), and Snapshot#removedDataFiles(FileIO) reads with it
+        org.apache.iceberg.SnapshotChanges changes =
+            org.apache.iceberg.SnapshotChanges.builderFor(table).snapshot(s).build();
         java.util.Set<String> removed = new java.util.HashSet<>();
-        s.removedDataFiles(table.io()).forEach(f -> removed.add(f.location()));
+        changes.removedDataFiles().forEach(f -> removed.add(f.location()));
         java.util.Set<String> added = new java.util.HashSet<>();
-        s.addedDataFiles(table.io()).forEach(f -> added.add(f.location()));
+        changes.addedDataFiles().forEach(f -> added.add(f.location()));
         // the rows each cat's replaced files held, with what deleted from them there
         Map<Integer, Map<String, java.util.Set<String>>> replaced = new TreeMap<>();
         for (FileScanTask task : plan(table, s.parentId())) {

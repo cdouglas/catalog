@@ -24,6 +24,7 @@ import java.util.Map;
 import net.jqwik.api.Arbitraries;
 import net.jqwik.api.Arbitrary;
 import net.jqwik.api.Combinators;
+import net.jqwik.api.Example;
 import net.jqwik.api.ForAll;
 import net.jqwik.api.Property;
 import net.jqwik.api.Provide;
@@ -295,6 +296,37 @@ class TestRebaseProperties {
     if (outcome[3] != null) {
       Statistics.label("false positives").collect(encoding, outcome[3]);
     }
+  }
+
+  /**
+   * Round p12-r0p's rebase job, shrunk (seed -6056536446781838245): a prefix that partitions by
+   * {@code day(ts)}, replaces the table with a schema without {@code ts} (the old spec stays), then
+   * cherry-picks a snapshot of the old spec onto main and rewrites one of its files. The rewrite's
+   * manifest of the removed file carries the old spec and the new schema, which do not bind
+   * together, and the oracle's lineage, reading the rewrite's files with the spec each manifest
+   * carries, failed: {@code ValidationException: Cannot find source column for partition field:
+   * 1001: ts_day: day(4)}.
+   */
+  @Example
+  void aRewriteInASpecWhoseSourceColumnAReplaceDropped() {
+    List<TableScript.Cmd> prefix = new ArrayList<>();
+    prefix.add(new TableScript.Cmd(TableScript.Kind.ADD_PARTITION_FIELD, 0, 3, 0));
+    for (int i = 0; i < 5; i++) {
+      prefix.add(new TableScript.Cmd(TableScript.Kind.FAST_APPEND, 0, 0, 0));
+    }
+    prefix.add(new TableScript.Cmd(TableScript.Kind.REPLACE, 1, 0, 0));
+    prefix.add(new TableScript.Cmd(TableScript.Kind.FAST_APPEND, 0, 0, 8));
+    prefix.add(new TableScript.Cmd(TableScript.Kind.CHERRY_PICK, 5, 1, 5));
+    prefix.add(new TableScript.Cmd(TableScript.Kind.REWRITE_FILES, 10, 3, 9));
+    prefix.add(new TableScript.Cmd(TableScript.Kind.CREATE_BRANCH, 2, 11, 11));
+    prefix.add(new TableScript.Cmd(TableScript.Kind.FAST_FORWARD, 10, 11, 23));
+    List<TableScript.Cmd> window = List.of(
+        new TableScript.Cmd(TableScript.Kind.EQUALITY_DELETE, 8, 10, 10),
+        new TableScript.Cmd(TableScript.Kind.OVERWRITE, 1, 11, 3),
+        new TableScript.Cmd(TableScript.Kind.CREATE_TAG, 7, 0, 10));
+    verifyRead(LamportEncoding.NAME, 2, true, LocalCatalogMode.APPEND, true, prefix,
+        new Reader(1, Expressions.alwaysTrue(), true, Writes.OTHER_TABLE, 1), window,
+        Placement.BEFORE_THE_COMMIT);
   }
 
   /**
