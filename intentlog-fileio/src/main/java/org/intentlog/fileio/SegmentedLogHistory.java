@@ -50,15 +50,16 @@ public final class SegmentedLogHistory {
 
   /**
    * The log whose catalog object had {@code versions} (oldest first, each the object's bytes) and
-   * whose segments, named under {@code <prefix>/<log id>/} in their store, took {@code appends}
-   * (in order); {@code pages} the committed set's pages stored.
+   * whose segments, named under {@code <prefix>/<log id>/} in their store (the prefix the versions
+   * record, else {@code prefix}), took {@code appends} (in order); {@code pages} the committed
+   * set's pages stored.
    */
   public SegmentedLogHistory(List<byte[]> versions, List<Append> appends, String prefix,
       Map<String, byte[]> pages) {
     this.pages = pages;
     Map<Long, SegmentedLog.Seg> installed = new TreeMap<>();
     for (byte[] version : versions) {
-      SegmentedLog.Cat c = SegmentedLog.parse(AtomicFileLog.decode(version));
+      SegmentedLog.Cat c = SegmentedLog.parse(AtomicFileLog.decode(version), prefix);
       byte[] was = checkpoints.putIfAbsent(c.ck(), c.checkpoint());
       if (was != null && !Arrays.equals(was, c.checkpoint())) {
         violations.add("two checkpoints at " + c.ck() + " differ (I11)");
@@ -80,7 +81,7 @@ public final class SegmentedLogHistory {
       SegmentedLog.Seg seg = installed.get(o);
       long count = 0;
       boolean ended = false;
-      String name = SegmentedLog.path(prefix, seg.logId(), seg.name());
+      String name = SegmentedLog.path(seg.prefix(), seg.logId(), seg.name());
       for (Append a : bySegment.getOrDefault(name, List.of())) {
         if (count >= seg.limit()) {
           ended = true;

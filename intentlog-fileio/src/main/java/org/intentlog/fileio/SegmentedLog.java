@@ -80,7 +80,10 @@ import org.intentlog.wire.RetiredSegment;
  *       ended, and seals one that hasn't; the first copy the log holds is the record, and if none
  *       does, the append is void, a {@link LogConflictException} (D4).
  *   <li>A segment's blob is {@code <prefix>/<log id>/<name>}: the log's id is its checkpoint's, so
- *       no entry carries it, and the logs that share a prefix keep their segments apart.
+ *       no entry carries it, and the logs that share a prefix keep their segments apart. The prefix
+ *       is the catalog object's: its creator's, recorded after the checkpoint's position unless it
+ *       is the default every client derives from the catalog object's location (D13), so a client
+ *       configured with another, or none, keeps the log's segments where they are.
  *   <li>A retired segment is deleted by the name its Retired entry holds once its TTL has passed,
  *       by a checkpoint, which drops the entry only once the segment is gone, and by the sweep
  *       ({@link #trim}). The sweep also lists this log's segments for unnamed blobs, and deletes
@@ -138,9 +141,17 @@ public final class SegmentedLog implements SharedLog {
     }
   }
 
+  private static final System.Logger LOG = System.getLogger(SegmentedLog.class.getName());
+
   private final AtomicFileLog catalog;
   private final SegmentStore store;
-  private final String prefix;
+  /** Where a log this creates keeps its segments; null: the default. */
+  private final String configured;
+  /**
+   * Where the segments of a log whose catalog object records no prefix are, which every client of
+   * the catalog object derives alike from its location (D13); null if none is derived.
+   */
+  private final String defaultPrefix;
   private final Options options;
   private final long limit;
   private final long maxRecordBytes;
@@ -160,14 +171,37 @@ public final class SegmentedLog implements SharedLog {
   /** Whether a read through an append of this log found it void: the log is behind. */
   private volatile boolean behind = false;
 
+  /** Whether this log warned that its catalog object's prefix is not the one it was given. */
+  private volatile boolean warned = false;
+
   /**
    * A segmented log whose catalog object is {@code catalog} (format 4) and whose segments are
-   * {@code store}'s, named under {@code <prefix>/<log id>/}.
+   * {@code store}'s, named under {@code <prefix>/<log id>/}: a log this creates keeps them under
+   * {@code prefix}, which its catalog object records; a log that exists keeps them where its
+   * catalog object says.
    */
   public SegmentedLog(AtomicFileLog catalog, SegmentStore store, String prefix, Options options) {
+    this(catalog, store, prefix, null, options);
+  }
+
+  /**
+   * A segmented log whose catalog object is {@code catalog} (format 4) and whose segments are
+   * {@code store}'s, named under {@code <prefix>/<log id>/}, the prefix the catalog object records
+   * (D13). A log this creates keeps them under {@code prefix}, or {@code defaultPrefix} if that is
+   * null, and records the prefix unless it is the default. A catalog object that records none
+   * keeps them under {@code defaultPrefix}, which every client of the catalog object must derive
+   * alike from its location.
+   *
+   * @param prefix where a log this creates keeps its segments; null: the default
+   * @param defaultPrefix where a log whose catalog object records no prefix keeps them; null if
+   *     there is no default for this catalog object, which then must record its prefix
+   */
+  public SegmentedLog(AtomicFileLog catalog, SegmentStore store, String prefix,
+      String defaultPrefix, Options options) {
     this.catalog = catalog;
     this.store = store;
-    this.prefix = prefix.endsWith("/") ? prefix.substring(0, prefix.length() - 1) : prefix;
+    this.configured = trimSlash(prefix);
+    this.defaultPrefix = trimSlash(defaultPrefix);
     this.options = options;
     this.limit = options.limit() > 0 ? options.limit() : store.maxBlocks();
     if (limit > store.maxBlocks()) {
@@ -191,9 +225,23 @@ public final class SegmentedLog implements SharedLog {
     }
   }
 
+  private static String trimSlash(String prefix) {
+    return prefix != null && prefix.endsWith("/") ? prefix.substring(0, prefix.length() - 1)
+        : prefix;
+  }
+
   @Override
   public String toString() {
-    return "segmented log " + catalog + " (segments at " + prefix + ")";
+    return "segmented log " + catalog + " (segments at " + segmentPrefix() + ")";
+  }
+
+  /**
+   * Where this log's segments are: under the prefix its catalog object records (or the default),
+   * once this log has read it; before, where a log it creates would keep them (null if nowhere).
+   */
+  public String segmentPrefix() {
+    Cat c = cached;
+    return c != null ? c.prefix() : configured != null ? configured : defaultPrefix;
   }
 
   @Override
@@ -216,7 +264,7 @@ public final class SegmentedLog implements SharedLog {
    * for a test's oracle to read with while this log's caches stay as they are.
    */
   SegmentedLog copy() {
-    SegmentedLog c = new SegmentedLog(catalog, store, prefix, options);
+    SegmentedLog c = new SegmentedLog(catalog, store, configured, defaultPrefix, options);
     c.cached = cached;
     c.newest = newest;
     return c;
@@ -237,13 +285,9 @@ public final class SegmentedLog implements SharedLog {
     return prefix + "/" + logId + "/" + name;
   }
 
-  private String path(UUID logId, String name) {
-    return path(prefix, logId, name);
-  }
-
   /** Where an Install's segment is: at the location it names, else under the log's prefix. */
   private String path(Seg seg) {
-    return path(seg.logId(), seg.name(), seg.location());
+    return path(seg.prefix(), seg.logId(), seg.name(), seg.location());
   }
 
   /**
@@ -251,9 +295,9 @@ public final class SegmentedLog implements SharedLog {
    * store, if one is given (a segment a migration left at another prefix keeps its place), else
    * under the log's prefix.
    */
-  private String path(UUID logId, String name, String location) {
+  private String path(String prefix, UUID logId, String name, String location) {
     if (location.isEmpty()) {
-      return path(logId, name);
+      return path(prefix, logId, name);
     }
     try {
       return store.nameAt(location);
@@ -298,9 +342,10 @@ public final class SegmentedLog implements SharedLog {
 
   /**
    * A segment an Install of the log {@code logId} names. The Install holds all but the log's id,
-   * which its catalog object's checkpoint holds.
+   * which its catalog object's checkpoint holds, and the prefix, which the catalog object records
+   * once (or the default).
    */
-  record Seg(UUID logId, long ordinal, String name, String location, long limit) {
+  record Seg(UUID logId, String prefix, long ordinal, String name, String location, long limit) {
     byte[] install() {
       return LogEnvelope.encodeInstallSegment(new InstallSegment(ordinal, name, location, limit));
     }
@@ -308,10 +353,11 @@ public final class SegmentedLog implements SharedLog {
 
   /**
    * The catalog object as read: its view, the log's id, the checkpoint and its position, the
-   * segments installed from the checkpoint's on (contiguous), and the retired ones.
+   * prefix it records (null: none) and the segments' prefix (it, or the default; null if neither),
+   * the segments installed from the checkpoint's on (contiguous), and the retired ones.
    */
-  record Cat(LogView view, UUID logId, byte[] checkpoint, SegmentPosition ck, List<Seg> segs,
-      List<RetiredSegment> retired) {
+  record Cat(LogView view, UUID logId, byte[] checkpoint, SegmentPosition ck, String recorded,
+      String prefix, List<Seg> segs, List<RetiredSegment> retired) {
 
     Seg seg(long ordinal) {
       long i = ordinal - segs.get(0).ordinal();
@@ -332,12 +378,18 @@ public final class SegmentedLog implements SharedLog {
     }
   }
 
-  /**
-   * The catalog object's replay: the first record is the position the checkpoint covers; an
-   * Install counts only if it is of the next ordinal (the first one, of the checkpoint's); any
-   * other record frame but a Retired entry is void.
-   */
+  /** The catalog object's replay, its segments under the prefix it records alone. */
   static Cat parse(LogView v) {
+    return parse(v, null);
+  }
+
+  /**
+   * The catalog object's replay: the first record is the position the checkpoint covers; the
+   * next, if it is one, the prefix the segments are named under (else they are under {@code
+   * defaultPrefix}: D13); an Install counts only if it is of the next ordinal (the first one, of
+   * the checkpoint's); any other record frame but a Retired entry is void.
+   */
+  static Cat parse(LogView v, String defaultPrefix) {
     byte[] checkpoint = v.checkpoint().orElseThrow(
         () -> new IllegalStateException("A catalog object without a checkpoint"));
     LogEnvelope.Checkpoint decoded = LogEnvelope.decodeCheckpoint(checkpoint);
@@ -348,15 +400,19 @@ public final class SegmentedLog implements SharedLog {
       throw new IllegalStateException("A catalog object names no position for its checkpoint");
     }
     SegmentPosition ck = SegmentPosition.decode(through);
+    String recorded = null;
     List<Seg> segs = new ArrayList<>();
     List<RetiredSegment> retired = new ArrayList<>();
-    for (byte[] bytes : frames.subList(1, frames.size())) {
-      LogEnvelope.Record r = LogEnvelope.decodeRecord(bytes);
-      if (r.installSegment() != null) {
+    for (int f = 1; f < frames.size(); f++) {
+      LogEnvelope.Record r = LogEnvelope.decodeRecord(frames.get(f));
+      if (f == 1 && r.segmentPrefix() != null) {
+        recorded = trimSlash(r.segmentPrefix());
+      } else if (r.installSegment() != null) {
         InstallSegment i = r.installSegment();
         long next = segs.isEmpty() ? ck.ordinal() : segs.get(segs.size() - 1).ordinal() + 1;
         if (i.ordinal() == next) {
-          segs.add(new Seg(decoded.logId(), i.ordinal(), i.name(), i.location(), i.limit()));
+          segs.add(new Seg(decoded.logId(), recorded != null ? recorded : defaultPrefix,
+              i.ordinal(), i.name(), i.location(), i.limit()));
         }
       } else if (r.retiredSegment() != null) {
         retired.add(r.retiredSegment());
@@ -365,7 +421,30 @@ public final class SegmentedLog implements SharedLog {
     if (segs.isEmpty()) {
       throw new IllegalStateException("A catalog object installs no segment at its checkpoint's");
     }
-    return new Cat(v, decoded.logId(), checkpoint, ck, List.copyOf(segs), List.copyOf(retired));
+    return new Cat(v, decoded.logId(), checkpoint, ck, recorded,
+        recorded != null ? recorded : defaultPrefix, List.copyOf(segs), List.copyOf(retired));
+  }
+
+  /**
+   * The catalog object {@code v} as this log reads it: its segments under the prefix it records,
+   * else this log's default. Fails if it records none and this log has no default: the log's
+   * creator derived one this client does not. Warns once if the prefix this log was given is
+   * another: the catalog object's wins.
+   */
+  private Cat parseCat(LogView v) {
+    Cat c = parse(v, defaultPrefix);
+    if (c.prefix() == null) {
+      throw new IllegalStateException("The catalog object " + catalog + " records no prefix for "
+          + "its segments, and this client derives no default from its location: open the "
+          + "catalog at the location its creator did");
+    }
+    if (configured != null && !configured.equals(c.prefix()) && !warned) {
+      warned = true;
+      LOG.log(System.Logger.Level.WARNING, "The catalog object " + catalog + " keeps its "
+          + "segments under " + c.prefix() + "; the prefix this client was given, " + configured
+          + ", is ignored");
+    }
+    return c;
   }
 
   /** Keeps {@code c} if it is not older than the catalog object held; returns the newer. */
@@ -389,7 +468,7 @@ public final class SegmentedLog implements SharedLog {
     } catch (NotFoundException e) {
       return null;
     }
-    Cat c = parse(v);
+    Cat c = parseCat(v);
     adopt(c);
     return c;
   }
@@ -569,7 +648,7 @@ public final class SegmentedLog implements SharedLog {
 
   /** A view of the checkpoint of {@code c} and no records. */
   private View whole(Cat c) {
-    SegTail tail = new SegTail(prefix, c.logId(), true, c.ck(), c.checkpoint().length);
+    SegTail tail = new SegTail(where(), c.logId(), true, c.ck(), c.checkpoint().length);
     return new View(tail, c.checkpoint(), c.ck(), List.of(), new long[0], new long[0]);
   }
 
@@ -581,7 +660,7 @@ public final class SegmentedLog implements SharedLog {
       ordinals[i] = w.ordinals.get(i);
       offsets[i] = w.offsets.get(i);
     }
-    SegTail tail = new SegTail(prefix, logId, true, w.end, bytes + w.bytes);
+    SegTail tail = new SegTail(where(), logId, true, w.end, bytes + w.bytes);
     return new View(tail, null, from, List.copyOf(w.records), ordinals, offsets);
   }
 
@@ -745,9 +824,10 @@ public final class SegmentedLog implements SharedLog {
       c = fresh;
     }
     UUID logId = c.logId();
+    String prefix = c.prefix();
     String name = segmentName(o);
     try {
-      while (!store.create(path(logId, name))) {
+      while (!store.create(path(prefix, logId, name))) {
         name = segmentName(o);
       }
     } catch (SegmentStore.Throttled e) {
@@ -755,11 +835,11 @@ public final class SegmentedLog implements SharedLog {
     } catch (RuntimeException e) {
       throw new LogNotSentException("A segment of " + this + " could not be created", e);
     }
-    byte[] install = new Seg(logId, o, name, "", limit).install();
+    byte[] install = new Seg(logId, prefix, o, name, "", limit).install();
     for (int attempt = 0; attempt < options.sendAttempts(); attempt++) {
       try {
         Receipt r = catalog.append(install, c.view().tail());
-        return adopt(parse(catalog.readThrough(r, Duration.ZERO)));
+        return adopt(parseCat(catalog.readThrough(r, Duration.ZERO)));
       } catch (LogThrottledException | LogNotSentException e) {
         throw e;
       } catch (LogFullException e) {
@@ -774,7 +854,7 @@ public final class SegmentedLog implements SharedLog {
           // under its own id), so no Install can name this blob: delete it, rather than leave it
           // to a sweep (one that cannot list leaves it for good)
           try {
-            store.delete(path(logId, name));
+            store.delete(path(prefix, logId, name));
           } catch (RuntimeException deleteFailed) {
             // the log's sweep deletes it, once it can (if the object is another log's, none does)
           }
@@ -880,7 +960,7 @@ public final class SegmentedLog implements SharedLog {
           && t.records() + 1 == cp.index && cp.index <= seg.limit()) {
         // The reply put the copy at the end of the view this log kept: nothing landed between,
         // and the segment hadn't ended, so the view through it is that view and the record
-        SegTail tail = new SegTail(prefix, c.logId(), true,
+        SegTail tail = new SegTail(where(), c.logId(), true,
             new SegmentPosition(cp.ordinal, cp.index, cp.offset + cp.length),
             kept.tail.bytes + record.length);
         return kept.extend(new View(tail, null, t, List.of(record), new long[] {cp.ordinal},
@@ -928,7 +1008,7 @@ public final class SegmentedLog implements SharedLog {
   @Override
   public LogTail probe() {
     if (!catalog.probe().exists()) {
-      return new SegTail(prefix, null, false, SegmentPosition.START, 0);
+      return new SegTail(where(), null, false, SegmentPosition.START, 0);
     }
     View v = newest;
     if (v != null) {
@@ -966,6 +1046,9 @@ public final class SegmentedLog implements SharedLog {
       long now = options.clockMs().getAsLong();
       List<byte[]> records = new ArrayList<>();
       records.add(LogEnvelope.encodeCheckpointThrough(t.position.encode()));
+      if (c.recorded() != null) {
+        records.add(LogEnvelope.encodeSegmentPrefix(c.recorded())); // the creator's, restated
+      }
       for (Seg s : c.segs()) {
         if (s.ordinal() >= t.position.ordinal()) {
           records.add(s.install());
@@ -973,7 +1056,7 @@ public final class SegmentedLog implements SharedLog {
       }
       for (RetiredSegment old : c.retired()) {
         // an entry is the only reference to its segment: drop it only once the segment is gone
-        if (!expired(old, now) || !deleteRetired(c.logId(), old, deleted)) {
+        if (!expired(old, now) || !deleteRetired(c, old, deleted)) {
           records.add(LogEnvelope.encodeRetiredSegment(old));
         }
       }
@@ -986,7 +1069,7 @@ public final class SegmentedLog implements SharedLog {
       }
       try {
         Receipt r = catalog.replace(c.view().tail(), checkpoint, records);
-        adopt(parse(catalog.readThrough(r, Duration.ZERO)));
+        adopt(parseCat(catalog.readThrough(r, Duration.ZERO)));
         return;
       } catch (LogConflictException e) {
         // an Install or another checkpoint landed: read again
@@ -1012,9 +1095,12 @@ public final class SegmentedLog implements SharedLog {
 
   /**
    * Creates the log (docs/LOG_SEGMENTS.md "Creating the log"): segment 0, under the id of the log
-   * its checkpoint begins, then the catalog object if absent, with the first checkpoint and
+   * its checkpoint begins and the prefix this log was given (or the default), then the catalog
+   * object if absent, with the first checkpoint, the prefix unless it is the default (D13), and
    * segment 0's Install. One of the same checkpoint is this creation, retried; another is another
    * writer's log, and this creation deletes its segment 0, which no sweep lists.
+   *
+   * @throws IllegalStateException if the log is absent and this log has no prefix to create it at
    */
   private void create(byte[] checkpoint) {
     LogTail absent = catalog.probe();
@@ -1022,10 +1108,16 @@ public final class SegmentedLog implements SharedLog {
       created(checkpoint, null);
       return;
     }
+    String prefix = configured != null ? configured : defaultPrefix;
+    if (prefix == null) {
+      throw new IllegalStateException("The catalog object " + catalog + " does not exist, and "
+          + "this client cannot create its log: it was given no prefix for its segments, and "
+          + "derives no default from the catalog object's location");
+    }
     UUID logId = LogEnvelope.decodeCheckpoint(checkpoint).logId();
     String name = segmentName(0);
     try {
-      while (!store.create(path(logId, name))) {
+      while (!store.create(path(prefix, logId, name))) {
         name = segmentName(0);
       }
     } catch (SegmentStore.Throttled e) {
@@ -1033,32 +1125,36 @@ public final class SegmentedLog implements SharedLog {
     } catch (SegmentStore.Refused e) {
       throw new LogNotSentException("The store refused the creation of " + this, e);
     }
+    List<byte[]> records = new ArrayList<>();
+    records.add(LogEnvelope.encodeCheckpointThrough(SegmentPosition.START.encode()));
+    if (!prefix.equals(defaultPrefix)) {
+      records.add(LogEnvelope.encodeSegmentPrefix(prefix));
+    }
+    records.add(new Seg(logId, prefix, 0, name, "", limit).install());
     try {
-      Receipt r = catalog.replace(absent, checkpoint, List.of(
-          LogEnvelope.encodeCheckpointThrough(SegmentPosition.START.encode()),
-          new Seg(logId, 0, name, "", limit).install()));
-      adopt(parse(catalog.readThrough(r, Duration.ZERO)));
+      Receipt r = catalog.replace(absent, checkpoint, records);
+      adopt(parseCat(catalog.readThrough(r, Duration.ZERO)));
     } catch (LogConflictException e) {
-      abandon(logId, name);
+      abandon(prefix, logId, name);
       created(checkpoint, e);
     } catch (RuntimeException e) {
-      abandon(logId, name); // of unknown outcome: the runtime reads the log to settle it
+      abandon(prefix, logId, name); // of unknown outcome: the runtime reads the log to settle it
       throw e;
     }
   }
 
   /**
-   * Deletes segment {@code name} of a creation of the log {@code logId} if the catalog object is
-   * another log's: then no Install can name it (the creation's replace was conditioned on the
-   * object's absence), and no sweep lists it (each lists its own log's). Best effort: one whose
-   * delete or read fails stays, as does one whose catalog object is absent (the replace may land
-   * yet).
+   * Deletes segment {@code name} of a creation of the log {@code logId} under {@code prefix} if
+   * the catalog object is another log's: then no Install can name it (the creation's replace was
+   * conditioned on the object's absence), and no sweep lists it (each lists its own log's). Best
+   * effort: one whose delete or read fails stays, as does one whose catalog object is absent (the
+   * replace may land yet).
    */
-  private void abandon(UUID logId, String name) {
+  private void abandon(String prefix, UUID logId, String name) {
     try {
       Cat c = readCat();
       if (c != null && !c.logId().equals(logId)) {
-        store.delete(path(logId, name));
+        store.delete(path(prefix, logId, name));
       }
     } catch (RuntimeException e) {
       // it stays (docs/AZURE_LOG_FORMAT.md OI-10)
@@ -1080,16 +1176,16 @@ public final class SegmentedLog implements SharedLog {
   }
 
   /**
-   * Deletes the segment of {@code r}, a Retired entry of the log {@code logId}, unless {@code
-   * deleted} holds it already; whether it is gone. A delete that fails leaves it for the sweep or
-   * the next checkpoint.
+   * Deletes the segment of {@code r}, a Retired entry of the catalog object {@code c}, unless
+   * {@code deleted} holds it already; whether it is gone. A delete that fails leaves it for the
+   * sweep or the next checkpoint.
    */
-  private boolean deleteRetired(UUID logId, RetiredSegment r, Set<String> deleted) {
+  private boolean deleteRetired(Cat c, RetiredSegment r, Set<String> deleted) {
     if (deleted.contains(r.name())) {
       return true;
     }
     try {
-      store.delete(path(logId, r.name(), r.location()));
+      store.delete(path(c.prefix(), c.logId(), r.name(), r.location()));
     } catch (RuntimeException e) {
       return false;
     }
@@ -1127,12 +1223,12 @@ public final class SegmentedLog implements SharedLog {
     for (RetiredSegment r : c.retired()) {
       named.add(r.name());
       if (expired(r, now)) {
-        deleteRetired(c.logId(), r, deleted); // by name: no listing needed
+        deleteRetired(c, r, deleted); // by name: no listing needed
       }
     }
     long newest = c.last().ordinal();
-    for (String full : store.list(path(c.logId(), "seg-"))) {
-      long ordinal = ordinalAt(prefix, c.logId(), full); // -1: none of this log's segments
+    for (String full : store.list(path(c.prefix(), c.logId(), "seg-"))) {
+      long ordinal = ordinalAt(c.prefix(), c.logId(), full); // -1: none of this log's segments
       String name = full.substring(full.lastIndexOf('/') + 1);
       if (ordinal >= 0 && ordinal <= newest && !named.contains(name)) {
         try {
@@ -1145,26 +1241,34 @@ public final class SegmentedLog implements SharedLog {
   }
 
   private SegTail tailOf(LogTail tail) {
-    if (!(tail instanceof SegTail t) || !t.prefix.equals(prefix)) {
+    if (!(tail instanceof SegTail t) || !t.log.equals(where())) {
       throw new IllegalArgumentException("Not a tail of " + this + ": " + tail);
     }
     return t;
+  }
+
+  /** The log a tail is of: its catalog object's location. */
+  private String where() {
+    return catalog.toString();
   }
 
   // ============================================================
   // Tails, receipts, views
   // ============================================================
 
-  /** Where a read ended: the log's id, a position, and the bytes read since the checkpoint. */
+  /**
+   * Where a read ended: the catalog object's location, the log's id, a position, and the bytes
+   * read since the checkpoint.
+   */
   static final class SegTail implements LogTail {
-    private final String prefix;
+    private final String log;
     private final UUID logId;
     private final boolean exists;
     private final SegmentPosition position;
     private final long bytes;
 
-    SegTail(String prefix, UUID logId, boolean exists, SegmentPosition position, long bytes) {
-      this.prefix = prefix;
+    SegTail(String log, UUID logId, boolean exists, SegmentPosition position, long bytes) {
+      this.log = log;
       this.logId = logId;
       this.exists = exists;
       this.position = position;
@@ -1183,7 +1287,7 @@ public final class SegmentedLog implements SharedLog {
 
     @Override
     public boolean continues(LogTail earlier) {
-      return earlier instanceof SegTail e && e.prefix.equals(prefix) && exists && e.exists
+      return earlier instanceof SegTail e && e.log.equals(log) && exists && e.exists
           && e.logId.equals(logId) && position.compareTo(e.position) >= 0;
     }
 
@@ -1198,7 +1302,7 @@ public final class SegmentedLog implements SharedLog {
 
     @Override
     public String toString() {
-      return prefix + "@" + position + (exists ? "" : " (absent)");
+      return log + "@" + position + (exists ? "" : " (absent)");
     }
   }
 

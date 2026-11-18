@@ -108,6 +108,26 @@ class TestSegmentWire {
     assertThat(r.installSegment()).isNull();
   }
 
+  /**
+   * The segments' prefix is a record of its own (docs/LOG_SEGMENTS.md D13): a tag, a length and
+   * the prefix's bytes, so a frame of {@code 2 + n + 21} bytes in the catalog object (its length's
+   * varint, then the 20-byte trailer) for a prefix of {@code n < 126} bytes.
+   */
+  @Test
+  void aSegmentPrefixRoundTrips() {
+    String prefix = "https://acct.blob.core.windows.net/logs/warehouse/catalog";
+    byte[] bytes = LogEnvelope.encodeSegmentPrefix(prefix);
+    assertThat(bytes).hasSize(2 + prefix.length());
+    LogEnvelope.Record r = LogEnvelope.decodeRecord(bytes);
+    assertThat(r.isSegmentRecord()).isTrue();
+    assertThat(r.segmentPrefix()).isEqualTo(prefix);
+    assertThat(r.checkpointThrough()).isNull();
+    assertThat(LogEnvelope.decodeRecord(LogEnvelope.encodeCheckpointThrough(new byte[24]))
+        .segmentPrefix()).isNull();
+    assertThatThrownBy(() -> LogEnvelope.decodeRecord(new byte[] {0x42, 0}))
+        .hasMessageContaining("empty");
+  }
+
   @Test
   void anInstallNeedsALimitAndAName() {
     assertThatThrownBy(() -> new InstallSegment(1, "s", "", 0))

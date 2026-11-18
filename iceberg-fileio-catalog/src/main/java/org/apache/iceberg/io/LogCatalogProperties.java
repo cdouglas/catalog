@@ -401,8 +401,13 @@ public final class LogCatalogProperties {
   public static final String LOG_AZURE_APPEND = "azure-append";
 
   /**
-   * Where the Azure log's segments are: {@code https://<account>.blob.core.windows.net/<container>
-   * /<path>}, the path their names' prefix. Required with {@link #LOG_AZURE_APPEND}.
+   * Where an Azure log this catalog creates keeps its segments: {@code
+   * https://<account>.blob.core.windows.net/<container>/<path>}, the path their names' prefix. The
+   * catalog object records it (docs/LOG_SEGMENTS.md D13), so every client finds a log's segments
+   * there whatever it is given, and one given another is warned that it is ignored. Optional: by
+   * default a log of a catalog object on Azure keeps them beside it, at the object's Blob URL with
+   * {@code .segments} appended, and records nothing; one of a catalog object elsewhere needs it to
+   * be created.
    */
   public static final String LOG_LOCATION = "fileio.catalog.log.location";
 

@@ -49,7 +49,10 @@ import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
  * account (docs/LOG_SEGMENTS.md "Testing"): a {@link FileIOCatalog} that opens its log from its
  * properties ({@code fileio.catalog.log} {@code azure-append}, an account key or a shared access
  * signature), as a deployment's does, in each table metadata storage. The catalog object and the
- * tables' files stay in memory. Segments of {@link #SEGMENT_RECORDS} records move the log on every
+ * tables' files stay in memory, outside Azure, so no default prefix is derived for the segments:
+ * each catalog's creator records the location it was given in its catalog object
+ * (docs/LOG_SEGMENTS.md D13), which every catalog of its name in a test is given alike. Segments
+ * of {@link #SEGMENT_RECORDS} records move the log on every
  * few commits, and a retirement TTL of 0 lets the next checkpoint or sweep delete retired
  * segments that other instances' catalog objects still name.
  *

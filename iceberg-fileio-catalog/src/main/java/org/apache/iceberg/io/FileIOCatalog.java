@@ -46,8 +46,9 @@ import org.intentlog.fileio.AtomicFileLog;
  *   <li>{@code fileio.catalog.inline.max.update.size}: the largest inline table update, in bytes
  *   <li>{@code fileio.catalog.log}: {@code atomic-file} (the default: the one object) or {@code
  *       azure-append}, a segmented log: the catalog object at {@code <warehouse>/catalog}, its
- *       segments Azure Append Blobs at {@code fileio.catalog.log.location} (docs/LOG_SEGMENTS.md,
- *       docs/AZURE_LOG.md "Configuration"; {@link AzureLogs})
+ *       segments Azure Append Blobs where the catalog object says, which its creator set from
+ *       {@code fileio.catalog.log.location}, or by default beside the object (docs/LOG_SEGMENTS.md
+ *       D13, docs/AZURE_LOG.md "Configuration"; {@link AzureLogs})
  * </ul>
  */
 public class FileIOCatalog extends LogCatalog {

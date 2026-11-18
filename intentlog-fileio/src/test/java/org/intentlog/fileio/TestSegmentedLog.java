@@ -356,6 +356,173 @@ class TestSegmentedLog {
         .containsExactly(b1, b2, b3);
   }
 
+  // D13: the segments' prefix is the catalog object's
+
+  /** A log at {@link #LOCATION} given {@code prefix} and {@code defaultPrefix} (each may be null). */
+  private SegmentedLog given(String prefix, String defaultPrefix, long limit) {
+    return given(LOCATION, prefix, defaultPrefix, limit);
+  }
+
+  private SegmentedLog given(String location, String prefix, String defaultPrefix, long limit) {
+    return new SegmentedLog(AtomicFileLog.segmented(io, location, () -> 7L, false), store, prefix,
+        defaultPrefix, SegmentedLog.Options.defaults().withLimit(limit).withRetireTtlMs(0)
+            .withClock(() -> 0L));
+  }
+
+  private void create(SegmentedLog log) {
+    LogTail absent = log.probe();
+    log.putCheckpoint(absent, checkpoint(0, absent));
+  }
+
+  /** Every version the catalog object at {@code location} had, as a log without a default reads it. */
+  private List<SegmentedLog.Cat> versions(String location) {
+    return io.history().stream().filter(w -> w.location().equals(location) && w.after() != null)
+        .map(w -> SegmentedLog.parse(AtomicFileLog.decode(w.after()))).toList();
+  }
+
+  /**
+   * D13: clients given another prefix, or none, keep a log's segments where its catalog object
+   * says. They read what its creator wrote, append to its segments, install the next ones under
+   * its prefix and compact it, and nothing lands under their own. Each client was configured with
+   * the prefix before, and one given another found no segment where it looked: its reads failed.
+   */
+  @Test
+  void clientsGivenAnotherPrefixOrNoneKeepTheSegmentsWhereTheCatalogObjectSays() {
+    SegmentedLog first = created(2); // given "segs", and no default: the object records it
+    SegmentedLog other = given("elsewhere", null, 2);
+    SegmentedLog none = given(null, null, 2);
+    List<String> warnings = new ArrayList<>();
+    java.util.logging.Logger jul = java.util.logging.Logger.getLogger(SegmentedLog.class.getName());
+    java.util.logging.Handler handler = new java.util.logging.Handler() {
+      @Override
+      public void publish(java.util.logging.LogRecord r) {
+        warnings.add(r.getMessage());
+      }
+
+      @Override
+      public void flush() {}
+
+      @Override
+      public void close() {}
+    };
+    java.util.logging.Level level = jul.getLevel(); // another suite may have quieted it
+    jul.setLevel(java.util.logging.Level.WARNING);
+    jul.addHandler(handler);
+    List<byte[]> sent = new ArrayList<>();
+    try {
+      for (SegmentedLog log : List.of(first, other, none, other, none, first, none)) {
+        byte[] r = record();
+        log.readThrough(log.append(r, null), Duration.ZERO); // segments 0-3, Installs by each
+        sent.add(r);
+      }
+    } finally {
+      jul.removeHandler(handler);
+      jul.setLevel(level);
+    }
+    // the client given another prefix says, once, that it is ignored
+    assertThat(warnings).singleElement().asString().contains("elsewhere", "is ignored");
+    for (SegmentedLog log : List.of(first, other, none, given("elsewhere", "segs-default", 2))) {
+      assertThat(log.read().records()).containsExactlyElementsOf(sent);
+      assertThat(log.segmentPrefix()).isEqualTo("segs");
+    }
+    LogTail through = none.read().tail();
+    none.putCheckpoint(through, checkpoint(1, through)); // restates the creator's prefix
+    byte[] after = record();
+    other.readThrough(other.append(after, null), Duration.ZERO);
+    assertThat(given(null, null, 2).read().records()).containsExactly(after);
+    assertThat(versions(LOCATION)).extracting(SegmentedLog.Cat::recorded).containsOnly("segs");
+    assertThat(store.names()).isNotEmpty()
+        .allSatisfy(n -> assertThat(n).startsWith("segs/" + LOG_ID + "/"));
+  }
+
+  /**
+   * D13: a log created at its default prefix records none, so its catalog object holds no byte
+   * more than before: a creator given the default records none either, and one given another
+   * prefix records it in one frame of {@code 23 + n} bytes (its length's varint, the record's tag
+   * and length, the prefix's {@code n} bytes, the 20-byte trailer; for {@code n} up to 125).
+   * Checkpoints keep it so, whoever writes them.
+   */
+  @Test
+  void aLogCreatedAtItsDefaultRecordsNoPrefix() {
+    create(given(null, "segs", 2));
+    byte[] atDefault = io.bytes(LOCATION);
+    SegmentedLog.Cat cat = SegmentedLog.parse(AtomicFileLog.decode(atDefault), "segs");
+    assertThat(cat.recorded()).isNull();
+    assertThat(cat.prefix()).isEqualTo("segs");
+    assertThat(cat.view().records()).hasSize(2); // the checkpoint's position, Install 0
+
+    create(given("mem:///given-the-default/catalog", "segs", "segs", 2));
+    assertThat(io.bytes("mem:///given-the-default/catalog")).hasSize(atDefault.length);
+    create(given("mem:///given-another/catalog", "segs", null, 2));
+    assertThat(io.bytes("mem:///given-another/catalog")).hasSize(atDefault.length + 23 + 4);
+
+    SegmentedLog writer = given("elsewhere", "segs", 2); // the catalog object's wins
+    for (int i = 0; i < 3; i++) {
+      writer.readThrough(writer.append(record(), null), Duration.ZERO);
+    }
+    LogTail through = writer.read().tail();
+    writer.putCheckpoint(through, checkpoint(1, through));
+    assertThat(versions(LOCATION)).hasSizeGreaterThan(2)
+        .allSatisfy(v -> assertThat(v.recorded()).isNull());
+    assertThat(store.names()).noneMatch(n -> n.startsWith("elsewhere/"));
+  }
+
+  /**
+   * D13: a prefix that is not the default is recorded at the log's creation and restated by every
+   * checkpoint, whichever client writes it, so a client given none and no default reads the log.
+   */
+  @Test
+  void anExplicitPrefixRoundTripsThroughCheckpoints() {
+    SegmentedLog creator = given("segs", "segs-default", 1);
+    create(creator);
+    List<SegmentedLog> writers = List.of(creator, given(null, "segs-default", 1),
+        given("elsewhere", "segs-default", 1));
+    for (SegmentedLog writer : writers) {
+      for (int i = 0; i < 2; i++) {
+        writer.readThrough(writer.append(record(), null), Duration.ZERO);
+      }
+      LogTail through = writer.read().tail();
+      writer.putCheckpoint(through, checkpoint(writers.indexOf(writer) + 1, through));
+    }
+    byte[] r = record();
+    creator.readThrough(creator.append(r, null), Duration.ZERO);
+    assertThat(versions(LOCATION)).hasSizeGreaterThan(writers.size())
+        .allSatisfy(v -> assertThat(v.recorded()).isEqualTo("segs"));
+    SegmentedLog none = given(null, null, 1);
+    assertThat(none.read().records()).containsExactly(r);
+    assertThat(none.segmentPrefix()).isEqualTo("segs");
+    assertThat(store.names()).isNotEmpty().allSatisfy(n -> assertThat(n).startsWith("segs/"));
+  }
+
+  /**
+   * D13: a client given no prefix and no default opens an existing log from its catalog object,
+   * but cannot create one: it fails before it writes anything.
+   */
+  @Test
+  void aClientWithNoPrefixCannotCreateALog() {
+    SegmentedLog none = given(null, null, 2);
+    LogTail absent = none.probe();
+    assertThatThrownBy(() -> none.putCheckpoint(absent, checkpoint(0, absent)))
+        .isInstanceOf(IllegalStateException.class).hasMessageContaining("cannot create");
+    assertThat(store.names()).isEmpty();
+    assertThat(io.bytes(LOCATION)).isNull();
+  }
+
+  /**
+   * D13: a catalog object that records no prefix keeps its segments at the default alone. A client
+   * that derives none fails, rather than look under the prefix it was given.
+   */
+  @Test
+  void aCatalogObjectWithoutAPrefixIsReadAtTheDefaultAlone() {
+    SegmentedLog atDefault = given(null, "segs", 2);
+    create(atDefault);
+    byte[] a = record();
+    atDefault.readThrough(atDefault.append(a, null), Duration.ZERO);
+    assertThatThrownBy(() -> given("segs", null, 2).read())
+        .isInstanceOf(IllegalStateException.class).hasMessageContaining("records no prefix");
+    assertThat(given("elsewhere", "segs", 2).read().records()).containsExactly(a);
+  }
+
   /**
    * An installer whose Install lost to another's of the same ordinal deletes the blob it created:
    * no Install can name it, and a sweep that cannot list would leave it.
@@ -392,7 +559,8 @@ class TestSegmentedLog {
     for (byte[] r : List.of(a, b, c)) {
       old.readThrough(old.append(r, null), Duration.ZERO); // 0: a, b; 1: c; 2 installed
     }
-    relocate(seg -> store.location(SegmentedLog.path("old", seg.logId(), seg.name())));
+    // the migration moves the prefix, and locates the segments it leaves at the old one
+    relocate("segs", seg -> store.location(SegmentedLog.path("old", seg.logId(), seg.name())));
 
     SegmentedLog moved = log("segs", 2, 2);
     assertThat(moved.read().records()).containsExactly(a, b, c);
@@ -429,20 +597,24 @@ class TestSegmentedLog {
   void aSegmentAtALocationTheStoreCannotReachFailsTheRead() {
     SegmentedLog log = created(2);
     log.readThrough(log.append(record(), null), Duration.ZERO);
-    relocate(seg -> "https://elsewhere.example/logs/" + seg.name());
+    relocate("segs", seg -> "https://elsewhere.example/logs/" + seg.name());
     assertThatThrownBy(() -> log(2).read()).hasStackTraceContaining("cannot reach");
   }
 
-  /** Replaces the catalog object's Installs with ones naming the locations {@code where} gives. */
-  private void relocate(Function<SegmentedLog.Seg, String> where) {
+  /**
+   * Replaces the catalog object's prefix with {@code prefix}, and its Installs with ones naming
+   * the locations {@code where} gives.
+   */
+  private void relocate(String prefix, Function<SegmentedLog.Seg, String> where) {
     AtomicFileLog catalog = AtomicFileLog.segmented(io, LOCATION, () -> 7L, false);
     LogView v = catalog.read();
     SegmentedLog.Cat cat = SegmentedLog.parse(v);
     List<byte[]> records = new ArrayList<>();
     records.add(LogEnvelope.encodeCheckpointThrough(cat.ck().encode()));
+    records.add(LogEnvelope.encodeSegmentPrefix(prefix));
     for (SegmentedLog.Seg seg : cat.segs()) {
-      records.add(new SegmentedLog.Seg(seg.logId(), seg.ordinal(), seg.name(), where.apply(seg),
-          seg.limit()).install());
+      records.add(new SegmentedLog.Seg(seg.logId(), prefix, seg.ordinal(), seg.name(),
+          where.apply(seg), seg.limit()).install());
     }
     catalog.replace(v.tail(), cat.checkpoint(), records);
   }

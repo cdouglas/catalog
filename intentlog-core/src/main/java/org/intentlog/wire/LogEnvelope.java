@@ -43,8 +43,8 @@ import java.util.UUID;
  * log's id, the committed set and the state machine's checkpoint; {@code LogRecord} carries a
  * record's id and the state machine's intention, a GC of the committed set ({@code
  * AdvanceHorizon}), a {@code PageOut} of its oldest block, or, in a segmented log's catalog
- * object, a segment's {@code InstallSegment} or {@code RetiredSegment} (provider records, which
- * no view carries). {@code CommittedPage} is a page's body, an object apart from the log. The
+ * object, a segment's {@code InstallSegment} or {@code RetiredSegment}, its checkpoint's position
+ * or the segments' prefix (provider records, which no view carries). {@code CommittedPage} is a page's body, an object apart from the log. The
  * state machine's bytes are opaque here.
  */
 public final class LogEnvelope {
@@ -68,6 +68,7 @@ public final class LogEnvelope {
   public static final int LOG_RECORD_INSTALL_SEGMENT = 5;
   public static final int LOG_RECORD_RETIRED_SEGMENT = 6;
   public static final int LOG_RECORD_CHECKPOINT_THROUGH = 7;
+  public static final int LOG_RECORD_SEGMENT_PREFIX = 8;
 
   public static final int INSTALL_SEGMENT_ORDINAL = 1;
   public static final int INSTALL_SEGMENT_NAME = 2;
@@ -137,11 +138,13 @@ public final class LogEnvelope {
 
   /**
    * A decoded {@code LogRecord}: an intention with its id, a GC record, a PageOut, or a segmented
-   * log's provider record (an Install or a Retired entry).
+   * log's provider record (an Install, a Retired entry, its checkpoint's position or its segments'
+   * prefix).
    */
   public static final class Record {
     private enum Kind {
-      INTENTION, ADVANCE_HORIZON, PAGE_OUT, INSTALL_SEGMENT, RETIRED_SEGMENT, CHECKPOINT_THROUGH
+      INTENTION, ADVANCE_HORIZON, PAGE_OUT, INSTALL_SEGMENT, RETIRED_SEGMENT, CHECKPOINT_THROUGH,
+      SEGMENT_PREFIX
     }
 
     private final Kind kind;
@@ -152,6 +155,7 @@ public final class LogEnvelope {
     private final InstallSegment installSegment;
     private final RetiredSegment retiredSegment;
     private byte[] checkpointThrough = null;
+    private String segmentPrefix = null;
 
     private Record(Kind kind, UUID id, byte[] intention, long watermarkMs, PageOut pageOut,
         InstallSegment installSegment, RetiredSegment retiredSegment) {
@@ -190,6 +194,12 @@ public final class LogEnvelope {
       return r;
     }
 
+    public static Record segmentPrefix(String prefix) {
+      Record r = new Record(Kind.SEGMENT_PREFIX, null, null, -1L, null, null, null);
+      r.segmentPrefix = prefix;
+      return r;
+    }
+
     /** Whether this is an intention, rather than a record of the committed set (GC, PageOut). */
     public boolean isIntention() {
       return kind == Kind.INTENTION;
@@ -206,12 +216,12 @@ public final class LogEnvelope {
     }
 
     /**
-     * Whether this is a segmented log's provider record: an Install, a Retired entry, or its
-     * checkpoint's position.
+     * Whether this is a segmented log's provider record: an Install, a Retired entry, its
+     * checkpoint's position, or its segments' prefix.
      */
     public boolean isSegmentRecord() {
       return kind == Kind.INSTALL_SEGMENT || kind == Kind.RETIRED_SEGMENT
-          || kind == Kind.CHECKPOINT_THROUGH;
+          || kind == Kind.CHECKPOINT_THROUGH || kind == Kind.SEGMENT_PREFIX;
     }
 
     /** The intention's id; null for any other record. */
@@ -247,6 +257,11 @@ public final class LogEnvelope {
     /** The position a segmented log's checkpoint covers; null for another record. */
     public byte[] checkpointThrough() {
       return checkpointThrough;
+    }
+
+    /** The prefix a segmented log's segments are named under; null for another record. */
+    public String segmentPrefix() {
+      return segmentPrefix;
     }
   }
 
@@ -508,6 +523,20 @@ public final class LogEnvelope {
   }
 
   /**
+   * Encodes a {@code LogRecord} that carries the prefix a segmented log's segments are named
+   * under.
+   */
+  public static byte[] encodeSegmentPrefix(String prefix) {
+    try {
+      ByteArrayOutputStream out = new ByteArrayOutputStream(prefix.length() + 3);
+      writeString(out, LOG_RECORD_SEGMENT_PREFIX, prefix);
+      return out.toByteArray();
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
+  /**
    * Decodes a {@code LogRecord}. Fails if it has no body, or more than one, or an intention
    * without an id, or a segment record with one.
    */
@@ -521,6 +550,7 @@ public final class LogEnvelope {
       InstallSegment install = null;
       RetiredSegment retired = null;
       byte[] through = null;
+      String prefix = null;
       int bodies = 0;
       while (in.available() > 0) {
         int tag = readVarint(in);
@@ -552,6 +582,10 @@ public final class LogEnvelope {
             through = readLengthDelimitedBytes(in);
             bodies++;
             break;
+          case LOG_RECORD_SEGMENT_PREFIX:
+            prefix = readString(in);
+            bodies++;
+            break;
           default:
             skipField(in, tag & 0x7);
         }
@@ -564,8 +598,12 @@ public final class LogEnvelope {
       if (pageOut != null) {
         return Record.pageOut(pageOut);
       }
-      if (install != null || retired != null || through != null) {
+      if (install != null || retired != null || through != null || prefix != null) {
         check(id == null, "A segment record carries an id");
+        if (prefix != null) {
+          check(!prefix.isEmpty(), "A segment prefix is empty");
+          return Record.segmentPrefix(prefix);
+        }
         return install != null ? Record.installSegment(install)
             : retired != null ? Record.retiredSegment(retired) : Record.checkpointThrough(through);
       }

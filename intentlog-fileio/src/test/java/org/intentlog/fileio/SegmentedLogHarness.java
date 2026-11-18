@@ -225,6 +225,8 @@ final class SegmentedLogHarness implements LogHarness {
   private final Segments store;
   private final String location;
   private final String prefix;
+  /** The prefix of a catalog object that records none (D13); null if the logs have no default. */
+  private final String defaultPrefix;
   private final String pages;
   private final StateMachine<?, ?, ?> machine;
   private final RoundRobin log;
@@ -236,12 +238,19 @@ final class SegmentedLogHarness implements LogHarness {
   private final SegmentedLog.Options neighbourOptions;
   private final List<byte[]> neighbourRecords = new ArrayList<>();
 
+  /**
+   * The harness of {@code logs}, instances of the log whose catalog object is at {@code location}
+   * in {@code io} and whose segments are in {@code store}, under the prefix the catalog object
+   * records or else {@code defaultPrefix}; the other log keeps its segments under {@code prefix}.
+   */
   SegmentedLogHarness(InMemoryAtomicFileIO io, Segments store, String location,
-      String prefix, List<SegmentedLog> logs, StateMachine<?, ?, ?> machine) {
+      String prefix, String defaultPrefix, List<SegmentedLog> logs,
+      StateMachine<?, ?, ?> machine) {
     this.io = io;
     this.store = store;
     this.location = location;
     this.prefix = prefix;
+    this.defaultPrefix = defaultPrefix;
     this.pages = location + ".committed/";
     this.machine = machine;
     this.log = new RoundRobin(logs);
@@ -477,7 +486,7 @@ final class SegmentedLogHarness implements LogHarness {
     List<SegmentedLog.Cat> out = new ArrayList<>();
     for (InMemoryAtomicFileIO.Write write : io.history()) {
       if (write.location().equals(location)) {
-        out.add(SegmentedLog.parse(AtomicFileLog.decode(write.after())));
+        out.add(SegmentedLog.parse(AtomicFileLog.decode(write.after()), defaultPrefix));
       }
     }
     return out;
@@ -509,7 +518,7 @@ final class SegmentedLogHarness implements LogHarness {
     List<Segments.Landed> appends = store.appends();
     for (long o = 0; installed.containsKey(o); o++) {
       SegmentedLog.Seg seg = installed.get(o);
-      String name = SegmentedLog.path(prefix, seg.logId(), seg.name());
+      String name = SegmentedLog.path(seg.prefix(), seg.logId(), seg.name());
       long count = 0;
       boolean ended = false;
       for (Segments.Landed a : appends) {
@@ -616,10 +625,17 @@ final class SegmentedLogHarness implements LogHarness {
       int c = a.compareTo(b);
       return c != 0 ? c : Long.compare(a.offset(), b.offset());
     });
+    String prefix = null;
     for (SegmentedLog.Cat c : catalogs()) {
       byte[] was = out.putIfAbsent(c.ck(), c.checkpoint());
       if (was != null && !Arrays.equals(was, c.checkpoint())) {
         violations.add("two checkpoints at " + c.ck() + " differ (I11)");
+      }
+      if (prefix == null) {
+        prefix = c.prefix();
+      } else if (!prefix.equals(c.prefix())) {
+        violations.add("the segments' prefix moved from " + prefix + " to " + c.prefix()
+            + " at " + c.ck() + " (D13)");
       }
     }
     return out;

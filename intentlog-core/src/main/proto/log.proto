@@ -172,6 +172,13 @@ message LogRecord {
     // encoding), the frame right after the checkpoint: a checkpoint is opaque
     // to its log, and the runtime checks the one it wrote against this.
     bytes checkpoint_through = 7;
+    // Where the log's segments are: the prefix their objects are named under,
+    // <prefix>/<log id>/<name>, as the log's creator wrote it (on Azure, a
+    // Blob URL). The frame right after checkpoint_through, and only there;
+    // every checkpoint restates it. Absent: the default every client derives
+    // from the catalog object's own location (docs/LOG_SEGMENTS.md D13), so a
+    // log created at its default carries none.
+    string segment_prefix = 8;
   }
 }
 
