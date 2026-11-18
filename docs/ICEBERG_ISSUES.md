@@ -15,9 +15,10 @@ before a PR.
 
 Upstream fixed C1. The fork fixes C2 to C30 on branch `core-fixes`, each
 in an upstream-style commit with its tests, so the project's tests no
-longer work around any of them.
+longer work around any of them. C31 is recorded, with a fix proposed and
+not yet written.
 
-`TestIcebergCoreIssues` has a canary for each issue: a test on
+`TestIcebergCoreIssues` has a canary for each issue up to C30: a test on
 `InMemoryCatalog` that asserts the bug is absent, with the message
 "Iceberg issue C*n* is back". Every canary passes against the fork. A
 canary that fails means a rebase dropped the fork's fix, or a release
@@ -69,8 +70,12 @@ record for fileio-catalog's Bug 86 (load racing a purge) found on
 2026-11-12, was fixed that day; it reproduces on main at `e70a2efcd0`,
 and upstream has no report of it. C30, which fileio-catalog's encoding
 contract found on 2026-11-17 with errata D17's fix, was fixed that day; it
-reproduces on main at `a6bc1f95e3`, and upstream has no report of it. The
-Fork column is `atomicio`, which sits on `core-perf`, on `core-fixes`.
+reproduces on main at `a6bc1f95e3`, and upstream has no report of it.
+C31, which a check of Iceberg's catalogs for fileio-catalog's Bug 117
+(merged expiry cleans stale base) found on 2026-11-18, reproduces on
+1.12.0 and on main at `a6bc1f95e3`; upstream has no report of it, and the
+fork does not fix it yet. The Fork column is `atomicio`, which sits on
+`core-perf`, on `core-fixes`.
 
 | Issue | Fork | 1.12.0 | main | Upstream |
 |---|---|---|---|---|
@@ -104,6 +109,7 @@ Fork column is `atomicio`, which sits on `core-perf`, on `core-fixes`.
 | C28. A JDBC commit whose UPDATE committed but whose reply was lost is reported as failed | fixed, `core-fixes` d69176a | yes (since 1.6.0) | yes | [#18743](https://github.com/apache/iceberg/issues/18743), open; PR [#18745](https://github.com/apache/iceberg/pull/18745), open, fixes the zero-row UPDATE as the fork does |
 | C29. A load racing a drop with purge reports a missing metadata file | fixed, `core-fixes` 207fce3 | yes | yes | not reported (2026-11-12); upstream reports a file the catalog still names as missing on purpose (`CatalogTests.testLoadTableWithMissingMetadataFile`), which the fix keeps |
 | C30. A removal of more snapshots than a table has fails with IllegalArgumentException | fixed, `core-fixes` e1853ce | yes | yes | not reported (2026-11-17); Java's client sends one update per snapshot since 1.9.1 (#13100, #13647), which meets it only on a table with no snapshots |
+| C31. An expiry cleans up the files of snapshots another writer removed | not fixed (fix proposed) | yes | yes | not reported (2026-11-18); [#13568](https://github.com/apache/iceberg/issues/13568), fixed by [#13614](https://github.com/apache/iceberg/pull/13614), the nearest: incremental cleanup's choice, not its base |
 
 "Not reported" means a search of apache/iceberg's issues, pull requests
 and PR branches, and of the issues@ and dev@ lists, found nothing for the
@@ -940,6 +946,38 @@ gone changes nothing.
   native replay does.
 - **Canary:** `aRemovalOfMoreSnapshotsThanTheTableHasApplies`, a bulk
   update applied as a REST server does (`CatalogHandlers.updateTable`).
+
+### C31. An expiry cleans up the files of snapshots another writer removed
+
+Details: [iceberg-issues/C31.md](iceberg-issues/C31.md).
+
+`RemoveSnapshots` commits its removal, then deletes the files reachable
+only from the snapshots its base has and a refresh of the table lacks,
+taking every such snapshot for its own. Another writer's removal is among them
+when a REST server applies the expiry's `remove-snapshots` to newer
+metadata (the commit has no requirement on the table's snapshots), and,
+on every catalog, when it lands between the commit and the cleanup's
+refresh. The expiry then deletes the files another writer's expiry kept
+(`cleanExpiredFiles(false)`, Spark's action before its own deletes), and,
+cleaning incrementally after another writer rolled main back and removed
+the snapshot it rolled back from, data files live in the table.
+
+- **Cause:** the cleanup's expired snapshots are the difference of `base`
+  and the refreshed table, not the expiry's removal, and incremental
+  cleanup takes main's history from `base`. A REST server applying the
+  update to newer metadata is the protocol as designed.
+- **Found by:** fileio-catalog's Bug 117 (merged expiry cleans stale
+  base), 2026-11-17, in its own merged expiries; a check of Iceberg's
+  catalogs the next day reproduced it through `RESTCatalogAdapter` and on
+  `InMemoryCatalog`, on 1.12.0 and main at `a6bc1f95e3`.
+- **Fork:** not fixed. The fix proposed: clean up the snapshots the
+  committed attempt removed, against what the refreshed table reaches,
+  and incrementally only when nothing else removed a snapshot and main is
+  where `base` had it, or after.
+- **In fileio-catalog:** an expiry conflicts with another removal since
+  its read (Bug 117), which closes the window before the commit for
+  FileIOCatalog. The window after it is Iceberg's.
+- **Canary:** none yet.
 
 ## Accepted Iceberg Behavior
 
