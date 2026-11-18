@@ -844,7 +844,9 @@ holds on the state it lost to (`CONFLICT`); staging it again on a fresh read
 is the caller's choice. The catalog restages namespace operations, renames,
 drops and table creates on a fresh read, up to Iceberg's default number of
 attempts (`LogCatalog.commitOnAFreshRead`, `dropTable`,
-`FileIOTableOperations.commitCreate`), and Iceberg re-applies a table commit.
+`FileIOTableOperations.commitCreate`), waiting before each retry as the loop
+waits after a lost race (`LogRuntime.waitAfterLostRace`), and Iceberg
+re-applies a table commit.
 A catalog transaction is not restaged: its deltas are judged where they land,
 and each table it pins conflicts on its whole version ([errata.md](errata.md)
 §D12).

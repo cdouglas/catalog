@@ -686,6 +686,27 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     return TimeUnit.MILLISECONDS.toNanos(boundMs);
   }
 
+  /**
+   * Waits as a commit waits after its {@code lostRaces}-th lost race: a time drawn uniformly below
+   * {@link #raceBoundNanos} (full jitter), from the writes' observed latency. For a caller that
+   * stages an operation again on a fresh read once a commit of it was rejected, so that the
+   * writers who lost to one winner spread out instead of racing again at once. Returns false if
+   * the thread was interrupted while it waited, with its interrupt kept and the wait cut short.
+   */
+  public boolean waitAfterLostRace(int lostRaces) {
+    long bound = raceBoundNanos(config, writeLatencyNanos.get(), lostRaces);
+    if (bound <= 0L) {
+      return true;
+    }
+    try {
+      TimeUnit.NANOSECONDS.sleep(ThreadLocalRandom.current().nextLong(bound + 1));
+      return true;
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      return false;
+    }
+  }
+
   /** The latency of the commit loop's writes as this runtime has seen them (0: none yet). */
   long writeLatencyNanos() {
     return writeLatencyNanos.get();

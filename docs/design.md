@@ -64,7 +64,8 @@ on it and commits them atomically:
    transaction's record, or throws `CommitStateUnknownException` (I10). A
    record whose preconditions fail goes back to the caller: the catalog
    (`LogCatalog`) stages a catalog operation again on a fresh read
-   (`commitOnAFreshRead`), and Iceberg re-applies a table commit; a
+   (`commitOnAFreshRead`), after the same wait, up to five times, and
+   Iceberg re-applies a table commit; a
    catalog transaction fails ([errata.md](errata.md) §D12). See
    [LOG.md](LOG.md) §"The commit loop".
 
@@ -621,8 +622,13 @@ What the matrix says:
    operation -- a namespace create, drop or property change, a table
    create, rename or drop -- which depends on nothing a concurrent change
    alters but existence, checked again on the fresh read (Bugs 47, 53,
-   54). A catalog transaction is the exception: it is not restaged, so one
-   that conflicts fails, for its caller to run again. Its deltas of inline
+   54). It makes five attempts, waiting before each as the commit loop
+   waits after a lost race; once they run out it throws
+   `ServiceUnavailableException`, nothing committed, and a create whose
+   table exists by then reports it existing (Bug 107 (create conflict
+   reported as exists)). A catalog transaction is the exception: it is
+   not restaged, so one that conflicts fails, for its caller to run
+   again. Its deltas of inline
    tables are judged where they land, as a table commit's; any other update
    of a table it writes conflicts on the table's whole version as it first
    read it ([errata.md](errata.md) §D12). A table it reads under

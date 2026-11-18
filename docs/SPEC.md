@@ -624,8 +624,16 @@ cleanup, on any failure but `CommitStateUnknownException`), so reporting a
 landed commit any other way loses the files its snapshot references (I10).
 The catalog restages namespace operations, renames, drops and table creates
 on a fresh read and retries their `CommitFailedException`, up to Iceberg's
-default number of attempts (`LogCatalog.commitOnAFreshRead`, `dropTable`,
-`FileIOTableOperations.commitCreate`). `commitTransaction` does not retry. A
+default number of attempts, five (`LogCatalog.commitOnAFreshRead`,
+`dropTable`, `FileIOTableOperations.commitCreate`), waiting before each
+retry as the commit loop waits after a lost race
+(`fileio.catalog.race.retry.basis`, `.min-wait-ms`). Once its attempts run
+out, an operation throws `ServiceUnavailableException`, a `CleanableFailure`
+that says nothing took effect and the operation may be run again; a create
+reads the catalog once more first, and if its table exists by then throws
+the conflict, which Iceberg's builder reports as `AlreadyExistsException`, so
+no create reports a table that does not exist as existing (Bug 107 (create
+conflict reported as exists)). `commitTransaction` does not retry. A
 catalog transaction sends its update of an inline table that adds snapshots
 and moves branches to them as a delta from the version it first read, which
 the encoding judges where the record lands and the commit loop carries over

@@ -172,6 +172,17 @@ public final class CatalogLog {
     }
   }
 
+  /**
+   * Waits before an operation whose commit conflicted is staged again on a fresh read, as the
+   * commit loop waits after its {@code attempt}-th lost race ({@code
+   * fileio.catalog.race.retry.basis}, {@code .min-wait-ms}; none where the latter is 0). Returns
+   * false if the thread was interrupted while it waited, with its interrupt kept: the operation
+   * then stops.
+   */
+  boolean waitBeforeRetry(int attempt) {
+    return runtime.waitAfterLostRace(attempt);
+  }
+
   /** The memo of this catalog's checkpoint encodings, or null if it keeps none. */
   CheckpointMemo checkpointMemo() {
     return machine.memo();

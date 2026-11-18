@@ -62,6 +62,7 @@ import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
+import org.apache.iceberg.exceptions.ServiceUnavailableException;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -124,6 +125,13 @@ public class LogCatalog extends BaseMetastoreCatalog
 
   private static final org.slf4j.Logger LOG =
       org.slf4j.LoggerFactory.getLogger(LogCatalog.class);
+
+  /**
+   * The attempts a catalog operation makes, each staged on a fresh read, before it gives up on
+   * commits that keep conflicting: as many as Iceberg makes of a table commit by default.
+   */
+  static final int OPERATION_ATTEMPTS =
+      org.apache.iceberg.TableProperties.COMMIT_NUM_RETRIES_DEFAULT + 1;
 
   private String catalogName;
   private String warehouseLocation;
@@ -295,11 +303,16 @@ public class LogCatalog extends BaseMetastoreCatalog
         .collect(Collectors.toList());
   }
 
+  /**
+   * Drops {@code identifier}. A drop does not depend on the table's state, but its record names
+   * the version it read, so one that conflicts with a concurrent commit to the table is staged
+   * again on a fresh read, after the commit loop's wait after a lost race, up to {@link
+   * #OPERATION_ATTEMPTS} times. false means only that the table did not exist.
+   *
+   * @throws ServiceUnavailableException if every attempt conflicted: nothing was dropped
+   */
   @Override
   public boolean dropTable(TableIdentifier identifier, boolean purge) {
-    // A drop does not depend on the table's state, but its record names the version it read, so
-    // one that conflicts with a concurrent commit to the table is retried on a fresh read. false
-    // means only that the table did not exist.
     for (int attempt = 1; ; attempt++) {
       final Replica<CatalogState> read = log.read();
       if (!read.state().containsTable(identifier)) {
@@ -321,8 +334,8 @@ public class LogCatalog extends BaseMetastoreCatalog
         throw e;
       } catch (CommitFailedException e) {
         deleteQuietly(kept);
-        if (attempt >= org.apache.iceberg.TableProperties.COMMIT_NUM_RETRIES_DEFAULT + 1) {
-          throw e;
+        if (attempt >= OPERATION_ATTEMPTS || !log.waitBeforeRetry(attempt)) {
+          throw unavailable(e, attempt, "drop table " + identifier);
         }
         continue;
       }
@@ -449,7 +462,8 @@ public class LogCatalog extends BaseMetastoreCatalog
 
   @Override
   public void renameTable(TableIdentifier from, TableIdentifier to) {
-    commitOnAFreshRead(read -> new CatalogMutation(read).renameTable(from, to));
+    commitOnAFreshRead("rename table " + from + " to " + to,
+        read -> new CatalogMutation(read).renameTable(from, to));
   }
 
   /**
@@ -489,24 +503,41 @@ public class LogCatalog extends BaseMetastoreCatalog
   }
 
   /**
-   * Commits what {@code stage} stages on a fresh read of the catalog, and on another if it
-   * conflicts with a concurrent change. A catalog operation does not depend on what its caller
-   * read, but its record names the versions it read: of its namespace, or of the parent of one it
-   * creates or drops, which any change there bumps (a table created in it, a sibling created, its
-   * properties set), and of a table it renames. {@code stage} checks existence on each read.
-   * Throws the conflict after Iceberg's default number of attempts.
+   * Commits what {@code stage} stages on a fresh read of the catalog, and on another, after the
+   * commit loop's wait after a lost race, if it conflicts with a concurrent change. A catalog
+   * operation does not depend on what its caller read, but its record names the versions it read:
+   * of its namespace, or of the parent of one it creates or drops, which any change there bumps (a
+   * table created in it, a sibling created, its properties set), and of a table it renames. {@code
+   * stage} checks existence on each read.
+   *
+   * @throws ServiceUnavailableException if each of {@link #OPERATION_ATTEMPTS} commits conflicted
+   *     (the callers of these operations expect no {@link CommitFailedException}): nothing was
+   *     committed
    */
-  private void commitOnAFreshRead(Function<Replica<CatalogState>, CatalogMutation> stage) {
+  private void commitOnAFreshRead(
+      String operation, Function<Replica<CatalogState>, CatalogMutation> stage) {
     for (int attempt = 1; ; attempt++) {
       try {
         stage.apply(log.read()).commit(log);
         return;
       } catch (CommitFailedException e) {
-        if (attempt >= org.apache.iceberg.TableProperties.COMMIT_NUM_RETRIES_DEFAULT + 1) {
-          throw e;
+        if (attempt >= OPERATION_ATTEMPTS || !log.waitBeforeRetry(attempt)) {
+          throw unavailable(e, attempt, operation);
         }
       }
     }
+  }
+
+  /**
+   * The failure of {@code operation}, whose {@code attempts} commits each conflicted with a
+   * concurrent change, the last with {@code conflict}: the catalog is too busy for it now, and
+   * nothing of it was committed, so it may be run again.
+   */
+  static ServiceUnavailableException unavailable(
+      CommitFailedException conflict, int attempts, String operation) {
+    return new ServiceUnavailableException(conflict,
+        "Cannot %s: each of its %s commits conflicted with a concurrent change, and none took "
+            + "effect (%s)", operation, attempts, conflict.getMessage());
   }
 
   @Override
@@ -744,7 +775,8 @@ public class LogCatalog extends BaseMetastoreCatalog
 
   @Override
   public void createNamespace(Namespace namespace, Map<String, String> metadata) {
-    commitOnAFreshRead(read -> new CatalogMutation(read).createNamespace(namespace, metadata));
+    commitOnAFreshRead("create namespace " + namespace,
+        read -> new CatalogMutation(read).createNamespace(namespace, metadata));
   }
 
   @Override
@@ -783,7 +815,8 @@ public class LogCatalog extends BaseMetastoreCatalog
   @Override
   public boolean dropNamespace(Namespace namespace) throws NamespaceNotEmptyException {
     try {
-      commitOnAFreshRead(read -> new CatalogMutation(read).dropNamespace(namespace));
+      commitOnAFreshRead("drop namespace " + namespace,
+          read -> new CatalogMutation(read).dropNamespace(namespace));
     } catch (NoSuchNamespaceException e) {
       return false;
     }
@@ -793,7 +826,8 @@ public class LogCatalog extends BaseMetastoreCatalog
   @Override
   public boolean setProperties(Namespace namespace, Map<String, String> properties)
       throws NoSuchNamespaceException {
-    commitOnAFreshRead(read -> new CatalogMutation(read).updateProperties(namespace, properties));
+    commitOnAFreshRead("change the properties of namespace " + namespace,
+        read -> new CatalogMutation(read).updateProperties(namespace, properties));
     return true;
   }
 
@@ -1255,8 +1289,13 @@ public class LogCatalog extends BaseMetastoreCatalog
      * Commits the creation of this table with {@code metadata}. Its record names the version of
      * the namespace it read, which any change there bumps (another table created or dropped in
      * it, its properties set), and Iceberg takes a create's conflict to mean the table exists. So
-     * one that conflicts is staged again on a fresh read, which fails if the table exists by then.
-     * Throws the conflict after Iceberg's default number of attempts.
+     * one that conflicts is staged again on a fresh read, after the commit loop's wait after a
+     * lost race, which fails if the table exists by then ({@link
+     * org.apache.iceberg.exceptions.AlreadyExistsException}). After {@link #OPERATION_ATTEMPTS}
+     * conflicts it reads the catalog again: if the table exists, it throws the conflict, which
+     * Iceberg reports as the table created concurrently; if not, it throws {@link
+     * ServiceUnavailableException}, which Iceberg passes on, so a table that does not exist is
+     * never reported as existing (Bug 107).
      */
     private void commitCreate(TableMetadata metadata) {
       Consumer<CatalogMutation> create = stageCreate(metadata);
@@ -1268,8 +1307,11 @@ public class LogCatalog extends BaseMetastoreCatalog
           landed = mut.commit(log);
           return;
         } catch (CommitFailedException e) {
-          if (attempt >= org.apache.iceberg.TableProperties.COMMIT_NUM_RETRIES_DEFAULT + 1) {
-            throw e;
+          if (attempt >= OPERATION_ATTEMPTS || !log.waitBeforeRetry(attempt)) {
+            if (log.read().state().containsTable(tableId)) {
+              throw e;
+            }
+            throw unavailable(e, attempt, "create table " + tableId);
           }
           read = log.read();
         }

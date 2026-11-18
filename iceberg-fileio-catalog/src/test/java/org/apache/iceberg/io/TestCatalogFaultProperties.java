@@ -745,7 +745,10 @@ class TestCatalogFaultProperties {
 
   enum Outcome {
     ACKNOWLEDGED,
-    /** A definite no: CommitFailedException, a validation or existence failure. */
+    /**
+     * A definite no: CommitFailedException, a validation or existence failure, or a catalog
+     * operation that ran out of attempts (ServiceUnavailableException).
+     */
     REJECTED,
     /** CommitStateUnknownException. */
     UNKNOWN,
@@ -2128,7 +2131,9 @@ class TestCatalogFaultProperties {
         outcome = Outcome.UNKNOWN;
         reason = firstLine(e);
       } catch (CommitFailedException | ValidationException | AlreadyExistsException
-          | NoSuchNamespaceException | NamespaceNotEmptyException e) {
+          | NoSuchNamespaceException | NamespaceNotEmptyException
+          | org.apache.iceberg.exceptions.ServiceUnavailableException e) {
+        // ServiceUnavailableException: a catalog operation whose attempts all conflicted (Bug 107)
         outcome = Outcome.REJECTED;
         reason = e.getClass().getSimpleName() + ": " + firstLine(e);
       } catch (NoSuchTableException e) {

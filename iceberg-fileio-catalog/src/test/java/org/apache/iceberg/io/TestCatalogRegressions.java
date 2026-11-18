@@ -59,6 +59,7 @@ import org.intentlog.fileio.AtomicFileLog;
 import org.intentlog.CommittedSet;
 import org.intentlog.DedupHorizonExceededException;
 import org.intentlog.Replica;
+import org.intentlog.memory.InMemorySharedLog;
 import org.intentlog.wire.UuidV7;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -6502,6 +6503,334 @@ public class TestCatalogRegressions {
       txn.asCatalog().dropTable(mixed, false);
       assertThatThrownBy(txn::commitTransaction).hasStackTraceContaining("Write refused");
       assertThat(catalog.tableExists(mixed)).isTrue();
+    }
+  }
+
+  /**
+   * Bug 107 (create conflict reported as exists): a table create's record names its namespace's
+   * version, which every create, drop or rename of a sibling bumps, so concurrent creates in one
+   * namespace land one per round; after five rounds a create gave up with the conflict, which
+   * Iceberg's builder reports as "Table was created concurrently", for a table that does not
+   * exist. A create, and each catalog operation, that keeps losing its race waits between
+   * attempts as the commit loop does after a lost race, and once its attempts run out throws
+   * ServiceUnavailableException, nothing committed; only a create that finds its table taken by
+   * then reports it existing.
+   */
+  @Nested
+  class CreatesThatKeepLosingToSiblings {
+    private final Namespace ns = Namespace.of("ns");
+    private final TableIdentifier t = TableIdentifier.of(ns, "t");
+
+    /**
+     * Eight writers create eight tables in one namespace from threads a latch releases. Each
+     * writer's appends to the shared log wait a while before they are sent (outside the log's
+     * lock), so every writer of a round reads before any of its appends lands, and each round has
+     * one winner: five rounds leave three creates whose attempts ran out.
+     */
+    @Test
+    void eightWritersInOneNamespace() throws Exception {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      InMemorySharedLog shared = new InMemorySharedLog(WAREHOUSE + "/catalog");
+      List<LogCatalog> catalogs = new ArrayList<>();
+      for (int i = 0; i < 8; i++) {
+        catalogs.add(slowAppends(io, shared, "w" + i));
+      }
+      catalogs.get(0).createNamespace(ns);
+      java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
+      Map<TableIdentifier, Throwable> outcomes = new ConcurrentHashMap<>();
+      List<Thread> threads = new ArrayList<>();
+      for (int i = 0; i < 8; i++) {
+        LogCatalog catalog = catalogs.get(i);
+        TableIdentifier table = TableIdentifier.of(ns, "t" + i);
+        Thread thread = new Thread(() -> {
+          try {
+            start.await();
+            catalog.createTable(table, SCHEMA);
+            outcomes.put(table, new Created());
+          } catch (Throwable e) {
+            outcomes.put(table, e);
+          }
+        });
+        thread.start();
+        threads.add(thread);
+      }
+      start.countDown();
+      for (Thread thread : threads) {
+        thread.join(120_000);
+      }
+      LogCatalog reader = slowAppends(io, shared, "reader");
+      assertThat(outcomes).hasSize(8);
+      outcomes.forEach((table, outcome) -> {
+        if (outcome instanceof Created) {
+          assertThat(reader.tableExists(table)).as("%s, created", table).isTrue();
+        } else {
+          assertThat(outcome)
+              .as("%s, which %s", table, reader.tableExists(table) ? "exists" : "does not exist")
+              .isNotInstanceOf(AlreadyExistsException.class)
+              .isInstanceOf(org.apache.iceberg.exceptions.ServiceUnavailableException.class);
+          assertThat(reader.tableExists(table)).as("%s, not created", table).isFalse();
+        }
+      });
+    }
+
+    /** A create that each attempt finds a sibling landed before: its attempts run out. */
+    @ParameterizedTest
+    @EnumSource(names = {"MEMLOG", "MEMLOG_TM"})
+    void aCreateThatKeepsLosingIsUnavailable(LocalCatalogMode mode) {
+      LogCatalog catalog = memlog(mode);
+      catalog.createNamespace(ns);
+      LogCatalog other = memlog(mode);
+      int[] siblings = {0};
+
+      Throwable thrown = raced(catalog, () -> other.createTable(
+          TableIdentifier.of(ns, "s" + siblings[0]++), SCHEMA), () -> catalog.createTable(t, SCHEMA));
+
+      assertThat(thrown).isInstanceOf(org.apache.iceberg.exceptions.ServiceUnavailableException.class)
+          .hasCauseInstanceOf(CommitFailedException.class);
+      assertThat(siblings[0]).isEqualTo(LogCatalog.OPERATION_ATTEMPTS);
+      assertThat(catalog.tableExists(t)).isFalse();
+    }
+
+    /**
+     * A create whose attempts ran out, and whose table another writer created before its last
+     * read: it exists, and Iceberg reports it so.
+     */
+    @Test
+    void aCreateWhoseTableExistsOnceItsAttemptsRunOutReportsIt() {
+      LogCatalog catalog = memlog(LocalCatalogMode.MEMLOG);
+      catalog.createNamespace(ns);
+      LogCatalog other = memlog(LocalCatalogMode.MEMLOG);
+      InMemorySharedLog shared = LocalCatalogMode.sharedLog(io, WAREHOUSE + "/catalog-c");
+      int[] appends = {0};
+      boolean[] inHook = {false};
+      shared.intercept(new InMemorySharedLog.Interceptor() {
+        @Override
+        public InMemorySharedLog.WriteFault beforeWrite(
+            InMemorySharedLog.Request request, byte[] payload) {
+          if (request == InMemorySharedLog.Request.APPEND && !inHook[0]) {
+            appends[0] += 1;
+            nested(inHook, () -> other.createTable(
+                TableIdentifier.of(ns, "s" + appends[0]), SCHEMA));
+          }
+          return InMemorySharedLog.WriteFault.NONE;
+        }
+
+        @Override
+        public InMemorySharedLog.ReadShape beforeRead(InMemorySharedLog.Request request) {
+          if (appends[0] == LogCatalog.OPERATION_ATTEMPTS && !inHook[0]
+              && request != InMemorySharedLog.Request.READ_THROUGH) {
+            appends[0] += 1;
+            nested(inHook, () -> other.createTable(t, SCHEMA));
+          }
+          return InMemorySharedLog.ReadShape.NORMAL;
+        }
+      });
+      try {
+        // the builder's report of the conflict the create threw
+        assertThatThrownBy(() -> catalog.createTable(t, SCHEMA))
+            .isInstanceOf(AlreadyExistsException.class)
+            .hasMessageContaining("created concurrently");
+      } finally {
+        shared.intercept(null);
+      }
+      assertThat(appends[0]).isEqualTo(LogCatalog.OPERATION_ATTEMPTS + 1);
+      assertThat(catalog.tableExists(t)).isTrue();
+    }
+
+    /** A namespace create that each attempt finds a sibling namespace landed before. */
+    @Test
+    void aNamespaceCreateThatKeepsLosingIsUnavailable() {
+      LogCatalog catalog = memlog(LocalCatalogMode.MEMLOG);
+      LogCatalog other = memlog(LocalCatalogMode.MEMLOG);
+      int[] siblings = {0};
+
+      Throwable thrown = raced(catalog,
+          () -> other.createNamespace(Namespace.of("s" + siblings[0]++)),
+          () -> catalog.createNamespace(ns));
+
+      assertThat(thrown).isInstanceOf(org.apache.iceberg.exceptions.ServiceUnavailableException.class);
+      assertThat(catalog.namespaceExists(ns)).isFalse();
+    }
+
+    /** A namespace drop that each attempt finds the namespace's properties changed before. */
+    @Test
+    void aNamespaceDropThatKeepsLosingIsUnavailable() {
+      LogCatalog catalog = memlog(LocalCatalogMode.MEMLOG);
+      catalog.createNamespace(ns);
+      LogCatalog other = memlog(LocalCatalogMode.MEMLOG);
+      int[] changes = {0};
+
+      Throwable thrown = raced(catalog,
+          () -> other.setProperties(ns, Map.of("k", "v" + changes[0]++)),
+          () -> catalog.dropNamespace(ns));
+
+      assertThat(thrown).isInstanceOf(org.apache.iceberg.exceptions.ServiceUnavailableException.class);
+      assertThat(catalog.namespaceExists(ns)).isTrue();
+    }
+
+    /** A property change that each attempt finds another landed before. */
+    @Test
+    void aPropertyChangeThatKeepsLosingIsUnavailable() {
+      LogCatalog catalog = memlog(LocalCatalogMode.MEMLOG);
+      catalog.createNamespace(ns);
+      LogCatalog other = memlog(LocalCatalogMode.MEMLOG);
+      int[] changes = {0};
+
+      Throwable thrown = raced(catalog,
+          () -> other.setProperties(ns, Map.of("k", "v" + changes[0]++)),
+          () -> catalog.removeProperties(ns, Set.of("k")));
+
+      assertThat(thrown).isInstanceOf(org.apache.iceberg.exceptions.ServiceUnavailableException.class);
+      assertThat(catalog.loadNamespaceMetadata(ns)).containsKey("k");
+    }
+
+    /** A rename, and a drop, of a table that each attempt finds changed. */
+    @Test
+    void aRenameAndADropThatKeepLosingAreUnavailable() {
+      LogCatalog catalog = memlog(LocalCatalogMode.MEMLOG);
+      catalog.createNamespace(ns);
+      catalog.createTable(t, SCHEMA);
+      LogCatalog other = memlog(LocalCatalogMode.MEMLOG);
+      int[] changes = {0};
+      Runnable change =
+          () -> other.loadTable(t).updateProperties().set("k", "v" + changes[0]++).commit();
+      TableIdentifier u = TableIdentifier.of(ns, "u");
+
+      assertThat(raced(catalog, change, () -> catalog.renameTable(t, u)))
+          .isInstanceOf(org.apache.iceberg.exceptions.ServiceUnavailableException.class);
+      assertThat(raced(catalog, change, () -> catalog.dropTable(t, false)))
+          .isInstanceOf(org.apache.iceberg.exceptions.ServiceUnavailableException.class);
+      assertThat(catalog.tableExists(t)).isTrue();
+      assertThat(catalog.tableExists(u)).isFalse();
+    }
+
+    private InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+
+    /** A catalog "c" over this test's store, on its shared log, in {@code mode}. */
+    private LogCatalog memlog(LocalCatalogMode mode) {
+      return mode.catalog(io, WAREHOUSE, "c",
+          Map.of(LogCatalogProperties.MAX_APPEND_COUNT, "1000"));
+    }
+
+    /**
+     * What {@code operation} of {@code catalog} throws, while {@code change} lands before each of
+     * its appends to its shared log (and nothing if it returns).
+     */
+    private Throwable raced(LogCatalog catalog, Runnable change, Runnable operation) {
+      InMemorySharedLog shared = LocalCatalogMode.sharedLog(io, WAREHOUSE + "/catalog-c");
+      boolean[] inHook = {false};
+      shared.intercept(new InMemorySharedLog.Interceptor() {
+        @Override
+        public InMemorySharedLog.WriteFault beforeWrite(
+            InMemorySharedLog.Request request, byte[] payload) {
+          if (request == InMemorySharedLog.Request.APPEND && !inHook[0]) {
+            nested(inHook, change);
+          }
+          return InMemorySharedLog.WriteFault.NONE;
+        }
+      });
+      try {
+        operation.run();
+        return null;
+      } catch (RuntimeException e) {
+        return e;
+      } finally {
+        shared.intercept(null);
+      }
+    }
+
+    /** Runs {@code change}, another writer's, inside a hook of the log, flagged by {@code inHook}. */
+    private void nested(boolean[] inHook, Runnable change) {
+      inHook[0] = true;
+      try {
+        change.run();
+      } finally {
+        inHook[0] = false;
+      }
+    }
+
+    /**
+     * A catalog {@code name} over {@code io}, on {@code shared}, whose appends wait 50 ms before
+     * they are sent.
+     */
+    private LogCatalog slowAppends(InMemoryAtomicFileIO io, InMemorySharedLog shared, String name) {
+      Map<String, String> properties = new HashMap<>();
+      properties.put(CatalogProperties.WAREHOUSE_LOCATION, WAREHOUSE);
+      properties.put(LogCatalogProperties.MAX_APPEND_COUNT, "1000");
+      properties.put(LogCatalogProperties.RACE_MIN_WAIT_MS, "0");
+      LogCatalog catalog = new LogCatalog(name, new SlowAppends(shared, 50), io, new HashMap<>());
+      catalog.initialize(name, properties);
+      return catalog;
+    }
+  }
+
+  /** The outcome of a create that returned. */
+  private static final class Created extends Throwable {
+    Created() {
+      super(null, null, false, false);
+    }
+  }
+
+  /** A shared log whose appends wait {@code delayMs} before they are sent, outside its lock. */
+  private static final class SlowAppends implements org.intentlog.SharedLog {
+    private final InMemorySharedLog log;
+    private final long delayMs;
+
+    SlowAppends(InMemorySharedLog log, long delayMs) {
+      this.log = log;
+      this.delayMs = delayMs;
+    }
+
+    @Override
+    public org.intentlog.Capabilities capabilities() {
+      return log.capabilities();
+    }
+
+    @Override
+    public org.intentlog.LogView read() {
+      return log.read();
+    }
+
+    @Override
+    public org.intentlog.LogView readThrough(
+        org.intentlog.Receipt receipt, java.time.Duration wait) {
+      return log.readThrough(receipt, wait);
+    }
+
+    @Override
+    public org.intentlog.LogTail probe() {
+      return log.probe();
+    }
+
+    @Override
+    public org.intentlog.Receipt append(byte[] record, org.intentlog.LogTail expected) {
+      try {
+        Thread.sleep(delayMs);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new IllegalStateException(e);
+      }
+      return log.append(record, expected);
+    }
+
+    @Override
+    public void putCheckpoint(org.intentlog.LogTail through, byte[] checkpoint) {
+      log.putCheckpoint(through, checkpoint);
+    }
+
+    @Override
+    public void trim(org.intentlog.LogTail through) {
+      log.trim(through);
+    }
+
+    @Override
+    public org.intentlog.LogView readAfter(org.intentlog.LogTail since) {
+      return log.readAfter(since);
+    }
+
+    @Override
+    public org.intentlog.PageStore pages() {
+      return log.pages();
     }
   }
 }
