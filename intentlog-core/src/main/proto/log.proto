@@ -181,7 +181,9 @@ message LogRecord {
 // checkpoint's position.
 message InstallSegment {
   uint64 ordinal = 1;
-  // The segment's name in the log's segment store, with its nonce.
+  // The segment's name, seg-<ordinal>-<nonce>. Its object is
+  // <prefix>/<log id>/<name>: the log's id is its checkpoint's log_id, so no
+  // entry carries it (docs/LOG_SEGMENTS.md D12).
   string name = 2;
   // Where the segment is, as a URL, in place of the store and name; empty
   // for one in the log's store.

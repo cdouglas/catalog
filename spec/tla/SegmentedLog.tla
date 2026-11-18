@@ -27,8 +27,11 @@
 (* record is in it where its read-through found it (P3), every read is a   *)
 (* slice of it from a checkpoint, checkpoints keep their place, every      *)
 (* segment can end (SG8), and a record has no copy in it that its writer   *)
-(* doesn't know may have landed (the shared-log model's `dup`). Bug        *)
-(* switches put back LOG_SEGMENTS.md's mistakes.                           *)
+(* doesn't know may have landed (the shared-log model's `dup`). Another    *)
+(* log keeps a segment at the same prefix, which its own catalog object    *)
+(* names: it must outlive this log's sweeps, Bug 100 (sweep deleted        *)
+(* another log's segments). Bug switches put back LOG_SEGMENTS.md's        *)
+(* mistakes.                                                               *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets, TLC
 
@@ -57,8 +60,8 @@ ASSUME /\ Limit >= 1 /\ MaxBlocks >= 1 /\ MaxOrd >= 0 /\ MaxSends >= 1 /\ MaxCop
        /\ AnySeg \in BOOLEAN /\ Ahead \in BOOLEAN
        /\ FaultKinds \subseteq {"lostReply", "notSent", "inflight", "shortRead"}
        /\ Bugs \subseteq {"catalogseal", "limitatnext", "sealcount", "readahead", "voidack",
-                          "createonmissing", "sweepearly", "sweepinflight", "sdkretry",
-                          "overlimit"}
+                          "createonmissing", "sweepearly", "sweepinflight", "sweepothers",
+                          "sdkretry", "overlimit"}
        \* A log refuses a limit its store can't hold; "overlimit" installs one anyway.
        /\ Limit <= MaxBlocks \/ "overlimit" \in Bugs
 
@@ -69,9 +72,14 @@ Min2(a, b) == IF a <= b THEN a ELSE b
 \* none, and the next Install sets it from a count read before.
 InstallLim == IF Has("limitatnext") THEN -1 ELSE Limit
 
-\* Segment names: <<ordinal, nonce>>, the nonce its creator's id.
-Names == {<<o, n>> : o \in 0..MaxOrd, n \in Writers \cup {0}}
-OrdOf(nm) == nm[1]
+\* Segment names: <<log, ordinal, nonce>>, the nonce its creator's id. A
+\* segment's blob is under its log's id, so the log is part of its name. This
+\* log's are "this"; Other is another log's segment 0 at the same prefix,
+\* which that log's catalog object (not modelled) names.
+Other == <<"other", 0, 0>>
+Names == {<<"this", o, n>> : o \in 0..MaxOrd, n \in Writers \cup {0}} \cup {Other}
+LogOf(nm) == nm[1]
+OrdOf(nm) == nm[2]
 AllRecs == UNION {{Recs[w][i] : i \in 1..Len(Recs[w])} : w \in Writers}
 
 VARIABLES
@@ -306,7 +314,7 @@ LRead(w) ==
 
 Create(w) ==
   LET s == ws[w]
-      cand == <<LastOrd(s.wc) + 1, w>>
+      cand == <<"this", LastOrd(s.wc) + 1, w>>
   IN /\ s.pc = "create"
      /\ blob' = IF blob[cand].ex THEN blob ELSE [blob EXCEPT ![cand] = [ex |-> TRUE, fr |-> << >>]]
      /\ SetW(w, [s EXCEPT !.cand = cand, !.pc = "cas"])
@@ -454,12 +462,14 @@ CasCk ==
   /\ UNCHANGED <<blob, ckpts, comp>> /\ UNCH_C
 
 \* The sweep (at TTL 0) deletes a retired segment, or an unnamed blob at or
-\* below the newest Install's ordinal: no Install of it can land any more.
-\* "sweepinflight": an unnamed blob of any ordinal. "sweepearly": a named one.
+\* below the newest Install's ordinal: no Install of it can land any more. It
+\* lists only this log's blobs. "sweepinflight": an unnamed blob of any
+\* ordinal. "sweepearly": a named one. "sweepothers": it lists every log's.
 Sweep ==
   /\ comp.sw < MaxSweep
   /\ \E nm \in Names :
        /\ blob[nm].ex
+       /\ LogOf(nm) = "this" \/ Has("sweepothers")
        /\ \/ nm \in cat.ret
           \/ nm \notin NamesIn(cat) /\ (OrdOf(nm) <= LastOrd(cat) \/ Has("sweepinflight"))
           \/ Has("sweepearly") /\ nm \in NamesIn(cat)
@@ -549,11 +559,11 @@ RNext(r) ==
 -----------------------------------------------------------------------------
 
 Init ==
-  /\ blob = [nm \in Names |-> [ex |-> nm = <<0, 0>>, fr |-> << >>]]
+  /\ blob = [nm \in Names |-> [ex |-> nm \in {<<"this", 0, 0>>, Other}, fr |-> << >>]]
   /\ cat = [ver |-> 1, ck |-> [ord |-> 0, rec |-> 0, k |-> 0],
-            segs |-> << [ord |-> 0, name |-> <<0, 0>>, lim |-> InstallLim, cl |-> -1] >>,
+            segs |-> << [ord |-> 0, name |-> <<"this", 0, 0>>, lim |-> InstallLim, cl |-> -1] >>,
             ret |-> {}]
-  /\ chain = << <<0, 0>> >>
+  /\ chain = << <<"this", 0, 0>> >>
   /\ lims = [o \in 0..MaxOrd |-> IF o = 0 THEN InstallLim ELSE -1]
   /\ closedAt = [o \in 0..MaxOrd |-> -1]
   /\ ckpts = {[ord |-> 0, rec |-> 0, k |-> 0]}
@@ -613,6 +623,9 @@ AckedInLog ==
 \* Every segment the catalog object names exists (SG4, SG6).
 NamedExist == \A j \in 1..Len(cat.segs) : blob[cat.segs[j].name].ex
 
+\* Another log's segment at the prefix, which its catalog object names, exists.
+OthersKept == blob[Other].ex
+
 \* P5: the checkpoint lies in a named segment, so a reader can start.
 Readable == Named(cat, cat.ck.ord) /\ cat.ck \in ckpts
 
@@ -629,5 +642,5 @@ CopiesKnown ==
 
 Safety ==
   /\ ReadsAreSlices /\ AckedInLog /\ NamedExist /\ Readable /\ CheckpointsStable /\ CanEnd
-  /\ CopiesKnown
+  /\ CopiesKnown /\ OthersKept
 =============================================================================

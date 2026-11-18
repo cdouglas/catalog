@@ -64,7 +64,11 @@ class TestSegmentedLog {
   }
 
   private static byte[] checkpoint(int n, LogTail through) {
-    return LogEnvelope.encodeCheckpoint(LOG_ID, new byte[0],
+    return checkpoint(LOG_ID, n, through);
+  }
+
+  private static byte[] checkpoint(UUID logId, int n, LogTail through) {
+    return LogEnvelope.encodeCheckpoint(logId, new byte[0],
         ("state-" + n).getBytes(StandardCharsets.UTF_8), through.position());
   }
 
@@ -81,9 +85,12 @@ class TestSegmentedLog {
   }
 
   private String segment(long ordinal) {
-    return store.names().stream()
-        .filter(n -> SegmentedLog.ordinalOf(n.substring("segs/".length())) == ordinal)
-        .findFirst().orElseThrow();
+    return segmentIn("segs", ordinal);
+  }
+
+  /** A segment's name as an Install holds it: its blob's, without the prefix and the log's id. */
+  private static String nameOf(String blob) {
+    return blob.substring(blob.lastIndexOf('/') + 1);
   }
 
   @Test
@@ -146,8 +153,7 @@ class TestSegmentedLog {
     byte[] frame = SegmentFrames.record(c, 1);
     SegmentStore.Appended at = store.append(one, frame);
     Receipt later = new SegmentedLog.SegReceipt(LOG_ID, List.of(new SegmentedLog.Copy(1,
-        one.substring("segs/".length()), at.offset(), at.blocks(), frame.length,
-        SegmentFrames.crcOf(frame))), c);
+        nameOf(one), at.offset(), at.blocks(), frame.length, SegmentFrames.crcOf(frame))), c);
     assertThat(log(3).read().records()).containsExactly(a, b); // segment 1 waits
     assertThat(log.readThrough(later, Duration.ZERO).records()).containsExactly(a, b, c);
     assertThat(SegmentFrames.parse(store.peek(segment(0)), store.peek(segment(0)).length, 0, 0))
@@ -239,7 +245,7 @@ class TestSegmentedLog {
     assertThat(retired()).containsExactly(4L);
     SegmentedLog.Cat cat = SegmentedLog.parse(AtomicFileLog.decode(io.bytes(LOCATION)));
     List<String> named = new ArrayList<>(
-        cat.segs().stream().map(seg -> "segs/" + seg.name()).toList());
+        cat.segs().stream().map(seg -> SegmentedLog.path("segs", LOG_ID, seg.name())).toList());
     named.add(segment(4));
     assertThat(store.names()).containsExactlyInAnyOrderElementsOf(named);
   }
@@ -253,11 +259,100 @@ class TestSegmentedLog {
   @Test
   void aSweepKeepsANamedSegmentAndABlobOfAnOrdinalStillToCome() {
     SegmentedLog log = created(4);
-    store.create("segs/seg-00000000000000000000-ffffffffffffffff"); // a creation's leftover
-    store.create("segs/seg-00000000000000000001-ffffffffffffffff"); // an Install in flight
+    String leftover =
+        SegmentedLog.path("segs", LOG_ID, "seg-00000000000000000000-ffffffffffffffff");
+    String inFlight =
+        SegmentedLog.path("segs", LOG_ID, "seg-00000000000000000001-ffffffffffffffff");
+    store.create(leftover); // an Install's that lost and failed to delete it
+    store.create(inFlight); // an Install in flight
     log.sweep();
-    assertThat(store.names()).containsExactlyInAnyOrder(segment(0),
-        "segs/seg-00000000000000000001-ffffffffffffffff");
+    assertThat(store.names()).containsExactlyInAnyOrder(segment(0), inFlight);
+  }
+
+  /**
+   * The sweep lists only its own log's segments: another log's unnamed blob of an ordinal at or
+   * below this log's newest (an orphan of that log, or its live segment) is that log's to judge,
+   * and so is anything at the prefix but this log's segments' names.
+   */
+  @Test
+  void aSweepListsOnlyItsOwnLogsSegments() {
+    SegmentedLog log = created(4);
+    UUID otherId = UuidV7.newUuidV7();
+    String others = SegmentedLog.path("segs", otherId, "seg-00000000000000000000-ffffffffffffffff");
+    String flat = "segs/seg-00000000000000000000-ffffffffffffffff"; // a name with no log's id
+    String odd = SegmentedLog.path("segs", LOG_ID, "seg-0-ff"); // not a segment's name
+    for (String blob : List.of(others, flat, odd)) {
+      store.create(blob);
+    }
+    log.sweep();
+    assertThat(store.names()).containsExactlyInAnyOrder(segment(0), others, flat, odd);
+    assertThat(SegmentedLog.ordinalAt("segs", LOG_ID, others)).isEqualTo(-1);
+    assertThat(SegmentedLog.ordinalAt("segs", otherId, others)).isEqualTo(0);
+    assertThat(SegmentedLog.ordinalAt("segs", LOG_ID, flat)).isEqualTo(-1);
+    assertThat(SegmentedLog.ordinalAt("segs", LOG_ID, odd)).isEqualTo(-1);
+  }
+
+  /**
+   * A creation that finds another writer's log deletes its segment 0: no Install can name it, and
+   * no sweep lists it, its log's id being in no catalog object.
+   */
+  @Test
+  void aCreationThatLostDeletesItsSegment() {
+    SegmentedLog first = log(2);
+    SegmentedLog second = log(2);
+    LogTail absent = first.probe();
+    AtomicLong creates = new AtomicLong();
+    store.intercept((op, name) -> {
+      if (op == InMemorySegmentStore.Op.CREATE && creates.getAndIncrement() == 0) {
+        // the second creation creates its segment 0; the first creates the log meanwhile
+        first.putCheckpoint(absent, checkpoint(0, absent));
+      }
+      return InMemorySegmentStore.Fault.NONE;
+    });
+    UUID otherId = UuidV7.newUuidV7();
+    assertThatThrownBy(() -> second.putCheckpoint(absent, checkpoint(otherId, 0, absent)))
+        .isInstanceOf(LogConflictException.class);
+    assertThat(creates.get()).isEqualTo(2);
+    assertThat(store.names()).containsExactly(segment(0));
+    assertThat(log(2).read().checkpoint().orElseThrow()).isEqualTo(checkpoint(0, absent));
+  }
+
+  /**
+   * Bug 100 (sweep deleted another log's segments): two catalogs configured with one segment
+   * location keep two logs whose segments share a prefix of one store. A compaction of one, and
+   * its sweep, must leave every segment of the other: its catalog object names them, and its
+   * records are in them.
+   */
+  @Test
+  void aSweepLeavesTheSegmentsOfAnotherLogAtItsPrefix() {
+    String otherLocation = "mem:///other-warehouse/catalog";
+    UUID otherId = UuidV7.newUuidV7();
+    SegmentedLog other = new SegmentedLog(AtomicFileLog.segmented(io, otherLocation, () -> 7L,
+        false), store, "segs", SegmentedLog.Options.defaults().withLimit(2).withRetireTtlMs(0)
+            .withClock(() -> 0L));
+    LogTail absent = other.probe();
+    other.putCheckpoint(absent, checkpoint(otherId, 0, absent));
+    byte[] b1 = record();
+    byte[] b2 = record();
+    other.readThrough(other.append(b1, null), Duration.ZERO);
+    other.readThrough(other.append(b2, null), Duration.ZERO); // ends its 0; installs its 1
+
+    SegmentedLog log = created(2);
+    byte[] a1 = record();
+    log.readThrough(log.append(a1, null), Duration.ZERO);
+    LogTail through = log.read().tail();
+    log.putCheckpoint(through, checkpoint(1, through));
+    log.trim(through); // the sweep
+
+    SegmentedLog reader = new SegmentedLog(AtomicFileLog.segmented(io, otherLocation, () -> 7L,
+        false), store, "segs", SegmentedLog.Options.defaults().withLimit(2));
+    assertThat(reader.read().records()).containsExactly(b1, b2);
+    byte[] b3 = record();
+    other.readThrough(other.append(b3, null), Duration.ZERO);
+    assertThat(log(2).read().records()).isEmpty();
+    assertThat(new SegmentedLog(AtomicFileLog.segmented(io, otherLocation, () -> 7L, false),
+        store, "segs", SegmentedLog.Options.defaults().withLimit(2)).read().records())
+        .containsExactly(b1, b2, b3);
   }
 
   /**
@@ -273,7 +368,8 @@ class TestSegmentedLog {
     stale.readThrough(stale.append(record(), null), Duration.ZERO); // void in 0; loses Install 1
     LogView view = log(1).read();
     SegmentedLog.Cat cat = SegmentedLog.parse(AtomicFileLog.decode(io.bytes(LOCATION)));
-    List<String> named = cat.segs().stream().map(seg -> "segs/" + seg.name()).toList();
+    List<String> named =
+        cat.segs().stream().map(seg -> SegmentedLog.path("segs", LOG_ID, seg.name())).toList();
     assertThat(store.names()).containsExactlyInAnyOrderElementsOf(named);
     assertThat(view.records()).hasSize(2);
   }
@@ -295,7 +391,7 @@ class TestSegmentedLog {
     for (byte[] r : List.of(a, b, c)) {
       old.readThrough(old.append(r, null), Duration.ZERO); // 0: a, b; 1: c; 2 installed
     }
-    relocate(seg -> store.location("old/" + seg.name())); // the move to prefix segs
+    relocate(seg -> store.location(SegmentedLog.path("old", seg.logId(), seg.name())));
 
     SegmentedLog moved = log("segs", 2, 2);
     assertThat(moved.read().records()).containsExactly(a, b, c);
@@ -309,8 +405,7 @@ class TestSegmentedLog {
     byte[] frame = SegmentFrames.record(f, 3);
     SegmentStore.Appended at = store.append(three, frame);
     Receipt later = new SegmentedLog.SegReceipt(LOG_ID, List.of(new SegmentedLog.Copy(3,
-        three.substring("segs/".length()), at.offset(), at.blocks(), frame.length,
-        SegmentFrames.crcOf(frame))), f);
+        nameOf(three), at.offset(), at.blocks(), frame.length, SegmentFrames.crcOf(frame))), f);
     assertThat(moved.readThrough(later, Duration.ZERO).records())
         .containsExactly(a, b, c, d, e, f); // seals 2, at old
     byte[] two = store.peek(segmentIn("old", 2));
@@ -345,8 +440,8 @@ class TestSegmentedLog {
     List<byte[]> records = new ArrayList<>();
     records.add(LogEnvelope.encodeCheckpointThrough(cat.ck().encode()));
     for (SegmentedLog.Seg seg : cat.segs()) {
-      records.add(new SegmentedLog.Seg(seg.ordinal(), seg.name(), where.apply(seg), seg.limit())
-          .install());
+      records.add(new SegmentedLog.Seg(seg.logId(), seg.ordinal(), seg.name(), where.apply(seg),
+          seg.limit()).install());
     }
     catalog.replace(v.tail(), cat.checkpoint(), records);
   }
@@ -359,8 +454,7 @@ class TestSegmentedLog {
 
   private String segmentIn(String prefix, long ordinal) {
     return store.names().stream()
-        .filter(n -> n.startsWith(prefix + "/"))
-        .filter(n -> SegmentedLog.ordinalOf(n.substring(prefix.length() + 1)) == ordinal)
+        .filter(n -> SegmentedLog.ordinalAt(prefix, LOG_ID, n) == ordinal)
         .findFirst().orElseThrow();
   }
 

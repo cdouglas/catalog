@@ -431,7 +431,7 @@ SG_BASE = {
     "Seal": "Seal",
 }
 SG_SAFETY = ["ReadsAreSlices", "AckedInLog", "NamedExist", "Readable", "CheckpointsStable",
-             "CanEnd", "CopiesKnown"]
+             "CanEnd", "CopiesKnown", "OthersKept"]
 SG_ACTIONS = ["AbstractGrows"]
 SG_FAULTS = '{"lostReply", "notSent", "inflight", "shortRead"}'
 # Segments of two records in blobs of three blocks: room for a race inside a segment.
@@ -466,6 +466,7 @@ SG_CONFIGS = {
                            {"AbstractGrows", "AckedInLog", "CheckpointsStable"}),
     "sg-sweepearly": ({"MaxSweep": "1", "Bugs": '{"sweepearly"}'}, {"NamedExist", "Readable"}),
     "sg-sweepinflight": ({"MaxSweep": "1", "Bugs": '{"sweepinflight"}'}, {"NamedExist"}),
+    "sg-sweepothers": ({"MaxSweep": "1", "Bugs": '{"sweepothers"}'}, {"OthersKept"}),
     "sg-sdkretry": ({**SG_WIDE, "MaxFaults": "1", "Bugs": '{"sdkretry"}'}, {"CopiesKnown"}),
     "sg-overlimit": ({"Limit": "3", "MaxBlocks": "2", "MaxReads": "0", "Bugs": '{"overlimit"}'},
                      {"CanEnd"}),

@@ -40,7 +40,7 @@ counts as a lost race (D4).
 | Object | Where | Format | Written by |
 |---|---|---|---|
 | Catalog object | `<warehouse>/catalog` | format 4: format 3's header, checkpoint frame and record frames, with segment records | atomicio: conditional append, or CAS replace |
-| Segment | `<prefix>/<name>`, or the location its Install names | segment frames (below) | blind appends through the segment store |
+| Segment | `<prefix>/<log id>/<name>`, or the location its Install names | segment frames (below) | blind appends through the segment store |
 | Page | `<warehouse>/catalog.committed/` | unchanged | unchanged |
 
 `<prefix>` is `fileio.catalog.log.location`. An entry that names a location (a URL in the
@@ -48,7 +48,10 @@ segment store, `SegmentStore.nameAt`) finds its segment there, not under the pre
 writes one, but a migration that moves the prefix writes them for the segments it leaves at the
 old one, so they are read, appended to, sealed and deleted where they are. A location the store
 can't reach (another container's) fails the read rather than read under the prefix. A
-segment's name is `seg-<ordinal>-<nonce>`, with a fresh nonce, as in v1 (AZ4). Only an installer creates a segment, and only before it sends the
+segment's name is `seg-<ordinal>-<nonce>`, with a fresh nonce, as in v1 (AZ4), and its object
+is under the log's id, `<prefix>/<log id>/<name>` (D12): every catalog object of the log holds
+the id in its checkpoint, so no entry carries it, and logs whose catalogs were given one prefix
+keep their segments apart. Only an installer creates a segment, and only before it sends the
 Install. A writer that finds a segment missing never creates it. A catalog object
 holds segment records only when the log keeps segments. A log without a segment store
 writes format 3, as today.
@@ -65,7 +68,7 @@ replay refuses one in a view.
 // after a checkpoint, the ordinal of the checkpoint's position.
 message InstallSegment {
   uint64 ordinal = 1;
-  string name = 2;      // under the log's prefix, with its nonce
+  string name = 2;      // seg-<ordinal>-<nonce>, under <prefix>/<log id>/ (D12)
   string location = 3;  // optional: a URL in place of prefix + name
   uint64 limit = 4;     // the segment ends at its limit-th record, or earlier at a seal (D2)
 }
@@ -88,9 +91,10 @@ segment at another location at all.
 `LogRecord.body` gains `InstallSegment install_segment = 5`,
 `RetiredSegment retired_segment = 6`, and `bytes checkpoint_through = 7`: the position
 the catalog object's checkpoint covers, the frame right after the checkpoint. None
-carries an id. A checkpoint is opaque to its log (the SharedLog contract writes them
-without a `through`), so the catalog object says where its checkpoint is, as v1's head
-did; the runtime checks the `through` it wrote against it. A catalog object is the
+carries an id, nor the log's id, which the checkpoint holds. A checkpoint is opaque to its
+log (the SharedLog contract writes them without a `through`), so the catalog object says
+where its checkpoint is, as v1's head did; the runtime checks the `through` it wrote
+against it. A catalog object is the
 header, the checkpoint frame, `checkpoint_through`, the Installs from the checkpoint's
 segment on, then Retired entries.
 
@@ -182,10 +186,11 @@ its index: the reply's block count (Azure's `x-ms-blob-committed-block-count`).
 **Installing.** To install segment `m+1` (with `m` the last installed), a writer
 creates it under a fresh name, then appends `InstallSegment(m+1, K)` to the catalog
 object with format 3's condition (its version and offset as read; on a store without
-appends, a CAS replace). A loser reads again. If an `m+1` landed, it uses that one and
-deletes its own blob, which no Install can name; one whose delete fails leaves it to the
-sweep's listing. Replay rejects any ordinal but the next, so each
-Install adds exactly one segment. A checkpoint or another Install landing in between
+appends, a CAS replace). A loser reads again. If an `m+1` landed, or the object it reads is
+another log's, it deletes its own blob, which no Install can name, and goes on with the
+object it read; one whose delete fails leaves it to its log's sweep (to none, if the object
+is another log's). Replay rejects any
+ordinal but the next, so each Install adds exactly one segment. A checkpoint or another Install landing in between
 also makes an Install retry; that costs one read. Installing several in one write is
 [Later](#later).
 
@@ -293,11 +298,13 @@ GC record, read through it, PageOuts, `putCheckpoint`, `trim`.
   carries records, so appends to segments never race a compaction.
 - **`trim(through)`** is the sweep. It deletes each retired segment whose TTL
   (`fileio.catalog.log.retire.ttl.ms`) has passed since `retired_at_ms`, where its
-  entry locates it. Then it lists the prefix and deletes unnamed blobs (those of
-  installers that lost and failed to delete them, creators' leftovers) whose ordinal is
-  at most the newest Install's. No Install of that ordinal can land any more, since
-  replay takes only the next ordinal, so no Install in flight names one. The rule needs
-  no clock, and so works with the catalog object and the segments on different stores.
+  entry locates it. Then it lists its own log's segments, `<prefix>/<log id>/`, and
+  deletes unnamed blobs (those of installers that lost and failed to delete them) whose
+  ordinal is at most the newest Install's. No Install of that ordinal can land any more,
+  since replay takes only the next ordinal, so no Install in flight names one. The rule
+  needs no clock, and so works with the catalog object and the segments on different
+  stores. It never lists another log's segments: another log at the prefix has segments
+  of the same ordinals that only its own catalog object names (D12).
   Only unnamed blobs need the listing, and they are empty (no writer appends to a
   segment no Install names): a credential that can't list (a SAS without container
   scope) leaks those alone. An unnamed blob at an overridden location is leaked; only a
@@ -307,9 +314,13 @@ GC record, read through it, PageOuts, `putCheckpoint`, `trim`.
   goes on from a fresh read. A clock ahead of the compactor's can only make a deletion
   early, which costs a reader a restart, never a record.
 
-**Creating the log** creates segment 0, then puts the catalog object if absent, with
-the first checkpoint (position `(0, 0, 0)`) and `InstallSegment(0, K)`. A creator that
-loses finds the log exists (`LogConflictException`); its segment is the sweep's.
+**Creating the log** creates segment 0, under the id of the log the first checkpoint
+begins, then puts the catalog object if absent, with that checkpoint (position
+`(0, 0, 0)`) and `InstallSegment(0, K)`. A creator that loses finds the log exists
+(`LogConflictException`) and deletes its segment 0: it is under a log id no catalog
+object holds, so no sweep lists it. One whose delete fails, or whose creation failed
+with the catalog object still absent (its put may land yet), leaves it
+([AZURE_LOG_FORMAT.md](AZURE_LOG_FORMAT.md) OI-10).
 
 **Finding the log.** A client finds the catalog at `<warehouse>/catalog`, as with
 format 3. A client opened without a segment store that finds a format 4 object refuses
@@ -330,6 +341,7 @@ it: "this catalog keeps segments". It never appends to it.
 | D9 | Records in the catalog object again (the review's "after the tail is sealed and no newer one is installed") are a segment too: an Install that names the catalog object. Built later. | It keeps ordinals contiguous and positions uniform, and the run ends in the object's own order (the next Install). Positions in it are the record count alone, since a compaction moves its frames. |
 | D10 | Format 4 is a catalog object with segment records. A log without segments writes format 3. | The review asked for a distinct number, so fixtures and tests name their layout. |
 | D11 | Several segments may be open at once. A writer may send a record to any open segment, or copies of it to several; the first copy in the log decides. | Installs can run ahead, so a rotation never waits for one. A copy in the next segment makes a commit at a segment's end one round trip. Copies are safe by the committed set and S2. |
+| D12 | A segment's object is `<prefix>/<log id>/<name>`, the log's id in its UUID text form. No entry carries the id: every catalog object of the log holds it in its checkpoint, so an entry's name stays `seg-<ordinal>-<nonce>` (41 bytes). The sweep lists only `<prefix>/<log id>/`, and a creator that loses deletes its own segment 0. | The prefix is client configuration, and nothing stops two catalogs from being given one. A sweep of the whole prefix took another log's live segments for its own unnamed blobs (any ordinal at or below its newest Install's), and that log lost every record after its checkpoint and could no longer be read: Bug 100 (sweep deleted another log's segments). The object's name is derived from what the catalog object already holds, as a page's is from its reference's node and digest, so it costs a record nothing. |
 
 ## Code
 
@@ -357,13 +369,13 @@ pages, and the catalog above the log.
 | SG3 | No write voids a record a read has returned. | A seal frame lands after it; a limit is fixed before the segment takes records (D1, D2). |
 | SG4 | Ordinals are contiguous from the checkpoint's. Each Install names a segment its installer created under a fresh name before sending it. | The catalog object's condition, replay's ordinal rule, nonce names (D8). |
 | SG5 | After the first Install, no record frame in the catalog object is in the log. | Replay of the catalog object. |
-| SG6 | A named segment is deleted (by a checkpoint or the sweep) only after a checkpoint covers it wholly and its TTL has passed since it was retired, and its Retired entry is dropped only once it is deleted. The sweep deletes an unnamed blob only once its ordinal is at most the newest Install's, so no Install in flight can name it. | Retirement happens only in `putCheckpoint`, for segments before the position's; replay takes an Install only of the next ordinal. |
+| SG6 | A named segment is deleted (by a checkpoint or the sweep) only after a checkpoint covers it wholly and its TTL has passed since it was retired, and its Retired entry is dropped only once it is deleted. The sweep deletes an unnamed blob only if it is its own log's and its ordinal is at most the newest Install's, so no Install in flight can name it, and no other log's catalog object does. | Retirement happens only in `putCheckpoint`, for segments before the position's; replay takes an Install only of the next ordinal; the sweep lists only its log's id (D12). |
 | SG7 | P1–P6 as the log meets them. P4 is not claimed: appends are blind. | As stated. |
 | SG8 | Every segment can end. Before its end it holds fewer than K frames, so a seal frame fits. | K is at most the store's block limit, and K − 1 of the largest frame and a seal frame fit its largest object, checked when the log opens. |
 | SG9 | A record applies at most once, at its first copy in the log. | The committed set skips a copy of a record that applied; S2 keeps a rejected one rejected. |
 
 The mistakes, each a switch that must break a property. The model (`SegmentedLog.tla`) has
-the first ten, and the Java has each as a mutant:
+the first eleven, and the Java has each as a mutant:
 
 | Switch | The mistake | Breaks |
 |---|---|---|
@@ -375,6 +387,7 @@ the first ten, and the Java has each as a mutant:
 | `createonmissing` | a writer that finds a segment missing creates it | SG3 |
 | `sweepearly` | the sweep deletes a segment the catalog object names | SG4, P5 |
 | `sweepinflight` | the sweep deletes an unnamed blob of the next ordinal | SG4: a delayed Install names a deleted segment, and the log stops |
+| `sweepothers` | the sweep lists every log's segments at the prefix: Bug 100 (sweep deleted another log's segments) | SG6, and P1 and P5 for the other log: its named segments are deleted |
 | `sdkretry` | a timed-out append is resent below the runtime | the shared-log model's `dup` |
 | `overlimit` | an Install sets a limit above the store's block limit | SG8: a segment fills before its end, takes no seal frame, and the log stops |
 | `nested` | replay of a segment takes an Install or a Retired entry in it | SG1, SG4 |
@@ -408,7 +421,9 @@ As LOG.md "Testing a provider", per stage:
   - small limits and block limits, Installs ahead, early seals, and copies;
   - appends delayed until after an end;
   - one to three instances with stale catalog objects;
-  - sweeps at TTL 0.
+  - sweeps at TTL 0;
+  - another log at the same prefix of the same store, which must read its records at the
+    drain.
 
   At the drain, every replica a read returned must read on to the end (as
   `staleReaders` did for the log v1). It draws the segments' store: in memory, or
@@ -416,8 +431,9 @@ As LOG.md "Testing a provider", per stage:
   don't.
 - **Mutants** (`fuzz/mutants/segments.sh`): each switch above, put in the code, fails
   the fuzzer; a checkpoint that drops an expired Retired entry without deleting its
-  segment (`dropretired`, a leak) and a log that ignores an entry's location
-  (`nolocation`) fail `TestSegmentedLog`.
+  segment (`dropretired`, a leak), a log that ignores an entry's location
+  (`nolocation`) and a creator that loses and keeps its segment 0 (`creationleak`, a leak)
+  fail `TestSegmentedLog`.
 - **Catalog suites**: `TestLocalCatalog*` in the `AZLOG*` modes. Also
   `TestCatalogFaultProperties` and `TestCatalogRaceProperties`, whose Append Blob draws
   open the new log.
@@ -441,7 +457,7 @@ Each stage is one or more commits on branch `log-segments`, each fix with its te
 | Property | Default | Meaning |
 |---|---|---|
 | `fileio.catalog.log` | `atomic-file` | `azure-append`: a segmented log on Azure Append Blobs |
-| `fileio.catalog.log.location` | none: required | the segments' prefix, a Blob URL |
+| `fileio.catalog.log.location` | none: required | the segments' prefix, a Blob URL; each log's are under `<prefix>/<log id>/` (D12) |
 | `fileio.catalog.log.segment.records` | the store's block limit (provisional) | K, the limit each Install sets. At most the store's block limit, and small enough that K − 1 of the largest frame fit an object (SG8) |
 | `fileio.catalog.log.copies` | false | whether an append near its segment's end also sends a copy to the next (D11) |
 | `fileio.catalog.log.checkpoint.share`, `.min.bytes`, `.records` | 1.0, 1 MiB, 10,000 | when to compact |
@@ -466,8 +482,8 @@ The conditional ablation on segments is [Later](#later).
 
 Built on branch `log-segments` (2026-11-15): stages 0 to 4, stage 3 within stage 2.
 catalog-bench's `sut-fileio` opens the segmented log too (its branch `log-segments`). Locally,
-the fuzzer passes 2,000 tries on four seeds; of `fuzz/mutants/segments.sh` ten mutants are
-caught and `fastvoid` is equivalent; the catalog's suites (the `AZLOG` modes among them) and the
+the fuzzer passes 2,000 tries on four seeds; of `fuzz/mutants/segments.sh` twelve mutants are
+caught and `fastvoid` is equivalent (2026-11-17, with D12's `sweepothers` and `creationleak`); the catalog's suites (the `AZLOG` modes among them) and the
 fault and race properties pass. `AzureLogCatalogIT` passed on the real account with a SAS that
 cannot list (450 tests). A havoc round is next.
 

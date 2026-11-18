@@ -1066,7 +1066,9 @@ configurations are `sg-*`, through `MCSegments.tla`.
   a send to a later segment.
 - **Compactors** put a checkpoint at a record boundary in the log and CAS-replace the catalog
   object with it, retiring the segments before its own. The sweep (at TTL 0) deletes a retired
-  segment, or an unnamed blob at or below the newest Install's ordinal.
+  segment, or an unnamed blob at or below the newest Install's ordinal, of this log's blobs
+  alone: a name is `<<log, ordinal, nonce>>`, and another log's segment 0 shares the prefix,
+  named by that log's catalog object (not modelled).
 - **Readers** read from the catalog object they hold, however stale: each segment to its end,
   then the next; an open segment ends the view, and an ended last one sends the reader to the
   catalog object again. A read may come back short, as a fault.
@@ -1085,6 +1087,7 @@ through the first that hasn't ended.
 | `CheckpointsStable` | a checkpoint keeps its place in the log |
 | `CanEnd` | SG8: a segment that hasn't ended has room for a seal frame |
 | `CopiesKnown` | no copy of a record is in the log that its writer doesn't know may have landed (the shared-log model's `dup`) |
+| `OthersKept` | another log's segment at the same prefix, which its catalog object names, exists: Bug 100 (sweep deleted another log's segments) |
 
 **Results** (2026-11-15). Every passing configuration holds:
 
@@ -1115,6 +1118,7 @@ Each bug switch (LOG_SEGMENTS.md "Invariants") breaks a property:
 | `createonmissing` (a writer creates a swept segment) | `AckedInLog` |
 | `sweepearly` (the sweep deletes a named segment) | `NamedExist` |
 | `sweepinflight` (the sweep deletes an unnamed blob of any ordinal) | `NamedExist` |
+| `sweepothers` (the sweep lists every log's blobs at the prefix; added 2026-11-17, not yet run) | `OthersKept` |
 | `sdkretry` (the SDK resends a timed-out append) | `CopiesKnown` |
 | `overlimit` (an Install sets a limit above the block limit) | `CanEnd` |
 

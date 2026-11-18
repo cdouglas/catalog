@@ -2,7 +2,7 @@
 
 The segmented log on Azure Append Blobs, specified from the code for review: what it stores, in
 what bytes, and the requests each operation makes. [LOG_SEGMENTS.md](LOG_SEGMENTS.md) is its
-design (the decisions D1–D11 and invariants SG1–SG9 cited here are its), and
+design (the decisions D1–D12 and invariants SG1–SG9 cited here are its), and
 [AZURE_LOG.md](AZURE_LOG.md) is why it is built on Azure this way.
 
 ## 1. Scope
@@ -20,15 +20,18 @@ design (the decisions D1–D11 and invariants SG1–SG9 cited here are its), and
 | Object | Where | Written by |
 |---|---|---|
 | Catalog object | the catalog's FileIO, `<warehouse>/catalog` | an Install: a conditional append; a checkpoint: a CAS replace |
-| Segment | `<prefix>/seg-<ordinal %020d>-<nonce %016x>`, an Append Blob, or the location (a blob URL in the container) its entry names | Append Block with no condition |
+| Segment | `<prefix>/<log id>/seg-<ordinal %020d>-<nonce %016x>`, an Append Blob, or the location (a blob URL in the container) its entry names | Append Block with no condition |
 | Page | the FileIO, `<warehouse>/catalog.committed/` | as the one-object log's (COMMITTED_PAGING.md) |
 
-`<prefix>` is the path of `fileio.catalog.log.location` in its container. A segment's name
-carries a fresh nonce, drawn until a create-if-absent takes it, so a stale writer never
-reaches a newer blob under an old name (D8). The log writes no location; a migration that moves
-the prefix writes one into each entry of a segment it leaves at the old one, and every request
-for that segment, its deletion among them, goes there (`AppendBlobStore.nameAt`, the URL's path
-in the container, decoded).
+`<prefix>` is the path of `fileio.catalog.log.location` in its container. `<log id>` is the
+log's id, the checkpoint's `log_id` (a UUIDv7) in its 36-character text form: every catalog
+object of the log holds it, so an entry names its segment by `seg-<ordinal>-<nonce>` alone, and
+logs given one prefix keep their segments apart, each sweep listing only its own (D12). A
+segment's name carries a fresh nonce, drawn until a create-if-absent takes it, so a stale writer
+never reaches a newer blob under an old name (D8). The log writes no location; a migration that
+moves the prefix writes one into each entry of a segment it leaves at the old one, and every
+request for that segment, its deletion among them, goes there (`AppendBlobStore.nameAt`, the
+URL's path in the container, decoded).
 
 ## 3. Wire formats
 
@@ -42,7 +45,8 @@ Format 3's object ([ATOMIC_FILE_LOG.md](ATOMIC_FILE_LOG.md)) under format number
    position below, which it checks against the next frame's);
 2. a `LogRecord` with `checkpoint_through`: the checkpoint's position (3.3);
 3. `LogRecord`s with `install_segment`: segments `c, c+1, …, t` from the checkpoint's segment
-   `c` on, each with its name, its location (if any) and its record limit K;
+   `c` on, each with its name (`seg-<ordinal>-<nonce>`, under the log's id), its location (if
+   any) and its record limit K;
 4. `LogRecord`s with `retired_segment`: segments a checkpoint covers wholly, each with its
    Install's name and location, its end position and when it was retired.
 
@@ -92,7 +96,7 @@ each starts; `start()` is the checkpoint's position or the tail the records foll
 | install | Put Blob (Append Blob) if absent; the catalog object's conditional append |
 | `readThrough` | none, if the reply put the copy at the kept view's end; else ranged GETs; a seal frame (Append Block) for each earlier segment that hasn't ended |
 | `putCheckpoint` | the catalog object (a GET); Delete Blob for each Retired entry past its TTL; its CAS replace |
-| `trim` (the sweep) | the catalog object (a GET); Delete Blob for each Retired entry past its TTL; List Blobs under the prefix; Delete Blob for each unnamed blob at or below the newest Install's ordinal |
+| `trim` (the sweep) | the catalog object (a GET); Delete Blob for each Retired entry past its TTL; List Blobs under `<prefix>/<log id>/seg-`; Delete Blob for each unnamed blob at or below the newest Install's ordinal |
 
 ## 5. Algorithms
 
@@ -115,10 +119,16 @@ sweep" are the algorithms; the code follows them, with these particulars:
   those past their TTL whose segments it deleted (where the entry locates them): an entry is
   dropped only once its segment is gone. A checkpoint at the object's own position with other
   bytes is refused (I11).
-- **A trim** first checks that the catalog object's checkpoint covers it (P5), then sweeps.
-- **Creation** creates segment 0, then the catalog object if absent: the checkpoint, position
-  `(0, 0, 0)`, Install 0. A catalog object with the same checkpoint is this creation, retried;
-  another is another writer's log (`LogConflictException`).
+- **An Install that lost** to another Install of its ordinal, or to a catalog object of
+  another log, deletes its blob.
+- **A trim** first checks that the catalog object's checkpoint covers it (P5), then sweeps. The
+  sweep lists its log's segments alone, and a listed name that is not one of them (another
+  log's, or no segment's) is ignored.
+- **Creation** creates segment 0 under the new log's id, then the catalog object if absent: the
+  checkpoint, position `(0, 0, 0)`, Install 0. A catalog object with the same checkpoint is this
+  creation, retried; another is another writer's log (`LogConflictException`), and the creation
+  deletes its segment 0. So does one whose put of the catalog object failed with unknown outcome
+  if the object it then reads is another log's.
 
 ## 6. Invariants
 
@@ -147,9 +157,9 @@ AZURE_LOG.md "Failures".
 | OI-2 | **A reader trusts that a ranged GET's body runs to the reported length.** The walk parses the bytes returned and takes the segment's length from the reply; nothing checks `from + bytes == length`. If the service returned fewer bytes with the full total, the reader would end its view early (a prefix, so P1 holds), not skip frames. AZURE_LOG.md's Q2 asks this of Azure. | `SegmentedLog.walk`, `AzureAppendBlobStore.read` |
 | OI-5 | **The sweep runs only inside a trim.** An idle log keeps unnamed and retired segments until its next compaction. | `SegmentedLog.trim` |
 | OI-7 | **`readThrough` retries without a pause** until `wait` has passed and `readAttempts` were made. | `SegmentedLog.readThrough` |
-| OI-10 | **A blob of a higher ordinal than the newest Install's is never swept**: a creation abandoned before its Install, until that ordinal is installed, or another log's at the same prefix. | `SegmentedLog.sweep` |
+| OI-10 | **Some unnamed blobs are never swept.** An installer's blob of a higher ordinal than the newest Install's waits until that ordinal is installed. A creator's segment 0 stays for good if its creation lost and its delete failed, or if its creation failed while the catalog object was still absent (its put might land yet): it is under a log id no catalog object holds, which no sweep lists. All are empty. | `SegmentedLog.sweep`, `SegmentedLog.create` |
 | OI-13 | **Only account-key credentials** reach the segments from a catalog. | `AzureLogs.open` |
 | OI-15 | **A catalog object that takes no more appends** (its store's append limit) takes no Install: once the newest segment has ended, appends fail unsent until a checkpoint replaces the object, which needs its GC record to land. Real stores' limits (ADLS: 50,000 appends) are far above an interval's Installs. | `SegmentedLog.install` |
 | OI-16 | **An instance's memory of segments grows**: the names it saw end, and their ends, are kept for the instance's life. | `SegmentedLog.skip`, `ends` |
-| OI-17 | **Unnamed blobs need a listing.** The sweep lists the prefix on every trim to find the blobs no catalog object names: an installer's that lost and failed to delete it, an abandoned creation's. They are empty. A SAS without container scope cannot list, and they stay; retired segments are deleted by name regardless. | `SegmentedLog.sweep` |
+| OI-17 | **Unnamed blobs need a listing.** The sweep lists its log's segments (`<prefix>/<log id>/`) on every trim to find the blobs no catalog object names: an installer's that lost and failed to delete it. They are empty. A SAS without container scope cannot list, and they stay; retired segments are deleted by name regardless. | `SegmentedLog.sweep` |
 | OI-18 | **A location must be in the log's container.** An `AppendBlobStore` is bound to one container, so a migration to another container or account would need a store per location; an entry locating a segment elsewhere fails the read. | `AzureAppendBlobStore.nameAt` |

@@ -482,7 +482,7 @@
       "InstallSegment": {
         "fields": [
           {"number": 1, "name": "ordinal", "type": "uint64", "repeated": false, "packed": false, "oneof": null, "comment": ""},
-          {"number": 2, "name": "name", "type": "string", "repeated": false, "packed": false, "oneof": null, "comment": "The segment's name in the log's segment store, with its nonce."},
+          {"number": 2, "name": "name", "type": "string", "repeated": false, "packed": false, "oneof": null, "comment": "The segment's name, seg-\u003cordinal>-\u003cnonce>. Its object is \u003cprefix>/\u003clog id>/\u003cname>: the log's id is its checkpoint's log_id, so no entry carries it (docs/LOG_SEGMENTS.md D12)."},
           {"number": 3, "name": "location", "type": "string", "repeated": false, "packed": false, "oneof": null, "comment": "Where the segment is, as a URL, in place of the store and name; empty for one in the log's store."},
           {"number": 4, "name": "limit", "type": "uint64", "repeated": false, "packed": false, "oneof": null, "comment": "The segment ends at its limit-th record, or earlier at a seal frame. Set by the segment's own Install, before it takes any record."}
         ]

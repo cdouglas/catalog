@@ -50,8 +50,8 @@ public final class SegmentedLogHistory {
 
   /**
    * The log whose catalog object had {@code versions} (oldest first, each the object's bytes) and
-   * whose segments, named under {@code prefix} in their store, took {@code appends} (in order);
-   * {@code pages} the committed set's pages stored.
+   * whose segments, named under {@code <prefix>/<log id>/} in their store, took {@code appends}
+   * (in order); {@code pages} the committed set's pages stored.
    */
   public SegmentedLogHistory(List<byte[]> versions, List<Append> appends, String prefix,
       Map<String, byte[]> pages) {
@@ -63,9 +63,9 @@ public final class SegmentedLogHistory {
       if (was != null && !Arrays.equals(was, c.checkpoint())) {
         violations.add("two checkpoints at " + c.ck() + " differ (I11)");
       }
-      c.retired().forEach(r -> names.add(r.name()));
+      c.retired().forEach(r -> names.add(c.logId() + "/" + r.name()));
       for (SegmentedLog.Seg s : c.segs()) {
-        names.add(s.name());
+        names.add(s.logId() + "/" + s.name());
         SegmentedLog.Seg other = installed.putIfAbsent(s.ordinal(), s);
         if (other != null && !other.name().equals(s.name())) {
           violations.add("two Installs of segment " + s.ordinal() + " (SG4)");
@@ -80,7 +80,8 @@ public final class SegmentedLogHistory {
       SegmentedLog.Seg seg = installed.get(o);
       long count = 0;
       boolean ended = false;
-      for (Append a : bySegment.getOrDefault(prefix + "/" + seg.name(), List.of())) {
+      String name = SegmentedLog.path(prefix, seg.logId(), seg.name());
+      for (Append a : bySegment.getOrDefault(name, List.of())) {
         if (count >= seg.limit()) {
           ended = true;
           break;
@@ -125,7 +126,10 @@ public final class SegmentedLogHistory {
     return pages;
   }
 
-  /** The names (under the prefix) of every segment a version installed or retired. */
+  /**
+   * Where every segment a version installed or retired is, under the prefix: {@code <log
+   * id>/<name>}.
+   */
   public java.util.Set<String> names() {
     return names;
   }

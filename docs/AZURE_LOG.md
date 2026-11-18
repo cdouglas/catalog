@@ -116,16 +116,18 @@ a writer whose record landed past the limit knows it with no read.
   ([ATOMIC_FILE_LOG.md](ATOMIC_FILE_LOG.md)): the checkpoint, the position it covers, the
   Installs of the segments from its own on (each setting its segment's record limit K), and
   the retired segments. An Install is a conditional append; a checkpoint, a CAS replace.
-- **The segments** are Append Blobs under `fileio.catalog.log.location`, named
-  `seg-<ordinal>-<nonce>`. A segment ends at its Kth record or its first seal frame. Its records
-  count only once every earlier segment has ended.
+- **The segments** are Append Blobs under `fileio.catalog.log.location`, each log's under its
+  id: `<location>/<log id>/seg-<ordinal>-<nonce>` (LOG_SEGMENTS.md D12), so catalogs given one
+  location keep their logs apart. A segment ends at its Kth record or its first seal frame. Its
+  records count only once every earlier segment has ended.
 - **Appends** go to the first segment a writer knows open; near its end a writer installs the
   next ahead. A read through an append seals any earlier segment that hasn't ended, and an
   append past its segment's end is void, a lost race (D4).
 - **Compaction** writes the checkpoint by replacing the catalog object, retiring the segments
   before its own. A retired segment is deleted by name once its TTL has passed, and its entry
-  dropped only then; the sweep also lists the prefix for unnamed blobs no Install can name any
-  more (empty ones: a credential that can't list leaks only those).
+  dropped only then; the sweep also lists its log's segments for unnamed blobs no Install can
+  name any more (empty ones: a credential that can't list leaks only those), and never another
+  log's.
 
 A read is two requests (the catalog object, then the segment), a refresh one.
 
@@ -139,7 +141,7 @@ A read is two requests (the catalog object, then the segment), a refresh one.
 | append a frame | Append Block with no condition; the reply's `x-ms-blob-append-offset` and `x-ms-blob-committed-block-count` |
 | read from an offset | Get Blob with `Range: bytes=<from−1>-`, the first byte dropped (a read from the end is then a `206`, not a `416` and a Get Blob Properties; Azurite answers `206` either way) |
 | delete | Delete Blob |
-| list (the sweep, for unnamed blobs) | List Blobs under the prefix |
+| list (the sweep, for unnamed blobs) | List Blobs under `<prefix>/<log id>/seg-` |
 | limits | 50,000 blocks a blob; blocks of 4 MiB before service version 2022-11-02, 100 MiB since; a blob of 50,000 × 4 MiB |
 
 The catalog object's requests are its FileIO's (on Azure, the fork's ADLS FileIO: conditional
@@ -170,7 +172,7 @@ which is the bug `SegmentedLog.tla`'s `sdkretry` switch puts back.
 | Property | Default | Meaning |
 |---|---|---|
 | `fileio.catalog.log` | `atomic-file` | `azure-append`: the segmented log on Azure Append Blobs |
-| `fileio.catalog.log.location` | none: required | the segments' prefix, `https://<account>.blob.core.windows.net/<container>/<path>` |
+| `fileio.catalog.log.location` | none: required | the segments' prefix, `https://<account>.blob.core.windows.net/<container>/<path>`; each log's segments are under `<path>/<log id>/`, so catalogs may share one |
 | `adls.auth.shared-key.account.name`, `.key` | none: required | the account key the segments' requests are signed with |
 | `fileio.catalog.log.segment.records` | the store's block limit (provisional) | K, the record limit each Install sets |
 | `fileio.catalog.log.copies` | false | whether an append near its segment's end also sends a copy to the next (D11) |

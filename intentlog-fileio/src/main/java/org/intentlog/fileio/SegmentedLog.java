@@ -32,6 +32,8 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.LongSupplier;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import org.apache.iceberg.exceptions.NotFoundException;
 import org.intentlog.Capabilities;
 import org.intentlog.LogConflictException;
@@ -77,10 +79,13 @@ import org.intentlog.wire.RetiredSegment;
  *   <li>A read through an append takes its copies in order: each needs the segments before its own
  *       ended, and seals one that hasn't; the first copy the log holds is the record, and if none
  *       does, the append is void, a {@link LogConflictException} (D4).
+ *   <li>A segment's blob is {@code <prefix>/<log id>/<name>}: the log's id is its checkpoint's, so
+ *       no entry carries it, and the logs that share a prefix keep their segments apart.
  *   <li>A retired segment is deleted by the name its Retired entry holds once its TTL has passed,
  *       by a checkpoint, which drops the entry only once the segment is gone, and by the sweep
- *       ({@link #trim}). The sweep also lists the prefix for unnamed blobs, and deletes those whose
- *       ordinal is at most the newest Install's: no Install of it can land any more.
+ *       ({@link #trim}). The sweep also lists this log's segments for unnamed blobs, and deletes
+ *       those whose ordinal is at most the newest Install's: no Install of it can land any more.
+ *       It never lists another log's.
  * </ul>
  *
  * <p>To the runtime this is a log of blind appends and separate checkpoints. The store sends each
@@ -157,7 +162,7 @@ public final class SegmentedLog implements SharedLog {
 
   /**
    * A segmented log whose catalog object is {@code catalog} (format 4) and whose segments are
-   * {@code store}'s, named under {@code prefix}.
+   * {@code store}'s, named under {@code <prefix>/<log id>/}.
    */
   public SegmentedLog(AtomicFileLog catalog, SegmentStore store, String prefix, Options options) {
     this.catalog = catalog;
@@ -214,22 +219,34 @@ public final class SegmentedLog implements SharedLog {
   // Names
   // ============================================================
 
-  private String path(String name) {
-    return prefix + "/" + name;
+  /**
+   * Where the segment {@code name} of the log {@code logId} is in its store under {@code prefix}:
+   * {@code <prefix>/<log id>/<name>}. The id is the log's checkpoint's ({@code
+   * LogCheckpoint.log_id}), which every catalog object of the log holds, so an entry names its
+   * segment without it; and the logs whose segments share a prefix keep them apart, each sweep
+   * listing only its own.
+   */
+  static String path(String prefix, UUID logId, String name) {
+    return prefix + "/" + logId + "/" + name;
   }
 
-  /** Where an Install's segment is: at the location it names, else under the prefix. */
+  private String path(UUID logId, String name) {
+    return path(prefix, logId, name);
+  }
+
+  /** Where an Install's segment is: at the location it names, else under the log's prefix. */
   private String path(Seg seg) {
-    return path(seg.name(), seg.location());
+    return path(seg.logId(), seg.name(), seg.location());
   }
 
   /**
-   * Where segment {@code name} is: at {@code location}, a URL in the store, if one is given (a
-   * segment a migration left at another prefix keeps its place), else under the log's prefix.
+   * Where segment {@code name} of the log {@code logId} is: at {@code location}, a URL in the
+   * store, if one is given (a segment a migration left at another prefix keeps its place), else
+   * under the log's prefix.
    */
-  private String path(String name, String location) {
+  private String path(UUID logId, String name, String location) {
     if (location.isEmpty()) {
-      return path(name);
+      return path(logId, name);
     }
     try {
       return store.nameAt(location);
@@ -239,29 +256,44 @@ public final class SegmentedLog implements SharedLog {
     }
   }
 
+  /** A segment's name: {@code seg-<ordinal %020d>-<nonce %016x>}. */
+  private static final Pattern NAME = Pattern.compile("seg-([0-9]{20})-[0-9a-f]{16}");
+
   private static String segmentName(long ordinal) {
     return String.format("seg-%020d-%016x", ordinal, ThreadLocalRandom.current().nextLong());
   }
 
   /** The ordinal a segment's name holds; -1 if it is no segment's name. */
   static long ordinalOf(String name) {
-    if (!name.startsWith("seg-")) {
+    Matcher m = NAME.matcher(name);
+    if (!m.matches()) {
       return -1;
     }
-    int dash = name.indexOf('-', 4);
     try {
-      return dash < 0 ? -1 : Long.parseLong(name.substring(4, dash));
+      return Long.parseLong(m.group(1));
     } catch (NumberFormatException e) {
       return -1;
     }
+  }
+
+  /**
+   * The ordinal of the segment at {@code path}, a name in the store, if it is one of the log
+   * {@code logId}'s under {@code prefix}; -1 if it is not: another log's, or no segment's.
+   */
+  static long ordinalAt(String prefix, UUID logId, String path) {
+    String own = path(prefix, logId, "");
+    return path.startsWith(own) ? ordinalOf(path.substring(own.length())) : -1;
   }
 
   // ============================================================
   // The catalog object
   // ============================================================
 
-  /** A segment an Install names. */
-  record Seg(long ordinal, String name, String location, long limit) {
+  /**
+   * A segment an Install of the log {@code logId} names. The Install holds all but the log's id,
+   * which its catalog object's checkpoint holds.
+   */
+  record Seg(UUID logId, long ordinal, String name, String location, long limit) {
     byte[] install() {
       return LogEnvelope.encodeInstallSegment(new InstallSegment(ordinal, name, location, limit));
     }
@@ -317,7 +349,7 @@ public final class SegmentedLog implements SharedLog {
         InstallSegment i = r.installSegment();
         long next = segs.isEmpty() ? ck.ordinal() : segs.get(segs.size() - 1).ordinal() + 1;
         if (i.ordinal() == next) {
-          segs.add(new Seg(i.ordinal(), i.name(), i.location(), i.limit()));
+          segs.add(new Seg(decoded.logId(), i.ordinal(), i.name(), i.location(), i.limit()));
         }
       } else if (r.retiredSegment() != null) {
         retired.add(r.retiredSegment());
@@ -705,9 +737,10 @@ public final class SegmentedLog implements SharedLog {
       }
       c = fresh;
     }
+    UUID logId = c.logId();
     String name = segmentName(o);
     try {
-      while (!store.create(path(name))) {
+      while (!store.create(path(logId, name))) {
         name = segmentName(o);
       }
     } catch (SegmentStore.Throttled e) {
@@ -715,7 +748,7 @@ public final class SegmentedLog implements SharedLog {
     } catch (RuntimeException e) {
       throw new LogNotSentException("A segment of " + this + " could not be created", e);
     }
-    byte[] install = new Seg(o, name, "", limit).install();
+    byte[] install = new Seg(logId, o, name, "", limit).install();
     for (int attempt = 0; attempt < options.sendAttempts(); attempt++) {
       try {
         Receipt r = catalog.append(install, c.view().tail());
@@ -728,16 +761,18 @@ public final class SegmentedLog implements SharedLog {
         // lost (a conflict), or of unknown outcome: the catalog object says
         Cat fresh = existing();
         Seg won = fresh.seg(o);
-        if (won != null && !won.name().equals(name)) {
-          // another's Install of o landed, so no Install can name this blob: delete it, rather
-          // than leave it to a sweep (one that cannot list leaves it for good)
+        boolean another = !fresh.logId().equals(logId);
+        if (another || (won != null && !won.name().equals(name))) {
+          // another's Install of o landed, or the object is another log's (whose segments are
+          // under its own id), so no Install can name this blob: delete it, rather than leave it
+          // to a sweep (one that cannot list leaves it for good)
           try {
-            store.delete(path(name));
+            store.delete(path(logId, name));
           } catch (RuntimeException deleteFailed) {
-            // the sweep deletes it, once it can
+            // the log's sweep deletes it, once it can (if the object is another log's, none does)
           }
         }
-        if (won != null || fresh.last().ordinal() + 1 != o) {
+        if (another || won != null || fresh.last().ordinal() + 1 != o) {
           return fresh;
         }
         c = fresh; // a checkpoint changed the object: append again from it
@@ -931,7 +966,7 @@ public final class SegmentedLog implements SharedLog {
       }
       for (RetiredSegment old : c.retired()) {
         // an entry is the only reference to its segment: drop it only once the segment is gone
-        if (!expired(old, now) || !deleteRetired(old, deleted)) {
+        if (!expired(old, now) || !deleteRetired(c.logId(), old, deleted)) {
           records.add(LogEnvelope.encodeRetiredSegment(old));
         }
       }
@@ -969,9 +1004,10 @@ public final class SegmentedLog implements SharedLog {
   }
 
   /**
-   * Creates the log (docs/LOG_SEGMENTS.md "Creating the log"): segment 0, then the catalog object
-   * if absent, with the first checkpoint and segment 0's Install. One of the same checkpoint is
-   * this creation, retried; another is another writer's log.
+   * Creates the log (docs/LOG_SEGMENTS.md "Creating the log"): segment 0, under the id of the log
+   * its checkpoint begins, then the catalog object if absent, with the first checkpoint and
+   * segment 0's Install. One of the same checkpoint is this creation, retried; another is another
+   * writer's log, and this creation deletes its segment 0, which no sweep lists.
    */
   private void create(byte[] checkpoint) {
     LogTail absent = catalog.probe();
@@ -979,9 +1015,10 @@ public final class SegmentedLog implements SharedLog {
       created(checkpoint, null);
       return;
     }
+    UUID logId = LogEnvelope.decodeCheckpoint(checkpoint).logId();
     String name = segmentName(0);
     try {
-      while (!store.create(path(name))) {
+      while (!store.create(path(logId, name))) {
         name = segmentName(0);
       }
     } catch (SegmentStore.Throttled e) {
@@ -992,10 +1029,32 @@ public final class SegmentedLog implements SharedLog {
     try {
       Receipt r = catalog.replace(absent, checkpoint, List.of(
           LogEnvelope.encodeCheckpointThrough(SegmentPosition.START.encode()),
-          new Seg(0, name, "", limit).install()));
+          new Seg(logId, 0, name, "", limit).install()));
       adopt(parse(catalog.readThrough(r, Duration.ZERO)));
     } catch (LogConflictException e) {
+      abandon(logId, name);
       created(checkpoint, e);
+    } catch (RuntimeException e) {
+      abandon(logId, name); // of unknown outcome: the runtime reads the log to settle it
+      throw e;
+    }
+  }
+
+  /**
+   * Deletes segment {@code name} of a creation of the log {@code logId} if the catalog object is
+   * another log's: then no Install can name it (the creation's replace was conditioned on the
+   * object's absence), and no sweep lists it (each lists its own log's). Best effort: one whose
+   * delete or read fails stays, as does one whose catalog object is absent (the replace may land
+   * yet).
+   */
+  private void abandon(UUID logId, String name) {
+    try {
+      Cat c = readCat();
+      if (c != null && !c.logId().equals(logId)) {
+        store.delete(path(logId, name));
+      }
+    } catch (RuntimeException e) {
+      // it stays (docs/AZURE_LOG_FORMAT.md OI-10)
     }
   }
 
@@ -1014,15 +1073,16 @@ public final class SegmentedLog implements SharedLog {
   }
 
   /**
-   * Deletes the segment of {@code r}, unless {@code deleted} holds it already; whether it is gone.
-   * A delete that fails leaves it for the sweep or the next checkpoint.
+   * Deletes the segment of {@code r}, a Retired entry of the log {@code logId}, unless {@code
+   * deleted} holds it already; whether it is gone. A delete that fails leaves it for the sweep or
+   * the next checkpoint.
    */
-  private boolean deleteRetired(RetiredSegment r, Set<String> deleted) {
+  private boolean deleteRetired(UUID logId, RetiredSegment r, Set<String> deleted) {
     if (deleted.contains(r.name())) {
       return true;
     }
     try {
-      store.delete(path(r.name(), r.location()));
+      store.delete(path(logId, r.name(), r.location()));
     } catch (RuntimeException e) {
       return false;
     }
@@ -1032,9 +1092,10 @@ public final class SegmentedLog implements SharedLog {
 
   /**
    * The sweep (docs/LOG_SEGMENTS.md "Compaction, retirement and the sweep"): deletes each retired
-   * segment whose TTL has passed by its entry's name, then lists the prefix and deletes each
-   * unnamed blob whose ordinal is at most the newest Install's. {@code through}'s checkpoint is
-   * the catalog object's or older.
+   * segment whose TTL has passed by its entry's name, then lists this log's segments ({@code
+   * <prefix>/<log id>/}) and deletes each unnamed blob whose ordinal is at most the newest
+   * Install's. Another log's segments at the prefix are its own sweep's. {@code through}'s
+   * checkpoint is the catalog object's or older.
    */
   @Override
   public void trim(LogTail through) {
@@ -1059,13 +1120,13 @@ public final class SegmentedLog implements SharedLog {
     for (RetiredSegment r : c.retired()) {
       named.add(r.name());
       if (expired(r, now)) {
-        deleteRetired(r, deleted); // by name: no listing needed
+        deleteRetired(c.logId(), r, deleted); // by name: no listing needed
       }
     }
     long newest = c.last().ordinal();
-    for (String full : store.list(prefix + "/seg-")) {
-      String name = full.substring(prefix.length() + 1);
-      long ordinal = ordinalOf(name);
+    for (String full : store.list(path(c.logId(), "seg-"))) {
+      long ordinal = ordinalAt(prefix, c.logId(), full); // -1: none of this log's segments
+      String name = full.substring(full.lastIndexOf('/') + 1);
       if (ordinal >= 0 && ordinal <= newest && !named.contains(name)) {
         try {
           store.delete(full);

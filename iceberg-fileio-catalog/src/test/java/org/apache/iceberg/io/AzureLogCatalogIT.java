@@ -57,10 +57,11 @@ import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
  * endpoint) and {@code AZURE_STORAGE_KEY} (its account key) or {@code AZURE_STORAGE_SAS} (a
  * signature for its objects) set: {@code mvn -o -pl iceberg-fileio-catalog test
  * -Dtest='AzureLogCatalogIT*'}. Each run writes under {@code catalog-it/<UTC>-<random>}, a log per
- * catalog of each test, and deletes it afterwards: by listing the prefix, or, with a signature
- * that cannot list, by the names every catalog object installed or retired (retired segments are
- * deleted by name, so only an unnamed blob, an installer's that lost its Install and failed to
- * delete it, could be left).
+ * catalog of each test (its segments under {@code <location>/<log id>/}), and deletes it
+ * afterwards: by listing the prefix, or, with a signature that cannot list, by the names every
+ * catalog object installed or retired (retired segments are deleted by name, so only an unnamed
+ * blob could be left: an installer's that lost its Install, or a creator's that lost the log's
+ * creation, and failed to delete it).
  */
 @EnabledIfEnvironmentVariable(named = "AZURE_LOG_IT_CONTAINER_URL", matches = ".+")
 class AzureLogCatalogIT {
@@ -160,7 +161,9 @@ class AzureLogCatalogIT {
       listed = false; // a signature that cannot list the container
       files.addAll(NAMED);
     }
-    // A log's newest segment outlives the sweeps: its ordinal is how often the log moved on
+    // A log's newest segment outlives the sweeps: its ordinal is how often the log moved on. A
+    // segment is <location>/<log id>/seg-<ordinal>-<nonce>, so the directories above it are the
+    // log's and the location's
     Map<String, Long> last = new HashMap<>();
     for (String f : files) {
       int seg = f.indexOf("/seg-");

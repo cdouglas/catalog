@@ -49,6 +49,7 @@ import org.intentlog.segments.SegmentFrames;
 import org.intentlog.segments.SegmentPosition;
 import org.intentlog.testkit.LogHarness;
 import org.intentlog.wire.LogEnvelope;
+import org.intentlog.wire.UuidV7;
 
 /**
  * A {@link SegmentedLog} over an {@link InMemoryAtomicFileIO} (its catalog object and pages) and
@@ -65,6 +66,11 @@ import org.intentlog.wire.LogEnvelope;
  * object held must be the replay of that log through its position (I11); every view a read
  * returned a state it held; and at the drain every read must read on from its tail to the log's
  * end.
+ *
+ * <p>Another log, of another catalog object, keeps its segments at the same prefix of the same
+ * store, as two catalogs configured with one segment location do: it takes two records before the
+ * run, and at the drain it must read them still. No request of the log under test may touch its
+ * segments: Bug 100 (sweep deleted another log's segments).
  */
 final class SegmentedLogHarness implements LogHarness {
 
@@ -225,6 +231,11 @@ final class SegmentedLogHarness implements LogHarness {
   private final List<String> readViolations = new ArrayList<>();
   private Hooks hooks = null;
 
+  /** The other log at the prefix: its catalog object's location, options and records. */
+  private final String neighbour;
+  private final SegmentedLog.Options neighbourOptions;
+  private final List<byte[]> neighbourRecords = new ArrayList<>();
+
   SegmentedLogHarness(InMemoryAtomicFileIO io, Segments store, String location,
       String prefix, List<SegmentedLog> logs, StateMachine<?, ?, ?> machine) {
     this.io = io;
@@ -263,6 +274,44 @@ final class SegmentedLogHarness implements LogHarness {
       }
     });
     store.intercept(this::segmentFault);
+    this.neighbour = location + "-neighbour";
+    // K the store's block limit: none of the log under test's options, which a mutant may break
+    this.neighbourOptions = SegmentedLog.Options.defaults().withLimit(0).withRetireTtlMs(0)
+        .withClock(() -> 0L);
+    SegmentedLog other = neighbour();
+    LogTail absent = other.probe();
+    other.putCheckpoint(absent, LogEnvelope.encodeCheckpoint(UuidV7.newUuidV7(), new byte[0],
+        new byte[0], absent.position()));
+    for (int i = 0; i < 2; i++) {
+      byte[] record = LogEnvelope.encodeRecord(UuidV7.newUuidV7(), new byte[] {(byte) i});
+      other.readThrough(other.append(record, null), Duration.ZERO);
+      neighbourRecords.add(record);
+    }
+  }
+
+  /** The other log at the prefix, as a fresh process opens it. */
+  private SegmentedLog neighbour() {
+    return new SegmentedLog(AtomicFileLog.segmented(io, neighbour, () -> 7L, false),
+        store.store(), prefix, neighbourOptions);
+  }
+
+  /** The other log at the prefix must hold its records still, whatever this log swept. */
+  private List<String> neighbourViolations() {
+    Hooks was = hooks;
+    hooks = null;
+    try {
+      List<byte[]> read = neighbour().read().records();
+      boolean same = read.size() == neighbourRecords.size();
+      for (int i = 0; same && i < read.size(); i++) {
+        same = Arrays.equals(read.get(i), neighbourRecords.get(i));
+      }
+      return same ? List.of() : List.of("another log at the prefix reads " + read.size()
+          + " records, not its " + neighbourRecords.size());
+    } catch (RuntimeException e) {
+      return List.of("another log at the prefix cannot be read (its segments were swept?): " + e);
+    } finally {
+      hooks = was;
+    }
   }
 
   private static InMemoryAtomicFileIO.Fault ioFault(WriteFault fault) {
@@ -460,7 +509,7 @@ final class SegmentedLogHarness implements LogHarness {
     List<Segments.Landed> appends = store.appends();
     for (long o = 0; installed.containsKey(o); o++) {
       SegmentedLog.Seg seg = installed.get(o);
-      String name = prefix + "/" + seg.name();
+      String name = SegmentedLog.path(prefix, seg.logId(), seg.name());
       long count = 0;
       boolean ended = false;
       for (Segments.Landed a : appends) {
@@ -581,6 +630,7 @@ final class SegmentedLogHarness implements LogHarness {
     List<String> violations = new ArrayList<>(readViolations);
     violations.addAll(violations(machine));
     violations.addAll(staleReaders());
+    violations.addAll(neighbourViolations());
     return violations;
   }
 
