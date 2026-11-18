@@ -69,7 +69,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
- * Canaries for the Iceberg core bugs this project's fuzzers and reviews found, C1 to C29 in
+ * Canaries for the Iceberg core bugs this project's fuzzers and reviews found, C1 to C31 in
  * docs/ICEBERG_ISSUES.md: one test each, on Iceberg's own InMemoryCatalog, that asserts the bug is
  * absent. Upstream fixed C1, and the fork's core-fixes branch fixes the others, so every test
  * passes against the fork. A test that fails means its bug is back: a rebase dropped the fork's
@@ -1011,6 +1011,130 @@ class TestIcebergCoreIssues {
     Table reloaded = catalog.loadTable(ID);
     assertThat(reloaded.snapshots()).hasSize(1);
     assertThat(reloaded.currentSnapshot().snapshotId()).isEqualTo(head);
+  }
+
+  /**
+   * C31. An expiry must clean up only the files of the snapshots it removed: another writer's
+   * removal landing between the expiry's commit and its cleanup's refresh (on any catalog; on a
+   * REST catalog also before the server applies the expiry) left those snapshots in the base the
+   * cleanup compared with the table, so it deleted what that writer kept (its manifest list) and,
+   * cleaning up incrementally after that writer rolled main back, a data file live again.
+   */
+  @Test
+  void anExpiryCleansUpOnlyTheSnapshotsItRemoved() {
+    // X expires S2, keeping its files, just after Y's expiry of S1 (by id) commits
+    InMemoryCatalog kept = catalog();
+    long[] s = history(kept);
+    String s2List = kept.loadTable(ID).snapshot(s[1]).manifestListLocation();
+    afterItsCommit(kept, () -> kept.loadTable(ID).expireSnapshots().expireSnapshotId(s[1])
+            .cleanExpiredFiles(false).commit())
+        .expireSnapshots().expireSnapshotId(s[0]).commit();
+    assertThat(exists(kept, s2List)).as(BACK, "C31").isTrue();
+
+    // X rolls main back to S2, which reads b, and expires S3, keeping its files, just after Y's
+    // expiry of what is older than S2 (S1, by age: incremental cleanup) commits
+    InMemoryCatalog live = catalog();
+    long[] t = history(live);
+    Table y = afterItsCommit(live, () -> {
+      Table x = live.loadTable(ID);
+      x.manageSnapshots().rollbackTo(t[1]).commit();
+      x.expireSnapshots().expireSnapshotId(t[2]).cleanExpiredFiles(false).commit();
+    });
+    y.expireSnapshots().expireOlderThan(y.snapshot(t[1]).timestampMillis()).commit();
+    assertThat(exists(live, path("b"))).as(BACK, "C31").isTrue();
+  }
+
+  /**
+   * A table with S1 appending a, S2 appending b (which exists in storage), S3 deleting b, each a
+   * millisecond after the last; their ids.
+   */
+  private static long[] history(InMemoryCatalog catalog) {
+    Table table = catalog.createTable(ID, SCHEMA);
+    try (java.io.OutputStream out = table.io().newOutputFile(path("b")).createOrOverwrite()) {
+      out.write(1);
+    } catch (java.io.IOException e) {
+      throw new java.io.UncheckedIOException(e);
+    }
+    table.newFastAppend().appendFile(file("a")).commit();
+    long s1 = table.currentSnapshot().snapshotId();
+    laterThan(table.currentSnapshot().timestampMillis());
+    table.newFastAppend().appendFile(file("b")).commit();
+    long s2 = table.currentSnapshot().snapshotId();
+    laterThan(table.currentSnapshot().timestampMillis());
+    table.newDelete().deleteFile(path("b")).commit();
+    return new long[] {s1, s2, table.currentSnapshot().snapshotId()};
+  }
+
+  /** Whether {@code location} exists in {@code catalog}'s storage (InMemoryFileIO throws if not). */
+  private static boolean exists(InMemoryCatalog catalog, String location) {
+    try {
+      return catalog.loadTable(ID).io().newInputFile(location).exists();
+    } catch (org.apache.iceberg.exceptions.NotFoundException e) {
+      return false;
+    }
+  }
+
+  /** Waits until the clock passes {@code millis}. */
+  private static void laterThan(long millis) {
+    while (System.currentTimeMillis() <= millis) {
+      Thread.onSpinWait();
+    }
+  }
+
+  /**
+   * The table {@code ID} of {@code catalog}, through operations that run {@code other} once, just
+   * after their first commit lands.
+   */
+  private static Table afterItsCommit(InMemoryCatalog catalog, Runnable other) {
+    TableOperations ops = ((HasTableOperations) catalog.loadTable(ID)).operations();
+    boolean[] ran = {false};
+    TableOperations wrapped =
+        new TableOperations() {
+          @Override
+          public TableMetadata current() {
+            return ops.current();
+          }
+
+          @Override
+          public TableMetadata refresh() {
+            return ops.refresh();
+          }
+
+          @Override
+          public void commit(TableMetadata base, TableMetadata metadata) {
+            ops.commit(base, metadata);
+            if (!ran[0]) {
+              ran[0] = true;
+              other.run();
+            }
+          }
+
+          @Override
+          public org.apache.iceberg.io.FileIO io() {
+            return ops.io();
+          }
+
+          @Override
+          public org.apache.iceberg.encryption.EncryptionManager encryption() {
+            return ops.encryption();
+          }
+
+          @Override
+          public String metadataFileLocation(String fileName) {
+            return ops.metadataFileLocation(fileName);
+          }
+
+          @Override
+          public org.apache.iceberg.io.LocationProvider locationProvider() {
+            return ops.locationProvider();
+          }
+
+          @Override
+          public long newSnapshotId() {
+            return ops.newSnapshotId();
+          }
+        };
+    return new org.apache.iceberg.BaseTable(wrapped, "c.ns.t");
   }
 
   /**

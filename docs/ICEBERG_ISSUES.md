@@ -13,12 +13,11 @@ reports or pull requests upstream. It covers the reproduction, the cause
 with links to the 1.12.0 source, the fix, its tests, and what to settle
 before a PR.
 
-Upstream fixed C1. The fork fixes C2 to C30 on branch `core-fixes`, each
+Upstream fixed C1. The fork fixes C2 to C31 on branch `core-fixes`, each
 in an upstream-style commit with its tests, so the project's tests no
-longer work around any of them. C31 is recorded, with a fix proposed and
-not yet written.
+longer work around any of them.
 
-`TestIcebergCoreIssues` has a canary for each issue up to C30: a test on
+`TestIcebergCoreIssues` has a canary for each issue up to C31: a test on
 `InMemoryCatalog` that asserts the bug is absent, with the message
 "Iceberg issue C*n* is back". Every canary passes against the fork. A
 canary that fails means a rebase dropped the fork's fix, or a release
@@ -74,7 +73,7 @@ reproduces on main at `a6bc1f95e3`, and upstream has no report of it.
 C31, which a check of Iceberg's catalogs for fileio-catalog's Bug 117
 (merged expiry cleans stale base) found on 2026-11-18, reproduces on
 1.12.0 and on main at `a6bc1f95e3`; upstream has no report of it, and the
-fork does not fix it yet. The Fork column is `atomicio`, which sits on
+fork fixed it the same day. The Fork column is `atomicio`, which sits on
 `core-perf`, on `core-fixes`.
 
 | Issue | Fork | 1.12.0 | main | Upstream |
@@ -109,7 +108,7 @@ fork does not fix it yet. The Fork column is `atomicio`, which sits on
 | C28. A JDBC commit whose UPDATE committed but whose reply was lost is reported as failed | fixed, `core-fixes` d69176a | yes (since 1.6.0) | yes | [#18743](https://github.com/apache/iceberg/issues/18743), open; PR [#18745](https://github.com/apache/iceberg/pull/18745), open, fixes the zero-row UPDATE as the fork does |
 | C29. A load racing a drop with purge reports a missing metadata file | fixed, `core-fixes` 207fce3 | yes | yes | not reported (2026-11-12); upstream reports a file the catalog still names as missing on purpose (`CatalogTests.testLoadTableWithMissingMetadataFile`), which the fix keeps |
 | C30. A removal of more snapshots than a table has fails with IllegalArgumentException | fixed, `core-fixes` e1853ce | yes | yes | not reported (2026-11-17); Java's client sends one update per snapshot since 1.9.1 (#13100, #13647), which meets it only on a table with no snapshots |
-| C31. An expiry cleans up the files of snapshots another writer removed | not fixed (fix proposed) | yes | yes | not reported (2026-11-18); [#13568](https://github.com/apache/iceberg/issues/13568), fixed by [#13614](https://github.com/apache/iceberg/pull/13614), the nearest: incremental cleanup's choice, not its base |
+| C31. An expiry cleans up the files of snapshots another writer removed | fixed, `core-fixes` 67a523a | yes | yes | not reported (2026-11-18); [#13568](https://github.com/apache/iceberg/issues/13568), fixed by [#13614](https://github.com/apache/iceberg/pull/13614), the nearest: incremental cleanup's choice, not its base |
 
 "Not reported" means a search of apache/iceberg's issues, pull requests
 and PR branches, and of the issues@ and dev@ lists, found nothing for the
@@ -970,14 +969,14 @@ the snapshot it rolled back from, data files live in the table.
   base), 2026-11-17, in its own merged expiries; a check of Iceberg's
   catalogs the next day reproduced it through `RESTCatalogAdapter` and on
   `InMemoryCatalog`, on 1.12.0 and main at `a6bc1f95e3`.
-- **Fork:** not fixed. The fix proposed: clean up the snapshots the
-  committed attempt removed, against what the refreshed table reaches,
-  and incrementally only when nothing else removed a snapshot and main is
-  where `base` had it, or after.
+- **Fork:** fixed, `core-fixes` 67a523a: the cleanup runs on the base
+  less the snapshots other writers removed, and incrementally only when
+  there are none.
 - **In fileio-catalog:** an expiry conflicts with another removal since
   its read (Bug 117), which closes the window before the commit for
   FileIOCatalog. The window after it is Iceberg's.
-- **Canary:** none yet.
+- **Canary:** `anExpiryCleansUpOnlyTheSnapshotsItRemoved`: a swapping
+  catalog's two cases raced after the commit.
 
 ## Accepted Iceberg Behavior
 
