@@ -608,7 +608,8 @@ public final class CheckpointRoundTrip {
       CatalogState.NsEntry ns = e.getValue();
       items.put(
           "namespace " + e.getKey(),
-          String.format("parent=%d name=%s version=%d", ns.parentId, ns.name, ns.version));
+          String.format("parent=%d name=%s version=%d removals=%d",
+              ns.parentId, ns.name, ns.version, ns.removals));
     }
     for (Map.Entry<Integer, Map<String, String>> e : file.allNamespaceProperties().entrySet()) {
       e.getValue().forEach((k, v) -> items.put("namespace " + e.getKey() + " property " + k, v));

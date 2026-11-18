@@ -44,12 +44,54 @@ import org.intentlog.Replica;
  * A transaction on the catalog, staged on a read of its log ({@link #base}): namespaces and
  * tables created, dropped, updated or renamed, namespace properties set, and the tables it read.
  * Each change is checked against the base as it is staged. Its {@link #intention} names the
- * version of each namespace and table it depends on, and a commit ({@link CatalogLog#commit})
- * takes effect only where those versions still hold.
+ * version of each namespace and table it depends on, and what each name it binds (a create, a
+ * rename's new name) requires of its namespace ({@link CreateCondition}); a commit ({@link
+ * CatalogLog#commit}) takes effect only where those still hold.
  */
 public class CatalogMutation {
 
+  /**
+   * What an action that binds a name (a table or namespace created, a table's new name) requires
+   * of the namespace it binds it in, where its record lands ({@code
+   * fileio.catalog.create.condition}).
+   */
+  public enum CreateCondition {
+    /**
+     * The namespace exists, has freed no name since the read (its removals), and the name is
+     * free: creates of different names in one namespace do not conflict.
+     */
+    NAME("name"),
+    /**
+     * The namespace is at the version read: any change there since (a sibling created, dropped
+     * or renamed, a property set) fails the record, so creates in one namespace land one at a
+     * time.
+     */
+    NAMESPACE("namespace");
+
+    private final String value;
+
+    CreateCondition(String value) {
+      this.value = value;
+    }
+
+    /** The condition's name as the catalog property gives it. */
+    public String value() {
+      return value;
+    }
+
+    /** The condition named {@code value}. */
+    public static CreateCondition of(String value) {
+      for (CreateCondition condition : values()) {
+        if (condition.value.equals(value)) {
+          return condition;
+        }
+      }
+      throw new IllegalArgumentException("Unknown create condition: " + value);
+    }
+  }
+
   private final Replica<CatalogState> base;
+  private final CreateCondition createCondition;
   private final CatalogState original;
   // Tables a serializable transaction read: the refs it read (a read witness), or none, a read of
   // the whole version (a read pin)
@@ -93,9 +135,18 @@ public class CatalogMutation {
   // The version a delta was built on, where not this mutation's read's (a catalog transaction's)
   private final Map<TableIdentifier, Integer> deltaBases;
 
-  /** A transaction staged on {@code base}, a read of the catalog's log. */
+  /**
+   * A transaction staged on {@code base}, a read of the catalog's log, whose names bind by {@link
+   * CreateCondition#NAME}, the catalog's default.
+   */
   public CatalogMutation(Replica<CatalogState> base) {
+    this(base, CreateCondition.NAME);
+  }
+
+  /** A transaction staged on {@code base}, whose names bind by {@code createCondition}. */
+  public CatalogMutation(Replica<CatalogState> base, CreateCondition createCondition) {
     this.base = base;
+    this.createCondition = createCondition;
     this.original = base.state();
     this.tables = Maps.newHashMap();
     this.readTables = Maps.newHashMap();
@@ -120,6 +171,18 @@ public class CatalogMutation {
   /** The read of the log this transaction is staged on, and commits on top of. */
   public Replica<CatalogState> base() {
     return base;
+  }
+
+  /** What the names this transaction binds require of their namespaces. */
+  public CreateCondition createCondition() {
+    return createCondition;
+  }
+
+  // What a name bound in existing namespace nsId requires of it, as this transaction read it
+  private int bindingRead(int nsId) {
+    return createCondition == CreateCondition.NAME
+        ? original.namespaceRemovals(nsId)
+        : original.namespaceVersion(nsId);
   }
 
   public CatalogMutation createNamespace(Namespace namespace) {
@@ -535,7 +598,9 @@ public class CatalogMutation {
 
   /**
    * The intention of this transaction: its actions, each naming the version of what it depends
-   * on in {@link #base}, which replay checks where the record lands.
+   * on in {@link #base}, which replay checks where the record lands; a create, and a rename's new
+   * name, by its {@link #createCondition}: its namespace's removals, or its version, as the base
+   * holds them (-1 for a namespace this transaction creates).
    */
   public ProtoCodec.CatalogIntention intention() {
     List<ProtoCodec.Action> actions = new ArrayList<>();
@@ -563,12 +628,12 @@ public class CatalogMutation {
       String name = nameOf(ns);
 
       int parentId = 0;
-      int parentVersion = original.namespaceVersion(0);
+      int parentVersion = bindingRead(0);
       if (!parent.isEmpty()) {
         Integer existingParentId = original.namespaceId(parent);
         if (existingParentId != null) {
           parentId = existingParentId;
-          parentVersion = original.namespaceVersion(existingParentId);
+          parentVersion = bindingRead(existingParentId);
         } else {
           // Parent created in same transaction
           Integer lateBoundParentId = nsIdMap.get(parent);
@@ -581,7 +646,8 @@ public class CatalogMutation {
 
       int nsId = nextLateNsid--;
       nsIdMap.put(ns, nsId);
-      actions.add(new ProtoCodec.CreateNamespaceAction(nsId, 1, parentId, parentVersion, name));
+      actions.add(new ProtoCodec.CreateNamespaceAction(
+          nsId, 1, parentId, byName(), parentVersion, name));
 
       // Add properties for this namespace. Null values are remove markers
       // from a subsequent updateProperties call; skip them since there is
@@ -656,12 +722,12 @@ public class CatalogMutation {
         // Namespace created in same transaction
         nsId = nsIdMap.get(ns);
       } else {
-        nsVersion = original.namespaceVersion(nsId);
+        nsVersion = bindingRead(nsId);
       }
 
       int tblId = nextLateTblid--;
       actions.add(new ProtoCodec.CreateTableAction(
-          tblId, 1, nsId, nsVersion, ident.name(), metadataLocation));
+          tblId, 1, nsId, byName(), nsVersion, ident.name(), metadataLocation));
     }
 
     // Process table updates
@@ -697,13 +763,13 @@ public class CatalogMutation {
       if (nsId == null) {
         nsId = nsIdMap.get(ns);
       } else {
-        nsVersion = original.namespaceVersion(nsId);
+        nsVersion = bindingRead(nsId);
       }
 
       int tblId = nextLateTblid--;
       byte[] createDelta = inlineTableCreateDeltas.get(ident);
       actions.add(new ProtoCodec.CreateTableInlineAction(
-          tblId, 1, nsId, nsVersion, ident.name(), metadata, codec, createDelta));
+          tblId, 1, nsId, byName(), nsVersion, ident.name(), metadata, codec, createDelta));
     }
 
     // Process inline table updates (full mode, optionally with bundled ML delta)
@@ -760,12 +826,16 @@ public class CatalogMutation {
         newNsId = nsIdMap.get(newNs);
         newNsVersion = -1;
       } else {
-        newNsVersion = original.namespaceVersion(newNsId);
+        newNsVersion = bindingRead(newNsId);
       }
       actions.add(new ProtoCodec.RenameTableAction(
-          tblId, version, newNsId, newNsVersion, to.name()));
+          tblId, version, newNsId, byName(), newNsVersion, to.name()));
     }
     return new ProtoCodec.CatalogIntention(actions);
+  }
+
+  private boolean byName() {
+    return createCondition == CreateCondition.NAME;
   }
 
   /**

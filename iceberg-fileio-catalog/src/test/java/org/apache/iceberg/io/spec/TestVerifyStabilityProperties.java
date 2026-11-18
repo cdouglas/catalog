@@ -27,6 +27,7 @@ import net.jqwik.api.constraints.IntRange;
 import net.jqwik.api.statistics.Statistics;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.io.CatalogMutation;
 import org.apache.iceberg.io.CatalogState;
 import org.apache.iceberg.io.CatalogTestSupport;
 import org.apache.iceberg.io.ProtoCodec;
@@ -39,9 +40,10 @@ import org.apache.iceberg.io.ProtoCodec;
  * intention that does not hold on a state holds on no state after it.
  *
  * <p>A run grows a history from a small catalog: at each step a writer stages a transaction on
- * a read of the history, the current state or one a few steps back, as {@link
- * org.apache.iceberg.io.CatalogMutation} stages it ({@link
- * CatalogStateGenerators#writerTransaction}), and its record lands on the current state, where
+ * a read of the history, the current state or one a few steps back, as {@link CatalogMutation}
+ * stages it ({@link CatalogStateGenerators#writerTransaction}), its names binding by the writer's
+ * create condition (by name two times in three, by namespace version otherwise, so that writers
+ * of both kinds meet), and its record lands on the current state, where
  * replay applies it if its intention verifies. Names come from a small universe, so creates,
  * drops and renames of one name meet often, and a record's versions are those of a read near the
  * current state. Every action that fails its verify where its record lands, and every rejected
@@ -90,6 +92,9 @@ class TestVerifyStabilityProperties {
     private final List<Rejected> rejected = new ArrayList<>();
     private final StringBuilder trace = new StringBuilder();
     private int rechecks = 0;
+    // Rejected records that bind a name, and how often one found it free again later: the case a
+    // check of the name alone would let a late copy apply
+    private int freedAgain = 0;
 
     Run(long seed) {
       this.seed = seed;
@@ -126,7 +131,11 @@ class TestVerifyStabilityProperties {
       for (int step = 1; step <= steps; step++) {
         int back = Math.min(BACK[rng.nextInt(BACK.length)], history.size() - 1);
         CatalogState read = history.get(history.size() - 1 - back);
-        CatalogStateGenerators.Staged staged = CatalogStateGenerators.writerTransaction(read, rng);
+        // Each writer binds names by its own condition, as writers may differ
+        CatalogMutation.CreateCondition condition = rng.nextInt(3) == 0
+            ? CatalogMutation.CreateCondition.NAMESPACE : CatalogMutation.CreateCondition.NAME;
+        CatalogStateGenerators.Staged staged =
+            CatalogStateGenerators.writerTransaction(read, rng, condition);
         if (staged == null) {
           continue;
         }
@@ -136,6 +145,8 @@ class TestVerifyStabilityProperties {
       }
       Statistics.label("records applied").collect(Math.min(applied / 10 * 10, 50));
       Statistics.label("rejections rechecked").collect(Math.min(rechecks / 100 * 100, 1000));
+      Statistics.label("rejected name bindings rechecked with the name free")
+          .collect(freedAgain == 0 ? "0" : freedAgain < 10 ? "1-9" : "10+");
     }
 
     /** Lands {@code staged}'s record on the current state; whether replay applied it. */
@@ -161,6 +172,9 @@ class TestVerifyStabilityProperties {
         for (Rejected r : rejected) {
           rechecks += 1;
           check(!r.verifies(builder), "%s verifies at step %d", r, step);
+          if (r.action == null && r.staged.aNameIsFree(state)) {
+            freedAgain += 1;
+          }
         }
       } else {
         rejected.add(new Rejected(step, null, staged));

@@ -133,6 +133,7 @@ public class FormatExplorerFixtures {
             pointerMultiTableConflictRetry(),
             inlineMultiTableConflictRetry(),
             concurrentCreatesBoundAtReplay(),
+            createByNameAfterADrop(),
             renameTableAcrossNamespaces(),
             inlineManifestList(),
             compactionWithCommittedSetGc(),
@@ -192,11 +193,13 @@ public class FormatExplorerFixtures {
         "Record 0: the empty transaction FileIOCatalog.initialize commits to create the file. "
             + "Its id joins the committed set, like any other.");
     log.append(txn(2), mut -> mut.createNamespace(Namespace.of("analytics")),
-        "Record 1: CreateNamespace(id = -1, version = 1, parent_id = 0, parent_version = 0). "
+        "Record 1: CreateNamespace(id = -1, version = 1, parent_id = 0, parent_removals = 0). "
             + "The id is late-bound: replay binds -1 to the checkpoint's next_namespace_id, 1. "
-            + "parent_version is the root's version when the writer read it; replay bumps the "
-            + "root to 1, so a concurrent top-level create or drop that read version 0 is "
-            + "rejected.");
+            + "parent_removals, the oneof's member a writer sends by default "
+            + "(fileio.catalog.create.condition name), is the root's removals when the writer "
+            + "read it, the names freed under it: the create applies if none was freed since "
+            + "and no top-level namespace is named analytics. Replay bumps the root's version "
+            + "to 1, so a concurrent top-level drop that read version 0 is rejected.");
     return log.scenario(
         "empty-bootstrap",
         "The smallest catalog: an 8-byte header, a checkpoint with only the catalog UUID, the "
@@ -222,9 +225,9 @@ public class FormatExplorerFixtures {
         mut -> mut.createNamespace(Namespace.of("staging"))
             .createTable(rawEvents, "s3://lake/staging/raw_events/v1.metadata.json"),
         "Record 1: CreateNamespace(id = -1) and CreateTable(id = -1, namespace_id = -1, "
-            + "namespace_version = -1). The table names the namespace by its late-bound id; "
-            + "replay binds the namespace first, then the table to it. A version of -1 means "
-            + "the namespace is created in this transaction, so there is no version to check.");
+            + "namespace_removals = -1). The table names the namespace by its late-bound id; "
+            + "replay binds the namespace first, then the table to it. A -1 means the namespace "
+            + "is created in this transaction, so there is nothing of it to check.");
     return log.scenario(
         "txn-multi-action-with-late-bind",
         "Two actions in one transaction, a CreateNamespace and a CreateTable in it. Look for "
@@ -500,9 +503,10 @@ public class FormatExplorerFixtures {
   }
 
   /**
-   * Three writers read one snapshot and each create a table. Replay binds their late-bound ids
-   * in log order, so the two that commit get different ids; the third, in the namespace the
-   * first changed, is rejected.
+   * Four writers read one snapshot and each create a table. Replay binds their late-bound ids
+   * in log order, so those that commit get different ids. Those that bind their names by name
+   * commit beside each other; the one that binds it by the namespace's version, in the namespace
+   * the first changed, is rejected.
    */
   private static Scenario concurrentCreatesBoundAtReplay() {
     Namespace sales = Namespace.of("sales");
@@ -515,8 +519,9 @@ public class FormatExplorerFixtures {
     log.append(base, txn(71),
         mut -> mut.createTable(TableIdentifier.of(sales, "orders"),
             "s3://lake/sales/orders/v1.metadata.json"),
-        "W1: CreateTable(sales.orders, id = -1, namespace_version = 1). Applies: replay binds "
-            + "-1 to next_table_id, 1, and bumps sales to version 2.");
+        "W1: CreateTable(sales.orders, id = -1, namespace_removals = 0). Applies: sales has "
+            + "freed no name and has no table named orders. Replay binds -1 to next_table_id, 1, "
+            + "and bumps sales to version 2.");
     log.append(base, txn(72),
         mut -> mut.createTable(TableIdentifier.of(ops, "alerts"),
             "s3://lake/ops/alerts/v1.metadata.json"),
@@ -526,21 +531,76 @@ public class FormatExplorerFixtures {
     log.append(base, txn(73),
         mut -> mut.createTable(TableIdentifier.of(sales, "refunds"),
             "s3://lake/sales/refunds/v1.metadata.json"),
-        "W3, from the same snapshot: CreateTable(sales.refunds, namespace_version = 1). "
-            + "Rejected: W1 moved sales to version 2. Creates in one namespace serialize on "
-            + "its version; creates in different namespaces do not conflict.");
+        "W3, from the same snapshot: CreateTable(sales.refunds, namespace_removals = 0). "
+            + "Applies, beside W1: no name in sales was freed since W3 read it, and refunds is "
+            + "free. It gets id 3.");
+    log.append(base, txn(74), CatalogMutation.CreateCondition.NAMESPACE,
+        mut -> mut.createTable(TableIdentifier.of(sales, "archive"),
+            "s3://lake/sales/archive/v1.metadata.json"),
+        "W4, from the same snapshot, binding its name by the namespace's version "
+            + "(fileio.catalog.create.condition namespace): CreateTable(sales.archive, "
+            + "namespace_version = 1), the oneof's other member. Rejected: W1 moved sales to "
+            + "version 2. Creates by namespace serialize on its version, and a create by name "
+            + "bumps it too, so writers of both kinds can share a catalog.");
     return log.scenario(
         "concurrent-creates-bound-at-replay",
-        "Three writers read the same snapshot and each append a create. The records carry the "
-            + "same late-bound id; replay binds them to different ids in log order. The parent "
-            + "namespace's version orders creates under it.",
+        "Four writers read the same snapshot and each append a create. The records carry the "
+            + "same late-bound id; replay binds them to different ids in log order. A create by "
+            + "name (CreateTable.namespace_removals) needs its name free and no name in its "
+            + "namespace freed since its read; one by namespace (namespace_version) needs the "
+            + "namespace unchanged.",
         List.of(),
         read -> {
           CatalogState state = read.state();
           expect(state.tableId(TableIdentifier.of(sales, "orders")), 1, "sales.orders id");
           expect(state.tableId(TableIdentifier.of(ops, "alerts")), 2, "ops.alerts id");
-          expect(state.containsTable(TableIdentifier.of(sales, "refunds")), false,
-              "sales.refunds exists");
+          expect(state.tableId(TableIdentifier.of(sales, "refunds")), 3, "sales.refunds id");
+          expect(state.containsTable(TableIdentifier.of(sales, "archive")), false,
+              "sales.archive exists");
+        });
+  }
+
+  /**
+   * A create by name whose record lands after its name was taken and freed again: the
+   * namespace's removals moved, so it is rejected, though the name is free where it lands.
+   */
+  private static Scenario createByNameAfterADrop() {
+    Namespace sales = Namespace.of("sales");
+    TableIdentifier tmp = TableIdentifier.of(sales, "tmp");
+    TableIdentifier orders = TableIdentifier.of(sales, "orders");
+    Replica<CatalogState> base =
+        Log.of(emptyCatalog())
+            .append(txn(75), mut -> mut.createNamespace(sales)
+                .createTable(tmp, "s3://lake/sales/tmp/v1.metadata.json"), null)
+            .append(txn(76), mut -> mut.dropTable(tmp), null)
+            .state();
+    Log log = Log.checkpoint(base);
+    log.append(base, txn(77),
+        mut -> mut.createTable(orders, "s3://lake/sales/orders/v1.metadata.json"),
+        "W2: CreateTable(sales.orders, namespace_removals = 1). Applies: one name freed in "
+            + "sales (tmp's drop, in the checkpoint), as W2 read it, and orders free.");
+    log.append(txn(78), mut -> mut.dropTable(orders),
+        "W3: DropTable(sales.orders). Applies, and bumps sales' version and its removals to "
+            + "2.");
+    log.append(base, txn(79),
+        mut -> mut.createTable(orders, "s3://lake/sales/orders/v1-w1.metadata.json"),
+        "W1's create of sales.orders, staged on the checkpoint before W2's (namespace_removals "
+            + "= 1), lands last: a copy of a record whose writer was told it failed, delayed in "
+            + "flight on a log of blind appends. Rejected: sales' removals moved to 2, though "
+            + "orders is free again. Had replay checked the name alone, W1's table would appear "
+            + "after W1 was told the create failed; removals only grow, so a create by name "
+            + "that failed fails on every later state (S2).");
+    return log.scenario(
+        "create-by-name-aba",
+        "A namespace's removals (Namespace.removals, field 5 of the checkpoint's row: 1 here, "
+            + "for the table dropped before it; absent while 0): each drop of a table or a child "
+            + "namespace, and each rename out of a name, adds one. A create by name holds while "
+            + "they are as its writer read them and its name is free.",
+        List.of(),
+        read -> {
+          CatalogState state = read.state();
+          expect(state.containsTable(orders), false, "sales.orders exists");
+          expect(state.namespaceRemovals(state.namespaceId(sales)), 2, "sales removals");
         });
   }
 
@@ -557,10 +617,11 @@ public class FormatExplorerFixtures {
             .state();
     Log log = Log.checkpoint(base);
     log.append(base, txn(81), mut -> mut.renameTable(from, to),
-        "RenameTable(id = 1, version = 1, new_namespace_id = 2, new_namespace_version = 1, "
-            + "new_name = \"daily_v2\"). Applies: the table keeps its id and metadata, moves to "
-            + "version 2, and both namespaces' versions are bumped, as a drop and a create "
-            + "would bump them.");
+        "RenameTable(id = 1, version = 1, new_namespace_id = 2, new_namespace_removals = 0, "
+            + "new_name = \"daily_v2\"). Applies: the new name binds as a create's (prod has "
+            + "freed no name, and daily_v2 is free); the table keeps its id and metadata, moves "
+            + "to version 2, both namespaces' versions are bumped, as a drop and a create would "
+            + "bump them, and staging's removals, for the name it freed.");
     log.append(base, txn(82),
         mut -> mut.updateTable(from, "s3://lake/staging/daily/v2.metadata.json"),
         "An update from the snapshot before the rename: UpdateTableLocation(id = 1, version = "
@@ -1328,7 +1389,13 @@ public class FormatExplorerFixtures {
     /** Appends the record of a writer that read {@code snapshot}. */
     Log append(Replica<CatalogState> snapshot, UUID id, Consumer<CatalogMutation> change,
         String note) {
-      CatalogMutation mut = new CatalogMutation(snapshot);
+      return append(snapshot, id, CatalogMutation.CreateCondition.NAME, change, note);
+    }
+
+    /** Appends the record of a writer that read {@code snapshot}, binding names by {@code by}. */
+    Log append(Replica<CatalogState> snapshot, UUID id, CatalogMutation.CreateCondition by,
+        Consumer<CatalogMutation> change, String note) {
+      CatalogMutation mut = new CatalogMutation(snapshot, by);
       change.accept(mut);
       return appendRecord(
           ProtoCodec.encodeTransaction(new ProtoCodec.Transaction(id, mut.intention())), note);

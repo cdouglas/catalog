@@ -81,7 +81,9 @@ import org.intentlog.wire.LogEnvelope;
  * drops and property changes; table creates, drops, renames and property changes; and appends and
  * deletes of every row, which Iceberg retries on a conflict as it does a property change (unlike
  * a schema change). They run on a small universe of names, from a generated catalog state; each
- * writer has its own catalog mode. A result is a return value or an exception's class; the
+ * writer has its own catalog mode, and binds the names it creates by name or by the namespace's
+ * version, as drawn ({@code fileio.catalog.create.condition}). A result is a return value or an
+ * exception's class; the
  * catalog's state is its namespaces with their properties and its tables with theirs (a table
  * created carries its creator's name) and their live data files.
  *
@@ -133,7 +135,8 @@ class TestCatalogRaceProperties {
       @ForAll boolean compactAfter,
       @ForAll("modes") LocalCatalogMode fileModeD,
       @ForAll("afterOps") Op after,
-      @ForAll boolean again) {
+      @ForAll boolean again,
+      @ForAll @IntRange(min = 0, max = 15) int namespaceWriters) {
     // The writers' modes on one catalog object, or on a shared log or Append Blobs with the same
     // table metadata storage.
     LocalCatalogMode modeA = fileModeA.on(catalogLog);
@@ -199,11 +202,18 @@ class TestCatalogRaceProperties {
         Map.of(LogCatalogProperties.CONFLICT_ENCODING, encoding), () -> past[0] += 5));
     Statistics.label("encoding").collect(encoding);
     // In the race, each writer's clock is off as drawn: its commits may be retried, but end alike
-    LogCatalog writerA = modeA.catalog(io, WAREHOUSE, "c", propsA, clock(clockOffsets.get(0)));
+    // Writers A, B, C and D bind the names they create by the namespace's version where their bit
+    // of namespaceWriters is set, else by name
+    LogCatalog writerA = modeA.catalog(io, WAREHOUSE, "c", creating(propsA, namespaceWriters, 0),
+        clock(clockOffsets.get(0)));
     List<LogCatalog> writers = List.of(
-        modeB.catalog(io, WAREHOUSE, "c", props, clock(clockOffsets.get(1))),
-        modeC.catalog(io, WAREHOUSE, "c", props, clock(clockOffsets.get(2))));
-    LogCatalog writerD = modeD.catalog(io, WAREHOUSE, "c", props, clock(clockOffsets.get(3)));
+        modeB.catalog(io, WAREHOUSE, "c", creating(props, namespaceWriters, 1),
+            clock(clockOffsets.get(1))),
+        modeC.catalog(io, WAREHOUSE, "c", creating(props, namespaceWriters, 2),
+            clock(clockOffsets.get(2))));
+    LogCatalog writerD = modeD.catalog(io, WAREHOUSE, "c", creating(props, namespaceWriters, 3),
+        clock(clockOffsets.get(3)));
+    Statistics.label("writers creating by namespace").collect(Integer.bitCount(namespaceWriters));
     String[] results = new String[racers.size()];
     int[] writes = {0};
     boolean[] nested = {false};
@@ -556,6 +566,20 @@ class TestCatalogRaceProperties {
     return new String[] {resultA, state(serialIo), resultD, resultAgain};
   }
 
+  /**
+   * {@code props}, with creates binding names by the namespace's version if bit {@code writer} of
+   * {@code namespaceWriters} is set ({@code fileio.catalog.create.condition} namespace).
+   */
+  private static Map<String, String> creating(
+      Map<String, String> props, int namespaceWriters, int writer) {
+    if ((namespaceWriters >> writer & 1) == 0) {
+      return props;
+    }
+    Map<String, String> byNamespace = new java.util.HashMap<>(props);
+    byNamespace.put(LogCatalogProperties.CREATE_CONDITION, "namespace");
+    return byNamespace;
+  }
+
   /** What a run reported: A's result, the racers', D's if it ran and A's second commit's. */
   private static String outcomes(String a, String[] racers, Op d, String resultD, String again) {
     return "A=" + a + " " + java.util.Arrays.toString(racers)
@@ -622,7 +646,7 @@ class TestCatalogRaceProperties {
     Op c = twoRacers ? new Op(racerC, y, x) : new Op(null, 0, 0);
     aRaceEndsAsASerialRun(fileModeA, fileModeB, fileModeC, storage, catalogLog, setup, a, b, c,
         gc, paging, clockOffsets, encoding, reads, recordingReads, tailReads, compactAfter,
-        fileModeA, new Op(null, 0, 0), false);
+        fileModeA, new Op(null, 0, 0), false, 0);
   }
 
   /** What a racer does to a table a transaction writes or reads. */

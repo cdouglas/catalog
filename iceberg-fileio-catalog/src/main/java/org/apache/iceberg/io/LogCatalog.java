@@ -141,6 +141,8 @@ public class LogCatalog extends BaseMetastoreCatalog
   private final Map<String, String> catalogProperties;
   // Whether its table commits pin what Iceberg commits once (FileIOTableOperations.doCommit)
   private boolean pinsCommitOnce = true;
+  // What the names its writes bind require of their namespaces (fileio.catalog.create.condition)
+  private CatalogMutation.CreateCondition createCondition = CatalogMutation.CreateCondition.NAME;
   // The InlineSnapshots this catalog's loads of inline tables made, for later loads to reuse
   private final InlineSnapshots inlineSnapshots = new InlineSnapshots();
   // The clock the catalog's commits mint their ids from, and compact by; null for the system's
@@ -203,6 +205,7 @@ public class LogCatalog extends BaseMetastoreCatalog
 
     inlineSettings(); // validates the inline properties
     LogCatalogProperties.dropForce(catalogProperties); // validates it
+    createCondition = LogCatalogProperties.createCondition(catalogProperties);
     String conflictEncoding = LogCatalogProperties.conflictEncoding(catalogProperties);
     LogCatalogProperties.snapshotPaging(catalogProperties); // validates them
 
@@ -325,7 +328,7 @@ public class LogCatalog extends BaseMetastoreCatalog
         if (!purge) {
           kept = keptFiles(identifier, read);
         }
-        new CatalogMutation(read).dropTable(identifier).commit(log);
+        mutation(read).dropTable(identifier).commit(log);
       } catch (NoSuchTableException e) {
         deleteQuietly(kept);
         return false;
@@ -463,7 +466,7 @@ public class LogCatalog extends BaseMetastoreCatalog
   @Override
   public void renameTable(TableIdentifier from, TableIdentifier to) {
     commitOnAFreshRead("rename table " + from + " to " + to,
-        read -> new CatalogMutation(read).renameTable(from, to));
+        read -> mutation(read).renameTable(from, to));
   }
 
   /**
@@ -485,7 +488,7 @@ public class LogCatalog extends BaseMetastoreCatalog
       if (read.state().isInlineTable(tblId)) {
         return true;
       }
-      CatalogMutation mut = new CatalogMutation(read);
+      CatalogMutation mut = mutation(read);
       try {
         FileIOTableOperations ops = tableOpsAsRead(identifier, read);
         TableMetadata current = ops.current();
@@ -505,10 +508,11 @@ public class LogCatalog extends BaseMetastoreCatalog
   /**
    * Commits what {@code stage} stages on a fresh read of the catalog, and on another, after the
    * commit loop's wait after a lost race, if it conflicts with a concurrent change. A catalog
-   * operation does not depend on what its caller read, but its record names the versions it read:
-   * of its namespace, or of the parent of one it creates or drops, which any change there bumps (a
-   * table created in it, a sibling created, its properties set), and of a table it renames. {@code
-   * stage} checks existence on each read.
+   * operation does not depend on what its caller read, but its record names what it read: the
+   * version of its namespace, or of the parent of one it drops, which any change there bumps (a
+   * table created in it, a sibling created, its properties set); of a table it renames; and, for
+   * a name it binds (a namespace created, a table's new name), the namespace's removals or its
+   * version, by the catalog's create condition. {@code stage} checks existence on each read.
    *
    * @throws ServiceUnavailableException if each of {@link #OPERATION_ATTEMPTS} commits conflicted
    *     (the callers of these operations expect no {@link CommitFailedException}): nothing was
@@ -526,6 +530,11 @@ public class LogCatalog extends BaseMetastoreCatalog
         }
       }
     }
+  }
+
+  /** A transaction staged on {@code read}, whose names bind by the catalog's create condition. */
+  private CatalogMutation mutation(Replica<CatalogState> read) {
+    return new CatalogMutation(read, createCondition);
   }
 
   /**
@@ -585,6 +594,7 @@ public class LogCatalog extends BaseMetastoreCatalog
             : new FileIOTableOperations(tableIdentifier, log, io, inline, inlineSnapshots, read);
     ops.pinsCommitOnce = pinsCommitOnce;
     ops.pinsExpiries = !LogCatalogProperties.expiryMerge(catalogProperties);
+    ops.createCondition = createCondition;
     return ops;
   }
 
@@ -776,7 +786,7 @@ public class LogCatalog extends BaseMetastoreCatalog
   @Override
   public void createNamespace(Namespace namespace, Map<String, String> metadata) {
     commitOnAFreshRead("create namespace " + namespace,
-        read -> new CatalogMutation(read).createNamespace(namespace, metadata));
+        read -> mutation(read).createNamespace(namespace, metadata));
   }
 
   @Override
@@ -816,7 +826,7 @@ public class LogCatalog extends BaseMetastoreCatalog
   public boolean dropNamespace(Namespace namespace) throws NamespaceNotEmptyException {
     try {
       commitOnAFreshRead("drop namespace " + namespace,
-          read -> new CatalogMutation(read).dropNamespace(namespace));
+          read -> mutation(read).dropNamespace(namespace));
     } catch (NoSuchNamespaceException e) {
       return false;
     }
@@ -827,7 +837,7 @@ public class LogCatalog extends BaseMetastoreCatalog
   public boolean setProperties(Namespace namespace, Map<String, String> properties)
       throws NoSuchNamespaceException {
     commitOnAFreshRead("change the properties of namespace " + namespace,
-        read -> new CatalogMutation(read).updateProperties(namespace, properties));
+        read -> mutation(read).updateProperties(namespace, properties));
     return true;
   }
 
@@ -863,6 +873,8 @@ public class LogCatalog extends BaseMetastoreCatalog
     private boolean pinsExpiries = false;
     // Whether these are a replace transaction's, whose commit restates the table (Bug 81)
     private boolean replaces = false;
+    // What a create through these operations requires of its namespace
+    private CatalogMutation.CreateCondition createCondition = CatalogMutation.CreateCondition.NAME;
 
     FileIOTableOperations(
         TableIdentifier tableId,
@@ -1218,7 +1230,7 @@ public class LogCatalog extends BaseMetastoreCatalog
         throw new CommitFailedException(
             "Cannot commit %s: stale table metadata (not the version last read)", tableId);
       }
-      CatalogMutation mut = new CatalogMutation(read);
+      CatalogMutation mut = new CatalogMutation(read, createCondition);
       stageUpdate(mut, base, metadata);
       if ((pinsCommitOnce && (replaces || commitsOnce(metadata.changes())))
           || (pinsExpiries && removesSnapshots(metadata.changes()))) {
@@ -1286,22 +1298,23 @@ public class LogCatalog extends BaseMetastoreCatalog
     }
 
     /**
-     * Commits the creation of this table with {@code metadata}. Its record names the version of
-     * the namespace it read, which any change there bumps (another table created or dropped in
-     * it, its properties set), and Iceberg takes a create's conflict to mean the table exists. So
-     * one that conflicts is staged again on a fresh read, after the commit loop's wait after a
-     * lost race, which fails if the table exists by then ({@link
-     * org.apache.iceberg.exceptions.AlreadyExistsException}). After {@link #OPERATION_ATTEMPTS}
-     * conflicts it reads the catalog again: if the table exists, it throws the conflict, which
-     * Iceberg reports as the table created concurrently; if not, it throws {@link
-     * ServiceUnavailableException}, which Iceberg passes on, so a table that does not exist is
-     * never reported as existing (Bug 107).
+     * Commits the creation of this table with {@code metadata}. Its record names, by the catalog's
+     * create condition, the namespace's removals as it read them, which a table dropped or renamed
+     * out of its name there moves, and its name free; or the namespace's version, which any change
+     * there bumps (another table created or dropped in it, its properties set). Iceberg takes a
+     * create's conflict to mean the table exists. So one that conflicts is staged again on a fresh
+     * read, after the commit loop's wait after a lost race, which fails if the table exists by then
+     * ({@link org.apache.iceberg.exceptions.AlreadyExistsException}). After {@link
+     * #OPERATION_ATTEMPTS} conflicts it reads the catalog again: if the table exists, it throws
+     * the conflict, which Iceberg reports as the table created concurrently; if not, it throws
+     * {@link ServiceUnavailableException}, which Iceberg passes on, so a table that does not exist
+     * is never reported as existing (Bug 107 (create conflict reported as exists)).
      */
     private void commitCreate(TableMetadata metadata) {
       Consumer<CatalogMutation> create = stageCreate(metadata);
       Replica<CatalogState> read = lastRead;
       for (int attempt = 1; ; attempt++) {
-        CatalogMutation mut = new CatalogMutation(read);
+        CatalogMutation mut = new CatalogMutation(read, createCondition);
         create.accept(mut);
         try {
           landed = mut.commit(log);
@@ -2484,7 +2497,7 @@ public class LogCatalog extends BaseMetastoreCatalog
   @Override
   public void commitTransaction(CatalogCommit commit) {
     final Replica<CatalogState> current = log.read();
-    final CatalogMutation newCatalog = new CatalogMutation(current);
+    final CatalogMutation newCatalog = mutation(current);
     boolean witness = LogCatalogProperties.txnReadWitness(catalogProperties);
 
     for (TableRead read : commit.reads()) {

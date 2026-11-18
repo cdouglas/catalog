@@ -135,6 +135,43 @@ public final class LogCatalogProperties {
   }
 
   /**
+   * What a writer's action that binds a name requires of the namespace it binds it in, where its
+   * record lands. It covers every name a catalog binds: a table's create (with {@code
+   * registerTable} and a create transaction), the new name of a renamed table, and a namespace's
+   * create; in a catalog transaction too. Each record says which it sent, so writers may differ.
+   *
+   * <ul>
+   *   <li>{@code name}: the namespace exists, has freed no name since the writer read it (its
+   *       removals: each drop or rename out of a name there, and each drop of a child namespace,
+   *       adds one), and the name is free. Creates of different names in one namespace do not
+   *       conflict, and a create that lost its name never applies, though the name be freed
+   *       again (docs/SPEC.md, "Action Verification Rules").
+   *   <li>{@code namespace}: the namespace is at the version the writer read, which any change
+   *       there moves (a sibling created, dropped or renamed, a property set), so creates in one
+   *       namespace land one at a time, as before (for ablation).
+   * </ul>
+   *
+   * <p>Either way a create bumps its namespace's version, so a drop of the namespace, and a
+   * create by {@code namespace}, conflict with it. Default: {@code name}.
+   */
+  public static final String CREATE_CONDITION = "fileio.catalog.create.condition";
+  public static final String DEFAULT_CREATE_CONDITION = "name";
+
+  /**
+   * The create condition {@code properties} name ({@link #CREATE_CONDITION}).
+   *
+   * @throws IllegalArgumentException for a value that is neither {@code name} nor {@code
+   *     namespace}
+   */
+  public static CatalogMutation.CreateCondition createCondition(Map<String, String> properties) {
+    String val = properties == null ? null : properties.get(CREATE_CONDITION);
+    String condition = val != null ? val : DEFAULT_CREATE_CONDITION;
+    Preconditions.checkArgument(condition.equals("name") || condition.equals("namespace"),
+        "%s must be name or namespace, got %s", CREATE_CONDITION, condition);
+    return CatalogMutation.CreateCondition.of(condition);
+  }
+
+  /**
    * Whether a drop of an inline table that does not purge it first writes the table to its
    * metadata directory as a pointer table's is (a metadata file, and a manifest list file for each
    * snapshot whose list the catalog holds inline), so that {@code registerTable} with that file

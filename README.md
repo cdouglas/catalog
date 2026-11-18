@@ -194,7 +194,8 @@ suites skip; see [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
   - `TestCatalogRaceProperties` runs other operations just before an
     operation's catalog writes, and requires the result of a serial run.
     It and `TestCatalogFaultProperties` draw the catalog's log: one
-    object, or a shared log.
+    object, or a shared log, and each writer's create condition
+    (`fileio.catalog.create.condition`).
   - `TestInlineDifferentialProperties` runs one schedule of table
     operations on a pointer catalog and an inline one, and requires the
     same results and reads, also of the inline table as a worker it is
@@ -202,7 +203,10 @@ suites skip; see [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
     inline delta replays to the metadata it committed.
   - `spec/` checks the format itself: concurrent writers (on one object
     and on a shared log, with copies of records appended again, and
-    sends that land late), invariants, codecs, and canonical state.
+    sends that land late), invariants, codecs, canonical state, and N1,
+    that every action's verify is stable: an action rejected where its
+    record lands is rejected on every later state, so a late copy of a
+    rejected record never applies (`TestVerifyStabilityProperties`).
   - `CommitProtocol` (intentlog-testkit) fuzzes the commit protocol on
     each provider (`TestMemoryCommitProtocol`,
     `TestAtomicFileCommitProtocol`), over a state machine of entity
@@ -287,6 +291,7 @@ suites skip; see [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
 | `fileio.catalog.txn.read.witness` | `true` | A serializable catalog transaction's record names the branches it read of each table, which the conflict encoding judges by what changed of them; `false` holds each table it read to its version (for ablation) |
 | `fileio.catalog.drop.materialize` | `true` | A drop that keeps an inline table's files (purge false) first writes the table to its metadata directory as a pointer table's is (a manifest list file per inline list, then a metadata file), so `registerTable` brings it back; a drop that cannot write it fails, and deletes what it wrote |
 | `fileio.catalog.drop.force` | `false` | A drop that cannot write an inline table to its metadata directory drops it anyway and logs a warning; the table's files stay with no metadata file to register, for a GC by listing, as a purge whose writer fails after its drop landed leaves them |
+| `fileio.catalog.create.condition` | `name` | What every name a writer binds requires of its namespace where the record lands: table creates (with `registerTable` and create transactions), a renamed table's new name, and namespace creates, in catalog transactions too. `name`: the namespace exists, has freed no name since the read (its removals), and the name is free, so creates of different names in one namespace do not conflict; `namespace`: the namespace's version is the one read, so creates in one namespace land one at a time (for ablation). Each record says which it sent, so writers may differ |
 | `fileio.catalog.conflict.encoding` | `manifest-window` | How replay decides whether a table update conflicts with what landed since its writer read the table; fixed when the catalog is created ([docs/SPEC.md](docs/SPEC.md) "Conflict Encodings") |
 
 See [docs/LOG.md](docs/LOG.md) for the commit protocol,

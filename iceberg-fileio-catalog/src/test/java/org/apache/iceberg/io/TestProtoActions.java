@@ -189,18 +189,19 @@ public class TestProtoActions {
       if (a instanceof ProtoCodec.CreateNamespaceAction) {
         ProtoCodec.CreateNamespaceAction c = (ProtoCodec.CreateNamespaceAction) a;
         bound.add(new ProtoCodec.CreateNamespaceAction(
-            ns.get(c.id), c.version, ns.getOrDefault(c.parentId, c.parentId), c.parentVersion,
-            c.name));
+            ns.get(c.id), c.version, ns.getOrDefault(c.parentId, c.parentId), c.byName,
+            c.byName ? c.parentRemovals : c.parentVersion, c.name));
       } else if (a instanceof ProtoCodec.CreateTableAction) {
         ProtoCodec.CreateTableAction c = (ProtoCodec.CreateTableAction) a;
         bound.add(new ProtoCodec.CreateTableAction(
-            tbl.get(c.id), c.version, ns.getOrDefault(c.namespaceId, c.namespaceId),
-            c.namespaceVersion, c.name, c.metadataLocation));
+            tbl.get(c.id), c.version, ns.getOrDefault(c.namespaceId, c.namespaceId), c.byName,
+            c.byName ? c.namespaceRemovals : c.namespaceVersion, c.name, c.metadataLocation));
       } else if (a instanceof ProtoCodec.CreateTableInlineAction) {
         ProtoCodec.CreateTableInlineAction c = (ProtoCodec.CreateTableInlineAction) a;
         bound.add(new ProtoCodec.CreateTableInlineAction(
-            tbl.get(c.id), c.version, ns.getOrDefault(c.namespaceId, c.namespaceId),
-            c.namespaceVersion, c.name, c.metadata, c.metadataCodec, c.deltaBytes));
+            tbl.get(c.id), c.version, ns.getOrDefault(c.namespaceId, c.namespaceId), c.byName,
+            c.byName ? c.namespaceRemovals : c.namespaceVersion, c.name, c.metadata,
+            c.metadataCodec, c.deltaBytes));
       } else if (a instanceof ProtoCodec.SetNamespacePropertyAction) {
         ProtoCodec.SetNamespacePropertyAction c = (ProtoCodec.SetNamespacePropertyAction) a;
         bound.add(new ProtoCodec.SetNamespacePropertyAction(
@@ -213,8 +214,8 @@ public class TestProtoActions {
         ProtoCodec.RenameTableAction c = (ProtoCodec.RenameTableAction) a;
         bound.add(new ProtoCodec.RenameTableAction(
             tbl.getOrDefault(c.id, c.id), c.version,
-            ns.getOrDefault(c.newNamespaceId, c.newNamespaceId), c.newNamespaceVersion,
-            c.newName));
+            ns.getOrDefault(c.newNamespaceId, c.newNamespaceId), c.byName,
+            c.byName ? c.newNamespaceRemovals : c.newNamespaceVersion, c.newName));
       } else {
         bound.add(a);
       }
@@ -2460,6 +2461,21 @@ public class TestProtoActions {
     }
 
     @Test
+    void dropTblVsNamespaceChanges_conflict_nsVersion() {
+      // A table's drop bumps its namespace's version (design.md, the DT row): a table create, a
+      // child namespace's create and a property change staged before it are rejected.
+      byte[] file = baseFile();
+      ProtoCodec.Transaction create = txn(createTbl(3, 1, "t3", 1, 1, "s3://t3"));
+      ProtoCodec.Transaction child = txn(createNs(3, 1, "child", 1, 1));
+      ProtoCodec.Transaction prop = txn(setNsProp(1, 1, "env", "prod"));
+      Replica<CatalogState> r = apply(file, txn(dropTbl(2, 1)), create, child, prop);
+      assertThat(r.state().namespaceVersion(1)).isEqualTo(2);
+      assertThat(r.committed().contains(create.id())).isFalse();
+      assertThat(r.committed().contains(child.id())).isFalse();
+      assertThat(r.committed().contains(prop.id())).isFalse();
+    }
+
+    @Test
     void updateTblVsUpdateTbl_conflict_tblVersion() {
       byte[] file = baseFile();
       ProtoCodec.Transaction t1 = txn(updateTbl(1, 1, "s3://t1/v2"));
@@ -2598,6 +2614,218 @@ public class TestProtoActions {
       assertThat(r.committed().contains(t1.id())).isTrue();
       assertThat(r.committed().contains(t2.id())).isFalse();
       assertThat(r.committed().contains(t3.id())).isFalse();
+    }
+  }
+
+  // ============================================================
+  // Creates by name (fileio.catalog.create.condition name)
+  // ============================================================
+
+  static ProtoCodec.CreateTableAction createTblByName(
+      int id, int nsId, String name, int nsRemovals, String location) {
+    return new ProtoCodec.CreateTableAction(id, 1, nsId, true, nsRemovals, name, location);
+  }
+
+  static ProtoCodec.CreateTableInlineAction createTblInlineByName(
+      int id, int nsId, String name, int nsRemovals) {
+    return new ProtoCodec.CreateTableInlineAction(id, 1, nsId, true, nsRemovals, name,
+        CatalogTestSupport.newInlineTable("s3://" + name), CatalogTestSupport.inlineTableCodec(),
+        null);
+  }
+
+  static ProtoCodec.CreateNamespaceAction createNsByName(
+      int id, int parentId, String name, int parentRemovals) {
+    return new ProtoCodec.CreateNamespaceAction(id, 1, parentId, true, parentRemovals, name);
+  }
+
+  static ProtoCodec.RenameTableAction renameTblByName(
+      int id, int version, int newNsId, int newNsRemovals, String newName) {
+    return new ProtoCodec.RenameTableAction(id, version, newNsId, true, newNsRemovals, newName);
+  }
+
+  /**
+   * The conflict matrix for actions that bind a name by name (design.md, "Operation × Operation
+   * Conflict Matrix"): the second action (B) was staged on the state before the first (A), and
+   * binds its name with the namespace's removals as it read them, 0 here.
+   */
+  @Nested
+  class ByNameConflictTests {
+
+    /** As ConflictTests' catalog: two namespaces, two tables under db (ns 1), a property. */
+    private byte[] baseFile() {
+      return catalog()
+          .ns(1, 0, "db", 1)
+          .ns(2, 0, "other", 1)
+          .tbl(1, 1, "t1", 1, "s3://t1/v1")
+          .tbl(2, 1, "t2", 1, "s3://t2/v1")
+          .prop(1, "owner", "alice")
+          .build();
+    }
+
+    private final TableIdentifier tA = TableIdentifier.of(Namespace.of("db"), "tA");
+    private final TableIdentifier tB = TableIdentifier.of(Namespace.of("db"), "tB");
+
+    @Test
+    void createTblVsCreateTbl_compose() {
+      Replica<CatalogState> r = apply(baseFile(),
+          txn(createTbl(3, 1, "tA", 1, 1, "s3://tA")),
+          txn(createTblByName(4, 1, "tB", 0, "s3://tB")));
+      assertThat(r.state().containsTable(tA)).isTrue();
+      assertThat(r.state().containsTable(tB)).isTrue();
+    }
+
+    @Test
+    void createTblVsCreateTblSameName_conflict_name() {
+      ProtoCodec.Transaction second = txn(createTblByName(4, 1, "tA", 0, "s3://tA-2"));
+      Replica<CatalogState> r = apply(baseFile(),
+          txn(createTblByName(3, 1, "tA", 0, "s3://tA")), second);
+      assertThat(r.state().location(tA)).isEqualTo("s3://tA");
+      assertThat(r.committed().contains(second.id())).isFalse();
+    }
+
+    @Test
+    void createTblInlineVsCreateTblInline_compose() {
+      Replica<CatalogState> r = apply(baseFile(),
+          txn(createTblInlineByName(3, 1, "tA", 0)),
+          txn(createTblInlineByName(4, 1, "tB", 0)));
+      assertThat(r.state().isInlineTable(tA)).isTrue();
+      assertThat(r.state().isInlineTable(tB)).isTrue();
+    }
+
+    @Test
+    void createNsChildVsCreateNsChild_compose_and_sameName_conflict() {
+      ProtoCodec.Transaction same = txn(createNsByName(5, 1, "a", 0));
+      Replica<CatalogState> r = apply(baseFile(),
+          txn(createNsByName(3, 1, "a", 0)),
+          txn(createNsByName(4, 1, "b", 0)),
+          same);
+      assertThat(r.state().containsNamespace(Namespace.of("db", "a"))).isTrue();
+      assertThat(r.state().containsNamespace(Namespace.of("db", "b"))).isTrue();
+      assertThat(r.committed().contains(same.id())).isFalse();
+    }
+
+    @Test
+    void createTblVsCreateNsChild_compose() {
+      // A table and a child namespace may share a name, as they may by namespace version
+      Replica<CatalogState> r = apply(baseFile(),
+          txn(createTbl(3, 1, "a", 1, 1, "s3://a")),
+          txn(createNsByName(4, 1, "a", 0)));
+      assertThat(r.state().containsTable(TableIdentifier.of(Namespace.of("db"), "a"))).isTrue();
+      assertThat(r.state().containsNamespace(Namespace.of("db", "a"))).isTrue();
+    }
+
+    @Test
+    void setNsPropertyAndUpdateTblVsCreates_compose() {
+      Replica<CatalogState> r = apply(baseFile(),
+          txn(setNsProp(1, 1, "owner", "bob")),
+          txn(updateTbl(1, 1, "s3://t1/v2")),
+          txn(createTblByName(3, 1, "tA", 0, "s3://tA")),
+          txn(createNsByName(4, 1, "a", 0)),
+          txn(renameTblByName(2, 1, 1, 0, "tB")));
+      assertThat(r.state().containsTable(tA)).isTrue();
+      assertThat(r.state().containsNamespace(Namespace.of("db", "a"))).isTrue();
+      assertThat(r.state().containsTable(tB)).isTrue();
+    }
+
+    @Test
+    void dropTblVsCreates_conflict_removals() {
+      ProtoCodec.Transaction create = txn(createTblByName(3, 1, "tA", 0, "s3://tA"));
+      ProtoCodec.Transaction child = txn(createNsByName(4, 1, "a", 0));
+      ProtoCodec.Transaction rename = txn(renameTblByName(2, 1, 1, 0, "tB"));
+      Replica<CatalogState> r =
+          apply(baseFile(), txn(dropTbl(1, 1)), create, child, rename);
+      assertThat(r.state().namespaceRemovals(1)).isEqualTo(1);
+      assertThat(r.committed().contains(create.id())).isFalse();
+      assertThat(r.committed().contains(child.id())).isFalse();
+      assertThat(r.committed().contains(rename.id())).isFalse();
+    }
+
+    @Test
+    void renameTblInPlaceVsCreate_conflict_removals() {
+      // A rename within db frees t1 there, even though the table stays in db
+      ProtoCodec.Transaction create = txn(createTblByName(3, 1, "tA", 0, "s3://tA"));
+      Replica<CatalogState> r = apply(baseFile(), txn(renameTbl(1, 1, 1, 1, "t9")), create);
+      assertThat(r.state().namespaceRemovals(1)).isEqualTo(1);
+      assertThat(r.committed().contains(create.id())).isFalse();
+    }
+
+    @Test
+    void renameTblIntoNsVsCreate_compose() {
+      // A rename into other (ns 2) from db frees a name in db, none in other
+      Replica<CatalogState> r = apply(baseFile(),
+          txn(renameTbl(1, 1, 2, 1, "moved")),
+          txn(createTblByName(3, 2, "tA", 0, "s3://tA")));
+      assertThat(r.state().namespaceRemovals(1)).isEqualTo(1);
+      assertThat(r.state().namespaceRemovals(2)).isEqualTo(0);
+      assertThat(r.state().containsTable(TableIdentifier.of(Namespace.of("other"), "tA")))
+          .isTrue();
+    }
+
+    @Test
+    void dropNsVsCreates_conflict_gone_and_parentRemovals() {
+      // other (ns 2) is empty: its drop removes it, and frees a name under the root
+      ProtoCodec.Transaction inIt = txn(createTblByName(3, 2, "tA", 0, "s3://tA"));
+      ProtoCodec.Transaction sibling = txn(createNsByName(4, 0, "third", 0));
+      Replica<CatalogState> r = apply(baseFile(), txn(dropNs(2, 1)), inIt, sibling);
+      assertThat(r.state().namespaceRemovals(0)).isEqualTo(1);
+      assertThat(r.committed().contains(inIt.id())).isFalse();
+      assertThat(r.committed().contains(sibling.id())).isFalse();
+    }
+
+    @Test
+    void createByNameVsCreateByNamespace_conflict_nsVersion() {
+      // A create by name still bumps the namespace's version
+      ProtoCodec.Transaction serial = txn(createTbl(4, 1, "tB", 1, 1, "s3://tB"));
+      Replica<CatalogState> r = apply(baseFile(),
+          txn(createTblByName(3, 1, "tA", 0, "s3://tA")), serial);
+      assertThat(r.state().containsTable(tA)).isTrue();
+      assertThat(r.committed().contains(serial.id())).isFalse();
+    }
+
+    @Test
+    void createByNameVsDropNs_conflict_nsVersion() {
+      ProtoCodec.Transaction drop = txn(dropNs(2, 1));
+      Replica<CatalogState> r = apply(baseFile(),
+          txn(createTblByName(3, 2, "tA", 0, "s3://tA")), drop);
+      assertThat(r.state().containsNamespace(Namespace.of("other"))).isTrue();
+      assertThat(r.committed().contains(drop.id())).isFalse();
+    }
+
+    @Test
+    void malformedConditions_neverApply() {
+      // A concrete namespace with -1, or a late-bound one with a count
+      ProtoCodec.Transaction concrete = txn(createTblByName(3, 1, "tA", -1, "s3://tA"));
+      ProtoCodec.Transaction lateBound = new ProtoCodec.Transaction(UuidV7.newUuidV7(), List.of(
+          new ProtoCodec.CreateNamespaceAction(-1, 1, 0, true, 0, "fresh"),
+          new ProtoCodec.CreateTableAction(-1, 1, -1, true, 0, "tA", "s3://tA")));
+      Replica<CatalogState> r = apply(baseFile(), concrete, lateBound);
+      assertThat(r.committed().contains(concrete.id())).isFalse();
+      assertThat(r.committed().contains(lateBound.id())).isFalse();
+    }
+
+    @Test
+    void byNameActionsRoundTripTheCodec() {
+      ProtoCodec.Transaction txn = new ProtoCodec.Transaction(UuidV7.newUuidV7(), List.of(
+          new ProtoCodec.CreateNamespaceAction(-1, 1, 0, true, 0, "fresh"),
+          new ProtoCodec.CreateTableAction(-1, 1, -1, true, -1, "tA", "s3://tA"),
+          createTblByName(-2, 1, "tB", 7, "s3://tB"),
+          renameTblByName(1, 1, 1, 300, "renamed"),
+          new ProtoCodec.CreateTableInlineAction(-3, 1, 2, true, 0, "tC",
+              CatalogTestSupport.newInlineTable("s3://tC"),
+              CatalogTestSupport.inlineTableCodec(), null)));
+      byte[] bytes = ProtoCodec.encodeTransaction(txn);
+      ProtoCodec.Transaction decoded = ProtoCodec.decodeTransaction(bytes);
+      assertThat(ProtoCodec.encodeTransaction(decoded)).isEqualTo(bytes);
+      ProtoCodec.CreateTableAction tb = (ProtoCodec.CreateTableAction) decoded.actions().get(2);
+      assertThat(tb.byName).isTrue();
+      assertThat(tb.namespaceRemovals).isEqualTo(7);
+      ProtoCodec.RenameTableAction rn = (ProtoCodec.RenameTableAction) decoded.actions().get(3);
+      assertThat(rn.byName).isTrue();
+      assertThat(rn.newNamespaceRemovals).isEqualTo(300);
+      ProtoCodec.CreateTableAction byVersion = (ProtoCodec.CreateTableAction)
+          ProtoCodec.decodeTransaction(ProtoCodec.encodeTransaction(
+              txn(createTbl(3, 1, "tA", 1, 0, "s3://tA")))).actions().get(0);
+      assertThat(byVersion.byName).as("a version of 0, written").isFalse();
     }
   }
 

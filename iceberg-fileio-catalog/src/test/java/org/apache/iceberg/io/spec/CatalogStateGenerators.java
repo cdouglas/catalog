@@ -348,14 +348,38 @@ final class CatalogStateGenerators {
   private static final List<WriterOp> BARE =
       List.of(WriterOp.SET_CONFLICT_ENCODING, WriterOp.SET_SNAPSHOT_PAGING, WriterOp.UNKNOWN);
 
-  /** A writer's transaction: its intention, and the ops it staged, for a trace. */
+  /**
+   * A writer's transaction: its intention, the ops it staged, for a trace, and the names it binds
+   * (tables created or renamed to, and namespaces created).
+   */
   static final class Staged {
     final ProtoCodec.CatalogIntention intention;
     final List<String> ops;
+    final List<TableIdentifier> boundTables = new ArrayList<>();
+    final List<Namespace> boundNamespaces = new ArrayList<>();
 
     Staged(ProtoCodec.CatalogIntention intention, List<String> ops) {
       this.intention = intention;
       this.ops = ops;
+    }
+
+    /** Whether one of the names it binds is free on {@code state}, in a namespace that exists. */
+    boolean aNameIsFree(CatalogState state) {
+      for (TableIdentifier table : boundTables) {
+        if (!state.containsTable(table) && state.containsNamespace(table.namespace())) {
+          return true;
+        }
+      }
+      for (Namespace ns : boundNamespaces) {
+        Namespace parent = ns.length() > 1
+            ? Namespace.of(java.util.Arrays.copyOf(ns.levels(), ns.length() - 1))
+            : Namespace.empty();
+        if (!state.containsNamespace(ns)
+            && (parent.isEmpty() || state.containsNamespace(parent))) {
+          return true;
+        }
+      }
+      return false;
     }
 
     @Override
@@ -365,14 +389,16 @@ final class CatalogStateGenerators {
   }
 
   /**
-   * A transaction a writer stages on {@code read} as {@link CatalogMutation} stages it (each op
-   * checked against the read, with the versions of what it depends on as the read holds them):
+   * A transaction a writer stages on {@code read} as {@link CatalogMutation} stages it, its names
+   * binding by {@code condition} (each op checked against the read, with the versions, and the
+   * removals or versions of the namespaces it binds names in, as the read holds them):
    * one to three ops drawn with {@code rng} from {@link #NAMESPACES}, {@link #TABLE_NAMES} and
    * the read's tables, skipping those the read refuses; or, now and then, one bare action of the
    * kinds no catalog operation stages (a conflict encoding, snapshot paging, an unknown action).
    * Null if nothing staged.
    */
-  static Staged writerTransaction(CatalogState read, Random rng) {
+  static Staged writerTransaction(
+      CatalogState read, Random rng, CatalogMutation.CreateCondition condition) {
     if (rng.nextInt(20) == 0) {
       switch (BARE.get(rng.nextInt(BARE.size()))) {
         case SET_CONFLICT_ENCODING: {
@@ -387,13 +413,15 @@ final class CatalogStateGenerators {
           return bare(new ProtoCodec.UnknownAction(99, new byte[] {8, 1}), "unknown(99)");
       }
     }
-    CatalogMutation mutation = new CatalogMutation(CatalogTestSupport.replicaOf(read));
+    CatalogMutation mutation =
+        new CatalogMutation(CatalogTestSupport.replicaOf(read), condition);
     List<String> staged = new ArrayList<>();
+    List<Object> bound = new ArrayList<>();
     Map<TableIdentifier, Boolean> updated = new HashMap<>();
     int ops = 1 + rng.nextInt(3);
     for (int i = 0; i < ops; i++) {
-      String done =
-          stage(mutation, read, WEIGHTED.get(rng.nextInt(WEIGHTED.size())), rng, updated);
+      String done = stage(
+          mutation, read, WEIGHTED.get(rng.nextInt(WEIGHTED.size())), rng, updated, bound);
       if (done != null) {
         staged.add(done);
       }
@@ -401,7 +429,18 @@ final class CatalogStateGenerators {
     if (staged.isEmpty()) {
       return null;
     }
-    return new Staged(mutation.intention(), staged);
+    if (condition == CatalogMutation.CreateCondition.NAMESPACE) {
+      staged.add(0, "by namespace:");
+    }
+    Staged transaction = new Staged(mutation.intention(), staged);
+    for (Object name : bound) {
+      if (name instanceof TableIdentifier) {
+        transaction.boundTables.add((TableIdentifier) name);
+      } else {
+        transaction.boundNamespaces.add((Namespace) name);
+      }
+    }
+    return transaction;
   }
 
   private static Staged bare(ProtoCodec.Action action, String what) {
@@ -410,7 +449,7 @@ final class CatalogStateGenerators {
 
   /** Stages {@code op} on {@code mutation}; what it staged, or null if the read refuses it. */
   private static String stage(CatalogMutation mutation, CatalogState read, WriterOp op,
-      Random rng, Map<TableIdentifier, Boolean> updated) {
+      Random rng, Map<TableIdentifier, Boolean> updated, List<Object> bound) {
     Namespace ns = NAMESPACES.get(rng.nextInt(NAMESPACES.size()));
     TableIdentifier fresh =
         TableIdentifier.of(ns, TABLE_NAMES.get(rng.nextInt(TABLE_NAMES.size())));
@@ -425,6 +464,7 @@ final class CatalogStateGenerators {
           // a map of its own: a later change of its properties in the transaction merges into it
           mutation.createNamespace(
               ns, rng.nextBoolean() ? new HashMap<>() : new HashMap<>(Map.of(key, value)));
+          bound.add(ns);
           return "createNamespace(" + ns + ")";
         case DROP_NAMESPACE:
           mutation.dropNamespace(ns);
@@ -439,11 +479,13 @@ final class CatalogStateGenerators {
           return "removeProperty(" + ns + ", " + key + ")";
         case CREATE_TABLE:
           mutation.createTable(fresh, "mem:///" + fresh + "/" + value);
+          bound.add(fresh);
           return "createTable(" + fresh + ")";
         case CREATE_TABLE_INLINE:
           mutation.createTableInline(fresh,
               CatalogTestSupport.newInlineTable("mem:///" + fresh + "/" + value),
               CatalogTestSupport.inlineTableCodec());
+          bound.add(fresh);
           return "createTableInline(" + fresh + ")";
         case DROP_TABLE:
           mutation.dropTable(existing);
@@ -482,6 +524,7 @@ final class CatalogStateGenerators {
           return "updateTableInlineDelta(" + existing + ")";
         case RENAME_TABLE:
           mutation.renameTable(existing, fresh);
+          bound.add(fresh);
           return "renameTable(" + existing + ", " + fresh + ")";
         default:
           throw new IllegalStateException("Not a staged op: " + op);

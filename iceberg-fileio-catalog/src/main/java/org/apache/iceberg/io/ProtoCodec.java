@@ -116,6 +116,7 @@ public class ProtoCodec {
   private static final int NS_VERSION = 2;
   private static final int NS_PARENT_ID = 3;
   private static final int NS_NAME = 4;
+  private static final int NS_REMOVALS = 5;
 
   // Table field numbers
   private static final int TBL_ID = 1;
@@ -212,6 +213,7 @@ public class ProtoCodec {
   private static final int CREATE_NS_PARENT_ID = 3;
   private static final int CREATE_NS_PARENT_VERSION = 4;
   private static final int CREATE_NS_NAME = 5;
+  private static final int CREATE_NS_PARENT_REMOVALS = 6;
 
   // DropNamespace field numbers
   private static final int DROP_NS_ID = 1;
@@ -235,6 +237,7 @@ public class ProtoCodec {
   private static final int CREATE_TBL_NS_VERSION = 4;
   private static final int CREATE_TBL_NAME = 5;
   private static final int CREATE_TBL_METADATA_LOCATION = 6;
+  private static final int CREATE_TBL_NS_REMOVALS = 7;
 
   // DropTable field numbers
   private static final int DROP_TBL_ID = 1;
@@ -294,6 +297,7 @@ public class ProtoCodec {
   // Optional delta bytes carrying initial manifest-pool entries for an
   // inline-ML create-with-snapshots commit.
   private static final int CREATE_INLINE_TBL_DELTA = 8;
+  private static final int CREATE_INLINE_TBL_NS_REMOVALS = 9;
 
   // RenameTable field numbers
   private static final int RENAME_TBL_ID = 1;
@@ -301,6 +305,7 @@ public class ProtoCodec {
   private static final int RENAME_TBL_NEW_NS_ID = 3;
   private static final int RENAME_TBL_NEW_NS_VERSION = 4;
   private static final int RENAME_TBL_NEW_NAME = 5;
+  private static final int RENAME_TBL_NEW_NS_REMOVALS = 6;
 
   // SetConflictEncoding field numbers
   private static final int SET_CONFLICT_ENCODING_NAME = 1;
@@ -519,12 +524,16 @@ public class ProtoCodec {
     writeVarint(out, NS_VERSION, entry.version);
     writeVarint(out, NS_PARENT_ID, entry.parentId);
     writeString(out, NS_NAME, entry.name);
+    if (entry.removals != 0) {
+      // absent while the namespace has freed no name, as in every catalog without a drop
+      writeVarint(out, NS_REMOVALS, entry.removals);
+    }
     return out.toByteArray();
   }
 
   private static void decodeNamespace(byte[] bytes, CatalogState.Builder builder) throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
-    int id = 0, version = 0, parentId = 0;
+    int id = 0, version = 0, parentId = 0, removals = 0;
     String name = "";
 
     while (in.available() > 0) {
@@ -543,11 +552,14 @@ public class ProtoCodec {
         case NS_NAME:
           name = readString(in);
           break;
+        case NS_REMOVALS:
+          removals = readVarint(in);
+          break;
         default:
           skipField(in, tag & 0x7);
       }
     }
-    builder.addNamespace(id, parentId, name, version);
+    builder.addNamespace(id, parentId, name, version, removals);
   }
 
   private static byte[] encodeTable(int id, CatalogState.TblEntry entry, byte[] conflictState)
@@ -1141,7 +1153,12 @@ public class ProtoCodec {
       writeVarint(inner, CREATE_NS_ID, a.id);
       writeVarint(inner, CREATE_NS_VERSION, a.version);
       writeVarint(inner, CREATE_NS_PARENT_ID, a.parentId);
-      writeVarint(inner, CREATE_NS_PARENT_VERSION, a.parentVersion);
+      // the oneof's member, written even when 0
+      if (a.byName) {
+        writeVarint(inner, CREATE_NS_PARENT_REMOVALS, a.parentRemovals);
+      } else {
+        writeVarint(inner, CREATE_NS_PARENT_VERSION, a.parentVersion);
+      }
       writeString(inner, CREATE_NS_NAME, a.name);
       writeLengthDelimited(out, ACTION_CREATE_NAMESPACE, inner.toByteArray());
     } else if (action instanceof DropNamespaceAction) {
@@ -1171,7 +1188,11 @@ public class ProtoCodec {
       writeVarint(inner, CREATE_TBL_ID, a.id);
       writeVarint(inner, CREATE_TBL_VERSION, a.version);
       writeVarint(inner, CREATE_TBL_NS_ID, a.namespaceId);
-      writeVarint(inner, CREATE_TBL_NS_VERSION, a.namespaceVersion);
+      if (a.byName) {
+        writeVarint(inner, CREATE_TBL_NS_REMOVALS, a.namespaceRemovals);
+      } else {
+        writeVarint(inner, CREATE_TBL_NS_VERSION, a.namespaceVersion);
+      }
       writeString(inner, CREATE_TBL_NAME, a.name);
       writeString(inner, CREATE_TBL_METADATA_LOCATION, a.metadataLocation);
       writeLengthDelimited(out, ACTION_CREATE_TABLE, inner.toByteArray());
@@ -1247,7 +1268,11 @@ public class ProtoCodec {
       writeVarint(inner, CREATE_INLINE_TBL_ID, a.id);
       writeVarint(inner, CREATE_INLINE_TBL_VERSION, a.version);
       writeVarint(inner, CREATE_INLINE_TBL_NS_ID, a.namespaceId);
-      writeVarint(inner, CREATE_INLINE_TBL_NS_VERSION, a.namespaceVersion);
+      if (a.byName) {
+        writeVarint(inner, CREATE_INLINE_TBL_NS_REMOVALS, a.namespaceRemovals);
+      } else {
+        writeVarint(inner, CREATE_INLINE_TBL_NS_VERSION, a.namespaceVersion);
+      }
       writeString(inner, CREATE_INLINE_TBL_NAME, a.name);
       writeBytes(inner, CREATE_INLINE_TBL_METADATA, a.metadata);
       writeVarint(inner, CREATE_INLINE_TBL_METADATA_CODEC, a.metadataCodec & 0xFF);
@@ -1261,7 +1286,11 @@ public class ProtoCodec {
       writeVarint(inner, RENAME_TBL_ID, a.id);
       writeVarint(inner, RENAME_TBL_VERSION, a.version);
       writeVarint(inner, RENAME_TBL_NEW_NS_ID, a.newNamespaceId);
-      writeVarint(inner, RENAME_TBL_NEW_NS_VERSION, a.newNamespaceVersion);
+      if (a.byName) {
+        writeVarint(inner, RENAME_TBL_NEW_NS_REMOVALS, a.newNamespaceRemovals);
+      } else {
+        writeVarint(inner, RENAME_TBL_NEW_NS_VERSION, a.newNamespaceVersion);
+      }
       writeString(inner, RENAME_TBL_NEW_NAME, a.newName);
       writeLengthDelimited(out, ACTION_RENAME_TABLE, inner.toByteArray());
     } else if (action instanceof SetConflictEncodingAction) {
@@ -1359,7 +1388,8 @@ public class ProtoCodec {
 
   private static CreateNamespaceAction decodeCreateNamespace(byte[] bytes) throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
-    int id = 0, version = 0, parentId = 0, parentVersion = 0;
+    int id = 0, version = 0, parentId = 0, parentRead = 0;
+    boolean byName = false; // the oneof's last member read; neither: a version of 0
     String name = "";
 
     while (in.available() > 0) {
@@ -1376,7 +1406,12 @@ public class ProtoCodec {
           parentId = readVarint(in);
           break;
         case CREATE_NS_PARENT_VERSION:
-          parentVersion = readVarint(in);
+          parentRead = readVarint(in);
+          byName = false;
+          break;
+        case CREATE_NS_PARENT_REMOVALS:
+          parentRead = readVarint(in);
+          byName = true;
           break;
         case CREATE_NS_NAME:
           name = readString(in);
@@ -1385,7 +1420,7 @@ public class ProtoCodec {
           skipField(in, tag & 0x7);
       }
     }
-    return new CreateNamespaceAction(id, version, parentId, parentVersion, name);
+    return new CreateNamespaceAction(id, version, parentId, byName, parentRead, name);
   }
 
   private static DropNamespaceAction decodeDropNamespace(byte[] bytes) throws IOException {
@@ -1465,6 +1500,7 @@ public class ProtoCodec {
   private static CreateTableAction decodeCreateTable(byte[] bytes) throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
     int id = 0, version = 0, nsId = 0, nsVersion = 0;
+    boolean byName = false; // nsVersion is the namespace's removals; neither member: version 0
     String name = "", metadataLocation = "";
 
     while (in.available() > 0) {
@@ -1482,6 +1518,11 @@ public class ProtoCodec {
           break;
         case CREATE_TBL_NS_VERSION:
           nsVersion = readVarint(in);
+          byName = false;
+          break;
+        case CREATE_TBL_NS_REMOVALS:
+          nsVersion = readVarint(in);
+          byName = true;
           break;
         case CREATE_TBL_NAME:
           name = readString(in);
@@ -1493,7 +1534,7 @@ public class ProtoCodec {
           skipField(in, tag & 0x7);
       }
     }
-    return new CreateTableAction(id, version, nsId, nsVersion, name, metadataLocation);
+    return new CreateTableAction(id, version, nsId, byName, nsVersion, name, metadataLocation);
   }
 
   private static DropTableAction decodeDropTable(byte[] bytes) throws IOException {
@@ -1570,6 +1611,7 @@ public class ProtoCodec {
   private static CreateTableInlineAction decodeCreateTableInline(byte[] bytes) throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
     int id = 0, version = 0, nsId = 0, nsVersion = 0;
+    boolean byName = false; // nsVersion is the namespace's removals; neither member: version 0
     String name = "";
     byte[] metadata = new byte[0];
     Byte metadataCodec = null;
@@ -1590,6 +1632,11 @@ public class ProtoCodec {
           break;
         case CREATE_INLINE_TBL_NS_VERSION:
           nsVersion = readVarint(in);
+          byName = false;
+          break;
+        case CREATE_INLINE_TBL_NS_REMOVALS:
+          nsVersion = readVarint(in);
+          byName = true;
           break;
         case CREATE_INLINE_TBL_NAME:
           name = readString(in);
@@ -1611,7 +1658,7 @@ public class ProtoCodec {
         metadataCodec != null,
         "CreateTableInline action missing required codec tag (table %s)", id);
     return new CreateTableInlineAction(
-        id, version, nsId, nsVersion, name, metadata, metadataCodec, deltaBytes);
+        id, version, nsId, byName, nsVersion, name, metadata, metadataCodec, deltaBytes);
   }
 
   private static UpdateTableInlineAction decodeUpdateTableInline(byte[] bytes) throws IOException {
@@ -1742,6 +1789,7 @@ public class ProtoCodec {
   private static RenameTableAction decodeRenameTable(byte[] bytes) throws IOException {
     ByteArrayInputStream in = new ByteArrayInputStream(bytes);
     int id = 0, version = 0, newNsId = 0, newNsVersion = 0;
+    boolean byName = false; // newNsVersion is the namespace's removals; neither member: version 0
     String newName = "";
 
     while (in.available() > 0) {
@@ -1759,6 +1807,11 @@ public class ProtoCodec {
           break;
         case RENAME_TBL_NEW_NS_VERSION:
           newNsVersion = readVarint(in);
+          byName = false;
+          break;
+        case RENAME_TBL_NEW_NS_REMOVALS:
+          newNsVersion = readVarint(in);
+          byName = true;
           break;
         case RENAME_TBL_NEW_NAME:
           newName = readString(in);
@@ -1767,7 +1820,7 @@ public class ProtoCodec {
           skipField(in, tag & 0x7);
       }
     }
-    return new RenameTableAction(id, version, newNsId, newNsVersion, newName);
+    return new RenameTableAction(id, version, newNsId, byName, newNsVersion, newName);
   }
 
   // ============================================================
@@ -2434,19 +2487,81 @@ public class ProtoCodec {
     }
   }
 
+  /**
+   * Why an action that binds {@code name} in namespace {@code nsId} (a table's name, or with
+   * {@code table} false a child namespace's) does not hold on {@code builder}, by the condition
+   * its writer sent (catalog.proto's oneof of the two, {@code fileio.catalog.create.condition}),
+   * or null if it holds:
+   *
+   * <ul>
+   *   <li>by the namespace's version ({@code byName} false): the namespace is at {@code read}, the
+   *       version its writer read, which any change there moves;
+   *   <li>by name: the namespace exists, its removals are {@code read}, those its writer read, and
+   *       the name is free. Stable (S2): namespace ids are never reused, removals only grow, and a
+   *       name is freed only by an action that adds to them, so once this fails it fails on every
+   *       later state.
+   * </ul>
+   *
+   * <p>A {@code read} of -1 is a namespace this record creates (late-bound, a negative id), which
+   * has nothing to check. By name, a concrete namespace with -1, or a late-bound one with a count,
+   * is malformed, and never holds: skipping the count would let a name freed later bind again.
+   */
+  static String bindingProblem(CatalogState.Builder builder, int nsId, boolean byName, int read,
+      boolean table, String name) {
+    if (!byName) {
+      return read < 0 || builder.namespaceVersion(nsId) == read ? null : "namespace: version";
+    }
+    if (nsId < 0 || read < 0) {
+      return nsId < 0 && read == -1 ? null : "name: malformed";
+    }
+    if (builder.namespaceEntry(nsId) == null) {
+      return "name: namespace gone";
+    }
+    if (builder.namespaceRemovals(nsId) != read) {
+      return "name: a name freed since";
+    }
+    if (table ? builder.tableNameTaken(nsId, name) : builder.namespaceNameTaken(nsId, name)) {
+      return "name: taken";
+    }
+    return null;
+  }
+
+  /**
+   * Creates a namespace under {@code parentId}, by the condition its writer sent ({@link
+   * #bindingProblem}): the parent's version as read, or its removals as read and the name free.
+   */
   public static class CreateNamespaceAction implements Action {
     final int id;
     final int version;
     final int parentId;
+    /** By name: the parent's removals as read; else its version. -1: late-bound. */
+    final boolean byName;
     final int parentVersion;
+    final int parentRemovals;
     final String name;
 
+    /** A create conditioned on its parent's version, {@code parentVersion}. */
     public CreateNamespaceAction(int id, int version, int parentId, int parentVersion, String name) {
+      this(id, version, parentId, false, parentVersion, name);
+    }
+
+    /**
+     * A create conditioned on {@code parentRead}: the parent's removals as read if {@code
+     * byName}, else its version.
+     */
+    public CreateNamespaceAction(
+        int id, int version, int parentId, boolean byName, int parentRead, String name) {
       this.id = id;
       this.version = version;
       this.parentId = parentId;
-      this.parentVersion = parentVersion;
+      this.byName = byName;
+      this.parentVersion = byName ? 0 : parentRead;
+      this.parentRemovals = byName ? parentRead : 0;
       this.name = name;
+    }
+
+    private int parentRead() {
+      return byName ? parentRemovals : parentVersion;
     }
 
     @Override
@@ -2454,13 +2569,15 @@ public class ProtoCodec {
       if (id == CatalogState.ROOT_ID) {
         return false;  // the root row exists in every catalog; never replace it
       }
-      // Parent version must match (skipped when the parent is late-bound).
-      // The root is versioned like any other parent.
-      int currentParentVersion = builder.namespaceVersion(parentId);
-      if (parentVersion >= 0 && currentParentVersion != parentVersion) {
-        return false;
-      }
-      return true;
+      // The root is a parent like any other
+      return bindingProblem(builder, parentId, byName, parentRead(), false, name) == null;
+    }
+
+    @Override
+    public String explain(CatalogState.Builder builder) {
+      String problem = id == CatalogState.ROOT_ID || !byName
+          ? null : bindingProblem(builder, parentId, true, parentRemovals, false, name);
+      return problem != null ? problem : Action.super.explain(builder);
     }
 
     @Override
@@ -2468,7 +2585,7 @@ public class ProtoCodec {
       // Resolve the parent first so a record naming itself as parent is unbound.
       int boundParentId = ids.namespace(parentId);
       return new CreateNamespaceAction(
-          ids.defineNamespace(id), version, boundParentId, parentVersion, name);
+          ids.defineNamespace(id), version, boundParentId, byName, parentRead(), name);
     }
 
     @Override
@@ -2502,11 +2619,13 @@ public class ProtoCodec {
     @Override
     public void apply(CatalogState.Builder builder) {
       // Capture parent before removing so we can bump the parent's version
-      // (dropping a child mutates the parent's children set).
+      // (dropping a child mutates the parent's children set), and count the
+      // name it frees there.
       CatalogState.NsEntry entry = builder.namespaceEntry(id);
       int parentId = entry != null ? entry.parentId : 0;
       builder.removeNamespace(id);
       builder.bumpNamespaceVersion(parentId);
+      builder.bumpNamespaceRemovals(parentId);
     }
   }
 
@@ -2576,40 +2695,65 @@ public class ProtoCodec {
     }
   }
 
+  /**
+   * Creates a table with a metadata file in {@code namespaceId}, by the condition its writer sent
+   * ({@link #bindingProblem}): the namespace's version as read, or its removals as read and the
+   * name free.
+   */
   public static class CreateTableAction implements Action {
     final int id;
     final int version;
     final int namespaceId;
+    /** By name: the namespace's removals as read; else its version. -1: late-bound. */
+    final boolean byName;
     final int namespaceVersion;
+    final int namespaceRemovals;
     final String name;
     final String metadataLocation;
 
+    /** A create conditioned on its namespace's version, {@code namespaceVersion}. */
     public CreateTableAction(int id, int version, int namespaceId, int namespaceVersion,
                              String name, String metadataLocation) {
+      this(id, version, namespaceId, false, namespaceVersion, name, metadataLocation);
+    }
+
+    /**
+     * A create conditioned on {@code namespaceRead}: the namespace's removals as read if {@code
+     * byName}, else its version.
+     */
+    public CreateTableAction(int id, int version, int namespaceId, boolean byName,
+        int namespaceRead, String name, String metadataLocation) {
       this.id = id;
       this.version = version;
       this.namespaceId = namespaceId;
-      this.namespaceVersion = namespaceVersion;
+      this.byName = byName;
+      this.namespaceVersion = byName ? 0 : namespaceRead;
+      this.namespaceRemovals = byName ? namespaceRead : 0;
       this.name = name;
       this.metadataLocation = metadataLocation;
     }
 
+    private int namespaceRead() {
+      return byName ? namespaceRemovals : namespaceVersion;
+    }
+
     @Override
     public boolean verify(CatalogState.Builder builder) {
-      if (namespaceVersion >= 0) {
-        int currentNsVersion = builder.namespaceVersion(namespaceId);
-        if (currentNsVersion != namespaceVersion) {
-          return false;
-        }
-      }
-      return true;
+      return bindingProblem(builder, namespaceId, byName, namespaceRead(), true, name) == null;
+    }
+
+    @Override
+    public String explain(CatalogState.Builder builder) {
+      String problem = byName
+          ? bindingProblem(builder, namespaceId, true, namespaceRemovals, true, name) : null;
+      return problem != null ? problem : Action.super.explain(builder);
     }
 
     @Override
     public Action bind(IdBinding ids) {
       int boundNamespaceId = ids.namespace(namespaceId);
-      return new CreateTableAction(
-          ids.defineTable(id), version, boundNamespaceId, namespaceVersion, name, metadataLocation);
+      return new CreateTableAction(ids.defineTable(id), version, boundNamespaceId, byName,
+          namespaceRead(), name, metadataLocation);
     }
 
     @Override
@@ -2639,11 +2783,13 @@ public class ProtoCodec {
     @Override
     public void apply(CatalogState.Builder builder) {
       // Capture parent before removing so we can bump the parent's version
-      // (dropping a table mutates the parent's children set).
+      // (dropping a table mutates the parent's children set), and count the
+      // name it frees there.
       CatalogState.TblEntry entry = builder.tableEntry(id);
       int parentNsId = entry != null ? entry.namespaceId : 0;
       builder.removeTable(id);
       builder.bumpNamespaceVersion(parentNsId);
+      builder.bumpNamespaceRemovals(parentNsId);
     }
   }
 
@@ -3158,14 +3304,17 @@ public class ProtoCodec {
   }
 
   /**
-   * Creates an inline table (metadata stored in catalog, not external file).
-   * Verification: namespace version must match (same as CreateTable).
+   * Creates an inline table (metadata stored in catalog, not external file), by the condition its
+   * writer sent, as {@link CreateTableAction}.
    */
   public static class CreateTableInlineAction implements Action {
     final int id;
     final int version;
     final int namespaceId;
+    /** By name: the namespace's removals as read; else its version. -1: late-bound. */
+    final boolean byName;
     final int namespaceVersion;
+    final int namespaceRemovals;
     final String name;
     final byte[] metadata;
     /** Codec used to encode {@link #metadata}. */
@@ -3190,33 +3339,51 @@ public class ProtoCodec {
     public CreateTableInlineAction(
         int id, int version, int namespaceId, int namespaceVersion,
         String name, byte[] metadata, byte metadataCodec, byte[] deltaBytes) {
+      this(id, version, namespaceId, false, namespaceVersion, name, metadata, metadataCodec,
+          deltaBytes);
+    }
+
+    /**
+     * A create conditioned on {@code namespaceRead}: the namespace's removals as read if {@code
+     * byName}, else its version.
+     */
+    public CreateTableInlineAction(
+        int id, int version, int namespaceId, boolean byName, int namespaceRead,
+        String name, byte[] metadata, byte metadataCodec, byte[] deltaBytes) {
       this.id = id;
       this.version = version;
       this.namespaceId = namespaceId;
-      this.namespaceVersion = namespaceVersion;
+      this.byName = byName;
+      this.namespaceVersion = byName ? 0 : namespaceRead;
+      this.namespaceRemovals = byName ? namespaceRead : 0;
       this.name = name;
       this.metadata = metadata;
       this.metadataCodec = metadataCodec;
       this.deltaBytes = deltaBytes;
     }
 
+    private int namespaceRead() {
+      return byName ? namespaceRemovals : namespaceVersion;
+    }
+
     @Override
     public boolean verify(CatalogState.Builder builder) {
-      if (namespaceVersion >= 0) {
-        int currentNsVersion = builder.namespaceVersion(namespaceId);
-        if (currentNsVersion != namespaceVersion) {
-          return false;
-        }
-      }
-      return true;
+      return bindingProblem(builder, namespaceId, byName, namespaceRead(), true, name) == null;
+    }
+
+    @Override
+    public String explain(CatalogState.Builder builder) {
+      String problem = byName
+          ? bindingProblem(builder, namespaceId, true, namespaceRemovals, true, name) : null;
+      return problem != null ? problem : Action.super.explain(builder);
     }
 
     @Override
     public Action bind(IdBinding ids) {
       int boundNamespaceId = ids.namespace(namespaceId);
       return new CreateTableInlineAction(
-          ids.defineTable(id), version, boundNamespaceId, namespaceVersion, name, metadata,
-          metadataCodec, deltaBytes);
+          ids.defineTable(id), version, boundNamespaceId, byName, namespaceRead(), name,
+          metadata, metadataCodec, deltaBytes);
     }
 
     @Override
@@ -3246,29 +3413,51 @@ public class ProtoCodec {
    * manifest refs, inline TM bytes) is id-keyed and follows by construction.
    *
    * <p>Verification: source {@code tbl_v} must match (catches concurrent drop /
-   * update / rename of the same id). When {@code newNamespaceVersion >= 0}, the
-   * destination namespace's version must match — caller passes {@code -1} to
-   * skip the check when the destination ns was created in this same transaction
-   * (late-bind), mirroring {@link CreateTableAction}.
+   * update / rename of the same id), and the new name binds as a create's does
+   * ({@link #bindingProblem}), by the condition its writer sent: the destination
+   * namespace's version as read, or its removals as read and the name free;
+   * {@code -1} when the destination was created in this same transaction
+   * (late-bound), mirroring {@link CreateTableAction}.
    *
    * <p>Apply bumps the source and destination namespaces' children-set version,
-   * matching the rule for {@link CreateTableAction} / {@link DropTableAction}.
-   * See SPEC_TM.md "Rename" and design.md "Operation × Operation Conflict Matrix".
+   * matching the rule for {@link CreateTableAction} / {@link DropTableAction}, and
+   * counts the name it frees in the source namespace (its removals), whichever
+   * namespace it moves to. See SPEC_TM.md "Rename" and design.md "Operation ×
+   * Operation Conflict Matrix".
    */
   public static class RenameTableAction implements Action {
     final int id;
     final int version;
     final int newNamespaceId;
+    /** By name: the destination's removals as read; else its version. -1: late-bound. */
+    final boolean byName;
     final int newNamespaceVersion;
+    final int newNamespaceRemovals;
     final String newName;
 
+    /** A rename conditioned on its destination's version, {@code newNamespaceVersion}. */
     public RenameTableAction(
         int id, int version, int newNamespaceId, int newNamespaceVersion, String newName) {
+      this(id, version, newNamespaceId, false, newNamespaceVersion, newName);
+    }
+
+    /**
+     * A rename conditioned on {@code newNamespaceRead}: the destination's removals as read if
+     * {@code byName}, else its version.
+     */
+    public RenameTableAction(int id, int version, int newNamespaceId, boolean byName,
+        int newNamespaceRead, String newName) {
       this.id = id;
       this.version = version;
       this.newNamespaceId = newNamespaceId;
-      this.newNamespaceVersion = newNamespaceVersion;
+      this.byName = byName;
+      this.newNamespaceVersion = byName ? 0 : newNamespaceRead;
+      this.newNamespaceRemovals = byName ? newNamespaceRead : 0;
       this.newName = newName;
+    }
+
+    private int newNamespaceRead() {
+      return byName ? newNamespaceRemovals : newNamespaceVersion;
     }
 
     @Override
@@ -3279,22 +3468,24 @@ public class ProtoCodec {
       if (currentVersion != version) {
         return false;
       }
-      // Destination ns_v must match (when not late-bound). Catches a concurrent
-      // CreateTable / DropTable / RenameTable into the same destination ns —
-      // any of those bumps the parent ns's children-set version.
-      if (newNamespaceVersion >= 0) {
-        int currentNsVersion = builder.namespaceVersion(newNamespaceId);
-        if (currentNsVersion != newNamespaceVersion) {
-          return false;
-        }
-      }
-      return true;
+      // The new name binds as a create's: by the destination's version (any
+      // CreateTable / DropTable / RenameTable there bumps it), or by name.
+      return bindingProblem(
+          builder, newNamespaceId, byName, newNamespaceRead(), true, newName) == null;
+    }
+
+    @Override
+    public String explain(CatalogState.Builder builder) {
+      String problem = byName && builder.tableVersion(id) == version
+          ? bindingProblem(builder, newNamespaceId, true, newNamespaceRemovals, true, newName)
+          : null;
+      return problem != null ? problem : Action.super.explain(builder);
     }
 
     @Override
     public Action bind(IdBinding ids) {
       return new RenameTableAction(
-          id, version, ids.namespace(newNamespaceId), newNamespaceVersion, newName);
+          id, version, ids.namespace(newNamespaceId), byName, newNamespaceRead(), newName);
     }
 
     @Override
@@ -3308,8 +3499,10 @@ public class ProtoCodec {
           TableAction.of(TableAction.Kind.RENAME, id, version), before, builder);
       // Renaming mutates the source ns's children set (table left) and the
       // destination ns's children set (table arrived). Bump both, exactly like
-      // DropTable + CreateTable would have.
+      // DropTable + CreateTable would have, and count the name it frees in the
+      // source, even when the destination is the same namespace.
       builder.bumpNamespaceVersion(oldNsId);
+      builder.bumpNamespaceRemovals(oldNsId);
       if (newNamespaceId != oldNsId) {
         builder.bumpNamespaceVersion(newNamespaceId);
       }

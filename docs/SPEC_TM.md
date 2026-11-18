@@ -157,7 +157,10 @@ message CreateTableInline {
   int32  id                = 1;   // late-bound (negative)
   int32  version           = 2;   // the new table's version (1)
   int32  namespace_id      = 3;   // negative if created in this transaction
-  int32  namespace_version = 4;   // must match; -1 if late-bound
+  oneof namespace_condition {     // as CreateTable's (SPEC.md)
+    int32 namespace_version  = 4; // must match; -1 if late-bound
+    int32 namespace_removals = 9; // must match, and the name free; -1 if late-bound
+  }
   string name              = 5;
   bytes  metadata          = 6;   // codec-encoded full TableMetadata
   InlineMetadataCodec metadata_codec = 7;  // required, 0 (gzip) included
@@ -768,11 +771,13 @@ state is copied across, and no migration can leak it.
 Implementation: `FileIOCatalog.renameTable` calls
 `format.from(catalogFile).renameTable(from, to).commit(io)`. Pointer-mode
 and inline (TM, TM+ML) tables all take the same path. The wire action is
-`RenameTable(id, version, new_namespace_id, new_namespace_version, new_name)`;
-on apply it bumps the source and destination namespaces' children-set
-versions, exactly like `DropTable` + `CreateTable` would have. Conflict
-semantics fall out of the design.md operation × operation matrix without
-new fields — see entry **RT'** there.
+`RenameTable(id, version, new_namespace_id, new_namespace_version |
+new_namespace_removals, new_name)`, its new name binding as a create's does
+(SPEC.md §"Action Verification Rules"); on apply it bumps the source and
+destination namespaces' children-set versions, exactly like `DropTable` +
+`CreateTable` would have, and the source namespace's removals, for the name
+it frees there. Conflict semantics fall out of the design.md operation ×
+operation matrix — see entry **RT'** there.
 
 ## Sealed snapshot blocks
 

@@ -99,7 +99,9 @@ import org.intentlog.wire.LogEnvelope;
  * command may also preempt the one before it: it runs to completion just before one of that
  * operation's reads of the catalog or its first conditional write, so the two race. Each writer
  * has its own catalog mode (append / CAS / compaction, pointer / inline TM / inline ML), or all
- * writers share one. A small limit on inline updates moves tables out of inline storage and back:
+ * writers share one, and binds the names it creates by name or by the namespace's version, as
+ * drawn ({@code fileio.catalog.create.condition}). A small limit on inline updates moves tables
+ * out of inline storage and back:
  * a big property evicts a table to a metadata file, and a later update that fits in full returns
  * it.
  *
@@ -209,13 +211,14 @@ class TestCatalogFaultProperties {
       @ForAll @IntRange(min = 0, max = 7) int pagingWriters,
       @ForAll @IntRange(min = 0, max = 7) int wholeReaders,
       @ForAll @IntRange(min = 0, max = 7) int fusedWriters,
+      @ForAll @IntRange(min = 0, max = 7) int namespaceWriters,
       @ForAll("clockOffsets") List<Long> clockOffsets,
       @ForAll("segmentLimits") int segmentLimit,
       @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
     new Run(onLog(log, modes.subList(0, writers)), maxUpdateSize, false, strictVersions,
         reads, recordingReads, gzipWriters, gcWriters, pagingWriters, wholeReaders, fusedWriters,
-        clockOffsets,
+        namespaceWriters, clockOffsets,
         segmentLimit, encoding)
         .execute(schedule);
   }
@@ -234,13 +237,14 @@ class TestCatalogFaultProperties {
       @ForAll @IntRange(min = 0, max = 7) int pagingWriters,
       @ForAll @IntRange(min = 0, max = 7) int wholeReaders,
       @ForAll @IntRange(min = 0, max = 7) int fusedWriters,
+      @ForAll @IntRange(min = 0, max = 7) int namespaceWriters,
       @ForAll("clockOffsets") List<Long> clockOffsets,
       @ForAll("segmentLimits") int segmentLimit,
       @ForAll("encodings") String encoding,
       @ForAll("schedules") List<Cmd> schedule) {
     new Run(onLog(log, modes.subList(0, writers)), maxUpdateSize, true, strictVersions,
         reads, recordingReads, gzipWriters, gcWriters, pagingWriters, wholeReaders, fusedWriters,
-        clockOffsets,
+        namespaceWriters, clockOffsets,
         segmentLimit, encoding)
         .execute(schedule);
   }
@@ -855,8 +859,10 @@ class TestCatalogFaultProperties {
      * its own id but the newest), if bit {@code i} of {@code pagingWriters} is set, and its clock is
      * off by {@code clockOffsets.get(i)} ms. Writer {@code i} compacts with its commits past the
      * commit knobs, replacing the catalog instead of appending, if bit {@code i} of {@code
-     * fusedWriters} is set, else after them, at its own point past the knobs. With a {@code
-     * segmentLimit}, the catalog object holds
+     * fusedWriters} is set, else after them, at its own point past the knobs. Writer {@code i}
+     * binds the names it creates by the namespace's version ({@code
+     * fileio.catalog.create.condition} namespace) if bit {@code i} of {@code namespaceWriters} is
+     * set, else by name. With a {@code segmentLimit}, the catalog object holds
      * at most that many writes, and an append past it fails (Bug 66); on Append Blobs, each
      * segment holds at most that many blocks, its record limit K, else Azure's 50,000 with K
      * {@link #AZURE_SEGMENT_RECORDS}.
@@ -864,7 +870,8 @@ class TestCatalogFaultProperties {
     Run(List<LocalCatalogMode> modes, int maxUpdateSize, boolean faults, boolean strictVersions,
         InMemoryAtomicFileIO.ReadMode reads, boolean recordingReads, int gzipWriters,
         int gcWriters, int pagingWriters,
-        int wholeReaders, int fusedWriters, List<Long> clockOffsets, int segmentLimit,
+        int wholeReaders, int fusedWriters, int namespaceWriters, List<Long> clockOffsets,
+        int segmentLimit,
         String encoding) {
       this.maxUpdateSize = maxUpdateSize;
       this.faults = faults;
@@ -915,6 +922,9 @@ class TestCatalogFaultProperties {
         if ((fusedWriters >> i & 1) == 1) { // a commit past the limits replaces the catalog
           writerProperties.put(LogCatalogProperties.COMPACT_AFTER_COMMIT, "false");
         }
+        if ((namespaceWriters >> i & 1) == 1) { // its creates bind by the namespace's version
+          writerProperties.put(LogCatalogProperties.CREATE_CONDITION, "namespace");
+        }
         long offset = clockOffsets.get(i);
         // Each writer compacts after its commits at its own point past the limits: writer 0 at
         // them, the others 0.4 and 0.8 of the limits further on
@@ -936,17 +946,20 @@ class TestCatalogFaultProperties {
       this.model = actual();
       trace.append(String.format(
           "modes %s, max update size %d%s, reads %s, gzip writers %s, gc writers %s,"
-              + " paging writers %s, clocks off by %s ms, segment limit %d%nseed: %s%n",
+              + " paging writers %s, writers creating by namespace %s, clocks off by %s ms,"
+              + " segment limit %d%nseed: %s%n",
           modes, maxUpdateSize, strictVersions ? ", strict versions" : "", reads,
           Integer.toBinaryString(gzipWriters), Integer.toBinaryString(gcWriters),
-          Integer.toBinaryString(pagingWriters), clockOffsets.subList(0, modes.size()),
-          segmentLimit, model));
+          Integer.toBinaryString(pagingWriters), Integer.toBinaryString(namespaceWriters),
+          clockOffsets.subList(0, modes.size()), segmentLimit, model));
       Statistics.label("gc writers")
           .collect(Integer.bitCount(gcWriters & ((1 << modes.size()) - 1)));
       Statistics.label("whole readers")
           .collect(Integer.bitCount(wholeReaders & ((1 << modes.size()) - 1)));
       Statistics.label("fused writers")
           .collect(Integer.bitCount(fusedWriters & ((1 << modes.size()) - 1)));
+      Statistics.label("writers creating by namespace")
+          .collect(Integer.bitCount(namespaceWriters & ((1 << modes.size()) - 1)));
       Statistics.label("paging writers")
           .collect(Integer.bitCount(pagingWriters & ((1 << modes.size()) - 1)));
       Statistics.label("clocks off")
@@ -2133,7 +2146,8 @@ class TestCatalogFaultProperties {
       } catch (CommitFailedException | ValidationException | AlreadyExistsException
           | NoSuchNamespaceException | NamespaceNotEmptyException
           | org.apache.iceberg.exceptions.ServiceUnavailableException e) {
-        // ServiceUnavailableException: a catalog operation whose attempts all conflicted (Bug 107)
+        // ServiceUnavailableException: a catalog operation whose attempts all conflicted (Bug 107
+        // (create conflict reported as exists))
         outcome = Outcome.REJECTED;
         reason = e.getClass().getSimpleName() + ": " + firstLine(e);
       } catch (NoSuchTableException e) {

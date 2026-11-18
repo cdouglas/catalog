@@ -93,6 +93,17 @@ catalog does:
 | rename table | source present (same uuid, if read), target absent, target namespace present |
 | `newTransaction()` of a transaction's table | stages into the catalog transaction |
 
+FileIOCatalog checks a name a change binds (a table create, a rename's target, a namespace create)
+by the catalog's `fileio.catalog.create.condition`, against the read its commit stages on. By
+`name`, the default, it checks the table's condition as stated, and one more: no name in the
+namespace was freed (a table dropped or renamed out of it, a child namespace dropped) between that
+read and the point the commit takes effect. A rejection then stays one, so a late copy of the
+record never applies once the name is free again (SPEC.md, "Action Verification Rules"); a
+transaction whose read a sibling's drop overtook fails, as one that conflicts does. By
+`namespace`, it checks that the namespace's version is the one that read held, which any change
+there moves (a sibling created or dropped, a property set): a stricter condition than the table
+states, under which creates in one namespace land one at a time.
+
 The transaction sees its own changes: a dropped table no longer loads, a renamed one loads under its
 new name only, a created one loads and takes updates, listings include them. The commit carries the
 transaction's net effect against the catalog as the transaction found it, which is what

@@ -561,9 +561,14 @@ encodings (`fuzz/mutants`). `TestConflictMatrix` holds the matrix below.
 
 ## Operation × Operation Conflict Matrix
 
-The matrix below falls out of I2 (action versions are bumped on apply)
-and the version-checking rules in [SPEC.md](SPEC.md) §"Action Verification
-Rules". It is the *enforced* rule, backed by `TestProtoActions$ConflictTests`.
+The matrices below fall out of I2 (action versions are bumped on apply)
+and the rules in [SPEC.md](SPEC.md) §"Action Verification Rules". They are
+the *enforced* rules, backed by `TestProtoActions$ConflictTests` (by the
+namespace's version) and `TestProtoActions$ByNameConflictTests` (by name).
+An action that binds a name (CN↓, CT, CTI, RT') binds it by the condition
+its writer sent (`fileio.catalog.create.condition`): the first matrix is
+the `namespace` condition's, and every other action's; the second gives
+the binding actions' columns under `name`, the default.
 
 Each row is the **first** action applied (A); each column is a **second**
 action (B) whose preconditions were captured against the pre-A state and
@@ -585,7 +590,7 @@ the same parent.
 | **RP**   | ns v | ns v | ns v | ns v | ns v | ns v | ✓     | ✓     | ns v  | ✓     |
 | **CT**   | ns v | ns v | ns v | ns v | ns v | ns v | ✓     | ✓     | ns v  | ✓     |
 | **CTI**  | ns v | ns v | ns v | ns v | ns v | ns v | ✓     | ✓     | ns v  | ✓     |
-| **DT**   | ✓    | —    | ✓    | ✓    | ✓    | ✓    | —     | tbl v | tbl v | tbl v |
+| **DT**   | ns v | —    | ns v | ns v | ns v | ns v | —     | tbl v | tbl v | tbl v |
 | **UT**   | ✓    | —    | ✓    | ✓    | ✓    | ✓    | tbl v | tbl v | tbl v | tbl v |
 | **RT'**  | ns v | —    | ns v | ns v | ns v | ns v | tbl v | tbl v | tbl v | tbl v |
 | **RT**   | ✓    | ✓    | ✓    | ✓    | ✓    | ✓    | tbl v | tbl v | tbl v | ✓     |
@@ -599,9 +604,39 @@ Legend: **CN↓** `CreateNamespace` (child), **DN** `DropNamespace`,
 "tbl v" = table version conflicts. A `UT` or `RT` cell of the same table
 is the `lamport` encoding's; the others relax `UT` × `UT` (below).
 
+Under `name`, B in the four binding columns needs its namespace to exist
+with the removals it read, and its name free; A's apply is the same under
+either condition (a create by name still bumps the namespace's version), so
+the rows of a create by name, and the columns of every action that binds no
+name, are those above. Cells, B binding a name other than A's:
+
+|          | CN↓  | CT       | CTI      | RT'      |
+|----------|------|----------|----------|----------|
+| **CN↓**  | ✓    | ✓        | ✓        | ✓        |
+| **DN**   | gone | gone     | gone     | gone     |
+| **SP**   | ✓    | ✓        | ✓        | ✓        |
+| **RP**   | ✓    | ✓        | ✓        | ✓        |
+| **CT**   | ✓    | ✓        | ✓        | ✓        |
+| **CTI**  | ✓    | ✓        | ✓        | ✓        |
+| **DT**   | rem  | rem      | rem      | rem      |
+| **UT**   | ✓    | ✓        | ✓        | ✓        |
+| **RT'**  | rem  | rem      | rem      | rem      |
+| **RT**   | ✓    | ✓        | ✓        | ✓        |
+
+"gone" = the namespace B binds in was dropped; "rem" = A freed a name in
+that namespace (a drop, a rename out of its name, also within the
+namespace, or a child namespace's drop: DN of a child counts in its
+parent), so its removals moved. B binding A's own name conflicts on the
+name ("taken") in the CN↓ row (a namespace) and the CT, CTI and RT' rows (a
+table into it). RT' into the namespace from another frees no name there and
+composes, unless its new name is B's. RT' as B also needs its source table
+at the version it read (tbl v), as above.
+
 What the matrix says:
 
-1. All ns-level mutations under the same parent serialize on `ns v`.
+1. All ns-level mutations under the same parent serialize on `ns v`,
+   but for creates by name: those of different names in one namespace
+   compose, and conflict only with a name freed there since their read.
 2. `DT` and `UT` on the *same* table serialize on `tbl v`. Neither
    conflicts with unrelated ns-level ops except through the parent's
    children-set rule.
@@ -615,8 +650,9 @@ What the matrix says:
    with an update the encoding cannot tell leaves those refs alone (under
    `lamport`, any).
 5. The root is a parent like any other: an ordinary namespace row with
-   id 0, so top-level creates and drops serialize on its version. It
-   cannot be named, created, or dropped (SPEC.md §State Model).
+   id 0, so top-level creates bind their names, and drops serialize, on
+   its version and removals. It cannot be named, created, or dropped
+   (SPEC.md §State Model).
 6. A conflict fails the record, not the operation: Iceberg re-applies a
    table commit on a fresh read, and FileIOCatalog re-applies a catalog
    operation -- a namespace create, drop or property change, a table
@@ -780,9 +816,15 @@ the log it landed in, and compacts after the commit
    also drops what it references is rejected (Bug 14).
 4. `apply` must bump the version of every entity whose state it mutates,
    including the parent namespace if it changes the namespace's
-   children set (I2).
-5. Add an `apply()` row to the conflict matrix above and one test in
-   `TestProtoActions$ConflictTests` per cell.
+   children set (I2), and the namespace's removals if it frees a name
+   there. `verify` must be stable (S2): once it fails, it fails on every
+   later state; add the action to
+   `CatalogStateGenerators.writerTransaction` so that N1
+   (`spec/TestVerifyStabilityProperties`) checks it. An action that binds
+   a name binds it by `ProtoCodec.bindingProblem`.
+5. Add an `apply()` row to the conflict matrices above and one test in
+   `TestProtoActions$ConflictTests` per cell (and `$ByNameConflictTests`
+   for a column of the `name` matrix).
 6. Add an idempotency test to `TestProtoActions$IdempotencyTests`:
    replaying the action with a fresh UUID against the post-apply state
    must be rejected.
@@ -920,7 +962,7 @@ classes handle this for you; manual codecs require it as a discipline.
 | File | What it covers |
 |------|----------------|
 | `TestProtoCatalogFormat` | PB codec, replay of catalog files, reader-version gates |
-| `TestProtoActions` | Per-action positive/negative tests, conflict matrix, idempotency, randomized tests, inline tables, manifest-pool round-trip |
+| `TestProtoActions` | Per-action positive/negative tests, conflict matrices (by namespace version, `ConflictTests`; by name, `ByNameConflictTests`), idempotency, randomized tests, inline tables, manifest-pool round-trip |
 | `TestProtoCommitKnobs` | `max.append.count` / `max.append.size` thresholds; `MockIO` |
 | `TestInlineDelta` | Inline TM delta encode/decode/apply, `computeDelta`, ML delta types |
 | `TestInlineManifestEndToEnd` | End-to-end commit→reload across BASELINE / TM_ONLY / TM_ML configs; per-`SnapshotProducer` operation coverage; codec-axis subclass parameterized over `gzip` / `structural` |

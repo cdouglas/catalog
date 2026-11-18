@@ -57,8 +57,8 @@ final class SpecUtils {
             .setNextTableId(pcf.nextTableId());
 
     // The root namespace row (id 0) is not listed by namespaces(); carry its
-    // version so top-level creates verify against the right value.
-    builder.addNamespace(0, 0, "", pcf.namespaceVersion(0));
+    // version and removals so top-level creates verify against the right values.
+    builder.addNamespace(0, 0, "", pcf.namespaceVersion(0), pcf.namespaceRemovals(0));
 
     // Namespaces
     for (Namespace ns : pcf.namespaces()) {
@@ -66,7 +66,7 @@ final class SpecUtils {
       if (nsId == null) continue;
       CatalogState.NsEntry entry = pcf.namespaceEntry(nsId);
       if (entry == null) continue;
-      builder.addNamespace(nsId, entry.parentId, entry.name, entry.version);
+      builder.addNamespace(nsId, entry.parentId, entry.name, entry.version, entry.removals);
 
       Map<String, String> props = pcf.namespaceProperties(ns);
       if (props != null) {

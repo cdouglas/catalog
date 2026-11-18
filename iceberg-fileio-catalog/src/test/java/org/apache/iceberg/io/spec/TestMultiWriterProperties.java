@@ -65,7 +65,8 @@ import org.intentlog.fileio.AtomicFileLog;
  *
  * <p>A generated schedule interleaves, on one thread, the steps of several writers. Each writer
  * reads a snapshot, stages a transaction of namespace, property and table operations against it,
- * and commits. The format's knobs are drawn per schedule, so commits mix appends, CAS and
+ * and commits, binding the names it creates by name or by the namespace's version, as drawn per
+ * writer ({@code fileio.catalog.create.condition}). The format's knobs are drawn per schedule, so commits mix appends, CAS and
  * compaction by count and by size. Every commit that changes the file is checked as one step from
  * the version it replaced ({@code pre}) to the version it wrote ({@code post}). Successive writes
  * chain, so the steps together cover the whole history:
@@ -153,10 +154,12 @@ class TestMultiWriterProperties {
       @ForAll boolean gc,
       @ForAll("segmentLimits") int segmentLimit,
       @ForAll("encodings") String encoding,
-      @ForAll("schedules") List<Cmd> schedule) {
+      @ForAll("schedules") List<Cmd> schedule,
+      @ForAll @IntRange(min = 0, max = 15) int namespaceWriters) {
     new Run(new MultiWriterStorage.File(
         strictVersions, reads, recordingReads, segmentLimit, tailReads), writers,
-        maxAppendCount, appendHeadroom, false, gc, encoding, compactAfter).execute(schedule);
+        maxAppendCount, appendHeadroom, false, gc, encoding, compactAfter, namespaceWriters)
+        .execute(schedule);
   }
 
   @Property(tries = 300)
@@ -172,10 +175,12 @@ class TestMultiWriterProperties {
       @ForAll boolean gc,
       @ForAll("segmentLimits") int segmentLimit,
       @ForAll("encodings") String encoding,
-      @ForAll("schedules") List<Cmd> schedule) {
+      @ForAll("schedules") List<Cmd> schedule,
+      @ForAll @IntRange(min = 0, max = 15) int namespaceWriters) {
     new Run(new MultiWriterStorage.File(
         strictVersions, reads, recordingReads, segmentLimit, tailReads), writers,
-        maxAppendCount, appendHeadroom, true, gc, encoding, compactAfter).execute(schedule);
+        maxAppendCount, appendHeadroom, true, gc, encoding, compactAfter, namespaceWriters)
+        .execute(schedule);
   }
 
   @Property(tries = 300)
@@ -187,10 +192,11 @@ class TestMultiWriterProperties {
       @ForAll boolean tailReads,
       @ForAll boolean gc,
       @ForAll("encodings") String encoding,
-      @ForAll("schedules") List<Cmd> schedule) {
+      @ForAll("schedules") List<Cmd> schedule,
+      @ForAll @IntRange(min = 0, max = 15) int namespaceWriters) {
     new Run(new MultiWriterStorage.Memory(conditional, tailReads), writers, maxAppendCount,
         appendHeadroom,
-        false, gc, encoding, true).execute(schedule);
+        false, gc, encoding, true, namespaceWriters).execute(schedule);
   }
 
   @Property(tries = 300)
@@ -202,10 +208,11 @@ class TestMultiWriterProperties {
       @ForAll boolean tailReads,
       @ForAll boolean gc,
       @ForAll("encodings") String encoding,
-      @ForAll("schedules") List<Cmd> schedule) {
+      @ForAll("schedules") List<Cmd> schedule,
+      @ForAll @IntRange(min = 0, max = 15) int namespaceWriters) {
     new Run(new MultiWriterStorage.Memory(conditional, tailReads), writers, maxAppendCount,
         appendHeadroom,
-        true, gc, encoding, true).execute(schedule);
+        true, gc, encoding, true, namespaceWriters).execute(schedule);
   }
 
   /**
@@ -671,12 +678,15 @@ class TestMultiWriterProperties {
 
   private static final class Writer {
     final int id;
+    // What the names it creates require of their namespaces (fileio.catalog.create.condition)
+    final CatalogMutation.CreateCondition condition;
     Replica<CatalogState> snapshot; // null when idle
     byte[] snapshotBytes;
     List<Op> ops;
 
-    Writer(int id) {
+    Writer(int id, CatalogMutation.CreateCondition condition) {
       this.id = id;
+      this.condition = condition;
     }
   }
 
@@ -762,7 +772,7 @@ class TestMultiWriterProperties {
      * compacts, and its outcome is never unknown for it.
      */
     Run(MultiWriterStorage storage, int writers, int maxAppendCount, long appendHeadroom,
-        boolean faults, boolean gc, String encoding, boolean compactAfter) {
+        boolean faults, boolean gc, String encoding, boolean compactAfter, int namespaceWriters) {
       this.storage = storage;
       this.faults = faults;
       this.gc = gc;
@@ -810,12 +820,18 @@ class TestMultiWriterProperties {
       }
       this.writers = new Writer[writers];
       for (int i = 0; i < writers; i++) {
-        this.writers[i] = new Writer(i);
+        // Writer i binds the names it creates by the namespace's version if bit i is set
+        this.writers[i] = new Writer(i, (namespaceWriters >> i & 1) == 1
+            ? CatalogMutation.CreateCondition.NAMESPACE : CatalogMutation.CreateCondition.NAME);
       }
+      Statistics.label("writers creating by namespace")
+          .collect(Integer.bitCount(namespaceWriters & ((1 << writers) - 1)));
       trace.append(String.format(
-          "log: %s, maxAppendCount=%d maxAppendSize=%d (seed %d bytes)%s, compaction %s%n",
+          "log: %s, maxAppendCount=%d maxAppendSize=%d (seed %d bytes)%s, compaction %s,"
+              + " writers creating by namespace %s%n",
           storage.describe(), maxAppendCount, maxAppendSize, seedLength,
-          gc ? ", retention 0" : "", compactAfter ? "after commits" : "with them"));
+          gc ? ", retention 0" : "", compactAfter ? "after commits" : "with them",
+          Integer.toBinaryString(namespaceWriters & ((1 << writers) - 1))));
       Statistics.label("compaction").collect(compactAfter ? "after commits" : "with them");
       Statistics.label("gc").collect(gc);
       trace.append("seed: ").append(View.of(read().state())).append('\n');
@@ -1111,7 +1127,7 @@ class TestMultiWriterProperties {
       String reason = "";
       try {
         ctx.active = true;
-        mut(w.snapshot, ops).commit(log);
+        mut(w.snapshot, ops, w.condition).commit(log);
         outcome = Outcome.ACKNOWLEDGED;
       } catch (CommitFailedException | AlreadyExistsException | NoSuchTableException e) {
         outcome = Outcome.REJECTED;
@@ -1247,7 +1263,8 @@ class TestMultiWriterProperties {
           invalid);
       InMemoryAtomicFileIO alone = scratch(write.before);
       CatalogLog aloneLog = CatalogTestSupport.log(alone, CATALOG, config);
-      View serial = View.of(mut(aloneLog.read(), ops).commit(aloneLog).state());
+      View serial = View.of(
+          mut(aloneLog.read(), ops, CatalogMutation.CreateCondition.NAME).commit(aloneLog).state());
       check(serial.equals(post), "serial re-execution differs:%n  serial: %s%n  actual: %s",
           serial, post);
       View expected = View.of(pre).copy();
@@ -1290,8 +1307,9 @@ class TestMultiWriterProperties {
       }
     }
 
-    private CatalogMutation mut(Replica<CatalogState> base, List<Op> ops) {
-      CatalogMutation mut = new CatalogMutation(base);
+    private CatalogMutation mut(
+        Replica<CatalogState> base, List<Op> ops, CatalogMutation.CreateCondition condition) {
+      CatalogMutation mut = new CatalogMutation(base, condition);
       ops.forEach(op -> op.stage(mut));
       return mut;
     }
@@ -1299,7 +1317,7 @@ class TestMultiWriterProperties {
     /** Whether {@code ops} stage cleanly on {@code base}: the client-side validity check. */
     private boolean stages(CatalogState base, List<Op> ops) {
       try {
-        mut(CatalogTestSupport.replicaOf(base), ops);
+        mut(CatalogTestSupport.replicaOf(base), ops, CatalogMutation.CreateCondition.NAME);
         return true;
       } catch (AlreadyExistsException
           | NoSuchNamespaceException

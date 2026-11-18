@@ -338,6 +338,12 @@ public class CatalogState {
     return entry != null ? entry.version : -1;
   }
 
+  /** The names namespace {@code nsId} has freed ({@link NsEntry#removals}); -1 if it is gone. */
+  public int namespaceRemovals(int nsId) {
+    NsEntry entry = namespaceById.get(nsId);
+    return entry != null ? entry.removals : -1;
+  }
+
   public NsEntry namespaceEntry(int nsId) {
     return namespaceById.get(nsId);
   }
@@ -580,15 +586,28 @@ public class CatalogState {
   // Entry types
   // ============================================================
 
+  /**
+   * A namespace's row: its parent, name and version, and its removals, the names in it it has
+   * freed: each drop of a table or of a child namespace, and each rename of a table out of its
+   * name, adds one. It only grows, and a name in the namespace is freed only by an action that
+   * adds to it, so a create that found its name taken, or the count past what its writer read,
+   * finds the same on every later state (docs/SPEC.md, "Action Verification Rules").
+   */
   public static class NsEntry {
     public final int parentId;
     public final String name;
     public final int version;
+    public final int removals;
 
     public NsEntry(int parentId, String name, int version) {
+      this(parentId, name, version, 0);
+    }
+
+    public NsEntry(int parentId, String name, int version, int removals) {
       this.parentId = parentId;
       this.name = name;
       this.version = version;
+      this.removals = removals;
     }
   }
 
@@ -673,7 +692,12 @@ public class CatalogState {
     }
 
     public Builder addNamespace(int id, int parentId, String name, int version) {
-      NsEntry entry = new NsEntry(parentId, name, version);
+      return addNamespace(id, parentId, name, version, 0);
+    }
+
+    /** Adds namespace {@code id}, which has freed {@code removals} names ({@link NsEntry}). */
+    public Builder addNamespace(int id, int parentId, String name, int version, int removals) {
+      NsEntry entry = new NsEntry(parentId, name, version, removals);
       namespaceById.put(id, entry);
       // Keep nextNamespaceId monotone: a transaction-replayed CreateNamespaceAction
       // adds an id that wasn't reflected in the (older) checkpoint header, so the
@@ -785,7 +809,7 @@ public class CatalogState {
     public Builder updateNamespaceVersion(int id, int newVersion) {
       NsEntry old = namespaceById.get(id);
       if (old != null) {
-        namespaceById.put(id, new NsEntry(old.parentId, old.name, newVersion));
+        namespaceById.put(id, new NsEntry(old.parentId, old.name, newVersion, old.removals));
       }
       return this;
     }
@@ -798,7 +822,21 @@ public class CatalogState {
     public Builder bumpNamespaceVersion(int id) {
       NsEntry old = namespaceById.get(id);
       if (old != null) {
-        namespaceById.put(id, new NsEntry(old.parentId, old.name, old.version + 1));
+        namespaceById.put(
+            id, new NsEntry(old.parentId, old.name, old.version + 1, old.removals));
+      }
+      return this;
+    }
+
+    /**
+     * Counts a name freed in namespace {@code id} ({@link NsEntry#removals}): a table dropped or
+     * renamed out of its name there, or a child namespace dropped. Called with the version's bump.
+     */
+    public Builder bumpNamespaceRemovals(int id) {
+      NsEntry old = namespaceById.get(id);
+      if (old != null) {
+        namespaceById.put(
+            id, new NsEntry(old.parentId, old.name, old.version, old.removals + 1));
       }
       return this;
     }
@@ -1346,6 +1384,36 @@ public class CatalogState {
     public int namespaceVersion(int nsId) {
       NsEntry entry = namespaceById.get(nsId);
       return entry != null ? entry.version : -1;
+    }
+
+    /** The names namespace {@code nsId} has freed ({@link NsEntry#removals}); -1 if it is gone. */
+    public int namespaceRemovals(int nsId) {
+      NsEntry entry = namespaceById.get(nsId);
+      return entry != null ? entry.removals : -1;
+    }
+
+    /** Whether a table of namespace {@code nsId}, which exists, is named {@code name}. */
+    public boolean tableNameTaken(int nsId, String name) {
+      // The table lookup is kept whole by every change, whatever the namespace lookup's state
+      return tableLookup.containsKey(TableIdentifier.of(buildNamespace(nsId), name));
+    }
+
+    /** Whether a namespace of parent {@code parentId}, which exists, is named {@code name}. */
+    public boolean namespaceNameTaken(int parentId, String name) {
+      if (!lookupsStale) {
+        Namespace parent = buildNamespace(parentId);
+        String[] levels = java.util.Arrays.copyOf(parent.levels(), parent.length() + 1);
+        levels[parent.length()] = name;
+        return namespaceLookup.containsKey(Namespace.of(levels));
+      }
+      // after a namespace was added: by the entries, as a rebuild of the lookup would find it
+      for (Map.Entry<Integer, NsEntry> entry : namespaceById.entrySet()) {
+        if (entry.getKey() != ROOT_ID && entry.getValue().parentId == parentId
+            && entry.getValue().name.equals(name)) {
+          return true;
+        }
+      }
+      return false;
     }
 
     public NsEntry namespaceEntry(int nsId) {

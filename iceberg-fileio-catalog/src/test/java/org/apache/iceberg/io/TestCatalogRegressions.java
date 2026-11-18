@@ -745,18 +745,35 @@ public class TestCatalogRegressions {
 
     @Test
     void appendCreatesUnderRootConflictOnRootVersion() {
-      // Top-level creates serialize on the root's version, as sibling creates
-      // under any other parent do.
+      // Top-level creates by the namespace's version serialize on the root's
+      // version, as sibling creates under any other parent do.
+      CasFileIO io = new CasFileIO();
+      CatalogLog log = log(io, APPEND);
+      Replica<CatalogState> snap = seed(log, "seed");
+      CatalogMutation.CreateCondition byVersion = CatalogMutation.CreateCondition.NAMESPACE;
+
+      new CatalogMutation(snap, byVersion).createNamespace(Namespace.of("x")).commit(log);
+      assertThatThrownBy(() -> new CatalogMutation(snap, byVersion)
+              .createNamespace(Namespace.of("y")).commit(log))
+          .isInstanceOf(CommitFailedException.class);
+
+      assertThat(log.read().state().namespaces())
+          .containsExactlyInAnyOrder(Namespace.of("seed"), Namespace.of("x"));
+    }
+
+    @Test
+    void appendCreatesUnderRootByNameCompose() {
+      // By name, top-level creates of different names compose, as sibling
+      // creates under any other parent do.
       CasFileIO io = new CasFileIO();
       CatalogLog log = log(io, APPEND);
       Replica<CatalogState> snap = seed(log, "seed");
 
       new CatalogMutation(snap).createNamespace(Namespace.of("x")).commit(log);
-      assertThatThrownBy(() -> new CatalogMutation(snap).createNamespace(Namespace.of("y")).commit(log))
-          .isInstanceOf(CommitFailedException.class);
+      new CatalogMutation(snap).createNamespace(Namespace.of("y")).commit(log);
 
       assertThat(log.read().state().namespaces())
-          .containsExactlyInAnyOrder(Namespace.of("seed"), Namespace.of("x"));
+          .containsExactlyInAnyOrder(Namespace.of("seed"), Namespace.of("x"), Namespace.of("y"));
     }
 
     @Test
@@ -6514,7 +6531,8 @@ public class TestCatalogRegressions {
    * exist. A create, and each catalog operation, that keeps losing its race waits between
    * attempts as the commit loop does after a lost race, and once its attempts run out throws
    * ServiceUnavailableException, nothing committed; only a create that finds its table taken by
-   * then reports it existing.
+   * then reports it existing. The creates here bind their names by the namespace's version
+   * ({@code fileio.catalog.create.condition} namespace), under which siblings conflict.
    */
   @Nested
   class CreatesThatKeepLosingToSiblings {
@@ -6522,44 +6540,15 @@ public class TestCatalogRegressions {
     private final TableIdentifier t = TableIdentifier.of(ns, "t");
 
     /**
-     * Eight writers create eight tables in one namespace from threads a latch releases. Each
-     * writer's appends to the shared log wait a while before they are sent (outside the log's
-     * lock), so every writer of a round reads before any of its appends lands, and each round has
-     * one winner: five rounds leave three creates whose attempts ran out.
+     * Eight writers create eight tables in one namespace from threads a latch releases ({@link
+     * #eightCreates}); every round has one winner, so five rounds leave three creates whose
+     * attempts ran out. None may be told its table exists when it does not.
      */
     @Test
     void eightWritersInOneNamespace() throws Exception {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
-      InMemorySharedLog shared = new InMemorySharedLog(WAREHOUSE + "/catalog");
-      List<LogCatalog> catalogs = new ArrayList<>();
-      for (int i = 0; i < 8; i++) {
-        catalogs.add(slowAppends(io, shared, "w" + i));
-      }
-      catalogs.get(0).createNamespace(ns);
-      java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
-      Map<TableIdentifier, Throwable> outcomes = new ConcurrentHashMap<>();
-      List<Thread> threads = new ArrayList<>();
-      for (int i = 0; i < 8; i++) {
-        LogCatalog catalog = catalogs.get(i);
-        TableIdentifier table = TableIdentifier.of(ns, "t" + i);
-        Thread thread = new Thread(() -> {
-          try {
-            start.await();
-            catalog.createTable(table, SCHEMA);
-            outcomes.put(table, new Created());
-          } catch (Throwable e) {
-            outcomes.put(table, e);
-          }
-        });
-        thread.start();
-        threads.add(thread);
-      }
-      start.countDown();
-      for (Thread thread : threads) {
-        thread.join(120_000);
-      }
-      LogCatalog reader = slowAppends(io, shared, "reader");
-      assertThat(outcomes).hasSize(8);
+      Map<TableIdentifier, Throwable> outcomes = eightCreates(io, ns, i -> BY_NAMESPACE);
+      LogCatalog reader = memlogReader(io);
       outcomes.forEach((table, outcome) -> {
         if (outcome instanceof Created) {
           assertThat(reader.tableExists(table)).as("%s, created", table).isTrue();
@@ -6577,9 +6566,9 @@ public class TestCatalogRegressions {
     @ParameterizedTest
     @EnumSource(names = {"MEMLOG", "MEMLOG_TM"})
     void aCreateThatKeepsLosingIsUnavailable(LocalCatalogMode mode) {
-      LogCatalog catalog = memlog(mode);
+      LogCatalog catalog = memlog(mode, BY_NAMESPACE);
       catalog.createNamespace(ns);
-      LogCatalog other = memlog(mode);
+      LogCatalog other = memlog(mode, BY_NAMESPACE);
       int[] siblings = {0};
 
       Throwable thrown = raced(catalog, () -> other.createTable(
@@ -6597,9 +6586,9 @@ public class TestCatalogRegressions {
      */
     @Test
     void aCreateWhoseTableExistsOnceItsAttemptsRunOutReportsIt() {
-      LogCatalog catalog = memlog(LocalCatalogMode.MEMLOG);
+      LogCatalog catalog = memlog(LocalCatalogMode.MEMLOG, BY_NAMESPACE);
       catalog.createNamespace(ns);
-      LogCatalog other = memlog(LocalCatalogMode.MEMLOG);
+      LogCatalog other = memlog(LocalCatalogMode.MEMLOG, BY_NAMESPACE);
       InMemorySharedLog shared = LocalCatalogMode.sharedLog(io, WAREHOUSE + "/catalog-c");
       int[] appends = {0};
       boolean[] inHook = {false};
@@ -6640,8 +6629,8 @@ public class TestCatalogRegressions {
     /** A namespace create that each attempt finds a sibling namespace landed before. */
     @Test
     void aNamespaceCreateThatKeepsLosingIsUnavailable() {
-      LogCatalog catalog = memlog(LocalCatalogMode.MEMLOG);
-      LogCatalog other = memlog(LocalCatalogMode.MEMLOG);
+      LogCatalog catalog = memlog(LocalCatalogMode.MEMLOG, BY_NAMESPACE);
+      LogCatalog other = memlog(LocalCatalogMode.MEMLOG, BY_NAMESPACE);
       int[] siblings = {0};
 
       Throwable thrown = raced(catalog,
@@ -6704,12 +6693,18 @@ public class TestCatalogRegressions {
       assertThat(catalog.tableExists(u)).isFalse();
     }
 
-    private InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+    private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
 
     /** A catalog "c" over this test's store, on its shared log, in {@code mode}. */
     private LogCatalog memlog(LocalCatalogMode mode) {
-      return mode.catalog(io, WAREHOUSE, "c",
-          Map.of(LogCatalogProperties.MAX_APPEND_COUNT, "1000"));
+      return memlog(mode, Map.of());
+    }
+
+    /** As {@link #memlog(LocalCatalogMode)}, with {@code extra} properties. */
+    private LogCatalog memlog(LocalCatalogMode mode, Map<String, String> extra) {
+      Map<String, String> properties = new HashMap<>(extra);
+      properties.put(LogCatalogProperties.MAX_APPEND_COUNT, "1000");
+      return mode.catalog(io, WAREHOUSE, "c", properties);
     }
 
     /**
@@ -6717,51 +6712,316 @@ public class TestCatalogRegressions {
      * its appends to its shared log (and nothing if it returns).
      */
     private Throwable raced(LogCatalog catalog, Runnable change, Runnable operation) {
-      InMemorySharedLog shared = LocalCatalogMode.sharedLog(io, WAREHOUSE + "/catalog-c");
-      boolean[] inHook = {false};
-      shared.intercept(new InMemorySharedLog.Interceptor() {
-        @Override
-        public InMemorySharedLog.WriteFault beforeWrite(
-            InMemorySharedLog.Request request, byte[] payload) {
-          if (request == InMemorySharedLog.Request.APPEND && !inHook[0]) {
-            nested(inHook, change);
-          }
-          return InMemorySharedLog.WriteFault.NONE;
-        }
-      });
-      try {
-        operation.run();
-        return null;
-      } catch (RuntimeException e) {
-        return e;
-      } finally {
-        shared.intercept(null);
-      }
+      return TestCatalogRegressions.raced(io, change, operation);
     }
+  }
 
-    /** Runs {@code change}, another writer's, inside a hook of the log, flagged by {@code inHook}. */
-    private void nested(boolean[] inHook, Runnable change) {
-      inHook[0] = true;
-      try {
-        change.run();
-      } finally {
-        inHook[0] = false;
-      }
+  /**
+   * Creates by name ({@code fileio.catalog.create.condition} name, the default): a create's
+   * record requires its namespace to exist with the removals its writer read and its name free,
+   * so creates of different names in one namespace commit together, while a create whose name was
+   * taken and freed again before its record landed never applies (S2: the commit loop reports a
+   * record rejected after one read, and on a log of blind appends a copy of it may land later).
+   */
+  @Nested
+  class CreatesByName {
+    private final Namespace ns = Namespace.of("ns");
+    private final TableIdentifier t = TableIdentifier.of(ns, "t");
+    private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+
+    /** Eight writers create eight tables in one namespace at once ({@link #eightCreates}). */
+    @Test
+    void eightWritersInOneNamespaceAllCreate() throws Exception {
+      Map<TableIdentifier, Throwable> outcomes = eightCreates(io, ns, i -> Map.of());
+      LogCatalog reader = memlogReader(io);
+      outcomes.forEach((table, outcome) -> {
+        assertThat(outcome).as("%s", table).isInstanceOf(Created.class);
+        assertThat(reader.tableExists(table)).as("%s", table).isTrue();
+      });
     }
 
     /**
-     * A catalog {@code name} over {@code io}, on {@code shared}, whose appends wait 50 ms before
-     * they are sent.
+     * Half the eight writers bind by name and half by the namespace's version: those by name all
+     * create; those by namespace lose to every landing since their read, and may run out of
+     * attempts, but none is told a table that does not exist exists.
      */
-    private LogCatalog slowAppends(InMemoryAtomicFileIO io, InMemorySharedLog shared, String name) {
-      Map<String, String> properties = new HashMap<>();
-      properties.put(CatalogProperties.WAREHOUSE_LOCATION, WAREHOUSE);
-      properties.put(LogCatalogProperties.MAX_APPEND_COUNT, "1000");
-      properties.put(LogCatalogProperties.RACE_MIN_WAIT_MS, "0");
-      LogCatalog catalog = new LogCatalog(name, new SlowAppends(shared, 50), io, new HashMap<>());
-      catalog.initialize(name, properties);
-      return catalog;
+    @Test
+    void eightWritersOfBothConditions() throws Exception {
+      Map<TableIdentifier, Throwable> outcomes =
+          eightCreates(io, ns, i -> i % 2 == 0 ? Map.of() : BY_NAMESPACE);
+      LogCatalog reader = memlogReader(io);
+      outcomes.forEach((table, outcome) -> {
+        boolean byName = Integer.parseInt(table.name().substring(1)) % 2 == 0;
+        if (byName) {
+          assertThat(outcome).as("%s, by name", table).isInstanceOf(Created.class);
+        }
+        if (outcome instanceof Created) {
+          assertThat(reader.tableExists(table)).as("%s, created", table).isTrue();
+        } else {
+          assertThat(outcome).as("%s", table)
+              .isInstanceOf(org.apache.iceberg.exceptions.ServiceUnavailableException.class);
+          assertThat(reader.tableExists(table)).as("%s, not created", table).isFalse();
+        }
+      });
     }
+
+    /**
+     * A create of t staged on a read, then another writer creates t and drops it, then the staged
+     * record lands: rejected, though t is free where it lands, and t stays absent. On one object
+     * the commit loop rejects it on its read after the lost race; on a shared log and on Append
+     * Blobs its record lands, and replay rejects it.
+     */
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "CAS", "MEMLOG", "MEMLOG_TM", "AZLOG"})
+    void aCreateWhoseNameWasTakenAndFreedNeverApplies(LocalCatalogMode mode) {
+      LogCatalog writer = mode.catalog(io, WAREHOUSE, "c", Map.of());
+      writer.createNamespace(ns);
+      CatalogMutation staged = new CatalogMutation(writer.log().read())
+          .createTable(t, WAREHOUSE + "/ns/t/metadata/staged.metadata.json");
+      LogCatalog other = mode.catalog(io, WAREHOUSE, "c", Map.of());
+      other.createTable(t, SCHEMA);
+      assertThat(other.dropTable(t, true)).isTrue();
+      int landed = mode.sharedLog ? sharedLog().records().size() : -1;
+
+      assertThatThrownBy(() -> staged.commit(writer.log()))
+          .isInstanceOf(CommitFailedException.class);
+
+      if (mode.sharedLog) {
+        assertThat(sharedLog().records()).as("records, the staged one among them")
+            .hasSize(landed + 1);
+      }
+      assertThat(mode.catalog(io, WAREHOUSE, "c", Map.of()).tableExists(t)).isFalse();
+      mode.assertCommitPolicy(io);
+    }
+
+    /** On a shared log, a copy of the rejected record appended later still changes nothing. */
+    @Test
+    void aLateCopyOfTheRejectedRecordChangesNothing() {
+      LogCatalog writer = LocalCatalogMode.MEMLOG.catalog(io, WAREHOUSE, "c", Map.of());
+      writer.createNamespace(ns);
+      CatalogMutation staged = new CatalogMutation(writer.log().read())
+          .createTable(t, WAREHOUSE + "/ns/t/metadata/staged.metadata.json");
+      writer.createTable(t, SCHEMA);
+      assertThatThrownBy(() -> staged.commit(writer.log()))
+          .isInstanceOf(AlreadyExistsException.class);
+      byte[] rejected = sharedLog().records().get(sharedLog().records().size() - 1);
+      writer.dropTable(t, true);
+
+      sharedLog().append(rejected, null);
+
+      assertThat(LocalCatalogMode.MEMLOG.catalog(io, WAREHOUSE, "c", Map.of()).tableExists(t))
+          .isFalse();
+    }
+
+    /**
+     * A create whose read a sibling's drop invalidates before its record lands (the namespace's
+     * removals moved) is staged again on a fresh read, and lands.
+     */
+    @ParameterizedTest
+    @EnumSource(names = {"MEMLOG", "MEMLOG_TM"})
+    void aCreateASiblingsDropInvalidatedLandsOnAFreshRead(LocalCatalogMode mode) {
+      // no compaction, whose GC record is an append too
+      Map<String, String> uncompacted = Map.of(LogCatalogProperties.MAX_APPEND_COUNT, "1000");
+      LogCatalog catalog = mode.catalog(io, WAREHOUSE, "c", uncompacted);
+      catalog.createNamespace(ns);
+      LogCatalog other = mode.catalog(io, WAREHOUSE, "c", uncompacted);
+      TableIdentifier sibling = TableIdentifier.of(ns, "s");
+      other.createTable(sibling, SCHEMA);
+      int[] appends = {0};
+
+      Throwable thrown = raced(io, () -> {
+        if (appends[0]++ == 0) {
+          other.dropTable(sibling, true);
+        }
+      }, () -> catalog.createTable(t, SCHEMA));
+
+      assertThat(thrown).isNull();
+      assertThat(appends[0]).as("the create's appends").isEqualTo(2);
+      assertThat(catalog.tableExists(t)).isTrue();
+      assertThat(catalog.tableExists(sibling)).isFalse();
+    }
+
+    /**
+     * Writers of both conditions on one catalog: a create by name bumps the namespace's version,
+     * so a create by namespace staged before it lands is rejected; a create by namespace leaves
+     * the removals alone, so a create by name of another name staged before it lands applies; a
+     * namespace's drop staged before a create by name lands is rejected, as the namespace is not
+     * empty then; and a create by name staged before the namespace's drop never applies.
+     */
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "MEMLOG"})
+    void writersOfBothConditionsShareACatalog(LocalCatalogMode mode) {
+      LogCatalog byName = mode.catalog(io, WAREHOUSE, "c", Map.of());
+      LogCatalog byNamespace = mode.catalog(io, WAREHOUSE, "c", BY_NAMESPACE);
+      byName.createNamespace(ns);
+      TableIdentifier u = TableIdentifier.of(ns, "u");
+      TableIdentifier v = TableIdentifier.of(ns, "v");
+
+      CatalogMutation serial =
+          new CatalogMutation(byNamespace.log().read(), CatalogMutation.CreateCondition.NAMESPACE)
+              .createTable(u, WAREHOUSE + "/ns/u/metadata/staged.metadata.json");
+      byName.createTable(t, SCHEMA);
+      assertThatThrownBy(() -> serial.commit(byNamespace.log()))
+          .isInstanceOf(CommitFailedException.class);
+
+      CatalogMutation relaxed =
+          new CatalogMutation(byName.log().read(), CatalogMutation.CreateCondition.NAME)
+              .createTable(v, WAREHOUSE + "/ns/v/metadata/staged.metadata.json");
+      byNamespace.createTable(u, SCHEMA);
+      relaxed.commit(byName.log());
+      assertThat(byName.listTables(ns)).containsExactlyInAnyOrder(t, u, v);
+
+      Namespace empty = Namespace.of("empty");
+      byName.createNamespace(empty);
+      CatalogMutation drop = new CatalogMutation(byNamespace.log().read()).dropNamespace(empty);
+      CatalogMutation late = new CatalogMutation(byName.log().read())
+          .createTable(TableIdentifier.of(empty, "w"), WAREHOUSE + "/empty/w/staged.metadata.json");
+      byName.createTable(TableIdentifier.of(empty, "x"), SCHEMA);
+      assertThatThrownBy(() -> drop.commit(byNamespace.log()))
+          .isInstanceOf(CommitFailedException.class);
+      byName.dropTable(TableIdentifier.of(empty, "x"), true);
+      assertThat(byNamespace.dropNamespace(empty)).isTrue();
+      assertThatThrownBy(() -> late.commit(byName.log())).isInstanceOf(CommitFailedException.class);
+      assertThat(byName.namespaceExists(empty)).isFalse();
+    }
+
+    /** A namespace create and a rename by name: siblings do not conflict, a freed name does. */
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "MEMLOG"})
+    void namespaceCreatesAndRenamesBindByName(LocalCatalogMode mode) {
+      LogCatalog catalog = mode.catalog(io, WAREHOUSE, "c", Map.of());
+      LogCatalog other = mode.catalog(io, WAREHOUSE, "c", Map.of());
+      catalog.createNamespace(ns);
+      catalog.createTable(t, SCHEMA);
+      TableIdentifier u = TableIdentifier.of(ns, "u");
+
+      CatalogMutation child = new CatalogMutation(catalog.log().read())
+          .createNamespace(Namespace.of("ns", "a"));
+      CatalogMutation rename = new CatalogMutation(catalog.log().read()).renameTable(t, u);
+      other.createNamespace(Namespace.of("ns", "b"));
+      other.createTable(TableIdentifier.of(ns, "s"), SCHEMA);
+      child.commit(catalog.log());
+      rename.commit(catalog.log());
+      assertThat(catalog.listNamespaces(ns))
+          .containsExactlyInAnyOrder(Namespace.of("ns", "a"), Namespace.of("ns", "b"));
+      assertThat(catalog.tableExists(u)).isTrue();
+
+      // A child namespace created and dropped since: the namespace create's record never applies
+      CatalogMutation again = new CatalogMutation(catalog.log().read())
+          .createNamespace(Namespace.of("ns", "c"));
+      other.createNamespace(Namespace.of("ns", "c"));
+      other.dropNamespace(Namespace.of("ns", "c"));
+      assertThatThrownBy(() -> again.commit(catalog.log()))
+          .isInstanceOf(CommitFailedException.class);
+      assertThat(catalog.namespaceExists(Namespace.of("ns", "c"))).isFalse();
+    }
+
+    private InMemorySharedLog sharedLog() {
+      return LocalCatalogMode.sharedLog(io, WAREHOUSE + "/catalog-c");
+    }
+  }
+
+  /** Properties of a catalog whose creates bind names by the namespace's version. */
+  private static final Map<String, String> BY_NAMESPACE =
+      Map.of(LogCatalogProperties.CREATE_CONDITION, "namespace");
+
+  /**
+   * What {@code operation} throws, while {@code change} lands before each of its appends to the
+   * shared log of catalog "c" over {@code io} (and nothing if it returns).
+   */
+  private static Throwable raced(InMemoryAtomicFileIO io, Runnable change, Runnable operation) {
+    InMemorySharedLog shared = LocalCatalogMode.sharedLog(io, WAREHOUSE + "/catalog-c");
+    boolean[] inHook = {false};
+    shared.intercept(new InMemorySharedLog.Interceptor() {
+      @Override
+      public InMemorySharedLog.WriteFault beforeWrite(
+          InMemorySharedLog.Request request, byte[] payload) {
+        if (request == InMemorySharedLog.Request.APPEND && !inHook[0]) {
+          nested(inHook, change);
+        }
+        return InMemorySharedLog.WriteFault.NONE;
+      }
+    });
+    try {
+      operation.run();
+      return null;
+    } catch (RuntimeException e) {
+      return e;
+    } finally {
+      shared.intercept(null);
+    }
+  }
+
+  /**
+   * Eight writers, catalogs "w0" to "w7" over {@code io} with {@code properties} each, on one
+   * shared log (at catalog "c"'s location) whose appends wait 50 ms before they are sent, outside
+   * the log's lock, so that every writer of a round reads before any of its appends lands: each
+   * creates table "t" and its number in {@code ns} from a thread a latch releases. Each table's
+   * outcome: {@link Created}, or what its create threw.
+   */
+  private static Map<TableIdentifier, Throwable> eightCreates(InMemoryAtomicFileIO io,
+      Namespace ns, java.util.function.IntFunction<Map<String, String>> properties)
+      throws InterruptedException {
+    InMemorySharedLog shared = LocalCatalogMode.sharedLog(io, WAREHOUSE + "/catalog-c");
+    List<LogCatalog> catalogs = new ArrayList<>();
+    for (int i = 0; i < 8; i++) {
+      catalogs.add(slowAppends(io, shared, "w" + i, properties.apply(i)));
+    }
+    catalogs.get(0).createNamespace(ns);
+    java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
+    Map<TableIdentifier, Throwable> outcomes = new ConcurrentHashMap<>();
+    List<Thread> threads = new ArrayList<>();
+    for (int i = 0; i < 8; i++) {
+      LogCatalog catalog = catalogs.get(i);
+      TableIdentifier table = TableIdentifier.of(ns, "t" + i);
+      Thread thread = new Thread(() -> {
+        try {
+          start.await();
+          catalog.createTable(table, SCHEMA);
+          outcomes.put(table, new Created());
+        } catch (Throwable e) {
+          outcomes.put(table, e);
+        }
+      });
+      thread.start();
+      threads.add(thread);
+    }
+    start.countDown();
+    for (Thread thread : threads) {
+      thread.join(120_000);
+    }
+    assertThat(outcomes).hasSize(8);
+    return outcomes;
+  }
+
+  /** A catalog that reads catalog "c" over {@code io}, on its shared log. */
+  private static LogCatalog memlogReader(InMemoryAtomicFileIO io) {
+    return LocalCatalogMode.MEMLOG.catalog(io, WAREHOUSE, "c", Map.of());
+  }
+
+  /** Runs {@code change}, another writer's, inside a hook of the log, flagged by {@code inHook}. */
+  private static void nested(boolean[] inHook, Runnable change) {
+    inHook[0] = true;
+    try {
+      change.run();
+    } finally {
+      inHook[0] = false;
+    }
+  }
+
+  /**
+   * A catalog {@code name} over {@code io}, on {@code shared}, whose appends wait 50 ms before
+   * they are sent, with {@code extra} properties.
+   */
+  private static LogCatalog slowAppends(
+      InMemoryAtomicFileIO io, InMemorySharedLog shared, String name, Map<String, String> extra) {
+    Map<String, String> properties = new HashMap<>(extra);
+    properties.put(CatalogProperties.WAREHOUSE_LOCATION, WAREHOUSE);
+    properties.put(LogCatalogProperties.MAX_APPEND_COUNT, "1000");
+    properties.put(LogCatalogProperties.RACE_MIN_WAIT_MS, "0");
+    LogCatalog catalog = new LogCatalog(name, new SlowAppends(shared, 50), io, new HashMap<>());
+    catalog.initialize(name, properties);
+    return catalog;
   }
 
   /** The outcome of a create that returned. */

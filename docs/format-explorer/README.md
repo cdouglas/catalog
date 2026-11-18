@@ -65,13 +65,14 @@ Nodes marked ⚠ (red) are explained in the detail pane:
 | 6 | `evolve-table-inline-delta` | schema, partition spec, sort order and property updates in one delta |
 | 7 | `pointer-multi-table-conflict-retry` | atomic multi-table commits, version-based conflicts, a rejected record left in the log |
 | 8 | `inline-multi-table-conflict-retry` | the same with inline tables and deltas |
-| 9 | `concurrent-creates-bound-at-replay` | three writers of one snapshot: replay binds their ids in log order; the parent's version serializes creates under it |
-| 10 | `rename-table-across-namespaces` | `RenameTable` (Action 11), and a stale update it rejects |
-| 11 | `inline-manifest-list` | an inline-ML table: the manifest pool, per-snapshot indices, `AddManifestDelta.position`; what a delta names by reference: manifests by UUID and number under the table's prefix, removals by index in the parent's list, the parent's summary entries, the delta's one new snapshot's id |
-| 12 | `compaction-with-committed-set-gc` | the committed-transaction set, its GC horizon and the unknown answer below it |
-| 13 | `concurrent-appends-merged` | `SetConflictEncoding` (manifest-window); two appends to one version, both committed: replay merges the second where it lands (re-parented, renumbered, its list on the first's) |
-| 14 | `concurrent-append-refused` | the same race with an expiry between: the second record names its expired parent by reference and is refused; its writer's retry commits |
-| 15 | `a-day-of-commits` | a structural-codec inline-ML table after 100 appends (merges every few), an expiry and a CAS write, measured against the metadata.json files and manifest lists Iceberg writes for the same history |
+| 9 | `concurrent-creates-bound-at-replay` | four writers of one snapshot: replay binds their ids in log order; creates by name (`namespace_removals`, the default) of different names commit together, one by namespace (`namespace_version`) serializes on the parent's version |
+| 10 | `create-by-name-aba` | a namespace's `removals` in the checkpoint; a create by name whose name was taken and freed again before its record landed, rejected (S2) |
+| 11 | `rename-table-across-namespaces` | `RenameTable` (Action 11), and a stale update it rejects |
+| 12 | `inline-manifest-list` | an inline-ML table: the manifest pool, per-snapshot indices, `AddManifestDelta.position`; what a delta names by reference: manifests by UUID and number under the table's prefix, removals by index in the parent's list, the parent's summary entries, the delta's one new snapshot's id |
+| 13 | `compaction-with-committed-set-gc` | the committed-transaction set, its GC horizon and the unknown answer below it |
+| 14 | `concurrent-appends-merged` | `SetConflictEncoding` (manifest-window); two appends to one version, both committed: replay merges the second where it lands (re-parented, renumbered, its list on the first's) |
+| 15 | `concurrent-append-refused` | the same race with an expiry between: the second record names its expired parent by reference and is refused; its writer's retry commits |
+| 16 | `a-day-of-commits` | a structural-codec inline-ML table after 100 appends (merges every few), an expiry and a CAS write, measured against the metadata.json files and manifest lists Iceberg writes for the same history |
 
 Each record's note says what it does and how replay treats it. Notes on the whole file appear
 under the scenario's description.

@@ -114,6 +114,9 @@ message Namespace {
   int32  version   = 2;
   int32  parent_id = 3;       // 0 = root
   string name      = 4;       // single-level name, not full path
+  int32  removals  = 5;       // the names it has freed (a table dropped or
+                              //   renamed out of a name, a child dropped);
+                              //   only grows; absent while 0
 }
 
 message Table {
@@ -174,16 +177,34 @@ actions of the same transaction may name it (see [Late-Binding](#late-binding)).
 A `*_version` of -1 means the entity it names is late-bound, so there is no
 version to check.
 
+An action that binds a name (`CreateNamespace`, `CreateTable`,
+`CreateTableInline`, and `RenameTable`'s new name) says what it requires of
+the namespace it binds the name in, in a oneof its writer chooses
+(`fileio.catalog.create.condition`; each record says which, so writers may
+differ), its member written even when 0:
+
+- `*_version` (`namespace`): the namespace is at the version the writer read,
+  which any change there moves;
+- `*_removals` (`name`, the default): the namespace exists, its `removals` are
+  those the writer read, and the name is free.
+
+`-1` in either means the namespace is created in the same transaction
+(late-bound): there is nothing of it to check. By name, a concrete namespace
+with `-1`, or a late-bound one with a count, never applies.
+
 ```protobuf
 message CreateNamespace {
   int32  id             = 1;    // late-bound (negative); 0, the root, is rejected
   int32  version        = 2;    // the new namespace's version (1)
   int32  parent_id      = 3;    // 0 = root; negative if created in this transaction
-  int32  parent_version = 4;    // must match; -1 if the parent is late-bound
+  oneof parent_condition {
+    int32 parent_version  = 4;  // must match; -1 if the parent is late-bound
+    int32 parent_removals = 6;  // must match, and the name free; -1 if late-bound
+  }
   string name           = 5;
 }
 
-message DropNamespace {
+message DropNamespace {         // bumps the parent's version and removals
   int32 id      = 1;
   int32 version = 2;            // must match for commit
 }
@@ -205,12 +226,15 @@ message CreateTable {
   int32  id                = 1; // late-bound (negative)
   int32  version           = 2; // the new table's version (1)
   int32  namespace_id      = 3; // negative if created in this transaction
-  int32  namespace_version = 4; // must match; -1 if the namespace is late-bound
+  oneof namespace_condition {
+    int32 namespace_version  = 4; // must match; -1 if the namespace is late-bound
+    int32 namespace_removals = 7; // must match, and the name free; -1 if late-bound
+  }
   string name              = 5;
   string metadata_location = 6;
 }
 
-message DropTable {
+message DropTable {  // bumps its namespace's version and removals
   int32 id      = 1;
   int32 version = 2; // must match current; FileIOCatalog.dropTable retries on a
                      // fresh read when another commit changed the table, and a
@@ -234,14 +258,18 @@ message ReadTable {
 // Renames a table in place — the int32 table id is stable, only
 // (namespace, name) on TblEntry changes. Applies to both pointer-mode and
 // inline tables (the id-keyed manifest pool / snapshot refs follow by
-// construction). Apply bumps the version of the table and of both
-// namespaces. See SPEC_TM.md "Rename" and design.md "Operation × Operation
-// Conflict Matrix" entry RT'.
+// construction). Its new name binds as a create's. Apply bumps the version
+// of the table and of both namespaces, and the removals of the namespace it
+// leaves, even when it stays in it. See SPEC_TM.md "Rename" and design.md
+// "Operation × Operation Conflict Matrix" entry RT'.
 message RenameTable {
-  int32  id                    = 1;
+  int32  id                    = 1; // source
   int32  version               = 2; // source tbl_v; must match current
   int32  new_namespace_id      = 3; // negative if created in this transaction
-  int32  new_namespace_version = 4; // must match; -1 if late-bound
+  oneof new_namespace_condition {
+    int32 new_namespace_version  = 4; // must match; -1 if late-bound
+    int32 new_namespace_removals = 6; // must match, and new_name free; -1 if late-bound
+  }
   string new_name              = 5;
 }
 
@@ -293,10 +321,10 @@ record-1   = framed<LogRecord{ id=…, intention=Intention{
                SetConflictEncoding(name="lamport") } }>                  ; the encoding
 record-2   = framed<LogRecord{ id=…, intention=Intention{
                CreateNamespace(id=-1, version=1,
-                               parent_id=0, parent_version=0, name="db") } }>
+                               parent_id=0, parent_removals=0, name="db") } }>
 record-3   = framed<LogRecord{ id=…, intention=Intention{
                CreateTable(id=-1, version=1,
-                           namespace_id=1, namespace_version=1,
+                           namespace_id=1, namespace_removals=0,
                            name="t", metadata_location="…/meta-A.json") } }>
 ```
 
@@ -307,11 +335,14 @@ record, which sets the catalog's conflict encoding
 (`fileio.catalog.conflict.encoding`, default `manifest-window`) and whose id joins
 the committed set like any other. Replay
 binds record 2's namespace -1 to `next_namespace_id`, 1, and bumps the root to
-version 1; `parent_version` is the root's version when the writer read it.
-Record 3's writer read `db` as id 1 at version 1; replay binds the table -1 to
-id 1 and bumps `db` to version 2. Created in one transaction, the two actions
-would share one record, the `CreateTable` naming the namespace by its
-late-bound id (`namespace_id=-1, namespace_version=-1`).
+version 1; `parent_removals` is the root's removals when the writer read it,
+and the record applies while they are unchanged and no top-level namespace is
+named `db`. Record 3's writer read `db` as id 1 with no name freed in it;
+replay binds the table -1 to id 1 and bumps `db` to version 2. Created in one
+transaction, the two actions would share one record, the `CreateTable` naming
+the namespace by its late-bound id (`namespace_id=-1, namespace_removals=-1`).
+A writer with `fileio.catalog.create.condition` `namespace` sends
+`parent_version=0` and `namespace_version=1` in their place.
 
 <!-- protocol "Magic = LCAT:32,Format Version = 2:32,CP Length (varint):16,Checkpoint - empty (root row; next ids 1):48,GC Length (varint):16,GC record - AdvanceHorizon (drops nothing):48,Rec1 Length (varint):16,Record 1 - SetConflictEncoding (initialize):48,Rec2 Length (varint):16,Record 2 - CreateNamespace (id=-1 v=1 db):48,Rec3 Length (varint):16,Record 3 - CreateTable (id=-1 v=1 ns=1 t):48" -->
 ```
@@ -711,9 +742,10 @@ late-bound ID, and replay binds it to a real ID:
   (separate sequences). Actions later in the same transaction reference
   a new entity by its late-bound ID.
 - A create's own `version` is 1, the version replay gives the new
-  entity. A version field that names another entity (`parent_version`,
-  `namespace_version`, `new_namespace_version`) is `-1` when that entity
-  is created in the same txn.
+  entity. A field that names another entity's version or removals
+  (`parent_version`, `namespace_version`, `new_namespace_version`, and the
+  `*_removals` beside them) is `-1` when that entity is created in the
+  same txn.
 - On replay, `CatalogIntention.apply` binds each late-bound ID, at its
   defining create, to the replaying state's next namespace / table ID
   (`ProtoCodec.IdBinding`), and resolves later references to it. Every
@@ -766,9 +798,10 @@ demand, for tests and tooling.
 (`parentId = 0`, `name = ""`), present in every catalog and written to
 the checkpoint with the other namespaces. `parentId = 0` means "child of
 the root". Because it is a row, the root is versioned like any other
-parent: creating or dropping a top-level namespace bumps its version, so
-top-level creates serialize as sibling creates do under any other
-parent. The root is otherwise reserved:
+parent: creating or dropping a top-level namespace bumps its version, and
+dropping one its removals, so top-level creates bind their names as
+sibling creates do under any other parent. The root is otherwise
+reserved:
 
 - it is not addressable by name: `namespaceLookup` omits it, so
   `Namespace.empty()` does not exist as far as callers are concerned;
@@ -781,7 +814,8 @@ parent. The root is otherwise reserved:
 
 **Entry classes:**
 
-- `NsEntry(int parentId, String name, int version)` — namespace metadata.
+- `NsEntry(int parentId, String name, int version, int removals)` —
+  namespace metadata; `removals` counts the names it has freed.
   The `namespaceLookup` map is rebuilt from `namespaceById` by walking
   parent chains.
 - `TblEntry(int namespaceId, String name, int version, String metadataLocation)`
@@ -812,23 +846,43 @@ the id is a UUIDv7, and `CatalogIntention.verify` accepts it.
   against the state before the transaction, so such a record would pass
   and apply to a state no read could build;
 - action fails its own `verify()`, checked against the state before the
-  transaction, not after the record's earlier actions:
+  transaction, not after the record's earlier actions (every `verify()` is
+  stable, S2: one that fails where its record lands fails on every later
+  state, which `spec/TestVerifyStabilityProperties` checks, N1):
 
 | Action                   | Precondition                                              |
 |--------------------------|-----------------------------------------------------------|
-| CreateNamespace          | not the root (id 0); parent version matches (skipped if -1: late-bound) |
+| CreateNamespace          | not the root (id 0); the name binds in the parent (below) |
 | DropNamespace            | not the root (id 0); namespace version matches            |
 | SetNamespaceProperty     | namespace version matches (skipped if -1)                 |
 | RemoveNamespaceProperty  | namespace version matches (skipped if -1)                 |
-| CreateTable              | namespace version matches (skipped if -1)                 |
+| CreateTable              | the name binds in the namespace (below)                   |
 | DropTable                | table version matches                                     |
 | UpdateTableLocation      | the conflict encoding admits it: the table version matches |
 | ReadTable                | the conflict encoding admits it: a read pin's table version matches; a read witness's refs are unchanged since its version |
-| CreateTableInline        | namespace version matches (skipped if -1)                 |
+| CreateTableInline        | the name binds in the namespace (below)                   |
 | UpdateTableInline        | the conflict encoding admits it ([Conflict Encodings](#conflict-encodings)): under `lamport`, the table version matches |
-| RenameTable              | table version matches; destination namespace version matches (skipped if -1) |
+| RenameTable              | table version matches; the new name binds in the destination namespace (below) |
 | SetConflictEncoding      | the catalog has no encoding and has never had a table     |
 | unknown action type      | always passes (`UnknownAction`)                           |
+
+A name binds in a namespace by the condition the record names
+(`ProtoCodec.bindingProblem`):
+
+| Condition (the oneof's member) | Holds where the record lands if |
+|---|---|
+| `*_version` (`namespace`) | the namespace's version is the one read (skipped if -1: late-bound) |
+| `*_removals` (`name`) | the namespace (by id) exists, its removals are those read, and no table of it (for a table's name) or no child namespace of it (for a namespace's) has the name; skipped if the namespace is late-bound (a negative id, with -1); a concrete namespace with -1, or a late-bound one with a count, never holds |
+
+The name check is the one `CatalogMutation` makes as it stages: a table's
+name against the namespace's tables, a namespace's against its parent's
+children. A table and a namespace may share a name under either condition.
+The `name` condition is stable (S2, [LOG.md](LOG.md) §"Unconditional
+appends"): namespace ids are never reused, removals only grow, and a taken
+name is freed only by an action that adds to them, so a record it rejects
+it rejects on every later state, though the name be freed again. "Name
+absent" alone would not be: a create rejected because its name was taken
+would apply once the table was dropped, from a late copy of its record.
 
 Each `apply()` bumps the version of any entity whose state it mutates: a
 table update or rename bumps the table (an update from its version where
@@ -836,9 +890,14 @@ the record lands), and a create starts its entity at the record's
 `version` (1). A namespace's version covers its children and
 properties: creating, dropping or renaming a child bumps the parent
 namespace (a rename bumps both, when they differ), and setting or removing
-a property bumps that namespace. `ReadTable` and unknown actions change
-nothing. See [design.md](design.md) for the operation × operation conflict
-matrix that falls out of these rules.
+a property bumps that namespace. A namespace's removals count the names
+freed in it: `DropTable` adds one to its namespace's, `DropNamespace` to its
+parent's, and `RenameTable` to the namespace it leaves, even when its new
+name is in the same namespace. A create by name bumps its namespace's
+version as one by version does, so a namespace's drop, and a create by
+version, conflict with it. `ReadTable` and unknown actions change nothing.
+See [design.md](design.md) for the operation × operation conflict matrix
+that falls out of these rules.
 
 ## Schema Evolution
 
