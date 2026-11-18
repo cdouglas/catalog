@@ -494,10 +494,22 @@ final class TableViews {
     return files;
   }
 
+  /** {@link #metadataTable} of {@code table}, its snapshots positioned in the table's order. */
+  static String metadataTableRows(Table table, org.apache.iceberg.MetadataTableType type) {
+    Map<Long, Integer> position = new java.util.HashMap<>();
+    for (Snapshot s : table.snapshots()) {
+      position.put(s.snapshotId(), position.size());
+    }
+    return metadataTable(table, type, position, false);
+  }
+
   /**
    * The rows of {@code table}'s metadata table {@code type}, sorted, with snapshot ids as
    * positions and what differs between the two runs (times, file names, sizes) left out: with the
-   * clock-ordered columns, if the wall clock stepped.
+   * clock-ordered columns, if the wall clock stepped. Planned on a direct executor: the manifests
+   * are read in the order of the snapshot's manifest list (the physical view's), where Iceberg's
+   * worker pool reads them in any order, and PARTITIONS takes a partition's {@code spec_id} from
+   * the file it reads first among those of its newest snapshot (TestMetadataTableOrder).
    */
   private static String metadataTable(
       Table table, org.apache.iceberg.MetadataTableType type, Map<Long, Integer> position,
@@ -505,7 +517,10 @@ final class TableViews {
     Table metadata = org.apache.iceberg.MetadataTableUtils.createMetadataTableInstance(table, type);
     List<String> rows = new ArrayList<>();
     try (org.apache.iceberg.io.CloseableIterable<FileScanTask> tasks =
-        metadata.newScan().planFiles()) {
+        metadata.newScan()
+            .planWith(org.apache.iceberg.relocated.com.google.common.util.concurrent.MoreExecutors
+                .newDirectExecutorService())
+            .planFiles()) {
       for (FileScanTask task : tasks) {
         try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.StructLike> data =
             task.asDataTask().rows()) {
