@@ -166,6 +166,15 @@ class TestCatalogFaultProperties {
    */
   private static final int AZURE_SEGMENT_RECORDS = 4;
   /**
+   * The share of tries, in percent, in which some table must seal a snapshot block when every
+   * catalog pages at blocks of 2 ({@code -Dfileio.catalog.test.snapshot.block=2}, as a round's
+   * faultA2 and faultB2 do): about a quarter of catalogMatchesModel's tries and a fifth of
+   * faultyStorageNeverMisreportsACommit's seal one at a window of 1 (100 tries each, 2026-11-18),
+   * so a change that stops most of them sealing fails the job; no floor at other paging.
+   */
+  private static final double SEALING_FLOOR =
+      Integer.valueOf(2).equals(LocalCatalogMode.SNAPSHOT_BLOCK) ? 10 : 0;
+  /**
    * The segments' blocks on Append Blobs at an inline limit of 8 KiB or more: half the smallest of
    * the big properties of those limits (4, 9.6 and 24 KiB), so a record that holds one is over the
    * log's bound, and its update goes to a metadata file by the bound where the limit keeps it
@@ -841,6 +850,8 @@ class TestCatalogFaultProperties {
     private final Map<String, Map<Long, Long>> parents = new HashMap<>();
     // Conditional writes whose catalog file has been checked against a checkpoint of it.
     private int checkedWrites = 0;
+    /** The most sealed snapshot blocks any table had at a check (docs/SNAPSHOT_PAGING.md). */
+    private int mostSealed = 0;
 
     // The running top-level command's storage plan. Faults and preemption apply only while armed,
     // and only on the thread that runs the schedule.
@@ -1072,6 +1083,16 @@ class TestCatalogFaultProperties {
       long pageOuts = pageOuts();
       Statistics.label("PageOut records").collect(
           pageOuts == 0 ? "none" : pageOuts < 4 ? "1-3" : "4 or more");
+      Statistics.label("most sealed blocks of a table").collect(
+          mostSealed < 3 ? String.valueOf(mostSealed) : "3 or more");
+      // A paged job (a round's faultA2 and faultB2, at blocks of 2 and a window of 1) must seal: a
+      // run that seals nothing tests none of the paging, whatever it finds. Judged from 100 tries
+      // on (a smoke run's 3 may all seal nothing)
+      Statistics.label("a table sealed a block").collect(mostSealed > 0);
+      if (SEALING_FLOOR > 0) {
+        Statistics.label("a table sealed a block").coverage(c -> c.check(true)
+            .count((sealed, all) -> all < 100 || 100.0 * sealed / all >= SEALING_FLOOR));
+      }
     }
 
     /** The PageOut records the catalog's log ever held: the committed set's pages sealed. */
@@ -2327,6 +2348,9 @@ class TestCatalogFaultProperties {
                   AzureLogs.open(io, CATALOG_LOCATION, azure, CATALOG_LOCATION, readerProperties),
                   LogCatalogProperties.runtimeConfig(PROPERTIES))
               : CatalogTestSupport.log(io, CATALOG_LOCATION, PROPERTIES)).read().state();
+      for (TableIdentifier id : file.tables()) {
+        mostSealed = Math.max(mostSealed, file.sealedBlocks(file.tableId(id)).size());
+      }
       List<TableIdentifier> ids = new ArrayList<>();
       for (Namespace ns : checker.listNamespaces(Namespace.empty())) {
         tables.namespaces.put(ns, new TreeMap<>(checker.loadNamespaceMetadata(ns)));

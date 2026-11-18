@@ -26,12 +26,13 @@
 # tries to 3 (to check the image, not the code); ROUND_JOBS, a round's jobs (default all eleven);
 # SNAPSHOT_BLOCK and SNAPSHOT_WINDOW, the snapshot paging every catalog the tests make is created
 # with (docs/SNAPSHOT_PAGING.md; LocalCatalogMode; unset, the catalog's default, which seals
-# nothing in the fuzzers' short schedules; 0, none; window 8 with a block): 4 seals a table's
-# blocks every few commits, and 2 with a window of 1 reaches re-inlining's import pages.
+# nothing in the fuzzers' short schedules, except in a round's faultA2 and faultB2, which page at
+# 2 and 1; 0, none; window 8 with a block): 4 seals a table's blocks every few commits, and 2 with
+# a window of 1 reaches re-inlining's import pages.
 #
 # A round's jobs (tries per @Property, in the order the class declares them):
-#   faultA1-2  TestCatalogFaultProperties.catalogMatchesModel, 30,000
-#   faultB1-2  TestCatalogFaultProperties.faultyStorageNeverMisreportsACommit, 30,000
+#   faultA1-2  TestCatalogFaultProperties.catalogMatchesModel, 30,000 (A2 paging at 2 and 1)
+#   faultB1-2  TestCatalogFaultProperties.faultyStorageNeverMisreportsACommit, 30,000 (B2 too)
 #   race       TestCatalogRaceProperties: aRaceEndsAsASerialRun 200,000,
 #              aTransactionRaceEndsAsASerialRun 10,000
 #   mw         spec.TestMultiWriterProperties, 300,000 each
@@ -217,13 +218,28 @@ setup() {
   esac
 }
 
+# paged <job>: whether a round's job pages snapshots at blocks of 2 and a window of 1 (sealing a
+# table's history every commit or two, and reaching re-inlining's import pages) where the round
+# sets no SNAPSHOT_BLOCK: faultA2 and faultB2, the second of each fault property's pair, so every
+# round fuzzes paging (the catalog's default, blocks of 256, seals nothing in a short schedule)
+paged() {
+  case $1 in
+    faultA2|faultB2) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 round() {
   for j in $ROUND_JOBS; do
     tests_of $j > /dev/null
     worktree $W/$j $COMMIT && setup $j $W/$j
   done
   for j in $ROUND_JOBS; do
-    job $W/$j $O/$j.log "$(tests_of $j)"
+    if [ -z "${SNAPSHOT_BLOCK:-}" ] && paged $j; then
+      SNAPSHOT_BLOCK=2 SNAPSHOT_WINDOW=1 job $W/$j $O/$j.log "$(tests_of $j)"
+    else
+      job $W/$j $O/$j.log "$(tests_of $j)"
+    fi
   done
   wait
   for f in $O/*.log; do

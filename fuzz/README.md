@@ -43,6 +43,10 @@ to keep it. `JOBS` limits the jobs at once (default all), `HEAP` each test JVM's
 4g; a job's resident size is up to two gigabytes more, with Maven's). A round wants eleven cores
 and about 68 GB; a calibration, a core and 6 GB per mutant. `ROUND_JOBS` runs some of a round's
 jobs (`ROUND_JOBS=race ./run.sh round ...` reruns one; the memory limit counts only those).
+A round's faultA2 and faultB2 page snapshots at blocks of 2 and a window of 1, and fail if too
+few of their tries seal a block; the other jobs run at the catalog's default, which seals nothing
+in their short schedules. `SNAPSHOT_BLOCK` (and `SNAPSHOT_WINDOW`) sets paging for every job of a
+run instead: a paging round (`r0p`) runs the race, rebase and differential jobs at 2 and 1 too.
 
 ## Memory on a shared host
 
