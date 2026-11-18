@@ -1047,14 +1047,17 @@ class TestRebaseProperties {
    * read (resets, a ref's removal, expiries, spec and table changes), of resets (rollbacks,
    * fast-forwards, cherry-picks), of a ref removed or created, of expiries of all but each
    * branch's head, of schema changes (which change what a branch's scan reads, and leave the
-   * branch where it was), and of any single command.
+   * branch where it was), and of any single command. A sixth of them are a rollback alone: a ref
+   * reset with nothing that advances it or changes the schema, which only the reset stamps of a
+   * read witness see (calibration set reads' readnoreset needs these, and the rest of the windows
+   * rarely make one).
    */
   @Provide
   Arbitrary<List<TableScript.Cmd>> readWindows() {
     Arbitrary<Integer> small = Arbitraries.integers().between(0, 11);
     Arbitrary<TableScript.Cmd> headsOnly = Combinators.combine(small, small)
         .as((a, c) -> new TableScript.Cmd(TableScript.Kind.EXPIRE_SNAPSHOTS, a, 0, c * 2 + 1));
-    return Arbitraries.frequencyOf(
+    Arbitrary<List<TableScript.Cmd>> mixed = Arbitraries.frequencyOf(
             Tuple.of(4, TableScript.commands(
                 kind -> VALIDATED.contains(kind) || APPEND_LIKE.contains(kind))),
             Tuple.of(2, TableScript.commands(GUARDS::contains)),
@@ -1065,6 +1068,10 @@ class TestRebaseProperties {
             Tuple.of(3, TableScript.windowCommands(TestRebaseProperties::single)))
         .withoutEdgeCases()
         .list().ofMinSize(1).ofMaxSize(4);
+    Arbitrary<List<TableScript.Cmd>> rollback =
+        TableScript.commands(kind -> kind == TableScript.Kind.ROLLBACK).withoutEdgeCases()
+            .list().ofSize(1);
+    return Arbitraries.frequencyOf(Tuple.of(5, mixed), Tuple.of(1, rollback));
   }
 
   /** Commands that change a table's schema: a column added, dropped, renamed or promoted. */
