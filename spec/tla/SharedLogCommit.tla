@@ -57,12 +57,14 @@ ASSUME /\ FaultKinds \subseteq WriteFaults \cup ReadFaults \cup PutFaults
 
 VARIABLES
   log,       \* every record appended, in order (the trimmed ones too)
-  ckpts,     \* the checkpoints stored: [pos, st, C, H], the state through log[pos]
+  ckpts,     \* the checkpoints stored: [pos, st, C, H, F, P], the state, committed set,
+             \* horizon, floor and page references through log[pos]
   trimmed,   \* the log is trimmed through this position
   inflight,  \* appends sent, not landed, not yet failed: a timed-out request
   now,       \* the clock
   nf,        \* faults injected so far
-  comp,      \* what compactors did so far: [gc, ck, tr]
+  comp,      \* what compactors did so far: [gc, ck, tr, pg, sw], the GC records,
+             \* checkpoints, trims, page puts and sweeps
   ws,        \* Writers -> the writer's commit (see Idle)
   ended,     \* the outcomes reported, per commit: [c, id, out, cf, cx, ci]
   ook,       \* every oracle check so far passed (SharedLogOracles)
