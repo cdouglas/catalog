@@ -6,15 +6,6 @@
 # which the expiry's two ways of finding the entries to drop share): each mutant must fail an
 # oracle.
 MUTANTS="poolorphan seqnoshift windowfloor"
-# Equivalent under this code's writers, so no oracle can catch it: a pool entry is replaced only by
-# an equal copy (a record that sends again a manifest the pool holds: a list on a parent whose list
-# is a file, a full update's lists), since a commit that would change one writes a metadata file
-# instead (LogCatalog.restatesAManifest) and the merge refuses a record that would (Landing; see
-# phase4.sh's norestate). Calibration si2-calib (2026-10-30) did not catch it; counted in
-# TestCatalogFaultProperties, TestInlineDifferentialProperties, TestRebaseProperties and
-# TestCatalogRegressions, 768 replacements changed no entry's sequence numbers, first row id,
-# adding snapshot or counts. The check guards loads against an entry that did change.
-EQUIVALENT="reusestale"
 ORACLES=TestCatalogFaultProperties,TestInlineDifferentialProperties
 
 prepare() {
@@ -37,9 +28,6 @@ mutant() { # name main-dir test-dir
     seqnoshift) mutate $M/Landing.java "      if (sequenceNumber > baseLastSequenceNumber) {
         sequenceNumber += sequenceShift;
       }" "" ;;
-    # a load reuses the InlineSnapshots it made after a pool entry was replaced for their path
-    reusestale) mutate $M/LogCatalog.java "        if (replacements != table.poolReplacements
-            || table.copies.size() > 2 * pool.size() + 64) {" "        if (table.copies.size() > 2 * pool.size() + 64) {" ;;
     # replay's metadata log keeps two entries at a bound of 0 or 1, where Iceberg keeps one
     windowfloor) mutate $M/Window.java "    int keep = Math.min(to - from, Math.max(1, bound) - 1);" "    int keep = Math.min(to - from, Math.max(2, bound) - 1);" ;;
   esac
