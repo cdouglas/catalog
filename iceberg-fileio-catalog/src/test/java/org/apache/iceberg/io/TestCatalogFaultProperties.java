@@ -103,7 +103,8 @@ import org.intentlog.wire.LogEnvelope;
  * drawn ({@code fileio.catalog.create.condition}). A small limit on inline updates moves tables
  * out of inline storage and back:
  * a big property evicts a table to a metadata file, and a later update that fits in full returns
- * it.
+ * it. On Append Blobs at the larger limits, the segments' blocks are small instead, so a big
+ * property's record is over the log's bound, which evicts it (SPEC_TM.md "Size Budget").
  *
  * <p>In {@link #faultyStorageNeverMisreportsACommit}, each operation's storage also fails as its
  * command says: its first two conditional writes (see {@link InMemoryAtomicFileIO.Fault}) and one
@@ -164,6 +165,13 @@ class TestCatalogFaultProperties {
    * fuzzer's records (a run's are 10 to 60), so that the log moves on to a new segment often.
    */
   private static final int AZURE_SEGMENT_RECORDS = 4;
+  /**
+   * The segments' blocks on Append Blobs at an inline limit of 8 KiB or more: half the smallest of
+   * the big properties of those limits (4, 9.6 and 24 KiB), so a record that holds one is over the
+   * log's bound, and its update goes to a metadata file by the bound where the limit keeps it
+   * inline.
+   */
+  private static final int AZURE_BLOCK_BYTES = 2048;
 
   // Retry commits, throttled writes and lost races without sleeping; merge manifests early, so
   // merge appends read them; keep two previous metadata files, so pointer-mode commits delete
@@ -898,6 +906,14 @@ class TestCatalogFaultProperties {
         // The store before the catalogs that open the log on it, with the block limit drawn
         this.azureBlocks = segmentLimit > 0 ? segmentLimit : 50_000;
         this.azure = LocalCatalogMode.azureStore(io, CATALOG_LOCATION, azureBlocks);
+        boolean small = maxUpdateSize > AZURE_BLOCK_BYTES;
+        if (small) {
+          // The record's bound, not the inline limit, evicts big properties (SPEC_TM.md "Size
+          // Budget")
+          azure.limitBlockBytes(AZURE_BLOCK_BYTES);
+        }
+        Statistics.label("Append Blob blocks").collect(
+            small ? AZURE_BLOCK_BYTES + " B" : "service's");
         // K: the block limit drawn, or segments of a few records, so that the log moves on
         properties.put(LogCatalogProperties.LOG_SEGMENT_RECORDS,
             String.valueOf(segmentLimit > 0 ? segmentLimit : AZURE_SEGMENT_RECORDS));
@@ -1045,6 +1061,12 @@ class TestCatalogFaultProperties {
             limit + ": " + (segments < 2 ? "1" : segments < 4 ? "2-3" : "4 or more"));
         Statistics.label("seal frames").collect(
             limit + ": " + (seals == 0 ? "none" : seals < 3 ? "1-2" : "3 or more"));
+        long evicted = 0;
+        for (Writer w : writers) {
+          evicted += w.catalog.log().counts().evicted();
+        }
+        Statistics.label("updates evicted for their records to fit").collect(
+            evicted == 0 ? "none" : evicted < 3 ? "1-2" : "3 or more");
       }
       long pageOuts = pageOuts();
       Statistics.label("PageOut records").collect(

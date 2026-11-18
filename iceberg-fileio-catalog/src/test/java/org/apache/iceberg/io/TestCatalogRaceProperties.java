@@ -82,7 +82,9 @@ import org.intentlog.wire.LogEnvelope;
  * deletes of every row, which Iceberg retries on a conflict as it does a property change (unlike
  * a schema change). They run on a small universe of names, from a generated catalog state; each
  * writer has its own catalog mode, and binds the names it creates by name or by the namespace's
- * version, as drawn ({@code fileio.catalog.create.condition}). A result is a return value or an
+ * version, as drawn ({@code fileio.catalog.create.condition}); on Append Blobs, the race's
+ * segments may take small blocks, so that some records are over the log's bound and their inline
+ * updates go to metadata files (the serial runs' do not). A result is a return value or an
  * exception's class; the
  * catalog's state is its namespaces with their properties and its tables with theirs (a table
  * created carries its creator's name) and their live data files.
@@ -136,7 +138,8 @@ class TestCatalogRaceProperties {
       @ForAll("modes") LocalCatalogMode fileModeD,
       @ForAll("afterOps") Op after,
       @ForAll boolean again,
-      @ForAll @IntRange(min = 0, max = 15) int namespaceWriters) {
+      @ForAll @IntRange(min = 0, max = 15) int namespaceWriters,
+      @ForAll("blockBytes") int blockBytes) {
     // The writers' modes on one catalog object, or on a shared log or Append Blobs with the same
     // table metadata storage.
     LocalCatalogMode modeA = fileModeA.on(catalogLog);
@@ -201,6 +204,11 @@ class TestCatalogRaceProperties {
     setup.apply(base.catalog(io, WAREHOUSE, "c",
         Map.of(LogCatalogProperties.CONFLICT_ENCODING, encoding), () -> past[0] += 5));
     Statistics.label("encoding").collect(encoding);
+    if (catalogLog == LocalCatalogMode.Log.AZURE && blockBytes > 0) {
+      // The race's writers open the log on segments of small blocks, on which some of their
+      // records are over the log's bound: their inline updates go to metadata files
+      LocalCatalogMode.azureStore(io, CATALOG).limitBlockBytes(blockBytes);
+    }
     // In the race, each writer's clock is off as drawn: its commits may be retried, but end alike
     // Writers A, B, C and D bind the names they create by the namespace's version where their bit
     // of namespaceWriters is set, else by name
@@ -383,6 +391,15 @@ class TestCatalogRaceProperties {
       results[k] = racers.get(k).run(writers.get(k), name(k));
     }
     String raceState = state(io);
+    if (catalogLog == LocalCatalogMode.Log.AZURE) {
+      long evicted = writerA.log().counts().evicted() + writerD.log().counts().evicted();
+      for (LogCatalog w : writers) {
+        evicted += w.log().counts().evicted();
+      }
+      Statistics.label("updates evicted for their records to fit").collect(
+          (blockBytes > 0 ? blockBytes + " B blocks: " : "the service's blocks: ")
+              + (evicted == 0 ? "none" : evicted < 3 ? "1-2" : "3 or more"));
+    }
 
     // A transaction whose reads a racer changed must fail. One whose table a racer changed may
     // commit: an inline table's append is judged where the record lands, and commits where a
@@ -636,7 +653,8 @@ class TestCatalogRaceProperties {
       @ForAll InMemoryAtomicFileIO.ReadMode reads,
       @ForAll boolean recordingReads,
       @ForAll boolean tailReads,
-      @ForAll boolean compactAfter) {
+      @ForAll boolean compactAfter,
+      @ForAll("blockBytes") int blockBytes) {
     LocalCatalogMode storage = fileModeA.inlineML ? LocalCatalogMode.APPEND_ML
         : fileModeA.inlineTM ? LocalCatalogMode.APPEND_TM : LocalCatalogMode.APPEND;
     // every namespace and table, each table with a snapshot
@@ -646,7 +664,7 @@ class TestCatalogRaceProperties {
     Op c = twoRacers ? new Op(racerC, y, x) : new Op(null, 0, 0);
     aRaceEndsAsASerialRun(fileModeA, fileModeB, fileModeC, storage, catalogLog, setup, a, b, c,
         gc, paging, clockOffsets, encoding, reads, recordingReads, tailReads, compactAfter,
-        fileModeA, new Op(null, 0, 0), false, 0);
+        fileModeA, new Op(null, 0, 0), false, 0, blockBytes);
   }
 
   /** What a racer does to a table a transaction writes or reads. */
@@ -675,6 +693,17 @@ class TestCatalogRaceProperties {
         net.jqwik.api.Tuple.of(2, LocalCatalogMode.Log.OBJECT),
         net.jqwik.api.Tuple.of(1, LocalCatalogMode.Log.SHARED),
         net.jqwik.api.Tuple.of(1, LocalCatalogMode.Log.AZURE));
+  }
+
+  /**
+   * On Append Blobs, the blocks the race's writers' segments take (0: the service's): about the
+   * size of an inline create's or append's record (a run's records stayed under blocks of 512 B
+   * but for some transactions'), so that some records are over the log's bound and go to metadata
+   * files (SPEC_TM.md "Size Budget"), and above a pointer table's.
+   */
+  @Provide
+  Arbitrary<Integer> blockBytes() {
+    return Arbitraries.of(0, 0, 256, 512);
   }
 
   /** A catalog state: some namespaces, with properties, and some tables in them. */
