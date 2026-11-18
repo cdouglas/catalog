@@ -32,7 +32,11 @@ import org.intentlog.fileio.AtomicFileLog;
  * SupportsAtomicOperations}: S3, S3 Express, GCS, ADLS), beside its tables' files: a {@link
  * LogCatalog} over an {@link AtomicFileLog}. The object is at {@code <warehouse>/catalog} unless
  * the catalog is given a location; the store is the catalog's FileIO ({@code io-impl}), which the
- * catalog closes when it is closed, unless it was given one.
+ * catalog closes when it is closed, unless it was given one. A table without a location of its own
+ * goes under its namespace's, {@code <warehouse>/<levels...>/<table>}; the catalog refuses a
+ * namespace, or such a table, whose location would be the object's or under it (at the default
+ * location, the top-level namespace {@code catalog}), as a store with directories (ADLS with a
+ * hierarchical namespace) cannot hold a path as a file and a directory at once.
  *
  * <p>Configuration (with {@link LogCatalogProperties} for how commits append and compact):
  *
@@ -97,5 +101,11 @@ public class FileIOCatalog extends LogCatalog {
     }
     open(new AtomicFileLog(fileIO, catalogLocation, LogCatalogProperties.readLookup(properties)),
         fileIO);
+  }
+
+  /** The catalog object's location: {@code <warehouse>/catalog}, unless it was given another. */
+  @Override
+  protected String catalogObjectLocation() {
+    return catalogLocation;
   }
 }

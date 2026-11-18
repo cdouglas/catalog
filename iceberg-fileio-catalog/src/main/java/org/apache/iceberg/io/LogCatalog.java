@@ -743,10 +743,14 @@ public class LogCatalog extends BaseMetastoreCatalog
             catalogProperties,
             CatalogProperties.UNIQUE_TABLE_LOCATION,
             CatalogProperties.UNIQUE_TABLE_LOCATION_DEFAULT);
-    return String.join(
+    String location = String.join(
         "/",
         defaultNamespaceLocation(tableIdentifier.namespace()),
         LocationUtil.tableLocation(tableIdentifier, unique));
+    Preconditions.checkArgument(!takesTheCatalogObjects(location),
+        "Cannot create table %s at its default location, %s: it is the catalog object's or under"
+            + " it; give the table a location", tableIdentifier, location);
+    return location;
   }
 
   private String defaultNamespaceLocation(Namespace namespace) {
@@ -754,6 +758,45 @@ public class LogCatalog extends BaseMetastoreCatalog
       return warehouseLocation;
     }
     return warehouseLocation + "/" + String.join("/", namespace.levels());
+  }
+
+  /**
+   * Where the catalog keeps an object of its own among its tables' files, which no namespace and
+   * no table may take as its default location; null if it keeps none there (a log elsewhere). A
+   * {@link FileIOCatalog} keeps its log's object at {@code <warehouse>/catalog}, unless it is given
+   * another location.
+   */
+  protected String catalogObjectLocation() {
+    return null;
+  }
+
+  /**
+   * Whether {@code location}, a namespace's or a table's default location, is the catalog object's
+   * or under it: a store with directories (ADLS with a hierarchical namespace) cannot hold a path
+   * as a file and a directory at once.
+   */
+  private boolean takesTheCatalogObjects(String location) {
+    String object = catalogObjectLocation();
+    if (object == null || warehouseLocation == null || warehouseLocation.isEmpty()) {
+      return false;
+    }
+    object = LocationUtil.stripTrailingSlash(object);
+    return location.equals(object) || location.startsWith(object + "/");
+  }
+
+  /**
+   * Refuses to create {@code namespace} if its default location is the catalog object's or under
+   * it: the top-level namespace {@code catalog} of a FileIOCatalog at its default location, and
+   * any namespace under it, which would create it as a missing ancestor.
+   */
+  private void checkNamespaceLocation(Namespace namespace) {
+    if (namespace.isEmpty()) {
+      return; // CatalogMutation refuses it
+    }
+    String location = defaultNamespaceLocation(namespace);
+    Preconditions.checkArgument(!takesTheCatalogObjects(location),
+        "Cannot create namespace %s: its location, %s, is the catalog object's or under it",
+        namespace, location);
   }
 
   /**
@@ -795,6 +838,7 @@ public class LogCatalog extends BaseMetastoreCatalog
 
   @Override
   public void createNamespace(Namespace namespace, Map<String, String> metadata) {
+    checkNamespaceLocation(namespace);
     commitOnAFreshRead("create namespace " + namespace,
         read -> mutation(read).createNamespace(namespace, metadata));
   }
@@ -2588,6 +2632,7 @@ public class LogCatalog extends BaseMetastoreCatalog
     for (NamespaceChange change : commit.namespaceChanges()) {
       switch (change.kind()) {
         case CREATE:
+          checkNamespaceLocation(change.namespace());
           newCatalog.createNamespace(change.namespace(), change.properties());
           break;
         case SET_PROPERTIES:

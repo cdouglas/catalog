@@ -294,6 +294,18 @@ suites skip; see [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
 | `fileio.catalog.create.condition` | `name` | What every name a writer binds requires of its namespace where the record lands: table creates (with `registerTable` and create transactions), a renamed table's new name, and namespace creates, in catalog transactions too. `name`: the namespace exists, has freed no name since the read (its removals), and the name is free, so creates of different names in one namespace do not conflict; `namespace`: the namespace's version is the one read, so creates in one namespace land one at a time (for ablation). Each record says which it sent, so writers may differ |
 | `fileio.catalog.conflict.encoding` | `manifest-window` | How replay decides whether a table update conflicts with what landed since its writer read the table; fixed when the catalog is created ([docs/SPEC.md](docs/SPEC.md) "Conflict Encodings") |
 
+A `FileIOCatalog` keeps its log in the object `<warehouse>/catalog` (its
+pages under `<warehouse>/catalog.committed/`), unless it is given another
+location, and a table without a location of its own goes under its
+namespace's: `<warehouse>/<level>/.../<table>` (with a suffix under
+Iceberg's `unique-table-location`). The catalog refuses, with
+`IllegalArgumentException`, a namespace whose location would be the
+object's or under it (at the default location, the top-level namespace
+`catalog` and any namespace in it, also as a missing ancestor or in a
+catalog transaction), and a table without a location whose default
+location would be: a store with directories (ADLS with a hierarchical
+namespace) cannot hold a path as a file and a directory at once.
+
 See [docs/LOG.md](docs/LOG.md) for the commit protocol,
 [docs/ATOMIC_FILE_LOG.md](docs/ATOMIC_FILE_LOG.md) for how the catalog file
 commits, and [docs/design.md](docs/design.md) for guidance on choosing

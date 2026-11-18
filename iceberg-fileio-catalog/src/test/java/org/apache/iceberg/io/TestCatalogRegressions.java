@@ -7375,6 +7375,113 @@ public class TestCatalogRegressions {
     }
   }
 
+  /**
+   * A namespace's tables go under its default location, {@code <warehouse>/<levels...>}, and a
+   * FileIOCatalog keeps its log in the object {@code <warehouse>/catalog}: a top-level namespace
+   * named {@code catalog} would put its tables under the object's path, which on a store with
+   * directories (ADLS with a hierarchical namespace) cannot be a file and a directory at once.
+   * The catalog refuses a namespace whose default location is the object's, or under it, however
+   * it would be created (directly, as a missing ancestor, in a catalog transaction), and a table
+   * without a location of its own whose default location is.
+   */
+  @Nested
+  class TheNamespaceNamedCatalog {
+    private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+    private final Namespace named = Namespace.of("catalog");
+
+    /** A catalog at {@code location} (null: {@code <warehouse>/catalog}), with {@code extra}. */
+    private FileIOCatalog fileIOCatalog(String location, Map<String, String> extra) {
+      Map<String, String> properties = new HashMap<>(extra);
+      properties.put(CatalogProperties.WAREHOUSE_LOCATION, WAREHOUSE);
+      properties.put(LogCatalogProperties.RACE_MIN_WAIT_MS, "0");
+      FileIOCatalog catalog = new FileIOCatalog("c", location, io, new HashMap<>());
+      catalog.initialize("c", properties);
+      return catalog;
+    }
+
+    @Test
+    void isRefused() {
+      FileIOCatalog catalog = fileIOCatalog(null, Map.of());
+
+      assertThatThrownBy(() -> catalog.createNamespace(named))
+          .isInstanceOf(IllegalArgumentException.class)
+          .hasMessageContaining(WAREHOUSE + "/catalog");
+      // as the missing ancestor of the namespace created
+      assertThatThrownBy(() -> catalog.createNamespace(Namespace.of("catalog", "x")))
+          .isInstanceOf(IllegalArgumentException.class);
+      assertThat(catalog.listNamespaces()).isEmpty();
+
+      // names whose locations are elsewhere
+      catalog.createNamespace(Namespace.of("catalogs"));
+      catalog.createNamespace(Namespace.of("x", "catalog"));
+      catalog.createTable(TableIdentifier.of("catalogs", "catalog"), SCHEMA);
+      assertThat(catalog.listNamespaces())
+          .containsExactlyInAnyOrder(Namespace.of("catalogs"), Namespace.of("x"));
+    }
+
+    @Test
+    void isRefusedInACatalogTransaction() {
+      FileIOCatalog catalog = fileIOCatalog(null, Map.of());
+      for (Namespace refused : List.of(named, Namespace.of("catalog", "x"))) {
+        CatalogTransaction txn =
+            catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+        org.apache.iceberg.catalog.SupportsNamespaces txc =
+            (org.apache.iceberg.catalog.SupportsNamespaces) txn.asCatalog();
+        txc.createNamespace(Namespace.of("ok"));
+        txc.createNamespace(refused);
+        assertThatThrownBy(txn::commitTransaction)
+            .as("%s", refused)
+            .isInstanceOf(IllegalArgumentException.class);
+      }
+      assertThat(catalog.listNamespaces()).isEmpty();
+    }
+
+    /**
+     * A catalog given another location: its namespace {@code catalog} is free, and a namespace or
+     * table whose default location is the object's is refused.
+     */
+    @Test
+    void ofACatalogElsewhereIsFree() {
+      FileIOCatalog catalog = fileIOCatalog(WAREHOUSE + "/ns/catalog", Map.of());
+      catalog.createNamespace(named);
+      catalog.createNamespace(Namespace.of("ns"));
+
+      assertThatThrownBy(() -> catalog.createNamespace(Namespace.of("ns", "catalog")))
+          .isInstanceOf(IllegalArgumentException.class);
+      TableIdentifier table = TableIdentifier.of("ns", "catalog");
+      assertThatThrownBy(() -> catalog.createTable(table, SCHEMA))
+          .isInstanceOf(IllegalArgumentException.class)
+          .hasMessageContaining(WAREHOUSE + "/ns/catalog");
+      assertThat(catalog.tableExists(table)).isFalse();
+
+      // with a location of its own, the table is created
+      assertThat(catalog.buildTable(table, SCHEMA).withLocation(WAREHOUSE + "/tables/catalog")
+          .create().location()).isEqualTo(WAREHOUSE + "/tables/catalog");
+    }
+
+    /** With unique table locations, a table's default location is never the object's. */
+    @Test
+    void aTableWithAUniqueLocationIsCreated() {
+      FileIOCatalog catalog = fileIOCatalog(WAREHOUSE + "/ns/catalog",
+          Map.of(CatalogProperties.UNIQUE_TABLE_LOCATION, "true"));
+      catalog.createNamespace(Namespace.of("ns"));
+      TableIdentifier table = TableIdentifier.of("ns", "catalog");
+
+      assertThat(catalog.createTable(table, SCHEMA).location())
+          .startsWith(WAREHOUSE + "/ns/catalog-");
+    }
+
+    /** A LogCatalog over another log keeps no object among its tables: every name is free. */
+    @Test
+    void ofALogElsewhereIsFree() {
+      LogCatalog catalog = LocalCatalogMode.MEMLOG.catalog(io, WAREHOUSE, "c", Map.of());
+      catalog.createNamespace(named);
+      catalog.createTable(TableIdentifier.of(named, "t"), SCHEMA);
+      assertThat(catalog.loadTable(TableIdentifier.of(named, "t")).location())
+          .isEqualTo(WAREHOUSE + "/catalog/t");
+    }
+  }
+
   /** Properties of a catalog whose creates bind names by the namespace's version. */
   private static final Map<String, String> BY_NAMESPACE =
       Map.of(LogCatalogProperties.CREATE_CONDITION, "namespace");
