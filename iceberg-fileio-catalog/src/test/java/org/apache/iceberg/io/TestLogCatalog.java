@@ -22,8 +22,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
@@ -33,6 +37,7 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.inmemory.InMemoryFileIO;
+import org.apache.iceberg.relocated.com.google.common.util.concurrent.MoreExecutors;
 import org.apache.iceberg.types.Types;
 import org.intentlog.fileio.AtomicFileLog;
 import org.junit.jupiter.api.Test;
@@ -94,6 +99,61 @@ class TestLogCatalog {
     assertThat(read.currentSnapshot().addedDataFiles(read.io()))
         .extracting(DataFile::location)
         .containsExactly(file.location());
+  }
+
+  /**
+   * The catalog's own parallel work, here a drop that keeps an inline-ML table's files writing its
+   * manifest lists, runs on Iceberg's worker pool, or on the executor the catalog is given ({@link
+   * LogCatalog#executeWith}): a direct one runs it on the calling thread, where a benchmark
+   * attributes its requests to the operation.
+   */
+  @ParameterizedTest(name = "direct={0}")
+  @ValueSource(booleans = {true, false})
+  void aDropWritesItsListsOnTheCatalogsExecutor(boolean direct) {
+    Set<Thread> writers = ConcurrentHashMap.newKeySet();
+    List<String> lists = new CopyOnWriteArrayList<>();
+    FileIO io = new InMemoryFileIO() {
+      @Override
+      public OutputFile newOutputFile(String location) {
+        if (location.contains("/metadata/snap-")) {
+          writers.add(Thread.currentThread());
+          lists.add(location);
+        }
+        return super.newOutputFile(location);
+      }
+    };
+    LogCatalog catalog =
+        new LogCatalog("c", new AtomicFileLog(logIO, logLocation), io, new HashMap<>());
+    catalog.initialize("c", Map.of(
+        CatalogProperties.WAREHOUSE_LOCATION, warehouse,
+        "fileio.catalog.inline", "true",
+        "fileio.catalog.inline.manifests", "true"));
+    if (direct) {
+      catalog.executeWith(MoreExecutors.newDirectExecutorService());
+    }
+    Namespace ns = Namespace.of("db");
+    TableIdentifier id = TableIdentifier.of(ns, "t");
+    catalog.createNamespace(ns);
+    Table table = catalog.createTable(id, SCHEMA);
+    for (String name : List.of("a", "b", "c")) {
+      table.newFastAppend()
+          .appendFile(DataFiles.builder(PartitionSpec.unpartitioned())
+              .withPath(warehouse + "/db/t/data/" + name + ".parquet")
+              .withFileSizeInBytes(10)
+              .withRecordCount(1)
+              .build())
+          .commit();
+    }
+    assertThat(lists).as("the catalog holds the lists").isEmpty();
+
+    assertThat(catalog.dropTable(id, false)).isTrue();
+
+    assertThat(lists).hasSize(3);
+    if (direct) {
+      assertThat(writers).containsExactly(Thread.currentThread());
+    } else {
+      assertThat(writers).isNotEmpty().doesNotContain(Thread.currentThread());
+    }
   }
 
   @Test

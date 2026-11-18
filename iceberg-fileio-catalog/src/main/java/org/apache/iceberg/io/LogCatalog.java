@@ -154,6 +154,8 @@ public class LogCatalog extends BaseMetastoreCatalog
   // every catalog shares
   private java.util.concurrent.Executor cleanupExecutor = null;
   private CommitCleanup cleanup;
+  // What the catalog's own parallel work runs on (executeWith): null for Iceberg's worker pool
+  private volatile java.util.concurrent.ExecutorService workers = null;
 
   /**
    * A catalog whose subclass opens its log and FileIO when it is initialized ({@link #openLog}).
@@ -206,6 +208,23 @@ public class LogCatalog extends BaseMetastoreCatalog
   LogCatalog cleanupExecutor(java.util.concurrent.Executor executor) {
     Preconditions.checkState(log == null, "The catalog's cleanup is set before it is initialized");
     this.cleanupExecutor = executor;
+    return this;
+  }
+
+  /**
+   * Runs the catalog's own parallel work on {@code executorService} instead of Iceberg's shared
+   * worker pool ({@code ThreadPools.getWorkerPool()}), as a scan's {@code planWith} or an expiry's
+   * {@code executeDeleteWith} runs an operation's: writing an inline table's manifest lists to
+   * files when the table goes to a metadata file (a drop that keeps its files, an update or create
+   * that does not fit inline, an eviction to fit the log's record bound). A direct executor runs
+   * that work on the calling thread, where a benchmark attributes its requests to the operation.
+   * Table operations loaded before the call keep the executor they had; a drop, a create and a
+   * catalog transaction load theirs as they run. The deletes of what failed commits wrote run
+   * apart from it, off every operation's thread ({@link CommitCleanup}).
+   */
+  public LogCatalog executeWith(java.util.concurrent.ExecutorService executorService) {
+    Preconditions.checkNotNull(executorService, "Invalid executor service: null");
+    this.workers = executorService;
     return this;
   }
 
@@ -665,6 +684,7 @@ public class LogCatalog extends BaseMetastoreCatalog
             : new FileIOTableOperations(
                 tableIdentifier, log, io, inline, inlineSnapshots, read, cleanup);
     ops.pinsCommitOnce = pinsCommitOnce;
+    ops.workers = workers;
     ops.pinsExpiries = !LogCatalogProperties.expiryMerge(catalogProperties);
     ops.createCondition = createCondition;
     return ops;
@@ -987,6 +1007,9 @@ public class LogCatalog extends BaseMetastoreCatalog
     private boolean loaded = false;
     // Whether a commit of what Iceberg commits once pins it (LogCatalog.leavingCommitOnceUnpinned)
     private boolean pinsCommitOnce = true;
+    // What these operations' parallel work runs on (LogCatalog.executeWith): null for Iceberg's
+    // worker pool
+    private java.util.concurrent.ExecutorService workers = null;
     // Whether an expiry pins the version it read (fileio.catalog.expiry.merge false, an ablation)
     private boolean pinsExpiries = false;
     // Whether these are a replace transaction's, whose commit restates the table (Bug 81)
@@ -1267,7 +1290,8 @@ public class LogCatalog extends BaseMetastoreCatalog
       org.apache.iceberg.util.Tasks.foreach(inlineSnapshots)
           .stopOnFailure()
           .throwFailureWhenFinished()
-          .executeWith(org.apache.iceberg.util.ThreadPools.getWorkerPool())
+          .executeWith(
+              workers != null ? workers : org.apache.iceberg.util.ThreadPools.getWorkerPool())
           .run(
               s -> {
                 String name =

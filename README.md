@@ -319,7 +319,12 @@ on two daemon threads the JVM's catalogs share. A commit whose outcome
 is unknown keeps them, as its record may name them. Closing a catalog
 waits up to 2 s for its deletes, then drops the rest; those, a delete
 that fails, and deletes queued when the JVM exits leave their files for
-a GC by listing.
+a GC by listing. The catalog's own parallel work (writing an inline
+table's manifest lists to files, for a drop that keeps its files or an
+update that leaves inline storage) runs on Iceberg's worker pool unless
+`LogCatalog.executeWith` gives it an executor: a direct one runs it on the
+calling thread, as a benchmark that attributes requests to operations
+needs.
 
 See [docs/LOG.md](docs/LOG.md) for the commit protocol,
 [docs/ATOMIC_FILE_LOG.md](docs/ATOMIC_FILE_LOG.md) for how the catalog file
