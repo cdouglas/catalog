@@ -991,7 +991,7 @@ final class TableScript {
 
     /**
      * The partition of a row whose {@code cat} is {@code k + 1}, as {@link #newFile} writes it: one
-     * value for each transform, the k-th of four.
+     * value for each transform, the k-th (a day or an hour k after the first).
      */
     private static String partitionPath(PartitionSpec spec, int k) {
       List<String> path = new ArrayList<>();
@@ -1003,9 +1003,10 @@ final class TableScript {
         } else if (transform.equals("void")) {
           value = "null";
         } else if (transform.equals("day")) {
-          value = "2026-10-1" + (6 + k);
+          value = java.time.LocalDate.of(2026, 10, 16).plusDays(k).toString();
         } else if (transform.equals("hour")) {
-          value = "2026-10-16-0" + (3 + k);
+          value = java.time.LocalDateTime.of(2026, 10, 16, 3, 0).plusHours(k)
+              .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd-HH"));
         } else if (transform.startsWith("truncate") && spec.schema().findType(field.sourceId())
             .typeId() == org.apache.iceberg.types.Type.TypeID.STRING) {
           value = "ab" + (char) ('c' + k);
