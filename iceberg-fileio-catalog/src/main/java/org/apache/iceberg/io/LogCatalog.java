@@ -384,13 +384,16 @@ public class LogCatalog extends BaseMetastoreCatalog
     deleteQuietly(io, files);
   }
 
-  /** Deletes from {@code io} what a drop that did not land wrote, logging what it cannot. */
+  /**
+   * Deletes from {@code io} what a commit that did not land wrote (a drop's version of its table,
+   * an eviction's metadata), logging what it cannot.
+   */
   private static void deleteQuietly(FileIO io, java.util.Collection<String> files) {
     for (String file : files) {
       try {
         io.deleteFile(file);
       } catch (RuntimeException e) {
-        LOG.warn("Cannot delete {}, which a drop that did not land wrote", file, e);
+        LOG.warn("Cannot delete {}, which a commit that did not land wrote", file, e);
       }
     }
   }
@@ -475,8 +478,9 @@ public class LogCatalog extends BaseMetastoreCatalog
    * whose history behind the sealing line goes to import pages in a catalog that pages, so a
    * table of any depth fits. Returns whether the table is inline afterwards: false in a catalog
    * that does not inline, or when its head does not fit in {@code
-   * fileio.catalog.inline.max.update.size}, which leaves it as it was. Retries a conflict with a
-   * concurrent commit to the table on a fresh read, as many times as Iceberg retries a commit.
+   * fileio.catalog.inline.max.update.size}, or its record in what the log stores, which leaves it
+   * as it was. Retries a conflict with a concurrent commit to the table on a fresh read, as many
+   * times as Iceberg retries a commit.
    */
   public boolean reinline(TableIdentifier identifier) {
     for (int attempt = 1; ; attempt++) {
@@ -492,7 +496,7 @@ public class LogCatalog extends BaseMetastoreCatalog
       try {
         FileIOTableOperations ops = tableOpsAsRead(identifier, read);
         TableMetadata current = ops.current();
-        if (!ops.stageUpdate(mut, current, current, false)) {
+        if (!ops.stageUpdate(mut, current, current, false) || !fits(mut)) {
           return false;
         }
         mut.commit(log);
@@ -503,6 +507,12 @@ public class LogCatalog extends BaseMetastoreCatalog
         }
       }
     }
+  }
+
+  /** Whether {@code mut}'s record fits in what the catalog's log stores (CatalogLog.commit). */
+  private boolean fits(CatalogMutation mut) {
+    long bound = log.maxRecordBytes();
+    return bound <= 0 || log.recordBytes(mut) <= bound;
   }
 
   /**
@@ -1034,8 +1044,22 @@ public class LogCatalog extends BaseMetastoreCatalog
      * a writer that does not inline is committing to it.
      */
     String writeUpdateMetadata(boolean isCreate, TableMetadata metadata) {
-      TableMetadata file = withManifestListFiles(metadata);
+      return writeUpdateMetadata(isCreate, metadata, file -> { });
+    }
+
+    /**
+     * As {@link #writeUpdateMetadata(boolean, TableMetadata)}, giving each list file to {@code
+     * opened} as it is opened, and the metadata file once written: none for a create whose
+     * metadata names its file already (a registered table's), which exists.
+     */
+    private String writeUpdateMetadata(
+        boolean isCreate, TableMetadata metadata, Consumer<String> opened) {
+      TableMetadata file = withManifestListFiles(metadata, opened);
+      boolean exists = isCreate && file.metadataFileLocation() != null;
       String location = writeNewMetadataIfRequired(isCreate, file);
+      if (!exists) {
+        opened.accept(location);
+      }
       // what TableMetadataParser.read returns for the file just written, as core-perf's
       // JdbcTableOperations builds it, before the commit stages it
       written = TableMetadata.buildFrom(file)
@@ -1065,6 +1089,34 @@ public class LogCatalog extends BaseMetastoreCatalog
         deleteQuietly(io(), lists);
         throw e;
       }
+    }
+
+    /**
+     * How the inline update or create of {@code metadata} that these operations stage goes to a
+     * metadata file instead, if the record it is staged on is larger than the log stores ({@link
+     * CatalogMutation#evictLargest}): written as {@link #writeUpdateMetadata} writes an update too
+     * large to inline, its files deleted if the record does not land.
+     */
+    private CatalogMutation.Eviction eviction(boolean isCreate, TableMetadata metadata) {
+      return new CatalogMutation.Eviction() {
+        @Override
+        public String write(List<String> out) {
+          java.util.Queue<String> files = new java.util.concurrent.ConcurrentLinkedQueue<>();
+          try {
+            String location = writeUpdateMetadata(isCreate, metadata, files::add);
+            out.addAll(files);
+            return location;
+          } catch (RuntimeException e) {
+            deleteQuietly(io(), files);
+            throw e;
+          }
+        }
+
+        @Override
+        public void delete(List<String> files) {
+          deleteQuietly(io(), files);
+        }
+      };
     }
 
     /**
@@ -1364,9 +1416,11 @@ public class LogCatalog extends BaseMetastoreCatalog
             && !restatesAManifest(null, null, metadata, true, all)) {
           if (manifestBytes != null) {
             return mut -> mut.createTableInlineWithManifests(
-                tableId, metadataBytes, inline.codec.tag(), manifestBytes);
+                    tableId, metadataBytes, inline.codec.tag(), manifestBytes)
+                .evictable(tableId, eviction(true, metadata));
           }
-          return mut -> mut.createTableInline(tableId, metadataBytes, inline.codec.tag());
+          return mut -> mut.createTableInline(tableId, metadataBytes, inline.codec.tag())
+              .evictable(tableId, eviction(true, metadata));
         }
       }
       String location = writeUpdateMetadata(true, metadata);
@@ -1379,7 +1433,8 @@ public class LogCatalog extends BaseMetastoreCatalog
      * fits in
      * {@code fileio.catalog.inline.max.update.size}: a delta, if the table is inline (the common
      * case); the full metadata, inline, which re-inlines a pointer table; else a metadata file,
-     * which evicts the table from inline storage.
+     * which evicts the table from inline storage. An inline form goes to a metadata file too if the
+     * record it is committed in turns out larger than the log stores ({@link CatalogLog#commit}).
      */
     void stageUpdate(CatalogMutation mut, TableMetadata base, TableMetadata metadata) {
       stageUpdate(mut, base, metadata, true);
@@ -1437,6 +1492,7 @@ public class LogCatalog extends BaseMetastoreCatalog
             if (deltaBytes.length <= inline.maxUpdateSize) {
               mut.updateTableInlineDelta(tableId, deltaBytes);
               mut.bringingBack(tableId, broughtBack(proto, tblId, metadata));
+              evictable(mut, metadata, orFile);
               return true;
             }
           }
@@ -1497,10 +1553,23 @@ public class LogCatalog extends BaseMetastoreCatalog
           if (imported != null) {
             mut.importingBlocks(tableId, imported.put(log.pages(), tblId));
           }
+          evictable(mut, metadata, orFile);
           return true;
         }
       }
       return toFile(mut, metadata, orFile);
+    }
+
+    /**
+     * Makes the inline update of {@code metadata} just staged on {@code mut} go to a metadata file
+     * if its record is larger than the log stores, as one that does not fit in {@code
+     * fileio.catalog.inline.max.update.size} does, if {@code orFile}: the update stays inline only
+     * where it fits in both (CatalogLog.commit).
+     */
+    private void evictable(CatalogMutation mut, TableMetadata metadata, boolean orFile) {
+      if (orFile) {
+        mut.evictable(tableId, eviction(false, metadata));
+      }
     }
 
     /**

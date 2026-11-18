@@ -130,6 +130,8 @@ public final class InMemoryAppendBlobStore implements AppendBlobStore {
   private final Map<String, List<byte[]>> versions = new LinkedHashMap<>();
   private final List<Delayed> delayed = new ArrayList<>();
   private final int maxBlocks;
+  // The largest block it takes; 0 for the service's (maxBlockBytes)
+  private volatile long blockLimit = 0;
   private final LongSupplier clockMs;
   private long etags = 0;
   private boolean history = true;
@@ -174,6 +176,25 @@ public final class InMemoryAppendBlobStore implements AppendBlobStore {
     return maxBlocks;
   }
 
+  /**
+   * Takes blocks of at most {@code bytes} (Azure: 4 MiB before service version 2022-11-02, 100 MiB
+   * since, the default here): {@link #maxBlockBytes} says so, and a larger Append Block is refused
+   * ({@link Refused}, as the service's {@code 413}), with nothing landed. A log reads the limit when
+   * it is made, so a test sets it before the log on this store is opened.
+   */
+  public InMemoryAppendBlobStore limitBlockBytes(long bytes) {
+    if (bytes < 1) {
+      throw new IllegalArgumentException("A block limit of " + bytes + " bytes");
+    }
+    this.blockLimit = bytes;
+    return this;
+  }
+
+  @Override
+  public long maxBlockBytes() {
+    return blockLimit > 0 ? blockLimit : AppendBlobStore.super.maxBlockBytes();
+  }
+
   // ============================================================
   // Writes
   // ============================================================
@@ -200,6 +221,10 @@ public final class InMemoryAppendBlobStore implements AppendBlobStore {
     Stored s = blobs.get(name);
     if (s == null || !s.append) {
       throw new NotFound("No Append Blob " + name);
+    }
+    if (block.length > maxBlockBytes()) {
+      throw new Refused("RequestBodyTooLarge: a block of " + block.length + " bytes is larger than "
+          + maxBlockBytes(), null);
     }
     if (fault == Fault.DELAYED) {
       delayed.add(new Delayed(name, block.clone(), maxSize, appendPosition));

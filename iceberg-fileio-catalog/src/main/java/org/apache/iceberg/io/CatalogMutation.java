@@ -134,6 +134,10 @@ public class CatalogMutation {
   private final Set<TableIdentifier> pinned;
   // The version a delta was built on, where not this mutation's read's (a catalog transaction's)
   private final Map<TableIdentifier, Integer> deltaBases;
+  // How each inline update or create staged here goes to a metadata file instead (evict)
+  private final Map<TableIdentifier, Eviction> evictions;
+  // The files the evictions so far wrote, each with the eviction that deletes them
+  private final List<Map.Entry<Eviction, List<String>>> evicted;
 
   /**
    * A transaction staged on {@code base}, a read of the catalog's log, whose names bind by {@link
@@ -166,6 +170,8 @@ public class CatalogMutation {
     this.tableRenames = Maps.newHashMap();
     this.pinned = Sets.newHashSet();
     this.deltaBases = Maps.newHashMap();
+    this.evictions = Maps.newHashMap();
+    this.evicted = new ArrayList<>();
   }
 
   /** The read of the log this transaction is staged on, and commits on top of. */
@@ -417,6 +423,7 @@ public class CatalogMutation {
     inlineTableBroughtBack.remove(tableId);
     inlineTableImports.remove(tableId);
     inlineTableDeltaUpdates.remove(tableId);
+    evictions.remove(tableId);
     tables.put(tableId, null);
     return this;
   }
@@ -571,6 +578,147 @@ public class CatalogMutation {
         "Version %s of %s is not at or before the version read", version, table);
     deltaBases.put(table, version);
     return this;
+  }
+
+  /**
+   * How an inline update or create staged on a transaction goes to a metadata file instead, when
+   * the transaction's record is larger than its log stores ({@link #evictLargest}): the table's
+   * operations write its metadata as a pointer table's (each inline-ML snapshot's list to a file,
+   * then a metadata file), as they do an update too large to inline.
+   */
+  interface Eviction {
+    /**
+     * Writes the table's metadata file and returns its location, adding each file it wrote to
+     * {@code written}. A write that fails deletes what was written before it, and throws.
+     */
+    String write(List<String> written);
+
+    /** Deletes {@code files}, written for a record that did not land, logging what it cannot. */
+    void delete(List<String> files);
+  }
+
+  /**
+   * Makes {@code eviction} how the inline update or create of {@code table} staged on this
+   * transaction goes to a metadata file, if the record must shrink to fit its log.
+   */
+  CatalogMutation evictable(TableIdentifier table, Eviction eviction) {
+    evictions.put(table, eviction);
+    return this;
+  }
+
+  /**
+   * Stages the largest inline update or create of this transaction that can go to a metadata file
+   * ({@link #evictable}) as one: its eviction writes the file, and the update names it (an {@code
+   * UpdateTableLocation} action, or a create of a pointer table), which takes the table out of
+   * inline storage as an update too large to inline does. For a record larger than its log stores
+   * ({@link CatalogLog#commit}). Largest by the bytes it holds inline. Returns false if there is
+   * none left.
+   *
+   * <p>A delta a catalog transaction built on a version of its table older than this
+   * transaction's read ({@link #builtOn}) goes last: a metadata file applies only on the version
+   * it was built on, and the table has changed since, so its eviction fails the transaction as a
+   * conflict, as such an update that never fit inline does ({@link CommitFailedException}).
+   */
+  boolean evictLargest() {
+    evictions.keySet().removeIf(table -> !stagedInline(table));
+    TableIdentifier largest = null;
+    for (TableIdentifier table : evictions.keySet()) {
+      if (largest == null || evictsBefore(table, largest)) {
+        largest = table;
+      }
+    }
+    if (largest == null) {
+      return false;
+    }
+    if (behindRead(largest)) {
+      throw new CommitFailedException(
+          "Cannot commit: table %s changed since the transaction read it, and its update must "
+              + "go to a metadata file, which applies only on the version it was built on, for "
+              + "the transaction's record to fit in its log", largest);
+    }
+    Eviction eviction = evictions.remove(largest);
+    List<String> written = new ArrayList<>();
+    String location = eviction.write(written);
+    evicted.add(Map.entry(eviction, written));
+    if (inlineTables.containsKey(largest)) {
+      inlineTables.remove(largest);
+      inlineTableCodecs.remove(largest);
+      inlineTableCreateDeltas.remove(largest);
+      tables.put(largest, location);
+    } else {
+      inlineTableUpdates.remove(largest);
+      inlineTableUpdateCodecs.remove(largest);
+      inlineTableUpdateMlDeltas.remove(largest);
+      inlineTableUpdateRemovals.remove(largest);
+      inlineTableBroughtBack.remove(largest);
+      inlineTableImports.remove(largest);
+      inlineTableDeltaUpdates.remove(largest);
+      deltaBases.remove(largest);
+      tableUpdates.put(largest, location);
+    }
+    return true;
+  }
+
+  /**
+   * Deletes the files this transaction's evictions wrote ({@link #evictLargest}), for a record
+   * that did not land: none of them is named by the catalog.
+   */
+  void deleteEvicted() {
+    for (Map.Entry<Eviction, List<String>> e : evicted) {
+      e.getKey().delete(e.getValue());
+    }
+    evicted.clear();
+  }
+
+  private boolean stagedInline(TableIdentifier table) {
+    return inlineTables.containsKey(table)
+        || inlineTableUpdates.containsKey(table)
+        || inlineTableDeltaUpdates.containsKey(table);
+  }
+
+  // Whether table goes before other: one that can go first, then the larger, then by name
+  private boolean evictsBefore(TableIdentifier table, TableIdentifier other) {
+    boolean behind = behindRead(table);
+    if (behind != behindRead(other)) {
+      return !behind;
+    }
+    long bytes = inlineBytes(table);
+    long otherBytes = inlineBytes(other);
+    return bytes != otherBytes
+        ? bytes > otherBytes
+        : table.toString().compareTo(other.toString()) < 0;
+  }
+
+  // A delta built on a version of the table older than this transaction's read
+  private boolean behindRead(TableIdentifier table) {
+    Integer version = deltaBases.get(table);
+    Integer tblId = original.tableId(table);
+    return version != null && tblId != null && version != original.tableVersion(tblId);
+  }
+
+  // The bytes the table's inline update or create holds: what its eviction takes off the record
+  private long inlineBytes(TableIdentifier table) {
+    long bytes = length(inlineTables.get(table))
+        + length(inlineTableCreateDeltas.get(table))
+        + length(inlineTableUpdates.get(table))
+        + length(inlineTableUpdateMlDeltas.get(table))
+        + length(inlineTableDeltaUpdates.get(table));
+    long[] removed = inlineTableUpdateRemovals.get(table);
+    bytes += removed != null ? 8L * removed.length : 0;
+    for (SnapshotPages.BroughtBack back : inlineTableBroughtBack.getOrDefault(table, List.of())) {
+      bytes += back.leaf.length;
+      for (byte[] hash : back.proof) {
+        bytes += hash.length;
+      }
+    }
+    for (SnapshotPages.SealedBlock block : inlineTableImports.getOrDefault(table, List.of())) {
+      bytes += block.digest.length + block.merkleRoot.length + 8L * block.liveIds.length;
+    }
+    return bytes;
+  }
+
+  private static long length(byte[] bytes) {
+    return bytes != null ? bytes.length : 0;
   }
 
   // True when the namespace does NOT exist once this transaction's pending

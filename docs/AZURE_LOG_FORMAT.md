@@ -147,8 +147,10 @@ AZURE_LOG.md "Failures".
   (a change to it is a new format number for the catalog object).
 - **K** is at most the store's block limit (50,000), and K − 1 of the largest frame and a seal
   frame fit a blob (50,000 × 4 MiB), so a segment can always end (SG8). The largest record is
-  therefore at most the store's block and about 4 MiB at K = 50,000; a smaller K allows larger
-  records.
+  therefore at most the store's block and about 4 MiB at K = 50,000 (4,194,370 B); a smaller K
+  allows larger records. It is the log's `maxRecordBytes`: the commit loop rejects a larger
+  record (`TOO_LARGE`), and the catalog sends a record's inline table updates to metadata files,
+  largest first, until it fits (SPEC_TM.md "Size Budget").
 
 ## 9. Open issues
 

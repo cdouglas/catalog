@@ -391,6 +391,15 @@ public final class LogEnvelope {
     }
   }
 
+  /**
+   * The length of the {@code LogRecord} that {@link #encodeRecord} makes of an intention of {@code
+   * intentionBytes} bytes, whatever its id: the id's field (a tag, a length and 16 bytes) and the
+   * intention's (a tag, its length's varint and the intention).
+   */
+  public static long recordBytes(int intentionBytes) {
+    return 1 + 1 + 16 + 1 + ProtoWire.varintSize(intentionBytes) + (long) intentionBytes;
+  }
+
   /** Encodes a {@code LogRecord} that carries an intention. */
   public static byte[] encodeRecord(UUID id, byte[] intention) {
     try {

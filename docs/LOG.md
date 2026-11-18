@@ -113,7 +113,12 @@ threshold compares, and `continues(earlier)` says that the log only grew since
 `earlier` (on one object, it was not replaced). `maxRecordBytes` is the
 largest record one append stores (0: no limit): the commit loop writes a
 larger record in a replace, on a log that replaces itself, and rejects it
-before sending it (`TOO_LARGE`) on one that does not (Bug 71). A `Receipt` is
+before sending it (`TOO_LARGE`) on one that does not (Bug 71). A writer that
+keeps its records under the bound measures them as the loop does
+(`LogRuntime.maxRecordBytes`, 0 on a log that replaces itself, and
+`recordBytes`, the envelope around the encoded intention): the catalog sends
+inline table updates to metadata files until its record fits (SPEC_TM.md
+"Size Budget"). A `Receipt` is
 a provider's acknowledgement of a write: the version written, a log position,
 an offset or a sequence number.
 

@@ -205,6 +205,36 @@ class TestSharedLogRuntime {
     assertThat(log.records()).hasSize(1);
   }
 
+  /**
+   * What a writer that keeps its records under the log's bound measures ({@link
+   * LogRuntime#recordBytes}, {@link LogRuntime#maxRecordBytes}) is what the commit loop compares:
+   * a record of exactly the bound is sent, one byte more is rejected.
+   */
+  @Test
+  void aRecordOfTheBoundIsSentAndOneByteMoreIsNot() {
+    Replica<State> base = created();
+    assertThat(writer.maxRecordBytes()).as("no bound").isZero();
+    Txn fits = txn(base, "t", Set.of(), Set.of("a"));
+    Txn over = txn(base, "tt", Set.of(), Set.of("a"));
+    long bytes = writer.recordBytes(fits);
+    assertThat(writer.recordBytes(over)).isEqualTo(bytes + 1);
+    log.limitRecordBytes(bytes);
+    assertThat(writer.maxRecordBytes()).isEqualTo(bytes);
+
+    assertThatThrownBy(() -> writer.commit(base, over))
+        .isInstanceOfSatisfying(CommitRejectedException.class, e ->
+            assertThat(e.reason()).isEqualTo(CommitRejectedException.Reason.TOO_LARGE));
+    Replica<State> landed = writer.commit(base, fits);
+
+    assertThat(landed.state().version("a")).isEqualTo(1);
+    assertThat(log.records().get(log.records().size() - 1)).hasSize((int) bytes);
+    for (int n : new int[] {0, 1, 127, 128, 16_383, 16_384, 2_097_151, 2_097_152}) {
+      assertThat(LogEnvelope.recordBytes(n))
+          .as("a record of an intention of %d bytes", n)
+          .isEqualTo(LogEnvelope.encodeRecord(java.util.UUID.randomUUID(), new byte[n]).length);
+    }
+  }
+
   @Test
   void aRecordWhoseReadsAnotherCommitChangedIsRejectedWhereItLands() { // [ReadBack, Judge]
     Replica<State> base = created();

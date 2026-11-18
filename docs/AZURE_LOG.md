@@ -128,6 +128,11 @@ a writer whose record landed past the limit knows it with no read.
   dropped only then; the sweep also lists its log's segments for unnamed blobs no Install can
   name any more (empty ones: a credential that can't list leaks only those), and never another
   log's.
+- **A record** is one block, so the log bounds a record (its `maxRecordBytes`: the smaller of a
+  block and a (K − 1)th of a blob, less a frame's 17 bytes: 4,194,370 B at K = 50,000), and
+  cannot write a larger one in a replace as the one-object log does. A commit whose record is
+  over the bound sends its inline table updates to metadata files, largest first, until it fits
+  (SPEC_TM.md "Size Budget"); one that still does not fit fails (`RecordTooLargeException`).
 
 A read is two requests (the catalog object, then the segment), a refresh one.
 

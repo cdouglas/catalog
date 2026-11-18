@@ -363,8 +363,9 @@ metadata file location) clears the table's inline state, pool included.
 
 - A **pointer writer** (no inline TM) committing to an inline-ML table,
   and an inline writer **evicting** one (an update that does not fit in
-  `fileio.catalog.inline.max.update.size`, or restates a pooled manifest,
-  above), write a metadata file. A metadata file can name only manifest
+  `fileio.catalog.inline.max.update.size`, restates a pooled manifest,
+  above, or is in a record larger than the log stores, SPEC_TM.md "Size
+  Budget"), write a metadata file. A metadata file can name only manifest
   list files, so
   `writeUpdateMetadata` first writes each `InlineSnapshot`'s list to
   `<metadata dir>/snap-<snapshotId>-<uuid>.avro`
@@ -416,7 +417,7 @@ write a list holding a partitioned table's inline manifest.
 |-----------------------------------|---------|-------------|
 | `fileio.catalog.inline`           | `false` | Inline TM (see SPEC_TM.md). |
 | `fileio.catalog.inline.manifests` | `false` | Inline ML. Requires `inline=true`. |
-| `fileio.catalog.inline.max.update.size` | 4,190,208 | Largest inline table update, manifest updates included (see SPEC_TM.md). |
+| `fileio.catalog.inline.max.update.size` | 4,190,208 | Largest inline table update, manifest updates included; the log's bound on a record also applies (see SPEC_TM.md). |
 | `fileio.catalog.inline.strict`    | `false` | Fail loading a mixed-mode table (inline lists and list files) instead of logging a warning (see "Loading"). |
 
 Setting `inline.manifests=true` without `inline=true` raises

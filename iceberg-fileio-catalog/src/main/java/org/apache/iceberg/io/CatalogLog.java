@@ -132,18 +132,69 @@ public final class CatalogLog {
 
   /**
    * Commits {@code mutation} on top of the read it was staged on, and returns the read of the log
-   * its record landed in.
+   * its record landed in. On a log that bounds its records ({@link #maxRecordBytes}), a record
+   * larger than the bound first sends the transaction's inline updates and creates to metadata
+   * files, largest first, until it fits ({@link CatalogMutation#evictLargest}); if the commit then
+   * does not take effect, the files they wrote are deleted.
    *
    * @throws CommitFailedException if it did not take effect, and never will; or a subclass, or
    *     {@link org.apache.iceberg.exceptions.AlreadyExistsException} or {@link
    *     org.apache.iceberg.exceptions.NoSuchTableException}, as the state it lost to explains it
    *     ({@link CatalogMutation#explain})
    * @throws RecordTooLargeException if its record is larger than the log stores, on a log that
-   *     cannot replace itself: it did not take effect, and a retry of it cannot
+   *     cannot replace itself, with every inline update it could evict evicted: it did not take
+   *     effect, and a retry of it cannot
    * @throws CommitStateUnknownException if it may or may not have
    */
   public Replica<CatalogState> commit(CatalogMutation mutation) {
     Preconditions.checkNotNull(mutation.base(), "Cannot commit a transaction staged on no read");
+    try {
+      fit(mutation);
+    } catch (RuntimeException e) {
+      mutation.deleteEvicted(); // nothing was sent
+      throw e;
+    }
+    try {
+      return send(mutation);
+    } catch (CommitFailedException
+        | org.apache.iceberg.exceptions.AlreadyExistsException
+        | org.apache.iceberg.exceptions.NoSuchTableException
+        | RecordTooLargeException e) {
+      mutation.deleteEvicted(); // the record did not land
+      throw e;
+    }
+  }
+
+  /**
+   * The largest record this catalog's commits may send, or 0 if any may (a log that replaces
+   * itself writes a record larger than an append stores in a replace): what the commit loop
+   * rejects a larger record by ({@link LogRuntime#maxRecordBytes}).
+   */
+  public long maxRecordBytes() {
+    return runtime.maxRecordBytes();
+  }
+
+  /** The length of the record a commit of {@code mutation} sends ({@link LogRuntime#recordBytes}). */
+  public long recordBytes(CatalogMutation mutation) {
+    return runtime.recordBytes(mutation.intention());
+  }
+
+  /**
+   * Evicts {@code mutation}'s inline updates and creates, largest first, while its record is larger
+   * than the log stores: on a log with no bound, nothing. A record that still does not fit once
+   * none is left is sent as it is, and rejected ({@link RecordTooLargeException}).
+   */
+  private void fit(CatalogMutation mutation) {
+    long bound = runtime.maxRecordBytes();
+    if (bound <= 0) {
+      return;
+    }
+    while (runtime.recordBytes(mutation.intention()) > bound && mutation.evictLargest()) {
+      counts.evicted.increment();
+    }
+  }
+
+  private Replica<CatalogState> send(CatalogMutation mutation) {
     try {
       Replica<CatalogState> landed = seen(runtime.commit(mutation.base(), mutation.intention()));
       counts.committed.increment();
@@ -221,6 +272,7 @@ public final class CatalogLog {
     private final Map<String, LongAdder> reasons = new ConcurrentHashMap<>();
     private final LongAdder rejected = new LongAdder();
     private final LongAdder unknown = new LongAdder();
+    private final LongAdder evicted = new LongAdder();
 
     public long committed() {
       return committed.sum();
@@ -236,6 +288,14 @@ public final class CatalogLog {
 
     public long unknown() {
       return unknown.sum();
+    }
+
+    /**
+     * The inline updates and creates that went to metadata files for their records to fit in the
+     * log ({@link CatalogLog#commit}), whether or not the records landed.
+     */
+    public long evicted() {
+      return evicted.sum();
     }
 
     /** Conflicts by their reason, in its order. */

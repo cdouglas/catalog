@@ -775,6 +775,27 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
   }
 
   /**
+   * The largest record a commit to this log may send, or 0 if a record of any size may: a log that
+   * cannot replace itself rejects a commit whose record is larger than one append stores ({@link
+   * Capabilities#maxRecordBytes}) before sending it ({@link CommitRejectedException.Reason#TOO_LARGE});
+   * one that can writes it in a replace. As the log says now: a commit reads its capabilities when
+   * it starts.
+   */
+  public long maxRecordBytes() {
+    Capabilities caps = log.capabilities();
+    return caps.fusedReplace() ? 0 : caps.maxRecordBytes();
+  }
+
+  /**
+   * The length of the record a commit of {@code intention} sends, which is what the commit loop
+   * compares with {@link #maxRecordBytes}: a commit of it is rejected {@code TOO_LARGE} exactly
+   * when this is larger, on a log that bounds its records.
+   */
+  public long recordBytes(I intention) {
+    return LogEnvelope.recordBytes(machine.encodeIntention(intention).length);
+  }
+
+  /**
    * Commits {@code intention}, built from {@code base}, and returns the replica of the log its
    * record landed in. Then, as the policy says of that replica, its writer may compact the log
    * ({@link #compact} on a log that keeps its checkpoints apart, {@code compactAfter} on one that

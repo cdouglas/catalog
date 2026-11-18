@@ -6281,7 +6281,8 @@ public class TestCatalogRegressions {
    * same record four more times, with backoff, and the catalog's own drops, renames and namespace
    * changes retried it as often. It now throws RecordTooLargeException, a CleanableFailure that is
    * not a CommitFailedException: Iceberg does not retry it, and cleans up what the commit wrote.
-   * Found by the 2026-11-17 design review (API reviewer).
+   * Found by the 2026-11-17 design review (API reviewer). The records here are larger than the
+   * log stores even with their inline updates in metadata files (ARecordOverTheLogsBound...).
    */
   @Nested
   class ARecordLargerThanTheLogStores {
@@ -6292,7 +6293,8 @@ public class TestCatalogRegressions {
       LogCatalog catalog = catalog(io, LocalCatalogMode.MEMLOG_TM);
       catalog.createNamespace(mixedNs);
       Table table = catalog.createTable(mixed, intSchema);
-      LocalCatalogMode.sharedLog(io, CATALOG).limitRecordBytes(4096);
+      Set<String> before = metadataDirectory(io, table.location());
+      LocalCatalogMode.sharedLog(io, CATALOG).limitRecordBytes(64);
       long sent = catalog.log().counts().rejected();
 
       assertThatThrownBy(() -> table.updateProperties().set("k", bigValue(8192)).commit())
@@ -6301,6 +6303,10 @@ public class TestCatalogRegressions {
           .isNotInstanceOf(CommitFailedException.class);
 
       assertThat(catalog.log().counts().rejected() - sent).as("commits rejected").isEqualTo(1);
+      assertThat(catalog.log().counts().evicted()).as("the update evicted first").isEqualTo(1);
+      assertThat(metadataDirectory(io, table.location()))
+          .as("the metadata file its eviction wrote, deleted")
+          .isEqualTo(before);
       assertThat(catalog.loadTable(mixed).properties()).doesNotContainKey("k");
     }
 
@@ -6333,7 +6339,8 @@ public class TestCatalogRegressions {
       table.newFastAppend().appendFile(dataFile("a")).commit();
       catalog.createTable(u, intSchema);
       Set<String> before = metadataDirectory(io, table.location());
-      LocalCatalogMode.sharedLog(io, CATALOG).limitRecordBytes(4096);
+      Set<String> beforeU = metadataDirectory(io, catalog.loadTable(u).location());
+      LocalCatalogMode.sharedLog(io, CATALOG).limitRecordBytes(64);
 
       CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
       txn.asCatalog().dropTable(mixed, false);
@@ -6343,6 +6350,248 @@ public class TestCatalogRegressions {
       assertThat(catalog.tableExists(mixed)).isTrue();
       assertThat(metadataDirectory(io, table.location())).as("what the drop wrote, deleted")
           .isEqualTo(before);
+      assertThat(metadataDirectory(io, catalog.loadTable(u).location()))
+          .as("what the eviction of u's update wrote, deleted")
+          .isEqualTo(beforeU);
+    }
+  }
+
+  /**
+   * A record over the log's bound: {@code fileio.catalog.inline.max.update.size} bounds one
+   * table's update, not a record, and a log that cannot replace itself (the segmented log on Append
+   * Blobs: one block; a shared log with a record limit) rejects a larger record before sending it
+   * (TOO_LARGE, Bug 104 (oversized record retried as conflict)), which no retry changes: a catalog
+   * transaction over several inline tables, or one update under the limit but over the block with
+   * its envelope, could never land. A record over the bound now sends its inline updates and
+   * creates to metadata files, largest first, until it fits, as an update too large to inline goes
+   * (CatalogLog.commit); one that does not fit with none left still fails, and the files its
+   * evictions wrote are deleted. Found by the 2026-11-17 design review (API reviewer).
+   */
+  @Nested
+  class ARecordOverTheLogsBoundEvictsInlineUpdates {
+
+    /** The segments' blocks: each update below fits in one, and the transactions' records don't. */
+    private static final int BLOCK = 8192;
+
+    /** A catalog in {@code mode} (an AZLOG one) whose log's segments take blocks of {@code bytes}. */
+    private LogCatalog onBlocks(InMemoryAtomicFileIO io, LocalCatalogMode mode, long bytes) {
+      LocalCatalogMode.azureStore(io, CATALOG).limitBlockBytes(bytes);
+      return catalog(io, mode);
+    }
+
+    private TableIdentifier table(String name) {
+      return TableIdentifier.of(mixedNs, name);
+    }
+
+    private boolean inline(Table table) {
+      return ((org.apache.iceberg.HasTableOperations) table).operations().current()
+          .metadataFileLocation().startsWith("inline://");
+    }
+
+    /** The largest block the catalog's segments took. */
+    private int largestBlock(InMemoryAtomicFileIO io) {
+      return LocalCatalogMode.azureStore(io, CATALOG).appends().stream()
+          .mapToInt(a -> a.block().length).max().orElse(0);
+    }
+
+    @Test
+    void theBoundIsTheLogs() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog azure = onBlocks(io, LocalCatalogMode.AZLOG_TM, BLOCK);
+      assertThat(azure.log().maxRecordBytes())
+          .as("a block less a frame's overhead, at K = %s", LocalCatalogMode.AZURE_BLOCKS)
+          .isEqualTo(BLOCK - org.intentlog.segments.SegmentFrames.MAX_OVERHEAD);
+
+      // a log that replaces itself writes a larger record in a replace: it has no bound
+      InMemoryAtomicFileIO capped = new InMemoryAtomicFileIO();
+      capped.limitAppendBytes(4096);
+      assertThat(catalog(capped, LocalCatalogMode.APPEND_TM).log().maxRecordBytes()).isZero();
+      assertThat(catalog(new InMemoryAtomicFileIO(), LocalCatalogMode.MEMLOG_TM).log()
+          .maxRecordBytes()).isZero();
+    }
+
+    @ParameterizedTest
+    @EnumSource(names = {"AZLOG_TM", "AZLOG_ML"})
+    void aTransactionOverTheBoundEvictsItsLargestTables(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = onBlocks(io, mode, BLOCK);
+      Map<TableIdentifier, Integer> sizes =
+          Map.of(table("a"), 2500, table("b"), 3000, table("c"), 3500);
+      catalog.createNamespace(mixedNs);
+      sizes.keySet().forEach(id -> catalog.createTable(id, intSchema));
+
+      // each table's update fits in a block, and the three do not
+      CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      sizes.forEach((id, size) -> {
+        Table table = txn.asCatalog().loadTable(id);
+        table.updateProperties().set("k", bigValue(size)).commit();
+        table.newFastAppend().appendFile(dataFile(id.name())).commit();
+      });
+      txn.commitTransaction();
+
+      LogCatalog reader = catalog(io, mode);
+      sizes.forEach((id, size) -> {
+        Table table = reader.loadTable(id);
+        assertThat(table.properties()).as("%s", id).containsEntry("k", bigValue(size));
+        assertThat(dataFiles(table)).containsExactly("mem:///data/" + id.name() + ".parquet");
+        manifestLists(io, table);
+      });
+      assertThat(inline(reader.loadTable(table("c")))).as("the largest, evicted").isFalse();
+      assertThat(inline(reader.loadTable(table("a")))).as("a, inline").isTrue();
+      assertThat(inline(reader.loadTable(table("b")))).as("b, inline").isTrue();
+      assertThat(catalog.log().counts().evicted()).isEqualTo(1);
+      assertThat(largestBlock(io)).as("the transaction's block").isLessThanOrEqualTo(BLOCK);
+    }
+
+    @ParameterizedTest
+    @EnumSource(names = {"AZLOG_TM", "AZLOG_ML"})
+    void anUpdateUnderTheInlineLimitButOverTheBoundGoesToAMetadataFile(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = onBlocks(io, mode, BLOCK);
+      catalog.createNamespace(mixedNs);
+      Table table = catalog.createTable(mixed, intSchema);
+      table.newFastAppend().appendFile(dataFile("a")).commit();
+      assertThat(inline(catalog.loadTable(mixed))).isTrue();
+
+      // under fileio.catalog.inline.max.update.size (4 MiB), over the block
+      table.updateProperties().set("k", bigValue(2 * BLOCK)).commit();
+
+      Table read = catalog(io, mode).loadTable(mixed);
+      assertThat(read.properties()).containsEntry("k", bigValue(2 * BLOCK));
+      assertThat(dataFiles(read)).containsExactly("mem:///data/a.parquet");
+      assertThat(inline(read)).as("evicted").isFalse();
+      manifestLists(io, read);
+
+      // and its next update that fits goes inline again
+      read.updateProperties().remove("k").commit();
+      assertThat(inline(catalog(io, mode).loadTable(mixed))).as("back inline").isTrue();
+    }
+
+    @ParameterizedTest
+    @EnumSource(names = {"AZLOG_TM", "AZLOG_ML"})
+    void aCreateOverTheBoundGoesToAMetadataFile(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = onBlocks(io, mode, BLOCK);
+      catalog.createNamespace(mixedNs);
+
+      org.apache.iceberg.Transaction create = catalog.buildTable(mixed, intSchema)
+          .withProperty("k", bigValue(2 * BLOCK))
+          .createTransaction();
+      create.newFastAppend().appendFile(dataFile("a")).commit();
+      create.commitTransaction();
+
+      Table read = catalog(io, mode).loadTable(mixed);
+      assertThat(read.properties()).containsEntry("k", bigValue(2 * BLOCK));
+      assertThat(dataFiles(read)).containsExactly("mem:///data/a.parquet");
+      assertThat(inline(read)).as("created as a pointer table").isFalse();
+      manifestLists(io, read);
+    }
+
+    @ParameterizedTest
+    @EnumSource(names = {"AZLOG_TM", "AZLOG_ML"})
+    void aRecordThatDoesNotFitEvictedFailsAndDeletesWhatItsEvictionsWrote(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = onBlocks(io, mode, BLOCK);
+      catalog.createNamespace(mixedNs);
+      Table table = catalog.createTable(mixed, intSchema);
+
+      // a namespace property over the block, which no eviction shrinks
+      CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      Table staged = txn.asCatalog().loadTable(mixed);
+      staged.updateProperties().set("k", bigValue(BLOCK / 2)).commit();
+      staged.newFastAppend().appendFile(dataFile("a")).commit();
+      ((org.apache.iceberg.catalog.SupportsNamespaces) txn.asCatalog())
+          .setProperties(mixedNs, Map.of("k", bigValue(2 * BLOCK)));
+      Set<String> before = metadataDirectory(io, table.location());
+
+      assertThatThrownBy(txn::commitTransaction).isInstanceOf(RecordTooLargeException.class);
+
+      assertThat(catalog.log().counts().evicted()).as("the table's update evicted").isEqualTo(1);
+      assertThat(metadataDirectory(io, table.location()))
+          .as("the files its eviction wrote, deleted")
+          .isSubsetOf(before);
+      Table read = catalog(io, mode).loadTable(mixed);
+      assertThat(read.properties()).doesNotContainKey("k");
+      assertThat(read.currentSnapshot()).isNull();
+      assertThat(inline(read)).isTrue();
+    }
+
+    @ParameterizedTest
+    @EnumSource(names = {"AZLOG_TM", "AZLOG_ML"})
+    void aCreateWhoseMetadataFileItselfIsOverTheBoundFails(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = onBlocks(io, mode, BLOCK);
+      catalog.createNamespace(mixedNs);
+      // a name that compresses little: an inline create compresses its metadata
+      java.util.Random random = new java.util.Random(1);
+      StringBuilder name = new StringBuilder();
+      for (int i = 0; i < 4 * BLOCK; i++) {
+        name.append((char) ('a' + random.nextInt(26)));
+      }
+      String location = WAREHOUSE + "/" + name;
+
+      assertThatThrownBy(
+              () -> catalog.buildTable(mixed, intSchema).withLocation(location).create())
+          .isInstanceOf(RecordTooLargeException.class);
+
+      assertThat(catalog.log().counts().evicted()).isEqualTo(1);
+      assertThat(metadataDirectory(io, location)).as("its metadata file, deleted").isEmpty();
+      assertThat(catalog.tableExists(mixed)).isFalse();
+    }
+
+    /**
+     * A catalog transaction's delta built on a version of its table that changed since goes to a
+     * metadata file last: a metadata file applies only on the version it was built on, so its
+     * eviction would fail the transaction (or, applied to the version read since, lose the change).
+     */
+    @Test
+    void aDeltaBuiltOnAnOlderVersionIsEvictedLast() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = onBlocks(io, LocalCatalogMode.AZLOG_ML, BLOCK);
+      LogCatalog other = catalog(io, LocalCatalogMode.AZLOG_ML);
+      TableIdentifier u = table("u");
+      catalog.createNamespace(mixedNs);
+      catalog.createTable(mixed, intSchema).newFastAppend().appendFile(dataFile("x")).commit();
+      catalog.createTable(u, intSchema);
+      CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      txn.asCatalog().loadTable(mixed).newFastAppend().appendFile(dataFile("a"))
+          .set("big", bigValue(5000)).commit();
+      txn.asCatalog().loadTable(u).updateProperties().set("k", bigValue(3500)).commit();
+      other.loadTable(mixed).newFastAppend().appendFile(dataFile("b")).commit();
+
+      // mixed's delta is the larger, and the transaction read the version before b
+      txn.commitTransaction();
+
+      LogCatalog reader = catalog(io, LocalCatalogMode.AZLOG_ML);
+      assertThat(dataFiles(reader.loadTable(mixed))).containsExactly(
+          "mem:///data/a.parquet", "mem:///data/b.parquet", "mem:///data/x.parquet");
+      assertThat(inline(reader.loadTable(mixed))).as("mixed, merged inline").isTrue();
+      assertThat(reader.loadTable(u).properties()).containsEntry("k", bigValue(3500));
+      assertThat(inline(reader.loadTable(u))).as("u, evicted").isFalse();
+    }
+
+    @Test
+    void aDeltaBuiltOnAnOlderVersionThatMustBeEvictedConflicts() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = onBlocks(io, LocalCatalogMode.AZLOG_ML, BLOCK);
+      LogCatalog other = catalog(io, LocalCatalogMode.AZLOG_ML);
+      catalog.createNamespace(mixedNs);
+      Table table = catalog.createTable(mixed, intSchema);
+      table.newFastAppend().appendFile(dataFile("x")).commit();
+      CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      txn.asCatalog().loadTable(mixed).newFastAppend().appendFile(dataFile("a"))
+          .set("big", bigValue(2 * BLOCK)).commit();
+      other.loadTable(mixed).newFastAppend().appendFile(dataFile("b")).commit();
+      Set<String> before = metadataDirectory(io, table.location());
+
+      assertThatThrownBy(txn::commitTransaction)
+          .isInstanceOf(CommitFailedException.class)
+          .hasMessageContaining("changed since the transaction read it");
+
+      Table read = catalog(io, LocalCatalogMode.AZLOG_ML).loadTable(mixed);
+      assertThat(dataFiles(read)).as("b kept")
+          .containsExactly("mem:///data/b.parquet", "mem:///data/x.parquet");
+      assertThat(metadataDirectory(io, table.location())).isSubsetOf(before);
     }
   }
 

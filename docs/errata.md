@@ -271,8 +271,9 @@ root holds 0.36 MB, and 1.07 MB lies in 24 pages (SNAPSHOT_PAGING.md
   merge shrinks, and fast appends never merge.
 - The root keeps about 18 B a sealed snapshot, so it grows with the history
   expiry leaves.
-- Eviction is by update size only (`fileio.catalog.inline.max.update.size`),
-  so a table whose deltas fit stays inline however large it grows. A per-table
+- Eviction is by the size of an update (`fileio.catalog.inline.max.update.size`)
+  or of its record (the log's bound, SPEC_TM.md "Size Budget"), so a table
+  whose deltas fit stays inline however large it grows. A per-table
   size threshold would evict it to pointer mode (SNAPSHOT_PAGING.md step 6,
   cold-table eviction, deferred).
 

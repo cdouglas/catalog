@@ -118,7 +118,8 @@ When an inline catalog commits a table update,
 `FileIOTableOperations.stageUpdate()` takes the first of three modes
 whose payload fits in `fileio.catalog.inline.max.update.size` (default
 `InlineDeltaCodec.APPEND_LIMIT` = 4 MiB - 4096, leaving a safety margin
-for framing):
+for framing), and whose record fits in what the catalog's log stores
+(see "Size Budget"):
 
 | Mode        | Payload                            | When used                                   |
 |-------------|------------------------------------|---------------------------------------------|
@@ -671,7 +672,7 @@ admits.
 |-----------------------------------|---------------|-------------|
 | `fileio.catalog.inline`           | `false`       | Enable inline TM. When true, `doCommit()` uses delta/full/pointer mode selection instead of writing external metadata files. |
 | `fileio.catalog.inline.tm.codec`  | `structural`  | Codec for newly-written inline `TableMetadata` bytes. `structural` (binary, columnar) or `gzip` (gzipped JSON). Decode is always driven by the on-wire codec tag, so changing this setting affects only new writes. |
-| `fileio.catalog.inline.max.update.size` | 4,190,208 | Largest inline table update in bytes (a delta, or full metadata with its manifest updates). A larger update writes a metadata file. See "Delivery Modes". |
+| `fileio.catalog.inline.max.update.size` | 4,190,208 | Largest inline table update in bytes (a delta, or full metadata with its manifest updates). A larger update writes a metadata file, as does one whose record is larger than the log stores. See "Delivery Modes" and "Size Budget". |
 
 `fileio.catalog.max.append.count` and `fileio.catalog.max.append.size`
 (see [ATOMIC_FILE_LOG.md](ATOMIC_FILE_LOG.md)) still apply.
@@ -830,7 +831,8 @@ it), moves the snapshot inline with its list and entries, and removes it from
 ### Inline → Pointer (Eviction)
 
 Triggered when an update fits in `fileio.catalog.inline.max.update.size`
-neither as a delta nor in full, or restates a pooled manifest (SPEC_ML).
+neither as a delta nor in full, restates a pooled manifest (SPEC_ML), or
+is in a record larger than the log stores ("Size Budget" below).
 On eviction:
 
 1. Write each inline-ML snapshot's manifest list to an Avro file
@@ -903,6 +905,48 @@ Approximate sizes per update:
 | Full metadata (6000+ snapshots)| >4 MB          | no → pointer mode |
 
 The delta path handles >99.9% of updates.
+
+### The record's bound
+
+`fileio.catalog.inline.max.update.size` bounds one table's update, not a
+record: a record also holds its envelope (the commit's id), every other
+action of its transaction, and an update's brought-back proofs and import
+entries. The bound on a record is the log's
+(`Capabilities.maxRecordBytes`), and only a log that cannot replace
+itself has one: on Azure Append Blobs, a segment's frame, the smaller of
+a block and a (K − 1)th of a blob, less the frame's 17 bytes (4,194,370 B
+at K = 50,000 on a real account; AZURE_LOG.md); a shared log's record
+limit. `AtomicFileLog` writes a record larger than
+an append stores in a replace, so a catalog on one object has none.
+Typical records are small (the benchmark's captures average about
+460 B), but megabytes are plausible: a full update of an inline table
+with a wide schema and a long schema history, an inline-ML delta from a
+large manifest rewrite, a catalog transaction over many tables, large
+table properties.
+
+Each commit measures its record as the commit loop will
+(`LogRuntime.recordBytes`: the envelope around the encoded intention,
+which is what the loop compares with `LogRuntime.maxRecordBytes`, so the
+two agree to the byte). While the record is over the bound,
+`CatalogLog.commit` sends the largest of its inline updates and creates
+(by the bytes each holds inline) to a metadata file, as an update that
+does not fit in `max.update.size` goes (pointer mode, "Inline → Pointer"
+above), and measures again. The effective inline limit of a single-table
+commit is thus the smaller of `max.update.size` and what the bound leaves
+of the record; a catalog transaction keeps its smaller tables inline.
+A delta that a catalog transaction built on a version of its table older
+than the version its commit staged on goes last: a metadata file applies
+only on the version it was built on, so its eviction fails the
+transaction as a conflict (`CommitFailedException`), as the
+transaction's updates that never fit inline fail on a changed table. A
+record still over the bound with nothing left inline is rejected
+(`RecordTooLargeException`, not retried). The files a record's
+evictions wrote are deleted if it does not land (a conflict, a
+rejection), and kept if its outcome is unknown.
+`LogCatalog.reinline` returns false for a record over the bound and
+commits nothing. Evictions count in `CatalogLog.CommitCounts.evicted`.
+A record is never fragmented over several appends: that protocol waits
+for records over the bound to turn out common.
 
 ## Compatibility
 

@@ -136,9 +136,10 @@ read); the table changes (`TableChange`: the name at the start, the metadata fir
 tables (name and metadata); and the namespace changes. Failures: `CommitFailedException` for a
 condition or read that no longer holds, `ValidationException` for an update's own validation,
 `CommitStateUnknownException` when the outcome is unknown, `UnsupportedOperationException` for what
-the catalog cannot do. FileIOCatalog also throws `RecordTooLargeException` for a transaction whose
-record is larger than its log stores in one append, on a log that cannot replace itself (the
-segmented log on Append Blobs).
+the catalog cannot do. On a log that cannot replace itself (the segmented log on Append Blobs),
+FileIOCatalog sends a transaction's largest inline table updates to metadata files until its
+record fits in one append (SPEC_TM.md "Size Budget"), and throws `RecordTooLargeException` for one
+that does not fit with none left.
 
 | Catalog | SNAPSHOT | SERIALIZABLE | Catalog changes |
 |---|---|---|---|
