@@ -825,8 +825,12 @@ record landed, and only if replay judged none, by the committed set. On a log
 with checkpoints apart, another compactor's GC record can land between a
 writer's record and its read, and drop the id of a record that applied; the
 committed set alone would report a landed commit as failed (`setonly` in
-`SharedLogCommit.tla`). On one object the two always agree: a version's only
-GC record precedes every record appended to it.
+`SharedLogCommit.tla`). On one object a version's GC record precedes the
+records appended to it, except in a compaction sent again after it lost to
+appends (`CompactionPolicy.resend`, "Compaction" below): that version is
+`[chk][records][gc][page-outs]`, and its GC record can drop the id of a copied
+record that applied (when its watermark passes the record's id). Replay judged
+the record where it landed, so the rule's first step answers for it there too.
 
 **Unconditional appends.** A log without conditional appends needs no fencing.
 A copy of a record that applied is skipped by its id, or once GC dropped the

@@ -89,9 +89,11 @@ replay applied, in order. The properties are stated over it.
 
 A commit judges its own record as `LogRuntime.landed` does: by what replay did
 with it first (applied or rejected), and only if replay did not judge it, by the
-committed set. On one object a GC record precedes every record of its version,
-so the two agree: judging by the committed set alone reached the same states in
-every configuration.
+committed set. On one object a version's GC record precedes the records
+appended to it, except in a compaction sent again (`CompactResends`), which
+copies the records that beat it in front of its GC record; that GC record can
+drop the id of a copied record that applied, and replay's judgment, which comes
+first, answers for it.
 
 **Writers.** Each writer runs its operations in turn. Each writer action is
 one storage request, so other writers interleave between any two. Faults are

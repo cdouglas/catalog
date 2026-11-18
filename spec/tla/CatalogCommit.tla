@@ -372,8 +372,9 @@ Committed(w, s, R) ==
 \* commit's own record. Committed if replay applied it, or if R holds its
 \* id; at or below R's horizon, unknown if a write may have landed, else
 \* CommitFailedException (with Bug 64d the exception escaped raw);
-\* otherwise `then`. On one object, a GC record precedes every record of
-\* its version, so replay's judgment and the committed set agree. A paged
+\* otherwise `then`. Replay's judgment comes first: on one object a
+\* compaction sent again copies the records that beat it in front of its GC
+\* record, which can drop the id of a copied record that applied. A paged
 \* id is looked up in its page (pf: the get fails): one its page lacks can
 \* never apply (BEYOND_FLOOR: CommitFailedException); a get that fails is a
 \* failed read, in a read back (rb) an ambiguous write; a page deleted since

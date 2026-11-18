@@ -170,7 +170,7 @@ Earlier(s) == s.amb \/ (s.dup /\ ~Has("dup"))
 
 \* landed(): what a read R (watching the commit's record) says of it,
 \* through the page store when its id is paged (pf: the get fails). With
-\* "setonly", the committed set alone decides, as on one object. An id its
+\* "setonly", the committed set alone decides. An id its
 \* page lacks can never apply: the commit fails (BEYOND_FLOOR). A get that
 \* fails is a failed read: in a read back (rb) the write is ambiguous, else
 \* the outcome unknown. A page deleted since the read (GC dropped it): the
