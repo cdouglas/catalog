@@ -367,7 +367,7 @@ calib() {
       # the try each property first failed at: a round's tries for the property should be ten
       # times the largest of these among the mutants its job is meant to catch (calibration margin)
       if [ "$verdict" = caught ]; then
-        at=$(failed $O/$m.log 2>/dev/null | awk '{printf "%s%s.%s at try %s", NR > 1 ? ", " : "", $1, $2, $4}')
+        at=$(failed $O/$m.log 2>/dev/null | awk '{printf "%s%s.%s at try %s", (NR > 1 ? ", " : ""), $1, $2, $4}')
         [ -n "$at" ] && verdict="caught ($at)"
       fi
     fi
