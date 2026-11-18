@@ -229,16 +229,20 @@ boundary, decoded.
 
 **A whole read** (`read()`) is one GET of every byte where the store's GET
 reports the version and length it read (`readsRecordVersion()`: S3, ADLS;
-step 7), and a HEAD then a GET elsewhere (GCS), checked as above. A view
-records its incarnation and its frames' offsets.
+step 7), and a HEAD then a GET elsewhere (GCS), checked as above. One GET
+reads to the stream's end, which must be the length the GET reported: a store
+that served a superseded version's bytes up to where a shorter live version
+ends would end the read at a frame's end, every frame checking, and a prefix
+of the version is not the version (Bug 122 (spliced read went backwards)). A
+view records its incarnation and its frames' offsets.
 
 **A tail read** (`readAfter(since)`), from a tail whose bytes this log read or
 wrote (incarnation X, length N). Where the store's reads record their
 version, it is one GET of [N − 20, end) of the version V it finds, which
-reports V and its length L, and then steps 3 and 4; if those bytes are not
-X's trailer, or the GET found nothing (V ends before N − 20: a 416, which the
-stream reports as its end), V is read whole, a second GET of V from its
-start. Elsewhere (GCS, or `fileio.catalog.read.
+reports V and its length L, where the read must end, and then steps 3 and 4;
+if those bytes are not X's trailer, or the GET found nothing (V ends before
+N − 20: a 416, which the stream reports as its end), V is read whole, a second
+GET of V from its start. Elsewhere (GCS, or `fileio.catalog.read.
 lookup`):
 
 1. A HEAD: the version V and its length L. If L < N, the object was replaced:
@@ -664,7 +668,10 @@ Standard about 27 ms, two or more a commit).
   ([Replaying a suffix](#replaying-a-suffix)).
 - `AtomicFileLog` unit tests: a replace longer than the tail, a replace of the
   same length, a splice at and inside a frame, a tail read with nothing new,
-  a tail read whose GET finds the object shorter than its HEAD did.
+  a tail read whose GET finds the object shorter than its HEAD did, and reads
+  in one GET served short of their version at a frame's end (Bug 122 (spliced
+  read went backwards): a tail read, a read through an append, a refresh, and
+  a commit that settles an append whose reply was lost).
   `SharedLogContract`'s `readAfter` case on `AtomicFileLog`.
 - Gaps on a shared log (S4): a `MemoryLogHarness` mode that serves a
   checkpoint and records with a gap between them, or trims past its newest

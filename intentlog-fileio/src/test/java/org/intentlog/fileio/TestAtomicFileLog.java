@@ -31,19 +31,28 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.zip.CRC32C;
 import org.apache.iceberg.io.AtomicOutputFile;
 import org.apache.iceberg.io.InMemoryAtomicFileIO;
 import org.apache.iceberg.io.SupportsAtomicOperations;
+import org.intentlog.CompactionPolicy;
 import org.intentlog.LogConflictException;
 import org.intentlog.LogFullException;
 import org.intentlog.LogNotSentException;
 import org.intentlog.LogRefusedException;
+import org.intentlog.LogRuntime;
 import org.intentlog.LogTail;
 import org.intentlog.LogThrottledException;
 import org.intentlog.LogView;
 import org.intentlog.Receipt;
+import org.intentlog.Replay;
+import org.intentlog.Replica;
+import org.intentlog.RuntimeConfig;
+import org.intentlog.testkit.EntityVersionsMachine;
+import org.intentlog.wire.LogEnvelope;
 import org.junit.jupiter.api.Test;
 
 /** The atomic-file log: its layout, and the store's signals mapped onto the log's. */
@@ -897,5 +906,226 @@ class TestAtomicFileLog {
         assertThat(after.records()).hasSize(replacement.size());
       }
     }
+  }
+
+  /**
+   * Bug 122 (spliced read went backwards): where a store's reads record their version (S3, ADLS),
+   * a read reads to the end of the stream, and its GET reports the version's length. A tail read
+   * that found the object replaced reads that version whole, by a second GET; a replace by a
+   * shorter object that lands before it, on a store that serves the rest of a superseded version
+   * from the live one (a stream reopened mid-read, unpinned, past the live object's end, which the
+   * fork's streams report as their end), ends the read where the live object ends: a prefix of the
+   * version, every frame of it checked, behind the replica the read continued. A read that ends
+   * short of the length its GET reported is torn, and is read again.
+   */
+  @Test
+  void aReadEndingShortOfTheVersionItsGetFoundReadsAgain() {
+    InMemoryAtomicFileIO store = new InMemoryAtomicFileIO();
+    store.setReadsRecordVersion(true);
+    AtomicLong incarnations = new AtomicLong();
+    AtomicFileLog reader = new AtomicFileLog(store, LOCATION, incarnations::incrementAndGet);
+    AtomicFileLog writer = new AtomicFileLog(store, LOCATION, incarnations::incrementAndGet);
+    LogView held = reader.readThrough(reader.replace(AtomicFileLog.tailOf(
+        store.newInputFile(LOCATION)), bytes("checkpoint"),
+        List.of(bytes("r1"), bytes("r2"), bytes("r3"))), Duration.ZERO);
+    // Another writer's replace: a version whose checkpoint is behind the replica, and records
+    // after it (as a compaction sent again with the records that beat it writes)
+    LogView copied = writer.readThrough(writer.replace(held.tail(), bytes("checkpoint"),
+        List.of(bytes("r1"), bytes("r2"), bytes("r3"), bytes("r4"))), Duration.ZERO);
+    // spliced at the end of r1's frame in the version the read found
+    spliceAt(store, AtomicFileLog.encode(bytes("checkpoint"), List.of(bytes("r1"))).length);
+    AtomicInteger requests = new AtomicInteger();
+    store.injectReadFaults(location -> {
+      if (requests.incrementAndGet() == 2) { // the GET of the version the tail read found, whole
+        store.injectReadFaults(this::noFault);
+        writer.replace(copied.tail(), bytes("c"), List.of());
+      }
+      return InMemoryAtomicFileIO.ReadFault.NONE;
+    });
+
+    LogView after = reader.readAfter(held.tail());
+    assertThat(store.served(InMemoryAtomicFileIO.ReadMode.SPLICE)).isEqualTo(1);
+    assertThat(string(after.checkpoint().orElseThrow())).isEqualTo("c");
+    assertThat(after.records()).isEmpty();
+    assertSameView(after, reader.read());
+  }
+
+  /**
+   * Bug 122: a read through an append from a probed tail reads the version the append wrote; one
+   * that a shorter object superseded, served as that version's bytes up to a frame's end before
+   * the record and nothing after, ends short of the length the write gave it: it is torn, and the
+   * read is of the live object, not a view without the record (P3).
+   */
+  @Test
+  void aReadThroughEndingShortOfTheVersionWrittenReadsTheObject() {
+    InMemoryAtomicFileIO store = new InMemoryAtomicFileIO();
+    store.setReadsRecordVersion(true);
+    AtomicLong incarnations = new AtomicLong();
+    AtomicFileLog mine = new AtomicFileLog(store, LOCATION, incarnations::incrementAndGet);
+    AtomicFileLog other = new AtomicFileLog(store, LOCATION, incarnations::incrementAndGet);
+    mine.replace(AtomicFileLog.tailOf(store.newInputFile(LOCATION)), bytes("checkpoint"),
+        List.of(bytes("r1"), bytes("r2")));
+    Receipt receipt = mine.append(bytes("r3"), mine.probe());
+    LogView appended = other.read();
+    other.replace(appended.tail(), bytes("c"), List.of());
+    // spliced at the end of r2's frame, before the record the append wrote
+    spliceAt(store,
+        AtomicFileLog.encode(bytes("checkpoint"), List.of(bytes("r1"), bytes("r2"))).length);
+
+    LogView through = mine.readThrough(receipt, Duration.ZERO);
+    assertThat(store.served(InMemoryAtomicFileIO.ReadMode.SPLICE)).isEqualTo(1);
+    assertThat(string(through.checkpoint().orElseThrow())).isEqualTo("c");
+    assertSameView(through, mine.read());
+  }
+
+  /**
+   * Bug 122, as the runtime sees it: a refresh never returns a replica behind the one it was
+   * given (LOG.md "The log SPI"). On one object the runtime takes a read that does not continue
+   * the replica for a replace since, which is newer; a torn read that ends at a frame's end of a
+   * version whose checkpoint is older than the replica (a compaction sent again with the records
+   * that beat it) was a replica behind it.
+   */
+  @Test
+  void aRefreshNeverGoesBackOnATornRead() {
+    InMemoryAtomicFileIO store = new InMemoryAtomicFileIO();
+    store.setReadsRecordVersion(true);
+    AtomicLong incarnations = new AtomicLong();
+    AtomicFileLog raw = new AtomicFileLog(store, LOCATION, incarnations::incrementAndGet);
+    LogRuntime<EntityVersionsMachine.State, EntityVersionsMachine.Builder,
+        EntityVersionsMachine.Txn> writer = runtime(store, incarnations);
+    LogRuntime<EntityVersionsMachine.State, EntityVersionsMachine.Builder,
+        EntityVersionsMachine.Txn> reader = runtime(store, incarnations);
+    writer.bootstrap(new EntityVersionsMachine.Txn("init", Map.of(), Set.of()));
+    for (int i = 0; i < 12; i++) {
+      Replica<EntityVersionsMachine.State> on = writer.read();
+      writer.commit(on, EntityVersionsMachine.Txn.on(on.state(), "t" + i, Set.of(), Set.of("e")));
+    }
+    Replica<EntityVersionsMachine.State> prior = reader.read();
+    assertThat(prior.state().history()).hasSize(13);
+
+    // A compaction sent again with the records that beat it: the replay through two records,
+    // then the rest (TAIL_READS.md "Compaction after the commit")
+    LogView whole = raw.read();
+    List<byte[]> records = whole.records();
+    byte[] resentCheckpoint = checkpointThrough(whole, 2);
+    LogView resent = raw.readThrough(raw.replace(whole.tail(), resentCheckpoint,
+        records.subList(2, records.size())), Duration.ZERO);
+    // spliced at the end of the frame before its last record, past the end of the object the
+    // second GET meets: that version compacted to its checkpoint
+    int at = AtomicFileLog.encode(resentCheckpoint, records.subList(2, records.size() - 1)).length;
+    spliceAt(store, at);
+    AtomicInteger requests = new AtomicInteger();
+    store.injectReadFaults(location -> {
+      if (requests.incrementAndGet() == 2) { // the GET of the version the tail read found, whole
+        store.injectReadFaults(this::noFault);
+        raw.replace(resent.tail(), checkpointThrough(resent, resent.records().size()), List.of());
+      }
+      return InMemoryAtomicFileIO.ReadFault.NONE;
+    });
+
+    Replica<EntityVersionsMachine.State> refreshed = reader.refresh(prior);
+    assertThat(store.served(InMemoryAtomicFileIO.ReadMode.SPLICE)).isEqualTo(1);
+    assertThat(refreshed.state().history()).as("the refresh's history")
+        .containsExactlyElementsOf(prior.state().history());
+    assertThat(refreshed.state()).isEqualTo(reader.read().state());
+  }
+
+  /**
+   * Bug 122, at its worst: a commit whose append landed with its reply lost reads the log to
+   * settle it, and that read must not go back (LOG.md "The commit loop": lagread). A compaction
+   * sent again with the records that beat it, its record among them, then a compaction of that,
+   * land around the tail read's second GET, which a splicing store serves short. The prefix it
+   * took for the object, from before the commit's base, held no record of the commit and did not
+   * hold its reads: the commit was rejected as a conflict, its record applied.
+   */
+  @Test
+  void aCommitWhoseRecordLandedIsNotRejectedOnATornRead() {
+    InMemoryAtomicFileIO store = new InMemoryAtomicFileIO();
+    store.setReadsRecordVersion(true);
+    AtomicLong incarnations = new AtomicLong();
+    AtomicFileLog raw = new AtomicFileLog(store, LOCATION, incarnations::incrementAndGet);
+    LogRuntime<EntityVersionsMachine.State, EntityVersionsMachine.Builder,
+        EntityVersionsMachine.Txn> others = runtime(store, incarnations);
+    LogRuntime<EntityVersionsMachine.State, EntityVersionsMachine.Builder,
+        EntityVersionsMachine.Txn> mine = runtime(store, incarnations);
+    others.bootstrap(new EntityVersionsMachine.Txn("init", Map.of(), Set.of()));
+    for (int i = 0; i < 12; i++) {
+      Replica<EntityVersionsMachine.State> on = others.read();
+      others.commit(on, EntityVersionsMachine.Txn.on(
+          on.state(), "t" + i, Set.of(), Set.of(i == 10 ? "a" : "e")));
+    }
+    Replica<EntityVersionsMachine.State> base = mine.read();
+    EntityVersionsMachine.Txn txn =
+        EntityVersionsMachine.Txn.on(base.state(), "mine", Set.of("a"), Set.of("b"));
+
+    // My append lands, its reply lost. Before the read that settles it, a compaction that read
+    // through t0 and lost to the appends since lands with them, mine the last; then, before that
+    // read's second GET, a compaction of that version
+    AtomicInteger appends = new AtomicInteger();
+    AtomicInteger requests = new AtomicInteger(-1);
+    LogView[] resent = new LogView[1];
+    store.injectFaults((location, strategy) -> {
+      if (strategy == AtomicOutputFile.Strategy.APPEND && appends.incrementAndGet() == 1) {
+        requests.set(0);
+        return InMemoryAtomicFileIO.Fault.LOST_REPLY;
+      }
+      return InMemoryAtomicFileIO.Fault.NONE;
+    });
+    store.injectReadFaults(location -> {
+      int request = requests.get() < 0 ? -1 : requests.incrementAndGet();
+      if (request == 1) { // the tail read's GET
+        requests.set(-1);
+        LogView whole = raw.read();
+        List<byte[]> records = whole.records();
+        byte[] checkpoint = checkpointThrough(whole, 2);
+        resent[0] = raw.readThrough(raw.replace(whole.tail(), checkpoint,
+            records.subList(2, records.size())), Duration.ZERO);
+        // spliced after t9, before t10 wrote what my commit reads, past the compacted object
+        spliceAt(store, AtomicFileLog.encode(checkpoint, records.subList(2, 11)).length);
+        requests.set(1);
+      } else if (request == 2) { // the GET of the version it found, whole
+        requests.set(-1);
+        raw.replace(resent[0].tail(), checkpointThrough(resent[0], resent[0].records().size()),
+            List.of());
+      }
+      return InMemoryAtomicFileIO.ReadFault.NONE;
+    });
+
+    Replica<EntityVersionsMachine.State> landed = mine.commit(base, txn);
+    assertThat(store.served(InMemoryAtomicFileIO.ReadMode.SPLICE)).isEqualTo(1);
+    assertThat(landed.state().history()).last().isEqualTo("mine");
+    assertThat(mine.read().state().history()).containsOnlyOnce("mine");
+  }
+
+  /** A runtime over the object at {@link #LOCATION} in {@code store}, never compacting. */
+  private static LogRuntime<EntityVersionsMachine.State, EntityVersionsMachine.Builder,
+      EntityVersionsMachine.Txn> runtime(InMemoryAtomicFileIO store, AtomicLong incarnations) {
+    RuntimeConfig config = new RuntimeConfig(4, 3, 0L, 0L, Long.MAX_VALUE,
+        CompactionPolicy.limits(1000, Long.MAX_VALUE), Duration.ZERO, System::currentTimeMillis,
+        RuntimeConfig.DEFAULT_ADMISSION_WINDOW_MS, Long.MAX_VALUE).withRaceByLatency(false);
+    return new LogRuntime<>(new AtomicFileLog(store, LOCATION, incarnations::incrementAndGet),
+        EntityVersionsMachine.INSTANCE, config);
+  }
+
+  /**
+   * {@code store} splicing from now on at {@code at}, which must be past the end of the live
+   * object: a superseded version's read ends there.
+   */
+  private static void spliceAt(InMemoryAtomicFileIO store, int at) {
+    store.readMode(InMemoryAtomicFileIO.ReadMode.SPLICE);
+    store.spliceAt((bound, live) -> {
+      assertThat(at).as("a splice past the live object's end").isGreaterThan(live.length)
+          .isLessThan(bound.length);
+      return at;
+    });
+  }
+
+  /** The checkpoint a compaction writes after the first {@code through} records of {@code view}. */
+  private static byte[] checkpointThrough(LogView view, int through) {
+    Replay.Result<EntityVersionsMachine.Builder> replayed = Replay.replay(
+        EntityVersionsMachine.INSTANCE, view.checkpoint().orElseThrow(),
+        view.records().subList(0, through), null);
+    return LogEnvelope.encodeCheckpoint(replayed.logId(), replayed.committed().build().bytes(),
+        EntityVersionsMachine.INSTANCE.encodeCheckpoint(replayed.builder().build()));
   }
 }

@@ -105,7 +105,9 @@ import org.intentlog.wire.ProtoWire;
  * ADLS's SDK, 4 MiB) keeps them and reads on from there, with a GET of the version live then; the
  * frames' checks reject the join unless that version extends the one cut (Bug 114 (big ADLS reads
  * fail under appends)). One cut before a byte reads again. A store that breaks that contract (S5)
- * serves bytes the frames' checks reject.
+ * serves bytes the frames' checks reject, or a prefix of the version that ends at a frame's end,
+ * which a read to the stream's end tells by the length its GET reported (Bug 122 (spliced read
+ * went backwards)).
  *
  * <p>An append frames its record from the version its condition names: from the view of it this
  * log read or wrote, or, for a tail only a {@link #probe} found, from that version's last trailer,
@@ -393,6 +395,11 @@ public final class AtomicFileLog implements SharedLog {
       if (cut) {
         cuts.add(length >= 0 ? length : file.getLength());
         return null;
+      }
+      if (length < 0 && base + size > at) {
+        // read to the stream's end, with no lookup: it must end where the version its GET found
+        // does (Bug 122 (spliced read went backwards))
+        endsWithItsVersion(file, base + size);
       }
       byte[] read = Arrays.copyOf(bytes, size);
       FileView view = from == null
@@ -732,7 +739,28 @@ public final class AtomicFileLog implements SharedLog {
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
+    if (readFirst && bytes.length > 0) {
+      endsWithItsVersion(file, bytes.length);
+    }
     return viewOf(file, bytes);
+  }
+
+  /**
+   * Fails unless a read to the stream's end, on a store whose reads record their version, ended at
+   * {@code end} where that version ends: the length its GET reported, which {@code file} keeps (no
+   * request). Every frame of a prefix of the version that ends at a frame's end checks, so only its
+   * length tells it from the version. A store that serves the rest of a superseded version from a
+   * shorter live one (a stream reopened past its end, unpinned, reports its end) ends the read
+   * there, and the prefix, taken for the version, can be older than a replica the read continues,
+   * or than the base of a commit it settles (Bug 122 (spliced read went backwards)). A read that
+   * ends elsewhere was torn, and is read again.
+   */
+  private void endsWithItsVersion(InputFile file, long end) {
+    long length = file.getLength();
+    if (end != length) {
+      throw new FrameCheckException(location + ": a read of a version of " + length
+          + " bytes ended at " + end);
+    }
   }
 
   /** The view of {@code bytes}, the whole of the version {@code file} read, every frame checked. */

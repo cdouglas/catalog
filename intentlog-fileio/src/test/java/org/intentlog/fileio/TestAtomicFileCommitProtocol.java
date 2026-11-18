@@ -76,6 +76,27 @@ class TestAtomicFileCommitProtocol {
         true, InMemoryAtomicFileIO.ReadMode.OPEN, true, 0L, settings, schedule);
   }
 
+  /**
+   * Bug 122 (spliced read went backwards): on a store whose reads record their version, without
+   * appends, w0's tail read after its lost replace found the object replaced (a copy of a record,
+   * CAS'd after its records) and read that version whole by a second GET; w1's commit replaced it
+   * with a shorter object first, and the store, splicing, served the version's bytes up to a
+   * frame's end past the new object's end and nothing after. The commit loop took that prefix,
+   * through p17, 6 records behind the replica w0 staged on, for the object, and rejected w0.0 as a
+   * conflict against it (justify's oracle). Seed -8870318493459999813, try 3,746 of 5,000, shrunk.
+   */
+  @Example
+  void aReadSplicedShortOfItsVersionIsReadAgain() {
+    CommitProtocol.Settings settings =
+        new CommitProtocol.Settings(2, true, CommitProtocol.NO_GC, 0L, -1, -1L, 24, 0L);
+    List<CommitProtocol.Cmd> schedule = List.of(
+        new CommitProtocol.Cmd(CommitProtocol.Step.BEGIN, 0, 1, 0, 0, 0, 0, 0),
+        begin(0), begin(0), begin(0), begin(0), begin(0), begin(0), begin(1), duplicate(0),
+        new CommitProtocol.Cmd(CommitProtocol.Step.COMMIT, 0, 13, 0, 0, 11, 0, 0));
+    commitsAreHonestAndCopiesNeverApply(
+        false, InMemoryAtomicFileIO.ReadMode.SPLICE, true, 3L, settings, schedule);
+  }
+
   private static CommitProtocol.Cmd begin(int writer) {
     return new CommitProtocol.Cmd(CommitProtocol.Step.BEGIN, writer, 0, 0, 0, 0, 0, 0);
   }

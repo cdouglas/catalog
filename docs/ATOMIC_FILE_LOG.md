@@ -168,14 +168,22 @@ join is that replace. A store without appends (GCS) reads again from the
 start, since no version there extends another. A page of the log is written
 once, so its read is one GET on any store. A
 store that breaks that contract, serving the live version or the rest of one
-from a reopened stream, serves bytes the frames' checks reject (unless the
-object it served is the same incarnation, whose bytes up to the length read are
-the same), and `read()` reads again too. A read through an append from a probed
-tail, whose version a later write superseded, reads the live object, which
-holds the append's record unless a replace folded it into a checkpoint (then
-the commit is ambiguous, P3). A store's accelerated read path (S3's analytics
-accelerator, GCS's analytics core) reads the live object, and a catalog's
-FileIO must leave it off (errata T6).
+from a reopened stream, serves bytes the frames' checks reject, unless they are
+of the same incarnation: a version that extends the one read, or a prefix of
+it that ends at a frame's end, where a shorter live version ended the stream (a
+GET from past an object's end is the stream's end). So a read ends where its
+version does. After a lookup it reads the length the lookup found, and a stream
+that ends sooner fails it. In one GET it reads to the stream's end, which must
+be the length the GET reported for the version, which the file keeps (no
+request): a prefix of the version, every frame of which checks, is not the
+version, and a read that took it for the version could go back behind a
+replica it continued, and reject a commit whose record had applied (Bug 122
+(spliced read went backwards)). Either way, `read()` reads again. A read
+through an append from a probed tail, whose version a later write superseded,
+reads the live object, which holds the append's record unless a replace folded
+it into a checkpoint (then the commit is ambiguous, P3). A store's accelerated
+read path (S3's analytics accelerator, GCS's analytics core) reads the live
+object, and a catalog's FileIO must leave it off (errata T6).
 
 **Signals.** Each write is prepared (`AtomicOutputFile.prepare`, which
 computes the checksum the store checks) and then sent (`writeAtomic`). The
