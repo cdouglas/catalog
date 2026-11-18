@@ -741,6 +741,54 @@ class TestAtomicFileLog {
     }
   }
 
+  /**
+   * Bug 116 (zonal page re-put not atomic): a page's name is a content address, and another writer
+   * may put a page that exists already. A put creates the page only if it is absent, in one
+   * conditional write, and never writes it in place: on a GCS zonal bucket a plain write is an
+   * appendable upload, visible before it is finalized, so a reader during another writer's put of a
+   * page a checkpoint names found it short. A second put writes nothing and succeeds.
+   */
+  @Test
+  void aPagePutCreatesThePageOnlyIfAbsent() {
+    String location = LOCATION + ".committed/p0";
+    AtomicInteger puts = new AtomicInteger();
+    io.injectPlainFaults((request, at) -> {
+      if (request == InMemoryAtomicFileIO.PlainRequest.PUT && at.equals(location)) {
+        puts.incrementAndGet();
+      }
+      return InMemoryAtomicFileIO.Fault.NONE;
+    });
+    log.pages().put("p0", bytes("page"));
+    log.pages().put("p0", bytes("page"));
+    assertThat(puts.get()).isEqualTo(2);
+    assertThat(io.pagePuts(true)).as("created, by a conditional create").isEqualTo(1);
+    assertThat(io.pagePuts(false)).as("found there, nothing written").isEqualTo(1);
+    assertThat(log.pages().get("p0")).hasValueSatisfying(
+        page -> assertThat(string(page)).isEqualTo("page"));
+  }
+
+  /** A put that loses the page's creation to another writer's put of it succeeds (Bug 116). */
+  @Test
+  void aPagePutThatLosesItsCreationSucceeds() {
+    String location = LOCATION + ".committed/p1";
+    io.injectPlainFaults((request, at) -> {
+      if (at.equals(location) && io.bytes(location) == null) {
+        io.seed(location, bytes("page 1")); // another writer's put lands first
+      }
+      return InMemoryAtomicFileIO.Fault.NONE;
+    });
+    log.pages().put("p1", bytes("page 1"));
+    assertThat(io.pagePuts(false)).isEqualTo(1);
+    assertThat(log.pages().get("p1")).hasValueSatisfying(
+        page -> assertThat(string(page)).isEqualTo("page 1"));
+    // a throttled put is no creation another writer won: it fails, and puts nothing
+    io.injectPlainFaults((request, at) -> InMemoryAtomicFileIO.Fault.THROTTLED);
+    assertThatThrownBy(() -> log.pages().put("p2", bytes("page 2")))
+        .isInstanceOf(SupportsAtomicOperations.StorageThrottleException.class);
+    io.injectPlainFaults((request, at) -> InMemoryAtomicFileIO.Fault.NONE);
+    assertThat(log.pages().get("p2")).isEmpty();
+  }
+
   /** Runs {@code run} without the suites' check of each tail read against a whole read. */
   private static void withoutTailReadCheck(Runnable run) {
     String check = System.getProperty(AtomicFileLog.CHECK_TAIL_READS);

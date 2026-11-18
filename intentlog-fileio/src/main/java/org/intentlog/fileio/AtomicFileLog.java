@@ -39,7 +39,6 @@ import org.apache.iceberg.io.AtomicOutputFile;
 import org.apache.iceberg.io.CAS;
 import org.apache.iceberg.io.FileInfo;
 import org.apache.iceberg.io.InputFile;
-import org.apache.iceberg.io.PositionOutputStream;
 import org.apache.iceberg.io.SeekableInputStream;
 import org.apache.iceberg.io.SupportsAtomicOperations;
 import org.apache.iceberg.io.SupportsPrefixOperations;
@@ -930,10 +929,26 @@ public final class AtomicFileLog implements SharedLog {
       this.prefix = prefix;
     }
 
+    /**
+     * Creates the page if no object has its name, in one conditional write: a CAS from a file that
+     * has seen no version, which creates the object only if it is absent, as a replace that creates
+     * the log does. A name is a content address, so an object of that name holds these bytes: a
+     * put that finds one (another writer's put of the page, or its own that landed) writes nothing
+     * and succeeds. A plain write would rewrite the page in place, and on a GCS zonal bucket a plain
+     * write is an appendable upload, visible before it is finalized: a reader of a page a
+     * checkpoint names, during another writer's put of it, would find it short (Bug 116 (zonal
+     * page re-put not atomic)). A throttled put fails.
+     */
     @Override
     public void put(String name, byte[] page) {
-      try (PositionOutputStream out = io.newOutputFile(prefix + name).createOrOverwrite()) {
-        out.write(page);
+      try {
+        AtomicOutputFile out = io.newOutputFile(io.newInputFile(prefix + name));
+        CAS token = out.prepare(() -> new ByteArrayInputStream(page), AtomicOutputFile.Strategy.CAS);
+        out.writeAtomic(token, () -> new ByteArrayInputStream(page));
+      } catch (SupportsAtomicOperations.StorageThrottleException e) {
+        throw e;
+      } catch (SupportsAtomicOperations.CASException e) {
+        // the page exists: these bytes, put by another writer or by an earlier put of this one
       } catch (IOException e) {
         throw new UncheckedIOException(e);
       }

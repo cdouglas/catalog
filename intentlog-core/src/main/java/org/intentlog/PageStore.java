@@ -26,14 +26,22 @@ import java.util.Optional;
  * digest (docs/COMMITTED_PAGING.md "Page objects"). The provider places a name (a file log beside
  * its object, a queue in its archiver's store), so a log that moves takes its pages along.
  *
- * <p>Every writer that puts a name puts the same bytes, so a put may be repeated, and a put that
- * landed with its reply lost is no different from one that landed. Replay never reads a page: the
- * runtime gets one only to learn whether an id in (H, F] committed, and deletes one only once a GC
- * record dropped its reference, or as an orphan once the floor passed its node unreferenced.
+ * <p>A name is a content address (a committed-set page's node and digest; a state machine's page
+ * names its own, as snapshot pages name their table, version, block and digest), so every writer
+ * that puts a name puts the same bytes: a put may be repeated, by this writer or another, and a put
+ * that landed with its reply lost is no different from one that landed. Replay never reads a page:
+ * the runtime gets one only to learn whether an id in (H, F] committed, and deletes one only once a
+ * GC record dropped its reference, or as an orphan once the floor passed its node unreferenced.
  */
 public interface PageStore {
 
-  /** Stores {@code page} under {@code name}. Idempotent: a name's bytes never change. */
+  /**
+   * Stores {@code page} under {@code name}. Atomic: a reader finds the name's whole bytes or no
+   * page, never part of them, though another writer puts the name at the same time, or crashes
+   * putting it; so a put of a name that exists must not write it in place (Bug 116 (zonal page
+   * re-put not atomic): on a GCS zonal bucket a plain write is visible before it is finalized).
+   * Idempotent: a name's bytes never change, and a put of a name that exists may leave it as it is.
+   */
   void put(String name, byte[] page);
 
   /**

@@ -423,6 +423,11 @@ The PageOuts go into the write as follows:
     differ under one name (found by `TestCommittedSetBlocks` in stage 3).
   - Different contents never share a name, so a page cannot be overwritten
     with bytes its record does not describe.
+  - A put is atomic: a reader finds a name's whole bytes or no page, while
+    another compactor puts the same name or after one crashed putting it
+    (`PageStore.put`). `AtomicFileLog` creates a page only if it is absent,
+    in one conditional write, and a put that finds it there succeeds; it
+    never writes a page in place (Bug 116 (zonal page re-put not atomic)).
 - **Body.**
   `CommittedPage { min_reader_version, log_id, level, index, packed_entries }`.
   - A reader checks the log id, the node and the digest, and fails the lookup

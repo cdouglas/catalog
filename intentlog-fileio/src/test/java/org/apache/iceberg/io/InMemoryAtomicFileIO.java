@@ -69,6 +69,13 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
  *
  * <p>Plain {@link OutputFile} writes are unconditional, as for table metadata and data files.
  *
+ * <p>A log's pages ({@code AtomicFileLog}'s, at {@code <log>.committed/<name>}: {@link #pages}) are
+ * put by a conditional create, a CAS from a snapshot that has seen no version, which creates the
+ * page only if it is absent. Such a create is a page put, not a write of the log: it meets the
+ * plain-request faults ({@link PlainRequest#PUT}; and {@link Fault#THROTTLED}), not {@link
+ * #injectFaults}, and stays out of {@link #history}, so a fuzzer's plan of the log's writes and an
+ * oracle that decodes them see the log's alone. {@link #pagePuts} counts them.
+ *
  * <p>{@link #injectFaults} makes conditional writes fail the way remote storage can: before the
  * write lands, or after it lands with the reply lost (an {@link IOException} or a runtime error, as
  * SDKs surface either) or reported as a precondition failure (a transport retry that ran into its
@@ -110,7 +117,10 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
 
   /** A request that is not conditional, as plain-request faults see it. */
   public enum PlainRequest {
-    /** The write of an object through {@link #newOutputFile(String)}, as its stream closes. */
+    /**
+     * The write of an object through {@link #newOutputFile(String)}, as its stream closes; or a
+     * page put, a conditional create of a page (the class comment), as it is sent.
+     */
     PUT,
     DELETE,
     LIST
@@ -119,8 +129,9 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
   /**
    * Chooses the fault of each plain request: {@link Fault#FAIL_BEFORE} fails it without effect,
    * and {@link Fault#LOST_REPLY} lets a put or delete land and then fails it (a listing fails);
-   * other faults act as {@link Fault#NONE}. It is called as the request is issued, and holds no
-   * lock.
+   * {@link Fault#THROTTLED} throttles a page put (a conditional create of a page: the class
+   * comment); other faults act as {@link Fault#NONE}. It is called as the request is issued, and
+   * holds no lock.
    */
   @FunctionalInterface
   public interface PlainFaults {
@@ -263,6 +274,10 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
   private final Map<ReadFault, Integer> injectedReads = Maps.newEnumMap(ReadFault.class);
   private volatile boolean recordHistory = true;
   private volatile WriteListener listener = null;
+  private volatile java.util.function.Predicate<String> pages =
+      location -> location.contains(".committed/");
+  private int pagesCreated = 0;
+  private int pagesFound = 0;
 
   public InMemoryAtomicFileIO() {
     this(true);
@@ -526,6 +541,19 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
   /** Stores {@code bytes} at {@code location} unconditionally, as a new generation. */
   public void seed(String location, byte[] bytes) {
     put(location, bytes.clone());
+  }
+
+  /** The locations whose conditional creates are page puts (the class comment). */
+  public void pages(java.util.function.Predicate<String> isPage) {
+    this.pages = isPage;
+  }
+
+  /**
+   * Page puts: those that created their page ({@code created}), else those that found it there
+   * already and wrote nothing.
+   */
+  public synchronized int pagePuts(boolean created) {
+    return created ? pagesCreated : pagesFound;
   }
 
   /** Number of conditional writes rejected because the object changed, by strategy. */
@@ -797,6 +825,10 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
         throw new IllegalStateException("prepare() was not called");
       }
       String location = location();
+      if (strategy == Strategy.CAS && pages.test(location)
+          && replace.expected(strategy) == null) {
+        return putPage(location, readAll(source.get()));
+      }
       Fault fault = faults.next(location, strategy);
       byte[] data = readAll(source.get());
       Version expected = replace.expected(strategy);
@@ -871,6 +903,38 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
         }
       }
     }
+  }
+
+  /**
+   * A page put: a conditional create of {@code location} with {@code data}, as the plain-request
+   * faults say ({@link Fault#THROTTLED} too); out of {@link #history}.
+   */
+  private InputFile putPage(String location, byte[] data) {
+    Fault fault = plainFaults.next(PlainRequest.PUT, location);
+    if (fault == Fault.FAIL_BEFORE) {
+      failPlain(fault, PlainRequest.PUT, location);
+    }
+    if (fault == Fault.THROTTLED) {
+      synchronized (this) {
+        injected.merge(fault, 1, Integer::sum);
+      }
+      String msg = "injected: a put of page " + location + " throttled";
+      throw new StorageThrottleException(msg, new IOException(msg));
+    }
+    Version written;
+    synchronized (this) {
+      if (objects.containsKey(location)) {
+        pagesFound += 1;
+        String msg = "CAS precondition failed at " + location + ": the page exists";
+        throw new StorageInvariantException(msg, new IOException(msg));
+      }
+      pagesCreated += 1;
+      written = put(location, data);
+    }
+    if (fault == Fault.LOST_REPLY) {
+      failPlain(fault, PlainRequest.PUT, location);
+    }
+    return new BoundInputFile(location, written);
   }
 
   /** Throws {@link IOException} once a read reaches {@code breakAt}. */

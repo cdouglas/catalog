@@ -228,7 +228,16 @@ object holds no intention record.
 
 **Pages.** The committed set's pages are objects beside the catalog's, at
 `<catalog location>.committed/<level>-<index>-<digest hex>`
-([COMMITTED_PAGING.md](COMMITTED_PAGING.md)). A replace puts the pages its
+([COMMITTED_PAGING.md](COMMITTED_PAGING.md)), and snapshot pages beside them
+([SNAPSHOT_PAGING.md](SNAPSHOT_PAGING.md)). A page's name is a content address,
+so another writer may put a page that exists: a put creates the page only if
+no object has its name, in one conditional write (a CAS from a file that has
+seen no version, as the log's creation is), and one that finds the page there
+writes nothing and succeeds. It never writes a page in place: on a GCS zonal
+bucket a plain write is an appendable upload, visible before it is finalized,
+so a reader of a page a checkpoint names, during another writer's put of it,
+found it short, and a writer that crashed in the put left it short (Bug 116
+(zonal page re-put not atomic)). A replace puts the pages its
 PageOuts name before it writes; the checkpoint it writes is the replay of the
 version it replaces, so it still holds those blocks, and the next replace's
 checkpoint holds their references instead. The replace whose GC record drops a
