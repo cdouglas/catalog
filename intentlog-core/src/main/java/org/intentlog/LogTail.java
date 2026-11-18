@@ -36,6 +36,20 @@ public interface LogTail {
   /**
    * Whether this tail, a later one, continues {@code earlier}: records were appended after it. If
    * not, the log was replaced (compacted) since.
+   *
+   * <p>A log that replaces itself may also answer true for a replace that left the log no shorter,
+   * where it cannot tell one from appends: it then means "did not shrink". {@code AtomicFileLog}
+   * does so for a tail a probe found, whose version and length it knows but not its bytes, and
+   * compares it with an earlier tail by length alone. Where it read or wrote the bytes at both
+   * tails, the last frame's trailer names the object's incarnation, which every replace draws
+   * anew, and tells a replace from appends. The runtime asks this of a log that replaces itself
+   * only after a lost append race with tail reads off, where the looser reading is safe: it
+   * appends the same record again at the probed tail, framed from the probed version's last
+   * trailer, and replay judges the record where it lands and applies it at most once (a copy is
+   * skipped by its id in the committed set, or rejected at or below the floor), even after a
+   * checkpoint its writer never read. A log that cannot
+   * replace itself must answer exactly: a commit's floor, its settling of a lost append and {@code
+   * LogRuntime.newer} rest on it.
    */
   boolean continues(LogTail earlier);
 

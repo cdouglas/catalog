@@ -110,7 +110,11 @@ envelopes, below); it stores and orders them. A `LogTail` is the end of the
 log as a read or probe saw it, and the condition a conditional write names:
 `exists` is false before the log is created, `bytes` is what the size
 threshold compares, and `continues(earlier)` says that the log only grew since
-`earlier` (on one object, it was not replaced). `maxRecordBytes` is the
+`earlier` (on one object, it was not replaced). A log that replaces itself may
+read it as "did not shrink" where it cannot tell a replace from appends:
+`AtomicFileLog` compares a tail a probe found by length alone, and the runtime
+asks it only where that is safe (`LogTail.continues` says why); a log that
+cannot replace itself answers exactly. `maxRecordBytes` is the
 largest record one append stores (0: no limit): the commit loop writes a
 larger record in a replace, on a log that replaces itself, and rejects it
 before sending it (`TOO_LARGE`) on one that does not (Bug 71). A writer that
@@ -169,7 +173,7 @@ commit.
 | P1 | One total order of records; every read returns a checkpoint and a prefix of the records after it, and says truly where its records start (`LogView.start`), so that the runtime can refuse a gap or a splice |
 | P2 | An acknowledged write (append, replace, checkpoint) is durable |
 | P3 | `readThrough(r)` returns a view whose records, after its checkpoint, include `r`'s record, or fails. A view whose checkpoint already holds the record cannot say whether it applied once GC drops its id |
-| P4 | Of several conditional writes on the same tail, at most one lands |
+| P4 | A conditional write (an append or a replace naming a tail) lands only if the log's tail is the one it names when it lands, whatever moved it since, an append or a replace: of several conditional writes on one tail, at most one lands |
 | P5 | No trim before a durable checkpoint covers the records trimmed |
 | P6 | `LogFullException` and `LogNotSentException` (and its subclass `LogRefusedException`) mean nothing landed |
 
@@ -178,23 +182,48 @@ appends is a legal provider. It does not allow one with a hole: a provider
 need not prevent one (Kafka's retention trims whatever the checkpoints say),
 but must report its records' positions truly, and the runtime refuses the read
 (S4). P4 binds only a log with conditional writes. `SharedLogContract`
-(intentlog-testkit) checks P1 (positions included), P3, P4 and P5 (and I11,
-below) as far as a provider's capabilities allow.
+(intentlog-testkit) checks P1 (positions included), P3, P4 (two appends, or
+two replaces, on one tail) and P5 (and I11, below) as far as a provider's
+capabilities allow.
 
 ### Failures
 
 | Signal | From | Meaning | The commit loop |
 |---|---|---|---|
 | `LogConflictException` | a conditional write | the tail is not the one expected. No proof that the write did not land: a transport retry of a write that landed fails its condition | reads, unless only the tail is needed (a lost append race) |
-| `LogThrottledException` | a write | backpressure (a 429, a 5xx, a per-object update rate). The write may have landed even so, and sending it again is safe | sends it again after a backoff, up to 8 sends; then the write is ambiguous, and a fresh read settles it |
+| `LogThrottledException` | a write that is safe to send again (below) | backpressure or a transient server error (a 429, a 5xx, a per-object update rate). The write may have landed even so | sends it again after a backoff, up to 8 sends; then the write is ambiguous, and a fresh read settles it. On a log without conditional appends, a throttled send before one that landed counts as a write that may have landed (`duplicate`) |
 | `LogFullException` | an append | the log holds as many writes as its store allows (S3 Express: 10,000 parts; an Azure Append Blob: 50,000 blocks). Nothing landed, and no append can | replaces, on a fresh read (Bug 66) |
 | `LogNotSentException` | a write | preparing it failed: nothing was sent | rejects (`NOT_SENT`), unless an earlier write of the commit may have landed |
-| `LogRefusedException` (a `LogNotSentException`) | a write | the store refused it with an error the same write gets again, which proves nothing landed: a client error (a 403, a 400, a 413, a 501) on the write's only attempt (`AtomicFileLog`, from the FileIO's `StorageRefusedException`) | rejects at once (`REFUSED`), with no wait and no resend, unless an earlier write of the commit may have landed (a throttled send of the same write counts: Bug 118 (refused writes reported unknown)) |
+| `LogRefusedException` (a `LogNotSentException`) | a write | the store refused it with an error the same write gets again, which proves nothing landed: a client error (a 403, a 400, a 413, a 501) on the write's only attempt (`AtomicFileLog`, from the FileIO's `StorageRefusedException`; `SegmentedLog`, from the Append Blob store's refusal) | rejects at once (`REFUSED`), with no wait and no resend, unless an earlier write of the commit may have landed (a throttled send of the same write counts: Bug 118 (refused writes reported unknown)) |
 | `TrimmedException` | `readThrough`, `readAfter` | the records asked for are gone | `readThrough`: the outcome is unknown, and a fresh read settles it; `readAfter`: a fresh read |
 | `LogGapException` | the runtime, on a view | the records do not start where the checkpoint ends, or do not follow the tail a fold needs: a gap or a splice | the read fails (the log is unreadable; unknown if a write may have landed) |
 | `LogLagException` | `readThrough` after its wait; a commit's read that stays behind the commit's floor | a replica of the log lags its appends | `readThrough`: the write is ambiguous, and a fresh read settles it; a lagging read: the log is unreadable |
 | any other exception | a write | the outcome is unknown | waits as after a lost race, then a fresh read settles it (Bug 113 (ambiguous resends never wait)) |
 | any other exception | a read or probe | the log could not be read | unknown if a write may have landed; else rethrown |
+
+**Throttles and refusals by provider.** A provider throws
+`LogThrottledException` only for a write that lands at most once in effect,
+which is what makes sending it again safe: a conditional write, whose sends
+all name one tail (P4); a blind append of a record replay applies once (an
+intention, by its id; a GC record or a PageOut, which applied twice changes
+nothing); or a write whose repeat leaves only garbage (a segment created under
+a fresh name, which the sweep deletes if no Install names it).
+
+- `AtomicFileLog`: a conditional write (a CAS replace, or an append
+  conditioned on a tail, a lookup the append sends first included) that the
+  fork's FileIO reports as `StorageThrottleException`: on S3, what the SDK's
+  retry policy calls throttling (503 SlowDown, 429, ...) and 500, 502, 503 and
+  504; on ADLS, 429, 500, 502, 503 and 504; on GCS, 429 and every 5xx but 501
+  (Bug 112 (503s not treated as throttling)). It throws `LogRefusedException`
+  for the FileIO's `StorageRefusedException`: a client error on the write's
+  only attempt, which proves nothing landed (Bug 118 (refused writes reported
+  unknown)).
+- `SegmentedLog` on Append Blobs: an append to a segment, or the creation of a
+  segment or of the log, that the store answers with 503, 429, 408, or 500
+  `OperationTimedOut` or `InternalError` (AZURE_LOG.md); any other 4xx but 404
+  is a refusal, since the client sends each request once. Its catalog object's
+  writes are `AtomicFileLog`'s.
+- `InMemorySharedLog`: any write its hooks throttle.
 
 ## The envelope
 
@@ -1023,7 +1052,9 @@ it does not.
 **`AtomicFileLog`** keeps the log in one object: a header, a checkpoint, and
 the records appended after it ([ATOMIC_FILE_LOG.md](ATOMIC_FILE_LOG.md)). A
 tail is the object's version (ETag or generation) and length, and continues an
-earlier one if the object did not shrink; a replace usually makes it shorter.
+earlier one if the object did not shrink and, where the log read or wrote the
+bytes at both, is the same incarnation; a tail a probe found is compared by
+length alone (`LogTail.continues`).
 A read through a write returns the object the write left, so P3 holds
 trivially; it reads nothing when the write says what that is (a replace holds
 what it wrote, and an append conditioned on a tail whose bytes the log read or

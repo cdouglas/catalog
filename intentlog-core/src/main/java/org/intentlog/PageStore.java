@@ -32,6 +32,15 @@ import java.util.Optional;
  * that landed with its reply lost is no different from one that landed. Replay never reads a page:
  * the runtime gets one only to learn whether an id in (H, F] committed, and deletes one only once a
  * GC record dropped its reference, or as an orphan once the floor passed its node unreferenced.
+ *
+ * <p>A {@link #get} must find a page whose {@link #put} completed, by any writer, unless it was
+ * deleted since: an empty get is taken for a page that was collected. A lookup of a committed id
+ * then reads the log again, and a load of a table's sealed snapshots reads the table as it is
+ * now if the catalog no longer names the page; either fails if a fresh read still names it. S3
+ * (general-purpose and directory buckets), GCS and ADLS give a get read-after-write, as do the
+ * in-memory stores. {@link #list} may lag puts and deletes: only a sweep lists, and it deletes
+ * only pages that are garbage under the replica it sweeps from, so a page a lagging list misses
+ * waits for a later sweep.
  */
 public interface PageStore {
 

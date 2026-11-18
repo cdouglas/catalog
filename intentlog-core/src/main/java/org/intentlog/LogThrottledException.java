@@ -19,9 +19,21 @@
 package org.intentlog;
 
 /**
- * Storage pushed back (a 429, a 5xx, a per-object update rate). The write may have landed even
- * so; sending the same write again is safe, since at most one of them lands (P4) and replay
- * applies its record once.
+ * Storage pushed back on a write: backpressure (a 429, a per-object update rate) or a transient
+ * server error (a 5xx). The write may have landed even so: a 5xx can follow a write the service
+ * applied, and an SDK's own retries report only their last attempt. The runtime sends the same
+ * write again after a backoff, and counts it as a write that may have landed.
+ *
+ * <p>A provider throws it only for a write that lands at most once in effect, which is what makes
+ * sending it again safe: a conditional write, whose sends all name one tail, so at most one lands
+ * (P4); a blind append of a record replay applies once (an intention, by its id; a GC record or a
+ * PageOut, which applied twice changes nothing); or a write whose repeat leaves only garbage (a
+ * segment created under a fresh name, which the sweep deletes if no Install names it). {@code
+ * AtomicFileLog} throws it for a conditional write the FileIO reports as {@code
+ * StorageThrottleException}; {@code SegmentedLog} for an append to a segment and the creation of a
+ * segment or of the log, and for its catalog object's writes as {@code AtomicFileLog} does; {@code
+ * InMemorySharedLog} for any write its hooks throttle. docs/LOG.md "Failures" lists the stores'
+ * errors behind each.
  */
 public class LogThrottledException extends RuntimeException {
   public LogThrottledException(String message, Throwable cause) {
