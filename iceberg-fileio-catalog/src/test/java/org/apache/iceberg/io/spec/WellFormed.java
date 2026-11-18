@@ -41,6 +41,12 @@ import org.apache.iceberg.io.CatalogState;
  *   <li>Inline/pointer disjointness (SPEC.md §State Model): a table's metadata
  *       lives in {@code tblInlineMetadata} OR has non-null
  *       {@code metadataLocation}, never both.</li>
+ *   <li>Referential integrity: every table's namespace and every namespace's
+ *       parent exist.</li>
+ *   <li>Names unique within a parent: no two tables of a namespace share a
+ *       name, and no two namespaces of a parent ({@link #namesUnique}).</li>
+ *   <li>Ids below the next-id counters: every entry the lookups name has an id
+ *       below its counter.</li>
  * </ul>
  *
  * <p>Each check returns false (not throws) so jqwik's shrinker can minimise
@@ -58,19 +64,78 @@ import org.apache.iceberg.io.CatalogState;
  * consistency check would require exposing manifest-pool internals, so it is
  * not checked here.
  *
- * <p>Not checked: referential integrity (every table's namespace and every
- * namespace's parent exist), ids below the next-id counters, and name
- * uniqueness within a parent.
+ * <p>The entries are reached through the public accessors by id ({@code
+ * namespaceEntry}, {@code tableEntry}) below the counters: the lookups by name
+ * hold one id per name, so two entries of one name would show as one there.
  */
 final class WellFormed {
 
   private WellFormed() {}
 
   static boolean check(CatalogState state) {
-    return sentinelImpliesPoolEntry(state)
-        && namespaceLookupConsistent(state)
-        && tableLookupConsistent(state)
-        && inlinePointerDisjoint(state);
+    return violation(state) == null;
+  }
+
+  /** The first invariant {@code state} breaks, or null if it is well-formed. */
+  static String violation(CatalogState state) {
+    if (!sentinelImpliesPoolEntry(state)) {
+      return "an inline table without metadata";
+    }
+    if (!namespaceLookupConsistent(state)) {
+      return "the namespace lookup";
+    }
+    if (!tableLookupConsistent(state)) {
+      return "the table lookup";
+    }
+    if (!inlinePointerDisjoint(state)) {
+      return "a table both inline and a pointer";
+    }
+    return namesUnique(state);
+  }
+
+  /**
+   * Why the entries below the id counters are not referentially intact with unique names within
+   * each parent, or are not all the lookups name; null if they are.
+   */
+  static String namesUnique(CatalogState state) {
+    java.util.Set<String> namespaceNames = new java.util.HashSet<>();
+    int namespaces = 0;
+    for (int id = 1; id < state.nextNamespaceId(); id++) {
+      CatalogState.NsEntry entry = state.namespaceEntry(id);
+      if (entry == null) {
+        continue;
+      }
+      namespaces += 1;
+      if (state.namespaceEntry(entry.parentId) == null) {
+        return "namespace " + id + " (" + entry.name + ") has no parent " + entry.parentId;
+      }
+      if (!namespaceNames.add(entry.parentId + "/" + entry.name)) {
+        return "two namespaces of parent " + entry.parentId + " are named " + entry.name;
+      }
+    }
+    if (namespaces != state.namespaces().size()) {
+      return namespaces + " namespaces below the counter, " + state.namespaces().size()
+          + " by name";
+    }
+    java.util.Set<String> tableNames = new java.util.HashSet<>();
+    int tables = 0;
+    for (int id = 1; id < state.nextTableId(); id++) {
+      CatalogState.TblEntry entry = state.tableEntry(id);
+      if (entry == null) {
+        continue;
+      }
+      tables += 1;
+      if (entry.namespaceId == 0 || state.namespaceEntry(entry.namespaceId) == null) {
+        return "table " + id + " (" + entry.name + ") has no namespace " + entry.namespaceId;
+      }
+      if (!tableNames.add(entry.namespaceId + "/" + entry.name)) {
+        return "two tables of namespace " + entry.namespaceId + " are named " + entry.name;
+      }
+    }
+    if (tables != state.tables().size()) {
+      return tables + " tables below the counter, " + state.tables().size() + " by name";
+    }
+    return null;
   }
 
   /**

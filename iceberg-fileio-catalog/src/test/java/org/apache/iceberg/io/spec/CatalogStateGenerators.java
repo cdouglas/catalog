@@ -19,11 +19,20 @@
 package org.apache.iceberg.io.spec;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Random;
 import net.jqwik.api.Arbitraries;
 import net.jqwik.api.Arbitrary;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.exceptions.AlreadyExistsException;
+import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
+import org.apache.iceberg.exceptions.NoSuchNamespaceException;
+import org.apache.iceberg.exceptions.NoSuchTableException;
+import org.apache.iceberg.io.CatalogMutation;
+import org.apache.iceberg.io.CatalogTestSupport;
 import org.apache.iceberg.io.ProtoCodec;
 import org.apache.iceberg.io.CatalogState;
 
@@ -260,5 +269,230 @@ final class CatalogStateGenerators {
     String name = randomLowercaseName(rng, 1, 8, inUse);
     if (name == null) name = "ns" + newNsId;
     return new ProtoCodec.CreateNamespaceAction(newNsId, 1, 0, 0, name);
+  }
+
+  // ============================================================
+  // Writers' intentions, over a small universe
+  // ============================================================
+
+  /** The namespaces a writer names: two levels of two names, so that names collide often. */
+  static final List<Namespace> NAMESPACES =
+      List.of(
+          Namespace.of("a"),
+          Namespace.of("b"),
+          Namespace.of("a", "a"),
+          Namespace.of("a", "b"),
+          Namespace.of("b", "a"));
+
+  /** The table names a writer names. */
+  static final List<String> TABLE_NAMES = List.of("t", "u");
+
+  private static final List<String> KEYS = List.of("k1", "k2");
+
+  /** What a writer stages: each a change {@link CatalogMutation} stages, or a bare action. */
+  enum WriterOp {
+    CREATE_NAMESPACE,
+    DROP_NAMESPACE,
+    SET_PROPERTY,
+    REMOVE_PROPERTY,
+    CREATE_TABLE,
+    CREATE_TABLE_INLINE,
+    DROP_TABLE,
+    UPDATE_TABLE,
+    READ_TABLE,
+    UPDATE_INLINE_FULL,
+    UPDATE_INLINE_DELTA,
+    RENAME_TABLE,
+    /** A bare SetConflictEncoding, as a catalog's first record carries. */
+    SET_CONFLICT_ENCODING,
+    /** A bare SetSnapshotPaging, as a catalog's first record may carry. */
+    SET_SNAPSHOT_PAGING,
+    /** An action of a type this build does not know. */
+    UNKNOWN
+  }
+
+  /** The ops a writer's transaction is drawn from, weighted toward names that collide. */
+  private static final List<WriterOp> WEIGHTED = weighted();
+
+  private static List<WriterOp> weighted() {
+    List<WriterOp> ops = new ArrayList<>();
+    for (WriterOp op : WriterOp.values()) {
+      int weight;
+      switch (op) {
+        case CREATE_NAMESPACE:
+        case CREATE_TABLE:
+        case CREATE_TABLE_INLINE:
+        case DROP_TABLE:
+        case RENAME_TABLE:
+          weight = 4;
+          break;
+        case DROP_NAMESPACE:
+          weight = 3;
+          break;
+        case SET_CONFLICT_ENCODING:
+        case SET_SNAPSHOT_PAGING:
+        case UNKNOWN:
+          weight = 0; // drawn apart (BARE)
+          break;
+        default:
+          weight = 2;
+      }
+      for (int i = 0; i < weight; i++) {
+        ops.add(op);
+      }
+    }
+    return List.copyOf(ops);
+  }
+
+  /** The bare actions, one of which a writer's transaction is now and then. */
+  private static final List<WriterOp> BARE =
+      List.of(WriterOp.SET_CONFLICT_ENCODING, WriterOp.SET_SNAPSHOT_PAGING, WriterOp.UNKNOWN);
+
+  /** A writer's transaction: its intention, and the ops it staged, for a trace. */
+  static final class Staged {
+    final ProtoCodec.CatalogIntention intention;
+    final List<String> ops;
+
+    Staged(ProtoCodec.CatalogIntention intention, List<String> ops) {
+      this.intention = intention;
+      this.ops = ops;
+    }
+
+    @Override
+    public String toString() {
+      return String.join("; ", ops);
+    }
+  }
+
+  /**
+   * A transaction a writer stages on {@code read} as {@link CatalogMutation} stages it (each op
+   * checked against the read, with the versions of what it depends on as the read holds them):
+   * one to three ops drawn with {@code rng} from {@link #NAMESPACES}, {@link #TABLE_NAMES} and
+   * the read's tables, skipping those the read refuses; or, now and then, one bare action of the
+   * kinds no catalog operation stages (a conflict encoding, snapshot paging, an unknown action).
+   * Null if nothing staged.
+   */
+  static Staged writerTransaction(CatalogState read, Random rng) {
+    if (rng.nextInt(20) == 0) {
+      switch (BARE.get(rng.nextInt(BARE.size()))) {
+        case SET_CONFLICT_ENCODING: {
+          String encoding =
+              CatalogTestSupport.ENCODINGS.get(rng.nextInt(CatalogTestSupport.ENCODINGS.size()));
+          return bare(new ProtoCodec.SetConflictEncodingAction(encoding),
+              "setConflictEncoding(" + encoding + ")");
+        }
+        case SET_SNAPSHOT_PAGING:
+          return bare(new ProtoCodec.SetSnapshotPagingAction(2, 1), "setSnapshotPaging(2, 1)");
+        default:
+          return bare(new ProtoCodec.UnknownAction(99, new byte[] {8, 1}), "unknown(99)");
+      }
+    }
+    CatalogMutation mutation = new CatalogMutation(CatalogTestSupport.replicaOf(read));
+    List<String> staged = new ArrayList<>();
+    Map<TableIdentifier, Boolean> updated = new HashMap<>();
+    int ops = 1 + rng.nextInt(3);
+    for (int i = 0; i < ops; i++) {
+      String done =
+          stage(mutation, read, WEIGHTED.get(rng.nextInt(WEIGHTED.size())), rng, updated);
+      if (done != null) {
+        staged.add(done);
+      }
+    }
+    if (staged.isEmpty()) {
+      return null;
+    }
+    return new Staged(mutation.intention(), staged);
+  }
+
+  private static Staged bare(ProtoCodec.Action action, String what) {
+    return new Staged(new ProtoCodec.CatalogIntention(List.of(action)), List.of(what));
+  }
+
+  /** Stages {@code op} on {@code mutation}; what it staged, or null if the read refuses it. */
+  private static String stage(CatalogMutation mutation, CatalogState read, WriterOp op,
+      Random rng, Map<TableIdentifier, Boolean> updated) {
+    Namespace ns = NAMESPACES.get(rng.nextInt(NAMESPACES.size()));
+    TableIdentifier fresh =
+        TableIdentifier.of(ns, TABLE_NAMES.get(rng.nextInt(TABLE_NAMES.size())));
+    List<TableIdentifier> tables = new ArrayList<>(read.tables());
+    tables.sort(java.util.Comparator.comparing(TableIdentifier::toString));
+    TableIdentifier existing = tables.isEmpty() ? fresh : tables.get(rng.nextInt(tables.size()));
+    String key = KEYS.get(rng.nextInt(KEYS.size()));
+    String value = "v" + rng.nextInt(1000);
+    try {
+      switch (op) {
+        case CREATE_NAMESPACE:
+          // a map of its own: a later change of its properties in the transaction merges into it
+          mutation.createNamespace(
+              ns, rng.nextBoolean() ? new HashMap<>() : new HashMap<>(Map.of(key, value)));
+          return "createNamespace(" + ns + ")";
+        case DROP_NAMESPACE:
+          mutation.dropNamespace(ns);
+          return "dropNamespace(" + ns + ")";
+        case SET_PROPERTY:
+          mutation.updateProperties(ns, new HashMap<>(Map.of(key, value)));
+          return "setProperty(" + ns + ", " + key + ")";
+        case REMOVE_PROPERTY:
+          Map<String, String> removal = new HashMap<>();
+          removal.put(key, null);
+          mutation.updateProperties(ns, removal);
+          return "removeProperty(" + ns + ", " + key + ")";
+        case CREATE_TABLE:
+          mutation.createTable(fresh, "mem:///" + fresh + "/" + value);
+          return "createTable(" + fresh + ")";
+        case CREATE_TABLE_INLINE:
+          mutation.createTableInline(fresh,
+              CatalogTestSupport.newInlineTable("mem:///" + fresh + "/" + value),
+              CatalogTestSupport.inlineTableCodec());
+          return "createTableInline(" + fresh + ")";
+        case DROP_TABLE:
+          mutation.dropTable(existing);
+          return "dropTable(" + existing + ")";
+        case UPDATE_TABLE:
+          if (updated.put(existing, true) != null) {
+            return null; // one update of a table per transaction
+          }
+          mutation.updateTable(existing, "mem:///" + existing + "/" + value);
+          return "updateTable(" + existing + ")";
+        case READ_TABLE:
+          if (rng.nextBoolean()) {
+            mutation.readTable(existing);
+            return "readTable(" + existing + ")";
+          }
+          mutation.readRef(existing, "main");
+          return "readRef(" + existing + ", main)";
+        case UPDATE_INLINE_FULL:
+          if (!read.isInlineTable(existing) || updated.put(existing, true) != null) {
+            return null;
+          }
+          mutation.updateTableInline(existing,
+              CatalogTestSupport.newInlineTable("mem:///" + existing + "/" + value),
+              CatalogTestSupport.inlineTableCodec());
+          return "updateTableInline(" + existing + ")";
+        case UPDATE_INLINE_DELTA:
+          if (!read.isInlineTable(existing) || updated.put(existing, true) != null) {
+            return null;
+          }
+          mutation.updateTableInlineDelta(existing,
+              CatalogTestSupport.propertyDelta(key, value, System.currentTimeMillis()));
+          if (rng.nextInt(4) == 0) {
+            mutation.pin(existing);
+            return "updateTableInlineDelta(" + existing + ", pinned)";
+          }
+          return "updateTableInlineDelta(" + existing + ")";
+        case RENAME_TABLE:
+          mutation.renameTable(existing, fresh);
+          return "renameTable(" + existing + ", " + fresh + ")";
+        default:
+          throw new IllegalStateException("Not a staged op: " + op);
+      }
+    } catch (AlreadyExistsException
+        | NoSuchNamespaceException
+        | NoSuchTableException
+        | NamespaceNotEmptyException
+        | IllegalArgumentException
+        | IllegalStateException e) {
+      return null; // the read refuses it, as a writer's staging would
+    }
   }
 }
