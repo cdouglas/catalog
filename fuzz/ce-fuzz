@@ -231,7 +231,8 @@ round() {
   done
 }
 
-# failed <log>: the properties that failed in a job's log, one "<class> <method> <seed>" each:
+# failed <log>: the properties that failed in a job's log, one "<class> <method> <seed> <try>"
+# each (<try>: the try it failed at, which with shrinking off is the first that failed, or ?):
 # surefire names each failure, and jqwik's report of the property gives the seed it ran with (the
 # last report's, within 20,000 characters of its header). It streams the log, which can be
 # gigabytes, and reads one cut short as far as it goes.
@@ -244,7 +245,8 @@ f = (gzip.open(log + '.gz', 'rt', errors='replace') if os.path.exists(log + '.gz
 failure = re.compile(r'^\[ERROR\] (?:[a-z]\w*\.)*([A-Z][\w$]*)\.(\w+) -- Time elapsed.*<<< (?:FAILURE|ERROR)!')
 header = re.compile(r'^timestamp = [^,]*, ([A-Z][\w$]*):(\w+) = \s*$')
 seed_line = re.compile(r'^seed = (-?\d+)')
-failures, seeds = [], {}
+tries_line = re.compile(r'^tries = (\d+)')
+failures, seeds, tries = [], {}, {}
 report, budget = None, 0
 try:
     for line in f:
@@ -256,6 +258,9 @@ try:
             report, budget = (h.group(1), h.group(2)), 20000
             continue
         if report:
+            t = tries_line.match(line)
+            if t:
+                tries[report] = t.group(1)
             s = seed_line.match(line)
             if s:
                 seeds[report] = s.group(1)
@@ -270,7 +275,7 @@ for cls, method in failures:
     if (cls, method) not in seeds:
         print('%s.%s: no seed in its report' % (cls, method), file=sys.stderr)
         continue
-    print(cls, method, seeds[(cls, method)])
+    print(cls, method, seeds[(cls, method)], tries.get((cls, method), '?'))
 PY
 }
 
@@ -301,7 +306,7 @@ shrink() {
   failed $log > $O/failed.txt 2>> $O/summary.txt
   [ -s $O/failed.txt ] || { echo "no failed property with a seed in $log" >> $O/summary.txt; return; }
   local cls method seed d file
-  while read -r cls method seed; do
+  while read -r cls method seed _; do
     d=$W/$method
     worktree $d $COMMIT && setup $job $d
     file=$(find $d -path '*/src/test/java/*' -name "$cls.java" | head -1)
@@ -310,7 +315,7 @@ shrink() {
     job $d $O/$cls.$method.log "$cls#$method"
   done < $O/failed.txt
   wait
-  while read -r cls method seed; do
+  while read -r cls method seed _; do
     [ -f $O/$cls.$method.log ] || continue
     echo "$cls.$method seed=$seed: $(grep -ah '^exit=' $O/$cls.$method.log | tail -1)" \
       "| shrunk: $(joblog $O/$cls.$method.log | grep -aE '^Shrunk Sample' | head -1)" >> $O/summary.txt
@@ -343,6 +348,12 @@ calib() {
       verdict=$(echo "$c" | grep -qE '(^| )[1-9][0-9]*\+|\+[1-9]' && echo "ORACLES FAIL UNMUTATED" || echo "clean")
     else
       verdict=$(echo "$c" | grep -qE '(^| )[1-9][0-9]*\+|\+[1-9]' && echo "caught" || echo "NOT CAUGHT")
+      # the try each property first failed at: a round's tries for the property should be ten
+      # times the largest of these among the mutants its job is meant to catch (calibration margin)
+      if [ "$verdict" = caught ]; then
+        at=$(failed $O/$m.log 2>/dev/null | awk '{printf "%s%s.%s at try %s", NR > 1 ? ", " : "", $1, $2, $4}')
+        [ -n "$at" ] && verdict="caught ($at)"
+      fi
     fi
     echo "$m: $verdict | $c" >> $O/summary.txt
   done
