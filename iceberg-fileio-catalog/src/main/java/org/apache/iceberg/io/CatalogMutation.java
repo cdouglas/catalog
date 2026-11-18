@@ -291,7 +291,7 @@ public class CatalogMutation {
 
   public CatalogMutation updateTable(TableIdentifier table, String location) {
     if (!original.containsTable(table)) {
-      throw new NoSuchNamespaceException("Table does not exist: %s", table);
+      throw new NoSuchTableException("Table does not exist: %s", table);
     }
     checkNotRenamed(table);
     if (markedForDrop(table)) {

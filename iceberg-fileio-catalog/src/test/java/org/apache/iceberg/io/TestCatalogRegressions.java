@@ -6127,4 +6127,31 @@ public class TestCatalogRegressions {
       assertThat(raced[0]).isTrue();
     }
   }
+
+  /**
+   * Bug 101 (missing table: namespace exception): CatalogMutation's {@code updateTable}, the
+   * pointer update a commit stages, threw NoSuchNamespaceException for a table its read does not
+   * hold, where its inline updates, drops and renames throw NoSuchTableException. A commit through
+   * Iceberg stages an update only on a read that holds its table, so the mismatch reached callers
+   * of CatalogMutation itself. It now throws NoSuchTableException. Found by the 2026-11-17 design
+   * review (API reviewer).
+   */
+  @Nested
+  class AnUpdateOfATableTheReadDoesNotHold {
+
+    @Test
+    void throwsNoSuchTable() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = catalog(io, LocalCatalogMode.APPEND);
+      catalog.createNamespace(mixedNs);
+      CatalogMutation mutation = new CatalogMutation(catalog.log().read());
+
+      assertThatThrownBy(() -> mutation.updateTable(mixed, WAREHOUSE + "/ns/t/v1.metadata.json"))
+          .isInstanceOf(NoSuchTableException.class)
+          .hasMessage("Table does not exist: ns.t");
+      assertThatThrownBy(() -> mutation.updateTableInline(mixed, new byte[0], (byte) 0))
+          .isInstanceOf(NoSuchTableException.class)
+          .hasMessage("Table does not exist: ns.t");
+    }
+  }
 }
