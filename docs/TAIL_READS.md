@@ -236,9 +236,9 @@ records its incarnation and its frames' offsets.
 wrote (incarnation X, length N). Where the store's reads record their
 version, it is one GET of [N − 20, end) of the version V it finds, which
 reports V and its length L, and then steps 3 and 4; if those bytes are not
-X's trailer, the rest of V, [0, N − 20), is a second GET of V, and a GET
-that found nothing (V ends before N − 20: a 416, which the stream reports as
-its end) is followed by V read whole. Elsewhere (GCS, or `fileio.catalog.read.
+X's trailer, or the GET found nothing (V ends before N − 20: a 416, which the
+stream reports as its end), V is read whole, a second GET of V from its
+start. Elsewhere (GCS, or `fileio.catalog.read.
 lookup`):
 
 1. A HEAD: the version V and its length L. If L < N, the object was replaced:
@@ -260,7 +260,11 @@ lookup`):
    new records, at a tail bound to V and L.
 
 The GET asks for V (step 0), so its bytes are V's or it fails as stale and
-the read starts again. A GET whose bytes at N − 20 are X's trailer read V,
+the read starts again; a read cut after it read some bytes (ADLS's SDK sends
+a request per 4 MiB block, each asking for V) reads on from where it stopped,
+with a GET of the version live then, and the frames after N, which must all
+name X, reject a join across a replace ([ATOMIC_FILE_LOG.md](ATOMIC_FILE_LOG.md)
+"Reads"; Bug 114 (big ADLS reads fail under appends)). A GET whose bytes at N − 20 are X's trailer read V,
 and V is X extended: within one incarnation every write is an append, so V's
 bytes up to N are the replica's. The trailer stands in for the byte
 comparison a whole read's fold makes ([Replaying a suffix](#replaying-a-suffix)).

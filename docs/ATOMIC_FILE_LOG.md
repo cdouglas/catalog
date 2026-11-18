@@ -105,12 +105,12 @@ reads format 2, unchecked, for captured logs.
 | `SharedLog` | On the object |
 |---|---|
 | `capabilities()` | appends if the FileIO does at the object's location (`supportsAppend(location)`), conditionally; replaces (fused); no separate checkpoints; reads its own writes |
-| `read()` | the whole object, bound to the version it found: one GET where the store's reads record their version (`readsRecordVersion()`: S3, ADLS), else a lookup and a GET (GCS) |
+| `read()` | the whole object, bound to the version it found: one GET where the store's reads record their version (`readsRecordVersion()`: S3, ADLS), else a lookup and a GET (GCS); a read cut part way by a write reads on from where it stopped (below) |
 | `probe()` | the object's version and length, without reading it; a tail that does not exist if the object does not |
 | `append(record, tail)` | appends the record's frame at the tail's length, conditioned on its version (`Strategy.APPEND`), naming that version's incarnation: from the view this log read or wrote at the tail, or, for a tail a probe found, from that version's last trailer, read pinned to it (a version superseded since fails as a lost race, unsent). An unconditional append is refused |
 | `replace(tail, checkpoint, records)` | writes `[header][checkpoint][records]`, framed with an incarnation drawn for the write, as the whole object, conditioned on the tail's version, or on the object's absence if the tail does not exist (`Strategy.CAS`) |
 | `readThrough(receipt)` | the object the write left, so its record is among the records (P3): without a read when the write says what it holds (a replace holds what it wrote; an append conditioned on a tail whose bytes this log read or wrote holds those bytes and the record), else by reading the version the write wrote, or the live object if a later write superseded it |
-| `readAfter(tail)` | from a tail whose bytes this log read or wrote (incarnation X, length N): a GET of the bytes of the object's version V from N - 20 to its end, as one request where the store's reads record their version, else after a lookup of V and its length L (pinned, step 0). If those 20 bytes are the trailer of the frame the tail ends with, V is X extended, and the view is the tail's checkpoint and records (the same arrays) and the frames after N, each checked; else (another incarnation, or a shorter object) V whole: its bytes before N - 20 and those the GET read, or V read whole if the GET found none. From a tail a probe found, a whole read ([TAIL_READS.md](TAIL_READS.md) "Reads") |
+| `readAfter(tail)` | from a tail whose bytes this log read or wrote (incarnation X, length N): a GET of the bytes of the object's version V from N - 20 to its end, as one request where the store's reads record their version, else after a lookup of V and its length L (pinned, step 0). If those 20 bytes are the trailer of the frame the tail ends with, V is X extended, and the view is the tail's checkpoint and records (the same arrays) and the frames after N, each checked; else (another incarnation, or a shorter object) V read whole, a GET of it from its start. From a tail a probe found, a whole read ([TAIL_READS.md](TAIL_READS.md) "Reads") |
 | `putCheckpoint`, `trim` | not supported (a replace checkpoints) |
 
 **Tails.** A tail is the object's version (an ETag or generation) and length.
@@ -148,8 +148,24 @@ asks for that version (`If-Match`). Elsewhere (GCS, whose reads record none,
 or `fileio.catalog.read.lookup`) the lookup that binds its tail chooses the
 version, and the GET asks for it (GCS's `if-generation-match`). A write that
 lands between two requests of a read fails the later one as stale
-(`StaleReadException`) rather than return part of another object, and
-`read()` reads again (up to `READ_ATTEMPTS`). A page of the log is written
+(`StaleReadException`) rather than return part of another object. One read
+may be several requests: ADLS's SDK downloads blocks of 4 MiB, each after the
+first asking for the version the first found, so under steady appends a read
+of more than a block seldom finds a quiet stretch as long as its blocks. A
+read cut after it read some bytes keeps them and reads on from there, with a
+GET of the version live then, joining what it read before (Bug 114 (big ADLS
+reads fail under appends)); a read cut before it read a byte, or whose join
+fails a check, reads again from the start (up to `READ_ATTEMPTS`). An append
+leaves the bytes before the cut as they were, so the join is the live
+version. A replace does not, and its join fails the frames' checks: every
+frame must check and name one incarnation, so a cut after any frame meets
+the new object's incarnation; a cut inside the first frame (a checkpoint
+longer than a block) meets the frame's own trailer, which must give its
+offset and checksum, and each version a read was cut in must end where a
+frame of the join ends. Only a replace that holds the cut version's bytes up
+to the cut passes (one that wrote the same checkpoint again), and then the
+join is that replace. A store without appends (GCS) reads again from the
+start, since no version there extends another. A page of the log is written
 once, so its read is one GET on any store. A
 store that breaks that contract, serving the live version or the rest of one
 from a reopened stream, serves bytes the frames' checks reject (unless the

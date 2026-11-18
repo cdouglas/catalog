@@ -100,8 +100,11 @@ import org.intentlog.wire.ProtoWire;
  * binds the version comes first, and the GET asks for it: a HEAD and a GET. Either way, a write that
  * lands between two requests of one read fails the later one as stale ({@link
  * SupportsAtomicOperations.StaleReadException}) rather than return part of another object (errata
- * T6), and the log reads again. A store that breaks that contract (S5) serves bytes the frames'
- * checks reject.
+ * T6). A read so cut after it read some bytes (a store's stream may send a request per block:
+ * ADLS's SDK, 4 MiB) keeps them and reads on from there, with a GET of the version live then; the
+ * frames' checks reject the join unless that version extends the one cut (Bug 114 (big ADLS reads
+ * fail under appends)). One cut before a byte reads again. A store that breaks that contract (S5)
+ * serves bytes the frames' checks reject.
  *
  * <p>An append frames its record from the version its condition names: from the view of it this
  * log read or wrote, or, for a tail only a {@link #probe} found, from that version's last trailer,
@@ -129,9 +132,10 @@ public final class AtomicFileLog implements SharedLog {
   public static final int TRAILER_SIZE = 20;
 
   /**
-   * How many times a read reads again when it fails as stale or fails the frames' checks. Each
-   * failure is a write that landed in the round trip between the read's lookup and its GET, so a
-   * run of them is a store serving no version it reports, not contention.
+   * How many times a read reads again from the start when it fails as stale before it read a byte,
+   * or fails the frames' checks. Each such failure is a write that landed in the round trip between
+   * the read's lookup and its GET (a read cut after it read some bytes reads on from there, and
+   * counts none), so a run of them is a store serving no version it reports, not contention.
    */
   static final int READ_ATTEMPTS = 10;
 
@@ -230,15 +234,7 @@ public final class AtomicFileLog implements SharedLog {
 
   @Override
   public LogView read() {
-    for (int attempt = 1; ; attempt += 1) {
-      try {
-        return parse(io.newInputFile(location));
-      } catch (SupportsAtomicOperations.StaleReadException | FrameCheckException e) {
-        if (attempt >= READ_ATTEMPTS) {
-          throw e;
-        }
-      }
-    }
+    return readOn(null);
   }
 
   /**
@@ -268,13 +264,13 @@ public final class AtomicFileLog implements SharedLog {
    * since} ends with, V is X extended (every frame names its object, and an append extends only the
    * version its condition names), and the view is {@code since}'s checkpoint and records, the same
    * arrays, and the frames after N, each checked: the runtime folds only those. Else the object was
-   * replaced, and the view is V's: its bytes before N - 20 and those the GET read, or V read whole
-   * if the GET found none. A tail a probe found, or bytes that fail a check or a read that fails as
-   * stale, are read whole or again as {@link #read} does.
+   * replaced, and the view is V read whole: a GET of it from its start, asking for V. A tail a probe
+   * found is read whole. A read cut part way reads on as {@link #readOn} says.
    *
-   * <p>Under {@code intentlog.fileio.tail.check} (the test suites), each tail read is checked
-   * against a whole read of the version it found: the trailer stands in for a comparison of the
-   * bytes before N, and this makes its argument the thing the suites test.
+   * <p>Under {@code intentlog.fileio.tail.check} (the test suites), each tail read, and each read
+   * that read on past a cut, is checked against a whole read of the version it found: the trailer
+   * stands in for a comparison of the bytes before N, and this makes its argument the thing the
+   * suites test.
    */
   @Override
   public LogView readAfter(LogTail since) {
@@ -282,92 +278,212 @@ public final class AtomicFileLog implements SharedLog {
     if (from.view == null || from.view.trailer.length != TRAILER_SIZE) {
       return read();
     }
-    for (int attempt = 1; ; attempt += 1) {
-      try {
-        FileView view = tailRead(from);
-        if (Boolean.getBoolean(CHECK_TAIL_READS)) {
-          checkAgainstWhole(view);
-        }
-        return view;
-      } catch (SupportsAtomicOperations.StaleReadException | FrameCheckException e) {
-        if (attempt >= READ_ATTEMPTS) {
-          throw e;
-        }
-      }
-    }
+    return readOn(from);
   }
 
   /** The system property that checks each tail read against a whole read (tests). */
   public static final String CHECK_TAIL_READS = "intentlog.fileio.tail.check";
 
-  /** One tail read from {@code from} (see {@link #readAfter}). */
-  private FileView tailRead(FileTail from) {
-    return readFirst ? tailReadFirst(from) : tailReadAfterLookup(from);
+  /**
+   * Reads the log: whole if {@code from} is null, else what follows it ({@link #readAfter}). A read
+   * is of one version, so a write that lands between two of the requests a store's stream sends
+   * for one read fails the later one as stale (ADLS's SDK reads in blocks of 4 MiB, each after the
+   * first asking for the version the first found). A read cut so keeps the bytes it read and reads
+   * on from where it stopped, with a GET of the version live then ({@link Reading}): an append
+   * leaves the bytes before the cut as they were, and the frames' checks reject a join across a
+   * replace (Bug 114 (big ADLS reads fail under appends)). Where every write is a replace (no
+   * appends), a cut reads again from the start. A read that fails as stale before it reads a byte,
+   * or whose bytes fail a check, reads again from the start, up to {@link #READ_ATTEMPTS} times.
+   */
+  private FileView readOn(FileTail from) {
+    Reading reading = new Reading(from);
+    for (int failures = 0; ; ) {
+      try {
+        FileView view = reading.round(io.newInputFile(location));
+        if (view == null) {
+          continue; // cut: read on
+        }
+        if (reading.joined() && Boolean.getBoolean(CHECK_TAIL_READS)) {
+          checkAgainstWhole(view);
+        }
+        return view;
+      } catch (SupportsAtomicOperations.StaleReadException | FrameCheckException e) {
+        failures += 1;
+        if (failures >= READ_ATTEMPTS) {
+          throw e;
+        }
+        reading = new Reading(from);
+      }
+    }
+  }
+
+  /** The most a read asks of a stream at once: below any store's block, so a cut loses nothing. */
+  private static final int READ_CHUNK = 1 << 20;
+
+  /**
+   * One read of the object, over as many GETs as cuts take: the bytes it has read, from offset
+   * {@code base} of the object (0 for a whole read; N - 20 for a tail read from a view of N bytes,
+   * whose last trailer they must start with), and the lengths of the versions it was cut in.
+   *
+   * <p>Joining a read cut in version V with one of the version V' live then is sound if V' is V
+   * extended: V' holds V's bytes. It is checked when the read ends. Each frame must check, and
+   * one incarnation run through them, so if any frame ended before the cut (a tail read's always
+   * has: its first 20 bytes are a trailer), a V' of another incarnation fails it. A cut inside
+   * the first frame has only the frame's own checks: its trailer, from V', must give the frame's
+   * offset and checksum; and each version cut must end where a frame of the join ends, no later
+   * than the join. A replace of the object passes only if it held V's bytes up to the cut, as one
+   * that wrote the same checkpoint again does; then the join is the replace, read as it is.
+   */
+  private final class Reading {
+    private FileTail from; // the view a tail read continues; null for a whole read
+    private long base;
+    private byte[] bytes = new byte[0];
+    private int size = 0;
+    private final List<Long> cuts = new ArrayList<>();
+
+    Reading(FileTail from) {
+      this.from = from;
+      this.base = from == null ? 0L : from.length - TRAILER_SIZE;
+    }
+
+    /** Whether the view is a join: of a tail read, or of a read that read on past a cut. */
+    boolean joined() {
+      return from != null || !cuts.isEmpty();
+    }
+
+    /**
+     * One GET of {@code file}, after a lookup of it where reads do not record their version, from
+     * where the read stopped: the view if it read to the end of the version, null if it was cut
+     * and reads on.
+     */
+    FileView round(InputFile file) {
+      long at = base + size;
+      long length = -1;
+      boolean cut;
+      try (SeekableInputStream in = file.newStream()) {
+        if (!readFirst) {
+          // Open, then look up, then read, as a whole read does: the lookup binds the version the
+          // GET asks for (step 0)
+          length = file.getLength();
+          if (from != null && size == 0 && (length < from.length
+              || (length > from.length && !appends))) {
+            // shorter, or longer on a store without appends, where every change is a replace:
+            // read whole, not the 20 bytes before the tail first
+            return whole(file);
+          }
+          if (length < at) {
+            throw new FrameCheckException(
+                location + " is " + length + " bytes, shorter than the " + at + " a read cut");
+          }
+        }
+        in.seek(at);
+        cut = readStream(in, length < 0 ? -1L : length - at);
+      } catch (EOFException e) {
+        throw new FrameCheckException(location + ": " + e.getMessage());
+      } catch (IOException e) {
+        throw new UncheckedIOException(e);
+      }
+      if (from != null && (size >= TRAILER_SIZE ? !Arrays.equals(
+          bytes, 0, TRAILER_SIZE, from.view.trailer, 0, TRAILER_SIZE) : !cut)) {
+        // Not X's bytes at N, or nothing there: replaced. Read it whole: this version, unless the
+        // read was cut, which a write since superseded
+        return cut ? restartWhole() : whole(file);
+      }
+      if (cut) {
+        cuts.add(length >= 0 ? length : file.getLength());
+        return null;
+      }
+      byte[] read = Arrays.copyOf(bytes, size);
+      FileView view = from == null
+          ? viewOf(file, read)
+          : extended(from.view, file, from.length, read);
+      checkCuts(read);
+      return view;
+    }
+
+    /** Reads on as a whole read, from a GET of {@code file}'s version from its start. */
+    private FileView whole(InputFile file) {
+      restartWhole();
+      return round(file);
+    }
+
+    private FileView restartWhole() {
+      from = null;
+      base = 0L;
+      size = 0;
+      cuts.clear();
+      return null;
+    }
+
+    /**
+     * Reads {@code in} into the bytes read, to its end or {@code limit} bytes (-1: to its end):
+     * true if a write cut it, failing a request after the first as stale. A stale failure before
+     * it read a byte fails the read, as does one where no version extends another (no appends).
+     */
+    private boolean readStream(InputStream in, long limit) throws IOException {
+      int start = size;
+      try {
+        while (limit < 0 || size - start < limit) {
+          if (size == bytes.length) {
+            long want = limit >= 0 ? start + limit : Math.max(8192L, 2L * bytes.length);
+            bytes = Arrays.copyOf(bytes, (int) Math.min(want, Integer.MAX_VALUE - 8));
+          }
+          int ask = Math.min(bytes.length - size, READ_CHUNK);
+          if (limit >= 0) {
+            ask = (int) Math.min(ask, limit - (size - start));
+          }
+          int n = in.read(bytes, size, ask);
+          if (n < 0) {
+            if (limit >= 0) {
+              throw new EOFException(
+                  "Unexpected end of stream: read " + (size - start) + " of " + limit);
+            }
+            return false;
+          }
+          size += n;
+        }
+        return false;
+      } catch (SupportsAtomicOperations.StaleReadException e) {
+        if (size == start || !appends) {
+          throw e;
+        }
+        return true;
+      }
+    }
+
+    /**
+     * Fails unless every version the read was cut in ends where a frame of {@code read} ends (the
+     * object's bytes from {@link #base}), no later than the join.
+     */
+    private void checkCuts(byte[] read) {
+      for (long cutAt : cuts) {
+        if (!endsAFrame(read, from == null ? HEADER_SIZE : TRAILER_SIZE, base, cutAt)) {
+          throw new FrameCheckException(location + ": a read cut in a version of " + cutAt
+              + " bytes joined one with no frame ending there");
+        }
+      }
+    }
   }
 
   /**
-   * One tail read as one GET, from N - 20 to the end of the version it finds, which the file keeps
-   * (step 7). A GET from past the object's end reads nothing: the object is shorter than N - 20, and
-   * was replaced.
+   * Whether a frame of {@code bytes} (the object's from offset {@code base}, their frames, already
+   * checked, from index {@code first}) ends at offset {@code at} of the object.
    */
-  private FileView tailReadFirst(FileTail from) {
-    FileView held = from.view;
-    long n = from.length;
-    InputFile file = io.newInputFile(location);
-    byte[] bytes;
-    try (SeekableInputStream in = file.newStream()) {
-      in.seek(n - TRAILER_SIZE);
-      bytes = in.readAllBytes();
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
-    }
-    if (bytes.length >= TRAILER_SIZE
-        && Arrays.equals(bytes, 0, TRAILER_SIZE, held.trailer, 0, TRAILER_SIZE)) {
-      return extended(held, file, n, bytes);
-    }
-    if (bytes.length == 0) {
-      return (FileView) parse(file); // nothing at N - 20: replaced by a shorter object
-    }
-    // Not X's bytes at N: replaced. The rest of the version the GET read is before N - 20, which
-    // the file reads of that version
-    byte[] whole = new byte[(int) (n - TRAILER_SIZE + bytes.length)];
-    try (SeekableInputStream in = file.newStream()) {
-      readFully(in, whole, (int) (n - TRAILER_SIZE));
-    } catch (EOFException e) {
-      throw new FrameCheckException(location + ": " + e.getMessage());
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
-    }
-    System.arraycopy(bytes, 0, whole, (int) (n - TRAILER_SIZE), bytes.length);
-    return viewOf(file, whole);
-  }
-
-  /** One tail read after a lookup (see {@link #readAfter}). */
-  private FileView tailReadAfterLookup(FileTail from) {
-    FileView held = from.view;
-    long n = from.length;
-    InputFile file = io.newInputFile(location);
-    byte[] bytes;
-    // Open, then look up, then read, as a whole read does: the lookup binds the version the GET
-    // asks for (step 0)
-    try (SeekableInputStream in = file.newStream()) {
-      long length = file.getLength();
-      if (length < n || (length > n && !appends)) {
-        // shorter, or longer on a store without appends, where every change is a replace: read
-        // whole, not the 20 bytes before the tail first
-        return (FileView) parse(file);
+  private static boolean endsAFrame(byte[] bytes, int first, long base, long at) {
+    int pos = first;
+    while (base + pos < at && pos < bytes.length) {
+      long length = 0;
+      int i = pos;
+      for (int shift = 0; ; shift += 7) {
+        byte b = bytes[i++];
+        length |= (long) (b & 0x7F) << shift;
+        if (b >= 0) {
+          break;
+        }
       }
-      in.seek(n - TRAILER_SIZE);
-      bytes = readFully(in, (int) (length - n + TRAILER_SIZE));
-    } catch (EOFException e) {
-      throw new FrameCheckException(location + ": " + e.getMessage());
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
+      pos = (int) (i + length + TRAILER_SIZE);
     }
-    if (!Arrays.equals(bytes, 0, TRAILER_SIZE, held.trailer, 0, TRAILER_SIZE)) {
-      return (FileView) parse(file); // not X's bytes at N: replaced
-    }
-    return extended(held, file, n, bytes);
+    return base + pos == at;
   }
 
   /**
