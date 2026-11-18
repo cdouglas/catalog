@@ -62,8 +62,9 @@ java -cp tools/tla2tools.jar tlc2.TLC -workers 2 -config states/cfg/log-mix.cfg 
 ```
 
 `TLC_WORKERS` (default 2) and `TLC_HEAP` (default 2g) size the runs. Checked with
-TLC 2026.10.13.164326 (rev 210df3a), the version that jar reported. The whole
-table takes about 40 minutes. Most configurations take seconds; `mix`,
+TLC 2026.10.13.164326 (rev 210df3a), the version that jar reported. A full
+run took about six hours on the dev box at 4c685a3 ("Results"). Most
+configurations take seconds; `mix`,
 `mix-lenient`, `skew`, `log-mix` and `log-missingfail` take 3 to 6 minutes
 each, and `log-three` 8 to 11.
 
@@ -125,28 +126,28 @@ as FileIOCatalog and Iceberg do. Catalog transactions are not.
 
 ### Actions, code, and the jqwik checks that cover them
 
-Line numbers are of `LogRuntime.java` at 7e056b3 unless stated. `TestLogRuntime`
+Line numbers are of `LogRuntime.java` at 6a4c762 unless stated. `TestLogRuntime`
 (intentlog-core) drives each branch on a scripted log; each test names its action.
 
 | Action | Code | Covered by |
 |---|---|---|
-| `Begin`, `Stage` | `CatalogMutation.intention()` (`CatalogMutation.java:398`); id minted after the read's horizon :324 | all three fuzzers |
-| `Start` | `commit` :202, `loop` :348 | all |
-| `Write` (CAS) | `log.replace` :402, `records` :561 (GC watermark :562), `write` :582; `AtomicFileLog.write` (`AtomicFileLog.java:167`) | all |
-| `Write` (APPEND) | `log.append` :426, `write` :582 | all |
-| `Write` with `SegOK` false | `catch LogFullException` :427 (Bug 66) | MW, fault (segment limits drawn) |
-| `Write` with faults | `write` :582; the store's signals mapped by `AtomicFileLog.write` | MW, fault (`InMemoryAtomicFileIO.Fault`) |
-| `ReadBack` | `write`'s `readThrough` :613, `validate` :720; `AtomicFileLog` answers it from the write when the write says what the object holds (a replace; an append from a tail whose bytes it read or wrote), with no request: the same view, since every write gives the object a version of its own (errata D20) | all; strict versions: MW, fault |
-| `Rebase` | `catch LogConflictException` :403 and the read after it :411 | all |
-| `Refresh` | `catch LogConflictException` :434, `probe().continues` :440 | all |
-| `Shrink` | the read when the log was replaced :444 | MW |
-| `FreshForCAS` | `mustReplace` with `stale` :385 (Bugs 12, 26) | MW |
-| `Resolve` | `catch AmbiguousWrite` :458 | MW, fault |
-| `Exhaust`, `FinalRead` | after the loop :491, :494 | MW (faults) |
-| `Unreadable` | `catch UnreadableLog` :480 | MW, fault (read faults) |
-| `Judge` | `landed` :694; `CommittedSet.Builder.contains` (`CommittedSet.java:142`) | MW, fault, race (gc) |
-| `Restage` | `LogCatalog.commitOnAFreshRead` (`LogCatalog.java:281`); Iceberg's table commit retry | fault, race |
-| `Replay`, `Fold` | `Replay.replayOnto` (`Replay.java:127`), `mayApply` (`CommittedSet.java:151`), `CatalogIntention.verify` (`ProtoCodec.java:1560`) | all (every read), `CheckpointRoundTrip` |
+| `Begin`, `Stage` | `CatalogMutation.intention()` (`CatalogMutation.java:795`); id minted after the read's floor :1378 | all three fuzzers |
+| `Start` | `commit` :830, `loop` :1428 | all |
+| `Write` (CAS) | `log.replace` :1505, `prepare` :1299 (GC watermark :1301), `write` :1788; `AtomicFileLog.write` (`AtomicFileLog.java:689`) | all |
+| `Write` (APPEND) | `log.append` :1538, `write` :1788 | all |
+| `Write` with `SegOK` false | `catch LogFullException` :1539 (Bug 66 (append cap never compacted)) | MW, fault (segment limits drawn) |
+| `Write` with faults | `write` :1788; the store's signals mapped by `AtomicFileLog.write` | MW, fault (`InMemoryAtomicFileIO.Fault`) |
+| `ReadBack` | `write`'s `readThrough` :1826, `validate` :2049; `AtomicFileLog` answers it from the write when the write says what the object holds (a replace; an append from a tail whose bytes it read or wrote), with no request: the same view, since every write gives the object a version of its own (errata D20) | all; strict versions: MW, fault |
+| `Rebase` | `catch LogConflictException` :1511 and the read after it :1521 | all |
+| `Refresh` | `catch LogConflictException` :1547, `probe().continues` :1580 | all |
+| `Shrink` | the read when the log was replaced :1585 | MW |
+| `FreshForCAS` | `mustReplace` with `stale` :1484 (Bug 12 (compacted the stale snapshot), Bug 26 (retry compacted without reading)) | MW |
+| `Resolve` | `catch AmbiguousWrite` :1599 | MW, fault |
+| `Exhaust`, `FinalRead` | after the loop :1638, :1641 | MW (faults) |
+| `Unreadable` | `catch UnreadableLog` :1627 | MW, fault (read faults) |
+| `Judge` | `landed` :1957; `CommittedSet.Builder.contains` (`CommittedSet.java:1306`) | MW, fault, race (gc) |
+| `Restage` | `LogCatalog.commitOnAFreshRead` (`LogCatalog.java:611`); Iceberg's table commit retry | fault, race |
+| `Replay`, `Fold` | `Replay.replayOnto` (`Replay.java:219`), `mayApply` (`CommittedSet.java:1311`), `CatalogIntention.verify` (`ProtoCodec.java:2275`) | all (every read), `CheckpointRoundTrip` |
 | `LandInflight` | none: a timed-out request that lands later | none |
 | `Tick`, `Skew` | the runtime's clock (`RuntimeConfig.clockMs`) | gc runs (wall clock); no fuzzer skews clocks |
 
@@ -174,9 +175,12 @@ goes in a replace, `oversized` in `mustReplace`: Bug 71, covered by
 
 ## Results
 
-Every configuration passes. The state counts in this file's tables are from
-`check.py`'s full run at 4c685a3 (2026-11-11: 138 configurations, about six
-hours on the dev box):
+Every configuration of the correct protocol passes. `check.py` holds 159
+configurations (98 of the file model, 41 `log-*`, 20 `sg-*`), 102 of them
+expected to pass; the rest are bug switches, each expected to break a
+property. The state counts in this file's tables are from `check.py`'s full
+run at 4c685a3 (2026-11-11: the 138 configurations it held then, about six
+hours on the dev box), unless a table gives its own date:
 
 | Config | What it adds | States |
 |---|---|---|
@@ -380,25 +384,25 @@ trim) is one order of these.
 
 ### Actions and code
 
-Line numbers are of `LogRuntime.java` at 7e056b3. `TestSharedLogRuntime`
+Line numbers are of `LogRuntime.java` at 6a4c762. `TestSharedLogRuntime`
 (intentlog-memory) drives each schedule the model found, with its switch in
 brackets.
 
 | Action | Code | Covered by |
 |---|---|---|
-| `Begin` | `commit` :202; the id minted after the read's horizon :324; the commit's floor :328 | protocol, MW |
-| `Send` | `log.append(record, null)` :426, through `write` :582; a throttled send kept as `duplicate` :609 (`dup`) | protocol, MW |
-| `ReadBack` | `readThrough` :613; a view without the record is ambiguous :617 (`p3`) | protocol, MW |
-| `Resolve` | `catch AmbiguousWrite` :458; `read` reads again until it reaches the floor :639 (`lagread`) | protocol, MW |
-| `Exhaust` | after the loop :491 | protocol |
-| `Judge` | `landed` :694: replay's outcome first, then the committed set (`setonly`) | protocol, MW |
-| `AppendGc`, `PutCheckpoint`, `Trim` | `compact` :89; `InMemorySharedLog.putCheckpoint` and `trim` | protocol (also inside commits, whole or GC record only), MW (between operations) |
+| `Begin` | `commit` :830; the id minted after the read's floor :1378; the commit's floor :1383 | protocol, MW |
+| `Send` | `log.append(record, null)` :1538, through `write` :1788; a throttled send kept as `duplicate` :1821 (`dup`) | protocol, MW |
+| `ReadBack` | `readThrough` :1826; a view without the record is ambiguous :1839 (`p3`) | protocol, MW |
+| `Resolve` | `catch AmbiguousWrite` :1599; `read` reads again until it reaches the floor :1887 (`lagread`) | protocol, MW |
+| `Exhaust` | after the loop :1638 | protocol |
+| `Judge` | `landed` :1957: replay's outcome first, then the committed set (`setonly`) | protocol, MW |
+| `AppendGc`, `PutCheckpoint`, `Trim` | `compact` :263; `InMemorySharedLog.putCheckpoint` and `trim` | protocol (also inside commits, whole or GC record only), MW (between operations) |
 | `LandInflight` | a `DELAYED` append, landed by `InMemorySharedLog.deliverDelayed` | protocol, MW |
 | lagging reads (`Lag`), reads from older checkpoints | `InMemorySharedLog`'s read shapes (`ReadShape`) | protocol (stale reads) |
 
 "protocol" is `TestMemoryCommitProtocol` (the testkit's `CommitProtocol` on
 `InMemorySharedLog`); "MW" is `TestMultiWriterProperties` on the shared log.
-Not modelled: creating the log (its first checkpoint, `create` :528),
+Not modelled: creating the log (its first checkpoint, `create` :1747),
 `refresh`, a record larger than the log stores, which `loop` rejects before
 sending it (`TOO_LARGE`, Bug 71; `TestSharedLogRuntime`), and reads outside a
 commit, such as a catalog's right after its own, which `read(floor)` keeps
@@ -850,7 +854,7 @@ writes.
 
 `docs/SNAPSHOT_PAGING.md` step 4 pages a table's old snapshots out of the root:
 the state machine itself names pages, which a compactor puts before the root
-that names them. The file model has them (the shared log does not yet:
+that names them. The file model has them (the shared-log model does not:
 `SealEvery` is 0 in every `log-*` configuration).
 
 - **The state** (`RSM.tla`) holds `sealed`, the names of its pages: `[e, v]`,
