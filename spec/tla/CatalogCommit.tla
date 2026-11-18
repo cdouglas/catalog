@@ -945,9 +945,10 @@ CheckpointIsReplay ==
 \* The set keeps its shape; every stamp lies on the grid.
 PagesExist == PagesExistIn(LiveR, store)
 
-\* The state's pages (SNAPSHOT_PAGING.md "Testing", oracle 1): every page the
-\* catalog object's root names, and the catalog still names, is in the store: a
-\* compactor puts a root's pages before writing it, and a sweep deletes none a
+\* The state's pages (SNAPSHOT_PAGING.md "Testing"; in Java,
+\* CheckpointRoundTrip.snapshotPagesProblem): every page the catalog object's
+\* root names, and the catalog still names, is in the store: a compactor puts a
+\* root's pages before writing it, and a sweep deletes none a
 \* reader of the object may need. A page a record after the root dropped (an
 \* expiry that emptied its block) is garbage once that record is in the log: a
 \* reader replays it before it loads; one that loaded before fails, as Iceberg's

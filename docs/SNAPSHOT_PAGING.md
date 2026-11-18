@@ -642,71 +642,78 @@ commit latency (p50 / p99) and the catalog bytes it read:
 
 The cases that matter sit at the sealing line, as the committed set's sit at
 its marks: records that touch a snapshot just inside the inline window, just
-behind it, in a sealed block, pinned by a ref, brought back, or expired. The
-fuzzers run with B = 4 and W = 8, so that tables seal blocks constantly.
+behind it, in a sealed block, pinned by a ref, brought back, or expired. A
+table seals its first block when its last sequence number reaches B + W
+(`SnapshotPages.sealedThrough`): 12 at B = 4, W = 8; 3 at B = 2, W = 1; 1,280
+at the catalog's default (B = 256, W = 1,024).
 
-**Targets drawn against the line.** A generator draws the snapshot a record
-touches (its parent, its ref target, its cherry-pick source, the snapshots an
-expiry removes) from regions of the table where it lands:
+**Unit tests.** `TestSnapshotPages` holds a page to its block (its snapshots
+and their lists, the name that names it), each leaf to its proof under the
+block's Merkle root, and blocks to the line they seal at.
+`TestSnapshotPaging` runs mostly at B = 4, W = 8 (B = 2, W = 1 for stale
+handles), on one object and on a shared log:
 
-| Region | A commit on it (parent) | A ref moved to it | Expiry of it |
-|---|---|---|---|
-| the head | applies | applies | per Iceberg |
-| inline, within W | merges or conflicts per the encoding | applies | applies |
-| in the block the next record seals | applies; `sealed` once a later record has sealed it | applies; with a proof once sealed | applies |
-| sealed, live | conflicts (`sealed`) | applies with a valid proof; `sealed` without, or with a wrong one | applies: its id leaves the live set |
-| sealed, expired | conflicts | `sealed` (not live) | no-op, as Iceberg's |
-| pinned by a ref (a straggler) | as inline | applies | applies |
-| brought back by an earlier record | as inline | applies | applies |
+- the catalog's first record fixes its paging;
+- a fresh catalog's load, lazy or not, reads every snapshot with its list,
+  from the pages a compaction stored or, before one, from those its replay
+  sealed;
+- a commit makes no snapshot it does not add;
+- a rollback or a tag onto a sealed snapshot brings it back with its proof,
+  and a proof for another place, or a forged leaf, proves nothing;
+- an expiry that empties blocks drops their pages, which the compaction that
+  writes the root without them deletes; a sweep deletes an orphan page of a
+  version the root has reached and keeps one of a later version;
+- `deleteOrphanPages` deletes the pages whose deletes a compaction failed;
+- a stale handle reads collected pages as the table is now, and a page the
+  table still names that the store lost is never taken for collected;
+- a copy for a worker (`SerializableTable`) reads the history from the pages;
+- re-inlining (step 5): a deep pointer table comes back with import pages, a
+  table upgraded to v3 comes back, an import whose record does not land
+  leaves pages a sweep deletes, and replay checks what an import shows.
 
-**The reference.** Every property runs a paged catalog beside a catalog that
-never pages (B infinite), on the same schedule:
+**The suites and the fuzzers.** `LocalCatalogMode` creates every catalog with
+the paging `-Dfileio.catalog.test.snapshot.block` and `.window` (8 unless
+set) give, and ce-fuzz passes `SNAPSHOT_BLOCK` and `SNAPSHOT_WINDOW` on to
+them. Unset, a catalog takes the default, which seals nothing in the suites'
+and fuzzers' schedules (the fault fuzzer's are at most 40 operations over
+four tables). With paging set:
 
-- **Loads agree.** Each table reads the same through both: metadata, every
-  snapshot, the snapshot log, refs, lists, files per ref, every metadata table
-  (`TableViews.logical` and `physical`, as `TestInlineDifferentialProperties`
-  compares pointer and inline catalogs).
-- **Admission differs only where it may.** A record that applies in the
-  reference and not in the paged catalog must be one that needed a sealed
-  snapshot without carrying it (its rejection says `sealed`). Every other
-  outcome is the same. The reverse never happens.
-- **The replay check** compares the split of each delta with the builder on
-  the whole table, in the reference, where every snapshot is at hand.
+- `CheckpointRoundTrip.snapshotPagesProblem`, wherever the local suites and
+  the fuzzers check their catalog files (`assertPagesExist`), checks each page
+  the newest root names that replay still names: it exists, decodes as its name says, holds the
+  block's live snapshots, and its leaves hash to the block's Merkle root. The
+  checkpoint round trip does not compare a root's sealed blocks or its B and W
+  (design.md I6).
+- `TestCatalogFaultProperties` loads every table whole through its checker
+  and through a fresh reader, which reads sealed snapshots from the pages, and
+  requires the same metadata and snapshots of both; its `REINLINE` operation
+  and other commits that bring a pointer table back import pages; and it
+  checks that a purge deleted every manifest and list the table had
+  (`checkPurged`, Bug 94 (purge leaks a paged table)).
+- `TestInlineDifferentialProperties` runs `TableScript`'s schedules (with
+  rollbacks and refs on old snapshots) on a pointer catalog, which pages
+  nothing, and on a paged inline one: each step must commit alike in both,
+  and the tables read the same.
 
-**The catalog fuzzers** (`TestCatalogFaultProperties`, `TableScript`'s
-schedules, the differential and rebase properties) gain the small B and W,
-and operations aimed at the line: rollbacks and tags on old snapshots,
-fast-forward cherry-picks of old staged snapshots, branches that keep their
-own ancestors past expiry (holes in blocks), expiries whose cutoff falls
-inside a block, and stale writers whose base is behind the line. They
-already move tables out of inline storage and back (a small inline update
-limit); at the small B and W the tables they bring back are deep, so a
-re-inline imports pages, and page faults reach its puts. A re-inlined table
-must load as its pointer form did.
+Rounds that reach sealed blocks and import pages run at B = 2, W = 1 (step 5).
 
-**Pages.** `CheckpointRoundTrip` checks that every page a root names exists,
-decodes, hashes to its name, and holds what the reference's snapshots are; and
-that replaying the log equals decoding the root (I11, with roots byte-equal).
-Faults: a page missing, a get that fails, a put whose reply is lost, a sweep
-at any step. Oracles:
+**Calibration.** Snapshot paging has no mutant set of its own. `drops.sh`'s
+`purgeafter` (a purge that reads the dropped version's history only after the
+drop lands) needs sealed pages and runs at `SNAPSHOT_BLOCK=2
+SNAPSHOT_WINDOW=1` (fuzz/mutants/).
 
-1. A load or an expiry's read never takes a missing page for empty: it fails.
-2. A sweep deletes only pages the root shows are garbage, and never one that
-   a root a provider may serve names, nor an import page whose record may
-   still apply.
-3. At the drain, after every table is dropped or expires every snapshot, a
-   sweep leaves no page.
-4. A load that asks for no history reads no page (requests counted, as
-   `TestCommitReads` counts reads).
+**TLA+.** The file model has the state's pages (spec/tla/README.md "The
+state's pages"): puts before the root, sweeps from a writer's view however
+stale, and `StatePagesExist`, which `statepages` and `after-statepages` hold
+and two bug switches break: `rootfirst` (a root written before its pages) and
+`sweepstale` (a sweep that deletes every page its view does not name, whatever
+the version). The model has no load, so a missing page read as empty is
+checked in Java alone (`TestSnapshotPaging`, above). The shared-log model has
+no state pages, and neither model has import pages.
 
-**TLA+.** The models learn pages for the state as the review proposed (put,
-get, delete, a root naming them), with bug switches for a root written before
-its pages, a sweep of a page a servable root names, and a missing page read
-as empty.
-
-**Measurements.** ReplayBench at 3,000 and 7,200 snapshots (fast and merge),
-the ingest captures' checkpoint breakdown, and catalog-bench E3 (depth
-7,200), before and after each step below.
+**Measurements.** ReplayBench (one table's checkpoint, REPLAY_BENCH_RESULTS.md)
+and catalog-bench's E3 at 7,200 snapshots measured the steps below
+([Sizes](#sizes)).
 
 ## Order of work
 
@@ -881,9 +888,10 @@ Each step stands alone and is measured before the next:
      rounds take the catalog's default, which seals nothing in their short
      schedules; `0` turns paging off. `CheckpointRoundTrip`
      checks every root's pages. The file model (`spec/tla`) has the state's
-     pages: puts before the root, sweeps from any view, and two bug switches
-     (a root before its pages; a sweep that ignores versions) that break
-     `StatePagesExist`; the shared-log model does not have them yet.
+     pages: puts before the root, sweeps from a writer's view however stale,
+     and two bug switches (a root before its pages; a sweep that ignores
+     versions) that break `StatePagesExist`; the shared-log model does not
+     have them.
 5. **Re-inlining at any depth.** Import pages, the FULL record that names
    them, their GC, and a maintenance call that re-inlines a pointer table
    without a data commit. Built 2026-11-06:
