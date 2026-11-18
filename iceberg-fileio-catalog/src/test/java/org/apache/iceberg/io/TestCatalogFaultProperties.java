@@ -965,8 +965,9 @@ class TestCatalogFaultProperties {
     final int id;
     final LogCatalog catalog;
     // Whether it writes table metadata inline: its updates go as deltas, which the conflict
-    // encoding can judge where they land
+    // encoding can judge where they land; and manifest lists too
     final boolean inline;
+    final boolean inlineLists;
     final Map<TableIdentifier, Table> handles = new HashMap<>();
     CatalogTransaction txn = null;
     // The tables the open transaction loaded, by the catalog's names they had then
@@ -981,10 +982,11 @@ class TestCatalogFaultProperties {
     final List<TableIdentifier> keeping = new ArrayList<>();
     final Set<Namespace> createdNamespaces = new HashSet<>();
 
-    Writer(int id, LogCatalog catalog, boolean inline) {
+    Writer(int id, LogCatalog catalog, boolean inline, boolean inlineLists) {
       this.id = id;
       this.catalog = catalog;
       this.inline = inline;
+      this.inlineLists = inlineLists;
     }
 
     void closeTxn() {
@@ -1155,7 +1157,7 @@ class TestCatalogFaultProperties {
         double draw = (i * 0.4) % 1.0;
         this.writers[i] = new Writer(i, modes.get(i).catalog(io, WAREHOUSE, CATALOG_NAME,
             writerProperties, offset == 0 ? null : () -> System.currentTimeMillis() + offset,
-            () -> draw), modes.get(i).inlineTM || modes.get(i).inlineML);
+            () -> draw), modes.get(i).inlineTM || modes.get(i).inlineML, modes.get(i).inlineML);
       }
       // Reading does not depend on a catalog's mode, only on its log.
       this.checker = LocalCatalogMode.readerFor(io, CATALOG_LOCATION)
@@ -2813,10 +2815,14 @@ class TestCatalogFaultProperties {
           }
           unchanged &= Objects.equals(now.metadataLocation, at.metadataLocation);
           // An append is judged where the record lands if the table was inline when the
-          // transaction loaded it and is the same inline table now (LogCatalog.stageJudged)
+          // transaction loaded it and is the same inline table now (LogCatalog.stageJudged);
+          // unless it is the first snapshot of a table upgraded to v3, which gives row ids to the
+          // data manifests it keeps from before the upgrade: a writer that inlines manifest lists
+          // writes a metadata file for it (Bug 36), which applies only on the version it read
           int[] then = LogCatalog.inlineVersion(at.metadataLocation);
           int[] since = LogCatalog.inlineVersion(now.metadataLocation);
-          judged &= !at.updated || then != null && since != null && then[0] == since[0];
+          judged &= !at.updated || then != null && since != null && then[0] == since[0]
+              && !(w.inlineLists && givesRowIds(at.metadata));
           judged &= at.updated || !at.changed && at.scans.isEmpty() && !at.declared
               || Objects.equals(now.metadataLocation, at.metadataLocation);
         }
@@ -2838,6 +2844,16 @@ class TestCatalogFaultProperties {
         return "nothing raced it, and it read the table fresh";
       }
       return null;
+    }
+
+    /**
+     * Whether a snapshot added to main of {@code metadata} gives row ids to manifests: main's head
+     * of a v3 table was written before the upgrade (it has no first row id), so its data manifests
+     * have none.
+     */
+    private boolean givesRowIds(TableMetadata metadata) {
+      Snapshot head = metadata.currentSnapshot();
+      return metadata.formatVersion() >= 3 && head != null && head.firstRowId() == null;
     }
 
     /**
