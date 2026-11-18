@@ -352,6 +352,61 @@ A paged table is evicted the same way.
 **Trigger to revisit:** v3 upgrades of deep inline-ML tables in a workload
 the paper measures, where the eviction's writes matter.
 
+### D27. A view names its tables only in its SQL
+
+A view's SQL names the tables it reads, and the engine resolves the names at
+query time against the version's default catalog and namespace
+([VIEWS.md](VIEWS.md), "Identity"). The catalog records no dependency, so a
+drop or a rename of a table a view reads breaks the view at its next query, as
+in every Iceberg catalog.
+
+Dependency records would make a view's tables part of the catalog's state. A
+view version would bind each table it reads in one of two ways, and could mix
+them:
+- **By id.** The version records each table's id. Its SQL refers to the table
+  through that binding, not by text, and a load serves SQL that names the
+  table's current identifier. So a rename keeps the view valid. That needs SQL
+  the catalog can rewrite without parsing a dialect: references stored as
+  bindings, substituted at load.
+- **By name.** The version records the identifiers. A drop or a rename out of
+  one is refused unless the same record binds the name again: a transaction
+  that creates a table, or renames another, into its place. So the view stays
+  valid across a swap.
+
+Either way, a table a live view depends on cannot be dropped, as a namespace
+with children cannot. The check must be stable (S2) as `DropNamespace`'s is:
+- a view that depends on a table bumps the table's version, so a drop staged on
+  a read without dependents fails if one has landed since;
+- versions only grow, so a late copy of that drop fails too.
+
+What blocks it is the input, not the format. Iceberg's `ViewBuilder` carries a
+schema, SQL per dialect, defaults and properties, and no engine passes the
+tables its query resolved. Bindings would need engines' cooperation, a
+FileIOCatalog-specific property, or a catalog that parses each dialect. A
+reference into another catalog cannot be bound.
+
+**Trigger to revisit:** an engine integration that can supply a view's
+resolved tables, or a claim about view integrity in the paper.
+
+### D28. Pointer locations are full strings
+
+A pointer table's or view's metadata location is a full string in every
+record that moves it and in every checkpoint: catalog.proto
+`Table.metadata_location`, `UpdateTableLocation`, `View.metadata_location`,
+about 115 bytes for `s3://<bucket>/<warehouse>/<ns>/<name>/metadata/00003-<uuid>.gz.metadata.json`.
+
+A compact form would record the entity's location once, empty when it is the
+catalog's default for its identifier at create, and per version a 16-byte
+nonce and the version number, about 18 bytes. The writer would name its file
+`<metadata dir>/<version>-<nonce>.metadata.json`. `registerTable` and
+`registerView` adopt a file of any name, so they keep the full string as the
+oneof's other case. That saves about 100 bytes per pointer entity in every
+checkpoint, and per record that moves one: 0.3 MB of E1's 3,000-table pointer
+checkpoint; 0.2 MB against 1.1 MB at 10,000 views.
+
+**Trigger to revisit:** checkpoint bytes of a pointer catalog with many tables
+or views mattering in a measured workload.
+
 ### D8. Typed-protobuf encoding for Iceberg structural types (skip JSON serde)
 
 `AddSortOrderUpdate` is encoded structurally (see SPEC_TM.md §"Other
