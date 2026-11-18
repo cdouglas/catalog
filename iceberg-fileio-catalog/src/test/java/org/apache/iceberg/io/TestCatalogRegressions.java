@@ -7170,6 +7170,211 @@ public class TestCatalogRegressions {
     }
   }
 
+  /**
+   * Bug 108 (txn can't drop table and namespace): a catalog transaction that dropped every table
+   * of a namespace, or renamed them out of it, and then dropped the namespace was refused with
+   * NamespaceNotEmptyException: staging the namespace's drop counted as its children the tables
+   * the transaction drops and those it renames out. Iceberg's transaction allows it, as a serial
+   * run of the same calls does. The record drops the namespace after its tables; a create in the
+   * namespace that lands before the record fails it (the namespace's version moved), and the
+   * transaction run again finds the namespace not empty.
+   */
+  @Nested
+  class ATransactionThatEmptiesANamespaceAndDropsIt {
+    private final Namespace ns = Namespace.of("ns");
+    private final TableIdentifier t = TableIdentifier.of(ns, "t");
+    private final TableIdentifier u = TableIdentifier.of(ns, "u");
+    private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "CAS", "APPEND_TM", "COMPACT_ML", "MEMLOG", "AZLOG_TM"})
+    void dropsItsTablesThenTheNamespace(LocalCatalogMode mode) {
+      LogCatalog catalog = catalog(io, mode);
+      catalog.createNamespace(ns);
+      catalog.createTable(t, SCHEMA);
+      catalog.createTable(u, SCHEMA);
+
+      CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      assertThat(txn.asCatalog().dropTable(t, true)).isTrue();
+      assertThat(txn.asCatalog().dropTable(u, false)).isTrue();
+      assertThat(namespaces(txn).dropNamespace(ns)).isTrue();
+      txn.commitTransaction();
+
+      LogCatalog reader = catalog(io, mode);
+      assertThat(reader.namespaceExists(ns)).isFalse();
+      assertThat(reader.tableExists(t)).isFalse();
+      assertThat(reader.tableExists(u)).isFalse();
+      mode.assertCommitPolicy(io);
+    }
+
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "CAS", "APPEND_TM", "COMPACT_ML", "MEMLOG", "AZLOG_TM"})
+    void renamesOneOutDropsOneThenTheNamespace(LocalCatalogMode mode) {
+      LogCatalog catalog = catalog(io, mode);
+      Namespace other = Namespace.of("other");
+      TableIdentifier moved = TableIdentifier.of(other, "t");
+      catalog.createNamespace(ns);
+      catalog.createNamespace(other);
+      catalog.createTable(t, SCHEMA).newFastAppend().appendFile(dataFile("t1")).commit();
+      catalog.createTable(u, SCHEMA);
+
+      CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      txn.asCatalog().renameTable(t, moved);
+      assertThat(txn.asCatalog().dropTable(u, true)).isTrue();
+      assertThat(namespaces(txn).dropNamespace(ns)).isTrue();
+      txn.commitTransaction();
+
+      LogCatalog reader = catalog(io, mode);
+      assertThat(reader.namespaceExists(ns)).isFalse();
+      assertThat(reader.listNamespaces()).containsExactly(other);
+      assertThat(reader.listTables(other)).containsExactly(moved);
+      assertThat(dataFiles(reader.loadTable(moved))).containsExactly("mem:///data/t1.parquet");
+      mode.assertCommitPolicy(io);
+    }
+
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "CAS", "APPEND_TM", "COMPACT_ML", "MEMLOG", "AZLOG_TM"})
+    void dropsAChildNamespaceThenItsParent(LocalCatalogMode mode) {
+      LogCatalog catalog = catalog(io, mode);
+      Namespace child = Namespace.of("ns", "c");
+      TableIdentifier inChild = TableIdentifier.of(child, "t");
+      catalog.createNamespace(ns);
+      catalog.createNamespace(child);
+      catalog.createTable(t, SCHEMA);
+      catalog.createTable(inChild, SCHEMA);
+
+      CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      assertThat(txn.asCatalog().dropTable(inChild, true)).isTrue();
+      assertThat(namespaces(txn).dropNamespace(child)).isTrue();
+      assertThat(txn.asCatalog().dropTable(t, true)).isTrue();
+      assertThat(namespaces(txn).dropNamespace(ns)).isTrue();
+      txn.commitTransaction();
+
+      LogCatalog reader = catalog(io, mode);
+      assertThat(reader.listNamespaces()).isEmpty();
+      assertThat(reader.namespaceExists(child)).isFalse();
+      assertThat(reader.tableExists(t)).isFalse();
+      assertThat(reader.tableExists(inChild)).isFalse();
+      mode.assertCommitPolicy(io);
+    }
+
+    /**
+     * Another writer creates a table in the namespace just before the transaction's record is
+     * written: the record does not apply, and the table stays. The transaction run again, on a
+     * read that holds the table, finds the namespace not empty.
+     */
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "CAS", "APPEND_TM", "COMPACT_ML", "MEMLOG", "AZLOG_TM"})
+    void aCreateInTheNamespaceBeforeTheRecordFailsIt(LocalCatalogMode mode) {
+      LogCatalog catalog = catalog(io, mode);
+      LogCatalog sibling = catalog(io, mode);
+      catalog.createNamespace(ns);
+      catalog.createTable(t, SCHEMA);
+
+      CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      assertThat(txn.asCatalog().dropTable(t, true)).isTrue();
+      assertThat(namespaces(txn).dropNamespace(ns)).isTrue();
+      boolean[] raced = {false};
+      beforeTheNextWrite(mode, () -> {
+        raced[0] = true;
+        sibling.createTable(u, SCHEMA);
+      });
+      try {
+        assertThatThrownBy(txn::commitTransaction).isInstanceOf(CommitFailedException.class);
+      } finally {
+        noHooks(mode);
+      }
+
+      assertThat(raced[0]).as("the create landed just before the record").isTrue();
+      LogCatalog reader = catalog(io, mode);
+      assertThat(reader.namespaceExists(ns)).isTrue();
+      assertThat(reader.listTables(ns)).containsExactlyInAnyOrder(t, u);
+      assertThat(reader.loadTable(u).schema().asStruct()).isEqualTo(SCHEMA.asStruct());
+
+      CatalogTransaction again =
+          reader.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      assertThat(again.asCatalog().dropTable(t, true)).isTrue();
+      assertThatThrownBy(() -> namespaces(again).dropNamespace(ns))
+          .isInstanceOf(NamespaceNotEmptyException.class);
+      mode.assertCommitPolicy(io);
+    }
+
+    /**
+     * Another writer creates a table in the namespace after the transaction's last load and
+     * before its commit, which reads the catalog again: the namespace is not empty there.
+     */
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "MEMLOG"})
+    void aCreateInTheNamespaceBeforeTheCommitFindsItNotEmpty(LocalCatalogMode mode) {
+      LogCatalog catalog = catalog(io, mode);
+      catalog.createNamespace(ns);
+      catalog.createTable(t, SCHEMA);
+
+      CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      assertThat(txn.asCatalog().dropTable(t, true)).isTrue();
+      assertThat(namespaces(txn).dropNamespace(ns)).isTrue();
+      catalog(io, mode).createTable(u, SCHEMA);
+
+      assertThatThrownBy(txn::commitTransaction).isInstanceOf(NamespaceNotEmptyException.class);
+      LogCatalog reader = catalog(io, mode);
+      assertThat(reader.listTables(ns)).containsExactlyInAnyOrder(t, u);
+    }
+
+    private org.apache.iceberg.catalog.SupportsNamespaces namespaces(CatalogTransaction txn) {
+      return (org.apache.iceberg.catalog.SupportsNamespaces) txn.asCatalog();
+    }
+
+    /**
+     * Runs {@code race}, another writer's, once, just before the next write to catalog "c"'s log:
+     * its object, its shared log, or its segments on Append Blobs.
+     */
+    private void beforeTheNextWrite(LocalCatalogMode mode, Runnable race) {
+      boolean[] ran = {false};
+      Runnable once = () -> {
+        if (!ran[0]) {
+          ran[0] = true;
+          race.run();
+        }
+      };
+      if (mode.sharedLog) {
+        LocalCatalogMode.sharedLog(io, CATALOG).intercept(new InMemorySharedLog.Interceptor() {
+          @Override
+          public InMemorySharedLog.WriteFault beforeWrite(
+              InMemorySharedLog.Request request, byte[] payload) {
+            if (request == InMemorySharedLog.Request.APPEND) {
+              once.run();
+            }
+            return InMemorySharedLog.WriteFault.NONE;
+          }
+        });
+      } else if (mode.azureLog) {
+        LocalCatalogMode.azureStore(io, CATALOG).intercept((op, name) -> {
+          if (op == org.intentlog.azure.InMemoryAppendBlobStore.Op.APPEND) {
+            once.run();
+          }
+          return org.intentlog.azure.InMemoryAppendBlobStore.Fault.NONE;
+        });
+      } else {
+        io.injectFaults((location, strategy) -> {
+          if (location.equals(CATALOG)) {
+            once.run();
+          }
+          return Fault.NONE;
+        });
+      }
+    }
+
+    private void noHooks(LocalCatalogMode mode) {
+      io.injectFaults((location, strategy) -> Fault.NONE);
+      if (mode.sharedLog) {
+        LocalCatalogMode.sharedLog(io, CATALOG).intercept(null);
+      }
+      if (mode.azureLog) {
+        LocalCatalogMode.azureStore(io, CATALOG).intercept(null);
+      }
+    }
+  }
+
   /** Properties of a catalog whose creates bind names by the namespace's version. */
   private static final Map<String, String> BY_NAMESPACE =
       Map.of(LogCatalogProperties.CREATE_CONDITION, "namespace");

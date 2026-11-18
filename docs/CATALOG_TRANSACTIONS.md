@@ -86,7 +86,7 @@ catalog does:
 | Change | Condition where the commit takes effect |
 |---|---|
 | create namespace (with properties) | absent (missing parents are created with it) |
-| drop namespace | present, holds no tables or namespaces |
+| drop namespace | present, holds no tables or namespaces but those the transaction drops or renames out of it |
 | set or remove namespace properties | present |
 | create table (`buildTable(...).create()`, `createTable`, `createTransaction()`) | absent; namespace present |
 | drop table (purge or not) | present, and the same table (uuid) the transaction read, if it read it |

@@ -168,6 +168,13 @@ message Action {
 }
 ```
 
+Every action verifies against the state before the record, and `apply` runs
+them in order. `CatalogMutation.intention()` creates namespaces first
+(parents before children) and drops them last (children before parents),
+after the drops and renames of tables: a transaction may drop every table of
+a namespace, or rename them out of it, and then the namespace, and each drop
+applies to an empty namespace.
+
 ### Pointer-Mode Action Messages
 
 Each action carries version fields for optimistic conflict detection. A

@@ -286,7 +286,9 @@ public class CatalogMutation {
                 .noneMatch(e -> parentOf(e.getKey()).equals(namespace));
     final boolean noTblChild =
         original.tables().stream()
-                .filter(tbl -> tables.get(tbl) == null)
+                // a table this transaction drops, or renames, is no child by its old name (a
+                // rename's new name is, below)
+                .filter(tbl -> !markedForDrop(tbl) && !tableRenames.containsKey(tbl))
                 .map(TableIdentifier::namespace)
                 .noneMatch(ns -> ns.equals(namespace))
             && tables.entrySet().stream()
@@ -812,18 +814,6 @@ public class CatalogMutation {
       }
     }
 
-    // Process namespace drops (false = drop)
-    for (Map.Entry<Namespace, Boolean> entry : namespaces.entrySet()) {
-      if (!entry.getValue()) {
-        Namespace ns = entry.getKey();
-        Integer nsId = original.namespaceId(ns);
-        if (nsId != null) {
-          int version = original.namespaceVersion(nsId);
-          actions.add(new ProtoCodec.DropNamespaceAction(nsId, version));
-        }
-      }
-    }
-
     // Process namespace property updates (for existing namespaces).
     // updateProperties merges into the same map for both
     // sets and removes; a null value is the remove marker.
@@ -978,6 +968,22 @@ public class CatalogMutation {
       }
       actions.add(new ProtoCodec.RenameTableAction(
           tblId, version, newNsId, byName(), newNsVersion, to.name()));
+    }
+
+    // Namespace drops last, children before parents: a namespace this transaction drops is empty
+    // once its tables' drops and renames, and its children's drops, apply (dropNamespace)
+    List<Namespace> dropped = namespaces.entrySet().stream()
+        .filter(e -> !e.getValue())
+        .map(Map.Entry::getKey)
+        .sorted(Comparator.comparingInt(Namespace::length).reversed()
+            .thenComparing(Namespace::toString))
+        .collect(Collectors.toList());
+    for (Namespace ns : dropped) {
+      Integer nsId = original.namespaceId(ns);
+      if (nsId != null) {
+        int version = original.namespaceVersion(nsId);
+        actions.add(new ProtoCodec.DropNamespaceAction(nsId, version));
+      }
     }
     return new ProtoCodec.CatalogIntention(actions);
   }
