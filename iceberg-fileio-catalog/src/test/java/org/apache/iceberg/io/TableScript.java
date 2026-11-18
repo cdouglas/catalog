@@ -247,6 +247,30 @@ final class TableScript {
     return steps;
   }
 
+  /**
+   * A command that does not apply to the table as it is (no live data file, no snapshot to pick):
+   * the step is skipped, as one Iceberg rejects is.
+   */
+  static final class NotApplicable extends RuntimeException {
+    NotApplicable(String message) {
+      super(message);
+    }
+  }
+
+  /**
+   * Whether {@code e}, which a step threw, rejects it as a step may be rejected: a conflict, a
+   * validation, an argument Iceberg refuses, or a command that does not apply. Anything else (an
+   * {@code IllegalStateException} or a {@code NullPointerException} from the catalog, a commit
+   * whose outcome is unknown where nothing failed) is a bug, and fails the run rather than read as
+   * a rejection; a failed self-check is an {@code Error} and is never caught.
+   */
+  static boolean rejects(RuntimeException e) {
+    return e instanceof org.apache.iceberg.exceptions.CommitFailedException
+        || e instanceof org.apache.iceberg.exceptions.ValidationException
+        || e instanceof IllegalArgumentException
+        || e instanceof NotApplicable;
+  }
+
   /** Runs commands on table {@link #ID} of a catalog. */
   static final class Runner {
     private final Catalog catalog;
@@ -315,8 +339,10 @@ final class TableScript {
         this.stale = other.loadTable(ID);
         try {
           Cmd member = step.size() > 1 ? step.get(1) : null;
-          if (member == null || member.kind == Kind.REPLACE) {
-            throw new IllegalStateException("no command for the stale handle");
+          // a stale handle runs one table command: not a replace, a transaction or another STALE
+          if (member == null || member.kind == Kind.REPLACE || member.kind == Kind.STALE
+              || member.kind == Kind.TRANSACTION || member.kind == Kind.CATALOG_TXN) {
+            throw new NotApplicable("no command for the stale handle");
           }
           // A stale handle's history is its version's, less what expired since: a paging catalog's
           // lazy load reads collected pages as the table is now, as REST's does (SNAPSHOT_PAGING.md,
@@ -325,6 +351,9 @@ final class TableScript {
           other.loadTable(ID).snapshots().forEach(s -> still.add(s.snapshotId()));
           run(member, handle, still);
         } catch (RuntimeException e) {
+          if (!rejects(e)) {
+            throw unexpected(e);
+          }
           trace.append("  skipped: ").append(e).append('\n');
           return e;
         }
@@ -342,6 +371,10 @@ final class TableScript {
                 : null;
         trace.append(catalogTxn != null ? "catalog transaction (" + catalogTxn.isolationLevel()
             + ") " : "transaction ").append(group).append('\n');
+        // Once a member fails part way, Iceberg's BaseTransaction refuses every later operation
+        // and the commit ("last operation has not committed"): an IllegalStateException then is
+        // the skipped member's, not a bug
+        boolean[] memberSkipped = {false};
         try {
           Transaction txn = catalogTxn == null ? table.newTransaction() : null;
           Table target = txn != null ? txn.table() : catalogTxn.asCatalog().loadTable(ID);
@@ -360,6 +393,13 @@ final class TableScript {
                 run(member, i % 2 == 1 ? second : target);
                 staged += 1;
               } catch (RuntimeException e) {
+                // A transaction's table also refuses snapshot management and scans (Iceberg's
+                // BaseTransaction.TransactionTable): the member does not apply there
+                if (!rejects(e) && !(e instanceof UnsupportedOperationException)
+                    && !(memberSkipped[0] && e instanceof IllegalStateException)) {
+                  throw unexpected(e);
+                }
+                memberSkipped[0] = true;
                 trace.append("  member skipped: ").append(e).append('\n');
               }
             }
@@ -372,7 +412,7 @@ final class TableScript {
                 "a member of " + group + " committed outside its transaction\n" + trace);
           }
           if (staged == 0) {
-            throw new IllegalStateException("no member staged");
+            throw new NotApplicable("no member staged");
           }
           if (txn != null) {
             txn.commitTransaction();
@@ -380,6 +420,9 @@ final class TableScript {
             catalogTxn.commitTransaction();
           }
         } catch (RuntimeException e) {
+          if (!rejects(e) && !(memberSkipped[0] && e instanceof IllegalStateException)) {
+            throw unexpected(e);
+          }
           trace.append("  skipped: ").append(e).append('\n');
           return e;
         }
@@ -392,11 +435,23 @@ final class TableScript {
             run(first, table);
           }
         } catch (RuntimeException e) {
+          if (!rejects(e)) {
+            throw unexpected(e);
+          }
           trace.append("  skipped: ").append(e).append('\n');
           return e;
         }
       }
       return null;
+    }
+
+    /**
+     * A step's exception that no rejection throws, as an {@code Error}: a step may run inside a
+     * commit (a window run just before another writer's record is appended), and the commit loop
+     * maps a {@code RuntimeException} it cannot classify to an outcome of that commit.
+     */
+    private AssertionError unexpected(RuntimeException e) {
+      return new AssertionError("a step threw what no rejection throws: " + e + "\n" + trace, e);
     }
 
     /** The commits this runner's catalog has tried, landed or not; 0 for a catalog not a log's. */
@@ -450,7 +505,7 @@ final class TableScript {
         case REWRITE_FILES:
           List<DataFile> rewritten = liveFiles(target);
           if (rewritten.isEmpty()) {
-            throw new IllegalStateException("no live data file");
+            throw new NotApplicable("no live data file");
           }
           DataFile compacted = rewritten.get(cmd.b % rewritten.size());
           org.apache.iceberg.RewriteFiles rewrite =
@@ -591,7 +646,7 @@ final class TableScript {
             throw new java.io.UncheckedIOException(e);
           }
           if (live.isEmpty()) {
-            throw new IllegalStateException("no live data file");
+            throw new NotApplicable("no live data file");
           }
           live.sort(java.util.Comparator.comparing(DataFile::location));
           DataFile data = live.get(cmd.b % live.size());
@@ -639,7 +694,7 @@ final class TableScript {
         case REMOVE_PARTITION_FIELD:
           List<PartitionField> fields = target.spec().fields();
           if (fields.isEmpty()) {
-            throw new IllegalStateException("no partition field");
+            throw new NotApplicable("no partition field");
           }
           target.updateSpec().removeField(fields.get(cmd.b % fields.size()).name()).commit();
           break;
@@ -693,7 +748,7 @@ final class TableScript {
           List<String> refs = new ArrayList<>(target.refs().keySet());
           refs.remove("main");
           if (refs.isEmpty()) {
-            throw new IllegalStateException("no ref to remove");
+            throw new NotApplicable("no ref to remove");
           }
           refs.sort(String::compareTo);
           String removed = refs.get(cmd.b % refs.size());
@@ -842,14 +897,14 @@ final class TableScript {
         }
       });
       if (added.isEmpty()) {
-        throw new IllegalStateException("no added column");
+        throw new NotApplicable("no added column");
       }
       return added.get(index % added.size());
     }
 
     private static Snapshot pick(List<Snapshot> snapshots, int index) {
       if (snapshots.isEmpty()) {
-        throw new IllegalStateException("no snapshot");
+        throw new NotApplicable("no snapshot");
       }
       return snapshots.get(index % snapshots.size());
     }
@@ -908,7 +963,7 @@ final class TableScript {
         throw new java.io.UncheckedIOException(e);
       }
       if (live.isEmpty()) {
-        throw new IllegalStateException("no live data file");
+        throw new NotApplicable("no live data file");
       }
       live.sort(java.util.Comparator.comparing(t -> t.file().location()));
       return live.get(Math.floorMod(index, live.size()));

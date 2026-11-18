@@ -417,6 +417,10 @@ class TestRebaseProperties {
       }
     } catch (RuntimeException e) {
       // a file TableScript cannot write in the table's spec (as its runner skips the command)
+      if (!TableScript.rejects(e)) {
+        throw new AssertionError(
+            "R's write threw what no rejection throws: " + e + "\n" + trace, e);
+      }
       trace.append("R's write skipped: ").append(e).append('\n');
       writes = Writes.NOTHING;
     }
@@ -616,8 +620,11 @@ class TestRebaseProperties {
       outcome = "failed without a conflict (" + subject.failure.getClass().getSimpleName() + ")";
     }
 
-    // Both runs end alike: what the subject admitted is what the retry committed.
-    if ((subject.failure == null) != (reference.failure == null)) {
+    // Both runs end alike: what the subject admitted is what the retry committed, and what it
+    // failed the retry fails as
+    if ((subject.failure == null) != (reference.failure == null)
+        || (subject.failure != null
+            && subject.failure.getClass() != reference.failure.getClass())) {
       throw new AssertionError(String.format(
           "R %s in the subject but %s in the reference%n%s",
           subject.failure == null ? "committed" : "failed (" + subject.failure + ")",

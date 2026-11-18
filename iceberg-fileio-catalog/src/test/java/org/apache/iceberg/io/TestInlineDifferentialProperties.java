@@ -89,7 +89,8 @@ class TestInlineDifferentialProperties {
       RuntimeException pointerRejected = p.run(step);
       clock.stepped();
       RuntimeException inlineRejected = i.run(step);
-      if ((pointerRejected == null) != (inlineRejected == null)) {
+      if ((pointerRejected == null) != (inlineRejected == null)
+          || (pointerRejected != null && pointerRejected.getClass() != inlineRejected.getClass())) {
         throw new AssertionError(String.format(
             "the step %s in the pointer catalog and %s in the inline one%ntrace:%n%s",
             pointerRejected == null ? "committed" : "was rejected (" + pointerRejected + ")",
