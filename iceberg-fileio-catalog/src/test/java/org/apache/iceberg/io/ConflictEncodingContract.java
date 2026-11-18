@@ -86,7 +86,12 @@ abstract class ConflictEncodingContract {
   /** The name of the encoding under test. */
   abstract String encoding();
 
-  /** The catalogs and log of a try, after its prefix: R's writer, and the racer's. */
+  /**
+   * The catalogs and log of a try, after its prefix: R's writer, and the racer's. If {@code
+   * merging}, the tables merge manifests ({@code commit.manifest.min-count-to-merge} 2) and data
+   * commands add one to three files (C2 (retry oracle never merges manifests)), so records remove
+   * and write manifests that keep older files.
+   */
   private final class Fixture {
     final LogCatalog catalog;
     final LogCatalog other;
@@ -95,7 +100,8 @@ abstract class ConflictEncodingContract {
     final TableScript.Runner racer;
 
     Fixture(int formatVersion, boolean partitioned, LocalCatalogMode mode,
-        boolean smallInlineUpdates, List<TableScript.Cmd> prefix, StringBuilder trace) {
+        boolean smallInlineUpdates, boolean merging, List<TableScript.Cmd> prefix,
+        StringBuilder trace) {
       Map<String, String> properties = new HashMap<>();
       properties.put(LogCatalogProperties.CONFLICT_ENCODING, encoding());
       properties.put(
@@ -103,16 +109,21 @@ abstract class ConflictEncodingContract {
       if (smallInlineUpdates) {
         properties.put(LogCatalog.INLINE_MAX_UPDATE_SIZE, "2048");
       }
+      if (merging) {
+        properties.put(
+            CatalogProperties.TABLE_DEFAULT_PREFIX + TableProperties.MANIFEST_MIN_MERGE_COUNT, "2");
+      }
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       this.catalog = mode.catalog(io, WAREHOUSE, "c", properties);
       this.log = LocalCatalogMode.sharedLog(io, LOCATION);
       catalog.createNamespace(Namespace.of("ns"));
-      this.writer = new TableScript.Runner(catalog, formatVersion, partitioned, trace);
+      this.writer = new TableScript.Runner(catalog, formatVersion, partitioned, trace)
+          .severalFiles(merging);
       for (List<TableScript.Cmd> step : TableScript.steps(prefix)) {
         writer.run(step);
       }
       this.other = mode.catalog(io, WAREHOUSE, "c", properties);
-      this.racer = new TableScript.Runner(other, "w", trace);
+      this.racer = new TableScript.Runner(other, "w", trace).severalFiles(merging);
     }
   }
 
@@ -126,14 +137,16 @@ abstract class ConflictEncodingContract {
       @ForAll("windows") List<TableScript.Cmd> window,
       @ForAll("operations") TableScript.Cmd r,
       @ForAll("extensions") List<TableScript.Cmd> extension,
-      @ForAll @IntRange(min = -1, max = 5) int renameAt) {
+      @ForAll @IntRange(min = -1, max = 5) int renameAt,
+      @ForAll boolean merging) {
     StringBuilder trace = new StringBuilder(String.format(
-        "%s v%d %s, %s%s%nprefix %s%nwindow %s%nR %s%nextension %s, rename at %d%n",
+        "%s v%d %s, %s%s%s%nprefix %s%nwindow %s%nR %s%nextension %s, rename at %d%n",
         encoding(), formatVersion, partitioned ? "partitioned" : "unpartitioned", mode,
-        smallInlineUpdates ? ", small inline updates" : "", prefix, window, r, extension,
+        smallInlineUpdates ? ", small inline updates" : "",
+        merging ? ", merging manifests of several files" : "", prefix, window, r, extension,
         renameAt));
-    Fixture fixture =
-        new Fixture(formatVersion, partitioned, mode, smallInlineUpdates, prefix, trace);
+    Fixture fixture = new Fixture(formatVersion, partitioned, mode, smallInlineUpdates, merging,
+        prefix, trace);
     InMemorySharedLog log = fixture.log;
     LogCatalog other = fixture.other;
     TableScript.Runner writer = fixture.writer;
@@ -230,13 +243,15 @@ abstract class ConflictEncodingContract {
       @ForAll boolean smallInlineUpdates,
       @ForAll("prefixes") List<TableScript.Cmd> prefix,
       @ForAll("refExtensions") List<TableScript.Cmd> extension,
-      @ForAll @IntRange(min = -1, max = 5) int renameAt) {
+      @ForAll @IntRange(min = -1, max = 5) int renameAt,
+      @ForAll boolean merging) {
     StringBuilder trace = new StringBuilder(String.format(
-        "%s v%d %s, %s%s%nprefix %s%nextension %s, rename at %d%n", encoding(), formatVersion,
+        "%s v%d %s, %s%s%s%nprefix %s%nextension %s, rename at %d%n", encoding(), formatVersion,
         partitioned ? "partitioned" : "unpartitioned", mode,
-        smallInlineUpdates ? ", small inline updates" : "", prefix, extension, renameAt));
-    Fixture fixture =
-        new Fixture(formatVersion, partitioned, mode, smallInlineUpdates, prefix, trace);
+        smallInlineUpdates ? ", small inline updates" : "",
+        merging ? ", merging manifests of several files" : "", prefix, extension, renameAt));
+    Fixture fixture = new Fixture(formatVersion, partitioned, mode, smallInlineUpdates, merging,
+        prefix, trace);
     CatalogState base = replay(fixture.log, fixture.log.records().size(), null).builder().build();
     Integer tableId = base.tableId(TableScript.ID);
     if (tableId == null) {

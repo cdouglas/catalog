@@ -318,7 +318,9 @@ final class TableViews {
    * What {@code table} holds, by item, whatever its manifests' layout: its metadata, every snapshot
    * (sequence number, parent, operation, schema, summary without manifest counts) with the files it
    * added and removed, every ref with its live data files and their deletes (with partitions,
-   * sequence numbers and record counts), the snapshot log, and its row ids.
+   * sequence numbers and record counts), the snapshot log, its row ids, and whether each manifest
+   * says what its entries hold (its minimum sequence number, its row id range: {@link
+   * #manifests}), which no layout changes.
    *
    * <p>A commit's row ids depend on its layout: a manifest it writes takes ids for every row it
    * holds, kept ones too (a merged manifest's), so a retry that merges otherwise gives its new rows
@@ -362,6 +364,7 @@ final class TableViews {
       items.put(String.format("snapshot %02d changes", i), changes(table, s));
     }
     rowIds(table, metadata, earlier, nextRowIdBefore, items);
+    items.put("manifests", manifests(table, metadata));
     for (Map.Entry<String, SnapshotRef> r : metadata.refs().entrySet()) {
       SnapshotRef ref = r.getValue();
       items.put("ref " + r.getKey(), String.format("#%s %s %s/%s/%s",
@@ -480,6 +483,121 @@ final class TableViews {
       ranges.put(first, end);
     }
     items.put("row ids", violation != null ? violation : "ok");
+  }
+
+  /**
+   * Whether every manifest of every snapshot's list says what its entries hold, whatever the
+   * layout ({@link #logical}): "ok", or the first violation, by snapshot position. A manifest's
+   * minimum sequence number is the least data sequence number of its live entries, as Iceberg's
+   * {@code ManifestWriter} computes it, and at most its own: a merging commit drops the delete
+   * files older than every data manifest's minimum, so one too high drops deletes still needed. In
+   * v3, each data manifest of a snapshot with row ids has a first row id; the range of ids from
+   * there, its added and existing rows (which {@code ManifestListWriter} sets aside), lies below
+   * the table's next row id and apart from every other manifest's; and each live file's ids lie
+   * inside it, or below it if the file keeps the ids an earlier manifest gave it (a merged or
+   * rewritten manifest's existing files). A manifest a list names again with the same first row
+   * id is checked once.
+   */
+  private static String manifests(Table table, TableMetadata metadata) {
+    List<Snapshot> snapshots = metadata.snapshots();
+    java.util.Set<String> checked = new java.util.HashSet<>();
+    TreeMap<Long, Long> ranges = new TreeMap<>(); // first row id -> end, of distinct manifests
+    try {
+      for (int i = 0; i < snapshots.size(); i++) {
+        Snapshot s = snapshots.get(i);
+        for (ManifestFile m : s.allManifests(table.io())) {
+          boolean data = m.content() == org.apache.iceberg.ManifestContent.DATA;
+          if (data && s.firstRowId() != null && m.firstRowId() == null) {
+            return String.format("snapshot %02d lists a data manifest without row ids", i);
+          }
+          if (!checked.add(m.path() + "@" + m.firstRowId())) {
+            continue;
+          }
+          String problem = manifest(table, metadata, m, ranges);
+          if (problem != null) {
+            return String.format("snapshot %02d lists a manifest %s", i, problem);
+          }
+        }
+      }
+    } catch (RuntimeException e) {
+      return "fails: " + e.getClass().getSimpleName();
+    }
+    return "ok";
+  }
+
+  /**
+   * What is wrong with {@code m} ({@link #manifests}), adding its row id range to {@code ranges}
+   * (first row id to end); null if nothing is.
+   */
+  private static String manifest(Table table, TableMetadata metadata, ManifestFile m,
+      TreeMap<Long, Long> ranges) {
+    if (m.minSequenceNumber() > m.sequenceNumber()) {
+      return String.format("whose minimum sequence number %d is above its own, %d",
+          m.minSequenceNumber(), m.sequenceNumber());
+    }
+    boolean data = m.content() == org.apache.iceberg.ManifestContent.DATA;
+    Long first = data ? m.firstRowId() : null;
+    long end = 0;
+    if (first != null) {
+      end = first + count(m.addedRowsCount()) + count(m.existingRowsCount());
+      Map.Entry<Long, Long> before = ranges.floorEntry(first);
+      Map.Entry<Long, Long> after = ranges.ceilingEntry(first);
+      if (end > metadata.nextRowId()) {
+        return String.format("whose row ids [%d, %d) pass the next row id %d", first, end,
+            metadata.nextRowId());
+      } else if (end > first && ((before != null && before.getValue() > first)
+          || (after != null && after.getKey() < end))) {
+        return String.format("whose row ids [%d, %d) overlap another manifest's", first, end);
+      } else if (end > first) {
+        ranges.put(first, end); // a manifest of no live rows sets no id aside
+      }
+    }
+    // Read with the table's specs, as Lineage does: a manifest's own spec need not bind to the
+    // schema it carries
+    Long least = null;
+    for (ContentFile<?> file : liveFiles(table, m)) {
+      Long sequenceNumber = file.dataSequenceNumber();
+      if (sequenceNumber != null && (least == null || sequenceNumber < least)) {
+        least = sequenceNumber;
+      }
+      Long id = data ? file.firstRowId() : null;
+      if (first != null && id != null && id + file.recordCount() > first
+          && (id < first || id + file.recordCount() > end)) {
+        return String.format("whose row ids [%d, %d) do not hold a file's, [%d, %d)", first,
+            end, id, id + file.recordCount());
+      }
+    }
+    if (least != null && least.longValue() != m.minSequenceNumber()) {
+      return String.format(
+          "whose minimum sequence number is %d, where its live files' least is %d",
+          m.minSequenceNumber(), least);
+    }
+    return null;
+  }
+
+  private static long count(Long rows) {
+    return rows == null ? 0 : rows;
+  }
+
+  /** The live files of manifest {@code m}, read with {@code table}'s specs. */
+  private static List<ContentFile<?>> liveFiles(Table table, ManifestFile m) {
+    List<ContentFile<?>> files = new ArrayList<>();
+    try {
+      if (m.content() == org.apache.iceberg.ManifestContent.DATA) {
+        try (org.apache.iceberg.ManifestReader<org.apache.iceberg.DataFile> reader =
+            org.apache.iceberg.ManifestFiles.read(m, table.io(), table.specs())) {
+          reader.forEach(files::add);
+        }
+      } else {
+        try (org.apache.iceberg.ManifestReader<DeleteFile> reader =
+            org.apache.iceberg.ManifestFiles.readDeleteManifest(m, table.io(), table.specs())) {
+          reader.forEach(files::add);
+        }
+      }
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+    return files;
   }
 
   /** The live data files of {@code snapshot}. */

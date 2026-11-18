@@ -70,7 +70,13 @@ import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
  *
  * <p>The subject draws its encoding, and whether R's writer pins what Iceberg commits once (a
  * schema or spec update, a ref reset): replay must tell that from the delta too ({@link
- * TableChange#commitOnce}), as it must for a writer that does not pin. The statistics count, per
+ * TableChange#commitOnce}), as it must for a writer that does not pin. Half the tries merge
+ * manifests (C2 (retry oracle never merges manifests)): the table's {@code
+ * commit.manifest.min-count-to-merge} is 2, so a merging producer (a merge append, an overwrite, a
+ * delete, a row delta) rewrites its branch's manifests into one with its own, and data commands
+ * add one to three files, so a commit that removes one rewrites a manifest that keeps the others:
+ * a manifest R wrote then keeps older entries, whose sequence numbers and row ids the merge must
+ * leave as they were ({@link TableViews#logical}'s manifests). The statistics count, per
  * encoding, the conflicts a retry repaired (false positives), those a retry confirmed, and the
  * admitted records. Under the Lamport clock the subject is a reference too, which sets the
  * baseline.
@@ -117,8 +123,9 @@ class TestRebaseProperties {
       @ForAll boolean pinned,
       @ForAll("prefixes") List<TableScript.Cmd> prefix,
       @ForAll("windows") List<TableScript.Cmd> window,
-      @ForAll("operations") TableScript.Cmd r) {
-    check(encoding, formatVersion, partitioned, mode, pinned, prefix, window, r);
+      @ForAll("operations") TableScript.Cmd r,
+      @ForAll boolean merging) {
+    check(encoding, formatVersion, partitioned, mode, pinned, merging, prefix, window, r);
   }
 
   @Property(tries = 300)
@@ -128,9 +135,10 @@ class TestRebaseProperties {
       @ForAll("inlineManifestModes") LocalCatalogMode mode,
       @ForAll("prefixes") List<TableScript.Cmd> prefix,
       @ForAll("windows") List<TableScript.Cmd> window,
-      @ForAll("appends") TableScript.Cmd r) {
-    check(AdmitDeltasEncoding.register(), formatVersion, partitioned, mode, true, prefix, window,
-        r);
+      @ForAll("appends") TableScript.Cmd r,
+      @ForAll boolean merging) {
+    check(AdmitDeltasEncoding.register(), formatVersion, partitioned, mode, true, merging, prefix,
+        window, r);
   }
 
   /**
@@ -146,8 +154,9 @@ class TestRebaseProperties {
       @ForAll("inlineManifestModes") LocalCatalogMode mode,
       @ForAll("upgrades") List<TableScript.Cmd> prefix,
       @ForAll("upgradeWindows") List<TableScript.Cmd> window,
-      @ForAll("appends") TableScript.Cmd r) {
-    check(AdmitDeltasEncoding.register(), 2, partitioned, mode, true, prefix, window, r);
+      @ForAll("appends") TableScript.Cmd r,
+      @ForAll boolean merging) {
+    check(AdmitDeltasEncoding.register(), 2, partitioned, mode, true, merging, prefix, window, r);
   }
 
   /**
@@ -161,8 +170,10 @@ class TestRebaseProperties {
       @ForAll("inlineManifestModes") LocalCatalogMode mode,
       @ForAll("prefixes") List<TableScript.Cmd> prefix,
       @ForAll("appendWindows") List<TableScript.Cmd> window,
-      @ForAll("appendLike") TableScript.Cmd r) {
-    check(BlindAppendEncoding.NAME, formatVersion, partitioned, mode, true, prefix, window, r);
+      @ForAll("appendLike") TableScript.Cmd r,
+      @ForAll boolean merging) {
+    check(BlindAppendEncoding.NAME, formatVersion, partitioned, mode, true, merging, prefix, window,
+        r);
   }
 
   /**
@@ -178,8 +189,9 @@ class TestRebaseProperties {
       @ForAll("inlineManifestModes") LocalCatalogMode mode,
       @ForAll("prefixes") List<TableScript.Cmd> prefix,
       @ForAll("dataWindows") List<TableScript.Cmd> window,
-      @ForAll("validated") TableScript.Cmd r) {
-    check(encoding, formatVersion, partitioned, mode, true, prefix, window, r);
+      @ForAll("validated") TableScript.Cmd r,
+      @ForAll boolean merging) {
+    check(encoding, formatVersion, partitioned, mode, true, merging, prefix, window, r);
   }
 
   /**
@@ -197,8 +209,9 @@ class TestRebaseProperties {
       @ForAll("inlineManifestModes") LocalCatalogMode mode,
       @ForAll("guardPrefixes") List<TableScript.Cmd> prefix,
       @ForAll("guardWindows") List<TableScript.Cmd> window,
-      @ForAll("guarded") TableScript.Cmd r) {
-    check(encoding, formatVersion, partitioned, mode, true, prefix, window, r);
+      @ForAll("guarded") TableScript.Cmd r,
+      @ForAll boolean merging) {
+    check(encoding, formatVersion, partitioned, mode, true, merging, prefix, window, r);
   }
 
   /**
@@ -214,8 +227,9 @@ class TestRebaseProperties {
       @ForAll("inlineManifestModes") LocalCatalogMode mode,
       @ForAll("keptHeads") List<TableScript.Cmd> prefix,
       @ForAll("expiredHistories") List<TableScript.Cmd> window,
-      @ForAll("validatingFromTheHead") TableScript.Cmd r) {
-    check(encoding, formatVersion, true, mode, true, prefix, window, r);
+      @ForAll("validatingFromTheHead") TableScript.Cmd r,
+      @ForAll boolean merging) {
+    check(encoding, formatVersion, true, mode, true, merging, prefix, window, r);
   }
 
   /**
@@ -235,8 +249,9 @@ class TestRebaseProperties {
       @ForAll boolean pinned,
       @ForAll("guardPrefixes") List<TableScript.Cmd> prefix,
       @ForAll("expiryWindows") List<TableScript.Cmd> window,
-      @ForAll("expiries") TableScript.Cmd r) {
-    check(encoding, formatVersion, partitioned, mode, pinned, prefix, window, r);
+      @ForAll("expiries") TableScript.Cmd r,
+      @ForAll boolean merging) {
+    check(encoding, formatVersion, partitioned, mode, pinned, merging, prefix, window, r);
   }
 
   /**
@@ -252,8 +267,9 @@ class TestRebaseProperties {
       @ForAll("validatedEncodings") String encoding,
       @ForAll @IntRange(min = 2, max = 3) int formatVersion,
       @ForAll("inlineManifestModes") LocalCatalogMode mode,
-      @ForAll("removals") List<List<TableScript.Cmd>> sample) {
-    check(encoding, formatVersion, true, mode, true, sample.get(0), sample.get(1),
+      @ForAll("removals") List<List<TableScript.Cmd>> sample,
+      @ForAll boolean merging) {
+    check(encoding, formatVersion, true, mode, true, merging, sample.get(0), sample.get(1),
         sample.get(2).get(0));
   }
 
@@ -280,9 +296,10 @@ class TestRebaseProperties {
       @ForAll("readPrefixes") List<TableScript.Cmd> prefix,
       @ForAll("readers") Reader r,
       @ForAll("readWindows") List<TableScript.Cmd> window,
-      @ForAll("placements") Placement placement) {
-    String[] outcome = verifyRead(encoding, formatVersion, partitioned, mode, witness, prefix, r,
-        window, placement);
+      @ForAll("placements") Placement placement,
+      @ForAll boolean merging) {
+    String[] outcome = verifyRead(encoding, formatVersion, partitioned, mode, witness, merging,
+        prefix, r, window, placement);
     String storage = mode.inlineML ? "inline ML" : mode.inlineTM ? "inline TM" : "pointer";
     if (outcome[1].startsWith(Writes.SAME_TABLE.name())) {
       // a rejection may be its append's: a conflict of the delta, or of an update pinned
@@ -324,7 +341,7 @@ class TestRebaseProperties {
         new TableScript.Cmd(TableScript.Kind.EQUALITY_DELETE, 8, 10, 10),
         new TableScript.Cmd(TableScript.Kind.OVERWRITE, 1, 11, 3),
         new TableScript.Cmd(TableScript.Kind.CREATE_TAG, 7, 0, 10));
-    verifyRead(LamportEncoding.NAME, 2, true, LocalCatalogMode.APPEND, true, prefix,
+    verifyRead(LamportEncoding.NAME, 2, true, LocalCatalogMode.APPEND, true, false, prefix,
         new Reader(1, Expressions.alwaysTrue(), true, Writes.OTHER_TABLE, 1), window,
         Placement.BEFORE_THE_COMMIT);
   }
@@ -332,7 +349,8 @@ class TestRebaseProperties {
   /**
    * One try of {@link #anAdmittedReadSeesTheRowsItRead}: R's read of the table the prefix built,
    * the window run where {@code placement} says (all of it before R's commit, if R writes
-   * nothing). Returns how R's read went (by its rows), what R wrote and where the window ran,
+   * nothing), on a table that merges manifests of several files if {@code merging} (as {@link
+   * #verify}'s). Returns how R's read went (by its rows), what R wrote and where the window ran,
    * whether R read rows, why a read whose rows had not changed was rejected (null if none was),
    * and how the window moved R's ref.
    */
@@ -342,29 +360,32 @@ class TestRebaseProperties {
       boolean partitioned,
       LocalCatalogMode mode,
       boolean witness,
+      boolean merging,
       List<TableScript.Cmd> prefix,
       Reader r,
       List<TableScript.Cmd> window,
       Placement placement) {
     StringBuilder trace = new StringBuilder(String.format(
-        "v%d %s, %s, %s%s%nprefix %s%nR %s%nwindow %s, %s%n", formatVersion,
+        "v%d %s, %s, %s%s%s%nprefix %s%nR %s%nwindow %s, %s%n", formatVersion,
         partitioned ? "partitioned" : "unpartitioned", mode, encoding,
-        witness ? "" : ", reads pinned", prefix, r, window, placement));
+        witness ? "" : ", reads pinned", merging ? ", merging manifests of several files" : "",
+        prefix, r, window, placement));
     InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
-    Map<String, String> properties = new java.util.HashMap<>(PROPERTIES);
+    Map<String, String> properties = Run.properties(merging);
     properties.put(LogCatalogProperties.CONFLICT_ENCODING, encoding);
     properties.put(LogCatalogProperties.TXN_READ_WITNESS, String.valueOf(witness));
     LogCatalog catalog = mode.catalog(io, WAREHOUSE, "c", properties);
     catalog.createNamespace(Namespace.of("ns"));
     TableScript.Runner writer =
-        new TableScript.Runner(catalog, formatVersion, partitioned, trace);
+        new TableScript.Runner(catalog, formatVersion, partitioned, trace).severalFiles(merging);
     TableViews.Lineage lineage = new TableViews.Lineage();
     for (List<TableScript.Cmd> step : TableScript.steps(prefix)) {
       writer.run(step);
       lineage.observe(Run.reader(io).loadTable(TableScript.ID));
     }
     TableScript.Runner racer =
-        new TableScript.Runner(mode.catalog(io, WAREHOUSE, "c", PROPERTIES), "w", trace);
+        new TableScript.Runner(mode.catalog(io, WAREHOUSE, "c", PROPERTIES), "w", trace)
+            .severalFiles(merging);
     TableScript.Runner files = new TableScript.Runner(catalog, "r", trace);
 
     // R scans T, as the transaction first read it
@@ -543,14 +564,16 @@ class TestRebaseProperties {
       boolean partitioned,
       LocalCatalogMode mode,
       boolean pinned,
+      boolean merging,
       List<TableScript.Cmd> prefix,
       List<TableScript.Cmd> window,
       TableScript.Cmd r) {
     String[] outcome =
-        verify(encoding, formatVersion, partitioned, mode, pinned, prefix, window, r);
+        verify(encoding, formatVersion, partitioned, mode, pinned, merging, prefix, window, r);
     Statistics.label("R on a raced table")
         .collect(pinned ? encoding : encoding + ", unpinned", outcome[0]);
     Statistics.label("R").collect(outcome[1]);
+    Statistics.label("manifests").collect(outcome[2]);
   }
 
   /** One try ({@code verify} with {@code pinned}), R's writer pinning what it commits once. */
@@ -565,11 +588,7 @@ class TestRebaseProperties {
     return verify(encoding, formatVersion, partitioned, mode, true, prefix, window, r);
   }
 
-  /**
-   * One try: R on the table the prefix built, the window run just before its first write, in the
-   * subject, whose writer pins what Iceberg commits once if {@code pinned}, and in the reference.
-   * Returns how R's record went in the subject, and R's kind (with " failed" if it failed).
-   */
+  /** One try ({@code verify} with {@code merging}), R's manifests never merged. */
   static String[] verify(
       String encoding,
       int formatVersion,
@@ -579,18 +598,43 @@ class TestRebaseProperties {
       List<TableScript.Cmd> prefix,
       List<TableScript.Cmd> window,
       TableScript.Cmd r) {
+    return verify(encoding, formatVersion, partitioned, mode, pinned, false, prefix, window, r);
+  }
+
+  /**
+   * One try: R on the table the prefix built, the window run just before its first write, in the
+   * subject, whose writer pins what Iceberg commits once if {@code pinned}, and in the reference.
+   * If {@code merging}, the table merges manifests ({@code commit.manifest.min-count-to-merge} 2,
+   * so a merging producer rewrites its branch's manifests into one with its own, whose older
+   * entries keep their sequence numbers and row ids), and data commands add one to three files
+   * ({@link TableScript.Runner#severalFiles}), so a commit that removes one rewrites a manifest
+   * that keeps the others. Returns how R's record went in the subject, R's kind (with " failed"
+   * if it failed), and whether it merged and wrote a manifest of older files.
+   */
+  static String[] verify(
+      String encoding,
+      int formatVersion,
+      boolean partitioned,
+      LocalCatalogMode mode,
+      boolean pinned,
+      boolean merging,
+      List<TableScript.Cmd> prefix,
+      List<TableScript.Cmd> window,
+      TableScript.Cmd r) {
     StringBuilder trace = new StringBuilder(String.format(
-        "v%d %s, %s, %s%s%nprefix %s%nwindow %s%nR %s%n", formatVersion,
+        "v%d %s, %s, %s%s%s%nprefix %s%nwindow %s%nR %s%n", formatVersion,
         partitioned ? "partitioned" : "unpartitioned", mode, encoding,
-        pinned ? "" : ", R's writer leaves commit-once unpinned", prefix, window, r));
-    Run subject =
-        Run.of(encoding, mode, formatVersion, partitioned, pinned, prefix, window, r, trace);
-    Run reference = Run.of(LamportEncoding.NAME, mode, formatVersion, partitioned, true, prefix,
-        window, r, new StringBuilder());
+        pinned ? "" : ", R's writer leaves commit-once unpinned",
+        merging ? ", merging manifests of several files" : "", prefix, window, r));
+    Run subject = Run.of(encoding, mode, formatVersion, partitioned, pinned, merging, prefix,
+        window, r, trace);
+    Run reference = Run.of(LamportEncoding.NAME, mode, formatVersion, partitioned, true, merging,
+        prefix, window, r, new StringBuilder());
     if (r.kind == TableScript.Kind.EXPIRE_SNAPSHOTS && subject.raced && subject.changed
         && subject.conflicts == 0 && subject.failure == null) {
       // merged where it landed: the window, then what R chose on the prefix's table, removed
-      reference = Run.expiryReference(mode, formatVersion, partitioned, prefix, window, r, trace);
+      reference = Run.expiryReference(mode, formatVersion, partitioned, merging, prefix, window,
+          r, trace);
     }
 
     String outcome;
@@ -638,7 +682,10 @@ class TestRebaseProperties {
           + "\n" + trace);
     }
     CheckpointRoundTrip.assertEveryWrite(subject.io);
-    return new String[] {outcome, r.kind + (subject.failure == null ? "" : " failed")};
+    return new String[] {outcome, r.kind + (subject.failure == null ? "" : " failed"),
+        !merging ? "not merging"
+            : subject.keptOlderFiles ? "merging, R wrote a manifest of older files"
+                : "merging, R wrote no manifest of older files"};
   }
 
   @Provide
@@ -1192,35 +1239,39 @@ class TestRebaseProperties {
     final boolean changed; // whether the window changed the table
     final long conflicts; // how many of R's commits conflicted where they landed
     final Map<String, String> view;
+    // whether a snapshot R added wrote a manifest that keeps files of earlier commits
+    final boolean keptOlderFiles;
 
     private Run(InMemoryAtomicFileIO io, RuntimeException failure, boolean raced,
-        boolean changed, long conflicts, Map<String, String> view) {
+        boolean changed, long conflicts, Map<String, String> view, boolean keptOlderFiles) {
       this.io = io;
       this.failure = failure;
       this.raced = raced;
       this.changed = changed;
       this.conflicts = conflicts;
       this.view = view;
+      this.keptOlderFiles = keptOlderFiles;
     }
 
     static Run of(String encoding, LocalCatalogMode mode, int formatVersion, boolean partitioned,
-        boolean pinned, List<TableScript.Cmd> prefix, List<TableScript.Cmd> window,
-        TableScript.Cmd r, StringBuilder trace) {
+        boolean pinned, boolean merging, List<TableScript.Cmd> prefix,
+        List<TableScript.Cmd> window, TableScript.Cmd r, StringBuilder trace) {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
-      Map<String, String> properties = new java.util.HashMap<>(PROPERTIES);
+      Map<String, String> properties = properties(merging);
       properties.put(LogCatalogProperties.CONFLICT_ENCODING, encoding);
       LogCatalog catalog = mode.catalog(io, WAREHOUSE, "c", properties);
       if (!pinned) {
         catalog.leavingCommitOnceUnpinned();
       }
       catalog.createNamespace(Namespace.of("ns"));
-      TableScript.Runner writer =
-          new TableScript.Runner(catalog, formatVersion, partitioned, trace);
+      TableScript.Runner writer = new TableScript.Runner(catalog, formatVersion, partitioned,
+          trace).severalFiles(merging);
       for (List<TableScript.Cmd> step : TableScript.steps(prefix)) {
         writer.run(step);
       }
       TableScript.Runner racer =
-          new TableScript.Runner(mode.catalog(io, WAREHOUSE, "c", PROPERTIES), "w", trace);
+          new TableScript.Runner(mode.catalog(io, WAREHOUSE, "c", PROPERTIES), "w", trace)
+              .severalFiles(merging);
       boolean[] raced = {false};
       String[] before = {null};
       String[] after = {null};
@@ -1254,7 +1305,43 @@ class TestRebaseProperties {
           failure == null ? "committed" : "failed", conflicts, results));
       return new Run(io, failure, raced[0], raced[0] && !before[0].equals(after[0]), conflicts,
           TableViews.logical(reader(io).loadTable(TableScript.ID),
-              beforeR[0].snapshots().size(), beforeR[0].nextRowId()));
+              beforeR[0].snapshots().size(), beforeR[0].nextRowId()),
+          keptOlderFiles(io, beforeR[0]));
+    }
+
+    /**
+     * The properties of a run's first catalog, which creates the tables: tables that merge their
+     * manifests, if {@code merging}.
+     */
+    private static Map<String, String> properties(boolean merging) {
+      Map<String, String> properties = new java.util.HashMap<>(PROPERTIES);
+      if (merging) {
+        properties.put(
+            CatalogProperties.TABLE_DEFAULT_PREFIX + TableProperties.MANIFEST_MIN_MERGE_COUNT,
+            "2");
+      }
+      return properties;
+    }
+
+    /**
+     * Whether a snapshot the table has now, and not {@code before}, wrote a manifest that keeps
+     * files of earlier commits (a merged one, or one it rewrote to remove files).
+     */
+    private static boolean keptOlderFiles(InMemoryAtomicFileIO io, TableMetadata before) {
+      java.util.Set<Long> had = new java.util.HashSet<>();
+      before.snapshots().forEach(s -> had.add(s.snapshotId()));
+      org.apache.iceberg.Table table = reader(io).loadTable(TableScript.ID);
+      for (org.apache.iceberg.Snapshot s : table.snapshots()) {
+        if (had.contains(s.snapshotId())) {
+          continue;
+        }
+        for (org.apache.iceberg.ManifestFile m : s.allManifests(table.io())) {
+          if (java.util.Objects.equals(m.snapshotId(), s.snapshotId()) && m.hasExistingFiles()) {
+            return true;
+          }
+        }
+      }
+      return false;
     }
 
     /**
@@ -1266,14 +1353,14 @@ class TestRebaseProperties {
      * removeSnapshots would drop the ref with it).
      */
     static Run expiryReference(LocalCatalogMode mode, int formatVersion, boolean partitioned,
-        List<TableScript.Cmd> prefix, List<TableScript.Cmd> window, TableScript.Cmd r,
-        StringBuilder trace) {
+        boolean merging, List<TableScript.Cmd> prefix, List<TableScript.Cmd> window,
+        TableScript.Cmd r, StringBuilder trace) {
       // What R chooses on the prefix's table
       InMemoryAtomicFileIO scratch = new InMemoryAtomicFileIO();
-      LogCatalog chooser = mode.catalog(scratch, WAREHOUSE, "c", PROPERTIES);
+      LogCatalog chooser = mode.catalog(scratch, WAREHOUSE, "c", properties(merging));
       chooser.createNamespace(Namespace.of("ns"));
-      TableScript.Runner chooses =
-          new TableScript.Runner(chooser, formatVersion, partitioned, new StringBuilder());
+      TableScript.Runner chooses = new TableScript.Runner(chooser, formatVersion, partitioned,
+          new StringBuilder()).severalFiles(merging);
       for (List<TableScript.Cmd> step : TableScript.steps(prefix)) {
         chooses.run(step);
       }
@@ -1282,18 +1369,18 @@ class TestRebaseProperties {
       removed.removeAll(sequenceNumbers(current(scratch)));
 
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
-      Map<String, String> properties = new java.util.HashMap<>(PROPERTIES);
+      Map<String, String> properties = properties(merging);
       properties.put(LogCatalogProperties.CONFLICT_ENCODING, LamportEncoding.NAME);
       LogCatalog catalog = mode.catalog(io, WAREHOUSE, "c", properties);
       catalog.createNamespace(Namespace.of("ns"));
-      TableScript.Runner writer =
-          new TableScript.Runner(catalog, formatVersion, partitioned, new StringBuilder());
+      TableScript.Runner writer = new TableScript.Runner(catalog, formatVersion, partitioned,
+          new StringBuilder()).severalFiles(merging);
       for (List<TableScript.Cmd> step : TableScript.steps(prefix)) {
         writer.run(step);
       }
       TableScript.Runner racer =
           new TableScript.Runner(mode.catalog(io, WAREHOUSE, "c", PROPERTIES), "w",
-              new StringBuilder());
+              new StringBuilder()).severalFiles(merging);
       for (List<TableScript.Cmd> step : TableScript.steps(window)) {
         racer.run(step);
       }
@@ -1327,7 +1414,7 @@ class TestRebaseProperties {
       }
       return new Run(io, failure, true, true, 0,
           TableViews.logical(reader(io).loadTable(TableScript.ID),
-              beforeR.snapshots().size(), beforeR.nextRowId()));
+              beforeR.snapshots().size(), beforeR.nextRowId()), false);
     }
 
     private static java.util.Set<Long> sequenceNumbers(TableMetadata metadata) {

@@ -284,6 +284,8 @@ final class TableScript {
     private int nextValue = 0;
     // A transaction's members leave the metadata log's bound alone (ICEBERG_ISSUES.md A6)
     private boolean inTransaction = false;
+    // Whether a data command adds one to three files, by its a (severalFiles)
+    private boolean severalFiles = false;
 
     /**
      * Creates the tables, in {@code formatVersion}, partitioned by cat if {@code partitioned}.
@@ -328,6 +330,16 @@ final class TableScript {
       this.names = "mem:///data/" + names + "/";
       this.table = catalog.loadTable(ID);
       this.stale = table;
+    }
+
+    /**
+     * Has the appends, overwrites and insert-only row deltas this runner runs add {@code a % 3 + 1}
+     * files to their partition, not one, if {@code several}: manifests of several files, which a
+     * later commit that removes one of them rewrites, keeping the others.
+     */
+    Runner severalFiles(boolean several) {
+      this.severalFiles = several;
+      return this;
     }
 
     /** Runs {@code step}; returns the exception that rejected it, or null if it committed. */
@@ -476,17 +488,24 @@ final class TableScript {
       }
       switch (cmd.kind) {
         case FAST_APPEND:
-          target.newFastAppend().appendFile(newFile(target, cmd.c)).commit();
+          org.apache.iceberg.AppendFiles fast = target.newFastAppend();
+          newFiles(target, cmd).forEach(fast::appendFile);
+          fast.commit();
           break;
         case MERGE_APPEND:
-          target.newAppend().appendFile(newFile(target, cmd.c)).commit();
+          org.apache.iceberg.AppendFiles merged = target.newAppend();
+          newFiles(target, cmd).forEach(merged::appendFile);
+          merged.commit();
           break;
         case STAGED_APPEND:
-          target.newFastAppend().appendFile(newFile(target, cmd.c)).stageOnly().commit();
+          org.apache.iceberg.AppendFiles staged = target.newFastAppend();
+          newFiles(target, cmd).forEach(staged::appendFile);
+          staged.stageOnly().commit();
           break;
         case BRANCH_APPEND:
-          target.newFastAppend().appendFile(newFile(target, cmd.c)).toBranch(ref(cmd.b))
-              .commit();
+          org.apache.iceberg.AppendFiles branched = target.newFastAppend();
+          newFiles(target, cmd).forEach(branched::appendFile);
+          branched.toBranch(ref(cmd.b)).commit();
           break;
         case DELETE_FILE:
           target.newDelete().deleteFromRowFilter(Expressions.alwaysTrue()).commit();
@@ -526,14 +545,14 @@ final class TableScript {
               .commit();
           break;
         case OVERWRITE:
-          target.newOverwrite()
-              .overwriteByRowFilter(Expressions.alwaysTrue())
-              .addFile(newFile(target, cmd.c))
-              .commit();
+          org.apache.iceberg.OverwriteFiles everything =
+              target.newOverwrite().overwriteByRowFilter(Expressions.alwaysTrue());
+          newFiles(target, cmd).forEach(everything::addFile);
+          everything.commit();
           break;
         case REPLACE_PARTITIONS:
-          org.apache.iceberg.ReplacePartitions replace =
-              target.newReplacePartitions().addFile(newFile(target, cmd.c));
+          org.apache.iceberg.ReplacePartitions replace = target.newReplacePartitions();
+          newFiles(target, cmd).forEach(replace::addFile);
           if (cmd.b % 2 == 1 && target.currentSnapshot() != null) {
             replace.validateFromSnapshot(target.currentSnapshot().snapshotId())
                 .validateNoConflictingData()
@@ -544,7 +563,8 @@ final class TableScript {
         case OVERWRITE_PARTITION:
           org.apache.iceberg.expressions.Expression partition = inPartition(cmd.c);
           org.apache.iceberg.OverwriteFiles overwrite =
-              target.newOverwrite().overwriteByRowFilter(partition).addFile(newFile(target, cmd.c));
+              target.newOverwrite().overwriteByRowFilter(partition);
+          newFiles(target, cmd).forEach(overwrite::addFile);
           if (target.currentSnapshot() != null) {
             overwrite.validateFromSnapshot(target.currentSnapshot().snapshotId());
           }
@@ -564,8 +584,8 @@ final class TableScript {
         case LONG_OVERWRITE:
           org.apache.iceberg.expressions.Expression overwritten = inPartition(cmd.c);
           org.apache.iceberg.OverwriteFiles job =
-              target.newOverwrite().overwriteByRowFilter(overwritten)
-                  .addFile(newFile(target, cmd.c));
+              target.newOverwrite().overwriteByRowFilter(overwritten);
+          newFiles(target, cmd).forEach(job::addFile);
           Snapshot read = target.currentSnapshot();
           if (read != null) {
             job.validateFromSnapshot(
@@ -603,8 +623,8 @@ final class TableScript {
           merge.commit();
           break;
         case INSERT_ROW_DELTA:
-          org.apache.iceberg.RowDelta insert =
-              target.newRowDelta().addRows(newFile(target, cmd.c));
+          org.apache.iceberg.RowDelta insert = target.newRowDelta();
+          newFiles(target, cmd).forEach(insert::addRows);
           if (target.currentSnapshot() != null) {
             insert.validateFromSnapshot(target.currentSnapshot().snapshotId());
           }
@@ -616,9 +636,9 @@ final class TableScript {
           break;
         case CHECKPOINT_APPEND:
           String checkpoint = "cp" + cmd.b % 3;
-          target.newFastAppend()
-              .appendFile(newFile(target, cmd.c))
-              .set("checkpoint", checkpoint)
+          org.apache.iceberg.AppendFiles sink = target.newFastAppend();
+          newFiles(target, cmd).forEach(sink::appendFile);
+          sink.set("checkpoint", checkpoint)
               .validateWith(new org.apache.iceberg.SnapshotAncestryValidator() {
                 @Override
                 public boolean validate(Iterable<Snapshot> ancestors) {
@@ -907,6 +927,18 @@ final class TableScript {
         throw new NotApplicable("no snapshot");
       }
       return snapshots.get(index % snapshots.size());
+    }
+
+    /**
+     * The files a data command {@code cmd} adds: one in partition {@code cmd.c % 4} ({@link
+     * #newFile}), or {@code cmd.a % 3 + 1} there with {@link #severalFiles}.
+     */
+    private List<DataFile> newFiles(Table target, Cmd cmd) {
+      List<DataFile> files = new ArrayList<>();
+      for (int i = severalFiles ? cmd.a % 3 + 1 : 1; i > 0; i--) {
+        files.add(newFile(target, cmd.c));
+      }
+      return files;
     }
 
     /**
