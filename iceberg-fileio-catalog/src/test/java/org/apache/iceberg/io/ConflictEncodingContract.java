@@ -27,6 +27,7 @@ import java.util.TreeMap;
 import java.util.UUID;
 import net.jqwik.api.Arbitraries;
 import net.jqwik.api.Arbitrary;
+import net.jqwik.api.Combinators;
 import net.jqwik.api.ForAll;
 import net.jqwik.api.Property;
 import net.jqwik.api.Provide;
@@ -53,7 +54,9 @@ import org.intentlog.wire.LogEnvelope;
  * runs, which can take the table anywhere: expiry, rollbacks, schema and partition-spec changes
  * that reuse ids, eviction from inline storage and re-inlining (with a small inline update limit),
  * renames away and back, and R's own retry, whose snapshot and manifests R's record names too.
- * Each try checks that:
+ * The window's and the extension's writers may store tables otherwise than R's (pointer, inline TM
+ * or inline ML), and {@link #aRecordPastAListFileWritersCommitIsJudgedAlike} runs C1's race. Each
+ * try checks that:
  *
  * <ul>
  *   <li>judging R's record where it landed, on a replay of the log up to it, is what the log's
@@ -87,10 +90,14 @@ abstract class ConflictEncodingContract {
   abstract String encoding();
 
   /**
-   * The catalogs and log of a try, after its prefix: R's writer, and the racer's. If {@code
-   * merging}, the tables merge manifests ({@code commit.manifest.min-count-to-merge} 2) and data
-   * commands add one to three files (C2 (retry oracle never merges manifests)), so records remove
-   * and write manifests that keep older files.
+   * The catalogs and log of a try, after its prefix: R's writer, the racer's, which commits the
+   * window, and the extender's, which commits the extension. If {@code merging}, the tables merge
+   * manifests ({@code commit.manifest.min-count-to-merge} 2) and data commands add one to three
+   * files (C2 (retry oracle never merges manifests)), so records remove and write manifests that
+   * keep older files. The racer and the extender store tables in the modes {@code windowWriter}
+   * and {@code extensionWriter} (null: R's {@code mode}), drawn apart from R's (C1 (list-file
+   * snapshots stamp nothing)): a writer that does not inline manifest lists commits a snapshot
+   * with a list file, which sends no manifests.
    */
   private final class Fixture {
     final LogCatalog catalog;
@@ -98,8 +105,10 @@ abstract class ConflictEncodingContract {
     final InMemorySharedLog log;
     final TableScript.Runner writer;
     final TableScript.Runner racer;
+    final TableScript.Runner extender;
 
     Fixture(int formatVersion, boolean partitioned, LocalCatalogMode mode,
+        LocalCatalogMode windowWriter, LocalCatalogMode extensionWriter,
         boolean smallInlineUpdates, boolean merging, List<TableScript.Cmd> prefix,
         StringBuilder trace) {
       Map<String, String> properties = new HashMap<>();
@@ -122,8 +131,13 @@ abstract class ConflictEncodingContract {
       for (List<TableScript.Cmd> step : TableScript.steps(prefix)) {
         writer.run(step);
       }
-      this.other = mode.catalog(io, WAREHOUSE, "c", properties);
+      LocalCatalogMode window = windowWriter != null ? windowWriter : mode;
+      LocalCatalogMode extension = extensionWriter != null ? extensionWriter : mode;
+      this.other = window.catalog(io, WAREHOUSE, "c", properties);
       this.racer = new TableScript.Runner(other, "w", trace).severalFiles(merging);
+      this.extender = extension == window ? racer
+          : new TableScript.Runner(extension.catalog(io, WAREHOUSE, "c", properties), "x", trace)
+              .severalFiles(merging);
     }
   }
 
@@ -138,15 +152,56 @@ abstract class ConflictEncodingContract {
       @ForAll("operations") TableScript.Cmd r,
       @ForAll("extensions") List<TableScript.Cmd> extension,
       @ForAll @IntRange(min = -1, max = 5) int renameAt,
+      @ForAll boolean merging,
+      @ForAll("writers") LocalCatalogMode windowWriter,
+      @ForAll("writers") LocalCatalogMode extensionWriter) {
+    race(formatVersion, partitioned, mode, windowWriter, extensionWriter, smallInlineUpdates,
+        merging, prefix, window, r, extension, renameAt);
+  }
+
+  /**
+   * C1's race (C1 (list-file snapshots stamp nothing), Bug 97 (list-file writers stamp no
+   * partition)): on a partitioned table, R, by a writer that inlines manifest lists, commits on main
+   * in partition p (validating there, or adding data there); just before its record, a writer that
+   * does not inline lists (inline TM) commits data on main in p, whose snapshot has a list file and
+   * sends no manifests; the extension starts with an append to another partition by a writer that
+   * does, which gives the branch an inline head list again. A record rejected where it landed (on a
+   * head whose list is a file, or a change in p) must stay rejected after it (S2): a writer that
+   * read past the rejection retries, and a copy of the record in flight must not apply too.
+   */
+  @Property(tries = 150)
+  void aRecordPastAListFileWritersCommitIsJudgedAlike(
+      @ForAll @IntRange(min = 2, max = 3) int formatVersion,
+      @ForAll("prefixes") List<TableScript.Cmd> prefix,
+      @ForAll("listFileRaces") List<TableScript.Cmd> race,
+      @ForAll("extensions") List<TableScript.Cmd> extension,
       @ForAll boolean merging) {
+    List<TableScript.Cmd> extended = new ArrayList<>();
+    extended.add(race.get(2));
+    extended.addAll(extension);
+    race(formatVersion, true, LocalCatalogMode.MEMLOG_ML, LocalCatalogMode.MEMLOG_TM,
+        LocalCatalogMode.MEMLOG_ML, false, merging, prefix, List.of(race.get(1)), race.get(0),
+        extended, -1);
+  }
+
+  /**
+   * One try of the contract's race: R on the table the prefix built, the window committed by the
+   * racer just before R's first record, the extension by the extender after it ({@link Fixture}),
+   * the table renamed away and back before the extension's {@code renameAt}-th command.
+   */
+  private void race(int formatVersion, boolean partitioned, LocalCatalogMode mode,
+      LocalCatalogMode windowWriter, LocalCatalogMode extensionWriter, boolean smallInlineUpdates,
+      boolean merging, List<TableScript.Cmd> prefix, List<TableScript.Cmd> window,
+      TableScript.Cmd r, List<TableScript.Cmd> extension, int renameAt) {
     StringBuilder trace = new StringBuilder(String.format(
-        "%s v%d %s, %s%s%s%nprefix %s%nwindow %s%nR %s%nextension %s, rename at %d%n",
+        "%s v%d %s, %s%s%s%nprefix %s%nwindow %s%s%nR %s%nextension %s%s, rename at %d%n",
         encoding(), formatVersion, partitioned ? "partitioned" : "unpartitioned", mode,
         smallInlineUpdates ? ", small inline updates" : "",
-        merging ? ", merging manifests of several files" : "", prefix, window, r, extension,
-        renameAt));
-    Fixture fixture = new Fixture(formatVersion, partitioned, mode, smallInlineUpdates, merging,
-        prefix, trace);
+        merging ? ", merging manifests of several files" : "", prefix, window,
+        windowWriter != null ? " by " + windowWriter : "", r, extension,
+        extensionWriter != null ? " by " + extensionWriter : "", renameAt));
+    Fixture fixture = new Fixture(formatVersion, partitioned, mode, windowWriter, extensionWriter,
+        smallInlineUpdates, merging, prefix, trace);
     InMemorySharedLog log = fixture.log;
     LogCatalog other = fixture.other;
     TableScript.Runner writer = fixture.writer;
@@ -218,7 +273,7 @@ abstract class ConflictEncodingContract {
         judged += judgeCopy(log, capture.record, admitted, trace);
       }
       if (i < extension.size()) {
-        racer.run(List.of(extension.get(i)));
+        fixture.extender.run(List.of(extension.get(i)));
         judged += judgeCopy(log, capture.record, admitted, trace);
       }
     }
@@ -244,14 +299,16 @@ abstract class ConflictEncodingContract {
       @ForAll("prefixes") List<TableScript.Cmd> prefix,
       @ForAll("refExtensions") List<TableScript.Cmd> extension,
       @ForAll @IntRange(min = -1, max = 5) int renameAt,
-      @ForAll boolean merging) {
+      @ForAll boolean merging,
+      @ForAll("writers") LocalCatalogMode extensionWriter) {
     StringBuilder trace = new StringBuilder(String.format(
-        "%s v%d %s, %s%s%s%nprefix %s%nextension %s, rename at %d%n", encoding(), formatVersion,
+        "%s v%d %s, %s%s%s%nprefix %s%nextension %s%s, rename at %d%n", encoding(), formatVersion,
         partitioned ? "partitioned" : "unpartitioned", mode,
         smallInlineUpdates ? ", small inline updates" : "",
-        merging ? ", merging manifests of several files" : "", prefix, extension, renameAt));
-    Fixture fixture = new Fixture(formatVersion, partitioned, mode, smallInlineUpdates, merging,
-        prefix, trace);
+        merging ? ", merging manifests of several files" : "", prefix, extension,
+        extensionWriter != null ? " by " + extensionWriter : "", renameAt));
+    Fixture fixture = new Fixture(formatVersion, partitioned, mode, null, extensionWriter,
+        smallInlineUpdates, merging, prefix, trace);
     CatalogState base = replay(fixture.log, fixture.log.records().size(), null).builder().build();
     Integer tableId = base.tableId(TableScript.ID);
     if (tableId == null) {
@@ -276,7 +333,7 @@ abstract class ConflictEncodingContract {
         witnesses.judge(fixture.log);
       }
       if (i < extension.size()) {
-        fixture.racer.run(List.of(extension.get(i)));
+        fixture.extender.run(List.of(extension.get(i)));
         witnesses.judge(fixture.log);
       }
     }
@@ -491,6 +548,42 @@ abstract class ConflictEncodingContract {
   Arbitrary<LocalCatalogMode> modes() {
     return Arbitraries.of(LocalCatalogMode.sharedLogModes());
   }
+
+  /**
+   * The mode a racer or extender stores tables in, drawn apart from R's: null (R's mode) half the
+   * time.
+   */
+  @Provide
+  Arbitrary<LocalCatalogMode> writers() {
+    return Arbitraries.of(LocalCatalogMode.sharedLogModes()).injectNull(0.5);
+  }
+
+  /**
+   * C1's race, as R, the window's command and the extension's first: R on main in partition p, a
+   * data commit on main in p, an append to another partition.
+   */
+  @Provide
+  Arbitrary<List<TableScript.Cmd>> listFileRaces() {
+    Arbitrary<Integer> small = Arbitraries.integers().between(0, 11);
+    return Combinators.combine(Arbitraries.of(IN_A_PARTITION), Arbitraries.of(IN_A_PARTITION),
+            small, small, Arbitraries.integers().between(0, 3),
+            Arbitraries.integers().between(1, 3),
+            Arbitraries.of(TableScript.Kind.FAST_APPEND, TableScript.Kind.MERGE_APPEND))
+        .as((rKind, kind, a, b, p, offset, append) -> List.of(
+            new TableScript.Cmd(rKind, a, b, p), new TableScript.Cmd(kind, b, a, p),
+            new TableScript.Cmd(append, a, a, (p + offset) % 4)))
+        .withoutEdgeCases();
+  }
+
+  /**
+   * Commits on main whose files, or the rows they validate or remove, are in partition {@code c %
+   * 4}.
+   */
+  private static final List<TableScript.Kind> IN_A_PARTITION =
+      List.of(TableScript.Kind.FAST_APPEND, TableScript.Kind.MERGE_APPEND,
+          TableScript.Kind.INSERT_ROW_DELTA, TableScript.Kind.EQUALITY_DELETE,
+          TableScript.Kind.OVERWRITE_PARTITION, TableScript.Kind.REPLACE_PARTITIONS,
+          TableScript.Kind.DELETE_PARTITION, TableScript.Kind.LONG_OVERWRITE);
 
   @Provide
   Arbitrary<List<TableScript.Cmd>> prefixes() {
