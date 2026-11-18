@@ -394,12 +394,88 @@ class TestSnapshotPaging {
     String ahead = SnapshotPages.pageName(tblId, version + 5, 99, digest);
     pages.put(old, new byte[] {1});
     pages.put(ahead, new byte[] {2});
-    writer.log().sweep(writer.log().read());
+    assertThat(writer.deleteOrphanPages()).contains(old).doesNotContain(ahead);
     after = writer.log().read().state().sealedBlocks(tblId);
     for (SnapshotPages.SealedBlock block : root("gc").sealedBlocks(tblId).values()) {
       assertThat(pages.list()).contains(block.pageName(tblId));
     }
     assertThat(pages.list()).doesNotContain(old).contains(ahead);
+  }
+
+  /**
+   * Pages a compaction's root dropped, whose deletes failed (review F7): only the replicas that
+   * replayed the drop know of them, a root does not, so a writer that reads the catalog from a
+   * later root runs commits and compactions and leaves them. {@link LogCatalog#deleteOrphanPages},
+   * the maintenance call, deletes them, keeps every page a root names, and the catalog still loads
+   * the table, every snapshot of it.
+   */
+  @ParameterizedTest
+  @EnumSource(names = {"CAS_ML", "CAS_TM"})
+  void deleteOrphanPagesDeletesWhatAFailedCompactionLeft(LocalCatalogMode mode) throws Exception {
+    LogCatalog writer = mode.catalog(io, WAREHOUSE, "orphans", paging(4, 8));
+    writer.createNamespace(Namespace.of("ns"));
+    Table table = writer.buildTable(TABLE, SCHEMA).withPartitionSpec(SPEC).create();
+    List<Long> ids = new ArrayList<>();
+    for (int i = 0; i < 40; i++) {
+      append(table, i);
+      ids.add(table.currentSnapshot().snapshotId());
+    }
+    int tblId = writer.log().read().state().tableId(TABLE);
+    org.intentlog.PageStore pages = writer.log().pages();
+    // The root a commit writes is the state before its own record: its pages are stored
+    List<String> sealed = pageNames(root("orphans"), tblId);
+    assertThat(sealed.size()).isGreaterThan(2);
+
+    // An expiry empties the oldest blocks; the deletes of the compaction that drops their pages fail
+    long cutoff = table.snapshot(ids.get(12)).timestampMillis();
+    table.expireSnapshots().expireOlderThan(cutoff).retainLast(1).cleanExpiredFiles(false)
+        .commit();
+    io.injectPlainFaults((request, location) ->
+        request == InMemoryAtomicFileIO.PlainRequest.DELETE && location.contains("/snap.")
+            ? InMemoryAtomicFileIO.Fault.FAIL_BEFORE
+            : InMemoryAtomicFileIO.Fault.NONE);
+    try {
+      append(table, 40); // a compaction after the expiry (CAS: every commit)
+    } finally {
+      io.injectPlainFaults((request, location) -> InMemoryAtomicFileIO.Fault.NONE);
+    }
+    List<String> named = pageNames(writer.log().read().state(), tblId);
+    List<String> orphans = sealed.stream().filter(name -> !named.contains(name))
+        .collect(Collectors.toList());
+    assertThat(orphans).isNotEmpty();
+    assertThat(pages.list()).containsAll(orphans);
+
+    // The writer is gone; another reads the catalog from the root and commits and compacts
+    LogCatalog other = mode.catalog(io, WAREHOUSE, "orphans", paging(4, 8));
+    for (int i = 41; i < 50; i++) {
+      append(other.loadTable(TABLE), i);
+    }
+    assertThat(pages.list()).as("left by every compaction since").containsAll(orphans);
+
+    List<String> deleted = other.deleteOrphanPages();
+
+    assertThat(deleted).containsAll(orphans);
+    assertThat(pages.list()).doesNotContainAnyElementsOf(orphans)
+        .containsAll(pageNames(root("orphans"), tblId));
+    CheckpointRoundTrip.assertPagesExist(io);
+    Table fresh = mode.catalog(io, WAREHOUSE, "orphans", paging(4, 8)).loadTable(TABLE);
+    List<Long> remaining = current(fresh).snapshots().stream()
+        .map(Snapshot::snapshotId).collect(Collectors.toList());
+    assertThat(remaining).doesNotContainAnyElementsOf(ids.subList(0, 12))
+        .containsAll(ids.subList(13, 40));
+    try (CloseableIterable<FileScanTask> tasks = fresh.newScan().planFiles()) {
+      assertThat(Iterables.size(tasks)).isEqualTo(50);
+    }
+    assertThat(other.deleteOrphanPages()).as("nothing left").isEmpty();
+  }
+
+  /** The pages of {@code tblId}'s sealed blocks in {@code state}. */
+  private static List<String> pageNames(CatalogState state, int tblId) {
+    List<String> names = new ArrayList<>();
+    for (SnapshotPages.SealedBlock block : state.sealedBlocks(tblId).values()) {
+      names.add(block.pageName(tblId));
+    }
+    return names;
   }
 
   /** The state the catalog file's checkpoint holds: the root its last compaction wrote. */
@@ -703,7 +779,7 @@ class TestSnapshotPaging {
     assertThat(put).hasSize(8);
 
     // A sweep while the record may still land keeps its pages
-    writer.log().sweep(writer.log().read());
+    assertThat(writer.deleteOrphanPages()).doesNotContainAnyElementsOf(put);
     assertThat(pages.list()).containsAll(put);
 
     // Another commit passes the version the import was staged for
@@ -715,7 +791,7 @@ class TestSnapshotPaging {
     assertThatThrownBy(() -> mut.commit(writer.log()))
         .isInstanceOf(org.apache.iceberg.exceptions.CommitFailedException.class);
     assertThat(writer.log().read().state().isInlineTable(tblId)).isFalse();
-    writer.log().sweep(writer.log().read());
+    assertThat(writer.deleteOrphanPages()).containsAll(put);
     assertThat(pages.list()).doesNotContainAnyElementsOf(put);
   }
 

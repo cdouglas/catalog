@@ -395,9 +395,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
 
   /**
    * Deletes every page {@code set} does not reference whose node ends at or below its floor
-   * (docs/COMMITTED_PAGING.md "Orphans"). Such a page can never become referenced, since a PageOut
-   * names the oldest block above the floor and the floor only rises; a page whose PageOut may still
-   * land is above it. A store that cannot list its pages is not swept.
+   * ({@link #orphans}). A store that cannot list its pages is not swept.
    */
   private static void sweep(PageStore store, CommittedSet set) {
     List<String> names;
@@ -406,16 +404,30 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     } catch (UnsupportedOperationException e) {
       return;
     }
+    for (String name : orphans(names, set)) {
+      store.delete(name);
+    }
+  }
+
+  /**
+   * Of {@code names}, the committed set's pages that {@code set} does not reference and whose node
+   * ends at or below its floor (docs/COMMITTED_PAGING.md "Orphans"). Such a page can never become
+   * referenced, since a PageOut names the oldest block above the floor and the floor only rises; a
+   * page whose PageOut may still land is above it.
+   */
+  private static List<String> orphans(List<String> names, CommittedSet set) {
     Set<String> referenced = new HashSet<>();
     for (PageRef page : set.pages()) {
       referenced.add(page.name());
     }
+    List<String> orphans = new ArrayList<>();
     for (String name : names) {
       long top = CommittedSetCodec.pageTop(name);
       if (top >= 0L && top <= set.floor() && !referenced.contains(name)) {
-        store.delete(name);
+        orphans.add(name);
       }
     }
+    return orphans;
   }
 
   /** A page a reference names that the page store does not hold: GC dropped it since. */
@@ -491,30 +503,39 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
   }
 
   /**
-   * Deletes the orphaned pages of the log as {@code replica} holds it: each page in the log's page
-   * store that its committed set does not reference and whose node ends at or below its floor
-   * (docs/COMMITTED_PAGING.md "Orphans"). Safe from any replica, however stale: a PageOut that
-   * lands later seals a block above the floor where it lands, so its page ends above the floor of
-   * every replica before it. The runtime sweeps after each write that sealed or dropped a page;
-   * this is for a maintenance job, or a test. Does nothing if the log stores no pages, or its
-   * store cannot list them.
+   * Deletes the orphaned pages of the log as {@code replica} holds it, from one listing of the
+   * log's page store: each page of the committed set that its committed set does not reference and
+   * whose node ends at or below its floor (docs/COMMITTED_PAGING.md "Orphans"), and each of the
+   * machine's pages that is garbage under its state ({@link StateMachine#garbagePages}). Returns
+   * the names of the pages it deleted. Safe from any replica, however stale: a PageOut that lands
+   * later seals a block above the floor where it lands, so its page ends above the floor of every
+   * replica before it, and a machine's page is garbage only if it is under every state after the
+   * replica's too. The runtime sweeps the committed set's orphans after each write that sealed or
+   * dropped a page; this is for a maintenance job, or a test. Does nothing if the log stores no
+   * pages, or its store cannot list them.
    *
-   * @throws RuntimeException if listing or deleting a page failed
+   * @throws RuntimeException if listing or deleting a page failed: the pages deleted before it
+   *     stay deleted, and a later sweep finds the rest
    */
-  public void sweep(Replica<S> replica) {
+  public List<String> sweep(Replica<S> replica) {
     PageStore store = log.pages();
-    if (store != null) {
-      sweep(store, replica.committed());
-      List<String> names;
-      try {
-        names = store.list();
-      } catch (UnsupportedOperationException e) {
-        return;
-      }
-      for (String name : machine.garbagePages(replica.state(), names)) {
-        store.delete(name);
-      }
+    if (store == null) {
+      return List.of();
     }
+    List<String> names;
+    try {
+      names = store.list();
+    } catch (UnsupportedOperationException e) {
+      return List.of();
+    }
+    Set<String> garbage = new LinkedHashSet<>(orphans(names, replica.committed()));
+    garbage.addAll(new java.util.TreeSet<>(machine.garbagePages(replica.state(), names)));
+    List<String> deleted = new ArrayList<>();
+    for (String name : garbage) {
+      store.delete(name);
+      deleted.add(name);
+    }
+    return deleted;
   }
 
   /**

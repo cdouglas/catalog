@@ -531,6 +531,45 @@ public class LogCatalog extends BaseMetastoreCatalog
     }
   }
 
+  /**
+   * Deletes the orphaned pages of the catalog's log, as Iceberg's orphan-file removal deletes the
+   * files no metadata of a table names: a maintenance operation, for an operator to schedule,
+   * which nothing in the catalog calls. Returns the names of the pages it deleted.
+   *
+   * <p>It reads the catalog, lists the log's page store once, and deletes each page that is garbage
+   * under the catalog it read, and so under every catalog after it:
+   *
+   * <ul>
+   *   <li>a page of the committed set (docs/COMMITTED_PAGING.md, "Orphans") that the set does not
+   *       reference and whose ids end at or below its floor: one whose PageOut was refused, never
+   *       sent, or lost with its compactor. A compaction that pages sweeps these too;
+   *   <li>a page of a table's sealed snapshots (docs/SNAPSHOT_PAGING.md, "Page GC") of a table
+   *       that is gone (dropped, or evicted to a pointer table), or sealed at a version of its
+   *       table the catalog has reached and does not name: a block whose every snapshot expired,
+   *       or an import page of a re-inlining whose record did not land. The compactor whose root
+   *       drops a page deletes it once the root lands; a root does not record the pages it
+   *       dropped, so one that compactor failed to delete, or did not get to, only this finds.
+   * </ul>
+   *
+   * <p>Safe from any read, however stale, while other writers commit and compact: once garbage, a
+   * page is never named again. A committed set's page whose PageOut may still land ends above the
+   * floor; a snapshot page that a record after the read sealed is of a table, or a version of its
+   * table, the read has not reached. A reader that holds an older read and needs a page this
+   * deleted reads the table's snapshots as the table is now, as after any compactor's delete
+   * ({@code PageCollectedException}). It deletes pages only: what commits that failed wrote among
+   * the tables' files the catalog deletes as they fail ({@link CommitCleanup}).
+   *
+   * <p>Cost: a read of the catalog, a LIST of the page store, and a delete per page it deletes. Run
+   * it now and then (as a table's orphan-file removal is run, daily or weekly), and after a writer
+   * crashed or a store failed deletes; a store that cannot list its pages deletes nothing.
+   *
+   * @throws RuntimeException if the read, the listing or a delete failed: the pages deleted before
+   *     it stay deleted, and the next run deletes the rest
+   */
+  public List<String> deleteOrphanPages() {
+    return log.sweep(log.read());
+  }
+
   /** Whether {@code mut}'s record fits in what the catalog's log stores (CatalogLog.commit). */
   private boolean fits(CatalogMutation mut) {
     long bound = log.maxRecordBytes();

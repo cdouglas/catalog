@@ -325,3 +325,21 @@ See [docs/LOG.md](docs/LOG.md) for the commit protocol,
 [docs/ATOMIC_FILE_LOG.md](docs/ATOMIC_FILE_LOG.md) for how the catalog file
 commits, and [docs/design.md](docs/design.md) for guidance on choosing
 append vs CAS and which inline mode and codec to enable.
+
+## Maintenance
+
+Two calls on `LogCatalog` (and so `FileIOCatalog`) are for an operator to
+schedule, as a table's orphan-file removal and expiry are; nothing in the
+catalog calls them.
+
+- `deleteOrphanPages()` deletes the log's orphaned pages and returns their
+  names: snapshot pages a compaction's root dropped whose delete failed or
+  whose compactor died first, import pages of a re-inlining whose record
+  did not land, and the committed set's orphans. It reads the catalog,
+  lists the page store once, and deletes each page that is garbage under
+  that read, which no later state can name, so it is safe while writers
+  commit. Run it daily, say, and after a writer crashed or the store failed
+  deletes ([docs/SNAPSHOT_PAGING.md](docs/SNAPSHOT_PAGING.md) "Page GC").
+- `reinline(TableIdentifier)` brings a pointer table back into inline
+  storage without a data commit ([docs/SNAPSHOT_PAGING.md](docs/SNAPSHOT_PAGING.md)
+  "Re-inlining").

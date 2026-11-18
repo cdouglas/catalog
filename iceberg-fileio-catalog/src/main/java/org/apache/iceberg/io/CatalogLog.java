@@ -81,11 +81,12 @@ public final class CatalogLog {
 
   /**
    * Deletes the log's orphaned pages as {@code read} holds the catalog: the committed set's, and
-   * sealed snapshot blocks' pages that are garbage under its state (LogRuntime.sweep). For a
-   * maintenance job, or a test.
+   * sealed snapshot blocks' pages that are garbage under its state (LogRuntime.sweep), from one
+   * listing of its page store. Returns the names of the pages it deleted. The catalog's
+   * maintenance call ({@link LogCatalog#deleteOrphanPages}).
    */
-  public void sweep(Replica<CatalogState> read) {
-    runtime.sweep(read);
+  public List<String> sweep(Replica<CatalogState> read) {
+    return runtime.sweep(read);
   }
 
   /** The log's page store, where sealed snapshot blocks' pages are; null if it has none. */

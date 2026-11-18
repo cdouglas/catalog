@@ -376,9 +376,20 @@ root does not name it.
 
 None of these can be undone. Sequence numbers and table versions only rise,
 snapshots never come back, and table ids are not reused. So a sweep needs no
-clock and no grace period. Any compactor may sweep: list the page store and
-delete the garbage the root shows. A page whose block is not yet sealed in
-the root (one a compactor ahead wrote) is not garbage.
+clock and no grace period: list the page store and delete the garbage a read
+of the catalog shows, from any read, however stale. A page whose block is
+not yet sealed in the read (one a compactor ahead wrote) is not garbage.
+
+The compactor whose root drops a page deletes it once the root lands
+(`StateMachine.droppedPages`). A root does not record the pages it dropped:
+a page whose delete failed, or whose compactor died first, and an import
+page whose record did not land, are found only by a sweep. The sweep is a
+maintenance call, as a table's orphan-file removal is:
+`LogCatalog.deleteOrphanPages` reads the catalog, lists the page store once,
+and deletes the snapshot pages that are garbage under the read and the
+committed set's orphans (COMMITTED_PAGING.md, "Orphans"), a delete per page.
+An operator schedules it (daily, say, and after a writer crashed or a store
+failed deletes); nothing in the catalog calls it.
 
 - On a shared log with checkpoints apart, the sweep counts every checkpoint
   the provider may still serve, not only the newest.
@@ -855,7 +866,8 @@ Each step stands alone and is measured before the next:
    - Expiry removes sealed ids from their blocks' live ids; replay records
      the pages its records drop, and the runtime deletes them once a root
      without them lands; `LogRuntime.sweep` deletes orphans
-     (`StateMachine.garbagePages`; a5c8aaf).
+     (`StateMachine.garbagePages`; a5c8aaf), as the maintenance call
+     `LogCatalog.deleteOrphanPages`.
    - A copy for workers (`SerializableTable`) of a table whose history is
      not loaded ships the snapshots its load holds and a supplier a worker
      calls (the fork's `ShippableSnapshots`, atomicio 8ad653ae75): the inline

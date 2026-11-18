@@ -447,8 +447,11 @@ The PageOuts go into the write as follows:
 - **Orphans.** These are pages whose PageOut was refused, never sent, or lost
   in a crash. They are swept by one rule: an unreferenced page whose node ends
   at or below the current floor can never become referenced, since a PageOut
-  must name the oldest block above the floor. A sweep (any compactor, now and
-  then) lists the prefix and deletes those.
+  must name the oldest block above the floor. A sweep lists the prefix and
+  deletes those: the runtime's, after each write that sealed or dropped a
+  page, and the maintenance call `LogCatalog.deleteOrphanPages`, which also
+  deletes the catalog's orphaned snapshot pages (SNAPSHOT_PAGING.md, "Page
+  GC").
   - It never deletes a page whose record may still land, because such a page
     is above the floor.
 
