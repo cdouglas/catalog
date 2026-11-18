@@ -695,7 +695,13 @@ four tables). With paging set:
   nothing, and on a paged inline one: each step must commit alike in both,
   and the tables read the same.
 
-Rounds that reach sealed blocks and import pages run at B = 2, W = 1 (step 5).
+A round's faultA2 and faultB2 run at B = 2, W = 1, which reaches sealed
+blocks and import pages (step 5); the fault fuzzer reports the most sealed
+blocks of any table, and at B = 2 fails a job of 100 tries or more where
+fewer than 10% of its tries seal a block (about a quarter and a fifth of its
+two properties' do). A paging round (`r0p`: `SNAPSHOT_BLOCK=2
+SNAPSHOT_WINDOW=1` for every job) runs the race, rebase and differential
+jobs there too (fuzz/README.md).
 
 **Calibration.** Snapshot paging has no mutant set of its own. `drops.sh`'s
 `purgeafter` (a purge that reads the dropped version's history only after the
