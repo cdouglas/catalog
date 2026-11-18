@@ -80,7 +80,8 @@ import org.intentlog.wire.ProtoWire;
  * Azure Append Blob's position); a replace writes a new object conditioned on the version it
  * replaces (an ETag or generation), or on its absence. Every replace writes a checkpoint and the
  * records after it in one write, so each record follows exactly one checkpoint. A store without
- * append (GCS, or a store whose {@code supportsAppend()} is false) commits by replace only, and a
+ * append at the object's location (GCS; an S3 general-purpose bucket: {@code
+ * supportsAppend(location)} false) commits by replace only, and a
  * record too large for one append to the store ({@code maxAppendBytes}, less the record's length
  * prefix and trailer: {@link Capabilities#maxRecordBytes}) goes in a replace.
  *
@@ -137,6 +138,8 @@ public final class AtomicFileLog implements SharedLog {
   private final SupportsAtomicOperations io;
   private final String location;
   private final long maxRecordBytes;
+  // Whether the store appends at this location (S3: in directory buckets only)
+  private final boolean appends;
   private final PageStore pages;
   private final LongSupplier incarnations;
   // Whether a read of the log's object is one GET, with no lookup before it (the class comment)
@@ -195,6 +198,7 @@ public final class AtomicFileLog implements SharedLog {
     long maxAppend = io.maxAppendBytes(location);
     int prefix = ProtoWire.varintSize((int) Math.min(maxAppend, Integer.MAX_VALUE));
     this.maxRecordBytes = maxAppend > 0 ? Math.max(1L, maxAppend - prefix - TRAILER_SIZE) : 0L;
+    this.appends = io.supportsAppend(location);
     this.pages = new FilePages(location + ".committed/");
   }
 
@@ -221,7 +225,7 @@ public final class AtomicFileLog implements SharedLog {
 
   @Override
   public Capabilities capabilities() {
-    return new Capabilities(io.supportsAppend(), true, true, false, maxRecordBytes);
+    return new Capabilities(appends, true, true, false, maxRecordBytes);
   }
 
   @Override
@@ -348,7 +352,7 @@ public final class AtomicFileLog implements SharedLog {
     // asks for (step 0)
     try (SeekableInputStream in = file.newStream()) {
       long length = file.getLength();
-      if (length < n || (length > n && !io.supportsAppend())) {
+      if (length < n || (length > n && !appends)) {
         // shorter, or longer on a store without appends, where every change is a replace: read
         // whole, not the 20 bytes before the tail first
         return (FileView) parse(file);

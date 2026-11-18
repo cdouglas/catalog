@@ -104,7 +104,7 @@ reads format 2, unchecked, for captured logs.
 
 | `SharedLog` | On the object |
 |---|---|
-| `capabilities()` | appends if the FileIO does (`supportsAppend()`), conditionally; replaces (fused); no separate checkpoints; reads its own writes |
+| `capabilities()` | appends if the FileIO does at the object's location (`supportsAppend(location)`), conditionally; replaces (fused); no separate checkpoints; reads its own writes |
 | `read()` | the whole object, bound to the version it found: one GET where the store's reads record their version (`readsRecordVersion()`: S3, ADLS), else a lookup and a GET (GCS) |
 | `probe()` | the object's version and length, without reading it; a tail that does not exist if the object does not |
 | `append(record, tail)` | appends the record's frame at the tail's length, conditioned on its version (`Strategy.APPEND`), naming that version's incarnation: from the view this log read or wrote at the tail, or, for a tail a probe found, from that version's last trailer, read pinned to it (a version superseded since fails as a lost race, unsent). An unconditional append is refused |
@@ -178,7 +178,8 @@ fork's exceptions map onto the log's ([LOG.md](LOG.md) §"Failures"):
 The commit loop ([LOG.md](LOG.md) §"The commit loop") appends a record when
 it can, and replaces the object with its record when no append can carry it:
 
-- the FileIO cannot append (`supportsAppend()` is false: `GCSFileIO`);
+- the FileIO cannot append at the object's location (`supportsAppend(location)` is
+  false: `GCSFileIO`, and `S3FileIO` outside directory buckets);
 - an append was refused as full (`SegmentLimitException`): the object holds as
   many writes as the store allows, whatever the thresholds say (Bug 66);
 - the record is larger than one append to the store writes
@@ -236,10 +237,10 @@ whether a commit whose id the floor has passed applied.
 
 **CAS-only mode.** A store that replaces conditionally but cannot append
 needs every commit to replace. On GCS (a generation precondition) the log
-forces it: `GCSFileIO.supportsAppend()` is false. On an S3 general-purpose
-bucket (if-match) the setting `max.append.count=0` is required: `S3FileIO`
-reports `supportsAppend()`, but appends at a write offset, which only S3
-Express directory buckets accept. A replace that loses a race rebases on a
+forces it: `GCSFileIO.supportsAppend()` is false. So it does on an S3
+general-purpose bucket (if-match): `S3FileIO.supportsAppend(location)` is true
+only in directory buckets (S3 Express), the only buckets that take an append
+at a write offset. A replace that loses a race rebases on a
 fresh read, so concurrent commits whose preconditions do not overlap all
 succeed, as they would by append.
 

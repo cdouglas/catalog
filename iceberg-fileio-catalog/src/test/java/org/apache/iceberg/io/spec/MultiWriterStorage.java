@@ -322,7 +322,7 @@ abstract class MultiWriterStorage {
       hooks = null;
       try {
         AtomicFileLog log = new AtomicFileLog(io, CATALOG);
-        if (io.supportsAppend()) {
+        if (io.supportsAppend(CATALOG)) {
           try {
             log.append(record, log.probe());
             return true;

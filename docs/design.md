@@ -886,9 +886,10 @@ append, then a compaction (Bug 66 (full object stopped commits)). The
 best count depends on the store's latencies and the catalog's size, so it
 should be measured per store or set by a principled rule
 ([errata.md](errata.md) §D14 (knobs fixed, not per store)). GCS has no append, and the format commits every write there by
-CAS whatever the setting (`GCSFileIO.supportsAppend()` is false). For S3
-standard buckets, which support conditional full-object replace but not
-conditional append, set `max.append.count = 0` to force CAS-only mode.
+CAS whatever the setting (`GCSFileIO.supportsAppend()` is false), and so
+does an S3 general-purpose bucket, which supports conditional full-object
+replace but not conditional append (`S3FileIO.supportsAppend(location)` is
+true for directory buckets only).
 
 A writer that loses a race for the object (another writer's append or
 replace landed first) waits before it reads again and resends: a time

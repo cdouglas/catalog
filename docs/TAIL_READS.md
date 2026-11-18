@@ -243,7 +243,7 @@ lookup`):
 
 1. A HEAD: the version V and its length L. If L < N, the object was replaced:
    a whole read (a GET of V's bytes). On a store without appends
-   (`supportsAppend()` false: S3 Standard, GCS) every change is a replace, so
+   (`supportsAppend(location)` false: S3 Standard, GCS) every change is a replace, so
    L > N is a whole read too: step 2's GET would only find a trailer that is
    not X's, and the whole read after it would cost a GET more (campaign `p4r`
    on S3 Standard: about one GET a commit, and more lost CAS races; see

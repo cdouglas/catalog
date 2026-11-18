@@ -29,7 +29,7 @@ Constants live in
 | `AWS_SECRET_ACCESS_KEY` | yes | `…` | Standard AWS SDK. |
 | `AWS_SESSION_TOKEN` | optional | `…` | Standard AWS SDK; needed for SSO/STS. |
 | `AWS_REGION` | recommended | `us-west-2` | Standard AWS SDK. |
-| `AWS_TEST_BUCKET` | yes | `my-test-bucket--usw2-az3--x-s3` | Bucket the tests use. Must already exist. An S3 Express directory bucket runs every S3 suite. A standard bucket rejects `writeOffsetBytes`, so the APPEND-mode suites fail there: run only the CAS suites (`-Dit.test='TestS3*CAS*'`). |
+| `AWS_TEST_BUCKET` | yes | `my-test-bucket--usw2-az3--x-s3` | Bucket the tests use. Must already exist. An S3 Express directory bucket runs every S3 suite. A standard bucket takes no `writeOffsetBytes` appends (`S3FileIO.supportsAppend(location)` is false there), so the catalog commits by replace whatever a suite's mode sets: the APPEND-mode suites test appends only on a directory bucket. |
 
 ### GCP (GCS)
 

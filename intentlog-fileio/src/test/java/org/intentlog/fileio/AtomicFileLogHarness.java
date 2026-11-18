@@ -61,6 +61,7 @@ public final class AtomicFileLogHarness implements LogHarness {
 
   private final InMemoryAtomicFileIO io;
   private final AtomicFileLog log;
+  private final String location;
   private final String pages;
   private final StateMachine<?, ?, ?> machine;
   private final HeldReads reads;
@@ -80,6 +81,7 @@ public final class AtomicFileLogHarness implements LogHarness {
     SplittableRandom random = new SplittableRandom(seed);
     this.log = new AtomicFileLog(io, location, random.split()::nextLong);
     this.reads = new HeldReads(log, location);
+    this.location = location;
     this.pages = location + ".committed/";
     this.machine = machine;
     io.readMode(mode);
@@ -183,7 +185,7 @@ public final class AtomicFileLogHarness implements LogHarness {
     Hooks was = hooks;
     hooks = null;
     try {
-      if (io.supportsAppend()) {
+      if (io.supportsAppend(location)) {
         log.append(record, log.probe());
       } else {
         LogView view = log.read();

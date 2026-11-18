@@ -563,6 +563,30 @@ class TestAtomicFileLog {
     assertThat(log.capabilities().fusedReplace()).isTrue();
   }
 
+  /**
+   * Bug 111 (S3 standard buckets never commit): a FileIO that appends at some locations only (S3:
+   * directory buckets) says so by location, and the log asks for its own. Before, it asked the
+   * FileIO-wide question, which S3FileIO answered true for every bucket, so on a general-purpose
+   * bucket every commit appended, was refused, and none landed.
+   */
+  @Test
+  void aStoreThatAppendsAtSomeLocationsAnswersForTheLogs() {
+    InMemoryAtomicFileIO someBuckets = new InMemoryAtomicFileIO() {
+      @Override
+      public boolean supportsAppend() {
+        return false; // not at every location
+      }
+
+      @Override
+      public boolean supportsAppend(String location) {
+        return location.startsWith("mem:///express/");
+      }
+    };
+    assertThat(new AtomicFileLog(someBuckets, LOCATION).capabilities().append()).isFalse();
+    assertThat(new AtomicFileLog(someBuckets, "mem:///express/catalog").capabilities().append())
+        .isTrue();
+  }
+
   // ============================================================
   // Tail reads (docs/TAIL_READS.md "Reads")
   // ============================================================
