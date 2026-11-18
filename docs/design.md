@@ -470,9 +470,10 @@ files when it fails with `CommitFailedException` (a `CleanableFailure`),
 and a caller may run a failed commit again, so a commit that landed must
 not report failure. `CatalogLog` maps a rejection to
 `CommitFailedException` (or the conflict it explains; a record larger
-than the log stores to `RecordTooLargeException`, also a
-`CleanableFailure`, which Iceberg does not retry) and an unknown outcome
-to `CommitStateUnknownException`. Work after the commit lands
+than the log stores to `RecordTooLargeException`, and a write the store
+refused with an error the same write gets again to
+`CommitRefusedException`, both `CleanableFailure`s that Iceberg does not
+retry) and an unknown outcome to `CommitStateUnknownException`. Work after the commit lands
 does not change its outcome: the catalog deletes the metadata files that
 dropped out of a table's log through `CatalogUtil.deleteFiles`, which
 logs a failure instead of throwing it (Bug 61), and a drop with purge

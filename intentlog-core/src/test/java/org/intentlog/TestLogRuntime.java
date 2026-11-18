@@ -632,6 +632,45 @@ class TestLogRuntime {
             e -> assertThat(e.reason()).isEqualTo(CommitRejectedException.Reason.NOT_SENT));
   }
 
+  /**
+   * Bug 118 (refused writes reported unknown): a write the store refused with an error the same
+   * write gets again (a client error: denied permissions, a malformed request) landed nowhere, and
+   * a resend is refused too. The commit is rejected at once: one send, no wait, no read.
+   */
+  @Test
+  void aRefusedWriteIsRejectedAtOnce() {
+    Replica<Map<String, Integer>> base = created();
+    runtime = new LogRuntime<>(log, ToyMachine.INSTANCE,
+        config(10, NO_GC, 5L).withRaceByLatency(false));
+    log.faults(Fault.REFUSED);
+    log.calls.clear();
+    CommitTrace.open();
+    try {
+      assertThatThrownBy(() -> bump(base, "k"))
+          .isInstanceOfSatisfying(CommitRejectedException.class, e -> {
+            assertThat(e.reason()).isEqualTo(CommitRejectedException.Reason.REFUSED);
+            assertThat(e.getCause()).isInstanceOf(LogRefusedException.class);
+          });
+      assertThat(CommitTrace.drain()).extracting(CommitTrace.Event::kind)
+          .doesNotContain(CommitTrace.Kind.BACKOFF, CommitTrace.Kind.AMBIGUOUS);
+    } finally {
+      CommitTrace.close();
+    }
+    assertThat(log.calls).containsExactly("append");
+    assertThat(log.versionCount()).isEqualTo(1); // nothing landed
+  }
+
+  /** A refusal after a write that may have landed cannot say the commit did not land. */
+  @Test
+  void aRefusedWriteAfterOneThatMayHaveLandedIsUnknown() {
+    Replica<Map<String, Integer>> base = created();
+    log.faults(Fault.LOST_REQUEST, Fault.REFUSED);
+    assertThatThrownBy(() -> bump(base, "k")).isInstanceOf(CommitOutcomeUnknownException.class);
+    // a throttled send before the refused one, in the same write, may have landed too
+    log.faults(Fault.THROTTLED, Fault.REFUSED, Fault.REFUSED);
+    assertThatThrownBy(() -> bump(base, "k")).isInstanceOf(CommitOutcomeUnknownException.class);
+  }
+
   @Test
   void aWriteNotSentAfterOneThatMayHaveLandedIsUnknown() {
     Replica<Map<String, Integer>> base = created();

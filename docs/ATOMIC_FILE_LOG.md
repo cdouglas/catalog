@@ -186,6 +186,7 @@ fork's exceptions map onto the log's ([LOG.md](LOG.md) §"Failures"):
 | a failure in `prepare` | `LogNotSentException`: nothing was sent |
 | `StorageThrottleException` (a 429, a 5xx, GCS's per-object update rate) | `LogThrottledException`. Mapped before `CASException`, its superclass |
 | `SegmentLimitException` (S3 Express: 10,000 parts; an Azure Append Blob: 50,000 blocks) | `LogFullException` |
+| `StorageRefusedException` (a client error that proves nothing landed: 400, 401, 403, 413, 501, ... on the write's only attempt; never 404, 408, 409, 412, 429, nor a 4xx after the SDK's retries, which an earlier attempt may have landed before) | `LogRefusedException`: the commit is rejected at once (`REFUSED`; Bug 118 (refused writes reported unknown)) |
 | `CASException`, `AppendException` | `LogConflictException` |
 | any other failure | the write's outcome is unknown |
 

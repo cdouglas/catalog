@@ -6357,6 +6357,119 @@ public class TestCatalogRegressions {
   }
 
   /**
+   * Bug 118 (refused writes reported unknown): a conditional write that the store refused with a
+   * client error (a 403, a 400) surfaced as the SDK's own exception, which AtomicFileLog let out
+   * and the commit loop took for a write of unknown outcome: it waited, read the catalog, sent the
+   * record again, and after ten sends reported the commit unknown (CommitStateUnknownException),
+   * which Iceberg neither retries nor cleans up after. A refused write is refused every time. The
+   * fork's FileIOs now raise StorageRefusedException for a client error that proves nothing landed
+   * (on the write's only attempt), AtomicFileLog maps it to LogRefusedException, the commit loop
+   * rejects the commit at once (REFUSED), and CatalogLog throws CommitRefusedException: a
+   * CleanableFailure that Iceberg does not retry, so a snapshot producer deletes what it wrote. An
+   * error no FileIO classifies still leaves the outcome unknown. Found by a review of the commit
+   * loop's failures.
+   */
+  @Nested
+  class AWriteTheStoreRefuses {
+
+    /** Refuses every conditional write of the catalog object, as {@code fault} says. */
+    private void fail(InMemoryAtomicFileIO io, InMemoryAtomicFileIO.Fault fault) {
+      io.injectFaults((location, strategy) ->
+          location.equals(CATALOG) ? fault : InMemoryAtomicFileIO.Fault.NONE);
+    }
+
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND_TM", "CAS_TM", "APPEND_ML"})
+    void aSnapshotProducerFailsAtOnceAndCleansUp(LocalCatalogMode mode) {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = catalog(io, mode);
+      catalog.createNamespace(mixedNs);
+      Table table = catalog.createTable(mixed, intSchema);
+      Set<String> before = metadataDirectory(io, table.location());
+      byte[] object = io.bytes(CATALOG);
+      long rejected = catalog.log().counts().rejected();
+      fail(io, InMemoryAtomicFileIO.Fault.REFUSED);
+
+      assertThatThrownBy(() -> table.newFastAppend().appendFile(dataFile("a")).commit())
+          .isInstanceOf(CommitRefusedException.class)
+          .isInstanceOf(org.apache.iceberg.exceptions.CleanableFailure.class)
+          .isNotInstanceOf(CommitFailedException.class)
+          .hasStackTraceContaining("StorageRefusedException");
+
+      assertThat(io.injected(InMemoryAtomicFileIO.Fault.REFUSED)).as("sent once").isEqualTo(1);
+      assertThat(io.bytes(CATALOG)).as("nothing landed").isEqualTo(object);
+      assertThat(catalog.log().counts().rejected() - rejected).as("rejected").isEqualTo(1);
+      assertThat(catalog.log().counts().unknown()).as("unknown").isZero();
+      assertThat(metadataDirectory(io, table.location()))
+          .as("what the producer wrote, deleted")
+          .isEqualTo(before);
+      fail(io, InMemoryAtomicFileIO.Fault.NONE);
+      assertThat(catalog.loadTable(mixed).currentSnapshot()).isNull();
+    }
+
+    /** The catalog's own operations retry a conflict, not a refusal. */
+    @Test
+    void aNamespaceChangeFailsAtOnce() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = catalog(io, LocalCatalogMode.APPEND);
+      catalog.createNamespace(mixedNs);
+      fail(io, InMemoryAtomicFileIO.Fault.REFUSED);
+
+      assertThatThrownBy(() -> catalog.createNamespace(Namespace.of("other")))
+          .isInstanceOf(CommitRefusedException.class);
+      assertThatThrownBy(() -> catalog.setProperties(mixedNs, Map.of("k", "v")))
+          .isInstanceOf(CommitRefusedException.class);
+
+      assertThat(io.injected(InMemoryAtomicFileIO.Fault.REFUSED)).as("sent once each")
+          .isEqualTo(2);
+      fail(io, InMemoryAtomicFileIO.Fault.NONE);
+      assertThat(catalog.namespaceExists(Namespace.of("other"))).isFalse();
+      assertThat(catalog.loadNamespaceMetadata(mixedNs)).doesNotContainKey("k");
+    }
+
+    @Test
+    void creatingTheCatalogFailsAtOnce() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      fail(io, InMemoryAtomicFileIO.Fault.REFUSED);
+
+      assertThatThrownBy(() -> catalog(io, LocalCatalogMode.APPEND))
+          .isInstanceOf(CommitRefusedException.class);
+
+      assertThat(io.injected(InMemoryAtomicFileIO.Fault.REFUSED)).as("sent once").isEqualTo(1);
+      assertThat(io.newInputFile(CATALOG).exists()).isFalse();
+    }
+
+    /**
+     * A write that fails with an error the FileIO does not classify may have landed: the commit
+     * waits, reads to settle it, and sends again (Bug 113), and with every send failing ends
+     * unknown.
+     */
+    @Test
+    void anUnclassifiedErrorStillEndsUnknownAfterBackoff() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      LogCatalog catalog = LocalCatalogMode.APPEND.catalog(io, WAREHOUSE, "c", Map.of(
+          LogCatalogProperties.RACE_BASIS, "fixed", LogCatalogProperties.RACE_MIN_WAIT_MS, "1"));
+      catalog.createNamespace(mixedNs);
+      fail(io, InMemoryAtomicFileIO.Fault.FAIL_BEFORE);
+
+      org.intentlog.CommitTrace.open();
+      try {
+        assertThatThrownBy(() -> catalog.setProperties(mixedNs, Map.of("k", "v")))
+            .isInstanceOf(CommitStateUnknownException.class);
+        assertThat(org.intentlog.CommitTrace.drain().stream()
+                .filter(e -> e.kind() == org.intentlog.CommitTrace.Kind.BACKOFF))
+            .as("a wait before each read that settles a send")
+            .hasSize(org.intentlog.RuntimeConfig.DEFAULT_MAX_ATTEMPTS);
+      } finally {
+        org.intentlog.CommitTrace.close();
+      }
+      assertThat(io.injected(InMemoryAtomicFileIO.Fault.FAIL_BEFORE))
+          .isEqualTo(org.intentlog.RuntimeConfig.DEFAULT_MAX_ATTEMPTS);
+      assertThat(catalog.log().counts().unknown()).isEqualTo(1);
+    }
+  }
+
+  /**
    * A record over the log's bound: {@code fileio.catalog.inline.max.update.size} bounds one
    * table's update, not a record, and a log that cannot replace itself (the segmented log on Append
    * Blobs: one block; a shared log with a record limit) rejects a larger record before sending it

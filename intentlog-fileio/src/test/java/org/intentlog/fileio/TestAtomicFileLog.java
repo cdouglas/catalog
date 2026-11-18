@@ -38,6 +38,8 @@ import org.apache.iceberg.io.InMemoryAtomicFileIO;
 import org.apache.iceberg.io.SupportsAtomicOperations;
 import org.intentlog.LogConflictException;
 import org.intentlog.LogFullException;
+import org.intentlog.LogNotSentException;
+import org.intentlog.LogRefusedException;
 import org.intentlog.LogTail;
 import org.intentlog.LogThrottledException;
 import org.intentlog.LogView;
@@ -153,6 +155,30 @@ class TestAtomicFileLog {
         .isInstanceOf(LogThrottledException.class);
   }
 
+  /**
+   * Bug 118 (refused writes reported unknown): a write the store refused with a client error that
+   * proves nothing landed is refused, which the commit loop does not send again; an error the
+   * FileIO does not classify leaves the write's outcome unknown, as it did.
+   */
+  @Test
+  void aRefusalIsARefusalNotAnUnknownOutcome() {
+    LogView created = create();
+    io.injectFaults((location, strategy) -> InMemoryAtomicFileIO.Fault.REFUSED);
+    assertThatThrownBy(() -> log.append(bytes("r2"), created.tail()))
+        .isInstanceOf(LogRefusedException.class)
+        .isInstanceOf(LogNotSentException.class)
+        .hasCauseInstanceOf(SupportsAtomicOperations.StorageRefusedException.class);
+    assertThatThrownBy(() -> log.replace(created.tail(), bytes("c2"), List.of()))
+        .isInstanceOf(LogRefusedException.class);
+    assertThat(io.injected(InMemoryAtomicFileIO.Fault.REFUSED)).isEqualTo(2);
+
+    io.injectFaults((location, strategy) -> InMemoryAtomicFileIO.Fault.FAIL_BEFORE);
+    assertThatThrownBy(() -> log.append(bytes("r2"), created.tail()))
+        .isInstanceOf(UncheckedIOException.class)
+        .isNotInstanceOf(LogNotSentException.class);
+    assertThat(log.read().records()).extracting(TestAtomicFileLog::string).containsExactly("r1");
+  }
+
   @Test
   void anObjectAtItsSegmentLimitIsFull() {
     io.limitSegments(2);
@@ -173,8 +199,9 @@ class TestAtomicFileLog {
     LogView appended =
         limited.readThrough(limited.append(new byte[278], created.tail()), Duration.ZERO);
     assertThat(appended.records()).hasSize(2);
+    // the store refuses a larger append (Azure's 413), with nothing landed
     assertThatThrownBy(() -> limited.append(new byte[279], appended.tail()))
-        .isInstanceOf(UncheckedIOException.class);
+        .isInstanceOf(LogRefusedException.class);
   }
 
   @Test

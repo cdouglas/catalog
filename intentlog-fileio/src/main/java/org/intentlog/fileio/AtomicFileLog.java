@@ -46,6 +46,7 @@ import org.intentlog.Capabilities;
 import org.intentlog.LogConflictException;
 import org.intentlog.LogFullException;
 import org.intentlog.LogNotSentException;
+import org.intentlog.LogRefusedException;
 import org.intentlog.LogTail;
 import org.intentlog.LogThrottledException;
 import org.intentlog.LogView;
@@ -680,9 +681,10 @@ public final class AtomicFileLog implements SharedLog {
 
   /**
    * Writes {@code bytes} conditioned on {@code current}, mapping the store's signals onto the
-   * log's: a throttle, a failed condition (a CAS conflict or a lost append race), a full object.
-   * A failure to prepare the write sent nothing; any other failure leaves its outcome unknown.
-   * Returns the version written.
+   * log's: a throttle, a failed condition (a CAS conflict or a lost append race), a full object, a
+   * refusal (a client error that proves nothing landed, which the same write gets again: {@link
+   * LogRefusedException}). A failure to prepare the write sent nothing; any other failure leaves
+   * its outcome unknown. Returns the version written.
    */
   private InputFile write(InputFile current, byte[] bytes, AtomicOutputFile.Strategy strategy) {
     AtomicOutputFile out;
@@ -702,6 +704,9 @@ public final class AtomicFileLog implements SharedLog {
       throw new LogThrottledException("Storage throttled a write to " + location, e);
     } catch (SupportsAtomicOperations.SegmentLimitException e) {
       throw new LogFullException(location + " holds as many writes as the store allows", e);
+    } catch (SupportsAtomicOperations.StorageRefusedException e) {
+      throw new LogRefusedException(
+          strategy + " write to " + location + " was refused: " + e.getMessage(), e);
     } catch (SupportsAtomicOperations.CASException | SupportsAtomicOperations.AppendException e) {
       throw new LogConflictException(strategy + " write to " + location + " lost a race", e);
     } catch (IOException e) {

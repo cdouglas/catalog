@@ -171,7 +171,7 @@ commit.
 | P3 | `readThrough(r)` returns a view whose records, after its checkpoint, include `r`'s record, or fails. A view whose checkpoint already holds the record cannot say whether it applied once GC drops its id |
 | P4 | Of several conditional writes on the same tail, at most one lands |
 | P5 | No trim before a durable checkpoint covers the records trimmed |
-| P6 | `LogFullException` and `LogNotSentException` mean nothing landed |
+| P6 | `LogFullException` and `LogNotSentException` (and its subclass `LogRefusedException`) mean nothing landed |
 
 P1 allows a read to return any prefix: a replica that lags behind the log's
 appends is a legal provider. It does not allow one with a hole: a provider
@@ -189,6 +189,7 @@ below) as far as a provider's capabilities allow.
 | `LogThrottledException` | a write | backpressure (a 429, a 5xx, a per-object update rate). The write may have landed even so, and sending it again is safe | sends it again after a backoff, up to 8 sends; then the write is ambiguous, and a fresh read settles it |
 | `LogFullException` | an append | the log holds as many writes as its store allows (S3 Express: 10,000 parts; an Azure Append Blob: 50,000 blocks). Nothing landed, and no append can | replaces, on a fresh read (Bug 66) |
 | `LogNotSentException` | a write | preparing it failed: nothing was sent | rejects (`NOT_SENT`), unless an earlier write of the commit may have landed |
+| `LogRefusedException` (a `LogNotSentException`) | a write | the store refused it with an error the same write gets again, which proves nothing landed: a client error (a 403, a 400, a 413, a 501) on the write's only attempt (`AtomicFileLog`, from the FileIO's `StorageRefusedException`) | rejects at once (`REFUSED`), with no wait and no resend, unless an earlier write of the commit may have landed (a throttled send of the same write counts: Bug 118 (refused writes reported unknown)) |
 | `TrimmedException` | `readThrough`, `readAfter` | the records asked for are gone | `readThrough`: the outcome is unknown, and a fresh read settles it; `readAfter`: a fresh read |
 | `LogGapException` | the runtime, on a view | the records do not start where the checkpoint ends, or do not follow the tail a fold needs: a gap or a splice | the read fails (the log is unreadable; unknown if a write may have landed) |
 | `LogLagException` | `readThrough` after its wait; a commit's read that stays behind the commit's floor | a replica of the log lags its appends | `readThrough`: the write is ambiguous, and a fresh read settles it; a lagging read: the log is unreadable |
@@ -571,8 +572,10 @@ three outcomes, and a caller can rely on each:
   `CONFLICT` (its preconditions do not hold on `state()`, the replica it lost
   to), `BEYOND_HORIZON`, `CREATE_LOST` (another writer created the log first),
   `EXHAUSTED` (out of attempts with no write that may have landed),
-  `NOT_SENT`, or `TOO_LARGE` (its record is larger than an append stores, on
-  a log that cannot replace itself; nothing was sent);
+  `NOT_SENT`, `REFUSED` (the store refused a write with an error the same
+  write gets again; nothing landed), or `TOO_LARGE` (its record is larger
+  than an append stores, on a log that cannot replace itself; nothing was
+  sent);
 - **`CommitOutcomeUnknownException`**: either. Its cause is the write that may
   have landed, with any read failures since suppressed on it.
 
@@ -583,7 +586,9 @@ if a pending create or a rename's destination now collides,
 `NoSuchTableException` if a rename's source is gone, else
 `CommitFailedException`), `TOO_LARGE` to `RecordTooLargeException` (a
 `CleanableFailure` that Iceberg does not retry, since the same record is as
-large), the other rejections to `CommitFailedException`, which Iceberg
+large), `REFUSED` to `CommitRefusedException` (likewise: the store refuses
+the same write again until whatever its error names, permissions say, is
+fixed), the other rejections to `CommitFailedException`, which Iceberg
 retries on a fresh read, and an unknown outcome to
 `CommitStateUnknownException`.
 
@@ -716,7 +721,8 @@ function COMMIT(log, base, intention):
         if not settles(fresh): unknown            # it lags behind where the write would be (Bug 90)
     reject EXHAUSTED
 
-# A LogNotSentException out of the loop: unknown if earlier(), else reject NOT_SENT.
+# A LogNotSentException out of the loop: unknown if earlier(), else reject REFUSED
+# (a LogRefusedException) or NOT_SENT.
 
 function WRITE(send):                             # one write, read back
     last = none

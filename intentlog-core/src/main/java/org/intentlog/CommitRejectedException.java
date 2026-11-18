@@ -44,6 +44,13 @@ public class CommitRejectedException extends RuntimeException {
     /** A write failed before anything was sent, with no earlier write that may have landed. */
     NOT_SENT,
     /**
+     * The store refused a write with an error the same request gets again ({@link
+     * LogRefusedException}: a client error, such as denied permissions), with no earlier write that
+     * may have landed. Nothing landed, and a retry of the commit is refused too until whatever the
+     * error names is fixed.
+     */
+    REFUSED,
+    /**
      * Its record is larger than one append stores ({@link Capabilities#maxRecordBytes}), on a log
      * that cannot replace itself. Nothing was sent.
      */

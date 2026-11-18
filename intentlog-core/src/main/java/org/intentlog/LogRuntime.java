@@ -1385,12 +1385,18 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
       try {
         return loop();
       } catch (LogNotSentException e) {
-        // A write failed before anything was sent. The commit failed, unless an earlier write of
-        // it may have landed.
+        // A write failed before anything was sent, or the store refused it. The commit failed,
+        // unless an earlier write of it may have landed. A refusal is not retried: the same write
+        // is refused again.
         Throwable earlier = earlier();
         if (earlier != null) {
           earlier.addSuppressed(e);
           throw new CommitOutcomeUnknownException(earlier);
+        }
+        if (e instanceof LogRefusedException) {
+          throw new CommitRejectedException(
+              CommitRejectedException.Reason.REFUSED, null,
+              "Cannot commit: the store refused a write: " + e.getMessage(), e);
         }
         throw new CommitRejectedException(
             CommitRejectedException.Reason.NOT_SENT, null,

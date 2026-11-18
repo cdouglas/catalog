@@ -45,8 +45,9 @@ import java.util.List;
  * is no proof that it did not land: a transport retry of a write that landed fails its
  * condition), {@link LogThrottledException} under backpressure (it may have landed; the same
  * write may be sent again), and {@link LogFullException} or {@link LogNotSentException} when
- * nothing landed. Any other exception from a write leaves its outcome unknown; any exception from
- * a read or probe means the log could not be read.
+ * nothing landed ({@link LogRefusedException}, a {@link LogNotSentException}, when the store
+ * refused it with an error the same write gets again). Any other exception from a write leaves
+ * its outcome unknown; any exception from a read or probe means the log could not be read.
  */
 public interface SharedLog {
 

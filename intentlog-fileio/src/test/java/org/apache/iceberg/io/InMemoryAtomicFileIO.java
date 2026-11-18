@@ -79,8 +79,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
  * <p>{@link #injectFaults} makes conditional writes fail the way remote storage can: before the
  * write lands, or after it lands with the reply lost (an {@link IOException} or a runtime error, as
  * SDKs surface either) or reported as a precondition failure (a transport retry that ran into its
- * own write); or throttled, before or after landing. A lost reply leaves the caller unable to tell
- * whether the write took effect.
+ * own write); throttled, before or after landing; or refused with a client error, before landing.
+ * A lost reply leaves the caller unable to tell whether the write took effect.
  * {@link #injectReadFaults} makes reads fail: a request for an object's metadata or content throws,
  * or its content stream breaks part way through.
  */
@@ -103,7 +103,12 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
      * Lands, then throws {@link StorageThrottleException}: a 5xx after the service applied the
      * write, or a 429 that ended an SDK's retries of a write that landed.
      */
-    LANDED_THROTTLED
+    LANDED_THROTTLED,
+    /**
+     * Throws {@link StorageRefusedException} before the precondition check (a 403, a 400: a client
+     * error the same write gets again); nothing lands.
+     */
+    REFUSED
   }
 
   /**
@@ -482,8 +487,8 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
    * Caps the bytes one append writes at {@code max}, and reports the cap ({@link
    * #maxAppendBytes}), as Azure caps an {@code AppendBlock} (4 MiB before service version
    * 2022-11-02, 100 MiB since) and the ADLS FileIO reports it. A larger append fails, before
-   * landing, with the raw error the ADLS FileIO lets out (a 413 from the service); a CAS is not
-   * capped, since the ADLS FileIO writes one in blocks of the cap. 0 removes the cap.
+   * landing, as the ADLS FileIO refuses one (the service's 413: {@link StorageRefusedException});
+   * a CAS is not capped, since the ADLS FileIO writes one in blocks of the cap. 0 removes the cap.
    */
   public void limitAppendBytes(int max) {
     this.appendByteLimit = max;
@@ -843,10 +848,16 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
           String msg = "injected: " + strategy + " at " + location + " throttled";
           throw new StorageThrottleException(msg, new IOException(msg));
         }
+        if (fault == Fault.REFUSED) {
+          String msg = "injected: " + strategy + " at " + location + " refused (HTTP 403)";
+          throw new StorageRefusedException(msg, new IOException(msg));
+        }
         if (strategy == Strategy.APPEND && appendByteLimit > 0 && data.length > appendByteLimit) {
-          throw new UncheckedIOException(new IOException(String.format(
+          // the service's 413 RequestBodyTooLarge, which the ADLS FileIO refuses
+          String msg = String.format(
               "injected: an append of %d bytes at %s is larger than the store allows (%d)",
-              data.length, location, appendByteLimit)));
+              data.length, location, appendByteLimit);
+          throw new StorageRefusedException(msg, new IOException(msg));
         }
         Version live = objects.get(location);
         long expectedGen = expected == null ? 0 : expected.generation;

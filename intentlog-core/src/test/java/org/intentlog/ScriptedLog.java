@@ -51,7 +51,9 @@ final class ScriptedLog implements SharedLog {
     /** The write fails after it was sent, without landing. */
     LOST_REQUEST,
     /** Preparing the write fails; nothing is sent. */
-    NOT_SENT
+    NOT_SENT,
+    /** Storage refuses the write with an error the same write gets again; nothing lands. */
+    REFUSED
   }
 
   /** A version of the log: its lineage (bumped by every replace) and contents. */
@@ -278,6 +280,9 @@ final class ScriptedLog implements SharedLog {
     }
     if (fault == Fault.THROTTLED) {
       throw new LogThrottledException("throttled", null);
+    }
+    if (fault == Fault.REFUSED) {
+      throw new LogRefusedException("refused", null);
     }
     if (fault == Fault.LOST_REQUEST) {
       throw new UncheckedIOException(new IOException("request lost"));

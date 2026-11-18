@@ -124,6 +124,10 @@ public final class CatalogLog {
     try {
       runtime.bootstrap(new ProtoCodec.CatalogIntention(actions));
     } catch (CommitRejectedException e) {
+      if (e.reason() == CommitRejectedException.Reason.REFUSED) {
+        throw new CommitRefusedException(
+            e, String.format("Cannot create the catalog at %s: %s", log, e.getMessage()));
+      }
       throw new CommitFailedException(e, "Cannot create the catalog at %s: %s", log, e.getMessage());
     } catch (CommitOutcomeUnknownException e) {
       throw new CommitStateUnknownException(e.getCause());
@@ -144,6 +148,9 @@ public final class CatalogLog {
    * @throws RecordTooLargeException if its record is larger than the log stores, on a log that
    *     cannot replace itself, with every inline update it could evict evicted: it did not take
    *     effect, and a retry of it cannot
+   * @throws CommitRefusedException if the store refused its write with an error the same write
+   *     gets again (a client error, such as denied permissions): it did not take effect, and a
+   *     retry of it is refused too
    * @throws CommitStateUnknownException if it may or may not have
    */
   public Replica<CatalogState> commit(CatalogMutation mutation) {
@@ -159,7 +166,8 @@ public final class CatalogLog {
     } catch (CommitFailedException
         | org.apache.iceberg.exceptions.AlreadyExistsException
         | org.apache.iceberg.exceptions.NoSuchTableException
-        | RecordTooLargeException e) {
+        | RecordTooLargeException
+        | CommitRefusedException e) {
       mutation.deleteEvicted(); // the record did not land
       throw e;
     }
@@ -213,6 +221,10 @@ public final class CatalogLog {
           // the same record again is as large: not a CommitFailedException, which Iceberg retries
           counts.rejected.increment();
           throw new RecordTooLargeException(e, e.getMessage());
+        case REFUSED:
+          // the store refuses the same write again: not a CommitFailedException either (Bug 118)
+          counts.rejected.increment();
+          throw new CommitRefusedException(e, e.getMessage() + " at " + log);
         default:
           counts.rejected.increment();
           throw new CommitFailedException(e, "%s", e.getMessage());
