@@ -26,7 +26,9 @@ the files a test suite writes, run it with `-Dexplorer.dump=<dir>` (see [Check t
 decoder](#check-the-decoder)).
 
 Inline table metadata (`InlineTable.metadata`, `CreateTableInline.metadata`,
-`UpdateTableInline.full_metadata`) is decoded in the browser with `DecompressionStream('gzip')`:
+`UpdateTableInline.full_metadata`) is decoded in the browser with `DecompressionStream('gzip')`
+(and a view's inline metadata, `View`, `CreateView` and `UpdateView`'s `inline_metadata`, gzipped
+view JSON, gets **Show recovered JSON**):
 
 - **`CODEC_JSON_GZIP`**: gunzip, then the TableMetadata JSON, pretty-printed.
 - **`CODEC_STRUCTURAL`**: gunzip, then the layout's top level: its version
@@ -68,11 +70,12 @@ Nodes marked ⚠ (red) are explained in the detail pane:
 | 9 | `concurrent-creates-bound-at-replay` | four writers of one snapshot: replay binds their ids in log order; creates by name (`namespace_removals`, the default) of different names commit together, one by namespace (`namespace_version`) serializes on the parent's version |
 | 10 | `create-by-name-aba` | a namespace's `removals` in the checkpoint; a create by name whose name was taken and freed again before its record landed, rejected (S2) |
 | 11 | `rename-table-across-namespaces` | `RenameTable` (Action 11), and a stale update it rejects |
-| 12 | `inline-manifest-list` | an inline-ML table: the manifest pool, per-snapshot indices, `AddManifestDelta.position`; what a delta names by reference: manifests by UUID and number under the table's prefix, removals by index in the parent's list, the parent's summary entries, the delta's one new snapshot's id |
-| 13 | `compaction-with-committed-set-gc` | the committed-transaction set, its GC horizon and the unknown answer below it |
-| 14 | `concurrent-appends-merged` | `SetConflictEncoding` (manifest-window); two appends to one version, both committed: replay merges the second where it lands (re-parented, renumbered, its list on the first's) |
-| 15 | `concurrent-append-refused` | the same race with an expiry between: the second record names its expired parent by reference and is refused; its writer's retry commits |
-| 16 | `a-day-of-commits` | a structural-codec inline-ML table after 100 appends (merges every few), an expiry and a CAS write, measured against the metadata.json files and manifest lists Iceberg writes for the same history |
+| 12 | `views-inline-and-pointer` | views (docs/VIEWS.md): a `View` row in the checkpoint (`min_reader_version` 2), `CreateView` inline, a table create rejected on the view's name, an `UpdateView` that moves the view to a metadata file, `RenameView` |
+| 13 | `inline-manifest-list` | an inline-ML table: the manifest pool, per-snapshot indices, `AddManifestDelta.position`; what a delta names by reference: manifests by UUID and number under the table's prefix, removals by index in the parent's list, the parent's summary entries, the delta's one new snapshot's id |
+| 14 | `compaction-with-committed-set-gc` | the committed-transaction set, its GC horizon and the unknown answer below it |
+| 15 | `concurrent-appends-merged` | `SetConflictEncoding` (manifest-window); two appends to one version, both committed: replay merges the second where it lands (re-parented, renumbered, its list on the first's) |
+| 16 | `concurrent-append-refused` | the same race with an expiry between: the second record names its expired parent by reference and is refused; its writer's retry commits |
+| 17 | `a-day-of-commits` | a structural-codec inline-ML table after 100 appends (merges every few), an expiry and a CAS write, measured against the metadata.json files and manifest lists Iceberg writes for the same history |
 
 Each record's note says what it does and how replay treats it. Notes on the whole file appear
 under the scenario's description.

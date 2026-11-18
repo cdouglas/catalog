@@ -68,7 +68,7 @@ transactions ([Stage 2](#stage-2-views-in-catalog-transactions)).
   - Nothing in `ViewBuilder` would let it: the builder takes a schema, SQL text per dialect,
     defaults and properties, and the catalog does not parse SQL.
 
-## Decisions (proposed)
+## Decisions
 
 **V1. Views are their own kind under a namespace.**
 - A namespace has three kinds of children: child namespaces, with their own names; and tables
@@ -157,7 +157,7 @@ Views in catalog transactions are stage 2, below.
 
 ## Format
 
-catalog.proto, proposed:
+catalog.proto (as built; [SPEC.md](SPEC.md) "View Action Messages"):
 
 ```proto
 message Checkpoint {
@@ -235,8 +235,11 @@ message RenameView {
 - **Reader version.** A checkpoint that holds a view says `min_reader_version` 2. There are no
   users to keep compatible with, but an older reader should refuse a catalog with views rather
   than silently drop them.
-- **Invariant.** design.md gains one: no namespace holds a table and a view of one name.
+- **Invariant.** design.md I13: no namespace holds a table and a view of one name.
   `WellFormed` checks it after every apply.
+- **Next view id.** `next_view_id` is absent until the catalog's first view, and a checkpoint
+  without a view says `min_reader_version` 1: a catalog without views writes the bytes it wrote
+  before views.
 
 ## Sizes
 

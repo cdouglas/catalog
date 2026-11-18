@@ -82,7 +82,13 @@ public class ProtoCodec {
    * altered semantics on an existing field). New tags an old reader can
    * skip via {@code default → skipField} do not require a bump.
    */
-  public static final int SUPPORTED_READER_VERSION = 1;
+  public static final int SUPPORTED_READER_VERSION = 2;
+
+  /**
+   * The reader version a checkpoint that holds a view needs: a reader before views would drop
+   * them. A checkpoint without one says 1, the version before views, so its bytes are as they were.
+   */
+  static final int VIEWS_READER_VERSION = 2;
 
   // Wire types
 
@@ -102,10 +108,13 @@ public class ProtoCodec {
   /** The catalog's conflict encoding; absent until a record sets one. */
   private static final int CHECKPOINT_CONFLICT_ENCODING = 5;
   private static final int CHECKPOINT_SNAPSHOT_PAGING = 6;
+  /** The id replay binds the next view to; absent until the catalog's first view (then past 1). */
+  private static final int CHECKPOINT_NEXT_VIEW_ID = 7;
   static final int CHECKPOINT_NAMESPACES = 10;
   static final int CHECKPOINT_TABLES = 11;
   static final int CHECKPOINT_NAMESPACE_PROPERTIES = 12;
   static final int CHECKPOINT_INLINE_TABLES = 13;
+  static final int CHECKPOINT_VIEWS = 14;
 
   // CommittedTransactions field numbers (compressed UUIDv7 set).
   // Entries are interleaved (varint delta + 10 random bytes per entry,
@@ -126,6 +135,15 @@ public class ProtoCodec {
   private static final int TBL_NAME = 4;
   private static final int TBL_METADATA_LOCATION = 5;
   private static final int TBL_CONFLICT_STATE = 6;
+
+  // View field numbers
+  private static final int VIEW_ID = 1;
+  private static final int VIEW_VERSION = 2;
+  private static final int VIEW_NAMESPACE_ID = 3;
+  private static final int VIEW_NAME = 4;
+  private static final int VIEW_INLINE_METADATA = 5;
+  private static final int VIEW_METADATA_LOCATION = 6;
+  private static final int VIEW_CODEC = 7;
 
   // NamespaceProperty field numbers
   private static final int NSPROP_NAMESPACE_ID = 1;
@@ -207,6 +225,10 @@ public class ProtoCodec {
   private static final int ACTION_RENAME_TABLE = 11;
   private static final int ACTION_SET_CONFLICT_ENCODING = 12;
   private static final int ACTION_SET_SNAPSHOT_PAGING = 13;
+  private static final int ACTION_CREATE_VIEW = 14;
+  private static final int ACTION_UPDATE_VIEW = 15;
+  private static final int ACTION_DROP_VIEW = 16;
+  private static final int ACTION_RENAME_VIEW = 17;
 
   // CreateNamespace field numbers
   private static final int CREATE_NS_ID = 1;
@@ -308,6 +330,36 @@ public class ProtoCodec {
   private static final int RENAME_TBL_NEW_NAME = 5;
   private static final int RENAME_TBL_NEW_NS_REMOVALS = 6;
 
+  // CreateView field numbers
+  private static final int CREATE_VIEW_ID = 1;
+  private static final int CREATE_VIEW_VERSION = 2;
+  private static final int CREATE_VIEW_NS_ID = 3;
+  private static final int CREATE_VIEW_NS_VERSION = 4;
+  private static final int CREATE_VIEW_NS_REMOVALS = 5;
+  private static final int CREATE_VIEW_NAME = 6;
+  private static final int CREATE_VIEW_INLINE_METADATA = 7;
+  private static final int CREATE_VIEW_METADATA_LOCATION = 8;
+  private static final int CREATE_VIEW_CODEC = 9;
+
+  // UpdateView field numbers
+  private static final int UPDATE_VIEW_ID = 1;
+  private static final int UPDATE_VIEW_VERSION = 2;
+  private static final int UPDATE_VIEW_INLINE_METADATA = 3;
+  private static final int UPDATE_VIEW_METADATA_LOCATION = 4;
+  private static final int UPDATE_VIEW_CODEC = 5;
+
+  // DropView field numbers
+  private static final int DROP_VIEW_ID = 1;
+  private static final int DROP_VIEW_VERSION = 2;
+
+  // RenameView field numbers
+  private static final int RENAME_VIEW_ID = 1;
+  private static final int RENAME_VIEW_VERSION = 2;
+  private static final int RENAME_VIEW_NEW_NS_ID = 3;
+  private static final int RENAME_VIEW_NEW_NS_VERSION = 4;
+  private static final int RENAME_VIEW_NEW_NAME = 5;
+  private static final int RENAME_VIEW_NEW_NS_REMOVALS = 6;
+
   // SetConflictEncoding field numbers
   private static final int SET_CONFLICT_ENCODING_NAME = 1;
 
@@ -344,12 +396,16 @@ public class ProtoCodec {
 
       // Stamp first so the reader fails fast on a version mismatch before
       // chewing through the rest of the payload.
-      writeVarint(out, CHECKPOINT_MIN_READER_VERSION, SUPPORTED_READER_VERSION);
+      writeVarint(out, CHECKPOINT_MIN_READER_VERSION,
+          original.viewById().isEmpty() ? 1 : VIEWS_READER_VERSION);
 
       // Next IDs: the state's. Replay allocates the ids of the records that follow this
       // checkpoint.
       writeVarint(out, CHECKPOINT_NEXT_NAMESPACE_ID, original.nextNamespaceId());
       writeVarint(out, CHECKPOINT_NEXT_TABLE_ID, original.nextTableId());
+      if (original.nextViewId() > 1) {
+        writeVarint(out, CHECKPOINT_NEXT_VIEW_ID, original.nextViewId());
+      }
       if (original.conflictEncodingName() != null) {
         writeString(out, CHECKPOINT_CONFLICT_ENCODING, original.conflictEncodingName());
       }
@@ -416,6 +472,12 @@ public class ProtoCodec {
         }
       }
 
+      // Views, pointer and inline alike, each whole
+      for (Map.Entry<Integer, CatalogState.ViewEntry> entry :
+          sorted(original.viewById()).entrySet()) {
+        writeLengthDelimited(out, CHECKPOINT_VIEWS, encodeView(entry.getKey(), entry.getValue()));
+      }
+
       return out.toByteArray();
     } catch (IOException e) {
       throw new UncheckedIOException(e);
@@ -452,6 +514,8 @@ public class ProtoCodec {
       Map<Integer, byte[]> conflictStates = new HashMap<>();
       // Each inline table's bytes, for the memo
       Map<Integer, byte[]> inlineTables = memo != null ? new HashMap<>() : null;
+      // A view names its namespace, whose row may come after it: added once all are read
+      List<byte[]> views = new ArrayList<>();
       while (in.available() > 0) {
         int tag = readVarint(in);
         int fieldNumber = tag >>> 3;
@@ -475,6 +539,9 @@ public class ProtoCodec {
             break;
           case CHECKPOINT_NEXT_TABLE_ID:
             builder.setNextTableId(readVarint(in));
+            break;
+          case CHECKPOINT_NEXT_VIEW_ID:
+            builder.setNextViewId(readVarint(in));
             break;
           case CHECKPOINT_CONFLICT_ENCODING:
             builder.setConflictEncoding(readString(in));
@@ -500,6 +567,9 @@ public class ProtoCodec {
               inlineTables.put(inlineId, inlineTable);
             }
             break;
+          case CHECKPOINT_VIEWS:
+            views.add(readLengthDelimitedBytes(in));
+            break;
           default:
             skipField(in, wireType);
         }
@@ -510,6 +580,9 @@ public class ProtoCodec {
       // Fails for an encoding this build does not know: its replay would differ.
       EncodingState.Codec stateCodec = builder.conflictEncoding().stateCodec();
       conflictStates.forEach((id, bytes) -> builder.setConflictState(id, stateCodec.decode(bytes)));
+      for (byte[] view : views) {
+        decodeView(view, builder);
+      }
       // Rebuild lookups after all entries are loaded (handles out-of-order decoding)
       builder.rebuildLookups();
       if (inlineTables != null) {
@@ -616,6 +689,89 @@ public class ProtoCodec {
     if (conflictState != null) {
       conflictStates.put(id, conflictState);
     }
+  }
+
+  private static byte[] encodeView(int id, CatalogState.ViewEntry entry) throws IOException {
+    ByteArrayOutputStream out = new BytesOut();
+    writeVarint(out, VIEW_ID, id);
+    writeVarint(out, VIEW_VERSION, entry.version);
+    writeVarint(out, VIEW_NAMESPACE_ID, entry.namespaceId);
+    writeString(out, VIEW_NAME, entry.name);
+    writeViewMetadata(
+        out, entry.metadata(), VIEW_INLINE_METADATA, VIEW_METADATA_LOCATION, VIEW_CODEC);
+    return out.toByteArray();
+  }
+
+  /**
+   * Writes a view's metadata, the oneof of its inline bytes and its file's location, and with
+   * inline bytes their codec, written even when 0 (as an inline table's).
+   */
+  private static void writeViewMetadata(
+      ByteArrayOutputStream out, CatalogState.ViewMetadataRef metadata, int inlineField,
+      int locationField, int codecField) throws IOException {
+    if (metadata.inline() != null) {
+      writeBytes(out, inlineField, metadata.inline());
+      writeVarint(out, codecField, metadata.codec() & 0xFF);
+    } else if (metadata.location() != null) {
+      writeString(out, locationField, metadata.location());
+    }
+  }
+
+  /**
+   * A view's metadata as decoded: inline bytes require their codec, as an inline table's do. With
+   * both cases of the oneof present, the last one read is the field's (protobuf's rule).
+   */
+  private static CatalogState.ViewMetadataRef viewMetadata(
+      byte[] inline, String location, Byte codec, String what) {
+    if (inline != null) {
+      Preconditions.checkState(codec != null, "%s missing required codec tag", what);
+      return CatalogState.ViewMetadataRef.inline(inline, codec);
+    }
+    return new CatalogState.ViewMetadataRef(location, null, InlineMetadataCodecs.TAG_JSON_GZIP);
+  }
+
+  private static void decodeView(byte[] bytes, CatalogState.Builder builder) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    int id = 0, version = 0, nsId = 0;
+    String name = "";
+    byte[] inline = null;
+    String location = null;
+    Byte codec = null;
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      switch (tag >>> 3) {
+        case VIEW_ID:
+          id = readVarint(in);
+          break;
+        case VIEW_VERSION:
+          version = readVarint(in);
+          break;
+        case VIEW_NAMESPACE_ID:
+          nsId = readVarint(in);
+          break;
+        case VIEW_NAME:
+          name = readString(in);
+          break;
+        case VIEW_INLINE_METADATA:
+          inline = readLengthDelimitedBytes(in);
+          location = null;
+          break;
+        case VIEW_METADATA_LOCATION:
+          location = readString(in);
+          inline = null;
+          break;
+        case VIEW_CODEC:
+          codec = (byte) readVarint(in);
+          break;
+        default:
+          skipField(in, tag & 0x7);
+      }
+    }
+    CatalogState.ViewMetadataRef metadata = viewMetadata(inline, location, codec, "View " + id);
+    Preconditions.checkState(
+        metadata.wellFormed(), "View %s has no metadata, or inline metadata of codec %s", id,
+        metadata.codec());
+    builder.addView(id, nsId, name, version, metadata);
   }
 
   private static byte[] encodeNamespaceProperty(int nsId, String key, String value) throws IOException {
@@ -1304,6 +1460,48 @@ public class ProtoCodec {
       ByteArrayOutputStream inner = new BytesOut();
       writeLengthDelimited(inner, SET_SNAPSHOT_PAGING_PAGING, encodeSnapshotPaging(a.block, a.window));
       writeLengthDelimited(out, ACTION_SET_SNAPSHOT_PAGING, inner.toByteArray());
+    } else if (action instanceof CreateViewAction) {
+      CreateViewAction a = (CreateViewAction) action;
+      ByteArrayOutputStream inner = new BytesOut();
+      writeVarint(inner, CREATE_VIEW_ID, a.id);
+      writeVarint(inner, CREATE_VIEW_VERSION, a.version);
+      writeVarint(inner, CREATE_VIEW_NS_ID, a.namespaceId);
+      if (a.byName) {
+        writeVarint(inner, CREATE_VIEW_NS_REMOVALS, a.namespaceRead);
+      } else {
+        writeVarint(inner, CREATE_VIEW_NS_VERSION, a.namespaceRead);
+      }
+      writeString(inner, CREATE_VIEW_NAME, a.name);
+      writeViewMetadata(inner, a.metadata, CREATE_VIEW_INLINE_METADATA,
+          CREATE_VIEW_METADATA_LOCATION, CREATE_VIEW_CODEC);
+      writeLengthDelimited(out, ACTION_CREATE_VIEW, inner.toByteArray());
+    } else if (action instanceof UpdateViewAction) {
+      UpdateViewAction a = (UpdateViewAction) action;
+      ByteArrayOutputStream inner = new BytesOut();
+      writeVarint(inner, UPDATE_VIEW_ID, a.id);
+      writeVarint(inner, UPDATE_VIEW_VERSION, a.version);
+      writeViewMetadata(inner, a.metadata, UPDATE_VIEW_INLINE_METADATA,
+          UPDATE_VIEW_METADATA_LOCATION, UPDATE_VIEW_CODEC);
+      writeLengthDelimited(out, ACTION_UPDATE_VIEW, inner.toByteArray());
+    } else if (action instanceof DropViewAction) {
+      DropViewAction a = (DropViewAction) action;
+      ByteArrayOutputStream inner = new BytesOut();
+      writeVarint(inner, DROP_VIEW_ID, a.id);
+      writeVarint(inner, DROP_VIEW_VERSION, a.version);
+      writeLengthDelimited(out, ACTION_DROP_VIEW, inner.toByteArray());
+    } else if (action instanceof RenameViewAction) {
+      RenameViewAction a = (RenameViewAction) action;
+      ByteArrayOutputStream inner = new BytesOut();
+      writeVarint(inner, RENAME_VIEW_ID, a.id);
+      writeVarint(inner, RENAME_VIEW_VERSION, a.version);
+      writeVarint(inner, RENAME_VIEW_NEW_NS_ID, a.newNamespaceId);
+      if (a.byName) {
+        writeVarint(inner, RENAME_VIEW_NEW_NS_REMOVALS, a.newNamespaceRead);
+      } else {
+        writeVarint(inner, RENAME_VIEW_NEW_NS_VERSION, a.newNamespaceRead);
+      }
+      writeString(inner, RENAME_VIEW_NEW_NAME, a.newName);
+      writeLengthDelimited(out, ACTION_RENAME_VIEW, inner.toByteArray());
     }
     return out.toByteArray();
   }
@@ -1383,9 +1581,155 @@ public class ProtoCodec {
         return decodeSetConflictEncoding(actionBytes);
       case ACTION_SET_SNAPSHOT_PAGING:
         return decodeSetSnapshotPaging(actionBytes);
+      case ACTION_CREATE_VIEW:
+        return decodeCreateView(actionBytes);
+      case ACTION_UPDATE_VIEW:
+        return decodeUpdateView(actionBytes);
+      case ACTION_DROP_VIEW:
+        return decodeDropView(actionBytes);
+      case ACTION_RENAME_VIEW:
+        return decodeRenameView(actionBytes);
       default:
         return new UnknownAction(actionType, actionBytes);
     }
+  }
+
+  private static CreateViewAction decodeCreateView(byte[] bytes) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    int id = 0, version = 0, nsId = 0, nsRead = 0;
+    boolean byName = false; // the oneof's last member read; neither: a version of 0
+    String name = "";
+    byte[] inline = null;
+    String location = null;
+    Byte codec = null;
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      switch (tag >>> 3) {
+        case CREATE_VIEW_ID:
+          id = readVarint(in);
+          break;
+        case CREATE_VIEW_VERSION:
+          version = readVarint(in);
+          break;
+        case CREATE_VIEW_NS_ID:
+          nsId = readVarint(in);
+          break;
+        case CREATE_VIEW_NS_VERSION:
+          nsRead = readVarint(in);
+          byName = false;
+          break;
+        case CREATE_VIEW_NS_REMOVALS:
+          nsRead = readVarint(in);
+          byName = true;
+          break;
+        case CREATE_VIEW_NAME:
+          name = readString(in);
+          break;
+        case CREATE_VIEW_INLINE_METADATA:
+          inline = readLengthDelimitedBytes(in);
+          location = null;
+          break;
+        case CREATE_VIEW_METADATA_LOCATION:
+          location = readString(in);
+          inline = null;
+          break;
+        case CREATE_VIEW_CODEC:
+          codec = (byte) readVarint(in);
+          break;
+        default:
+          skipField(in, tag & 0x7);
+      }
+    }
+    return new CreateViewAction(id, version, nsId, byName, nsRead, name,
+        viewMetadata(inline, location, codec, "CreateView action (view " + id + ")"));
+  }
+
+  private static UpdateViewAction decodeUpdateView(byte[] bytes) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    int id = 0, version = 0;
+    byte[] inline = null;
+    String location = null;
+    Byte codec = null;
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      switch (tag >>> 3) {
+        case UPDATE_VIEW_ID:
+          id = readVarint(in);
+          break;
+        case UPDATE_VIEW_VERSION:
+          version = readVarint(in);
+          break;
+        case UPDATE_VIEW_INLINE_METADATA:
+          inline = readLengthDelimitedBytes(in);
+          location = null;
+          break;
+        case UPDATE_VIEW_METADATA_LOCATION:
+          location = readString(in);
+          inline = null;
+          break;
+        case UPDATE_VIEW_CODEC:
+          codec = (byte) readVarint(in);
+          break;
+        default:
+          skipField(in, tag & 0x7);
+      }
+    }
+    return new UpdateViewAction(
+        id, version, viewMetadata(inline, location, codec, "UpdateView action (view " + id + ")"));
+  }
+
+  private static DropViewAction decodeDropView(byte[] bytes) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    int id = 0, version = 0;
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      switch (tag >>> 3) {
+        case DROP_VIEW_ID:
+          id = readVarint(in);
+          break;
+        case DROP_VIEW_VERSION:
+          version = readVarint(in);
+          break;
+        default:
+          skipField(in, tag & 0x7);
+      }
+    }
+    return new DropViewAction(id, version);
+  }
+
+  private static RenameViewAction decodeRenameView(byte[] bytes) throws IOException {
+    ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+    int id = 0, version = 0, newNsId = 0, newNsRead = 0;
+    boolean byName = false;
+    String newName = "";
+    while (in.available() > 0) {
+      int tag = readVarint(in);
+      switch (tag >>> 3) {
+        case RENAME_VIEW_ID:
+          id = readVarint(in);
+          break;
+        case RENAME_VIEW_VERSION:
+          version = readVarint(in);
+          break;
+        case RENAME_VIEW_NEW_NS_ID:
+          newNsId = readVarint(in);
+          break;
+        case RENAME_VIEW_NEW_NS_VERSION:
+          newNsRead = readVarint(in);
+          byName = false;
+          break;
+        case RENAME_VIEW_NEW_NS_REMOVALS:
+          newNsRead = readVarint(in);
+          byName = true;
+          break;
+        case RENAME_VIEW_NEW_NAME:
+          newName = readString(in);
+          break;
+        default:
+          skipField(in, tag & 0x7);
+      }
+    }
+    return new RenameViewAction(id, version, newNsId, byName, newNsRead, newName);
   }
 
   private static CreateNamespaceAction decodeCreateNamespace(byte[] bytes) throws IOException {
@@ -2321,7 +2665,7 @@ public class ProtoCodec {
     }
 
     /**
-     * Whether no action references a namespace or table that another action of
+     * Whether no action references a namespace, table or view that another action of
      * this transaction drops. Every action verifies against the state before
      * the transaction, so such a record would pass verify and then apply to an
      * inconsistent state (a namespace or table whose parent is gone) that no
@@ -2330,20 +2674,36 @@ public class ProtoCodec {
     private static boolean selfConsistent(List<Action> actions) {
       Set<Integer> droppedNamespaces = new HashSet<>();
       Set<Integer> droppedTables = new HashSet<>();
+      Set<Integer> droppedViews = new HashSet<>();
       for (Action action : actions) {
         if (action instanceof DropNamespaceAction) {
           droppedNamespaces.add(((DropNamespaceAction) action).id);
         } else if (action instanceof DropTableAction) {
           droppedTables.add(((DropTableAction) action).id);
+        } else if (action instanceof DropViewAction) {
+          droppedViews.add(((DropViewAction) action).id);
         }
       }
-      if (droppedNamespaces.isEmpty() && droppedTables.isEmpty()) {
+      if (droppedNamespaces.isEmpty() && droppedTables.isEmpty() && droppedViews.isEmpty()) {
         return true;
       }
       for (Action action : actions) {
+        if (action instanceof UpdateViewAction
+            && droppedViews.contains(((UpdateViewAction) action).id)) {
+          return false;
+        } else if (action instanceof RenameViewAction
+            && droppedViews.contains(((RenameViewAction) action).id)) {
+          return false;
+        }
         final int namespace;
         final int table;
-        if (action instanceof CreateNamespaceAction) {
+        if (action instanceof CreateViewAction) {
+          namespace = ((CreateViewAction) action).namespaceId;
+          table = -1;
+        } else if (action instanceof RenameViewAction) {
+          namespace = ((RenameViewAction) action).newNamespaceId;
+          table = -1;
+        } else if (action instanceof CreateNamespaceAction) {
           namespace = ((CreateNamespaceAction) action).parentId;
           table = -1;
         } else if (action instanceof SetNamespacePropertyAction) {
@@ -2408,13 +2768,16 @@ public class ProtoCodec {
     private final CatalogState.Builder builder;
     private final Map<Integer, Integer> namespaces = new HashMap<>();
     private final Map<Integer, Integer> tables = new HashMap<>();
+    private final Map<Integer, Integer> views = new HashMap<>();
     private int nextNamespaceId;
     private int nextTableId;
+    private int nextViewId;
 
     IdBinding(CatalogState.Builder builder) {
       this.builder = builder;
       this.nextNamespaceId = builder.nextNamespaceId();
       this.nextTableId = builder.nextTableId();
+      this.nextViewId = builder.nextViewId();
     }
 
     /**
@@ -2446,6 +2809,17 @@ public class ProtoCodec {
       int real = Math.max(nextTableId, builder.nextTableId());
       nextTableId = real + 1;
       bind(tables, id, real);
+      return real;
+    }
+
+    /** Binds a view id at its defining create, which must be late-bound (as a table's). */
+    int defineView(int id) {
+      if (id >= 0) {
+        throw new IllegalStateException("A create names a concrete view id: " + id);
+      }
+      int real = Math.max(nextViewId, builder.nextViewId());
+      nextViewId = real + 1;
+      bind(views, id, real);
       return real;
     }
 
@@ -2490,10 +2864,10 @@ public class ProtoCodec {
   }
 
   /**
-   * Why an action that binds {@code name} in namespace {@code nsId} (a table's name, or with
-   * {@code table} false a child namespace's) does not hold on {@code builder}, by the condition
-   * its writer sent (catalog.proto's oneof of the two, {@code fileio.catalog.create.condition}),
-   * or null if it holds:
+   * Why an action that binds {@code name} in namespace {@code nsId} (a table's or a view's name,
+   * which share one set of names, or with {@code table} false a child namespace's) does not hold
+   * on {@code builder}, by the condition its writer sent (catalog.proto's oneof of the two, {@code
+   * fileio.catalog.create.condition}), or null if it holds:
    *
    * <ul>
    *   <li>by the namespace's version ({@code byName} false): the namespace is at {@code read}, the
@@ -2522,7 +2896,7 @@ public class ProtoCodec {
     if (builder.namespaceRemovals(nsId) != read) {
       return "name: a name freed since";
     }
-    if (table ? builder.tableNameTaken(nsId, name) : builder.namespaceNameTaken(nsId, name)) {
+    if (table ? builder.entityNameTaken(nsId, name) : builder.namespaceNameTaken(nsId, name)) {
       return "name: taken";
     }
     return null;
@@ -3503,6 +3877,191 @@ public class ProtoCodec {
       // destination ns's children set (table arrived). Bump both, exactly like
       // DropTable + CreateTable would have, and count the name it frees in the
       // source, even when the destination is the same namespace.
+      builder.bumpNamespaceVersion(oldNsId);
+      builder.bumpNamespaceRemovals(oldNsId);
+      if (newNamespaceId != oldNsId) {
+        builder.bumpNamespaceVersion(newNamespaceId);
+      }
+    }
+  }
+
+  /**
+   * Creates a view in {@code namespaceId} with its whole metadata (a file's location, or inline),
+   * by the condition its writer sent ({@link #bindingProblem}): the namespace's version as read, or
+   * its removals as read and the name free of tables and views alike (docs/VIEWS.md V7). Apply
+   * bumps the namespace's version, so a drop of it staged on a read without the view fails (V8).
+   */
+  public static class CreateViewAction implements Action {
+    final int id;
+    final int version;
+    final int namespaceId;
+    /** By name: the namespace's removals as read; else its version. -1: late-bound. */
+    final boolean byName;
+    final int namespaceRead;
+    final String name;
+    final CatalogState.ViewMetadataRef metadata;
+
+    public CreateViewAction(int id, int version, int namespaceId, boolean byName,
+        int namespaceRead, String name, CatalogState.ViewMetadataRef metadata) {
+      this.id = id;
+      this.version = version;
+      this.namespaceId = namespaceId;
+      this.byName = byName;
+      this.namespaceRead = namespaceRead;
+      this.name = name;
+      this.metadata = metadata;
+    }
+
+    @Override
+    public boolean verify(CatalogState.Builder builder) {
+      return metadata.wellFormed()
+          && bindingProblem(builder, namespaceId, byName, namespaceRead, true, name) == null;
+    }
+
+    @Override
+    public String explain(CatalogState.Builder builder) {
+      if (!metadata.wellFormed()) {
+        return "view: malformed metadata";
+      }
+      String problem = byName
+          ? bindingProblem(builder, namespaceId, true, namespaceRead, true, name) : null;
+      return problem != null ? problem : Action.super.explain(builder);
+    }
+
+    @Override
+    public Action bind(IdBinding ids) {
+      int boundNamespaceId = ids.namespace(namespaceId);
+      return new CreateViewAction(ids.defineView(id), version, boundNamespaceId, byName,
+          namespaceRead, name, metadata);
+    }
+
+    @Override
+    public void apply(CatalogState.Builder builder) {
+      builder.addView(id, namespaceId, name, version, metadata);
+      // As a table create: the namespace's children changed
+      builder.bumpNamespaceVersion(namespaceId);
+    }
+  }
+
+  /**
+   * Sets a view's whole next metadata (a replace, a property change, a location change), a file's
+   * location or inline, so the view may change form on any commit (docs/VIEWS.md V2). It applies
+   * only on the version its writer read, under every conflict encoding (V6).
+   */
+  public static class UpdateViewAction implements Action {
+    final int id;
+    final int version;
+    final CatalogState.ViewMetadataRef metadata;
+
+    public UpdateViewAction(int id, int version, CatalogState.ViewMetadataRef metadata) {
+      this.id = id;
+      this.version = version;
+      this.metadata = metadata;
+    }
+
+    @Override
+    public boolean verify(CatalogState.Builder builder) {
+      return metadata.wellFormed() && builder.viewVersion(id) == version;
+    }
+
+    @Override
+    public String explain(CatalogState.Builder builder) {
+      return !metadata.wellFormed() ? "view: malformed metadata" : "view: version";
+    }
+
+    @Override
+    public void apply(CatalogState.Builder builder) {
+      builder.updateView(id, version + 1, metadata);
+    }
+  }
+
+  /**
+   * Drops a view at the version its writer read. Apply bumps its namespace's version and counts
+   * the name it frees there (its removals), as a table's drop does, so a create of the name by
+   * name that failed while the view held it stays failed (S2).
+   */
+  public static class DropViewAction implements Action {
+    final int id;
+    final int version;
+
+    public DropViewAction(int id, int version) {
+      this.id = id;
+      this.version = version;
+    }
+
+    @Override
+    public boolean verify(CatalogState.Builder builder) {
+      return builder.viewVersion(id) == version;
+    }
+
+    @Override
+    public String explain(CatalogState.Builder builder) {
+      return "view: version";
+    }
+
+    @Override
+    public void apply(CatalogState.Builder builder) {
+      CatalogState.ViewEntry entry = builder.viewEntry(id);
+      int nsId = entry != null ? entry.namespaceId : 0;
+      builder.removeView(id);
+      builder.bumpNamespaceVersion(nsId);
+      builder.bumpNamespaceRemovals(nsId);
+    }
+  }
+
+  /**
+   * Moves a view to a new name, in its namespace or another, as {@link RenameTableAction} moves a
+   * table: the view at the version read, and its new name bound as a create's ({@link
+   * #bindingProblem}), across tables and views. Apply bumps the view's version, both namespaces'
+   * versions, and the removals of the namespace it leaves.
+   */
+  public static class RenameViewAction implements Action {
+    final int id;
+    final int version;
+    final int newNamespaceId;
+    /** By name: the destination's removals as read; else its version. -1: late-bound. */
+    final boolean byName;
+    final int newNamespaceRead;
+    final String newName;
+
+    public RenameViewAction(int id, int version, int newNamespaceId, boolean byName,
+        int newNamespaceRead, String newName) {
+      this.id = id;
+      this.version = version;
+      this.newNamespaceId = newNamespaceId;
+      this.byName = byName;
+      this.newNamespaceRead = newNamespaceRead;
+      this.newName = newName;
+    }
+
+    @Override
+    public boolean verify(CatalogState.Builder builder) {
+      return builder.viewVersion(id) == version
+          && bindingProblem(builder, newNamespaceId, byName, newNamespaceRead, true, newName)
+              == null;
+    }
+
+    @Override
+    public String explain(CatalogState.Builder builder) {
+      if (builder.viewVersion(id) != version) {
+        return "view: version";
+      }
+      String problem = byName
+          ? bindingProblem(builder, newNamespaceId, true, newNamespaceRead, true, newName) : null;
+      return problem != null ? problem : Action.super.explain(builder);
+    }
+
+    @Override
+    public Action bind(IdBinding ids) {
+      return new RenameViewAction(
+          id, version, ids.namespace(newNamespaceId), byName, newNamespaceRead, newName);
+    }
+
+    @Override
+    public void apply(CatalogState.Builder builder) {
+      CatalogState.ViewEntry old = builder.viewEntry(id);
+      int oldNsId = old != null ? old.namespaceId : 0;
+      builder.renameView(id, newNamespaceId, newName, version + 1);
       builder.bumpNamespaceVersion(oldNsId);
       builder.bumpNamespaceRemovals(oldNsId);
       if (newNamespaceId != oldNsId) {

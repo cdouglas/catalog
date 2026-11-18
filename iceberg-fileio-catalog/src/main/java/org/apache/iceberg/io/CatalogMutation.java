@@ -34,6 +34,7 @@ import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
+import org.apache.iceberg.exceptions.NoSuchViewException;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
@@ -41,8 +42,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.intentlog.Replica;
 
 /**
- * A transaction on the catalog, staged on a read of its log ({@link #base}): namespaces and
- * tables created, dropped, updated or renamed, namespace properties set, and the tables it read.
+ * A transaction on the catalog, staged on a read of its log ({@link #base}): namespaces, tables
+ * and views created, dropped, updated or renamed, namespace properties set, and the tables it read.
  * Each change is checked against the base as it is staged. Its {@link #intention} names the
  * version of each namespace and table it depends on, and what each name it binds (a create, a
  * rename's new name) requires of its namespace ({@link CreateCondition}); a commit ({@link
@@ -138,6 +139,14 @@ public class CatalogMutation {
   private final Map<TableIdentifier, Eviction> evictions;
   // The files the evictions so far wrote, each with the eviction that deletes them
   private final List<Map.Entry<Eviction, List<String>>> evicted;
+  // Views created, updated (each with its whole metadata), dropped and renamed (docs/VIEWS.md).
+  // A view's identifier is never a table's, so these never share a key with the tables' maps.
+  private final Map<TableIdentifier, CatalogState.ViewMetadataRef> viewCreates;
+  private final Map<TableIdentifier, CatalogState.ViewMetadataRef> viewUpdates;
+  private final Set<TableIdentifier> viewDrops;
+  private final Map<TableIdentifier, TableIdentifier> viewRenames;
+  // How each inline view create or update staged here goes to a metadata file instead (evict)
+  private final Map<TableIdentifier, Eviction> viewEvictions;
   // The files written ahead of this transaction's record for the changes staged on it (a metadata
   // file and its lists, a dropped table's version), which nothing names unless the record lands;
   // written by the worker pool's threads too
@@ -179,6 +188,11 @@ public class CatalogMutation {
     this.deltaBases = Maps.newHashMap();
     this.evictions = Maps.newHashMap();
     this.evicted = new ArrayList<>();
+    this.viewCreates = Maps.newHashMap();
+    this.viewUpdates = Maps.newHashMap();
+    this.viewDrops = Sets.newHashSet();
+    this.viewRenames = Maps.newHashMap();
+    this.viewEvictions = Maps.newHashMap();
   }
 
   /** The read of the log this transaction is staged on, and commits on top of. */
@@ -312,7 +326,19 @@ public class CatalogMutation {
             && tableRenames.values().stream()
                 .map(TableIdentifier::namespace)
                 .noneMatch(ns -> ns.equals(namespace));
-    if (!noNsChild || !noTblChild) {
+    // a view is a child too (docs/VIEWS.md V8), unless this transaction drops or renames it out
+    final boolean noViewChild =
+        original.views().stream()
+                .filter(view -> !viewDrops.contains(view) && !viewRenames.containsKey(view))
+                .map(TableIdentifier::namespace)
+                .noneMatch(ns -> ns.equals(namespace))
+            && viewCreates.keySet().stream()
+                .map(TableIdentifier::namespace)
+                .noneMatch(ns -> ns.equals(namespace))
+            && viewRenames.values().stream()
+                .map(TableIdentifier::namespace)
+                .noneMatch(ns -> ns.equals(namespace));
+    if (!noNsChild || !noTblChild || !noViewChild) {
       throw new NamespaceNotEmptyException("Namespace %s is not empty", namespace);
     }
     namespaces.put(namespace, false);
@@ -329,6 +355,7 @@ public class CatalogMutation {
         || inlineTables.get(table) != null || tableRenames.containsValue(table)) {
       throw new AlreadyExistsException("Table already exists: %s", table);
     }
+    checkNoView(table);
     tables.put(table, location);
     return this;
   }
@@ -410,6 +437,9 @@ public class CatalogMutation {
     if (holds(to)) {
       throw new AlreadyExistsException("Table already exists: %s", to);
     }
+    if (viewHolds(to)) {
+      throw new AlreadyExistsException("Cannot rename %s to %s. View already exists", from, to);
+    }
     tableRenames.put(from, to);
     return this;
   }
@@ -430,6 +460,111 @@ public class CatalogMutation {
     return original.containsTable(name)
         && ((tables.containsKey(name) && tables.get(name) == null)
             || tableRenames.containsKey(name));
+  }
+
+  // ============================================================
+  // Views (docs/VIEWS.md)
+  // ============================================================
+
+  /**
+   * Creates a view with its whole metadata: a metadata file's location, or the metadata inline
+   * ({@link CatalogState.ViewMetadataRef}). Its name must be free of tables and views alike.
+   */
+  public CatalogMutation createView(TableIdentifier view, CatalogState.ViewMetadataRef metadata) {
+    Preconditions.checkArgument(metadata.wellFormed(), "Malformed view metadata for %s", view);
+    if (checkNamespaceExists(view.namespace())) {
+      throw new NoSuchNamespaceException("Namespace does not exist: %s", view.namespace());
+    }
+    if (viewHolds(view)) {
+      throw new AlreadyExistsException("View already exists: %s", view);
+    }
+    if (tableHolds(view)) {
+      throw new AlreadyExistsException("Table with same name already exists: %s", view);
+    }
+    viewCreates.put(view, metadata);
+    return this;
+  }
+
+  /** Sets a view's whole next metadata, applied only on the version this transaction read. */
+  public CatalogMutation updateView(TableIdentifier view, CatalogState.ViewMetadataRef metadata) {
+    Preconditions.checkArgument(metadata.wellFormed(), "Malformed view metadata for %s", view);
+    if (viewCreates.containsKey(view)) {
+      // a view this transaction creates: its create carries the metadata
+      viewCreates.put(view, metadata);
+      return this;
+    }
+    checkViewExists(view);
+    viewUpdates.put(view, metadata);
+    return this;
+  }
+
+  public CatalogMutation dropView(TableIdentifier view) {
+    checkViewExists(view);
+    viewUpdates.remove(view);
+    viewEvictions.remove(view);
+    viewDrops.add(view);
+    return this;
+  }
+
+  public CatalogMutation renameView(TableIdentifier from, TableIdentifier to) {
+    Preconditions.checkNotNull(from, "Source view cannot be null");
+    Preconditions.checkNotNull(to, "Destination view cannot be null");
+    Preconditions.checkArgument(!from.equals(to), "Source and destination identifiers are equal");
+    checkViewExists(from);
+    if (checkNamespaceExists(to.namespace())) {
+      throw new NoSuchNamespaceException("Namespace does not exist: %s", to.namespace());
+    }
+    if (viewHolds(to)) {
+      throw new AlreadyExistsException("Cannot rename %s to %s. View already exists", from, to);
+    }
+    if (tableHolds(to)) {
+      throw new AlreadyExistsException("Cannot rename %s to %s. Table already exists", from, to);
+    }
+    viewRenames.put(from, to);
+    return this;
+  }
+
+  /**
+   * Makes {@code eviction} how the inline create or update of view {@code view} staged on this
+   * transaction goes to a metadata file, if the record must shrink to fit its log.
+   */
+  CatalogMutation viewEvictable(TableIdentifier view, Eviction eviction) {
+    viewEvictions.put(view, eviction);
+    return this;
+  }
+
+  /** Whether the transaction stages a view's create or update. */
+  boolean stagesView(TableIdentifier view) {
+    return viewCreates.containsKey(view) || viewUpdates.containsKey(view);
+  }
+
+  // Whether a view holds the name, so far as this transaction stages it: one in the read (even one
+  // it drops or renames out: a view's create or rename binds by name, which the state before the
+  // record holds, so a view takes no name its own record frees), one created, or one renamed in
+  private boolean viewHolds(TableIdentifier ident) {
+    return original.containsView(ident) || viewCreates.containsKey(ident)
+        || viewRenames.containsValue(ident);
+  }
+
+  // As viewHolds, for tables, a name the transaction frees included: a view takes no such name,
+  // where a table's rename may ({@link #holds}, Bug 124)
+  private boolean tableHolds(TableIdentifier ident) {
+    return original.containsTable(ident) || tables.get(ident) != null
+        || inlineTables.containsKey(ident) || tableRenames.containsValue(ident);
+  }
+
+  private void checkNoView(TableIdentifier table) {
+    if (viewHolds(table)) {
+      throw new AlreadyExistsException("View with same name already exists: %s", table);
+    }
+  }
+
+  // A view of the read, not dropped or renamed away by this transaction
+  private void checkViewExists(TableIdentifier view) {
+    if (!original.containsView(view) || viewDrops.contains(view)
+        || viewRenames.containsKey(view)) {
+      throw new NoSuchViewException("View does not exist: %s", view);
+    }
   }
 
   public CatalogMutation dropTable(TableIdentifier tableId) {
@@ -481,6 +616,7 @@ public class CatalogMutation {
         || inlineTables.get(table) != null || tableRenames.containsValue(table)) {
       throw new AlreadyExistsException("Table already exists: %s", table);
     }
+    checkNoView(table);
     inlineTables.put(table, metadata);
     inlineTableCodecs.put(table, codecTag);
     return this;
@@ -665,11 +801,34 @@ public class CatalogMutation {
    */
   boolean evictLargest() {
     evictions.keySet().removeIf(table -> !stagedInline(table));
+    viewEvictions.keySet().removeIf(view -> inlineViewBytes(view) == 0);
     TableIdentifier largest = null;
     for (TableIdentifier table : evictions.keySet()) {
       if (largest == null || evictsBefore(table, largest)) {
         largest = table;
       }
+    }
+    // A view's inline metadata goes first when it is larger: a view is never behind its read
+    TableIdentifier largestView = null;
+    for (TableIdentifier view : viewEvictions.keySet()) {
+      if (largestView == null || evictsBefore(inlineViewBytes(view), view,
+          inlineViewBytes(largestView), largestView)) {
+        largestView = view;
+      }
+    }
+    if (largestView != null && (largest == null || behindRead(largest)
+        || evictsBefore(inlineViewBytes(largestView), largestView, inlineBytes(largest), largest))) {
+      Eviction eviction = viewEvictions.remove(largestView);
+      List<String> written = new ArrayList<>();
+      CatalogState.ViewMetadataRef location =
+          CatalogState.ViewMetadataRef.location(eviction.write(written));
+      evicted.add(Map.entry(eviction, written));
+      if (viewCreates.containsKey(largestView)) {
+        viewCreates.put(largestView, location);
+      } else {
+        viewUpdates.put(largestView, location);
+      }
+      return true;
     }
     if (largest == null) {
       return false;
@@ -754,11 +913,22 @@ public class CatalogMutation {
     if (behind != behindRead(other)) {
       return !behind;
     }
-    long bytes = inlineBytes(table);
-    long otherBytes = inlineBytes(other);
+    return evictsBefore(inlineBytes(table), table, inlineBytes(other), other);
+  }
+
+  // The larger first, then by name
+  private static boolean evictsBefore(
+      long bytes, TableIdentifier ident, long otherBytes, TableIdentifier other) {
     return bytes != otherBytes
         ? bytes > otherBytes
-        : table.toString().compareTo(other.toString()) < 0;
+        : ident.toString().compareTo(other.toString()) < 0;
+  }
+
+  // The bytes a view's staged inline create or update holds; 0 if none is staged inline
+  private long inlineViewBytes(TableIdentifier view) {
+    CatalogState.ViewMetadataRef metadata = viewCreates.containsKey(view)
+        ? viewCreates.get(view) : viewUpdates.get(view);
+    return metadata != null && metadata.inline() != null ? metadata.inline().length : 0;
   }
 
   // A delta built on a version of the table older than this transaction's read
@@ -1048,6 +1218,47 @@ public class CatalogMutation {
           tblId, version, newNsId, byName, newNsVersion, to.name()));
     }
 
+    // Views: creates (late-bound ids of their own), updates, renames and drops, each on the
+    // version read
+    int nextLateViewId = -1;
+    for (Map.Entry<TableIdentifier, CatalogState.ViewMetadataRef> entry
+        : sortedByName(viewCreates).entrySet()) {
+      TableIdentifier ident = entry.getKey();
+      Integer nsId = original.namespaceId(ident.namespace());
+      int nsRead = -1;
+      if (nsId == null) {
+        nsId = nsIdMap.get(ident.namespace());
+      } else {
+        nsRead = bindingRead(nsId);
+      }
+      actions.add(new ProtoCodec.CreateViewAction(
+          nextLateViewId--, 1, nsId, byName(), nsRead, ident.name(), entry.getValue()));
+    }
+    for (Map.Entry<TableIdentifier, CatalogState.ViewMetadataRef> entry
+        : sortedByName(viewUpdates).entrySet()) {
+      int viewId = original.viewId(entry.getKey());
+      actions.add(new ProtoCodec.UpdateViewAction(
+          viewId, original.viewVersion(viewId), entry.getValue()));
+    }
+    for (Map.Entry<TableIdentifier, TableIdentifier> entry : sortedByName(viewRenames).entrySet()) {
+      int viewId = original.viewId(entry.getKey());
+      TableIdentifier to = entry.getValue();
+      Integer newNsId = original.namespaceId(to.namespace());
+      int newNsRead = -1;
+      if (newNsId == null) {
+        newNsId = nsIdMap.get(to.namespace());
+      } else {
+        newNsRead = bindingRead(newNsId);
+      }
+      actions.add(new ProtoCodec.RenameViewAction(
+          viewId, original.viewVersion(viewId), newNsId, byName(), newNsRead, to.name()));
+    }
+    for (TableIdentifier view : viewDrops.stream()
+        .sorted(Comparator.comparing(TableIdentifier::toString)).collect(Collectors.toList())) {
+      int viewId = original.viewId(view);
+      actions.add(new ProtoCodec.DropViewAction(viewId, original.viewVersion(viewId)));
+    }
+
     // Namespace drops last, children before parents: a namespace this transaction drops is empty
     // once its tables' drops and renames, and its children's drops, apply (dropNamespace)
     List<Namespace> dropped = namespaces.entrySet().stream()
@@ -1070,6 +1281,15 @@ public class CatalogMutation {
     return createCondition == CreateCondition.NAME;
   }
 
+  // In order of their identifiers, so that a transaction's record is a function of what it staged
+  private static <V> java.util.SortedMap<TableIdentifier, V> sortedByName(
+      Map<TableIdentifier, V> map) {
+    java.util.SortedMap<TableIdentifier, V> sorted =
+        new java.util.TreeMap<>(Comparator.comparing(TableIdentifier::toString));
+    sorted.putAll(map);
+    return sorted;
+  }
+
   /**
    * The most informative error for this transaction, if it does not hold on {@code state}, the
    * state it lost to: AlreadyExistsException if a pending create or rename destination now exists
@@ -1080,13 +1300,17 @@ public class CatalogMutation {
    */
   RuntimeException explain(CatalogState state, String message) {
     for (Map.Entry<TableIdentifier, String> e : tables.entrySet()) {
-      if (e.getValue() != null && state.containsTable(e.getKey())) {
-        return new AlreadyExistsException("Table already exists: %s", e.getKey());
+      if (e.getValue() != null) {
+        RuntimeException taken = tableNameTaken(state, e.getKey());
+        if (taken != null) {
+          return taken;
+        }
       }
     }
-    for (Map.Entry<TableIdentifier, byte[]> e : inlineTables.entrySet()) {
-      if (state.containsTable(e.getKey())) {
-        return new AlreadyExistsException("Table already exists: %s", e.getKey());
+    for (TableIdentifier table : inlineTables.keySet()) {
+      RuntimeException taken = tableNameTaken(state, table);
+      if (taken != null) {
+        return taken;
       }
     }
     for (Map.Entry<TableIdentifier, TableIdentifier> rename : tableRenames.entrySet()) {
@@ -1099,8 +1323,44 @@ public class CatalogMutation {
           && !(frees(to) && java.util.Objects.equals(state.tableId(to), original.tableId(to)))) {
         return new AlreadyExistsException("Table already exists: %s", to);
       }
+      if (state.containsView(rename.getValue())) {
+        return new AlreadyExistsException(
+            "Cannot rename %s to %s. View already exists", rename.getKey(), rename.getValue());
+      }
+    }
+    for (TableIdentifier view : viewCreates.keySet()) {
+      if (state.containsView(view)) {
+        return new AlreadyExistsException("View already exists: %s", view);
+      }
+      if (state.containsTable(view)) {
+        return new AlreadyExistsException("Table with same name already exists: %s", view);
+      }
+    }
+    for (Map.Entry<TableIdentifier, TableIdentifier> rename : viewRenames.entrySet()) {
+      if (!state.containsView(rename.getKey())) {
+        return new NoSuchViewException("View does not exist: %s", rename.getKey());
+      }
+      if (state.containsView(rename.getValue())) {
+        return new AlreadyExistsException(
+            "Cannot rename %s to %s. View already exists", rename.getKey(), rename.getValue());
+      }
+      if (state.containsTable(rename.getValue())) {
+        return new AlreadyExistsException(
+            "Cannot rename %s to %s. Table already exists", rename.getKey(), rename.getValue());
+      }
     }
     return new CommitFailedException("%s", message);
+  }
+
+  // Why a table create of the name fails on state, if a table or a view holds it
+  private static RuntimeException tableNameTaken(CatalogState state, TableIdentifier table) {
+    if (state.containsTable(table)) {
+      return new AlreadyExistsException("Table already exists: %s", table);
+    }
+    if (state.containsView(table)) {
+      return new AlreadyExistsException("View with same name already exists: %s", table);
+    }
+    return null;
   }
 
   /**

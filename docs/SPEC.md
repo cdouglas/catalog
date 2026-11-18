@@ -66,8 +66,9 @@ message Checkpoint {
   // Replay binds a transaction's late-bound ids to these, in log order.
   int32  next_namespace_id         = 2;
   int32  next_table_id             = 3;
-  // The reader version this checkpoint needs (ProtoCodec
-  // SUPPORTED_READER_VERSION, now 1). Written first; required.
+  int32  next_view_id              = 7;   // absent until the first view; absent: 1
+  // The reader version this checkpoint needs: 2 when it holds a view, else 1
+  // (ProtoCodec SUPPORTED_READER_VERSION, now 2). Written first; required.
   int32  min_reader_version        = 4;
   // The catalog's conflict encoding; absent until a record sets one
   // (SetConflictEncoding), and then replay judges by "lamport".
@@ -80,6 +81,7 @@ message Checkpoint {
   repeated Table              tables                 = 11;  // pointer-mode tables
   repeated NamespaceProperty  namespace_properties   = 12;
   repeated InlineTable        inline_tables          = 13;  // inline-mode tables
+  repeated View               views                  = 14;  // pointer and inline views
 }
 ```
 
@@ -90,8 +92,12 @@ fails if it is absent or exceeds `ProtoCodec.SUPPORTED_READER_VERSION`.
 A table ID appears in either `tables` (pointer mode) or `inline_tables`
 (inline mode), never both.
 
+A checkpoint that holds a view says `min_reader_version` 2, so a reader from
+before views refuses it rather than drop its views; one without a view says
+1, its bytes as they were before views.
+
 A checkpoint is a function of the state it holds (I11): the encoder writes
-`namespaces`, `tables` and `inline_tables` in order of id, and
+`namespaces`, `tables`, `inline_tables` and `views` in order of id, and
 `namespace_properties` in order of namespace id and then key; within an inline
 table, `manifest_pool` in order of path and `snapshot_refs` in order of
 snapshot id ([SPEC_ML.md](SPEC_ML.md)). The order of a map in memory depends on
@@ -114,9 +120,9 @@ message Namespace {
   int32  version   = 2;
   int32  parent_id = 3;       // 0 = root
   string name      = 4;       // single-level name, not full path
-  int32  removals  = 5;       // the names it has freed (a table dropped or
-                              //   renamed out of a name, a child dropped);
-                              //   only grows; absent while 0
+  int32  removals  = 5;       // the names it has freed (a table or a view
+                              //   dropped or renamed out of a name, a child
+                              //   dropped); only grows; absent while 0
 }
 
 message Table {
@@ -134,9 +140,25 @@ message NamespaceProperty {
   string key          = 2;
   string value        = 3;
 }
+
+// A view (VIEWS.md): its own kind, with its own ids, sharing its
+// namespace's names with the namespace's tables. Whole in every version.
+message View {
+  int32  id           = 1;
+  int32  version      = 2;
+  int32  namespace_id = 3;
+  string name         = 4;
+  oneof metadata {
+    bytes  inline_metadata   = 5;   // Iceberg's view JSON, gzipped
+    string metadata_location = 6;   // a view metadata file
+  }
+  InlineMetadataCodec codec   = 7;  // with inline_metadata, required:
+                                    //   CODEC_JSON_GZIP only
+}
 ```
 
-For `InlineTable`, see [SPEC_TM.md](SPEC_TM.md).
+For `InlineTable`, see [SPEC_TM.md](SPEC_TM.md). For views, see
+[VIEWS.md](VIEWS.md) and [View Action Messages](#view-action-messages).
 
 ### Intention
 
@@ -164,6 +186,10 @@ message Action {
     RenameTable             rename_table              = 11;
     SetConflictEncoding     set_conflict_encoding     = 12;
     SetSnapshotPaging       set_snapshot_paging       = 13;
+    CreateView              create_view               = 14;  // see below
+    UpdateView              update_view               = 15;
+    DropView                drop_view                 = 16;
+    RenameView              rename_view               = 17;
   }
 }
 ```
@@ -171,21 +197,23 @@ message Action {
 Every action verifies against the state before the record, and `apply` runs
 them in order. `CatalogMutation.intention()` creates namespaces first
 (parents before children) and drops them last (children before parents),
-after the drops and renames of tables: a transaction may drop every table of
-a namespace, or rename them out of it, and then the namespace, and each drop
-applies to an empty namespace.
+after the drops and renames of tables and views: a transaction may drop every
+table and view of a namespace, or rename them out of it, and then the
+namespace, and each drop applies to an empty namespace.
 
 ### Pointer-Mode Action Messages
 
 Each action carries version fields for optimistic conflict detection. A
 create names its new entity by a late-bound (negative) id, `-1, -2, ...` for
-namespaces and, separately, for tables, in the order of their creates; later
+namespaces and, separately, for tables and for views, in the order of their
+creates; later
 actions of the same transaction may name it (see [Late-Binding](#late-binding)).
 A `*_version` of -1 means the entity it names is late-bound, so there is no
 version to check.
 
 An action that binds a name (`CreateNamespace`, `CreateTable`,
-`CreateTableInline`, and `RenameTable`'s new name) says what it requires of
+`CreateTableInline`, `CreateView`, and `RenameTable`'s and `RenameView`'s new
+names) says what it requires of
 the namespace it binds the name in, in a oneof its writer chooses
 (`fileio.catalog.create.condition`; each record says which, so writers may
 differ), its member written even when 0:
@@ -299,6 +327,65 @@ message SetSnapshotPaging {
 Inline action messages (`CreateTableInline`, `UpdateTableInline`) and the
 delta hierarchy under `TableMetadataDelta` live in [SPEC_TM.md](SPEC_TM.md);
 manifest-list delta updates live in [SPEC_ML.md](SPEC_ML.md).
+
+### View Action Messages
+
+A view's metadata is whole in every action (VIEWS.md V2): `inline_metadata`
+(Iceberg's view JSON, gzipped at the default level, its `codec` required and
+`CODEC_JSON_GZIP` only) or `metadata_location`. An action with neither, or
+with another codec, never applies. A view applies only on the version its
+writer read, under every conflict encoding (V6): views keep no conflict
+state.
+
+```protobuf
+// Binds its name as CreateTable does, across tables and views; apply bumps
+// its namespace's version.
+message CreateView {
+  int32 id = 1;                      // late-bound (negative)
+  int32 version = 2;                 // the new view's version (1)
+  int32 namespace_id = 3;            // negative if created in this transaction
+  oneof namespace_condition {
+    int32 namespace_version  = 4;
+    int32 namespace_removals = 5;
+  }
+  string name = 6;
+  oneof metadata {
+    bytes  inline_metadata   = 7;
+    string metadata_location = 8;
+  }
+  InlineMetadataCodec codec = 9;     // with inline_metadata
+}
+
+// The view's whole next metadata: a replace, a property or location change.
+message UpdateView {
+  int32 id = 1;
+  int32 version = 2;                 // must match current
+  oneof metadata {
+    bytes  inline_metadata   = 3;
+    string metadata_location = 4;
+  }
+  InlineMetadataCodec codec = 5;     // with inline_metadata
+}
+
+// Apply bumps its namespace's version and removals.
+message DropView {
+  int32 id = 1;
+  int32 version = 2;
+}
+
+// As RenameTable, across tables and views; apply bumps the view's version,
+// both namespaces' versions, and the removals of the namespace it leaves.
+message RenameView {
+  int32 id = 1;
+  int32 version = 2;
+  int32 new_namespace_id = 3;
+  oneof new_namespace_condition {
+    int32 new_namespace_version  = 4;
+    int32 new_namespace_removals = 6;
+  }
+  string new_name = 5;
+}
+```
 
 ## Worked examples
 
@@ -798,11 +885,14 @@ and the number of intention records after the checkpoint
 |----------------------|----------------------------------|--------------------------------------|
 | `nextNamespaceId`    | `int`                            | Next namespace ID replay binds       |
 | `nextTableId`        | `int`                            | Next table ID replay binds           |
+| `nextViewId`         | `int`                            | Next view ID replay binds            |
 | `namespaceById`      | `Map<Integer, NsEntry>`          | Namespace ID → entry                 |
 | `namespaceLookup`    | `Map<Namespace, Integer>`        | Namespace path → ID (derived)        |
 | `nsProperties`       | `Map<Integer, Map<Str, Str>>`    | Namespace ID → properties            |
 | `tableById`          | `Map<Integer, TblEntry>`         | Table ID → entry                     |
 | `tableLookup`        | `Map<TableIdentifier, Integer>`  | Table name → ID (derived)            |
+| `viewById`           | `Map<Integer, ViewEntry>`        | View ID → entry                      |
+| `viewLookup`         | `Map<TableIdentifier, Integer>`  | View name → ID (derived)             |
 | `tblInlineMetadata`  | `Map<Integer, byte[]>`           | Table ID → encoded TableMetadata bytes |
 | `tblInlineMetadataCodec` | `Map<Integer, Byte>`         | Table ID → codec tag of those bytes  |
 | `tblManifestPrefix`  | `Map<Integer, String>`           | Table ID → manifest-list prefix      |
@@ -844,6 +934,10 @@ reserved:
 - `TblEntry(int namespaceId, String name, int version, String metadataLocation)`
   — table metadata. For inline tables `metadataLocation` is null; the actual
   metadata lives in `tblInlineMetadata`.
+- `ViewEntry(int namespaceId, String name, int version, ...)` — a view: its
+  metadata file's location, or its metadata inline with its codec, exactly one
+  of the two. No namespace holds a table and a view of one name (design.md
+  I13).
 
 A table ID appears in either `tableById` with a non-null `metadataLocation`
 (pointer mode) or in `tblInlineMetadata` (inline mode), never both. Inline
@@ -864,7 +958,7 @@ the id is a UUIDv7, and `CatalogIntention.verify` accepts it.
 - late-bound id is referenced before (or without) its defining create,
   or defined twice, or whose create names a concrete id
   (`ProtoCodec.IdBinding`);
-- action references a namespace or table that another of its actions
+- action references a namespace, table or view that another of its actions
   drops (`CatalogIntention.selfConsistent`, Bug 14): every action verifies
   against the state before the transaction, so such a record would pass
   and apply to a state no read could build;
@@ -886,6 +980,10 @@ the id is a UUIDv7, and `CatalogIntention.verify` accepts it.
 | CreateTableInline        | the name binds in the namespace (below)                   |
 | UpdateTableInline        | the conflict encoding admits it ([Conflict Encodings](#conflict-encodings)): under `lamport`, the table version matches |
 | RenameTable              | table version matches; the new name binds in the destination namespace (below) |
+| CreateView               | well-formed metadata; the name binds in the namespace (below) |
+| UpdateView               | well-formed metadata; view version matches (every encoding) |
+| DropView                 | view version matches                                      |
+| RenameView               | view version matches; the new name binds in the destination namespace (below) |
 | SetConflictEncoding      | the catalog has no encoding and has never had a table     |
 | unknown action type      | always passes (`UnknownAction`)                           |
 
@@ -895,14 +993,17 @@ A name binds in a namespace by the condition the record names
 | Condition (the oneof's member) | Holds where the record lands if |
 |---|---|
 | `*_version` (`namespace`) | the namespace's version is the one read (skipped if -1: late-bound) |
-| `*_removals` (`name`) | the namespace (by id) exists, its removals are those read, and no table of it (for a table's name) or no child namespace of it (for a namespace's) has the name; skipped if the namespace is late-bound (a negative id, with -1); a concrete namespace with -1, or a late-bound one with a count, never holds |
+| `*_removals` (`name`) | the namespace (by id) exists, its removals are those read, and no table or view of it (for a table's or a view's name) or no child namespace of it (for a namespace's) has the name; skipped if the namespace is late-bound (a negative id, with -1); a concrete namespace with -1, or a late-bound one with a count, never holds |
 
 The name check is the one `CatalogMutation` makes as it stages: a table's
-name against the namespace's tables, a namespace's against its parent's
-children. Every action verifies on the state before the record, so a rename
-into a name its own record frees (a `DropTable` of the table there, or a
-`RenameTable` of it out, which the record applies first) goes by
-`*_version`: by `*_removals` the name would be taken (CATALOG_TRANSACTIONS.md). A table and a namespace may share a name under either condition.
+or a view's name against the namespace's tables and views, which share one
+set of names (VIEWS.md V7), a namespace's against its parent's children.
+Every action verifies on the state before the record, so a rename into a name
+its own record frees (a `DropTable` of the table there, or a `RenameTable` of
+it out, which the record applies first) goes by `*_version`: by `*_removals`
+the name would be taken (CATALOG_TRANSACTIONS.md). A view takes no name its
+own record frees. A table or a view and a namespace may share a name under
+either condition.
 The `name` condition is stable (S2, [LOG.md](LOG.md) §"Unconditional
 appends"): namespace ids are never reused, removals only grow, and a taken
 name is freed only by an action that adds to them, so a record it rejects
@@ -917,9 +1018,12 @@ the record lands), and a create starts its entity at the record's
 properties: creating, dropping or renaming a child bumps the parent
 namespace (a rename bumps both, when they differ), and setting or removing
 a property bumps that namespace. A namespace's removals count the names
-freed in it: `DropTable` adds one to its namespace's, `DropNamespace` to its
-parent's, and `RenameTable` to the namespace it leaves, even when its new
-name is in the same namespace. A create by name bumps its namespace's
+freed in it: `DropTable` and `DropView` add one to their namespace's,
+`DropNamespace` to its parent's, and `RenameTable` and `RenameView` to the
+namespace they leave, even when the new name is in the same namespace. A
+view's create, drop and rename bump namespaces' versions as a table's do, so
+a namespace's drop staged before a view's create fails (VIEWS.md V8); an
+`UpdateView` bumps only the view. A create by name bumps its namespace's
 version as one by version does, so a namespace's drop, and a create by
 version, conflict with it. `ReadTable` and unknown actions change nothing.
 See [design.md](design.md) for the operation × operation conflict matrix

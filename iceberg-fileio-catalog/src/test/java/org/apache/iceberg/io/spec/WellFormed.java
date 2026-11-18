@@ -21,6 +21,7 @@ package org.apache.iceberg.io.spec;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.io.CatalogState;
+import org.apache.iceberg.io.InlineMetadataCodecs;
 
 /**
  * Structural well-formedness check for P4 ({@link TestInvariantProperties}).
@@ -47,6 +48,10 @@ import org.apache.iceberg.io.CatalogState;
  *       name, and no two namespaces of a parent ({@link #namesUnique}).</li>
  *   <li>Ids below the next-id counters: every entry the lookups name has an id
  *       below its counter.</li>
+ *   <li>Views (docs/VIEWS.md): every view's namespace exists, its metadata is
+ *       a file's location or inline JSON, never both or neither, no two views
+ *       of a namespace share a name, and no namespace holds a table and a view
+ *       of one name, the two kinds sharing one set of names.</li>
  * </ul>
  *
  * <p>Each check returns false (not throws) so jqwik's shrinker can minimise
@@ -134,6 +139,33 @@ final class WellFormed {
     }
     if (tables != state.tables().size()) {
       return tables + " tables below the counter, " + state.tables().size() + " by name";
+    }
+    java.util.Set<String> viewNames = new java.util.HashSet<>();
+    int views = 0;
+    for (int id = 1; id < state.nextViewId(); id++) {
+      CatalogState.ViewEntry entry = state.viewEntry(id);
+      if (entry == null) {
+        continue;
+      }
+      views += 1;
+      if (entry.namespaceId == 0 || state.namespaceEntry(entry.namespaceId) == null) {
+        return "view " + id + " (" + entry.name + ") has no namespace " + entry.namespaceId;
+      }
+      if ((entry.metadataLocation == null) == (entry.inlineMetadata() == null)) {
+        return "view " + id + " is " + (entry.isInline() ? "both inline and a pointer" : "neither");
+      }
+      if (entry.isInline() && entry.codec != InlineMetadataCodecs.TAG_JSON_GZIP) {
+        return "view " + id + " has inline codec " + entry.codec;
+      }
+      if (!viewNames.add(entry.namespaceId + "/" + entry.name)) {
+        return "two views of namespace " + entry.namespaceId + " are named " + entry.name;
+      }
+      if (tableNames.contains(entry.namespaceId + "/" + entry.name)) {
+        return "namespace " + entry.namespaceId + " holds a table and a view named " + entry.name;
+      }
+    }
+    if (views != state.views().size()) {
+      return views + " views below the counter, " + state.views().size() + " by name";
     }
     return null;
   }

@@ -421,7 +421,7 @@
   -->
   <script id="fixtures-data" type="application/json">{
   "formatVersion": 3,
-  "readerVersion": 1,
+  "readerVersion": 2,
   "structuralFormatVersion": 2,
   "deflateProbe": "1f8b08000000000000ff75535b8edb300cbc4aa1af16b0123befcd558a45c1d87456a864b912dd4512e4ee2525c78917a83f0c509c2187af9b6a7d7040fa2f86687ca78eab42119c2cea61308d3aaab27a2bcbb26d35ff4bbd97df417e628e5fa50a657d0d9402a8b83e2e97167ee3b20ffe84e284483ae29f01bb1a7537b81306752c47c7d03740d86817d5b1da6f76dbeab04991477fedede03a2d6af685aa8710b0e370f5073a48af1c285b1ce0e74dd1a547161e290c3571f639b235689b0c948855a13a708267ab5081459a80ec6036722b722cebbbb3ba1737014987460ac5ff53c8388c04aea7ebc45c4f4c6e169e7db8ccf82dd8f8ccc9facd4bd6cdc405e7874e0a7b8a9d331bac8d03fbbd5a15df563fa6ecdb2902c179ae7cc69f3a684d943468d149c7c7018c66eeb0287c22be08ba3f3ab69b32f770b11ee69d9e2597b1a5b2dfefef856ab085c1f2b07bac1fa3ee219091554baf7992affe97014f63fad580b49a027451169ec5e797e887c02b398e35519351f102de9384b4bbcf9c8214e78b361f48fbd06078288cd34b5637734ef25274be901eb91e64e44df9cf4e0e83b511e8de0225ad85fa0c86704110ce48ba357c9cd15c519f2e243cb55def0efbf2ad5a7189199a8f7a31b68f215c005f9f4c3303467b517bd7078c72fabaf6bc388cbd466a78699e97d6411f3f7c5e00cd0713b015b90c89a34beae471f1be13ef8ca947fbd9b6af9e07515b7fce5c8704a9eef1e5fe0f99a09df49b040000",
   "schema": {
@@ -514,13 +514,15 @@
         "fields": [
           {"number": 2, "name": "next_namespace_id", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": "ID allocation state: replay binds a transaction's late-bound ids to these, in log order (see CreateNamespace)."},
           {"number": 3, "name": "next_table_id", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": ""},
-          {"number": 4, "name": "min_reader_version", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": "The reader version this checkpoint needs (ProtoCodec SUPPORTED_READER_VERSION, now 1); a reader that supports less refuses it."},
+          {"number": 7, "name": "next_view_id", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": "Absent until the catalog's first view (then past 1); absent reads as 1."},
+          {"number": 4, "name": "min_reader_version", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": "The reader version this checkpoint needs: 2 (ProtoCodec SUPPORTED_READER_VERSION, VIEWS_READER_VERSION) when it holds a view, else 1, the version before views; a reader that supports less refuses it."},
           {"number": 5, "name": "conflict_encoding", "type": "string", "repeated": false, "packed": false, "oneof": null, "comment": "The catalog's conflict encoding (ConflictEncoding): how replay decides whether a table update conflicts with what landed since its writer read the table. Absent until a record sets one (SetConflictEncoding), and then replay judges by the Lamport clock, \"lamport\". A reader that does not know the encoding refuses the checkpoint."},
           {"number": 6, "name": "snapshot_paging", "type": "SnapshotPaging", "repeated": false, "packed": false, "oneof": null, "comment": "How the catalog pages its inline tables' old snapshots (docs/SNAPSHOT_PAGING.md): absent until a record sets it (SetSnapshotPaging), and then no snapshot is paged."},
           {"number": 10, "name": "namespaces", "type": "Namespace", "repeated": true, "packed": true, "oneof": null, "comment": "Catalog contents, each in order of its key (id; namespace id and then key for properties), so that a checkpoint is a function of the state (I11)"},
           {"number": 11, "name": "tables", "type": "Table", "repeated": true, "packed": true, "oneof": null, "comment": ""},
           {"number": 12, "name": "namespace_properties", "type": "NamespaceProperty", "repeated": true, "packed": true, "oneof": null, "comment": ""},
-          {"number": 13, "name": "inline_tables", "type": "InlineTable", "repeated": true, "packed": true, "oneof": null, "comment": "Inline table metadata (tables with metadata stored in the catalog)"}
+          {"number": 13, "name": "inline_tables", "type": "InlineTable", "repeated": true, "packed": true, "oneof": null, "comment": "Inline table metadata (tables with metadata stored in the catalog)"},
+          {"number": 14, "name": "views", "type": "View", "repeated": true, "packed": true, "oneof": null, "comment": "Views, pointer and inline, in order of id (docs/VIEWS.md)"}
         ]
       },
       "SnapshotPaging": {
@@ -535,7 +537,7 @@
           {"number": 2, "name": "version", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": ""},
           {"number": 3, "name": "parent_id", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": "0 = root"},
           {"number": 4, "name": "name", "type": "string", "repeated": false, "packed": false, "oneof": null, "comment": "single level name, not full path"},
-          {"number": 5, "name": "removals", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": "The names the namespace has freed: each drop of a table or a child namespace, and each rename of a table out of its name there, adds one. It only grows, so a create by name (CreateTable.namespace_removals) that failed stays failed. Absent while 0."}
+          {"number": 5, "name": "removals", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": "The names the namespace has freed: each drop of a table, a view or a child namespace, and each rename of a table or a view out of its name there, adds one. It only grows, so a create by name (CreateTable.namespace_removals) that failed stays failed. Absent while 0."}
         ]
       },
       "Table": {
@@ -546,6 +548,17 @@
           {"number": 4, "name": "name", "type": "string", "repeated": false, "packed": false, "oneof": null, "comment": ""},
           {"number": 5, "name": "metadata_location", "type": "string", "repeated": false, "packed": false, "oneof": null, "comment": ""},
           {"number": 6, "name": "conflict_state", "type": "bytes", "repeated": false, "packed": false, "oneof": null, "comment": "The conflict encoding's state of the table, in the encoding's own layout; absent while it has none (a table it has not observed, or an encoding that keeps none)."}
+        ]
+      },
+      "View": {
+        "fields": [
+          {"number": 1, "name": "id", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "version", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 3, "name": "namespace_id", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 4, "name": "name", "type": "string", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 5, "name": "inline_metadata", "type": "bytes", "repeated": false, "packed": false, "oneof": "metadata", "comment": "Iceberg's view metadata JSON (ViewMetadataParser), by codec"},
+          {"number": 6, "name": "metadata_location", "type": "string", "repeated": false, "packed": false, "oneof": "metadata", "comment": "a view metadata file"},
+          {"number": 7, "name": "codec", "type": "InlineMetadataCodec", "repeated": false, "packed": false, "oneof": null, "comment": "With inline_metadata, required (written even when 0): CODEC_JSON_GZIP, the only codec a view takes (the structural codec is a table codec)"}
         ]
       },
       "NamespaceProperty": {
@@ -622,7 +635,11 @@
           {"number": 10, "name": "create_table_inline", "type": "CreateTableInline", "repeated": false, "packed": false, "oneof": "action", "comment": ""},
           {"number": 11, "name": "rename_table", "type": "RenameTable", "repeated": false, "packed": false, "oneof": "action", "comment": ""},
           {"number": 12, "name": "set_conflict_encoding", "type": "SetConflictEncoding", "repeated": false, "packed": false, "oneof": "action", "comment": ""},
-          {"number": 13, "name": "set_snapshot_paging", "type": "SetSnapshotPaging", "repeated": false, "packed": false, "oneof": "action", "comment": ""}
+          {"number": 13, "name": "set_snapshot_paging", "type": "SetSnapshotPaging", "repeated": false, "packed": false, "oneof": "action", "comment": ""},
+          {"number": 14, "name": "create_view", "type": "CreateView", "repeated": false, "packed": false, "oneof": "action", "comment": ""},
+          {"number": 15, "name": "update_view", "type": "UpdateView", "repeated": false, "packed": false, "oneof": "action", "comment": ""},
+          {"number": 16, "name": "drop_view", "type": "DropView", "repeated": false, "packed": false, "oneof": "action", "comment": ""},
+          {"number": 17, "name": "rename_view", "type": "RenameView", "repeated": false, "packed": false, "oneof": "action", "comment": ""}
         ]
       },
       "CreateNamespace": {
@@ -688,6 +705,44 @@
         ]
       },
       "RenameTable": {
+        "fields": [
+          {"number": 1, "name": "id", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "version", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": "must match"},
+          {"number": 3, "name": "new_namespace_id", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": "negative if created in this transaction"},
+          {"number": 4, "name": "new_namespace_version", "type": "int32", "repeated": false, "packed": false, "oneof": "new_namespace_condition", "comment": "must match; -1 if late-bound"},
+          {"number": 6, "name": "new_namespace_removals", "type": "int32", "repeated": false, "packed": false, "oneof": "new_namespace_condition", "comment": "must match, and the new name free; -1 if late-bound"},
+          {"number": 5, "name": "new_name", "type": "string", "repeated": false, "packed": false, "oneof": null, "comment": ""}
+        ]
+      },
+      "CreateView": {
+        "fields": [
+          {"number": 1, "name": "id", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": "late-bound (negative)"},
+          {"number": 2, "name": "version", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": "the new view's version (1)"},
+          {"number": 3, "name": "namespace_id", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": "negative if created in this transaction"},
+          {"number": 4, "name": "namespace_version", "type": "int32", "repeated": false, "packed": false, "oneof": "namespace_condition", "comment": "must match; -1 if late-bound"},
+          {"number": 5, "name": "namespace_removals", "type": "int32", "repeated": false, "packed": false, "oneof": "namespace_condition", "comment": "must match, and the name free; -1 if late-bound"},
+          {"number": 6, "name": "name", "type": "string", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 7, "name": "inline_metadata", "type": "bytes", "repeated": false, "packed": false, "oneof": "metadata", "comment": ""},
+          {"number": 8, "name": "metadata_location", "type": "string", "repeated": false, "packed": false, "oneof": "metadata", "comment": ""},
+          {"number": 9, "name": "codec", "type": "InlineMetadataCodec", "repeated": false, "packed": false, "oneof": null, "comment": "with inline_metadata"}
+        ]
+      },
+      "UpdateView": {
+        "fields": [
+          {"number": 1, "name": "id", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "version", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": "must match current"},
+          {"number": 3, "name": "inline_metadata", "type": "bytes", "repeated": false, "packed": false, "oneof": "metadata", "comment": ""},
+          {"number": 4, "name": "metadata_location", "type": "string", "repeated": false, "packed": false, "oneof": "metadata", "comment": ""},
+          {"number": 5, "name": "codec", "type": "InlineMetadataCodec", "repeated": false, "packed": false, "oneof": null, "comment": "with inline_metadata"}
+        ]
+      },
+      "DropView": {
+        "fields": [
+          {"number": 1, "name": "id", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": ""},
+          {"number": 2, "name": "version", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": "must match current"}
+        ]
+      },
+      "RenameView": {
         "fields": [
           {"number": 1, "name": "id", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": ""},
           {"number": 2, "name": "version", "type": "int32", "repeated": false, "packed": false, "oneof": null, "comment": "must match"},
@@ -1215,6 +1270,19 @@
       ]
     },
     {
+      "name": "views-inline-and-pointer",
+      "description": "Views (docs/VIEWS.md): a checkpoint holding a pointer view, then a view's life as records: CreateView inline, a table create of its name rejected, an UpdateView that moves it to a metadata file, and a RenameView. Click CreateView's inline_metadata for its JSON.",
+      "hex": "4c43415400000003b20108021210019000000000700080000000000000011a17321508301a11bf9e89db95cd3f01272e4d5426e071f3c0228201200210021801380252080800100118002200520d080110021800220573616c6573725f080110011801220e7765656b6c795f726576656e7565324773333a2f2f6c616b652f73616c65732f7765656b6c795f726576656e75652f6d657461646174612f30303030312d30633965386137622e677a2e6d657461646174612e6a736f6eed5e1ef106a1a71c0800000000000000f4c9eda3a6030a100196a49db4a8733496b9d59b7ac6bc121291031a8e03728b0308ffffffff0f100118012800320d6461696c795f726576656e75653aeb021f8b08000000000000ff7d514d4fc24010fd2b9b3941d2da1651b03735e84583013d1842cca61d70c36e5bf603d310febbd30f4a20d13d4cb2f3e6edbcf7760f3b813fbe73228518c2e82e0c43449f6ae88faa32ae4a783a1178b0cab5e2d6dfa13622cf208e3c9079c26d7d01731d0781e41b0c0c976882940b597e69dc61e690d826f946c50dc48b3dd8b2c08a62b54b6c87f9959890f6089469335875684dc655359ff29286356e9dd048c88a4b83def1b5945b8483d790061de9a4e04f22264271d98bc61e1bf4e1b03c2c3d489cd698756efd56497b6dd45d6056283496abc2578447a3e1ed4d341ed6f15d5a344e29ae4b88f780d95a64e8b76a4dc1f5865c90a81577d2d67d6a26042ea04e1696959542a3217d75fae7a16e659528d518e69397c9e33ba3dc3c462b7b5ce52eb37d763f676d2cec69367d65f5bb57b94ec9107b9e4d3fded8c3276be24e0581f44b9db63a9ea37599af9be5ff793fcb89f8bf67c99cc07e0200004800ed5e1ef106a1a71cd000000000000000f9e5422e630a100196a49db8907ad0a7b9f5b8dcf7dc49124f1a4d2a4b08ffffffff0f1001180138002a0d6461696c795f726576656e7565322e73333a2f2f6c616b652f73616c65732f6461696c795f726576656e75652f76312e6d657461646174612e6a736f6eed5e1ef106a1a71c8c02000000000000c405c23f640a100196a49dbc787df1a1b99504bc3cd18c12501a4e7a4c08021001224673333a2f2f6c616b652f73616c65732f6461696c795f726576656e75652f6d657461646174612f30303030322d34663164326333622e677a2e6d657461646174612e6a736f6eed5e1ef106a1a71c04030000000000004da3fa6c310a100196a49dc0607d9784b9b47e18959cdb121d1a1b8a011808021002180130002a0e726576656e75655f62795f646179ed5e1ef106a1a71c7d03000000000000ba339a7f",
+      "notes": [
+        {"start": 208, "end": 652, "label": "CreateView (Action field 14; id = -1, namespace_removals = 0, name = \"daily_revenue\"), its metadata inline: Iceberg's view JSON, gzipped (inline_metadata, codec = CODEC_JSON_GZIP, the only codec a view takes). Views have ids of their own: replay binds -1 to the checkpoint's next_view_id, 2. The name binds as a table's would, and a table's name is one it may not take."},
+        {"start": 652, "end": 772, "label": "A writer that read the catalog before the view creates a table of its name: CreateTable(namespace_removals = 0). Rejected: tables and views share a namespace's names, and a view holds it."},
+        {"start": 772, "end": 893, "label": "UpdateView (Action field 15; id = 2, version = 1): a pointer writer's replace sends the view's whole next metadata as a file's location. A view carries its whole metadata on every commit, never a delta, so it changes form here: inline to pointer. It applies only on the version read, under any conflict encoding."},
+        {"start": 893, "end": 963, "label": "RenameView (Action field 17; id = 2, version = 2, new_namespace_removals = 0): the new name binds as a create's, across tables and views; the view keeps its id and metadata, and sales counts the name it freed."},
+        {"start": -1, "end": -1, "label": "The checkpoint holds weekly_revenue as a View row (Checkpoint.views, field 14), with next_view_id (field 7), and says min_reader_version 2, as every checkpoint holding a view does: a reader before views would drop it."},
+        {"start": -1, "end": -1, "label": "Views are their own kind under a namespace, with their own ids, sharing the namespace's names with its tables."}
+      ]
+    },
+    {
       "name": "inline-manifest-list",
       "description": "An inline-ML table (fileio.catalog.inline.manifests): no manifest list files. The checkpoint carries each table's manifest_pool and per-snapshot snapshot_refs; a delta changes a snapshot's list with AddManifestDelta and RemoveManifestDelta, naming what the state holds by reference: manifests by name under the table's prefix, removals by index in the parent's list, summary entries by the parent's.",
       "hex": "4c43415400000003f90808021210019000000000700080000000000000011a3d323b08301a37efff90da95cd3f904e7a52a2e844c1c480c0843d603e68b30847003335c0f0f43ca7402e6d828bfe7d1f00e807acf76e65a434a80a8b8022a308200110021802520808001001180022005211080110021800220977617265686f7573656afd070801100218012206636c69636b732ab9061f8b08000000000000ff8d55c98edb300cfd9540bdb4409cb19d38dbadc77e4351148c4427c2687125b9839960febda4ec38c974bae460401297473ef2e52c5a1f2ca4e22786a8bd13fb7a2e121c0c167daf95d88bb2da9565a95441dfb2d8f067cb1f3e8ebf4acc85f112520e20e272fff060e0111f9e20e0c9f7111fa4d1f231b21dc45444fcd1a39358b8de1e30887d353ef49d8284aab091ee36ab75536d576bce32be4b6f7aeb0a06b6990bd987808ec2c9135ac8b764389c28c0d7b348cf1d520d31855e26ca7e6fd96a346a30e48804c281657b3acd4520903a203d903752578658c6bba3789d9fd9889b35ba242eee0f2e495b8c096c975e26cfe5e4497dc3a30fcf77fe2d9878cd49f8f54dd6d5e40bd6f78e0bbb66bef75428b505f3b1aae7b3fad394bd99222438de23bff39f3a6874e43468d072c74702c6e3d0614678b57803e8f5d2b1f594b98367e3e1bed377c999b65cf6b7d76f73a1b085de10d91dca0bd51d84a479eaf2edc0e4edfb0dc1134ddf1570ab53001779f609fc70137d1f6824475ab36b3e54347eaf19429edd6b4eb6e4c71b6c3ea4c20785e182304e3703babbc7095e8ede05df21d583647916fec9f16210b60445672065ac97dd1cab99b6ea29e8848b04e188a968356d6fd42f581c9e134713cd72bddd94bbaaa6c207d361eb176353c984caa29d648e0783f1bc90de7601236b43213d8d13d9bec4a46894aefbe7a08b273f8c45b36d764db3dced76dbedaaaecaa6a2510fd8e6aa2c689298b388fff418b7ed4034c993a0f1997c8646be2721ff11f5b289ef294cecad05da43ee3e31719133e83a743ca6f204ee48e2749d0099b76f2f5800d11db5c3ab8e8ae5a259ace8019422a7cc2333c37cb03d85cd439295d314d5665d2d59e9f8377905943431d9a5ac39d89865e43f129447bad51249468f37c93f7740a238fb323cccaa45552fcad94762d3ea345ba98dacdb0a77b03dac65a3964827280f3bb9551b5cb70dac0e4b59ab4f143bf904e677f8c3f51b7cc49205a75b52bb222b0649a933d416fa4378672e28faad20f396934c26921a2d99653a5f7bfdf66522dbf8e3a0f57fe5f61f03c7b92d26c834fd3d6266e8c69a49254ea742a73fbdc5b09e1fa8f98204e4171f952fc66b070000322473333a2f2f6c616b652f77617265686f7573652f636c69636b732f6d657461646174612f48003a399a01109d1c2e3f4a5b4c6d8e7f0a1b2c3d4e5fa00100108030280130013951515151515151514001588008720c1a04e84e00002204e84e00003a399a01109d1c2e3f4a5b4c6d8e7f0a1b2c3d4e5fa00101108030280130013951515151515151514001588008720c1a04e94e00002204e94e0000620200015802420d09515151515151515112020001ed5e1ef106a1a71c08000000000000008d16628cc4010a100196a49d47487d95bab956560e3ee9bf12af011aac014aa901080110021aa20110c0e1f6a4ea3218010a410a3f09525252525252525212001a110803100118800828013080086001800201200039515151515151515152140803121008021a0c0a0a080012060a04e84e00000a10120e0a046d61696e1a066272616e63680a056a031a01000a36623412309a01101f2e3d4c5b6a49788a6b5c4d3e2f1a0ba00100108030280230024001588008720c1a04e84e00002204e84e000018002d6605908fed5e1ef106a1a71c9704000000000000cd5fb66f",
@@ -1332,7 +1400,10 @@
       'CreateTableInline.metadata': true,
       'UpdateTableInline.full_metadata': true,
       'AddSchema.schema_json': true,
-      'AddPartitionSpec.spec_json': true
+      'AddPartitionSpec.spec_json': true,
+      'View.inline_metadata': true,
+      'CreateView.inline_metadata': true,
+      'UpdateView.inline_metadata': true
     };
 
     // Bytes fields whose payload is gzip-wrapped JSON (no codec discriminator).
@@ -1344,7 +1415,11 @@
     // ("decompresses to N bytes of <label>").
     var GZIP_JSON_BYTES_FIELDS = {
       'AddSchema.schema_json':       'Schema JSON',
-      'AddPartitionSpec.spec_json':  'PartitionSpec JSON'
+      'AddPartitionSpec.spec_json':  'PartitionSpec JSON',
+      // A view's inline metadata: its only codec is CODEC_JSON_GZIP (docs/VIEWS.md V4)
+      'View.inline_metadata':        'ViewMetadata JSON',
+      'CreateView.inline_metadata':  'ViewMetadata JSON',
+      'UpdateView.inline_metadata':  'ViewMetadata JSON'
     };
 
     // Bytes fields that are 16-byte UUIDs. The committed set

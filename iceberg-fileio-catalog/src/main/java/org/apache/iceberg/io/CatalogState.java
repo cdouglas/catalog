@@ -36,10 +36,12 @@ import org.intentlog.StateMachine;
 
 /**
  * The catalog's state, as replay of its log reaches it ({@link CatalogStateMachine}): namespaces
- * and their properties, and tables, each with a pointer to its metadata file or its metadata (and
- * manifest lists) inline. Every namespace and table has an id and a version, which each change to
- * it bumps; a transaction's intention names the versions it read. Immutable; the log's id and
- * committed set are the {@link org.intentlog.Replica}'s, not the state's.
+ * and their properties, tables, each with a pointer to its metadata file or its metadata (and
+ * manifest lists) inline, and views, each with a pointer to its metadata file or its metadata
+ * inline (docs/VIEWS.md). A namespace's tables and views share one set of names. Every namespace,
+ * table and view has an id and a version, which each change to it bumps; a transaction's intention
+ * names the versions it read. Immutable; the log's id and committed set are the {@link
+ * org.intentlog.Replica}'s, not the state's.
  */
 public class CatalogState {
 
@@ -49,6 +51,7 @@ public class CatalogState {
   // ID tracking
   private final int nextNamespaceId;
   private final int nextTableId;
+  private final int nextViewId;
 
   // Namespace state: id -> (parentId, name, version)
   private final Map<Integer, NsEntry> namespaceById;
@@ -57,6 +60,10 @@ public class CatalogState {
   // Table state: id -> (nsId, name, version, metadataLocation)
   private final Map<Integer, TblEntry> tableById;
   private final Map<TableIdentifier, Integer> tableLookup;
+
+  // View state: id -> (nsId, name, version, its metadata's location or its metadata inline)
+  private final Map<Integer, ViewEntry> viewById;
+  private final Map<TableIdentifier, Integer> viewLookup;
 
   // Namespace properties: nsId -> (key -> value)
   private final Map<Integer, Map<String, String>> nsProperties;
@@ -96,10 +103,13 @@ public class CatalogState {
   private CatalogState(Builder builder) {
     this.nextNamespaceId = builder.nextNamespaceId;
     this.nextTableId = builder.nextTableId;
+    this.nextViewId = builder.nextViewId;
     this.namespaceById = builder.namespaceById.built();
     this.namespaceLookup = builder.namespaceLookup.built();
     this.tableById = builder.tableById.built();
     this.tableLookup = builder.tableLookup.built();
+    this.viewById = builder.viewById.built();
+    this.viewLookup = builder.viewLookup.built();
     this.nsProperties = builder.nsProperties.built();
     this.tblInlineMetadata = builder.tblInlineMetadata.built();
     this.tblManifestPrefix = builder.tblManifestPrefix.built();
@@ -133,10 +143,13 @@ public class CatalogState {
     Builder builder = new Builder();
     builder.nextNamespaceId = nextNamespaceId;
     builder.nextTableId = nextTableId;
+    builder.nextViewId = nextViewId;
     builder.namespaceById.share(namespaceById);
     builder.namespaceLookup.share(namespaceLookup);
     builder.tableById.share(tableById);
     builder.tableLookup.share(tableLookup);
+    builder.viewById.share(viewById);
+    builder.viewLookup.share(viewLookup);
     builder.nsProperties.share(nsProperties);
     builder.tblInlineMetadata.share(tblInlineMetadata);
     builder.tblManifestPrefix.share(tblManifestPrefix);
@@ -317,6 +330,58 @@ public class CatalogState {
     Integer id = tableLookup.get(table);
     return id != null ? inlineMetadata(id) : null;
   }
+
+  public List<TableIdentifier> views() {
+    return new ArrayList<>(viewLookup.keySet());
+  }
+
+  /** Whether the view exists, inline or with a metadata file. */
+  public boolean containsView(TableIdentifier view) {
+    return viewLookup.containsKey(view);
+  }
+
+  /** Whether a table or a view of the namespace holds the identifier's name. */
+  public boolean nameTaken(TableIdentifier ident) {
+    return tableLookup.containsKey(ident) || viewLookup.containsKey(ident);
+  }
+
+  public Integer viewId(TableIdentifier ident) {
+    return viewLookup.get(ident);
+  }
+
+  public int viewVersion(int viewId) {
+    ViewEntry entry = viewById.get(viewId);
+    return entry != null ? entry.version : -1;
+  }
+
+  public ViewEntry viewEntry(int viewId) {
+    return viewById.get(viewId);
+  }
+
+  /** The view's entry, or null if there is none of that name. */
+  public ViewEntry viewEntry(TableIdentifier view) {
+    Integer id = viewLookup.get(view);
+    return id != null ? viewById.get(id) : null;
+  }
+
+  public int nextViewId() {
+    return nextViewId;
+  }
+
+  Map<Integer, ViewEntry> viewById() {
+    return viewById;
+  }
+
+  /**
+   * The metadata location an inline view's load names at {@code version} (docs/VIEWS.md V11): a
+   * sentinel no table's location parser reads ({@code inline://...} is a table's).
+   */
+  static String inlineViewLocation(TableIdentifier view, int id, int version) {
+    return INLINE_VIEW_SCHEME + view + "#" + id + "." + version;
+  }
+
+  /** The scheme of an inline view's metadata location ({@link #inlineViewLocation}). */
+  static final String INLINE_VIEW_SCHEME = "inline-view://";
 
   // ============================================================
   // Ids, versions and inline storage
@@ -612,6 +677,76 @@ public class CatalogState {
     }
   }
 
+  /**
+   * A view's row: its namespace, name and version, and its metadata, which is whole in every
+   * version (docs/VIEWS.md V2): a metadata file's location, or the metadata inline, Iceberg's view
+   * JSON encoded by {@code codec} (only {@link InlineMetadataCodecs#TAG_JSON_GZIP}). Exactly one of
+   * the two is set.
+   */
+  public static class ViewEntry {
+    public final int namespaceId;
+    public final String name;
+    public final int version;
+    public final String metadataLocation;
+    private final byte[] inlineMetadata;
+    public final byte codec;
+
+    ViewEntry(int namespaceId, String name, int version, ViewMetadataRef metadata) {
+      this.namespaceId = namespaceId;
+      this.name = name;
+      this.version = version;
+      this.metadataLocation = metadata.location();
+      this.inlineMetadata = metadata.inline();
+      this.codec = metadata.codec();
+    }
+
+    /** Whether the view's metadata is inline. */
+    public boolean isInline() {
+      return inlineMetadata != null;
+    }
+
+    /** The view's inline metadata, by {@link #codec}; null for a view with a metadata file. */
+    public byte[] inlineMetadata() {
+      return inlineMetadata;
+    }
+
+    /** The view's metadata, as a record carries it. */
+    ViewMetadataRef metadata() {
+      return isInline()
+          ? ViewMetadataRef.inline(inlineMetadata, codec)
+          : ViewMetadataRef.location(metadataLocation);
+    }
+  }
+
+  /**
+   * A view's metadata as a record or a checkpoint carries it: a metadata file's location, or the
+   * metadata inline, encoded by {@code codec}. Either may be null in a malformed record, which
+   * never applies.
+   */
+  record ViewMetadataRef(String location, byte[] inline, byte codec) {
+    static ViewMetadataRef location(String location) {
+      return new ViewMetadataRef(location, null, InlineMetadataCodecs.TAG_JSON_GZIP);
+    }
+
+    static ViewMetadataRef inline(byte[] metadata, byte codec) {
+      return new ViewMetadataRef(null, metadata, codec);
+    }
+
+    /**
+     * Whether a view can hold this metadata: exactly one of the two, and inline metadata only by
+     * the JSON codec (V4: the structural codec is a table codec).
+     */
+    boolean wellFormed() {
+      return (location == null) != (inline == null)
+          && (inline == null || codec == InlineMetadataCodecs.TAG_JSON_GZIP);
+    }
+
+    /** The bytes the metadata holds in a record: what an eviction would take off it. */
+    long bytes() {
+      return inline != null ? inline.length : location != null ? location.length() : 0;
+    }
+  }
+
   public static class TblEntry {
     public final int namespaceId;
     public final String name;
@@ -636,6 +771,7 @@ public class CatalogState {
   public static class Builder implements StateMachine.Builder<CatalogState> {
     private int nextNamespaceId = 1;
     private int nextTableId = 1;
+    private int nextViewId = 1;
 
     // Each map is shared with the state this builder continues until its first change here
     // (SharedMap)
@@ -643,6 +779,8 @@ public class CatalogState {
     private final SharedMap<Namespace, Integer> namespaceLookup = new SharedMap<>();
     private final SharedMap<Integer, TblEntry> tableById = new SharedMap<>();
     private final SharedMap<TableIdentifier, Integer> tableLookup = new SharedMap<>();
+    private final SharedMap<Integer, ViewEntry> viewById = new SharedMap<>();
+    private final SharedMap<TableIdentifier, Integer> viewLookup = new SharedMap<>();
     // A namespace's properties: shared with the state this builder continues until a change here,
     // which copies them first (ownedProperties)
     private final SharedMap<Integer, Map<String, String>> nsProperties = new SharedMap<>();
@@ -692,6 +830,11 @@ public class CatalogState {
       return this;
     }
 
+    public Builder setNextViewId(int id) {
+      this.nextViewId = id;
+      return this;
+    }
+
     public Builder addNamespace(int id, int parentId, String name, int version) {
       return addNamespace(id, parentId, name, version, 0);
     }
@@ -723,6 +866,8 @@ public class CatalogState {
       namespaceLookup.putAll(namespaceLookupOfEntries());
       tableLookup.clear();
       tableLookup.putAll(tableLookupOfEntries());
+      viewLookup.clear();
+      viewLookup.putAll(viewLookupOfEntries());
       lookupsStale = false;
       return this;
     }
@@ -746,14 +891,25 @@ public class CatalogState {
       return lookup;
     }
 
+    private Map<TableIdentifier, Integer> viewLookupOfEntries() {
+      Map<TableIdentifier, Integer> lookup = new HashMap<>();
+      for (Map.Entry<Integer, ViewEntry> entry : viewById.entrySet()) {
+        Namespace ns = buildNamespace(entry.getValue().namespaceId);
+        lookup.put(TableIdentifier.of(ns, entry.getValue().name), entry.getKey());
+      }
+      return lookup;
+    }
+
     /** Fails unless the lookups this builder kept are those its entries make. */
     private void checkLookups() {
       if (!namespaceLookup.equals(namespaceLookupOfEntries())
-          || !tableLookup.equals(tableLookupOfEntries())) {
+          || !tableLookup.equals(tableLookupOfEntries())
+          || !viewLookup.equals(viewLookupOfEntries())) {
         throw new ReplayCheckError(String.format(
             "The lookups a builder kept differ from its entries': namespaces %s, expected %s;"
-                + " tables %s, expected %s",
-            namespaceLookup, namespaceLookupOfEntries(), tableLookup, tableLookupOfEntries()));
+                + " tables %s, expected %s; views %s, expected %s",
+            namespaceLookup, namespaceLookupOfEntries(), tableLookup, tableLookupOfEntries(),
+            viewLookup, viewLookupOfEntries()));
       }
     }
 
@@ -805,6 +961,81 @@ public class CatalogState {
     private TableIdentifier tableKeyOrNull(TblEntry entry) {
       Namespace ns = pathOrNull(entry.namespaceId);
       return ns == null ? null : TableIdentifier.of(ns, entry.name);
+    }
+
+    private TableIdentifier viewKeyOrNull(ViewEntry entry) {
+      Namespace ns = pathOrNull(entry.namespaceId);
+      return ns == null ? null : TableIdentifier.of(ns, entry.name);
+    }
+
+    /** Adds view {@code id} with {@code metadata}, whole (a file's location, or inline). */
+    Builder addView(int id, int namespaceId, String name, int version, ViewMetadataRef metadata) {
+      viewById.put(id, new ViewEntry(namespaceId, name, version, metadata));
+      viewLookup.put(TableIdentifier.of(buildNamespace(namespaceId), name), id);
+      // As addTable: keep nextViewId ahead of any id that arrived via transaction replay
+      if (id >= nextViewId) {
+        nextViewId = id + 1;
+      }
+      return this;
+    }
+
+    /** Sets view {@code id}'s metadata, whole, at {@code newVersion}. */
+    Builder updateView(int id, int newVersion, ViewMetadataRef metadata) {
+      ViewEntry old = viewById.get(id);
+      if (old != null) {
+        viewById.put(id, new ViewEntry(old.namespaceId, old.name, newVersion, metadata));
+      }
+      return this;
+    }
+
+    /** Moves view {@code id} to a new name, keeping its id and metadata. */
+    Builder renameView(int id, int newNamespaceId, String newName, int newVersion) {
+      ViewEntry old = viewById.get(id);
+      if (old == null) {
+        return this;
+      }
+      removeLookup(viewLookup, viewKeyOrNull(old), id);
+      viewById.put(id, new ViewEntry(newNamespaceId, newName, newVersion, old.metadata()));
+      viewLookup.put(TableIdentifier.of(buildNamespace(newNamespaceId), newName), id);
+      return this;
+    }
+
+    Builder removeView(int id) {
+      ViewEntry entry = viewById.remove(id);
+      if (entry != null) {
+        removeLookup(viewLookup, viewKeyOrNull(entry), id);
+      }
+      return this;
+    }
+
+    public int viewVersion(int viewId) {
+      ViewEntry entry = viewById.get(viewId);
+      return entry != null ? entry.version : -1;
+    }
+
+    public ViewEntry viewEntry(int viewId) {
+      return viewById.get(viewId);
+    }
+
+    public Integer viewId(TableIdentifier ident) {
+      return viewLookup.get(ident);
+    }
+
+    public int nextViewId() {
+      return nextViewId;
+    }
+
+    /** Whether a view of namespace {@code nsId}, which exists, is named {@code name}. */
+    public boolean viewNameTaken(int nsId, String name) {
+      return viewLookup.containsKey(TableIdentifier.of(buildNamespace(nsId), name));
+    }
+
+    /**
+     * Whether a table or a view of namespace {@code nsId}, which exists, is named {@code name}: the
+     * two kinds share one set of names (docs/VIEWS.md V1).
+     */
+    public boolean entityNameTaken(int nsId, String name) {
+      return tableNameTaken(nsId, name) || viewNameTaken(nsId, name);
     }
 
     public Builder updateNamespaceVersion(int id, int newVersion) {

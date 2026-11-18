@@ -135,6 +135,7 @@ public class FormatExplorerFixtures {
             concurrentCreatesBoundAtReplay(),
             createByNameAfterADrop(),
             renameTableAcrossNamespaces(),
+            viewsInlineAndPointer(),
             inlineManifestList(),
             compactionWithCommittedSetGc(),
             compactionPagesCommittedSet(),
@@ -638,6 +639,95 @@ public class FormatExplorerFixtures {
           expect(state.containsTable(from), false, "staging.daily exists");
           expect(state.location(to), "s3://lake/staging/daily/v1.metadata.json", "location");
         });
+  }
+
+  /**
+   * A checkpoint holding a view, then a view (docs/VIEWS.md) created inline, a table create of
+   * its name rejected, the view's replace by a pointer writer, and its rename.
+   */
+  private static Scenario viewsInlineAndPointer() {
+    Namespace sales = Namespace.of("sales");
+    TableIdentifier weekly = TableIdentifier.of(sales, "weekly_revenue");
+    TableIdentifier view = TableIdentifier.of(sales, "daily_revenue");
+    TableIdentifier renamed = TableIdentifier.of(sales, "revenue_by_day");
+    Replica<CatalogState> base =
+        Log.of(emptyCatalog())
+            .append(txn(120), mut -> mut.createNamespace(sales)
+                .createView(weekly, CatalogState.ViewMetadataRef.location(
+                    "s3://lake/sales/weekly_revenue/metadata/00001-0c9e8a7b.gz.metadata.json")),
+                null)
+            .state();
+    CatalogState.ViewMetadataRef inline = InlineViewMetadata.encode(viewMetadata(
+        "SELECT day, sum(amount) AS revenue FROM sales.orders GROUP BY day"));
+    Log log = Log.checkpoint(base);
+    log.append(base, txn(121), mut -> mut.createView(view, inline),
+        "CreateView (Action field 14; id = -1, namespace_removals = 0, name = "
+            + "\"daily_revenue\"), its metadata inline: Iceberg's view JSON, gzipped "
+            + "(inline_metadata, codec = CODEC_JSON_GZIP, the only codec a view takes). Views have "
+            + "ids of their own: replay binds -1 to the checkpoint's next_view_id, 2. The name "
+            + "binds as a table's would, and a table's name is one it may not take.");
+    log.append(base, txn(122),
+        mut -> mut.createTable(view, "s3://lake/sales/daily_revenue/v1.metadata.json"),
+        "A writer that read the catalog before the view creates a table of its name: "
+            + "CreateTable(namespace_removals = 0). Rejected: tables and views share a "
+            + "namespace's names, and a view holds it.");
+    Replica<CatalogState> withView = log.state();
+    log.append(withView, txn(123),
+        mut -> mut.updateView(view, CatalogState.ViewMetadataRef.location(
+            "s3://lake/sales/daily_revenue/metadata/00002-4f1d2c3b.gz.metadata.json")),
+        "UpdateView (Action field 15; id = 2, version = 1): a pointer writer's replace sends "
+            + "the view's whole next metadata as a file's location. A view carries its whole "
+            + "metadata on every commit, never a delta, so it changes form here: inline to "
+            + "pointer. It applies only on the version read, under any conflict encoding.");
+    log.append(txn(124), mut -> mut.renameView(view, renamed),
+        "RenameView (Action field 17; id = 2, version = 2, new_namespace_removals = 0): the "
+            + "new name binds as a create's, across tables and views; the view keeps its id and "
+            + "metadata, and sales counts the name it freed.");
+    return log.scenario(
+        "views-inline-and-pointer",
+        "Views (docs/VIEWS.md): a checkpoint holding a pointer view, then a view's life as "
+            + "records: CreateView inline, a table create of its name rejected, an UpdateView "
+            + "that moves it to a metadata file, and a RenameView. Click CreateView's "
+            + "inline_metadata for its JSON.",
+        List.of(
+            "The checkpoint holds weekly_revenue as a View row (Checkpoint.views, field 14), "
+                + "with next_view_id (field 7), and says min_reader_version 2, as every "
+                + "checkpoint holding a view does: a reader before views would drop it.",
+            "Views are their own kind under a namespace, with their own ids, sharing the "
+                + "namespace's names with its tables."),
+        read -> {
+          CatalogState state = read.state();
+          expect(state.containsView(view), false, "sales.daily_revenue exists");
+          expect(state.viewId(renamed), 2, "sales.revenue_by_day id");
+          expect(state.viewVersion(2), 3, "view version");
+          expect(state.containsTable(view), false, "the rejected table exists");
+          expect(state.viewEntry(renamed).metadataLocation,
+              "s3://lake/sales/daily_revenue/metadata/00002-4f1d2c3b.gz.metadata.json",
+              "location");
+          expect(state.viewId(weekly), 1, "sales.weekly_revenue id");
+        });
+  }
+
+  /** A view's metadata, pinned: one version of {@code sql} over two columns. */
+  private static org.apache.iceberg.view.ViewMetadata viewMetadata(String sql) {
+    Schema schema = new Schema(
+        Types.NestedField.optional(1, "day", Types.DateType.get()),
+        Types.NestedField.optional(2, "revenue", Types.DecimalType.of(18, 2)));
+    return org.apache.iceberg.view.ViewMetadata.builder()
+        .assignUUID("019000ee-0000-7000-8000-000000000001")
+        .setLocation("s3://lake/sales/daily_revenue")
+        .setCurrentVersion(
+            org.apache.iceberg.view.ImmutableViewVersion.builder()
+                .versionId(1)
+                .schemaId(schema.schemaId())
+                .timestampMillis(PINNED_TS)
+                .defaultNamespace(Namespace.of("sales"))
+                .putSummary("engine-name", "spark")
+                .addRepresentations(org.apache.iceberg.view.ImmutableSQLViewRepresentation.builder()
+                    .dialect("spark").sql(sql).build())
+                .build(),
+            schema)
+        .build();
   }
 
   /**

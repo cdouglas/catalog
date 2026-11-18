@@ -89,9 +89,12 @@ message Checkpoint {
   // these, in log order (see CreateNamespace).
   int32 next_namespace_id = 2;
   int32 next_table_id = 3;
+  // Absent until the catalog's first view (then past 1); absent reads as 1.
+  int32 next_view_id = 7;
 
-  // The reader version this checkpoint needs (ProtoCodec
-  // SUPPORTED_READER_VERSION, now 1); a reader that supports less refuses it.
+  // The reader version this checkpoint needs: 2 (ProtoCodec
+  // SUPPORTED_READER_VERSION, VIEWS_READER_VERSION) when it holds a view, else
+  // 1, the version before views; a reader that supports less refuses it.
   int32 min_reader_version = 4;
 
   // The catalog's conflict encoding (ConflictEncoding): how replay decides
@@ -114,6 +117,9 @@ message Checkpoint {
 
   // Inline table metadata (tables with metadata stored in the catalog)
   repeated InlineTable inline_tables = 13;
+
+  // Views, pointer and inline, in order of id (docs/VIEWS.md)
+  repeated View views = 14;
 }
 
 // A table's snapshots are cut into blocks of `block` sequence numbers; block k
@@ -132,10 +138,10 @@ message Namespace {
   int32 version = 2;
   int32 parent_id = 3;      // 0 = root
   string name = 4;          // single level name, not full path
-  // The names the namespace has freed: each drop of a table or a child
-  // namespace, and each rename of a table out of its name there, adds one. It
-  // only grows, so a create by name (CreateTable.namespace_removals) that
-  // failed stays failed. Absent while 0.
+  // The names the namespace has freed: each drop of a table, a view or a
+  // child namespace, and each rename of a table or a view out of its name
+  // there, adds one. It only grows, so a create by name
+  // (CreateTable.namespace_removals) that failed stays failed. Absent while 0.
   int32 removals = 5;
 }
 
@@ -149,6 +155,26 @@ message Table {
   // layout; absent while it has none (a table it has not observed, or an
   // encoding that keeps none).
   bytes conflict_state = 6;
+}
+
+// A view (docs/VIEWS.md): its own kind under a namespace, with its own ids.
+// A namespace's tables and views share one set of names: no namespace holds a
+// table and a view of one name. Its metadata is whole in every version, a
+// metadata file's location or the metadata inline, so a view may change form
+// on any commit.
+message View {
+  int32 id = 1;
+  int32 version = 2;
+  int32 namespace_id = 3;
+  string name = 4;
+  oneof metadata {
+    // Iceberg's view metadata JSON (ViewMetadataParser), by codec
+    bytes  inline_metadata   = 5;
+    string metadata_location = 6;   // a view metadata file
+  }
+  // With inline_metadata, required (written even when 0): CODEC_JSON_GZIP,
+  // the only codec a view takes (the structural codec is a table codec)
+  InlineMetadataCodec codec = 7;
 }
 
 message NamespaceProperty {
@@ -276,6 +302,10 @@ message Action {
     RenameTable        rename_table         = 11;
     SetConflictEncoding set_conflict_encoding = 12;
     SetSnapshotPaging  set_snapshot_paging  = 13;
+    CreateView         create_view          = 14;
+    UpdateView         update_view          = 15;
+    DropView           drop_view            = 16;
+    RenameView         rename_view          = 17;
   }
 }
 
@@ -283,9 +313,9 @@ message Action {
 // Action types - version fields enable conflict detection
 // ============================================================
 
-// A transaction names the namespaces and tables it creates by late-bound
-// (negative) ids: -1, -2, ... for namespaces and, separately, for tables, in
-// the order of their creates. Replay binds
+// A transaction names the namespaces, tables and views it creates by
+// late-bound (negative) ids: -1, -2, ... for namespaces and, separately, for
+// tables and for views, in the order of their creates. Replay binds
 // each to the replaying state's next id when it applies the create, so every
 // reader assigns the same ids and two writers of one snapshot cannot claim
 // one id. Later actions of the same transaction may name a late-bound id;
@@ -299,7 +329,9 @@ message Action {
 //   *_version   the namespace is at the version the writer read, which any
 //               change there moves ("namespace");
 //   *_removals  the namespace exists, its removals (Namespace.removals) are
-//               those the writer read, and the name is free ("name"). A
+//               those the writer read, and the name is free ("name"): of
+//               child namespaces for a namespace's create; of tables and
+//               views alike for a table's or a view's, which share names. A
 //               negative namespace id must come with -1, a concrete one with
 //               a count; otherwise the action never applies.
 
@@ -383,6 +415,64 @@ message RenameTable {
     int32 new_namespace_removals = 6; // must match, and the new name free; -1 if late-bound
   }
   string new_name              = 5;
+}
+
+// ============================================================
+// View actions (docs/VIEWS.md)
+// ============================================================
+
+// A view's metadata in every view action is whole: inline_metadata (with its
+// codec, required, CODEC_JSON_GZIP only) or metadata_location; an action with
+// neither, or with another codec, never applies. A view applies only on the
+// version its writer read, under every conflict encoding.
+
+// Binds its name as CreateTable does, across tables and views. Apply bumps
+// its namespace's version.
+message CreateView {
+  int32 id = 1;                      // late-bound (negative)
+  int32 version = 2;                 // the new view's version (1)
+  int32 namespace_id = 3;            // negative if created in this transaction
+  oneof namespace_condition {
+    int32 namespace_version  = 4;    // must match; -1 if late-bound
+    int32 namespace_removals = 5;    // must match, and the name free; -1 if late-bound
+  }
+  string name = 6;
+  oneof metadata {
+    bytes  inline_metadata   = 7;
+    string metadata_location = 8;
+  }
+  InlineMetadataCodec codec = 9;     // with inline_metadata
+}
+
+// The view's whole next metadata (a replace, a property or location change).
+message UpdateView {
+  int32 id = 1;
+  int32 version = 2;                 // must match current
+  oneof metadata {
+    bytes  inline_metadata   = 3;
+    string metadata_location = 4;
+  }
+  InlineMetadataCodec codec = 5;     // with inline_metadata
+}
+
+// Apply bumps its namespace's version and removals.
+message DropView {
+  int32 id = 1;
+  int32 version = 2;                 // must match current
+}
+
+// As RenameTable: its new name binds as a create's does, across tables and
+// views. Apply bumps the view's version, both namespaces' versions, and the
+// removals of the namespace it leaves (even when it stays in it).
+message RenameView {
+  int32 id = 1;
+  int32 version = 2;                 // must match
+  int32 new_namespace_id = 3;        // negative if created in this transaction
+  oneof new_namespace_condition {
+    int32 new_namespace_version  = 4;  // must match; -1 if late-bound
+    int32 new_namespace_removals = 6;  // must match, and the new name free; -1 if late-bound
+  }
+  string new_name = 5;
 }
 
 // Sets the catalog's conflict encoding: the first record of a catalog

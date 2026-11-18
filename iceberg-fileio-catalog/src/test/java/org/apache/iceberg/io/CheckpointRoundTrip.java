@@ -617,7 +617,8 @@ public final class CheckpointRoundTrip {
     CatalogState file = replica.state();
     SortedMap<String, String> items = new TreeMap<>();
     items.put("catalog uuid", String.valueOf(replica.logId()));
-    items.put("next ids", file.nextNamespaceId() + "/" + file.nextTableId());
+    items.put("next ids",
+        file.nextNamespaceId() + "/" + file.nextTableId() + "/" + file.nextViewId());
     items.put("committed transactions", fingerprint(replica.committed().bytes()));
     for (Map.Entry<Integer, CatalogState.NsEntry> e : file.namespaceById().entrySet()) {
       CatalogState.NsEntry ns = e.getValue();
@@ -642,6 +643,18 @@ public final class CheckpointRoundTrip {
     }
     for (TableIdentifier t : file.tables()) {
       items.put("table name " + t, String.valueOf(file.tableId(t)));
+    }
+    for (Map.Entry<Integer, CatalogState.ViewEntry> e : file.viewById().entrySet()) {
+      CatalogState.ViewEntry v = e.getValue();
+      items.put(
+          "view " + e.getKey(),
+          String.format(
+              "namespace=%d name=%s version=%d location=%s inline=%s",
+              v.namespaceId, v.name, v.version, v.metadataLocation,
+              v.isInline() ? "codec=" + v.codec + " " + fingerprint(v.inlineMetadata()) : null));
+    }
+    for (TableIdentifier v : file.views()) {
+      items.put("view name " + v, String.valueOf(file.viewId(v)));
     }
     file.allInlineTables()
         .forEach(

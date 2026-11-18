@@ -78,6 +78,7 @@ public class TestProtoActions {
     private final CommittedSet.Builder committed = CommittedSet.builder();
     private int maxNsId = 0;
     private int maxTblId = 0;
+    private int maxViewId = 0;
 
     CatalogBuilder() {
       this.inner = CatalogState.builder();
@@ -113,6 +114,14 @@ public class TestProtoActions {
       return this;
     }
 
+    /** Adds a view with its whole metadata. Tracks max IDs automatically. */
+    CatalogBuilder view(
+        int id, int nsId, String name, int version, CatalogState.ViewMetadataRef metadata) {
+      inner.addView(id, nsId, name, version, metadata);
+      maxViewId = Math.max(maxViewId, id);
+      return this;
+    }
+
     /** Sets a namespace property. */
     CatalogBuilder prop(int nsId, String key, String value) {
       inner.setNamespaceProperty(nsId, key, value);
@@ -129,6 +138,7 @@ public class TestProtoActions {
     byte[] build() {
       inner.setNextNamespaceId(maxNsId + 1);
       inner.setNextTableId(maxTblId + 1);
+      inner.setNextViewId(maxViewId + 1);
       return CatalogTestSupport.encodeFullFile(
           CatalogTestSupport.LOG_ID, committed.build(), inner.build());
     }

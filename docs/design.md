@@ -604,6 +604,18 @@ reference that conflicts on the whole version and lets Iceberg retry,
 and the two must end alike; it was calibrated against mutants of the
 encodings (`fuzz/mutants`). `TestConflictMatrix` holds the matrix below.
 
+### I13. No namespace holds a table and a view of one name
+
+A namespace's tables and views share one set of names, as Iceberg's view
+catalogs require (VIEWS.md V7): every action that binds a name in a
+namespace (a table's or a view's create, a rename's new name) checks it
+against both kinds, by the condition its writer sent, and a name is freed
+only by an action that adds to the namespace's removals, of either kind.
+So the rule is stable (S2): a create that lost to the other kind's entity
+of its name stays rejected once that entity is dropped or renamed away (the
+cross-kind create ABA). `spec/WellFormed` checks the invariant after every
+apply, and `TestViewActions$SharedNames` holds a race of each kind.
+
 ## Operation × Operation Conflict Matrix
 
 The matrices below fall out of I2 (action versions are bumped on apply)
@@ -639,6 +651,13 @@ the same parent.
 | **UT**   | ✓    | —    | ✓    | ✓    | ✓    | ✓    | tbl v | tbl v | tbl v | tbl v |
 | **RT'**  | ns v | —    | ns v | ns v | ns v | ns v | tbl v | tbl v | tbl v | tbl v |
 | **RT**   | ✓    | ✓    | ✓    | ✓    | ✓    | ✓    | tbl v | tbl v | tbl v | ✓     |
+
+Views (VIEWS.md) add four actions that fall in the same pattern:
+`CreateView` binds a name as `CT` does (its row and column are `CT`'s), `RenameView` as
+`RT'` does, `DropView` as `DT` does, and `UpdateView` conflicts on the view's
+version alone, under every encoding (its row and column are `UT`'s under
+`lamport`). A view and a table of different names compose as two tables do;
+a create of either kind fails on the other kind's name.
 
 Legend: **CN↓** `CreateNamespace` (child), **DN** `DropNamespace`,
 **SP** `SetNamespaceProperty`, **RP** `RemoveNamespaceProperty`,
