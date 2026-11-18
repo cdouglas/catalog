@@ -192,7 +192,7 @@ below) as far as a provider's capabilities allow.
 | `TrimmedException` | `readThrough`, `readAfter` | the records asked for are gone | `readThrough`: the outcome is unknown, and a fresh read settles it; `readAfter`: a fresh read |
 | `LogGapException` | the runtime, on a view | the records do not start where the checkpoint ends, or do not follow the tail a fold needs: a gap or a splice | the read fails (the log is unreadable; unknown if a write may have landed) |
 | `LogLagException` | `readThrough` after its wait; a commit's read that stays behind the commit's floor | a replica of the log lags its appends | `readThrough`: the write is ambiguous, and a fresh read settles it; a lagging read: the log is unreadable |
-| any other exception | a write | the outcome is unknown | a fresh read settles it |
+| any other exception | a write | the outcome is unknown | waits as after a lost race, then a fresh read settles it (Bug 113 (ambiguous resends never wait)) |
 | any other exception | a read or probe | the log could not be read | unknown if a write may have landed; else rethrown |
 
 ## The envelope
@@ -684,8 +684,11 @@ function COMMIT(log, base, intention):
         # The write may have landed. Its record carries id, so a fresh read says. If it
         # has not landed and the intention still holds, retry: a write still in flight
         # carries the same record (and, if conditional, a condition on the tail it saw),
-        # so replay applies it once. A rejection stays one: S2.
+        # so replay applies it once. A rejection stays one: S2. Wait first, as after a
+        # lost race: an error the log does not classify (a 5xx past the SDK's retries)
+        # is otherwise read and resent at once, every attempt (Bug 113).
         ambiguous = e
+        raceBackoff()                             # interrupted: unknown
         fresh = READ()                            # failure: unknown
         if landed(fresh, e): return fresh
         settle(fresh)
@@ -766,7 +769,15 @@ Express as the benchmarks model it (an append ~22 ms) that is ~88 ms first and
 ~1.4 s at most. The ablation, basis `fixed`, starts the bound at
 `RuntimeConfig.raceMinWaitMs` (`fileio.catalog.race.retry.min-wait-ms`, default
 100 ms) and doubles it up to the larger of 1 s and that value; 0 waits for
-neither. The writers who lost to one winner would otherwise all read and
+neither. By latency, a runtime that has timed no write yet waits by the fixed
+bound: a send whose outcome is unknown is not timed, since its error may come
+from the client or after an SDK's own retries. A write whose outcome is
+unknown (an `Ambiguous` one) is followed by the same wait, before the read
+that settles it and the resend, and lost races and ambiguous writes double
+the bound alike: without it an error the log does not classify (a store
+that refuses every append with an error its FileIO does not map, a 5xx past
+the SDK's retries) was read and resent ten times within a few milliseconds,
+then reported unknown (Bug 113 (ambiguous resends never wait)). The writers who lost to one winner would otherwise all read and
 resend at once, and on a log that only replaces itself most of them lose
 again, each loss costing a read of the whole log (the contention benchmark:
 13.7 lost races per committed operation at 32 writers on an S3

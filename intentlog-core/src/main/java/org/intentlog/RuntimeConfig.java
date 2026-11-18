@@ -28,11 +28,12 @@ import java.util.function.LongSupplier;
  * @param maxThrottleAttempts the times a write is sent while storage throttles it (8)
  * @param throttleMinWaitMs the first backoff after a throttled write; later ones double, up to the
  *     larger of 5 s and this, each plus up to 50% jitter
- * @param raceMinWaitMs with {@link #raceByLatency} false, the bound of the first wait after a lost
- *     race (a conditional write that failed its condition), before the commit reads or probes the
- *     log again; each later lost race of the commit doubles it, up to the larger of 1 s and this.
- *     The wait is drawn uniformly below the bound (full jitter), so that writers who lost to one
- *     winner spread out. 0: no wait after a lost race, whatever the basis
+ * @param raceMinWaitMs with {@link #raceByLatency} false, or before the runtime has timed a write,
+ *     the bound of the first wait after a lost race (a conditional write that failed its
+ *     condition) or a write whose outcome is unknown, before the commit reads or probes the log
+ *     again; each later lost race or unknown write of the commit doubles it, up to the larger of 1
+ *     s and this. The wait is drawn uniformly below the bound (full jitter), so that writers who
+ *     lost to one winner spread out. 0: no wait after a lost race, whatever the basis
  * @param committedRetentionMs how long the committed set keeps an id (R): a compaction's GC record
  *     drops those older ({@code Long.MAX_VALUE}: never). Within it, a writer learns whether its
  *     record applied exactly, from the inline set or a page

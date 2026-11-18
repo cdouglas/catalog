@@ -663,18 +663,20 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
 
   /** Sleeps; an interrupt stops the caller, with {@code cause} (its outcome unknown) thrown. */
   /**
-   * The bound, in nanoseconds, of the wait after a commit's {@code lostRaces}-th lost race (0: no
-   * wait). By latency ({@link RuntimeConfig#raceByLatency}): {@link RuntimeConfig#RACE_FIRST_WRITES}
-   * times {@code latencyNanos}, the writes' observed latency, doubled for each race the commit lost
-   * before, up to {@link RuntimeConfig#RACE_MAX_WRITES} times it. Otherwise {@code raceMinWaitMs},
-   * doubled likewise, up to the larger of 1 s and it. {@code raceMinWaitMs} 0 waits for neither.
+   * The bound, in nanoseconds, of the wait after a commit's {@code lostRaces}-th lost race or
+   * ambiguous write (0: no wait). By latency ({@link RuntimeConfig#raceByLatency}): {@link
+   * RuntimeConfig#RACE_FIRST_WRITES} times {@code latencyNanos}, the writes' observed latency,
+   * doubled for each race the commit lost before, up to {@link RuntimeConfig#RACE_MAX_WRITES} times
+   * it. Otherwise, and by latency before the runtime has timed a write ({@code latencyNanos} 0),
+   * {@code raceMinWaitMs}, doubled likewise, up to the larger of 1 s and it. {@code raceMinWaitMs} 0
+   * waits for neither.
    */
   static long raceBoundNanos(RuntimeConfig config, long latencyNanos, int lostRaces) {
     long base = config.raceMinWaitMs();
     if (base <= 0L) {
       return 0L;
     }
-    if (config.raceByLatency()) {
+    if (config.raceByLatency() && latencyNanos > 0L) {
       long cap = RuntimeConfig.RACE_MAX_WRITES * latencyNanos;
       long bound = RuntimeConfig.RACE_FIRST_WRITES * latencyNanos;
       for (int lost = 1; lost < lostRaces && bound < cap; lost++) {
@@ -722,7 +724,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     sleepNanos(TimeUnit.MILLISECONDS.toNanos(ms), cause);
   }
 
-  private static void sleepNanos(long nanos, RuntimeException cause) {
+  private static void sleepNanos(long nanos, Throwable cause) {
     if (nanos <= 0L) {
       return;
     }
@@ -1331,6 +1333,9 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     // The races this commit lost (writes that failed their condition): each doubles the bound of
     // the wait before it reads or probes the log again (raceBackoff).
     private int lostRaces = 0;
+    // The writes of this commit whose outcome was unknown (AmbiguousWrite): each doubles the bound
+    // of that wait too, which comes before the read that settles the write and the resend.
+    private int ambiguousWrites = 0;
     // Whether the record is larger than one append stores (an Azure AppendBlock: 4 MiB before
     // service version 2022-11-02, 100 MiB since): only a replace can commit it. An append of it
     // fails without landing, which the commit took for ambiguous on every attempt (Bug 71).
@@ -1572,8 +1577,12 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
           // (and, if conditional, a condition on the tail it saw), so replay applies the intention
           // once. A rejection stays a rejection: replay verifies a record against the state it
           // lands on, and once it fails there it fails at every later point (S2), so a late
-          // landing of an intention that does not hold changes nothing.
+          // landing of an intention that does not hold changes nothing. Wait first, as after a
+          // lost race: a write that failed for a reason the log does not classify (a 5xx, an
+          // error storage answers every append with) would otherwise be read and resent at once,
+          // every attempt in a few milliseconds, into a store that may be struggling (Bug 113).
           ambiguous = e;
+          ambiguousBackoff(e);
           Replayed fresh = resolve(e.getCause());
           if (fresh == null) {
             throw new CommitOutcomeUnknownException(e.getCause());
@@ -1630,14 +1639,28 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
      */
     private void raceBackoff(RuntimeException lost) {
       lostRaces += 1;
-      long bound = raceBoundNanos(config, writeLatencyNanos.get(), lostRaces);
+      backoff(lost);
+    }
+
+    /**
+     * Waits after a write whose outcome is unknown, before the read that says whether it landed
+     * and the resend, as after a lost race ({@link #raceBackoff}); ambiguous writes and lost races
+     * double the bound alike. An interrupt stops the commit, its outcome unknown.
+     */
+    private void ambiguousBackoff(AmbiguousWrite e) {
+      ambiguousWrites += 1;
+      backoff(e.getCause());
+    }
+
+    private void backoff(Throwable cause) {
+      long bound = raceBoundNanos(config, writeLatencyNanos.get(), lostRaces + ambiguousWrites);
       if (bound <= 0L) {
         return;
       }
       long wait = ThreadLocalRandom.current().nextLong(bound + 1);
       CommitTrace.event(CommitTrace.Kind.BACKOFF, TimeUnit.NANOSECONDS.toMillis(wait),
           TimeUnit.NANOSECONDS.toMillis(bound));
-      sleepNanos(wait, lost);
+      sleepNanos(wait, cause);
     }
 
     private void adopt(Replayed fresh) {

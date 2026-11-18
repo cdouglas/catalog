@@ -61,7 +61,8 @@ on it and commits them atomically:
    its writes' observed latency at first
    (`fileio.catalog.race.retry.basis`); and it settles a write
    whose outcome it did not learn by reading the log for the
-   transaction's record, or throws `CommitStateUnknownException` (I10). A
+   transaction's record, after the same wait, or throws
+   `CommitStateUnknownException` (I10). A
    record whose preconditions fail goes back to the caller: the catalog
    (`LogCatalog`) stages a catalog operation again on a fresh read
    (`commitOnAFreshRead`), after the same wait, up to five times, and

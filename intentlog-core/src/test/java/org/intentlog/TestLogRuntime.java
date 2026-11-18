@@ -439,6 +439,68 @@ class TestLogRuntime {
     assertThat(bump(base, "k").state()).containsEntry("k", 1);
   }
 
+  /**
+   * Bug 113 (ambiguous resends never wait): a write whose outcome is unknown (here a request lost
+   * in flight, as an error the log does not classify reads) is followed by a wait, as after a lost
+   * race, before the read that says whether it landed and the resend; each doubles the bound. A
+   * commit whose every write is lost so ends unknown, its sends spread out instead of following
+   * one another at once.
+   */
+  @Test
+  void anAmbiguousWriteWaitsBeforeItReadsAndResends() { // [Resolve]
+    runtime = new LogRuntime<>(log, ToyMachine.INSTANCE,
+        config(10, NO_GC, 5L).withRaceByLatency(false));
+    Replica<Map<String, Integer>> base = created();
+    log.faults(Fault.LOST_REQUEST, Fault.LOST_REQUEST, Fault.LOST_REQUEST, Fault.LOST_REQUEST);
+    log.calls.clear();
+    CommitTrace.open();
+    try {
+      assertThatThrownBy(() -> bump(base, "k")).isInstanceOf(CommitOutcomeUnknownException.class);
+      List<CommitTrace.Event> events = CommitTrace.drain();
+      // each of the 4 attempts: sent, ambiguous, a wait, then the read that settles it
+      List<CommitTrace.Kind> kinds = events.stream().map(CommitTrace.Event::kind)
+          .filter(k -> k == CommitTrace.Kind.SEND || k == CommitTrace.Kind.AMBIGUOUS
+              || k == CommitTrace.Kind.BACKOFF || k == CommitTrace.Kind.READ)
+          .toList();
+      List<CommitTrace.Kind> attempt = List.of(CommitTrace.Kind.SEND,
+          CommitTrace.Kind.AMBIGUOUS, CommitTrace.Kind.BACKOFF, CommitTrace.Kind.READ);
+      assertThat(kinds).containsExactlyElementsOf(java.util.Collections.nCopies(4, attempt)
+          .stream().flatMap(List::stream).toList());
+      assertThat(events.stream().filter(e -> e.kind() == CommitTrace.Kind.BACKOFF)
+          .mapToLong(CommitTrace.Event::b)).containsExactly(5L, 10L, 20L, 40L);
+      // the races it lost: none
+      assertThat(events.get(events.size() - 1).b()).isZero();
+    } finally {
+      CommitTrace.close();
+    }
+    assertThat(log.versionCount()).isEqualTo(1); // nothing landed
+    assertThat(log.calls).containsExactly("append", "readAfter", "append", "readAfter",
+        "append", "readAfter", "append", "readAfter");
+  }
+
+  /**
+   * By latency, a runtime that has timed no write yet (none landed or lost a race: an ambiguous
+   * send is not timed) waits by the fixed bound, {@code raceMinWaitMs}: a client that opens a log
+   * and whose first writes fail does not resend at once (Bug 113).
+   */
+  @Test
+  void anAmbiguousWriteBeforeAnyTimedWriteWaitsByTheFixedBound() {
+    Replica<Map<String, Integer>> base = created();
+    runtime = new LogRuntime<>(log, ToyMachine.INSTANCE, config(10, NO_GC, 5L));
+    assertThat(runtime.writeLatencyNanos()).isZero();
+    log.faults(Fault.LOST_REQUEST, Fault.LOST_REQUEST);
+    CommitTrace.open();
+    try {
+      assertThat(bump(base, "k").state()).containsEntry("k", 1);
+      assertThat(CommitTrace.drain().stream().filter(e -> e.kind() == CommitTrace.Kind.BACKOFF)
+          .mapToLong(CommitTrace.Event::b)).containsExactly(5L, 10L);
+    } finally {
+      CommitTrace.close();
+    }
+    assertThat(LogRuntime.raceBoundNanos(config(10, NO_GC, 5L), 0L, 3))
+        .isEqualTo(20_000_000L);
+  }
+
   @Test
   void aWriteWhoseOutcomeNoReadCanSettleIsUnknown() { // [Resolve, Unreadable]
     Replica<Map<String, Integer>> base = created();
