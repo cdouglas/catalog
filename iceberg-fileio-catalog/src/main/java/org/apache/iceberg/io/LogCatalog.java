@@ -62,6 +62,7 @@ import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
+import org.apache.iceberg.exceptions.NoSuchViewException;
 import org.apache.iceberg.exceptions.ServiceUnavailableException;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -69,6 +70,10 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.util.LocationUtil;
 import org.apache.iceberg.util.PropertyUtil;
+import org.apache.iceberg.view.BaseMetastoreViewCatalog;
+import org.apache.iceberg.view.ViewMetadata;
+import org.apache.iceberg.view.ViewOperations;
+import org.apache.iceberg.view.ViewUtil;
 import org.intentlog.ReplayCheckError;
 import org.intentlog.Replica;
 import org.intentlog.RuntimeConfig;
@@ -76,8 +81,9 @@ import org.intentlog.SharedLog;
 
 /**
  * An Iceberg catalog whose state is replicated through a shared log ({@link SharedLog}): its
- * namespaces, their properties, and its tables, each with a pointer to a metadata file or (with
- * {@code fileio.catalog.inline}) its metadata inline. A read replays the log ({@link CatalogLog});
+ * namespaces, their properties, its tables and its views (docs/VIEWS.md), each with a pointer to a
+ * metadata file or (with {@code fileio.catalog.inline}) its metadata inline. A namespace's tables
+ * and views share one set of names. A read replays the log ({@link CatalogLog});
  * a change appends a transaction's intention to it, which takes effect where it lands if what it
  * read is unchanged there. Multi-table transactions commit the same way. Table files go to a
  * {@link FileIO} of their own.
@@ -88,7 +94,7 @@ import org.intentlog.SharedLog;
  * #closeWithCatalog}); a log or FileIO it was given stays its caller's, who may share it with
  * other catalogs.
  */
-public class LogCatalog extends BaseMetastoreCatalog
+public class LogCatalog extends BaseMetastoreViewCatalog
     implements SupportsNamespaces, SupportsCatalogTransactions {
   // TODO audit loadTable in BaseMetastoreCatalog
   // TODO buildTable overridden in BaseMetastoreCatalog?
@@ -650,8 +656,11 @@ public class LogCatalog extends BaseMetastoreCatalog
     return new LogTableBuilder(identifier, schema);
   }
 
-  /** Iceberg's table builder, whose replace transactions commit as replaces (Bug 81). */
-  private class LogTableBuilder extends BaseMetastoreCatalogTableBuilder {
+  /**
+   * Iceberg's table builder, whose replace transactions commit as replaces (Bug 81), and refuse a
+   * view's name, as a view catalog's do.
+   */
+  private class LogTableBuilder extends BaseMetastoreViewCatalogTableBuilder {
     LogTableBuilder(TableIdentifier identifier, Schema schema) {
       super(identifier, schema);
     }
@@ -729,6 +738,154 @@ public class LogCatalog extends BaseMetastoreCatalog
   LogCatalog leavingCommitOnceUnpinned() {
     this.pinsCommitOnce = false;
     return this;
+  }
+
+  //
+  // ViewCatalog (docs/VIEWS.md)
+  //
+
+  /**
+   * Operations on view {@code identifier}, as the next refresh finds it: its whole metadata inline
+   * where the catalog inlines ({@code fileio.catalog.inline}, which inlines tables and views
+   * alike) and it fits, else in a metadata file.
+   */
+  @Override
+  protected ViewOperations newViewOps(TableIdentifier identifier) {
+    InlineSettings inline = inlineSettings();
+    return new LogViewOperations(identifier, ViewUtil.fullViewName(name(), identifier), log, io,
+        inline.metadata, inline.maxUpdateSize, cleanup, createCondition);
+  }
+
+  @Override
+  public List<TableIdentifier> listViews(Namespace namespace) {
+    CatalogState state = state();
+    if (!namespace.isEmpty() && !state.containsNamespace(namespace)) {
+      throw new NoSuchNamespaceException(
+          "Cannot list views for namespace. Namespace does not exist: %s", namespace);
+    }
+    return state.views().stream()
+        .filter(v -> v.namespace().equals(namespace))
+        .sorted(Comparator.comparing(TableIdentifier::toString))
+        .collect(Collectors.toList());
+  }
+
+  /**
+   * Drops view {@code identifier}, staged again on a fresh read after a conflict with a concurrent
+   * change, as a table's drop is. Once the drop has landed, a pointer view's metadata file is
+   * deleted, as JDBC's drop deletes it ({@code gc.enabled}); an inline view has none (V9). A drop
+   * whose outcome is unknown keeps the file. false means only that the view did not exist.
+   *
+   * @throws ServiceUnavailableException if every attempt conflicted: nothing was dropped
+   */
+  @Override
+  public boolean dropView(TableIdentifier identifier) {
+    for (int attempt = 1; ; attempt++) {
+      Replica<CatalogState> read = log.read();
+      CatalogState.ViewEntry entry = read.state().viewEntry(identifier);
+      if (entry == null) {
+        return false;
+      }
+      ViewMetadata dropped = entry.isInline() ? null : droppedMetadata(identifier, entry);
+      CatalogMutation mut = mutation(read);
+      String kept = null;
+      try {
+        if (entry.isInline()) {
+          kept = keptView(identifier, entry, mut::wroteAhead);
+        }
+        mut.dropView(identifier).commit(log);
+      } catch (RuntimeException e) {
+        cleanup.delete(mut.abandonedFiles());
+        if (e instanceof NoSuchViewException) {
+          return false;
+        }
+        if (!(e instanceof CommitFailedException)) {
+          throw e;
+        }
+        if (attempt >= OPERATION_ATTEMPTS || !log.waitBeforeRetry(attempt)) {
+          throw unavailable((CommitFailedException) e, attempt, "drop view " + identifier);
+        }
+        continue;
+      }
+      if (kept != null) {
+        LOG.info("Dropped inline view {}: register {} to bring it back", identifier, kept);
+      }
+      if (dropped != null) {
+        try {
+          CatalogUtil.dropViewMetadata(io, dropped);
+        } catch (RuntimeException e) {
+          // the drop has landed: work after it does not change its outcome (design.md I10)
+          LOG.warn("Dropped view {}, but could not delete its metadata file", identifier, e);
+        }
+      }
+      return true;
+    }
+  }
+
+  /**
+   * Writes the inline view a drop removes to a metadata file in its metadata directory, as a pointer
+   * view's is, if its {@code gc.enabled} is false: Iceberg keeps a dropped view's metadata file
+   * then, for {@code registerView} to bring it back, and an inline view has none, as a non-purge
+   * drop of an inline table writes one ({@link LogCatalogProperties#DROP_MATERIALIZE}). Returns the
+   * file, given to {@code written} too; null if it writes none. A write that fails fails the drop;
+   * with {@link LogCatalogProperties#DROP_FORCE}, the drop goes on with none.
+   */
+  private String keptView(
+      TableIdentifier identifier, CatalogState.ViewEntry entry, Consumer<String> written) {
+    if (!LogCatalogProperties.dropMaterialize(catalogProperties)) {
+      return null;
+    }
+    ViewMetadata metadata = InlineViewMetadata.decode(entry.inlineMetadata(), entry.codec, null);
+    if (PropertyUtil.propertyAsBoolean(metadata.properties(),
+        org.apache.iceberg.TableProperties.GC_ENABLED,
+        org.apache.iceberg.TableProperties.GC_ENABLED_DEFAULT)) {
+      return null;
+    }
+    try {
+      String file = ((LogViewOperations) newViewOps(identifier)).writeFile(metadata);
+      written.accept(file);
+      return file;
+    } catch (RuntimeException e) {
+      if (!LogCatalogProperties.dropForce(catalogProperties)) {
+        throw e;
+      }
+      LOG.warn("Cannot write view {} to its metadata directory: dropping it anyway ({})",
+          identifier, LogCatalogProperties.DROP_FORCE, e);
+      return null;
+    }
+  }
+
+  /**
+   * The metadata of the pointer view a drop removes, whose file the drop deletes once it lands;
+   * null if the file is gone (the drop goes on, deleting nothing).
+   */
+  private ViewMetadata droppedMetadata(TableIdentifier identifier, CatalogState.ViewEntry entry) {
+    try {
+      return org.apache.iceberg.view.ViewMetadataParser.read(io, entry.metadataLocation);
+    } catch (org.apache.iceberg.exceptions.NotFoundException e) {
+      LOG.warn("Cannot read the metadata file of view {}: dropping it without deleting the file",
+          identifier, e);
+      return null;
+    }
+  }
+
+  /**
+   * Registers a table as {@link BaseMetastoreCatalog#registerTable} does, refusing a view's name
+   * first, as JDBC's does: the commit refuses it too, but only after reading the metadata file.
+   */
+  @Override
+  public org.apache.iceberg.Table registerTable(
+      TableIdentifier identifier, String metadataFileLocation) {
+    if (isValidIdentifier(identifier) && state().containsView(identifier)) {
+      throw new org.apache.iceberg.exceptions.AlreadyExistsException(
+          "View with same name already exists: %s", identifier);
+    }
+    return super.registerTable(identifier, metadataFileLocation);
+  }
+
+  @Override
+  public void renameView(TableIdentifier from, TableIdentifier to) {
+    commitOnAFreshRead("rename view " + from + " to " + to,
+        read -> mutation(read).renameView(from, to));
   }
 
   /** How this catalog stores table metadata, from its {@code fileio.catalog.inline*} properties. */

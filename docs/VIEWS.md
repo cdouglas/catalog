@@ -133,11 +133,17 @@ fresh read, as JDBC's does.
   created since.
 
 **V9. A drop deletes a pointer view's files.**
-- A drop deletes a pointer view's metadata once the drop has landed, as JDBC does. An inline
-  view has none.
+- A drop deletes a pointer view's metadata once the drop has landed, as JDBC does
+  (`CatalogUtil.dropViewMetadata`, under `gc.enabled`). An inline view has none.
 - Its files are deleted after an acknowledged drop only:
   - an unknown outcome keeps them;
   - a definitely failed drop wrote nothing.
+- With `gc.enabled` false, Iceberg keeps a dropped view's metadata file, for `registerView` to
+  bring it back. An inline view has none, so its drop first writes its metadata to a file in its
+  metadata directory, as a non-purge drop of an inline table does
+  (`fileio.catalog.drop.materialize`, default true), and logs it. A write that fails fails the
+  drop (`fileio.catalog.drop.force` drops it anyway); a drop that definitely failed has the file
+  deleted.
 - A pointer commit that definitely failed hands its new file to `CommitCleanup`, as table
   commits do (Bug 119 (failed attempts leave metadata files)).
 
@@ -297,22 +303,35 @@ predicate changed (edited). gzip is at the default level, as a pointer view's fi
   `BaseMetastoreCatalog` and implements `ViewCatalog`, and it keeps `SupportsNamespaces` and
   `SupportsCatalogTransactions`. It implements `newViewOps`, `listViews`, `dropView` and
   `renameView`. The base class provides `buildView`, `loadView`, `viewExists` and
-  `registerView`.
+  `registerView`. Its table builder extends `BaseMetastoreViewCatalogTableBuilder`, whose
+  replace transactions refuse a view's name.
 - **`LogViewOperations extends BaseViewOperations`.**
-  - `doRefresh` reads the view from the replica: inline, by decoding; a pointer, by reading
-    its file.
-  - `doCommit` stages `CreateView` (base null) or `UpdateView` on a fresh read, and commits
-    through `CatalogLog`:
-    - a pointer writer writes its file first (`writeNewMetadataIfRequired`);
-    - an inline writer sends bytes.
-  - **Retries.** Creates retry with the create backoff and give up as table creates do. A
-    create whose name is taken by the time it lands throws `AlreadyExistsException` (Bug 107
-    (create conflict reported as exists)).
+  - `doRefresh` reads the view from a fresh read: inline, by decoding; a pointer, by reading
+    its file. A pointer view's file deleted by a drop that landed after the read is read again
+    from a fresh read (`BaseViewOperations`' refresh on `NotFoundException`).
+  - `doCommit` stages `CreateView` (base null) or `UpdateView` on the read the view was loaded
+    from (an update built on another version fails as stale), and commits through
+    `CatalogLog`:
+    - an inline writer sends the bytes if they fit in `fileio.catalog.inline.max.update.size`;
+    - otherwise, and for a pointer writer, the file is written first
+      (`writeNewMetadataIfRequired`), and a registered view names its own file.
+  - **After a commit** the operations take the replica it landed in as the view's state, as a
+    table's do (errata D20): a pointer view holds the metadata it wrote rather than reading it
+    back, so a commit reads the catalog once.
+  - **Retries.** A create is staged again on a fresh read after a conflict, waiting as the
+    commit loop does, up to `OPERATION_ATTEMPTS`, as a table's create is. A create whose name
+    is taken by the time it lands throws `AlreadyExistsException`, with Iceberg's message for
+    the kind that holds it (Bug 107 (create conflict reported as exists)). An update that
+    conflicts fails (`CommitFailedException`); Iceberg's view updates retry it on a fresh read.
   - **Outcomes.** They map as table commits' do: `CommitFailedException`,
     `CommitStateUnknownException` (files kept), and `CommitCleanup` for what definitely failed.
+- **`dropView` and `renameView`** are staged on a fresh read and again after a conflict, as a
+  table's drop and rename are; they report a conflict in every attempt as
+  `ServiceUnavailableException`.
 - **Table-side changes.**
   - `createTable`, `registerTable` and `renameTable` onto a view's name throw
-    `AlreadyExistsException`.
+    `AlreadyExistsException` (`registerTable` checks before it reads the metadata file, as
+    JDBC's does).
   - `loadTable` of a view's name throws `NoSuchTableException`, and `loadView` of a table's
     name throws `NoSuchViewException`.
   - `listTables` lists no views, and `listViews` lists no tables.
