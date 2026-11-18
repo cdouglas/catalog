@@ -10,18 +10,24 @@
 # (TestCatalogRegressions' CreatesByName, and TestProtoActions' ByNameConflictTests), and the
 # multi-writer fuzzer, whose copies of landed records (DUPLICATE) and late landings (DELIVER) must
 # change nothing. Locally (2026-11-17) N1 at 1,000 tries catches each (first at try 5, 1, 2, 6 and
-# 54 in the order above), the regressions catch each, and the multi-writer fuzzer only noabsence
-# (at try 18 and 201 of its two properties on one object): the ABA mutants need a create by name
-# that a log of blind appends took and replay rejected, and a copy of it once its name is free,
-# which its schedules did not reach for absentonly in 4 x 3,000 tries (a create is 4% of the ops
-# they stage).
+# 54 in the order above), the regressions catch each, and the multi-writer fuzzer's general
+# properties only noabsence (at try 18 and 201 of its two properties on one object): the ABA
+# mutants need a create by name that a log of blind appends took and replay rejected, and a copy
+# of it once its name is free, which their schedules did not reach for absentonly in 4 x 3,000
+# tries (a create is 4% of the ops they stage). Its property aimed at that shape,
+# aRejectedBindingStaysRejectedOnceItsNameIsFree (a few names bound and freed on a shared log of
+# blind appends, a copy of each rejected binding once its names are free), alone at 20,000 tries
+# (2026-11-18) catches absentonly at try 1, noabsence at 72, dropnobump at 1,209, renamenobump at
+# 6,027 and nsdropnobump at 6,400 (earlier runs of it: absentonly at 8 and 268, dropnobump at 1,
+# renamenobump at 486, nsdropnobump at 274, and the last two not in 3,000 once each), and fails
+# nothing unmutated in 20,000 tries.
 MUTANTS="absentonly noabsence dropnobump renamenobump nsdropnobump"
 EQUIVALENT=""
 ORACLES=TestVerifyStabilityProperties,TestCatalogRegressions,TestProtoActions,TestMultiWriterProperties
 
 prepare() {
   tries $1/$T/spec/TestVerifyStabilityProperties.java 1000
-  tries $1/$T/spec/TestMultiWriterProperties.java each 300
+  tries $1/$T/spec/TestMultiWriterProperties.java 300 300 300 300 20000
 }
 
 mutant() { # name main-dir test-dir

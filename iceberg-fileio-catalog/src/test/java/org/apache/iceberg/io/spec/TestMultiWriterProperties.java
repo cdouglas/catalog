@@ -122,6 +122,12 @@ import org.intentlog.fileio.AtomicFileLog;
  * log through them. On both, a copy of any intention record that ever landed is appended again
  * ({@link Step#DUPLICATE}), whether its original is still a record, folded into a checkpoint, or
  * past the GC horizon: it must change nothing.
+ *
+ * <p>{@link #aRejectedBindingStaysRejectedOnceItsNameIsFree} narrows the schedules to names bound
+ * and freed (creates, drops and renames of a few names, namespace creates and drops), on a shared
+ * log of blind appends, where a record that replay rejects still lands, and lands a copy of each
+ * rejected create or rename again once its names are free: it must stay rejected (the ABA a
+ * namespace's removals stop, SPEC.md "Action Verification Rules").
  */
 class TestMultiWriterProperties {
 
@@ -138,8 +144,29 @@ class TestMultiWriterProperties {
           Namespace.of("b", "x"),
           Namespace.of("a", "x", "p"));
   private static final List<String> TABLE_NAMES = List.of("t", "u");
-  private static final List<TableIdentifier> TABLES = tablesOf(NAMESPACES);
   private static final List<String> KEYS = List.of("k1", "k2");
+
+  /** The names a run's operations pick from: namespaces, and table names in each of them. */
+  static final class Universe {
+    final List<Namespace> namespaces;
+    final List<String> tableNames;
+    final List<TableIdentifier> tables;
+
+    Universe(List<Namespace> namespaces, List<String> tableNames) {
+      this.namespaces = namespaces;
+      this.tableNames = tableNames;
+      this.tables = tablesOf(namespaces, tableNames);
+    }
+  }
+
+  private static final Universe EVERY_NAME = new Universe(NAMESPACES, TABLE_NAMES);
+  /**
+   * The seed's two namespaces and a child namespace that starts absent, and one name to create in
+   * each (beside the seed's tables, {@code t}): a run binds and frees the same few names again and
+   * again, and writers that read before one landed create it together.
+   */
+  private static final Universe FEW_NAMES = new Universe(
+      List.of(Namespace.of("a"), Namespace.of("b"), Namespace.of("a", "x")), List.of("u"));
 
   @Property(tries = 300)
   void historyIsSerialExecutionOfAcknowledgedTransactions(
@@ -216,6 +243,32 @@ class TestMultiWriterProperties {
   }
 
   /**
+   * A binding rejected where its record landed (a table or namespace create, a rename) stays
+   * rejected once its name is freed, by a drop, a rename or a namespace's drop: the ABA a
+   * namespace's removals stop, under writers of both create conditions. The schedules bind and
+   * free a few names ({@link #bindingSchedules}) on a shared log of blind appends, where a record
+   * replay rejects still lands. A copy of each such record lands again once all its names are free
+   * in namespaces that exist, where a check of the names alone would apply it; half the copies
+   * {@link Step#DUPLICATE} makes are of the newest of them; and on faulty storage a send delayed in
+   * flight lands late ({@link Step#DELIVER}). Ids are kept as long as by default (no GC with a
+   * retention of 0), so the committed set's horizon skips no copy. The oracles are the other
+   * properties': a copy changes nothing, and a late landing takes effect only for a commit whose
+   * outcome was unknown.
+   */
+  @Property(tries = 300)
+  void aRejectedBindingStaysRejectedOnceItsNameIsFree(
+      @ForAll @IntRange(min = 2, max = 4) int writers,
+      @ForAll("maxAppendCounts") int maxAppendCount,
+      @ForAll boolean faults,
+      @ForAll boolean tailReads,
+      @ForAll("encodings") String encoding,
+      @ForAll("bindingSchedules") List<Cmd> schedule,
+      @ForAll @IntRange(min = 0, max = 15) int namespaceWriters) {
+    new Run(new MultiWriterStorage.Memory(false, tailReads), writers, maxAppendCount, -1L,
+        faults, false, encoding, true, namespaceWriters, FEW_NAMES, true).execute(schedule);
+  }
+
+  /**
    * A commit step's third operand picks a read of the catalog during the commit to fail, two times
    * in three: one of its first four read requests, which fails (outright or mid-stream on one
    * object; on a shared log, outright or served stale). Later reads succeed. Returns the index of
@@ -262,14 +315,35 @@ class TestMultiWriterProperties {
 
   @Provide
   Arbitrary<List<Cmd>> schedules() {
-    Arbitrary<Step> steps = Arbitraries.frequency(
-        Tuple.of(2, Step.BEGIN), Tuple.of(8, Step.OP), Tuple.of(2, Step.COMMIT),
-        Tuple.of(1, Step.DUPLICATE), Tuple.of(1, Step.COMPACT), Tuple.of(1, Step.DELIVER));
+    return schedules(
+        Arbitraries.frequency(
+            Tuple.of(2, Step.BEGIN), Tuple.of(8, Step.OP), Tuple.of(2, Step.COMMIT),
+            Tuple.of(1, Step.DUPLICATE), Tuple.of(1, Step.COMPACT), Tuple.of(1, Step.DELIVER)),
+        opKinds());
+  }
+
+  /**
+   * Schedules that bind and free names: table creates (most often), drops and renames, namespace
+   * creates and drops; transactions begin and commit more often than in {@link #schedules}.
+   */
+  @Provide
+  Arbitrary<List<Cmd>> bindingSchedules() {
+    return schedules(
+        Arbitraries.frequency(
+            Tuple.of(3, Step.BEGIN), Tuple.of(8, Step.OP), Tuple.of(3, Step.COMMIT),
+            Tuple.of(1, Step.DUPLICATE), Tuple.of(1, Step.COMPACT), Tuple.of(1, Step.DELIVER)),
+        Arbitraries.frequency(
+            Tuple.of(3, OpKind.CREATE_TABLE), Tuple.of(2, OpKind.DROP_TABLE),
+            Tuple.of(2, OpKind.RENAME_TABLE), Tuple.of(2, OpKind.CREATE_NAMESPACE),
+            Tuple.of(2, OpKind.DROP_NAMESPACE)));
+  }
+
+  private static Arbitrary<List<Cmd>> schedules(Arbitrary<Step> steps, Arbitrary<OpKind> ops) {
     Arbitrary<Integer> small = Arbitraries.integers().between(0, 11);
     return Combinators.combine(
             steps,
             Arbitraries.integers().between(0, 3),
-            opKinds(),
+            ops,
             small,
             small,
             small,
@@ -762,6 +836,17 @@ class TestMultiWriterProperties {
     private final Map<ByteBuffer, Delayed> delayed = new HashMap<>();
     private Delayed running = null;
     private int nextValue = 0;
+    // The names the operations pick from
+    private final Universe universe;
+    // Whether rejected bindings are copied: once their names are free, and by half the DUPLICATEs
+    private final boolean copiesOfRejected;
+    // The records of transactions that bind a name (a create, a rename) that landed and changed
+    // nothing (replay rejected them), oldest first
+    private final List<byte[]> rejectedRecords = new ArrayList<>();
+    // Their transactions' operations
+    private final List<List<Op>> rejectedOps = new ArrayList<>();
+    // The rejected bindings a copy of has landed while their names were free
+    private final java.util.Set<Integer> copiedWhenFree = new java.util.HashSet<>();
 
     /**
      * With {@code gc}, the retention of committed transaction ids is 0: every CAS drops every id
@@ -773,7 +858,21 @@ class TestMultiWriterProperties {
      */
     Run(MultiWriterStorage storage, int writers, int maxAppendCount, long appendHeadroom,
         boolean faults, boolean gc, String encoding, boolean compactAfter, int namespaceWriters) {
+      this(storage, writers, maxAppendCount, appendHeadroom, faults, gc, encoding, compactAfter,
+          namespaceWriters, EVERY_NAME, false);
+    }
+
+    /**
+     * As above, its operations picking names from {@code universe}; with {@code copiesOfRejected},
+     * a copy of each rejected binding lands once its names are free ({@link #copyFreedBindings}),
+     * and half the copies of records are of the newest rejected bindings.
+     */
+    Run(MultiWriterStorage storage, int writers, int maxAppendCount, long appendHeadroom,
+        boolean faults, boolean gc, String encoding, boolean compactAfter, int namespaceWriters,
+        Universe universe, boolean copiesOfRejected) {
       this.storage = storage;
+      this.universe = universe;
+      this.copiesOfRejected = copiesOfRejected;
       this.faults = faults;
       this.gc = gc;
       Statistics.label("storage").collect(storage.describe());
@@ -970,6 +1069,7 @@ class TestMultiWriterProperties {
             break;
           case DELIVER:
             deliver();
+            copyFreedBindings();
             break;
           default:
             throw new IllegalStateException("Unknown step " + cmd.step);
@@ -982,28 +1082,64 @@ class TestMultiWriterProperties {
       }
       // The drain: what is still in flight lands, and is judged as it does.
       deliver();
+      copyFreedBindings();
       List<String> violations = storage.checkpointViolations();
       check(violations.isEmpty(), "checkpoints: %s", violations);
     }
 
-    /** A copy of a record that landed is appended again: it must change nothing. */
+    /**
+     * A copy of a record that landed is appended again: it must change nothing. With {@link
+     * #copiesOfRejected}, an even {@code pick} copies one of the newest rejected bindings.
+     */
     private void duplicate(int pick) {
-      List<byte[]> landed = storage.landedRecords();
+      boolean ofRejected = copiesOfRejected && pick % 2 == 0 && !rejectedRecords.isEmpty();
+      List<byte[]> landed = ofRejected ? rejectedRecords : storage.landedRecords();
       if (landed.isEmpty()) {
         return;
       }
-      Replica<CatalogState> before = read();
-      if (!storage.appendCopy(landed.get(pick % landed.size()))) {
+      int index = ofRejected
+          ? landed.size() - 1 - pick / 2 % landed.size()
+          : pick % landed.size();
+      if (copy(landed.get(index), String.format("duplicate of %srecord #%d",
+          ofRejected ? "rejected binding " : "", index))) {
+        Statistics.label("steps").collect(ofRejected ? "duplicate of a rejected binding" : "duplicate");
+      }
+    }
+
+    /**
+     * With {@link #copiesOfRejected}, between commits: a copy of each rejected binding whose names
+     * are all free again, in namespaces that exist, lands once (as a late copy of its record may,
+     * whenever it lands), where a check of the names alone would apply it.
+     */
+    private void copyFreedBindings() {
+      if (!copiesOfRejected || !commits.isEmpty()) {
         return;
       }
+      for (int i = 0; i < rejectedRecords.size(); i++) {
+        if (!copiedWhenFree.contains(i) && namesFree(read().state(), rejectedOps.get(i))) {
+          copiedWhenFree.add(i);
+          if (copy(rejectedRecords.get(i),
+              String.format("copy of rejected binding #%d, its names free again", i))) {
+            Statistics.label("steps").collect("copy of a rejected binding, its names free");
+          }
+        }
+      }
+    }
+
+    /** Appends a copy of {@code record}, which must change nothing; false if the store cannot. */
+    private boolean copy(byte[] record, String what) {
+      Replica<CatalogState> before = read();
+      if (!storage.appendCopy(record)) {
+        return false;
+      }
       Replica<CatalogState> after = read();
-      trace.append(String.format("duplicate of record #%d%n", pick % landed.size()));
+      trace.append(what).append('\n');
       check(View.of(after.state()).equals(View.of(before.state())),
           "a copy of a record applied:%n  before: %s%n  after:  %s",
           View.of(before.state()), View.of(after.state()));
       check(Arrays.equals(after.committed().bytes(), before.committed().bytes()),
           "a copy of a record changed the committed set or its horizon");
-      Statistics.label("steps").collect("duplicate");
+      return true;
     }
 
     /**
@@ -1018,6 +1154,10 @@ class TestMultiWriterProperties {
             !View.of(parse(write.after)).equals(View.of(parse(write.before)));
         trace.append(String.format("delayed w%d record landed%s%n", d.writer,
             effective ? " and took effect" : ""));
+        if (!effective && bindsAName(d.ops)) {
+          rejectedRecords.add(write.record);
+          rejectedOps.add(d.ops);
+        }
         Statistics.label("delayed landing").collect(
             (effective ? "took effect" : "changed nothing") + ", outcome " + d.outcome);
         String difference = storage.difference(write);
@@ -1045,6 +1185,41 @@ class TestMultiWriterProperties {
       }
     }
 
+    /**
+     * Whether every name {@code ops} bind is free on {@code state}, in a namespace that exists:
+     * where a check of the names alone would let a copy of their record apply.
+     */
+    private static boolean namesFree(CatalogState state, List<Op> ops) {
+      for (Op op : ops) {
+        boolean free;
+        switch (op.kind) {
+          case CREATE_TABLE:
+            free = !state.containsTable(op.table) && state.containsNamespace(op.table.namespace());
+            break;
+          case RENAME_TABLE:
+            free = !state.containsTable(op.to) && state.containsNamespace(op.to.namespace());
+            break;
+          case CREATE_NAMESPACE:
+            Namespace parent = parentOf(op.namespace);
+            free = !state.containsNamespace(op.namespace)
+                && (parent.isEmpty() || state.containsNamespace(parent));
+            break;
+          default:
+            continue;
+        }
+        if (!free) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    /** Whether {@code ops} bind a name: create a table or a namespace, or rename a table. */
+    private static boolean bindsAName(List<Op> ops) {
+      return ops.stream().anyMatch(op -> op.kind == OpKind.CREATE_TABLE
+          || op.kind == OpKind.CREATE_NAMESPACE || op.kind == OpKind.RENAME_TABLE);
+    }
+
     /** Whether {@code op} updates a table: a metadata file, or a delta. */
     private static boolean changes(Op op) {
       return op.kind == OpKind.UPDATE_TABLE || op.kind == OpKind.SET_TABLE_PROPERTY
@@ -1060,28 +1235,28 @@ class TestMultiWriterProperties {
       String value = "v" + nextValue++;
       switch (cmd.op) {
         case CREATE_NAMESPACE:
-          Namespace created = NAMESPACES.get(cmd.a % NAMESPACES.size());
+          Namespace created = pick(universe.namespaces, cmd.a);
           return cmd.b % 3 == 0
               ? Op.namespace(cmd.op, created, null, null)
               : Op.namespace(cmd.op, created, KEYS.get(cmd.b % 2), value);
         case DROP_NAMESPACE:
-          return Op.namespace(cmd.op, pick(namespaces, NAMESPACES, cmd.a), null, null);
+          return Op.namespace(cmd.op, pick(namespaces, universe.namespaces, cmd.a), null, null);
         case SET_PROPERTY:
         case REMOVE_PROPERTY:
           return Op.namespace(
               cmd.op,
-              pick(namespaces, NAMESPACES, cmd.a),
+              pick(namespaces, universe.namespaces, cmd.a),
               KEYS.get(cmd.b % 2),
               cmd.op == OpKind.SET_PROPERTY ? value : null);
         case CREATE_TABLE:
-          TableIdentifier fresh =
-              TableIdentifier.of(pick(namespaces, NAMESPACES, cmd.a), TABLE_NAMES.get(cmd.b % 2));
+          TableIdentifier fresh = TableIdentifier.of(
+              pick(namespaces, universe.namespaces, cmd.a), pick(universe.tableNames, cmd.b));
           return cmd.b / 2 % 2 == 1
               ? Op.inlineTable(fresh, "mem:///" + fresh + "/" + value)
               : Op.table(cmd.op, fresh, "mem:///" + fresh + "/" + value, null);
         case SET_TABLE_PROPERTY:
         case SET_TABLE_LOCATION:
-          TableIdentifier inline = pick(tables, TABLES, cmd.a);
+          TableIdentifier inline = pick(tables, universe.tables, cmd.a);
           if (!snap.isInlineTable(inline)) {
             return null; // a delta changes an inline table
           }
@@ -1091,14 +1266,14 @@ class TestMultiWriterProperties {
           delta.read = snap.tableVersion(snap.tableId(inline));
           return delta;
         case DROP_TABLE:
-          return Op.table(cmd.op, pick(tables, TABLES, cmd.a), null, null);
+          return Op.table(cmd.op, pick(tables, universe.tables, cmd.a), null, null);
         case UPDATE_TABLE:
         case READ_TABLE:
-          TableIdentifier t = pick(tables, TABLES, cmd.a);
+          TableIdentifier t = pick(tables, universe.tables, cmd.a);
           String location = cmd.op == OpKind.UPDATE_TABLE ? "mem:///" + t + "/" + value : null;
           return Op.table(cmd.op, t, location, snap.location(t));
         case RENAME_TABLE:
-          return Op.rename(pick(tables, TABLES, cmd.a), pick(TABLES, cmd.b));
+          return Op.rename(pick(tables, universe.tables, cmd.a), pick(universe.tables, cmd.b));
         default:
           throw new IllegalStateException("Unknown op " + cmd.op);
       }
@@ -1178,6 +1353,9 @@ class TestMultiWriterProperties {
             "one commit changed the state twice");
         if (!after.equals(View.of(parse(wr.before)))) {
           effective.add(wr);
+        } else if (wr.record != null && bindsAName(ops)) {
+          rejectedRecords.add(wr.record);
+          rejectedOps.add(ops);
         }
         checkIntegrity(after);
         String difference = storage.difference(wr);
@@ -1248,6 +1426,7 @@ class TestMultiWriterProperties {
       w.snapshot = null;
       w.snapshotBytes = null;
       w.ops = null;
+      copyFreedBindings();
     }
 
     /**
@@ -1352,10 +1531,10 @@ class TestMultiWriterProperties {
     return index >= 8 || snapshot.isEmpty() ? pick(universe, index) : pick(snapshot, index);
   }
 
-  private static List<TableIdentifier> tablesOf(List<Namespace> namespaces) {
+  private static List<TableIdentifier> tablesOf(List<Namespace> namespaces, List<String> names) {
     List<TableIdentifier> tables = new ArrayList<>();
     for (Namespace ns : namespaces) {
-      for (String name : TABLE_NAMES) {
+      for (String name : names) {
         tables.add(TableIdentifier.of(ns, name));
       }
     }

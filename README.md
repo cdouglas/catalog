@@ -203,7 +203,9 @@ suites skip; see [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
     inline delta replays to the metadata it committed.
   - `spec/` checks the format itself: concurrent writers (on one object
     and on a shared log, with copies of records appended again, and
-    sends that land late), invariants, codecs, canonical state, and N1,
+    sends that land late; one property binds and frees a few names, and
+    copies the records replay rejected once their names are free),
+    invariants, codecs, canonical state, and N1,
     that every action's verify is stable: an action rejected where its
     record lands is rejected on every later state, so a late copy of a
     rejected record never applies (`TestVerifyStabilityProperties`).
