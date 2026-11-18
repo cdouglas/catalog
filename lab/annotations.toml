@@ -124,7 +124,12 @@ select = ["g1-witness-*", "jmh/j-g1*"]
 select = ["i12-count-*", "i12-retention-*"]
 
 [campaigns.d17-expiry]
-select = ["d17-expiry-*"]
+select = ["where:label = 'd17-expiry' AND started_at < TIMESTAMP '2026-11-18 00:00:00'"]
+
+# d17-expiry rerun after Bug 117 (merged expiry cleans stale base): an expiry no longer merges
+# past another snapshot removal (fileio 6a4c762, havoc, 2026-11-18)
+[campaigns.d17-expiry-b117]
+select = ["where:label = 'd17-expiry' AND started_at >= TIMESTAMP '2026-11-18 00:00:00'"]
 [[annotate]]
 select = "where:label = 'pilot-mix' AND started_at < TIMESTAMP '2026-10-27 05:45:00'"
 mark = "superseded"
