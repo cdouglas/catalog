@@ -641,8 +641,8 @@ class TestCatalogRaceProperties {
       @ForAll("modes") LocalCatalogMode fileModeB,
       @ForAll("modes") LocalCatalogMode fileModeC,
       @ForAll("logs") LocalCatalogMode.Log catalogLog,
-      @ForAll @IntRange(min = 0, max = 11) int x,
-      @ForAll @IntRange(min = 0, max = 11) int y,
+      @ForAll @IntRange(min = 0, max = 47) int x,
+      @ForAll @IntRange(min = 0, max = 47) int y,
       @ForAll("tableRacers") Kind racerB,
       @ForAll("tableRacers") Kind racerC,
       @ForAll boolean twoRacers,
@@ -718,12 +718,17 @@ class TestCatalogRaceProperties {
         .as(Setup::new);
   }
 
+  /**
+   * Operations with operands 0 to 47: a catalog transaction's change and its variant come from
+   * {@code x / 12} and {@code y / 12} (see {@link Kind#CATALOG_TXN}); every other use of them is
+   * modulo 2, 3 or 4, or {@code / 4 % 2}, which 48 keeps uniform.
+   */
   @Provide
   Arbitrary<Op> ops() {
     return Combinators.combine(
             Arbitraries.of(Kind.class),
-            Arbitraries.integers().between(0, 11),
-            Arbitraries.integers().between(0, 11))
+            Arbitraries.integers().between(0, 47),
+            Arbitraries.integers().between(0, 47))
         .as(Op::new);
   }
 
@@ -737,7 +742,7 @@ class TestCatalogRaceProperties {
         Combinators.combine(
                 Arbitraries.of(Kind.SET_TABLE_PROPERTY, Kind.FAST_APPEND, Kind.DELETE_ALL,
                     Kind.DROP_TABLE, Kind.RENAME_TABLE, Kind.CATALOG_TXN),
-                Arbitraries.integers().between(0, 11))
+                Arbitraries.integers().between(0, 47))
             .as((kind, y) -> new Op(kind, 0, y)),
         Arbitraries.just(new Op(null, 0, 0)));
   }
@@ -824,8 +829,12 @@ class TestCatalogRaceProperties {
     DELETE_ALL,
     /**
      * Loads one table, or two (the second if it exists), in a catalog transaction, scans them when
-     * {@code y / 4} is even, appends to the first and commits; serializable when {@code x / 4} is
-     * even, else snapshot isolation.
+     * {@code y / 4} is even (or, the second, declares a read of it when {@code y / 12 % 4} is 3),
+     * appends to the first, stages one more change as {@code x / 12 % 4} picks, and commits;
+     * serializable when {@code x / 4} is even, else snapshot isolation. The change (the review's
+     * A6): none; a drop of the second table (purging it or not) or a rename of the first or the
+     * second; a create of a table, or a property of the first; a namespace's create, drop (of its
+     * tables first, a cascade), property set or removal. Its variant is {@code y / 12 % 4}.
      */
     CATALOG_TXN;
 
@@ -877,13 +886,32 @@ class TestCatalogRaceProperties {
       return y / 4 % 2 == 0;
     }
 
+    /** The change a transaction stages beyond its append, and its variant: 0 to 3 each. */
+    private int change() {
+      return x / 12 % 4;
+    }
+
+    private int variant() {
+      return y / 12 % 4;
+    }
+
+    /** Whether a transaction declares a read of the second table instead of scanning it. */
+    boolean declares() {
+      return variant() == 3;
+    }
+
+    /** The table a transaction's change creates, or renames a table to. */
+    private TableIdentifier third() {
+      return TABLES.get((x + y + 1) % TABLES.size());
+    }
+
     /**
      * The tables whose isolation the transaction checks: the one it appends to, and the other it
      * scans if it is serializable.
      */
     private List<TableIdentifier> readTables() {
-      return serializable() && scans() && !other().equals(table()) ? List.of(table(), other())
-          : List.of(table());
+      return serializable() && (scans() || declares()) && !other().equals(table())
+          ? List.of(table(), other()) : List.of(table());
     }
 
     /** What the transaction's isolation checks of each table it reads, as stored now. */
@@ -926,10 +954,16 @@ class TestCatalogRaceProperties {
         if (n.length == 1 || !t[0].equals(n[0])) {
           return false; // missing now, or another table
         }
-        if (!serializable() || !scans()) {
-          continue; // only a serializable transaction's scans are reads (errata D12)
+        if (!serializable()) {
+          continue; // only a serializable transaction's reads are reads (errata D12)
         }
-        if (!t[1].equals(n[1])) {
+        if (declares() && !other().equals(table()) && id.equals(other())) {
+          if (!t[2].equals(n[2])) {
+            return false; // a declared read holds the table's version
+          }
+          continue;
+        }
+        if (scans() && !t[1].equals(n[1])) {
           return false;
         }
       }
@@ -996,7 +1030,9 @@ class TestCatalogRaceProperties {
             }
             if (!other().equals(table()) && catalog.tableExists(other())) {
               Table read = txCatalog.loadTable(other());
-              if (scans()) {
+              if (declares()) {
+                txn.declareRead(other());
+              } else if (scans()) {
                 read.newScan().planFiles();
               }
             }
@@ -1007,8 +1043,9 @@ class TestCatalogRaceProperties {
                     .withRecordCount(1)
                     .build())
                 .commit();
+            String staged = stageChange(txCatalog, appended, who);
             txn.commitTransaction();
-            return "ok";
+            return "ok" + staged;
           default:
             handle[0] = catalog.loadTable(table());
             handle[0].newDelete()
@@ -1018,6 +1055,56 @@ class TestCatalogRaceProperties {
         }
       } catch (RuntimeException e) {
         return outcome(e);
+      }
+    }
+
+    /**
+     * Stages a catalog transaction's change beyond its append ({@link #change}) on {@code
+     * txCatalog}, the transaction's catalog, in which {@code appended} is the table it appended
+     * to; returns what it says of it ("" or a result).
+     */
+    private String stageChange(
+        org.apache.iceberg.catalog.Catalog txCatalog, Table appended, String who) {
+      org.apache.iceberg.catalog.SupportsNamespaces namespaces =
+          (org.apache.iceberg.catalog.SupportsNamespaces) txCatalog;
+      switch (change()) {
+        case 1:
+          switch (variant()) {
+            case 0:
+            case 1:
+              return " " + txCatalog.dropTable(other(), variant() == 1);
+            case 2:
+              txCatalog.renameTable(table(), third());
+              return "";
+            default:
+              txCatalog.renameTable(other(), third());
+              return "";
+          }
+        case 2:
+          if (variant() < 2) {
+            txCatalog.buildTable(third(), SCHEMA).withProperty("origin", who).create();
+          } else {
+            appended.updateProperties().set(key(), who).commit();
+          }
+          return "";
+        case 3:
+          Namespace ns = NAMESPACES.get((x / 4 + y) % NAMESPACES.size());
+          switch (variant()) {
+            case 0:
+              namespaces.createNamespace(ns, Map.of(key(), who));
+              return "";
+            case 1:
+              for (TableIdentifier t : txCatalog.listTables(ns)) {
+                txCatalog.dropTable(t, false);
+              }
+              return " " + namespaces.dropNamespace(ns);
+            case 2:
+              return " " + namespaces.setProperties(ns, Map.of(key(), who));
+            default:
+              return " " + namespaces.removeProperties(ns, Set.of(key()));
+          }
+        default:
+          return "";
       }
     }
 
@@ -1034,6 +1121,25 @@ class TestCatalogRaceProperties {
         return "ok";
       } catch (RuntimeException e) {
         return outcome(e);
+      }
+    }
+
+    /** What {@link #stageChange} stages, for the trace. */
+    private String describeChange() {
+      Namespace ns = NAMESPACES.get((x / 4 + y) % NAMESPACES.size());
+      switch (change()) {
+        case 1:
+          return new String[] {", drop " + other(), ", drop " + other() + " with purge",
+              ", rename " + table() + " to " + third(),
+              ", rename " + other() + " to " + third()}[variant()];
+        case 2:
+          return variant() < 2 ? ", create " + third() : ", set " + key() + " on " + table();
+        case 3:
+          return new String[] {", create namespace " + ns, ", drop namespace " + ns
+              + " and its tables", ", set " + key() + " on " + ns, ", remove " + key() + " from "
+              + ns}[variant()];
+        default:
+          return "";
       }
     }
 
@@ -1066,10 +1172,12 @@ class TestCatalogRaceProperties {
         case DELETE_ALL:
           return "deleteAll(" + table() + ")";
         case CATALOG_TXN:
-          return String.format("catalogTxn(%s, %s %s%s)",
+          return String.format("catalogTxn(%s, %s %s%s%s)",
               serializable() ? "serializable" : "snapshot", scans() ? "scan and append to"
                   : "append to", table(),
-              other().equals(table()) ? "" : (scans() ? ", scan " : ", load ") + other());
+              other().equals(table()) ? "" : (declares() ? ", declare a read of "
+                  : scans() ? ", scan " : ", load ") + other(),
+              describeChange());
         default:
           return kind + "(" + table() + ")";
       }

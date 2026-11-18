@@ -95,7 +95,9 @@ import org.intentlog.wire.LogEnvelope;
  * table and its refs alone expires) and those retention settings, manifest rewrites, table
  * create / drop / rename (across namespaces too) / replace, upgrades from format v2 to v3,
  * namespace create / drop and property changes, and multi-table catalog transactions whose
- * loads, appends and commit are separate steps, so other writers' operations run in between. A
+ * steps (loads, appends, scans of a branch or tag, declared reads, table drops with purge or not,
+ * renames, creates and property changes, namespace creates, drops and property changes) and
+ * commit are separate commands, so other writers' operations run in between. A
  * command may also preempt the one before it: it runs to completion just before one of that
  * operation's reads of the catalog or its first conditional write, so the two race. Each writer
  * has its own catalog mode (append / CAS / compaction, pointer / inline TM / inline ML), or all
@@ -146,9 +148,13 @@ import org.intentlog.wire.LogEnvelope;
  *   <li>Row lineage, in a v3 table: once a snapshot has row ids, every live data file has them; the
  *       files' ranges are disjoint and below the table's next row id; a file's first row id never
  *       changes along main's lineage, nor do a snapshot's first row id and added rows.
- *   <li>An acknowledged catalog transaction saw no concurrent change it must not miss: any change
- *       to a table it appended to, since it first loaded the table (errata D12); and, under
- *       serializable isolation, to the main branch of any table it scanned (a load is not a read).
+ *   <li>A catalog transaction's changes take effect all together at its commit, or none of them
+ *       (the 2026-11-17 review's A6). An acknowledged one saw no concurrent change it must not
+ *       miss: a table it changed was not replaced since it first loaded it (errata D12); and,
+ *       under serializable isolation, every branch or tag it scanned names the snapshot it read,
+ *       and a table whose read it declared is at the version it read (a load is not a read). A
+ *       table it, or any drop, removed keeping its files can be registered again: a metadata file
+ *       under its location holds its last version.
  *   <li>Progress (the 2026-11-17 review's A5): an operation whose model effect applies, and no
  *       fault was injected into, is not rejected as a conflict ({@link CommitFailedException}, or
  *       {@code ServiceUnavailableException} once a catalog operation's attempts ran out) when
@@ -401,6 +407,14 @@ class TestCatalogFaultProperties {
             Tuple.of(3, Kind.TXN_BEGIN),
             Tuple.of(4, Kind.TXN_APPEND),
             Tuple.of(2, Kind.TXN_READ),
+            Tuple.of(1, Kind.TXN_DROP),
+            Tuple.of(1, Kind.TXN_RENAME),
+            Tuple.of(1, Kind.TXN_CREATE),
+            Tuple.of(1, Kind.TXN_SET_PROPERTY),
+            Tuple.of(1, Kind.TXN_CREATE_NAMESPACE),
+            Tuple.of(1, Kind.TXN_DROP_NAMESPACE),
+            Tuple.of(1, Kind.TXN_SET_NAMESPACE_PROPERTY),
+            Tuple.of(1, Kind.TXN_REMOVE_NAMESPACE_PROPERTY),
             Tuple.of(3, Kind.TXN_COMMIT));
     Arbitrary<Integer> small = Arbitraries.integers().between(0, 11);
     Arbitrary<Integer> preempt =
@@ -570,9 +584,36 @@ class TestCatalogFaultProperties {
     TXN_BEGIN,
     /** Loads a table in the open catalog transaction and stages an append to it. */
     TXN_APPEND,
-    /** Loads a table in the open catalog transaction. */
+    /**
+     * Loads a table in the open catalog transaction and reads it, as {@code c % 4} picks: a scan
+     * of main, of b0 or of t0 (main if the table has no such ref), or a declared read.
+     */
     TXN_READ,
-    TXN_COMMIT
+    /** Drops a table in the open catalog transaction, purging it when {@code b} is odd. */
+    TXN_DROP,
+    /**
+     * Renames a table in the open catalog transaction to the one {@code b} picks: mostly a name
+     * the table does not have, when {@code b < 8}.
+     */
+    TXN_RENAME,
+    /** Creates a table in the open catalog transaction, in format v2 or v3 as {@code b} picks. */
+    TXN_CREATE,
+    /** Sets fz.k1 or fz.k2 on a table in the open catalog transaction. */
+    TXN_SET_PROPERTY,
+    /**
+     * Namespace changes in the open catalog transaction, as their namesakes without TXN_; a drop,
+     * when {@code c} is odd, drops the namespace's tables first, keeping their files.
+     */
+    TXN_CREATE_NAMESPACE,
+    TXN_DROP_NAMESPACE,
+    TXN_SET_NAMESPACE_PROPERTY,
+    TXN_REMOVE_NAMESPACE_PROPERTY,
+    TXN_COMMIT;
+
+    /** Whether it stages a change or read in a catalog transaction, changing no catalog yet. */
+    boolean stagesInATransaction() {
+      return name().startsWith("TXN_") && this != TXN_COMMIT;
+    }
   }
 
   /**
@@ -707,6 +748,11 @@ class TestCatalogFaultProperties {
     }
 
     TableState copy() {
+      return withUuid(uuid);
+    }
+
+    /** A copy of this state, as a table of UUID {@code uuid}. */
+    TableState withUuid(String uuid) {
       TableState copy = new TableState(uuid, formatVersion);
       copy.files.addAll(files);
       copy.deletes.putAll(deletes);
@@ -834,6 +880,8 @@ class TestCatalogFaultProperties {
     // For an expiry: its table, and the snapshots it chose to expire just before it committed
     TableIdentifier expiring = null;
     Set<Long> chosen = null;
+    // The tables, by their names before it ran, it drops keeping their files
+    List<TableIdentifier> keeping = List.of();
 
     Op(String description, Action action, Effect effect) {
       this.description = description;
@@ -876,18 +924,42 @@ class TestCatalogFaultProperties {
   /** A table loaded in a writer's open catalog transaction, as it was when first loaded. */
   private static final class Loaded {
     final String uuid;
-    final Long snapshotId;
     final String metadataLocation;
-    boolean appended = false;
-    boolean scanned = false;
+    final TableMetadata metadata;
+    // Whether the transaction changed it (an update, a drop, a rename), and updated it (an append
+    // or a property, which the conflict encoding judges on an inline table)
+    boolean changed = false;
+    boolean updated = false;
+    // The refs it scanned, each to the snapshot it named then (null: none), and whether it
+    // declared a read of the table
+    final Map<String, Long> scans = new TreeMap<>();
+    boolean declared = false;
 
     Loaded(TableMetadata metadata) {
       this.uuid = metadata.uuid();
-      this.snapshotId =
-          metadata.currentSnapshot() == null ? null : metadata.currentSnapshot().snapshotId();
       this.metadataLocation = metadata.metadataFileLocation();
+      this.metadata = metadata;
     }
   }
+
+  /** A change a writer staged in its open catalog transaction, and its effect at the commit. */
+  private static final class Staged {
+    final String description;
+    final Effect effect;
+
+    Staged(String description, Effect effect) {
+      this.description = description;
+      this.effect = effect;
+    }
+
+    @Override
+    public String toString() {
+      return description;
+    }
+  }
+
+  /** The UUID the model gives a table a catalog transaction creates, until its commit lands. */
+  private static final String CREATED_IN_TXN = "created in a transaction ";
 
   private static final class Writer {
     final int id;
@@ -897,8 +969,17 @@ class TestCatalogFaultProperties {
     final boolean inline;
     final Map<TableIdentifier, Table> handles = new HashMap<>();
     CatalogTransaction txn = null;
+    // The tables the open transaction loaded, by the catalog's names they had then
     final Map<TableIdentifier, Loaded> loaded = new LinkedHashMap<>();
-    final List<Map.Entry<TableIdentifier, String>> staged = new ArrayList<>();
+    final List<Staged> staged = new ArrayList<>();
+    // Each name the transaction resolves to a table it holds, to the catalog's name that table had
+    // when the transaction loaded it; a table it created, to null
+    final Map<TableIdentifier, TableIdentifier> names = new HashMap<>();
+    // The tables it drops with purge, and keeping their files, by the catalog's names; the
+    // namespaces it created
+    final List<TableIdentifier> purging = new ArrayList<>();
+    final List<TableIdentifier> keeping = new ArrayList<>();
+    final Set<Namespace> createdNamespaces = new HashSet<>();
 
     Writer(int id, LogCatalog catalog, boolean inline) {
       this.id = id;
@@ -910,6 +991,22 @@ class TestCatalogFaultProperties {
       txn = null;
       loaded.clear();
       staged.clear();
+      names.clear();
+      purging.clear();
+      keeping.clear();
+      createdNamespaces.clear();
+    }
+
+    /**
+     * Loads {@code id} in the open transaction, and returns how the transaction first loaded the
+     * table it names there; null for a table it created.
+     */
+    Loaded load(TableIdentifier id, Table[] table) {
+      table[0] = txn.asCatalog().loadTable(id);
+      names.putIfAbsent(id, id); // a table the transaction has not touched: the catalog's
+      TableIdentifier origin = names.get(id);
+      return origin == null ? null : loaded.computeIfAbsent(
+          origin, k -> new Loaded(((HasTableOperations) table[0]).operations().current()));
     }
   }
 
@@ -1503,7 +1600,7 @@ class TestCatalogFaultProperties {
           boolean purge = cmd.b % 2 == 1;
           Set<String> purgeable = purge ? purgeable(id) : Set.of();
           boolean[] purged = {false};
-          return new Op(
+          Op drop = new Op(
               "dropTable(" + id + (purge ? ", purge" : "") + ")",
               () -> {
                 if (!w.catalog.dropTable(id, purge)) {
@@ -1518,6 +1615,8 @@ class TestCatalogFaultProperties {
                   checkPurged(id, purgeable);
                 }
               });
+          drop.keeping = purge ? List.of() : List.of(id);
+          return drop;
         case RENAME_TABLE:
           TableIdentifier to = TABLES.get(cmd.b % TABLES.size());
           if (to.equals(id)) {
@@ -2135,59 +2234,191 @@ class TestCatalogFaultProperties {
               () -> w.txn = w.catalog.createTransaction(level),
               (m, actual) -> {});
         case TXN_APPEND:
+          if (w.txn == null) {
+            return null;
+          }
+          DataFile staged = newFile();
+          return staging(w, "txn.append(" + id + ", " + staged.location() + ")", () -> {
+            Table[] table = {null};
+            Loaded at = w.load(id, table);
+            table[0].newFastAppend().appendFile(inSpec(table[0], staged)).commit();
+            if (at != null) {
+              at.changed = true;
+              at.updated = true;
+            }
+            return new Staged("append " + staged.location() + " to " + id,
+                (m, actual) -> existing(m, id).files.add(staged.location()));
+          });
         case TXN_READ:
           if (w.txn == null) {
             return null;
           }
-          DataFile staged = cmd.kind == Kind.TXN_APPEND ? newFile() : null;
-          return new Op(
-              staged != null ? "txn.append(" + id + ", " + staged.location() + ")" : "txn.read(" + id + ")",
-              () -> {
-                try {
-                  Catalog txc = w.txn.asCatalog();
-                  Table table = txc.loadTable(id);
-                  w.loaded.computeIfAbsent(
-                      id, k -> new Loaded(((HasTableOperations) table).operations().current()));
-                  if (staged != null) {
-                    table.newFastAppend().appendFile(inSpec(table, staged)).commit();
-                    w.loaded.get(id).appended = true;
-                    w.staged.add(Map.entry(id, staged.location()));
-                  } else {
-                    table.newScan().planFiles();
-                    w.loaded.get(id).scanned = true;
+          String readRef = new String[] {SnapshotRef.MAIN_BRANCH, "b0", "t0", null}[cmd.c % 4];
+          return staging(w, "txn.read(" + id + (readRef == null ? ", declared" : ", " + readRef)
+              + ")", () -> {
+                Table[] table = {null};
+                Loaded at = w.load(id, table);
+                if (readRef == null) {
+                  w.txn.declareRead(id);
+                  if (at != null) {
+                    at.declared = true;
                   }
-                } catch (org.apache.iceberg.exceptions.NotFoundException e) {
-                  // The transaction stages on the version it read; an expiry, or a drop with
-                  // purge, since may have deleted that version's manifest list, which the append
-                  // reads. A rejection, as for a stale handle (the transaction would fail at
-                  // commit anyway: the table changed since it read it). A live snapshot without
-                  // its manifest list is still caught by the check of every snapshot's list.
-                  w.closeTxn();
-                  throw new ValidationException(e, "the transaction's snapshot is gone");
-                } catch (RuntimeException e) {
-                  w.closeTxn(); // abandon the transaction
-                  throw e;
+                  return null;
                 }
-              },
-              (m, actual) -> {});
+                // A ref the table had when the transaction loaded it, else main
+                String scanRef = at != null && at.metadata.ref(readRef) != null ? readRef
+                    : SnapshotRef.MAIN_BRANCH;
+                try (CloseableIterable<FileScanTask> tasks =
+                    table[0].newScan().useRef(scanRef).planFiles()) {
+                  tasks.forEach(task -> { });
+                } catch (IllegalArgumentException e) {
+                  // main of a table with no snapshot: its rows, none, are read all the same
+                  table[0].newScan().planFiles();
+                } catch (IOException e) {
+                  throw new UncheckedIOException(e);
+                }
+                if (at != null) {
+                  SnapshotRef readHead = at.metadata.ref(scanRef);
+                  at.scans.put(scanRef, readHead == null ? null : readHead.snapshotId());
+                }
+                return null;
+              });
+        case TXN_DROP:
+          if (w.txn == null) {
+            return null;
+          }
+          boolean txnPurge = cmd.b % 2 == 1;
+          return staging(w, "txn.dropTable(" + id + (txnPurge ? ", purge" : "") + ")", () -> {
+            if (w.names.containsKey(id) && w.names.get(id) == null) {
+              throw new ValidationException("%s was created in the transaction", id);
+            }
+            Table[] table = {null};
+            Loaded at = w.load(id, table);
+            if (!w.txn.asCatalog().dropTable(id, txnPurge)) {
+              throw new NoSuchTableException("dropTable returned false: %s", id);
+            }
+            at.changed = true;
+            TableIdentifier origin = w.names.remove(id);
+            (txnPurge ? w.purging : w.keeping).add(origin);
+            return new Staged("drop " + id + (txnPurge ? " with purge" : ""), (m, actual) -> {
+              existing(m, id);
+              m.remove(id);
+            });
+          });
+        case TXN_RENAME:
+          if (w.txn == null) {
+            return null;
+          }
+          // Mostly a name the model does not have; else any, to collide
+          List<TableIdentifier> free = new ArrayList<>(TABLES);
+          free.removeAll(model.keySet());
+          TableIdentifier txnTo = cmd.b >= 8 || free.isEmpty()
+              ? TABLES.get(cmd.b % TABLES.size()) : free.get(cmd.b % free.size());
+          if (txnTo.equals(id)) {
+            return null;
+          }
+          return staging(w, "txn.renameTable(" + id + ", " + txnTo + ")", () -> {
+            Table[] table = {null};
+            Loaded at = w.load(id, table);
+            w.txn.asCatalog().renameTable(id, txnTo);
+            if (at != null) {
+              at.changed = true;
+            }
+            w.names.put(txnTo, w.names.remove(id));
+            return new Staged("rename " + id + " to " + txnTo, (m, actual) -> {
+              TableState state = existing(m, id);
+              if (m.containsKey(txnTo)) {
+                throw new IllegalStateException(txnTo + " exists");
+              }
+              if (!m.namespaces.containsKey(txnTo.namespace())) {
+                throw new IllegalStateException(txnTo.namespace() + " does not exist");
+              }
+              m.remove(id);
+              m.put(txnTo, state);
+            });
+          });
+        case TXN_CREATE:
+          if (w.txn == null) {
+            return null;
+          }
+          List<TableIdentifier> absent = new ArrayList<>(TABLES);
+          absent.removeAll(model.keySet());
+          TableIdentifier txnCreated = cmd.a >= 8 || absent.isEmpty()
+              ? TABLES.get(cmd.a % TABLES.size()) : absent.get(cmd.a % absent.size());
+          int txnVersion = 2 + cmd.b % 2;
+          String placeholder = CREATED_IN_TXN + nextValue++;
+          return staging(w, "txn.createTable(" + txnCreated + ", v" + txnVersion + ")", () -> {
+            w.txn.asCatalog().buildTable(txnCreated, SCHEMA)
+                .withProperty(TableProperties.FORMAT_VERSION, String.valueOf(txnVersion))
+                .create();
+            w.names.put(txnCreated, null);
+            return new Staged("create " + txnCreated, (m, actual) -> {
+              if (m.containsKey(txnCreated) || !m.namespaces.containsKey(txnCreated.namespace())) {
+                throw new IllegalStateException("cannot create " + txnCreated);
+              }
+              m.put(txnCreated, new TableState(placeholder, txnVersion));
+            });
+          });
+        case TXN_SET_PROPERTY:
+          if (w.txn == null) {
+            return null;
+          }
+          String txnPropKey = KEYS.get(cmd.b % KEYS.size());
+          String txnPropValue = "v" + nextValue++;
+          return staging(w, "txn.setProperty(" + id + ", " + txnPropKey + "=" + txnPropValue + ")",
+              () -> {
+                Table[] table = {null};
+                Loaded at = w.load(id, table);
+                table[0].updateProperties().set(txnPropKey, txnPropValue).commit();
+                if (at != null) {
+                  at.changed = true;
+                  at.updated = true;
+                }
+                return new Staged("set " + txnPropKey + " on " + id,
+                    (m, actual) -> existing(m, id).props.put(txnPropKey, txnPropValue));
+              });
+        case TXN_CREATE_NAMESPACE:
+        case TXN_DROP_NAMESPACE:
+        case TXN_SET_NAMESPACE_PROPERTY:
+        case TXN_REMOVE_NAMESPACE_PROPERTY:
+          if (w.txn == null) {
+            return null;
+          }
+          return txnNamespaceOp(cmd, w, NAMESPACES.get(cmd.b % NAMESPACES.size()));
         case TXN_COMMIT:
           if (w.txn == null) {
             return null;
           }
           CatalogTransaction txn = w.txn;
           Map<TableIdentifier, Loaded> loaded = new LinkedHashMap<>(w.loaded);
-          List<Map.Entry<TableIdentifier, String>> appends = new ArrayList<>(w.staged);
+          List<Staged> changes = new ArrayList<>(w.staged);
+          // What each purge deletes: the manifests and lists of the table as it is now, just
+          // before the commit (Bug 96)
+          Map<TableIdentifier, Set<String>> purging = new TreeMap<>(BY_NAME);
+          w.purging.forEach(t -> purging.put(t, purgeable(t)));
+          List<TableIdentifier> keepingFiles = new ArrayList<>(w.keeping);
           w.closeTxn();
+          boolean[] landed = {false};
           Op commit = new Op(
-              "txn.commit(" + txn.isolationLevel() + ", appends " + appends + ")",
-              txn::commitTransaction,
+              "txn.commit(" + txn.isolationLevel() + ", " + changes + ")",
+              () -> {
+                txn.commitTransaction();
+                landed[0] = true;
+              },
               (m, actual) -> {
-                if (!appends.isEmpty()) {
-                  checkIsolation(txn.isolationLevel(), loaded, m);
+                // All of it, or nothing: the effects apply to the model's copy in the order the
+                // transaction staged them, and any that does not apply fails the whole
+                checkIsolation(txn.isolationLevel(), loaded, m);
+                for (Staged change : changes) {
+                  change.effect.apply(m, actual);
                 }
-                appends.forEach(e -> existing(m, e.getKey()).files.add(e.getValue()));
+                adoptCreated(m, actual);
+                if (landed[0]) {
+                  purging.forEach(this::checkPurged);
+                }
               });
           commit.loaded = loaded;
+          commit.keeping = keepingFiles;
           return commit;
         default:
           throw new IllegalStateException("Unknown kind " + cmd.kind);
@@ -2258,6 +2489,178 @@ class TestCatalogFaultProperties {
       }
     }
 
+    /** A step staging a change or a read in a catalog transaction. */
+    @FunctionalInterface
+    interface Stage {
+      /** Stages it; returns the change staged, or null for a read. */
+      Staged stage();
+    }
+
+    /**
+     * {@code w}'s step {@code stage} in its open transaction, which changes no catalog: a change
+     * joins the transaction's, for its commit. A step the transaction refuses (a table or
+     * namespace it does not have, or has, or one not empty) leaves it open; any other failure
+     * abandons it.
+     */
+    private Op staging(Writer w, String description, Stage stage) {
+      return new Op(description, () -> {
+        try {
+          Staged change = stage.stage();
+          if (change != null) {
+            w.staged.add(change);
+          }
+        } catch (NoSuchTableException | AlreadyExistsException | NoSuchNamespaceException
+            | NamespaceNotEmptyException | ValidationException e) {
+          throw e;
+        } catch (UnsupportedOperationException | IllegalArgumentException e) {
+          // a namespace it dropped created again, a ref it does not have
+          throw new ValidationException(e, "%s", e.getMessage());
+        } catch (org.apache.iceberg.exceptions.NotFoundException e) {
+          // The transaction stages on the version it read; an expiry, or a drop with purge,
+          // since may have deleted that version's manifest list, which the append reads. A
+          // rejection, as for a stale handle (the transaction would fail at commit anyway: the
+          // table changed since it read it). A live snapshot without its manifest list is still
+          // caught by the check of every snapshot's list.
+          w.closeTxn();
+          throw new ValidationException(e, "the transaction's snapshot is gone");
+        } catch (RuntimeException e) {
+          w.closeTxn(); // abandon the transaction
+          throw e;
+        }
+      }, (m, actual) -> {});
+    }
+
+    /** A namespace change on {@code ns} in {@code w}'s open transaction. */
+    private Op txnNamespaceOp(Cmd cmd, Writer w, Namespace ns) {
+      String key = KEYS.get(cmd.b / 2 % KEYS.size());
+      org.apache.iceberg.catalog.SupportsNamespaces txc =
+          (org.apache.iceberg.catalog.SupportsNamespaces) w.txn.asCatalog();
+      switch (cmd.kind) {
+        case TXN_CREATE_NAMESPACE:
+          Map<String, String> props = cmd.b % 2 == 1 ? Map.of(key, "v" + nextValue++) : Map.of();
+          return staging(w, "txn.createNamespace(" + ns + ", " + props + ")", () -> {
+            txc.createNamespace(ns, props);
+            w.createdNamespaces.add(ns);
+            return new Staged("create " + ns, (m, actual) -> {
+              if (m.namespaces.containsKey(ns)) {
+                throw new IllegalStateException(ns + " exists");
+              }
+              m.namespaces.put(ns, new TreeMap<>(props));
+            });
+          });
+        case TXN_DROP_NAMESPACE:
+          if (w.createdNamespaces.contains(ns)) {
+            return null; // created and dropped: neither happens, which the model does not follow
+          }
+          // Half the time a cascade: the namespace's tables dropped first, keeping their files
+          boolean cascade = cmd.c % 2 == 1;
+          return staging(w, "txn.dropNamespace(" + ns + (cascade ? ", its tables first" : "")
+              + ")", () -> {
+            if (cascade) {
+              for (TableIdentifier t : w.txn.asCatalog().listTables(ns)) {
+                if (w.names.containsKey(t) && w.names.get(t) == null) {
+                  continue; // created in the transaction, which the model does not drop
+                }
+                Table[] table = {null};
+                Loaded at = w.load(t, table);
+                if (w.txn.asCatalog().dropTable(t, false)) {
+                  at.changed = true;
+                  w.keeping.add(w.names.remove(t));
+                  w.staged.add(new Staged("drop " + t, (m, actual) -> {
+                    existing(m, t);
+                    m.remove(t);
+                  }));
+                }
+              }
+            }
+            if (!txc.dropNamespace(ns)) {
+              throw new NoSuchNamespaceException("dropNamespace returned false: %s", ns);
+            }
+            return new Staged("drop " + ns, (m, actual) -> {
+              if (!m.namespaces.containsKey(ns)) {
+                throw new IllegalStateException(ns + " does not exist");
+              }
+              if (m.keySet().stream().anyMatch(t -> t.namespace().equals(ns))) {
+                throw new IllegalStateException(ns + " is not empty");
+              }
+              m.namespaces.remove(ns);
+            });
+          });
+        case TXN_SET_NAMESPACE_PROPERTY:
+          String value = "v" + nextValue++;
+          return staging(w, "txn.setProperties(" + ns + ", " + key + "=" + value + ")", () -> {
+            txc.setProperties(ns, Map.of(key, value));
+            return new Staged("set " + key + " on " + ns, (m, actual) -> {
+              if (!m.namespaces.containsKey(ns)) {
+                throw new IllegalStateException(ns + " does not exist");
+              }
+              m.namespaces.get(ns).put(key, value);
+            });
+          });
+        default:
+          return staging(w, "txn.removeProperties(" + ns + ", " + key + ")", () -> {
+            txc.removeProperties(ns, Set.of(key));
+            return new Staged("remove " + key + " from " + ns, (m, actual) -> {
+              if (!m.namespaces.containsKey(ns)) {
+                throw new IllegalStateException(ns + " does not exist");
+              }
+              m.namespaces.get(ns).remove(key);
+            });
+          });
+      }
+    }
+
+    /**
+     * Gives each table a catalog transaction created the UUID the catalog has for it, at the name
+     * it has once the transaction's changes apply.
+     */
+    private static void adoptCreated(Model m, Model actual) {
+      for (TableIdentifier name : new ArrayList<>(m.keySet())) {
+        TableState state = m.get(name);
+        if (state.uuid.startsWith(CREATED_IN_TXN)) {
+          TableState now = actual.get(name);
+          if (now == null) {
+            throw new IllegalStateException(name + ", which the transaction created, is missing");
+          }
+          m.put(name, state.withUuid(now.uuid));
+        }
+      }
+    }
+
+    /**
+     * Checks that {@code was}, a table dropped keeping its files, can be registered again (errata
+     * T4): a metadata file under its location holds its last version, its UUID, snapshots and
+     * current snapshot.
+     */
+    private void checkKept(TableIdentifier id, TableState was) {
+      String location;
+      try {
+        location = org.apache.iceberg.util.JsonUtil.mapper().readTree(was.json).get("location")
+            .asText();
+      } catch (IOException e) {
+        throw new UncheckedIOException(e);
+      }
+      List<String> files = new ArrayList<>();
+      for (org.apache.iceberg.io.FileInfo file : io.listPrefix(location + "/metadata/")) {
+        if (!file.location().endsWith(".metadata.json")) {
+          continue;
+        }
+        TableMetadata kept = TableMetadataParser.read(io, file.location());
+        files.add(file.location());
+        Set<Long> snapshots = new TreeSet<>();
+        kept.snapshots().forEach(snapshot -> snapshots.add(snapshot.snapshotId()));
+        Long current = kept.currentSnapshot() == null ? null : kept.currentSnapshot().snapshotId();
+        if (kept.uuid().equals(was.uuid) && snapshots.equals(was.snapshotIds)
+            && Objects.equals(current, was.snapshotId)) {
+          Statistics.label("a table dropped keeping its files").collect("registerable");
+          return;
+        }
+      }
+      throw fail("%s was dropped keeping its files, but no metadata file under %s holds its last"
+          + " version (snapshots %s, current %s): %s", id, location, was.snapshotIds,
+          was.snapshotId, files);
+    }
+
     /**
      * Throws if a catalog transaction that loaded {@code loaded} could not have committed on
      * {@code current}, the state its effects apply to.
@@ -2267,8 +2670,9 @@ class TestCatalogFaultProperties {
         Map<TableIdentifier, TableState> current) {
       loaded.forEach(
           (id, at) -> {
-            boolean read = level == IsolationLevel.SERIALIZABLE && at.scanned;
-            if (!at.appended && !read) {
+            boolean read = level == IsolationLevel.SERIALIZABLE
+                && (!at.scans.isEmpty() || at.declared);
+            if (!at.changed && !read) {
               return; // a load is not a read
             }
             TableState now = current.get(id);
@@ -2276,19 +2680,26 @@ class TestCatalogFaultProperties {
               throw new IsolationViolation(level + ": " + id + " was replaced or dropped");
             }
             if (!read) {
-              // a table it wrote may have changed since: an inline table's appends are judged
-              // where the record lands (errata D12), and the model checks what they did
+              // a table it changed may have changed since: an inline table's updates are judged
+              // where the record lands (errata D12), a drop or rename applies to the table as it
+              // is, and the model checks what they did
               return;
             }
-            // serializable: each table it scanned, its main branch (its rows: none, if it had
-            // no snapshot then and has none now)
-            boolean unchanged = Objects.equals(at.snapshotId, now.snapshotId);
-            if (!unchanged) {
-              throw new IsolationViolation(
-                  String.format(
-                      "%s: %s changed after it was scanned (snapshot %s -> %s, metadata %s -> %s)",
-                      level, id, at.snapshotId, now.snapshotId, at.metadataLocation,
-                      now.metadataLocation));
+            // serializable: each ref it scanned names the snapshot it read (its rows: none, if
+            // it named none then and names none now); a declared read, the version it read
+            for (Map.Entry<String, Long> scan : at.scans.entrySet()) {
+              Long named = now.refIds.get(scan.getKey());
+              if (!Objects.equals(scan.getValue(), named)) {
+                throw new IsolationViolation(String.format(
+                    "%s: %s changed after it was scanned (%s at snapshot %s -> %s, metadata %s ->"
+                        + " %s)", level, id, scan.getKey(), scan.getValue(), named,
+                    at.metadataLocation, now.metadataLocation));
+              }
+            }
+            if (at.declared && !Objects.equals(at.metadataLocation, now.metadataLocation)) {
+              throw new IsolationViolation(String.format(
+                  "%s: %s changed after its read was declared (metadata %s -> %s)", level, id,
+                  at.metadataLocation, now.metadataLocation));
             }
           });
     }
@@ -2303,8 +2714,9 @@ class TestCatalogFaultProperties {
       trace.append(String.format("%sw%d %s%n", indent, w.id, op));
       Outcome outcome;
       String reason = "";
-      // A rejection as a conflict, which may need to be justified (see mustCommit)
+      // A rejection as a conflict, which may need to be justified (see mustCommit), and the failure
       boolean conflict = false;
+      RuntimeException failure = null;
       if (topLevel) {
         armed = true;
       }
@@ -2321,11 +2733,18 @@ class TestCatalogFaultProperties {
         // (create conflict reported as exists))
         outcome = Outcome.REJECTED;
         reason = e.getClass().getSimpleName() + ": " + firstLine(e);
+        failure = e;
+        // A catalog transaction's commit refused for a table or namespace it should not find,
+        // or find: its model effect checks those (the review's A6)
         conflict = e instanceof CommitFailedException
-            || e instanceof org.apache.iceberg.exceptions.ServiceUnavailableException;
+            || e instanceof org.apache.iceberg.exceptions.ServiceUnavailableException
+            || cmd.kind == Kind.TXN_COMMIT && !(e instanceof ValidationException)
+                && !(e instanceof CommitRefusedException);
       } catch (NoSuchTableException e) {
         outcome = Outcome.REJECTED;
         reason = e.getClass().getSimpleName() + ": " + firstLine(e);
+        conflict = cmd.kind == Kind.TXN_COMMIT;
+        failure = e;
         w.handles.clear(); // a handle to a dropped table is unusable; a caller reloads
       } catch (IllegalStateException e) {
         if (e.getMessage() == null || !e.getMessage().startsWith("Table UUID does not match")) {
@@ -2358,12 +2777,13 @@ class TestCatalogFaultProperties {
       if (!faultsFired.isEmpty()) {
         Statistics.label("outcome after a fault").collect(outcome);
       }
-      if (cmd.kind == Kind.TXN_BEGIN || cmd.kind == Kind.TXN_APPEND || cmd.kind == Kind.TXN_READ) {
+      if (cmd.kind == Kind.TXN_BEGIN || cmd.kind.stagesInATransaction()) {
         return; // no change to the catalog
       }
       // A preempting command runs without faults, and nothing preempts it
       String must = conflict && (!topLevel || fired.isEmpty())
-          ? mustCommit(cmd, w, op, topLevel && !preempting.isEmpty(), topLevel && writes == 0)
+          ? mustCommit(cmd, w, op, topLevel && !preempting.isEmpty(), topLevel && writes == 0,
+              failure)
           : null;
       resolve(cmd, op, outcome, reason, must,
           topLevel && !preempting.isEmpty(), !topLevel || fired.isEmpty());
@@ -2374,7 +2794,8 @@ class TestCatalogFaultProperties {
      * committed if its model effect applies; null if it may conflict. {@code preempted}: a command
      * ran inside it; {@code unsent}: it wrote nothing to the catalog's log.
      */
-    private String mustCommit(Cmd cmd, Writer w, Op op, boolean preempted, boolean unsent) {
+    private String mustCommit(Cmd cmd, Writer w, Op op, boolean preempted, boolean unsent,
+        RuntimeException failure) {
       if (op.loaded != null) { // a catalog transaction's commit
         if (preempted) {
           return null;
@@ -2395,12 +2816,13 @@ class TestCatalogFaultProperties {
           // transaction loaded it and is the same inline table now (LogCatalog.stageJudged)
           int[] then = LogCatalog.inlineVersion(at.metadataLocation);
           int[] since = LogCatalog.inlineVersion(now.metadataLocation);
-          judged &= !at.appended || then != null && since != null && then[0] == since[0];
-          judged &= at.appended || !at.scanned
+          judged &= !at.updated || then != null && since != null && then[0] == since[0];
+          judged &= at.updated || !at.changed && at.scans.isEmpty() && !at.declared
               || Objects.equals(now.metadataLocation, at.metadataLocation);
         }
-        if (unchanged) {
-          return "no other writer changed the tables it loaded since it loaded them";
+        if (unchanged || !(failure instanceof CommitFailedException)) {
+          return unchanged ? "no other writer changed the tables it loaded since it loaded them"
+              : "nothing raced it";
         }
         return judged ? "it appended only to inline tables, whose appends the conflict encoding"
             + " judges where the record lands, yet it sent no record" : null;
@@ -2479,7 +2901,19 @@ class TestCatalogFaultProperties {
             state.lastSequenceNumber = now.lastSequenceNumber;
             state.sequenceNumbers.clear();
             state.sequenceNumbers.putAll(now.sequenceNumbers);
+            state.refIds.clear();
+            state.refIds.putAll(now.refIds);
           });
+      // A table dropped keeping its files, by an operation that took effect, can be registered
+      // again (errata T4)
+      if (outcome == Outcome.ACKNOWLEDGED || outcome == Outcome.UNKNOWN && withDiff == null) {
+        for (TableIdentifier kept : op.keeping) {
+          TableState was = lastActual.get(kept);
+          if (was != null) {
+            checkKept(kept, was);
+          }
+        }
+      }
       checkHistory(cmd, op, outcome, preempted, faultless, actual);
       lastActual = actual;
     }
