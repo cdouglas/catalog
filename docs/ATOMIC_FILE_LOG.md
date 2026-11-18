@@ -289,8 +289,9 @@ bootstrap at once: one creates the object, and the others find it created.
 
 The header's `formatVersion` must equal `AtomicFileLog.FORMAT_VERSION` (3), or,
 for a segmented log's catalog object, `SEGMENTED_FORMAT_VERSION` (4): the same
-frames, holding the checkpoint, the position it covers and the segments'
-Installs and Retired entries ([LOG_SEGMENTS.md](LOG_SEGMENTS.md),
+frames, holding the checkpoint, the position it covers, where the segments are
+(unless at the default) and the segments' Installs and Retired entries
+([LOG_SEGMENTS.md](LOG_SEGMENTS.md),
 [AZURE_LOG_FORMAT.md](AZURE_LOG_FORMAT.md) §3.1). A log opened for one refuses
 the other, so a client without a segment store never appends to a segmented
 log's catalog object.

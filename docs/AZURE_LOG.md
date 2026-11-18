@@ -113,13 +113,19 @@ a writer whose record landed past the limit knows it with no read.
 
 [LOG_SEGMENTS.md](LOG_SEGMENTS.md) is the design. In brief:
 - **The catalog object** is the catalog's FileIO's object at `<warehouse>/catalog`, in format 4
-  ([ATOMIC_FILE_LOG.md](ATOMIC_FILE_LOG.md)): the checkpoint, the position it covers, the
-  Installs of the segments from its own on (each setting its segment's record limit K), and
-  the retired segments. An Install is a conditional append; a checkpoint, a CAS replace.
-- **The segments** are Append Blobs under `fileio.catalog.log.location`, each log's under its
-  id: `<location>/<log id>/seg-<ordinal>-<nonce>` (LOG_SEGMENTS.md D12), so catalogs given one
-  location keep their logs apart. A segment ends at its Kth record or its first seal frame. Its
-  records count only once every earlier segment has ended.
+  ([ATOMIC_FILE_LOG.md](ATOMIC_FILE_LOG.md)): the checkpoint, the position it covers, where the
+  segments are (unless at the default), the Installs of the segments from its own on (each
+  setting its segment's record limit K), and the retired segments. An Install is a conditional
+  append; a checkpoint, a CAS replace.
+- **The segments** are Append Blobs under the prefix the catalog object records (LOG_SEGMENTS.md
+  D13): the `fileio.catalog.log.location` its creator was given, or by default, for a catalog
+  object on Azure, beside it: `https://<account>.blob.<suffix>/<container>/<path>.segments` for
+  the object `abfss://<container>@<account>.dfs.<suffix>/<path>`, which the object then doesn't
+  record. So every client finds them, whatever it is configured with, and needs only the
+  account's credentials. Each log's are under its id: `<prefix>/<log id>/seg-<ordinal>-<nonce>`
+  (D12), so catalogs whose creators were given one location keep their logs apart. A segment
+  ends at its Kth record or its first seal frame. Its records count only once every earlier
+  segment has ended.
 - **Appends** go to the first segment a writer knows open; near its end a writer installs the
   next ahead. A read through an append seals any earlier segment that hasn't ended, and an
   append past its segment's end is void, a lost race (D4).
@@ -153,7 +159,10 @@ A read is two requests (the catalog object, then the segment), a refresh one.
 | limits | 50,000 blocks a blob; blocks of 4 MiB before service version 2022-11-02, 100 MiB since; a blob of 50,000 × 4 MiB |
 
 The catalog object's requests are its FileIO's (on Azure, the fork's ADLS FileIO: conditional
-appends, and CAS by rename), and its pages are under `<warehouse>/catalog.committed/`.
+appends, and CAS by rename), and its pages are under `<warehouse>/catalog.committed/`. A segment
+is named by its Blob URL (`BlobUrlSegments`), and its requests go to the container that URL
+names, through a store opened for it on first use, signed by the key or signature the
+catalog's properties give for its account.
 
 ## Failures
 
@@ -180,8 +189,9 @@ which is the bug `SegmentedLog.tla`'s `sdkretry` switch puts back.
 | Property | Default | Meaning |
 |---|---|---|
 | `fileio.catalog.log` | `atomic-file` | `azure-append`: the segmented log on Azure Append Blobs |
-| `fileio.catalog.log.location` | none: required | the segments' prefix, `https://<account>.blob.core.windows.net/<container>/<path>`; each log's segments are under `<path>/<log id>/`, so catalogs may share one |
-| `adls.auth.shared-key.account.name`, `.key` | none: required | the account key the segments' requests are signed with |
+| `fileio.catalog.log.location` | the default: beside the catalog object | where a log this catalog creates keeps its segments, `https://<account>.blob.core.windows.net/<container>/<path>`; each log's segments are under `<path>/<log id>/`, so catalogs may share one. The catalog object records it (LOG_SEGMENTS.md D13), so a client opening a log needs none, and one given another is warned that it is ignored. Its default, for a catalog object `abfs[s]://<container>@<account>.dfs.<suffix>/<path>` (or `wasb[s]://`, `.blob.`), is `https://<account>.blob.<suffix>/<container>/<path>.segments`, which the object doesn't record; a catalog object elsewhere has none, and a client creating its log needs this |
+| `adls.auth.shared-key.account.name`, `.key` | one of these two: required | the account key a container's requests are signed with, if the container is of that account |
+| `adls.sas-token.<account>` (or `.<account>.dfs.core.windows.net`, `.blob.`) | | a shared access signature for the account's containers, used where no key of the account is given |
 | `fileio.catalog.log.segment.records` | the store's block limit (provisional) | K, the record limit each Install sets |
 | `fileio.catalog.log.copies` | false | whether an append near its segment's end also sends a copy to the next (D11) |
 | `fileio.catalog.log.retire.ttl.ms` | 60,000 | how long a retired segment stays before it is deleted |
@@ -191,9 +201,11 @@ which is the bug `SegmentedLog.tla`'s `sdkretry` switch puts back.
 
 - **intentlog-core:** the `SegmentStore` SPI, segment frames, positions (`org.intentlog.segments`).
 - **intentlog-fileio:** `SegmentedLog`, over `AtomicFileLog.segmented` for the catalog object.
-- **intentlog-azure:** `AppendBlobSegments`, `AzureAppendBlobStore` (the Azure SDK, its retries
-  off), and `InMemoryAppendBlobStore` (the account's semantics in memory, with fault hooks).
-- **iceberg-fileio-catalog:** `AzureLogs` opens the log from the catalog's properties.
+- **intentlog-azure:** `AppendBlobSegments`, `BlobUrlSegments` (segments named by their Blob
+  URLs, in the containers those name), `AzureAppendBlobStore` (the Azure SDK, its retries off),
+  and `InMemoryAppendBlobStore` (the account's semantics in memory, with fault hooks).
+- **iceberg-fileio-catalog:** `AzureLogs` opens the log from the catalog's properties, and
+  derives the default prefix (`AzureLogs.defaultPrefix`).
 
 ## Testing
 
@@ -207,9 +219,14 @@ which is the bug `SegmentedLog.tla`'s `sdkretry` switch puts back.
   `TestLocalCatalogTransaction`, every checkpoint checked against a replay of the log's history
   (`SegmentedLogHistory`); and `TestCatalogFaultProperties` and `TestCatalogRaceProperties`,
   which draw this log.
+- **Clients configured alike or not** (`TestAzureLogs`): catalogs given another location, or
+  none, share the log its creator made; a catalog object on Azure keeps its segments at the
+  default and records nothing; a client without credentials for the recorded account fails,
+  naming it.
 - **A real account:** `AzureAppendBlobStoreIT` (the store's requests), and `AzureLogCatalogIT`
-  (the catalog suites with their segments on the account; run explicitly with
-  `AZURE_LOG_IT_CONTAINER_URL` and `AZURE_STORAGE_KEY`).
+  (the catalog suites with their segments on the account, its catalog objects in memory, so each
+  records its prefix; run explicitly with `AZURE_LOG_IT_CONTAINER_URL` and `AZURE_STORAGE_KEY` or
+  `AZURE_STORAGE_SAS`).
 
 ## Measurements
 
@@ -235,8 +252,8 @@ catalog-bench's `bin/azure-spike.sh`, on a VM of the rmow-bench deploy:
 
 - **Several records in one block** (group commit): fewer blocks, so rarer new segments, at the
   cost of latency. Each record keeps its own frame and id, so replay doesn't change.
-- **The FileIO's other credentials** for the segments (a SAS, a connection string, the default
-  credential), beside the account key: the store takes a `TokenCredential` already.
+- **The FileIO's other credentials** for the segments (a connection string, the default
+  credential), beside an account key or a SAS: the store takes a `TokenCredential` already.
 - **Other stores** (LOG_SEGMENTS.md "Later").
 
 ## Related work

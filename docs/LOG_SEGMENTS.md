@@ -26,7 +26,8 @@ Append Blobs first), which writers append to blind.
   position says where in the segments replay resumes.
 
 There is no head blob, no checkpoint blob and no pad. The catalog object says which log
-a catalog keeps (format 4, which a client without a segment store refuses); every frame,
+a catalog keeps (format 4, which a client without a segment store refuses) and where its
+segments are (D13), so a client needs only credentials for them; every frame,
 the catalog object's and the segments', is checked; an append tries a bounded number of
 segments; and a named segment's TTL counts from its retirement.
 
@@ -40,14 +41,21 @@ counts as a lost race (D4).
 | Object | Where | Format | Written by |
 |---|---|---|---|
 | Catalog object | `<warehouse>/catalog` | format 4: format 3's header, checkpoint frame and record frames, with segment records | atomicio: conditional append, or CAS replace |
-| Segment | `<prefix>/<log id>/<name>`, or the location its Install names | segment frames (below) | blind appends through the segment store |
+| Segment | `<prefix>/<log id>/<name>`, under the catalog object's prefix (D13), or the location its Install names | segment frames (below) | blind appends through the segment store |
 | Page | `<warehouse>/catalog.committed/` | unchanged | unchanged |
 
-`<prefix>` is `fileio.catalog.log.location`. An entry that names a location (a URL in the
+`<prefix>` is the catalog object's (D13). The log's creator writes the prefix it was given
+(`fileio.catalog.log.location`) after the checkpoint's position, and every checkpoint restates
+it, unless it is the default every client derives from the catalog object's own location: on
+Azure, the object's Blob URL with `.segments` appended. Then the object records nothing, and a
+client reads the segments at the default. A client given another prefix uses the object's, and
+warns that its own is ignored; one given none needs no prefix to open a log, only to create one
+where no default is derived. An entry that names a location (a URL in the
 segment store, `SegmentStore.nameAt`) finds its segment there, not under the prefix: a log never
 writes one, but a migration that moves the prefix writes them for the segments it leaves at the
 old one, so they are read, appended to, sealed and deleted where they are. A location the store
-can't reach (another container's) fails the read rather than read under the prefix. A
+can't reach (an account the client has no credentials for) fails the read rather than read under
+the prefix. A
 segment's name is `seg-<ordinal>-<nonce>`, with a fresh nonce, as in v1 (AZ4), and its object
 is under the log's id, `<prefix>/<log id>/<name>` (D12): every catalog object of the log holds
 the id in its checkpoint, so no entry carries it, and logs whose catalogs were given one prefix
@@ -58,7 +66,7 @@ writes format 3, as today.
 
 ## Records
 
-Three new bodies in `LogRecord`'s oneof (log.proto). All are provider records:
+Four new bodies in `LogRecord`'s oneof (log.proto). All are provider records:
 `SegmentedLog` reads them from the catalog object and leaves them out of every view, and
 replay refuses one in a view.
 
@@ -89,14 +97,17 @@ reference a deletion can follow without listing, while a listing of the prefix c
 segment at another location at all.
 
 `LogRecord.body` gains `InstallSegment install_segment = 5`,
-`RetiredSegment retired_segment = 6`, and `bytes checkpoint_through = 7`: the position
-the catalog object's checkpoint covers, the frame right after the checkpoint. None
+`RetiredSegment retired_segment = 6`, `bytes checkpoint_through = 7`: the position
+the catalog object's checkpoint covers, the frame right after the checkpoint, and `string
+segment_prefix = 8`: where the segments are, the frame after that, absent at the default
+(D13). None
 carries an id, nor the log's id, which the checkpoint holds. A checkpoint is opaque to its
 log (the SharedLog contract writes them without a `through`), so the catalog object says
 where its checkpoint is, as v1's head did; the runtime checks the `through` it wrote
 against it. A catalog object is the
-header, the checkpoint frame, `checkpoint_through`, the Installs from the checkpoint's
-segment on, then Retired entries.
+header, the checkpoint frame, `checkpoint_through`, `segment_prefix` unless it is the
+default, the Installs from the checkpoint's segment on, then Retired entries. A
+`segment_prefix` anywhere else is void.
 
 **Segment frames** are v1's frames with the pad replaced by a seal frame:
 
@@ -292,6 +303,8 @@ GC record, read through it, PageOuts, `putCheckpoint`, `trim`.
   position is the same (I11). Otherwise it CAS-replaces the object with:
   - the header (format 4);
   - the checkpoint frame;
+  - the object's `segment_prefix`, if it records one: its creator's, whatever prefix the
+    compactor was given (D13);
   - an `InstallSegment` for each segment from `through`'s ordinal on, as the object
     names them, each with its limit (open segments installed ahead among them);
   - a `RetiredSegment` for each segment before `through`'s ordinal that the object
@@ -322,16 +335,22 @@ GC record, read through it, PageOuts, `putCheckpoint`, `trim`.
   early, which costs a reader a restart, never a record.
 
 **Creating the log** creates segment 0, under the id of the log the first checkpoint
-begins, then puts the catalog object if absent, with that checkpoint (position
-`(0, 0, 0)`) and `InstallSegment(0, K)`. A creator that loses finds the log exists
+begins and the prefix the creator was given (or the default), then puts the catalog object if
+absent, with that checkpoint (position `(0, 0, 0)`), the prefix unless it is the default, and
+`InstallSegment(0, K)`. A creator given no prefix that derives no default fails before it writes
+anything. A creator that loses finds the log exists
 (`LogConflictException`) and deletes its segment 0: it is under a log id no catalog
 object holds, so no sweep lists it. One whose delete fails, or whose creation failed
 with the catalog object still absent (its put may land yet), leaves it
 ([AZURE_LOG_FORMAT.md](AZURE_LOG_FORMAT.md) OI-10).
 
 **Finding the log.** A client finds the catalog at `<warehouse>/catalog`, as with
-format 3. A client opened without a segment store that finds a format 4 object refuses
-it: "this catalog keeps segments". It never appends to it.
+format 3, and the segments where its catalog object says (D13). A client opened without a
+segment store that finds a format 4 object refuses
+it: "this catalog keeps segments". It never appends to it. A client that finds an object
+recording no prefix and derives no default from its location (it was opened at another form of
+the location than the creator's, one the default rule doesn't know) fails rather than look
+anywhere else.
 
 ## Decisions beyond the review
 
@@ -348,7 +367,8 @@ it: "this catalog keeps segments". It never appends to it.
 | D9 | Records in the catalog object again (the review's "after the tail is sealed and no newer one is installed") are a segment too: an Install that names the catalog object. Built later. | It keeps ordinals contiguous and positions uniform, and the run ends in the object's own order (the next Install). Positions in it are the record count alone, since a compaction moves its frames. |
 | D10 | Format 4 is a catalog object with segment records. A log without segments writes format 3. | The review asked for a distinct number, so fixtures and tests name their layout. |
 | D11 | Several segments may be open at once. A writer may send a record to any open segment, or copies of it to several; the first copy in the log decides. | Installs can run ahead, so a rotation never waits for one. A copy in the next segment makes a commit at a segment's end one round trip. Copies are safe by the committed set and S2. |
-| D12 | A segment's object is `<prefix>/<log id>/<name>`, the log's id in its UUID text form. No entry carries the id: every catalog object of the log holds it in its checkpoint, so an entry's name stays `seg-<ordinal>-<nonce>` (41 bytes). The sweep lists only `<prefix>/<log id>/`, and a creator that loses deletes its own segment 0. | The prefix is client configuration, and nothing stops two catalogs from being given one. A sweep of the whole prefix took another log's live segments for its own unnamed blobs (any ordinal at or below its newest Install's), and that log lost every record after its checkpoint and could no longer be read: Bug 100 (sweep deleted another log's segments). The object's name is derived from what the catalog object already holds, as a page's is from its reference's node and digest, so it costs a record nothing. |
+| D12 | A segment's object is `<prefix>/<log id>/<name>`, the log's id in its UUID text form. No entry carries the id: every catalog object of the log holds it in its checkpoint, so an entry's name stays `seg-<ordinal>-<nonce>` (41 bytes). The sweep lists only `<prefix>/<log id>/`, and a creator that loses deletes its own segment 0. | Nothing stops the creators of two catalogs from being given one prefix. A sweep of the whole prefix took another log's live segments for its own unnamed blobs (any ordinal at or below its newest Install's), and that log lost every record after its checkpoint and could no longer be read: Bug 100 (sweep deleted another log's segments). The object's name is derived from what the catalog object already holds, as a page's is from its reference's node and digest, so it costs a record nothing. |
+| D13 | The catalog object records the segments' prefix, `segment_prefix` after `checkpoint_through`, as the log's creator was given it, and every checkpoint restates it; when it equals the default, it is absent. The default is derived from the catalog object's own location: on Azure (`abfs[s]://<container>@<account>.dfs.<suffix>/<path>`, or `wasb[s]://` and `.blob.`) the Blob URL `https://<account>.blob.<suffix>/<container>/<path>.segments`, the same for every form of the location; elsewhere there is none, and the prefix is recorded in full. `fileio.catalog.log.location` is used only to create a log, and ignored, with a warning, when the object records another. A client that reads an object recording no prefix and derives no default fails. | The prefix was client configuration that every client had to repeat; one given another found no segment where it looked, and failed closed. Recorded, it needs no client to agree, and a client needs only credentials. The default keeps the common case to no byte more than before: a catalog object on Azure keeps its segments beside it, `.segments` a sibling of the object as `.committed/` is, never a path under it (on a hierarchical namespace the object is a file), and named so that no table location, `<warehouse>/<namespace>/<table>`, holds `seg-` names under a log's id. Explicit, it is one frame of 23 + n bytes for a prefix of n ≤ 125 bytes: its length, the record's tag and length, the prefix, the 20-byte trailer. A field beside `checkpoint_through` in its record would save the frame's 21 bytes but give `LogRecord` a field outside its oneof for one body. Since the default is derived, the rule is part of the format: a client that derived another from the same object would look elsewhere, so it maps every form of a location to one prefix, and derives none from a form it doesn't know. The model (`SegmentedLog.tla`) names segments by log, ordinal and nonce under one prefix every client shares; D13 makes that the format's guarantee rather than the configuration's, and the model is unchanged. |
 
 ## Code
 
@@ -357,8 +377,8 @@ it: "this catalog keeps segments". It never appends to it.
 | intentlog-core | `SegmentStore` SPI: create a segment under a name if absent; append a frame blind (returns the offset and the block count); read from an offset (bytes, length, blocks); delete; list; the limits (blocks, the largest object, the largest frame). Segment frames move here from intentlog-azure's `Frames`, with the seal frame in place of the pad. log.proto and `LogEnvelope` gain `InstallSegment` and `RetiredSegment`. `LogRuntime.write` lets a read-through's `LogConflictException` through as a lost race. |
 | intentlog-fileio | `SegmentedLog`: the catalog object as an `AtomicFileLog` writing format 4, the merged view, positions and tails, appends and rotation, `readThrough`, creation, `putCheckpoint`, `trim`. `AtomicFileLog` reads format 4 when it has a segment store, and refuses it otherwise. |
 | intentlog-memory | `InMemorySegmentStore`: limits in blocks and bytes, and the fault hooks of `InMemorySharedLog`. |
-| intentlog-azure | `AppendBlobSegments`: a `SegmentStore` on `AppendBlobStore` (Append Block with no condition; `appendBlockCounted`, the reply's block count). The log v1 (`AppendBlobLog`, `AzureLogHead`, its checkpoint blobs and pad) is removed; `AppendBlobStore` keeps its block-blob requests, which catalog-bench's timed store implements. intentlog-fileio's `SegmentedLogHistory` checks each checkpoint against a replay of the log's history. |
-| iceberg-fileio-catalog | `AzureLogs` opens a `SegmentedLog`: the catalog object on the catalog's FileIO, segments at `fileio.catalog.log.location`. `LocalCatalogMode`'s `AZLOG*` modes run it over `InMemoryAtomicFileIO` and the in-memory Azure store. |
+| intentlog-azure | `AppendBlobSegments`: a `SegmentStore` on `AppendBlobStore` (Append Block with no condition; `appendBlockCounted`, the reply's block count). `BlobUrlSegments`: segments named by their Blob URLs, each in the container its URL names, through a store opened for that container (D13). The log v1 (`AppendBlobLog`, `AzureLogHead`, its checkpoint blobs and pad) is removed; `AppendBlobStore` keeps its block-blob requests, which catalog-bench's timed store implements. intentlog-fileio's `SegmentedLogHistory` checks each checkpoint against a replay of the log's history. |
+| iceberg-fileio-catalog | `AzureLogs` opens a `SegmentedLog`: the catalog object on the catalog's FileIO, segments where it says (D13), through `BlobUrlSegments` with each container signed by its account's key or signature; a log it creates at `fileio.catalog.log.location`, or the default `AzureLogs.defaultPrefix` derives. `LocalCatalogMode`'s `AZLOG*` modes run it over `InMemoryAtomicFileIO` and the in-memory Azure store. |
 | spec/tla | `SegmentedLog.tla` and its configurations in `check.py`, in place of `AzureLog.tla`. |
 | fuzz | `fuzz/mutants/segments.sh`. ce-fuzz's `azure` job runs the new fuzzer. |
 | docs | AZURE_LOG.md and AZURE_LOG_FORMAT.md describe this log. ATOMIC_FILE_LOG.md gains format 4. LOG.md's providers, CLAUDE.md, and the format explorer (format 4 objects and segment frames) follow. |
@@ -380,6 +400,7 @@ pages, and the catalog above the log.
 | SG7 | P1–P6 as the log meets them. P4 is not claimed: appends are blind. | As stated. |
 | SG8 | Every segment can end. Before its end it holds fewer than K frames, so a seal frame fits. | K is at most the store's block limit B, checked when the log opens, and the largest frame is at most a (B − 1)th of the store's largest object less a seal frame, so K − 1 of them and a seal fit whatever K a segment's installer set (Bug 115 (segment that cannot end)). |
 | SG9 | A record applies at most once, at its first copy in the log. | The committed set skips a copy of a record that applied; S2 keeps a rejected one rejected. |
+| SG10 | Every client of a log names its segments under one prefix, which never changes: the one its catalog object records, or the default. | The creator records its prefix unless it is the default; a checkpoint restates the object's; replay takes it only right after `checkpoint_through`; a client reads it before any request of a segment, and one that derives no default for an object recording none fails (D13). |
 
 The mistakes, each a switch that must break a property. The model (`SegmentedLog.tla`) has
 the first eleven, and the Java has each as a mutant:
@@ -429,7 +450,8 @@ As LOG.md "Testing a provider", per stage:
   - faults on every request of both stores;
   - small limits and block limits, Installs ahead, early seals, and copies;
   - appends delayed until after an end;
-  - one to three instances with stale catalog objects;
+  - one to three instances with stale catalog objects, each given the prefix, another, or none,
+    with or without a default (D13: the catalog object's prefix must never move);
   - sweeps at TTL 0;
   - another log at the same prefix of the same store, which must read its records at the
     drain.
@@ -445,7 +467,8 @@ As LOG.md "Testing a provider", per stage:
   fail `TestSegmentedLog`.
 - **Catalog suites**: `TestLocalCatalog*` in the `AZLOG*` modes. Also
   `TestCatalogFaultProperties` and `TestCatalogRaceProperties`, whose Append Blob draws
-  open the new log.
+  open the new log, and `TestAzureLogs`: catalogs configured with another location, or none,
+  share their creator's log; one of a catalog object on Azure records no prefix (D13).
 - **Real account**: `AzureLogCatalogIT`, with the warehouse (the catalog object) on
   the account through the ADLS FileIO.
 
@@ -466,7 +489,7 @@ Each stage is one or more commits on branch `log-segments`, each fix with its te
 | Property | Default | Meaning |
 |---|---|---|
 | `fileio.catalog.log` | `atomic-file` | `azure-append`: a segmented log on Azure Append Blobs |
-| `fileio.catalog.log.location` | none: required | the segments' prefix, a Blob URL; each log's are under `<prefix>/<log id>/` (D12) |
+| `fileio.catalog.log.location` | the default (D13) | where a log the catalog creates keeps its segments, a Blob URL; each log's are under `<prefix>/<log id>/` (D12). The catalog object records it unless it is the default, beside the object; a client given another uses the object's. A catalog object elsewhere than Azure has no default, and needs it to be created |
 | `fileio.catalog.log.segment.records` | the store's block limit (provisional) | K, the limit each Install sets. At most the store's block limit (SG8); the largest record does not depend on it |
 | `fileio.catalog.log.copies` | false | whether an append near its segment's end also sends a copy to the next (D11) |
 | `fileio.catalog.log.checkpoint.share`, `.min.bytes`, `.records` | 1.0, 1 MiB, 10,000 | when to compact |
@@ -489,7 +512,8 @@ The conditional ablation on segments is [Later](#later).
 
 ## Progress
 
-Built on branch `log-segments` (2026-11-15): stages 0 to 4, stage 3 within stage 2.
+Built on branch `log-segments` (2026-11-15): stages 0 to 4, stage 3 within stage 2. D13 (the
+prefix in the catalog object) on branch `segment-location` (2026-11-17).
 catalog-bench's `sut-fileio` opens the segmented log too (its branch `log-segments`). Locally,
 the fuzzer passes 2,000 tries on four seeds; of `fuzz/mutants/segments.sh` twelve mutants are
 caught and `fastvoid` is equivalent (2026-11-17, with D12's `sweepothers` and `creationleak`); the catalog's suites (the `AZLOG` modes among them) and the
