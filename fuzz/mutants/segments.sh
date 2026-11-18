@@ -4,19 +4,21 @@
 # small limits, copies, sweeps at TTL 0, another log at the same prefix) or the log's regressions
 # (TestSegmentedLog). The model's catalogseal, limitatnext and sealcount have no Java to mutate:
 # no catalog record states an end, an Install sets only its own segment's limit, and a seal frame
-# carries no count. nested is replay's refusal of a provider record in a view (TestReplay). Five
+# carries no count. nested is replay's refusal of a provider record in a view (TestReplay). Six
 # are the Java's own: fastvoid, the read through an append that skips its read when the reply
 # puts the copy at the kept view's end, past its segment's limit; lastcopy, the read through
 # deciding by the last copy the log holds rather than the first; dropretired, a checkpoint
 # dropping a Retired entry past its TTL without deleting its segment (a leak where the sweep
 # can't list); nolocation, an entry's location ignored for a name under the prefix (only a
-# migration writes one); and creationleak, a creator that lost keeping its segment 0, under a log
-# id no sweep lists (a leak). fastvoid is equivalent (2026-11-15, 2,000 tries locally): an append
-# whose reply puts it past the limit is void with no read and never in a receipt, and a receipt
-# whose store can't say the index has none for the fast path to match. Locally at 2,000 tries
-# (2026-11-17) the other twelve are caught: dropretired, nolocation and creationleak by
-# TestSegmentedLog, sweepothers by both, and the rest by the fuzzer.
-MUTANTS="readahead voidack createonmissing sweepearly sweepinflight sweepothers sdkretry overlimit fastvoid lastcopy dropretired nolocation creationleak"
+# migration writes one); creationleak, a creator that lost keeping its segment 0, under a log id
+# no sweep lists (a leak); and kbound, a writer sizing its largest record by its own K, not the
+# store's block limit (Bug 115 (segment that cannot end): the fuzzer's instances share one K).
+# fastvoid is equivalent (2026-11-15, 2,000 tries locally): an append whose reply puts it past the
+# limit is void with no read and never in a receipt, and a receipt whose store can't say the index
+# has none for the fast path to match. Locally at 2,000 tries (2026-11-17) the other thirteen are
+# caught: dropretired, nolocation, creationleak and kbound by TestSegmentedLog, sweepothers and
+# overlimit by both, and the rest by the fuzzer.
+MUTANTS="readahead voidack createonmissing sweepearly sweepinflight sweepothers sdkretry overlimit fastvoid lastcopy dropretired nolocation creationleak kbound"
 EQUIVALENT="fastvoid"
 ORACLES=TestSegmentedCommitProtocol,TestSegmentedLog
 
@@ -75,6 +77,8 @@ mutant() { # name main-dir test-dir (the catalog's; these mutants are intentlog'
     overlimit) mutate $SL "    this.limit = options.limit() > 0 ? options.limit() : store.maxBlocks();
     if (limit > store.maxBlocks()) {" "    this.limit = options.limit() > 0 ? options.limit() + 1 : store.maxBlocks();
     if (limit > store.maxBlocks() + 1) {" ;;
+    # Bug 115: a writer sizes its largest record by its own K, not the store's block limit
+    kbound) mutate $SL "    long frame = Math.min(store.maxBlockBytes(), blocks > 1 ? room / (blocks - 1) : room);" "    long frame = Math.min(store.maxBlockBytes(), limit > 1 ? room / (limit - 1) : room);" ;;
     # the read through an append skips its read for a copy at the kept view's end, past the limit
     fastvoid) mutate $SL "          && t.records() + 1 == cp.index && cp.index <= seg.limit()) {" "          && t.records() + 1 == cp.index) {" ;;
     # the read through an append decides by the last copy the log holds

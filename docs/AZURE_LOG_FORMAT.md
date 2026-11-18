@@ -146,9 +146,12 @@ AZURE_LOG.md "Failures".
 - **Formats:** the catalog object's format number 4; a segment frame has no version of its own
   (a change to it is a new format number for the catalog object).
 - **K** is at most the store's block limit (50,000), and K − 1 of the largest frame and a seal
-  frame fit a blob (50,000 × 4 MiB), so a segment can always end (SG8). The largest record is
-  therefore at most the store's block and about 4 MiB at K = 50,000 (4,194,370 B); a smaller K
-  allows larger records. It is the log's `maxRecordBytes`: the commit loop rejects a larger
+  frame fit a blob (50,000 × 4 MiB), so a segment can always end (SG8). A segment's K is its
+  installer's, and a record may land in a segment any writer installed, so the largest frame
+  is sized for the largest K, the block limit: at most the store's block and a 49,999th of a
+  blob less a seal frame, whatever K the writer sets. The largest record is therefore about 4 MiB
+  (4,194,370 B; 4,194,287 B on a service version before 2022-11-02, whose blocks are 4 MiB) at
+  any K (Bug 115 (segment that cannot end)). It is the log's `maxRecordBytes`: the commit loop rejects a larger
   record (`TOO_LARGE`), and the catalog sends a record's inline table updates to metadata files,
   largest first, until it fits (SPEC_TM.md "Size Budget").
 

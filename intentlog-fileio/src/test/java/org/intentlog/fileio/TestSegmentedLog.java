@@ -32,6 +32,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 import org.apache.iceberg.io.InMemoryAtomicFileIO;
 import org.intentlog.LogConflictException;
+import org.intentlog.LogNotSentException;
 import org.intentlog.LogTail;
 import org.intentlog.LogView;
 import org.intentlog.Receipt;
@@ -462,5 +463,87 @@ class TestSegmentedLog {
   void aLimitPastTheStoresBlocksIsRefused() {
     assertThatThrownBy(() -> log(9)).isInstanceOf(IllegalArgumentException.class)
         .hasMessageContaining("past the store");
+  }
+
+  // Bug 115 (segment that cannot end): segments of 8 blocks and 1,000 bytes, blocks of 1,000
+
+  private static final int SMALL_SEGMENT = 1000;
+
+  private final InMemorySegmentStore small = new InMemorySegmentStore(8, SMALL_SEGMENT,
+      SMALL_SEGMENT);
+
+  private SegmentedLog inSmall(long limit) {
+    return new SegmentedLog(AtomicFileLog.segmented(io, LOCATION, () -> 7L, false), small, "segs",
+        SegmentedLog.Options.defaults().withLimit(limit).withRetireTtlMs(0).withClock(() -> 0L));
+  }
+
+  /** A record whose frame is exactly {@code frameBytes}. */
+  private static byte[] recordWithFrame(int frameBytes) {
+    for (int payload = frameBytes; payload > 0; payload--) {
+      byte[] r = LogEnvelope.encodeRecord(UuidV7.newUuidV7(), new byte[payload]);
+      if (SegmentFrames.record(r, 0).length == frameBytes) {
+        return r;
+      }
+    }
+    throw new IllegalStateException("no record frames to " + frameBytes);
+  }
+
+  /**
+   * Bug 115 (segment that cannot end): a segment's limit is its installer's K, but a writer sized
+   * its records by its own K. A writer with K = 2 sent two records of 500-byte frames into a
+   * segment whose installer set K = 4: the segment's 1,000 bytes held two records and no room for
+   * a seal frame, so it never ended, and every record after it was lost to readers (SG8). The bound
+   * now follows the store's block limit, which bounds every K, so writers of any K share it, and
+   * such a record is refused before it is sent; whatever lands, the log reads on.
+   */
+  @Test
+  void aSmallLimitsRecordsCannotFillALargeLimitsSegment() {
+    SegmentedLog large = inSmall(4); // installs segment 0, K = 4
+    LogTail absent = large.probe();
+    large.putCheckpoint(absent, checkpoint(0, absent));
+    SegmentedLog smallK = inSmall(2);
+    List<byte[]> sent = new ArrayList<>();
+    for (byte[] r : List.of(recordWithFrame(SMALL_SEGMENT / 2), recordWithFrame(SMALL_SEGMENT / 2),
+        record(), record())) {
+      try {
+        smallK.readThrough(smallK.append(r, null), Duration.ZERO);
+        sent.add(r);
+      } catch (LogNotSentException e) {
+        assertThat(r.length).isGreaterThan((int) smallK.capabilities().maxRecordBytes());
+      }
+    }
+    assertThat(sent).hasSizeGreaterThanOrEqualTo(2);
+    assertThat(inSmall(4).read().records()).containsExactlyElementsOf(sent);
+    assertThat(smallK.capabilities().maxRecordBytes())
+        .isEqualTo(large.capabilities().maxRecordBytes())
+        .isEqualTo(inSmall(8).capabilities().maxRecordBytes());
+  }
+
+  /**
+   * The bound's worst case: a segment whose installer set K to the store's block limit, filled by
+   * a writer of any K with K - 1 of the largest frames its bound allows. The seal frame still fits:
+   * a record that finds the segment full goes to the next, whose read through ends this one with
+   * it, and the log reads on (Bug 115).
+   */
+  @Test
+  void theLargestRecordsLeaveRoomForASealAtTheStoresLimit() {
+    SegmentedLog full = inSmall(8);
+    LogTail absent = full.probe();
+    full.putCheckpoint(absent, checkpoint(0, absent));
+    SegmentedLog smallK = inSmall(2);
+    long bound = smallK.capabilities().maxRecordBytes();
+    List<byte[]> sent = new ArrayList<>();
+    for (int i = 0; i < 9; i++) {
+      byte[] r = null;
+      for (int payload = (int) bound; r == null || r.length > bound; payload--) {
+        r = LogEnvelope.encodeRecord(UuidV7.newUuidV7(), new byte[payload]);
+      }
+      assertThat(bound - r.length).isLessThanOrEqualTo(1);
+      smallK.readThrough(smallK.append(r, null), Duration.ZERO);
+      sent.add(r);
+    }
+    LogView view = inSmall(8).read();
+    assertThat(view.records()).containsExactlyElementsOf(sent);
+    assertThat(SegmentPosition.decode(view.tail().position()).ordinal()).isEqualTo(1);
   }
 }

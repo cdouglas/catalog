@@ -129,7 +129,10 @@ a writer whose record landed past the limit knows it with no read.
   name any more (empty ones: a credential that can't list leaks only those), and never another
   log's.
 - **A record** is one block, so the log bounds a record (its `maxRecordBytes`: the smaller of a
-  block and a (K − 1)th of a blob, less a frame's 17 bytes: 4,194,370 B at K = 50,000), and
+  block and a 49,999th of a blob less a seal frame, less a frame's 17 bytes: 4,194,370 B, at any
+  K, since a record may land in a segment whose installer set any K up to the blob's 50,000
+  blocks (LOG_SEGMENTS.md, SG8; 4,194,287 B on a service version before 2022-11-02, whose blocks
+  are 4 MiB)), and
   cannot write a larger one in a replace as the one-object log does. A commit whose record is
   over the bound sends its inline table updates to metadata files, largest first, until it fits
   (SPEC_TM.md "Size Budget"); one that still does not fit fails (`RecordTooLargeException`).

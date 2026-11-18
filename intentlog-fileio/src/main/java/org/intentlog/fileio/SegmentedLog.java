@@ -175,12 +175,19 @@ public final class SegmentedLog implements SharedLog {
       throw new IllegalArgumentException("A record limit of " + limit + " is past the store's "
           + store.maxBlocks() + " blocks a segment");
     }
+    // SG8: before its end a segment holds at most K - 1 records, and its K is its installer's,
+    // which may be any writer's, up to the store's block limit B. So the largest frame is sized for
+    // K = B, whatever this log's K: B - 1 of them and a seal fit a segment, so K - 1 do for every K.
+    // Sized by this log's own K, a writer with a small K sent records that filled a segment of a
+    // larger K before its end, with no room for a seal: it never ended (Bug 115 (segment that
+    // cannot end)).
+    long blocks = store.maxBlocks();
     long room = store.maxSegmentBytes() - SegmentFrames.SEAL;
-    long frame = Math.min(store.maxBlockBytes(), limit > 1 ? room / (limit - 1) : room);
+    long frame = Math.min(store.maxBlockBytes(), blocks > 1 ? room / (blocks - 1) : room);
     this.maxRecordBytes = frame - SegmentFrames.MAX_OVERHEAD;
     if (maxRecordBytes < 1) {
       throw new IllegalArgumentException("Segments of " + store.maxSegmentBytes() + " bytes hold "
-          + limit + " records of no size");
+          + blocks + " records of no size");
     }
   }
 

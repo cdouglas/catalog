@@ -111,9 +111,16 @@ trailer = ordinal crc           ; the segment's ordinal (u64le), CRC32C (u32le) 
 A seal frame is 13 bytes. Every frame after a segment's end is void. Appends carry no
 condition: there is no byte bound (D2). Each frame is one block of the store, and
 before its end a segment holds fewer than K frames, all records. So a seal frame
-always fits if K is at most the store's block limit (50,000 on Azure), and if K − 1 of
-the largest frame and a seal frame fit the store's largest object. A log checks both
-when it opens, and installs no segment that breaks them (SG8).
+always fits if K is at most the store's block limit B (50,000 on Azure), and if K − 1 of
+the largest frame and a seal frame fit the store's largest object. A segment's K is its
+installer's, and a writer's records land in segments others installed, so the largest
+frame must leave room for a seal at any K a writer may set: it is the smaller of the
+store's largest block and a (B − 1)th of its largest object less a seal frame, whatever
+K the writer sets itself. A log checks K against B when it opens, and installs no
+segment past B (SG8). Sized by its own K instead, a writer with a small K sent records
+that filled, before its Kth record, a segment a writer with a larger K installed, with
+no room left for a seal frame; the segment never ended and the log stopped there
+(Bug 115 (segment that cannot end)).
 
 **Positions** are the end of the last record read, or a checkpoint's position when no
 record follows it:
@@ -371,7 +378,7 @@ pages, and the catalog above the log.
 | SG5 | After the first Install, no record frame in the catalog object is in the log. | Replay of the catalog object. |
 | SG6 | A named segment is deleted (by a checkpoint or the sweep) only after a checkpoint covers it wholly and its TTL has passed since it was retired, and its Retired entry is dropped only once it is deleted. The sweep deletes an unnamed blob only if it is its own log's and its ordinal is at most the newest Install's, so no Install in flight can name it, and no other log's catalog object does. | Retirement happens only in `putCheckpoint`, for segments before the position's; replay takes an Install only of the next ordinal; the sweep lists only its log's id (D12). |
 | SG7 | P1–P6 as the log meets them. P4 is not claimed: appends are blind. | As stated. |
-| SG8 | Every segment can end. Before its end it holds fewer than K frames, so a seal frame fits. | K is at most the store's block limit, and K − 1 of the largest frame and a seal frame fit its largest object, checked when the log opens. |
+| SG8 | Every segment can end. Before its end it holds fewer than K frames, so a seal frame fits. | K is at most the store's block limit B, checked when the log opens, and the largest frame is at most a (B − 1)th of the store's largest object less a seal frame, so K − 1 of them and a seal fit whatever K a segment's installer set (Bug 115 (segment that cannot end)). |
 | SG9 | A record applies at most once, at its first copy in the log. | The committed set skips a copy of a record that applied; S2 keeps a rejected one rejected. |
 
 The mistakes, each a switch that must break a property. The model (`SegmentedLog.tla`) has
@@ -392,8 +399,10 @@ the first eleven, and the Java has each as a mutant:
 | `overlimit` | an Install sets a limit above the store's block limit | SG8: a segment fills before its end, takes no seal frame, and the log stops |
 | `nested` | replay of a segment takes an Install or a Retired entry in it | SG1, SG4 |
 | `lastcopy` | `readThrough` decides by a later copy while an earlier one is in the log | an honest outcome, when a compaction drops the id between them (LOG.md's `dup`) |
+| `kbound` | a writer sizes its largest record by its own K, not the store's block limit: Bug 115 (segment that cannot end) | SG8: a writer with a small K fills a segment another installed with a larger K before its end, with no room for a seal, and the log stops |
 
-The last two are below the model's level: it has no frame bodies, and no committed set.
+The last three are below the model's level: it has no frame bodies or sizes, and no
+committed set.
 Two mistakes can't happen here, and so have no switch. Replay taking an
 Install of any ordinal (`ordinalgap`) needs an Install that lands on a catalog object it
 didn't read, which the catalog object's condition refuses. Replay applying record frames in
@@ -458,7 +467,7 @@ Each stage is one or more commits on branch `log-segments`, each fix with its te
 |---|---|---|
 | `fileio.catalog.log` | `atomic-file` | `azure-append`: a segmented log on Azure Append Blobs |
 | `fileio.catalog.log.location` | none: required | the segments' prefix, a Blob URL; each log's are under `<prefix>/<log id>/` (D12) |
-| `fileio.catalog.log.segment.records` | the store's block limit (provisional) | K, the limit each Install sets. At most the store's block limit, and small enough that K − 1 of the largest frame fit an object (SG8) |
+| `fileio.catalog.log.segment.records` | the store's block limit (provisional) | K, the limit each Install sets. At most the store's block limit (SG8); the largest record does not depend on it |
 | `fileio.catalog.log.copies` | false | whether an append near its segment's end also sends a copy to the next (D11) |
 | `fileio.catalog.log.checkpoint.share`, `.min.bytes`, `.records` | 1.0, 1 MiB, 10,000 | when to compact |
 | `fileio.catalog.log.retire.ttl.ms` | 60,000 | how long a retired segment stays before it is deleted |

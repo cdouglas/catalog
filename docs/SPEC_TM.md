@@ -914,9 +914,10 @@ action of its transaction, and an update's brought-back proofs and import
 entries. The bound on a record is the log's
 (`Capabilities.maxRecordBytes`), and only a log that cannot replace
 itself has one: on Azure Append Blobs, a segment's frame, the smaller of
-a block and a (K − 1)th of a blob, less the frame's 17 bytes (4,194,370 B
-at K = 50,000 on a real account; AZURE_LOG.md); a shared log's record
-limit. `AtomicFileLog` writes a record larger than
+a block and a 49,999th of a blob less a seal frame, less the frame's 17
+bytes (4,194,370 B on a real account, whatever K: a record may land in a
+segment whose installer set any K up to the blob's 50,000 blocks;
+AZURE_LOG.md); a shared log's record limit. `AtomicFileLog` writes a record larger than
 an append stores in a replace, so a catalog on one object has none.
 Typical records are small (the benchmark's captures average about
 460 B), but megabytes are plausible: a full update of an inline table
