@@ -141,10 +141,15 @@ public class LogCatalog extends BaseMetastoreCatalog
   // What the catalog opened itself, which it closes with it
   private final CloseableGroup closeables = new CloseableGroup();
 
-  /** A catalog whose subclass opens its log and FileIO when it is initialized ({@link #openLog}). */
+  /**
+   * A catalog whose subclass opens its log and FileIO when it is initialized ({@link #openLog}).
+   * The catalog keeps a copy of {@code catalogProperties}, to which {@link #initialize} adds its
+   * properties.
+   */
   protected LogCatalog(String catalogName, Map<String, String> catalogProperties) {
     this.catalogName = catalogName;
-    this.catalogProperties = catalogProperties;
+    this.catalogProperties =
+        catalogProperties != null ? new HashMap<>(catalogProperties) : new HashMap<>();
   }
 
   /**

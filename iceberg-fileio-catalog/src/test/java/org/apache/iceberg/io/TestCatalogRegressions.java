@@ -6208,4 +6208,42 @@ public class TestCatalogRegressions {
       assertThat(catalog(io, mode).namespaceExists(mixedNs)).isTrue();
     }
   }
+
+  /**
+   * Bug 103 (immutable properties map refused): LogCatalog kept the map of properties its
+   * constructor was given, and {@code initialize} added its own properties to it, so a catalog
+   * given an immutable map ({@code Map.of}, Guava's ImmutableMap) failed to initialize with an
+   * UnsupportedOperationException, and one given a mutable map changed its caller's map. The
+   * catalog now keeps a copy. Found by the 2026-11-17 design review (API reviewer).
+   */
+  @Nested
+  class ACatalogGivenItsPropertiesAsAMap {
+
+    @Test
+    void initializesFromAnImmutableMap() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      FileIOCatalog catalog =
+          new FileIOCatalog("c", CATALOG, io, Map.of(LogCatalogProperties.RACE_MIN_WAIT_MS, "0"));
+
+      catalog.initialize("c", Map.of(CatalogProperties.WAREHOUSE_LOCATION, WAREHOUSE));
+      catalog.createNamespace(mixedNs);
+
+      assertThat(catalog.namespaceExists(mixedNs)).isTrue();
+      assertThat(catalog.properties())
+          .containsEntry(LogCatalogProperties.RACE_MIN_WAIT_MS, "0")
+          .containsEntry(CatalogProperties.WAREHOUSE_LOCATION, WAREHOUSE);
+    }
+
+    @Test
+    void leavesTheCallersMapAsItWas() {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      Map<String, String> given = new HashMap<>(Map.of(LogCatalogProperties.RACE_MIN_WAIT_MS, "0"));
+      LogCatalog catalog = new LogCatalog("c", LocalCatalogMode.sharedLog(io, CATALOG), io, given);
+
+      catalog.initialize("c", Map.of(CatalogProperties.WAREHOUSE_LOCATION, WAREHOUSE));
+
+      assertThat(given).containsExactly(Map.entry(LogCatalogProperties.RACE_MIN_WAIT_MS, "0"));
+      assertThat(catalog.properties()).containsKey(CatalogProperties.WAREHOUSE_LOCATION);
+    }
+  }
 }
