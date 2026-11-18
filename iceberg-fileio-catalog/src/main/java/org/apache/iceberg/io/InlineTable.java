@@ -20,7 +20,7 @@ package org.apache.iceberg.io;
 
 import java.util.Objects;
 import org.apache.iceberg.TableMetadata;
-import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.intentlog.ReplayCheckError;
 
 /**
  * One version of an inline table's metadata as the catalog's state holds it: encoded (as a
@@ -112,7 +112,7 @@ final class InlineTable {
         String kept = org.apache.iceberg.TableMetadataParser.toJson(made);
         String back = org.apache.iceberg.TableMetadataParser.toJson(decoded);
         if (!java.util.Arrays.equals(encoded, again) || !kept.equals(back)) {
-          throw new IllegalStateException(
+          throw new ReplayCheckError(
               "Inline metadata does not round-trip (" + encoded.length + " -> " + again.length
                   + " bytes):\n  kept:    " + kept + "\n  decoded: " + back);
         }
@@ -156,9 +156,11 @@ final class InlineTable {
           org.apache.iceberg.TableMetadataParser.toJson(decoder.decodeFields(bytes).toMetadata(null));
       String whole = org.apache.iceberg.TableMetadataParser.toJson(
           TableFields.of(decoder.decodeFull(bytes, null)).toMetadata(null));
-      Preconditions.checkState(
-          lazy.equals(whole), "The table's fields decode otherwise than its metadata:%n  fields:"
-              + "   %s%n  metadata: %s", lazy, whole);
+      if (!lazy.equals(whole)) {
+        throw new ReplayCheckError(String.format(
+            "The table's fields decode otherwise than its metadata:%n  fields:   %s%n  metadata: %s",
+            lazy, whole));
+      }
     }
     return decoded;
   }

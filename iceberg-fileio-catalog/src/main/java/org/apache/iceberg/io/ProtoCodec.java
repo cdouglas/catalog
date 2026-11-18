@@ -53,6 +53,7 @@ import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.intentlog.Intention;
+import org.intentlog.ReplayCheckError;
 import org.intentlog.wire.LogEnvelope;
 import org.intentlog.wire.UuidV7;
 
@@ -402,9 +403,10 @@ public class ProtoCodec {
                 tblId, tblEntry, table, prefix, pool, snapRefs, original.poolOrdinals(tblId),
                 original.nextOrdinal(tblId), conflictState(original, stateCodec, tblId),
                 original.sealedBlocks(tblId));
-            Preconditions.checkState(
-                inlineBytes == null || java.util.Arrays.equals(inlineBytes, encoded),
-                "The memoized encoding of inline table %s differs from its encoding", tblId);
+            if (inlineBytes != null && !java.util.Arrays.equals(inlineBytes, encoded)) {
+              throw new ReplayCheckError(
+                  "The memoized encoding of inline table " + tblId + " differs from its encoding");
+            }
             if (inlineBytes == null && memo != null) {
               memo.put(tblId, inputs, encoded);
             }

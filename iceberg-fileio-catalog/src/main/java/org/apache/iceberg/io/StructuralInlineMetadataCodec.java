@@ -47,6 +47,7 @@ import org.apache.iceberg.TableMetadata.MetadataLogEntry;
 import org.apache.iceberg.TableMetadataParser;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.intentlog.ReplayCheckError;
 
 /**
  * "Structural Snapshot Stream" — a purpose-built columnar encoding that
@@ -180,7 +181,7 @@ public final class StructuralInlineMetadataCodec implements InlineMetadataCodec 
     if (NativeDelta.CHECK) {
       byte[] reparsed = strippedJsonByTree(meta);
       if (!java.util.Arrays.equals(strippedJson, reparsed)) {
-        throw new IllegalStateException("The metadata's JSON without its blocks differs from the"
+        throw new ReplayCheckError("The metadata's JSON without its blocks differs from the"
             + " re-parsed one:\n  written:  " + new String(strippedJson, StandardCharsets.UTF_8)
             + "\n  reparsed: " + new String(reparsed, StandardCharsets.UTF_8));
       }

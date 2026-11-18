@@ -52,6 +52,7 @@ import org.intentlog.LogThrottledException;
 import org.intentlog.LogView;
 import org.intentlog.PageStore;
 import org.intentlog.Receipt;
+import org.intentlog.ReplayCheckError;
 import org.intentlog.SharedLog;
 import org.intentlog.wire.ProtoWire;
 
@@ -525,7 +526,7 @@ public final class AtomicFileLog implements SharedLog {
       same = Arrays.equals(whole.records().get(i), view.records.get(i));
     }
     if (!same) {
-      throw new IllegalStateException("A tail read of " + location + " disagrees with a whole read"
+      throw new ReplayCheckError("A tail read of " + location + " disagrees with a whole read"
           + " of the version it found: " + view.records.size() + " records, against "
           + whole.records().size());
     }

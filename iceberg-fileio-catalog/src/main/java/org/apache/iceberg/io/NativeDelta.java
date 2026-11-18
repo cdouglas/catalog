@@ -65,6 +65,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.util.PropertyUtil;
+import org.intentlog.ReplayCheckError;
 
 /**
  * Replay of a table update's delta on {@link TableFields}, never on the whole table through
@@ -125,18 +126,18 @@ final class NativeDelta {
       applied = replay(base, delta, builder, tableId, stale, baseLocation);
     } catch (RuntimeException e) {
       if (rejected == null) {
-        throw new IllegalStateException(
+        throw new ReplayCheckError(
             "Native replay rejects a delta the builder applies: " + e, e);
       }
       throw e;
     }
     if (rejected != null) {
-      throw new IllegalStateException(
+      throw new ReplayCheckError(
           "Native replay applies a delta the builder rejects: " + rejected, rejected);
     }
     String actual = TableMetadataParser.toJson(applied.toMetadata(null));
     if (!expected.equals(actual)) {
-      throw new IllegalStateException(
+      throw new ReplayCheckError(
           "Native replay differs from the builder's:\n  builder: " + expected + "\n  native:  "
               + actual);
     }

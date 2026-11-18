@@ -5,8 +5,11 @@
 # only the checksum sees is inside the checkpoint's frame, of a replace whose checkpoint is as long:
 # the protocol fuzzer's checkpoints rarely keep their length across a replace (it missed the
 # mutant in 50,000 tries, with a third of its splices inside that frame), so TestAtomicFileLog,
-# which splices two such objects at every byte, is an oracle too.
-MUTANTS="lengthonly notrailer nochecksum probeinc nojoint"
+# which splices two such objects at every byte, is an oracle too. foldnogc folds a replica's records
+# without their GC records: only the replay check (a fold against a replay of the whole view) sees
+# it, and only since a failed check fails the run instead of reading as an unknown commit (the gap
+# plan's B1; it passed 5,000 tries of each fuzzer before).
+MUTANTS="lengthonly notrailer nochecksum probeinc nojoint foldnogc"
 EQUIVALENT=""
 ORACLES=TestMemoryCommitProtocol,TestAtomicFileCommitProtocol,TestAtomicFileLog
 
@@ -37,6 +40,12 @@ mutant() { # name main-dir test-dir (the catalog's; these mutants are intentlog'
     # probed version gave (the commit loop's probe path: tail reads off)
     probeinc) mutate $FL "    long incarnation = before != null ? before.incarnation : incarnationAt(at);" "    long incarnation = before != null ? before.incarnation : 0L;" ;;
     # TLA+ nojoint: a read's records are replayed wherever they start
+    # a fold onto a replica drops the GC records among the records it folds
+    foldnogc) mutate $RT "            prior.logId(), prior.intentionRecords(), prior.recordsSinceGc(), prior.bytesSinceGc(),
+            records.subList(from, records.size()), watch, null);" "            prior.logId(), prior.intentionRecords(), prior.recordsSinceGc(), prior.bytesSinceGc(),
+            records.subList(from, records.size()).stream()
+                .filter(r -> !LogEnvelope.decodeRecord(r).isAdvanceHorizon())
+                .collect(java.util.stream.Collectors.toList()), watch, null);" ;;
     nojoint) mutate $RT "    if (through == null) {
       return;
     }

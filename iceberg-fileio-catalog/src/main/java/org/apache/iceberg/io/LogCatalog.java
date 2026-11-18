@@ -69,6 +69,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.util.LocationUtil;
 import org.apache.iceberg.util.PropertyUtil;
+import org.intentlog.ReplayCheckError;
 import org.intentlog.Replica;
 import org.intentlog.RuntimeConfig;
 import org.intentlog.SharedLog;
@@ -1939,7 +1940,7 @@ public class LogCatalog extends BaseMetastoreCatalog
       String expected = TableMetadataParser.toJson(whole);
       String actual = TableMetadataParser.toJson(replayed.toMetadata(null));
       if (!expected.equals(actual)) {
-        throw new IllegalStateException(
+        throw new ReplayCheckError(
             "A full update's replay differs from its metadata:\n  metadata: " + expected
                 + "\n  replay:   " + actual);
       }

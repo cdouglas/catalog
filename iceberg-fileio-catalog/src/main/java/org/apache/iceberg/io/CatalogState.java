@@ -31,6 +31,7 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.intentlog.ReplayCheckError;
 import org.intentlog.StateMachine;
 
 /**
@@ -749,7 +750,7 @@ public class CatalogState {
     private void checkLookups() {
       if (!namespaceLookup.equals(namespaceLookupOfEntries())
           || !tableLookup.equals(tableLookupOfEntries())) {
-        throw new AssertionError(String.format(
+        throw new ReplayCheckError(String.format(
             "The lookups a builder kept differ from its entries': namespaces %s, expected %s;"
                 + " tables %s, expected %s",
             namespaceLookup, namespaceLookupOfEntries(), tableLookup, tableLookupOfEntries()));
@@ -1124,7 +1125,7 @@ public class CatalogState {
         }
         // replay rejects such a record; under the replay check, reaching here is a bug
         if (POOL_CHECK) {
-          throw new AssertionError(String.format(
+          throw new ReplayCheckError(String.format(
               "table %d restates pooled manifest %s: %s -> %s",
               tblId, manifest.path(), poolEntry(pooled), poolEntry(manifest)));
         }

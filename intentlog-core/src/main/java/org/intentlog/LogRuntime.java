@@ -1205,7 +1205,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     }
     boolean holds = ids.contains(watch);
     if (CHECK && holds != holds(prior.view(), watch)) {
-      throw new IllegalStateException(
+      throw new ReplayCheckError(
           "A replica's intention ids say it holds a record of " + watch + ": " + holds
               + ", its view's records say " + !holds);
     }
@@ -1237,7 +1237,7 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
       differ.add("log id");
     }
     if (!differ.isEmpty()) {
-      throw new IllegalStateException(
+      throw new ReplayCheckError(
           "A fold onto a replica of " + log + " differs from a replay of the whole view: "
               + String.join(", ", differ));
     }
