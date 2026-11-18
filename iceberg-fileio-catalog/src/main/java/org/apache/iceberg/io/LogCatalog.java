@@ -1250,8 +1250,7 @@ public class LogCatalog extends BaseMetastoreCatalog
       landed = null;
       written = null;
       doCommit(base, metadata);
-      deleteRemovedRealMetadataFiles(base, metadata);
-      adoptLanded();
+      deleteRemovedRealMetadataFiles(base, adoptLanded());
     }
 
     /**
@@ -1264,9 +1263,9 @@ public class LogCatalog extends BaseMetastoreCatalog
      * still reads the log. The commit has landed whatever happens here: if the table cannot be
      * loaded from the replica (a pointer table's metadata file unreadable, or the table dropped
      * just after the commit, which a read through it can see), the next {@link #current()}
-     * refreshes instead.
+     * refreshes instead. Returns the table as the replica holds it, or null if it was not loaded.
      */
-    private void adoptLanded() {
+    private TableMetadata adoptLanded() {
       Replica<CatalogState> committed = landed;
       TableMetadata wrote = written;
       landed = null;
@@ -1278,7 +1277,7 @@ public class LogCatalog extends BaseMetastoreCatalog
         try {
           loadFrom(committed.state(), wrote);
           lastRead = committed;
-          return;
+          return current();
         } catch (NoSuchTableException e) {
           // dropped just after the commit landed: the refresh reports it
         } catch (RuntimeException e) {
@@ -1286,21 +1285,32 @@ public class LogCatalog extends BaseMetastoreCatalog
         }
       }
       requestRefresh();
+      return null;
     }
 
-    private void deleteRemovedRealMetadataFiles(TableMetadata base, TableMetadata metadata) {
-      if (base == null) {
+    /**
+     * After a commit that read {@code base} and landed as {@code landed}, deletes the metadata files
+     * ({@code write.metadata.delete-after-commit.enabled}) the metadata log of {@code base} names
+     * and that of {@code landed} does not: the table that landed, not the metadata the commit was
+     * built from, whose log may drop more (Bug 110): a delta merged onto a changed table lands with
+     * the log replay keeps, under the bound ({@code write.metadata.previous-versions-max}) the
+     * table has there. Nothing if the landed table is unknown (not loaded) or another table (a
+     * read through the commit that found its name taken again), whose log is not this one's.
+     */
+    private void deleteRemovedRealMetadataFiles(TableMetadata base, TableMetadata landed) {
+      if (base == null || landed == null
+          || !java.util.Objects.equals(base.uuid(), landed.uuid())) {
         return;
       }
       boolean deleteAfterCommit =
-          metadata.propertyAsBoolean(
+          landed.propertyAsBoolean(
               org.apache.iceberg.TableProperties.METADATA_DELETE_AFTER_COMMIT_ENABLED,
               org.apache.iceberg.TableProperties.METADATA_DELETE_AFTER_COMMIT_ENABLED_DEFAULT);
       if (!deleteAfterCommit) {
         return;
       }
       Set<TableMetadata.MetadataLogEntry> removed = new HashSet<>(base.previousFiles());
-      removed.removeAll(metadata.previousFiles());
+      removed.removeAll(landed.previousFiles());
       // Drop inline:// pseudo-URIs -- they don't correspond to real files.
       removed.removeIf(entry -> entry.file() != null && entry.file().startsWith("inline://"));
       if (removed.isEmpty()) {

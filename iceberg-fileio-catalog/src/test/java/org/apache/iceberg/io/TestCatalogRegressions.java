@@ -7529,6 +7529,83 @@ public class TestCatalogRegressions {
     }
   }
 
+  /**
+   * Bug 110 (merge deleted logged metadata files): after a commit, a table's operations deleted
+   * the metadata files ({@code write.metadata.delete-after-commit.enabled}) that the metadata log
+   * of the version the commit read names and that of the metadata it wrote does not. An inline
+   * delta that merged onto a changed table lands with the metadata log replay keeps, which can
+   * hold more: here another writer raised {@code write.metadata.previous-versions-max} before the
+   * delta, built under the old bound, landed, and the writer deleted a metadata file the landed
+   * table's log still names. It now deletes only what the read version's log names and the landed
+   * table's does not. Found by the 2026-11-17 design review (F8).
+   */
+  @Nested
+  class MetadataFilesDeletedAfterAMergedCommit {
+    private final TableIdentifier t = TableIdentifier.of("ns", "t");
+    private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+
+    private org.apache.iceberg.TableMetadata metadata(Table table) {
+      return ((org.apache.iceberg.HasTableOperations) table).operations().current();
+    }
+
+    /** The files of {@code metadata}'s log that are not inline and do not exist. */
+    private List<String> missing(org.apache.iceberg.TableMetadata metadata) {
+      List<String> missing = new ArrayList<>();
+      for (org.apache.iceberg.TableMetadata.MetadataLogEntry entry : metadata.previousFiles()) {
+        if (!entry.file().startsWith("inline://") && io.bytes(entry.file()) == null) {
+          missing.add(entry.file());
+        }
+      }
+      return missing;
+    }
+
+    @Test
+    void areThoseTheLandedTablesLogDrops() {
+      // A pointer table with four metadata files in its log, then a commit that takes it inline
+      LogCatalog pointer = LocalCatalogMode.APPEND.catalog(io, WAREHOUSE, "c", Map.of());
+      pointer.createNamespace(Namespace.of("ns"));
+      Table table = pointer.createTable(t, SCHEMA, org.apache.iceberg.PartitionSpec.unpartitioned(),
+          Map.of(org.apache.iceberg.TableProperties.METADATA_DELETE_AFTER_COMMIT_ENABLED, "true",
+              org.apache.iceberg.TableProperties.METADATA_PREVIOUS_VERSIONS_MAX, "2"));
+      for (int i = 0; i < 4; i++) {
+        table.newFastAppend().appendFile(file("p" + i)).commit();
+      }
+      LogCatalog x = LocalCatalogMode.APPEND_TM.catalog(io, WAREHOUSE, "c", Map.of());
+      LogCatalog y = LocalCatalogMode.APPEND_TM.catalog(io, WAREHOUSE, "c", Map.of());
+      x.loadTable(t).newFastAppend().appendFile(file("i0")).commit();
+      assertThat(missing(metadata(x.loadTable(t)))).isEmpty();
+
+      // Y's append, under the bound of 2, lands after X raised it to 10, and merges
+      Table stale = y.loadTable(t);
+      boolean[] raced = {false};
+      io.injectFaults((location, strategy) -> {
+        if (location.equals(CATALOG) && !raced[0]) {
+          raced[0] = true;
+          x.loadTable(t).updateProperties()
+              .set(org.apache.iceberg.TableProperties.METADATA_PREVIOUS_VERSIONS_MAX, "10")
+              .commit();
+        }
+        return Fault.NONE;
+      });
+      try {
+        stale.newFastAppend().appendFile(file("y")).commit();
+      } finally {
+        io.injectFaults((location, strategy) -> Fault.NONE);
+      }
+
+      assertThat(raced[0]).isTrue();
+      assertThat(y.log().counts().conflictReasons()).as("Y's append merged").isEmpty();
+      org.apache.iceberg.TableMetadata landed =
+          metadata(LocalCatalogMode.APPEND_TM.catalog(io, WAREHOUSE, "c", Map.of()).loadTable(t));
+      assertThat(landed.snapshots()).hasSize(6);
+      assertThat(landed.properties())
+          .containsEntry(org.apache.iceberg.TableProperties.METADATA_PREVIOUS_VERSIONS_MAX, "10");
+      assertThat(missing(landed))
+          .as("metadata files the landed table's log names")
+          .isEmpty();
+    }
+  }
+
   /** Properties of a catalog whose creates bind names by the namespace's version. */
   private static final Map<String, String> BY_NAMESPACE =
       Map.of(LogCatalogProperties.CREATE_CONDITION, "namespace");

@@ -691,6 +691,15 @@ branch it read that had no snapshot, and a declared read of the whole table
 without refs (a read pin). `fileio.catalog.txn.read.witness` `false` sends every read as a pin
 (for ablation).
 
+A commit that deletes old metadata files
+(`write.metadata.delete-after-commit.enabled`) deletes, once it has landed,
+the real files the metadata log of the version it read names and that of
+the table as its commit landed does not: a delta merged onto a changed
+table lands with the log replay keeps, under the bound
+(`write.metadata.previous-versions-max`) the table has there, which may keep
+files the writer's own metadata drops (Bug 110 (merge deleted logged metadata
+files)). A writer that cannot load the table it landed deletes none.
+
 A load reads the catalog, then a pointer table's metadata file, and a drop
 with purge or a commit that deletes old metadata files
 (`write.metadata.delete-after-commit.enabled`) may land between the two and
