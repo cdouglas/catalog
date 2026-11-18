@@ -164,8 +164,8 @@ Azure's responses, mapped onto the SPI's signals (LOG.md "Failures"):
 | 201 | Append Block | a receipt; a block count past K is a void append, sent on to the next segment |
 | 409 `BlockCountExceedsLimit` | Append Block | nothing landed: the segment has ended; send to the next |
 | 404 `BlobNotFound` | Append Block | nothing landed: the catalog object held was stale. Read it and send again (within `append`) |
-| 503 `ServerBusy`, 500 `OperationTimedOut`, 500 `InternalError` | any write | `LogThrottledException`: it may have landed, and sending it again is safe |
-| another 4xx (403, 400) | any write | `LogNotSentException`: the service refused it, and nothing landed |
+| 503 `ServerBusy`, 500 `OperationTimedOut`, 500 `InternalError`, 429 | any write | `LogThrottledException`: backpressure; it may have landed, and sending it again is safe |
+| another 4xx (403, 400, 408) | any write | `LogNotSentException`: the service refused it, and nothing landed (a 408: the request did not arrive whole) |
 | a timeout, a reset connection, any other exception | a write | unknown outcome (the exception itself) |
 | any failure | a read | the log could not be read |
 

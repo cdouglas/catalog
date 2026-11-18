@@ -171,7 +171,8 @@ public interface AppendBlobStore {
 
   /**
    * The service is busy or timed out ({@code 503 ServerBusy}, {@code 500 OperationTimedOut}, {@code
-   * 500 InternalError}): a write may have landed, and may be sent again; a read failed.
+   * 500 InternalError}), or asks for fewer requests ({@code 429}): a write may have landed, and may
+   * be sent again; a read failed.
    */
   final class Throttled extends RuntimeException {
     public Throttled(String message, Throwable cause) {

@@ -21,9 +21,12 @@ package org.intentlog.azure;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.azure.core.http.HttpHeaderName;
+import com.azure.core.http.HttpHeaders;
 import com.azure.core.http.HttpPipelineCallContext;
 import com.azure.core.http.HttpPipelineNextPolicy;
 import com.azure.core.http.HttpPipelineNextSyncPolicy;
+import com.azure.core.http.HttpRequest;
 import com.azure.core.http.HttpResponse;
 import com.azure.core.http.policy.HttpPipelinePolicy;
 import com.azure.storage.blob.BlobContainerClient;
@@ -31,6 +34,8 @@ import com.azure.storage.blob.BlobContainerClientBuilder;
 import com.azure.storage.common.StorageSharedKeyCredential;
 import com.azure.storage.common.policy.RequestRetryOptions;
 import com.azure.storage.common.policy.RetryPolicyType;
+import java.nio.ByteBuffer;
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
@@ -46,10 +51,12 @@ import org.intentlog.azure.AppendBlobStore.NotFound;
 import org.intentlog.azure.AppendBlobStore.PositionMismatch;
 import org.intentlog.azure.AppendBlobStore.Props;
 import org.intentlog.azure.AppendBlobStore.Refused;
+import org.intentlog.azure.AppendBlobStore.Throttled;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 /**
@@ -137,6 +144,87 @@ class TestAzureAppendBlobStore {
         .isEqualTo("https://acct.blob.core.windows.net/logs/seg/0001");
     assertThat(primary.maxBlocks()).isEqualTo(50_000);
     assertThat(primary.maxBlockBytes()).isEqualTo(100L << 20);
+  }
+
+  /**
+   * A {@code 429} (too many requests) is backpressure: {@code Throttled}, which the log sends
+   * again after a backoff, not {@code Refused}, which ends the commit as not sent. A {@code 408}
+   * stays refused: the request did not arrive whole. No service: a policy answers every request.
+   */
+  @Test
+  void aTooManyRequestsAnswerIsThrottled() {
+    AppendBlobStore busy = answering(429, "TooManyRequests");
+    assertThatThrownBy(() -> busy.appendBlock("seg", block('a'), 0, -1))
+        .isInstanceOf(Throttled.class);
+    assertThatThrownBy(() -> busy.properties("seg")).isInstanceOf(Throttled.class);
+    AppendBlobStore timedOut = answering(408, "RequestTimeout");
+    assertThatThrownBy(() -> timedOut.appendBlock("seg", block('a'), 0, -1))
+        .isInstanceOf(Refused.class);
+  }
+
+  /** A store whose every request is answered {@code status}, with {@code errorCode}. */
+  private static AppendBlobStore answering(int status, String errorCode) {
+    HttpPipelinePolicy answer = new HttpPipelinePolicy() {
+      @Override
+      public Mono<HttpResponse> process(HttpPipelineCallContext context, HttpPipelineNextPolicy next) {
+        return Mono.just(answer(context.getHttpRequest(), status, errorCode));
+      }
+
+      @Override
+      public HttpResponse processSync(
+          HttpPipelineCallContext context, HttpPipelineNextSyncPolicy next) {
+        return answer(context.getHttpRequest(), status, errorCode);
+      }
+    };
+    return new AzureAppendBlobStore(
+        new BlobContainerClientBuilder().endpoint("https://acct.blob.core.windows.net/logs")
+            .credential(CREDENTIAL)
+            .retryOptions(new RequestRetryOptions(RetryPolicyType.FIXED, 1, (Duration) null, null, null, null))
+            .addPolicy(answer)
+            .buildClient());
+  }
+
+  private static HttpResponse answer(HttpRequest request, int status, String errorCode) {
+    HttpHeaders headers = new HttpHeaders()
+        .set(HttpHeaderName.fromString("x-ms-error-code"), errorCode)
+        .set(HttpHeaderName.CONTENT_LENGTH, "0");
+    return new HttpResponse(request) {
+      @Override
+      public int getStatusCode() {
+        return status;
+      }
+
+      @Override
+      @SuppressWarnings("deprecation")
+      public String getHeaderValue(String name) {
+        return headers.getValue(name);
+      }
+
+      @Override
+      public HttpHeaders getHeaders() {
+        return headers;
+      }
+
+      @Override
+      public Flux<ByteBuffer> getBody() {
+        return Flux.empty();
+      }
+
+      @Override
+      public Mono<byte[]> getBodyAsByteArray() {
+        return Mono.just(new byte[0]);
+      }
+
+      @Override
+      public Mono<String> getBodyAsString() {
+        return Mono.just("");
+      }
+
+      @Override
+      public Mono<String> getBodyAsString(Charset charset) {
+        return Mono.just("");
+      }
+    };
   }
 
   /** A location names its blob back, its name decoded; another container's names none. */
