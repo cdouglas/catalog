@@ -2724,8 +2724,8 @@ public class LogCatalog extends BaseMetastoreCatalog
    * conflict encoding judges where the record lands; any other is checked by its requirements and
    * must find the table at that version, which the record pins (errata D12). A rename or drop
    * applies to the table as this read has it. Each read must be unchanged from the version the
-   * transaction first read to this read ({@link TableRead#unchangedIn}; a scan read, also the
-   * schema it read with: {@link #scanSchemaChanged}), and the record holds it until it lands: a
+   * transaction first read to this read ({@link TableRead#unchangedIn}: a scan read's ref and the
+   * schema it read with), and the record holds it until it lands: a
    * scan read by the refs it read (a read witness, which the encoding judges by what changed of
    * them and of the schema; under {@code lamport}, any change), a declared read by the table's
    * version (a read pin). A commit with no changes checks its reads on this read and writes
@@ -2769,7 +2769,7 @@ public class LogCatalog extends BaseMetastoreCatalog
 
     for (TableRead read : commit.reads()) {
       TableMetadata now = currentMetadata(read.identifier(), current);
-      if (!read.unchangedIn(now) || scanSchemaChanged(read, now)) {
+      if (!read.unchangedIn(now)) {
         String reason = readChange(read, now);
         log.readChanged(reason);
         throw new CommitFailedException(
@@ -2887,38 +2887,6 @@ public class LogCatalog extends BaseMetastoreCatalog
       keptVersion(tableId, current, newCatalog::wroteAhead);
     }
     return true;
-  }
-
-  /**
-   * Whether the schema a scan read resolved, its ref's in the version the transaction first read,
-   * is another in {@code now}, a version of the same table: a branch's scan reads with the table's
-   * current schema, which a rename, a drop and re-add or a type promotion changes without moving
-   * the branch (Bug 120 (schema change escaped read witness)); a tag's, with its snapshot's. False
-   * for a declared read, which holds the whole version, and where there is no such table.
-   */
-  static boolean scanSchemaChanged(TableRead read, TableMetadata now) {
-    if (now == null || !read.isScan()) {
-      return false;
-    }
-    return !scanSchema(read.metadata(), read.ref()).asStruct()
-        .equals(scanSchema(now, read.ref()).asStruct());
-  }
-
-  /**
-   * The schema a scan of {@code ref} resolves in {@code metadata}: a tag's snapshot's, else (a
-   * branch, or no such ref) the table's current schema.
-   */
-  private static Schema scanSchema(TableMetadata metadata, String ref) {
-    SnapshotRef named = metadata.ref(ref);
-    if (named != null && named.isTag()) {
-      Snapshot snapshot = metadata.snapshot(named.snapshotId());
-      Integer id = snapshot != null ? snapshot.schemaId() : null;
-      Schema schema = id != null ? metadata.schemasById().get(id) : null;
-      if (schema != null) {
-        return schema;
-      }
-    }
-    return metadata.schema();
   }
 
   /**

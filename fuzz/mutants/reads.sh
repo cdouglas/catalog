@@ -1,19 +1,19 @@
 # Calibration of the oracle of serializable reads (TestRebaseProperties
 # .anAdmittedReadSeesTheRowsItRead; docs/CATALOG_TRANSACTIONS.md "No false negatives"; anchors as
 # of its commit): each mutant admits reads whose rows changed, and must fail it. A read is checked
-# twice: at the commit's read of the catalog (TableRead.unchangedIn and the schema the scan read
-# with, from the version the transaction first read), then where the record lands (a read witness,
-# which the encoding judges, or a read pin, from the commit's read). readunchecked skips the first;
-# readschemaunchecked skips its schema; readunheld writes neither witness nor pin; readnoadvance
+# twice: at the commit's read of the catalog (TableRead.unchangedIn, the fork's: the ref and the
+# schema the scan read with, from the version the transaction first read), then where the record
+# lands (a read witness, which the encoding judges, or a read pin, from the commit's read).
+# readunchecked skips the first; readunheld writes neither witness nor pin; readnoadvance
 # and readnoreset make concern-vector's witness (and its descendants') read only a ref's resets or
 # only its advances, readnoschema not the schema (Bug 120 (schema change escaped read witness):
 # the oracle's rows carry the schema a scan reads with; TestCatalogRegressions
-# $ASchemaChangeToATableATransactionScanned catches both schema mutants too); lmpreadall makes
+# $ASchemaChangeToATableATransactionScanned catches it too); lmpreadall makes
 # lamport-minus-properties' witness read nothing. readfilter judges a scan read at the commit's
 # read by its filter, as the encodings are to judge it (errata D12), but reads only the data files
 # added to the ref, not its delete files, removals or resets: what the oracle must catch once the
 # encodings judge filters.
-MUTANTS="readunchecked readschemaunchecked readunheld readnoadvance readnoreset readnoschema lmpreadall readfilter"
+MUTANTS="readunchecked readunheld readnoadvance readnoreset readnoschema lmpreadall readfilter"
 EQUIVALENT=""
 ORACLES=TestRebaseProperties#anAdmittedReadSeesTheRowsItRead
 
@@ -25,9 +25,7 @@ mutant() { # name main-dir test-dir
   local M=$2
   case $1 in
     # the commit's read does not check the reads
-    readunchecked) mutate $M/LogCatalog.java "      if (!read.unchangedIn(now) || scanSchemaChanged(read, now)) {" "      if (false) {" ;;
-    # the commit's read does not check the schema a scan read with
-    readschemaunchecked) mutate $M/LogCatalog.java "      if (!read.unchangedIn(now) || scanSchemaChanged(read, now)) {" "      if (!read.unchangedIn(now)) {" ;;
+    readunchecked) mutate $M/LogCatalog.java "      if (!read.unchangedIn(now)) {" "      if (false) {" ;;
     # the record holds no read where it lands
     readunheld) mutate $M/LogCatalog.java "      if (witness && then != null) {
         newCatalog.readRef(read.identifier(), read.ref());
@@ -46,8 +44,7 @@ mutant() { # name main-dir test-dir
     return Witness.of(base);" ;;
     # a scan read is unchanged at the commit's read where no data file added to its ref since its
     # snapshot might match its filter: delete files, removals and resets go unread
-    readfilter) mutate $M/LogCatalog.java "      if (!read.unchangedIn(now) || scanSchemaChanged(read, now)) {" "      if ((!read.unchangedIn(now) && !addsNoDataUnder(read, now))
-          || scanSchemaChanged(read, now)) {" \
+    readfilter) mutate $M/LogCatalog.java "      if (!read.unchangedIn(now)) {" "      if (!read.unchangedIn(now) && !addsNoDataUnder(read, now)) {" \
       && mutate $M/LogCatalog.java "  private TableMetadata currentMetadata(TableIdentifier table, Replica<CatalogState> current) {" "  private boolean addsNoDataUnder(TableRead read, TableMetadata now) {
     if (now == null || !read.isScan() || read.snapshotId() == null
         || !java.util.Objects.equals(now.uuid(), read.metadata().uuid())) {

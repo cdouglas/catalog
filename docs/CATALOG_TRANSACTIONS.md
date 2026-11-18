@@ -62,7 +62,23 @@ or deletes), a read is what the transaction scanned:
   schema it resolves is the one the scan read with: a rename, a drop and re-add or a type promotion
   changes what a branch's scan reads without moving the branch (Bug 120 (schema change escaped
   read witness)). `TableRead.unchangedIn`, the coarsest judgment the API gives, compares the
-  ref's snapshot alone; FileIOCatalog compares the schema beside it.
+  ref's snapshot and that schema.
+- An *incremental scan's read* (`newIncrementalAppendScan`, `newIncrementalChangelogScan`, and
+  the deprecated `appendsAfter`) is a scan read of each ref its range resolves: the branch whose
+  current snapshot it ends at (`useBranch`, else `main`) when it names no end, and a tag it starts
+  or ends at, which it resolves as `useRef(tag)` does. A range between snapshots fixed by their
+  ids (`toSnapshot(id)`, `appendsBetween`) records nothing, as a scan of a fixed snapshot. An
+  expiry that leaves the refs alone does not change the read, though a re-run of the scan over a
+  range whose snapshots it expired would fail (Bug 121 (unrecorded incremental and metadata
+  scans), fork core-perf 30c0ef5d1e).
+- A *whole-table read*, as a declared read: a metadata table the transaction loads of a table it
+  holds (`asCatalog().loadTable(ns.t.files)`, recorded as it is handed out; it reads the
+  origin's version, not the transaction's staged writes), and a partition statistics scan, even
+  of a fixed snapshot, whose statistics another writer may set or remove (Bug 121). A metadata
+  table an engine builds itself (`MetadataTableUtils.createMetadataTableInstance`, as Spark's
+  actions do) is not seen: such an engine declares its read. A serializable transaction's tables
+  do not allow distributed planning, so an engine plans through `newScan` or `newBatchScan`,
+  which record their reads.
 - A *declared read*: `CatalogTransaction.declareRead(table)`, the whole version of a table as the
   transaction first read it, for engines that decide on a table's schema, properties or snapshots
   without scanning. Unchanged if the table's version is.
