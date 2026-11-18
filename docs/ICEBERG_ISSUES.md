@@ -13,11 +13,11 @@ reports or pull requests upstream. It covers the reproduction, the cause
 with links to the 1.12.0 source, the fix, its tests, and what to settle
 before a PR.
 
-Upstream fixed C1. The fork fixes C2 to C31 on branch `core-fixes`, each
+Upstream fixed C1. The fork fixes C2 to C32 on branch `core-fixes`, each
 in an upstream-style commit with its tests, so the project's tests no
 longer work around any of them.
 
-`TestIcebergCoreIssues` has a canary for each issue up to C31: a test on
+`TestIcebergCoreIssues` has a canary for each issue up to C32: a test on
 `InMemoryCatalog` that asserts the bug is absent, with the message
 "Iceberg issue C*n* is back". Every canary passes against the fork. A
 canary that fails means a rebase dropped the fork's fix, or a release
@@ -73,7 +73,10 @@ reproduces on main at `a6bc1f95e3`, and upstream has no report of it.
 C31, which a check of Iceberg's catalogs for fileio-catalog's Bug 117
 (merged expiry cleans stale base) found on 2026-11-18, reproduces on
 1.12.0 and on main at `a6bc1f95e3`; upstream has no report of it, and the
-fork fixed it the same day. The Fork column is `atomicio`, which sits on
+fork fixed it the same day. C32, which fileio-catalog's differential
+fuzzer found in round p12-r0p (2026-11-17), reproduces on 1.12.0 and on
+main at `a6bc1f95e3`; upstream has no report of it, and the fork fixed it
+on 2026-11-18. The Fork column is `atomicio`, which sits on
 `core-perf`, on `core-fixes`.
 
 | Issue | Fork | 1.12.0 | main | Upstream |
@@ -109,6 +112,7 @@ fork fixed it the same day. The Fork column is `atomicio`, which sits on
 | C29. A load racing a drop with purge reports a missing metadata file | fixed, `core-fixes` 207fce3 | yes | yes | not reported (2026-11-12); upstream reports a file the catalog still names as missing on purpose (`CatalogTests.testLoadTableWithMissingMetadataFile`), which the fix keeps |
 | C30. A removal of more snapshots than a table has fails with IllegalArgumentException | fixed, `core-fixes` e1853ce | yes | yes | not reported (2026-11-17); Java's client sends one update per snapshot since 1.9.1 (#13100, #13647), which meets it only on a table with no snapshots |
 | C31. An expiry cleans up the files of snapshots another writer removed | fixed, `core-fixes` 67a523a | yes | yes | not reported (2026-11-18); [#13568](https://github.com/apache/iceberg/issues/13568), fixed by [#13614](https://github.com/apache/iceberg/pull/13614), the nearest: incremental cleanup's choice, not its base |
+| C32. A partitions-table row depends on the order its manifests are read | fixed, `core-fixes` c82e05c | yes | yes | not reported (2026-11-18); #4516's review asked whether such a row would show "a random one" |
 
 "Not reported" means a search of apache/iceberg's issues, pull requests
 and PR branches, and of the issues@ and dev@ lists, found nothing for the
@@ -977,6 +981,33 @@ the snapshot it rolled back from, data files live in the table.
   FileIOCatalog. The window after it is Iceberg's.
 - **Canary:** `anExpiryCleansUpOnlyTheSnapshotsItRemoved`: a swapping
   catalog's two cases raced after the commit.
+
+### C32. A partitions-table row depends on the order its manifests are read
+
+Details: [iceberg-issues/C32.md](iceberg-issues/C32.md).
+
+PARTITIONS takes a partition's `spec_id` and last update from the first
+file it reads of the partition's newest snapshot, and reads the
+snapshot's manifests in parallel. Where one snapshot adds files of one
+partition under two specs (after a rename of a partition field, say, a
+merge-on-read commit writes new rows under the current spec and deletes
+under the old), two scans of one table can disagree on `spec_id`; where
+two snapshots that touch it share a millisecond, on
+`last_updated_snapshot_id`.
+
+- **Cause:** `Partition.update` replaces them only for a strictly newer
+  commit time, so a tie goes to the first file read, and the reads run
+  on the scan's plan executor.
+- **Found by:** fileio-catalog's differential fuzzer, round p12-r0p
+  (2026-11-17): `spec_id` 0 against 1 between two catalogs' copies of a
+  table, and between an inline table and its own serialized copy.
+- **Fork:** fixed, `core-fixes` c82e05c: a tie is broken on the
+  snapshot's sequence number, its id, then the file's spec id.
+- **In fileio-catalog:** the differential oracle plans metadata tables on
+  a direct executor (fileio 83513ce), so it compared one reading either
+  way.
+- **Canary:** `aPartitionsRowIsTheSameInAnyManifestOrder`: a row delta's
+  data file and delete file under two specs, read in both orders.
 
 ## Accepted Iceberg Behavior
 

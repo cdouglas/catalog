@@ -626,8 +626,8 @@ final class TableViews {
    * positions and what differs between the two runs (times, file names, sizes) left out: with the
    * clock-ordered columns, if the wall clock stepped. Planned on a direct executor: the manifests
    * are read in the order of the snapshot's manifest list (the physical view's), where Iceberg's
-   * worker pool reads them in any order, and PARTITIONS takes a partition's {@code spec_id} from
-   * the file it reads first among those of its newest snapshot (TestMetadataTableOrder).
+   * worker pool reads them in any order, so no row depends on that order (as PARTITIONS' did: C32
+   * (partitions spec_id read-order dependent); TestMetadataTableOrder).
    */
   private static String metadataTable(
       Table table, org.apache.iceberg.MetadataTableType type, Map<Long, Integer> position,

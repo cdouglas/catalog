@@ -62,6 +62,7 @@ import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.inmemory.InMemoryCatalog;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
+import org.apache.iceberg.relocated.com.google.common.util.concurrent.MoreExecutors;
 import org.apache.iceberg.types.Types;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -1042,6 +1043,27 @@ class TestIcebergCoreIssues {
     });
     y.expireSnapshots().expireOlderThan(y.snapshot(t[1]).timestampMillis()).commit();
     assertThat(exists(live, path("b"))).as(BACK, "C31").isTrue();
+  }
+
+  /**
+   * C32. A partitions-table row must not depend on the order its manifests are read: Iceberg reads
+   * them in parallel on the scan's plan executor and took a partition's spec_id (and, on a tie of
+   * commit times, its last update) from the first file it read among those of its newest snapshot,
+   * so where one snapshot adds files of one partition under two specs, two scans of one table
+   * disagreed. The table: a row delta adding a data file of spec 0 and a position delete file of
+   * spec 1, which only renames spec 0's field, in one partition; its manifests read in order and
+   * in reverse.
+   */
+  @Test
+  void aPartitionsRowIsTheSameInAnyManifestOrder() {
+    Table table = TestMetadataTableOrder.tableWithOneSnapshotOverTwoSpecs(catalog());
+    // the data manifest and the delete manifest
+    assertThat(table.currentSnapshot().allManifests(table.io())).hasSize(2);
+    String inOrder =
+        TestMetadataTableOrder.partitionSpecIds(table, MoreExecutors.newDirectExecutorService());
+    String reversed =
+        TestMetadataTableOrder.partitionSpecIds(table, new TestMetadataTableOrder.Reversing(2));
+    assertThat(reversed).as(BACK, "C32").isEqualTo(inOrder);
   }
 
   /**

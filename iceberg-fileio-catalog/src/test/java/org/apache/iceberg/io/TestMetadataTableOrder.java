@@ -41,25 +41,21 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
+import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
-import org.apache.iceberg.relocated.com.google.common.util.concurrent.MoreExecutors;
 import org.apache.iceberg.types.Types;
 import org.junit.jupiter.api.Test;
 
 /**
- * Iceberg's PARTITIONS metadata table aggregates a partition's files (as the table's unified
- * partition type sees them) and takes its {@code spec_id}, {@code last_updated_at} and {@code
- * last_updated_snapshot_id} from the file of the newest snapshot it reads, the first it reads on a
- * tie of commit times ({@code PartitionsTable.Partition.update}). It reads the manifests in
- * parallel on the scan's plan executor ({@code PartitionsTable.planEntries}: a {@code
- * ParallelIterable}), so where one snapshot adds files of one partition under two specs, the
- * columns follow which manifest a worker read first: two scans of one table can disagree. Round
- * p12-r0p's differential failure was this: PARTITIONS {@code spec_id} 0 against 1 for {@code
- * {cat=null}} (a data file and a position delete file of one snapshot, under two specs),
- * between the pointer and the inline catalog and between the inline table and its own serialized
- * copy, whose metadata is the same. {@link TableViews} plans metadata tables on a direct executor,
- * in the order of the snapshot's manifest list, which its physical view compares.
+ * {@link TableViews} plans metadata tables on a direct executor, in the order of the snapshot's
+ * manifest list (which its physical view compares), so a metadata table reads alike every time,
+ * however Iceberg's worker pool would schedule the manifests' reads. The case that called for it is
+ * this class's table: one snapshot adds files of one partition under two specs, and Iceberg's
+ * PARTITIONS took the partition's {@code spec_id} from whichever manifest a worker read first
+ * (C32 (partitions spec_id read-order dependent), fixed on the fork's {@code core-fixes};
+ * {@code TestIcebergCoreIssues} holds its canary, on this table), which failed round p12-r0p's
+ * differential test.
  */
 class TestMetadataTableOrder {
   private static final Schema SCHEMA =
@@ -67,27 +63,15 @@ class TestMetadataTableOrder {
           required(1, "id", Types.IntegerType.get()), optional(2, "cat", Types.IntegerType.get()));
 
   @Test
-  void aPartitionsSpecIdFollowsTheOrderItsManifestsAreRead() {
-    Table table = tableWithOneSnapshotOverTwoSpecs();
-    int manifests = table.currentSnapshot().allManifests(table.io()).size();
-    assertThat(manifests).isEqualTo(2); // the data manifest and the delete manifest
-
-    String inOrder = partitionSpecIds(table, MoreExecutors.newDirectExecutorService());
-    String reversed = partitionSpecIds(table, new Reversing(manifests));
-    assertThat(inOrder).isEqualTo("{cat=null} spec_id=0");
-    assertThat(reversed).isEqualTo("{cat=null} spec_id=1");
-    // In order, the same every time: what TableViews compares
-    for (int i = 0; i < 20; i++) {
-      assertThat(partitionSpecIds(table, MoreExecutors.newDirectExecutorService()))
-          .isEqualTo(inOrder);
-    }
-  }
-
-  @Test
-  void tableViewsReadsPartitionsInManifestOrder() {
-    Table table = tableWithOneSnapshotOverTwoSpecs();
+  void tableViewsReadsAMetadataTableAlikeEveryTime() {
+    InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+    LogCatalog catalog =
+        LocalCatalogMode.APPEND.catalog(io, "mem:///warehouse", "c", Map.of());
+    catalog.createNamespace(Namespace.of("ns"));
+    Table table = tableWithOneSnapshotOverTwoSpecs(catalog);
     String first = TableViews.metadataTableRows(table, MetadataTableType.PARTITIONS);
-    assertThat(first).isEqualTo("[partition={category=null} spec_id=0 record_count=1 file_count=1"
+    // the newest spec's id, in either order of the manifests (C32)
+    assertThat(first).isEqualTo("[partition={category=null} spec_id=1 record_count=1 file_count=1"
         + " total_data_file_size_in_bytes=10 position_delete_record_count=1"
         + " position_delete_file_count=1 equality_delete_record_count=0"
         + " equality_delete_file_count=0 last_updated_at=* last_updated_snapshot_id=#0]");
@@ -102,13 +86,9 @@ class TestMetadataTableOrder {
    * field, so one partition in the unified type), with one snapshot: a row delta adding a data file
    * of spec 0 and a position delete file of spec 1, both in partition {@code cat=null}. (An
    * unpartitioned spec's files are a partition of their own: they and spec 1's {@code cat=null}
-   * are two rows.)
+   * are two rows.) Table {@code ns.t} of {@code catalog}, which has namespace {@code ns}.
    */
-  private static Table tableWithOneSnapshotOverTwoSpecs() {
-    InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
-    LogCatalog catalog =
-        LocalCatalogMode.APPEND.catalog(io, "mem:///warehouse", "c", Map.of());
-    catalog.createNamespace(Namespace.of("ns"));
+  static Table tableWithOneSnapshotOverTwoSpecs(Catalog catalog) {
     Table table =
         catalog
             .buildTable(TableIdentifier.of("ns", "t"), SCHEMA)
@@ -143,7 +123,7 @@ class TestMetadataTableOrder {
   }
 
   /** Each PARTITIONS row's partition and spec id, sorted, scanned on {@code executor}. */
-  private static String partitionSpecIds(Table table, ExecutorService executor) {
+  static String partitionSpecIds(Table table, ExecutorService executor) {
     Table partitions =
         MetadataTableUtils.createMetadataTableInstance(table, MetadataTableType.PARTITIONS);
     List<String> rows = new ArrayList<>();
@@ -170,7 +150,7 @@ class TestMetadataTableOrder {
    * in the reverse order: the manifests' reads, which {@code ParallelIterable} submits together,
    * last first.
    */
-  private static final class Reversing extends AbstractExecutorService {
+  static final class Reversing extends AbstractExecutorService {
     private final int n;
     private final List<Runnable> held = new ArrayList<>();
     private volatile boolean shutdown = false;
