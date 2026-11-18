@@ -631,6 +631,29 @@ class TestSegmentedLog {
         .findFirst().orElseThrow();
   }
 
+  /**
+   * Bug 118 (refused writes reported unknown): a write the segments' store refuses (a client
+   * error, sent once) is a refusal, which the commit loop ends at once (REFUSED), not a plain
+   * not-sent, which Iceberg retries: an append, the creation of a segment, the log's creation.
+   */
+  @Test
+  void aWriteTheStoreRefusesIsARefusal() {
+    SegmentedLog log = created(2);
+    store.intercept((op, name) -> op == InMemorySegmentStore.Op.APPEND
+        ? InMemorySegmentStore.Fault.REFUSED : InMemorySegmentStore.Fault.NONE);
+    assertThatThrownBy(() -> log.append(record(), null)) // blind
+        .isInstanceOf(org.intentlog.LogRefusedException.class);
+    store.intercept((op, name) -> op == InMemorySegmentStore.Op.CREATE
+        ? InMemorySegmentStore.Fault.REFUSED : InMemorySegmentStore.Fault.NONE);
+    SegmentedLog fresh = new SegmentedLog(
+        AtomicFileLog.segmented(io, "mem:///warehouse/other", () -> 7L, false), store, "segs",
+        SegmentedLog.Options.defaults().withLimit(2).withRetireTtlMs(0).withClock(() -> 0L));
+    LogTail absent = fresh.probe();
+    assertThatThrownBy(() -> fresh.putCheckpoint(absent, checkpoint(0, absent)))
+        .isInstanceOf(org.intentlog.LogRefusedException.class);
+    store.intercept(null);
+  }
+
   @Test
   void aLimitPastTheStoresBlocksIsRefused() {
     assertThatThrownBy(() -> log(9)).isInstanceOf(IllegalArgumentException.class)

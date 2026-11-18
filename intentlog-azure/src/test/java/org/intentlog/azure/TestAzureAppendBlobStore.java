@@ -148,8 +148,9 @@ class TestAzureAppendBlobStore {
 
   /**
    * A {@code 429} (too many requests) is backpressure: {@code Throttled}, which the log sends
-   * again after a backoff, not {@code Refused}, which ends the commit as not sent. A {@code 408}
-   * stays refused: the request did not arrive whole. No service: a policy answers every request.
+   * again after a backoff, not {@code Refused}, which ends the commit as refused. So is a {@code
+   * 408} (the request did not arrive whole in time: transient). A {@code 403} is refused. No
+   * service: a policy answers every request.
    */
   @Test
   void aTooManyRequestsAnswerIsThrottled() {
@@ -159,6 +160,9 @@ class TestAzureAppendBlobStore {
     assertThatThrownBy(() -> busy.properties("seg")).isInstanceOf(Throttled.class);
     AppendBlobStore timedOut = answering(408, "RequestTimeout");
     assertThatThrownBy(() -> timedOut.appendBlock("seg", block('a'), 0, -1))
+        .isInstanceOf(Throttled.class);
+    AppendBlobStore forbidden = answering(403, "AuthorizationFailure");
+    assertThatThrownBy(() -> forbidden.appendBlock("seg", block('a'), 0, -1))
         .isInstanceOf(Refused.class);
   }
 

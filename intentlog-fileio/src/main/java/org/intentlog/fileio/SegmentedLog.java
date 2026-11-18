@@ -40,6 +40,7 @@ import org.intentlog.LogConflictException;
 import org.intentlog.LogFullException;
 import org.intentlog.LogLagException;
 import org.intentlog.LogNotSentException;
+import org.intentlog.LogRefusedException;
 import org.intentlog.LogTail;
 import org.intentlog.LogThrottledException;
 import org.intentlog.LogView;
@@ -757,7 +758,9 @@ public final class SegmentedLog implements SharedLog {
       } catch (SegmentStore.Throttled e) {
         throw new LogThrottledException(this + " throttled an append", e);
       } catch (SegmentStore.Refused e) {
-        throw new LogNotSentException("The store refused an append to " + this, e);
+        // a client error sending again would not change: nothing landed (Bug 118 (refused writes
+        // reported unknown))
+        throw new LogRefusedException("The store refused an append to " + this, e);
       }
       if (a.blocks() > seg.limit()) {
         skip.add(seg.name()); // void by its reply: past the segment's limit
@@ -832,6 +835,8 @@ public final class SegmentedLog implements SharedLog {
       }
     } catch (SegmentStore.Throttled e) {
       throw new LogThrottledException(this + " throttled the creation of a segment", e);
+    } catch (SegmentStore.Refused e) {
+      throw new LogRefusedException("The store refused the creation of a segment of " + this, e);
     } catch (RuntimeException e) {
       throw new LogNotSentException("A segment of " + this + " could not be created", e);
     }
@@ -1123,7 +1128,7 @@ public final class SegmentedLog implements SharedLog {
     } catch (SegmentStore.Throttled e) {
       throw new LogThrottledException(this + " throttled its creation", e);
     } catch (SegmentStore.Refused e) {
-      throw new LogNotSentException("The store refused the creation of " + this, e);
+      throw new LogRefusedException("The store refused the creation of " + this, e);
     }
     List<byte[]> records = new ArrayList<>();
     records.add(LogEnvelope.encodeCheckpointThrough(SegmentPosition.START.encode()));

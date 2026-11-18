@@ -482,16 +482,19 @@ public final class AzureAppendBlobStore implements AppendBlobStore {
 
   /**
    * The exception for a failure a method does not handle: {@link Throttled} for a busy or timed
-   * out service, or one that asks for fewer requests ({@code 429}: backpressure, which the log
-   * sends again after a backoff); {@link NotFound} for a missing blob or container; {@link Refused}
-   * for any other {@code 4xx} ({@code 408} too: the request did not arrive whole); and the SDK's
-   * own exception otherwise.
+   * out service, one that asks for fewer requests ({@code 429}: backpressure, which the log sends
+   * again after a backoff), or a request that did not arrive whole in time ({@code 408}: transient,
+   * so sent again after a backoff too); {@link NotFound} for a missing blob or container; {@link
+   * Refused} for any other {@code 4xx}, which sending again would not change (the client sends
+   * each request once, so nothing an earlier attempt did hides behind it); and the SDK's own
+   * exception otherwise.
    */
   private static RuntimeException failure(String op, String name, BlobStorageException e) {
     int status = e.getStatusCode();
     BlobErrorCode code = e.getErrorCode();
     if (status == 503
         || status == 429
+        || status == 408
         || (status == 500
             && (BlobErrorCode.OPERATION_TIMED_OUT.equals(code)
                 || BlobErrorCode.INTERNAL_ERROR.equals(code)))) {
