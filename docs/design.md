@@ -370,17 +370,29 @@ Compaction writes a checkpoint of the state a writer replayed from the
 checkpoint and log: the log's id, the committed set and its horizon
 exactly, and the state machine's `encodeCheckpoint` of the state, which
 must round-trip (S4). So replaying the log and decoding a checkpoint of
-the result must give the same state. For the catalog: every namespace,
-property and
-table by id, with its metadata location, inline metadata, codec,
-manifest list prefix, manifest pool and snapshot references, and the
-name lookups, id counters and committed-transaction set. An apply step
+the result must give the same state. For the catalog: every namespace by
+id, with its version and removals, and its properties; every table by id,
+with its version, metadata location, inline metadata, codec, manifest
+list prefix, manifest pool (each manifest with its ordinal, and the
+table's next ordinal), manifest lists, sealed snapshot blocks (each
+block's digest, Merkle root, leaf count, live ids and the table version
+that sealed it) and conflict-encoding state; the catalog's conflict
+encoding and snapshot paging (B and W); and the name lookups, id
+counters and committed-transaction set. Two things in a replayed state
+are not in a checkpoint, by design: a sealed block's page bytes until a
+compactor stores them, which the runtime puts before any checkpoint it
+writes (`StateMachine.pages`), and the pages a record dropped that no
+compactor has deleted yet, which a sweep finds instead. An apply step
 may not leave state a checkpoint does not represent: a table with both
-a metadata location and inline metadata (Bug 27, which the next
-compaction reverted to the inline copy), inline state for a dropped
-table, an inline table without a prefix. `CheckpointRoundTrip` checks
-every catalog file written in `TestCatalogFaultProperties`,
-`TestMultiWriterProperties` and the `TestLocalCatalog*` suites.
+a metadata location and inline metadata (Bug 27 (pointer and inline
+both kept), which the next compaction reverted to the inline copy),
+inline state for a dropped table, an inline table without a prefix.
+`CheckpointRoundTrip` checks every catalog file written in
+`TestCatalogFaultProperties`, `TestMultiWriterProperties` and the
+`TestLocalCatalog*` suites: it compares all of the above but the sealed
+blocks and the snapshot paging, whose pages it checks against the newest
+root instead (`snapshotPagesProblem`: each page exists and holds its
+block's live snapshots).
 
 ### I7. A delta replays to the metadata its writer committed
 
@@ -454,7 +466,8 @@ settles by reading the log; if that read fails, or the loop runs out of
 attempts while such a write may still be in flight, the commit is
 unknown. So is a commit whose id the committed set's GC horizon has
 passed, if one of its writes may have landed; otherwise it is rejected,
-since replay rejects its record from then on (Bug 64). A retention
+since replay rejects its record from then on (Bug 64 (record below
+horizon reapplied)). A retention
 shorter than a commit takes is legal but lossy: it makes this case
 common, but never incorrect ([LOG.md](LOG.md) "The committed set and
 GC"). A writer judges its record by replay's judgment where it landed
@@ -464,6 +477,25 @@ and on a log without conditional appends, it counts a throttled send as
 a write that may have landed, never lets a read fall behind the one it
 staged on, and settles a write only on a read whose records include it
 ([LOG.md](LOG.md) §"The commit loop").
+
+**When a commit may be unknown** (`LogRuntime`'s commit loop). Only
+after a write of it that may have landed, or an interrupt. A write may
+have landed if its reply was lost; its read back failed, lagged past the
+visibility wait, or lacked its record; storage throttled it on every
+send; it failed its condition (a transport retry of a write that landed
+does); or, on a log without conditional appends, storage throttled it
+before a send of it that landed. Such a write leaves the commit unknown
+when the loop cannot settle it: the read that would fails; a page its
+id's lookup needs cannot be read; its id is at or below the horizon; a
+later write of the commit fails before it is sent or is refused; the
+attempts run out while the write may still land, or, on a log whose
+reads may lag, with no read past the tail its lost append named (Bug 90
+(lagging read hid the record)); or the write was the log's creation, and
+the read finds no creation of its own. A commit interrupted while it
+waits to send or read again is unknown too. Every other commit ends
+committed or rejected, so one none of whose writes failed, was
+throttled, lost a race or failed its read back, and that was not
+interrupted, is never unknown.
 
 For the catalog the stakes are files: Iceberg deletes a commit's new
 files when it fails with `CommitFailedException` (a `CleanableFailure`),
