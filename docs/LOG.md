@@ -515,7 +515,8 @@ floor `F` and horizon `H` (`F = H` until ids are paged):
 A non-v7 `q` returns `false` without consulting the floor.
 `LogRuntime.committed(replica, q)` answers the same, reading a page through
 the log's page store (a page GC has dropped since the replica was read sends
-it to a fresh read).
+it to a fresh read, which on a log whose reads may lag may not fall behind the
+view the lookup was for: Bug 125 (missing-page reread went backwards)).
 
 **Replay rejects a record at or below the floor.** Replay asks
 `CommittedSet.Builder.mayApply`, not `contains`, which would throw for such a
@@ -884,8 +885,9 @@ shared-log model"):
    staged on: S2 holds from there, and every copy of the record lands after
    it. On a read that lags behind it, the intention may not hold *yet* while
    its record has applied. So each read must reach the commit's floor (the
-   tail it staged on, or a later read it adopted); one that lags is read
-   again, and then the log is unreadable (`LogLagException`).
+   tail it staged on, a later read it adopted, or the view whose page lookup
+   found the page gone, Bug 125); one that lags is read again, and then the
+   log is unreadable (`LogLagException`).
 3. **A read back must include the record** (`p3`, `seen` above). A view whose
    checkpoint already holds the record cannot tell an applied record whose id
    GC dropped from one that never applied. Such a view leaves the write

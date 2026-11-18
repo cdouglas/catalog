@@ -1366,8 +1366,8 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
     // send fails its condition instead, P4).
     private Throwable duplicate = null;
     // On a log that cannot replace itself, the tail no read of this commit may fall behind: the
-    // read it staged on, or a later one it adopted. On a read that lags behind it, the intention
-    // may not hold yet while its record has applied.
+    // read it staged on, a later one it adopted, or one whose page lookup it reads again for. On a
+    // read that lags behind it, the intention may not hold yet while its record has applied.
     private LogTail floor;
 
     Commit(Replica<S> base, I intention) {
@@ -2003,6 +2003,12 @@ public final class LogRuntime<S, B extends StateMachine.Builder<S>, I extends In
         // id is then at or below the horizon, or where no page can hold it (TLA+: missingfail)
         if (rereads >= MAX_PAGE_REREADS) {
           return unreadablePage(missing, earlier);
+        }
+        // Not behind fresh, on a log whose reads may lag: on an older view the record may not
+        // have landed and the floor not passed its id, and the commit looked unapplied, a
+        // conflict, where it was beyond the floor or, sent before, had applied
+        if (!caps.fusedReplace()) {
+          floor = fresh.replica().tail();
         }
         Replayed again;
         try {

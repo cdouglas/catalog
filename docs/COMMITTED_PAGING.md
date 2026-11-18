@@ -438,7 +438,12 @@ The PageOuts go into the write as follows:
   - A page may be deleted once a GC record that drops it has landed. A reader
     still holding an older replica then finds the page missing, reads again,
     and finds the id at or below H (UNKNOWN, as it would have been) or above
-    every page (absent, as in Lookups). In a correct log only a stale replica
+    every page (absent, as in Lookups). On a log whose reads may lag, that
+    read may not fall behind the view the lookup was for: a commit's floor
+    moves to it first. An older view could predate the paging and the record
+    alike, and the commit would look unapplied (Bug 125 (missing-page reread
+    went backwards): a conflict reported for a commit beyond the floor, or
+    one that applied). In a correct log only a stale replica
     names a missing page. Giving up instead would report UNKNOWN; that is not
     wrong, but it is less than reading again finds for an id above the page's
     newest (the TLA+ switch `missingfail` breaks only `UnknownExplained`).

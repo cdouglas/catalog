@@ -40,6 +40,7 @@ import org.intentlog.Replay;
 import org.intentlog.Replica;
 import org.intentlog.RuntimeConfig;
 import org.intentlog.memory.InMemorySharedLog.PageFault;
+import org.intentlog.memory.InMemorySharedLog.ReadShape;
 import org.intentlog.memory.InMemorySharedLog.Request;
 import org.intentlog.memory.InMemorySharedLog.WriteFault;
 import org.intentlog.testkit.EntityVersionsMachine;
@@ -75,10 +76,18 @@ class TestSharedLogPaging {
     WriteFault nextAppend = WriteFault.NONE;
     Runnable beforeNextGet = null;
     PageFault gets = PageFault.NONE;
+    PageFault nextGet = null;
+    final java.util.ArrayDeque<ReadShape> nextReads = new java.util.ArrayDeque<>();
+    // Every checkpoint fails, other writers' too: a compaction whose PageOuts land and whose
+    // checkpoint does not, as one that crashed between them
+    boolean failCheckpoints = false;
     boolean active = true;
 
     @Override
     public WriteFault beforeWrite(Request request, byte[] payload) {
+      if (failCheckpoints && request == Request.PUT_CHECKPOINT) {
+        return WriteFault.FAIL_BEFORE;
+      }
       if (!active || request != Request.APPEND
           || !LogEnvelope.decodeRecord(payload).isIntention()) {
         return WriteFault.NONE;
@@ -112,7 +121,17 @@ class TestSharedLogPaging {
         beforeNextGet = null;
         others(other);
       }
+      if (nextGet != null) {
+        PageFault fault = nextGet;
+        nextGet = null;
+        return fault;
+      }
       return gets;
+    }
+
+    @Override
+    public ReadShape beforeRead(Request request) {
+      return active && !nextReads.isEmpty() ? nextReads.poll() : ReadShape.NORMAL;
     }
 
     void others(Runnable requests) {
@@ -362,6 +381,41 @@ class TestSharedLogPaging {
         .hasRootCauseInstanceOf(java.io.IOException.class);
     assertThat(writer.read().committed().horizon())
         .isGreaterThanOrEqualTo(UuidV7.timestampMs(idOf("w")));
+  }
+
+  /**
+   * A lookup that finds its page gone reads the log again, on a log whose reads may lag its
+   * appends. That read must not lag behind the view the lookup was for: on an older one, where the
+   * commit's record had not landed and its id was above the floor, the commit looked unapplied and
+   * was rejected as a conflict, though its reads held and the floor had passed its id (p16's
+   * tailreads calibration, TestMemoryCommitProtocol on unmutated code). Had an earlier send of it
+   * applied before its id was paged, the older view could predate that too: a conflict reported
+   * for a commit that applied.
+   */
+  @Test
+  void aReadAfterAMissingPageDoesNotLagBehindTheViewItsLookupWasFor() {
+    commits(T0, 20, "t");
+    clock.set(T0 + 55L); // stamped among the first ids: in a block that will be sealed
+    Replica<State> base = writer.read();
+    hooks.beforeNextAppend = () -> {
+      commits(T0 + 1_000L, 40, "u");
+      hooks.failCheckpoints = true;
+      assertThatThrownBy(() -> compactAt(T0 + 100_000L, HOUR)).isInstanceOf(RuntimeException.class);
+      hooks.failCheckpoints = false;
+    };
+    // The lookup of its id, paged by the time it lands, finds the page gone, and the read after
+    // it lags: as of the commit's base, after its floor, before the PageOuts and the record
+    hooks.nextGet = PageFault.MISSING;
+    hooks.beforeNextGet = () -> {
+      ReadShape asOfBase = ReadShape.of(1, 1_000);
+      hooks.nextReads.add(asOfBase); // a read of what follows the replica it holds
+      hooks.nextReads.add(asOfBase); // and a whole read, if that cannot be folded
+    };
+    assertThatThrownBy(() -> writer.commit(base, Txn.on(base.state(), "slow", Set.of(),
+        Set.of("slow"))))
+        .isInstanceOfSatisfying(CommitRejectedException.class, e ->
+            assertThat(e.reason()).isEqualTo(CommitRejectedException.Reason.BEYOND_FLOOR));
+    assertThat(replayed().history()).doesNotContain("slow");
   }
 
   @Test
