@@ -32,7 +32,6 @@ import org.intentlog.azure.InMemoryAppendBlobStore;
 import org.intentlog.memory.InMemorySegmentStore;
 import org.intentlog.segments.SegmentStore;
 import org.intentlog.testkit.CommitProtocol;
-import org.intentlog.testkit.EntityVersionsMachine;
 
 /**
  * The testkit's commit-protocol fuzzer on {@link SegmentedLog} (docs/LOG_SEGMENTS.md "Testing"):
@@ -105,7 +104,7 @@ class TestSegmentedCommitProtocol {
     SegmentedLog oracle = logs.remove(instances);
     CommitProtocol.run(new SegmentedLogHarness(io, segments, "mem:///log", "segments",
         defaultPrefix, logs, oracle, clock, ttl, listable, random.nextLong(),
-        EntityVersionsMachine.INSTANCE),
+        CommitProtocol.MACHINE),
         settings, schedule);
   }
 

@@ -24,7 +24,6 @@ import net.jqwik.api.ForAll;
 import net.jqwik.api.Property;
 import net.jqwik.api.Provide;
 import org.intentlog.testkit.CommitProtocol;
-import org.intentlog.testkit.EntityVersionsMachine;
 
 /**
  * The commit-protocol fuzzer ({@link CommitProtocol}) on the in-memory shared log: appends
@@ -39,7 +38,7 @@ class TestMemoryCommitProtocol {
       @ForAll("settings") CommitProtocol.Settings settings,
       @ForAll("schedules") List<CommitProtocol.Cmd> schedule) {
     InMemorySharedLog log = new InMemorySharedLog("log", conditional);
-    CommitProtocol.run(new MemoryLogHarness(log, EntityVersionsMachine.INSTANCE), settings,
+    CommitProtocol.run(new MemoryLogHarness(log, CommitProtocol.MACHINE), settings,
         schedule);
   }
 

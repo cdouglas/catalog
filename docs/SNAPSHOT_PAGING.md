@@ -717,6 +717,16 @@ the version). The model has no load, so a missing page read as empty is
 checked in Java alone (`TestSnapshotPaging`, above). The shared-log model has
 no state pages, and neither model has import pages.
 
+**The runtime's handling, on every log.** The commit-protocol fuzzers run a
+machine that pages its history and drops pages as the catalog seals and drops
+snapshot blocks (`CommitProtocol.MACHINE`; LOG.md "Testing a provider"), on
+the memory log, one object and the segmented log: puts before a checkpoint
+under put faults, deletes after it lands, and sweeps from stale replicas, one
+of them between a compactor's puts and its checkpoint's write. Calibration set
+`statepages.sh` (fuzz/mutants/) holds the TLA+ switches `sweepstale` and
+`rootfirst` (as `staterootfirst`) there, and mistakes of `putStatePages` and
+the sweep.
+
 **Measurements.** ReplayBench (one table's checkpoint, REPLAY_BENCH_RESULTS.md)
 and catalog-bench's E3 at 7,200 snapshots measured the steps below
 ([Sizes](#sizes)).

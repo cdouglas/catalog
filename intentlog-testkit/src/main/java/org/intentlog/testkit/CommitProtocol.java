@@ -91,9 +91,18 @@ import org.intentlog.wire.UuidV7;
  * compaction is also split around
  * its PageOuts, its pages put at one step ({@link Step#SPLIT}) and its PageOuts landed at a later
  * one, or never: it crashed after the puts ({@link Step#LAND}); orphaned pages are swept at any
- * step, from a writer's replica, however stale, or a fresh one ({@link Step#SWEEP}); and the id of
- * any record that landed is looked up through such a replica, reading its page if it is paged
- * ({@link Step#LOOKUP}).
+ * step, from a writer's replica, however stale, or a fresh one, or at the first write after a
+ * put of a page of the history, from the replica the writer held when the step armed it: a
+ * compactor's write of its checkpoint, after it put the pages the checkpoint names ({@link
+ * Step#SWEEP}); and the id of any record that landed is looked up through such a replica, reading
+ * its page if it is paged ({@link Step#LOOKUP}).
+ *
+ * <p>The machine ({@link #MACHINE}) pages a copy of its history in chunks of four tags, as the
+ * catalog pages its tables' old snapshots, and a transaction in four drops the oldest page its
+ * state names ({@link EntityVersionsMachine#TRIM}): so in every run the runtime puts a machine's
+ * pages before a checkpoint that names them, deletes those a checkpoint's records dropped once it
+ * lands, and sweeps them, under the page faults of the compaction or commit putting them (a
+ * failed put of one fails its checkpoint, a fault of the commit).
  *
  * <p>Each transaction carries its commit's tag, and the state keeps the tags it applied in order,
  * so the oracles read what applied from the state alone:
@@ -121,8 +130,12 @@ import org.intentlog.wire.UuidV7;
  *       reference ({@link CommittedSetCodec}) encodes of its ids, marks and pages, so its blocks
  *       are the rule's.
  *   <li>A sweep deletes exactly the pages that the replica it acted on does not reference and whose
- *       nodes end at or below its floor (oracle 3); a compaction deletes the pages its GC record
- *       dropped.
+ *       nodes end at or below its floor (oracle 3), and the pages of the history that are garbage
+ *       under every state from the replica's on, as the fuzzer reckons them from the history it
+ *       applied: a trimmed chunk's, or one that does not hold its chunk; never a chunk's at or past
+ *       those the replica sealed. A compaction deletes the pages its GC record dropped.
+ *   <li>After every step, each page of the history that the log's newest checkpoint names, and its
+ *       newest state has not trimmed since, exists and holds that chunk of the history.
  *   <li>A lookup of an id through a replica finds it only if its transaction applied, and misses it
  *       only if it had not applied there, nor ever will if the id is at or below the replica's
  *       floor; it reports the horizon exceeded only at or below the horizon, and fails only after a
@@ -132,7 +145,8 @@ import org.intentlog.wire.UuidV7;
  *       late has not applied); no commit applied twice; the state is the serial execution of the
  *       transactions applied, each one's reads holding where it applied; every checkpoint is the
  *       replay of the log through it (I11), so readers from any of them agree; and a GC record at
- *       the newest id, then a sweep, leave no page at all (oracle 4).
+ *       the newest id, then a sweep, leave no page of the committed set (oracle 4), and no page of
+ *       the history the final state does not name.
  * </ul>
  *
  * <p>Judging each commit only as it ends misses copies that land after it, and checkpoints no
@@ -143,6 +157,13 @@ public final class CommitProtocol {
   private CommitProtocol() {}
 
   static final List<String> ENTITIES = List.of("a", "b", "c");
+
+  /**
+   * The machine the fuzzer runs: {@link EntityVersionsMachine} paging its history in chunks of
+   * four tags, so that the runtime puts, deletes and sweeps a machine's pages beside the committed
+   * set's. A harness replays its log with it ({@link LogHarness#checkpointViolations}).
+   */
+  public static final EntityVersionsMachine MACHINE = EntityVersionsMachine.paged(4);
 
   /** No GC: the committed set keeps every id. */
   public static final long NO_GC = Long.MAX_VALUE;
@@ -236,7 +257,9 @@ public final class CommitProtocol {
    * ({@code a}) and its page faults ({@code e}, bits 4-7); for {@link Step#DUPLICATE}, the record
    * copied ({@code e}); for {@link Step#SPLIT}, its page faults ({@code e}, bits 4-7); for {@link
    * Step#LAND}, whether the compactor crashes ({@code a}) after how many of its PageOuts ({@code
-   * b}); for {@link Step#SWEEP}, the writer whose replica it sweeps from, if it has one; for {@link
+   * b}); for {@link Step#SWEEP}, the writer whose replica it sweeps from, if it has one, and whether
+   * it sweeps now or at a compactor's write after the compactor puts a page of the history ({@code
+   * a}); for {@link
    * Step#LOOKUP}, the writer whose replica it looks through, if it has one, the record whose id it
    * looks up ({@code a} and {@code e}, bits 8-11), and its page faults ({@code e}, bits 4-7). Each
    * step first advances the clock by {@code 1 + t} ms. Commands that do not apply are skipped.
@@ -279,7 +302,7 @@ public final class CommitProtocol {
         case LAND:
           return String.format("LAND(%d,%d)%s", a, b, time);
         case SWEEP:
-          return String.format("w%d:SWEEP%s", writer, time);
+          return String.format("w%d:SWEEP(%d)%s", writer, a, time);
         case LOOKUP:
           return String.format("w%d:LOOKUP(%d,%d)%s", writer, a, e, time);
         default:
@@ -667,17 +690,23 @@ public final class CommitProtocol {
     private int splitCount = 0;
     // The latest clock any compaction, split or commit ran on: no block above it less A is sealed
     private long sealingClock = Long.MIN_VALUE;
+    // A sweep armed to run at the next write after a put of a page of the history (a compactor's
+    // write of the checkpoint that names it), from the replica it holds; null if none
+    private Replica<State> armedSweep = null;
+    private int armedBy = -1;
+    // Whether a page of the history was put in this step, since an armed sweep last ran
+    private boolean statePagePut = false;
 
     Run(LogHarness harness, Settings settings) {
       this.harness = harness;
       this.settings = settings;
-      this.runtime = new LogRuntime<>(harness.log(), EntityVersionsMachine.INSTANCE,
+      this.runtime = new LogRuntime<>(harness.log(), MACHINE,
           settings.config(settings.retentionMs, () -> writerClock));
-      this.compactor = new LogRuntime<>(harness.log(), EntityVersionsMachine.INSTANCE,
+      this.compactor = new LogRuntime<>(harness.log(), MACHINE,
           settings.config(settings.retentionMs, () -> now + settings.compactorAheadMs));
-      this.racer = new LogRuntime<>(harness.log(), EntityVersionsMachine.INSTANCE,
+      this.racer = new LogRuntime<>(harness.log(), MACHINE,
           settings.config(settings.retentionMs, () -> writerClock));
-      this.oracle = new LogRuntime<>(harness.oracleLog(), EntityVersionsMachine.INSTANCE,
+      this.oracle = new LogRuntime<>(harness.oracleLog(), MACHINE,
           settings.config(settings.retentionMs, () -> writerClock));
       this.faultDraws = new Random(settings.seed ^ 0x6A09E667F3BCC909L);
       harness.clock(() -> now);
@@ -709,7 +738,7 @@ public final class CommitProtocol {
         txns.put(tag, txn);
         long stamp = EPOCH_MS - 1 - random.nextInt((int) span);
         harness.appendCopy(LogEnvelope.encodeRecord(UuidV7.newUuidV7(stamp, random),
-            EntityVersionsMachine.INSTANCE.encodeIntention(txn)));
+            MACHINE.encodeIntention(txn)));
       }
       if (settings.prefill > 0) {
         trace.append("prefilled ").append(settings.prefill).append(" records over ")
@@ -723,6 +752,9 @@ public final class CommitProtocol {
 
     @Override
     public WriteFault beforeWrite() {
+      if (armedSweep != null && statePagePut) {
+        sweepArmed();
+      }
       Context c = commits.peek();
       if (c == null || !c.active) {
         c = maintenance;
@@ -782,22 +814,29 @@ public final class CommitProtocol {
 
     /**
      * A page request fails as the commit running plans, or the compaction or split outside one. A
-     * failed get is a fault of the commit, which may change its outcome; a put, delete or listing
-     * that fails must not.
+     * failed get is a fault of the commit, which may change its outcome, and so is a failed put of
+     * a page of the history (the checkpoint that names it fails, before anything is sent: a commit
+     * that replaces the log with its record fails with it); a put of the committed set's, a delete
+     * or a listing that fails must not.
      */
     @Override
     public PageFault beforePage(PageRequest request, String name) {
       Context c = commits.peek();
       boolean inCommit = c != null && c.active;
+      boolean statePut = request == PageRequest.PUT && name != null
+          && EntityVersionsMachine.pageIndex(name) >= 0;
+      statePagePut |= statePut;
       PageFault fault = (inCommit ? c.pages : pagePlan).next(request);
       if (request == PageRequest.GET) {
         Statistics.label("page reads").collect(inCommit ? "a commit's" : "another's");
       }
       if (fault != PageFault.NONE) {
-        if (request == PageRequest.GET && inCommit) {
+        if ((request == PageRequest.GET || statePut) && inCommit) {
           c.faulted = true;
         } else if (request == PageRequest.GET) {
           pageReadFaulted = true;
+        } else if (statePut && maintenance != null) {
+          maintenance.faulted = true;
         }
         trace.append("    page ").append(request).append(name != null ? " of " + name : "")
             .append(": ").append(fault).append('\n');
@@ -984,7 +1023,7 @@ public final class CommitProtocol {
             land(cmd);
             break;
           case SWEEP:
-            sweep(w);
+            sweep(w, cmd);
             break;
           case LOOKUP:
             lookup(w, cmd);
@@ -993,6 +1032,12 @@ public final class CommitProtocol {
             throw new IllegalStateException("Unknown step " + cmd.step);
         }
         checkSet("after " + cmd);
+        checkHistoryPages("after " + cmd);
+        statePagePut = false;
+      }
+      if (armedSweep != null) {
+        Statistics.label("armed sweeps").collect("never ran");
+        armedSweep = null;
       }
       for (Writer w : writers) {
         if (w.snapshot != null) {
@@ -1038,7 +1083,12 @@ public final class CommitProtocol {
             ? writes : -1;
       }
       String tag = "w" + w.id + "." + w.commits++;
-      w.txn = Txn.on(w.snapshot.state(), tag, subset(cmd.a), subset(cmd.b));
+      Set<String> written = subset(cmd.b);
+      if ((cmd.a & 8) != 0 && (cmd.b & 8) != 0) {
+        // One transaction in four also drops the oldest page of the history the state names
+        written.add(EntityVersionsMachine.TRIM);
+      }
+      w.txn = Txn.on(w.snapshot.state(), tag, subset(cmd.a), written);
       txns.put(tag, w.txn);
       trace.append(String.format("w%d begin %s on %s (%s)%n", w.id, w.txn, w.snapshot.state(),
           base));
@@ -1471,36 +1521,193 @@ public final class CommitProtocol {
     }
 
     /**
-     * Sweeps from the replica of writer {@code w}, however stale, or a fresh one if it has none:
-     * the sweep deletes exactly the pages the replica does not reference whose nodes end at or
-     * below its floor (oracle 3).
+     * Sweeps from the replica of writer {@code w}, however stale, or a fresh one if it has none
+     * ({@code a} of 0-7); or ({@code a} of 8-15) arms a sweep from the replica the writer holds
+     * now (its transaction's, or its last commit's), or a fresh one, which runs at the next write
+     * that follows a put of a page of the history: a compactor's, between its puts of the pages
+     * its checkpoint names and its write of the checkpoint, when the replica may be behind the
+     * records that sealed them ({@link #sweepArmed}).
      */
-    private void sweep(Writer w) {
+    private void sweep(Writer w, Cmd cmd) {
       if (harness.log().pages() == null) {
+        return;
+      }
+      if (cmd.a >= 8) {
+        if (armedSweep != null) {
+          Statistics.label("armed sweeps").collect("never ran");
+        }
+        armedSweep = w.snapshot != null ? w.snapshot : w.last != null ? w.last : runtime.read();
+        armedBy = w.id;
+        statePagePut = false;
+        trace.append("w").append(w.id).append(" arms a sweep\n");
         return;
       }
       boolean stale = w.snapshot != null;
       Replica<State> on = stale ? w.snapshot : runtime.read();
+      sweepFrom(on, stale ? "w" + w.id + " sweeps" : "sweep", stale ? "stale" : "fresh", true);
+    }
+
+    /**
+     * Runs the armed sweep, unfaulted, inside the write that follows a put of a page of the
+     * history (the commit or compaction writing it goes on after it).
+     */
+    private void sweepArmed() {
+      Replica<State> on = armedSweep;
+      armedSweep = null;
+      statePagePut = false;
+      Context c = commits.peek();
+      boolean active = c != null && c.active;
+      if (active) {
+        c.active = false;
+      }
+      Context was = maintenance;
+      maintenance = null;
+      PagePlan plan = pagePlan;
+      pagePlan = PagePlan.NONE;
+      try {
+        sweepFrom(on, "  w" + armedBy + " sweeps between puts of pages of the history and a write",
+            "armed, at a write after a put", false);
+        Statistics.label("armed sweeps").collect("ran");
+      } finally {
+        pagePlan = plan;
+        maintenance = was;
+        if (active) {
+          c.active = true;
+        }
+      }
+    }
+
+    /**
+     * Sweeps from {@code on}: the sweep deletes exactly the committed set's pages the replica does
+     * not reference whose nodes end at or below its floor (oracle 3), and the pages of the history
+     * that are garbage under every state from the replica's on, as the history it applied says
+     * ({@link #historyPagesKept}). Under the step's faults if {@code faulted}.
+     */
+    private void sweepFrom(Replica<State> on, String what, String kind, boolean faulted) {
       CommittedSet set = on.committed();
       Set<String> referenced = names(set.pages());
+      List<String> history = on.state().history();
+      int[] marks = historyMarks(history);
       Map<String, byte[]> before = harness.storedPages();
       Set<String> expected = new TreeSet<>();
       for (String name : before.keySet()) {
-        if (referenced.contains(name) || top(name) > set.floor()) {
+        int k = EntityVersionsMachine.pageIndex(name);
+        if (k >= 0 ? historyPagesKept(name, k, history, marks)
+            : referenced.contains(name) || top(name) > set.floor()) {
           expected.add(name);
         }
       }
-      if (!maintain("a sweep", () -> runtime.sweep(on))) {
-        return;
+      if (faulted) {
+        if (!maintain("a sweep", () -> runtime.sweep(on))) {
+          return;
+        }
+      } else {
+        runtime.sweep(on);
       }
       Set<String> after = new TreeSet<>(harness.storedPages().keySet());
-      check(after.equals(expected), "a sweep from %s replica (floor %d) left %s, not %s",
-          stale ? "a writer's" : "a fresh", set.floor(), after, expected);
+      check(after.equals(expected), "a sweep (%s; its replica's floor %d, pages of the history"
+              + " %d..%d) left %s, not %s", kind, set.floor(), marks[0], marks[1], after,
+          expected);
       int deleted = before.size() - after.size();
-      trace.append(stale ? "w" + w.id + " sweeps" : "sweep").append(", floor ")
-          .append(set.floor()).append(": deleted ").append(deleted).append('\n');
+      long ofHistory = before.keySet().stream()
+          .filter(n -> EntityVersionsMachine.pageIndex(n) >= 0 && !after.contains(n)).count();
+      trace.append(what).append(", floor ").append(set.floor()).append(": deleted ")
+          .append(deleted).append(ofHistory > 0 ? " (" + ofHistory + " of the history)" : "")
+          .append('\n');
       Statistics.label("sweeps").collect(
-          (stale ? "stale" : "fresh") + (deleted > 0 ? ", deleted" : ", nothing to delete"));
+          kind + (deleted > 0 ? ", deleted" : ", nothing to delete"));
+      Statistics.label("sweeps of pages of the history").collect(
+          kind + (ofHistory > 0 ? ", deleted" : ", deleted none"));
+    }
+
+    // ============================================================
+    // The pages of the history, against the history
+    // ============================================================
+
+    /**
+     * The pages of the history a state that applied {@code history} names, by the fuzzer's own
+     * account of the machine's rule: {chunks trimmed, chunks sealed}. Each tag seals the chunks
+     * the history completes, then a transaction that writes {@link EntityVersionsMachine#TRIM}
+     * drops the oldest page, if any.
+     */
+    private int[] historyMarks(List<String> history) {
+      int chunk = MACHINE.chunk();
+      int trimmed = 0;
+      for (int i = 0; i < history.size(); i++) {
+        Txn txn = txns.get(history.get(i));
+        if (txn != null && txn.writes().contains(EntityVersionsMachine.TRIM)
+            && trimmed < (i + 1) / chunk) {
+          trimmed++;
+        }
+      }
+      return new int[] {trimmed, history.size() / chunk};
+    }
+
+    /** The name of the {@code k}-th page of {@code history}, which holds its k-th chunk. */
+    private static String historyPageName(List<String> history, int k) {
+      return EntityVersionsMachine.pageName(k, historyPage(history, k));
+    }
+
+    private static byte[] historyPage(List<String> history, int k) {
+      int chunk = MACHINE.chunk();
+      return EntityVersionsMachine.pageBytes(history.subList(k * chunk, (k + 1) * chunk));
+    }
+
+    /**
+     * Whether a sweep from a replica that applied {@code history} ({@code marks}, {@link
+     * #historyMarks}) keeps {@code name}, the {@code k}-th page of the history: one at or past the
+     * chunks it sealed, which a later record may seal; or one it names, the k-th chunk's, not
+     * trimmed. A trimmed page is never named again, nor one holding anything but its chunk.
+     */
+    private static boolean historyPagesKept(String name, int k, List<String> history,
+        int[] marks) {
+      return k >= marks[1] || (k >= marks[0] && name.equals(historyPageName(history, k)));
+    }
+
+    /**
+     * The pages of the history that the log's newest checkpoint names and its newest state still
+     * names (records after the checkpoint may trim some, which are garbage from there on), against
+     * the history: each the chunk the history holds at its index, under its name, and stored. A
+     * checkpoint is never written before a page it names, and a page is deleted only once it is
+     * garbage under every state after some state of the log; replay never reads a page, so only
+     * this sees one missing or wrong.
+     */
+    private void checkHistoryPages(String when) {
+      Replica<State> live = oracle.read();
+      LogView view = live.view() != null ? live.view() : harness.oracleLog().read();
+      byte[] checkpoint = view.checkpoint().orElse(null);
+      if (checkpoint == null) {
+        return;
+      }
+      State named =
+          MACHINE.decodeCheckpoint(LogEnvelope.decodeCheckpoint(checkpoint).state()).build();
+      List<String> history = live.state().history();
+      int[] marks = historyMarks(named.history());
+      check(named.trimmed() == marks[0] && named.sealed() == marks[1], "%s: the newest"
+              + " checkpoint names the pages of chunks %d..%d of the history, not %d..%d", when,
+          named.trimmed(), named.sealed(), marks[0], marks[1]);
+      int trimmed = historyMarks(history)[0];
+      List<String> names = named.pageNames();
+      Map<String, byte[]> stored = names.isEmpty() ? Map.of() : harness.storedPages();
+      int kept = 0;
+      for (int i = 0; i < names.size(); i++) {
+        int k = named.trimmed() + i;
+        String name = names.get(i);
+        byte[] expected = historyPage(history, k);
+        check(name.equals(EntityVersionsMachine.pageName(k, expected)), "%s: the newest"
+            + " checkpoint names %s for chunk %d of the history, not its page", when, name, k);
+        if (k < trimmed) {
+          continue; // trimmed by a record after the checkpoint: garbage
+        }
+        kept++;
+        byte[] body = stored.get(name);
+        check(body != null, "%s: page %s, which the newest checkpoint and the log's newest state"
+            + " name, does not exist", when, name);
+        check(Arrays.equals(body, expected), "%s: page %s does not hold chunk %d of the history",
+            when, name, k);
+      }
+      Statistics.label("pages of the history the newest checkpoint names").collect(
+          kept == 0 ? "none" : kept < 4 ? "1-3" : "4 or more");
     }
 
     /**
@@ -1518,7 +1725,7 @@ public final class CommitProtocol {
       }
       LogEnvelope.Record record = landed.get(((cmd.a << 4) | (cmd.e >> 8)) % landed.size());
       UUID id = record.id();
-      String tag = EntityVersionsMachine.INSTANCE.decodeIntention(record.intention()).tag();
+      String tag = MACHINE.decodeIntention(record.intention()).tag();
       boolean stale = w.snapshot != null;
       String replica = stale ? "a writer's" : "a fresh";
       Replica<State> on = stale ? w.snapshot : runtime.read();
@@ -1748,7 +1955,7 @@ public final class CommitProtocol {
       for (byte[] bytes : harness.landedRecords()) {
         LogEnvelope.Record record = LogEnvelope.decodeRecord(bytes);
         if (record.isIntention()) {
-          String tag = EntityVersionsMachine.INSTANCE.decodeIntention(record.intention()).tag();
+          String tag = MACHINE.decodeIntention(record.intention()).tag();
           UUID known = ids.putIfAbsent(tag, record.id());
           check(known == null || known.equals(record.id()), "records of %s carry ids %s and %s",
               tag, known, record.id());
@@ -1782,7 +1989,7 @@ public final class CommitProtocol {
             "%s was reported %s and applied after all", tag, outcome);
       });
       // The serial execution of what applied, in order: each holds where it applies.
-      State serial = State.empty();
+      State serial = MACHINE.empty().build();
       for (String tag : applied) {
         Txn txn = txns.get(tag);
         check(txn != null, "an unknown transaction %s applied", tag);
@@ -1793,6 +2000,7 @@ public final class CommitProtocol {
       List<String> violations = harness.checkpointViolations();
       check(violations.isEmpty(), "checkpoints: %s", violations);
       checkSet("at the drain");
+      checkHistoryPages("at the drain");
       collectOrphans(applied);
     }
 
@@ -1809,7 +2017,7 @@ public final class CommitProtocol {
           .orElseThrow();
       if (harness.log().capabilities().separateCheckpoints()) {
         trace.append("drain: a compactor at retention 0, at ").append(newest).append('\n');
-        new LogRuntime<>(harness.log(), EntityVersionsMachine.INSTANCE,
+        new LogRuntime<>(harness.log(), MACHINE,
             settings.config(0L, () -> newest)).compact();
       } else {
         trace.append("drain: a GC record at ").append(newest).append('\n');
@@ -1819,11 +2027,28 @@ public final class CommitProtocol {
       check(last.committed().floor() >= newest && last.committed().pages().isEmpty(),
           "a GC record at %d left the floor at %d, and pages %s", newest,
           last.committed().floor(), last.committed().pages());
+      // The pages of the history the log names, by the history it applied; the rest are garbage:
+      // pages of compactions whose checkpoints did not land, and trimmed ones not yet deleted
+      List<String> history = last.state().history();
+      int[] marks = historyMarks(history);
+      Set<String> named = new TreeSet<>();
+      for (int k = marks[0]; k < marks[1]; k++) {
+        named.add(historyPageName(history, k));
+      }
+      long garbage = harness.storedPages().keySet().stream()
+          .filter(n -> EntityVersionsMachine.pageIndex(n) >= 0 && !named.contains(n)).count();
+      Statistics.label("pages of the history at the drain that the log does not name").collect(
+          garbage == 0 ? "none" : garbage < 3 ? "1-2" : "3 or more");
+      Statistics.label("chunks of the history sealed").collect(
+          marks[1] == 0 ? "none" : marks[1] < 4 ? "1-3" : marks[1] < 12 ? "4-11" : "12 or more");
+      Statistics.label("chunks of the history trimmed").collect(
+          marks[0] == 0 ? "none" : marks[0] < 3 ? "1-2" : "3 or more");
       runtime.sweep(last);
-      Map<String, byte[]> left = harness.storedPages();
-      check(left.isEmpty(), "pages outlived a GC record at the newest id and a sweep: %s",
-          left.keySet());
+      Set<String> left = new TreeSet<>(harness.storedPages().keySet());
+      left.removeAll(named);
+      check(left.isEmpty(), "pages outlived a GC record at the newest id and a sweep: %s", left);
       checkSet("after the GC at the newest id");
+      checkHistoryPages("after the GC at the newest id");
     }
 
     /**
@@ -1850,7 +2075,7 @@ public final class CommitProtocol {
       check(at != null, "%s returned a replica at a tail the log never had: %s", what,
           replica.state());
       Replay.Result<Builder> replayed = Replay.replay(
-          EntityVersionsMachine.INSTANCE, at.checkpoint().orElse(null), at.records(), null);
+          MACHINE, at.checkpoint().orElse(null), at.records(), null);
       State state = replayed.builder().build();
       check(state.equals(replica.state())
               && Arrays.equals(replayed.committed().build().bytes(), replica.committed().bytes())

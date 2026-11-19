@@ -78,7 +78,11 @@ Two state machines implement the SPI:
 - `EntityVersionsMachine` (intentlog-testkit): entities with versions, and
   transactions that read some at versions and write some, the state of the
   TLA+ models. Each transaction carries a tag, and the state keeps the tags it
-  applied, in order, so a fuzzer reads from the state alone what applied.
+  applied, in order, so a fuzzer reads from the state alone what applied. Its
+  paged form (`EntityVersionsMachine.paged`) also pages a copy of that history
+  in chunks (`hist.<k>.<digest>`), which a transaction writing `!trim` drops
+  the oldest of: a machine's pages (`StateMachine.pages`, `droppedPages`,
+  `garbagePages`), as the catalog's sealed snapshot blocks are.
 
 ## The log SPI
 
@@ -1128,7 +1132,10 @@ trimmed ones included, for oracles to replay.
   commits other writers commit (up to three times), compactors and GC records
   run and delayed appends land; and copies of any record that ever landed,
   which must never apply. A step of maintenance may fail after a fault (each
-  is safe to abandon), never without one.
+  is safe to abandon), never without one. Its machine pages its history, so
+  the runtime puts a machine's pages before each checkpoint, deletes the
+  trimmed ones after it, and sweeps them, from stale replicas too, and from
+  one armed to run between a compactor's puts and its checkpoint's write.
   It judges each commit as it ends, the state after each copy, and, once
   every delayed append has landed, the whole run: each outcome again, no
   commit applied twice, the state as the serial execution of what applied,
@@ -1140,8 +1147,14 @@ trimmed ones included, for oracles to replay.
   holding its transaction once. A writer's next transaction is staged on a
   fresh read, or on the replica its last commit returned, as it is, read on
   from with it as the floor, or refreshed, as a catalog's handles do; a read
-  on from a replica, stale or served with a gap, is never behind it.
-  `TestMemoryCommitProtocol` and `TestAtomicFileCommitProtocol` run it. Each
+  on from a replica, stale or served with a gap, is never behind it. Each page
+  of the history that the newest checkpoint names and the log has not trimmed
+  since exists and holds its chunk; a sweep deletes exactly the garbage the
+  history says (never a chunk at or past those its replica sealed); and at the
+  drain, a sweep leaves no page of the history the log does not name.
+  `TestMemoryCommitProtocol`, `TestAtomicFileCommitProtocol` and
+  `TestSegmentedCommitProtocol` run it (`fuzz/mutants/statepages.sh` calibrates
+  the machine's pages there). Each
   of the shared-log model's bug switches, put back in `LogRuntime`, fails it
   on the memory log.
 - `SharedLogCommit.tla` ([spec/tla/README.md](../spec/tla/README.md)) checks

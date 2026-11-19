@@ -26,7 +26,6 @@ import net.jqwik.api.Property;
 import net.jqwik.api.Provide;
 import org.apache.iceberg.io.InMemoryAtomicFileIO;
 import org.intentlog.testkit.CommitProtocol;
-import org.intentlog.testkit.EntityVersionsMachine;
 
 /**
  * The commit-protocol fuzzer ({@link CommitProtocol}) on one object of a store, with offset
@@ -53,7 +52,7 @@ class TestAtomicFileCommitProtocol {
     InMemoryAtomicFileIO io = new InMemoryAtomicFileIO(append);
     io.setReadsRecordVersion(recordingReads);
     withTailReadCheck(pinned, () -> CommitProtocol.run(new AtomicFileLogHarness(
-        io, "mem:///log", EntityVersionsMachine.INSTANCE, reads, seed), settings, schedule));
+        io, "mem:///log", CommitProtocol.MACHINE, reads, seed), settings, schedule));
   }
 
   /**
