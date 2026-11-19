@@ -27,6 +27,7 @@ import java.util.TreeMap;
 import net.jqwik.api.Arbitraries;
 import net.jqwik.api.Arbitrary;
 import net.jqwik.api.Combinators;
+import net.jqwik.api.Example;
 import net.jqwik.api.ForAll;
 import net.jqwik.api.GenerationMode;
 import net.jqwik.api.Property;
@@ -65,7 +66,10 @@ import org.intentlog.wire.LogEnvelope;
  * it appended to (dropped, or another under its name). Otherwise it may commit or fail: an inline
  * table's append is judged where the record lands, and a serializable transaction's reads by the
  * branches it read (a read witness), so a racer's change that leaves those alone may land first
- * (errata D12); a commit must end as the serial run.
+ * (errata D12); a commit must end as the serial run, or as one with the transaction before the
+ * racers that ran before its writes: a table's existence is not a read, so a transaction that
+ * found a table absent (its drop of it returns false) commits after a racer created it, ahead of
+ * that racer serially.
  *
  * <p>A fourth writer's operation on A's table, D's, if there is one, runs just after A's first
  * write to the catalog lands, at A's next request of its log: a read through a write reads on to
@@ -114,6 +118,23 @@ class TestCatalogRaceProperties {
   @Provide
   Arbitrary<String> encodings() {
     return Arbitraries.of(LocalCatalogMode.ENCODINGS);
+  }
+
+  /**
+   * Round p16-r2p's race job (try 59,637, seed 8065492585526323585): A, a serializable catalog
+   * transaction, appends to a.u and drops a.t, which does not exist when it stages (its drop
+   * returns false); B creates a.t just before A's write. A commits, and B's a.t stays: the serial
+   * run A, then B. A table's existence is not a read (docs/CATALOG_TRANSACTIONS.md), and A read
+   * nothing B wrote, so A commits.
+   */
+  @Example
+  void aTransactionThatDroppedATableNotYetCreatedSerializesBeforeTheCreate() {
+    aRaceEndsAsASerialRun(LocalCatalogMode.COMPACT, LocalCatalogMode.COMPACT_TM,
+        LocalCatalogMode.COMPACT_TM, LocalCatalogMode.APPEND, LocalCatalogMode.Log.OBJECT,
+        new Setup(5, 0, 10, 0, 8), new Op(Kind.CATALOG_TXN, 17, 0), new Op(Kind.CREATE_TABLE, 0, 0),
+        new Op(null, 0, 0), false, true, List.of(0L, 300L, 3L, 0L), "partition-vector",
+        InMemoryAtomicFileIO.ReadMode.SPLICE, true, true, false, LocalCatalogMode.CAS,
+        new Op(null, 0, 0), false, 13, 0);
   }
 
   @Property(tries = 1000)
@@ -432,7 +453,10 @@ class TestCatalogRaceProperties {
         || raceA.equals("CommitStateUnknownException"));
     // The serial runs the race may end as, the first that matches: D after A, or before it if D
     // ran while A's operation did; without A if it failed as it may, or, if it lost its outcome
-    // to gc, with it too. A mismatch is reported against the first.
+    // to gc, with it too; and a catalog transaction that committed before the racers that ran
+    // before its writes, which it may serialize ahead of, since what it found absent was no read
+    // (a drop of a table not yet created returns false; docs/CATALOG_TRANSACTIONS.md). A mismatch
+    // is reported against the first.
     boolean excluded = replaced || lost;
     String race = outcomes(raceA, results, d, resultD[0], raceAgain);
     List<Op> aOrNone = new java.util.ArrayList<>();
@@ -444,24 +468,34 @@ class TestCatalogRaceProperties {
     String serialState = null;
     boolean tookEffect = false; // A lost its outcome, but the race ends as the serial run with A
     boolean dBeforeA = false;
+    boolean aFirstSerially = false;
+    boolean mayGoFirst = a.kind == Kind.CATALOG_TXN && before > 0 && raceA.startsWith("ok");
     candidates:
     for (Op serialOp : aOrNone) {
       for (boolean dFirst : dDuring[0] ? new boolean[] {false, true} : new boolean[] {false}) {
-        String[] serial = new String[racers.size()];
-        String[] run = serialRun(setup, base, serialOp, modeA, racers, racerModes, before, props,
-            serial, d, modeD, dFirst, raceAgain != null);
-        String described = outcomes(excluded ? raceA : run[0], serial, d, run[2], run[3]);
-        boolean matches = race.equals(described) && raceState.equals(run[1]);
-        if (serialRun == null || matches) {
-          serialRun = described;
-          serialState = run[1];
-          tookEffect = excluded && serialOp != null;
-          dBeforeA = dFirst;
-        }
-        if (matches) {
-          break candidates;
+        for (boolean aFirst : mayGoFirst && serialOp != null && !dFirst
+            ? new boolean[] {false, true} : new boolean[] {false}) {
+          String[] serial = new String[racers.size()];
+          String[] run = serialRun(setup, base, serialOp, modeA, racers, racerModes, before,
+              props, serial, d, modeD, dFirst, raceAgain != null, aFirst);
+          String described = outcomes(excluded ? raceA : run[0], serial, d, run[2], run[3]);
+          boolean matches = race.equals(described) && raceState.equals(run[1]);
+          if (serialRun == null || matches) {
+            serialRun = described;
+            serialState = run[1];
+            tookEffect = excluded && serialOp != null;
+            dBeforeA = dFirst;
+            aFirstSerially = aFirst;
+          }
+          if (matches) {
+            break candidates;
+          }
         }
       }
+    }
+    if (mayGoFirst) {
+      Statistics.label("a committed transaction, serially")
+          .collect(aFirstSerially ? "before the racers before its writes" : "after them");
     }
     Statistics.label("A failed as it may").collect(replaced);
     Statistics.label("A lost its outcome to gc").collect(lost);
@@ -550,16 +584,20 @@ class TestCatalogRaceProperties {
   /**
    * A serial run on a copy of {@code setup}: the racers that ran before A's writes, then A unless
    * it is null, with D, if any, just before it ({@code dFirst}) or just after, then A's second
-   * commit through its handle ({@code again}, if A's operation succeeded), then the rest. Fills
-   * {@code results} with the racers' results; returns A's result, the catalog's state, D's result
-   * and that of A's second commit.
+   * commit through its handle ({@code again}, if A's operation succeeded), then the rest. If
+   * {@code aFirst}, A runs before the racers that ran before its writes instead (D then after
+   * them). Fills {@code results} with the racers' results; returns A's result, the catalog's
+   * state, D's result and that of A's second commit.
    */
   private static String[] serialRun(Setup setup, LocalCatalogMode base, Op a,
       LocalCatalogMode modeA, List<Op> racers, List<LocalCatalogMode> racerModes, int before,
       Map<String, String> props, String[] results, Op d, LocalCatalogMode modeD, boolean dFirst,
-      boolean again) {
+      boolean again, boolean aFirst) {
     InMemoryAtomicFileIO serialIo = new InMemoryAtomicFileIO();
     setup.apply(base.catalog(serialIo, WAREHOUSE, "c", Map.of()));
+    Table[] handle = {null};
+    String resultA = !aFirst || a == null ? null
+        : a.run(modeA.catalog(serialIo, WAREHOUSE, "c", props), "A", handle);
     for (int k = 0; k < before; k++) {
       results[k] = racers.get(k).run(
           racerModes.get(k).catalog(serialIo, WAREHOUSE, "c", props), name(k));
@@ -568,9 +606,10 @@ class TestCatalogRaceProperties {
     if (d.kind != null && dFirst) {
       resultD = d.run(modeD.catalog(serialIo, WAREHOUSE, "c", props), "D");
     }
-    Table[] handle = {null};
-    String resultA = a == null ? null
-        : a.run(modeA.catalog(serialIo, WAREHOUSE, "c", props), "A", handle);
+    if (!aFirst) {
+      resultA = a == null ? null
+          : a.run(modeA.catalog(serialIo, WAREHOUSE, "c", props), "A", handle);
+    }
     if (d.kind != null && !dFirst) {
       resultD = d.run(modeD.catalog(serialIo, WAREHOUSE, "c", props), "D");
     }
