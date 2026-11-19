@@ -72,7 +72,8 @@ share; `CPU_SHARES=2` makes a run yield to every other process when the CPUs are
 assignments: `SNAPSHOT_BLOCK=2 SNAPSHOT_WINDOW=1 calib ...`), in order, each once the host's
 5-minute load average and the run's JVMs come to at most `LOAD_MAX` (default 120; runs it started
 in the last 10 minutes count at their JVMs, as the load average lags) and its memory limit
-leaves `MEM_RESERVE` gigabytes (default 64) of the host's available memory; lines appended while
+leaves `MEM_RESERVE` gigabytes (default 64) of the host's available memory less what the running
+ce-fuzz containers may still grow by, up to their limits; lines appended while
 it runs are taken in turn, and `<file>.done` records what started. A line `soak <fork> <commit>
 <prefix>` makes it, with nothing queued waiting, start rounds `<prefix>-1`, `<prefix>-2`, ... of
 that commit, one at a time (`SOAK_MAX`), whenever the load allows (`SOAK_LOAD`, default 100), at

@@ -10,9 +10,11 @@
 # comment. Lines start in order, each once the host's 5-minute load average (counting each run
 # started in the last RAMP seconds, default 600, at its JVMs, as it ramps up; and not counting
 # soak rounds older than that, which yield) plus the run's JVMs is at most LOAD_MAX (default 120),
-# and the host's available memory exceeds the run's memory limit by MEM_RESERVE gigabytes
-# (default 64). Lines appended while it runs are taken in turn; each line started is recorded in
-# <file>.done, so a restarted queue skips it (a line is its text: give each run its own name).
+# and the host's available memory, less what every running ce-fuzz container may still grow by
+# (its limit less its use), exceeds the run's memory limit by MEM_RESERVE gigabytes (default 64):
+# were every container to reach its limit, the host would keep the reserve. Lines appended while
+# it runs are taken in turn; each line started is recorded in <file>.done, so a restarted queue
+# skips it (a line is its text: give each run its own name).
 #
 # A line "soak <fork> <commit> <prefix>" (after assignments, as for a round) makes the queue, when
 # nothing queued is waiting, start rounds <prefix>-1, <prefix>-2, ... of <commit>, at most
@@ -28,7 +30,7 @@ SOAK_LOAD=${SOAK_LOAD:-100}
 MEM_RESERVE=${MEM_RESERVE:-64}
 RAMP=${RAMP:-600}
 SOAK_MAX=${SOAK_MAX:-1}
-[ $# = 1 ] && [ -f "$1" ] || { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+[ $# = 1 ] && [ -f "$1" ] || { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 Q=$(readlink -f "$1"); DONE=$Q.done
 touch "$DONE"
 say() { echo "$(date -u +%FT%TZ) $*"; }
@@ -63,18 +65,28 @@ soaking() {
   done
 }
 
+# headroom: the gigabytes the running ce-fuzz containers may still take, each its memory limit
+# less what it uses
+headroom() {
+  docker stats --no-stream --format '{{.Name}} {{.MemUsage}}' 2>/dev/null | awk '
+    function g(v) { u = v; sub(/[0-9.]+/, "", u); v += 0
+      return u == "TiB" ? v * 1024 : u == "GiB" ? v : u == "MiB" ? v / 1024 : u == "KiB" ? v / 1048576 : v / 1073741824 }
+    $1 ~ /^ce-fuzz-/ { h += g($4) - g($2) } END { printf "%d\n", h }'
+}
+
 # fits <slots> <mem> <discount> <max>: whether the host has room for the run now under the load
 # <max>, discount being the load to set aside (old soak rounds'); prints why not
 fits() {
-  local load avail
+  local load avail head
   load=$(cut -d' ' -f2 /proc/loadavg)
-  avail=$(free -g | awk '/^Mem:/ {print $7}')
+  head=$(headroom)
+  avail=$(( $(free -g | awk '/^Mem:/ {print $7}') - ${head:-0} ))
   if ! awk -v l="$load" -v r="$(recent)" -v s="$1" -v d="$3" -v m="$4" \
       'BEGIN { exit !(l - d + r + s <= m) }'; then
     echo "load $load - $3 soaking + $(recent) ramping + $1 > $4"; return 1
   fi
   if [ $(( avail - $2 )) -lt "$MEM_RESERVE" ]; then
-    echo "available ${avail}g - ${2}g < ${MEM_RESERVE}g reserve"; return 1
+    echo "available less headroom ${avail}g - ${2}g < ${MEM_RESERVE}g reserve"; return 1
   fi
 }
 
