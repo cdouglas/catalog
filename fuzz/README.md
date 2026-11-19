@@ -50,9 +50,9 @@ jqwik runs a property's tries one after another, so a job is about one core, and
 as long as its longest job: p15-r1's `azure` (1,000,000 tries) ran 13.6 hours, its next longest
 6. A round therefore runs each long job as several shards (`SHARDS`; `ce-fuzz` with no arguments
 gives the default): each shard its own worktree and JVM, with its own random seed and its share
-of each property's tries (rounded up), as `<job>.<k>` (`<job>.<k>.log.gz`). The default makes 43
-JVMs of the eleven jobs, about an hour and a quarter each, so a round wants 43 cores (65 at most:
-the CPU limit) and 260 GB of limits (about 2 GB each in use). `SHARDS=1` runs each job as one
+of each property's tries (rounded up), as `<job>.<k>` (`<job>.<k>.log.gz`). The default makes 51
+JVMs of the eleven jobs, about an hour and a quarter each on a loaded host, so a round wants 51
+cores (77 at most: the CPU limit) and 308 GB of limits (about 2 GB each in use). `SHARDS=1` runs each job as one
 JVM; `SHARDS="azure=16 race=8"` names counts, and a bare count is every job's that isn't named.
 `summary.txt` gives each shard's line, then each sharded job's: its shards' exits, the longest's
 time, each class's failures summed. jqwik sizes what it generates by a property's tries, so a
@@ -93,7 +93,7 @@ run instead: a paging round (`r0p`) runs the race, rebase and differential jobs 
 ## Memory on a shared host
 
 Each run's container has a hard memory limit, without swap (`MEM`; by default its JVMs at once
-times their heap and 2 GB, and 2 GB: 260 GB for a round of 43 shards), and the highest OOM score. A run that
+times their heap and 2 GB, and 2 GB: 308 GB for a round of 51 shards), and the highest OOM score. A run that
 outgrows its limit loses one of its own JVMs to the kernel's OOM killer (the job fails, exit 137
 in its log), never another user's process; and should the host itself run short, the kernel
 kills this run first. `run.sh` warns if the limit did not take: rootless Docker applies it only

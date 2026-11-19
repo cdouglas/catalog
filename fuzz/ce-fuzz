@@ -33,23 +33,28 @@
 # a window of 1 reaches re-inlining's import pages.
 #
 # A round's jobs (tries per @Property, in the order the class declares them):
-#   faultA1-2  TestCatalogFaultProperties.catalogMatchesModel, 30,000 (A2 paging at 2 and 1)
-#   faultB1-2  TestCatalogFaultProperties.faultyStorageNeverMisreportsACommit, 30,000 (B2 too)
+#   faultA1-2  TestCatalogFaultProperties.catalogMatchesModel, 30,000, A2 60,000 paging at 2 and 1
+#   faultB1-2  TestCatalogFaultProperties.faultyStorageNeverMisreportsACommit, 30,000, B2 60,000
+#              (ten times txns.sh's nsdropfirst at 2/1 once views share the schedules: 5,424)
 #   race       TestCatalogRaceProperties: aRaceEndsAsASerialRun 200,000,
 #              aTransactionRaceEndsAsASerialRun 10,000
 #   mw         spec.TestMultiWriterProperties, 300,000 each
 #   proto      TestMemoryCommitProtocol 300,000, TestAtomicFileCommitProtocol 1,000,000 (ten times
 #              its slowest mutants' first failures: compactnocopy at 60,437, notrailer at 57,493;
 #              300,000 ran in 1,334 s)
-#   rebase     TestRebaseProperties, 3,000 each (REBASE_TRIES: each in turn)
+#   rebase     TestRebaseProperties, 3,000 each but aValidatedCommitIsWhatItsRetryWouldCommit's
+#              20,000 (ten times phase3.sh's blindnoreset, which only it catches: 1,605)
+#              (REBASE_TRIES: each in turn)
 #   contract   the ConflictEncodingContract subclasses, 2,000 each
 #
 # A job runs as SHARDS says ("<job>=<n> ...", a bare <n> for every job it doesn't name; 1: none),
 # each shard its own worktree and JVM, with its own random seed and 1/n of each property's tries
 # (rounded up), named <job>.<k> (logs <job>.<k>.log): a round takes its longest shard's time, not
-# its longest job's (p15-r1's azure job: 13.6 h on one core). The default, from p15-r1's times,
-# brings each to about an hour and a quarter: azure=12 race=6 diff=6 rebase=4 mw=3 faultA1=3
-# faultA2=3 faultB1=2 faultB2=2, 43 JVMs. jqwik sizes generation by a property's tries, so a
+# its longest job's (p15-r1's azure job: 13.6 h on one core). The default, from p16g-r0's times
+# (43 JVMs on a host loaded to ~100), brings each to about an hour and a quarter: azure=12 race=6
+# rebase=6 faultA2=6 mw=4 faultB2=4 diff=4 faultA1=3 faultB1=2 proto=2 contract=2, 51 JVMs (an
+# unsharded job there, proto or contract, took twice its p15-r1 time). jqwik sizes generation by
+# a property's tries, so a
 # shard's (at least a calibration's, for every job) are what a shrink or a replay of its seed
 # must use; a calibration margin (ten times a mutant's first failing try) is judged on the job's
 # tries, all shards together.
@@ -60,7 +65,7 @@ SRC=/work/src
 T=iceberg-fileio-catalog/src/test/java/org/apache/iceberg/io
 HEAP=${HEAP:-4g}
 SHRINKING=${SHRINKING:-OFF}
-SHARDS=${SHARDS:-"azure=12 race=6 diff=6 rebase=4 mw=3 faultA1=3 faultA2=3 faultB1=2 faultB2=2"}
+SHARDS=${SHARDS:-"azure=12 race=6 rebase=6 faultA2=6 mw=4 faultB2=4 diff=4 faultA1=3 faultB1=2 proto=2 contract=2"}
 
 # die <message>: to stderr, and to the run's summary once it has one (a container's log is
 # gone with the container)
@@ -245,8 +250,10 @@ tests_of() {
 # shard's share)
 setup() {
   case ${1%%.*} in
-    faultA*) tries $2/$T/TestCatalogFaultProperties.java 30000 1 ;;
-    faultB*) tries $2/$T/TestCatalogFaultProperties.java 1 30000 ;;
+    faultA1) tries $2/$T/TestCatalogFaultProperties.java 30000 1 ;;
+    faultB1) tries $2/$T/TestCatalogFaultProperties.java 1 30000 ;;
+    faultA2) tries $2/$T/TestCatalogFaultProperties.java 60000 1 ;;
+    faultB2) tries $2/$T/TestCatalogFaultProperties.java 1 60000 ;;
     race) tries $2/$T/TestCatalogRaceProperties.java 200000 10000 ;;
     mw) tries $2/$T/spec/TestMultiWriterProperties.java each 300000 ;;
     proto)
@@ -255,7 +262,8 @@ setup() {
     azure) tries $2/intentlog-fileio/src/test/java/org/intentlog/fileio/TestSegmentedCommitProtocol.java 1000000 ;;
     rebase)
       # shellcheck disable=SC2206
-      local r=(${REBASE_TRIES:-3000}); [ ${#r[@]} = 1 ] && r=(each "${r[0]}")
+      local r=(${REBASE_TRIES:-3000 3000 3000 3000 20000 3000 3000 3000 3000 3000})
+      [ ${#r[@]} = 1 ] && r=(each "${r[0]}")
       tries $2/$T/TestRebaseProperties.java "${r[@]}" ;;
     contract) tries $2/$T/ConflictEncodingContract.java each 2000 ;;
     diff)
@@ -497,5 +505,5 @@ case $cmd in
     cat $O/summary.txt ;;
   status) status "${1:-}" ;;
   slots) slots ;;
-  *) sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
