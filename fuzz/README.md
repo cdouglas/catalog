@@ -67,19 +67,24 @@ apart (default 10), as each compiles for about a minute first; a calibration's m
 `run.sh` gives each run a CPU limit (`CPUS`, default one and a half per JVM) besides its memory
 limit, so a burst of its JVMs' compilers and collectors leaves the host's other users their
 share; `CPU_SHARES=2` makes a run yield to every other process when the CPUs are all busy.
-`queue.sh <file>` (run it detached: `setsid nohup ./queue.sh q.txt > out/queue.log 2>&1 <
-/dev/null &`) starts the runs a file lists (`calib p16 36b7e98 p16f-cal-budget budget`, after any
-assignments: `SNAPSHOT_BLOCK=2 SNAPSHOT_WINDOW=1 calib ...`), in order, each once the host's
-5-minute load average and the run's JVMs come to at most `LOAD_MAX` (default 120; runs it started
-in the last 10 minutes count at their JVMs, as the load average lags) and its memory limit
-leaves `MEM_RESERVE` gigabytes (default 64) of the host's available memory less what the running
-ce-fuzz containers may still grow by, up to their limits; lines appended while
-it runs are taken in turn, and `<file>.done` records what started. A line `soak <fork> <commit>
-<prefix>` makes it, with nothing queued waiting, start rounds `<prefix>-1`, `<prefix>-2`, ... of
-that commit, one at a time (`SOAK_MAX`), whenever the load allows (`SOAK_LOAD`, default 100), at
-`CPU_SHARES=2`: a soak
-takes only cycles nobody else wants, and queued runs count the load of a soak round past its
-ramp-up as free. `soak off` stops it starting more.
+`queue.sh <file>` (run it detached: `setsid -f nohup ./queue.sh q.txt >> out/queue.log 2>&1 <
+/dev/null`) starts the runs a file lists (`calib p16 36b7e98 p16f-cal-budget budget`, after any
+assignments: `SNAPSHOT_BLOCK=2 SNAPSHOT_WINDOW=1 calib ...`), in order, each once the host has room:
+its 5-minute load average and the run's JVMs come to at most `LOAD_MAX` (default 120; runs it
+started in the last 10 minutes count at their JVMs, as the load average lags), and our runs never
+oversubscribe its memory: the host's available memory (with the ZFS ARC above its floor, which the
+kernel gives back under pressure), less what every running ce-fuzz container may still grow by up
+to its limit, must leave the run's limit and `MEM_RESERVE` gigabytes (default 64). Lines appended
+while it runs are taken in turn, and `<file>.done` records what started. A line `soak <fork>
+<commit> <prefix>` makes it, with nothing queued waiting, start rounds `<prefix>-1`, `<prefix>-2`,
+... of that commit, one at a time (`SOAK_MAX`), when the load is under `SOAK_LOAD` (default 100)
+and the memory has room as above, at `CPU_SHARES=2`: a soak takes only cycles nobody else wants,
+and queued runs count the load of a soak round past its ramp-up as free. Memory does not yield
+so: a soak round stands aside for anyone who needs it. A queued run that would fit were the soak
+rounds stopped stops the newest; and when the room falls below the reserve (another user's
+demand grew), the newest soak round is stopped and none starts for `SOAK_BACKOFF` seconds (default
+1800). A stopped round keeps its logs, but its unfinished shards' seeds are lost. `soak off`
+stops it starting more.
 A round's faultA2 and faultB2 page snapshots at blocks of 2 and a window of 1, and fail if too
 few of their tries seal a block; the other jobs run at the catalog's default, which seals nothing
 in their short schedules. `SNAPSHOT_BLOCK` (and `SNAPSHOT_WINDOW`) sets paging for every job of a
