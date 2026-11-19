@@ -1,6 +1,6 @@
 # Calibration of catalog transactions beyond appends (the 2026-11-17 review's A6, and C3's catalog
 # half; the gap plan's item 1.4; anchors as of its commit, renamebeforeuuid's as of Bug 124's, which
-# stages renames after the loop): each mutant must fail an oracle. Run at
+# stages renames after the loop, and of views' stage 2, whose view loop stages its renames alike): each mutant must fail an oracle. Run at
 # SNAPSHOT_BLOCK=2 SNAPSHOT_WINDOW=1. Before the item no fuzzer staged a drop, rename, create or
 # namespace change in a catalog transaction: each mutant passed 300 tries of each fault property
 # and 300/100 of the race fuzzer's. Tries below are the fault fuzzer's,
@@ -69,10 +69,17 @@ mutant() { # name main-dir test-dir
       }
 
       if (change.dropped()) {" \
-      && mutate $M/LogCatalog.java "      if (change.renamedTo() != null) {
+      && mutate $M/LogCatalog.java "          newCatalog.pin(tableId);
+        }
+      }
+
+      if (change.renamedTo() != null) {
         renames.add(change);
       }
-    }" "    }" ;;
+    }" "          newCatalog.pin(tableId);
+        }
+      }
+    }" ;;
     # a transaction's rename applies to whatever table has the name when it commits, though it was
     # replaced since the transaction loaded it (its uuid unchecked)
     renamereplaced) mutate $M/LogCatalog.java "      if (!java.util.Objects.equals(currentMetadata.uuid(), change.base().uuid())) {
