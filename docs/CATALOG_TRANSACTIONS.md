@@ -140,7 +140,10 @@ action on the state before the record, where the name is still taken (Bug 124 (r
 name fails)).
 
 The transaction sees its own changes: a dropped table no longer loads, a renamed one loads under its
-new name only, a created one loads and takes updates, listings include them. The commit carries the
+new name only, a created one loads and takes updates, listings include them. Every table it loads is
+the transaction's, its changes staged into the transaction, including one another writer creates
+as the transaction looks for it (the fork's Bug 128 (transaction load returned live table),
+core-perf 21c54d93cc). The commit carries the
 transaction's net effect against the catalog as the transaction found it, which is what
 `CatalogMutation` records: tables created (with their final metadata), tables updated (by their
 names at the start, with the version first read), renamed (start name to final name) and dropped,
