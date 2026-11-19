@@ -442,7 +442,11 @@ and a view's metadata carries its own uuid. What Batavia could add, outside Iceb
 - **API.** `CatalogCommit` gains `ViewChange`s (create, replace, drop, rename), and
   `CatalogTransaction` a view catalog to stage them through.
 - **Implementations.**
-  - `BaseCatalogTransaction` stages view changes as it stages table creates and drops.
+  - `BaseCatalogTransaction` stages view changes as it stages table creates and drops, and its
+    staging of a namespace's drop counts the namespace's views as children. Today it counts
+    only tables and namespaces, so a transaction that drops a namespace holding a view stages
+    the drop, and its commit throws `NamespaceNotEmptyException` with nothing applied
+    (`TestCatalogRegressions$Views`).
   - JDBC commits them in its one database transaction, on the V1 schema.
   - `RESTCatalog`'s transaction throws, since its request has no view changes.
   - FileIOCatalog stages `CreateView`, `UpdateView`, `DropView` and `RenameView` into the

@@ -1307,6 +1307,34 @@ public class TestCatalogRegressions {
     }
 
     /**
+     * A catalog transaction drops a namespace's tables, then the namespace, which holds a view. A
+     * transaction stages no view changes (VIEWS.md stage 2), and its staging of the drop counts
+     * only tables and namespaces (the fork's {@code BaseCatalogTransaction}), so the commit finds
+     * the namespace not empty, and nothing applies. Found by the fault fuzzer's calibration
+     * (views-cal-views, unmutated), whose model counted the view only outside a transaction.
+     */
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "CAS", "MEMLOG", "AZLOG"})
+    void aTransactionsDropOfANamespaceWithAViewFailsAtItsCommit(LocalCatalogMode mode) {
+      LogCatalog catalog = mode.catalog(io, WAREHOUSE, "c", Map.of());
+      catalog.createNamespace(ns);
+      TableIdentifier t = TableIdentifier.of(ns, "t");
+      catalog.createTable(t, SCHEMA);
+      createView(catalog, v, "select 1", Map.of());
+
+      CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      assertThat(txn.asCatalog().dropTable(t, true)).isTrue();
+      assertThat(((org.apache.iceberg.catalog.SupportsNamespaces) txn.asCatalog())
+          .dropNamespace(ns)).isTrue();
+      assertThatThrownBy(txn::commitTransaction).isInstanceOf(NamespaceNotEmptyException.class);
+
+      LogCatalog reader = mode.catalog(io, WAREHOUSE, "c", Map.of());
+      assertThat(reader.namespaceExists(ns)).isTrue();
+      assertThat(reader.tableExists(t)).isTrue();
+      assertThat(reader.viewExists(v)).isTrue();
+    }
+
+    /**
      * One view written by an inline writer and a pointer writer in turn: each commit carries the
      * whole view, in its writer's form (V2, V3), and both read every version alike.
      */
