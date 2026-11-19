@@ -477,7 +477,8 @@ class TestCatalogRaceProperties {
             ? new boolean[] {false, true} : new boolean[] {false}) {
           String[] serial = new String[racers.size()];
           String[] run = serialRun(setup, base, serialOp, modeA, racers, racerModes, before,
-              props, serial, d, modeD, dFirst, raceAgain != null, aFirst);
+              props, serial, d, modeD, dFirst, raceAgain != null, aFirst,
+              catalogLog == LocalCatalogMode.Log.AZURE ? blockBytes : 0);
           String described = outcomes(excluded ? raceA : run[0], serial, d, run[2], run[3]);
           boolean matches = race.equals(described) && raceState.equals(run[1]);
           if (serialRun == null || matches) {
@@ -587,14 +588,19 @@ class TestCatalogRaceProperties {
    * commit through its handle ({@code again}, if A's operation succeeded), then the rest. If
    * {@code aFirst}, A runs before the racers that ran before its writes instead (D then after
    * them). Fills {@code results} with the racers' results; returns A's result, the catalog's
-   * state, D's result and that of A's second commit.
+   * state, D's result and that of A's second commit. On Append Blobs, its writers' segments take
+   * the race's blocks ({@code blockBytes}, 0: the service's), so a record over the race's bound
+   * is over the serial run's too.
    */
   private static String[] serialRun(Setup setup, LocalCatalogMode base, Op a,
       LocalCatalogMode modeA, List<Op> racers, List<LocalCatalogMode> racerModes, int before,
       Map<String, String> props, String[] results, Op d, LocalCatalogMode modeD, boolean dFirst,
-      boolean again, boolean aFirst) {
+      boolean again, boolean aFirst, int blockBytes) {
     InMemoryAtomicFileIO serialIo = new InMemoryAtomicFileIO();
     setup.apply(base.catalog(serialIo, WAREHOUSE, "c", Map.of()));
+    if (blockBytes > 0) {
+      LocalCatalogMode.azureStore(serialIo, CATALOG).limitBlockBytes(blockBytes);
+    }
     Table[] handle = {null};
     String resultA = !aFirst || a == null ? null
         : a.run(modeA.catalog(serialIo, WAREHOUSE, "c", props), "A", handle);
