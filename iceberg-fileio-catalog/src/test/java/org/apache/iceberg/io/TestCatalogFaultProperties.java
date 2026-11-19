@@ -926,10 +926,12 @@ class TestCatalogFaultProperties {
     final String uuid;
     final String metadataLocation;
     final TableMetadata metadata;
-    // Whether the transaction changed it (an update, a drop, a rename), and updated it (an append
-    // or a property, which the conflict encoding judges on an inline table)
+    // Whether the transaction changed it (an update, a drop, a rename it did not undo), and updated
+    // it (an append or a property, which the conflict encoding judges on an inline table); and
+    // whether it renamed it (a change unless it renamed it back, as the commit sees)
     boolean changed = false;
     boolean updated = false;
+    boolean renamed = false;
     // The refs it scanned, each to the snapshot it named then (null: none), and whether it
     // declared a read of the table
     final Map<String, Long> scans = new TreeMap<>();
@@ -946,9 +948,16 @@ class TestCatalogFaultProperties {
   private static final class Staged {
     final String description;
     final Effect effect;
+    // For a rename, the catalog's name the renamed table had when the transaction loaded it
+    final TableIdentifier renameOf;
 
     Staged(String description, Effect effect) {
+      this(description, null, effect);
+    }
+
+    Staged(String description, TableIdentifier renameOf, Effect effect) {
       this.description = description;
+      this.renameOf = renameOf;
       this.effect = effect;
     }
 
@@ -2328,10 +2337,11 @@ class TestCatalogFaultProperties {
             Loaded at = w.load(id, table);
             w.txn.asCatalog().renameTable(id, txnTo);
             if (at != null) {
-              at.changed = true;
+              at.renamed = true;
             }
-            w.names.put(txnTo, w.names.remove(id));
-            return new Staged("rename " + id + " to " + txnTo, (m, actual) -> {
+            TableIdentifier renameOf = w.names.remove(id);
+            w.names.put(txnTo, renameOf);
+            return new Staged("rename " + id + " to " + txnTo, renameOf, (m, actual) -> {
               TableState state = existing(m, id);
               if (m.containsKey(txnTo)) {
                 throw new IllegalStateException(txnTo + " exists");
@@ -2398,6 +2408,22 @@ class TestCatalogFaultProperties {
           CatalogTransaction txn = w.txn;
           Map<TableIdentifier, Loaded> loaded = new LinkedHashMap<>(w.loaded);
           List<Staged> changes = new ArrayList<>(w.staged);
+          // A table renamed back to the name it was loaded by, and changed no other way, the
+          // commit leaves alone (BaseCatalogTransaction sends a rename only of a table whose name
+          // is not the one it started with): its renames have no effect, and need neither the
+          // table nor the names they passed through at the commit, which serializes the
+          // transaction before whatever dropped the one or took the others since (a table's
+          // existence is no read). A rename not undone is a change.
+          Set<TableIdentifier> renamedBack = new HashSet<>();
+          w.names.forEach((name, origin) -> {
+            if (name.equals(origin) && loaded.containsKey(origin) && loaded.get(origin).renamed
+                && !loaded.get(origin).changed) {
+              renamedBack.add(origin);
+            }
+          });
+          loaded.forEach((origin, at) -> at.changed |= at.renamed && !renamedBack.contains(origin));
+          List<Staged> effects = new ArrayList<>(changes);
+          effects.removeIf(c -> c.renameOf != null && renamedBack.contains(c.renameOf));
           // What each purge deletes: the manifests and lists of the table as it is now, just
           // before the commit (Bug 96)
           Map<TableIdentifier, Set<String>> purging = new TreeMap<>(BY_NAME);
@@ -2415,7 +2441,7 @@ class TestCatalogFaultProperties {
                 // All of it, or nothing: the effects apply to the model's copy in the order the
                 // transaction staged them, and any that does not apply fails the whole
                 checkIsolation(txn.isolationLevel(), loaded, m);
-                for (Staged change : changes) {
+                for (Staged change : effects) {
                   change.effect.apply(m, actual);
                 }
                 adoptCreated(m, actual);
