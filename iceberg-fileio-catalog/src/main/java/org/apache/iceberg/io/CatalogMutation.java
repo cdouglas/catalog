@@ -433,14 +433,20 @@ public class CatalogMutation {
   }
 
   public CatalogMutation dropTable(TableIdentifier tableId) {
-    // A name a rename staged here took names the renamed table, whatever the read held there: the
-    // drop is of that table, by its name in the read, and the rename goes (Bug 126)
-    for (Map.Entry<TableIdentifier, TableIdentifier> rename : tableRenames.entrySet()) {
-      if (rename.getValue().equals(tableId)) {
-        TableIdentifier from = rename.getKey();
-        tableRenames.remove(from);
-        return dropTable(from);
-      }
+    // A name a rename staged here took names the renamed table, which this record cannot drop: it
+    // drops tables by their names in the read and renames after them, and dropping the table in
+    // the rename's place would lose the conditions the rename binds its name by, which the record
+    // must meet where it lands. And a table this transaction dropped is gone from its view. Both
+    // were taken as a drop of what the read held under the name, again, leaving a renamed table
+    // there (Bug 126). The catalog-transaction API drops a renamed table by its name in the read,
+    // with no rename.
+    if (tableRenames.containsValue(tableId)) {
+      throw new IllegalArgumentException(
+          "Cannot drop " + tableId + ": a table renamed into it in this transaction");
+    }
+    if (markedForDrop(tableId)) {
+      throw new NoSuchTableException("Table does not exist: %s (dropped in this transaction)",
+          tableId);
     }
     if (!original.containsTable(tableId)) {
       throw new NoSuchTableException("Table does not exist: %s", tableId);

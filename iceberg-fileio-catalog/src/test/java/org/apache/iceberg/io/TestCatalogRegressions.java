@@ -8399,14 +8399,15 @@ public class TestCatalogRegressions {
   }
 
   /**
-   * Bug 126 (second drop missed renamed table): a transaction that dropped a table, renamed
+   * Bug 126 (second drop missed renamed table): a CatalogMutation that dropped a table, renamed
    * another into its name (Bug 124) and dropped that name again left the renamed table there: the
    * second drop resolved the name against the read, whose table there the transaction had dropped
-   * already, and staged that drop again. A drop of a name a rename staged before took drops the
-   * renamed table, as Iceberg's catalogs do (a table renamed in and dropped is a table dropped),
-   * and so does one of a name only the rename brought (which said the table did not exist).
-   * Found by the multi-writer fuzzer (round views-r0), which drives CatalogMutation directly; the
-   * catalog-transaction API resolved the name to the renamed table itself.
+   * already, and staged that drop again. A record drops tables by their names in the read and
+   * renames after them, so it cannot drop a table in a rename's place without losing the
+   * conditions the rename binds its name by, which it must meet where it lands: such a drop is
+   * refused, as is a second drop of a table. Found by the multi-writer fuzzer (round views-r0),
+   * which drives CatalogMutation directly; the catalog-transaction API drops a renamed table by its
+   * name in the read, with no rename.
    */
   @Nested
   class ADropOfANameARenameTook {
@@ -8426,30 +8427,26 @@ public class TestCatalogRegressions {
     }
 
     @Test
-    void dropsTheTableRenamedIntoANameItFreed() {
-      new CatalogMutation(setUp()).dropTable(u).renameTable(t, u).dropTable(u).commit(log);
+    void refusesToDropTheTableRenamedIntoANameItFreed() {
+      CatalogMutation mut = new CatalogMutation(setUp()).dropTable(u).renameTable(t, u);
+      assertThatThrownBy(() -> mut.dropTable(u)).isInstanceOf(IllegalArgumentException.class);
 
-      assertThat(log.read().state().tables()).isEmpty();
-    }
-
-    @Test
-    void dropsTheTableRenamedIntoANewName() {
-      new CatalogMutation(setUp()).renameTable(t, v).dropTable(v).commit(log);
-
-      assertThat(log.read().state().tables()).containsExactly(u);
-    }
-
-    @Test
-    void freesTheNameForAnotherRename() {
-      Replica<CatalogState> read = setUp();
-      String uLocation = read.state().location(u);
-      new CatalogMutation(read).renameTable(u, v).dropTable(v).renameTable(t, v).commit(log);
-
+      mut.commit(log); // as staged before the refused drop
       CatalogState after = log.read().state();
-      assertThat(after.tables()).containsExactly(v);
-      assertThat(after.location(v))
-          .isNotEqualTo(uLocation)
-          .isEqualTo("mem:///ns/t/v1.metadata.json");
+      assertThat(after.tables()).containsExactly(u);
+      assertThat(after.location(u)).isEqualTo("mem:///ns/t/v1.metadata.json");
+    }
+
+    @Test
+    void refusesToDropTheTableRenamedIntoANewName() {
+      CatalogMutation mut = new CatalogMutation(setUp()).renameTable(t, v);
+      assertThatThrownBy(() -> mut.dropTable(v)).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void refusesToDropATableTwice() {
+      CatalogMutation mut = new CatalogMutation(setUp()).dropTable(u);
+      assertThatThrownBy(() -> mut.dropTable(u)).isInstanceOf(NoSuchTableException.class);
     }
   }
 }
