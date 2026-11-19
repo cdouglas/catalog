@@ -2741,6 +2741,7 @@ class TestCatalogFaultProperties {
               });
         }
         default: {
+          resolveKeptViews();
           if (model.keptViews.isEmpty()) {
             return null;
           }
@@ -2765,6 +2766,20 @@ class TestCatalogFaultProperties {
      * which fails an acknowledged drop: the view could not be registered again.
      */
     private String keptFile(TableIdentifier view, ViewState state) {
+      String file = heldFile(state);
+      if (file == null) {
+        // an acknowledged drop's effect then fails the run; a rejected one's does not apply
+        throw new IllegalStateException(String.format(
+            "the drop of %s, kept (gc.enabled false), left no metadata file of %s", view, state));
+      }
+      return file;
+    }
+
+    /**
+     * A metadata file that holds {@code state}: a pointer view's own, or one in its metadata
+     * directory; null if none does.
+     */
+    private String heldFile(ViewState state) {
       if (state.metadataLocation != null && !state.metadataLocation.startsWith("inline-view://")
           && holds(state.metadataLocation, state)) {
         return state.metadataLocation;
@@ -2774,9 +2789,30 @@ class TestCatalogFaultProperties {
           return info.location();
         }
       }
-      // an acknowledged drop's effect then fails the run; a rejected one's does not apply
-      throw new IllegalStateException(String.format(
-          "the drop of %s, kept (gc.enabled false), left no metadata file of %s", view, state));
+      return null;
+    }
+
+    /**
+     * Each kept view's file the model recorded that is gone, replaced by a file of its metadata
+     * directory that holds it; the run fails if none does. The file recorded when a drop landed
+     * may be one a racing drop of the same inline view wrote first, and deleted since, losing
+     * (each writes the view to a file of its own before its commit, and a drop that fails deletes
+     * what it wrote): both held the view when the drop that landed was applied to the model.
+     */
+    private void resolveKeptViews() {
+      for (String file : new ArrayList<>(model.keptViews.keySet())) {
+        if (io.newInputFile(file).exists()) {
+          continue;
+        }
+        ViewState state = model.keptViews.remove(file);
+        String held = heldFile(state);
+        if (held == null) {
+          throw fail("a view dropped keeping its metadata (gc.enabled false) cannot be registered"
+              + " again: %s is gone, and no metadata file under %s holds %s", file,
+              state.location, state);
+        }
+        model.keptViews.put(held, state);
+      }
     }
 
     /** Whether the view metadata file {@code file} holds {@code state}. */
