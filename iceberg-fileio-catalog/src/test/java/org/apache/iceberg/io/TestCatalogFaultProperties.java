@@ -3031,7 +3031,15 @@ class TestCatalogFaultProperties {
         if (!file.location().endsWith(".metadata.json")) {
           continue;
         }
-        TableMetadata kept = TableMetadataParser.read(io, file.location());
+        TableMetadata kept;
+        try {
+          kept = TableMetadataParser.read(io, file.location());
+        } catch (IllegalArgumentException e) {
+          // A view given the table's name since writes its metadata files here too: a table and
+          // a view share names (VIEWS.md V7), and so default locations. Anything else fails.
+          org.apache.iceberg.view.ViewMetadataParser.read(io, file.location());
+          continue;
+        }
         files.add(file.location());
         Set<Long> snapshots = new TreeSet<>();
         kept.snapshots().forEach(snapshot -> snapshots.add(snapshot.snapshotId()));
