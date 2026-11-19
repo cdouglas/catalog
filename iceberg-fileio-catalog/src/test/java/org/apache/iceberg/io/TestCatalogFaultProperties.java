@@ -77,6 +77,7 @@ import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
 import org.apache.iceberg.io.InMemoryAtomicFileIO.ReadFault;
 import org.apache.iceberg.types.Types;
+import org.intentlog.Replica;
 import org.intentlog.fileio.SegmentedLogHistory;
 import org.intentlog.azure.InMemoryAppendBlobStore;
 import org.intentlog.fileio.AtomicFileLog;
@@ -94,7 +95,10 @@ import org.intentlog.wire.LogEnvelope;
  * schema and partition-spec changes, table transactions, snapshot expiry (of everything older than
  * now or than one of the table's snapshots, of one snapshot by id, or of what the retention of the
  * table and its refs alone expires) and those retention settings, manifest rewrites, table
- * create / drop / rename (across namespaces too) / replace, upgrades from format v2 to v3,
+ * create / drop / rename (across namespaces too) / replace, upgrades from format v2 to v3, refs
+ * moved and snapshots expired behind the sealing line of snapshot paging (rollbacks, tags of old
+ * snapshots, expiries of sealed ones), sweeps of the log's orphaned pages (from a fresh read, or
+ * from a writer's replica however stale),
  * namespace create / drop and property changes, and multi-table catalog transactions whose
  * steps (loads, appends, scans of a branch or tag, declared reads, table drops with purge or not,
  * renames, creates and property changes, namespace creates, drops and property changes, view
@@ -112,7 +116,11 @@ import org.intentlog.wire.LogEnvelope;
  *
  * <p>In {@link #faultyStorageNeverMisreportsACommit}, each operation's storage also fails as its
  * command says: its first two conditional writes (see {@link InMemoryAtomicFileIO.Fault}) and one
- * of its reads (see {@link InMemoryAtomicFileIO.ReadFault}). Reads of {@code metadata.json} do not
+ * of its reads (see {@link InMemoryAtomicFileIO.ReadFault}; on a shared log, a read of a page
+ * fails or finds no page, as if the store lost it, which must fail the operation, never read as an
+ * empty block), and its plain requests: a page put or another put, a delete or a listing fails,
+ * before it lands or after with its reply lost ({@link Cmd#plainPlans}). Reads of {@code
+ * metadata.json} do not
  * fail, as Iceberg retries them after 100 ms; nor do reads on Iceberg's worker threads, which
  * would make the schedule nondeterministic. A preempting operation runs without faults. Storage may
  * also be strict about versions, as it is in practice: a read pinned to a replaced version fails
@@ -146,7 +154,13 @@ import org.intentlog.wire.LogEnvelope;
  *       wrote have its own. In v3, snapshots' row-id ranges are apart and below the next row id.
  *   <li>Every version of the catalog file that a writer wrote reads the same as a checkpoint of
  *       it, which the next compaction would write (see {@link CheckpointRoundTrip}); and every page
- *       of the committed set the newest version references exists, as its reference says.
+ *       the newest version references exists, as its reference says: the committed set's, and the
+ *       sealed snapshot blocks' its root names. A sweep runs too at the first conditional write
+ *       after a command put a page, before the root or record that names it lands.
+ *   <li>The drain, after the schedule, on storage that no longer fails: a compaction lands (its
+ *       root's pages put first, however earlier puts of them failed), a sweep from a fresh read
+ *       leaves every page the newest root names, and with every table dropped, a compaction and a
+ *       sweep leave no snapshot page in the log's page store.
  *   <li>Row lineage, in a v3 table: once a snapshot has row ids, every live data file has them; the
  *       files' ranges are disjoint and below the table's next row id; a file's first row id never
  *       changes along main's lineage, nor do a snapshot's first row id and added rows.
@@ -200,8 +214,8 @@ class TestCatalogFaultProperties {
   /**
    * The share of tries, in percent, in which some table must seal a snapshot block when every
    * catalog pages at blocks of 2 ({@code -Dfileio.catalog.test.snapshot.block=2}, as a round's
-   * faultA2 and faultB2 do): about a quarter of catalogMatchesModel's tries and a fifth of
-   * faultyStorageNeverMisreportsACommit's seal one at a window of 1 (100 tries each, 2026-11-18),
+   * faultA2 and faultB2 do): 19% of catalogMatchesModel's tries and 13% of
+   * faultyStorageNeverMisreportsACommit's seal one at a window of 1 (300 tries each, 2026-11-19),
    * so a change that stops most of them sealing fails the job; no floor at other paging.
    */
   private static final double SEALING_FLOOR =
@@ -383,7 +397,7 @@ class TestCatalogFaultProperties {
             Tuple.of(2, Kind.CREATE_TABLE),
             Tuple.of(1, Kind.DROP_TABLE),
             Tuple.of(1, Kind.RENAME_TABLE),
-            Tuple.of(4, Kind.FAST_APPEND),
+            Tuple.of(6, Kind.FAST_APPEND),
             Tuple.of(2, Kind.MERGE_APPEND),
             Tuple.of(2, Kind.DELETE_FILE),
             Tuple.of(2, Kind.SET_PROPERTY),
@@ -399,14 +413,18 @@ class TestCatalogFaultProperties {
             Tuple.of(1, Kind.CREATE_BRANCH),
             Tuple.of(2, Kind.BRANCH_APPEND),
             Tuple.of(1, Kind.FAST_FORWARD),
+            Tuple.of(1, Kind.ROLLBACK),
+            Tuple.of(1, Kind.TAG_OLD),
             Tuple.of(1, Kind.REMOVE_REF),
             Tuple.of(1, Kind.STAGE_APPEND),
             Tuple.of(1, Kind.CHERRY_PICK),
             Tuple.of(2, Kind.TABLE_TXN),
             Tuple.of(2, Kind.EXPIRE_SNAPSHOTS),
+            Tuple.of(2, Kind.EXPIRE_OLD),
             Tuple.of(1, Kind.SET_RETENTION),
             Tuple.of(1, Kind.REWRITE_MANIFESTS),
             Tuple.of(1, Kind.REINLINE),
+            Tuple.of(2, Kind.SWEEP),
             Tuple.of(1, Kind.CREATE_NAMESPACE),
             Tuple.of(1, Kind.DROP_NAMESPACE),
             Tuple.of(2, Kind.SET_NAMESPACE_PROPERTY),
@@ -443,8 +461,12 @@ class TestCatalogFaultProperties {
             Tuple.of(2, 2),
             Tuple.of(1, 3),
             Tuple.of(1, 4));
-    // b and c together: a combinator takes at most eight arbitraries
+    // b and c together, and the read and plain faults: a combinator takes at most eight
+    // arbitraries
     Arbitrary<int[]> operands = Combinators.combine(small, small).as((b, c) -> new int[] {b, c});
+    Arbitrary<int[]> readAndPlain = Combinators.combine(
+            small, Arbitraries.integers().between(0, 63), Arbitraries.integers().between(0, 7))
+        .as((read, plain, page) -> new int[] {read, plain, page});
     return Combinators.combine(
             kinds,
             Arbitraries.integers().between(0, 2),
@@ -453,9 +475,9 @@ class TestCatalogFaultProperties {
             Arbitraries.of(true, false),
             preempt,
             Arbitraries.integers().between(0, 143),
-            small)
-        .as((kind, writer, a, bc, fresh, pre, writeFaults, readFault) ->
-            new Cmd(kind, writer, a, bc[0], bc[1], fresh, pre, writeFaults, readFault))
+            readAndPlain)
+        .as((kind, writer, a, bc, fresh, pre, writeFaults, rp) ->
+            new Cmd(kind, writer, a, bc[0], bc[1], fresh, pre, writeFaults, rp[0], rp[1], rp[2]))
         .list()
         .ofMinSize(1)
         .ofMaxSize(40)
@@ -485,6 +507,7 @@ class TestCatalogFaultProperties {
       case STAGE_APPEND:
       case TABLE_TXN:
       case EXPIRE_SNAPSHOTS:
+      case EXPIRE_OLD:
       case REWRITE_MANIFESTS:
       case DROP_TABLE:
       case RENAME_TABLE:
@@ -519,6 +542,7 @@ class TestCatalogFaultProperties {
       case RENAME_TABLE:
       case REPLACE_TABLE:
       case REINLINE:
+      case SWEEP:
       case CREATE_NAMESPACE:
       case DROP_NAMESPACE:
       case SET_NAMESPACE_PROPERTY:
@@ -579,6 +603,19 @@ class TestCatalogFaultProperties {
     BRANCH_APPEND,
     /** Fast-forwards main to branch b0 or b1. */
     FAST_FORWARD,
+    /**
+     * Moves main, of a table the last check found with sealed blocks if any has them, to one of
+     * its snapshots that check found sealed, as {@code b} picks, or to one of its three oldest if
+     * none is: an ancestor of main ({@code rollbackTo}) when {@code c} is even, else any snapshot
+     * ({@code setCurrentSnapshot}). Behind the sealing line, the record brings the snapshot back
+     * from its page with a Merkle proof (docs/SNAPSHOT_PAGING.md, "Testing").
+     */
+    ROLLBACK,
+    /**
+     * Tags a snapshot as {@link #ROLLBACK} picks one, as t0 or t1, as {@code c} picks: a tag the
+     * handle's table has is replaced.
+     */
+    TAG_OLD,
     /** Removes a branch or tag the table has. */
     REMOVE_REF,
     /** Stages an append (write-audit-publish) under a new wap.id, leaving main as it is. */
@@ -593,6 +630,13 @@ class TestCatalogFaultProperties {
      */
     EXPIRE_SNAPSHOTS,
     /**
+     * Expires one of the table's snapshots behind the sealing line, as the last check found it
+     * ({@link Expiry#A_SNAPSHOT}, the first or second sealed, as {@code c} picks), cleaning up as
+     * {@link #EXPIRE_SNAPSHOTS} does: a live id leaves its sealed block, or the block empties and
+     * its page is dropped. Nothing, if the last check found none sealed.
+     */
+    EXPIRE_OLD,
+    /**
      * Sets a retention, as {@code c} picks: a branch's minimum number of snapshots or maximum
      * snapshot age, a ref's maximum age, or a table property that sets one for all.
      */
@@ -604,6 +648,15 @@ class TestCatalogFaultProperties {
      * sees, and in a writer that does not inline it does nothing.
      */
     REINLINE,
+    /**
+     * Deletes the log's orphaned pages ({@link CatalogLog#sweep}) as a fresh read holds the
+     * catalog ({@link LogCatalog#deleteOrphanPages}) when {@code b % 3} is 0, else as the writer's
+     * newest replica holds it (1) or the oldest it kept (2), however stale. Preempting another
+     * writer's command, it runs at that command's first conditional write after it put a page (a
+     * compactor's root, a re-inlining's record), and not at a request: a sweep from a replica
+     * before the records that sealed a page must spare it.
+     */
+    SWEEP,
     /** Creates ns or ns2, as {@code b} picks, with a property when {@code b} is odd. */
     CREATE_NAMESPACE,
     /** Drops ns or ns2, as {@code b} picks, which fails unless it is empty. */
@@ -684,7 +737,8 @@ class TestCatalogFaultProperties {
    * be stale. {@code preempt}, if not negative, runs this command just before storage request
    * number {@code preempt} (reads of the catalog and the first conditional write) of the command
    * before it, if that is another writer's and gets that far. On faulty storage, {@code
-   * writeFaults} and {@code readFault} pick the command's faults.
+   * writeFaults} and {@code readFault} pick the command's faults, and {@code pageFault} and {@code
+   * plainFault} faults of its plain requests ({@link #plainPlans}).
    */
   static final class Cmd {
     final Kind kind;
@@ -696,9 +750,11 @@ class TestCatalogFaultProperties {
     final int preempt;
     final int writeFaults;
     final int readFault;
+    final int plainFault;
+    final int pageFault;
 
     Cmd(Kind kind, int writer, int a, int b, int c, boolean fresh, int preempt, int writeFaults,
-        int readFault) {
+        int readFault, int plainFault, int pageFault) {
       this.kind = kind;
       this.writer = writer;
       this.a = a;
@@ -708,6 +764,56 @@ class TestCatalogFaultProperties {
       this.preempt = preempt;
       this.writeFaults = writeFaults;
       this.readFault = readFault;
+      this.plainFault = plainFault;
+      this.pageFault = pageFault;
+    }
+
+    /**
+     * Whether another writer sweeps, from its kept replica or its newest, at this command's first
+     * conditional write after it put a page ({@link Kind#SWEEP}): a quarter of the time, faults or
+     * not.
+     */
+    boolean sweepsAfterPagePut() {
+      return pageFault == 4 || pageFault == 5;
+    }
+
+    /**
+     * Whether its first get of a page finds none, as if the store lost the page (on a shared log,
+     * on faulty storage; {@code pageFault} 6): the load must fail, never read the block as empty.
+     */
+    boolean losesAPage() {
+      return pageFault == 6;
+    }
+
+    /**
+     * The plain requests to fail ({@link InMemoryAtomicFileIO.PlainRequest}: puts, deletes and
+     * listings of the store, not conditional writes), each failed before it lands or landed with
+     * its reply lost. Half the time the first or second page put (a log's: snapshot pages, import
+     * pages, the committed set's), which only commands that compact or re-inline send ({@code
+     * pageFault} 0-3; at 4 and 5 another writer sweeps after its first page put instead: {@link
+     * #sweepsAfterPagePut}; at 6 its first page get finds none: {@link #losesAPage}); and apart from that, three times in eight, the first to fourth
+     * delete, the first or second listing (a sweep's), or the first to third other put (the
+     * tables' and views' metadata files, manifests and lists: a commit's, a materialized drop's,
+     * an eviction's).
+     */
+    List<PlainPlan> plainPlans() {
+      List<PlainPlan> plans = new ArrayList<>();
+      if (pageFault < 4) {
+        plans.add(new PlainPlan(PlainClass.PAGE_PUT, pageFault % 2,
+            pageFault < 2 ? Fault.FAIL_BEFORE : Fault.LOST_REPLY));
+      }
+      if (plainFault >= 40) {
+        int v = plainFault - 40;
+        Fault fault = v % 2 == 0 ? Fault.FAIL_BEFORE : Fault.LOST_REPLY;
+        if (v < 8) {
+          plans.add(new PlainPlan(PlainClass.DELETE, v / 2, fault));
+        } else if (v < 12) {
+          plans.add(new PlainPlan(PlainClass.LIST, (v - 8) / 2, fault));
+        } else if (v < 18) {
+          plans.add(new PlainPlan(PlainClass.OTHER_PUT, (v - 12) / 2, fault));
+        }
+      }
+      return plans;
     }
 
     List<Fault> writePlan() {
@@ -730,7 +836,29 @@ class TestCatalogFaultProperties {
       return String.format(
           "w%d:%s(%d,%d,%d%s)%s%s",
           writer, kind, a, b, c, fresh ? ",fresh" : "", preempt >= 0 ? "@" + preempt : "",
-          writeFaults != 0 || readFault != 0 ? "!" + writeFaults + "/" + readFault : "");
+          writeFaults != 0 || readFault != 0 || plainFault != 0 || pageFault != 0
+              ? "!" + writeFaults + "/" + readFault + "/" + plainFault + "/" + pageFault : "");
+    }
+  }
+
+  /** The classes of plain requests a command's plan counts and fails one of. */
+  enum PlainClass {
+    PAGE_PUT,
+    OTHER_PUT,
+    DELETE,
+    LIST
+  }
+
+  /** The {@code index}th plain request of class {@code of} fails with {@code fault}. */
+  static final class PlainPlan {
+    final PlainClass of;
+    final int index;
+    final Fault fault;
+
+    PlainPlan(PlainClass of, int index, Fault fault) {
+      this.of = of;
+      this.index = index;
+      this.fault = fault;
     }
   }
 
@@ -1230,6 +1358,9 @@ class TestCatalogFaultProperties {
     final List<TxnView> views = new ArrayList<>();
     final Map<TableIdentifier, TxnView> viewsByName = new HashMap<>();
     final Set<TableIdentifier> viewsGone = new HashSet<>();
+    // The newest replica its log held after its first command, or after its last sweep from it: a
+    // stale replica to sweep from (SWEEP)
+    Replica<CatalogState> kept = null;
 
     Writer(int id, LogCatalog catalog, boolean inline, boolean inlineLists) {
       this.id = id;
@@ -1338,6 +1469,14 @@ class TestCatalogFaultProperties {
     private final List<String> fired = new ArrayList<>();
     // The kinds of the commands that preempted the running one
     private final List<Kind> preempting = new ArrayList<>();
+    // The running top-level command's plain-request faults, and its plain requests so far, by class
+    private List<PlainPlan> plainPlans = List.of();
+    private Cmd running; // the top-level command running, while it runs
+    private boolean swept; // whether a sweep ran after one of its page puts
+    private int pageGets; // its gets of a shared log's pages
+    private final int[] plainRequests = new int[PlainClass.values().length];
+    // The catalog as the last check read it: where the sealing line is, for statistics
+    private CatalogState lastState = null;
 
     /**
      * Writer {@code i} writes inline metadata with the gzip codec if bit {@code i} of {@code
@@ -1475,6 +1614,8 @@ class TestCatalogFaultProperties {
           sharedLog != null ? "shared log" : azure != null ? "Append Blobs" : "one object");
       io.injectFaults(this::onWrite);
       io.injectReadFaults(this::onRead);
+      io.injectPlainFaults((request, location) ->
+          onPlain(request, location, location != null && location.contains(".committed/")));
       if (azure != null) {
         azure.intercept(this::onAzure);
       }
@@ -1485,6 +1626,9 @@ class TestCatalogFaultProperties {
           public InMemorySharedLog.WriteFault beforeWrite(
               InMemorySharedLog.Request request, byte[] payload) {
             if (request != InMemorySharedLog.Request.APPEND) {
+              if (request == InMemorySharedLog.Request.PUT_CHECKPOINT) {
+                sweepAfterPagePut(); // a compactor's root
+              }
               return InMemorySharedLog.WriteFault.NONE;
             }
             Fault fault = onWrite(CATALOG_LOCATION, AtomicOutputFile.Strategy.APPEND);
@@ -1496,6 +1640,39 @@ class TestCatalogFaultProperties {
           public InMemorySharedLog.ReadShape beforeRead(InMemorySharedLog.Request request) {
             return onRead(CATALOG_LOCATION) == ReadFault.NONE
                 ? InMemorySharedLog.ReadShape.NORMAL : InMemorySharedLog.ReadShape.FAIL;
+          }
+
+          // Its pages meet the plain-request faults and the read faults, as a store's do
+          @Override
+          public InMemorySharedLog.PageFault beforePage(
+              InMemorySharedLog.Request request, String name) {
+            Fault fault;
+            switch (request) {
+              case GET_PAGE:
+                // a get that fails, or finds no page, as if the store lost it: a load must fail
+                // then, and never take the block for empty
+                if (faults && armed && Thread.currentThread() == owner && running != null
+                    && running.losesAPage() && pageGets++ == 0) {
+                  fired.add("page get #0 MISSING of " + name);
+                  Statistics.label("plain fault fired").collect("PAGE_GET MISSING");
+                  return InMemorySharedLog.PageFault.MISSING;
+                }
+                ReadFault read = onRead("page " + name);
+                return read == ReadFault.NONE ? InMemorySharedLog.PageFault.NONE
+                    : read == ReadFault.FAIL ? InMemorySharedLog.PageFault.FAIL
+                        : InMemorySharedLog.PageFault.MISSING;
+              case PUT_PAGE:
+                fault = onPlain(InMemoryAtomicFileIO.PlainRequest.PUT, "page " + name, true);
+                break;
+              case DELETE_PAGE:
+                fault = onPlain(InMemoryAtomicFileIO.PlainRequest.DELETE, "page " + name, true);
+                break;
+              default:
+                fault = onPlain(InMemoryAtomicFileIO.PlainRequest.LIST, "pages", true);
+            }
+            return fault == Fault.FAIL_BEFORE ? InMemorySharedLog.PageFault.FAIL
+                : fault == Fault.LOST_REPLY ? InMemorySharedLog.PageFault.LOST_REPLY
+                    : InMemorySharedLog.PageFault.NONE;
           }
         });
       }
@@ -1580,6 +1757,75 @@ class TestCatalogFaultProperties {
         Statistics.label("a table sealed a block").coverage(c -> c.check(true)
             .count((sealed, all) -> all < 100 || 100.0 * sealed / all >= SEALING_FLOOR));
       }
+      drain();
+    }
+
+    /**
+     * The drain (the 2026-11-17 review's A4, oracles 2 and 3 of docs/SNAPSHOT_PAGING.md "Testing"),
+     * on storage that no longer fails: a compaction lands, its root's pages put first, as it must
+     * whatever puts of them failed or lost their replies before (a put that finds its page
+     * succeeds: Bug 116); a sweep from a fresh read leaves every page the newest root names; and
+     * once every table is dropped, a compaction and a sweep leave no snapshot page in the log's
+     * page store: every page the run put was garbage by then, and found.
+     */
+    private void drain() {
+      Map<String, String> properties = new HashMap<>(readerProperties);
+      // On one object every commit replaces it with a checkpoint
+      properties.put(LogCatalogProperties.MAX_APPEND_COUNT, "0");
+      LogCatalog drainer = LocalCatalogMode.readerFor(io, CATALOG_LOCATION)
+          .catalog(io, WAREHOUSE, CATALOG_NAME, properties);
+      Namespace drained = NS;
+      try {
+        if (!drainer.namespaceExists(drained)) {
+          drainer.createNamespace(drained);
+        }
+        drainer.setProperties(drained, Map.of(KEY_PREFIX + "drained", "1"));
+        compact(drainer);
+      } catch (RuntimeException e) {
+        AssertionError error = fail("the drain's compaction on storage that no longer fails"
+            + " failed: %s", e);
+        error.initCause(e);
+        throw error;
+      }
+      drainer.deleteOrphanPages();
+      checkCheckpoints();
+      int tables = 0;
+      for (Namespace ns : drainer.listNamespaces(Namespace.empty())) {
+        for (TableIdentifier id : drainer.listTables(ns)) {
+          drainer.dropTable(id, true);
+          tables += 1;
+        }
+      }
+      compact(drainer);
+      List<String> swept = drainer.deleteOrphanPages();
+      List<String> left = new ArrayList<>();
+      for (String name : pageNames()) {
+        if (SnapshotPages.parseName(name) != null) {
+          left.add(name);
+        }
+      }
+      Statistics.label("the drain swept snapshot pages").collect(
+          swept.stream().anyMatch(name -> SnapshotPages.parseName(name) != null));
+      check(left.isEmpty(), "with its %d tables dropped, the catalog compacted and swept, the log"
+          + " still holds snapshot pages %s", tables, left);
+    }
+
+    /** Compacts the catalog's log through {@code catalog}, if it is not one object (which did). */
+    private void compact(LogCatalog catalog) {
+      if (sharedLog != null || azure != null) {
+        catalog.log().compact();
+      }
+    }
+
+    /** The names of the pages the catalog's log stores now. */
+    private List<String> pageNames() {
+      if (sharedLog != null) {
+        return new ArrayList<>(sharedLog.storedPages().keySet());
+      }
+      String prefix = CATALOG_LOCATION + ".committed/";
+      List<String> names = new ArrayList<>();
+      io.listPrefix(prefix).forEach(file -> names.add(file.location().substring(prefix.length())));
+      return names;
     }
 
     /** The PageOut records the catalog's log ever held: the committed set's pages sealed. */
@@ -1614,7 +1860,17 @@ class TestCatalogFaultProperties {
       writePlan = faults ? cmd.writePlan() : List.of();
       failingRead = faults ? cmd.failingRead() : -1;
       readFault = cmd.readFaultKind();
+      plainPlans = faults ? cmd.plainPlans() : List.of();
+      java.util.Arrays.fill(plainRequests, 0);
+      running = cmd;
+      swept = false;
+      pageGets = 0;
       run(cmd, true);
+      running = null;
+      Writer w = writer(cmd);
+      if (w.kept == null) {
+        w.kept = w.catalog.log().newest();
+      }
     }
 
     // ---------------- storage hooks ----------------
@@ -1623,6 +1879,7 @@ class TestCatalogFaultProperties {
       if (!armed || Thread.currentThread() != owner) {
         return Fault.NONE;
       }
+      sweepAfterPagePut();
       if (!wrote) {
         preemptAt(requests++);
         wrote = true;
@@ -1651,6 +1908,61 @@ class TestCatalogFaultProperties {
       }
       fired.add("read #" + read + " " + readFault + " of " + location);
       return readFault;
+    }
+
+    /**
+     * What a plain request meets ({@link Cmd#plainPlans}): a plan's fault if it is the planned one
+     * of its class, counting the running top-level command's requests of each. {@code page}: a put
+     * of a log's page store ({@code <log>.committed/}, or a shared log's pages).
+     */
+    private Fault onPlain(InMemoryAtomicFileIO.PlainRequest request, String location,
+        boolean page) {
+      if (!armed || Thread.currentThread() != owner) {
+        return Fault.NONE;
+      }
+      PlainClass of;
+      switch (request) {
+        case PUT:
+          of = page ? PlainClass.PAGE_PUT : PlainClass.OTHER_PUT;
+          break;
+        case DELETE:
+          of = PlainClass.DELETE;
+          break;
+        default:
+          of = PlainClass.LIST;
+      }
+      int n = plainRequests[of.ordinal()]++;
+      for (PlainPlan plan : plainPlans) {
+        if (plan.of == of && plan.index == n) {
+          fired.add(of + " #" + n + " " + plan.fault + " of " + location);
+          Statistics.label("plain fault fired").collect(of + " " + plan.fault);
+          return plan.fault;
+        }
+      }
+      return Fault.NONE;
+    }
+
+    /**
+     * Runs a pending {@link Kind#SWEEP} now, as the running command sends a conditional write (or a
+     * shared log's checkpoint) after it put a page: before the root or record that names the page
+     * lands, from a replica that may not have sealed it.
+     */
+    private void sweepAfterPagePut() {
+      if (!armed || Thread.currentThread() != owner
+          || plainRequests[PlainClass.PAGE_PUT.ordinal()] == 0) {
+        return;
+      }
+      if (pending != null && pending.kind == Kind.SWEEP) {
+        runPending("after a page put");
+      } else if (running != null && running.sweepsAfterPagePut() && !swept) {
+        swept = true;
+        Cmd preempted = pending;
+        // the next writer's, from its kept replica (b 2) or its newest (b 1)
+        pending = new Cmd(Kind.SWEEP, running.writer + 1, 0, running.pageFault == 4 ? 2 : 1, 0,
+            false, 0, 0, 0, 0, 0);
+        runPending("after a page put");
+        pending = preempted;
+      }
     }
 
     /**
@@ -1691,19 +2003,26 @@ class TestCatalogFaultProperties {
           io, new LocalCatalogMode.AzureStore(CATALOG_LOCATION, azure));
     }
 
+    /** Runs the pending command at request {@code request}, if that is its; a sweep waits. */
     private void preemptAt(int request) {
-      if (pending != null && pending.preempt == request) {
-        Cmd nested = pending;
-        pending = null;
-        preempting.add(nested.kind);
-        armed = false;
-        try {
-          trace.append(String.format("  preempted at request #%d by%n", request));
-          Statistics.label("preemption").collect("at request #" + request);
-          run(nested, false);
-        } finally {
-          armed = true;
-        }
+      if (pending != null && pending.kind != Kind.SWEEP && pending.preempt == request) {
+        runPending("at request #" + request);
+      }
+    }
+
+    private void runPending(String where) {
+      Cmd nested = pending;
+      pending = null;
+      if (nested.kind != Kind.SWEEP) {
+        preempting.add(nested.kind); // a sweep changes no table: it races nothing
+      }
+      armed = false;
+      try {
+        trace.append(String.format("  preempted %s by%n", where));
+        Statistics.label("preemption").collect(where);
+        run(nested, false);
+      } finally {
+        armed = true;
       }
     }
 
@@ -1819,7 +2138,7 @@ class TestCatalogFaultProperties {
         Statistics.label("purge").collect("not checked: a fault");
         return;
       }
-      if (preempting.contains(Kind.EXPIRE_SNAPSHOTS)) {
+      if (preempting.contains(Kind.EXPIRE_SNAPSHOTS) || preempting.contains(Kind.EXPIRE_OLD)) {
         Statistics.label("purge").collect("not checked: an expiry ran first");
         return;
       }
@@ -1852,9 +2171,60 @@ class TestCatalogFaultProperties {
       return table;
     }
 
+    /**
+     * The snapshots of {@code id} the last check found behind the sealing line, live in its sealed
+     * blocks (docs/SNAPSHOT_PAGING.md).
+     */
+    private Set<Long> sealedIds(TableIdentifier id) {
+      CatalogState state = lastState;
+      Integer tblId = state == null ? null : state.tableId(id);
+      Set<Long> ids = new HashSet<>();
+      if (tblId != null) {
+        for (SnapshotPages.SealedBlock block : state.sealedBlocks(tblId).values()) {
+          for (long live : block.liveIds) {
+            ids.add(live);
+          }
+        }
+      }
+      return ids;
+    }
+
+    private boolean sealed(TableIdentifier id, long snapshotId) {
+      return sealedIds(id).contains(snapshotId);
+    }
+
+    /**
+     * A snapshot of {@code history} (oldest first, not empty) to move a ref to, as {@code b}
+     * picks: one of those the last check found sealed, if any, else one of the three oldest.
+     */
+    private long target(TableIdentifier id, List<Snapshot> history, int b) {
+      Set<Long> sealedIds = sealedIds(id);
+      List<Snapshot> sealedOnes = new ArrayList<>(history);
+      sealedOnes.removeIf(s -> !sealedIds.contains(s.snapshotId()));
+      return sealedOnes.isEmpty()
+          ? history.get(b % Math.min(3, history.size())).snapshotId()
+          : sealedOnes.get(b % sealedOnes.size()).snapshotId();
+    }
+
+    /**
+     * A table for a command aimed at the sealing line: one the last check found with sealed blocks
+     * if there are any (by {@code index}), else as {@link #pickTable} picks.
+     */
+    private TableIdentifier pickSealedTable(int index) {
+      List<TableIdentifier> sealedTables = new ArrayList<>();
+      for (TableIdentifier id : model.keySet()) {
+        if (!sealedIds(id).isEmpty()) {
+          sealedTables.add(id);
+        }
+      }
+      return sealedTables.isEmpty() ? pickTable(index)
+          : sealedTables.get(index % sealedTables.size());
+    }
+
     /** Concrete operands for {@code cmd}, or null if it does not apply. */
     private Op interpret(Cmd cmd, Writer w) {
-      TableIdentifier id = pickTable(cmd.a);
+      TableIdentifier id = cmd.kind == Kind.ROLLBACK || cmd.kind == Kind.TAG_OLD
+          || cmd.kind == Kind.EXPIRE_OLD ? pickSealedTable(cmd.a) : pickTable(cmd.a);
       switch (cmd.kind) {
         case CREATE_TABLE:
           // Mostly a table that does not exist; else any, to race or collide.
@@ -2150,6 +2520,92 @@ class TestCatalogFaultProperties {
                 state.deletes.clear();
                 state.deletes.putAll(actual.get(id).deletes);
               });
+        case ROLLBACK:
+          boolean toAncestor = cmd.c % 2 == 0;
+          long[] mainTarget = {-1};
+          return new Op(
+              (toAncestor ? "rollbackTo(" : "setCurrentSnapshot(") + id + ", pick " + cmd.b + ")",
+              () -> {
+                Table table = handle(w, id, cmd.fresh);
+                List<Snapshot> history = oldestFirst(table);
+                if (toAncestor) {
+                  Snapshot current = table.currentSnapshot();
+                  Set<Long> ancestors = current == null ? Set.of() : new HashSet<>(
+                      org.apache.iceberg.util.SnapshotUtil.ancestorIds(current, table::snapshot));
+                  history.removeIf(s -> !ancestors.contains(s.snapshotId()));
+                }
+                if (history.isEmpty()) {
+                  throw new ValidationException("%s has no snapshot to move main to", id);
+                }
+                long snapshotId = target(id, history, cmd.b);
+                mainTarget[0] = snapshotId;
+                Statistics.label("a ref moved behind the sealing line")
+                    .collect(sealed(id, snapshotId));
+                try {
+                  ManageSnapshots manage = table.manageSnapshots();
+                  (toAncestor ? manage.rollbackTo(snapshotId)
+                      : manage.setCurrentSnapshot(snapshotId)).commit();
+                } catch (IllegalArgumentException e) {
+                  throw new ValidationException(e, "%s", e.getMessage()); // expired since
+                }
+              },
+              (m, actual) -> {
+                TableState state = existing(m, id);
+                TableState now = actual.get(id);
+                if (now == null || !Objects.equals(now.refIds.get(SnapshotRef.MAIN_BRANCH),
+                    mainTarget[0])) {
+                  throw new IllegalStateException(String.format("main names snapshot %s, not %d,"
+                      + " which its operation chose", now == null ? null
+                      : now.refIds.get(SnapshotRef.MAIN_BRANCH), mainTarget[0]));
+                }
+                // Main holds what that snapshot holds, which the model does not follow
+                state.files.clear();
+                state.files.addAll(now.files);
+                state.deletes.clear();
+                state.deletes.putAll(now.deletes);
+              });
+        case TAG_OLD:
+          String oldTag = "t" + cmd.c % 2;
+          long[] tagged = {-1};
+          boolean[] tagReplaced = {false};
+          return new Op(
+              "tagOld(" + id + ", " + oldTag + ", pick " + cmd.b + ")",
+              () -> {
+                Table table = handle(w, id, cmd.fresh);
+                List<Snapshot> history = oldestFirst(table);
+                if (history.isEmpty()) {
+                  throw new ValidationException("%s has no snapshot", id);
+                }
+                long snapshotId = target(id, history, cmd.b);
+                tagged[0] = snapshotId;
+                Statistics.label("a ref moved behind the sealing line")
+                    .collect(sealed(id, snapshotId));
+                tagReplaced[0] = table.refs().containsKey(oldTag);
+                try {
+                  if (tagReplaced[0]) {
+                    table.manageSnapshots().replaceTag(oldTag, snapshotId).commit();
+                  } else {
+                    table.manageSnapshots().createTag(oldTag, snapshotId).commit();
+                  }
+                } catch (IllegalArgumentException e) {
+                  throw new ValidationException(e, "%s", e.getMessage()); // a ref, or expired
+                }
+              },
+              (m, actual) -> {
+                TableState state = existing(m, id);
+                TableState now = actual.get(id);
+                if (now == null || !now.tags.containsKey(oldTag)
+                    || tagReplaced[0] != state.tags.containsKey(oldTag)) {
+                  throw new IllegalStateException(
+                      (tagReplaced[0] ? "cannot replace " : "cannot create ") + oldTag);
+                }
+                if (!Objects.equals(now.refIds.get(oldTag), tagged[0])) {
+                  throw new IllegalStateException(String.format("%s names snapshot %s, not %d,"
+                      + " which its operation chose", oldTag, now.refIds.get(oldTag), tagged[0]));
+                }
+                state.tags.put(oldTag, new TreeSet<>(now.tags.get(oldTag)));
+                state.tagSnapshots.put(oldTag, now.tagSnapshots.get(oldTag));
+              });
         case REMOVE_REF:
           TableState holding = model.get(id);
           if (holding == null || holding.branches.isEmpty() && holding.tags.isEmpty()) {
@@ -2305,10 +2761,15 @@ class TestCatalogFaultProperties {
                 state.props.put(txnKey, txnValue);
               });
         case EXPIRE_SNAPSHOTS:
+        case EXPIRE_OLD:
           boolean cleanMetadata = cmd.b % 2 == 1;
           boolean keepFiles = cmd.b / 2 % 2 == 1;
-          Expiry expiry = Expiry.values()[cmd.c % 4];
-          int operand = cmd.c / 4;
+          boolean old = cmd.kind == Kind.EXPIRE_OLD;
+          if (old && sealedIds(id).isEmpty()) {
+            return null;
+          }
+          Expiry expiry = old ? Expiry.A_SNAPSHOT : Expiry.values()[cmd.c % 4];
+          int operand = old ? cmd.c % 2 : cmd.c / 4;
           String expired;
           switch (expiry) {
             case OLDER_THAN_NOW:
@@ -2334,6 +2795,13 @@ class TestCatalogFaultProperties {
                     .cleanExpiredFiles(!keepFiles)
                     .cleanExpiredMetadata(cleanMetadata);
                 List<Snapshot> history = oldestFirst(table);
+                if (old) {
+                  // the sealed ones, if the handle has any
+                  Set<Long> sealedIds = sealedIds(id);
+                  List<Snapshot> sealedOnes = new ArrayList<>(history);
+                  sealedOnes.removeIf(s -> !sealedIds.contains(s.snapshotId()));
+                  history = sealedOnes.isEmpty() ? history : sealedOnes;
+                }
                 Snapshot picked = history.isEmpty() ? null : history.get(operand % history.size());
                 if (expiry == Expiry.OLDER_THAN_NOW) {
                   expire.expireOlderThan(System.currentTimeMillis() + 1).retainLast(operand + 1);
@@ -2341,6 +2809,10 @@ class TestCatalogFaultProperties {
                   expire.expireOlderThan(picked.timestampMillis());
                 } else if (expiry == Expiry.A_SNAPSHOT && picked != null) {
                   expire.expireSnapshotId(picked.snapshotId());
+                  if (old) {
+                    Statistics.label("an expiry behind the sealing line")
+                        .collect(sealed(id, picked.snapshotId()));
+                  }
                 }
                 Statistics.label("expiry").collect(expiry);
                 try {
@@ -2501,6 +2973,31 @@ class TestCatalogFaultProperties {
               "reinline(" + id + ")",
               () -> w.catalog.reinline(id),
               (m, actual) -> existing(m, id));
+        case SWEEP:
+          int from = cmd.b % 3;
+          Replica<CatalogState> replica = from == 0 ? null
+              : from == 1 ? w.catalog.log().newest() : w.kept;
+          if (from == 2) {
+            w.kept = w.catalog.log().newest(); // the next sweep from a kept replica, from this one
+          }
+          return new Op(
+              "sweep(" + (replica == null ? "fresh read" : from == 1 ? "newest replica"
+                  : "kept replica") + ")",
+              () -> {
+                List<String> deleted = replica == null ? w.catalog.deleteOrphanPages()
+                    : w.catalog.log().sweep(replica);
+                if (!deleted.isEmpty()) {
+                  trace.append(String.format("      (deleted %s)%n", deleted));
+                }
+                long snapshotPages = deleted.stream()
+                    .filter(name -> SnapshotPages.parseName(name) != null).count();
+                Statistics.label("sweep deleted").collect(deleted.isEmpty() ? "nothing"
+                    : snapshotPages == 0 ? "committed-set pages"
+                        : snapshotPages == deleted.size() ? "snapshot pages" : "both");
+              },
+              // It changes no table: a page it deleted that any catalog from its read on names,
+              // the next check's loads and its round trip of the newest root find gone
+              (m, actual) -> { });
         case CREATE_NAMESPACE:
         case DROP_NAMESPACE:
         case SET_NAMESPACE_PROPERTY:
@@ -3457,6 +3954,13 @@ class TestCatalogFaultProperties {
         conflict = cmd.kind == Kind.TXN_COMMIT;
         failure = e;
         w.handles.clear(); // a handle to a dropped table is unusable; a caller reloads
+      } catch (SnapshotPages.MissingPage e) {
+        // A page its table names that a get did not find: lost, as an injected fault made it
+        if (!topLevel || fired.isEmpty()) {
+          throw unexpected(e);
+        }
+        outcome = Outcome.FAILED;
+        reason = e.getClass().getSimpleName() + ": " + firstLine(e);
       } catch (IllegalStateException e) {
         if (e.getMessage() == null || !e.getMessage().startsWith("Table UUID does not match")) {
           throw unexpected(e);
@@ -3498,6 +4002,11 @@ class TestCatalogFaultProperties {
       }
       if (cmd.kind == Kind.TXN_BEGIN || cmd.kind.stagesInATransaction()) {
         return; // no change to the catalog
+      }
+      if (cmd.kind == Kind.SWEEP && !topLevel) {
+        // No change to a table, and it may run after the record of the command it preempts landed
+        // (in the compaction after it): that command's check reads the catalog after both
+        return;
       }
       // A preempting command runs without faults, and nothing preempts it
       String must = conflict && (!topLevel || fired.isEmpty())
@@ -3683,7 +4192,7 @@ class TestCatalogFaultProperties {
         boolean faultless, Model actual) {
       Map<String, TableState> before = new HashMap<>();
       lastActual.values().forEach(state -> before.put(state.uuid, state));
-      boolean expiry = cmd.kind == Kind.EXPIRE_SNAPSHOTS
+      boolean expiry = (cmd.kind == Kind.EXPIRE_SNAPSHOTS || cmd.kind == Kind.EXPIRE_OLD)
           && (outcome == Outcome.ACKNOWLEDGED || outcome == Outcome.UNKNOWN);
       for (Map.Entry<TableIdentifier, TableState> e : actual.entrySet()) {
         TableState now = e.getValue();
@@ -3785,6 +4294,7 @@ class TestCatalogFaultProperties {
       for (TableIdentifier id : file.tables()) {
         mostSealed = Math.max(mostSealed, file.sealedBlocks(file.tableId(id)).size());
       }
+      lastState = file;
       List<TableIdentifier> ids = new ArrayList<>();
       for (Namespace ns : checker.listNamespaces(Namespace.empty())) {
         tables.namespaces.put(ns, new TreeMap<>(checker.loadNamespaceMetadata(ns)));

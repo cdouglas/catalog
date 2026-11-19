@@ -73,6 +73,14 @@ public final class CatalogLog {
     return seen(runtime.read(newest.get()));
   }
 
+  /**
+   * The newest replica this catalog has read or committed in, or null before its first: however
+   * stale, a replica a {@link #sweep} may act on (a test's).
+   */
+  Replica<CatalogState> newest() {
+    return newest.get();
+  }
+
   /** Records {@code replica}, read or committed in, as the newest this catalog has seen. */
   private Replica<CatalogState> seen(Replica<CatalogState> replica) {
     newest.accumulateAndGet(replica, runtime::newer);

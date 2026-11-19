@@ -17,21 +17,28 @@
 # "import: block out of order or empty"), encodemerkle (try 1) and the TLA+ switch rootfirst (a
 # root's pages put after it lands: try 8, the root names a page that does not exist).
 #
-# Not reached at 2,000 tries before or after, left for the plan's items 2.1 and 2.2:
-# withoutneighbour (a sealed snapshot's expiry also takes its neighbour's live id: three expiries
-# of a sealed snapshot in 2,000 tries, even picking sealed ones), missingempty (a page the store
-# lacks reads as an empty block: no page goes missing without a sweep), importinlinelost (a
-# re-inlining loses the snapshots behind its line that keep inline lists), and the switch
-# sweepstale (garbagePages without its version guard: nothing in the fuzzer sweeps).
-MUTANTS="importdropblock encodeskipblock encodeleaves"
+# withoutneighbour (a sealed snapshot's expiry also takes its neighbour's live id) needed the gap
+# plan's item 2.1, whose EXPIRE_OLD expires sealed snapshots: an unraced expiry then removes more
+# than it chose (catalogMatchesModel, try 179), or a later command finds a snapshot gone
+# (faultyStorageNeverMisreportsACommit, try 1,299). missingempty (a page the store lacks reads as an
+# empty block) needed a page lost, which no correct component does: 2.1's faults make a shared
+# log's page get find no page, and a commit built on that load drops the block's snapshots
+# (faultyStorageNeverMisreportsACommit only, try 1,008; another run caught it at 81, a third passed
+# 2,000). Not reached at 2,000 tries, before or after 2.1: importinlinelost (a re-inlining loses
+# the snapshots behind its line that keep inline lists).
+# The switch sweepstale (garbagePages without its version guard) is in pagefaults.sh, with 2.2's
+# sweeps.
+MUTANTS="importdropblock encodeskipblock encodeleaves withoutneighbour missingempty"
 # A bring-back whose proof is not checked: every writer sends a true proof, so only a writer that
 # lies could tell (it passed 1,000 tries of each, before and after)
 EQUIVALENT="noproof"
 ORACLES=TestCatalogFaultProperties
 
 prepare() {
-  # 4,000: importdropblock fails at try 394 (C8: ten times the margin)
-  tries $1/$T/TestCatalogFaultProperties.java each 4000
+  # catalogMatchesModel 4,000, faultyStorageNeverMisreportsACommit 11,000: importdropblock fails at
+  # try 394, withoutneighbour catalogMatchesModel at 179, missingempty the other at 1,008 (C8: ten
+  # times the margin, in a property that catches each)
+  tries $1/$T/TestCatalogFaultProperties.java 4000 11000
 }
 
 RT=intentlog-core/src/main/java/org/intentlog/LogRuntime.java

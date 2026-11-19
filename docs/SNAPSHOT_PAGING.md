@@ -682,14 +682,34 @@ four tables). With paging set:
   the fuzzers check their catalog files (`assertPagesExist`), checks each page
   the newest root names that replay still names: it exists, decodes as its name says, holds the
   block's live snapshots, and its leaves hash to the block's Merkle root. The
-  checkpoint round trip does not compare a root's sealed blocks or its B and W
-  (design.md I6).
+  checkpoint round trip compares a root's B and W and each table's sealed
+  blocks (version, digest, Merkle root, leaves, live ids) with its replay's,
+  and a checkpoint's bytes with the encoding of that replay (design.md I6,
+  I11).
 - `TestCatalogFaultProperties` loads every table whole through its checker
   and through a fresh reader, which reads sealed snapshots from the pages, and
   requires the same metadata and snapshots of both; its `REINLINE` operation
   and other commits that bring a pointer table back import pages; and it
   checks that a purge deleted every manifest and list the table had
-  (`checkPurged`, Bug 94 (purge leaks a paged table)).
+  (`checkPurged`, Bug 94 (purge leaks a paged table)). It draws targets
+  against the line: `ROLLBACK` (`rollbackTo` or `setCurrentSnapshot`) and
+  `TAG_OLD` move main or a tag onto a snapshot the last check found sealed
+  (one of the three oldest when none is), which brings it back with its
+  proof, and `EXPIRE_OLD` expires a sealed snapshot, so a live id leaves its
+  block or the block empties. `SWEEP` deletes orphaned pages as a fresh read
+  holds the catalog or as a writer's own replica does, however stale; as a
+  preempting command it runs at the first conditional write after the
+  command it preempts put a page, before a compactor's root or a
+  re-inlining's record lands. Its faults reach the page store (a put failed
+  or landed with its reply lost, a failed delete or listing; on a shared log,
+  a get that fails or finds no page, as if the store lost it, which must fail
+  the operation and never read as an empty block) and the tables'
+  plain writes (metadata files, manifests and lists: a commit's, a
+  materialized drop's, an eviction's). Each run ends with a drain, on storage
+  that no longer fails: a compaction must land, its root's pages put first
+  however earlier puts of them failed; a sweep from a fresh read must leave
+  every page the newest root names; and with every table dropped, a
+  compaction and a sweep must leave no snapshot page in the store.
 - `TestInlineDifferentialProperties` runs `TableScript`'s schedules (with
   rollbacks and refs on old snapshots) on a pointer catalog, which pages
   nothing, and on a paged inline one: each step must commit alike in both,
@@ -697,16 +717,20 @@ four tables). With paging set:
 
 A round's faultA2 and faultB2 run at B = 2, W = 1, which reaches sealed
 blocks and import pages (step 5); the fault fuzzer reports the most sealed
-blocks of any table, and at B = 2 fails a job of 100 tries or more where
-fewer than 10% of its tries seal a block (about a quarter and a fifth of its
-two properties' do). A paging round (`r0p`: `SNAPSHOT_BLOCK=2
+blocks of any table, the refs and expiries it aimed behind the line, what
+its sweeps deleted and the plain faults it injected, and at B = 2 fails a job
+of 100 tries or more where fewer than 10% of its tries seal a block (19% and
+13% of its two properties' do). A paging round (`r0p`: `SNAPSHOT_BLOCK=2
 SNAPSHOT_WINDOW=1` for every job) runs the race, rebase and differential
 jobs there too (fuzz/README.md).
 
-**Calibration.** Snapshot paging has no mutant set of its own. `drops.sh`'s
-`purgeafter` (a purge that reads the dropped version's history only after the
-drop lands) needs sealed pages and runs at `SNAPSHOT_BLOCK=2
-SNAPSHOT_WINDOW=1` (fuzz/mutants/).
+**Calibration.** Three sets need sealed pages and run at `SNAPSHOT_BLOCK=2
+SNAPSHOT_WINDOW=1` (fuzz/mutants/): `history.sh` (blocks lost or skipped by
+an import or a checkpoint, a sealed expiry that takes its neighbour, a lost
+page read as empty), `pagefaults.sh` (a page put that finds its page fails, a
+failed put taken as put, a sweep without the version guard, a materialized
+drop that ignores a failed write) and `drops.sh`'s `purgeafter` (a purge that
+reads the dropped version's history only after the drop lands).
 
 **TLA+.** The file model has the state's pages (spec/tla/README.md "The
 state's pages"): puts before the root, sweeps from a writer's view however
@@ -714,7 +738,8 @@ stale, and `StatePagesExist`, which `statepages` and `after-statepages` hold
 and two bug switches break: `rootfirst` (a root written before its pages) and
 `sweepstale` (a sweep that deletes every page its view does not name, whatever
 the version). The model has no load, so a missing page read as empty is
-checked in Java alone (`TestSnapshotPaging`, above). The shared-log model has
+checked in Java alone (`TestSnapshotPaging`, above, and the fault fuzzer's
+lost pages: `history.sh`'s `missingempty`). The shared-log model has
 no state pages, and neither model has import pages.
 
 **The runtime's handling, on every log.** The commit-protocol fuzzers run a
