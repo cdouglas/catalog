@@ -18,7 +18,9 @@
 # git can resolve in /in/fileio.bundle. A job's whole log goes to /out/<name>/<job>.log.gz (read
 # it with zcat or zgrep -a, which also read one cut short), its start and exit lines to
 # /out/<name>/<job>.log, and summaries to /out/<name>/summary.txt. Env: JOBS, how many jobs run
-# at once (default: all of them; a shrink's, 1); HEAP, each test JVM's heap (default 4g); SHRINKING, jqwik's shrinking in rounds,
+# at once (default: all of them; a shrink's, 1); SHARDS, how many JVMs each of a round's jobs runs
+# as (below); STAGGER, the seconds between two jobs' starts (default 10: each compiles for about a
+# minute first); HEAP, each test JVM's heap (default 4g); SHRINKING, jqwik's shrinking in rounds,
 # calibrations and test jobs (default OFF: a failure reports its sample and seed at once, and
 # shrink shrinks it); SHRINK_HEAP (default 16g) and SHRINK_SECONDS (default 1800), a shrink's heap
 # and how long jqwik shrinks; JOB_TIMEOUT, a limit on each job's time (as timeout(1) takes it;
@@ -41,6 +43,16 @@
 #              300,000 ran in 1,334 s)
 #   rebase     TestRebaseProperties, 3,000 each (REBASE_TRIES: each in turn)
 #   contract   the ConflictEncodingContract subclasses, 2,000 each
+#
+# A job runs as SHARDS says ("<job>=<n> ...", a bare <n> for every job it doesn't name; 1: none),
+# each shard its own worktree and JVM, with its own random seed and 1/n of each property's tries
+# (rounded up), named <job>.<k> (logs <job>.<k>.log): a round takes its longest shard's time, not
+# its longest job's (p15-r1's azure job: 13.6 h on one core). The default, from p15-r1's times,
+# brings each to about an hour and a quarter: azure=12 race=6 diff=6 rebase=4 mw=3 faultA1=3
+# faultA2=3 faultB1=2 faultB2=2, 43 JVMs. jqwik sizes generation by a property's tries, so a
+# shard's (at least a calibration's, for every job) are what a shrink or a replay of its seed
+# must use; a calibration margin (ten times a mutant's first failing try) is judged on the job's
+# tries, all shards together.
 set -uo pipefail
 
 BUNDLE=/in/fileio.bundle
@@ -48,6 +60,7 @@ SRC=/work/src
 T=iceberg-fileio-catalog/src/test/java/org/apache/iceberg/io
 HEAP=${HEAP:-4g}
 SHRINKING=${SHRINKING:-OFF}
+SHARDS=${SHARDS:-"azure=12 race=6 diff=6 rebase=4 mw=3 faultA1=3 faultA2=3 faultB1=2 faultB2=2"}
 
 # die <message>: to stderr, and to the run's summary once it has one (a container's log is
 # gone with the container)
@@ -76,16 +89,17 @@ worktree() {
 }
 
 # tries <file> <tries...> | tries <file> each <tries>: sets each @Property's tries, in the order
-# the class declares them, or every one's to the same. The counts must match the file's
+# the class declares them, or every one's to the same, each divided by DIVIDE (a shard's share,
+# rounded up; default 1). The counts must match the file's
 # properties, one each, and every property must say @Property(tries = N): a property added to a
 # fuzzed class stops the run here until its job names its count, rather than inherit one sized
 # for another (round p8-r0's race job ran a 200-try property 200,000 times, for days)
 tries() {
-  [ "${SMOKE:-0}" = 1 ] && set -- "$1" each 3
-  local err
-  err=$(python3 - "$@" 2>&1 <<'PY'
+  local err divide=${DIVIDE:-1}
+  [ "${SMOKE:-0}" = 1 ] && { set -- "$1" each 3; divide=1; }
+  err=$(python3 - "$1" "$divide" "${@:2}" 2>&1 <<'PY'
 import re, sys
-f, args = sys.argv[1], sys.argv[2:]
+f, divide, args = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
 s = open(f).read()
 props = len(re.findall(r'@Property\b', s))
 found = len(re.findall(r'@Property\(tries = \d+\)', s))
@@ -95,7 +109,7 @@ counts = [args[1]] * props if len(args) == 2 and args[0] == 'each' else args
 if len(counts) != props or not all(c.isdigit() for c in counts):
     sys.exit('%s has %d properties; the job gives "%s": one count per property, in order, '
              'or "each N"' % (f, props, ' '.join(args)))
-it = iter(counts)
+it = iter(str(-(-int(c) // divide)) for c in counts)
 open(f, 'w').write(re.sub(r'@Property\(tries = \d+\)',
                           lambda m: '@Property(tries = %s)' % next(it), s))
 PY
@@ -123,11 +137,11 @@ PY
 # exhaustive counts unchecked, so at a job's tries a large space whose product wraps negative is
 # enumerated in order, only its last parameters varying (round cp4-r0's race job).
 job() {
-  while [ "$(jobs -rp | wc -l)" -ge "${JOBS:-64}" ]; do wait -n; done
+  [ -n "${JOBS:-}" ] && while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do wait -n; done
   (
     cd "$1" || exit 2
     start=$(date +%s)
-    head="start $(date -Is) $(git rev-parse --short HEAD) fork=$FORK heap=$HEAP"
+    head="start $(date -Is) $(git rev-parse --short HEAD) fork=$FORK heap=$HEAP shard=${SHARD:-1/1}"
     head+=" shrinking=$SHRINKING timeout=${JOB_TIMEOUT:-none}"
     head+=" snapshot_block=${SNAPSHOT_BLOCK:-default} snapshot_window=${SNAPSHOT_BLOCK:+${SNAPSHOT_WINDOW:-8}}"
     echo "$head" > "$2"
@@ -181,9 +195,39 @@ status() {
 # A round's jobs (ROUND_JOBS: some of them, to rerun)
 ROUND_JOBS=${ROUND_JOBS:-"faultA1 faultB1 faultA2 faultB2 race mw proto azure rebase contract diff"}
 
-# tests_of <job>: the tests a round's job (or a test job) runs; a test job's are its own
+# shards <job>: how many shards SHARDS gives a round's job
+shards() {
+  local n=1 w
+  for w in $SHARDS; do
+    case $w in
+      "$1"=*) n=${w#*=}; break ;;
+      *=*) ;;
+      *) n=$w ;;
+    esac
+  done
+  [[ $n =~ ^[1-9][0-9]*$ ]] || die "SHARDS gives $1 '$n' shards"
+  echo "$n"
+}
+
+# shard_names <job>: the names a round's job runs under: itself, or <job>.1 to <job>.<n>
+shard_names() {
+  local n k
+  n=$(shards "$1") || exit 2
+  if [ "$n" = 1 ]; then echo "$1"; else for k in $(seq "$n"); do echo "$1.$k"; done; fi
+}
+
+# slots: how many JVMs a round runs at once (its jobs' shards, JOBS at most), for run.sh's limits
+slots() {
+  local j n=0
+  for j in $ROUND_JOBS; do n=$(( n + $(shards $j) )); done
+  [ -n "${JOBS:-}" ] && [ "$JOBS" -lt $n ] && n=$JOBS
+  echo $n
+}
+
+# tests_of <job>: the tests a round's job (or a test job, or a shard <job>.<k>) runs; a test
+# job's are its own
 tests_of() {
-  case $1 in
+  case ${1%%.*} in
     faultA*|faultB*) echo TestCatalogFaultProperties ;;
     race) echo TestCatalogRaceProperties ;;
     mw) echo TestMultiWriterProperties ;;
@@ -197,9 +241,10 @@ tests_of() {
   esac
 }
 
-# setup <job> <dir>: sets the tries of the job's properties in the worktree <dir>
+# setup <job> <dir>: sets the tries of the job's properties in the worktree <dir> (DIVIDE: a
+# shard's share)
 setup() {
-  case $1 in
+  case ${1%%.*} in
     faultA*) tries $2/$T/TestCatalogFaultProperties.java 30000 1 ;;
     faultB*) tries $2/$T/TestCatalogFaultProperties.java 1 30000 ;;
     race) tries $2/$T/TestCatalogRaceProperties.java 200000 10000 ;;
@@ -225,27 +270,55 @@ setup() {
 # sets no SNAPSHOT_BLOCK: faultA2 and faultB2, the second of each fault property's pair, so every
 # round fuzzes paging (the catalog's default, blocks of 256, seals nothing in a short schedule)
 paged() {
-  case $1 in
+  case ${1%%.*} in
     faultA2|faultB2) return 0 ;;
     *) return 1 ;;
   esac
 }
 
 round() {
+  local j s n i k=0
   for j in $ROUND_JOBS; do
     tests_of $j > /dev/null
-    worktree $W/$j $COMMIT && setup $j $W/$j
+    n=$(shards $j) || exit 2
+    for s in $(shard_names $j); do
+      worktree $W/$s $COMMIT && DIVIDE=$n setup $j $W/$s
+    done
   done
   for j in $ROUND_JOBS; do
-    if [ -z "${SNAPSHOT_BLOCK:-}" ] && paged $j; then
-      SNAPSHOT_BLOCK=2 SNAPSHOT_WINDOW=1 job $W/$j $O/$j.log "$(tests_of $j)"
-    else
-      job $W/$j $O/$j.log "$(tests_of $j)"
-    fi
+    n=$(shards $j)
+    for s in $(shard_names $j); do
+      [ $(( k++ )) = 0 ] || sleep "${STAGGER:-10}"
+      i=${s#$j}; i=${i#.}
+      if [ -z "${SNAPSHOT_BLOCK:-}" ] && paged $j; then
+        SHARD=${i:-1}/$n SNAPSHOT_BLOCK=2 SNAPSHOT_WINDOW=1 job $W/$s $O/$s.log "$(tests_of $j)"
+      else
+        SHARD=${i:-1}/$n job $W/$s $O/$s.log "$(tests_of $j)"
+      fi
+    done
   done
   wait
-  for f in $O/*.log; do
-    echo "$(basename $f .log): $(grep -ah '^exit=' $f | tail -1) | $(classes $f)" >> $O/summary.txt
+  for j in $ROUND_JOBS; do
+    for s in $(shard_names $j); do
+      echo "$s: $(grep -ah '^exit=' $O/$s.log | tail -1) | $(classes $O/$s.log)" >> $O/summary.txt
+    done
+  done
+  # a sharded job's line: its shards' exits, the longest's time, and each class's failures and
+  # errors summed
+  for j in $ROUND_JOBS; do
+    n=$(shards $j)
+    [ "$n" = 1 ] && continue
+    for s in $(shard_names $j); do
+      echo "$(grep -ah '^exit=' $O/$s.log | tail -1) | $(classes $O/$s.log)"
+    done | awk -v j=$j -v n=$n '
+      { split($1, e, "="); exits[e[2] == "" ? "none" : e[2]]++
+        if (match($0, /elapsed=[0-9]+/)) { t = substr($0, RSTART + 8, RLENGTH - 8) + 0; if (t > max) max = t }
+        for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+\+[0-9]+$/ && i < NF) {
+          split($i, fe, "+"); c = $(i + 1); if (!(c in f)) order[++m] = c; f[c] += fe[1]; er[c] += fe[2] } }
+      END { x = ""; for (k in exits) x = x (x == "" ? "" : " ") "exit=" k " x" exits[k]
+        printf "%s (%d shards): %s, longest elapsed=%ds |", j, n, x, max
+        for (i = 1; i <= m; i++) printf " %d+%d %s", f[order[i]], er[order[i]], order[i]; print "" }' \
+      >> $O/summary.txt
   done
 }
 
@@ -319,6 +392,15 @@ shrink() {
   local log=/out/$1.log job=${1#*/}
   [ -f $log ] || die "no job log $log"
   tests_of $job > /dev/null
+  # a shard's share of the job's tries (jqwik sizes generation by them) and the job's paging,
+  # unless SNAPSHOT_BLOCK says otherwise, as its start line records them
+  local head; head=$(head -1 $log)
+  DIVIDE=$(echo "$head" | sed -n 's|.* shard=[0-9]*/\([0-9]*\) .*|\1|p'); DIVIDE=${DIVIDE:-1}
+  if [ -z "${SNAPSHOT_BLOCK:-}" ]; then
+    SNAPSHOT_BLOCK=$(echo "$head" | sed -n 's/.* snapshot_block=\([0-9]*\) .*/\1/p')
+    SNAPSHOT_WINDOW=$(echo "$head" | sed -n 's/.* snapshot_window=\([0-9]*\)$/\1/p')
+    [ -n "$SNAPSHOT_BLOCK" ] || unset SNAPSHOT_BLOCK SNAPSHOT_WINDOW
+  fi
   HEAP=${SHRINK_HEAP:-16g}; SHRINKING=BOUNDED; JOBS=${JOBS:-1}
   JOB_TIMEOUT=${JOB_TIMEOUT:-$(( 2 * ${SHRINK_SECONDS:-1800} + 3600 ))}
   failed $log > $O/failed.txt 2>> $O/summary.txt
@@ -348,7 +430,9 @@ calib() {
   [ -f $set ] || die "no calibration set $1 (have: $(ls /opt/ce-fuzz/mutants | tr '\n' ' '))"
   # shellcheck source=/dev/null
   . $set
+  local k=0
   for m in none $MUTANTS; do
+    [ $(( k++ )) = 0 ] || sleep "${STAGGER:-10}"
     worktree $W/$m $COMMIT
     prepare $W/$m
     if [ $m != none ]; then
@@ -395,7 +479,10 @@ case $cmd in
     trap 'rm -rf /work /tmp/surefire-*' EXIT
     echo "$cmd fork=$FORK commit=$(git -C $SRC rev-parse --short $COMMIT) jobs=${JOBS:-all} heap=$HEAP" \
       "shrinking=$SHRINKING smoke=${SMOKE:-0} cpus=$(nproc) mem=$(free -g | awk '/Mem:/ {print $2}')G" \
-      "limit=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo unknown) $(date -Is)" > $O/run.txt
+      "limit=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo unknown)" \
+      "cpu.max=$(cat /sys/fs/cgroup/cpu.max 2>/dev/null | tr ' ' / || echo unknown)" \
+      "cpu.weight=$(cat /sys/fs/cgroup/cpu.weight 2>/dev/null || echo unknown)" \
+      "$([ $cmd = round ] && echo "jvms=$(slots) ")$(date -Is)" > $O/run.txt
     case $cmd in
       round) round ;;
       shrink) [ $# -ge 1 ] || die "usage: ce-fuzz shrink <fork> <commit> <name> <run>/<job>"; shrink $1 ;;
@@ -409,5 +496,6 @@ case $cmd in
     echo "done $(date -Is)" >> $O/run.txt
     cat $O/summary.txt ;;
   status) status "${1:-}" ;;
-  *) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  slots) slots ;;
+  *) sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

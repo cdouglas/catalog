@@ -19,7 +19,7 @@ base repository: an online build and test run of HEAD in the base image fetches 
 dependency and surefire provider, then the fork's jars come out of it. It also builds the image here. The pack,
 `fuzz/build/ce-fuzz-<date>.tar` (about 240 MB), holds `ctx/` (the build context: the
 repositories, the driver, the calibration sets), `fileio.bundle` (every local branch, so unpushed
-commits too), `run.sh` and this file. For new commits, only the bundle changes:
+commits too), `run.sh`, `queue.sh` and this file. For new commits, only the bundle changes:
 
     git bundle create fileio.bundle --branches
 
@@ -40,9 +40,45 @@ which also read a log cut short), with its start and exit lines in `<job>.log`; 
 CAUGHT`, and `none`, the unmutated oracles, which must be `clean`), and `run.txt` (the fork,
 commit, host). Copy `out/<name>/` back
 to keep it. `JOBS` limits the jobs at once (default all), `HEAP` each test JVM's heap (default
-4g; a job's resident size is up to two gigabytes more, with Maven's). A round wants eleven cores
-and about 68 GB; a calibration, a core and 6 GB per mutant. `ROUND_JOBS` runs some of a round's
-jobs (`ROUND_JOBS=race ./run.sh round ...` reruns one; the memory limit counts only those).
+4g; a job's resident size is up to two gigabytes more, with Maven's). `ROUND_JOBS` runs some of a
+round's jobs (`ROUND_JOBS=race ./run.sh round ...` reruns one; the limits count only those).
+`./run.sh plan <cmd> <args...>` prints the JVMs, memory limit and CPUs a run would take.
+
+## Shards
+
+jqwik runs a property's tries one after another, so a job is about one core, and a round takes
+as long as its longest job: p15-r1's `azure` (1,000,000 tries) ran 13.6 hours, its next longest
+6. A round therefore runs each long job as several shards (`SHARDS`; `ce-fuzz` with no arguments
+gives the default): each shard its own worktree and JVM, with its own random seed and its share
+of each property's tries (rounded up), as `<job>.<k>` (`<job>.<k>.log.gz`). The default makes 43
+JVMs of the eleven jobs, about an hour and a quarter each, so a round wants 43 cores (65 at most:
+the CPU limit) and 260 GB of limits (about 2 GB each in use). `SHARDS=1` runs each job as one
+JVM; `SHARDS="azure=16 race=8"` names counts, and a bare count is every job's that isn't named.
+`summary.txt` gives each shard's line, then each sharded job's: its shards' exits, the longest's
+time, each class's failures summed. jqwik sizes what it generates by a property's tries, so a
+shard (thousands of tries for every job, at least a calibration's) is not quite a slice of the
+whole job's run: `shrink` reruns a shard with its own share, as its start line records, and so
+must a replay of its seed. A calibration margin (a round's tries at least ten times a mutant's
+first failing try) counts the job's tries, all shards together. Jobs start `STAGGER` seconds
+apart (default 10), as each compiles for about a minute first; a calibration's mutants too.
+
+## Sharing the host
+
+`run.sh` gives each run a CPU limit (`CPUS`, default one and a half per JVM) besides its memory
+limit, so a burst of its JVMs' compilers and collectors leaves the host's other users their
+share; `CPU_SHARES=2` makes a run yield to every other process when the CPUs are all busy.
+`queue.sh <file>` (run it detached: `setsid nohup ./queue.sh q.txt > out/queue.log 2>&1 <
+/dev/null &`) starts the runs a file lists (`calib p16 36b7e98 p16f-cal-budget budget`, after any
+assignments: `SNAPSHOT_BLOCK=2 SNAPSHOT_WINDOW=1 calib ...`), in order, each once the host's
+5-minute load average and the run's JVMs come to at most `LOAD_MAX` (default 120; runs it started
+in the last 10 minutes count at their JVMs, as the load average lags) and its memory limit
+leaves `MEM_RESERVE` gigabytes (default 64) of the host's available memory; lines appended while
+it runs are taken in turn, and `<file>.done` records what started. A line `soak <fork> <commit>
+<prefix>` makes it, with nothing queued waiting, start rounds `<prefix>-1`, `<prefix>-2`, ... of
+that commit, one at a time (`SOAK_MAX`), whenever the load allows (`SOAK_LOAD`, default 100), at
+`CPU_SHARES=2`: a soak
+takes only cycles nobody else wants, and queued runs count the load of a soak round past its
+ramp-up as free. `soak off` stops it starting more.
 A round's faultA2 and faultB2 page snapshots at blocks of 2 and a window of 1, and fail if too
 few of their tries seal a block; the other jobs run at the catalog's default, which seals nothing
 in their short schedules. `SNAPSHOT_BLOCK` (and `SNAPSHOT_WINDOW`) sets paging for every job of a
@@ -50,8 +86,8 @@ run instead: a paging round (`r0p`) runs the race, rebase and differential jobs 
 
 ## Memory on a shared host
 
-Each run's container has a hard memory limit, without swap (`MEM`; by default its jobs at once
-times their heap and 2 GB, and 2 GB: 68 GB for a round), and the highest OOM score. A run that
+Each run's container has a hard memory limit, without swap (`MEM`; by default its JVMs at once
+times their heap and 2 GB, and 2 GB: 260 GB for a round of 43 shards), and the highest OOM score. A run that
 outgrows its limit loses one of its own JVMs to the kernel's OOM killer (the job fails, exit 137
 in its log), never another user's process; and should the host itself run short, the kernel
 kills this run first. `run.sh` warns if the limit did not take: rootless Docker applies it only
@@ -66,7 +102,8 @@ A round runs without shrinking (`SHRINKING=OFF`): jqwik reports a failing proper
 sample and its seed at once and moves on. Shrinking in the round's JVM retains every candidate it
 tries, so a long multi-writer sample could fill a small heap and thrash for hours. `run.sh shrink
 <fork> <commit> <name> <run>/<job>` then shrinks each property that failed in that job, one at a
-time: a worktree set up as the job's was (its tries, which also size jqwik's generation), the
+time: a worktree set up as the job's was (its tries, a shard's share, which also size jqwik's
+generation; its snapshot paging), the
 property pinned to the seed it failed with, run alone in a JVM of `SHRINK_HEAP` (default 16g),
 shrinking for `SHRINK_SECONDS` (default 1800), with a timeout of twice that and an hour. Its log
 is `out/<name>/<Class>.<method>.log.gz`; `summary.txt` gives each one's exit and its shrunk sample's
@@ -81,7 +118,7 @@ files as it ends, so an exited container holds little besides its image; a name 
 
 ## What runs
 
-`ce-fuzz` (the image's entrypoint) clones the bundle, checks out a worktree per job at the
+`ce-fuzz` (the image's entrypoint) clones the bundle, checks out a worktree per job (or shard) at the
 commit, sets each property's tries (as the phase-exit rounds do: `ce-fuzz` with no arguments
 lists them; a job names one count per property of its class, or `each N`, and a class whose
 properties don't match its job's counts stops the run at setup, so a property added to a fuzzed

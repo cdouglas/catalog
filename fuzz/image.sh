@@ -10,7 +10,7 @@
 # repository, which an online build of this checkout's HEAD fills with every other dependency.
 # Env: IMAGE (default ce-fuzz:latest), PACK=0 to skip packing. The pack is
 # fuzz/build/ce-fuzz-<date>.tar: ctx/ (the build context), fileio.bundle (every local branch),
-# run.sh, README.md.
+# run.sh, queue.sh, README.md.
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
@@ -77,7 +77,7 @@ PACKDIR=$HERE/build/ce-fuzz-$(date +%Y%m%d)
 rm -rf "$PACKDIR"; mkdir -p "$PACKDIR"
 cp -r "$CTX" "$PACKDIR/ctx"
 git -C "$ROOT" bundle create "$PACKDIR/fileio.bundle" --branches
-cp "$HERE/run.sh" "$HERE/README.md" "$PACKDIR/"
+cp "$HERE/run.sh" "$HERE/queue.sh" "$HERE/README.md" "$PACKDIR/"
 tar -C "$HERE/build" -cf "$PACKDIR.tar" "$(basename "$PACKDIR")"
 rm -rf "$PACKDIR"
 ls -la "$PACKDIR.tar"
