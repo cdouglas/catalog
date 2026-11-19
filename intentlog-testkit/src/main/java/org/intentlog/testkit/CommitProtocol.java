@@ -408,6 +408,22 @@ public final class CommitProtocol {
       WriteFault.NONE, WriteFault.NONE, WriteFault.LOST_REPLY, WriteFault.LANDED_THROTTLED,
       WriteFault.DELAYED, WriteFault.LANDED_AS_CONFLICT);
 
+  // Beyond its plan, a commit, the commit that preempts it and a step of maintenance (a
+  // compaction, a sweep, a lookup) meet faults drawn per request (the gap plan's 2.4, the review's
+  // B5): none half the time, else up to four, each request meeting one with chance 1 in
+  // EXTRA_ONE_IN. A throttle may begin a run of up to four, which the runtime's sends of one write
+  // meet in a row, past its three attempts; and a commit's request may first land the appends
+  // delayed so far, a race between two of its requests.
+  private static final List<WriteFault> EXTRA_WRITE_FAULTS = List.of(
+      WriteFault.FAIL_BEFORE, WriteFault.NOT_SENT, WriteFault.LOST_REPLY, WriteFault.THROTTLED,
+      WriteFault.THROTTLED, WriteFault.LANDED_THROTTLED, WriteFault.DELAYED,
+      WriteFault.LANDED_AS_CONFLICT);
+  private static final List<ReadFault> EXTRA_READ_FAULTS = List.of(
+      ReadFault.FAIL, ReadFault.STALE, ReadFault.PAST_RECORD, ReadFault.GAP);
+  private static final int EXTRA_ONE_IN = 6;
+  // A commit is preempted again with chance 1 in 3 after each preemption, up to this many times
+  private static final int MAX_PREEMPTIONS = 3;
+
   /** Runs {@code schedule} on {@code harness}; a failed oracle throws {@link AssertionError}. */
   public static void run(LogHarness harness, Settings settings, List<Cmd> schedule) {
     new Run(harness, settings).execute(schedule);
@@ -526,9 +542,21 @@ public final class CommitProtocol {
     boolean faulted = false;
     boolean preempted = false;
     boolean active = false;
+    // Faults beyond the plan, drawn per request from `draws` while `extra` are left (null draws:
+    // none), and the throttles left in a run one began
+    final Random draws;
+    int extra;
+    int throttles = 0;
+    int throttledInARow = 0;
+    // The writer committing, how many times it was preempted, and the request a preemption after
+    // the first is due at (-1: none)
+    Writer owner;
+    int preemptions = 0;
+    int rearmAt = -1;
 
     Context(List<WriteFault> plan, int failingRead, ReadFault readFault, boolean everyRead,
-        PagePlan pages, Writer pending, Boolean compaction, int preemptAt, boolean afterWrite) {
+        PagePlan pages, Writer pending, Boolean compaction, int preemptAt, boolean afterWrite,
+        Random draws, int extra) {
       this.plan = plan;
       this.failingRead = failingRead;
       this.readFault = readFault;
@@ -538,12 +566,54 @@ public final class CommitProtocol {
       this.compaction = compaction;
       this.preemptAt = preemptAt;
       this.afterWrite = afterWrite;
+      this.draws = draws;
+      this.extra = extra;
     }
 
     /** A commit without faults or preemption. */
     static Context plain() {
+      return budgeted(null, 0);
+    }
+
+    /** A commit or a step of maintenance with no plan: only faults drawn from {@code draws}. */
+    static Context budgeted(Random draws, int extra) {
       return new Context(List.of(), -1, ReadFault.NONE, false, PagePlan.NONE, null, null, -1,
-          false);
+          false, draws, extra);
+    }
+
+    /** A write fault beyond the plan: the rest of a throttle run, or one drawn. */
+    WriteFault extraWrite() {
+      if (throttles > 0) {
+        throttles--;
+        return draws.nextInt(4) == 0 ? WriteFault.LANDED_THROTTLED : WriteFault.THROTTLED;
+      }
+      if (draws == null || extra <= 0 || draws.nextInt(EXTRA_ONE_IN) != 0) {
+        return WriteFault.NONE;
+      }
+      extra--;
+      WriteFault fault = EXTRA_WRITE_FAULTS.get(draws.nextInt(EXTRA_WRITE_FAULTS.size()));
+      if (fault == WriteFault.THROTTLED || fault == WriteFault.LANDED_THROTTLED) {
+        throttles = draws.nextInt(4);
+      }
+      return fault;
+    }
+
+    /** A read fault beyond the plan, drawn. */
+    ReadFault extraRead() {
+      if (draws == null || extra <= 0 || draws.nextInt(EXTRA_ONE_IN) != 0) {
+        return ReadFault.NONE;
+      }
+      extra--;
+      return EXTRA_READ_FAULTS.get(draws.nextInt(EXTRA_READ_FAULTS.size()));
+    }
+
+    /** Whether a request first lands the appends delayed so far. */
+    boolean deliverFirst() {
+      if (draws == null || extra <= 0 || draws.nextInt(2 * EXTRA_ONE_IN) != 0) {
+        return false;
+      }
+      extra--;
+      return true;
     }
   }
 
@@ -585,6 +655,15 @@ public final class CommitProtocol {
     // The fault the first read of a transaction's base meets, when the base is read on from the
     // replica its writer's last commit returned (outside a commit: no context plans it)
     private ReadFault baseReadFault = ReadFault.NONE;
+    // The step of maintenance running outside a commit (a compaction, a sweep, a lookup, or a
+    // compaction that preempts a commit), whose requests meet its faults; null if none
+    private Context maintenance = null;
+    // The draws of the faults beyond the plans, from the run's seed
+    private final Random faultDraws;
+    // The writers whose commits are running (one preempting another's)
+    private final Set<Writer> committing = new HashSet<>();
+    // The oracle's reads: of its own instance of the log, where the harness has instances
+    private final LogRuntime<State, Builder, Txn> oracle;
     private int splitCount = 0;
     // The latest clock any compaction, split or commit ran on: no block above it less A is sealed
     private long sealingClock = Long.MIN_VALUE;
@@ -598,6 +677,10 @@ public final class CommitProtocol {
           settings.config(settings.retentionMs, () -> now + settings.compactorAheadMs));
       this.racer = new LogRuntime<>(harness.log(), EntityVersionsMachine.INSTANCE,
           settings.config(settings.retentionMs, () -> writerClock));
+      this.oracle = new LogRuntime<>(harness.oracleLog(), EntityVersionsMachine.INSTANCE,
+          settings.config(settings.retentionMs, () -> writerClock));
+      this.faultDraws = new Random(settings.seed ^ 0x6A09E667F3BCC909L);
+      harness.clock(() -> now);
       this.writers = new Writer[settings.writers];
       for (int i = 0; i < writers.length; i++) {
         writers[i] = new Writer(i);
@@ -642,14 +725,28 @@ public final class CommitProtocol {
     public WriteFault beforeWrite() {
       Context c = commits.peek();
       if (c == null || !c.active) {
-        return WriteFault.NONE;
+        c = maintenance;
+        if (c == null) {
+          return WriteFault.NONE;
+        }
+      } else {
+        request(c);
       }
-      request(c);
       WriteFault fault = c.writes < c.plan.size() ? c.plan.get(c.writes) : WriteFault.NONE;
+      if (fault == WriteFault.NONE) {
+        fault = c.extraWrite();
+      }
       c.writes++;
+      boolean throttled = fault == WriteFault.THROTTLED || fault == WriteFault.LANDED_THROTTLED;
+      c.throttledInARow = throttled ? c.throttledInARow + 1 : 0;
+      if (c.throttledInARow == 3) {
+        Statistics.label("writes throttled three times in a row")
+            .collect(c == maintenance ? "maintenance's" : "a commit's");
+      }
       if (fault != WriteFault.NONE) {
         c.faulted = true;
-        trace.append("    write #").append(c.writes - 1).append(": ").append(fault).append('\n');
+        trace.append("    ").append(c == maintenance ? "maintenance " : "").append("write #")
+            .append(c.writes - 1).append(": ").append(fault).append('\n');
       }
       return fault;
     }
@@ -662,17 +759,25 @@ public final class CommitProtocol {
         baseReadFault = ReadFault.NONE;
         if (fault != ReadFault.NONE) {
           trace.append("    the base's read: ").append(fault).append('\n');
+          return fault;
         }
-        return fault;
+        c = maintenance;
+        if (c == null) {
+          return ReadFault.NONE;
+        }
+      } else {
+        request(c);
       }
-      request(c);
       int read = c.reads++;
-      if (c.readFault == ReadFault.NONE || (read != c.failingRead && !c.everyRead)) {
+      ReadFault fault = c.readFault != ReadFault.NONE && (read == c.failingRead || c.everyRead)
+          ? c.readFault : c.extraRead();
+      if (fault == ReadFault.NONE) {
         return ReadFault.NONE;
       }
       c.faulted = true;
-      trace.append("    read #").append(read).append(": ").append(c.readFault).append('\n');
-      return c.readFault;
+      trace.append("    ").append(c == maintenance ? "maintenance " : "").append("read #")
+          .append(read).append(": ").append(fault).append('\n');
+      return fault;
     }
 
     /**
@@ -704,7 +809,18 @@ public final class CommitProtocol {
     /** Counts a request of the commit {@code c}; runs the preempting commit or compactor first. */
     private void request(Context c) {
       int request = c.requests++;
-      boolean due = c.afterWrite ? c.writes > 0 : request == c.preemptAt;
+      if (c.deliverFirst()) {
+        int delivered = harness.deliverDelayed();
+        if (delivered > 0) {
+          // Another writer's appends land between two of this commit's requests: a race
+          c.preempted = true;
+          trace.append("  ").append(delivered).append(" delayed landed at request #")
+              .append(request).append('\n');
+          Statistics.label("delayed appends landed").collect("between two requests of a commit");
+        }
+      }
+      boolean due = c.rearmAt >= 0 ? request == c.rearmAt
+          : c.afterWrite ? c.writes > 0 : request == c.preemptAt;
       if ((c.pending == null && c.compaction == null) || !due) {
         return;
       }
@@ -712,16 +828,95 @@ public final class CommitProtocol {
       Boolean compaction = c.compaction;
       c.pending = null;
       c.compaction = null;
+      c.rearmAt = -1;
       c.preempted = true;
+      c.preemptions++;
       c.active = false;
       trace.append("  preempted at request #").append(request).append(" by\n");
       if (other != null) {
-        commit(other, Region.NOW, 0, Context.plain());
-        Statistics.label("preempted by").collect("a writer");
-      } else if (compact(compaction)) {
-        Statistics.label("preempted by").collect(compaction ? "a compaction" : "a GC record");
+        if (other.snapshot != null && !committing.contains(other)) {
+          commit(other, Region.NOW, 0, budgeted());
+          Statistics.label("preempted by").collect("a writer");
+        }
+      } else {
+        Context was = maintenance;
+        maintenance = budgeted();
+        try {
+          if (compact(compaction)) {
+            Statistics.label("preempted by").collect(compaction ? "a compaction" : "a GC record");
+          }
+        } catch (RuntimeException e) {
+          if (!maintenance.faulted) {
+            throw e;
+          }
+          trace.append("  the compaction failed after a fault: ").append(e).append('\n');
+          Statistics.label("maintenance after a fault").collect("a preempting compaction failed");
+        } finally {
+          maintenance = was;
+        }
       }
       c.active = true;
+      rearm(c, request);
+    }
+
+    /**
+     * After a preemption, with chance 1 in 3, another a few requests later (up to {@link
+     * #MAX_PREEMPTIONS}): by a writer with a transaction open that is not committing, or else, on
+     * a log that keeps checkpoints apart, by a compactor.
+     */
+    private void rearm(Context c, int request) {
+      if (c.draws == null || c.preemptions >= MAX_PREEMPTIONS || c.draws.nextInt(3) != 0) {
+        return;
+      }
+      int from = c.draws.nextInt(writers.length);
+      for (int k = 0; k < writers.length && c.pending == null; k++) {
+        Writer candidate = writers[(from + k) % writers.length];
+        if (candidate.snapshot != null && candidate != c.owner
+            && !committing.contains(candidate)) {
+          c.pending = candidate;
+        }
+      }
+      if (c.pending == null) {
+        if (!harness.log().capabilities().separateCheckpoints()) {
+          return;
+        }
+        c.compaction = c.draws.nextBoolean();
+      }
+      c.rearmAt = request + 1 + c.draws.nextInt(4);
+      Statistics.label("preempted again").collect(c.pending != null ? "by a writer" : "by a"
+          + " compactor");
+    }
+
+    /** A context of faults drawn per request alone, in a run with faults; else none. */
+    private Context budgeted() {
+      if (!settings.faults) {
+        return Context.plain();
+      }
+      return Context.budgeted(new Random(faultDraws.nextLong()),
+          faultDraws.nextBoolean() ? 0 : 1 + faultDraws.nextInt(4));
+    }
+
+    /**
+     * Runs a step of maintenance under faults drawn per request ({@link #budgeted}); returns
+     * whether it ran through. It may fail after a fault: each step is safe to abandon ({@code
+     * LogRuntime.compact}); one that fails without one fails the run.
+     */
+    private boolean maintain(String what, Runnable step) {
+      Context was = maintenance;
+      maintenance = budgeted();
+      try {
+        step.run();
+        return true;
+      } catch (RuntimeException e) {
+        if (!maintenance.faulted) {
+          throw e;
+        }
+        trace.append("  ").append(what).append(" failed after a fault: ").append(e).append('\n');
+        Statistics.label("maintenance after a fault").collect(what + " failed");
+        return false;
+      } finally {
+        maintenance = was;
+      }
     }
 
     /**
@@ -838,7 +1033,7 @@ public final class CommitProtocol {
       if (last == null || cmd.c < 8) {
         w.snapshotWrites = writes;
       } else {
-        byte[] live = runtime.read().tail().position();
+        byte[] live = oracle.read().tail().position();
         w.snapshotWrites = live != null && Arrays.equals(live, w.snapshot.tail().position())
             ? writes : -1;
       }
@@ -937,10 +1132,11 @@ public final class CommitProtocol {
             List.of(FIRST_WRITE_FAULTS.get(cmd.a), SECOND_WRITE_FAULTS.get(cmd.b)),
             (cmd.c - 5) / 3, readFault, cmd.c >= 14,
             afterWrite ? PagePlan.readBack(cmd.e >> 4) : PagePlan.of(cmd.e >> 4), other,
-            compaction, preemptAt, afterWrite));
+            compaction, preemptAt, afterWrite, new Random(faultDraws.nextLong()),
+            faultDraws.nextBoolean() ? 0 : 1 + faultDraws.nextInt(4)));
       } else {
         commit(w, region, pick, new Context(List.of(), -1, ReadFault.NONE, false, PagePlan.NONE,
-            other, compaction, preemptAt, afterWrite));
+            other, compaction, preemptAt, afterWrite, null, 0));
       }
     }
 
@@ -956,6 +1152,8 @@ public final class CommitProtocol {
       if (top) {
         CommitTrace.open(); // the runtime's events, for the compactions' statistics
       }
+      ctx.owner = w;
+      committing.add(w);
       commits.push(ctx);
       Outcome outcome;
       String reason = "";
@@ -986,6 +1184,7 @@ public final class CommitProtocol {
       } finally {
         ctx.active = false;
         commits.pop();
+        committing.remove(w);
         writerClock = clockBefore;
       }
       w.snapshot = null;
@@ -1005,7 +1204,7 @@ public final class CommitProtocol {
       Statistics.label("stamps").collect(region + " " + outcome
           + (outcome == Outcome.REJECTED ? reason : ""));
 
-      Replica<State> live = runtime.read();
+      Replica<State> live = oracle.read();
       List<String> applied = live.state().history();
       long times = applied.stream().filter(txn.tag()::equals).count();
       if (top) {
@@ -1108,7 +1307,7 @@ public final class CommitProtocol {
       if (region == Region.AHEAD) {
         return now + AHEAD_MS;
       }
-      CommittedSet set = runtime.read().committed();
+      CommittedSet set = oracle.read().committed();
       long floor = set.floor();
       long horizon = set.horizon();
       List<Long> stamps = set.ids().stream().map(UuidV7::timestampMs).sorted()
@@ -1155,18 +1354,19 @@ public final class CommitProtocol {
      */
     private void compactStep(Cmd cmd) {
       boolean whole = cmd.a % 3 != 0;
-      Replica<State> before = whole && harness.log().pages() != null ? runtime.read() : null;
+      Replica<State> before = whole && harness.log().pages() != null ? oracle.read() : null;
       pagePlan = settings.faults ? PagePlan.of(cmd.e >> 4) : PagePlan.NONE;
       boolean deletes = pagePlan.request != PageRequest.DELETE;
+      boolean[] did = {false};
       try {
-        if (!compact(whole)) {
+        if (!maintain("a compaction", () -> did[0] = compact(whole)) || !did[0]) {
           return;
         }
       } finally {
         pagePlan = PagePlan.NONE;
       }
       if (before != null && deletes) {
-        Set<String> kept = names(runtime.read().committed().pages());
+        Set<String> kept = names(oracle.read().committed().pages());
         Map<String, byte[]> stored = harness.storedPages();
         for (PageRef ref : before.committed().pages()) {
           check(kept.contains(ref.name()) || !stored.containsKey(ref.name()),
@@ -1244,13 +1444,13 @@ public final class CommitProtocol {
      * nothing at all (oracle 1).
      */
     private void landPageOut(PageOut pageOut, String what) {
-      Replica<State> before = runtime.read();
+      Replica<State> before = oracle.read();
       CommittedSet.Seal oldest = before.committed().sealable(Long.MAX_VALUE);
       boolean seals = oldest != null && oldest.record().equals(pageOut);
       trace.append("  PageOut ").append(pageOut.name())
           .append(seals ? ": its block is the oldest" : ": its block changed").append('\n');
       harness.appendCopy(LogEnvelope.encodePageOut(pageOut));
-      Replica<State> after = runtime.read();
+      Replica<State> after = oracle.read();
       check(after.state().equals(before.state()), "a PageOut changed the state:%n  before: %s%n"
           + "  after:  %s", before.state(), after.state());
       CommittedSet was = before.committed();
@@ -1290,7 +1490,9 @@ public final class CommitProtocol {
           expected.add(name);
         }
       }
-      runtime.sweep(on);
+      if (!maintain("a sweep", () -> runtime.sweep(on))) {
+        return;
+      }
       Set<String> after = new TreeSet<>(harness.storedPages().keySet());
       check(after.equals(expected), "a sweep from %s replica (floor %d) left %s, not %s",
           stale ? "a writer's" : "a fresh", set.floor(), after, expected);
@@ -1336,9 +1538,18 @@ public final class CommitProtocol {
       pagePlan = settings.faults ? PagePlan.of(cmd.e >> 4) : PagePlan.NONE;
       pageReadFaulted = false;
       String result;
+      boolean[] faulted = {false};
       try {
-        boolean found = runtime.committed(on, id);
-        List<String> history = runtime.read().state().history();
+        boolean found;
+        Context was = maintenance;
+        maintenance = budgeted();
+        try {
+          found = runtime.committed(on, id);
+        } finally {
+          faulted[0] = maintenance.faulted;
+          maintenance = was;
+        }
+        List<String> history = oracle.read().state().history();
         check(!found || history.contains(tag),
             "a lookup through %s replica found %s (%s), which did not apply", replica, tag, where);
         check(found || !applied, "a lookup through %s replica that applied %s (%s) did not find"
@@ -1347,11 +1558,11 @@ public final class CommitProtocol {
             + " the floor of %s replica, did not find it, and it applied", tag, replica);
         result = found ? "found" : "not found";
       } catch (DedupHorizonExceededException e) {
-        long horizon = runtime.read().committed().horizon();
+        long horizon = oracle.read().committed().horizon();
         check(ts <= horizon, "a lookup of %s, above the horizon %d, exceeded it", tag, horizon);
         result = "horizon exceeded";
       } catch (RuntimeException e) {
-        if (!pageReadFaulted) {
+        if (!pageReadFaulted && !faulted[0]) {
           throw new AssertionError("a lookup of " + tag + " (" + where + ") through " + replica
               + " replica failed without a fault\ntrace:\n" + trace, e);
         }
@@ -1403,12 +1614,12 @@ public final class CommitProtocol {
         landPageOut(record.pageOut(), "copy");
         return;
       }
-      Replica<State> before = runtime.read();
+      Replica<State> before = oracle.read();
       String original = original(copy, before);
       trace.append("duplicate record #").append(pick % landed.size()).append(" (")
           .append(original).append(")\n");
       harness.appendCopy(copy);
-      Replica<State> after = runtime.read();
+      Replica<State> after = oracle.read();
       check(after.state().equals(before.state()),
           "a copy of a record applied:%n  before: %s%n  after:  %s", before.state(), after.state());
       check(Arrays.equals(after.committed().bytes(), before.committed().bytes()),
@@ -1450,7 +1661,7 @@ public final class CommitProtocol {
      * missing or wrong.
      */
     private void checkSet(String when) {
-      Replica<State> live = runtime.read();
+      Replica<State> live = oracle.read();
       CommittedSet set = live.committed();
       long horizon = set.horizon();
       long floor = set.floor();
@@ -1560,7 +1771,7 @@ public final class CommitProtocol {
           landPageOut(pageOut, "split");
         }
       }
-      State last = runtime.read().state();
+      State last = oracle.read().state();
       List<String> applied = last.history();
       check(new TreeSet<>(applied).size() == applied.size(), "a commit applied twice: %s",
           applied);
@@ -1604,7 +1815,7 @@ public final class CommitProtocol {
         trace.append("drain: a GC record at ").append(newest).append('\n');
         harness.appendCopy(LogEnvelope.encodeAdvanceHorizon(newest));
       }
-      Replica<State> last = runtime.read();
+      Replica<State> last = oracle.read();
       check(last.committed().floor() >= newest && last.committed().pages().isEmpty(),
           "a GC record at %d left the floor at %d, and pages %s", newest,
           last.committed().floor(), last.committed().pages());

@@ -450,24 +450,36 @@ As LOG.md "Testing a provider", per stage:
 - **`TestSegmentedCommitProtocol`** (intentlog-fileio): the testkit's `CommitProtocol`
   fuzzer on `SegmentedLog` over `InMemoryAtomicFileIO` and `InMemorySegmentStore`. It
   draws:
-  - faults on every request of both stores;
+  - faults on any request of both stores, as the commit or step of maintenance running
+    draws them (`CommitProtocol`'s budget: throttle runs past the runtime's attempts,
+    failed checkpoints, trims, retired segments' deletes and sweeps);
   - small limits and block limits, Installs ahead, early seals, and copies;
   - appends delayed until after an end;
   - one to three instances with stale catalog objects, each given the prefix, another, or none,
-    with or without a default (D13: the catalog object's prefix must never move);
-  - sweeps at TTL 0;
+    with or without a default (D13: the catalog object's prefix must never move), taking
+    requests in stretches drawn from the seed, so one may sleep through several
+    checkpoints, retirements and sweeps; the oracle reads its own instance;
+  - retirement TTLs of 0, 20 or 200 ms on the schedule's clock, and a store that refuses
+    listings (a SAS without list) a quarter of the time;
   - another log at the same prefix of the same store, which must read its records at the
     drain.
 
   At the drain, every replica a read returned must read on to the end (as
-  `staleReaders` did for the log v1). It draws the segments' store: in memory, or
+  `staleReaders` did for the log v1), and every segment ever installed that the store still
+  holds must be installed or retired by the newest catalog object (its entries are the only
+  references to it). No segment may be deleted while the catalog object installs it, nor a
+  retired one before its TTL has passed (SG6's TTL half, which the model leaves out). It draws the segments' store: in memory, or
   `AppendBlobSegments` on `InMemoryAppendBlobStore`, whose replies say the block count or
   don't.
 - **Mutants** (`fuzz/mutants/segments.sh`): each switch above, put in the code, fails
   the fuzzer; a checkpoint that drops an expired Retired entry without deleting its
   segment (`dropretired`, a leak), a log that ignores an entry's location
   (`nolocation`) and a creator that loses and keeps its segment 0 (`creationleak`, a leak)
-  fail `TestSegmentedLog`.
+  fail `TestSegmentedLog`. `fuzz/mutants/budget.sh` holds the fuzzer to the paths its
+  budget reaches: a write throttled on every attempt reported rejected (`throttlereject`),
+  a checkpoint that drops the entry of a segment whose delete failed (`dropundeleted`), a
+  retired segment deleted before its TTL (`expiredalways`), and a CAS replace of the
+  catalog object over an Install appended since (`casoverappend`).
 - **Catalog suites**: `TestLocalCatalog*` in the `AZLOG*` modes. Also
   `TestCatalogFaultProperties` and `TestCatalogRaceProperties`, whose Append Blob draws
   open the new log, and `TestAzureLogs`: catalogs configured with another location, or none,

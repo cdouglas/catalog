@@ -1121,9 +1121,14 @@ trimmed ones included, for oracles to replay.
   `LogHarness`, over `EntityVersionsMachine`, with the TLA+ models' schedules:
   writers whose requests meet faults (failures, lost replies, throttles,
   delayed appends, failed and stale reads, reads that break P3, reads with a
-  gap) and inside
-  whose commits other writers commit, compactors and GC records inside
-  commits, and copies of any record that ever landed, which must never apply.
+  gap): planned for a commit's first two writes and one of its reads, and
+  drawn per request beyond them within a budget each commit, each commit
+  that preempts one and each step of maintenance (a compaction, a sweep, a
+  lookup) draws, throttles in runs past the runtime's attempts; inside whose
+  commits other writers commit (up to three times), compactors and GC records
+  run and delayed appends land; and copies of any record that ever landed,
+  which must never apply. A step of maintenance may fail after a fault (each
+  is safe to abandon), never without one.
   It judges each commit as it ends, the state after each copy, and, once
   every delayed append has landed, the whole run: each outcome again, no
   commit applied twice, the state as the serial execution of what applied,

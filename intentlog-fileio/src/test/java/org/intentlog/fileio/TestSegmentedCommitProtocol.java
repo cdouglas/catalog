@@ -26,6 +26,7 @@ import net.jqwik.api.Arbitrary;
 import net.jqwik.api.ForAll;
 import net.jqwik.api.Property;
 import net.jqwik.api.Provide;
+import net.jqwik.api.Tuple;
 import org.apache.iceberg.io.InMemoryAtomicFileIO;
 import org.intentlog.azure.InMemoryAppendBlobStore;
 import org.intentlog.memory.InMemorySegmentStore;
@@ -64,14 +65,17 @@ class TestSegmentedCommitProtocol {
       @ForAll("stores") String stores,
       @ForAll("instances") int instances,
       @ForAll("prefixes") String prefixes,
+      @ForAll("ttls") long ttl,
+      @ForAll("listings") boolean listable,
       @ForAll long seed,
       @ForAll("settings") CommitProtocol.Settings settings,
       @ForAll("schedules") List<CommitProtocol.Cmd> schedule) {
-    run(limit, extraBlocks, copies, stores, instances, prefixes, seed, settings, schedule);
+    run(limit, extraBlocks, copies, stores, instances, prefixes, ttl, listable, seed, settings,
+        schedule);
   }
 
   static void run(long limit, long extraBlocks, boolean copies, String stores, int instances,
-      String prefixes, long seed, CommitProtocol.Settings settings,
+      String prefixes, long ttl, boolean listable, long seed, CommitProtocol.Settings settings,
       List<CommitProtocol.Cmd> schedule) {
     InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
     SegmentedLogHarness.Segments segments = stores.equals("segments")
@@ -83,8 +87,10 @@ class TestSegmentedCommitProtocol {
     SegmentStore store = segments.store();
     SplittableRandom random = new SplittableRandom(seed);
     String defaultPrefix = prefixes.equals("configured") ? null : "segments";
+    SegmentedLogHarness.Clock clock = new SegmentedLogHarness.Clock();
     List<SegmentedLog> logs = new ArrayList<>();
-    for (int i = 0; i < instances; i++) {
+    // the writers' instances, then the oracle's
+    for (int i = 0; i <= instances; i++) {
       AtomicFileLog catalog =
           AtomicFileLog.segmented(io, "mem:///log", random.split()::nextLong, false);
       String prefix = switch (prefixes) {
@@ -93,11 +99,29 @@ class TestSegmentedCommitProtocol {
         default -> new String[] {"segments", null, "elsewhere-" + i}[random.nextInt(3)];
       };
       logs.add(new SegmentedLog(catalog, store, prefix, defaultPrefix,
-          SegmentedLog.Options.defaults().withLimit(limit).withRetireTtlMs(0)
-              .withClock(() -> 0L).withCopies(copies)));
+          SegmentedLog.Options.defaults().withLimit(limit).withRetireTtlMs(ttl)
+              .withClock(clock).withCopies(copies)));
     }
+    SegmentedLog oracle = logs.remove(instances);
     CommitProtocol.run(new SegmentedLogHarness(io, segments, "mem:///log", "segments",
-        defaultPrefix, logs, EntityVersionsMachine.INSTANCE), settings, schedule);
+        defaultPrefix, logs, oracle, clock, ttl, listable, random.nextLong(),
+        EntityVersionsMachine.INSTANCE),
+        settings, schedule);
+  }
+
+  /**
+   * The retirement TTL: 0, or a few or many of the schedule's steps (each advances its clock by
+   * 1 ms or more), so that a retired segment may outlive a read of it or not.
+   */
+  @Provide
+  Arbitrary<Long> ttls() {
+    return Arbitraries.of(0L, 20L, 200L);
+  }
+
+  /** Whether the store lists, three times in four (one that does not: a SAS without list). */
+  @Provide
+  Arbitrary<Boolean> listings() {
+    return Arbitraries.frequency(Tuple.of(3, true), Tuple.of(1, false));
   }
 
   /**

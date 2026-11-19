@@ -21,6 +21,7 @@ package org.intentlog.testkit;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.LongSupplier;
 import org.intentlog.LogTail;
 import org.intentlog.LogView;
 import org.intentlog.SharedLog;
@@ -149,6 +150,22 @@ public interface LogHarness {
    */
   default boolean held(LogView view) {
     return true;
+  }
+
+  /**
+   * The log the fuzzer's oracle reads, apart from the writers' (where the harness has instances
+   * of the log, one of its own, so that its reads leave theirs as stale as they were); the log by
+   * default.
+   */
+  default SharedLog oracleLog() {
+    return log();
+  }
+
+  /**
+   * The schedule's clock, which the fuzzer gives the harness before it runs: what a log that
+   * keeps time (a segmented log's retirement) reads. Ignored by default.
+   */
+  default void clock(LongSupplier now) {
   }
 
   /**

@@ -22,11 +22,16 @@ import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.SplittableRandom;
 import java.util.TreeMap;
+import java.util.function.LongSupplier;
+import net.jqwik.api.statistics.Statistics;
 import org.apache.iceberg.io.FileInfo;
 import org.apache.iceberg.io.InMemoryAtomicFileIO;
 import org.intentlog.Capabilities;
@@ -54,11 +59,14 @@ import org.intentlog.wire.UuidV7;
 /**
  * A {@link SegmentedLog} over an {@link InMemoryAtomicFileIO} (its catalog object and pages) and
  * an {@link InMemorySegmentStore} (its segments), dressed for fuzzing. Every request of either
- * store meets the fuzzer's faults: a write may fail, be refused, be throttled before or after it
- * lands, lose its reply, or (a segment append) land later; a read may fail, or (a segment's) be
- * served short of its last block. One to three instances of the log, each with its own catalog
- * object and views, take requests in turn, as processes would; an append's read-through goes to
- * the instance that sent it, as a process reads through its own appends.
+ * store may meet the fuzzer's faults, as the commit or step of maintenance running draws them: a
+ * write may fail, be refused, be throttled before or after it lands, lose its reply, or (a segment
+ * append) land later; a read may fail, or (a segment's) be served short of its last block. One to
+ * three instances of the log, each with its own catalog object and views, take requests in
+ * stretches drawn from the seed, as processes would, one sleeping through several checkpoints,
+ * retirements and sweeps; an append's read-through goes to the instance that sent it, as a
+ * process reads through its own appends. The oracle reads its own instance, and the instances
+ * retire segments by the schedule's clock.
  *
  * <p>The oracles see the log the stores hold: the segments every catalog object ever installed,
  * in ordinal order, each up to its end (its limit-th record or its first seal frame), through the
@@ -230,6 +238,23 @@ final class SegmentedLogHarness implements LogHarness {
   private final String pages;
   private final StateMachine<?, ?, ?> machine;
   private final RoundRobin log;
+  // The oracle's instance, apart from the writers'
+  private final RoundRobin oracle;
+  private final Clock clock;
+  // The instances' retirement TTL; and whether the store lists (one whose listings the service
+  // refuses, as for a SAS without list permission, leaves the sweep only the retired segments'
+  // deletes by name)
+  private final long ttl;
+  private final boolean listable;
+  // What the catalog object's versions say of segments, read on as it is written: when each
+  // retired segment was retired, every segment ever installed, and those the newest installs and
+  // retires
+  private int versionsSeen = 0;
+  private final Map<String, Long> retiredAt = new HashMap<>();
+  private final Set<String> everInstalled = new HashSet<>();
+  private Set<String> installedNow = Set.of();
+  private Set<String> retiredNow = Set.of();
+  private final List<String> deleteViolations = new ArrayList<>();
   private final List<String> readViolations = new ArrayList<>();
   private Hooks hooks = null;
 
@@ -244,8 +269,8 @@ final class SegmentedLogHarness implements LogHarness {
    * records or else {@code defaultPrefix}; the other log keeps its segments under {@code prefix}.
    */
   SegmentedLogHarness(InMemoryAtomicFileIO io, Segments store, String location,
-      String prefix, String defaultPrefix, List<SegmentedLog> logs,
-      StateMachine<?, ?, ?> machine) {
+      String prefix, String defaultPrefix, List<SegmentedLog> logs, SegmentedLog oracle,
+      Clock clock, long ttl, boolean listable, long seed, StateMachine<?, ?, ?> machine) {
     this.io = io;
     this.store = store;
     this.location = location;
@@ -253,7 +278,11 @@ final class SegmentedLogHarness implements LogHarness {
     this.defaultPrefix = defaultPrefix;
     this.pages = location + ".committed/";
     this.machine = machine;
-    this.log = new RoundRobin(logs);
+    this.log = new RoundRobin(logs, seed);
+    this.oracle = new RoundRobin(List.of(oracle), seed);
+    this.clock = clock;
+    this.ttl = ttl;
+    this.listable = listable;
     io.injectFaults((loc, strategy) -> hooks == null ? InMemoryAtomicFileIO.Fault.NONE
         : ioFault(hooks.beforeWrite()));
     io.injectReadFaults(loc -> {
@@ -347,6 +376,13 @@ final class SegmentedLogHarness implements LogHarness {
     if (h == null) {
       return Segments.Fault.NONE;
     }
+    if (op == Segments.Request.DELETE) {
+      checkDelete(name);
+    }
+    if (op == Segments.Request.LIST && !listable) {
+      Statistics.label("listings").collect("refused");
+      return Segments.Fault.FAIL_BEFORE;
+    }
     switch (op) {
       case READ:
       case LIST: {
@@ -360,7 +396,11 @@ final class SegmentedLogHarness implements LogHarness {
         return Segments.Fault.NONE;
       }
       default:
-        return switch (h.beforeWrite()) {
+        WriteFault fault = h.beforeWrite();
+        if (op == Segments.Request.DELETE) {
+          Statistics.label("segment deletes").collect(fault == WriteFault.NONE ? "ran" : "failed");
+        }
+        return switch (fault) {
           case NONE -> Segments.Fault.NONE;
           case FAIL_BEFORE -> Segments.Fault.FAIL_BEFORE;
           case NOT_SENT -> Segments.Fault.REFUSED;
@@ -379,6 +419,29 @@ final class SegmentedLogHarness implements LogHarness {
   }
 
   @Override
+  public SharedLog oracleLog() {
+    return oracle;
+  }
+
+  @Override
+  public void clock(LongSupplier now) {
+    clock.source = now;
+  }
+
+  /**
+   * The clock the instances retire segments by: the schedule's, once the fuzzer gives it ({@link
+   * #clock(LongSupplier)}); 0 before.
+   */
+  static final class Clock implements LongSupplier {
+    private volatile LongSupplier source = () -> 0L;
+
+    @Override
+    public long getAsLong() {
+      return source.getAsLong();
+    }
+  }
+
+  @Override
   public void hook(Hooks newHooks) {
     this.hooks = newHooks;
   }
@@ -386,7 +449,11 @@ final class SegmentedLogHarness implements LogHarness {
   /** One log of several instances, each request to the next, each read checked. */
   private final class RoundRobin implements SharedLog {
     private final List<SegmentedLog> logs;
-    private int next = 0;
+    // The instance taking requests, and how many more it takes: stretches drawn from the seed,
+    // so an instance may sleep through several checkpoints, retirements and sweeps
+    private final SplittableRandom picks;
+    private SegmentedLog current;
+    private int stretch = 0;
 
     /** Each read served: a copy of its instance as the read left it, and the tail it returned. */
     private final List<Map.Entry<SegmentedLog, LogTail>> reads = new ArrayList<>();
@@ -394,12 +461,17 @@ final class SegmentedLogHarness implements LogHarness {
     /** The instance each receipt came from: a process reads through its own appends. */
     private final Map<Receipt, SegmentedLog> appended = new java.util.IdentityHashMap<>();
 
-    RoundRobin(List<SegmentedLog> logs) {
+    RoundRobin(List<SegmentedLog> logs, long seed) {
       this.logs = List.copyOf(logs);
+      this.picks = new SplittableRandom(seed);
     }
 
     private SegmentedLog pick() {
-      return logs.get(next++ % logs.size());
+      if (stretch-- <= 0) {
+        current = logs.get(picks.nextInt(logs.size()));
+        stretch = picks.nextInt(32);
+      }
+      return current;
     }
 
     private LogView seen(SegmentedLog by, LogView view, String how) {
@@ -641,9 +713,80 @@ final class SegmentedLogHarness implements LogHarness {
     return out;
   }
 
+  /** Reads on the catalog object's versions written since the last call. */
+  private void catchUp() {
+    List<InMemoryAtomicFileIO.Write> history = io.history();
+    for (; versionsSeen < history.size(); versionsSeen++) {
+      InMemoryAtomicFileIO.Write write = history.get(versionsSeen);
+      if (!write.location().equals(location)) {
+        continue;
+      }
+      SegmentedLog.Cat c = SegmentedLog.parse(AtomicFileLog.decode(write.after()), defaultPrefix);
+      Set<String> installed = new HashSet<>();
+      c.segs().forEach(seg -> installed.add(seg.name()));
+      Set<String> retired = new HashSet<>();
+      c.retired().forEach(r -> {
+        retired.add(r.name());
+        retiredAt.putIfAbsent(r.name(), r.retiredAtMs());
+      });
+      everInstalled.addAll(installed);
+      installedNow = installed;
+      retiredNow = retired;
+    }
+  }
+
+  /**
+   * SG6: a segment is deleted only once retired, and its TTL passed (the half of SG6 the model
+   * does not hold): never one the newest catalog object installs, nor a retired one sooner.
+   */
+  private void checkDelete(String full) {
+    catchUp();
+    String name = full.substring(full.lastIndexOf('/') + 1);
+    Long at = retiredAt.get(name);
+    long now = clock.getAsLong();
+    if (installedNow.contains(name)) {
+      deleteViolations.add("a delete of segment " + name + ", which the catalog object installs");
+    } else if (at != null && at + ttl > now) {
+      deleteViolations.add("a delete of segment " + name + ", retired at " + at + ", before its"
+          + " TTL of " + ttl + " ms passed (now " + now + ")");
+    }
+  }
+
+  /**
+   * A segment once installed that the store still holds must be installed or retired by the
+   * newest catalog object: its entries are the only references to it, which a store that cannot
+   * list leaves no sweep to find.
+   */
+  private List<String> leaks() {
+    Hooks was = hooks;
+    hooks = null;
+    try {
+      catchUp();
+      List<SegmentedLog.Cat> versions = catalogs();
+      if (versions.isEmpty()) {
+        return List.of();
+      }
+      SegmentedLog.Cat newest = versions.get(versions.size() - 1);
+      List<String> leaks = new ArrayList<>();
+      for (String full : store.store().list(SegmentedLog.path(newest.prefix(), newest.logId(), ""))) {
+        String name = full.substring(full.lastIndexOf('/') + 1);
+        if (everInstalled.contains(name) && !installedNow.contains(name)
+            && !retiredNow.contains(name)) {
+          leaks.add("segment " + name + ", once installed, is neither installed nor retired by"
+              + " the catalog object: no reference to it is left");
+        }
+      }
+      return leaks;
+    } finally {
+      hooks = was;
+    }
+  }
+
   @Override
   public List<String> checkpointViolations() {
     List<String> violations = new ArrayList<>(readViolations);
+    violations.addAll(deleteViolations);
+    violations.addAll(leaks());
     violations.addAll(violations(machine));
     violations.addAll(staleReaders());
     violations.addAll(neighbourViolations());
