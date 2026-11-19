@@ -116,10 +116,12 @@ each starts; `start()` is the checkpoint's position or the tail the records foll
 
 LOG_SEGMENTS.md "Reading", "Writing", "A commit's outcome" and "Compaction, retirement and the
 sweep" are the algorithms; the code follows them, with these particulars:
-- **An append's target** is the first segment this instance knows open: from the newest view's
-  tail on, past segments it saw end. After two ended segments (void replies, full), or after a
-  read-through found an append void, it reads the catalog object and goes to the newest. It
-  tries `sendAttempts` (8) segments, then fails unsent (`LogNotSentException`).
+- **An append's target** is the first segment this instance knows open: from the newest whole
+  view's tail on, past segments it saw end, which take no send (a tail read learns that segments
+  ended without moving that view: Bug 127 (ended segments spent append sends)). After two ended
+  segments (void replies, full), or after a read-through found an append void, it reads the
+  catalog object and goes to the newest. It sends to `sendAttempts` (8) segments, then fails
+  unsent (`LogNotSentException`).
 - **Installs ahead:** an append whose index is within `max(1, K/100)` of K installs the next
   segment if none is installed, ignoring a failure; with `copies`, it also sends a copy there,
   and a copy whose outcome the store can't say makes the append's outcome unknown.

@@ -719,6 +719,11 @@ public final class SegmentedLog implements SharedLog {
         o = Math.max(o, c.last().ordinal());
         ended = 0;
       }
+      // past the segments this log knows ended, which take no send (Bug 127: tail reads learn
+      // that segments ended without moving the newest view, which firstOpen starts from)
+      while (c.seg(o) != null && skip.contains(c.seg(o).name())) {
+        o++;
+      }
       Seg seg = c.seg(o);
       if (seg == null) {
         if (o < c.segs().get(0).ordinal()) {
@@ -729,10 +734,6 @@ public final class SegmentedLog implements SharedLog {
         if (c.seg(o) == null) {
           o = firstOpen(c);
         }
-        continue;
-      }
-      if (skip.contains(seg.name())) {
-        o++;
         continue;
       }
       byte[] frame = SegmentFrames.record(record, o);

@@ -198,8 +198,9 @@ its index: the reply's block count (Azure's `x-ms-blob-committed-block-count`).
   apply.
 - **NotFound** (the segment was swept) re-reads the catalog object and sends to its
   first open segment.
-- The loop is bounded by attempts. Past the bound it fails with `LogNotSentException`,
-  since nothing landed.
+- The loop is bounded by attempts: sends, not segments, so a segment the writer already
+  knows ended costs none. Past the bound it fails with `LogNotSentException`, since
+  nothing landed.
 
 **Installing.** To install segment `m+1` (with `m` the last installed), a writer
 creates it under a fresh name, then appends `InstallSegment(m+1, K)` to the catalog

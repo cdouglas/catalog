@@ -741,4 +741,35 @@ class TestSegmentedLog {
     assertThat(view.records()).containsExactlyElementsOf(sent);
     assertThat(SegmentPosition.decode(view.tail().position()).ordinal()).isEqualTo(1);
   }
+
+  /**
+   * Bug 127 (ended segments spent append sends): an append walks on from the segment the log's
+   * newest whole view ends in, and spent one of its sends on each segment past it the log knew had
+   * ended, though it sends nothing there. Tail reads learn that segments ended without moving
+   * that view, so a log tail-reading behind a writer that ended a segment per record could give
+   * up an append with no fault met (no segment found in its sends: NOT_SENT). Found by the
+   * commit-protocol fuzzer (calibration set budget, unmutated: K 1, two instances).
+   */
+  @Test
+  void anAppendSpendsNoSendsOnSegmentsTheLogKnowsEnded() {
+    SegmentedLog writer = created(1);
+    SegmentedLog behind = log(1);
+    behind.read(); // a whole view, ending in segment 0, open
+    for (int i = 0; i < 2; i++) {
+      writer.readThrough(writer.append(record(), null), Duration.ZERO); // segments 0 and 1 end
+    }
+    LogTail inOne = writer.read().tail();
+    assertThat(SegmentPosition.decode(inOne.position()).ordinal()).isEqualTo(1);
+    int sends = SegmentedLog.Options.defaults().sendAttempts();
+    for (int i = 0; i < sends; i++) {
+      writer.readThrough(writer.append(record(), null), Duration.ZERO); // segments 2 to 9 end
+    }
+    behind.readAfter(inOne); // segments 1 to 9 ended; the whole view still ends in segment 0
+
+    byte[] r = record();
+    behind.readThrough(behind.append(r, null), Duration.ZERO);
+    List<byte[]> read = log(1).read().records();
+    assertThat(read).hasSize(sends + 3);
+    assertThat(read.get(sends + 2)).isEqualTo(r);
+  }
 }
