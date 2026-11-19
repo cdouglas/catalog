@@ -903,6 +903,34 @@ class TestCatalogFaultProperties {
     return state;
   }
 
+  /**
+   * Renames each table of {@code renames} from its name to its new one, as LogCatalog stages a
+   * catalog transaction's renames: each out of a name before any into it, so a rename takes a
+   * name another of them frees whatever their order; one into a name still held (a swap) fails.
+   */
+  private static void renameAll(
+      Model m, List<Map.Entry<TableIdentifier, TableIdentifier>> renames) {
+    List<Map.Entry<TableIdentifier, TableIdentifier>> left = new ArrayList<>(renames);
+    while (!left.isEmpty()) {
+      Map.Entry<TableIdentifier, TableIdentifier> next = left.stream()
+          .filter(r -> !m.containsKey(r.getValue()))
+          .findFirst()
+          .orElse(left.get(0));
+      left.remove(next);
+      TableIdentifier from = next.getKey();
+      TableIdentifier to = next.getValue();
+      TableState state = existing(m, from);
+      if (m.containsKey(to)) {
+        throw new IllegalStateException(to + " exists");
+      }
+      if (!m.namespaces.containsKey(to.namespace())) {
+        throw new IllegalStateException(to.namespace() + " does not exist");
+      }
+      m.remove(from);
+      m.put(to, state);
+    }
+  }
+
   enum Outcome {
     ACKNOWLEDGED,
     /**
@@ -926,12 +954,11 @@ class TestCatalogFaultProperties {
     final String uuid;
     final String metadataLocation;
     final TableMetadata metadata;
-    // Whether the transaction changed it (an update, a drop, a rename it did not undo), and updated
-    // it (an append or a property, which the conflict encoding judges on an inline table); and
-    // whether it renamed it (a change unless it renamed it back, as the commit sees)
+    // Whether the transaction changed it (an update, a drop, a rename it did not undo: set at the
+    // commit), and updated it (an append or a property, which the conflict encoding judges on an
+    // inline table)
     boolean changed = false;
     boolean updated = false;
-    boolean renamed = false;
     // The refs it scanned, each to the snapshot it named then (null: none), and whether it
     // declared a read of the table
     final Map<String, Long> scans = new TreeMap<>();
@@ -944,20 +971,28 @@ class TestCatalogFaultProperties {
     }
   }
 
-  /** A change a writer staged in its open catalog transaction, and its effect at the commit. */
+  /**
+   * A change a writer staged in its open catalog transaction, and its effect at the commit. The
+   * commit applies a transaction's changes as LogCatalog stages them, by phase: namespace creates
+   * and properties; then the changes to the tables it loaded, each by the catalog's name the
+   * table had when the transaction loaded it; then those tables' renames, net (a name to its
+   * final one); then its creates, with the changes to the tables it created; then its namespace
+   * drops. Within a phase, in the order the transaction staged them.
+   */
   private static final class Staged {
+    static final int NAMESPACES = 0;
+    static final int TABLES = 1;
+    static final int RENAMES = 2;
+    static final int CREATES = 3;
+    static final int NAMESPACE_DROPS = 4;
+
     final String description;
+    final int phase;
     final Effect effect;
-    // For a rename, the catalog's name the renamed table had when the transaction loaded it
-    final TableIdentifier renameOf;
 
-    Staged(String description, Effect effect) {
-      this(description, null, effect);
-    }
-
-    Staged(String description, TableIdentifier renameOf, Effect effect) {
+    Staged(String description, int phase, Effect effect) {
       this.description = description;
-      this.renameOf = renameOf;
+      this.phase = phase;
       this.effect = effect;
     }
 
@@ -2261,8 +2296,10 @@ class TestCatalogFaultProperties {
               at.changed = true;
               at.updated = true;
             }
+            TableIdentifier appendTo = at != null ? w.names.get(id) : id;
             return new Staged("append " + staged.location() + " to " + id,
-                (m, actual) -> existing(m, id).files.add(staged.location()));
+                at != null ? Staged.TABLES : Staged.CREATES,
+                (m, actual) -> existing(m, appendTo).files.add(staged.location()));
           });
         case TXN_READ:
           if (w.txn == null) {
@@ -2315,10 +2352,11 @@ class TestCatalogFaultProperties {
             at.changed = true;
             TableIdentifier origin = w.names.remove(id);
             (txnPurge ? w.purging : w.keeping).add(origin);
-            return new Staged("drop " + id + (txnPurge ? " with purge" : ""), (m, actual) -> {
-              existing(m, id);
-              m.remove(id);
-            });
+            return new Staged("drop " + id + (txnPurge ? " with purge" : ""), Staged.TABLES,
+                (m, actual) -> {
+                  existing(m, origin);
+                  m.remove(origin);
+                });
           });
         case TXN_RENAME:
           if (w.txn == null) {
@@ -2334,14 +2372,14 @@ class TestCatalogFaultProperties {
           }
           return staging(w, "txn.renameTable(" + id + ", " + txnTo + ")", () -> {
             Table[] table = {null};
-            Loaded at = w.load(id, table);
+            w.load(id, table);
             w.txn.asCatalog().renameTable(id, txnTo);
-            if (at != null) {
-              at.renamed = true;
-            }
             TableIdentifier renameOf = w.names.remove(id);
             w.names.put(txnTo, renameOf);
-            return new Staged("rename " + id + " to " + txnTo, renameOf, (m, actual) -> {
+            // A table it loaded is renamed at the commit from its name then to its last (net);
+            // one it created, in its creates' phase, as staged
+            return new Staged("rename " + id + " to " + txnTo,
+                renameOf != null ? Staged.RENAMES : Staged.CREATES, (m, actual) -> {
               TableState state = existing(m, id);
               if (m.containsKey(txnTo)) {
                 throw new IllegalStateException(txnTo + " exists");
@@ -2368,7 +2406,7 @@ class TestCatalogFaultProperties {
                 .withProperty(TableProperties.FORMAT_VERSION, String.valueOf(txnVersion))
                 .create();
             w.names.put(txnCreated, null);
-            return new Staged("create " + txnCreated, (m, actual) -> {
+            return new Staged("create " + txnCreated, Staged.CREATES, (m, actual) -> {
               if (m.containsKey(txnCreated) || !m.namespaces.containsKey(txnCreated.namespace())) {
                 throw new IllegalStateException("cannot create " + txnCreated);
               }
@@ -2390,8 +2428,10 @@ class TestCatalogFaultProperties {
                   at.changed = true;
                   at.updated = true;
                 }
+                TableIdentifier setOn = at != null ? w.names.get(id) : id;
                 return new Staged("set " + txnPropKey + " on " + id,
-                    (m, actual) -> existing(m, id).props.put(txnPropKey, txnPropValue));
+                    at != null ? Staged.TABLES : Staged.CREATES,
+                    (m, actual) -> existing(m, setOn).props.put(txnPropKey, txnPropValue));
               });
         case TXN_CREATE_NAMESPACE:
         case TXN_DROP_NAMESPACE:
@@ -2408,22 +2448,29 @@ class TestCatalogFaultProperties {
           CatalogTransaction txn = w.txn;
           Map<TableIdentifier, Loaded> loaded = new LinkedHashMap<>(w.loaded);
           List<Staged> changes = new ArrayList<>(w.staged);
-          // A table renamed back to the name it was loaded by, and changed no other way, the
-          // commit leaves alone (BaseCatalogTransaction sends a rename only of a table whose name
-          // is not the one it started with): its renames have no effect, and need neither the
-          // table nor the names they passed through at the commit, which serializes the
-          // transaction before whatever dropped the one or took the others since (a table's
-          // existence is no read). A rename not undone is a change.
-          Set<TableIdentifier> renamedBack = new HashSet<>();
+          // The renames of the tables it loaded, net, as BaseCatalogTransaction sends them: each
+          // table from the name it was loaded by to its last, if that is another (one renamed
+          // back, or dropped, is renamed not at all). They need neither the table at the names
+          // it passed through nor those names free at the commit, which serializes the
+          // transaction before whatever took them since (a table's existence is no read). A
+          // rename not undone is a change.
+          List<Map.Entry<TableIdentifier, TableIdentifier>> renames = new ArrayList<>();
           w.names.forEach((name, origin) -> {
-            if (name.equals(origin) && loaded.containsKey(origin) && loaded.get(origin).renamed
-                && !loaded.get(origin).changed) {
-              renamedBack.add(origin);
+            if (origin != null && !name.equals(origin)) {
+              renames.add(Map.entry(origin, name));
             }
           });
-          loaded.forEach((origin, at) -> at.changed |= at.renamed && !renamedBack.contains(origin));
+          renames.forEach(r -> {
+            if (loaded.containsKey(r.getKey())) {
+              loaded.get(r.getKey()).changed = true;
+            }
+          });
+          // Its changes in the order the commit applies them (Staged)
           List<Staged> effects = new ArrayList<>(changes);
-          effects.removeIf(c -> c.renameOf != null && renamedBack.contains(c.renameOf));
+          effects.removeIf(c -> c.phase == Staged.RENAMES);
+          effects.add(new Staged("renames " + renames, Staged.RENAMES,
+              (m, actual) -> renameAll(m, renames)));
+          effects.sort(java.util.Comparator.comparingInt(c -> c.phase));
           // What each purge deletes: the manifests and lists of the table as it is now, just
           // before the commit (Bug 96)
           Map<TableIdentifier, Set<String>> purging = new TreeMap<>(BY_NAME);
@@ -2573,7 +2620,7 @@ class TestCatalogFaultProperties {
           return staging(w, "txn.createNamespace(" + ns + ", " + props + ")", () -> {
             txc.createNamespace(ns, props);
             w.createdNamespaces.add(ns);
-            return new Staged("create " + ns, (m, actual) -> {
+            return new Staged("create " + ns, Staged.NAMESPACES, (m, actual) -> {
               if (m.namespaces.containsKey(ns)) {
                 throw new IllegalStateException(ns + " exists");
               }
@@ -2597,10 +2644,11 @@ class TestCatalogFaultProperties {
                 Loaded at = w.load(t, table);
                 if (w.txn.asCatalog().dropTable(t, false)) {
                   at.changed = true;
-                  w.keeping.add(w.names.remove(t));
-                  w.staged.add(new Staged("drop " + t, (m, actual) -> {
-                    existing(m, t);
-                    m.remove(t);
+                  TableIdentifier dropped = w.names.remove(t);
+                  w.keeping.add(dropped);
+                  w.staged.add(new Staged("drop " + t, Staged.TABLES, (m, actual) -> {
+                    existing(m, dropped);
+                    m.remove(dropped);
                   }));
                 }
               }
@@ -2608,7 +2656,7 @@ class TestCatalogFaultProperties {
             if (!txc.dropNamespace(ns)) {
               throw new NoSuchNamespaceException("dropNamespace returned false: %s", ns);
             }
-            return new Staged("drop " + ns, (m, actual) -> {
+            return new Staged("drop " + ns, Staged.NAMESPACE_DROPS, (m, actual) -> {
               if (!m.namespaces.containsKey(ns)) {
                 throw new IllegalStateException(ns + " does not exist");
               }
@@ -2622,7 +2670,7 @@ class TestCatalogFaultProperties {
           String value = "v" + nextValue++;
           return staging(w, "txn.setProperties(" + ns + ", " + key + "=" + value + ")", () -> {
             txc.setProperties(ns, Map.of(key, value));
-            return new Staged("set " + key + " on " + ns, (m, actual) -> {
+            return new Staged("set " + key + " on " + ns, Staged.NAMESPACES, (m, actual) -> {
               if (!m.namespaces.containsKey(ns)) {
                 throw new IllegalStateException(ns + " does not exist");
               }
@@ -2632,7 +2680,7 @@ class TestCatalogFaultProperties {
         default:
           return staging(w, "txn.removeProperties(" + ns + ", " + key + ")", () -> {
             txc.removeProperties(ns, Set.of(key));
-            return new Staged("remove " + key + " from " + ns, (m, actual) -> {
+            return new Staged("remove " + key + " from " + ns, Staged.NAMESPACES, (m, actual) -> {
               if (!m.namespaces.containsKey(ns)) {
                 throw new IllegalStateException(ns + " does not exist");
               }
