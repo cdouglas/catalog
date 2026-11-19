@@ -8,7 +8,10 @@
 # so a namespace drop staged on a read without it lands over it (V8); viewstale applies a view's
 # update on a version other than the one it read (V6); viewdeletefirst deletes a pointer view's
 # metadata file before its drop lands, so a drop whose outcome is unknown, or that does not land,
-# leaves a view whose metadata is gone (V9). The oracles: N1 (TestVerifyStabilityProperties: a
+# leaves a view whose metadata is gone (V9); txnviewstale stages a catalog transaction's view
+# change on the version its commit reads, not the one the transaction loaded (VIEWS.md "Stage 2");
+# txnkeptview drops a kept inline view in a catalog transaction without writing it to a file. The
+# oracles: N1 (TestVerifyStabilityProperties: a
 # rejected action stays rejected, every state well-formed, design.md I13 among it), the multi-writer
 # fuzzer (serial re-execution, copies of rejected bindings once their names are free), the fault
 # and race fuzzers through Iceberg's API, the regressions (TestViewActions, TestCatalogRegressions'
@@ -25,7 +28,15 @@
 # (catalogMatchesModel at 68); the race fuzzer at 1,000 tablenoview (at 386); ViewCatalogTests
 # tablenoview. Neither fuzzer caught viewdeletefirst, the fault fuzzer not in 1,000 tries of each
 # property: it needs a drop of a pointer view whose gc is on, that a fault leaves unlanded.
-MUTANTS="viewnotable tablenoview viewdropnoremovals viewnobump viewstale viewdeletefirst"
+# Locally (2026-11-19, fileio d071ec8, errata T8 (fuzzer transactions lack views) fixed):
+# txnviewstale fails the fault fuzzer's catalogMatchesModel at try 1,426 of 2,000 (an acknowledged
+# transaction updated a view changed since it loaded it) and CatalogTransactionTests'
+# aViewChangeFailsWhereTheViewChangedSince in every mode; not the race fuzzer in 3,000 tries of its
+# transaction property, whose racers run after the commit's own read, where the record's version
+# binding rejects the change anyway. txnkeptview fails catalogMatchesModel at try 52,
+# faultyStorageNeverMisreportsACommit at 753, and TestCatalogRegressions'
+# aTransactionsViewDropTreatsItsFilesAsDropViewDoes.
+MUTANTS="viewnotable tablenoview viewdropnoremovals viewnobump viewstale viewdeletefirst txnviewstale txnkeptview"
 EQUIVALENT=""
 ORACLES=TestVerifyStabilityProperties,TestMultiWriterProperties,TestCatalogFaultProperties,TestCatalogRaceProperties,TestViewActions,TestCatalogRegressions,TestLocalViewCatalog
 
@@ -62,5 +73,12 @@ mutant() { # name main-dir test-dir
         CatalogUtil.dropViewMetadata(io, dropped);
       }
 " ;;
+    # a catalog transaction changes a view on the version the commit reads, not the one it loaded
+    txnviewstale) mutate $M/LogCatalog.java "      if (!java.util.Objects.equals(
+          LogViewOperations.location(current.state(), viewId)," "      if (false && !java.util.Objects.equals(
+          LogViewOperations.location(current.state(), viewId)," ;;
+    # a catalog transaction's drop of a kept inline view writes it to no file
+    txnkeptview) mutate $M/LogCatalog.java "          keptView(viewId, entry, newCatalog::wroteAhead);
+" "" ;;
   esac
 }
