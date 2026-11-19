@@ -93,6 +93,39 @@ Validated == [w \in {1, 2, 3} |->
                   [] w = 2 -> << T({"p2"}, {"p2", "main", "v"}) >>
                   [] OTHER -> << T({"p1"}, {"p1", "main", "v"}) >>]
 
+\* Tables and views (docs/VIEWS.md; RSM's named actions): a create of kind k
+\* named n in namespace p, bound by name (the default create condition) or by
+\* the namespace's version; a view's update; a drop; a rename to tn in tp; a
+\* namespace's drop. Each is one operation, not restaged, in the free
+\* schedule: a writer whose read refuses one ends it with no commit.
+Nm(op, k, p, n, by, tp, tn) ==
+  [rd |-> {}, wr |-> {}, cr |-> None, retry |-> FALSE,
+   nm |-> [op |-> op, k |-> k, p |-> p, n |-> n, by |-> by, tp |-> tp, tn |-> tn]]
+Make(k, p, n) == Nm("create", k, p, n, "name", None, None)
+MakeByVersion(k, p, n) == Nm("create", k, p, n, "version", None, None)
+UpdateView(p, n) == Nm("update", "view", p, n, None, None, None)
+Drop(k, p, n) == Nm("drop", k, p, n, None, None, None)
+Move(k, p, n, tp, tn) == Nm("rename", k, p, n, "name", tp, tn)
+DropNs(p) == Nm("dropns", None, p, None, None, None, None)
+
+\* A table and a view take one name, a.x, then the view moves to b.y as a
+\* table takes that name (V7: either kind's binding counts the other's).
+Names == [w \in {1, 2} |->
+            IF w = 1 THEN << Make("table", "a", "x"), Make("table", "b", "y") >>
+            ELSE << Make("view", "a", "x"), Move("view", "a", "x", "b", "y") >>]
+\* The table's create binds by the namespace's version, the view's by name:
+\* writers may mix the create conditions.
+NamesMixed == [w \in {1, 2} |->
+                 IF w = 1 THEN << MakeByVersion("table", "a", "x") >>
+                 ELSE << Make("view", "a", "x"), Drop("view", "a", "x") >>]
+\* A view's create and its namespace's drop, staged on one read (V8).
+ViewNsDrop == [w \in {1, 2} |->
+                 IF w = 1 THEN << Make("view", "a", "x") >> ELSE << DropNs("a") >>]
+\* Two updates of a view staged on one version (V6).
+ViewUpdates == [w \in {1, 2} |->
+                  IF w = 1 THEN << Make("view", "a", "x"), UpdateView("a", "x") >>
+                  ELSE << UpdateView("a", "x") >>]
+
 NoSkew2 == [w \in {1, 2} |-> 0]
 NoSkew3 == [w \in {1, 2, 3} |-> 0]
 Behind2 == [w \in {1, 2} |-> IF w = 1 THEN 0 ELSE 2]
@@ -160,6 +193,19 @@ Not_CompactionResent == Len(file.inc) # 4
 Not_ResentPageOutRefused ==
   ~(Len(file.inc) = 4 /\ \E i \in DOMAIN file.log : IsPo(file.log[i])
                         /\ \A p \in LiveR.P : PageName(p) # PageName(file.log[i]))
+
+\* Tables and views: replay rejected a named action's record (a name the other
+\* kind took, a view's update on a stale version, a namespace's drop that lost
+\* to a create in it).
+Not_NamedRejected ==
+  \A i \in 1..Len(Txns(file.log)) :
+    Txns(file.log)[i].nm # None => Txns(file.log)[i].id \in IdsOf(Hist)
+\* A writer's named operation, the last it ended, failed: replay rejected its
+\* record, or the commit loop's read did before it wrote (a view's update on a
+\* stale version).
+Not_NamedFailed ==
+  \A w \in Writers : ~(res[w] = "failed" /\ ws[w].pc = "idle" /\ ws[w].k > 1
+                       /\ NmOf(Shapes[w][ws[w].k - 1]) # None)
 
 \* Paging (COMMITTED_PAGING.md). A CAS's PageOut applied: the floor above
 \* the horizon. A writer about to judge its record by a read whose id is

@@ -7,6 +7,34 @@ Ents == {"a", "b"}
 T(rd, wr) == [rd |-> rd, wr |-> wr, cr |-> None]
 Create(p) == [rd |-> {p}, wr |-> {p}, cr |-> p]
 
+\* Tables and views (docs/VIEWS.md; RSM's named actions), as MC's: a writer
+\* whose read refuses one ends it with no commit.
+Nm(op, k, p, n, by, tp, tn) ==
+  [rd |-> {}, wr |-> {}, cr |-> None,
+   nm |-> [op |-> op, k |-> k, p |-> p, n |-> n, by |-> by, tp |-> tp, tn |-> tn]]
+Make(k, p, n) == Nm("create", k, p, n, "name", None, None)
+MakeByVersion(k, p, n) == Nm("create", k, p, n, "version", None, None)
+Drop(k, p, n) == Nm("drop", k, p, n, None, None, None)
+Move(k, p, n, tp, tn) == Nm("rename", k, p, n, "name", tp, tn)
+
+\* The ABA of a create by name (design.md I13): writer 1's create of a.x is
+\* rejected while writer 2's entity of the other kind holds the name, which
+\* writer 2 then frees; a copy of writer 1's record still in flight
+\* (LandInflight) must stay rejected, by the namespace's removals.
+ViewFreed == [w \in {1, 2} |->
+                IF w = 1 THEN << Make("table", "a", "x") >>
+                ELSE << Make("view", "a", "x"), Drop("view", "a", "x") >>]
+TableFreed == [w \in {1, 2} |->
+                 IF w = 1 THEN << Make("view", "a", "x") >>
+                 ELSE << Make("table", "a", "x"), Drop("table", "a", "x") >>]
+TableMoved == [w \in {1, 2} |->
+                 IF w = 1 THEN << Make("view", "a", "x") >>
+                 ELSE << Make("table", "a", "x"), Move("table", "a", "x", "a", "y") >>]
+\* Writer 1 binds by the namespace's version, which writer 2's create moves.
+ViewFreedByVersion == [w \in {1, 2} |->
+                         IF w = 1 THEN << MakeByVersion("table", "a", "x") >>
+                         ELSE << Make("view", "a", "x"), Drop("view", "a", "x") >>]
+
 \* Writer 2 reads what writer 1 writes.
 Contend == [w \in {1, 2} |->
               IF w = 1 THEN << T({"a"}, {"a"}) >> ELSE << T({"a", "b"}, {"b"}) >>]
@@ -100,6 +128,15 @@ Not_Throttled == \A w \in Writers : ws[w].pc # "throttled"
 Not_Exhausted == \A w \in Writers : ~(ws[w].pc = "send" /\ ws[w].att >= MaxAttempts)
 \* A commit resolving an ambiguous write after a read of it lagged the log.
 Not_LaggingRead == \A w \in Writers : ~(ws[w].lg /\ ws[w].pc = "resolve")
+\* Tables and views: a copy of a create its writer reported failed landed
+\* after a drop or a rename that applied freed the name it binds (the ABA).
+Not_LateCopyAfterFree ==
+  ~\E e \in ended : \E i, j \in 1..Len(log) :
+     /\ j < i /\ IsTxn(log[i]) /\ IsTxn(log[j])
+     /\ e.out = "failed" /\ log[i].id = e.id
+     /\ log[i].nm # None /\ log[i].nm.op = "create"
+     /\ log[j].nm # None /\ log[j].nm.op \in {"drop", "rename"} /\ log[j].id \in IdsOf(Hist)
+     /\ log[j].nm.p = log[i].nm.p /\ log[j].nm.n = log[i].nm.n
 
 \* Paging (COMMITTED_PAGING.md). A PageOut applied: the floor above the
 \* horizon. A PageOut that changed nothing (its block changed, or was sealed

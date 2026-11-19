@@ -563,24 +563,6 @@ mode, so a catalog's FileIO should leave them off, and nothing makes it.
 **Trigger to revisit:** when a catalog's FileIO enables an accelerated read
 path.
 
-### T7. The TLA+ models do not include views
-
-`spec/tla/` models the commit loop over one replicated state machine
-(`RSM.tla`) on one catalog object, on a shared log, and on Append Blobs, and
-`check.py`'s bug switches each break a property. Views (VIEWS.md) are not in
-those models: no view's create, update, drop or rename, no names shared by a
-namespace's tables and views (V7), no view create bumping its namespace's
-version under a namespace drop (V8), and no switch for a view mutant. What the
-view actions require is checked in Java only: N1
-(`TestVerifyStabilityProperties`) and `WellFormed`'s I13, the multi-writer
-fuzzer's serial re-execution and its copies of rejected bindings of either
-kind, the fault and race fuzzers through Iceberg's API, the regressions, and
-the calibration set `fuzz/mutants/views.sh`.
-
-**Trigger to revisit:** once the first havoc fuzz round with the view kinds
-is running: model views beside tables in `RSM.tla`'s catalog state, with bug
-switches for the cross-kind name check and the view drop's removals.
-
 ## Known Unknowns
 
 These are pending measurement or validation. None block current work;

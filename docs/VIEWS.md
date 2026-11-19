@@ -424,8 +424,12 @@ and a view's metadata carries its own uuid. What Batavia could add, outside Iceb
   five format mutants (`viewstale` at try 159, the others within 13); the multi-writer fuzzer all
   but `viewdeletefirst` (`viewdropnoremovals` only by the binding property, at try 321 of 3,000);
   the fault and race fuzzers one each. The script's header has each oracle's tries.
-- **TLA+:** views are not in the models yet (errata T7 (TLA+ omits views)); the Java oracles
-  above check them, verification stability (S2) among them by N1.
+- **TLA+:** `spec/tla`'s models hold tables and views by name (README "Tables and views"):
+  creates by name or by version, a view's update, drops, renames and a namespace's drop, with
+  `WellNamed` (I13). Switches for `viewnotable`, `tablenoview`, `viewnobump` and `viewstale`
+  break `Serializable` on either log; `viewdropnoremovals` breaks `HonestFailed` on the shared
+  log, through a late copy of a rejected create, which one object's conditional writes never
+  land.
 - **havoc:** one round with the view kinds, after the merge.
 
 ## Stage 2: views in catalog transactions

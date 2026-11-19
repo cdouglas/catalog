@@ -49,7 +49,7 @@ BASE = {
     "Bugs": "{}",
 }
 
-SAFETY = ["Readable", "NoUnheldState", "ExactlyOnce", "Serializable", "UniqueIds",
+SAFETY = ["Readable", "NoUnheldState", "ExactlyOnce", "Serializable", "UniqueIds", "WellNamed",
           "HonestCommitted", "HonestFailed", "UnknownExplained", "SoloCommits", "StampsCount",
           "PagesExist", "PagesExact", "Shape", "OnGrid", "StatePagesExist"]
 ACTIONS = ["HistGrows", "CasAppliesItsRecord", "CheckpointIsReplay"]
@@ -277,6 +277,36 @@ CONFIGS = {
     # must be refused (the digest check), which on one object only a resend needs.
     "after-nodigest": ({**FPAGE, **AFTER, "CompactResends": "2", "Skew": "<- Behind2",
                         "Bugs": '{"nodigest"}'}, {"PagesExact"}),
+    # Tables and views (docs/VIEWS.md): a table and a view racing for a name, by create and by
+    # rename; the create conditions mixed; a view's create against its namespace's drop; two
+    # updates of a view on one version. With every fault, and two per writer, compaction and
+    # resends race them.
+    "names": ({"Shapes": "<- Names", "MaxCount": "1"}, "pass"),
+    "names-faults": ({"Shapes": "<- Names", "MaxCount": "1", "MaxFaults": "1",
+                      "FaultKinds": ALL_FAULTS, "Strict": "TRUE"}, "pass"),
+    "names-mixed": ({"Shapes": "<- NamesMixed", "MaxCount": "1", "MaxFaults": "1",
+                     "FaultKinds": ALL_FAULTS}, "pass"),
+    "view-nsdrop": ({"Shapes": "<- ViewNsDrop", "MaxFaults": "1", "FaultKinds": ALL_FAULTS},
+                    "pass"),
+    "view-updates": ({"Shapes": "<- ViewUpdates", "MaxCount": "1", "MaxFaults": "1",
+                      "FaultKinds": ALL_FAULTS}, "pass"),
+    # Their switches (fuzz/mutants/views.sh and creates.sh): a binding of either kind that
+    # ignores the other kind's names, or every name; a view's create that leaves its namespace's
+    # version (a drop of the namespace lands over it); a view's update on any version. The ABA
+    # switches need a late copy of a rejected record, which one object's conditional writes
+    # never land (log-* below).
+    "viewnotable": ({"Shapes": "<- Names", "MaxCount": "1", "Bugs": '{"viewnotable"}'},
+                    {"WellNamed", "Serializable"}),
+    "tablenoview": ({"Shapes": "<- Names", "MaxCount": "1", "Bugs": '{"tablenoview"}'},
+                    {"WellNamed", "Serializable"}),
+    "noabsence": ({"Shapes": "<- Names", "MaxCount": "1", "Bugs": '{"noabsence"}'},
+                  {"WellNamed", "Serializable"}),
+    "viewnobump": ({"Shapes": "<- ViewNsDrop", "Bugs": '{"viewnobump"}'},
+                   {"WellNamed", "Serializable"}),
+    "viewnobump-mixed": ({"Shapes": "<- NamesMixed", "MaxCount": "1", "Bugs": '{"viewnobump"}'},
+                         {"WellNamed", "Serializable"}),
+    "viewstale": ({"Shapes": "<- ViewUpdates", "MaxCount": "1", "Bugs": '{"viewstale"}'},
+                  {"Serializable"}),
     # The state's pages (SNAPSHOT_PAGING.md "Testing"): an entity's history seals into a page
     # at each version and drops one behind (SealEvery 1); writer 1 writes "a" three times.
     "statepages": (SPAGE, "pass"),
@@ -315,8 +345,8 @@ LOG_BASE = {
 
 LOG_SAFETY = ["StampsCount", "Readable", "Deterministic", "CheckpointIsReplay", "ExactlyOnce",
               "Serializable",
-              "UniqueIds", "HonestCommitted", "HonestFailed", "UnknownExplained", "SoloCommits",
-              "PagesExist", "PagesExact", "Shape", "OnGrid"]
+              "UniqueIds", "WellNamed", "HonestCommitted", "HonestFailed", "UnknownExplained",
+              "SoloCommits", "PagesExist", "PagesExact", "Shape", "OnGrid"]
 LOG_ACTIONS = ["HistGrows"]
 
 LOG_FAULTS = ('{"failBefore", "notSent", "lostReply", "throttled", "landedThrottled", '
@@ -401,6 +431,36 @@ LOG_CONFIGS = {
     "log-sweepabove": ({**PAGE, "Bugs": '{"sweepabove"}'}, {"PagesExist"}),
     "log-mintH": ({**PAGE, "Skew": "<- Behind2", "CompSkews": "{2}", "Bugs": '{"mintH"}'},
                   {"SoloCommits"}),
+    # Tables and views: the ABA of a create by name (a copy of a rejected create in flight while
+    # the other kind's entity frees its name), freed by a view's drop, a table's drop and a
+    # table's rename; bound by the namespace's version; with compaction (the removals carried
+    # through a checkpoint, and a reader starting from it) and the late landing alone.
+    "log-view-freed": ({"Shapes": "<- ViewFreed", "MaxFaults": "1", "FaultKinds": LOG_FAULTS},
+                       "pass"),
+    "log-table-freed": ({"Shapes": "<- TableFreed", "MaxFaults": "1", "FaultKinds": LOG_FAULTS},
+                        "pass"),
+    "log-table-moved": ({"Shapes": "<- TableMoved", "MaxFaults": "1", "FaultKinds": LOG_FAULTS},
+                        "pass"),
+    "log-view-freed-version": ({"Shapes": "<- ViewFreedByVersion", "MaxFaults": "1",
+                                "FaultKinds": LOG_FAULTS}, "pass"),
+    "log-view-freed-gc": ({**COMPACT1, "Shapes": "<- ViewFreed", "MaxFaults": "1",
+                           "FaultKinds": '{"inflight"}'}, "pass"),
+    # Their switches: a name freed without counting it in the namespace's removals (a view's
+    # drop; a table's drop and rename), a binding that ignores the removals, or the other kind.
+    "log-viewdropnoremovals": ({"Shapes": "<- ViewFreed", "MaxFaults": "1",
+                                "FaultKinds": '{"inflight"}', "Bugs": '{"viewdropnoremovals"}'},
+                               {"HonestFailed"}),
+    "log-dropnobump": ({"Shapes": "<- TableFreed", "MaxFaults": "1", "FaultKinds": '{"inflight"}',
+                        "Bugs": '{"dropnobump"}'}, {"HonestFailed"}),
+    "log-renamenobump": ({"Shapes": "<- TableMoved", "MaxFaults": "1",
+                          "FaultKinds": '{"inflight"}', "Bugs": '{"renamenobump"}'},
+                         {"HonestFailed"}),
+    "log-absentonly": ({"Shapes": "<- ViewFreed", "MaxFaults": "1", "FaultKinds": '{"inflight"}',
+                        "Bugs": '{"absentonly"}'}, {"HonestFailed"}),
+    "log-viewnotable": ({"Shapes": "<- TableFreed", "Bugs": '{"viewnotable"}'},
+                        {"WellNamed", "Serializable"}),
+    "log-tablenoview": ({"Shapes": "<- ViewFreed", "Bugs": '{"tablenoview"}'},
+                        {"WellNamed", "Serializable"}),
     # Not in the plan: a lookup whose page was deleted since its read (GC dropped it) fails
     # instead of reading again.
     "log-missingfail": ({**COMPACT1, **PAGE1, "Lag": "TRUE", "MaxFaults": "1",
@@ -505,6 +565,12 @@ WITNESSES = [
     ("log-base", "Not_FailedButLanded"), ("log-faults2", "Not_Unknown"),
     ("log-faults", "Not_Error"), ("log-faults", "Not_Throttled"),
     ("log-faults2", "Not_Exhausted"), ("log-lag", "Not_LaggingRead"),
+    # Tables and views.
+    ("names", "Not_NamedRejected"), ("names-mixed", "Not_NamedRejected"),
+    ("view-nsdrop", "Not_NamedRejected"), ("view-updates", "Not_NamedFailed"),
+    ("log-view-freed", "Not_LateCopyAfterFree"), ("log-table-freed", "Not_LateCopyAfterFree"),
+    ("log-table-moved", "Not_LateCopyAfterFree"),
+    ("log-view-freed-version", "Not_LateCopyAfterFree"),
     # Paging.
     ("page", "Not_Floor"), ("page", "Not_PageOutInLog"), ("page-faults", "Not_PagedOwnId"),
     ("page-faults", "Not_Orphan"), ("page-gc", "Not_Swept"), ("page-cas", "Not_TwoPages"),

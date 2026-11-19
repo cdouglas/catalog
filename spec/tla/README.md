@@ -18,7 +18,10 @@ Two models of the commit loop (`LogRuntime.commit`, formerly
 Both models also page the committed set as `docs/COMMITTED_PAGING.md` designs it:
 the floor, PageOut records, page puts and sweeps. That part was written before
 its Java (stage 2 of the design's order of work); see
-[Paging the committed set](#paging-the-committed-set).
+[Paging the committed set](#paging-the-committed-set). And both hold tables and
+views by name, beside the entities: creates by name, their removals, and the
+names a namespace's tables and views share (docs/VIEWS.md); see
+[Tables and views](#tables-and-views).
 
 The model reproduces the commit loop, not Iceberg. Table metadata (inline TM and
 ML, deltas, row lineage, DVs), byte encoding, SDK error mapping and performance
@@ -26,7 +29,7 @@ are out of scope.
 
 | File | What it holds |
 |---|---|
-| `RSM.tla` | The state machine and replay (`Replay`; `CommittedSet` with its blocks, floor and pages; `landed`'s verdict and page lookups), and the serial execution the properties compare with |
+| `RSM.tla` | The state machine and replay (`Replay`; `CommittedSet` with its blocks, floor and pages; `landed`'s verdict and page lookups; tables' and views' named actions), and the serial execution the properties compare with |
 | `CatalogCommit.tla` | The protocol: storage, the commit loop, faults, GC, the bug switches, the properties |
 | `CatalogOracles.tla` | The three fuzzers' oracles, their tightened versions, and `Adequate` |
 | `MC.tla` | Scenarios (what each writer commits) and the coverage witnesses |
@@ -86,7 +89,9 @@ transaction reads some entities at the versions its snapshot had, writes some of
 them, and may create an entity under one it writes. Replay applies a record if
 `mayApply` admits its id (not in `C`, above `H`) and its reads still hold
 (`Intention.verify`). The checkpoint carries a ghost history: the records
-replay applied, in order. The properties are stated over it.
+replay applied, in order. The properties are stated over it. A record may
+instead carry a named action on a table or a view
+([Tables and views](#tables-and-views)).
 
 A commit judges its own record as `LogRuntime.landed` does: by what replay did
 with it first (applied or rejected), and only if replay did not judge it, by the
@@ -162,8 +167,9 @@ goes in a replace, `oversized` in `mustReplace`: Bug 71, covered by
 |---|---|
 | `Readable` | every version of the catalog replays |
 | `ExactlyOnce` | no transaction applies twice |
-| `Serializable` | the catalog is the serial execution of the transactions applied, each one's reads (as its snapshot had them) holding where it applies, creates binding fresh ids |
+| `Serializable` | the catalog is the serial execution of the transactions applied, each one's reads (as its snapshot had them) holding where it applies, and what its named action asked of the state (a name free, a view at the version read, a namespace empty), creates binding fresh ids |
 | `UniqueIds` | no id names two entities |
+| `WellNamed` | design.md I13: no namespace holds two tables or views of one name, or any once it is dropped |
 | `HonestCommitted` | a commit reported committed applied, and stays applied, through compaction and GC |
 | `HonestFailed` | a commit reported failed, or any error but unknown, is not applied, now or later (a late landing included) |
 | `UnknownExplained` | an unknown outcome follows a fault, or a read that put the id at or below the horizon |
@@ -175,8 +181,8 @@ goes in a replace, `oversized` in `mustReplace`: Bug 71, covered by
 
 ## Results
 
-Every configuration of the correct protocol passes. `check.py` holds 159
-configurations (98 of the file model, 41 `log-*`, 20 `sg-*`), 102 of them
+Every configuration of the correct protocol passes. `check.py` holds 181
+configurations (109 of the file model, 52 `log-*`, 20 `sg-*`), 112 of them
 expected to pass; the rest are bug switches, each expected to break a
 property. The state counts in this file's tables are from `check.py`'s full
 run at 4c685a3 (2026-11-11: the 138 configurations it held then, about six
@@ -1140,6 +1146,84 @@ The witnesses (`check.py --witnesses -k sg-`) are each reached:
 - compaction: a checkpoint moved, a segment retired and one swept;
 - reads: a reader stepping past an ended last segment, and a 404 for a stale writer and for a
   stale reader.
+
+## Tables and views
+
+`RSM.tla` holds tables and views by name beside the entities, as the catalog binds names
+(docs/VIEWS.md; design.md I13; `fileio.catalog.create.condition`). A scenario's operation may
+carry a named action (`nm`), which the writer stages on its read (`NamedOn`) and replay checks
+(`NamedVerify`, ProtoCodec's view and table actions):
+
+| Action | The record carries | Replay applies it if | It applies |
+|---|---|---|---|
+| create of a table or a view, name n in namespace p | p's removals and version as read | by name: p not dropped, its removals unchanged, n held by no table or view (V7); by version: p's version unchanged | a new entity, its id bound at replay; p's version + 1 (V8) |
+| a view's update | the view's id and version | the view at that version (V6) | the version read + 1 |
+| drop | the entity's id and version | the entity at that version | removes it; p's version + 1, p's removals + 1 |
+| rename to name tn in namespace tp | the entity's id and version; tp's removals and version | the entity at that version, and tn bound in tp as a create's name | moves it; the version read + 1; both namespaces' versions + 1; p's removals + 1 |
+| a namespace's drop | p's version | p's version unchanged | p dropped; p's version + 1 |
+
+The writer checks its read first, as `CatalogMutation` does (`Refused`): a name held, an
+entity absent, or a namespace dropped or not empty ends the operation with no record
+(`AlreadyExistsException`, `NoSuchViewException`, `NamespaceNotEmptyException`). Named
+operations run in the free schedules and are not restaged.
+
+Three properties judge them. `WellNamed` is I13. `Serializable` judges a named action by what
+it asked of the state as its snapshot had it (`NamedValid`): a create's or a rename's name free
+in a namespace not dropped, the entity at the version read, a namespace dropped empty. It does
+not use the removals or versions the record carries. `HonestFailed` catches the ABA: a create
+reported failed whose late copy applies once its name is freed.
+
+**Results** (2026-11-18). Every passing configuration holds:
+
+| Config | What it adds | States |
+|---|---|---:|
+| `names` | a table and a view take one name, a.x; the view moves to b.y as a table takes that name | 357 |
+| `names-faults` | the same, with every fault | 4,298 |
+| `names-mixed` | a table's create bound by version, a view's by name, then the view's drop; every fault | 1,287 |
+| `view-nsdrop` | a view's create and its namespace's drop, staged on one read; every fault | 397 |
+| `view-updates` | two updates of a view staged on one version; every fault | 698 |
+| `log-view-freed`, `log-table-freed`, `log-table-moved` | the ABA on the shared log: writer 1's create of a.x is rejected while writer 2's entity of the other kind holds the name; writer 2 frees it (a view's drop, a table's drop, a table's rename); a copy of writer 1's record in flight lands after; every fault | 1,226 each |
+| `log-view-freed-version` | the same with writer 1 bound by version | 1,226 |
+| `log-view-freed-gc` | the same with a GC record, a checkpoint and a trim; the late landing alone (8 minutes) | 1,054,999 |
+
+Each switch puts back a mutant of the Java calibration sets (`fuzz/mutants/views.sh`,
+`creates.sh`) and breaks a property:
+
+| Switch | What it does | Config | Caught by |
+|---|---|---|---|
+| `viewnotable` | a view's create or rename ignores the tables' names | `viewnotable`, `log-viewnotable` | `Serializable` |
+| `tablenoview` | a table's create or rename ignores the views' names | `tablenoview`, `log-tablenoview` | `Serializable` |
+| `noabsence` | a binding by name ignores whether its name is held | `noabsence` | `Serializable` |
+| `viewnobump` | a view's create leaves its namespace's version: a drop of the namespace staged before it lands over it; a table's create bound by version takes its name | `viewnobump`, `viewnobump-mixed` | `Serializable` |
+| `viewstale` | a view's update applies on any version of the view | `viewstale` | `Serializable` |
+| `viewdropnoremovals` | a view's drop frees its name without counting it in the removals | `log-viewdropnoremovals` | `HonestFailed` |
+| `dropnobump`, `renamenobump` | the same for a table's drop and a table's rename | `log-dropnobump`, `log-renamenobump` | `HonestFailed` |
+| `absentonly` | a binding by name ignores the removals | `log-absentonly` | `HonestFailed` |
+
+TLC checks `Serializable` before `WellNamed`, so it reports `Serializable` first. Checked
+alone, `WellNamed` breaks too under every switch above `viewstale`, which takes no name.
+
+The witnesses (`check.py --witnesses`) are reached: replay rejects a named action's record
+(`names`, `names-mixed`, `view-nsdrop`: a name taken, a namespace's drop that lost to a
+create); a view's update staged on a stale version fails (`view-updates`: the commit loop's
+read rejects it before it writes); and a copy of a create its writer reported failed lands
+after a drop or a rename freed its name (`log-*-freed`, `log-table-moved`), which replay
+rejects by the removals, or by the version for a create bound by version.
+
+**What the model shows.** The ABA switches break a property only on the shared log, through a
+late landing. On one object a record lands only on the version its writer conditioned it on,
+and a writer told that its record failed never sends it again, so no copy lands after the name
+is freed. That is why, in Java, the multi-writer fuzzer catches those mutants only with its
+property of blind appends on a shared log (`aRejectedBindingStaysRejectedOnceItsNameIsFree`;
+`creates.sh`'s header): the segmented log on Append Blobs, with its blind appends, has the late
+landings the shared-log model has. The cross-kind, version and namespace switches break
+`Serializable` on either log, without faults.
+
+**Not modelled.** Child namespaces (a child's drop counts in its parent's removals:
+`creates.sh`'s `nsdropnobump`); catalog transactions (a rename into a name its own record frees,
+Bug 124 (rename into freed name fails)); a named table's commits, which stay writes of
+entities; the forms, inline or pointer, and the files a drop deletes (`views.sh`'s
+`viewdeletefirst`); the fuzzers' oracle schedules on named operations.
 
 ## History
 

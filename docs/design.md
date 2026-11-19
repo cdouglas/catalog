@@ -614,7 +614,10 @@ only by an action that adds to the namespace's removals, of either kind.
 So the rule is stable (S2): a create that lost to the other kind's entity
 of its name stays rejected once that entity is dropped or renamed away (the
 cross-kind create ABA). `spec/WellFormed` checks the invariant after every
-apply, and `TestViewActions$SharedNames` holds a race of each kind.
+apply, and `TestViewActions$SharedNames` holds a race of each kind. The
+TLA+ models state it as `WellNamed` (spec/tla/README.md "Tables and
+views"), and their switches for the cross-kind check and a view drop's
+removals each break a property.
 
 ## Operation × Operation Conflict Matrix
 

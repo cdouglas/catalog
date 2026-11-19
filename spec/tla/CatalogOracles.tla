@@ -8,17 +8,21 @@
 EXTENDS CatalogCommit
 
 \* What a test sees of the catalog: entity versions stand for the values the
-\* fuzzers write (each write a fresh one), and creates count per parent (a
-\* test names entities, not ids). No committed set, horizon or history.
+\* fuzzers write (each write a fresh one), creates count per parent (a test
+\* names entities, not ids), and named tables and views by namespace, name,
+\* kind and version, with the namespaces dropped. No committed set, horizon or
+\* history.
 ViewOf(st) ==
-  [ver |-> st.ver, kids |-> [p \in Entities |-> Cardinality({m \in st.made : m.p = p})]]
+  [ver |-> st.ver, kids |-> [p \in Entities |-> Cardinality({m \in st.made : m.p = p})],
+   named |-> {[p |-> m.p, n |-> m.n, k |-> m.k, v |-> m.v] : m \in {x \in st.made : x.n # None}},
+   gone |-> st.gone]
 View(f) == ViewOf(Replay(f).st)
 
 \* Operation sh staged afresh on st: what a serial run commits.
 Fresh(sh, st) ==
   LET rd == [e \in sh.rd |-> st.ver[e]] IN
   [id |-> None, rd |-> rd, ird |-> rd, wr |-> sh.wr, cr |-> sh.cr, cid |-> 0,
-   wv |-> [e \in sh.wr |-> st.ver[e]]]
+   wv |-> [e \in sh.wr |-> st.ver[e]], nm |-> NamedOn(sh, st)]
 
 AllDone == \A w \in Writers : ws[w].pc = "idle" /\ ws[w].k > Len(Shapes[w])
 

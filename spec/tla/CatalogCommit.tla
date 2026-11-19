@@ -92,7 +92,9 @@ ASSUME /\ FaultKinds \subseteq WriteFaults \cup ReadFaults \cup PutFaults
                           "pageown", "rootfirst", "sweepstale",
                           "lengthonly", "notrailer", "probeinc",
                           "compactbase", "compactresend", "compactfail",
-                          "compactcopyafter", "compactreplaced"}
+                          "compactcopyafter", "compactreplaced",
+                          "viewnotable", "tablenoview", "viewdropnoremovals", "viewnobump", "viewstale",
+                          "absentonly", "noabsence", "dropnobump", "renamenobump"}
        /\ TailReads \in BOOLEAN
        /\ CompactAfter \in BOOLEAN
        /\ CompactResends \in Nat
@@ -431,7 +433,8 @@ NextWrite(w) ==
 \* (CatalogMutation), as w's n-th commit. Its id is minted after the floor
 \* of R (UuidV7.newUuidV7After; not with Bug 64c; with "mintH", after its
 \* horizon, as before paging). With Bug 16 the record carries the
-\* preconditions of the entities it writes, not of those it only reads.
+\* preconditions of the entities it writes, not of those it only reads. A
+\* named action is staged as RSM's NamedOn.
 Stage(w, sh, R, n) ==
   LET ts  == IF Has("64c") THEN Clock(w)
              ELSE Max(Clock(w), (IF Has("mintH") THEN R.H ELSE R.F) + 1)
@@ -439,7 +442,7 @@ Stage(w, sh, R, n) ==
   IN [id |-> [w |-> w, n |-> n, ts |-> ts],
       rd |-> IF Has("16") THEN [e \in sh.wr |-> R.st.ver[e]] ELSE ird,
       ird |-> ird, wr |-> sh.wr, cr |-> sh.cr, wv |-> [e \in sh.wr |-> R.st.ver[e]],
-      cid |-> IF Has("10") /\ sh.cr # None THEN R.st.next ELSE 0]
+      cid |-> IF Has("10") /\ sh.cr # None THEN R.st.next ELSE 0, nm |-> NamedOn(sh, R.st)]
 
 Staged(s, R, r) ==
   [s EXCEPT !.txn = r, !.snap = R, !.base = R,
@@ -460,7 +463,9 @@ MayPreempt ==
        [] OTHER -> FALSE
 
 \* Stage the next operation on a read of the catalog. In the fuzzers'
-\* schedules, between operations (race: A first, the rest after it).
+\* schedules, between operations (race: A first, the rest after it). A named
+\* action the read refuses (RSM's Refused: AlreadyExistsException,
+\* NoSuchViewException, NamespaceNotEmptyException) ends with no commit.
 Begin(w) ==
   LET s == ws[w] IN
   /\ s.pc = "idle" /\ s.k <= Len(Shapes[w])
@@ -468,8 +473,9 @@ Begin(w) ==
   /\ Sched = "race" => (w = 1 \/ ws[1].k > Len(Shapes[1]))
   /\ \E R \in WholeReads(None) :
        /\ ~R.err
-       /\ ws' = [ws EXCEPT ![w] = [Staged(s, R, Stage(w, Shapes[w][s.k], R, s.n))
-                                      EXCEPT !.pc = "staged"]]
+       /\ ws' = [ws EXCEPT ![w] =
+                    IF Refused(Shapes[w][s.k], R.st) THEN Idle(s.k + 1, s.n)
+                    ELSE [Staged(s, R, Stage(w, Shapes[w][s.k], R, s.n)) EXCEPT !.pc = "staged"]]
   /\ UNCHANGED <<file, inflight, now, nf, ended, res, ook, sched>>
   /\ UNCHANGED PageVars
 
@@ -899,6 +905,10 @@ StampsCount == CountsChanges(LiveR.st)
 
 \* No id names two entities (S4 in FileIOCatalog.tla; Bug 10).
 UniqueIds == \A m1, m2 \in LiveR.st.made : m1.id = m2.id => m1 = m2
+
+\* I13: a namespace's tables and views hold distinct names, none in a
+\* namespace dropped (RSM's WellNamedSt).
+WellNamed == WellNamedSt(LiveR.st)
 
 \* Honest outcomes: a commit reported committed applied, and stays applied
 \* (through compaction and GC); one reported failed (or any error but

@@ -53,7 +53,9 @@ ASSUME /\ FaultKinds \subseteq WriteFaults \cup ReadFaults \cup PutFaults
        /\ Bugs \subseteq {"ckclock", "setonly", "trimearly", "noverify", "freshid", "p3",
                           "dup", "lagread", "basever",
                           "floorgap", "nodigest", "absentpage", "sweepabove", "mintH",
-                          "missingfail", "nojoint"}
+                          "missingfail", "nojoint",
+                          "viewnotable", "tablenoview", "viewdropnoremovals", "viewnobump", "viewstale",
+                          "absentonly", "noabsence", "dropnobump", "renamenobump"}
 
 VARIABLES
   log,       \* every record appended, in order (the trimmed ones too)
@@ -198,17 +200,20 @@ Stage(w, sh, R, n) ==
   LET rd == [e \in sh.rd |-> R.st.ver[e]] IN
   [id |-> [w |-> w, n |-> n, ts |-> Max(Clock(w), MintAfter(R) + 1), k |-> 0],
    rd |-> rd, ird |-> rd, wr |-> sh.wr, cr |-> sh.cr, cid |-> 0,
-   wv |-> [e \in sh.wr |-> R.st.ver[e]]]
+   wv |-> [e \in sh.wr |-> R.st.ver[e]], nm |-> NamedOn(sh, R.st)]
 
 \* Stage the next transaction on a read of the log, from any usable
-\* checkpoint. A read that lags misses records that have landed: a race.
+\* checkpoint. A read that lags misses records that have landed: a race. A
+\* named action the read refuses (RSM's Refused) ends with no commit.
 Begin(w) ==
   LET s == ws[w] IN
   /\ s.pc = "idle" /\ s.k <= Len(Shapes[w])
   /\ \E c \in Usable : \E q \in Ends(c) :
        LET R == ReadFrom(c, q, None) IN
-       ws' = [ws EXCEPT ![w] = [s EXCEPT !.pc = "send", !.txn = Stage(w, Shapes[w][s.k], R, s.n),
-                                         !.base = q, !.ci = q < Len(log), !.lg = q < Len(log)]]
+       ws' = [ws EXCEPT ![w] =
+                IF Refused(Shapes[w][s.k], R.st) THEN Idle(s.k + 1, s.n)
+                ELSE [s EXCEPT !.pc = "send", !.txn = Stage(w, Shapes[w][s.k], R, s.n),
+                               !.base = q, !.ci = q < Len(log), !.lg = q < Len(log)]]
   /\ UNCHANGED <<log, ckpts, trimmed, inflight, now, nf, comp, ended, ook>>
   /\ UNCHANGED PageVars
 
@@ -486,6 +491,10 @@ StampsCount == CountsChanges(Full.st)
 
 \* No id names two entities.
 UniqueIds == \A m1, m2 \in Full.st.made : m1.id = m2.id => m1 = m2
+
+\* I13: a namespace's tables and views hold distinct names, none in a
+\* namespace dropped (RSM's WellNamedSt).
+WellNamed == WellNamedSt(Full.st)
 
 \* Honest outcomes (I10): a commit reported committed applied, and stays
 \* applied (through GC, checkpoints and trims); one reported failed (or any
