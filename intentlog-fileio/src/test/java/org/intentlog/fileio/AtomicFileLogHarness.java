@@ -269,6 +269,47 @@ public final class AtomicFileLogHarness implements LogHarness {
     }
   }
 
+  @Override
+  public boolean tracksTails() {
+    return true;
+  }
+
+  /**
+   * The version the store held whose frames, through the tail's length, end in a trailer of the
+   * tail's incarnation (its position: the incarnation and the length, little-endian), cut there.
+   * Appends only extend a version, so every version of one incarnation that long agrees there.
+   */
+  @Override
+  public LogView viewAt(LogTail tail) {
+    byte[] at = tail.position();
+    if (at == null || at.length != 2 * Long.BYTES) {
+      return null;
+    }
+    long incarnation = littleEndian(at, 0);
+    long length = littleEndian(at, Long.BYTES);
+    for (InMemoryAtomicFileIO.Write write : io.history()) {
+      if (!write.location().equals(reads.location)) {
+        continue;
+      }
+      for (byte[] version : Arrays.asList(write.before(), write.after())) {
+        if (version != null && length <= version.length
+            && frameEnds(version).contains((int) length)
+            && littleEndian(version, (int) length - AtomicFileLog.TRAILER_SIZE) == incarnation) {
+          return AtomicFileLog.decode(Arrays.copyOf(version, (int) length));
+        }
+      }
+    }
+    return null;
+  }
+
+  private static long littleEndian(byte[] bytes, int at) {
+    long value = 0;
+    for (int i = Long.BYTES - 1; i >= 0; i--) {
+      value = (value << 8) | (bytes[at + i] & 0xFFL);
+    }
+    return value;
+  }
+
   /**
    * Whether {@code view} is a state the log held: some version's checkpoint, and a prefix of its
    * records (a read may return any prefix, P1). Every version the store held is in its history.

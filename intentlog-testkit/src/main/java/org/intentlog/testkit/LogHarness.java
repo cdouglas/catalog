@@ -20,6 +20,8 @@ package org.intentlog.testkit;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import org.intentlog.LogTail;
 import org.intentlog.LogView;
 import org.intentlog.SharedLog;
 
@@ -147,5 +149,46 @@ public interface LogHarness {
    */
   default boolean held(LogView view) {
     return true;
+  }
+
+  /**
+   * Whether {@link #viewAt} can say what the log held at a tail; false by default, for a harness
+   * that cannot.
+   */
+  default boolean tracksTails() {
+    return false;
+  }
+
+  /**
+   * The log as it stood when a read or write ended at {@code tail}: a checkpoint the log stored
+   * at or before it and the records after that through it, read without faults; null if the log
+   * never ended there, or if the tail names no position ({@link LogTail#position}). Any checkpoint
+   * at or before the tail will do, since each is the replay of the log through its position (I11).
+   * The oracle that a replica is the log through its tail, a fold of records alone included, which
+   * keeps no view for {@link #held} (the gap plan's 2.3). Only where {@link #tracksTails} says so.
+   */
+  default LogView viewAt(LogTail tail) {
+    return null;
+  }
+
+  /** A view of {@code checkpoint} (null for none) and {@code records}, ending at {@code tail}. */
+  static LogView view(byte[] checkpoint, List<byte[]> records, LogTail tail) {
+    List<byte[]> held = List.copyOf(records);
+    return new LogView() {
+      @Override
+      public LogTail tail() {
+        return tail;
+      }
+
+      @Override
+      public Optional<byte[]> checkpoint() {
+        return Optional.ofNullable(checkpoint);
+      }
+
+      @Override
+      public List<byte[]> records() {
+        return held;
+      }
+    };
   }
 }

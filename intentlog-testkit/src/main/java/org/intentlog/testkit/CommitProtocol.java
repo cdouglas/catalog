@@ -28,6 +28,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Random;
 import java.util.Set;
 import java.util.TreeSet;
@@ -50,6 +51,7 @@ import org.intentlog.LogRuntime;
 import org.intentlog.LogView;
 import org.intentlog.PageStore;
 import org.intentlog.PagedOutException;
+import org.intentlog.Replay;
 import org.intentlog.Replica;
 import org.intentlog.RuntimeConfig;
 import org.intentlog.testkit.EntityVersionsMachine.Builder;
@@ -496,6 +498,9 @@ public final class CommitProtocol {
     Replica<State> snapshot; // null when idle
     long snapshotWrites;
     Txn txn;
+    // The replica its last commit returned, which its next transaction may be staged on (as a
+    // catalog's handle holds the replica its commit landed in), or read on from; null if none
+    Replica<State> last;
 
     Writer(int id) {
       this.id = id;
@@ -577,6 +582,9 @@ public final class CommitProtocol {
     private PagePlan pagePlan = PagePlan.NONE;
     // Whether a page read outside a commit met a fault
     private boolean pageReadFaulted = false;
+    // The fault the first read of a transaction's base meets, when the base is read on from the
+    // replica its writer's last commit returned (outside a commit: no context plans it)
+    private ReadFault baseReadFault = ReadFault.NONE;
     private int splitCount = 0;
     // The latest clock any compaction, split or commit ran on: no block above it less A is sealed
     private long sealingClock = Long.MIN_VALUE;
@@ -650,7 +658,12 @@ public final class CommitProtocol {
     public ReadFault beforeRead() {
       Context c = commits.peek();
       if (c == null || !c.active) {
-        return ReadFault.NONE;
+        ReadFault fault = baseReadFault;
+        baseReadFault = ReadFault.NONE;
+        if (fault != ReadFault.NONE) {
+          trace.append("    the base's read: ").append(fault).append('\n');
+        }
+        return fault;
       }
       request(c);
       int read = c.reads++;
@@ -794,14 +807,84 @@ public final class CommitProtocol {
       drain();
     }
 
+    /**
+     * Stages a transaction: on a fresh read, or, if the writer's last commit returned a replica, on
+     * that replica as it is, a read with it as the floor, or a refresh of it (the gap plan's 2.3),
+     * as a catalog's handles stage on the replica they hold and read on from it. {@code c} picks
+     * the base: a fresh read (0-7), the replica (8-11), a read on from it (12-13), a refresh of it
+     * (14-15); {@code d}, in a run with faults, what the first read of one read on from it meets:
+     * nothing (0-7), a stale read (8-11), a gap (12-15).
+     */
     private void begin(Writer w, Cmd cmd) {
-      w.snapshot = runtime.read();
-      checkHeld(w.snapshot, "a read");
-      w.snapshotWrites = harness.landedWrites();
+      long writes = harness.landedWrites();
+      Replica<State> last = w.last;
+      String base;
+      if (last == null || cmd.c < 8) {
+        base = "a fresh read";
+        w.snapshot = runtime.read();
+        checkReplica(w.snapshot, "a read");
+      } else if (cmd.c < 12) {
+        base = "its last commit's replica";
+        w.snapshot = last;
+      } else {
+        boolean floor = cmd.c < 14;
+        base = floor ? "a read on from its last commit's" : "a refresh of its last commit's";
+        ReadFault fault = !settings.faults || cmd.d < 8 ? ReadFault.NONE
+            : cmd.d < 12 ? ReadFault.STALE : ReadFault.GAP;
+        w.snapshot = readOn(last, floor, fault);
+      }
+      Statistics.label("transactions staged on").collect(base);
+      // Raced from the start if the log moved since its base was read: a fresh read ends elsewhere
+      if (last == null || cmd.c < 8) {
+        w.snapshotWrites = writes;
+      } else {
+        byte[] live = runtime.read().tail().position();
+        w.snapshotWrites = live != null && Arrays.equals(live, w.snapshot.tail().position())
+            ? writes : -1;
+      }
       String tag = "w" + w.id + "." + w.commits++;
       w.txn = Txn.on(w.snapshot.state(), tag, subset(cmd.a), subset(cmd.b));
       txns.put(tag, w.txn);
-      trace.append(String.format("w%d begin %s on %s%n", w.id, w.txn, w.snapshot.state()));
+      trace.append(String.format("w%d begin %s on %s (%s)%n", w.id, w.txn, w.snapshot.state(),
+          base));
+    }
+
+    /**
+     * {@code prior} read on from: a read with it as the floor ({@code floor}), or a refresh of it,
+     * whose first read meets {@code fault}. The replica is checked as any read's, and must not be
+     * behind prior: it applied what prior did, and on a log that cannot replace itself its tail
+     * continues prior's (Bug 72's monotonic reads; {@code LogRuntime.newer}). A read the fault made
+     * fail (a gap the fold refuses) falls back to a fresh read, as a catalog's would.
+     */
+    private Replica<State> readOn(Replica<State> prior, boolean floor, ReadFault fault) {
+      String what = floor ? "a read with a floor" : "a refresh";
+      Replica<State> read;
+      baseReadFault = fault;
+      try {
+        read = floor ? runtime.read(prior) : runtime.refresh(prior);
+      } catch (RuntimeException e) {
+        if (fault == ReadFault.NONE) {
+          throw new AssertionError(what + " failed without a fault\ntrace:\n" + trace, e);
+        }
+        trace.append("    ").append(what).append(" failed (").append(e).append("), read afresh\n");
+        Statistics.label("reads on after a fault").collect("failed: read afresh");
+        read = runtime.read();
+        checkReplica(read, "a read");
+        return read;
+      } finally {
+        baseReadFault = ReadFault.NONE;
+      }
+      if (fault != ReadFault.NONE) {
+        Statistics.label("reads on after a fault").collect(fault + ": read on");
+      }
+      checkReplica(read, what);
+      List<String> before = prior.state().history();
+      List<String> after = read.state().history();
+      check(after.size() >= before.size() && after.subList(0, before.size()).equals(before),
+          "%s went back: %s, after %s", what, after, before);
+      check(harness.log().capabilities().fusedReplace() || read.tail().continues(prior.tail()),
+          "%s returned a replica behind the one it read on from", what);
+      return read;
     }
 
     private static Set<String> subset(int bits) {
@@ -881,9 +964,10 @@ public final class CommitProtocol {
       // The ms of the commit's id, which the runtime mints from its writer's clock just above the
       // floor of the replica it commits on (UuidV7.newUuidV7After)
       long idMs = Math.max(stamp, w.snapshot.committed().floor() + 1);
+      Replica<State> landed = null;
       try {
         ctx.active = true;
-        checkHeld((top ? runtime : racer).commit(w.snapshot, txn), "a commit");
+        landed = (top ? runtime : racer).commit(w.snapshot, txn);
         outcome = Outcome.COMMITTED;
       } catch (CommitRejectedException e) {
         outcome = Outcome.REJECTED;
@@ -906,6 +990,15 @@ public final class CommitProtocol {
       }
       w.snapshot = null;
       w.txn = null;
+      if (landed != null) {
+        // The replica its record landed in (LOG.md, "The commit loop"): the log through its tail,
+        // which applied the transaction once; the writer's next may be staged on it
+        checkReplica(landed, "a commit");
+        long applied = landed.state().history().stream().filter(txn.tag()::equals).count();
+        check(applied == 1, "%s committed, and returned a replica that applied it %d times",
+            txn.tag(), applied);
+        w.last = landed;
+      }
       outcomes.put(txn.tag(), outcome);
       trace.append(String.format("w%d %s -> %s%s%n", w.id, txn.tag(), outcome, reason));
       Statistics.label("outcome").collect(outcome + (ctx.faulted ? " after a fault" : ""));
@@ -1525,12 +1618,38 @@ public final class CommitProtocol {
     /**
      * The oracle that no replica holds a state the log never held (docs/TAIL_READS.md "Testing"):
      * the view {@code replica} was replayed from, if it keeps one, is a checkpoint the log stored
-     * and the records after its position, none missing and none another log's.
+     * and the records after its position, none missing and none another log's. And, where the
+     * harness can say what the log held at a tail ({@link LogHarness#viewAt}), the replica is the
+     * log through its tail: the replay of that view has its state, committed set and log id (the
+     * gap plan's 2.3). A fold of records alone keeps no view, so only this sees one gone wrong, or a
+     * replica of another tail than its own.
      */
-    private void checkHeld(Replica<State> replica, String what) {
+    private void checkReplica(Replica<State> replica, String what) {
       LogView view = replica.view();
       check(view == null || harness.held(view), "%s returned a replica of a state the log never"
           + " held: %d records after a checkpoint", what, view == null ? 0 : view.records().size());
+      if (!harness.tracksTails()) {
+        return;
+      }
+      if (replica.tail().position() == null) {
+        Statistics.label("replicas against the log through their tails").collect("no position");
+        return;
+      }
+      LogView at = harness.viewAt(replica.tail());
+      check(at != null, "%s returned a replica at a tail the log never had: %s", what,
+          replica.state());
+      Replay.Result<Builder> replayed = Replay.replay(
+          EntityVersionsMachine.INSTANCE, at.checkpoint().orElse(null), at.records(), null);
+      State state = replayed.builder().build();
+      check(state.equals(replica.state())
+              && Arrays.equals(replayed.committed().build().bytes(), replica.committed().bytes())
+              && Objects.equals(replayed.logId(), replica.logId()),
+          "%s returned a replica that is not the log through its tail:%n  replica %s, floor %d,"
+              + " %d inline ids%n  the log    %s, floor %d, %d inline ids", what, replica.state(),
+          replica.committed().floor(), replica.committed().ids().size(), state,
+          replayed.committed().build().floor(), replayed.committed().build().ids().size());
+      Statistics.label("replicas against the log through their tails")
+          .collect(view == null ? "a fold" : "a replay of a view");
     }
 
     private void check(boolean condition, String format, Object... args) {

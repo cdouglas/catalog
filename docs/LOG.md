@@ -1128,7 +1128,14 @@ trimmed ones included, for oracles to replay.
   every delayed append has landed, the whole run: each outcome again, no
   commit applied twice, the state as the serial execution of what applied,
   and every checkpoint as the replay of the log through it; and every replica
-  a read or a commit returns as a state the log held (`LogHarness.held`).
+  a read or a commit returns as a state the log held (`LogHarness.held`)
+  and, where the harness says what the log held at a tail
+  (`LogHarness.viewAt`: the memory log, one object), as the replay of the
+  log through its tail, a fold of records alone included; a commit's as
+  holding its transaction once. A writer's next transaction is staged on a
+  fresh read, or on the replica its last commit returned, as it is, read on
+  from with it as the floor, or refreshed, as a catalog's handles do; a read
+  on from a replica, stale or served with a gap, is never behind it.
   `TestMemoryCommitProtocol` and `TestAtomicFileCommitProtocol` run it. Each
   of the shared-log model's bug switches, put back in `LogRuntime`, fails it
   on the memory log.

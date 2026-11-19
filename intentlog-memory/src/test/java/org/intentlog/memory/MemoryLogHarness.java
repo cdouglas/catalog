@@ -25,8 +25,10 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import org.intentlog.CommittedSet;
 import org.intentlog.Intention;
+import org.intentlog.LogTail;
 import org.intentlog.LogView;
 import org.intentlog.Replay;
 import org.intentlog.SharedLog;
@@ -231,5 +233,31 @@ public final class MemoryLogHarness implements LogHarness {
       }
     }
     return true;
+  }
+
+  @Override
+  public boolean tracksTails() {
+    return true;
+  }
+
+  /**
+   * The newest checkpoint stored at or before the tail's position (the number of records through
+   * it), trimmed ones included, and the records after it through the tail.
+   */
+  @Override
+  public LogView viewAt(LogTail tail) {
+    byte[] at = tail.position();
+    if (at == null || at.length != Long.BYTES) {
+      return null;
+    }
+    long position = ByteBuffer.wrap(at).getLong();
+    List<byte[]> records = log.records();
+    if (position < 0 || position > records.size()) {
+      return null;
+    }
+    Map.Entry<Long, byte[]> checkpoint = new TreeMap<>(log.checkpoints()).floorEntry(position);
+    int from = checkpoint == null ? 0 : checkpoint.getKey().intValue();
+    return LogHarness.view(checkpoint == null ? null : checkpoint.getValue(),
+        records.subList(from, (int) position), tail);
   }
 }
