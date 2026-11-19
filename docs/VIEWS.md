@@ -6,7 +6,9 @@ set `fuzz/mutants/views.sh` ([Testing](#testing)), and the TLA+ models' tables a
 (spec/tla/README.md "Tables and views"). Designed 2026-11-18, its open questions settled by the
 user the same day ([Decisions on the open questions](#decisions-on-the-open-questions)); M1 is
 measured ([Sizes](#sizes)). Stage 2, views in catalog transactions
-([Stage 2](#stage-2-views-in-catalog-transactions)), is not started.
+([Stage 2](#stage-2-views-in-catalog-transactions)), is built (2026-11-19): the API on the fork's
+`core-perf`, `atomicio` restacked onto it, FileIOCatalog's staging. catalog-bench has the view
+operations and E7's tree (M2), not yet run.
 
 ## Summary
 
@@ -351,7 +353,7 @@ and a view's metadata carries its own uuid. What Batavia could add, outside Iceb
 1. **Views in catalog transactions** (stage 2). A view and the tables it reads change
    atomically: create a table and the view over it, or swap a view to a new table, in one
    record.
-   - JDBC can do the same in one database transaction.
+   - JDBC does the same in one database transaction.
    - REST cannot: its `CommitTransactionRequest` carries table changes only.
    - This is also what puts E7's whole tree, views included, in one transaction.
 2. **Dependency records** (errata D27). A view version binds each table it reads, by id or by
@@ -436,29 +438,39 @@ and a view's metadata carries its own uuid. What Batavia could add, outside Iceb
 
 ## Stage 2: views in catalog transactions
 
-- **Where the API change goes.** On the fork's `core-perf`, where the transaction API lives:
+- **Where the API is.** On the fork's `core-perf` (20f42d53b4), where the transaction API lives:
   `SupportsCatalogTransactions`, `CatalogTransaction`, `CatalogCommit`, `BaseCatalogTransaction`,
-  with JDBC's and REST's implementations. The baselines run core-perf, and JDBC implements the
-  API, so the change belongs there and not on `atomicio`, which holds the atomic storage
-  operations and sits on core-perf.
-- **API.** `CatalogCommit` gains `ViewChange`s (create, replace, drop, rename), and
-  `CatalogTransaction` a view catalog to stage them through.
+  with JDBC's and REST's implementations. `atomicio` sits on it (restacked; its head before is
+  tag `atomicio-pre-views-txn`).
+- **API.** `CatalogCommit` carries `viewChanges` (`ViewChange`: the view's version as the
+  transaction read it, its metadata after the transaction, its new name, or its drop) and
+  `createdViews`. A commit applies the drops, then the updates, then the renames, then the
+  creates, of tables and views alike. Each view change applies only to the view at the version
+  read (V6). `CatalogTransaction.asViewCatalog()` stages them; `asCatalog()` is a `ViewCatalog`
+  too where the catalog has views.
 - **Implementations.**
-  - `BaseCatalogTransaction` stages view changes as it stages table creates and drops, and its
-    staging of a namespace's drop counts the namespace's views as children. Today it counts
-    only tables and namespaces, so a transaction that drops a namespace holding a view stages
-    the drop, and its commit throws `NamespaceNotEmptyException` with nothing applied
+  - `BaseCatalogTransaction` stages a view's create and replace through the catalog's own
+    builder (`BaseMetastoreViewCatalog.buildView(identifier, ops)`, so its default location and
+    view properties apply), and its property and location changes, renames and drops. A
+    staged table or view keeps its name from the other kind. A namespace's drop counts its
+    views; a view created after the transaction staged the drop fails the commit
     (`TestCatalogRegressions$Views`).
-  - JDBC commits them in its one database transaction, on the V1 schema.
+  - JDBC commits them in its one database transaction, on the V1 schema. It writes each view's
+    next metadata file first, and deletes a dropped view's metadata once the commit lands, as
+    `dropView` does.
   - `RESTCatalog`'s transaction throws, since its request has no view changes.
   - FileIOCatalog stages `CreateView`, `UpdateView`, `DropView` and `RenameView` into the
-    transaction's record.
-- **Cost of the change.**
-  - It restacks `atomicio` onto the new `core-perf`, with a tag for its old head.
-  - Both are republished, and rmow-bench builds on `atomicio`, so the publish waits for its
-    campaigns.
-  - The baselines' classpath digest changes, so their packs age again. It should land before
-    the package that catalog-bench's O1 campaign runs, or wait until after O1.
+    transaction's record (`LogCatalog.stageViewChanges`). Each view must be at the version the
+    transaction read. A drop treats files as `dropView` does (V9). An update or create goes
+    inline or to a metadata file, as a view's commit sends it. A view's create or rename takes
+    no name the state before the record holds, though the transaction frees it, and a table
+    takes no name a view held there (errata D29 (txn takes no freed name)).
+- **Tests.** `CatalogTransactionTests` gains view cases. JDBC runs them on V1, REST its refusal,
+  and FileIOCatalog runs them in every `LocalCatalogMode` (`takesNamesItFreesAcrossKinds` false:
+  D29 (txn takes no freed name)). The fuzzers' transactions stage no view changes yet (errata T8
+  (fuzzer transactions lack views)).
+- **Cost.** The baselines' classpath digest changed with `core-perf`, so their packs age again.
+  No table commit path changed.
 
 ## Measurement
 
@@ -487,8 +499,8 @@ and a view's metadata carries its own uuid. What Batavia could add, outside Iceb
 | 3 | Catalog API, view operations, table-side checks; `ViewCatalogTests` green in every mode | 1.5 days |
 | 4 | N1, multi-writer, fault and race fuzzers, regressions, `views.sh` calibrated | 2 days |
 | 5 | Merge onto main (2026-11-19); a sharded havoc round and the `views` and `creates` calibrations on the merged head | |
-| 6 | catalog-bench's view operations, with E7's tree (G5) | 1 day |
-| 7 | Stage 2: `ViewChange` on the fork's `core-perf`, with `BaseCatalogTransaction`'s, JDBC's and FileIOCatalog's implementations; restack and republish | 2 days |
+| 6 | catalog-bench's view operations, with E7's tree (G5): done 2026-11-19 (catalog-bench 446e321..3ec4ac0) | 1 day |
+| 7 | Stage 2: `ViewChange` on the fork's `core-perf`, with `BaseCatalogTransaction`'s, JDBC's and FileIOCatalog's implementations; restack and republish: done 2026-11-19 | 2 days |
 
 ## Decisions on the open questions
 

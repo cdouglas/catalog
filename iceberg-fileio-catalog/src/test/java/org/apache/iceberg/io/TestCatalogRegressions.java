@@ -1307,15 +1307,16 @@ public class TestCatalogRegressions {
     }
 
     /**
-     * A catalog transaction drops a namespace's tables, then the namespace, which holds a view. A
-     * transaction stages no view changes (VIEWS.md stage 2), and its staging of the drop counts
-     * only tables and namespaces (the fork's {@code BaseCatalogTransaction}), so the commit finds
-     * the namespace not empty, and nothing applies. Found by the fault fuzzer's calibration
-     * (views-cal-views, unmutated), whose model counted the view only outside a transaction.
+     * A catalog transaction drops a namespace's tables, then the namespace, which holds a view: its
+     * staging of the drop counts the namespace's views (the fork's {@code BaseCatalogTransaction})
+     * and refuses it. A view created after the transaction staged the drop fails its commit, and
+     * nothing applies. Found by the fault fuzzer's calibration (views-cal-views, unmutated), whose
+     * model counted the view only outside a transaction; before stage 2 (VIEWS.md), only the commit
+     * refused the drop.
      */
     @ParameterizedTest
     @EnumSource(names = {"APPEND", "CAS", "MEMLOG", "AZLOG"})
-    void aTransactionsDropOfANamespaceWithAViewFailsAtItsCommit(LocalCatalogMode mode) {
+    void aTransactionsDropOfANamespaceWithAViewFails(LocalCatalogMode mode) {
       LogCatalog catalog = mode.catalog(io, WAREHOUSE, "c", Map.of());
       catalog.createNamespace(ns);
       TableIdentifier t = TableIdentifier.of(ns, "t");
@@ -1324,9 +1325,19 @@ public class TestCatalogRegressions {
 
       CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
       assertThat(txn.asCatalog().dropTable(t, true)).isTrue();
-      assertThat(((org.apache.iceberg.catalog.SupportsNamespaces) txn.asCatalog())
+      assertThatThrownBy(() -> ((org.apache.iceberg.catalog.SupportsNamespaces) txn.asCatalog())
+          .dropNamespace(ns)).isInstanceOf(NamespaceNotEmptyException.class);
+
+      // a view created after the transaction staged the drop: the commit refuses it
+      assertThat(catalog.dropView(v)).isTrue();
+      CatalogTransaction raced =
+          catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      assertThat(raced.asCatalog().dropTable(t, true)).isTrue();
+      assertThat(((org.apache.iceberg.catalog.SupportsNamespaces) raced.asCatalog())
           .dropNamespace(ns)).isTrue();
-      assertThatThrownBy(txn::commitTransaction).isInstanceOf(NamespaceNotEmptyException.class);
+      createView(catalog, v, "select 2", Map.of());
+      assertThatThrownBy(raced::commitTransaction)
+          .isInstanceOf(NamespaceNotEmptyException.class);
 
       LogCatalog reader = mode.catalog(io, WAREHOUSE, "c", Map.of());
       assertThat(reader.namespaceExists(ns)).isTrue();
@@ -1424,6 +1435,40 @@ public class TestCatalogRegressions {
       assertThat(registered.sqlFor("spark").sql()).isEqualTo("select 1");
       assertThat(registered.versions()).isEqualTo(kept.versions());
       assertThat(stored(catalog)).isEqualTo("file");
+    }
+
+    /**
+     * A catalog transaction's view drop does what {@code dropView} does (VIEWS.md V9, stage 2): a
+     * pointer view's metadata file is deleted once the transaction lands, not before; an inline view
+     * with {@code gc.enabled} false is written to a file first, which {@code registerView} brings
+     * back.
+     */
+    @Test
+    void aTransactionsViewDropTreatsItsFilesAsDropViewDoes() {
+      LogCatalog pointer = LocalCatalogMode.CAS.catalog(io, WAREHOUSE, "c", Map.of());
+      pointer.createNamespace(ns);
+      String file = metadata(createView(pointer, v, "select 1", Map.of())).metadataFileLocation();
+      CatalogTransaction txn =
+          pointer.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      assertThat(txn.asViewCatalog().dropView(v)).isTrue();
+      assertThat(io.newInputFile(file).exists()).as("kept until the drop lands").isTrue();
+      txn.commitTransaction();
+      assertThat(pointer.viewExists(v)).isFalse();
+      assertThat(io.newInputFile(file).exists()).as("deleted: the drop landed").isFalse();
+
+      LogCatalog inline = LocalCatalogMode.CAS_TM.catalog(io, WAREHOUSE, "c", Map.of());
+      TableIdentifier keptId = TableIdentifier.of(ns, "kept");
+      org.apache.iceberg.view.View kept = createView(inline, keptId, "select 2",
+          Map.of(org.apache.iceberg.TableProperties.GC_ENABLED, "false"));
+      CatalogTransaction keeping =
+          inline.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      assertThat(keeping.asViewCatalog().dropView(keptId)).isTrue();
+      keeping.commitTransaction();
+      List<String> files = new ArrayList<>();
+      io.listPrefix(kept.location() + "/metadata/").forEach(info -> files.add(info.location()));
+      assertThat(files).hasSize(1);
+      assertThat(inline.registerView(keptId, files.get(0)).sqlFor("spark").sql())
+          .isEqualTo("select 2");
     }
 
     /**

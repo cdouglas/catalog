@@ -96,6 +96,14 @@ public class TestLocalCatalogTransaction {
       return true;
     }
 
+    @Override
+    protected boolean takesNamesItFreesAcrossKinds() {
+      // a view's create or rename takes no name the state before the record holds, nor a table
+      // a name a view holds there, though the transaction frees it (errata D29 (txn takes no
+      // freed name))
+      return false;
+    }
+
     /**
      * A transaction's snapshot changes to an inline table are judged where its record lands
      * (errata D12): a snapshot isolation transaction's appends to two inline-ML tables, one of

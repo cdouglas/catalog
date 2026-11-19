@@ -58,6 +58,7 @@ import org.apache.iceberg.catalog.TableChange;
 import org.apache.iceberg.catalog.TableCommit;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.catalog.TableRead;
+import org.apache.iceberg.catalog.ViewChange;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
@@ -2898,8 +2899,10 @@ public class LogCatalog extends BaseMetastoreViewCatalog
     final CatalogMutation newCatalog = mutation(current);
     // The tables dropped with purge, each with the version it drops and its history (Bug 96)
     Map<TableIdentifier, TableMetadata> purged = new HashMap<>();
+    // The pointer views dropped, whose metadata files go once the drop lands (VIEWS.md V9)
+    Map<TableIdentifier, ViewMetadata> droppedViews = new HashMap<>();
     try {
-      if (!stageTransaction(commit, current, newCatalog, purged)) {
+      if (!stageTransaction(commit, current, newCatalog, purged, droppedViews)) {
         return;
       }
       newCatalog.commit(log);
@@ -2910,19 +2913,29 @@ public class LogCatalog extends BaseMetastoreViewCatalog
 
     // The commit landed: a purge that cannot read or delete a file logs it (Bug 96)
     purged.forEach(this::purge);
+    droppedViews.forEach((view, metadata) -> {
+      try {
+        CatalogUtil.dropViewMetadata(io, metadata);
+      } catch (RuntimeException e) {
+        // the drop has landed: work after it does not change its outcome (design.md I10)
+        LOG.warn("Dropped view {}, but could not delete its metadata file", view, e);
+      }
+    });
   }
 
   /**
    * Stages {@code commit} on {@code newCatalog}, a transaction on {@code current}, as {@link
    * #commitTransaction} commits it, writing ahead of its record what goes to files ({@link
-   * CatalogMutation#wroteAhead}); adds the tables it drops with purge to {@code purged}. Returns
-   * false, staging nothing, if it has no changes, once its reads are checked.
+   * CatalogMutation#wroteAhead}); adds the tables it drops with purge to {@code purged}, and the
+   * pointer views it drops to {@code droppedViews}. Returns false, staging nothing, if it has no
+   * changes, once its reads are checked.
    */
   private boolean stageTransaction(
       CatalogCommit commit,
       Replica<CatalogState> current,
       CatalogMutation newCatalog,
-      Map<TableIdentifier, TableMetadata> purged) {
+      Map<TableIdentifier, TableMetadata> purged,
+      Map<TableIdentifier, ViewMetadata> droppedViews) {
     boolean witness = LogCatalogProperties.txnReadWitness(catalogProperties);
 
     for (TableRead read : commit.reads()) {
@@ -3032,6 +3045,8 @@ public class LogCatalog extends BaseMetastoreViewCatalog
           .accept(newCatalog);
     }
 
+    stageViewChanges(commit, current, newCatalog, droppedViews);
+
     for (NamespaceChange change : commit.namespaceChanges()) {
       if (change.kind() == NamespaceChange.Kind.DROP) {
         newCatalog.dropNamespace(change.namespace());
@@ -3057,6 +3072,61 @@ public class LogCatalog extends BaseMetastoreViewCatalog
       keptVersion(tableId, current, newCatalog::wroteAhead);
     }
     return true;
+  }
+
+  /**
+   * Stages a catalog transaction's view changes on {@code newCatalog} (VIEWS.md "Stage 2"): each
+   * applies only to the view at the version the transaction read, which must be the view {@code
+   * current} has (a view's metadata is replaced whole, V6), and the record holds it until it lands.
+   * A drop of an inline view whose {@code gc.enabled} is false writes it to a file first, as {@link
+   * #dropView} does; a pointer view's file is deleted once the drop lands ({@code droppedViews}).
+   * An update and a create go inline, or to a metadata file written ahead, as a view's commit
+   * sends them. A view's create or rename takes no name the state before the record holds, nor a
+   * table a name a view holds there, though the transaction frees it (errata D29 (txn takes no
+   * freed name)).
+   */
+  private void stageViewChanges(
+      CatalogCommit commit,
+      Replica<CatalogState> current,
+      CatalogMutation newCatalog,
+      Map<TableIdentifier, ViewMetadata> droppedViews) {
+    List<ViewChange> renames = new ArrayList<>();
+    for (ViewChange change : commit.viewChanges()) {
+      TableIdentifier viewId = change.identifier();
+      CatalogState.ViewEntry entry = current.state().viewEntry(viewId);
+      if (entry == null) {
+        throw new NoSuchViewException("View does not exist: %s", viewId);
+      }
+      if (!java.util.Objects.equals(
+          LogViewOperations.location(current.state(), viewId),
+          change.base().metadataFileLocation())) {
+        throw new CommitFailedException(
+            "Cannot commit transaction: view %s changed since the transaction read it", viewId);
+      }
+
+      if (change.dropped()) {
+        if (entry.isInline()) {
+          keptView(viewId, entry, newCatalog::wroteAhead);
+        } else {
+          droppedViews.put(viewId, change.base());
+        }
+        newCatalog.dropView(viewId);
+        continue;
+      }
+      if (change.updated() != null) {
+        ((LogViewOperations) newViewOps(viewId)).stageUpdate(newCatalog, change.updated());
+      }
+      if (change.renamedTo() != null) {
+        renames.add(change);
+      }
+    }
+    for (ViewChange change : renames) {
+      newCatalog.renameView(change.identifier(), change.renamedTo());
+    }
+    for (Map.Entry<TableIdentifier, ViewMetadata> created : commit.createdViews().entrySet()) {
+      ((LogViewOperations) newViewOps(created.getKey()))
+          .stageCreate(newCatalog, created.getValue());
+    }
   }
 
   /**

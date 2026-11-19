@@ -155,8 +155,10 @@ left and logged, and the transaction still reports its commit (Bug 96). A writer
 the commit leaves the files for a GC by listing. A drop that keeps an inline table's files writes
 the table to its metadata directory before the commit (SPEC.md, "Commits"); if it cannot,
 the transaction fails and deletes what it wrote, unless `fileio.catalog.drop.force`, which drops the table anyway and leaves
-its files as a purge interrupted after its commit does. Replace transactions, `registerTable` and views stay unsupported in a catalog transaction
-and throw.
+its files as a purge interrupted after its commit does. Views stage as tables do
+(docs/VIEWS.md "Stage 2"): a view's create, replace, property change, rename and drop, each on the
+version the transaction read. Replace transactions, `registerTable` and `registerView` stay
+unsupported in a catalog transaction and throw.
 
 ## The SPI
 

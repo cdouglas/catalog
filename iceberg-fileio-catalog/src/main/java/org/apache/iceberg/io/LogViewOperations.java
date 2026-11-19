@@ -276,6 +276,27 @@ final class LogViewOperations extends BaseViewOperations {
   }
 
   /**
+   * Stages the view's create with {@code metadata} on {@code mut}, a catalog transaction's, as a
+   * create through these operations sends it (inline, or a metadata file written now, which the
+   * transaction deletes if its record does not land): {@link LogCatalog#commitTransaction}.
+   */
+  void stageCreate(CatalogMutation mut, ViewMetadata metadata) {
+    CatalogState.ViewMetadataRef staged = stage(metadata, mut::wroteAhead);
+    mut.createView(view, staged);
+    evictable(mut, staged, metadata);
+  }
+
+  /**
+   * Stages the view's update to {@code metadata} on {@code mut}, a catalog transaction's, which
+   * applies only on the version the transaction read, as an update through these operations does.
+   */
+  void stageUpdate(CatalogMutation mut, ViewMetadata metadata) {
+    CatalogState.ViewMetadataRef staged = stage(metadata, mut::wroteAhead);
+    mut.updateView(view, staged);
+    evictable(mut, staged, metadata);
+  }
+
+  /**
    * Writes {@code metadata}, which names no file, to a new metadata file of the view's metadata
    * directory, as a commit of a pointer view does, and returns it: for a drop that keeps an inline
    * view's metadata ({@link LogCatalog#dropView}).

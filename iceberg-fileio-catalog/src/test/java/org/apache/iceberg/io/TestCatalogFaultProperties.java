@@ -2999,8 +2999,8 @@ class TestCatalogFaultProperties {
               if (!m.namespaces.containsKey(ns)) {
                 throw new IllegalStateException(ns + " does not exist");
               }
-              // A view in it keeps it: a transaction stages no view changes (VIEWS.md stage 2), so
-              // its commit finds the namespace not empty
+              // A view in it keeps it: the transaction's staging refuses the drop of a namespace
+              // whose views it sees, and its commit refuses one with a view created since
               if (m.keySet().stream().anyMatch(t -> t.namespace().equals(ns))
                   || m.views.keySet().stream().anyMatch(v -> v.namespace().equals(ns))) {
                 throw new IllegalStateException(ns + " is not empty");

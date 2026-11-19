@@ -16,7 +16,7 @@ none of them. `TestIcebergCoreIssues` asserts each is absent; on stock Iceberg
 
 An entry's ID is not reused: a finished entry is deleted and its ID retired.
 Retired: S3-S5, D1-D3, D5-D7, D9, D10, D11, D15, D17, D19, D20, D23, D24, D26, T1, T2, T4, T5,
-U2, U3
+T7, U2, U3
 (`git log -p docs/errata.md` has each; the plans in TAIL_READS.md,
 CHECKPOINT_PLAN.md and SNAPSHOT_PAGING.md cite them by ID and summary). Five
 IDs (S2, D9, D10, T4, T5) were reused before this rule, so an older code
@@ -409,6 +409,29 @@ bytes against 161; a replace's record of 29 against 145).
 **Trigger to revisit:** checkpoint bytes of a pointer catalog with many tables
 or views mattering in a measured workload.
 
+### D29. A transaction's create takes no name it frees
+
+A catalog transaction's record binds each name it takes on the state before
+the record, where a name the record frees is still held. So a view's create or
+rename takes no name that state holds, though a drop or rename of the same
+transaction frees it. A table's create is the same, and a table takes no name a
+view held there. The commit then fails as `AlreadyExistsException`, with nothing
+applied: `CatalogMutation.createView`, `renameView`, `createTable` and
+`renameTable`'s view check (`viewHolds`, `tableHolds`). Only a table's rename
+into a name the transaction frees of another table binds by the namespace's
+version, which every change of its names moves (Bug 124 (rename into freed name
+fails)). JDBC takes such names in its one database transaction
+(`CatalogTransactionTests.aNameATransactionFreesIsFreeForTheOtherKind`;
+fileio's suites set `takesNamesItFreesAcrossKinds` false).
+
+The format already allows the fix: `CreateView`, `RenameView` and
+`CreateTable` carry the namespace's version as their binding's other case. The
+record would also have to order view drops before view creates and renames;
+today it puts view drops after them.
+
+**Trigger to revisit:** a workload that replaces a table by a view, or a view
+by a table, of the same name in one transaction (two transactions do it today).
+
 ### D8. Typed-protobuf encoding for Iceberg structural types (skip JSON serde)
 
 `AddSortOrderUpdate` is encoded structurally (see SPEC_TM.md §"Other
@@ -562,6 +585,19 @@ mode, so a catalog's FileIO should leave them off, and nothing makes it.
 
 **Trigger to revisit:** when a catalog's FileIO enables an accelerated read
 path.
+
+### T8. The fuzzers' catalog transactions stage no view changes
+
+Views in catalog transactions (VIEWS.md "Stage 2") are tested by
+`CatalogTransactionTests`' view cases in every `LocalCatalogMode`, by the
+regressions (`TestCatalogRegressions$Views`), and by JDBC's suite on the fork.
+The fault and race fuzzers draw view operations outside transactions only.
+Their transactions' model (`Staged` effects, `checkIsolation`) has no view
+create, replace, rename or drop. So no fuzzer races a transaction's view
+change against another writer's, under faults or across logs.
+
+**Trigger to revisit:** the next fuzz round after stage 2, or any change to
+`LogCatalog.stageViewChanges` or the record's view actions.
 
 ## Known Unknowns
 
