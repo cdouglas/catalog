@@ -467,8 +467,11 @@ and a view's metadata carries its own uuid. What Batavia could add, outside Iceb
     takes no name a view held there (errata D29 (txn takes no freed name)).
 - **Tests.** `CatalogTransactionTests` gains view cases. JDBC runs them on V1, REST its refusal,
   and FileIOCatalog runs them in every `LocalCatalogMode` (`takesNamesItFreesAcrossKinds` false:
-  D29 (txn takes no freed name)). The fuzzers' transactions stage no view changes yet (errata T8
-  (fuzzer transactions lack views)).
+  D29 (txn takes no freed name)). The fault fuzzer's transactions create, replace, set
+  properties on, rename and drop views (`TXN_*_VIEW`), which its model applies net at the
+  commit, each on the version the transaction loaded, refusing the commit where D29 does; the
+  race fuzzer's `CATALOG_TXN` changes a view against racers on that view and on the name it
+  renames it to.
 - **Cost.** The baselines' classpath digest changed with `core-perf`, so their packs age again.
   No table commit path changed.
 

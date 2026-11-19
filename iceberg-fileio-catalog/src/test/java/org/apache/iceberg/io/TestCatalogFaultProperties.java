@@ -97,8 +97,9 @@ import org.intentlog.wire.LogEnvelope;
  * create / drop / rename (across namespaces too) / replace, upgrades from format v2 to v3,
  * namespace create / drop and property changes, and multi-table catalog transactions whose
  * steps (loads, appends, scans of a branch or tag, declared reads, table drops with purge or not,
- * renames, creates and property changes, namespace creates, drops and property changes) and
- * commit are separate commands, so other writers' operations run in between. A
+ * renames, creates and property changes, namespace creates, drops and property changes, view
+ * creates, replaces, property changes, renames and drops) and commit are separate commands, so
+ * other writers' operations run in between. A
  * command may also preempt the one before it: it runs to completion just before one of that
  * operation's reads of the catalog or its first conditional write, so the two race. Each writer
  * has its own catalog mode (append / CAS / compaction, pointer / inline TM / inline ML), or all
@@ -155,7 +156,8 @@ import org.intentlog.wire.LogEnvelope;
  *       under serializable isolation, every branch or tag it scanned names the snapshot it read,
  *       and a table whose read it declared is at the version it read (a load is not a read). A
  *       table it, or any drop, removed keeping its files can be registered again: a metadata file
- *       under its location holds its last version.
+ *       under its location holds its last version. A view it changed was at the version it first
+ *       loaded (VIEWS.md V6), and a view it dropped keeping its metadata can be registered again.
  *   <li>Progress (the 2026-11-17 review's A5): an operation whose model effect applies, and no
  *       fault was injected into, is not rejected as a conflict ({@link CommitFailedException}, or
  *       {@code ServiceUnavailableException} once a catalog operation's attempts ran out) when
@@ -426,6 +428,11 @@ class TestCatalogFaultProperties {
             Tuple.of(1, Kind.TXN_DROP_NAMESPACE),
             Tuple.of(1, Kind.TXN_SET_NAMESPACE_PROPERTY),
             Tuple.of(1, Kind.TXN_REMOVE_NAMESPACE_PROPERTY),
+            Tuple.of(1, Kind.TXN_CREATE_VIEW),
+            Tuple.of(1, Kind.TXN_REPLACE_VIEW),
+            Tuple.of(1, Kind.TXN_VIEW_PROPERTIES),
+            Tuple.of(1, Kind.TXN_RENAME_VIEW),
+            Tuple.of(1, Kind.TXN_DROP_VIEW),
             Tuple.of(3, Kind.TXN_COMMIT));
     Arbitrary<Integer> small = Arbitraries.integers().between(0, 11);
     Arbitrary<Integer> preempt =
@@ -649,6 +656,18 @@ class TestCatalogFaultProperties {
     TXN_DROP_NAMESPACE,
     TXN_SET_NAMESPACE_PROPERTY,
     TXN_REMOVE_NAMESPACE_PROPERTY,
+    /**
+     * View changes in the open catalog transaction (VIEWS.md "Stage 2"), through its view catalog,
+     * as their namesakes without TXN_ pick their operands: a create, a replace of its version, a
+     * property, a rename and a drop. The commit applies them net, as BaseCatalogTransaction sends
+     * them: a view it created as created last, one it had, changed only on the version it first
+     * loaded.
+     */
+    TXN_CREATE_VIEW,
+    TXN_REPLACE_VIEW,
+    TXN_VIEW_PROPERTIES,
+    TXN_RENAME_VIEW,
+    TXN_DROP_VIEW,
     TXN_COMMIT;
 
     /** Whether it stages a change or read in a catalog transaction, changing no catalog yet. */
@@ -980,6 +999,8 @@ class TestCatalogFaultProperties {
     Set<Long> chosen = null;
     // The tables, by their names before it ran, it drops keeping their files
     List<TableIdentifier> keeping = List.of();
+    // For a catalog transaction's commit: whether it changes views
+    boolean changesViews = false;
 
     Op(String description, Action action, Effect effect) {
       this.description = description;
@@ -1046,6 +1067,35 @@ class TestCatalogFaultProperties {
     }
   }
 
+  /**
+   * Fails the effect of a catalog transaction that takes a name the state before its record holds,
+   * as LogCatalog refuses it while errata D29 (txn takes no freed name) stands: a table's create,
+   * or a view's create or rename, into a name a table or view holds there, though the transaction
+   * frees it; a table's rename into a name a view holds there. (A table's rename into a name the
+   * transaction frees of a table binds by the namespace's version: Bug 124 (rename into freed name
+   * fails).) Each name is its holder's at the end of the transaction.
+   */
+  private static void takesNoNameItFrees(Model m, List<TableIdentifier> tablesCreated,
+      List<Map.Entry<TableIdentifier, TableIdentifier>> tableRenames,
+      List<TableIdentifier> viewsTaking) {
+    if (TAKES_NAMES_IT_FREES) {
+      return;
+    }
+    List<TableIdentifier> taken = new ArrayList<>();
+    tablesCreated.stream().filter(t -> m.containsKey(t) || m.views.containsKey(t))
+        .forEach(taken::add);
+    tableRenames.stream().map(Map.Entry::getValue).filter(m.views::containsKey)
+        .forEach(taken::add);
+    viewsTaking.stream().filter(v -> m.containsKey(v) || m.views.containsKey(v))
+        .forEach(taken::add);
+    if (!taken.isEmpty()) {
+      Statistics.label("a transaction refused for taking a name it frees (errata D29)")
+          .collect(taken.size() > 1 ? "names" : "a name");
+      throw new IllegalStateException(
+          "errata D29 (txn takes no freed name): it takes " + taken + ", held before its record");
+    }
+  }
+
   enum Outcome {
     ACKNOWLEDGED,
     /**
@@ -1087,19 +1137,65 @@ class TestCatalogFaultProperties {
   }
 
   /**
+   * A view a writer's open catalog transaction touched: one it had, as it first loaded it (its
+   * name then, and the version it read), or one it created; what the transaction made of it, and
+   * its name there.
+   */
+  private static final class TxnView {
+    final TableIdentifier start; // null for a view it created
+    final String baseLocation;
+    ViewState current;
+    TableIdentifier name;
+    boolean updated = false;
+    boolean dropped = false;
+
+    TxnView(TableIdentifier name, org.apache.iceberg.view.ViewMetadata base) {
+      this.start = name;
+      this.baseLocation = base.metadataFileLocation();
+      this.current = Run.viewState(base);
+      this.name = name;
+    }
+
+    TxnView(TableIdentifier name, ViewState created) {
+      this.start = null;
+      this.baseLocation = null;
+      this.current = created;
+      this.name = name;
+    }
+
+    /** Whether the commit changes the view: a create, or a change to one it had. */
+    boolean changes() {
+      return start == null ? !dropped : dropped || updated || !name.equals(start);
+    }
+
+    @Override
+    public String toString() {
+      if (start == null) {
+        return "create " + name;
+      }
+      return dropped ? "drop " + start
+          : (updated ? "update " + start : "") + (updated && !name.equals(start) ? " and " : "")
+              + (name.equals(start) ? "" : "rename " + start + " to " + name);
+    }
+  }
+
+  /**
    * A change a writer staged in its open catalog transaction, and its effect at the commit. The
    * commit applies a transaction's changes as LogCatalog stages them, by phase: namespace creates
    * and properties; then the changes to the tables it loaded, each by the catalog's name the
    * table had when the transaction loaded it; then those tables' renames, net (a name to its
-   * final one); then its creates, with the changes to the tables it created; then its namespace
-   * drops. Within a phase, in the order the transaction staged them.
+   * final one); then its creates, with the changes to the tables it created; then its view
+   * changes, net (LogCatalog.stageViewChanges: drops and updates of the views it had, their
+   * renames, and the views it created); then its namespace drops. Within a phase, in the order the
+   * transaction staged them.
    */
   private static final class Staged {
     static final int NAMESPACES = 0;
     static final int TABLES = 1;
     static final int RENAMES = 2;
     static final int CREATES = 3;
-    static final int NAMESPACE_DROPS = 4;
+    static final int VIEWS = 4;
+    static final int NAMESPACE_DROPS = 5;
 
     final String description;
     final int phase;
@@ -1116,6 +1212,18 @@ class TestCatalogFaultProperties {
       return description;
     }
   }
+
+  /**
+   * Whether a catalog transaction's create or rename takes a name the same transaction frees
+   * (errata D29 (txn takes no freed name): not yet).
+   */
+  private static final boolean TAKES_NAMES_IT_FREES = false;
+
+  /**
+   * The key a kept view a catalog transaction dropped has among the model's kept views until the
+   * check after its commit finds its metadata file.
+   */
+  private static final String KEPT_BY_A_TRANSACTION = "dropped kept by a transaction: ";
 
   /** The UUID the model gives a table a catalog transaction creates, until its commit lands. */
   private static final String CREATED_IN_TXN = "created in a transaction ";
@@ -1140,6 +1248,11 @@ class TestCatalogFaultProperties {
     final List<TableIdentifier> purging = new ArrayList<>();
     final List<TableIdentifier> keeping = new ArrayList<>();
     final Set<Namespace> createdNamespaces = new HashSet<>();
+    // The views the open transaction touched, as BaseCatalogTransaction keeps them: each by the
+    // name it has in the transaction, and the names it freed of views (dropped, renamed out)
+    final List<TxnView> views = new ArrayList<>();
+    final Map<TableIdentifier, TxnView> viewsByName = new HashMap<>();
+    final Set<TableIdentifier> viewsGone = new HashSet<>();
 
     Writer(int id, LogCatalog catalog, boolean inline, boolean inlineLists) {
       this.id = id;
@@ -1156,6 +1269,25 @@ class TestCatalogFaultProperties {
       purging.clear();
       keeping.clear();
       createdNamespaces.clear();
+      views.clear();
+      viewsByName.clear();
+      viewsGone.clear();
+    }
+
+    /**
+     * Loads view {@code name} in the open transaction, and returns how the transaction holds it:
+     * the first load of a view it had records the version it read.
+     */
+    TxnView loadView(TableIdentifier name, org.apache.iceberg.view.View[] view) {
+      view[0] = txn.asViewCatalog().loadView(name);
+      TxnView held = viewsByName.get(name);
+      if (held == null) {
+        held = new TxnView(name,
+            ((org.apache.iceberg.view.BaseView) view[0]).operations().current());
+        views.add(held);
+        viewsByName.put(name, held);
+      }
+      return held;
     }
 
     /**
@@ -2572,6 +2704,15 @@ class TestCatalogFaultProperties {
             return null;
           }
           return txnNamespaceOp(cmd, w, NAMESPACES.get(cmd.b % NAMESPACES.size()));
+        case TXN_CREATE_VIEW:
+        case TXN_REPLACE_VIEW:
+        case TXN_VIEW_PROPERTIES:
+        case TXN_RENAME_VIEW:
+        case TXN_DROP_VIEW:
+          if (w.txn == null) {
+            return null;
+          }
+          return txnViewOp(cmd, w);
         case TXN_COMMIT:
           if (w.txn == null) {
             return null;
@@ -2601,7 +2742,32 @@ class TestCatalogFaultProperties {
           effects.removeIf(c -> c.phase == Staged.RENAMES);
           effects.add(new Staged("renames " + renames, Staged.RENAMES,
               (m, actual) -> renameAll(m, renames)));
+          // Its view changes, net, as BaseCatalogTransaction sends them
+          List<TxnView> viewChanges = new ArrayList<>();
+          w.views.forEach(v -> {
+            if (v.changes()) {
+              viewChanges.add(v);
+            }
+          });
+          if (!viewChanges.isEmpty()) {
+            effects.add(new Staged("views " + viewChanges, Staged.VIEWS,
+                (m, actual) -> applyViewChanges(m, viewChanges)));
+          }
           effects.sort(java.util.Comparator.comparingInt(c -> c.phase));
+          // The names it takes: its tables' creates (by their names at the end), its tables'
+          // renames, and its views' creates and renames
+          List<TableIdentifier> tablesCreated = new ArrayList<>();
+          w.names.forEach((name, origin) -> {
+            if (origin == null) {
+              tablesCreated.add(name);
+            }
+          });
+          List<TableIdentifier> viewsTaking = new ArrayList<>();
+          viewChanges.forEach(v -> {
+            if (!v.dropped && !v.name.equals(v.start)) {
+              viewsTaking.add(v.name);
+            }
+          });
           // What each purge deletes: the manifests and lists of the table as it is now, just
           // before the commit (Bug 96)
           Map<TableIdentifier, Set<String>> purging = new TreeMap<>(BY_NAME);
@@ -2610,7 +2776,8 @@ class TestCatalogFaultProperties {
           w.closeTxn();
           boolean[] landed = {false};
           Op commit = new Op(
-              "txn.commit(" + txn.isolationLevel() + ", " + changes + ")",
+              "txn.commit(" + txn.isolationLevel() + ", " + changes
+                  + (viewChanges.isEmpty() ? "" : ", views " + viewChanges) + ")",
               () -> {
                 txn.commitTransaction();
                 landed[0] = true;
@@ -2619,6 +2786,7 @@ class TestCatalogFaultProperties {
                 // All of it, or nothing: the effects apply to the model's copy in the order the
                 // transaction staged them, and any that does not apply fails the whole
                 checkIsolation(txn.isolationLevel(), loaded, m);
+                takesNoNameItFrees(m, tablesCreated, renames, viewsTaking);
                 for (Staged change : effects) {
                   change.effect.apply(m, actual);
                 }
@@ -2629,6 +2797,7 @@ class TestCatalogFaultProperties {
               });
           commit.loaded = loaded;
           commit.keeping = keepingFiles;
+          commit.changesViews = !viewChanges.isEmpty();
           return commit;
         default:
           throw new IllegalStateException("Unknown kind " + cmd.kind);
@@ -2756,6 +2925,146 @@ class TestCatalogFaultProperties {
                 checkBindable(m, registered);
                 m.views.put(registered, kept);
               });
+        }
+      }
+    }
+
+    /**
+     * A view change in {@code w}'s open catalog transaction (VIEWS.md "Stage 2"), through its view
+     * catalog, with operands as {@link #viewOp}'s namesake picks them. It stages nothing the
+     * commit's effect reads but {@code w}'s view of it ({@link Writer#views}), which follows
+     * BaseCatalogTransaction's: a view it had, from its first load; one it created.
+     */
+    private Op txnViewOp(Cmd cmd, Writer w) {
+      String value = "v" + nextValue++;
+      org.apache.iceberg.catalog.ViewCatalog txViews = w.txn.asViewCatalog();
+      org.apache.iceberg.view.View[] view = {null};
+      switch (cmd.kind) {
+        case TXN_CREATE_VIEW: {
+          TableIdentifier created = pickName(cmd.a);
+          boolean kept = cmd.b % 2 == 1;
+          String sql = "select '" + value + "'";
+          return staging(w, "txn.createView(" + created + (kept ? ", kept" : "") + ")", () -> {
+            org.apache.iceberg.view.ViewBuilder builder = txViews.buildView(created)
+                .withSchema(SCHEMA)
+                .withDefaultNamespace(created.namespace())
+                .withQuery("spark", sql);
+            if (kept) {
+              builder = builder.withProperty(TableProperties.GC_ENABLED, "false");
+            }
+            builder.create();
+            TxnView staged = new TxnView(created, new ViewState(sql, 1, kept));
+            w.views.add(staged);
+            w.viewsByName.put(created, staged);
+            w.viewsGone.remove(created);
+            return null;
+          });
+        }
+        case TXN_REPLACE_VIEW: {
+          TableIdentifier name = pickView(cmd.a);
+          String sql = "select '" + value + "'";
+          return staging(w, "txn.replaceView(" + name + ")", () -> {
+            TxnView at = w.loadView(name, view);
+            view[0].replaceVersion()
+                .withSchema(SCHEMA)
+                .withDefaultNamespace(name.namespace())
+                .withQuery("spark", sql)
+                .commit();
+            at.current = at.current.with(sql, at.current.versionId + 1);
+            at.updated = true;
+            return null;
+          });
+        }
+        case TXN_VIEW_PROPERTIES: {
+          TableIdentifier name = pickView(cmd.a);
+          String key = KEYS.get(cmd.b % KEYS.size());
+          return staging(w, "txn.setViewProperty(" + name + ", " + key + "=" + value + ")", () -> {
+            TxnView at = w.loadView(name, view);
+            view[0].updateProperties().set(key, value).commit();
+            at.current = at.current.copy();
+            at.current.props.put(key, value);
+            at.updated = true;
+            return null;
+          });
+        }
+        case TXN_RENAME_VIEW: {
+          TableIdentifier name = pickView(cmd.a);
+          TableIdentifier to = pickName(cmd.b);
+          if (to.equals(name)) {
+            return null; // refused as it is staged
+          }
+          return staging(w, "txn.renameView(" + name + ", " + to + ")", () -> {
+            TxnView at = w.loadView(name, view);
+            txViews.renameView(name, to);
+            w.viewsByName.remove(name);
+            w.viewsGone.add(name);
+            w.viewsByName.put(to, at);
+            w.viewsGone.remove(to);
+            at.name = to;
+            return null;
+          });
+        }
+        default: {
+          TableIdentifier name = pickView(cmd.a);
+          return staging(w, "txn.dropView(" + name + ")", () -> {
+            TxnView at = w.loadView(name, view);
+            if (!txViews.dropView(name)) {
+              throw new NoSuchViewException("dropView returned false: %s", name);
+            }
+            at.dropped = true;
+            w.viewsByName.remove(name);
+            w.viewsGone.add(name);
+            return null;
+          });
+        }
+      }
+    }
+
+    /**
+     * Applies a catalog transaction's view changes, net, to {@code m}, as LogCatalog stages them
+     * (stageViewChanges): a change to a view it had only on the version it first loaded (VIEWS.md
+     * V6), or none of the transaction applies; drops and updates, then renames, then creates. A
+     * kept view's drop ({@code gc.enabled} false) leaves a metadata file to register, which {@link
+     * #resolve} finds once the commit took effect.
+     */
+    private void applyViewChanges(Model m, List<TxnView> changes) {
+      for (TxnView v : changes) {
+        if (v.start != null) {
+          ViewState now = existingView(m, v.start);
+          if (!Objects.equals(now.metadataLocation, v.baseLocation)) {
+            throw new IllegalStateException(String.format(
+                "view %s changed since the transaction loaded it (%s -> %s)", v.start,
+                v.baseLocation, now.metadataLocation));
+          }
+        }
+      }
+      List<Map.Entry<TableIdentifier, ViewState>> renamed = new ArrayList<>();
+      for (TxnView v : changes) {
+        if (v.start == null) {
+          continue;
+        }
+        ViewState now = m.views.remove(v.start);
+        if (v.dropped) {
+          if (now.kept) {
+            m.keptViews.put(KEPT_BY_A_TRANSACTION + v.start, now.copy());
+          }
+          continue;
+        }
+        ViewState next = v.updated ? v.current.copy() : now;
+        if (v.name.equals(v.start)) {
+          m.views.put(v.start, next);
+        } else {
+          renamed.add(Map.entry(v.name, next));
+        }
+      }
+      for (Map.Entry<TableIdentifier, ViewState> rename : renamed) {
+        checkBindable(m, rename.getKey());
+        m.views.put(rename.getKey(), rename.getValue());
+      }
+      for (TxnView v : changes) {
+        if (v.start == null) {
+          checkBindable(m, v.name);
+          m.views.put(v.name, v.current.copy());
         }
       }
     }
@@ -2910,13 +3219,16 @@ class TestCatalogFaultProperties {
     /** A step staging a change or a read in a catalog transaction. */
     @FunctionalInterface
     interface Stage {
-      /** Stages it; returns the change staged, or null for a read. */
+      /**
+       * Stages it; returns the change staged, or null for a read or a view's change (the commit
+       * finds those in the writer's {@link Writer#views}).
+       */
       Staged stage();
     }
 
     /**
      * {@code w}'s step {@code stage} in its open transaction, which changes no catalog: a change
-     * joins the transaction's, for its commit. A step the transaction refuses (a table or
+     * joins the transaction's, for its commit. A step the transaction refuses (a table, view or
      * namespace it does not have, or has, or one not empty) leaves it open; any other failure
      * abandons it.
      */
@@ -2928,7 +3240,7 @@ class TestCatalogFaultProperties {
             w.staged.add(change);
           }
         } catch (NoSuchTableException | AlreadyExistsException | NoSuchNamespaceException
-            | NamespaceNotEmptyException | ValidationException e) {
+            | NamespaceNotEmptyException | NoSuchViewException | ValidationException e) {
           throw e;
         } catch (UnsupportedOperationException | IllegalArgumentException e) {
           // a namespace it dropped created again, a ref it does not have
@@ -3215,6 +3527,10 @@ class TestCatalogFaultProperties {
       if (!faultsFired.isEmpty()) {
         Statistics.label("outcome after a fault").collect(outcome);
       }
+      if (op.changesViews) {
+        Statistics.label("a catalog transaction's commit with view changes").collect(outcome
+            + (outcome == Outcome.REJECTED ? " " + reason.replaceAll(":.*", "") : ""));
+      }
       if (cmd.kind == Kind.TXN_BEGIN || cmd.kind.stagesInATransaction()) {
         return; // no change to the catalog
       }
@@ -3345,6 +3661,16 @@ class TestCatalogFaultProperties {
               "%s reported %s (%s) but took effect", op, outcome, reason);
           check(withoutDiff == null, "%s reported %s (%s), but %s", op, outcome, reason,
               withoutDiff);
+      }
+      // A kept view a catalog transaction dropped, with effect, left a metadata file that holds it
+      for (String key : new ArrayList<>(model.keptViews.keySet())) {
+        if (key.startsWith(KEPT_BY_A_TRANSACTION)) {
+          ViewState kept = model.keptViews.remove(key);
+          String file = heldFile(kept);
+          check(file != null, "%s dropped %s, kept (gc.enabled false), but left no metadata file of"
+              + " it", op, key.substring(KEPT_BY_A_TRANSACTION.length()));
+          model.keptViews.put(file, kept);
+        }
       }
       // Observe what the model cannot predict: a view's metadata location
       model.views.forEach((id, state) -> {

@@ -123,6 +123,8 @@ class TestCatalogRaceProperties {
           TableIdentifier.of(Namespace.of("a"), "t"),
           TableIdentifier.of(Namespace.of("a"), "u"));
   private static final List<String> KEYS = List.of("k1", "k2");
+  /** The namespace of the entries for views among a transaction's reads ({@link Op#reads}). */
+  private static final Namespace VIEW_READ = Namespace.of("view read");
 
   @Provide
   Arbitrary<String> encodings() {
@@ -690,7 +692,8 @@ class TestCatalogRaceProperties {
    * and reads, on tables that each hold a snapshot, stored as A's mode stores them: where a
    * transaction's appends to an inline table are judged where its record lands, and commit where
    * a retry of them would (errata D12). Racer B writes A's table, and C, if any, the other table A
-   * loads. It must end as a serial run, as above.
+   * loads; or, as a view's racer, B changes the view A changes, and C the name A renames it to.
+   * It must end as a serial run, as above.
    */
   @Property(tries = 200)
   void aTransactionRaceEndsAsASerialRun(
@@ -715,7 +718,9 @@ class TestCatalogRaceProperties {
     LocalCatalogMode storage = fileModeA.inlineML ? LocalCatalogMode.APPEND_ML
         : fileModeA.inlineTM ? LocalCatalogMode.APPEND_TM : LocalCatalogMode.APPEND;
     // every namespace and table, each table with a snapshot
-    Setup setup = new Setup(7, 0, 15, 2, 15, 0);
+    // every namespace and table, each table with a snapshot, and the views of the names no table
+    // takes
+    Setup setup = new Setup(7, 0, 15, 2, 15, 3);
     Op a = new Op(Kind.CATALOG_TXN, x, y);
     Op b = new Op(racerB, x, x + y);
     Op c = twoRacers ? new Op(racerC, y, x) : new Op(null, 0, 0);
@@ -724,11 +729,15 @@ class TestCatalogRaceProperties {
         fileModeA, new Op(null, 0, 0), false, 0, blockBytes);
   }
 
-  /** What a racer does to a table a transaction writes or reads. */
+  /**
+   * What a racer does to a table a transaction writes or reads, or to a view it changes or the name
+   * it renames one to: B's view is A's, C's is the one A renames to.
+   */
   @Provide
   Arbitrary<Kind> tableRacers() {
     return Arbitraries.of(
-        Kind.FAST_APPEND, Kind.SET_TABLE_PROPERTY, Kind.DELETE_ALL, Kind.CATALOG_TXN);
+        Kind.FAST_APPEND, Kind.SET_TABLE_PROPERTY, Kind.DELETE_ALL, Kind.CATALOG_TXN,
+        Kind.SET_VIEW_PROPERTY, Kind.CREATE_VIEW, Kind.DROP_VIEW);
   }
 
   /** The setup's tables: pointer tables, or inline TM or ML, on one object. */
@@ -883,7 +892,7 @@ class TestCatalogRaceProperties {
 
   /** A view of {@code id} whose SQL and origin name {@code who}. */
   private static org.apache.iceberg.view.ViewBuilder buildView(
-      LogCatalog catalog, TableIdentifier id, String who) {
+      org.apache.iceberg.catalog.ViewCatalog catalog, TableIdentifier id, String who) {
     return catalog.buildView(id)
         .withSchema(SCHEMA)
         .withDefaultNamespace(id.namespace())
@@ -920,9 +929,11 @@ class TestCatalogRaceProperties {
      * {@code y / 4} is even (or, the second, declares a read of it when {@code y / 12 % 4} is 3),
      * appends to the first, stages one more change as {@code x / 12 % 4} picks, and commits;
      * serializable when {@code x / 4} is even, else snapshot isolation. The change (the review's
-     * A6): none; a drop of the second table (purging it or not) or a rename of the first or the
-     * second; a create of a table, or a property of the first; a namespace's create, drop (of its
-     * tables first, a cascade), property set or removal. Its variant is {@code y / 12 % 4}.
+     * A6): none, or a view's change (VIEWS.md "Stage 2": a create; a replace of its version with a
+     * property set; a rename to the other view name, or a drop if that is its own); a drop of the
+     * second table (purging it or not) or a rename of the first or the second; a create of a
+     * table, or a property of the first; a namespace's create, drop (of its tables first, a
+     * cascade), property set or removal. Its variant is {@code y / 12 % 4}.
      */
     CATALOG_TXN;
 
@@ -1027,6 +1038,13 @@ class TestCatalogRaceProperties {
         reads.put(id, metadata.uuid() + " " + (main == null ? "-" : main.snapshotId()) + " "
             + metadata.metadataFileLocation());
       }
+      if (changesAView()) {
+        // a view it changes, which it changes only on the version it read (VIEWS.md V6)
+        reads.put(TableIdentifier.of(VIEW_READ, view().toString()), reader.viewExists(view())
+            ? "view " + ((org.apache.iceberg.view.BaseView) reader.loadView(view())).operations()
+                .current().metadataFileLocation()
+            : "missing");
+      }
       return reads;
     }
 
@@ -1038,7 +1056,7 @@ class TestCatalogRaceProperties {
     /**
      * Whether the tables are as the transaction read them: the same table and, under serializable
      * isolation if it scanned them, main on the same snapshot (or on none, then and now: its rows
-     * are the same, none).
+     * are the same, none); and a view it changes, the same version.
      */
     boolean unchanged(Map<TableIdentifier, String> then, Map<TableIdentifier, String> now) {
       for (TableIdentifier id : then.keySet()) {
@@ -1046,6 +1064,12 @@ class TestCatalogRaceProperties {
         String[] n = now.get(id).split(" ");
         if (t.length == 1) {
           continue; // missing then: the transaction did not load it
+        }
+        if (id.namespace().equals(VIEW_READ)) {
+          if (!then.get(id).equals(now.get(id))) {
+            return false; // a view it changes, changed since it loaded it, at any isolation
+          }
+          continue;
         }
         if (n.length == 1 || !t[0].equals(n[0])) {
           return false; // missing now, or another table
@@ -1157,7 +1181,7 @@ class TestCatalogRaceProperties {
                     .withRecordCount(1)
                     .build())
                 .commit();
-            String staged = stageChange(txCatalog, appended, who);
+            String staged = stageChange(txCatalog, txn.asViewCatalog(), appended, who);
             txn.commitTransaction();
             return "ok" + staged;
           default:
@@ -1174,11 +1198,11 @@ class TestCatalogRaceProperties {
 
     /**
      * Stages a catalog transaction's change beyond its append ({@link #change}) on {@code
-     * txCatalog}, the transaction's catalog, in which {@code appended} is the table it appended
-     * to; returns what it says of it ("" or a result).
+     * txCatalog} and {@code txViews}, the transaction's catalog and view catalog, in which {@code
+     * appended} is the table it appended to; returns what it says of it ("" or a result).
      */
-    private String stageChange(
-        org.apache.iceberg.catalog.Catalog txCatalog, Table appended, String who) {
+    private String stageChange(org.apache.iceberg.catalog.Catalog txCatalog,
+        org.apache.iceberg.catalog.ViewCatalog txViews, Table appended, String who) {
       org.apache.iceberg.catalog.SupportsNamespaces namespaces =
           (org.apache.iceberg.catalog.SupportsNamespaces) txCatalog;
       switch (change()) {
@@ -1218,8 +1242,34 @@ class TestCatalogRaceProperties {
               return " " + namespaces.removeProperties(ns, Set.of(key()));
           }
         default:
-          return "";
+          switch (variant()) {
+            case 1:
+              buildView(txViews, view(), who).create();
+              return "";
+            case 2:
+              org.apache.iceberg.view.View changed = txViews.loadView(view());
+              changed.replaceVersion()
+                  .withSchema(SCHEMA)
+                  .withDefaultNamespace(view().namespace())
+                  .withQuery("spark", "select '" + who + "-txn'")
+                  .commit();
+              changed.updateProperties().set(key(), who).commit();
+              return "";
+            case 3:
+              if (otherView().equals(view())) {
+                return " " + txViews.dropView(view());
+              }
+              txViews.renameView(view(), otherView());
+              return "";
+            default:
+              return "";
+          }
       }
+    }
+
+    /** Whether a transaction's change is to a view it loads (an update, a rename or a drop). */
+    private boolean changesAView() {
+      return kind == Kind.CATALOG_TXN && change() == 0 && variant() >= 2;
     }
 
     /** A second commit through {@code handle}: a file named for {@code who} appended. */
@@ -1253,7 +1303,10 @@ class TestCatalogRaceProperties {
               + " and its tables", ", set " + key() + " on " + ns, ", remove " + key() + " from "
               + ns}[variant()];
         default:
-          return "";
+          return new String[] {"", ", create view " + view(), ", replace view " + view()
+              + " and set " + key() + " on it", otherView().equals(view())
+                  ? ", drop view " + view() : ", rename view " + view() + " to " + otherView()}
+              [variant()];
       }
     }
 

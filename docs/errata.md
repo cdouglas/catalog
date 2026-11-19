@@ -16,7 +16,7 @@ none of them. `TestIcebergCoreIssues` asserts each is absent; on stock Iceberg
 
 An entry's ID is not reused: a finished entry is deleted and its ID retired.
 Retired: S3-S5, D1-D3, D5-D7, D9, D10, D11, D15, D17, D19, D20, D23, D24, D26, T1, T2, T4, T5,
-T7, U2, U3
+T7, T8, U2, U3
 (`git log -p docs/errata.md` has each; the plans in TAIL_READS.md,
 CHECKPOINT_PLAN.md and SNAPSHOT_PAGING.md cite them by ID and summary). Five
 IDs (S2, D9, D10, T4, T5) were reused before this rule, so an older code
@@ -585,19 +585,6 @@ mode, so a catalog's FileIO should leave them off, and nothing makes it.
 
 **Trigger to revisit:** when a catalog's FileIO enables an accelerated read
 path.
-
-### T8. The fuzzers' catalog transactions stage no view changes
-
-Views in catalog transactions (VIEWS.md "Stage 2") are tested by
-`CatalogTransactionTests`' view cases in every `LocalCatalogMode`, by the
-regressions (`TestCatalogRegressions$Views`), and by JDBC's suite on the fork.
-The fault and race fuzzers draw view operations outside transactions only.
-Their transactions' model (`Staged` effects, `checkIsolation`) has no view
-create, replace, rename or drop. So no fuzzer races a transaction's view
-change against another writer's, under faults or across logs.
-
-**Trigger to revisit:** the next fuzz round after stage 2, or any change to
-`LogCatalog.stageViewChanges` or the record's view actions.
 
 ## Known Unknowns
 
