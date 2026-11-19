@@ -8397,4 +8397,59 @@ public class TestCatalogRegressions {
       assertThat(dataFiles(reader.loadTable(u))).isEmpty();
     }
   }
+
+  /**
+   * Bug 126 (second drop missed renamed table): a transaction that dropped a table, renamed
+   * another into its name (Bug 124) and dropped that name again left the renamed table there: the
+   * second drop resolved the name against the read, whose table there the transaction had dropped
+   * already, and staged that drop again. A drop of a name a rename staged before took drops the
+   * renamed table, as Iceberg's catalogs do (a table renamed in and dropped is a table dropped),
+   * and so does one of a name only the rename brought (which said the table did not exist).
+   * Found by the multi-writer fuzzer (round views-r0), which drives CatalogMutation directly; the
+   * catalog-transaction API resolved the name to the renamed table itself.
+   */
+  @Nested
+  class ADropOfANameARenameTook {
+    private final Namespace ns = Namespace.of("ns");
+    private final TableIdentifier t = TableIdentifier.of(ns, "t");
+    private final TableIdentifier u = TableIdentifier.of(ns, "u");
+    private final TableIdentifier v = TableIdentifier.of(ns, "v");
+    private final CatalogLog log = log(new CasFileIO(), APPEND);
+
+    private Replica<CatalogState> setUp() {
+      new CatalogMutation(log.empty())
+          .createNamespace(ns)
+          .createTable(t, "mem:///ns/t/v1.metadata.json")
+          .createTable(u, "mem:///ns/u/v1.metadata.json")
+          .commit(log);
+      return log.read();
+    }
+
+    @Test
+    void dropsTheTableRenamedIntoANameItFreed() {
+      new CatalogMutation(setUp()).dropTable(u).renameTable(t, u).dropTable(u).commit(log);
+
+      assertThat(log.read().state().tables()).isEmpty();
+    }
+
+    @Test
+    void dropsTheTableRenamedIntoANewName() {
+      new CatalogMutation(setUp()).renameTable(t, v).dropTable(v).commit(log);
+
+      assertThat(log.read().state().tables()).containsExactly(u);
+    }
+
+    @Test
+    void freesTheNameForAnotherRename() {
+      Replica<CatalogState> read = setUp();
+      String uLocation = read.state().location(u);
+      new CatalogMutation(read).renameTable(u, v).dropTable(v).renameTable(t, v).commit(log);
+
+      CatalogState after = log.read().state();
+      assertThat(after.tables()).containsExactly(v);
+      assertThat(after.location(v))
+          .isNotEqualTo(uLocation)
+          .isEqualTo("mem:///ns/t/v1.metadata.json");
+    }
+  }
 }

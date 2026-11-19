@@ -144,8 +144,11 @@ new name only, a created one loads and takes updates, listings include them. The
 transaction's net effect against the catalog as the transaction found it, which is what
 `CatalogMutation` records: tables created (with their final metadata), tables updated (by their
 names at the start, with the version first read), renamed (start name to final name) and dropped,
-and namespaces created, changed and dropped. A purge reads the dropped version's history before
-the commit and deletes the table's files after it lands; a file it cannot read or delete then is
+and namespaces created, changed and dropped. Staged on `CatalogMutation` directly, a drop of a name
+a rename staged before took is a drop of the renamed table, by its start name, and the rename goes,
+as through the API (Bug 126 (second drop missed renamed table)). A purge reads the dropped
+version's history before the commit and deletes the table's files after it lands; a file it
+cannot read or delete then is
 left and logged, and the transaction still reports its commit (Bug 96). A writer that fails after
 the commit leaves the files for a GC by listing. A drop that keeps an inline table's files writes
 the table to its metadata directory before the commit (SPEC.md, "Commits"); if it cannot,

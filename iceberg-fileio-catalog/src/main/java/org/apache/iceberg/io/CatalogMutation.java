@@ -433,6 +433,15 @@ public class CatalogMutation {
   }
 
   public CatalogMutation dropTable(TableIdentifier tableId) {
+    // A name a rename staged here took names the renamed table, whatever the read held there: the
+    // drop is of that table, by its name in the read, and the rename goes (Bug 126)
+    for (Map.Entry<TableIdentifier, TableIdentifier> rename : tableRenames.entrySet()) {
+      if (rename.getValue().equals(tableId)) {
+        TableIdentifier from = rename.getKey();
+        tableRenames.remove(from);
+        return dropTable(from);
+      }
+    }
     if (!original.containsTable(tableId)) {
       throw new NoSuchTableException("Table does not exist: %s", tableId);
     }
