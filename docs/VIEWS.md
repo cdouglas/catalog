@@ -1,10 +1,12 @@
 # Views (design)
 
-Status: designed 2026-11-18 on branch `views` (from main 0c8bdf5), its open questions settled
-by the user the same day ([Decisions on the open questions](#decisions-on-the-open-questions)).
-M1 is measured ([Sizes](#sizes)); the rest is being built. Stage 1 is views in the catalog
-(V1-V12). Stage 2 is views in catalog
-transactions ([Stage 2](#stage-2-views-in-catalog-transactions)).
+Status: stage 1, views in the catalog (V1-V12), is built and on main (2026-11-19): the format,
+state and actions, `LogCatalog` as a `ViewCatalog`, the fuzzers' view kinds and the calibration
+set `fuzz/mutants/views.sh` ([Testing](#testing)), and the TLA+ models' tables and views by name
+(spec/tla/README.md "Tables and views"). Designed 2026-11-18, its open questions settled by the
+user the same day ([Decisions on the open questions](#decisions-on-the-open-questions)); M1 is
+measured ([Sizes](#sizes)). Stage 2, views in catalog transactions
+([Stage 2](#stage-2-views-in-catalog-transactions)), is not started.
 
 ## Summary
 
@@ -484,7 +486,7 @@ and a view's metadata carries its own uuid. What Batavia could add, outside Iceb
 | 2 | Format, state, actions, codecs; SPEC.md, design.md invariant, explorer fixtures | 1.5 days |
 | 3 | Catalog API, view operations, table-side checks; `ViewCatalogTests` green in every mode | 1.5 days |
 | 4 | N1, multi-writer, fault and race fuzzers, regressions, `views.sh` calibrated | 2 days |
-| 5 | Merge onto main after the current fuzz round and phase 1; a havoc round | |
+| 5 | Merge onto main (2026-11-19); a sharded havoc round and the `views` and `creates` calibrations on the merged head | |
 | 6 | catalog-bench's view operations, with E7's tree (G5) | 1 day |
 | 7 | Stage 2: `ViewChange` on the fork's `core-perf`, with `BaseCatalogTransaction`'s, JDBC's and FileIOCatalog's implementations; restack and republish | 2 days |
 
