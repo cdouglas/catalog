@@ -1005,7 +1005,11 @@ class TestCatalogFaultProperties {
      */
     Loaded load(TableIdentifier id, Table[] table) {
       table[0] = txn.asCatalog().loadTable(id);
-      names.putIfAbsent(id, id); // a table the transaction has not touched: the catalog's
+      // A table the transaction has not touched is the catalog's; one it created maps to null,
+      // which putIfAbsent would take for absent
+      if (!names.containsKey(id)) {
+        names.put(id, id);
+      }
       TableIdentifier origin = names.get(id);
       return origin == null ? null : loaded.computeIfAbsent(
           origin, k -> new Loaded(((HasTableOperations) table[0]).operations().current()));
