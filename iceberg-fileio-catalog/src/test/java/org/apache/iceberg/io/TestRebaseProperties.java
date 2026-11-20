@@ -151,7 +151,7 @@ class TestRebaseProperties {
       @ForAll @IntRange(min = 2, max = 3) int formatVersion,
       @ForAll boolean partitioned,
       @ForAll("inlineManifestModes") LocalCatalogMode mode,
-      @ForAll("prefixes") List<TableScript.Cmd> prefix,
+      @ForAll("prefixesOrNone") List<TableScript.Cmd> prefix,
       @ForAll("windows") List<TableScript.Cmd> window,
       @ForAll("appends") TableScript.Cmd r,
       @ForAll boolean merging,
@@ -1421,6 +1421,16 @@ class TestRebaseProperties {
   Arbitrary<List<TableScript.Cmd>> prefixes() {
     return TableScript.commands(kind -> kind != TableScript.Kind.STALE).withoutEdgeCases()
         .list().ofMinSize(1).ofMaxSize(12);
+  }
+
+  /**
+   * Prefixes, a fifth of the time none: R is then the first commit of an empty table, and its
+   * snapshot has no parent, racing a window that gives main a head (Landing's fresh history).
+   */
+  @Provide
+  Arbitrary<List<TableScript.Cmd>> prefixesOrNone() {
+    return Arbitraries.frequencyOf(
+        Tuple.of(1, Arbitraries.just(List.<TableScript.Cmd>of())), Tuple.of(4, prefixes()));
   }
 
   @Provide

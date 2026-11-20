@@ -115,6 +115,10 @@ final class TableScript {
   enum Kind {
     FAST_APPEND,
     MERGE_APPEND,
+    /**
+     * Stages an append (no ref moves to it) on main, or on branch {@code b % 2} if {@code b % 4 >=
+     * 2}.
+     */
     STAGED_APPEND,
     BRANCH_APPEND,
     DELETE_FILE,
@@ -509,6 +513,11 @@ final class TableScript {
         case STAGED_APPEND:
           org.apache.iceberg.AppendFiles staged = target.newFastAppend();
           newFiles(target, cmd).forEach(staged::appendFile);
+          if (cmd.b % 4 >= 2) {
+            // staged on a branch: its parent is the branch's head (main's if it has none), which
+            // its record does not name (Landing.unmergeable's staged snapshots; gap plan 2.8)
+            staged.toBranch(ref(cmd.b));
+          }
           staged.stageOnly().commit();
           break;
         case BRANCH_APPEND:

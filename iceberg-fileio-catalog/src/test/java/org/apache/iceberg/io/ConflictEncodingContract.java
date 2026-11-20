@@ -154,9 +154,10 @@ abstract class ConflictEncodingContract {
       @ForAll @IntRange(min = -1, max = 5) int renameAt,
       @ForAll boolean merging,
       @ForAll("writers") LocalCatalogMode windowWriter,
-      @ForAll("writers") LocalCatalogMode extensionWriter) {
+      @ForAll("writers") LocalCatalogMode extensionWriter,
+      @ForAll("branchExtensions") List<TableScript.Cmd> branchExtension) {
     race(formatVersion, partitioned, mode, windowWriter, extensionWriter, smallInlineUpdates,
-        merging, prefix, window, r, extension, renameAt);
+        merging, prefix, window, r, extension, renameAt, branchExtension);
   }
 
   /**
@@ -181,7 +182,7 @@ abstract class ConflictEncodingContract {
     extended.addAll(extension);
     race(formatVersion, true, LocalCatalogMode.MEMLOG_ML, LocalCatalogMode.MEMLOG_TM,
         LocalCatalogMode.MEMLOG_ML, false, merging, prefix, List.of(race.get(1)), race.get(0),
-        extended, -1);
+        extended, -1, null);
   }
 
   /**
@@ -192,7 +193,8 @@ abstract class ConflictEncodingContract {
   private void race(int formatVersion, boolean partitioned, LocalCatalogMode mode,
       LocalCatalogMode windowWriter, LocalCatalogMode extensionWriter, boolean smallInlineUpdates,
       boolean merging, List<TableScript.Cmd> prefix, List<TableScript.Cmd> window,
-      TableScript.Cmd r, List<TableScript.Cmd> extension, int renameAt) {
+      TableScript.Cmd r, List<TableScript.Cmd> extension, int renameAt,
+      List<TableScript.Cmd> branchExtension) {
     StringBuilder trace = new StringBuilder(String.format(
         "%s v%d %s, %s%s%s%nprefix %s%nwindow %s%s%nR %s%nextension %s%s, rename at %d%n",
         encoding(), formatVersion, partitioned ? "partitioned" : "unpartitioned", mode,
@@ -262,6 +264,19 @@ abstract class ConflictEncodingContract {
     Statistics.label("R's record where it landed")
         .collect(admitted ? (stale ? "admitted on a changed table" : "admitted on its base")
             : "rejected");
+    // A record the merge refused (Landing.unmergeable) is judged against copies landing past
+    // commits on main, R's branch but for a branch append's: what moves the head, the parents
+    // and the lists those refusals read (the review's C6, gap plan 2.8). Its rejection must stay
+    // one (S2)
+    String reason = admitted ? null : intention(capture.record).explain(first);
+    if (reason != null && reason.startsWith("merge:") && branchExtension != null) {
+      extension = branchExtension;
+      trace.append("rejected (").append(reason).append("): extension on main ")
+          .append(extension).append('\n');
+      Statistics.label("extension").collect("on main, after " + reason);
+    } else {
+      Statistics.label("extension").collect("drawn");
+    }
 
     // Every later point a copy of it could land at.
     int judged = 0;
@@ -605,6 +620,25 @@ abstract class ConflictEncodingContract {
   @Provide
   Arbitrary<List<TableScript.Cmd>> extensions() {
     return TableScript.commands(ConflictEncodingContract::single).withoutEdgeCases()
+        .list().ofMinSize(1).ofMaxSize(6);
+  }
+
+  /**
+   * Commands that commit on main: what moves a branch's head, its snapshots' parents and lists,
+   * which the merge's refusals read ({@link Landing#unmergeable}).
+   */
+  private static final java.util.Set<TableScript.Kind> BRANCH_COMMITS = java.util.EnumSet.of(
+      TableScript.Kind.FAST_APPEND, TableScript.Kind.MERGE_APPEND, TableScript.Kind.DELETE_FILE,
+      TableScript.Kind.EQUALITY_DELETE, TableScript.Kind.POSITION_DELETE,
+      TableScript.Kind.REWRITE_FILES, TableScript.Kind.OVERWRITE,
+      TableScript.Kind.REPLACE_PARTITIONS, TableScript.Kind.OVERWRITE_PARTITION,
+      TableScript.Kind.MERGE_ROW_DELTA, TableScript.Kind.STAGED_APPEND,
+      TableScript.Kind.CHERRY_PICK, TableScript.Kind.ROLLBACK);
+
+  /** Extensions after a "merge:" rejection: commits on main ({@link #BRANCH_COMMITS}). */
+  @Provide
+  Arbitrary<List<TableScript.Cmd>> branchExtensions() {
+    return TableScript.commands(BRANCH_COMMITS::contains).withoutEdgeCases()
         .list().ofMinSize(1).ofMaxSize(6);
   }
 
