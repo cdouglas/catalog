@@ -1182,6 +1182,8 @@ the version condition should make harmless (the 2026-11-17 review's F3, items 3 
 | `sg-faults` | one fault: lost reply, not sent, in flight, short read (of a reader's segment, or of the read-through's) | 262,970 |
 | `sg-faults-compact` | a fault, with a checkpoint and a sweep | 157,574 |
 | `sg-short` | two short reads, K = 2 in blobs of three blocks (2026-11-20) | 68,778 |
+| `sg-compact-ahead` | `sg-compact` with one record each and one read, writers taking any open segment and installing ahead (2026-11-20) | 14,943,360 |
+| `sg-copies-faults` | two copies of a record, three sends, one fault of any kind (2026-11-20) | 958,644 |
 
 The larger scenarios narrow writers' choices (`AnySeg` and `Ahead` false): with both open,
 `sg-two-each` had not finished after 15 minutes.
