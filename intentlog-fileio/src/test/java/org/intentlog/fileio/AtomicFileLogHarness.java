@@ -67,6 +67,11 @@ public final class AtomicFileLogHarness implements LogHarness {
   private final HeldReads reads;
   private final List<String> readViolations = new ArrayList<>();
   private final Map<byte[], LogView> decoded = new java.util.IdentityHashMap<>();
+  // In OPEN and PINNED modes no write lands between a read's lookup and its GET, or one that does
+  // fails the GET: a fresh read of the one object is a whole version, no older than the object
+  // was when the read began (the runtime's settles() rests on it; the 2026-11-17 review's B8). A
+  // writer that preempts inside the read may read a later one first: its read began later
+  private final boolean whole;
   private Hooks hooks = null;
 
   public AtomicFileLogHarness(InMemoryAtomicFileIO io, String location,
@@ -84,6 +89,8 @@ public final class AtomicFileLogHarness implements LogHarness {
     this.location = location;
     this.pages = location + ".committed/";
     this.machine = machine;
+    this.whole = mode == InMemoryAtomicFileIO.ReadMode.OPEN
+        || mode == InMemoryAtomicFileIO.ReadMode.PINNED;
     io.readMode(mode);
     SplittableRandom splices = random.split();
     // A third at a frame's end (format 2 would decode it), a third inside the checkpoint's frame
@@ -315,6 +322,11 @@ public final class AtomicFileLogHarness implements LogHarness {
    * records (a read may return any prefix, P1). Every version the store held is in its history.
    */
   private boolean held(LogView view, String location) {
+    return versionOf(view, location, false) >= 0;
+  }
+
+  /** Every version of the object at {@code location}, in the order the store held them. */
+  private List<byte[]> versions(String location) {
     List<byte[]> versions = new ArrayList<>();
     for (InMemoryAtomicFileIO.Write write : io.history()) {
       if (write.location().equals(location)) {
@@ -324,11 +336,58 @@ public final class AtomicFileLogHarness implements LogHarness {
         versions.add(write.after());
       }
     }
+    return versions;
+  }
+
+  /**
+   * The latest of {@link #versions} that holds {@code view}: its checkpoint, and its records
+   * exactly if {@code exactly}, else a prefix of them; -1 if none does.
+   */
+  private int versionOf(LogView view, String location, boolean exactly) {
+    List<byte[]> versions = versions(location);
     byte[] checkpoint = view.checkpoint().orElseThrow();
-    for (byte[] version : versions) {
-      LogView whole = decoded.computeIfAbsent(version, AtomicFileLog::decode);
-      if (Arrays.equals(checkpoint, whole.checkpoint().orElseThrow())
-          && startsWith(whole.records(), view.records())) {
+    for (int i = versions.size() - 1; i >= 0; i--) {
+      LogView version = decoded.computeIfAbsent(versions.get(i), AtomicFileLog::decode);
+      if (Arrays.equals(checkpoint, version.checkpoint().orElseThrow())
+          && (exactly ? sameRecords(version.records(), view.records())
+              : startsWith(version.records(), view.records()))) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  private static boolean sameRecords(List<byte[]> a, List<byte[]> b) {
+    return a.size() == b.size() && startsWith(a, b);
+  }
+
+  /**
+   * Whether {@code records}, which a read after {@code since} returned alone, are what a version
+   * the store held has after it: a version of its incarnation that continues the one it names,
+   * with these records after it (exactly in OPEN and PINNED modes; else a prefix of them).
+   */
+  private boolean followsIn(LogTail since, List<byte[]> records, String location) {
+    byte[] at = since.position();
+    if (at == null || at.length != 2 * Long.BYTES) {
+      return true; // a tail that names no position: nothing to check against
+    }
+    long length = littleEndian(at, Long.BYTES);
+    LogView before = viewAt(since);
+    if (before == null) {
+      return false;
+    }
+    int n = before.records().size();
+    for (byte[] version : versions(location)) {
+      if (version.length < length || littleEndian(version, (int) length - AtomicFileLog.TRAILER_SIZE)
+          != littleEndian(at, 0) || !frameEnds(version).contains((int) length)) {
+        continue;
+      }
+      List<byte[]> all = decoded.computeIfAbsent(version, AtomicFileLog::decode).records();
+      if (all.size() < n) {
+        continue;
+      }
+      List<byte[]> after = all.subList(n, all.size());
+      if (whole ? sameRecords(after, records) : startsWith(after, records)) {
         return true;
       }
     }
@@ -346,10 +405,34 @@ public final class AtomicFileLogHarness implements LogHarness {
     }
 
     private LogView checked(LogView view, String how) {
+      return checked(view, how, -2);
+    }
+
+    /** The newest version of the object now, as {@link #versions} counts them; -1 if none. */
+    private int newest() {
+      return versions(location).size() - 1;
+    }
+
+    /**
+     * {@code view}, checked: a state the log held; and, for a fresh read (a read of the object as
+     * it is, not one through a write, which may answer from it: {@code began} the newest version
+     * when it began) in OPEN and PINNED modes, a whole version no older than that.
+     */
+    private LogView checked(LogView view, String how, int began) {
       Hooks was = hooks;
       hooks = null;
       try {
-        if (!held(view, location)) {
+        if (began > -2 && whole) {
+          int version = versionOf(view, location, true);
+          if (version < 0) {
+            readViolations.add(how + " returned no whole version the store held: "
+                + view.records().size() + " records after a checkpoint of "
+                + view.checkpoint().orElseThrow().length + " bytes");
+          } else if (version < began) {
+            readViolations.add(how + " returned version " + version
+                + ", older than version " + began + ", the object when the read began");
+          }
+        } else if (!held(view, location)) {
           readViolations.add(how + " returned a state the log never held: "
               + view.records().size() + " records after a checkpoint of "
               + view.checkpoint().orElseThrow().length + " bytes");
@@ -367,7 +450,8 @@ public final class AtomicFileLogHarness implements LogHarness {
 
     @Override
     public LogView read() {
-      return checked(log.read(), "a read");
+      int began = newest();
+      return checked(log.read(), "a read", began);
     }
 
     @Override
@@ -392,8 +476,22 @@ public final class AtomicFileLogHarness implements LogHarness {
 
     @Override
     public LogView readAfter(LogTail since) {
+      int began = newest();
       LogView view = log.readAfter(since);
-      return view.checkpoint().isPresent() ? checked(view, "a read after a tail") : view;
+      if (view.checkpoint().isPresent()) {
+        return checked(view, "a read after a tail", began);
+      }
+      Hooks was = hooks;
+      hooks = null;
+      try {
+        if (!followsIn(since, view.records(), location)) {
+          readViolations.add("a read after a tail returned " + view.records().size()
+              + " records no version the store held has after it");
+        }
+      } finally {
+        hooks = was;
+      }
+      return view;
     }
 
     @Override
