@@ -129,6 +129,30 @@ class TestAtomicFileLog {
         .containsExactly(AtomicOutputFile.Strategy.CAS, AtomicOutputFile.Strategy.APPEND);
   }
 
+  /**
+   * No replace writes bytes an earlier version held, though it replaces the object with the same
+   * checkpoint and records: each draws an incarnation into its frames. On an S3 general-purpose
+   * bucket a version is its ETag, a hash of its bytes, so a CAS from a version also replaces a
+   * later one with the same bytes (A-B-A; the fork's SupportsAtomicOperations.newOutputFile): a
+   * log whose replaces repeated bytes could not tell a writer that the object changed in between
+   * (the 2026-11-17 review's API5).
+   */
+  @Test
+  void aReplaceNeverWritesAnEarlierVersionsBytes() {
+    AtomicFileLog drawing = new AtomicFileLog(io, LOCATION);
+    List<byte[]> versions = new java.util.ArrayList<>();
+    LogTail tail = absent();
+    for (int i = 0; i < 8; i++) {
+      Receipt r = drawing.replace(tail, bytes("chk"), List.of(bytes("r1")));
+      tail = drawing.readThrough(r, Duration.ZERO).tail();
+      byte[] version = io.bytes(LOCATION);
+      for (byte[] earlier : versions) {
+        assertThat(version).as("replace %s", i).isNotEqualTo(earlier);
+      }
+      versions.add(version);
+    }
+  }
+
   @Test
   void aReplaceStartsANewLineage() {
     LogView created = create();

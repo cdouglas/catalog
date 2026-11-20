@@ -22,9 +22,14 @@
 # when the page is there. pagesAreStoredByName passed it (2026-11-20); aPageThereIsNotWrittenAgain
 # and twoWritersPutOnePageAtOnce fail it on both of TestAtomicFileLogContract's logs, counting the
 # store's landed writes.
-MUTANTS="casoverappend appendoverreplace pageplain"
+#
+# A-B-A (API5): fixedinc gives every replace the same incarnation, so a replace with the same
+# checkpoint and records writes an earlier version's bytes, which an S3 general-purpose bucket's
+# ETag (a hash of them) cannot tell apart. TestAtomicFileLog's
+# aReplaceNeverWritesAnEarlierVersionsBytes alone fails it (2026-11-20).
+MUTANTS="casoverappend appendoverreplace pageplain fixedinc"
 EQUIVALENT=""
-ORACLES=TestAtomicFileLogContract,TestInMemorySharedLogContract,TestSegmentedLogContract
+ORACLES=TestAtomicFileLogContract,TestInMemorySharedLogContract,TestSegmentedLogContract,TestAtomicFileLog
 
 IO=intentlog-fileio/src/test/java/org/apache/iceberg/io/InMemoryAtomicFileIO.java
 FILELOG=intentlog-fileio/src/main/java/org/intentlog/fileio/AtomicFileLog.java
@@ -42,6 +47,8 @@ mutant() { # name main-dir test-dir (the catalog's; these mutants are intentlog'
     # an append lands at the end of an object a CAS replaced since the version it names
     appendoverreplace) mutate $IO "        if (expectedGen != liveGen) {" "        if (expectedGen != liveGen && !(strategy == Strategy.APPEND && expected != null
             && live != null && live.segments == 1)) {" ;;
+    # every replace draws the same incarnation
+    fixedinc) mutate $FILELOG "    this(io, location, () -> ThreadLocalRandom.current().nextLong(), lookupFirst);" "    this(io, location, () -> 42L, lookupFirst);" ;;
     # a page put rewrites the page in place, a plain write
     pageplain) mutate $FILELOG "        AtomicOutputFile out = io.newOutputFile(io.newInputFile(prefix + name));
         CAS token = out.prepare(() -> new ByteArrayInputStream(page), AtomicOutputFile.Strategy.CAS);
