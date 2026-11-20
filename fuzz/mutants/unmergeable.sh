@@ -17,14 +17,19 @@
 # was added: a snapshot staged on a branch (TableScript's STAGED_APPEND, half the time), and a
 # table's first commit racing others (the merge probe's empty prefixes). The first found Bug 132
 # (staged snapshot merged as main's): the refusal then covered a staged snapshot only once main
-# had moved, and one staged on another branch merged as main's. The contracts' steering seldom fires: their records are rejected
-# as "merge:" in about one try of 300.
+# had moved, and one staged on another branch merged as main's. On havoc (p21-cal-unmergeable,
+# b264cf1, 300 each): listfile at 44-223, stagedmoved 6-177, freshhistory 275 (by
+# anAdmittedTransaction, not the empty prefixes), removednothead 2-158; moresnapshots not caught
+# at 300, hence 2,000 for the transaction property. The contracts' steering seldom fires: their
+# records are rejected as "merge:" in about one try of 300.
 MUTANTS="moresnapshots listfile stagedmoved freshhistory removednothead"
 EQUIVALENT=""
 ORACLES=TestRebaseProperties,TestBlindAppendEncoding,TestPartitionVectorEncoding,TestManifestWindowEncoding,TestConcernVectorEncoding
 
 prepare() {
-  tries $1/$T/TestRebaseProperties.java each 300
+  # anAdmittedTransactionIsWhatItsRetryWouldCommit (#10) is the one property that reaches
+  # moresnapshots (first failing try 194 locally): ten times that
+  tries $1/$T/TestRebaseProperties.java 300 300 300 300 300 300 300 300 300 2000 300 300
   tries $1/$T/ConflictEncodingContract.java each 400
 }
 
