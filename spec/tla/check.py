@@ -375,13 +375,15 @@ LOG_BASE = {
     "BlockIds": "1",
     "GridBits": "3",
     "SealEvery": "0",
+    "Cond": "FALSE",
+    "MaxLooks": "0",
     "Bugs": "{}",
 }
 
 LOG_SAFETY = ["StampsCount", "Readable", "Deterministic", "CheckpointIsReplay", "ExactlyOnce",
               "Serializable",
               "UniqueIds", "WellNamed", "HonestCommitted", "HonestFailed", "UnknownExplained",
-              "SoloCommits", "PagesExist", "PagesExact", "Shape", "OnGrid"]
+              "SoloCommits", "PagesExist", "PagesExact", "Shape", "OnGrid", "MonotoneReads"]
 LOG_ACTIONS = ["HistGrows"]
 
 LOG_FAULTS = ('{"failBefore", "notSent", "lostReply", "throttled", "landedThrottled", '
@@ -397,6 +399,10 @@ PAGE = {"Shapes": "<- TwoEach", "MaxTime": "1", "MaxPage": "1", "MaxSweep": "1"}
 PAGE1 = {"MaxTime": "1", "MaxPage": "1", "MaxSweep": "1"}
 PAGE_FAULTS = ('{"failBefore", "notSent", "lostReply", "throttled", "landedThrottled", '
                '"inflight", "readFail", "pageFail", "putFail", "putLost"}')
+# Conditional appends (Cond): every fault, a conditional append's reply that says it lost though
+# it landed (condLanded), and void appends.
+COND_FAULTS = ('{"failBefore", "notSent", "lostReply", "throttled", "landedThrottled", '
+               '"inflight", "readFail", "condLanded", "void"}')
 
 LOG_CONFIGS = {
     "log-base": ({}, "pass"),
@@ -496,6 +502,38 @@ LOG_CONFIGS = {
                         {"WellNamed", "Serializable"}),
     "log-tablenoview": ({"Shapes": "<- ViewFreed", "Bugs": '{"tablenoview"}'},
                         {"WellNamed", "Serializable"}),
+    # Newer runtime paths (the 2026-11-17 review's F7): conditional appends on a log that cannot
+    # replace itself, a lost one settled only by a read past the tail it named (Bug 90); void
+    # appends (an append past its segment's end, docs/LOG_SEGMENTS.md D4), a lost race that
+    # leaves nothing to resolve; reads outside a commit, which never go back (Bug 72).
+    "log-cond": ({"Cond": "TRUE"}, "pass"),
+    "log-cond-two-each": ({"Cond": "TRUE", "Shapes": "<- TwoEach"}, "pass"),
+    # Two attempts, so that a commit can lose both (to the other writer's record and the GC
+    # record) and end on a read that lags behind its lost sends.
+    "log-cond-lag": ({**COMPACT1, "Cond": "TRUE", "Lag": "TRUE", "MaxAttempts": "2"}, "pass"),
+    "log-cond-faults": ({"Cond": "TRUE", "Lag": "TRUE", "MaxFaults": "1",
+                         "FaultKinds": COND_FAULTS}, "pass"),
+    "log-cond-faults2": ({"Cond": "TRUE", "Shapes": "<- Blind", "MaxFaults": "2",
+                          "FaultKinds": COND_FAULTS, "MaxAttempts": "2"}, "pass"),
+    "log-void": ({"MaxFaults": "2", "FaultKinds": '{"void", "throttled"}'}, "pass"),
+    "log-void-lag": ({**COMPACT1, "Lag": "TRUE", "MaxFaults": "1", "FaultKinds": '{"void"}',
+                      "MaxAttempts": "2"}, "pass"),
+    "log-reads": ({**COMPACT1, "Lag": "TRUE", "MaxLooks": "2"}, "pass"),
+    "log-reads-faults": ({"Lag": "TRUE", "MaxLooks": "1", "MaxFaults": "1",
+                          "FaultKinds": LOG_FAULTS}, "pass"),
+    # Their switches: the last loss settled by a read that lags behind the tail it named (Bug
+    # 90); a void append left unresolved (a lagging read cannot settle it, and the commit is
+    # unknown with no race to explain it), or landed in effect (the commit, out of attempts,
+    # fails with its record applied); a catalog's read that goes back (Bug 72).
+    "log-lagsettle": ({"Cond": "TRUE", "Lag": "TRUE", "MaxAttempts": "1", "MaxFaults": "1",
+                       "FaultKinds": '{"condLanded"}', "Bugs": '{"lagsettle"}'},
+                      {"HonestFailed"}),
+    "log-voidunres": ({"Lag": "TRUE", "MaxAttempts": "1", "MaxFaults": "1",
+                       "FaultKinds": '{"void"}', "Bugs": '{"voidunres"}'}, {"UnknownExplained"}),
+    "log-voidlands": ({"MaxAttempts": "1", "MaxFaults": "1", "FaultKinds": '{"void"}',
+                       "Bugs": '{"voidlands"}'}, {"HonestFailed"}),
+    "log-readsgoback": ({"Lag": "TRUE", "MaxLooks": "1", "Bugs": '{"readsgoback"}'},
+                        {"MonotoneReads"}),
     # Not in the plan: a lookup whose page was deleted since its read (GC dropped it) fails
     # instead of reading again.
     "log-missingfail": ({**COMPACT1, **PAGE1, "Lag": "TRUE", "MaxFaults": "1",
@@ -602,6 +640,11 @@ WITNESSES = [
     ("log-base", "Not_FailedButLanded"), ("log-faults2", "Not_Unknown"),
     ("log-faults", "Not_Error"), ("log-faults", "Not_Throttled"),
     ("log-faults2", "Not_Exhausted"), ("log-lag", "Not_LaggingRead"),
+    # Conditional appends, void appends, reads outside a commit (F7).
+    ("log-cond", "Not_CondLost"), ("log-cond-lag", "Not_UnknownUnsettled"),
+    ("log-cond-faults", "Not_Settled"), ("log-cond-faults", "Not_LostButCommitted"),
+    ("log-void", "Not_Void"), ("log-void", "Not_VoidCommitted"),
+    ("log-reads", "Not_Floored"),
     # Tables and views.
     ("names", "Not_NamedRejected"), ("names-mixed", "Not_NamedRejected"),
     ("view-nsdrop", "Not_NamedRejected"), ("view-updates", "Not_NamedFailed"),

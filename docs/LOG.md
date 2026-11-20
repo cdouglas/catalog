@@ -912,7 +912,8 @@ past the tail the append named, so that a read that does not lag settles the
 loss: the log v1 on Azure conditioned an append on its position, not its
 segment, for that reason (Bug 89 (moved on, same position)). A read of one object is of the object as
 it is, so there any read settles a loss. `SharedLogCommit.tla` models
-unconditional appends only.
+conditional appends too (`Cond`; switch `lagsettle` puts Bug 90 back), and
+void appends and a catalog's reads outside a commit.
 
 **Restaging is the caller's.** The loop rejects an intention that no longer
 holds on the state it lost to (`CONFLICT`); staging it again on a fresh read

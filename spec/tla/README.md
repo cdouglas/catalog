@@ -185,8 +185,8 @@ goes in a replace, `oversized` in `mustReplace`: Bug 71, covered by
 
 ## Results
 
-Every configuration of the correct protocol passes. `check.py` holds 194
-configurations (122 of the file model, 52 `log-*`, 20 `sg-*`), 122 of them
+Every configuration of the correct protocol passes. `check.py` holds 207
+configurations (122 of the file model, 65 `log-*`, 20 `sg-*`), 131 of them
 expected to pass; the rest are bug switches, each expected to break a
 property. The state counts in this file's tables are from `check.py`'s full
 run at 4c685a3 (2026-11-11: the 138 configurations it held then, about six
@@ -384,7 +384,24 @@ unconditionally (`Send`), and reads through it (`ReadBack`). A write that fails
 or loses its reply is resolved by a fresh read (`Resolve`), as on the file:
 committed if the record is there; otherwise sent again if the transaction holds,
 else failed. The faults are the file model's, less `landedConflict` (there is no
-condition to fail), plus `notSent` (`LogNotSentException`: nothing landed).
+condition to fail), plus `notSent` (`LogNotSentException`: nothing landed) and
+`void` (an append past its segment's end, docs/LOG_SEGMENTS.md D4: nothing
+landed, and the reply says so; a lost race, not a fault, which the writer
+answers by probing and sending again).
+
+With `Cond`, appends are conditional on the tail the writer holds (P4). A lost
+one may have landed all the same (a transport retry of a write that landed fails
+its condition: fault `condLanded`), so the loss is unresolved, at the furthest
+tail a lost send named (`lostAt`); the writer probes and sends again at the new
+tail. A read past that tail settles the loss; a commit out of attempts with a
+loss unresolved reads the log once more, and is unknown if that read lags behind
+it (Bug 90 (lagging read hid the record)). An append in flight lands only on the
+tail it names.
+
+**Reads outside a commit.** Each writer's catalog loads the log up to
+`MaxLooks` times (`Look`), keeping the newest replica it has read or committed
+in, which a read that lags behind it serves instead (`LogRuntime.read(floor)`,
+`CatalogLog`; Bug 72).
 
 **Compactors.** Within budgets, in any order and interleaved with the writers:
 
@@ -413,16 +430,19 @@ brackets.
 | `AppendGc`, `PutCheckpoint`, `Trim` | `compact` :263; `InMemorySharedLog.putCheckpoint` and `trim` | protocol (also inside commits, whole or GC record only), MW (between operations) |
 | `LandInflight` | a `DELAYED` append, landed by `InMemorySharedLog.deliverDelayed` | protocol, MW |
 | lagging reads (`Lag`), reads from older checkpoints | `InMemorySharedLog`'s read shapes (`ReadShape`) | protocol (stale reads) |
+| `Send` with `Cond` | `log.append(record, at)` in the loop's append branch; a `LogConflictException` leaves the write `unresolved` and records `lostAt`, then a probe and a resend at the new tail | protocol (`InMemorySharedLog`'s conditional mode), `TestSharedLogRuntime` |
+| `Send`'s `void` | `LogVoidException`, a lost race with nothing to resolve: no `unresolved`, a probe, a blind resend; ambiguous after a throttled send | segmented: `TestSegmentedCommitProtocol` |
+| `Exhaust`'s last read | after the loop: `resolve(unresolved)`, then `settles` (Bug 90) | `TestSharedLogRuntime` |
+| `Look` | `LogRuntime.read(floor)` and `refresh`; `CatalogLog` keeps the newest replica (Bug 72) | `TestSharedLogRuntime`, `TestCatalogRegressions` |
 
 "protocol" is `TestMemoryCommitProtocol` (the testkit's `CommitProtocol` on
 `InMemorySharedLog`); "MW" is `TestMultiWriterProperties` on the shared log.
-Not modelled: creating the log (its first checkpoint, `create` :1747),
-`refresh`, a record larger than the log stores, which `loop` rejects before
-sending it (`TOO_LARGE`, Bug 71; `TestSharedLogRuntime`), and reads outside a
-commit, such as a catalog's right after its own, which `read(floor)` keeps
-from going back (Bug 72; `TestSharedLogRuntime`, `TestCatalogRegressions`),
-and conditional appends, whose last lost send only a read past the tail it
-named settles (Bug 90 (lagging read hid the record); `TestSharedLogRuntime`).
+Not modelled: creating the log (its first checkpoint, `create` :1747) and a
+record larger than the log stores, which `loop` rejects before sending it
+(`TOO_LARGE`, Bug 71; `TestSharedLogRuntime`). `Send`'s `Cond`, `void` and
+`condLanded`, and `Exhaust`'s last read, are the loop's conditional branch
+(`lostAt`, `settle`, `settles`), and `Look` is a catalog's `read(floor)` (the
+2026-11-17 review's F7).
 
 ### Properties
 
@@ -434,7 +454,9 @@ The file model's, restated over the whole log, with these differences:
 | `Deterministic` | every reader, from whichever usable checkpoint, replays the log to the same state, committed set and horizon |
 | `CheckpointIsReplay` | a checkpoint at `p` is the replay of the log through `p` (I11) |
 | `ExactlyOnce` | no commit applies twice, whatever ids it took |
-| `SoloCommits` | as on the file; checkpoints and trims are no race, a lagging read is |
+| `SoloCommits` | as on the file; checkpoints and trims are no race, a lagging read is, and so is a void append |
+| `UnknownExplained` | as on the file, and, with `Cond`, after a conditional send lost a race and the commit's last read lagged behind the tail it named (a ghost of the race, which a void append does not set) |
+| `MonotoneReads` | a catalog's read outside a commit never holds fewer transactions than a replica it read or committed in before (Bug 72) |
 
 `CasAppliesItsRecord` has no counterpart (there is no fused write).
 
@@ -457,6 +479,14 @@ Every configuration of the correct protocol passes:
 | `log-concerns`, `log-concerns-faults` | a table's concerns as entities; with every fault | 890; 18,562 |
 | `log-blind-appends` | two blind appends, with compaction and every fault | 301,950 |
 | `log-validated` | three validated commits on partitions | 890 |
+| `log-cond`, `log-cond-two-each` | conditional appends (`Cond`), one and two transactions each | 44; 733 |
+| `log-cond-lag` | conditional appends, two attempts, compaction and lagging reads | 30,814 |
+| `log-cond-faults`, `log-cond-faults2` | with every fault, `condLanded` and `void` among them, lagging reads; two faults within two attempts | 1,492; 6,031 |
+| `log-void`, `log-void-lag` | void appends (and throttles); one with compaction and lagging reads | 544; 62,977 |
+| `log-reads`, `log-reads-faults` | catalogs' reads outside a commit (`Look`), with compaction and lagging reads; with every fault | 2,430,667; 15,013 |
+
+The `log-cond*`, `log-void*` and `log-reads*` counts are of 2026-11-20 (the
+review's F7).
 
 **Coverage.** `check.py --witnesses` reaches, in the passing configurations:
 
@@ -468,12 +498,19 @@ Every configuration of the correct protocol passes:
 - a record twice in the log, and a copy that can land after its commit reported;
 - a failed commit whose record is in the log;
 - throttle retries, the last attempt spent, an unknown outcome;
-- a commit resolving an ambiguous write after a read of it lagged.
+- a commit resolving an ambiguous write after a read of it lagged;
+- a conditional send that lost its race; a commit unknown because its last
+  read lagged behind its lost sends; a loss settled by a read past it; a
+  commit whose send landed though its reply said it lost, which committed;
+- a void append, and a commit that sent again after one and committed;
+- a catalog's read outside a commit that lagged behind the replica it held.
 
 ### Calibration
 
 Each switch puts back a mistake this kind of log admits. The first five were
-planned with the model; the last three are what the model found (below):
+planned with the model; the next three are what the model found (below);
+the last four came with conditional and void appends and reads outside a
+commit (the 2026-11-17 review's F7):
 
 | Switch | What it does | Caught by |
 |---|---|---|
@@ -486,6 +523,10 @@ planned with the model; the last three are what the model found (below):
 | `lagread` | the read that resolves an ambiguous write may lag behind the one the commit staged on | `HonestFailed` |
 | `p3` | `readThrough` may answer from a checkpoint that already holds the record | `HonestFailed` |
 | `basever` | an entity's version set from the one its record was staged on (see the file model) | `StampsCount` |
+| `lagsettle` | with `Cond`, any read settles a lost conditional send, one that lags behind the tail it named too (Bug 90 (lagging read hid the record)) | `HonestFailed` (`log-lagsettle`) |
+| `voidunres` | a void append is left unresolved, as a lost conditional one is: a lagging read cannot settle it | `UnknownExplained` (`log-voidunres`) |
+| `voidlands` | a void append lands in effect, though the writer takes it for lost | `HonestFailed` (`log-voidlands`) |
+| `readsgoback` | a catalog's read outside a commit adopts a read that lags behind the replica it holds (Bug 72) | `MonotoneReads` (`log-readsgoback`) |
 
 ### What the model found
 

@@ -172,4 +172,22 @@ Not_PageDropped ==
 \* Blocks: two inline blocks; a block of more than one id.
 Not_TwoBlocks == Cardinality(Blocks(Full.C)) < 2
 Not_WideBlock == \A b \in Blocks(Full.C) : b.lv = 0
+
+\* Conditional appends (Cond): a send that lost its race; a commit whose
+\* lost send its last read could not settle (unknown); a read settled a
+\* loss (the commit goes on); a send of a commit that landed, reported as
+\* a lost race, and the commit committed after all.
+Not_CondLost == \A w \in Writers : ~ws[w].cl
+Not_UnknownUnsettled == \A e \in ended : ~(e.out = "unknown" /\ e.ul)
+Not_Settled == \A w \in Writers : ~(ws[w].pc # "idle" /\ ws[w].cl /\ ~ws[w].ur)
+Not_LostButCommitted ==
+  \A e \in ended : ~(e.out = "committed" /\ e.cf
+                     /\ \E i, j \in 1..Len(Txns(log)) :
+                          i < j /\ Txns(log)[i].id = e.id /\ Txns(log)[j].id = e.id)
+\* A void send; a commit that sent again after one and committed.
+Not_Void == \A e \in ended : ~e.vd
+Not_VoidCommitted == \A e \in ended : ~(e.vd /\ e.out = "committed")
+\* A catalog's read outside a commit lagged behind the replica it held, so
+\* it served that replica (Bug 72).
+Not_Floored == \A w \in Writers : ~looks[w].fl
 =============================================================================
