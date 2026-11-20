@@ -135,6 +135,76 @@ public abstract class SharedLogContract {
     assertThat(pages.get(a)).isPresent();
   }
 
+  /**
+   * How many page puts of this log have written a page's bytes to its storage (created it), if
+   * the test can tell; -1 if not.
+   */
+  protected long pageWrites() {
+    return -1;
+  }
+
+  /**
+   * A put of a page that is there writes nothing: its name is a content address, so the bytes
+   * there are these, and a rewrite in place could show a reader part of them (Bug 116 (zonal page
+   * re-put not atomic)). The page reads as it was.
+   */
+  @Test
+  void aPageThereIsNotWrittenAgain() {
+    PageStore pages = log.pages();
+    assumeThat(pages).as("the log keeps pages").isNotNull();
+    create(checkpoint(0));
+    String a = "4-12345-" + "0c".repeat(16);
+    byte[] page = "page c".getBytes(StandardCharsets.UTF_8);
+    pages.put(a, page);
+    long written = pageWrites();
+    pages.put(a, page);
+    pages.put(a, page);
+    assertThat(pages.get(a)).hasValueSatisfying(p -> assertThat(p).isEqualTo(page));
+    if (written >= 0) {
+      assertThat(pageWrites()).as("page writes after re-puts").isEqualTo(written);
+    }
+  }
+
+  /**
+   * Two writers put one page at once (compactors sealing the same block): both return, and the
+   * page holds its bytes, whole, written once where the test can tell.
+   */
+  @Test
+  void twoWritersPutOnePageAtOnce() throws Exception {
+    PageStore pages = log.pages();
+    assumeThat(pages).as("the log keeps pages").isNotNull();
+    create(checkpoint(0));
+    long before = pageWrites();
+    int names = 20;
+    java.util.concurrent.ExecutorService writers =
+        java.util.concurrent.Executors.newFixedThreadPool(2);
+    try {
+      for (int i = 0; i < names; i++) {
+        String name = i + "-" + (1000 + i) + "-" + String.format("%032x", i);
+        byte[] page = ("page " + i).getBytes(StandardCharsets.UTF_8);
+        java.util.concurrent.CyclicBarrier together = new java.util.concurrent.CyclicBarrier(2);
+        List<java.util.concurrent.Future<?>> puts = new ArrayList<>();
+        for (int w = 0; w < 2; w++) {
+          puts.add(writers.submit(() -> {
+            together.await();
+            pages.put(name, page);
+            return null;
+          }));
+        }
+        for (java.util.concurrent.Future<?> put : puts) {
+          put.get(WAIT.toMillis() * 10, java.util.concurrent.TimeUnit.MILLISECONDS);
+        }
+        assertThat(pages.get(name)).as(name)
+            .hasValueSatisfying(p -> assertThat(p).isEqualTo(page));
+      }
+    } finally {
+      writers.shutdownNow();
+    }
+    if (before >= 0) {
+      assertThat(pageWrites() - before).as("page writes").isEqualTo(names);
+    }
+  }
+
   @Test
   void aNewLogDoesNotExistUntilCreated() {
     assertThat(log.probe().exists()).isFalse();

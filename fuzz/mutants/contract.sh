@@ -16,11 +16,18 @@
 # through a write's). Of the fuzzers, TestAtomicFileCommitProtocol catches casoverappend (try 16
 # of 5,000); TestSegmentedCommitProtocol misses it in 2,000 tries (a checkpoint replacing the
 # catalog object over an Install).
-MUTANTS="casoverappend appendoverreplace"
+#
+# Pages (the 2026-11-17 review's API4): pageplain puts a page with a plain write, which rewrites it
+# in place (Bug 116 (zonal page re-put not atomic)), not a conditional create that writes nothing
+# when the page is there. pagesAreStoredByName passed it (2026-11-20); aPageThereIsNotWrittenAgain
+# and twoWritersPutOnePageAtOnce fail it on both of TestAtomicFileLogContract's logs, counting the
+# store's landed writes.
+MUTANTS="casoverappend appendoverreplace pageplain"
 EQUIVALENT=""
 ORACLES=TestAtomicFileLogContract,TestInMemorySharedLogContract,TestSegmentedLogContract
 
 IO=intentlog-fileio/src/test/java/org/apache/iceberg/io/InMemoryAtomicFileIO.java
+FILELOG=intentlog-fileio/src/main/java/org/intentlog/fileio/AtomicFileLog.java
 
 prepare() {
   : # the contract's tests are examples, not properties: no tries to set
@@ -35,5 +42,11 @@ mutant() { # name main-dir test-dir (the catalog's; these mutants are intentlog'
     # an append lands at the end of an object a CAS replaced since the version it names
     appendoverreplace) mutate $IO "        if (expectedGen != liveGen) {" "        if (expectedGen != liveGen && !(strategy == Strategy.APPEND && expected != null
             && live != null && live.segments == 1)) {" ;;
+    # a page put rewrites the page in place, a plain write
+    pageplain) mutate $FILELOG "        AtomicOutputFile out = io.newOutputFile(io.newInputFile(prefix + name));
+        CAS token = out.prepare(() -> new ByteArrayInputStream(page), AtomicOutputFile.Strategy.CAS);
+        out.writeAtomic(token, () -> new ByteArrayInputStream(page));" "        try (java.io.OutputStream plain = io.newOutputFile(prefix + name).createOrOverwrite()) {
+          plain.write(page);
+        }" ;;
   esac
 }

@@ -603,6 +603,11 @@ public class InMemoryAtomicFileIO implements SupportsAtomicOperations, SupportsP
     return ImmutableMap.copyOf(writes);
   }
 
+  /** How many writes have landed, of any kind, on any object: each stored a generation. */
+  public long writesLanded() {
+    return generations.get();
+  }
+
   private synchronized Version put(String location, byte[] bytes) {
     return put(location, bytes, 1);
   }

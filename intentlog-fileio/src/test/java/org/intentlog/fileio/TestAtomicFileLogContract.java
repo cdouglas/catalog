@@ -28,17 +28,33 @@ class TestAtomicFileLogContract {
 
   @Nested
   class WithAppend extends SharedLogContract {
+    private InMemoryAtomicFileIO io;
+
     @Override
     protected SharedLog newLog() {
-      return new AtomicFileLog(new InMemoryAtomicFileIO(), "mem:///log");
+      io = new InMemoryAtomicFileIO();
+      return new AtomicFileLog(io, "mem:///log");
+    }
+
+    @Override
+    protected long pageWrites() {
+      return io.writesLanded(); // only page puts write while a page case runs
     }
   }
 
   @Nested
   class CasOnly extends SharedLogContract {
+    private InMemoryAtomicFileIO io;
+
     @Override
     protected SharedLog newLog() {
-      return new AtomicFileLog(new InMemoryAtomicFileIO(false), "mem:///log");
+      io = new InMemoryAtomicFileIO(false);
+      return new AtomicFileLog(io, "mem:///log");
+    }
+
+    @Override
+    protected long pageWrites() {
+      return io.writesLanded(); // only page puts write while a page case runs
     }
   }
 }
