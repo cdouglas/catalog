@@ -9158,4 +9158,50 @@ public class TestCatalogRegressions {
           cmd(TableScript.Kind.BRANCH_APPEND, 6, 11, 1), new int[] {1, 0});
     }
   }
+
+  /**
+   * Bug 132 (staged snapshot merged as main's): a staged snapshot (an append's {@code
+   * stageOnly()}, no ref moving to it) names no branch in its record, so the merge took it for
+   * main's: its parent main's head where it lands, its totals counted from there. Iceberg stages it
+   * on its producer's branch: the parent is that branch's head (main's if the table lacks it), the
+   * totals count from that head (from 0 if it has none). A snapshot staged on a branch the table
+   * lacks merged onto a table changed elsewhere with totals counted from main's head; one staged on
+   * a branch at main's head merged onto its old parent past an append to that branch, where
+   * Iceberg's retry builds on the append. The merge refused a staged snapshot only once main had
+   * moved. Found by the rebase oracle once TableScript staged on branches (gap plan 2.8). A
+   * staged snapshot now merges nowhere: its record applies only on its base, and a conflict is
+   * retried as Iceberg retries it.
+   */
+  @Nested
+  class AStagedSnapshotNamesNoBranch {
+    private final List<String> encodings = List.of(ManifestWindowEncoding.NAME,
+        ConcernVectorEncoding.NAME, BlindAppendEncoding.NAME, PartitionVectorEncoding.NAME);
+
+    private void raced(List<TableScript.Cmd> prefix, List<TableScript.Cmd> window,
+        TableScript.Cmd r) {
+      for (String encoding : encodings) {
+        for (int version = 2; version <= 3; version++) {
+          TestRebaseProperties.verify(encoding, version, false, LocalCatalogMode.COMPACT_ML,
+              prefix, window, r);
+        }
+      }
+    }
+
+    @Test
+    void stagedOnABranchTheTableLacks() {
+      // staged on b0 (STAGED_APPEND with b % 4 == 2), which no ref names; a property set races it
+      raced(List.of(cmd(TableScript.Kind.FAST_APPEND, 0, 0, 0)),
+          List.of(cmd(TableScript.Kind.SET_PROPERTY, 0, 0, 0)),
+          cmd(TableScript.Kind.STAGED_APPEND, 0, 2, 0));
+    }
+
+    @Test
+    void stagedOnABranchAnAppendAdvances() {
+      // b0 created at main's head; an append to b0 races the snapshot staged on it
+      raced(List.of(cmd(TableScript.Kind.FAST_APPEND, 0, 0, 0),
+              cmd(TableScript.Kind.CREATE_BRANCH, 0, 0, 0)),
+          List.of(cmd(TableScript.Kind.BRANCH_APPEND, 0, 0, 1)),
+          cmd(TableScript.Kind.STAGED_APPEND, 0, 2, 1));
+    }
+  }
 }

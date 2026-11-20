@@ -331,10 +331,12 @@ final class Landing {
           && (moved || landing.parents.containsKey(add.snapshotId))) {
         return "its manifest list is a file, written for its base";
       }
-      if (!branches.containsKey(first(add.snapshotId, adds))
-          && landing.parents.containsKey(add.snapshotId)) {
-        // a staged snapshot: the branch it was staged on is unknown
-        return "it stages a snapshot on a branch that has moved";
+      if (!branches.containsKey(first(add.snapshotId, adds))) {
+        // A staged snapshot: its record names no branch, and Iceberg stages it on its producer's
+        // (its parent that branch's head, main's if the table lacks it; its totals counted from
+        // that head, from 0 if it has none), which a table changed since may have moved, or main
+        // alone (Bug 132 (staged snapshot merged as main's))
+        return "it stages a snapshot, whose branch it does not name";
       }
     }
     for (Map.Entry<Long, Long> head : landing.parents.entrySet()) {
