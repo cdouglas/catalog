@@ -1506,6 +1506,15 @@ class TestCatalogFaultProperties {
     // effect in the catalog and settled it then (settleEarly)
     private Op runningOp;
     private boolean settled;
+    // A late preemption that did not settle the running command (its record had not landed, or
+    // landed changing nothing a check reads): the model then, the preempting command's operation,
+    // and whether it took effect (lateOrder); and the operation of the last command run nested
+    private Model beforeLate;
+    private Op lateOp;
+    private boolean lateTookEffect;
+    private Op lastNestedOp;
+    // Whether the running command's effect is in the model already (lateOrder), for resolve
+    private boolean effectApplied;
     private List<Fault> writePlan;
     private int writes;
     private int failingRead;
@@ -1900,6 +1909,9 @@ class TestCatalogFaultProperties {
       wrote = false;
       lateRequests = 0;
       settled = false;
+      beforeLate = null;
+      lateOp = null;
+      effectApplied = false;
       writes = 0;
       reads = 0;
       fired.clear();
@@ -2086,8 +2098,53 @@ class TestCatalogFaultProperties {
       }
       Statistics.label("a late preemption's command")
           .collect(running.kind + (settled ? ", landed" : ", not landed"));
+      Model before = model; // resolve replaces it when the preempting command's effect applies
+      Model unsettled = settled ? null : copy(model);
+      lastNestedOp = null;
       runPending("at request #" + request + " after its first write"
           + (settled ? ", its record landed" : ""));
+      if (!settled) {
+        beforeLate = unsettled;
+        lateOp = lastNestedOp;
+        lateTookEffect = model != before;
+      }
+    }
+
+    /**
+     * Whether the catalog holds the running command's effect applied before the late preempting
+     * command's, not after: its record landed before that command ran, changing nothing a check
+     * reads then (a removal of a property the namespace lacked), so it was not settled. If so, sets
+     * the model to that order, and resolve applies nothing more. The order is inferred from the
+     * catalog's state, as settleEarly infers a landing: a record that landed after the preempting
+     * command and lost its effect would read the same, an interleaving only late preemptions of a
+     * command whose effect is void where it lands reach.
+     */
+    private boolean lateOrder(Op op) {
+      Model now = actual();
+      Model after = copy(model);
+      try {
+        op.effect.apply(after, now);
+        if (diff(after, now) == null) {
+          return false;
+        }
+      } catch (IllegalStateException e) { // an IsolationViolation too: try the other order
+      }
+      Model first = copy(beforeLate);
+      try {
+        op.effect.apply(first, now);
+        if (lateTookEffect && lateOp != null) {
+          lateOp.effect.apply(first, now);
+        }
+      } catch (IllegalStateException e) {
+        return false;
+      }
+      if (diff(first, now) != null) {
+        return false;
+      }
+      trace.append("    (its record landed before the command that preempted it ran)\n");
+      Statistics.label("a late preemption's order").collect("the preempted command first");
+      model = first;
+      return true;
     }
 
     /**
@@ -4055,6 +4112,9 @@ class TestCatalogFaultProperties {
     private void run(Cmd cmd, boolean topLevel) {
       Writer w = writer(cmd);
       Op op = interpret(cmd, w);
+      if (!topLevel) {
+        lastNestedOp = op;
+      }
       if (op == null) {
         return;
       }
@@ -4173,8 +4233,13 @@ class TestCatalogFaultProperties {
           ? mustCommit(cmd, w, op, topLevel && !preempting.isEmpty(), topLevel && writes == 0,
               failure)
           : null;
+      if (topLevel && lateOp != null
+          && (outcome == Outcome.ACKNOWLEDGED || outcome == Outcome.UNKNOWN)) {
+        effectApplied = lateOrder(op);
+      }
       resolve(cmd, op, outcome, reason, must,
           topLevel && !preempting.isEmpty(), !topLevel || fired.isEmpty());
+      effectApplied = false;
     }
 
     /**
@@ -4265,7 +4330,9 @@ class TestCatalogFaultProperties {
       Model with = copy(model);
       String applies = null;
       try {
-        op.effect.apply(with, actual);
+        if (!effectApplied) {
+          op.effect.apply(with, actual);
+        }
       } catch (IsolationViolation e) {
         if (outcome == Outcome.ACKNOWLEDGED) {
           throw fail("acknowledged %s, but %s", op, e.getMessage());
