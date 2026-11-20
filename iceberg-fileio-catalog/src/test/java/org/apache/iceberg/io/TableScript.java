@@ -378,6 +378,7 @@ final class TableScript {
 
     /** Runs {@code step}; returns the exception that rejected it, or null if it committed. */
     RuntimeException run(List<Cmd> step) {
+      staleRejection = null;
       Cmd first = step.get(0);
       if (first.kind == Kind.STALE) {
         trace.append("stale ").append(step.subList(1, step.size())).append('\n');
@@ -508,7 +509,26 @@ final class TableScript {
      */
     /** {@link TableScript#rejects}, or a read of metadata the table as it is no longer has. */
     private boolean rejectsHere(RuntimeException e) {
-      return rejects(e) || staleRead(e);
+      if (rejects(e)) {
+        return true;
+      }
+      if (staleRead(e)) {
+        staleRejection = e;
+        return true;
+      }
+      return false;
+    }
+
+    // The rejection of the step running that was a stale read ({@link #staleRead}), if one was
+    private RuntimeException staleRejection = null;
+
+    /**
+     * Whether {@code rejected}, what {@link #run} returned, was a stale read: a handle's read of a
+     * manifest list or manifest an expiry deleted, which rejects the step before its own checks
+     * do. Another catalog that keeps the list inline reads on, and may reject the step otherwise.
+     */
+    boolean rejectedAsStale(RuntimeException rejected) {
+      return rejected != null && rejected == staleRejection;
     }
 
     /**

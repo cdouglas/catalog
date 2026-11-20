@@ -92,8 +92,12 @@ class TestInlineDifferentialProperties {
       RuntimeException pointerRejected = p.run(step);
       clock.stepped();
       RuntimeException inlineRejected = i.run(step);
+      // Rejected alike: a stale handle's read of a list the pointer catalog's expiry deleted
+      // rejects a step the inline catalog, which keeps the list inline, rejects otherwise, or
+      // the reverse (round p24-r0)
       if ((pointerRejected == null) != (inlineRejected == null)
-          || (pointerRejected != null && pointerRejected.getClass() != inlineRejected.getClass())) {
+          || (pointerRejected != null && pointerRejected.getClass() != inlineRejected.getClass()
+              && !p.rejectedAsStale(pointerRejected) && !i.rejectedAsStale(inlineRejected))) {
         throw new AssertionError(String.format(
             "the step %s in the pointer catalog and %s in the inline one%ntrace:%n%s",
             pointerRejected == null ? "committed" : "was rejected (" + pointerRejected + ")",
@@ -180,7 +184,8 @@ class TestInlineDifferentialProperties {
       RuntimeException pagedRejected = p.run(step);
       if ((referenceRejected == null) != (pagedRejected == null)
           || (referenceRejected != null
-              && referenceRejected.getClass() != pagedRejected.getClass())) {
+              && referenceRejected.getClass() != pagedRejected.getClass()
+              && !r.rejectedAsStale(referenceRejected) && !p.rejectedAsStale(pagedRejected))) {
         throw new AssertionError(String.format(
             "the step %s in the unpaged catalog and %s in the paged one%ntrace:%n%s",
             referenceRejected == null ? "committed" : "was rejected (" + referenceRejected + ")",
